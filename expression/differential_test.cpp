@@ -17,8 +17,6 @@
 // date_add/date_sub, extract} x {int64, double, varchar, date, bool-as-int64}
 // x {non-NULL, left NULL, right NULL, both NULL} plus exception cells
 // (division by zero, INT64_MIN/-1, int64 overflow, type mismatch).
-#include "expression/bytecode.hpp"
-
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -30,11 +28,11 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "expression/bytecode.hpp"
 // Pulls the production EvaluationContext adapter, which transitively provides
 // the concrete TransactionContext needed by the relational_detail driver
 // below while keeping this expression-directory TU free of database/
 // includes.
-#include "query/evaluation_context_impl.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "expression/binary_expression.hpp"
@@ -45,6 +43,7 @@
 #include "expression/interval_expression.hpp"
 #include "expression/jit.hpp"
 #include "gtest/gtest.h"
+#include "query/evaluation_context_impl.hpp"
 #include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/row.hpp"
@@ -77,8 +76,9 @@ std::string DescribeValue(const Value& value) {
 std::string DescribeRow(const Schema& schema, const Row& row) {
   std::string description;
   for (size_t i = 0; i < schema.ColumnCount() && i < row.Size(); ++i) {
-    if (!description.empty()) { description += ", ";
-}
+    if (!description.empty()) {
+      description += ", ";
+    }
     description +=
         schema.GetColumn(i).Name().name + "=" + DescribeValue(row[i]);
   }
@@ -121,19 +121,22 @@ Attempt EvaluateAst(const Expression& expression, const Row& row,
                     const Schema& schema) {
   try {
     return Evaluated(expression->Evaluate(row, schema));
-  } catch (const std::exception& error) { return Thrown(error);
-}
+  } catch (const std::exception& error) {
+    return Thrown(error);
+  }
 }
 
 Attempt EvaluateBytecode(const std::optional<BytecodeProgram>& program,
                          const Schema& schema, const Row& row) {
-  if (!program.has_value()) { return Unsupported("bytecode compile failed");
-}
+  if (!program.has_value()) {
+    return Unsupported("bytecode compile failed");
+  }
   try {
     return Evaluated(
         program->EvaluateBatch(MakeSingleRowChunk(schema, row)).ValueAt(0));
-  } catch (const std::exception& error) { return Thrown(error);
-}
+  } catch (const std::exception& error) {
+    return Thrown(error);
+  }
 }
 
 Attempt EvaluateDetailPath(const Expression& expression, const Row& row,
@@ -143,23 +146,26 @@ Attempt EvaluateDetailPath(const Expression& expression, const Row& row,
   const relational_detail::CteMap ctes;
   try {
     return Evaluated(
-        relational_detail::Evaluate(expression, scope, nullptr, context,
-                                    ctes));
-  } catch (const std::exception& error) { return Thrown(error);
-}
+        relational_detail::Evaluate(expression, scope, nullptr, context, ctes));
+  } catch (const std::exception& error) {
+    return Thrown(error);
+  }
 }
 
 bool SameValue(const Value& left, const Value& right) {
-  if (left.IsNull() || right.IsNull()) { return left.IsNull() && right.IsNull();
-}
-  if (left.type != right.type) { return false;
-}
+  if (left.IsNull() || right.IsNull()) {
+    return left.IsNull() && right.IsNull();
+  }
+  if (left.type != right.type) {
+    return false;
+  }
   if (left.type == ValueType::kDouble) {
     // Both paths run identical FP expressions; require bit-identical results
     // so inf/NaN cells compare deterministically.
     const bool left_nan = std::isnan(left.value.double_value);
-    if (left_nan != std::isnan(right.value.double_value)) { return false;
-}
+    if (left_nan != std::isnan(right.value.double_value)) {
+      return false;
+    }
     return left_nan || left.value.double_value == right.value.double_value;
   }
   return left == right;
@@ -200,12 +206,12 @@ class DifferentialTally {
         oracle.has_value()) {
       CheckOracle(cell, input, *available.front().second, *oracle);
     }
-    if (available.size() < 2) { return;
-}
+    if (available.size() < 2) {
+      return;
+    }
     ++compared_;
     for (size_t i = 1; i < available.size(); ++i) {
-      ComparePair(cell, input, *available[i - 1].second,
-                  *available[i].second);
+      ComparePair(cell, input, *available[i - 1].second, *available[i].second);
     }
   }
 
@@ -248,8 +254,8 @@ class DifferentialTally {
           << "] exception message differs";
       return;
     }
-    ADD_FAILURE() << "[differential][MISMATCH] " << cell << " input["
-                  << input << "] one path threw, another returned: baseline="
+    ADD_FAILURE() << "[differential][MISMATCH] " << cell << " input[" << input
+                  << "] one path threw, another returned: baseline="
                   << Describe(baseline) << " other=" << Describe(other);
   }
 
@@ -264,8 +270,8 @@ Expression GtZero(std::string_view column) {
 }
 
 const Schema& IntSchema() {
-  static const Schema schema("ints", {Column("i", ValueType::kInt64),
-                                      Column("j", ValueType::kInt64)});
+  static const Schema schema(
+      "ints", {Column("i", ValueType::kInt64), Column("j", ValueType::kInt64)});
   return schema;
 }
 
@@ -282,8 +288,8 @@ const Schema& StringSchema() {
 }
 
 const Schema& DateSchema() {
-  static const Schema schema("dates", {Column("d", ValueType::kDate),
-                                       Column("e", ValueType::kDate)});
+  static const Schema schema(
+      "dates", {Column("d", ValueType::kDate), Column("e", ValueType::kDate)});
   return schema;
 }
 
@@ -323,18 +329,16 @@ std::vector<CaseCell> BuildCaseCells() {
   });
   cells.push_back({
       "case/constant-true",
-      CaseExpressionExp(
-          {{ConstantValueExp(Value(true)),
-            ConstantValueExp(Value(int64_t{1}))}},
-          ConstantValueExp(Value(int64_t{2}))),
+      CaseExpressionExp({{ConstantValueExp(Value(true)),
+                          ConstantValueExp(Value(int64_t{1}))}},
+                        ConstantValueExp(Value(int64_t{2}))),
       {Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{1})},
   });
   cells.push_back({
       "case/constant-false",
-      CaseExpressionExp(
-          {{ConstantValueExp(Value(false)),
-            ConstantValueExp(Value(int64_t{1}))}},
-          ConstantValueExp(Value(int64_t{2}))),
+      CaseExpressionExp({{ConstantValueExp(Value(false)),
+                          ConstantValueExp(Value(int64_t{1}))}},
+                        ConstantValueExp(Value(int64_t{2}))),
       {Value(int64_t{2}), Value(int64_t{2}), Value(int64_t{2})},
   });
   return cells;
@@ -351,9 +355,10 @@ std::vector<InCell> BuildInCells() {
   });
   cells.push_back({
       "in/null-in-list",
-      InExpressionExp(ColumnValueExp("i"),
-                      {ConstantValueExp(Value(int64_t{1})), ConstantValueExp(Value()),
-                       ConstantValueExp(Value(int64_t{2}))}),
+      InExpressionExp(
+          ColumnValueExp("i"),
+          {ConstantValueExp(Value(int64_t{1})), ConstantValueExp(Value()),
+           ConstantValueExp(Value(int64_t{2}))}),
       {Value(), Value(true), Value()},
   });
   cells.push_back({
@@ -376,10 +381,8 @@ std::vector<InCell> BuildInCells() {
 
 TEST(DifferentialTest, Evaluate_ArithmeticMatrix_MatchesAcrossPaths) {
   const std::vector<std::pair<std::string, BinaryOperation>> operations{
-      {"add", BinaryOperation::kAdd},
-      {"sub", BinaryOperation::kSubtract},
-      {"mul", BinaryOperation::kMultiply},
-      {"div", BinaryOperation::kDivide},
+      {"add", BinaryOperation::kAdd},      {"sub", BinaryOperation::kSubtract},
+      {"mul", BinaryOperation::kMultiply}, {"div", BinaryOperation::kDivide},
       {"mod", BinaryOperation::kModulo},
   };
   const std::vector<Row> int_rows{
@@ -392,36 +395,33 @@ TEST(DifferentialTest, Evaluate_ArithmeticMatrix_MatchesAcrossPaths) {
       Row({Value(kInt64Max), Value(int64_t{1})}),
   };
   const std::vector<Row> double_rows{
-      Row({Value(2.5), Value(0.5)}),
-      Row({Value(), Value(0.5)}),
-      Row({Value(2.5), Value()}),
-      Row({Value(), Value()}),
+      Row({Value(2.5), Value(0.5)}), Row({Value(), Value(0.5)}),
+      Row({Value(2.5), Value()}),    Row({Value(), Value()}),
       Row({Value(1.0), Value(0.0)}),
   };
   DifferentialTally tally;
   for (const auto& [op_name, op] : operations) {
-    Expression int_expr = BinaryExpressionExp(ColumnValueExp("i"), op,
-                                              ColumnValueExp("j"));
+    Expression int_expr =
+        BinaryExpressionExp(ColumnValueExp("i"), op, ColumnValueExp("j"));
     auto int_program = BytecodeCompiler::Compile(int_expr, IntSchema());
     for (size_t r = 0; r < int_rows.size(); ++r) {
       tally.Compare("int64/" + op_name + "/row" + std::to_string(r),
                     DescribeRow(IntSchema(), int_rows[r]),
                     {{"ast", EvaluateAst(int_expr, int_rows[r], IntSchema())},
-                     {"bytecode",
-                      EvaluateBytecode(int_program, IntSchema(), int_rows[r])}});
+                     {"bytecode", EvaluateBytecode(int_program, IntSchema(),
+                                                   int_rows[r])}});
     }
-    Expression double_expr = BinaryExpressionExp(ColumnValueExp("x"), op,
-                                                 ColumnValueExp("y"));
+    Expression double_expr =
+        BinaryExpressionExp(ColumnValueExp("x"), op, ColumnValueExp("y"));
     auto double_program =
         BytecodeCompiler::Compile(double_expr, DoubleSchema());
     for (size_t r = 0; r < double_rows.size(); ++r) {
-      tally.Compare("double/" + op_name + "/row" + std::to_string(r),
-                    DescribeRow(DoubleSchema(), double_rows[r]),
-                    {{"ast", EvaluateAst(double_expr, double_rows[r],
-                                         DoubleSchema())},
-                     {"bytecode", EvaluateBytecode(double_program,
-                                                   DoubleSchema(),
-                                                   double_rows[r])}});
+      tally.Compare(
+          "double/" + op_name + "/row" + std::to_string(r),
+          DescribeRow(DoubleSchema(), double_rows[r]),
+          {{"ast", EvaluateAst(double_expr, double_rows[r], DoubleSchema())},
+           {"bytecode",
+            EvaluateBytecode(double_program, DoubleSchema(), double_rows[r])}});
     }
   }
   tally.Summarize("arithmetic");
@@ -442,34 +442,33 @@ TEST(DifferentialTest, Evaluate_ComparisonMatrix_MatchesAcrossPaths) {
     std::vector<Row> rows;
   };
   const std::vector<Family> families{
-      {"int64", &IntSchema(),
+      {"int64",
+       &IntSchema(),
        {Row({Value(int64_t{7}), Value(int64_t{3})}),
         Row({Value(int64_t{3}), Value(int64_t{7})}),
         Row({Value(int64_t{7}), Value(int64_t{7})}),
-        Row({Value(), Value(int64_t{7})}),
-        Row({Value(int64_t{7}), Value()}),
+        Row({Value(), Value(int64_t{7})}), Row({Value(int64_t{7}), Value()}),
         Row({Value(), Value()})}},
-      {"double", &DoubleSchema(),
-       {Row({Value(2.5), Value(0.5)}),
-        Row({Value(0.5), Value(2.5)}),
-        Row({Value(2.5), Value(2.5)}),
-        Row({Value(), Value(2.5)}),
+      {"double",
+       &DoubleSchema(),
+       {Row({Value(2.5), Value(0.5)}), Row({Value(0.5), Value(2.5)}),
+        Row({Value(2.5), Value(2.5)}), Row({Value(), Value(2.5)}),
         Row({Value(), Value()})}},
-      {"varchar", &StringSchema(),
+      {"varchar",
+       &StringSchema(),
        {Row({TextValue("abc"), TextValue("abc")}),
         Row({TextValue("abc"), TextValue("abd")}),
         Row({TextValue("abd"), TextValue("abc")}),
         Row({TextValue(""), TextValue("abc")}),
-        Row({Value(), TextValue("abc")}),
-        Row({TextValue("abc"), Value()}),
+        Row({Value(), TextValue("abc")}), Row({TextValue("abc"), Value()}),
         Row({Value(), Value()})}},
-      {"date", &DateSchema(),
+      {"date",
+       &DateSchema(),
        {Row({Value::Date("1994-01-01"), Value::Date("1994-01-01")}),
         Row({Value::Date("1994-01-01"), Value::Date("1996-04-05")}),
         Row({Value::Date("1997-11-30"), Value::Date("1996-04-05")}),
         Row({Value(), Value::Date("1996-04-05")}),
-        Row({Value::Date("1996-04-05"), Value()}),
-        Row({Value(), Value()})}},
+        Row({Value::Date("1996-04-05"), Value()}), Row({Value(), Value()})}},
   };
   DifferentialTally tally;
   for (const Family& family : families) {
@@ -479,13 +478,13 @@ TEST(DifferentialTest, Evaluate_ComparisonMatrix_MatchesAcrossPaths) {
           ColumnValueExp(family.schema->GetColumn(1).Name().name));
       auto program = BytecodeCompiler::Compile(predicate, *family.schema);
       for (size_t r = 0; r < family.rows.size(); ++r) {
-        tally.Compare(std::string(family.type) + "/" + op_name + "/row" +
-                          std::to_string(r),
-                      DescribeRow(*family.schema, family.rows[r]),
-                      {{"ast", EvaluateAst(predicate, family.rows[r],
-                                           *family.schema)},
-                       {"bytecode", EvaluateBytecode(program, *family.schema,
-                                                     family.rows[r])}});
+        tally.Compare(
+            std::string(family.type) + "/" + op_name + "/row" +
+                std::to_string(r),
+            DescribeRow(*family.schema, family.rows[r]),
+            {{"ast", EvaluateAst(predicate, family.rows[r], *family.schema)},
+             {"bytecode",
+              EvaluateBytecode(program, *family.schema, family.rows[r])}});
       }
     }
   }
@@ -511,11 +510,11 @@ TEST(DifferentialTest, Evaluate_LogicalThreeValuedLogic_MatchesAcrossPaths) {
     Expression expr = BinaryExpressionExp(GtZero("i"), op, GtZero("j"));
     auto program = BytecodeCompiler::Compile(expr, IntSchema());
     for (size_t r = 0; r < rows.size(); ++r) {
-      tally.Compare("logic/" + op_name + "/row" + std::to_string(r),
-                    DescribeRow(IntSchema(), rows[r]),
-                    {{"ast", EvaluateAst(expr, rows[r], IntSchema())},
-                     {"bytecode",
-                      EvaluateBytecode(program, IntSchema(), rows[r])}});
+      tally.Compare(
+          "logic/" + op_name + "/row" + std::to_string(r),
+          DescribeRow(IntSchema(), rows[r]),
+          {{"ast", EvaluateAst(expr, rows[r], IntSchema())},
+           {"bytecode", EvaluateBytecode(program, IntSchema(), rows[r])}});
     }
   }
   // Constant truth table: exercises folding inside the bytecode compiler.
@@ -523,16 +522,14 @@ TEST(DifferentialTest, Evaluate_LogicalThreeValuedLogic_MatchesAcrossPaths) {
   for (const auto& [op_name, op] : operations) {
     for (const Value& left : booleans) {
       for (const Value& right : booleans) {
-        const Expression expr = BinaryExpressionExp(ConstantValueExp(left),
-                                                    op,
+        const Expression expr = BinaryExpressionExp(ConstantValueExp(left), op,
                                                     ConstantValueExp(right));
         auto program = BytecodeCompiler::Compile(expr, IntSchema());
-        tally.Compare("logic-const/" + op_name,
-                      "lhs=" + DescribeValue(left) +
-                          ",rhs=" + DescribeValue(right),
-                      {{"ast", EvaluateAst(expr, Row(), IntSchema())},
-                       {"bytecode",
-                        EvaluateBytecode(program, IntSchema(), Row())}});
+        tally.Compare(
+            "logic-const/" + op_name,
+            "lhs=" + DescribeValue(left) + ",rhs=" + DescribeValue(right),
+            {{"ast", EvaluateAst(expr, Row(), IntSchema())},
+             {"bytecode", EvaluateBytecode(program, IntSchema(), Row())}});
       }
     }
   }
@@ -540,9 +537,10 @@ TEST(DifferentialTest, Evaluate_LogicalThreeValuedLogic_MatchesAcrossPaths) {
     const Expression expr =
         UnaryExpressionExp(ConstantValueExp(child), UnaryOperation::kNot);
     auto program = BytecodeCompiler::Compile(expr, IntSchema());
-    tally.Compare("logic/not", "child=" + DescribeValue(child),
-                  {{"ast", EvaluateAst(expr, Row(), IntSchema())},
-                   {"bytecode", EvaluateBytecode(program, IntSchema(), Row())}});
+    tally.Compare(
+        "logic/not", "child=" + DescribeValue(child),
+        {{"ast", EvaluateAst(expr, Row(), IntSchema())},
+         {"bytecode", EvaluateBytecode(program, IntSchema(), Row())}});
   }
   const std::vector<std::pair<std::string, UnaryOperation>> unary_predicates{
       {"is_null", UnaryOperation::kIsNull},
@@ -553,53 +551,95 @@ TEST(DifferentialTest, Evaluate_LogicalThreeValuedLogic_MatchesAcrossPaths) {
       {"is_not_false", UnaryOperation::kIsNotFalse}};
   for (const auto& [name, op] : unary_predicates) {
     for (const Value& child : booleans) {
-      const Expression expr =
-          UnaryExpressionExp(ConstantValueExp(child), op);
+      const Expression expr = UnaryExpressionExp(ConstantValueExp(child), op);
       auto program = BytecodeCompiler::Compile(expr, IntSchema());
-      tally.Compare("logic/" + name, "child=" + DescribeValue(child),
-                    {{"ast", EvaluateAst(expr, Row(), IntSchema())},
-                     {"bytecode",
-                      EvaluateBytecode(program, IntSchema(), Row())}});
+      tally.Compare(
+          "logic/" + name, "child=" + DescribeValue(child),
+          {{"ast", EvaluateAst(expr, Row(), IntSchema())},
+           {"bytecode", EvaluateBytecode(program, IntSchema(), Row())}});
     }
   }
   tally.Summarize("logical");
 }
 
+// D7 (docs/design.md) acceptance 1 + 2: the Bytecode VM must short-circuit
+// AND/OR exactly like the AST, so an error on the right-hand side (division
+// by zero) is raised ONLY for the rows where the left operand does not
+// already decide the result.  A FALSE AND-guard must suppress the RHS error
+// and a TRUE OR-guard must suppress the RHS error.
+TEST(DifferentialTest, Evaluate_LogicalShortCircuitErrors_MatchAcrossPaths) {
+  const Expression ne0 =
+      BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kNotEquals,
+                          ConstantValueExp(Value(int64_t{0})));
+  const Expression divj =
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{10})),
+                          BinaryOperation::kDivide, ColumnValueExp("j"));
+  const Expression rhs = BinaryExpressionExp(
+      divj, BinaryOperation::kGreaterThan, ConstantValueExp(Value(int64_t{1})));
+  const std::vector<Expression> guards{
+      BinaryExpressionExp(ne0, BinaryOperation::kAnd, rhs),
+      BinaryExpressionExp(ne0, BinaryOperation::kOr, rhs),
+  };
+  // i=0 decides AND (skip rhs), i≠0 decides OR (skip rhs); j=0 is the
+  // throwing RHS cell; NULL i / NULL j exercise the three-valued rows.
+  const std::vector<Row> rows{
+      Row({Value(int64_t{0}), Value(int64_t{0})}),  // AND skips the throw
+      Row({Value(int64_t{5}), Value(int64_t{0})}),  // OR skips the throw
+      Row({Value(int64_t{5}), Value(int64_t{2})}),
+      Row({Value(int64_t{0}), Value(int64_t{2})}),
+      Row({Value(), Value(int64_t{0})}),  // NULL lhs: rhs runs
+      Row({Value(), Value(int64_t{2})}),
+      Row({Value(int64_t{5}), Value()}),  // rhs NULL compares NULL
+      Row({Value(), Value()}),
+  };
+  DifferentialTally tally;
+  for (const Expression& expr : guards) {
+    auto program = BytecodeCompiler::Compile(expr, IntSchema());
+    for (size_t r = 0; r < rows.size(); ++r) {
+      tally.Compare(
+          "shortcircuit/row" + std::to_string(r),
+          DescribeRow(IntSchema(), rows[r]),
+          {{"ast", EvaluateAst(expr, rows[r], IntSchema())},
+           {"bytecode", EvaluateBytecode(program, IntSchema(), rows[r])}});
+    }
+  }
+  tally.Summarize("logical short-circuit");
+}
 
 TEST(DifferentialTest, Evaluate_LikePatterns_MatchesAcrossPaths) {
-  const std::vector<const char*> patterns{
-      "abc", "a%", "%c", "a%c", "_bc", "%", "ab_", "a_c"};
-  const std::vector<Value> values{
-      TextValue("abc"), TextValue("abd"), TextValue(""), Value()};
+  const std::vector<const char*> patterns{"abc", "a%", "%c",  "a%c",
+                                          "_bc", "%",  "ab_", "a_c"};
+  const std::vector<Value> values{TextValue("abc"), TextValue("abd"),
+                                  TextValue(""), Value()};
   DifferentialTally tally;
   size_t cell = 0;
   for (const char* pattern : patterns) {
-    const Expression expr = BinaryExpressionExp(
-        ColumnValueExp("s"), BinaryOperation::kLike,
-        ConstantValueExp(TextValue(pattern)));
+    const Expression expr =
+        BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kLike,
+                            ConstantValueExp(TextValue(pattern)));
     auto program = BytecodeCompiler::Compile(expr, StringSchema());
     for (const Value& value : values) {
       const Row row({value, TextValue("unused")});
-      tally.Compare("like/cell" + std::to_string(cell++),
-                    "s=" + DescribeValue(value) + ",pattern=" + pattern,
-                    {{"ast", EvaluateAst(expr, row, StringSchema())},
-                     {"bytecode", EvaluateBytecode(program, StringSchema(),
-                                                   row)}});
+      tally.Compare(
+          "like/cell" + std::to_string(cell++),
+          "s=" + DescribeValue(value) + ",pattern=" + pattern,
+          {{"ast", EvaluateAst(expr, row, StringSchema())},
+           {"bytecode", EvaluateBytecode(program, StringSchema(), row)}});
     }
   }
   const std::vector<const char*> not_like_patterns{"abc", "a%", "%c"};
   for (const char* pattern : not_like_patterns) {
-    const Expression expr = BinaryExpressionExp(
-        ColumnValueExp("s"), BinaryOperation::kNotLike,
-        ConstantValueExp(TextValue(pattern)));
+    const Expression expr =
+        BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kNotLike,
+                            ConstantValueExp(TextValue(pattern)));
     auto program = BytecodeCompiler::Compile(expr, StringSchema());
     for (const Value& value : values) {
       const Row row({value, TextValue("unused")});
-      tally.Compare("not-like/cell" + std::to_string(cell++),
-                    "s=" + DescribeValue(value) + ",pattern=" + pattern,
-                    {{"ast", EvaluateAst(expr, row, StringSchema())},
-                     {"bytecode", EvaluateBytecode(program, StringSchema(),
-                                                   row)}});
+      tally.Compare(
+          "not-like/cell" + std::to_string(cell++),
+          "s=" + DescribeValue(value) + ",pattern=" + pattern,
+          {{"ast", EvaluateAst(expr, row, StringSchema())},
+           {"bytecode", EvaluateBytecode(program, StringSchema(), row)}});
     }
   }
   const std::vector<Row> pair_rows{
@@ -612,23 +652,23 @@ TEST(DifferentialTest, Evaluate_LikePatterns_MatchesAcrossPaths) {
       ColumnValueExp("s"), BinaryOperation::kLike, ColumnValueExp("t"));
   auto like_program = BytecodeCompiler::Compile(like_column, StringSchema());
   for (size_t r = 0; r < pair_rows.size(); ++r) {
-    tally.Compare("like/columns/row" + std::to_string(r),
-                  DescribeRow(StringSchema(), pair_rows[r]),
-                  {{"ast", EvaluateAst(like_column, pair_rows[r],
-                                       StringSchema())},
-                   {"bytecode", EvaluateBytecode(like_program, StringSchema(),
-                                                 pair_rows[r])}});
+    tally.Compare(
+        "like/columns/row" + std::to_string(r),
+        DescribeRow(StringSchema(), pair_rows[r]),
+        {{"ast", EvaluateAst(like_column, pair_rows[r], StringSchema())},
+         {"bytecode",
+          EvaluateBytecode(like_program, StringSchema(), pair_rows[r])}});
   }
   // Non-string operand: both paths must raise the unified message.
   const Row bad_row({Value(int64_t{5}), Value()});
-  const Expression like_int = BinaryExpressionExp(
-      ColumnValueExp("i"), BinaryOperation::kLike,
-      ConstantValueExp(TextValue("a%")));
+  const Expression like_int =
+      BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kLike,
+                          ConstantValueExp(TextValue("a%")));
   auto bad_program = BytecodeCompiler::Compile(like_int, IntSchema());
-  tally.Compare("like/non-string", "i=5,pattern=a%",
-                {{"ast", EvaluateAst(like_int, bad_row, IntSchema())},
-                 {"bytecode",
-                  EvaluateBytecode(bad_program, IntSchema(), bad_row)}});
+  tally.Compare(
+      "like/non-string", "i=5,pattern=a%",
+      {{"ast", EvaluateAst(like_int, bad_row, IntSchema())},
+       {"bytecode", EvaluateBytecode(bad_program, IntSchema(), bad_row)}});
   tally.Summarize("like");
 }
 
@@ -641,28 +681,25 @@ TEST(DifferentialTest, Evaluate_StringConcatenation_MatchesAcrossPaths) {
       Row({TextValue(""), TextValue("x")}),
   };
   DifferentialTally tally;
-  const Expression concat = BinaryExpressionExp(ColumnValueExp("s"),
-                                                BinaryOperation::kAdd,
-                                                ColumnValueExp("t"));
+  const Expression concat = BinaryExpressionExp(
+      ColumnValueExp("s"), BinaryOperation::kAdd, ColumnValueExp("t"));
   auto program = BytecodeCompiler::Compile(concat, StringSchema());
   for (size_t r = 0; r < rows.size(); ++r) {
-    tally.Compare("concat/row" + std::to_string(r),
-                  DescribeRow(StringSchema(), rows[r]),
-                  {{"ast", EvaluateAst(concat, rows[r], StringSchema())},
-                   {"bytecode",
-                    EvaluateBytecode(program, StringSchema(), rows[r])}});
+    tally.Compare(
+        "concat/row" + std::to_string(r), DescribeRow(StringSchema(), rows[r]),
+        {{"ast", EvaluateAst(concat, rows[r], StringSchema())},
+         {"bytecode", EvaluateBytecode(program, StringSchema(), rows[r])}});
   }
   const Schema mixed_schema("mixed", {Column("i", ValueType::kInt64),
                                       Column("s", ValueType::kVarChar)});
   const Row mixed({Value(int64_t{5}), TextValue("x")});
-  const Expression mixed_expr = BinaryExpressionExp(ColumnValueExp("i"),
-                                                    BinaryOperation::kAdd,
-                                                    ColumnValueExp("s"));
+  const Expression mixed_expr = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kAdd, ColumnValueExp("s"));
   auto mixed_program = BytecodeCompiler::Compile(mixed_expr, mixed_schema);
-  tally.Compare("concat/mixed-type", DescribeRow(mixed_schema, mixed),
-                {{"ast", EvaluateAst(mixed_expr, mixed, mixed_schema)},
-                 {"bytecode", EvaluateBytecode(mixed_program, mixed_schema,
-                                               mixed)}});
+  tally.Compare(
+      "concat/mixed-type", DescribeRow(mixed_schema, mixed),
+      {{"ast", EvaluateAst(mixed_expr, mixed, mixed_schema)},
+       {"bytecode", EvaluateBytecode(mixed_program, mixed_schema, mixed)}});
   tally.Summarize("concat");
 }
 
@@ -727,18 +764,21 @@ TEST(DifferentialTest, Evaluate_DateFunctions_MatchesAcrossPaths) {
        FunctionCallExp("extract_year", {ConstantValueExp(Value())})},
   };
   const std::vector<std::optional<Value>> oracles{
-      TextValue("1995-01-01"), TextValue("1998-09-18"), Value(),
-      Value(int64_t{1996}),    Value(int64_t{7}),       Value(int64_t{15}),
+      TextValue("1995-01-01"),
+      TextValue("1998-09-18"),
+      Value(),
+      Value(int64_t{1996}),
+      Value(int64_t{7}),
+      Value(int64_t{15}),
       Value(),
   };
   for (size_t c = 0; c < folded.size(); ++c) {
     auto program = BytecodeCompiler::Compile(folded[c].second, DateSchema());
-    tally.Compare(folded[c].first, "literal",
-                  {{"ast",
-                    EvaluateAst(folded[c].second, empty_row, DateSchema())},
-                   {"bytecode", EvaluateBytecode(program, DateSchema(),
-                                                 empty_row)}},
-                  oracles[c]);
+    tally.Compare(
+        folded[c].first, "literal",
+        {{"ast", EvaluateAst(folded[c].second, empty_row, DateSchema())},
+         {"bytecode", EvaluateBytecode(program, DateSchema(), empty_row)}},
+        oracles[c]);
   }
 
   // Column argument: function shapes are bytecode-unsupported today; the
@@ -769,13 +809,13 @@ TEST(DifferentialTest, Evaluate_DateFunctions_MatchesAcrossPaths) {
     auto program =
         BytecodeCompiler::Compile(column_forms[c].second, DateSchema());
     for (size_t r = 0; r < date_rows.size(); ++r) {
-      tally.Compare(column_forms[c].first + "/row" + std::to_string(r),
-                    DescribeRow(DateSchema(), date_rows[r]),
-                    {{"ast", EvaluateAst(column_forms[c].second, date_rows[r],
-                                         DateSchema())},
-                     {"bytecode", EvaluateBytecode(program, DateSchema(),
-                                                   date_rows[r])}},
-                    column_oracles[c][r]);
+      tally.Compare(
+          column_forms[c].first + "/row" + std::to_string(r),
+          DescribeRow(DateSchema(), date_rows[r]),
+          {{"ast",
+            EvaluateAst(column_forms[c].second, date_rows[r], DateSchema())},
+           {"bytecode", EvaluateBytecode(program, DateSchema(), date_rows[r])}},
+          column_oracles[c][r]);
     }
   }
 
@@ -788,7 +828,8 @@ TEST(DifferentialTest, Evaluate_DateFunctions_MatchesAcrossPaths) {
   tally.Summarize("date-functions");
 }
 
-TEST(DifferentialTest, CompileFilter_SupportedOperations_MatchesAstAndBytecode) {
+TEST(DifferentialTest,
+     CompileFilter_SupportedOperations_MatchesAstAndBytecode) {
   const std::vector<std::pair<std::string, BinaryOperation>> operations{
       {"eq", BinaryOperation::kEquals},
       {"ne", BinaryOperation::kNotEquals},
@@ -833,7 +874,8 @@ TEST(DifferentialTest, CompileFilter_SupportedOperations_MatchesAstAndBytecode) 
   }
 }
 
-TEST(DifferentialTest, CompileProjection_LinearTransformation_MatchesAstAndBytecode) {
+TEST(DifferentialTest,
+     CompileProjection_LinearTransformation_MatchesAstAndBytecode) {
   const auto jit = JitInt64Kernels::CompileProjection();
   if (!jit.has_value()) {
     GTEST_SKIP() << "JIT projection kernel unavailable (LLVM disabled)";
@@ -866,12 +908,12 @@ TEST(DifferentialTest, CompileProjection_LinearTransformation_MatchesAstAndBytec
 // messages/semantics wherever the intent was identical (LIKE message, modulo
 // by zero message, unary-minus overflow guard).  These cells assert the newly
 // unified behaviour so it cannot drift back.
-TEST(DifferentialTest, EvaluateDetailPath_CommonExpressions_AgreesWithCanonicalEvaluator) {
+TEST(DifferentialTest,
+     EvaluateDetailPath_CommonExpressions_AgreesWithCanonicalEvaluator) {
   const Schema& schema = IntSchema();
   const Row zero_division({Value(int64_t{5}), Value(int64_t{0})});
-  const Expression modulo_zero = BinaryExpressionExp(ColumnValueExp("i"),
-                                                     BinaryOperation::kModulo,
-                                                     ColumnValueExp("j"));
+  const Expression modulo_zero = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kModulo, ColumnValueExp("j"));
   const Attempt ast_mod = EvaluateAst(modulo_zero, zero_division, schema);
   const Attempt detail_mod =
       EvaluateDetailPath(modulo_zero, zero_division, schema);
@@ -892,8 +934,7 @@ TEST(DifferentialTest, EvaluateDetailPath_CommonExpressions_AgreesWithCanonicalE
   // relational_detail interpreter.
   const Row case_row({Value(int64_t{9}), Value(int64_t{0})});
   const Expression selected = CaseExpressionExp(
-      {{BinaryExpressionExp(ColumnValueExp("i"),
-                            BinaryOperation::kGreaterThan,
+      {{BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,
                             ConstantValueExp(Value(int64_t{3}))),
         ConstantValueExp(Value(int64_t{10}))}},
       ConstantValueExp(Value(int64_t{20})));
@@ -903,8 +944,7 @@ TEST(DifferentialTest, EvaluateDetailPath_CommonExpressions_AgreesWithCanonicalE
   const Schema& dates = DateSchema();
   const Row date_row({Value::Date("1994-01-01"), Value::Date("1996-04-05")});
   const Expression add_year = FunctionCallExp(
-      "date_add",
-      {ColumnValueExp("d"), IntervalExpressionExp(1, "year")});
+      "date_add", {ColumnValueExp("d"), IntervalExpressionExp(1, "year")});
   const Attempt detail_date = EvaluateDetailPath(add_year, date_row, dates);
   ASSERT_EQ(detail_date.kind, Attempt::Kind::kValue);
   EXPECT_TRUE(SameValue(detail_date.value, Value::Date("1995-01-01")));
@@ -936,12 +976,10 @@ TEST(DifferentialTest, EvaluateDetailPath_ThreeValuedLogic_MatchesCanonical) {
       Row({Value(), Value(int64_t{0})}),            // N F
       Row({Value(), Value()}),                      // N N
   };
-  const Expression conjunction = BinaryExpressionExp(ColumnValueExp("i"),
-                                                     BinaryOperation::kAnd,
-                                                     ColumnValueExp("j"));
-  const Expression disjunction = BinaryExpressionExp(ColumnValueExp("i"),
-                                                     BinaryOperation::kOr,
-                                                     ColumnValueExp("j"));
+  const Expression conjunction = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kAnd, ColumnValueExp("j"));
+  const Expression disjunction = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kOr, ColumnValueExp("j"));
   const Expression negation =
       UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kNot);
   for (size_t r = 0; r < rows.size(); ++r) {
@@ -955,7 +993,8 @@ TEST(DifferentialTest, EvaluateDetailPath_ThreeValuedLogic_MatchesCanonical) {
       if (detail.kind == ast.kind && ast.kind == Attempt::Kind::kValue) {
         EXPECT_TRUE(SameValue(detail.value, ast.value))
             << "[differential][MISMATCH] " << name << " [" << input
-            << "] canonical=" << Describe(ast) << " detail=" << Describe(detail);
+            << "] canonical=" << Describe(ast)
+            << " detail=" << Describe(detail);
       }
     }
     const Attempt ast_not = EvaluateAst(negation, rows[r], schema);
@@ -979,9 +1018,8 @@ TEST(DifferentialTest, EvaluateDetailPath_ThreeValuedLogic_MatchesCanonical) {
 TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   const Schema& schema = IntSchema();
   const Row seven_three({Value(int64_t{7}), Value(int64_t{3})});
-  const Expression division = BinaryExpressionExp(ColumnValueExp("i"),
-                                                  BinaryOperation::kDivide,
-                                                  ColumnValueExp("j"));
+  const Expression division = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kDivide, ColumnValueExp("j"));
   const Attempt detail_div = EvaluateDetailPath(division, seven_three, schema);
   const Attempt ast_div = EvaluateAst(division, seven_three, schema);
   EXPECT_EQ(detail_div.kind, Attempt::Kind::kValue);
@@ -991,9 +1029,8 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
       << "int/int division must produce double like the canonical evaluator";
 
   const Row max_one({Value(kInt64Max), Value(int64_t{1})});
-  const Expression overflow_add = BinaryExpressionExp(ColumnValueExp("i"),
-                                                      BinaryOperation::kAdd,
-                                                      ColumnValueExp("j"));
+  const Expression overflow_add = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kAdd, ColumnValueExp("j"));
   const Attempt detail_add = EvaluateDetailPath(overflow_add, max_one, schema);
   const Attempt ast_add = EvaluateAst(overflow_add, max_one, schema);
   EXPECT_EQ(detail_add.kind, Attempt::Kind::kThrow);
@@ -1011,8 +1048,41 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   EXPECT_EQ(detail_extreme.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(ast_extreme.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_extreme.exception, ast_extreme.exception);
-  EXPECT_EQ(detail_extreme.note, ast_extreme.note)
-      << "INT64_MIN % -1 message";
+  EXPECT_EQ(detail_extreme.note, ast_extreme.note) << "INT64_MIN % -1 message";
+}
+
+TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
+  // Fixed: the wrapping JIT kernels returned wrapped values where the AST
+  // throws. The checked kernels must report overflow on the same inputs.
+  const auto sum = JitInt64Kernels::CompileSumChecked();
+  if (!sum.has_value()) {
+    GTEST_SKIP() << "checked JIT sum kernel unavailable (LLVM disabled)";
+  }
+  {
+    const int64_t inputs[] = {std::numeric_limits<int64_t>::max(), int64_t{1}};
+    bool overflowed = false;
+    (void)sum->SumChecked(inputs, 2, &overflowed);
+    EXPECT_TRUE(overflowed);
+  }
+  {
+    const int64_t inputs[] = {int64_t{1}, int64_t{2}};
+    bool overflowed = true;
+    (void)sum->SumChecked(inputs, 2, &overflowed);
+    EXPECT_FALSE(overflowed);
+  }
+  const auto proj = JitInt64Kernels::CompileProjectionChecked();
+  if (!proj.has_value()) {
+    GTEST_SKIP() << "checked JIT projection kernel unavailable";
+  }
+  {
+    const int64_t input = std::numeric_limits<int64_t>::max();
+    int64_t output = 0;
+    bool mul_of = false;
+    bool add_of = false;
+    proj->ProjectChecked(&input, &output, 1, int64_t{2}, int64_t{0}, &mul_of,
+                         &add_of);
+    EXPECT_TRUE(mul_of);
+  }
 }
 
 TEST(DifferentialTest, EvaluateDetailPath_ConcatNull_MatchesCanonical) {

@@ -16,15 +16,15 @@
 
 #include "table/full_scan_iterator.hpp"
 
-#include <optional>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string_view>
-#include <vector>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
@@ -110,16 +110,18 @@ FullScanIterator::FullScanIterator(
       key_filter_(key_filter),
       key_column_(key_column),
       peek_compares_(peek_compares) {
-  if (!pos_.IsValid()) { return;
-}
+  if (!pos_.IsValid()) {
+    return;
+  }
   page_ = std::make_unique<PageRef>(
       txn->GetPageManager()->GetPage(pos_.page_id, /*shared=*/true));
   SeekVisibleRow();
 }
 
 IteratorBase& FullScanIterator::operator++() {
-  if (!pos_.IsValid()) { return *this;
-}
+  if (!pos_.IsValid()) {
+    return *this;
+  }
   ++pos_.slot;
   if (page_ == nullptr) {
     page_ = std::make_unique<PageRef>(
@@ -208,8 +210,9 @@ void FullScanIterator::SeekVisibleRow() {
       }
       ++pos_.slot;
     }
-    if (!AdvancePage()) { break;
-}
+    if (!AdvancePage()) {
+      break;
+    }
   }
   pos_.page_id = ~0ULL;
   current_row_.Clear();
@@ -219,14 +222,16 @@ bool FullScanIterator::AdvancePage() {
   page_id_t next_page = 0;
   if (pages_) {
     ++page_index_;
-    if (page_index_ < pages_->size()) { next_page = (*pages_)[page_index_];
-}
+    if (page_index_ < pages_->size()) {
+      next_page = (*pages_)[page_index_];
+    }
   } else {
     next_page = (*page_)->body.row_page.next_page_id_;
   }
   page_.reset();
-  if (next_page == 0) { return false;
-}
+  if (next_page == 0) {
+    return false;
+  }
   pos_ = RowPosition(next_page, 0);
   page_ = std::make_unique<PageRef>(
       txn_->GetPageManager()->GetPage(next_page, /*shared=*/true));

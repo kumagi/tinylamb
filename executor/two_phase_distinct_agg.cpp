@@ -128,8 +128,7 @@ TwoPhaseDistinctAgg::TwoPhaseDistinctAgg(
                                                 input_schema_)) {}
 
 TwoPhaseDistinctAgg::TwoPhaseDistinctAgg(
-    Executor child, Schema input_schema,
-    std::vector<Expression> group_by_keys,
+    Executor child, Schema input_schema, std::vector<Expression> group_by_keys,
     std::vector<NamedExpression> aggregates)
     : child_(std::move(child)),
       input_schema_(std::move(input_schema)),
@@ -138,8 +137,8 @@ TwoPhaseDistinctAgg::TwoPhaseDistinctAgg(
     group_by_keys_.emplace_back("group_key_" + std::to_string(i),
                                 std::move(group_by_keys[i]));
   }
-  output_schema_ = MakeTwoPhaseDistinctSchema(group_by_keys_, aggregates_,
-                                              input_schema_);
+  output_schema_ =
+      MakeTwoPhaseDistinctSchema(group_by_keys_, aggregates_, input_schema_);
 }
 
 void TwoPhaseDistinctAgg::Materialize() {
@@ -175,7 +174,8 @@ void TwoPhaseDistinctAgg::Materialize() {
 
   const size_t g_count = group_by_keys_.size();
 
-  // Phase 1: Group by key + distinct column to eliminate duplicate (group_key, distinct_val)
+  // Phase 1: Group by key + distinct column to eliminate duplicate (group_key,
+  // distinct_val)
   Row in_row;
   RowPosition pos;
   while (child_->Next(&in_row, &pos)) {
@@ -244,16 +244,14 @@ void TwoPhaseDistinctAgg::Materialize() {
             }
             break;
           case AggregationType::kMin:
-            if (!val.IsNull() &&
-                (curr_state->non_distinct_mins[i].IsNull() ||
-                 val < curr_state->non_distinct_mins[i])) {
+            if (!val.IsNull() && (curr_state->non_distinct_mins[i].IsNull() ||
+                                  val < curr_state->non_distinct_mins[i])) {
               curr_state->non_distinct_mins[i] = val;
             }
             break;
           case AggregationType::kMax:
-            if (!val.IsNull() &&
-                (curr_state->non_distinct_maxs[i].IsNull() ||
-                 curr_state->non_distinct_maxs[i] < val)) {
+            if (!val.IsNull() && (curr_state->non_distinct_maxs[i].IsNull() ||
+                                  curr_state->non_distinct_maxs[i] < val)) {
               curr_state->non_distinct_maxs[i] = val;
             }
             break;
@@ -270,7 +268,8 @@ void TwoPhaseDistinctAgg::Materialize() {
     }
   }
 
-  // Phase 2: Finalize aggregation over deduplicated distinct sets and non-distinct partials
+  // Phase 2: Finalize aggregation over deduplicated distinct sets and
+  // non-distinct partials
   auto emit_group = [&](const Row* key, const GroupState& s) {
     std::vector<Value> row_vals;
     if (key != nullptr) {
@@ -361,8 +360,8 @@ void TwoPhaseDistinctAgg::Materialize() {
             } else {
               double total = 0.0;
               if (s.non_distinct_sums[i].type == ValueType::kInt64) {
-                total = static_cast<double>(
-                    s.non_distinct_sums[i].value.int_value);
+                total =
+                    static_cast<double>(s.non_distinct_sums[i].value.int_value);
               } else if (s.non_distinct_sums[i].type == ValueType::kDouble) {
                 total = s.non_distinct_sums[i].value.double_value;
               }

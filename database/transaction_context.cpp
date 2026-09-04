@@ -19,37 +19,42 @@
 //
 
 #include "database/transaction_context.hpp"
+
 #include <memory>
-#include <string_view>
+#include <ostream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
-#include <ostream>
 
 #include "common/status_or.hpp"
 #include "database/catalog_reader.hpp"
 
 namespace tinylamb {
-StatusOr<std::shared_ptr<Table> > TransactionContext::GetTable(
+StatusOr<std::shared_ptr<Table>> TransactionContext::GetTable(
     std::string_view table_name) {
   auto it = tables_.find(std::string(table_name));
   if (it != tables_.end()) {
     return it->second;
   }
-  if (catalog_ == nullptr) { return Status::kNotExists; }
+  if (catalog_ == nullptr) {
+    return Status::kNotExists;
+  }
   ASSIGN_OR_RETURN(Table, tbl, catalog_->GetTable(*this, table_name));
   auto result =
       tables_.emplace(table_name, std::make_shared<Table>(std::move(tbl)));
   return result.first->second;
 }
 
-StatusOr<std::shared_ptr<TableStatistics> > TransactionContext::GetStats(
+StatusOr<std::shared_ptr<TableStatistics>> TransactionContext::GetStats(
     std::string_view table_name) {
   auto it = stats_.find(std::string(table_name));
   if (it != stats_.end()) {
     return it->second;
   }
-  if (catalog_ == nullptr) { return Status::kNotExists; }
+  if (catalog_ == nullptr) {
+    return Status::kNotExists;
+  }
   struct ThreadStatsCache {
     CatalogReader* owner{nullptr};
     uint64_t epoch{0};

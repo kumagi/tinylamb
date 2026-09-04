@@ -2,14 +2,14 @@
 #include "expression/bytecode.hpp"
 
 #include <cassert>
-#include <cstdint>
-#include <optional>
-#include <exception>
 #include <cstddef>
-#include <stdexcept>
+#include <cstdint>
+#include <exception>
 #include <limits>
-#include <vector>
+#include <optional>
+#include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
@@ -19,9 +19,9 @@
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
-#include "type/value_type.hpp"
-#include "type/type.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -67,18 +67,18 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       const int offset =
           schema.Offset(expression->AsColumnValue().GetColumnName());
       if (offset < 0 ||
-          std::cmp_greater(offset,
-                           std::numeric_limits<uint16_t>::max())) {
+          std::cmp_greater(offset, std::numeric_limits<uint16_t>::max())) {
         return false;
       }
-      program->AddInstruction(
-          {.opcode=BytecodeOp::kLoadColumn, .operand=static_cast<uint16_t>(offset)});
+      program->AddInstruction({.opcode = BytecodeOp::kLoadColumn,
+                               .operand = static_cast<uint16_t>(offset)});
       return true;
     }
     case TypeTag::kConstantValue: {
       const uint16_t offset =
           program->AddConstant(expression->AsConstantValue().GetValue());
-      program->AddInstruction({.opcode=BytecodeOp::kLoadConstant, .operand=offset});
+      program->AddInstruction(
+          {.opcode = BytecodeOp::kLoadConstant, .operand = offset});
       return true;
     }
     case TypeTag::kBinaryExp: {
@@ -96,16 +96,19 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       // pop), so every path reaches `end` with exactly one value.
       if (binary.Op() == BinaryOperation::kAnd ||
           binary.Op() == BinaryOperation::kOr) {
-        if (!CompileNode(binary.Left(), schema, program)) { return false;
-}
+        if (!CompileNode(binary.Left(), schema, program)) {
+          return false;
+        }
         const size_t jump_index = program->Size();
         program->AddInstruction({.opcode = binary.Op() == BinaryOperation::kAnd
-                                              ? BytecodeOp::kJumpIfFalse
-                                              : BytecodeOp::kJumpIfTrue});
-        if (!CompileNode(binary.Right(), schema, program)) { return false;
-}
-        program->AddInstruction(
-            {.opcode=BytecodeOp::kBinaryInt64, .operand=0, .binary=binary.Op()});
+                                               ? BytecodeOp::kJumpIfFalse
+                                               : BytecodeOp::kJumpIfTrue});
+        if (!CompileNode(binary.Right(), schema, program)) {
+          return false;
+        }
+        program->AddInstruction({.opcode = BytecodeOp::kBinaryInt64,
+                                 .operand = 0,
+                                 .binary = binary.Op()});
         // Patch: jump lands just past the merge instruction.
         program->SetJumpTarget(jump_index,
                                static_cast<int32_t>(program->Size()) -
@@ -116,35 +119,44 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
           !CompileNode(binary.Right(), schema, program)) {
         return false;
       }
-      const ValueType left_type = ValueTypeFor(binary.Left()->ResultType(schema));
-      const ValueType right_type = ValueTypeFor(binary.Right()->ResultType(schema));
+      const ValueType left_type =
+          ValueTypeFor(binary.Left()->ResultType(schema));
+      const ValueType right_type =
+          ValueTypeFor(binary.Right()->ResultType(schema));
       if (binary.Op() == BinaryOperation::kLike ||
           binary.Op() == BinaryOperation::kNotLike) {
-        if (left_type != ValueType::kVarChar || right_type != ValueType::kVarChar) {
+        if (left_type != ValueType::kVarChar ||
+            right_type != ValueType::kVarChar) {
           return false;
         }
       }
       ValueType operand_type = left_type;
-      if (operand_type == ValueType::kDouble || right_type == ValueType::kDouble) {
+      if (operand_type == ValueType::kDouble ||
+          right_type == ValueType::kDouble) {
         operand_type = ValueType::kDouble;
       }
-      program->AddInstruction(
-          {.opcode=BinaryOpcode(operand_type), .operand=0, .binary=binary.Op()});
+      program->AddInstruction({.opcode = BinaryOpcode(operand_type),
+                               .operand = 0,
+                               .binary = binary.Op()});
       return true;
     }
     case TypeTag::kUnaryExp: {
       const UnaryExpression& unary = expression->AsUnaryExpression();
-      if (!CompileNode(unary.Child(), schema, program)) { return false;
-}
-      const ValueType operand_type = ValueTypeFor(unary.Child()->ResultType(schema));
+      if (!CompileNode(unary.Child(), schema, program)) {
+        return false;
+      }
+      const ValueType operand_type =
+          ValueTypeFor(unary.Child()->ResultType(schema));
       if (operand_type != ValueType::kInt64 &&
           operand_type != ValueType::kDouble) {
         return false;
       }
-      program->AddInstruction(
-          {.opcode=operand_type == ValueType::kDouble ? BytecodeOp::kUnaryDouble
-                                              : BytecodeOp::kUnaryInt64,
-           .operand=0, .binary=BinaryOperation::kAdd, .unary=unary.Op()});
+      program->AddInstruction({.opcode = operand_type == ValueType::kDouble
+                                             ? BytecodeOp::kUnaryDouble
+                                             : BytecodeOp::kUnaryInt64,
+                               .operand = 0,
+                               .binary = BinaryOperation::kAdd,
+                               .unary = unary.Op()});
       return true;
     }
     default:
@@ -160,11 +172,13 @@ std::optional<BytecodeProgram> BytecodeCompiler::Compile(
     const Expression folded =
         ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
     BytecodeProgram program;
-    if (!CompileNode(folded, schema, &program)) { return std::nullopt;
-}
+    if (!CompileNode(folded, schema, &program)) {
+      return std::nullopt;
+    }
     const ValueType result_type = ValueTypeFor(folded->ResultType(schema));
-    if (result_type == ValueType::kNull) { return std::nullopt;
-}
+    if (result_type == ValueType::kNull) {
+      return std::nullopt;
+    }
     program.SetResultType(result_type);
     return program;
   } catch (const std::exception&) {
@@ -195,10 +209,9 @@ ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
         case BytecodeOp::kJumpIfTrue: {
           assert(!stack.empty());
           const Value& top = stack.back();
-          const bool decides =
-              instruction.opcode == BytecodeOp::kJumpIfFalse
-                  ? (!top.IsNull() && !top.Truthy())
-                  : (!top.IsNull() && top.Truthy());
+          const bool decides = instruction.opcode == BytecodeOp::kJumpIfFalse
+                                   ? (!top.IsNull() && !top.Truthy())
+                                   : (!top.IsNull() && top.Truthy());
           if (decides) {
             pc += static_cast<size_t>(instruction.jump_target);
             --pc;  // the for-loop ++pc lands on the target.
@@ -234,8 +247,9 @@ ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
         }
       }
     }
-    if (stack.size() != 1) { throw std::runtime_error("invalid bytecode stack");
-}
+    if (stack.size() != 1) {
+      throw std::runtime_error("invalid bytecode stack");
+    }
     result.Append(stack.back());
   }
   return result;
@@ -257,10 +271,9 @@ Value BytecodeProgram::EvaluateRow(const Row& row) const {
       case BytecodeOp::kJumpIfTrue: {
         assert(!stack.empty());
         const Value& top = stack.back();
-        const bool decides =
-            instruction.opcode == BytecodeOp::kJumpIfFalse
-                ? (!top.IsNull() && !top.Truthy())
-                : (!top.IsNull() && top.Truthy());
+        const bool decides = instruction.opcode == BytecodeOp::kJumpIfFalse
+                                 ? (!top.IsNull() && !top.Truthy())
+                                 : (!top.IsNull() && top.Truthy());
         if (decides) {
           pc += static_cast<size_t>(instruction.jump_target);
           --pc;
@@ -294,7 +307,9 @@ Value BytecodeProgram::EvaluateRow(const Row& row) const {
       }
     }
   }
-  if (stack.size() != 1) { throw std::runtime_error("invalid bytecode stack"); }
+  if (stack.size() != 1) {
+    throw std::runtime_error("invalid bytecode stack");
+  }
   return std::move(stack.back());
 }
 

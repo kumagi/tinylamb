@@ -12,8 +12,7 @@
 
 namespace tinylamb {
 
-ValidityBitmap::ValidityBitmap(size_t count, bool default_val)
-    : size_(count) {
+ValidityBitmap::ValidityBitmap(size_t count, bool default_val) : size_(count) {
   Reset(count, default_val);
 }
 

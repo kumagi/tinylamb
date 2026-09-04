@@ -405,11 +405,15 @@ TEST(ExpressionRewriteTest, ReferencesOnly) {
   EXPECT_FALSE(ReferencesOnly(qualified_expr, {"other"}));
 }
 
-TEST(ExpressionRewriteTest, NonConvergingRewriteThrows) {
+TEST(ExpressionRewriteTest, NonConvergingRewriteReturnsLastStableForm) {
+  // D6 (docs/design.md): the pass cap is a safety net, not a rejection
+  // mechanism.  A pathological rule set must not turn "no fixed point" into
+  // a runtime failure: Rewrite returns the last stable form instead.
   using namespace expression_dsl;
   ExpressionRuleSet rules;
   // Toggle the constant between 0 and 1 forever: the expression never
-  // stabilizes, so the 32-pass budget is exhausted and Rewrite throws.
+  // stabilizes, so the 32-pass budget is exhausted and Rewrite returns the
+  // final form without throwing.
   rules.Add(ExpressionRule(
       "toggle", Is(TypeTag::kConstantValue),
       [](const Expression& expression, const ExpressionBindings&) {
@@ -418,10 +422,11 @@ TEST(ExpressionRewriteTest, NonConvergingRewriteThrows) {
         }
         return ConstantValueExp(Value(1));
       }));
-  EXPECT_THROW(
-      (void)ExpressionRewriter(rules)
-          .Rewrite(ConstantValueExp(Value(1))),
-      std::runtime_error);
+  Expression result;
+  EXPECT_NO_THROW(result = ExpressionRewriter(rules).Rewrite(
+                      ConstantValueExp(Value(1))));
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->Type(), TypeTag::kConstantValue);
 }
 
 TEST(ExpressionRewriteTest, DeeplyNestedExpressionThrowsInsteadOfCrashing) {
@@ -731,6 +736,174 @@ TEST(ExpressionRewriteTest, SchemaFreeSelfComparisonKeepsThreeValuedResult) {
   EXPECT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
   EXPECT_EQ(rewritten->AsBinaryExpression().Op(),
             BinaryOperation::kLessThan);
+}
+
+TEST(ExpressionRewriteTest, TypedSignAbsorptionAndRepeatedAddend) {
+  const Schema schema(
+      "input", {Column("i", ValueType::kInt64),
+                Column("d", ValueType::kDouble),
+                Column("s", ValueType::kVarChar)});
+  auto rewritten = [&schema](const Expression& expression) {
+    return RewriteTypedArithmetic(expression, schema);
+  };
+
+  // (-1 * i) and (i * -1) fold to unary minus; NULLs propagate unchanged.
+  for (const BinaryOperation op :
+       {BinaryOperation::kMultiply, BinaryOperation::kMultiply}) {
+    const Expression left_constant = BinaryExpressionExp(
+        ConstantValueExp(Value(-1)), op, ColumnValueExp(ColumnName("input", "i")));
+    const Expression folded = rewritten(left_constant);
+    ASSERT_EQ(folded->Type(), TypeTag::kUnaryExp) << folded->ToString();
+    EXPECT_EQ(folded->AsUnaryExpression().Op(), UnaryOperation::kMinus);
+    EXPECT_EQ(folded->Evaluate(Row({Value(7), Value(2.5), Value("s")}), schema),
+              Value(-7));
+    EXPECT_TRUE(folded->Evaluate(Row({Value(), Value(2.5), Value("s")}), schema)
+                    .IsNull());
+
+    const Expression right_constant =
+        BinaryExpressionExp(ColumnValueExp(ColumnName("input", "i")), op,
+                            ConstantValueExp(Value(-1)));
+    EXPECT_EQ(rewritten(right_constant)->Type(), TypeTag::kUnaryExp);
+  }
+
+  // Doubles absorb the sign exactly as well.
+  const Expression double_sign = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("input", "d")), BinaryOperation::kMultiply,
+      ConstantValueExp(Value(-1.0)));
+  EXPECT_EQ(rewritten(double_sign)->Type(), TypeTag::kUnaryExp);
+
+  // Non-numeric operands never fold.
+  const Expression text = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("input", "s")), BinaryOperation::kMultiply,
+      ConstantValueExp(Value(-1)));
+  EXPECT_EQ(rewritten(text)->Type(), TypeTag::kBinaryExp);
+
+  // Repeated addend doubles the operand for both numeric types.
+  const Expression int_add = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("input", "i")), BinaryOperation::kAdd,
+      ColumnValueExp(ColumnName("input", "i")));
+  const Expression doubled = rewritten(int_add);
+  ASSERT_EQ(doubled->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(doubled->AsBinaryExpression().Op(), BinaryOperation::kMultiply);
+  EXPECT_EQ(doubled->Evaluate(Row({Value(21), Value(2.5), Value("s")}), schema),
+            Value(42));
+
+  const Expression double_add = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("input", "d")), BinaryOperation::kAdd,
+      ColumnValueExp(ColumnName("input", "d")));
+  EXPECT_EQ(rewritten(double_add)->Evaluate(
+                Row({Value(1), Value(2.5), Value("s")}), schema),
+            Value(5.0));
+
+  // Volatile calls and untyped columns stay untouched.
+  const Expression volatile_add = BinaryExpressionExp(
+      FunctionCallExp("rand", {}), BinaryOperation::kAdd,
+      FunctionCallExp("rand", {}));
+  EXPECT_EQ(rewritten(volatile_add)->Type(), TypeTag::kBinaryExp);
+  const Expression unknown = BinaryExpressionExp(
+      ColumnValueExp("nope"), BinaryOperation::kAdd,
+      ColumnValueExp("nope"));
+  EXPECT_EQ(rewritten(unknown)->Type(), TypeTag::kBinaryExp);
+}
+
+TEST(ExpressionRewriteTest, TypedConstantReassociationStaysExact) {
+  const Schema schema("input", {Column("i", ValueType::kInt64),
+                                Column("d", ValueType::kDouble)});
+  const Expression a = ColumnValueExp(ColumnName("input", "i"));
+  auto rewritten = [&schema](const Expression& expression) {
+    return RewriteTypedArithmetic(expression, schema);
+  };
+  auto expect_form = [&](const Expression& tree, const BinaryOperation op,
+                         const int64_t constant) {
+    const Expression folded = rewritten(tree);
+    EXPECT_EQ(folded->Type(), TypeTag::kBinaryExp) << folded->ToString();
+    if (folded->Type() == TypeTag::kBinaryExp) {
+      EXPECT_EQ(folded->AsBinaryExpression().Op(), op);
+      EXPECT_EQ(folded->AsBinaryExpression()
+                    .Right()
+                    ->AsConstantValue()
+                    .GetValue(),
+                Value(constant))
+          << folded->ToString();
+    }
+  };
+
+  expect_form(BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kAdd,
+                                                ConstantValueExp(Value(5))),
+                                  BinaryOperation::kAdd,
+                                  ConstantValueExp(Value(3))),
+              BinaryOperation::kAdd, 8);
+  expect_form(BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kSubtract,
+                                                ConstantValueExp(Value(5))),
+                                  BinaryOperation::kSubtract,
+                                  ConstantValueExp(Value(3))),
+              BinaryOperation::kSubtract, 8);
+  expect_form(BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kAdd,
+                                                ConstantValueExp(Value(5))),
+                                  BinaryOperation::kSubtract,
+                                  ConstantValueExp(Value(8))),
+              BinaryOperation::kSubtract, 3);
+  expect_form(BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kSubtract,
+                                                ConstantValueExp(Value(5))),
+                                  BinaryOperation::kAdd,
+                                  ConstantValueExp(Value(3))),
+              BinaryOperation::kSubtract, 2);
+
+  // Chains collapse through the rewritten inner form.
+  expect_form(BinaryExpressionExp(
+                  BinaryExpressionExp(BinaryExpressionExp(
+                                          a, BinaryOperation::kAdd,
+                                          ConstantValueExp(Value(5))),
+                                      BinaryOperation::kAdd,
+                                      ConstantValueExp(Value(3))),
+                  BinaryOperation::kAdd, ConstantValueExp(Value(2))),
+              BinaryOperation::kAdd, 10);
+
+  // Results must be identical on every input, NULLs included.
+  const Expression folded =
+      rewritten(BinaryExpressionExp(BinaryExpressionExp(
+                                        a, BinaryOperation::kSubtract,
+                                        ConstantValueExp(Value(5))),
+                                    BinaryOperation::kAdd,
+                                    ConstantValueExp(Value(3))));
+  ASSERT_EQ(folded->Type(), TypeTag::kBinaryExp);
+  for (const int64_t probe : {12, 5, 0, -4}) {
+    EXPECT_EQ(folded->Evaluate(Row({Value(probe), Value(0.0)}), schema),
+              Value(probe - 2));
+  }
+  EXPECT_TRUE(folded->Evaluate(Row({Value(), Value(0.0)}), schema).IsNull());
+
+  // Multiply reassociation folds non-negative constants only.
+  expect_form(BinaryExpressionExp(BinaryExpressionExp(
+                                      a, BinaryOperation::kMultiply,
+                                      ConstantValueExp(Value(2))),
+                                  BinaryOperation::kMultiply,
+                                  ConstantValueExp(Value(3))),
+              BinaryOperation::kMultiply, 6);
+
+  // Constant combines that would overflow are skipped, not folded.
+  const int64_t max_int = std::numeric_limits<int64_t>::max();
+  const Expression overflowing =
+      BinaryExpressionExp(BinaryExpressionExp(
+                              a, BinaryOperation::kAdd,
+                              ConstantValueExp(Value(max_int))),
+                          BinaryOperation::kAdd,
+                          ConstantValueExp(Value(max_int)));
+  const Expression unchanged =
+      BinaryExpressionExp(BinaryExpressionExp(
+                              a, BinaryOperation::kAdd,
+                              ConstantValueExp(Value(max_int))),
+                          BinaryOperation::kAdd,
+                          ConstantValueExp(Value(max_int)));
+  EXPECT_EQ(rewritten(overflowing)->ToString(), unchanged->ToString());
+
+  // Floating-point trees never reassociate: rounding is not associative.
+  const Expression d = ColumnValueExp(ColumnName("input", "d"));
+  const Expression double_tree = BinaryExpressionExp(
+      BinaryExpressionExp(d, BinaryOperation::kAdd,
+                          ConstantValueExp(Value(0.5))),
+      BinaryOperation::kAdd, ConstantValueExp(Value(2)));
+  EXPECT_EQ(rewritten(double_tree)->ToString(), double_tree->ToString());
 }
 
 TEST(ExpressionRewriteTest, ReassociateConstantArithmetic) {
@@ -1188,6 +1361,33 @@ TEST(ExpressionRewriteTest, IntervalNormalize) {
   EXPECT_EQ(rewritten_ja->AsIntervalExpression().GetIntervalValue().days, 6);
   EXPECT_EQ(rewritten_ja->AsIntervalExpression().GetIntervalValue().nanos,
             6LL * 3600LL * 1000000000LL);
+
+  // Overflowing fast paths must refuse the rewrite (leaving the runtime
+  // arithmetic to throw like the AST ground truth) instead of silently
+  // wrapping through int64 arithmetic.
+  constexpr int64_t kHalfMax = std::numeric_limits<int64_t>::max() / 2;
+  Expression huge1 = IntervalExpressionExp(kHalfMax, "day");
+  Expression huge2 = IntervalExpressionExp(kHalfMax, "day");
+  Expression overflow_add =
+      BinaryExpressionExp(huge1, BinaryOperation::kAdd, huge2);
+  Expression rewritten_overflow = rewriter.Rewrite(overflow_add);
+  // Unfolded: the fast path refused, so the rewritten tree must not carry
+  // the silently wrapped amount (-2).  The parse path now preserves large
+  // day amounts exactly, and the runtime addition is the authority.
+  EXPECT_EQ(rewritten_overflow->ToString().find("-2"), std::string::npos)
+      << *rewritten_overflow;
+
+  Expression huge_scaled = IntervalExpressionExp(kHalfMax, "day");
+  Expression overflow_mul = BinaryExpressionExp(
+      huge_scaled, BinaryOperation::kMultiply,
+      ConstantValueExp(Value(int64_t{4})));
+  EXPECT_EQ(rewriter.Rewrite(overflow_mul)->Type(), TypeTag::kBinaryExp);
+
+  // Negating INT64_MIN is UB on int64; the rule must refuse it.
+  Expression min_iv =
+      IntervalExpressionExp(std::numeric_limits<int64_t>::min(), "day");
+  Expression neg_min = UnaryExpressionExp(min_iv, UnaryOperation::kMinus);
+  EXPECT_EQ(rewriter.Rewrite(neg_min)->Type(), TypeTag::kUnaryExp);
 }
 
 TEST(ExpressionRewriteTest, PredicatePushdownCase) {
@@ -1278,6 +1478,64 @@ TEST(ExpressionRewriteTest, InnerJoinNotNullInference) {
   EXPECT_TRUE(has_y_not_null);
 }
 
+TEST(ExpressionRewriteTest, NotNullInferenceIdempotentAndRootScoped) {
+  // D6 (docs/design.md) acceptance 1: rewriting the same expression twice
+  // must not change its fingerprint, and inferred predicates must appear
+  // exactly once (deduplicated by content), never re-appended from within a
+  // nested AND.
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  Expression x = ColumnValueExp("x");
+  Expression y = ColumnValueExp("y");
+  Expression z = ColumnValueExp("z");
+  Expression k = ColumnValueExp("k");
+  // ((x = y AND y = z) AND k > 5): the equalities live in a NESTED conjunct.
+  Expression inner = BinaryExpressionExp(
+      BinaryExpressionExp(x, BinaryOperation::kEquals, y),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(y, BinaryOperation::kEquals, z));
+  Expression input = BinaryExpressionExp(
+      std::move(inner), BinaryOperation::kAnd,
+      BinaryExpressionExp(k, BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{5}))));
+
+  Expression once = rewriter.Rewrite(input);
+  Expression twice = rewriter.Rewrite(once);
+  EXPECT_EQ(once->ToString(), twice->ToString());
+
+  int not_null_count = 0;
+  for (const auto& c : SplitConjuncts(once)) {
+    if (c->Type() == TypeTag::kUnaryExp &&
+        c->AsUnaryExpression().Op() == UnaryOperation::kIsNotNull) {
+      ++not_null_count;
+    }
+  }
+  // Exactly one IS NOT NULL per distinct equality operand: x, y, z.
+  EXPECT_EQ(not_null_count, 3);
+}
+
+TEST(ExpressionRewriteTest, ShortPassCapReturnsLastFormWithoutThrowing) {
+  // D6 (docs/design.md) acceptance 3: a deliberately short cap returns the
+  // last expression (semantics-preserving) instead of rejecting the query.
+  using namespace expression_dsl;
+  ExpressionRuleSet rules;
+  std::atomic<int> applications{0};
+  rules.Add(ExpressionRule(
+      "slow_chain", Is(TypeTag::kBinaryExp),
+      [&](const Expression& /*expression*/, const ExpressionBindings&) {
+        ++applications;
+        return Expression{};  // never changes anything
+      }));
+  ExpressionRewriter rewriter(rules);
+  rewriter.set_pass_limit(1);
+  Expression input = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kEquals,
+      ConstantValueExp(Value(int64_t{1})));
+  Expression result;
+  ASSERT_NO_THROW(result = rewriter.Rewrite(input));
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->ToString(), input->ToString());
+}
+
 TEST(ExpressionRewriteTest, RegexpPrefixExtraction) {
   ExpressionRewriter rewriter(ExpressionRuleSet::Default());
 
@@ -1312,56 +1570,47 @@ TEST(ExpressionRewriteTest, RegexpPrefixExtraction) {
 }
 
 TEST(ExpressionRewriteTest, CastPushdownComparison) {
+  // The cast_pushdown rule was removed: pushing a comparison through CAST
+  // without knowing the child's type changes observable behavior (DOUBLE
+  // truncation, VARCHAR parse semantics, DATE channel; a fractional
+  // equality folded to FALSE would also lose the UNKNOWN result for a NULL
+  // child).  Every shape must stay untouched.
   ExpressionRewriter rewriter(ExpressionRuleSet::Default());
-
   Expression col = ColumnValueExp("col");
 
-  // CAST(col AS DOUBLE) = 10.0 -> col = 10
-  Expression cast_double = CastExpressionExp(col, "DOUBLE");
-  Expression eq_int = BinaryExpressionExp(
-      cast_double, BinaryOperation::kEquals, ConstantValueExp(Value(10.0)));
-  Expression rewritten1 = rewriter.Rewrite(eq_int);
-  ASSERT_EQ(rewritten1->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(rewritten1->AsBinaryExpression().Op(), BinaryOperation::kEquals);
-  EXPECT_EQ(rewritten1->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
-            Value(int64_t{10}));
+  auto assert_untouched = [&](const Expression& input) {
+    Expression rewritten = rewriter.Rewrite(input);
+    EXPECT_EQ(rewritten->ToString(), input->ToString())
+        << "cast comparison must not be rewritten: " << *rewritten;
+  };
 
-  // CAST(col AS DOUBLE) = 3.5 -> false (cannot equal fractional float)
-  Expression eq_fraction = BinaryExpressionExp(
-      cast_double, BinaryOperation::kEquals, ConstantValueExp(Value(3.5)));
-  Expression rewritten2 = rewriter.Rewrite(eq_fraction);
-  ASSERT_EQ(rewritten2->Type(), TypeTag::kConstantValue);
-  EXPECT_FALSE(rewritten2->AsConstantValue().GetValue().Truthy());
-
-  // CAST(col AS DOUBLE) < 3.5 -> col <= 3
-  Expression lt_fraction = BinaryExpressionExp(
-      cast_double, BinaryOperation::kLessThan, ConstantValueExp(Value(3.5)));
-  Expression rewritten3 = rewriter.Rewrite(lt_fraction);
-  ASSERT_EQ(rewritten3->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(rewritten3->AsBinaryExpression().Op(),
-            BinaryOperation::kLessThanEquals);
-  EXPECT_EQ(rewritten3->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
-            Value(int64_t{3}));
-
-  // CAST(col AS DOUBLE) > 3.5 -> col >= 4
-  Expression gt_fraction = BinaryExpressionExp(
-      cast_double, BinaryOperation::kGreaterThan, ConstantValueExp(Value(3.5)));
-  Expression rewritten4 = rewriter.Rewrite(gt_fraction);
-  ASSERT_EQ(rewritten4->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(rewritten4->AsBinaryExpression().Op(),
-            BinaryOperation::kGreaterThanEquals);
-  EXPECT_EQ(rewritten4->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
-            Value(int64_t{4}));
-
-  // CAST(col AS INT64) = 42 -> col = 42
-  Expression cast_int = CastExpressionExp(col, "INT64");
-  Expression eq_cast_int = BinaryExpressionExp(
-      cast_int, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{42})));
-  Expression rewritten5 = rewriter.Rewrite(eq_cast_int);
-  ASSERT_EQ(rewritten5->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(rewritten5->AsBinaryExpression().Op(), BinaryOperation::kEquals);
-  EXPECT_EQ(rewritten5->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
-            Value(int64_t{42}));
+  assert_untouched(BinaryExpressionExp(CastExpressionExp(col, "DOUBLE"),
+                                       BinaryOperation::kEquals,
+                                       ConstantValueExp(Value(10.0))));
+  // A fractional constant must not fold to FALSE: CAST(NULL AS DOUBLE) = 3.5
+  // is UNKNOWN, not FALSE.
+  assert_untouched(BinaryExpressionExp(CastExpressionExp(col, "DOUBLE"),
+                                       BinaryOperation::kEquals,
+                                       ConstantValueExp(Value(3.5))));
+  assert_untouched(BinaryExpressionExp(CastExpressionExp(col, "DOUBLE"),
+                                       BinaryOperation::kNotEquals,
+                                       ConstantValueExp(Value(3.5))));
+  assert_untouched(BinaryExpressionExp(CastExpressionExp(col, "DOUBLE"),
+                                       BinaryOperation::kLessThan,
+                                       ConstantValueExp(Value(3.5))));
+  assert_untouched(BinaryExpressionExp(CastExpressionExp(col, "DOUBLE"),
+                                       BinaryOperation::kGreaterThan,
+                                       ConstantValueExp(Value(3.5))));
+  assert_untouched(BinaryExpressionExp(CastExpressionExp(col, "INT64"),
+                                       BinaryOperation::kEquals,
+                                       ConstantValueExp(Value(int64_t{42}))));
+  // A constant on the left is still canonicalized (operands swapped) but the
+  // cast must survive: no pushdown onto the bare column.
+  Expression swapped = rewriter.Rewrite(BinaryExpressionExp(
+      ConstantValueExp(Value(int64_t{42})), BinaryOperation::kEquals,
+      CastExpressionExp(col, "INT64")));
+  EXPECT_NE(swapped->ToString().find("CAST("), std::string::npos)
+      << *swapped;
 }
 
 TEST(ExpressionRewriteTest, DeterministicFunctionCse) {

@@ -23,15 +23,14 @@ a layer may only include equal or lower layers):
     common -> type -> storage(page + recovery/wal + transaction) -> index
            -> table -> database -> expression
            -> relational(executor/detail) -> plan -> executor
-           -> sql(query/, parser/) -> server
+           -> sql(query/) -> server
 
 benchmark/, main.cpp and test targets (*_test*, *_fuzzer*, *_benchmark.*) sit
-above everything and may include freely.  legacy/ is an explicit archive and
-is not checked.  page/recovery/transaction share one rank because CMake
-declares them as the single tightly-coupled Layer 3 (see CMakeLists.txt);
-splitting them apart is future work.  Known, accepted violations live in
-DEFAULT_ALLOWLIST -- shrinking that list is how layering regressions get
-paid off.
+above everything and may include freely.  page/recovery/transaction share one
+rank because CMake declares them as the single tightly-coupled Layer 3 (see
+CMakeLists.txt); splitting them apart is future work.  Known, accepted
+violations live in DEFAULT_ALLOWLIST -- shrinking that list is how layering
+regressions get paid off.
 
 Usage:
     python3 scripts/check_layering.py                # enforce (exit 0/1)
@@ -59,14 +58,14 @@ LAYERS = (
     ("relational", ("executor/detail/",)),
     ("plan", ("plan/",)),
     ("executor", ("executor/",)),
-    ("sql", ("query/", "parser/")),
+    ("sql", ("query/",)),
     ("server", ("server/",)),
 )
 RANK = {name: rank for rank, (name, _) in enumerate(LAYERS)}
 
 TOP_PREFIXES = ("benchmark/",)  # plus main.cpp and test targets, below
 TEST_PATTERN = re.compile(r"_test\.|_fuzzer|_benchmark\.")
-IGNORED_PREFIXES = ("legacy/", "scripts/", "docs/", ".git/", "build")
+IGNORED_PREFIXES = ("scripts/", "docs/", ".git/", "build")
 INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.MULTILINE)
 
 # Edges the target architecture bans outright (expression→database の逆転など).  They are
@@ -90,9 +89,7 @@ DEFAULT_ALLOWLIST = (
     "plan/product_plan.cpp -> executor/hash_join_mode.hpp",
     "plan/implementation_rules.cpp -> executor/hash_join_mode.hpp",
     # V3': statement IR が executor 層より上位にある問題。
-    #      A2-1 シム撤去前は parser/ast.hpp 経由、撤去後は直参照になるため
-    #      移行期間中は両方を許容する。
-    "executor/detail/* -> parser/ast.hpp",
+    #      移行期間中の直参照を許容する。
     "executor/detail/* -> query/statement.hpp",
     "executor/relational.cpp -> query/statement.hpp",
     # --- 構造上既知だが未対処のエッジ (潰したらこのリストから削る) -------

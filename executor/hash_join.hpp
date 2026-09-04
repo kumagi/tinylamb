@@ -138,9 +138,10 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   void SetupOneSideSpilled();
   void SetupBothSpilled();
   template <typename RightCont>
-  void JoinPartitionPair(const std::vector<std::pair<Row, RowPosition>>& left_part,
-                         const RightCont& right_part,
-                         std::vector<std::pair<Row, RowPosition>>* out);
+  void JoinPartitionPair(
+      const std::vector<std::pair<Row, RowPosition>>& left_part,
+      const RightCont& right_part,
+      std::vector<std::pair<Row, RowPosition>>* out);
   void RunStripedProbe();
   bool EmitNextMatch(Row* dst, RowPosition* rp);
 

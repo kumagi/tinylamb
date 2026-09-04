@@ -151,4 +151,77 @@ TEST(BytecodeTest, EvaluateBatch_WithInt64Comparisons_MatchesAstAndJitSemantics)
   }
 }
 
+TEST(BytecodeTest, D7_CompilesAndOrToShortCircuitJumps) {
+  // D7 (docs/design.md): AND must emit JumpIfFalse and OR must emit
+  // JumpIfTrue before the right operand, mirroring the AST evaluator.
+  const Schema schema("input", {Column("i", ValueType::kInt64),
+                                Column("j", ValueType::kInt64)});
+  Expression lhs = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kNotEquals,
+      ConstantValueExp(Value(0)));
+  Expression rhs = BinaryExpressionExp(
+      ColumnValueExp("j"), BinaryOperation::kGreaterThan,
+      ConstantValueExp(Value(1)));
+  Expression conj = BinaryExpressionExp(lhs, BinaryOperation::kAnd, rhs);
+  auto program = BytecodeCompiler::Compile(conj, schema);
+  ASSERT_TRUE(program.has_value());
+  EXPECT_TRUE(std::ranges::any_of(
+      program->Instructions(), [](const BytecodeInstruction& instruction) {
+        return instruction.opcode == BytecodeOp::kJumpIfFalse;
+      }));
+
+  Expression disj = BinaryExpressionExp(lhs, BinaryOperation::kOr, rhs);
+  auto or_program = BytecodeCompiler::Compile(disj, schema);
+  ASSERT_TRUE(or_program.has_value());
+  EXPECT_TRUE(std::ranges::any_of(
+      or_program->Instructions(), [](const BytecodeInstruction& instruction) {
+        return instruction.opcode == BytecodeOp::kJumpIfTrue;
+      }));
+  // Every jump target must land inside the program (stack-depth invariant
+  // guard from D7: no dangling labels).
+  for (const BytecodeInstruction& instruction : or_program->Instructions()) {
+    if (instruction.opcode == BytecodeOp::kJumpIfTrue ||
+        instruction.opcode == BytecodeOp::kJumpIfFalse) {
+      const long long target =
+          static_cast<long long>(&instruction - or_program->Instructions().data()) +
+          instruction.jump_target;
+      EXPECT_GE(target, 0);
+      EXPECT_LE(target, static_cast<long long>(or_program->Instructions().size()));
+    }
+  }
+}
+
+TEST(BytecodeTest, D7_RightHandSideErrorsAreSuppressedByShortCircuit) {
+  // `i <> 0 AND 10 / j > 1`: rows where i = 0 must NOT evaluate 10 / j, so
+  // j = 0 divides by zero ONLY on rows whose left side is TRUE or NULL
+  // (identical to the AST semantics).
+  const Schema schema("input", {Column("i", ValueType::kInt64),
+                                Column("j", ValueType::kInt64)});
+  Expression guard = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kNotEquals,
+      ConstantValueExp(Value(0)));
+  Expression division = BinaryExpressionExp(
+      ConstantValueExp(Value(10)), BinaryOperation::kDivide,
+      ColumnValueExp("j"));
+  Expression conj = BinaryExpressionExp(
+      guard, BinaryOperation::kAnd,
+      BinaryExpressionExp(division, BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(1))));
+  auto program = BytecodeCompiler::Compile(conj, schema);
+  ASSERT_TRUE(program.has_value());
+
+  {
+    DataChunk safe_rows(schema);
+    safe_rows.Append(Row({Value(0), Value(0)}));  // FALSE AND (10/0) -> FALSE
+    const ColumnVector output = program->EvaluateBatch(safe_rows);
+    EXPECT_EQ(output.ValueAt(0), Value(false));
+  }
+  {
+    DataChunk throwing_rows(schema);
+    throwing_rows.Append(Row({Value(1), Value(0)}));  // TRUE AND (10/0) -> error
+    EXPECT_THROW(static_cast<void>(program->EvaluateBatch(throwing_rows)),
+                  std::exception);
+  }
+}
+
 }  // namespace tinylamb

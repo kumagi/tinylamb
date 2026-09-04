@@ -20,9 +20,10 @@
 
 namespace tinylamb {
 
-BatchNestedLoopJoin::BatchNestedLoopJoin(
-    Executor left, Schema left_schema, Executor right, Schema right_schema,
-    Expression predicate, JoinKind kind, size_t block_size)
+BatchNestedLoopJoin::BatchNestedLoopJoin(Executor left, Schema left_schema,
+                                         Executor right, Schema right_schema,
+                                         Expression predicate, JoinKind kind,
+                                         size_t block_size)
     : left_(std::move(left)),
       left_schema_(std::move(left_schema)),
       right_(std::move(right)),
@@ -37,13 +38,12 @@ bool BatchNestedLoopJoin::EvaluatePredicate(const Row& left,
   if (!predicate_) {
     return true;
   }
+  // Predicate errors (e.g. division by zero) must propagate to the caller:
+  // swallowing them as FALSE corrupts Anti-join output (a failed match would
+  // emit the outer row instead of erroring).
   Row combined = left + right;
-  try {
-    Value res = predicate_->Evaluate(combined, combined_schema_);
-    return !res.IsNull() && res.Truthy();
-  } catch (...) {
-    return false;
-  }
+  Value res = predicate_->Evaluate(combined, combined_schema_);
+  return !res.IsNull() && res.Truthy();
 }
 
 void BatchNestedLoopJoin::ExecuteBlockJoin() {
@@ -60,6 +60,7 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
 
   std::vector<std::pair<Row, RowPosition>> left_block;
   left_block.reserve(block_size_);
+  std::vector<bool> right_matched(right_rows.size(), false);
 
   bool left_exhausted = false;
   size_t total_bytes = 0;
@@ -81,11 +82,14 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
 
     std::vector<size_t> left_match_counts(left_block.size(), 0);
 
-    for (const auto& r_item : right_rows) {
+    for (size_t r = 0; r < right_rows.size(); ++r) {
+      const auto& r_item = right_rows[r];
       for (size_t i = 0; i < left_block.size(); ++i) {
         if (EvaluatePredicate(left_block[i].first, r_item.first)) {
           ++left_match_counts[i];
-          if (kind_ == JoinKind::kInner || kind_ == JoinKind::kLeftOuter) {
+          right_matched[r] = true;
+          if (kind_ == JoinKind::kInner || kind_ == JoinKind::kLeftOuter ||
+              kind_ == JoinKind::kRightOuter || kind_ == JoinKind::kFullOuter) {
             output_.emplace_back(left_block[i].first + r_item.first,
                                  left_block[i].second);
             total_bytes += EstimateRowBytes(output_.back().first);
@@ -94,7 +98,7 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
       }
     }
 
-    if (kind_ == JoinKind::kLeftOuter) {
+    if (kind_ == JoinKind::kLeftOuter || kind_ == JoinKind::kFullOuter) {
       for (size_t i = 0; i < left_block.size(); ++i) {
         if (left_match_counts[i] == 0) {
           output_.emplace_back(
@@ -118,6 +122,20 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
           total_bytes += EstimateRowBytes(output_.back().first);
         }
       }
+    } else if (kind_ != JoinKind::kInner && kind_ != JoinKind::kRightOuter) {
+      throw std::runtime_error(
+          std::string("BatchNestedLoopJoin: unsupported join kind ") +
+          std::string(JoinKindName(kind_)));
+    }
+  }
+  if (kind_ == JoinKind::kRightOuter || kind_ == JoinKind::kFullOuter) {
+    const Row null_left(std::vector<Value>(left_schema_.ColumnCount()));
+    for (size_t r = 0; r < right_rows.size(); ++r) {
+      if (!right_matched[r]) {
+        output_.emplace_back(null_left + right_rows[r].first,
+                             right_rows[r].second);
+        total_bytes += EstimateRowBytes(output_.back().first);
+      }
     }
   }
 
@@ -132,9 +150,7 @@ void BatchNestedLoopJoin::EnsureMaterialized() {
   ExecuteBlockJoin();
 }
 
-void BatchNestedLoopJoin::MaterializePipeline() {
-  EnsureMaterialized();
-}
+void BatchNestedLoopJoin::MaterializePipeline() { EnsureMaterialized(); }
 
 bool BatchNestedLoopJoin::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
@@ -154,6 +170,7 @@ size_t BatchNestedLoopJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
+  destination->Reset();
   EnsureMaterialized();
   if (output_offset_ >= output_.size()) {
     return 0;

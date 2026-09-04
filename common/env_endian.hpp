@@ -35,4 +35,4 @@
 
 #endif
 
-#endif // ENV_ENDIAN_HPP
+#endif  // ENV_ENDIAN_HPP

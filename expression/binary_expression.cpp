@@ -23,19 +23,19 @@
 #include <optional>
 #include <ostream>
 #include <stdexcept>
-#include <string_view>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
-#include "type/column_name.hpp"
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
+#include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
-#include "type/type.hpp"
 
 namespace tinylamb {
 
@@ -52,7 +52,9 @@ bool IsStructJson(std::string_view s) {
 
 std::vector<std::string> ExtractStructValues(std::string_view json) {
   std::vector<std::string> values;
-  if (!IsStructJson(json)) { return values; }
+  if (!IsStructJson(json)) {
+    return values;
+  }
   std::string_view inner = json.substr(1, json.size() - 2);
   int depth = 0;
   bool in_string = false;
@@ -61,13 +63,27 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
   for (size_t i = 0; i < inner.size(); ++i) {
     char c = inner[i];
     if (in_string) {
-      if (c == '\\' && i + 1 < inner.size()) { ++i; continue; }
-      if (c == '"') { in_string = false; }
+      if (c == '\\' && i + 1 < inner.size()) {
+        ++i;
+        continue;
+      }
+      if (c == '"') {
+        in_string = false;
+      }
       continue;
     }
-    if (c == '"') { in_string = true; continue; }
-    if (c == '{' || c == '[' || c == '(') { ++depth; continue; }
-    if (c == '}' || c == ']' || c == ')') { if (depth > 0) --depth; continue; }
+    if (c == '"') {
+      in_string = true;
+      continue;
+    }
+    if (c == '{' || c == '[' || c == '(') {
+      ++depth;
+      continue;
+    }
+    if (c == '}' || c == ']' || c == ')') {
+      if (depth > 0) --depth;
+      continue;
+    }
     if (c == ',' && depth == 0) {
       parts.push_back(inner.substr(start, i - start));
       start = i + 1;
@@ -77,12 +93,19 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
     parts.push_back(inner.substr(start));
   }
   for (auto p : parts) {
-    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.front()))) { p.remove_prefix(1); }
-    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.back()))) { p.remove_suffix(1); }
+    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.front()))) {
+      p.remove_prefix(1);
+    }
+    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.back()))) {
+      p.remove_suffix(1);
+    }
     size_t colon = p.find(':');
     if (colon != std::string_view::npos) {
       p = p.substr(colon + 1);
-      while (!p.empty() && std::isspace(static_cast<unsigned char>(p.front()))) { p.remove_prefix(1); }
+      while (!p.empty() &&
+             std::isspace(static_cast<unsigned char>(p.front()))) {
+        p.remove_prefix(1);
+      }
     }
     values.emplace_back(p);
   }
@@ -95,15 +118,21 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
 Value StructJsonCompare(std::string_view lhs, std::string_view rhs) {
   auto v1 = ExtractStructValues(lhs);
   auto v2 = ExtractStructValues(rhs);
-  if (v1.empty() && v2.empty()) { return Value(true); }
-  if (v1.empty() || v1.size() != v2.size()) { return Value(false); }
+  if (v1.empty() && v2.empty()) {
+    return Value(true);
+  }
+  if (v1.empty() || v1.size() != v2.size()) {
+    return Value(false);
+  }
   bool saw_null = false;
   for (size_t i = 0; i < v1.size(); ++i) {
     if (v1[i] == "null" || v2[i] == "null") {
       saw_null = true;
       continue;
     }
-    if (v1[i] != v2[i]) { return Value(false); }
+    if (v1[i] != v2[i]) {
+      return Value(false);
+    }
   }
   return saw_null ? Value() : Value(true);
 }
@@ -133,9 +162,8 @@ std::string FoldCase(std::string_view s) {
   out.reserve(s.size());
   for (char c : s) {
     const auto uc = static_cast<unsigned char>(c);
-    out.push_back(uc >= 'A' && uc <= 'Z'
-                      ? static_cast<char>(uc - 'A' + 'a')
-                      : c);
+    out.push_back(uc >= 'A' && uc <= 'Z' ? static_cast<char>(uc - 'A' + 'a')
+                                         : c);
   }
   return out;
 }
@@ -187,8 +215,9 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         (!right.IsNull() && !right.Truthy())) {
       return Value(false);
     }
-    if (left.IsNull() || right.IsNull()) { return {};
-}
+    if (left.IsNull() || right.IsNull()) {
+      return {};
+    }
     return Value(true);
   }
   if (op == BinaryOperation::kOr) {
@@ -196,17 +225,20 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         (!right.IsNull() && right.Truthy())) {
       return Value(true);
     }
-    if (left.IsNull() || right.IsNull()) { return {};
-}
+    if (left.IsNull() || right.IsNull()) {
+      return {};
+    }
     return Value(false);
   }
   if (op == BinaryOperation::kXor) {
-    if (left.IsNull() || right.IsNull()) { return {};
-}
+    if (left.IsNull() || right.IsNull()) {
+      return {};
+    }
     return Value(left.Truthy() != right.Truthy());
   }
-  if (left.IsNull() || right.IsNull()) { return {};
-}
+  if (left.IsNull() || right.IsNull()) {
+    return {};
+  }
   // IN lists are typed by the left-hand expression in GoogleSQL.  The AST
   // represents a bare DATE literal as STRING, so coerce it when it is
   // compared with a DATE column value.
@@ -236,25 +268,32 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         const int64_t a = *lhs;
         const int64_t b = *rhs;
         switch (op) {
-          case BinaryOperation::kEquals: return Value(a == b);
-          case BinaryOperation::kNotEquals: return Value(a != b);
-          case BinaryOperation::kLessThan: return Value(a < b);
-          case BinaryOperation::kLessThanEquals: return Value(a <= b);
-          case BinaryOperation::kGreaterThan: return Value(a > b);
-          case BinaryOperation::kGreaterThanEquals: return Value(a >= b);
-          default: break;
+          case BinaryOperation::kEquals:
+            return Value(a == b);
+          case BinaryOperation::kNotEquals:
+            return Value(a != b);
+          case BinaryOperation::kLessThan:
+            return Value(a < b);
+          case BinaryOperation::kLessThanEquals:
+            return Value(a <= b);
+          case BinaryOperation::kGreaterThan:
+            return Value(a > b);
+          case BinaryOperation::kGreaterThanEquals:
+            return Value(a >= b);
+          default:
+            break;
         }
       }
     }
-    auto timestamp_seconds = [](std::string_view text) -> std::optional<time_t> {
+    auto timestamp_seconds =
+        [](std::string_view text) -> std::optional<time_t> {
       if (text.size() < 19 || text[4] != '-' || text[7] != '-' ||
           (text[10] != ' ' && text[10] != 'T')) {
         return std::nullopt;
       }
       int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
-      if (sscanf(std::string(text.substr(0, 19)).c_str(),
-                 "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute,
-                 &second) != 6) {
+      if (sscanf(std::string(text.substr(0, 19)).c_str(), "%d-%d-%d %d:%d:%d",
+                 &year, &month, &day, &hour, &minute, &second) != 6) {
         return std::nullopt;
       }
       std::tm tm{};
@@ -274,8 +313,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       }
       return epoch;
     };
-    if (left.type == ValueType::kVarChar &&
-        right.type == ValueType::kVarChar) {
+    if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
       const std::string_view lhs(left.value.varchar_value);
       const std::string_view rhs(right.value.varchar_value);
       const auto looks_like_timestamp = [](std::string_view text) {
@@ -314,16 +352,23 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
           const bool equivalent_default_zone =
               (has_zone(lhs) != has_zone(rhs)) &&
               std::llabs(*a - *b) == 8LL * 60LL * 60LL;
-          const bool equal = (*a == *b && fractional_equal) ||
-                             equivalent_default_zone;
+          const bool equal =
+              (*a == *b && fractional_equal) || equivalent_default_zone;
           switch (op) {
-            case BinaryOperation::kEquals: return Value(equal);
-            case BinaryOperation::kNotEquals: return Value(!equal);
-            case BinaryOperation::kLessThan: return Value(*a < *b);
-            case BinaryOperation::kLessThanEquals: return Value(*a <= *b);
-            case BinaryOperation::kGreaterThan: return Value(*a > *b);
-            case BinaryOperation::kGreaterThanEquals: return Value(*a >= *b);
-            default: break;
+            case BinaryOperation::kEquals:
+              return Value(equal);
+            case BinaryOperation::kNotEquals:
+              return Value(!equal);
+            case BinaryOperation::kLessThan:
+              return Value(*a < *b);
+            case BinaryOperation::kLessThanEquals:
+              return Value(*a <= *b);
+            case BinaryOperation::kGreaterThan:
+              return Value(*a > *b);
+            case BinaryOperation::kGreaterThanEquals:
+              return Value(*a >= *b);
+            default:
+              break;
           }
         }
       }
@@ -344,9 +389,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       return Value(static_cast<int64_t>(0));
     }
     const uint64_t bits = static_cast<uint64_t>(left.value.int_value);
-    const uint64_t shifted = op == BinaryOperation::kShiftLeft
-                                 ? bits << amount
-                                 : bits >> amount;
+    const uint64_t shifted =
+        op == BinaryOperation::kShiftLeft ? bits << amount : bits >> amount;
     return Value(static_cast<int64_t>(shifted));
   }
   // Collation-aware normalization: when either operand carries a
@@ -376,8 +420,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
           "collation: " +
           std::string(pattern));
     }
-    const bool matched =
-        Like(folded_left.value.varchar_value, pattern);
+    const bool matched = Like(folded_left.value.varchar_value, pattern);
     return Value(op == BinaryOperation::kLike ? matched : !matched);
   }
   const bool numeric =
@@ -393,31 +436,42 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     const bool rhs_negative = !right.IsUnsigned() && right.value.int_value < 0;
     auto compare = [&]() {
       if (!mixed_signedness) {
-        return lhs_unsigned < rhs_unsigned ? -1
+        return lhs_unsigned < rhs_unsigned   ? -1
                : lhs_unsigned > rhs_unsigned ? 1
                                              : 0;
       }
       if (lhs_negative || rhs_negative) {
         return lhs_negative == rhs_negative
-                   ? (lhs_negative ? (left.value.int_value < right.value.int_value ? -1 :
-                                      left.value.int_value > right.value.int_value ? 1 : 0)
-                                   : (right.value.int_value < left.value.int_value ? 1 :
-                                      right.value.int_value > left.value.int_value ? -1 : 0))
+                   ? (lhs_negative
+                          ? (left.value.int_value < right.value.int_value   ? -1
+                             : left.value.int_value > right.value.int_value ? 1
+                                                                            : 0)
+                          : (right.value.int_value < left.value.int_value ? 1
+                             : right.value.int_value > left.value.int_value
+                                 ? -1
+                                 : 0))
                    : (lhs_negative ? -1 : 1);
       }
-      return lhs_unsigned < rhs_unsigned ? -1
+      return lhs_unsigned < rhs_unsigned   ? -1
              : lhs_unsigned > rhs_unsigned ? 1
                                            : 0;
     };
     const int cmp = compare();
     switch (op) {
-      case BinaryOperation::kEquals: return Value(cmp == 0);
-      case BinaryOperation::kNotEquals: return Value(cmp != 0);
-      case BinaryOperation::kLessThan: return Value(cmp < 0);
-      case BinaryOperation::kLessThanEquals: return Value(cmp <= 0);
-      case BinaryOperation::kGreaterThan: return Value(cmp > 0);
-      case BinaryOperation::kGreaterThanEquals: return Value(cmp >= 0);
-      default: break;
+      case BinaryOperation::kEquals:
+        return Value(cmp == 0);
+      case BinaryOperation::kNotEquals:
+        return Value(cmp != 0);
+      case BinaryOperation::kLessThan:
+        return Value(cmp < 0);
+      case BinaryOperation::kLessThanEquals:
+        return Value(cmp <= 0);
+      case BinaryOperation::kGreaterThan:
+        return Value(cmp > 0);
+      case BinaryOperation::kGreaterThanEquals:
+        return Value(cmp >= 0);
+      default:
+        break;
     }
     if (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract ||
         op == BinaryOperation::kMultiply || op == BinaryOperation::kDivide ||
@@ -438,9 +492,9 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         int64_t signed_result = 0;
         switch (op) {
           case BinaryOperation::kAdd:
-            fits_signed = rhs <=
-                         static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) -
-                         lhs;
+            fits_signed = rhs <= static_cast<uint64_t>(
+                                     std::numeric_limits<int64_t>::max()) -
+                                     lhs;
             if (fits_signed) {
               signed_result = static_cast<int64_t>(lhs) + right.value.int_value;
             }
@@ -450,9 +504,10 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
             signed_result = static_cast<int64_t>(lhs) - right.value.int_value;
             break;
           case BinaryOperation::kMultiply:
-            fits_signed = rhs == 0 ||
-                          lhs <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
-                                     rhs;
+            fits_signed =
+                rhs == 0 || lhs <= static_cast<uint64_t>(
+                                       std::numeric_limits<int64_t>::max()) /
+                                       rhs;
             if (fits_signed) {
               signed_result = static_cast<int64_t>(lhs) * right.value.int_value;
             }
@@ -466,12 +521,23 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       }
       uint64_t unsigned_result = 0;
       switch (op) {
-        case BinaryOperation::kAdd: unsigned_result = lhs + rhs; break;
-        case BinaryOperation::kSubtract: unsigned_result = lhs - rhs; break;
-        case BinaryOperation::kMultiply: unsigned_result = lhs * rhs; break;
-        case BinaryOperation::kDivide: unsigned_result = lhs / rhs; break;
-        case BinaryOperation::kModulo: unsigned_result = lhs % rhs; break;
-        default: break;
+        case BinaryOperation::kAdd:
+          unsigned_result = lhs + rhs;
+          break;
+        case BinaryOperation::kSubtract:
+          unsigned_result = lhs - rhs;
+          break;
+        case BinaryOperation::kMultiply:
+          unsigned_result = lhs * rhs;
+          break;
+        case BinaryOperation::kDivide:
+          unsigned_result = lhs / rhs;
+          break;
+        case BinaryOperation::kModulo:
+          unsigned_result = lhs % rhs;
+          break;
+        default:
+          break;
       }
       return Value(static_cast<int64_t>(unsigned_result)).WithUnsigned();
     }
@@ -523,10 +589,14 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       case BinaryOperation::kMultiply:
         return Value(lhs * rhs);
       case BinaryOperation::kDivide:
-        if (rhs == 0.0) { throw std::runtime_error("division by zero"); }
+        if (rhs == 0.0) {
+          throw std::runtime_error("division by zero");
+        }
         return Value(lhs / rhs);
       case BinaryOperation::kModulo:
-        if (rhs == 0.0) { throw std::runtime_error("division by zero"); }
+        if (rhs == 0.0) {
+          throw std::runtime_error("division by zero");
+        }
         return Value(std::fmod(lhs, rhs));
       case BinaryOperation::kEquals:
         return Value(lhs == rhs);
@@ -547,8 +617,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   if (left.type != right.type) {
     auto is_iv = [](std::string_view s) {
       return s.find('-') != std::string_view::npos &&
-             s.find(' ') != std::string_view::npos &&
-             s.find('-') < s.find(' ');
+             s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
     };
     if (left.type == ValueType::kVarChar && right.type == ValueType::kInt64 &&
         is_iv(left.value.varchar_value) && op == BinaryOperation::kMultiply) {
@@ -562,13 +631,18 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     }
     if (left.type == ValueType::kDate && right.type == ValueType::kVarChar) {
       try {
-        return EvaluateBinary(op, left, Value::DateFromDays(ParseDateDays(right.value.varchar_value)));
+        return EvaluateBinary(
+            op, left,
+            Value::DateFromDays(ParseDateDays(right.value.varchar_value)));
       } catch (const std::exception& error) {
         (void)error;
       }
-    } else if (left.type == ValueType::kVarChar && right.type == ValueType::kDate) {
+    } else if (left.type == ValueType::kVarChar &&
+               right.type == ValueType::kDate) {
       try {
-        return EvaluateBinary(op, Value::DateFromDays(ParseDateDays(left.value.varchar_value)), right);
+        return EvaluateBinary(
+            op, Value::DateFromDays(ParseDateDays(left.value.varchar_value)),
+            right);
       } catch (const std::exception& error) {
         (void)error;
       }
@@ -578,22 +652,30 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
     auto is_iv = [](std::string_view s) {
       return s.find('-') != std::string_view::npos &&
-             s.find(' ') != std::string_view::npos &&
-             s.find('-') < s.find(' ');
+             s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
     };
     if (is_iv(left.value.varchar_value) && is_iv(right.value.varchar_value)) {
       IntervalValue iv1 = IntervalValue::Parse(left.value.varchar_value);
       IntervalValue iv2 = IntervalValue::Parse(right.value.varchar_value);
       switch (op) {
-        case BinaryOperation::kAdd: return Value((iv1 + iv2).ToString());
-        case BinaryOperation::kSubtract: return Value((iv1 - iv2).ToString());
-        case BinaryOperation::kEquals: return Value(iv1 == iv2);
-        case BinaryOperation::kNotEquals: return Value(iv1 != iv2);
-        case BinaryOperation::kLessThan: return Value(iv1 < iv2);
-        case BinaryOperation::kLessThanEquals: return Value(iv1 <= iv2);
-        case BinaryOperation::kGreaterThan: return Value(iv1 > iv2);
-        case BinaryOperation::kGreaterThanEquals: return Value(iv1 >= iv2);
-        default: break;
+        case BinaryOperation::kAdd:
+          return Value((iv1 + iv2).ToString());
+        case BinaryOperation::kSubtract:
+          return Value((iv1 - iv2).ToString());
+        case BinaryOperation::kEquals:
+          return Value(iv1 == iv2);
+        case BinaryOperation::kNotEquals:
+          return Value(iv1 != iv2);
+        case BinaryOperation::kLessThan:
+          return Value(iv1 < iv2);
+        case BinaryOperation::kLessThanEquals:
+          return Value(iv1 <= iv2);
+        case BinaryOperation::kGreaterThan:
+          return Value(iv1 > iv2);
+        case BinaryOperation::kGreaterThanEquals:
+          return Value(iv1 >= iv2);
+        default:
+          break;
       }
     }
   }
@@ -621,9 +703,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   }
   try {
     auto preserve_unsigned = [&](Value result) {
-      return (left.IsUnsigned() || right.IsUnsigned())
-                 ? result.WithUnsigned()
-                 : result;
+      return (left.IsUnsigned() || right.IsUnsigned()) ? result.WithUnsigned()
+                                                       : result;
     };
     switch (op) {
       case BinaryOperation::kAdd:
@@ -680,8 +761,9 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
           IsStructJson(folded_right.value.varchar_value)) {
         const Value equal = StructJsonCompare(folded_left.value.varchar_value,
                                               folded_right.value.varchar_value);
-        if (equal.IsNull()) { return {};
-}
+        if (equal.IsNull()) {
+          return {};
+        }
         return Value(!equal.Truthy());
       }
       return Value(folded_left != folded_right);
@@ -700,6 +782,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     case BinaryOperation::kNotLike:
     case BinaryOperation::kShiftLeft:
     case BinaryOperation::kShiftRight:
+    case BinaryOperation::kIsDistinctFrom:
+    case BinaryOperation::kIsNotDistinctFrom:
       // Already handled above; kept for -Wswitch completeness.
       break;
   }
@@ -750,8 +834,8 @@ Value BinaryExpression::Evaluate(const Row& row, const Schema& schema,
         left_value.Truthy() != (op_ == BinaryOperation::kAnd)) {
       return Value(op_ == BinaryOperation::kOr);
     }
-    return EvaluateBinary(
-        op_, left_value, right_->Evaluate(row, schema, context));
+    return EvaluateBinary(op_, left_value,
+                          right_->Evaluate(row, schema, context));
   }
   return EvaluateBinary(op_, left_->Evaluate(row, schema, context),
                         right_->Evaluate(row, schema, context));
@@ -795,8 +879,8 @@ Type BinaryExpression::ResultType(const Schema& left,
 }
 
 std::string BinaryExpression::ToString() const {
-  return "(" + left_->ToString() + " " +
-         std::string(tinylamb::ToString(op_)) + " " + right_->ToString() + ")";
+  return "(" + left_->ToString() + " " + std::string(tinylamb::ToString(op_)) +
+         " " + right_->ToString() + ")";
 }
 
 void BinaryExpression::Dump(std::ostream& o) const { o << ToString(); }

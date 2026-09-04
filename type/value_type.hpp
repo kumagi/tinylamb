@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_TYPE_VALUE_TYPE_HPP
 #define TINYLAMB_TYPE_VALUE_TYPE_HPP
 
+#include <cstdint>
+#include <functional>
 #include <string_view>
 
 namespace tinylamb {

@@ -16,8 +16,8 @@
 
 #include "common/serdes.hpp"
 
-#include <cstdint>
 #include <bit>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>

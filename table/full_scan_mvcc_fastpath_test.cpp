@@ -90,7 +90,8 @@ class FullScanMvccFastPathTest : public ::testing::Test {
 
 // A read-only scan over pages whose stamp qualifies for the physical path
 // must return exactly the seeded rows -- no more, no fewer, correct values.
-TEST_F(FullScanMvccFastPathTest, BeginFullScan_ReadOnlyScan_ReturnsSeededRowsVerbatim) {
+TEST_F(FullScanMvccFastPathTest,
+       BeginFullScan_ReadOnlyScan_ReturnsSeededRowsVerbatim) {
   TransactionContext seed = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "SampleTable"));
   for (int i = 0; i < 5; ++i) {
@@ -170,8 +171,9 @@ TEST_F(FullScanMvccFastPathTest,
 
 // Same contract for deletions: an open read-only snapshot keeps seeing a
 // physically removed row; snapshots opened after the delete do not.
-TEST_F(FullScanMvccFastPathTest,
-       BeginFullScan_WhenWriterDeletesRowAfterBegin_ReaderKeepsDeletedRowVisible) {
+TEST_F(
+    FullScanMvccFastPathTest,
+    BeginFullScan_WhenWriterDeletesRowAfterBegin_ReaderKeepsDeletedRowVisible) {
   TransactionContext seed = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "SampleTable"));
   RowPosition tail;

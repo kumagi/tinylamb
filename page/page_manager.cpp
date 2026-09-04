@@ -63,6 +63,13 @@ void PageManager::DestroyPage(Transaction& system_txn, Page* target) {
   GetMetaPage()->DestroyPage(system_txn, target);
 }
 
+// D3 (docs/design.md): undo restored the destroyed page; drop it from the
+// allocator free stack so the next AllocateNewPage cannot re-issue it.
+void PageManager::PopFreePageHead(page_id_t pid, page_id_t next) {
+  PageRef meta = GetMetaPage();
+  meta->body.meta_page.PopFreePageHead(pid, next);
+}
+
 PageRef PageManager::AllocateNewPage(Transaction& system_txn,
                                      PageType new_page_type) {
   return GetMetaPage()->AllocateNewPage(system_txn, pool_, new_page_type);

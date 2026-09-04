@@ -54,8 +54,7 @@ std::string IndexSchema::GenerateKey(const Row& row) const {
 }
 
 Encoder& operator<<(Encoder& a, const IndexSchema& idx) {
-  a << idx.name_ << idx.key_ << idx.include_
-    << static_cast<uint8_t>(idx.mode_);
+  a << idx.name_ << idx.key_ << idx.include_ << static_cast<uint8_t>(idx.mode_);
   return a;
 }
 

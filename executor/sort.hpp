@@ -4,8 +4,8 @@
 
 #include <algorithm>
 #include <optional>
-#include <utility>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "executor/executor_base.hpp"
@@ -36,8 +36,12 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
   // PipelineBreaker interface
   [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
   void MaterializePipeline() override { Materialize(); }
-  [[nodiscard]] size_t MaterializedRowCount() const override { return rows_.size(); }
-  [[nodiscard]] size_t MaterializedBytes() const override { return rows_charge_.Bytes(); }
+  [[nodiscard]] size_t MaterializedRowCount() const override {
+    return rows_.size();
+  }
+  [[nodiscard]] size_t MaterializedBytes() const override {
+    return rows_charge_.Bytes();
+  }
 
  private:
   void Materialize();

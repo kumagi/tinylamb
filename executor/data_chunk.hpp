@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
-#include "page/row_position.hpp"
 #include "executor/zone_map.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -52,11 +52,16 @@ class ColumnVector {
     return strings_;
   }
 
-  [[nodiscard]] Value AggregateLogicalAnd(const SelectionVector* sel = nullptr) const;
-  [[nodiscard]] Value AggregateLogicalOr(const SelectionVector* sel = nullptr) const;
-  [[nodiscard]] Value AggregateBitAnd(const SelectionVector* sel = nullptr) const;
-  [[nodiscard]] Value AggregateBitOr(const SelectionVector* sel = nullptr) const;
-  [[nodiscard]] Value AggregateBitXor(const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateLogicalAnd(
+      const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateLogicalOr(
+      const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitAnd(
+      const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitOr(
+      const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitXor(
+      const SelectionVector* sel = nullptr) const;
 
  private:
   void AppendDefault();
@@ -82,17 +87,14 @@ class DataChunk {
   explicit DataChunk(const std::vector<ValueType>& types,
                      size_t capacity = kDefaultVectorSize);
 
-  void Initialize(const Schema& schema,
-                  size_t capacity = kDefaultVectorSize);
+  void Initialize(const Schema& schema, size_t capacity = kDefaultVectorSize);
   void Initialize(const std::vector<ValueType>& types,
                   size_t capacity = kDefaultVectorSize);
   void Reset();
-  void Reset(const Schema& schema,
-             size_t capacity = kDefaultVectorSize);
+  void Reset(const Schema& schema, size_t capacity = kDefaultVectorSize);
   void Reserve(size_t capacity);
 
-  void Append(const Row& row,
-              RowPosition position = RowPosition());
+  void Append(const Row& row, RowPosition position = RowPosition());
   void Append(Row&& row, RowPosition position = RowPosition());
   void Append(const DataChunk& source, size_t row_index);
   // Appends one row assembled column-wise from `sources` without
@@ -129,16 +131,16 @@ class DataChunk {
     return zone_maps_[index];
   }
 
-  [[nodiscard]] Value AggregateLogicalAnd(size_t col_idx,
-                                          const SelectionVector* sel = nullptr) const;
-  [[nodiscard]] Value AggregateLogicalOr(size_t col_idx,
-                                         const SelectionVector* sel = nullptr) const;
-  [[nodiscard]] Value AggregateBitAnd(size_t col_idx,
-                                      const SelectionVector* sel = nullptr) const;
-  [[nodiscard]] Value AggregateBitOr(size_t col_idx,
-                                     const SelectionVector* sel = nullptr) const;
-  [[nodiscard]] Value AggregateBitXor(size_t col_idx,
-                                      const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateLogicalAnd(
+      size_t col_idx, const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateLogicalOr(
+      size_t col_idx, const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitAnd(
+      size_t col_idx, const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitOr(
+      size_t col_idx, const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitXor(
+      size_t col_idx, const SelectionVector* sel = nullptr) const;
 
  private:
   void EnsureLayout(const Row& row);

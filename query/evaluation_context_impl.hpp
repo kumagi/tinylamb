@@ -40,7 +40,10 @@ class RelationalEvaluationContext : public EvaluationContext {
                               const relational_detail::Scope* scope,
                               const relational_detail::CteMap& ctes,
                               const AggregateResultMap* aggregates)
-      : context_(context), scope_(scope), ctes_(ctes), aggregates_(aggregates) {}
+      : context_(context),
+        scope_(scope),
+        ctes_(ctes),
+        aggregates_(aggregates) {}
 
   // Executes the statement with the same strategy as the relational_detail
   // interpreter: indexed correlated execution when the outer scope allows it,
@@ -56,9 +59,8 @@ class RelationalEvaluationContext : public EvaluationContext {
     const relational_detail::Relation* relation =
         indexed.has_value() ? &*indexed : nullptr;
     if (relation == nullptr) {
-      relation =
-          relational_detail::ExecuteCachedUncorrelated(context_, statement,
-                                                       ctes_);
+      relation = relational_detail::ExecuteCachedUncorrelated(context_,
+                                                              statement, ctes_);
     }
     std::optional<relational_detail::Relation> executed;
     if (relation == nullptr) {
@@ -86,8 +88,9 @@ class RelationalEvaluationContext : public EvaluationContext {
   // types.
   [[nodiscard]] Status GetOrAddFunction(std::string_view function_name,
                                         int argument_count) override {
-    if (context_.GetCatalog() == nullptr) { return Status::kNotExists;
-}
+    if (context_.GetCatalog() == nullptr) {
+      return Status::kNotExists;
+    }
     return context_.GetCatalog()
         ->GetOrAddFunction(context_, function_name, argument_count)
         .GetStatus();

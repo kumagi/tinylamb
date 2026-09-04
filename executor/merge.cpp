@@ -136,8 +136,7 @@ bool MergeExecutor::Next(Row* dst, RowPosition* rp) {
         }
 
         if (clause.action == WhenNotMatchedClause::Action::kInsert) {
-          Row inserted_row(
-              std::vector<Value>(target_schema.ColumnCount()));
+          Row inserted_row(std::vector<Value>(target_schema.ColumnCount()));
           if (clause.target_columns.empty()) {
             for (size_t i = 0;
                  i < clause.values.size() && i < inserted_row.values_.size();
@@ -148,8 +147,8 @@ bool MergeExecutor::Next(Row* dst, RowPosition* rp) {
               }
             }
           } else {
-            for (size_t i = 0; i < clause.target_columns.size() &&
-                               i < clause.values.size();
+            for (size_t i = 0;
+                 i < clause.target_columns.size() && i < clause.values.size();
                  ++i) {
               size_t target_col = clause.target_columns[i];
               if (target_col < inserted_row.values_.size() &&
@@ -159,8 +158,7 @@ bool MergeExecutor::Next(Row* dst, RowPosition* rp) {
               }
             }
           }
-          StatusOr<RowPosition> st =
-              target_table_->Insert(*txn_, inserted_row);
+          StatusOr<RowPosition> st = target_table_->Insert(*txn_, inserted_row);
           if (st.GetStatus() != Status::kSuccess) {
             throw std::runtime_error("MERGE insert failed on table " +
                                      std::string(target_schema.Name()));
@@ -173,8 +171,8 @@ bool MergeExecutor::Next(Row* dst, RowPosition* rp) {
     }
   }
 
-  *dst = Row({Value("Merge Rows"), Value(inserted_count_), Value(updated_count_),
-              Value(deleted_count_)});
+  *dst = Row({Value("Merge Rows"), Value(inserted_count_),
+              Value(updated_count_), Value(deleted_count_)});
   if (rp != nullptr) {
     *rp = RowPosition();
   }

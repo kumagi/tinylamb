@@ -20,9 +20,9 @@
 #include <cstdio>
 #include <memory>
 #include <set>
-#include <vector>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/random_string.hpp"
@@ -61,8 +61,7 @@ class PageManagerTest : public ::testing::Test {
     // Wire the real recovery stack so a re-open after the simulated crash
     // replays committed WAL records exactly like PageStorage does.
     rm_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               rm_.get());
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), rm_.get());
     // Boot-time recovery, same as PageStorage's constructor would do.
     // Tests that poke raw page bodies (unlogged) disable this to emulate a
     // clean restart instead of a crash.
@@ -124,14 +123,18 @@ TEST_F(PageManagerTest, AllocateNewPage) {
     // Make sure no SEGV happen.
     // Union overlay: writes stay inside the kPageSize page allocation.
     // Union overlay: writes stay inside the kPageSize page allocation.
-    buff[j] = static_cast<char>((page->PageID() + j) & 0xff);  // NOLINT(clang-analyzer-security.ArrayBound)
+    buff[j] =
+        static_cast<char>((page->PageID() + j) &
+                          0xff);  // NOLINT(clang-analyzer-security.ArrayBound)
   }
 
-  // Assert -- implicit; no SEGV means the page body is writable and sized correctly
+  // Assert -- implicit; no SEGV means the page body is writable and sized
+  // correctly
 }
 
 TEST_F(PageManagerTest, AllocateMultipleNewPage) {
-  // Arrange -- allocate 15+1 free pages, each written with a deterministic byte pattern
+  // Arrange -- allocate 15+1 free pages, each written with a deterministic byte
+  // pattern
   constexpr int kPages = 15;
   std::set<page_id_t> allocated_ids;
   for (int i = 0; i <= kPages; ++i) {
@@ -139,7 +142,9 @@ TEST_F(PageManagerTest, AllocateMultipleNewPage) {
     char* buff = page->body.free_page.FreeBody();
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
       // Union overlay: writes stay inside the kPageSize page allocation.
-      buff[j] = static_cast<char>((page->PageID() + j) & 0xff);  // NOLINT(clang-analyzer-security.ArrayBound)
+      buff[j] = static_cast<char>(
+          (page->PageID() + j) &
+          0xff);  // NOLINT(clang-analyzer-security.ArrayBound)
     }
     allocated_ids.insert(page->PageID());
   }
@@ -155,7 +160,8 @@ TEST_F(PageManagerTest, AllocateMultipleNewPage) {
     FreePage& page = ref.GetFreePage();
     char* buff = page.FreeBody();
 
-    // Assert -- each page's body still has the deterministic pattern written before reset
+    // Assert -- each page's body still has the deterministic pattern written
+    // before reset
     for (size_t j = 0; j < kFreeBodySize; ++j) {
       ASSERT_EQ(buff[j], static_cast<char>((id + j) & 0xff));
     }
@@ -169,7 +175,8 @@ TEST_F(PageManagerTest, DestroyPage) {
     DestroyPage(page.get());
   }
 
-  // Act -- re-allocate 15 free pages; PageManager should recycle destroyed page IDs
+  // Act -- re-allocate 15 free pages; PageManager should recycle destroyed page
+  // IDs
   for (int i = 0; i < 15; ++i) {
     PageRef page = AllocatePage(PageType::kFreePage);
 
@@ -241,8 +248,7 @@ TEST_F(PageManagerTest, CommittedRowPageWithRowsSurvivesCrash) {
   ASSERT_FALSE(recovered.IsNull())
       << "row page " << page_id << " lost by crash recovery";
   Transaction read_txn = tm_->Begin();
-  const StatusOr<std::string_view> r1 =
-      recovered->Read(read_txn, first_slot);
+  const StatusOr<std::string_view> r1 = recovered->Read(read_txn, first_slot);
   EXPECT_EQ(r1.GetStatus(), Status::kSuccess);
   if (r1.HasValue()) {
     EXPECT_EQ(r1.Value(), "first-row");

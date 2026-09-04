@@ -65,9 +65,10 @@ class ConcurrentJoinHashTable {
 };
 
 // Multi-threaded parallel hash join where worker threads share a synchronized
-// concurrent hash table during build, synchronize at a barrier, and concurrently
-// probe to emit joined rows.
-class SharedBuildParallelHashJoin : public ExecutorBase, public PipelineBreaker {
+// concurrent hash table during build, synchronize at a barrier, and
+// concurrently probe to emit joined rows.
+class SharedBuildParallelHashJoin : public ExecutorBase,
+                                    public PipelineBreaker {
  public:
   SharedBuildParallelHashJoin(
       Executor left, std::vector<slot_t> left_cols, Executor right,
@@ -97,7 +98,9 @@ class SharedBuildParallelHashJoin : public ExecutorBase, public PipelineBreaker 
   void BuildSharedHashTable();
   void ParallelProbe();
   [[nodiscard]] static std::string MakeKey(const Row& row,
-                                          const std::vector<slot_t>& cols);
+                                           const std::vector<slot_t>& cols);
+  [[nodiscard]] static bool KeyHasNull(const Row& row,
+                                       const std::vector<slot_t>& cols);
   [[nodiscard]] static uint64_t HashKey(std::string_view key);
 
   Executor left_;

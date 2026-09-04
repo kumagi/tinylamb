@@ -18,7 +18,7 @@ namespace {
 // benchmark/tpch_benchmark.cpp sets via the environment variable; operators
 // can still override or disable ("0") with TINYLAMB_QUERY_MEMORY_BYTES.
 constexpr size_t kDefaultQueryMemoryBytes = size_t{8} << 30;  // 8 GiB
-}
+}  // namespace
 
 size_t QueryMemoryBudget::LimitFromEnv() {
   const char* env = std::getenv("TINYLAMB_QUERY_MEMORY_BYTES");

@@ -41,7 +41,9 @@ TEST(PostgresProtocolTest, ParsesStartupPacket) {
   const std::optional<StartupPacket> parsed =
       ParseStartupPacket(packet, &error);
   ASSERT_TRUE(parsed) << error;
-  if (!parsed.has_value()) { return; }
+  if (!parsed.has_value()) {
+    return;
+  }
   EXPECT_EQ(parsed->protocol_version, kProtocolVersion30);
   EXPECT_EQ(parsed->parameters.at("user"), "alice");
   EXPECT_EQ(parsed->parameters.at("database"), "warehouse");
@@ -85,9 +87,8 @@ TEST(PostgresProtocolTest, RejectsMalformedStartupPackets) {
   {
     std::string error;
     // Act -- a value without its terminating NUL
-    EXPECT_FALSE(ParseStartupPacket(StartupWithPayload(
-                                     std::string("user\0alice", 10)),
-                                    &error));
+    EXPECT_FALSE(ParseStartupPacket(
+        StartupWithPayload(std::string("user\0alice", 10)), &error));
     EXPECT_NE(error.find("unterminated startup parameter value"),
               std::string::npos);
   }
@@ -95,8 +96,7 @@ TEST(PostgresProtocolTest, RejectsMalformedStartupPackets) {
     std::string error;
     // Act -- trailing garbage after the double-NUL terminator
     EXPECT_FALSE(ParseStartupPacket(
-                     StartupWithPayload(std::string("user\0alice\0\0junk", 16)),
-                     &error));
+        StartupWithPayload(std::string("user\0alice\0\0junk", 16)), &error));
     EXPECT_NE(error.find("data after startup packet terminator"),
               std::string::npos);
   }
@@ -104,8 +104,7 @@ TEST(PostgresProtocolTest, RejectsMalformedStartupPackets) {
     std::string error;
     // Act -- all parameters present but no empty-string terminator
     EXPECT_FALSE(ParseStartupPacket(
-                     StartupWithPayload(std::string("user\0alice\0", 11)),
-                     &error));
+        StartupWithPayload(std::string("user\0alice\0", 11)), &error));
     EXPECT_NE(error.find("no terminator"), std::string::npos);
   }
   {
@@ -141,8 +140,8 @@ TEST(PostgresProtocolTest, EncodesDoubleAndDateValues) {
                  Value(std::string("x")), Value()});
   // Act -- encode a data row and a matching row description
   const std::string message = DataRow(row);
-  const std::string description = RowDescription(
-      {{"d", ValueType::kDouble}, {"dt", ValueType::kDate}});
+  const std::string description =
+      RowDescription({{"d", ValueType::kDouble}, {"dt", ValueType::kDate}});
 
   // Assert -- the double prints with full precision
   EXPECT_NE(message.find("3.5"), std::string::npos);
@@ -180,8 +179,8 @@ TEST(PostgresProtocolTest, EmptyQueryAndNegotiateProtocolVersion) {
 
 TEST(PostgresProtocolTest, ErrorResponseSanitizesFields) {
   // Act -- build an error response whose message and SQLSTATE carry NUL bytes
-  const std::string message = ErrorResponse(std::string("bad\0query", 9),
-                                            std::string("42\0P01", 6));
+  const std::string message =
+      ErrorResponse(std::string("bad\0query", 9), std::string("42\0P01", 6));
   // Assert -- the type byte and severity fields are present
   EXPECT_EQ(message[0], 'E');
   EXPECT_NE(message.find("ERROR"), std::string::npos);
@@ -221,8 +220,8 @@ TEST(PostgresProtocolTest, SplitSqlStatementsRespectsBackslashEscapes) {
   // normal character to the splitter, so `\'` toggled the quote state early
   // and a semicolon inside the string split statements (classic
   // statement-split injection: `SELECT 'a\', 2; DROP TABLE t; --'`).
-  const std::vector<std::string> one = SplitSqlStatements(
-      "SELECT 'a\\', 2; DROP TABLE t; --'");
+  const std::vector<std::string> one =
+      SplitSqlStatements("SELECT 'a\\', 2; DROP TABLE t; --'");
   ASSERT_EQ(one.size(), 1U);
   EXPECT_EQ(one[0], "SELECT 'a\\', 2; DROP TABLE t; --'");
 
@@ -235,12 +234,11 @@ TEST(PostgresProtocolTest, SplitSqlStatementsRespectsBackslashEscapes) {
 
 TEST(PostgresProtocolTest, RowDescriptionDefaultNameAndTypes) {
   // Act -- describe columns with empty names and every wire type
-  const std::string description = RowDescription(
-      {{"", ValueType::kVarChar},
-       {"i", ValueType::kInt64},
-       {"d", ValueType::kDouble},
-       {"t", ValueType::kDate},
-       {"n", ValueType::kNull}});
+  const std::string description = RowDescription({{"", ValueType::kVarChar},
+                                                  {"i", ValueType::kInt64},
+                                                  {"d", ValueType::kDouble},
+                                                  {"t", ValueType::kDate},
+                                                  {"n", ValueType::kNull}});
   // Assert -- anonymous columns are labelled ?column?
   EXPECT_NE(description.find("?column?"), std::string::npos);
   // int8 OID 20
@@ -337,7 +335,9 @@ TEST(PostgresProtocolTest, DuplicateStartupParametersKeepLastValue) {
   const std::optional<StartupPacket> parsed =
       ParseStartupPacket(packet, &error);
   ASSERT_TRUE(parsed) << error;
-  if (!parsed.has_value()) { return; }
+  if (!parsed.has_value()) {
+    return;
+  }
   ASSERT_EQ(parsed->parameters.size(), 1U);
   EXPECT_EQ(parsed->parameters.at("user"), "second");
 }

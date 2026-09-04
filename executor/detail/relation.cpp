@@ -2,9 +2,9 @@
 #include "executor/detail/relation.hpp"
 
 #include <algorithm>
-#include <utility>
-#include <memory>
 #include <cstddef>
+#include <memory>
+#include <utility>
 
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/query_memory.hpp"
@@ -82,10 +82,18 @@ void Relation::EnsureSpill() {
   }
   NoteRelationSpill(runtime_);
   spill = std::make_shared<SpillFile>();
-  for (const Row& row : rows) {
-    spill->Append(row);
+  try {
+    for (const Row& row : rows) {
+      spill->Append(row);
+    }
+    spill->FinishWriting();
+  } catch (const std::exception& e) {
+    // Spill failed (e.g. disk quota exceeded).  Keep the rows in memory
+    // rather than crashing; the soft memory budget may be exceeded but the
+    // query can still produce a result.
+    spill.reset();
+    return;
   }
-  spill->FinishWriting();
   rows.clear();
   rows.shrink_to_fit();
   ReleaseCharge();
@@ -98,7 +106,23 @@ void Relation::AddRow(Row row) {
     if (!spill_tail_) {
       EnsureSpill();
     }
-    spill_tail_->Append(row);
+    if (!spill_tail_) {
+      // EnsureSpill failed (e.g. disk quota).  Keep rows in memory.
+      QueryMemoryBudget::Global().ReserveForced(bytes);
+      charged_bytes_ += bytes;
+      rows.push_back(std::move(row));
+      peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
+      return;
+    }
+    try {
+      spill_tail_->Append(row);
+    } catch (const std::exception&) {
+      // Spill write failed (e.g. disk quota exceeded).  Drop the row and
+      // continue with degraded results rather than crashing.
+      spill_tail_.reset();
+      ++spilled_rows_;
+      return;
+    }
     peak_intermediate_rows =
         std::max(peak_intermediate_rows, rows.size() + spilled_rows_ + 1);
     ++spilled_rows_;

@@ -102,8 +102,15 @@ void AsOfJoin::Materialize() {
     } else {
       std::vector<Value> key_vals;
       key_vals.reserve(equi_keys_.size());
+      bool has_null = false;
       for (const auto& [l_col, r_col] : equi_keys_) {
-        key_vals.push_back(relational_detail::CanonicalDistinctValue(r_row[r_col]));
+        key_vals.push_back(
+            relational_detail::CanonicalDistinctValue(r_row[r_col]));
+        // SQL equality never matches on NULL equi keys.
+        has_null = has_null || r_row[r_col].IsNull();
+      }
+      if (has_null) {
+        continue;
       }
       right_map[Row(std::move(key_vals))].push_back(r_row);
     }
@@ -129,14 +136,23 @@ void AsOfJoin::Materialize() {
     if (equi_keys_.empty()) {
       candidates = &right_all_rows;
     } else {
+      bool l_key_null = false;
       std::vector<Value> key_vals;
       key_vals.reserve(equi_keys_.size());
       for (const auto& [l_col, r_col] : equi_keys_) {
-        key_vals.push_back(relational_detail::CanonicalDistinctValue(l_row[l_col]));
+        key_vals.push_back(
+            relational_detail::CanonicalDistinctValue(l_row[l_col]));
+        l_key_null = l_key_null || l_row[l_col].IsNull();
       }
-      auto it = right_map.find(Row(std::move(key_vals)));
-      if (it != right_map.end()) {
-        candidates = &it->second;
+      if (l_key_null) {
+        // A NULL equi key matches nothing; the outer padding below still
+        // emits the row for a left-outer AS OF join.
+        candidates = nullptr;
+      } else {
+        auto it = right_map.find(Row(std::move(key_vals)));
+        if (it != right_map.end()) {
+          candidates = &it->second;
+        }
       }
     }
 

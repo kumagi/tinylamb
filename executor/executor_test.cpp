@@ -15,16 +15,16 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <cctype>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -52,8 +52,8 @@
 #include "executor/index_scan.hpp"
 #include "executor/insert.hpp"
 #include "executor/limit.hpp"
-#include "executor/parallel_scan.hpp"
 #include "executor/parallel_aggregation.hpp"
+#include "executor/parallel_scan.hpp"
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
 #include "executor/sort.hpp"
@@ -78,8 +78,9 @@ class SyntheticBatchExecutor final : public ExecutorBase {
   explicit SyntheticBatchExecutor(size_t row_count) : row_count_(row_count) {}
 
   bool Next(Row* destination, RowPosition* position) override {
-    if (next_row_ == row_count_) { return false;
-}
+    if (next_row_ == row_count_) {
+      return false;
+    }
     *destination = Row({Value(static_cast<int64_t>(next_row_ % 100))});
     if (position != nullptr) {
       *position = RowPosition(1, next_row_);
@@ -93,9 +94,8 @@ class SyntheticBatchExecutor final : public ExecutorBase {
     destination->Reset(schema, max_rows);
     const size_t batch_rows = std::min<size_t>(max_rows, 64);
     while (next_row_ < row_count_ && destination->Size() < batch_rows) {
-      destination->Append(
-          Row({Value(static_cast<int64_t>(next_row_ % 100))}),
-          RowPosition(1, next_row_));
+      destination->Append(Row({Value(static_cast<int64_t>(next_row_ % 100))}),
+                          RowPosition(1, next_row_));
       ++next_row_;
     }
     return destination->Size();
@@ -168,9 +168,9 @@ TEST_F(ExecutorTest, FullScan) {
   const std::shared_ptr<Table>& tbl = tbl_status.Value();
   FullScan fs(ctx.txn_, *tbl);
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2)}),
-                            Row({Value(3), Value("piyo"), Value(12.2)}),
-                            Row({Value(1), Value("world"), Value(4.9)}),
-                            Row({Value(2), Value("arise"), Value(4.14)})});
+                           Row({Value(3), Value("piyo"), Value(12.2)}),
+                           Row({Value(1), Value("world"), Value(4.9)}),
+                           Row({Value(2), Value("arise"), Value(4.14)})});
   DumpLog(fs);
   Row got;
   RowPosition pos;
@@ -203,10 +203,10 @@ TEST_F(ExecutorTest, IndexScan) {
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"), true,
-                BinaryExpressionExp(ColumnValueExp("score"),
-                                    BinaryOperation::kGreaterThan,
-                                    ConstantValueExp(Value(10.0))),
-                sc);
+               BinaryExpressionExp(ColumnValueExp("score"),
+                                   BinaryOperation::kGreaterThan,
+                                   ConstantValueExp(Value(10.0))),
+               sc);
   Row target({Value(3), Value("piyo"), Value(12.2)});
   DumpLog(fs);
   Row got;
@@ -230,11 +230,11 @@ TEST_F(ExecutorTest, IndexOnlyScan) {
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"),
-                    true,
-                    BinaryExpressionExp(ColumnValueExp("score"),
-                                        BinaryOperation::kGreaterThan,
-                                        ConstantValueExp(Value(10.0))),
-                    sc);
+                   true,
+                   BinaryExpressionExp(ColumnValueExp("score"),
+                                       BinaryOperation::kGreaterThan,
+                                       ConstantValueExp(Value(10.0))),
+                   sc);
   Row expected({Value("piyo"), Value(12.2)});
   DumpLog(fs);
   Row got;
@@ -258,10 +258,10 @@ TEST_F(ExecutorTest, IndexOnlyFullScan) {
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value(), Value(), true,
-                    BinaryExpressionExp(ColumnValueExp("score"),
-                                        BinaryOperation::kGreaterThan,
-                                        ConstantValueExp(Value(1.0))),
-                    sc);
+                   BinaryExpressionExp(ColumnValueExp("score"),
+                                       BinaryOperation::kGreaterThan,
+                                       ConstantValueExp(Value(1.0))),
+                   sc);
   DumpLog(fs);
   Row got;
   RowPosition pos;
@@ -288,10 +288,10 @@ TEST_F(ExecutorTest, Projection) {
   const std::shared_ptr<Table>& tbl = tbl_status.Value();
   auto fs = std::make_shared<FullScan>(ctx.txn_, *tbl);
   Projection proj({NamedExpression("key"), NamedExpression("score")},
-                   tbl->GetSchema(), std::move(fs));
+                  tbl->GetSchema(), std::move(fs));
   std::unordered_set rows(
       {Row({Value(0), Value(1.2)}), Row({Value(3), Value(12.2)}),
-        Row({Value(1), Value(4.9)}), Row({Value(2), Value(4.14)})});
+       Row({Value(1), Value(4.9)}), Row({Value(2), Value(4.14)})});
   DumpLog(proj);
   Row got;
 
@@ -322,7 +322,7 @@ TEST_F(ExecutorTest, Selection) {
   const std::shared_ptr<Table>& tbl = tbl_status.Value();
   Expression key_is_1 =
       BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
-                           ConstantValueExp(Value(1)));
+                          ConstantValueExp(Value(1)));
   Selection sel(key_is_1, tbl->GetSchema(),
                 std::make_shared<FullScan>(ctx.txn_, *tbl));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
@@ -332,19 +332,20 @@ TEST_F(ExecutorTest, Selection) {
   // Act -- advance Selection cursor to first matching row
   ASSERT_TRUE(sel.Next(&got, nullptr));
 
-  // Assert -- matched row is in expected set and cursor exhausts after one match
+  // Assert -- matched row is in expected set and cursor exhausts after one
+  // match
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_FALSE(sel.Next(&got, nullptr));
 }
 
 TEST_F(ExecutorTest, SelectionSkipsImpossibleZoneMapBatch) {
   TransactionContext ctx = rs_->BeginContext();
-  const StatusOr<std::shared_ptr<Table>> table_status = ctx.GetTable(kTableName);
+  const StatusOr<std::shared_ptr<Table>> table_status =
+      ctx.GetTable(kTableName);
   ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
   const std::shared_ptr<Table>& table = table_status.Value();
   Selection selection(
-      BinaryExpressionExp(ColumnValueExp("key"),
-                          BinaryOperation::kGreaterThan,
+      BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kGreaterThan,
                           ConstantValueExp(Value(1000))),
       table->GetSchema(), std::make_shared<FullScan>(ctx.txn_, *table));
   DataChunk output;
@@ -366,8 +367,9 @@ TEST_F(ExecutorTest, SelectionUsesJitForLargeIntegerBatches) {
       schema, std::make_shared<ConstantExecutor>(std::move(rows)), 1024);
   DataChunk output;
   size_t selected = 0;
-  while (selection.NextBatch(&output) != 0) { selected += output.Size();
-}
+  while (selection.NextBatch(&output) != 0) {
+    selected += output.Size();
+  }
   EXPECT_EQ(selected, 1047U);
   EXPECT_GE(selection.JitBatches(), 1U);
 }
@@ -381,11 +383,10 @@ TEST_F(ExecutorTest, ProjectionUsesJitForLargeAffineIntegerBatches) {
   const Schema schema("jit", {Column("value", ValueType::kInt64)});
   std::vector<NamedExpression> expressions = {NamedExpression(
       "affine",
-      BinaryExpressionExp(
-          BinaryExpressionExp(ColumnValueExp("value"),
-                              BinaryOperation::kMultiply,
-                              ConstantValueExp(Value(3))),
-          BinaryOperation::kAdd, ConstantValueExp(Value(7))))};
+      BinaryExpressionExp(BinaryExpressionExp(ColumnValueExp("value"),
+                                              BinaryOperation::kMultiply,
+                                              ConstantValueExp(Value(3))),
+                          BinaryOperation::kAdd, ConstantValueExp(Value(7))))};
   Projection projection(std::move(expressions), schema,
                         std::make_shared<ConstantExecutor>(std::move(rows)),
                         1024);
@@ -412,8 +413,8 @@ TEST_F(ExecutorTest, AggregationUsesJitForLargeIntegerSumBatches) {
   }
   const Schema schema("jit", {Column("value", ValueType::kInt64)});
   std::vector<NamedExpression> aggregates = {NamedExpression(
-      "sum", AggregateExpressionExp(AggregationType::kSum,
-                                     ColumnValueExp("value")))};
+      "sum",
+      AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("value")))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates), 1024);
@@ -497,12 +498,13 @@ TEST_F(ExecutorTest, IndexJoin) {
   ASSERT_SUCCESS(rs_->CreateIndex(
       ctx, "RightTable",
       IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
-  const StatusOr<std::shared_ptr<Table>> reload_right_status = ctx.GetTable("RightTable");
+  const StatusOr<std::shared_ptr<Table>> reload_right_status =
+      ctx.GetTable("RightTable");
   ASSERT_EQ(reload_right_status.GetStatus(), Status::kSuccess);
   const std::shared_ptr<Table>& reload_right = reload_right_status.Value();
   ASSERT_EQ(reload_right->IndexCount(), 1);
   IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
-                *reload_right, reload_right->GetIndex(0), {0});
+               *reload_right, reload_right->GetIndex(0), {0});
   LOG(INFO) << ij;
   std::unordered_set expected(
       {Row({Value(0), Value("hello"), Value(1.2), Value(0), Value(9.2),
@@ -562,7 +564,8 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
   ASSERT_SUCCESS(rs_->CreateIndex(
       ctx, "RightTable",
       IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
-  const StatusOr<std::shared_ptr<Table>> reload_right_status = ctx.GetTable("RightTable");
+  const StatusOr<std::shared_ptr<Table>> reload_right_status =
+      ctx.GetTable("RightTable");
   ASSERT_EQ(reload_right_status.GetStatus(), Status::kSuccess);
   const std::shared_ptr<Table>& reload_right = reload_right_status.Value();
   ASSERT_EQ(reload_right->IndexCount(), 1);
@@ -604,7 +607,8 @@ TEST_F(ExecutorTest, Insert) {
       {Column("key2", ValueType::kInt64), Column("name2", ValueType::kVarChar),
        Column("score2", ValueType::kDouble)}};
   rs_->CreateTable(ctx, src_schema);
-  const StatusOr<std::shared_ptr<Table>> right_tbl_status = ctx.GetTable("SrcTable");
+  const StatusOr<std::shared_ptr<Table>> right_tbl_status =
+      ctx.GetTable("SrcTable");
   ASSERT_EQ(right_tbl_status.GetStatus(), Status::kSuccess);
   const std::shared_ptr<Table>& right_tbl = right_tbl_status.Value();
   BulkInsert(ctx.txn_, *right_tbl,
@@ -620,7 +624,8 @@ TEST_F(ExecutorTest, Insert) {
   LOG(INFO) << *insert;
   Row result;
 
-  // Act 1 -- iterate Insert executor to produce rows from SrcTable into SampleTable
+  // Act 1 -- iterate Insert executor to produce rows from SrcTable into
+  // SampleTable
   ASSERT_TRUE(insert->Next(&result, nullptr));
   ASSERT_EQ(result[1], Value(7));
   ASSERT_FALSE(insert->Next(&result, nullptr));
@@ -666,7 +671,8 @@ TEST_F(ExecutorTest, Update) {
       {Column("key2", ValueType::kInt64), Column("name2", ValueType::kVarChar),
        Column("score2", ValueType::kDouble)}};
   rs_->CreateTable(ctx, src_schema);
-  const StatusOr<std::shared_ptr<Table>> right_tbl_status = ctx.GetTable("SrcTable");
+  const StatusOr<std::shared_ptr<Table>> right_tbl_status =
+      ctx.GetTable("SrcTable");
   ASSERT_EQ(right_tbl_status.GetStatus(), Status::kSuccess);
 
   std::vector<NamedExpression> update_rule = {
@@ -707,7 +713,8 @@ TEST_F(ExecutorTest, Update) {
     rows.erase(got);
   }
 
-  // Assert 2 -- FullScan consumed all expected updated rows and cursor exhausted
+  // Assert 2 -- FullScan consumed all expected updated rows and cursor
+  // exhausted
   ASSERT_TRUE(rows.empty());
 }
 
@@ -760,9 +767,9 @@ TEST_F(ExecutorTest, MixedAggregateKeepsBitAndResult) {
       Row({Value(int64_t{3}), Value("c")}),
   });
   std::vector<NamedExpression> aggregates = {
-      NamedExpression("bit_and", AggregateExpressionExp(
-                                     AggregationType::kBitAnd,
-                                     ColumnValueExp("x"))),
+      NamedExpression("bit_and",
+                      AggregateExpressionExp(AggregationType::kBitAnd,
+                                             ColumnValueExp("x"))),
       NamedExpression("str", AggregateExpressionExp(AggregationType::kStringAgg,
                                                     ColumnValueExp("y")))};
   AggregationExecutor agg(src, schema, aggregates);
@@ -807,7 +814,8 @@ TEST_F(ExecutorTest, MinMaxWithNaNIsNaNAcrossPaths) {
 
 TEST_F(ExecutorTest, VectorizedScanFilterProjectAggregatePipeline) {
   TransactionContext ctx = rs_->BeginContext();
-  const StatusOr<std::shared_ptr<Table>> table_status = ctx.GetTable(kTableName);
+  const StatusOr<std::shared_ptr<Table>> table_status =
+      ctx.GetTable(kTableName);
   ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
   const std::shared_ptr<Table>& table = table_status.Value();
   const Schema input_schema = table->GetSchema();
@@ -817,16 +825,14 @@ TEST_F(ExecutorTest, VectorizedScanFilterProjectAggregatePipeline) {
                           BinaryOperation::kGreaterThan,
                           ConstantValueExp(Value(4.0))),
       input_schema, scan);
-  std::vector<NamedExpression> projections = {
-      NamedExpression(
-          "doubled",
-          BinaryExpressionExp(ColumnValueExp("score"),
-                              BinaryOperation::kMultiply,
-                              ConstantValueExp(Value(2.0))))};
+  std::vector<NamedExpression> projections = {NamedExpression(
+      "doubled",
+      BinaryExpressionExp(ColumnValueExp("score"), BinaryOperation::kMultiply,
+                          ConstantValueExp(Value(2.0))))};
   auto project = std::make_shared<Projection>(projections, input_schema,
                                               std::move(filter));
-  const Schema projected_schema(
-      "projected", {Column("doubled", ValueType::kDouble)});
+  const Schema projected_schema("projected",
+                                {Column("doubled", ValueType::kDouble)});
   std::vector<NamedExpression> aggregates = {
       NamedExpression("count",
                       AggregateExpressionExp(AggregationType::kCount,
@@ -859,14 +865,17 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
     for (int64_t key = 0; key < kRows; ++key) {
       std::string payload = "row-" + std::to_string(key);
       payload.resize(100, 'x');
-      ASSERT_SUCCESS(table.Insert(
-          writer.txn_, Row({Value(key), Value(std::move(payload))})).GetStatus());
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_, Row({Value(key), Value(std::move(payload))}))
+              .GetStatus());
     }
     ASSERT_SUCCESS(writer.txn_.PreCommit());
   }
 
   TransactionContext reader = rs_->BeginReadOnlyContext();
-  const StatusOr<std::shared_ptr<Table>> table_status = reader.GetTable(kParallelTable);
+  const StatusOr<std::shared_ptr<Table>> table_status =
+      reader.GetTable(kParallelTable);
   ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
   const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 4, 1);
@@ -878,8 +887,8 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
   while (scan.NextBatch(&chunk, 37) != 0) {
     ASSERT_LE(chunk.Size(), 37U);
     for (size_t row = 0; row < chunk.Size(); ++row) {
-      EXPECT_TRUE(keys.insert(chunk.ColumnAt(0).ValueAt(row).value.int_value)
-                      .second);
+      EXPECT_TRUE(
+          keys.insert(chunk.ColumnAt(0).ValueAt(row).value.int_value).second);
     }
   }
   EXPECT_EQ(keys.size(), static_cast<size_t>(kRows));
@@ -892,21 +901,16 @@ TEST_F(ExecutorTest, ThreadLocalAggregationMergesPartialAndDistinctStates) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto input = std::make_shared<SyntheticBatchExecutor>(10000);
   std::vector<NamedExpression> aggregates = {
-      NamedExpression("count",
-                      AggregateExpressionExp(AggregationType::kCount,
-                                             ColumnValueExp("value"))),
-      NamedExpression("sum",
-                      AggregateExpressionExp(AggregationType::kSum,
-                                             ColumnValueExp("value"))),
-      NamedExpression("avg",
-                      AggregateExpressionExp(AggregationType::kAvg,
-                                             ColumnValueExp("value"))),
-      NamedExpression("min",
-                      AggregateExpressionExp(AggregationType::kMin,
-                                             ColumnValueExp("value"))),
-      NamedExpression("max",
-                      AggregateExpressionExp(AggregationType::kMax,
-                                             ColumnValueExp("value"))),
+      NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
+                                                      ColumnValueExp("value"))),
+      NamedExpression("sum", AggregateExpressionExp(AggregationType::kSum,
+                                                    ColumnValueExp("value"))),
+      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
+                                                    ColumnValueExp("value"))),
+      NamedExpression("min", AggregateExpressionExp(AggregationType::kMin,
+                                                    ColumnValueExp("value"))),
+      NamedExpression("max", AggregateExpressionExp(AggregationType::kMax,
+                                                    ColumnValueExp("value"))),
       NamedExpression("distinct_count",
                       AggregateExpressionExp(AggregationType::kCount,
                                              ColumnValueExp("value"), true))};
@@ -965,7 +969,8 @@ TEST_F(ExecutorTest, DistinctAllDuplicates) {
   for (int i = 0; i < 6; ++i) {
     rows.emplace_back(std::vector<Value>{Value(7)});
   }
-  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  DistinctExecutor distinct(
+      std::make_shared<ConstantExecutor>(std::move(rows)));
   Row row;
   RowPosition pos;
   ASSERT_TRUE(distinct.Next(&row, &pos));
@@ -976,7 +981,8 @@ TEST_F(ExecutorTest, DistinctAllDuplicates) {
 TEST_F(ExecutorTest, DistinctAlreadySortedInput) {
   std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value(2)}),
                         Row({Value(3)}), Row({Value(4)}), Row({Value(4)})};
-  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  DistinctExecutor distinct(
+      std::make_shared<ConstantExecutor>(std::move(rows)));
   Row row;
   RowPosition pos;
   int64_t expected = 1;
@@ -990,7 +996,8 @@ TEST_F(ExecutorTest, DistinctAlreadySortedInput) {
 TEST_F(ExecutorTest, DistinctUnsortedInterleavedDuplicates) {
   std::vector<Row> rows{Row({Value(3)}), Row({Value(1)}), Row({Value(3)}),
                         Row({Value(2)}), Row({Value(1)}), Row({Value(4)})};
-  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  DistinctExecutor distinct(
+      std::make_shared<ConstantExecutor>(std::move(rows)));
   Row row;
   RowPosition pos;
   std::unordered_set<Value> seen;
@@ -1000,8 +1007,8 @@ TEST_F(ExecutorTest, DistinctUnsortedInterleavedDuplicates) {
     ++count;
   }
   EXPECT_EQ(count, 4U);
-  EXPECT_EQ(seen,
-            std::unordered_set<Value>({Value(1), Value(2), Value(3), Value(4)}));
+  EXPECT_EQ(seen, std::unordered_set<Value>(
+                      {Value(1), Value(2), Value(3), Value(4)}));
 }
 
 TEST_F(ExecutorTest, DistinctMultipleColumns) {
@@ -1009,7 +1016,8 @@ TEST_F(ExecutorTest, DistinctMultipleColumns) {
       Row({Value(1), Value("a")}), Row({Value(1), Value("a")}),
       Row({Value(1), Value("b")}), Row({Value(2), Value("a")}),
       Row({Value(2), Value("a")}), Row({Value(2), Value("c")})};
-  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  DistinctExecutor distinct(
+      std::make_shared<ConstantExecutor>(std::move(rows)));
   Row row;
   RowPosition pos;
   std::unordered_set<Row> seen;
@@ -1027,14 +1035,16 @@ TEST_F(ExecutorTest, DistinctNullValueTreatedAsValue) {
   // std::hash<Value> maps kNull to a constant (it no longer throws), so
   // DistinctExecutor deduplicates NULL-containing rows like any other value.
   std::vector<Row> rows{Row({Value()}), Row({Value()}), Row({Value(5)})};
-  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  DistinctExecutor distinct(
+      std::make_shared<ConstantExecutor>(std::move(rows)));
   Row row;
   RowPosition pos;
   size_t count = 0;
   bool saw_null = false;
   while (distinct.Next(&row, &pos)) {
-    if (row[0].IsNull()) { saw_null = true;
-}
+    if (row[0].IsNull()) {
+      saw_null = true;
+    }
     ++count;
   }
   EXPECT_EQ(count, 2U);
@@ -1048,11 +1058,11 @@ TEST_F(ExecutorTest, DistinctOverFullScanPreservesRowsAndPositions) {
   const std::shared_ptr<Table>& tbl = tbl_status.Value();
   DistinctExecutor distinct(std::make_shared<FullScan>(ctx.txn_, *tbl));
   LOG(INFO) << distinct;
-  std::unordered_set<Row> expected({
-      Row({Value(0), Value("hello"), Value(1.2)}),
-      Row({Value(3), Value("piyo"), Value(12.2)}),
-      Row({Value(1), Value("world"), Value(4.9)}),
-      Row({Value(2), Value("arise"), Value(4.14)})});
+  std::unordered_set<Row> expected(
+      {Row({Value(0), Value("hello"), Value(1.2)}),
+       Row({Value(3), Value("piyo"), Value(12.2)}),
+       Row({Value(1), Value("world"), Value(4.9)}),
+       Row({Value(2), Value("arise"), Value(4.14)})});
   Row row;
   RowPosition pos;
   size_t count = 0;
@@ -1074,9 +1084,9 @@ TEST_F(ExecutorTest, CrossJoinProducesCartesianProduct) {
   auto right = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value("a")}), Row({Value("b")})});
   CrossJoin join(left, right);
-  std::unordered_set<Row> expected({
-      Row({Value(1), Value("a")}), Row({Value(1), Value("b")}),
-      Row({Value(2), Value("a")}), Row({Value(2), Value("b")})});
+  std::unordered_set<Row> expected(
+      {Row({Value(1), Value("a")}), Row({Value(1), Value("b")}),
+       Row({Value(2), Value("a")}), Row({Value(2), Value("b")})});
   Row got;
   RowPosition pos;
   size_t count = 0;
@@ -1093,8 +1103,7 @@ TEST_F(ExecutorTest, CrossJoinProducesCartesianProduct) {
 TEST_F(ExecutorTest, CrossJoinEmptyRightSideYieldsNoRows) {
   auto left = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(1)}), Row({Value(2)})});
-  auto right =
-      std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  auto right = std::make_shared<ConstantExecutor>(std::vector<Row>{});
   CrossJoin join(left, right);
   Row got;
   RowPosition pos;
@@ -1102,8 +1111,7 @@ TEST_F(ExecutorTest, CrossJoinEmptyRightSideYieldsNoRows) {
 }
 
 TEST_F(ExecutorTest, CrossJoinEmptyLeftSideYieldsNoRows) {
-  auto left =
-      std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  auto left = std::make_shared<ConstantExecutor>(std::vector<Row>{});
   auto right = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value("a")}), Row({Value("b")})});
   CrossJoin join(left, right);
@@ -1112,10 +1120,8 @@ TEST_F(ExecutorTest, CrossJoinEmptyLeftSideYieldsNoRows) {
 }
 
 TEST_F(ExecutorTest, CrossJoinBothSidesEmptyYieldsNoRows) {
-  auto left =
-      std::make_shared<ConstantExecutor>(std::vector<Row>{});
-  auto right =
-      std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  auto left = std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  auto right = std::make_shared<ConstantExecutor>(std::vector<Row>{});
   CrossJoin join(left, right);
   Row got;
   DataChunk chunk;
@@ -1268,29 +1274,29 @@ TEST_F(ExecutorTest, SelectionConstantOnLeftIsFlipped) {
     std::ranges::sort(keys);
     return keys;
   };
-  EXPECT_EQ(collect_keys(BinaryExpressionExp(
-                ConstantValueExp(Value(2)), BinaryOperation::kLessThan,
-                ColumnValueExp("key"))),
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                                             BinaryOperation::kLessThan,
+                                             ColumnValueExp("key"))),
             std::vector<int64_t>({3}));
-  EXPECT_EQ(collect_keys(BinaryExpressionExp(
-                ConstantValueExp(Value(2)), BinaryOperation::kLessThanEquals,
-                ColumnValueExp("key"))),
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                                             BinaryOperation::kLessThanEquals,
+                                             ColumnValueExp("key"))),
             std::vector<int64_t>({2, 3}));
-  EXPECT_EQ(collect_keys(BinaryExpressionExp(
-                ConstantValueExp(Value(3)), BinaryOperation::kGreaterThan,
-                ColumnValueExp("key"))),
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(ConstantValueExp(Value(3)),
+                                             BinaryOperation::kGreaterThan,
+                                             ColumnValueExp("key"))),
             std::vector<int64_t>({0, 1, 2}));
   EXPECT_EQ(collect_keys(BinaryExpressionExp(
                 ConstantValueExp(Value(3)), BinaryOperation::kGreaterThanEquals,
                 ColumnValueExp("key"))),
             std::vector<int64_t>({0, 1, 2, 3}));
-  EXPECT_EQ(collect_keys(BinaryExpressionExp(
-                ConstantValueExp(Value(3)), BinaryOperation::kEquals,
-                ColumnValueExp("key"))),
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(ConstantValueExp(Value(3)),
+                                             BinaryOperation::kEquals,
+                                             ColumnValueExp("key"))),
             std::vector<int64_t>({3}));
-  EXPECT_EQ(collect_keys(BinaryExpressionExp(
-                ConstantValueExp(Value(3)), BinaryOperation::kNotEquals,
-                ColumnValueExp("key"))),
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(ConstantValueExp(Value(3)),
+                                             BinaryOperation::kNotEquals,
+                                             ColumnValueExp("key"))),
             std::vector<int64_t>({0, 1, 2}));
 }
 
@@ -1371,13 +1377,16 @@ TEST_F(ExecutorTest, ParallelScanProjectedColumns) {
   constexpr int64_t kRows = 800;
   {
     TransactionContext writer = rs_->BeginContext();
-    Schema schema{kTable, {Column("key", ValueType::kInt64),
-                           Column("name", ValueType::kVarChar)}};
+    Schema schema{kTable,
+                  {Column("key", ValueType::kInt64),
+                   Column("name", ValueType::kVarChar)}};
     ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
     for (int64_t key = 0; key < kRows; ++key) {
-      ASSERT_SUCCESS(table.Insert(
-          writer.txn_, Row({Value(key), Value("n" + std::to_string(key))}))
-          .GetStatus());
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_,
+                      Row({Value(key), Value("n" + std::to_string(key))}))
+              .GetStatus());
     }
     ASSERT_SUCCESS(writer.txn_.PreCommit());
   }
@@ -1409,13 +1418,16 @@ TEST_F(ExecutorTest, ParallelScanReorderedProjectionThrows) {
   constexpr int64_t kRows = 800;
   {
     TransactionContext writer = rs_->BeginContext();
-    Schema schema{kTable, {Column("key", ValueType::kInt64),
-                           Column("name", ValueType::kVarChar)}};
+    Schema schema{kTable,
+                  {Column("key", ValueType::kInt64),
+                   Column("name", ValueType::kVarChar)}};
     ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
     for (int64_t key = 0; key < kRows; ++key) {
-      ASSERT_SUCCESS(table.Insert(
-          writer.txn_, Row({Value(key), Value("n" + std::to_string(key))}))
-          .GetStatus());
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_,
+                      Row({Value(key), Value("n" + std::to_string(key))}))
+              .GetStatus());
     }
     ASSERT_SUCCESS(writer.txn_.PreCommit());
   }
@@ -1452,8 +1464,9 @@ TEST_F(ExecutorTest, ParallelScanSplitsLargeChunksWhenAskedSmallBatches) {
   size_t batches = 0;
   while (true) {
     const size_t got = scan.NextBatch(&chunk, 1);
-    if (got == 0) { break;
-}
+    if (got == 0) {
+      break;
+    }
     EXPECT_EQ(got, 1U);
     total += got;
     ++batches;
@@ -1471,13 +1484,12 @@ TEST_F(ExecutorTest, ParallelAggregationCountStarAndExpressionChild) {
       NamedExpression(
           "count_star",
           AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("*"))),
-      NamedExpression(
-          "sum_plus_one",
-          AggregateExpressionExp(
-              AggregationType::kSum,
-              BinaryExpressionExp(ColumnValueExp("value"),
-                                  BinaryOperation::kAdd,
-                                  ConstantValueExp(Value(1)))))};
+      NamedExpression("sum_plus_one",
+                      AggregateExpressionExp(
+                          AggregationType::kSum,
+                          BinaryExpressionExp(ColumnValueExp("value"),
+                                              BinaryOperation::kAdd,
+                                              ConstantValueExp(Value(1)))))};
   ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
                                         2);
   Row result;
@@ -1487,12 +1499,34 @@ TEST_F(ExecutorTest, ParallelAggregationCountStarAndExpressionChild) {
   EXPECT_FALSE(aggregate.Next(&result, nullptr));
 }
 
+TEST_F(ExecutorTest, ParallelAggregationRespectsWhereFilter) {
+  // PRODUCTION BUG (fixed): the typed fast paths (row count / column scan)
+  // ignored an aggregate's FILTER(WHERE) predicate, so a pushed-down filter
+  // silently over-counted. The generic path must apply it.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<SyntheticBatchExecutor>(100);  // values 1..100
+  auto sum = std::make_shared<AggregateExpression>(AggregationType::kSum,
+                                                   ColumnValueExp("value"));
+  sum->SetWhereFilter(BinaryExpressionExp(ColumnValueExp("value"),
+                                          BinaryOperation::kGreaterThan,
+                                          ConstantValueExp(Value(50))));
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("sum_gt_50", std::move(sum))};
+  ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
+                                        2);
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  // SyntheticBatchExecutor yields 0..99; value > 50 keeps 51..99 = 3675
+  // (the unfiltered sum would be 4950).
+  EXPECT_EQ(result[0], Value(3675));
+}
+
 TEST_F(ExecutorTest, ParallelAggregationAverageOverEmptyInput) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto input = std::make_shared<ConstantExecutor>(std::vector<Row>{});
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
-                                                    ColumnValueExp("value")))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "avg",
+      AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("value")))};
   ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
                                         2);
   Row result;
@@ -1503,10 +1537,9 @@ TEST_F(ExecutorTest, ParallelAggregationAverageOverEmptyInput) {
 TEST_F(ExecutorTest, ParallelAggregationNextBatchAndDump) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto input = std::make_shared<SyntheticBatchExecutor>(50);
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("count",
-                      AggregateExpressionExp(AggregationType::kCount,
-                                             ColumnValueExp("value")))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "count", AggregateExpressionExp(AggregationType::kCount,
+                                      ColumnValueExp("value")))};
   ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
                                         3);
   LOG(INFO) << aggregate;
@@ -1518,12 +1551,11 @@ TEST_F(ExecutorTest, ParallelAggregationNextBatchAndDump) {
 
 TEST_F(ExecutorTest, ParallelAggregationMissingColumnThrows) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
-  auto input = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(2)})});
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("sum_missing",
-                      AggregateExpressionExp(AggregationType::kSum,
-                                             ColumnValueExp("missing")))};
+  auto input =
+      std::make_shared<ConstantExecutor>(std::vector<Row>{Row({Value(2)})});
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "sum_missing", AggregateExpressionExp(AggregationType::kSum,
+                                            ColumnValueExp("missing")))};
   ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
                                         2);
   Row result;
@@ -1538,11 +1570,13 @@ class FailingBatchExecutor final : public ExecutorBase {
       : remaining_(good_batches) {}
 
   bool Next(Row* dst, RowPosition* position) override {
-    if (remaining_ == 0 || failed_) { return false;
-}
+    if (remaining_ == 0 || failed_) {
+      return false;
+    }
     *dst = Row({Value(static_cast<int64_t>(emitted_))});
-    if (position != nullptr) { *position = RowPosition(1, emitted_);
-}
+    if (position != nullptr) {
+      *position = RowPosition(1, emitted_);
+    }
     ++emitted_;
     --remaining_;
     return true;
@@ -1551,8 +1585,9 @@ class FailingBatchExecutor final : public ExecutorBase {
   size_t NextBatch(DataChunk* destination, size_t max_rows) override {
     destination->Reset();
     for (size_t i = 0; i < max_rows && !failed_; ++i) {
-      if (remaining_ == 0) { break;
-}
+      if (remaining_ == 0) {
+        break;
+      }
       if (remaining_ == 1) {
         failed_ = true;
         throw std::runtime_error("synthetic aggregation failure");
@@ -1581,12 +1616,10 @@ TEST_F(ExecutorTest, ParallelAggregationRethrowsOnRetry) {
   // later Next() with a well-formed empty aggregate (COUNT=0 / SUM=NULL).
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   std::vector<NamedExpression> aggregates = {
-      NamedExpression("count",
-                      AggregateExpressionExp(AggregationType::kCount,
-                                             ColumnValueExp("value"))),
-      NamedExpression("sum",
-                      AggregateExpressionExp(AggregationType::kSum,
-                                             ColumnValueExp("value")))};
+      NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
+                                                      ColumnValueExp("value"))),
+      NamedExpression("sum", AggregateExpressionExp(AggregationType::kSum,
+                                                    ColumnValueExp("value")))};
   ParallelAggregationExecutor aggregate(
       std::make_shared<FailingBatchExecutor>(3), schema, aggregates, 2);
   Row result;
@@ -1614,12 +1647,12 @@ TEST_F(ExecutorTest, ParallelAggregationInt64FastPathMatchesSequential) {
                                                       ColumnValueExp("value"))),
         NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
                                                       ColumnValueExp("value"))),
-        NamedExpression(
-            "count", AggregateExpressionExp(AggregationType::kCount,
-                                            ColumnValueExp("value"))),
-        NamedExpression(
-            "count_star", AggregateExpressionExp(AggregationType::kCount,
-                                                 ColumnValueExp("*"))),
+        NamedExpression("count",
+                        AggregateExpressionExp(AggregationType::kCount,
+                                               ColumnValueExp("value"))),
+        NamedExpression("count_star",
+                        AggregateExpressionExp(AggregationType::kCount,
+                                               ColumnValueExp("*"))),
         NamedExpression("sum_expr",
                         AggregateExpressionExp(
                             AggregationType::kSum,
@@ -1648,8 +1681,9 @@ TEST_F(ExecutorTest, ParallelAggregationInt64FastPathMatchesSequential) {
   EXPECT_EQ(actual[5], Value(101));
   EXPECT_EQ(actual[6], Value(4993 + 99));
   for (size_t column = 0; column < expected.values_.size(); ++column) {
-    if (column == 3) { continue;
-}
+    if (column == 3) {
+      continue;
+    }
     EXPECT_EQ(actual[column], expected[column]) << "column " << column;
   }
   EXPECT_DOUBLE_EQ(actual[3].value.double_value,
@@ -1715,12 +1749,10 @@ TEST_F(ExecutorTest, SortDumpAndSmallInput) {
 }
 
 TEST_F(ExecutorTest, HashJoinNextBatchAndDump) {
-  auto left = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1), Value("l")}),
-                       Row({Value(2), Value("l2")})});
-  auto right = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1), Value("r1")}),
-                       Row({Value(1), Value("r2")})});
+  auto left = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(1), Value("l")}), Row({Value(2), Value("l2")})});
+  auto right = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(1), Value("r1")}), Row({Value(1), Value("r2")})});
   HashJoin join(left, {0}, right, {0});
   LOG(INFO) << join;
   DataChunk chunk;
@@ -1768,6 +1800,40 @@ TEST_F(ExecutorTest, HashJoinSpilledBuildKeepsNullProbeKeyOutOfAntiOutput) {
   EXPECT_EQ(out[0][0], Value(int64_t{500}));
 }
 
+TEST_F(ExecutorTest, InMemoryShardedBuildKeepsNullBuildKeyOutOfMatches) {
+  // PRODUCTION BUG (fixed): the pipelined in-memory join's sharded build
+  // inserted NULL (invalid) keys as KeyRef{} -- int_key 0, hash 0 -- so a
+  // probe key of 0 chained onto the NULL-keyed build row (SQL: no match).
+  // The build path must respect the same contract as BuildSideIndex, which
+  // already skipped invalid keys.
+  // The smaller side always becomes the build side, so the NULL-keyed side
+  // must be the small one.
+  auto build = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(int64_t{0})}),
+      Row({Value()}),  // NULL build key.
+      Row({Value(int64_t{4999})}),
+  });
+  std::vector<Row> probe_rows;
+  for (int64_t i = 0; i < 5000; ++i) {
+    probe_rows.emplace_back(Row({Value(i)}));
+  }
+  probe_rows.emplace_back(Row({Value(int64_t{12345})}));  // matches nothing.
+  auto probe = std::make_shared<ConstantExecutor>(probe_rows);
+  HashJoin join(probe, {0}, build, {0}, HashJoinMode::kInMemory,
+                JoinKind::kInner, /*worker_count=*/8);
+  std::vector<Row> out;
+  Row row;
+  RowPosition rp;
+  while (join.Next(&row, &rp)) {
+    out.push_back(row);
+  }
+  // Probe 0 matches the real 0 row; 4999 matches; 12345 matches nothing and
+  // must not match the NULL build key.
+  ASSERT_EQ(out.size(), 2U);
+  EXPECT_EQ(out[0][0], Value(int64_t{0}));
+  EXPECT_EQ(out[1][0], Value(int64_t{4999}));
+}
+
 TEST_F(ExecutorTest, HashJoinWithMultipleJoinColumnsDumpsAllKeys) {
   auto left = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(1), Value(10), Value("l")})});
@@ -1812,8 +1878,8 @@ TEST_F(ExecutorTest, LimitEqualToInputRows) {
 }
 
 TEST_F(ExecutorTest, LimitGreaterThanInputRows) {
-  auto input = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1)})});
+  auto input =
+      std::make_shared<ConstantExecutor>(std::vector<Row>{Row({Value(1)})});
   LimitExecutor limit(input, 5, 0);
   Row row;
   ASSERT_TRUE(limit.Next(&row, nullptr));
@@ -1891,8 +1957,9 @@ std::vector<Row> RelationalRun(Database& database, std::string_view sql) {
     return rows;
   }
   Row row;
-  while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row);
-}
+  while (prepared.Value()->Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
   return rows;
 }
@@ -1930,8 +1997,9 @@ TEST_F(ExecutorTest, RelationalTruthinessOfBareColumns) {
   // name (varchar), score (double) and key (int64) are tested for truthiness
   // directly inside the relational predicate evaluator (relational.cpp Truthy).
   const auto rows = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE (name AND score AND key) OR "
-            "key = 5 ORDER BY key;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE (name AND score AND key) OR "
+      "key = 5 ORDER BY key;");
   ASSERT_EQ(rows.size(), 3U);
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[1][0], Value(2));
@@ -1941,16 +2009,18 @@ TEST_F(ExecutorTest, RelationalTruthinessOfBareColumns) {
 TEST_F(ExecutorTest, RelationalNotEqualsAndLikePredicates) {
   // kNotEquals on numeric operands and LIKE with a trailing '%'.
   const auto not_equals = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE key != 2 OR key = 5 ORDER BY "
-            "key;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE key != 2 OR key = 5 ORDER BY "
+      "key;");
   ASSERT_EQ(not_equals.size(), 3U);
   EXPECT_EQ(not_equals[0][0], Value(0));
   EXPECT_EQ(not_equals[1][0], Value(1));
   EXPECT_EQ(not_equals[2][0], Value(3));
 
   const auto like = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE name LIKE 'hello%' OR key = 3 "
-            "ORDER BY key;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE name LIKE 'hello%' OR key = 3 "
+      "ORDER BY key;");
   ASSERT_EQ(like.size(), 2U);
   EXPECT_EQ(like[0][0], Value(0));
   EXPECT_EQ(like[1][0], Value(3));
@@ -1959,8 +2029,9 @@ TEST_F(ExecutorTest, RelationalNotEqualsAndLikePredicates) {
 TEST_F(ExecutorTest, RelationalStringConcatenationWithPlus) {
   // '+' on two VARCHAR operands concatenates in the relational evaluator.
   const auto rows = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR name + name = "
-            "'hellohello' ORDER BY key;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE key = 1 OR name + name = "
+      "'hellohello' ORDER BY key;");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(0));
   EXPECT_EQ(rows[1][0], Value(1));
@@ -1976,21 +2047,41 @@ TEST_F(ExecutorTest, RelationalUnaryOperators) {
   EXPECT_EQ(minus[1][1], Value(-4.14));
 
   const auto is_null = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE key IS NULL OR key IS NOT "
-            "NULL;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE key IS NULL OR key IS NOT "
+      "NULL;");
   EXPECT_EQ(is_null.size(), 4U);
 
   const auto not_expr = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE NOT (key = 1) OR key = 2 "
-            "ORDER BY key;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE NOT (key = 1) OR key = 2 "
+      "ORDER BY key;");
   ASSERT_EQ(not_expr.size(), 3U);
   EXPECT_EQ(not_expr[0][0], Value(0));
   EXPECT_EQ(not_expr[1][0], Value(2));
   EXPECT_EQ(not_expr[2][0], Value(3));
 }
 
+TEST_F(ExecutorTest, RelationalSortMixedSignDescendingKeepsOrder) {
+  // Regression: the radix-sort fast path encoded DESC keys by flipping all
+  // bits of the raw two's-complement value, which kept negative keys below
+  // positive ones and produced a scrambled order for mixed-sign INT64.
+  const auto descending = RelationalRun(
+      *rs_,
+      "SELECT key FROM (SELECT -1 AS key UNION ALL SELECT 13 "
+      "UNION ALL SELECT -3 UNION ALL SELECT 2 UNION ALL SELECT 0) "
+      "ORDER BY key DESC;");
+  ASSERT_EQ(descending.size(), 5U);
+  EXPECT_EQ(descending[0][0], Value(13));
+  EXPECT_EQ(descending[1][0], Value(2));
+  EXPECT_EQ(descending[2][0], Value(0));
+  EXPECT_EQ(descending[3][0], Value(-1));
+  EXPECT_EQ(descending[4][0], Value(-3));
+}
+
 TEST_F(ExecutorTest, RelationalAggregateInUnaryAndCase) {
-  const auto negated = RelationalRun(*rs_, "SELECT -COUNT(*) FROM SampleTable;");
+  const auto negated =
+      RelationalRun(*rs_, "SELECT -COUNT(*) FROM SampleTable;");
   ASSERT_EQ(negated.size(), 1U);
   EXPECT_EQ(negated[0][0], Value(-4));
 
@@ -2001,9 +2092,10 @@ TEST_F(ExecutorTest, RelationalAggregateInUnaryAndCase) {
   EXPECT_EQ(conditional[0][0], Value(1));
 
   // Aggregate in the CASE else-clause (when-clauses carry no aggregate).
-  const auto aggregate_else = RelationalRun(
-      *rs_, "SELECT CASE WHEN key > 0 THEN 1 ELSE COUNT(*) END FROM "
-            "SampleTable;");
+  const auto aggregate_else =
+      RelationalRun(*rs_,
+                    "SELECT CASE WHEN key > 0 THEN 1 ELSE COUNT(*) END FROM "
+                    "SampleTable;");
   ASSERT_EQ(aggregate_else.size(), 1U);
   EXPECT_EQ(aggregate_else[0][0], Value(4));
 }
@@ -2031,13 +2123,15 @@ TEST_F(ExecutorTest, RelationalScalarFunctionsInGroupedQuery) {
 }
 
 TEST_F(ExecutorTest, RelationalDateFunctions) {
-  const auto add = RelationalRun(*rs_, "SELECT DATE_ADD('2026-01-01', INTERVAL 3 DAY);");
+  const auto add =
+      RelationalRun(*rs_, "SELECT DATE_ADD('2026-01-01', INTERVAL 3 DAY);");
   ASSERT_EQ(add.size(), 1U);
   EXPECT_EQ(add[0][0], Value("2026-01-04"));
 
   const auto extract = RelationalRun(
-      *rs_, "SELECT EXTRACT(YEAR FROM '2026-08-21'), EXTRACT(MONTH FROM "
-            "'2026-08-21'), EXTRACT(DAY FROM '2026-08-21');");
+      *rs_,
+      "SELECT EXTRACT(YEAR FROM '2026-08-21'), EXTRACT(MONTH FROM "
+      "'2026-08-21'), EXTRACT(DAY FROM '2026-08-21');");
   ASSERT_EQ(extract.size(), 1U);
   EXPECT_EQ(extract[0][0], Value(2026));
   EXPECT_EQ(extract[0][1], Value(8));
@@ -2048,8 +2142,9 @@ TEST_F(ExecutorTest, RelationalCorrelatedExistsBuildsIndex) {
   // The correlated equality `o.key = key` drives the per-subquery correlated
   // index (local key on the right-hand side of the equality).
   const auto rows = RelationalRun(
-      *rs_, "SELECT o.key FROM SampleTable AS o WHERE EXISTS (SELECT 1 FROM "
-            "SampleTable WHERE o.key = key AND key > 1) ORDER BY o.key;");
+      *rs_,
+      "SELECT o.key FROM SampleTable AS o WHERE EXISTS (SELECT 1 FROM "
+      "SampleTable WHERE o.key = key AND key > 1) ORDER BY o.key;");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(2));
   EXPECT_EQ(rows[1][0], Value(3));
@@ -2059,9 +2154,10 @@ TEST_F(ExecutorTest, RelationalCorrelatedExistsCacheHits) {
   // A cross join repeats every outer key 4 times; only the first evaluation
   // per key builds the correlated index, the rest must hit the result cache.
   const auto rows = RelationalRun(
-      *rs_, "SELECT o.key FROM SampleTable AS o CROSS JOIN SampleTable AS b "
-            "WHERE EXISTS (SELECT COUNT(*) FROM SampleTable WHERE o.key = key "
-            "HAVING COUNT(*) > 0) ORDER BY o.key;");
+      *rs_,
+      "SELECT o.key FROM SampleTable AS o CROSS JOIN SampleTable AS b "
+      "WHERE EXISTS (SELECT COUNT(*) FROM SampleTable WHERE o.key = key "
+      "HAVING COUNT(*) > 0) ORDER BY o.key;");
   ASSERT_EQ(rows.size(), 16U);
   for (const Row& row : rows) {
     EXPECT_TRUE(row[0].value.int_value >= 0 && row[0].value.int_value <= 3);
@@ -2071,13 +2167,15 @@ TEST_F(ExecutorTest, RelationalCorrelatedExistsCacheHits) {
 TEST_F(ExecutorTest, RelationalInnerAndLeftJoins) {
   // Inner join without an equality key uses the nested-loop fallback.
   const auto inner = RelationalRun(
-      *rs_, "SELECT a.key FROM SampleTable AS a JOIN SampleTable AS b ON "
-            "a.key > b.key ORDER BY a.key;");
+      *rs_,
+      "SELECT a.key FROM SampleTable AS a JOIN SampleTable AS b ON "
+      "a.key > b.key ORDER BY a.key;");
   ASSERT_EQ(inner.size(), 6U);
   // Left join without an equality key emits unmatched rows with NULLs.
   const auto left = RelationalRun(
-      *rs_, "SELECT a.key FROM SampleTable AS a LEFT JOIN SampleTable AS b ON "
-            "a.key > b.key ORDER BY a.key;");
+      *rs_,
+      "SELECT a.key FROM SampleTable AS a LEFT JOIN SampleTable AS b ON "
+      "a.key > b.key ORDER BY a.key;");
   ASSERT_EQ(left.size(), 7U);
   int64_t previous = -1;
   for (const Row& row : left) {
@@ -2088,8 +2186,9 @@ TEST_F(ExecutorTest, RelationalInnerAndLeftJoins) {
 
 TEST_F(ExecutorTest, RelationalDistinctDeduplicatesJoinedRows) {
   const auto rows = RelationalRun(
-      *rs_, "SELECT DISTINCT a.key FROM SampleTable AS a CROSS JOIN SampleTable "
-            "AS b WHERE a.key = 1 OR a.key = 2;");
+      *rs_,
+      "SELECT DISTINCT a.key FROM SampleTable AS a CROSS JOIN SampleTable "
+      "AS b WHERE a.key = 1 OR a.key = 2;");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[1][0], Value(2));
@@ -2097,34 +2196,39 @@ TEST_F(ExecutorTest, RelationalDistinctDeduplicatesJoinedRows) {
 
 TEST_F(ExecutorTest, RelationalSortAndLimitOffset) {
   const auto sorted = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 ORDER BY "
-            "key = 99;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 ORDER BY "
+      "key = 99;");
   ASSERT_EQ(sorted.size(), 2U);
 
   const auto limited = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 LIMIT 1 "
-            "OFFSET 1;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 LIMIT 1 "
+      "OFFSET 1;");
   ASSERT_EQ(limited.size(), 1U);
   EXPECT_EQ(limited[0][0], Value(2));
 }
 
 TEST_F(ExecutorTest, RelationalInSubqueriesAndScalarFallback) {
-  const auto uncorrelated = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT key FROM "
-            "SampleTable ORDER BY key);");
+  const auto uncorrelated =
+      RelationalRun(*rs_,
+                    "SELECT key FROM SampleTable WHERE key IN (SELECT key FROM "
+                    "SampleTable ORDER BY key);");
   EXPECT_EQ(uncorrelated.size(), 4U);
 
   const auto derived_star = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT * FROM (SELECT * "
-            "FROM SampleTable));");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE key IN (SELECT * FROM (SELECT * "
+      "FROM SampleTable));");
   EXPECT_EQ(derived_star.size(), 4U);
 
   // Scalar subquery that is neither correlated-indexable nor cacheable must
   // fall back to a full ExecuteQuery.  LIMIT 1 keeps the scalar subquery
   // within its one-row contract.
   const auto scalar = RelationalRun(
-      *rs_, "SELECT (SELECT * FROM (SELECT * FROM SampleTable) LIMIT 1) FROM "
-            "SampleTable;");
+      *rs_,
+      "SELECT (SELECT * FROM (SELECT * FROM SampleTable) LIMIT 1) FROM "
+      "SampleTable;");
   ASSERT_EQ(scalar.size(), 4U);
   for (const Row& row : scalar) {
     EXPECT_EQ(row[0], Value(0));
@@ -2134,18 +2238,20 @@ TEST_F(ExecutorTest, RelationalInSubqueriesAndScalarFallback) {
   // rejected as uncorrelated by StatementUsesOnlyScopes; the unresolvable join
   // predicate is then dropped, leaving a cross join, so IN tests only match
   // the returned constant.
-  const auto cross = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT 1 FROM "
-            "SampleTable AS s JOIN SampleTable AS s2 ON s2.key = "
-            "SampleTable.key);");
+  const auto cross =
+      RelationalRun(*rs_,
+                    "SELECT key FROM SampleTable WHERE key IN (SELECT 1 FROM "
+                    "SampleTable AS s JOIN SampleTable AS s2 ON s2.key = "
+                    "SampleTable.key);");
   ASSERT_EQ(cross.size(), 1U);
   EXPECT_EQ(cross[0][0], Value(1));
 }
 
 TEST_F(ExecutorTest, RelationalScalarSubqueryReturnsNullWhenEmpty) {
-  const auto rows = RelationalRun(
-      *rs_, "SELECT (SELECT key FROM SampleTable WHERE key = 99) FROM "
-            "SampleTable;");
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT (SELECT key FROM SampleTable WHERE key = 99) FROM "
+                    "SampleTable;");
   ASSERT_EQ(rows.size(), 4U);
   EXPECT_TRUE(rows[0][0].IsNull());
 }
@@ -2182,7 +2288,8 @@ TEST_F(ExecutorTest, RelationalExplainPlans) {
     return text;
   };
 
-  const std::string derived = explain("SELECT * FROM (SELECT * FROM SampleTable);");
+  const std::string derived =
+      explain("SELECT * FROM (SELECT * FROM SampleTable);");
   EXPECT_NE(derived.find("Relational Physical Plan"), std::string::npos)
       << derived;
   EXPECT_NE(derived.find("SubqueryScan"), std::string::npos) << derived;
@@ -2204,8 +2311,7 @@ TEST_F(ExecutorTest, RelationalExplainPlans) {
   // LEFT JOIN with unused right side may be eliminated.
   // If present, it should carry type=left.
   if (left.find("type=left") == std::string::npos) {
-    EXPECT_NE(left.find("SeqScan SampleTable AS a"), std::string::npos)
-        << left;
+    EXPECT_NE(left.find("SeqScan SampleTable AS a"), std::string::npos) << left;
   }
 
   const std::string limited = explain(
@@ -2216,19 +2322,22 @@ TEST_F(ExecutorTest, RelationalExplainPlans) {
 
 TEST_F(ExecutorTest, RelationalAggregateOnVarcharThrows) {
   ExpectMessageContains(
-      RelationalThrow(*rs_, "SELECT name, SUM(name) AS s FROM SampleTable "
-                            "GROUP BY name;"),
+      RelationalThrow(*rs_,
+                      "SELECT name, SUM(name) AS s FROM SampleTable "
+                      "GROUP BY name;"),
       "numeric value required");
 }
 
 TEST_F(ExecutorTest, RelationalAmbiguousColumnThrows) {
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM SampleTable AS a "
-                                              "JOIN SampleTable AS b ON "
-                                              "a.key = b.key;"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT key FROM SampleTable AS a "
+                                        "JOIN SampleTable AS b ON "
+                                        "a.key = b.key;"),
                         "ambiguous column key");
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT a.key FROM SampleTable AS "
-                                              "a JOIN SampleTable AS b ON "
-                                              "a.key = b.key WHERE key > 1;"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT a.key FROM SampleTable AS "
+                                        "a JOIN SampleTable AS b ON "
+                                        "a.key = b.key WHERE key > 1;"),
                         "ambiguous column key");
 }
 
@@ -2239,35 +2348,41 @@ TEST_F(ExecutorTest, RelationalUnknownColumnThrows) {
 }
 
 TEST_F(ExecutorTest, RelationalLikeNonStringOperandThrows) {
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM SampleTable WHERE "
-                                              "key LIKE '5' OR key = 1;"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT key FROM SampleTable WHERE "
+                                        "key LIKE '5' OR key = 1;"),
                         "LIKE requires string operands");
 }
 
 TEST_F(ExecutorTest, RelationalAggregateInWhereThrows) {
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM SampleTable WHERE "
-                                              "COUNT(*) > 0;"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT key FROM SampleTable WHERE "
+                                        "COUNT(*) > 0;"),
                         "aggregate outside grouping");
 }
 
 TEST_F(ExecutorTest, RelationalMissingTableThrows) {
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM nonexistent JOIN "
-                                              "SampleTable ON TRUE;"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT key FROM nonexistent JOIN "
+                                        "SampleTable ON TRUE;"),
                         "table nonexistent not found");
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT (SELECT x FROM missing) "
-                                              "FROM SampleTable;"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT (SELECT x FROM missing) "
+                                        "FROM SampleTable;"),
                         "table missing not found");
 }
 
 TEST_F(ExecutorTest, RelationalUnsupportedFunctionThrows) {
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT FOOBAR(1) FROM SampleTable "
-                                              "GROUP BY key;"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT FOOBAR(1) FROM SampleTable "
+                                        "GROUP BY key;"),
                         "unsupported function foobar");
 }
 
 TEST_F(ExecutorTest, RelationalDateAddArityThrows) {
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT DATE_ADD('2026-01-01', "
-                                              "5);"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT DATE_ADD('2026-01-01', "
+                                        "5);"),
                         "DATE_ADD/DATE_SUB arity");
 }
 
@@ -2275,8 +2390,9 @@ TEST_F(ExecutorTest, RelationalDatePlusDateThrows) {
   RelationalRun(*rs_, "CREATE TABLE RelDate (d DATE, v INT64);");
   RelationalRun(*rs_, "INSERT INTO RelDate VALUES (date '2026-01-01', 1);");
   RelationalRun(*rs_, "INSERT INTO RelDate VALUES (date '2026-06-01', 2);");
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT v FROM RelDate WHERE v = 1 "
-                                              "OR d + d = 'x';"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT v FROM RelDate WHERE v = 1 "
+                                        "OR d + d = 'x';"),
                         "unsupported binary operation");
 }
 
@@ -2286,9 +2402,10 @@ TEST_F(ExecutorTest, RelationalCorrelatedSubqueryOverNullOuterDocumentsBug) {
   // crash.  The LEFT JOIN below null-extends b for every outer row, so the
   // EXISTS predicate rejects every row.
   const auto rows = RelationalRun(
-      *rs_, "SELECT o.key FROM SampleTable AS o LEFT JOIN SampleTable AS b ON "
-            "o.key = b.key AND b.key = 99 WHERE EXISTS (SELECT 1 FROM "
-            "SampleTable WHERE b.key = key);");
+      *rs_,
+      "SELECT o.key FROM SampleTable AS o LEFT JOIN SampleTable AS b ON "
+      "o.key = b.key AND b.key = 99 WHERE EXISTS (SELECT 1 FROM "
+      "SampleTable WHERE b.key = key);");
   EXPECT_TRUE(rows.empty());
 }
 
@@ -2297,13 +2414,12 @@ TEST_F(ExecutorTest, AggregationExpressionChildIsEvaluatedPerRow) {
   // executor materializes each row and evaluates it via the expression.
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})};
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("sum_plus_one",
-                      AggregateExpressionExp(
-                          AggregationType::kSum,
-                          BinaryExpressionExp(ColumnValueExp("value"),
-                                              BinaryOperation::kAdd,
-                                              ConstantValueExp(Value(1)))))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "sum_plus_one",
+      AggregateExpressionExp(
+          AggregationType::kSum,
+          BinaryExpressionExp(ColumnValueExp("value"), BinaryOperation::kAdd,
+                              ConstantValueExp(Value(1)))))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates));
@@ -2319,10 +2435,9 @@ TEST_F(ExecutorTest, AggregationMissingColumnThrows) {
   // Arrange: the aggregate references a column that is not in the input schema.
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   std::vector<Row> rows{Row({Value(1)})};
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("sum_missing",
-                      AggregateExpressionExp(AggregationType::kSum,
-                                             ColumnValueExp("nope")))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "sum_missing",
+      AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("nope")))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates));
@@ -2336,9 +2451,9 @@ TEST_F(ExecutorTest, AggregationAverageOverIntColumn) {
   // Arrange: AVG over an INT64 column must convert each value to double.
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})};
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
-                                                    ColumnValueExp("value")))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "avg",
+      AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("value")))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates));
@@ -2354,9 +2469,9 @@ TEST_F(ExecutorTest, AggregationDumpListsAggregates) {
   // Arrange: an aggregation over a two-row constant input.
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   std::vector<Row> rows{Row({Value(1)}), Row({Value(2)})};
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
-                                                      ColumnValueExp("value")))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "count", AggregateExpressionExp(AggregationType::kCount,
+                                      ColumnValueExp("value")))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates));
@@ -2396,10 +2511,9 @@ TEST_F(ExecutorTest, AggregationJitEligibleSumWithoutThresholdUsesFallback) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value()}),
                         Row({Value(4)})};
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("sum",
-                      AggregateExpressionExp(AggregationType::kSum,
-                                             ColumnValueExp("value")))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "sum",
+      AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("value")))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates));
@@ -2416,10 +2530,9 @@ TEST_F(ExecutorTest, AggregationCountStarCountsNullRows) {
   // is NULL.
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   std::vector<Row> rows{Row({Value(1)}), Row({Value()}), Row({Value(3)})};
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("count_star",
-                      AggregateExpressionExp(AggregationType::kCount,
-                                             ColumnValueExp("*")))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "count_star",
+      AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("*")))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates));
@@ -2434,9 +2547,9 @@ TEST_F(ExecutorTest, AggregationCountStarCountsNullRows) {
 TEST_F(ExecutorTest, AggregationAverageOverEmptyInputIsNull) {
   // Arrange: AVG over an empty input has no values to average.
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
-  std::vector<NamedExpression> aggregates = {
-      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
-                                                    ColumnValueExp("value")))};
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "avg",
+      AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("value")))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::vector<Row>{}), schema,
       std::move(aggregates));
@@ -2476,18 +2589,19 @@ class ScopedQueryMemory {
 // Wide rows are needed so a 64 KiB budget forces relation spill-to-disk.
 void CreateWideTable(Database& rs, std::string_view name, size_t rows) {
   TransactionContext ctx = rs.BeginContext();
-  Schema schema{std::string(name),
-                {Column("key", ValueType::kInt64),
-                 Column("name", ValueType::kVarChar)}};
+  Schema schema{
+      std::string(name),
+      {Column("key", ValueType::kInt64), Column("name", ValueType::kVarChar)}};
   StatusOr<Table> created = rs.CreateTable(ctx, schema);
   ASSERT_SUCCESS(created.GetStatus());
   for (int64_t key = 0; std::cmp_less(key, rows); ++key) {
     std::string payload = "row-" + std::to_string(key);
     payload.resize(96, 'x');
-    ASSERT_SUCCESS(created.Value()
-                       .Insert(ctx.txn_, Row(std::vector{Value(key),
-                                                         Value(std::string(payload))}))
-                       .GetStatus());
+    ASSERT_SUCCESS(
+        created.Value()
+            .Insert(ctx.txn_,
+                    Row(std::vector{Value(key), Value(std::string(payload))}))
+            .GetStatus());
   }
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
@@ -2495,13 +2609,14 @@ void CreateWideTable(Database& rs, std::string_view name, size_t rows) {
 // Returns the integer immediately following `key` in `text` (or -1).
 long StatsValue(const std::string& text, const std::string& key) {
   const size_t pos = text.find(key);
-  if (pos == std::string::npos) { return -1;
-}
+  if (pos == std::string::npos) {
+    return -1;
+  }
   const size_t begin = pos + key.size();
   size_t end = begin;
   while (end < text.size() && std::isdigit(text[end]) != 0) {
     ++end;
-}
+  }
   return begin == end ? -1 : std::stol(text.substr(begin, end - begin));
 }
 
@@ -2509,9 +2624,9 @@ long StatsValue(const std::string& text, const std::string& key) {
 std::string RelationalExplain(Database& database, std::string_view sql,
                               bool analyze = false) {
   std::ostringstream out;
-  for (const Row& row : RelationalRun(
-           database, (analyze ? "EXPLAIN ANALYZE " : "EXPLAIN ") +
-                         std::string(sql))) {
+  for (const Row& row :
+       RelationalRun(database, (analyze ? "EXPLAIN ANALYZE " : "EXPLAIN ") +
+                                   std::string(sql))) {
     out << row[0].AsString() << '\n';
   }
   return out.str();
@@ -2583,8 +2698,9 @@ TEST_F(ExecutorTest, RelationalHybridHashLeftJoinSpillsUnderBudget) {
   // hybrid hash join must emit unmatched rows from both the resident bucket
   // and the replayed spilled partitions.
   const auto rows = RelationalRun(
-      *rs_, "SELECT a.key FROM WideLeft AS a LEFT JOIN WideLeft AS b ON "
-            "a.key = b.key AND b.key = 999;");
+      *rs_,
+      "SELECT a.key FROM WideLeft AS a LEFT JOIN WideLeft AS b ON "
+      "a.key = b.key AND b.key = 999;");
   ASSERT_EQ(rows.size(), 200U);
   const std::string plan = RelationalExplain(*rs_,
                                              "SELECT a.key FROM WideLeft AS a "
@@ -2593,6 +2709,108 @@ TEST_F(ExecutorTest, RelationalHybridHashLeftJoinSpillsUnderBudget) {
                                              /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
+}
+
+// D8 (docs/design.md) acceptance: hybrid hash join with spill, compared
+// against the same query with no memory budget.  Covers null-safe equality,
+// RIGHT OUTER and FULL OUTER, and mixed resident/spill inputs.  A budget of
+// 64KiB forces the 200-row wide tables to spill so every partition path
+// (resident build, spilled build, unmatched spill rows) is exercised.
+namespace {
+// Wide table whose join key is non-NULL but with a few NULL keys to exercise
+// null-safe equality and NULL-padding paths.
+void CreateWideTableWithNullKeys(Database& rs, std::string_view name,
+                                 size_t rows) {
+  TransactionContext ctx = rs.BeginContext();
+  Schema schema{
+      std::string(name),
+      {Column("key", ValueType::kInt64), Column("name", ValueType::kVarChar)}};
+  StatusOr<Table> created = rs.CreateTable(ctx, schema);
+  ASSERT_SUCCESS(created.GetStatus());
+  for (int64_t key = 0; std::cmp_less(key, rows); ++key) {
+    std::string payload = "row-" + std::to_string(key);
+    payload.resize(96, 'x');
+    Value key_value =
+        (key % 20 == 0) ? Value() : Value(static_cast<int64_t>(key % 50));
+    ASSERT_SUCCESS(
+        created.Value()
+            .Insert(ctx.txn_,
+                    Row(std::vector{key_value, Value(std::string(payload))}))
+            .GetStatus());
+  }
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+std::vector<std::pair<int64_t, int64_t>> KeyPairCounts(
+    const std::vector<Row>& rows) {
+  std::vector<std::pair<int64_t, int64_t>> out;
+  out.reserve(rows.size());
+  for (const Row& row : rows) {
+    out.emplace_back(row[0].IsNull() ? -1 : row[0].value.int_value,
+                     row[1].IsNull() ? -1 : row[1].value.int_value);
+  }
+  std::ranges::sort(out);
+  return out;
+}
+}  // namespace
+
+TEST_F(ExecutorTest, RelationalNullSafeInnerJoinSpillMatchesUnbudgeted) {
+  CreateWideTableWithNullKeys(*rs_, "NullSafeJoin", 200);
+  const std::string sql =
+      "SELECT a.key, b.key FROM NullSafeJoin AS a JOIN NullSafeJoin AS b "
+      "ON a.key IS NOT DISTINCT FROM b.key "
+      "WHERE EXISTS (SELECT 1 FROM NullSafeJoin);";
+  std::vector<std::pair<int64_t, int64_t>> reference;
+  {
+    ScopedQueryMemory unlimited(0);  // no budget: everything resident
+    reference = KeyPairCounts(RelationalRun(*rs_, sql));
+  }
+  EXPECT_FALSE(reference.empty());
+  {
+    ScopedQueryMemory memory(65536);  // 64KiB forces spill
+    const auto spilled = KeyPairCounts(RelationalRun(*rs_, sql));
+    EXPECT_EQ(spilled, reference);
+  }
+}
+
+TEST_F(ExecutorTest, RelationalRightOuterJoinSpillMatchesUnbudgeted) {
+  CreateWideTableWithNullKeys(*rs_, "RightJoin", 200);
+  // The right (build) side spills; every unmatched right row must still be
+  // emitted null-extended on the left, from both resident and spilled
+  // partitions (D8: no silent loss, no double output).
+  const std::string sql =
+      "SELECT a.key, b.key FROM (SELECT key FROM RightJoin) AS a "
+      "RIGHT JOIN RightJoin AS b ON a.key = b.key "
+      "WHERE EXISTS (SELECT 1 FROM RightJoin);";
+  std::vector<std::pair<int64_t, int64_t>> reference;
+  {
+    ScopedQueryMemory unlimited(0);
+    reference = KeyPairCounts(RelationalRun(*rs_, sql));
+  }
+  EXPECT_FALSE(reference.empty());
+  {
+    ScopedQueryMemory memory(65536);
+    const auto spilled = KeyPairCounts(RelationalRun(*rs_, sql));
+    EXPECT_EQ(spilled, reference);
+  }
+}
+
+TEST_F(ExecutorTest, RelationalFullOuterJoinSpillMatchesUnbudgeted) {
+  CreateWideTableWithNullKeys(*rs_, "FullJoin", 200);
+  const std::string sql =
+      "SELECT a.key, b.key FROM FullJoin AS a FULL JOIN FullJoin AS b "
+      "ON a.key = b.key WHERE EXISTS (SELECT 1 FROM FullJoin);";
+  std::vector<std::pair<int64_t, int64_t>> reference;
+  {
+    ScopedQueryMemory unlimited(0);
+    reference = KeyPairCounts(RelationalRun(*rs_, sql));
+  }
+  EXPECT_FALSE(reference.empty());
+  {
+    ScopedQueryMemory memory(65536);
+    const auto spilled = KeyPairCounts(RelationalRun(*rs_, sql));
+    EXPECT_EQ(spilled, reference);
+  }
 }
 
 TEST_F(ExecutorTest, RelationalNullableJoinKeysDoNotMatch) {
@@ -2620,8 +2838,9 @@ TEST_F(ExecutorTest, RelationalNullableJoinKeysDoNotMatch) {
       "a.k = b.k;");
   ASSERT_EQ(left_rows.size(), 3U);
   std::unordered_set<Row> null_extended;
-  for (const Row& row : left_rows) { null_extended.insert(row);
-}
+  for (const Row& row : left_rows) {
+    null_extended.insert(row);
+  }
   EXPECT_EQ(null_extended,
             (std::unordered_set<Row>{Row({Value("a1"), Value("b1")}),
                                      Row({Value("a2"), Value()}),
@@ -2633,8 +2852,8 @@ TEST_F(ExecutorTest, RelationalPartitionedAggregationSpillsUnderBudget) {
   // so the partitioned aggregation path (spill-by-hash-partition) is forced.
   CreateWideTable(*rs_, "WideAgg", 400);
   ScopedQueryMemory memory(65536);
-  const auto rows = RelationalRun(
-      *rs_, "SELECT key, COUNT(*) FROM WideAgg GROUP BY key;");
+  const auto rows =
+      RelationalRun(*rs_, "SELECT key, COUNT(*) FROM WideAgg GROUP BY key;");
   ASSERT_EQ(rows.size(), 400U);
   for (const Row& row : rows) {
     EXPECT_EQ(row[1], Value(1));  // keys are unique, every group is size 1
@@ -2669,8 +2888,9 @@ TEST_F(ExecutorTest, RelationalDistinctCrossJoinSpillsUnderBudget) {
       "b WHERE EXISTS (SELECT 1 FROM WideDistinct);");
   ASSERT_EQ(rows.size(), 200U);
   const std::string plan = RelationalExplain(
-      *rs_, "SELECT DISTINCT a.key FROM WideDistinct AS a CROSS JOIN "
-            "WideDistinct AS b WHERE EXISTS (SELECT 1 FROM WideDistinct);",
+      *rs_,
+      "SELECT DISTINCT a.key FROM WideDistinct AS a CROSS JOIN "
+      "WideDistinct AS b WHERE EXISTS (SELECT 1 FROM WideDistinct);",
       /*analyze=*/true);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
 }
@@ -2701,8 +2921,9 @@ TEST_F(ExecutorTest, RelationalCorrelatedExistsKeepsSpilledRows) {
   CreateWideTable(*rs_, "WideExists", 200);
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
-      *rs_, "SELECT o.key FROM WideExists AS o WHERE EXISTS (SELECT 1 FROM "
-            "WideExists WHERE o.key = key AND key > 150);");
+      *rs_,
+      "SELECT o.key FROM WideExists AS o WHERE EXISTS (SELECT 1 FROM "
+      "WideExists WHERE o.key = key AND key > 150);");
   EXPECT_EQ(rows.size(), 49U);
 }
 
@@ -2722,30 +2943,50 @@ TEST_F(ExecutorTest, RelationalWindowFunctionKeepsSpilledRows) {
   // window query returned a fraction of (or zero) rows.
   CreateWideTable(*rs_, "WideWin", 200);
   ScopedQueryMemory memory(65536);
-  const auto rows = RelationalRun(
-      *rs_, "SELECT key, SUM(key) OVER (ORDER BY key ROWS BETWEEN "
-            "UNBOUNDED PRECEDING AND CURRENT ROW) FROM WideWin;");
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT key, SUM(key) OVER (ORDER BY key ROWS BETWEEN "
+                    "UNBOUNDED PRECEDING AND CURRENT ROW) FROM WideWin;");
   ASSERT_EQ(rows.size(), 200U);
   EXPECT_FALSE(rows[199][1].IsNull());
 }
 
-// Segfaults: correlated EXISTS + cross join under memory budget (spill path).
-// TODO: file/track this crash in the issue tracker before enabling.
-TEST_F(ExecutorTest, DISABLED_RelationalCorrelatedExistsCrossJoinSpillsUnderBudget) {
+TEST_F(ExecutorTest, RelationalGroupBySpillKeepsNullKeys) {
+  // PRODUCTION BUG (fixed): the partitioned aggregation spilled rows via
+  // EncodeMemcomparableFormat, which throws on NULL group keys; the same
+  // query grouped NULLs normally while resident.  The partitioner now uses
+  // the same '\0' tag as the parallel hash join.
+  CreateWideTable(*rs_, "WideNullGroup", 200);
+  ScopedQueryMemory memory(65536);
+  const auto rows = RelationalRun(
+      *rs_,
+      "SELECT name, COUNT(*) FROM (SELECT CAST(NULL AS STRING) AS name, "
+      "key FROM WideNullGroup) GROUP BY name;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_TRUE(rows[0][0].IsNull());
+  EXPECT_EQ(rows[0][1], Value(int64_t{200}));
+}
+
+// The stale comment above ("Segfaults ... before enabling") described a
+// former crash that the HAVING/aggregate-preparation fixes resolved; the
+// test below has been running enabled since then.
+TEST_F(ExecutorTest, RelationalCorrelatedExistsCrossJoinSpillsUnderBudget) {
   // A correlated EXISTS under a finite budget where the inner source still
   // fits in memory; the correlated index stays populated and the result cache
   // absorbs the 40000 repeated probes.
   CreateWideTable(*rs_, "WideCrossExists", 200);
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
-      *rs_, "SELECT o.key FROM WideCrossExists AS o CROSS JOIN WideCrossExists "
-            "AS b WHERE EXISTS (SELECT COUNT(*) FROM WideCrossExists WHERE "
-            "o.key = key HAVING COUNT(*) > 0);");
+      *rs_,
+      "SELECT o.key FROM WideCrossExists AS o CROSS JOIN WideCrossExists "
+      "AS b WHERE EXISTS (SELECT COUNT(*) FROM WideCrossExists WHERE "
+      "o.key = key HAVING COUNT(*) > 0);");
   EXPECT_EQ(rows.size(), 40000U);
   const std::string plan = RelationalExplain(
-      *rs_, "SELECT o.key FROM WideCrossExists AS o CROSS JOIN WideCrossExists "
-            "AS b WHERE EXISTS (SELECT COUNT(*) FROM WideCrossExists WHERE "
-            "o.key = key HAVING COUNT(*) > 0);",
+      *rs_,
+      "SELECT o.key FROM WideCrossExists AS o CROSS JOIN WideCrossExists "
+      "AS b WHERE EXISTS (SELECT COUNT(*) FROM WideCrossExists WHERE "
+      "o.key = key HAVING COUNT(*) > 0);",
       /*analyze=*/true);
   EXPECT_GT(StatsValue(plan, "correlated_result_cache_hits="), 0);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
@@ -2753,13 +2994,14 @@ TEST_F(ExecutorTest, DISABLED_RelationalCorrelatedExistsCrossJoinSpillsUnderBudg
 
 TEST_F(ExecutorTest, RelationalAggregateSumEmptyAndDouble) {
   // SUM over an empty (all-filtered) input yields NULL, not 0.
-  const auto empty = RelationalRun(
-      *rs_, "SELECT SUM(score) FROM SampleTable WHERE key = 99;");
+  const auto empty =
+      RelationalRun(*rs_, "SELECT SUM(score) FROM SampleTable WHERE key = 99;");
   ASSERT_EQ(empty.size(), 1U);
   EXPECT_TRUE(empty[0][0].IsNull());
 
   // SUM over a DOUBLE column returns a double; over INT64 an integer.
-  const auto doubles = RelationalRun(*rs_, "SELECT SUM(score) FROM SampleTable;");
+  const auto doubles =
+      RelationalRun(*rs_, "SELECT SUM(score) FROM SampleTable;");
   ASSERT_EQ(doubles.size(), 1U);
   EXPECT_NEAR(doubles[0][0].value.double_value, 22.44, 1e-9);
 
@@ -2769,25 +3011,27 @@ TEST_F(ExecutorTest, RelationalAggregateSumEmptyAndDouble) {
 }
 
 TEST_F(ExecutorTest, RelationalExplainResultOnlyAndDerivedAlias) {
-  const std::string result_only = RelationalExplain(*rs_, "SELECT INTERVAL 3 DAY;");
+  const std::string result_only =
+      RelationalExplain(*rs_, "SELECT INTERVAL 3 DAY;");
   EXPECT_NE(result_only.find("Result rows~1"), std::string::npos)
       << result_only;
 
-  const std::string aliased =
-      RelationalExplain(*rs_, "SELECT * FROM (SELECT * FROM SampleTable) AS d;");
+  const std::string aliased = RelationalExplain(
+      *rs_, "SELECT * FROM (SELECT * FROM SampleTable) AS d;");
   EXPECT_NE(aliased.find("SubqueryScan AS d"), std::string::npos) << aliased;
 }
 
 TEST_F(ExecutorTest, RelationalExplainWithClauseCteScan) {
-  const std::string plan = RelationalExplain(
-      *rs_, "WITH w AS (SELECT 1 AS x) SELECT * FROM w;");
+  const std::string plan =
+      RelationalExplain(*rs_, "WITH w AS (SELECT 1 AS x) SELECT * FROM w;");
   EXPECT_NE(plan.find("CteOrMissingScan w"), std::string::npos) << plan;
 }
 
 TEST_F(ExecutorTest, RelationalExplainNestedLoopUnknownRows) {
   const std::string plan = RelationalExplain(
-      *rs_, "SELECT * FROM (SELECT * FROM SampleTable) AS a JOIN SampleTable AS "
-            "b ON a.key > b.key;");
+      *rs_,
+      "SELECT * FROM (SELECT * FROM SampleTable) AS a JOIN SampleTable AS "
+      "b ON a.key > b.key;");
   EXPECT_NE(plan.find("NestedLoopJoin"), std::string::npos) << plan;
   EXPECT_NE(plan.find("rows~unknown"), std::string::npos) << plan;
 }
@@ -2818,20 +3062,22 @@ TEST_F(ExecutorTest, RelationalExplainMemoryLimitBranches) {
 }
 
 TEST_F(ExecutorTest, RelationalInSubqueryMissingTableThrows) {
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM SampleTable WHERE "
-                                              "key IN (SELECT key FROM "
-                                              "missing_table);"),
+  ExpectMessageContains(RelationalThrow(*rs_,
+                                        "SELECT key FROM SampleTable WHERE "
+                                        "key IN (SELECT key FROM "
+                                        "missing_table);"),
                         "table missing_table not found");
 }
 
 TEST_F(ExecutorTest, RelationalDateSubAndDateColumnArithmetic) {
-  const auto sub = RelationalRun(
-      *rs_, "SELECT DATE_SUB('2026-03-01', INTERVAL 2 DAY);");
+  const auto sub =
+      RelationalRun(*rs_, "SELECT DATE_SUB('2026-03-01', INTERVAL 2 DAY);");
   ASSERT_EQ(sub.size(), 1U);
   EXPECT_EQ(sub[0][0], Value("2026-02-27"));
 
   RelationalRun(*rs_, "CREATE TABLE RelDateArith (d DATE, v INT64);");
-  RelationalRun(*rs_, "INSERT INTO RelDateArith VALUES (DATE '2026-01-01', 1);");
+  RelationalRun(*rs_,
+                "INSERT INTO RelDateArith VALUES (DATE '2026-01-01', 1);");
   const auto add = RelationalRun(
       *rs_, "SELECT DATE_ADD(d, INTERVAL 1 MONTH) FROM RelDateArith;");
   ASSERT_EQ(add.size(), 1U);
@@ -2846,8 +3092,9 @@ TEST_F(ExecutorTest, RelationalWithClauseMaterializesCte) {
   ASSERT_EQ(single.size(), 4U);
 
   const auto joined = RelationalRun(
-      *rs_, "WITH w AS (SELECT key FROM SampleTable) SELECT a.key FROM w AS a "
-            "JOIN w AS b ON a.key = b.key;");
+      *rs_,
+      "WITH w AS (SELECT key FROM SampleTable) SELECT a.key FROM w AS a "
+      "JOIN w AS b ON a.key = b.key;");
   ASSERT_EQ(joined.size(), 4U);
 }
 
@@ -2859,12 +3106,14 @@ TEST_F(ExecutorTest, RelationalStringKeyHybridHashJoinSpillsUnderBudget) {
   // EXISTS marker: keeps this on the relational engine (see
   // RelationalHybridHashJoinSpillsUnderBudget).
   const auto rows = RelationalRun(
-      *rs_, "SELECT a.key FROM WideStrJoin AS a JOIN WideStrJoin AS b ON "
-            "a.name = b.name WHERE EXISTS (SELECT 1 FROM WideStrJoin);");
+      *rs_,
+      "SELECT a.key FROM WideStrJoin AS a JOIN WideStrJoin AS b ON "
+      "a.name = b.name WHERE EXISTS (SELECT 1 FROM WideStrJoin);");
   ASSERT_EQ(rows.size(), 400U);
   const std::string plan = RelationalExplain(
-      *rs_, "SELECT a.key FROM WideStrJoin AS a JOIN WideStrJoin AS b ON "
-            "a.name = b.name WHERE EXISTS (SELECT 1 FROM WideStrJoin);",
+      *rs_,
+      "SELECT a.key FROM WideStrJoin AS a JOIN WideStrJoin AS b ON "
+      "a.name = b.name WHERE EXISTS (SELECT 1 FROM WideStrJoin);",
       /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
@@ -2876,12 +3125,14 @@ TEST_F(ExecutorTest, RelationalStringKeyHybridLeftJoinSpillsUnderBudget) {
   CreateWideTable(*rs_, "WideStrLeft", 400);
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
-      *rs_, "SELECT a.key FROM WideStrLeft AS a LEFT JOIN WideStrLeft AS b ON "
-            "a.name = b.name AND b.key = 999;");
+      *rs_,
+      "SELECT a.key FROM WideStrLeft AS a LEFT JOIN WideStrLeft AS b ON "
+      "a.name = b.name AND b.key = 999;");
   ASSERT_EQ(rows.size(), 400U);
   const std::string plan = RelationalExplain(
-      *rs_, "SELECT a.key FROM WideStrLeft AS a LEFT JOIN WideStrLeft AS b ON "
-            "a.name = b.name AND b.key = 999;",
+      *rs_,
+      "SELECT a.key FROM WideStrLeft AS a LEFT JOIN WideStrLeft AS b ON "
+      "a.name = b.name AND b.key = 999;",
       /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
@@ -2901,7 +3152,8 @@ TEST_F(ExecutorTest, RelationalLikeWildcardBacktracking) {
   EXPECT_EQ(suffix[0][0], Value(0));
 
   const auto single = RelationalRun(
-      *rs_, "SELECT key FROM SampleTable WHERE name LIKE 'h_llo' ORDER BY key;");
+      *rs_,
+      "SELECT key FROM SampleTable WHERE name LIKE 'h_llo' ORDER BY key;");
   ASSERT_EQ(single.size(), 1U);
   EXPECT_EQ(single[0][0], Value(0));
 }
@@ -2910,8 +3162,9 @@ TEST_F(ExecutorTest, RelationalNumericAndVarcharBinaryOperators) {
   // GROUP BY forces the relational evaluator (a plain SELECT would use the
   // plan-based executor and never touch relational.cpp's Binary()).
   const auto numeric = RelationalRun(
-      *rs_, "SELECT key + 1, key - 1, key * 2, key / 2 FROM SampleTable GROUP "
-            "BY key;");
+      *rs_,
+      "SELECT key + 1, key - 1, key * 2, key / 2 FROM SampleTable GROUP "
+      "BY key;");
   ASSERT_EQ(numeric.size(), 4U);
   std::unordered_set<int64_t> seen;
   for (const Row& row : numeric) {
@@ -2953,12 +3206,10 @@ TEST_F(ExecutorTest, HashJoinDisjointKeysProducesEmptyOutput) {
 }
 
 TEST_F(ExecutorTest, HashJoinMultiMatchOnRightSide) {
-  auto left = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1), Value("l1")}),
-                       Row({Value(2), Value("l2")})});
-  auto right = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1), Value("r1")}),
-                       Row({Value(1), Value("r2")})});
+  auto left = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(1), Value("l1")}), Row({Value(2), Value("l2")})});
+  auto right = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(1), Value("r1")}), Row({Value(1), Value("r2")})});
   HashJoin join(left, {0}, right, {0}, HashJoinMode::kInMemory, 2);
   std::unordered_set<Row> expected(
       {Row({Value(1), Value("l1"), Value(1), Value("r1")}),
@@ -2974,12 +3225,10 @@ TEST_F(ExecutorTest, HashJoinMultiMatchOnRightSide) {
 }
 
 TEST_F(ExecutorTest, HashJoinCompositeStringKeyMatchesExactly) {
-  auto left = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1), Value("alice")}),
-                       Row({Value(1), Value("bob")})});
-  auto right = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1), Value("alice")}),
-                       Row({Value(2), Value("bob")})});
+  auto left = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(1), Value("alice")}), Row({Value(1), Value("bob")})});
+  auto right = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(1), Value("alice")}), Row({Value(2), Value("bob")})});
   HashJoin join(left, {0, 1}, right, {0, 1}, HashJoinMode::kInMemory, 2);
   Row got;
   ASSERT_TRUE(join.Next(&got, nullptr));
@@ -3018,19 +3267,18 @@ TEST_F(ExecutorTest, HashJoinNullJoinKeysDoNotMatch) {
     ASSERT_EQ(got[0], got[1]);
     matches.insert(got);
   }
-  EXPECT_EQ(matches,
-            (std::unordered_set<Row>{Row({Value(1), Value(1)}),
-                                     Row({Value(2), Value(2)})}));
+  EXPECT_EQ(matches, (std::unordered_set<Row>{Row({Value(1), Value(1)}),
+                                              Row({Value(2), Value(2)})}));
 
   // Reactive-spill path: the same rows joined through spill partitions.
   {
     ScopedQueryMemory memory(256);
-    auto spill_left = std::make_shared<ConstantExecutor>(std::vector<Row>{
-        Row({Value(1)}), Row({Value()}), Row({Value(2)})});
-    auto spill_right = std::make_shared<ConstantExecutor>(std::vector<Row>{
-        Row({Value(1)}), Row({Value()}), Row({Value(2)})});
-    HashJoin spilled(spill_left, {0}, spill_right, {0},
-                     HashJoinMode::kInMemory, 2);
+    auto spill_left = std::make_shared<ConstantExecutor>(
+        std::vector<Row>{Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+    auto spill_right = std::make_shared<ConstantExecutor>(
+        std::vector<Row>{Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+    HashJoin spilled(spill_left, {0}, spill_right, {0}, HashJoinMode::kInMemory,
+                     2);
     size_t count = 0;
     while (spilled.Next(&got, nullptr)) {
       ASSERT_EQ(got[0], got[1]);
@@ -3043,10 +3291,10 @@ TEST_F(ExecutorTest, HashJoinNullJoinKeysDoNotMatch) {
   // Hybrid path: partition-0 resident plus spilled partitions.
   {
     ScopedQueryMemory memory(256);
-    auto hybrid_left = std::make_shared<ConstantExecutor>(std::vector<Row>{
-        Row({Value(1)}), Row({Value()}), Row({Value(2)})});
-    auto hybrid_right = std::make_shared<ConstantExecutor>(std::vector<Row>{
-        Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+    auto hybrid_left = std::make_shared<ConstantExecutor>(
+        std::vector<Row>{Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+    auto hybrid_right = std::make_shared<ConstantExecutor>(
+        std::vector<Row>{Row({Value(1)}), Row({Value()}), Row({Value(2)})});
     HashJoin hybrid(hybrid_left, {0}, hybrid_right, {0}, HashJoinMode::kHybrid,
                     2);
     size_t count = 0;
@@ -3077,8 +3325,9 @@ TEST_F(ExecutorTest, HashJoinNextBatchSplitsOutput) {
   size_t total = 0;
   while (true) {
     const size_t got = join.NextBatch(&chunk, 2);
-    if (got == 0) { break;
-}
+    if (got == 0) {
+      break;
+    }
     EXPECT_LE(got, 2U);
     for (size_t r = 0; r < got; ++r) {
       ASSERT_TRUE(expected.erase(chunk.RowAt(r)));
@@ -3106,15 +3355,19 @@ TEST_F(ExecutorTest, HashJoinReactiveSpillIntKeyUnderBudget) {
    public:
     explicit PositionedRows(std::vector<Row> rows) : rows_(std::move(rows)) {}
     bool Next(Row* dst, RowPosition* rp) override {
-      if (offset_ >= rows_.size()) { return false;
-}
+      if (offset_ >= rows_.size()) {
+        return false;
+      }
       *dst = rows_[offset_];
-      if (rp != nullptr) { *rp = RowPosition(7, static_cast<slot_t>(offset_));
-}
+      if (rp != nullptr) {
+        *rp = RowPosition(7, static_cast<slot_t>(offset_));
+      }
       ++offset_;
       return true;
     }
-    void Dump(std::ostream& out, int /*indent*/) const override { out << "PositionedRows"; }
+    void Dump(std::ostream& out, int /*indent*/) const override {
+      out << "PositionedRows";
+    }
 
    private:
     std::vector<Row> rows_;
@@ -3290,55 +3543,54 @@ TEST_F(ExecutorTest, HashJoinHybridResidentOverflowFoldsBuild) {
 // ===== Sort executor spill-to-disk coverage =====
 TEST_F(ExecutorTest, SortIntAscendingAndDescending) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
-  auto asc_input = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(3)}), Row({Value(1)}), Row({Value(2)}),
-                       Row({Value(1)})});
+  auto asc_input = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(3)}), Row({Value(1)}), Row({Value(2)}), Row({Value(1)})});
   SortExecutor asc(asc_input, schema,
                    {{ColumnValueExp("value"), true, std::nullopt}});
   Row row;
   RowPosition pos;
   std::vector<int64_t> asc_order;
-  while (asc.Next(&row, &pos)) { asc_order.push_back(row[0].value.int_value);
-}
+  while (asc.Next(&row, &pos)) {
+    asc_order.push_back(row[0].value.int_value);
+  }
   EXPECT_EQ(asc_order, (std::vector<int64_t>{1, 1, 2, 3}));
 
-  auto desc_input = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(3)}), Row({Value(1)}), Row({Value(2)}),
-                       Row({Value(1)})});
+  auto desc_input = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(3)}), Row({Value(1)}), Row({Value(2)}), Row({Value(1)})});
   SortExecutor desc(desc_input, schema,
                     {{ColumnValueExp("value"), false, std::nullopt}});
   std::vector<int64_t> desc_order;
-  while (desc.Next(&row, &pos)) { desc_order.push_back(row[0].value.int_value);
-}
+  while (desc.Next(&row, &pos)) {
+    desc_order.push_back(row[0].value.int_value);
+  }
   EXPECT_EQ(desc_order, (std::vector<int64_t>{3, 2, 1, 1}));
 }
 
 TEST_F(ExecutorTest, SortMultipleKeysTieBreak) {
   const Schema schema("synthetic", {Column("a", ValueType::kInt64),
                                     Column("b", ValueType::kVarChar)});
-  auto input = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1), Value("b")}),
-                       Row({Value(2), Value("a")}), Row({Value(1), Value("a")}),
-                       Row({Value(2), Value("b")})});
+  auto input = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(1), Value("b")}), Row({Value(2), Value("a")}),
+      Row({Value(1), Value("a")}), Row({Value(2), Value("b")})});
   SortExecutor sort(input, schema,
                     {{ColumnValueExp("a"), true, std::nullopt},
                      {ColumnValueExp("b"), true, std::nullopt}});
   Row row;
   RowPosition pos;
   std::vector<Row> out;
-  while (sort.Next(&row, &pos)) { out.push_back(row);
-}
-  EXPECT_EQ(out, std::vector<Row>({Row({Value(1), Value("a")}),
-                                   Row({Value(1), Value("b")}),
-                                   Row({Value(2), Value("a")}),
-                                   Row({Value(2), Value("b")})}));
+  while (sort.Next(&row, &pos)) {
+    out.push_back(row);
+  }
+  EXPECT_EQ(out,
+            std::vector<Row>(
+                {Row({Value(1), Value("a")}), Row({Value(1), Value("b")}),
+                 Row({Value(2), Value("a")}), Row({Value(2), Value("b")})}));
 }
 
 TEST_F(ExecutorTest, SortVarcharKey) {
   const Schema schema("synthetic", {Column("name", ValueType::kVarChar)});
-  auto input = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value("pear")}), Row({Value("apple")}),
-                       Row({Value("banana")})});
+  auto input = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value("pear")}), Row({Value("apple")}), Row({Value("banana")})});
   SortExecutor sort(input, schema,
                     {{ColumnValueExp("name"), true, std::nullopt}});
   Row row;
@@ -3353,31 +3605,34 @@ TEST_F(ExecutorTest, SortVarcharKey) {
 TEST_F(ExecutorTest, SortDoubleAndDateKeys) {
   const Schema dbl("synthetic", {Column("score", ValueType::kDouble)});
   auto dbl_input = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1.5)}), Row({Value(-2.0)}),
-                       Row({Value(0.5)}), Row({Value(-2.0)})});
+      std::vector<Row>{Row({Value(1.5)}), Row({Value(-2.0)}), Row({Value(0.5)}),
+                       Row({Value(-2.0)})});
   SortExecutor dbl_sort(dbl_input, dbl,
                         {{ColumnValueExp("score"), true, std::nullopt}});
   Row row;
   RowPosition pos;
   std::vector<double> out;
-  while (dbl_sort.Next(&row, &pos)) { out.push_back(row[0].value.double_value);
-}
+  while (dbl_sort.Next(&row, &pos)) {
+    out.push_back(row[0].value.double_value);
+  }
   ASSERT_EQ(out.size(), 4U);
-  for (size_t i = 1; i < out.size(); ++i) { EXPECT_LE(out[i - 1], out[i]);
-}
+  for (size_t i = 1; i < out.size(); ++i) {
+    EXPECT_LE(out[i - 1], out[i]);
+  }
 
   const Schema date("synthetic", {Column("d", ValueType::kDate),
                                   Column("v", ValueType::kInt64)});
-  auto date_input = std::make_shared<ConstantExecutor>(std::vector<Row>{
-      Row({Value::Date("2026-03-01"), Value(1)}),
-      Row({Value::Date("2026-01-15"), Value(2)}),
-      Row({Value::Date("2025-12-31"), Value(3)}),
-      Row({Value::Date("2026-01-15"), Value(4)})});
+  auto date_input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value::Date("2026-03-01"), Value(1)}),
+                       Row({Value::Date("2026-01-15"), Value(2)}),
+                       Row({Value::Date("2025-12-31"), Value(3)}),
+                       Row({Value::Date("2026-01-15"), Value(4)})});
   SortExecutor date_sort(date_input, date,
                          {{ColumnValueExp("d"), true, std::nullopt}});
   std::vector<int64_t> v;
-  while (date_sort.Next(&row, &pos)) { v.push_back(row[1].value.int_value);
-}
+  while (date_sort.Next(&row, &pos)) {
+    v.push_back(row[1].value.int_value);
+  }
   // Equal dates keep their input order (stable sort).
   EXPECT_EQ(v, (std::vector<int64_t>{3, 2, 4, 1}));
 }
@@ -3385,9 +3640,8 @@ TEST_F(ExecutorTest, SortDoubleAndDateKeys) {
 TEST_F(ExecutorTest, SortNullsAscendingFirstDescendingLast) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto collect = [&](bool ascending) {
-    auto input = std::make_shared<ConstantExecutor>(
-        std::vector<Row>{Row({Value()}), Row({Value(1)}), Row({Value()}),
-                         Row({Value(0)})});
+    auto input = std::make_shared<ConstantExecutor>(std::vector<Row>{
+        Row({Value()}), Row({Value(1)}), Row({Value()}), Row({Value(0)})});
     SortExecutor sort(input, schema,
                       {{ColumnValueExp("value"), ascending, std::nullopt}});
     Row row;
@@ -3396,8 +3650,9 @@ TEST_F(ExecutorTest, SortNullsAscendingFirstDescendingLast) {
     std::vector<bool> null_flags;
     while (sort.Next(&row, &pos)) {
       null_flags.push_back(row[0].IsNull());
-      if (!row[0].IsNull()) { ints.push_back(row[0].value.int_value);
-}
+      if (!row[0].IsNull()) {
+        ints.push_back(row[0].value.int_value);
+      }
     }
     return std::make_pair(ints, null_flags);
   };
@@ -3455,7 +3710,8 @@ TEST_F(ExecutorTest, SortExternalSpillDescendingPreservesPositions) {
   for (int64_t i = 0; i < 300; ++i) {
     std::string payload = "row-" + std::to_string(i);
     payload.resize(96, 'x');
-    rows.emplace_back(std::vector<Value>{Value(i), Value(std::string(payload))});
+    rows.emplace_back(
+        std::vector<Value>{Value(i), Value(std::string(payload))});
   }
   const Schema schema("wide", {Column("key", ValueType::kInt64),
                                Column("name", ValueType::kVarChar)});
@@ -3463,15 +3719,19 @@ TEST_F(ExecutorTest, SortExternalSpillDescendingPreservesPositions) {
    public:
     explicit PositionedRows(std::vector<Row> rows) : rows_(std::move(rows)) {}
     bool Next(Row* dst, RowPosition* rp) override {
-      if (offset_ >= rows_.size()) { return false;
-}
+      if (offset_ >= rows_.size()) {
+        return false;
+      }
       *dst = rows_[offset_];
-      if (rp != nullptr) { *rp = RowPosition(7, static_cast<slot_t>(offset_));
-}
+      if (rp != nullptr) {
+        *rp = RowPosition(7, static_cast<slot_t>(offset_));
+      }
       ++offset_;
       return true;
     }
-    void Dump(std::ostream& out, int /*indent*/) const override { out << "PositionedRows"; }
+    void Dump(std::ostream& out, int /*indent*/) const override {
+      out << "PositionedRows";
+    }
 
    private:
     std::vector<Row> rows_;
@@ -3513,9 +3773,11 @@ TEST_F(ExecutorTest, HashJoinVarcharAndDoubleKeysAndGrowth) {
   for (int i = 0; i < 30; ++i) {
     std::string v = "long_varchar_key_" + std::to_string(i);
     double d = static_cast<double>(i) * 1.5;
-    left_rows.emplace_back(Row({Value(std::string(v)), Value(d), Value(int64_t{i})}));
+    left_rows.emplace_back(
+        Row({Value(std::string(v)), Value(d), Value(int64_t{i})}));
     if (i % 2 == 0) {
-      right_rows.emplace_back(Row({Value(std::string(v)), Value(d), Value(int64_t{i * 10})}));
+      right_rows.emplace_back(
+          Row({Value(std::string(v)), Value(d), Value(int64_t{i * 10})}));
     }
   }
   for (const auto& r : left_rows) {
@@ -3525,7 +3787,8 @@ TEST_F(ExecutorTest, HashJoinVarcharAndDoubleKeysAndGrowth) {
     ASSERT_SUCCESS(right_tbl.Insert(ctx.txn_, r).GetStatus());
   }
 
-  // Hash join on varchar key (> 8 chars, triggers grow and multi-block encoding)
+  // Hash join on varchar key (> 8 chars, triggers grow and multi-block
+  // encoding)
   HashJoin hj_varchar(std::make_shared<FullScan>(ctx.txn_, left_tbl), {0},
                       std::make_shared<FullScan>(ctx.txn_, right_tbl), {0});
   size_t count_v = 0;
@@ -3552,14 +3815,18 @@ TEST_F(ExecutorTest, AggregationTypedConstantFastPath) {
   }
   const Schema schema("s", {Column("v", ValueType::kInt64)});
   std::vector<NamedExpression> aggregates = {
-      NamedExpression("sum_c", AggregateExpressionExp(AggregationType::kSum,
-                                                      ConstantValueExp(Value(int64_t{1})))),
-      NamedExpression("count_c", AggregateExpressionExp(AggregationType::kCount,
-                                                        ConstantValueExp(Value(int64_t{42})))),
-      NamedExpression("min_c", AggregateExpressionExp(AggregationType::kMin,
-                                                      ConstantValueExp(Value(int64_t{5})))),
-      NamedExpression("max_c", AggregateExpressionExp(AggregationType::kMax,
-                                                      ConstantValueExp(Value(int64_t{5}))))};
+      NamedExpression(
+          "sum_c", AggregateExpressionExp(AggregationType::kSum,
+                                          ConstantValueExp(Value(int64_t{1})))),
+      NamedExpression("count_c", AggregateExpressionExp(
+                                     AggregationType::kCount,
+                                     ConstantValueExp(Value(int64_t{42})))),
+      NamedExpression(
+          "min_c", AggregateExpressionExp(AggregationType::kMin,
+                                          ConstantValueExp(Value(int64_t{5})))),
+      NamedExpression("max_c", AggregateExpressionExp(
+                                   AggregationType::kMax,
+                                   ConstantValueExp(Value(int64_t{5}))))};
   AggregationExecutor aggregate(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates), 64);
@@ -3572,28 +3839,30 @@ TEST_F(ExecutorTest, AggregationTypedConstantFastPath) {
 }
 
 TEST_F(ExecutorTest, ParallelAggregationLogicalAndOr) {
-  std::vector<Row> rows = {
-      Row({Value(int64_t{1}), Value(int64_t{1})}),
-      Row({Value(int64_t{1}), Value(int64_t{0})}),
-      Row({Value(int64_t{1}), Value(int64_t{1})})};
-  const Schema schema("s", {Column("c1", ValueType::kInt64),
-                            Column("c2", ValueType::kInt64)});
+  std::vector<Row> rows = {Row({Value(int64_t{1}), Value(int64_t{1})}),
+                           Row({Value(int64_t{1}), Value(int64_t{0})}),
+                           Row({Value(int64_t{1}), Value(int64_t{1})})};
+  const Schema schema(
+      "s", {Column("c1", ValueType::kInt64), Column("c2", ValueType::kInt64)});
   std::vector<NamedExpression> aggregates = {
-      NamedExpression("and1", AggregateExpressionExp(
-                                  AggregationType::kLogicalAnd,
-                                  BinaryExpressionExp(ColumnValueExp("c1"),
-                                                      BinaryOperation::kAdd,
-                                                      ConstantValueExp(Value(int64_t{0}))))),
-      NamedExpression("and2", AggregateExpressionExp(
-                                  AggregationType::kLogicalAnd,
-                                  BinaryExpressionExp(ColumnValueExp("c2"),
-                                                      BinaryOperation::kAdd,
-                                                      ConstantValueExp(Value(int64_t{0}))))),
-      NamedExpression("or2", AggregateExpressionExp(
-                                 AggregationType::kLogicalOr,
-                                 BinaryExpressionExp(ColumnValueExp("c2"),
-                                                     BinaryOperation::kAdd,
-                                                     ConstantValueExp(Value(int64_t{0})))))};
+      NamedExpression(
+          "and1",
+          AggregateExpressionExp(
+              AggregationType::kLogicalAnd,
+              BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kAdd,
+                                  ConstantValueExp(Value(int64_t{0}))))),
+      NamedExpression(
+          "and2",
+          AggregateExpressionExp(
+              AggregationType::kLogicalAnd,
+              BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kAdd,
+                                  ConstantValueExp(Value(int64_t{0}))))),
+      NamedExpression(
+          "or2",
+          AggregateExpressionExp(
+              AggregationType::kLogicalOr,
+              BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kAdd,
+                                  ConstantValueExp(Value(int64_t{0})))))};
   ParallelAggregationExecutor agg(
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates), 64);
@@ -3612,18 +3881,15 @@ TEST_F(ExecutorTest, ProjectionCseEliminatesRepeatedBinaryExpression) {
   for (int64_t i = 0; i < 100; ++i) {
     rows.emplace_back(std::vector<Value>{Value(i), Value(i * 10)});
   }
-  const Schema schema("cse",
-                       {Column("x", ValueType::kInt64),
-                        Column("y", ValueType::kInt64)});
+  const Schema schema(
+      "cse", {Column("x", ValueType::kInt64), Column("y", ValueType::kInt64)});
   auto src = std::make_shared<ConstantExecutor>(std::move(rows));
   // Expression: x + y (appears twice)
-  auto sum_expr = BinaryExpressionExp(ColumnValueExp("x"),
-                                      BinaryOperation::kAdd,
-                                      ColumnValueExp("y"));
+  auto sum_expr = BinaryExpressionExp(
+      ColumnValueExp("x"), BinaryOperation::kAdd, ColumnValueExp("y"));
   // Projection: [x + y, x + y]
-  std::vector<NamedExpression> projections = {
-      NamedExpression("s1", sum_expr),
-      NamedExpression("s2", sum_expr)};
+  std::vector<NamedExpression> projections = {NamedExpression("s1", sum_expr),
+                                              NamedExpression("s2", sum_expr)};
   Projection proj(std::move(projections), schema, std::move(src));
 
   // Verify CSE was detected
@@ -3651,14 +3917,12 @@ TEST_F(ExecutorTest, ProjectionCseHandlesSingleOccurrenceExpression) {
   auto src = std::make_shared<ConstantExecutor>(std::move(rows));
   // Projection: [v + 1, v + 2] - no shared subexpression
   std::vector<NamedExpression> projections = {
-      NamedExpression("a",
-                       BinaryExpressionExp(ColumnValueExp("v"),
-                                           BinaryOperation::kAdd,
-                                           ConstantValueExp(Value(int64_t{1})))),
-      NamedExpression("b",
-                       BinaryExpressionExp(ColumnValueExp("v"),
-                                           BinaryOperation::kAdd,
-                                           ConstantValueExp(Value(int64_t{2}))))};
+      NamedExpression(
+          "a", BinaryExpressionExp(ColumnValueExp("v"), BinaryOperation::kAdd,
+                                   ConstantValueExp(Value(int64_t{1})))),
+      NamedExpression(
+          "b", BinaryExpressionExp(ColumnValueExp("v"), BinaryOperation::kAdd,
+                                   ConstantValueExp(Value(int64_t{2}))))};
   Projection proj(std::move(projections), schema, std::move(src));
 
   // No CSE should be detected
@@ -3673,6 +3937,53 @@ TEST_F(ExecutorTest, ProjectionCseHandlesSingleOccurrenceExpression) {
     ++count;
   }
   EXPECT_EQ(count, 10U);
+}
+
+// D5 (docs/design.md) acceptance 1: run the SAME inputs through the direct
+// Optimizer route and the relational route (the semantically neutral EXISTS
+// marker forces the relational engine) and require identical row sets, NULL
+// handling and schema for the shapes that previously exposed rule bugs:
+// COUNT(*), outer join + IS NULL anti-selection, and a three-table join
+// under WHERE.
+TEST_F(ExecutorTest, OptimizerAndRelationalPathsAgree) {
+  RelationalRun(*rs_, "CREATE TABLE D5A (id INT64, k INT64);");
+  RelationalRun(*rs_, "CREATE TABLE D5B (id INT64, v INT64);");
+  RelationalRun(*rs_, "CREATE TABLE D5C (id INT64, w INT64);");
+  RelationalRun(*rs_,
+                "INSERT INTO D5A VALUES (1, 10), (2, 20), (3, NULL), "
+                "(4, 40), (5, NULL);");
+  RelationalRun(*rs_, "INSERT INTO D5B VALUES (1, 100), (2, 200), (6, 600);");
+  RelationalRun(*rs_, "INSERT INTO D5C VALUES (1, 7), (2, 8), (3, 9);");
+
+  const std::vector<std::pair<std::string, std::string>> pairs{
+      {"SELECT COUNT(*) FROM D5A;",
+       "SELECT COUNT(*) FROM D5A WHERE EXISTS (SELECT 1 FROM D5A);"},
+      {"SELECT a.id FROM D5A AS a LEFT JOIN D5B AS b ON a.id = b.id "
+       "WHERE b.id IS NULL;",
+       "SELECT a.id FROM D5A AS a LEFT JOIN D5B AS b ON a.id = b.id "
+       "WHERE b.id IS NULL AND EXISTS (SELECT 1 FROM D5C);"},
+      {"SELECT a.id, b.v, c.w FROM D5A AS a JOIN D5B AS b ON a.id = b.id "
+       "JOIN D5C AS c ON a.id = c.id WHERE a.k > 5;",
+       "SELECT a.id, b.v, c.w FROM D5A AS a JOIN D5B AS b ON a.id = b.id "
+       "JOIN D5C AS c ON a.id = c.id WHERE a.k > 5 AND "
+       "EXISTS (SELECT 1 FROM D5C AS e WHERE e.id = a.id);"},
+  };
+  for (const auto& [optimizer_sql, relational_sql] : pairs) {
+    const auto normalize = [](std::vector<Row> rows) {
+      std::vector<std::string> lines;
+      for (const Row& row : rows) {
+        std::ostringstream out;
+        out << row;
+        lines.push_back(out.str());
+      }
+      std::ranges::sort(lines);
+      return lines;
+    };
+    const auto optimized = normalize(RelationalRun(*rs_, optimizer_sql));
+    const auto relational = normalize(RelationalRun(*rs_, relational_sql));
+    EXPECT_EQ(optimized, relational) << "divergence for: " << optimizer_sql;
+    EXPECT_FALSE(optimized.empty());
+  }
 }
 
 }  // namespace tinylamb

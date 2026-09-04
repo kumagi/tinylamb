@@ -94,9 +94,7 @@ void IncrementalSortExecutor::EnsureMaterialized() {
   ExecuteIncrementalSort();
 }
 
-void IncrementalSortExecutor::MaterializePipeline() {
-  EnsureMaterialized();
-}
+void IncrementalSortExecutor::MaterializePipeline() { EnsureMaterialized(); }
 
 bool IncrementalSortExecutor::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
@@ -113,10 +111,11 @@ bool IncrementalSortExecutor::Next(Row* dst, RowPosition* rp) {
 }
 
 size_t IncrementalSortExecutor::NextBatch(DataChunk* destination,
-                                         size_t max_rows) {
+                                          size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
+  destination->Reset();
   EnsureMaterialized();
   if (output_offset_ >= output_.size()) {
     return 0;

@@ -35,8 +35,7 @@ class IndexScanPlan final : public PlanBase {
                 const TableStatistics& ts, std::vector<Value> begin_key,
                 std::vector<Value> end_key, bool ascending, Expression where,
                 std::vector<ColumnName> provided_order = {},
-                bool lock_rows = false,
-                bool wait_for_write_intent = true);
+                bool lock_rows = false, bool wait_for_write_intent = true);
   // Point-union access for constant IN lists: one [begin,end] pair per
   // distinct value. Ordering credit only survives a single range.
   IndexScanPlan(
@@ -61,8 +60,13 @@ class IndexScanPlan final : public PlanBase {
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
-  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
-                                 const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

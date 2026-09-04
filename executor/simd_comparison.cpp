@@ -135,9 +135,10 @@ void SimdComparisonKernel::CompareDouble(const double* data, size_t count,
   }
 }
 
-void SimdComparisonKernel::CompareStringPrefix(
-    const std::string_view* data, size_t count, BinaryOperation op,
-    std::string_view target, ValidityBitmap* out_mask) {
+void SimdComparisonKernel::CompareStringPrefix(const std::string_view* data,
+                                               size_t count, BinaryOperation op,
+                                               std::string_view target,
+                                               ValidityBitmap* out_mask) {
   assert(out_mask != nullptr);
   switch (op) {
     case BinaryOperation::kEquals:
@@ -162,7 +163,8 @@ void SimdComparisonKernel::CompareStringPrefix(
       break;
     case BinaryOperation::kGreaterThanEquals:
       EvaluateScalarComparison(data, count, target,
-                               std::greater_equal<std::string_view>(), out_mask);
+                               std::greater_equal<std::string_view>(),
+                               out_mask);
       break;
     default:
       out_mask->Reset(count, false);
@@ -170,9 +172,10 @@ void SimdComparisonKernel::CompareStringPrefix(
   }
 }
 
-void SimdComparisonKernel::CompareInt64Vectors(
-    const int64_t* lhs, const int64_t* rhs, size_t count, BinaryOperation op,
-    ValidityBitmap* out_mask) {
+void SimdComparisonKernel::CompareInt64Vectors(const int64_t* lhs,
+                                               const int64_t* rhs, size_t count,
+                                               BinaryOperation op,
+                                               ValidityBitmap* out_mask) {
   assert(out_mask != nullptr);
   switch (op) {
     case BinaryOperation::kEquals:
@@ -204,9 +207,10 @@ void SimdComparisonKernel::CompareInt64Vectors(
   }
 }
 
-void SimdComparisonKernel::CompareDoubleVectors(
-    const double* lhs, const double* rhs, size_t count, BinaryOperation op,
-    ValidityBitmap* out_mask) {
+void SimdComparisonKernel::CompareDoubleVectors(const double* lhs,
+                                                const double* rhs, size_t count,
+                                                BinaryOperation op,
+                                                ValidityBitmap* out_mask) {
   assert(out_mask != nullptr);
   switch (op) {
     case BinaryOperation::kEquals:

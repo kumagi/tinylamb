@@ -20,20 +20,20 @@ namespace {
 // NULL-padded rows of a LEFT JOIN therefore never survive a WHERE conjunct
 // with this property, which makes the outer join reducible to an inner
 // join.
-bool RejectsNulls(const Expression& expression,
-                  const std::string& qualifier) {
-  if (!expression) { return false;
-}
+bool RejectsNulls(const Expression& expression, const std::string& qualifier) {
+  if (!expression) {
+    return false;
+  }
   switch (expression->Type()) {
     case TypeTag::kColumnValue: {
-      const ColumnName& column =
-          expression->AsColumnValue().GetColumnName();
+      const ColumnName& column = expression->AsColumnValue().GetColumnName();
       return !column.schema.empty() && column.schema == qualifier;
     }
     case TypeTag::kConstantValue:
       // Constants do not depend on the padded columns, so a constant TRUE
       // keeps the padded rows alive.
-      return false;    case TypeTag::kBinaryExp: {
+      return false;
+    case TypeTag::kBinaryExp: {
       const BinaryExpression& binary = expression->AsBinaryExpression();
       switch (binary.Op()) {
         case BinaryOperation::kAnd:
@@ -123,10 +123,10 @@ bool RejectsNulls(const Expression& expression,
 
 // Column identifiers (bare names) the conjunct references on the given
 // source, using the same bare-name resolution the engine applies.
-bool ConjunctTouches(const Expression& conjunct,
-                     const std::string& qualifier) {
-  if (!conjunct) { return false;
-}
+bool ConjunctTouches(const Expression& conjunct, const std::string& qualifier) {
+  if (!conjunct) {
+    return false;
+  }
   for (const ColumnName& column : conjunct->TouchedColumns()) {
     if (!column.schema.empty() && column.schema == qualifier) {
       return true;
@@ -138,11 +138,13 @@ bool ConjunctTouches(const Expression& conjunct,
 }  // namespace
 
 bool ReduceOuterJoins(SelectStatement* statement) {
-  if (statement == nullptr || !statement->WhereClause()) { return false;
-}
+  if (statement == nullptr || !statement->WhereClause()) {
+    return false;
+  }
   std::vector<SelectSource> sources = statement->Sources();
-  if (sources.empty()) { return false;
-}
+  if (sources.empty()) {
+    return false;
+  }
 
   // Qualifiers visible at each depth: sources [0, i] feed the join whose
   // right side is source i.
@@ -158,8 +160,9 @@ bool ReduceOuterJoins(SelectStatement* statement) {
     bool touches = false;
     for (const Expression& conjunct :
          SplitConjuncts(statement->WhereClause())) {
-      if (!ConjunctTouches(conjunct, qualifier)) { continue;
-}
+      if (!ConjunctTouches(conjunct, qualifier)) {
+        continue;
+      }
       touches = true;
       if (!RejectsNulls(conjunct, qualifier)) {
         all_reject = false;
@@ -171,8 +174,9 @@ bool ReduceOuterJoins(SelectStatement* statement) {
       changed = true;
     }
   }
-  if (changed) { statement->SetSources(std::move(sources));
-}
+  if (changed) {
+    statement->SetSources(std::move(sources));
+  }
   return changed;
 }
 

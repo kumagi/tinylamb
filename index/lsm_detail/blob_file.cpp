@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "index/lsm_detail/blob_file.hpp"
+
 #include <endian.h>
 
 #include <cstdint>

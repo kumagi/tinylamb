@@ -15,11 +15,14 @@
  */
 
 #include "decoder.hpp"
+
+#include <cstdint>
+#include <ios>
+#include <stdexcept>
 #include <string>
+
 #include "common/constants.hpp"
 #include "common/serdes.hpp"
-#include <ios>
-#include <cstdint>
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -78,8 +81,6 @@ Decoder& Decoder::operator>>(uint64_t& u64) {
   return *this;
 }
 
-
-
 Decoder& Decoder::operator>>(double& d) {
   char bytes[sizeof(d)]{};
   is_->read(bytes, sizeof(bytes));
@@ -88,7 +89,14 @@ Decoder& Decoder::operator>>(double& d) {
 }
 
 Decoder& Decoder::operator>>(ValueType& v) {
-  is_->read(reinterpret_cast<char*>(&v), sizeof(v));
+  // Reject out-of-range discriminants at the decode boundary instead of
+  // materializing an invalid enum value that later switches must handle.
+  uint8_t raw = 0;
+  is_->read(reinterpret_cast<char*>(&raw), sizeof(raw));
+  if (raw > static_cast<uint8_t>(ValueType::kArray)) {
+    throw std::runtime_error("undefined value type in decoder");
+  }
+  v = static_cast<ValueType>(raw);
   return *this;
 }
 

@@ -15,29 +15,29 @@
  */
 
 #include "type/value.hpp"
+
 #include <endian.h>
 
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
-
 #include <cstring>
 #include <functional>
 #include <limits>
-#include <string>
-#include <vector>
-#include <utility>
-#include <stdexcept>
 #include <ostream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/serdes.hpp"
-#include "type/value_type.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -71,7 +71,6 @@ std::string ToString(UnaryOperation type) {
   }
   return "UNKNOWN";
 }
-
 
 std::string ToString(AggregationType type) {
   switch (type) {
@@ -230,8 +229,9 @@ Value Value::DateFromDays(int64_t days) {
 }
 
 int64_t Value::DateDays() const {
-  if (type != ValueType::kDate) { throw std::runtime_error("DATE value required");
-}
+  if (type != ValueType::kDate) {
+    throw std::runtime_error("DATE value required");
+  }
   return value.int_value;
 }
 
@@ -245,21 +245,22 @@ Value Value::Array(std::vector<Value> elements, std::string element_sql_type) {
 }
 
 const std::vector<Value>& Value::ArrayElements() const {
-  if (array_ == nullptr) { return kEmptyArrayElements; }
+  if (array_ == nullptr) {
+    return kEmptyArrayElements;
+  }
   return array_->elements;
 }
 
 const std::string& Value::ArrayElementSqlType() const {
   static const std::string kEmpty;
-  if (array_ == nullptr) { return kEmpty; }
+  if (array_ == nullptr) {
+    return kEmpty;
+  }
   return array_->element_sql_type;
 }
 
 Value::Value(const Value& o)
-    : value(o.value),
-      type(o.type),
-      array_(o.array_),
-      collation_(o.collation_) {
+    : value(o.value), type(o.type), array_(o.array_), collation_(o.collation_) {
   if (type == ValueType::kVarChar) {
     if (!o.owned_data.empty()) {
       owned_data = o.owned_data;
@@ -286,7 +287,9 @@ Value::Value(Value&& o) noexcept
 }
 
 Value& Value::operator=(const Value& rhs) {
-  if (this == &rhs) { return *this; }
+  if (this == &rhs) {
+    return *this;
+  }
   type = rhs.type;
   value = rhs.value;
   owned_data.clear();
@@ -304,7 +307,9 @@ Value& Value::operator=(const Value& rhs) {
 }
 
 Value& Value::operator=(Value&& o) noexcept {
-  if (this == &o) { return *this; }
+  if (this == &o) {
+    return *this;
+  }
   owned_data = std::move(o.owned_data);
   array_ = std::move(o.array_);
   type = o.type;
@@ -345,7 +350,9 @@ bool Value::Truthy() const {
       size_t bytes = sizeof(uint32_t) + SerializeSize(ArrayElementSqlType());
       for (const Value& element : ArrayElements()) {
         bytes += 1;
-        if (!element.IsNull()) { bytes += 1 + element.Size(); }
+        if (!element.IsNull()) {
+          bytes += 1 + element.Size();
+        }
       }
       return bytes;
     }
@@ -452,7 +459,9 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
       cursor += DeserializeStringView(cursor, &sql_type);
       for (uint32_t i = 0; i < count; ++i) {
         const bool present = *cursor++ != 0;
-        if (!present) { continue; }
+        if (!present) {
+          continue;
+        }
         const auto elem_type = static_cast<ValueType>(*cursor++);
         cursor += SkipSerialized(cursor, elem_type);
       }
@@ -463,11 +472,17 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
 }
 
 std::string FormatDoubleShortest(double value) {
-  if (std::isnan(value)) { return "nan"; }
-  if (std::isinf(value)) { return value > 0 ? "inf" : "-inf"; }
+  if (std::isnan(value)) {
+    return "nan";
+  }
+  if (std::isinf(value)) {
+    return value > 0 ? "inf" : "-inf";
+  }
   char buffer[64];
   auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
-  if (ec != std::errc()) { return std::to_string(value); }
+  if (ec != std::errc()) {
+    return std::to_string(value);
+  }
   return std::string(buffer, ptr - buffer);
 }
 
@@ -482,7 +497,9 @@ std::string FormatDoubleShortest(double value) {
     case ValueType::kVarChar:
       return "\"" + std::string(value.varchar_value) + "\"";
     case ValueType::kDouble: {
-      if (std::isnan(value.double_value)) { return "nan"; }
+      if (std::isnan(value.double_value)) {
+        return "nan";
+      }
       if (std::isinf(value.double_value)) {
         return value.double_value > 0 ? "inf" : "-inf";
       }
@@ -492,12 +509,13 @@ std::string FormatDoubleShortest(double value) {
       return std::string(buffer, ptr - buffer);
     }
 
-
     case ValueType::kArray: {
       std::string out = "ARRAY<" + ArrayElementSqlType() + ">[";
       const auto& elements = ArrayElements();
       for (size_t i = 0; i < elements.size(); ++i) {
-        if (i != 0) { out += ", "; }
+        if (i != 0) {
+          out += ", ";
+        }
         out += elements[i].IsNull() ? "NULL" : elements[i].AsString();
       }
       out += "]";
@@ -520,17 +538,22 @@ bool Value::operator==(const Value& rhs) const {
     case ValueType::kVarChar: {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
-      if (sv1 == sv2) { return true; }
+      if (sv1 == sv2) {
+        return true;
+      }
       auto is_iv = [](std::string_view s) {
         // Interval text carries a single-hyphen month token ("2014-1 0 ...");
         // a leading token shaped like an ISO date ("2014-01-01 ...") is a
         // timestamp string and must compare byte-exact instead.
         const size_t sp = s.find(' ');
-        if (sp == std::string_view::npos) { return false; }
+        if (sp == std::string_view::npos) {
+          return false;
+        }
         const size_t hy = s.find('-');
-        if (hy == std::string_view::npos || hy > sp) { return false; }
-        return s.substr(0, sp).find('-') ==
-               s.substr(0, sp).rfind('-');
+        if (hy == std::string_view::npos || hy > sp) {
+          return false;
+        }
+        return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) == IntervalValue::Parse(sv2);
@@ -546,7 +569,9 @@ bool Value::operator==(const Value& rhs) const {
       // equality non-transitive, contradicted operator< and std::hash, and
       // merged distinct group keys; comparison sites that need fuzzy
       // matching (e.g. accumulated sums) must opt in explicitly.
-      if (std::isnan(lhs) && std::isnan(rhs_double)) { return true; }
+      if (std::isnan(lhs) && std::isnan(rhs_double)) {
+        return true;
+      }
       return lhs == rhs_double;
     }
     case ValueType::kArray:
@@ -608,18 +633,30 @@ size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
   for (size_t size = 0;;) {
     buffer = src;
     const size_t offset = dst->size();
-    if (buffer[8] == 9) {
+    // The flag byte is unsigned; reading it as signed char would turn a
+    // corrupt 0x80..0xFF image into a negative length and an underflowing
+    // size_t accumulator.
+    const unsigned char flag = static_cast<unsigned char>(buffer[8]);
+    if (flag == 9) {
+      // Continuation group: eight payload bytes follow.
       size += 8;
       dst->resize(size);
       ::memcpy(dst->data() + offset, buffer, 8);
+      src += 9;
+    } else if (flag == 0) {
+      // Empty-string encoding: the encoder emits a single all-zero group for
+      // "". Consume the group and leave dst empty.
+      src += 9;
+      break;
+    } else if (8 < flag) {
+      throw std::runtime_error("corrupt memcomparable varchar length");
     } else {
-      size += buffer[8];
+      size += flag;
       src += 9;
       dst->resize(size);
-      ::memcpy(dst->data() + offset, buffer, buffer[8]);
+      ::memcpy(dst->data() + offset, buffer, flag);
       break;
     }
-    src += buffer[8];
   }
   return src - initial_offset;
 }
@@ -723,7 +760,14 @@ size_t Value::DecodeMemcomparableFormat(const char* src) {
       cursor += sizeof(be);
       const uint32_t count = be32toh(be);
       const char* type_begin = cursor;
-      while (*cursor != '\0') { ++cursor; }
+      // Bounded scan: a corrupt image without a terminator must not walk off
+      // the key buffer.  Real SQL type names are far shorter than this cap.
+      while (*cursor != '\0') {
+        if (static_cast<size_t>(cursor - type_begin) >= 64) {
+          throw std::runtime_error("corrupt memcomparable array type name");
+        }
+        ++cursor;
+      }
       std::string sql_type(type_begin, cursor);
       ++cursor;
       std::vector<Value> elements;
@@ -764,11 +808,14 @@ bool Value::operator<(const Value& rhs) const {
         // a leading token shaped like an ISO date ("2014-01-01 ...") is a
         // timestamp string and must compare byte-exact instead.
         const size_t sp = s.find(' ');
-        if (sp == std::string_view::npos) { return false; }
+        if (sp == std::string_view::npos) {
+          return false;
+        }
         const size_t hy = s.find('-');
-        if (hy == std::string_view::npos || hy > sp) { return false; }
-        return s.substr(0, sp).find('-') ==
-               s.substr(0, sp).rfind('-');
+        if (hy == std::string_view::npos || hy > sp) {
+          return false;
+        }
+        return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) < IntervalValue::Parse(sv2);
@@ -801,11 +848,14 @@ bool Value::operator>(const Value& rhs) const {
         // a leading token shaped like an ISO date ("2014-01-01 ...") is a
         // timestamp string and must compare byte-exact instead.
         const size_t sp = s.find(' ');
-        if (sp == std::string_view::npos) { return false; }
+        if (sp == std::string_view::npos) {
+          return false;
+        }
         const size_t hy = s.find('-');
-        if (hy == std::string_view::npos || hy > sp) { return false; }
-        return s.substr(0, sp).find('-') ==
-               s.substr(0, sp).rfind('-');
+        if (hy == std::string_view::npos || hy > sp) {
+          return false;
+        }
+        return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) > IntervalValue::Parse(sv2);
@@ -826,8 +876,7 @@ Value Value::operator+(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     int64_t result = 0;
-    if (__builtin_add_overflow(value.int_value, rhs.value.int_value,
-                               &result)) {
+    if (__builtin_add_overflow(value.int_value, rhs.value.int_value, &result)) {
       throw std::runtime_error("integer overflow on '+'");
     }
     return Value(result);
@@ -849,8 +898,7 @@ Value Value::operator-(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     int64_t result = 0;
-    if (__builtin_sub_overflow(value.int_value, rhs.value.int_value,
-                               &result)) {
+    if (__builtin_sub_overflow(value.int_value, rhs.value.int_value, &result)) {
       throw std::runtime_error("integer overflow on '-'");
     }
     return Value(result);
@@ -867,8 +915,7 @@ Value Value::operator*(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     int64_t result = 0;
-    if (__builtin_mul_overflow(value.int_value, rhs.value.int_value,
-                               &result)) {
+    if (__builtin_mul_overflow(value.int_value, rhs.value.int_value, &result)) {
       throw std::runtime_error("integer overflow on '*'");
     }
     return Value(result);
@@ -952,7 +999,8 @@ Value Value::operator^(const Value& rhs) const {
 int CompareForOrderBy(const Value& a, const Value& b) {
   // Type rank keeps cross-type keys in a deterministic total order; matching
   // types compare by value.
-  static constexpr int kRank[] = {0, 1, 4, 3, 5, 6};  // null,int,string,double,date,array
+  static constexpr int kRank[] = {0, 1, 4, 3,
+                                  5, 6};  // null,int,string,double,date,array
   auto rank_of = [](const Value& v) {
     return v.type == ValueType::kNull
                ? 0
@@ -961,14 +1009,16 @@ int CompareForOrderBy(const Value& a, const Value& b) {
   };
   if (a.IsNull() || b.IsNull()) {
     // NULLs compare equal here; NULLS FIRST/LAST is the caller's decision.
-    if (a.IsNull() && b.IsNull()) { return 0;
-}
+    if (a.IsNull() && b.IsNull()) {
+      return 0;
+    }
     return a.IsNull() ? -1 : 1;
   }
   const int ra = rank_of(a);
   const int rb = rank_of(b);
-  if (ra != rb) { return ra < rb ? -1 : 1;
-}
+  if (ra != rb) {
+    return ra < rb ? -1 : 1;
+  }
   switch (a.type) {
     case ValueType::kInt64:
     case ValueType::kDate:
@@ -982,8 +1032,9 @@ int CompareForOrderBy(const Value& a, const Value& b) {
       // equal under the ordering (DESC is the exact reverse).
       const bool nx = std::isnan(x);
       const bool ny = std::isnan(y);
-      if (nx || ny) { return nx && ny ? 0 : (nx ? -1 : 1);
-}
+      if (nx || ny) {
+        return nx && ny ? 0 : (nx ? -1 : 1);
+      }
       return x < y ? -1 : (y < x ? 1 : 0);
     }
     case ValueType::kVarChar: {
@@ -1011,11 +1062,11 @@ int CompareForOrderBy(const Value& a, const Value& b) {
       const size_t n = std::min(xs.size(), ys.size());
       for (size_t i = 0; i < n; ++i) {
         const int c = CompareForOrderBy(xs[i], ys[i]);
-        if (c != 0) { return c;
-}
+        if (c != 0) {
+          return c;
+        }
       }
-      return xs.size() < ys.size() ? -1
-                                   : (ys.size() < xs.size() ? 1 : 0);
+      return xs.size() < ys.size() ? -1 : (ys.size() < xs.size() ? 1 : 0);
     }
     default:
       return 0;
@@ -1095,11 +1146,14 @@ uint64_t std::hash<tinylamb::Value>::operator()(
         // a leading token shaped like an ISO date ("2014-01-01 ...") is a
         // timestamp string and must compare byte-exact instead.
         const size_t sp = s.find(' ');
-        if (sp == std::string_view::npos) { return false; }
+        if (sp == std::string_view::npos) {
+          return false;
+        }
         const size_t hy = s.find('-');
-        if (hy == std::string_view::npos || hy > sp) { return false; }
-        return s.substr(0, sp).find('-') ==
-               s.substr(0, sp).rfind('-');
+        if (hy == std::string_view::npos || hy > sp) {
+          return false;
+        }
+        return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv)) {
         tinylamb::IntervalValue iv = tinylamb::IntervalValue::Parse(sv);

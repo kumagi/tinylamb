@@ -56,7 +56,10 @@ class VMCache {
     cache_.Read(dst, offset * sizeof(T), size * sizeof(T));
   }
   void Invalidate(size_t offset, size_t length) {
-    cache_.Invalidate(offset, length * sizeof(T));
+    // Element units like Read(): the offset was previously passed through
+    // as raw bytes while the length was scaled, so any non-zero offset
+    // invalidated the wrong range.
+    cache_.Invalidate(offset * sizeof(T), length * sizeof(T));
   }
   [[nodiscard]] std::string Dump() const { return cache_.Dump(); }
 

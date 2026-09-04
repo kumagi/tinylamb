@@ -57,12 +57,18 @@ class BlobFile final {
     while (file_writer_.CommittedLSN() < lsn) {
       // A dead writer would stall this loop forever; surface its error.
       if (file_writer_.Failed()) {
-        throw std::runtime_error("BlobFile flush failed: " +
-                                 std::string(std::strerror(
-                                     file_writer_.ErrorNumber())));
+        throw std::runtime_error(
+            "BlobFile flush failed: " +
+            std::string(std::strerror(file_writer_.ErrorNumber())));
       }
       std::this_thread::yield();
     }
+    // Wait for the bytes the run header will reference to survive fdatasync:
+    // SortedRun::FlushInternal fsyncs the run file itself, but a crash
+    // between that fsync and the blob's own group-commit window would leave
+    // a durable run pointing at torn blob payloads (quarantined on restore,
+    // torn reads while running).
+    file_writer_.WaitForDurable(lsn);
   }
 
   friend std::ostream& operator<<(std::ostream& o, const BlobFile& b) {

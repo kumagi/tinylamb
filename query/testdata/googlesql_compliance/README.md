@@ -5,7 +5,7 @@ Vendored from [google/googlesql](https://github.com/google/googlesql)
 
 Pin: `TINYLAMB_GOOGLESQL_VERSION` in CMakeLists.txt (currently `2026.7.2`).
 Currently **274** upstream `*.test` files from that tag, plus locally authored
-`optimizer_*.test` expectation suites (currently 12 files / 225 cases).
+`optimizer_*.test` expectation suites (currently 13 files / 262 cases).
 
 Re-fetch with:
 
@@ -34,3 +34,11 @@ using repeatable `[plan_contains=...]` and `[plan_not_contains=...]` options.
 `[mode=explain]` runs `EXPLAIN`; `[mode=explain_analyze]` runs
 `EXPLAIN ANALYZE` so runtime/adaptive behavior can also be asserted. Fragment
 matching avoids brittle exact goldens for costs and timings.
+
+`optimizer_arithmetic_high_expectations.test` ends with a clearly commented
+section of typed-arithmetic cases: sign absorption (`-1 * col -> -col`),
+repeated-addend folding (`col + col -> col * 2`), and add/multiply constant
+reassociation on column operands. These rewrites live in the typed pass
+(`RewriteTypedArithmetic`), which resolves column result types where the
+schema-less expression rewriter cannot; the cases validate result rows and
+stable plan fragments together end to end.

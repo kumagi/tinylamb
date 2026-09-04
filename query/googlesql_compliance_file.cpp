@@ -6,7 +6,6 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
-
 #include <cstdint>
 #include <filesystem>
 #include <ranges>
@@ -27,7 +26,6 @@ namespace {
 std::vector<std::string> SplitTopLevel(std::string_view text);
 
 std::string Trim(std::string_view text) {
-
   size_t begin = 0;
   while (begin < text.size() &&
          std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
@@ -42,9 +40,9 @@ std::string Trim(std::string_view text) {
 }
 
 std::string ToLower(std::string text) {
-  std::ranges::transform(
-      text, text.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::ranges::transform(text, text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
   return text;
 }
 
@@ -62,8 +60,13 @@ size_t TopLevelAsPosition(const std::string& lower) {
   for (size_t i = 0; i < lower.size(); ++i) {
     const char c = lower[i];
     if (in_string) {
-      if (c == '\\' && i + 1 < lower.size()) { ++i; continue; }
-      if (c == quote) { in_string = false; }
+      if (c == '\\' && i + 1 < lower.size()) {
+        ++i;
+        continue;
+      }
+      if (c == quote) {
+        in_string = false;
+      }
       continue;
     }
     if (c == '"' || c == '\'') {
@@ -74,7 +77,9 @@ size_t TopLevelAsPosition(const std::string& lower) {
     if (c == '[' || c == '{' || c == '(' || c == '<') {
       ++depth;
     } else if (c == ']' || c == '}' || c == ')' || c == '>') {
-      if (depth > 0) { --depth; }
+      if (depth > 0) {
+        --depth;
+      }
     } else if (c == ' ' && depth == 0 &&
                lower.compare(i, needle.size(), needle) == 0) {
       return i;
@@ -86,14 +91,18 @@ size_t TopLevelAsPosition(const std::string& lower) {
 // True when `s` ends with "<whitespace><identifier>" and the boundary sits at
 // bracket depth zero outside string literals.
 bool SplitTrailingIdentifier(const std::string& s, size_t* split) {
-  if (s.empty()) { return false; }
+  if (s.empty()) {
+    return false;
+  }
   size_t end = s.size();
   while (end > 0 &&
          (std::isalnum(static_cast<unsigned char>(s[end - 1])) != 0 ||
           s[end - 1] == '_')) {
     --end;
   }
-  if (end == s.size() || end == 0) { return false; }
+  if (end == s.size() || end == 0) {
+    return false;
+  }
   // The identifier must be preceded by whitespace...
   if (std::isspace(static_cast<unsigned char>(s[end - 1])) == 0) {
     return false;
@@ -105,8 +114,13 @@ bool SplitTrailingIdentifier(const std::string& s, size_t* split) {
   for (size_t i = 0; i < end - 1; ++i) {
     const char c = s[i];
     if (in_string) {
-      if (c == '\\' && i + 1 < end - 1) { ++i; continue; }
-      if (c == quote) { in_string = false; }
+      if (c == '\\' && i + 1 < end - 1) {
+        ++i;
+        continue;
+      }
+      if (c == quote) {
+        in_string = false;
+      }
       continue;
     }
     if (c == '"' || c == '\'') {
@@ -114,10 +128,16 @@ bool SplitTrailingIdentifier(const std::string& s, size_t* split) {
       quote = c;
       continue;
     }
-    if (c == '[' || c == '{' || c == '(' || c == '<') { ++depth; }
-    if (c == ']' || c == '}' || c == ')' || c == '>') { --depth; }
+    if (c == '[' || c == '{' || c == '(' || c == '<') {
+      ++depth;
+    }
+    if (c == ']' || c == '}' || c == ')' || c == '>') {
+      --depth;
+    }
   }
-  if (depth != 0 || in_string) { return false; }
+  if (depth != 0 || in_string) {
+    return false;
+  }
   *split = end;
   return true;
 }
@@ -136,7 +156,9 @@ std::vector<std::string> SplitCases(std::string_view contents) {
     current += line;
     current.push_back('\n');
   }
-  if (!Trim(current).empty()) { cases.push_back(std::move(current)); }
+  if (!Trim(current).empty()) {
+    cases.push_back(std::move(current));
+  }
   return cases;
 }
 
@@ -165,12 +187,13 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     std::istringstream features(value);
     while (std::getline(features, feature, ',')) {
       feature = Trim(feature);
-      if (!feature.empty()) { out->required_features.push_back(feature); }
+      if (!feature.empty()) {
+        out->required_features.push_back(feature);
+      }
     }
     return true;
   }
-  if (key == "default required_features" ||
-      key == "default required_feature") {
+  if (key == "default required_features" || key == "default required_feature") {
     file_default_features->clear();
     std::string feature;
     std::istringstream features(value);
@@ -240,14 +263,15 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
   return true;
 }
 
-
 bool ParseStructRow(std::string_view text, size_t* offset,
                     std::vector<std::string>* fields) {
   while (*offset < text.size() &&
          std::isspace(static_cast<unsigned char>(text[*offset])) != 0) {
     ++*offset;
   }
-  if (*offset >= text.size() || text[*offset] != '{') { return false; }
+  if (*offset >= text.size() || text[*offset] != '{') {
+    return false;
+  }
   ++*offset;
   std::string token;
   int depth = 1;
@@ -256,7 +280,9 @@ bool ParseStructRow(std::string_view text, size_t* offset,
   char quote = '\0';
   auto flush = [&]() {
     const std::string field = Trim(token);
-    if (!field.empty()) { fields->push_back(field); }
+    if (!field.empty()) {
+      fields->push_back(field);
+    }
     token.clear();
   };
   while (*offset < text.size() && depth > 0) {
@@ -269,7 +295,9 @@ bool ParseStructRow(std::string_view text, size_t* offset,
         ++*offset;
         continue;
       }
-      if (c == quote) { in_string = false; }
+      if (c == quote) {
+        in_string = false;
+      }
       continue;
     }
     if (c == '"' || c == '\'') {
@@ -298,7 +326,9 @@ bool ParseStructRow(std::string_view text, size_t* offset,
       continue;
     }
     if (c == ']' || c == ')' || c == '>') {
-      if (bracket_depth > 0) { --bracket_depth; }
+      if (bracket_depth > 0) {
+        --bracket_depth;
+      }
       token.push_back(c);
       continue;
     }
@@ -315,14 +345,18 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
   const std::string lower = ToLower(std::string(result));
   out->unknown_order = lower.find("unknown order") != std::string::npos;
   const size_t array_open = result.find('[');
-  if (array_open == std::string_view::npos) { return; }
+  if (array_open == std::string_view::npos) {
+    return;
+  }
   size_t offset = array_open + 1;
   while (offset < result.size()) {
     while (offset < result.size() &&
            std::isspace(static_cast<unsigned char>(result[offset])) != 0) {
       ++offset;
     }
-    if (offset >= result.size() || result[offset] == ']') { break; }
+    if (offset >= result.size() || result[offset] == ']') {
+      break;
+    }
     if (result[offset] == ',') {
       ++offset;
       continue;
@@ -341,7 +375,9 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
     }
     std::vector<std::string> fields;
     if (result[offset] == '{') {
-      if (!ParseStructRow(result, &offset, &fields)) { break; }
+      if (!ParseStructRow(result, &offset, &fields)) {
+        break;
+      }
       out->expected_rows.push_back(std::move(fields));
       continue;
     }
@@ -354,8 +390,11 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
     while (end < result.size()) {
       const char c = result[end];
       if (in_string) {
-        if (c == '\\' && end + 1 < result.size()) { ++end; }
-        else if (c == quote) { in_string = false; }
+        if (c == '\\' && end + 1 < result.size()) {
+          ++end;
+        } else if (c == quote) {
+          in_string = false;
+        }
         ++end;
         continue;
       }
@@ -365,15 +404,22 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
         ++end;
         continue;
       }
-      if (c == '<' || c == '[' || c == '(' || c == '{') { ++depth; }
-      else if (c == '>' && depth > 0) { --depth; }
-      else if ((c == ')' || c == '}') && depth > 0) { --depth; }
-      else if ((c == ',' && depth == 0) || c == ']') { break; }
+      if (c == '<' || c == '[' || c == '(' || c == '{') {
+        ++depth;
+      } else if (c == '>' && depth > 0) {
+        --depth;
+      } else if ((c == ')' || c == '}') && depth > 0) {
+        --depth;
+      } else if ((c == ',' && depth == 0) || c == ']') {
+        break;
+      }
       ++end;
     }
     const std::string token = Trim(result.substr(offset, end - offset));
     offset = end;
-    if (!token.empty()) { out->expected_rows.push_back({token}); }
+    if (!token.empty()) {
+      out->expected_rows.push_back({token});
+    }
   }
 }
 
@@ -432,7 +478,9 @@ std::string ReadLogicalOptionLine(std::istringstream* stream,
     for (size_t i = 0; i < text.size(); ++i) {
       const char c = text[i];
       if (in_string) {
-        if (c == '\\' && i + 1 < text.size()) { ++i; } else if (c == quote) {
+        if (c == '\\' && i + 1 < text.size()) {
+          ++i;
+        } else if (c == quote) {
           in_string = false;
         }
         continue;
@@ -451,17 +499,19 @@ std::string ReadLogicalOptionLine(std::istringstream* stream,
   std::string line = std::move(first_line);
   while (unbalanced(line)) {
     std::string next;
-    if (!std::getline(*stream, next)) { break; }
+    if (!std::getline(*stream, next)) {
+      break;
+    }
     line.push_back(' ');
     line += next;
   }
   return line;
 }
 
-GoogleSqlComplianceCase ParseSegment(std::string_view file,
-                                     std::string_view segment,
-                                     std::string* current_default_tz,
-                                     std::vector<std::string>* default_features) {
+GoogleSqlComplianceCase ParseSegment(
+    std::string_view file, std::string_view segment,
+    std::string* current_default_tz,
+    std::vector<std::string>* default_features) {
   GoogleSqlComplianceCase test_case;
   test_case.file = std::string(file);
   test_case.default_time_zone = *current_default_tz;
@@ -473,7 +523,9 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
   while (std::getline(stream, line)) {
     const std::string trimmed = Trim(line);
     if (in_options) {
-      if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
+      if (trimmed.empty() || trimmed.starts_with('#')) {
+        continue;
+      }
       if (trimmed.front() == '[') {
         line = ReadLogicalOptionLine(&stream, line);
       }
@@ -489,15 +541,18 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
       std::ostringstream rest;
       rest << stream.rdbuf();
       ParseResult(rest.str(), &test_case);
-      test_case.sql = NormalizeCommentEscapes(ApplyParameters(Trim(sql), test_case.parameters));
+      test_case.sql = NormalizeCommentEscapes(
+          ApplyParameters(Trim(sql), test_case.parameters));
       if (test_case.name.empty()) {
-        test_case.name = test_case.prepare_database ? "prepare_database"
-                                                    : "unnamed";
+        test_case.name =
+            test_case.prepare_database ? "prepare_database" : "unnamed";
       }
       return test_case;
     }
     if (sql.empty()) {
-      if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
+      if (trimmed.empty() || trimmed.starts_with('#')) {
+        continue;
+      }
       if (trimmed.front() == '[') {
         line = ReadLogicalOptionLine(&stream, line);
       }
@@ -511,7 +566,8 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     sql += line;
     sql.push_back('\n');
   }
-  test_case.sql = NormalizeCommentEscapes(ApplyParameters(Trim(sql), test_case.parameters));
+  test_case.sql =
+      NormalizeCommentEscapes(ApplyParameters(Trim(sql), test_case.parameters));
   if (test_case.name.empty()) {
     test_case.name =
         test_case.prepare_database ? "prepare_database" : "unnamed";
@@ -519,16 +575,12 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
   return test_case;
 }
 
-
-
 std::string Unquote(std::string_view token) {
   if (token.size() >= 1 && (token.front() == 'b' || token.front() == 'B')) {
     token.remove_prefix(1);
   }
-  if (token.size() >= 2 &&
-      ((token.front() == '"' && token.back() == '"') ||
-       (token.front() == '\'' && token.back() == '\''))) {
-
+  if (token.size() >= 2 && ((token.front() == '"' && token.back() == '"') ||
+                            (token.front() == '\'' && token.back() == '\''))) {
     std::string out;
     for (size_t i = 1; i + 1 < token.size(); ++i) {
       if (token[i] == '\\' && i + 2 < token.size()) {
@@ -564,7 +616,6 @@ std::string Unquote(std::string_view token) {
   return std::string(token);
 }
 
-
 std::vector<std::string> SplitTopLevel(std::string_view text) {
   std::vector<std::string> parts;
   std::string current;
@@ -579,7 +630,9 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
         current.push_back(text[++i]);
         continue;
       }
-      if (c == quote) { in_string = false; }
+      if (c == quote) {
+        in_string = false;
+      }
       continue;
     }
     if (c == '"' || c == '\'') {
@@ -594,20 +647,26 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
       continue;
     }
     if (c == ']' || c == '}' || c == ')' || c == '>') {
-      if (depth > 0) { --depth; }
+      if (depth > 0) {
+        --depth;
+      }
       current.push_back(c);
       continue;
     }
     if (c == ',' && depth == 0) {
       const std::string part = Trim(current);
-      if (!part.empty()) { parts.push_back(part); }
+      if (!part.empty()) {
+        parts.push_back(part);
+      }
       current.clear();
       continue;
     }
     current.push_back(c);
   }
   const std::string part = Trim(current);
-  if (!part.empty()) { parts.push_back(part); }
+  if (!part.empty()) {
+    parts.push_back(part);
+  }
   return parts;
 }
 
@@ -623,8 +682,9 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
   int depth = 1;
   size_t close = std::string::npos;
   for (size_t i = kPrefix.size(); i < text.size(); ++i) {
-    if (text[i] == '<') { ++depth; }
-    else if (text[i] == '>') {
+    if (text[i] == '<') {
+      ++depth;
+    } else if (text[i] == '>') {
       --depth;
       if (depth == 0) {
         close = i;
@@ -632,7 +692,9 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
       }
     }
   }
-  if (close == std::string::npos) { return false; }
+  if (close == std::string::npos) {
+    return false;
+  }
   *sql_type = Trim(text.substr(kPrefix.size(), close - kPrefix.size()));
   std::string rest = Trim(text.substr(close + 1));
   if (rest.size() < 2 || rest.front() != '[' || rest.back() != ']') {
@@ -646,7 +708,9 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
     inner = Trim(inner.substr(kKnown.size()));
   } else if (lower.starts_with(kUnknown)) {
     inner = Trim(inner.substr(kUnknown.size()));
-    if (unordered != nullptr) { *unordered = true; }
+    if (unordered != nullptr) {
+      *unordered = true;
+    }
   }
   *elements = SplitTopLevel(inner);
   return true;
@@ -655,7 +719,9 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
 std::string QuoteComplianceString(std::string_view text, bool bytes) {
   std::string out = bytes ? "b\"" : "\"";
   for (const char c : text) {
-    if (c == '"' || c == '\\') { out.push_back('\\'); }
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+    }
     out.push_back(c);
   }
   out.push_back('"');
@@ -673,7 +739,9 @@ std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
   std::string current_default_tz = "America/Los_Angeles";
   std::vector<std::string> default_features;
   for (const std::string& segment : SplitCases(contents)) {
-    if (Trim(segment).empty()) { continue; }
+    if (Trim(segment).empty()) {
+      continue;
+    }
     GoogleSqlComplianceCase test_case =
         ParseSegment(file, segment, &current_default_tz, &default_features);
     if (test_case.name == "unnamed" ||
@@ -683,7 +751,9 @@ std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
         test_case.name += "_" + std::to_string(unnamed++);
       }
     }
-    if (test_case.sql.empty() && !test_case.prepare_database) { continue; }
+    if (test_case.sql.empty() && !test_case.prepare_database) {
+      continue;
+    }
     cases.push_back(std::move(test_case));
   }
   return cases;
@@ -695,8 +765,12 @@ std::vector<std::string> ListGoogleSqlComplianceFiles(
   std::error_code error;
   for (const auto& entry :
        std::filesystem::directory_iterator(std::string(directory), error)) {
-    if (!entry.is_regular_file()) { continue; }
-    if (entry.path().extension() != ".test") { continue; }
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    if (entry.path().extension() != ".test") {
+      continue;
+    }
     files.push_back(entry.path().filename().string());
   }
   std::ranges::sort(files);
@@ -706,10 +780,18 @@ std::vector<std::string> ListGoogleSqlComplianceFiles(
 bool IsDifferentialPrivacyCase(const GoogleSqlComplianceCase& test_case) {
   const std::string hay =
       ToLower(test_case.file + " " + test_case.name + " " + test_case.sql);
-  if (hay.find("differential_privacy") != std::string::npos) { return true; }
-  if (hay.find("differential privacy") != std::string::npos) { return true; }
-  if (hay.find("anonymization") != std::string::npos) { return true; }
-  if (hay.find("anon_") != std::string::npos) { return true; }
+  if (hay.find("differential_privacy") != std::string::npos) {
+    return true;
+  }
+  if (hay.find("differential privacy") != std::string::npos) {
+    return true;
+  }
+  if (hay.find("anonymization") != std::string::npos) {
+    return true;
+  }
+  if (hay.find("anon_") != std::string::npos) {
+    return true;
+  }
   for (const std::string& feature : test_case.required_features) {
     const std::string lower = ToLower(feature);
     if (lower.find("anonym") != std::string::npos ||
@@ -722,12 +804,16 @@ bool IsDifferentialPrivacyCase(const GoogleSqlComplianceCase& test_case) {
 }
 
 std::string FormatComplianceValue(const Value& value) {
-  if (value.IsNull()) { return "NULL"; }
+  if (value.IsNull()) {
+    return "NULL";
+  }
   switch (value.type) {
     case ValueType::kInt64:
       return std::to_string(value.value.int_value);
     case ValueType::kDouble: {
-      if (std::isnan(value.value.double_value)) { return "nan"; }
+      if (std::isnan(value.value.double_value)) {
+        return "nan";
+      }
       if (std::isinf(value.value.double_value)) {
         return value.value.double_value > 0 ? "inf" : "-inf";
       }
@@ -744,17 +830,21 @@ std::string FormatComplianceValue(const Value& value) {
       const std::string sql_type = value.ArrayElementSqlType();
       const auto& elements = value.ArrayElements();
       std::string inner;
-      if (elements.size() >= 2) { inner = "known order:"; }
+      if (elements.size() >= 2) {
+        inner = "known order:";
+      }
       for (size_t i = 0; i < elements.size(); ++i) {
-        if (i != 0) { inner += ", "; }
+        if (i != 0) {
+          inner += ", ";
+        }
         const Value& element = elements[i];
         if (element.IsNull()) {
           inner += "NULL";
         } else if (sql_type == "BOOL" || sql_type == "BOOLEAN") {
-          inner += element.type == ValueType::kInt64 &&
-                           element.value.int_value != 0
-                       ? "true"
-                       : "false";
+          inner +=
+              element.type == ValueType::kInt64 && element.value.int_value != 0
+                  ? "true"
+                  : "false";
         } else if (sql_type == "STRING") {
           inner += QuoteComplianceString(
               std::string(element.value.varchar_value), false);
@@ -788,19 +878,25 @@ std::string NormalizeWsText(std::string_view str) {
   bool in_space = false;
   for (char c : str) {
     if (std::isspace(static_cast<unsigned char>(c))) {
-      if (!in_space && !out.empty() && out.back() != '[' && out.back() != '(' && out.back() != '{' && out.back() != ',') {
+      if (!in_space && !out.empty() && out.back() != '[' && out.back() != '(' &&
+          out.back() != '{' && out.back() != ',') {
         out.push_back(' ');
       }
       in_space = true;
     } else {
-      if (in_space && !out.empty() && (c == ']' || c == ')' || c == '}' || c == ',')) {
-        if (out.back() == ' ') { out.pop_back(); }
+      if (in_space && !out.empty() &&
+          (c == ']' || c == ')' || c == '}' || c == ',')) {
+        if (out.back() == ' ') {
+          out.pop_back();
+        }
       }
       in_space = false;
       out.push_back(c);
     }
   }
-  if (!out.empty() && out.back() == ' ') { out.pop_back(); }
+  if (!out.empty() && out.back() == ' ') {
+    out.pop_back();
+  }
   return out;
 }
 
@@ -839,11 +935,11 @@ void SplitProtoMembers(const std::string& body,
         // name so recursive proto comparison can distinguish them from
         // positional STRUCT values.
         size_t name_end = 0;
-        while (name_end < piece.size() &&
-               (std::isalnum(static_cast<unsigned char>(piece[name_end])) !=
-                    0 ||
-                piece[name_end] == '_' || piece[name_end] == '.' ||
-                piece[name_end] == '[' || piece[name_end] == ']')) {
+        while (
+            name_end < piece.size() &&
+            (std::isalnum(static_cast<unsigned char>(piece[name_end])) != 0 ||
+             piece[name_end] == '_' || piece[name_end] == '.' ||
+             piece[name_end] == '[' || piece[name_end] == ']')) {
           ++name_end;
         }
         size_t body_start = name_end;
@@ -866,8 +962,13 @@ void SplitProtoMembers(const std::string& body,
   while (i < n) {
     const char c = body[i];
     if (in_string) {
-      if (c == '\\' && i + 1 < n) { i += 2; continue; }
-      if (c == quote) { in_string = false; }
+      if (c == '\\' && i + 1 < n) {
+        i += 2;
+        continue;
+      }
+      if (c == quote) {
+        in_string = false;
+      }
       ++i;
       continue;
     }
@@ -877,16 +978,24 @@ void SplitProtoMembers(const std::string& body,
       ++i;
       continue;
     }
-    if (c == '{' || c == '(' || c == '[' || c == '<') { ++depth; ++i; continue; }
+    if (c == '{' || c == '(' || c == '[' || c == '<') {
+      ++depth;
+      ++i;
+      continue;
+    }
     if (c == '}' || c == ')' || c == ']' || c == '>') {
-      if (depth > 0) { --depth; }
+      if (depth > 0) {
+        --depth;
+      }
       ++i;
       continue;
     }
     if (depth == 0 && (c == ',' || c == ';')) {
       flush(i);
       ++i;
-      while (i < n && std::isspace(static_cast<unsigned char>(body[i]))) { ++i; }
+      while (i < n && std::isspace(static_cast<unsigned char>(body[i]))) {
+        ++i;
+      }
       start = i;
       continue;
     }
@@ -894,14 +1003,19 @@ void SplitProtoMembers(const std::string& body,
       // Whitespace ends the member only when an identifier-colon follows
       // ("field: value field2: value2"); bare values keep their spaces.
       size_t j = i;
-      while (j < n && std::isspace(static_cast<unsigned char>(body[j]))) { ++j; }
+      while (j < n && std::isspace(static_cast<unsigned char>(body[j]))) {
+        ++j;
+      }
       if (j < n && ProtoIsIdentStart(body[j])) {
         size_t k = j + 1;
-        while (k < n && (std::isalnum(static_cast<unsigned char>(body[k])) != 0 ||
-                         body[k] == '_' || body[k] == '.' || body[k] == ']')) {
+        while (k < n &&
+               (std::isalnum(static_cast<unsigned char>(body[k])) != 0 ||
+                body[k] == '_' || body[k] == '.' || body[k] == ']')) {
           ++k;
         }
-        while (k < n && std::isspace(static_cast<unsigned char>(body[k]))) { ++k; }
+        while (k < n && std::isspace(static_cast<unsigned char>(body[k]))) {
+          ++k;
+        }
         if (k < n && (body[k] == ':' || body[k] == '{' || body[k] == '<') &&
             k > j) {
           flush(i);
@@ -933,7 +1047,9 @@ std::string CanonicalizeProtoBody(const std::string& body) {
   std::sort(canon.begin(), canon.end());
   std::string joined;
   for (const std::string& item : canon) {
-    if (!joined.empty()) { joined.push_back('|'); }
+    if (!joined.empty()) {
+      joined.push_back('|');
+    }
     joined += item;
   }
   return joined;
@@ -971,12 +1087,20 @@ bool ProtoBodiesMatch(const std::string& want_body,
   }
   bool all_named = true;
   for (const auto& [name, raw] : want_members) {
-    if (name.empty()) { all_named = false; break; }
+    if (name.empty()) {
+      all_named = false;
+      break;
+    }
   }
   for (const auto& [name, raw] : actual_members) {
-    if (name.empty()) { all_named = false; break; }
+    if (name.empty()) {
+      all_named = false;
+      break;
+    }
   }
-  if (!all_named) { return false; }
+  if (!all_named) {
+    return false;
+  }
   return CanonicalizeProtoBody(want_body) == CanonicalizeProtoBody(actual_body);
 }
 
@@ -987,22 +1111,32 @@ bool ProtoBodiesMatch(const std::string& want_body,
 // makes JSON-encoded BOOL/number members fail against `false`/numeric tokens.
 Value ParseEmbeddedComplianceValue(std::string token) {
   token = Trim(token);
-  if (ToLower(token) == "null") { return Value(); }
-  if (ToLower(token) == "true") { return Value(int64_t{1}); }
-  if (ToLower(token) == "false") { return Value(int64_t{0}); }
+  if (ToLower(token) == "null") {
+    return Value();
+  }
+  if (ToLower(token) == "true") {
+    return Value(int64_t{1});
+  }
+  if (ToLower(token) == "false") {
+    return Value(int64_t{0});
+  }
   if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
     return Value(Unquote(token));
   }
   try {
     size_t consumed = 0;
     const int64_t value = std::stoll(token, &consumed);
-    if (consumed == token.size()) { return Value(value); }
+    if (consumed == token.size()) {
+      return Value(value);
+    }
   } catch (...) {
   }
   try {
     size_t consumed = 0;
     const double value = std::stod(token, &consumed);
-    if (consumed == token.size()) { return Value(value); }
+    if (consumed == token.size()) {
+      return Value(value);
+    }
   } catch (...) {
   }
   return Value(std::move(token));
@@ -1010,11 +1144,15 @@ Value ParseEmbeddedComplianceValue(std::string token) {
 
 bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   const std::string want = Trim(expected);
-  if (ToLower(want) == "null") { return actual.IsNull(); }
+  if (ToLower(want) == "null") {
+    return actual.IsNull();
+  }
   if (want.starts_with("ARRAY<") && want.ends_with("(NULL)")) {
     return actual.IsNull();
   }
-  if (actual.IsNull()) { return false; }
+  if (actual.IsNull()) {
+    return false;
+  }
   if (actual.IsArray()) {
     std::string sql_type;
     std::vector<std::string> elements;
@@ -1023,8 +1161,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       return false;
     }
     std::string lower_type = ToLower(sql_type);
-    const std::string lower_actual_type =
-        ToLower(actual.ArrayElementSqlType());
+    const std::string lower_actual_type = ToLower(actual.ArrayElementSqlType());
     // ENUM<T> / PROTO<T> goldens match engines that carry the bare type path
     // (ENUM<googlesql_test.X> vs "googlesql_test.X").
     if (lower_type != lower_actual_type &&
@@ -1033,7 +1170,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       const std::string unwrapped =
           Trim(lower_type.substr(lower_type.find('<') + 1,
                                  lower_type.size() - lower_type.find('<') - 2));
-      if (unwrapped == lower_actual_type) { lower_type = lower_actual_type; }
+      if (unwrapped == lower_actual_type) {
+        lower_type = lower_actual_type;
+      }
     }
     // Engines that cannot name nested message element types report the bare
     // PROTO/STRUCT tag; judge those by element values.
@@ -1087,8 +1226,12 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
                  t == "double" || t == "real";
         };
         auto normalize_float = [](const std::string& t) -> std::string {
-          if (t == "float64") { return "double"; }
-          if (t == "float32" || t == "real") { return "float"; }
+          if (t == "float64") {
+            return "double";
+          }
+          if (t == "float32" || t == "real") {
+            return "float";
+          }
           return t;
         };
         const std::string norm_want = normalize_float(lower_type);
@@ -1102,21 +1245,27 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         }
       }
     }
-    if (elements.size() != actual.ArrayElements().size()) { return false; }
+    if (elements.size() != actual.ArrayElements().size()) {
+      return false;
+    }
     if (unordered) {
       // The reference does not guarantee element order: match as a multiset.
       std::vector<bool> used(elements.size(), false);
       for (const Value& element : actual.ArrayElements()) {
         bool found = false;
         for (size_t i = 0; i < elements.size(); ++i) {
-          if (used[i]) { continue; }
+          if (used[i]) {
+            continue;
+          }
           if (ComplianceValueMatches(element, elements[i])) {
             used[i] = true;
             found = true;
             break;
           }
         }
-        if (!found) { return false; }
+        if (!found) {
+          return false;
+        }
       }
       return true;
     }
@@ -1173,36 +1322,42 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     char* end = nullptr;
     errno = 0;
     const double parsed = std::strtod(want.c_str(), &end);
-    if (end == want.c_str()) { return false; }
+    if (end == want.c_str()) {
+      return false;
+    }
     const double got = actual.value.double_value;
-    if (std::isnan(got) || std::isnan(parsed)) { return false; }
-    if (std::isinf(got) || std::isinf(parsed)) { return got == parsed; }
+    if (std::isnan(got) || std::isnan(parsed)) {
+      return false;
+    }
+    if (std::isinf(got) || std::isinf(parsed)) {
+      return got == parsed;
+    }
     if (std::fabs(parsed) < 1e-300) {
       return std::fabs(got - parsed) <= 1e-5 * std::fabs(parsed);
     }
-    return std::fabs(got - parsed) <=
-           1e-6 * std::max(1.0, std::fabs(parsed));
+    return std::fabs(got - parsed) <= 1e-6 * std::max(1.0, std::fabs(parsed));
   }
 
   if (actual.type == ValueType::kVarChar) {
     if (want.size() >= 3 && (want[0] == 'b' || want[0] == 'B') &&
         want[1] == '"' && want.back() == '"') {
-      return std::string(actual.value.varchar_value) ==
-             Unquote(want.substr(1));
+      return std::string(actual.value.varchar_value) == Unquote(want.substr(1));
     }
     const std::string unquoted = Unquote(want);
     const std::string actual_str = std::string(actual.value.varchar_value);
-    if (actual_str == unquoted) { return true; }
+    if (actual_str == unquoted) {
+      return true;
+    }
     // APPROX_TOP_* returns ARRAY<STRUCT<...>>.  The compact runtime stores
     // each struct element as a positional textual value; compare its fields
     // recursively against the positional struct token in the golden.
     if (actual_str.size() >= 2 && actual_str.front() == '{' &&
-        actual_str.back() == '}' && want.size() >= 2 &&
-        want.front() == '{' && want.back() == '}') {
-      const std::vector<std::string> actual_fields = SplitTopLevel(
-          actual_str.substr(1, actual_str.size() - 2));
-      const std::vector<std::string> expected_fields = SplitTopLevel(
-          want.substr(1, want.size() - 2));
+        actual_str.back() == '}' && want.size() >= 2 && want.front() == '{' &&
+        want.back() == '}') {
+      const std::vector<std::string> actual_fields =
+          SplitTopLevel(actual_str.substr(1, actual_str.size() - 2));
+      const std::vector<std::string> expected_fields =
+          SplitTopLevel(want.substr(1, want.size() - 2));
       if (actual_fields.size() == expected_fields.size()) {
         bool matched = true;
         for (size_t i = 0; i < actual_fields.size(); ++i) {
@@ -1213,7 +1368,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             break;
           }
         }
-        if (matched) { return true; }
+        if (matched) {
+          return true;
+        }
       }
     }
     // Some STRUCT constructors contain arrays whose elements are themselves
@@ -1237,7 +1394,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             break;
           }
         }
-        if (matched) { return true; }
+        if (matched) {
+          return true;
+        }
       }
     }
     auto compact_json = [](std::string_view text) {
@@ -1348,8 +1507,8 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       };
       const std::vector<std::string> actual_values = split_object_values(
           std::string_view(actual_str).substr(1, actual_str.size() - 2));
-      const std::vector<std::string> expected_values = SplitTopLevel(
-          std::string_view(want).substr(1, want.size() - 2));
+      const std::vector<std::string> expected_values =
+          SplitTopLevel(std::string_view(want).substr(1, want.size() - 2));
       if (!actual_values.empty() &&
           actual_values.size() == expected_values.size()) {
         bool matched = true;
@@ -1364,7 +1523,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         if (matched) return true;
       }
     }
-    if (actual_str == unquoted) { return true; }
+    if (actual_str == unquoted) {
+      return true;
+    }
     auto normalize_ws = [](std::string_view str) -> std::string {
       return NormalizeWsText(str);
     };
@@ -1403,11 +1564,16 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       }
       std::string actual_body = norm_actual.empty() ? actual_str : norm_actual;
       if (!want_body.empty() && !actual_body.empty()) {
-        if (ProtoBodiesMatch(want_body, actual_body)) { return true; }
+        if (ProtoBodiesMatch(want_body, actual_body)) {
+          return true;
+        }
       }
     }
     if ("{" + actual_str + "}" == unquoted || "{" + actual_str + "}" == want ||
-        "{" + norm_actual + "}" == unquoted || "{" + norm_actual + "}" == want) { return true; }
+        "{" + norm_actual + "}" == unquoted ||
+        "{" + norm_actual + "}" == want) {
+      return true;
+    }
     // Strips a leading `"key":` / bare `key:` marker, ignoring colons
     // that live inside brackets or quotes (e.g. ARRAY tokens carrying
     // ordering annotations).
@@ -1418,14 +1584,22 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       for (size_t i = 0; i < elem.size(); ++i) {
         const char c = elem[i];
         if (in_str) {
-          if (c == '\\' && i + 1 < elem.size()) { ++i; }
-          else if (c == quote) { in_str = false; }
+          if (c == '\\' && i + 1 < elem.size()) {
+            ++i;
+          } else if (c == quote) {
+            in_str = false;
+          }
           continue;
         }
-        if (c == '"' || c == '\'') { in_str = true; quote = c; }
-        else if (c == '<' || c == '[' || c == '(' || c == '{') { ++depth; }
-        else if (c == '>' || c == ']' || c == ')' || c == '}') {
-          if (depth > 0) { --depth; }
+        if (c == '"' || c == '\'') {
+          in_str = true;
+          quote = c;
+        } else if (c == '<' || c == '[' || c == '(' || c == '{') {
+          ++depth;
+        } else if (c == '>' || c == ']' || c == ')' || c == '}') {
+          if (depth > 0) {
+            --depth;
+          }
         } else if (c == ':' && depth == 0 && i + 1 < elem.size()) {
           return Trim(elem.substr(i + 1));
         }
@@ -1433,7 +1607,8 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       return elem;
     };
     if (!want.empty() && want.front() == '{' && want.back() == '}' &&
-        !norm_actual.empty() && norm_actual.front() == '{' && norm_actual.back() == '}') {
+        !norm_actual.empty() && norm_actual.front() == '{' &&
+        norm_actual.back() == '}') {
       // Order-insensitive comparison: protos and structs are field sets, so
       // members match as a multiset of canonicalized tokens.
       auto canonical_members = [&](const std::string& body) {
@@ -1443,7 +1618,8 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         for (std::string& p : parts) {
           std::string elem = drop_key(Trim(p));
           const std::string lower_elem = ToLower(elem);
-          if (lower_elem.starts_with("array<") && lower_elem.ends_with("(null)")) {
+          if (lower_elem.starts_with("array<") &&
+              lower_elem.ends_with("(null)")) {
             elem = "NULL";
           }
           out.push_back(normalize_ws(strip_order_annotations(elem)));
@@ -1455,8 +1631,10 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
           canonical_members(norm_actual.substr(1, norm_actual.size() - 2))) {
         return true;
       }
-      std::vector<std::string> want_parts = SplitTopLevel(want.substr(1, want.size() - 2));
-      std::vector<std::string> got_parts = SplitTopLevel(norm_actual.substr(1, norm_actual.size() - 2));
+      std::vector<std::string> want_parts =
+          SplitTopLevel(want.substr(1, want.size() - 2));
+      std::vector<std::string> got_parts =
+          SplitTopLevel(norm_actual.substr(1, norm_actual.size() - 2));
       if (want_parts.size() == got_parts.size()) {
         bool matched = true;
         for (size_t idx = 0; idx < want_parts.size(); ++idx) {
@@ -1478,18 +1656,29 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             }
           }
           if (ToLower(got_elem) == "null") {
-            if (ToLower(want_elem) != "null") { matched = false; break; }
-          } else if (ToLower(got_elem) == "true" || ToLower(got_elem) == "false") {
-            if (ToLower(want_elem) != ToLower(got_elem)) { matched = false; break; }
+            if (ToLower(want_elem) != "null") {
+              matched = false;
+              break;
+            }
+          } else if (ToLower(got_elem) == "true" ||
+                     ToLower(got_elem) == "false") {
+            if (ToLower(want_elem) != ToLower(got_elem)) {
+              matched = false;
+              break;
+            }
           } else if (!ComplianceValueMatches(
                          ParseEmbeddedComplianceValue(got_elem), want_elem)) {
-            matched = false; break;
+            matched = false;
+            break;
           }
         }
-        if (matched) { return true; }
+        if (matched) {
+          return true;
+        }
       }
     }
-    // Match timestamps where reference output includes timezone suffix like -08, +00, etc.
+    // Match timestamps where reference output includes timezone suffix like
+    // -08, +00, etc.
     if (unquoted.size() > 3 &&
         (unquoted[unquoted.size() - 3] == '-' ||
          unquoted[unquoted.size() - 3] == '+') &&
@@ -1502,21 +1691,29 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       }
     }
     if (actual_str.size() >= 19 && unquoted.size() >= 19 &&
-        actual_str[4] == '-' && actual_str[7] == '-' &&
-        unquoted[4] == '-' && unquoted[7] == '-') {
-      auto parse_ts_utc = [](std::string_view s) -> std::pair<bool, std::pair<int64_t, int64_t>> {
+        actual_str[4] == '-' && actual_str[7] == '-' && unquoted[4] == '-' &&
+        unquoted[7] == '-') {
+      auto parse_ts_utc = [](std::string_view s)
+          -> std::pair<bool, std::pair<int64_t, int64_t>> {
         int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
-        if (sscanf(s.data(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) < 6) {
+        if (sscanf(s.data(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) <
+            6) {
           return {false, {0, 0}};
         }
         int64_t sub_ns = 0;
         size_t dot = s.find('.');
         if (dot != std::string_view::npos) {
           size_t end_d = dot + 1;
-          while (end_d < s.size() && s[end_d] >= '0' && s[end_d] <= '9') { ++end_d; }
+          while (end_d < s.size() && s[end_d] >= '0' && s[end_d] <= '9') {
+            ++end_d;
+          }
           std::string frac_str(s.substr(dot + 1, end_d - (dot + 1)));
-          while (frac_str.size() < 9) { frac_str.push_back('0'); }
-          if (frac_str.size() > 9) { frac_str = frac_str.substr(0, 9); }
+          while (frac_str.size() < 9) {
+            frac_str.push_back('0');
+          }
+          if (frac_str.size() > 9) {
+            frac_str = frac_str.substr(0, 9);
+          }
           sub_ns = std::stoll(frac_str);
         }
         int tz_sec = 0;
@@ -1530,11 +1727,12 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
           }
           tz_sec = (tzh * 3600 + tzm * 60) * (s[tz_pos] == '-' ? -1 : 1);
         }
-        std::chrono::year_month_day ymd{std::chrono::year{Y},
-                                        std::chrono::month{static_cast<unsigned>(M)},
-                                        std::chrono::day{static_cast<unsigned>(D)}};
+        std::chrono::year_month_day ymd{
+            std::chrono::year{Y}, std::chrono::month{static_cast<unsigned>(M)},
+            std::chrono::day{static_cast<unsigned>(D)}};
         int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
-        int64_t total_secs = days * 86400LL + h * 3600LL + m * 60LL + sec - tz_sec;
+        int64_t total_secs =
+            days * 86400LL + h * 3600LL + m * 60LL + sec - tz_sec;
         return {true, {total_secs, sub_ns}};
       };
       auto [ok1, utc1] = parse_ts_utc(actual_str);
@@ -1551,6 +1749,5 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   }
   return FormatComplianceValue(actual) == Unquote(want);
 }
-
 
 }  // namespace tinylamb

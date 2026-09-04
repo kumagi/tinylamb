@@ -27,15 +27,16 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <tuple>
-#include <string>
 #include <vector>
+
 #include "page/page_type.hpp"
 
 #ifdef __has_include
 #if __has_include(<sanitizer/lsan_interface.h>)
-#if defined(__SANITIZE_ADDRESS__) ||                 \
+#if defined(__SANITIZE_ADDRESS__) || \
     (defined(__has_feature) && __has_feature(address_sanitizer))
 #define TINYLAMB_HAS_LSAN 1
 #endif
@@ -184,8 +185,8 @@ TEST_F(PagePoolTest, ReadFromRejectsCorruptChecksum) {
   pp->DropAllPages();
 
   {
-    std::fstream file(filename_,
-                      std::ios_base::in | std::ios_base::out | std::ios_base::binary);
+    std::fstream file(filename_, std::ios_base::in | std::ios_base::out |
+                                     std::ios_base::binary);
     ASSERT_TRUE(file.good());
     file.seekp(static_cast<std::streamoff>((3 * kPageSize) + 8));
     char flip = 0x5a;
@@ -198,9 +199,9 @@ TEST_F(PagePoolTest, ReadFromRejectsCorruptChecksum) {
 
 TEST_F(PagePoolTest, PageInitForEveryPageType) {
   // Arrange/Act -- construct a Page for every concrete page type
-  for (PageType type : {PageType::kMetaPage, PageType::kRowPage,
-                        PageType::kLeafPage, PageType::kBranchPage,
-                        PageType::kFreePage}) {
+  for (PageType type :
+       {PageType::kMetaPage, PageType::kRowPage, PageType::kLeafPage,
+        PageType::kBranchPage, PageType::kFreePage}) {
     Page page(7, type);
 
     // Assert -- header fields initialized by PageInit
@@ -436,7 +437,8 @@ TEST_F(PagePoolTest, DropAllPagesWithPinnedRefsRetiresEntries) {
     EXPECT_EQ(keep->PageID(), 4U);
     EXPECT_EQ(transient->PageID(), 5U);
     // Union overlay: the write stays inside the kPageSize allocation.
-    keep->body.free_page.FreeBody()[0] = 'r';  // NOLINT(clang-analyzer-security.ArrayBound)
+    keep->body.free_page.FreeBody()[0] =
+        'r';  // NOLINT(clang-analyzer-security.ArrayBound)
   }
   PageRef fresh = pp->GetPage(6);
   ASSERT_EQ(fresh->PageID(), 6U);
@@ -450,7 +452,8 @@ TEST_F(PagePoolTest, DurabilityGateFiresForDirtyPagesOnly) {
   PageRef page = pp->GetPage(8);
   page->SetPageLSN(77);
   // Union overlay: the write stays inside the kPageSize allocation.
-  page->body.free_page.FreeBody()[0] = 'z';  // NOLINT(clang-analyzer-security.ArrayBound)
+  page->body.free_page.FreeBody()[0] =
+      'z';  // NOLINT(clang-analyzer-security.ArrayBound)
 
   // Act -- flushing the dirty page must gate its page LSN first
   pp->FlushPageForTest(8);
@@ -472,7 +475,8 @@ TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
     ASSERT_NE(buff, nullptr);
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
       // Union overlay: the write stays inside the kPageSize allocation.
-      buff[j] = static_cast<char>(0x5a);  // NOLINT(clang-analyzer-security.ArrayBound)
+      buff[j] = static_cast<char>(
+          0x5a);  // NOLINT(clang-analyzer-security.ArrayBound)
     }
 
     // Act -- write back page 7; flushing a never-resident page is a no-op
@@ -635,13 +639,16 @@ TEST_F(PagePoolTest, ParallelGetPageStressMixedIdsWithDirtyReload) {
         {
           PageRef page = pp->GetPage(mine, nullptr);
           // Union overlay: the write stays inside the kPageSize allocation.
-          page->body.free_page.FreeBody()[0] = stamp;  // NOLINT(clang-analyzer-security.ArrayBound)
+          page->body.free_page.FreeBody()[0] =
+              stamp;  // NOLINT(clang-analyzer-security.ArrayBound)
         }
         {
           PageRef reloaded = pp->GetPage(mine, nullptr);
           EXPECT_EQ(reloaded->PageID(), mine);
-          EXPECT_EQ(reloaded->body.free_page.FreeBody()[0],  // NOLINT(clang-analyzer-security.ArrayBound)
-                    stamp);
+          EXPECT_EQ(
+              reloaded->body.free_page
+                  .FreeBody()[0],  // NOLINT(clang-analyzer-security.ArrayBound)
+              stamp);
         }
       }
     });
@@ -654,9 +661,8 @@ TEST_F(PagePoolTest, ParallelGetPageStressMixedIdsWithDirtyReload) {
   // Quiet phase: push the working set out so the pool shrinks back under its
   // capacity now that every pin is gone.
   for (int i = 0; i <= kDefaultCapacity; ++i) {
-    PageRef page =
-        pp->GetPage(static_cast<page_id_t>(900000) + static_cast<page_id_t>(i),
-                    nullptr);
+    PageRef page = pp->GetPage(
+        static_cast<page_id_t>(900000) + static_cast<page_id_t>(i), nullptr);
     ASSERT_EQ(page->PageID(), 900000 + i);
   }
   EXPECT_LE(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));

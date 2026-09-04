@@ -11,7 +11,9 @@ namespace {
 std::string OrderTermsToString(const std::vector<WindowOrderTerm>& terms) {
   std::string out;
   for (const auto& term : terms) {
-    if (!out.empty()) { out += ", "; }
+    if (!out.empty()) {
+      out += ", ";
+    }
     out += term.expression->ToString();
     out += term.ascending ? " ASC" : " DESC";
     if (term.nulls_first.has_value()) {
@@ -40,8 +42,7 @@ std::string FrameBoundToString(const WindowFrameBound& bound) {
 }
 }  // namespace
 
-Value WindowFunctionCallExpression::Evaluate(const Row&,
-                                              const Schema&) const {
+Value WindowFunctionCallExpression::Evaluate(const Row&, const Schema&) const {
   throw std::runtime_error(
       "window function " + function +
       " evaluated without pre-computation (internal error)");
@@ -62,22 +63,40 @@ std::unordered_set<ColumnName> WindowFunctionCallExpression::TouchedColumns()
       }
     }
   };
-  for (const Expression& argument : args) { collect(argument); }
-  if (where_filter) { collect(where_filter); }
-  for (const auto& term : inner_order_by) { collect(term.expression); }
-  for (const Expression& expression : partition_by) { collect(expression); }
-  for (const auto& term : order_by) { collect(term.expression); }
-  if (frame_start.offset) { collect(frame_start.offset); }
-  if (frame_end.offset) { collect(frame_end.offset); }
+  for (const Expression& argument : args) {
+    collect(argument);
+  }
+  if (where_filter) {
+    collect(where_filter);
+  }
+  for (const auto& term : inner_order_by) {
+    collect(term.expression);
+  }
+  for (const Expression& expression : partition_by) {
+    collect(expression);
+  }
+  for (const auto& term : order_by) {
+    collect(term.expression);
+  }
+  if (frame_start.offset) {
+    collect(frame_start.offset);
+  }
+  if (frame_end.offset) {
+    collect(frame_end.offset);
+  }
   return columns;
 }
 
 std::string WindowFunctionCallExpression::ToString() const {
   std::ostringstream out;
   out << function << "(";
-  if (distinct) { out << "DISTINCT "; }
+  if (distinct) {
+    out << "DISTINCT ";
+  }
   for (size_t i = 0; i < args.size(); ++i) {
-    if (i) { out << ", "; }
+    if (i) {
+      out << ", ";
+    }
     out << args[i]->ToString();
   }
   if (!inner_order_by.empty()) {
@@ -90,7 +109,9 @@ std::string WindowFunctionCallExpression::ToString() const {
   if (!partition_by.empty()) {
     out << "PARTITION BY ";
     for (size_t i = 0; i < partition_by.size(); ++i) {
-      if (i) { out << ", "; }
+      if (i) {
+        out << ", ";
+      }
       out << partition_by[i]->ToString();
     }
     out << " ";
@@ -99,10 +120,9 @@ std::string WindowFunctionCallExpression::ToString() const {
     out << "ORDER BY " << OrderTermsToString(order_by) << " ";
   }
   if (has_frame) {
-    const char* unit = frame_unit == WindowFrameUnit::kRange
-                           ? "RANGE"
-                           : frame_unit == WindowFrameUnit::kGroups ? "GROUPS"
-                                                                    : "ROWS";
+    const char* unit = frame_unit == WindowFrameUnit::kRange    ? "RANGE"
+                       : frame_unit == WindowFrameUnit::kGroups ? "GROUPS"
+                                                                : "ROWS";
     out << unit << " BETWEEN " << FrameBoundToString(frame_start) << " AND "
         << FrameBoundToString(frame_end);
     switch (exclusion) {
@@ -123,10 +143,10 @@ std::string WindowFunctionCallExpression::ToString() const {
   return out.str();
 }
 
-Expression WindowFunctionCallExp(
-    std::string function, std::vector<Expression> args,
-    std::vector<Expression> partition_by,
-    std::vector<WindowOrderTerm> order_by) {
+Expression WindowFunctionCallExp(std::string function,
+                                 std::vector<Expression> args,
+                                 std::vector<Expression> partition_by,
+                                 std::vector<WindowOrderTerm> order_by) {
   auto node = std::make_shared<WindowFunctionCallExpression>();
   node->function = std::move(function);
   node->args = std::move(args);

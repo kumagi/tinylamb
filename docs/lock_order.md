@@ -10,6 +10,13 @@ waiting on an outer one.
 4. LockManager row/table locks (txn order: lower table id first on multi-table)
 5. LSM memtable / run mutex (single writer per tree)
 6. Logger enqueue latch → Logger work mutex (D1, see below)
+7. MVCC version shard mutex → transaction table lock (Wound-Wait preemption
+   and the deadlock detector's victim wounding only). Never the reverse:
+   no path may acquire a version shard mutex while holding the transaction
+   table lock.
+8. MVCC version shard mutex → wait-for graph mutex (AddWaitForEdge under the
+   shard lock; the detector snapshots the graph under the graph mutex alone
+   and re-locks the table only to wound).
 ```
 
 ## Rules

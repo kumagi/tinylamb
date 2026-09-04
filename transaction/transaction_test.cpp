@@ -19,8 +19,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <cstdint>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <optional>
@@ -53,14 +53,13 @@ class TransactionTest : public ::testing::Test {
     pm_.reset();
     l_.reset();
     // Unique log file per run: parallel test suites must not share a WAL.
-    l_ = std::make_unique<Logger>("transaction_test-" + RandomString() +
-                                  ".log");
+    l_ =
+        std::make_unique<Logger>("transaction_test-" + RandomString() + ".log");
     lm_ = std::make_unique<LockManager>();
     // Fixture premise: pm_/recovery_ stay null on purpose.  The tests below
     // only exercise lock/version bookkeeping; any page-accessing method would
     // crash on the null PageManager.
-    tm_ = std::make_unique<TransactionManager>(pm_.get(), l_.get(),
-                                               nullptr);
+    tm_ = std::make_unique<TransactionManager>(pm_.get(), l_.get(), nullptr);
   }
 
  protected:
@@ -156,12 +155,14 @@ TEST_F(TransactionTest, MVCCVisibilityChain) {
     Transaction reader = tm_->Begin(true);
     ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(reader, rp, std::nullopt), "v1");
 
-    // Act 2 -- writer 2 overwrites with "v2" while the reader's snapshot is open
+    // Act 2 -- writer 2 overwrites with "v2" while the reader's snapshot is
+    // open
     Transaction writer2 = tm_->Begin();
     ASSERT_TRUE(writer2.AddWriteSet(rp));
     writer2.RegisterVersionWrite(rp, "v1", "v2");
 
-    // Assert 2 -- committed v1 stays visible; pending writes are not a plan gate
+    // Assert 2 -- committed v1 stays visible; pending writes are not a plan
+    // gate
     ASSERT_FALSE(reader.RequiresHistoricalRead());
     ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(reader, rp, std::nullopt), "v1");
     // Assert 3 -- the writer itself sees its own uncommitted pending version
@@ -234,8 +235,7 @@ TEST_F(TransactionTest, GcDropsRedundantLatestVersionBeforeDeleteIntentRead) {
   Transaction deleting = tm_->Begin();
   ASSERT_TRUE(deleting.AddWriteSet(rp));
   ASSERT_SUCCESS_AND_EQ(
-      tm_->ReadVersion(deleting, rp, std::string_view("physical")),
-      "physical");
+      tm_->ReadVersion(deleting, rp, std::string_view("physical")), "physical");
   deleting.Abort();
 }
 
@@ -286,8 +286,9 @@ TEST_F(TransactionTest, TransactionStatusStreaming) {
   // Arrange -- one value per TransactionStatus enum member
   // Act -- stream each status to a string buffer
   std::ostringstream oss;
-  oss << TransactionStatus::kUnknown << "|" << TransactionStatus::kRunning << "|"
-      << TransactionStatus::kCommitted << "|" << TransactionStatus::kAborted;
+  oss << TransactionStatus::kUnknown << "|" << TransactionStatus::kRunning
+      << "|" << TransactionStatus::kCommitted << "|"
+      << TransactionStatus::kAborted;
   // Assert -- every status has a documented textual representation
   EXPECT_EQ(oss.str(), "Unknown|Running|Committed|Aborted");
 }
@@ -496,10 +497,10 @@ TEST(TransactionManagerTest, AbortAfterPreCommitIsNoOp) {
   // PRODUCTION BUG (fixed): Abort() lacked an IsFinished guard, so calling it
   // after a successful PreCommit ran the undo walk and physically rolled
   // back already-committed writes.
-  const std::string db_name = "abort_after_commit-test-" + RandomString() +
-                              ".db";
-  const std::string log_name = "abort_after_commit-test-" + RandomString() +
-                               ".log";
+  const std::string db_name =
+      "abort_after_commit-test-" + RandomString() + ".db";
+  const std::string log_name =
+      "abort_after_commit-test-" + RandomString() + ".log";
   {
     PageManager pm(db_name, 10);
     Logger logger(log_name);
@@ -519,8 +520,8 @@ TEST(TransactionManagerTest, AbortAfterPreCommitIsNoOp) {
     ASSERT_TRUE(writer.IsFinished());
 
     Transaction reader = tm.Begin(true);
-    ASSERT_SUCCESS_AND_EQ(
-        tm.ReadVersion(reader, rp, std::nullopt), "committed-value");
+    ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(reader, rp, std::nullopt),
+                          "committed-value");
   }
   std::ignore = std::remove(db_name.c_str());
   std::ignore = std::remove(log_name.c_str());

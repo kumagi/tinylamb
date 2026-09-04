@@ -30,6 +30,7 @@
 
 #include "checkpoint_manager.hpp"
 #include "common/constants.hpp"
+#include "common/crc32c.hpp"
 #include "common/debug.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
@@ -572,6 +573,12 @@ LogRecord LogRecord::CompensateSetLowestValueLogRecord(txn_id_t tid,
   l.pid = pid;
   l.type = LogType::kLowestValue;
   l.redo_page = redo;
+  // The CLR reuses the normal kLowestValue type (there is no dedicated
+  // kCompensateSetLowestValue), so LogUndo would otherwise treat it as a
+  // fresh undo with undo_page == 0 and clobber lowest_page_ to an invalid id
+  // on a second recovery pass. Setting undo_page == redo_page makes the
+  // record idempotent: redo and undo both leave the same value.
+  l.undo_page = redo;
   return l;
 }
 LogRecord LogRecord::AllocatePageLogRecord(lsn_t prev_lsn, txn_id_t txn,
@@ -587,12 +594,15 @@ LogRecord LogRecord::AllocatePageLogRecord(lsn_t prev_lsn, txn_id_t txn,
 }
 
 LogRecord LogRecord::DestroyPageLogRecord(lsn_t prev_lsn, txn_id_t txn,
-                                          page_id_t pid) {
+                                          page_id_t pid, PageType old_page_type,
+                                          std::string old_page_body) {
   LogRecord l;
   l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.type = LogType::kSystemDestroyPage;
+  l.allocated_page_type = old_page_type;
+  l.undo_data = std::move(old_page_body);
   return l;
 }
 
@@ -626,6 +636,7 @@ void LogRecord::Clear() {
   dirty_page_table.clear();
   active_transaction_table.clear();
   allocated_page_type = PageType::kUnknown;
+  wire_version = kWalRecordVersion;
 }
 
 size_t LogRecord::Size() const {
@@ -686,27 +697,39 @@ size_t LogRecord::Size() const {
               (dirty_page_table.size() * sizeof(std::pair<page_id_t, lsn_t>));
       size += sizeof(active_transaction_table.size()) +
               (active_transaction_table.size() *
-                  CheckpointManager::ActiveTransactionEntry::Size());
+               CheckpointManager::ActiveTransactionEntry::Size());
       break;
     case LogType::kSystemAllocPage:
       // The encoder stores PageType as a uint64_t to keep the WAL format
       // independent of the enum's underlying representation.
       size += sizeof(uint64_t);
       break;
+    case LogType::kSystemDestroyPage:
+      // D3 (docs/design.md): v2+ carries the destroyed page's type and an
+      // optional body image; v1 destroy records were pid-only.
+      if (wire_version >= kDestroyPayloadWalVersion) {
+        size += sizeof(uint64_t);
+        size += SerializeSize(undo_data);
+      }
+      break;
     case LogType::kBegin:
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertBranch:
-    case LogType::kSystemDestroyPage:
     case LogType::kCompensateInsertRow:
     case LogType::kCommit:
     case LogType::kCompensateInsertLeaf:
       break;
   }
+  // D9 (docs/design.md): v3 records end with a CRC32C field that Size()
+  // includes so the recovery scan advances byte-exactly over the checksum.
+  if (wire_version >= kWalRecordVersion) {
+    size += kWalRecordCrcSize;
+  }
   return size;
 }
 
 Encoder& operator<<(Encoder& e, const LogRecord& l) {
-  e << kSerdesMagic << kSerdesVersion << static_cast<uint16_t>(l.type)
+  e << kSerdesMagic << kWalRecordVersion << static_cast<uint16_t>(l.type)
     << l.prev_lsn << l.txn_id;
   const uint8_t types = (l.HasPageID() ? kHasPageID : 0) |
                         (l.HasSlot() ? kHasSlot : 0) |
@@ -768,13 +791,17 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
     case LogType::kSystemAllocPage:
       e << static_cast<uint64_t>(l.allocated_page_type);
       break;
+    case LogType::kSystemDestroyPage:
+      // D3 (docs/design.md): type plus optional body image of the destroyed
+      // page, so undo of an aborted destroy restores it exactly.
+      e << static_cast<uint64_t>(l.allocated_page_type) << l.undo_data;
+      break;
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertRow:
     case LogType::kCompensateInsertLeaf:
     case LogType::kCompensateInsertBranch:
     case LogType::kBegin:
     case LogType::kCommit:
-    case LogType::kSystemDestroyPage:
       // Nothing to do.
       break;
   }
@@ -797,9 +824,12 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
   if (magic != kSerdesMagic) {
     throw std::runtime_error("invalid WAL record magic");
   }
-  if (version != kSerdesVersion) {
+  // Accept v1/v2/v3 (header contract in log_record.hpp): v1 is
+  // kSerdesVersion, v2 added the destroy-page payload, v3 added the CRC.
+  if (version < kLegacyWalRecordVersion || version > kWalRecordVersion) {
     throw std::runtime_error("unsupported WAL record version");
   }
+  l.wire_version = version;
   uint16_t type_raw = 0;
   d >> type_raw >> l.prev_lsn >> l.txn_id;
   l.type = static_cast<LogType>(type_raw);
@@ -821,9 +851,17 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
     case LogType::kCommit:
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertBranch:
-    case LogType::kSystemDestroyPage:
     case LogType::kCompensateInsertRow:
     case LogType::kCompensateInsertLeaf:
+      break;
+    case LogType::kSystemDestroyPage:
+      // D3 (docs/design.md): v2+ destroy records carry the destroyed page's
+      // type and optional body image.  A v1 record decodes to the legacy
+      // pid-only form (kUnknown type, empty body).
+      if (l.wire_version >= kDestroyPayloadWalVersion) {
+        d >> l.allocated_page_type;
+        d >> l.undo_data;
+      }
       break;
     case LogType::kInsertRow:
     case LogType::kInsertLeaf:
@@ -880,7 +918,15 @@ std::string LogRecord::Serialize() const {
   std::stringstream ss;
   Encoder enc(ss);
   enc << *this;
-  return ss.str();
+  std::string record = ss.str();
+  // D9 (docs/design.md): the CRC field is appended at the record tail and
+  // covers the complete record byte sequence excluding itself.
+  const uint32_t crc = Crc32C(record.data(), record.size());
+  record.push_back(static_cast<char>((crc >> 24) & 0xFF));
+  record.push_back(static_cast<char>((crc >> 16) & 0xFF));
+  record.push_back(static_cast<char>((crc >> 8) & 0xFF));
+  record.push_back(static_cast<char>(crc & 0xFF));
+  return record;
 }
 
 void LogRecord::DumpPosition(std::ostream& o) const {

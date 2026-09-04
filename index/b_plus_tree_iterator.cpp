@@ -60,9 +60,13 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       // Construction never mutates: read-only lookups keep RO transactions
       // on shared latches and avoid GrowTreeHeightIfNeeded/foster absorption.
       PageRef leaf = tree_->FindLeafReadOnly(*txn_, begin, false);
-      pid_ = leaf->PageID();
-      idx_ = leaf->body.leaf_page.Find(begin);
-      valid_ = idx_ < static_cast<size_t>(leaf->body.leaf_page.row_count_);
+      // A prefix seek key (e.g. a point range over the leading columns of a
+      // composite key) can exhaust the leaf the descent lands on: the
+      // separator that routed the descent left may itself start with the
+      // seek key, so its extensions continue in later leaves. Walk forward
+      // instead of reporting an empty range.
+      valid_ = tree_->PositionAtOrAbove(leaf, idx_, *txn_, begin);
+      pid_ = valid_ ? leaf->PageID() : 0;
       if (valid_ && !end.empty() && end < leaf->body.leaf_page.GetKey(idx_)) {
         valid_ = false;
       }
@@ -122,9 +126,22 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
       pid_ = foster_pair.child_pid;
       PageRef next_ref = txn_->GetPageManager()->GetPage(pid_, true);
       ref.PageUnlock();
+      // Empty foster-tail leaves are reachable after deletions (the deleter
+      // only refeeds its own chain).  Skip past them instead of ending the
+      // scan early, mirroring the operator-- handling.
+      while (next_ref->body.leaf_page.row_count_ == 0) {
+        if (auto nested = next_ref->GetFoster(*txn_)) {
+          pid_ = nested.Value().child_pid;
+          PageRef following = txn_->GetPageManager()->GetPage(pid_, true);
+          next_ref.PageUnlock();
+          next_ref = std::move(following);
+          continue;
+        }
+        valid_ = false;
+        return *this;
+      }
       idx_ = 0;
-      if (next_ref->body.leaf_page.row_count_ == 0 ||
-          (!end_.empty() && end_ < next_ref->body.leaf_page.GetKey(idx_))) {
+      if (!end_.empty() && end_ < next_ref->body.leaf_page.GetKey(idx_)) {
         valid_ = false;
       }
 

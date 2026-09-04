@@ -66,8 +66,9 @@ class LSMTree final {
   void MergeAll();
 
   friend std::ostream& operator<<(std::ostream& o, const LSMTree& t) {
-    o << "LSMTree(dir=" << t.root_dir_ << ", generation="
-      << t.generation_.load(std::memory_order_relaxed) << ", blob=" << t.blob_;
+    o << "LSMTree(dir=" << t.root_dir_
+      << ", generation=" << t.generation_.load(std::memory_order_relaxed)
+      << ", blob=" << t.blob_;
     {
       std::scoped_lock lk(t.mem_tree_lock_);
       o << ", mem_tree=" << t.mem_tree_.size()
@@ -85,13 +86,16 @@ class LSMTree final {
   friend void Flusher(LSMTree* tree);
   friend void Merger(LSMTree* tree);
   LSMView GetViewImpl() const { return {blob_, index_}; }
+  // D10 (docs/design.md): scan the run directory at open and restore
+  // index_/files_ in numeric generation order (newest first); corrupt,
+  // incomplete, malformed or duplicate-generation files are quarantined.
+  void RestoreRuns();
 
   struct FileAndIndex {
     std::filesystem::path filepath;
     SortedRun index;
 
-    friend std::ostream& operator<<(std::ostream& o,
-                                    const FileAndIndex& fi) {
+    friend std::ostream& operator<<(std::ostream& o, const FileAndIndex& fi) {
       o << "FileAndIndex(" << fi.filepath << ": " << fi.index << ")";
       return o;
     }

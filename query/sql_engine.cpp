@@ -25,30 +25,34 @@
 #include <utility>
 #include <vector>
 
-#include "common/status_or.hpp"
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/delete.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "executor/detail/window_eval.hpp"
 #include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/insert.hpp"
 #include "executor/limit.hpp"
 #include "executor/projection.hpp"
 #include "executor/relational.hpp"
+#include "executor/set_operation.hpp"
 #include "executor/sort.hpp"
 #include "executor/update.hpp"
-#include "expression/named_expression.hpp"
 #include "expression/aggregate_expression.hpp"
-#include "expression/expression.hpp"
 #include "expression/cast_expression.hpp"
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "plan/group_by_plan.hpp"
 #include "plan/optimizer.hpp"
 #include "plan/plan.hpp"
 #include "query/googlesql_ast.hpp"
@@ -153,7 +157,9 @@ StatusOr<QueryResult> SqlEngine::Execute(TransactionContext& ctx,
               std::chrono::steady_clock::now() - started)
               .count());
     }
-    if (!prepared.HasValue()) { return prepared.GetStatus(); }
+    if (!prepared.HasValue()) {
+      return prepared.GetStatus();
+    }
     return QueryResult(std::move(prepared.Value()), last_statement_type_,
                        result_column_names_);
   } catch (const std::exception& e) {
@@ -162,9 +168,7 @@ StatusOr<QueryResult> SqlEngine::Execute(TransactionContext& ctx,
   }
 }
 
-uint64_t SqlEngine::ThreadExecutionCount() {
-  return tls_sql_execution_count;
-}
+uint64_t SqlEngine::ThreadExecutionCount() { return tls_sql_execution_count; }
 
 void SqlEngine::SetThreadRuntimeProfiling(bool enabled) {
   tls_sql_runtime_profiling = enabled;
@@ -208,11 +212,12 @@ bool ContainsQueryExpression(const Expression& expression) {
 bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
   if (statement.Sources().empty() || !statement.WithQueries().empty() ||
       statement.GroupBy().size() != 0 || statement.Having() ||
-      statement.Qualify() || statement.HasDistinctOn() || statement.HasLimit() ||
-      statement.Offset() != 0 ||
-      std::ranges::any_of(statement.SelectList(), [](const NamedExpression& item) {
-        return relational_detail::ContainsAggregate(item.expression);
-      })) {
+      statement.Qualify() || statement.HasDistinctOn() ||
+      statement.HasLimit() || statement.Offset() != 0 ||
+      std::ranges::any_of(
+          statement.SelectList(), [](const NamedExpression& item) {
+            return relational_detail::ContainsAggregate(item.expression);
+          })) {
     return false;
   }
   std::unordered_set<std::string> outer_names;
@@ -228,14 +233,14 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
       outer_names.insert(source.alias);
     }
   }
-  if (std::ranges::any_of(
-          statement.SelectList(), [](const NamedExpression& item) {
-            return ContainsQueryExpression(item.expression);
-          }) ||
-      std::ranges::any_of(
-          statement.OrderBy(), [](const SelectStatement::OrderByTerm& term) {
-            return ContainsQueryExpression(term.expression);
-          })) {
+  if (std::ranges::any_of(statement.SelectList(),
+                          [](const NamedExpression& item) {
+                            return ContainsQueryExpression(item.expression);
+                          }) ||
+      std::ranges::any_of(statement.OrderBy(),
+                          [](const SelectStatement::OrderByTerm& term) {
+                            return ContainsQueryExpression(term.expression);
+                          })) {
     return false;
   }
 
@@ -308,10 +313,9 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
     if (!query.Exists() && query.Test()->Type() == TypeTag::kColumnValue) {
       const ColumnName& test_column =
           query.Test()->AsColumnValue().GetColumnName();
-      correlated = correlated ||
-                   (!test_column.schema.empty() &&
-                    outer_names.contains(test_column.schema) &&
-                    !inner_names.contains(test_column.schema));
+      correlated = correlated || (!test_column.schema.empty() &&
+                                  outer_names.contains(test_column.schema) &&
+                                  !inner_names.contains(test_column.schema));
     }
     if (!correlated) {
       return false;
@@ -325,11 +329,13 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
 // a unique index. Keep this SQL-layer check in addition to the optimizer's
 // DistinctPlan elimination because this facade normally adds the executable
 // DISTINCT wrapper after physical optimization.
-bool ProjectionContainsUniqueKey(
-    const Plan& plan, const std::vector<NamedExpression>& columns,
-    size_t visible_columns) {
+bool ProjectionContainsUniqueKey(const Plan& plan,
+                                 const std::vector<NamedExpression>& columns,
+                                 size_t visible_columns) {
   const Table* table = plan->ScanSource();
-  if (table == nullptr) { return false; }
+  if (table == nullptr) {
+    return false;
+  }
   std::unordered_set<slot_t> projected;
   const size_t count = std::min(visible_columns, columns.size());
   for (size_t i = 0; i < count; ++i) {
@@ -337,9 +343,11 @@ bool ProjectionContainsUniqueKey(
     if (!expression || expression->Type() != TypeTag::kColumnValue) {
       continue;
     }
-    const int offset = table->GetSchema().Offset(
-        expression->AsColumnValue().GetColumnName());
-    if (offset >= 0) { projected.insert(static_cast<slot_t>(offset)); }
+    const int offset =
+        table->GetSchema().Offset(expression->AsColumnValue().GetColumnName());
+    if (offset >= 0) {
+      projected.insert(static_cast<slot_t>(offset));
+    }
   }
   for (size_t i = 0; i < table->IndexCount(); ++i) {
     const Index& index = table->GetIndex(i);
@@ -402,7 +410,9 @@ void ValidateNarrowInteger(const ColumnName& column, const Value& value) {
 // is not an expandable shape.
 bool ExpandStructInsertValue(const Value& single, size_t width,
                              std::vector<Value>* out) {
-  if (width <= 1) { return false; }
+  if (width <= 1) {
+    return false;
+  }
   if (single.IsNull()) {
     *out = std::vector<Value>(width);
     return true;
@@ -411,13 +421,24 @@ bool ExpandStructInsertValue(const Value& single, size_t width,
                                       Value* parsed) -> bool {
     const std::string trimmed = [&] {
       size_t b = token.find_first_not_of(" \t\r\n");
-      if (b == std::string::npos) { return std::string(); }
+      if (b == std::string::npos) {
+        return std::string();
+      }
       size_t e = token.find_last_not_of(" \t\r\n");
       return token.substr(b, e - b + 1);
     }();
-    if (trimmed == "null") { *parsed = Value(); return true; }
-    if (trimmed == "true") { *parsed = Value(int64_t{1}); return true; }
-    if (trimmed == "false") { *parsed = Value(int64_t{0}); return true; }
+    if (trimmed == "null") {
+      *parsed = Value();
+      return true;
+    }
+    if (trimmed == "true") {
+      *parsed = Value(int64_t{1});
+      return true;
+    }
+    if (trimmed == "false") {
+      *parsed = Value(int64_t{0});
+      return true;
+    }
     if (trimmed.size() >= 2 && trimmed.front() == '"' &&
         trimmed.back() == '"') {
       std::string unescaped;
@@ -426,10 +447,18 @@ bool ExpandStructInsertValue(const Value& single, size_t width,
         if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
           ++i;
           switch (trimmed[i]) {
-            case 'n': unescaped.push_back('\n'); break;
-            case 't': unescaped.push_back('\t'); break;
-            case 'r': unescaped.push_back('\r'); break;
-            default: unescaped.push_back(trimmed[i]); break;
+            case 'n':
+              unescaped.push_back('\n');
+              break;
+            case 't':
+              unescaped.push_back('\t');
+              break;
+            case 'r':
+              unescaped.push_back('\r');
+              break;
+            default:
+              unescaped.push_back(trimmed[i]);
+              break;
           }
         } else {
           unescaped.push_back(trimmed[i]);
@@ -499,18 +528,24 @@ bool ExpandStructInsertValue(const Value& single, size_t width,
         current.push_back(c);
       }
     }
-    if (!current.empty()) { parts.push_back(std::move(current)); }
+    if (!current.empty()) {
+      parts.push_back(std::move(current));
+    }
     return parts;
   };
 
-  if (single.type != ValueType::kVarChar) { return false; }
+  if (single.type != ValueType::kVarChar) {
+    return false;
+  }
   const std::string text(single.value.varchar_value);
   if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
     return false;
   }
   const std::vector<std::string> members =
       split_top_level(text.substr(1, text.size() - 2));
-  if (members.size() != width) { return false; }
+  if (members.size() != width) {
+    return false;
+  }
   std::vector<Value> expanded;
   expanded.reserve(width);
   for (const std::string& member : members) {
@@ -523,8 +558,11 @@ bool ExpandStructInsertValue(const Value& single, size_t width,
     for (size_t i = 0; i < member.size(); ++i) {
       const char c = member[i];
       if (in_str) {
-        if (c == '\\') { ++i; }
-        else if (c == quote) { in_str = false; }
+        if (c == '\\') {
+          ++i;
+        } else if (c == quote) {
+          in_str = false;
+        }
         continue;
       }
       if (c == '"' || c == '\'') {
@@ -539,14 +577,16 @@ bool ExpandStructInsertValue(const Value& single, size_t width,
         break;
       }
     }
-    std::string value_text = colon == std::string::npos ? member
-                                                        : member.substr(colon + 1);
+    std::string value_text =
+        colon == std::string::npos ? member : member.substr(colon + 1);
     if (colon == std::string::npos) {
       // Anonymous positional shape: the member itself is the value.
       value_text = member;
     }
     Value parsed;
-    if (!json_value_to_value(value_text, &parsed)) { return false; }
+    if (!json_value_to_value(value_text, &parsed)) {
+      return false;
+    }
     expanded.push_back(std::move(parsed));
   }
   *out = std::move(expanded);
@@ -602,8 +642,9 @@ std::optional<ExplainRequest> ParseExplain(std::string_view sql) {
   };
   auto consume = [&](std::string_view* input, std::string_view keyword) {
     *input = trim(*input);
-    if (input->size() < keyword.size()) { return false;
-}
+    if (input->size() < keyword.size()) {
+      return false;
+    }
     for (size_t i = 0; i < keyword.size(); ++i) {
       if (std::toupper(static_cast<unsigned char>((*input)[i])) != keyword[i]) {
         return false;
@@ -618,13 +659,15 @@ std::optional<ExplainRequest> ParseExplain(std::string_view sql) {
   };
 
   std::string_view remainder = sql;
-  if (!consume(&remainder, "EXPLAIN")) { return std::nullopt;
-}
+  if (!consume(&remainder, "EXPLAIN")) {
+    return std::nullopt;
+  }
   const bool analyze = consume(&remainder, "ANALYZE");
   remainder = trim(remainder);
-  if (remainder.empty()) { return ExplainRequest{.analyze=analyze, .query={}};
-}
-  return ExplainRequest{.analyze=analyze, .query=remainder};
+  if (remainder.empty()) {
+    return ExplainRequest{.analyze = analyze, .query = {}};
+  }
+  return ExplainRequest{.analyze = analyze, .query = remainder};
 }
 
 std::vector<Row> ExplainRows(std::string_view plan) {
@@ -638,8 +681,9 @@ std::vector<Row> ExplainRows(std::string_view plan) {
     if (!line.empty()) {
       rows.emplace_back(std::vector<Value>{Value(std::string(line))});
     }
-    if (end == std::string_view::npos) { break;
-}
+    if (end == std::string_view::npos) {
+      break;
+    }
     begin = end + 1;
   }
   return rows;
@@ -654,8 +698,9 @@ constexpr size_t kMaxCachedTemplatesPerShard =
 // BindSelect reconstructs statements from size_t Limit() and would drop the
 // "explicit zero" marker, silently turning LIMIT 0 back into "unlimited".
 bool IsExplicitZeroLimit(const Statement& statement) {
-  if (statement.Type() != StatementType::kSelect) { return false;
-}
+  if (statement.Type() != StatementType::kSelect) {
+    return false;
+  }
   const auto& select = dynamic_cast<const SelectStatement&>(statement);
   return select.HasLimit() && select.Limit() == 0;
 }
@@ -697,8 +742,9 @@ std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint) {
   TemplateShard& shard = ShardFor(fingerprint);
   std::scoped_lock lock(shard.mutex);
   const auto cached = shard.cache.find(fingerprint);
-  if (cached == shard.cache.end()) { return nullptr;
-}
+  if (cached == shard.cache.end()) {
+    return nullptr;
+  }
   if (local_templates.size() >= kMaxCachedTemplates) {
     local_templates.clear();
   }
@@ -725,8 +771,9 @@ std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
   };
   auto consume = [&](std::string_view* input, std::string_view keyword) {
     *input = trim(*input);
-    if (input->size() < keyword.size()) { return false;
-}
+    if (input->size() < keyword.size()) {
+      return false;
+    }
     for (size_t i = 0; i < keyword.size(); ++i) {
       if (std::toupper(static_cast<unsigned char>((*input)[i])) != keyword[i]) {
         return false;
@@ -742,8 +789,9 @@ std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
   };
 
   std::string_view remainder = sql;
-  if (!consume(&remainder, "ANALYZE")) { return std::nullopt;
-}
+  if (!consume(&remainder, "ANALYZE")) {
+    return std::nullopt;
+  }
   remainder = trim(remainder);
   if (!remainder.empty() && remainder.back() == ';') {
     remainder.remove_suffix(1);
@@ -753,13 +801,15 @@ std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
   remainder = trim(remainder);
 
   AnalyzeRequest request;
-  if (remainder.empty()) { return request;
-}
+  if (remainder.empty()) {
+    return request;
+  }
 
   while (!remainder.empty()) {
     remainder = trim(remainder);
-    if (remainder.empty()) { break;
-}
+    if (remainder.empty()) {
+      break;
+    }
     if (std::isalpha(static_cast<unsigned char>(remainder.front())) == 0 &&
         remainder.front() != '_') {
       return std::nullopt;
@@ -773,10 +823,12 @@ std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
     request.tables.emplace_back(remainder.substr(0, length));
     remainder.remove_prefix(length);
     remainder = trim(remainder);
-    if (remainder.empty()) { break;
-}
-    if (remainder.front() != ',') { return std::nullopt;
-}
+    if (remainder.empty()) {
+      break;
+    }
+    if (remainder.front() != ',') {
+      return std::nullopt;
+    }
     remainder.remove_prefix(1);
   }
   return request;
@@ -822,15 +874,19 @@ std::optional<Executor> ServeCompiledSelect(TransactionContext& ctx,
   }
   if (!shape.order_expressions.empty() &&
       !compiled.plan->IsOrderedBy(shape.order_expressions,
-                                  shape.order_ascending)) {
+                                  shape.order_ascending,
+                                  shape.order_nulls_first)) {
     std::vector<SortExecutor::Key> keys;
     keys.reserve(shape.sort_keys.size());
-    for (const auto& key : shape.sort_keys) {
-      keys.push_back({key.first, key.second, std::nullopt});
+    for (size_t i = 0; i < shape.sort_keys.size(); ++i) {
+      const auto& key = shape.sort_keys[i];
+      keys.push_back({key.first, key.second,
+                      i < shape.order_nulls_first.size()
+                          ? shape.order_nulls_first[i]
+                          : std::nullopt});
     }
-    executor = std::make_shared<SortExecutor>(std::move(executor),
-                                              compiled.plan->GetSchema(),
-                                              std::move(keys));
+    executor = std::make_shared<SortExecutor>(
+        std::move(executor), compiled.plan->GetSchema(), std::move(keys));
   }
   if ((shape.has_limit || shape.offset != 0) &&
       !compiled.plan->EnforcesLimit(shape.limit, shape.offset)) {
@@ -863,8 +919,8 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
     for (const Expression& cell : cells) {
       // Slots receive this execution's values; slot-free subtrees are shared
       // immutable nodes, so cloning cost is proportional to literals only.
-      evaluated.push_back(CloneWithPreparedValues(cell, values)
-                              ->Evaluate(Row(), Schema()));
+      evaluated.push_back(
+          CloneWithPreparedValues(cell, values)->Evaluate(Row(), Schema()));
     }
     if (shape.has_named_columns) {
       // Destination offsets were validated at fill time; replay them.
@@ -884,8 +940,7 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
       }
       if (expected == ValueType::kDouble &&
           evaluated[i].type == ValueType::kInt64) {
-        evaluated[i] =
-            Value(static_cast<double>(evaluated[i].value.int_value));
+        evaluated[i] = Value(static_cast<double>(evaluated[i].value.int_value));
         continue;
       }
       if (expected == ValueType::kDate &&
@@ -938,8 +993,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     if (const std::optional<AnalyzeRequest> analyze = ParseAnalyze(sql)) {
       last_statement_type_ = StatementType::kAnalyze;
       result_column_names_ = {"command", "table", "rows"};
-      StatusOr<Executor> executed =
-          ExecuteAnalyze(*database_, ctx, *analyze);
+      StatusOr<Executor> executed = ExecuteAnalyze(*database_, ctx, *analyze);
       if (!executed.HasValue()) {
         last_error_ = "ANALYZE failed";
         return executed.GetStatus();
@@ -947,7 +1001,6 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
       return executed;
     }
   }
-
 
   // no DDL/DML side effect may happen before the statement kind is known,
   // so EXPLAIN can reject non-SELECT statements without executing them.
@@ -970,8 +1023,9 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   // class of statements.  Keep complex structural queries on the original
   // parse path until the binder has a structural parameter model.
   std::string upper_query(query_sql);
-  std::transform(upper_query.begin(), upper_query.end(), upper_query.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+  std::transform(
+      upper_query.begin(), upper_query.end(), upper_query.begin(),
+      [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
   if (upper_query.find("STRUCT") != std::string::npos ||
       upper_query.find("PROTO") != std::string::npos) {
     templated.templatable = false;
@@ -1024,15 +1078,17 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     const auto planning_start = std::chrono::steady_clock::now();
     StatusOr<Executor> prepared = PrepareStatement(ctx, std::move(statement));
     const auto planning_end = std::chrono::steady_clock::now();
-    if (!prepared.HasValue()) { return prepared.GetStatus();
-}
+    if (!prepared.HasValue()) {
+      return prepared.GetStatus();
+    }
 
     uint64_t rows = 0;
     std::chrono::steady_clock::time_point execution_end = planning_end;
     if (explain->analyze) {
       Row row;
-      while (prepared.Value()->Next(&row, nullptr)) { ++rows;
-}
+      while (prepared.Value()->Next(&row, nullptr)) {
+        ++rows;
+      }
       execution_end = std::chrono::steady_clock::now();
     }
     std::ostringstream output;
@@ -1059,10 +1115,12 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
 
   if (templated.templatable && !cache_hit && !IsExplicitZeroLimit(*statement)) {
     try {
-      RememberTemplate(
-          templated.fingerprint,
-          BindStatementLiterals(*statement, templated.parameters));
-    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) // Template caching is best-effort; any bind failure just means the statement is parsed verbatim next time.
+      RememberTemplate(templated.fingerprint,
+                       BindStatementLiterals(*statement, templated.parameters));
+    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) //
+                                       // Template caching is best-effort; any
+                                       // bind failure just means the statement
+                                       // is parsed verbatim next time.
     }
   }
   // Arm the compiled-plan fill sites inside PrepareStatement; the guard
@@ -1122,8 +1180,8 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
     if (path.size() > 1) {
       proto_path.assign(path.begin() + 1, path.end());
     }
-    resolved.push_back(ResolvedItem{static_cast<size_t>(offset),
-                                    path.back(), std::move(proto_path), &item});
+    resolved.push_back(ResolvedItem{static_cast<size_t>(offset), path.back(),
+                                    std::move(proto_path), &item});
   }
 
   QueryData query;
@@ -1174,24 +1232,26 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
         if (!TryProtoTextGetField(cell.value.varchar_value,
                                   entry.proto_path.back(), &extracted) ||
             !extracted.IsArray()) {
-          throw std::runtime_error("nested DML target is not a repeated "
-                                   "protocol field: " + item.target_path);
+          throw std::runtime_error(
+              "nested DML target is not a repeated "
+              "protocol field: " +
+              item.target_path);
         }
         array_cell = std::move(extracted);
       }
       Value& edit_cell = proto_target ? array_cell : cell;
-      const Column element_column(
-          ColumnName("", entry.element_name),
-          edit_cell.IsNull() ? ValueType::kNull
-                             : edit_cell.IsArray() ? ValueType::kInt64
-                                                   : edit_cell.type);
+      const Column element_column(ColumnName("", entry.element_name),
+                                  edit_cell.IsNull()    ? ValueType::kNull
+                                  : edit_cell.IsArray() ? ValueType::kInt64
+                                                        : edit_cell.type);
       Schema element_schema("", {element_column});
-      relational_detail::Scope outer_scope{.row = &new_row,
-                                           .schema = &schema,
-                                           .outer = nullptr};
-      auto eval_on_element =
-          [&](const Expression& expr, const Value& element) -> Value {
-        if (!expr) { return Value(true); }
+      relational_detail::Scope outer_scope{
+          .row = &new_row, .schema = &schema, .outer = nullptr};
+      auto eval_on_element = [&](const Expression& expr,
+                                 const Value& element) -> Value {
+        if (!expr) {
+          return Value(true);
+        }
         Row element_row({element});
         relational_detail::Scope element_scope{.row = &element_row,
                                                .schema = &element_schema,
@@ -1216,9 +1276,10 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
                 "value");
           }
           if (!edit_cell.IsArray()) {
-            throw std::runtime_error("nested DELETE requires an ARRAY value "
-                                     "in column " +
-                                     item.target_path);
+            throw std::runtime_error(
+                "nested DELETE requires an ARRAY value "
+                "in column " +
+                item.target_path);
           }
           load_working();
           std::vector<Value> kept;
@@ -1243,7 +1304,8 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
           state.working = std::move(kept);
           state.update_baseline = state.working;
           state.update_touched.assign(state.working.size(), false);
-          edit_cell = Value::Array(state.working, edit_cell.ArrayElementSqlType());
+          edit_cell =
+              Value::Array(state.working, edit_cell.ArrayElementSqlType());
           break;
         }
         case NestedDmlItem::Kind::kUpdate: {
@@ -1253,9 +1315,10 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
                 "value");
           }
           if (!edit_cell.IsArray()) {
-            throw std::runtime_error("nested UPDATE requires an ARRAY value "
-                                     "in column " +
-                                     item.target_path);
+            throw std::runtime_error(
+                "nested UPDATE requires an ARRAY value "
+                "in column " +
+                item.target_path);
           }
           load_working();
           int64_t touched = 0;
@@ -1263,8 +1326,7 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
             const Value matches =
                 eval_on_element(item.predicate, state.update_baseline[i]);
             if (!matches.IsNull() && relational_detail::Truthy(matches)) {
-              if (i < state.update_touched.size() &&
-                  state.update_touched[i]) {
+              if (i < state.update_touched.size() && state.update_touched[i]) {
                 throw std::runtime_error(
                     "Attempted to modify an array element with multiple "
                     "nested UPDATE statements");
@@ -1285,7 +1347,8 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
                     << " array elements modified, but found " << touched;
             throw std::runtime_error(message.str());
           }
-          edit_cell = Value::Array(state.working, edit_cell.ArrayElementSqlType());
+          edit_cell =
+              Value::Array(state.working, edit_cell.ArrayElementSqlType());
           break;
         }
         case NestedDmlItem::Kind::kInsert: {
@@ -1295,9 +1358,10 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
                 "value");
           }
           if (!edit_cell.IsArray()) {
-            throw std::runtime_error("nested INSERT requires an ARRAY value "
-                                     "in column " +
-                                     item.target_path);
+            throw std::runtime_error(
+                "nested INSERT requires an ARRAY value "
+                "in column " +
+                item.target_path);
           }
           load_working();
           int64_t inserted = 0;
@@ -1313,8 +1377,9 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
             });
           } else {
             for (const auto& values : item.insert_values) {
-              if (values.empty()) { continue;
-}
+              if (values.empty()) {
+                continue;
+              }
               state.working.push_back(relational_detail::Evaluate(
                   values.front(), outer_scope, nullptr, ctx,
                   relational_detail::CteMap{}));
@@ -1330,15 +1395,18 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
             throw std::runtime_error(message.str());
           }
           state.update_baseline = state.working;
-          edit_cell = Value::Array(state.working, edit_cell.ArrayElementSqlType());
+          edit_cell =
+              Value::Array(state.working, edit_cell.ArrayElementSqlType());
           break;
         }
       }
       if (proto_target) {
-        const auto rewritten = ProtoTextSetField(
-            std::string(cell.value.varchar_value), entry.proto_path, edit_cell,
-            proto_type);
-        if (rewritten.has_value()) { cell = Value(std::string(*rewritten)); }
+        const auto rewritten =
+            ProtoTextSetField(std::string(cell.value.varchar_value),
+                              entry.proto_path, edit_cell, proto_type);
+        if (rewritten.has_value()) {
+          cell = Value(std::string(*rewritten));
+        }
       }
     }
     StatusOr<RowPosition> updated = table->Update(ctx.txn_, position, new_row);
@@ -1366,9 +1434,14 @@ std::string EscapeStructKey(std::string_view text) {
   std::string escaped;
   for (const char c : text) {
     switch (c) {
-      case '"': escaped += "\\\""; break;
-      case '\\': escaped += "\\\\"; break;
-      default: escaped.push_back(c);
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\\':
+        escaped += "\\\\";
+        break;
+      default:
+        escaped.push_back(c);
     }
   }
   return escaped;
@@ -1382,11 +1455,12 @@ std::string EscapeStructKey(std::string_view text) {
 Value DecodeStructMember(const std::string& text) {
   std::string trimmed = text;
   size_t b = trimmed.find_first_not_of(" \t\r\n");
-  if (b == std::string::npos) { return Value(); }
+  if (b == std::string::npos) {
+    return Value();
+  }
   size_t e = trimmed.find_last_not_of(" \t\r\n");
   trimmed = trimmed.substr(b, e - b + 1);
-  if (trimmed.size() >= 4 && trimmed.front() == '"' &&
-      trimmed.back() == '"') {
+  if (trimmed.size() >= 4 && trimmed.front() == '"' && trimmed.back() == '"') {
     const std::string inner = trimmed.substr(1, trimmed.size() - 2);
     if (!inner.empty() && ((inner.front() == '{' && inner.back() == '}') ||
                            (inner.front() == '[' && inner.back() == ']'))) {
@@ -1407,8 +1481,7 @@ std::optional<std::vector<int>> FindStructPathOrdinals(
   std::vector<int> ordinals;
   std::string current = json;
   for (const std::string& seg : segs) {
-    if (current.size() < 2 || current.front() != '{' ||
-        current.back() != '}') {
+    if (current.size() < 2 || current.front() != '{' || current.back() != '}') {
       return std::nullopt;
     }
     const auto members =
@@ -1428,7 +1501,9 @@ std::optional<std::vector<int>> FindStructPathOrdinals(
     ordinals.push_back(index);
     Value decoded =
         DecodeStructMember(members[static_cast<size_t>(index)].second);
-    if (decoded.IsNull()) { return std::nullopt; }
+    if (decoded.IsNull()) {
+      return std::nullopt;
+    }
     if (decoded.type == ValueType::kVarChar &&
         !std::string_view(decoded.value.varchar_value).starts_with("{")) {
       // A STRUCT may contain a protocol message encoded as a TEXT member.
@@ -1453,8 +1528,7 @@ std::optional<std::string> SetStructPathByOrdinals(
     // Assigning through a NULL / non-object intermediate.
     throw std::runtime_error("Cannot set field of NULL STRUCT");
   }
-  const auto members =
-      SplitJsonObjectMembers(json.substr(1, json.size() - 2));
+  const auto members = SplitJsonObjectMembers(json.substr(1, json.size() - 2));
   const int index = ordinals[depth];
   if (index < 0 || static_cast<size_t>(index) >= members.size()) {
     return std::nullopt;
@@ -1462,7 +1536,9 @@ std::optional<std::string> SetStructPathByOrdinals(
   std::string rebuilt = "{";
   bool first = true;
   for (size_t i = 0; i < members.size(); ++i) {
-    if (!first) { rebuilt += ","; }
+    if (!first) {
+      rebuilt += ",";
+    }
     first = false;
     rebuilt += "\"";
     rebuilt += EscapeStructKey(members[i].first);
@@ -1480,19 +1556,17 @@ std::optional<std::string> SetStructPathByOrdinals(
           const std::string_view proto_text(nested_value.value.varchar_value);
           const std::string proto_type =
               InferProtoTypeName(proto_text, proto_path);
-          const auto proto = ProtoTextSetField(std::string(proto_text),
-                                               proto_path, new_value,
-                                               proto_type);
+          const auto proto = ProtoTextSetField(
+              std::string(proto_text), proto_path, new_value, proto_type);
           rebuilt += proto.has_value()
                          ? EncodeStructMemberJson(Value(std::string(*proto)))
-                                       : members[i].second;
+                         : members[i].second;
         } else {
           auto nested = SetStructPathByOrdinals(
-              nested_value.IsNull()
-                  ? std::string("null")
-                  : nested_value.type == ValueType::kVarChar
-                        ? std::string(nested_value.value.varchar_value)
-                        : std::string("null"),
+              nested_value.IsNull() ? std::string("null")
+              : nested_value.type == ValueType::kVarChar
+                  ? std::string(nested_value.value.varchar_value)
+                  : std::string("null"),
               segs, ordinals, depth + 1, new_value);
           rebuilt += nested.has_value() ? *nested : members[i].second;
         }
@@ -1542,14 +1616,15 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
             start = pos + 1;
           }
         }
-        field_targets.push_back(FieldTarget{static_cast<size_t>(base),
-                                            std::move(segments), &expression,
-                                            {}});
+        field_targets.push_back(FieldTarget{
+            static_cast<size_t>(base), std::move(segments), &expression, {}});
         continue;
       }
     }
     int offset = -1;
-    if (!target.name.empty()) { offset = column_index(target.name); }
+    if (!target.name.empty()) {
+      offset = column_index(target.name);
+    }
     if (offset < 0) {
       throw std::runtime_error("UPDATE SET target not found: " +
                                target.ToString());
@@ -1566,7 +1641,9 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
   if (where_clause) {
     std::function<Expression(const Expression&)> bind_struct_fields =
         [&](const Expression& expr) -> Expression {
-      if (!expr) { return expr; }
+      if (!expr) {
+        return expr;
+      }
       if (expr->Type() == TypeTag::kColumnValue) {
         const ColumnName& name = expr->AsColumnValue().GetColumnName();
         if (!name.schema.empty() && name.schema != update.TableName() &&
@@ -1577,8 +1654,7 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
                 "__get_field_safe",
                 {ColumnValueExp(ColumnName(
                      update.TableName(),
-                     schema.GetColumn(static_cast<size_t>(base))
-                         .Name().name)),
+                     schema.GetColumn(static_cast<size_t>(base)).Name().name)),
                  ConstantValueExp(Value(std::string(name.name)))});
           }
         }
@@ -1591,8 +1667,7 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
         changed |= child->ToString() != mapped->ToString();
         child = std::move(mapped);
       }
-      return changed ? WithExpressionChildren(expr, std::move(children))
-                     : expr;
+      return changed ? WithExpressionChildren(expr, std::move(children)) : expr;
     };
     where_clause = bind_struct_fields(where_clause);
   }
@@ -1600,12 +1675,11 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
   auto source = table->BeginFullScan(ctx.txn_);
   while (source.IsValid()) {
     Row row = *source;
-    relational_detail::Scope scope{.row = &row, .schema = &schema,
-                                   .outer = nullptr};
-    if (!where_clause || relational_detail::Truthy(
-                              relational_detail::Evaluate(
-                                  where_clause, scope, nullptr, ctx,
-                                  relational_detail::CteMap{}))) {
+    relational_detail::Scope scope{
+        .row = &row, .schema = &schema, .outer = nullptr};
+    if (!where_clause ||
+        relational_detail::Truthy(relational_detail::Evaluate(
+            where_clause, scope, nullptr, ctx, relational_detail::CteMap{}))) {
       pending.emplace_back(std::move(row), source.Position());
     }
     ++source;
@@ -1617,9 +1691,11 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     target.ordinals.assign(target.segments.size(), -1);
     for (const auto& [candidate, candidate_position] : pending) {
       const Value& cell = candidate.values_[target.offset];
-      if (cell.IsNull() || cell.type != ValueType::kVarChar) { continue; }
-      auto found = FindStructPathOrdinals(
-          std::string(cell.value.varchar_value), target.segments);
+      if (cell.IsNull() || cell.type != ValueType::kVarChar) {
+        continue;
+      }
+      auto found = FindStructPathOrdinals(std::string(cell.value.varchar_value),
+                                          target.segments);
       if (found.has_value()) {
         target.ordinals = *found;
         break;
@@ -1657,19 +1733,17 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
           throw std::runtime_error("Cannot set field of NULL `" + proto_type +
                                    "`");
         }
-        relational_detail::Scope row_scope{.row = &new_row,
-                                           .schema = &schema,
-                                           .outer = nullptr};
+        relational_detail::Scope row_scope{
+            .row = &new_row, .schema = &schema, .outer = nullptr};
         const Value assigned =
             relational_detail::Evaluate(*target.value, row_scope, nullptr, ctx,
                                         relational_detail::CteMap{});
         ValidateEnumFieldValue(
-            proto_type, target.segments.empty() ? std::string()
-                                                : target.segments.back(),
+            proto_type,
+            target.segments.empty() ? std::string() : target.segments.back(),
             assigned);
-        auto rewritten =
-            ProtoTextSetField(std::string(payload), target.segments, assigned,
-                              proto_type);
+        auto rewritten = ProtoTextSetField(
+            std::string(payload), target.segments, assigned, proto_type);
         if (rewritten.has_value()) {
           cell = Value(std::move(*rewritten));
         }
@@ -1679,12 +1753,10 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
         throw std::runtime_error("Cannot set field of NULL STRUCT");
       }
       const std::string text(cell.value.varchar_value);
-      relational_detail::Scope row_scope{.row = &new_row,
-                                         .schema = &schema,
-                                         .outer = nullptr};
-      const Value assigned =
-          relational_detail::Evaluate(*target.value, row_scope, nullptr, ctx,
-                                      relational_detail::CteMap{});
+      relational_detail::Scope row_scope{
+          .row = &new_row, .schema = &schema, .outer = nullptr};
+      const Value assigned = relational_detail::Evaluate(
+          *target.value, row_scope, nullptr, ctx, relational_detail::CteMap{});
       auto rewritten = SetStructPathByOrdinals(text, target.segments,
                                                target.ordinals, 0, assigned);
       if (rewritten.has_value()) {
@@ -1711,6 +1783,234 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
 
 }  // namespace
 
+StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
+                                                  TransactionContext& ctx) {
+  // Cascades-route set operations: each operand runs through normal statement
+  // routing (recursively via PrepareStatement) and the operands combine at the
+  // executor level with INTERSECT binding tighter than UNION/EXCEPT, mirroring
+  // the relational interpreter's precedence rules.
+  std::vector<std::shared_ptr<SelectStatement>> terms;
+  std::vector<SetOperationKind> pair_kinds;
+  const SetOperationTree* tree = select.GetSetOperationTree().get();
+  if (tree != nullptr && tree->grouped) {
+    terms.push_back(tree->first);
+    for (size_t i = 0; i < tree->branches.size(); ++i) {
+      terms.push_back(tree->branches[i]);
+      pair_kinds.push_back(i < tree->kinds.size()
+                               ? tree->kinds[i]
+                               : SetOperationKind::kUnionAll);
+    }
+  } else {
+    auto head = std::make_shared<SelectStatement>(select);
+    head->ClearUnionAll();
+    // Set-operation modifiers belong to the concatenated result: evaluate the
+    // trunk unmodified and apply ORDER BY / LIMIT after the fold.
+    head->SetOrderBy({});
+    head->SetLimit(std::nullopt);
+    head->SetOffset(0);
+    terms.push_back(std::move(head));
+    for (size_t i = 0; i < select.UnionAll().size(); ++i) {
+      terms.push_back(select.UnionAll()[i]);
+      pair_kinds.push_back(i < select.SetOperationKinds().size()
+                               ? select.SetOperationKinds()[i]
+                               : SetOperationKind::kUnionAll);
+    }
+  }
+
+  // Recursive PrepareStatement calls overwrite member state (notably
+  // result_column_names_); capture the outer statement's output names before
+  // descending so the post-fold ORDER BY schema matches THIS statement.
+  const std::vector<std::string> output_names = result_column_names_;
+  std::vector<std::vector<Row>> term_rows;
+  for (auto& term : terms) {
+    // A WITH clause scopes over the whole set-operation statement, but the
+    // operand ASTs carry no WithQueries of their own.  Clone each operand and
+    // attach the outer CTEs so the recursive PrepareStatement can resolve
+    // CTE references inside every branch.
+    if (!select.WithQueries().empty()) {
+      auto owned = std::make_shared<SelectStatement>(*term);
+      bool added = false;
+      for (const auto& [name, query] : select.WithQueries()) {
+        if (!owned->WithQueries().contains(name)) {
+          owned->AddWithQuery(name, query);
+          added = true;
+        }
+      }
+      if (added) {
+        term = std::move(owned);
+      }
+    }
+    StatusOr<Executor> prepared =
+        PrepareStatement(ctx, std::make_unique<SelectStatement>(*term));
+    if (!prepared.HasValue()) {
+      return prepared.GetStatus();
+    }
+    std::vector<Row> rows;
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    term_rows.push_back(std::move(rows));
+  }
+
+  const auto apply_pair = [](std::vector<Row> left, std::vector<Row> right,
+                             SetOperationKind operation) {
+    SetOperationExecutor operation_executor(
+        {std::make_shared<ConstantExecutor>(std::move(left)),
+         std::make_shared<ConstantExecutor>(std::move(right))},
+        operation);
+    std::vector<Row> folded;
+    Row row;
+    while (operation_executor.Next(&row, nullptr)) {
+      folded.push_back(row);
+    }
+    return folded;
+  };
+  std::vector<std::vector<Row>> folded_terms;
+  std::vector<SetOperationKind> low_ops;
+  folded_terms.push_back(std::move(term_rows.front()));
+  for (size_t i = 0; i + 1 < term_rows.size(); ++i) {
+    const SetOperationKind operation = pair_kinds[i];
+    const bool intersects = operation == SetOperationKind::kIntersect ||
+                            operation == SetOperationKind::kIntersectAll;
+    if (intersects) {
+      folded_terms.back() = apply_pair(std::move(folded_terms.back()),
+                                       std::move(term_rows[i + 1]), operation);
+    } else {
+      low_ops.push_back(operation);
+      folded_terms.push_back(std::move(term_rows[i + 1]));
+    }
+  }
+  std::vector<Row> combined = std::move(folded_terms.front());
+  for (size_t j = 1; j < folded_terms.size(); ++j) {
+    combined = apply_pair(std::move(combined), std::move(folded_terms[j]),
+                          low_ops[j - 1]);
+  }
+
+  Executor executor = std::make_shared<ConstantExecutor>(std::move(combined));
+  if (!select.OrderBy().empty()) {
+    std::vector<Column> columns;
+    columns.reserve(output_names.size());
+    for (const std::string& name : output_names) {
+      columns.emplace_back(name, ValueType::kNull);
+    }
+    const Schema combined_schema("", std::move(columns));
+    std::vector<SortExecutor::Key> keys;
+    keys.reserve(select.OrderBy().size());
+    for (const auto& term : select.OrderBy()) {
+      keys.push_back({term.expression, term.ascending, term.nulls_first});
+    }
+    executor = std::make_shared<SortExecutor>(std::move(executor),
+                                              combined_schema, std::move(keys));
+  }
+  if (select.HasLimit() || select.Offset() != 0) {
+    executor = std::make_shared<LimitExecutor>(std::move(executor),
+                                               select.Limit(), select.Offset());
+  }
+  return executor;
+}
+
+StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
+    const SelectStatement& select, TransactionContext& ctx) {
+  // Core: FROM + WHERE (+ join conditions) optimized by Cascades.  The
+  // projection carries every base column the grouping pipeline needs
+  // (select list, GROUP BY, HAVING, ORDER BY); Project re-resolves the real
+  // select list against this core output.
+  QueryData core;
+  Expression where = select.WhereClause();
+  std::unordered_set<std::string> seen_relations;
+  for (const SelectSource& source : select.Sources()) {
+    if (!source.alias.empty() && !seen_relations.insert(source.alias).second) {
+      last_error_ = "duplicate FROM relation; use distinct aliases";
+      return Status::kUnknown;
+    }
+    core.from_.push_back(source.alias);
+    if (!source.alias.empty() && source.alias != source.table) {
+      core.aliases_.emplace(source.alias, source.table);
+    }
+    if (source.join_condition) {
+      where = where ? BinaryExpressionExp(where, BinaryOperation::kAnd,
+                                          source.join_condition)
+                    : source.join_condition;
+    }
+  }
+  core.where_ = where ? where : ConstantValueExp(Value(true));
+
+  std::vector<NamedExpression> required;
+  const auto require = [&required](const Expression& expression) {
+    if (!expression) {
+      return;
+    }
+    for (const ColumnName& column : expression->TouchedColumns()) {
+      if (column.name == "*") {
+        continue;
+      }
+      const bool already = std::ranges::any_of(required, [&](const auto& item) {
+        return item.expression->AsColumnValue().GetColumnName() == column;
+      });
+      if (!already) {
+        required.emplace_back("", ColumnValueExp(column));
+      }
+    }
+  };
+  for (const NamedExpression& item : select.SelectList()) {
+    require(item.expression);
+  }
+  // GROUP BY / HAVING / ORDER BY may reference SELECT-list aliases at any
+  // expression depth; the core query knows nothing of output aliases, so
+  // collect the aliased expressions' base columns instead of the alias
+  // names themselves.  Over-substitution is safe here: the requirement set
+  // is a superset of what the grouping pipeline needs.
+  const std::function<Expression(const Expression&)> substitute_aliases =
+      [&](const Expression& expression) -> Expression {
+    if (!expression) {
+      return expression;
+    }
+    if (expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName& name = expression->AsColumnValue().GetColumnName();
+      if (!name.schema.empty()) {
+        return expression;
+      }
+      for (const NamedExpression& item : select.SelectList()) {
+        if (!item.name.empty() && IdentifierEquals(item.name, name.name)) {
+          return item.expression;
+        }
+      }
+      return expression;
+    }
+    std::vector<Expression> rewritten;
+    for (const Expression& child : ExpressionChildren(expression)) {
+      rewritten.push_back(substitute_aliases(child));
+    }
+    return WithExpressionChildren(expression, rewritten);
+  };
+  for (const Expression& expression : select.GroupBy()) {
+    require(substitute_aliases(expression));
+  }
+  require(substitute_aliases(select.Having()));
+  for (const auto& term : select.OrderBy()) {
+    require(substitute_aliases(term.expression));
+  }
+  if (required.empty()) {
+    // Aggregates over no columns (COUNT(*)): a constant source column keeps
+    // the core projection valid while carrying every input row.
+    required.emplace_back("", ConstantValueExp(Value(true)));
+  }
+  core.select_ = std::move(required);
+
+  RETURN_IF_FAIL(core.Rewrite(ctx));
+  ASSIGN_OR_RETURN(Plan, core_plan, Optimizer::Optimize(core, ctx));
+  auto statement = std::make_shared<SelectStatement>(select);
+  std::vector<Column> output_columns;
+  output_columns.reserve(result_column_names_.size());
+  for (const std::string& name : result_column_names_) {
+    output_columns.emplace_back(name, ValueType::kNull);
+  }
+  Plan finish = std::make_shared<GroupByPlan>(
+      core_plan, std::move(statement), Schema("", std::move(output_columns)));
+  return finish->EmitExecutor(ctx);
+}
+
 StatusOr<Executor> SqlEngine::PrepareStatement(
     TransactionContext& ctx, std::unique_ptr<Statement> statement) {
   last_statement_type_ = statement->Type();
@@ -1725,9 +2025,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // output schema is available: a raw select list still holds the
         // literal "*" directive, whose width/name cannot define the catalog.
         relational_detail::Relation materialized =
-            relational_detail::ExecuteQuery(ctx, *create.AsQuery(), nullptr, {});
+            relational_detail::ExecuteQuery(ctx, *create.AsQuery(), nullptr,
+                                            {});
         std::vector<Row> rows;
-        materialized.ForEachRow([&rows](const Row& row) { rows.push_back(row); });
+        materialized.ForEachRow(
+            [&rows](const Row& row) { rows.push_back(row); });
         std::vector<Column> columns;
         columns.reserve(materialized.schema.ColumnCount());
         for (size_t i = 0; i < materialized.schema.ColumnCount(); ++i) {
@@ -1758,9 +2060,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             columns.back().SetUnsigned(true);
           }
         }
-        ASSIGN_OR_RETURN(Table, table,
-                         database_->CreateTable(
-                             ctx, Schema(create.TableName(), columns)));
+        ASSIGN_OR_RETURN(
+            Table, table,
+            database_->CreateTable(ctx, Schema(create.TableName(), columns)));
         for (auto& row : rows) {
           // Coerce materialized values to the declared column types: the
           // SELECT output may carry narrower types (e.g. INT64 literals in
@@ -1780,7 +2082,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           ASSIGN_OR_RETURN(RowPosition, pos, table.Insert(ctx.txn_, row));
         }
         return Executor(std::make_shared<ConstantExecutor>(
-            Row({Value("CREATE TABLE"), Value(static_cast<int64_t>(rows.size()))})));
+            Row({Value("CREATE TABLE"),
+                 Value(static_cast<int64_t>(rows.size()))})));
       }
       ASSIGN_OR_RETURN(Table, table,
                        database_->CreateTable(
@@ -1801,17 +2104,21 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         plan_cache_parameters_.clear();
         relational_detail::Relation materialized =
             relational_detail::ExecuteQuery(ctx, *insert.Query(), nullptr, {});
-        materialized.ForEachRow([&rows](Row row) { rows.push_back(std::move(row)); });
+        materialized.ForEachRow(
+            [&rows](Row row) { rows.push_back(std::move(row)); });
       } else {
         if (insert.Values().empty()) {
           return Status::kUnknown;
         }
-        // Batch INSERT chunking: evaluate values and process in chunks of kInsertChunkSize
+        // Batch INSERT chunking: evaluate values and process in chunks of
+        // kInsertChunkSize
         constexpr size_t kInsertChunkSize = 64;
         const size_t num_values = insert.Values().size();
         rows.reserve(num_values);
-        for (size_t chunk_start = 0; chunk_start < num_values; chunk_start += kInsertChunkSize) {
-          const size_t chunk_end = std::min(chunk_start + kInsertChunkSize, num_values);
+        for (size_t chunk_start = 0; chunk_start < num_values;
+             chunk_start += kInsertChunkSize) {
+          const size_t chunk_end =
+              std::min(chunk_start + kInsertChunkSize, num_values);
           for (size_t v_idx = chunk_start; v_idx < chunk_end; ++v_idx) {
             const auto& values = insert.Values()[v_idx];
             std::vector<Value> row;
@@ -1836,8 +2143,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             last_error_ = "duplicate INSERT column: " + column;
             return Status::kUnknown;
           }
-          const int destination =
-              table->GetSchema().Offset(ColumnName(column));
+          const int destination = table->GetSchema().Offset(ColumnName(column));
           if (destination < 0) {
             last_error_ = "unknown INSERT column: " + column;
             return Status::kNotExists;
@@ -1861,8 +2167,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           // INSERT t VALUES ((1, 'x')) / VALUES (NULL) / (DEFAULT): a single
           // STRUCT (or whole-row NULL) expands across every column.
           std::vector<Value> expanded;
-          if (ExpandStructInsertValue(row[0],
-                                      table->GetSchema().ColumnCount(),
+          if (ExpandStructInsertValue(row[0], table->GetSchema().ColumnCount(),
                                       &expanded)) {
             row = Row(std::move(expanded));
           }
@@ -1875,8 +2180,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         for (size_t i = 0; i < row.values_.size(); ++i) {
           const ValueType expected = table->GetSchema().GetColumn(i).Type();
-          ValidateNarrowInteger(table->GetSchema().GetColumn(i).Name(),
-                                row[i]);
+          ValidateNarrowInteger(table->GetSchema().GetColumn(i).Name(), row[i]);
           if (row[i].IsNull() || row[i].type == expected) {
             continue;
           }
@@ -2022,22 +2326,21 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // optimizer); neither LimitExecutor nor LimitedRows can express that
       // because they read limit==0 as "unbounded" (§6.3).
       if (select->HasLimit() && select->Limit() == 0) {
-        return Executor(std::make_shared<ConstantExecutor>(
-            std::vector<Row>{}));
+        return Executor(std::make_shared<ConstantExecutor>(std::vector<Row>{}));
       }
       const bool has_unnest = std::any_of(
           select->Sources().begin(), select->Sources().end(),
           [](const SelectSource& s) { return static_cast<bool>(s.unnest); });
-      const bool has_subquery_or_lateral = std::any_of(
-          select->Sources().begin(), select->Sources().end(),
-          [](const SelectSource& s) {
-            return s.is_lateral || s.query != nullptr;
-          });
+      const bool has_subquery_or_lateral =
+          std::any_of(select->Sources().begin(), select->Sources().end(),
+                      [](const SelectSource& s) {
+                        return s.is_lateral || s.query != nullptr;
+                      });
       const bool can_decorrelate_subqueries =
           CanUseDecorrelatedSubqueryOptimizer(*select);
       const bool simple_count_star =
-          select->Sources().size() == 1 &&
-          !select->Sources()[0].query && !select->Sources()[0].unnest &&
+          select->Sources().size() == 1 && !select->Sources()[0].query &&
+          !select->Sources()[0].unnest &&
           select->Sources()[0].join_type == JoinType::kCross &&
           select->Sources()[0].join_condition == nullptr &&
           select->WithQueries().empty() && select->GroupBy().empty() &&
@@ -2045,26 +2348,131 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           select->OrderBy().empty() && !select->Distinct() &&
           select->SelectList().size() == 1 &&
           select->SelectList()[0].expression &&
-          select->SelectList()[0].expression->Type() == TypeTag::kAggregateExp &&
-          select->SelectList()[0].expression->AsAggregateExpression().GetType() ==
-              AggregationType::kCount &&
-          !select->SelectList()[0].expression->AsAggregateExpression().Distinct() &&
+          select->SelectList()[0].expression->Type() ==
+              TypeTag::kAggregateExp &&
+          select->SelectList()[0]
+                  .expression->AsAggregateExpression()
+                  .GetType() == AggregationType::kCount &&
+          !select->SelectList()[0]
+               .expression->AsAggregateExpression()
+               .Distinct() &&
           select->SelectList()[0].expression->AsAggregateExpression().Child() &&
-          select->SelectList()[0].expression->AsAggregateExpression().Child()->Type() ==
-              TypeTag::kColumnValue &&
+          select->SelectList()[0]
+                  .expression->AsAggregateExpression()
+                  .Child()
+                  ->Type() == TypeTag::kColumnValue &&
           select->SelectList()[0]
                   .expression->AsAggregateExpression()
                   .Child()
                   ->AsColumnValue()
                   .GetColumnName()
                   .name == "*" &&
-           (!select->WhereClause() ||
+          (!select->WhereClause() ||
            select->WhereClause()->Type() == TypeTag::kConstantValue);
-      const bool has_set_operation = !select->UnionAll().empty();
+      // Value-table operands (SELECT AS VALUE / AS <proto>) need the
+      // relational interpreter's proto-field ORDER BY resolution; their rows
+      // are folded single-column payloads, not plain projections.
+      const bool has_value_table_operand = std::any_of(
+          select->SelectList().begin(), select->SelectList().end(),
+          [](const NamedExpression& item) {
+            return item.expression &&
+                   item.expression->Type() == TypeTag::kFunctionCallExp &&
+                   (item.expression->AsFunctionCallExpression().FuncName() ==
+                        "__value_table_value" ||
+                    item.expression->AsFunctionCallExpression().FuncName() ==
+                        "__proto_new");
+          });
+      const bool sources_plain = std::all_of(
+          select->Sources().begin(), select->Sources().end(),
+          [](const SelectSource& source) {
+            return source.query == nullptr && !source.unnest &&
+                   !source.is_lateral && source.table.empty() == false;
+          });
+      if (!select->UnionAll().empty() && !has_value_table_operand &&
+          select->WithQueries().empty() && sources_plain) {
+        return ExecuteSetOperation(*select, ctx);
+      }
+      // Self-joins expose the same base relation under two aliases; the
+      // relational interpreter resolves each alias against its own renamed
+      // scope, which keeps per-alias projections and ORDER BY output-alias
+      // keys correct regardless of access-path choice.
+      const auto any_self_join = [](const SelectStatement& stmt) {
+        for (size_t i = 0; i < stmt.Sources().size(); ++i) {
+          for (size_t j = i + 1; j < stmt.Sources().size(); ++j) {
+            if (!stmt.Sources()[i].table.empty() &&
+                stmt.Sources()[i].table == stmt.Sources()[j].table) {
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+      // GROUP BY / HAVING / aggregate statements: the Cascades-optimized
+      // FROM + WHERE core (join ordering, access paths, filter pushdown)
+      // feeds the proven relational grouping finish pipeline (GroupByPlan).
+      {
+        const bool has_grouping =
+            !select->GroupBy().empty() || select->Having() ||
+            std::ranges::any_of(
+                select->SelectList(), [](const NamedExpression& item) {
+                  return relational_detail::ContainsAggregate(item.expression);
+                });
+        bool touches_multiple_relations_unqualified = false;
+        if (select->Sources().size() > 1) {
+          const auto unqualified = [](const Expression& expression) {
+            for (const ColumnName& column : expression->TouchedColumns()) {
+              if (column.schema.empty() && column.name != "*") {
+                return true;
+              }
+            }
+            return false;
+          };
+          touches_multiple_relations_unqualified =
+              std::ranges::any_of(select->SelectList(),
+                                  [&](const NamedExpression& item) {
+                                    return unqualified(item.expression);
+                                  }) ||
+              (select->WhereClause() && unqualified(select->WhereClause())) ||
+              std::ranges::any_of(select->GroupBy(), unqualified) ||
+              (select->Having() && unqualified(select->Having()));
+        }
+        // Grouped statements whose expressions carry correlated subqueries
+        // need the relational interpreter's scope chain (outer/CTE threading
+        // through Project); the bridge below runs without it.  Aggregates
+        // mixed with bare non-grouped columns inside one expression also stay
+        // put: their result depends on the group representative row, whose
+        // identity is not stable across access-path choices.
+        const auto touches_query_expression =
+            [](const Expression& expression) -> bool {
+          return expression && relational_detail::ContainsQuery(expression);
+        };
+        bool grouped_expressions_correlate =
+            touches_query_expression(select->Having());
+        for (const Expression& expression : select->GroupBy()) {
+          grouped_expressions_correlate = grouped_expressions_correlate ||
+                                          touches_query_expression(expression);
+        }
+        for (const NamedExpression& item : select->SelectList()) {
+          grouped_expressions_correlate =
+              grouped_expressions_correlate ||
+              touches_query_expression(item.expression);
+        }
+        // The bridge earns its keep on multi-relation grouped queries, where
+        // the Cascades join ordering / access-path choice applies; grouped
+        // single-table queries keep the tuned relational stream-aggregation
+        // path.
+        if (select->Sources().size() > 1 && has_grouping &&
+            !simple_count_star && !select->Qualify() &&
+            !relational_detail::HasWindowFunctions(*select) &&
+            select->WithQueries().empty() && sources_plain &&
+            !touches_multiple_relations_unqualified &&
+            !grouped_expressions_correlate && !any_self_join(*select)) {
+          return ExecuteGroupedSelect(*select, ctx);
+        }
+      }
       if ((select->RequiresRelationalEvaluation() &&
            !can_decorrelate_subqueries) ||
-          select->Sources().empty() || has_unnest || has_subquery_or_lateral ||
-          has_set_operation) {
+          select->Sources().empty() || has_unnest || has_subquery_or_lateral) {
         if (simple_count_star) {
           // COUNT(*) over one plain table is fully representable by the
           // Cascades single-relation path, including a covering index-only
@@ -2079,25 +2487,6 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         return emit_relational();
       }
 
-      // Phase 8 routing: queries whose FROM uses table aliases (including
-      // self-joins of one physical table) go through the cost-based
-      // optimizer, which renames scan schemas to the alias identity. Plain
-      // unaliased joins keep the tuned relational path; outer joins and
-      // FROM-subqueries never reach this point (the visitor marks them
-      // complex above).
-      // Phase 8 routing: the cost-based optimizer owns single-relation
-      // queries (as before) plus multi-relation queries whose sources use
-      // table aliases -- including self-joins of one physical table, which
-      // the optimizer represents by renaming scan schemas to the alias
-      // identity. Plain unaliased joins keep the tuned relational path, and
-      // outer joins / FROM-subqueries never reach this point (the visitor
-      // marks them complex above).
-      const bool uses_aliases =
-          std::any_of(select->Sources().begin(), select->Sources().end(),
-                      [](const SelectSource& source) {
-                        return !source.alias.empty() &&
-                               source.alias != source.table;
-                      });
       // Unqualified column references across several relations are rejected
       // by the relational resolver with a precise ambiguity diagnostic; keep
       // them there.
@@ -2106,8 +2495,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // A bare `*` is an expansion directive, not a column reference.
         const auto touches_unqualified = [](const NamedExpression& item) {
           for (const ColumnName& column : item.expression->TouchedColumns()) {
-            if (column.schema.empty() && column.name != "*") { return true;
-}
+            if (column.schema.empty() && column.name != "*") {
+              return true;
+            }
           }
           return false;
         };
@@ -2123,33 +2513,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const bool multi_relation = select->Sources().size() > 1;
       const bool has_aggregate =
           std::ranges::any_of(
-              select->SelectList(), [](const NamedExpression& item) {
+              select->SelectList(),
+              [](const NamedExpression& item) {
                 return relational_detail::ContainsAggregate(item.expression);
               }) ||
           relational_detail::ContainsAggregate(select->Having());
-      const bool order_uses_projection_expression = std::ranges::any_of(
-          select->OrderBy(), [](const SelectStatement::OrderByTerm& term) {
-            return term.expression->Type() != TypeTag::kColumnValue;
-          });
-      const bool order_uses_select_alias = std::ranges::any_of(
-          select->OrderBy(), [&](const SelectStatement::OrderByTerm& term) {
-            if (!term.expression ||
-                term.expression->Type() != TypeTag::kColumnValue) {
-              return false;
-            }
-            const ColumnName& order_name =
-                term.expression->AsColumnValue().GetColumnName();
-            if (!order_name.schema.empty()) {
-              return false;
-            }
-            return std::ranges::any_of(
-                select->SelectList(), [&](const NamedExpression& item) {
-                  return !item.name.empty() &&
-                         IdentifierEquals(item.name, order_name.name) &&
-                         item.expression->ToString() !=
-                             term.expression->ToString();
-                });
-          });
       // Keep optimizer plans for ordinary aliased equi-joins, but preserve
       // the general relational path when the optimizer cannot yet prove a
       // safe implementation.  Non-equality joins and inner joins whose
@@ -2183,27 +2551,24 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                                    : std::unordered_set<ColumnName>{});
       const bool has_join_only_source = std::ranges::any_of(
           select->Sources(), [&](const SelectSource& source) {
-            if (source.alias.empty()) { return false; }
-            return !std::ranges::any_of(
-                visible_references, [&](const ColumnName& column) {
-                  return !column.schema.empty() &&
-                         column.schema == source.alias;
-                });
+            if (source.alias.empty()) {
+              return false;
+            }
+            return !std::ranges::any_of(visible_references,
+                                        [&](const ColumnName& column) {
+                                          return !column.schema.empty() &&
+                                                 column.schema == source.alias;
+                                        });
           });
       if (multi_relation &&
-          (has_aggregate || !uses_aliases || has_unqualified_column ||
-           has_non_equality_join ||
-           has_join_only_source)) {
+          (has_aggregate || has_unqualified_column || has_non_equality_join ||
+           has_join_only_source || any_self_join(*select))) {
         return emit_relational();
       }
-      // The relational evaluator owns the post-projection ORDER BY scope.
-      // Keep computed ordering and direct SELECT aliases on that path until
-      // the optimizer can carry the projected schema through every physical
-      // sort boundary; otherwise a pushed-down sort sees qualified source
-      // names that are no longer in its child schema.
-      if (order_uses_projection_expression || order_uses_select_alias) {
-        return emit_relational();
-      }
+      // Post-projection ORDER BY scope: the adapter normalizes computed keys
+      // and SELECT aliases to projection-output names (sort_expressions) and
+      // a post-plan SortExecutor covers plans that do not enforce ordering,
+      // so computed ordering no longer forces the relational path.
       QueryData query;
       Expression where = select->WhereClause();
       std::unordered_set<std::string> seen_relations;
@@ -2256,24 +2621,25 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
               has_star = true;
               for (const std::string& relation : query.from_) {
                 const auto aliased = query.aliases_.find(relation);
-                const std::string& physical =
-                    aliased == query.aliases_.end() ? relation
-                                                    : aliased->second;
+                const std::string& physical = aliased == query.aliases_.end()
+                                                  ? relation
+                                                  : aliased->second;
                 if (!column.schema.empty() && column.schema != relation &&
-                    column.schema != physical) { continue;
-}
-                StatusOr<std::shared_ptr<Table>> found =
-                    ctx.GetTable(physical);
-                if (!found.HasValue()) { continue;
-}
+                    column.schema != physical) {
+                  continue;
+                }
+                StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+                if (!found.HasValue()) {
+                  continue;
+                }
                 const Schema& source_schema = found.Value()->GetSchema();
                 if (source_schema.ColumnCount() == 1 &&
                     physical.find("TestExtraPBValueTable") !=
                         std::string::npos) {
-                  const ColumnName base(
-                      relation, source_schema.GetColumn(0).Name().name);
-                  for (const char* field : {"int32_val1", "int32_val2",
-                                            "str_value"}) {
+                  const ColumnName base(relation,
+                                        source_schema.GetColumn(0).Name().name);
+                  for (const char* field :
+                       {"int32_val1", "int32_val2", "str_value"}) {
                     expanded.emplace_back(
                         field,
                         FunctionCallExp(
@@ -2283,11 +2649,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                   }
                   continue;
                 }
-                for (size_t i = 0;
-                     i < source_schema.ColumnCount(); ++i) {
-                  expanded.emplace_back(
-                      ColumnName(relation,
-                                 source_schema.GetColumn(i).Name().name));
+                for (size_t i = 0; i < source_schema.ColumnCount(); ++i) {
+                  expanded.emplace_back(ColumnName(
+                      relation, source_schema.GetColumn(i).Name().name));
                 }
               }
               continue;
@@ -2295,8 +2659,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           }
           expanded.push_back(item);
         }
-        if (has_star && !expanded.empty()) { query.select_ = std::move(expanded);
-}
+        if (has_star && !expanded.empty()) {
+          query.select_ = std::move(expanded);
+        }
       }
       const size_t visible_columns = query.select_.size();
       std::vector<Expression> sort_expressions;
@@ -2310,10 +2675,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             order.expression->Type() != TypeTag::kColumnValue;
         query.order_expressions_.push_back(order.expression);
         query.order_ascending_.push_back(order.ascending);
-        auto selected = std::ranges::find_if(
-            query.select_, [&](const auto& item) {
-              if (item.expression->ToString() ==
-                  order.expression->ToString()) {
+        auto selected =
+            std::ranges::find_if(query.select_, [&](const auto& item) {
+              if (item.expression->ToString() == order.expression->ToString()) {
                 return true;
               }
               if (order.expression->Type() != TypeTag::kColumnValue ||
@@ -2332,16 +2696,30 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           // lower projection attempt to resolve a column that does not exist
           // in its child schema.
           if (order.expression->Type() == TypeTag::kColumnValue &&
-              order.expression->AsColumnValue().GetColumnName().schema.empty() &&
+              order.expression->AsColumnValue()
+                  .GetColumnName()
+                  .schema.empty() &&
               selected->expression->ToString() !=
                   order.expression->ToString()) {
             query.order_expressions_.back() = selected->expression;
+            // The logical key and the sort key now name different things
+            // (source expression vs output column); bind both to the
+            // projection output so the post-plan ordering check compares
+            // like with like instead of stacking a second sort.
+            order_needs_projection_binding = true;
           }
           // Sorting consumes the plan OUTPUT, whose columns are named by the
           // select list; normalize the key to that name so qualifiers
           // (table aliases) cannot break resolution after projection.
           if (!selected->name.empty()) {
-            sort_expressions.push_back(ColumnValueExp(ColumnName(selected->name)));
+            sort_expressions.push_back(
+                ColumnValueExp(ColumnName(selected->name)));
+            // The sort key is the output column, so the logical ordering
+            // must be checked against the same name: leaving the source
+            // expression here makes the post-plan IsOrderedBy comparison
+            // fail and stack a second sort above one the plan already
+            // declared.
+            order_needs_projection_binding = true;
           } else {
             sort_expressions.push_back(order.expression);
           }
@@ -2380,14 +2758,23 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       if (needs_distinct) {
         executor = std::make_shared<DistinctExecutor>(std::move(executor));
       }
+      // The ordering certification must use the keys the plan was actually
+      // built with.  When a sort key resolves to a SELECT-list alias,
+      // QueryData::Rewrite folds the output name back into its source
+      // expression, so query.order_expressions_ no longer matches the
+      // plan-declared output-name keys; sort_expressions is the faithful
+      // post-projection form and comparing it avoids stacking a second sort.
+      const std::vector<Expression>& ordering_keys =
+          order_needs_projection_binding ? sort_expressions
+                                         : query.order_expressions_;
       if (!select->OrderBy().empty() &&
-          !plan->IsOrderedBy(query.order_expressions_, query.order_ascending_)) {
+          !plan->IsOrderedBy(ordering_keys, query.order_ascending_,
+                             query.order_nulls_first_)) {
         std::vector<SortExecutor::Key> keys;
         keys.reserve(select->OrderBy().size());
         for (size_t i = 0; i < select->OrderBy().size(); ++i) {
-          keys.push_back(
-              {sort_expressions[i], sort_ascending[i],
-               select->OrderBy()[i].nulls_first});
+          keys.push_back({sort_expressions[i], sort_ascending[i],
+                          select->OrderBy()[i].nulls_first});
         }
         executor = std::make_shared<SortExecutor>(
             std::move(executor), plan->GetSchema(), std::move(keys));
@@ -2414,6 +2801,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         shape->column_names = result_column_names_;
         shape->order_expressions = query.order_expressions_;
         shape->order_ascending = query.order_ascending_;
+        shape->order_nulls_first = query.order_nulls_first_;
         shape->sort_keys.reserve(sort_expressions.size());
         for (size_t i = 0; i < sort_expressions.size(); ++i) {
           shape->sort_keys.emplace_back(sort_expressions[i],
@@ -2453,22 +2841,37 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // because array mutations are not expressible as plain projections.
         StatusOr<Executor> result =
             ExecuteNestedArrayUpdate(ctx, update, table.get());
-        if (result.HasValue()) { database_->BumpSchemaEpoch(); }
+        if (result.HasValue()) {
+          database_->BumpSchemaEpoch();
+        }
         return result;
       }
-  const Schema& schema = table->GetSchema();
+      const Schema& schema = table->GetSchema();
       {
         bool dotted_target = false;
+        bool plain_target = false;
         for (const auto& [target, expression] : update.SetClause()) {
           if (!target.schema.empty() && !target.name.empty() &&
               target.schema != update.TableName()) {
             dotted_target = true;
+          } else {
+            plain_target = true;
           }
+        }
+        // A mixed SET list would silently lose the plain assignments (the
+        // dotted path below only rewrites field_targets), so refuse the mixed
+        // shape instead of committing a partial update.
+        if (dotted_target && plain_target) {
+          throw std::runtime_error(
+              "UPDATE cannot mix dotted STRUCT field targets with plain column "
+              "targets in one SET clause");
         }
         if (dotted_target) {
           StatusOr<Executor> result =
               ExecuteStructFieldUpdate(ctx, update, table.get());
-          if (result.HasValue()) { database_->BumpSchemaEpoch(); }
+          if (result.HasValue()) {
+            database_->BumpSchemaEpoch();
+          }
           return result;
         }
       }
@@ -2495,8 +2898,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           update.SetClause();
       Expression where_clause = update.WhereClause();
       if (!value_table_alias.empty()) {
-        const ColumnName only_column(
-            update.TableName(), schema.GetColumn(0).Name().name);
+        const ColumnName only_column(update.TableName(),
+                                     schema.GetColumn(0).Name().name);
         auto matches_alias = [&](const ColumnName& name) {
           return (name.schema.empty() ||
                   IdentifierEquals(name.schema, value_table_alias)) &&
@@ -2510,17 +2913,18 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         if (where_clause) {
           std::function<Expression(const Expression&)> bind_alias =
               [&](const Expression& expr) -> Expression {
-            if (!expr) { return expr; }
+            if (!expr) {
+              return expr;
+            }
             if (expr->Type() == TypeTag::kColumnValue) {
-              const ColumnName& name =
-                  expr->AsColumnValue().GetColumnName();
+              const ColumnName& name = expr->AsColumnValue().GetColumnName();
               if (matches_alias(name)) {
                 return ColumnValueExp(only_column);
               }
               if (!name.schema.empty() &&
                   IdentifierEquals(name.schema, value_table_alias)) {
-                return ColumnValueExp(ColumnName(update.TableName(),
-                                                 name.name));
+                return ColumnValueExp(
+                    ColumnName(update.TableName(), name.name));
               }
               return expr;
             }
@@ -2555,26 +2959,27 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       if (where_clause) {
         std::function<Expression(const Expression&)> bind_struct_fields =
             [&](const Expression& expr) -> Expression {
-          if (!expr) { return expr; }
+          if (!expr) {
+            return expr;
+          }
           if (expr->Type() == TypeTag::kColumnValue) {
             const ColumnName& name = expr->AsColumnValue().GetColumnName();
             if (!name.schema.empty() && name.schema != update.TableName()) {
               const int base_column = column_index(name.schema);
-              if (base_column >= 0 && !name.name.empty() &&
-                  name.name != "*") {
+              if (base_column >= 0 && !name.name.empty() && name.name != "*") {
                 return FunctionCallExp(
                     "__get_field_safe",
                     {ColumnValueExp(ColumnName(
                          update.TableName(),
                          schema.GetColumn(static_cast<size_t>(base_column))
-                             .Name().name)),
+                             .Name()
+                             .name)),
                      ConstantValueExp(Value(std::string(name.name)))});
               }
             }
             if (single_column_table && name.schema.empty() &&
                 !name.name.empty() && name.name != "*" &&
-                !IdentifierEquals(name.name,
-                                  schema.GetColumn(0).Name().name)) {
+                !IdentifierEquals(name.name, schema.GetColumn(0).Name().name)) {
               return FunctionCallExp(
                   "__get_field_safe",
                   {ColumnValueExp(ColumnName(update.TableName(),
@@ -2609,8 +3014,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           const ColumnName& target = set_clause[j].first;
           if ((target.name == column.Name().name ||
                IdentifierEquals(target.name, column.Name().name)) &&
-              (target.schema.empty() ||
-               target.schema == update.TableName())) {
+              (target.schema.empty() || target.schema == update.TableName())) {
             expression = set_clause[j].second;
             const std::string lower_name = [&] {
               std::string out = column.Name().name;
@@ -2627,17 +3031,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                 lower_name.find("uint8") != std::string::npos) {
               expression = std::make_shared<CastExpression>(
                   std::move(expression),
-                  lower_name.find("uint32") != std::string::npos
-                      ? "UINT32"
-                      : lower_name.find("int32") != std::string::npos
-                            ? "INT32"
-                            : lower_name.find("uint16") != std::string::npos
-                                  ? "UINT16"
-                                  : lower_name.find("int16") != std::string::npos
-                                        ? "INT16"
-                                        : lower_name.find("uint8") != std::string::npos
-                                              ? "UINT8"
-                                              : "INT8",
+                  lower_name.find("uint32") != std::string::npos   ? "UINT32"
+                  : lower_name.find("int32") != std::string::npos  ? "INT32"
+                  : lower_name.find("uint16") != std::string::npos ? "UINT16"
+                  : lower_name.find("int16") != std::string::npos  ? "INT16"
+                  : lower_name.find("uint8") != std::string::npos  ? "UINT8"
+                                                                   : "INT8",
                   false);
             }
             applied[j] = true;
@@ -2647,7 +3046,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         output.emplace_back(column.Name().name, std::move(expression));
       }
       for (size_t j = 0; j < applied.size(); ++j) {
-        if (applied[j]) { continue; }
+        if (applied[j]) {
+          continue;
+        }
         const ColumnName& target = set_clause[j].first;
         const bool plain_or_local =
             target.schema.empty() || target.schema == update.TableName();
@@ -2661,19 +3062,17 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           applied[j] = true;
           continue;
         }
-        last_error_ =
-            "UPDATE SET target not found: " +
-            (set_clause[j].first.schema.empty()
-                 ? set_clause[j].first.name
-                 : set_clause[j].first.ToString());
+        last_error_ = "UPDATE SET target not found: " +
+                      (set_clause[j].first.schema.empty()
+                           ? set_clause[j].first.name
+                           : set_clause[j].first.ToString());
         return Status::kNotExists;
       }
       if (!proto_sets.empty()) {
         // Wrap the column read with chained __proto_set calls so each field
         // assignment applies to the payload produced by the previous one.
         for (auto& entry : output) {
-          if (!IdentifierEquals(entry.name,
-                                schema.GetColumn(0).Name().name)) {
+          if (!IdentifierEquals(entry.name, schema.GetColumn(0).Name().name)) {
             continue;
           }
           Expression current = std::move(entry.expression);
@@ -2688,8 +3087,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       QueryData query;
       query.from_ = {update.TableName()};
-      query.where_ = where_clause ? where_clause
-                                  : ConstantValueExp(Value(true));
+      query.where_ =
+          where_clause ? where_clause : ConstantValueExp(Value(true));
       query.select_ = std::move(output);
       query.require_row_position_ = true;
       RETURN_IF_FAIL(query.Rewrite(ctx));
@@ -2733,7 +3132,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                                      schema.GetColumn(0).Name().name);
         std::function<Expression(const Expression&)> bind_alias =
             [&](const Expression& expr) -> Expression {
-          if (!expr) { return expr; }
+          if (!expr) {
+            return expr;
+          }
           if (expr->Type() == TypeTag::kColumnValue) {
             const ColumnName& name = expr->AsColumnValue().GetColumnName();
             if ((name.schema.empty() ||
@@ -2743,8 +3144,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             }
             if (!name.schema.empty() &&
                 IdentifierEquals(name.schema, delete_alias)) {
-              return ColumnValueExp(
-                  ColumnName(remove.TableName(), name.name));
+              return ColumnValueExp(ColumnName(remove.TableName(), name.name));
             }
             return expr;
           }
@@ -2768,13 +3168,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                                      schema.GetColumn(0).Name().name);
         std::function<Expression(const Expression&)> bind_proto_fields =
             [&](const Expression& expr) -> Expression {
-          if (!expr) { return expr; }
+          if (!expr) {
+            return expr;
+          }
           if (expr->Type() == TypeTag::kColumnValue) {
             const ColumnName& name = expr->AsColumnValue().GetColumnName();
-            if (name.schema.empty() && !name.name.empty() &&
-                name.name != "*" &&
-                !IdentifierEquals(name.name,
-                                  schema.GetColumn(0).Name().name)) {
+            if (name.schema.empty() && !name.name.empty() && name.name != "*" &&
+                !IdentifierEquals(name.name, schema.GetColumn(0).Name().name)) {
               return FunctionCallExp(
                   "__get_field_safe",
                   {ColumnValueExp(only_column),
@@ -2799,8 +3199,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       QueryData query;
       query.from_ = {remove.TableName()};
-      query.where_ = where_clause ? where_clause
-                                  : ConstantValueExp(Value(true));
+      query.where_ =
+          where_clause ? where_clause : ConstantValueExp(Value(true));
       query.select_ = std::move(output);
       query.require_row_position_ = true;
       query.wait_for_write_intent_ = false;
@@ -2834,12 +3234,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
 std::optional<Executor> SqlEngine::ServeFromPlanCache(
     TransactionContext& ctx, const std::string& fingerprint,
     const std::vector<Value>& parameters) {
-  if (IsVolatileSpecializedPlan(fingerprint)) { return std::nullopt; }
+  if (IsVolatileSpecializedPlan(fingerprint)) {
+    return std::nullopt;
+  }
   CompiledPlanPtr compiled =
       FindThreadCompiledPlan(fingerprint, database_, database_->SchemaEpoch());
   if (!compiled) {
-    compiled = PreparedPlanCache::Instance().Find(
-        fingerprint, database_, database_->SchemaEpoch());
+    compiled = PreparedPlanCache::Instance().Find(fingerprint, database_,
+                                                  database_->SchemaEpoch());
   }
   if (!compiled) {
     return std::nullopt;
@@ -2888,13 +3290,12 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
         last_statement_type_ = StatementType::kUpdate;
         last_dml_table_ = compiled->table->GetSchema().Name();
         Executor executor = std::make_shared<Update>(
-            ctx.txn_, compiled->table.get(),
-            compiled->plan->EmitExecutor(ctx));
+            ctx.txn_, compiled->table.get(), compiled->plan->EmitExecutor(ctx));
         PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
         return RetainCompiledPlan(std::move(executor), compiled);
       }
       case CompiledPlan::Kind::kDelete: {
-          last_statement_type_ = StatementType::kDelete;
+        last_statement_type_ = StatementType::kDelete;
         last_dml_table_ = compiled->table->GetSchema().Name();
         Executor executor = std::make_shared<DeleteExecutor>(
             ctx.txn_, *compiled->table, compiled->plan->EmitExecutor(ctx));
@@ -2902,7 +3303,9 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
         return RetainCompiledPlan(std::move(executor), compiled);
       }
     }
-  } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) // Any fast-path doubt falls back to the authoritative legacy compile.
+  } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) // Any
+                                     // fast-path doubt falls back to the
+                                     // authoritative legacy compile.
   }
   return std::nullopt;
 }

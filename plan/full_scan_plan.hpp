@@ -29,13 +29,11 @@ namespace tinylamb {
 
 class FullScanPlan : public PlanBase {
  public:
-  explicit FullScanPlan(
-      const Table& table, const TableStatistics& ts,
-      size_t max_rows = std::numeric_limits<size_t>::max());
-  FullScanPlan(
-      const Table& table, const TableStatistics& ts,
-      std::vector<IntegerPeekCompare> peek_compares,
-      size_t max_rows = std::numeric_limits<size_t>::max());
+  explicit FullScanPlan(const Table& table, const TableStatistics& ts,
+                        size_t max_rows = std::numeric_limits<size_t>::max());
+  FullScanPlan(const Table& table, const TableStatistics& ts,
+               std::vector<IntegerPeekCompare> peek_compares,
+               size_t max_rows = std::numeric_limits<size_t>::max());
   FullScanPlan(const FullScanPlan&) = delete;
   FullScanPlan(FullScanPlan&&) = delete;
   FullScanPlan& operator=(const FullScanPlan&) = delete;

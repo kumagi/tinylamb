@@ -25,8 +25,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules();
 StatusOr<Plan> OptimizeSingleRelation(
     const QueryData& query, const Expression& predicate,
     const std::vector<NamedExpression>& projection_items, bool has_aggregate,
-    bool distinct,
-    const cascades::PhysicalProperties& required,
+    bool distinct, const cascades::PhysicalProperties& required,
     const cascades::RuleContext& context);
 
 }  // namespace tinylamb

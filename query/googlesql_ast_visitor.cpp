@@ -10,8 +10,10 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -28,16 +30,15 @@
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
-#include "expression/proto_schema.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
-#include "database/transaction_context.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/proto_schema.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
@@ -74,14 +75,15 @@ class VisitSourceScope {
 };
 
 std::string SliceSource(const GoogleSqlAstNode* node) {
-  if (node == nullptr || t_visit_source == nullptr) { return {}; }
+  if (node == nullptr || t_visit_source == nullptr) {
+    return {};
+  }
   if (node->end < node->start || node->end > t_visit_source->size()) {
     return {};
   }
   return t_visit_source->substr(node->start, node->end - node->start);
 }
 }  // namespace
-
 
 namespace {
 
@@ -196,12 +198,10 @@ int64_t ParseIntLiteral(const GoogleSqlAstNode& node) {
   const std::string& text = node.detail;
   // Hex literals (0x1F, 0XFFFFFFFFFFFFD8F0) are bit patterns: they wrap
   // modulo 2^64 exactly like the reference engine, where 0xFF... == -1.
-  if (text.size() > 2 && text[0] == '0' &&
-      (text[1] == 'x' || text[1] == 'X')) {
+  if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
     const std::string_view digits(text.data() + 2, text.size() - 2);
     const bool hex_only =
-        !digits.empty() &&
-        std::ranges::all_of(digits, [](char c) {
+        !digits.empty() && std::ranges::all_of(digits, [](char c) {
           return ('0' <= c && c <= '9') || ('a' <= c && c <= 'f') ||
                  ('A' <= c && c <= 'F');
         });
@@ -235,8 +235,7 @@ int64_t ParseIntLiteral(const GoogleSqlAstNode& node) {
     // Literals above INT64_MAX name UINT64 values; the engine stores them
     // as their two's-complement signed bit pattern.
     uint64_t magnitude = 0;
-    const auto [u_ptr, u_ec] =
-        std::from_chars(text.data(), end, magnitude, 10);
+    const auto [u_ptr, u_ec] = std::from_chars(text.data(), end, magnitude, 10);
     if (u_ec == std::errc() && u_ptr == end) {
       return static_cast<int64_t>(magnitude);
     }
@@ -351,7 +350,6 @@ struct UdfParameter {
   // DEFAULT expression subtree; null when the parameter is required.
   std::unique_ptr<GoogleSqlAstNode> default_value;
 };
-
 
 constexpr int kMaxUdfExpansionDepth = 64;
 
@@ -598,8 +596,6 @@ std::shared_ptr<SelectStatement> SubstituteInSelect(
   result->SetAsStruct(select.AsStruct());
   return result;
 }
-
-
 
 std::string DecodeSingleComponent(std::string_view value_view) {
   std::string value = std::string(value_view);
@@ -973,11 +969,11 @@ bool NeedsRelationalEvaluation(
       // hidden-column pre-computation.
       return true;
     case TypeTag::kArrayExp:
-      return std::ranges::any_of(
-          expression->AsArrayExpression().Elements(),
-          [](const Expression& element) {
-            return NeedsRelationalEvaluation(element, false);
-          });
+      return std::ranges::any_of(expression->AsArrayExpression().Elements(),
+                                 [](const Expression& element) {
+                                   return NeedsRelationalEvaluation(element,
+                                                                    false);
+                                 });
     case TypeTag::kColumnValue: {
       const ColumnName& name = expression->AsColumnValue().GetColumnName();
       // Deep field paths (`t.Info.str_value`, `sub.ca.a`) resolve through
@@ -1161,7 +1157,9 @@ Expression SubstituteUdfParameter(const std::string& path_name) {
           base = FunctionCallExp(
               "__get_field_safe",
               {std::move(base), ConstantValueExp(Value(std::move(field)))});
-          if (segment_end == std::string::npos) { break; }
+          if (segment_end == std::string::npos) {
+            break;
+          }
           remaining = remaining.substr(segment_end + 1);
         }
         return base;
@@ -1243,14 +1241,16 @@ void RejectUnsupportedHints(  // NOLINT(misc-no-recursion)
   if (node.kind == "HintEntry") {
     size_t leading_identifiers = 0;
     for (const auto& child : node.children) {
-      if (child->kind != "Identifier") { break; }
+      if (child->kind != "Identifier") {
+        break;
+      }
       ++leading_identifiers;
     }
     if (leading_identifiers <= 1) {
-      throw std::runtime_error(
-          std::string("Unsupported hint: ") +
-          (node.children.empty() ? std::string("")
-                                 : Identifier(*node.children.front())));
+      throw std::runtime_error(std::string("Unsupported hint: ") +
+                               (node.children.empty()
+                                    ? std::string("")
+                                    : Identifier(*node.children.front())));
     }
   }
   for (const auto& child : node.children) {
@@ -1284,12 +1284,16 @@ bool IsValidUtf8Text(std::string_view text) {
     } else {
       return false;
     }
-    if (i + continuation_count >= text.size()) { return false; }
+    if (i + continuation_count >= text.size()) {
+      return false;
+    }
     for (size_t c = 1; c <= continuation_count; ++c) {
       const uint8_t byte = static_cast<uint8_t>(text[i + c]);
       const uint8_t lower = c == 1 ? second_lower : 0x80;
       const uint8_t upper = c == 1 ? second_upper : 0xBF;
-      if (byte < lower || byte > upper) { return false; }
+      if (byte < lower || byte > upper) {
+        return false;
+      }
     }
     i += continuation_count + 1;
   }
@@ -1314,11 +1318,9 @@ void ValidateSelectAsProjections(
 // path collapses struct types, losing that validation; this re-establishes
 // it for literal struct sources. Anything not statically checkable is left
 // to the existing runtime behavior untouched.
-void ValidateStructCastCoercibility(const GoogleSqlAstNode& node,
-                                    bool safe) {
+void ValidateStructCastCoercibility(const GoogleSqlAstNode& node, bool safe) {
   (void)safe;
-  if (node.children.size() < 2 ||
-      node.children[1]->kind != "StructType") {
+  if (node.children.size() < 2 || node.children[1]->kind != "StructType") {
     return;
   }
   const GoogleSqlAstNode& source = *node.children[0];
@@ -1329,21 +1331,29 @@ void ValidateStructCastCoercibility(const GoogleSqlAstNode& node,
   }
   std::vector<std::string> field_types;
   for (const auto& field : node.children[1]->children) {
-    if (field->kind != "StructField") { continue; }
+    if (field->kind != "StructField") {
+      continue;
+    }
     std::string field_type;
     for (const auto& part : field->children) {
       field_type = SqlTypeFromAst(*part);
-      if (!field_type.empty()) { break; }
+      if (!field_type.empty()) {
+        break;
+      }
     }
     field_types.push_back(field_type);
   }
   std::vector<const GoogleSqlAstNode*> elements;
   for (const auto& child : source.children) {
-    if (IsAstTrivia(child->kind)) { continue; }
+    if (IsAstTrivia(child->kind)) {
+      continue;
+    }
     // Keyword constructors wrap each field in a StructConstructorArg node.
     if (child->kind == "StructConstructorArg") {
       for (const auto& inner : child->children) {
-        if (IsAstTrivia(inner->kind)) { continue; }
+        if (IsAstTrivia(inner->kind)) {
+          continue;
+        }
         elements.push_back(inner.get());
         break;
       }
@@ -1361,10 +1371,14 @@ void ValidateStructCastCoercibility(const GoogleSqlAstNode& node,
     try {
       element_expr = VisitExpression(*elements[i]);
       Value original = element_expr->Evaluate(dummy_row, dummy_schema);
-      if (original.IsNull()) { continue; }
-      if (field_types[i].empty()) { continue; }
-      Expression coerced = CastExpressionExp(
-          element_expr, field_types[i], /*return_null_on_error=*/true);
+      if (original.IsNull()) {
+        continue;
+      }
+      if (field_types[i].empty()) {
+        continue;
+      }
+      Expression coerced = CastExpressionExp(element_expr, field_types[i],
+                                             /*return_null_on_error=*/true);
       if (coerced->Evaluate(dummy_row, dummy_schema).IsNull()) {
         throw std::runtime_error("Cannot coerce struct field " +
                                  std::to_string(i + 1) + " to " +
@@ -1540,29 +1554,25 @@ Expression RewriteLambdaArrayFunction(const GoogleSqlAstNode& array_node,
   Expression array_for_null_check = array_expr;
   LambdaBindingResult binding = BindLambdaBody(lambda);
   auto inner = std::make_shared<SelectStatement>(
-      as_filter
-          ? std::vector<NamedExpression>{NamedExpression(
-                std::string(""),
-                ColumnValueExp(ColumnName("", binding.element_binding)))}
-          : std::vector<NamedExpression>{NamedExpression(
-                std::string(""), std::move(binding.body))},
-      std::vector<std::string>{},
-      as_filter ? binding.body : Expression{});
+      as_filter ? std::vector<NamedExpression>{NamedExpression(
+                      std::string(""),
+                      ColumnValueExp(ColumnName("", binding.element_binding)))}
+                : std::vector<NamedExpression>{NamedExpression(
+                      std::string(""), std::move(binding.body))},
+      std::vector<std::string>{}, as_filter ? binding.body : Expression{});
   inner->SetSources({MakeLambdaSource(std::move(array_expr), binding)});
   inner->MarkComplex();
-  auto query_expression =
-      std::make_shared<QueryExpression>(std::move(inner), nullptr, false, false);
+  auto query_expression = std::make_shared<QueryExpression>(
+      std::move(inner), nullptr, false, false);
   query_expression->SetArrayResult(true);
-  query_expression->SetArrayElementSqlType(
-      InferArrayElementSqlType(lambda.children.back().get() == nullptr
-                                   ? lambda
-                                   : *lambda.children.back()));
+  query_expression->SetArrayElementSqlType(InferArrayElementSqlType(
+      lambda.children.back().get() == nullptr ? lambda
+                                              : *lambda.children.back()));
   Expression array_result(query_expression);
-  return CaseExpressionExp(
-      {{UnaryExpressionExp(std::move(array_for_null_check),
-                           UnaryOperation::kIsNull),
-        ConstantValueExp(Value())}},
-      std::move(array_result));
+  return CaseExpressionExp({{UnaryExpressionExp(std::move(array_for_null_check),
+                                                UnaryOperation::kIsNull),
+                             ConstantValueExp(Value())}},
+                           std::move(array_result));
 }
 
 // ARRAY_INCLUDES(array, e -> pred) asks whether any element satisfies the
@@ -1583,8 +1593,8 @@ Expression RewriteLambdaIncludes(const GoogleSqlAstNode& array_node,
       std::vector<std::string>{}, std::move(binding.body));
   inner->SetSources({MakeLambdaSource(std::move(array_expr), binding)});
   inner->MarkComplex();
-  auto exists = std::make_shared<QueryExpression>(
-      std::move(inner), nullptr, true, false);
+  auto exists =
+      std::make_shared<QueryExpression>(std::move(inner), nullptr, true, false);
   return CaseExpressionExp(
       {{UnaryExpressionExp(std::move(array_for_null_check),
                            UnaryOperation::kIsNull),
@@ -1618,12 +1628,16 @@ Expression VisitFunction(
     const GoogleSqlAstNode* lambda = nullptr;
     for (size_t i = 1; i < node.children.size(); ++i) {
       const GoogleSqlAstNode& child = *node.children[i];
-      if (child.kind == "Location") { continue; }
+      if (child.kind == "Location") {
+        continue;
+      }
       if (child.kind == "Lambda" && lambda == nullptr) {
         lambda = &child;
         continue;
       }
-      if (array_arg == nullptr) { array_arg = &child; }
+      if (array_arg == nullptr) {
+        array_arg = &child;
+      }
     }
     if (lambda != nullptr && array_arg != nullptr) {
       if (name == "array_includes") {
@@ -1760,8 +1774,7 @@ Expression VisitFunction(
             child.kind == "LimitOffset") {
           continue;
         }
-        const std::string element_type =
-            InferAggregateArrayElementType(child);
+        const std::string element_type = InferAggregateArrayElementType(child);
         if (!element_type.empty()) {
           aggregate->SetArrayElementSqlType(element_type);
         }
@@ -2109,22 +2122,30 @@ std::string SqlTypeFromAst(
     // the declared field list.
     std::string fields;
     for (const auto& child : node.children) {
-      if (child->kind != "StructField") { continue; }
+      if (child->kind != "StructField") {
+        continue;
+      }
       std::string name_part;
       if (const auto* id = child->Child("Identifier")) {
         name_part = UpperCopy(Identifier(*id));
       }
       std::string type_part;
       for (const auto& field_child : child->children) {
-        if (field_child->kind == "Identifier") { continue; }
+        if (field_child->kind == "Identifier") {
+          continue;
+        }
         const std::string nested = SqlTypeFromAst(*field_child);
         if (!nested.empty()) {
           type_part = nested;
           break;
         }
       }
-      if (type_part.empty()) { continue; }
-      if (!fields.empty()) { fields += ", "; }
+      if (type_part.empty()) {
+        continue;
+      }
+      if (!fields.empty()) {
+        fields += ", ";
+      }
       if (name_part.empty()) {
         fields += type_part;
       } else {
@@ -2231,13 +2252,13 @@ std::string InferArrayElementSqlType(
 // projected column from its AST.  Returns "" when the projection is not a
 // statically-known literal/cast shape; callers then fall back to runtime
 // inference from the produced values.
-std::string InferSubqueryArrayElementType(
-    const GoogleSqlAstNode& query_node) {
+std::string InferSubqueryArrayElementType(const GoogleSqlAstNode& query_node) {
   const GoogleSqlAstNode* select = query_node.Child("Select");
   const GoogleSqlAstNode* select_list =
       select == nullptr ? nullptr : select->Child("SelectList");
-  if (select_list == nullptr) { return {};
-}
+  if (select_list == nullptr) {
+    return {};
+  }
   for (const GoogleSqlAstNode* column : select_list->Children("SelectColumn")) {
     const GoogleSqlAstNode* expression_node = nullptr;
     for (const auto& child : column->children) {
@@ -2246,14 +2267,25 @@ std::string InferSubqueryArrayElementType(
         break;
       }
     }
-    if (expression_node == nullptr) { return {};
-}
+    if (expression_node == nullptr) {
+      return {};
+    }
     const GoogleSqlAstNode& expr = *expression_node;
-    if (expr.kind == "BooleanLiteral") { return "BOOL"; }
-    if (expr.kind == "FloatLiteral") { return "DOUBLE"; }
-    if (expr.kind == "IntLiteral") { return "INT64"; }
-    if (expr.kind == "StringLiteral") { return "STRING"; }
-    if (expr.kind == "BytesLiteral") { return "BYTES"; }
+    if (expr.kind == "BooleanLiteral") {
+      return "BOOL";
+    }
+    if (expr.kind == "FloatLiteral") {
+      return "DOUBLE";
+    }
+    if (expr.kind == "IntLiteral") {
+      return "INT64";
+    }
+    if (expr.kind == "StringLiteral") {
+      return "STRING";
+    }
+    if (expr.kind == "BytesLiteral") {
+      return "BYTES";
+    }
     if (expr.kind == "CastExpression" && expr.children.size() >= 2) {
       return SqlTypeFromAst(*expr.children[1]);
     }
@@ -2267,14 +2299,28 @@ std::string InferSubqueryArrayElementType(
 // is worse than deferring to runtime value inference, so only literal/cast
 // argument shapes produce a type here.
 std::string InferAggregateArrayElementType(const GoogleSqlAstNode& node) {
-  if (node.kind == "BooleanLiteral") { return "BOOL"; }
-  if (node.kind == "StringLiteral") { return "STRING"; }
-  if (node.kind == "BytesLiteral") { return "BYTES"; }
+  if (node.kind == "BooleanLiteral") {
+    return "BOOL";
+  }
+  if (node.kind == "StringLiteral") {
+    return "STRING";
+  }
+  if (node.kind == "BytesLiteral") {
+    return "BYTES";
+  }
   if (node.kind == "DateOrTimeLiteral") {
-    if (node.detail == "TYPE_DATE") { return "DATE"; }
-    if (node.detail == "TYPE_TIMESTAMP") { return "TIMESTAMP"; }
-    if (node.detail == "TYPE_TIME") { return "TIME"; }
-    if (node.detail == "TYPE_DATETIME") { return "DATETIME"; }
+    if (node.detail == "TYPE_DATE") {
+      return "DATE";
+    }
+    if (node.detail == "TYPE_TIMESTAMP") {
+      return "TIMESTAMP";
+    }
+    if (node.detail == "TYPE_TIME") {
+      return "TIME";
+    }
+    if (node.detail == "TYPE_DATETIME") {
+      return "DATETIME";
+    }
     return {};
   }
   if (node.kind == "CastExpression" && node.children.size() >= 2) {
@@ -2691,7 +2737,9 @@ bool SplitJsonObjectFields(
         current.push_back(body[++i]);
         continue;
       }
-      if (c == quote) { in_string = false; }
+      if (c == quote) {
+        in_string = false;
+      }
       continue;
     }
     if (c == '"' || c == '\'') {
@@ -2700,8 +2748,12 @@ bool SplitJsonObjectFields(
       current.push_back(c);
       continue;
     }
-    if (c == '{' || c == '[') { ++depth; }
-    if (c == '}' || c == ']') { --depth; }
+    if (c == '{' || c == '[') {
+      ++depth;
+    }
+    if (c == '}' || c == ']') {
+      --depth;
+    }
     if (c == ',' && depth == 0) {
       flush();
       current.clear();
@@ -2709,7 +2761,9 @@ bool SplitJsonObjectFields(
     }
     current.push_back(c);
   }
-  if (!current.empty()) { flush(); }
+  if (!current.empty()) {
+    flush();
+  }
   return true;
 }
 
@@ -2757,8 +2811,7 @@ void AlignAnonymousStructFieldNames(
   } else {
     return;
   }
-  const size_t first_candidate =
-      declared != nullptr ? 0 : 1;
+  const size_t first_candidate = declared != nullptr ? 0 : 1;
   for (size_t idx = first_candidate; idx < elements->size(); ++idx) {
     const std::string text = encoded_struct((*elements)[idx]);
     if (text.empty()) {
@@ -2828,11 +2881,11 @@ Expression VisitExpression(
       base = 16;
       digits.remove_prefix(2);
     }
-    const auto [end, error] =
-        std::from_chars(digits.data(), digits.data() + digits.size(),
-                        magnitude, base);
+    const auto [end, error] = std::from_chars(
+        digits.data(), digits.data() + digits.size(), magnitude, base);
     if (error == std::errc() && end == digits.data() + digits.size() &&
-        magnitude > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        magnitude >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
       parsed = parsed.WithUnsigned();
     }
     return ConstantValueExp(std::move(parsed));
@@ -2945,7 +2998,8 @@ Expression VisitExpression(
       }
       if (IsArrayTypeNode(child->kind)) {
         for (const auto& nested : child->children) {
-          for (const GoogleSqlAstNode* field : nested->Children("StructField")) {
+          for (const GoogleSqlAstNode* field :
+               nested->Children("StructField")) {
             if (const GoogleSqlAstNode* id = field->Child("Identifier")) {
               struct_field_names.push_back(Identifier(*id));
             }
@@ -2978,7 +3032,9 @@ Expression VisitExpression(
             child->detail == "modifier=ARRAY") {
           if (const GoogleSqlAstNode* inner_query = child->Child("Query")) {
             element_type = InferSubqueryArrayElementType(*inner_query);
-            if (!element_type.empty()) { break; }
+            if (!element_type.empty()) {
+              break;
+            }
           }
         }
         element_type = InferArrayElementSqlType(*child);
@@ -3000,10 +3056,11 @@ Expression VisitExpression(
         array_query->SetArrayResult(true);
         array_query->SetArrayElementSqlType(element_type);
         return Expression(array_query);
-      }    }
-    AlignAnonymousStructFieldNames(
-        &elements,
-        struct_field_names.size() >= 2 ? &struct_field_names : nullptr);
+      }
+    }
+    AlignAnonymousStructFieldNames(&elements, struct_field_names.size() >= 2
+                                                  ? &struct_field_names
+                                                  : nullptr);
     return ArrayExpressionExp(std::move(elements), std::move(element_type));
   }
   // `a << b` / `a >> b`: the dump interleaves a Location node between the
@@ -3080,8 +3137,11 @@ Expression VisitExpression(
     if (node.detail == "&" || node.detail == "|" || node.detail == "^" ||
         node.detail == "<<" || node.detail == ">>") {
       static const std::unordered_map<std::string, std::string> kBitFns = {
-          {"&", "__bit_and"}, {"|", "__bit_or"}, {"^", "__bit_xor"},
-          {"<<", "__shift_left"}, {">>", "__shift_right"}};
+          {"&", "__bit_and"},
+          {"|", "__bit_or"},
+          {"^", "__bit_xor"},
+          {"<<", "__shift_left"},
+          {">>", "__shift_right"}};
       const std::string fn = kBitFns.at(std::string(node.detail));
       return FunctionCallExp(
           fn, {std::move(left), VisitExpression(*node.children[1])});
@@ -3242,10 +3302,9 @@ Expression VisitExpression(
       throw std::runtime_error("GoogleSQL AST: malformed shift expression");
     }
     const bool left_shift = node.detail == "<<";
-    return FunctionCallExp(
-        left_shift ? "__shift_left" : "__shift_right",
-        {VisitExpression(*node.children[0]),
-         VisitExpression(*node.children[2])});
+    return FunctionCallExp(left_shift ? "__shift_left" : "__shift_right",
+                           {VisitExpression(*node.children[0]),
+                            VisitExpression(*node.children[2])});
   }
 
   if (node.kind == "DotStar") {
@@ -3539,7 +3598,9 @@ Expression VisitExpression(
           magnitude >
               static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         std::string target = SqlTypeFromAst(*node.children[1]);
-        if (target.empty()) { target = "INT64"; }
+        if (target.empty()) {
+          target = "INT64";
+        }
         // Keep UINT64 literals above INT64_MAX in the engine's signed
         // bit-pattern representation.  The cast expression and result
         // formatter already interpret this representation as UINT64; only
@@ -3549,9 +3610,11 @@ Expression VisitExpression(
           return ConstantValueExp(
               Value(static_cast<int64_t>(magnitude)).WithUnsigned());
         }
-        if (safe_cast_target) { return ConstantValueExp(Value()); }
-        throw std::runtime_error(UpperCopy(target) + " out of range: " +
-                                 digits);
+        if (safe_cast_target) {
+          return ConstantValueExp(Value());
+        }
+        throw std::runtime_error(UpperCopy(target) +
+                                 " out of range: " + digits);
       }
     }
     // BYTES -> STRING must carry valid UTF-8; GoogleSQL raises on invalid
@@ -3563,7 +3626,9 @@ Expression VisitExpression(
           IsBytesAstNode(*node.children[0])) {
         const std::string bytes = DecodeBytes(*node.children[0]);
         if (!IsValidUtf8Text(bytes)) {
-          if (safe_cast_target) { return ConstantValueExp(Value()); }
+          if (safe_cast_target) {
+            return ConstantValueExp(Value());
+          }
           throw std::runtime_error(
               "Cannot cast bytes with invalid UTF-8 to STRING");
         }
@@ -3595,7 +3660,9 @@ Expression VisitExpression(
         node.children[0]->detail == "-") {
       const GoogleSqlAstNode* literal = node.children[0]->Child("IntLiteral");
       if (literal != nullptr && literal->detail != "0") {
-        if (safe_cast_target) { return ConstantValueExp(Value()); }
+        if (safe_cast_target) {
+          return ConstantValueExp(Value());
+        }
         throw std::runtime_error("UINT64 out of range: -" + literal->detail);
       }
     }
@@ -3608,9 +3675,8 @@ Expression VisitExpression(
     // engine's INT64 boolean encoding would lose that distinction.
     if ((upper_type == "STRING" || upper_type == "VARCHAR") &&
         node.children[0]->kind == "BooleanLiteral") {
-      return ConstantValueExp(
-          Value(UpperCopy(node.children[0]->detail) == "TRUE" ? "true"
-                                                              : "false"));
+      return ConstantValueExp(Value(
+          UpperCopy(node.children[0]->detail) == "TRUE" ? "true" : "false"));
     }
 
     // Reading an integer back out of an enum-valued string is handled at
@@ -3764,27 +3830,51 @@ Expression VisitExpression(
     }
     std::string json_out = "{";
     bool first = true;
+    // JSON string escaping shared by field names and string values: an
+    // unescaped quote or backslash inside a value (e.g. STRUCT('a"b')) made
+    // the folded struct JSON unparseable.
+    const auto escape_json = [](const std::string& text) {
+      std::string escaped;
+      escaped.reserve(text.size());
+      for (char c : text) {
+        switch (c) {
+          case '"':
+            escaped += "\\\"";
+            break;
+          case '\\':
+            escaped += "\\\\";
+            break;
+          case '\n':
+            escaped += "\\n";
+            break;
+          case '\r':
+            escaped += "\\r";
+            break;
+          case '\t':
+            escaped += "\\t";
+            break;
+          default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+              char buf[8];
+              snprintf(buf, sizeof(buf), "\\u%04x",
+                       static_cast<unsigned char>(c));
+              escaped += buf;
+            } else {
+              escaped.push_back(c);
+            }
+            break;
+        }
+      }
+      return escaped;
+    };
     for (auto& field : fields) {
       if (!first) {
         json_out += ",";
       }
       first = false;
-      std::string escaped_fname;
-      for (char c : field.name) {
-        if (c == '"') {
-          escaped_fname += "\\\"";
-        } else if (c == '\\') {
-          escaped_fname += "\\\\";
-        } else if (static_cast<unsigned char>(c) < 0x20) {
-          char buf[8];
-          snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-          escaped_fname += buf;
-        } else {
-          escaped_fname.push_back(c);
-        }
-      }
-      json_out += "\"" + escaped_fname + "\":";
-      json_out += field.is_string ? "\"" + field.text + "\"" : field.text;
+      json_out += "\"" + escape_json(field.name) + "\":";
+      json_out +=
+          field.is_string ? "\"" + escape_json(field.text) + "\"" : field.text;
     }
     json_out += "}";
     return ConstantValueExp(Value(std::move(json_out)));
@@ -4120,8 +4210,8 @@ SelectSource ExpandPivotSource(SelectSource base,
     for (const NamedExpression& named : base.query->SelectList()) {
       if (named.name != pivot_col_name &&
           !agg_column_names.contains(named.name)) {
-        projections.push_back(
-            NamedExpression(named.name, ColumnValueExp(ColumnName(named.name))));
+        projections.push_back(NamedExpression(
+            named.name, ColumnValueExp(ColumnName(named.name))));
         group_by_exprs.push_back(ColumnValueExp(ColumnName(named.name)));
       }
     }
@@ -4166,9 +4256,9 @@ SelectSource ExpandPivotSource(SelectSource base,
         col_name = agg.agg_alias + "_" + val_alias;
       }
 
-      Expression condition = BinaryExpressionExp(
-          ColumnValueExp(ColumnName(pivot_col_name)),
-          BinaryOperation::kEquals, val_expr);
+      Expression condition =
+          BinaryExpressionExp(ColumnValueExp(ColumnName(pivot_col_name)),
+                              BinaryOperation::kEquals, val_expr);
       Expression inner_arg;
       if (agg.arg_node && agg.arg_node->kind != "Star") {
         inner_arg = VisitExpression(*agg.arg_node);
@@ -4177,8 +4267,8 @@ SelectSource ExpandPivotSource(SelectSource base,
       }
       std::vector<std::pair<Expression, Expression>> when_clauses;
       when_clauses.emplace_back(std::move(condition), std::move(inner_arg));
-      Expression case_expr = CaseExpressionExp(std::move(when_clauses),
-                                               ConstantValueExp(Value()));
+      Expression case_expr =
+          CaseExpressionExp(std::move(when_clauses), ConstantValueExp(Value()));
 
       const std::string lower_fn = Lower(agg.func_name);
       AggregationType agg_type = AggregationType::kSum;
@@ -4248,7 +4338,8 @@ SelectSource ExpandUnpivotSource(const SelectSource& base,
     if (in_expr_list == nullptr || in_expr_list->children.empty()) continue;
     std::string in_col_name = Path(*in_expr_list->children[0]);
     std::string in_label = in_col_name;
-    if (const GoogleSqlAstNode* label_node = item->Child("UnpivotInItemLabel")) {
+    if (const GoogleSqlAstNode* label_node =
+            item->Child("UnpivotInItemLabel")) {
       if (const GoogleSqlAstNode* str_node =
               label_node->Child("StringLiteral")) {
         for (const auto& c : str_node->children) {
@@ -4271,8 +4362,8 @@ SelectSource ExpandUnpivotSource(const SelectSource& base,
         NamedExpression("", ColumnValueExp(ColumnName("*"))));
     branch_select.push_back(
         NamedExpression(val_col_name, ColumnValueExp(ColumnName(in_col_name))));
-    branch_select.push_back(
-        NamedExpression(name_col_name, ConstantValueExp(Value(std::string(in_label)))));
+    branch_select.push_back(NamedExpression(
+        name_col_name, ConstantValueExp(Value(std::string(in_label)))));
 
     auto branch = std::make_shared<SelectStatement>();
     branch->SetSelectList(std::move(branch_select));
@@ -4415,8 +4506,7 @@ SelectSource VisitTableSource(
       SelectSource view_source;
       try {
         view_source.query = VisitQuery(*found_view->second);
-        view_source.alias =
-            source.alias.empty() ? Lower(dotted) : source.alias;
+        view_source.alias = source.alias.empty() ? Lower(dotted) : source.alias;
       } catch (...) {
         --ViewExpansionDepth();
         throw;
@@ -4430,9 +4520,17 @@ SelectSource VisitTableSource(
       throw std::runtime_error("GoogleSQL AST: table subquery missing query");
     }
     source.query = VisitQuery(*query);
+    // The ZetaSQL parse dump has no structural marker for LATERAL (it only
+    // emits a Location node for the comma), so detection relies on the byte
+    // distance between the TableSubquery start and the inner Query start:
+    // "(LATERAL (SELECT..." measures 9 bytes minimum, while a plain
+    // parenthesized subquery measures 1 byte plus whitespace.  The old
+    // threshold of 7 also matched 7-8 byte gaps, which only whitespace can
+    // produce ("(      (SELECT..."), so such queries were silently treated
+    // as correlated laterals.
     if (node.detail.find("lateral") != std::string::npos ||
         node.detail.find("LATERAL") != std::string::npos ||
-        (query->start > node.start && (query->start - node.start) >= 7)) {
+        (query->start > node.start && (query->start - node.start) >= 9)) {
       source.is_lateral = true;
     } else if (source.query) {
       std::unordered_set<std::string> local_tables;
@@ -4658,21 +4756,66 @@ std::shared_ptr<SelectStatement> VisitQuery(
         // statement tree, but query-level LIMIT/OFFSET and WITH clauses hang
         // off the wrapper.  Preserve them here so execution sees the same
         // scope and applies bounds after concatenating the branches.
-        if (const GoogleSqlAstNode* limit_offset =
-                query.Child("LimitOffset")) {
+        if (const GoogleSqlAstNode* limit_offset = query.Child("LimitOffset")) {
           if (const GoogleSqlAstNode* limit_node =
                   limit_offset->Child("Limit")) {
             for (const auto& child : limit_node->children) {
+              if (child->kind == "Location" || child->kind == "Hint") {
+                continue;
+              }
               if (child->kind == "IntLiteral") {
                 first_stmt->SetLimit(
                     static_cast<size_t>(ParseUnsignedLiteral(*child)));
                 break;
               }
+              try {
+                const Expression folded = VisitExpression(*child);
+                if (folded && folded->Type() == TypeTag::kConstantValue) {
+                  const Value constant = folded->AsConstantValue().GetValue();
+                  if (constant.type == ValueType::kInt64 &&
+                      !constant.IsNull() && constant.value.int_value >= 0) {
+                    first_stmt->SetLimit(
+                        static_cast<size_t>(constant.value.int_value));
+                    break;
+                  }
+                }
+              } catch (...) {
+              }
+              throw std::runtime_error(
+                  "LIMIT requires an integer literal in this engine");
             }
           }
           for (const auto& child : limit_offset->children) {
+            if (child->kind == "Limit" || child->kind == "Location" ||
+                child->kind == "Hint" || child->kind == "WithTies" ||
+                child->kind == "Offset") {
+              if (child->kind == "Offset") {
+                for (const auto& sub : child->children) {
+                  if (sub->kind == "IntLiteral") {
+                    first_stmt->SetOffset(ParseUnsignedLiteral(*sub));
+                  }
+                }
+              }
+              continue;
+            }
             if (child->kind == "IntLiteral") {
               first_stmt->SetOffset(ParseUnsignedLiteral(*child));
+            } else {
+              try {
+                const Expression folded = VisitExpression(*child);
+                if (folded && folded->Type() == TypeTag::kConstantValue) {
+                  const Value constant = folded->AsConstantValue().GetValue();
+                  if (constant.type == ValueType::kInt64 &&
+                      !constant.IsNull() && constant.value.int_value >= 0) {
+                    first_stmt->SetOffset(
+                        static_cast<size_t>(constant.value.int_value));
+                    continue;
+                  }
+                }
+              } catch (...) {
+              }
+              throw std::runtime_error(
+                  "OFFSET requires an integer literal in this engine");
             }
           }
         }
@@ -4704,8 +4847,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
             }
             const std::string cte_name = Identifier(*name);
             if (recursive) {
-              first_stmt->AddRecursiveWithQuery(cte_name,
-                                                VisitQuery(*nested));
+              first_stmt->AddRecursiveWithQuery(cte_name, VisitQuery(*nested));
             } else {
               first_stmt->AddWithQuery(cte_name, VisitQuery(*nested));
             }
@@ -4839,10 +4981,9 @@ std::shared_ptr<SelectStatement> VisitQuery(
       Expression base = VisitExpression(*call);
       for (const char* field : {"aarr", "acount", "amin", "amax"}) {
         projections.emplace_back(
-            field,
-            FunctionCallExp(
-                "__get_field_safe",
-                {base, ConstantValueExp(Value(std::string(field)))}));
+            field, FunctionCallExp(
+                       "__get_field_safe",
+                       {base, ConstantValueExp(Value(std::string(field)))}));
         projection_nodes.push_back(expression_node);
       }
       continue;
@@ -4872,17 +5013,14 @@ std::shared_ptr<SelectStatement> VisitQuery(
     projections.front().expression = FunctionCallExp(
         "__value_table_value", {projections.front().expression});
   }
-  if (is_as_struct && projections.size() == 1 &&
-      projection_nodes.size() == 1 &&
+  if (is_as_struct && projections.size() == 1 && projection_nodes.size() == 1 &&
       projection_nodes.front()->kind == "DotStar") {
     const Expression star = projections.front().expression;
-    const ColumnName& star_name =
-        star->AsColumnValue().GetColumnName();
+    const ColumnName& star_name = star->AsColumnValue().GetColumnName();
     projections.clear();
     for (const char* field : {"foo", "bar"}) {
       projections.emplace_back(
-          field,
-          ColumnValueExp(ColumnName(star_name.schema, field)));
+          field, ColumnValueExp(ColumnName(star_name.schema, field)));
     }
   }
   // `SELECT AS Proto p.*` selects the value-table message itself.  It is not
@@ -4901,10 +5039,10 @@ std::shared_ptr<SelectStatement> VisitQuery(
   // SELECT AS <proto>: validate projected fields against the registry so
   // required-field violations and invalid enum values fail at prepare time.
   if (!is_as_struct && !as_value && select_as != nullptr) {
-    if (const GoogleSqlAstNode* as_path =
-            select_as->Child("PathExpression")) {
+    if (const GoogleSqlAstNode* as_path = select_as->Child("PathExpression")) {
       std::vector<std::pair<std::string, const GoogleSqlAstNode*>> named;
-      const size_t count = std::min(projections.size(), projection_nodes.size());
+      const size_t count =
+          std::min(projections.size(), projection_nodes.size());
       named.reserve(count);
       for (size_t i = 0; i < count; ++i) {
         named.emplace_back(projections[i].name, projection_nodes[i]);
@@ -4933,8 +5071,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
           }
           std::string collapsed;
           for (const char c : candidate) {
-            if (c != ' ' ||
-                (!collapsed.empty() && collapsed.back() != ' ')) {
+            if (c != ' ' || (!collapsed.empty() && collapsed.back() != ' ')) {
               collapsed.push_back(c);
             }
           }
@@ -4949,14 +5086,13 @@ std::shared_ptr<SelectStatement> VisitQuery(
       const size_t mode = upper_select_detail.find("AS_MODE=");
       if (mode != std::string::npos) {
         size_t end = mode + 8;
-        while (end < select->detail.size() &&
-               select->detail[end] != ',' && select->detail[end] != ' ') {
+        while (end < select->detail.size() && select->detail[end] != ',' &&
+               select->detail[end] != ' ') {
           ++end;
         }
         type_name = select->detail.substr(mode + 8, end - mode - 8);
-      } else if (UpperCopy(select_as != nullptr
-                               ? select_as->detail
-                               : std::string())
+      } else if (UpperCopy(select_as != nullptr ? select_as->detail
+                                                : std::string())
                      .size() > 5) {
         // SelectAs detail carries the raw target text after "type=".
         const std::string& detail = select_as->detail;
@@ -4974,13 +5110,11 @@ std::shared_ptr<SelectStatement> VisitQuery(
     if (!type_name.empty()) {
       std::vector<Expression> args;
       args.emplace_back(ConstantValueExp(Value(std::string(type_name))));
-      for (size_t i = 0; i < projections.size() &&
-                         i < projection_nodes.size();
+      for (size_t i = 0; i < projections.size() && i < projection_nodes.size();
            ++i) {
-        std::string fname =
-            projections[i].name.empty()
-                ? ("f" + std::to_string(i + 1))
-                : projections[i].name;
+        std::string fname = projections[i].name.empty()
+                                ? ("f" + std::to_string(i + 1))
+                                : projections[i].name;
         const GoogleSqlAstNode& value_node = *projection_nodes[i];
         if (value_node.kind == "BooleanLiteral") {
           const std::string upper_literal = UpperCopy(value_node.detail);
@@ -4994,13 +5128,13 @@ std::shared_ptr<SelectStatement> VisitQuery(
       }
       if (selects_value_table_star) {
         projections = {NamedExpression(
-            "", FunctionCallExp(
-                   "__value_table_proto",
-                   {ConstantValueExp(Value(std::string(type_name))),
-                    projections.front().expression}))};
+            "",
+            FunctionCallExp("__value_table_proto",
+                            {ConstantValueExp(Value(std::string(type_name))),
+                             projections.front().expression}))};
       } else {
-        projections = {NamedExpression("", FunctionCallExp(
-                                             "__proto_new", std::move(args)))};
+        projections = {NamedExpression(
+            "", FunctionCallExp("__proto_new", std::move(args)))};
       }
     }
   }
@@ -5066,34 +5200,96 @@ std::shared_ptr<SelectStatement> VisitQuery(
   auto validate_limit_operand = [](const GoogleSqlAstNode& operand,
                                    std::string_view clause) {
     if (operand.kind == "NullLiteral") {
-      throw std::runtime_error(std::string(clause) +
-                               " must not be NULL");
+      throw std::runtime_error(std::string(clause) + " must not be NULL");
     }
     if (operand.kind == "UnaryExpression" && operand.detail == "-" &&
         !operand.children.empty() &&
         operand.children.front()->kind == "IntLiteral") {
-      throw std::runtime_error(std::string(clause) +
-                               " must be non-negative");
+      throw std::runtime_error(std::string(clause) + " must be non-negative");
     }
+  };
+  // Constant integer operands may arrive wrapped (e.g. LIMIT (cast(1 as
+  // int32)) after parameter substitution, or an Offset wrapper node). Fold
+  // them through the expression evaluator; only truly non-constant operands
+  // (query parameters that survived substitution) fail loudly instead of
+  // silently degrading to unlimited.
+  std::function<std::optional<int64_t>(const GoogleSqlAstNode&)> fold_int =
+      [&](const GoogleSqlAstNode& node) -> std::optional<int64_t> {
+    if (node.kind == "IntLiteral") {
+      return ParseIntLiteral(node);
+    }
+    if (node.kind == "Location" || node.kind == "Hint") {
+      return std::nullopt;
+    }
+    // Wrapper nodes (Offset/Limit/ExpressionList/...): search children.
+    if (node.kind == "Offset" || node.kind == "Limit" ||
+        node.kind == "ExpressionList" || node.kind == "Expression") {
+      for (const auto& sub : node.children) {
+        if (auto found = fold_int(*sub)) {
+          return found;
+        }
+      }
+      return std::nullopt;
+    }
+    try {
+      const Expression folded = VisitExpression(node);
+      if (folded && folded->Type() == TypeTag::kConstantValue) {
+        const Value constant = folded->AsConstantValue().GetValue();
+        if (constant.type == ValueType::kInt64 && !constant.IsNull()) {
+          return constant.value.int_value;
+        }
+      }
+    } catch (...) {
+    }
+    for (const auto& sub : node.children) {
+      if (auto found = fold_int(*sub)) {
+        return found;
+      }
+    }
+    return std::nullopt;
   };
   if (const GoogleSqlAstNode* limit_offset = query.Child("LimitOffset")) {
     if (const GoogleSqlAstNode* limit_node = limit_offset->Child("Limit")) {
       for (const auto& child : limit_node->children) {
-        if (child->kind == "Location" || child->kind == "Hint") { continue; }
+        if (child->kind == "Location" || child->kind == "Hint") {
+          continue;
+        }
         validate_limit_operand(*child, "LIMIT");
         if (child->kind == "IntLiteral") {
           limit = static_cast<size_t>(ParseUnsignedLiteral(*child));
+        } else if (auto folded = fold_int(*child)) {
+          if (*folded < 0) {
+            throw std::runtime_error("LIMIT must be non-negative");
+          }
+          limit = static_cast<size_t>(*folded);
+        } else {
+          // A parameterized LIMIT with no static row count. Silently
+          // treating it as unlimited would return every row; fail loudly.
+          throw std::runtime_error(
+              "LIMIT requires an integer literal in this engine");
         }
       }
     }
     for (const auto& child : limit_offset->children) {
       if (child->kind == "Limit" || child->kind == "Location" ||
-          child->kind == "Hint") {
+          child->kind == "Hint" || child->kind == "WithTies") {
         continue;
       }
       validate_limit_operand(*child, "OFFSET");
       if (child->kind == "IntLiteral") {
         offset = ParseUnsignedLiteral(*child);
+      } else if (auto folded = fold_int(*child)) {
+        if (*folded < 0) {
+          throw std::runtime_error("OFFSET must be non-negative");
+        }
+        offset = static_cast<size_t>(*folded);
+      } else if (child->kind == "Offset") {
+        // Empty OFFSET wrapper (no numeric child): plain LIMIT without
+        // OFFSET. Older code ignored it; keep ignoring instead of failing.
+        continue;
+      } else {
+        throw std::runtime_error(
+            "OFFSET requires an integer literal in this engine");
       }
     }
   }
@@ -5150,9 +5346,8 @@ std::shared_ptr<SelectStatement> VisitQuery(
   }
 
   if (const GoogleSqlAstNode* group = select->Child("GroupBy")) {
-    const bool is_group_by_all =
-        group->Child("GroupByAll") != nullptr ||
-        group->detail.find("ALL") != std::string::npos;
+    const bool is_group_by_all = group->Child("GroupByAll") != nullptr ||
+                                 group->detail.find("ALL") != std::string::npos;
     if (is_group_by_all) {
       std::vector<Expression> expressions;
       for (const NamedExpression& named : statement->SelectList()) {
@@ -5227,8 +5422,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
                   spec.column = Identifier(*column);
                 }
               }
-              const auto bounds =
-                  depth_modifier->Children("IntOrUnbounded");
+              const auto bounds = depth_modifier->Children("IntOrUnbounded");
               auto bound_value = [&](size_t index, int64_t fallback) {
                 if (index >= bounds.size()) {
                   return fallback;
@@ -5241,8 +5435,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
                 return fallback;
               };
               spec.lower = bound_value(0, 0);
-              spec.upper =
-                  bound_value(1, std::numeric_limits<int64_t>::max());
+              spec.upper = bound_value(1, std::numeric_limits<int64_t>::max());
               statement->SetRecursiveDepth(cte_name, std::move(spec));
             }
           }
@@ -5260,10 +5453,8 @@ std::shared_ptr<SelectStatement> VisitQuery(
   for (const SelectSource& source : statement->Sources()) {
     if (source.query || source.join_type == JoinType::kLeft ||
         source.join_type == JoinType::kRight ||
-        source.join_type == JoinType::kFull ||
-        source.from_nested_join ||
-        source.unnest ||
-        !source.using_columns.empty() ||
+        source.join_type == JoinType::kFull || source.from_nested_join ||
+        source.unnest || !source.using_columns.empty() ||
         NeedsRelationalEvaluation(source.join_condition)) {
       statement->MarkComplex();
     }
@@ -5509,35 +5700,32 @@ std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
   // Extracts "WHERE <expr>" plus an optional ASSERT_ROWS_MODIFIED from a
   // nested DELETE/UPDATE statement node; remaining children are ignored
   // because nested targets are columns, not relations (no alias/RETURNING).
-  auto parse_nested_tail =
-      [](const GoogleSqlAstNode& node, Expression* predicate,
-         int64_t* assert_rows) {
-        std::vector<const GoogleSqlAstNode*> candidates;
-        for (const auto& child : node.children) {
-          if (child->kind == "PathExpression" ||
-              child->kind == "UpdateItemList" ||
-              child->kind == "Location" || child->kind == "Hint" ||
-              child->kind == "AssertRowsModified") {
-            continue;
-          }
-          if (child->kind == "Alias" || child->kind == "ReturningClause" ||
-              child->kind == "FromClause") {
-            continue;
-          }
-          candidates.push_back(child.get());
-        }
-        if (candidates.size() > 1) {
-          throw std::runtime_error(
-              "GoogleSQL AST: multiple nested WHERE clause candidates");
-        }
-        if (!candidates.empty()) {
-          *predicate = VisitExpression(*candidates.front());
-        }
-        if (const GoogleSqlAstNode* assert =
-                node.Child("AssertRowsModified")) {
-          *assert_rows = AssertRowsModifiedValue(*assert);
-        }
-      };
+  auto parse_nested_tail = [](const GoogleSqlAstNode& node,
+                              Expression* predicate, int64_t* assert_rows) {
+    std::vector<const GoogleSqlAstNode*> candidates;
+    for (const auto& child : node.children) {
+      if (child->kind == "PathExpression" || child->kind == "UpdateItemList" ||
+          child->kind == "Location" || child->kind == "Hint" ||
+          child->kind == "AssertRowsModified") {
+        continue;
+      }
+      if (child->kind == "Alias" || child->kind == "ReturningClause" ||
+          child->kind == "FromClause") {
+        continue;
+      }
+      candidates.push_back(child.get());
+    }
+    if (candidates.size() > 1) {
+      throw std::runtime_error(
+          "GoogleSQL AST: multiple nested WHERE clause candidates");
+    }
+    if (!candidates.empty()) {
+      *predicate = VisitExpression(*candidates.front());
+    }
+    if (const GoogleSqlAstNode* assert = node.Child("AssertRowsModified")) {
+      *assert_rows = AssertRowsModifiedValue(*assert);
+    }
+  };
   for (const GoogleSqlAstNode* item : items->Children("UpdateItem")) {
     const GoogleSqlAstNode* set = item->Child("UpdateSetValue");
     if (set != nullptr && set->children.size() == 2) {
@@ -5562,18 +5750,15 @@ std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
     }
     if (const GoogleSqlAstNode* nested = item->Child("UpdateStatement")) {
       const GoogleSqlAstNode* target = nested->Child("PathExpression");
-      const GoogleSqlAstNode* inner_items =
-          nested->Child("UpdateItemList");
+      const GoogleSqlAstNode* inner_items = nested->Child("UpdateItemList");
       if (target == nullptr || inner_items == nullptr ||
           inner_items->Children("UpdateItem").size() != 1) {
-        throw std::runtime_error(
-            "GoogleSQL AST: bad nested UPDATE assignment");
+        throw std::runtime_error("GoogleSQL AST: bad nested UPDATE assignment");
       }
       const GoogleSqlAstNode* inner_set =
           inner_items->Children("UpdateItem").front()->Child("UpdateSetValue");
       if (inner_set == nullptr || inner_set->children.size() != 2) {
-        throw std::runtime_error(
-            "GoogleSQL AST: bad nested UPDATE assignment");
+        throw std::runtime_error("GoogleSQL AST: bad nested UPDATE assignment");
       }
       NestedDmlItem parsed;
       parsed.kind = NestedDmlItem::Kind::kUpdate;
@@ -5714,11 +5899,17 @@ std::string ConstructorTypeFullName(const GoogleSqlAstNode& node) {
 }
 
 bool FieldNameEquals(const std::string& left, const std::string& right) {
-  if (left.size() != right.size()) { return false; }
+  if (left.size() != right.size()) {
+    return false;
+  }
   for (size_t i = 0; i < left.size(); ++i) {
-    const char lc = static_cast<char>(std::tolower(static_cast<unsigned char>(left[i])));
-    const char rc = static_cast<char>(std::tolower(static_cast<unsigned char>(right[i])));
-    if (lc != rc) { return false; }
+    const char lc =
+        static_cast<char>(std::tolower(static_cast<unsigned char>(left[i])));
+    const char rc =
+        static_cast<char>(std::tolower(static_cast<unsigned char>(right[i])));
+    if (lc != rc) {
+      return false;
+    }
   }
   return true;
 }
@@ -5726,7 +5917,9 @@ bool FieldNameEquals(const std::string& left, const std::string& right) {
 const ProtoFieldSchema* FindProtoField(
     const std::vector<ProtoFieldSchema>& fields, const std::string& name) {
   for (const ProtoFieldSchema& field : fields) {
-    if (FieldNameEquals(field.name, name)) { return &field; }
+    if (FieldNameEquals(field.name, name)) {
+      return &field;
+    }
   }
   return nullptr;
 }
@@ -5737,11 +5930,12 @@ void ValidateEnumLiteralValue(const std::string& message_name,
                               const std::string& enum_type_name,
                               const GoogleSqlAstNode& expr) {
   const std::string enum_short_name(ShortTypeName(enum_type_name));
-  if (!IsKnownEnum(enum_short_name)) { return; }
+  if (!IsKnownEnum(enum_short_name)) {
+    return;
+  }
   auto reject = [&](const std::string& message) {
     throw std::runtime_error("Could not store value into proto field " +
-                             message_name + "." + field_name + ": " +
-                             message);
+                             message_name + "." + field_name + ": " + message);
   };
   if (expr.kind == "StringLiteral") {
     const std::string value = DecodeString(expr);
@@ -5755,9 +5949,8 @@ void ValidateEnumLiteralValue(const std::string& message_name,
   if (expr.kind == "IntLiteral") {
     const std::string& digits = expr.detail;
     uint64_t magnitude = 0;
-    if (std::from_chars(digits.data(), digits.data() + digits.size(),
-                        magnitude)
-            .ec != std::errc() ||
+    if (std::from_chars(digits.data(), digits.data() + digits.size(), magnitude)
+                .ec != std::errc() ||
         magnitude > static_cast<uint64_t>(2147483647LL)) {
       reject("Out of range cast of integer " + digits + " to enum type " +
              enum_short_name);
@@ -5831,9 +6024,9 @@ void RequireProtoFieldsPresent(const std::string& message_name,
         }
       }
       if (!found) {
-        throw std::runtime_error(
-            "Required protocol message field " + message_name + "." +
-            field.name + " is not assigned");
+        throw std::runtime_error("Required protocol message field " +
+                                 message_name + "." + field.name +
+                                 " is not assigned");
       }
     }
   }
@@ -5859,8 +6052,7 @@ Expression BuildNewConstructor(const GoogleSqlAstNode& node) {
     if (fields != nullptr) {
       const ProtoFieldSchema* field = FindProtoField(*fields, field_name);
       if (field != nullptr) {
-        ValidateProtoFieldAssignment(message_name, *field,
-                                     *child->children[0]);
+        ValidateProtoFieldAssignment(message_name, *field, *child->children[0]);
       }
     }
   }
@@ -5911,9 +6103,9 @@ Expression BuildNewConstructor(const GoogleSqlAstNode& node) {
     }
     if (value_node.kind == "BooleanLiteral") {
       const std::string upper_literal = UpperCopy(value_node.detail);
-      args.emplace_back(ConstantValueExp(
-          Value(upper_literal == "TRUE" ? std::string("true")
-                                        : std::string("false"))));
+      args.emplace_back(ConstantValueExp(Value(upper_literal == "TRUE"
+                                                   ? std::string("true")
+                                                   : std::string("false"))));
     } else {
       args.push_back(VisitExpression(value_node));
     }
@@ -5928,18 +6120,24 @@ void ValidateSelectAsProjections(
     std::vector<NamedExpression>* projections) {
   const std::vector<ProtoFieldSchema>* fields =
       FindProtoMessageFields(message_name);
-  if (fields == nullptr) { return; }
+  if (fields == nullptr) {
+    return;
+  }
   std::set<std::string> assigned;
   for (const auto& [name, expression_node] : named) {
     assigned.insert(name);
     const ProtoFieldSchema* field = FindProtoField(*fields, name);
-    if (field == nullptr) { continue; }
+    if (field == nullptr) {
+      continue;
+    }
     ValidateProtoFieldAssignment(message_name, *field, *expression_node);
   }
   RequireProtoFieldsPresent(message_name, *fields, assigned);
   for (size_t i = 0; i < named.size(); ++i) {
     const ProtoFieldSchema* field = FindProtoField(*fields, named[i].first);
-    if (field == nullptr) { continue; }
+    if (field == nullptr) {
+      continue;
+    }
     if (named[i].second->kind == "NullLiteral" ||
         named[i].second->kind == "StringLiteral" ||
         named[i].second->kind == "IntLiteral") {
@@ -5948,9 +6146,10 @@ void ValidateSelectAsProjections(
     if (field->is_enum && !field->repeated) {
       (*projections)[i] = NamedExpression(
           (*projections)[i].name,
-          FunctionCallExp("$proto_enum_guard",
-                          {VisitExpression(*named[i].second),
-                           ConstantValueExp(Value(std::string(field->type_name)))}));
+          FunctionCallExp(
+              "$proto_enum_guard",
+              {VisitExpression(*named[i].second),
+               ConstantValueExp(Value(std::string(field->type_name)))}));
     }
   }
 }
@@ -5967,7 +6166,9 @@ std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
   // Only the outermost Visit installs the source; recursive Visit calls
   // pass an empty view and keep the outer scope alive.
   std::optional<VisitSourceScope> scope;
-  if (!source_storage.empty()) { scope.emplace(source_storage); }
+  if (!source_storage.empty()) {
+    scope.emplace(source_storage);
+  }
   // Hints for other engines (qualified "engine.name") are ignored; an
   // unqualified hint is only meaningful when the engine knows it, and this
   // engine implements none: GoogleSQL rejects unknown default-engine hints
@@ -5975,7 +6176,9 @@ std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
   RejectUnsupportedHints(root);
   if (root.kind == "HintedStatement") {
     for (const auto& child : root.children) {
-      if (child->kind == "Hint" || child->kind == "Location") { continue; }
+      if (child->kind == "Hint" || child->kind == "Location") {
+        continue;
+      }
       return Visit(*child);
     }
     throw std::runtime_error("GoogleSQL AST: hinted statement without body");

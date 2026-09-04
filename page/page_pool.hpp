@@ -135,8 +135,6 @@ class PagePool {
     std::mutex mu;
   };
 
-  void Unpin(page_id_t page_id);
-
   // Decrement pin_count once; log instead of wrapping on underflow.
   static void ReleasePin(Entry& entry, page_id_t page_id);
 

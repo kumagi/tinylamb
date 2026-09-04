@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -30,23 +31,13 @@
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
-#include "executor/constant_executor.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/window_eval.hpp"
-#include "executor/detail/subquery_runtime.hpp"
 #include "executor/executor_base.hpp"
-#include "executor/insert.hpp"
 #include "expression/window_function_expression.hpp"
 #include "gtest/gtest.h"
-#include "parser/parser.hpp"
-#include "parser/token.hpp"
-#include "parser/tokenizer.hpp"
-#include "plan/index_only_scan_plan.hpp"
-#include "plan/index_scan_plan.hpp"
-#include "plan/optimizer.hpp"
-#include "plan/plan.hpp"
+#include "index/index_schema.hpp"
 #include "query/plan_cache.hpp"
-#include "query/query_data.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
 #include "table/table_statistics.hpp"
@@ -64,161 +55,11 @@ class QueryTest : public ::testing::Test {
     db_ = std::make_unique<Database>(prefix_);
   }
 
-  StatusOr<Executor> Execute(TransactionContext& ctx,
-                             std::unique_ptr<Statement> stmt) const {
-    switch (stmt->Type()) {
-      case StatementType::kCreateTable: {
-        auto& create_table = dynamic_cast<CreateTableStatement&>(*stmt);
-        ASSIGN_OR_RETURN(Table, table,
-                         db_->CreateTable(ctx, Schema(create_table.TableName(),
-                                                      create_table.Columns())));
-        return {std::make_shared<ConstantExecutor>(
-            Row({Value(0), Value("CREATE TABLE")}))};
-      }
-      case StatementType::kInsert: {
-        auto& insert = dynamic_cast<InsertStatement&>(*stmt);
-        ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
-                         ctx.GetTable(insert.TableName()));
-        if (insert.Values().size() == 1) {
-          std::vector<Value> vals;
-          for (const auto& expr : insert.Values()[0]) {
-            vals.emplace_back(expr->Evaluate(Row(), Schema()));
-          }
-          Row row(std::move(vals));
-          return {std::make_shared<Insert>(
-              ctx.txn_, table.get(), std::make_shared<ConstantExecutor>(row))};
-        }
-        return Status::kNotImplemented;
-      }
-      case StatementType::kSelect: {
-        auto& select = dynamic_cast<SelectStatement&>(*stmt);
-        // The legacy QueryData adapter predates CTE and set-operation
-        // metadata.  Route those statements through the canonical relational
-        // executor instead of silently executing only the first UNION branch.
-        if (!select.UnionAll().empty() || !select.WithQueries().empty()) {
-          relational_detail::Relation relation =
-              relational_detail::ExecuteQuery(ctx, select, nullptr, {});
-          std::vector<Row> rows;
-          relation.ForEachRow(
-              [&rows](const Row& row) { rows.push_back(row); });
-          return {std::make_shared<ConstantExecutor>(std::move(rows))};
-        }
-        QueryData query;
-        query.from_ = select.FromClause();
-        query.where_ = select.WhereClause();
-        query.select_ = select.SelectList();
-        for (const SelectStatement::OrderByTerm& term : select.OrderBy()) {
-          query.order_expressions_.push_back(term.expression);
-          query.order_ascending_.push_back(term.ascending);
-          query.order_nulls_first_.push_back(term.nulls_first);
-        }
-        query.limit_count_ = select.HasLimit() ? select.Limit() : 0;
-        query.limit_offset_ = select.Offset();
-        query.distinct_ = select.Distinct();
-        ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-        return plan->EmitExecutor(ctx);
-      }
-      default:
-        return Status::kNotImplemented;
-    }
-  }
-
-  StatusOr<Executor> ExecuteQuery(TransactionContext& ctx,
-                                  const std::string& sql) const {
-    Tokenizer tokenizer(sql);
-    std::vector<Token> tokens = tokenizer.Tokenize();
-    Parser parser(tokens);
-    return Execute(ctx, parser.Parse());
-  }
-
   void TearDown() override { db_->DeleteAll(); }
 
   std::string prefix_;
   std::unique_ptr<Database> db_;
 };
-
-TEST_F(QueryTest, SimpleSelect) {
-  // Arrange
-  TransactionContext ctx = db_->BeginContext();
-  Row result;
-
-  // Act + Assert: CREATE TABLE t1
-  auto st_create =
-      ExecuteQuery(ctx, "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
-  ASSERT_EQ(st_create.GetStatus(), Status::kSuccess);
-  auto exec_create = std::move(st_create.Value());
-  ASSERT_TRUE(exec_create->Next(&result, nullptr));
-
-  // Act + Assert: INSERT (1, 10, 'hello')
-  auto st_insert1 =
-      ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
-  ASSERT_EQ(st_insert1.GetStatus(), Status::kSuccess);
-  auto exec_insert1 = std::move(st_insert1.Value());
-  ASSERT_TRUE(exec_insert1->Next(&result, nullptr));
-  ASSERT_EQ(result[1], Value(1));
-  ASSERT_FALSE(exec_insert1->Next(&result, nullptr));
-
-  // Act + Assert: INSERT (2, 20, 'world')
-  auto st_insert2 =
-      ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
-  ASSERT_EQ(st_insert2.GetStatus(), Status::kSuccess);
-  auto exec_insert2 = std::move(st_insert2.Value());
-  ASSERT_TRUE(exec_insert2->Next(&result, nullptr));
-  ASSERT_EQ(result[1], Value(1));
-  ASSERT_FALSE(exec_insert2->Next(&result, nullptr));
-
-  // Act + Assert: SELECT * FROM t1 WHERE c1 = 1
-  auto st_select = ExecuteQuery(ctx, "SELECT * FROM t1 WHERE c1 = 1;");
-  ASSERT_EQ(st_select.GetStatus(), Status::kSuccess);
-  auto exec_select = std::move(st_select.Value());
-  ASSERT_TRUE(exec_select->Next(&result, nullptr));
-  ASSERT_EQ(result[0], Value(1));
-  ASSERT_EQ(result[1], Value(10));
-  ASSERT_EQ(result[2], Value("hello"));
-  ASSERT_FALSE(exec_select->Next(&result, nullptr));
-
-  // Act + Assert: PreCommit
-  ASSERT_SUCCESS(ctx.txn_.PreCommit());
-}
-
-TEST_F(QueryTest, SelectWithProjection) {
-  // Arrange
-  TransactionContext ctx = db_->BeginContext();
-  Row result;
-
-  // Act + Assert: CREATE TABLE t1
-  auto st_create =
-      ExecuteQuery(ctx, "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
-  ASSERT_EQ(st_create.GetStatus(), Status::kSuccess);
-
-  // Act + Assert: INSERT (1, 10, 'hello')
-  auto st_insert1 =
-      ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
-  ASSERT_EQ(st_insert1.GetStatus(), Status::kSuccess);
-  auto exec_insert1 = std::move(st_insert1.Value());
-  ASSERT_TRUE(exec_insert1->Next(&result, nullptr));
-  ASSERT_FALSE(exec_insert1->Next(&result, nullptr));
-
-  // Act + Assert: INSERT (2, 20, 'world')
-  auto st_insert2 =
-      ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
-  ASSERT_EQ(st_insert2.GetStatus(), Status::kSuccess);
-  auto exec_insert2 = std::move(st_insert2.Value());
-  ASSERT_TRUE(exec_insert2->Next(&result, nullptr));
-  ASSERT_FALSE(exec_insert2->Next(&result, nullptr));
-
-  // Act + Assert: SELECT c1, c3 FROM t1 WHERE c1 = 2
-  auto st_select = ExecuteQuery(ctx, "SELECT c1, c3 FROM t1 WHERE c1 = 2;");
-  ASSERT_EQ(st_select.GetStatus(), Status::kSuccess);
-  auto exec_select = std::move(st_select.Value());
-  ASSERT_TRUE(exec_select->Next(&result, nullptr));
-  ASSERT_EQ(result[0], Value(2));
-  ASSERT_EQ(result[1], Value("world"));
-  ASSERT_FALSE(exec_select->Next(&result, nullptr));
-
-  // Act + Assert: PreCommit
-  ASSERT_SUCCESS(ctx.txn_.PreCommit());
-}
 
 namespace {
 std::vector<Row> RunSql(TransactionContext& ctx, Database& db,
@@ -238,6 +79,54 @@ std::vector<Row> RunSql(TransactionContext& ctx, Database& db,
   return rows;
 }
 }  // namespace
+
+TEST_F(QueryTest, SimpleSelect) {
+  // Arrange
+  TransactionContext ctx = db_->BeginContext();
+
+  // Act + Assert: CREATE TABLE t1
+  RunSql(ctx, *db_, "CREATE TABLE t1 (c1 INT64, c2 INT64, c3 VARCHAR(10));");
+
+  // Act + Assert: INSERT (1, 10, 'hello') and (2, 20, 'world'), one row each
+  std::vector<Row> insert1 =
+      RunSql(ctx, *db_, "INSERT INTO t1 VALUES (1, 10, 'hello');");
+  ASSERT_EQ(insert1.size(), 1U);
+  EXPECT_EQ(insert1[0][1], Value(1));
+  std::vector<Row> insert2 =
+      RunSql(ctx, *db_, "INSERT INTO t1 VALUES (2, 20, 'world');");
+  ASSERT_EQ(insert2.size(), 1U);
+  EXPECT_EQ(insert2[0][1], Value(1));
+
+  // Act + Assert: SELECT * FROM t1 WHERE c1 = 1
+  std::vector<Row> rows = RunSql(ctx, *db_, "SELECT * FROM t1 WHERE c1 = 1;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[0][1], Value(10));
+  EXPECT_EQ(rows[0][2], Value("hello"));
+
+  // Act + Assert: PreCommit
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(QueryTest, SelectWithProjection) {
+  // Arrange
+  TransactionContext ctx = db_->BeginContext();
+
+  // Act + Assert: CREATE TABLE t1 and two INSERTs
+  RunSql(ctx, *db_, "CREATE TABLE t1 (c1 INT64, c2 INT64, c3 VARCHAR(10));");
+  RunSql(ctx, *db_, "INSERT INTO t1 VALUES (1, 10, 'hello');");
+  RunSql(ctx, *db_, "INSERT INTO t1 VALUES (2, 20, 'world');");
+
+  // Act + Assert: SELECT c1, c3 FROM t1 WHERE c1 = 2
+  std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT c1, c3 FROM t1 WHERE c1 = 2;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(2));
+  EXPECT_EQ(rows[0][1], Value("world"));
+
+  // Act + Assert: PreCommit
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
 
 TEST_F(QueryTest, SqlEngineExplainRequiresQuery) {
   // Arrange
@@ -516,7 +405,8 @@ TEST_F(QueryTest, SqlEngineTemplateCacheEvictsFullShard) {
   // succeeds and can hit the (now-trimmed) cache without crashing.
   {
     TransactionContext ctx = db_->BeginContext();
-    ASSERT_TRUE(engine.Prepare(ctx, "INSERT INTO tpl_t VALUES (1);").HasValue());
+    ASSERT_TRUE(
+        engine.Prepare(ctx, "INSERT INTO tpl_t VALUES (1);").HasValue());
     ctx.txn_.Abort();
   }
 }
@@ -595,6 +485,48 @@ TEST_F(QueryTest, SqlEngineSelectOrderByLimitOffset) {
   std::vector<Row> distinct_page =
       RunSql(ctx, *db_, "SELECT DISTINCT a FROM t LIMIT 3;");
   ASSERT_EQ(distinct_page.size(), 3U);
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, OrderByAliasKeyResolvesAcrossSelfJoinScopes) {
+  // REGRESSION: an aliased self-join evaluates ORDER BY keys against the
+  // projected output schema first. A qualified key over the second input
+  // (p2.id, spelled through its output alias) must bind to the join input
+  // tuple it names, not be captured by the projection's same-named bare
+  // column of the FIRST input -- which silently degraded every tie of
+  // `ORDER BY p1.id, other_id` to hash-build order.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE probe (id INT64, k INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO probe VALUES (1, 10), (2, 10), (3, 20), (4, 20);");
+
+  std::vector<Row> pairs =
+      RunSql(ctx, *db_,
+             "SELECT p1.id, p2.id AS other_id FROM probe p1 "
+             "JOIN probe p2 ON p1.k = p2.k ORDER BY p1.id, other_id;");
+  ASSERT_EQ(pairs.size(), 8U);
+  EXPECT_EQ(pairs[0], Row({Value(1), Value(1)}));
+  EXPECT_EQ(pairs[1], Row({Value(1), Value(2)}));
+  EXPECT_EQ(pairs[2], Row({Value(2), Value(1)}));
+  EXPECT_EQ(pairs[3], Row({Value(2), Value(2)}));
+  EXPECT_EQ(pairs[4], Row({Value(3), Value(3)}));
+  EXPECT_EQ(pairs[5], Row({Value(3), Value(4)}));
+  EXPECT_EQ(pairs[6], Row({Value(4), Value(3)}));
+  EXPECT_EQ(pairs[7], Row({Value(4), Value(4)}));
+
+  // The alias as the sole ordering key orders by the second input column.
+  std::vector<Row> alias_only =
+      RunSql(ctx, *db_,
+             "SELECT p1.id, p2.id AS other_id FROM probe p1 "
+             "JOIN probe p2 ON p1.k = p2.k ORDER BY other_id, p1.id;");
+  ASSERT_EQ(alias_only.size(), 8U);
+  EXPECT_EQ(alias_only[0], Row({Value(1), Value(1)}));
+  EXPECT_EQ(alias_only[1], Row({Value(2), Value(1)}));
+  EXPECT_EQ(alias_only[2], Row({Value(1), Value(2)}));
+  EXPECT_EQ(alias_only[3], Row({Value(2), Value(2)}));
+  EXPECT_EQ(alias_only[4], Row({Value(3), Value(3)}));
+  EXPECT_EQ(alias_only[5], Row({Value(4), Value(3)}));
 
   ctx.txn_.Abort();
 }
@@ -783,9 +715,9 @@ TEST_F(QueryTest, MixedSetOperationChainsHonorPerPairOperators) {
   RunSql(ctx, *db_, "INSERT INTO m VALUES (1), (2);");
 
   // {1,2} EXCEPT {3} UNION ALL {4} = {1,2,4}; the old code returned {1,2}.
-  const std::vector<Row> mixed = RunSql(
-      ctx, *db_,
-      "SELECT x FROM m EXCEPT DISTINCT SELECT 3 UNION ALL SELECT 4;");
+  const std::vector<Row> mixed =
+      RunSql(ctx, *db_,
+             "SELECT x FROM m EXCEPT DISTINCT SELECT 3 UNION ALL SELECT 4;");
   ASSERT_EQ(mixed.size(), 3U);
   EXPECT_NE(std::ranges::find(mixed, Row({Value(1)})), mixed.end());
   EXPECT_NE(std::ranges::find(mixed, Row({Value(2)})), mixed.end());
@@ -793,15 +725,13 @@ TEST_F(QueryTest, MixedSetOperationChainsHonorPerPairOperators) {
 
   // `1 UNION ALL (2 INTERSECT DISTINCT 2)` = {1, 2}; the old code returned
   // three rows.
-  const std::vector<Row> intersect_chain =
-      RunSql(ctx, *db_,
-             "SELECT 1 UNION ALL SELECT 2 INTERSECT DISTINCT SELECT 2;");
+  const std::vector<Row> intersect_chain = RunSql(
+      ctx, *db_, "SELECT 1 UNION ALL SELECT 2 INTERSECT DISTINCT SELECT 2;");
   ASSERT_EQ(intersect_chain.size(), 2U);
 
   // A trailing UNION DISTINCT pair must de-duplicate its own result.
-  const std::vector<Row> distinct_tail =
-      RunSql(ctx, *db_,
-             "SELECT x FROM m UNION ALL SELECT 9 UNION DISTINCT SELECT 9;");
+  const std::vector<Row> distinct_tail = RunSql(
+      ctx, *db_, "SELECT x FROM m UNION ALL SELECT 9 UNION DISTINCT SELECT 9;");
   ASSERT_EQ(distinct_tail.size(), 3U);
   ctx.txn_.Abort();
 }
@@ -1136,10 +1066,10 @@ TEST_F(QueryTest, SqlEngineRecursiveCteMixedWithPlainCte) {
 // dedupes against the accumulated rows.
 TEST_F(QueryTest, SqlEngineRecursiveCteByNameUnionDedupesAlignedRows) {
   TransactionContext ctx = db_->BeginContext();
-  std::vector<Row> rows = RunSql(
-      ctx, *db_,
-      "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b "
-      "UNION DISTINCT BY NAME SELECT b, a FROM t) SELECT * FROM t;");
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b "
+             "UNION DISTINCT BY NAME SELECT b, a FROM t) SELECT * FROM t;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(1), Value(2)}));
   ctx.txn_.Abort();
@@ -1429,13 +1359,16 @@ TEST_F(QueryTest, LateralJoinExpansion) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE lat_outer (id INT64, name STRING(16));");
   RunSql(ctx, *db_, "CREATE TABLE lat_inner (outer_id INT64, score INT64);");
-  RunSql(ctx, *db_, "INSERT INTO lat_outer VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');");
+  RunSql(
+      ctx, *db_,
+      "INSERT INTO lat_outer VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');");
   RunSql(ctx, *db_, "INSERT INTO lat_inner VALUES (1, 100), (1, 95), (2, 80);");
 
   // Correlated LATERAL subquery: inner query references outer's id
   std::vector<Row> result = RunSql(
       ctx, *db_,
-      "SELECT o.name, i.score FROM lat_outer o, LATERAL (SELECT score FROM lat_inner WHERE outer_id = o.id) i ORDER BY o.name, i.score;");
+      "SELECT o.name, i.score FROM lat_outer o, LATERAL (SELECT score FROM "
+      "lat_inner WHERE outer_id = o.id) i ORDER BY o.name, i.score;");
   ASSERT_EQ(result.size(), 3U);
   EXPECT_EQ(result[0][0], Value("Alice"));
   EXPECT_EQ(result[0][1], Value(95));
@@ -1445,9 +1378,11 @@ TEST_F(QueryTest, LateralJoinExpansion) {
   EXPECT_EQ(result[2][1], Value(80));
 
   // LEFT LATERAL JOIN: includes Charlie with NULL score
-  std::vector<Row> left_result = RunSql(
-      ctx, *db_,
-      "SELECT o.name, i.score FROM lat_outer o LEFT JOIN LATERAL (SELECT score FROM lat_inner WHERE outer_id = o.id) i ON TRUE ORDER BY o.name, i.score;");
+  std::vector<Row> left_result =
+      RunSql(ctx, *db_,
+             "SELECT o.name, i.score FROM lat_outer o LEFT JOIN LATERAL "
+             "(SELECT score FROM lat_inner WHERE outer_id = o.id) i ON TRUE "
+             "ORDER BY o.name, i.score;");
   ASSERT_EQ(left_result.size(), 4U);
   EXPECT_EQ(left_result[0][0], Value("Alice"));
   EXPECT_EQ(left_result[0][1], Value(95));
@@ -1465,16 +1400,19 @@ TEST_F(QueryTest, PreparedStatementGenericCustomPlan) {
   TransactionContext ctx = db_->BeginContext();
   SqlEngine engine(*db_);
   RunSql(ctx, *db_, "CREATE TABLE pcache_thresh (id INT64, val INT64);");
-  RunSql(ctx, *db_, "INSERT INTO pcache_thresh VALUES (1, 10), (2, 20), (3, 30);");
+  RunSql(ctx, *db_,
+         "INSERT INTO pcache_thresh VALUES (1, 10), (2, 20), (3, 30);");
 
   // Repeated executions of parameterized SELECT
   for (int i = 0; i < 8; ++i) {
-    std::vector<Row> res = RunPrepared(&engine, &ctx, "SELECT val FROM pcache_thresh WHERE id = 1;");
+    std::vector<Row> res = RunPrepared(
+        &engine, &ctx, "SELECT val FROM pcache_thresh WHERE id = 1;");
     ASSERT_EQ(res.size(), 1U);
     EXPECT_EQ(res[0][0], Value(10));
   }
   // Parameter variation
-  std::vector<Row> res2 = RunPrepared(&engine, &ctx, "SELECT val FROM pcache_thresh WHERE id = 2;");
+  std::vector<Row> res2 =
+      RunPrepared(&engine, &ctx, "SELECT val FROM pcache_thresh WHERE id = 2;");
   ASSERT_EQ(res2.size(), 1U);
   EXPECT_EQ(res2[0][0], Value(20));
 
@@ -1495,11 +1433,13 @@ TEST_F(QueryTest, BatchInsertChunking) {
 
   RunSql(ctx, *db_, sql);
 
-  std::vector<Row> count_res = RunSql(ctx, *db_, "SELECT COUNT(*) FROM batch_tbl;");
+  std::vector<Row> count_res =
+      RunSql(ctx, *db_, "SELECT COUNT(*) FROM batch_tbl;");
   ASSERT_EQ(count_res.size(), 1U);
   EXPECT_EQ(count_res[0][0], Value(150));
 
-  std::vector<Row> sample_res = RunSql(ctx, *db_, "SELECT val FROM batch_tbl WHERE id = 70;");
+  std::vector<Row> sample_res =
+      RunSql(ctx, *db_, "SELECT val FROM batch_tbl WHERE id = 70;");
   ASSERT_EQ(sample_res.size(), 1U);
   EXPECT_EQ(sample_res[0][0], Value(700));
 
@@ -1510,13 +1450,14 @@ TEST_F(QueryTest, SelectDistinctOnExecution) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_,
          "CREATE TABLE emp_dist (dept VARCHAR, salary INT64, name VARCHAR);");
-  RunSql(ctx, *db_,
-         "INSERT INTO emp_dist VALUES ('HR', 100, 'Alice'), ('HR', 120, 'Bob'), "
-         "('IT', 200, 'Charlie'), ('IT', 180, 'David');");
-
-  std::vector<Row> res = RunSql(
+  RunSql(
       ctx, *db_,
-      "SELECT DISTINCT ON (dept) dept, salary, name FROM emp_dist ORDER BY dept, salary DESC;");
+      "INSERT INTO emp_dist VALUES ('HR', 100, 'Alice'), ('HR', 120, 'Bob'), "
+      "('IT', 200, 'Charlie'), ('IT', 180, 'David');");
+
+  std::vector<Row> res = RunSql(ctx, *db_,
+                                "SELECT DISTINCT ON (dept) dept, salary, name "
+                                "FROM emp_dist ORDER BY dept, salary DESC;");
   ASSERT_EQ(res.size(), 2U);
   EXPECT_EQ(res[0][0], Value("HR"));
   EXPECT_EQ(res[0][1], Value(120));
@@ -1532,11 +1473,12 @@ TEST_F(QueryTest, FetchFirstWithTiesExecution) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE score_ties (name VARCHAR, score INT64);");
   RunSql(ctx, *db_,
-         "INSERT INTO score_ties VALUES ('Alice', 100), ('Bob', 90), ('Charlie', 90), ('Dave', 80);");
+         "INSERT INTO score_ties VALUES ('Alice', 100), ('Bob', 90), "
+         "('Charlie', 90), ('Dave', 80);");
 
-  std::vector<Row> res = RunSql(
-      ctx, *db_,
-      "SELECT name, score FROM score_ties ORDER BY score DESC FETCH FIRST 2 ROWS WITH TIES;");
+  std::vector<Row> res = RunSql(ctx, *db_,
+                                "SELECT name, score FROM score_ties ORDER BY "
+                                "score DESC FETCH FIRST 2 ROWS WITH TIES;");
   ASSERT_EQ(res.size(), 3U);
   EXPECT_EQ(res[0][0], Value("Alice"));
   EXPECT_EQ(res[0][1], Value(100));
@@ -1548,14 +1490,17 @@ TEST_F(QueryTest, FetchFirstWithTiesExecution) {
 
 TEST_F(QueryTest, GroupByAllAndDistinctExecution) {
   TransactionContext ctx = db_->BeginContext();
-  RunSql(ctx, *db_,
-         "CREATE TABLE sales_grp (dept VARCHAR, region VARCHAR, amount INT64);");
-  RunSql(ctx, *db_,
-         "INSERT INTO sales_grp VALUES ('A', 'North', 10), ('A', 'North', 20), ('B', 'South', 30);");
-
-  std::vector<Row> res_all = RunSql(
+  RunSql(
       ctx, *db_,
-      "SELECT dept, region, sum(amount) AS total FROM sales_grp GROUP BY ALL ORDER BY dept;");
+      "CREATE TABLE sales_grp (dept VARCHAR, region VARCHAR, amount INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO sales_grp VALUES ('A', 'North', 10), ('A', 'North', 20), "
+         "('B', 'South', 30);");
+
+  std::vector<Row> res_all =
+      RunSql(ctx, *db_,
+             "SELECT dept, region, sum(amount) AS total FROM sales_grp GROUP "
+             "BY ALL ORDER BY dept;");
   ASSERT_EQ(res_all.size(), 2U);
   EXPECT_EQ(res_all[0][0], Value("A"));
   EXPECT_EQ(res_all[0][1], Value("North"));
@@ -1564,9 +1509,10 @@ TEST_F(QueryTest, GroupByAllAndDistinctExecution) {
   EXPECT_EQ(res_all[1][1], Value("South"));
   EXPECT_EQ(res_all[1][2], Value(30));
 
-  std::vector<Row> res_dist = RunSql(
-      ctx, *db_,
-      "SELECT dept, sum(amount) AS total FROM sales_grp GROUP BY DISTINCT dept ORDER BY dept;");
+  std::vector<Row> res_dist =
+      RunSql(ctx, *db_,
+             "SELECT dept, sum(amount) AS total FROM sales_grp GROUP BY "
+             "DISTINCT dept ORDER BY dept;");
   ASSERT_EQ(res_dist.size(), 2U);
   EXPECT_EQ(res_dist[0][0], Value("A"));
   EXPECT_EQ(res_dist[0][1], Value(30));
@@ -1580,14 +1526,16 @@ TEST_F(QueryTest, QualifyExecution) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_,
          "CREATE TABLE emp_qual (dept VARCHAR, salary INT64, name VARCHAR);");
-  RunSql(ctx, *db_,
-         "INSERT INTO emp_qual VALUES ('HR', 100, 'Alice'), ('HR', 120, 'Bob'), "
-         "('HR', 90, 'Charlie'), ('IT', 200, 'Dave');");
-
-  std::vector<Row> res = RunSql(
+  RunSql(
       ctx, *db_,
-      "SELECT dept, name, salary, row_number() OVER (PARTITION BY dept ORDER BY salary DESC) as rn "
-      "FROM emp_qual QUALIFY rn <= 2 ORDER BY dept, rn;");
+      "INSERT INTO emp_qual VALUES ('HR', 100, 'Alice'), ('HR', 120, 'Bob'), "
+      "('HR', 90, 'Charlie'), ('IT', 200, 'Dave');");
+
+  std::vector<Row> res =
+      RunSql(ctx, *db_,
+             "SELECT dept, name, salary, row_number() OVER (PARTITION BY dept "
+             "ORDER BY salary DESC) as rn "
+             "FROM emp_qual QUALIFY rn <= 2 ORDER BY dept, rn;");
   ASSERT_EQ(res.size(), 3U);
   EXPECT_EQ(res[0][0], Value("HR"));
   EXPECT_EQ(res[0][1], Value("Bob"));
@@ -1601,10 +1549,12 @@ TEST_F(QueryTest, QualifyExecution) {
 
 TEST_F(QueryTest, PivotAndUnpivotExecution) {
   TransactionContext ctx = db_->BeginContext();
+  RunSql(
+      ctx, *db_,
+      "CREATE TABLE piv_sales (dept VARCHAR, quarter VARCHAR, amount INT64);");
   RunSql(ctx, *db_,
-         "CREATE TABLE piv_sales (dept VARCHAR, quarter VARCHAR, amount INT64);");
-  RunSql(ctx, *db_,
-         "INSERT INTO piv_sales VALUES ('A', 'Q1', 10), ('A', 'Q2', 20), ('B', 'Q1', 30), ('B', 'Q2', 40);");
+         "INSERT INTO piv_sales VALUES ('A', 'Q1', 10), ('A', 'Q2', 20), ('B', "
+         "'Q1', 30), ('B', 'Q2', 40);");
 
   std::vector<Row> res_p = RunSql(
       ctx, *db_,
@@ -1618,14 +1568,13 @@ TEST_F(QueryTest, PivotAndUnpivotExecution) {
   EXPECT_EQ(res_p[1][1], Value(30));
   EXPECT_EQ(res_p[1][2], Value(40));
 
-  RunSql(ctx, *db_,
-         "CREATE TABLE widetab (dept VARCHAR, q1 INT64, q2 INT64);");
-  RunSql(ctx, *db_,
-         "INSERT INTO widetab VALUES ('A', 10, 20), ('B', 30, 40);");
+  RunSql(ctx, *db_, "CREATE TABLE widetab (dept VARCHAR, q1 INT64, q2 INT64);");
+  RunSql(ctx, *db_, "INSERT INTO widetab VALUES ('A', 10, 20), ('B', 30, 40);");
 
-  std::vector<Row> res_u = RunSql(
-      ctx, *db_,
-      "SELECT dept, val, col FROM widetab UNPIVOT(val FOR col IN (q1, q2)) ORDER BY dept, col;");
+  std::vector<Row> res_u =
+      RunSql(ctx, *db_,
+             "SELECT dept, val, col FROM widetab UNPIVOT(val FOR col IN (q1, "
+             "q2)) ORDER BY dept, col;");
   ASSERT_EQ(res_u.size(), 4U);
   EXPECT_EQ(res_u[0][0], Value("A"));
   EXPECT_EQ(res_u[0][1], Value(10));
@@ -1651,8 +1600,8 @@ TEST_F(QueryTest, OrderByHonorsExplicitNullsFirstLast) {
   RunSql(ctx, *db_, "CREATE TABLE nls (x INT64);");
   RunSql(ctx, *db_, "INSERT INTO nls VALUES (2), (NULL), (1);");
 
-  const std::vector<Row> asc_last = RunSql(
-      ctx, *db_, "SELECT x FROM nls ORDER BY x ASC NULLS LAST;");
+  const std::vector<Row> asc_last =
+      RunSql(ctx, *db_, "SELECT x FROM nls ORDER BY x ASC NULLS LAST;");
   ASSERT_EQ(asc_last.size(), 3U);
   EXPECT_EQ(asc_last[0][0], Value(1));
   EXPECT_EQ(asc_last[1][0], Value(2));
@@ -1666,12 +1615,187 @@ TEST_F(QueryTest, OrderByHonorsExplicitNullsFirstLast) {
   EXPECT_EQ(desc_first[2][0], Value(1));
 
   // TopN (LIMIT) and Sort must agree on the same ORDER BY.
-  const std::vector<Row> topn_last = RunSql(
-      ctx, *db_, "SELECT x FROM nls ORDER BY x ASC NULLS LAST LIMIT 3;");
+  const std::vector<Row> topn_last =
+      RunSql(ctx, *db_, "SELECT x FROM nls ORDER BY x ASC NULLS LAST LIMIT 3;");
   ASSERT_EQ(topn_last.size(), 3U);
   for (size_t i = 0; i < 3; ++i) {
     EXPECT_EQ(topn_last[i], asc_last[i]);
   }
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, DescendingIndexScanReturnsReversedRange) {
+  // The optimizer must offer reverse index scans for a descending ORDER BY
+  // over a range: the B+Tree iterator positions below `end` and walks left,
+  // so the sort (or TopN) can be elided.  Data correctness is the point:
+  // begin/end keys are direction-symmetric and the residual predicate
+  // re-checks boundary inclusivity.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE r (c1 INT64);");
+  {
+    Status index = db_->CreateIndex(
+        ctx, "r", IndexSchema("rpk", {0}, {}, IndexMode::kUnique));
+    ASSERT_EQ(index, Status::kSuccess);
+  }
+  RunSql(ctx, *db_,
+         "INSERT INTO r VALUES (1), (2), (94), (95), (96), (97), (98), (99),"
+         " (100);");
+
+  const std::vector<Row> desc =
+      RunSql(ctx, *db_,
+             "SELECT c1 FROM r WHERE c1 >= 95 AND c1 <= 99 ORDER BY c1 DESC;");
+  ASSERT_EQ(desc.size(), 5U);
+  for (size_t i = 0; i < 5; ++i) {
+    EXPECT_EQ(desc[i][0], Value(static_cast<int64_t>(99 - i)));
+  }
+
+  // DESC with LIMIT goes through the same reverse candidate (TopN must not
+  // reorder what the index already delivers in reverse).
+  const std::vector<Row> desc_limit = RunSql(
+      ctx, *db_, "SELECT c1 FROM r WHERE c1 >= 95 ORDER BY c1 DESC LIMIT 2;");
+  ASSERT_EQ(desc_limit.size(), 2U);
+  EXPECT_EQ(desc_limit[0][0], Value(int64_t{100}));
+  EXPECT_EQ(desc_limit[1][0], Value(int64_t{99}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, UnknownColumnOnSingleColumnTableIsAnError) {
+  // A bare unknown name must not silently become a proto __get_field_safe
+  // probe that returns NULL; only proto value tables absorb unknown fields.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE sc (only_col INT64);");
+  RunSql(ctx, *db_, "INSERT INTO sc VALUES (7);");
+
+  SqlEngine engine(*db_);
+  const StatusOr<Executor> prepared =
+      engine.Prepare(ctx, "SELECT typo_name FROM sc;");
+  EXPECT_FALSE(prepared.HasValue());
+  EXPECT_EQ(prepared.GetStatus(), Status::kNotExists);
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, StructConstantFoldingEscapesQuotesAndBackslashes) {
+  // Folded STRUCT JSON must stay parseable when a field value contains
+  // quotes, backslashes or control characters.
+  TransactionContext ctx = db_->BeginContext();
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_, R"(SELECT STRUCT('a"b\\c' AS s, 3 AS n);)");
+  ASSERT_EQ(rows.size(), 1U);
+  ASSERT_TRUE(rows[0][0].type == ValueType::kVarChar);
+  const std::string json(rows[0][0].value.varchar_value);
+  // The quote and backslash must be escaped inside the JSON string value.
+  EXPECT_NE(json.find(R"(a\"b\\c)"), std::string::npos)
+      << "unparseable struct JSON: " << json;
+  EXPECT_NE(json.find(R"("n":3)"), std::string::npos) << json;
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, MixedDottedAndPlainSetTargetsAreRejected) {
+  // The dotted STRUCT-field update path cannot apply plain column targets;
+  // previously the plain assignments were silently dropped.  A table whose
+  // dotted target is an ordinary column still trips the guard (the check is
+  // syntactic, before any STRUCT machinery runs).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE mix (id INT64, s INT64);");
+  RunSql(ctx, *db_, "INSERT INTO mix VALUES (1, 10);");
+
+  SqlEngine engine(*db_);
+  const StatusOr<Executor> prepared =
+      engine.Prepare(ctx, "UPDATE mix SET s.a = 20, id = 2 WHERE id = 1;");
+  EXPECT_FALSE(prepared.HasValue());
+  EXPECT_EQ(prepared.GetStatus(), Status::kUnknown);
+  ctx.txn_.Abort();
+}
+
+namespace {
+// Runs a scalar SELECT to completion; execution-time errors (overflow, divide
+// by zero) surface as exceptions from Next(), matching how the engine reports
+// them to callers.
+std::vector<Row> RunScalar(TransactionContext& ctx, Database& db,
+                           std::string_view sql) {
+  SqlEngine engine(db);
+  StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+  EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
+  std::vector<Row> rows;
+  if (!prepared.HasValue()) {
+    return rows;
+  }
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  return rows;
+}
+}  // namespace
+
+TEST_F(QueryTest, EighthScanNumericEdgeCases) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE one (x INT64);");
+  RunSql(ctx, *db_, "INSERT INTO one VALUES (7);");
+
+  // A1: IN must promote INT64/DOUBLE like `=` (was folded to FALSE).
+  EXPECT_EQ(RunScalar(ctx, *db_, "SELECT x FROM one WHERE 1 IN (1.0);").size(),
+            1U);  // 1 == 1.0 promotes to TRUE, so the row survives
+  EXPECT_EQ(RunScalar(ctx, *db_, "SELECT x FROM one WHERE 1 IN (2.0);").size(),
+            0U);  // 1 != 2.0
+  EXPECT_EQ(RunScalar(ctx, *db_, "SELECT x FROM one WHERE 7 IN (7.0);").size(),
+            1U);
+
+  // A11: ROUND/TRUNC of INT64_MAX must not wrap through double.
+  const auto round_max =
+      RunScalar(ctx, *db_, "SELECT ROUND(9223372036854775807);");
+  ASSERT_EQ(round_max.size(), 1U);
+  EXPECT_EQ(round_max[0][0], Value(std::numeric_limits<int64_t>::max()));
+
+  // C26: ABS(INT64_MIN) throws (UB / wrong sign before).
+  EXPECT_THROW(RunScalar(ctx, *db_, "SELECT ABS(-9223372036854775808);"),
+               std::exception);
+
+  // A9: MOD(INT64_MIN, -1) returns 0 (was SIGFPE).
+  const auto mod_min =
+      RunScalar(ctx, *db_, "SELECT MOD(-9223372036854775808, -1);");
+  ASSERT_EQ(mod_min.size(), 1U);
+  EXPECT_EQ(mod_min[0][0], Value(int64_t{0}));
+
+  // B14: GREATEST/LEAST promote mixed INT64/DOUBLE (was a type error).
+  const auto greatest = RunScalar(ctx, *db_, "SELECT GREATEST(1, 2.5);");
+  ASSERT_EQ(greatest.size(), 1U);
+  EXPECT_EQ(greatest[0][0], Value(2.5));
+
+  // B16: SAFE_ADD overflow to +inf returns NULL.
+  const auto safe = RunScalar(ctx, *db_, "SELECT SAFE_ADD(1e308, 1e308);");
+  ASSERT_EQ(safe.size(), 1U);
+  EXPECT_TRUE(safe[0][0].IsNull());
+
+  // B17: DIV out of INT64 range throws (was UB wrap).
+  EXPECT_THROW(RunScalar(ctx, *db_, "SELECT DIV(1e300, 2.0);"), std::exception);
+
+  // A10: DATE_BUCKET with a zero interval throws (was SIGFPE).
+  EXPECT_THROW(
+      RunScalar(ctx, *db_,
+                "SELECT DATE_BUCKET(DATE '2024-03-15', INTERVAL 0 MONTH);"),
+      std::exception);
+
+  // A4: AVG OVER a negative int64 sum (was uint64 misinterpretation).
+  RunSql(ctx, *db_, "CREATE TABLE av (v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO av VALUES (-5), (3);");
+  const auto avg_over =
+      RunScalar(ctx, *db_, "SELECT AVG(v) OVER () FROM av ORDER BY v;");
+  ASSERT_GE(avg_over.size(), 1U);
+  EXPECT_EQ(avg_over[0][0], Value(-1.0));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, EighthScanSingleColumnTypoRejected) {
+  // D2-query: an unknown column on a plain single-column table must error,
+  // not silently resolve through __get_field_safe to NULL.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE solo (only INT64);");
+  RunSql(ctx, *db_, "INSERT INTO solo VALUES (5);");
+  SqlEngine engine(*db_);
+  const StatusOr<Executor> prepared =
+      engine.Prepare(ctx, "SELECT only FROM solo WHERE typo_col = 5;");
+  EXPECT_FALSE(prepared.HasValue());
   ctx.txn_.Abort();
 }
 

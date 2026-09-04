@@ -40,8 +40,9 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
     const std::string encoded_left = l.EncodeMemcomparableFormat();
     const std::string encoded_right = r.EncodeMemcomparableFormat();
     const int cmp = left < right ? -1 : (right < left ? 1 : 0);
-    const int encoded_cmp =
-        encoded_left < encoded_right ? -1 : (encoded_right < encoded_left ? 1 : 0);
+    const int encoded_cmp = encoded_left < encoded_right
+                                ? -1
+                                : (encoded_right < encoded_left ? 1 : 0);
     if (cmp != encoded_cmp) {
       __builtin_trap();
     }

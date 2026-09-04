@@ -24,8 +24,7 @@
 
 namespace tinylamb {
 
-[[nodiscard]] Value EvaluateUnary(UnaryOperation operation,
-                                  const Value& child);
+[[nodiscard]] Value EvaluateUnary(UnaryOperation operation, const Value& child);
 
 class UnaryExpression : public ExpressionBase {
  public:

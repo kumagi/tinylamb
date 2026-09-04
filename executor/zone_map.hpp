@@ -22,6 +22,10 @@ class ZoneMap {
   void AddDouble(double value);
   void AddString(std::string_view value);
   void AddNull();
+  // Records a non-NULL value that carries no scalar ordering (arrays): it
+  // bumps value_count_ so MayMatch keeps the zone instead of pruning a batch
+  // that holds only array values.
+  void AddOpaque();
   void Reset();
 
   [[nodiscard]] bool MayMatch(BinaryOperation operation,

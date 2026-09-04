@@ -19,10 +19,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <ostream>
+#include <string>
 #include <thread>
 #include <utility>
-#include <string>
-#include <ostream>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -48,7 +48,8 @@ AggregationPlan::AggregationPlan(Plan child,
 
 const Schema& AggregationPlan::GetSchema() const { return schema_; }
 
-// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
+// EmitExecutor lives in the relational factory
+// (executor/relational_factory.cpp).
 
 const Table* AggregationPlan::ScanSource() const {
   return child_->ScanSource();

@@ -22,8 +22,8 @@
 #include <stdexcept>
 #include <string_view>
 
-#include "constants.hpp"
 #include "common/serdes.hpp"
+#include "constants.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {

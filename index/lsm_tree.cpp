@@ -16,14 +16,16 @@
 
 #include "index/lsm_tree.hpp"
 
-#include <atomic>
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -42,16 +44,142 @@ namespace {
 std::filesystem::path BlobPath(const std::filesystem::path& dir) {
   return dir / "blob.db";
 }
+
+// D10 (docs/design.md): run files are named "<id>-<blob-high-water>" for
+// flushed runs and "merged-<id>-<blob-high-water>" for merged runs.  The
+// numeric id in a merged file name is a FILE id, not the inherited
+// generation (that lives in the run header), so generation numbers are only
+// ever read from the header; the name is validated for the restore scan and
+// for picking a collision-free next id.
+bool ParseRunFileName(const std::string& name, bool* is_merged,
+                      unsigned long long* id,
+                      unsigned long long* blob_high_water) {
+  std::string body = name;
+  *is_merged = false;
+  constexpr std::string_view kPrefix = "merged-";
+  if (body.rfind(kPrefix, 0) == 0) {
+    *is_merged = true;
+    body.erase(0, kPrefix.size());
+  }
+  const size_t dash = body.find('-');
+  if (dash == std::string::npos || dash == 0 || dash + 1 >= body.size() ||
+      body.find('-', dash + 1) != std::string::npos) {
+    return false;
+  }
+  const std::string first = body.substr(0, dash);
+  const std::string second = body.substr(dash + 1);
+  const auto all_digits = [](const std::string& s) {
+    return std::ranges::all_of(s, [](char c) {
+      return std::isdigit(static_cast<unsigned char>(c)) != 0;
+    });
+  };
+  if (!all_digits(first) || !all_digits(second)) {
+    return false;
+  }
+  try {
+    *id = std::stoull(first);
+    *blob_high_water = std::stoull(second);
+  } catch (const std::exception&) {
+    return false;
+  }
+  return true;
+}
 }  // namespace
+
+// D10 (docs/design.md): a restarted LSMTree reopens flushed data.  There is
+// no MANIFEST: the directory itself is the source of truth.  Every entry is
+// classified explicitly (valid run / bad name / corrupt or incomplete file /
+// duplicate generation); nothing is silently ignored, and only valid runs
+// are restored.  Runs are ordered by the numeric generation from the run
+// HEADER (newest first), never by lexicographic file-name order.
+void LSMTree::RestoreRuns() {
+  struct Discovered {
+    size_t generation;
+    std::filesystem::path path;
+    SortedRun run;
+  };
+  std::vector<Discovered> runs;
+  std::set<size_t> names_seen;  // numeric ids used in file names
+  std::set<size_t> gens_seen;   // generations from run headers
+  const uint64_t blob_size = blob_.Written();
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(root_dir_, ec)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    const std::string name = entry.path().filename().string();
+    if (name == "blob.db") {
+      continue;
+    }
+    bool is_merged = false;
+    unsigned long long id = 0;
+    unsigned long long blob_high_water = 0;
+    if (!ParseRunFileName(name, &is_merged, &id, &blob_high_water)) {
+      // Unparsable name: quarantine it instead of serving an unknown file.
+      LOG(WARN) << "LSM restore: rejecting malformed run file " << name;
+      std::filesystem::rename(entry.path(), entry.path().string() + ".bad", ec);
+      continue;
+    }
+    names_seen.insert(static_cast<size_t>(id));
+    if (blob_high_water > blob_size) {
+      // The name references blob bytes that never reached disk: the run was
+      // written by a crashed flush.  Not promotable to a valid run.
+      LOG(WARN) << "LSM restore: quarantining run " << name
+                << " (blob high water " << blob_high_water << " > " << blob_size
+                << ")";
+      std::filesystem::rename(entry.path(), entry.path().string() + ".bad", ec);
+      continue;
+    }
+    try {
+      SortedRun run(entry.path());  // throws on corrupt/incomplete header
+      const size_t generation = run.Generation();
+      if (!gens_seen.insert(generation).second) {
+        LOG(WARN) << "LSM restore: duplicate generation " << generation
+                  << " from " << name << "; quarantining";
+        std::filesystem::rename(entry.path(), entry.path().string() + ".bad",
+                                ec);
+        continue;
+      }
+      runs.push_back({generation, entry.path(), std::move(run)});
+    } catch (const std::exception& error) {
+      LOG(WARN) << "LSM restore: quarantining unreadable run " << name << ": "
+                << error.what();
+      std::filesystem::rename(entry.path(), entry.path().string() + ".bad", ec);
+    }
+  }
+  // Newest generation first: Read/Contains scan index_ front-to-back and
+  // stop at the first hit, so ordering IS the visibility rule.
+  std::ranges::sort(runs, [](const Discovered& a, const Discovered& b) {
+    return a.generation > b.generation;
+  });
+  size_t high_water = 0;
+  for (Discovered& run : runs) {
+    files_.push_back(run.path);
+    index_.push_back(std::move(run.run));
+    high_water = std::max(high_water, run.generation + 1);
+  }
+  for (const size_t id : names_seen) {
+    // Never reuse an id that ever appeared in a file name: a leftover
+    // ".bad"-quarantined id must not collide with a fresh run either.
+    high_water = std::max(high_water, id + 1);
+  }
+  generation_.store(high_water, std::memory_order_relaxed);
+  if (!runs.empty()) {
+    LOG(INFO) << "LSM restore: reopened " << runs.size()
+              << " run(s), next generation " << high_water;
+  }
+}
 
 LSMTree::LSMTree(std::filesystem::path directory_path)
     : every_us_(1000),
       root_dir_(std::move(directory_path)),
       blob_(BlobPath(root_dir_)) {
   std::filesystem::create_directory(root_dir_);
+  // D10: restore flushed runs BEFORE the background threads can flush.
+  RestoreRuns();
   try {
-    flusher_ = std::thread([&](){Flusher(this);});
-    merger_ = std::thread([&](){Merger(this);});
+    flusher_ = std::thread([&]() { Flusher(this); });
+    merger_ = std::thread([&]() { Merger(this); });
   } catch (...) {
     // Do not leak a half-constructed background thread pool.
     stop_ = true;
@@ -73,6 +201,14 @@ LSMTree::~LSMTree() {
   }
   if (merger_.joinable()) {
     merger_.join();
+  }
+  // Final durability barrier: a well-behaved close flushes whatever the
+  // periodic flusher had not picked up yet, so a clean stop never drops
+  // writes that a Read() had already acknowledged.
+  try {
+    Sync();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "LSMTree final flush failed: " << e.what();
   }
 }
 
@@ -222,9 +358,8 @@ void LSMTree::Sync() {
     }
     std::swap(mem_tree_, frozen_mem_tree_);
     to_flush = frozen_mem_tree_;
-    new_index_file =
-        root_dir_ / (std::to_string(generation_) + "-" +
-                     std::to_string(blob_.Written()));
+    new_index_file = root_dir_ / (std::to_string(generation_) + "-" +
+                                  std::to_string(blob_.Written()));
     generation = generation_.fetch_add(1);
   }
   if (const Status s =
@@ -292,9 +427,8 @@ void LSMTree::MergeAll() {
       merged.push_back(it.TopIterator().GetEntry());
       max_key = it.Key();
     }
-    if (const Status s =
-            SortedRun::FlushInternal(path, min_key, max_key, merged,
-                                     merged_generation);
+    if (const Status s = SortedRun::FlushInternal(path, min_key, max_key,
+                                                  merged, merged_generation);
         s != Status::kSuccess) {
       // Sources stay registered; the merge is retried on a later tick.
       LOG(ERROR) << "merge failed: " << s;

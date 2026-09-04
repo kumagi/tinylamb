@@ -43,8 +43,13 @@ class RelationRenamePlan final : public PlanBase {
   [[nodiscard]] size_t EmitRowCount() const override {
     return src_->EmitRowCount();
   }
-  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
-                                 const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   [[nodiscard]] bool EnforcesLimit(size_t limit_count,
                                    size_t limit_offset) const override {
     return src_->EnforcesLimit(limit_count, limit_offset);

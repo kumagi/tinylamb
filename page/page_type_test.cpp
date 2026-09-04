@@ -30,8 +30,9 @@ TEST(PageTypeTest, StreamOperator) {
   ss << PageType::kUnknown << " " << PageType::kFreePage << " "
      << PageType::kMetaPage << " " << PageType::kRowPage << " "
      << PageType::kLeafPage << " " << PageType::kBranchPage;
-  EXPECT_EQ(ss.str(), "UnknownPageType FreePageType MetaPageType RowPageType "
-                      "LeafPageType BranchPageType");
+  EXPECT_EQ(ss.str(),
+            "UnknownPageType FreePageType MetaPageType RowPageType "
+            "LeafPageType BranchPageType");
 }
 
 TEST(PageTypeTest, SerializeDeserialize) {
@@ -45,9 +46,9 @@ TEST(PageTypeTest, SerializeDeserialize) {
 }
 
 TEST(PageTypeTest, AllTypesRoundTrip) {
-  for (const PageType type : {PageType::kUnknown, PageType::kFreePage,
-                              PageType::kMetaPage, PageType::kRowPage,
-                              PageType::kLeafPage, PageType::kBranchPage}) {
+  for (const PageType type :
+       {PageType::kUnknown, PageType::kFreePage, PageType::kMetaPage,
+        PageType::kRowPage, PageType::kLeafPage, PageType::kBranchPage}) {
     std::stringstream ss;
     Encoder e(ss);
     e << type;
@@ -62,9 +63,9 @@ TEST(PageTypeTest, RoundTripKeepsSerializedSizeStable) {
   // A PageType is stored as a fixed-width uint64_t on the wire.  Verify that
   // every value serializes to exactly 8 bytes so the page header layout never
   // depends on the enum value.
-  for (const PageType type : {PageType::kUnknown, PageType::kFreePage,
-                              PageType::kMetaPage, PageType::kRowPage,
-                              PageType::kLeafPage, PageType::kBranchPage}) {
+  for (const PageType type :
+       {PageType::kUnknown, PageType::kFreePage, PageType::kMetaPage,
+        PageType::kRowPage, PageType::kLeafPage, PageType::kBranchPage}) {
     std::stringstream ss;
     Encoder e(ss);
     e << type;
@@ -89,10 +90,9 @@ TEST(PageTypeTest, PageTypeStringHelper) {
   EXPECT_EQ(PageTypeString(PageType::kBranchPage), "BranchPage");
   EXPECT_EQ(PageTypeString(PageType::kUnknown), "(unknown)");
   // Deliberately invalid value: exercises the "(unknown)" fallback path.
-  EXPECT_EQ(
-      PageTypeString(
-          static_cast<PageType>(999)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
-      "(unknown)");
+  EXPECT_EQ(PageTypeString(static_cast<PageType>(
+                999)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+            "(unknown)");
 }
 
 }  // namespace tinylamb

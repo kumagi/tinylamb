@@ -15,6 +15,7 @@
  */
 
 #include "sorted_run.hpp"
+
 #include <endian.h>
 
 #ifdef TARGET_OS_LINUX
@@ -22,6 +23,7 @@
 #elif defined(__APPLE__)
 #endif
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -34,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <ostream>
@@ -173,7 +176,13 @@ int SortedRun::Entry::Compare(const SortedRun::Entry& rhs,
 
 SortedRun::Entry::Entry(std::string_view key, const LSMValue& value,
                         BlobFile& blob_) {
-  length_ = key.length();
+  // Entry is written to disk as a fixed 40-byte image; a longer key cannot
+  // round-trip through the run format. Fail loudly here instead of storing
+  // a truncated length that BuildKey/Find can never reproduce.
+  if (key.length() > std::numeric_limits<uint32_t>::max()) {
+    throw std::length_error("LSM key exceeds 4GiB run entry limit");
+  }
+  length_ = static_cast<uint32_t>(key.length());
   key_head_ = 0;
   const size_t head_bytes = std::min(key.size(), sizeof(uint32_t));
   if (0 < head_bytes) {
@@ -235,8 +244,8 @@ SortedRun::SortedRun(const std::filesystem::path& file) {
   auto read_full = [&](void* dst, size_t bytes) -> bool {
     size_t done = 0;
     while (done < bytes) {
-      const ssize_t got = ::read(fd, static_cast<char*>(dst) + done,
-                                 bytes - done);
+      const ssize_t got =
+          ::read(fd, static_cast<char*>(dst) + done, bytes - done);
       if (got <= 0) {
         return false;
       }
@@ -278,7 +287,26 @@ SortedRun::SortedRun(const std::filesystem::path& file) {
     throw std::runtime_error("Short read: " + file.string());
   }
   offset += sizeof(length_) + sizeof(generation_);
-  index_ = std::make_unique<VMCache<Entry> >(fd, 4096 * 4096, offset);
+  // D10 (docs/design.md): an interrupted flush leaves a valid header with a
+  // truncated entry area behind (run files are written under their final
+  // name).  Verify the file physically contains every advertised entry
+  // before promoting the run; incomplete images throw so the restore scan
+  // quarantines them instead of serving corrupt reads.
+  struct stat status{};
+  if (::fstat(fd, &status) != 0 ||
+      static_cast<size_t>(status.st_size) < offset + length_ * sizeof(Entry)) {
+    ::close(fd);
+    throw std::runtime_error("Incomplete run file: " + file.string());
+  }
+  // The cache takes ownership of fd and closes it on destruction; if its
+  // constructor throws (mmap/fstat failure under fd pressure), close the fd
+  // here so retries do not leak one descriptor per attempt.
+  try {
+    index_ = std::make_unique<VMCache<Entry> >(fd, 4096 * 4096, offset);
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
 }
 
 Status SortedRun::Construct(const std::filesystem::path& file,

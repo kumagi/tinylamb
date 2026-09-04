@@ -30,16 +30,16 @@ ValuesPlan::ValuesPlan(Schema schema, std::vector<Row> rows)
       stats_(MakeStats(schema_, rows_.size())) {
   for (const Row& row : rows_) {
     if (row.values_.size() != schema_.ColumnCount()) {
-      throw std::invalid_argument("ValuesPlan row/schema width mismatch: row=" +
-                                  std::to_string(row.values_.size()) + " schema=" +
-                                  std::to_string(schema_.ColumnCount()));
+      throw std::invalid_argument(
+          "ValuesPlan row/schema width mismatch: row=" +
+          std::to_string(row.values_.size()) +
+          " schema=" + std::to_string(schema_.ColumnCount()));
     }
   }
 }
 
-bool ValuesPlan::IsOrderedBy(
-    const std::vector<Expression>& expressions,
-    const std::vector<bool>& ascending) const {
+bool ValuesPlan::IsOrderedBy(const std::vector<Expression>& expressions,
+                             const std::vector<bool>& ascending) const {
   return expressions.empty() && ascending.empty();
 }
 
@@ -51,7 +51,8 @@ std::string ValuesPlan::ToString() const {
   return "Values (rows=" + std::to_string(rows_.size()) + ")";
 }
 
-DummyScanPlan::DummyScanPlan() : schema_("", {}), stats_(MakeStats(schema_, 1)) {}
+DummyScanPlan::DummyScanPlan()
+    : schema_("", {}), stats_(MakeStats(schema_, 1)) {}
 
 void DummyScanPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(indent) << "DummyScan (one row)";

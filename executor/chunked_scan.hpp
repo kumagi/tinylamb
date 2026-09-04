@@ -50,7 +50,9 @@ class ChunkedScan : public ExecutorBase {
 
   [[nodiscard]] const Schema& GetSchema() const { return schema_; }
   [[nodiscard]] size_t MorselCount() const { return morsels_.size(); }
-  [[nodiscard]] size_t CurrentMorselIndex() const { return current_morsel_idx_; }
+  [[nodiscard]] size_t CurrentMorselIndex() const {
+    return current_morsel_idx_;
+  }
 
  private:
   void InitializeTableMorsels();

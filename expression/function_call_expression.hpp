@@ -68,7 +68,8 @@ class FunctionCallExpression : public ExpressionBase {
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;
-  Status Validate(EvaluationContext& context, const Schema& schema) const override;
+  Status Validate(EvaluationContext& context,
+                  const Schema& schema) const override;
   [[nodiscard]] const std::string& FuncName() const { return func_name_; }
   [[nodiscard]] const std::vector<Expression>& Args() const { return args_; }
   [[nodiscard]] std::string ToString() const override;

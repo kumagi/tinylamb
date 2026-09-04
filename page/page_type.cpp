@@ -62,8 +62,7 @@ Encoder& operator<<(Encoder& e, const PageType& type) {
 }
 
 Decoder& operator>>(Decoder& d, PageType& type) {
-  constexpr auto kMaxValid =
-      static_cast<uint64_t>(PageType::kPaxPage);
+  constexpr auto kMaxValid = static_cast<uint64_t>(PageType::kPaxPage);
   uint64_t raw = 0;
   d >> raw;
   if (raw > kMaxValid) {

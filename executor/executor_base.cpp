@@ -1,5 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/executor_base.hpp"
+
 #include <cstddef>
 #include <utility>
 
@@ -18,8 +19,9 @@ size_t ExecutorBase::NextBatch(DataChunk* destination, size_t max_rows) {
   Row row;
   while (destination->Size() < max_rows) {
     RowPosition position;
-    if (!Next(&row, &position)) { break;
-}
+    if (!Next(&row, &position)) {
+      break;
+    }
     destination->Append(std::move(row), position);
   }
   return destination->Size();

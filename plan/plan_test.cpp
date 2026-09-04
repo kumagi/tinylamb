@@ -536,9 +536,8 @@ TEST_F(PlanTest, SortPlanOrdersRowsAndReportsOrdering) {
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
                         ctx.GetStats("Sc1"));
   Plan child(new FullScanPlan(*table, *stats));
-  Plan sorted(new SortPlan(
-      child, {SortKey{ColumnValueExp(ColumnName("Sc1.c1")), true,
-                      std::nullopt}}));
+  Plan sorted(new SortPlan(child, {SortKey{ColumnValueExp(ColumnName("Sc1.c1")),
+                                           true, std::nullopt}}));
 
   EXPECT_TRUE(
       sorted->IsOrderedBy({ColumnValueExp(ColumnName("Sc1.c1"))}, {true}));
@@ -566,8 +565,9 @@ TEST_F(PlanTest, SortAndTopNPlansReportSortedPrefixes) {
       scan, std::vector<SortKey>{{first, true, std::nullopt},
                                  {second, true, std::nullopt}});
   Plan topn = std::make_shared<TopNPlan>(
-      scan, std::vector<TopNKey>{{first, true, std::nullopt},
-                                 {second, true, std::nullopt}},
+      scan,
+      std::vector<TopNKey>{{first, true, std::nullopt},
+                           {second, true, std::nullopt}},
       3, 0);
 
   for (const Plan& plan : {sorted, topn}) {
@@ -578,16 +578,45 @@ TEST_F(PlanTest, SortAndTopNPlansReportSortedPrefixes) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
+TEST_F(PlanTest, IsOrderedByComparesNullPlacement) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc1"));
+  const Expression key = ColumnValueExp(ColumnName("Sc1.c1"));
+  // Explicit NULLS LAST on an ascending key: only a matching request (or an
+  // explicitly matching one) reports ordered.
+  Plan sorted_last =
+      std::make_shared<SortPlan>(std::make_shared<FullScanPlan>(*table, *stats),
+                                 std::vector<SortKey>{{key, true, false}});
+  EXPECT_TRUE(
+      sorted_last->IsOrderedBy({key}, {true}, {std::optional<bool>(false)}));
+  EXPECT_FALSE(
+      sorted_last->IsOrderedBy({key}, {true}, {std::optional<bool>(true)}));
+  // A bare request resolves to the engine default (NULLS FIRST for ASC),
+  // which this plan does not provide.
+  EXPECT_FALSE(sorted_last->IsOrderedBy({key}, {true}, {}));
+  // Defaulted keys keep the legacy behavior: bare and default requests match.
+  Plan sorted_default = std::make_shared<SortPlan>(
+      std::make_shared<FullScanPlan>(*table, *stats),
+      std::vector<SortKey>{{key, true, std::nullopt}});
+  EXPECT_TRUE(sorted_default->IsOrderedBy({key}, {true}, {}));
+  EXPECT_TRUE(
+      sorted_default->IsOrderedBy({key}, {true}, {std::optional<bool>(true)}));
+  EXPECT_FALSE(
+      sorted_default->IsOrderedBy({key}, {true}, {std::optional<bool>(false)}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
 TEST_F(PlanTest, ProjectionTranslatesAliasedOrderKeysToChildExpressions) {
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
                         ctx.GetStats("Sc1"));
   const Expression source_key = ColumnValueExp(ColumnName("Sc1.c1"));
-  Plan sorted =
-      std::make_shared<SortPlan>(std::make_shared<FullScanPlan>(*table, *stats),
-                                 std::vector<SortKey>{{source_key, true,
-                                                       std::nullopt}});
+  Plan sorted = std::make_shared<SortPlan>(
+      std::make_shared<FullScanPlan>(*table, *stats),
+      std::vector<SortKey>{{source_key, true, std::nullopt}});
   Plan projected = std::make_shared<ProjectionPlan>(
       sorted, std::vector<NamedExpression>{NamedExpression(
                   "$order0", ColumnValueExp(ColumnName("Sc1.c1")))});
@@ -688,9 +717,8 @@ TEST_F(PlanTest, MergeJoinPlanCarriesSortedKeyContractAndOutputSchema) {
   TableStatistics ts((Schema()));
   auto left_scan = std::make_shared<FullScanPlan>(*tbl1, ts);
   auto left = std::make_shared<SortPlan>(
-      left_scan,
-      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1.c1")), true,
-                            std::nullopt}});
+      left_scan, std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1.c1")),
+                                       true, std::nullopt}});
   auto right = std::make_shared<FullScanPlan>(*tbl2, ts);
 
   Plan plan(new MergeJoinPlan(left, {ColumnName("Sc1.c1")}, right,
@@ -1338,7 +1366,9 @@ TEST_F(PlanTest, BatchInsertChunking) {
   std::vector<Row> batch_rows;
   batch_rows.reserve(70);
   for (int i = 0; i < 70; ++i) {
-    batch_rows.emplace_back(Row({Value(1000 + i), Value("batch_" + std::to_string(i)), Value(static_cast<double>(i) * 1.5)}));
+    batch_rows.emplace_back(
+        Row({Value(1000 + i), Value("batch_" + std::to_string(i)),
+             Value(static_cast<double>(i) * 1.5)}));
   }
   for (const auto& r : batch_rows) {
     ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());

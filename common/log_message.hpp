@@ -28,12 +28,12 @@
 // and then aborts the process; callers wanting a survivable diagnostic must
 // use LOG(ERROR) or below.
 #define LOG(level) LogMessage(level, __FILE__, __LINE__, __func__).stream()
-#define STATUS(s, message)                   \
-  do {                                       \
-    if ((s) != Status::kSuccess) {           \
+#define STATUS(s, message)                    \
+  do {                                        \
+    if ((s) != Status::kSuccess) {            \
       LOG(FATAL) << (message) << ": " << (s); \
-      abort();                               \
-    }                                        \
+      abort();                                \
+    }                                         \
   } while (0)
 
 #ifndef ERROR_CODES_DEFINE
@@ -75,7 +75,10 @@ class LogStream {
 
   template <int N>
   LogStream& operator<<(const std::array<char, N>& rhs) {
-    message_ << rhs.data();
+    // Route through string_view: streaming the raw array pointer makes the
+    // ostream's internal length computation emit a sign-conversion warning
+    // in strict builds.
+    message_ << std::string_view(rhs.data());
     return *this;
   }
 

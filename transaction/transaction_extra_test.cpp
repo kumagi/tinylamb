@@ -210,8 +210,8 @@ TEST(LockWaitProgressTest, WaiterExtendsWhileSystemShowsReleaseProgress) {
 
   // Keep releasing/re-acquiring an unrelated row so the lock table shows
   // progress; the holder releases the contested row after ~500ms.
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(500);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   while (std::chrono::steady_clock::now() < deadline) {
     ASSERT_TRUE(lm.GetExclusiveLock(unrelated, 9));
     ASSERT_TRUE(lm.ReleaseExclusiveLock(unrelated, 9));
@@ -235,8 +235,8 @@ TEST(LockWaitProgressTest, WaiterExtendsWhileSystemShowsReleaseProgress) {
 class QueueTableTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    database_ = std::make_unique<Database>("queue_table_test-" +
-                                           RandomString());
+    database_ =
+        std::make_unique<Database>("queue_table_test-" + RandomString());
     TransactionContext ctx = database_->BeginContext();
     Schema schema("new_order_t", {Column("no_w_id", ValueType::kInt64),
                                   Column("no_d_id", ValueType::kInt64),
@@ -278,7 +278,7 @@ class QueueTableTest : public ::testing::Test {
 
 TEST_F(QueueTableTest, DeleteAffectsExactlyTheSnapshotSelectedRows) {
   constexpr int kExpectedGone = 8;  // one order == 8 queue rows
-  LoadQueue(1, 1, 256);  // 256 orders x 8 lines.
+  LoadQueue(1, 1, 256);             // 256 orders x 8 lines.
 
   TransactionContext ctx = database_->BeginContext();
   StatusOr<std::shared_ptr<Table>> table = ctx.GetTable("new_order_t");
@@ -311,8 +311,9 @@ TEST_F(QueueTableTest, DeleteAffectsExactlyTheSnapshotSelectedRows) {
   for (Iterator it = table.Value()->BeginFullScan(ctx.txn_); it.IsValid();
        ++it) {
     ++remaining;
-    if (it.Position() == selected.front()) { deleted_gone = false;
-}
+    if (it.Position() == selected.front()) {
+      deleted_gone = false;
+    }
   }
   EXPECT_TRUE(deleted_gone);
   EXPECT_EQ(remaining, 256 * 8 - kExpectedGone);
@@ -382,13 +383,15 @@ TEST_F(QueueTableTest, PointRangeOnKeyPrefixResolvesHeapRows) {
       for (Iterator it = ptable.Value()->BeginIndexScan(
                probe_ctx.txn_, idx, prefix, prefix, /*ascending=*/true);
            it.IsValid(); ++it) {
-        if ((*it).IsValid()) { ++seen;
-}
+        if ((*it).IsValid()) {
+          ++seen;
+        }
       }
       if (seen != heap_count) {
         mismatches.push_back(order);
-        if (mismatches.size() >= 8) { break;
-}
+        if (mismatches.size() >= 8) {
+          break;
+        }
       }
     }
     ASSERT_EQ(probe_ctx.PreCommit(), Status::kSuccess);
@@ -459,8 +462,7 @@ TEST_F(QueueTableTest, DeleteCompletesWhenPhysicalImageWasDisplaced) {
       doomed.GetTable("new_order_t");
   ASSERT_TRUE(doomed_table.HasValue());
   for (const RowPosition& pos : ten) {
-    ASSERT_EQ(doomed_table.Value()->Delete(doomed.txn_, pos),
-              Status::kSuccess);
+    ASSERT_EQ(doomed_table.Value()->Delete(doomed.txn_, pos), Status::kSuccess);
   }
   doomed.Abort();
 
@@ -495,10 +497,9 @@ TEST_F(QueueTableTest, DeleteCompletesWhenPhysicalImageWasDisplaced) {
   StatusOr<std::shared_ptr<Table>> vtable = verify.GetTable("new_order_t");
   ASSERT_TRUE(vtable.HasValue());
   const Index& vidx = vtable.Value()->GetIndex(0);
-  const std::vector<Value> head_key{Value(static_cast<int64_t>(1)),
-                                    Value(static_cast<int64_t>(1)),
-                                    Value(static_cast<int64_t>(10)),
-                                    Value(static_cast<int64_t>(1))};
+  const std::vector<Value> head_key{
+      Value(static_cast<int64_t>(1)), Value(static_cast<int64_t>(1)),
+      Value(static_cast<int64_t>(10)), Value(static_cast<int64_t>(1))};
   int remaining_head = 0;
   for (Iterator it =
            vtable.Value()->BeginIndexScan(verify.txn_, vidx, head_key, head_key,
@@ -510,6 +511,105 @@ TEST_F(QueueTableTest, DeleteCompletesWhenPhysicalImageWasDisplaced) {
   auto gone = vtable.Value()->Read(verify.txn_, head);
   EXPECT_FALSE(gone.HasValue());
   ASSERT_EQ(verify.PreCommit(), Status::kSuccess);
+}
+
+// ---------------------------------------------------------------------------
+// D4 (docs/design.md): WAL durability and external visibility are separated.
+// A reader records the commit LSN of any committed version it observes and
+// the commit path must wait for that dependency LSN to be durable before the
+// result is returned -- including for a read-only transaction and regardless
+// of the synchronous_commit setting.
+// ---------------------------------------------------------------------------
+
+TEST(DurabilityBarrierTest, ReadOnlyReaderWaitsForObservedCommitLSN) {
+  const std::string log_name =
+      "durability_barrier-test-" + RandomString() + ".log";
+  Logger logger(log_name);
+  LockManager lm;
+  TransactionManager tm(nullptr, &logger, nullptr);
+  // Own-commit waiting is OFF, so the only durability barrier a read-only
+  // reader can hit is the dependency wait introduced by D4.
+  tm.SetSynchronousCommit(false);
+
+  const RowPosition row(7, 1);
+  {
+    Transaction writer = tm.Begin();
+    ASSERT_TRUE(writer.AddWriteSet(row));
+    writer.RegisterVersionWrite(row, std::nullopt,
+                                std::optional<std::string_view>("committed"));
+    ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+  }
+
+  {
+    Transaction reader = tm.Begin(true);
+    ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(reader, row, std::nullopt),
+                          std::string("committed"));
+    // The observed version came from a real commit record, so the reader
+    // must have recorded a non-zero dependency LSN.
+    EXPECT_NE(reader.DurabilityDependence(), 0U);
+    const lsn_t dependence = reader.DurabilityDependence();
+    ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
+    // After PreCommit the dependency must be durable (WaitForDurable ran).
+    EXPECT_GE(logger.DurableLSN(), dependence);
+  }
+
+  ASSERT_EQ(std::remove(log_name.c_str()), 0);
+}
+
+TEST(DurabilityBarrierTest, ReadOnlyReaderWithoutVersionReadHasNoBarrier) {
+  const std::string log_name =
+      "durability_barrier_none-test-" + RandomString() + ".log";
+  Logger logger(log_name);
+  LockManager lm;
+  TransactionManager tm(nullptr, &logger, nullptr);
+  tm.SetSynchronousCommit(false);
+
+  // A read-only transaction that observes no committed version records no
+  // dependency and therefore must not wait on any durability barrier.
+  Transaction reader = tm.Begin(true);
+  EXPECT_EQ(reader.DurabilityDependence(), 0U);
+  ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
+  ASSERT_EQ(std::remove(log_name.c_str()), 0);
+}
+
+TEST(DurabilityBarrierTest, ChainedWriterDependsOnEarlierCommit) {
+  const std::string log_name =
+      "durability_barrier_chain-test-" + RandomString() + ".log";
+  Logger logger(log_name);
+  LockManager lm;
+  TransactionManager tm(nullptr, &logger, nullptr);
+  tm.SetSynchronousCommit(false);
+
+  const RowPosition a(11, 1);
+  const RowPosition b(12, 1);
+  lsn_t a_commit_lsn = 0;
+  {
+    Transaction t1 = tm.Begin();
+    ASSERT_TRUE(t1.AddWriteSet(a));
+    t1.RegisterVersionWrite(a, std::nullopt,
+                            std::optional<std::string_view>("A"));
+    ASSERT_EQ(t1.PreCommit(), Status::kSuccess);
+    // T1's commit record ends at BufferedLSN() at commit time; the version
+    // stamps that durable point (any byte offset above the record start).
+    a_commit_lsn = t1.PrevLSN();
+  }
+  {
+    // T2 reads T1's committed A, then writes B and commits.
+    Transaction t2 = tm.Begin();
+    ASSERT_TRUE(t2.AddWriteSet(b));
+    t2.RegisterVersionWrite(b, std::nullopt,
+                            std::optional<std::string_view>("B"));
+    ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(t2, a, std::nullopt),
+                          std::string("A"));
+    // T2 must carry a durability dependency from reading T1's version: the
+    // end of T1's commit record, strictly above the record's start LSN.
+    EXPECT_GT(t2.DurabilityDependence(), a_commit_lsn);
+    const lsn_t dep = t2.DurabilityDependence();
+    ASSERT_EQ(t2.PreCommit(), Status::kSuccess);
+    EXPECT_GE(logger.DurableLSN(), dep);
+  }
+
+  ASSERT_EQ(std::remove(log_name.c_str()), 0);
 }
 
 }  // namespace

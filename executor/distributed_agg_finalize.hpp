@@ -39,7 +39,8 @@ class DistributedAggFinalize : public ExecutorBase, public PipelineBreaker {
   struct AggregateSpec {
     AggType type{AggType::kSum};
     slot_t partial_val_slot{0};
-    slot_t partial_count_slot{0};  // Used for merging kAvg (partial sum + partial count)
+    slot_t partial_count_slot{
+        0};  // Used for merging kAvg (partial sum + partial count)
   };
 
   DistributedAggFinalize(std::vector<Executor> partial_sources,

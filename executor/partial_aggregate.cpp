@@ -247,14 +247,16 @@ void PartialAggregate::Materialize() {
           break;
         case AggregationType::kSum:
           if (!val.IsNull()) {
-            curr_state->sums[i] =
-                curr_state->sums[i].IsNull() ? val : (curr_state->sums[i] + val);
+            curr_state->sums[i] = curr_state->sums[i].IsNull()
+                                      ? val
+                                      : (curr_state->sums[i] + val);
           }
           break;
         case AggregationType::kAvg:
           if (!val.IsNull()) {
-            curr_state->sums[i] =
-                curr_state->sums[i].IsNull() ? val : (curr_state->sums[i] + val);
+            curr_state->sums[i] = curr_state->sums[i].IsNull()
+                                      ? val
+                                      : (curr_state->sums[i] + val);
             curr_state->counts[i]++;
           }
           break;
@@ -275,10 +277,10 @@ void PartialAggregate::Materialize() {
             curr_state->logical_ands[i] =
                 curr_state->logical_ands[i].IsNull()
                     ? Value(val.Truthy() ? int64_t{1} : int64_t{0})
-                    : Value((curr_state->logical_ands[i].Truthy() &&
-                             val.Truthy())
-                                ? int64_t{1}
-                                : int64_t{0});
+                    : Value(
+                          (curr_state->logical_ands[i].Truthy() && val.Truthy())
+                              ? int64_t{1}
+                              : int64_t{0});
           }
           break;
         case AggregationType::kLogicalOr:
@@ -286,16 +288,17 @@ void PartialAggregate::Materialize() {
             curr_state->logical_ors[i] =
                 curr_state->logical_ors[i].IsNull()
                     ? Value(val.Truthy() ? int64_t{1} : int64_t{0})
-                    : Value((curr_state->logical_ors[i].Truthy() ||
-                             val.Truthy())
-                                ? int64_t{1}
-                                : int64_t{0});
+                    : Value(
+                          (curr_state->logical_ors[i].Truthy() || val.Truthy())
+                              ? int64_t{1}
+                              : int64_t{0});
           }
           break;
         default:
           if (!val.IsNull()) {
-            curr_state->sums[i] =
-                curr_state->sums[i].IsNull() ? val : (curr_state->sums[i] + val);
+            curr_state->sums[i] = curr_state->sums[i].IsNull()
+                                      ? val
+                                      : (curr_state->sums[i] + val);
           }
           break;
       }
@@ -449,8 +452,8 @@ void FinalizeAggregate::Materialize() {
       std::vector<Value> key_vals;
       key_vals.reserve(g_count);
       for (size_t k = 0; k < g_count; ++k) {
-        key_vals.push_back(relational_detail::CanonicalDistinctValue(
-            partial_row[k]));
+        key_vals.push_back(
+            relational_detail::CanonicalDistinctValue(partial_row[k]));
       }
       Row g_key(std::move(key_vals));
       auto [it, inserted] = groups.try_emplace(g_key, FinalizeState{});
@@ -501,10 +504,10 @@ void FinalizeAggregate::Materialize() {
           curr_state->logical_ands[i] =
               curr_state->logical_ands[i].IsNull()
                   ? p_and
-                  : Value((curr_state->logical_ands[i].Truthy() &&
-                           p_and.Truthy())
-                              ? int64_t{1}
-                              : int64_t{0});
+                  : Value(
+                        (curr_state->logical_ands[i].Truthy() && p_and.Truthy())
+                            ? int64_t{1}
+                            : int64_t{0});
         }
       } else if (agg.GetType() == AggregationType::kLogicalOr) {
         const Value& p_or = partial_row[col_idx++];
@@ -512,8 +515,7 @@ void FinalizeAggregate::Materialize() {
           curr_state->logical_ors[i] =
               curr_state->logical_ors[i].IsNull()
                   ? p_or
-                  : Value((curr_state->logical_ors[i].Truthy() ||
-                           p_or.Truthy())
+                  : Value((curr_state->logical_ors[i].Truthy() || p_or.Truthy())
                               ? int64_t{1}
                               : int64_t{0});
         }

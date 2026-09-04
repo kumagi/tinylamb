@@ -28,7 +28,8 @@
 
 namespace tinylamb {
 
-// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
+// EmitExecutor lives in the relational factory
+// (executor/relational_factory.cpp).
 
 const Schema& SelectionPlan::GetSchema() const { return src_->GetSchema(); }
 

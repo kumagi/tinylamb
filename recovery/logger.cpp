@@ -68,9 +68,9 @@ Logger::Logger(const std::filesystem::path& logfile, size_t buffer_size,
       sync_interval_(std::chrono::milliseconds(std::max<size_t>(1, every_ms))),
       dst_(CreateFile(logfile)) {
   if (dst_ == -1) {
-    throw std::runtime_error("Failed to open log file: " +
-                             std::string(std::strerror(errno)) + " for " +
-                             logfile.string());
+    throw std::runtime_error(
+        "Failed to open log file: " + std::string(std::strerror(errno)) +
+        " for " + logfile.string());
   }
   // All state must be consistent before the worker starts; otherwise the
   // worker may observe flushed_lsn_ == 0 and append zeros over an existing
@@ -142,7 +142,9 @@ void Logger::WaitForDurable(lsn_t lsn) {
 }
 
 void Logger::AdviseOldBytesDurable(lsn_t before) {
-  if (before == 0 || dst_ < 0) { return; }
+  if (before == 0 || dst_ < 0) {
+    return;
+  }
 #ifdef POSIX_FADV_DONTNEED
   // Drop [0, before) from page cache: those bytes are now safe to discard
   // because the checkpoint that anchored them has been durably committed to
@@ -180,16 +182,24 @@ void Logger::Finish() {
 
 lsn_t Logger::AddLog(std::string_view payload) {
   RaiseIfFailed();
+  // D1: refuse records the recovery reader could never parse back.
+  if (payload.size() > kMaxRecordSize) {
+    throw std::invalid_argument("WAL record exceeds Logger::kMaxRecordSize: " +
+                                std::to_string(payload.size()) + " > " +
+                                std::to_string(kMaxRecordSize));
+  }
   std::unique_lock enq_lk{enqueue_latch_};
-  lsn_t lsn = buffered_lsn_.load(std::memory_order_relaxed);
-  size_t written = 0;
+  const lsn_t lsn = buffered_lsn_.load(std::memory_order_relaxed);
   while (!payload.empty()) {
     const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_seq_cst);
     const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_seq_cst);
 
     if (buffered_lsn - flushed_lsn == buffer_.size()) {
-      // Do not block on the enqueue latch while waiting for flush progress.
-      enq_lk.unlock();
+      // D1: the enqueue latch is held until the ENTIRE record has landed in
+      // the ring buffer, so no other producer can fragment this record's byte
+      // stream.  Waiting for flush progress while holding the latch is safe
+      // because the flush worker never takes enqueue_latch_ (see
+      // docs/lock_order.md); a full buffer drains without our help.
       std::unique_lock work_lk(work_mu_);
       work_cv_.wait(work_lk, [&] {
         return failed_.load(std::memory_order_acquire) ||
@@ -197,14 +207,7 @@ lsn_t Logger::AddLog(std::string_view payload) {
                        flushed_lsn_.load(std::memory_order_acquire) <
                    buffer_.size();
       });
-      enq_lk.lock();
       RaiseIfFailed();
-      if (written == 0) {
-        // Nothing of this payload landed yet, so another producer may have
-        // consumed LSN space while the enqueue latch was released; a stale
-        // value here would corrupt prev_lsn chains.
-        lsn = buffered_lsn_.load(std::memory_order_relaxed);
-      }
       continue;
     }
     const size_t buffered = buffered_lsn % buffer_.size();
@@ -217,8 +220,6 @@ lsn_t Logger::AddLog(std::string_view payload) {
 
     // Forward buffer pointer.
     buffered_lsn_.store(buffered_lsn + write_size, std::memory_order_release);
-    written += write_size;
-
     payload.remove_prefix(write_size);
   }
   enq_lk.unlock();
@@ -240,9 +241,10 @@ void Logger::LoggerWork() {
     const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_acquire);
 
     if (flushed_lsn == buffered_lsn) {
-      if (dirty && (finish_.load(std::memory_order_acquire) ||
-                    Clock::now() - last_sync >= sync_interval_ ||
-                    pending_durable_waiters_.load(std::memory_order_acquire) > 0)) {
+      if (dirty &&
+          (finish_.load(std::memory_order_acquire) ||
+           Clock::now() - last_sync >= sync_interval_ ||
+           pending_durable_waiters_.load(std::memory_order_acquire) > 0)) {
         if (FdataSync(dst_) != 0) {
           SetFailed(errno);
           return;
@@ -282,10 +284,17 @@ void Logger::LoggerWork() {
                   (flushed_off < buffered_off ? buffered_off : buffer_.size()) -
                       flushed_off);
       } while (flushed_size < 0 && errno == EINTR);
-      if (flushed_size <= 0) {
+      if (flushed_size < 0) {
         // Wake every waiter instead of leaving synchronous commits blocked
         // forever on a dead worker (e.g. ENOSPC / EIO).
         SetFailed(errno);
+        return;
+      }
+      if (flushed_size == 0) {
+        // A zero return on a non-zero write() is not a valid outcome and
+        // leaves errno meaningless; fail with an explicit code instead of
+        // reporting whatever the last syscall left behind.
+        SetFailed(EIO);
         return;
       }
       flushed_lsn_.store(flushed + flushed_size, std::memory_order_release);
@@ -297,8 +306,7 @@ void Logger::LoggerWork() {
     // the full sync_interval_ of latency. A bare timer would otherwise cap
     // throughput at floor(1 second / sync_interval_) * num_producers_per_fsync
     // barriers per second even when fsync itself is sub-millisecond.
-    const bool timer_elapsed =
-        Clock::now() - last_sync >= sync_interval_;
+    const bool timer_elapsed = Clock::now() - last_sync >= sync_interval_;
     const bool waiter_present =
         pending_durable_waiters_.load(std::memory_order_acquire) > 0;
     if (finish_.load(std::memory_order_acquire) || timer_elapsed ||

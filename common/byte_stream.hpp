@@ -82,8 +82,7 @@ class ByteStream {
   std::string_view Bytes(size_t max_len) {
     const size_t available = size_ - pos_;
     const size_t take = available < max_len ? available : max_len;
-    std::string_view result(
-        reinterpret_cast<const char*>(data_ + pos_), take);
+    std::string_view result(reinterpret_cast<const char*>(data_ + pos_), take);
     pos_ += take;
     return result;
   }

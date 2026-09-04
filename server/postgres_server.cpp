@@ -72,8 +72,9 @@ std::string StatusMessage(Status status) {
 
 std::string UppercaseCommand(std::string_view sql) {
   const size_t begin = sql.find_first_not_of(" \t\r\n");
-  if (begin == std::string_view::npos) { return {};
-}
+  if (begin == std::string_view::npos) {
+    return {};
+  }
   const size_t end = sql.find_first_of(" \t\r\n", begin);
   std::string command(sql.substr(begin, end - begin));
   for (char& c : command) {
@@ -126,19 +127,24 @@ class PostgresServer::Impl {
       AbortOpenTransaction(client);
       close(fd);
     }
-    if (listener_fd_ >= 0) { close(listener_fd_);
-}
-    if (wake_fd_ >= 0) { close(wake_fd_);
-}
-    if (epoll_fd_ >= 0) { close(epoll_fd_);
-}
-    if (reserve_fd_ >= 0) { close(reserve_fd_);
-}
+    if (listener_fd_ >= 0) {
+      close(listener_fd_);
+    }
+    if (wake_fd_ >= 0) {
+      close(wake_fd_);
+    }
+    if (epoll_fd_ >= 0) {
+      close(epoll_fd_);
+    }
+    if (reserve_fd_ >= 0) {
+      close(reserve_fd_);
+    }
   }
 
   bool Listen(std::string* error) {
-    if (listener_fd_ >= 0) { return true;
-}
+    if (listener_fd_ >= 0) {
+      return true;
+    }
 
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -159,8 +165,9 @@ class PostgresServer::Impl {
           socket(address->ai_family,
                  address->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
                  address->ai_protocol);
-      if (candidate < 0) { continue;
-}
+      if (candidate < 0) {
+        continue;
+      }
       const int enabled = 1;
       setsockopt(candidate, SOL_SOCKET, SO_REUSEADDR, &enabled,
                  sizeof(enabled));
@@ -222,8 +229,9 @@ class PostgresServer::Impl {
   }
 
   int Run(std::string* error) {
-    if (listener_fd_ < 0 && !Listen(error)) { return 1;
-}
+    if (listener_fd_ < 0 && !Listen(error)) {
+      return 1;
+    }
     std::array<epoll_event, 64> events{};
     while (!stopping_.load()) {
       // Bounded wait so the idle-connection sweep below keeps running even
@@ -231,8 +239,9 @@ class PostgresServer::Impl {
       const int count = epoll_wait(epoll_fd_, events.data(), events.size(),
                                    kIdleSweepIntervalMs);
       if (count < 0) {
-        if (errno == EINTR) { continue;
-}
+        if (errno == EINTR) {
+          continue;
+        }
         *error = ErrnoMessage("epoll_wait");
         return 1;
       }
@@ -250,18 +259,22 @@ class PostgresServer::Impl {
           ProcessReadCompletions();
           continue;
         }
-        if (!clients_.contains(fd)) { continue;
-}
+        if (!clients_.contains(fd)) {
+          continue;
+        }
         bool alive = true;
-        if ((flags & EPOLLIN) != 0U) { alive = ReadClient(fd);
-}
+        if ((flags & EPOLLIN) != 0U) {
+          alive = ReadClient(fd);
+        }
         if (alive && clients_.contains(fd) && (flags & EPOLLOUT) != 0U) {
           alive = WriteClient(fd);
         }
-        if ((flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U) { alive = false;
-}
-        if (!alive) { CloseClient(fd);
-}
+        if ((flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U) {
+          alive = false;
+        }
+        if (!alive) {
+          CloseClient(fd);
+        }
       }
       SweepIdleClients();
     }
@@ -304,6 +317,13 @@ class PostgresServer::Impl {
     std::unique_ptr<TransactionContext> transaction;
     char transaction_status{'I'};
     bool read_query_in_flight{false};
+    // When a read is offloaded to a worker, last_activity stops advancing
+    // until the completion returns. Track the offload time separately so a
+    // hung worker cannot pin the fd (and its buffers) past idle_timeout:
+    // in-flight connections are swept on the same timeout measured from
+    // here. ProcessReadCompletions drops completions for an unknown client
+    // id, so closing is safe.
+    std::chrono::steady_clock::time_point read_started_at{};
     std::chrono::steady_clock::time_point last_activity{
         std::chrono::steady_clock::now()};
   };
@@ -332,6 +352,24 @@ class PostgresServer::Impl {
   }
 
   void AcceptClients() {
+    // A previous EMFILE shed removed the listener from epoll; try to restore
+    // the reserve descriptor (and the epoll registration) before accepting.
+    if (listener_shed_due_to_fd_pressure_) {
+      reserve_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (reserve_fd_ >= 0) {
+        std::string error;
+        if (AddEpollFd(listener_fd_, EPOLLIN, &error)) {
+          listener_shed_due_to_fd_pressure_ = false;
+        } else {
+          std::cerr << error << '\n';
+          ::close(reserve_fd_);
+          reserve_fd_ = -1;
+          return;
+        }
+      } else {
+        return;
+      }
+    }
     while (true) {
       const int fd =
           accept4(listener_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -345,11 +383,21 @@ class PostgresServer::Impl {
           reserve_fd_ = -1;
           const int shed = accept4(listener_fd_, nullptr, nullptr,
                                    SOCK_NONBLOCK | SOCK_CLOEXEC);
-          if (shed >= 0) { ::close(shed);
-}
+          if (shed >= 0) {
+            ::close(shed);
+          }
           std::cerr << "descriptor limit hit (" << reason
                     << "); shed one pending connection\n";
           reserve_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+          if (reserve_fd_ < 0) {
+            // Without a reserve descriptor the next EMFILE accept would spin
+            // the level-triggered loop. Shed the listener from epoll until a
+            // future AcceptClients call restores the reserve: the cost is a
+            // delayed accept, not a busy loop.
+            epoll_event dummy{};
+            (void)epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listener_fd_, &dummy);
+            listener_shed_due_to_fd_pressure_ = true;
+          }
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
           std::cerr << ErrnoMessage("accept4") << '\n';
         }
@@ -374,14 +422,21 @@ class PostgresServer::Impl {
   }
 
   void SweepIdleClients() {
-    if (options_.idle_timeout <= std::chrono::seconds::zero()) { return;
-}
+    if (options_.idle_timeout <= std::chrono::seconds::zero()) {
+      return;
+    }
     const auto now = std::chrono::steady_clock::now();
     for (auto it = clients_.begin(); it != clients_.end();) {
       const Client& client = it->second;
+      // In-flight reads are exempt while the worker is making progress
+      // (last_activity cannot advance off the event loop), but a hung worker
+      // must not pin the connection forever: sweep it on the same timeout
+      // measured from the offload time. The orphaned completion is dropped
+      // by client-id check when it eventually arrives.
       const bool idle =
-          !client.read_query_in_flight &&
-          now - client.last_activity > options_.idle_timeout;
+          client.read_query_in_flight
+              ? now - client.read_started_at > options_.idle_timeout
+              : now - client.last_activity > options_.idle_timeout;
       if (idle) {
         const int fd = it->first;
         ++it;
@@ -394,8 +449,9 @@ class PostgresServer::Impl {
 
   bool ReadClient(int fd) {
     auto found = clients_.find(fd);
-    if (found == clients_.end()) { return false;
-}
+    if (found == clients_.end()) {
+      return false;
+    }
     Client& client = found->second;
     std::array<char, 8192> buffer{};
     while (true) {
@@ -403,9 +459,9 @@ class PostgresServer::Impl {
       if (size > 0) {
         client.input.append(buffer.data(), static_cast<size_t>(size));
         client.last_activity = std::chrono::steady_clock::now();
-        const size_t input_limit =
-            client.startup_complete ? options_.max_message_bytes + 5
-                                    : kMaxPreAuthInputBytes;
+        const size_t input_limit = client.startup_complete
+                                       ? options_.max_message_bytes + 5
+                                       : kMaxPreAuthInputBytes;
         if (client.input.size() > input_limit) {
           Queue(client,
                 pgwire::ErrorResponse("message exceeds server limit", "54000"));
@@ -414,12 +470,15 @@ class PostgresServer::Impl {
         }
         continue;
       }
-      if (size == 0) { return false;
-}
-      if (errno == EINTR) { continue;
-}
-      if (errno == EAGAIN || errno == EWOULDBLOCK) { break;
-}
+      if (size == 0) {
+        return false;
+      }
+      if (errno == EINTR) {
+        continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+      }
       return false;
     }
     ProcessInput(client);
@@ -429,8 +488,9 @@ class PostgresServer::Impl {
 
   bool WriteClient(int fd) {
     auto found = clients_.find(fd);
-    if (found == clients_.end()) { return false;
-}
+    if (found == clients_.end()) {
+      return false;
+    }
     Client& client = found->second;
     while (client.output_offset < client.output.size()) {
       const char* data = client.output.data() + client.output_offset;
@@ -441,17 +501,20 @@ class PostgresServer::Impl {
         client.last_activity = std::chrono::steady_clock::now();
         continue;
       }
-      if (size < 0 && errno == EINTR) { continue;
-}
-      if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { break;
-}
+      if (size < 0 && errno == EINTR) {
+        continue;
+      }
+      if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        break;
+      }
       return false;
     }
     if (client.output_offset == client.output.size()) {
       client.output.clear();
       client.output_offset = 0;
-      if (client.close_after_write) { return false;
-}
+      if (client.close_after_write) {
+        return false;
+      }
     }
     UpdateClientInterest(client);
     return true;
@@ -460,10 +523,12 @@ class PostgresServer::Impl {
   void UpdateClientInterest(const Client& client) const {
     epoll_event event{};
     event.events = EPOLLRDHUP;
-    if (!client.read_query_in_flight) { event.events |= EPOLLIN;
-}
-    if (client.output_offset < client.output.size()) { event.events |= EPOLLOUT;
-}
+    if (!client.read_query_in_flight) {
+      event.events |= EPOLLIN;
+    }
+    if (client.output_offset < client.output.size()) {
+      event.events |= EPOLLOUT;
+    }
     event.data.fd = client.fd;
     (void)epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client.fd, &event);
   }
@@ -479,15 +544,18 @@ class PostgresServer::Impl {
 
   void ProcessInput(Client& client) {
     while (!client.close_after_write) {
-      if (client.read_query_in_flight) { return;
-}
+      if (client.read_query_in_flight) {
+        return;
+      }
       if (!client.startup_complete) {
-        if (!ProcessStartup(client)) { return;
-}
+        if (!ProcessStartup(client)) {
+          return;
+        }
         continue;
       }
-      if (client.input.size() < 5) { return;
-}
+      if (client.input.size() < 5) {
+        return;
+      }
       uint32_t length = 0;
       try {
         length = pgwire::ReadUint32(client.input, 1);
@@ -501,8 +569,9 @@ class PostgresServer::Impl {
         return;
       }
       const size_t total = static_cast<size_t>(length) + 1;
-      if (client.input.size() < total) { return;
-}
+      if (client.input.size() < total) {
+        return;
+      }
       const char type = client.input[0];
       const std::string payload = client.input.substr(5, length - 4);
       client.input.erase(0, total);
@@ -521,8 +590,9 @@ class PostgresServer::Impl {
             client, std::string_view(payload.data(), payload.size() - 1));
         continue;
       }
-      if (type == 'H') { continue;  // Flush: queued output is already writable.
-}
+      if (type == 'H') {
+        continue;  // Flush: queued output is already writable.
+      }
       if (type == 'S') {
         Queue(client, pgwire::ReadyForQuery(client.transaction_status));
         continue;
@@ -534,8 +604,9 @@ class PostgresServer::Impl {
   }
 
   static bool ProcessStartup(Client& client) {
-    if (client.input.size() < 4) { return false;
-}
+    if (client.input.size() < 4) {
+      return false;
+    }
     uint32_t length = 0;
     try {
       length = pgwire::ReadUint32(client.input, 0);
@@ -547,8 +618,9 @@ class PostgresServer::Impl {
       client.close_after_write = true;
       return false;
     }
-    if (client.input.size() < length) { return false;
-}
+    if (client.input.size() < length) {
+      return false;
+    }
     const std::string packet = client.input.substr(0, length);
     client.input.erase(0, length);
     const uint32_t code = pgwire::ReadUint32(packet, 4);
@@ -588,8 +660,9 @@ class PostgresServer::Impl {
       std::vector<std::string> unsupported;
       for (const auto& [name, value] : startup->parameters) {
         (void)value;
-        if (name.starts_with("_pq_.")) { unsupported.push_back(name);
-}
+        if (name.starts_with("_pq_.")) {
+          unsupported.push_back(name);
+        }
       }
       Queue(client, pgwire::NegotiateProtocolVersion(0, unsupported));
     }
@@ -605,8 +678,8 @@ class PostgresServer::Impl {
     Queue(client, pgwire::ParameterStatus("integer_datetimes", "on"));
     Queue(client, pgwire::ParameterStatus("standard_conforming_strings", "on"));
     Queue(client, pgwire::ParameterStatus("TimeZone", "UTC"));
-    Queue(client, pgwire::BackendKeyData(
-                      static_cast<uint32_t>(getpid()), client.secret));
+    Queue(client, pgwire::BackendKeyData(static_cast<uint32_t>(getpid()),
+                                         client.secret));
     Queue(client, pgwire::ReadyForQuery('I'));
     client.startup_complete = true;
     return true;
@@ -643,10 +716,9 @@ class PostgresServer::Impl {
       if (ok) {
         const Status commit = implicit->PreCommit();
         if (commit != Status::kSuccess) {
-          Queue(client,
-                pgwire::ErrorResponse("transaction commit failed: " +
-                                          StatusMessage(commit),
-                                      "40001"));
+          Queue(client, pgwire::ErrorResponse("transaction commit failed: " +
+                                                  StatusMessage(commit),
+                                              "40001"));
         }
       } else if (!implicit->IsFinished()) {
         // A failing statement already aborted the context via FailStatement;
@@ -659,16 +731,13 @@ class PostgresServer::Impl {
 
   static bool ContainsTransactionControl(
       const std::vector<std::string>& statements) {
-    return std::ranges::any_of(statements,
-                               [](const std::string& statement) {
-                                 const std::string command =
-                                     UppercaseCommand(statement);
-                                 return command == "BEGIN" ||
-                                        command == "START" ||
-                                        command == "COMMIT" ||
-                                        command == "END" ||
-                                        command == "ROLLBACK";
-                               });
+    return std::ranges::any_of(statements, [](const std::string& statement) {
+      const std::string command = UppercaseCommand(statement);
+      return command == "BEGIN" || command == "START" || command == "COMMIT" ||
+             command == "END" || command == "ROLLBACK" ||
+             // PostgreSQL alias for ROLLBACK.
+             command == "ABORT";
+    });
   }
 
   bool ExecuteStatement(Client& client, const std::string& sql,
@@ -693,7 +762,7 @@ class PostgresServer::Impl {
       Queue(client, pgwire::CommandComplete("BEGIN"));
       return true;
     }
-    if (command == "ROLLBACK") {
+    if (command == "ROLLBACK" || command == "ABORT") {
       AbortOpenTransaction(client);
       client.transaction_status = 'I';
       Queue(client, pgwire::CommandComplete("ROLLBACK"));
@@ -767,8 +836,8 @@ class PostgresServer::Impl {
       if (type == StatementType::kSelect) {
         Queue(client, StreamSelectResult(result));
       } else {
-        Queue(client, pgwire::CommandComplete(
-                          CommandTag(type, result.AffectedRows())));
+        Queue(client,
+              pgwire::CommandComplete(CommandTag(type, result.AffectedRows())));
       }
       if (automatic) {
         // Standalone statement in a transaction-control message: legacy
@@ -835,8 +904,9 @@ class PostgresServer::Impl {
                                         const std::vector<Row>& rows) {
     std::string result;
     size_t column_count = names.size();
-    if (!rows.empty()) { column_count = rows.front().values_.size();
-}
+    if (!rows.empty()) {
+      column_count = rows.front().values_.size();
+    }
     std::vector<pgwire::ColumnDescription> columns(column_count);
     for (size_t i = 0; i < column_count; ++i) {
       columns[i].name =
@@ -850,24 +920,27 @@ class PostgresServer::Impl {
       }
     }
     result += pgwire::RowDescription(columns);
-    for (const Row& row : rows) { result += pgwire::DataRow(row);
-}
+    for (const Row& row : rows) {
+      result += pgwire::DataRow(row);
+    }
     result += pgwire::CommandComplete("SELECT " + std::to_string(rows.size()));
     return result;
   }
 
+  // Only bare SELECT statements may use the snapshot read worker. WITH and
+  // EXPLAIN are classified by their first word but may wrap writes
+  // (WITH ... DELETE/UPDATE/INSERT, EXPLAIN ANALYZE <DML>), so they take the
+  // normal execution path which handles them correctly.
   static bool IsReadOnly(const std::vector<std::string>& statements) {
-    return std::ranges::all_of(
-        statements, [](const std::string& statement) {
-          const std::string command = UppercaseCommand(statement);
-          return command == "SELECT" || command == "WITH" ||
-                 command == "EXPLAIN";
-        });
+    return std::ranges::all_of(statements, [](const std::string& statement) {
+      return UppercaseCommand(statement) == "SELECT";
+    });
   }
 
   void ScheduleReadQuery(Client& client,
                          const std::vector<std::string>& statements) {
     client.read_query_in_flight = true;
+    client.read_started_at = std::chrono::steady_clock::now();
     {
       std::scoped_lock lock(read_task_mutex_);
       read_tasks_.push_back({client.fd, client.id, statements});
@@ -876,8 +949,9 @@ class PostgresServer::Impl {
   }
 
   void StartReadWorkers() {
-    if (!read_workers_.empty()) { return;
-}
+    if (!read_workers_.empty()) {
+      return;
+    }
     read_workers_.reserve(read_worker_count_);
     for (size_t i = 0; i < read_worker_count_; ++i) {
       read_workers_.emplace_back([this] { ReadWorkerLoop(); });
@@ -891,8 +965,9 @@ class PostgresServer::Impl {
     }
     read_task_ready_.notify_all();
     for (std::thread& worker : read_workers_) {
-      if (worker.joinable()) { worker.join();
-}
+      if (worker.joinable()) {
+        worker.join();
+      }
     }
     read_workers_.clear();
   }
@@ -905,8 +980,9 @@ class PostgresServer::Impl {
         read_task_ready_.wait(lock, [&] {
           return read_workers_stopping_ || !read_tasks_.empty();
         });
-        if (read_workers_stopping_ && read_tasks_.empty()) { return;
-}
+        if (read_workers_stopping_ && read_tasks_.empty()) {
+          return;
+        }
         task = std::move(read_tasks_.front());
         read_tasks_.pop_front();
       }
@@ -916,7 +992,23 @@ class PostgresServer::Impl {
       while (peak < active &&
              !peak_concurrent_reads_.compare_exchange_weak(peak, active)) {
       }
-      std::string response = ExecuteReadTask(task.statements);
+      // A throwing worker would escape ReadWorkerLoop and take down the
+      // whole server via std::terminate. ExecuteReadTask only catches
+      // std::exception per statement; allocation failures, unknown
+      // exceptions, and transaction-context setup must also surface as a
+      // per-query error response, never as a dead thread.
+      std::string response;
+      try {
+        response = ExecuteReadTask(task.statements);
+      } catch (const std::exception& exception) {
+        response = pgwire::ErrorResponse(
+            std::string("read worker failed: ") + exception.what(), "XX000");
+        response += pgwire::ReadyForQuery('I');
+      } catch (...) {
+        response = pgwire::ErrorResponse("read worker failed: unknown error",
+                                         "XX000");
+        response += pgwire::ReadyForQuery('I');
+      }
       active_read_queries_.fetch_sub(1);
 
       {
@@ -1006,13 +1098,16 @@ class PostgresServer::Impl {
                             std::unique_ptr<TransactionContext>& implicit,
                             const std::string& message,
                             std::string_view sqlstate) {
-    if (automatic && !automatic->IsFinished()) { automatic->Abort();
-}
-    if (implicit && !implicit->IsFinished()) { implicit->Abort();
-}
+    if (automatic && !automatic->IsFinished()) {
+      automatic->Abort();
+    }
+    if (implicit && !implicit->IsFinished()) {
+      implicit->Abort();
+    }
     if (client.transaction) {
-      if (!client.transaction->IsFinished()) { client.transaction->Abort();
-}
+      if (!client.transaction->IsFinished()) {
+        client.transaction->Abort();
+      }
       client.transaction.reset();
       client.transaction_status = 'E';
     }
@@ -1028,8 +1123,9 @@ class PostgresServer::Impl {
 
   void CloseClient(int fd) {
     const auto found = clients_.find(fd);
-    if (found == clients_.end()) { return;
-}
+    if (found == clients_.end()) {
+      return;
+    }
     AbortOpenTransaction(found->second);
     (void)epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
@@ -1056,6 +1152,9 @@ class PostgresServer::Impl {
   int epoll_fd_{-1};
   int wake_fd_{-1};
   int reserve_fd_{-1};
+  // Set when AcceptClients shed the listener from epoll after losing the
+  // EMFILE reserve descriptor; cleared once the reserve is restored.
+  bool listener_shed_due_to_fd_pressure_{false};
   uint16_t bound_port_{0};
   std::atomic<bool> stopping_{false};
   bool read_workers_stopping_{false};

@@ -35,15 +35,13 @@ void HyperLogLog::Add(uint64_t hash) {
   hash = Mix64(hash);
   const size_t index = hash >> (64 - precision_);
   const uint64_t remaining = hash << precision_;
-  const uint8_t leading_zeros = remaining == 0
-      ? static_cast<uint8_t>(64 - precision_ + 1)
-      : static_cast<uint8_t>(std::countl_zero(remaining) + 1);
+  const uint8_t leading_zeros =
+      remaining == 0 ? static_cast<uint8_t>(64 - precision_ + 1)
+                     : static_cast<uint8_t>(std::countl_zero(remaining) + 1);
   registers_[index] = std::max(registers_[index], leading_zeros);
 }
 
-void HyperLogLog::Add(std::string_view data) {
-  Add(Fnv1a64(data));
-}
+void HyperLogLog::Add(std::string_view data) { Add(Fnv1a64(data)); }
 
 void HyperLogLog::Add(const Value& value) {
   if (value.IsNull()) {

@@ -19,9 +19,7 @@ namespace tinylamb {
 MaterializeExecutor::MaterializeExecutor(Executor child, Schema schema)
     : child_(std::move(child)), schema_(std::move(schema)) {}
 
-void MaterializeExecutor::MaterializePipeline() {
-  EnsureMaterialized();
-}
+void MaterializeExecutor::MaterializePipeline() { EnsureMaterialized(); }
 
 void MaterializeExecutor::EnsureMaterialized() {
   if (materialized_) {

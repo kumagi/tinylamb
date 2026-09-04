@@ -7,9 +7,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <sstream>
 #include <optional>
 #include <ratio>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -95,13 +95,18 @@ const Expression* FindSelectAlias(
 Expression ResolveAliasInTree(  // NOLINT(misc-no-recursion)
     const Expression& expression, const Schema& schema,
     const std::vector<NamedExpression>& select_list) {
-  if (!expression) { return expression;
-}
+  if (!expression) {
+    return expression;
+  }
   switch (expression->Type()) {
     case TypeTag::kColumnValue: {
       const ColumnName& name = expression->AsColumnValue().GetColumnName();
-      if (!name.schema.empty() || name.name == "*") { return expression; }
-      if (LocalColumnOffset(schema, name)) { return expression; }
+      if (!name.schema.empty() || name.name == "*") {
+        return expression;
+      }
+      if (LocalColumnOffset(schema, name)) {
+        return expression;
+      }
       if (const Expression* aliased = FindSelectAlias(select_list, name.name)) {
         return *aliased;
       }
@@ -127,9 +132,9 @@ Expression ResolveAliasInTree(  // NOLINT(misc-no-recursion)
         clauses.emplace_back(ResolveAliasInTree(condition, schema, select_list),
                              ResolveAliasInTree(result, schema, select_list));
       }
-      return CaseExpressionExp(std::move(clauses),
-                               ResolveAliasInTree(value.else_clause_, schema,
-                                                  select_list));
+      return CaseExpressionExp(
+          std::move(clauses),
+          ResolveAliasInTree(value.else_clause_, schema, select_list));
     }
     case TypeTag::kInExp: {
       const auto& value = expression->AsInExpression();
@@ -138,20 +143,18 @@ Expression ResolveAliasInTree(  // NOLINT(misc-no-recursion)
       for (const Expression& item : value.list_) {
         items.push_back(ResolveAliasInTree(item, schema, select_list));
       }
-      return InExpressionExp(ResolveAliasInTree(value.child_, schema,
-                                                select_list),
-                             std::move(items));
+      return InExpressionExp(
+          ResolveAliasInTree(value.child_, schema, select_list),
+          std::move(items));
     }
     case TypeTag::kFunctionCallExp:
       return FunctionCallExp(
-          expression->AsFunctionCallExpression().FuncName(),
-          [&] {
+          expression->AsFunctionCallExpression().FuncName(), [&] {
             std::vector<Expression> args;
             args.reserve(expression->AsFunctionCallExpression().Args().size());
             for (const Expression& argument :
                  expression->AsFunctionCallExpression().Args()) {
-              args.push_back(
-                  ResolveAliasInTree(argument, schema, select_list));
+              args.push_back(ResolveAliasInTree(argument, schema, select_list));
             }
             return args;
           }());
@@ -162,8 +165,7 @@ Expression ResolveAliasInTree(  // NOLINT(misc-no-recursion)
       for (const Expression& element : array.Elements()) {
         elements.push_back(ResolveAliasInTree(element, schema, select_list));
       }
-      return ArrayExpressionExp(std::move(elements),
-                                array.ElementSqlType());
+      return ArrayExpressionExp(std::move(elements), array.ElementSqlType());
     }
     default:
       // Aggregates, casts of aggregates, subqueries and constants stay as-is.
@@ -176,15 +178,16 @@ Expression ResolveAliasInTree(  // NOLINT(misc-no-recursion)
 std::shared_ptr<SelectStatement> ResolveGroupingAliases(
     const SelectStatement& statement, const Schema& input_schema) {
   const std::vector<NamedExpression>& select_list = statement.SelectList();
-  if (select_list.empty()) { return nullptr; }
+  if (select_list.empty()) {
+    return nullptr;
+  }
   bool changed = false;
   std::vector<Expression> group_by;
   group_by.reserve(statement.GroupBy().size());
   for (const Expression& key : statement.GroupBy()) {
     Expression resolved = key;
     if (key && key->Type() == TypeTag::kColumnValue) {
-      const ColumnName& name =
-          key->AsColumnValue().GetColumnName();
+      const ColumnName& name = key->AsColumnValue().GetColumnName();
       // GoogleSQL grouping items may be a select-list alias or an ordinal
       // position; base columns take precedence over both.
       const bool unqualified = name.schema.empty() && name.name != "*";
@@ -201,15 +204,19 @@ std::shared_ptr<SelectStatement> ResolveGroupingAliases(
               resolved = select_list[ordinal - 1].expression;
               changed = true;
             }
-          } catch (...) {
+          } catch (const std::exception&) {
+            // An out-of-range ordinal must keep its key: dropping it would
+            // silently regroup the whole relation into one group.
+            group_by.push_back(std::move(resolved));
             continue;
           }
         }
       }
     } else if (key) {
       resolved = ResolveAliasInTree(key, input_schema, select_list);
-      if (!(resolved == key)) { changed = true;
-}
+      if (!(resolved == key)) {
+        changed = true;
+      }
     }
     group_by.push_back(std::move(resolved));
   }
@@ -217,21 +224,27 @@ std::shared_ptr<SelectStatement> ResolveGroupingAliases(
       statement.Having()
           ? ResolveAliasInTree(statement.Having(), input_schema, select_list)
           : statement.Having();
-  if (statement.Having() && !(having == statement.Having())) { changed = true;
-}
-  if (!changed) { return nullptr; }
+  if (statement.Having() && !(having == statement.Having())) {
+    changed = true;
+  }
+  if (!changed) {
+    return nullptr;
+  }
   auto adjusted = std::make_shared<SelectStatement>(statement);
   adjusted->SetGroupBy(std::move(group_by));
-  if (statement.Having()) { adjusted->SetHaving(std::move(having)); }
+  if (statement.Having()) {
+    adjusted->SetHaving(std::move(having));
+  }
   return adjusted;
 }
 
-Value ProjectSubqueryRow(const Row& row, bool as_struct,
-                         const Schema* schema) {
-  if (row.values_.empty()) { return {};
-}
-  if (!as_struct) { return row[0];
-}
+Value ProjectSubqueryRow(const Row& row, bool as_struct, const Schema* schema) {
+  if (row.values_.empty()) {
+    return {};
+  }
+  if (!as_struct) {
+    return row[0];
+  }
   if (row.values_.size() == 1) {
     const Value& only = row.values_[0];
     // A fully-NULL single-field struct is a scalar NULL.
@@ -242,7 +255,9 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct,
   auto field_key = [&](size_t index) -> std::string {
     if (schema != nullptr && index < schema->ColumnCount()) {
       const std::string& name = schema->GetColumn(index).Name().name;
-      if (!name.empty() && !name.starts_with("$expr")) { return name; }
+      if (!name.empty() && !name.starts_with("$expr")) {
+        return name;
+      }
     }
     return "f" + std::to_string(index + 1);
   };
@@ -260,7 +275,9 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct,
         std::string inner;
         const std::vector<Value>& elements = v.ArrayElements();
         for (size_t i = 0; i < elements.size(); ++i) {
-          if (i > 0) { inner += ","; }
+          if (i > 0) {
+            inner += ",";
+          }
           const Value& element = elements[i];
           switch (element.type) {
             case ValueType::kNull:
@@ -287,7 +304,9 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct,
   };
   std::string json = "{";
   for (size_t i = 0; i < row.values_.size(); ++i) {
-    if (i > 0) { json += ","; }
+    if (i > 0) {
+      json += ",";
+    }
     json += "\"" + field_key(i) + "\":" + scalar_to_json(row.values_[i]);
   }
   json += "}";
@@ -468,8 +487,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     }
   }
   if (index == nullptr &&
-      !context.execution_runtime()->unindexable_queries.contains(
-          &statement)) {
+      !context.execution_runtime()->unindexable_queries.contains(&statement)) {
     const SelectSource& from = statement.Sources()[0];
     Schema peek_schema;
     if (statement.Sources().size() == 1 && !from.query && !from.table.empty()) {
@@ -664,6 +682,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         CollectAggregates(item.expression, &aggregate_expressions,
                           &seen_aggregates);
       }
+      // HAVING may reference aggregates that the select list does not emit
+      // (e.g. `SELECT COUNT(*) ... HAVING SUM(x) > 0`); each one needs its
+      // own accumulator so the group filter below can evaluate it.
+      CollectAggregates(statement.Having(), &aggregate_expressions,
+                        &seen_aggregates);
       struct GroupAggs {
         std::vector<AggregateAccumulator> accumulators;
       };
@@ -743,6 +766,16 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         Row representative;
         Scope scope{
             .row = &representative, .schema = &source.schema, .outer = nullptr};
+        // A HAVING predicate eliminates whole groups.  The probe path
+        // treats a cache miss as an empty relation, so filtered-out groups
+        // must simply not enter the cache; evaluating the group as if it
+        // survived would return a value where SQL requires the scalar NULL
+        // / zero-row semantics.
+        if (statement.Having() &&
+            !Truthy(Evaluate(statement.Having(), scope, &aggregate_results,
+                             context, ctes))) {
+          return;
+        }
         std::vector<Value> values;
         values.reserve(statement.SelectList().size());
         for (const NamedExpression& item : statement.SelectList()) {
@@ -883,7 +916,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     ++context.execution_runtime()->exists_short_circuit_queries;
   }
   Relation result = FinishQuery(context, *result_statement,
-                               std::move(candidates), &outer, ctes);
+                                std::move(candidates), &outer, ctes);
   if (!cache_key.has_value()) {
     return MaterializeRelation(result);
   }
@@ -1011,8 +1044,8 @@ bool ExpressionsAreLocal(TransactionContext& context,
 }
 
 bool StatementContainsVolatileFunction(const SelectStatement& statement) {
-  const auto expression_contains_volatile =
-      [](const Expression& expression, const auto& self) -> bool {
+  const auto expression_contains_volatile = [](const Expression& expression,
+                                               const auto& self) -> bool {
     if (!expression) {
       return false;
     }
@@ -1024,26 +1057,25 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
     }
     if (expression->Type() == TypeTag::kQueryExp) {
       const QueryExpression& query = expression->AsQueryExpression();
-      if (query.Query() &&
-          StatementContainsVolatileFunction(*query.Query())) {
+      if (query.Query() && StatementContainsVolatileFunction(*query.Query())) {
         return true;
       }
     }
-    return std::ranges::any_of(ExpressionChildren(expression),
-                               [&](const Expression& child) {
-                                 return self(child, self);
-                               });
+    return std::ranges::any_of(
+        ExpressionChildren(expression),
+        [&](const Expression& child) { return self(child, self); });
   };
-  const auto statement_contains_volatile =
-      [&](const SelectStatement& current, const auto& self) -> bool {
+  const auto statement_contains_volatile = [&](const SelectStatement& current,
+                                               const auto& self) -> bool {
     for (const NamedExpression& item : current.SelectList()) {
       if (expression_contains_volatile(item.expression,
-                                        expression_contains_volatile)) {
+                                       expression_contains_volatile)) {
         return true;
       }
     }
     for (const Expression& expression : current.GroupBy()) {
-      if (expression_contains_volatile(expression, expression_contains_volatile)) {
+      if (expression_contains_volatile(expression,
+                                       expression_contains_volatile)) {
         return true;
       }
     }
@@ -1057,7 +1089,7 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
     }
     for (const SelectStatement::OrderByTerm& term : current.OrderBy()) {
       if (expression_contains_volatile(term.expression,
-                                        expression_contains_volatile)) {
+                                       expression_contains_volatile)) {
         return true;
       }
     }
@@ -1163,8 +1195,7 @@ std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
     if (current->schema != nullptr) {
       for (size_t column = 0; column < current->schema->ColumnCount();
            ++column) {
-        const ColumnName& candidate =
-            current->schema->GetColumn(column).Name();
+        const ColumnName& candidate = current->schema->GetColumn(column).Name();
         const bool referenced = std::ranges::any_of(
             referenced_columns, [&](const ColumnName& requested) {
               return requested == candidate ||
@@ -1201,7 +1232,8 @@ std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
 
 const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           const SelectStatement& statement,
-                                          const CteMap& ctes, bool exists_only) {
+                                          const CteMap& ctes,
+                                          bool exists_only) {
   if (context.execution_runtime() == nullptr ||
       context.execution_runtime()->noncacheable_queries.contains(&statement)) {
     return nullptr;
@@ -1217,11 +1249,11 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
   // reused by a full-result consumer.
   const std::string structural_key =
       UncorrelatedCacheKey(statement, ctes, exists_only);
-  if (const auto structural = context.execution_runtime()
-                                  ->uncorrelated_results_by_fingerprint.find(
-                                      structural_key);
-      structural != context.execution_runtime()
-                        ->uncorrelated_results_by_fingerprint.end()) {
+  if (const auto structural =
+          context.execution_runtime()->uncorrelated_results_by_fingerprint.find(
+              structural_key);
+      structural !=
+      context.execution_runtime()->uncorrelated_results_by_fingerprint.end()) {
     ++context.execution_runtime()->uncorrelated_cache_hits;
     context.execution_runtime()->uncorrelated_results.emplace(
         &statement, structural->second);
@@ -1304,8 +1336,9 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
   // statement's own sources is inherently correlated (`FROM t.Info.str_value`
   // inside a subquery); it must never run with a detached (null) outer scope.
   for (const SelectSource& source : statement.Sources()) {
-    if (!source.unnest) { continue;
-}
+    if (!source.unnest) {
+      continue;
+    }
     if (!ExpressionUsesOnlyScopes(context, source.unnest, schemas, ctes)) {
       context.execution_runtime()->noncacheable_queries.insert(&statement);
       return nullptr;
@@ -1331,8 +1364,7 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     context.execution_runtime()->retained_statements.push_back(capped);
     ++context.execution_runtime()->exists_short_circuit_queries;
   }
-  Relation result =
-      ExecuteQuery(context, *execution_statement, nullptr, ctes);
+  Relation result = ExecuteQuery(context, *execution_statement, nullptr, ctes);
   auto [iter, inserted] =
       context.execution_runtime()->uncorrelated_results.emplace(
           &statement, std::make_shared<Relation>(std::move(result)));

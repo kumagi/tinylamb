@@ -660,3 +660,75 @@ adding a warehouse gate would make the number incomparable.
 - `sql_engine_tpch_test.ExecutesAllTwentyTwoQueries` PASS
 - `optimizer_test` 81 PASS
 - `executor_test` 158 PASS
+
+## 2026-09-04 — TPC-H SF=0.01 + TPC-C SF=1 (concurrent-agent WIP tree)
+
+- **Build:** `build-agent/`, `CMAKE_BUILD_TYPE=RelWithDebInfo`, working tree at
+  `febe02a` (bytecode-compiled residual filter evaluation) plus in-flight
+  uncommitted WIP from a second agent working in the same checkout.
+- **Host:** AMD Ryzen 9 9950X3D-class (32 threads), 121 GiB RAM. Other agent
+  builds were running concurrently during parts of the measurement window,
+  so single-query numbers carry a few ms of scheduler noise.
+
+### TPC-H SF=0.01
+
+- **Command:** `./tinylamb_tpch_benchmark /tmp/tpch_agent/tpch --scale-factor 0.01`
+  (fresh fixture, cold first run) and a second pass with `--reuse-database`
+  (warm). 21 of 22 queries executed; **Q21 failed with the pre-existing
+  `spill write failed` error, unchanged from the 2026-09-03 baseline.**
+
+| Query | Cold (ms) | Warm (ms) |
+| --- | ---: | ---: |
+| Q1 | 54.0 | 51.1 |
+| Q2 | 38.3 | 32.2 |
+| Q3 | 19.1 | 19.2 |
+| Q4 | 54.3 | 53.4 |
+| Q5 | 21.7 | 22.0 |
+| Q6 | 14.6 | 14.1 |
+| Q7 | 28.7 | 35.1 |
+| Q8 | 24.6 | 26.0 |
+| Q9 | 67.0 | 67.3 |
+| Q10 | 21.5 | 22.8 |
+| Q11 | 15.6 | 13.6 |
+| Q12 | 18.4 | 17.1 |
+| Q13 | 25.2 | 25.4 |
+| Q14 | 14.2 | 11.3 |
+| Q15 | 14.4 | 11.6 |
+| Q16 | 13.2 | 10.8 |
+| Q17 | 32.9 | 31.9 |
+| Q18 | 37.0 | 33.1 |
+| Q19 | 18.2 | 16.2 |
+| Q20 | 99.2 | 87.0 |
+| Q21 | FAIL | FAIL |
+| Q22 | 280.0 | 328.2 |
+| **Sum (excl. Q21)** | **912** | **929** |
+
+- vs. the 2026-09-03 baseline (1,060 ms, Q21 excluded): **about −14%**. The
+  gains concentrate in Q22 (394 → 280/328 ms), Q9 (119 → 67 ms) and
+  Q4/Q17/Q18; Q4 and Q2 are slower than baseline and are the noisiest
+  shapes under the concurrent build load — re-measure on a quiet tree
+  before treating per-query deltas as signal.
+
+### TPC-C SF=1
+
+- **Command:** `tinylamb_tpcc_benchmark <fresh-db> --scale-factor 1
+  --clients 10 --warmup 3 --seconds 20` (default deadlock policy, WAL
+  group-commit sync on).
+- **Result:** tps **3,879**, new_order_tpm **107,841**, 81,345 attempted /
+  77,583 committed transactions, engine abort rate 4.2% (3,414), user
+  rollbacks 348, `sql_path_gate=PASS`, plan-cache hit rate 99.46%.
+- First error (as in prior records): a `payment` write-intent wait timeout
+  on `district` — the known hot-row abort source, not a correctness
+  failure.
+- **Operational note:** a TPC-C fixture that was killed mid-population
+  (0-byte data file + 238 MiB WAL) stalls on every subsequent
+  `--reuse-existing` attempt, including `--verify-only`. Fresh fixtures
+  work. Root cause not yet investigated; recovery on the truncated
+  fixture state is the suspect.
+
+### Correctness
+- Full ctest in `build-agent`: 2,032 / 2,052 passed; remaining failures are
+  the pre-existing `optimizer_adaptive_runtime` expectation, plan-shape
+  expectations for the relational set-op/aggregation planner, and
+  in-flight WIP tests from the concurrent agent (`join_queries` FULL
+  OUTER JOIN fixtures, `timezones`, `SqlOracleFuzzer`).

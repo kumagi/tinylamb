@@ -349,7 +349,8 @@ bool CanPushPredicateIntoDerived(const Expression& predicate,
 }
 
 void CountPureProjectionSubexpressions(  // NOLINT(misc-no-recursion)
-    const Expression& expression, std::unordered_map<std::string, size_t>* counts,
+    const Expression& expression,
+    std::unordered_map<std::string, size_t>* counts,
     std::unordered_map<std::string, TypeTag>* kinds) {
   if (!expression) {
     return;
@@ -417,10 +418,8 @@ bool CanStreamOrderFromIndex(TransactionContext& context,
   if (index.sc_.key_.size() != 1) {
     return false;
   }
-  const std::string key_name = table.Value()->GetSchema()
-                                   .GetColumn(index.sc_.key_[0])
-                                   .Name()
-                                   .name;
+  const std::string key_name =
+      table.Value()->GetSchema().GetColumn(index.sc_.key_[0]).Name().name;
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
     Expression order = term.expression;
     if (order && order->Type() == TypeTag::kColumnValue) {
@@ -448,9 +447,8 @@ void EmitAffineDerivedPredicateAnnotation(const SelectStatement& statement,
     return;
   }
   const SelectStatement& inner = *statement.Sources()[0].query;
-  const std::string alias = statement.Sources()[0].alias.empty()
-                                ? "d"
-                                : statement.Sources()[0].alias;
+  const std::string alias =
+      statement.Sources()[0].alias.empty() ? "d" : statement.Sources()[0].alias;
   for (const Expression& predicate : SplitConjuncts(statement.WhereClause())) {
     if (!predicate || predicate->Type() != TypeTag::kBinaryExp) {
       continue;
@@ -485,8 +483,8 @@ void EmitAffineDerivedPredicateAnnotation(const SelectStatement& statement,
         continue;
       }
       output << pad << "Filter "
-             << affine.Left()->AsColumnValue().GetColumnName().name << " >= "
-             << threshold.value.int_value / multiplier.value.int_value
+             << affine.Left()->AsColumnValue().GetColumnName().name
+             << " >= " << threshold.value.int_value / multiplier.value.int_value
              << " below Project\n";
       (void)alias;
       return;
@@ -495,8 +493,7 @@ void EmitAffineDerivedPredicateAnnotation(const SelectStatement& statement,
 }
 
 void EmitTranslatedAffineFilter(const SelectStatement& statement,
-                                const std::string& pad,
-                                std::ostream& output) {
+                                const std::string& pad, std::ostream& output) {
   if (!statement.WhereClause()) {
     return;
   }
@@ -518,14 +515,15 @@ void EmitTranslatedAffineFilter(const SelectStatement& statement,
     }
     const Value multiplier = affine.Right()->AsConstantValue().GetValue();
     const Value threshold = comparison.Right()->AsConstantValue().GetValue();
-    if (multiplier.type != ValueType::kInt64 || threshold.type != ValueType::kInt64 ||
+    if (multiplier.type != ValueType::kInt64 ||
+        threshold.type != ValueType::kInt64 ||
         multiplier.value.int_value <= 0 ||
         threshold.value.int_value % multiplier.value.int_value != 0) {
       continue;
     }
     output << pad << "Filter "
-           << affine.Left()->AsColumnValue().GetColumnName().name << " >= "
-           << threshold.value.int_value / multiplier.value.int_value
+           << affine.Left()->AsColumnValue().GetColumnName().name
+           << " >= " << threshold.value.int_value / multiplier.value.int_value
            << " below Project\n";
     return;
   }
@@ -688,8 +686,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   std::unordered_map<std::string, size_t> cse_counts;
   std::unordered_map<std::string, TypeTag> cse_kinds;
   for (const NamedExpression& item : statement.SelectList()) {
-    CountPureProjectionSubexpressions(item.expression, &cse_counts,
-                                      &cse_kinds);
+    CountPureProjectionSubexpressions(item.expression, &cse_counts, &cse_kinds);
   }
   std::vector<std::string> cse_keys;
   for (const auto& [key, count] : cse_counts) {
@@ -699,13 +696,13 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   }
   std::ranges::sort(cse_keys);
   if (!cse_keys.empty()) {
-    const auto case_key = std::ranges::find_if(
-        cse_keys, [&](const std::string& key) {
+    const auto case_key =
+        std::ranges::find_if(cse_keys, [&](const std::string& key) {
           return cse_kinds.at(key) == TypeTag::kCaseExp;
         });
     if (case_key != cse_keys.end()) {
-      output << pad << "ComputeScalar CASE uses="
-             << cse_counts.at(*case_key) << '\n';
+      output << pad << "ComputeScalar CASE uses=" << cse_counts.at(*case_key)
+             << '\n';
     } else {
       output << pad << "ComputeScalar slots=" << cse_keys.size()
              << " uses=" << cse_counts.at(cse_keys.front()) << '\n';
@@ -727,8 +724,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         if (key.size() >= 2 && key.front() == '(' && key.back() == ')') {
           key = key.substr(1, key.size() - 2);
         }
-        output << pad << "TopN key=" << key
-               << " slot=$cse0\n"
+        output << pad << "TopN key=" << key << " slot=$cse0\n"
                << pad << "ComputeScalar $cse0 once\n";
         break;
       }
@@ -741,12 +737,14 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         context.GetTable(statement.Sources()[0].table);
     if (table.HasValue() && table.Value()->IndexCount() > 0 &&
         table.Value()->GetIndex(0).sc_.key_.size() == 1 &&
-        !statement.SelectList().empty() && statement.SelectList()[0].expression &&
+        !statement.SelectList().empty() &&
+        statement.SelectList()[0].expression &&
         statement.SelectList()[0].expression->Type() == TypeTag::kColumnValue) {
       const size_t key = table.Value()->GetIndex(0).sc_.key_[0];
       const std::string key_name =
           table.Value()->GetSchema().GetColumn(key).Name().name;
-      if (statement.SelectList()[0].expression->AsColumnValue()
+      if (statement.SelectList()[0]
+              .expression->AsColumnValue()
               .GetColumnName()
               .name == key_name) {
         output << pad << "UniqueKey " << key_name << '\n';
@@ -767,7 +765,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         }
       }
       for (const NamedExpression& item : statement.SelectList()) {
-        if (!item.expression || item.expression->Type() != TypeTag::kColumnValue) {
+        if (!item.expression ||
+            item.expression->Type() != TypeTag::kColumnValue) {
           continue;
         }
         const std::string name =
@@ -1572,9 +1571,15 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       size_t topn_limit = 0;
       if (statement.Qualify()) {
         const auto& q = statement.Qualify()->AsBinaryExpression();
+        // Only a non-negative INT64 constant is a row limit; reading
+        // value.int_value of a DOUBLE constant reinterprets its bit pattern
+        // (e.g. `<= 1.5` printed 4609434218613702656).
         if (q.Right() && q.Right()->Type() == TypeTag::kConstantValue) {
-          topn_limit = static_cast<size_t>(
-              q.Right()->AsConstantValue().GetValue().value.int_value);
+          const Value limit_value = q.Right()->AsConstantValue().GetValue();
+          if (limit_value.type == ValueType::kInt64 &&
+              0 <= limit_value.value.int_value) {
+            topn_limit = static_cast<size_t>(limit_value.value.int_value);
+          }
         }
       }
       output << pad << "PartitionTopN limit=" << topn_limit << '\n';

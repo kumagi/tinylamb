@@ -21,14 +21,14 @@
 #ifndef TINYLAMB_INDEX_SCAN_HPP
 #define TINYLAMB_INDEX_SCAN_HPP
 
+#include <vector>
+
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "table/iterator.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
-
-#include <vector>
 
 namespace tinylamb {
 class Index;
@@ -43,16 +43,16 @@ class IndexScan : public ExecutorBase {
             bool wait_for_write_intent = true);
   IndexScan(Transaction& txn, const Table& table, const Index& index,
             const std::vector<Value>& begin_key,
-            const std::vector<Value>& end_key,
-            bool ascending, Expression where, Schema sc,
-            bool lock_rows = false, bool wait_for_write_intent = true);
+            const std::vector<Value>& end_key, bool ascending, Expression where,
+            Schema sc, bool lock_rows = false,
+            bool wait_for_write_intent = true);
   // Point-union access (Phase 8 IN lists): scans each [begin,end] key range
   // in sequence. Ranges must be sorted and disjoint for ordered output.
-  IndexScan(Transaction& txn, const Table& table, const Index& index,
-            std::vector<std::pair<std::vector<Value>, std::vector<Value>>>
-                ranges,
-            bool ascending, Expression where, Schema sc,
-            bool lock_rows = false, bool wait_for_write_intent = true);
+  IndexScan(
+      Transaction& txn, const Table& table, const Index& index,
+      std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
+      bool ascending, Expression where, Schema sc, bool lock_rows = false,
+      bool wait_for_write_intent = true);
   IndexScan(const IndexScan&) = delete;
   IndexScan(IndexScan&&) = delete;
   IndexScan& operator=(const IndexScan&) = delete;

@@ -15,13 +15,15 @@
  */
 
 #include "type/column_name.hpp"
+
 #include <sstream>
 
 #include "gtest/gtest.h"
 
 namespace tinylamb {
 
-TEST(ColumnNameTest, Constructor_WithQualifiedAndBareStrings_SplitsSchemaAndName) {
+TEST(ColumnNameTest,
+     Constructor_WithQualifiedAndBareStrings_SplitsSchemaAndName) {
   ColumnName a("test.ColumnName");
   ColumnName b("foobar");
 
@@ -39,7 +41,8 @@ TEST(ColumnNameTest, ToString_WhenQualified_ReturnsOriginalString) {
   ASSERT_EQ(result, "Foo.Bar");
 }
 
-TEST(ColumnNameTest, Constructors_WithVariousInputFormats_PopulateFieldsCorrectly) {
+TEST(ColumnNameTest,
+     Constructors_WithVariousInputFormats_PopulateFieldsCorrectly) {
   ColumnName def;
   ColumnName two("s", "c");
   ColumnName bare("name");
@@ -64,7 +67,8 @@ TEST(ColumnNameTest, Constructors_WithVariousInputFormats_PopulateFieldsCorrectl
   EXPECT_TRUE(dot.Empty());
 }
 
-TEST(ColumnNameTest, Operators_WithMultipleInstances_EvaluatesEqualityOrderingAndHash) {
+TEST(ColumnNameTest,
+     Operators_WithMultipleInstances_EvaluatesEqualityOrderingAndHash) {
   ColumnName a("t.c");
   ColumnName b("t", "c");
   ColumnName c("t.d");
@@ -96,7 +100,8 @@ TEST(ColumnNameTest, Operators_WithMultipleInstances_EvaluatesEqualityOrderingAn
   EXPECT_NE(hash_a, hash_c);
 }
 
-TEST(ColumnNameTest, StreamOperator_ForQualifiedAndBareNames_RendersMatchingString) {
+TEST(ColumnNameTest,
+     StreamOperator_ForQualifiedAndBareNames_RendersMatchingString) {
   std::ostringstream oss_qualified;
   std::ostringstream oss_bare;
 

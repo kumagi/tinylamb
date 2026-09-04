@@ -561,10 +561,7 @@ enum class OperatorCostKind : uint8_t {
 [[nodiscard]] double EstimateMultiColumnSelectivity(
     const std::vector<double>& selectivities, double correlation_factor = 0.0);
 
-enum class PatternMatchingKind : uint8_t {
-  kLike,
-  kRegexp
-};
+enum class PatternMatchingKind : uint8_t { kLike, kRegexp };
 
 [[nodiscard]] double EstimatePatternSelectivity(
     PatternMatchingKind kind, std::string_view pattern,
@@ -591,12 +588,15 @@ struct MemoryBudget {
   double io_spill_cost_multiplier{3.5};
 };
 
-[[nodiscard]] double EstimateMemorySpillCost(
-    OperatorCostKind kind, double input_rows, const MemoryBudget& budget = {});
+[[nodiscard]] double EstimateMemorySpillCost(OperatorCostKind kind,
+                                             double input_rows,
+                                             const MemoryBudget& budget = {});
 
-[[nodiscard]] double CalibrateOperatorCost(
-    OperatorCostKind kind, double input_rows_left, double input_rows_right,
-    const PhysicalProperties& delivered, const PhysicalProperties& required);
+[[nodiscard]] double CalibrateOperatorCost(OperatorCostKind kind,
+                                           double input_rows_left,
+                                           double input_rows_right,
+                                           const PhysicalProperties& delivered,
+                                           const PhysicalProperties& required);
 
 struct PlanAlternative {
   Plan plan;

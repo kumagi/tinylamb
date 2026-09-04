@@ -33,10 +33,9 @@ class GroupingSetsExecutor : public ExecutorBase {
       std::vector<NamedExpression> all_group_keys,
       std::vector<NamedExpression> aggregates);
 
-  static GroupingSetsExecutor Cube(
-      Executor child, Schema input_schema,
-      std::vector<NamedExpression> all_group_keys,
-      std::vector<NamedExpression> aggregates);
+  static GroupingSetsExecutor Cube(Executor child, Schema input_schema,
+                                   std::vector<NamedExpression> all_group_keys,
+                                   std::vector<NamedExpression> aggregates);
 
   bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,

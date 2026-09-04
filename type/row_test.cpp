@@ -54,20 +54,22 @@ TEST(RowTest, SerializeDeserialize_WithNullValues_PreservesNulls) {
   EXPECT_EQ(restored[2], Value(3.5));
 }
 
-TEST(RowTest, DeserializeProjected_WithSubsetIndices_KeepsOnlyRequestedColumns) {
+TEST(RowTest,
+     DeserializeProjected_WithSubsetIndices_KeepsOnlyRequestedColumns) {
   const Schema schema("projected", {Column("id", ValueType::kInt64),
-                                     Column("ignored", ValueType::kVarChar),
-                                     Column("nullable", ValueType::kDouble),
-                                     Column("name", ValueType::kVarChar)});
-  const Row original(
-      {Value(7), Value("discard me"), Value(), Value("kept")});
+                                    Column("ignored", ValueType::kVarChar),
+                                    Column("nullable", ValueType::kDouble),
+                                    Column("name", ValueType::kVarChar)});
+  const Row original({Value(7), Value("discard me"), Value(), Value("kept")});
   std::vector<char> buffer(original.Size());
   original.Serialize(buffer.data());
 
   Row projected;
-  const size_t read_proj = projected.DeserializeProjected(buffer.data(), schema, {0, 2, 3});
+  const size_t read_proj =
+      projected.DeserializeProjected(buffer.data(), schema, {0, 2, 3});
   Row count_star;
-  const size_t read_star = count_star.DeserializeProjected(buffer.data(), schema, {});
+  const size_t read_star =
+      count_star.DeserializeProjected(buffer.data(), schema, {});
 
   EXPECT_EQ(read_proj, original.Size());
   ASSERT_EQ(projected.values_.size(), 3);
@@ -79,11 +81,11 @@ TEST(RowTest, DeserializeProjected_WithSubsetIndices_KeepsOnlyRequestedColumns) 
 }
 
 TEST(RowTest, SerializeRoundTrip_WithDateAndBinaryData_PreservesAllFields) {
-  const Schema schema("mixed", {Column("id", ValueType::kInt64),
-                                Column("when", ValueType::kDate),
-                                Column("blob", ValueType::kVarChar),
-                                Column("score", ValueType::kDouble),
-                                Column("note", ValueType::kVarChar)});
+  const Schema schema(
+      "mixed",
+      {Column("id", ValueType::kInt64), Column("when", ValueType::kDate),
+       Column("blob", ValueType::kVarChar), Column("score", ValueType::kDouble),
+       Column("note", ValueType::kVarChar)});
   const std::string blob("\x00\x01\xff binary \x00 data", 17);
   const Row original({Value(7), Value::Date("2021-03-04"),
                       Value(std::string(blob)), Value(2.5), Value()});
@@ -151,6 +153,26 @@ TEST(RowTest, Extract_WithOutOfBoundsIndices_ReturnsEmptyRow) {
   EXPECT_EQ(extracted.values_.size(), 0U);
 }
 
+TEST(RowTest, Deserialize_WithMismatchedColumnCount_ThrowsInsteadOfOob) {
+  // A forged count drove sc.GetColumn(i) out of bounds (Schema::GetColumn is
+  // operator[] without range checks). Stored images always carry the full
+  // schema width, so any mismatch is corruption.
+  const Schema schema(
+      "s", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  const Row row({Value(int64_t{1}), Value(int64_t{2}), Value(int64_t{3})});
+  std::vector<char> buf(row.Size());
+  row.Serialize(buf.data());
+  Row restored;
+  EXPECT_THROW(std::ignore = restored.Deserialize(buf.data(), schema),
+               std::runtime_error);
+  Row projected;
+  EXPECT_THROW(
+      std::ignore = projected.DeserializeProjected(buf.data(), schema, {0}),
+      std::runtime_error);
+  // TryPeekInteger with a forged wide image also returns nullopt instead of
+  // reading past the schema.
+  EXPECT_EQ(Row::TryPeekInteger(buf.data(), schema, 0), std::nullopt);
+}
 TEST(RowTest, Serialize_WithTooManyColumns_ThrowsInsteadOfCorrupting) {
   // Fixed: slot_t (u16) wrapped for >= 32768 columns and the top bit
   // collided with the null-bitmap flag, silently corrupting the image.
@@ -176,4 +198,3 @@ TEST(RowTest, Serialize_WithTooManyColumns_ThrowsInsteadOfCorrupting) {
 }
 
 }  // namespace tinylamb
-

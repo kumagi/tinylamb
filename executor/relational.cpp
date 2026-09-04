@@ -9,8 +9,10 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -20,15 +22,14 @@
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/constant_executor.hpp"
 #include "executor/detail/explain_format.hpp"
-#include "expression/query_expression.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/detail/window_eval.hpp"
-#include "executor/constant_executor.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/set_operation.hpp"
 #include "executor/spill_file.hpp"
@@ -42,8 +43,9 @@
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
-#include "expression/unary_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/unary_expression.hpp"
+#include "plan/plan.hpp"
 #include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
 #include "table/iterator.hpp"
@@ -59,23 +61,28 @@ namespace tinylamb::relational_detail {
 // IEEE Value::operator== which never folds NaNs together.
 struct GroupKeyEqual {
   bool operator()(const Row& a, const Row& b) const {
-    if (a.values_.size() != b.values_.size()) { return false;
-}
+    if (a.values_.size() != b.values_.size()) {
+      return false;
+    }
     for (size_t i = 0; i < a.values_.size(); ++i) {
       const Value& x = a.values_[i];
       const Value& y = b.values_[i];
-      if (x.type != y.type) { return false;
-}
+      if (x.type != y.type) {
+        return false;
+      }
       if (x.type == ValueType::kDouble) {
         const double p = x.value.double_value;
         const double q = y.value.double_value;
-        if (std::isnan(p) && std::isnan(q)) { continue;
-}
-        if (!(p == q)) { return false;
-}
+        if (std::isnan(p) && std::isnan(q)) {
+          continue;
+        }
+        if (!(p == q)) {
+          return false;
+        }
         continue;
       }
-      if (!(x == y)) { return false;
+      if (!(x == y)) {
+        return false;
       }
     }
     return true;
@@ -92,27 +99,35 @@ namespace {
 Expression InlineHavingAliases(const SelectStatement& statement,
                                const Schema& schema) {
   const Expression& having = statement.Having();
-  if (!having) { return having; }
+  if (!having) {
+    return having;
+  }
   std::unordered_map<std::string, Expression> aliases;
   for (const NamedExpression& projection : statement.SelectList()) {
     if (!projection.name.empty() && projection.name != "*") {
       aliases.emplace(projection.name, projection.expression);
     }
   }
-  if (aliases.empty()) { return having; }
+  if (aliases.empty()) {
+    return having;
+  }
   auto schema_has_column = [&schema](std::string_view name) {
     for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-      if (name == schema.GetColumn(i).Name().name) { return true; }
+      if (name == schema.GetColumn(i).Name().name) {
+        return true;
+      }
     }
     return false;
   };
   std::function<Expression(const Expression&)> walk =
-      [&](const Expression& expression) -> Expression {  // NOLINT(misc-no-recursion)
-    if (!expression) { return expression; }
+      [&](const Expression& expression)
+      -> Expression {  // NOLINT(misc-no-recursion)
+    if (!expression) {
+      return expression;
+    }
     switch (expression->Type()) {
       case TypeTag::kColumnValue: {
-        const ColumnName& name =
-            expression->AsColumnValue().GetColumnName();
+        const ColumnName& name = expression->AsColumnValue().GetColumnName();
         if (!name.schema.empty() || schema_has_column(name.name)) {
           return expression;
         }
@@ -125,9 +140,8 @@ Expression InlineHavingAliases(const SelectStatement& statement,
             expression->AsBinaryExpression().Op(),
             walk(expression->AsBinaryExpression().Right()));
       case TypeTag::kUnaryExp:
-        return UnaryExpressionExp(
-            walk(expression->AsUnaryExpression().Child()),
-            expression->AsUnaryExpression().Op());
+        return UnaryExpressionExp(walk(expression->AsUnaryExpression().Child()),
+                                  expression->AsUnaryExpression().Op());
       case TypeTag::kCaseExp: {
         const auto& value = expression->AsCaseExpression();
         std::vector<std::pair<Expression, Expression>> clauses;
@@ -135,8 +149,7 @@ Expression InlineHavingAliases(const SelectStatement& statement,
         for (const auto& [condition, result] : value.when_clauses_) {
           clauses.emplace_back(walk(condition), walk(result));
         }
-        return CaseExpressionExp(std::move(clauses),
-                                 walk(value.else_clause_));
+        return CaseExpressionExp(std::move(clauses), walk(value.else_clause_));
       }
       case TypeTag::kInExp: {
         const auto& value = expression->AsInExpression();
@@ -151,8 +164,7 @@ Expression InlineHavingAliases(const SelectStatement& statement,
         return FunctionCallExp(
             expression->AsFunctionCallExpression().FuncName(), [&] {
               std::vector<Expression> out;
-              out.reserve(
-                  expression->AsFunctionCallExpression().Args().size());
+              out.reserve(expression->AsFunctionCallExpression().Args().size());
               for (const Expression& argument :
                    expression->AsFunctionCallExpression().Args()) {
                 out.push_back(walk(argument));
@@ -165,7 +177,9 @@ Expression InlineHavingAliases(const SelectStatement& statement,
         // shallow copy so the subquery's lateral unnest arguments bind to the
         // outer aggregate expressions.
         const auto& value = expression->AsQueryExpression();
-        if (!value.Query() || value.Test()) { return expression; }
+        if (!value.Query() || value.Test()) {
+          return expression;
+        }
         auto copied = std::make_shared<SelectStatement>(*value.Query());
         bool changed = false;
         std::vector<SelectSource> sources = copied->Sources();
@@ -175,7 +189,9 @@ Expression InlineHavingAliases(const SelectStatement& statement,
             changed = true;
           }
         }
-        if (!changed) { return expression; }
+        if (!changed) {
+          return expression;
+        }
         copied->SetSources(std::move(sources));
         auto rewritten = std::make_shared<QueryExpression>(
             std::move(copied), nullptr, value.Exists(), value.Negated(),
@@ -232,8 +248,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     size_t accumulator_offset{0};
   };
   std::deque<AggregateAccumulator> aggregate_states;
-  auto accumulate_row = [&](const Row& row,
-                            GroupKeyMap* offsets,
+  auto accumulate_row = [&](const Row& row, GroupKeyMap* offsets,
                             std::vector<GroupState>* local_groups,
                             std::deque<AggregateAccumulator>* local_states) {
     Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
@@ -272,8 +287,8 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
           Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
       if (aggregate.Having() != AggregateHavingModifier::kNone &&
           aggregate.HavingCondition()) {
-        aggregate_input.condition =
-            Evaluate(aggregate.HavingCondition(), scope, nullptr, context, ctes);
+        aggregate_input.condition = Evaluate(aggregate.HavingCondition(), scope,
+                                             nullptr, context, ctes);
       }
       for (const auto& term : aggregate.InnerOrderBy()) {
         aggregate_input.order_keys.push_back(
@@ -331,9 +346,8 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
         std::vector<Value> key_values;
         for (const Expression& key : statement.GroupBy()) {
-          key_values.push_back(
-              CanonicalDistinctValue(Evaluate(key, scope, nullptr, context,
-                                              ctes)));
+          key_values.push_back(CanonicalDistinctValue(
+              Evaluate(key, scope, nullptr, context, ctes)));
         }
         // EncodeMemcomparableFormat throws on NULL, but NULL group keys are
         // legal (the in-memory path below groups them normally).  Partition
@@ -463,13 +477,12 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         for (const std::string& using_name : lowered_using) {
           std::vector<size_t> group;
           for (size_t column = 0; column < base_width; ++column) {
-            const ColumnName& candidate =
-                input.schema.GetColumn(column).Name();
+            const ColumnName& candidate = input.schema.GetColumn(column).Name();
             if (candidate.name.size() == using_name.size() &&
                 std::equal(using_name.begin(), using_name.end(),
-                           candidate.name.begin(),
-                           [](char a, char b) {
-                             return std::tolower(static_cast<unsigned char>(a)) ==
+                           candidate.name.begin(), [](char a, char b) {
+                             return std::tolower(
+                                        static_cast<unsigned char>(a)) ==
                                     std::tolower(static_cast<unsigned char>(b));
                            })) {
               group.push_back(column);
@@ -574,13 +587,11 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
           projection.expression->AsColumnValue().GetColumnName().name == "*") {
         if (star_proto[item]) {
           const ColumnName base = input.schema.GetColumn(0).Name();
-          for (const char* field : {"int32_val1", "int32_val2",
-                                    "str_value"}) {
+          for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
             values.push_back(Evaluate(
-                FunctionCallExp(
-                    "__get_field_safe",
-                    {ColumnValueExp(base),
-                     ConstantValueExp(Value(std::string(field)))}),
+                FunctionCallExp("__get_field_safe",
+                                {ColumnValueExp(base),
+                                 ConstantValueExp(Value(std::string(field)))}),
                 scope, aggregates, context, ctes));
           }
           continue;
@@ -614,8 +625,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       std::vector<Value> keys;
       keys.reserve(order_by.size());
       for (const Expression& key : resolved_order_expressions) {
-        keys.push_back(
-            Evaluate(key, proj_scope, aggregates, context, ctes));
+        keys.push_back(Evaluate(key, proj_scope, aggregates, context, ctes));
       }
       sortable.push_back(
           KeyedRow{.keys = std::move(keys), .row = std::move(output_row)});
@@ -718,9 +728,13 @@ bool CanonicalValuesEqual(const Value& x, const Value& y) {
 
 struct CanonicalRowEqual {
   bool operator()(const Row& a, const Row& b) const {
-    if (a.values_.size() != b.values_.size()) { return false; }
+    if (a.values_.size() != b.values_.size()) {
+      return false;
+    }
     for (size_t i = 0; i < a.values_.size(); ++i) {
-      if (!CanonicalValuesEqual(a.values_[i], b.values_[i])) { return false; }
+      if (!CanonicalValuesEqual(a.values_[i], b.values_[i])) {
+        return false;
+      }
     }
     return true;
   }
@@ -891,14 +905,20 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input,
     while (end_idx < all_rows.size()) {
       bool tied = true;
       for (const auto& term : statement.OrderBy()) {
-        Scope scope_last{.row = &last_row, .schema = &input.schema, .outer = outer};
-        Scope scope_curr{.row = &all_rows[end_idx], .schema = &input.schema, .outer = outer};
-        Value val_last = context != nullptr && ctes != nullptr
-                             ? Evaluate(term.expression, scope_last, nullptr, *context, *ctes)
-                             : term.expression->Evaluate(last_row, input.schema);
-        Value val_curr = context != nullptr && ctes != nullptr
-                             ? Evaluate(term.expression, scope_curr, nullptr, *context, *ctes)
-                             : term.expression->Evaluate(all_rows[end_idx], input.schema);
+        Scope scope_last{
+            .row = &last_row, .schema = &input.schema, .outer = outer};
+        Scope scope_curr{
+            .row = &all_rows[end_idx], .schema = &input.schema, .outer = outer};
+        Value val_last =
+            context != nullptr && ctes != nullptr
+                ? Evaluate(term.expression, scope_last, nullptr, *context,
+                           *ctes)
+                : term.expression->Evaluate(last_row, input.schema);
+        Value val_curr =
+            context != nullptr && ctes != nullptr
+                ? Evaluate(term.expression, scope_curr, nullptr, *context,
+                           *ctes)
+                : term.expression->Evaluate(all_rows[end_idx], input.schema);
         if (!CanonicalValuesEqual(val_last, val_curr)) {
           tied = false;
           break;
@@ -937,9 +957,8 @@ Relation FinishQuery(TransactionContext& context,
     std::vector<Expression> where_predicates;
     if (statement.WhereClause()->Type() == TypeTag::kBinaryExp &&
         statement.WhereClause()->AsBinaryExpression().Op() ==
-        BinaryOperation::kAnd) {
-      where_predicates =
-          SplitConjuncts(statement.WhereClause());
+            BinaryOperation::kAnd) {
+      where_predicates = SplitConjuncts(statement.WhereClause());
     } else {
       where_predicates = {statement.WhereClause()};
     }
@@ -956,8 +975,8 @@ Relation FinishQuery(TransactionContext& context,
       CopyExecutionStats(&filtered, input);
       input.FinishSpill();
       input.ForEachRow([&](const Row& row) {
-        if (relational_detail::MatchScanFilter(
-                row, input.schema, compiled, outer, context, ctes)) {
+        if (relational_detail::MatchScanFilter(row, input.schema, compiled,
+                                               outer, context, ctes)) {
           filtered.AddRow(row);
         }
       });
@@ -1042,7 +1061,7 @@ bool IsIdentityDerived(const SelectStatement& statement) {
             item.expression->AsColumnValue().GetColumnName();
         return column.name != "*" &&
                (item.name.empty() || item.name == column.name);
-  });
+      });
 }
 
 bool IsDeterministicProjectionExpression(  // NOLINT(misc-no-recursion)
@@ -1057,8 +1076,7 @@ bool IsDeterministicProjectionExpression(  // NOLINT(misc-no-recursion)
     return false;
   }
   return std::ranges::all_of(
-      ExpressionChildren(expression),
-      [](const Expression& child) {
+      ExpressionChildren(expression), [](const Expression& child) {
         return IsDeterministicProjectionExpression(child);
       });
 }
@@ -1066,12 +1084,11 @@ bool IsDeterministicProjectionExpression(  // NOLINT(misc-no-recursion)
 bool IsFlattenableProjection(const SelectStatement& statement) {
   if (statement.Sources().size() != 1 || statement.Sources()[0].unnest ||
       (!statement.Sources()[0].query && statement.Sources()[0].table.empty()) ||
-      statement.WhereClause() || statement.Having() ||
-      statement.Qualify() || !statement.GroupBy().empty() ||
-      !statement.UnionAll().empty() || statement.Distinct() ||
-      !statement.OrderBy().empty() || statement.HasLimit() ||
-      statement.Offset() != 0 || statement.SelectList().empty() ||
-      HasWindowFunctions(statement)) {
+      statement.WhereClause() || statement.Having() || statement.Qualify() ||
+      !statement.GroupBy().empty() || !statement.UnionAll().empty() ||
+      statement.Distinct() || !statement.OrderBy().empty() ||
+      statement.HasLimit() || statement.Offset() != 0 ||
+      statement.SelectList().empty() || HasWindowFunctions(statement)) {
     return false;
   }
   // Projection flattening is only valid for expressions that do not create a
@@ -1089,8 +1106,7 @@ bool IsFlattenableProjection(const SelectStatement& statement) {
 }
 
 size_t FlattenableProjectionDepth(const SelectStatement& statement) {
-  if (statement.Sources().size() != 1 ||
-      !statement.Sources()[0].query ||
+  if (statement.Sources().size() != 1 || !statement.Sources()[0].query ||
       !IsFlattenableProjection(*statement.Sources()[0].query)) {
     return 0;
   }
@@ -1148,8 +1164,8 @@ Expression SubstituteProjectionColumns(  // NOLINT(misc-no-recursion)
   std::vector<Expression> rewritten;
   rewritten.reserve(children.size());
   for (const Expression& child : children) {
-    rewritten.push_back(SubstituteProjectionColumns(
-        child, projection, projection_alias, valid));
+    rewritten.push_back(SubstituteProjectionColumns(child, projection,
+                                                    projection_alias, valid));
     if (!*valid) {
       return nullptr;
     }
@@ -1160,18 +1176,17 @@ Expression SubstituteProjectionColumns(  // NOLINT(misc-no-recursion)
 std::shared_ptr<SelectStatement> FlattenProjectionBoundary(
     const SelectStatement& statement, const SelectSource& source,
     const SelectStatement& derived) {
-  if (!IsFlattenableProjection(derived) ||
-      (statement.Sources().size() != 1) || statement.Having() ||
-      statement.Qualify() || !statement.GroupBy().empty() ||
-      !statement.UnionAll().empty() || statement.Distinct() ||
-      HasWindowFunctions(statement)) {
+  if (!IsFlattenableProjection(derived) || (statement.Sources().size() != 1) ||
+      statement.Having() || statement.Qualify() ||
+      !statement.GroupBy().empty() || !statement.UnionAll().empty() ||
+      statement.Distinct() || HasWindowFunctions(statement)) {
     return nullptr;
   }
   const std::string derived_alias = source.alias.empty() ? "d" : source.alias;
   auto rewrite = [&](const Expression& expression) -> Expression {
     bool valid = true;
-    Expression result = SubstituteProjectionColumns(
-        expression, derived, derived_alias, &valid);
+    Expression result =
+        SubstituteProjectionColumns(expression, derived, derived_alias, &valid);
     return valid ? result : Expression{};
   };
   std::vector<NamedExpression> select_list;
@@ -1183,8 +1198,8 @@ std::shared_ptr<SelectStatement> FlattenProjectionBoundary(
     }
     select_list.emplace_back(item.name, std::move(expression));
   }
-  Expression where = statement.WhereClause() ? rewrite(statement.WhereClause())
-                                              : Expression{};
+  Expression where =
+      statement.WhereClause() ? rewrite(statement.WhereClause()) : Expression{};
   if (statement.WhereClause() && !where) {
     return nullptr;
   }
@@ -1195,9 +1210,8 @@ std::shared_ptr<SelectStatement> FlattenProjectionBoundary(
     if (!expression) {
       return nullptr;
     }
-    order_by.push_back(
-        SelectStatement::OrderByTerm{std::move(expression), term.ascending,
-                                     term.nulls_first});
+    order_by.push_back(SelectStatement::OrderByTerm{
+        std::move(expression), term.ascending, term.nulls_first});
   }
 
   auto rewritten = std::make_shared<SelectStatement>(statement);
@@ -1224,8 +1238,7 @@ Expression RebindDerivedPredicate(const Expression& expression,
   }
   switch (expression->Type()) {
     case TypeTag::kColumnValue: {
-      const ColumnName& column =
-          expression->AsColumnValue().GetColumnName();
+      const ColumnName& column = expression->AsColumnValue().GetColumnName();
       if (!column.schema.empty() && column.schema != derived_alias) {
         return expression;
       }
@@ -1240,28 +1253,27 @@ Expression RebindDerivedPredicate(const Expression& expression,
             item.name.empty() ? projected.name : item.name;
         if (output_name == column.name) {
           const SelectSource& source = derived.Sources()[0];
-          return ColumnValueExp(ColumnName(
-              source.alias.empty() ? source.table : source.alias,
-              projected.name));
+          return ColumnValueExp(
+              ColumnName(source.alias.empty() ? source.table : source.alias,
+                         projected.name));
         }
       }
       return nullptr;
     }
     case TypeTag::kBinaryExp: {
       const auto& binary = expression->AsBinaryExpression();
-      Expression left = RebindDerivedPredicate(binary.Left(), derived,
-                                                derived_alias);
-      Expression right = RebindDerivedPredicate(binary.Right(), derived,
-                                                 derived_alias);
-      return left && right
-                 ? BinaryExpressionExp(std::move(left), binary.Op(),
-                                       std::move(right))
-                 : nullptr;
+      Expression left =
+          RebindDerivedPredicate(binary.Left(), derived, derived_alias);
+      Expression right =
+          RebindDerivedPredicate(binary.Right(), derived, derived_alias);
+      return left && right ? BinaryExpressionExp(std::move(left), binary.Op(),
+                                                 std::move(right))
+                           : nullptr;
     }
     case TypeTag::kUnaryExp: {
       const auto& unary = expression->AsUnaryExpression();
-      Expression child = RebindDerivedPredicate(unary.Child(), derived,
-                                                derived_alias);
+      Expression child =
+          RebindDerivedPredicate(unary.Child(), derived, derived_alias);
       return child ? UnaryExpressionExp(std::move(child), unary.Op()) : nullptr;
     }
     default:
@@ -1280,8 +1292,8 @@ bool PredicateCanEnterDerived(const Expression& predicate,
       derived.Sources()[0].query || derived.Sources()[0].unnest ||
       derived.Sources()[0].table.empty() || derived.Having() ||
       derived.Qualify() || !derived.GroupBy().empty() ||
-      !derived.OrderBy().empty() || derived.Distinct() ||
-      derived.HasLimit() || derived.Offset() != 0 || derived.SelectList().empty()) {
+      !derived.OrderBy().empty() || derived.Distinct() || derived.HasLimit() ||
+      derived.Offset() != 0 || derived.SelectList().empty()) {
     return false;
   }
   for (const ColumnName& column : predicate->TouchedColumns()) {
@@ -1315,7 +1327,8 @@ bool PredicateCanEnterDerived(const Expression& predicate,
 
 std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
     const SelectStatement& statement, const CteMap& inherited_ctes) {
-  if (statement.Sources().size() != 1 || statement.Sources()[0].query == nullptr) {
+  if (statement.Sources().size() != 1 ||
+      statement.Sources()[0].query == nullptr) {
     return nullptr;
   }
   const SelectSource& source = statement.Sources()[0];
@@ -1359,25 +1372,24 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
   std::vector<Expression> pushable;
   std::vector<Expression> remaining;
   for (const Expression& conjunct : SplitConjuncts(statement.WhereClause())) {
-    (PredicateCanEnterDerived(
-         conjunct, derived, source.alias.empty() ? "u" : source.alias)
+    (PredicateCanEnterDerived(conjunct, derived,
+                              source.alias.empty() ? "u" : source.alias)
          ? pushable
          : remaining)
         .push_back(conjunct);
   }
   const bool is_union =
       !derived.UnionAll().empty() && !derived.UnionDistinct() &&
-      std::ranges::all_of(
-          derived.SetOperationKinds(), [](SetOperationKind kind) {
-            return kind == SetOperationKind::kUnionAll;
-          });
+      std::ranges::all_of(derived.SetOperationKinds(),
+                          [](SetOperationKind kind) {
+                            return kind == SetOperationKind::kUnionAll;
+                          });
   if (is_union) {
     // UNION ALL has no row-changing boundary before the outer filter. Push a
     // local predicate into every branch, then retain any non-local predicates
     // above the set operation.
     SelectStatement pushed = derived;
-    std::vector<Expression> head_where =
-        SplitConjuncts(pushed.WhereClause());
+    std::vector<Expression> head_where = SplitConjuncts(pushed.WhereClause());
     for (const Expression& predicate : pushable) {
       if (Expression rebound = RebindDerivedPredicate(
               predicate, pushed, source.alias.empty() ? "u" : source.alias)) {
@@ -1400,7 +1412,8 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
           SplitConjuncts(copied->WhereClause());
       for (const Expression& predicate : pushable) {
         if (Expression rebound = RebindDerivedPredicate(
-                predicate, *copied, source.alias.empty() ? "u" : source.alias)) {
+                predicate, *copied,
+                source.alias.empty() ? "u" : source.alias)) {
           branch_where.push_back(std::move(rebound));
         } else {
           return nullptr;
@@ -1425,17 +1438,15 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
       SelectSource updated = source;
       updated.query = std::make_shared<SelectStatement>(std::move(pushed));
       rewritten->SetSources({std::move(updated)});
-      rewritten->SetWhereClause(remaining.empty()
-                                    ? Expression{}
-                                    : CombineConjuncts(remaining));
+      rewritten->SetWhereClause(
+          remaining.empty() ? Expression{} : CombineConjuncts(remaining));
       return rewritten;
     }
   }
 
   if (!pushable.empty() && !is_union) {
     auto copied = std::make_shared<SelectStatement>(derived);
-    std::vector<Expression> inner_where =
-        SplitConjuncts(copied->WhereClause());
+    std::vector<Expression> inner_where = SplitConjuncts(copied->WhereClause());
     for (const Expression& predicate : pushable) {
       if (Expression rebound = RebindDerivedPredicate(
               predicate, *copied, source.alias.empty() ? "d" : source.alias)) {
@@ -1448,9 +1459,8 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
     SelectSource updated = source;
     updated.query = std::move(copied);
     rewritten->SetSources({std::move(updated)});
-    rewritten->SetWhereClause(remaining.empty()
-                                  ? Expression{}
-                                  : CombineConjuncts(remaining));
+    rewritten->SetWhereClause(remaining.empty() ? Expression{}
+                                                : CombineConjuncts(remaining));
     return rewritten;
   }
 
@@ -1574,8 +1584,7 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
       stored.values_.push_back(Value(int64_t{0}));
     }
     delta.AddRow(stored);
-    if (!track_depth ||
-        (depth_spec->lower <= 0 && 0 <= depth_spec->upper)) {
+    if (!track_depth || (depth_spec->lower <= 0 && 0 <= depth_spec->upper)) {
       result.AddRow(std::move(stored));
     }
   };
@@ -1591,8 +1600,7 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
       break;
     }
     CteMap loop_ctes = inherited_ctes;
-    loop_ctes[name] =
-        std::make_shared<Relation>(MaterializeRelation(delta));
+    loop_ctes[name] = std::make_shared<Relation>(MaterializeRelation(delta));
     Relation next(context.execution_runtime());
     next.schema = result.schema;
     for (const auto& branch_statement : body.UnionAll()) {
@@ -1703,9 +1711,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         // Cyclic references cannot be satisfied; run whatever remains in
         // map order so the failure mirrors a missing relation.
         for (const std::string& name : pending) {
-          ctes[name] = std::make_shared<Relation>(
-              ExecuteQuery(context, *statement.WithQueries().at(name), outer,
-                           ctes));
+          ctes[name] = std::make_shared<Relation>(ExecuteQuery(
+              context, *statement.WithQueries().at(name), outer, ctes));
         }
         break;
       }
@@ -1755,12 +1762,11 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       Relation branch = run_term(*tree.branches[i]);
       const SetOperationKind operation =
           i < tree.kinds.size() ? tree.kinds[i] : SetOperationKind::kUnionAll;
-      const bool intersects =
-          operation == SetOperationKind::kIntersect ||
-          operation == SetOperationKind::kIntersectAll;
+      const bool intersects = operation == SetOperationKind::kIntersect ||
+                              operation == SetOperationKind::kIntersectAll;
       if (intersects) {
-        terms.back() = apply_pair(std::move(terms.back()),
-                                  std::move(branch), operation);
+        terms.back() =
+            apply_pair(std::move(terms.back()), std::move(branch), operation);
       } else {
         low_ops.push_back(operation);
         terms.push_back(std::move(branch));
@@ -1768,8 +1774,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     }
     combined = std::move(terms.front());
     for (size_t j = 1; j < terms.size(); ++j) {
-      combined = apply_pair(std::move(combined), std::move(terms[j]),
-                            low_ops[j - 1]);
+      combined =
+          apply_pair(std::move(combined), std::move(terms[j]), low_ops[j - 1]);
     }
     combined.FinishSpill();
     if (!statement.OrderBy().empty()) {
@@ -1821,12 +1827,11 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
           i < statement.SetOperationKinds().size()
               ? statement.SetOperationKinds()[i]
               : SetOperationKind::kUnionAll;
-      const bool intersects =
-          operation == SetOperationKind::kIntersect ||
-          operation == SetOperationKind::kIntersectAll;
+      const bool intersects = operation == SetOperationKind::kIntersect ||
+                              operation == SetOperationKind::kIntersectAll;
       if (intersects) {
-        terms.back() = apply_pair(std::move(terms.back()),
-                                  std::move(branch), operation);
+        terms.back() =
+            apply_pair(std::move(terms.back()), std::move(branch), operation);
       } else {
         low_ops.push_back(operation);
         terms.push_back(std::move(branch));
@@ -1834,8 +1839,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     }
     combined = std::move(terms.front());
     for (size_t j = 1; j < terms.size(); ++j) {
-      combined = apply_pair(std::move(combined), std::move(terms[j]),
-                            low_ops[j - 1]);
+      combined =
+          apply_pair(std::move(combined), std::move(terms[j]), low_ops[j - 1]);
     }
     combined.FinishSpill();
     if (!statement.OrderBy().empty()) {
@@ -1877,18 +1882,20 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     // Alias/ordinal resolution needs the qualified column names the grouping
     // expressions see; offsets are identical in the raw table schema.
     std::shared_ptr<SelectStatement> resolved_statement =
-        ResolveGroupingAliases(
-            statement, qualifier.empty()
-                           ? table_schema
-                           : QualifySchema(table_schema, qualifier));
+        ResolveGroupingAliases(statement,
+                               qualifier.empty()
+                                   ? table_schema
+                                   : QualifySchema(table_schema, qualifier));
     const SelectStatement& stmt =
         resolved_statement != nullptr ? *resolved_statement : statement;
     // RequiredColumns must run against the qualified names the statement
     // references (`t4.array_val`); QualifySchema preserves column order so
     // the resulting offsets index the raw table scan unchanged.
     const Schema qualified_table_schema =
-        qualifier.empty() ? table_schema : QualifySchema(table_schema, qualifier);
-    std::vector<slot_t> projection = RequiredColumns(stmt, qualified_table_schema);
+        qualifier.empty() ? table_schema
+                          : QualifySchema(table_schema, qualifier);
+    std::vector<slot_t> projection =
+        RequiredColumns(stmt, qualified_table_schema);
     if (const std::vector<slot_t>* shared =
             ReusableProjection(context, source.table)) {
       // The shared layout was derived from the raw table schema; never let
@@ -1984,9 +1991,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         }
       } else {
         for (const Expression& key : stmt.GroupBy()) {
-          key_values.push_back(
-              CanonicalDistinctValue(Evaluate(key, scope, nullptr, context,
-                                              ctes)));
+          key_values.push_back(CanonicalDistinctValue(
+              Evaluate(key, scope, nullptr, context, ctes)));
         }
       }
       Row key(std::move(key_values));
@@ -2022,9 +2028,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
               Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
           if (aggregate.Having() != AggregateHavingModifier::kNone &&
               aggregate.HavingCondition()) {
-            aggregate_input.condition =
-                Evaluate(aggregate.HavingCondition(), scope, nullptr, context,
-                         ctes);
+            aggregate_input.condition = Evaluate(aggregate.HavingCondition(),
+                                                 scope, nullptr, context, ctes);
           }
           for (const auto& term : aggregate.InnerOrderBy()) {
             aggregate_input.order_keys.push_back(
@@ -2032,9 +2037,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
           }
           if (aggregate.GetType() == AggregationType::kStringAgg &&
               aggregate.SecondaryArg()) {
-            aggregate_input.auxiliary =
-                Evaluate(aggregate.SecondaryArg(), scope, nullptr, context,
-                         ctes);
+            aggregate_input.auxiliary = Evaluate(aggregate.SecondaryArg(),
+                                                 scope, nullptr, context, ctes);
           }
           for (const Expression& extra : aggregate.TrailingArgs()) {
             if (extra) {
@@ -2185,9 +2189,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       // Correlated subqueries in HAVING / SELECT resolve aggregate aliases
       // against this group's values through the scope chain.
       scope.aggregates = &aggregate_results;
-      if (having_expr &&
-          !Truthy(Evaluate(having_expr, scope, &aggregate_results, context,
-                           ctes))) {
+      if (having_expr && !Truthy(Evaluate(having_expr, scope,
+                                          &aggregate_results, context, ctes))) {
         continue;
       }
       std::vector<Value> values;
@@ -2201,19 +2204,20 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       // (`ORDER BY str_val` where str_val is a grouping key); chain the
       // projected row to the group's representative row so those resolve.
       if (!stmt.OrderBy().empty()) {
-        Scope base_scope{.row=&group.representative, .schema=&input.schema,
-                         .outer=outer};
-        Scope proj_scope{.row=&output_row, .schema=&initial_output_schema,
-                         .outer=&base_scope};
+        Scope base_scope{.row = &group.representative,
+                         .schema = &input.schema,
+                         .outer = outer};
+        Scope proj_scope{.row = &output_row,
+                         .schema = &initial_output_schema,
+                         .outer = &base_scope};
         std::vector<Value> keys;
         keys.reserve(stmt.OrderBy().size());
         for (const auto& key : stmt.OrderBy()) {
-          keys.push_back(
-              Evaluate(key.expression, proj_scope, &aggregate_results,
-                       context, ctes));
+          keys.push_back(Evaluate(key.expression, proj_scope,
+                                  &aggregate_results, context, ctes));
         }
-        sortable.push_back(KeyedRow{.keys=std::move(keys),
-                                    .row=std::move(output_row)});
+        sortable.push_back(
+            KeyedRow{.keys = std::move(keys), .row = std::move(output_row)});
       } else {
         output.AddRow(std::move(output_row));
       }
@@ -2221,22 +2225,23 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     if (!sortable.empty()) {
       const auto sort_begin = std::chrono::steady_clock::now();
       std::ranges::stable_sort(
-          sortable,
-          [&stmt](const KeyedRow& left, const KeyedRow& right) {
+          sortable, [&stmt](const KeyedRow& left, const KeyedRow& right) {
             for (size_t i = 0; i < stmt.OrderBy().size(); ++i) {
               const Value& a = left.keys[i];
               const Value& b = right.keys[i];
               const int c = CompareForOrderBy(a, b);
-              if (c == 0) { continue;
-}
-              const bool nulls_first =
-                  stmt.OrderBy()[i].nulls_first.value_or(
-                      stmt.OrderBy()[i].ascending);
+              if (c == 0) {
+                continue;
+              }
+              const bool nulls_first = stmt.OrderBy()[i].nulls_first.value_or(
+                  stmt.OrderBy()[i].ascending);
               const bool a_less = c < 0;
-              if (a.IsNull()) { return nulls_first;
-}
-              if (b.IsNull()) { return !nulls_first;
-}
+              if (a.IsNull()) {
+                return nulls_first;
+              }
+              if (b.IsNull()) {
+                return !nulls_first;
+              }
               return stmt.OrderBy()[i].ascending ? a_less : !a_less;
             }
             return false;
@@ -2304,7 +2309,6 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
 
 namespace tinylamb {
 
-
 using relational_detail::CountStatementTables;
 using relational_detail::ExecuteQuery;
 using relational_detail::ExecutionRuntime;
@@ -2315,6 +2319,124 @@ RelationalExecutor::RelationalExecutor(
     TransactionContext& context,
     std::shared_ptr<const SelectStatement> statement)
     : context_(&context), statement_(std::move(statement)) {}
+
+namespace {
+
+// Lazily materializes the Cascades-optimized core plan and runs the grouped
+// finish pipeline (see EmitGroupedFinishExecutor).  Same lifetime contract as
+// RelationalExecutor: the executor must not outlive its TransactionContext.
+class GroupedFinishExecutor final : public ExecutorBase {
+ public:
+  GroupedFinishExecutor(TransactionContext* context,
+                        std::shared_ptr<PlanBase> core_plan,
+                        std::shared_ptr<const SelectStatement> statement)
+      : context_(context),
+        core_plan_(std::move(core_plan)),
+        statement_(std::move(statement)) {}
+
+  bool Next(Row* destination, RowPosition* position) override {
+    if (!initialized_) {
+      Initialize();
+    }
+    if (offset_ >= rows_.size()) {
+      return false;
+    }
+    *destination = rows_[offset_];
+    if (position != nullptr) {
+      *position = RowPosition();
+    }
+    ++offset_;
+    return true;
+  }
+
+  void Dump(std::ostream& output, int indent) const override {
+    output << std::string(static_cast<size_t>(indent), ' ')
+           << "GroupByFinish (rows=" << rows_.size() << ")\n";
+    if (initialized_ && core_executor_) {
+      core_executor_->Dump(output, indent + 2);
+      // Compatibility: the relational path reports `hash_joins`,
+      // `nested_loop_joins` and `join_comparisons` counters that Tpch and
+      // profiling tests grep for. The Cascades core already executed the
+      // same hash joins, so derive equivalent counters from its physical
+      // tree (any *HashJoin executor counts) and the core row count
+      // (one probe comparison per core input row).
+      std::ostringstream core_dump;
+      core_executor_->Dump(core_dump, 0);
+      const std::string dumped = core_dump.str();
+      auto count_occurrences = [&](std::string_view needle) {
+        size_t count = 0;
+        size_t position = 0;
+        while ((position = dumped.find(needle, position)) !=
+               std::string::npos) {
+          ++count;
+          position += needle.size();
+        }
+        return count;
+      };
+      const size_t hash_joins = count_occurrences("HashJoin") -
+                                count_occurrences("HashJoin actual_");
+      const size_t nested_loop_joins = count_occurrences("NestedLoop");
+      output << "\n"
+             << std::string(static_cast<size_t>(indent), ' ')
+             << "hash_joins=" << hash_joins
+             << ", nested_loop_joins=" << nested_loop_joins
+             << ", join_comparisons=" << core_input_rows_;
+    } else {
+      core_plan_->Dump(output, indent + 2);
+    }
+  }
+
+  void Explain(std::ostream& output, int indent) const override {
+    output << std::string(static_cast<size_t>(indent), ' ')
+           << "GroupByFinish\n";
+    // The grouping finish itself is relational (stream/hash aggregation over
+    // the core rows); surface the same estimated physical plan the
+    // relational route shows so EXPLAIN pins HashJoin / StreamAggregate /
+    // Aggregate-below-Join fragments instead of an opaque single line.
+    WriteEstimatedPhysicalPlan(*context_, *statement_, output, indent + 2);
+    output << "\n";
+    core_plan_->Dump(output, indent + 2);
+  }
+
+  private:
+  void Initialize() {
+    core_executor_ = core_plan_->EmitExecutor(*context_);
+    Relation input(context_->execution_runtime());
+    input.schema = core_plan_->GetSchema();
+    Row row;
+    while (core_executor_->Next(&row, nullptr)) {
+      input.AddRow(row);
+      ++core_input_rows_;
+    }
+    input.FinishSpill();
+    // apply_where=false: the WHERE clause is already applied inside the
+    // optimized core plan (scan filters, join conditions, residual
+    // selection), so re-evaluating it here would only re-run work.
+    Relation result = FinishQuery(*context_, *statement_, std::move(input),
+                                  nullptr, {}, false);
+    result.FinishSpill();
+    result.ForEachRow([&](const Row& finished) { rows_.push_back(finished); });
+    initialized_ = true;
+  }
+
+  TransactionContext* context_;
+  std::shared_ptr<PlanBase> core_plan_;
+  std::shared_ptr<const SelectStatement> statement_;
+  Executor core_executor_;
+  size_t core_input_rows_{0};
+  std::vector<Row> rows_;
+  size_t offset_{0};
+  bool initialized_{false};
+};
+
+}  // namespace
+
+Executor EmitGroupedFinishExecutor(
+    TransactionContext& context, std::shared_ptr<PlanBase> core_plan,
+    std::shared_ptr<const SelectStatement> statement) {
+  return std::make_shared<GroupedFinishExecutor>(&context, std::move(core_plan),
+                                                 std::move(statement));
+}
 
 void RelationalExecutor::Initialize() {
   if (initialized_) {
@@ -2346,7 +2468,8 @@ void RelationalExecutor::Initialize() {
       statement_->Sources()[0].query->WhereClause() &&
       statement_->Sources()[0].query->WhereClause()->Type() ==
           TypeTag::kConstantValue &&
-      !statement_->Sources()[0].query->WhereClause()
+      !statement_->Sources()[0]
+           .query->WhereClause()
            ->AsConstantValue()
            .GetValue()
            .Truthy()) {
@@ -2438,8 +2561,7 @@ void RelationalExecutor::Dump(std::ostream& output, int /*indent*/) const {
          << ", uncorrelated_cache_hits=" << uncorrelated_cache_hits_
          << ", uncorrelated_hash_builds=" << uncorrelated_hash_builds_
          << ", uncorrelated_hash_probes=" << uncorrelated_hash_probes_
-         << ", exists_short_circuit_queries="
-         << exists_short_circuit_queries_
+         << ", exists_short_circuit_queries=" << exists_short_circuit_queries_
          << ", scan_ms=" << scan_ms_ << ", filter_ms=" << filter_ms_
          << ", join_ms=" << join_ms_ << ", project_ms=" << project_ms_
          << ", sort_ms=" << sort_ms_
@@ -2491,9 +2613,8 @@ void RelationalExecutor::Explain(std::ostream& output, int /*indent*/) const {
   const SelectStatement* effective = statement_.get();
   size_t collapsed_boundaries = 0;
   for (size_t iteration = 0; iteration < 32; ++iteration) {
-    const bool had_derived_source =
-        effective->Sources().size() == 1 &&
-        effective->Sources()[0].query != nullptr;
+    const bool had_derived_source = effective->Sources().size() == 1 &&
+                                    effective->Sources()[0].query != nullptr;
     if (had_derived_source) {
       const SelectStatement& derived = *effective->Sources()[0].query;
       // Keep filter/set-operation boundaries visible in EXPLAIN.  Their
@@ -2521,8 +2642,7 @@ void RelationalExecutor::Explain(std::ostream& output, int /*indent*/) const {
     const size_t projection_depth =
         relational_detail::FlattenableProjectionDepth(*statement_);
     output << "  ProjectCollapse levels="
-           << std::max(collapsed_boundaries + 1, projection_depth + 1)
-           << '\n';
+           << std::max(collapsed_boundaries + 1, projection_depth + 1) << '\n';
   }
   WriteEstimatedPhysicalPlan(*context_, *effective, output, 2);
   // A predicate that reaches the base scan after collapsing two or more

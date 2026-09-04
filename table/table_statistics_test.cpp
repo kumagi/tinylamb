@@ -16,8 +16,8 @@
 
 #include "table/table_statistics.hpp"
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -140,7 +140,8 @@ TEST_F(TableStatisticsTest, UpdateStatistics_WhenCalled_StoresStatistics) {
   db_->UpdateStatistics(ctx, "Sc2", ts);
 }
 
-TEST_F(TableStatisticsTest, Update_WithSampleData_CollectsHistogramBoundariesAndCommonValues) {
+TEST_F(TableStatisticsTest,
+       Update_WithSampleData_CollectsHistogramBoundariesAndCommonValues) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
@@ -164,7 +165,8 @@ TEST_F(TableStatisticsTest, Update_WithSampleData_CollectsHistogramBoundariesAnd
   EXPECT_NEAR(statistics.EstimateCount(0, Value(10), Value(19)), 10, 1.5);
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_WithSkewAndNulls_ReturnsAccurateEstimates) {
+TEST_F(TableStatisticsTest,
+       EstimateSelectivity_WithSkewAndNulls_ReturnsAccurateEstimates) {
   {
     TransactionContext context = db_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(
@@ -238,7 +240,8 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_WithSkewAndNulls_ReturnsAccurate
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(TableStatisticsTest, RefreshStatistics_WideTable_PersistsAsSeparateColumnEntries) {
+TEST_F(TableStatisticsTest,
+       RefreshStatistics_WideTable_PersistsAsSeparateColumnEntries) {
   {
     TransactionContext context = db_->BeginContext();
     std::vector<Column> columns;
@@ -253,7 +256,8 @@ TEST_F(TableStatisticsTest, RefreshStatistics_WideTable_PersistsAsSeparateColumn
       std::vector<Value> values;
       values.reserve(20);
       for (int column = 0; column < 20; ++column) {
-        values.emplace_back(std::string(80, static_cast<char>('a' + ((row + column) % 26))));
+        values.emplace_back(
+            std::string(80, static_cast<char>('a' + ((row + column) % 26))));
       }
       ASSERT_SUCCESS(
           table.Insert(context.txn_, Row(std::move(values))).GetStatus());
@@ -276,7 +280,8 @@ TEST_F(TableStatisticsTest, RefreshStatistics_WideTable_PersistsAsSeparateColumn
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST(TableStatisticsSerializationTest, Deserialize_LegacyStatistics_ReconstructsStatistics) {
+TEST(TableStatisticsSerializationTest,
+     Deserialize_LegacyStatistics_ReconstructsStatistics) {
   std::stringstream stream;
   Encoder encoder(stream);
   encoder << uint64_t{1} << ValueType::kInt64 << int64_t{99} << int64_t{0}
@@ -304,21 +309,22 @@ TEST_F(TableStatisticsTest, Serialize_ColumnStats_FitsInOneLeafEntry) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(TableStatisticsTest, ReductionFactor_AndTransformBy_ComputesExpectedFactorsAndRows) {
+TEST_F(TableStatisticsTest,
+       ReductionFactor_AndTransformBy_ComputesExpectedFactorsAndRows) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  Expression equals = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
-      ConstantValueExp(Value(int64_t{5})));
+  Expression equals =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{5})));
   EXPECT_NEAR(statistics.ReductionFactor(schema, equals), 100.0, 20.0);
 
-  Expression impossible = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
-      ConstantValueExp(Value(int64_t{-999})));
+  Expression impossible =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{-999})));
   EXPECT_DOUBLE_EQ(statistics.ReductionFactor(schema, impossible),
                    std::numeric_limits<double>::max());
 
@@ -327,16 +333,17 @@ TEST_F(TableStatisticsTest, ReductionFactor_AndTransformBy_ComputesExpectedFacto
   EXPECT_NEAR(transformed.Rows(), 10, 2.0);
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_ConstantOnLeft_EvaluatesReverseComparison) {
+TEST_F(TableStatisticsTest,
+       EstimateSelectivity_ConstantOnLeft_EvaluatesReverseComparison) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  Expression left_equals = BinaryExpressionExp(
-      ConstantValueExp(Value(int64_t{5})), BinaryOperation::kEquals,
-      ColumnValueExp("Sc1.c1"));
+  Expression left_equals =
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{5})),
+                          BinaryOperation::kEquals, ColumnValueExp("Sc1.c1"));
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, left_equals), 0.01, 0.01);
 
   Expression left_greater = BinaryExpressionExp(
@@ -345,106 +352,111 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_ConstantOnLeft_EvaluatesReverseC
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, left_greater), 0.5, 0.05);
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_NotEqualsAndLike_ReturnsExpectedSelectivity) {
+TEST_F(TableStatisticsTest,
+       EstimateSelectivity_NotEqualsAndLike_ReturnsExpectedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  Expression not_equals = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kNotEquals,
-      ConstantValueExp(Value(int64_t{5})));
+  Expression not_equals =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kNotEquals,
+                          ConstantValueExp(Value(int64_t{5})));
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, not_equals), 0.99, 0.01);
 
-  Expression like = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c2"), BinaryOperation::kLike,
-      ConstantValueExp(Value(std::string("%"))));
-  Expression not_like = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c2"), BinaryOperation::kNotLike,
-      ConstantValueExp(Value(std::string("%"))));
+  Expression like =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c2"), BinaryOperation::kLike,
+                          ConstantValueExp(Value(std::string("%"))));
+  Expression not_like =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c2"), BinaryOperation::kNotLike,
+                          ConstantValueExp(Value(std::string("%"))));
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, like), 0.1, 0.05);
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, not_like), 0.9, 0.05);
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_CorrelatedRangeOnSameColumn_ComputesCombinedSelectivity) {
+TEST_F(
+    TableStatisticsTest,
+    EstimateSelectivity_CorrelatedRangeOnSameColumn_ComputesCombinedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  Expression equals_one = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
-      ConstantValueExp(Value(int64_t{1})));
-  Expression greater_double = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kGreaterThan,
-      ConstantValueExp(Value(2.5)));
-  Expression impossible_and = BinaryExpressionExp(
-      equals_one, BinaryOperation::kAnd, greater_double);
+  Expression equals_one =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{1})));
+  Expression greater_double = BinaryExpressionExp(ColumnValueExp("Sc1.c1"),
+                                                  BinaryOperation::kGreaterThan,
+                                                  ConstantValueExp(Value(2.5)));
+  Expression impossible_and =
+      BinaryExpressionExp(equals_one, BinaryOperation::kAnd, greater_double);
   EXPECT_DOUBLE_EQ(statistics.EstimateSelectivity(schema, impossible_and), 0);
 
   Expression greater_one = BinaryExpressionExp(
       ColumnValueExp("Sc1.c1"), BinaryOperation::kGreaterThan,
       ConstantValueExp(Value(int64_t{1})));
-  Expression less_three = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kLessThan,
-      ConstantValueExp(Value(int64_t{3})));
-  Expression correlated_or = BinaryExpressionExp(
-      greater_one, BinaryOperation::kOr, less_three);
+  Expression less_three =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(int64_t{3})));
+  Expression correlated_or =
+      BinaryExpressionExp(greater_one, BinaryOperation::kOr, less_three);
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, correlated_or), 0.98,
               0.05);
 
-  Expression correlated_and = BinaryExpressionExp(
-      greater_one, BinaryOperation::kAnd, less_three);
+  Expression correlated_and =
+      BinaryExpressionExp(greater_one, BinaryOperation::kAnd, less_three);
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, correlated_and), 0.03,
               0.03);
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_InExpression_ComputesExpectedSelectivity) {
+TEST_F(TableStatisticsTest,
+       EstimateSelectivity_InExpression_ComputesExpectedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  Expression in = InExpressionExp(
-      ColumnValueExp("Sc1.c1"),
-      {ConstantValueExp(Value(int64_t{1})), ConstantValueExp(Value(int64_t{2}))});
+  Expression in = InExpressionExp(ColumnValueExp("Sc1.c1"),
+                                  {ConstantValueExp(Value(int64_t{1})),
+                                   ConstantValueExp(Value(int64_t{2}))});
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, in), 0.02, 0.01);
 
   Expression in_compound = InExpressionExp(
-      BinaryExpressionExp(ColumnValueExp("Sc1.c1"),
-                          BinaryOperation::kEquals,
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(int64_t{1}))),
       {ConstantValueExp(Value(int64_t{2}))});
-  EXPECT_NEAR(statistics.EstimateSelectivity(schema, in_compound), 0.25,
-              0.001);
+  EXPECT_NEAR(statistics.EstimateSelectivity(schema, in_compound), 0.25, 0.001);
 
-  Expression in_column = InExpressionExp(
-      ColumnValueExp("Sc1.c1"), {ColumnValueExp("Sc1.c2")});
+  Expression in_column =
+      InExpressionExp(ColumnValueExp("Sc1.c1"), {ColumnValueExp("Sc1.c2")});
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, in_column), 0.25, 0.001);
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_ColumnToColumnEquality_ReturnsExpectedSelectivity) {
+TEST_F(TableStatisticsTest,
+       EstimateSelectivity_ColumnToColumnEquality_ReturnsExpectedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  Expression self = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
-      ColumnValueExp("Sc1.c1"));
+  Expression self =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
+                          ColumnValueExp("Sc1.c1"));
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, self), 1.0, 0.001);
 
-  Expression cross = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
-      ColumnValueExp("Sc1.c2"));
+  Expression cross =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
+                          ColumnValueExp("Sc1.c2"));
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, cross), 0.01, 0.01);
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_ConstantAndUnknownPredicates_ReturnsExpectedSelectivity) {
+TEST_F(
+    TableStatisticsTest,
+    EstimateSelectivity_ConstantAndUnknownPredicates_ReturnsExpectedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
@@ -464,7 +476,8 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_ConstantAndUnknownPredicates_Ret
               0.25, 0.001);
 }
 
-TEST_F(TableStatisticsTest, ScaleToRows_AndOperations_ScalesAndModifiesStatistics) {
+TEST_F(TableStatisticsTest,
+       ScaleToRows_AndOperations_ScalesAndModifiesStatistics) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
@@ -490,9 +503,9 @@ TEST_F(TableStatisticsTest, ScaleToRows_AndOperations_ScalesAndModifiesStatistic
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST(TableStatisticsSerializationTest, Serialize_NewFormatRoundTrip_PreservesAllFields) {
-  TableStatistics original(
-      Schema("T", {Column("a", ValueType::kInt64)}));
+TEST(TableStatisticsSerializationTest,
+     Serialize_NewFormatRoundTrip_PreservesAllFields) {
+  TableStatistics original(Schema("T", {Column("a", ValueType::kInt64)}));
   std::vector<ColumnStats> columns;
   columns.emplace_back(ValueType::kInt64);
   original.Assign(5, std::move(columns));
@@ -509,14 +522,14 @@ TEST(TableStatisticsSerializationTest, Serialize_NewFormatRoundTrip_PreservesAll
   EXPECT_EQ(decoded.Column(0).Type(), ValueType::kInt64);
 }
 
-TEST(TableStatisticsSerializationTest, Deserialize_LegacyDoubleDateVarchar_ReconstructsBucketsAndCounts) {
+TEST(TableStatisticsSerializationTest,
+     Deserialize_LegacyDoubleDateVarchar_ReconstructsBucketsAndCounts) {
   {
     std::stringstream stream;
     Encoder encoder(stream);
-    encoder << uint64_t{1} << ValueType::kDouble << 5.5 << 1.5
-            << uint64_t{3} << uint64_t{2};
-    TableStatistics statistics(
-        Schema("T", {Column("d", ValueType::kDouble)}));
+    encoder << uint64_t{1} << ValueType::kDouble << 5.5 << 1.5 << uint64_t{3}
+            << uint64_t{2};
+    TableStatistics statistics(Schema("T", {Column("d", ValueType::kDouble)}));
     Decoder decoder(stream);
     decoder >> statistics;
 
@@ -531,8 +544,7 @@ TEST(TableStatisticsSerializationTest, Deserialize_LegacyDoubleDateVarchar_Recon
     Encoder encoder(stream);
     encoder << uint64_t{1} << ValueType::kDate << int64_t{20000}
             << int64_t{10000} << uint64_t{4} << uint64_t{3};
-    TableStatistics statistics(
-        Schema("T", {Column("t", ValueType::kDate)}));
+    TableStatistics statistics(Schema("T", {Column("t", ValueType::kDate)}));
     Decoder decoder(stream);
     decoder >> statistics;
 
@@ -544,8 +556,7 @@ TEST(TableStatisticsSerializationTest, Deserialize_LegacyDoubleDateVarchar_Recon
     std::stringstream stream;
     Encoder encoder(stream);
     encoder << uint64_t{1} << ValueType::kVarChar << uint64_t{7} << uint64_t{6};
-    TableStatistics statistics(
-        Schema("T", {Column("v", ValueType::kVarChar)}));
+    TableStatistics statistics(Schema("T", {Column("v", ValueType::kVarChar)}));
     Decoder decoder(stream);
     decoder >> statistics;
 
@@ -556,7 +567,8 @@ TEST(TableStatisticsSerializationTest, Deserialize_LegacyDoubleDateVarchar_Recon
   }
 }
 
-TEST(TableStatisticsSerializationTest, Deserialize_LegacyNullColumn_ThrowsRuntimeException) {
+TEST(TableStatisticsSerializationTest,
+     Deserialize_LegacyNullColumn_ThrowsRuntimeException) {
   std::stringstream stream;
   Encoder encoder(stream);
   encoder << uint64_t{1} << ValueType::kNull;
@@ -566,7 +578,8 @@ TEST(TableStatisticsSerializationTest, Deserialize_LegacyNullColumn_ThrowsRuntim
   EXPECT_THROW(decoder >> statistics, std::runtime_error);
 }
 
-TEST(TableStatisticsSerializationTest, Deserialize_UnsupportedVersion_ThrowsRuntimeException) {
+TEST(TableStatisticsSerializationTest,
+     Deserialize_UnsupportedVersion_ThrowsRuntimeException) {
   std::stringstream stream;
   Encoder encoder(stream);
   encoder << uint64_t{0x544C535441545302ULL} << uint64_t{99};
@@ -577,30 +590,29 @@ TEST(TableStatisticsSerializationTest, Deserialize_UnsupportedVersion_ThrowsRunt
   EXPECT_THROW(decoder >> statistics, std::runtime_error);
 }
 
-TEST(TableStatisticsSerializationTest, EstimateRange_LegacyVarcharWithoutHistogram_FallsBackToAverageSelectivity) {
+TEST(
+    TableStatisticsSerializationTest,
+    EstimateRange_LegacyVarcharWithoutHistogram_FallsBackToAverageSelectivity) {
   std::stringstream stream;
   Encoder encoder(stream);
   encoder << uint64_t{1} << ValueType::kVarChar << uint64_t{7} << uint64_t{6};
-  TableStatistics statistics(
-      Schema("T", {Column("v", ValueType::kVarChar)}));
+  TableStatistics statistics(Schema("T", {Column("v", ValueType::kVarChar)}));
   Decoder decoder(stream);
   decoder >> statistics;
 
-  EXPECT_DOUBLE_EQ(statistics.Column(0).EstimateEqual(Value("xyz")),
-                   7.0 / 6.0);
-  EXPECT_NEAR(
-      statistics.Column(0).EstimateRange(std::nullopt, false, Value("z"),
-                                         false),
-      7.0 * 0.5, 0.001);
+  EXPECT_DOUBLE_EQ(statistics.Column(0).EstimateEqual(Value("xyz")), 7.0 / 6.0);
+  EXPECT_NEAR(statistics.Column(0).EstimateRange(std::nullopt, false,
+                                                 Value("z"), false),
+              7.0 * 0.5, 0.001);
 }
 
-TEST_F(TableStatisticsTest, EstimateRange_WithCoercionAndEdgeCases_ReturnsAccurateEstimates) {
+TEST_F(TableStatisticsTest,
+       EstimateRange_WithCoercionAndEdgeCases_ReturnsAccurateEstimates) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
 
-  EXPECT_NEAR(statistics.Column(2).EstimateEqual(Value(int64_t{10})), 1.0,
-              0.1);
+  EXPECT_NEAR(statistics.Column(2).EstimateEqual(Value(int64_t{10})), 1.0, 0.1);
 
   EXPECT_NEAR(statistics.EstimateCount(0, Value(5.0), Value(10.0)), 6, 2);
 
@@ -611,20 +623,17 @@ TEST_F(TableStatisticsTest, EstimateRange_WithCoercionAndEdgeCases_ReturnsAccura
                                                false),
             100.0);
 
-  EXPECT_NEAR(
-      statistics.Column(1).EstimateRange(std::nullopt, false, Value("c2-30"),
-                                         false),
-      31, 8);
+  EXPECT_NEAR(statistics.Column(1).EstimateRange(std::nullopt, false,
+                                                 Value("c2-30"), false),
+              31, 8);
 
-  EXPECT_DOUBLE_EQ(
-      statistics.Column(0).EstimateRange(Value(int64_t{10}), true,
-                                         Value(int64_t{5}), true),
-      0);
+  EXPECT_DOUBLE_EQ(statistics.Column(0).EstimateRange(Value(int64_t{10}), true,
+                                                      Value(int64_t{5}), true),
+                   0);
 
-  EXPECT_DOUBLE_EQ(
-      statistics.Column(0).EstimateRange(Value(int64_t{5}), true,
-                                         Value(int64_t{5}), false),
-      0);
+  EXPECT_DOUBLE_EQ(statistics.Column(0).EstimateRange(Value(int64_t{5}), true,
+                                                      Value(int64_t{5}), false),
+                   0);
 
   EXPECT_NEAR(statistics.Column(0).EstimateRange(Value(int64_t{5}), true,
                                                  Value(int64_t{5}), true),
@@ -635,24 +644,24 @@ TEST_F(TableStatisticsTest, EstimateRange_WithCoercionAndEdgeCases_ReturnsAccura
                                          Value(int64_t{10}), true),
       0);
 
-  TableStatistics huge = statistics.ScaleToRows(
-      std::numeric_limits<size_t>::max());
+  TableStatistics huge =
+      statistics.ScaleToRows(std::numeric_limits<size_t>::max());
   EXPECT_EQ(huge.Rows(), std::numeric_limits<size_t>::max());
   EXPECT_EQ(huge.Column(0).NonNullCount(), std::numeric_limits<size_t>::max());
 
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_ValueSatisfiesSameAndCrossType_ComputesExpectedSelectivity) {
+TEST_F(
+    TableStatisticsTest,
+    EstimateSelectivity_ValueSatisfiesSameAndCrossType_ComputesExpectedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  const auto col = [](std::string_view name) {
-    return ColumnValueExp(name);
-  };
+  const auto col = [](std::string_view name) { return ColumnValueExp(name); };
   const auto const_v = [](const Value& v) { return ConstantValueExp(v); };
   const auto bin = [](const Expression& l, BinaryOperation op,
                       const Expression& r) {
@@ -662,26 +671,23 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_ValueSatisfiesSameAndCrossType_C
     return bin(col("Sc1.c1"), BinaryOperation::kEquals, const_v(Value(v)));
   };
 
-  EXPECT_DOUBLE_EQ(
-      statistics.EstimateSelectivity(
-          schema, bin(eq(1), BinaryOperation::kAnd,
-                      bin(col("Sc1.c1"), BinaryOperation::kEquals,
-                          const_v(Value(2.5))))),
-      0);
+  EXPECT_DOUBLE_EQ(statistics.EstimateSelectivity(
+                       schema, bin(eq(1), BinaryOperation::kAnd,
+                                   bin(col("Sc1.c1"), BinaryOperation::kEquals,
+                                       const_v(Value(2.5))))),
+                   0);
 
-  EXPECT_NEAR(
-      statistics.EstimateSelectivity(
-          schema, bin(eq(1), BinaryOperation::kAnd,
-                      bin(col("Sc1.c1"), BinaryOperation::kNotEquals,
-                          const_v(Value(2.5))))),
-      0.01, 0.01);
+  EXPECT_NEAR(statistics.EstimateSelectivity(
+                  schema, bin(eq(1), BinaryOperation::kAnd,
+                              bin(col("Sc1.c1"), BinaryOperation::kNotEquals,
+                                  const_v(Value(2.5))))),
+              0.01, 0.01);
 
-  EXPECT_NEAR(
-      statistics.EstimateSelectivity(
-          schema, bin(eq(1), BinaryOperation::kAnd,
-                      bin(col("Sc1.c1"), BinaryOperation::kLessThan,
-                          const_v(Value(2.5))))),
-      0.01, 0.01);
+  EXPECT_NEAR(statistics.EstimateSelectivity(
+                  schema, bin(eq(1), BinaryOperation::kAnd,
+                              bin(col("Sc1.c1"), BinaryOperation::kLessThan,
+                                  const_v(Value(2.5))))),
+              0.01, 0.01);
 
   EXPECT_NEAR(
       statistics.EstimateSelectivity(
@@ -702,7 +708,8 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_ValueSatisfiesSameAndCrossType_C
           schema,
           bin(bin(col("Sc1.c1"), BinaryOperation::kEquals, const_v(Value(2.5))),
               BinaryOperation::kAnd,
-              bin(col("Sc1.c1"), BinaryOperation::kLessThan, const_v(Value(1))))),
+              bin(col("Sc1.c1"), BinaryOperation::kLessThan,
+                  const_v(Value(1))))),
       0);
 
   EXPECT_DOUBLE_EQ(
@@ -738,20 +745,18 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_ValueSatisfiesSameAndCrossType_C
 
   Expression greater_one = bin(col("Sc1.c1"), BinaryOperation::kGreaterThan,
                                const_v(Value(int64_t{1})));
-  EXPECT_DOUBLE_EQ(
-      statistics.EstimateSelectivity(
-          schema, bin(greater_one, BinaryOperation::kAnd, eq(1))),
-      0);
-  EXPECT_NEAR(
-      statistics.EstimateSelectivity(
-          schema, bin(greater_one, BinaryOperation::kOr, eq(1))),
-      0.99, 0.01);
+  EXPECT_DOUBLE_EQ(statistics.EstimateSelectivity(
+                       schema, bin(greater_one, BinaryOperation::kAnd, eq(1))),
+                   0);
+  EXPECT_NEAR(statistics.EstimateSelectivity(
+                  schema, bin(greater_one, BinaryOperation::kOr, eq(1))),
+              0.99, 0.01);
 
   EXPECT_DOUBLE_EQ(
       statistics.EstimateSelectivity(
           schema, bin(eq(1), BinaryOperation::kAnd,
-                      bin(const_v(Value(int64_t{5})), BinaryOperation::kLessThan,
-                          col("Sc1.c1")))),
+                      bin(const_v(Value(int64_t{5})),
+                          BinaryOperation::kLessThan, col("Sc1.c1")))),
       0);
   EXPECT_DOUBLE_EQ(
       statistics.EstimateSelectivity(
@@ -763,8 +768,7 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_ValueSatisfiesSameAndCrossType_C
       statistics.EstimateSelectivity(
           schema, bin(eq(1), BinaryOperation::kAnd,
                       bin(const_v(Value(int64_t{5})),
-                          BinaryOperation::kGreaterThanEquals,
-                          col("Sc1.c1")))),
+                          BinaryOperation::kGreaterThanEquals, col("Sc1.c1")))),
       0.01, 0.01);
 
   Expression same = bin(eq(1), BinaryOperation::kAnd, eq(1));
@@ -773,16 +777,18 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_ValueSatisfiesSameAndCrossType_C
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_NotXorAndFallbackPredicates_ReturnsExpectedSelectivity) {
+TEST_F(
+    TableStatisticsTest,
+    EstimateSelectivity_NotXorAndFallbackPredicates_ReturnsExpectedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  Expression equals_one = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
-      ConstantValueExp(Value(int64_t{1})));
+  Expression equals_one =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{1})));
   Expression not_equals_one =
       UnaryExpressionExp(equals_one, UnaryOperation::kNot);
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, not_equals_one), 0.99,
@@ -791,14 +797,14 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_NotXorAndFallbackPredicates_Retu
   Expression greater_ten = BinaryExpressionExp(
       ColumnValueExp("Sc1.c1"), BinaryOperation::kGreaterThan,
       ConstantValueExp(Value(int64_t{10})));
-  Expression xor_pred = BinaryExpressionExp(equals_one, BinaryOperation::kXor,
-                                            greater_ten);
+  Expression xor_pred =
+      BinaryExpressionExp(equals_one, BinaryOperation::kXor, greater_ten);
   EXPECT_GT(statistics.EstimateSelectivity(schema, xor_pred), 0.0);
   EXPECT_LE(statistics.EstimateSelectivity(schema, xor_pred), 1.0);
 
-  Expression equals_name = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c2"), BinaryOperation::kEquals,
-      ConstantValueExp(Value(std::string("c2-0"))));
+  Expression equals_name =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c2"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(std::string("c2-0"))));
   Expression or_columns =
       BinaryExpressionExp(equals_one, BinaryOperation::kOr, equals_name);
   EXPECT_GT(statistics.EstimateSelectivity(schema, or_columns), 0.0);
@@ -807,29 +813,30 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_NotXorAndFallbackPredicates_Retu
       equals_one, BinaryOperation::kOr, ColumnValueExp("Sc1.c1"));
   EXPECT_GT(statistics.EstimateSelectivity(schema, or_column_child), 0.0);
 
-  Expression column_compare = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kLessThan,
-      ColumnValueExp("Sc1.c2"));
+  Expression column_compare =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kLessThan,
+                          ColumnValueExp("Sc1.c2"));
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, column_compare), 0.25,
               0.001);
 
-  Expression arithmetic = BinaryExpressionExp(
-      ColumnValueExp("Sc1.c1"), BinaryOperation::kAdd,
-      ConstantValueExp(Value(int64_t{5})));
+  Expression arithmetic =
+      BinaryExpressionExp(ColumnValueExp("Sc1.c1"), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(int64_t{5})));
   EXPECT_DOUBLE_EQ(statistics.EstimateSelectivity(schema, arithmetic), 1.0);
 
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_IsNotNull_ReturnsExpectedSelectivity) {
+TEST_F(TableStatisticsTest,
+       EstimateSelectivity_IsNotNull_ReturnsExpectedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc2"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc2"));
   const Schema& schema = table.GetSchema();
 
-  Expression is_not_null = UnaryExpressionExp(
-      ColumnValueExp("Sc2.d4"), UnaryOperation::kIsNotNull);
+  Expression is_not_null =
+      UnaryExpressionExp(ColumnValueExp("Sc2.d4"), UnaryOperation::kIsNotNull);
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, is_not_null), 1.0, 0.001);
   ASSERT_SUCCESS(context.PreCommit());
 }
@@ -846,7 +853,8 @@ TEST_F(TableStatisticsTest, EstimateCount_InvalidColumnIndex_ThrowsOutOfRange) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(TableStatisticsTest, Concat_IntoEmptyStatistics_AdoptsRowCountAndColumns) {
+TEST_F(TableStatisticsTest,
+       Concat_IntoEmptyStatistics_AdoptsRowCountAndColumns) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
@@ -860,32 +868,33 @@ TEST_F(TableStatisticsTest, Concat_IntoEmptyStatistics_AdoptsRowCountAndColumns)
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST(TableStatisticsResolveColumnTest, EstimateSelectivity_SchemaQualifiedFallback_ResolvesColumn) {
+TEST(TableStatisticsResolveColumnTest,
+     EstimateSelectivity_SchemaQualifiedFallback_ResolvesColumn) {
   Schema schema("Sc1", {Column(ColumnName("X", "c1"), ValueType::kInt64)});
   TableStatistics statistics(schema);
   std::vector<ColumnStats> columns;
   columns.emplace_back(ValueType::kInt64);
   statistics.Assign(10, std::move(columns));
 
-  Expression equals = BinaryExpressionExp(
-      ColumnValueExp("X.c1"), BinaryOperation::kEquals,
-      ConstantValueExp(Value(int64_t{5})));
+  Expression equals =
+      BinaryExpressionExp(ColumnValueExp("X.c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{5})));
 
   const double selectivity = statistics.EstimateSelectivity(schema, equals);
   EXPECT_GE(selectivity, 0.0);
   EXPECT_LE(selectivity, 1.0);
 }
 
-TEST_F(TableStatisticsTest, EstimateSelectivity_AndFallbackAndValueSatisfiesDefaults_ComputesExpectedSelectivity) {
+TEST_F(
+    TableStatisticsTest,
+    EstimateSelectivity_AndFallbackAndValueSatisfiesDefaults_ComputesExpectedSelectivity) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
-  const auto col = [](std::string_view name) {
-    return ColumnValueExp(name);
-  };
+  const auto col = [](std::string_view name) { return ColumnValueExp(name); };
   const auto const_v = [](const Value& v) { return ConstantValueExp(v); };
   const auto bin = [](const Expression& l, BinaryOperation op,
                       const Expression& r) {
@@ -908,46 +917,47 @@ TEST_F(TableStatisticsTest, EstimateSelectivity_AndFallbackAndValueSatisfiesDefa
                   schema, bin(eq(1), BinaryOperation::kAnd, five_equals_five)),
               0.01, 0.01);
 
-  Expression like_double = bin(col("Sc1.c1"), BinaryOperation::kLike,
-                               const_v(Value(2.5)));
-  EXPECT_DOUBLE_EQ(
-      statistics.EstimateSelectivity(
-          schema, bin(eq(1), BinaryOperation::kAnd, like_double)),
-      0);
-  Expression like_int = bin(col("Sc1.c1"), BinaryOperation::kLike,
-                            const_v(Value(int64_t{1})));
-  EXPECT_DOUBLE_EQ(
-      statistics.EstimateSelectivity(
-          schema, bin(eq(1), BinaryOperation::kAnd, like_int)),
-      0);
+  Expression like_double =
+      bin(col("Sc1.c1"), BinaryOperation::kLike, const_v(Value(2.5)));
+  EXPECT_DOUBLE_EQ(statistics.EstimateSelectivity(
+                       schema, bin(eq(1), BinaryOperation::kAnd, like_double)),
+                   0);
+  Expression like_int =
+      bin(col("Sc1.c1"), BinaryOperation::kLike, const_v(Value(int64_t{1})));
+  EXPECT_DOUBLE_EQ(statistics.EstimateSelectivity(
+                       schema, bin(eq(1), BinaryOperation::kAnd, like_int)),
+                   0);
 
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST(TableStatisticsResolveColumnTest, EstimateSelectivity_UnknownSchemaQualifiedColumn_ReturnsFallbackSelectivity) {
+TEST(
+    TableStatisticsResolveColumnTest,
+    EstimateSelectivity_UnknownSchemaQualifiedColumn_ReturnsFallbackSelectivity) {
   Schema schema("Sc1", {Column(ColumnName("X", "c1"), ValueType::kInt64)});
   TableStatistics statistics(schema);
   std::vector<ColumnStats> columns;
   columns.emplace_back(ValueType::kInt64);
   statistics.Assign(10, std::move(columns));
 
-  Expression equals = BinaryExpressionExp(
-      ColumnValueExp("X.missing"), BinaryOperation::kEquals,
-      ConstantValueExp(Value(int64_t{5})));
+  Expression equals =
+      BinaryExpressionExp(ColumnValueExp("X.missing"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{5})));
 
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, equals), 0.25, 0.001);
 }
 
-TEST_F(TableStatisticsTest, Update_HighCardinalityColumn_StaysBoundedAndAccurate) {
+TEST_F(TableStatisticsTest,
+       Update_HighCardinalityColumn_StaysBoundedAndAccurate) {
   constexpr int kUniqueRows = 5000;
   constexpr int kHeavyRows = 1000;
   {
     TransactionContext context = db_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(
         Table, table,
-        db_->CreateTable(context,
-                         Schema("HighCard", {Column("v", ValueType::kInt64),
-                                             Column("skew", ValueType::kInt64)})));
+        db_->CreateTable(
+            context, Schema("HighCard", {Column("v", ValueType::kInt64),
+                                         Column("skew", ValueType::kInt64)})));
     for (int i = 0; i < kUniqueRows; ++i) {
       ASSERT_SUCCESS(table
                          .Insert(context.txn_,
@@ -955,11 +965,10 @@ TEST_F(TableStatisticsTest, Update_HighCardinalityColumn_StaysBoundedAndAccurate
                          .GetStatus());
     }
     for (int i = 0; i < kHeavyRows; ++i) {
-      ASSERT_SUCCESS(
-          table
-              .Insert(context.txn_,
-                      Row({Value(int64_t{999999}), Value(int64_t{42})}))
-              .GetStatus());
+      ASSERT_SUCCESS(table
+                         .Insert(context.txn_, Row({Value(int64_t{999999}),
+                                                    Value(int64_t{42})}))
+                         .GetStatus());
     }
     ASSERT_SUCCESS(context.PreCommit());
   }
@@ -970,8 +979,7 @@ TEST_F(TableStatisticsTest, Update_HighCardinalityColumn_StaysBoundedAndAccurate
                         db_->GetStatistics(context, "HighCard"));
   ASSERT_SUCCESS(statistics.Update(context.txn_, table));
 
-  EXPECT_EQ(statistics.Rows(),
-            static_cast<size_t>(kUniqueRows + kHeavyRows));
+  EXPECT_EQ(statistics.Rows(), static_cast<size_t>(kUniqueRows + kHeavyRows));
   const ColumnStats& values = statistics.Column(0);
   EXPECT_EQ(values.NonNullCount(),
             static_cast<size_t>(kUniqueRows + kHeavyRows));
@@ -1003,7 +1011,8 @@ TEST_F(TableStatisticsTest, Update_HighCardinalityColumn_StaysBoundedAndAccurate
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(TableStatisticsTest, Update_LongVarcharAndScaleOverflow_TruncatesAndClamps) {
+TEST_F(TableStatisticsTest,
+       Update_LongVarcharAndScaleOverflow_TruncatesAndClamps) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(
       Table, tbl,
@@ -1011,8 +1020,10 @@ TEST_F(TableStatisticsTest, Update_LongVarcharAndScaleOverflow_TruncatesAndClamp
                                    {Column("long_col", ValueType::kVarChar)})));
   std::string long_str_1(100, 'a');
   std::string long_str_2(100, 'b');
-  ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(std::move(long_str_1))})).GetStatus());
-  ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(std::move(long_str_2))})).GetStatus());
+  ASSERT_SUCCESS(
+      tbl.Insert(ctx.txn_, Row({Value(std::move(long_str_1))})).GetStatus());
+  ASSERT_SUCCESS(
+      tbl.Insert(ctx.txn_, Row({Value(std::move(long_str_2))})).GetStatus());
 
   TableStatistics stats(tbl.GetSchema());
   stats.Update(ctx.txn_, tbl);
@@ -1028,4 +1039,3 @@ TEST_F(TableStatisticsTest, Update_LongVarcharAndScaleOverflow_TruncatesAndClamp
 }
 
 }  // namespace tinylamb
-

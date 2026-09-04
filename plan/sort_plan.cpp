@@ -24,10 +24,38 @@ bool SortPlan::IsOrderedBy(const std::vector<Expression>& expressions,
   return true;
 }
 
+bool SortPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
+  if (expressions.size() > keys_.size() ||
+      ascending.size() != expressions.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < expressions.size(); ++i) {
+    if (keys_[i].ascending != ascending[i] ||
+        keys_[i].expression->ToString() != expressions[i]->ToString()) {
+      return false;
+    }
+    // Unspecified sides resolve to the engine default (NULLS FIRST for ASC,
+    // NULLS LAST for DESC); anything else must match exactly.
+    const bool provided = keys_[i].nulls_first.value_or(keys_[i].ascending);
+    const bool requested = i < nulls_first.size()
+                               ? nulls_first[i].value_or(ascending[i])
+                               : ascending[i];
+    if (provided != requested) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void SortPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(indent) << "Sort: [";
   for (size_t i = 0; i < keys_.size(); ++i) {
-    if (i > 0) { output << ", "; }
+    if (i > 0) {
+      output << ", ";
+    }
     output << keys_[i].expression->ToString()
            << (keys_[i].ascending ? " ASC" : " DESC");
   }
@@ -39,7 +67,9 @@ std::string SortPlan::ToString() const {
   std::ostringstream output;
   output << "Sort: [";
   for (size_t i = 0; i < keys_.size(); ++i) {
-    if (i > 0) { output << ", "; }
+    if (i > 0) {
+      output << ", ";
+    }
     output << keys_[i].expression->ToString()
            << (keys_[i].ascending ? " ASC" : " DESC");
   }

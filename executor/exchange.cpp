@@ -68,24 +68,42 @@ class PartitionScanExecutor : public ExecutorBase {
 
 }  // namespace
 
-ExchangeExecutor::ExchangeExecutor(
-    Executor child, ExchangeType type, size_t partition_count,
-    std::vector<slot_t> key_cols, std::vector<Value> range_bounds)
+ExchangeExecutor::ExchangeExecutor(Executor child, ExchangeType type,
+                                   size_t partition_count,
+                                   std::vector<slot_t> key_cols,
+                                   std::vector<Value> range_bounds)
     : child_(std::move(child)),
       type_(type),
       partition_count_(std::max<size_t>(1, partition_count)),
       key_cols_(std::move(key_cols)),
       range_bounds_(std::move(range_bounds)) {
+  // RouteRow returns an index in [0, range_bounds_.size()], so a range
+  // exchange needs exactly partition_count - 1 bounds to stay in bounds for
+  // every routing decision.
+  if (type_ == ExchangeType::kRange && partition_count_ > 1 &&
+      range_bounds_.size() != partition_count_ - 1) {
+    throw std::invalid_argument(
+        "range exchange requires partition_count - 1 range bounds");
+  }
   partitions_.resize(partition_count_);
 }
 
 size_t ExchangeExecutor::RouteRow(const Row& row) const {
   switch (type_) {
     case ExchangeType::kHash: {
+      // NULL-safe encoding: NULL sorts as a dedicated tag so NULL keys do
+      // not throw in EncodeMemcomparableFormat (cf. parallel hash join).
       std::string key;
       for (slot_t col : key_cols_) {
         if (col < row.Size()) {
-          key += row[col].EncodeMemcomparableFormat();
+          const Value& value = row[col];
+          if (value.IsNull()) {
+            key += '\0';
+            key += "NULL";
+          } else {
+            key += '\1';
+            key += value.EncodeMemcomparableFormat();
+          }
         }
       }
       return HashBytesKey(key) % partition_count_;
@@ -95,12 +113,24 @@ size_t ExchangeExecutor::RouteRow(const Row& row) const {
         return 0;
       }
       const Value& key = row[key_cols_[0]];
+      // NULL keys must not throw: route them to the first partition.
+      if (key.IsNull()) {
+        return 0;
+      }
       for (size_t i = 0; i < range_bounds_.size(); ++i) {
-        if (key < range_bounds_[i]) {
-          return i;
+        // Skip bounds that cannot be ordered against the key instead of
+        // throwing across the partition boundary.
+        try {
+          if (key < range_bounds_[i]) {
+            return i;
+          }
+        } catch (const std::exception&) {
+          continue;
         }
       }
-      return range_bounds_.size();
+      // Clamp for defense in depth: the constructor guarantees bounds ==
+      // partition_count - 1, but RouteRow must stay in range regardless.
+      return std::min(range_bounds_.size(), partition_count_ - 1);
     }
     case ExchangeType::kGather:
     case ExchangeType::kBroadcast:
@@ -144,9 +174,7 @@ void ExchangeExecutor::EnsureMaterialized() {
   current_gather_offset_ = 0;
 }
 
-void ExchangeExecutor::MaterializePipeline() {
-  EnsureMaterialized();
-}
+void ExchangeExecutor::MaterializePipeline() { EnsureMaterialized(); }
 
 size_t ExchangeExecutor::MaterializedRowCount() const {
   size_t total = 0;
@@ -186,6 +214,9 @@ size_t ExchangeExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
+  // Callers reuse the destination chunk across batches; without a Reset the
+  // previous batch's rows would leak into this one.
+  destination->Reset();
   EnsureMaterialized();
 
   size_t count = 0;
@@ -209,9 +240,11 @@ void ExchangeExecutor::Explain(std::ostream& o, int indent) const {
 
 Executor ExchangeExecutor::GetPartitionExecutor(size_t partition_idx) {
   assert(partition_idx < partition_count_);
-  return std::make_shared<PartitionScanExecutor>(
-      std::shared_ptr<ExchangeExecutor>(this, [](ExchangeExecutor*){}),
-      partition_idx);
+  // shared_from_this keeps the exchange alive for as long as any partition
+  // view holds it; the previous no-op-deleter alias dangled once the source
+  // ExchangeExecutor was destroyed.
+  return std::make_shared<PartitionScanExecutor>(shared_from_this(),
+                                                 partition_idx);
 }
 
 }  // namespace tinylamb

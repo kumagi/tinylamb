@@ -19,7 +19,8 @@
 namespace tinylamb {
 
 // MaterializeExecutor caches child rows into memory/disk, acting as an
-// explicit PipelineBreaker and allowing multi-pass reading over streaming inputs.
+// explicit PipelineBreaker and allowing multi-pass reading over streaming
+// inputs.
 class MaterializeExecutor : public ExecutorBase, public PipelineBreaker {
  public:
   MaterializeExecutor(Executor child, Schema schema);
@@ -34,8 +35,12 @@ class MaterializeExecutor : public ExecutorBase, public PipelineBreaker {
   // PipelineBreaker interface
   [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
   void MaterializePipeline() override;
-  [[nodiscard]] size_t MaterializedRowCount() const override { return rows_.size(); }
-  [[nodiscard]] size_t MaterializedBytes() const override { return charge_.Bytes(); }
+  [[nodiscard]] size_t MaterializedRowCount() const override {
+    return rows_.size();
+  }
+  [[nodiscard]] size_t MaterializedBytes() const override {
+    return charge_.Bytes();
+  }
 
   void Rewind();
 

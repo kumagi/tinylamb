@@ -20,7 +20,8 @@ bool CardinalityProbe::Next(Row* dst, RowPosition* rp) {
   const bool has_next = child_->Next(dst, rp);
   const auto end = std::chrono::steady_clock::now();
   elapsed_nanos_ += static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+          .count());
   if (has_next) {
     ++actual_rows_;
   }
@@ -35,7 +36,8 @@ size_t CardinalityProbe::NextBatch(DataChunk* destination, size_t max_rows) {
   const size_t count = child_->NextBatch(destination, max_rows);
   const auto end = std::chrono::steady_clock::now();
   elapsed_nanos_ += static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+          .count());
   actual_rows_ += count;
   return count;
 }

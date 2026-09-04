@@ -45,8 +45,8 @@ Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
     if (any_ci) {
       for (const Value& candidate : candidates) {
         if (!candidate.IsNull() && candidate.type == ValueType::kVarChar &&
-            std::string_view(candidate.value.varchar_value)
-                    .find('_') != std::string_view::npos) {
+            std::string_view(candidate.value.varchar_value).find('_') !=
+                std::string_view::npos) {
           throw std::runtime_error(
               "LIKE pattern has '_' which is not allowed when its operands "
               "have collation: " +
@@ -70,18 +70,22 @@ Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
     }
     if (result.Truthy()) {
       saw_true = true;
-      if (!is_all) { return Value(true); }
+      if (!is_all) {
+        return Value(true);
+      }
     } else if (is_all) {
       return Value(false);
     }
   }
-  if (!is_all) { return saw_true ? Value(true) : (saw_unknown ? Value() : Value(false));
-}
+  if (!is_all) {
+    return saw_true ? Value(true) : (saw_unknown ? Value() : Value(false));
+  }
   // ALL: TRUE only when every comparison was TRUE.
   return saw_unknown ? Value() : Value(true);
 }
 
-Value QueryExpression::Evaluate(const Row& /*row*/, const Schema& /*schema*/) const {
+Value QueryExpression::Evaluate(const Row& /*row*/,
+                                const Schema& /*schema*/) const {
   throw std::runtime_error("query expression requires relational evaluation");
 }
 
@@ -95,18 +99,16 @@ Value QueryExpression::Evaluate(const Row& /*row*/, const Schema& /*schema*/) co
 //   scalar        : first projected value, NULL when the subquery is empty
 Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
                                 EvaluationContext& context) const {
-  StatusOr<std::vector<Value>> rows =
-      context.RunSubquery(*query_, &row);
+  StatusOr<std::vector<Value>> rows = context.RunSubquery(*query_, &row);
   if (!rows.HasValue()) {
     throw std::runtime_error("subquery execution failed: " +
                              std::string(tinylamb::ToString(rows.GetStatus())));
   }
   const std::vector<Value> values = std::move(rows).MoveValue();
   if (array_result_) {
-    return Value::Array(
-        values,
-        array_element_sql_type_.empty() ? std::string("INT64")
-                                        : array_element_sql_type_);
+    return Value::Array(values, array_element_sql_type_.empty()
+                                    ? std::string("INT64")
+                                    : array_element_sql_type_);
   }
   if (exists_) {
     const bool any = !values.empty();
@@ -123,8 +125,7 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
       if (!test_value.IsNull() && !candidate.IsNull() &&
           test_value.Collation() != 0 && candidate.Collation() != 0 &&
           test_value.Collation() != candidate.Collation()) {
-        throw std::runtime_error(
-            "Collation conflict between the IN operands");
+        throw std::runtime_error("Collation conflict between the IN operands");
       }
       saw_null = saw_null || candidate.IsNull();
       if (!found && !test_value.IsNull() && !candidate.IsNull() &&
@@ -135,12 +136,14 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
     }
     const Value membership =
         found ? Value(true) : (saw_null ? Value() : Value(false));
-    if (!negated_) { return membership;
-}
+    if (!negated_) {
+      return membership;
+    }
     return membership.IsNull() ? Value() : Value(!membership.Truthy());
   }
-  if (values.empty()) { return {};
-}
+  if (values.empty()) {
+    return {};
+  }
   return values.front();
 }
 
@@ -149,12 +152,12 @@ std::unordered_set<ColumnName> QueryExpression::TouchedColumns() const {
 }
 
 std::string QueryExpression::ToString() const {
-  if (exists_) { return negated_ ? "NOT EXISTS(...)" : "EXISTS(...)";
-}
+  if (exists_) {
+    return negated_ ? "NOT EXISTS(...)" : "EXISTS(...)";
+  }
   if (test_) {
     if (mode_ == QuantifierMode::kAny || mode_ == QuantifierMode::kAll) {
-      return test_->ToString() + " " +
-             std::string(tinylamb::ToString(op_)) +
+      return test_->ToString() + " " + std::string(tinylamb::ToString(op_)) +
              (mode_ == QuantifierMode::kAny ? " ANY(...)" : " ALL(...)");
     }
     return test_->ToString() + (negated_ ? " NOT IN(...)" : " IN(...)");

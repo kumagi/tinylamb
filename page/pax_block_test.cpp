@@ -1,31 +1,31 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "page/pax_block.hpp"
-#include <cstdint>
+
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "executor/data_chunk.hpp"
 #include "gtest/gtest.h"
 #include "page/pax_layout.hpp"
 #include "type/date.hpp"
-#include "type/schema.hpp"
-#include "type/value_type.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
 TEST(PaxBlockTest, DictionaryAndBitPackingRoundTripWithNulls) {
   const Schema schema("pax", {Column("id", ValueType::kInt64),
-                                Column("status", ValueType::kVarChar),
-                                Column("shipdate", ValueType::kDate)});
+                              Column("status", ValueType::kVarChar),
+                              Column("shipdate", ValueType::kDate)});
   DataChunk chunk(schema, 256);
   for (int64_t row = 0; row < 256; ++row) {
-    chunk.Append(Row({Value(1000 + (row % 16)),
-                      row == 17 ? Value()
-                                : Value(row % 2 != 0 ? "OPEN" : "DONE"),
-                      Value::DateFromDays(ParseDateDays("1995-01-01") +
-                                          (row % 32))}));
+    chunk.Append(
+        Row({Value(1000 + (row % 16)),
+             row == 17 ? Value() : Value(row % 2 != 0 ? "OPEN" : "DONE"),
+             Value::DateFromDays(ParseDateDays("1995-01-01") + (row % 32))}));
   }
 
   const PaxBlock block = PaxBlock::Encode(chunk);
@@ -53,7 +53,7 @@ TEST(PaxBlockTest, PlainFallbackForHighCardinalityVarchar) {
   DataChunk chunk(schema, 64);
   for (int64_t row = 0; row < 64; ++row) {
     chunk.Append(Row({Value("unique_value_" + std::to_string(row) + "_" +
-                           std::string(32, 'x'))}));
+                            std::string(32, 'x'))}));
   }
 
   const PaxBlock block = PaxBlock::Encode(chunk);
@@ -67,8 +67,8 @@ TEST(PaxBlockTest, PlainFallbackWithNullsPreserved) {
   const Schema schema("pax", {Column("name", ValueType::kVarChar)});
   DataChunk chunk(schema, 32);
   for (int64_t row = 0; row < 32; ++row) {
-    chunk.Append(Row({row % 3 == 0 ? Value()
-                                   : Value("unique_" + std::to_string(row))}));
+    chunk.Append(
+        Row({row % 3 == 0 ? Value() : Value("unique_" + std::to_string(row))}));
   }
 
   const PaxBlock block = PaxBlock::Encode(chunk);

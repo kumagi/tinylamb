@@ -17,14 +17,15 @@
 #ifndef TINYLAMB_INDEX_ONLY_SCAN_PLAN_HPP
 #define TINYLAMB_INDEX_ONLY_SCAN_PLAN_HPP
 
-#include <ostream>
 #include <cstddef>
+#include <ostream>
 #include <vector>
+
+#include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
-#include "expression/named_expression.hpp"
 
 namespace tinylamb {
 class Index;
@@ -34,7 +35,8 @@ class IndexOnlyScanPlan : public PlanBase {
  public:
   IndexOnlyScanPlan(const Table& table, const Index& index,
                     const TableStatistics& ts, std::vector<Value> begin_key,
-                    std::vector<Value> end_key, bool ascending, Expression where,
+                    std::vector<Value> end_key, bool ascending,
+                    Expression where,
                     std::vector<ColumnName> provided_order = {});
   IndexOnlyScanPlan(const IndexOnlyScanPlan&) = delete;
   IndexOnlyScanPlan(IndexOnlyScanPlan&&) = delete;
@@ -54,8 +56,13 @@ class IndexOnlyScanPlan : public PlanBase {
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
-  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
-                                 const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

@@ -3,9 +3,9 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <optional>
-#include <mutex>
 #include <exception>
+#include <mutex>
+#include <optional>
 #include <ostream>
 #include <utility>
 #include <vector>
@@ -20,11 +20,10 @@
 
 namespace tinylamb {
 
-ParallelScan::ParallelScan(
-    Transaction& txn, const Table& table, size_t worker_count,
-    size_t pages_per_morsel,
-    std::optional<std::vector<slot_t>> projection,
-    std::vector<IntegerPeekCompare> peek_compares)
+ParallelScan::ParallelScan(Transaction& txn, const Table& table,
+                           size_t worker_count, size_t pages_per_morsel,
+                           std::optional<std::vector<slot_t>> projection,
+                           std::vector<IntegerPeekCompare> peek_compares)
     : txn_(&txn),
       table_(&table),
       projection_(std::move(projection)),
@@ -48,24 +47,26 @@ ParallelScan::~ParallelScan() {
 
 void ParallelScan::Start(size_t batch_size) {
   std::scoped_lock lock(mutex_);
-  if (started_) { return;
-}
+  if (started_) {
+    return;
+  }
   started_ = true;
-  if (morsels_.empty()) { return;
-}
+  if (morsels_.empty()) {
+    return;
+  }
   workers_.reserve(worker_count_);
   size_t launched = 0;
   for (size_t worker = 0; worker < worker_count_; ++worker) {
     try {
-      workers_.emplace_back(
-          [this, batch_size] { RunWorker(batch_size); });
+      workers_.emplace_back([this, batch_size] { RunWorker(batch_size); });
       ++launched;
     } catch (...) {
       // Thread creation can fail (e.g. resource_unavailable). Account only
       // for the workers that actually started and wake the consumer via
       // worker_error_ instead of blocking on active_workers_ forever.
-      if (!worker_error_) { worker_error_ = std::current_exception();
-}
+      if (!worker_error_) {
+        worker_error_ = std::current_exception();
+      }
       break;
     }
   }
@@ -86,13 +87,14 @@ void ParallelScan::RunWorker(size_t batch_size) {
     }
     while (true) {
       const size_t morsel_index = next_morsel_.fetch_add(1);
-      if (morsel_index >= morsels_.size()) { break;
-}
+      if (morsel_index >= morsels_.size()) {
+        break;
+      }
       const std::vector<IntegerPeekCompare>* peek_ptr =
           peek_compares_.empty() ? nullptr : &peek_compares_;
-      Iterator iterator = table_->BeginMorselScan(
-          *txn_, morsels_[morsel_index], projection_, nullptr,
-          std::nullopt, peek_ptr);
+      Iterator iterator =
+          table_->BeginMorselScan(*txn_, morsels_[morsel_index], projection_,
+                                  nullptr, std::nullopt, peek_ptr);
       // The layout never changes across refill, so Initialize is the single
       // reset path for both the first and subsequent chunks.
       DataChunk chunk;
@@ -109,8 +111,9 @@ void ParallelScan::RunWorker(size_t batch_size) {
           // a writer waiting for that latch could be the very consumer that
           // would otherwise drain the queue.
           iterator.DropPageLatch();
-          if (!Enqueue(std::move(chunk))) { return;
-}
+          if (!Enqueue(std::move(chunk))) {
+            return;
+          }
           // The chunk above was handed off; start the refill from a
           // well-defined state instead of re-initializing a moved-from one.
           chunk = DataChunk{};
@@ -123,8 +126,9 @@ void ParallelScan::RunWorker(size_t batch_size) {
       }
       iterator.DropPageLatch();
       if (!chunk.Empty()) {
-        if (!Enqueue(std::move(chunk))) { return;
-}
+        if (!Enqueue(std::move(chunk))) {
+          return;
+        }
         // Handing off moved out of `chunk`; restore a well-defined state so
         // the next morsel iteration starts from a fresh object.
         chunk = DataChunk{};
@@ -132,8 +136,9 @@ void ParallelScan::RunWorker(size_t batch_size) {
     }
   } catch (...) {
     std::scoped_lock lock(mutex_);
-    if (!worker_error_) { worker_error_ = std::current_exception();
-}
+    if (!worker_error_) {
+      worker_error_ = std::current_exception();
+    }
     cancelled_ = true;
   }
   {
@@ -146,11 +151,11 @@ void ParallelScan::RunWorker(size_t batch_size) {
 
 bool ParallelScan::Enqueue(DataChunk chunk) {
   std::unique_lock lock(mutex_);
-  space_cv_.wait(lock, [this] {
-    return cancelled_ || ready_.size() < max_ready_chunks_;
-  });
-  if (cancelled_) { return false;
-}
+  space_cv_.wait(
+      lock, [this] { return cancelled_ || ready_.size() < max_ready_chunks_; });
+  if (cancelled_) {
+    return false;
+  }
   ready_.push_back(std::move(chunk));
   lock.unlock();
   ready_cv_.notify_one();
@@ -179,10 +184,12 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
   ready_cv_.wait(lock, [this] {
     return !ready_.empty() || active_workers_ == 0 || worker_error_;
   });
-  if (worker_error_) { std::rethrow_exception(worker_error_);
-}
-  if (ready_.empty()) { return 0;
-}
+  if (worker_error_) {
+    std::rethrow_exception(worker_error_);
+  }
+  if (ready_.empty()) {
+    return 0;
+  }
   DataChunk chunk = std::move(ready_.front());
   ready_.pop_front();
   lock.unlock();
@@ -194,8 +201,7 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
   }
   pending_ = std::move(chunk);
   pending_offset_ = 0;
-  while (pending_offset_ < pending_->Size() &&
-         destination->Size() < max_rows) {
+  while (pending_offset_ < pending_->Size() && destination->Size() < max_rows) {
     destination->Append(*pending_, pending_offset_++);
   }
   return destination->Size();
@@ -203,20 +209,22 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
 
 bool ParallelScan::Next(Row* destination, RowPosition* position) {
   if (scalar_offset_ == scalar_batch_.Size()) {
-    if (NextBatch(&scalar_batch_) == 0) { return false;
-}
+    if (NextBatch(&scalar_batch_) == 0) {
+      return false;
+    }
     scalar_offset_ = 0;
   }
   *destination = scalar_batch_.RowAt(scalar_offset_);
-  if (position != nullptr) { *position = scalar_batch_.PositionAt(scalar_offset_);
-}
+  if (position != nullptr) {
+    *position = scalar_batch_.PositionAt(scalar_offset_);
+  }
   ++scalar_offset_;
   return true;
 }
 
 void ParallelScan::Dump(std::ostream& out, int /*indent*/) const {
-  out << "ParallelScan: " << table_->GetSchema().Name() << " ("
-      << worker_count_ << " workers, " << morsels_.size() << " morsels)";
+  out << "ParallelScan: " << table_->GetSchema().Name() << " (" << worker_count_
+      << " workers, " << morsels_.size() << " morsels)";
 }
 
 }  // namespace tinylamb

@@ -14,9 +14,10 @@
 namespace tinylamb {
 
 // Dictionary-encoded fast-path batch aggregation engine.
-// When group keys have low cardinality, group values are mapped to dense integer
-// dictionary codes (0 <= code < K). Aggregations accumulate directly into flat
-// code-indexed arrays without hash table hashing overhead during batch iteration.
+// When group keys have low cardinality, group values are mapped to dense
+// integer dictionary codes (0 <= code < K). Aggregations accumulate directly
+// into flat code-indexed arrays without hash table hashing overhead during
+// batch iteration.
 class DictionaryBatchAggregation {
  public:
   enum class AggOp : uint8_t {

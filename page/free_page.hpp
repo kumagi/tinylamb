@@ -30,12 +30,16 @@ class FreePage {
   void Initialize() { next_free_page = kEndOfFreeList; }
 
  public:
-  char* FreeBody() {
-    return reinterpret_cast<char*>(this) + sizeof(FreePage);
-  }
+  char* FreeBody() { return reinterpret_cast<char*>(this) + sizeof(FreePage); }
   static constexpr size_t FreeBodySize() {
     return kPageBodySize - sizeof(FreePage);
   }
+
+  // D3 (docs/design.md): RecoveryManager rebuilds the free-list chain after
+  // replaying kSystemDestroyPage redos; these are the only allocator-external
+  // users of the link field.
+  page_id_t NextFreePage() const { return next_free_page; }
+  void SetNextFreePage(page_id_t next) { next_free_page = next; }
 
  private:
   friend class Page;

@@ -42,6 +42,24 @@ class MetaPage {
     }
   }
 
+  // D3 (docs/design.md): the meta page mutates the free list outside the WAL,
+  // so a crash can leave a stale chain.  RecoveryManager re-derives the whole
+  // list by scanning the page range and installs the rebuilt head here.
+  [[nodiscard]] page_id_t FirstFreePage() const { return first_free_page; }
+  void RebuildFreeListHead(page_id_t head) { first_free_page = head; }
+
+  // D3: undoing a destroy restores the page and pops it from the free chain.
+  // The chain is a stack and destroy undo unwinds in reverse LSN order, so
+  // the restored page is always the head; `next` is the link captured from
+  // its free-page body BEFORE the image was restored.  A non-matching head
+  // (page flushed and chain extended meanwhile) leaves the link stale; the
+  // recovery rebuild is the authority for that case.
+  void PopFreePageHead(page_id_t pid, page_id_t next) {
+    if (first_free_page == pid) {
+      first_free_page = next;
+    }
+  }
+
  private:
   void Initialize() {
     max_page_count = 0;

@@ -78,11 +78,15 @@ std::string EncodeJoinKey(const Row& row, const std::vector<slot_t>& columns);
 size_t EstimateJoinRows(const Relation& left, const Relation& right,
                         const std::vector<Expression>& predicates);
 
+// D8 (docs/design.md): the hybrid operator supports null-safe equality
+// (NULL matches NULL), LEFT/RIGHT/FULL outer, and reprocesses every spilled
+// partition, so spilled rows are never dropped against the resident portion.
 Relation HybridHashJoin(Relation left, Relation right,
                         const std::vector<slot_t>& left_columns,
                         const std::vector<slot_t>& right_columns,
                         const std::function<bool(const Row&)>& matches,
-                        bool left_join, size_t* join_comparisons);
+                        bool left_join, size_t* join_comparisons,
+                        bool null_safe = false, bool right_join = false);
 
 bool ShouldHybridJoin(const Relation& left, const Relation& right);
 

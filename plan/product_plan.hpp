@@ -37,8 +37,7 @@ class ProductPlan final : public PlanBase {
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
               std::vector<ColumnName> right_cols);
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
-              std::vector<ColumnName> right_cols,
-              HashJoinMode hash_mode);
+              std::vector<ColumnName> right_cols, HashJoinMode hash_mode);
   // Explicit hash join kind. Semi/anti kinds emit only the left child's
   // columns; outer kinds retain both schemas and add NULL padding.
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,

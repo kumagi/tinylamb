@@ -114,7 +114,9 @@ class SelectionVector {
 
   [[nodiscard]] const uint32_t* Data() const { return indices_.data(); }
   [[nodiscard]] uint32_t* Data() { return indices_.data(); }
-  [[nodiscard]] const std::vector<uint32_t>& Indices() const { return indices_; }
+  [[nodiscard]] const std::vector<uint32_t>& Indices() const {
+    return indices_;
+  }
 
   void Filter(const ValidityBitmap& validity, SelectionVector* output) const;
   void Filter(const std::function<bool(uint32_t)>& pred,

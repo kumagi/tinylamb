@@ -46,6 +46,10 @@ class SortPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   // Sorting reorders but never adds or removes rows, so a limit below a
   // Sort still shapes the final output exactly.
   [[nodiscard]] bool EnforcesLimit(size_t limit_count,

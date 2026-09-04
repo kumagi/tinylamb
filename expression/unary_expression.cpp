@@ -50,13 +50,14 @@ Value EvaluateUnary(UnaryOperation operation, const Value& child) {
     case UnaryOperation::kNot:
       return child.IsNull() ? Value() : Value(!child.Truthy());
     case UnaryOperation::kMinus:
-      if (child.IsNull()) { return {}; }
+      if (child.IsNull()) {
+        return {};
+      }
       if (child.type == ValueType::kDouble) {
         return Value(-child.value.double_value);
       }
       if (child.type == ValueType::kInt64) {
-        if (child.value.int_value ==
-            std::numeric_limits<int64_t>::min()) {
+        if (child.value.int_value == std::numeric_limits<int64_t>::min()) {
           throw std::runtime_error("integer overflow in unary minus");
         }
         return Value(-child.value.int_value);
@@ -82,7 +83,6 @@ Type UnaryResultType(UnaryOperation operation, const Type& child) {
 }
 
 }  // namespace
-
 
 std::unordered_set<ColumnName> UnaryExpression::TouchedColumns() const {
   return child_->TouchedColumns();

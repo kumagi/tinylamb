@@ -90,8 +90,8 @@ PageStorage::PageStorage(std::string_view dbname, size_t wal_sync_ms)
     LogRecord probe;
     if (!rm_.ReadLog(checkpoint, &probe) ||
         probe.type != LogType::kBeginCheckpoint) {
-      LOG(WARN) << "Ignoring invalid master record at " << checkpoint
-                << " for " << dbname_;
+      LOG(WARN) << "Ignoring invalid master record at " << checkpoint << " for "
+                << dbname_;
       checkpoint = 0;
     }
   }
@@ -126,9 +126,9 @@ std::string PageStorage::MasterRecordName() const {
 
 std::ostream& operator<<(std::ostream& o, const PageStorage& ps) {
   o << "PageStorage(dbname=" << ps.dbname_ << ", logger=" << ps.logger_
-    << ", page_manager=" << ps.pm_
-    << ", recovery_manager=" << ps.rm_ << ", transaction_manager=" << ps.tm_
-    << ", checkpoint_manager=" << ps.cm_ << ")";
+    << ", page_manager=" << ps.pm_ << ", recovery_manager=" << ps.rm_
+    << ", transaction_manager=" << ps.tm_ << ", checkpoint_manager=" << ps.cm_
+    << ")";
   return o;
 }
 

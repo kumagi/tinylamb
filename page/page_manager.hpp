@@ -51,6 +51,19 @@ class PageManager {
   void AdvanceTableTail(page_id_t first_page, page_id_t expected,
                         page_id_t next);
 
+  // DROP TABLE (D3): the table's pages go back to the allocator, so its
+  // cached tail hint must disappear with them; a later table that reuses
+  // the first page id must not inherit a stale tail.
+  void ForgetTableTail(page_id_t first_page) {
+    std::scoped_lock lock(table_tails_mu_);
+    table_tails_.erase(first_page);
+  }
+
+  // D3 (docs/design.md): undo of a page destroy restores the page image and
+  // pops it from the allocator free stack (see MetaPage::PopFreePageHead).
+  // Defined in the .cpp because it needs the full Page definition.
+  void PopFreePageHead(page_id_t pid, page_id_t next);
+
   // Logically delete the page.
   void DestroyPage(Transaction& txn, Page* target);
 

@@ -30,12 +30,13 @@ enum class ExchangeType : uint8_t {
 
 // ExchangeExecutor distributes or gathers rows across multiple worker/partition
 // channels using Hash, Broadcast, Gather, or Range partitioning strategies.
-class ExchangeExecutor : public ExecutorBase, public PipelineBreaker {
+class ExchangeExecutor : public ExecutorBase,
+                         public PipelineBreaker,
+                         public std::enable_shared_from_this<ExchangeExecutor> {
  public:
-  ExchangeExecutor(
-      Executor child, ExchangeType type, size_t partition_count,
-      std::vector<slot_t> key_cols = {},
-      std::vector<Value> range_bounds = {});
+  ExchangeExecutor(Executor child, ExchangeType type, size_t partition_count,
+                   std::vector<slot_t> key_cols = {},
+                   std::vector<Value> range_bounds = {});
 
   ~ExchangeExecutor() override = default;
 
@@ -49,12 +50,14 @@ class ExchangeExecutor : public ExecutorBase, public PipelineBreaker {
   [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
   void MaterializePipeline() override;
   [[nodiscard]] size_t MaterializedRowCount() const override;
-  [[nodiscard]] size_t MaterializedBytes() const override { return charge_.Bytes(); }
+  [[nodiscard]] size_t MaterializedBytes() const override {
+    return charge_.Bytes();
+  }
 
   [[nodiscard]] size_t PartitionCount() const { return partition_count_; }
   [[nodiscard]] ExchangeType Type() const { return type_; }
-  [[nodiscard]] const std::vector<std::pair<Row, RowPosition>>& GetPartitionRows(
-      size_t partition_idx) const;
+  [[nodiscard]] const std::vector<std::pair<Row, RowPosition>>&
+  GetPartitionRows(size_t partition_idx) const;
 
   // Returns an Executor view over a single partition channel
   [[nodiscard]] Executor GetPartitionExecutor(size_t partition_idx);

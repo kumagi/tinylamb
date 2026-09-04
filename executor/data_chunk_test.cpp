@@ -1,11 +1,13 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/data_chunk.hpp"
+
 #include <cstdint>
 #include <optional>
-#include <vector>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "executor/dictionary_batch_aggregation.hpp"
 #include "executor/selection_vector.hpp"
 #include "executor/simd_comparison.hpp"
@@ -15,23 +17,22 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
-#include "common/constants.hpp"
 #include "gtest/gtest.h"
 #include "type/column.hpp"
-#include "type/schema.hpp"
-#include "type/value_type.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
-TEST(DataChunkTest, Append_TypedColumnsAndNulls_StoresCorrectValuesAndPositions) {
+TEST(DataChunkTest,
+     Append_TypedColumnsAndNulls_StoresCorrectValuesAndPositions) {
   const Schema schema("batch", {Column("id", ValueType::kInt64),
-                                 Column("name", ValueType::kVarChar),
-                                 Column("score", ValueType::kDouble)});
+                                Column("name", ValueType::kVarChar),
+                                Column("score", ValueType::kDouble)});
   DataChunk chunk(schema, 4);
-  chunk.Append(Row({Value(1), Value("one"), Value(1.5)}),
-               RowPosition(7, 2));
+  chunk.Append(Row({Value(1), Value("one"), Value(1.5)}), RowPosition(7, 2));
   chunk.Append(Row({Value(2), Value(), Value(2.5)}), RowPosition(7, 3));
 
   ASSERT_EQ(chunk.Size(), 2);
@@ -57,8 +58,8 @@ TEST(DataChunkTest, Append_ZeroColumns_StoresRowCount) {
 }
 
 TEST(DataChunkTest, Append_FromAnotherChunk_CopiesSelectedRows) {
-  DataChunk input(std::vector<ValueType>{ValueType::kInt64,
-                                         ValueType::kVarChar});
+  DataChunk input(
+      std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar});
   input.Append(Row({Value(1), Value("drop")}));
   input.Append(Row({Value(2), Value("keep")}));
   DataChunk output;
@@ -87,6 +88,27 @@ TEST(DataChunkTest, ZoneMap_AfterAppendsAndReset_MaintainsStatistics) {
   chunk.Reset();
   EXPECT_FALSE(chunk.ZoneMapAt(0).Minimum());
   EXPECT_EQ(chunk.ZoneMapAt(0).ValueCount(), 0U);
+}
+
+TEST(DataChunkTest, ZoneMap_ArrayValuesCountedOnColumnAppendPath) {
+  // PRODUCTION BUG (fixed): UpdateZoneMapFrom (AppendFrom/AppendGather path)
+  // skipped kArray entirely, so a batch of array rows had value_count_==0 and
+  // MayMatch pruned the whole batch. The row Append path counted them.
+  const Schema schema("t", {Column("a", ValueType::kArray)});
+  DataChunk src(schema, 4);
+  src.Append(Row({Value::Array({Value(1), Value(2)}, "INT64")}));
+  src.Append(Row({Value::Array({Value(3)}, "INT64")}));
+
+  DataChunk dst(schema, 4);
+  const uint32_t sel[] = {0, 1};
+  dst.AppendGather(src, sel, 2);
+
+  const ZoneMap& zone = dst.ZoneMapAt(0);
+  EXPECT_EQ(zone.ValueCount(), 2U);
+  EXPECT_TRUE(zone.Initialized());
+  // With only arrays present, no scalar envelope exists: MayMatch must keep
+  // the batch rather than prune it.
+  EXPECT_TRUE(zone.MayMatch(BinaryOperation::kEquals, Value(1)));
 }
 
 TEST(DataChunkTest, ZoneMap_NaNDoesNotPoisonEnvelope) {
@@ -161,7 +183,7 @@ TEST(DataChunkTest, Append_NullThenDouble_InfersDoubleType) {
 
 TEST(DataChunkTest, HasLayout_DifferentSchemas_ReturnsExpectedBoolean) {
   const Schema schema("t", {Column("id", ValueType::kInt64),
-                             Column("name", ValueType::kVarChar)});
+                            Column("name", ValueType::kVarChar)});
   DataChunk chunk(schema);
   EXPECT_TRUE(chunk.HasLayout(schema));
   const Schema other("t2", {Column("id", ValueType::kDouble),
@@ -179,16 +201,16 @@ TEST(DataChunkTest, HasLayout_WithNullColumn_MatchesSchema) {
 }
 
 TEST(DataChunkTest, Append_ChunkWidthMismatch_Throws) {
-  DataChunk source(std::vector<ValueType>{ValueType::kInt64,
-                                          ValueType::kVarChar});
+  DataChunk source(
+      std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar});
   source.Append(Row({Value(1), Value("x")}));
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
   EXPECT_ANY_THROW(target.Append(source, 0));
 }
 
 TEST(DataChunkTest, Append_LvalueRowWithPositions_StoresCorrectly) {
-  DataChunk chunk(std::vector<ValueType>{ValueType::kInt64,
-                                         ValueType::kVarChar});
+  DataChunk chunk(
+      std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar});
   Row row({Value(10), Value("ten")});
   chunk.Append(row, RowPosition(3, 5));
   Row row2({Value(20), Value("twenty")});
@@ -221,9 +243,8 @@ TEST(DataChunkTest, Append_RowValueMutatedAfterAppend_KeepsOriginalValue) {
 }
 
 TEST(DataChunkTest, Reserve_ThenAppendBeyondCapacity_GrowsAndStoresData) {
-  DataChunk chunk(std::vector<ValueType>{ValueType::kInt64,
-                                         ValueType::kVarChar},
-                  2);
+  DataChunk chunk(
+      std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar}, 2);
   chunk.Reserve(8);
   for (int i = 0; i < 20; ++i) {
     chunk.Append(Row({Value(int64_t{i}), Value("row")}),
@@ -236,9 +257,10 @@ TEST(DataChunkTest, Reserve_ThenAppendBeyondCapacity_GrowsAndStoresData) {
   }
 }
 
-TEST(DataChunkTest, AppendRowFromColumns_GivenColumnSources_BuildsRowsColumnWise) {
-  DataChunk input(std::vector<ValueType>{ValueType::kInt64,
-                                         ValueType::kVarChar});
+TEST(DataChunkTest,
+     AppendRowFromColumns_GivenColumnSources_BuildsRowsColumnWise) {
+  DataChunk input(
+      std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar});
   input.Append(Row({Value(1), Value("one")}), RowPosition(2, 0));
   input.Append(Row({Value(), Value()}), RowPosition(2, 1));
   input.Append(Row({Value(3), Value("three")}), RowPosition(2, 2));
@@ -284,8 +306,8 @@ TEST(DataChunkTest, AppendRowFromColumns_WithNullValues_InfersNullOnlyColumns) {
 }
 
 TEST(DataChunkTest, AppendRowFromColumns_WidthMismatch_Throws) {
-  DataChunk input(std::vector<ValueType>{ValueType::kInt64,
-                                         ValueType::kVarChar});
+  DataChunk input(
+      std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar});
   input.Append(Row({Value(1), Value("x")}));
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
   std::vector<const ColumnVector*> sources = {&input.ColumnAt(0),
@@ -294,8 +316,7 @@ TEST(DataChunkTest, AppendRowFromColumns_WidthMismatch_Throws) {
 }
 
 TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
-  DataChunk input(std::vector<ValueType>{ValueType::kInt64,
-                                         ValueType::kVarChar,
+  DataChunk input(std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar,
                                          ValueType::kDate});
   input.Append(Row({Value(4), Value("b"), Value::DateFromDays(9)}));
   input.Append(Row({Value(), Value("a"), Value()}));
@@ -323,7 +344,8 @@ TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
   EXPECT_EQ(output.ZoneMapAt(1).Minimum(), Value("a"));
 }
 
-TEST(DataChunkTest, Append_TypeMismatchFromSourceChunk_ThrowsWithoutPartialAppend) {
+TEST(DataChunkTest,
+     Append_TypeMismatchFromSourceChunk_ThrowsWithoutPartialAppend) {
   DataChunk source(std::vector<ValueType>{ValueType::kDouble});
   source.Append(Row({Value(1.5)}));
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
@@ -403,9 +425,9 @@ TEST(SelectionVectorTest, FilterAndToSelectionVector) {
 }
 
 TEST(VectorizedExpressionTest, EvaluateArithmeticAndComparison) {
-  const Schema schema("t", {Column("a", ValueType::kInt64),
-                            Column("b", ValueType::kInt64),
-                            Column("score", ValueType::kDouble)});
+  const Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64),
+            Column("score", ValueType::kDouble)});
   DataChunk chunk(schema, 4);
   chunk.Append(Row({Value(int64_t{10}), Value(int64_t{2}), Value(1.5)}));
   chunk.Append(Row({Value(int64_t{20}), Value(int64_t{5}), Value(2.5)}));
@@ -422,9 +444,9 @@ TEST(VectorizedExpressionTest, EvaluateArithmeticAndComparison) {
   EXPECT_TRUE(add_res.IsNull(2));
 
   // a > 15
-  Expression cmp_expr = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kGreaterThan,
-      ConstantValueExp(Value(int64_t{15})));
+  Expression cmp_expr =
+      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{15})));
   ValidityBitmap filter_mask =
       VectorizedExpression::EvaluateFilter(cmp_expr, schema, chunk);
   ASSERT_EQ(filter_mask.Size(), 3);
@@ -442,9 +464,8 @@ TEST(VectorizedExpressionTest, EvaluateArithmeticAndComparison) {
 TEST(SimdComparisonKernelTest, IntegerDoubleStringComparison) {
   std::vector<int64_t> ints = {10, 20, 30, 40, 50};
   ValidityBitmap int_mask;
-  SimdComparisonKernel::CompareInt64(ints.data(), ints.size(),
-                                     BinaryOperation::kGreaterThan, 25,
-                                     &int_mask);
+  SimdComparisonKernel::CompareInt64(
+      ints.data(), ints.size(), BinaryOperation::kGreaterThan, 25, &int_mask);
   EXPECT_EQ(int_mask.CountValid(), 3);
   EXPECT_FALSE(int_mask.Get(0));
   EXPECT_FALSE(int_mask.Get(1));
@@ -465,8 +486,8 @@ TEST(SimdComparisonKernelTest, IntegerDoubleStringComparison) {
   std::vector<std::string_view> strings = {"apple", "banana", "cherry", "date"};
   ValidityBitmap str_mask;
   SimdComparisonKernel::CompareStringPrefix(strings.data(), strings.size(),
-                                           BinaryOperation::kEquals, "banana",
-                                           &str_mask);
+                                            BinaryOperation::kEquals, "banana",
+                                            &str_mask);
   EXPECT_EQ(str_mask.CountValid(), 1);
   EXPECT_TRUE(str_mask.Get(1));
 }
@@ -540,9 +561,9 @@ TEST(VectorizedBooleanAndBitwiseAggregationTest, BitwiseAggregates) {
 }
 
 TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
-  const Schema schema("bools", {Column("a", ValueType::kInt64),
-                                Column("b", ValueType::kInt64),
-                                Column("c", ValueType::kInt64)});
+  const Schema schema(
+      "bools", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64),
+                Column("c", ValueType::kInt64)});
   DataChunk chunk(schema, 4);
   chunk.Append(Row({Value(int64_t{1}), Value(int64_t{0}), Value()}));
   chunk.Append(Row({Value(int64_t{1}), Value(int64_t{0}), Value()}));
@@ -573,8 +594,7 @@ TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
   // a OR b
   Expression or_expr = BinaryExpressionExp(
       ColumnValueExp("a"), BinaryOperation::kOr, ColumnValueExp("b"));
-  ColumnVector or_res =
-      VectorizedExpression::Evaluate(or_expr, schema, chunk);
+  ColumnVector or_res = VectorizedExpression::Evaluate(or_expr, schema, chunk);
   ASSERT_EQ(or_res.Size(), 3);
   EXPECT_EQ(or_res.ValueAt(0), Value(int64_t{1}));
   EXPECT_EQ(or_res.ValueAt(1), Value(int64_t{1}));
@@ -589,6 +609,52 @@ TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
   EXPECT_EQ(xor_res.ValueAt(0), Value(int64_t{1}));
   EXPECT_EQ(xor_res.ValueAt(1), Value(int64_t{1}));
   EXPECT_EQ(xor_res.ValueAt(2), Value(int64_t{0}));
+}
+
+TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
+  const Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  DataChunk chunk(schema, 4);
+  // (FALSE, NULL), (TRUE, NULL), (NULL, NULL), (FALSE, FALSE)
+  chunk.Append(Row({Value(int64_t{0}), Value()}));
+  chunk.Append(Row({Value(int64_t{1}), Value()}));
+  chunk.Append(Row({Value(), Value()}));
+  chunk.Append(Row({Value(int64_t{0}), Value(int64_t{0})}));
+
+  const Expression and_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kAnd, ColumnValueExp("b"));
+  const ColumnVector and_res =
+      VectorizedExpression::Evaluate(and_expr, schema, chunk);
+  ASSERT_EQ(and_res.Size(), 4);
+  // FALSE AND NULL -> FALSE (ground truth in binary_expression.cpp)
+  EXPECT_EQ(and_res.ValueAt(0), Value(int64_t{0}));
+  EXPECT_TRUE(and_res.ValueAt(1).IsNull());
+  EXPECT_TRUE(and_res.ValueAt(2).IsNull());
+  EXPECT_EQ(and_res.ValueAt(3), Value(int64_t{0}));
+  // Cross-check every row against scalar AST evaluation.
+  for (size_t i = 0; i < 4; ++i) {
+    const Value expected =
+        EvaluateBinary(BinaryOperation::kAnd, chunk.ColumnAt(0).ValueAt(i),
+                       chunk.ColumnAt(1).ValueAt(i));
+    EXPECT_EQ(and_res.ValueAt(i), expected) << "row " << i;
+  }
+
+  const Expression or_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kOr, ColumnValueExp("b"));
+  const ColumnVector or_res =
+      VectorizedExpression::Evaluate(or_expr, schema, chunk);
+  ASSERT_EQ(or_res.Size(), 4);
+  // FALSE OR NULL -> NULL, TRUE OR NULL -> TRUE (ground truth).
+  EXPECT_TRUE(or_res.ValueAt(0).IsNull());
+  EXPECT_EQ(or_res.ValueAt(1), Value(int64_t{1}));
+  EXPECT_TRUE(or_res.ValueAt(2).IsNull());
+  EXPECT_EQ(or_res.ValueAt(3), Value(int64_t{0}));
+  for (size_t i = 0; i < 4; ++i) {
+    const Value expected =
+        EvaluateBinary(BinaryOperation::kOr, chunk.ColumnAt(0).ValueAt(i),
+                       chunk.ColumnAt(1).ValueAt(i));
+    EXPECT_EQ(or_res.ValueAt(i), expected) << "row " << i;
+  }
 }
 
 }  // namespace tinylamb

@@ -111,21 +111,22 @@ Expression BindColumnQualifiedFieldReads(
           only_column = column;
         }
       }
-      if (!only_column.empty() && ToLowerCopy(only_column) !=
-                                      ToLowerCopy(name.name)) {
-        Expression current = ColumnValueExp(
-            ColumnName(name.schema, only_column));
+      if (!only_column.empty() &&
+          ToLowerCopy(only_column) != ToLowerCopy(name.name)) {
+        Expression current =
+            ColumnValueExp(ColumnName(name.schema, only_column));
         std::string remaining = name.name;
         while (!remaining.empty()) {
           const size_t dot = remaining.find('.');
-          const std::string field = dot == std::string::npos
-                                        ? remaining
-                                        : remaining.substr(0, dot);
-          current = FunctionCallExp(
-              "__get_field_safe",
-              {std::move(current),
-               ConstantValueExp(Value(std::string(field))) });
-          if (dot == std::string::npos) { break; }
+          const std::string field =
+              dot == std::string::npos ? remaining : remaining.substr(0, dot);
+          current =
+              FunctionCallExp("__get_field_safe",
+                              {std::move(current),
+                               ConstantValueExp(Value(std::string(field)))});
+          if (dot == std::string::npos) {
+            break;
+          }
           remaining = remaining.substr(dot + 1);
         }
         return current;
@@ -196,12 +197,14 @@ Expression BindFieldPaths(
     std::string remaining = col_name.name;
     while (!remaining.empty()) {
       const size_t dot = remaining.find('.');
-      std::string field = dot == std::string::npos ? remaining
-                                                   : remaining.substr(0, dot);
+      std::string field =
+          dot == std::string::npos ? remaining : remaining.substr(0, dot);
       current = FunctionCallExp(
           "__get_field_safe",
           {std::move(current), ConstantValueExp(Value(std::move(field)))});
-      if (dot == std::string::npos) { break; }
+      if (dot == std::string::npos) {
+        break;
+      }
       remaining = remaining.substr(dot + 1);
     }
     return current;
@@ -211,7 +214,9 @@ Expression BindFieldPaths(
   for (Expression& child : children) {
     Expression mapped = BindFieldPaths(child, col_table_map, relations);
     changed |= static_cast<bool>(mapped);
-    if (mapped) { child = std::move(mapped); }
+    if (mapped) {
+      child = std::move(mapped);
+    }
   }
   return changed ? WithExpressionChildren(exp, std::move(children)) : nullptr;
 }
@@ -223,7 +228,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     const std::unordered_map<std::string, std::string>& col_table_map,
     const std::unordered_set<std::string>& ambiguous_colum_name,
     const std::unordered_set<std::string>& relations,
-    const std::vector<ColumnName>& all_cols) {
+    const std::vector<ColumnName>& all_cols, bool expand_proto_value_table) {
   if (!exp) {
     return Status::kSuccess;
   }
@@ -259,11 +264,12 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
         exp = FunctionCallExp("__struct_json__", std::move(args));
         return Status::kSuccess;
       }
-      if (all_cols.size() == 1 && col_name.name != "*") {
+      if (expand_proto_value_table && all_cols.size() == 1 &&
+          col_name.name != "*") {
         exp = FunctionCallExp(
             "__get_field_safe",
             {ColumnValueExp(all_cols.front()),
-             ConstantValueExp(Value(std::string(col_name.name))) });
+             ConstantValueExp(Value(std::string(col_name.name)))});
         return Status::kSuccess;
       }
       return Status::kNotExists;
@@ -275,13 +281,16 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     Expression left = exp->AsBinaryExpression().Left();
     Expression right = exp->AsBinaryExpression().Right();
     RETURN_IF_FAIL(ResolveExpression(left, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols));
+                                     relations, all_cols,
+                                     expand_proto_value_table));
     RETURN_IF_FAIL(ResolveExpression(right, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols));
+                                     relations, all_cols,
+                                     expand_proto_value_table));
   } else if (exp->Type() == TypeTag::kUnaryExp) {
     Expression child = exp->AsUnaryExpression().Child();
     RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols));
+                                     relations, all_cols,
+                                     expand_proto_value_table));
   } else if (exp->Type() == TypeTag::kAggregateExp) {
     Expression child = exp->AsAggregateExpression().Child();
     if (!child) {
@@ -292,33 +301,40 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
       return Status::kSuccess;
     }
     RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols));
+                                     relations, all_cols,
+                                     expand_proto_value_table));
   } else if (exp->Type() == TypeTag::kCaseExp) {
     const auto& case_expression = exp->AsCaseExpression();
     for (const auto& clause : case_expression.when_clauses_) {
       Expression condition = clause.first;
       Expression value = clause.second;
       RETURN_IF_FAIL(ResolveExpression(condition, col_table_map,
-                                       ambiguous_colum_name, relations, all_cols));
+                                       ambiguous_colum_name, relations,
+                                       all_cols, expand_proto_value_table));
       RETURN_IF_FAIL(ResolveExpression(value, col_table_map,
-                                       ambiguous_colum_name, relations, all_cols));
+                                       ambiguous_colum_name, relations,
+                                       all_cols, expand_proto_value_table));
     }
     Expression otherwise = case_expression.else_clause_;
     RETURN_IF_FAIL(ResolveExpression(otherwise, col_table_map,
-                                     ambiguous_colum_name, relations, all_cols));
+                                     ambiguous_colum_name, relations, all_cols,
+                                     expand_proto_value_table));
   } else if (exp->Type() == TypeTag::kInExp) {
     const auto& in = exp->AsInExpression();
     Expression child = in.child_;
     RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols));
+                                     relations, all_cols,
+                                     expand_proto_value_table));
     for (Expression item : in.list_) {
       RETURN_IF_FAIL(ResolveExpression(item, col_table_map,
-                                       ambiguous_colum_name, relations, all_cols));
+                                       ambiguous_colum_name, relations,
+                                       all_cols, expand_proto_value_table));
     }
   } else if (exp->Type() == TypeTag::kFunctionCallExp) {
     for (Expression argument : exp->AsFunctionCallExpression().Args()) {
       RETURN_IF_FAIL(ResolveExpression(argument, col_table_map,
-                                       ambiguous_colum_name, relations, all_cols));
+                                       ambiguous_colum_name, relations,
+                                       all_cols, expand_proto_value_table));
     }
   }
   return Status::kSuccess;
@@ -351,15 +367,15 @@ Status ResolveSelect(
               (matched.front().name == "$expr0" ||
                matched.front().name == "int32_val1")) {
             const ColumnName base = matched.front();
-            for (const char* field : {"int32_val1", "int32_val2",
-                                      "str_value"}) {
+            for (const char* field :
+                 {"int32_val1", "int32_val2", "str_value"}) {
               it = select.insert(
                   it, NamedExpression(
-                         field,
-                         FunctionCallExp(
-                             "__get_field_safe",
-                             {ColumnValueExp(base),
-                              ConstantValueExp(Value(std::string(field)))})));
+                          field,
+                          FunctionCallExp(
+                              "__get_field_safe",
+                              {ColumnValueExp(base),
+                               ConstantValueExp(Value(std::string(field)))})));
               ++it;
             }
           } else {
@@ -376,15 +392,14 @@ Status ResolveSelect(
             (all_cols.front().name == "$expr0" ||
              all_cols.front().name == "int32_val1")) {
           const ColumnName base = all_cols.front();
-          for (const char* field : {"int32_val1", "int32_val2",
-                                    "str_value"}) {
+          for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
             it = select.insert(
-                it, NamedExpression(
-                       field,
-                       FunctionCallExp(
-                           "__get_field_safe",
-                           {ColumnValueExp(base),
-                            ConstantValueExp(Value(std::string(field))) })));
+                it,
+                NamedExpression(
+                    field, FunctionCallExp(
+                               "__get_field_safe",
+                               {ColumnValueExp(base),
+                                ConstantValueExp(Value(std::string(field)))})));
             ++it;
           }
           continue;
@@ -402,7 +417,8 @@ Status ResolveSelect(
       if (!col_name.schema.empty()) {
         Expression expression = it->expression;
         RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                         ambiguous_colum_name, relations, all_cols));
+                                         ambiguous_colum_name, relations,
+                                         all_cols, expand_proto_value_table));
         ++it;
         continue;
       }
@@ -416,11 +432,10 @@ Status ResolveSelect(
             it->expression = FunctionCallExp(
                 "__struct_json__",
                 {ConstantValueExp(Value(std::string(col_name.name))),
-                 FunctionCallExp(
-                     "__value_table_proto_existing",
-                     {ConstantValueExp(
-                          Value(std::string("googlesql_test.TestExtraPB"))),
-                      ColumnValueExp(all_cols.front())})});
+                 FunctionCallExp("__value_table_proto_existing",
+                                 {ConstantValueExp(Value(std::string(
+                                      "googlesql_test.TestExtraPB"))),
+                                  ColumnValueExp(all_cols.front())})});
             ++it;
             continue;
           }
@@ -436,11 +451,17 @@ Status ResolveSelect(
           ++it;
           continue;
         }
-        if (all_cols.size() == 1 && col_name.name != "*") {
+        if (expand_proto_value_table && all_cols.size() == 1 &&
+            col_name.name != "*") {
+          // Only proto value-table cells can absorb an unknown field name
+          // through __get_field_safe (the proto evaluator returns NULL for
+          // absent fields, matching GoogleSQL).  A plain single-column
+          // relation must reject the unknown name, otherwise a typo'd
+          // column reference silently yields NULL instead of an error.
           it->expression = FunctionCallExp(
               "__get_field_safe",
               {ColumnValueExp(all_cols.front()),
-               ConstantValueExp(Value(std::string(col_name.name))) });
+               ConstantValueExp(Value(std::string(col_name.name)))});
           ++it;
           continue;
         }
@@ -451,13 +472,13 @@ Status ResolveSelect(
     } else {
       Expression expression = it->expression;
       RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                       ambiguous_colum_name, relations, all_cols));
+                                       ambiguous_colum_name, relations,
+                                       all_cols, expand_proto_value_table));
       ++it;
     }
   }
-  if (expand_proto_value_table && all_cols.size() == 1 &&
-      select.size() == 1 && select.front().expression->Type() ==
-          TypeTag::kColumnValue &&
+  if (expand_proto_value_table && all_cols.size() == 1 && select.size() == 1 &&
+      select.front().expression->Type() == TypeTag::kColumnValue &&
       select.front().expression->AsColumnValue().GetColumnName().name ==
           all_cols.front().name) {
     const ColumnName base = all_cols.front();
@@ -465,10 +486,9 @@ Status ResolveSelect(
     for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
       select.emplace_back(
           field,
-          FunctionCallExp(
-              "__get_field_safe",
-              {ColumnValueExp(base),
-               ConstantValueExp(Value(std::string(field))) }));
+          FunctionCallExp("__get_field_safe",
+                          {ColumnValueExp(base),
+                           ConstantValueExp(Value(std::string(field)))}));
     }
   }
   return Status::kSuccess;
@@ -513,11 +533,15 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   for (auto& item : select_) {
     Expression mapped =
         BindFieldPaths(item.expression, col_table_map, relations);
-    if (mapped) { item.expression = std::move(mapped); }
+    if (mapped) {
+      item.expression = std::move(mapped);
+    }
   }
   {
     Expression mapped = BindFieldPaths(where_, col_table_map, relations);
-    if (mapped) { where_ = std::move(mapped); }
+    if (mapped) {
+      where_ = std::move(mapped);
+    }
   }
 
   // Rewrite SELECT clause.
@@ -527,10 +551,26 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
           named.expression, col_table_map, relations, relation_column_counts);
     }
   }
-  where_ = where_ ? BindColumnQualifiedFieldReads(where_, col_table_map,
-                                                  relations,
-                                                  relation_column_counts)
-                  : where_;
+  where_ = where_
+               ? BindColumnQualifiedFieldReads(where_, col_table_map, relations,
+                                               relation_column_counts)
+               : where_;
+
+  // Proto value tables (compliance harness) expose a single message column
+  // whose fields are addressed by name; only those relations may absorb an
+  // unknown bare column through __get_field_safe.
+  const bool expand_proto_value_table = [&] {
+    for (const std::string& relation : from_) {
+      const auto found = aliases_.find(relation);
+      const std::string& physical =
+          found == aliases_.end() ? relation : found->second;
+      if (physical.find("TestExtraPBValueTable") != std::string::npos ||
+          physical.find("WithProtoValueTable") != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  }();
 
   // ORDER BY is evaluated after projection, so a bare identifier may refer
   // to a SELECT-list alias (for example `SELECT id + 10 AS shifted ...
@@ -558,30 +598,16 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
         }
       }
     }
-    RETURN_IF_FAIL(ResolveExpression(order, col_table_map,
-                                     ambiguous_colum_name, relations,
-                                     all_cols));
+    RETURN_IF_FAIL(ResolveExpression(order, col_table_map, ambiguous_colum_name,
+                                     relations, all_cols,
+                                     expand_proto_value_table));
   }
-  RETURN_IF_FAIL(ResolveSelect(
-      select_, col_table_map, ambiguous_colum_name, all_cols, relations, [&] {
-                                 for (const std::string& relation : from_) {
-                                   const auto found = aliases_.find(relation);
-                                   const std::string& physical =
-                                       found == aliases_.end() ? relation
-                                                               : found->second;
-                                   if (physical.find("TestExtraPBValueTable") !=
-                                           std::string::npos ||
-                                       physical.find("WithProtoValueTable") !=
-                                           std::string::npos) {
-                                     return true;
-                                   }
-                                 }
-                                 return false;
-                               }()));
+  RETURN_IF_FAIL(ResolveSelect(select_, col_table_map, ambiguous_colum_name,
+                               all_cols, relations, expand_proto_value_table));
 
   // Rewrite WHERE clause.
   return ResolveExpression(where_, col_table_map, ambiguous_colum_name,
-                           relations, all_cols);
+                           relations, all_cols, expand_proto_value_table);
 }
 
 }  // namespace tinylamb

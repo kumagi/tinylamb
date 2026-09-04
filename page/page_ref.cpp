@@ -26,7 +26,9 @@
 namespace tinylamb {
 namespace {
 void ReleasePin(std::atomic<uint32_t>* pin_count, page_id_t page_id) {
-  if (pin_count == nullptr) { return; }
+  if (pin_count == nullptr) {
+    return;
+  }
   uint32_t pins = pin_count->load(std::memory_order_relaxed);
   while (pins != 0) {
     if (pin_count->compare_exchange_weak(pins, pins - 1,

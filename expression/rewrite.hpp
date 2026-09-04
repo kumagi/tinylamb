@@ -2,8 +2,8 @@
 #ifndef TINYLAMB_EXPRESSION_REWRITE_HPP
 #define TINYLAMB_EXPRESSION_REWRITE_HPP
 
-#include <functional>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -84,13 +84,27 @@ class ExpressionRule {
         pattern_(std::move(pattern)),
         rewrite_(std::move(rewrite)) {}
 
+  // D6 (docs/design.md): a predicate-ADDING rule applies to the ROOT
+  // conjunct set only.  Firing on inner AND subtrees made such a rule
+  // re-append the same predicate at every level, and the copies re-fed each
+  // other until the pass cap (the "expression rewrite did not converge"
+  // failure on legitimate 3-table joins).
+  ExpressionRule(std::string name, ExpressionPattern pattern, Rewrite rewrite,
+                 bool root_only)
+      : name_(std::move(name)),
+        pattern_(std::move(pattern)),
+        rewrite_(std::move(rewrite)),
+        root_only_(root_only) {}
+
   [[nodiscard]] const std::string& Name() const { return name_; }
+  [[nodiscard]] bool root_only() const { return root_only_; }
   [[nodiscard]] Expression Apply(const Expression& expression) const;
 
  private:
   std::string name_;
   ExpressionPattern pattern_;
   Rewrite rewrite_;
+  bool root_only_ = false;
 };
 
 class ExpressionRuleSet {
@@ -113,12 +127,18 @@ class ExpressionRewriter {
   explicit ExpressionRewriter(const ExpressionRuleSet& rules)
       : rules_(&rules) {}
 
+  // D6 (docs/design.md): the pass cap is a safety net.  Tests may shrink it
+  // to exercise the "cap reached -> return last stable form" path without
+  // paying 32 full passes; 0 restores the default.
+  void set_pass_limit(size_t passes) { pass_limit_ = passes; }
+
   [[nodiscard]] Expression Rewrite(const Expression& expression) const;
 
  private:
   [[nodiscard]] Expression RewriteOnce(const Expression& expression,
                                        size_t depth) const;
   const ExpressionRuleSet* rules_;
+  size_t pass_limit_ = 0;
 };
 
 [[nodiscard]] std::vector<Expression> ExpressionChildren(
@@ -128,8 +148,8 @@ class ExpressionRewriter {
 // Applies arithmetic rewrites that require resolved input-column types.
 // Keeping these separate from the schema-free rule set prevents type-changing
 // rewrites such as DOUBLE-column multiplication by an integer zero.
-[[nodiscard]] Expression RewriteTypedArithmetic(
-    const Expression& expression, const Schema& input_schema);
+[[nodiscard]] Expression RewriteTypedArithmetic(const Expression& expression,
+                                                const Schema& input_schema);
 [[nodiscard]] std::vector<Expression> SplitConjuncts(
     const Expression& expression);
 [[nodiscard]] Expression CombineConjuncts(

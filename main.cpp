@@ -15,22 +15,23 @@
  */
 
 #include <algorithm>
-#include <cstddef>
 #include <cctype>
+#include <cstddef>
 #include <exception>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "recovery/recovery_manager.hpp"
-#include "common/status_or.hpp"
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "executor/executor_base.hpp"
 #include "query/sql_engine.hpp"
+#include "recovery/recovery_manager.hpp"
 #include "server/postgres_protocol.hpp"
 #include "type/row.hpp"
 
@@ -64,6 +65,10 @@ int main(int argc, char** argv) {
   tinylamb::SqlEngine engine(database);
   // One implicit transaction wraps every statement of the script; the first
   // failure aborts the whole run instead of terminating the process.
+  // D4 (docs/design.md): output is buffered and only printed after the
+  // commit's durability barrier, so no row reaches the user before the
+  // commits it observed are durable.
+  std::vector<std::string> pending_output;
   for (const std::string& statement : statements) {
     try {
       tinylamb::StatusOr<tinylamb::QueryResult> executed =
@@ -78,8 +83,13 @@ int main(int argc, char** argv) {
         context.Abort();
         return 1;
       }
-      executed.Value().ForEach(
-          [](const tinylamb::Row& row) { std::cout << row << '\n'; });
+      std::string buffer;
+      executed.Value().ForEach([&buffer](const tinylamb::Row& row) {
+        std::ostringstream line;
+        line << row << '\n';
+        buffer += line.str();
+      });
+      pending_output.push_back(std::move(buffer));
     } catch (const std::exception& error) {
       std::cerr << "error executing statement: " << error.what() << '\n';
       context.Abort();
@@ -99,5 +109,10 @@ int main(int argc, char** argv) {
     std::cerr << "error during commit: " << error.what() << '\n';
     return 1;
   }
+  // Durability barrier passed; the buffered rows may now reach the user.
+  for (const std::string& chunk : pending_output) {
+    std::cout << chunk;
+  }
+  std::cout.flush();
   return 0;
 }

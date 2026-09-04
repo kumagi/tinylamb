@@ -18,8 +18,10 @@
 namespace tinylamb {
 
 enum class AsOfComparison : uint8_t {
-  kLessEqual,     // right.as_of <= left.as_of (find largest right.as_of <= left.as_of)
-  kGreaterEqual,  // right.as_of >= left.as_of (find smallest right.as_of >= left.as_of)
+  kLessEqual,     // right.as_of <= left.as_of (find largest right.as_of <=
+                  // left.as_of)
+  kGreaterEqual,  // right.as_of >= left.as_of (find smallest right.as_of >=
+                  // left.as_of)
 };
 
 class AsOfJoin : public ExecutorBase {

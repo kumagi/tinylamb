@@ -32,17 +32,25 @@ void BitmapScanPlan::Dump(std::ostream& output, int indent) const {
          << (combine_ == BitmapCombine::kAnd ? "BitmapAnd" : "BitmapOr")
          << " (estimated rows: " << estimated_rows_ << ")";
   for (const BitmapIndexRange& range : ranges_) {
-    output << "\n" << Indent(indent + 2) << "BitmapIndexScan: "
-           << range.index->sc_.name_ << " on " << table_.GetSchema().Name();
+    output << "\n"
+           << Indent(indent + 2)
+           << "BitmapIndexScan: " << range.index->sc_.name_ << " on "
+           << table_.GetSchema().Name();
     if (!range.begin_key.empty() || !range.end_key.empty()) {
       output << " [";
-      if (!range.begin_key.empty()) { output << range.begin_key.front(); }
+      if (!range.begin_key.empty()) {
+        output << range.begin_key.front();
+      }
       output << " -> ";
-      if (!range.end_key.empty()) { output << range.end_key.front(); }
+      if (!range.end_key.empty()) {
+        output << range.end_key.front();
+      }
       output << "]";
     }
   }
-  if (where_) { output << "\n" << Indent(indent + 2) << "Recheck: " << *where_; }
+  if (where_) {
+    output << "\n" << Indent(indent + 2) << "Recheck: " << *where_;
+  }
 }
 
 std::string BitmapScanPlan::ToString() const {

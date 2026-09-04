@@ -36,6 +36,36 @@ bool IncrementalSortPlan::IsOrderedBy(
   return true;
 }
 
+bool IncrementalSortPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
+  if (expressions.size() != ascending.size() ||
+      expressions.size() != prefix_keys_.size() + suffix_keys_.size()) {
+    return false;
+  }
+  size_t offset = 0;
+  for (const std::vector<SortKey>* key : {&prefix_keys_, &suffix_keys_}) {
+    for (const SortKey& sort_key : *key) {
+      if (!expressions[offset] || !sort_key.expression ||
+          expressions[offset]->ToString() != sort_key.expression->ToString() ||
+          ascending[offset] != sort_key.ascending) {
+        return false;
+      }
+      const bool provided = sort_key.nulls_first.value_or(sort_key.ascending);
+      const bool requested =
+          offset < nulls_first.size()
+              ? nulls_first[offset].value_or(ascending[offset])
+              : ascending[offset];
+      if (provided != requested) {
+        return false;
+      }
+      ++offset;
+    }
+  }
+  return true;
+}
+
 void IncrementalSortPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(indent) << ToString() << "\n";
   child_->Dump(output, indent + 2);

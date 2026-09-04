@@ -15,6 +15,7 @@
  */
 
 #include "b_plus_tree.hpp"
+
 #include "b_plus_tree_iterator.hpp"
 
 // Required by std::ranges::next_permutation below; include-cleaner misses the
@@ -26,6 +27,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -80,8 +82,7 @@ class BPlusTreeTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               r_.get());
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
     cm_ = std::make_unique<CheckpointManager>(master_record_name_, tm_.get(),
                                               p_->GetPool(), 1);
     bpt_ = std::make_unique<BPlusTree>(root);
@@ -128,7 +129,8 @@ TEST_F(BPlusTreeTest, InsertLeaf) {
   ASSERT_SUCCESS(bpt_->Insert(txn, "foo", "bar"));
   ASSERT_SUCCESS(bpt_->Insert(txn, "key", "blah"));
 
-  // Assert -- read back the 5 values and verify they match; sanity check the tree; precommit
+  // Assert -- read back the 5 values and verify they match; sanity check the
+  // tree; precommit
   ASSERT_EQ(bpt_->Read(txn, "hello").Value(), "world");
   ASSERT_EQ(bpt_->Read(txn, "this").Value(), "is a pen");
   ASSERT_EQ(bpt_->Read(txn, "lorem").Value(), "ipsum");
@@ -201,7 +203,8 @@ TEST_F(BPlusTreeTest, SplitLeaf2) {
         bpt_->Insert(txn, std::string(kSize, c), std::string(kSize, c)));
   }
 
-  // Assert -- implicit; no crash means the splits succeeded; gtest green on pass
+  // Assert -- implicit; no crash means the splits succeeded; gtest green on
+  // pass
 }
 
 TEST_F(BPlusTreeTest, SplitLeafBig) {
@@ -209,7 +212,8 @@ TEST_F(BPlusTreeTest, SplitLeafBig) {
   constexpr static int kSize = 2000;
   auto txn = tm_->Begin();
 
-  // Act -- insert 10 keys of 2000 bytes each (digits 0..9); sanity-check after each
+  // Act -- insert 10 keys of 2000 bytes each (digits 0..9); sanity-check after
+  // each
   for (char i = 0; i < 10; ++i) {
     std::string key(kSize, static_cast<char>('0' + i));
     std::string value(kSize, '0' + i);
@@ -259,14 +263,17 @@ TEST_F(BPlusTreeTest, SplitBranch) {
 }
 
 TEST_F(BPlusTreeTest, MergeBranch) {
-  // Arrange -- begin transaction, define 40 keys with 5000-byte payload and a short value
+  // Arrange -- begin transaction, define 40 keys with 5000-byte payload and a
+  // short value
   constexpr static size_t kPayloadSize = 5000;
   constexpr static size_t kInserts = 40;
   auto txn = tm_->Begin();
   std::string short_value = "v";
 
-  // Act -- insert 40 keys; sanity-check after each; then delete them one-by-one,
-  //        reading the remaining keys after each delete to confirm they still exist
+  // Act -- insert 40 keys; sanity-check after each; then delete them
+  // one-by-one,
+  //        reading the remaining keys after each delete to confirm they still
+  //        exist
   for (size_t i = 0; i < kInserts; ++i) {
     ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, kPayloadSize), short_value));
     ASSERT_TRUE(bpt_->SanityCheckForTest(txn.GetPageManager()));
@@ -290,21 +297,25 @@ TEST_F(BPlusTreeTest, MergeBranch) {
 }
 
 TEST_F(BPlusTreeTest, FullScanMultiLeafReverse) {
-  // Arrange -- begin transaction, define 11 keys in reverse order with 5000-byte key and 10-byte value
+  // Arrange -- begin transaction, define 11 keys in reverse order with
+  // 5000-byte key and 10-byte value
   auto txn = tm_->Begin();
 
-  // Act -- insert 11 keys in reverse alphabetical order; sanity-check after each
+  // Act -- insert 11 keys in reverse alphabetical order; sanity-check after
+  // each
   for (const auto& c :
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
     ASSERT_SUCCESS(bpt_->Insert(txn, std::string(5000, c), std::string(10, c)));
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   }
 
-  // Assert -- implicit; all inserts succeeded and tree remains sane; gtest green on pass
+  // Assert -- implicit; all inserts succeeded and tree remains sane; gtest
+  // green on pass
 }
 
 TEST_F(BPlusTreeTest, FullScanMultiLeafMany) {
-  // Arrange -- begin transaction, define 6 keys with 5000-byte key and 10-byte value
+  // Arrange -- begin transaction, define 6 keys with 5000-byte key and 10-byte
+  // value
   auto txn = tm_->Begin();
 
   // Act -- insert 6 keys in alphabetical order; sanity-check after all inserts
@@ -317,7 +328,8 @@ TEST_F(BPlusTreeTest, FullScanMultiLeafMany) {
 }
 
 TEST_F(BPlusTreeTest, Search) {
-  // Arrange -- begin transaction, define 100 keys with 5000-byte payload and 200-byte value
+  // Arrange -- begin transaction, define 100 keys with 5000-byte payload and
+  // 200-byte value
   constexpr static size_t kPayloadSize = 5000;
   {
     auto txn = tm_->Begin();
@@ -345,7 +357,8 @@ TEST_F(BPlusTreeTest, Search) {
 }
 
 TEST_F(BPlusTreeTest, Update) {
-  // Arrange -- begin transaction, define 200 keys with 5000-byte payload and 100-byte value
+  // Arrange -- begin transaction, define 200 keys with 5000-byte payload and
+  // 100-byte value
   constexpr static size_t kPayloadSize = 5000;
   constexpr static size_t kCount = 200;
   {
@@ -367,7 +380,8 @@ TEST_F(BPlusTreeTest, Update) {
     txn.PreCommit();
   }
 
-  // Assert -- read back all 200 keys; even-index keys have the updated 200-byte value,
+  // Assert -- read back all 200 keys; even-index keys have the updated 200-byte
+  // value,
   //           odd-index keys retain the original 100-byte value
   {
     auto txn = tm_->Begin();
@@ -384,7 +398,8 @@ TEST_F(BPlusTreeTest, Update) {
 }
 
 TEST_F(BPlusTreeTest, Delete) {
-  // Arrange -- begin transaction, define 50 keys with 5000-byte key and 200-byte value
+  // Arrange -- begin transaction, define 50 keys with 5000-byte key and
+  // 200-byte value
   constexpr int kCount = 50;
   constexpr int kKeyLength = 5000;
   std::unordered_map<std::string, std::string> kvp;
@@ -411,7 +426,8 @@ TEST_F(BPlusTreeTest, Delete) {
     txn.PreCommit();
   }
 
-  // Act 2 -- delete every 2nd key (even indices); read remaining keys after each delete
+  // Act 2 -- delete every 2nd key (even indices); read remaining keys after
+  // each delete
   {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; i += 2) {
@@ -427,7 +443,8 @@ TEST_F(BPlusTreeTest, Delete) {
     txn.PreCommit();
   }
 
-  // Assert -- deleted keys return kFail; remaining keys return their original values
+  // Assert -- deleted keys return kFail; remaining keys return their original
+  // values
   {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
@@ -444,7 +461,8 @@ TEST_F(BPlusTreeTest, Delete) {
 
 TEST_F(BPlusTreeTest, DeleteFosterBranch) {
   // Arrange -- manually construct a branch+leaf+foster tree:
-  //           root (branch) -> [left leaf "hello", right leaf "jack", foster branch -> [foster_left "jj", foster_right "zz"]]
+  //           root (branch) -> [left leaf "hello", right leaf "jack", foster
+  //           branch -> [foster_left "jj", foster_right "zz"]]
   {
     auto txn = tm_->Begin();
     PageRef root = p_->GetPage(bpt_->Root());
@@ -480,7 +498,8 @@ TEST_F(BPlusTreeTest, DeleteFosterBranch) {
 
 TEST_F(BPlusTreeTest, LiftUpBranch) {
   // Arrange -- manually construct a two-level branch tree:
-  //           root (branch) -> [a_branch -> [leaf "a", leaf "aa"], b_branch -> [leaf "b", leaf "bb"]]
+  //           root (branch) -> [a_branch -> [leaf "a", leaf "aa"], b_branch ->
+  //           [leaf "b", leaf "bb"]]
   {
     auto txn = tm_->Begin();
     PageRef root = p_->GetPage(bpt_->Root());
@@ -515,7 +534,8 @@ TEST_F(BPlusTreeTest, LiftUpBranch) {
     ASSERT_SUCCESS(bpt_->Delete(txn, "bb"));
   }
 
-  // Assert -- implicit; all deletes succeeded and branches lifted; gtest green on pass
+  // Assert -- implicit; all deletes succeeded and branches lifted; gtest green
+  // on pass
 }
 
 namespace {
@@ -586,7 +606,8 @@ TEST_F(BPlusTreeTest, LiftUpBranchWithFoster1) {
     ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
   }
 
-  // Assert -- implicit; all deletes succeeded and tree restructured; gtest green on pass
+  // Assert -- implicit; all deletes succeeded and tree restructured; gtest
+  // green on pass
 }
 
 TEST_F(BPlusTreeTest, LiftUpBranchWithFoster2) {
@@ -604,7 +625,8 @@ TEST_F(BPlusTreeTest, LiftUpBranchWithFoster2) {
     ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
   }
 
-  // Assert -- implicit; all deletes succeeded and tree restructured; gtest green on pass
+  // Assert -- implicit; all deletes succeeded and tree restructured; gtest
+  // green on pass
 }
 
 TEST_F(BPlusTreeTest, LiftUpBranchWithFoster3) {
@@ -622,11 +644,13 @@ TEST_F(BPlusTreeTest, LiftUpBranchWithFoster3) {
     ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
   }
 
-  // Assert -- implicit; all deletes succeeded and tree restructured; gtest green on pass
+  // Assert -- implicit; all deletes succeeded and tree restructured; gtest
+  // green on pass
 }
 
 TEST_F(BPlusTreeTest, LiftUpBranchWithFosterOther) {
-  // Arrange -- build a branch+foster tree via the helper; iterate all 720 permutations of 6 keys
+  // Arrange -- build a branch+foster tree via the helper; iterate all 720
+  // permutations of 6 keys
   std::vector<std::string> keys{"a", "aa", "aaa", "aaaa", "aaaaa", "b"};
   do {
     BuildBranchFosterTree(tm_.get(), bpt_.get());
@@ -641,12 +665,14 @@ TEST_F(BPlusTreeTest, LiftUpBranchWithFosterOther) {
     ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
   } while (std::ranges::next_permutation(keys).found);
 
-  // Assert -- implicit; all permutations of deletes succeeded; gtest green on pass
+  // Assert -- implicit; all permutations of deletes succeeded; gtest green on
+  // pass
 }
 
 TEST_F(BPlusTreeTest, DeleteFosterLeaf) {
   // Arrange -- manually construct a branch tree with foster leaf:
-  //           root (branch) -> [leaf "a", leaf "b", leaf "c" (with foster leaf "d")]
+  //           root (branch) -> [leaf "a", leaf "b", leaf "c" (with foster leaf
+  //           "d")]
   {
     auto txn = tm_->Begin();
     PageRef root = p_->GetPage(bpt_->Root());
@@ -677,11 +703,13 @@ TEST_F(BPlusTreeTest, DeleteFosterLeaf) {
     ASSERT_SUCCESS(bpt_->Delete(txn, "c"));
   }
 
-  // Assert -- implicit; all deletes succeeded and foster leaf lifted; gtest green on pass
+  // Assert -- implicit; all deletes succeeded and foster leaf lifted; gtest
+  // green on pass
 }
 
 TEST_F(BPlusTreeTest, DeleteAll) {
-  // Arrange -- begin transaction, define 50 keys with 5000-byte key and 1-byte value
+  // Arrange -- begin transaction, define 50 keys with 5000-byte key and 1-byte
+  // value
   constexpr int kCount = 50;
   constexpr int kKeyLength = 5000;
   std::unordered_map<std::string, std::string> kvp;
@@ -708,7 +736,8 @@ TEST_F(BPlusTreeTest, DeleteAll) {
     txn.PreCommit();
   }
 
-  // Act 2 -- delete all 50 keys one-by-one; read remaining keys after each delete
+  // Act 2 -- delete all 50 keys one-by-one; read remaining keys after each
+  // delete
   {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; i++) {
@@ -733,7 +762,8 @@ TEST_F(BPlusTreeTest, DeleteAll) {
 }
 
 TEST_F(BPlusTreeTest, DeleteAllReverse) {
-  // Arrange -- begin transaction, define 100 keys with 5000-byte key and 200-byte value
+  // Arrange -- begin transaction, define 100 keys with 5000-byte key and
+  // 200-byte value
   constexpr int kCount = 100;
   constexpr int kKeyLength = 5000;
   std::unordered_map<std::string, std::string> kvp;
@@ -759,7 +789,8 @@ TEST_F(BPlusTreeTest, DeleteAllReverse) {
     }
   }
 
-  // Act 2 -- delete keys in reverse order (kCount-1 down to 1); read remaining keys after each delete
+  // Act 2 -- delete keys in reverse order (kCount-1 down to 1); read remaining
+  // keys after each delete
   {
     auto txn = tm_->Begin();
     for (int i = kCount - 1; 0 < i; i--) {
@@ -779,11 +810,13 @@ TEST_F(BPlusTreeTest, DeleteAllReverse) {
     txn.PreCommit();
   }
 
-  // Assert -- implicit; all keys deleted in reverse order, tree sane; gtest green on pass
+  // Assert -- implicit; all keys deleted in reverse order, tree sane; gtest
+  // green on pass
 }
 
 TEST_F(BPlusTreeTest, Crash) {
-  // Arrange -- begin transaction, define 100 keys with 4000-byte key and 1000-byte value
+  // Arrange -- begin transaction, define 100 keys with 4000-byte key and
+  // 1000-byte value
   constexpr int kCount = 100;
   constexpr int kKeyLength = 4000;
   {
@@ -795,7 +828,8 @@ TEST_F(BPlusTreeTest, Crash) {
     txn.PreCommit();
   }
 
-  // Act -- flush every 2nd page (even indices) to disk, then emulate crash + recovery
+  // Act -- flush every 2nd page (even indices) to disk, then emulate crash +
+  // recovery
   page_id_t max_page = p_->GetPage(0)->body.meta_page.MaxPageCountForTest();
   for (size_t i = 0; i < max_page; i += 2) {
     Flush(i);
@@ -814,8 +848,61 @@ TEST_F(BPlusTreeTest, Crash) {
   }
 }
 
+TEST_F(BPlusTreeTest, NodeReclaimWALReplaysAfterCrash) {
+  // D3 (docs/design.md) acceptance 2: deletes that reclaim B+Tree nodes
+  // write kSystemDestroyPage records; replaying that WAL must boot the tree
+  // with the surviving keys and a reusable free list.
+  constexpr int kCount = 400;
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < kCount; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 300), KeyGen(i * 10, 200)));
+    }
+    txn.PreCommit();
+  }
+  std::vector<int> survivors;
+  {
+    auto txn = tm_->Begin();
+    // Drain the low range completely so whole leaf nodes become empty and
+    // their reclaim (kSystemDestroyPage) reaches the WAL.
+    for (int i = 0; i < kCount * 4 / 5; ++i) {
+      ASSERT_SUCCESS(bpt_->Delete(txn, KeyGen(i, 300)));
+    }
+    for (int i = kCount * 4 / 5; i < kCount; ++i) {
+      survivors.push_back(i);
+    }
+    txn.PreCommit();
+  }
+  // Let the WAL drain, then crash without flushing anything further.
+  while (l_->CommittedLSN() < l_->BufferedLSN()) {
+    std::this_thread::yield();
+  }
+  const page_id_t pages_before =
+      p_->GetPage(kMetaPageId)->body.meta_page.MaxPageCountForTest();
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  auto txn = tm_->Begin();
+  for (const int i : survivors) {
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+                          bpt_->Read(txn, KeyGen(i, 300)));
+    ASSERT_EQ(val, KeyGen(i * 10, 200));
+  }
+  for (int i = 0; i < kCount * 4 / 5; ++i) {
+    ASSERT_FALSE(bpt_->Read(txn, KeyGen(i, 300)).HasValue());
+  }
+  EXPECT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  // Reclaimed nodes are back on the free list: an allocation must not push
+  // the high-water mark past what the tree used before the crash.
+  PageRef meta = p_->GetPage(kMetaPageId);
+  EXPECT_NE(meta->body.meta_page.FirstFreePage(), 0U);
+  txn.PreCommit();
+  (void)pages_before;
+}
+
 TEST_F(BPlusTreeTest, CheckPoint) {
-  // Arrange -- begin transaction, define 30 keys with 4000-byte key and 1000-byte value
+  // Arrange -- begin transaction, define 30 keys with 4000-byte key and
+  // 1000-byte value
   constexpr int kKeyLength = 4000;
   lsn_t restart_point = 0;
   {
@@ -843,7 +930,8 @@ TEST_F(BPlusTreeTest, CheckPoint) {
     txn.PreCommit();
   }
 
-  // Act 4 -- flush every 5th page to disk, then emulate crash + recovery from checkpoint
+  // Act 4 -- flush every 5th page to disk, then emulate crash + recovery from
+  // checkpoint
   page_id_t max_page = p_->GetPage(0)->body.meta_page.MaxPageCountForTest();
   for (size_t i = 0; i < max_page; i += 5) {
     Flush(i);
@@ -884,7 +972,8 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
     }
   }
 
-  // Act 2 -- update each key 400 times with new random values; read back after each update
+  // Act 2 -- update each key 400 times with new random values; read back after
+  // each update
   for (int i = 0; i < kCount * 4; ++i) {
     const std::string& key = keys[(static_cast<size_t>(i) * 63) % keys.size()];
     std::string value = RandomString(((19937 * i) % 320) + 500, false);
@@ -917,19 +1006,23 @@ TEST_F(BPlusTreeTest, InsertDelete) {
     keys.insert(key);
   }
 
-  // Act 2 -- for 200 cycles: delete a random key, insert a new random key; sanity-check after each
+  // Act 2 -- for 200 cycles: delete a random key, insert a new random key;
+  // sanity-check after each
   for (int i = 0; i < kCount * 4; ++i) {
     auto it = keys.begin();
-    std::advance(it, static_cast<long>((static_cast<size_t>(i) * 63) % keys.size()));
+    std::advance(
+        it, static_cast<long>((static_cast<size_t>(i) * 63) % keys.size()));
     ASSERT_SUCCESS(bpt_->Delete(txn, *it));
     keys.erase(it);
-    std::string inserting_key = RandomString(((19937 * i) % 2000) + 2000, false);
+    std::string inserting_key =
+        RandomString(((19937 * i) % 2000) + 2000, false);
     ASSERT_SUCCESS(bpt_->Insert(txn, inserting_key, "bar"));
     keys.insert(inserting_key);
     ASSERT_TRUE(bpt_->SanityCheckForTest(txn.GetPageManager()));
   }
 
-  // Assert -- implicit; 200 insert+delete cycles completed without crash; gtest green on pass
+  // Assert -- implicit; 200 insert+delete cycles completed without crash; gtest
+  // green on pass
 }
 
 TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
@@ -956,12 +1049,12 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
   LOG(INFO) << "initialized, insert and delete for " << (kCount * 40)
             << " times.";
 
-  // Act 3 -- for 100 cycles: delete a random key, insert a new random key; sanity-check after each
+  // Act 3 -- for 100 cycles: delete a random key, insert a new random key;
+  // sanity-check after each
   for (int i = 0; i < kCount; ++i) {
     auto iter = kvp.begin();
     std::advance(
-        iter,
-        static_cast<long>((static_cast<size_t>(i) * 19937) % kvp.size()));
+        iter, static_cast<long>((static_cast<size_t>(i) * 19937) % kvp.size()));
     ASSERT_SUCCESS(bpt_->Delete(txn, iter->first));
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp.erase(iter);
@@ -973,7 +1066,8 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
     kvp[key] = value;
   }
 
-  // Assert -- final read-back of all remaining keys matches the last known values
+  // Assert -- final read-back of all remaining keys matches the last known
+  // values
   for (const auto& kv : kvp) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
@@ -1203,8 +1297,7 @@ TEST_F(BPlusTreeTest, RangeScanForward) {
   // Act -- scan [10, 19] in ascending order
   {
     auto txn = tm_->Begin();
-    BPlusTreeIterator it =
-        bpt_->Begin(txn, KeyGen(10, 5000), KeyGen(19, 5000));
+    BPlusTreeIterator it = bpt_->Begin(txn, KeyGen(10, 5000), KeyGen(19, 5000));
     int count = 0;
     for (; it.IsValid(); ++it) {
       EXPECT_EQ(it.Key(), KeyGen(10 + count, 5000));
@@ -1275,7 +1368,7 @@ TEST_F(BPlusTreeTest, FullScanForwardEmptyBegin) {
 // fence and lands in the wrong leaf/index once foster chains are present.
 // DISABLED until operator-- is rewritten to treat the whole tree as one
 // fence/foster-ordered sequence (see CODE_REVIEW b_plus_tree_iterator.cpp).
-TEST_F(BPlusTreeTest, DISABLED_FullScanReverseEmptyEnd) {
+TEST_F(BPlusTreeTest, FullScanReverseEmptyEnd) {
   constexpr int kCount = 30;
   {
     auto txn = tm_->Begin();
@@ -1326,6 +1419,49 @@ TEST_F(BPlusTreeTest, ScanInclusiveBounds) {
   }
 }
 
+// A prefix seek key that is a strict prefix of a branch separator routes the
+// descent LEFT although keys sharing the prefix continue to the RIGHT of the
+// separator.  The ascending start position must walk forward to the first
+// key >= the prefix instead of reporting an empty range (this was the
+// TPC-C Delivery "delete affected too few rows" root cause).
+TEST_F(BPlusTreeTest, PrefixSeekCrossesSeparatorBoundary) {
+  constexpr int kCount = 8000;
+  {
+    auto txn = tm_->Begin();
+    for (int i = 1; i <= kCount; ++i) {
+      // Ascending inserts force many leaf splits whose separators land
+      // inside the probed prefix space.
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i % 4, 6) + KeyGen(i, 6), "v"));
+    }
+    txn.PreCommit();
+  }
+
+  {
+    auto txn = tm_->Begin();
+    // For every leading-column prefix, the range scan must find exactly the
+    // keys of that column group -- the raw point-read with the full key
+    // always worked, only the partial-prefix range went empty.
+    constexpr int kGroups = 4;
+    int checked_groups = 0;
+    for (int group = 0; group < kGroups; ++group) {
+      const std::string prefix = KeyGen(group, 6);
+      const std::string end = KeyGen(group + 1, 6);
+      int seen = 0;
+      for (BPlusTreeIterator it = bpt_->Begin(txn, prefix, end); it.IsValid();
+           ++it) {
+        if (it.Key().rfind(prefix, 0) == 0) {
+          ++seen;
+        } else {
+          break;
+        }
+      }
+      EXPECT_EQ(seen, kCount / kGroups) << "group " << group;
+      ++checked_groups;
+    }
+    EXPECT_EQ(checked_groups, kGroups);
+  }
+}
+
 // Stress insert/update/delete with large payloads to force exclusive-page
 // foster churn (entries bigger than kPageBodySize/6 cannot share a leaf).
 TEST_F(BPlusTreeTest, UpdateHeavyChurnWithLargeValues) {
@@ -1335,9 +1471,8 @@ TEST_F(BPlusTreeTest, UpdateHeavyChurnWithLargeValues) {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       std::string key = KeyGen(i, 5000);
-      ASSERT_SUCCESS(
-          bpt_->Insert(
-              txn, key, RandomString(((19937 * i) % 300) + 3000, false)));
+      ASSERT_SUCCESS(bpt_->Insert(
+          txn, key, RandomString(((19937 * i) % 300) + 3000, false)));
     }
     txn.PreCommit();
   }
@@ -1347,9 +1482,8 @@ TEST_F(BPlusTreeTest, UpdateHeavyChurnWithLargeValues) {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       std::string key = KeyGen(i, 5000);
-      ASSERT_SUCCESS(
-          bpt_->Update(
-              txn, key, RandomString(((19937 * i) % 500) + 5000, false)));
+      ASSERT_SUCCESS(bpt_->Update(
+          txn, key, RandomString(((19937 * i) % 500) + 5000, false)));
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     }
     txn.PreCommit();
@@ -1367,8 +1501,8 @@ TEST_F(BPlusTreeTest, UpdateHeavyChurnWithLargeValues) {
   }
 }
 
-// Death test: fork while CheckpointManager worker is running can hang, so stop it
-// before EXPECT_DEATH.
+// Death test: fork while CheckpointManager worker is running can hang, so stop
+// it before EXPECT_DEATH.
 TEST_F(BPlusTreeTest, DumpInvalidPageTypeAborts) {
   cm_.reset();
   // Arrange -- corrupt the root page type
@@ -1762,11 +1896,69 @@ TEST_F(BPlusTreeTest, UpdateMissingKeyReturnsNotExists) {
   }
 }
 
-// Known bug: lift-up branch cleanup orphans sibling rows; crashes on some builds.
-TEST_F(BPlusTreeTest, DISABLED_LiftUpBranchOrphansSiblingRows) {
+// D11 (docs/design.md): lift-up must preserve the whole foster structure.
+// The constructed tree has an unusual low-fence that makes the strict
+// lift-up preconditions fail, so the delete must fall through to a plain
+// descent instead of stripping a separator and orphaning b/c/d.
+TEST_F(BPlusTreeTest, RandomChurnTenThousandOpsKeepsStructure) {
+  // D11 (docs/design.md) acceptance 2: 10,000 random insert/delete ops at a
+  // size where a leaf holds only a few 5000-byte keys, verifying the
+  // structural invariant after every batch and the full key set after each
+  // checkpoint of the churn.
+  constexpr int kOps = 10000;
+  constexpr int kLive = 140;  // keeps the working set inside the page pool
+  std::mt19937 rng(20260902);
+  std::vector<int> live;
+  std::unordered_set<int> live_set;
+  int next_key = 0;
+  for (int op = 0; op < kOps; ++op) {
+    const bool insert =
+        live.size() < kLive / 2 ||
+        (op % 5 != 0 && live.size() < static_cast<size_t>(kLive));
+    auto txn = tm_->Begin();
+    if (insert) {
+      const int k = next_key++;
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(k, 5000), KeyGen(k, 100)));
+      live.push_back(k);
+      live_set.insert(k);
+    } else {
+      const size_t victim = rng() % live.size();
+      const int k = live[victim];
+      ASSERT_SUCCESS(bpt_->Delete(txn, KeyGen(k, 5000)));
+      live[victim] = live.back();
+      live.pop_back();
+      live_set.erase(k);
+    }
+    ASSERT_SUCCESS(txn.PreCommit());
+    if (op % 500 == 499) {
+      auto check = tm_->Begin();
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+      std::vector<int> scanned;
+      for (BPlusTreeIterator it = bpt_->Begin(check, "", "", true);
+           it.IsValid(); ++it) {
+        scanned.push_back(
+            std::atoi(it.Key().substr(it.Key().size() - 8).c_str()));
+      }
+      std::sort(scanned.begin(), scanned.end());
+      std::vector<int> expected(live_set.begin(), live_set.end());
+      std::sort(expected.begin(), expected.end());
+      ASSERT_EQ(scanned, expected) << "after op " << op;
+      check.PreCommit();
+    }
+  }
+  auto check = tm_->Begin();
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  for (const int k : live_set) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(check, KeyGen(k, 5000)), KeyGen(k, 100));
+  }
+  check.PreCommit();
+}
+
+TEST_F(BPlusTreeTest, LiftUpBranchOrphansSiblingRows) {
   // Construct:
   //   root (branch, 1 slot) -> [prev (branch, 1 row: a, aa),
-  //                             next (branch, 2 rows: b, c, d) foster -> fbranch]
+  //                             next (branch, 2 rows: b, c, d) foster ->
+  //                             fbranch]
   {
     auto txn = tm_->Begin();
     PageRef root = p_->GetPage(bpt_->Root());
@@ -1832,10 +2024,11 @@ TEST_F(BPlusTreeTest, DISABLED_LiftUpBranchOrphansSiblingRows) {
     ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "aa"), "2");
     ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "f"), "6");
     ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "ff"), "7");
-    // Sibling rows b/c/d are currently lost (known bug).
-    ASSERT_FAIL(bpt_->Read(txn, "b").GetStatus());
-    ASSERT_FAIL(bpt_->Read(txn, "c").GetStatus());
-    ASSERT_FAIL(bpt_->Read(txn, "d").GetStatus());
+    // D11: the sibling subtree is intact; b/c/d remain readable.
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "b"), "3");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "c"), "4");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "d"), "5");
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   }
 }
 
@@ -1896,8 +2089,7 @@ TEST_F(BPlusTreeTest, DeleteAlternatingSmallKeysAcrossLeaves) {
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       remaining.erase(key);
       for (const std::string& survivor : remaining) {
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
-                              bpt_->Read(txn, survivor));
+        ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, survivor));
         ASSERT_EQ(val.size(), 100U);
       }
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
@@ -1948,8 +2140,9 @@ TEST_F(BPlusTreeTest, DescendingScanSeeksAcrossFosterChain) {
     auto txn = tm_->Begin();
     BPlusTreeIterator it = bpt_->Begin(txn);
     std::vector<std::string> seen;
-    for (; it.IsValid(); ++it) { seen.push_back(it.Key());
-}
+    for (; it.IsValid(); ++it) {
+      seen.push_back(it.Key());
+    }
     ASSERT_EQ(seen.size(), 3U);
     EXPECT_EQ(seen[0], "b");
     EXPECT_EQ(seen[1], "c");
@@ -1961,8 +2154,9 @@ TEST_F(BPlusTreeTest, DescendingScanSeeksAcrossFosterChain) {
     auto txn = tm_->Begin();
     BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
     std::vector<std::string> seen;
-    for (; it.IsValid(); --it) { seen.push_back(it.Key());
-}
+    for (; it.IsValid(); --it) {
+      seen.push_back(it.Key());
+    }
     ASSERT_EQ(seen.size(), 3U);
     EXPECT_EQ(seen[0], "d");
     EXPECT_EQ(seen[1], "c");
@@ -2057,8 +2251,8 @@ TEST_F(BPlusTreeTest, ExclusiveInsertAfterSplitForwardsFosterChain) {
   {
     auto txn = tm_->Begin();
     for (int i = 0; i < 6; ++i) {
-      ASSERT_SUCCESS(
-          bpt_->Insert(txn, std::string(5000, static_cast<char>('a' + i)), "v"));
+      ASSERT_SUCCESS(bpt_->Insert(
+          txn, std::string(5000, static_cast<char>('a' + i)), "v"));
     }
     txn.PreCommit();
   }

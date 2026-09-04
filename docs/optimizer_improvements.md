@@ -37,6 +37,40 @@ Regression guards added to `query/query_test.cpp`
 (`SqlEngineSelectOrderByLimitOffset` covers unordered ORDER BY+LIMIT+OFFSET,
 plain LIMIT+OFFSET single application, and DISTINCT+LIMIT).
 
+## Handover Log (2026-09, suite-green pass)
+
+Three defects surfaced while re-running the widened suite; all fixed with
+regression guards:
+
+- **ORDER BY over an output alias lost its key on aliased self-joins.**
+  `SELECT p1.id, p2.id AS other_id ... ORDER BY p1.id, other_id` degraded
+  every tie of `p1.id` to hash-build order: the sort key resolved through the
+  projected output schema first, where `FindColumn`'s bare-name fallback let
+  the qualified `p2.id` reference be captured by the projection's same-named
+  bare `id` column of the *first* input. `Lookup` now resolves every scope
+  exactly first and only applies the degraded-metadata bare-name fallback in
+  a second pass (`executor/detail/expression_eval.cpp`). Guard:
+  `OrderByAliasKeyResolvesAcrossSelfJoinScopes`, plus the compliance case
+  `adaptive_join_switches_after_outer_cardinality_surprise`.
+- **Typed arithmetic rewrites on column operands.** The aspirational
+  compliance contract (`optimizer_arithmetic_high_expectations.test`) pins
+  `-1 * a` → `-a`, `a + a` → `a * 2`, and INT64 add/subtract/multiply
+  constant reassociation on columns — shapes the schema-less rewriter cannot
+  see because column result types need the input schema.
+  `RewriteTypedArithmetic` (`expression/rewrite.cpp`) now implements them:
+  sign absorption is exact for INT64 and IEEE doubles, repeated-addend
+  doubling likewise, and constant reassociation is INT64-only with
+  overflow-checked constant combines (overflow skips the rewrite). Unit
+  coverage in `expression/rewrite_test.cpp`
+  (`TypedSignAbsorptionAndRepeatedAddend`,
+  `TypedConstantReassociationStaysExact`).
+- **Golden-result comparisons for join-order-sensitive chains** (the last
+  open Phase 9 item): `JoinChainMatchesGoldenResultUnderRuleSubsets`
+  captures the golden output of a four-relation chain under the default rule
+  set, then sweeps every logical join-order subset (full physical set) and
+  every physical-rule subset (full logical set), requiring row-for-row
+  equality against the golden sequence.
+
 ## Optimizer Capability Follow-ups (2026-08, post-Phase 8)
 
 Three improvements landed after auditing the aliased/self-join path:
@@ -184,8 +218,9 @@ relational executor; each needs its own design note):
 - [x] Plan-dump diagnostics (`dump_memo`).
 - [x] End-to-end suites: `SqlEngineTpchTest` / `SqlEngineTpccTest` exercise
       the Cascades path and pass.
-- [ ] Widen golden-result comparisons for join-order-sensitive queries
-      (TPC-H Q8/Q9-style chains) against captured outputs.
+- [x] Widen golden-result comparisons for join-order-sensitive queries
+      against captured outputs
+      (`JoinChainMatchesGoldenResultUnderRuleSubsets`).
 - [x] Deterministically sweep pseudo-randomized physical-rule subsets
       (`OptimizerOptions::disabled_implementation_rules`) and compare every
       executable plan after the engine's Sort/Limit safety-net semantics.

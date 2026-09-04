@@ -23,8 +23,9 @@ std::atomic<tinylamb::PostgresServer*> server{nullptr};
 
 void StopServer(int /*signal*/) {
   tinylamb::PostgresServer* instance = server.load(std::memory_order_relaxed);
-  if (instance != nullptr) { instance->RequestStop();
-}
+  if (instance != nullptr) {
+    instance->RequestStop();
+  }
 }
 
 void Usage(std::ostream& output) {
@@ -37,8 +38,9 @@ bool ParseUnsigned(std::string_view input, unsigned long* result) {
   char* end = nullptr;
   const std::string value(input);
   const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
-  if (end == value.c_str() || *end != '\0') { return false;
-}
+  if (end == value.c_str() || *end != '\0') {
+    return false;
+  }
   *result = parsed;
   return true;
 }
@@ -132,7 +134,8 @@ int main(int argc, char** argv) {
             << " with " << instance->ReadWorkerCount() << " read workers\n";
   const int result = instance->Run(&error);
   server.store(nullptr, std::memory_order_relaxed);
-  if (result != 0) { std::cerr << "server failed: " << error << '\n';
-}
+  if (result != 0) {
+    std::cerr << "server failed: " << error << '\n';
+  }
   return result;
 }

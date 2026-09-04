@@ -32,8 +32,8 @@ struct Scope {
   // through this chain (e.g. FROM UNNEST(agg_alias) after alias inlining).
   // Same type as relational_detail::AggregateResultMap, spelled inline to
   // keep this header free of the expression_eval.hpp cycle.
-  const std::unordered_map<const class AggregateExpression*, Value>*
-      aggregates{nullptr};
+  const std::unordered_map<const class AggregateExpression*, Value>* aggregates{
+      nullptr};
 };
 
 using CteMap = std::unordered_map<std::string, RelationPtr>;
@@ -167,8 +167,7 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
 Relation FinishQuery(TransactionContext& context,
                      const SelectStatement& statement, Relation input,
                      const Scope* outer, const CteMap& ctes,
-                     bool apply_where = true,
-                     size_t hidden_columns = 0);
+                     bool apply_where = true, size_t hidden_columns = 0);
 
 // GoogleSQL name resolution for grouped queries: GROUP BY / HAVING items may
 // reference SELECT-list aliases or ordinals when they do not resolve against

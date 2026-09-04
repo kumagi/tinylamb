@@ -18,8 +18,8 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <memory>
 #include <limits>
+#include <memory>
 #include <ostream>
 #include <string>
 
@@ -42,7 +42,8 @@ FullScanPlan::FullScanPlan(const Table& table, const TableStatistics& stats,
       max_rows_(max_rows),
       peek_compares_(std::move(peek_compares)) {}
 
-// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
+// EmitExecutor lives in the relational factory
+// (executor/relational_factory.cpp).
 
 const Schema& FullScanPlan::GetSchema() const { return table_.GetSchema(); }
 
@@ -65,8 +66,7 @@ void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
 
 std::string FullScanPlan::ToString() const {
   std::string result = "FullScan: " + std::string(table_.GetSchema().Name()) +
-                       "(estimated cost: " +
-                       std::to_string(AccessRowCount());
+                       "(estimated cost: " + std::to_string(AccessRowCount());
   if (max_rows_ != std::numeric_limits<size_t>::max()) {
     result += ", max rows: " + std::to_string(max_rows_);
   }

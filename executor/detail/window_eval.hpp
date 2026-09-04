@@ -16,9 +16,9 @@ namespace relational_detail {
 bool HasWindowFunctions(const SelectStatement& statement);
 
 struct WindowedInput {
-  Relation input;                            // rows extended with $winK columns
+  Relation input;  // rows extended with $winK columns
   std::shared_ptr<SelectStatement> statement;  // rewritten copy
-  size_t hidden_columns{0};                  // trailing $win column count
+  size_t hidden_columns{0};                    // trailing $win column count
 };
 
 // Pre-computes every window-function call in the statement into hidden
@@ -30,7 +30,6 @@ WindowedInput ApplyWindows(TransactionContext& context,
                            const Scope* outer, const CteMap& ctes);
 
 // Drops the trailing $winN columns produced by ApplyWindows.
-Relation TrimHiddenColumns(Relation&& input, size_t hidden_columns);
 
 }  // namespace relational_detail
 }  // namespace tinylamb

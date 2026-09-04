@@ -53,8 +53,7 @@ class IndexKey final {
   // body); a corrupt or partially written image is reported instead of
   // producing a string_view that runs past the 32 KiB page.
   static IndexKey Deserialize(const char* src, const char* end) {
-    if (end < src ||
-        static_cast<size_t>(end - src) < sizeof(bin_size_t)) {
+    if (end < src || static_cast<size_t>(end - src) < sizeof(bin_size_t)) {
       throw std::runtime_error("corrupt index key: truncated header");
     }
     bin_size_t size = 0;

@@ -41,14 +41,16 @@ namespace {
 std::string EncodeParts(const std::vector<Value>& parts) {
   std::string encoded;
   for (const Value& value : parts) {
-    if (value.IsNull()) { break;
-}
+    if (value.IsNull()) {
+      break;
+    }
     encoded += value.EncodeMemcomparableFormat();
   }
   return encoded;
 }
 
-std::string EncodeEndParts(const Index& index, const std::vector<Value>& parts) {
+std::string EncodeEndParts(const Index& index,
+                           const std::vector<Value>& parts) {
   std::string encoded = EncodeParts(parts);
   if (!encoded.empty() && parts.size() < index.sc_.key_.size()) {
     encoded.push_back(static_cast<char>(0xff));
@@ -65,12 +67,11 @@ Value FirstOrNull(const std::vector<Value>& parts) {
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
                                      Transaction& txn, const Value& begin,
                                      const Value& end, bool ascending)
-    : IndexScanIterator(table, index, txn,
-                        begin.IsNull() ? std::vector<Value>{}
-                                       : std::vector<Value>{begin},
-                        end.IsNull() ? std::vector<Value>{}
-                                     : std::vector<Value>{end},
-                        ascending) {}
+    : IndexScanIterator(
+          table, index, txn,
+          begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
+          end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
+          ascending) {}
 
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
                                      Transaction& txn,
@@ -103,8 +104,7 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
       Clear();
       return;
     }
-    value_offset_ =
-        ascending_ ? 0 : static_cast<int64_t>(val.size()) - 1;
+    value_offset_ = ascending_ ? 0 : static_cast<int64_t>(val.size()) - 1;
     pos_ = val[static_cast<size_t>(value_offset_)].pos;
     include_ = val[static_cast<size_t>(value_offset_)].include;
   }

@@ -21,8 +21,8 @@
 
 namespace tinylamb {
 
-// PartialSortExecutor: sorts only until Top-K elements or within partitioned blocks
-// without sorting entire runs.
+// PartialSortExecutor: sorts only until Top-K elements or within partitioned
+// blocks without sorting entire runs.
 class PartialSortExecutor : public ExecutorBase, public PipelineBreaker {
  public:
   PartialSortExecutor(Executor source, Schema schema,

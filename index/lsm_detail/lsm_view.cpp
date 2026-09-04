@@ -116,9 +116,9 @@ LSMView::Iterator::Iterator(const LSMView* vm, bool head)
       while (0 < curr) {
         int result = iters_[curr].Compare(iters_[curr / 2]);
         if (result == 0) {
-          result =
-              iters_[curr].Generation() < iters_[curr / 2].Generation() ? -1
-                                                                        : 1;
+          result = iters_[curr].Generation() < iters_[curr / 2].Generation()
+                       ? -1
+                       : 1;
         }
         if (0 < result) {
           std::swap(iters_[curr], iters_[curr / 2]);

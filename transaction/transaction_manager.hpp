@@ -105,10 +105,14 @@ class TransactionManager {
   };
   void SetDeadlockPolicy(DeadlockPolicy policy) {
     deadlock_policy_.store(static_cast<uint8_t>(policy),
-                            std::memory_order_release);
-    if (policy == DeadlockPolicy::kDeadlockDetect &&
-        !deadlock_detector_.joinable()) {
-      deadlock_detector_ = std::thread([this] { DeadlockDetectorLoop(); });
+                           std::memory_order_release);
+    // Two concurrent callers could both observe a non-joinable detector and
+    // move-assign the thread twice, which terminates the process.
+    if (policy == DeadlockPolicy::kDeadlockDetect) {
+      std::scoped_lock lock(deadlock_detector_mutex_);
+      if (!deadlock_detector_.joinable()) {
+        deadlock_detector_ = std::thread([this] { DeadlockDetectorLoop(); });
+      }
     }
   }
   [[nodiscard]] DeadlockPolicy GetDeadlockPolicy() const {
@@ -150,8 +154,9 @@ class TransactionManager {
   // base committed version is installed while the shard mutex is held so
   // concurrent readers see the old image for the whole intent window instead
   // of kNotExists.
-  bool AcquireWriteIntent(Transaction& txn, const RowPosition& rp, bool wait,
-                          std::optional<std::string_view> before = std::nullopt);
+  bool AcquireWriteIntent(
+      Transaction& txn, const RowPosition& rp, bool wait,
+      std::optional<std::string_view> before = std::nullopt);
 
   [[nodiscard]] uint64_t CurrentCommitTimestamp() const {
     return commit_timestamp_.load();
@@ -201,6 +206,11 @@ class TransactionManager {
     uint64_t begin_ts{0};
     uint64_t end_ts{std::numeric_limits<uint64_t>::max()};
     std::optional<std::string> value;
+    // D4 (docs/design.md): the durable point of the commit record that made
+    // this version visible (Logger::BufferedLSN() after the commit AddLog).
+    // Readers record it as a dependency LSN and the commit path waits for it
+    // to become durable before the result reaches the user.
+    lsn_t commit_lsn{0};
   };
   struct PendingVersion {
     txn_id_t owner{0};
@@ -211,7 +221,10 @@ class TransactionManager {
     std::vector<CommittedVersion> committed;
     std::optional<PendingVersion> pending;
   };
-  void CommitVersions(Transaction& txn);
+  // D4: commit_lsn is the durable point of this commit's WAL record; it is
+  // stamped onto every published version so readers can register a
+  // durability dependency on it.
+  void CommitVersions(Transaction& txn, lsn_t commit_lsn);
   void AbortVersions(Transaction& txn);
   void ForgetTransaction(Transaction& txn);
   void GarbageCollectVersions();
@@ -266,7 +279,6 @@ class TransactionManager {
   // delete from degrading all indexes to full scans.
   std::array<std::atomic<uint64_t>, kIndexMutationShardCount>
       max_index_mutation_ts_{};
-  std::atomic<int> pending_txn_count_{0};
   mutable std::array<VersionShard, kVersionShardCount> version_shards_;
   std::unordered_map<txn_id_t, uint64_t> active_snapshots_;
   PageManager* const page_manager_;
@@ -296,6 +308,9 @@ class TransactionManager {
   // Active deadlock detector thread (kDeadlockDetect only).
   std::atomic<bool> deadlock_detector_stop_{false};
   std::thread deadlock_detector_;
+  // Serializes detector spawn so concurrent SetDeadlockPolicy callers cannot
+  // double-assign the thread (which would call std::terminate).
+  mutable std::mutex deadlock_detector_mutex_;
   // Wait-for graph for kDeadlockDetect: maps (waiting_txn -> holder_txn) per
   // row. A cycle in this graph is a deadlock. Maintained under a single
   // global mutex because deadlock detection is a rare event, not a hot path.

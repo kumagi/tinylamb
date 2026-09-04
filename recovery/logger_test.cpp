@@ -20,10 +20,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
-#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/random_string.hpp"
@@ -95,7 +97,8 @@ TEST_F(LoggerTest, AppendTwo) {
   std::string d1("6uRa9BIQb5RD2p8dIxXKtpgIDU1HBT7wfqfdZDApAqX5crm36WaCgRXgQ");
   std::string d2("P16dKMXY5TvrZVU7bKqLuAdf636mxmSsZpaDkocoClSZs3pX3");
 
-  // Act -- append d1, sleep 1us, append d2; wait for commit; read back via ifstream
+  // Act -- append d1, sleep 1us, append d2; wait for commit; read back via
+  // ifstream
   l_->AddLog(d1);
   std::this_thread::sleep_for(std::chrono::microseconds(1));
   l_->AddLog(d2);
@@ -115,7 +118,8 @@ TEST_F(LoggerTest, AppendMany) {
   lsn_t lsn = 0;
   size_t size = 0;
 
-  // Act -- append each random string; accumulate LSN and total size; wait for commit; read back file size
+  // Act -- append each random string; accumulate LSN and total size; wait for
+  // commit; read back file size
   for (int i = 0; i < 64; ++i) {
     size_t random_size = ((i * 31) % 40) + 1;
     lsn = l_->AddLog(RandomString(random_size)) + random_size;
@@ -129,12 +133,14 @@ TEST_F(LoggerTest, AppendMany) {
 }
 
 TEST_F(LoggerTest, AppendExponential) {
-  // Arrange -- reset Logger to a fresh instance; prepare 1000 exponential-size strings ('x' repeated)
+  // Arrange -- reset Logger to a fresh instance; prepare 1000 exponential-size
+  // strings ('x' repeated)
   l_ = std::make_unique<Logger>(log_name_);
   lsn_t lsn = 0;
   size_t size = 0;
 
-  // Act -- append each string; accumulate LSN and total size; wait for commit; read back file size
+  // Act -- append each string; accumulate LSN and total size; wait for commit;
+  // read back file size
   for (int i = 0; i < 1000; ++i) {
     std::string data((i * i) + 1, 'x');
     lsn = l_->AddLog(data);
@@ -271,5 +277,96 @@ TEST_F(LoggerTest, AddLogReturnsFreshLsnAfterBufferFullWait) {
   EXPECT_GE(std::min(first_lsn, second_lsn), kBufSize);
   EXPECT_LE(std::max(first_lsn, second_lsn) + 16, kBufSize + 32);
   EXPECT_EQ(std::filesystem::file_size(log_name_), kBufSize + 32);
+}
+
+namespace {
+// Self-framing test payload: magic | thread | seq | length | fill.
+// A record fragmented by another producer breaks the magic/length/fill
+// walk in D1NoRecordsInterleavedAcrossProducers.
+constexpr uint32_t kD1Magic = 0x44315231U;  // "D1R1"
+
+std::string MakeD1Payload(uint32_t thread, uint32_t seq, size_t body_size) {
+  std::string out;
+  out.reserve(16 + body_size);
+  auto push32 = [&out](uint32_t v) {
+    out.push_back(static_cast<char>((v >> 24) & 0xFF));
+    out.push_back(static_cast<char>((v >> 16) & 0xFF));
+    out.push_back(static_cast<char>((v >> 8) & 0xFF));
+    out.push_back(static_cast<char>(v & 0xFF));
+  };
+  push32(kD1Magic);
+  push32(thread);
+  push32(seq);
+  push32(static_cast<uint32_t>(body_size));
+  out.append(body_size, static_cast<char>(thread * 31 + seq));
+  return out;
+}
+}  // namespace
+
+// D1 (docs/design.md) acceptance 1: payloads that cross buffer boundaries
+// many times over must still parse back record-atomic from several producer
+// threads.  Before D1 the full-buffer wait released the enqueue latch
+// mid-record and the byte stream was fragmented (reproduced 8/8).
+TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
+  constexpr size_t kBufSize = 4096;
+  constexpr size_t kThreads = 8;
+  constexpr size_t kRecordsPerThread = 8;
+  l_.reset();
+  auto logger = std::make_unique<Logger>(log_name_, kBufSize, 1);
+
+  std::vector<std::thread> producers;
+  for (size_t t = 0; t < kThreads; ++t) {
+    producers.emplace_back([&, t] {
+      for (size_t s = 0; s < kRecordsPerThread; ++s) {
+        // 16KB-class bodies against a 4KB ring: every record spans many
+        // full-buffer waits and several wrap-around copies.
+        const size_t body = (s % 2 == 0) ? 16384 : 64;
+        logger->AddLog(MakeD1Payload(static_cast<uint32_t>(t),
+                                     static_cast<uint32_t>(s), body));
+      }
+    });
+  }
+  for (auto& th : producers) {
+    th.join();
+  }
+  logger->Finish();
+
+  // Assert -- sequential parse: magic, length and fill bytes must match for
+  // every record; an interleaved fragment fails this walk immediately.
+  std::ifstream file(log_name_, std::ios::binary);
+  const auto read32 = [&file]() {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+      v = (v << 8) | static_cast<uint32_t>(file.get());
+    }
+    return v;
+  };
+  size_t records = 0;
+  while (file.peek() != std::ifstream::traits_type::eof()) {
+    const uint32_t magic = read32();
+    ASSERT_EQ(magic, kD1Magic) << "record " << records << ": interleave";
+    const uint32_t thread = read32();
+    const uint32_t seq = read32();
+    const uint32_t length = read32();
+    ASSERT_LT(thread, kThreads);
+    ASSERT_LT(seq, kRecordsPerThread);
+    const int fill = static_cast<unsigned char>(thread * 31 + seq);
+    for (uint32_t i = 0; i < length; ++i) {
+      ASSERT_EQ(file.get(), fill)
+          << "record " << records << " (thread " << thread << " seq " << seq
+          << "): fragmented payload";
+    }
+    ++records;
+  }
+  EXPECT_EQ(records, kThreads * kRecordsPerThread);
+}
+
+TEST_F(LoggerTest, D1RejectsRecordOverMaxSize) {
+  l_.reset();
+  auto logger = std::make_unique<Logger>(log_name_, 4096, 1);
+  EXPECT_THROW(logger->AddLog(std::string(Logger::kMaxRecordSize + 1, 'x')),
+               std::invalid_argument);
+  EXPECT_NO_THROW(logger->AddLog(std::string(Logger::kMaxRecordSize, 'x')));
+  logger->Finish();
 }
 }  // namespace tinylamb

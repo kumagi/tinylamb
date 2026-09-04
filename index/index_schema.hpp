@@ -83,8 +83,7 @@ class IndexSchema {
 
   [[nodiscard]] std::string GenerateKey(const Row& row) const;
   [[nodiscard]] bool IsUnique() const {
-    return mode_ == IndexMode::kUnique ||
-           mode_ == IndexMode::kVersionedUnique;
+    return mode_ == IndexMode::kUnique || mode_ == IndexMode::kVersionedUnique;
   }
   [[nodiscard]] bool StoresSingleValue() const {
     return mode_ == IndexMode::kUnique;

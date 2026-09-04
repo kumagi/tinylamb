@@ -16,8 +16,7 @@ bool MinMaxIndexExecutor::Next(Row* destination, RowPosition* position) {
   Row input;
   RowPosition input_position;
   while (source_->Next(&input, &input_position)) {
-    if (value_slot_ < input.values_.size() &&
-        !input[value_slot_].IsNull()) {
+    if (value_slot_ < input.values_.size() && !input[value_slot_].IsNull()) {
       *destination = Row({input[value_slot_]});
       // Scalar aggregates do not expose a row position. Keep the argument
       // accepted by ExecutorBase harmless for callers that pass one.

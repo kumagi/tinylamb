@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -112,7 +113,8 @@ TEST_F(LSMTreeTest, RangeScan) {
   LSMView::Iterator it = v.Begin();
   auto expected_iter = expected.begin();
 
-  // Assert -- iterator yields every key-value pair in sorted order, matching expected
+  // Assert -- iterator yields every key-value pair in sorted order, matching
+  // expected
   while (it.IsValid()) {
     ASSERT_EQ(expected_iter->first, it.Key());
     ASSERT_EQ(expected_iter->second, it.Value());
@@ -160,7 +162,8 @@ TEST_F(LSMTreeTest, OverwrittenRangeScan) {
     ASSERT_SUCCESS_AND_EQ(ret, std::to_string(i * 2));
   }
 
-  // Assert 2 -- v2 sees i*i for even keys, i*2 for odd keys (overwrite visible only in v2)
+  // Assert 2 -- v2 sees i*i for even keys, i*2 for odd keys (overwrite visible
+  // only in v2)
   for (int i = 0; i < 1000; ++i) {
     if (i % 2 == 0) {
       auto ret = v2.Find(std::to_string(i));
@@ -173,7 +176,8 @@ TEST_F(LSMTreeTest, OverwrittenRangeScan) {
 }
 
 TEST_F(LSMTreeTest, LongKeyRangeScan) {
-  // Arrange -- write 300 key-value pairs with long keys (i*i+1 bytes of 'x'), wait for sync
+  // Arrange -- write 300 key-value pairs with long keys (i*i+1 bytes of 'x'),
+  // wait for sync
   std::map<std::string, std::string> expected;
   for (int i = 0; i < 300; ++i) {
     std::string key((i * i) + 1, 'x');
@@ -187,7 +191,8 @@ TEST_F(LSMTreeTest, LongKeyRangeScan) {
   LSMView::Iterator it = v.Begin();
   auto expected_iter = expected.begin();
 
-  // Assert -- iterator yields every key-value pair in sorted order, matching expected
+  // Assert -- iterator yields every key-value pair in sorted order, matching
+  // expected
   while (it.IsValid()) {
     ASSERT_EQ(expected_iter->first, it.Key());
     ASSERT_EQ(expected_iter->second, it.Value());
@@ -263,8 +268,9 @@ TEST_F(LSMTreeTest, MergeAllOnEmptyIndex) {
   // Act -- merge the (empty) index, exactly what the background Merger does.
   t_->MergeAll();
 
-  // Assert -- should be a no-op on an empty tree.  Currently crashes in
-  // LSMView::CreateSingleRun() -> Begin() -> iters_[0] on an empty vector.
+  // Assert -- a no-op on an empty tree.  (The former crash in
+  // LSMView::CreateSingleRun() -> Begin() -> iters_[0] on an empty vector was
+  // fixed: the head iterator now skips invalid runs and reports invalid.)
   ASSERT_TRUE(true);
 }
 
@@ -541,4 +547,107 @@ TEST_F(LSMTreeTest, ContainsAfterMultipleMerges) {
   EXPECT_TRUE(t_->Contains("b29"));
   EXPECT_FALSE(t_->Contains("zzz"));
 }
+TEST_F(LSMTreeTest, ReopenRestoresFlushedRunsAndKeepsAppending) {
+  // D10 (docs/design.md): flushed data must survive restart.  Write+Sync,
+  // destroy the LSMTree, rebuild on the SAME directory and confirm Read and
+  // a full scan return every flushed key, including a large (blob-separated)
+  // value.  Then append a new generation, Sync and reopen a third time to
+  // confirm all generations stay coherent and no generation was reused.
+  std::map<std::string, std::string> generation1;
+  for (int i = 0; i < 200; ++i) {
+    const std::string key = std::to_string(i);
+    const std::string value =
+        "v1-" + std::string(300, static_cast<char>('a' + (i % 26)));
+    t_->Write(key, value);
+    generation1.emplace(key, value);
+  }
+  t_->Sync();
+  t_.reset();
+
+  std::map<std::string, std::string> generation2;
+  {
+    LSMTree reopened(dir_path_);
+    for (const auto& [key, value] : generation1) {
+      ASSERT_SUCCESS_AND_EQ(reopened.Read(key), value);
+    }
+    // A second, newer generation after the reopen.
+    for (int i = 200; i < 260; ++i) {
+      const std::string key = std::to_string(i);
+      const std::string value = "v2-" + key;
+      reopened.Write(key, value);
+      generation2.emplace(key, value);
+    }
+    reopened.Sync();
+  }
+
+  // Third open: generations 1 and 2 both present, ordering by generation so
+  // the newest value for an overlapping key wins.
+  {
+    LSMTree third(dir_path_);
+    for (const auto& [key, value] : generation1) {
+      ASSERT_SUCCESS_AND_EQ(third.Read(key), value);
+    }
+    for (const auto& [key, value] : generation2) {
+      ASSERT_SUCCESS_AND_EQ(third.Read(key), value);
+    }
+    third.Write("200", "v3-override");
+    third.Sync();
+  }
+  {
+    LSMTree fourth(dir_path_);
+    ASSERT_SUCCESS_AND_EQ(fourth.Read("200"), std::string("v3-override"));
+    ASSERT_SUCCESS_AND_EQ(fourth.Read("201"), std::string("v2-201"));
+    ASSERT_SUCCESS_AND_EQ(fourth.Read("0"), generation1.at("0"));
+  }
+}
+
+TEST_F(LSMTreeTest, ReopenRejectsMalformedRunFile) {
+  // D10 (docs/design.md): an unrecognized file name in the run directory is
+  // quarantined, not silently promoted or crashed on.
+  t_->Write("keep", "me");
+  t_->Sync();
+  t_.reset();
+  const std::filesystem::path junk =
+      std::filesystem::path(dir_path_) / "not-a-run";
+  {
+    std::ofstream out(junk);
+    out << "garbage";
+  }
+
+  ASSERT_NO_THROW(t_ = std::make_unique<LSMTree>(dir_path_));
+  ASSERT_SUCCESS_AND_EQ(t_->Read("keep"), std::string("me"));
+  // The malformed file was quarantined IN THE RUN DIRECTORY (the rename
+  // destination must be an absolute path; a bare "name.bad" would land in the
+  // process CWD instead).
+  EXPECT_TRUE(std::filesystem::exists(junk.string() + ".bad"))
+      << "quarantined file must be beside the run directory";
+  EXPECT_FALSE(std::filesystem::exists(junk));
+}
+
+TEST_F(LSMTreeTest, ReopenQuarantinesIncompleteRunFile) {
+  // D10 (docs/design.md): a run file whose advertised entry count exceeds
+  // the bytes actually on disk (torn flush) is unreadable and must be
+  // quarantined, never served as a valid run.
+  t_->Write("a", std::string(4000, 'z'));
+  t_->Sync();
+  t_.reset();
+  // Find the single run file and truncate it inside its entry area.
+  std::filesystem::path run;
+  for (const auto& e : std::filesystem::directory_iterator(dir_path_)) {
+    if (e.path().filename() == "blob.db") {
+      continue;
+    }
+    run = e.path();
+  }
+  ASSERT_FALSE(run.empty());
+  const auto original = std::filesystem::file_size(run);
+  std::filesystem::resize_file(run, original / 2);
+  ASSERT_LT(std::filesystem::file_size(run), original);
+
+  ASSERT_NO_THROW(t_ = std::make_unique<LSMTree>(dir_path_));
+  // The truncated run was quarantined; writing the same key still works.
+  t_->Write("a", "recovered");
+  ASSERT_SUCCESS_AND_EQ(t_->Read("a"), std::string("recovered"));
+}
+
 }  // namespace tinylamb

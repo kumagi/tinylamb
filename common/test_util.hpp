@@ -17,12 +17,13 @@
 #ifndef TINYLAMB_TEST_UTIL_HPP
 #define TINYLAMB_TEST_UTIL_HPP
 
+#include <sstream>
+
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
 #include "serdes.hpp"
-#include <sstream>
 
 namespace tinylamb {
 class Transaction;  // forward declaration for DumpLogTxn helper
@@ -52,8 +53,9 @@ void DumpLog(const T& obj, int indent = 0) {
   LOG(INFO) << oss.str();
 }
 
-// Variant for objects whose Dump signature takes a Transaction& (e.g. BPlusTree,
-// Database). Routes the dump through LOG(INFO) instead of raw std::ostream.
+// Variant for objects whose Dump signature takes a Transaction& (e.g.
+// BPlusTree, Database). Routes the dump through LOG(INFO) instead of raw
+// std::ostream.
 template <typename T>
 void DumpLogTxn(const T& obj, tinylamb::Transaction& txn, int indent = 0) {
   std::ostringstream oss;

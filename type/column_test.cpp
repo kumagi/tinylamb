@@ -54,7 +54,8 @@ TEST(ColumnTest, Dump_ToLogStream_SucceedsWithoutCrash) {
   LOG(ERROR) << c2;
 }
 
-TEST(ColumnTest, StreamOperator_WithVariousTypesAndConstraints_FormatsExpectedString) {
+TEST(ColumnTest,
+     StreamOperator_WithVariousTypesAndConstraints_FormatsExpectedString) {
   Column c1(ColumnName("int_col"), ValueType::kInt64);
   Column c2(ColumnName("uniq_col"), ValueType::kDouble,
             Constraint(Constraint::kUnique));
@@ -63,8 +64,7 @@ TEST(ColumnTest, StreamOperator_WithVariousTypesAndConstraints_FormatsExpectedSt
 
   oss << c1 << "|" << c2 << "|" << c3;
 
-  ASSERT_EQ(oss.str(),
-            "int_col: Integer|uniq_col: Double(UNIQUE)|bare_col");
+  ASSERT_EQ(oss.str(), "int_col: Integer|uniq_col: Double(UNIQUE)|bare_col");
 }
 
 TEST(ColumnTest, Accessors_WhenConstructedFromStringView_ReturnMatchingValues) {
@@ -79,7 +79,8 @@ TEST(ColumnTest, Accessors_WhenConstructedFromStringView_ReturnMatchingValues) {
   ASSERT_EQ(ctype, Constraint::kDefault);
 }
 
-TEST(ColumnTest, Hash_WithDistinctAndIdenticalColumns_DifferentiatesAndMatches) {
+TEST(ColumnTest,
+     Hash_WithDistinctAndIdenticalColumns_DifferentiatesAndMatches) {
   Column c1("a", ValueType::kInt64);
   Column c2("b", ValueType::kInt64);
   Column c3("a", ValueType::kDouble);

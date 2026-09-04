@@ -17,9 +17,9 @@
 #ifndef TINYLAMB_TABLE_HPP
 #define TINYLAMB_TABLE_HPP
 
-#include <unordered_map>
 #include <cstddef>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -149,9 +149,9 @@ class Table {
                      page_id_t* hint_leaf = nullptr) const;
   Status IndexDelete(Transaction& txn, const Index& idx,
                      const RowPosition& pos) const;
-  static Status IndexDelete(Transaction& txn, const Index& idx, const RowPosition& pos,
-                     const Row& original_row,
-                     page_id_t* hint_leaf = nullptr);
+  static Status IndexDelete(Transaction& txn, const Index& idx,
+                            const RowPosition& pos, const Row& original_row,
+                            page_id_t* hint_leaf = nullptr);
 
   friend class Database;
   friend class FullScanIterator;

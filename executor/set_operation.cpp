@@ -54,8 +54,7 @@ ValueType CommonSetValueType(ValueType left, ValueType right) {
 
 }  // namespace
 
-bool SetOperationRowEqual::operator()(const Row& left,
-                                      const Row& right) const {
+bool SetOperationRowEqual::operator()(const Row& left, const Row& right) const {
   if (left.values_.size() != right.values_.size()) {
     return false;
   }
@@ -256,7 +255,7 @@ void SetOperationExecutor::AppendIntersection(
   if (rows.empty()) {
     return;
   }
-    SetOperationRowMap counts;
+  SetOperationRowMap counts;
   for (const Positioned& item : rows[0]) {
     ++counts[item.row];
   }

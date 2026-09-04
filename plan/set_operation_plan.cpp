@@ -14,8 +14,12 @@ namespace tinylamb {
 namespace {
 
 ValueType CommonSetValueType(ValueType left, ValueType right) {
-  if (left == ValueType::kNull) { return right; }
-  if (right == ValueType::kNull || left == right) { return left; }
+  if (left == ValueType::kNull) {
+    return right;
+  }
+  if (right == ValueType::kNull || left == right) {
+    return left;
+  }
   if ((left == ValueType::kInt64 && right == ValueType::kDouble) ||
       (left == ValueType::kDouble && right == ValueType::kInt64)) {
     return ValueType::kDouble;
@@ -49,23 +53,28 @@ Schema SetOperationPlan::GenerateSchema() const {
 
 size_t SetOperationPlan::AccessRowCount() const {
   size_t rows = 0;
-  for (const Plan& child : children_) { rows += child->AccessRowCount(); }
+  for (const Plan& child : children_) {
+    rows += child->AccessRowCount();
+  }
   return rows;
 }
 
 size_t SetOperationPlan::EmitRowCount() const {
-  if (children_.empty()) { return 0; }
+  if (children_.empty()) {
+    return 0;
+  }
   if (operation_ == SetOperationKind::kUnionAll) {
     size_t rows = 0;
-    for (const Plan& child : children_) { rows += child->EmitRowCount(); }
+    for (const Plan& child : children_) {
+      rows += child->EmitRowCount();
+    }
     return rows;
   }
   return children_.front()->EmitRowCount();
 }
 
-bool SetOperationPlan::IsOrderedBy(
-    const std::vector<Expression>& expressions,
-    const std::vector<bool>& ascending) const {
+bool SetOperationPlan::IsOrderedBy(const std::vector<Expression>& expressions,
+                                   const std::vector<bool>& ascending) const {
   if (expressions.size() > order_keys_.size() ||
       ascending.size() != expressions.size()) {
     return false;
@@ -81,7 +90,9 @@ bool SetOperationPlan::IsOrderedBy(
 
 void SetOperationPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(indent) << ToString() << '\n';
-  for (const Plan& child : children_) { child->Dump(output, indent + 2); }
+  for (const Plan& child : children_) {
+    child->Dump(output, indent + 2);
+  }
 }
 
 std::string SetOperationPlan::ToString() const {
@@ -89,12 +100,18 @@ std::string SetOperationPlan::ToString() const {
     return "MergeAppend";
   }
   switch (operation_) {
-    case SetOperationKind::kUnion: return "Union";
-    case SetOperationKind::kUnionAll: return "UnionAll";
-    case SetOperationKind::kIntersect: return "Intersect";
-    case SetOperationKind::kIntersectAll: return "IntersectAll";
-    case SetOperationKind::kExcept: return "Except";
-    case SetOperationKind::kExceptAll: return "ExceptAll";
+    case SetOperationKind::kUnion:
+      return "Union";
+    case SetOperationKind::kUnionAll:
+      return "UnionAll";
+    case SetOperationKind::kIntersect:
+      return "Intersect";
+    case SetOperationKind::kIntersectAll:
+      return "IntersectAll";
+    case SetOperationKind::kExcept:
+      return "Except";
+    case SetOperationKind::kExceptAll:
+      return "ExceptAll";
   }
   return "SetOperation";
 }

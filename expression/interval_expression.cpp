@@ -2,18 +2,22 @@
 #include "expression/interval_expression.hpp"
 
 #include <ostream>
-#include "type/value.hpp"
-#include "expression/expression.hpp"
 #include <string>
+
+#include "expression/expression.hpp"
 #include "type/type.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 
-Value IntervalExpression::Evaluate(const Row& /*row*/, const Schema& /*schema*/) const {
+Value IntervalExpression::Evaluate(const Row& /*row*/,
+                                   const Schema& /*schema*/) const {
   return Value(std::string(text_));
 }
 
-Value IntervalExpression::Evaluate(const Row* /*unused*/, const Schema& /*unused*/, const Row* /*unused*/,
+Value IntervalExpression::Evaluate(const Row* /*unused*/,
+                                   const Schema& /*unused*/,
+                                   const Row* /*unused*/,
                                    const Schema& /*unused*/) const {
   return Value(std::string(text_));
 }
@@ -27,9 +31,7 @@ tinylamb::Type IntervalExpression::ResultType(const Schema& /*unused*/,
   return {TypeTag::kVarChar};
 }
 
-std::string IntervalExpression::ToString() const {
-  return "INTERVAL " + text_;
-}
+std::string IntervalExpression::ToString() const { return "INTERVAL " + text_; }
 
 void IntervalExpression::Dump(std::ostream& output) const {
   output << ToString();

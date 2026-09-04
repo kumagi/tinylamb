@@ -25,9 +25,9 @@
 #include <vector>
 
 #include "executor_base.hpp"
-#include "expression/named_expression.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/jit.hpp"
+#include "expression/named_expression.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {

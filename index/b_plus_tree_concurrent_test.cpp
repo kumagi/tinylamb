@@ -71,8 +71,7 @@ class BPlusTreeConcurrentTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               r_.get());
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
     cm_ = std::make_unique<CheckpointManager>(master_record_name_, tm_.get(),
                                               p_->GetPool(), 1);
     bpt_ = std::make_unique<BPlusTree>(root);
@@ -113,7 +112,8 @@ TEST_F(BPlusTreeConcurrentTest, InsertInsert) {
   std::vector<std::thread> workers;
   workers.reserve(kThreads);
 
-  // Act 1 -- each thread inserts kSize=2 random key-value pairs via bpt_->Insert
+  // Act 1 -- each thread inserts kSize=2 random key-value pairs via
+  // bpt_->Insert
   for (int i = 0; i < kThreads; ++i) {
     workers.emplace_back([&, i]() {
       std::mt19937 rand(i);

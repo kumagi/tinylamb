@@ -16,31 +16,31 @@
 
 #include "executor/aggregation.hpp"
 
-#include <memory>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cmath>
 #include <limits>
-#include <ranges>
+#include <memory>
 #include <optional>
-#include <stdexcept>
 #include <ostream>
+#include <ranges>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "executor/executor_base.hpp"
-#include "executor/data_chunk.hpp"
 #include "common/constants.hpp"
-#include "expression/aggregate_expression.hpp"
-#include "executor/query_memory.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/executor_base.hpp"
+#include "executor/query_memory.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/jit.hpp"
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
-#include "expression/jit.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -60,14 +60,13 @@ AggregationExecutor::AggregationExecutor(
       aggregates_(std::move(aggregates)),
       jit_threshold_rows_(jit_threshold_rows) {
   if (aggregates_.size() == 1) {
-    const auto& aggregate =
-        aggregates_[0].expression->AsAggregateExpression();
+    const auto& aggregate = aggregates_[0].expression->AsAggregateExpression();
     if (aggregate.GetType() == AggregationType::kSum && !aggregate.Distinct() &&
         aggregate.Child()->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
-      if (offset >= 0 && input_schema_.GetColumn(offset).Type() ==
-                             ValueType::kInt64 &&
+      if (offset >= 0 &&
+          input_schema_.GetColumn(offset).Type() == ValueType::kInt64 &&
           aggregate.Child()->AsColumnValue().GetColumnName().name.find(
               "uint64") == std::string::npos) {
         jit_sum_eligible_ = true;
@@ -125,20 +124,28 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
       rows_seen_ += input_batch_.Size();
       if (!jit_attempted_ && rows_seen_ >= jit_threshold_rows_) {
         jit_attempted_ = true;
-        jit_sum_ = JitInt64Kernels::CompileSum();
+        // Prefer the overflow-checked kernel so a single huge batch throws
+        // exactly like the serial path; never fall back to the wrapping
+        // kernel for correctness.
+        jit_sum_ = JitInt64Kernels::CompileSumChecked();
       }
       const ColumnVector& column = input_batch_.ColumnAt(jit_sum_column_);
-      if (jit_sum_ && input_batch_.ZoneMapAt(jit_sum_column_).NullCount() == 0) {
+      if (jit_sum_ &&
+          input_batch_.ZoneMapAt(jit_sum_column_).NullCount() == 0) {
         // The JIT kernel reads raw int64 storage; verify the child batch
         // really has the declared layout before trusting it.
         if (!input_batch_.HasLayout(input_schema_) ||
             column.Type() != ValueType::kInt64) {
           throw std::runtime_error("aggregation input layout mismatch");
         }
-        const int64_t partial =
-            jit_sum_->Sum(column.IntegerData().data(), column.Size());
-        // PRODUCTION FIX: the JIT kernel wraps on overflow; the serial and
-        // parallel paths throw. Detect the wrap per batch and per merge.
+        bool batch_overflow = false;
+        const int64_t partial = jit_sum_->SumChecked(
+            column.IntegerData().data(), column.Size(), &batch_overflow);
+        // The checked kernel reports intra-batch overflow exactly like the
+        // AST evaluator; merging into the running total is checked too.
+        if (batch_overflow) {
+          throw std::runtime_error("integer overflow on '+'");
+        }
         if (__builtin_add_overflow(total, partial, &total)) {
           throw std::runtime_error("integer overflow on '+'");
         }
@@ -146,10 +153,11 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
         ++jit_batches_;
       } else {
         for (size_t row = 0; row < column.Size(); ++row) {
-          if (column.IsNull(row)) { continue;
-}
-          if (__builtin_add_overflow(
-                  total, column.ValueAt(row).value.int_value, &total)) {
+          if (column.IsNull(row)) {
+            continue;
+          }
+          if (__builtin_add_overflow(total, column.ValueAt(row).value.int_value,
+                                     &total)) {
             throw std::runtime_error("integer overflow on '+'");
           }
           any = true;
@@ -206,28 +214,32 @@ bool IsTypedAggregate(AggregationType type) {
 
 }  // namespace
 
-bool AggregationExecutor::AccumulateTypedBatch(
-    std::vector<Value>* results, std::vector<int64_t>* counts,
-    const DataChunk& chunk) const {
-  if (!all_typed_) { return false;
-}
+bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
+                                               std::vector<int64_t>* counts,
+                                               const DataChunk& chunk) const {
+  if (!all_typed_) {
+    return false;
+  }
   const size_t rows = chunk.Size();
-  if (rows == 0) { return true;
-}
+  if (rows == 0) {
+    return true;
+  }
   // Bind every column reference first: a batch whose runtime storage does
   // not match the declared numeric type must fall back wholesale, before any
   // accumulator state has moved.
   std::vector<const ColumnVector*> columns(inputs_.size(), nullptr);
   for (size_t i = 0; i < inputs_.size(); ++i) {
     const AggregateInput& input = inputs_[i];
-    if (input.kind != AggregateInputKind::kTypedColumn) { continue;
-}
+    if (input.kind != AggregateInputKind::kTypedColumn) {
+      continue;
+    }
     const ColumnVector& column = chunk.ColumnAt(input.column);
     const ValueType actual = column.Type();
     // An all-null kNull column contributes nothing, which matches the
     // generic path; anything else unexpected defers to the generic loop.
-    if (actual != input.type && actual != ValueType::kNull) { return false;
-}
+    if (actual != input.type && actual != ValueType::kNull) {
+      return false;
+    }
     columns[i] = &column;
   }
   for (size_t i = 0; i < inputs_.size(); ++i) {
@@ -255,10 +267,10 @@ bool AggregationExecutor::AccumulateTypedBatch(
                     ? Value(CheckedAdd(0, scaled))
                     : Value(CheckedAdd((*results)[i].value.int_value, scaled));
           } else {
-            (*results)[i] =
-                Value(((*results)[i].IsNull() ? 0.0
-                                              : (*results)[i].value.double_value) +
-                      static_cast<double>(rows) * constant.value.double_value);
+            (*results)[i] = Value(
+                ((*results)[i].IsNull() ? 0.0
+                                        : (*results)[i].value.double_value) +
+                static_cast<double>(rows) * constant.value.double_value);
           }
           break;
         case AggregationType::kAvg:
@@ -281,8 +293,9 @@ bool AggregationExecutor::AccumulateTypedBatch(
       continue;
     }
     const ColumnVector& column = *columns[i];
-    if (column.Type() == ValueType::kNull) { continue;  // all-null batch
-}
+    if (column.Type() == ValueType::kNull) {
+      continue;  // all-null batch
+    }
     const bool is_int = column.Type() == ValueType::kInt64;
     const std::vector<int64_t>& integers = column.IntegerData();
     const std::vector<double>& doubles = column.DoubleData();
@@ -290,8 +303,9 @@ bool AggregationExecutor::AccumulateTypedBatch(
       case AggregationType::kCount: {
         int64_t non_null = 0;
         for (size_t row = 0; row < rows; ++row) {
-          if (!column.IsNull(row)) { ++non_null;
-}
+          if (!column.IsNull(row)) {
+            ++non_null;
+          }
         }
         (*results)[i].value.int_value += non_null;
         break;
@@ -324,55 +338,58 @@ bool AggregationExecutor::AccumulateTypedBatch(
               break;
             }
             Value& total = (*results)[i];
-            const uint64_t prior = total.IsNull()
-                                       ? 0
-                                       : static_cast<uint64_t>(
-                                             total.value.int_value);
+            const uint64_t prior =
+                total.IsNull() ? 0
+                               : static_cast<uint64_t>(total.value.int_value);
             if (prior > std::numeric_limits<uint64_t>::max() - batch_sum) {
               throw std::runtime_error("uint64 overflow in SUM");
             }
-            total = Value(static_cast<int64_t>(static_cast<uint64_t>(
-                prior + batch_sum)));
+            total = Value(
+                static_cast<int64_t>(static_cast<uint64_t>(prior + batch_sum)));
             break;
           }
           int64_t batch_sum = 0;
           bool any = false;
           for (size_t row = 0; row < rows; ++row) {
-            if (column.IsNull(row)) { continue;
-}
+            if (column.IsNull(row)) {
+              continue;
+            }
             batch_sum = CheckedAdd(batch_sum, integers[row]);
             any = true;
           }
-          if (!any) { break;
-}
+          if (!any) {
+            break;
+          }
           Value& total = (*results)[i];
-          total = total.IsNull() ? Value(batch_sum)
-                                 : Value(CheckedAdd(total.value.int_value,
-                                                    batch_sum));
+          total = total.IsNull()
+                      ? Value(batch_sum)
+                      : Value(CheckedAdd(total.value.int_value, batch_sum));
         } else {
           double batch_sum = 0.0;
           bool any = false;
           for (size_t row = 0; row < rows; ++row) {
-            if (column.IsNull(row)) { continue;
-}
+            if (column.IsNull(row)) {
+              continue;
+            }
             batch_sum = CheckedDoubleAdd(batch_sum, doubles[row]);
             any = true;
           }
-          if (!any) { break;
-}
+          if (!any) {
+            break;
+          }
           Value& total = (*results)[i];
-          total = total.IsNull()
-                      ? Value(batch_sum)
-                      : Value(CheckedDoubleAdd(total.value.double_value,
-                                               batch_sum));
+          total = total.IsNull() ? Value(batch_sum)
+                                 : Value(CheckedDoubleAdd(
+                                       total.value.double_value, batch_sum));
         }
         break;
       }
       case AggregationType::kAvg: {
         double& total = (*results)[i].value.double_value;
         for (size_t row = 0; row < rows; ++row) {
-          if (column.IsNull(row)) { continue;
-}
+          if (column.IsNull(row)) {
+            continue;
+          }
           total += is_int ? static_cast<double>(integers[row]) : doubles[row];
           ++(*counts)[i];
         }
@@ -381,8 +398,9 @@ bool AggregationExecutor::AccumulateTypedBatch(
       case AggregationType::kMin: {
         Value& best = (*results)[i];
         for (size_t row = 0; row < rows; ++row) {
-          if (column.IsNull(row)) { continue;
-}
+          if (column.IsNull(row)) {
+            continue;
+          }
           if (is_int) {
             const int64_t candidate = integers[row];
             if (best.IsNull() || candidate < best.value.int_value) {
@@ -407,8 +425,9 @@ bool AggregationExecutor::AccumulateTypedBatch(
       case AggregationType::kMax: {
         Value& best = (*results)[i];
         for (size_t row = 0; row < rows; ++row) {
-          if (column.IsNull(row)) { continue;
-}
+          if (column.IsNull(row)) {
+            continue;
+          }
           if (is_int) {
             const int64_t candidate = integers[row];
             if (best.IsNull() || best.value.int_value < candidate) {
@@ -499,6 +518,18 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
   std::vector<int64_t> counts(aggregates_.size(), 0);
   std::vector<relational_detail::DistinctValueSet> distinct_values(
       aggregates_.size());
+  // Every retained distinct value holds a forced global-budget reservation;
+  // without releasing them when this aggregation ends, the process-wide
+  // budget would ratchet up forever and eventually force everything to spill.
+  size_t distinct_charged_bytes = 0;
+  struct DistinctChargeRelease {
+    size_t* bytes;
+    ~DistinctChargeRelease() {
+      if (*bytes != 0) {
+        QueryMemoryBudget::Global().Release(*bytes);
+      }
+    }
+  } distinct_charge_release{&distinct_charged_bytes};
   // General accumulators for aggregate kinds the typed switches do not
   // model (kept in aggregate order).
   std::vector<std::unique_ptr<relational_detail::AggregateAccumulator>>
@@ -514,9 +545,8 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
         inputs_[i].kind != AggregateInputKind::kGeneric) {
       continue;
     }
-    accumulators[i] =
-        std::make_unique<relational_detail::AggregateAccumulator>(
-            &aggregates_[i].expression->AsAggregateExpression());
+    accumulators[i] = std::make_unique<relational_detail::AggregateAccumulator>(
+        &aggregates_[i].expression->AsAggregateExpression());
   }
   for (size_t i = 0; i < aggregates_.size(); ++i) {
     const auto& agg = aggregates_[i].expression->AsAggregateExpression();
@@ -582,8 +612,7 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
           }
           relational_detail::AggregateInput input;
           if (!IsCountStar(agg)) {
-            input.value =
-                agg.Child()->Evaluate(materialize(), input_schema_);
+            input.value = agg.Child()->Evaluate(materialize(), input_schema_);
           } else {
             input.value = Value(1);
           }
@@ -629,8 +658,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
         } else {
           val = agg.Child()->Evaluate(materialize(), input_schema_);
         }
-        if (val.IsNull()) { continue;
-}
+        if (val.IsNull()) {
+          continue;
+        }
         if (agg.Distinct()) {
           const size_t bytes = EstimateValueBytes(val);
           QueryMemoryBudget::Global().ReserveForced(bytes);
@@ -640,6 +670,7 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             QueryMemoryBudget::Global().Release(bytes);
             continue;
           }
+          distinct_charged_bytes += bytes;
         }
         switch (agg.GetType()) {
           case AggregationType::kSum:
@@ -661,8 +692,8 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
               results[i] = val;
             } else if (val.type == ValueType::kDouble &&
                        results[i].type == ValueType::kDouble) {
-              results[i] = Value(CheckedDoubleAdd(
-                  results[i].value.double_value, val.value.double_value));
+              results[i] = Value(CheckedDoubleAdd(results[i].value.double_value,
+                                                  val.value.double_value));
             } else {
               results[i] = results[i] + val;
             }
@@ -685,8 +716,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
                 std::isnan(results[i].value.double_value)) {
               break;  // NaN best wins; comparisons would be unsound.
             }
-            if (results[i].IsNull() || val < results[i]) { results[i] = val;
-}
+            if (results[i].IsNull() || val < results[i]) {
+              results[i] = val;
+            }
             break;
           case AggregationType::kMax:
             if (val.type == ValueType::kDouble &&
@@ -698,8 +730,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
                 std::isnan(results[i].value.double_value)) {
               break;
             }
-            if (results[i].IsNull() || results[i] < val) { results[i] = val;
-}
+            if (results[i].IsNull() || results[i] < val) {
+              results[i] = val;
+            }
             break;
           case AggregationType::kCount:
             ++results[i].value.int_value;
@@ -711,7 +744,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
           case AggregationType::kBitAnd:
           case AggregationType::kBitOr:
           case AggregationType::kBitXor: {
-            if (val.IsNull()) { break; }
+            if (val.IsNull()) {
+              break;
+            }
             const int64_t v = val.value.int_value;
             int64_t& cur = results[i].value.int_value;
             if (results[i].IsNull()) {
@@ -728,8 +763,8 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
           case AggregationType::kLogicalAnd:
             if (!val.IsNull()) {
               if (results[i].IsNull()) {
-                results[i] = Value(val.value.int_value != 0 ? int64_t{1}
-                                                            : int64_t{0});
+                results[i] =
+                    Value(val.value.int_value != 0 ? int64_t{1} : int64_t{0});
               } else if (val.value.int_value == 0) {
                 results[i] = Value(int64_t{0});
               }
@@ -773,14 +808,15 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
   return true;
 }
 
-size_t AggregationExecutor::NextBatch(DataChunk* destination,
-                                      size_t max_rows) {
+size_t AggregationExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
-  if (max_rows == 0) { return 0;
-}
+  if (max_rows == 0) {
+    return 0;
+  }
   Row row;
-  if (!Next(&row, nullptr)) { return 0;
-}
+  if (!Next(&row, nullptr)) {
+    return 0;
+  }
   destination->Append(std::move(row));
   return 1;
 }

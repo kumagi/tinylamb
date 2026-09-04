@@ -50,7 +50,6 @@ Dependency direction is mechanically enforced by `scripts/check_layering.py` (in
 [Layer 12] server       (server/)           [PostgreSQL wire protocol server]
 
 [Top-level] main.cpp, benchmark/, tests (*_test.cpp), fuzzers (*_fuzzer.cpp)
-[Archive]   legacy/ (Historical parser code; excluded from canonical SQL execution)
 ```
 
 ### Layer Map & Responsibilities
@@ -75,7 +74,7 @@ Dependency direction is mechanically enforced by `scripts/check_layering.py` (in
 ## 3. Core Subsystems & Invariants
 
 ### 3.1 SQL Frontend & Engine (`query/`, `server/`)
-- **GoogleSQL AST**: Pinned GoogleSQL `execute_query` binary generates the AST. `query/googlesql_ast_visitor.cpp` converts it into tinylamb expressions and relational operators. Legacy parsers in `legacy/parser/` are archived and not used in canonical query execution.
+- **GoogleSQL AST**: Pinned GoogleSQL `execute_query` binary generates the AST. `query/googlesql_ast_visitor.cpp` converts it into tinylamb expressions and relational operators.
 - **`SqlEngine` Facade**: `SqlEngine::Execute` and `QueryResult` provide a unified interface for CLI (`tinylamb`), benchmarks, and `tinylamb_server`.
 - **`EXPLAIN` / `EXPLAIN ANALYZE`**: Built-in support for inspecting selected physical plans and live execution profiles (scan/filter/join timings, row counts, cache hits).
 
@@ -172,4 +171,4 @@ clang-format -i $(find common type page recovery transaction index table databas
 1. **Check Layer Constraints First**: Place new classes/functions in the lowest appropriate layer. Run `python3 scripts/check_layering.py` before committing.
 2. **Preserve Semantic Equivalence**: If changing expressions or operators, verify with `expression/differential_test.cpp`.
 3. **Write Unit Tests**: Every bugfix or new feature must be accompanied by unit tests in the corresponding layer directory (`*_test.cpp`).
-4. **Refer to Architectural Decision Records (ADRs)**: Check [`docs/adr/`](docs/adr/) and [`ARCHITECTURE.md`](ARCHITECTURE.md) for rationale behind existing design decisions.
+4. **Refer to Architectural Decision Records (ADRs)**: Check [`docs/review/`](docs/review/), [`docs/adr-proposal.md`](docs/adr-proposal.md), and [`ARCHITECTURE.md`](ARCHITECTURE.md) for rationale behind existing design decisions.

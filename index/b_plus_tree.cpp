@@ -22,6 +22,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include "b_plus_tree_iterator.hpp"
@@ -82,13 +83,11 @@ PageRef BPlusTree::FindRightmostPage(Transaction& txn, PageRef&& page) {
 }
 
 PageRef BPlusTree::LeftmostPage(Transaction& txn) const {
-  return FindLeftmostPage(
-      txn, txn.GetPageManager()->GetPage(root_, true));
+  return FindLeftmostPage(txn, txn.GetPageManager()->GetPage(root_, true));
 }
 
 PageRef BPlusTree::RightmostPage(Transaction& txn) const {
-  return FindRightmostPage(
-      txn, txn.GetPageManager()->GetPage(root_, true));
+  return FindRightmostPage(txn, txn.GetPageManager()->GetPage(root_, true));
 }
 
 void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
@@ -103,8 +102,12 @@ void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
     PageRef new_left =
         txn.GetPageManager()->AllocateNewPage(txn, PageType::kBranchPage);
     new_left->SetLowestValue(txn, root_page.lowest_page_);
+    // Copying the root's separators into a fresh branch page must not drop
+    // any: a silently-failed InsertBranch would orphan that separator's
+    // subtree once the loop below deletes every separator from the root.
     for (slot_t i = 0; i < root->RowCount(); ++i) {
-      new_left->InsertBranch(txn, root_page.GetKey(i), root_page.GetValue(i));
+      COERCE(new_left->InsertBranch(txn, root_page.GetKey(i),
+                                    root_page.GetValue(i)));
     }
     COERCE(root->SetFoster(txn, FosterPair("", 0)));
     while (0 < root_page.RowCount()) {
@@ -122,8 +125,11 @@ void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
   PageRef new_left =
       txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage);
   const LeafPage& root_page = root->body.leaf_page;
+  // Surface any failed copy (see the branch-grow loop above): a dropped row
+  // here would be lost when the root is converted to a branch below.
   for (slot_t i = 0; i < root->body.leaf_page.RowCount(); ++i) {
-    new_left->InsertLeaf(txn, root_page.GetKey(i), root_page.GetValue(i));
+    COERCE(
+        new_left->InsertLeaf(txn, root_page.GetKey(i), root_page.GetValue(i)));
   }
   COERCE(new_left->SetHighFence(txn, IndexKey(new_right.key)));
   PageRef right_page = txn.GetPageManager()->GetPage(new_right.child_pid);
@@ -245,9 +251,9 @@ PageRef BPlusTree::FindLeafFromHint(Transaction& txn, std::string_view key,
 }
 
 PageRef BPlusTree::FindLeafReadOnly(Transaction& txn, std::string_view key,
-                                    bool less_than, page_id_t stop_before) const {
-  PageRef curr =
-      txn.GetPageManager()->GetPage(root_, true);
+                                    bool less_than,
+                                    page_id_t stop_before) const {
+  PageRef curr = txn.GetPageManager()->GetPage(root_, true);
   const auto go_right = [&](std::string_view foster_key) {
     return less_than ? foster_key < key : foster_key <= key;
   };
@@ -268,10 +274,8 @@ PageRef BPlusTree::FindLeafReadOnly(Transaction& txn, std::string_view key,
       return curr;
     }
     assert(curr->Type() == PageType::kBranchPage);
-    ASSIGN_OR_CRASH(page_id_t, next,
-                    curr->GetPageForKey(txn, key, less_than));
-    PageRef next_page =
-        txn.GetPageManager()->GetPage(next, true);
+    ASSIGN_OR_CRASH(page_id_t, next, curr->GetPageForKey(txn, key, less_than));
+    PageRef next_page = txn.GetPageManager()->GetPage(next, true);
     curr.PageUnlock();
     curr = std::move(next_page);
   }
@@ -320,16 +324,15 @@ Status BPlusTree::LeafInsert(Transaction& txn, PageRef& leaf,
     // the page already holds any row, even if free_size_ would fit the entry.
     // A half-split cannot make room for a second exclusive entry; give the
     // new key its own foster sibling instead.
-    const bool exclusive_reject = leaf->RowCount() > 0 &&
-                                  needed <= leaf->body.leaf_page.free_size_;
+    const bool exclusive_reject =
+        leaf->RowCount() > 0 && needed <= leaf->body.leaf_page.free_size_;
 
     if (exclusive_reject) {
       if (key < leaf->GetKey(0)) {
         // Shift existing rows onto `right`, then insert into the empty leaf.
         while (leaf->RowCount() > 0) {
           const std::string_view move_key = leaf->GetKey(0);
-          const std::string_view move_value =
-              leaf->body.leaf_page.GetValue(0);
+          const std::string_view move_value = leaf->body.leaf_page.GetValue(0);
           COERCE(right->InsertLeaf(txn, move_key, move_value));
           COERCE(leaf->Delete(txn, move_key));
         }
@@ -338,8 +341,8 @@ Status BPlusTree::LeafInsert(Transaction& txn, PageRef& leaf,
         }
         COERCE(right->SetLowFence(txn, IndexKey(right->GetKey(0))));
         COERCE(right->SetHighFence(txn, leaf->GetHighFence(txn)));
-        COERCE(
-            leaf->SetFoster(txn, FosterPair(right->GetKey(0), right->PageID())));
+        COERCE(leaf->SetFoster(txn,
+                               FosterPair(right->GetKey(0), right->PageID())));
         COERCE(leaf->InsertLeaf(txn, key, value));
         return Status::kSuccess;
       }
@@ -404,6 +407,44 @@ void BPlusTree::ReclaimIfOrphaned(Transaction& txn, PageRef& page,
   txn.GetPageManager()->DestroyPage(txn, &*page);
 }
 
+std::vector<page_id_t> BPlusTree::CollectPageIds(Transaction& txn,
+                                                 page_id_t root) {
+  // D3 (docs/design.md): DROP TABLE reclaims index pages.  Walk the full
+  // structure (lowest links, every child slot, and every foster chain) with
+  // an explicit stack and a seen set so shared or cyclic links terminate.
+  std::vector<page_id_t> pages;
+  std::unordered_set<page_id_t> seen;
+  std::vector<page_id_t> stack;
+  if (root != 0) {
+    stack.push_back(root);
+  }
+  PageManager* const pm = txn.GetPageManager();
+  while (!stack.empty()) {
+    const page_id_t pid = stack.back();
+    stack.pop_back();
+    if (pid == 0 || !seen.insert(pid).second) {
+      continue;
+    }
+    PageRef page = pm->GetPage(pid);
+    if (!page.IsValid()) {
+      // Broken or never-written image: it never holds children, and the
+      // free-list rebuild will adopt it if it ends up initialized.
+      continue;
+    }
+    pages.push_back(pid);
+    if (auto foster = page->GetFoster(txn); foster.HasValue()) {
+      stack.push_back(foster.Value().child_pid);
+    }
+    if (page->Type() == PageType::kBranchPage) {
+      stack.push_back(page->body.branch_page.lowest_page_);
+      for (slot_t i = 0; i < page->body.branch_page.RowCount(); ++i) {
+        stack.push_back(page->body.branch_page.GetValue(i));
+      }
+    }
+  }
+  return pages;
+}
+
 bool BPlusTree::PositionBelow(PageRef& leaf, size_t& idx, Transaction& txn,
                               std::string_view end) {
   LeafPage* lp = &leaf->body.leaf_page;
@@ -445,8 +486,7 @@ bool BPlusTree::PositionBelow(PageRef& leaf, size_t& idx, Transaction& txn,
         leaf = std::move(child);
       }
     }
-    if (leaf->PageID() == departed ||
-        leaf->body.leaf_page.row_count_ == 0) {
+    if (leaf->PageID() == departed || leaf->body.leaf_page.row_count_ == 0) {
       return false;
     }
     lp = &leaf->body.leaf_page;
@@ -465,6 +505,58 @@ bool BPlusTree::PositionBelow(PageRef& leaf, size_t& idx, Transaction& txn,
     }
     idx = lp->row_count_ - 1;
     return true;
+  }
+}
+
+bool BPlusTree::PositionAtOrAbove(PageRef& leaf, size_t& idx, Transaction& txn,
+                                  std::string_view begin) {
+  LeafPage* lp = &leaf->body.leaf_page;
+  for (;;) {
+    idx = lp->Find(begin);
+    if (idx < static_cast<size_t>(lp->row_count_)) {
+      return true;
+    }
+    // This leaf holds no key at or after `begin`: the lower bound lives in a
+    // later leaf, reached through the foster chain or across the high fence.
+    page_id_t next_pid = 0;
+    std::string seek;
+    if (auto foster = leaf->GetFoster(txn)) {
+      next_pid = foster.Value().child_pid;
+    } else {
+      const IndexKey high_fence = leaf->GetHighFence(txn);
+      if (high_fence.IsPlusInfinity()) {
+        return false;
+      }
+      seek = std::string(high_fence.GetKey().Value());
+    }
+    const page_id_t departed = leaf->PageID();
+    if (next_pid != 0) {
+      PageRef child = txn.GetPageManager()->GetPage(next_pid, true);
+      leaf.PageUnlock();
+      leaf = std::move(child);
+    } else {
+      // Inclusive seek stops before re-entering the page we left.
+      leaf.PageUnlock();
+      leaf = FindLeafReadOnly(txn, seek, false, departed);
+      if (leaf->PageID() == departed) {
+        leaf.PageUnlock();
+        leaf = FindLeafReadOnly(txn, seek, true, departed);
+        while (auto foster = leaf->GetFoster(txn)) {
+          if (foster.Value().child_pid == departed) {
+            break;
+          }
+          PageRef child =
+              txn.GetPageManager()->GetPage(foster.Value().child_pid, true);
+          leaf.PageUnlock();
+          leaf = std::move(child);
+        }
+      }
+    }
+    if (leaf->PageID() == departed) {
+      // The structure offered no leaf to the right of the exhausted one.
+      return false;
+    }
+    lp = &leaf->body.leaf_page;
   }
 }
 
@@ -495,8 +587,8 @@ Status BPlusTree::SetFosterRecursively(Transaction& txn, PageRef& parent,
     COERCE(new_foster_child->SetLowFence(txn, IndexKey(middle)));
   } else {
     assert(parent->Type() == PageType::kLeafPage);
-    parent->body.leaf_page.Split(parent->PageID(), txn, foster_key,
-                                 kDummyValue, &*new_foster_child);
+    parent->body.leaf_page.Split(parent->PageID(), txn, foster_key, kDummyValue,
+                                 &*new_foster_child);
     if (new_foster_child->RowCount() == 0) {
       // Exclusive-size rows all stayed on the parent, so the split produced
       // an empty page. Point the foster link straight at it without reading a
@@ -612,8 +704,7 @@ Status HandleFoster(Transaction& txn, PageRef& curr, std::string_view key,
           }
           BPlusTree::ReclaimIfOrphaned(txn, right_page, protected_pid);
         }
-      } else if (merged != Status::kNoSpace &&
-                 merged != Status::kTooBigData) {
+      } else if (merged != Status::kNoSpace && merged != Status::kTooBigData) {
         return merged;
       }
     }
@@ -664,6 +755,14 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) const {
           COERCE(
               curr->SetFoster(txn, FosterPair(old_key, next_page->PageID())));
         }
+        // D11 (docs/design.md): every row and foster link of the lifted page
+        // now lives under the root, so the old page is provably unreachable.
+        // Empty it (rows AND foster) and reclaim it instead of leaking.
+        COERCE(prev_page->SetFoster(txn, FosterPair()));
+        while (0 < prev_page->RowCount()) {
+          COERCE(prev_page->Delete(txn, prev_page->GetKey(0)));
+        }
+        ReclaimIfOrphaned(txn, prev_page, root_);
       } else {
         // Lift up branch node.
         assert(prev_page->Type() == PageType::kBranchPage);
@@ -678,6 +777,7 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) const {
         std::string old_key(old_key_view);
         if ((prev_page->RowCount() == 1 && key < old_key) ||
             (next_page->RowCount() == 1 && old_key <= key)) {
+          const page_id_t lifted_branch_pid = prev_page->PageID();
           COERCE(curr->Delete(txn, next_page->GetKey(0)));
           curr->SetLowestValue(txn, prev_page->body.branch_page.lowest_page_);
           for (slot_t i = 0; i < prev_page->RowCount(); ++i) {
@@ -699,15 +799,31 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) const {
           COERCE(foster_parent->SetFoster(
               txn, FosterPair(old_key, next_page->PageID())));
           COERCE(curr->SetFoster(txn, FosterPair(foster_key, foster_root_pid)));
-        }
-      }
-      if (!curr->GetFoster(txn).HasValue()) {
-        if (auto foster = next_page->GetFoster(txn)) {
-          COERCE(curr->SetFoster(txn, foster.Value()));
-          COERCE(next_page->SetFoster(txn, FosterPair()));
-        }
-        while (0 < next_page->RowCount()) {
-          STATUS(next_page->Delete(txn, next_page->GetKey(0)), "Has value");
+          // D11 (docs/design.md): the root adopted every separator, child and
+          // foster link of the lifted branch, so the old page is unreachable;
+          // empty and reclaim it instead of leaking the page id.  The lowest
+          // child clear goes through the logged setter so abort/crash replay
+          // restores it (D3 destroy undo then re-initializes the page).
+          // Note the latch handoff: with a foster chain the walk released the
+          // lifted page's latch (foster_parent moved off it) and GetPage is
+          // safe; without one, foster_parent STILL holds the latch and must
+          // be moved instead of re-pinned (re-locking = EDEADLK).
+          {
+            const bool chain_moved_on =
+                foster_parent->PageID() != lifted_branch_pid;
+            PageRef lifted =
+                chain_moved_on
+                    ? txn.GetPageManager()->GetPage(lifted_branch_pid)
+                    : std::move(foster_parent);
+            if (lifted.IsValid()) {
+              COERCE(lifted->SetFoster(txn, FosterPair()));
+              while (0 < lifted->RowCount()) {
+                COERCE(lifted->Delete(txn, lifted->GetKey(0)));
+              }
+              lifted->SetLowestValue(txn, 0);
+              ReclaimIfOrphaned(txn, lifted, root_);
+            }
+          }
         }
       }
     }
@@ -733,6 +849,17 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) const {
             : txn.GetPageManager()->GetPage(
                   curr->body.branch_page.GetValue(next_idx));
     if (next_page->RowCount() == 1 && !next_page->GetFoster(txn)) {
+      // D11 (docs/design.md): descending toward the lowest child
+      // (next_idx < 0) with a rebalance that deletes curr's only separator
+      // would leave curr as an EMPTY branch that still hangs off its parent
+      // (and, for the root, an empty root that orphans the promoted subtree
+      // -- the lift-up-orphans-sibling-rows bug).  An empty branch is never
+      // a valid descent target, so refuse to strip the last separator and
+      // just descend; the height-shrink path handles the root.
+      if (next_idx < 0 && curr->RowCount() == 1) {
+        curr = std::move(next_page);  // Releases parent lock here.
+        continue;
+      }
       if (next_idx < curr->RowCount() - 1) {
         // To avoid empty node, make the node have sibling.
         // Make right sibling a foster child and rebalance.
@@ -763,7 +890,8 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) const {
   }
   assert(curr->Type() == PageType::kLeafPage);
   for (;;) {
-    STATUS(HandleFoster(txn, curr, key, root_), "Foster operation must success");
+    STATUS(HandleFoster(txn, curr, key, root_),
+           "Foster operation must success");
     if (auto foster_pair = curr->GetFoster(txn)) {
       const FosterPair& foster = foster_pair.Value();
       if (foster.key <= key) {
@@ -827,14 +955,13 @@ StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
     // Validate the remembered leaf against the live tree before trusting it:
     // the branch level that currently routes `key` must point at it. Read
     // never mutates, so this only takes shared latches.
-    PageRef probe =
-        txn.GetPageManager()->GetPage(root_, true);
+    PageRef probe = txn.GetPageManager()->GetPage(root_, true);
     bool routed = false;
     while (probe->Type() == PageType::kBranchPage) {
       if (auto maybe_foster = probe->GetFoster(txn);
           maybe_foster.HasValue() && maybe_foster.Value().key <= key) {
-        PageRef child = txn.GetPageManager()->GetPage(
-            maybe_foster.Value().child_pid, true);
+        PageRef child =
+            txn.GetPageManager()->GetPage(maybe_foster.Value().child_pid, true);
         probe = std::move(child);  // Releases the parent latch here.
         continue;
       }
@@ -844,8 +971,7 @@ StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
     }
     probe.PageUnlock();
     if (routed) {
-      PageRef curr =
-          txn.GetPageManager()->GetPage(*hint_leaf, true);
+      PageRef curr = txn.GetPageManager()->GetPage(*hint_leaf, true);
       bool usable = curr->Type() == PageType::kLeafPage;
       if (usable) {
         // Fence reads are pure page-memory probes; shared latches suffice.
@@ -855,8 +981,8 @@ StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
         while (auto maybe_foster = curr->GetFoster(txn)) {
           const FosterPair& foster_child = maybe_foster.Value();
           if (foster_child.key <= key) {
-            PageRef child = txn.GetPageManager()->GetPage(
-                foster_child.child_pid, true);
+            PageRef child =
+                txn.GetPageManager()->GetPage(foster_child.child_pid, true);
             curr = std::move(child);
             continue;
           }
@@ -952,7 +1078,8 @@ void DumpLeafPage(Transaction& txn, PageRef&& page, std::ostream& o,
 
 // Recursive B+tree descent for dumping; depth is bounded by the tree height
 // (fanout is hundreds of entries per 32 KiB branch page).
-void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o, PageRef& page,  // NOLINT(misc-no-recursion)
+void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o,
+                           PageRef& page,  // NOLINT(misc-no-recursion)
                            int indent) const {
   if (page->Type() == PageType::kLeafPage) {
     o << Indent(indent);

@@ -22,9 +22,12 @@
 #include <ostream>
 
 #include "common/constants.hpp"
+#include "page/branch_page.hpp"
 #include "page/free_page.hpp"
+#include "page/leaf_page.hpp"
 #include "page/page_pool.hpp"
 #include "page/page_type.hpp"
+#include "page/row_page.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -55,13 +58,44 @@ PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
 // Precondition: latch of page is taken by txn.
 void MetaPage::DestroyPage(Transaction& txn, Page* target) {
   page_id_t free_page_id = target->PageID();
+  // D3 (docs/design.md): capture the destroyed page's type and -- when it
+  // still holds rows -- its body image so undo of an aborted destroy can
+  // restore the page exactly (e.g. a rolled-back DROP TABLE keeps its rows).
+  // A provably empty page is reconstructible from the type alone.
+  const PageType old_type = target->Type();
+  bool has_content = true;
+  switch (old_type) {
+    case PageType::kRowPage:
+      has_content = target->body.row_page.RowCount() != 0;
+      break;
+    case PageType::kLeafPage:
+      has_content = target->body.leaf_page.RowCount() != 0;
+      break;
+    case PageType::kBranchPage:
+      has_content = target->body.branch_page.RowCount() != 0;
+      break;
+    case PageType::kPaxPage:
+      // PaxPage exposes no cheap emptiness probe; conservatively capture the
+      // body so undo of an aborted destroy restores every stored column.
+      // Destroying a PAX page is rare (DROP TABLE), so the copy cost is fine.
+      has_content = true;
+      break;
+    default:
+      has_content = false;
+      break;
+  }
+  std::string old_body;
+  if (has_content) {
+    old_body.assign(reinterpret_cast<const char*>(&target->body),
+                    kPageBodySize);
+  }
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageID() == free_page_id);
   FreePage& free_page = target->body.free_page;
   // Add the free page to the free page chain.
   free_page.next_free_page = first_free_page;
   first_free_page = free_page_id;
-  txn.DestroyPageLog(free_page_id);
+  txn.DestroyPageLog(free_page_id, old_type, std::move(old_body));
 }
 
 void MetaPage::Dump(std::ostream& o, int /*unused*/) const {

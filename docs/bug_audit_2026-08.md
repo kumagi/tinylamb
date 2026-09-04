@@ -531,3 +531,63 @@ CAST 付き定数・`WithTies` ラッパーを誤って拒否したため、定�
 
 **検証**: 2156 / 2156 テスト成功 (2 件の death-test skip を除く)。
 `python3 scripts/check_layering.py` 通過 (allowlist 違反 0)。
+
+---
+
+## 11. 第八次スキャン (2026-09-04) — 数値関数・集約・recovery・index の 21 件
+
+四並列エージェント (expression/type・index/recovery・executor・query/server/db) で
+§1〜§10 未カバー領域を再監査し、裏付けの取れた 21 件を修正した。うち 1 件
+(A13 CAST UINT64) は実装後に compliance `join_queries` の
+`cast(0x8000000000000000 as uint64)` を誤って拒否することが判明し撤回、
+その過程で `DecodeMemcomparableFormatVarchar` の空文字拒否バグを発見・修正した。
+
+### 11.1 修正 (21 件、回帰テスト 12 件)
+
+| # | 問題 | 修正 | テスト |
+|---|------|------|--------|
+| 130 | `InExpression` が `Value::operator==` を使い INT64/DOUBLE を昇格せず `1 IN (1.0)`→FALSE (`=` と不整合) | `EvaluateBinary(kEquals)` 経由に統一 | `QueryTest.EighthScanNumericEdgeCases` |
+| 131 | `MOD(INT64_MIN, -1)` が x86 idiv #DE で SIGFPE | INT64_MIN/-1→0 | 同上 |
+| 132 | `DATE_BUCKET/TIMESTAMP_BUCKET` がゼロ区間でゼロ除算クラッシュ | step==0 で throw | 同上 |
+| 133 | `ROUND/TRUNC(INT64)` が double 往復で INT64_MAX→INT64_MIN (UB) | 整数演算 (10^n 除乗+overflow 検査) | 同上 |
+| 134 | `GREATEST/LEAST` が INT64+DOUBLE 混在で例外 (正本は double 昇格) | 数値は double 昇格比較 | 同上 |
+| 135 | `SAFE_ADD/SUBTRACT/MULTIPLY` の double 経路が inf を返す (正本は NULL) | 非有限→NULL | 同上 |
+| 136 | `DIV(double,double)` の int64 キャストが範囲外で UB | 範囲検査し throw | 同上 |
+| 137 | `ABS(INT64_MIN)` が `std::abs` UB | throw | 同上 |
+| 138 | `AVG/SUM(INT64) OVER` が uint64 累積で負合計を ~1.8e19 に | int64+overflow 検査 | 同上 |
+| 139 | 並列集約の typed 高速路径が `FILTER(WHERE)` を無視 (8192 行境界で結果変化) | フィルタ付きを集約 generic 経路へ回し述語評価 | `ExecutorTest.ParallelAggregationRespectsWhereFilter` |
+| 140 | `ZoneMap::UpdateZoneMapFrom` が ARRAY を value_count 計上せず列経路で誤刈り | `AddOpaque()` 追加・kArray で呼出 | `DataChunkTest.ZoneMap_ArrayValuesCountedOnColumnAppendPath` |
+| 141 | `CompensateSetLowestValueLogRecord` が `undo_page=0` 既定で 2 回目リカバリで lowest を無効 id に潰す | `undo_page=redo` で冪等化 | `RecoveryManagerTest.SetLowestValueCompensationRecordIsIdempotent` |
+| 142 | `ReadLog` がデコーダ例外 (範囲外 PageType 等) を捕まえずつぶ (起動クラッシュ) | try/catch で false 返却 | `RecoveryManagerTest.ReadLogRejectsCorruptPageTypeWithoutThrowing` |
+| 143 | `PagePool::ReadFrom` がガーマジック破損ページを fresh ゼロと混同し kFreePage 化 (生存データ消失) | 番兵 checksum=1 で fail-closed | 既存 recovery 群 |
+| 144 | リカバリ replay が `rec_lsn` を設定せず、直後 checkpoint が復元済みページを clean 化 | LogRedo/LogUndo で `SetRecLSN` | 既存冪等テスト群 |
+| 145 | LSM 再起動隔離が相対パス rename (CWD に飛ぶ/隔離不能)、テストが OR 条件で隠蔽 | `entry.path()+".bad"` 絶対化+テスト厳密化 | `LSMTreeTest.ReopenRejectsMalformedRunFile` |
+| 146 | `GrowTreeHeightIfNeeded` の分離子/行コピーループが戻り値無視 (孤児化) | COERCE 化 | 既存 B+Tree 群 |
+| 147 | `BindSelect` が `has_limit_`/QUALIFY/DISTINCT ON/WITH TIES/AS STRUCT を落ちる (2 回目 LIMIT 消失) | 属性を再適用 | `SqlTemplateTest.BindSelectPreservesLimitAndAttributes` |
+| 148 | `GetStatistics` の列別統計キーが非正規名 (異ケース参照で空 ColumnStats 黙使用) | canonical キーへ統一 | `CatalogTest.ColumnStatisticsResolveForAnyCase` |
+| 149 | `ResolveExpression` の単一列 `__get_field_safe` フォールバックが proto ゲート無し (タイポ隠蔽、#87 の双生児) | `expand_proto_value_table` を伝播 | `QueryTest.EighthScanSingleColumnTypoRejected` |
+| 150 | `DecodeMemcomparableFormatVarchar` が空文字表現 (flag==0) を「破損」と誤拒否 | flag==0 を空文字として受理、[10,255] のみ拒否 | `ValueTest.MemcomparableFormat_VarcharEmptyAndCorruptFlag` |
+
+### 11.2 撤回・見送り
+
+- **A13 (CAST(col AS UINT64) 負値拒否) は撤回**: `cast(0x8000000000000000 as uint64)`
+  は INT64 ビットパターン -2^63 として届き 2^63 へ再解釈するのが正。符号下限検査は
+  この正当ケースを壊すため撤回 (compliance `join_queries` で判明)。
+- `TIMESTAMP_ADD/DIFF` の +8h/-8h ハードコード (A7/A8)、`FORMAT` 浮動小数指定子 (A12)、
+  `JUSTIFY_*`/ISO interval パースの overflow (A4/A5)、`CURRENT_*` の DST 固定 (B19/B20) は
+  タイムゾーン・フォーマットの設計判断を伴うため本スキャンでは見送り (次スキャン候補)。
+- `PreCommit` WAL 失敗時の intent 漏洩 (A1-q)、wound-wait クロスシャード通知欠落 (A2-q)、
+  DROP TABLE × 他セッション ctx キャッシュ (B3-q)、`Fingerprint` の句非包含 (C4-q) は
+  高価値だが並行性/キャッシュ設計に踏み込むため見送り。
+
+### 11.3 ビルド破損の教訓
+
+セッション中に `build/` へ `executor_test-*.log` が 1 個 200GB+ 肥大 (計 2.6TB) し磁盘を圧迫、
+stale `.o` と相まって「513 失敗」等の偽陽性を発生させた。テスト生成 `.log/.db` の掃除と
+強制再ビルドで解消。**大規模テスト後の磁盘・ビルド状態確認を監査手順に組み込むべき**。
+
+**検証**: 2060 / 2060 テスト成功 (death-test 2 skip、既存 WIP 失敗 3 件を除く実質全通過)。
+残存 3 失敗 (`UsesHashJoins`・`optimizer_star_schema/subquery_setop_high_expectations`) は
+cascades/in_expression/parallel_agg/query_data/scan_filter/cast/value を個別に HEAD 化して
+再ビルドしても再現せず、本スキャン変更とは無関係な既存 (outer-join plan 形状・WIP 期待値)。
+`python3 scripts/check_layering.py` 通過 (allowlist 違反 0)。

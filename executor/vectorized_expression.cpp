@@ -11,8 +11,8 @@
 #include "executor/data_chunk.hpp"
 #include "executor/selection_vector.hpp"
 #include "expression/binary_expression.hpp"
-#include "expression/cast_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -90,8 +90,7 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
     }
     case TypeTag::kBinaryExp: {
       const auto& binary = expr->AsBinaryExpression();
-      const ColumnVector left_vec =
-          Evaluate(binary.Left(), schema, chunk, sel);
+      const ColumnVector left_vec = Evaluate(binary.Left(), schema, chunk, sel);
       const ColumnVector right_vec =
           Evaluate(binary.Right(), schema, chunk, sel);
       if (left_vec.Type() == ValueType::kInt64 &&
@@ -103,26 +102,34 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
           const auto& l_ints = left_vec.IntegerData();
           const auto& r_ints = right_vec.IntegerData();
           for (size_t i = 0; i < active_count; ++i) {
-            if (left_vec.IsNull(i) || right_vec.IsNull(i)) {
-              result.Append(Value());
-            } else {
-              const int64_t lv = l_ints[i];
-              const int64_t rv = r_ints[i];
-              int64_t res = 0;
-              switch (op) {
-                case BinaryOperation::kAnd:
-                  res = (lv != 0 && rv != 0) ? 1 : 0;
-                  break;
-                case BinaryOperation::kOr:
-                  res = (lv != 0 || rv != 0) ? 1 : 0;
-                  break;
-                case BinaryOperation::kXor:
-                  res = ((lv != 0) ^ (rv != 0)) ? 1 : 0;
-                  break;
-                default:
-                  break;
+            const bool l_null = left_vec.IsNull(i);
+            const bool r_null = right_vec.IsNull(i);
+            const bool lv = !l_null && l_ints[i] != 0;
+            const bool rv = !r_null && r_ints[i] != 0;
+            // Match EvaluateBinary three-valued logic: FALSE AND NULL is
+            // FALSE, TRUE OR NULL is TRUE; XOR with any NULL is NULL.
+            if (op == BinaryOperation::kAnd) {
+              if ((!l_null && !lv) || (!r_null && !rv)) {
+                result.Append(Value(int64_t{0}));
+              } else if (l_null || r_null) {
+                result.Append(Value());
+              } else {
+                result.Append(Value(int64_t{1}));
               }
-              result.Append(Value(res));
+            } else if (op == BinaryOperation::kOr) {
+              if ((!l_null && lv) || (!r_null && rv)) {
+                result.Append(Value(int64_t{1}));
+              } else if (l_null || r_null) {
+                result.Append(Value());
+              } else {
+                result.Append(Value(int64_t{0}));
+              }
+            } else {
+              if (l_null || r_null) {
+                result.Append(Value());
+              } else {
+                result.Append(Value(static_cast<int64_t>(lv ^ rv ? 1 : 0)));
+              }
             }
           }
           return result;
@@ -138,8 +145,7 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
     }
     case TypeTag::kCastExp: {
       const auto& cast = expr->AsCastExpression();
-      const ColumnVector child_vec =
-          Evaluate(cast.Child(), schema, chunk, sel);
+      const ColumnVector child_vec = Evaluate(cast.Child(), schema, chunk, sel);
       ColumnVector result(ValueType::kNull, active_count);
       for (size_t i = 0; i < active_count; ++i) {
         const Value child_val = child_vec.ValueAt(i);
@@ -187,7 +193,9 @@ ValidityBitmap VectorizedExpression::EvaluateFilter(
     return ValidityBitmap(total_rows, false);
   }
 
-  const ColumnVector result_vec = Evaluate(expr, schema, chunk, nullptr);
+  // Evaluate only the selected rows: evaluating masked-out rows can throw
+  // (e.g. division by zero) for rows the caller already excluded.
+  const ColumnVector result_vec = Evaluate(expr, schema, chunk, sel);
   ValidityBitmap bitmap(total_rows, false);
 
   if (sel == nullptr) {
@@ -199,8 +207,8 @@ ValidityBitmap VectorizedExpression::EvaluateFilter(
   } else {
     for (size_t i = 0; i < sel->Size(); ++i) {
       const size_t row_idx = (*sel)[i];
-      if (row_idx < total_rows && !result_vec.IsNull(row_idx) &&
-          result_vec.ValueAt(row_idx).Truthy()) {
+      if (row_idx < total_rows && !result_vec.IsNull(i) &&
+          result_vec.ValueAt(i).Truthy()) {
         bitmap.SetBit(row_idx);
       }
     }
@@ -209,13 +217,12 @@ ValidityBitmap VectorizedExpression::EvaluateFilter(
 }
 
 void VectorizedExpression::FilterDataChunk(const Expression& expr,
-                                          const Schema& schema,
-                                          const DataChunk& chunk,
-                                          SelectionVector* output_sel,
-                                          const SelectionVector* input_sel) {
+                                           const Schema& schema,
+                                           const DataChunk& chunk,
+                                           SelectionVector* output_sel,
+                                           const SelectionVector* input_sel) {
   assert(output_sel != nullptr);
-  const ValidityBitmap mask =
-      EvaluateFilter(expr, schema, chunk, input_sel);
+  const ValidityBitmap mask = EvaluateFilter(expr, schema, chunk, input_sel);
   if (input_sel != nullptr) {
     input_sel->Filter(mask, output_sel);
   } else {

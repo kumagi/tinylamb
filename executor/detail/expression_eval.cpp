@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
-#include <random>
 #include <limits>
 #include <map>
 #include <memory>
@@ -57,18 +56,10 @@
 
 namespace tinylamb::relational_detail {
 
-bool Truthy(const Value& value) {
-  if (value.IsNull()) {
-    return false;
-  }
-  if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
-    return value.value.int_value != 0;
-  }
-  if (value.type == ValueType::kDouble) {
-    return value.value.double_value != 0.0;
-  }
-  return !value.value.varchar_value.empty();
-}
+// Single definition of truthiness: Value::Truthy is the semantic reference
+// (AST evaluation, VectorizedExpression, and DataChunk all use it). The
+// residual/scan-filter path must not diverge for DOUBLE 0.0 or "".
+bool Truthy(const Value& value) { return value.Truthy(); }
 
 std::string ElementSqlTypeName(ValueType type) {
   switch (type) {
@@ -91,13 +82,15 @@ size_t DistinctValueHash::operator()(const Value& value) const {
 
 bool DistinctValueEqual::operator()(const Value& left,
                                     const Value& right) const {
-  if (left.type != right.type) { return false;
-}
+  if (left.type != right.type) {
+    return false;
+  }
   if (left.type == ValueType::kDouble) {
     const double x = left.value.double_value;
     const double y = right.value.double_value;
-    if (std::isnan(x) && std::isnan(y)) { return true;
-}
+    if (std::isnan(x) && std::isnan(y)) {
+      return true;
+    }
     return x == y;
   }
   return left == right;
@@ -127,7 +120,8 @@ bool IdentifierEquals(std::string_view left, std::string_view right) {
                     });
 }
 
-int FindColumn(const Schema& schema, const ColumnName& name) {
+int FindColumn(const Schema& schema, const ColumnName& name,
+               bool allow_bare_fallback = true) {
   int match = -1;
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& candidate = schema.GetColumn(i).Name();
@@ -143,13 +137,15 @@ int FindColumn(const Schema& schema, const ColumnName& name) {
       match = static_cast<int>(i);
     }
   }
-  if (match < 0 && !name.schema.empty()) {
+  if (match < 0 && !name.schema.empty() && allow_bare_fallback) {
     // Bare-name fallback for a qualified reference is only safe when this
     // schema carries no aliases at all (degraded metadata such as raw catalog
     // rows).  Once columns are aliased, a reference qualified by another
     // alias (`t1.x` seen from inside `... AS t2`) belongs to an outer scope;
     // capturing a same-named local column silently turns correlated
-    // predicates into wrong local filters.
+    // predicates into wrong local filters.  Callers resolve every scope
+    // without this fallback first (Lookup below), so an inner projected
+    // schema never steals a qualified reference from the tuple it names.
     bool any_qualified = false;
     for (size_t i = 0; i < schema.ColumnCount(); ++i) {
       if (!schema.GetColumn(i).Name().schema.empty()) {
@@ -194,8 +190,7 @@ std::string TrimFieldToken(std::string_view s) {
   while (begin < end && std::isspace(static_cast<unsigned char>(s[begin]))) {
     ++begin;
   }
-  while (end > begin &&
-         std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+  while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
     --end;
   }
   return std::string(s.substr(begin, end - begin));
@@ -394,7 +389,8 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
   if (raw.size() > 6 && raw.substr(0, 6) == "ARRAY<") {
     const size_t bracket = raw.find('[');
     if (bracket != std::string_view::npos && raw.back() == ']') {
-      std::string_view inner = raw.substr(bracket + 1, raw.size() - bracket - 2);
+      std::string_view inner =
+          raw.substr(bracket + 1, raw.size() - bracket - 2);
       std::vector<Value> elements;
       const std::string element_type_name(raw.substr(6, raw.find(">[") - 6));
       auto parse_element = [&](std::string_view token) {
@@ -447,8 +443,7 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
   }
   if (!raw.empty() && raw.front() == '[') {
     // Split top-level elements and decode each.
-    std::string_view inner =
-        raw.substr(1, raw.size() > 1 ? raw.size() - 2 : 0);
+    std::string_view inner = raw.substr(1, raw.size() > 1 ? raw.size() - 2 : 0);
     std::vector<Value> elements;
     int nest = 0;
     bool str = false;
@@ -565,7 +560,8 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
     }
     return result;
   };
-  auto scalar_to_json = [&normalize_encoded_arrays](const Value& v) -> std::string {
+  auto scalar_to_json =
+      [&normalize_encoded_arrays](const Value& v) -> std::string {
     switch (v.type) {
       case ValueType::kNull:
         return "null";
@@ -578,7 +574,7 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
             ((v.value.varchar_value.front() == '{' &&
               v.value.varchar_value.back() == '}') ||
              (v.value.varchar_value.front() == '[' &&
-             v.value.varchar_value.back() == ']'))) {
+              v.value.varchar_value.back() == ']'))) {
           return normalize_encoded_arrays(v.value.varchar_value);
         }
         if (LooksLikeProtoText(v.value.varchar_value)) {
@@ -695,9 +691,8 @@ bool JsonObjectFieldTexts(std::string_view json,
     // ("{"a":1}", inner quotes unescaped).  Detect the raw form by a quote
     // immediately followed by an opening bracket and scan to the matching
     // close bracket, ignoring quote state inside.
-    const bool raw_embedded =
-        i + 1 < end && json[i] == '"' &&
-        (json[i + 1] == '{' || json[i + 1] == '[');
+    const bool raw_embedded = i + 1 < end && json[i] == '"' &&
+                              (json[i + 1] == '{' || json[i + 1] == '[');
     int depth = 0;
     bool in_string = false;
     if (raw_embedded) {
@@ -758,8 +753,12 @@ int CompareEncodedField(std::string_view raw_left, std::string_view raw_right) {
   auto trim = [](std::string_view s) {
     size_t b = 0;
     size_t e = s.size();
-    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) { ++b; }
-    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) { --e; }
+    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) {
+      ++b;
+    }
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) {
+      --e;
+    }
     return s.substr(b, e - b);
   };
   const std::string_view l = trim(raw_left);
@@ -800,9 +799,9 @@ int CompareEncodedField(std::string_view raw_left, std::string_view raw_right) {
     // structs (nested fields), so recurse after stripping the quotes.
     const std::string_view inner_l = l.substr(1, l.size() - 2);
     const std::string_view inner_r = r.substr(1, r.size() - 2);
-    if (!inner_l.empty() && !inner_r.empty() &&
-        inner_l.front() == '{' && inner_l.back() == '}' &&
-        inner_r.front() == '{' && inner_r.back() == '}') {
+    if (!inner_l.empty() && !inner_r.empty() && inner_l.front() == '{' &&
+        inner_l.back() == '}' && inner_r.front() == '{' &&
+        inner_r.back() == '}') {
       return CompareEncodedField(inner_l, inner_r);
     }
     return inner_l == inner_r ? 1 : 0;
@@ -964,6 +963,21 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
         return {};
       }
     }
+    const int offset = FindColumn(*current->schema, name, false);
+    if (offset >= 0) {
+      return (*current->row)[static_cast<size_t>(offset)];
+    }
+  }
+  // Degraded-metadata pass: only after no scope bound the reference exactly
+  // may a schema without any qualified column capture it by bare name.
+  // Resolving inner projected schemas (ORDER BY keys see bare output columns
+  // like `id`) before the outer scope would otherwise bind `p2.id` to the
+  // inner `id` column of a different tuple.
+  for (const Scope* current = &scope; current != nullptr;
+       current = current->outer) {
+    if (current->row == nullptr || current->schema == nullptr) {
+      continue;
+    }
     const int offset = FindColumn(*current->schema, name);
     if (offset >= 0) {
       return (*current->row)[static_cast<size_t>(offset)];
@@ -996,9 +1010,8 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
       continue;
     }
     const ColumnName& physical = current->schema->GetColumn(0).Name();
-    const std::string qualifier = name.schema.empty()
-                                      ? std::string()
-                                      : name.schema;
+    const std::string qualifier =
+        name.schema.empty() ? std::string() : name.schema;
     std::string field = name.name;
     if (name.schema.empty()) {
       const size_t dot = field.find('.');
@@ -1023,20 +1036,16 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
   // the full path into segments and, per scope level (innermost outward),
   // try every split point: the leading segments form a (possibly qualified)
   // column reference and the trailing segments traverse encoded field values.
-  std::vector<std::string> segments = name.schema.empty()
-                                          ? SplitDottedName(name.name)
-                                          : [&] {
-                                            std::vector<std::string> parts =
-                                                SplitDottedName(name.schema);
-                                            for (std::string& part :
-                                                 SplitDottedName(name.name)) {
-                                              parts.push_back(std::move(part));
-                                            }
-                                            return parts;
-                                          }();
+  std::vector<std::string> segments =
+      name.schema.empty() ? SplitDottedName(name.name) : [&] {
+        std::vector<std::string> parts = SplitDottedName(name.schema);
+        for (std::string& part : SplitDottedName(name.name)) {
+          parts.push_back(std::move(part));
+        }
+        return parts;
+      }();
   if (segments.size() >= 2) {
-    const std::vector<std::string> fields(
-        segments.begin() + 1, segments.end());
+    const std::vector<std::string> fields(segments.begin() + 1, segments.end());
     for (const Scope* current = &scope; current != nullptr;
          current = current->outer) {
       if (current->row == nullptr || current->schema == nullptr) {
@@ -1050,8 +1059,7 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
           Value current_value = std::move(field);
           for (size_t i = 1; i < fields.size(); ++i) {
             current_value = ResolveFieldPath(
-                current_value,
-                std::vector<std::string>{fields[i]});
+                current_value, std::vector<std::string>{fields[i]});
           }
           return current_value;
         }
@@ -1080,9 +1088,9 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
         }
         return ResolveFieldPath(
             (*current->row)[column_index],
-            std::vector<std::string>(segments.begin() +
-                                         static_cast<ptrdiff_t>(base_parts.size()),
-                                     segments.end()));
+            std::vector<std::string>(
+                segments.begin() + static_cast<ptrdiff_t>(base_parts.size()),
+                segments.end()));
       }
       // First segment may be an alias whose whole row is the base value.
       if (name.schema.empty()) {
@@ -1121,8 +1129,7 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
           }
         }
         if (owned.size() == 1) {
-          return ResolveFieldPath(
-              (*current->row)[owned.front()], fields);
+          return ResolveFieldPath((*current->row)[owned.front()], fields);
         }
       }
       // Split point k: segments[0..k] form the base column reference
@@ -1147,14 +1154,13 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
           // searching other scopes instead of failing the whole lookup.
           // NULL bases (empty/unset protos) resolve to NULL field values
           // rather than aborting the lookup.
-          if (base_value.IsNull() ||
-              base_value.type == ValueType::kVarChar ||
+          if (base_value.IsNull() || base_value.type == ValueType::kVarChar ||
               split + 1 == segments.size()) {
             return ResolveFieldPath(
                 base_value,
-                std::vector<std::string>(segments.begin() +
-                                             static_cast<ptrdiff_t>(split + 1),
-                                         segments.end()));
+                std::vector<std::string>(
+                    segments.begin() + static_cast<ptrdiff_t>(split + 1),
+                    segments.end()));
           }
         }
       }
@@ -1196,8 +1202,8 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
           const Value& candidate = (*current->row)[0];
           if (!candidate.IsNull() && candidate.type == ValueType::kVarChar) {
             Value field;
-            if (TryProtoTextGetField(candidate.value.varchar_value,
-                                     name.name, &field)) {
+            if (TryProtoTextGetField(candidate.value.varchar_value, name.name,
+                                     &field)) {
               return field;
             }
             // A one-column value table's alias denotes the value itself, not
@@ -1461,8 +1467,8 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate)
     // whose declared unsigned type is unavailable here; their runtime
     // values are handled by the deferred UINT64_MAX detector below.  Keep
     // the name-based fast classification for ordinary table columns.
-    sum_is_uint64 = !aggregate->Distinct() &&
-                    name.find("uint64") != std::string::npos;
+    sum_is_uint64 =
+        !aggregate->Distinct() && name.find("uint64") != std::string::npos;
     // The compliance overflow UNION exposes its anonymous value as `x`.
     // Restrict this heuristic to that genuinely untyped shape so a signed
     // column such as int64_val containing -1 is never reinterpreted as an
@@ -1485,9 +1491,9 @@ std::string FormatWeightDouble(double w);
 
 }  // namespace
 
-void AggregateAccumulator::ApplyCore(
-    const Value& value, const std::vector<Value>& trailing_values,
-    const std::vector<Value>& order_keys) {
+void AggregateAccumulator::ApplyCore(const Value& value,
+                                     const std::vector<Value>& trailing_values,
+                                     const std::vector<Value>& order_keys) {
   // APPROX_TOP_COUNT counts NULL inputs and APPROX_TOP_SUM tracks values
   // whose weights are all NULL; every other aggregate ignores NULL inputs.
   const AggregationType core_type = expression->GetType();
@@ -1572,8 +1578,7 @@ void AggregateAccumulator::ApplyCore(
   // when it is paired with a nonnegative distinct value; ordinary signed
   // SUM(DISTINCT -1) remains a signed sum.
   if (expression->GetType() == AggregationType::kSum &&
-      expression->Distinct() && !sum_is_uint64 &&
-      sum_can_infer_uint64 &&
+      expression->Distinct() && !sum_is_uint64 && sum_can_infer_uint64 &&
       value.type == ValueType::kInt64) {
     if (value.value.int_value == -1) {
       if (sum_nonnegative_total != 0) {
@@ -1615,8 +1620,8 @@ void AggregateAccumulator::ApplyCore(
         if (sum_is_uint64) {
           const uint64_t unsigned_value =
               static_cast<uint64_t>(value.value.int_value);
-          if (uint_total > std::numeric_limits<uint64_t>::max() -
-                               unsigned_value) {
+          if (uint_total >
+              std::numeric_limits<uint64_t>::max() - unsigned_value) {
             throw std::runtime_error("uint64 overflow in SUM");
           }
           uint_total += unsigned_value;
@@ -1824,8 +1829,7 @@ void AggregateAccumulator::ApplyCore(
       if (val.type == ValueType::kDouble) {
         percentile_values_.push_back(val.value.double_value);
       } else if (val.type == ValueType::kInt64) {
-        percentile_values_.push_back(
-            static_cast<double>(val.value.int_value));
+        percentile_values_.push_back(static_cast<double>(val.value.int_value));
       } else {
         throw std::runtime_error("numeric value required");
       }
@@ -2282,8 +2286,8 @@ std::string TopEntryString(const Value& value, const std::string& metric_text) {
 // "...+00".  Recognize that canonical shape so ARRAY_AGG over TIMESTAMP
 // expressions reports the reference's element type instead of STRING.
 bool LooksLikeZonedTimestampText(std::string_view text) {
-  if (text.size() < 20 || text[4] != '-' || text[7] != '-' ||
-      text[10] != ' ' || text[13] != ':' || text[16] != ':') {
+  if (text.size() < 20 || text[4] != '-' || text[7] != '-' || text[10] != ' ' ||
+      text[13] != ':' || text[16] != ':') {
     return false;
   }
   for (const int idx : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15}) {
@@ -2295,8 +2299,9 @@ bool LooksLikeZonedTimestampText(std::string_view text) {
   if (zone == std::string_view::npos || zone + 3 > text.size()) {
     return false;
   }
-  return std::all_of(text.begin() + zone + 1, text.end(),
-                     [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+  return std::all_of(text.begin() + zone + 1, text.end(), [](char c) {
+    return std::isdigit(static_cast<unsigned char>(c)) != 0;
+  });
 }
 
 // Element SQL type for APPROX_QUANTILES output arrays. Boolean inputs arrive
@@ -2433,8 +2438,8 @@ Value AggregateAccumulator::FinishSketch(bool extract_count) const {
 
 bool AggregateAccumulator::IsDone() const {
   if (expression != nullptr &&
-      expression->GetType() == AggregationType::kAnyValue &&
-      saw_any_ && !extreme.IsNull()) {
+      expression->GetType() == AggregationType::kAnyValue && saw_any_ &&
+      !extreme.IsNull()) {
     return true;
   }
   return false;
@@ -2448,11 +2453,10 @@ void AggregateAccumulator::Add(AggregateInput input) {
     ApplyCore(input.value, input.trailing_values, input.order_keys);
     return;
   }
-  buffer_->push_back(BufferedRow{std::move(input.value),
-                                 std::move(input.order_keys),
-                                 std::move(input.condition),
-                                 std::move(input.auxiliary),
-                                 std::move(input.trailing_values)});
+  buffer_->push_back(
+      BufferedRow{std::move(input.value), std::move(input.order_keys),
+                  std::move(input.condition), std::move(input.auxiliary),
+                  std::move(input.trailing_values)});
 }
 
 void AggregateAccumulator::Add(const Value& value) {
@@ -2526,8 +2530,9 @@ Value AggregateAccumulator::Finish() const {
                            }
                            {
                              const int c = CompareForOrderBy(a, b);
-                             if (c == 0) { return false;
-}
+                             if (c == 0) {
+                               return false;
+                             }
                              const bool a_less = c < 0;
                              return term.ascending ? a_less : !a_less;
                            }
@@ -2557,8 +2562,7 @@ Value AggregateAccumulator::Finish() const {
         } else if (expression->SecondaryArg()) {
           // A delimiter argument that evaluates to NULL is rejected by
           // GoogleSQL instead of falling back to a default separator.
-          throw std::runtime_error(
-              "STRING_AGG delimiter must not be NULL");
+          throw std::runtime_error("STRING_AGG delimiter must not be NULL");
         }
       }
     }
@@ -2613,8 +2617,7 @@ Value AggregateAccumulator::Finish() const {
         for (const Value& value : array_values_) {
           if (!value.IsNull()) {
             element_type = ElementSqlTypeName(value.type);
-            if (element_type == "STRING" &&
-                value.type == ValueType::kVarChar &&
+            if (element_type == "STRING" && value.type == ValueType::kVarChar &&
                 LooksLikeZonedTimestampText(value.value.varchar_value)) {
               element_type = "TIMESTAMP";
             }
@@ -2636,8 +2639,9 @@ Value AggregateAccumulator::Finish() const {
         }
         // Raw text, not AsString(): AsString wraps VARCHAR values in quotes.
         const Value& element = array_values_[i];
-        if (element.IsNull()) { continue;
-}
+        if (element.IsNull()) {
+          continue;
+        }
         out += element.type == ValueType::kVarChar
                    ? std::string(element.value.varchar_value)
                    : element.AsString();
@@ -3297,7 +3301,6 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Evaluate(args[1], scope, aggregates, context, ctes);
   }
   if (name == "$proto_field_guard" || name == "$proto_enum_guard") {
-
     const auto& args = call.Args();
     const size_t expected = name == "$proto_field_guard" ? 3 : 2;
     if (args.size() != expected) {
@@ -3305,8 +3308,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     Value value = Evaluate(args[0], scope, aggregates, context, ctes);
     if (!value.IsNull()) {
-      const Value type_value = Evaluate(args[1], scope, aggregates, context,
-                                        ctes);
+      const Value type_value =
+          Evaluate(args[1], scope, aggregates, context, ctes);
       const std::string enum_type =
           type_value.type == ValueType::kVarChar
               ? std::string(type_value.value.varchar_value)
@@ -3514,7 +3517,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   // float), keeping downstream comparisons type-consistent.
   auto promotes_to_double = [&](const std::vector<Expression>& exprs) {
     for (const Expression& branch : exprs) {
-      if (scope.schema == nullptr) { continue; }
+      if (scope.schema == nullptr) {
+        continue;
+      }
       try {
         if (branch->ResultType(*scope.schema).GetType() == TypeTag::kDouble) {
           return true;
@@ -3537,14 +3542,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (call.Args().size() != 3) {
       throw std::runtime_error("IF requires 3 arguments");
     }
-    const bool as_double =
-        promotes_to_double({call.Args()[1], call.Args()[2]});
+    const bool as_double = promotes_to_double({call.Args()[1], call.Args()[2]});
     const Value condition =
         Evaluate(call.Args()[0], scope, aggregates, context, ctes);
     const bool take_then = !condition.IsNull() && Truthy(condition);
-    return normalize(
-        Evaluate(call.Args()[take_then ? 1 : 2], scope, aggregates, context,
-                 ctes), as_double);
+    return normalize(Evaluate(call.Args()[take_then ? 1 : 2], scope, aggregates,
+                              context, ctes),
+                     as_double);
   }
   if (name == "iferror") {
     if (call.Args().size() != 2) {
@@ -3597,7 +3601,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     };
     std::vector<Pair> pairs;
     for (const Value& element : arguments[0].ArrayElements()) {
-      if (element.IsNull()) { continue; }
+      if (element.IsNull()) {
+        continue;
+      }
       const std::string text = raw_str(element);
       if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
         throw std::runtime_error("__pipe_concat requires STRUCT elements");
@@ -3609,9 +3615,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           SplitJsonObjectMembers(body);
       for (const auto& [key, member] : members) {
         Value parsed;
-        if (!JsonTextToValue(member, &parsed)) { continue; }
-        if (key == "a") { a = std::move(parsed); }
-        if (key == "b") { b = std::move(parsed); }
+        if (!JsonTextToValue(member, &parsed)) {
+          continue;
+        }
+        if (key == "a") {
+          a = std::move(parsed);
+        }
+        if (key == "b") {
+          b = std::move(parsed);
+        }
       }
       pairs.push_back({raw_str(a), raw_str(b)});
     }
@@ -3621,7 +3633,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string separator = raw_str(arguments[1]);
     std::string result;
     for (const Pair& pair : pairs) {
-      if (!result.empty()) { result += separator; }
+      if (!result.empty()) {
+        result += separator;
+      }
       result += pair.a + "," + pair.b;
     }
     return Value(std::move(result));
@@ -3635,8 +3649,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     // use it for already typed values.
     bool triple_form = arguments.size() % 3 == 0;
     for (size_t i = 2; triple_form && i < arguments.size(); i += 3) {
-      triple_form = arguments[i].IsNull() ||
-                    arguments[i].type == ValueType::kInt64;
+      triple_form =
+          arguments[i].IsNull() || arguments[i].type == ValueType::kInt64;
     }
     const size_t stride = triple_form ? 3 : 2;
     if (arguments.size() % stride != 0) {
@@ -3676,9 +3690,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       };
       if (!quoted && field_value.type == ValueType::kVarChar &&
           LooksLikeProtoText(field_value.value.varchar_value)) {
-        json += "{" +
-                NormalizeProtoText(field_value.value.varchar_value).value_or("") +
-                "}";
+        json +=
+            "{" +
+            NormalizeProtoText(field_value.value.varchar_value).value_or("") +
+            "}";
         continue;
       }
       if (quoted || (field_value.type == ValueType::kVarChar &&
@@ -3924,10 +3939,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   if (name == "error") {
     // Unreachable in valid plans unless evaluated: raise the requested
     // runtime error (the message text is informational only).
-    throw std::runtime_error(
-        arguments.empty() || arguments[0].IsNull()
-            ? std::string("ERROR: user-raised")
-            : "generic::out_of_range: " + raw_str(arguments[0]));
+    throw std::runtime_error(arguments.empty() || arguments[0].IsNull()
+                                 ? std::string("ERROR: user-raised")
+                                 : "generic::out_of_range: " +
+                                       raw_str(arguments[0]));
   }
   if (name == "coalesce") {
     for (Value& value : arguments) {
@@ -4047,7 +4062,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     struct tm t = {};
     gmtime_r(&now, &t);
     CivilTime current{t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
-                      t.tm_min, t.tm_sec, 0};
+                      t.tm_min,         t.tm_sec,     0};
     return Value(FormatCivilTime(current));
   }
   if (name == "current_date") {
@@ -4176,9 +4191,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             return Value::DateFromDays(
                 std::chrono::sys_days{ymd}.time_since_epoch().count());
           } else if (has_tz) {
-            CivilTime ct_tmp{
-                Y, M, D, h,
-                m, static_cast<int>(sec)};
+            CivilTime ct_tmp{Y, M, D, h, m, static_cast<int>(sec)};
             int default_tz_sec =
                 ParseTimeZoneOffset(GetDefaultTimeZone(), &ct_tmp, -8 * 3600);
             struct tm t = {};
@@ -4312,8 +4325,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
               std::isdigit(static_cast<unsigned char>(
                   i + 1 < text.size() ? text[i + 1] : '0')) != 0) {
             has_explicit_zone = true;
-            explicit_sec = ParseTimeZoneOffset(std::string(text.substr(i)),
-                                               &ct, 0);
+            explicit_sec =
+                ParseTimeZoneOffset(std::string(text.substr(i)), &ct, 0);
             break;
           }
         }
@@ -4464,9 +4477,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       // scalar; UNNEST iterates it as a one-element array.
       const std::string element_type = ElementSqlTypeName(arr.type);
       arr = Value::Array({std::move(arr)},
-                         element_type.empty()
-                             ? "INT64"
-                             : element_type);
+                         element_type.empty() ? "INT64" : element_type);
     }
     struct OpEntry {
       const char* text;
@@ -4634,15 +4645,20 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const int64_t lhs = arguments[0].value.int_value;
     const int64_t rhs = arguments[1].value.int_value;
-    if (name == "__bit_and") { return Value(lhs & rhs); }
-    if (name == "__bit_or") { return Value(lhs | rhs); }
-    if (name == "__bit_xor") { return Value(lhs ^ rhs); }
+    if (name == "__bit_and") {
+      return Value(lhs & rhs);
+    }
+    if (name == "__bit_or") {
+      return Value(lhs | rhs);
+    }
+    if (name == "__bit_xor") {
+      return Value(lhs ^ rhs);
+    }
     if (rhs < 0 || rhs >= 64) {
       throw std::out_of_range("shift amount out of range");
     }
     const uint64_t ulhs = static_cast<uint64_t>(lhs);
-    const uint64_t shifted =
-        name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
+    const uint64_t shifted = name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
     return Value(static_cast<int64_t>(shifted));
   }
   if (name == "__proto_new") {
@@ -4670,7 +4686,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() != 2) {
       throw std::runtime_error("__value_table_proto requires two arguments");
     }
-    if (arguments[1].IsNull()) { return {}; }
+    if (arguments[1].IsNull()) {
+      return {};
+    }
     const std::string type_name = raw_str(arguments[0]);
     if (type_name.find("TestExtraPB") == std::string::npos) {
       return arguments[1];
@@ -4689,7 +4707,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       throw std::runtime_error(
           "__value_table_proto_existing requires two arguments");
     }
-    if (arguments[1].IsNull()) { return {}; }
+    if (arguments[1].IsNull()) {
+      return {};
+    }
     const std::string type_name = raw_str(arguments[0]);
     if (type_name.find("TestExtraPB") == std::string::npos) {
       return arguments[1];
@@ -4697,7 +4717,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::vector<std::pair<std::string, Value>> fields;
     const std::string payload = raw_str(arguments[1]);
     for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
-      if (!ProtoTextHasField(payload, field)) { continue; }
+      if (!ProtoTextHasField(payload, field)) {
+        continue;
+      }
       Value value;
       if (TryProtoTextGetField(payload, field, &value)) {
         fields.emplace_back(field, std::move(value));
@@ -4726,15 +4748,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     }
     // Resolve the type before the NULL check so error messages can name it.
-    const std::string type_name =
-        InferProtoTypeName(arguments[0].IsNull() ? std::string_view()
-                                                 : raw_str(arguments[0]),
-                           path);
+    const std::string type_name = InferProtoTypeName(
+        arguments[0].IsNull() ? std::string_view() : raw_str(arguments[0]),
+        path);
     if (arguments[0].IsNull()) {
-      throw std::runtime_error("Cannot set field of NULL `" +
-                               (type_name.empty() ? std::string("PROTO")
-                                                  : type_name) +
-                               "`");
+      throw std::runtime_error(
+          "Cannot set field of NULL `" +
+          (type_name.empty() ? std::string("PROTO") : type_name) + "`");
     }
     const std::string payload = raw_str(arguments[0]);
     ValidateEnumFieldValue(
@@ -4800,8 +4820,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::string object = raw_str(arguments[0]);
     const std::string field_name = raw_str(arguments[1]);
     Value proto_field;
-    if (object.size() >= 2 && object.front() == '{' &&
-        object.back() == '}') {
+    if (object.size() >= 2 && object.front() == '{' && object.back() == '}') {
       const auto members =
           SplitJsonObjectMembers(object.substr(1, object.size() - 2));
       for (const auto& [key, text] : members) {
@@ -5308,10 +5327,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     tm.tm_sec = ct.second;
     timegm(&tm);
     char buf[128];
-    const auto format_time = static_cast<size_t (*)(char*, size_t,
-                                                     const char*, const struct tm*)
-                                  noexcept>(
-        &std::strftime);
+    const auto format_time = static_cast<size_t (*)(
+        char*, size_t, const char*, const struct tm*) noexcept>(&std::strftime);
     format_time(buf, sizeof(buf), fmt.c_str(), &tm);
     return Value(std::string(buf));
   }
@@ -5435,6 +5452,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         const int64_t q = a / b;
         return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
       };
+      // A zero bucket width divides by zero (SIGFPE); GoogleSQL rejects it.
+      if (amount == 0) {
+        throw std::runtime_error(name + ": interval must not be zero");
+      }
       if (unit == "month" || unit == "months" || unit == "quarter" ||
           unit == "quarters" || unit == "year" || unit == "years") {
         int64_t step_m = amount;
@@ -5443,9 +5464,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         } else if (unit.starts_with("quarter")) {
           step_m = amount * 3;
         }
-        int64_t m_diff =
-            static_cast<int64_t>(d_ct.year - orig_ct.year) * 12 +
-            (d_ct.month - orig_ct.month);
+        if (step_m == 0) {
+          throw std::runtime_error(name + ": interval must not be zero");
+        }
+        int64_t m_diff = static_cast<int64_t>(d_ct.year - orig_ct.year) * 12 +
+                         (d_ct.month - orig_ct.month);
         int64_t bucket_m = floor_div(m_diff, step_m) * step_m;
         int64_t total_m = (orig_ct.year * 12 + orig_ct.month - 1) + bucket_m;
         int bucket_y = floor_div(total_m, 12);
@@ -5704,8 +5727,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       const int64_t q = a / b;
       return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
     };
-    int64_t total_m =
-        static_cast<int64_t>(int(ymd.year())) * 12 + unsigned(ymd.month()) - 1 + n;
+    int64_t total_m = static_cast<int64_t>(int(ymd.year())) * 12 +
+                      unsigned(ymd.month()) - 1 + n;
     int target_y = floor_div(total_m, 12);
     if (target_y < 1 || target_y > 9999) {
       throw std::runtime_error("DATE value out of range");
@@ -5827,7 +5850,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(full_months + day_diff / 31.0);
   }
 
-  auto utf8_offsets = [](std::string_view s) -> std::vector<size_t> {  // NOLINT(bugprone-branch-clone)
+  auto utf8_offsets = [](std::string_view s)
+      -> std::vector<size_t> {  // NOLINT(bugprone-branch-clone)
     std::vector<size_t> offsets;
     offsets.reserve(s.size() + 1);
     for (size_t i = 0; i < s.size();) {
@@ -6037,7 +6061,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (
+            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6132,7 +6157,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (
+            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6195,7 +6221,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (
+            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6253,7 +6280,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (
+            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6322,7 +6350,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (
+            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6359,7 +6388,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (
+            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6404,7 +6434,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (
+            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6678,7 +6709,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (
+            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6697,9 +6729,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (static_cast<size_t>(pos_arg) > (byte_mode ? s.size() : total_cps) + 1) {
       return Value(int64_t{0});
     }
-    const size_t byte_start =
-        byte_mode ? static_cast<size_t>(pos_arg - 1)
-                  : offsets[static_cast<size_t>(pos_arg - 1)];
+    const size_t byte_start = byte_mode
+                                  ? static_cast<size_t>(pos_arg - 1)
+                                  : offsets[static_cast<size_t>(pos_arg - 1)];
     try {
       const std::regex re(pat);
       std::string search_str = s.substr(byte_start);
@@ -6720,8 +6752,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           if (byte_mode) {
             // `target_end` is already the one-based end position because it
             // is an exclusive byte offset; starts need the usual +1.
-            return Value(static_cast<int64_t>(return_pos == 1 ? target_end
-                                                               : target_start + 1));
+            return Value(static_cast<int64_t>(
+                return_pos == 1 ? target_end : target_start + 1));
           }
           size_t match_cp_start = 1;
           size_t match_cp_end = 1;
@@ -6765,8 +6797,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       while (it != end) {
         // RE2 does not return the terminal empty match for BYTES/STRING
         // REGEXP_EXTRACT_ALL; std::regex_iterator does, so discard it.
-        if (it->length() == 0 && it->position() ==
-                                      static_cast<ptrdiff_t>(s.size())) {
+        if (it->length() == 0 &&
+            it->position() == static_cast<ptrdiff_t>(s.size())) {
           break;
         }
         if (it->size() > 1) {
@@ -6776,9 +6808,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         ++it;
       }
-      return Value::Array(std::move(results),
-                          name == "byte_regexp_extract_all" ? "BYTES"
-                                                             : "STRING");
+      return Value::Array(std::move(results), name == "byte_regexp_extract_all"
+                                                  ? "BYTES"
+                                                  : "STRING");
     } catch (...) {
       throw std::runtime_error("invalid regular expression: " + pat);
     }
@@ -6848,8 +6880,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        // NOLINTNEXTLINE(bugprone-empty-catch)
-        // NOLINTNEXTLINE(bugprone-empty-catch)
+          // NOLINTNEXTLINE(bugprone-empty-catch)
+          // NOLINTNEXTLINE(bugprone-empty-catch)
         } catch (...) {
         }
       }
@@ -7273,7 +7305,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           if (!parse_j(s, pos, v)) {
             return false;
           }
-          out.obj.emplace_back(std::move(k), std::make_unique<JVal>(std::move(v)));
+          out.obj.emplace_back(std::move(k),
+                               std::make_unique<JVal>(std::move(v)));
           skip_ws(s, pos);
           if (pos < s.size() && s[pos] == ',') {
             ++pos;
@@ -7402,7 +7435,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         int64_t idx = 0;
         try {
           idx = std::stoll(idx_str);
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - incomparable values are ignored.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - incomparable values
+                         // are ignored.
           cur = nullptr;
           break;
         }
@@ -7474,6 +7508,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     if (arguments[0].type == ValueType::kInt64) {
+      // std::abs(INT64_MIN) is UB (returns INT64_MIN); GoogleSQL raises
+      // "overflow" for ABS of the most-negative integer.
+      if (arguments[0].value.int_value == std::numeric_limits<int64_t>::min()) {
+        throw std::runtime_error("integer overflow in ABS");
+      }
       return Value(std::abs(arguments[0].value.int_value));
     }
     if (arguments[0].type == ValueType::kDouble) {
@@ -7506,19 +7545,43 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return {};
     }
-    const double val = arguments[0].type == ValueType::kInt64
-                           ? static_cast<double>(arguments[0].value.int_value)
-                           : arguments[0].value.double_value;
     const int64_t digits = arguments.size() == 2
                                ? (arguments[1].type == ValueType::kInt64
                                       ? arguments[1].value.int_value
                                       : 0)
                                : 0;
+    // INT64 input must not round-trip through double: |v| > 2^53 loses
+    // precision and INT64_MAX (== 2^63 as a double) casts back to INT64_MIN
+    // (UB). Round on integers directly.
+    if (arguments[0].type == ValueType::kInt64) {
+      const int64_t v = arguments[0].value.int_value;
+      if (digits >= 0) {
+        return Value(v);  // an integer is already rounded to >=0 places
+      }
+      int64_t scale = 1;
+      for (int64_t i = 0; i < -digits; ++i) {
+        if (scale > std::numeric_limits<int64_t>::max() / 10) {
+          return Value(int64_t{0});  // scale overflow => result rounds to 0
+        }
+        scale *= 10;
+      }
+      int64_t q = v / scale;
+      const int64_t rem = v % scale;
+      const int64_t half = scale / 2;
+      // Round half away from zero (GoogleSQL ROUND semantics).
+      const bool negative = v < 0;
+      if ((negative ? -rem : rem) >= half) {
+        q += negative ? -1 : 1;
+      }
+      int64_t result = 0;
+      if (__builtin_mul_overflow(q, scale, &result)) {
+        throw std::runtime_error("integer overflow in ROUND");
+      }
+      return Value(result);
+    }
+    const double val = arguments[0].value.double_value;
     const double factor = std::pow(10.0, digits);
     const double res = std::round(val * factor) / factor;
-    if (arguments[0].type == ValueType::kInt64 && digits <= 0) {
-      return Value(static_cast<int64_t>(res));
-    }
     return Value(res);
   }
   if (name == "trunc" || name == "truncate") {
@@ -7529,19 +7592,30 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return {};
     }
-    const double val = arguments[0].type == ValueType::kInt64
-                           ? static_cast<double>(arguments[0].value.int_value)
-                           : arguments[0].value.double_value;
     const int64_t digits = arguments.size() == 2
                                ? (arguments[1].type == ValueType::kInt64
                                       ? arguments[1].value.int_value
                                       : 0)
                                : 0;
+    // INT64 input: truncation never needs a double round-trip (see ROUND).
+    if (arguments[0].type == ValueType::kInt64) {
+      const int64_t v = arguments[0].value.int_value;
+      if (digits >= 0) {
+        return Value(v);
+      }
+      int64_t scale = 1;
+      for (int64_t i = 0; i < -digits; ++i) {
+        if (scale > std::numeric_limits<int64_t>::max() / 10) {
+          return Value(int64_t{0});
+        }
+        scale *= 10;
+      }
+      // (v / scale) * scale never overflows: its magnitude is <= |v|.
+      return Value(v / scale * scale);
+    }
+    const double val = arguments[0].value.double_value;
     const double factor = std::pow(10.0, digits);
     const double res = std::trunc(val * factor) / factor;
-    if (arguments[0].type == ValueType::kInt64 && digits <= 0) {
-      return Value(static_cast<int64_t>(res));
-    }
     return Value(res);
   }
   if (name == "ceil" || name == "ceiling") {
@@ -7579,6 +7653,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         arguments[1].type == ValueType::kInt64) {
       if (arguments[1].value.int_value == 0) {
         throw std::runtime_error("division by zero in MOD");
+      }
+      // INT64_MIN % -1 traps on x86 (idiv #DE); the mathematical result is 0.
+      if (arguments[0].value.int_value == std::numeric_limits<int64_t>::min() &&
+          arguments[1].value.int_value == -1) {
+        return Value(int64_t{0});
       }
       return Value(arguments[0].value.int_value % arguments[1].value.int_value);
     }
@@ -7642,13 +7721,35 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     }
     Value best = arguments[0];
+    // Mixed INT64/DOUBLE arguments promote to DOUBLE (GoogleSQL); the raw
+    // Value::operator< throws across types, so compare numerically.
+    const auto numeric = [](const Value& v) {
+      return v.type == ValueType::kInt64 || v.type == ValueType::kDouble;
+    };
+    const auto as_double = [](const Value& v) {
+      return v.type == ValueType::kDouble
+                 ? v.value.double_value
+                 : static_cast<double>(v.value.int_value);
+    };
+    const auto greater = [&](const Value& a, const Value& b) {
+      if (numeric(a) && numeric(b)) {
+        return as_double(a) > as_double(b);
+      }
+      return a > b;
+    };
+    const auto less = [&](const Value& a, const Value& b) {
+      if (numeric(a) && numeric(b)) {
+        return as_double(a) < as_double(b);
+      }
+      return a < b;
+    };
     for (size_t i = 1; i < arguments.size(); ++i) {
       if (name == "greatest") {
-        if (arguments[i] > best) {
+        if (greater(arguments[i], best)) {
           best = arguments[i];
         }
       } else {
-        if (arguments[i] < best) {
+        if (less(arguments[i], best)) {
           best = arguments[i];
         }
       }
@@ -7905,7 +8006,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (r == 0.0) {
       throw std::runtime_error("division by zero in DIV");
     }
-    return Value(static_cast<int64_t>(std::trunc(l / r)));
+    const double quotient = std::trunc(l / r);
+    // static_cast<int64_t> of an out-of-range double is UB; DIV must raise.
+    if (!(quotient >=
+              static_cast<double>(std::numeric_limits<int64_t>::min()) &&
+          quotient <
+              -static_cast<double>(std::numeric_limits<int64_t>::min()))) {
+      throw std::out_of_range("DIV result out of range for INT64");
+    }
+    return Value(static_cast<int64_t>(quotient));
   }
   if (name == "ieee_divide" || name == "safe_divide") {
     if (arguments.size() != 2) {
@@ -7970,13 +8079,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const double r = arguments[1].type == ValueType::kInt64
                          ? arguments[1].value.int_value
                          : arguments[1].value.double_value;
-    if (name == "safe_add") {
-      return Value(l + r);
+    // SAFE_* return NULL on overflow; the double path must not leak +/-inf.
+    const double checked =
+        name == "safe_add" ? l + r : (name == "safe_subtract" ? l - r : l * r);
+    if (std::isinf(checked) || std::isnan(checked)) {
+      return {};
     }
-    if (name == "safe_subtract") {
-      return Value(l - r);
-    }
-    return Value(l * r);
+    return Value(checked);
   }
   if (name == "safe_negate") {
     if (arguments.size() != 1) {
@@ -8448,8 +8557,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const auto& elements = arr.ArrayElements();
     auto same = [](const Value& a, const Value& b) {
-      if (a.IsNull() && b.IsNull()) { return true; }
-      if (a.IsNull() || b.IsNull()) { return false; }
+      if (a.IsNull() && b.IsNull()) {
+        return true;
+      }
+      if (a.IsNull() || b.IsNull()) {
+        return false;
+      }
       try {
         return Binary(BinaryOperation::kEquals, a, b).Truthy();
       } catch (...) {
@@ -8479,11 +8592,17 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 3 && arguments[2].type == ValueType::kDouble);
     double start_d = static_cast<double>(arguments[0].value.int_value);
     double end_d = static_cast<double>(arguments[1].value.int_value);
-    if (arguments[0].type == ValueType::kDouble) { start_d = arguments[0].value.double_value; }
-    if (arguments[1].type == ValueType::kDouble) { end_d = arguments[1].value.double_value; }
+    if (arguments[0].type == ValueType::kDouble) {
+      start_d = arguments[0].value.double_value;
+    }
+    if (arguments[1].type == ValueType::kDouble) {
+      end_d = arguments[1].value.double_value;
+    }
     double step_d = 1.0;
     if (arguments.size() == 3) {
-      if (arguments[2].IsNull()) { return {}; }
+      if (arguments[2].IsNull()) {
+        return {};
+      }
       step_d = arguments[2].type == ValueType::kDouble
                    ? arguments[2].value.double_value
                    : static_cast<double>(arguments[2].value.int_value);
@@ -8522,12 +8641,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const Value& start = arguments[0];
     const Value& stop = arguments[1];
-    const bool integral = start.type == ValueType::kInt64 &&
-                          stop.type == ValueType::kInt64 &&
-                          (arguments.size() < 3 ||
-                           arguments[2].type == ValueType::kInt64);
+    const bool integral =
+        start.type == ValueType::kInt64 && stop.type == ValueType::kInt64 &&
+        (arguments.size() < 3 || arguments[2].type == ValueType::kInt64);
     if (!integral &&
-        ((start.type != ValueType::kInt64 && start.type != ValueType::kDouble) ||
+        ((start.type != ValueType::kInt64 &&
+          start.type != ValueType::kDouble) ||
          (stop.type != ValueType::kInt64 && stop.type != ValueType::kDouble) ||
          (arguments.size() == 3 && arguments[2].type != ValueType::kInt64 &&
           arguments[2].type != ValueType::kDouble))) {
@@ -8536,9 +8655,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (integral) {
       const int64_t begin = start.value.int_value;
       const int64_t end = stop.value.int_value;
-      const int64_t step = arguments.size() == 3
-                               ? arguments[2].value.int_value
-                               : int64_t{1};
+      const int64_t step =
+          arguments.size() == 3 ? arguments[2].value.int_value : int64_t{1};
       if (step == 0) {
         throw std::runtime_error("GENERATE_SERIES step must be non-zero");
       }
@@ -8549,7 +8667,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       constexpr size_t kMaxGeneratedElements = 1'000'000;
       for (int64_t current = begin;;) {
         if (values.size() == kMaxGeneratedElements) {
-          throw std::runtime_error("GENERATE_SERIES generated too many elements");
+          throw std::runtime_error(
+              "GENERATE_SERIES generated too many elements");
         }
         values.emplace_back(current);
         if (current == end) {
@@ -8574,18 +8693,19 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const double begin = number(start);
     const double end = number(stop);
     const double step = arguments.size() == 3 ? number(arguments[2]) : 1.0;
-    if (!std::isfinite(begin) || !std::isfinite(end) ||
-        !std::isfinite(step) || step == 0.0) {
+    if (!std::isfinite(begin) || !std::isfinite(end) || !std::isfinite(step) ||
+        step == 0.0) {
       throw std::runtime_error(
-          "GENERATE_SERIES step and bounds must be finite; step must be non-zero");
+          "GENERATE_SERIES step and bounds must be finite; step must be "
+          "non-zero");
     }
     if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
       return Value::Array({}, "DOUBLE");
     }
     std::vector<Value> values;
     constexpr size_t kMaxGeneratedElements = 1'000'000;
-    for (double current = begin;
-         (step > 0 ? current <= end : current >= end); current += step) {
+    for (double current = begin; (step > 0 ? current <= end : current >= end);
+         current += step) {
       if (values.size() == kMaxGeneratedElements) {
         throw std::runtime_error("GENERATE_SERIES generated too many elements");
       }
@@ -8657,8 +8777,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const int64_t start_days = start_date.DateDays();
     const int64_t end_days = end_date.DateDays();
     std::vector<Value> elements;
-    for (int64_t d = start_days;
-         step_days > 0 ? d <= end_days : d >= end_days; d += step_days) {
+    for (int64_t d = start_days; step_days > 0 ? d <= end_days : d >= end_days;
+         d += step_days) {
       elements.push_back(Value::DateFromDays(d));
     }
     return Value::Array(std::move(elements), "DATE");
@@ -8840,9 +8960,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       out.push_back(kAlphabet[(byte & 0x03) << 4]);
       out += "==";
     } else if (remainder == 2) {
-      const uint32_t pair =
-          (static_cast<unsigned char>(input[i]) << 8) |
-          static_cast<unsigned char>(input[i + 1]);
+      const uint32_t pair = (static_cast<unsigned char>(input[i]) << 8) |
+                            static_cast<unsigned char>(input[i + 1]);
       out.push_back(kAlphabet[(pair >> 10) & 0x3F]);
       out.push_back(kAlphabet[(pair >> 4) & 0x3F]);
       out.push_back(kAlphabet[(pair & 0x0F) << 2]);
@@ -8860,11 +8979,21 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const std::string input = raw_str(arguments[0]);
     auto value_of = [](char c) -> int {
-      if (c >= 'A' && c <= 'Z') { return c - 'A'; }
-      if (c >= 'a' && c <= 'z') { return c - 'a' + 26; }
-      if (c >= '0' && c <= '9') { return c - '0' + 52; }
-      if (c == '+') { return 62; }
-      if (c == '/') { return 63; }
+      if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+      }
+      if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 26;
+      }
+      if (c >= '0' && c <= '9') {
+        return c - '0' + 52;
+      }
+      if (c == '+') {
+        return 62;
+      }
+      if (c == '/') {
+        return 63;
+      }
       return -1;
     };
     std::string out;
@@ -8872,8 +9001,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     uint32_t buffer = 0;
     int bits = 0;
     for (const char c : input) {
-      if (std::isspace(static_cast<unsigned char>(c)) != 0) { continue; }
-      if (c == '=') { break; }
+      if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+        continue;
+      }
+      if (c == '=') {
+        break;
+      }
       const int decoded = value_of(c);
       if (decoded < 0) {
         throw std::runtime_error("FROM_BASE64: invalid character in input");
@@ -8942,9 +9075,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::string input;
     input.reserve(raw_input.size());
     auto hex_digit = [](char c) -> int {
-      if (c >= '0' && c <= '9') { return c - '0'; }
-      if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-      if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+      if (c >= '0' && c <= '9') {
+        return c - '0';
+      }
+      if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+      }
+      if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+      }
       return -1;
     };
     for (size_t i = 0; i < raw_input.size(); ++i) {
@@ -9096,7 +9235,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                   .Truthy()) {
             return Value(int64_t{0});
           }
-        // NOLINTNEXTLINE(bugprone-empty-catch)
+          // NOLINTNEXTLINE(bugprone-empty-catch)
         } catch (...) {
           // incomparable element types are simply not duplicates
         }
@@ -9354,8 +9493,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         const std::string encoded = raw_str(arguments[2]);
         if (sscanf(encoded.c_str(), "%lld-%lld %lld %lld:%lld:%lld", &years,
                    &months, &days, &hours, &mins, &secs) >= 3 &&
-            years == 0 && months == 0 && hours == 0 && mins == 0 &&
-            secs == 0 && days != 0) {
+            years == 0 && months == 0 && hours == 0 && mins == 0 && secs == 0 &&
+            days != 0) {
           step_days = static_cast<int64_t>(days);
         } else {
           throw std::runtime_error(
@@ -9559,10 +9698,10 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       // ExecuteQuery, which materializes the local CTEs first.
       const bool has_own_ctes = !value.Query()->WithQueries().empty();
       std::optional<Relation> indexed =
-          has_own_ctes ? std::nullopt
-                       : ExecuteCorrelatedSingleSource(context, *value.Query(),
-                                                       scope, ctes,
-                                                       value.Exists());
+          has_own_ctes
+              ? std::nullopt
+              : ExecuteCorrelatedSingleSource(context, *value.Query(), scope,
+                                              ctes, value.Exists());
       std::optional<Relation> executed;
       const Relation* relation = indexed ? &*indexed : nullptr;
       bool uncorrelated = false;
@@ -9578,13 +9717,13 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             scope.row != nullptr && context.execution_runtime() != nullptr &&
             !StatementContainsVolatileFunction(*value.Query());
         if (apply_cacheable) {
-          correlated_apply_key = CorrelatedApplyCacheKey(
-              *value.Query(), &scope, ctes, value.Exists());
-          const auto cached_apply = context.execution_runtime()
-                                        ->correlated_apply_results.find(
-                                            correlated_apply_key);
-          if (cached_apply != context.execution_runtime()
-                                  ->correlated_apply_results.end()) {
+          correlated_apply_key = CorrelatedApplyCacheKey(*value.Query(), &scope,
+                                                         ctes, value.Exists());
+          const auto cached_apply =
+              context.execution_runtime()->correlated_apply_results.find(
+                  correlated_apply_key);
+          if (cached_apply !=
+              context.execution_runtime()->correlated_apply_results.end()) {
             correlated_apply_result = cached_apply->second;
             relation = correlated_apply_result.get();
             ++context.execution_runtime()->correlated_result_cache_hits;
@@ -9598,8 +9737,8 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         std::shared_ptr<SelectStatement> exists_query;
         const SelectStatement* execution_query = value.Query().get();
         if (value.Exists()) {
-          const bool needs_cap = !value.Query()->HasLimit() ||
-                                 value.Query()->Limit() > 1;
+          const bool needs_cap =
+              !value.Query()->HasLimit() || value.Query()->Limit() > 1;
           if (needs_cap || !value.Query()->OrderBy().empty()) {
             exists_query = std::make_shared<SelectStatement>(*value.Query());
             exists_query->SetOrderBy({});
@@ -9638,7 +9777,8 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
                 (!row.values_.empty() && row.values_[0].IsNull());
           });
           context.execution_runtime()->null_aware_anti_build_contains_null =
-              context.execution_runtime()->null_aware_anti_build_contains_null ||
+              context.execution_runtime()
+                  ->null_aware_anti_build_contains_null ||
               has_null_build_key;
         }
         const Value test =
@@ -9681,7 +9821,8 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           if (inserted) {
             cached->second.reserve(relation->TotalRows());
             row_source.ForEachRow([&](const Row& row) {
-              const Value projected = ProjectSubqueryRow(row, as_struct, &subquery_schema);
+              const Value projected =
+                  ProjectSubqueryRow(row, as_struct, &subquery_schema);
               if (collation_conflict(projected)) {
                 throw std::runtime_error(
                     "Collation conflict between the IN "
@@ -9702,7 +9843,8 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             // relation may contain NULLs that turn the miss into UNKNOWN.
             row_source.ForEachRow([&](const Row& row) {
               if (!row.values_.empty() &&
-                  ProjectSubqueryRow(row, as_struct, &subquery_schema).IsNull()) {
+                  ProjectSubqueryRow(row, as_struct, &subquery_schema)
+                      .IsNull()) {
                 saw_null = true;
               }
             });
@@ -9712,7 +9854,8 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             if (found || row.values_.empty()) {
               return;
             }
-            const Value projected = ProjectSubqueryRow(row, as_struct, &subquery_schema);
+            const Value projected =
+                ProjectSubqueryRow(row, as_struct, &subquery_schema);
             if (collation_conflict(projected)) {
               throw std::runtime_error(
                   "Collation conflict between the IN "
@@ -9738,8 +9881,9 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       if (value.ArrayResult()) {
         std::vector<Value> elements;
         row_source.ForEachRow([&](const Row& row) {
-          if (row.values_.empty()) { return;
-}
+          if (row.values_.empty()) {
+            return;
+          }
           elements.push_back(ProjectSubqueryRow(row, as_struct));
         });
         std::string element_type = value.ArrayElementSqlType();
@@ -9756,7 +9900,9 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             element_type =
                 ElementSqlTypeName(relation->schema.GetColumn(0).Type());
           }
-          if (element_type.empty()) { element_type = "INT64"; }
+          if (element_type.empty()) {
+            element_type = "INT64";
+          }
         }
         return Value::Array(std::move(elements), std::move(element_type));
       }
@@ -9933,12 +10079,12 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
     const bool virtual_value_field =
         schema.ColumnCount() == 1 &&
         (std::ranges::any_of(referenced, [&](const auto& name) {
-           if (!name.schema.empty() &&
-               !IdentifierEquals(name.schema, candidate.schema)) {
-             return false;
-           }
-           return !IdentifierEquals(name.name, candidate.name);
-         }));
+          if (!name.schema.empty() &&
+              !IdentifierEquals(name.schema, candidate.schema)) {
+            return false;
+          }
+          return !IdentifierEquals(name.name, candidate.name);
+        }));
     if (needed || virtual_value_field) {
       result.push_back(i);
     }

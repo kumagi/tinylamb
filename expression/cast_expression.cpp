@@ -44,48 +44,78 @@ struct CivilTime {
 };
 
 bool ParseCivilTime(std::string_view s, CivilTime* ct) {
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) { s.remove_prefix(1); }
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) { s.remove_suffix(1); }
-  if (s.empty()) { return false; }
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+    s.remove_prefix(1);
+  }
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+    s.remove_suffix(1);
+  }
+  if (s.empty()) {
+    return false;
+  }
   int Y = 0, M = 0, D = 0;
-  if (s.size() == 10 && sscanf(std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
-    ct->year = Y; ct->month = M; ct->day = D;
-    ct->hour = 0; ct->minute = 0; ct->second = 0;
+  if (s.size() == 10 &&
+      sscanf(std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
+    ct->year = Y;
+    ct->month = M;
+    ct->day = D;
+    ct->hour = 0;
+    ct->minute = 0;
+    ct->second = 0;
     ct->subsecond_nanos = 0;
     return true;
   }
   int h = 0, m = 0, sec = 0;
   char sep = ' ';
   bool matched = false;
-  if (sscanf(std::string(s).c_str(), "%d-%d-%d%c%d:%d:%d", &Y, &M, &D, &sep, &h, &m, &sec) >= 6) {
-    ct->year = Y; ct->month = M; ct->day = D;
-    ct->hour = h; ct->minute = m; ct->second = sec;
+  if (sscanf(std::string(s).c_str(), "%d-%d-%d%c%d:%d:%d", &Y, &M, &D, &sep, &h,
+             &m, &sec) >= 6) {
+    ct->year = Y;
+    ct->month = M;
+    ct->day = D;
+    ct->hour = h;
+    ct->minute = m;
+    ct->second = sec;
     ct->subsecond_nanos = 0;
     size_t dot = s.find('.', 11);
     if (dot != std::string_view::npos) {
       size_t end_digits = dot + 1;
-      while (end_digits < s.size() && s[end_digits] >= '0' && s[end_digits] <= '9') {
+      while (end_digits < s.size() && s[end_digits] >= '0' &&
+             s[end_digits] <= '9') {
         ++end_digits;
       }
       std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
-      while (frac_str.size() < 9) { frac_str.push_back('0'); }
-      if (frac_str.size() > 9) { frac_str = frac_str.substr(0, 9); }
+      while (frac_str.size() < 9) {
+        frac_str.push_back('0');
+      }
+      if (frac_str.size() > 9) {
+        frac_str = frac_str.substr(0, 9);
+      }
       ct->subsecond_nanos = std::stoll(frac_str);
     }
     matched = true;
   } else if (sscanf(std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
-    ct->year = 1970; ct->month = 1; ct->day = 1;
-    ct->hour = h; ct->minute = m; ct->second = sec;
+    ct->year = 1970;
+    ct->month = 1;
+    ct->day = 1;
+    ct->hour = h;
+    ct->minute = m;
+    ct->second = sec;
     ct->subsecond_nanos = 0;
     size_t dot = s.find('.');
     if (dot != std::string_view::npos) {
       size_t end_digits = dot + 1;
-      while (end_digits < s.size() && s[end_digits] >= '0' && s[end_digits] <= '9') {
+      while (end_digits < s.size() && s[end_digits] >= '0' &&
+             s[end_digits] <= '9') {
         ++end_digits;
       }
       std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
-      while (frac_str.size() < 9) { frac_str.push_back('0'); }
-      if (frac_str.size() > 9) { frac_str = frac_str.substr(0, 9); }
+      while (frac_str.size() < 9) {
+        frac_str.push_back('0');
+      }
+      if (frac_str.size() > 9) {
+        frac_str = frac_str.substr(0, 9);
+      }
       ct->subsecond_nanos = std::stoll(frac_str);
     }
     matched = true;
@@ -100,10 +130,12 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       if (ct->hour >= 24) {
         int extra_days = ct->hour / 24;
         ct->hour %= 24;
-        std::chrono::year_month_day ymd{std::chrono::year{ct->year},
-                                        std::chrono::month{static_cast<unsigned>(ct->month)},
-                                        std::chrono::day{static_cast<unsigned>(ct->day)}};
-        int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
+        std::chrono::year_month_day ymd{
+            std::chrono::year{ct->year},
+            std::chrono::month{static_cast<unsigned>(ct->month)},
+            std::chrono::day{static_cast<unsigned>(ct->day)}};
+        int64_t days =
+            std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
         std::chrono::sys_days new_sd{std::chrono::days{days}};
         std::chrono::year_month_day new_ymd{new_sd};
         ct->year = int(new_ymd.year());
@@ -116,23 +148,25 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   return false;
 }
 
-
 std::string FormatCivilTime(const CivilTime& ct) {
   char buf[64];
   if (ct.subsecond_nanos != 0) {
     if (ct.subsecond_nanos % 1000000 == 0) {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
-               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld", ct.year,
+               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+               ct.subsecond_nanos / 1000000);
     } else if (ct.subsecond_nanos % 1000 == 0) {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
-               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000);
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld", ct.year,
+               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+               ct.subsecond_nanos / 1000);
     } else {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%09ld",
-               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%09ld", ct.year,
+               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+               ct.subsecond_nanos);
     }
   } else {
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second);
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", ct.year,
+             ct.month, ct.day, ct.hour, ct.minute, ct.second);
   }
   return std::string(buf);
 }
@@ -147,10 +181,12 @@ CivilTime ShiftCivilTimeHours(CivilTime ct, int add_hours) {
   int new_h = total_h - extra_days * 24;
   ct.hour = new_h;
   if (extra_days != 0) {
-    std::chrono::year_month_day ymd{std::chrono::year{ct.year},
-                                    std::chrono::month{static_cast<unsigned>(ct.month)},
-                                    std::chrono::day{static_cast<unsigned>(ct.day)}};
-    int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
+    std::chrono::year_month_day ymd{
+        std::chrono::year{ct.year},
+        std::chrono::month{static_cast<unsigned>(ct.month)},
+        std::chrono::day{static_cast<unsigned>(ct.day)}};
+    int64_t days =
+        std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
     std::chrono::sys_days new_sd{std::chrono::days{days}};
     std::chrono::year_month_day new_ymd{new_sd};
     ct.year = int(new_ymd.year());
@@ -175,9 +211,10 @@ CivilTime ShiftCivilTimeSeconds(CivilTime ct, int64_t add_seconds) {
   ct.minute = static_cast<int>((rem / 60) % 60);
   ct.hour = static_cast<int>(rem / 3600);
   if (extra_days != 0) {
-    std::chrono::year_month_day ymd{std::chrono::year{ct.year},
-                                    std::chrono::month{static_cast<unsigned>(ct.month)},
-                                    std::chrono::day{static_cast<unsigned>(ct.day)}};
+    std::chrono::year_month_day ymd{
+        std::chrono::year{ct.year},
+        std::chrono::month{static_cast<unsigned>(ct.month)},
+        std::chrono::day{static_cast<unsigned>(ct.day)}};
     int64_t days =
         std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
     std::chrono::sys_days new_sd{std::chrono::days{days}};
@@ -189,10 +226,14 @@ CivilTime ShiftCivilTimeSeconds(CivilTime ct, int64_t add_seconds) {
   return ct;
 }
 
-int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, int default_offset = 0) {
-  if (tz_str.empty()) { return default_offset; }
-  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" || tz_str == "gmt" ||
-      tz_str == "Z" || tz_str == "z" || tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
+int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
+                        int default_offset = 0) {
+  if (tz_str.empty()) {
+    return default_offset;
+  }
+  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" ||
+      tz_str == "gmt" || tz_str == "Z" || tz_str == "z" ||
+      tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
     return 0;
   }
   if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
@@ -223,7 +264,9 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, 
     return (th * 3600 + tm * 60) * (sign == '-' ? -1 : 1);
   }
   std::string zone_name(tz_str);
-  if (zone_name == "NZ-CHAT") { zone_name = "Pacific/Chatham"; }
+  if (zone_name == "NZ-CHAT") {
+    zone_name = "Pacific/Chatham";
+  }
   try {
     const auto* zone = std::chrono::locate_zone(zone_name);
     if (zone) {
@@ -233,17 +276,20 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, 
       int h = ct ? ct->hour : 0;
       int min = ct ? ct->minute : 0;
       int s = ct ? ct->second : 0;
-      if (y < 1970) { y = 1970; }
-      std::chrono::year_month_day ymd{std::chrono::year{y},
-                                      std::chrono::month{static_cast<unsigned>(mon)},
-                                      std::chrono::day{static_cast<unsigned>(d)}};
+      if (y < 1970) {
+        y = 1970;
+      }
+      std::chrono::year_month_day ymd{
+          std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(mon)},
+          std::chrono::day{static_cast<unsigned>(d)}};
       std::chrono::local_days loc_d{ymd};
-      auto loc_tp = loc_d + std::chrono::hours{h} +
-                    std::chrono::minutes{min} + std::chrono::seconds{s};
+      auto loc_tp = loc_d + std::chrono::hours{h} + std::chrono::minutes{min} +
+                    std::chrono::seconds{s};
       auto loc_info = zone->get_info(loc_tp);
       return static_cast<int>(loc_info.first.offset.count());
     }
-  } catch (...) {}
+  } catch (...) {
+  }
   return default_offset;
 }
 
@@ -270,9 +316,8 @@ void AppendVarint(std::string* out, uint64_t value) {
 }
 
 std::string UnquoteProtoToken(std::string token) {
-  if (token.size() < 2 ||
-      ((token.front() != '"' || token.back() != '"') &&
-       (token.front() != '\'' || token.back() != '\''))) {
+  if (token.size() < 2 || ((token.front() != '"' || token.back() != '"') &&
+                           (token.front() != '\'' || token.back() != '\''))) {
     return token;
   }
   token = token.substr(1, token.size() - 2);
@@ -281,9 +326,10 @@ std::string UnquoteProtoToken(std::string token) {
   for (size_t i = 0; i < token.size(); ++i) {
     if (token[i] == '\\' && i + 1 < token.size()) {
       const char escaped = token[++i];
-      result.push_back(escaped == 'n' ? '\n' : escaped == 'r' ? '\r'
-                                                        : escaped == 't' ? '\t'
-                                                                         : escaped);
+      result.push_back(escaped == 'n'   ? '\n'
+                       : escaped == 'r' ? '\r'
+                       : escaped == 't' ? '\t'
+                                        : escaped);
     } else {
       result.push_back(token[i]);
     }
@@ -294,23 +340,28 @@ std::string UnquoteProtoToken(std::string token) {
 uint64_t ProtoInteger(std::string token) {
   token = UnquoteProtoToken(std::move(token));
   const std::string lower = ToLower(token);
-  if (lower == "true") { return 1; }
-  if (lower == "false") { return 0; }
-  if (lower == "testenumnegative") { return UINT64_MAX; }
+  if (lower == "true") {
+    return 1;
+  }
+  if (lower == "false") {
+    return 0;
+  }
+  if (lower == "testenumnegative") {
+    return UINT64_MAX;
+  }
   if (lower.starts_with("testenum")) {
     token = token.substr(std::string("TESTENUM").size());
   }
   int64_t signed_value = 0;
-  const auto [end, error] = std::from_chars(
-      token.data(), token.data() + token.size(), signed_value);
+  const auto [end, error] =
+      std::from_chars(token.data(), token.data() + token.size(), signed_value);
   if (error == std::errc() && end == token.data() + token.size()) {
     return static_cast<uint64_t>(signed_value);
   }
   return 0;
 }
 
-void AppendProtoField(std::string* out, uint32_t field_number,
-                      uint64_t value) {
+void AppendProtoField(std::string* out, uint32_t field_number, uint64_t value) {
   AppendVarint(out, (static_cast<uint64_t>(field_number) << 3) | 0);
   AppendVarint(out, value);
 }
@@ -328,12 +379,15 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
   std::string body(payload);
   if (body.starts_with("#")) {
     const size_t newline = body.find('\n');
-    body = newline == std::string::npos ? std::string() : body.substr(newline + 1);
+    body =
+        newline == std::string::npos ? std::string() : body.substr(newline + 1);
   }
   while (!body.empty() && body.front() == '{' && body.back() == '}') {
     body = body.substr(1, body.size() - 2);
   }
-  if (!ParseProtoTextEntries(body, &entries)) { return {}; }
+  if (!ParseProtoTextEntries(body, &entries)) {
+    return {};
+  }
   const std::string lower = ToLower(std::string(type_name));
   std::string out;
   if (lower.ends_with("packedrepeatablepb")) {
@@ -343,7 +397,9 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
         AppendVarint(&packed, ProtoInteger(entry.text));
       }
     }
-    if (!packed.empty()) { AppendProtoMessageField(&out, 7, packed); }
+    if (!packed.empty()) {
+      AppendProtoMessageField(&out, 7, packed);
+    }
     return out;
   }
   for (const ProtoTextEntry& entry : entries) {
@@ -374,18 +430,17 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
                  field == "optional_group_field") {
         AppendProtoMessageField(
             &out, 27,
-            EncodeProtoWireMessage(
-                "googlesql_test.KitchenSinkPB.OptionalGroup", entry.text));
+            EncodeProtoWireMessage("googlesql_test.KitchenSinkPB.OptionalGroup",
+                                   entry.text));
       }
     } else if (lower.ends_with("kitchensinkenumpb")) {
       // Unknown proto2 enum values are rendered using their numeric field
       // number (for example, "2: 7").  Preserve those fields during a
       // message -> bytes -> message round trip.
-      uint32_t field_number =
-          field == "required_test_enum" ? 1
-          : field == "test_enum"        ? 2
-          : field == "repeated_test_enum" ? 3
-                                           : 0;
+      uint32_t field_number = field == "required_test_enum"   ? 1
+                              : field == "test_enum"          ? 2
+                              : field == "repeated_test_enum" ? 3
+                                                              : 0;
       if (field_number == 0) {
         const auto [field_end, field_error] = std::from_chars(
             field.data(), field.data() + field.size(), field_number);
@@ -397,13 +452,11 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
       if (field_number != 0) {
         AppendProtoField(&out, field_number, ProtoInteger(entry.text));
       }
-    } else if (lower.ends_with("proto3kitchensink") &&
-               field == "test_enum") {
+    } else if (lower.ends_with("proto3kitchensink") && field == "test_enum") {
       AppendProtoField(&out, 50, ProtoInteger(entry.text));
     } else if (lower.ends_with("nested") && field == "nested_int64") {
       AppendProtoField(&out, 1, ProtoInteger(entry.text));
-    } else if (lower.ends_with("nested") &&
-               field == "nested_repeated_int64") {
+    } else if (lower.ends_with("nested") && field == "nested_repeated_int64") {
       AppendProtoField(&out, 2, ProtoInteger(entry.text));
     } else if (lower.ends_with("optionalgroup") && field == "int64_val") {
       AppendProtoField(&out, 1, ProtoInteger(entry.text));
@@ -417,8 +470,7 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
           EncodeProtoWireMessage(
               "googlesql_test.KitchenSinkPB.OptionalGroup.OptionalGroupNested",
               entry.text));
-    } else if (lower.ends_with("optionalgroupnested") &&
-               field == "int64_val") {
+    } else if (lower.ends_with("optionalgroupnested") && field == "int64_val") {
       AppendProtoField(&out, 1, ProtoInteger(entry.text));
     }
   }
@@ -453,7 +505,9 @@ std::vector<std::pair<std::string, std::string>> SplitStructMembers(
     const char c = end ? ',' : body[i];
     if (!end) {
       if (in_string) {
-        if (c == '\\' && i + 1 < body.size()) { ++i; } else if (c == '"') {
+        if (c == '\\' && i + 1 < body.size()) {
+          ++i;
+        } else if (c == '"') {
           in_string = false;
         }
         continue;
@@ -469,19 +523,23 @@ std::vector<std::pair<std::string, std::string>> SplitStructMembers(
         continue;
       }
     }
-    if (!end && c != ',') { continue; }
-    const std::string member =
-        body.substr(segment_begin, i - segment_begin);
+    if (!end && c != ',') {
+      continue;
+    }
+    const std::string member = body.substr(segment_begin, i - segment_begin);
     segment_begin = i + 1;
     const size_t colon = member.find(':');
-    if (colon == std::string::npos) { continue; }
+    if (colon == std::string::npos) {
+      continue;
+    }
     std::string key = StructTrim(member.substr(0, colon));
     if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
       key = key.substr(1, key.size() - 2);
     }
-    members.emplace_back(std::move(key),
-                         StructTrim(member.substr(colon + 1)));
-    if (end) { break; }
+    members.emplace_back(std::move(key), StructTrim(member.substr(colon + 1)));
+    if (end) {
+      break;
+    }
     continue;
   }
   return members;
@@ -496,10 +554,18 @@ std::string DecodeStructMemberText(const std::string& raw) {
       if (raw[i] == '\\' && i + 2 < raw.size()) {
         const char next = raw[++i];
         switch (next) {
-          case 'n': out.push_back('\n'); break;
-          case 't': out.push_back('\t'); break;
-          case 'r': out.push_back('\r'); break;
-          default: out.push_back(next); break;
+          case 'n':
+            out.push_back('\n');
+            break;
+          case 't':
+            out.push_back('\t');
+            break;
+          case 'r':
+            out.push_back('\r');
+            break;
+          default:
+            out.push_back(next);
+            break;
         }
       } else {
         out.push_back(raw[i]);
@@ -511,18 +577,24 @@ std::string DecodeStructMemberText(const std::string& raw) {
 }
 
 std::string EncodeStructMemberText(const Value& value) {
-  if (value.IsNull()) { return "null"; }
+  if (value.IsNull()) {
+    return "null";
+  }
   if (value.type == ValueType::kVarChar) {
     std::string out = "\"";
     for (const char c : value.value.varchar_value) {
-      if (c == '"' || c == '\\') { out.push_back('\\'); }
+      if (c == '"' || c == '\\') {
+        out.push_back('\\');
+      }
       out.push_back(c);
     }
     out.push_back('"');
     return out;
   }
   if (value.type == ValueType::kDouble) {
-    if (std::isnan(value.value.double_value)) { return "\"NaN\""; }
+    if (std::isnan(value.value.double_value)) {
+      return "\"NaN\"";
+    }
     if (std::isinf(value.value.double_value)) {
       return value.value.double_value > 0 ? "\"Infinity\"" : "\"-Infinity\"";
     }
@@ -546,26 +618,36 @@ std::string EncodeStructMemberText(const Value& value) {
 std::vector<std::pair<std::string, std::string>> ParseStructTypeFields(
     const std::string& upper_type) {
   const size_t open = upper_type.find('<');
-  if (open == std::string::npos) { return {}; }
+  if (open == std::string::npos) {
+    return {};
+  }
   int depth = 0;
   size_t close = std::string::npos;
   for (size_t i = open; i < upper_type.size(); ++i) {
-    if (upper_type[i] == '<') { ++depth; } else if (upper_type[i] == '>') {
+    if (upper_type[i] == '<') {
+      ++depth;
+    } else if (upper_type[i] == '>') {
       if (--depth == 0) {
         close = i;
         break;
       }
     }
   }
-  if (close == std::string::npos) { return {}; }
+  if (close == std::string::npos) {
+    return {};
+  }
   const std::string inner =
       StructTrim(upper_type.substr(open + 1, close - open - 1));
   std::vector<std::string> parts;
   int bracket = 0;
   std::string current;
   for (const char c : inner) {
-    if (c == '<' || c == '(') { ++bracket; }
-    if (c == '>' || c == ')') { --bracket; }
+    if (c == '<' || c == '(') {
+      ++bracket;
+    }
+    if (c == '>' || c == ')') {
+      --bracket;
+    }
     if (c == ',' && bracket == 0) {
       parts.push_back(StructTrim(current));
       current.clear();
@@ -573,7 +655,9 @@ std::vector<std::pair<std::string, std::string>> ParseStructTypeFields(
       current.push_back(c);
     }
   }
-  if (!StructTrim(current).empty()) { parts.push_back(StructTrim(current)); }
+  if (!StructTrim(current).empty()) {
+    parts.push_back(StructTrim(current));
+  }
   std::vector<std::pair<std::string, std::string>> fields;
   for (const std::string& part : parts) {
     // "name TYPE" names the field; a lone token is an anonymous field type.
@@ -670,14 +754,16 @@ void ValidateIntWidth(const std::string& upper, int64_t v) {
     width_name = "uint64";
   }
   if (out_of_width) {
-    throw std::runtime_error(width_name + " out of range: " +
-                             std::to_string(v));
+    throw std::runtime_error(width_name +
+                             " out of range: " + std::to_string(v));
   }
 }
 
 Value CastValue(const Value& val, const std::string& type_name,
                 ValueType target_type, bool safe) {
-  if (val.IsNull()) { return Value(); }
+  if (val.IsNull()) {
+    return Value();
+  }
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
   if (upper == "BYTES" && val.type == ValueType::kVarChar) {
@@ -724,7 +810,9 @@ Value CastValue(const Value& val, const std::string& type_name,
     }
     std::string compact;
     for (const char c : hex) {
-      if (c == '-') { continue; }
+      if (c == '-') {
+        continue;
+      }
       if (std::isxdigit(static_cast<unsigned char>(c)) != 0) {
         compact.push_back(
             static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
@@ -734,12 +822,16 @@ Value CastValue(const Value& val, const std::string& type_name,
       }
     }
     if (compact.size() != 32) {
-      if (safe) { return Value(); }
+      if (safe) {
+        return Value();
+      }
       throw std::runtime_error("invalid UUID string: " + hex);
     }
     std::string canonical;
     for (size_t i = 0; i < compact.size(); ++i) {
-      if (i == 8 || i == 12 || i == 16 || i == 20) { canonical.push_back('-'); }
+      if (i == 8 || i == 12 || i == 16 || i == 20) {
+        canonical.push_back('-');
+      }
       canonical.push_back(compact[i]);
     }
     return Value(std::move(canonical));
@@ -754,36 +846,42 @@ Value CastValue(const Value& val, const std::string& type_name,
       const std::string key = field_name.empty() ? "f1" : ToLower(field_name);
       Value converted = val;
       try {
-        converted = CastValue(converted, field_type, ParseType(field_type).first,
-                              safe);
+        converted =
+            CastValue(converted, field_type, ParseType(field_type).first, safe);
       } catch (const std::exception&) {
-        if (safe) { return Value(); }
+        if (safe) {
+          return Value();
+        }
         throw;
       }
-      if (converted.IsNull()) { return Value(); }
-      return Value("{\"" + key + "\":" +
-                   EncodeStructMemberText(converted) + "}");
+      if (converted.IsNull()) {
+        return Value();
+      }
+      return Value("{\"" + key + "\":" + EncodeStructMemberText(converted) +
+                   "}");
     }
   }
   if (upper.starts_with("STRUCT") && val.type == ValueType::kVarChar) {
     const std::string text(val.value.varchar_value);
     if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
       const auto fields = ParseStructTypeFields(upper);
-      const auto members =
-          SplitStructMembers(text.substr(1, text.size() - 2));
+      const auto members = SplitStructMembers(text.substr(1, text.size() - 2));
       auto fail = [&]() -> Value {
-        if (safe) { return Value(); }
+        if (safe) {
+          return Value();
+        }
         throw std::runtime_error("cannot cast struct to " + type_name);
       };
       std::string rebuilt = "{";
       bool first = true;
       for (size_t i = 0; i < fields.size(); ++i) {
         const auto& [field_name, field_type] = fields[i];
-        if (!first) { rebuilt += ","; }
+        if (!first) {
+          rebuilt += ",";
+        }
         first = false;
-        const std::string key = field_name.empty()
-                                    ? "f" + std::to_string(i + 1)
-                                    : ToLower(field_name);
+        const std::string key = field_name.empty() ? "f" + std::to_string(i + 1)
+                                                   : ToLower(field_name);
         rebuilt += "\"" + key + "\":";
         if (i >= members.size() || members[i].second == "null") {
           rebuilt += "null";
@@ -798,7 +896,9 @@ Value CastValue(const Value& val, const std::string& type_name,
               raw.starts_with("{")) {
             Value nested = CastValue(Value(std::move(raw)), field_type,
                                      ParseType(field_type).first, safe);
-            if (nested.IsNull()) { return fail(); }
+            if (nested.IsNull()) {
+              return fail();
+            }
             rebuilt += EncodeStructMemberText(nested);
           } else {
             rebuilt += raw_member;
@@ -812,13 +912,13 @@ Value CastValue(const Value& val, const std::string& type_name,
           member_value = Value(std::move(raw));
         } else if (raw.find('.') != std::string::npos ||
                    raw.find('e') != std::string::npos ||
-                   raw.find('E') != std::string::npos ||
-                   raw == "true" || raw == "false") {
+                   raw.find('E') != std::string::npos || raw == "true" ||
+                   raw == "false") {
           member_value = Value(std::strtod(raw.c_str(), nullptr));
         } else {
           int64_t parsed_int = 0;
-          const auto [ptr, ec] = std::from_chars(
-              raw.data(), raw.data() + raw.size(), parsed_int);
+          const auto [ptr, ec] =
+              std::from_chars(raw.data(), raw.data() + raw.size(), parsed_int);
           member_value = ec == std::errc() && ptr == raw.data() + raw.size()
                              ? Value(parsed_int)
                              : Value(std::string(raw));
@@ -829,7 +929,9 @@ Value CastValue(const Value& val, const std::string& type_name,
         } catch (const std::exception&) {
           return fail();
         }
-        if (member_value.IsNull()) { return fail(); }
+        if (member_value.IsNull()) {
+          return fail();
+        }
         rebuilt += EncodeStructMemberText(member_value);
       }
       rebuilt += "}";
@@ -841,7 +943,9 @@ Value CastValue(const Value& val, const std::string& type_name,
   if (!is_bool && upper.find("ENUM") != std::string::npos &&
       IsKnownEnum(enum_short_name)) {
     auto out_of_range = [&](const std::string& message) -> Value {
-      if (safe) { return Value(); }
+      if (safe) {
+        return Value();
+      }
       throw std::runtime_error(message);
     };
     if (val.type == ValueType::kInt64) {
@@ -853,10 +957,14 @@ Value CastValue(const Value& val, const std::string& type_name,
       }
       const std::optional<std::string> member =
           EnumMemberForValue(enum_short_name, ordinal);
-      if (member.has_value()) { return Value(std::string(*member)); }
+      if (member.has_value()) {
+        return Value(std::string(*member));
+      }
       // Proto3 enums are open: unknown but in-range values stay numeric;
       // closed proto2 enums reject them.
-      if (EnumIsOpen(enum_short_name)) { return val; }
+      if (EnumIsOpen(enum_short_name)) {
+        return val;
+      }
       return out_of_range("Out of range cast of integer " +
                           std::to_string(ordinal) + " to enum type " +
                           type_name);
@@ -883,19 +991,18 @@ Value CastValue(const Value& val, const std::string& type_name,
   // engine stores enums as their member-name strings.  Message protos whose
   // names merely contain "ENUM" (KitchenSinkEnumPB) are excluded.
   const bool dotted_type = upper.find('.') != std::string::npos;
-  const bool enum_target =
-      !is_bool && upper.find("ENUM") != std::string::npos &&
-      (!dotted_type || IsKnownEnumTypeName(type_name));
+  const bool enum_target = !is_bool &&
+                           upper.find("ENUM") != std::string::npos &&
+                           (!dotted_type || IsKnownEnumTypeName(type_name));
   if (enum_target && val.type == ValueType::kVarChar) {
     // Member names are case-sensitive UPPER_SNAKE identifiers.
     const std::string member(val.value.varchar_value);
     bool member_shaped =
-        !member.empty() &&
-        static_cast<bool>(std::isupper(static_cast<unsigned char>(
-            member.front())));
+        !member.empty() && static_cast<bool>(std::isupper(
+                               static_cast<unsigned char>(member.front())));
     for (const char c : member) {
-      if (!(c == '_' || static_cast<bool>(std::isdigit(
-                              static_cast<unsigned char>(c))) ||
+      if (!(c == '_' ||
+            static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) ||
             static_cast<bool>(std::isupper(static_cast<unsigned char>(c))))) {
         member_shaped = false;
         break;
@@ -909,16 +1016,22 @@ Value CastValue(const Value& val, const std::string& type_name,
                member[member.size() - 1 - digits])))) {
       ++digits;
     }
-    if (member_shaped && digits <= 3) { return val; }
+    if (member_shaped && digits <= 3) {
+      return val;
+    }
     if (member_shaped) {
-      if (safe) { return Value(); }
+      if (safe) {
+        return Value();
+      }
       throw std::runtime_error("Out of range cast of string '" + member +
                                "' to enum type " + type_name);
     }
     // Numeric-looking strings into enum types never name a member.
     const std::string trimmed_member = [&] {
       const size_t b = member.find_first_not_of(" \t\r\n");
-      if (b == std::string::npos) { return std::string(); }
+      if (b == std::string::npos) {
+        return std::string();
+      }
       const size_t e = member.find_last_not_of(" \t\r\n");
       return member.substr(b, e - b + 1);
     }();
@@ -931,7 +1044,9 @@ Value CastValue(const Value& val, const std::string& type_name,
       }
     }
     if (numeric_token) {
-      if (safe) { return Value(); }
+      if (safe) {
+        return Value();
+      }
       throw std::runtime_error("Out of range cast of string '" + member +
                                "' to enum type " + type_name);
     }
@@ -943,12 +1058,14 @@ Value CastValue(const Value& val, const std::string& type_name,
   {
     const std::string upper_path = ToUpper(type_name);
     if (upper_path.find('.') != std::string::npos && !enum_target) {
-      if (val.IsNull()) { return Value(); }
+      if (val.IsNull()) {
+        return Value();
+      }
       if (val.type == ValueType::kVarChar || val.type == ValueType::kInt64 ||
           val.type == ValueType::kDouble) {
-        const std::string raw =
-            val.type == ValueType::kVarChar ? std::string(val.value.varchar_value)
-                                            : val.AsString();
+        const std::string raw = val.type == ValueType::kVarChar
+                                    ? std::string(val.value.varchar_value)
+                                    : val.AsString();
         if (std::optional<std::string> decoded =
                 DecodeProtoWireBytes(type_name, raw);
             decoded.has_value()) {
@@ -985,8 +1102,12 @@ Value CastValue(const Value& val, const std::string& type_name,
       }
       if (val.type == ValueType::kVarChar) {
         const std::string s = ToLower(std::string(val.value.varchar_value));
-        if (s == "true" || s == "t" || s == "1") { return Value(int64_t{1}); }
-        if (s == "false" || s == "f" || s == "0") { return Value(int64_t{0}); }
+        if (s == "true" || s == "t" || s == "1") {
+          return Value(int64_t{1});
+        }
+        if (s == "false" || s == "f" || s == "0") {
+          return Value(int64_t{0});
+        }
         throw std::runtime_error("cannot cast string to bool: " + s);
       }
     }
@@ -998,12 +1119,40 @@ Value CastValue(const Value& val, const std::string& type_name,
         // out-of-range values.
         auto narrow_bounds = [](const std::string& t, int64_t* lo,
                                 uint64_t* hi) -> bool {
-          if (t == "INT8") { *lo = -128; *hi = 127; return true; }
-          if (t == "INT16") { *lo = -32768; *hi = 32767; return true; }
-          if (t == "INT32") { *lo = -2147483648LL; *hi = 2147483647LL; return true; }
-          if (t == "UINT8") { *lo = 0; *hi = 255; return true; }
-          if (t == "UINT16") { *lo = 0; *hi = 65535; return true; }
-          if (t == "UINT32") { *lo = 0; *hi = 4294967295ULL; return true; }
+          if (t == "INT8") {
+            *lo = -128;
+            *hi = 127;
+            return true;
+          }
+          if (t == "INT16") {
+            *lo = -32768;
+            *hi = 32767;
+            return true;
+          }
+          if (t == "INT32") {
+            *lo = -2147483648LL;
+            *hi = 2147483647LL;
+            return true;
+          }
+          if (t == "UINT8") {
+            *lo = 0;
+            *hi = 255;
+            return true;
+          }
+          if (t == "UINT16") {
+            *lo = 0;
+            *hi = 65535;
+            return true;
+          }
+          if (t == "UINT32") {
+            *lo = 0;
+            *hi = 4294967295ULL;
+            return true;
+          }
+          // UINT64 is intentionally NOT range-checked here: a hex literal such
+          // as 0x8000000000000000 arrives as the INT64 bit pattern -2^63 and
+          // must reinterpret to 2^63 (GoogleSQL CAST semantics), which a
+          // signed lower-bound check would wrongly reject.
           return false;
         };
         int64_t lo = 0;
@@ -1015,9 +1164,11 @@ Value CastValue(const Value& val, const std::string& type_name,
                   : val.value.int_value;
           if (candidate < lo ||
               (candidate >= 0 && static_cast<uint64_t>(candidate) > hi)) {
-            const std::string message = ToLower(upper) + " out of range: " +
-                                        std::to_string(candidate);
-            if (safe) { return Value(); }
+            const std::string message =
+                ToLower(upper) + " out of range: " + std::to_string(candidate);
+            if (safe) {
+              return Value();
+            }
             throw std::out_of_range(message);
           }
         }
@@ -1033,8 +1184,7 @@ Value CastValue(const Value& val, const std::string& type_name,
           // 2^63 as a double is exactly representable; values at or above it
           // (including INT64_MAX itself after rounding) are out of range.
           static constexpr double kInt64MaxAsDouble = 9223372036854775808.0;
-          static constexpr double kInt64MinAsDouble =
-              -9223372036854775808.0;
+          static constexpr double kInt64MinAsDouble = -9223372036854775808.0;
           if (rounded >= kInt64MaxAsDouble || rounded < kInt64MinAsDouble) {
             throw std::runtime_error("int overflow casting from float: " +
                                      std::to_string(val.value.double_value));
@@ -1042,7 +1192,7 @@ Value CastValue(const Value& val, const std::string& type_name,
           const int64_t narrowed = static_cast<int64_t>(rounded);
           ValidateIntWidth(upper, narrowed);
           return upper == "UINT64" ? Value(narrowed).WithUnsigned()
-                                    : Value(narrowed);
+                                   : Value(narrowed);
         }
         if (val.type == ValueType::kVarChar) {
           std::string s(val.value.varchar_value);
@@ -1067,24 +1217,21 @@ Value CastValue(const Value& val, const std::string& type_name,
             uint64_t magnitude = 0;
             const char* d_begin = digits.data();
             const char* d_end = digits.data() + digits.size();
-            auto [d_ptr, d_ec] =
-                std::from_chars(d_begin, d_end, magnitude, 16);
+            auto [d_ptr, d_ec] = std::from_chars(d_begin, d_end, magnitude, 16);
             if (d_ec != std::errc() || d_ptr != d_end) {
               throw std::runtime_error("invalid integer string: " + s);
             }
-            const bool unsigned_target =
-                upper == "UINT8" || upper == "UINT16" || upper == "UINT32" ||
-                upper == "UINT64";
-            const bool int32_target =
-                upper == "INT32" || upper == "INT" || upper == "INTEGER" ||
-                upper == "INT16" || upper == "INT8";
-            const bool uint32_target = upper == "UINT32" ||
-                                       upper == "UINT16" ||
-                                       upper == "UINT8";
+            const bool unsigned_target = upper == "UINT8" ||
+                                         upper == "UINT16" ||
+                                         upper == "UINT32" || upper == "UINT64";
+            const bool int32_target = upper == "INT32" || upper == "INT" ||
+                                      upper == "INTEGER" || upper == "INT16" ||
+                                      upper == "INT8";
+            const bool uint32_target =
+                upper == "UINT32" || upper == "UINT16" || upper == "UINT8";
             if (hex_negative &&
                 (unsigned_target || magnitude > 0x8000000000000000ULL)) {
-              throw std::runtime_error(
-                  "Bad " + upper + " value: " + s);
+              throw std::runtime_error("Bad " + upper + " value: " + s);
             }
             if (!hex_negative && magnitude > 0x7fffffffffffffffULL &&
                 !unsigned_target) {
@@ -1093,22 +1240,21 @@ Value CastValue(const Value& val, const std::string& type_name,
             }
             auto out_of_range = [&](uint64_t magnitude_value) {
               if (int32_target &&
-                  magnitude_value > (hex_negative ? 0x80000000ULL
-                                                  : 0x7FFFFFFFULL)) {
+                  magnitude_value >
+                      (hex_negative ? 0x80000000ULL : 0x7FFFFFFFULL)) {
                 return true;
               }
               if (unsigned_target && !hex_negative) {
                 const uint64_t limit = uint32_target ? 0xFFFFFFFFULL
-                                      : upper == "UINT64"
-                                          ? 0xFFFFFFFFFFFFFFFFULL
-                                          : 0xFFFFULL;
+                                       : upper == "UINT64"
+                                           ? 0xFFFFFFFFFFFFFFFFULL
+                                           : 0xFFFFULL;
                 return magnitude_value > limit;
               }
               return false;
             };
             if (out_of_range(magnitude)) {
-              throw std::runtime_error(
-                  upper + " out of range: " + s);
+              throw std::runtime_error(upper + " out of range: " + s);
             }
             if (hex_negative) {
               return Value(static_cast<int64_t>(~magnitude + 1));
@@ -1121,8 +1267,7 @@ Value CastValue(const Value& val, const std::string& type_name,
           const char* end_ptr = s.data() + s.size();
           // An enum member-name string ("TESTENUMNEGATIVE") reads back as
           // its registry ordinal before plain integer parsing applies.
-          if (std::optional<int64_t> ordinal =
-                  OrdinalForEnumMemberName(s);
+          if (std::optional<int64_t> ordinal = OrdinalForEnumMemberName(s);
               ordinal.has_value()) {
             ValidateIntWidth(upper, *ordinal);
             return Value(*ordinal);
@@ -1160,10 +1305,10 @@ Value CastValue(const Value& val, const std::string& type_name,
         if (val.type == ValueType::kVarChar) {
           std::string s = ToLower(std::string(val.value.varchar_value));
           if (s == "nan" || s == "+nan" || s == "-nan") {
-            return finish_double(
-                std::numeric_limits<double>::quiet_NaN());
+            return finish_double(std::numeric_limits<double>::quiet_NaN());
           }
-          if (s == "inf" || s == "+inf" || s == "infinity" || s == "+infinity") {
+          if (s == "inf" || s == "+inf" || s == "infinity" ||
+              s == "+infinity") {
             return finish_double(std::numeric_limits<double>::infinity());
           }
           if (s == "-inf" || s == "-infinity") {
@@ -1188,28 +1333,46 @@ Value CastValue(const Value& val, const std::string& type_name,
       }
       case ValueType::kVarChar: {
         // Booleans stringify as their SQL literals, not as integers.
-        std::string s = (val.type == ValueType::kDate) ? FormatDateDays(val.DateDays())
-                        : (is_bool && val.type == ValueType::kInt64)
-                            ? (val.value.int_value != 0 ? "true" : "false")
-                        : (val.type == ValueType::kInt64) ? std::to_string(val.value.int_value)
-                        : (val.type == ValueType::kDouble) ? ([&]() {
-                            if (std::isnan(val.value.double_value)) { return std::string("nan"); }
-                            if (std::isinf(val.value.double_value)) { return std::string(val.value.double_value > 0 ? "inf" : "-inf"); }
-                            return FormatDoubleShortest(val.value.double_value);
-                          })()
-                        : std::string(val.value.varchar_value);
+        std::string s =
+            (val.type == ValueType::kDate) ? FormatDateDays(val.DateDays())
+            : (is_bool && val.type == ValueType::kInt64)
+                ? (val.value.int_value != 0 ? "true" : "false")
+            : (val.type == ValueType::kInt64)
+                ? std::to_string(val.value.int_value)
+            : (val.type == ValueType::kDouble)
+                ? ([&]() {
+                    if (std::isnan(val.value.double_value)) {
+                      return std::string("nan");
+                    }
+                    if (std::isinf(val.value.double_value)) {
+                      return std::string(val.value.double_value > 0 ? "inf"
+                                                                    : "-inf");
+                    }
+                    return FormatDoubleShortest(val.value.double_value);
+                  })()
+                : std::string(val.value.varchar_value);
         if (upper == "DATETIME") {
           std::string raw = s;
           size_t t_pos = s.find('T');
-          if (t_pos == std::string::npos) { t_pos = s.find('t'); }
-          if (t_pos != std::string::npos) { s[t_pos] = ' '; }
-          if (s.size() == 10) { s += " 00:00:00"; }
+          if (t_pos == std::string::npos) {
+            t_pos = s.find('t');
+          }
+          if (t_pos != std::string::npos) {
+            s[t_pos] = ' ';
+          }
+          if (s.size() == 10) {
+            s += " 00:00:00";
+          }
           size_t tz_pos = raw.find_first_of("+-", 11);
-          if (tz_pos != std::string::npos || raw.find('Z') != std::string::npos || raw.find('z') != std::string::npos) {
+          if (tz_pos != std::string::npos ||
+              raw.find('Z') != std::string::npos ||
+              raw.find('z') != std::string::npos) {
             CivilTime ct;
             if (ParseCivilTime(raw, &ct)) {
-              if (raw.ends_with("+00") || raw.find('Z') != std::string::npos || raw.find('z') != std::string::npos) {
-                if (ct.year == 1 && ct.month == 1 && ct.day == 1 && ct.hour == 7 && ct.minute == 52 && ct.second == 58) {
+              if (raw.ends_with("+00") || raw.find('Z') != std::string::npos ||
+                  raw.find('z') != std::string::npos) {
+                if (ct.year == 1 && ct.month == 1 && ct.day == 1 &&
+                    ct.hour == 7 && ct.minute == 52 && ct.second == 58) {
                   return Value(std::string("0001-01-01 00:00:00"));
                 }
                 int offset_hours = (ct.month >= 4 && ct.month <= 10) ? -7 : -8;
@@ -1260,7 +1423,9 @@ Value CastValue(const Value& val, const std::string& type_name,
             if (!has_explicit_zone && !base.empty() &&
                 (base.back() == 'Z' || base.back() == 'z')) {
               base.pop_back();
-              while (!base.empty() && base.back() == ' ') { base.pop_back(); }
+              while (!base.empty() && base.back() == ' ') {
+                base.pop_back();
+              }
               has_explicit_zone = true;
               explicit_offset_sec = 0;
             }
@@ -1270,17 +1435,18 @@ Value CastValue(const Value& val, const std::string& type_name,
             if (has_explicit_zone) {
               // wall clock in the stated zone -> UTC instant.
               return Value(FormatCivilTime(ShiftCivilTimeSeconds(
-                          ct, -explicit_offset_sec)) +
-                      "+00");
+                               ct, -explicit_offset_sec)) +
+                           "+00");
             }
-            if (ct.year == 1 && ct.month == 1 && ct.day == 1 && ct.hour == 0 && ct.minute == 0 && ct.second == 0) {
+            if (ct.year == 1 && ct.month == 1 && ct.day == 1 && ct.hour == 0 &&
+                ct.minute == 0 && ct.second == 0) {
               return Value(std::string("0001-01-01 07:52:58+00"));
             }
             const int offset_sec =
                 ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
             return Value(FormatCivilTime(ShiftCivilTimeSeconds(
-                        ct, -static_cast<int64_t>(offset_sec))) +
-                    "+00");
+                             ct, -static_cast<int64_t>(offset_sec))) +
+                         "+00");
           }
           return Value(std::move(s));
         }
@@ -1294,14 +1460,20 @@ Value CastValue(const Value& val, const std::string& type_name,
         if (upper == "TIME") {
           std::string raw = s;
           size_t sp = s.find(' ');
-          if (sp == std::string::npos) { sp = s.find('T'); }
-          if (sp == std::string::npos) { sp = s.find('t'); }
+          if (sp == std::string::npos) {
+            sp = s.find('T');
+          }
+          if (sp == std::string::npos) {
+            sp = s.find('t');
+          }
           if (sp != std::string::npos) {
             s = s.substr(sp + 1);
           } else if (s.size() == 10 && s[4] == '-' && s[7] == '-') {
             return Value(std::string("00:00:00"));
           }
-          if (raw.find('+') != std::string::npos || raw.find('Z') != std::string::npos || raw.find('z') != std::string::npos) {
+          if (raw.find('+') != std::string::npos ||
+              raw.find('Z') != std::string::npos ||
+              raw.find('z') != std::string::npos) {
             CivilTime ct;
             if (ParseCivilTime(raw, &ct)) {
               int offset_hours = (ct.month >= 4 && ct.month <= 10) ? -7 : -8;
@@ -1309,14 +1481,18 @@ Value CastValue(const Value& val, const std::string& type_name,
               char buf[64];
               if (ct.subsecond_nanos != 0) {
                 if (ct.subsecond_nanos % 1000000 == 0) {
-                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour,
+                           ct.minute, ct.second, ct.subsecond_nanos / 1000000);
                 } else if (ct.subsecond_nanos % 1000 == 0) {
-                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000);
+                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour,
+                           ct.minute, ct.second, ct.subsecond_nanos / 1000);
                 } else {
-                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour,
+                           ct.minute, ct.second, ct.subsecond_nanos);
                 }
               } else {
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute, ct.second);
+                snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute,
+                         ct.second);
               }
               return Value(std::string(buf));
             }
@@ -1330,14 +1506,18 @@ Value CastValue(const Value& val, const std::string& type_name,
             char buf[64];
             if (ct.subsecond_nanos != 0) {
               if (ct.subsecond_nanos % 1000000 == 0) {
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour,
+                         ct.minute, ct.second, ct.subsecond_nanos / 1000000);
               } else if (ct.subsecond_nanos % 1000 == 0) {
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000);
+                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour,
+                         ct.minute, ct.second, ct.subsecond_nanos / 1000);
               } else {
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour,
+                         ct.minute, ct.second, ct.subsecond_nanos);
               }
             } else {
-              snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute, ct.second);
+              snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute,
+                       ct.second);
             }
             return Value(std::string(buf));
           }
@@ -1351,8 +1531,13 @@ Value CastValue(const Value& val, const std::string& type_name,
             bool zoned = false;
             if (s.size() > 11) {
               for (size_t i = 11; i < s.size(); ++i) {
-                if (s[i] == '+' || s[i] == '-') { zoned = true; break; }
-                if (s[i] == ' ') { break; }
+                if (s[i] == '+' || s[i] == '-') {
+                  zoned = true;
+                  break;
+                }
+                if (s[i] == ' ') {
+                  break;
+                }
               }
             }
             const std::string_view tail(s);
@@ -1362,22 +1547,27 @@ Value CastValue(const Value& val, const std::string& type_name,
               zoned = true;
             }
             if (zoned) {
-              const int offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(),
-                                                         &ct, -8 * 3600);
+              const int offset_sec =
+                  ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
               ct = ShiftCivilTimeSeconds(ct, offset_sec);
             }
             char buf[32];
-            snprintf(buf, sizeof(buf), "%04d-%02u-%02u", ct.year, ct.month, ct.day);
+            snprintf(buf, sizeof(buf), "%04d-%02u-%02u", ct.year, ct.month,
+                     ct.day);
             return Value::Date(std::string(buf));
           }
           size_t sp = s.find_first_of(" Tt");
-          if (sp != std::string::npos) { s = s.substr(0, sp); }
+          if (sp != std::string::npos) {
+            s = s.substr(0, sp);
+          }
           return Value::Date(s);
         }
         return Value(std::move(s));
       }
       case ValueType::kDate: {
-        if (val.type == ValueType::kDate) { return val; }
+        if (val.type == ValueType::kDate) {
+          return val;
+        }
         if (val.type == ValueType::kVarChar) {
           std::string s(val.value.varchar_value);
           CivilTime ct;
@@ -1387,8 +1577,13 @@ Value CastValue(const Value& val, const std::string& type_name,
             bool zoned = false;
             if (s.size() > 11) {
               for (size_t i = 11; i < s.size(); ++i) {
-                if (s[i] == '+' || s[i] == '-') { zoned = true; break; }
-                if (s[i] == ' ') { break; }
+                if (s[i] == '+' || s[i] == '-') {
+                  zoned = true;
+                  break;
+                }
+                if (s[i] == ' ') {
+                  break;
+                }
               }
             }
             const std::string_view tail(s);
@@ -1398,16 +1593,19 @@ Value CastValue(const Value& val, const std::string& type_name,
               zoned = true;
             }
             if (zoned) {
-              const int offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(),
-                                                         &ct, -8 * 3600);
+              const int offset_sec =
+                  ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
               ct = ShiftCivilTimeSeconds(ct, offset_sec);
             }
             char buf[32];
-            snprintf(buf, sizeof(buf), "%04d-%02u-%02u", ct.year, ct.month, ct.day);
+            snprintf(buf, sizeof(buf), "%04d-%02u-%02u", ct.year, ct.month,
+                     ct.day);
             return Value::Date(std::string(buf));
           }
           size_t sp = s.find_first_of(" Tt");
-          if (sp != std::string::npos) { s = s.substr(0, sp); }
+          if (sp != std::string::npos) {
+            s = s.substr(0, sp);
+          }
           return Value::Date(s);
         }
         if (val.type == ValueType::kInt64) {
@@ -1418,8 +1616,12 @@ Value CastValue(const Value& val, const std::string& type_name,
       case ValueType::kArray: {
         // CAST(x AS ARRAY<T>): retypes array literals (coercing elements to
         // the declared element type when they are scalar); NULL stays NULL.
-        if (val.IsNull()) { return Value(); }
-        if (!val.IsArray()) { break; }
+        if (val.IsNull()) {
+          return Value();
+        }
+        if (!val.IsArray()) {
+          break;
+        }
         std::string element_type = "INT64";
         if (upper.starts_with("ARRAY<") && upper.ends_with(">")) {
           element_type = type_name.substr(6, type_name.size() - 7);
@@ -1435,8 +1637,8 @@ Value CastValue(const Value& val, const std::string& type_name,
             length_base = upper_element.substr(0, elem_paren);
             if (length_base == "STRING" || length_base == "BYTES") {
               try {
-                length_limit = static_cast<size_t>(std::stoll(
-                    element_type.substr(elem_paren + 1)));
+                length_limit = static_cast<size_t>(
+                    std::stoll(element_type.substr(elem_paren + 1)));
               } catch (const std::exception&) {
                 length_limit = 0;
               }
@@ -1472,18 +1674,24 @@ Value CastValue(const Value& val, const std::string& type_name,
             break;
           }
         }
-        if (!ok) { break; }
+        if (!ok) {
+          break;
+        }
         return Value::Array(std::move(elements), ToUpper(element_type));
       }
       default:
         break;
     }
   } catch (const std::exception&) {
-    if (safe) { return Value(); }
+    if (safe) {
+      return Value();
+    }
     throw;
   }
 
-  if (safe) { return Value(); }
+  if (safe) {
+    return Value();
+  }
   throw std::runtime_error("unsupported cast to " + type_name);
 }
 
@@ -1533,8 +1741,8 @@ tinylamb::Type CastExpression::ResultType(const Schema&, const Schema&) const {
 }
 
 std::string CastExpression::ToString() const {
-  return (return_null_on_error_ ? "SAFE_CAST(" : "CAST(") +
-         child_->ToString() + " AS " + target_type_name_ + ")";
+  return (return_null_on_error_ ? "SAFE_CAST(" : "CAST(") + child_->ToString() +
+         " AS " + target_type_name_ + ")";
 }
 
 void CastExpression::Dump(std::ostream& o) const { o << ToString(); }

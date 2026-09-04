@@ -33,20 +33,22 @@ bool NestedLoopJoin::EvaluatePredicate(const Row& left,
   if (!predicate_) {
     return true;
   }
+  // Predicate errors must propagate (see BatchNestedLoopJoin): swallowing
+  // them as FALSE corrupts Anti-join output.
   Row combined = left + right;
-  try {
-    Value res = predicate_->Evaluate(combined, combined_schema_);
-    return !res.IsNull() && res.Truthy();
-  } catch (...) {
-    return false;
-  }
+  Value res = predicate_->Evaluate(combined, combined_schema_);
+  return !res.IsNull() && res.Truthy();
 }
 
 void NestedLoopJoin::Materialize() {
+  if (materialize_error_ != nullptr) {
+    std::rethrow_exception(materialize_error_);
+  }
   output_.clear();
   output_offset_ = 0;
 
-  // Materialize the right side into memory so it can be re-scanned across blocks.
+  // Materialize the right side into memory so it can be re-scanned across
+  // blocks.
   std::vector<std::pair<Row, RowPosition>> right_rows;
   Row r_row;
   RowPosition r_pos;
@@ -82,12 +84,14 @@ void NestedLoopJoin::Materialize() {
           ++left_match_count[i];
           if (kind_ == JoinKind::kSingle && left_match_count[i] > 1) {
             throw std::runtime_error(
-                "Single join violation: more than one match found for outer row");
+                "Single join violation: more than one match found for outer "
+                "row");
           }
           if (assert_unique_ && kind_ == JoinKind::kSemi &&
               left_match_count[i] > 1) {
             throw std::runtime_error(
-                "Semi join uniqueness assertion failed: multiple matches for outer row");
+                "Semi join uniqueness assertion failed: multiple matches for "
+                "outer row");
           }
           if (kind_ == JoinKind::kInner || kind_ == JoinKind::kLeftOuter) {
             output_.emplace_back(left_block[i].first + r_item.first,
@@ -140,13 +144,18 @@ void NestedLoopJoin::Materialize() {
       }
     }
   }
-
-  materialized_ = true;
 }
 
 bool NestedLoopJoin::Next(Row* dst, RowPosition* rp) {
   if (!materialized_) {
-    Materialize();
+    try {
+      Materialize();
+      materialized_ = true;
+    } catch (...) {
+      materialize_error_ = std::current_exception();
+      materialized_ = true;  // Prevent a retry that would see drained inputs.
+      throw;
+    }
   }
   if (output_offset_ >= output_.size()) {
     return false;

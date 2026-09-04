@@ -67,6 +67,13 @@ class BPlusTree {
   static void ReclaimIfOrphaned(Transaction& txn, PageRef& page,
                                 page_id_t protected_pid);
 
+  // D3 (docs/design.md): enumerate every page id reachable from the tree at
+  // `root` -- children, lowest links and the whole foster chain -- so a
+  // DROP can hand them back through PageManager::DestroyPage.  Broken or
+  // never-written pages are skipped; duplicates collapse via a seen set.
+  static std::vector<page_id_t> CollectPageIds(Transaction& txn,
+                                               page_id_t root);
+
  private:
   static Status LeafInsert(Transaction& txn, PageRef& leaf,
                            std::string_view key, std::string_view value);
@@ -74,6 +81,14 @@ class BPlusTree {
   // leftwards through leaves; false when no such key exists.
   bool PositionBelow(PageRef& leaf, size_t& idx, Transaction& txn,
                      std::string_view end);
+  // Ascending-scan start position for prefix seeks: first key >= `begin`,
+  // advancing rightwards through leaves when the landing leaf holds only
+  // keys below `begin`; false when no such key exists.  The plain descent
+  // cannot serve this: a prefix seek key that is a strict prefix of a branch
+  // separator routes to the left child whose entries all compare below the
+  // prefix (the TPC-C Delivery 'affected too few rows' root cause).
+  bool PositionAtOrAbove(PageRef& leaf, size_t& idx, Transaction& txn,
+                         std::string_view begin);
   static Status SetFosterRecursively(Transaction& txn, PageRef& parent,
                                      PageRef& new_child,
                                      std::string_view foster_key);

@@ -43,10 +43,14 @@ void TopNExecutor::Materialize() {
       // (TopN) disagree with an unbounded SortExecutor.
       if (lhs.type == ValueType::kDouble && rhs.type == ValueType::kDouble) {
         const int cmp = CompareForOrderBy(lhs, rhs);
-        if (cmp == 0) { continue; }
+        if (cmp == 0) {
+          continue;
+        }
         return cmp < 0 ? keys_[i].ascending : !keys_[i].ascending;
       }
-      if (lhs == rhs) { continue; }
+      if (lhs == rhs) {
+        continue;
+      }
       return keys_[i].ascending ? lhs < rhs : rhs < lhs;
     }
     return left.sequence < right.sequence;
@@ -66,7 +70,8 @@ void TopNExecutor::Materialize() {
                           .sequence = sequence++};
       candidate.keys.reserve(keys_.size());
       for (const Key& key : keys_) {
-        candidate.keys.push_back(key.expression->Evaluate(candidate.row, schema_));
+        candidate.keys.push_back(
+            key.expression->Evaluate(candidate.row, schema_));
       }
       rows_.push_back(std::move(candidate));
     }
@@ -74,10 +79,9 @@ void TopNExecutor::Materialize() {
     output_index_ = std::min(offset_, rows_.size());
     output_end_ = output_index_;
     if (output_index_ < rows_.size()) {
-      const size_t boundary =
-          limit_ > rows_.size() - output_index_
-              ? rows_.size()
-              : output_index_ + limit_;
+      const size_t boundary = limit_ > rows_.size() - output_index_
+                                  ? rows_.size()
+                                  : output_index_ + limit_;
       output_end_ = boundary;
       if (boundary != 0 && boundary <= rows_.size()) {
         const Candidate& last = rows_[boundary - 1];
@@ -89,7 +93,9 @@ void TopNExecutor::Materialize() {
               break;
             }
           }
-          if (!tied) { break; }
+          if (!tied) {
+            break;
+          }
           ++output_end_;
         }
       }
@@ -104,12 +110,13 @@ void TopNExecutor::Materialize() {
   while (source_->Next(&row, &position)) {
     ++input_rows_;
     Candidate candidate{.row = std::move(row),
-                         .position = position,
-                         .keys = {},
-                         .sequence = sequence++};
+                        .position = position,
+                        .keys = {},
+                        .sequence = sequence++};
     candidate.keys.reserve(keys_.size());
     for (const Key& key : keys_) {
-      candidate.keys.push_back(key.expression->Evaluate(candidate.row, schema_));
+      candidate.keys.push_back(
+          key.expression->Evaluate(candidate.row, schema_));
     }
     if (heap.size() < capacity) {
       heap.push(std::move(candidate));
@@ -130,25 +137,30 @@ void TopNExecutor::Materialize() {
 }
 
 bool TopNExecutor::Next(Row* dst, RowPosition* position) {
-  if (!materialized_) { Materialize(); }
-  if (output_index_ >= output_end_) { return false; }
+  if (!materialized_) {
+    Materialize();
+  }
+  if (output_index_ >= output_end_) {
+    return false;
+  }
   *dst = std::move(rows_[output_index_].row);
-  if (position != nullptr) { *position = rows_[output_index_].position; }
+  if (position != nullptr) {
+    *position = rows_[output_index_].position;
+  }
   ++output_index_;
   return true;
 }
 
 void TopNExecutor::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "TopN (limit=" << limit_ << ", offset="
-          << offset_ << (with_ties_ ? ", with ties" : "") << ")\n"
-          << Indent(indent + 2);
+  output << Indent(indent) << "TopN (limit=" << limit_ << ", offset=" << offset_
+         << (with_ties_ ? ", with ties" : "") << ")\n"
+         << Indent(indent + 2);
   source_->Dump(output, indent + 2);
   if (materialized_) {
     output << "\n"
-           << Indent(indent)
-           << "TopN heap_capacity=" << heap_capacity_
-           << " input_rows=" << input_rows_
-           << " output_rows=" << (output_end_ - std::min(offset_, rows_.size()));
+           << Indent(indent) << "TopN heap_capacity=" << heap_capacity_
+           << " input_rows=" << input_rows_ << " output_rows="
+           << (output_end_ - std::min(offset_, rows_.size()));
   }
 }
 

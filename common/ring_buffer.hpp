@@ -5,10 +5,9 @@
 #ifndef TINYLAMB_RING_BUFFER_HPP
 #define TINYLAMB_RING_BUFFER_HPP
 
-#include <cassert>
-
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -31,7 +30,8 @@ inline size_t NearestPowerOf2(size_t n) {
 template <typename T>
 class SimpleRingBuffer {
  public:
-  explicit SimpleRingBuffer(size_t size) : buffer_(detail::NearestPowerOf2(size)) {
+  explicit SimpleRingBuffer(size_t size)
+      : buffer_(detail::NearestPowerOf2(size)) {
     assert(std::popcount(buffer_.size()) == 1);
   }
 
@@ -135,8 +135,7 @@ class RingBuffer {
   [[nodiscard]] size_t Capacity() const { return buffer_.size(); }
 
   friend std::ostream& operator<<(std::ostream& o, const RingBuffer<T>& b) {
-    o << "RingBuffer(capacity=" << b.Capacity()
-      << ", size="
+    o << "RingBuffer(capacity=" << b.Capacity() << ", size="
       << (b.write_idx_.load(std::memory_order_relaxed) -
           b.read_idx_.load(std::memory_order_relaxed))
       << ")";

@@ -27,8 +27,7 @@ class BitmapScanPlan final : public PlanBase {
  public:
   BitmapScanPlan(const Table& table, const TableStatistics& statistics,
                  std::vector<BitmapIndexRange> ranges, BitmapCombine combine,
-                 Expression where, size_t estimated_rows,
-                 size_t access_rows);
+                 Expression where, size_t estimated_rows, size_t access_rows);
 
   Executor EmitExecutor(TransactionContext& txn) const override;
   [[nodiscard]] const Table* ScanSource() const override { return &table_; }

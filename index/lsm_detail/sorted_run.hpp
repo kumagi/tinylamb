@@ -37,7 +37,6 @@
 #include "common/vm_cache.hpp"
 #include "index/lsm_detail/blob_file.hpp"
 
-
 namespace tinylamb {
 
 struct LSMValue {

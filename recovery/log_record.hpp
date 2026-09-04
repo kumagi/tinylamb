@@ -37,6 +37,22 @@
 
 namespace tinylamb {
 
+// WAL record format version (docs/design.md D3, D9).
+// v1 (== kSerdesVersion): kSystemDestroyPage carried only the page id and
+//     records ended after their payload (no CRC).
+// v2: kSystemDestroyPage additionally carries the destroyed page's type and
+//     an optional full body image so undo restores the page exactly.
+// v3 (D9): every new record ends with a CRC32C over all preceding record
+//     bytes; readers verify it and treat a mismatch as the valid log end.
+// Readers must keep accepting v1/v2 (no CRC); writers always emit the
+// current version.
+inline constexpr uint32_t kWalRecordVersion = 3U;
+inline constexpr uint32_t kLegacyWalRecordVersion = 1U;
+// First wire version whose kSystemDestroyPage carries type + body (D3).
+inline constexpr uint32_t kDestroyPayloadWalVersion = 2U;
+// D9: the CRC field itself is not covered by the checksum.
+inline constexpr size_t kWalRecordCrcSize = sizeof(uint32_t);
+
 // The 16-bit base is part of the WAL record format: records serialize the
 // type as a raw uint16_t (see the Decoder/Encoder operators below), so the
 // narrower base suggested by performance-enum-size must not be applied.
@@ -185,8 +201,13 @@ struct LogRecord {
   static LogRecord AllocatePageLogRecord(lsn_t prev_lsn, txn_id_t txn,
                                          page_id_t pid, PageType new_page_type);
 
-  static LogRecord DestroyPageLogRecord(lsn_t prev_lsn, txn_id_t txn,
-                                        page_id_t pid);
+  // D3 (docs/design.md): the destroy record carries the destroyed page's
+  // type and (unless provably all-zero) its body image so that undo can
+  // restore an aborted destroy exactly; redo re-initializes it as kFreePage.
+  static LogRecord DestroyPageLogRecord(
+      lsn_t prev_lsn, txn_id_t txn, page_id_t pid,
+      PageType old_page_type = PageType::kUnknown,
+      std::string old_page_body = {});
 
   static LogRecord BeginCheckpointLogRecord();
 
@@ -224,6 +245,11 @@ struct LogRecord {
       active_transaction_table;
   // Page alloc/destroy target.b
   PageType allocated_page_type = PageType::kUnknown;
+  // WAL wire format that produced (or will receive) this record.  Written
+  // records always use kWalRecordVersion; decoded records keep the version
+  // read from the header so Size() matches the on-disk byte count for both
+  // v1 and v2 destroy records.
+  uint32_t wire_version = kWalRecordVersion;
 };
 
 }  // namespace tinylamb

@@ -26,8 +26,8 @@ namespace tinylamb {
 
 class EvaluationContext;
 
-[[nodiscard]] Value EvaluateBinary(BinaryOperation operation,
-                                   const Value& left, const Value& right);
+[[nodiscard]] Value EvaluateBinary(BinaryOperation operation, const Value& left,
+                                   const Value& right);
 
 // Lowercases ASCII letters; the fold applied by case-insensitive collation
 // comparisons ('und:ci').

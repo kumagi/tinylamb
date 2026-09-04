@@ -252,7 +252,8 @@ TEST_F(IndexTest, Update_ManyRowsUnderHeavyLoad_UpdatesSuccessfully) {
   Row read;
   for (int i = 0; i < kCount * 4; ++i) {
     RowPosition& pos = rps[(static_cast<size_t>(i) * 63) % rps.size()];
-    std::string key = RandomString(((static_cast<size_t>(19937) * i) % 3200) + 500, false);
+    std::string key =
+        RandomString(((static_cast<size_t>(19937) * i) % 3200) + 500, false);
     Row new_row({Value(i), Value(std::move(key)), Value(i % 20)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Update(ctx.txn_, pos, new_row));
     rps[(static_cast<size_t>(i) * 63) % rps.size()] = rp;

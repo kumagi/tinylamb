@@ -32,8 +32,7 @@ TEST(LockManagerTest, ExclusiveWaitTimesOut) {
   std::thread waiter([&] {
     // Contended exclusive wait should fail after a short timeout instead of
     // hanging forever.
-    EXPECT_FALSE(
-        lm.GetExclusiveLock(row, 2, std::chrono::milliseconds(50)));
+    EXPECT_FALSE(lm.GetExclusiveLock(row, 2, std::chrono::milliseconds(50)));
   });
   waiter.join();
   ASSERT_TRUE(lm.ReleaseExclusiveLock(row, 1));
@@ -97,8 +96,7 @@ TEST(LockManagerTest, ExclusiveWaitTimesOutWithoutDurabilityWait) {
   ASSERT_TRUE(lm.GetExclusiveLock(row, 1, false));
 
   std::thread waiter([&] {
-    EXPECT_FALSE(lm.GetExclusiveLock(
-        row, 2, std::chrono::milliseconds(50)));
+    EXPECT_FALSE(lm.GetExclusiveLock(row, 2, std::chrono::milliseconds(50)));
   });
   waiter.join();
   ASSERT_TRUE(lm.ReleaseExclusiveLock(row, 1));

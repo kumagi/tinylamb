@@ -26,8 +26,9 @@
 #include <string>
 #include <string_view>
 
-#include "common/crc32c.hpp"
 #include "common/constants.hpp"
+#include "common/crc32c.hpp"
+#include "common/serdes.hpp"
 #include "common/status_or.hpp"
 #include "index_key.hpp"
 #include "page/free_page.hpp"
@@ -35,17 +36,16 @@
 #include "page/page_type.hpp"
 #include "page/row_page.hpp"
 #include "page_ref.hpp"
-#include "common/serdes.hpp"
 #include "transaction/transaction.hpp"
 
 // do/while wrap keeps the macro a single statement so it cannot glue onto a
 // dangling `else`; the message carries the offending type for diagnosis.
-#define ASSERT_PAGE_TYPE(expected_type)                                     \
-  do {                                                                      \
-    if (type != (expected_type)) {                                          \
-      throw std::runtime_error("Invalid page type: actual=" +               \
-                               PageTypeString(type));                       \
-    }                                                                       \
+#define ASSERT_PAGE_TYPE(expected_type)                       \
+  do {                                                        \
+    if (type != (expected_type)) {                            \
+      throw std::runtime_error("Invalid page type: actual=" + \
+                               PageTypeString(type));         \
+    }                                                         \
   } while (false)
 
 namespace tinylamb {
@@ -570,7 +570,19 @@ void Page::UpdateBranchImpl(std::string_view key, page_id_t pid) {
 
 void Page::DeleteBranchImpl(std::string_view key) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage);
-  body.branch_page.DeleteImpl(key);
+  // D2 (docs/design.md): redo/undo-only entry.  BranchPage::DeleteImpl keeps
+  // its promote-lowest special case for the forward path (which may pass a
+  // key below the first separator), so the replay guard lives here: re-apply
+  // a branch delete only while the recorded separator is still present; an
+  // already-applied delete becomes a successful no-op instead of dropping a
+  // different separator and shifting the foster links.
+  const slot_t count = body.branch_page.RowCount();
+  for (slot_t i = 0; i < count; ++i) {
+    if (body.branch_page.GetKey(i) == key) {
+      body.branch_page.DeleteImpl(key);
+      return;
+    }
+  }
 }
 
 void Page::SetLowestValueBranchImpl(page_id_t lowest_value) {
@@ -589,9 +601,10 @@ void* Page::operator new(size_t /*unused*/) {
 }
 
 void Page::operator delete(void* page) noexcept {
-  // Matches the class operator new above (new char[kPageSize]); the deallocation
-  // type must stay char[] to pair with it.
-  delete[] reinterpret_cast<char*>(page);  // NOLINT(cppcoreguidelines-owning-memory)
+  // Matches the class operator new above (new char[kPageSize]); the
+  // deallocation type must stay char[] to pair with it.
+  delete[] reinterpret_cast<char*>(
+      page);  // NOLINT(cppcoreguidelines-owning-memory)
 }
 
 void Page::Dump(std::ostream& o, int indent) const {

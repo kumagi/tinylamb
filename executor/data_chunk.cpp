@@ -7,14 +7,15 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include "executor/zone_map.hpp"
-#include "type/value_type.hpp"
-#include "type/value.hpp"
-#include "type/schema.hpp"
 #include <vector>
+
 #include "executor/selection_vector.hpp"
-#include "type/row.hpp"
+#include "executor/zone_map.hpp"
 #include "page/row_position.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -41,6 +42,10 @@ void UpdateZoneMapFrom(const ColumnVector& column, size_t index,
       zone_map->AddString(column.StringData()[index]);
       break;
     case ValueType::kArray:
+      // Arrays are non-NULL values with no scalar envelope; record them so
+      // the zone stays eligible (matching ZoneMap::Add on the row path).
+      zone_map->AddOpaque();
+      break;
     case ValueType::kNull:
       break;
   }
@@ -149,8 +154,9 @@ void ColumnVector::Reserve(size_t capacity) {
 
 void ColumnVector::EnsureNullBit(size_t index, bool is_null) {
   const size_t word = index / 64;
-  if (null_bitmap_.size() <= word) { null_bitmap_.resize(word + 1, 0);
-}
+  if (null_bitmap_.size() <= word) {
+    null_bitmap_.resize(word + 1, 0);
+  }
   const uint64_t mask = uint64_t{1} << (index % 64);
   if (is_null) {
     null_bitmap_[word] |= mask;
@@ -206,8 +212,9 @@ void ColumnVector::MaterializeInferredStorage() {
 
 Value ColumnVector::ValueAt(size_t index) const {
   assert(index < size_ && "ColumnVector::ValueAt out of range");
-  if (IsNull(index)) { return {};
-}
+  if (IsNull(index)) {
+    return {};
+  }
   switch (type_) {
     case ValueType::kInt64:
       return Value(integers_[index]);
@@ -246,8 +253,9 @@ void DataChunk::Initialize(const std::vector<ValueType>& types,
                            size_t capacity) {
   columns_.clear();
   columns_.reserve(types.size());
-  for (ValueType type : types) { columns_.emplace_back(type, capacity);
-}
+  for (ValueType type : types) {
+    columns_.emplace_back(type, capacity);
+  }
   zone_maps_.clear();
   zone_maps_.resize(types.size());
   positions_.clear();
@@ -256,10 +264,12 @@ void DataChunk::Initialize(const std::vector<ValueType>& types,
 }
 
 void DataChunk::Reset() {
-  for (ColumnVector& column : columns_) { column.Reset();
-}
-  for (ZoneMap& zone_map : zone_maps_) { zone_map.Reset();
-}
+  for (ColumnVector& column : columns_) {
+    column.Reset();
+  }
+  for (ZoneMap& zone_map : zone_maps_) {
+    zone_map.Reset();
+  }
   positions_.clear();
   size_ = 0;
 }
@@ -269,21 +279,25 @@ void DataChunk::Reset(const Schema& schema, size_t capacity) {
 }
 
 bool DataChunk::HasLayout(const Schema& schema) const {
-  if (ColumnCount() != schema.ColumnCount()) { return false;
-}
+  if (ColumnCount() != schema.ColumnCount()) {
+    return false;
+  }
   for (size_t i = 0; i < ColumnCount(); ++i) {
     const ValueType have = columns_[i].Type();
-    if (have == ValueType::kNull) { continue;
-}
-    if (have != schema.GetColumn(i).Type()) { return false;
-}
+    if (have == ValueType::kNull) {
+      continue;
+    }
+    if (have != schema.GetColumn(i).Type()) {
+      return false;
+    }
   }
   return true;
 }
 
 void DataChunk::Reserve(size_t capacity) {
-  for (ColumnVector& column : columns_) { column.Reserve(capacity);
-}
+  for (ColumnVector& column : columns_) {
+    column.Reserve(capacity);
+  }
   positions_.reserve(capacity);
 }
 
@@ -377,8 +391,8 @@ void DataChunk::AppendRowFromColumns(
   ++size_;
 }
 
-void DataChunk::AppendGather(const DataChunk& source,
-                             const uint32_t* selection, size_t count) {
+void DataChunk::AppendGather(const DataChunk& source, const uint32_t* selection,
+                             size_t count) {
   for (size_t i = 0; i < count; ++i) {
     if (selection[i] >= source.Size()) {
       throw std::out_of_range("data chunk append row out of range");
@@ -533,11 +547,10 @@ Value ColumnVector::AggregateBitAnd(const SelectionVector* sel) const {
     for (size_t w = 0; w < words; ++w) {
       const size_t base = w * 64;
       const size_t limit = std::min(size_ - base, size_t{64});
-      const uint64_t null_word =
-          w < null_bitmap_.size() ? null_bitmap_[w] : 0;
+      const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
 #if defined(__clang__)
-        #pragma clang loop vectorize(enable)
+#pragma clang loop vectorize(enable)
 #endif
         for (size_t i = 0; i < limit; ++i) {
           acc &= static_cast<uint64_t>(data[base + i]);
@@ -585,11 +598,10 @@ Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
     for (size_t w = 0; w < words; ++w) {
       const size_t base = w * 64;
       const size_t limit = std::min(size_ - base, size_t{64});
-      const uint64_t null_word =
-          w < null_bitmap_.size() ? null_bitmap_[w] : 0;
+      const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
 #if defined(__clang__)
-        #pragma clang loop vectorize(enable)
+#pragma clang loop vectorize(enable)
 #endif
         for (size_t i = 0; i < limit; ++i) {
           acc |= static_cast<uint64_t>(data[base + i]);
@@ -637,11 +649,10 @@ Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
     for (size_t w = 0; w < words; ++w) {
       const size_t base = w * 64;
       const size_t limit = std::min(size_ - base, size_t{64});
-      const uint64_t null_word =
-          w < null_bitmap_.size() ? null_bitmap_[w] : 0;
+      const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
 #if defined(__clang__)
-        #pragma clang loop vectorize(enable)
+#pragma clang loop vectorize(enable)
 #endif
         for (size_t i = 0; i < limit; ++i) {
           acc ^= static_cast<uint64_t>(data[base + i]);
@@ -676,7 +687,8 @@ Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
 Value DataChunk::AggregateLogicalAnd(size_t col_idx,
                                      const SelectionVector* sel) const {
   if (col_idx >= columns_.size()) {
-    throw std::out_of_range("DataChunk::AggregateLogicalAnd col_idx out of range");
+    throw std::out_of_range(
+        "DataChunk::AggregateLogicalAnd col_idx out of range");
   }
   return columns_[col_idx].AggregateLogicalAnd(sel);
 }
@@ -684,7 +696,8 @@ Value DataChunk::AggregateLogicalAnd(size_t col_idx,
 Value DataChunk::AggregateLogicalOr(size_t col_idx,
                                     const SelectionVector* sel) const {
   if (col_idx >= columns_.size()) {
-    throw std::out_of_range("DataChunk::AggregateLogicalOr col_idx out of range");
+    throw std::out_of_range(
+        "DataChunk::AggregateLogicalOr col_idx out of range");
   }
   return columns_[col_idx].AggregateLogicalOr(sel);
 }

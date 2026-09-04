@@ -152,10 +152,9 @@ Status WriteSplitStatistics(BPlusTree& tree, Transaction& txn,
   RETURN_IF_FAIL(UpsertStatistics(tree, txn, table_name,
                                   EncodeStatisticsMeta(stats.Rows())));
   for (size_t column = 0; column < stats.Columns(); ++column) {
-    RETURN_IF_FAIL(
-        UpsertStatistics(tree, txn, StatisticsColumnKey(table_name,
-                                                        static_cast<slot_t>(column)),
-                         Serialize(stats.Column(column))));
+    RETURN_IF_FAIL(UpsertStatistics(
+        tree, txn, StatisticsColumnKey(table_name, static_cast<slot_t>(column)),
+        Serialize(stats.Column(column))));
   }
   return Status::kSuccess;
 }
@@ -165,11 +164,10 @@ Status WriteSplitStatistics(BPlusTree& tree, Transaction& txn,
 StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
                                       const Schema& schema) {
   // Serializes the existence check with the catalog insert within this
-  // process. B+tree inserts reject duplicates, but by the time Insert fails
-  // the table page (and any unique indexes) are already allocated and
-  // cannot be reclaimed -- kSystemDestroyPage redo is unimplemented, so a
-  // lost race would leak pages permanently. Close the race before the
-  // allocation instead of compensating afterwards.
+  // process. B+tree inserts reject duplicates; by the time Insert fails the
+  // table page is already allocated, so close the race before the allocation
+  // instead of compensating afterwards. (D3 made page reclaim crash-safe,
+  // but the pre-check avoids allocating a page per losing CREATE TABLE.)
   std::scoped_lock lock(catalog_mu_);
   // Existence must be checked case-insensitively: GetTable() resolves names
   // with a case-insensitive fallback, so an exact-match-only check here let
@@ -238,8 +236,8 @@ Status Database::DropTable(TransactionContext& ctx,
   const std::string canonical(tbl.GetSchema().Name());
   const Schema& schema = tbl.GetSchema();
   for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
-    const Status deleted = statistics_.Delete(
-        ctx.txn_, StatisticsColumnKey(canonical, column));
+    const Status deleted =
+        statistics_.Delete(ctx.txn_, StatisticsColumnKey(canonical, column));
     if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
       return deleted;
     }
@@ -251,10 +249,37 @@ Status Database::DropTable(TransactionContext& ctx,
     }
   }
   RETURN_IF_FAIL(catalog_.Delete(ctx.txn_, canonical));
-  // KNOWN LIMITATION: the table's row/index pages stay allocated (space
-  // leak). Reclaiming them needs kSystemDestroyPage redo support in the
-  // recovery manager -- do NOT wire PageManager::DestroyPage here until that
-  // lands, or a crash after DROP would make the next startup fail.
+  // D3 (docs/design.md): reclaim the table's storage.  Row pages follow the
+  // chain; index pages are enumerated from each B+Tree root (children,
+  // lowest links and foster chains).  Every destroy is WAL-logged with the
+  // old page type and image, so a crash after DROP replays the destroy redo
+  // (pages become free pages and rejoin the free list at recovery) while a
+  // ROLLBACK restores the pages exactly.
+  {
+    page_id_t pid = tbl.first_pid_;
+    while (pid != 0) {
+      PageRef page = storage_.pm_.GetPage(pid);
+      if (!page.IsValid()) {
+        break;
+      }
+      const page_id_t next = page->body.row_page.next_page_id_;
+      storage_.pm_.DestroyPage(ctx.txn_, &*page);
+      page.PageUnlock();
+      pid = next;
+    }
+    for (size_t i = 0; i < tbl.IndexCount(); ++i) {
+      for (const page_id_t idx_pid :
+           BPlusTree::CollectPageIds(ctx.txn_, tbl.GetIndex(i).Root())) {
+        PageRef page = storage_.pm_.GetPage(idx_pid);
+        if (!page.IsValid()) {
+          continue;
+        }
+        storage_.pm_.DestroyPage(ctx.txn_, &*page);
+        page.PageUnlock();
+      }
+    }
+    storage_.pm_.ForgetTableTail(tbl.first_pid_);
+  }
   // Invalidate cached images so later lookups observe the drop.
   ctx.tables_.erase(canonical);
   ctx.stats_.erase(canonical);
@@ -419,8 +444,11 @@ StatusOr<TableStatistics> Database::GetStatistics(
   std::vector<ColumnStats> columns;
   columns.reserve(schema.ColumnCount());
   for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
+    // Column keys live under the canonical name too; using the caller's raw
+    // case missed every column record for a differently-cased reference and
+    // silently substituted empty ColumnStats.
     StatusOr<std::string_view> payload =
-        statistics_.Read(ctx.txn_, StatisticsColumnKey(schema_name, column));
+        statistics_.Read(ctx.txn_, StatisticsColumnKey(canonical, column));
     if (!payload.HasValue()) {
       columns.emplace_back(schema.GetColumn(column).Type());
       continue;

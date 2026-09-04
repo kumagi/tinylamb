@@ -30,21 +30,31 @@ namespace {
 
 bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
                   const std::vector<Expression>& expressions,
-                  const std::vector<bool>& ascending) {
+                  const std::vector<bool>& ascending,
+                  const std::vector<std::optional<bool>>& nulls_first = {}) {
   if (provided.empty() || expressions.empty() ||
       expressions.size() != ascending.size() ||
       expressions.size() > provided.size()) {
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (expressions[i]->Type() != TypeTag::kColumnValue) { return false;
-}
+    // Index keys use memcomparable byte order with NULL encoded smallest.
+    const bool requested = i < nulls_first.size()
+                               ? nulls_first[i].value_or(ascending[i])
+                               : ascending[i];
+    if (requested != scan_ascending) {
+      return false;
+    }
+    if (expressions[i]->Type() != TypeTag::kColumnValue) {
+      return false;
+    }
     if (expressions[i]->AsColumnValue().GetColumnName().name !=
         provided[i].name) {
       return false;
     }
-    if (ascending[i] != scan_ascending) { return false;
-}
+    if (ascending[i] != scan_ascending) {
+      return false;
+    }
   }
   return true;
 }
@@ -58,8 +68,8 @@ Value FirstOrNull(const std::vector<Value>& keys) {
 IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
                                      const TableStatistics& ts,
                                      std::vector<Value> begin_key,
-                                     std::vector<Value> end_key,
-                                     bool ascending, Expression where,
+                                     std::vector<Value> end_key, bool ascending,
+                                     Expression where,
                                      std::vector<ColumnName> provided_order)
     : table_(table),
       index_(index),
@@ -86,7 +96,8 @@ Schema IndexOnlyScanPlan::OutputSchema() const {
   return {"", cols};
 }
 
-// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
+// EmitExecutor lives in the relational factory
+// (executor/relational_factory.cpp).
 
 size_t IndexOnlyScanPlan::AccessRowCount() const { return EmitRowCount(); }
 
@@ -98,10 +109,17 @@ size_t IndexOnlyScanPlan::EmitRowCount() const {
   return stats_.Rows();
 }
 
+bool IndexOnlyScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
+                                    const std::vector<bool>& ascending) const {
+  return OrderMatches(provided_order_, ascending_, expressions, ascending);
+}
+
 bool IndexOnlyScanPlan::IsOrderedBy(
     const std::vector<Expression>& expressions,
-    const std::vector<bool>& ascending) const {
-  return OrderMatches(provided_order_, ascending_, expressions, ascending);
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
+  return OrderMatches(provided_order_, ascending_, expressions, ascending,
+                      nulls_first);
 }
 
 void IndexOnlyScanPlan::Dump(std::ostream& o, int /*indent*/) const {

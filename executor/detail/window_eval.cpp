@@ -280,8 +280,7 @@ struct WindowRuntime {
   // Resolves [lo, hi] (inclusive) frame bounds within the ordered partition.
   std::pair<size_t, size_t> ResolveFrame(
       const WindowFunctionCallExpression& window,
-      const std::vector<Row>& /*rows*/,
-      const std::vector<size_t>& ordered,
+      const std::vector<Row>& /*rows*/, const std::vector<size_t>& ordered,
       const std::vector<std::vector<Value>>& order_values, size_t position,
       const std::vector<size_t>& peer_end) const {
     const size_t m = ordered.size();
@@ -908,15 +907,20 @@ struct WindowRuntime {
         }
         return Value(total);
       }
-      uint64_t total = 0;
+      // Accumulate as signed int64 with overflow detection: summing into a
+      // uint64 made a negative total wrap to ~1.8e19, so AVG({-5,3}) returned
+      // a huge positive value instead of -1.0.
+      int64_t total = 0;
       for (const Value& value : non_null) {
-        total += static_cast<uint64_t>(value.value.int_value);
+        if (__builtin_add_overflow(total, value.value.int_value, &total)) {
+          throw std::runtime_error("integer overflow in " + fn);
+        }
       }
       if (fn == "AVG") {
         return Value(static_cast<double>(total) /
                      static_cast<double>(non_null.size()));
       }
-      return Value(static_cast<int64_t>(total));
+      return Value(total);
     }
     if (fn == "MIN" || fn == "MAX") {
       const Value* best = &non_null[0];
@@ -1795,27 +1799,6 @@ WindowedInput ApplyWindows(TransactionContext& context,
   }
   result.hidden_columns = windows.size();
   return result;
-}
-
-Relation TrimHiddenColumns(Relation&& input, size_t hidden_columns) {
-  if (hidden_columns == 0) {
-    return std::move(input);
-  }
-  Relation trimmed(input.runtime());
-  std::vector<Column> columns;
-  const size_t keep = input.schema.ColumnCount() - hidden_columns;
-  columns.reserve(keep);
-  for (size_t i = 0; i < keep; ++i) {
-    columns.push_back(input.schema.GetColumn(i));
-  }
-  trimmed.schema = Schema("", std::move(columns));
-  input.FinishSpill();
-  for (Row& row : input.rows) {
-    row.values_.resize(keep);
-    trimmed.AddRow(std::move(row));
-  }
-  trimmed.FinishSpill();
-  return trimmed;
 }
 
 }  // namespace relational_detail

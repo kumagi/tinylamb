@@ -69,10 +69,11 @@ class Md5 {
     buffer_.clear();
     std::string out(16, '\0');
     for (int i = 0; i < 4; ++i) {
-      out[i] = static_cast<char>((a_ >> (8 * i)) & 0xFF);
-      out[4 + i] = static_cast<char>((b_ >> (8 * i)) & 0xFF);
-      out[8 + i] = static_cast<char>((c_ >> (8 * i)) & 0xFF);
-      out[12 + i] = static_cast<char>((d_ >> (8 * i)) & 0xFF);
+      const size_t k = static_cast<size_t>(i);
+      out[k] = static_cast<char>((a_ >> (8 * i)) & 0xFF);
+      out[4 + k] = static_cast<char>((b_ >> (8 * i)) & 0xFF);
+      out[8 + k] = static_cast<char>((c_ >> (8 * i)) & 0xFF);
+      out[12 + k] = static_cast<char>((d_ >> (8 * i)) & 0xFF);
     }
     return out;
   }
@@ -188,7 +189,7 @@ class Sha1 {
     buffer_.clear();
     std::string out(20, '\0');
     for (size_t w = 0; w < 5; ++w) {
-      for (int i = 0; i < 4; ++i) {
+      for (size_t i = 0; i < 4; ++i) {
         out[w * 4 + i] = static_cast<char>((h_[w] >> (24 - 8 * i)) & 0xFF);
       }
     }
@@ -296,7 +297,7 @@ class Sha256 {
     buffer_.clear();
     std::string out(32, '\0');
     for (size_t w = 0; w < 8; ++w) {
-      for (int i = 0; i < 4; ++i) {
+      for (size_t i = 0; i < 4; ++i) {
         out[w * 4 + i] = static_cast<char>((h_[w] >> (24 - 8 * i)) & 0xFF);
       }
     }
@@ -423,7 +424,7 @@ class Sha512 {
     buffer_.clear();
     std::string out(64, '\0');
     for (size_t w = 0; w < 8; ++w) {
-      for (int i = 0; i < 8; ++i) {
+      for (size_t i = 0; i < 8; ++i) {
         out[w * 8 + i] = static_cast<char>((h_[w] >> (56 - 8 * i)) & 0xFF);
       }
     }
@@ -464,7 +465,7 @@ class Sha512 {
     uint64_t w[80];
     for (size_t i = 0; i < 16; ++i) {
       w[i] = 0;
-      for (int j = 0; j < 8; ++j) {
+      for (size_t j = 0; j < 8; ++j) {
         w[i] = (w[i] << 8) | static_cast<uint8_t>(p[i * 8 + j]);
       }
     }

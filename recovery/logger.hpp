@@ -33,6 +33,14 @@ namespace tinylamb {
 
 class Logger final {
  public:
+  // D1: a WAL record must stay within the bound the recovery reader accepts
+  // (RecoveryManager parses records from a 16 MiB window, and the serialized
+  // record carries magic/version/header/CRC overhead on top of the payload).
+  // AddLog rejects anything larger instead of writing bytes that could never
+  // be replayed.
+  static constexpr size_t kMaxRecordSize =
+      (size_t{16} << 20) - (size_t{64} << 10);
+
   explicit Logger(const std::filesystem::path& logfile,
                   size_t buffer_size = size_t{1024} * 1024 * 8,
                   size_t every_ms = 1);

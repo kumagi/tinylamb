@@ -59,7 +59,8 @@ Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
   // Compute in size_t first: bin_size_t addition wraps for huge payloads and
   // would bypass the TooBig/NoSpace guards below.
   const size_t physical_size = SerializeSize(key) + sizeof(value);
-  if (physical_size > static_cast<size_t>(std::numeric_limits<bin_size_t>::max())) {
+  if (physical_size >
+      static_cast<size_t>(std::numeric_limits<bin_size_t>::max())) {
     return Status::kTooBigData;
   }
   if (static_cast<size_t>(kPageBodySize / 6) < physical_size) {
@@ -85,6 +86,16 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   if (physical_size > std::numeric_limits<bin_size_t>::max()) {
     return;
   }
+  // D2 (docs/design.md): re-applied branch insert (same log replayed, or a
+  // redo after an undo rewound page_lsn) must not duplicate the separator or
+  // inflate row_count_.  Normal BranchPage::Insert rejects duplicates before
+  // reaching here, so an exact-key hit can only be a replay: overwrite the
+  // child id in place instead.
+  const int dup = Search(key, false);
+  if (dup >= 0 && std::cmp_less(dup, row_count_) && GetKey(dup) == key) {
+    SerializePID(Payload() + rows_[dup + kExtraIdx].offset, pid);
+    return;
+  }
   free_size_ -= physical_size + sizeof(RowPointer);
   if ((Payload() + free_ptr_ - physical_size) <=
       reinterpret_cast<char*>(&rows_[row_count_ + kExtraIdx + 2])) {
@@ -105,7 +116,8 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
 Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
   const size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
-  if (physical_size > static_cast<size_t>(std::numeric_limits<bin_size_t>::max())) {
+  if (physical_size >
+      static_cast<size_t>(std::numeric_limits<bin_size_t>::max())) {
     return Status::kTooBigData;
   }
   if (static_cast<size_t>(kPageBodySize / 6) < physical_size) {
@@ -129,13 +141,13 @@ Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
 }
 
 void BranchPage::UpdateImpl(std::string_view key, page_id_t pid) {
-  // Recovery redo replays previously applied updates, so the key must exist.
-  // A missing key would make Search return -1 and rows_[kExtraIdx - 1] alias
-  // the foster slot; refuse instead of silently corrupting it.
+  // D2 (docs/design.md): redo/undo-only entry (normal updates verify the key
+  // through Update() first).  A missing key -- already undone by a prior pass,
+  // or separator shifted by a re-applied delete -- is a successful no-op:
+  // Search's floor landing must never be allowed to overwrite a DIFFERENT
+  // child id or alias the foster slot at kExtraIdx-1.
   const int pos = Search(key, false);
-  if (pos < 0) {
-    assert(!"UpdateImpl for a key that is not in this branch page");
-    LOG(ERROR) << "UpdateImpl: key not found, foster slot kept intact";
+  if (pos < 0 || std::cmp_less_equal(row_count_, pos) || GetKey(pos) != key) {
     return;
   }
   SerializePID(Payload() + rows_[pos + kExtraIdx].offset, pid);
@@ -187,7 +199,11 @@ void BranchPage::DeleteImpl(std::string_view key) {
     lowest_page_ = GetValue(0);
     ++pos;
   }
-  free_size_ += SerializeSize(GetKey(pos)) + sizeof(page_id_t);
+  // Refund exactly what InsertImpl charged: key + page id + the RowPointer
+  // slot.  Missing the pointer here permanently inflated free_size_, and the
+  // optimistic admission check then underflowed free_ptr_ into the slot array.
+  free_size_ +=
+      SerializeSize(GetKey(pos)) + sizeof(page_id_t) + sizeof(RowPointer);
   memmove(rows_ + pos + kExtraIdx, rows_ + pos + kExtraIdx + 1,
           sizeof(RowPointer) * (row_count_ - pos - 1));
   --row_count_;
@@ -218,13 +234,11 @@ Status BranchPage::SetLowFence(page_id_t pid, Transaction& txn,
                                const IndexKey& lf) {
   if (lf.IsNotInfinity()) {
     const size_t physical_size = SerializeSize(lf);
-    const bin_size_t old_size =
-        (rows_[kLowFenceIdx] == kMinusInfinity ||
-         rows_[kLowFenceIdx] == kPlusInfinity)
-            ? 0
-            : rows_[kLowFenceIdx].size;
-    if (physical_size > old_size &&
-        free_size_ < physical_size - old_size) {
+    const bin_size_t old_size = (rows_[kLowFenceIdx] == kMinusInfinity ||
+                                 rows_[kLowFenceIdx] == kPlusInfinity)
+                                    ? 0
+                                    : rows_[kLowFenceIdx].size;
+    if (physical_size > old_size && free_size_ < physical_size - old_size) {
       return Status::kNoSpace;
     }
   }
@@ -237,13 +251,11 @@ Status BranchPage::SetHighFence(page_id_t pid, Transaction& txn,
                                 const IndexKey& hf) {
   if (hf.IsNotInfinity()) {
     const size_t physical_size = SerializeSize(hf);
-    const bin_size_t old_size =
-        (rows_[kHighFenceIdx] == kMinusInfinity ||
-         rows_[kHighFenceIdx] == kPlusInfinity)
-            ? 0
-            : rows_[kHighFenceIdx].size;
-    if (physical_size > old_size &&
-        free_size_ < physical_size - old_size) {
+    const bin_size_t old_size = (rows_[kHighFenceIdx] == kMinusInfinity ||
+                                 rows_[kHighFenceIdx] == kPlusInfinity)
+                                    ? 0
+                                    : rows_[kHighFenceIdx].size;
+    if (physical_size > old_size && free_size_ < physical_size - old_size) {
       return Status::kNoSpace;
     }
   }
@@ -308,14 +320,14 @@ void BranchPage::SetFosterImpl(const FosterPair& foster) {
   if (physical_size >
       static_cast<size_t>(std::numeric_limits<bin_size_t>::max())) {
     assert(!"foster payload does not fit in a page");
-    LOG(ERROR) << "SetFosterImpl: oversized foster key ("
-               << physical_size << " bytes) rejected";
+    LOG(ERROR) << "SetFosterImpl: oversized foster key (" << physical_size
+               << " bytes) rejected";
     return;
   }
   if (static_cast<size_t>(kPageBodySize) < physical_size) {
     assert(!"foster payload does not fit in a page");
-    LOG(ERROR) << "SetFosterImpl: oversized foster key ("
-               << physical_size << " bytes) rejected";
+    LOG(ERROR) << "SetFosterImpl: oversized foster key (" << physical_size
+               << " bytes) rejected";
     return;
   }
   std::string payload(physical_size, 0);
@@ -359,8 +371,7 @@ Status BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
     pivot++;
   }
   while (pivot > 0 && pivot < static_cast<size_t>(row_count_) &&
-         key < GetKey(pivot) &&
-         kPayload < consumed_size + expected_size) {
+         key < GetKey(pivot) && kPayload < consumed_size + expected_size) {
     consumed_size -=
         SerializeSize(GetKey(pivot)) + sizeof(page_id_t) + sizeof(RowPointer);
     pivot--;
@@ -378,7 +389,8 @@ Status BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
   for (size_t i = pivot; i < original_row_count; ++i) {
     RETURN_IF_FAIL(this_page->Delete(txn, GetKey(pivot)));
   }
-  if (right->RowCount() == 0 || right->GetKey(0) <= key) {  // NOLINT(bugprone-branch-clone)
+  if (right->RowCount() == 0 ||
+      right->GetKey(0) <= key) {  // NOLINT(bugprone-branch-clone)
     assert(expected_size <= right->body.branch_page.free_size_);
   } else {
     assert(expected_size <= free_size_);
@@ -503,7 +515,8 @@ std::string BiggestKey(PageRef&& page) {
 
 // Recursion follows the B+tree descent; its depth is bounded by the tree
 // height (~log_fanout), which stays in single digits for 32 KiB pages.
-bool SanityCheck(PageRef&& page, PageManager* pm) {  // NOLINT(misc-no-recursion)
+bool SanityCheck(PageRef&& page,
+                 PageManager* pm) {  // NOLINT(misc-no-recursion)
   if (page->Type() == PageType::kLeafPage) {
     return page->body.leaf_page.SanityCheckForTest();
   }
@@ -515,7 +528,8 @@ bool SanityCheck(PageRef&& page, PageManager* pm) {  // NOLINT(misc-no-recursion
 }
 }  // namespace
 
-bool BranchPage::SanityCheckForTest(PageManager* pm) const {  // NOLINT(misc-no-recursion)
+bool BranchPage::SanityCheckForTest(
+    PageManager* pm) const {  // NOLINT(misc-no-recursion)
   // Violations are reported through the boolean result instead of
   // LOG(FATAL)-and-continue: FATAL is about to become an aborting level, and
   // continuing after a detected corruption only obscures the diagnosis.

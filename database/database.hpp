@@ -88,8 +88,8 @@ class Database final : public CatalogReader {
 
   friend std::ostream& operator<<(std::ostream& o, const Database& db);
 
-  StatusOr<TableStatistics> GetStatistics(TransactionContext& ctx,
-                                          std::string_view schema_name) override;
+  StatusOr<TableStatistics> GetStatistics(
+      TransactionContext& ctx, std::string_view schema_name) override;
 
   Status UpdateStatistics(TransactionContext& ctx, std::string_view schema_name,
                           const TableStatistics& ts);

@@ -6,8 +6,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
-#include <string_view>
 #include <string>
+#include <string_view>
 
 namespace tinylamb {
 namespace {
@@ -110,26 +110,31 @@ int64_t ParseDateDays(std::string_view date) {
   if (pos != date.size()) {
     throw std::runtime_error("invalid DATE value");
   }
-  if (y < static_cast<int>(year::min()) ||
-      static_cast<int>(year::max()) < y) {
+  if (y < static_cast<int>(year::min()) || static_cast<int>(year::max()) < y) {
+    throw std::runtime_error("invalid DATE value");
+  }
+  // Range-check before constructing month/day: their constructors truncate to
+  // unsigned char, so an out-of-range value like month 257 would silently
+  // wrap into a valid-looking month instead of failing validation.
+  if (m < 1 || 12 < m || d < 1 || 31 < d) {
     throw std::runtime_error("invalid DATE value");
   }
   const year_month_day ymd{year{static_cast<int>(y)},
                            std::chrono::month{static_cast<unsigned>(m)},
                            day{static_cast<unsigned>(d)}};
   // ok() validates month 1..12, day 1..31 and leap-year February days.
-  if (!ymd.ok()) { throw std::runtime_error("invalid DATE value");
-}
+  if (!ymd.ok()) {
+    throw std::runtime_error("invalid DATE value");
+  }
   return sys_days{ymd}.time_since_epoch().count();
 }
 
 std::string FormatDateDays(int64_t days) {
   std::array<char, 16> buffer{};
   const year_month_day ymd{ToSysDays(days)};
-  const int written =
-      std::snprintf(buffer.data(), buffer.size(), "%04d-%02u-%02u",
-                    int(ymd.year()), unsigned(ymd.month()),
-                    unsigned(ymd.day()));
+  const int written = std::snprintf(buffer.data(), buffer.size(),
+                                    "%04d-%02u-%02u", int(ymd.year()),
+                                    unsigned(ymd.month()), unsigned(ymd.day()));
   if (written < 0 || static_cast<size_t>(written) >= buffer.size()) {
     throw std::runtime_error("DATE value out of representable range");
   }
@@ -151,7 +156,8 @@ int64_t AddDateIntervalDays(int64_t days, int64_t amount,
     const year_month_day ymd{ToSysDays(days)};
     // Split so both components stay small and no intermediate overflows.
     return ShiftYMDClamped(ymd, FloorDiv(amount, 12), FloorMod(amount, 12))
-        .time_since_epoch().count();
+        .time_since_epoch()
+        .count();
   }
   if (unit == "year" || unit == "years") {
     const year_month_day ymd{ToSysDays(days)};
@@ -173,7 +179,8 @@ void SetDefaultTimeZone(std::string_view tz) {
 }
 
 std::string GetDefaultTimeZone() {
-  return tls_default_time_zone.empty() ? "America/Los_Angeles" : tls_default_time_zone;
+  return tls_default_time_zone.empty() ? "America/Los_Angeles"
+                                       : tls_default_time_zone;
 }
 
 }  // namespace tinylamb

@@ -12,8 +12,7 @@ SQL frontend
 The `tinylamb` executable reads one SQL statement from standard input. The
 pinned GoogleSQL parser produces its parser AST, a visitor converts that tree
 directly to tinylamb expressions and relational query nodes, and the resulting
-plan is executed by tinylamb. SQL text is not parsed again by tinylamb's legacy
-Tokenizer, Parser, or PrattParser.
+plan is executed by tinylamb.
 
 ```console
 cmake -S . -B build
@@ -121,11 +120,7 @@ There is no second standalone DP optimizer; `optimizer.cpp` is the façade and
 post-processing layer (aggregates, residual predicates).
 
 **Statement AST:** SQL DML/SELECT shapes live in `query/statement.hpp`
-(executor-side code includes it directly; the `parser/ast.hpp` shim remains
-only for the legacy parser headers under `parser/` and is slated for removal).
-The legacy Tokenizer/Parser/Pratt implementations under `legacy/parser/` are
-an archive used by historical tests only (see `legacy/parser/README.md`) and
-are not part of the GoogleSQL path.
+(executor-side code includes it directly).
 
 **Layer libraries:** `tinylamb_core` is an INTERFACE aggregate over
 `tinylamb_common` → … → `tinylamb_executor` (see `CMakeLists.txt`). The

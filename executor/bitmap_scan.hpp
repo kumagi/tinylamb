@@ -31,16 +31,16 @@ struct RowPositionComparator {
   }
 };
 
-inline std::vector<RowPosition> BitmapAnd(
-    const std::vector<RowPosition>& a, const std::vector<RowPosition>& b) {
+inline std::vector<RowPosition> BitmapAnd(const std::vector<RowPosition>& a,
+                                          const std::vector<RowPosition>& b) {
   std::vector<RowPosition> result;
   std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
                         std::back_inserter(result), RowPositionComparator{});
   return result;
 }
 
-inline std::vector<RowPosition> BitmapOr(
-    const std::vector<RowPosition>& a, const std::vector<RowPosition>& b) {
+inline std::vector<RowPosition> BitmapOr(const std::vector<RowPosition>& a,
+                                         const std::vector<RowPosition>& b) {
   std::vector<RowPosition> result;
   std::set_union(a.begin(), a.end(), b.begin(), b.end(),
                  std::back_inserter(result), RowPositionComparator{});

@@ -54,13 +54,11 @@ SkipScanDistinct::SkipScanDistinct(Transaction& txn, const Table& table,
                                    const Value& end, bool ascending,
                                    Expression where, Schema sc,
                                    size_t prefix_cols)
-    : SkipScanDistinct(txn, table, index,
-                       begin.IsNull() ? std::vector<Value>{}
-                                      : std::vector<Value>{begin},
-                       end.IsNull() ? std::vector<Value>{}
-                                    : std::vector<Value>{end},
-                       ascending, std::move(where), std::move(sc),
-                       prefix_cols) {}
+    : SkipScanDistinct(
+          txn, table, index,
+          begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
+          end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
+          ascending, std::move(where), std::move(sc), prefix_cols) {}
 
 SkipScanDistinct::SkipScanDistinct(Transaction& txn, const Table& table,
                                    const Index& index,
@@ -125,8 +123,8 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       Row next_key;
       next_key.DecodeMemcomparableFormat(iter_.Key());
       bool prefix_equal = true;
-      for (size_t col = 0; col < prefix_cols_ && col < prev_key.Size() &&
-                           col < next_key.Size();
+      for (size_t col = 0;
+           col < prefix_cols_ && col < prev_key.Size() && col < next_key.Size();
            ++col) {
         if (prev_key[col] != next_key[col]) {
           prefix_equal = false;
@@ -136,7 +134,8 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       if (!prefix_equal) {
         break;
       }
-      // Same prefix, seek past this prefix using BPlusTree seek with prefix upper bound!
+      // Same prefix, seek past this prefix using BPlusTree seek with prefix
+      // upper bound!
       std::vector<Value> prefix_values;
       for (size_t col = 0; col < prefix_cols_ && col < prev_key.Size(); ++col) {
         prefix_values.push_back(prev_key[col]);
@@ -152,8 +151,8 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       Row next_key;
       next_key.DecodeMemcomparableFormat(iter_.Key());
       bool prefix_equal = true;
-      for (size_t col = 0; col < prefix_cols_ && col < prev_key.Size() &&
-                           col < next_key.Size();
+      for (size_t col = 0;
+           col < prefix_cols_ && col < prev_key.Size() && col < next_key.Size();
            ++col) {
         if (prev_key[col] != next_key[col]) {
           prefix_equal = false;

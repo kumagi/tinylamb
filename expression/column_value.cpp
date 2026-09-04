@@ -47,15 +47,17 @@ bool IdentifierEquals(std::string_view left, std::string_view right) {
 
 int ResolveOffset(const Schema& schema, const ColumnName& name) {
   const int exact = schema.Offset(name);
-  if (exact >= 0) { return exact;
-}
+  if (exact >= 0) {
+    return exact;
+  }
 
   // SQL identifiers are case-insensitive unless quoted. ColumnName currently
   // does not retain quotedness, so use case-insensitive lookup as the fallback.
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& candidate = schema.GetColumn(i).Name();
-    if (!IdentifierEquals(candidate.name, name.name)) { continue;
-}
+    if (!IdentifierEquals(candidate.name, name.name)) {
+      continue;
+    }
     if (name.schema.empty() ||
         IdentifierEquals(candidate.schema, name.schema) ||
         IdentifierEquals(schema.Name(), name.schema) ||
@@ -93,9 +95,12 @@ Type ColumnType(const Column& column) {
 
 std::unordered_set<ColumnName> ColumnValue::TouchedColumns() const {
   return {col_name_};
-}Value ColumnValue::Evaluate(const Row& row, const Schema& schema) const {
+}
+Value ColumnValue::Evaluate(const Row& row, const Schema& schema) const {
   const int offset = ResolveOffset(schema, col_name_);
-  if (offset >= 0) { return row[static_cast<size_t>(offset)]; }
+  if (offset >= 0) {
+    return row[static_cast<size_t>(offset)];
+  }
   throw std::runtime_error("column " + col_name_.ToString() + " not found");
 }
 
@@ -111,9 +116,12 @@ Value ColumnValue::Evaluate(const Row* left, const Schema& left_schema,
     return (*right)[static_cast<size_t>(right_offset)];
   }
   throw std::runtime_error("column " + col_name_.ToString() + " not found");
-}Type ColumnValue::ResultType(const Schema& schema) const {
+}
+Type ColumnValue::ResultType(const Schema& schema) const {
   const int offset = ResolveOffset(schema, col_name_);
-  if (offset < 0) { throw std::runtime_error("column type not found"); }
+  if (offset < 0) {
+    throw std::runtime_error("column type not found");
+  }
   return ColumnType(schema.GetColumn(static_cast<size_t>(offset)));
 }
 

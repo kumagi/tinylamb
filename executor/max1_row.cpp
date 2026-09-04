@@ -15,8 +15,7 @@ bool Max1RowExecutor::Next(Row* destination, RowPosition* position) {
     return false;
   }
   if (emitted_) {
-    throw std::runtime_error(
-        "scalar subquery returned more than one row");
+    throw std::runtime_error("scalar subquery returned more than one row");
   }
   emitted_ = true;
   *destination = std::move(row);

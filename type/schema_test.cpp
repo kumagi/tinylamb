@@ -31,12 +31,12 @@ namespace tinylamb {
 
 TEST(SchemaTest, Constructor_WithValidColumns_InitializesCorrectly) {
   Schema s("sample", {Column(ColumnName("c1"), ValueType::kInt64,
-                              Constraint(Constraint::kPrimaryKey)),
-                       Column(ColumnName("c2"), ValueType::kDouble)});
+                             Constraint(Constraint::kPrimaryKey)),
+                      Column(ColumnName("c2"), ValueType::kDouble)});
   Schema t("next_schema", {Column(ColumnName("c1"), ValueType::kInt64,
-                                   Constraint(Constraint::kPrimaryKey)),
-                            Column(ColumnName("c2"), ValueType::kDouble),
-                            Column(ColumnName("c3"), ValueType::kVarChar)});
+                                  Constraint(Constraint::kPrimaryKey)),
+                           Column(ColumnName("c2"), ValueType::kDouble),
+                           Column(ColumnName("c3"), ValueType::kVarChar)});
 
   EXPECT_EQ(s.ColumnCount(), 2);
   EXPECT_EQ(s.Name(), "sample");
@@ -47,33 +47,33 @@ TEST(SchemaTest, Constructor_WithValidColumns_InitializesCorrectly) {
 TEST(SchemaTest, SerializeDeserialize_DiverseSchemas_PreservesStructure) {
   SerializeDeserializeTest(
       Schema("sample", {Column(ColumnName("c1"), ValueType::kInt64,
-                                Constraint(Constraint::kPrimaryKey)),
-                         Column(ColumnName("c2"), ValueType::kDouble)}));
+                               Constraint(Constraint::kPrimaryKey)),
+                        Column(ColumnName("c2"), ValueType::kDouble)}));
   SerializeDeserializeTest(
       Schema("next_schema", {Column(ColumnName("c1"), ValueType::kInt64,
-                                     Constraint(Constraint::kPrimaryKey)),
-                              Column(ColumnName("c2"), ValueType::kDouble),
-                              Column(ColumnName("c3"), ValueType::kVarChar)}));
+                                    Constraint(Constraint::kPrimaryKey)),
+                             Column(ColumnName("c2"), ValueType::kDouble),
+                             Column(ColumnName("c3"), ValueType::kVarChar)}));
 }
 
 TEST(SchemaTest, Dump_ToLogStream_SucceedsWithoutCrash) {
   Schema s("sample", {Column(ColumnName("c1"), ValueType::kInt64,
                              Constraint(Constraint::kPrimaryKey)),
                       Column(ColumnName("c2"), ValueType::kDouble)});
-  Schema t("next_schema",
-           {Column(ColumnName("c1"), ValueType::kInt64,
-                   Constraint(Constraint::kPrimaryKey)),
-            Column(ColumnName("c2"), ValueType::kDouble),
-            Column(ColumnName("c3"), ValueType::kVarChar)});
+  Schema t("next_schema", {Column(ColumnName("c1"), ValueType::kInt64,
+                                  Constraint(Constraint::kPrimaryKey)),
+                           Column(ColumnName("c2"), ValueType::kDouble),
+                           Column(ColumnName("c3"), ValueType::kVarChar)});
 
   LOG(INFO) << s;
   LOG(WARN) << t;
 }
 
-TEST(SchemaTest, ColumnSet_FromMixedNamedAndUnnamedColumns_CollectsAllColumnNames) {
-  Schema s("sample", {Column("c1", ValueType::kInt64),
-                      Column("c2", ValueType::kDouble),
-                      Column("", ValueType::kVarChar)});
+TEST(SchemaTest,
+     ColumnSet_FromMixedNamedAndUnnamedColumns_CollectsAllColumnNames) {
+  Schema s("sample",
+           {Column("c1", ValueType::kInt64), Column("c2", ValueType::kDouble),
+            Column("", ValueType::kVarChar)});
 
   const std::unordered_set<ColumnName> set = s.ColumnSet();
 
@@ -83,10 +83,11 @@ TEST(SchemaTest, ColumnSet_FromMixedNamedAndUnnamedColumns_CollectsAllColumnName
   ASSERT_NE(set.find(ColumnName("sample", "")), set.end());
 }
 
-TEST(SchemaTest, Offset_WithQualifiedAndUnqualifiedNames_ReturnsIndexOrMinusOne) {
-  Schema s("sample", {Column("c1", ValueType::kInt64),
-                      Column("c2", ValueType::kDouble),
-                      Column("c3", ValueType::kVarChar)});
+TEST(SchemaTest,
+     Offset_WithQualifiedAndUnqualifiedNames_ReturnsIndexOrMinusOne) {
+  Schema s("sample",
+           {Column("c1", ValueType::kInt64), Column("c2", ValueType::kDouble),
+            Column("c3", ValueType::kVarChar)});
 
   const ssize_t off_c1 = s.Offset(ColumnName("c1"));
   const ssize_t off_c2 = s.Offset(ColumnName("c2"));
@@ -103,7 +104,8 @@ TEST(SchemaTest, Offset_WithQualifiedAndUnqualifiedNames_ReturnsIndexOrMinusOne)
   ASSERT_EQ(off_nope, -1);
 }
 
-TEST(SchemaTest, PlusOperator_ConcatenatingTwoSchemas_MergesColumnsAndClearsName) {
+TEST(SchemaTest,
+     PlusOperator_ConcatenatingTwoSchemas_MergesColumnsAndClearsName) {
   Schema left("left", {Column("a", ValueType::kInt64)});
   Schema right("right", {Column("b", ValueType::kDouble),
                          Column("c", ValueType::kVarChar)});
@@ -118,8 +120,8 @@ TEST(SchemaTest, PlusOperator_ConcatenatingTwoSchemas_MergesColumnsAndClearsName
 }
 
 TEST(SchemaTest, StreamOperator_ForPopulatedSchema_RendersNameAndColumns) {
-  Schema s("sample", {Column("c1", ValueType::kInt64),
-                      Column("c2", ValueType::kDouble)});
+  Schema s("sample",
+           {Column("c1", ValueType::kInt64), Column("c2", ValueType::kDouble)});
   std::ostringstream oss;
 
   oss << s;

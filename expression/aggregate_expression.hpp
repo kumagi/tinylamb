@@ -63,9 +63,7 @@ class AggregateExpression : public ExpressionBase {
   [[nodiscard]] const std::optional<size_t>& InnerLimit() const {
     return inner_limit_;
   }
-  void SetInnerLimit(std::optional<size_t> limit) {
-    inner_limit_ = limit;
-  }
+  void SetInnerLimit(std::optional<size_t> limit) { inner_limit_ = limit; }
   // STRING_AGG delimiter (second argument), evaluated per row by call sites.
   [[nodiscard]] const Expression& SecondaryArg() const {
     return secondary_arg_;

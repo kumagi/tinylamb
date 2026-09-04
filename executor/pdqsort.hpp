@@ -15,7 +15,8 @@
 
 namespace tinylamb {
 
-// In-memory fast path pattern-defeating quicksort for in-memory row collections.
+// In-memory fast path pattern-defeating quicksort for in-memory row
+// collections.
 class PdqSort {
  public:
   static void Sort(std::vector<std::pair<Row, RowPosition>>& rows,

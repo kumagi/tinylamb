@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -45,6 +46,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/crc32c.hpp"
 #include "common/decoder.hpp"
 #include "common/log_message.hpp"
 #include "common/serdes.hpp"
@@ -184,14 +186,13 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       target->PageInit(log.pid, log.allocated_page_type);
       break;
     case LogType::kSystemDestroyPage:
-      // Destroy-redo needs allocator semantics (free-list update) that the
-      // WAL record does not carry: it has neither the old page image nor
-      // the successor state of meta_page. Replaying it naively would
-      // corrupt the page allocator, so fail loudly instead of guessing.
-      // DESIGN DECISION REQUIRED -- see recovery/CODE_REVIEW.md.
-      throw std::runtime_error(
-          "kSystemDestroyPage redo not implemented (page " +
-          std::to_string(log.pid) + ")");
+      // D3 (docs/design.md): destroy-redo initializes the page as a free
+      // page.  The WAL record carries no free-list successor, so the chain
+      // itself is rebuilt from a page-range scan when recovery finishes
+      // (RecoverFrom tail); re-applying the same destroy redo only re-runs
+      // this idempotent initialization.
+      target->PageInit(log.pid, PageType::kFreePage);
+      break;
     case LogType::kSetLowFence:
     case LogType::kCompensateSetLowFence: {
       auto ik = Decode<IndexKey>(log.redo_data);
@@ -207,6 +208,11 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     default:
       assert(!"must not reach here");
   }
+  // ARIES: a page modified during replay is dirty from the earliest applied
+  // LSN. Without this the page keeps recovery_lsn == MAX (set on load), a
+  // checkpoint would record it clean in the DPT, and a crash before its
+  // flush would silently drop the restored effect.
+  target->SetRecLSN(lsn);
   target->SetPageLSN(lsn);
 }
 
@@ -228,15 +234,30 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot, log.undo_data);
       target->InsertImpl(log.slot, log.undo_data);
       break;
-    case LogType::kSystemDestroyPage:
-      // Undoing a destroy cannot restore the lost page image: the record
-      // carries neither the old content nor the original page type
-      // (allocated_page_type is kUnknown for destroy records). The
-      // reinitialization below is lossy but keeps the page id addressable;
-      // pinned by AbortWithDestroyPageLogReinitializesPage.
-      // DESIGN DECISION REQUIRED -- see recovery/CODE_REVIEW.md.
+    case LogType::kSystemDestroyPage: {
+      // D3 (docs/design.md): v2 destroy records carry the destroyed page's
+      // type and, when it held content, its full body image, so undoing an
+      // aborted destroy restores the page exactly (a rolled-back DROP TABLE
+      // keeps its rows).  A legacy v1 record (or an all-zero body) falls
+      // back to type-only reinitialization; the free-list rebuild at the
+      // end of recovery then treats any remaining orphan conservatively.
+      const page_id_t popped_next = target->Type() == PageType::kFreePage
+                                        ? target->body.free_page.NextFreePage()
+                                        : 0;
       target->PageInit(log.pid, log.allocated_page_type);
+      if (!log.undo_data.empty()) {
+        std::memcpy(
+            &target->body, log.undo_data.data(),
+            std::min(log.undo_data.size(), static_cast<size_t>(kPageBodySize)));
+      }
+      // The restore made the page live again; drop it from the allocator's
+      // free stack so the next AllocateNewPage cannot re-issue it.
+      if (log.allocated_page_type != PageType::kFreePage && tm != nullptr &&
+          tm->GetPageManager() != nullptr) {
+        tm->GetPageManager()->PopFreePageHead(log.pid, popped_next);
+      }
       break;
+    }
     case LogType::kInsertLeaf:
       tm->CompensateInsertLog(log.txn_id, log.pid, log.key);
       target->DeleteImpl(log.key);
@@ -306,6 +327,9 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       // Compensating log cannot undo.
       break;
   }
+  // See LogRedo: an undone page is dirty from this LSN for the next
+  // checkpoint's dirty-page table.
+  target->SetRecLSN(lsn);
   target->SetPageLSN(lsn);
 }
 
@@ -331,8 +355,9 @@ void PageReplay(PageRef&& target,
     // contain such an ALLOCATE, whose redo (PageInit) is a no-op on them.
     const bool nothing_applied_yet = target->PageLSN() == 0;
     if (nothing_applied_yet || target->PageLSN() < lsn) {
-      if (RecoveryTraceEnabled()) { LOG(INFO) << "redo: " << log;
-}
+      if (RecoveryTraceEnabled()) {
+        LOG(INFO) << "redo: " << log;
+      }
       LogRedo(target, lsn, log);
     }
   }
@@ -343,11 +368,13 @@ void PageReplay(PageRef&& target,
     const auto it = committed_txn.find(undo_log.txn_id);
     assert(undo_log.pid == target->PageID());
     if (it == committed_txn.end()) {
-      if (RecoveryTraceEnabled()) { LOG(INFO) << "undo: " << undo_log;
-}
+      if (RecoveryTraceEnabled()) {
+        LOG(INFO) << "undo: " << undo_log;
+      }
       LogUndo(target, log.first, undo_log, tm);
-      if (undone != nullptr) { undone->Record(log.first);
-}
+      if (undone != nullptr) {
+        undone->Record(log.first);
+      }
     }
   }
 
@@ -359,31 +386,35 @@ void PageReplay(PageRef&& target,
 }
 
 size_t RecoveryWorkerCount(size_t jobs) {
-  if (jobs <= 1) { return jobs;
-}
+  if (jobs <= 1) {
+    return jobs;
+  }
   size_t workers = std::thread::hardware_concurrency();
-  if (workers == 0) { workers = 1;
-}
+  if (workers == 0) {
+    workers = 1;
+  }
   if (const char* env = std::getenv("TINYLAMB_RECOVERY_WORKERS");
       env != nullptr && env[0] != '\0') {
     char* end = nullptr;
     const unsigned long parsed = std::strtoul(env, &end, 10);
     // Accept only a fully numeric value; "12abc" or garbage keeps the
     // hardware default instead of silently adopting a partial parse.
-    if (end != env && *end == '\0' && parsed > 0) { workers = parsed;
-}
+    if (end != env && *end == '\0' && parsed > 0) {
+      workers = parsed;
+    }
   }
   return std::min(jobs, workers);
 }
 
 void ReplayPagesInParallel(
     PagePool* pool,
-    std::vector<
-        std::pair<page_id_t, std::vector<std::pair<lsn_t, LogRecord>>>>* jobs,
+    std::vector<std::pair<page_id_t, std::vector<std::pair<lsn_t, LogRecord>>>>*
+        jobs,
     const std::unordered_set<txn_id_t>& committed_txn, TransactionManager* tm,
     RecoveryManager::UndoneRecorder* undone) {
-  if (jobs->empty()) { return;
-}
+  if (jobs->empty()) {
+    return;
+  }
   const size_t workers = RecoveryWorkerCount(jobs->size());
   auto replay_one = [&](size_t index) {
     auto& [page_id, logs] = (*jobs)[index];
@@ -393,8 +424,9 @@ void ReplayPagesInParallel(
     PageReplay(std::move(page), logs, committed_txn, tm, undone);
   };
   if (workers <= 1) {
-    for (size_t i = 0; i < jobs->size(); ++i) { replay_one(i);
-}
+    for (size_t i = 0; i < jobs->size(); ++i) {
+      replay_one(i);
+    }
     return;
   }
 
@@ -405,14 +437,16 @@ void ReplayPagesInParallel(
     try {
       for (;;) {
         const size_t index = next.fetch_add(1, std::memory_order_relaxed);
-        if (index >= jobs->size()) { return;
-}
+        if (index >= jobs->size()) {
+          return;
+        }
         replay_one(index);
       }
     } catch (...) {
       std::scoped_lock lock(error_mutex);
-      if (!first_error) { first_error = std::current_exception();
-}
+      if (!first_error) {
+        first_error = std::current_exception();
+      }
       next.store(jobs->size(), std::memory_order_relaxed);
     }
   };
@@ -422,10 +456,12 @@ void ReplayPagesInParallel(
   for (size_t i = 0; i < workers; ++i) {
     threads.emplace_back(worker);
   }
-  for (std::thread& thread : threads) { thread.join();
-}
-  if (first_error) { std::rethrow_exception(first_error);
-}
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  if (first_error) {
+    std::rethrow_exception(first_error);
+  }
 }
 
 }  // namespace
@@ -459,14 +495,20 @@ bool RecoveryManager::OpenReadFd() const {
   if (read_fd_ >= 0) {
     return true;
   }
+  // read_fd_ is a mutable non-atomic member reachable from concurrent Abort()
+  // walks; serialize the lazy open so two threads cannot race the
+  // check-and-assign (and leak one of the descriptors).
+  std::scoped_lock lock(read_fd_mutex_);
+  if (read_fd_ >= 0) {
+    return true;
+  }
   // O_RDONLY pread-only handle: concurrent readers never share file state,
   // so parallel Abort() walks of the prev_lsn chains are race-free.
   read_fd_ = ::open(std::string(log_name_).c_str(), O_RDONLY | O_CLOEXEC);
   return read_fd_ >= 0;
 }
 
-void RecoveryManager::SinglePageRecovery(PageRef&& page,
-                                         TransactionManager* tm,
+void RecoveryManager::SinglePageRecovery(PageRef&& page, TransactionManager* tm,
                                          UndoneRecorder* undone) {
   SinglePageRecovery(std::move(page), tm, undone, LogFileSizeOrZero(log_name_));
 }
@@ -711,6 +753,32 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
               << allocator.MaxPageCount() << " -> " << max_seen_pid;
     allocator.RestoreMaxPageCount(max_seen_pid);
   }
+
+  // D3 (docs/design.md): rebuild the free list.  The meta page mutates the
+  // allocator chain outside the WAL, so after a crash the on-disk chain may
+  // be stale, point at re-issued pages, or miss pages whose destroy redo
+  // just ran.  Re-derive it from the scan itself: every page in
+  // [1, max_page_count] that ended recovery as a kFreePage is linked, live
+  // pages (valid, non-free images including lossy-undone kUnknown orphans
+  // still referenced by parents) are never linked.  Running this twice --
+  // or on a clean reopen -- produces the same chain.
+  const page_id_t high_water = allocator.MaxPageCount();
+  page_id_t free_head = 0;
+  size_t rebuilt_free_pages = 0;
+  for (page_id_t pid = high_water; 1 <= pid; --pid) {
+    PageRef p = pool_->GetPageForRecovery(pid, nullptr);
+    if (p->Type() != PageType::kFreePage) {
+      continue;
+    }
+    p.GetFreePage().SetNextFreePage(free_head);
+    free_head = pid;
+    ++rebuilt_free_pages;
+  }
+  allocator.RebuildFreeListHead(free_head);
+  if (rebuilt_free_pages != 0) {
+    LOG(INFO) << "Rebuilt free list: " << rebuilt_free_pages
+              << " pages, head=" << free_head;
+  }
 }
 
 lsn_t RecoveryManager::ValidLogEnd(lsn_t from) const {
@@ -746,7 +814,7 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
     DeserializeU16(header.data() + sizeof(uint32_t) * 2, &raw_type);
   }
   if (std::cmp_less(nhead, header.size()) || magic != kSerdesMagic ||
-      version != kSerdesVersion ||
+      (version < kLegacyWalRecordVersion || version > kWalRecordVersion) ||
       !IsKnownLogType(static_cast<LogType>(raw_type))) {
     return false;
   }
@@ -759,18 +827,57 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
     std::string buffer(want, '\0');
     ssize_t nread = 0;
     do {
-      nread = ::pread(read_fd_, buffer.data(), want,
-                      static_cast<off_t>(lsn));
+      nread = ::pread(read_fd_, buffer.data(), want, static_cast<off_t>(lsn));
     } while (nread < 0 && errno == EINTR);
     if (nread <= 0) {
       return false;
     }
     buffer.resize(static_cast<size_t>(nread));
     std::istringstream in;
-    in.str(std::move(buffer));
+    in.str(buffer);
     Decoder dec(in);
-    dec >> *dst;
+    // ReadLog's contract is bool (false == torn/corrupt tail, treated as the
+    // valid log end). The decoder throws on an out-of-range PageType/enum or
+    // unknown log type, so a mid-record bit rot must be caught here rather
+    // than propagating out of analysis/redo and aborting startup.
+    try {
+      dec >> *dst;
+    } catch (const std::exception& error) {
+      LOG(WARN) << "WAL decode failed at LSN " << lsn << ": " << error.what();
+      return false;
+    }
     if (in.good() && IsKnownLogType(dst->type)) {
+      // D9 (docs/design.md): a v3 record carries a CRC32C at its tail over
+      // every preceding record byte.  magic/version/type were validated above
+      // and the payload decoded cleanly here; now validate the CRC.  A
+      // mismatch means the record is corrupt: the reader stops and reports
+      // it as the valid log end so nothing after it is replayed.
+      if (dst->wire_version >= kWalRecordVersion) {
+        const size_t total = dst->Size();  // record bytes + CRC field
+        if (want < total && nread == static_cast<ssize_t>(want) &&
+            want < kMaxWindow) {
+          continue;  // window too small to reach the CRC; grow and re-read.
+        }
+        if (static_cast<size_t>(nread) < total) {
+          return false;  // EOF before the CRC: torn tail.
+        }
+        const size_t body = total - kWalRecordCrcSize;
+        const char* crc_pos = buffer.data() + body;
+        uint32_t stored = 0;
+        stored = (static_cast<uint32_t>(static_cast<unsigned char>(crc_pos[0]))
+                  << 24) |
+                 (static_cast<uint32_t>(static_cast<unsigned char>(crc_pos[1]))
+                  << 16) |
+                 (static_cast<uint32_t>(static_cast<unsigned char>(crc_pos[2]))
+                  << 8) |
+                 static_cast<uint32_t>(static_cast<unsigned char>(crc_pos[3]));
+        const uint32_t computed = Crc32C(buffer.data(), body);
+        if (stored != computed) {
+          LOG(WARN) << "WAL CRC mismatch at LSN " << lsn << " (stored "
+                    << stored << ", computed " << computed << ")";
+          return false;
+        }
+      }
       return true;
     }
     if (std::cmp_less(nread, want) || want >= kMaxWindow) {
@@ -781,8 +888,7 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
 
 void RecoveryManager::UndoLoserChains(const std::vector<lsn_t>& loser_heads,
                                       UndoneRecorder* undone,
-                                      TransactionManager* tm,
-                                      lsn_t scan_end) {
+                                      TransactionManager* tm, lsn_t scan_end) {
   for (lsn_t head : loser_heads) {
     std::unordered_set<lsn_t> visited;
     for (lsn_t cur = head; cur != 0;) {

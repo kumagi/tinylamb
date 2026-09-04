@@ -19,16 +19,17 @@
 //
 
 #include "index_only_scan.hpp"
-#include <vector>
-#include <utility>
+
 #include <ostream>
+#include <utility>
+#include <vector>
 
 #include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "index/index_schema.hpp"
-#include "type/column.hpp"
 #include "page/row_position.hpp"
+#include "type/column.hpp"
 
 namespace tinylamb {
 
@@ -36,20 +37,18 @@ IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
                              const Index& index, const Value& begin,
                              const Value& end, bool ascending, Expression where,
                              const Schema& sc)
-    : IndexOnlyScan(txn, table, index,
-                    begin.IsNull() ? std::vector<Value>{}
-                                   : std::vector<Value>{begin},
-                    end.IsNull() ? std::vector<Value>{}
-                                 : std::vector<Value>{end},
-                    ascending, std::move(where), sc) {}
+    : IndexOnlyScan(
+          txn, table, index,
+          begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
+          end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
+          ascending, std::move(where), sc) {}
 
 IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
                              const Index& index,
                              const std::vector<Value>& begin_key,
                              const std::vector<Value>& end_key, bool ascending,
                              Expression where, const Schema& sc)
-    : iter_(table, index, txn, begin_key, end_key,
-            ascending),
+    : iter_(table, index, txn, begin_key, end_key, ascending),
       cond_(std::move(where)),
       key_schema_(KeySchema(index, sc)),
       value_schema_(ValueSchema(index, sc)),
@@ -67,7 +66,7 @@ Schema IndexOnlyScan::KeySchema(const Index& idx, const Schema& input_schema) {
 }
 
 Schema IndexOnlyScan::ValueSchema(const Index& idx,
-                                   const Schema& input_schema) {
+                                  const Schema& input_schema) {
   const IndexSchema& is = idx.sc_;
   std::vector<Column> cols;
   cols.reserve(is.include_.size());
@@ -101,10 +100,12 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
     }
     *dst = iter_.GetKey() + iter_.Include();
     ++iter_;
-    if (!dst->IsValid()) { continue;
-}
-    if (cond_ && !cond_->Evaluate(*dst, output_schema_).Truthy()) { continue;
-}
+    if (!dst->IsValid()) {
+      continue;
+    }
+    if (cond_ && !cond_->Evaluate(*dst, output_schema_).Truthy()) {
+      continue;
+    }
     return true;
   }
   return false;
@@ -112,7 +113,9 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
 
 void IndexOnlyScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "IndexOnlyScan: " << iter_;
-  if (!ascending_) { o << " reverse"; }
+  if (!ascending_) {
+    o << " reverse";
+  }
   if (cond_) {
     o << " WHERE " << *cond_;
   }

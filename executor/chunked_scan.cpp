@@ -87,7 +87,8 @@ size_t ChunkedScan::FillFromIndex(DataChunk* destination, size_t max_rows) {
   return raw_batch.Size();
 }
 
-size_t ChunkedScan::FillFromTableMorsels(DataChunk* destination, size_t max_rows) {
+size_t ChunkedScan::FillFromTableMorsels(DataChunk* destination,
+                                         size_t max_rows) {
   assert(destination != nullptr);
   if (table_scan_exhausted_) {
     return 0;
@@ -124,7 +125,7 @@ size_t ChunkedScan::FillFromTableMorsels(DataChunk* destination, size_t max_rows
       if (filter_) {
         SelectionVector sel;
         VectorizedExpression::FilterDataChunk(*filter_, schema_, raw_batch,
-                                             &sel);
+                                              &sel);
         destination->AppendGather(raw_batch, sel.Data(), sel.Size());
       } else {
         for (size_t i = 0; i < raw_batch.Size(); ++i) {
@@ -144,6 +145,10 @@ size_t ChunkedScan::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
+  // The batch contract is "append the next batch to the given chunk";
+  // callers that reuse a destination would otherwise mix rows from two
+  // batches, so reset before filling.
+  destination->Reset(schema_, max_rows);
   if (is_index_scan_) {
     return FillFromIndex(destination, max_rows);
   }
@@ -171,8 +176,8 @@ bool ChunkedScan::Next(Row* dst, RowPosition* rp) {
 void ChunkedScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "ChunkedScan(";
   if (is_index_scan_) {
-    o << "index=" << (index_ ? index_->sc_.name_ : "") << ", begin="
-      << index_begin_ << ", end=" << index_end_;
+    o << "index=" << (index_ ? index_->sc_.name_ : "")
+      << ", begin=" << index_begin_ << ", end=" << index_end_;
   } else {
     o << "table=" << schema_.Name() << ", morsels=" << morsels_.size();
   }

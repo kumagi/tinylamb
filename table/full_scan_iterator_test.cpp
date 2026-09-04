@@ -92,7 +92,8 @@ TEST_F(FullScanIteratorTest, BeginFullScan_AllRows_ScansSuccessfully) {
   }
 }
 
-TEST_F(FullScanIteratorTest, BeginFullScan_WithProjection_ReturnsRequestedColumnsInOrder) {
+TEST_F(FullScanIteratorTest,
+       BeginFullScan_WithProjection_ReturnsRequestedColumnsInOrder) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   ASSERT_SUCCESS(
@@ -105,14 +106,14 @@ TEST_F(FullScanIteratorTest, BeginFullScan_WithProjection_ReturnsRequestedColumn
   EXPECT_EQ((*projected)[0], Value(42));
   EXPECT_EQ((*projected)[1], Value(3.5));
 
-  Iterator no_columns =
-      table.BeginFullScan(ctx.txn_, std::vector<slot_t>{});
+  Iterator no_columns = table.BeginFullScan(ctx.txn_, std::vector<slot_t>{});
   ASSERT_TRUE(no_columns.IsValid());
   EXPECT_TRUE((*no_columns).values_.empty());
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
-TEST_F(FullScanIteratorTest, BeginFullScan_AfterDeletingFirstSlot_ScansRemainingRows) {
+TEST_F(FullScanIteratorTest,
+       BeginFullScan_AfterDeletingFirstSlot_ScansRemainingRows) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   RowPosition first;
@@ -120,7 +121,7 @@ TEST_F(FullScanIteratorTest, BeginFullScan_AfterDeletingFirstSlot_ScansRemaining
     ASSIGN_OR_ASSERT_FAIL(
         RowPosition, position,
         table.Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
-                                     Value(0.1 + i)})));
+                                    Value(0.1 + i)})));
     if (i == 0) {
       first = position;
     }
@@ -139,7 +140,8 @@ TEST_F(FullScanIteratorTest, BeginFullScan_AfterDeletingFirstSlot_ScansRemaining
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
-TEST_F(FullScanIteratorTest, BeginFullScan_OldSnapshotAfterDelete_ScansPhysicallyDeletedTailRow) {
+TEST_F(FullScanIteratorTest,
+       BeginFullScan_OldSnapshotAfterDelete_ScansPhysicallyDeletedTailRow) {
   TransactionContext seed = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "SampleTable"));
   RowPosition tail;
@@ -174,14 +176,16 @@ TEST_F(FullScanIteratorTest, BeginFullScan_OldSnapshotAfterDelete_ScansPhysicall
   ASSERT_SUCCESS(fresh_reader.PreCommit());
 }
 
-TEST_F(FullScanIteratorTest, BeginMorselScan_WithMorsels_IteratesOnlyRequestedPages) {
+TEST_F(FullScanIteratorTest,
+       BeginMorselScan_WithMorsels_IteratesOnlyRequestedPages) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   for (int i = 0; i < 130; ++i) {
-    ASSERT_SUCCESS(table.Insert(ctx.txn_,
-                                Row({Value(i), Value("v" + std::to_string(i)),
-                                     Value(0.1 + i)}))
-                       .GetStatus());
+    ASSERT_SUCCESS(
+        table
+            .Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                   Value(0.1 + i)}))
+            .GetStatus());
   }
   const std::vector<Table::ScanMorsel> morsels =
       table.BuildScanMorsels(ctx.txn_, 2);

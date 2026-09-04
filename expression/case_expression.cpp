@@ -59,8 +59,9 @@ Value CaseExpression::Evaluate(const Row& row, const Schema& schema) const {
 namespace {
 
 Type UnifiedBranchType(std::vector<Type> branch_types) {
-  if (branch_types.empty()) { return {TypeTag::kInvalid};
-}
+  if (branch_types.empty()) {
+    return {TypeTag::kInvalid};
+  }
   const Type first = branch_types.front();
   for (const Type& type : branch_types) {
     if (type.GetType() != first.GetType()) {
@@ -99,8 +100,7 @@ Value CaseExpression::Evaluate(const Row& row, const Schema& schema,
       return when.second->Evaluate(row, schema, context);
     }
   }
-  return else_clause_ ? else_clause_->Evaluate(row, schema, context)
-                      : Value();
+  return else_clause_ ? else_clause_->Evaluate(row, schema, context) : Value();
 }
 
 Type CaseExpression::ResultType(const Schema& schema) const {

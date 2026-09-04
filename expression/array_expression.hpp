@@ -12,7 +12,8 @@ namespace tinylamb {
 
 class ArrayExpression : public ExpressionBase {
  public:
-  ArrayExpression(std::vector<Expression> elements, std::string element_sql_type)
+  ArrayExpression(std::vector<Expression> elements,
+                  std::string element_sql_type)
       : elements_(std::move(elements)),
         element_sql_type_(std::move(element_sql_type)) {}
 

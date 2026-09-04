@@ -907,6 +907,125 @@ TEST_F(OptimizerTest, PhysicalRuleSubsetsPreserveOrderedLimitResults) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, JoinChainMatchesGoldenResultUnderRuleSubsets) {
+  // Phase 9 hardening: a four-relation chain whose result depends on getting
+  // every join predicate applied exactly once. The default rule set captures
+  // the golden output; every logical join-order subset crossed with every
+  // physical-rule subset must reproduce it row for row.
+  QueryData query{
+      {"Sc4", "Sc1", "Sc2", "Sc3"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(
+              BinaryExpressionExp(
+                  ColumnValueExp(ColumnName("Sc4", "c1")),
+                  BinaryOperation::kEquals,
+                  ColumnValueExp(ColumnName("Sc1", "c1"))),
+              BinaryOperation::kAnd,
+              BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                                  BinaryOperation::kEquals,
+                                  ColumnValueExp(ColumnName("Sc2", "d1")))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(
+              BinaryExpressionExp(ColumnValueExp(ColumnName("Sc2", "d1")),
+                                  BinaryOperation::kEquals,
+                                  ColumnValueExp(ColumnName("Sc3", "e1"))),
+              BinaryOperation::kAnd,
+              BinaryExpressionExp(ColumnValueExp(ColumnName("Sc4", "c2")),
+                                  BinaryOperation::kEquals,
+                                  ConstantValueExp(Value("1"))))),
+      {NamedExpression("sc4", ColumnName("Sc4", "c1")),
+       NamedExpression("sc1", ColumnName("Sc1", "c1")),
+       NamedExpression("sc3", ColumnName("Sc3", "e1"))}};
+  query.order_expressions_ = {ColumnValueExp(ColumnName("Sc4", "c1"))};
+  query.order_ascending_ = {true};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  auto drain = [&](const OptimizerOptions& options) {
+    const auto plan_or = Optimizer::Optimize(query, context, options);
+    if (plan_or.GetStatus() == Status::kNotImplemented) {
+      return std::optional<std::vector<std::array<int64_t, 3>>>{};
+    }
+    EXPECT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    Executor executor = plan_or.Value()->EmitExecutor(context);
+    std::vector<std::array<int64_t, 3>> rows;
+    Row row;
+    while (executor->Next(&row, nullptr)) {
+      rows.push_back({row[0].value.int_value, row[1].value.int_value,
+                      row[2].value.int_value});
+    }
+    return std::optional<std::vector<std::array<int64_t, 3>>>{std::move(rows)};
+  };
+
+  const auto golden = drain(OptimizerOptions::Default());
+  ASSERT_TRUE(golden.has_value());
+  // Sc4.c1 values in the filtered chain are distinct and ascending, so the
+  // golden output is a deterministic sequence.
+  ASSERT_GE(golden->size(), 5U);
+  for (size_t i = 1; i < golden->size(); ++i) {
+    EXPECT_LT((*golden)[i - 1][0], (*golden)[i][0]) << "golden not ordered";
+  }
+
+  const std::array<std::string, 4> order_rules = {
+      "join_commutativity", "join_enumeration", "join_associativity_left",
+      "join_associativity_right"};
+  const std::array<std::string, 5> physical_rules = {
+      "index_scan", "full_scan", "hash_join", "index_join", "nested_loop_join"};
+
+  std::vector<uint32_t> physical_masks;
+  for (uint32_t mask = 0; mask < (1U << physical_rules.size()); ++mask) {
+    const bool has_scan = (mask & 0b00011U) != 0;
+    const bool has_join = (mask & 0b11100U) != 0;
+    if (has_scan && has_join) {
+      physical_masks.push_back(mask);
+    }
+  }
+  // Fixed seed keeps failures reproducible.
+  std::mt19937 rng(0x4A4F494EU);  // "JOIN"
+  std::shuffle(physical_masks.begin(), physical_masks.end(), rng);
+
+  size_t planned = 0;
+  auto check = [&](const OptimizerOptions& options, uint32_t order_mask,
+                   uint32_t physical_mask) {
+    SCOPED_TRACE(::testing::Message()
+                 << "order_mask=" << order_mask
+                 << " physical_mask=" << physical_mask);
+    const auto rows = drain(options);
+    if (!rows.has_value()) {
+      return;
+    }
+    EXPECT_EQ(*rows, *golden);
+    ++planned;
+  };
+
+  // Dimension 1: every logical join-order subset with the full physical set.
+  for (uint32_t order_mask = 0; order_mask < (1U << order_rules.size());
+       ++order_mask) {
+    OptimizerOptions options = OptimizerOptions::Default();
+    for (size_t bit = 0; bit < order_rules.size(); ++bit) {
+      if ((order_mask & (1U << bit)) != 0) {
+        options.relational_rules.Remove(order_rules[bit]);
+      }
+    }
+    check(options, order_mask, (1U << physical_rules.size()) - 1);
+  }
+
+  // Dimension 2: every physical-rule subset with the full logical set.
+  for (const uint32_t physical_mask : physical_masks) {
+    OptimizerOptions options = OptimizerOptions::Default();
+    for (size_t bit = 0; bit < physical_rules.size(); ++bit) {
+      if ((physical_mask & (1U << bit)) == 0) {
+        options.disabled_implementation_rules.insert(physical_rules[bit]);
+      }
+    }
+    check(options, 0, physical_mask);
+  }
+
+  EXPECT_GE(planned, 20U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, IndexOnlyScan) {
   // Arrange
   QueryData qd{
@@ -1880,7 +1999,7 @@ TEST_F(OptimizerTest, LimitWithOrderedIndexStreamsOnlyTopKRows) {
 }
 
 TEST_F(OptimizerTest,
-       DISABLED_UnboundedIndexProvidesAscendingAndDescendingOrder) {
+       UnboundedIndexProvidesAscendingAndDescendingOrder) {
   TransactionContext context = rs_->BeginContext();
   const auto optimize = [&](bool ascending) {
     QueryData query{
@@ -2132,7 +2251,7 @@ TEST_F(OptimizerTest, InListDrivesPointUnionIndexAccess) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest, DISABLED_DisjointRangesUseBitmapOrWithResidualRecheck) {
+TEST_F(OptimizerTest, DisjointRangesUseBitmapOrWithResidualRecheck) {
   QueryData query{
       {"Sc1"},
       BinaryExpressionExp(
@@ -2176,7 +2295,7 @@ TEST_F(OptimizerTest, DISABLED_DisjointRangesUseBitmapOrWithResidualRecheck) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest, DISABLED_IndependentIndexPredicatesUseBitmapAnd) {
+TEST_F(OptimizerTest, IndependentIndexPredicatesUseBitmapAnd) {
   QueryData query{
       {"Sc2"},
       BinaryExpressionExp(

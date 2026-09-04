@@ -89,8 +89,7 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
       break;
     }
   }
-  if (slot == row_max_ &&
-      !txn.AddWriteSet(RowPosition(page_id, slot))) {
+  if (slot == row_max_ && !txn.AddWriteSet(RowPosition(page_id, slot))) {
     return Status::kConflicts;
   }
   const StatusOr<slot_t> inserted = InsertRowAt(slot, record);
@@ -135,7 +134,13 @@ StatusOr<slot_t> RowPage::InsertRow(std::string_view new_row) {
 }
 
 StatusOr<slot_t> RowPage::InsertRowAt(slot_t slot, std::string_view new_row) {
-  assert(new_row.size() <= std::numeric_limits<slot_t>::max());
+  // Leaf/Branch pages reject oversized payloads with kTooBigData; RowPage
+  // must do the same. The assert alone vanishes in NDEBUG builds, where the
+  // narrowing below (rows_[slot].size, free_ptr_/free_size_) would silently
+  // truncate the record.
+  if (new_row.size() > std::numeric_limits<bin_size_t>::max()) {
+    return Status::kTooBigData;
+  }
   if (slot < row_max_ && rows_[slot].offset != 0) {
     return Status::kConflicts;
   }
@@ -185,6 +190,9 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
 }
 
 Status RowPage::UpdateRow(slot_t slot, std::string_view record) {
+  if (record.size() > std::numeric_limits<bin_size_t>::max()) {
+    return Status::kTooBigData;
+  }
   const size_t previous_size = rows_[slot].size;
   if (record.size() <= previous_size) {
     // There is already enough space, just overwrite.
@@ -210,8 +218,7 @@ Status RowPage::UpdateRow(slot_t slot, std::string_view record) {
         live_bytes += rows_[i].size;
       }
     }
-    if (SlotArrayBytes(row_max_) + record.size() >
-        kPageBodySize - live_bytes) {
+    if (SlotArrayBytes(row_max_) + record.size() > kPageBodySize - live_bytes) {
       return Status::kNoSpace;
     }
     DeFragmentExcept(slot);
@@ -243,6 +250,14 @@ Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
 }
 
 void RowPage::DeleteRow(slot_t slot) {
+  // D2 (docs/design.md): row delete and its compensating undo may be applied
+  // more than once (loser undo rewinds page_lsn, so a second recovery pass
+  // redoes then re-undoes the same record).  A slot that is already empty
+  // (or beyond row_max_) is a successful no-op; decrementing row_count_ a
+  // second time underflowed the uint16_t to 65535 and inflated free_size_.
+  if (row_max_ <= slot || rows_[slot].offset == 0) {
+    return;
+  }
   row_count_--;
   free_size_ += rows_[slot].size;
   rows_[slot].size = rows_[slot].offset = 0;
@@ -267,8 +282,9 @@ void RowPage::DeFragmentExcept(slot_t excluded_slot) {
   free_ptr_ = kPageBodySize;
   for (size_t i = 0; i < row_max_; ++i) {
     if (rows_[i].offset == 0 || i == excluded_slot) {
-      if (i == excluded_slot) { rows_[i].size = rows_[i].offset = 0;
-}
+      if (i == excluded_slot) {
+        rows_[i].size = rows_[i].offset = 0;
+      }
       continue;
     }
 

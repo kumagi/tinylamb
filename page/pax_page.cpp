@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/serdes.hpp"
@@ -61,8 +62,11 @@ bool InBounds(uint32_t offset, uint32_t length) {
 }
 
 bool ReadDirectory(const char* in, Directory* directory) {
-  directory->type = static_cast<ValueType>(
-      static_cast<unsigned char>(in[0]));
+  const unsigned char raw_type = static_cast<unsigned char>(in[0]);
+  if (raw_type > static_cast<unsigned char>(ValueType::kArray)) {
+    return false;
+  }
+  directory->type = static_cast<ValueType>(raw_type);
   if (static_cast<PaxEncoding>(static_cast<unsigned char>(in[1])) !=
       PaxEncoding::kPlain) {
     return false;
@@ -79,8 +83,8 @@ bool ReadDirectory(const char* in, Directory* directory) {
 
 void PaxPage::Initialize() {
   bytes_.fill(0);
-  WriteHeader(bytes_.data(), 0, 0, kHeaderBytes, 0, kHeaderBytes,
-              kHeaderBytes, kHeaderBytes);
+  WriteHeader(bytes_.data(), 0, 0, kHeaderBytes, 0, kHeaderBytes, kHeaderBytes,
+              kHeaderBytes);
 }
 
 Status PaxPage::Store(const DataChunk& chunk) {
@@ -94,10 +98,11 @@ Status PaxPage::Store(const DataChunk& chunk) {
   const uint32_t visibility_offset = kHeaderBytes;
   const uint32_t visibility_length = static_cast<uint32_t>(rows) * 8U;
   const uint32_t directory_offset = visibility_offset + visibility_length;
-  const size_t directory_end =
-      static_cast<size_t>(directory_offset) +
-      static_cast<size_t>(columns) * kDirectoryBytes;
-  if (directory_end > bytes_.size()) { return Status::kNoSpace; }
+  const size_t directory_end = static_cast<size_t>(directory_offset) +
+                               static_cast<size_t>(columns) * kDirectoryBytes;
+  if (directory_end > bytes_.size()) {
+    return Status::kNoSpace;
+  }
 
   size_t cursor = directory_end;
   for (size_t column_index = 0; column_index < columns; ++column_index) {
@@ -170,9 +175,9 @@ Status PaxPage::Store(const DataChunk& chunk) {
       return Status::kUnknownType;
     }
 
-    WriteDirectory(bytes_.data() + directory_offset +
-                       column_index * kDirectoryBytes,
-                   directory);
+    WriteDirectory(
+        bytes_.data() + directory_offset + column_index * kDirectoryBytes,
+        directory);
   }
 
   WriteHeader(bytes_.data(), columns, rows, visibility_offset,
@@ -186,17 +191,27 @@ StatusOr<DataChunk> PaxPage::Load() const {
   uint16_t version = 0;
   uint16_t columns = 0;
   uint16_t rows = 0;
+  uint32_t visibility_offset = 0;
+  uint32_t visibility_length = 0;
   uint32_t directory_offset = 0;
+  uint32_t payload_begin = 0;
   uint32_t payload_end = 0;
   DeserializeU16(bytes_.data() + 0, &version);
   DeserializeU16(bytes_.data() + 2, &columns);
   DeserializeU16(bytes_.data() + 4, &rows);
+  DeserializeU32(bytes_.data() + 8, &visibility_offset);
+  DeserializeU32(bytes_.data() + 12, &visibility_length);
   DeserializeU32(bytes_.data() + 16, &directory_offset);
+  DeserializeU32(bytes_.data() + 20, &payload_begin);
   DeserializeU32(bytes_.data() + 24, &payload_end);
+  const size_t directory_end = static_cast<size_t>(directory_offset) +
+                               static_cast<size_t>(columns) * kDirectoryBytes;
   if (version != kPaxFormatVersion || payload_end > bytes_.size() ||
-      static_cast<size_t>(directory_offset) +
-              static_cast<size_t>(columns) * kDirectoryBytes >
-          bytes_.size()) {
+      directory_end > bytes_.size() || payload_begin < directory_end ||
+      payload_begin > payload_end ||
+      static_cast<size_t>(visibility_offset) + visibility_length >
+          bytes_.size() ||
+      visibility_length != static_cast<uint32_t>(rows) * 8U) {
     return Status::kCorrupt;
   }
 
@@ -204,9 +219,9 @@ StatusOr<DataChunk> PaxPage::Load() const {
   std::vector<ValueType> types;
   types.reserve(columns);
   for (size_t column = 0; column < columns; ++column) {
-    if (!ReadDirectory(bytes_.data() + directory_offset +
-                           column * kDirectoryBytes,
-                       &directories[column])) {
+    if (!ReadDirectory(
+            bytes_.data() + directory_offset + column * kDirectoryBytes,
+            &directories[column])) {
       return Status::kCorrupt;
     }
     types.push_back(directories[column].type);
@@ -217,6 +232,28 @@ StatusOr<DataChunk> PaxPage::Load() const {
       return Status::kCorrupt;
     }
   }
+  // Every column region must sit inside the payload window, and regions must
+  // not overlap: forged offsets could otherwise alias one column's bytes as
+  // another's without any out-of-bounds read to catch it. Empty ranges
+  // (kNull columns carry no value bytes) are skipped.
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  ranges.reserve(columns * 2);
+  for (const Directory& directory : directories) {
+    ranges.emplace_back(directory.data_offset, directory.data_length);
+    ranges.emplace_back(directory.null_offset, directory.null_length);
+  }
+  std::sort(ranges.begin(), ranges.end());
+  uint32_t cursor = payload_begin;
+  for (const auto& [offset, length] : ranges) {
+    if (length == 0) {
+      continue;
+    }
+    if (offset < payload_begin || length > payload_end - offset ||
+        offset < cursor) {
+      return Status::kCorrupt;
+    }
+    cursor = offset + length;
+  }
 
   DataChunk chunk(types, rows);
   for (size_t row = 0; row < rows; ++row) {
@@ -224,8 +261,7 @@ StatusOr<DataChunk> PaxPage::Load() const {
     values.reserve(columns);
     for (const Directory& directory : directories) {
       const bool is_null =
-          (static_cast<unsigned char>(
-               bytes_[directory.null_offset + row / 8]) &
+          (static_cast<unsigned char>(bytes_[directory.null_offset + row / 8]) &
            (1U << (row % 8))) != 0;
       if (is_null || directory.type == ValueType::kNull) {
         values.emplace_back();
@@ -238,8 +274,7 @@ StatusOr<DataChunk> PaxPage::Load() const {
           return Status::kCorrupt;
         }
         uint64_t bits = 0;
-        DeserializeU64(bytes_.data() + directory.data_offset + row * 8,
-                       &bits);
+        DeserializeU64(bytes_.data() + directory.data_offset + row * 8, &bits);
         if (directory.type == ValueType::kDouble) {
           values.emplace_back(std::bit_cast<double>(bits));
         } else if (directory.type == ValueType::kDate) {
@@ -256,10 +291,8 @@ StatusOr<DataChunk> PaxPage::Load() const {
         }
         uint32_t begin = 0;
         uint32_t end = 0;
-        DeserializeU32(bytes_.data() + directory.data_offset + row * 4,
-                       &begin);
-        DeserializeU32(bytes_.data() + directory.data_offset +
-                           (row + 1U) * 4,
+        DeserializeU32(bytes_.data() + directory.data_offset + row * 4, &begin);
+        DeserializeU32(bytes_.data() + directory.data_offset + (row + 1U) * 4,
                        &end);
         const size_t string_bytes = directory.data_length - offsets_bytes;
         if (begin > end || end > string_bytes) {

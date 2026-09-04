@@ -65,8 +65,7 @@ class LeafPageTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               r_.get());
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
   }
 
   PageRef Page() { return p_->GetPage(leaf_page_id_); }
@@ -101,7 +100,8 @@ TEST_F(LeafPageTest, InsertLeaf) {
   ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
   ASSERT_FAIL(page->InsertLeaf(txn, "hello", "baby"));
 
-  // Assert -- reading the inserted key returns the value; reading wrong key fails
+  // Assert -- reading the inserted key returns the value; reading wrong key
+  // fails
   ASSIGN_OR_ASSERT_FAIL(std::string_view, out1, page->Read(txn, "hello"));
   ASSERT_EQ(out1, "world");
   ASSERT_FAIL(page->Read(txn, "foo").GetStatus());
@@ -173,7 +173,8 @@ TEST_F(LeafPageTest, UpdateMany) {
   auto txn = tm_->Begin();
   PageRef page = Page();
 
-  // Act -- insert "hello" then update it 6 times with progressively longer values
+  // Act -- insert "hello" then update it 6 times with progressively longer
+  // values
   ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
   for (size_t i = 1; i <= 1000000; i *= 10) {
     ASSERT_SUCCESS(page->Update(txn, "hello", "baby" + std::to_string(i)));
@@ -189,7 +190,8 @@ TEST_F(LeafPageTest, Delete) {
   auto txn = tm_->Begin();
   PageRef page = Page();
 
-  // Act -- insert "hello", then attempt deletes of non-existent and existing keys
+  // Act -- insert "hello", then attempt deletes of non-existent and existing
+  // keys
   ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
   ASSERT_FAIL(page->Delete(txn, "hello1"));
   ASSERT_SUCCESS(page->Delete(txn, "hello"));
@@ -234,41 +236,61 @@ TEST_F(LeafPageTest, InsertDefrag) {
   PageRef page = Page();
   std::string value;
   value.resize(5000);
-  for (char& i : value) { i = '1'; }
+  for (char& i : value) {
+    i = '1';
+  }
 
   // Act 1 -- insert 6 large keys (~5000 bytes each) until page is full at key7
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key1", value));
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key2", value));
-  for (char& i : value) { i = '2'; }
+  for (char& i : value) {
+    i = '2';
+  }
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key3", value));
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key4", value));
-  for (char& i : value) { i = '3'; }
+  for (char& i : value) {
+    i = '3';
+  }
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key5", value));
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key6", value));
   ASSERT_FAIL(page->InsertLeaf(txn, "key7", value));
 
   // Act 2 -- delete key2 to free space, then insert key7 (should succeed)
   ASSERT_SUCCESS(page->Delete(txn, "key2"));
-  for (char& i : value) { i = '4'; }
+  for (char& i : value) {
+    i = '4';
+  }
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key7", value));
   ASSERT_FAIL(page->InsertLeaf(txn, "key8", value));
 
   // Act 3 -- delete key1 to free more space, then insert key8 (should succeed)
   ASSERT_SUCCESS(page->Delete(txn, "key1"));
-  for (char& i : value) { i = '5'; }
+  for (char& i : value) {
+    i = '5';
+  }
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key8", value));
 
   // Assert -- surviving keys have the expected values; key2/key1 are gone
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row1, page->Read(txn, "key3"));
-  for (const char& i : row1) { ASSERT_EQ(i, '2'); }
+  for (const char& i : row1) {
+    ASSERT_EQ(i, '2');
+  }
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row2, page->Read(txn, "key4"));
-  for (const char& i : row2) { ASSERT_EQ(i, '2'); }
+  for (const char& i : row2) {
+    ASSERT_EQ(i, '2');
+  }
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row3, page->Read(txn, "key5"));
-  for (const char& i : row3) { ASSERT_EQ(i, '3'); }
+  for (const char& i : row3) {
+    ASSERT_EQ(i, '3');
+  }
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row4, page->Read(txn, "key7"));
-  for (const char& i : row4) { ASSERT_EQ(i, '4'); }
+  for (const char& i : row4) {
+    ASSERT_EQ(i, '4');
+  }
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row5, page->Read(txn, "key8"));
-  for (const char& i : row5) { ASSERT_EQ(i, '5'); }
+  for (const char& i : row5) {
+    ASSERT_EQ(i, '5');
+  }
 }
 
 TEST_F(LeafPageTest, LowestHighestKey) {
@@ -290,7 +312,8 @@ TEST_F(LeafPageTest, LowestHighestKey) {
 }
 
 TEST_F(LeafPageTest, Split) {
-  // Arrange -- nothing more than fixture setup; Split test works on allocated pages
+  // Arrange -- nothing more than fixture setup; Split test works on allocated
+  // pages
   auto txn = tm_->Begin();
 
   // Act -- for 8 iterations, fill a left leaf page, split it into a right page,
@@ -321,7 +344,8 @@ TEST_F(LeafPageTest, Split) {
     }
   }
 
-  // Assert -- implicit; split logic verified by successful inserts and no crashes
+  // Assert -- implicit; split logic verified by successful inserts and no
+  // crashes
 }
 
 TEST_F(LeafPageTest, InsertCrash) {
@@ -627,7 +651,8 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
     kvp.emplace(key, value);
   }
 
-  // Act 2 -- for kCount*8 iterations, delete then re-insert each key with new value
+  // Act 2 -- for kCount*8 iterations, delete then re-insert each key with new
+  // value
   for (int i = 0; i < kCount * 8; ++i) {
     const std::string& key = keys[(static_cast<size_t>(i) * 63) % keys.size()];
     std::string value = RandomString(((19937 * i) % 320) + 100, false);
@@ -646,7 +671,8 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
 TEST_F(LeafPageTest, FosterChild) {
   // Arrange -- nothing more than fixture setup
 
-  // Act -- for 5 iterations, set foster pairs with random keys and child page IDs
+  // Act -- for 5 iterations, set foster pairs with random keys and child page
+  // IDs
   for (int i = 0; i < 5; ++i) {
     std::string key = RandomString(((19937 * i) % 12) + 10000, false);
     {
@@ -673,7 +699,8 @@ TEST_F(LeafPageTest, Fences) {
   Transaction txn = tm_->Begin();
   PageRef page = Page();
 
-  // Act -- for 100 iterations, set low/high fences with random strings and verify
+  // Act -- for 100 iterations, set low/high fences with random strings and
+  // verify
   for (int i = 0; i < 100; ++i) {
     std::string low = RandomString(((19937 * i) % 12) + 10000, false);
     std::string high = RandomString(((19937 * i) % 12) + 10000, false);
@@ -932,4 +959,31 @@ TEST_F(LeafPageTest, UpdateHugeValueOverflowsPhysicalSize) {
   Status result = page->Update(txn, "k", value);
   ASSERT_EQ(result, Status::kTooBigData);
 }
+TEST_F(LeafPageTest, ImplOperationsAreIdempotent) {
+  // D2 (docs/design.md): redo/undo apply through the *Impl entry points, so
+  // re-applying the same records must keep row count, slot and key content
+  // intact instead of duplicating entries or removing live neighbours.
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->body.leaf_page.InsertImpl("k1", "v1");
+  page->body.leaf_page.InsertImpl("k2", "v2");
+  page->body.leaf_page.InsertImpl("k1", "v1");  // re-applied insert
+  ASSERT_EQ(page->body.leaf_page.RowCount(), 2);
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, v1, page->Read(txn, "k1"));
+  EXPECT_EQ(v1, "v1");
+
+  page->body.leaf_page.UpdateImpl("k1", "v1b");
+  page->body.leaf_page.UpdateImpl("missing", "x");  // absent key: no-op
+  ASSERT_EQ(page->body.leaf_page.RowCount(), 2);
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, v1b, page->Read(txn, "k1"));
+  EXPECT_EQ(v1b, "v1b");
+
+  page->body.leaf_page.DeleteImpl("k1");
+  page->body.leaf_page.DeleteImpl("k1");           // re-applied delete
+  page->body.leaf_page.DeleteImpl("never-there");  // absent key: no-op
+  ASSERT_EQ(page->body.leaf_page.RowCount(), 1);
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, v2, page->Read(txn, "k2"));
+  EXPECT_EQ(v2, "v2");
+}
+
 }  // namespace tinylamb

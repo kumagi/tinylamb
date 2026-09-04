@@ -95,6 +95,19 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
                << " bytes) rejected";
     return;
   }
+  // D2 (docs/design.md): re-applying the insert (redo after a page_lsn
+  // rewind, or the same log replayed by a second recovery pass) must not
+  // duplicate the entry or inflate row_count_.  An already-present key is
+  // overwritten in place -- a logical no-op for identical payloads.
+  const size_t dup = Find(key);
+  if (dup < row_count_ && GetKey(dup) == key) {
+    std::string payload;
+    payload.resize(physical_size);
+    SerializeStringView(payload.data(), key);
+    SerializeStringView(payload.data() + SerializeSize(key), value);
+    UpdateSlotImpl(rows_[dup], payload);
+    return;
+  }
   if (free_ptr_ <= (sizeof(RowPointer) * (row_count_ + 1)) + physical_size) {
     DeFragment();
   }
@@ -110,7 +123,8 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   memmove(rows_ + pos + 1, rows_ + pos,
           sizeof(RowPointer) * (row_count_ - pos));
   row_count_++;
-  rows_[pos] = {.offset=free_ptr_, .size=static_cast<bin_size_t>(physical_size)};
+  rows_[pos] = {.offset = free_ptr_,
+                .size = static_cast<bin_size_t>(physical_size)};
 }
 
 Status LeafPage::Update(page_id_t page_id, Transaction& txn,
@@ -138,11 +152,19 @@ Status LeafPage::Update(page_id_t page_id, Transaction& txn,
 }
 
 void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
+  // D2 (docs/design.md): a re-applied update whose key is already gone
+  // (undone by a prior pass) is a no-op rather than an out-of-range slot
+  // write. Find() returns row_count_ on a miss, so the guard below rejects
+  // both a hole and a wrong-key landing.
+  const size_t pos = Find(key);
+  if (pos >= row_count_ || GetKey(pos) != key) {
+    return;
+  }
   std::string payload;
   payload.resize(SerializeSize(key) + SerializeSize(redo));
   SerializeStringView(payload.data(), key);
   SerializeStringView(payload.data() + SerializeSize(key), redo);
-  UpdateSlotImpl(rows_[Find(key)], payload);
+  UpdateSlotImpl(rows_[pos], payload);
 }
 
 void LeafPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
@@ -165,7 +187,8 @@ void LeafPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
       pos.size = 0;
       DeFragment();
     }
-    assert((sizeof(RowPointer) * (row_count_ + 1)) + physical_size <= free_ptr_);
+    assert((sizeof(RowPointer) * (row_count_ + 1)) + physical_size <=
+           free_ptr_);
     free_ptr_ -= physical_size;
     pos.offset = free_ptr_;
   }
@@ -184,9 +207,14 @@ Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
 }
 
 void LeafPage::DeleteImpl(std::string_view key) {
-  assert(0 < row_count_);
-  size_t pos = Find(key);
-  assert(pos < row_count_);
+  // D2 (docs/design.md): a re-applied delete (or an undo targeting a key a
+  // later pass already removed) must be a successful no-op.  Find() returns
+  // the insertion point, so without the equality check below a missing key
+  // would memmove away a live neighbour row and underflow row_count_.
+  const size_t pos = Find(key);
+  if (pos >= row_count_ || GetKey(pos) != key) {
+    return;
+  }
   free_size_ += rows_[pos].size + sizeof(RowPointer);
   memmove(rows_ + pos, rows_ + pos + 1,
           sizeof(RowPointer) * (row_count_ - pos - 1));
@@ -237,8 +265,9 @@ StatusOr<std::string_view> LeafPage::HighestKey(Transaction& /*unused*/) const {
 
 slot_t LeafPage::RowCount() const { return row_count_; }
 
-Status LeafPage::Split(page_id_t /*pid*/, Transaction& txn, std::string_view key,
-                       std::string_view value, Page* right) {
+Status LeafPage::Split(page_id_t /*pid*/, Transaction& txn,
+                       std::string_view key, std::string_view value,
+                       Page* right) {
   const size_t kPayload = kPageBodySize - offsetof(LeafPage, rows_);
   const size_t kThreshold = kPayload / 2;
   const size_t expected_size =
@@ -256,16 +285,15 @@ Status LeafPage::Split(page_id_t /*pid*/, Transaction& txn, std::string_view key
   // Keep pivot in [0, row_count_]: never read GetKey(row_count_).
   while (pivot < static_cast<size_t>(row_count_) && GetKey(pivot) < key &&
          consumed_size < expected_size) {
-    consumed_size += SerializeSize(GetKey(pivot)) + SerializeSize(GetValue(pivot)) +
-                     sizeof(RowPointer);
+    consumed_size += SerializeSize(GetKey(pivot)) +
+                     SerializeSize(GetValue(pivot)) + sizeof(RowPointer);
     pivot++;
   }
   while (pivot > 0 && pivot < static_cast<size_t>(row_count_) &&
          key < GetKey(pivot) && kPayload < consumed_size + expected_size) {
     pivot--;
-    consumed_size -=
-        SerializeSize(GetKey(pivot)) + SerializeSize(GetValue(pivot)) +
-        sizeof(RowPointer);
+    consumed_size -= SerializeSize(GetKey(pivot)) +
+                     SerializeSize(GetValue(pivot)) + sizeof(RowPointer);
   }
 
   const size_t original_row_count = row_count_;
@@ -279,7 +307,8 @@ Status LeafPage::Split(page_id_t /*pid*/, Transaction& txn, std::string_view key
     RETURN_IF_FAIL(this_page->Delete(txn, GetKey(pivot)));
   }
 
-  if (right->RowCount() == 0 || right->GetKey(0) <= key) {  // NOLINT(bugprone-branch-clone)
+  if (right->RowCount() == 0 ||
+      right->GetKey(0) <= key) {  // NOLINT(bugprone-branch-clone)
     assert(expected_size <= right->body.leaf_page.free_size_);
   } else {
     assert(expected_size <= free_size_);
@@ -370,15 +399,15 @@ namespace {
 
 Status FenceNeedsSpace(bin_size_t free_size, const RowPointer& fence_pos,
                        const IndexKey& fence) {
-  if (!fence.IsNotInfinity()) { return Status::kSuccess;
-}
+  if (!fence.IsNotInfinity()) {
+    return Status::kSuccess;
+  }
   const size_t physical_size = SerializeSize(fence);
   const bin_size_t old_size =
       (fence_pos == kMinusInfinity || fence_pos == kPlusInfinity)
           ? 0
           : fence_pos.size;
-  if (physical_size > old_size &&
-      free_size < physical_size - old_size) {
+  if (physical_size > old_size && free_size < physical_size - old_size) {
     return Status::kNoSpace;
   }
   return Status::kSuccess;
@@ -521,7 +550,8 @@ Status LeafPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
   std::string move_value(right.body.leaf_page.GetValue(0));
   Page* this_page = GET_PAGE_PTR(this);
   // Exclusive-sized entries cannot share a page; surface NoSpace to the caller
-  // instead of aborting so Delete/HandleFoster can leave the foster chain intact.
+  // instead of aborting so Delete/HandleFoster can leave the foster chain
+  // intact.
   RETURN_IF_FAIL(this_page->InsertLeaf(txn, move_key, move_value));
   if (1 < right.RowCount()) {
     std::string next_foster_key(right.GetKey(1));

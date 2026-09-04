@@ -42,12 +42,15 @@ std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
     columns.merge(term.expression->TouchedColumns());
   }
   for (const Expression& argument : trailing_args_) {
-    if (argument) { columns.merge(argument->TouchedColumns()); }
+    if (argument) {
+      columns.merge(argument->TouchedColumns());
+    }
   }
   return columns;
 }
 
-Value AggregateExpression::Evaluate(const Row& /*row*/, const Schema& /*schema*/) const {
+Value AggregateExpression::Evaluate(const Row& /*row*/,
+                                    const Schema& /*schema*/) const {
   // This method must not be called directly: the value of an aggregate
   // expression is calculated by the aggregator.
   throw std::logic_error("aggregate expression cannot be evaluated directly");
@@ -90,7 +93,9 @@ std::string AggregateExpression::ToString() const {
                     (distinct_ ? "DISTINCT " : "") +
                     (child_ ? child_->ToString() : "*");
   for (const Expression& argument : trailing_args_) {
-    if (argument) { out += ", " + argument->ToString(); }
+    if (argument) {
+      out += ", " + argument->ToString();
+    }
   }
   if (having_ != AggregateHavingModifier::kNone && having_cond_) {
     out += having_ == AggregateHavingModifier::kMax ? " HAVING MAX "
@@ -100,9 +105,13 @@ std::string AggregateExpression::ToString() const {
   if (!inner_order_by_.empty()) {
     out += " ORDER BY ";
     for (size_t i = 0; i < inner_order_by_.size(); ++i) {
-      if (i) { out += ", "; }
+      if (i) {
+        out += ", ";
+      }
       out += inner_order_by_[i].expression->ToString();
-      if (!inner_order_by_[i].ascending) { out += " DESC"; }
+      if (!inner_order_by_[i].ascending) {
+        out += " DESC";
+      }
     }
   }
   if (inner_limit_.has_value()) {
@@ -111,8 +120,6 @@ std::string AggregateExpression::ToString() const {
   return out + ")";
 }
 
-void AggregateExpression::Dump(std::ostream& o) const {
-  o << ToString();
-}
+void AggregateExpression::Dump(std::ostream& o) const { o << ToString(); }
 
 }  // namespace tinylamb

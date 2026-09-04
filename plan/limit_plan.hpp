@@ -36,9 +36,16 @@ class LimitPlan final : public PlanBase {
   }
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
-  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
-                                 const std::vector<bool>& ascending) const override {
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending) const override {
     return src_->IsOrderedBy(expressions, ascending);
+  }
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override {
+    return src_->IsOrderedBy(expressions, ascending, nulls_first);
   }
   [[nodiscard]] bool EnforcesLimit(size_t limit_count,
                                    size_t limit_offset) const override {

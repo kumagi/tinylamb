@@ -45,8 +45,8 @@
 // Like ASSIGN_OR_ASSERT_FAIL, but binds `value` as a const reference into the
 // temporary StatusOr so large values (Table, Row, TableStatistics, ...) are
 // not copied. Use only when `value` is never mutated afterwards.
-#define ASSIGN_OR_ASSERT_FAIL_CONST(type, value, expr) \
-  auto value##_const_tmp = expr;                       \
+#define ASSIGN_OR_ASSERT_FAIL_CONST(type, value, expr)        \
+  auto value##_const_tmp = expr;                              \
   ASSERT_EQ(value##_const_tmp.GetStatus(), Status::kSuccess); \
   const type& value(value##_const_tmp.Value())
 
@@ -66,24 +66,25 @@
     ASSERT_EQ(tmp.Value(), expected);             \
   }
 
-#define ASSIGN_OR_CRASH(type, value, expr)                       \
-  StatusOr<type> value##_tmp = expr;                             \
-  if (UNLIKELY(value##_tmp.GetStatus() != Status::kSuccess)) {   \
-    LOG(FATAL) << "Crashed: " << value##_tmp.GetStatus();        \
-    abort();                                                     \
-  }                                                              \
+#define ASSIGN_OR_CRASH(type, value, expr)                     \
+  StatusOr<type> value##_tmp = expr;                           \
+  if (UNLIKELY(value##_tmp.GetStatus() != Status::kSuccess)) { \
+    LOG(FATAL) << "Crashed: " << value##_tmp.GetStatus();      \
+    abort();                                                   \
+  }                                                            \
   type value = value##_tmp.Value()
 
 // Like ASSIGN_OR_CRASH, but binds `value` as a const reference into the
 // temporary StatusOr so the value is not copied. Use only when `value` is
 // never mutated afterwards.
-#define ASSIGN_OR_CRASH_CONST(type, value, expr)                        \
-  auto value##_const_tmp = expr;                                        \
-  if (UNLIKELY(value##_const_tmp.GetStatus() != Status::kSuccess)) {    \
-    LOG(FATAL) << "Crashed: " << value##_const_tmp.GetStatus();         \
-    abort();                                                            \
-  }                                                                     \
-  const type& value = value##_const_tmp.Value()  /* NOLINT(bugprone-macro-parentheses) */
+#define ASSIGN_OR_CRASH_CONST(type, value, expr)                     \
+  auto value##_const_tmp = expr;                                     \
+  if (UNLIKELY(value##_const_tmp.GetStatus() != Status::kSuccess)) { \
+    LOG(FATAL) << "Crashed: " << value##_const_tmp.GetStatus();      \
+    abort();                                                         \
+  }                                                                  \
+  const type& value =                                                \
+      value##_const_tmp.Value() /* NOLINT(bugprone-macro-parentheses) */
 
 namespace tinylamb {
 

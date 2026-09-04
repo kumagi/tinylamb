@@ -43,6 +43,10 @@ class TopNPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   [[nodiscard]] bool EnforcesLimit(size_t limit, size_t offset) const override {
     return !with_ties_ && limit == limit_ && offset == offset_;
   }

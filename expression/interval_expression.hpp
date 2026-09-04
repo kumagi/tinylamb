@@ -14,9 +14,14 @@ namespace tinylamb {
 
 class IntervalExpression : public ExpressionBase {
  public:
-  IntervalExpression(int64_t amount, std::string unit, std::string raw_amount = "")
-      : amount_(amount), unit_(std::move(unit)), raw_amount_(std::move(raw_amount)) {
-    for (char& c : unit_) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+  IntervalExpression(int64_t amount, std::string unit,
+                     std::string raw_amount = "")
+      : amount_(amount),
+        unit_(std::move(unit)),
+        raw_amount_(std::move(raw_amount)) {
+    for (char& c : unit_) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
     if (!raw_amount_.empty()) {
       value_ = IntervalValue::Parse(raw_amount_, unit_);
     } else {

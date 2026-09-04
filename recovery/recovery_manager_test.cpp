@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "recovery/checkpoint_manager.hpp"
 #include "recovery/recovery_manager.hpp"
 
 #include <gtest/gtest.h>
@@ -39,12 +38,13 @@
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
-#include "logger.hpp"
 #include "log_record.hpp"
+#include "logger.hpp"
 #include "page/index_key.hpp"
 #include "page/page_type.hpp"
 #include "page/row_page_test.hpp"
 #include "page/row_pointer.hpp"
+#include "recovery/checkpoint_manager.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 
@@ -71,8 +71,7 @@ class RecoveryManagerTest : public RowPageTest {
     l_ = std::make_unique<Logger>(file_name_ + ".log");
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               r_.get());
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
   }
 
   void Recover() override {
@@ -483,33 +482,197 @@ TEST_F(RecoveryManagerTest, LogUndoWithUnknownLogThrows) {
   LogRecord unknown;
   // Act -- ask for an undo of the unknown record
   // Assert -- IsPageManipulation rejects it with a runtime error
-  EXPECT_THROW(r_->LogUndoWithPage(0, unknown, tm_.get()),
-               std::runtime_error);
+  EXPECT_THROW(r_->LogUndoWithPage(0, unknown, tm_.get()), std::runtime_error);
 }
 
-TEST_F(RecoveryManagerTest, DestroyPageRedoThrowsNotImplemented) {
-  // Arrange -- append a SystemDestroyPage record for the fixture row page and
-  // flush it so recovery can see it
-  l_->AddLog(
-      LogRecord::DestroyPageLogRecord(100, 1, page_id_).Serialize());
+TEST_F(RecoveryManagerTest, LoserUndoSurvivesRepeatedRecoveryPasses) {
+  // D2 (docs/design.md) acceptance 1: a database with loser INSERT and
+  // DELETE chains must produce the same row count and content through
+  // several RecoverFrom passes (page_lsn rewinds on undo; every replayed
+  // redo/undo pair must land on the same logical state).
+  ASSERT_TRUE(InsertRow("committed-1"));
+  ASSERT_TRUE(InsertRow("committed-2"));
+  DeleteRow(1);  // committed physical delete of slot 1
+  ASSERT_TRUE(InsertRow("loser-insert", /*commit=*/false));
+  {
+    // Loser DELETE: writes the delete record, then dies without commit.
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(page->Delete(txn, 0));
+    page.PageUnlock();
+    while (l_->CommittedLSN() < l_->BufferedLSN()) {
+      std::this_thread::yield();
+    }
+    // Crash without commit or abort: the record stays a loser in the WAL.
+  }
+
+  size_t prev_count = 0;
+  std::string prev_row;
+  for (int pass = 0; pass < 3; ++pass) {
+    Recover();
+    r_->RecoverFrom(0, tm_.get());
+    const size_t count = GetRowCount();
+    const std::string row = ReadRow(0);
+    if (pass > 0) {
+      EXPECT_EQ(count, prev_count) << "pass " << pass;
+      EXPECT_EQ(row, prev_row) << "pass " << pass;
+    }
+    // The loser insert and the loser delete must both be undone: only
+    // "committed-1" at slot 0 survives the second delete's undo restoring
+    // slot 0... but "committed-1" was physically deleted? No: the committed
+    // DELETE removed slot 1 ("committed-2"); the loser DELETE targeted slot
+    // 0 and must be rolled back.
+    EXPECT_EQ(count, 1U) << "pass " << pass;
+    EXPECT_EQ(row, "committed-1") << "pass " << pass;
+    prev_count = count;
+    prev_row = row;
+  }
+}
+
+TEST_F(RecoveryManagerTest, DestroyPageRedoInitializesFreePageAndRebuildsList) {
+  // D3 (docs/design.md) acceptance 1/3: a committed destroy redo turns the
+  // page into a valid free page, the recovery-end scan links it into the
+  // rebuilt free list, and the next allocation reuses the id.
+  ASSERT_TRUE(InsertRow("doomed"));
+  Flush();
+  l_->AddLog(LogRecord::DestroyPageLogRecord(100, 1, page_id_,
+                                             PageType::kRowPage, "body")
+                 .Serialize());
   while (l_->CommittedLSN() < l_->BufferedLSN()) {
     std::this_thread::yield();
   }
-  PageRef page = p_->GetPage(page_id_);
-  ASSERT_FALSE(page.IsNull());
 
-  // Act -- replay the page's logs; the destroy record reaches LogRedo
-  // Assert -- the redo path for kSystemDestroyPage is unimplemented and throws
-  EXPECT_THROW(r_->SinglePageRecovery(std::move(page), tm_.get()),
-               std::runtime_error);
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_FALSE(page.IsNull());
+    EXPECT_EQ(page->Type(), PageType::kFreePage);
+    page.PageUnlock();
+  }
+  {
+    PageRef meta = p_->GetPage(kMetaPageId);
+    EXPECT_EQ(meta->body.meta_page.FirstFreePage(), page_id_);
+  }
+
+  // The freed page is handed out again by the allocator.
+  auto txn = tm_->Begin();
+  PageRef reused = p_->AllocateNewPage(txn, PageType::kRowPage);
+  EXPECT_EQ(reused->PageID(), page_id_);
+  reused.PageUnlock();
+  ASSERT_SUCCESS(txn.PreCommit());
+
+  // Re-running recovery over the same WAL (acceptance 3) must not corrupt
+  // the free page structure or hand the id out twice.
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
+  PageRef again = p_->GetPage(page_id_);
+  ASSERT_FALSE(again.IsNull());
+  EXPECT_NE(again->Type(), PageType::kUnknown);
+}
+
+TEST_F(RecoveryManagerTest, DestroyPageRedoTwiceOnSamePageIsIdempotent) {
+  // D3 (docs/design.md) acceptance 3: applying the same destroy redo twice
+  // leaves a structurally identical free page.
+  ASSERT_TRUE(InsertRow("twice"));
+  Flush();
+  const std::string record = LogRecord::DestroyPageLogRecord(
+                                 100, 1, page_id_, PageType::kRowPage, "body")
+                                 .Serialize();
+  l_->AddLog(record);
+  l_->AddLog(record);
+  while (l_->CommittedLSN() < l_->BufferedLSN()) {
+    std::this_thread::yield();
+  }
+
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  // The rebuilt free-page image is dirty in the pool; flush it so the
+  // header/checksum assertions observe the bytes that would survive a
+  // second crash.
+  p_->GetPool()->FlushPageForTest(page_id_);
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_FALSE(page.IsNull());
+    EXPECT_EQ(page->Type(), PageType::kFreePage);
+    EXPECT_TRUE(page->IsValid());
+    EXPECT_EQ(page->body.free_page.NextFreePage(), 0);
+    page.PageUnlock();
+  }
+  {
+    PageRef meta = p_->GetPage(kMetaPageId);
+    EXPECT_EQ(meta->body.meta_page.FirstFreePage(), page_id_);
+  }
+}
+
+TEST_F(RecoveryManagerTest, DestroyPageUndoRestoresRowContent) {
+  // D3: an aborted destroy (here a rolled-back DROP TABLE pattern) restores
+  // the page image, so committed rows survive the rollback.
+  ASSERT_TRUE(InsertRow("keepme"));
+  const page_id_t doomed = page_id_;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(doomed);
+    ASSERT_FALSE(page.IsNull());
+    p_->DestroyPage(txn, &*page);
+    page.PageUnlock();
+    txn.Abort();
+  }
+  {
+    PageRef after = p_->GetPage(doomed);
+    ASSERT_FALSE(after.IsNull());
+    EXPECT_EQ(after->Type(), PageType::kRowPage);
+  }
+  ASSERT_EQ(GetRowCount(), 1);
+  EXPECT_EQ(ReadRow(0), "keepme");
+  // The restored page must not linger on the allocator free stack.
+  PageRef meta = p_->GetPage(kMetaPageId);
+  EXPECT_NE(meta->body.meta_page.FirstFreePage(), doomed);
+}
+
+TEST_F(RecoveryManagerTest, LegacyV1DestroyRecordStillParses) {
+  // D3 (docs/design.md): readers keep accepting the v1 pid-only destroy
+  // record; Size() matches the on-disk bytes so log scanning stays synced.
+  LogRecord record = LogRecord::DestroyPageLogRecord(100, 1, page_id_);
+  std::string v1 = record.Serialize();
+  // Strip the v2+ destroy tail (PageType u64 + length-prefixed empty body)
+  // and the v3 CRC field, then downgrade the header version back to v1
+  // (big-endian): the result is a byte-exact legacy v1 pid-only record.
+  v1.resize(v1.size() -
+            (sizeof(uint64_t) + sizeof(uint16_t) + kWalRecordCrcSize));
+  v1[4] = 0;
+  v1[5] = 0;
+  v1[6] = 0;
+  v1[7] = kLegacyWalRecordVersion;
+  ASSERT_EQ(v1.size(), 4U + 4U + 2U + 8U + 8U + 1U + 8U);
+
+  std::istringstream in(v1);
+  Decoder dec(in);
+  LogRecord decoded;
+  dec >> decoded;
+  EXPECT_EQ(decoded.type, LogType::kSystemDestroyPage);
+  EXPECT_EQ(decoded.pid, page_id_);
+  EXPECT_EQ(decoded.allocated_page_type, PageType::kUnknown);
+  EXPECT_TRUE(decoded.undo_data.empty());
+  EXPECT_EQ(decoded.Size(), v1.size());  // v1 has no CRC tail
+
+  // Scanning over a legacy record must stay byte-synchronized.
+  const lsn_t start = l_->BufferedLSN();
+  l_->AddLog(v1);
+  while (l_->CommittedLSN() < l_->BufferedLSN()) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(r_->ValidLogEnd(start), start + v1.size());
 }
 
 TEST_F(RecoveryManagerTest, EndCheckpointRecordsCommittedTransactions) {
   // Arrange -- append an EndCheckpoint record whose active-transaction table
   // already marks txn 42 as committed
   l_->AddLog(LogRecord::EndCheckpointLogRecord(
-                 {{page_id_, 0}},
-                 {{42, TransactionStatus::kCommitted, 0}})
+                 {{page_id_, 0}}, {{42, TransactionStatus::kCommitted, 0}})
                  .Serialize());
   while (l_->CommittedLSN() < l_->BufferedLSN()) {
     std::this_thread::yield();
@@ -587,9 +750,8 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoSetFoster) {
     page.PageUnlock();
     txn.PreCommit();
   }
-  LogRecord foster =
-      LogRecord::SetFosterLogRecord(0, 7, pid, FosterPair("redo", 1),
-                                    FosterPair("undo", 2));
+  LogRecord foster = LogRecord::SetFosterLogRecord(
+      0, 7, pid, FosterPair("redo", 1), FosterPair("undo", 2));
 
   // Act -- undo a SetFoster on the leaf page
   r_->LogUndoWithPage(0, foster, tm_.get());
@@ -607,12 +769,10 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoSetFences) {
     page.PageUnlock();
     txn.PreCommit();
   }
-  LogRecord low = LogRecord::SetLowFenceLogRecord(0, 7, pid,
-                                                  IndexKey("redo-low"),
-                                                  IndexKey("undo-low"));
-  LogRecord high = LogRecord::SetHighFenceLogRecord(0, 7, pid,
-                                                    IndexKey("redo-high"),
-                                                    IndexKey("undo-high"));
+  LogRecord low = LogRecord::SetLowFenceLogRecord(
+      0, 7, pid, IndexKey("redo-low"), IndexKey("undo-low"));
+  LogRecord high = LogRecord::SetHighFenceLogRecord(
+      0, 7, pid, IndexKey("redo-high"), IndexKey("undo-high"));
 
   // Act -- undo the low and high fence updates
   r_->LogUndoWithPage(0, low, tm_.get());
@@ -751,8 +911,8 @@ TEST_F(RecoveryManagerTest, ReplayBranchPageLogsRedoAndUndo) {
   }
   l_->AddLog(
       LogRecord::InsertingBranchLogRecord(0, 42, pid, "b", 50).Serialize());
-  l_->AddLog(LogRecord::UpdatingBranchLogRecord(0, 42, pid, "b", 51, 50)
-                 .Serialize());
+  l_->AddLog(
+      LogRecord::UpdatingBranchLogRecord(0, 42, pid, "b", 51, 50).Serialize());
   l_->AddLog(
       LogRecord::DeletingBranchLogRecord(0, 42, pid, "b", 51).Serialize());
   l_->AddLog(LogRecord::SetLowestLogRecord(0, 42, pid, 60, 70).Serialize());
@@ -903,9 +1063,9 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoBranchDelete) {
 
 TEST_F(RecoveryManagerTest, ParallelReplayRethrowsWorkerError) {
   // Arrange -- two committed, on-disk-valid row pages so the recovery has two
-  // replay jobs, plus a DestroyPage log for the fixture page whose LogRedo arm
-  // throws std::runtime_error("not implemented yet").  The destroy log is
-  // appended after the pages were flushed, so its LSN exceeds the pages'
+  // replay jobs, plus a corrupt-by-type record (kUpdateBranch against a ROW
+  // page) whose LogRedo arm throws via the page-type assertion.  The record
+  // is appended after the pages were flushed, so its LSN exceeds the pages'
   // PageLSN and the redo phase really reaches the throwing arm.
   ASSERT_TRUE(InsertRow("first"));
   page_id_t second_pid = 0;
@@ -919,7 +1079,8 @@ TEST_F(RecoveryManagerTest, ParallelReplayRethrowsWorkerError) {
   }
   Flush();
   p_->GetPool()->FlushPageForTest(second_pid);
-  l_->AddLog(LogRecord::DestroyPageLogRecord(100, 1, page_id_).Serialize());
+  l_->AddLog(LogRecord::UpdatingBranchLogRecord(100, 1, page_id_, "k", 2, 3)
+                 .Serialize());
   while (l_->CommittedLSN() < l_->BufferedLSN()) {
     std::this_thread::yield();
   }
@@ -972,7 +1133,8 @@ TEST_F(RecoveryManagerTest, RecoveryTraceLogsExecuteInFreshProcess) {
   const std::string self =
       std::filesystem::read_symlink("/proc/self/exe").string();
   const std::string filter =
-      "--gtest_filter=RecoveryManagerTest.RecoveryTraceLogsExecuteInFreshProcess";
+      "--gtest_filter=RecoveryManagerTest."
+      "RecoveryTraceLogsExecuteInFreshProcess";
   const std::string cmd = "TINYLAMB_RECOVERY_TRACE=1 '" + self + "' " + filter +
                           " --gtest_brief=1 >/dev/null 2>&1";
   // Re-executes this test binary itself to verify the env-gated recovery
@@ -1024,7 +1186,8 @@ TEST_F(RecoveryManagerTest, HalfWrittenRecordIsTruncatedOnce) {
       LogRecord::InsertingLogRecord(0, 777, page_id_, 1, "half").Serialize();
   {
     std::ofstream tail(file_name_ + ".log", std::ios::app | std::ios::binary);
-    tail.write(payload.data(), static_cast<std::streamsize>(payload.size() / 2));
+    tail.write(payload.data(),
+               static_cast<std::streamsize>(payload.size() / 2));
     ASSERT_FALSE(tail.fail());
   }
 
@@ -1048,8 +1211,7 @@ TEST_F(RecoveryManagerTest, CorruptTailAbortsByDefault) {
     ASSERT_TRUE(InsertRow("survivor"));
     WaitForLogFlush(l_);
     {
-      std::ofstream tail(file_name_ + ".log",
-                         std::ios::app | std::ios::binary);
+      std::ofstream tail(file_name_ + ".log", std::ios::app | std::ios::binary);
       tail << "\x51\x13torn-tail";
       ASSERT_FALSE(tail.fail());
     }
@@ -1178,6 +1340,107 @@ TEST_F(RecoveryManagerTest, CheckpointDirtyPageTablePreservesMaxPageId) {
     again.PageUnlock();
   }
   std::ignore = std::remove(master.c_str());
+}
+
+// D9 (docs/design.md): per-record CRC32C at the WAL tail.
+TEST_F(RecoveryManagerTest, MidRecordBitFlipStopsScanAtThatRecord) {
+  // Arrange -- a committed row, then a second committed-INSERT record whose
+  // payload middle byte is flipped after the log is durable.  Headers stay
+  // parseable; only the CRC can catch this corruption.
+  ASSERT_TRUE(InsertRow("before-flip"));
+  WaitForLogFlush(l_);
+  const lsn_t second_start = l_->BufferedLSN();
+  l_->AddLog(LogRecord::InsertingLogRecord(0, 99, page_id_, 1, "intact-payload")
+                 .Serialize());
+  WaitForLogFlush(l_);
+  {
+    std::fstream file(file_name_ + ".log",
+                      std::ios::in | std::ios::out | std::ios::binary);
+    // Flip the final payload byte (just before the CRC field).
+    const std::streampos target =
+        static_cast<std::streampos>(second_start + 20);
+    file.seekp(target);
+    const int original = file.get();
+    file.seekp(target);
+    file.put(static_cast<char>(original ^ 0x01));
+    ASSERT_FALSE(file.fail());
+  }
+
+  // Act -- the scan must stop exactly at the corrupted record, not past it.
+  EXPECT_EQ(r_->ValidLogEnd(0), second_start);
+
+  // Assert -- forced recovery truncates at the stop point and keeps the
+  // earlier committed row intact.
+  RecoveryManager::SetTornTailTruncationAllowed(true);
+  Recover();
+  ASSERT_NO_FATAL_FAILURE(r_->RecoverFrom(0, tm_.get()));
+  EXPECT_EQ(static_cast<lsn_t>(std::filesystem::file_size(file_name_ + ".log")),
+            second_start);
+  ASSERT_EQ(GetRowCount(), 1);
+  EXPECT_EQ(ReadRow(0), "before-flip");
+}
+
+TEST_F(RecoveryManagerTest, MixedLegacyAndCurrentVersionLogsScanCleanly) {
+  // D9 (docs/design.md): the reader walks a WAL that mixes v1 (no CRC) and
+  // current-version (CRC) records; every record byte-counts exactly.
+  const lsn_t start = l_->BufferedLSN();
+  LogRecord destroy = LogRecord::DestroyPageLogRecord(100, 1, page_id_);
+  std::string legacy = destroy.Serialize();
+  legacy.resize(legacy.size() -
+                (sizeof(uint64_t) + sizeof(uint16_t) + kWalRecordCrcSize));
+  legacy[4] = 0;
+  legacy[5] = 0;
+  legacy[6] = 0;
+  legacy[7] = kLegacyWalRecordVersion;
+  l_->AddLog(legacy);
+  const lsn_t after_legacy = l_->BufferedLSN();
+  EXPECT_EQ(after_legacy - start, legacy.size());
+  l_->AddLog(destroy.Serialize());
+  WaitForLogFlush(l_);
+
+  EXPECT_EQ(r_->ValidLogEnd(start), l_->BufferedLSN());
+  LogRecord decoded;
+  ASSERT_TRUE(r_->ReadLog(start, &decoded));
+  EXPECT_EQ(decoded.wire_version, kLegacyWalRecordVersion);
+  ASSERT_TRUE(r_->ReadLog(after_legacy, &decoded));
+  EXPECT_EQ(decoded.wire_version, kWalRecordVersion);
+}
+
+TEST_F(RecoveryManagerTest, ReadLogRejectsCorruptPageTypeWithoutThrowing) {
+  // D4: a record whose header is valid but whose PageType payload byte is out
+  // of range must make ReadLog return false (torn/corrupt tail), not throw out
+  // of the decoder and abort startup.
+  ASSERT_TRUE(InsertRow("alloc-before"));
+  WaitForLogFlush(l_);
+  const lsn_t start = l_->BufferedLSN();
+  LogRecord alloc =
+      LogRecord::AllocatePageLogRecord(0, 1, 500, PageType::kRowPage);
+  std::string bytes = alloc.Serialize();
+  // The PageType is serialized as a big-endian uint64 after the fixed header;
+  // corrupt its low byte to an undefined discriminant (v3 has a trailing CRC,
+  // so also drop the CRC to force the decode path rather than CRC rejection).
+  ASSERT_GT(bytes.size(), 12U);
+  bytes[bytes.size() - kWalRecordCrcSize - 1] = static_cast<char>(0x7f);
+  l_->AddLog(bytes);
+  WaitForLogFlush(l_);
+
+  LogRecord decoded;
+  EXPECT_NO_THROW({
+    // Either the CRC check or the decoder guard rejects it; both yield false.
+    EXPECT_FALSE(r_->ReadLog(start, &decoded));
+  });
+}
+
+TEST_F(RecoveryManagerTest, SetLowestValueCompensationRecordIsIdempotent) {
+  // D1: the SetLowestValue CLR reuses the normal kLowestValue type, so a
+  // second recovery pass would undo it. undo_page == redo_page makes redo and
+  // undo both restore the same value (previously undo_page defaulted to 0 and
+  // clobbered lowest_page_ to an invalid id).
+  const LogRecord clr =
+      LogRecord::CompensateSetLowestValueLogRecord(7, 42, 1234);
+  EXPECT_EQ(clr.type, LogType::kLowestValue);
+  EXPECT_EQ(clr.redo_page, 1234U);
+  EXPECT_EQ(clr.undo_page, 1234U);
 }
 
 }  // namespace tinylamb

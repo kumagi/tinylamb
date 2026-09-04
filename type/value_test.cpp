@@ -90,7 +90,8 @@ TEST(ValueTest, SerializeDeserialize_DiverseTypes_PreservesValues) {
   SerializeDeserializeTest(v_double);
 }
 
-TEST(ValueTest, SerializeDeserialize_DateAndBinaryAndLongVarchar_PreservesValues) {
+TEST(ValueTest,
+     SerializeDeserialize_DateAndBinaryAndLongVarchar_PreservesValues) {
   Value v_date = Value::Date("2020-01-02");
   Value v_empty("");
   const std::string binary("\x00\x01\xff embedded \x00 nulls", 20);
@@ -207,7 +208,8 @@ TEST(ValueTest, EncodeMemcomparableFormat_WithIntValues_PreservesTotalOrder) {
   MemcomparableFormatEncodeTest(extreme);
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_WithDoubleValues_PreservesOrderAndSignFlag) {
+TEST(ValueTest,
+     EncodeMemcomparableFormat_WithDoubleValues_PreservesOrderAndSignFlag) {
   // Fixed: the sign flag used to be written via `be |= 0x80`, which only
   // landed on the first image byte on little-endian hosts.  The flag byte is
   // now written positionally and must match the decoder's expectation on any
@@ -220,11 +222,13 @@ TEST(ValueTest, EncodeMemcomparableFormat_WithDoubleValues_PreservesOrderAndSign
   EXPECT_NE(enc_pos[1] & 0x80, 0);
   EXPECT_EQ(enc_neg[1] & 0x80, 0);
 
-  std::vector<Value> edge = {
-      Value(-std::numeric_limits<double>::infinity()),
-      Value(-1.0), Value(0.0), Value(1e-300),
-      Value(1.0), Value(std::numeric_limits<double>::max()),
-      Value(std::numeric_limits<double>::infinity())};
+  std::vector<Value> edge = {Value(-std::numeric_limits<double>::infinity()),
+                             Value(-1.0),
+                             Value(0.0),
+                             Value(1e-300),
+                             Value(1.0),
+                             Value(std::numeric_limits<double>::max()),
+                             Value(std::numeric_limits<double>::infinity())};
   MemcomparableFormatEncodeTest(edge);
 
   // -0.0 and +0.0 encode to the same image (SQL treats them equal).
@@ -247,7 +251,8 @@ TEST(ValueTest, EncodeMemcomparableFormat_WithDoubleValues_PreservesOrderAndSign
   EXPECT_TRUE(std::isnan(decoded_nan.value.double_value));
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_WithVariousVarchars_MatchesExpectedEncoding) {
+TEST(ValueTest,
+     EncodeMemcomparableFormat_WithVariousVarchars_MatchesExpectedEncoding) {
   Value v_a("a");
   Value v_ab("ab");
   Value v_abc("abc");
@@ -291,24 +296,24 @@ TEST(ValueTest, EncodeMemcomparableFormat_WithVariousVarchars_MatchesExpectedEnc
       v_abcdefghij.EncodeMemcomparableFormat(),
       std::string({'\2', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', '\x09', 'i',
                    'j', '\0', '\0', '\0', '\0', '\0', '\0', '\x02'}));
-  EXPECT_EQ(
-      v_bin.EncodeMemcomparableFormat(),
-      std::string("\x02\x60\x70\x10\x11\x12\x80\x90\x01\x08"));
+  EXPECT_EQ(v_bin.EncodeMemcomparableFormat(),
+            std::string("\x02\x60\x70\x10\x11\x12\x80\x90\x01\x08"));
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_WithVarcharValues_PreservesTotalOrder) {
+TEST(ValueTest,
+     EncodeMemcomparableFormat_WithVarcharValues_PreservesTotalOrder) {
   std::vector<Value> prefixes = {Value("a"), Value("aa"), Value("aaa")};
   std::vector<Value> alpha = {Value("a"), Value("b"), Value("c")};
   std::vector<Value> long_strs = {Value("blah,blah,blah"),
-                                  Value("this is a pen"),
-                                  Value("0123456789")};
+                                  Value("this is a pen"), Value("0123456789")};
 
   MemcomparableFormatEncodeTest(prefixes);
   MemcomparableFormatEncodeTest(alpha);
   MemcomparableFormatEncodeTest(long_strs);
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_WithDoubleValues_MatchesExpectedEncoding) {
+TEST(ValueTest,
+     EncodeMemcomparableFormat_WithDoubleValues_MatchesExpectedEncoding) {
   Value v_pos(1.0);
   Value v_zero(0.0);
   Value v_neg(-1.0);
@@ -324,7 +329,8 @@ TEST(ValueTest, EncodeMemcomparableFormat_WithDoubleValues_MatchesExpectedEncodi
                          '\xff', '\xff'}));
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_WithDoubleValues_PreservesTotalOrder) {
+TEST(ValueTest,
+     EncodeMemcomparableFormat_WithDoubleValues_PreservesTotalOrder) {
   std::vector<Value> ascending = {Value(1.0), Value(2.0), Value(3.0)};
   std::vector<Value> descending = {Value(-1.0), Value(-2.0), Value(-3.0)};
   std::vector<Value> signed_vals = {Value(-1.0), Value(0.0), Value(1.0)};
@@ -387,6 +393,23 @@ TEST(ValueTest, MemcomparableFormat_WithVarcharValues_RoundTripsAccurately) {
   EncodeDecodeTest(v_rand);
 }
 
+TEST(ValueTest, MemcomparableFormat_VarcharEmptyAndCorruptFlag) {
+  // Empty string encodes as a single all-zero group (flag byte 0); the
+  // hardened decoder must accept it as "" rather than reject flag==0.
+  Value empty("");
+  EncodeDecodeTest(empty);
+
+  // A flag byte in [10,255] is not a valid group terminator: reject it
+  // instead of reading a bogus length.
+  std::string corrupt;
+  corrupt.push_back(static_cast<char>(ValueType::kVarChar));
+  corrupt.append(8, 'x');
+  corrupt.push_back(static_cast<char>(12));  // invalid flag
+  Value decoded;
+  EXPECT_THROW(decoded.DecodeMemcomparableFormat(corrupt.c_str()),
+               std::runtime_error);
+}
+
 TEST(ValueTest, MemcomparableFormat_WithDoubleValues_RoundTripsAccurately) {
   Value v_max(std::numeric_limits<double>::max());
   Value v_12(12.0);
@@ -420,7 +443,8 @@ void MemcomparableFormatDecodeTest(const std::vector<std::string>& input) {
 
 }  // namespace
 
-TEST(ValueTest, DecodeMemcomparableFormat_WithPermutedIntBytes_DecodesInAscendingOrder) {
+TEST(ValueTest,
+     DecodeMemcomparableFormat_WithPermutedIntBytes_DecodesInAscendingOrder) {
   std::string src = "\x60\x70\x80\x90\x10\x11\x12";
   ASSERT_EQ(src.size(), 7);
   std::vector<std::string> targets;
@@ -431,7 +455,9 @@ TEST(ValueTest, DecodeMemcomparableFormat_WithPermutedIntBytes_DecodesInAscendin
   MemcomparableFormatDecodeTest(targets);
 }
 
-TEST(ValueTest, DecodeMemcomparableFormat_WithPermutedVarcharBytes_DecodesInAscendingOrder) {
+TEST(
+    ValueTest,
+    DecodeMemcomparableFormat_WithPermutedVarcharBytes_DecodesInAscendingOrder) {
   std::string src = "\x60\x70\x80\x90\x10\x11\x12";
   ASSERT_EQ(src.size(), 7);
   std::vector<std::string> targets;
@@ -446,7 +472,9 @@ TEST(ValueTest, DecodeMemcomparableFormat_WithPermutedVarcharBytes_DecodesInAsce
   MemcomparableFormatDecodeTest(targets);
 }
 
-TEST(ValueTest, DecodeMemcomparableFormat_WithPermutedDoubleBytes_DecodesInAscendingOrder) {
+TEST(
+    ValueTest,
+    DecodeMemcomparableFormat_WithPermutedDoubleBytes_DecodesInAscendingOrder) {
   std::string src = "\x60\x70\x80\x90\x10\x11\x12";
   std::vector<std::string> targets;
   do {
@@ -460,15 +488,18 @@ TEST(ValueTest, ToString_UnaryAndAggregationEnums_FormatsExpectedStrings) {
   std::ostringstream unary;
   std::ostringstream agg;
 
-  unary << UnaryOperation::kIsNull << "|" << UnaryOperation::kIsNotNull << "|"
-        << UnaryOperation::kNot << "|" << UnaryOperation::kMinus << "|"
-        << static_cast<UnaryOperation>(  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
-            99);
+  unary
+      << UnaryOperation::kIsNull << "|" << UnaryOperation::kIsNotNull << "|"
+      << UnaryOperation::kNot << "|" << UnaryOperation::kMinus << "|"
+      << static_cast<
+             UnaryOperation>(  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+             99);
   agg << AggregationType::kCount << "|" << AggregationType::kSum << "|"
       << AggregationType::kAvg << "|" << AggregationType::kMin << "|"
       << AggregationType::kMax << "|"
-      << static_cast<AggregationType>(  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
-          99);
+      << static_cast<
+             AggregationType>(  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+             99);
 
   EXPECT_EQ(unary.str(), "IS NULL|IS NOT NULL|NOT|-|UNKNOWN");
   EXPECT_EQ(agg.str(), "COUNT|SUM|AVG|MIN|MAX|UNKNOWN");
@@ -509,7 +540,8 @@ TEST(ValueTest, AsString_VariousValueTypes_ReturnsFormattedString) {
   EXPECT_EQ(oss.str(), "7");
 }
 
-TEST(ValueTest, PlusOperator_WithVarcharsAndIncompatibleTypes_ConcatenatesOrThrows) {
+TEST(ValueTest,
+     PlusOperator_WithVarcharsAndIncompatibleTypes_ConcatenatesOrThrows) {
   Value s1("foo");
   Value s2("bar");
   Value num(1);
@@ -688,7 +720,8 @@ TEST(ValueTest, Truthy_VariousTypes_ReturnsExpectedBoolean) {
   EXPECT_TRUE(double_zero.Truthy());
 }
 
-TEST(ValueTest, ComparisonOperators_WithIntegers_ReturnsConsistentBooleanResults) {
+TEST(ValueTest,
+     ComparisonOperators_WithIntegers_ReturnsConsistentBooleanResults) {
   Value v1(1);
   Value v2(2);
 
@@ -721,7 +754,8 @@ TEST(DateTest, ParseAndFormat_ValidDates_RoundTripsPreservingChronology) {
   EXPECT_LT(ParseDateDays("2020-01-01"), ParseDateDays("2020-01-02"));
 }
 
-TEST(DateTest, AddDateIntervalDays_DayMonthYearIntervals_CalculatesCorrectDates) {
+TEST(DateTest,
+     AddDateIntervalDays_DayMonthYearIntervals_CalculatesCorrectDates) {
   int64_t d_jan31_2024 = ParseDateDays("2024-01-31");
   int64_t d_mar01_2024 = ParseDateDays("2024-03-01");
   int64_t d_jan31_2023 = ParseDateDays("2023-01-31");
@@ -760,9 +794,9 @@ TEST(DateTest, AddDateIntervalDays_WithUnknownUnits_ThrowsRuntimeError) {
 }
 
 TEST(DateTest, ValueDateFromDays_ValidDays_ConstructsExpectedValue) {
-  const std::vector<int64_t> day_counts = {
-      ParseDateDays("1970-01-01"), ParseDateDays("2020-02-29"),
-      ParseDateDays("2038-01-19")};
+  const std::vector<int64_t> day_counts = {ParseDateDays("1970-01-01"),
+                                           ParseDateDays("2020-02-29"),
+                                           ParseDateDays("2038-01-19")};
 
   for (int64_t days : day_counts) {
     const Value value = Value::DateFromDays(days);
@@ -838,7 +872,8 @@ TEST(ValueTest, Arithmetic_OnNonNumericTypes_ThrowsRuntimeError) {
 
 TEST(ValueTest, Operations_OnInvalidValueType_ThrowsRuntimeError) {
   Value broken;
-  broken.type = static_cast<ValueType>(99);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+  broken.type = static_cast<ValueType>(
+      99);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
   std::array<char, 16> buffer{};
 
   EXPECT_THROW(std::ignore = broken.Size(), std::runtime_error);
@@ -846,7 +881,8 @@ TEST(ValueTest, Operations_OnInvalidValueType_ThrowsRuntimeError) {
   EXPECT_THROW(
       broken.Deserialize(
           buffer.data(),
-          static_cast<ValueType>(99)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+          static_cast<ValueType>(
+              99)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
       std::runtime_error);
   EXPECT_THROW(std::ignore = broken.AsString(), std::runtime_error);
   EXPECT_THROW(std::ignore = broken.EncodeMemcomparableFormat(),
@@ -857,7 +893,8 @@ TEST(ValueTest, Operations_OnInvalidValueType_ThrowsRuntimeError) {
   EXPECT_THROW(std::hash<Value>{}(broken), std::runtime_error);
 }
 
-TEST(ValueTest, DecodeMemcomparableFormat_WithInvalidPrefix_ThrowsRuntimeError) {
+TEST(ValueTest,
+     DecodeMemcomparableFormat_WithInvalidPrefix_ThrowsRuntimeError) {
   Value v;
 
   EXPECT_THROW(v.DecodeMemcomparableFormat("\x00"), std::runtime_error);
@@ -896,16 +933,16 @@ TEST(ValueTest, UnorderedContainers_WithNullKeys_HandlesLookupAndCounting) {
   EXPECT_EQ(group_count, 2);
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_VarcharBoundaryShapes_PreservesRelativeOrder) {
-  std::vector<Value> prefixes = {Value(""), Value("a"), Value("ab"), Value("abc")};
-  std::vector<Value> nul_bytes = {Value(std::string("a\0b", 3)),
-                                  Value(std::string("a", 1)),
-                                  Value(std::string("a\0", 2)),
-                                  Value(std::string("a!", 2))};
-  std::vector<Value> high_bit = {Value(std::string("\x01", 1)),
-                                 Value(std::string("\x7f", 1)),
-                                 Value(std::string("\x80", 1)),
-                                 Value(std::string("\xff", 1))};
+TEST(ValueTest,
+     EncodeMemcomparableFormat_VarcharBoundaryShapes_PreservesRelativeOrder) {
+  std::vector<Value> prefixes = {Value(""), Value("a"), Value("ab"),
+                                 Value("abc")};
+  std::vector<Value> nul_bytes = {
+      Value(std::string("a\0b", 3)), Value(std::string("a", 1)),
+      Value(std::string("a\0", 2)), Value(std::string("a!", 2))};
+  std::vector<Value> high_bit = {
+      Value(std::string("\x01", 1)), Value(std::string("\x7f", 1)),
+      Value(std::string("\x80", 1)), Value(std::string("\xff", 1))};
   std::vector<Value> long_prefixes = {
       Value(std::string(64, 'x') + "a"),
       Value(std::string(64, 'x') + "b"),
@@ -919,7 +956,8 @@ TEST(ValueTest, EncodeMemcomparableFormat_VarcharBoundaryShapes_PreservesRelativ
   MemcomparableFormatEncodeTest(long_prefixes);
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_EmptyAndNonEmptyVarchar_SortsEmptyFirst) {
+TEST(ValueTest,
+     EncodeMemcomparableFormat_EmptyAndNonEmptyVarchar_SortsEmptyFirst) {
   Value empty_val("");
   Value one_val("a");
 
@@ -933,10 +971,8 @@ TEST(ValueTest, EncodeMemcomparableFormat_EmptyAndNonEmptyVarchar_SortsEmptyFirs
 TEST(ValueTest, ToString_AllUnaryOperations_FormatsCorrectStrings) {
   std::ostringstream oss;
 
-  oss << UnaryOperation::kIsTrue << "|"
-      << UnaryOperation::kIsNotTrue << "|"
-      << UnaryOperation::kIsFalse << "|"
-      << UnaryOperation::kIsNotFalse;
+  oss << UnaryOperation::kIsTrue << "|" << UnaryOperation::kIsNotTrue << "|"
+      << UnaryOperation::kIsFalse << "|" << UnaryOperation::kIsNotFalse;
 
   EXPECT_EQ(oss.str(), "IS TRUE|IS NOT TRUE|IS FALSE|IS NOT FALSE");
 }
@@ -945,7 +981,8 @@ TEST(ValueTest, Deserialize_WithUndefinedValueType_ThrowsRuntimeError) {
   Value v;
   char buf[16]{};
 
-  EXPECT_THROW(v.Deserialize(buf, static_cast<ValueType>(99)), std::runtime_error);
+  EXPECT_THROW(v.Deserialize(buf, static_cast<ValueType>(99)),
+               std::runtime_error);
 }
 
 TEST(ValueTest, SkipSerialized_WithNullOrUndefinedType_ThrowsRuntimeError) {
@@ -975,8 +1012,10 @@ TEST(ValueTest, EncodeMemcomparableFormat_OnNullValue_ThrowsRuntimeError) {
                std::runtime_error);
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_ArrayWithNullElement_RoundTripsDecodedArray) {
-  Value arr = Value::Array({Value(int64_t{1}), Value(), Value(int64_t{3})}, "INT64");
+TEST(ValueTest,
+     EncodeMemcomparableFormat_ArrayWithNullElement_RoundTripsDecodedArray) {
+  Value arr =
+      Value::Array({Value(int64_t{1}), Value(), Value(int64_t{3})}, "INT64");
 
   std::string encoded = arr.EncodeMemcomparableFormat();
   Value decoded;
@@ -1022,7 +1061,8 @@ TEST(DateTest, FormatDateDays_DaysOutOfRange_ThrowsRuntimeError) {
   int64_t underflow_days = -20000000LL;
   int64_t overflow_days = 20000000LL;
 
-  EXPECT_THROW(std::ignore = FormatDateDays(underflow_days), std::runtime_error);
+  EXPECT_THROW(std::ignore = FormatDateDays(underflow_days),
+               std::runtime_error);
   EXPECT_THROW(std::ignore = FormatDateDays(overflow_days), std::runtime_error);
 }
 
@@ -1030,33 +1070,32 @@ TEST(DateTest, AddDateIntervalDays_YearOverflow_ThrowsRuntimeError) {
   int64_t max_date = ParseDateDays("9999-12-31");
   int64_t min_date = ParseDateDays("0001-01-01");
 
-  EXPECT_THROW(
-      std::ignore = AddDateIntervalDays(max_date, 999999, "year"),
-      std::runtime_error);
-  EXPECT_THROW(
-      std::ignore = AddDateIntervalDays(min_date, -999999, "year"),
-      std::runtime_error);
+  EXPECT_THROW(std::ignore = AddDateIntervalDays(max_date, 999999, "year"),
+               std::runtime_error);
+  EXPECT_THROW(std::ignore = AddDateIntervalDays(min_date, -999999, "year"),
+               std::runtime_error);
 }
 
 TEST(DateTest, ParseDateDays_InvalidDateStrings_ThrowsRuntimeError) {
   int64_t valid_date = ParseDateDays("2024-01-01");
 
-  EXPECT_THROW(std::ignore = ParseDateDays("999999999-01-01"), std::runtime_error);
-  EXPECT_THROW(std::ignore = ParseDateDays("2024-01-01xyz"), std::runtime_error);
+  EXPECT_THROW(std::ignore = ParseDateDays("999999999-01-01"),
+               std::runtime_error);
+  EXPECT_THROW(std::ignore = ParseDateDays("2024-01-01xyz"),
+               std::runtime_error);
   EXPECT_THROW(std::ignore = ParseDateDays("2024-01-01 "), std::runtime_error);
-  EXPECT_THROW(std::ignore = ParseDateDays("99999999-01-01"), std::runtime_error);
+  EXPECT_THROW(std::ignore = ParseDateDays("99999999-01-01"),
+               std::runtime_error);
   EXPECT_THROW(std::ignore = ParseDateDays("-2024-01-01"), std::runtime_error);
   EXPECT_THROW(std::ignore = ParseDateDays("2024/01/01"), std::runtime_error);
   EXPECT_THROW(std::ignore = ParseDateDays("2024-02-30"), std::runtime_error);
   EXPECT_THROW(std::ignore = ParseDateDays(""), std::runtime_error);
-  EXPECT_THROW(
-      std::ignore = AddDateIntervalDays(valid_date,
-                                        std::numeric_limits<int64_t>::max(), "day"),
-      std::runtime_error);
-  EXPECT_THROW(
-      std::ignore = AddDateIntervalDays(valid_date,
-                                        std::numeric_limits<int64_t>::min(), "day"),
-      std::runtime_error);
+  EXPECT_THROW(std::ignore = AddDateIntervalDays(
+                   valid_date, std::numeric_limits<int64_t>::max(), "day"),
+               std::runtime_error);
+  EXPECT_THROW(std::ignore = AddDateIntervalDays(
+                   valid_date, std::numeric_limits<int64_t>::min(), "day"),
+               std::runtime_error);
 }
 
 TEST(DateTest, SetDefaultTimeZone_CustomAndEmpty_UpdatesOrResetsTimeZone) {
@@ -1070,7 +1109,8 @@ TEST(DateTest, SetDefaultTimeZone_CustomAndEmpty_UpdatesOrResetsTimeZone) {
   EXPECT_EQ(default_tz, "America/Los_Angeles");
 }
 
-TEST(IntervalTest, ParseAndJustify_VariousIntervalFormats_ComputesExpectedValues) {
+TEST(IntervalTest,
+     ParseAndJustify_VariousIntervalFormats_ComputesExpectedValues) {
   IntervalValue iv = IntervalValue::Parse("  P1Y");
   SetSessionConstant("foo_cov", "bar_cov");
 
@@ -1181,7 +1221,8 @@ TEST(ValueTypeTest, ValueTypeToString_AllEnumValues_ReturnsExpectedString) {
   EXPECT_EQ(ValueTypeToString(ValueType::kDouble), "Double");
   EXPECT_EQ(ValueTypeToString(ValueType::kDate), "Date");
   EXPECT_EQ(ValueTypeToString(ValueType::kArray), "Array");
-  EXPECT_EQ(ValueTypeToString(static_cast<ValueType>(99)), "unknown value type");
+  EXPECT_EQ(ValueTypeToString(static_cast<ValueType>(99)),
+            "unknown value type");
 }
 
 TEST(FunctionTest, Serialize_CustomFunction_RoundTripsThroughDecoder) {
@@ -1221,7 +1262,8 @@ TEST(TypeTest, Serialize_TypeTag_RoundTripsThroughDecoder) {
   EXPECT_TRUE(restored.IsValid());
 }
 
-TEST(ValueTest, Comparison_WithIntervalLikeAndGenericStrings_OrdersLexicographically) {
+TEST(ValueTest,
+     Comparison_WithIntervalLikeAndGenericStrings_OrdersLexicographically) {
   Value iv1("1-2 3 4:5:6");
   Value iv2("2-0 0 0:0:0");
   Value s1("foo-bar");

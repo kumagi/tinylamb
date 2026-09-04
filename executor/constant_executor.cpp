@@ -20,9 +20,9 @@
 #include <ostream>
 #include <utility>
 
-#include "type/row.hpp"
-#include "page/row_position.hpp"
 #include "executor/data_chunk.hpp"
+#include "page/row_position.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
 

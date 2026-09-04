@@ -61,7 +61,8 @@ TEST_F(SortedRunEntryTest, Generate) {
   }
   l.reset();
 
-  // Assert -- read back the three entries via a fresh BlobFile and verify key/value
+  // Assert -- read back the three entries via a fresh BlobFile and verify
+  // key/value
   BlobFile blob(filepath_);
   ASSERT_EQ(short_entry.BuildKey(blob), "abc");
   ASSERT_EQ(short_entry.BuildValue(blob), "val");
@@ -105,7 +106,8 @@ TEST_F(SortedRunEntryTest, Compare) {
 }
 
 TEST_F(SortedRunEntryTest, MoreCompare) {
-  // Arrange -- build a vector of 12 keys with varied lengths and prefixes; build entries for each + extension
+  // Arrange -- build a vector of 12 keys with varied lengths and prefixes;
+  // build entries for each + extension
   std::vector<std::string> keys = {
       std::string(1, 0), std::string(2, 0),  std::string(3, 0),
       std::string(1, 0), std::string(2, 0),  std::string(3, 0),
@@ -129,7 +131,8 @@ TEST_F(SortedRunEntryTest, MoreCompare) {
     }
   }
 
-  // Assert -- pairwise comparison of all candidates/entries yields consistent ordering
+  // Assert -- pairwise comparison of all candidates/entries yields consistent
+  // ordering
   for (size_t i = 0; i < candidates.size(); ++i) {
     for (size_t j = 0; j < candidates.size(); ++j) {
       if (candidates[i] < candidates[j]) {
@@ -173,8 +176,8 @@ class SortedRunTest : public ::testing::Test {
 };
 
 TEST_F(SortedRunTest, First) {
-  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value pairs
-  // Act -- find the first key "common_prefix:0"
+  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value
+  // pairs Act -- find the first key "common_prefix:0"
   auto result = sr_->Find("common_prefix:0", *blob_);
 
   // Assert -- the result is "0" (i^2 = 0^2 = 0)
@@ -182,8 +185,8 @@ TEST_F(SortedRunTest, First) {
 }
 
 TEST_F(SortedRunTest, Build) {
-  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value pairs
-  // Act -- find the key "common_prefix:121"
+  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value
+  // pairs Act -- find the key "common_prefix:121"
   auto result = sr_->Find("common_prefix:121", *blob_);
 
   // Assert -- the result is "14641" (121^2 = 14641)
@@ -191,8 +194,8 @@ TEST_F(SortedRunTest, Build) {
 }
 
 TEST_F(SortedRunTest, Find) {
-  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value pairs
-  // Act -- find all 1000 keys in the run
+  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value
+  // pairs Act -- find all 1000 keys in the run
   for (int i = 0; i < 1000; ++i) {
     auto result = sr_->Find("common_prefix:" + std::to_string(i), *blob_);
     ASSERT_SUCCESS_AND_EQ(result, std::to_string(i * i));
@@ -292,15 +295,15 @@ TEST_F(SortedRunTest, InlineValueRoundTripsThroughFind) {
   const SortedRun run(index_file);
   for (int len = 1; len <= 8; ++len) {
     const std::string expected(len, static_cast<char>('a' + len - 1));
-    ASSERT_SUCCESS_AND_EQ(run.Find("k" + std::to_string(len), *blob),
-                          expected);
+    ASSERT_SUCCESS_AND_EQ(run.Find("k" + std::to_string(len), *blob), expected);
   }
   std::ignore = std::filesystem::remove(data_file);
   std::ignore = std::filesystem::remove(index_file);
 }
 
 TEST_F(SortedRunTest, Delete) {
-  // Arrange -- build a SortedRun with 1000 keys where i%3==0 are deletes, i%3==1 are values, i%3==2 absent
+  // Arrange -- build a SortedRun with 1000 keys where i%3==0 are deletes,
+  // i%3==1 are values, i%3==2 absent
   std::filesystem::path data_file;
   std::filesystem::path index_file;
   {
@@ -339,18 +342,20 @@ TEST_F(SortedRunTest, Delete) {
 }
 
 TEST_F(SortedRunTest, Iterator) {
-  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value pairs
-  // Act -- walk the iterator from begin to end
+  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value
+  // pairs Act -- walk the iterator from begin to end
   auto iter = sr_->Begin(*blob_);
   while (iter.IsValid()) {
     ++iter;
   }
 
-  // Assert -- implicit; iterator exhausts after 1000 entries; gtest green on pass
+  // Assert -- implicit; iterator exhausts after 1000 entries; gtest green on
+  // pass
 }
 
 TEST_F(SortedRunTest, DeleteScan) {
-  // Arrange -- build a SortedRun with 1000 keys where i%3==0 are deletes, i%3==1 are values, i%3==2 absent
+  // Arrange -- build a SortedRun with 1000 keys where i%3==0 are deletes,
+  // i%3==1 are values, i%3==2 absent
   std::filesystem::path data_file;
   std::filesystem::path index_file;
   {
@@ -389,7 +394,8 @@ TEST_F(SortedRunTest, IteratorEquality) {
   SortedRun::Iterator copy = first;
 
   // Act -- compare equal iterators, then advance one of them
-  // Assert -- identical offsets compare equal, differing offsets compare unequal
+  // Assert -- identical offsets compare equal, differing offsets compare
+  // unequal
   ASSERT_TRUE(copy == first);
   ASSERT_FALSE(copy != first);
   ++first;

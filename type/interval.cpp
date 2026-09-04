@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <sstream>
@@ -226,6 +227,12 @@ IntervalValue IntervalValue::Parse(std::string_view text,
       char desig =
           static_cast<char>(std::toupper(static_cast<unsigned char>(s[pos++])));
       double val = std::stod(num_str) * sign;
+      // C++20 makes an out-of-range double-to-integral cast undefined; a
+      // literal like P9e300Y must be rejected, not cast to garbage.
+      if (!(val >= -9.3e18 && val <= 9.3e18)) {
+        throw std::runtime_error(
+            "generic::out_of_range: INTERVAL value out of range");
+      }
       sign = 1;
       if (!in_time) {
         if (desig == 'Y') {
@@ -253,54 +260,181 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         }
       }
     }
-    int64_t tot_months = parsed_y * 12 + parsed_m;
+    // Saturate instead of overflowing: the ISO-8601 designator path used a
+    // plain int64 multiply, so a literal like P999999999999Y wrapped into a
+    // negative interval rather than reporting an out-of-range value.
+    const auto checked_mul = [](int64_t a, int64_t b) -> int64_t {
+      int64_t result = 0;
+      if (__builtin_mul_overflow(a, b, &result)) {
+        throw std::runtime_error(
+            "generic::out_of_range: INTERVAL value out of range");
+      }
+      return result;
+    };
+    const auto checked_add = [](int64_t a, int64_t b) -> int64_t {
+      int64_t result = 0;
+      if (__builtin_add_overflow(a, b, &result)) {
+        throw std::runtime_error(
+            "generic::out_of_range: INTERVAL value out of range");
+      }
+      return result;
+    };
+    int64_t tot_months = checked_add(checked_mul(parsed_y, 12), parsed_m);
+    const int64_t hour_nanos = checked_mul(
+        checked_add(checked_mul(parsed_h, 3600), checked_mul(parsed_min, 60)),
+        1000000000LL);
+    const double sec_nanos = std::round(parsed_sec * 1000000000.0);
+    if (!(sec_nanos >= -9.2e18 && sec_nanos <= 9.2e18)) {
+      throw std::runtime_error(
+          "generic::out_of_range: INTERVAL value out of range");
+    }
     int64_t tot_nanos =
-        (parsed_h * 3600 + parsed_min * 60) * 1000000000LL +
-        static_cast<int64_t>(std::round(parsed_sec * 1000000000.0));
+        checked_add(hour_nanos, static_cast<int64_t>(sec_nanos));
     return {tot_months, parsed_d, tot_nanos};
   }
 
   // Single unit conversions
   if (!u.empty() && u.find(" to ") == std::string::npos) {
-    double dval = 0.0;
-    try {
-      dval = std::stod(s);
-    } catch (...) {
-      dval = 0.0;
+    // Parse integral amounts exactly (std::stod loses precision beyond
+    // 2^53 and its double -> int64 cast wraps at 2^63, turning
+    // INTERVAL '9223372036854775806' DAY into a negative interval).
+    int64_t ival = 0;
+    const bool integral = [&] {
+      const char* begin = s.data();
+      const char* end = s.data() + s.size();
+      if (begin == end) {
+        return false;
+      }
+      size_t digits = 0;
+      for (const char c : s) {
+        if (std::isdigit(static_cast<unsigned char>(c))) {
+          ++digits;
+        }
+      }
+      const auto [ptr, ec] = std::from_chars(begin, end, ival);
+      return ec == std::errc() && ptr == end &&
+             digits == static_cast<size_t>(end - begin);
+    }();
+    if (!integral) {
+      double dval = 0.0;
+      try {
+        dval = std::stod(s);
+      } catch (...) {
+        dval = 0.0;
+      }
+      auto to_int64 = [](double v) -> int64_t {
+        const double rounded = std::round(v);
+        if (rounded >= 9223372036854775808.0 ||
+            rounded < -9223372036854775808.0) {
+          throw std::runtime_error(
+              "generic::out_of_range: INTERVAL value out of range");
+        }
+        return static_cast<int64_t>(rounded);
+      };
+      if (u == "year" || u == "years") {
+        return {to_int64(dval * 12), 0, 0};
+      }
+      if (u == "quarter" || u == "quarters") {
+        return {to_int64(dval * 3), 0, 0};
+      }
+      if (u == "month" || u == "months") {
+        return {to_int64(dval), 0, 0};
+      }
+      if (u == "week" || u == "weeks") {
+        return {0, to_int64(dval * 7), 0};
+      }
+      if (u == "day" || u == "days") {
+        return {0, to_int64(dval), 0};
+      }
+      if (u == "hour" || u == "hours") {
+        return {0, 0, to_int64(dval * 3600.0 * 1e9)};
+      }
+      if (u == "minute" || u == "minutes") {
+        return {0, 0, to_int64(dval * 60.0 * 1e9)};
+      }
+      if (u == "second" || u == "seconds") {
+        return {0, 0, to_int64(dval * 1e9)};
+      }
+      if (u == "millisecond" || u == "milliseconds") {
+        return {0, 0, to_int64(dval * 1e6)};
+      }
+      if (u == "microsecond" || u == "microseconds") {
+        return {0, 0, to_int64(dval * 1e3)};
+      }
+      if (u == "nanosecond" || u == "nanoseconds") {
+        return {0, 0, to_int64(dval)};
+      }
     }
-
     if (u == "year" || u == "years") {
-      return {static_cast<int64_t>(dval * 12), 0, 0};
+      return {__builtin_mul_overflow(ival, int64_t{12}, &ival)
+                  ? throw std::runtime_error(
+                        "generic::out_of_range: INTERVAL value out of range")
+                  : ival,
+              0, 0};
     }
     if (u == "quarter" || u == "quarters") {
-      return {static_cast<int64_t>(dval * 3), 0, 0};
+      return {__builtin_mul_overflow(ival, int64_t{3}, &ival)
+                  ? throw std::runtime_error(
+                        "generic::out_of_range: INTERVAL value out of range")
+                  : ival,
+              0, 0};
     }
     if (u == "month" || u == "months") {
-      return {static_cast<int64_t>(dval), 0, 0};
+      return {ival, 0, 0};
     }
     if (u == "week" || u == "weeks") {
-      return {0, static_cast<int64_t>(dval * 7), 0};
+      return {0,
+              __builtin_mul_overflow(ival, int64_t{7}, &ival)
+                  ? throw std::runtime_error(
+                        "generic::out_of_range: INTERVAL value out of range")
+                  : ival,
+              0};
     }
     if (u == "day" || u == "days") {
-      return {0, static_cast<int64_t>(dval), 0};
+      return {0, ival, 0};
     }
     if (u == "hour" || u == "hours") {
-      return {0, 0, static_cast<int64_t>(std::round(dval * 3600.0 * 1e9))};
+      return {0, 0,
+              __builtin_mul_overflow(ival, int64_t{3600} * 1000000000LL, &ival)
+                  ? throw std::runtime_error(
+                        "generic::out_of_range: INTERVAL value out of "
+                        "range")
+                  : ival};
     }
     if (u == "minute" || u == "minutes") {
-      return {0, 0, static_cast<int64_t>(std::round(dval * 60.0 * 1e9))};
+      return {0, 0,
+              __builtin_mul_overflow(ival, int64_t{60} * 1000000000LL, &ival)
+                  ? throw std::runtime_error(
+                        "generic::out_of_range: INTERVAL value out of "
+                        "range")
+                  : ival};
     }
     if (u == "second" || u == "seconds") {
-      return {0, 0, static_cast<int64_t>(std::round(dval * 1e9))};
+      return {0, 0,
+              __builtin_mul_overflow(ival, int64_t{1000000000LL}, &ival)
+                  ? throw std::runtime_error(
+                        "generic::out_of_range: INTERVAL value out of "
+                        "range")
+                  : ival};
     }
     if (u == "millisecond" || u == "milliseconds") {
-      return {0, 0, static_cast<int64_t>(std::round(dval * 1e6))};
+      return {0, 0,
+              __builtin_mul_overflow(ival, int64_t{1000000}, &ival)
+                  ? throw std::runtime_error(
+                        "generic::out_of_range: INTERVAL value out of "
+                        "range")
+                  : ival};
     }
     if (u == "microsecond" || u == "microseconds") {
-      return {0, 0, static_cast<int64_t>(std::round(dval * 1e3))};
+      return {0, 0,
+              __builtin_mul_overflow(ival, int64_t{1000}, &ival)
+                  ? throw std::runtime_error(
+                        "generic::out_of_range: INTERVAL value out of "
+                        "range")
+                  : ival};
     }
     if (u == "nanosecond" || u == "nanoseconds") {
-      return {0, 0, static_cast<int64_t>(std::round(dval))};
+      return {0, 0, ival};
     }
   }
 
@@ -365,24 +499,48 @@ IntervalValue IntervalValue::Parse(std::string_view text,
           break;
         }
         switch (unit) {
-          case 0:
-            iv.months += val * 12;
+          case 0: {
+            int64_t years = 0;
+            if (__builtin_mul_overflow(val, 12, &years)) {
+              ok = false;
+              break;
+            }
+            iv.months += years;
             break;
+          }
           case 1:
             iv.months += val;
             break;
           case 2:
             iv.days += val;
             break;
-          case 3:
-            iv.nanos += val * 3600LL * 1000000000LL;
+          case 3: {
+            int64_t scaled = 0;
+            if (__builtin_mul_overflow(val, 3600LL * 1000000000LL, &scaled)) {
+              ok = false;
+              break;
+            }
+            iv.nanos += scaled;
             break;
-          case 4:
-            iv.nanos += val * 60LL * 1000000000LL;
+          }
+          case 4: {
+            int64_t scaled = 0;
+            if (__builtin_mul_overflow(val, 60LL * 1000000000LL, &scaled)) {
+              ok = false;
+              break;
+            }
+            iv.nanos += scaled;
             break;
-          case 5:
-            iv.nanos += val * 1000000000LL;
+          }
+          case 5: {
+            int64_t scaled = 0;
+            if (__builtin_mul_overflow(val, 1000000000LL, &scaled)) {
+              ok = false;
+              break;
+            }
+            iv.nanos += scaled;
             break;
+          }
           default:
             ok = false;
             break;

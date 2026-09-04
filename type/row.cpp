@@ -44,8 +44,8 @@ const Value& Row::operator[](size_t i) const { return values_[i]; }
 
 size_t Row::Serialize(char* dst) const {
   const char* const original_offset = dst;
-  const bool has_null =
-      std::ranges::any_of(values_, [](const Value& value) { return value.IsNull(); });
+  const bool has_null = std::ranges::any_of(
+      values_, [](const Value& value) { return value.IsNull(); });
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
   // Slot width is 16 bits and the top bit is the null-bitmap flag; a row with
   // >= 32768 columns would silently wrap the count and corrupt the image.
@@ -58,14 +58,16 @@ size_t Row::Serialize(char* dst) const {
     const size_t bitmap_size = (values_.size() + 7) / 8;
     memset(dst, 0, bitmap_size);
     for (size_t i = 0; i < values_.size(); ++i) {
-      if (values_[i].IsNull()) { dst[i / 8] |= static_cast<char>(1U << (i % 8));
-}
+      if (values_[i].IsNull()) {
+        dst[i / 8] |= static_cast<char>(1U << (i % 8));
+      }
     }
     dst += bitmap_size;
   }
   for (const Value& value : values_) {
-    if (!value.IsNull()) { dst += value.Serialize(dst);
-}
+    if (!value.IsNull()) {
+      dst += value.Serialize(dst);
+    }
   }
   return dst - original_offset;
 }
@@ -77,6 +79,11 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
   const slot_t count = encoded_count & ~kNullBitmapFlag;
+  // The stored image always carries every schema column; a forged count
+  // would otherwise drive sc.GetColumn(i) out of bounds below.
+  if (count != sc.ColumnCount()) {
+    throw std::runtime_error("row image column count mismatch");
+  }
   const char* bitmap = nullptr;
   if (has_null) {
     bitmap = src;
@@ -88,8 +95,9 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
     const bool is_null =
         has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
     Value v;
-    if (!is_null) { src += v.Deserialize(src, sc.GetColumn(i).Type());
-}
+    if (!is_null) {
+      src += v.Deserialize(src, sc.GetColumn(i).Type());
+    }
     values_.push_back(v);
   }
   return src - original_offset;
@@ -103,6 +111,11 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
   const slot_t count = encoded_count & ~kNullBitmapFlag;
+  // Projected reads still walk the full stored image to skip unkept columns,
+  // so the count must match the full schema here as well.
+  if (count != sc.ColumnCount()) {
+    throw std::runtime_error("row image column count mismatch");
+  }
   const char* bitmap = nullptr;
   if (has_null) {
     bitmap = src;
@@ -115,8 +128,7 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
   for (slot_t i = 0; i < count; ++i) {
     const bool is_null =
         has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
-    const bool keep =
-        projection < columns.size() && columns[projection] == i;
+    const bool keep = projection < columns.size() && columns[projection] == i;
     if (is_null) {
       if (keep) {
         values_.emplace_back();
@@ -144,8 +156,10 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
   const slot_t count = encoded_count & ~kNullBitmapFlag;
-  if (column >= count) { return std::nullopt;
-}
+  if (column >= count || count != sc.ColumnCount() ||
+      column >= sc.ColumnCount()) {
+    return std::nullopt;
+  }
   const char* bitmap = nullptr;
   if (has_null) {
     bitmap = src;
@@ -155,8 +169,9 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
     const bool is_null =
         has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
     if (i == column) {
-      if (is_null) { return std::nullopt;
-}
+      if (is_null) {
+        return std::nullopt;
+      }
       const ValueType type = sc.GetColumn(i).Type();
       if (type != ValueType::kInt64 && type != ValueType::kDate) {
         return std::nullopt;
@@ -165,22 +180,25 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
       value.Deserialize(src, type);
       return value.value.int_value;
     }
-    if (is_null) { continue;
-}
+    if (is_null) {
+      continue;
+    }
     src += Value::SkipSerialized(src, sc.GetColumn(i).Type());
   }
   return std::nullopt;
 }
 
 size_t Row::Size() const {
-  const bool has_null =
-      std::ranges::any_of(values_, [](const Value& value) { return value.IsNull(); });
+  const bool has_null = std::ranges::any_of(
+      values_, [](const Value& value) { return value.IsNull(); });
   size_t ret = sizeof(uint16_t);
-  if (has_null) { ret += (values_.size() + 7) / 8;
-}
+  if (has_null) {
+    ret += (values_.size() + 7) / 8;
+  }
   for (const auto& v : values_) {
-    if (!v.IsNull()) { ret += v.Size();
-}
+    if (!v.IsNull()) {
+      ret += v.Size();
+    }
   }
   return ret;
 }

@@ -19,9 +19,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <atomic>
-#include <array>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
@@ -94,7 +94,9 @@ bool PageOffset(page_id_t pid, off_t* out) {
 }  // namespace
 
 PagePool::PagePool(std::string_view file_name, size_t capacity)
-    : file_name_(file_name), fd_(OpenPageFile(file_name)), capacity_(capacity) {}
+    : file_name_(file_name),
+      fd_(OpenPageFile(file_name)),
+      capacity_(capacity) {}
 
 void PagePool::SetDurabilityGate(std::function<void(lsn_t)> gate) {
   durability_gate_ = std::move(gate);
@@ -190,9 +192,17 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
         // Keep the victim resident: dropping it here would silently lose its
         // dirty image. Reattach under pool_latch so a racing miss either pins
         // this entry or waits for it; only an id that raced back into the
-        // pool cannot be reattached.
+        // pool cannot be reattached. Keep victim owning the image until the
+        // node is constructed: Entry's latch allocation may throw, and a
+        // released raw pointer would leak.
         if (!pool_.contains(victim_id)) {
-          pool_lru_.emplace_back(victim.release());
+          Page* const raw_victim = victim.get();
+          try {
+            pool_lru_.emplace_back(raw_victim);
+          } catch (...) {
+            throw;
+          }
+          (void)victim.release();
           pool_lru_.back().pin_count.store(0, std::memory_order_relaxed);
           const LruType::iterator restored = std::prev(pool_lru_.end());
           pool_.emplace(victim_id, restored);
@@ -268,8 +278,8 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
     if (validate && new_page->PageID() != page_id) {
       latch.unlock();
       LOG(ERROR) << "loaded page image id mismatch: requested=" << page_id
-                 << " image=" << new_page->PageID() << " status="
-                 << Status::kCorrupt;
+                 << " image=" << new_page->PageID()
+                 << " status=" << Status::kCorrupt;
       throw std::runtime_error("page id mismatch on load: page_id=" +
                                std::to_string(page_id));
     }
@@ -281,18 +291,37 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       continue;
     }
 
-    Page* const raw_page = new_page.release();
+    // Exception safety: keep new_page owning the image until the list node
+    // is fully constructed. Entry::Entry allocates its page_latch and the
+    // list allocates its node -- either can throw, and releasing ownership
+    // first would leak the image.
+    Page* const raw_page = new_page.get();
     std::shared_mutex* const raw_latch = new_page_latch.get();
-    pool_lru_.emplace_back(raw_page);
+    try {
+      pool_lru_.emplace_back(raw_page);
+    } catch (...) {
+      // new_page still owns raw_page; nothing installed.
+      throw;
+    }
+    // The list node now owns the image.
+    (void)new_page.release();
     pool_lru_.back().page_latch = std::move(new_page_latch);
     const LruType::iterator installed = std::prev(pool_lru_.end());
-    std::atomic<uint32_t>* const installed_pin_count = &installed->pin_count;
-    pool_.emplace(page_id, installed);
-    {
-      PoolShard& shard = shards_[ShardIndex(page_id)];
-      std::scoped_lock shard_latch(shard.mu);
-      shard.map.emplace(page_id, &*installed);
+    try {
+      pool_.emplace(page_id, installed);
+      {
+        PoolShard& shard = shards_[ShardIndex(page_id)];
+        std::scoped_lock shard_latch(shard.mu);
+        shard.map.emplace(page_id, &*installed);
+      }
+    } catch (...) {
+      // Roll back the half-installed node: the maps never saw it, so just
+      // destroy the list entry (which frees the loaded image). The caller's
+      // PageRef was never created, so no pin is outstanding.
+      pool_lru_.erase(installed);
+      throw;
     }
+    std::atomic<uint32_t>* const installed_pin_count = &installed->pin_count;
     latch.unlock();
     // Page content was loaded without holding page_latch, so the caller may
     // take a shared page latch when requested.
@@ -315,6 +344,11 @@ void PagePool::DropAllPages() {
 }
 
 void PagePool::FlushPageForTest(page_id_t page_id) {
+  // Hold the Entry address (not a map iterator): list-node addresses stay
+  // stable across Touch splices and DropAllPages retires, and a pinned entry
+  // can never be detached, so this pointer outlives every path below.  The
+  // guard releases the pin even when WriteBack throws.
+  Entry* pinned = nullptr;
   {
     std::unique_lock latch(pool_latch);
     const auto it = pool_.find(page_id);
@@ -324,51 +358,19 @@ void PagePool::FlushPageForTest(page_id_t page_id) {
     // Pin the entry so a concurrent eviction cannot detach and destroy the
     // Page between unlocking pool_latch and WriteBack (the raw pointer would
     // dangle the moment the evictor's unique_ptr resets).
-    it->second->pin_count.fetch_add(1, std::memory_order_relaxed);
+    pinned = &*it->second;
+    pinned->pin_count.fetch_add(1, std::memory_order_relaxed);
     Touch(it->second);
   }
+  struct UnpinGuard {
+    Entry* entry;
+    page_id_t id;
+    ~UnpinGuard() { PagePool::ReleasePin(*entry, id); }
+  } guard{pinned, page_id};
   std::scoped_lock io(io_latches_[ShardIndex(page_id)].mu);
-  std::unique_lock latch(pool_latch);
-  const auto it = pool_.find(page_id);
-  if (it == pool_.end()) {
-    // Evicted and re-created?  The pin we hold kept the original Page alive
-    // through DetachVictim's window, so reaching here means the entry was
-    // retired (DropAllPages); just drop our pin.
-    latch.unlock();
-    return;
-  }
-  Page* target = it->second->page.get();
-  latch.unlock();
-  WriteBack(target);
-  latch.lock();
-  const auto still = pool_.find(page_id);
-  if (still != pool_.end()) {
-    ReleasePin(*still->second, page_id);
-  }
-}
-
-void PagePool::Unpin(page_id_t page_id) {
-  // Fast path: resolve the entry via its stripe and decrement outside any
-  // pool-wide latch so parallel unpins and hit-path pins never serialize
-  // behind eviction bookkeeping.
-  {
-    PoolShard& shard = shards_[ShardIndex(page_id)];
-    std::scoped_lock shard_latch(shard.mu);
-    if (auto entry = shard.map.find(page_id); entry != shard.map.end()) {
-      ReleasePin(*entry->second, page_id);
-      return;
-    }
-  }
-  // Slow path: the entry is momentarily absent from its stripe map (mid
-  // eviction bookkeeping) or retired by DropAllPages; resolve it through the
-  // pool map instead. A pinned entry always remains in pool_ until its pins
-  // drop to zero, so a legitimate unpin never misses here silently.
-  std::shared_lock latch(pool_latch);
-  const auto entry = pool_.find(page_id);
-  if (entry == pool_.end()) {
-    return;  // Dropped or retired; nothing to release.
-  }
-  ReleasePin(*entry->second, page_id);
+  // Safe without pool_latch: DetachVictim only moves Entry::page out when the
+  // pin count is zero, and this guard holds one pin until scope exit.
+  WriteBack(pinned->page.get());
 }
 
 // Precondition: no latch requirement; operates on the entry atomically.
@@ -388,6 +390,8 @@ void PagePool::ReleasePin(Entry& entry, page_id_t page_id) {
 bool PagePool::DetachVictim(std::unique_ptr<Page>* victim) {
   assert(!pool_latch.try_lock());
   for (auto target = pool_lru_.begin(); target != pool_lru_.end(); ++target) {
+    // Cheap first look (relaxed); the authoritative ACQUIRE recheck happens
+    // under the stripe mutex below.
     if (0 < target->pin_count.load(std::memory_order_relaxed)) {
       continue;
     }
@@ -400,9 +404,14 @@ bool PagePool::DetachVictim(std::unique_ptr<Page>* victim) {
       // this entry must have completed its fetch_add inside that critical
       // section, so a zero here means nobody can hold or obtain this entry
       // anymore.
+      // TSAN fix: the recheck must be an ACQUIRE load.  PageRef::PageUnlock
+      // decrements with a RELEASE fetch_sub; an acquire here establishes
+      // happens-before with that decrement, so destroying the Entry (which
+      // frees the pin_count memory) cannot race the decrement itself.  The
+      // relaxed loads below reported "data race in PagePool::Entry::~Entry".
       std::scoped_lock shard_latch(shard.mu);
       shard.map.erase(page_id);
-      if (0 < target->pin_count.load(std::memory_order_relaxed)) {
+      if (0 < target->pin_count.load(std::memory_order_acquire)) {
         shard.map.emplace(page_id, &*target);  // Still pinned; restore.
       } else {
         confirmed = true;
@@ -457,12 +466,17 @@ PagePool::~PagePool() {
     }
     if (fd_ >= 0) {
       SyncFileChecked(fd_);
-      ::close(fd_);
-      fd_ = -1;
     }
   } catch (...) {
     LOG(ERROR) << "page pool destruction lost " << dirty.size()
                << " dirty pages";
+  }
+  // Close the descriptor even when write-back failed: leaking it turns a
+  // recoverable shutdown error into a permanent fd leak, and this is the
+  // last owner of fd_.
+  if (fd_ >= 0) {
+    ::close(fd_);
+    fd_ = -1;
   }
 }
 
@@ -533,8 +547,8 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
                << "image as a fresh free page";
     target->PageInit(pid, PageType::kFreePage);
   } else {
-    const bool all_zero = std::ranges::all_of(
-        disk_image, [](char byte) { return byte == 0; });
+    const bool all_zero =
+        std::ranges::all_of(disk_image, [](char byte) { return byte == 0; });
     if (all_zero) {
       target->PageInit(pid, PageType::kFreePage);
       nread = 0;  // Fresh sparse region has no checksum to validate.
@@ -545,18 +559,24 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
         // Preserve a recoverable, checksum-invalid placeholder. Recovery
         // opens pages without validation and reconstructs this image from
         // WAL; ordinary readers still hit the validation failure below.
+        // The non-zero sentinel checksum distinguishes this corrupt (torn)
+        // page from a genuine all-zero fresh region, so the free-page
+        // materialization below does NOT silently reclaim live data.
         LOG(ERROR) << "invalid page format on page_id=" << pid << ": "
                    << error.what();
         target->PageInit(pid, PageType::kUnknown);
         target->format_magic = 0;
-        target->checksum = 0;
+        target->checksum = 1;
       }
     }
   }
   if (nread == kPageSize && !target->IsValid()) {
     if (target->type == PageType::kUnknown && target->checksum == 0) {
       // A freshly extended file region reads as zeros; uninitialized rather
-      // than corrupt. Real pages always carry a non-zero CRC after WriteBack.
+      // than corrupt. (Genuine zero regions are caught by the all_zero check
+      // above with nread reset to 0, so this branch is defensive only.) Real
+      // corrupt pages carry the sentinel checksum=1 and fall through to fail
+      // closed below.
       target->PageInit(pid, PageType::kFreePage);
     } else if (validate) {
       LOG(ERROR) << "corrupt page checksum on page_id=" << pid

@@ -58,7 +58,9 @@ Schema MakeCombinedSchema(const Schema& left, const Schema& right) {
   for (size_t i = 0; i < right.ColumnCount(); ++i) {
     cols.push_back(right.GetColumn(i));
   }
-  return Schema(std::string(left.Name()) + "_interval_" + std::string(right.Name()), std::move(cols));
+  return Schema(
+      std::string(left.Name()) + "_interval_" + std::string(right.Name()),
+      std::move(cols));
 }
 
 }  // namespace
@@ -101,8 +103,16 @@ void IntervalJoin::Materialize() {
     } else {
       std::vector<Value> key_vals;
       key_vals.reserve(equi_keys_.size());
+      bool has_null = false;
       for (const auto& [l_col, r_col] : equi_keys_) {
-        key_vals.push_back(relational_detail::CanonicalDistinctValue(r_row[r_col]));
+        key_vals.push_back(
+            relational_detail::CanonicalDistinctValue(r_row[r_col]));
+        // SQL equality never matches on NULL equi keys; canonicalized NULLs
+        // would otherwise compare equal to each other through the map.
+        has_null = has_null || r_row[r_col].IsNull();
+      }
+      if (has_null) {
+        continue;
       }
       right_map[Row(std::move(key_vals))].push_back(r_row);
     }
@@ -128,14 +138,23 @@ void IntervalJoin::Materialize() {
     if (equi_keys_.empty()) {
       candidates = &right_all_rows;
     } else {
+      bool l_key_null = false;
       std::vector<Value> key_vals;
       key_vals.reserve(equi_keys_.size());
       for (const auto& [l_col, r_col] : equi_keys_) {
-        key_vals.push_back(relational_detail::CanonicalDistinctValue(l_row[l_col]));
+        key_vals.push_back(
+            relational_detail::CanonicalDistinctValue(l_row[l_col]));
+        l_key_null = l_key_null || l_row[l_col].IsNull();
       }
-      auto it = right_map.find(Row(std::move(key_vals)));
-      if (it != right_map.end()) {
-        candidates = &it->second;
+      if (l_key_null) {
+        // A NULL equi key matches nothing; the outer padding below still
+        // emits the row when this is a left-outer interval join.
+        candidates = nullptr;
+      } else {
+        auto it = right_map.find(Row(std::move(key_vals)));
+        if (it != right_map.end()) {
+          candidates = &it->second;
+        }
       }
     }
 

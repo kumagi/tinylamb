@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -50,7 +51,9 @@ Encoder& operator<<(Encoder& a, const Column& c) {
   // catalog's column metadata.  The high bit is not part of ValueType, so
   // existing signed column encodings remain byte-compatible.
   uint8_t encoded_type = static_cast<uint8_t>(c.type_);
-  if (c.unsigned_) { encoded_type |= 0x80; }
+  if (c.unsigned_) {
+    encoded_type |= 0x80;
+  }
   a << c.col_name_ << encoded_type << c.constraint_;
   return a;
 }
@@ -59,7 +62,11 @@ Decoder& operator>>(Decoder& e, Column& c) {
   uint8_t encoded_type = 0;
   e >> c.col_name_ >> encoded_type >> c.constraint_;
   c.unsigned_ = (encoded_type & 0x80) != 0;
-  c.type_ = static_cast<ValueType>(encoded_type & 0x7f);
+  const uint8_t raw_type = encoded_type & 0x7f;
+  if (raw_type > static_cast<uint8_t>(ValueType::kArray)) {
+    throw std::runtime_error("undefined column type in decoder");
+  }
+  c.type_ = static_cast<ValueType>(raw_type);
   return e;
 }
 

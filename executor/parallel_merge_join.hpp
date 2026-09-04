@@ -35,12 +35,12 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
     size_t right_end{0};
   };
 
-  ParallelMergeJoin(
-      Executor left, std::vector<slot_t> left_cols, Executor right,
-      std::vector<slot_t> right_cols,
-      size_t worker_count = std::thread::hardware_concurrency(),
-      JoinKind kind = JoinKind::kInner, Expression residual = Expression(),
-      Schema residual_schema = Schema());
+  ParallelMergeJoin(Executor left, std::vector<slot_t> left_cols,
+                    Executor right, std::vector<slot_t> right_cols,
+                    size_t worker_count = std::thread::hardware_concurrency(),
+                    JoinKind kind = JoinKind::kInner,
+                    Expression residual = Expression(),
+                    Schema residual_schema = Schema());
 
   ~ParallelMergeJoin() override = default;
 
@@ -53,8 +53,12 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
   // PipelineBreaker interface
   [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
   void MaterializePipeline() override;
-  [[nodiscard]] size_t MaterializedRowCount() const override { return output_.size(); }
-  [[nodiscard]] size_t MaterializedBytes() const override { return charge_.Bytes(); }
+  [[nodiscard]] size_t MaterializedRowCount() const override {
+    return output_.size();
+  }
+  [[nodiscard]] size_t MaterializedBytes() const override {
+    return charge_.Bytes();
+  }
 
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
   [[nodiscard]] JoinKind Kind() const { return kind_; }

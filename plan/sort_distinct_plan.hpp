@@ -33,6 +33,12 @@ class SortDistinctPlan final : public PlanBase {
       const std::vector<bool>& ascending) const override {
     return child_->IsOrderedBy(expressions, ascending);
   }
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override {
+    return child_->IsOrderedBy(expressions, ascending, nulls_first);
+  }
   [[nodiscard]] const Plan& Child() const { return child_; }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;

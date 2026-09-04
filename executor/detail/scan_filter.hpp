@@ -21,7 +21,7 @@
 namespace tinylamb {
 class TransactionContext;
 class Table;
-}
+}  // namespace tinylamb
 
 namespace tinylamb::relational_detail {
 
@@ -38,8 +38,8 @@ struct SimpleComparePredicate {
 struct CompiledScanFilter {
   std::vector<SimpleComparePredicate> simple;
   std::vector<Expression> residual;
-  // Disjunctive branches: OR(AND(pred1, pred2, ...), AND(pred3, pred4, ...), ...)
-  // Each inner vector is one AND branch.  MatchScanFilter returns true if
+  // Disjunctive branches: OR(AND(pred1, pred2, ...), AND(pred3, pred4, ...),
+  // ...) Each inner vector is one AND branch.  MatchScanFilter returns true if
   // ALL predicates in ANY branch pass.  Falls back to residual evaluation
   // only when the branch contains non-simple (residual) predicates.
   struct DisjunctiveBranch {
@@ -71,13 +71,14 @@ std::vector<IntegerPeekCompare> BuildIntegerPeeks(
     const CompiledScanFilter& filter, const std::vector<slot_t>* projection,
     const Schema& full_schema);
 
-bool TryParallelTableScan(
-    TransactionContext& context, Table& table,
-    const std::vector<slot_t>* projection,
-    const std::unordered_set<int64_t>* key_filter,
-    std::optional<slot_t> full_key_column, bool filter_during_scan,
-    const CompiledScanFilter* scan_filter, const Schema& result_schema,
-    const Scope* outer, const CteMap& ctes, Relation* result);
+bool TryParallelTableScan(TransactionContext& context, Table& table,
+                          const std::vector<slot_t>* projection,
+                          const std::unordered_set<int64_t>* key_filter,
+                          std::optional<slot_t> full_key_column,
+                          bool filter_during_scan,
+                          const CompiledScanFilter* scan_filter,
+                          const Schema& result_schema, const Scope* outer,
+                          const CteMap& ctes, Relation* result);
 
 Relation LoadSource(TransactionContext& context, const SelectSource& source,
                     const Scope* outer, const CteMap& ctes,

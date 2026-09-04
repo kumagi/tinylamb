@@ -101,7 +101,8 @@ TEST_F(RowPageTest, ReadMany) {
 TEST_F(RowPageTest, UpdateMany) {
   // Arrange
   constexpr static int kInserts = 20;
-  constexpr static std::string_view kLongMessage = " long updated messages!!!!!";
+  constexpr static std::string_view kLongMessage =
+      " long updated messages!!!!!";
   constexpr static std::string_view kShortMessage = "s";
 
   // Act 1 -- insert kInserts short messages
@@ -673,4 +674,37 @@ TEST_F(RowPageTest, DeFragmentAndDump) {
   EXPECT_NE(dumped.find("row1"), std::string::npos);
   ASSERT_SUCCESS(txn.PreCommit());
 }
+TEST_F(RowPageTest, OversizedRecordIsRejectedWithTooBigData) {
+  // InsertRowAt/UpdateRow narrowed size_t into bin_size_t (u16) behind a
+  // debug-only assert; NDEBUG builds silently truncated oversized records.
+  Page test_page(0, PageType::kRowPage);
+  RowPage* row = &test_page.body.row_page;
+  const std::string huge(70000, 'x');
+  StatusOr<slot_t> inserted = row->InsertRow(huge);
+  EXPECT_FALSE(inserted.HasValue());
+  EXPECT_EQ(inserted.GetStatus(), Status::kTooBigData);
+  // Leaf/Branch parity: oversized payloads report kTooBigData, never kNoSpace.
+  ASSERT_TRUE(InsertRow("row-a"));
+  EXPECT_EQ(row->UpdateRow(0, huge), Status::kTooBigData);
+  EXPECT_EQ(ReadRow(0), "row-a");
+}
+TEST_F(RowPageTest, DeleteRowReappliedIsIdempotent) {
+  // D2 (docs/design.md): the loser-undo pattern rewinds page_lsn, so a
+  // second recovery pass re-applies the same DeleteRow.  It must not
+  // underflow row_count_ (the 65535 audit symptom) nor inflate free_size_.
+  ASSERT_TRUE(InsertRow("row-a"));
+  ASSERT_TRUE(InsertRow("row-b"));
+  DeleteRow(0);  // committed delete of slot 0
+  {
+    PageRef page = p_->GetPage(page_id_);
+    const bin_size_t free_before = page->body.row_page.FreeSizeForTest();
+    page->body.row_page.DeleteRow(0);   // already deleted: no-op
+    page->body.row_page.DeleteRow(99);  // out of range: no-op
+    EXPECT_EQ(page->body.row_page.RowCount(), 1);
+    EXPECT_EQ(page->body.row_page.FreeSizeForTest(), free_before);
+  }
+  EXPECT_EQ(GetRowCount(), 1);
+  EXPECT_EQ(ReadRow(1), "row-b");
+}
+
 }  // namespace tinylamb

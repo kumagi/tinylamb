@@ -12,17 +12,18 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
-  */
+ */
 
 #include <stdlib.h>  // NOLINT(modernize-deprecated-headers) // POSIX setenv/unsetenv below are only provided by this header.
+
 #include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <vector>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/encoder.hpp"
@@ -103,7 +104,7 @@ TEST_F(CatalogTest, GetTable) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
-                          ctx.GetTable("test_schema"));
+                                ctx.GetTable("test_schema"));
     ctx.txn_.PreCommit();
 
     // Assert -- retrieved table's schema matches the created schema
@@ -127,12 +128,13 @@ TEST_F(CatalogTest, Recover) {
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
-  // Act -- emulate crash, recover database, open new context, get table, pre-commit
+  // Act -- emulate crash, recover database, open new context, get table,
+  // pre-commit
   Recover();
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
-                          ctx.GetTable("test_schema"));
+                                ctx.GetTable("test_schema"));
     ctx.txn_.PreCommit();
 
     // Assert -- recovered table's schema matches the originally created schema
@@ -190,18 +192,16 @@ TEST_F(CatalogTest, StatisticsUpdateAndRefresh) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
-                          ctx.GetTable("stats_tbl"));
-    ASSERT_SUCCESS(
-        tbl->Insert(ctx.txn_, Row({Value(1)})).GetStatus());
-    ASSERT_SUCCESS(
-        tbl->Insert(ctx.txn_, Row({Value(2)})).GetStatus());
+                                ctx.GetTable("stats_tbl"));
+    ASSERT_SUCCESS(tbl->Insert(ctx.txn_, Row({Value(1)})).GetStatus());
+    ASSERT_SUCCESS(tbl->Insert(ctx.txn_, Row({Value(2)})).GetStatus());
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, stats,
-                          ctx.GetStats("stats_tbl"));
+                                ctx.GetStats("stats_tbl"));
 
     // Assert -- statistics are not updated implicitly by inserts
     EXPECT_EQ(stats->Rows(), 0);
@@ -213,7 +213,7 @@ TEST_F(CatalogTest, StatisticsUpdateAndRefresh) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, refreshed,
-                          ctx.GetStats("stats_tbl"));
+                                ctx.GetStats("stats_tbl"));
     EXPECT_EQ(refreshed->Rows(), 2);
 
     // Act -- scale the statistics threefold and write them back
@@ -224,7 +224,7 @@ TEST_F(CatalogTest, StatisticsUpdateAndRefresh) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, updated,
-                          ctx.GetStats("stats_tbl"));
+                                ctx.GetStats("stats_tbl"));
     EXPECT_EQ(updated->Rows(), 6);
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
@@ -242,7 +242,7 @@ TEST_F(CatalogTest, BeginReadOnlyContext) {
   // Act -- open a read-only context and fetch the table
   TransactionContext ctx = rs_->BeginReadOnlyContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
-                        ctx.GetTable("ro_tbl"));
+                              ctx.GetTable("ro_tbl"));
 
   // Assert -- the table is visible to the read-only transaction
   ASSERT_EQ(schema, tbl->GetSchema());
@@ -287,13 +287,13 @@ TEST_F(CatalogTest, TransactionContextCache) {
 
   // Act -- request the table and stats twice each
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl1,
-                        ctx.GetTable("cache_tbl"));
+                              ctx.GetTable("cache_tbl"));
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl2,
-                        ctx.GetTable("cache_tbl"));
+                              ctx.GetTable("cache_tbl"));
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, s1,
-                        ctx.GetStats("cache_tbl"));
+                              ctx.GetStats("cache_tbl"));
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, s2,
-                        ctx.GetStats("cache_tbl"));
+                              ctx.GetStats("cache_tbl"));
 
   // Assert -- subsequent requests hit the context-local cache
   EXPECT_EQ(tbl1.get(), tbl2.get());
@@ -395,10 +395,9 @@ TEST_F(CatalogTest, PageStoragePageSlotsAllocateReuse) {
     EXPECT_EQ(gone.GetStatus(), Status::kNotExists);
 
     // Act -- destroy the page so its id returns to the free list
-    // HAZARD: this commits a kSystemDestroyPage record whose redo is not
-    // implemented (recovery_manager.cpp throws on replay). A crash followed
-    // by recovery of THIS database would fail at startup. Pinned here until
-    // destroy-redo is designed; do not copy this pattern into other tests.
+    // D3 (docs/design.md): the destroy redo initializes the page as a free
+    // page and recovery rebuilds the free list, so a crash after this commit
+    // no longer breaks startup.
     pm->DestroyPage(txn, first.get());
   }
 
@@ -441,9 +440,9 @@ TEST_F(CatalogTest, PageStorageAllocatesGrowingPageIds) {
 
 TEST_F(CatalogTest, CreateTableWithUniqueColumn) {
   // Arrange -- a schema whose key column carries a UNIQUE constraint
-  Schema schema("unique_tbl",
-                {Column("id", ValueType::kInt64, Constraint(Constraint::kUnique)),
-                 Column("name", ValueType::kVarChar)});
+  Schema schema("unique_tbl", {Column("id", ValueType::kInt64,
+                                      Constraint(Constraint::kUnique)),
+                               Column("name", ValueType::kVarChar)});
 
   // Act -- create the table; this path builds a unique B+tree index
   {
@@ -456,7 +455,7 @@ TEST_F(CatalogTest, CreateTableWithUniqueColumn) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
-                          ctx.GetTable("unique_tbl"));
+                                ctx.GetTable("unique_tbl"));
     ASSERT_EQ(schema, tbl->GetSchema());
     ASSERT_EQ(tbl->IndexCount(), 1U);
     ASSERT_TRUE(tbl->GetIndex(0).IsUnique());
@@ -466,9 +465,9 @@ TEST_F(CatalogTest, CreateTableWithUniqueColumn) {
 
 TEST_F(CatalogTest, UniqueIndexRejectsDuplicateKeys) {
   // Arrange -- a UNIQUE-constrained table created through the catalog
-  Schema schema("uniq_ins",
-                {Column("id", ValueType::kInt64, Constraint(Constraint::kUnique)),
-                 Column("name", ValueType::kVarChar)});
+  Schema schema("uniq_ins", {Column("id", ValueType::kInt64,
+                                    Constraint(Constraint::kUnique)),
+                             Column("name", ValueType::kVarChar)});
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
@@ -479,7 +478,7 @@ TEST_F(CatalogTest, UniqueIndexRejectsDuplicateKeys) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
-                          ctx.GetTable("uniq_ins"));
+                                ctx.GetTable("uniq_ins"));
     ASSERT_SUCCESS(
         tbl->Insert(ctx.txn_, Row({Value(1), Value("alice")})).GetStatus());
     const Status duplicate =
@@ -493,9 +492,8 @@ TEST_F(CatalogTest, UniqueIndexRejectsDuplicateKeys) {
 
 TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {
   // Arrange -- create and commit a table with two columns.
-  Schema schema("drop_tbl",
-                {Column("c", ValueType::kInt64),
-                 Column("d", ValueType::kVarChar)});
+  Schema schema("drop_tbl", {Column("c", ValueType::kInt64),
+                             Column("d", ValueType::kVarChar)});
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
@@ -506,7 +504,7 @@ TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, before,
-                          ctx.GetTable("drop_tbl"));
+                                ctx.GetTable("drop_tbl"));
     EXPECT_EQ(schema, before->GetSchema());
     ASSERT_SUCCESS(rs_->DropTable(ctx, "drop_tbl"));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -523,9 +521,8 @@ TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {
 
 TEST_F(CatalogTest, CreateIndexOnExistingTable) {
   // Arrange -- create and commit a table without any index.
-  Schema schema("idx_tbl",
-                {Column("id", ValueType::kInt64),
-                 Column("name", ValueType::kVarChar)});
+  Schema schema("idx_tbl", {Column("id", ValueType::kInt64),
+                            Column("name", ValueType::kVarChar)});
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
@@ -535,8 +532,8 @@ TEST_F(CatalogTest, CreateIndexOnExistingTable) {
   // Act -- add a secondary index on column 1.
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "idx_tbl",
-                                    IndexSchema("idx_tbl|name", {1})));
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(ctx, "idx_tbl", IndexSchema("idx_tbl|name", {1})));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -544,7 +541,7 @@ TEST_F(CatalogTest, CreateIndexOnExistingTable) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
-                          ctx.GetTable("idx_tbl"));
+                                ctx.GetTable("idx_tbl"));
     EXPECT_EQ(tbl->IndexCount(), 1U);
     EXPECT_EQ(tbl->GetIndex(0).sc_.name_, "idx_tbl|name");
     ctx.txn_.PreCommit();
@@ -566,14 +563,14 @@ TEST_F(CatalogTest, CreateIndexRefreshesContextCache) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, stale,
-                          ctx.GetTable("cache_idx"));
+                                ctx.GetTable("cache_idx"));
     EXPECT_EQ(stale->IndexCount(), 0U);
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "cache_idx",
-                                    IndexSchema("cache_idx|name", {1})));
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(ctx, "cache_idx", IndexSchema("cache_idx|name", {1})));
 
     // Assert -- lookups now serve a refreshed image that carries the index.
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, fresh,
-                          ctx.GetTable("cache_idx"));
+                                ctx.GetTable("cache_idx"));
     ASSERT_EQ(fresh->IndexCount(), 1U);
     EXPECT_EQ(fresh->GetIndex(0).sc_.name_, "cache_idx|name");
 
@@ -603,7 +600,7 @@ TEST_F(CatalogTest, DropTableInvalidatesContextCache) {
   // Act -- populate the context cache, then drop on the same context.
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, cached,
-                        ctx.GetTable("cache_drop"));
+                              ctx.GetTable("cache_drop"));
   std::ignore = cached;
   ASSERT_SUCCESS(rs_->DropTable(ctx, "cache_drop"));
 
@@ -621,7 +618,8 @@ TEST_F(CatalogTest, MoveAssignmentClearsCaches) {
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl, ctx.GetTable("move_ctx"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable("move_ctx"));
   std::ignore = tbl;
 
   // Act -- move-assign a fresh context over this one.
@@ -643,15 +641,17 @@ TEST_F(CatalogTest, MoveAssignmentClearsCaches) {
 // index-carrying catalog across the same crash boundary.
 TEST_F(CatalogTest, TableWithIndexesSurvivesCrash) {
   // Arrange -- create a table and two secondary indexes, then commit.
-  Schema schema("fuzz_tbl",
-                {Column("f_id", ValueType::kInt64, Constraint(Constraint::kIndex)),
-                 Column("name", ValueType::kVarChar),
-                 Column("double", ValueType::kDouble)});
+  Schema schema("fuzz_tbl", {Column("f_id", ValueType::kInt64,
+                                    Constraint(Constraint::kIndex)),
+                             Column("name", ValueType::kVarChar),
+                             Column("double", ValueType::kDouble)});
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "fuzz_tbl", IndexSchema("num_idx", {0})));
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "fuzz_tbl", IndexSchema("str_idx", {1})));
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(ctx, "fuzz_tbl", IndexSchema("num_idx", {0})));
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(ctx, "fuzz_tbl", IndexSchema("str_idx", {1})));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -660,16 +660,16 @@ TEST_F(CatalogTest, TableWithIndexesSurvivesCrash) {
 
   // Assert -- the table and both indexes come back.
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl, ctx.GetTable("fuzz_tbl"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable("fuzz_tbl"));
   EXPECT_EQ(tbl->IndexCount(), 2U);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
 TEST_F(CatalogTest, CreateIndexAloneSurvivesCrash) {
   // Arrange -- commit a bare table first (this is known to survive recovery).
-  Schema schema("solo_idx",
-                {Column("id", ValueType::kInt64),
-                 Column("name", ValueType::kVarChar)});
+  Schema schema("solo_idx", {Column("id", ValueType::kInt64),
+                             Column("name", ValueType::kVarChar)});
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
@@ -690,7 +690,8 @@ TEST_F(CatalogTest, CreateIndexAloneSurvivesCrash) {
 
   // Assert -- the index added after recovery is still attached.
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl, ctx.GetTable("solo_idx"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable("solo_idx"));
   EXPECT_EQ(tbl->IndexCount(), 1U);
   EXPECT_EQ(tbl->GetIndex(0).sc_.name_, "by_name");
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -701,11 +702,10 @@ TEST_F(CatalogTest, EmptyReadCommitBeforeCrashKeepsTable) {
   // The fuzzer commits a table plus two secondary indexes, then commits one
   // read-only context (GetTable + PreCommit with no writes), then emulates a
   // crash; reopening loses the table even though either step alone survives.
-  Schema schema("empty_read_tbl",
-                {Column("f_id", ValueType::kInt64,
-                         Constraint(Constraint::kIndex)),
-                 Column("name", ValueType::kVarChar),
-                 Column("double", ValueType::kDouble)});
+  Schema schema("empty_read_tbl", {Column("f_id", ValueType::kInt64,
+                                          Constraint(Constraint::kIndex)),
+                                   Column("name", ValueType::kVarChar),
+                                   Column("double", ValueType::kDouble)});
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
@@ -732,7 +732,7 @@ TEST_F(CatalogTest, EmptyReadCommitBeforeCrashKeepsTable) {
   // Assert -- the table survives.
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
-                        ctx.GetTable("empty_read_tbl"));
+                              ctx.GetTable("empty_read_tbl"));
   EXPECT_EQ(tbl->GetSchema().Name(), "empty_read_tbl");
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
@@ -756,8 +756,53 @@ TEST_F(CatalogTest, TwoCleanRecoveryCyclesKeepTable) {
   Recover();  // second crash-recovery cycle without any DDL in between
 
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl, ctx.GetTable("two_gen"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable("two_gen"));
   EXPECT_EQ(tbl->GetSchema().Name(), "two_gen");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(CatalogTest, DropTableCrashRecoveryReclaimsPages) {
+  // D3 (docs/design.md) acceptance 1: CREATE, insert, DROP, crash, recover,
+  // reopen -- the dropped table's pages come back as free pages linked into
+  // the rebuilt free list and are reused by the next allocation.
+  Schema schema("drop_reclaim", {Column("id", ValueType::kInt64),
+                                 Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(ctx, schema));
+    for (int i = 0; i < 100; ++i) {
+      ASSERT_SUCCESS(
+          tbl.Insert(ctx.txn_, Row({Value(static_cast<int64_t>(i)),
+                                    Value("row-payload-" + std::to_string(i))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->DropTable(ctx, "drop_reclaim"));
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  Recover();  // crash right after the committed DROP
+
+  TransactionContext ctx = rs_->BeginContext();
+  EXPECT_FALSE(ctx.GetTable("drop_reclaim").HasValue());
+  PageManager* pm = ctx.txn_.GetPageManager();
+  {
+    PageRef meta = pm->GetPage(kMetaPageId);
+    const page_id_t head = meta->body.meta_page.FirstFreePage();
+    EXPECT_NE(head, 0U) << "free list must hold the dropped table's pages";
+    PageRef freed = pm->GetPage(head);
+    ASSERT_FALSE(freed.IsNull());
+    EXPECT_EQ(freed->Type(), PageType::kFreePage);
+  }
+  // The dropped pages are reusable by the very next allocation.
+  PageRef reused = pm->AllocateNewPage(ctx.txn_, PageType::kRowPage);
+  ASSERT_FALSE(reused.IsNull());
+  ASSERT_TRUE(reused->Insert(ctx.txn_, "reused-row").HasValue());
+  reused.PageUnlock();
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
@@ -784,15 +829,14 @@ TEST_F(CatalogTest, CreateIndexOnRecoveredTableFails) {
     TransactionContext ctx = rs_->BeginContext();
     const Status created =
         rs_->CreateIndex(ctx, "recovered_idx", IndexSchema("by_name", {1}));
-    // Expected behaviour; currently fails with kNotExists.
     EXPECT_EQ(created, Status::kSuccess);
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 }
 
 TEST_F(CatalogTest, FailedCreateIndexCommitDoesNotPoisonCatalog) {
-  // Documents bug: committing the context whose CreateIndex failed wipes the
-  // previously committed table at the NEXT recovery.
+  // Regression pin: committing the context whose CreateIndex failed must not
+  // wipe the previously committed table at the NEXT recovery.
   Schema schema("poison_probe", {Column("id", ValueType::kInt64),
                                  Column("name", ValueType::kVarChar)});
   {
@@ -805,13 +849,8 @@ TEST_F(CatalogTest, FailedCreateIndexCommitDoesNotPoisonCatalog) {
     TransactionContext ctx = rs_->BeginContext();
     const Status created =
         rs_->CreateIndex(ctx, "poison_probe", IndexSchema("by_name", {1}));
-    if (created != Status::kSuccess) {
-      // Current behaviour lands here; committing anyway mirrors what a
-      // caller that ignores the status would do.
-      ctx.txn_.PreCommit();
-    } else {
-      ASSERT_SUCCESS(ctx.txn_.PreCommit());
-    }
+    ASSERT_SUCCESS(created);
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
   Recover();
 
@@ -828,10 +867,11 @@ TEST_F(CatalogTest, ListTablesAfterRecover) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
-    ASSERT_SUCCESS(rs_->CreateTable(
-                        ctx, Schema("other_tbl", {Column("id", ValueType::kInt64),
-                                               Column("name", ValueType::kVarChar)}))
-                       .GetStatus());
+    ASSERT_SUCCESS(
+        rs_->CreateTable(
+               ctx, Schema("other_tbl", {Column("id", ValueType::kInt64),
+                                         Column("name", ValueType::kVarChar)}))
+            .GetStatus());
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
   Recover();
@@ -880,12 +920,33 @@ TEST_F(CatalogTest, DropTableAndStats_WorkForAnyCase) {
   }
   {
     TransactionContext ctx4 = rs_->BeginContext();
-    EXPECT_EQ(rs_->GetTable(ctx4, "MixedName").GetStatus(),
-              Status::kNotExists);
+    EXPECT_EQ(rs_->GetTable(ctx4, "MixedName").GetStatus(), Status::kNotExists);
     auto stats = rs_->GetStatistics(ctx4, "mixedname");
     EXPECT_EQ(stats.GetStatus(), Status::kNotExists);
     ASSERT_SUCCESS(ctx4.txn_.PreCommit());
   }
+}
+
+TEST_F(CatalogTest, ColumnStatisticsResolveForAnyCase) {
+  // PRODUCTION BUG (fixed): GetStatistics read the per-column records under
+  // the user-supplied case while writing them under the canonical name, so a
+  // differently-cased reference silently substituted empty ColumnStats.
+  TransactionContext ctx = rs_->BeginContext();
+  Schema schema("CaseStats", {Column("id", ValueType::kInt64)});
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(ctx, schema));
+  for (int64_t i = 0; i < 5; ++i) {
+    ASSERT_TRUE(tbl.Insert(ctx.txn_, Row({Value(i)})).HasValue());
+  }
+  ASSERT_SUCCESS(rs_->RefreshStatistics(ctx, "CaseStats"));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+
+  TransactionContext ctx2 = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, stats,
+                        rs_->GetStatistics(ctx2, "casestats"));
+  ASSERT_EQ(stats.Rows(), 5U);
+  EXPECT_GT(stats.Column(0).Count(), 0U)
+      << "column statistics must be populated for a differently-cased read";
+  ASSERT_SUCCESS(ctx2.txn_.PreCommit());
 }
 
 TEST_F(CatalogTest, CreateIndex_FailurePropagatesFromCreateTable) {
@@ -893,10 +954,10 @@ TEST_F(CatalogTest, CreateIndex_FailurePropagatesFromCreateTable) {
   // failed unique-index build silently registered an unconstrained table.
   TransactionContext ctx = rs_->BeginContext();
   Schema schema("uniq_tbl", {Column("id", ValueType::kInt64,
-                                  Constraint(Constraint::kUnique))});
+                                    Constraint(Constraint::kUnique))});
   // Normal creation must succeed and enforce uniqueness.
   ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(ctx, schema));
-  RowPosition pos = tbl.Insert(ctx.txn_, Row({Value(1)})).Value();
+  ASSERT_TRUE(tbl.Insert(ctx.txn_, Row({Value(1)})).HasValue());
   EXPECT_EQ(tbl.Insert(ctx.txn_, Row({Value(1)})).GetStatus(),
             Status::kDuplicates);
 }

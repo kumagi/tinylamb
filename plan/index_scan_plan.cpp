@@ -5,12 +5,15 @@
 
 #include "index_scan_plan.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
-#include <vector>
-#include <utility>
+#include <optional>
 #include <ostream>
+#include <ranges>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
@@ -23,9 +26,6 @@
 #include "type/type.hpp"
 #include "type/value.hpp"
 
-#include <algorithm>
-#include <ranges>
-
 namespace tinylamb {
 namespace {
 
@@ -34,14 +34,18 @@ bool IntConstant(const Expression& expression, int64_t* value) {
     return false;
   }
   const Value constant = expression->AsConstantValue().GetValue();
-  if (constant.type != ValueType::kInt64) { return false; }
+  if (constant.type != ValueType::kInt64) {
+    return false;
+  }
   *value = constant.value.int_value;
   return true;
 }
 
 bool AffineColumn(const Expression& expression, const ColumnName& target,
-                 int64_t* multiplier) {  // NOLINT(misc-no-recursion)
-  if (!expression) { return false; }
+                  int64_t* multiplier) {  // NOLINT(misc-no-recursion)
+  if (!expression) {
+    return false;
+  }
   if (expression->Type() == TypeTag::kColumnValue) {
     const ColumnName& column = expression->AsColumnValue().GetColumnName();
     if (column.name != target.name || column.schema != target.schema) {
@@ -49,7 +53,9 @@ bool AffineColumn(const Expression& expression, const ColumnName& target,
     }
     return true;
   }
-  if (expression->Type() != TypeTag::kBinaryExp) { return false; }
+  if (expression->Type() != TypeTag::kBinaryExp) {
+    return false;
+  }
   const auto& binary = expression->AsBinaryExpression();
   int64_t constant = 0;
   if (binary.Op() == BinaryOperation::kAdd &&
@@ -62,7 +68,9 @@ bool AffineColumn(const Expression& expression, const ColumnName& target,
   }
   if (binary.Op() == BinaryOperation::kMultiply &&
       IntConstant(binary.Right(), &constant)) {
-    if (!AffineColumn(binary.Left(), target, multiplier)) { return false; }
+    if (!AffineColumn(binary.Left(), target, multiplier)) {
+      return false;
+    }
     *multiplier *= constant;
     return true;
   }
@@ -71,18 +79,27 @@ bool AffineColumn(const Expression& expression, const ColumnName& target,
 
 bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
                   const std::vector<Expression>& expressions,
-                  const std::vector<bool>& ascending) {
+                  const std::vector<bool>& ascending,
+                  const std::vector<std::optional<bool>>& nulls_first = {}) {
   if (provided.empty() || expressions.empty() ||
       expressions.size() != ascending.size() ||
       expressions.size() > provided.size()) {
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
+    // Index keys use memcomparable byte order with NULL encoded smallest, so
+    // a forward scan yields NULLS FIRST and a reverse scan NULLS LAST
+    // (affine post-projection moves values but not the NULL position).
+    const bool requested = i < nulls_first.size()
+                               ? nulls_first[i].value_or(ascending[i])
+                               : ascending[i];
+    if (requested != scan_ascending) {
+      return false;
+    }
     if (expressions[i]->Type() == TypeTag::kColumnValue) {
       const ColumnName& column =
           expressions[i]->AsColumnValue().GetColumnName();
-      if (column.name != provided[i].name ||
-          ascending[i] != scan_ascending) {
+      if (column.name != provided[i].name || ascending[i] != scan_ascending) {
         return false;
       }
       continue;
@@ -98,7 +115,9 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
     }
     const bool expression_ascending =
         multiplier > 0 ? scan_ascending : !scan_ascending;
-    if (ascending[i] != expression_ascending) { return false; }
+    if (ascending[i] != expression_ascending) {
+      return false;
+    }
   }
   return true;
 }
@@ -110,20 +129,23 @@ Value FirstOrNull(const std::vector<Value>& keys) {
 // Bounds-based estimate for point-union scans: spans [min,max] across the
 // points. The residual predicate keeps results correct; the estimate stays
 // conservative.
-TableStatistics BoundsStats(const TableStatistics& ts, const Index& index,
-                            const std::vector<
-                                std::pair<std::vector<Value>,
-                                          std::vector<Value>>>& ranges) {
+TableStatistics BoundsStats(
+    const TableStatistics& ts, const Index& index,
+    const std::vector<std::pair<std::vector<Value>, std::vector<Value>>>&
+        ranges) {
   Value min;
   Value max;
   for (const auto& range : ranges) {
-    if (range.first.empty()) { continue;
-}
+    if (range.first.empty()) {
+      continue;
+    }
     const Value& key = range.first.front();
-    if (min.IsNull() || key < min) { min = key;
-}
-    if (max.IsNull() || max < key) { max = key;
-}
+    if (min.IsNull() || key < min) {
+      min = key;
+    }
+    if (max.IsNull() || max < key) {
+      max = key;
+    }
   }
   return ts.TransformBy(index.sc_.key_[0], min, max);
 }
@@ -154,9 +176,8 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
 IndexScanPlan::IndexScanPlan(
     const Table& table, const Index& index, const TableStatistics& ts,
     std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
-    bool ascending, Expression where,
-    std::vector<ColumnName> provided_order, bool lock_rows,
-    bool wait_for_write_intent)
+    bool ascending, Expression where, std::vector<ColumnName> provided_order,
+    bool lock_rows, bool wait_for_write_intent)
     : table_(table),
       index_(index),
       stats_(BoundsStats(ts, index, ranges)),
@@ -169,7 +190,8 @@ IndexScanPlan::IndexScanPlan(
       where_(std::move(where)),
       provided_order_(std::move(provided_order)) {}
 
-// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
+// EmitExecutor lives in the relational factory
+// (executor/relational_factory.cpp).
 
 const Schema& IndexScanPlan::GetSchema() const { return table_.GetSchema(); }
 
@@ -197,6 +219,14 @@ bool IndexScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
   // Point ranges are sorted and disjoint before construction, so scanning
   // them in sequence preserves the advertised global key order.
   return OrderMatches(provided_order_, ascending_, expressions, ascending);
+}
+
+bool IndexScanPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
+  return OrderMatches(provided_order_, ascending_, expressions, ascending,
+                      nulls_first);
 }
 
 void IndexScanPlan::Dump(std::ostream& o, int /*indent*/) const {

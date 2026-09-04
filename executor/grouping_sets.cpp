@@ -93,15 +93,19 @@ Schema MakeGroupingSetsSchema(
     cols.emplace_back(name, vt);
   }
   for (const NamedExpression& named : aggregates) {
-    const auto& agg = named.expression->AsAggregateExpression();
-    if (agg.GetType() == AggregationType::kCount) {
-      cols.emplace_back(named.name, ValueType::kInt64);
-    } else if (agg.GetType() == AggregationType::kAvg ||
-               agg.GetType() == AggregationType::kSum) {
-      cols.emplace_back(named.name, ValueType::kDouble);
-    } else {
-      cols.emplace_back(named.name, ValueType::kVarChar);
+    // Delegate to the aggregate's own static result type (COUNT -> INT64,
+    // AVG/statistics/sketches -> DOUBLE/VARCHAR, everything else such as
+    // SUM/MIN/MAX/BIT_* -> the child type). The previous hand listing
+    // declared SUM(int) as Double and BIT_*/MIN(int) as VarChar while the
+    // executor emits the child-typed values.
+    ValueType vt = ValueType::kVarChar;
+    try {
+      vt = TypeTagToValueType(
+          named.expression->ResultType(input_schema).GetType());
+    } catch (...) {
+      vt = ValueType::kVarChar;
     }
+    cols.emplace_back(named.name, vt);
   }
   return Schema("grouping_sets_agg", std::move(cols));
 }
@@ -152,7 +156,8 @@ GroupingSetsExecutor GroupingSetsExecutor::Cube(
   std::vector<std::pair<size_t, size_t>> mask_with_popcount;
   mask_with_popcount.reserve(total_sets);
   for (size_t mask = 0; mask < total_sets; ++mask) {
-    mask_with_popcount.emplace_back(mask, static_cast<size_t>(__builtin_popcountll(mask)));
+    mask_with_popcount.emplace_back(
+        mask, static_cast<size_t>(__builtin_popcountll(mask)));
   }
 
   std::stable_sort(mask_with_popcount.begin(), mask_with_popcount.end(),
@@ -273,7 +278,8 @@ void GroupingSetsExecutor::Materialize() {
 
         if (agg.Distinct()) {
           if (!val.IsNull()) {
-            s.distinct_sets[i].insert(relational_detail::CanonicalDistinctValue(val));
+            s.distinct_sets[i].insert(
+                relational_detail::CanonicalDistinctValue(val));
           }
           continue;
         }
@@ -455,7 +461,8 @@ bool GroupingSetsExecutor::Next(Row* dst, RowPosition* rp) {
   return true;
 }
 
-size_t GroupingSetsExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+size_t GroupingSetsExecutor::NextBatch(DataChunk* destination,
+                                       size_t max_rows) {
   destination->Reset(output_schema_, max_rows);
   if (max_rows == 0) {
     return 0;

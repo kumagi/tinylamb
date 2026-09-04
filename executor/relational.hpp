@@ -12,6 +12,14 @@ namespace tinylamb {
 
 class SelectStatement;
 class TransactionContext;
+class PlanBase;
+
+// Bridge for plan/GroupByPlan: materializes `core_plan` (the Cascades-
+// optimized FROM + WHERE core) and runs the statement's grouping finish
+// pipeline (Project / HAVING / DISTINCT / ORDER BY / LIMIT) over it.
+Executor EmitGroupedFinishExecutor(
+    TransactionContext& context, std::shared_ptr<PlanBase> core_plan,
+    std::shared_ptr<const SelectStatement> statement);
 
 class RelationalExecutor : public ExecutorBase {
  public:

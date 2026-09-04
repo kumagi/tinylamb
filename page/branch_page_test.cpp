@@ -78,8 +78,7 @@ class BranchPageTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               r_.get());
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
     // r_->RecoverFrom(0, tm_.get());
   }
 
@@ -528,7 +527,8 @@ TEST_F(BranchPageTest, DeleteAbort) {
 
 TEST_F(BranchPageTest, UpdateHeavy) {
   // Arrange
-  std::mt19937 random(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp) fixed seed keeps the test reproducible
+  std::mt19937 random(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp) fixed seed
+                           // keeps the test reproducible
   constexpr int kCount = 40;
   Transaction txn = tm_->Begin();
   std::vector<std::string> keys;
@@ -614,7 +614,8 @@ TEST_F(BranchPageTest, FosterChild) {
   Transaction txn = tm_->Begin();
   PageRef page = Page();
 
-  // Act -- for 100 iterations, set/get foster pair, then clear it and verify gone
+  // Act -- for 100 iterations, set/get foster pair, then clear it and verify
+  // gone
   for (int i = 0; i < 100; ++i) {
     std::string key = RandomString(((19937 * i) % 12) + 5000, false);
     ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
@@ -697,8 +698,7 @@ TEST_F(BranchPageTest, InsertTooBigData) {
   PageRef page = Page();
 
   // Act -- a key larger than the per-entry limit must be rejected
-  Status result =
-      page->InsertBranch(txn, std::string(6000, 'a'), 1);
+  Status result = page->InsertBranch(txn, std::string(6000, 'a'), 1);
 
   // Assert -- kTooBigData, not a silent truncation or crash
   ASSERT_EQ(result, Status::kTooBigData);
@@ -726,8 +726,7 @@ TEST_F(BranchPageTest, UpdateTooBigKey) {
   ASSERT_SUCCESS(page->InsertBranch(txn, "a", 1));
 
   // Act -- updating with an oversized key must be rejected up-front
-  Status result =
-      page->UpdateBranch(txn, std::string(6000, 'a'), 2);
+  Status result = page->UpdateBranch(txn, std::string(6000, 'a'), 2);
 
   // Assert -- kTooBigData
   ASSERT_EQ(result, Status::kTooBigData);
@@ -787,8 +786,7 @@ TEST_F(BranchPageTest, SetFosterNoSpace) {
   }
 
   // Act -- an oversized foster key cannot fit in the remaining space
-  Status result =
-      page->SetFoster(txn, FosterPair(std::string(5000, 'f'), 99));
+  Status result = page->SetFoster(txn, FosterPair(std::string(5000, 'f'), 99));
 
   // Assert -- kNoSpace
   ASSERT_EQ(result, Status::kNoSpace);
@@ -934,4 +932,29 @@ TEST_F(BranchPageTest, MoveRightToFosterKeepsLookupsOrdered) {
   ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "c", false), 3);
   ASSERT_SUCCESS(txn.PreCommit());
 }
+TEST_F(BranchPageTest, ImplOperationsAreIdempotent) {
+  // D2 (docs/design.md): re-applied branch redo/undo records must not
+  // duplicate separators, corrupt foster slots, or drop the wrong child.
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->body.branch_page.InsertImpl("m", 10);
+  page->body.branch_page.InsertImpl("s", 20);
+  page->body.branch_page.InsertImpl("m", 10);  // re-applied insert
+  ASSERT_EQ(page->body.branch_page.RowCount(), 2);
+  ASSERT_EQ(page->body.branch_page.GetValue(0), 10U);
+
+  page->body.branch_page.UpdateImpl("m", 11);
+  page->body.branch_page.UpdateImpl("missing", 99);  // no-op, keeps children
+  ASSERT_EQ(page->body.branch_page.RowCount(), 2);
+  ASSERT_EQ(page->body.branch_page.GetValue(0), 11U);
+  ASSERT_EQ(page->body.branch_page.GetValue(1), 20U);
+
+  page->DeleteBranchImpl("m");
+  page->DeleteBranchImpl("m");       // re-applied delete via redo wrapper
+  page->DeleteBranchImpl("absent");  // absent key: no-op
+  ASSERT_EQ(page->body.branch_page.RowCount(), 1);
+  EXPECT_EQ(page->body.branch_page.GetKey(0), "s");
+  EXPECT_EQ(page->body.branch_page.GetValue(0), 20U);
+}
+
 }  // namespace tinylamb

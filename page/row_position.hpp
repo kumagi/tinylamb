@@ -36,7 +36,7 @@ struct RowPosition {
   page_id_t page_id = ~0LLU;
 
   // n-th row in the page.
-  slot_t slot = ~0;
+  slot_t slot = ~slot_t{0};
 
   [[nodiscard]] bool IsValid() const { return page_id != ~0LLU; }
 
@@ -65,7 +65,7 @@ struct RowPosition {
     const char* const original_offset = src;
     src += DeserializePID(src, &page_id);
     src += DeserializeSlot(src, &slot);
-    return src - original_offset;
+    return static_cast<size_t>(src - original_offset);
   }
 
   static constexpr size_t Size() { return sizeof(page_id) + sizeof(slot); }

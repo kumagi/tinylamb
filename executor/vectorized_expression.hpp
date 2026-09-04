@@ -42,9 +42,9 @@ class VectorizedExpression {
   static Value Aggregate(AggregationType type, const ColumnVector& col,
                          const SelectionVector* sel = nullptr);
   static Value AggregateLogicalAnd(const ColumnVector& col,
-                                  const SelectionVector* sel = nullptr);
+                                   const SelectionVector* sel = nullptr);
   static Value AggregateLogicalOr(const ColumnVector& col,
-                                 const SelectionVector* sel = nullptr);
+                                  const SelectionVector* sel = nullptr);
   static Value AggregateBitAnd(const ColumnVector& col,
                                const SelectionVector* sel = nullptr);
   static Value AggregateBitOr(const ColumnVector& col,

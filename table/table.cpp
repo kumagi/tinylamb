@@ -18,9 +18,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <optional>
-#include <cstdint>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -43,7 +43,6 @@
 #include "page/page_type.hpp"
 #include "page/row_position.hpp"
 #include "table/scan_options.hpp"
-#include "common/log_message.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -97,8 +96,7 @@ constexpr bin_size_t kTailPreallocateThreshold = kPageBodySize / 16;
 // std::ignore, or heap/index divergence goes undiagnosed.
 void LogCompensationFailure(std::string_view operation, Status status) {
   if (status != Status::kSuccess) {
-    LOG(WARN) << "Table compensation " << operation
-              << " failed: " << status;
+    LOG(WARN) << "Table compensation " << operation << " failed: " << status;
   }
 }
 }  // namespace
@@ -119,8 +117,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     bool finished = false;
     while (ref->body.row_page.next_page_id_ != 0) {
       const page_id_t previous = ref->PageID();
-      PageRef next =
-          page_manager->GetPage(ref->body.row_page.next_page_id_);
+      PageRef next = page_manager->GetPage(ref->body.row_page.next_page_id_);
       page_manager->AdvanceTableTail(first_pid_, previous, next->PageID());
       ref = std::move(next);
       StatusOr<slot_t> next_pos = ref->Insert(txn, serialized_row);
@@ -185,9 +182,8 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       // the index entries added before the failing one and remove the row
       // that was already written to the row page.
       for (size_t j = 0; j < i; ++j) {
-        LogCompensationFailure(
-            "insert-rollback IndexDelete",
-            IndexDelete(txn, indexes_[j], rp));
+        LogCompensationFailure("insert-rollback IndexDelete",
+                               IndexDelete(txn, indexes_[j], rp));
       }
       PageRef written = txn.GetPageManager()->GetPage(rp.page_id);
       LogCompensationFailure("insert-rollback heap Delete",
@@ -197,7 +193,6 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   }
   return rp;
 }
-
 
 namespace {
 // Phase2-5: index-maintenance decisions come from comparing column offsets,
@@ -230,9 +225,9 @@ bool KeyColumnChanged(const Value& a, const Value& b) {
 
 // True when no column feeding this index (key or include) differs between
 // the original and the updated row.
-bool IndexCoversUnchanged(
-    const Index& idx, const std::vector<slot_t>& changed_key_columns,
-    const std::vector<slot_t>& changed_include_columns) {
+bool IndexCoversUnchanged(const Index& idx,
+                          const std::vector<slot_t>& changed_key_columns,
+                          const std::vector<slot_t>& changed_include_columns) {
   const auto untouched = [](const std::vector<slot_t>& columns,
                             const std::vector<slot_t>& changed) {
     return std::ranges::all_of(columns, [&](slot_t slot) {
@@ -282,10 +277,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
         std::unique(changed_key_columns.begin(), changed_key_columns.end()),
         changed_key_columns.end());
     std::sort(changed_include_columns.begin(), changed_include_columns.end());
-    changed_include_columns.erase(
-        std::unique(changed_include_columns.begin(),
-                    changed_include_columns.end()),
-        changed_include_columns.end());
+    changed_include_columns.erase(std::unique(changed_include_columns.begin(),
+                                              changed_include_columns.end()),
+                                  changed_include_columns.end());
     const auto changed = [&](const std::vector<slot_t>& watched, bool key) {
       std::vector<slot_t> diff;
       for (slot_t slot : watched) {
@@ -357,8 +351,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     for (; deleted < indexes_.size(); ++deleted) {
       failure = IndexDelete(txn, indexes_[deleted], pos, original_row,
                             &idx_cursors[deleted]);
-      if (failure != Status::kSuccess) { break;
-}
+      if (failure != Status::kSuccess) {
+        break;
+      }
     }
     if (deleted < indexes_.size()) {
       // The physical row was rewritten in place: put back the deleted keys
@@ -372,8 +367,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     for (; inserted < indexes_.size(); ++inserted) {
       failure = IndexInsert(txn, indexes_[inserted], row, new_pos,
                             &idx_cursors[inserted]);
-      if (failure != Status::kSuccess) { break;
-}
+      if (failure != Status::kSuccess) {
+        break;
+      }
     }
     if (inserted < indexes_.size()) {
       // Fully restore the pre-update state: undo the applied inserts,
@@ -386,8 +382,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
     return new_pos;
   }
-  if (s != Status::kNoSpace) { return s;
-}
+  if (s != Status::kNoSpace) {
+    return s;
+  }
   // PRODUCTION RESTRUCTURE: reserve the relocation target BEFORE deleting
   // the original row.  The old delete-first ordering compensated failures by
   // rewriting the old image, but RowPage::Update cannot resurrect a deleted
@@ -402,6 +399,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       new_pos.page_id = page->PageID();
       new_pos.slot = next_pos.Value();
       finished = true;
+      // The compensation block below re-pins new_pos.page_id; the pool
+      // forbids same-thread re-acquisition of an exclusively latched page.
+      page.PageUnlock();
       break;
     }
     if (next_pos.GetStatus() != Status::kNoSpace) {
@@ -432,6 +432,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     new_pos = new_row_pos;
     txn.GetPageManager()->AdvanceTableTail(first_pid_, tail_page_id,
                                            new_page->PageID());
+    // Same re-pin hazard as above: release the fresh tail page's latch
+    // before the compensation block can GetPage(new_pos.page_id).
+    new_page.PageUnlock();
   }
   // The copy at new_pos exists; now remove index entries and the original
   // physical row.  Every failure below compensates by dropping the copy and
@@ -441,15 +444,19 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   for (; deleted < indexes_.size(); ++deleted) {
     failure = IndexDelete(txn, indexes_[deleted], pos, original_row,
                           &idx_cursors[deleted]);
-    if (failure != Status::kSuccess) { break;
-}
+    if (failure != Status::kSuccess) {
+      break;
+    }
   }
   if (deleted < indexes_.size()) {
-    // Drop the reserved copy; the original row and its keys stay intact.
+    // Drop the reserved copy; the original row survives at pos, but the
+    // first `deleted` index entries were already removed and must be
+    // reinstated or the row would go missing from those index scans.
     PageRef copy_page = txn.GetPageManager()->GetPage(new_pos.page_id);
     LogCompensationFailure("update-rollback reserved-copy Delete",
                            copy_page->Delete(txn, new_pos.slot));
     copy_page.PageUnlock();
+    reinstate_old_keys(deleted, pos);
     return failure;
   }
   const Status delete_status =
@@ -468,8 +475,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   for (; inserted < indexes_.size(); ++inserted) {
     failure = IndexInsert(txn, indexes_[inserted], row, new_pos,
                           &idx_cursors[inserted]);
-    if (failure != Status::kSuccess) { break;
-}
+    if (failure != Status::kSuccess) {
+      break;
+    }
   }
   if (inserted < indexes_.size()) {
     // The row lives at new_pos now; undo the partial inserts and repoint the
@@ -494,16 +502,16 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
   size_t deleted = 0;
   for (; deleted < indexes_.size(); ++deleted) {
     failure = IndexDelete(txn, indexes_[deleted], pos, original_row);
-    if (failure != Status::kSuccess) { break;
-}
+    if (failure != Status::kSuccess) {
+      break;
+    }
   }
   if (deleted < indexes_.size()) {
     // The row survives, so every applied index deletion must be undone:
     // "row present x some index entries gone" is not a legal state.
     for (size_t j = 0; j < deleted; ++j) {
-      LogCompensationFailure(
-          "delete-rollback IndexInsert",
-          IndexInsert(txn, indexes_[j], original_row, pos));
+      LogCompensationFailure("delete-rollback IndexInsert",
+                             IndexInsert(txn, indexes_[j], original_row, pos));
     }
     return failure;
   }
@@ -591,7 +599,9 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
             // An UPDATE whose key did not change needs no second entry.  The
             // heap supplies the versioned row; index-only scans are not used
             // for this mode because INCLUDE values are not versioned here.
-            if (hint_leaf != nullptr) { *hint_leaf = cursor; }
+            if (hint_leaf != nullptr) {
+              *hint_leaf = cursor;
+            }
             return Status::kSuccess;
           }
           if (Read(txn, value.pos).HasValue()) {
@@ -628,13 +638,16 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
     // Keep the key -> RowPosition edge.  RowPage MVCC decides whether the
     // pointed version is visible, which makes the same index usable by both
     // a pre-delete reader and a post-delete reader without a table scan.
-    if (hint_leaf != nullptr) { *hint_leaf = cursor; }
+    if (hint_leaf != nullptr) {
+      *hint_leaf = cursor;
+    }
     return Status::kSuccess;
   }
   if (idx.StoresSingleValue()) {
     RETURN_IF_FAIL(bpt.Delete(txn, key));
   } else {
-    ASSIGN_OR_RETURN(std::string_view, existing_data, bpt.Read(txn, key, &cursor));
+    ASSIGN_OR_RETURN(std::string_view, existing_data,
+                     bpt.Read(txn, key, &cursor));
     auto values = Decode<std::vector<IndexValueType>>(existing_data);
     std::erase_if(values,
                   [&](const IndexValueType& v) { return v.pos == pos; });
@@ -653,9 +666,10 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
 
 Iterator Table::BeginFullScan(Transaction& txn,
                               const TableScanOptions& options) const {
-  return Iterator(new FullScanIterator(
-      this, &txn, options.projection, options.key_filter,
-      options.key_column, options.peek_compares));
+  auto owned = std::make_unique<FullScanIterator>(
+      this, &txn, options.projection, options.key_filter, options.key_column,
+      options.peek_compares);
+  return Iterator(owned.release());
 }
 
 Iterator Table::BeginMorselScan(
@@ -664,8 +678,10 @@ Iterator Table::BeginMorselScan(
     const std::unordered_set<int64_t>* key_filter,
     std::optional<slot_t> key_column,
     const std::vector<IntegerPeekCompare>* peek_compares) const {
-  return Iterator(new FullScanIterator(this, &txn, pages, std::move(projection),
-                                       key_filter, key_column, peek_compares));
+  auto owned = std::make_unique<FullScanIterator>(
+      this, &txn, pages, std::move(projection), key_filter, key_column,
+      peek_compares);
+  return Iterator(owned.release());
 }
 
 std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
@@ -691,28 +707,28 @@ std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
 Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
                                const Value& begin, const Value& end,
                                bool ascending) const {
-  return BeginIndexScan(txn, index,
-                        begin.IsNull() ? std::vector<Value>{}
-                                       : std::vector<Value>{begin},
-                        end.IsNull() ? std::vector<Value>{}
-                                     : std::vector<Value>{end},
-                        ascending);
+  return BeginIndexScan(
+      txn, index,
+      begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
+      end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end}, ascending);
 }
 
 Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
                                const std::vector<Value>& begin_key,
                                const std::vector<Value>& end_key,
                                bool ascending) const {
-  return Iterator(
-      new IndexScanIterator(*this, index, txn, begin_key, end_key, ascending));
+  auto owned = std::make_unique<IndexScanIterator>(*this, index, txn, begin_key,
+                                                  end_key, ascending);
+  return Iterator(owned.release());
 }
 
 std::unordered_map<slot_t, size_t> Table::AvailableKeyIndex() const {
   std::unordered_map<slot_t, size_t> ret;
   for (size_t i = 0; i < indexes_.size(); ++i) {
     // Skip key-less indexes instead of reading key_[0] out of bounds.
-    if (indexes_[i].sc_.key_.empty()) { continue;
-}
+    if (indexes_[i].sc_.key_.empty()) {
+      continue;
+    }
     ret.emplace(indexes_[i].sc_.key_[0], i);
   }
   return ret;

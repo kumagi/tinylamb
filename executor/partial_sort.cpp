@@ -44,9 +44,10 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
 
 }  // namespace
 
-PartialSortExecutor::PartialSortExecutor(
-    Executor source, Schema schema, std::vector<SortExecutor::Key> keys,
-    size_t top_k, size_t offset, size_t block_size)
+PartialSortExecutor::PartialSortExecutor(Executor source, Schema schema,
+                                         std::vector<SortExecutor::Key> keys,
+                                         size_t top_k, size_t offset,
+                                         size_t block_size)
     : source_(std::move(source)),
       schema_(std::move(schema)),
       keys_(std::move(keys)),
@@ -79,8 +80,8 @@ void PartialSortExecutor::ExecutePartialSort() {
       if (current_block.size() >= block_size_) {
         if (top_k_ > 0 && top_k_ < current_block.size()) {
           std::partial_sort(current_block.begin(),
-                            current_block.begin() + top_k_,
-                            current_block.end(), comp);
+                            current_block.begin() + top_k_, current_block.end(),
+                            comp);
           current_block.resize(top_k_);
         } else {
           std::sort(current_block.begin(), current_block.end(), comp);
@@ -93,8 +94,7 @@ void PartialSortExecutor::ExecutePartialSort() {
     }
     if (!current_block.empty()) {
       if (top_k_ > 0 && top_k_ < current_block.size()) {
-        std::partial_sort(current_block.begin(),
-                          current_block.begin() + top_k_,
+        std::partial_sort(current_block.begin(), current_block.begin() + top_k_,
                           current_block.end(), comp);
         current_block.resize(top_k_);
       } else {
@@ -143,9 +143,7 @@ void PartialSortExecutor::EnsureMaterialized() {
   ExecutePartialSort();
 }
 
-void PartialSortExecutor::MaterializePipeline() {
-  EnsureMaterialized();
-}
+void PartialSortExecutor::MaterializePipeline() { EnsureMaterialized(); }
 
 bool PartialSortExecutor::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
@@ -165,6 +163,7 @@ size_t PartialSortExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
+  destination->Reset();
   EnsureMaterialized();
   if (output_offset_ >= output_.size()) {
     return 0;

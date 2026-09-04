@@ -50,8 +50,7 @@ class SetOperationExecutor : public ExecutorBase {
                       SetOperationRowSet* seen);
   void AppendIntersection(const std::vector<std::vector<Positioned>>& rows,
                           bool all);
-  void AppendExcept(const std::vector<std::vector<Positioned>>& rows,
-                    bool all);
+  void AppendExcept(const std::vector<std::vector<Positioned>>& rows, bool all);
   void MaterializePartitioned();
   void MaterializeRows(std::vector<std::vector<Positioned>> rows);
 

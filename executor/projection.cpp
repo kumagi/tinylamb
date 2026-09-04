@@ -16,9 +16,9 @@
 
 #include "projection.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <algorithm>
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -27,30 +27,35 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "expression/expression.hpp"
-#include "expression/named_expression.hpp"
-#include "executor/executor_base.hpp"
-#include "expression/bytecode.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/executor_base.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/bytecode.hpp"
+#include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/jit.hpp"
+#include "expression/named_expression.hpp"
+#include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
-#include "expression/binary_expression.hpp"
-#include "expression/constant_value.hpp"
-#include "expression/rewrite.hpp"
 #include "type/value_type.hpp"
 
 namespace {
 
 bool IntConstant(const tinylamb::Expression& expression, int64_t* value) {
-  if (expression->Type() != tinylamb::TypeTag::kConstantValue) { return false;
-}
-  const tinylamb::Value constant =
-      expression->AsConstantValue().GetValue();
-  if (constant.type != tinylamb::ValueType::kInt64) { return false;
-}
+  if (expression->Type() != tinylamb::TypeTag::kConstantValue) {
+    return false;
+  }
+  const tinylamb::Value constant = expression->AsConstantValue().GetValue();
+  if (constant.type != tinylamb::ValueType::kInt64) {
+    return false;
+  }
+  // Signed JIT arithmetic cannot represent UINT64 operands.
+  if (constant.IsUnsigned()) {
+    return false;
+  }
   *value = constant.value.int_value;
   return true;
 }
@@ -59,16 +64,21 @@ bool Affine(  // NOLINT(misc-no-recursion)
     const tinylamb::Expression& expression, const tinylamb::Schema& schema,
     uint16_t* column, int64_t* multiplier, int64_t* addend) {
   if (expression->Type() == tinylamb::TypeTag::kColumnValue) {
-    const int offset = schema.Offset(
-        expression->AsColumnValue().GetColumnName());
-    if (offset < 0 || schema.GetColumn(offset).Type() !=
-                          tinylamb::ValueType::kInt64) { return false;
-}
+    const int offset =
+        schema.Offset(expression->AsColumnValue().GetColumnName());
+    if (offset < 0 ||
+        schema.GetColumn(offset).Type() != tinylamb::ValueType::kInt64) {
+      return false;
+    }
+    if (schema.GetColumn(offset).IsUnsigned()) {
+      return false;
+    }
     *column = static_cast<uint16_t>(offset);
     return true;
   }
-  if (expression->Type() != tinylamb::TypeTag::kBinaryExp) { return false;
-}
+  if (expression->Type() != tinylamb::TypeTag::kBinaryExp) {
+    return false;
+  }
   const auto& binary = expression->AsBinaryExpression();
   int64_t constant = 0;
   if (binary.Op() == tinylamb::BinaryOperation::kMultiply &&
@@ -131,8 +141,8 @@ bool IsCseSafe(  // NOLINT(misc-no-recursion)
     case tinylamb::TypeTag::kBinaryExp:
     case tinylamb::TypeTag::kCaseExp:
     case tinylamb::TypeTag::kUnaryExp:
-      return std::ranges::all_of(
-          tinylamb::ExpressionChildren(expression), IsCseSafe);
+      return std::ranges::all_of(tinylamb::ExpressionChildren(expression),
+                                 IsCseSafe);
     default:
       return false;
   }
@@ -156,9 +166,9 @@ tinylamb::Expression RewriteCse(  // NOLINT(misc-no-recursion)
     changed |= rewritten.get() != child.get();
     child = std::move(rewritten);
   }
-  return changed ? tinylamb::WithExpressionChildren(expression,
-                                                     std::move(children))
-                 : expression;
+  return changed
+             ? tinylamb::WithExpressionChildren(expression, std::move(children))
+             : expression;
 }
 
 }  // namespace
@@ -205,8 +215,7 @@ Projection::Projection(std::vector<NamedExpression> expressions,
       slots.erase(keys[i]);
       continue;
     }
-    augmented_columns.emplace_back(ColumnName("", slot),
-                                   program->ResultType());
+    augmented_columns.emplace_back(ColumnName("", slot), program->ResultType());
     cse_bytecodes_.push_back(std::move(program));
   }
   augmented_schema_ =
@@ -228,13 +237,15 @@ Projection::Projection(std::vector<NamedExpression> expressions,
 
 bool Projection::Next(Row* dst, RowPosition* rp) {
   if (output_offset_ >= output_batch_.Size()) {
-    if (NextBatch(&output_batch_) == 0) { return false;
-}
+    if (NextBatch(&output_batch_) == 0) {
+      return false;
+    }
     output_offset_ = 0;
   }
   *dst = output_batch_.RowAt(output_offset_);
-  if (rp != nullptr) { *rp = output_batch_.PositionAt(output_offset_);
-}
+  if (rp != nullptr) {
+    *rp = output_batch_.PositionAt(output_offset_);
+  }
   ++output_offset_;
   return true;
 }
@@ -242,8 +253,9 @@ bool Projection::Next(Row* dst, RowPosition* rp) {
 size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
   destination->Reserve(max_rows);
-  if (src_->NextBatch(&input_batch_, max_rows) == 0) { return 0;
-}
+  if (src_->NextBatch(&input_batch_, max_rows) == 0) {
+    return 0;
+  }
   const DataChunk* expression_input = &input_batch_;
   if (!cse_bytecodes_.empty()) {
     std::vector<ColumnVector> cse_values;
@@ -261,8 +273,8 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
       sources.push_back(&value);
     }
     for (size_t row_index = 0; row_index < input_batch_.Size(); ++row_index) {
-      cse_input_batch_.AppendRowFromColumns(
-          sources, row_index, input_batch_.PositionAt(row_index));
+      cse_input_batch_.AppendRowFromColumns(sources, row_index,
+                                            input_batch_.PositionAt(row_index));
     }
     expression_input = &cse_input_batch_;
   }
@@ -270,21 +282,52 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
   for (size_t index = 0; index < bytecodes_.size(); ++index) {
     JitProjectionState& jit = jit_states_[index];
     jit.rows_seen += expression_input->Size();
-    if (jit.eligible && !jit.attempted &&
-        cse_bytecodes_.empty() && jit.rows_seen >= jit_threshold_rows_) {
+    if (jit.eligible && !jit.attempted && cse_bytecodes_.empty() &&
+        jit.rows_seen >= jit_threshold_rows_) {
       jit.attempted = true;
-      jit.kernel = JitInt64Kernels::CompileProjection();
+      jit.kernel = JitInt64Kernels::CompileProjectionChecked();
+      if (!jit.kernel) {
+        jit.kernel = JitInt64Kernels::CompileProjection();
+      }
     }
     if (jit.kernel && expression_input->ZoneMapAt(jit.column).Initialized() &&
         expression_input->ZoneMapAt(jit.column).NullCount() == 0) {
       std::vector<int64_t> output(expression_input->Size());
-      jit.kernel->Project(
-          expression_input->ColumnAt(jit.column).IntegerData().data(),
-                          output.data(), output.size(), jit.multiplier,
-                          jit.addend);
+      bool mul_overflow = false;
+      bool add_overflow = false;
+      try {
+        jit.kernel->ProjectChecked(
+            expression_input->ColumnAt(jit.column).IntegerData().data(),
+            output.data(), output.size(), jit.multiplier, jit.addend,
+            &mul_overflow, &add_overflow);
+      } catch (const std::logic_error&) {
+        // Unchecked kernel fallback (checked unavailable): verify with
+        // scalar overflow checks to preserve AST throw semantics.
+        jit.kernel->Project(
+            expression_input->ColumnAt(jit.column).IntegerData().data(),
+            output.data(), output.size(), jit.multiplier, jit.addend);
+        const auto& inputs =
+            expression_input->ColumnAt(jit.column).IntegerData();
+        for (size_t r = 0; r < inputs.size(); ++r) {
+          int64_t product = 0;
+          int64_t projected = 0;
+          if (__builtin_mul_overflow(inputs[r], jit.multiplier, &product) ||
+              __builtin_add_overflow(product, jit.addend, &projected)) {
+            throw std::runtime_error("integer overflow on '*'");
+          }
+          output[r] = projected;
+        }
+      }
+      if (mul_overflow) {
+        throw std::runtime_error("integer overflow on '*'");
+      }
+      if (add_overflow) {
+        throw std::runtime_error("integer overflow on '+'");
+      }
       evaluated[index].emplace(ValueType::kInt64, output.size());
-      for (int64_t value : output) { evaluated[index]->Append(Value(value));
-}
+      for (int64_t value : output) {
+        evaluated[index]->Append(Value(value));
+      }
       ++jit_batches_;
     } else if (bytecodes_[index]) {
       evaluated[index].emplace(
@@ -316,8 +359,8 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
     std::vector<Value> result;
     result.reserve(expressions_.size());
     std::optional<Row> row;
-    for (size_t expression_index = 0;
-         expression_index < expressions_.size(); ++expression_index) {
+    for (size_t expression_index = 0; expression_index < expressions_.size();
+         ++expression_index) {
       const NamedExpression& named = expressions_[expression_index];
       if (evaluated[expression_index]) {
         result.push_back(evaluated[expression_index]->ValueAt(row_index));
@@ -333,8 +376,9 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
           continue;
         }
       }
-      if (!row) { row = expression_input->RowAt(row_index);
-}
+      if (!row) {
+        row = expression_input->RowAt(row_index);
+      }
       result.push_back(named.expression->Evaluate(*row, augmented_schema_));
     }
     destination->Append(Row(std::move(result)),

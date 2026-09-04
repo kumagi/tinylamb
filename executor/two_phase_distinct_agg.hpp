@@ -19,8 +19,9 @@
 namespace tinylamb {
 
 // TwoPhaseDistinctAgg: Two-phase distinct aggregation executor.
-// Phase 1 (partial distinct): groups by group key + distinct column to eliminate duplicates.
-// Phase 2 (finalize agg): combines deduplicated distinct values and non-distinct partials per group.
+// Phase 1 (partial distinct): groups by group key + distinct column to
+// eliminate duplicates. Phase 2 (finalize agg): combines deduplicated distinct
+// values and non-distinct partials per group.
 class TwoPhaseDistinctAgg : public ExecutorBase {
  public:
   TwoPhaseDistinctAgg(Executor child, Schema input_schema,

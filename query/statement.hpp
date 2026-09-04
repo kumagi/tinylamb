@@ -19,12 +19,12 @@
 
 #include <cstdint>
 #include <memory>
-#include <sstream>
 #include <optional>
 #include <ostream>
+#include <sstream>
 #include <string>
-#include <unordered_set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/set_operation.hpp"
@@ -87,9 +87,6 @@ struct SelectSource {
   // star expansion coalesce them (see Lookup / relational projection).
   std::vector<std::string> using_columns;
 };
-
-
-
 
 enum class StatementType : uint8_t {
   kCreateTable,
@@ -342,8 +339,8 @@ class SelectStatement : public Statement {
   }
   [[nodiscard]] bool UnionDistinct() const { return union_distinct_; }
   [[nodiscard]] bool UnionByName() const { return union_by_name_; }
-  [[nodiscard]] const std::shared_ptr<SetOperationTree>&
-  GetSetOperationTree() const {
+  [[nodiscard]] const std::shared_ptr<SetOperationTree>& GetSetOperationTree()
+      const {
     return set_operation_tree_;
   }
   void SetSetOperationTree(std::shared_ptr<SetOperationTree> tree) {

@@ -22,15 +22,15 @@
 #include <memory>
 #include <ostream>
 #include <stdexcept>
-#include <vector>
-#include <utility>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/hash_join_mode.hpp"
-#include "plan/plan.hpp"
 #include "index/index.hpp"
+#include "plan/plan.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
@@ -64,8 +64,9 @@ constexpr uint8_t kJoinKindFullOuter = 6;
 // Row-count statistics feed cost comparisons only; a pathological estimate
 // must wrap to "very expensive", never to a small number that would win.
 size_t SaturatingMul(size_t a, size_t b) {
-  if (a == 0 || b == 0) { return 0;
-}
+  if (a == 0 || b == 0) {
+    return 0;
+  }
   constexpr size_t kMax = std::numeric_limits<size_t>::max();
   return a > kMax / b ? kMax : a * b;
 }
@@ -95,8 +96,7 @@ TableStatistics HashJoinStats(const TableStatistics& left,
 // Semi/anti joins emit only the left side's columns, with at most one output
 // row per left row.
 TableStatistics SemiAntiJoinStats(const TableStatistics& left,
-                                  const TableStatistics& right,
-                                  JoinKind kind) {
+                                  const TableStatistics& right, JoinKind kind) {
   if (IsAntiJoinKind(kind) || IsNullAwareAntiJoinKind(kind)) {
     // Anti joins can retain every probe row; without a null-aware/selectivity
     // estimate, the probe cardinality is the sound upper-bound estimate.
@@ -154,9 +154,9 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
       right_ts_(nullptr),
       hash_mode_(hash_mode),
       kind_(kind),
-      output_schema_(IsSemiOrAnti(kind_) ? left_src_->GetSchema()
-                                         : left_src_->GetSchema() +
-                                               right_src_->GetSchema()),
+      output_schema_(IsSemiOrAnti(kind_)
+                         ? left_src_->GetSchema()
+                         : left_src_->GetSchema() + right_src_->GetSchema()),
       stats_(IsSemiOrAnti(kind_)
                  ? SemiAntiJoinStats(left_src_->GetStats(),
                                      right_src_->GetStats(), kind)
@@ -214,7 +214,6 @@ JoinKind FullOuterJoinKind() {
   return static_cast<JoinKind>(kJoinKindFullOuter);
 }
 
-
 // For Index Join.
 ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          const Table& right_tbl, const Index& idx,
@@ -260,7 +259,8 @@ ProductPlan::ProductPlan(Plan left_src, Plan right_src)
       output_schema_(left_src_->GetSchema() + right_src_->GetSchema()),
       stats_(CrossJoinStats(left_src_->GetStats(), right_src_->GetStats())) {}
 
-// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
+// EmitExecutor lives in the relational factory
+// (executor/relational_factory.cpp).
 
 [[nodiscard]] const Schema& ProductPlan::GetSchema() const {
   return output_schema_;
@@ -302,8 +302,7 @@ size_t ProductPlan::EmitRowCount() const {
   }
   if (left_cols_.empty() && right_cols_.empty()) {
     // CrossJoin.
-    return SaturatingMul(left_src_->EmitRowCount(),
-                         right_src_->EmitRowCount());
+    return SaturatingMul(left_src_->EmitRowCount(), right_src_->EmitRowCount());
   }
   if (right_tbl_ != nullptr) {
     // IndexJoin

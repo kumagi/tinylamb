@@ -17,8 +17,8 @@
 #ifndef TINYLAMB_RECOVERY_MANAGER_HPP
 #define TINYLAMB_RECOVERY_MANAGER_HPP
 
-#include <mutex>
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -62,8 +62,7 @@ class RecoveryManager {
   // (e.g. the `--force` CLI flag), recovery truncates the damaged tail and
   // replays the intact prefix instead.
   static void SetTornTailTruncationAllowed(bool allowed) {
-    torn_tail_truncation_allowed_.store(allowed,
-                                        std::memory_order_relaxed);
+    torn_tail_truncation_allowed_.store(allowed, std::memory_order_relaxed);
   }
   [[nodiscard]] static bool TornTailTruncationAllowed() {
     return torn_tail_truncation_allowed_.load(std::memory_order_relaxed);
@@ -81,18 +80,19 @@ class RecoveryManager {
 
   bool ReadLog(lsn_t lsn, LogRecord* dst) const;
 
+  // Offset of the first unparseable record at or after `from` (the single
+  // torn-tail authority; see D9 in docs/design.md for the CRC extension).
+  [[nodiscard]] lsn_t ValidLogEnd(lsn_t from) const;
+
   void LogUndoWithPage(lsn_t lsn, const LogRecord& log, TransactionManager* tm);
 
-  friend std::ostream& operator<<(std::ostream& o,
-                                  const RecoveryManager& rm) {
+  friend std::ostream& operator<<(std::ostream& o, const RecoveryManager& rm) {
     o << "RecoveryManager(log=" << rm.log_name_ << ")";
     return o;
   }
 
  private:
   [[nodiscard]] bool OpenReadFd() const;
-  // Offset of the first unparseable record at or after `from`.
-  [[nodiscard]] lsn_t ValidLogEnd(lsn_t from) const;
   void SinglePageRecovery(PageRef&& page, TransactionManager* tm,
                           UndoneRecorder* undone, std::uintmax_t scan_end);
   // Walks each loser transaction's prev_lsn chain newest-first and applies
@@ -105,6 +105,8 @@ class RecoveryManager {
 
   std::string log_name_;
   mutable int read_fd_ = -1;
+  // Guards the lazy open of read_fd_ against concurrent readers.
+  mutable std::mutex read_fd_mutex_;
   PagePool* pool_{nullptr};
 };
 

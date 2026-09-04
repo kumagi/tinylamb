@@ -166,13 +166,13 @@ class Value {
   [[nodiscard]] std::string AsString() const;
   friend std::ostream& operator<<(std::ostream& o, const Value& v);
 
-// Three-way comparison with SQL ORDER BY semantics among non-NULL values:
-// NULL orders below everything, NaN orders directly above NULL and below
-// every other number, and cross-type or unordered operands fall back to a
-// deterministic total order instead of throwing.
-// Returns a negative value when a sorts before b, zero when equal under the
-// ordering, positive when a sorts after b.
-friend int CompareForOrderBy(const Value& a, const Value& b);
+  // Three-way comparison with SQL ORDER BY semantics among non-NULL values:
+  // NULL orders below everything, NaN orders directly above NULL and below
+  // every other number, and cross-type or unordered operands fall back to a
+  // deterministic total order instead of throwing.
+  // Returns a negative value when a sorts before b, zero when equal under the
+  // ordering, positive when a sorts after b.
+  friend int CompareForOrderBy(const Value& a, const Value& b);
 
   // Read/Write with type info.
   friend Encoder& operator<<(Encoder& a, const Value& v);

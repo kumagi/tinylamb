@@ -3,18 +3,19 @@
 #include "query/sql_template.hpp"
 
 #include <gtest/gtest.h>
-#include <memory>
-#include <string_view>
-#include <vector>
-#include <stdexcept>
-#include <utility>
+
 #include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
-#include "expression/named_expression.hpp"
-#include "expression/expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
@@ -30,12 +31,14 @@ namespace {
 std::unique_ptr<Statement> ParseSql(std::string_view sql) {
   GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
   EXPECT_TRUE(parsed.ok) << parsed.error;
-  if (!parsed.ok) { return nullptr;
-}
+  if (!parsed.ok) {
+    return nullptr;
+  }
   auto ast = GoogleSqlAstParser::Parse(parsed.ast);
   EXPECT_EQ(ast.GetStatus(), Status::kSuccess);
-  if (!ast.HasValue()) { return nullptr;
-}
+  if (!ast.HasValue()) {
+    return nullptr;
+  }
   return GoogleSqlAstVisitor::Visit(*ast.Value());
 }
 
@@ -81,6 +84,24 @@ TEST(SqlTemplateTest, BindsCachedSelectTree) {
             std::string::npos);
 }
 
+TEST(SqlTemplateTest, BindSelectPreservesLimitAndAttributes) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  // C1: BindSelect must re-apply has_limit_ (the constructor sets limit_ but
+  // not has_limit_) and the QUALIFY/DISTINCT ON/WITH TIES/AS STRUCT clauses,
+  // otherwise a template-cache hit silently drops them.
+  auto original = ParseSql("SELECT DISTINCT a FROM t WHERE a > 1 LIMIT 3;");
+  ASSERT_TRUE(original);
+  const SqlTemplate templated =
+      ExtractSqlTemplate("SELECT DISTINCT a FROM t WHERE a > 5 LIMIT 3;");
+  auto bound = BindStatementLiterals(*original, templated.parameters);
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound);
+  EXPECT_TRUE(select.HasLimit()) << "has_limit_ lost during re-bind";
+  EXPECT_EQ(select.Limit(), 3U);
+  EXPECT_TRUE(select.Distinct());
+}
+
 TEST(SqlTemplateTest, BindsCompositeStockLookup) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
@@ -100,8 +121,7 @@ TEST(SqlTemplateTest, BindsDateLiteralsPreservingTheDateType) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
-  auto original =
-      ParseSql("SELECT d FROM t WHERE d <= date '1998-09-18';");
+  auto original = ParseSql("SELECT d FROM t WHERE d <= date '1998-09-18';");
   ASSERT_TRUE(original);
   const SqlTemplate templated =
       ExtractSqlTemplate("SELECT d FROM t WHERE d <= date '1994-01-01';");
@@ -164,7 +184,8 @@ TEST(SqlTemplateTest, PreservesLineCommentsInFingerprint) {
 }
 
 TEST(SqlTemplateTest, PreservesBlockCommentsInFingerprint) {
-  const SqlTemplate extracted = ExtractSqlTemplate("SELECT 1 /* block note */;");
+  const SqlTemplate extracted =
+      ExtractSqlTemplate("SELECT 1 /* block note */;");
   EXPECT_EQ(extracted.fingerprint, "SELECT 0 /* block note */;");
   ASSERT_EQ(extracted.parameters.size(), 1U);
   EXPECT_EQ(extracted.parameters[0], Value(1));
@@ -243,7 +264,7 @@ std::shared_ptr<SelectStatement> WhereOrderByTree() {
       std::vector<SelectStatement::OrderByTerm>{
           {BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kAdd,
                                ConstantValueExp(Value(2))),
-                               true, std::nullopt}});
+           true, std::nullopt}});
 }
 
 TEST(SqlTemplateTest, BindsWhereBeforeOrderByInTextOrder) {
@@ -328,7 +349,7 @@ TEST(SqlTemplateTest, BindsGroupingClausesBeforeOrderBy) {
       std::vector<SelectStatement::OrderByTerm>{
           {BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kAdd,
                                ConstantValueExp(Value(4))),
-                               true, std::nullopt}});
+           true, std::nullopt}});
   cached->SetGroupBy(std::vector<Expression>{ColumnValueExp("k")});
   cached->SetHaving(BinaryExpressionExp(ColumnValueExp("k"),
                                         BinaryOperation::kGreaterThan,
@@ -448,6 +469,35 @@ TEST(SqlTemplateTest, FingerprintSeparatesIdentifierFromLiteralShapes) {
   EXPECT_NE(quoted.fingerprint, bare.fingerprint);
 }
 
+TEST(SqlTemplateTest, TimestampLiteralParametersAreUtcNormalized) {
+  // PRODUCTION BUG (fixed): the first parse normalized a TIMESTAMP '...'
+  // literal to UTC, but the template/plan caches replayed the RAW string
+  // parameter on later runs, so the identical SQL returned a different value
+  // the second time.
+  const SqlTemplate one =
+      ExtractSqlTemplate("SELECT TIMESTAMP '2024-01-01 00:00:00+09:00';");
+  ASSERT_EQ(one.parameters.size(), 1U);
+  EXPECT_EQ(one.parameters[0].type, ValueType::kVarChar);
+  EXPECT_EQ(one.parameters[0].value.varchar_value, "2023-12-31 15:00:00+00");
+
+  // Plain strings and non-TIMESTAMP keywords must stay untouched.
+  const SqlTemplate plain =
+      ExtractSqlTemplate("SELECT '2024-01-01 00:00:00+09:00';");
+  ASSERT_EQ(plain.parameters.size(), 1U);
+  EXPECT_EQ(plain.parameters[0].value.varchar_value,
+            "2024-01-01 00:00:00+09:00");
+
+  const SqlTemplate comment =
+      ExtractSqlTemplate("SELECT 'TIMESTAMP is great';");
+  ASSERT_EQ(comment.parameters.size(), 1U);
+  EXPECT_EQ(comment.parameters[0].value.varchar_value, "TIMESTAMP is great");
+
+  // DATE literals keep their own typed handling (unaffected).
+  const SqlTemplate date = ExtractSqlTemplate("SELECT DATE '2024-01-01';");
+  ASSERT_EQ(date.parameters.size(), 1U);
+  EXPECT_EQ(date.parameters[0].value.varchar_value, "2024-01-01");
+}
+
 TEST(SqlTemplateTest, BindsInSubqueryTestBeforeSubqueryBody) {
   // Regression (§7.1): inside "11 IN (SELECT ... u.k = 22)" the tested
   // literal appears in the text before the subquery body; binding the
@@ -471,8 +521,7 @@ TEST(SqlTemplateTest, BindsInSubqueryTestBeforeSubqueryBody) {
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_TRUE(select.WhereClause());
   ASSERT_EQ(select.WhereClause()->Type(), TypeTag::kQueryExp);
-  const auto& query_expression =
-      select.WhereClause()->AsQueryExpression();
+  const auto& query_expression = select.WhereClause()->AsQueryExpression();
   ASSERT_TRUE(query_expression.Test());
   EXPECT_EQ(query_expression.Test()->ToString(), "11");
   const auto& subquery = *query_expression.Query();
@@ -483,8 +532,8 @@ TEST(SqlTemplateTest, BindsInSubqueryTestBeforeSubqueryBody) {
 std::shared_ptr<SelectStatement> LiteralCteBody(const char* column,
                                                 int64_t literal) {
   return std::make_shared<SelectStatement>(
-      std::vector<NamedExpression>{NamedExpression(column,
-                                                   ColumnValueExp(column))},
+      std::vector<NamedExpression>{
+          NamedExpression(column, ColumnValueExp(column))},
       std::vector<std::string>{"t"},
       BinaryExpressionExp(ColumnValueExp(column), BinaryOperation::kEquals,
                           ConstantValueExp(Value(literal))));

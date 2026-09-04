@@ -30,9 +30,7 @@ class SetOperationPlan final : public PlanBase {
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return children_.front()->GetStats();
   }
-  [[nodiscard]] const Schema& GetSchema() const override {
-    return schema_;
-  }
+  [[nodiscard]] const Schema& GetSchema() const override { return schema_; }
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
   [[nodiscard]] bool IsOrderedBy(

@@ -75,8 +75,9 @@ bool LockManager::GetExclusiveLock(const RowPosition& row, txn_id_t owner,
     // activity keeps releasing rows the system is moving, so extend the
     // wait (bounded by kDurabilityWaitFloor) instead of reporting a
     // spurious conflict that executors would treat as a lost update.
-    const auto total_cap = std::chrono::duration_cast<std::chrono::milliseconds>(
-        kDurabilityWaitFloor);
+    const auto total_cap =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            kDurabilityWaitFloor);
     const auto start = std::chrono::steady_clock::now();
     auto patience = timeout;
     for (;;) {
@@ -94,8 +95,9 @@ bool LockManager::GetExclusiveLock(const RowPosition& row, txn_id_t owner,
         wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
-      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - start);
+      const auto elapsed =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - start);
       if (elapsed >= total_cap) {
         wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -107,8 +109,7 @@ bool LockManager::GetExclusiveLock(const RowPosition& row, txn_id_t owner,
   return true;
 }
 
-bool LockManager::ReleaseExclusiveLock(const RowPosition& row,
-                                       txn_id_t owner) {
+bool LockManager::ReleaseExclusiveLock(const RowPosition& row, txn_id_t owner) {
   Shard& sh = shards_[ShardIndex(row)];
   std::unique_lock lk(sh.mu);
   const auto it = sh.exclusive.find(row);

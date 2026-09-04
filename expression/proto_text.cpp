@@ -9,8 +9,8 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -36,8 +36,8 @@ std::string ToLowerCopy(std::string_view s) {
   std::string out;
   out.reserve(s.size());
   for (const char c : s) {
-    out.push_back(static_cast<char>(
-        std::tolower(static_cast<unsigned char>(c))));
+    out.push_back(
+        static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
   }
   return out;
 }
@@ -90,16 +90,36 @@ bool ReadQuoted(std::string_view text, size_t* i, std::string* out) {
     if (c == '\\' && *i + 1 < text.size()) {
       const char next = text[*i + 1];
       switch (next) {
-        case 'n': out->push_back('\n'); break;
-        case 't': out->push_back('\t'); break;
-        case 'r': out->push_back('\r'); break;
-        case 'a': out->push_back('\a'); break;
-        case 'b': out->push_back('\b'); break;
-        case 'f': out->push_back('\f'); break;
-        case 'v': out->push_back('\v'); break;
-        case '\\': out->push_back('\\'); break;
-        case '\'': out->push_back('\''); break;
-        case '"': out->push_back('"'); break;
+        case 'n':
+          out->push_back('\n');
+          break;
+        case 't':
+          out->push_back('\t');
+          break;
+        case 'r':
+          out->push_back('\r');
+          break;
+        case 'a':
+          out->push_back('\a');
+          break;
+        case 'b':
+          out->push_back('\b');
+          break;
+        case 'f':
+          out->push_back('\f');
+          break;
+        case 'v':
+          out->push_back('\v');
+          break;
+        case '\\':
+          out->push_back('\\');
+          break;
+        case '\'':
+          out->push_back('\'');
+          break;
+        case '"':
+          out->push_back('"');
+          break;
         case 'x': {
           if (*i + 3 < text.size()) {
             const std::string hex(text.substr(*i + 2, 2));
@@ -111,7 +131,9 @@ bool ReadQuoted(std::string_view text, size_t* i, std::string* out) {
           }
           break;
         }
-        default: out->push_back(next); break;
+        default:
+          out->push_back(next);
+          break;
       }
       *i += 2;
       continue;
@@ -131,12 +153,24 @@ std::string EscapeQuoted(std::string_view raw) {
   std::string out;
   for (const char c : raw) {
     switch (c) {
-      case '\n': out += "\\n"; break;
-      case '\t': out += "\\t"; break;
-      case '\r': out += "\\r"; break;
-      case '"': out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      default: out.push_back(c); break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      default:
+        out.push_back(c);
+        break;
     }
   }
   return out;
@@ -172,11 +206,10 @@ struct SimpleCivilTime {
 };
 
 int64_t CivilToNanos(const SimpleCivilTime& ct) {
-  const std::chrono::year_month_day ymd{
-      std::chrono::year{ct.year}, std::chrono::month{ct.month},
-      std::chrono::day{ct.day}};
-  const int64_t days =
-      std::chrono::sys_days{ymd}.time_since_epoch().count();
+  const std::chrono::year_month_day ymd{std::chrono::year{ct.year},
+                                        std::chrono::month{ct.month},
+                                        std::chrono::day{ct.day}};
+  const int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
   const int64_t secs =
       days * 86400LL + ct.hour * 3600LL + ct.minute * 60LL + ct.second;
   return secs * 1000000000LL + ct.nanos;
@@ -232,7 +265,8 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
       }
       if (pos < s.size() && s[pos] == '.') {
         const size_t begin = ++pos;
-        while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos]))) {
+        while (pos < s.size() &&
+               std::isdigit(static_cast<unsigned char>(s[pos]))) {
           ++pos;
         }
         std::string frac(s.substr(begin, pos - begin));
@@ -250,9 +284,8 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
         if (std::sscanf(std::string(s.substr(pos + 1)).c_str(), "%d:%d", &th,
                         &tm) >= 1) {
           const int offset = th * 3600 + tm * 60;
-          return CivilToNanos(ct) -
-                 static_cast<int64_t>(offset) * 1000000000LL *
-                     (sign == '-' ? -1 : 1);
+          return CivilToNanos(ct) - static_cast<int64_t>(offset) *
+                                        1000000000LL * (sign == '-' ? -1 : 1);
         }
       }
     }
@@ -270,8 +303,7 @@ std::string FormatTimestampNanos(int64_t nanos, int precision) {
              ct.month, ct.day, ct.hour, ct.minute, ct.second);
   } else {
     char frac[16];
-    snprintf(frac, sizeof(frac), "%09lld",
-             static_cast<long long>(ct.nanos));
+    snprintf(frac, sizeof(frac), "%09lld", static_cast<long long>(ct.nanos));
     frac[precision] = '\0';
     snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02d:%02d:%02d.%s+00", ct.year,
              ct.month, ct.day, ct.hour, ct.minute, ct.second, frac);
@@ -367,9 +399,9 @@ Value ApplyReadConversion(FieldFormat format, Value v) {
       const int day = static_cast<int>(dec % 100);
       const int mon = static_cast<int>((dec / 100) % 100);
       const int yr = static_cast<int>(dec / 10000);
-      return Value::DateFromDays(
-          ParseDateDays(std::to_string(yr) + "-" + std::to_string(mon) + "-" +
-                        std::to_string(day)));
+      return Value::DateFromDays(ParseDateDays(std::to_string(yr) + "-" +
+                                               std::to_string(mon) + "-" +
+                                               std::to_string(day)));
     }
     case FieldFormat::kTsSeconds:
       if (v.type == ValueType::kInt64) {
@@ -390,8 +422,7 @@ Value ApplyReadConversion(FieldFormat format, Value v) {
   return v;
 }
 
-std::optional<Value> ApplyWriteConversion(FieldFormat format,
-                                          const Value& v) {
+std::optional<Value> ApplyWriteConversion(FieldFormat format, const Value& v) {
   if (v.IsNull()) {
     return std::nullopt;
   }
@@ -637,8 +668,8 @@ bool ParseProtoTextEntries(std::string_view body,
         ++i;  // consume closing brace
       } else {
         const size_t start = i;
-        while (i < body.size() && !IsSpaceChar(body[i]) &&
-               body[i] != ',' && body[i] != ';' && body[i] != '#') {
+        while (i < body.size() && !IsSpaceChar(body[i]) && body[i] != ',' &&
+               body[i] != ';' && body[i] != '#') {
           ++i;
         }
         if (i == start) {
@@ -748,8 +779,7 @@ std::optional<std::string> NormalizeProtoText(std::string_view text) {
       out.push_back(' ');
     }
     if (entry.is_message) {
-      const std::optional<std::string> nested =
-          NormalizeProtoText(entry.text);
+      const std::optional<std::string> nested = NormalizeProtoText(entry.text);
       out += entry.name + " { " + nested.value_or("") + " }";
     } else {
       out += entry.name + ": " + entry.text;
@@ -886,9 +916,8 @@ std::optional<std::string> AbsentEnumDefault(
       continue;
     }
     size_t digits = 0;
-    while (digits < token.size() &&
-           std::isdigit(static_cast<unsigned char>(
-               token[token.size() - 1 - digits]))) {
+    while (digits < token.size() && std::isdigit(static_cast<unsigned char>(
+                                        token[token.size() - 1 - digits]))) {
       ++digits;
     }
     if (digits == 0 || digits >= token.size()) {
@@ -905,8 +934,8 @@ std::optional<std::string> AbsentEnumDefault(
   prefix.reserve(lower.size());
   for (const char c : lower) {
     if (c != '_') {
-      prefix.push_back(static_cast<char>(
-          std::toupper(static_cast<unsigned char>(c))));
+      prefix.push_back(
+          static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
     }
   }
   return prefix + "0";
@@ -1011,9 +1040,8 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
     const std::string bare(key.substr(4));
     const std::string lower_bare = ToLowerCopy(bare);
     if (lower_bare.find("repeated") != std::string::npos) {
-      throw std::runtime_error("Field " + bare +
-                               " is repeated, so has_" + bare +
-                               " is not allowed");
+      throw std::runtime_error("Field " + bare + " is repeated, so has_" +
+                               bare + " is not allowed");
     }
     *out = Value(int64_t{ProtoTextHasField(text, bare) ? int64_t{1} : 0});
     return true;
@@ -1125,8 +1153,7 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
       *out = Value();
       return true;
     }
-    std::optional<std::string> enum_default =
-        AbsentEnumDefault(key, entries);
+    std::optional<std::string> enum_default = AbsentEnumDefault(key, entries);
     if (enum_default.has_value()) {
       *out = Value(std::move(*enum_default));
       return true;
@@ -1193,10 +1220,17 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
           continue;
         }
         switch (element.type) {
-          case ValueType::kInt64: elem_type = "INT64"; break;
-          case ValueType::kDouble: elem_type = "DOUBLE"; break;
-          case ValueType::kVarChar: elem_type = "STRING"; break;
-          default: break;
+          case ValueType::kInt64:
+            elem_type = "INT64";
+            break;
+          case ValueType::kDouble:
+            elem_type = "DOUBLE";
+            break;
+          case ValueType::kVarChar:
+            elem_type = "STRING";
+            break;
+          default:
+            break;
         }
         if (!elem_type.empty()) {
           break;
@@ -1240,8 +1274,7 @@ namespace {
 // segment semantics; helper for ProtoTextSetField.
 std::optional<std::string> SetFieldInBody(const std::string_view body,
                                           const std::vector<std::string>& path,
-                                          size_t depth,
-                                          const Value& new_value,
+                                          size_t depth, const Value& new_value,
                                           const std::string& type_name);
 
 std::string RenderEntry(const ProtoTextEntry& entry) {
@@ -1251,10 +1284,11 @@ std::string RenderEntry(const ProtoTextEntry& entry) {
   return entry.name + ": " + entry.text;
 }
 
-std::optional<std::string> SetFieldInBody(
-    const std::string_view body, const std::vector<std::string>& path,
-    const size_t depth, const Value& new_value,
-    const std::string& type_name) {
+std::optional<std::string> SetFieldInBody(const std::string_view body,
+                                          const std::vector<std::string>& path,
+                                          const size_t depth,
+                                          const Value& new_value,
+                                          const std::string& type_name) {
   std::vector<ProtoTextEntry> entries;
   if (!ParseProtoTextEntries(body, &entries) && !entries.empty()) {
     return std::nullopt;
@@ -1283,8 +1317,8 @@ std::optional<std::string> SetFieldInBody(
     }
     // Setting: convert the value per field-name FORMAT annotations, then
     // replace the first matching entry in place (or append at the end).
-    std::optional<Value> converted = ApplyWriteConversion(
-        ClassifyFieldFormat(target), new_value);
+    std::optional<Value> converted =
+        ApplyWriteConversion(ClassifyFieldFormat(target), new_value);
     Value value_to_store = converted.has_value() ? *converted : new_value;
 
     std::vector<ProtoTextEntry> replacement;
@@ -1300,10 +1334,9 @@ std::optional<std::string> SetFieldInBody(
         }
         if (element.type == ValueType::kVarChar &&
             LooksLikeProtoText(RawTextOfValue(element))) {
-          replacement.push_back(
-              {target, true,
-               NormalizeProtoText(RawTextOfValue(element))
-                   .value_or(RawTextOfValue(element))});
+          replacement.push_back({target, true,
+                                 NormalizeProtoText(RawTextOfValue(element))
+                                     .value_or(RawTextOfValue(element))});
         } else {
           replacement.push_back(
               {target, false, FormatProtoTextScalar(RawTextOfValue(element))});
@@ -1314,10 +1347,9 @@ std::optional<std::string> SetFieldInBody(
                 RawTextOfValue(value_to_store).empty())) {
       // Message-looking strings nest; an empty string constructs an empty
       // submessage.
-      replacement.push_back(
-          {target, true,
-           NormalizeProtoText(RawTextOfValue(value_to_store))
-               .value_or(RawTextOfValue(value_to_store))});
+      replacement.push_back({target, true,
+                             NormalizeProtoText(RawTextOfValue(value_to_store))
+                                 .value_or(RawTextOfValue(value_to_store))});
     } else {
       replacement.push_back(
           {target, false,
@@ -1364,8 +1396,8 @@ std::optional<std::string> SetFieldInBody(
       continue;
     }
     found_any = true;
-    auto nested = SetFieldInBody(entry.text, path, depth + 1, new_value,
-                                 type_name);
+    auto nested =
+        SetFieldInBody(entry.text, path, depth + 1, new_value, type_name);
     if (nested.has_value()) {
       entry.text = *nested;
       return [&] {
@@ -1387,8 +1419,8 @@ std::optional<std::string> SetFieldInBody(
   // GoogleSQL refuses to assign through a missing intermediate submessage
   // (it reads as NULL); creating it implicitly is not allowed.
   if (!target.empty()) {
-    throw std::runtime_error("Cannot set field of NULL `" + type_name +
-                             "." + target + "`");
+    throw std::runtime_error("Cannot set field of NULL `" + type_name + "." +
+                             target + "`");
   }
   return std::nullopt;
 }
@@ -1432,10 +1464,9 @@ bool RequiredProtoField(const std::string& type_name,
 }
 
 void ValidateEnumFieldValue(const std::string& type_name,
-                            const std::string& field_name,
-                            const Value& value) {
-  const std::string key = ToLowerCopy(type_name) + "/" +
-                          ToLowerCopy(field_name);
+                            const std::string& field_name, const Value& value) {
+  const std::string key =
+      ToLowerCopy(type_name) + "/" + ToLowerCopy(field_name);
   const auto& known = KnownEnumFields();
   const auto it = known.find(key);
   if (it == known.end()) {
@@ -1443,8 +1474,8 @@ void ValidateEnumFieldValue(const std::string& type_name,
   }
   // Proto3 enums accept numeric values verbatim (unknown members are
   // preserved); proto2 requires known member names.
-  const bool proto3 = ToLowerCopy(type_name).find("proto3") !=
-                      std::string::npos;
+  const bool proto3 =
+      ToLowerCopy(type_name).find("proto3") != std::string::npos;
   if (value.type == ValueType::kInt64 || value.type == ValueType::kDouble) {
     if (proto3) {
       return;
@@ -1503,8 +1534,8 @@ std::string ConstructProtoText(
       continue;
     }
     ValidateEnumFieldValue(type_name, field_name, raw_value);
-    std::optional<Value> converted = ApplyWriteConversion(
-        ClassifyFieldFormat(field_name), raw_value);
+    std::optional<Value> converted =
+        ApplyWriteConversion(ClassifyFieldFormat(field_name), raw_value);
     Value value = converted.has_value() ? *converted : raw_value;
     // TestExtraPB's repeated string field is represented through the generic
     // VARCHAR channel, where enum-like tokens would otherwise be emitted
@@ -1545,10 +1576,9 @@ std::string ConstructProtoText(
         }
         ValidateEnumFieldValue(type_name, field_name, element);
         const std::string text = RawTextOfValue(element);
-        if (element.type == ValueType::kVarChar &&
-            LooksLikeProtoText(text)) {
-          append_entry(field_name,
-                       NormalizeProtoText(text).value_or(text), true);
+        if (element.type == ValueType::kVarChar && LooksLikeProtoText(text)) {
+          append_entry(field_name, NormalizeProtoText(text).value_or(text),
+                       true);
         } else {
           append_entry(field_name, FormatProtoTextScalar(text), false);
         }
@@ -1601,12 +1631,10 @@ struct WireFieldSpec {
   bool repeated;
 };
 
-const std::unordered_map<std::string,
-                         std::unordered_map<int, WireFieldSpec>>&
+const std::unordered_map<std::string, std::unordered_map<int, WireFieldSpec>>&
 WireFieldMaps() {
   static const auto* const kMap = new auto(
-      std::unordered_map<std::string,
-                         std::unordered_map<int, WireFieldSpec>>{
+      std::unordered_map<std::string, std::unordered_map<int, WireFieldSpec>>{
           // KitchenSinkEnumPB carries three TestEnum fields; unknown members
           // are dropped from their field and preserved as "<number>: <value>"
           // raw entries (proto2 semantics).
@@ -1616,8 +1644,7 @@ WireFieldMaps() {
             {3, {"repeated_test_enum", true}}}},
           // Only the Proto3KitchenSink bytes round trip appears in tests:
           // test_enum surfaces as field 50.  proto3 keeps unknown members.
-          {"googlesql_test.proto3kitchensink",
-           {{50, {"test_enum", false}}}},
+          {"googlesql_test.proto3kitchensink", {{50, {"test_enum", false}}}},
           // KitchenSinkPB's double_val is a protobuf fixed64 field.  Keeping
           // this small wire map lets CAST(bytes AS KitchenSinkPB).double_val
           // participate in NaN/INF comparisons instead of becoming NULL.
@@ -1671,8 +1698,8 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
     return std::nullopt;
   }
   const auto& fields = map_it->second;
-  const bool proto2 = ToLowerCopy(type_name).find("kitchensinkenumpb") !=
-                      std::string::npos;
+  const bool proto2 =
+      ToLowerCopy(type_name).find("kitchensinkenumpb") != std::string::npos;
   std::vector<std::pair<std::string, std::string>> entries;
   size_t i = 0;
   while (i < bytes.size()) {
@@ -1710,23 +1737,24 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
     }
     if (wire_type == 2) {
       uint64_t length = 0;
-      if (!ReadBase128(bytes, &i, &length) ||
-          length > bytes.size() - i) {
+      if (!ReadBase128(bytes, &i, &length) || length > bytes.size() - i) {
         return std::nullopt;
       }
       const std::string_view nested = bytes.substr(i, length);
       i += length;
-      if (field_it == fields.end()) { continue; }
-      if (std::string_view(field_it->second.name) ==
-          "repeated_bool_packed") {
+      if (field_it == fields.end()) {
+        continue;
+      }
+      if (std::string_view(field_it->second.name) == "repeated_bool_packed") {
         size_t packed_pos = 0;
         while (packed_pos < nested.size()) {
           uint64_t packed_value = 0;
           if (!ReadBase128(nested, &packed_pos, &packed_value)) {
             return std::nullopt;
           }
-          entries.emplace_back(field_it->second.name,
-                               std::to_string(static_cast<int64_t>(packed_value)));
+          entries.emplace_back(
+              field_it->second.name,
+              std::to_string(static_cast<int64_t>(packed_value)));
         }
         continue;
       }
@@ -1750,7 +1778,9 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
         std::string escaped;
         escaped.reserve(nested.size() + 2);
         for (const char c : nested) {
-          if (c == '"' || c == '\\') { escaped.push_back('\\'); }
+          if (c == '"' || c == '\\') {
+            escaped.push_back('\\');
+          }
           escaped.push_back(c);
         }
         entries.emplace_back(field_it->second.name,
@@ -1787,12 +1817,12 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
   // repeated fields remain repeated entries for ProtoTextExtractField.
   std::vector<std::pair<std::string, std::string>> merged;
   for (const auto& entry : entries) {
-    auto previous = std::find_if(
-        merged.begin(), merged.end(), [&](const auto& candidate) {
+    auto previous =
+        std::find_if(merged.begin(), merged.end(), [&](const auto& candidate) {
           return ToLowerCopy(candidate.first) == ToLowerCopy(entry.first);
         });
-    const auto spec_it = std::find_if(
-        fields.begin(), fields.end(), [&](const auto& candidate) {
+    const auto spec_it =
+        std::find_if(fields.begin(), fields.end(), [&](const auto& candidate) {
           return std::string_view(candidate.second.name) == entry.first;
         });
     const bool repeated = spec_it != fields.end() && spec_it->second.repeated;
@@ -1801,7 +1831,9 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
     } else if (entry.first == "nested_value" ||
                entry.first == "OptionalGroup") {
       if (!entry.second.empty()) {
-        if (!previous->second.empty()) { previous->second.push_back(' '); }
+        if (!previous->second.empty()) {
+          previous->second.push_back(' ');
+        }
         previous->second += entry.second;
       }
     } else {
@@ -1850,7 +1882,7 @@ namespace {
 // Field names are lowercase; a payload scores one point per signature field
 // it mentions (top level) and per SET-target hint that matches.
 struct KnownProtoType {
-  const char* name;       // display form used in messages
+  const char* name;  // display form used in messages
   std::vector<const char*> signature;
 };
 
@@ -1861,17 +1893,29 @@ const std::vector<KnownProtoType>& KnownProtoTypes() {
         "optional_group", "repeated_holder", "date_default",
         "timestamp_uint64"}},
       {"googlesql_test.Proto3KitchenSink",
-       {"int32_val", "uint32_val", "int64_val", "uint64_val",
-        "string_val", "bytes_val", "bool_val", "nested_value",
-        "repeated_int32_val", "repeated_uint32_val", "repeated_int64_val",
-        "repeated_uint64_val", "repeated_string_val", "repeated_float_val",
-        "repeated_double_val", "repeated_bytes_val", "repeated_bool_val",
-        "test_enum", "repeated_test_enum", "nullable_string",
+       {"int32_val",
+        "uint32_val",
+        "int64_val",
+        "uint64_val",
+        "string_val",
+        "bytes_val",
+        "bool_val",
+        "nested_value",
+        "repeated_int32_val",
+        "repeated_uint32_val",
+        "repeated_int64_val",
+        "repeated_uint64_val",
+        "repeated_string_val",
+        "repeated_float_val",
+        "repeated_double_val",
+        "repeated_bytes_val",
+        "repeated_bool_val",
+        "test_enum",
+        "repeated_test_enum",
+        "nullable_string",
         "nullable_nested_value"}},
-      {"googlesql_test.TestExtraPB", {"int32_val1", "int32_val2",
-                                       "str_value"}},
-      {"googlesql_test.KitchenSinkEnumPB",
-       {"required_test_enum"}},
+      {"googlesql_test.TestExtraPB", {"int32_val1", "int32_val2", "str_value"}},
+      {"googlesql_test.KitchenSinkEnumPB", {"required_test_enum"}},
       {"googlesql_test.EmptyMessage", {}},
   });
   return *kTypes;
@@ -1906,8 +1950,7 @@ std::string ExtractProtoTypeMarker(std::string_view text) {
       const size_t begin = pos + kMarker.size();
       const size_t end = text.find('\n', begin);
       const std::string_view name =
-          text.substr(begin,
-                      end == std::string_view::npos ? end : end - begin);
+          text.substr(begin, end == std::string_view::npos ? end : end - begin);
       std::string trimmed = ToLowerCopy(name);
       while (!trimmed.empty() &&
              std::isspace(static_cast<unsigned char>(trimmed.back()))) {
@@ -1920,8 +1963,9 @@ std::string ExtractProtoTypeMarker(std::string_view text) {
   return {};
 }
 
-std::string InferProtoTypeName(
-    std::string_view payload, const std::vector<std::string>& hint_fields) {  std::string marked = ExtractProtoTypeMarker(payload);
+std::string InferProtoTypeName(std::string_view payload,
+                               const std::vector<std::string>& hint_fields) {
+  std::string marked = ExtractProtoTypeMarker(payload);
   if (!marked.empty()) {
     // Canonicalize to the display form when this is a modelled type.
     for (const KnownProtoType& type : KnownProtoTypes()) {

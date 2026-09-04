@@ -34,6 +34,12 @@ class DistinctPlan final : public PlanBase {
       const std::vector<bool>& ascending) const override {
     return child_->IsOrderedBy(expressions, ascending);
   }
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override {
+    return child_->IsOrderedBy(expressions, ascending, nulls_first);
+  }
   [[nodiscard]] const Plan& Child() const { return child_; }
   [[nodiscard]] const std::vector<Expression>& DistinctOn() const {
     return distinct_on_;

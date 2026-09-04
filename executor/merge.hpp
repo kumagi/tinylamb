@@ -51,10 +51,9 @@ struct WhenNotMatchedClause {
   std::vector<Expression> values;
   std::vector<size_t> target_columns;
 
-  static WhenNotMatchedClause Insert(
-      std::vector<Expression> values,
-      std::vector<size_t> target_columns = {},
-      Expression condition = nullptr) {
+  static WhenNotMatchedClause Insert(std::vector<Expression> values,
+                                     std::vector<size_t> target_columns = {},
+                                     Expression condition = nullptr) {
     WhenNotMatchedClause clause;
     clause.action = Action::kInsert;
     clause.condition = std::move(condition);
@@ -66,9 +65,8 @@ struct WhenNotMatchedClause {
 
 class MergeExecutor : public ExecutorBase {
  public:
-  MergeExecutor(Transaction& txn, Table* target_table,
-                Executor source, Schema source_schema,
-                Expression on_condition,
+  MergeExecutor(Transaction& txn, Table* target_table, Executor source,
+                Schema source_schema, Expression on_condition,
                 std::vector<WhenMatchedClause> matched_clauses,
                 std::vector<WhenNotMatchedClause> not_matched_clauses);
 

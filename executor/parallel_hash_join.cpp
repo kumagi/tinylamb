@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -141,6 +142,16 @@ std::string SharedBuildParallelHashJoin::MakeKey(
   return key;
 }
 
+bool SharedBuildParallelHashJoin::KeyHasNull(const Row& row,
+                                             const std::vector<slot_t>& cols) {
+  for (slot_t col : cols) {
+    if (col < row.values_.size() && row[col].IsNull()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint64_t SharedBuildParallelHashJoin::HashKey(std::string_view key) {
   return Fnv1aHash(key);
 }
@@ -154,7 +165,8 @@ void SharedBuildParallelHashJoin::BuildSharedHashTable() {
   }
 
   const size_t total_build = build_tuples.size();
-  const size_t num_threads = std::min(worker_count_, std::max<size_t>(1, total_build / 16));
+  const size_t num_threads =
+      std::min(worker_count_, std::max<size_t>(1, total_build / 16));
 
   auto build_worker = [&](size_t thread_id) {
     const size_t chunk_sz = (total_build + num_threads - 1) / num_threads;
@@ -162,6 +174,12 @@ void SharedBuildParallelHashJoin::BuildSharedHashTable() {
     const size_t end = std::min(total_build, start + chunk_sz);
     for (size_t i = start; i < end; ++i) {
       const auto& t = build_tuples[i];
+      // SQL equality never matches on NULL; a NULL-keyed build row would
+      // collide with other NULL-keyed probes through the shared '\0' tag,
+      // so it must not enter the hash table at all.
+      if (KeyHasNull(t.first, right_cols_)) {
+        continue;
+      }
       std::string key = MakeKey(t.first, right_cols_);
       const uint64_t hash = HashKey(key);
       shared_hash_table_.Insert(hash, std::move(key), t.first, t.second);
@@ -173,11 +191,27 @@ void SharedBuildParallelHashJoin::BuildSharedHashTable() {
   } else {
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
+    std::mutex error_mutex;
+    std::exception_ptr build_error;
     for (size_t i = 0; i < num_threads; ++i) {
-      workers.emplace_back(build_worker, i);
+      workers.emplace_back([&, i] {
+        try {
+          build_worker(i);
+        } catch (...) {
+          // An exception escaping a raw thread terminates the process;
+          // capture it and rethrow on the joining thread instead.
+          std::lock_guard<std::mutex> lock(error_mutex);
+          if (build_error == nullptr) {
+            build_error = std::current_exception();
+          }
+        }
+      });
     }
     for (auto& w : workers) {
       w.join();
+    }
+    if (build_error != nullptr) {
+      std::rethrow_exception(build_error);
     }
   }
 }
@@ -191,9 +225,11 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
   }
 
   const size_t total_probe = probe_tuples.size();
-  const size_t num_threads = std::min(worker_count_, std::max<size_t>(1, total_probe / 16));
+  const size_t num_threads =
+      std::min(worker_count_, std::max<size_t>(1, total_probe / 16));
 
-  std::vector<std::vector<std::pair<Row, RowPosition>>> thread_outputs(num_threads);
+  std::vector<std::vector<std::pair<Row, RowPosition>>> thread_outputs(
+      num_threads);
 
   auto probe_worker = [&](size_t thread_id) {
     const size_t chunk_sz = (total_probe + num_threads - 1) / num_threads;
@@ -203,15 +239,23 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
 
     for (size_t i = start; i < end; ++i) {
       const auto& left_tuple = probe_tuples[i];
-      const std::string key = MakeKey(left_tuple.first, left_cols_);
+      // SQL equality never matches on NULL: a NULL-keyed probe row takes the
+      // no-match path for every kind (anti/outer emit it padded or raw).
+      const bool probe_has_null = KeyHasNull(left_tuple.first, left_cols_);
+      const std::string key = probe_has_null
+                                  ? std::string()
+                                  : MakeKey(left_tuple.first, left_cols_);
       const uint64_t hash = HashKey(key);
-      const auto matches = shared_hash_table_.FindMatches(hash, key);
+      const auto matches = probe_has_null
+                               ? std::vector<std::pair<Row, RowPosition>>{}
+                               : shared_hash_table_.FindMatches(hash, key);
 
       switch (kind_) {
         case JoinKind::kInner:
           for (const auto& m : matches) {
             std::vector<Value> joined_values;
-            joined_values.reserve(left_tuple.first.values_.size() + m.first.values_.size());
+            joined_values.reserve(left_tuple.first.values_.size() +
+                                  m.first.values_.size());
             for (size_t c = 0; c < left_tuple.first.values_.size(); ++c) {
               joined_values.push_back(left_tuple.first[c]);
             }
@@ -236,19 +280,22 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
           if (!matches.empty()) {
             for (const auto& m : matches) {
               std::vector<Value> joined_values;
-              joined_values.reserve(left_tuple.first.values_.size() + m.first.values_.size());
+              joined_values.reserve(left_tuple.first.values_.size() +
+                                    m.first.values_.size());
               for (size_t c = 0; c < left_tuple.first.values_.size(); ++c) {
                 joined_values.push_back(left_tuple.first[c]);
               }
               for (size_t c = 0; c < m.first.values_.size(); ++c) {
                 joined_values.push_back(m.first[c]);
               }
-              out.emplace_back(Row(std::move(joined_values)), left_tuple.second);
+              out.emplace_back(Row(std::move(joined_values)),
+                               left_tuple.second);
             }
           } else {
             // Null pad right side
             std::vector<Value> joined_values;
-            joined_values.reserve(left_tuple.first.values_.size() + right_cols_.size());
+            joined_values.reserve(left_tuple.first.values_.size() +
+                                  right_cols_.size());
             for (size_t c = 0; c < left_tuple.first.values_.size(); ++c) {
               joined_values.push_back(left_tuple.first[c]);
             }
@@ -297,12 +344,19 @@ void SharedBuildParallelHashJoin::EnsureMaterialized() {
   if (materialized_) {
     return;
   }
-  materialized_ = true;
   output_.clear();
   output_offset_ = 0;
 
-  BuildSharedHashTable();
-  ParallelProbe();
+  try {
+    BuildSharedHashTable();
+    ParallelProbe();
+  } catch (...) {
+    // Latch the failure so a retried Next() rethrows instead of reporting the
+    // half-built output_ as a complete result.
+    materialized_ = true;
+    throw;
+  }
+  materialized_ = true;
 }
 
 void SharedBuildParallelHashJoin::MaterializePipeline() {

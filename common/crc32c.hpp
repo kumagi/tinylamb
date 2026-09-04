@@ -48,8 +48,8 @@ namespace detail {
 // attribute lets this compile in translation units built without -msse4.2;
 // the compiler will not inline a target mismatch, but a static call is still
 // far cheaper than the 32k+ cycle bit loop for a 4 KiB page.
-[[gnu::target("sse4.2")]] [[nodiscard]] inline uint32_t
-Crc32CRawHardware(uint32_t crc, std::span<const uint8_t> data) {
+[[gnu::target("sse4.2")]] [[nodiscard]] inline uint32_t Crc32CRawHardware(
+    uint32_t crc, std::span<const uint8_t> data) {
 #if defined(__x86_64__) || defined(__i386__)
   const uint8_t* p = data.data();
   const uint8_t* const end = data.data() + data.size();
@@ -90,8 +90,8 @@ Crc32CRawHardware(uint32_t crc, std::span<const uint8_t> data) {
 }
 
 [[nodiscard]] inline uint32_t Crc32C(const void* data, size_t length) {
-  return Crc32C(std::span<const uint8_t>(
-      static_cast<const uint8_t*>(data), length));
+  return Crc32C(
+      std::span<const uint8_t>(static_cast<const uint8_t*>(data), length));
 }
 
 // Incremental form: continue an unfinished computation. `raw` is the state
@@ -100,8 +100,7 @@ Crc32CRawHardware(uint32_t crc, std::span<const uint8_t> data) {
 [[nodiscard]] inline uint32_t Crc32CExtend(uint32_t raw, const void* data,
                                            size_t length) {
   return detail::Crc32CRawHardware(
-      raw, std::span<const uint8_t>(static_cast<const uint8_t*>(data),
-                                    length));
+      raw, std::span<const uint8_t>(static_cast<const uint8_t*>(data), length));
 }
 
 }  // namespace tinylamb

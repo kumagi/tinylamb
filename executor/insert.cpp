@@ -36,8 +36,15 @@
 namespace tinylamb {
 namespace {
 
+// Primary-key duplicate detection stringifies the key value.  A NULL key
+// gets its own sentinel: the reference engine treats two NULL primary keys
+// as duplicates of each other (dml_insert.test
+// insert_duplicate_new_null_row_error / insert_ignore_two_new_rows_with_null_
+// primary_key), so NULLs must NOT behave as pairwise-distinct here.
 std::string KeyString(const Value& value) {
-  if (value.IsNull()) { return "\x01NULL"; }
+  if (value.IsNull()) {
+    return "\x01NULL";
+  }
   return value.AsString();
 }
 
@@ -63,8 +70,9 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
   if (enforce_primary_key_) {
     for (auto it = target_->BeginFullScan(*txn_); it.IsValid(); ++it) {
       const Row& current = *it;
-      if (current.values_.size() == 0) { continue;
-}
+      if (current.values_.size() == 0) {
+        continue;
+      }
       std::string key = KeyString(current[0]);
       existing_keys.insert(key);
       existing_positions.emplace(std::move(key), it.Position());
@@ -98,8 +106,9 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
             throw std::runtime_error("insert failed on table " +
                                      std::string(target_->GetSchema().Name()));
           }
-          if (!in_batch) { ++insertion_count;
-}
+          if (!in_batch) {
+            ++insertion_count;
+          }
           continue;
         }
         case InsertExecutionMode::kReplace: {
@@ -109,14 +118,14 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
             throw std::runtime_error("insert failed on table " +
                                      std::string(target_->GetSchema().Name()));
           }
-          if (!in_batch) { ++insertion_count;
-}
+          if (!in_batch) {
+            ++insertion_count;
+          }
           continue;
         }
         case InsertExecutionMode::kDefault:
-          throw std::runtime_error(
-              "Failed to insert row with primary key (" + key +
-              ") due to previously existing row");
+          throw std::runtime_error("Failed to insert row with primary key (" +
+                                   key + ") due to previously existing row");
       }
     }
     StatusOr<RowPosition> inserted = target_->Insert(*txn_, new_row);

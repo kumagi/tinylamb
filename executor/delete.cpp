@@ -15,13 +15,15 @@
 
 namespace tinylamb {
 bool DeleteExecutor::Next(Row* dst, RowPosition* rp) {
-  if (finished_) { return false;
-}
+  if (finished_) {
+    return false;
+  }
   std::vector<RowPosition> pending;
   Row row;
   RowPosition position;
-  while (source_->Next(&row, &position)) { pending.push_back(position);
-}
+  while (source_->Next(&row, &position)) {
+    pending.push_back(position);
+  }
   int64_t count = 0;
   for (const RowPosition& row_position : pending) {
     if (target_->Delete(*txn_, row_position) != Status::kSuccess) {
@@ -38,8 +40,9 @@ bool DeleteExecutor::Next(Row* dst, RowPosition* rp) {
                              " rows were modified");
   }
   *dst = Row({Value("Delete Rows"), Value(count)});
-  if (rp != nullptr) { *rp = RowPosition();
-}
+  if (rp != nullptr) {
+    *rp = RowPosition();
+  }
   finished_ = true;
   return true;
 }

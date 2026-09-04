@@ -76,8 +76,8 @@ class QueryScheduler {
 // destruction, so every operator in the plan shares one CPU/memory budget.
 class ScheduledExecutor final : public ExecutorBase {
  public:
-  ScheduledExecutor(Executor child, QueryScheduler& scheduler,
-                    size_t cpu_slots, size_t memory_bytes)
+  ScheduledExecutor(Executor child, QueryScheduler& scheduler, size_t cpu_slots,
+                    size_t memory_bytes)
       : child_(std::move(child)),
         scheduler_(&scheduler),
         cpu_slots_(cpu_slots),

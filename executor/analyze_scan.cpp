@@ -133,7 +133,8 @@ bool AnalyzeScan::Next(Row* dst, RowPosition* rp) {
       // Lowest values (up to 5 unique)
       for (const auto& v : sample) {
         if (lowest.empty() || lowest.back().value != v) {
-          lowest.push_back(ValueFrequency{.value = v, .count = value_counts[v]});
+          lowest.push_back(
+              ValueFrequency{.value = v, .count = value_counts[v]});
           if (lowest.size() == kBoundaryValueCount) break;
         }
       }
@@ -141,7 +142,8 @@ bool AnalyzeScan::Next(Row* dst, RowPosition* rp) {
       // Highest values (up to 5 unique)
       for (auto it = sample.rbegin(); it != sample.rend(); ++it) {
         if (highest.empty() || highest.back().value != *it) {
-          highest.push_back(ValueFrequency{.value = *it, .count = value_counts[*it]});
+          highest.push_back(
+              ValueFrequency{.value = *it, .count = value_counts[*it]});
           if (highest.size() == kBoundaryValueCount) break;
         }
       }
@@ -149,10 +151,13 @@ bool AnalyzeScan::Next(Row* dst, RowPosition* rp) {
       // Build histogram buckets
       const size_t num_buckets = std::min(bucket_count_, sample.size());
       if (num_buckets > 0) {
-        const double bucket_step = static_cast<double>(sample.size()) / static_cast<double>(num_buckets);
+        const double bucket_step = static_cast<double>(sample.size()) /
+                                   static_cast<double>(num_buckets);
         for (size_t b = 0; b < num_buckets; ++b) {
-          const size_t start_idx = static_cast<size_t>(std::floor(static_cast<double>(b) * bucket_step));
-          const size_t end_idx = static_cast<size_t>(std::floor(static_cast<double>(b + 1) * bucket_step));
+          const size_t start_idx = static_cast<size_t>(
+              std::floor(static_cast<double>(b) * bucket_step));
+          const size_t end_idx = static_cast<size_t>(
+              std::floor(static_cast<double>(b + 1) * bucket_step));
           if (start_idx >= end_idx || start_idx >= sample.size()) continue;
           const size_t clamped_end = std::min(end_idx, sample.size());
           const Value& lower = sample[start_idx];
@@ -164,9 +169,10 @@ bool AnalyzeScan::Next(Row* dst, RowPosition* rp) {
               ++distinct_in_bucket;
             }
           }
-          const size_t count = sample.size() > 0
-              ? (non_null_count * (clamped_end - start_idx)) / sample.size()
-              : (clamped_end - start_idx);
+          const size_t count =
+              sample.size() > 0
+                  ? (non_null_count * (clamped_end - start_idx)) / sample.size()
+                  : (clamped_end - start_idx);
           histogram.push_back(HistogramBucket{
               .lower = lower,
               .upper = upper,
@@ -180,7 +186,10 @@ bool AnalyzeScan::Next(Row* dst, RowPosition* rp) {
     ColumnStats cs(val_type);
     cs.non_null_count_ = non_null_count;
     cs.null_count_ = null_count;
-    cs.distinct_count_ = non_null_count > 0 ? std::max(size_t{1}, static_cast<size_t>(hll.Estimate())) : 0;
+    cs.distinct_count_ =
+        non_null_count > 0
+            ? std::max(size_t{1}, static_cast<size_t>(hll.Estimate()))
+            : 0;
     cs.histogram_ = std::move(histogram);
     cs.most_common_values_ = std::move(mcvs);
     cs.lowest_values_ = std::move(lowest);

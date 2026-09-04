@@ -2,8 +2,8 @@
 #ifndef TINYLAMB_DATABASE_CATALOG_READER_HPP
 #define TINYLAMB_DATABASE_CATALOG_READER_HPP
 
-#include <string_view>
 #include <cstdint>
+#include <string_view>
 
 #include "common/status_or.hpp"
 #include "table/table.hpp"
@@ -25,8 +25,8 @@ class CatalogReader {
 
   virtual StatusOr<Table> GetTable(TransactionContext& context,
                                    std::string_view name) = 0;
-  virtual StatusOr<TableStatistics> GetStatistics(
-      TransactionContext& context, std::string_view name) = 0;
+  virtual StatusOr<TableStatistics> GetStatistics(TransactionContext& context,
+                                                  std::string_view name) = 0;
   virtual StatusOr<Function> GetOrAddFunction(TransactionContext& context,
                                               std::string_view name,
                                               int argument_count) = 0;

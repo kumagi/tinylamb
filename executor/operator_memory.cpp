@@ -18,9 +18,7 @@ OperatorMemoryReservation::OperatorMemoryReservation(
       limit_(limit_bytes),
       spill_callback_(std::move(spill_callback)) {}
 
-OperatorMemoryReservation::~OperatorMemoryReservation() {
-  Reset();
-}
+OperatorMemoryReservation::~OperatorMemoryReservation() { Reset(); }
 
 OperatorMemoryReservation::OperatorMemoryReservation(
     OperatorMemoryReservation&& other) noexcept

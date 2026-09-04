@@ -84,7 +84,9 @@ bool BitmapHeapScan::Next(Row* dst, RowPosition* rp) {
 void BitmapHeapScan::Dump(std::ostream& o, int /*indent*/) const {
   o << bitmap_operation_ << "\n  BitmapHeapScan: (" << positions_.size()
     << " positions)";
-  if (where_) { o << "\n  Recheck: " << *where_; }
+  if (where_) {
+    o << "\n  Recheck: " << *where_;
+  }
 }
 
 }  // namespace tinylamb

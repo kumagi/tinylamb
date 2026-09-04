@@ -12,7 +12,8 @@ namespace tinylamb {
 EmptyPlan::EmptyPlan(Plan child)
     : child_(std::move(child)), stats_(child_->GetSchema()) {}
 
-// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
+// EmitExecutor lives in the relational factory
+// (executor/relational_factory.cpp).
 
 void EmptyPlan::Dump(std::ostream& o, int indent) const {
   o << Indent(indent) << "EmptyResult (estimated cost: 0)\n";

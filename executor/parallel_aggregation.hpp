@@ -9,8 +9,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include "executor/executor_base.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/executor_base.hpp"
+#include "executor/query_memory.hpp"
 #include "expression/named_expression.hpp"
 #include "type/schema.hpp"
 
@@ -37,8 +38,12 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   // How each aggregate reads its input.  kInt64Column / kDoubleColumn
   // aggregates can run directly over the chunk's raw numeric storage;
   // everything else falls back to the per-row generic path.
-  enum class AggregateInputKind : uint8_t { kRowCount, kInt64Column, kDoubleColumn,
-                                  kGeneric };
+  enum class AggregateInputKind : uint8_t {
+    kRowCount,
+    kInt64Column,
+    kDoubleColumn,
+    kGeneric
+  };
   struct AggregateInput {
     AggregateInputKind kind{AggregateInputKind::kGeneric};
     size_t column{0};
@@ -48,6 +53,15 @@ class ParallelAggregationExecutor final : public ExecutorBase {
     std::vector<Value> values;
     std::vector<int64_t> counts;
     std::vector<relational_detail::DistinctValueSet> distinct_values;
+    // Every retained distinct value holds a forced global-budget reservation;
+    // release the retained total when the state dies so the process-wide
+    // budget cannot ratchet up across repeated aggregations.
+    size_t distinct_charged_bytes{0};
+    ~PartialState() {
+      if (distinct_charged_bytes != 0) {
+        QueryMemoryBudget::Global().Release(distinct_charged_bytes);
+      }
+    }
   };
 
   [[nodiscard]] PartialState MakeState() const;

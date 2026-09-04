@@ -18,10 +18,18 @@ class JitInt64Kernels {
   using ProjectionFn = void (*)(const int64_t*, int64_t*, uint64_t, int64_t,
                                 int64_t);
   using SumFn = int64_t (*)(const int64_t*, uint64_t);
+  // Overflow-checked variants: the trailing out-params report whether any
+  // lane wrapped, so callers can throw exactly like the AST evaluator
+  // instead of silently returning wrapped values.
+  using SumCheckedFn = int64_t (*)(const int64_t*, uint64_t, uint8_t*);
+  using ProjectionCheckedFn = void (*)(const int64_t*, int64_t*, uint64_t,
+                                       int64_t, int64_t, uint8_t*, uint8_t*);
 
   static std::optional<JitInt64Kernels> CompileFilter(BinaryOperation op);
   static std::optional<JitInt64Kernels> CompileProjection();
   static std::optional<JitInt64Kernels> CompileSum();
+  static std::optional<JitInt64Kernels> CompileProjectionChecked();
+  static std::optional<JitInt64Kernels> CompileSumChecked();
 
   JitInt64Kernels(JitInt64Kernels&&) noexcept;
   JitInt64Kernels& operator=(JitInt64Kernels&&) noexcept;
@@ -36,6 +44,11 @@ class JitInt64Kernels {
   void Project(const int64_t* input, int64_t* output, size_t count,
                int64_t multiplier, int64_t addend) const;
   [[nodiscard]] int64_t Sum(const int64_t* input, size_t count) const;
+  void ProjectChecked(const int64_t* input, int64_t* output, size_t count,
+                      int64_t multiplier, int64_t addend,
+                      bool* multiply_overflowed, bool* add_overflowed) const;
+  [[nodiscard]] int64_t SumChecked(const int64_t* input, size_t count,
+                                   bool* overflowed) const;
   [[nodiscard]] double CompileMilliseconds() const;
 
  private:

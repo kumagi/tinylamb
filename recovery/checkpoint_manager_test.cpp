@@ -15,24 +15,25 @@
  */
 
 #include "recovery/checkpoint_manager.hpp"
-#include <string>
-#include <cstdio>
-#include <memory>
-#include <filesystem>
-#include <thread>
-#include <chrono>
 
-#include "common/random_string.hpp"
-#include "common/test_util.hpp"
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <thread>
+
 #include "common/constants.hpp"
+#include "common/random_string.hpp"
 #include "common/status_or.hpp"
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_ref.hpp"
 #include "page/page_type.hpp"
 #include "page/row_page_test.hpp"
 #include "recovery/logger.hpp"
-#include "transaction/lock_manager.hpp"
 #include "recovery/recovery_manager.hpp"
+#include "transaction/lock_manager.hpp"
 
 namespace tinylamb {
 class CheckpointTest : public RowPageTest {
@@ -69,8 +70,7 @@ class CheckpointTest : public RowPageTest {
     p_ = std::make_unique<PageManager>(db_name_, 10);
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               nullptr);
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), nullptr);
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     cm_ = std::make_unique<CheckpointManager>(master_record_name_, tm_.get(),
                                               p_->GetPool(), 1);
@@ -195,8 +195,8 @@ TEST_F(CheckpointTest, PeriodicCheckpointRuns) {
   // Arrange -- fixture creates a CheckpointManager with a 1-second interval
   // Act -- start the background worker and wait for its first checkpoint
   cm_->Start();
-  for (int i = 0;
-       i < 400 && !std::filesystem::exists(master_record_name_); ++i) {
+  for (int i = 0; i < 400 && !std::filesystem::exists(master_record_name_);
+       ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   // Assert -- the periodic worker called WriteCheckpoint, writing the master

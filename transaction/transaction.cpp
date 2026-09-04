@@ -19,11 +19,11 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
-#include <mutex>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -82,10 +82,12 @@ Transaction::Transaction(Transaction&& o) noexcept
       version_read_caches_(std::move(o.version_read_caches_)),
       read_state_mutex_(std::move(o.read_state_mutex_)),
       prev_lsn_(o.prev_lsn_),
+      durability_dependence_(
+          o.durability_dependence_.load(std::memory_order_acquire)),
       status_(o.status_),
       read_only_(o.read_only_),
-      wounded_(o.wounded_.load(std::memory_order_acquire)),
-      transaction_manager_(o.transaction_manager_) {
+      transaction_manager_(o.transaction_manager_),
+      wounded_(o.wounded_.load(std::memory_order_acquire)) {
   if (o.transaction_manager_ != nullptr) {
     o.transaction_manager_->MoveActiveTransaction(&o, this);
   }
@@ -123,8 +125,9 @@ bool Transaction::AddReadSet(const RowPosition& rp) {
 
 bool Transaction::AddWriteSet(const RowPosition& rp) {
   assert(!IsFinished());
-  if (read_only_) { return false;
-}
+  if (read_only_) {
+    return false;
+  }
   if (write_set_.contains(rp)) {
     return true;
   }
@@ -138,7 +141,9 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
 
 bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
   assert(!IsFinished());
-  if (read_only_) { return false; }
+  if (read_only_) {
+    return false;
+  }
   if (write_set_.contains(rp)) {
     return true;
   }
@@ -151,10 +156,12 @@ bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
 
 bool Transaction::TryAddWriteSet(const RowPosition& rp) {
   assert(!IsFinished());
-  if (read_only_) { return false;
-}
-  if (write_set_.contains(rp)) { return true;
-}
+  if (read_only_) {
+    return false;
+  }
+  if (write_set_.contains(rp)) {
+    return true;
+  }
   if (!transaction_manager_->AcquireWriteIntent(*this, rp, false)) {
     return false;
   }
@@ -174,8 +181,9 @@ Transaction::VersionCacheShard& Transaction::ThreadShard() {
   std::scoped_lock state_guard(*read_state_mutex_);
   std::unique_ptr<VersionCacheShard>& entry =
       version_read_caches_[std::this_thread::get_id()];
-  if (!entry) { entry = std::make_unique<VersionCacheShard>();
-}
+  if (!entry) {
+    entry = std::make_unique<VersionCacheShard>();
+  }
   owner_epoch = shard_epoch_;
   shard = entry.get();
   return *shard;
@@ -200,8 +208,9 @@ StatusOr<std::string_view> Transaction::ReadVersion(
   // conflict with writers), so this path does not populate it; per-row
   // insertion under a shared lock would serialize concurrent scan workers.
   if (transaction_manager_ == nullptr) {
-    if (!physical) { return Status::kNotExists;
-}
+    if (!physical) {
+      return Status::kNotExists;
+    }
     return *physical;
   }
   {
@@ -223,21 +232,24 @@ StatusOr<std::string_view> Transaction::ReadVersion(
   }
   StatusOr<std::string> visible =
       transaction_manager_->ReadVersion(*this, rp, physical);
-  if (!visible.HasValue()) { return visible.GetStatus();
-}
+  if (!visible.HasValue()) {
+    return visible.GetStatus();
+  }
   VersionCacheShard& shard = ThreadShard();
   std::scoped_lock shard_lock(shard.mutex);
   const uint64_t epoch = write_epoch_.load(std::memory_order_acquire);
   auto [iter, inserted] = shard.entries.insert_or_assign(
-      rp, VersionCacheEntry{.epoch=epoch, .value=std::move(visible.Value())});
+      rp,
+      VersionCacheEntry{.epoch = epoch, .value = std::move(visible.Value())});
   constexpr size_t kMaxVersionReadCache = 4096;
   if (shard.entries.size() > kMaxVersionReadCache) {
     // Evict a single entry (never the one just inserted): clearing the whole
     // shard would invalidate every string_view this thread still holds from
     // earlier reads.
     auto victim = shard.entries.begin();
-    if (victim == iter) { ++victim;
-}
+    if (victim == iter) {
+      ++victim;
+    }
     shard.entries.erase(victim);
   }
   return std::string_view(iter->second.value);
@@ -247,8 +259,9 @@ void Transaction::RegisterVersionWrite(const RowPosition& rp,
                                        std::optional<std::string_view> before,
                                        std::optional<std::string_view> after) {
   std::scoped_lock state_guard(*read_state_mutex_);
-  if (transaction_manager_ == nullptr) { return;
-}
+  if (transaction_manager_ == nullptr) {
+    return;
+  }
   // Invalidate every shard's cached entries for this generation: any worker
   // under this transaction that reads after the new version registers must
   // not serve a pre-write value from its cache.  Entries tagged with the
@@ -389,10 +402,13 @@ lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
   return prev_lsn_;
 }
 
-lsn_t Transaction::DestroyPageLog(page_id_t destroyed_page_id) {
+lsn_t Transaction::DestroyPageLog(page_id_t destroyed_page_id,
+                                  PageType old_page_type,
+                                  std::string old_page_body) {
   assert(!IsFinished());
   prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id));
+      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id,
+                                      old_page_type, std::move(old_page_body)));
   return prev_lsn_;
 }
 

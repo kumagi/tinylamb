@@ -1,16 +1,15 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
-#include "page/page.hpp"
-
 #include "gtest/gtest.h"
+#include "page/page.hpp"
 #include "type/date.hpp"
 
 namespace tinylamb {
 
 TEST(PaxPageTest, PageTypePersistsColumnarChunk) {
-  const Schema schema("pax", {Column("id", ValueType::kInt64),
-                              Column("price", ValueType::kDouble),
-                              Column("name", ValueType::kVarChar),
-                              Column("day", ValueType::kDate)});
+  const Schema schema(
+      "pax",
+      {Column("id", ValueType::kInt64), Column("price", ValueType::kDouble),
+       Column("name", ValueType::kVarChar), Column("day", ValueType::kDate)});
   DataChunk input(schema, 3);
   input.Append(Row({Value(int64_t{7}), Value(1.5), Value("one"),
                     Value::Date("2026-08-24")}));

@@ -12,6 +12,8 @@
 #include "executor/chunked_scan.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/scan_filter.hpp"
+#include "executor/exchange.hpp"
 #include "executor/grouping_sets.hpp"
 #include "executor/incremental_sort.hpp"
 #include "executor/interval_join.hpp"
@@ -44,8 +46,8 @@
 namespace tinylamb {
 
 TEST(MinMaxIndexExecutorTest, EmptyAndNullPrefixProduceScalarNull) {
-  auto source = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value()}), Row({Value(int64_t{42})})});
+  auto source = std::make_shared<ValuesExecutor>(
+      std::vector<Row>{Row({Value()}), Row({Value(int64_t{42})})});
   MinMaxIndexExecutor executor(std::move(source), 0);
 
   Row result;
@@ -77,7 +79,8 @@ TEST(PartialSortTest, TopKWithoutSortingEntireRun) {
   std::vector<SortExecutor::Key> keys = {
       {ColumnValueExp("score"), true, std::nullopt}};
 
-  PartialSortExecutor partial_sort(src, schema, keys, /*top_k=*/3, /*offset=*/0);
+  PartialSortExecutor partial_sort(src, schema, keys, /*top_k=*/3,
+                                   /*offset=*/0);
   EXPECT_FALSE(partial_sort.IsMaterialized());
   partial_sort.MaterializePipeline();
   EXPECT_TRUE(partial_sort.IsMaterialized());
@@ -158,7 +161,7 @@ TEST(PartialSortTest, PartitionedBlockSorting) {
       {ColumnValueExp("val"), true, std::nullopt}};
 
   PartialSortExecutor partial_sort(src, schema, keys, /*top_k=*/0, /*offset=*/0,
-                                  /*block_size=*/3);
+                                   /*block_size=*/3);
 
   DataChunk destination(schema, 10);
   size_t count = partial_sort.NextBatch(&destination);
@@ -208,20 +211,20 @@ TEST(PercentileContTest, OrderedSetAggregationLinearInterpolation) {
 }
 
 TEST(VectorizedAggregationExecutorTest, BitwiseAndLogicalAggregation) {
-  const Schema schema("data", {Column("a", ValueType::kInt64),
-                               Column("b", ValueType::kInt64)});
+  const Schema schema(
+      "data", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
   auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
       Row({Value(int64_t{0b1100}), Value(int64_t{1})}),
       Row({Value(int64_t{0b1010}), Value(int64_t{1})}),
       Row({Value(int64_t{0b1001}), Value(int64_t{0})}),
   });
 
-  auto bit_and = std::make_shared<AggregateExpression>(
-      AggregationType::kBitAnd, ColumnValueExp("a"));
-  auto bit_or = std::make_shared<AggregateExpression>(
-      AggregationType::kBitOr, ColumnValueExp("a"));
-  auto bit_xor = std::make_shared<AggregateExpression>(
-      AggregationType::kBitXor, ColumnValueExp("a"));
+  auto bit_and = std::make_shared<AggregateExpression>(AggregationType::kBitAnd,
+                                                       ColumnValueExp("a"));
+  auto bit_or = std::make_shared<AggregateExpression>(AggregationType::kBitOr,
+                                                      ColumnValueExp("a"));
+  auto bit_xor = std::make_shared<AggregateExpression>(AggregationType::kBitXor,
+                                                       ColumnValueExp("a"));
   auto log_and = std::make_shared<AggregateExpression>(
       AggregationType::kLogicalAnd, ColumnValueExp("b"));
   auto log_or = std::make_shared<AggregateExpression>(
@@ -256,8 +259,9 @@ TEST(TwoPhaseDistinctAggTest, BasicDistinctAggregation) {
   auto agg_count = std::make_shared<AggregateExpression>(
       AggregationType::kCount, ColumnValueExp("salary"), true);
 
-  TwoPhaseDistinctAggExecutor distinct_agg(
-      src, schema, {ColumnValueExp("dept")}, {NamedExpression("cnt", agg_count)});
+  TwoPhaseDistinctAggExecutor distinct_agg(src, schema,
+                                           {ColumnValueExp("dept")},
+                                           {NamedExpression("cnt", agg_count)});
 
   std::vector<Row> out_rows;
   Row row;
@@ -290,7 +294,7 @@ TEST(SharedBuildParallelHashJoinTest, BasicExecution) {
   Executor left1 = std::make_shared<ValuesExecutor>(left_rows);
   Executor right1 = std::make_shared<ValuesExecutor>(right_rows);
   SharedBuildParallelHashJoin join_inner(left1, {0}, right1, {0}, 4,
-                                        JoinKind::kInner);
+                                         JoinKind::kInner);
   size_t inner_count = 0;
   Row row;
   RowPosition rp;
@@ -318,6 +322,120 @@ TEST(SharedBuildParallelHashJoinTest, BasicExecution) {
     ++anti_count;
   }
   EXPECT_EQ(anti_count, 0);
+}
+
+TEST(BatchNestedLoopJoinTest, RightOuterEmitsUnmatchedRightRows) {
+  const Schema left_schema("l", {Column("id", ValueType::kInt64)});
+  const Schema right_schema("r", {Column("id", ValueType::kInt64)});
+  Executor left = std::make_shared<ValuesExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)})});
+  Executor right = std::make_shared<ValuesExecutor>(
+      std::vector<Row>{Row({Value(2)}), Row({Value(3)})});
+  Expression predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("l", "id")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("r", "id")));
+  BatchNestedLoopJoin join(std::move(left), left_schema, std::move(right),
+                           right_schema, predicate, JoinKind::kRightOuter, 1);
+  Row row;
+  RowPosition rp;
+  std::vector<Row> out;
+  while (join.Next(&row, &rp)) {
+    out.push_back(row);
+  }
+  // (2,2) matched + (NULL,3) unmatched = 2 rows.
+  ASSERT_EQ(out.size(), 2);
+  size_t null_left = 0;
+  for (const Row& r : out) {
+    if (r[0].IsNull()) {
+      ++null_left;
+      EXPECT_EQ(r[1], Value(3));
+    }
+  }
+  EXPECT_EQ(null_left, 1);
+}
+
+TEST(ScanFilterTest, UnsignedComparisonsMatchGroundTruth) {
+  // Fixed: the signed int fast path mis-filtered UINT64 boundary values
+  // (UINT64_MAX stored as bit pattern -1 matched `id < 0`).
+  Column unsigned_col("id", ValueType::kInt64);
+  unsigned_col.SetUnsigned(true);
+  const Schema schema("t", {unsigned_col});
+  const Value max_uint = Value(int64_t{-1}).WithUnsigned();
+  const Row row({max_uint});
+  relational_detail::SimpleComparePredicate pred;
+  pred.column = 0;
+  pred.op = BinaryOperation::kLessThan;
+  pred.constant = Value(int64_t{0});
+  pred.int_payload = true;
+  pred.int_constant = 0;
+  EXPECT_FALSE(relational_detail::MatchSimpleCompare(row, pred))
+      << "UINT64_MAX is not < 0 under unsigned semantics";
+  EXPECT_FALSE(
+      EvaluateBinary(BinaryOperation::kLessThan, max_uint, Value(int64_t{0}))
+          .Truthy());
+  // MatchScanFilter tags rows from the schema before matching, so the
+  // residual path agrees too.
+  Row tagged = row;
+  tagged[0] = tagged[0].WithUnsigned();
+  EXPECT_FALSE(relational_detail::MatchSimpleCompare(tagged, pred));
+}
+
+TEST(GroupingSetsTest, OutputSchemaMatchesAggregateResultTypes) {
+  // Fixed: SUM(int) was declared Double and BIT_AND/MIN(int) VarChar while
+  // the executor emits child-typed values.
+  const Schema input("t", {Column("x", ValueType::kInt64)});
+  const Expression sum = std::make_shared<AggregateExpression>(
+      AggregationType::kSum, ColumnValueExp("x"));
+  const NamedExpression sum_named("s", sum);
+  Executor child = std::make_shared<ValuesExecutor>(
+      std::vector<Row>{Row({Value(int64_t{1})})});
+  GroupingSetsExecutor gs(std::move(child), input, {}, {{}}, {sum_named});
+  const Schema& out = gs.OutputSchema();
+  ASSERT_EQ(out.ColumnCount(), 1U);
+  EXPECT_EQ(out.GetColumn(0).Type(), ValueType::kInt64);
+}
+
+TEST(ExchangeTest, NextBatchResetsReusedDestination) {
+  // Fixed: Append-only NextBatch mixed the previous batch into a reused
+  // destination chunk.
+  Executor child = std::make_shared<ValuesExecutor>(
+      std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})}),
+                       Row({Value(int64_t{3})})});
+  auto exchange = std::make_shared<ExchangeExecutor>(std::move(child),
+                                                     ExchangeType::kGather, 1);
+  exchange->MaterializePipeline();
+  const Schema schema("t", {Column("x", ValueType::kInt64)});
+  DataChunk chunk(schema, 8);
+  Executor part = exchange->GetPartitionExecutor(0);
+  size_t first = part->NextBatch(&chunk, 2);
+  EXPECT_EQ(first, 2U);
+  size_t second = part->NextBatch(&chunk, 2);
+  EXPECT_EQ(second, 1U);
+  EXPECT_EQ(chunk.Size(), 1U) << "reused chunk must not retain prior rows";
+}
+
+TEST(BatchNestedLoopJoinTest, PredicateErrorPropagatesForAntiJoin) {
+  const Schema left_schema("l", {Column("a", ValueType::kInt64)});
+  const Schema right_schema("r", {Column("b", ValueType::kInt64)});
+  Executor left =
+      std::make_shared<ValuesExecutor>(std::vector<Row>{Row({Value(1)})});
+  Executor right =
+      std::make_shared<ValuesExecutor>(std::vector<Row>{Row({Value(0)})});
+  // 1 / 0 throws; it must not be swallowed as FALSE (which would emit the
+  // anti-join row instead of erroring).
+  Expression predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("l", "a")), BinaryOperation::kDivide,
+      ColumnValueExp(ColumnName("r", "b")));
+  BatchNestedLoopJoin join(std::move(left), left_schema, std::move(right),
+                           right_schema, predicate, JoinKind::kAnti, 16);
+  Row row;
+  RowPosition rp;
+  EXPECT_THROW(
+      {
+        while (join.Next(&row, &rp)) {
+        }
+      },
+      std::runtime_error);
 }
 
 }  // namespace tinylamb

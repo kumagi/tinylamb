@@ -20,8 +20,10 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -55,8 +57,7 @@ void WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     if (!out) {
-      throw std::runtime_error("Failed to open master record: " +
-                               tmp.string());
+      throw std::runtime_error("Failed to open master record: " + tmp.string());
     }
     std::array<char, sizeof(lsn_t)> encoded{};
     SerializeU64(encoded.data(), lsn);
@@ -66,11 +67,38 @@ void WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
       throw std::runtime_error("Failed to write master record: " +
                                tmp.string());
     }
+    // The comment contract above promises a file fsync before the rename:
+    // without it a crash can leave an empty/torn master record behind even
+    // though the directory entry was synced. std::ofstream has no fd
+    // accessor, so flush through the OS handle for the same path.
+    out.close();
+#ifdef __APPLE__
+    const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
+    int rc = -1;
+    if (fd >= 0) {
+      rc = ::fcntl(fd, F_FULLFSYNC);
+      ::close(fd);
+    }
+#else
+    const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
+    int rc = -1;
+    if (fd >= 0) {
+      do {
+        rc = ::fdatasync(fd);
+      } while (rc < 0 && errno == EINTR);
+      ::close(fd);
+    }
+#endif
+    if (rc != 0) {
+      std::error_code ec;
+      std::filesystem::remove(tmp, ec);
+      throw std::runtime_error("Failed to fsync master record: " +
+                               tmp.string() + ": " + std::strerror(errno));
+    }
   }
   std::filesystem::rename(tmp, path);
-  const std::filesystem::path dir = path.has_parent_path()
-                                        ? path.parent_path()
-                                        : std::filesystem::path(".");
+  const std::filesystem::path dir =
+      path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
   const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
   if (dir_fd >= 0) {
     ::fsync(dir_fd);

@@ -18,9 +18,9 @@
 #define TINYLAMB_TRANSACTION_HPP
 
 #include <atomic>
-#include <optional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -83,6 +83,9 @@ class Transaction final {
     status_ = o.status_;
     transaction_manager_ = o.transaction_manager_;
     read_only_ = o.read_only_;
+    durability_dependence_.store(
+        o.durability_dependence_.load(std::memory_order_acquire),
+        std::memory_order_release);
     // Carry the victim flag: a Wound() issued right before the move would
     // otherwise be forgotten and the victim would keep running (and keep
     // its write intents) forever.
@@ -104,6 +107,23 @@ class Transaction final {
            status_ == TransactionStatus::kAborted;
   }
   lsn_t PrevLSN() const { return prev_lsn_; }
+
+  // D4 (docs/design.md): WAL durability and external visibility are separate.
+  // A reader that observes another transaction's committed MVCC version
+  // records that commit's durable LSN here (running maximum).  Before any
+  // result derived from it reaches the user -- including for a read-only
+  // transaction -- the commit path waits for this LSN to be durable.  A zero
+  // value means the transaction observed nothing that needs a barrier.
+  void RecordDurabilityDependence(lsn_t durable_lsn) const {
+    lsn_t cur = durability_dependence_.load(std::memory_order_relaxed);
+    while (cur < durable_lsn &&
+           !durability_dependence_.compare_exchange_weak(
+               cur, durable_lsn, std::memory_order_relaxed)) {
+    }
+  }
+  [[nodiscard]] lsn_t DurabilityDependence() const {
+    return durability_dependence_.load(std::memory_order_acquire);
+  }
 
   bool AddReadSet(const RowPosition& rp);
   bool AddWriteSet(const RowPosition& rp);
@@ -170,7 +190,12 @@ class Transaction final {
 
   lsn_t AllocatePageLog(page_id_t page_id, PageType new_page_type);
 
-  lsn_t DestroyPageLog(page_id_t page_id);
+  // D3 (docs/design.md): destroy records carry the old page type and, when
+  // the page held rows, a full body image so undo restores an aborted
+  // destroy exactly.
+  lsn_t DestroyPageLog(page_id_t page_id,
+                       PageType old_page_type = PageType::kUnknown,
+                       std::string old_page_body = {});
 
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.
@@ -249,9 +274,11 @@ class Transaction final {
   // A read-only query may hand page morsels to multiple scan workers.  The
   // version cache and read set are transaction-local, so guard them while
   // preserving a single MVCC snapshot across those workers.
-  std::unique_ptr<std::mutex> read_state_mutex_{
-      std::make_unique<std::mutex>()};
+  std::unique_ptr<std::mutex> read_state_mutex_{std::make_unique<std::mutex>()};
   lsn_t prev_lsn_{};
+  // D4: highest dependency commit LSN observed by this transaction (see
+  // RecordDurabilityDependence).  Updated from const read paths.
+  mutable std::atomic<lsn_t> durability_dependence_{0};
   TransactionStatus status_ = TransactionStatus::kUnknown;
   bool read_only_{false};
 

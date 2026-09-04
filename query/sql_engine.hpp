@@ -6,13 +6,13 @@
 #ifndef TINYLAMB_SQL_ENGINE_HPP
 #define TINYLAMB_SQL_ENGINE_HPP
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
-#include <cstdint>
 #include <vector>
 
 #include "common/status_or.hpp"
@@ -24,6 +24,7 @@ namespace tinylamb {
 
 class Database;
 class Statement;
+class SelectStatement;
 class TransactionContext;
 enum class StatementType : uint8_t;
 
@@ -98,6 +99,17 @@ class SqlEngine {
  private:
   StatusOr<Executor> PrepareStatement(TransactionContext& ctx,
                                       std::unique_ptr<Statement> statement);
+
+  // Cascades-route set operations: each operand runs through normal statement
+  // routing (recursively) and the operands combine at the executor level with
+  // INTERSECT binding tighter than UNION/EXCEPT.
+  StatusOr<Executor> ExecuteSetOperation(const SelectStatement& select,
+                                         TransactionContext& ctx);
+
+  // GROUP BY / HAVING / aggregate routing: optimizes the FROM + WHERE core
+  // through Cascades and wraps it in a GroupByPlan finish node.
+  StatusOr<Executor> ExecuteGroupedSelect(const SelectStatement& select,
+                                          TransactionContext& ctx);
 
   // Phase 2-1 compiled-plan cache. Returns a served Executor on a hit
   // (nullopt = miss or any doubt; callers fall back to the legacy path).

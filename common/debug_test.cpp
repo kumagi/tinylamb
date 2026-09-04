@@ -14,17 +14,17 @@
  * limitations under the License.
  */
 
-#include "common/constants.hpp"
 #include "common/debug.hpp"
-#include "common/decoder.hpp"
-#include "common/encoder.hpp"
-#include "common/status_or.hpp"
 
 #include <sstream>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
+#include "common/status_or.hpp"
 #include "gtest/gtest.h"
 
 namespace tinylamb {
@@ -71,7 +71,13 @@ TEST(DebugTest, OmittedString_WhenLongerThanLimit_TruncatesMiddleWithEllipsis) {
   EXPECT_EQ(out.substr(out.size() - 8), long_str.substr(long_str.size() - 8));
 }
 
-TEST(DebugTest, OmittedString_WhenShorterThanEightBytes_DoesNotThrow) {  // Fixed: the old tail slice `substr(len - 8)` underflowed size_t and threw
+TEST(
+    DebugTest,
+    OmittedString_WhenShorterThanEightBytes_DoesNotThrow) {  // Fixed: the old
+                                                             // tail slice
+                                                             // `substr(len -
+                                                             // 8)` underflowed
+                                                             // size_t and threw
   // std::out_of_range whenever limit < size < 8 (e.g. a 6-byte index key in
   // Dump output).
   EXPECT_NO_THROW(std::ignore = OmittedString("hello", 4));
@@ -146,7 +152,8 @@ TEST(DebugTest, EncoderDecoder_WithDiverseTypes_RoundTripsAccurately) {
   const std::vector<int64_t> vec = {1, 2, 3, 4, 5};
   const std::pair<std::string, int64_t> pair_val = {"key", 100};
 
-  enc << u8 << u32 << slot << i64 << u64 << d << vt << b << std::string_view(str) << vec << pair_val;
+  enc << u8 << u32 << slot << i64 << u64 << d << vt << b
+      << std::string_view(str) << vec << pair_val;
 
   Decoder dec(ss);
   uint8_t r_u8 = 0;
@@ -161,7 +168,8 @@ TEST(DebugTest, EncoderDecoder_WithDiverseTypes_RoundTripsAccurately) {
   std::vector<int64_t> r_vec;
   std::pair<std::string, int64_t> r_pair;
 
-  dec >> r_u8 >> r_u32 >> r_slot >> r_i64 >> r_u64 >> r_d >> r_vt >> r_b >> r_str >> r_vec >> r_pair;
+  dec >> r_u8 >> r_u32 >> r_slot >> r_i64 >> r_u64 >> r_d >> r_vt >> r_b >>
+      r_str >> r_vec >> r_pair;
 
   EXPECT_EQ(r_u8, u8);
   EXPECT_EQ(r_u32, u32);
@@ -176,7 +184,10 @@ TEST(DebugTest, EncoderDecoder_WithDiverseTypes_RoundTripsAccurately) {
   EXPECT_EQ(r_pair, pair_val);
 
   std::stringstream ss_trunc;
-  ss_trunc.write("\x05\x00" "ab", 4);
+  ss_trunc.write(
+      "\x05\x00"
+      "ab",
+      4);
   Decoder dec_trunc(ss_trunc);
   std::string r_trunc;
   dec_trunc >> r_trunc;
@@ -202,6 +213,16 @@ TEST(DecoderTest, Bool_NonCanonicalByte_NormalizesToTrue) {
   EXPECT_FALSE(v_zero);
 }
 
+TEST(DecoderTest, ValueType_OutOfRangeByte_ThrowsInsteadOfPoisoning) {
+  // Fixed: the raw byte became the ValueType enum without validation, so a
+  // corrupted stream materialized an invalid discriminant.
+  std::stringstream ss;
+  ss.put(static_cast<char>(99));
+  Decoder dec(ss);
+  ValueType v = ValueType::kNull;
+  EXPECT_THROW(dec >> v, std::runtime_error);
+}
+
 TEST(StatusOrTest, MoveValue_SecondCallThrows) {
   // Fixed: MoveValue() left the optional engaged, so a second call returned a
   // second (moved-from) copy instead of throwing as documented.
@@ -221,5 +242,3 @@ TEST(StatusOrTest, Value_OnFailedStatus_Throws) {
 }
 
 }  // namespace tinylamb
-
-

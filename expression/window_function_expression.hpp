@@ -71,17 +71,16 @@ class WindowFunctionCallExpression : public ExpressionBase {
   }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
-  [[nodiscard]] tinylamb::Type ResultType(
-      const Schema& schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override { o << ToString(); }
 };
 
-Expression WindowFunctionCallExp(
-    std::string function, std::vector<Expression> args,
-    std::vector<Expression> partition_by,
-    std::vector<WindowOrderTerm> order_by);
+Expression WindowFunctionCallExp(std::string function,
+                                 std::vector<Expression> args,
+                                 std::vector<Expression> partition_by,
+                                 std::vector<WindowOrderTerm> order_by);
 
 }  // namespace tinylamb
 

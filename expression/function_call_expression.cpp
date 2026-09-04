@@ -28,26 +28,24 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
-#include <vector>
 #include <utility>
-
-#include "expression/cast_expression.hpp"
-#include "expression/constant_value.hpp"
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
-#include "expression/evaluation_context.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/evaluation_context.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/sql_udf.hpp"
 #include "type/column_name.hpp"
+#include "type/date.hpp"
 #include "type/function.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
-#include "type/date.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -71,39 +69,59 @@ struct CivilTime {
 };
 
 bool ParseCivilTime(std::string_view s, CivilTime* ct) {
-  if (s.empty()) { return false; }
+  if (s.empty()) {
+    return false;
+  }
   const std::string input(s);
   int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
   bool matched = false;
-  if (sscanf(input.c_str(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) >= 3 ||
-      sscanf(input.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) >= 3) {
-    ct->year = Y; ct->month = M; ct->day = D;
-    ct->hour = h; ct->minute = m; ct->second = sec;
+  if (sscanf(input.c_str(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) >=
+          3 ||
+      sscanf(input.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) >=
+          3) {
+    ct->year = Y;
+    ct->month = M;
+    ct->day = D;
+    ct->hour = h;
+    ct->minute = m;
+    ct->second = sec;
     ct->subsecond_nanos = 0;
     size_t dot = s.find('.');
     if (dot != std::string_view::npos) {
       size_t end_digits = dot + 1;
-      while (end_digits < s.size() && s[end_digits] >= '0' && s[end_digits] <= '9') {
+      while (end_digits < s.size() && s[end_digits] >= '0' &&
+             s[end_digits] <= '9') {
         ++end_digits;
       }
       std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
-      while (frac_str.size() < 9) { frac_str.push_back('0'); }
-      if (frac_str.size() > 9) { frac_str = frac_str.substr(0, 9); }
+      while (frac_str.size() < 9) {
+        frac_str.push_back('0');
+      }
+      if (frac_str.size() > 9) {
+        frac_str = frac_str.substr(0, 9);
+      }
       ct->subsecond_nanos = std::stoll(frac_str);
     }
     matched = true;
   } else if (sscanf(input.c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
-    ct->hour = h; ct->minute = m; ct->second = sec;
+    ct->hour = h;
+    ct->minute = m;
+    ct->second = sec;
     ct->subsecond_nanos = 0;
     size_t dot = s.find('.');
     if (dot != std::string_view::npos) {
       size_t end_digits = dot + 1;
-      while (end_digits < s.size() && s[end_digits] >= '0' && s[end_digits] <= '9') {
+      while (end_digits < s.size() && s[end_digits] >= '0' &&
+             s[end_digits] <= '9') {
         ++end_digits;
       }
       std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
-      while (frac_str.size() < 9) { frac_str.push_back('0'); }
-      if (frac_str.size() > 9) { frac_str = frac_str.substr(0, 9); }
+      while (frac_str.size() < 9) {
+        frac_str.push_back('0');
+      }
+      if (frac_str.size() > 9) {
+        frac_str = frac_str.substr(0, 9);
+      }
       ct->subsecond_nanos = std::stoll(frac_str);
     }
     matched = true;
@@ -118,10 +136,12 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       if (ct->hour >= 24) {
         int extra_days = ct->hour / 24;
         ct->hour %= 24;
-        std::chrono::year_month_day ymd{std::chrono::year{ct->year},
-                                        std::chrono::month{static_cast<unsigned>(ct->month)},
-                                        std::chrono::day{static_cast<unsigned>(ct->day)}};
-        int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
+        std::chrono::year_month_day ymd{
+            std::chrono::year{ct->year},
+            std::chrono::month{static_cast<unsigned>(ct->month)},
+            std::chrono::day{static_cast<unsigned>(ct->day)}};
+        int64_t days =
+            std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
         std::chrono::sys_days new_sd{std::chrono::days{days}};
         std::chrono::year_month_day new_ymd{new_sd};
         ct->year = int(new_ymd.year());
@@ -146,10 +166,12 @@ CivilTime ShiftCivilTimeHours(const CivilTime& ct, int offset_hours) {
     res.hour = (total_hours % 24 + 24) % 24;
   }
   if (day_diff != 0) {
-    std::chrono::year_month_day ymd{std::chrono::year{res.year},
-                                    std::chrono::month{static_cast<unsigned>(res.month)},
-                                    std::chrono::day{static_cast<unsigned>(res.day)}};
-    int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count() + day_diff;
+    std::chrono::year_month_day ymd{
+        std::chrono::year{res.year},
+        std::chrono::month{static_cast<unsigned>(res.month)},
+        std::chrono::day{static_cast<unsigned>(res.day)}};
+    int64_t days =
+        std::chrono::sys_days{ymd}.time_since_epoch().count() + day_diff;
     std::chrono::sys_days new_sd{std::chrono::days{days}};
     std::chrono::year_month_day new_ymd{new_sd};
     res.year = int(new_ymd.year());
@@ -159,10 +181,14 @@ CivilTime ShiftCivilTimeHours(const CivilTime& ct, int offset_hours) {
   return res;
 }
 
-int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, int default_offset = 0) {
-  if (tz_str.empty()) { return default_offset; }
-  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" || tz_str == "gmt" ||
-      tz_str == "Z" || tz_str == "z" || tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
+int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
+                        int default_offset = 0) {
+  if (tz_str.empty()) {
+    return default_offset;
+  }
+  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" ||
+      tz_str == "gmt" || tz_str == "Z" || tz_str == "z" ||
+      tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
     return 0;
   }
   if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
@@ -193,7 +219,9 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, 
     return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
   }
   std::string zone_name(tz_str);
-  if (zone_name == "NZ-CHAT") { zone_name = "Pacific/Chatham"; }
+  if (zone_name == "NZ-CHAT") {
+    zone_name = "Pacific/Chatham";
+  }
   try {
     const auto* zone = std::chrono::locate_zone(zone_name);
     if (zone) {
@@ -203,13 +231,15 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, 
       int h = ct ? ct->hour : 0;
       int min = ct ? ct->minute : 0;
       int s = ct ? ct->second : 0;
-      if (y < 1970) { y = 1970; }
-      std::chrono::year_month_day ymd{std::chrono::year{y},
-                                      std::chrono::month{static_cast<unsigned>(mon)},
-                                      std::chrono::day{static_cast<unsigned>(d)}};
+      if (y < 1970) {
+        y = 1970;
+      }
+      std::chrono::year_month_day ymd{
+          std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(mon)},
+          std::chrono::day{static_cast<unsigned>(d)}};
       std::chrono::local_days loc_d{ymd};
-      auto loc_tp = loc_d + std::chrono::hours{h} +
-                    std::chrono::minutes{min} + std::chrono::seconds{s};
+      auto loc_tp = loc_d + std::chrono::hours{h} + std::chrono::minutes{min} +
+                    std::chrono::seconds{s};
       auto loc_info = zone->get_info(loc_tp);
       return static_cast<int>(loc_info.first.offset.count());
     }
@@ -241,18 +271,21 @@ std::string FormatCivilTime(const CivilTime& ct) {
   char buf[64];
   if (ct.subsecond_nanos != 0) {
     if (ct.subsecond_nanos % 1000000 == 0) {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
-               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld", ct.year,
+               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+               ct.subsecond_nanos / 1000000);
     } else if (ct.subsecond_nanos % 1000 == 0) {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
-               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000);
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld", ct.year,
+               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+               ct.subsecond_nanos / 1000);
     } else {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%09ld",
-               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%09ld", ct.year,
+               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+               ct.subsecond_nanos);
     }
   } else {
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second);
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", ct.year,
+             ct.month, ct.day, ct.hour, ct.minute, ct.second);
   }
   return std::string(buf);
 }
@@ -292,9 +325,15 @@ Value ProtoTextScalar(std::string_view raw) {
   while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) {
     raw.remove_suffix(1);
   }
-  if (raw.empty() || raw == "null") { return {}; }
-  if (raw == "true") { return Value(int64_t{1}); }
-  if (raw == "false") { return Value(int64_t{0}); }
+  if (raw.empty() || raw == "null") {
+    return {};
+  }
+  if (raw == "true") {
+    return Value(int64_t{1});
+  }
+  if (raw == "false") {
+    return Value(int64_t{0});
+  }
   if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
     return Value(std::string(raw.substr(1, raw.size() - 2)));
   }
@@ -333,10 +372,14 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
            std::isspace(static_cast<unsigned char>(text[i]))) {
       ++i;
     }
-    if (i >= text.size()) { break; }
+    if (i >= text.size()) {
+      break;
+    }
     if (text[i] == '#') {
       // Comment token: skip through end of line.
-      while (i < text.size() && text[i] != '\n') { ++i; }
+      while (i < text.size() && text[i] != '\n') {
+        ++i;
+      }
       continue;
     }
     if (text[i] == '{' || text[i] == '}') {
@@ -360,7 +403,9 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
       for (; j < text.size(); ++j) {
         const char c = text[j];
         if (str) {
-          if (c == '\\' && j + 1 < text.size()) { ++j; } else if (c == '"') {
+          if (c == '\\' && j + 1 < text.size()) {
+            ++j;
+          } else if (c == '"') {
             str = false;
           }
           continue;
@@ -370,11 +415,12 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
         } else if (c == '{') {
           ++nest;
         } else if (c == '}') {
-          if (--nest == 0) { break; }
+          if (--nest == 0) {
+            break;
+          }
         }
       }
-      std::string_view body =
-          text.substr(i + 1, j > i + 1 ? j - i - 1 : 0);
+      std::string_view body = text.substr(i + 1, j > i + 1 ? j - i - 1 : 0);
       while (!body.empty() &&
              std::isspace(static_cast<unsigned char>(body.front()))) {
         body.remove_prefix(1);
@@ -394,7 +440,9 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
       }
       continue;
     }
-    if (i >= text.size() || text[i] != ':') { break; }
+    if (i >= text.size() || text[i] != ':') {
+      break;
+    }
     ++i;
     while (i < text.size() &&
            std::isspace(static_cast<unsigned char>(text[i]))) {
@@ -405,7 +453,9 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
     if (i < text.size() && text[i] == '"') {
       ++i;
       while (i < text.size() && text[i] != '"') {
-        if (text[i] == '\\' && i + 1 < text.size()) { ++i; }
+        if (text[i] == '\\' && i + 1 < text.size()) {
+          ++i;
+        }
         ++i;
       }
       value_end = std::min(text.size(), i + 1);
@@ -423,11 +473,13 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
                      return std::tolower(static_cast<unsigned char>(a)) ==
                             std::tolower(static_cast<unsigned char>(b));
                    })) {
-      matches.push_back(ProtoTextScalar(
-          text.substr(value_begin, value_end - value_begin)));
+      matches.push_back(
+          ProtoTextScalar(text.substr(value_begin, value_end - value_begin)));
     }
   }
-  if (matches.empty()) { return false; }
+  if (matches.empty()) {
+    return false;
+  }
   if (matches.size() == 1) {
     *out = std::move(matches[0]);
   } else {
@@ -473,9 +525,8 @@ Value ExecuteFunction(const std::string& name,
     if (!values[0].IsNull()) {
       Row dummy_row;
       Schema dummy_schema;
-      Expression checked =
-          CastExpressionExp(ConstantValueExp(values[0]), raw_str(values[1]),
-                            false);
+      Expression checked = CastExpressionExp(ConstantValueExp(values[0]),
+                                             raw_str(values[1]), false);
       // Full CAST validation against the enum registry; throws on unknown
       // members or out-of-range ordinals.
       static_cast<void>(checked->Evaluate(dummy_row, dummy_schema));
@@ -484,8 +535,7 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "__pipe_concat") {
     if (values.size() != 2 || !values[0].IsArray()) {
-      throw std::runtime_error(
-          "__pipe_concat requires an array and separator");
+      throw std::runtime_error("__pipe_concat requires an array and separator");
     }
     const std::string separator = raw_str(values[1]);
     struct Pair {
@@ -494,19 +544,26 @@ Value ExecuteFunction(const std::string& name,
     };
     std::vector<Pair> pairs;
     for (const Value& element : values[0].ArrayElements()) {
-      if (element.IsNull()) { continue; }
+      if (element.IsNull()) {
+        continue;
+      }
       const std::string text = raw_str(element);
       Value a;
       Value b;
-      const std::string body =
-          text.size() >= 2 && text.front() == '{'
-              ? text.substr(1, text.size() - 2)
-              : text;
+      const std::string body = text.size() >= 2 && text.front() == '{'
+                                   ? text.substr(1, text.size() - 2)
+                                   : text;
       for (const auto& [key, member] : SplitJsonObjectMembers(body)) {
         Value parsed;
-        if (!JsonTextToValue(member, &parsed)) { continue; }
-        if (IdentifierEquals(key, "a")) { a = std::move(parsed); }
-        if (IdentifierEquals(key, "b")) { b = std::move(parsed); }
+        if (!JsonTextToValue(member, &parsed)) {
+          continue;
+        }
+        if (IdentifierEquals(key, "a")) {
+          a = std::move(parsed);
+        }
+        if (IdentifierEquals(key, "b")) {
+          b = std::move(parsed);
+        }
       }
       pairs.push_back({raw_str(a), raw_str(b)});
     }
@@ -515,7 +572,9 @@ Value ExecuteFunction(const std::string& name,
     });
     std::string result;
     for (const Pair& pair : pairs) {
-      if (!result.empty()) { result += separator; }
+      if (!result.empty()) {
+        result += separator;
+      }
       result += pair.a + "," + pair.b;
     }
     return Value(std::move(result));
@@ -530,7 +589,9 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 2) {
       throw std::runtime_error("get_field requires 2 arguments");
     }
-    if (values[0].IsNull()) { return {}; }
+    if (values[0].IsNull()) {
+      return {};
+    }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
     // Proto TEXT payloads resolve through the shared extractor (defaults,
@@ -560,7 +621,9 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 2) {
       throw std::runtime_error("__get_field_safe requires 2 arguments");
     }
-    if (values[0].IsNull()) { return {}; }
+    if (values[0].IsNull()) {
+      return {};
+    }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
     // Proto field reads need scalar defaults even when an empty proto is
@@ -569,14 +632,15 @@ Value ExecuteFunction(const std::string& name,
     if (TryProtoTextGetField(object, field, &proto_field)) {
       return proto_field;
     }
-    if (object.size() >= 2 && object.front() == '{' &&
-        object.back() == '}') {
+    if (object.size() >= 2 && object.front() == '{' && object.back() == '}') {
       const auto members =
           SplitJsonObjectMembers(object.substr(1, object.size() - 2));
       for (const auto& [key, text] : members) {
         if (IdentifierEquals(key, field)) {
           Value parsed;
-          if (!JsonTextToValue(text, &parsed)) { return {}; }
+          if (!JsonTextToValue(text, &parsed)) {
+            return {};
+          }
           return parsed;
         }
       }
@@ -585,7 +649,9 @@ Value ExecuteFunction(const std::string& name,
       // object exposes its only value positionally.
       if (members.size() == 1) {
         Value parsed;
-        if (!JsonTextToValue(members.front().second, &parsed)) { return {}; }
+        if (!JsonTextToValue(members.front().second, &parsed)) {
+          return {};
+        }
         return parsed;
       }
     }
@@ -646,14 +712,18 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "coalesce") {
     for (const auto& val : values) {
-      if (!val.IsNull()) { return val; }
+      if (!val.IsNull()) {
+        return val;
+      }
     }
     return {};
   }
   if (name == "concat") {
     std::string result;
     for (const auto& value : values) {
-      if (value.IsNull()) { return {}; }
+      if (value.IsNull()) {
+        return {};
+      }
       if (value.type != ValueType::kVarChar) {
         throw std::runtime_error("CONCAT currently requires string arguments");
       }
@@ -665,7 +735,9 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 1) {
       throw std::runtime_error("UPPER requires 1 argument");
     }
-    if (values[0].IsNull()) { return {}; }
+    if (values[0].IsNull()) {
+      return {};
+    }
     std::string s = raw_str(values[0]);
     for (char& c : s) {
       c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -676,7 +748,9 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 1) {
       throw std::runtime_error("LOWER requires 1 argument");
     }
-    if (values[0].IsNull()) { return {}; }
+    if (values[0].IsNull()) {
+      return {};
+    }
     std::string s = raw_str(values[0]);
     for (char& c : s) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -687,7 +761,9 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 1) {
       throw std::runtime_error("ABS requires 1 argument");
     }
-    if (values[0].IsNull()) { return {}; }
+    if (values[0].IsNull()) {
+      return {};
+    }
     if (values[0].type == ValueType::kInt64) {
       return Value(std::abs(values[0].value.int_value));
     }
@@ -700,7 +776,9 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 1) {
       throw std::runtime_error("SQRT requires 1 argument");
     }
-    if (values[0].IsNull()) { return {}; }
+    if (values[0].IsNull()) {
+      return {};
+    }
     double val = values[0].type == ValueType::kInt64
                      ? static_cast<double>(values[0].value.int_value)
                      : (values[0].type == ValueType::kDouble
@@ -737,7 +815,9 @@ Value ExecuteFunction(const std::string& name,
     size_t begin = 0;
     if (start < 0) {
       const size_t back = static_cast<size_t>(-start);
-      if (back >= size) { return Value(std::string()); }
+      if (back >= size) {
+        return Value(std::string());
+      }
       begin = size - back;
     } else {
       begin = start <= 1 ? 0 : static_cast<size_t>(start - 1);
@@ -746,23 +826,28 @@ Value ExecuteFunction(const std::string& name,
                               ? static_cast<size_t>(values[2].value.int_value)
                               : std::string::npos;
 
-    if (begin >= size) { return Value(std::string()); }
+    if (begin >= size) {
+      return Value(std::string());
+    }
     return Value(input.substr(begin, length));
   }
-  if (name == "length" || name == "char_length" ||
-      name == "character_length" || name == "octet_length" ||
-      name == "byte_length") {
+  if (name == "length" || name == "char_length" || name == "character_length" ||
+      name == "octet_length" || name == "byte_length") {
     if (values.size() != 1) {
       throw std::runtime_error(name + " requires 1 argument");
     }
-    if (values[0].IsNull()) { return {}; }
+    if (values[0].IsNull()) {
+      return {};
+    }
     return Value(static_cast<int64_t>(raw_str(values[0]).size()));
   }
   if (name == "instr" || name == "strpos") {
     if (values.size() != 2) {
       throw std::runtime_error(name + " requires 2 arguments");
     }
-    if (values[0].IsNull() || values[1].IsNull()) { return {}; }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return {};
+    }
     const std::string hay = raw_str(values[0]);
     const std::string needle = raw_str(values[1]);
     const size_t pos = hay.find(needle);
@@ -815,7 +900,9 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 1) {
       throw std::runtime_error("EXTRACT requires one argument");
     }
-    if (values[0].IsNull()) { return {}; }
+    if (values[0].IsNull()) {
+      return {};
+    }
     if (values[0].type != ValueType::kDate &&
         values[0].type != ValueType::kVarChar) {
       throw std::runtime_error("EXTRACT requires DATE or STRING");
@@ -823,7 +910,9 @@ Value ExecuteFunction(const std::string& name,
     const std::string date = values[0].type == ValueType::kDate
                                  ? values[0].AsString()
                                  : std::string(values[0].value.varchar_value);
-    if (date.size() < 10) { throw std::runtime_error("invalid DATE value"); }
+    if (date.size() < 10) {
+      throw std::runtime_error("invalid DATE value");
+    }
     int64_t part = 0;
     try {
       if (name == "extract_year") {
@@ -851,8 +940,12 @@ Value ExecuteFunction(const std::string& name,
     return Value(output.str());
   }
   if (name == "current_datetime") {
-    if (values.size() > 1) { throw std::runtime_error("CURRENT_DATETIME takes at most 1 argument"); }
-    if (values.size() == 1 && values[0].IsNull()) { return {}; }
+    if (values.size() > 1) {
+      throw std::runtime_error("CURRENT_DATETIME takes at most 1 argument");
+    }
+    if (values.size() == 1 && values[0].IsNull()) {
+      return {};
+    }
     int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
     if (values.size() == 1 && !values[0].IsNull()) {
       std::string tz_str = raw_str(values[0]);
@@ -865,13 +958,16 @@ Value ExecuteFunction(const std::string& name,
     struct tm t = {};
     gmtime_r(&now, &t);
     CivilTime current{t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
-                      t.tm_min,
-                      t.tm_sec, 0};
+                      t.tm_min,         t.tm_sec,     0};
     return Value(FormatCivilTime(current));
   }
   if (name == "current_date") {
-    if (values.size() > 1) { throw std::runtime_error("CURRENT_DATE takes at most 1 argument"); }
-    if (values.size() == 1 && values[0].IsNull()) { return {}; }
+    if (values.size() > 1) {
+      throw std::runtime_error("CURRENT_DATE takes at most 1 argument");
+    }
+    if (values.size() == 1 && values[0].IsNull()) {
+      return {};
+    }
     int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
     if (values.size() == 1 && !values[0].IsNull()) {
       std::string tz_str = raw_str(values[0]);
@@ -883,14 +979,20 @@ Value ExecuteFunction(const std::string& name,
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
     gmtime_r(&now, &t);
-    std::chrono::year_month_day ymd{std::chrono::year{t.tm_year + 1900},
-                                    std::chrono::month{static_cast<unsigned>(t.tm_mon + 1)},
-                                    std::chrono::day{static_cast<unsigned>(t.tm_mday)}};
-    return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+    std::chrono::year_month_day ymd{
+        std::chrono::year{t.tm_year + 1900},
+        std::chrono::month{static_cast<unsigned>(t.tm_mon + 1)},
+        std::chrono::day{static_cast<unsigned>(t.tm_mday)}};
+    return Value::DateFromDays(
+        std::chrono::sys_days{ymd}.time_since_epoch().count());
   }
   if (name == "string") {
-    if (values.empty() || values.size() > 2) { throw std::runtime_error("STRING requires 1 or 2 arguments"); }
-    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) { return {}; }
+    if (values.empty() || values.size() > 2) {
+      throw std::runtime_error("STRING requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
+      return {};
+    }
     if (values.size() == 2) {
       CivilTime ct = ValueToCivilTime(values[0]);
       std::string tz_str = raw_str(values[1]);
@@ -919,16 +1021,21 @@ Value ExecuteFunction(const std::string& name,
     }
     return Value(raw_str(values[0]));
   }
-  if (name == "format_timestamp" || name == "format_datetime" || name == "format_date") {
+  if (name == "format_timestamp" || name == "format_datetime" ||
+      name == "format_date") {
     if (values.size() < 2 || values.size() > 3) {
       throw std::runtime_error(name + " takes 2 or 3 arguments");
     }
-    if (values[0].IsNull() || values[1].IsNull()) { return {}; }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return {};
+    }
     std::string fmt = raw_str(values[0]);
     CivilTime ct = ValueToCivilTime(values[1]);
     int tz_offset_sec = 0;
     if (values.size() == 3) {
-      if (values[2].IsNull()) { return {}; }
+      if (values[2].IsNull()) {
+        return {};
+      }
       std::string tz_str = raw_str(values[2]);
       if (tz_str.empty() || tz_str == "invalid_time_zone") {
         throw std::runtime_error("invalid timezone: " + tz_str);
@@ -960,10 +1067,8 @@ Value ExecuteFunction(const std::string& name,
     tm.tm_sec = ct.second;
     timegm(&tm);
     char buf[128];
-    const auto format_time = static_cast<size_t (*)(char*, size_t,
-                                                     const char*, const struct tm*)
-                                  noexcept>(
-        &std::strftime);
+    const auto format_time = static_cast<size_t (*)(
+        char*, size_t, const char*, const struct tm*) noexcept>(&std::strftime);
     format_time(buf, sizeof(buf), fmt.c_str(), &tm);
     return Value(std::string(buf));
   }
@@ -971,11 +1076,16 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() < 2 || values.size() > 3) {
       throw std::runtime_error("PARSE_TIMESTAMP requires 2 or 3 arguments");
     }
-    if (values[0].IsNull() || values[1].IsNull()) { return {}; }
-    if (values.size() == 3 && values[2].IsNull()) { return {}; }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return {};
+    }
+    if (values.size() == 3 && values[2].IsNull()) {
+      return {};
+    }
     std::string fmt = raw_str(values[0]);
     std::string input = raw_str(values[1]);
-    int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr, -8 * 3600);
+    int tz_offset_sec =
+        ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr, -8 * 3600);
     if (values.size() == 3) {
       std::string tz_str = raw_str(values[2]);
       if (tz_str.empty() || tz_str == "invalid_time_zone") {
@@ -985,7 +1095,8 @@ Value ExecuteFunction(const std::string& name,
     }
     struct tm tm = {};
     tm.tm_year = 100;
-    tm.tm_mon = 0; tm.tm_mday = 1;
+    tm.tm_mon = 0;
+    tm.tm_mday = 1;
     char* parsed_end = strptime(input.c_str(), fmt.c_str(), &tm);
     if (parsed_end == nullptr) {
       throw std::runtime_error("PARSE_TIMESTAMP failed for: " + input);
@@ -1064,7 +1175,9 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 2) {
       throw std::runtime_error("__value_table_proto requires two arguments");
     }
-    if (values[1].IsNull()) { return {}; }
+    if (values[1].IsNull()) {
+      return {};
+    }
     const std::string type_name = raw_str(values[0]);
     if (type_name.find("TestExtraPB") == std::string::npos) {
       return values[1];
@@ -1083,7 +1196,9 @@ Value ExecuteFunction(const std::string& name,
       throw std::runtime_error(
           "__value_table_proto_existing requires two arguments");
     }
-    if (values[1].IsNull()) { return {}; }
+    if (values[1].IsNull()) {
+      return {};
+    }
     const std::string type_name = raw_str(values[0]);
     if (type_name.find("TestExtraPB") == std::string::npos) {
       return values[1];
@@ -1091,7 +1206,9 @@ Value ExecuteFunction(const std::string& name,
     const std::string payload = raw_str(values[1]);
     std::vector<std::pair<std::string, Value>> fields;
     for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
-      if (!ProtoTextHasField(payload, field)) { continue; }
+      if (!ProtoTextHasField(payload, field)) {
+        continue;
+      }
       Value value;
       if (TryProtoTextGetField(payload, field, &value)) {
         fields.emplace_back(field, std::move(value));
@@ -1118,15 +1235,12 @@ Value ExecuteFunction(const std::string& name,
         start = dot + 1;
       }
     }
-    const std::string type_name =
-        InferProtoTypeName(values[0].IsNull() ? std::string_view()
-                                              : raw_str(values[0]),
-                           path);
+    const std::string type_name = InferProtoTypeName(
+        values[0].IsNull() ? std::string_view() : raw_str(values[0]), path);
     if (values[0].IsNull()) {
-      throw std::runtime_error("Cannot set field of NULL `" +
-                               (type_name.empty() ? std::string("PROTO")
-                                                  : type_name) +
-                               "`");
+      throw std::runtime_error(
+          "Cannot set field of NULL `" +
+          (type_name.empty() ? std::string("PROTO") : type_name) + "`");
     }
     const std::string payload = raw_str(values[0]);
     auto rewritten = ProtoTextSetField(payload, path, values[2], type_name);
@@ -1179,6 +1293,28 @@ Value ExecuteFunction(const std::string& name,
     return Value(floor_div(*nanos, 1000LL));
   }
 
+  // IS_NAN / IS_INF: the AST ground truth must implement every scalar the
+  // scope-based relational evaluator supports (expression_eval.cpp), or a
+  // plan-shape change that routes the predicate through this evaluator turns
+  // a working query into "not yet executable".
+  if (name == "is_inf" || name == "is_nan") {
+    if (values.size() != 1) {
+      return {};
+    }
+    const Value& arg = values[0];
+    if (arg.IsNull()) {
+      return {};
+    }
+    if (arg.type != ValueType::kDouble) {
+      return Value(int64_t{0});
+    }
+    const double v = arg.value.double_value;
+    if (name == "is_inf") {
+      return Value(std::isinf(v) ? int64_t{1} : int64_t{0});
+    }
+    return Value(std::isnan(v) ? int64_t{1} : int64_t{0});
+  }
+
   // SQL scalar UDFs registered by CREATE FUNCTION: evaluate the body against
   // a synthetic single-row scope holding the argument values.
   if (std::optional<SqlScalarFunction> udf = FindSqlScalarFunction(name)) {
@@ -1190,7 +1326,6 @@ Value ExecuteFunction(const std::string& name,
 }
 
 }  // namespace
-
 
 // ---- Struct (JSON text) helpers shared by the evaluators and the DML
 // mapping. Struct values are stored as flat JSON objects:
@@ -1212,9 +1347,13 @@ bool IdentifierEquals(std::string_view left, std::string_view right) {
 
 std::string TrimJson(std::string s) {
   size_t b = 0;
-  while (b < s.size() && IsJsonSpace(s[b])) { ++b; }
+  while (b < s.size() && IsJsonSpace(s[b])) {
+    ++b;
+  }
   size_t e = s.size();
-  while (e > b && IsJsonSpace(s[e - 1])) { --e; }
+  while (e > b && IsJsonSpace(s[e - 1])) {
+    --e;
+  }
   return s.substr(b, e - b);
 }
 
@@ -1223,16 +1362,25 @@ std::string EscapeJsonText(std::string_view text) {
   escaped.reserve(text.size());
   for (const char c : text) {
     switch (c) {
-      case '"': escaped += "\\\""; break;
-      case '\\': escaped += "\\\\"; break;
-      case '\n': escaped += "\\n"; break;
-      case '\t': escaped += "\\t"; break;
-      case '\r': escaped += "\\r"; break;
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
       default:
         if (static_cast<unsigned char>(c) < 0x20) {
           char buf[8];
-          snprintf(buf, sizeof(buf), "\\u%04x",
-                   static_cast<unsigned char>(c));
+          snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
           escaped += buf;
         } else {
           escaped.push_back(c);
@@ -1252,7 +1400,9 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
   std::string current;
   auto flush = [&]() {
     const std::string member = TrimJson(current);
-    if (member.empty()) { return; }
+    if (member.empty()) {
+      return;
+    }
     size_t colon = std::string::npos;
     int d2 = 0;
     bool s2 = false;
@@ -1260,14 +1410,24 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
     for (size_t i = 0; i < member.size(); ++i) {
       const char c = member[i];
       if (s2) {
-        if (c == '\\' && i + 1 < member.size()) { ++i; }
-        else if (c == q2) { s2 = false; }
+        if (c == '\\' && i + 1 < member.size()) {
+          ++i;
+        } else if (c == q2) {
+          s2 = false;
+        }
         continue;
       }
-      if (c == '"' || c == '\'') { s2 = true; q2 = c; }
-      else if (c == '{' || c == '[') { ++d2; }
-      else if (c == '}' || c == ']') { --d2; }
-      else if (c == ':' && d2 == 0) { colon = i; break; }
+      if (c == '"' || c == '\'') {
+        s2 = true;
+        q2 = c;
+      } else if (c == '{' || c == '[') {
+        ++d2;
+      } else if (c == '}' || c == ']') {
+        --d2;
+      } else if (c == ':' && d2 == 0) {
+        colon = i;
+        break;
+      }
     }
     std::string key =
         colon == std::string::npos ? member : member.substr(0, colon);
@@ -1313,21 +1473,37 @@ std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
 
 bool JsonTextToValue(const std::string& text, Value* parsed) {
   const std::string trimmed = TrimJson(text);
-  if (trimmed == "null") { *parsed = Value(); return true; }
-  if (trimmed == "true") { *parsed = Value(int64_t{1}); return true; }
-  if (trimmed == "false") { *parsed = Value(int64_t{0}); return true; }
-  if (trimmed.size() >= 2 && trimmed.front() == '"' &&
-      trimmed.back() == '"') {
+  if (trimmed == "null") {
+    *parsed = Value();
+    return true;
+  }
+  if (trimmed == "true") {
+    *parsed = Value(int64_t{1});
+    return true;
+  }
+  if (trimmed == "false") {
+    *parsed = Value(int64_t{0});
+    return true;
+  }
+  if (trimmed.size() >= 2 && trimmed.front() == '"' && trimmed.back() == '"') {
     std::string unescaped;
     unescaped.reserve(trimmed.size());
     for (size_t i = 1; i + 1 < trimmed.size(); ++i) {
       if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
         ++i;
         switch (trimmed[i]) {
-          case 'n': unescaped.push_back('\n'); break;
-          case 't': unescaped.push_back('\t'); break;
-          case 'r': unescaped.push_back('\r'); break;
-          default: unescaped.push_back(trimmed[i]); break;
+          case 'n':
+            unescaped.push_back('\n');
+            break;
+          case 't':
+            unescaped.push_back('\t');
+            break;
+          case 'r':
+            unescaped.push_back('\r');
+            break;
+          default:
+            unescaped.push_back(trimmed[i]);
+            break;
         }
       } else {
         unescaped.push_back(trimmed[i]);
@@ -1377,11 +1553,9 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
         const char c = at_end ? ',' : body[i];
         if (!at_end && c == '"') {
           quoted = !quoted;
-        } else if (!quoted && !at_end &&
-                   (c == '[' || c == '{' || c == '(')) {
+        } else if (!quoted && !at_end && (c == '[' || c == '{' || c == '(')) {
           ++depth;
-        } else if (!quoted && !at_end &&
-                   (c == ']' || c == '}' || c == ')')) {
+        } else if (!quoted && !at_end && (c == ']' || c == '}' || c == ')')) {
           --depth;
         }
         if (at_end || (!quoted && depth == 0 && c == ',')) {
@@ -1421,10 +1595,9 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
   }
-  if (!trimmed.empty() &&
-      ((trimmed.front() == '{' && trimmed.back() == '}') ||
-       (trimmed.front() == '[' && trimmed.back() == ']') ||
-       lowered_head == "array")) {
+  if (!trimmed.empty() && ((trimmed.front() == '{' && trimmed.back() == '}') ||
+                           (trimmed.front() == '[' && trimmed.back() == ']') ||
+                           lowered_head == "array")) {
     // Objects / bare arrays / canonical ARRAY<T>[...] tokens stay as raw
     // struct-member text.
     *parsed = Value(std::string(trimmed));
@@ -1434,7 +1607,9 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
 }
 
 std::string EncodeStructMemberJson(const Value& value) {
-  if (value.IsNull()) { return "null"; }
+  if (value.IsNull()) {
+    return "null";
+  }
   switch (value.type) {
     case ValueType::kInt64:
       return std::to_string(value.value.int_value);
@@ -1450,9 +1625,8 @@ std::string EncodeStructMemberJson(const Value& value) {
     case ValueType::kVarChar: {
       std::string text(value.value.varchar_value);
       // Nested structs and arrays are already JSON-shaped; embed verbatim.
-      if (text.size() >= 2 &&
-          ((text.front() == '{' && text.back() == '}') ||
-           (text.front() == '[' && text.back() == ']'))) {
+      if (text.size() >= 2 && ((text.front() == '{' && text.back() == '}') ||
+                               (text.front() == '[' && text.back() == ']'))) {
         return text;
       }
       return "\"" + EscapeJsonText(text) + "\"";
@@ -1470,7 +1644,9 @@ std::string EncodeStructMemberJson(const Value& value) {
 
 Value StructSetField(const Value& json, const std::string& path,
                      const Value& new_value) {
-  if (json.IsNull()) { return json; }
+  if (json.IsNull()) {
+    return json;
+  }
   if (json.type != ValueType::kVarChar) {
     throw std::runtime_error("struct field assignment requires a STRUCT");
   }
@@ -1479,16 +1655,18 @@ Value StructSetField(const Value& json, const std::string& path,
     throw std::runtime_error("struct field assignment requires a STRUCT");
   }
   size_t dot = path.find('.');
-  const std::string head = dot == std::string::npos ? path : path.substr(0, dot);
+  const std::string head =
+      dot == std::string::npos ? path : path.substr(0, dot);
   const std::string rest =
       dot == std::string::npos ? std::string() : path.substr(dot + 1);
-  const auto members =
-      SplitJsonObjectMembers(text.substr(1, text.size() - 2));
+  const auto members = SplitJsonObjectMembers(text.substr(1, text.size() - 2));
   std::string rebuilt = "{";
   bool first = true;
   bool replaced = false;
   for (auto& [key, value_text] : members) {
-    if (!first) { rebuilt += ","; }
+    if (!first) {
+      rebuilt += ",";
+    }
     first = false;
     if (IdentifierEquals(key, head)) {
       replaced = true;
@@ -1498,15 +1676,17 @@ Value StructSetField(const Value& json, const std::string& path,
       } else {
         Value nested;
         JsonTextToValue(value_text, &nested);
-        rebuilt += EncodeStructMemberJson(
-            StructSetField(nested, rest, new_value));
+        rebuilt +=
+            EncodeStructMemberJson(StructSetField(nested, rest, new_value));
       }
     } else {
       rebuilt += "\"" + EscapeJsonText(key) + "\":" + value_text;
     }
   }
   if (!replaced) {
-    if (!first) { rebuilt += ","; }
+    if (!first) {
+      rebuilt += ",";
+    }
     rebuilt += "\"" + EscapeJsonText(head) + "\":";
     if (rest.empty()) {
       rebuilt += EncodeStructMemberJson(new_value);
@@ -1558,17 +1738,16 @@ Value FunctionCallExpression::Evaluate(const Row& row,
       throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
     }
     const Value date = args_[0]->Evaluate(row, schema);
-    if (date.IsNull()) { return {};
-}
-    return AddOrSubInterval(func_name_, date,
-                            args_[1]->AsIntervalExpression());
+    if (date.IsNull()) {
+      return {};
+    }
+    return AddOrSubInterval(func_name_, date, args_[1]->AsIntervalExpression());
   }
   // Conditional-evaluation semantics: only the taken (or error-handled)
   // branch is evaluated, so errors inside untaken branches never surface.
   // Branch results are normalized to the common supertype of every branch so
   // downstream comparisons and sort keys stay type-consistent.
-  auto promotes_to_double = [&](const Schema& schema_for_types,
-                                size_t from) {
+  auto promotes_to_double = [&](const Schema& schema_for_types, size_t from) {
     for (size_t i = from; i < args_.size(); ++i) {
       try {
         if (args_[i]->ResultType(schema_for_types).GetType() ==
@@ -1589,16 +1768,19 @@ Value FunctionCallExpression::Evaluate(const Row& row,
     return value;
   };
   if (func_name_ == "if") {
-    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
-}
+    if (args_.size() != 3) {
+      throw std::runtime_error("IF requires 3 arguments");
+    }
     const bool as_double = promotes_to_double(schema, 1);
     return normalize(
         args_[args_[0]->Evaluate(row, schema).Truthy() ? 1 : 2]->Evaluate(
-            row, schema), as_double);
+            row, schema),
+        as_double);
   }
   if (func_name_ == "iferror") {
-    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
-}
+    if (args_.size() != 2) {
+      throw std::runtime_error("IFERROR requires 2 arguments");
+    }
     const bool as_double = promotes_to_double(schema, 0);
     try {
       return normalize(args_[0]->Evaluate(row, schema), as_double);
@@ -1607,8 +1789,9 @@ Value FunctionCallExpression::Evaluate(const Row& row,
     }
   }
   if (func_name_ == "iserror") {
-    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
-}
+    if (args_.size() != 1) {
+      throw std::runtime_error("ISERROR requires 1 argument");
+    }
     try {
       args_[0]->Evaluate(row, schema);
       return Value(int64_t{0});
@@ -1617,8 +1800,9 @@ Value FunctionCallExpression::Evaluate(const Row& row,
     }
   }
   if (func_name_ == "nulliferror") {
-    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
-}
+    if (args_.size() != 1) {
+      throw std::runtime_error("NULLIFERROR requires 1 argument");
+    }
     try {
       return args_[0]->Evaluate(row, schema);
     } catch (const std::exception&) {
@@ -1658,23 +1842,25 @@ Value FunctionCallExpression::Evaluate(const Row* left,
     }
     const Value date =
         args_[0]->Evaluate(left, left_schema, right, right_schema);
-    if (date.IsNull()) { return {};
-}
-    return AddOrSubInterval(func_name_, date,
-                            args_[1]->AsIntervalExpression());
+    if (date.IsNull()) {
+      return {};
+    }
+    return AddOrSubInterval(func_name_, date, args_[1]->AsIntervalExpression());
   }
   // Lazy conditional-evaluation semantics (mirrors the plain overload).
   if (func_name_ == "if") {
-    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
-}
+    if (args_.size() != 3) {
+      throw std::runtime_error("IF requires 3 arguments");
+    }
     const Value condition =
         args_[0]->Evaluate(left, left_schema, right, right_schema);
-    return args_[condition.Truthy() ? 1 : 2]->Evaluate(
-        left, left_schema, right, right_schema);
+    return args_[condition.Truthy() ? 1 : 2]->Evaluate(left, left_schema, right,
+                                                       right_schema);
   }
   if (func_name_ == "iferror") {
-    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
-}
+    if (args_.size() != 2) {
+      throw std::runtime_error("IFERROR requires 2 arguments");
+    }
     try {
       return args_[0]->Evaluate(left, left_schema, right, right_schema);
     } catch (const std::exception&) {
@@ -1682,8 +1868,9 @@ Value FunctionCallExpression::Evaluate(const Row* left,
     }
   }
   if (func_name_ == "iserror") {
-    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
-}
+    if (args_.size() != 1) {
+      throw std::runtime_error("ISERROR requires 1 argument");
+    }
     try {
       args_[0]->Evaluate(left, left_schema, right, right_schema);
       return Value(int64_t{0});
@@ -1692,8 +1879,9 @@ Value FunctionCallExpression::Evaluate(const Row* left,
     }
   }
   if (func_name_ == "nulliferror") {
-    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
-}
+    if (args_.size() != 1) {
+      throw std::runtime_error("NULLIFERROR requires 1 argument");
+    }
     try {
       return args_[0]->Evaluate(left, left_schema, right, right_schema);
     } catch (const std::exception&) {
@@ -1717,21 +1905,23 @@ Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
       throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
     }
     const Value date = args_[0]->Evaluate(row, schema, context);
-    if (date.IsNull()) { return {};
-}
-    return AddOrSubInterval(func_name_, date,
-                            args_[1]->AsIntervalExpression());
+    if (date.IsNull()) {
+      return {};
+    }
+    return AddOrSubInterval(func_name_, date, args_[1]->AsIntervalExpression());
   }
   // Lazy conditional-evaluation semantics (mirrors the plain overload).
   if (func_name_ == "if") {
-    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
-}
+    if (args_.size() != 3) {
+      throw std::runtime_error("IF requires 3 arguments");
+    }
     const Value condition = args_[0]->Evaluate(row, schema, context);
     return args_[condition.Truthy() ? 1 : 2]->Evaluate(row, schema, context);
   }
   if (func_name_ == "iferror") {
-    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
-}
+    if (args_.size() != 2) {
+      throw std::runtime_error("IFERROR requires 2 arguments");
+    }
     try {
       return args_[0]->Evaluate(row, schema, context);
     } catch (const std::exception&) {
@@ -1739,8 +1929,9 @@ Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
     }
   }
   if (func_name_ == "iserror") {
-    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
-}
+    if (args_.size() != 1) {
+      throw std::runtime_error("ISERROR requires 1 argument");
+    }
     try {
       args_[0]->Evaluate(row, schema, context);
       return Value(int64_t{0});
@@ -1749,8 +1940,9 @@ Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
     }
   }
   if (func_name_ == "nulliferror") {
-    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
-}
+    if (args_.size() != 1) {
+      throw std::runtime_error("NULLIFERROR requires 1 argument");
+    }
     try {
       return args_[0]->Evaluate(row, schema, context);
     } catch (const std::exception&) {
@@ -1771,7 +1963,9 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
       const Value& field = args_[1]->AsConstantValue().GetValue();
       if (field.type == ValueType::kVarChar) {
         const std::string name(field.value.varchar_value);
-        if (name == "str_value") { return {TypeTag::kArray}; }
+        if (name == "str_value") {
+          return {TypeTag::kArray};
+        }
         if (name.starts_with("int") || name.starts_with("uint") ||
             name.starts_with("fixed") || name.starts_with("sfixed") ||
             name.starts_with("sint") || name == "bool_val") {
@@ -1784,36 +1978,41 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
   if (func_name_ == "coalesce" || func_name_ == "nullif" ||
       func_name_ == "ifnull" || func_name_ == "greatest" ||
       func_name_ == "least") {
-    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    if (args_.empty()) {
+      return {TypeTag::kInvalid};
+    }
     return args_[0]->ResultType(schema);
   }
   if (func_name_ == "if") {
-    if (args_.size() < 2) { return {TypeTag::kInvalid}; }
+    if (args_.size() < 2) {
+      return {TypeTag::kInvalid};
+    }
     return args_[1]->ResultType(schema);
   }
   if (func_name_ == "iferror" || func_name_ == "nulliferror") {
-    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    if (args_.empty()) {
+      return {TypeTag::kInvalid};
+    }
     return args_[0]->ResultType(schema);
   }
   if (func_name_ == "iserror") {
     return {TypeTag::kBigInt};
   }
-  if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
+  if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
+      func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
   }
   if (func_name_ == "concat" || func_name_ == "current_timestamp" ||
-      func_name_ == "format" ||
-      func_name_ == "substr" || func_name_ == "substring" ||
-      func_name_ == "upper" || func_name_ == "lower" ||
-      func_name_ == "trim" || func_name_ == "ltrim" || func_name_ == "rtrim" ||
-      func_name_ == "replace" || func_name_ == "repeat" ||
-      func_name_ == "reverse" || func_name_ == "split_substr" ||
-      func_name_ == "byte_substr" || func_name_ == "byte_reverse" ||
-      func_name_ == "code_points_to_string" || func_name_ == "code_points_to_bytes" ||
-      func_name_ == "octet_length" ||
-      func_name_ == "left" || func_name_ == "right" ||
-      func_name_ == "lpad" || func_name_ == "rpad" ||
-      func_name_ == "initcap" || func_name_ == "chr" ||
+      func_name_ == "format" || func_name_ == "substr" ||
+      func_name_ == "substring" || func_name_ == "upper" ||
+      func_name_ == "lower" || func_name_ == "trim" || func_name_ == "ltrim" ||
+      func_name_ == "rtrim" || func_name_ == "replace" ||
+      func_name_ == "repeat" || func_name_ == "reverse" ||
+      func_name_ == "split_substr" || func_name_ == "byte_substr" ||
+      func_name_ == "byte_reverse" || func_name_ == "code_points_to_string" ||
+      func_name_ == "code_points_to_bytes" || func_name_ == "octet_length" ||
+      func_name_ == "left" || func_name_ == "right" || func_name_ == "lpad" ||
+      func_name_ == "rpad" || func_name_ == "initcap" || func_name_ == "chr" ||
       func_name_ == "soundex" || func_name_ == "translate" ||
       func_name_ == "regexp_extract" || func_name_ == "regexp_replace" ||
       func_name_.starts_with("json_") || func_name_ == "to_json_string") {
@@ -1826,8 +2025,7 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
       func_name_ == "starts_with" || func_name_ == "ends_with" ||
       func_name_ == "ascii" || func_name_ == "unicode" ||
       func_name_ == "regexp_contains" || func_name_ == "regexp_match" ||
-      func_name_ == "regexp_instr" ||
-      func_name_ == "div" ||
+      func_name_ == "regexp_instr" || func_name_ == "div" ||
       func_name_.starts_with("extract_")) {
     return {TypeTag::kBigInt};
   }
@@ -1838,7 +2036,9 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
       func_name_ == "floor" || func_name_ == "mod" ||
       func_name_ == "safe_add" || func_name_ == "safe_subtract" ||
       func_name_ == "safe_multiply" || func_name_ == "safe_negate") {
-    if (args_.empty()) { return {TypeTag::kBigInt}; }
+    if (args_.empty()) {
+      return {TypeTag::kBigInt};
+    }
     return args_[0]->ResultType(schema);
   }
   if (func_name_ == "pow" || func_name_ == "power" || func_name_ == "sqrt" ||
@@ -1865,7 +2065,9 @@ Type FunctionCallExpression::ResultType(const Schema& left,
       const Value& field = args_[1]->AsConstantValue().GetValue();
       if (field.type == ValueType::kVarChar) {
         const std::string name(field.value.varchar_value);
-        if (name == "str_value") { return {TypeTag::kArray}; }
+        if (name == "str_value") {
+          return {TypeTag::kArray};
+        }
         if (name.starts_with("int") || name.starts_with("uint") ||
             name.starts_with("fixed") || name.starts_with("sfixed") ||
             name.starts_with("sint") || name == "bool_val") {
@@ -1878,36 +2080,41 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   if (func_name_ == "coalesce" || func_name_ == "nullif" ||
       func_name_ == "ifnull" || func_name_ == "greatest" ||
       func_name_ == "least") {
-    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    if (args_.empty()) {
+      return {TypeTag::kInvalid};
+    }
     return args_[0]->ResultType(left, right);
   }
   if (func_name_ == "if") {
-    if (args_.size() < 2) { return {TypeTag::kInvalid}; }
+    if (args_.size() < 2) {
+      return {TypeTag::kInvalid};
+    }
     return args_[1]->ResultType(left, right);
   }
   if (func_name_ == "iferror" || func_name_ == "nulliferror") {
-    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    if (args_.empty()) {
+      return {TypeTag::kInvalid};
+    }
     return args_[0]->ResultType(left, right);
   }
   if (func_name_ == "iserror") {
     return {TypeTag::kBigInt};
   }
-  if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
+  if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
+      func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
   }
   if (func_name_ == "concat" || func_name_ == "current_timestamp" ||
-      func_name_ == "format" ||
-      func_name_ == "substr" || func_name_ == "substring" ||
-      func_name_ == "upper" || func_name_ == "lower" ||
-      func_name_ == "trim" || func_name_ == "ltrim" || func_name_ == "rtrim" ||
-      func_name_ == "replace" || func_name_ == "repeat" ||
-      func_name_ == "reverse" || func_name_ == "split_substr" ||
-      func_name_ == "byte_substr" || func_name_ == "byte_reverse" ||
-      func_name_ == "code_points_to_string" || func_name_ == "code_points_to_bytes" ||
-      func_name_ == "octet_length" ||
-      func_name_ == "left" || func_name_ == "right" ||
-      func_name_ == "lpad" || func_name_ == "rpad" ||
-      func_name_ == "initcap" || func_name_ == "chr" ||
+      func_name_ == "format" || func_name_ == "substr" ||
+      func_name_ == "substring" || func_name_ == "upper" ||
+      func_name_ == "lower" || func_name_ == "trim" || func_name_ == "ltrim" ||
+      func_name_ == "rtrim" || func_name_ == "replace" ||
+      func_name_ == "repeat" || func_name_ == "reverse" ||
+      func_name_ == "split_substr" || func_name_ == "byte_substr" ||
+      func_name_ == "byte_reverse" || func_name_ == "code_points_to_string" ||
+      func_name_ == "code_points_to_bytes" || func_name_ == "octet_length" ||
+      func_name_ == "left" || func_name_ == "right" || func_name_ == "lpad" ||
+      func_name_ == "rpad" || func_name_ == "initcap" || func_name_ == "chr" ||
       func_name_ == "soundex" || func_name_ == "translate" ||
       func_name_ == "regexp_extract" || func_name_ == "regexp_replace" ||
       func_name_.starts_with("json_") || func_name_ == "to_json_string") {
@@ -1920,8 +2127,7 @@ Type FunctionCallExpression::ResultType(const Schema& left,
       func_name_ == "starts_with" || func_name_ == "ends_with" ||
       func_name_ == "ascii" || func_name_ == "unicode" ||
       func_name_ == "regexp_contains" || func_name_ == "regexp_match" ||
-      func_name_ == "regexp_instr" ||
-      func_name_ == "div" ||
+      func_name_ == "regexp_instr" || func_name_ == "div" ||
       func_name_.starts_with("extract_")) {
     return {TypeTag::kBigInt};
   }
@@ -1932,7 +2138,9 @@ Type FunctionCallExpression::ResultType(const Schema& left,
       func_name_ == "floor" || func_name_ == "mod" ||
       func_name_ == "safe_add" || func_name_ == "safe_subtract" ||
       func_name_ == "safe_multiply" || func_name_ == "safe_negate") {
-    if (args_.empty()) { return {TypeTag::kBigInt}; }
+    if (args_.empty()) {
+      return {TypeTag::kBigInt};
+    }
     return args_[0]->ResultType(left, right);
   }
   if (func_name_ == "pow" || func_name_ == "power" || func_name_ == "sqrt" ||
@@ -1952,7 +2160,6 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   return {TypeTag::kVarChar};
 }
 
-
 Status FunctionCallExpression::Validate(EvaluationContext& context,
                                         const Schema& schema) const {
   for (const auto& arg : args_) {
@@ -1964,8 +2171,7 @@ Status FunctionCallExpression::Validate(EvaluationContext& context,
   // Function registration goes through the abstract context; the production
   // implementation forwards to Database::GetOrAddFunction (improvement3.md
   // A1).  Type check is still TODO.
-  return context.GetOrAddFunction(func_name_,
-                                  static_cast<int>(args_.size()));
+  return context.GetOrAddFunction(func_name_, static_cast<int>(args_.size()));
 }
 
 }  // namespace tinylamb

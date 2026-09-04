@@ -58,8 +58,9 @@ void DistributedAggFinalize::MergePartialStreams() {
       for (size_t a = 0; a < aggregates_.size(); ++a) {
         const auto& spec = aggregates_[a];
         auto& state = group.states[a];
-        const Value val =
-            spec.partial_val_slot < row.Size() ? row[spec.partial_val_slot] : Value();
+        const Value val = spec.partial_val_slot < row.Size()
+                              ? row[spec.partial_val_slot]
+                              : Value();
 
         switch (spec.type) {
           case AggType::kCount:
@@ -140,8 +141,9 @@ void DistributedAggFinalize::FinalizeGroups() {
           break;
         case AggType::kAvg:
           row_values.push_back(
-              state.count > 0 ? Value(state.sum / static_cast<double>(state.count))
-                              : Value());
+              state.count > 0
+                  ? Value(state.sum / static_cast<double>(state.count))
+                  : Value());
           break;
         case AggType::kMin:
           row_values.push_back(state.has_val ? state.min_val : Value());
@@ -169,9 +171,7 @@ void DistributedAggFinalize::EnsureMaterialized() {
   FinalizeGroups();
 }
 
-void DistributedAggFinalize::MaterializePipeline() {
-  EnsureMaterialized();
-}
+void DistributedAggFinalize::MaterializePipeline() { EnsureMaterialized(); }
 
 bool DistributedAggFinalize::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
@@ -192,6 +192,7 @@ size_t DistributedAggFinalize::NextBatch(DataChunk* destination,
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
+  destination->Reset();
   EnsureMaterialized();
   if (output_offset_ >= finalized_rows_.size()) {
     return 0;

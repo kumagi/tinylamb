@@ -42,6 +42,7 @@ class Column {
   [[nodiscard]] const ColumnName& Name() const { return col_name_; }
   ColumnName& Name() { return col_name_; }
   [[nodiscard]] ValueType Type() const { return type_; }
+  void SetType(ValueType type) { type_ = type; }
   [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
   void SetUnsigned(bool value) { unsigned_ = value; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }

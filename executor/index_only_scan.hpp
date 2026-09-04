@@ -21,13 +21,13 @@
 #ifndef TINYLAMB_INDEX_ONLY_SCAN_HPP
 #define TINYLAMB_INDEX_ONLY_SCAN_HPP
 
+#include <vector>
+
 #include "executor_base.hpp"
 #include "expression/expression.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
-
-#include <vector>
 
 namespace tinylamb {
 class Index;
@@ -43,8 +43,8 @@ class IndexOnlyScan : public ExecutorBase {
                 Expression where, const Schema& sc);
   IndexOnlyScan(Transaction& txn, const Table& table, const Index& index,
                 const std::vector<Value>& begin_key,
-                const std::vector<Value>& end_key,
-                bool ascending, Expression where, const Schema& sc);
+                const std::vector<Value>& end_key, bool ascending,
+                Expression where, const Schema& sc);
   IndexOnlyScan(const IndexOnlyScan&) = delete;
   IndexOnlyScan(IndexOnlyScan&&) = delete;
   IndexOnlyScan& operator=(const IndexOnlyScan&) = delete;

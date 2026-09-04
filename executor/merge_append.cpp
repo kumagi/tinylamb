@@ -14,7 +14,9 @@ namespace tinylamb {
 namespace {
 
 Value CoerceTo(const Value& value, ValueType type) {
-  if (value.IsNull() || value.type == type) { return value; }
+  if (value.IsNull() || value.type == type) {
+    return value;
+  }
   if (type == ValueType::kDouble && value.type == ValueType::kInt64) {
     return Value(static_cast<double>(value.value.int_value));
   }
@@ -27,8 +29,7 @@ Value MergeAppendExecutor::KeyValue(const Head& head,
                                     const SortExecutor::Key& key) const {
   Value value;
   if (key.expression->Type() == TypeTag::kColumnValue) {
-    const ColumnName& column =
-        key.expression->AsColumnValue().GetColumnName();
+    const ColumnName& column = key.expression->AsColumnValue().GetColumnName();
     const int child_offset = schemas_[head.source].Offset(column);
     if (child_offset >= 0 &&
         static_cast<size_t>(child_offset) < head.row.values_.size()) {
@@ -51,9 +52,9 @@ Value MergeAppendExecutor::KeyValue(const Head& head,
           : -1;
   if (output_offset >= 0 &&
       static_cast<size_t>(output_offset) < output_schema_.ColumnCount()) {
-    value = CoerceTo(value,
-                     output_schema_.GetColumn(static_cast<size_t>(output_offset))
-                         .Type());
+    value = CoerceTo(
+        value,
+        output_schema_.GetColumn(static_cast<size_t>(output_offset)).Type());
   }
   return value;
 }
@@ -75,7 +76,9 @@ bool MergeAppendExecutor::Before(const Head& left, const Head& right) const {
 }
 
 void MergeAppendExecutor::Initialize() {
-  if (initialized_) { return; }
+  if (initialized_) {
+    return;
+  }
   if (sources_.size() != schemas_.size()) {
     throw std::invalid_argument("merge append source/schema count mismatch");
   }
@@ -91,10 +94,14 @@ void MergeAppendExecutor::Initialize() {
 
 bool MergeAppendExecutor::Next(Row* destination, RowPosition* position) {
   Initialize();
-  if (heads_.empty()) { return false; }
+  if (heads_.empty()) {
+    return false;
+  }
   size_t best = 0;
   for (size_t index = 1; index < heads_.size(); ++index) {
-    if (Before(heads_[index], heads_[best])) { best = index; }
+    if (Before(heads_[index], heads_[best])) {
+      best = index;
+    }
   }
   Head emitted = std::move(heads_[best]);
   if (sources_[emitted.source]->Next(&heads_[best].row,
@@ -107,24 +114,29 @@ bool MergeAppendExecutor::Next(Row* destination, RowPosition* position) {
     throw std::invalid_argument("merge append row/schema width mismatch");
   }
   for (size_t column = 0; column < emitted.row.values_.size(); ++column) {
-    emitted.row.values_[column] =
-        CoerceTo(emitted.row.values_[column],
-                 output_schema_.GetColumn(column).Type());
+    emitted.row.values_[column] = CoerceTo(
+        emitted.row.values_[column], output_schema_.GetColumn(column).Type());
   }
   *destination = std::move(emitted.row);
-  if (position != nullptr) { *position = emitted.position; }
+  if (position != nullptr) {
+    *position = emitted.position;
+  }
   return true;
 }
 
 void MergeAppendExecutor::Dump(std::ostream& output, int indent) const {
   output << Indent(indent) << "MergeAppend: [";
   for (size_t i = 0; i < keys_.size(); ++i) {
-    if (i != 0) { output << ", "; }
+    if (i != 0) {
+      output << ", ";
+    }
     output << keys_[i].expression->ToString()
            << (keys_[i].ascending ? " ASC" : " DESC");
   }
   output << "]\n";
-  for (const Executor& source : sources_) { source->Dump(output, indent + 2); }
+  for (const Executor& source : sources_) {
+    source->Dump(output, indent + 2);
+  }
 }
 
 }  // namespace tinylamb

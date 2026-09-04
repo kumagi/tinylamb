@@ -48,8 +48,8 @@ class EvaluationContext {
 
   // Registers (or finds) a function signature during validation; mirrors
   // Database::GetOrAddFunction for FunctionCallExpression::Validate.
-  [[nodiscard]] virtual Status GetOrAddFunction(
-      std::string_view function_name, int argument_count) = 0;
+  [[nodiscard]] virtual Status GetOrAddFunction(std::string_view function_name,
+                                                int argument_count) = 0;
 };
 
 }  // namespace tinylamb

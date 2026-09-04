@@ -1,11 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/sort.hpp"
 
-
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cmath>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -119,8 +118,9 @@ using Span = std::pair<uint32_t, uint32_t>;
 int CompareSpans(std::string_view a, std::string_view b) {
   const size_t common = std::min(a.size(), b.size());
   const int c = std::memcmp(a.data(), b.data(), common);
-  if (c != 0) { return c;
-}
+  if (c != 0) {
+    return c;
+  }
   return a.size() < b.size() ? -1 : (a.size() > b.size() ? 1 : 0);
 }
 
@@ -169,7 +169,11 @@ class SortKeyEncoder {
     }
     *is_null = false;
     const uint64_t bits = static_cast<uint64_t>(v.value.int_value);
-    return specs_[0].ascending ? bits ^ (uint64_t{1} << 63) : ~bits;
+    // Order-preserving map: sign flip for ASC. DESC must invert that map
+    // (~(bits ^ sign)), not the raw two's-complement bits: ~bits keeps
+    // negative keys below positive ones, so mixed-sign DESC came out wrong.
+    const uint64_t flipped = bits ^ (uint64_t{1} << 63);
+    return specs_[0].ascending ? flipped : ~flipped;
   }
 
   void AppendEncoded(const Row& row, std::string* out) const {
@@ -222,8 +226,9 @@ void RadixSortIndices(size_t* begin, size_t* end,
                       const std::vector<uint64_t>& keys,
                       std::vector<size_t>* tmp) {
   const size_t n = static_cast<size_t>(end - begin);
-  if (n < 2) { return;
-}
+  if (n < 2) {
+    return;
+  }
   tmp->resize(n);
   size_t* src = begin;
   size_t* dst = tmp->data();
@@ -233,8 +238,9 @@ void RadixSortIndices(size_t* begin, size_t* end,
     for (size_t i = 0; i < n; ++i) {
       ++count[((keys[src[i]] >> shift) & 0xFF) + 1];
     }
-    for (int b = 0; b < 256; ++b) { count[b + 1] += count[b];
-}
+    for (int b = 0; b < 256; ++b) {
+      count[b + 1] += count[b];
+    }
     for (size_t i = 0; i < n; ++i) {
       dst[count[(keys[src[i]] >> shift) & 0xFF]++] = src[i];
     }
@@ -280,10 +286,12 @@ class KeyOrdering {
 
   std::vector<size_t> BuildPermutation(size_t rows, size_t workers) const {
     std::vector<size_t> perm(rows);
-    for (size_t i = 0; i < rows; ++i) { perm[i] = i;
-}
-    if (rows < 2) { return perm;
-}
+    for (size_t i = 0; i < rows; ++i) {
+      perm[i] = i;
+    }
+    if (rows < 2) {
+      return perm;
+    }
 
     size_t sortable_begin = 0;
     size_t sortable_end = rows;
@@ -300,22 +308,22 @@ class KeyOrdering {
         if (encoder_.SingleNullsFirst()) {
           std::copy(nulls.begin(), nulls.end(), perm.begin());
           std::copy(non_nulls.begin(), non_nulls.end(),
-                    perm.begin() +
-                        static_cast<std::ptrdiff_t>(nulls.size()));
+                    perm.begin() + static_cast<std::ptrdiff_t>(nulls.size()));
           sortable_begin = nulls.size();
         } else {
           std::copy(non_nulls.begin(), non_nulls.end(), perm.begin());
-          std::copy(nulls.begin(), nulls.end(),
-                    perm.begin() +
-                        static_cast<std::ptrdiff_t>(non_nulls.size()));
+          std::copy(
+              nulls.begin(), nulls.end(),
+              perm.begin() + static_cast<std::ptrdiff_t>(non_nulls.size()));
           sortable_end = non_nulls.size();
         }
       }
     }
 
     const size_t sortable_rows = sortable_end - sortable_begin;
-    if (sortable_rows < 2) { return perm;
-}
+    if (sortable_rows < 2) {
+      return perm;
+    }
     size_t* base = perm.data() + sortable_begin;
     const auto index_less = [&](size_t a, size_t b) {
       if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
@@ -343,8 +351,9 @@ class KeyOrdering {
     for (size_t worker = 0; worker < workers; ++worker) {
       const size_t begin = worker * run_size;
       const size_t end = std::min(sortable_rows, begin + run_size);
-      if (begin == end) { break;
-}
+      if (begin == end) {
+        break;
+      }
       threads.emplace_back([&, begin, end] {
         try {
           if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
@@ -355,14 +364,16 @@ class KeyOrdering {
           }
         } catch (...) {
           std::scoped_lock lock(error_mutex);
-          if (!error) { error = std::current_exception();
-}
+          if (!error) {
+            error = std::current_exception();
+          }
         }
       });
     }
     threads.clear();
-    if (error) { std::rethrow_exception(error);
-}
+    if (error) {
+      std::rethrow_exception(error);
+    }
     for (size_t width = run_size; width < sortable_rows; width *= 2) {
       for (size_t begin = 0; begin < sortable_rows; begin += width * 2) {
         const size_t middle = std::min(sortable_rows, begin + width);
@@ -372,8 +383,9 @@ class KeyOrdering {
                              index_less);
         }
       }
-      if (width > sortable_rows / 2) { break;
-}
+      if (width > sortable_rows / 2) {
+        break;
+      }
     }
     return perm;
   }
@@ -410,8 +422,9 @@ class RunReader {
   }
 
   bool Next(PositionedRow* dst) {
-    if (remaining_ == 0) { return false;
-}
+    if (remaining_ == 0) {
+      return false;
+    }
     Row row;
     RowPosition position;
     Decoder dec(stream_);
@@ -431,8 +444,9 @@ class RunReader {
 
 void ApplyPermutation(std::vector<PositionedRow>* rows,
                       const std::vector<size_t>& permutation) {
-  if (permutation.size() != rows->size()) { return;
-}
+  if (permutation.size() != rows->size()) {
+    return;
+  }
   std::vector<PositionedRow> sorted;
   sorted.reserve(permutation.size());
   for (const size_t index : permutation) {
@@ -481,8 +495,7 @@ void SortExecutor::Materialize() {
         rows_.size() < kParallelSortMinRows
             ? 1
             : std::min(worker_count_, std::max<size_t>(1, rows_.size()));
-    ApplyPermutation(&rows_,
-                     ordering.BuildPermutation(rows_.size(), workers));
+    ApplyPermutation(&rows_, ordering.BuildPermutation(rows_.size(), workers));
     rows_charge_ = std::move(charge);
   } else {
     if (!rows_.empty()) {
@@ -508,8 +521,7 @@ void SortExecutor::Materialize() {
           charge.Add(EstimateRowBytes(item.first) + sizeof(RowPosition));
           const uint32_t begin = static_cast<uint32_t>(keys.size());
           ord.AppendEncodedTo(item.first, &keys);
-          spans.emplace_back(begin,
-                             static_cast<uint32_t>(keys.size() - begin));
+          spans.emplace_back(begin, static_cast<uint32_t>(keys.size() - begin));
           rows.push_back(std::move(item));
         }
         return !rows.empty();
@@ -531,11 +543,13 @@ void SortExecutor::Materialize() {
         return window->Fill(ord, reader.get());
       }
       bool Advance(const KeyOrdering& ord) {
-        if (!window) { return false;
-}
+        if (!window) {
+          return false;
+        }
         ++window->index;
-        if (window->index < window->rows.size()) { return true;
-}
+        if (window->index < window->rows.size()) {
+          return true;
+        }
         return window->Fill(ord, reader.get());
       }
     };
@@ -553,8 +567,9 @@ void SortExecutor::Materialize() {
     };
     auto cursor_less = [&](size_t a, size_t b) {
       const int c = CompareSpans(current_key(a), current_key(b));
-      if (c != 0) { return c > 0;
-}
+      if (c != 0) {
+        return c > 0;
+      }
       return cursors[a].run_id > cursors[b].run_id;
     };
     std::priority_queue<size_t, std::vector<size_t>, decltype(cursor_less)>
@@ -575,8 +590,9 @@ void SortExecutor::Materialize() {
       }
       rows_.push_back(std::move(cursor.window->rows[cursor.window->index]));
       output_charge.Add(EstimateRowBytes(rows_.back().first));
-      if (cursor.Advance(ordering)) { heap.push(id);
-}
+      if (cursor.Advance(ordering)) {
+        heap.push(id);
+      }
     }
     charge.ReleaseAll();
     rows_charge_ = std::move(output_charge);
@@ -586,13 +602,16 @@ void SortExecutor::Materialize() {
 }
 
 bool SortExecutor::Next(Row* dst, RowPosition* rp) {
-  if (!materialized_) { Materialize();
-}
-  if (offset_ >= rows_.size()) { return false;
-}
+  if (!materialized_) {
+    Materialize();
+  }
+  if (offset_ >= rows_.size()) {
+    return false;
+  }
   *dst = std::move(rows_[offset_].first);
-  if (rp != nullptr) { *rp = rows_[offset_].second;
-}
+  if (rp != nullptr) {
+    *rp = rows_[offset_].second;
+  }
   ++offset_;
   return true;
 }

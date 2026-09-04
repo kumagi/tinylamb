@@ -1,0 +1,360 @@
+# Locally authored aspirational E2E tests. These cases intentionally describe
+# the arithmetic rewrite quality expected from a high-end commercial SQL
+# optimizer: identity elimination, sign canonicalization, NULL-safe zero
+# absorption, IEEE/overflow error contracts, and sargable predicate forms.
+# Every case validates result rows first; [mode=explain] cases additionally
+# pin the stable plan fragments the rewrite must (or must not) produce.
+
+[prepare_database]
+CREATE TABLE arithmetic_input AS
+SELECT 1 AS id, 10 AS a, 20 AS b, 2.5 AS f
+UNION ALL SELECT 2, 0, -5, -1.5
+UNION ALL SELECT 3, CAST(NULL AS INT64), 20, CAST(NULL AS FLOAT64);
+ANALYZE arithmetic_input;
+--
+ARRAY<STRUCT<id INT64, a INT64, b INT64, f FLOAT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=/ 1]
+[name=division_by_one_identity]
+SELECT id, a / 1 AS d, a / 1.0 AS fd FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, d INT64, fd FLOAT64>>[
+  {1, 10, 10}, {2, 0, 0}, {3, NULL, NULL}
+]
+==
+
+[mode=explain]
+[plan_not_contains=+ 0.0]
+[plan_not_contains=* 1.0]
+[name=floating_identity_constants_neutralized]
+SELECT id, a + 0.0 AS x, a * 1.0 AS y FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64>>[
+  {1, 10, 10}, {2, 0, 0}, {3, NULL, NULL}
+]
+==
+
+[mode=explain]
+[plan_not_contains=+ -5]
+[plan_contains=- 5]
+[name=negative_addend_becomes_subtraction]
+SELECT id, a + (-5) AS x FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64>>[
+  {1, 5}, {2, -5}, {3, NULL}
+]
+==
+
+[mode=explain]
+[plan_not_contains=- -5]
+[plan_contains=+ 5]
+[name=negative_subtrahend_becomes_addition]
+SELECT id, a - (-5) AS x FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64>>[
+  {1, 15}, {2, 5}, {3, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=(arithmetic_input.a = 10)]
+[plan_not_contains=+ 0]
+[name=filter_identity_add_removed_for_sargability]
+SELECT id FROM arithmetic_input WHERE a + 0 = 10 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=(arithmetic_input.a = 10)]
+[plan_not_contains=* 1]
+[name=filter_identity_multiply_removed_for_sargability]
+SELECT id FROM arithmetic_input WHERE a * 1 = 10 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=(arithmetic_input.a = 10)]
+[name=filter_division_identity_removed_for_sargability]
+SELECT id FROM arithmetic_input WHERE a / 1 = 10 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=(arithmetic_input.a = 10)]
+[plan_not_contains=2 - 2]
+[name=filter_cascades_constant_fold_then_identity]
+SELECT id FROM arithmetic_input WHERE a + (2 - 2) = 10 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=- 3]
+[name=filter_negative_addend_canonicalized]
+SELECT id FROM arithmetic_input WHERE a + (-3) = 7 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=arithmetic_input.a < 10)]
+[plan_not_contains=10 > arithmetic_input.a]
+[name=literal_on_left_flips_to_sargable_less]
+SELECT id FROM arithmetic_input WHERE 10 > a ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{2}]
+==
+
+[mode=explain]
+[plan_contains=arithmetic_input.a >= 5]
+[plan_not_contains=5 <= arithmetic_input.a)]
+[name=literal_on_left_flips_to_sargable_geq]
+SELECT id FROM arithmetic_input WHERE 5 <= a ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=arithmetic_input.a > 5]
+[plan_not_contains=5 < arithmetic_input.a)]
+[name=literal_on_left_flips_to_sargable_gt]
+SELECT id FROM arithmetic_input WHERE 5 < a ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=arithmetic_input.b <= 20)]
+[plan_not_contains=20 >= arithmetic_input.b]
+[name=literal_on_left_flips_to_sargable_leq]
+SELECT id FROM arithmetic_input WHERE 20 >= b ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}]
+==
+
+[mode=explain]
+[plan_contains=CASE]
+[name=zero_multiply_predicate_stays_null_safe]
+SELECT id FROM arithmetic_input WHERE a * 0 = 0 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+
+[mode=explain]
+[plan_contains=CASE]
+[plan_not_contains=* 0]
+[name=int64_zero_multiply_null_safe_on_both_sides]
+SELECT id, a * 0 AS x, 0 * a AS y, b * 0 AS z FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64, z INT64>>[
+  {1, 0, 0, 0}, {2, 0, 0, 0}, {3, NULL, NULL, 0}
+]
+==
+
+[mode=explain]
+[plan_contains=arithmetic_input.f * 0]
+[name=double_zero_multiply_kept_for_nan_safety]
+SELECT id, f * 0.0 AS z FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, z FLOAT64>>[
+  {1, 0}, {2, 0}, {3, NULL}
+]
+==
+
+[name=nan_and_infinity_times_zero_stay_nan_ieee]
+SELECT CAST('NaN' AS FLOAT64) * 0.0 AS nz,
+       CAST('Infinity' AS FLOAT64) * 0.0 AS iz,
+       -CAST('Infinity' AS FLOAT64) * 0.0 AS mz
+--
+ARRAY<STRUCT<nz FLOAT64, iz FLOAT64, mz FLOAT64>>[{nan, nan, nan}]
+==
+
+[name=constant_overflow_raises_instead_of_wrapping]
+SELECT 9223372036854775807 + 1 AS ov
+--
+ERROR: integer overflow
+==
+
+[name=int64_min_boundary_constant_folds_exactly]
+SELECT -9223372036854775807 - 1 AS lo
+--
+ARRAY<STRUCT<lo INT64>>[{-9223372036854775808}]
+==
+
+[name=integer_division_by_zero_keeps_runtime_error]
+SELECT a / 0 AS d FROM arithmetic_input
+--
+ERROR: division by zero
+==
+
+[name=double_division_by_zero_keeps_runtime_error]
+SELECT f / 0.0 AS d FROM arithmetic_input
+--
+ERROR: division by zero
+==
+
+[name=mod_by_zero_keeps_runtime_error]
+SELECT MOD(a, 0) AS m FROM arithmetic_input
+--
+ERROR: division by zero in MOD
+==
+
+[name=safe_arithmetic_identities]
+SELECT id, SAFE_ADD(a, 0) AS x, SAFE_SUBTRACT(a, 0) AS y,
+       SAFE_MULTIPLY(a, 1) AS z
+FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64, z INT64>>[
+  {1, 10, 10, 10}, {2, 0, 0, 0}, {3, NULL, NULL, NULL}
+]
+==
+
+[name=safe_zero_and_null_arguments_stay_null_safe]
+SELECT id, SAFE_MULTIPLY(a, 0) AS x, SAFE_ADD(a, CAST(NULL AS INT64)) AS y
+FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64>>[
+  {1, 0, NULL}, {2, 0, NULL}, {3, NULL, NULL}
+]
+==
+
+[name=safe_divide_returns_null_on_zero_divisor]
+SELECT id, SAFE_DIVIDE(a, 0) AS x, SAFE_DIVIDE(a, 2) AS y
+FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64>>[
+  {1, NULL, 5}, {2, NULL, 0}, {3, NULL, NULL}
+]
+==
+
+[name=nested_abs_collapses]
+SELECT id, ABS(ABS(a)) AS x, ABS(ABS(ABS(-5))) AS y
+FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64>>[
+  {1, 10, 5}, {2, 0, 5}, {3, NULL, 5}
+]
+==
+
+[name=nested_greatest_least_flatten]
+SELECT id, GREATEST(GREATEST(a, b), 99) AS g, LEAST(LEAST(a, b), 99) AS l
+FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, g INT64, l INT64>>[
+  {1, 99, 10}, {2, 99, -5}, {3, NULL, NULL}
+]
+==
+
+[name=self_subtract_preserves_null]
+SELECT id, a - a AS x FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64>>[
+  {1, 0}, {2, 0}, {3, NULL}
+]
+==
+
+[name=self_subtract_predicate_keeps_unknown]
+SELECT id FROM arithmetic_input WHERE a - a = 0 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+
+[name=mod_by_one_keeps_null_contract]
+SELECT id, MOD(a, 1) AS m FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, m INT64>>[
+  {1, 0}, {2, 0}, {3, NULL}
+]
+==
+
+[name=integer_division_is_floating]
+SELECT 17 / 5 AS q, -17 / 5 AS nq
+--
+ARRAY<STRUCT<q FLOAT64, nq FLOAT64>>[{3.4, -3.4}]
+==
+
+[name=mod_sign_follows_dividend]
+SELECT MOD(-17, 5) AS m1, MOD(17, -5) AS m2, MOD(17, 5) AS m3
+--
+ARRAY<STRUCT<m1 INT64, m2 INT64, m3 INT64>>[{-2, 2, 2}]
+==
+
+[name=negative_one_constant_multiply_folds]
+SELECT -1 * 5 AS n1, 5 * -1 AS n2
+--
+ARRAY<STRUCT<n1 INT64, n2 INT64>>[{-5, -5}]
+==
+
+[name=deep_constant_tree_folds_fully]
+SELECT ((1 + 2) * (3 + 4)) - 20 AS x, ((10 - 4) / 3) * 2 AS y
+--
+ARRAY<STRUCT<x INT64, y FLOAT64>>[{1, 4}]
+==
+
+# ---------------------------------------------------------------------------
+# Typed-arithmetic rewrites below run in the typed pass
+# (RewriteTypedArithmetic), which sees the input schema and can resolve
+# column result types where the schema-less ExpressionRuleSet cannot.
+# These cases pin the E2E contract: sign absorption (-1 * col -> -col),
+# repeated-addend folding (col + col -> col * 2), and add/multiply constant
+# reassociation on column operands.  Every case validates result rows (NULL
+# propagation included) together with the stable plan fragments.
+# ---------------------------------------------------------------------------
+
+[mode=explain]
+[plan_contains=(-arithmetic_input.a)]
+[plan_not_contains=* -1]
+[name=negative_one_multiply_absorbs_sign_on_column]
+SELECT id, -1 * a AS n, a * -1 AS r FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, n INT64, r INT64>>[
+  {1, -10, -10}, {2, 0, 0}, {3, NULL, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=(arithmetic_input.a * 2)]
+[plan_contains=(arithmetic_input.b * 2)]
+[plan_contains=(arithmetic_input.f * 2)]
+[plan_not_contains=+ arithmetic_input.a]
+[plan_not_contains=+ arithmetic_input.f]
+[name=repeated_addend_folds_to_multiply_by_two]
+SELECT id, a + a AS x, b + b AS y, f + f AS z FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64, z FLOAT64>>[
+  {1, 20, 40, 5}, {2, 0, -10, -3}, {3, NULL, 40, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=arithmetic_input.a + 8)]
+[plan_contains=arithmetic_input.a - 8)]
+[plan_contains=arithmetic_input.a - 3)]
+[plan_contains=arithmetic_input.a - 2)]
+[plan_not_contains=+ 5]
+[name=add_subtract_constant_reassociation_on_column]
+SELECT id, (a + 5) + 3 AS x, (a - 5) - 3 AS y,
+       (a + 5) - 8 AS z, (a - 5) + 3 AS w
+FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64, z INT64, w INT64>>[
+  {1, 18, 2, 7, 8}, {2, 8, -8, -3, -2}, {3, NULL, NULL, NULL, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=arithmetic_input.a * 6)]
+[plan_not_contains=* 2)]
+[name=multiply_constant_reassociation_on_column]
+SELECT id, (a * 2) * 3 AS x FROM arithmetic_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64>>[
+  {1, 60}, {2, 0}, {3, NULL}
+]
+==
+

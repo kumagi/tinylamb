@@ -23,8 +23,8 @@
 #include <vector>
 
 #include "executor_base.hpp"
-#include "expression/expression.hpp"
 #include "expression/bytecode.hpp"
+#include "expression/expression.hpp"
 #include "expression/jit.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"

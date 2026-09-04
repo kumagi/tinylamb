@@ -30,10 +30,10 @@
 #include "expression/named_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "full_scan_plan.hpp"
+#include "incremental_sort_plan.hpp"
 #include "index/index.hpp"
 #include "index_only_scan_plan.hpp"
 #include "index_scan_plan.hpp"
-#include "incremental_sort_plan.hpp"
 #include "limit_plan.hpp"
 #include "max1_row_plan.hpp"
 #include "merge_join_plan.hpp"
@@ -402,7 +402,6 @@ double EqualityPrefixRows(const TableStatistics& statistics, const Index& index,
   return std::max(1.0, rows);
 }
 
-
 std::optional<std::vector<std::vector<Value>>> DisjunctiveIndexPrefixes(
     const Expression& filter, const Schema& schema, const Index& index) {
   const std::vector<Expression> disjuncts =
@@ -470,8 +469,8 @@ std::optional<std::vector<std::vector<Value>>> DisjunctiveIndexPrefixes(
   return prefixes;
 }
 
-std::unordered_map<slot_t, Range> ComparisonRanges(
-    const Expression& predicate, const Schema& schema) {
+std::unordered_map<slot_t, Range> ComparisonRanges(const Expression& predicate,
+                                                   const Schema& schema) {
   std::unordered_map<slot_t, Range> result;
   for (const Expression& conjunct : SplitConjuncts(predicate)) {
     if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
@@ -501,8 +500,8 @@ std::unordered_map<slot_t, Range> ComparisonRanges(
     if (offset < 0) {
       continue;
     }
-    result[static_cast<slot_t>(offset)].Update(
-        binary.Op(), constant->GetValue(), direction);
+    result[static_cast<slot_t>(offset)].Update(binary.Op(),
+                                               constant->GetValue(), direction);
   }
   return result;
 }
@@ -521,8 +520,7 @@ std::vector<PlanAlternative> ScanAlternatives(
   // clause (Phase 2 pushdown); it must be applied in full because the root
   // SelectionPlan wrap no longer exists. Conjuncts speak relation identities
   // while scan machinery speaks physical table names, so translate down.
-  Expression filter =
-      QualifyDown(memo.Get(group).filter, relation, physical);
+  Expression filter = QualifyDown(memo.Get(group).filter, relation, physical);
   // Canonicalize the neutral predicate before access-path costing. Keeping a
   // literal TRUE as a non-null filter would disable safe unordered LIMIT
   // pushdown into FullScan even though it cannot reject a row.
@@ -535,9 +533,8 @@ std::vector<PlanAlternative> ScanAlternatives(
   const Expression scan_predicate =
       filter ? filter : ConstantValueExp(Value(true));
   const bool no_filter =
-      !filter ||
-      (filter->Type() == TypeTag::kConstantValue &&
-       filter->AsConstantValue().GetValue().Truthy());
+      !filter || (filter->Type() == TypeTag::kConstantValue &&
+                  filter->AsConstantValue().GetValue().Truthy());
   std::vector<NamedExpression> fallback_select;
   if (const auto found = context.scan_projections.find(relation);
       found != context.scan_projections.end()) {
@@ -722,8 +719,8 @@ std::vector<PlanAlternative> ScanAlternatives(
       // near-identical bitmaps whose AND cannot beat the regular composite
       // range scan (e.g. TPC-C customer lookups hit the (w,d,id) primary
       // index, not two overlapping w-prefix bitmaps).
-      auto leading_key_range = [&](const Index& candidate)
-          -> const std::pair<const slot_t, Range>* {
+      auto leading_key_range =
+          [&](const Index& candidate) -> const std::pair<const slot_t, Range>* {
         const auto found = ranges.find(candidate.sc_.key_.front());
         if (found == ranges.end() ||
             (!found->second.min && !found->second.max)) {
@@ -778,8 +775,7 @@ std::vector<PlanAlternative> ScanAlternatives(
           std::vector<BitmapIndexRange> or_ranges;
           for (const Expression& disjunct : disjuncts) {
             const auto disjunct_ranges = ComparisonRanges(disjunct, schema);
-            const auto found =
-                disjunct_ranges.find(index.sc_.key_.front());
+            const auto found = disjunct_ranges.find(index.sc_.key_.front());
             if (found == disjunct_ranges.end() ||
                 (!found->second.min && !found->second.max)) {
               or_ranges.clear();
@@ -800,14 +796,14 @@ std::vector<PlanAlternative> ScanAlternatives(
                 table, statistics, std::move(or_ranges), BitmapCombine::kOr,
                 scan_predicate, statistics.Rows(), statistics.Rows());
             if (fallback_select.size() != bitmap->GetSchema().ColumnCount()) {
-              bitmap = std::make_shared<ProjectionPlan>(bitmap, fallback_select);
+              bitmap =
+                  std::make_shared<ProjectionPlan>(bitmap, fallback_select);
             }
             bitmap = finalize(bitmap);
-            candidates.push_back(PlanAlternative{.plan = std::move(bitmap),
-                                                 .local_cost = 0.0,
-                                                 .estimated_rows =
-                                                     filter_selectivity *
-                                                     statistics.Rows()});
+            candidates.push_back(PlanAlternative{
+                .plan = std::move(bitmap),
+                .local_cost = 0.0,
+                .estimated_rows = filter_selectivity * statistics.Rows()});
           }
         }
       }
@@ -1045,7 +1041,8 @@ std::vector<PlanAlternative> ScanAlternatives(
     if (filter) {
       const std::vector<Expression> conjuncts = SplitConjuncts(filter);
       for (const Expression& conjunct : conjuncts) {
-        if (auto simple = relational_detail::TryCompileSimpleCompare(conjunct, schema)) {
+        if (auto simple =
+                relational_detail::TryCompileSimpleCompare(conjunct, schema)) {
           if (simple->int_payload) {
             IntegerPeekCompare peek;
             peek.column = simple->column;
@@ -1056,11 +1053,12 @@ std::vector<PlanAlternative> ScanAlternatives(
         }
       }
     }
-    Plan full_scan = scan_peeks.empty()
-        ? static_cast<Plan>(std::make_shared<FullScanPlan>(
-              table, statistics, scan_limit))
-        : static_cast<Plan>(std::make_shared<FullScanPlan>(
-              table, statistics, std::move(scan_peeks), scan_limit));
+    Plan full_scan =
+        scan_peeks.empty()
+            ? static_cast<Plan>(
+                  std::make_shared<FullScanPlan>(table, statistics, scan_limit))
+            : static_cast<Plan>(std::make_shared<FullScanPlan>(
+                  table, statistics, std::move(scan_peeks), scan_limit));
     if (filter) {
       full_scan =
           std::make_shared<SelectionPlan>(full_scan, filter, statistics);
@@ -1530,8 +1528,8 @@ StatusOr<Plan> OptimizeSingleRelation(
         const int target_slot = schema.Offset(target);
         if (target_slot >= 0 &&
             schema.GetColumn(static_cast<size_t>(target_slot))
-                .GetConstraint()
-                .ctype != Constraint::kNothing) {
+                    .GetConstraint()
+                    .ctype != Constraint::kNothing) {
           const auto& column_constraint =
               schema.GetColumn(static_cast<size_t>(target_slot))
                   .GetConstraint();
@@ -1539,7 +1537,8 @@ StatusOr<Plan> OptimizeSingleRelation(
               column_constraint.ctype == Constraint::kNotNull ||
               column_constraint.ctype == Constraint::kPrimaryKey;
           if (non_null) {
-            const TableStatistics& statistics = *context.statistics.at(relation);
+            const TableStatistics& statistics =
+                *context.statistics.at(relation);
             for (size_t index_offset = 0; index_offset < table.IndexCount();
                  ++index_offset) {
               const Index& index = table.GetIndex(index_offset);
@@ -1636,8 +1635,8 @@ StatusOr<Plan> OptimizeSingleRelation(
                     i < query.order_nulls_first_.size()
                         ? query.order_nulls_first_[i]
                         : std::nullopt};
-        (i < prefix_length ? prefix_keys : suffix_keys).push_back(
-            std::move(key));
+        (i < prefix_length ? prefix_keys : suffix_keys)
+            .push_back(std::move(key));
       }
       plan = std::make_shared<IncrementalSortPlan>(
           std::move(plan), std::move(prefix_keys), std::move(suffix_keys));
@@ -1673,10 +1672,9 @@ StatusOr<Plan> OptimizeSingleRelation(
   if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
     const bool needs_ordering = !sort_expressions.empty();
     const bool topn = std::dynamic_pointer_cast<TopNPlan>(plan) != nullptr;
-    if (!topn &&
-        (!needs_ordering ||
-         plan->IsOrderedBy(sort_expressions, query.order_ascending_,
-                           slice_nulls(sort_expressions.size())))) {
+    if (!topn && (!needs_ordering ||
+                  plan->IsOrderedBy(sort_expressions, query.order_ascending_,
+                                    slice_nulls(sort_expressions.size())))) {
       plan = std::make_shared<LimitPlan>(std::move(plan), query.limit_count_,
                                          query.limit_offset_);
     }
@@ -2344,11 +2342,10 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                                                        *statistics->second);
             Plan aggregate = std::make_shared<HashAggregatePlan>(
                 std::move(scan), logical.target_list);
-            return std::vector<PlanAlternative>{
-                PlanAlternative{.plan = std::move(aggregate),
-                                .local_cost =
-                                    static_cast<double>(statistics->second->Rows()),
-                                .estimated_rows = 1.0}};
+            return std::vector<PlanAlternative>{PlanAlternative{
+                .plan = std::move(aggregate),
+                .local_cost = static_cast<double>(statistics->second->Rows()),
+                .estimated_rows = 1.0}};
           }
           Plan values = std::make_shared<ValuesPlan>(logical.output_schema,
                                                      logical.values);

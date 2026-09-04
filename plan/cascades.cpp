@@ -23,13 +23,13 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
-#include "executor/detail/scan_filter.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "query/query_data.hpp"
@@ -264,9 +264,9 @@ Expression CanonicalizeConjuncts(const Expression& predicate) {
 // Example: OR(AND(t1.a=1, t2.b=2), AND(t1.a=3, t2.b=4))
 //   → t1 scan filter: OR(t1.a=1, t1.a=3)
 //   → t2 scan filter: OR(t2.b=2, t2.b=4)
-void PushOrLocalConditions(Memo& memo, const Expression& or_expr,
-                           const std::function<bool(const std::string&)>&
-                               relation_enabled) {
+void PushOrLocalConditions(
+    Memo& memo, const Expression& or_expr,
+    const std::function<bool(const std::string&)>& relation_enabled) {
   if (!or_expr || or_expr->Type() != TypeTag::kBinaryExp ||
       or_expr->AsBinaryExpression().Op() != BinaryOperation::kOr) {
     return;
@@ -5921,7 +5921,6 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
       // Aggregation collapses the input; ordering and row positions die here.
       return {PhysicalProperties{}};
     case LogicalOperator::kSelection:
-    case LogicalOperator::kProjection:
     case LogicalOperator::kLimit:
     case LogicalOperator::kDistinct:
     case LogicalOperator::kMax1Row:
@@ -5940,6 +5939,61 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
     case LogicalOperator::kAssert:
       // Row-filtering and row-shaping operators pass rows through in order.
       return {required};
+    case LogicalOperator::kProjection: {
+      // A projection renames columns: the parent's ordering is expressed in
+      // output-name space, and pushing it through unchanged asks the child
+      // for columns it does not expose (e.g. sorting below a projection by a
+      // SELECT-list alias).  Translate each key to the projected input
+      // column it derives from; a key that does not project from a simple
+      // input column makes the ordering undeliverable below, so drop it and
+      // let the parent enforce it above the projection.
+      PhysicalProperties child = required;
+      if (!child.ordering.empty()) {
+        std::vector<ColumnName> translated;
+        translated.reserve(child.ordering.size());
+        for (const ColumnName& column : child.ordering) {
+          bool mapped = false;
+          for (const NamedExpression& output : expression.target_list) {
+            if (!output.expression ||
+                output.expression->Type() != TypeTag::kColumnValue) {
+              continue;
+            }
+            const ColumnName& source =
+                output.expression->AsColumnValue().GetColumnName();
+            const auto identifier_equals = [](std::string_view left,
+                                              std::string_view right) {
+              return left.size() == right.size() &&
+                     std::equal(
+                         left.begin(), left.end(), right.begin(),
+                         [](char lhs, char rhs) {
+                           return std::tolower(
+                                      static_cast<unsigned char>(lhs)) ==
+                                  std::tolower(static_cast<unsigned char>(rhs));
+                         });
+            };
+            const bool name_matches =
+                identifier_equals(output.name, column.name) ||
+                identifier_equals(source.name, column.name);
+            const bool qualified_matches =
+                !column.schema.empty() && source == column;
+            if (name_matches || qualified_matches) {
+              translated.push_back(source);
+              mapped = true;
+              break;
+            }
+          }
+          if (!mapped) {
+            translated.clear();
+            child.ordering.clear();
+            break;
+          }
+        }
+        if (!translated.empty()) {
+          child.ordering = std::move(translated);
+        }
+      }
+      return {child};
+    }
     case LogicalOperator::kUnion:
     case LogicalOperator::kUnionAll:
     case LogicalOperator::kIntersect:

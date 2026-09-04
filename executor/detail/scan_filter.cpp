@@ -334,8 +334,7 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
     // the branch evaluation overhead exceeds the original tree traversal.
     if (predicate->Type() == TypeTag::kBinaryExp &&
         predicate->AsBinaryExpression().Op() == BinaryOperation::kOr) {
-      std::vector<Expression> disjuncts =
-          SplitDisjuncts(predicate);
+      std::vector<Expression> disjuncts = SplitDisjuncts(predicate);
       if (disjuncts.size() >= 2 && !ContainsQuery(predicate)) {
         bool all_branches_usable = true;
         std::vector<CompiledScanFilter::DisjunctiveBranch> branches;
@@ -393,7 +392,7 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
       Expression combined = compiled.residual[0];
       for (size_t i = 1; i < compiled.residual.size(); ++i) {
         combined = BinaryExpressionExp(combined, BinaryOperation::kAnd,
-                                      compiled.residual[i]);
+                                       compiled.residual[i]);
       }
       if (auto bytecode = BytecodeCompiler::Compile(combined, schema)) {
         compiled.residual_bytecode = std::move(*bytecode);
@@ -443,12 +442,9 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
         }
       }
       if (branch_ok && !branch.residual.empty()) {
-        Scope scope{.row = match_row,
-                    .schema = &schema,
-                    .outer = outer};
+        Scope scope{.row = match_row, .schema = &schema, .outer = outer};
         for (const Expression& predicate : branch.residual) {
-          if (!Truthy(
-                  Evaluate(predicate, scope, nullptr, context, ctes))) {
+          if (!Truthy(Evaluate(predicate, scope, nullptr, context, ctes))) {
             branch_ok = false;
             break;
           }

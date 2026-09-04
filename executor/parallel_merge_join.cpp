@@ -124,7 +124,18 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
     while (l < range.left_end && r < range.right_end) {
       if (KeyIsNull(left_rows_[l].first, left_cols_)) {
         if (kind_ == JoinKind::kAnti || kind_ == JoinKind::kLeftOuter) {
-          out.emplace_back(left_rows_[l].first, left_rows_[l].second);
+          if (kind_ == JoinKind::kLeftOuter) {
+            // NULL keys match nothing; a left-outer survivor still needs the
+            // NULL-padded right side or the partition's rows end up with
+            // mixed widths downstream.
+            std::vector<Value> vals = left_rows_[l].first.values_;
+            for (size_t c = 0; c < right_cols_.size(); ++c) {
+              vals.push_back(Value());
+            }
+            out.emplace_back(Row(std::move(vals)), left_rows_[l].second);
+          } else {
+            out.emplace_back(left_rows_[l].first, left_rows_[l].second);
+          }
         }
         ++l;
         continue;
@@ -159,7 +170,8 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
         }
         size_t r_end = r + 1;
         while (r_end < range.right_end &&
-               CompareKeys(right_rows_[r].first, right_rows_[r_end].first) == 0) {
+               CompareKeys(right_rows_[r].first, right_rows_[r_end].first) ==
+                   0) {
           ++r_end;
         }
 
@@ -265,9 +277,7 @@ void ParallelMergeJoin::EnsureMaterialized() {
   ExecuteParallelMerge();
 }
 
-void ParallelMergeJoin::MaterializePipeline() {
-  EnsureMaterialized();
-}
+void ParallelMergeJoin::MaterializePipeline() { EnsureMaterialized(); }
 
 bool ParallelMergeJoin::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
@@ -287,6 +297,7 @@ size_t ParallelMergeJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
+  destination->Reset();
   EnsureMaterialized();
   if (output_offset_ >= output_.size()) {
     return 0;

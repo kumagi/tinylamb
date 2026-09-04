@@ -2,12 +2,12 @@
 
 #include "query/sql_template.hpp"
 
-
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
-#include <exception>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -29,18 +29,17 @@
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
-#include "type/value.hpp"
-#include "type/value_type.hpp"
-#include "type/type.hpp"
+#include "query/googlesql_ast_visitor.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
+#include "type/type.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
 
-bool IsIdentChar(unsigned char c) {
-  return std::isalnum(c) != 0 || c == '_';
-}
+bool IsIdentChar(unsigned char c) { return std::isalnum(c) != 0 || c == '_'; }
 
 // std::stod/std::stoll throw out_of_range on tokens like "1e999" or 20-digit
 // integers; template extraction must never leak that exception through
@@ -49,8 +48,9 @@ bool TryParseDouble(const std::string& token, double* out) {
   try {
     size_t consumed = 0;
     const double value = std::stod(token, &consumed);
-    if (consumed != token.size()) { return false;
-}
+    if (consumed != token.size()) {
+      return false;
+    }
     *out = value;
     return true;
   } catch (const std::exception&) {
@@ -62,8 +62,9 @@ bool TryParseInt64(const std::string& token, int64_t* out) {
   try {
     size_t consumed = 0;
     const int64_t value = std::stoll(token, &consumed);
-    if (consumed != token.size()) { return false;
-}
+    if (consumed != token.size()) {
+      return false;
+    }
     *out = value;
     return true;
   } catch (const std::exception&) {
@@ -72,11 +73,11 @@ bool TryParseInt64(const std::string& token, int64_t* out) {
 }
 
 bool KeywordAt(std::string_view sql, size_t pos, std::string_view keyword) {
-  if (pos + keyword.size() > sql.size()) { return false;
-}
+  if (pos + keyword.size() > sql.size()) {
+    return false;
+  }
   for (size_t i = 0; i < keyword.size(); ++i) {
-    if (std::toupper(static_cast<unsigned char>(sql[pos + i])) !=
-        keyword[i]) {
+    if (std::toupper(static_cast<unsigned char>(sql[pos + i])) != keyword[i]) {
       return false;
     }
   }
@@ -99,17 +100,26 @@ bool SkipBindConstant(const Value& value) {
 // literals shifts every later parameter and silently rewrites operator or
 // field-name slots into user data.
 bool IsStructuralCallArg(std::string_view func, size_t index) {
-  if (func == "__quantified__") { return index >= 2; }
-  if (func == "__struct_json__") { return index % 3 != 1; }
-  if (func == "make_interval" || func == "get_field") { return index == 1; }
+  if (func == "__quantified__") {
+    return index >= 2;
+  }
+  if (func == "__struct_json__") {
+    return index % 3 != 1;
+  }
+  if (func == "make_interval" || func == "get_field") {
+    return index == 1;
+  }
   return false;
 }
 
 Expression BindExpression(const Expression& expression,
                           const std::vector<Value>& parameters, size_t* index);
 
-NamedExpression BindNamed(const NamedExpression& item,  // NOLINT(misc-no-recursion) // Recursive expression-tree binding by design; trees are parser-bounded in depth.
-                          const std::vector<Value>& parameters, size_t* index) {
+NamedExpression BindNamed(
+    const NamedExpression&
+        item,  // NOLINT(misc-no-recursion) // Recursive expression-tree binding
+               // by design; trees are parser-bounded in depth.
+    const std::vector<Value>& parameters, size_t* index) {
   return {item.name, BindExpression(item.expression, parameters, index)};
 }
 
@@ -117,15 +127,20 @@ std::shared_ptr<SelectStatement> BindSelect(
     const SelectStatement& select, const std::vector<Value>& parameters,
     size_t* index);
 
-Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recursion) // Recursive expression-tree binding by design; trees are parser-bounded in depth.
-                          const std::vector<Value>& parameters, size_t* index) {
-  if (!expression) { return expression;
-}
+Expression BindExpression(
+    const Expression&
+        expression,  // NOLINT(misc-no-recursion) // Recursive expression-tree
+                     // binding by design; trees are parser-bounded in depth.
+    const std::vector<Value>& parameters, size_t* index) {
+  if (!expression) {
+    return expression;
+  }
   switch (expression->Type()) {
     case TypeTag::kConstantValue: {
       const Value current = expression->AsConstantValue().GetValue();
-      if (SkipBindConstant(current)) { return expression;
-}
+      if (SkipBindConstant(current)) {
+        return expression;
+      }
       if (*index >= parameters.size()) {
         throw std::runtime_error("SQL template parameter underflow");
       }
@@ -145,8 +160,9 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
       // back to parsing the statement verbatim.
       if (current.type == ValueType::kVarChar &&
           parameter.type == ValueType::kDate) {
-        throw std::runtime_error("SQL template literal type mismatch: date "
-                                 "literal bound into a string slot");
+        throw std::runtime_error(
+            "SQL template literal type mismatch: date "
+            "literal bound into a string slot");
       }
       return ConstantValueExp(parameter);
     }
@@ -156,12 +172,13 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
       const auto& binary = expression->AsBinaryExpression();
       Expression left = BindExpression(binary.Left(), parameters, index);
       Expression right = BindExpression(binary.Right(), parameters, index);
-      return BinaryExpressionExp(std::move(left), binary.Op(), std::move(right));
+      return BinaryExpressionExp(std::move(left), binary.Op(),
+                                 std::move(right));
     }
     case TypeTag::kUnaryExp: {
       const auto& unary = expression->AsUnaryExpression();
-      return UnaryExpressionExp(BindExpression(unary.Child(), parameters, index),
-                                unary.Op());
+      return UnaryExpressionExp(
+          BindExpression(unary.Child(), parameters, index), unary.Op());
     }
     case TypeTag::kAggregateExp: {
       const auto& aggregate = expression->AsAggregateExpression();
@@ -236,7 +253,8 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
     case TypeTag::kCastExp: {
       const auto& cast = expression->AsCastExpression();
       Expression child = BindExpression(cast.Child(), parameters, index);
-      return std::make_shared<CastExpression>(std::move(child), cast.TargetTypeName(), cast.ReturnNullOnError());
+      return std::make_shared<CastExpression>(
+          std::move(child), cast.TargetTypeName(), cast.ReturnNullOnError());
     }
     default:
       // Unhandled expression kinds return the cached tree's subtree SHARED
@@ -254,40 +272,55 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
 // statements (improvements2.md §7.1).
 bool ContainsBindableConstant(const Expression& expression);
 
-bool SelectHasBindableConstant(const SelectStatement& select) {  // NOLINT(misc-no-recursion) // Recursive statement-tree scan by design; trees are parser-bounded in depth.
+bool SelectHasBindableConstant(
+    const SelectStatement&
+        select) {  // NOLINT(misc-no-recursion) // Recursive statement-tree scan
+                   // by design; trees are parser-bounded in depth.
   for (const NamedExpression& item : select.SelectList()) {
-    if (ContainsBindableConstant(item.expression)) { return true;
-}
+    if (ContainsBindableConstant(item.expression)) {
+      return true;
+    }
   }
-  if (ContainsBindableConstant(select.WhereClause())) { return true;
-}
+  if (ContainsBindableConstant(select.WhereClause())) {
+    return true;
+  }
   for (const Expression& key : select.GroupBy()) {
-    if (ContainsBindableConstant(key)) { return true;
-}
+    if (ContainsBindableConstant(key)) {
+      return true;
+    }
   }
-  if (ContainsBindableConstant(select.Having())) { return true;
-}
+  if (ContainsBindableConstant(select.Having())) {
+    return true;
+  }
   for (const auto& term : select.OrderBy()) {
-    if (ContainsBindableConstant(term.expression)) { return true;
-}
+    if (ContainsBindableConstant(term.expression)) {
+      return true;
+    }
   }
   for (const SelectSource& source : select.Sources()) {
-    if (ContainsBindableConstant(source.join_condition)) { return true;
-}
+    if (ContainsBindableConstant(source.join_condition)) {
+      return true;
+    }
     if (source.query && SelectHasBindableConstant(*source.query)) {
       return true;
     }
   }
   return std::ranges::any_of(
       select.WithQueries(),
-      [](const auto& entry) {  // NOLINT(misc-no-recursion) // Recursive statement-tree scan by design; trees are parser-bounded in depth.
+      [](const auto&
+             entry) {  // NOLINT(misc-no-recursion) // Recursive statement-tree
+                       // scan by design; trees are parser-bounded in depth.
         return SelectHasBindableConstant(*entry.second);
       });
 }
 
-bool ContainsBindableConstant(const Expression& expression) {  // NOLINT(misc-no-recursion) // Recursive expression-tree scan by design; trees are parser-bounded in depth.
-  if (!expression) { return false;
-}
+bool ContainsBindableConstant(
+    const Expression&
+        expression) {  // NOLINT(misc-no-recursion) // Recursive expression-tree
+                       // scan by design; trees are parser-bounded in depth.
+  if (!expression) {
+    return false;
+  }
   switch (expression->Type()) {
     case TypeTag::kConstantValue:
       return !SkipBindConstant(expression->AsConstantValue().GetValue());
@@ -297,8 +330,7 @@ bool ContainsBindableConstant(const Expression& expression) {  // NOLINT(misc-no
              ContainsBindableConstant(binary.Right());
     }
     case TypeTag::kUnaryExp:
-      return ContainsBindableConstant(
-          expression->AsUnaryExpression().Child());
+      return ContainsBindableConstant(expression->AsUnaryExpression().Child());
     case TypeTag::kAggregateExp:
       return ContainsBindableConstant(
           expression->AsAggregateExpression().Child());
@@ -314,25 +346,29 @@ bool ContainsBindableConstant(const Expression& expression) {  // NOLINT(misc-no
     }
     case TypeTag::kInExp: {
       const auto& in = expression->AsInExpression();
-      if (ContainsBindableConstant(in.child_)) { return true;
-}
+      if (ContainsBindableConstant(in.child_)) {
+        return true;
+      }
       return std::ranges::any_of(in.list_, ContainsBindableConstant);
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
       for (size_t i = 0; i < call.Args().size(); ++i) {
-        if (IsStructuralCallArg(call.FuncName(), i)) { continue;
-}
-        if (ContainsBindableConstant(call.Args()[i])) { return true;
-}
+        if (IsStructuralCallArg(call.FuncName(), i)) {
+          continue;
+        }
+        if (ContainsBindableConstant(call.Args()[i])) {
+          return true;
+        }
       }
       return false;
     }
     case TypeTag::kArrayExp:
       for (const Expression& element :
            expression->AsArrayExpression().Elements()) {
-        if (ContainsBindableConstant(element)) { return true;
-}
+        if (ContainsBindableConstant(element)) {
+          return true;
+        }
       }
       return false;
     case TypeTag::kQueryExp: {
@@ -341,14 +377,15 @@ bool ContainsBindableConstant(const Expression& expression) {  // NOLINT(misc-no
              SelectHasBindableConstant(*query.Query());
     }
     case TypeTag::kCastExp:
-      return ContainsBindableConstant(
-          expression->AsCastExpression().Child());
+      return ContainsBindableConstant(expression->AsCastExpression().Child());
     default:
       return false;
   }
 }
 
-std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by design; trees are parser-bounded in depth.
+std::shared_ptr<SelectStatement>
+BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
+             // design; trees are parser-bounded in depth.
     const SelectStatement& select, const std::vector<Value>& parameters,
     size_t* index) {
   std::vector<std::pair<std::string, std::shared_ptr<SelectStatement>>> withs;
@@ -424,14 +461,35 @@ std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Re
   auto result = std::make_shared<SelectStatement>(
       std::move(items), select.FromClause(), std::move(where), std::move(order),
       select.Limit(), select.Offset(), select.Distinct());
+  // The constructor sets limit_ but not has_limit_; re-apply every clause the
+  // re-bound statement must preserve, otherwise a template-cache hit rebuilds
+  // a statement that silently drops LIMIT / QUALIFY / DISTINCT ON / WITH TIES
+  // / AS STRUCT (the visitor's SubstituteInSelect copies all of these).
+  result->SetLimit(select.HasLimit() ? std::optional<size_t>(select.Limit())
+                                     : std::nullopt);
   for (const auto& [alias, table] : select.Aliases()) {
     result->AddAlias(alias, table);
   }
   result->SetSources(std::move(sources));
-  if (!group.empty()) { result->SetGroupBy(std::move(group));
-}
-  if (having) { result->SetHaving(std::move(having));
-}
+  if (!group.empty()) {
+    result->SetGroupBy(std::move(group));
+  }
+  if (having) {
+    result->SetHaving(std::move(having));
+  }
+  if (select.Qualify()) {
+    result->SetQualify(BindExpression(select.Qualify(), parameters, index));
+  }
+  if (select.HasDistinctOn()) {
+    std::vector<Expression> distinct_on;
+    distinct_on.reserve(select.DistinctOn().size());
+    for (const Expression& item : select.DistinctOn()) {
+      distinct_on.push_back(BindExpression(item, parameters, index));
+    }
+    result->SetDistinctOn(std::move(distinct_on));
+  }
+  result->SetWithTies(select.WithTies());
+  result->SetAsStruct(select.AsStruct());
   // UNION ALL branches appear after the main SELECT in SQL text, so bind
   // them last (after every main-select parameter) in branch order. Dropping
   // them silently shrank re-bound statements to their first branch.
@@ -441,18 +499,17 @@ std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Re
         branch_index < select.SetOperationKinds().size()
             ? select.SetOperationKinds()[branch_index]
             : SetOperationKind::kUnionAll;
-    const SetOperationMatch match =
-        branch_index < select.Matches().size() ? select.Matches()[branch_index]
-                                               : SetOperationMatch{};
-    result->AddSetOperation(kind,
-                            BindSelect(*select.UnionAll()[branch_index],
-                                       parameters, index),
-                            match);
+    const SetOperationMatch match = branch_index < select.Matches().size()
+                                        ? select.Matches()[branch_index]
+                                        : SetOperationMatch{};
+    result->AddSetOperation(
+        kind, BindSelect(*select.UnionAll()[branch_index], parameters, index),
+        match);
   }
   if (select.GetSetOperationTree() != nullptr) {
     auto tree = std::make_shared<SetOperationTree>();
-    tree->first = BindSelect(*select.GetSetOperationTree()->first, parameters,
-                             index);
+    tree->first =
+        BindSelect(*select.GetSetOperationTree()->first, parameters, index);
     tree->kinds = select.GetSetOperationTree()->kinds;
     tree->grouped = select.GetSetOperationTree()->grouped;
     tree->branches.reserve(select.GetSetOperationTree()->branches.size());
@@ -467,26 +524,32 @@ std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Re
   for (auto& [name, query] : withs) {
     result->AddWithQuery(name, std::move(query));
   }
-  if (select.RequiresRelationalEvaluation()) { result->MarkComplex();
-}
+  if (select.RequiresRelationalEvaluation()) {
+    result->MarkComplex();
+  }
   return result;
 }
 
 // Returns the end offset (exclusive) of the "$$"/"$tag$" opener at pos, or
 // pos when the token is not a dollar-quote opener.
 size_t DollarQuoteDelimiterEnd(std::string_view sql, size_t pos) {
-  if (pos + 1 >= sql.size()) { return pos;
-}
-  if (sql[pos + 1] == '$') { return pos + 2;
-}
+  if (pos + 1 >= sql.size()) {
+    return pos;
+  }
+  if (sql[pos + 1] == '$') {
+    return pos + 2;
+  }
   const auto first = static_cast<unsigned char>(sql[pos + 1]);
-  if (std::isalpha(first) == 0 && first != '_') { return pos;
-}
+  if (std::isalpha(first) == 0 && first != '_') {
+    return pos;
+  }
   size_t j = pos + 1;
-  while (j < sql.size() && IsIdentChar(sql[j])) { ++j;
-}
-  if (j < sql.size() && sql[j] == '$') { return j + 1;
-}
+  while (j < sql.size() && IsIdentChar(sql[j])) {
+    ++j;
+  }
+  if (j < sql.size() && sql[j] == '$') {
+    return j + 1;
+  }
   return pos;
 }
 
@@ -549,6 +612,7 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       continue;
     }
     if (c == '\'') {
+      const size_t quote_pos = i;
       ++i;
       std::string literal;
       while (i < sql.size()) {
@@ -563,6 +627,24 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         }
         literal.push_back(sql[i]);
         ++i;
+      }
+      // PRODUCTION FIX (Q3): a TIMESTAMP '...' literal is UTC-normalized by
+      // the visitor on the first parse, but the template/plan caches replayed
+      // the RAW string parameter on later runs, so the same SQL returned a
+      // different value the second time.  Normalize at extraction so every
+      // consumer observes the same value.  The normalization is idempotent,
+      // so re-binding a cached constant stays correct.
+      // `quote_pos` is the opening quote; walk back over whitespace to the end
+      // of the preceding token, then inspect the 9-char keyword window.
+      size_t kw_end = quote_pos;
+      while (0 < kw_end &&
+             std::isspace(static_cast<unsigned char>(sql[kw_end - 1])) != 0) {
+        --kw_end;
+      }
+      if (9 <= kw_end &&
+          std::string_view(sql.data() + kw_end - 9, 9) == "TIMESTAMP" &&
+          (kw_end == 9 || !IsIdentChar(sql[kw_end - 10]))) {
+        literal = NormalizeTimestampText(literal);
       }
       result.parameters.emplace_back(std::move(literal));
       result.fingerprint += "'?'";
@@ -627,7 +709,8 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         result.fingerprint.push_back(sql[i]);
         ++i;
       }
-      while (i < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i])) != 0) {
+      while (i < sql.size() &&
+             std::isdigit(static_cast<unsigned char>(sql[i])) != 0) {
         result.fingerprint.push_back(sql[i]);
         ++i;
       }
@@ -658,8 +741,9 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       if (i < sql.size() && (sql[i] == 'e' || sql[i] == 'E')) {
         is_float = true;
         ++i;
-        if (i < sql.size() && (sql[i] == '+' || sql[i] == '-')) { ++i;
-}
+        if (i < sql.size() && (sql[i] == '+' || sql[i] == '-')) {
+          ++i;
+        }
         while (i < sql.size() &&
                std::isdigit(static_cast<unsigned char>(sql[i])) != 0) {
           ++i;
@@ -694,8 +778,9 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
     result.fingerprint.push_back(sql[i]);
     ++i;
   }
-  if (result.parameters.empty()) { result.templatable = false;
-}
+  if (result.parameters.empty()) {
+    result.templatable = false;
+  }
   return result;
 }
 
@@ -705,8 +790,8 @@ std::unique_ptr<Statement> BindStatementLiterals(
   std::unique_ptr<Statement> bound;
   switch (statement.Type()) {
     case StatementType::kSelect: {
-      auto select = BindSelect(
-          dynamic_cast<const SelectStatement&>(statement), parameters, &index);
+      auto select = BindSelect(dynamic_cast<const SelectStatement&>(statement),
+                               parameters, &index);
       bound = std::make_unique<SelectStatement>(std::move(*select));
       break;
     }

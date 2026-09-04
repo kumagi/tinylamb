@@ -3,8 +3,8 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <ios>
 #include <filesystem>
+#include <ios>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -15,8 +15,8 @@
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
-#include "type/row.hpp"
 #include "page/row_position.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
 namespace {

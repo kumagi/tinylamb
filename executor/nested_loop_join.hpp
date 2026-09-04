@@ -48,6 +48,10 @@ class NestedLoopJoin : public ExecutorBase {
   Schema combined_schema_;
 
   bool materialized_{false};
+  // Latched when Materialize() throws: both children are drained by then, so
+  // a retry would observe empty inputs and silently return zero rows.  The
+  // original error is rethrown instead.
+  std::exception_ptr materialize_error_;
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};
 };

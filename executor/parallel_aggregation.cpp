@@ -1,15 +1,13 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/parallel_aggregation.hpp"
 
-#include "executor/detail/expression_eval.hpp"
-
 #include <algorithm>
-#include <cmath>
-#include <limits>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -19,12 +17,13 @@
 #include <utility>
 #include <vector>
 
-#include "executor/executor_base.hpp"
-#include "executor/data_chunk.hpp"
 #include "common/constants.hpp"
-#include "expression/aggregate_expression.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/data_chunk.hpp"
+#include "executor/detail/expression_eval.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -46,10 +45,15 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
     const auto& aggregate =
         aggregates_[index].expression->AsAggregateExpression();
     AggregateInput input;
-    if (IsCountStar(aggregate)) {
+    // Aggregates carrying a FILTER(WHERE ...) predicate (pushed down by the
+    // filter_aggregate_pushdown rule) must go through the generic path, which
+    // evaluates the predicate per row. The typed fast paths (row count and
+    // column scans) ignore WhereFilter and would silently over-count.
+    const bool has_filter = static_cast<bool>(aggregate.WhereFilter());
+    if (IsCountStar(aggregate) && !has_filter) {
       input.kind = AggregateInputKind::kRowCount;
       row_count_indices_.push_back(index);
-    } else if (!aggregate.Distinct() &&
+    } else if (!aggregate.Distinct() && !has_filter &&
                aggregate.Child()->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
@@ -82,19 +86,23 @@ ParallelAggregationExecutor::MakeState() const {
   for (size_t index = 0; index < aggregates_.size(); ++index) {
     const AggregationType type =
         aggregates_[index].expression->AsAggregateExpression().GetType();
-    if (type == AggregationType::kCount) { state.values[index] = Value(0);
-}
-    if (type == AggregationType::kAvg) { state.values[index] = Value(0.0);
-}
+    if (type == AggregationType::kCount) {
+      state.values[index] = Value(0);
+    }
+    if (type == AggregationType::kAvg) {
+      state.values[index] = Value(0.0);
+    }
   }
   return state;
 }
 
-void ParallelAggregationExecutor::AccumulateValue(
-    PartialState* state, size_t index, const Value& value,
-    bool apply_distinct) const {
-  if (value.IsNull()) { return;
-}
+void ParallelAggregationExecutor::AccumulateValue(PartialState* state,
+                                                  size_t index,
+                                                  const Value& value,
+                                                  bool apply_distinct) const {
+  if (value.IsNull()) {
+    return;
+  }
   const auto& aggregate =
       aggregates_[index].expression->AsAggregateExpression();
   if (aggregate.GetType() == AggregationType::kSum ||
@@ -109,17 +117,17 @@ void ParallelAggregationExecutor::AccumulateValue(
     const size_t bytes = EstimateValueBytes(value);
     QueryMemoryBudget::Global().ReserveForced(bytes);
     if (!state->distinct_values[index]
-                   .insert(relational_detail::CanonicalDistinctValue(value))
-                   .second) {
+             .insert(relational_detail::CanonicalDistinctValue(value))
+             .second) {
       QueryMemoryBudget::Global().Release(bytes);
       return;
     }
+    state->distinct_charged_bytes += bytes;
   }
   switch (aggregate.GetType()) {
     case AggregationType::kSum:
-      state->values[index] = state->values[index].IsNull()
-                                 ? value
-                                 : state->values[index] + value;
+      state->values[index] =
+          state->values[index].IsNull() ? value : state->values[index] + value;
       break;
     case AggregationType::kAvg:
       state->values[index].value.double_value +=
@@ -145,14 +153,18 @@ void ParallelAggregationExecutor::AccumulateValue(
       if (state->values[index].IsNull()) {
         state->values[index] = Value(value.Truthy() ? int64_t{1} : int64_t{0});
       } else {
-        state->values[index] = Value((state->values[index].Truthy() && value.Truthy()) ? int64_t{1} : int64_t{0});
+        state->values[index] = Value(
+            (state->values[index].Truthy() && value.Truthy()) ? int64_t{1}
+                                                              : int64_t{0});
       }
       break;
     case AggregationType::kLogicalOr:
       if (state->values[index].IsNull()) {
         state->values[index] = Value(value.Truthy() ? int64_t{1} : int64_t{0});
       } else {
-        state->values[index] = Value((state->values[index].Truthy() || value.Truthy()) ? int64_t{1} : int64_t{0});
+        state->values[index] = Value(
+            (state->values[index].Truthy() || value.Truthy()) ? int64_t{1}
+                                                              : int64_t{0});
       }
       break;
     default:
@@ -214,6 +226,18 @@ void ParallelAggregationExecutor::AccumulateGeneric(
       }
       const auto& aggregate =
           aggregates_[index].expression->AsAggregateExpression();
+      // FILTER(WHERE ...) predicate: skip the row for this aggregate when the
+      // predicate is not TRUE (mirrors the serial AggregationExecutor).
+      if (aggregate.WhereFilter()) {
+        if (!materialized) {
+          materialized = chunk.RowAt(row_index);
+        }
+        const Value keep =
+            aggregate.WhereFilter()->Evaluate(*materialized, input_schema_);
+        if (keep.IsNull() || !keep.Truthy()) {
+          continue;
+        }
+      }
       Value value;
       if (IsCountStar(aggregate)) {
         value = Value(1);
@@ -221,16 +245,18 @@ void ParallelAggregationExecutor::AccumulateGeneric(
         const int offset = input_schema_.Offset(
             aggregate.Child()->AsColumnValue().GetColumnName());
         if (offset >= 0) {
-          value = chunk.ColumnAt(static_cast<size_t>(offset))
-                      .ValueAt(row_index);
+          value =
+              chunk.ColumnAt(static_cast<size_t>(offset)).ValueAt(row_index);
         } else {
-          if (!materialized) { materialized = chunk.RowAt(row_index);
-}
+          if (!materialized) {
+            materialized = chunk.RowAt(row_index);
+          }
           value = aggregate.Child()->Evaluate(*materialized, input_schema_);
         }
       } else {
-        if (!materialized) { materialized = chunk.RowAt(row_index);
-}
+        if (!materialized) {
+          materialized = chunk.RowAt(row_index);
+        }
         value = aggregate.Child()->Evaluate(*materialized, input_schema_);
       }
       AccumulateValue(state, index, value, true);
@@ -241,15 +267,17 @@ void ParallelAggregationExecutor::AccumulateGeneric(
 void ParallelAggregationExecutor::AccumulateInt64Column(
     PartialState* state, size_t aggregate_index,
     const ColumnVector& column) const {
-  const AggregationType type =
-      aggregates_[aggregate_index].expression->AsAggregateExpression().GetType();
+  const AggregationType type = aggregates_[aggregate_index]
+                                   .expression->AsAggregateExpression()
+                                   .GetType();
   const std::vector<int64_t>& data = column.IntegerData();
   switch (type) {
     case AggregationType::kCount: {
       int64_t& count = state->values[aggregate_index].value.int_value;
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (!column.IsNull(row)) { ++count;
-}
+        if (!column.IsNull(row)) {
+          ++count;
+        }
       }
       break;
     }
@@ -260,31 +288,33 @@ void ParallelAggregationExecutor::AccumulateInt64Column(
       bool any = false;
       bool overflow = false;
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (column.IsNull(row)) { continue;
-}
+        if (column.IsNull(row)) {
+          continue;
+        }
         if (__builtin_add_overflow(sum, data[row], &sum)) {
           overflow = true;
         }
         any = true;
       }
-      if (!any) { break;
-}
+      if (!any) {
+        break;
+      }
       Value& total = state->values[aggregate_index];
-      if (overflow || (!total.IsNull() &&
-                       __builtin_add_overflow(total.value.int_value, sum,
-                                              &sum))) {
+      if (overflow ||
+          (!total.IsNull() &&
+           __builtin_add_overflow(total.value.int_value, sum, &sum))) {
         throw std::runtime_error("integer overflow on '+'");
       }
       total = total.IsNull() ? Value(sum) : Value(sum);
       break;
     }
     case AggregationType::kAvg: {
-      double& total =
-          state->values[aggregate_index].value.double_value;
+      double& total = state->values[aggregate_index].value.double_value;
       int64_t& count = state->counts[aggregate_index];
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (column.IsNull(row)) { continue;
-}
+        if (column.IsNull(row)) {
+          continue;
+        }
         total += static_cast<double>(data[row]);
         ++count;
       }
@@ -293,8 +323,9 @@ void ParallelAggregationExecutor::AccumulateInt64Column(
     case AggregationType::kMin: {
       Value& best = state->values[aggregate_index];
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (column.IsNull(row)) { continue;
-}
+        if (column.IsNull(row)) {
+          continue;
+        }
         if (best.IsNull() || data[row] < best.value.int_value) {
           best = Value(data[row]);
         }
@@ -304,8 +335,9 @@ void ParallelAggregationExecutor::AccumulateInt64Column(
     case AggregationType::kMax: {
       Value& best = state->values[aggregate_index];
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (column.IsNull(row)) { continue;
-}
+        if (column.IsNull(row)) {
+          continue;
+        }
         if (best.IsNull() || best.value.int_value < data[row]) {
           best = Value(data[row]);
         }
@@ -320,15 +352,17 @@ void ParallelAggregationExecutor::AccumulateInt64Column(
 void ParallelAggregationExecutor::AccumulateDoubleColumn(
     PartialState* state, size_t aggregate_index,
     const ColumnVector& column) const {
-  const AggregationType type =
-      aggregates_[aggregate_index].expression->AsAggregateExpression().GetType();
+  const AggregationType type = aggregates_[aggregate_index]
+                                   .expression->AsAggregateExpression()
+                                   .GetType();
   const std::vector<double>& data = column.DoubleData();
   switch (type) {
     case AggregationType::kCount: {
       int64_t& count = state->values[aggregate_index].value.int_value;
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (!column.IsNull(row)) { ++count;
-}
+        if (!column.IsNull(row)) {
+          ++count;
+        }
       }
       break;
     }
@@ -336,25 +370,27 @@ void ParallelAggregationExecutor::AccumulateDoubleColumn(
       double sum = 0.0;
       bool any = false;
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (column.IsNull(row)) { continue;
-}
+        if (column.IsNull(row)) {
+          continue;
+        }
         sum += data[row];
         any = true;
       }
-      if (!any) { break;
-}
+      if (!any) {
+        break;
+      }
       Value& total = state->values[aggregate_index];
-      total = total.IsNull() ? Value(sum)
-                             : Value(total.value.double_value + sum);
+      total =
+          total.IsNull() ? Value(sum) : Value(total.value.double_value + sum);
       break;
     }
     case AggregationType::kAvg: {
-      double& total =
-          state->values[aggregate_index].value.double_value;
+      double& total = state->values[aggregate_index].value.double_value;
       int64_t& count = state->counts[aggregate_index];
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (column.IsNull(row)) { continue;
-}
+        if (column.IsNull(row)) {
+          continue;
+        }
         total += data[row];
         ++count;
       }
@@ -363,8 +399,9 @@ void ParallelAggregationExecutor::AccumulateDoubleColumn(
     case AggregationType::kMin: {
       Value& best = state->values[aggregate_index];
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (column.IsNull(row)) { continue;
-}
+        if (column.IsNull(row)) {
+          continue;
+        }
         // GoogleSQL: any NaN in the group makes MIN/MAX NaN (matches the
         // serial typed path and the ground truth accumulator).
         if (std::isnan(data[row])) {
@@ -380,8 +417,9 @@ void ParallelAggregationExecutor::AccumulateDoubleColumn(
     case AggregationType::kMax: {
       Value& best = state->values[aggregate_index];
       for (size_t row = 0; row < column.Size(); ++row) {
-        if (column.IsNull(row)) { continue;
-}
+        if (column.IsNull(row)) {
+          continue;
+        }
         if (std::isnan(data[row])) {
           best = Value(std::numeric_limits<double>::quiet_NaN());
           continue;
@@ -461,7 +499,11 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
           if (destination->values[index].IsNull()) {
             destination->values[index] = source.values[index];
           } else {
-            destination->values[index] = Value((destination->values[index].Truthy() && source.values[index].Truthy()) ? int64_t{1} : int64_t{0});
+            destination->values[index] =
+                Value((destination->values[index].Truthy() &&
+                       source.values[index].Truthy())
+                          ? int64_t{1}
+                          : int64_t{0});
           }
         }
         break;
@@ -470,7 +512,11 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
           if (destination->values[index].IsNull()) {
             destination->values[index] = source.values[index];
           } else {
-            destination->values[index] = Value((destination->values[index].Truthy() || source.values[index].Truthy()) ? int64_t{1} : int64_t{0});
+            destination->values[index] =
+                Value((destination->values[index].Truthy() ||
+                       source.values[index].Truthy())
+                          ? int64_t{1}
+                          : int64_t{0});
           }
         }
         break;
@@ -485,8 +531,9 @@ Row ParallelAggregationExecutor::Finalize(PartialState state) const {
   for (size_t index = 0; index < aggregates_.size(); ++index) {
     const auto& aggregate =
         aggregates_[index].expression->AsAggregateExpression();
-    if (aggregate.GetType() != AggregationType::kAvg) { continue;
-}
+    if (aggregate.GetType() != AggregationType::kAvg) {
+      continue;
+    }
     if (state.counts[index] == 0) {
       state.values[index] = Value();
     } else {
@@ -499,10 +546,12 @@ Row ParallelAggregationExecutor::Finalize(PartialState state) const {
 
 bool ParallelAggregationExecutor::Next(Row* destination,
                                        RowPosition* /*position*/) {
-  if (errored_) { std::rethrow_exception(error_);
-}
-  if (executed_) { return false;
-}
+  if (errored_) {
+    std::rethrow_exception(error_);
+  }
+  if (executed_) {
+    return false;
+  }
   std::vector<PartialState> partials;
   partials.reserve(worker_count_);
   for (size_t worker = 0; worker < worker_count_; ++worker) {
@@ -525,15 +574,17 @@ bool ParallelAggregationExecutor::Next(Row* destination,
             std::scoped_lock input_guard(input_mutex);
             rows = child_->NextBatch(&chunk);
           }
-          if (rows == 0) { break;
-}
+          if (rows == 0) {
+            break;
+          }
           Accumulate(&partials[worker], chunk);
         }
       } catch (...) {
         stopped.store(true, std::memory_order_relaxed);
         std::scoped_lock error_guard(error_mutex);
-        if (!error) { error = std::current_exception();
-}
+        if (!error) {
+          error = std::current_exception();
+        }
       }
     });
   }
@@ -547,21 +598,24 @@ bool ParallelAggregationExecutor::Next(Row* destination,
   }
 
   PartialState merged = MakeState();
-  for (const PartialState& partial : partials) { Merge(&merged, partial);
-}
+  for (const PartialState& partial : partials) {
+    Merge(&merged, partial);
+  }
   *destination = Finalize(std::move(merged));
   executed_ = true;
   return true;
 }
 
 size_t ParallelAggregationExecutor::NextBatch(DataChunk* destination,
-                                               size_t max_rows) {
+                                              size_t max_rows) {
   destination->Reset();
-  if (max_rows == 0) { return 0;
-}
+  if (max_rows == 0) {
+    return 0;
+  }
   Row row;
-  if (!Next(&row, nullptr)) { return 0;
-}
+  if (!Next(&row, nullptr)) {
+    return 0;
+  }
   destination->Append(std::move(row));
   return 1;
 }
@@ -569,7 +623,8 @@ size_t ParallelAggregationExecutor::NextBatch(DataChunk* destination,
 void ParallelAggregationExecutor::Dump(std::ostream& out, int indent) const {
   out << "ParallelAggregationExecutor (" << worker_count_ << " workers) {";
   for (const NamedExpression& aggregate : aggregates_) {
-    out << "\n" << Indent(indent + 2) << aggregate.name << ": "
+    out << "\n"
+        << Indent(indent + 2) << aggregate.name << ": "
         << *aggregate.expression;
   }
   out << "\n" << Indent(indent) << "}";

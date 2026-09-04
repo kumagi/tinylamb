@@ -57,14 +57,17 @@ TEST_F(LogRecordTest, construct) {
 }
 
 TEST_F(LogRecordTest, check) {
-  // Arrange -- a generic LogRecord for round-trip serdes, plus per-category sub-arranges under SCOPED_TRACE
+  // Arrange -- a generic LogRecord for round-trip serdes, plus per-category
+  // sub-arranges under SCOPED_TRACE
   SerializeDeserializeCheck(
       LogRecord(0xaabbccddeeff0011, 0x1122334455667788, LogType::kBegin));
 
   {
-    // Arrange -- InsertBranch-related logs (Inserting/InsertingLeaf/InsertingBranch + compensations)
+    // Arrange -- InsertBranch-related logs
+    // (Inserting/InsertingLeaf/InsertingBranch + compensations)
     SCOPED_TRACE("Insertion log tests");
-    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each log variant
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for
+    // each log variant
     SerializeDeserializeCheck(
         LogRecord::InsertingLogRecord(12, 2, 1, 3, "hello"));
     SerializeDeserializeCheck(
@@ -81,9 +84,11 @@ TEST_F(LogRecordTest, check) {
   }
 
   {
-    // Arrange -- UpdateBranch-related logs (Updating/UpdatingLeaf/UpdatingBranch + compensations)
+    // Arrange -- UpdateBranch-related logs
+    // (Updating/UpdatingLeaf/UpdatingBranch + compensations)
     SCOPED_TRACE("Updating log tests");
-    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each log variant
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for
+    // each log variant
     SerializeDeserializeCheck(
         LogRecord::UpdatingLogRecord(13, 3, 3, 4, "redo_log", "long_undo_log"));
     SerializeDeserializeCheck(LogRecord::UpdatingLeafLogRecord(
@@ -100,9 +105,11 @@ TEST_F(LogRecordTest, check) {
   }
 
   {
-    // Arrange -- Delete-related logs (Deleting/DeletingLeaf/DeletingBranch + compensations)
+    // Arrange -- Delete-related logs (Deleting/DeletingLeaf/DeletingBranch +
+    // compensations)
     SCOPED_TRACE("Deletion log tests");
-    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each log variant
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for
+    // each log variant
     SerializeDeserializeCheck(
         LogRecord::DeletingLogRecord(13, 4, 4, 5, "undo_log"));
     SerializeDeserializeCheck(
@@ -118,9 +125,11 @@ TEST_F(LogRecordTest, check) {
   }
 
   {
-    // Arrange -- IndexKey-related logs (SetLowFence / SetHighFence with various key boundaries)
+    // Arrange -- IndexKey-related logs (SetLowFence / SetHighFence with various
+    // key boundaries)
     SCOPED_TRACE("Fence log tests");
-    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each fence log
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for
+    // each fence log
     SerializeDeserializeCheck(LogRecord::SetLowFenceLogRecord(
         20, 21, 12, IndexKey::MinusInfinity(), IndexKey("low")));
     SerializeDeserializeCheck(LogRecord::SetLowFenceLogRecord(
@@ -139,15 +148,17 @@ TEST_F(LogRecordTest, check) {
   {
     // Arrange -- Foster Child-related logs (SetFoster with FosterPair entries)
     SCOPED_TRACE("Foster log tests");
-    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each foster log
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for
+    // each foster log
     SerializeDeserializeCheck(LogRecord::SetFosterLogRecord(
         20, 21, 12, FosterPair("new", 0), FosterPair("old", 43)));
     SerializeDeserializeCheck(LogRecord::SetFosterLogRecord(
         2, 1, 11, FosterPair("ne", 44), FosterPair("old", 1)));
   }
 
-  // Arrange -- Checkpoint-related logs (BeginCheckpoint / EndCheckpoint with txn table)
-  // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality
+  // Arrange -- Checkpoint-related logs (BeginCheckpoint / EndCheckpoint with
+  // txn table) Act + Assert -- SerializeDeserializeCheck asserts round-trip
+  // equality
   SerializeDeserializeCheck(LogRecord::BeginCheckpointLogRecord());
   SerializeDeserializeCheck(LogRecord::EndCheckpointLogRecord(
       {{1, 2}, {3, 4}, {5, 6}}, {{4LLU, TransactionStatus::kRunning, 5LLU},
@@ -190,9 +201,9 @@ TEST_F(LogRecordTest, SerializationSizeMatchesSerialize) {
       LogRecord::CompensatingDeleteLeafLogRecord(2, 3, "key", "redo"),
       LogRecord::CompensatingDeleteBranchLogRecord(2, 3, "key", 5),
       LogRecord::SetLowFenceLogRecord(1, 2, 3, IndexKey("redo"),
-                                     IndexKey("undo")),
-      LogRecord::SetHighFenceLogRecord(1, 2, 3, IndexKey("redo"),
                                       IndexKey("undo")),
+      LogRecord::SetHighFenceLogRecord(1, 2, 3, IndexKey("redo"),
+                                       IndexKey("undo")),
       LogRecord::SetFosterLogRecord(1, 2, 3, FosterPair("new", 4),
                                     FosterPair("old", 5)),
       LogRecord::SetLowestLogRecord(1, 2, 3, 4, 5),
@@ -229,23 +240,38 @@ TEST_F(LogRecordTest, HasSlotAndPageIdFlags) {
 
 TEST_F(LogRecordTest, LogTypeStreamOperator) {
   // Arrange -- every defined LogType value
-  const std::vector<LogType> types{
-      LogType::kUnknown,      LogType::kBegin,
-      LogType::kInsertRow,    LogType::kInsertLeaf,
-      LogType::kInsertBranch, LogType::kUpdateRow,
-      LogType::kUpdateLeaf,   LogType::kUpdateBranch,
-      LogType::kDeleteRow,    LogType::kDeleteLeaf,
-      LogType::kDeleteBranch, LogType::kSetLowFence,
-      LogType::kSetHighFence, LogType::kSetFoster,
-      LogType::kCompensateInsertRow,    LogType::kCompensateInsertLeaf,
-      LogType::kCompensateInsertBranch, LogType::kCompensateUpdateRow,
-      LogType::kCompensateUpdateLeaf,   LogType::kCompensateUpdateBranch,
-      LogType::kCompensateDeleteRow,    LogType::kCompensateDeleteLeaf,
-      LogType::kCompensateDeleteBranch, LogType::kCompensateSetLowFence,
-      LogType::kCompensateSetHighFence, LogType::kCompensateSetFoster,
-      LogType::kCommit,       LogType::kBeginCheckpoint,
-      LogType::kEndCheckpoint, LogType::kSystemAllocPage,
-      LogType::kSystemDestroyPage, LogType::kLowestValue};
+  const std::vector<LogType> types{LogType::kUnknown,
+                                   LogType::kBegin,
+                                   LogType::kInsertRow,
+                                   LogType::kInsertLeaf,
+                                   LogType::kInsertBranch,
+                                   LogType::kUpdateRow,
+                                   LogType::kUpdateLeaf,
+                                   LogType::kUpdateBranch,
+                                   LogType::kDeleteRow,
+                                   LogType::kDeleteLeaf,
+                                   LogType::kDeleteBranch,
+                                   LogType::kSetLowFence,
+                                   LogType::kSetHighFence,
+                                   LogType::kSetFoster,
+                                   LogType::kCompensateInsertRow,
+                                   LogType::kCompensateInsertLeaf,
+                                   LogType::kCompensateInsertBranch,
+                                   LogType::kCompensateUpdateRow,
+                                   LogType::kCompensateUpdateLeaf,
+                                   LogType::kCompensateUpdateBranch,
+                                   LogType::kCompensateDeleteRow,
+                                   LogType::kCompensateDeleteLeaf,
+                                   LogType::kCompensateDeleteBranch,
+                                   LogType::kCompensateSetLowFence,
+                                   LogType::kCompensateSetHighFence,
+                                   LogType::kCompensateSetFoster,
+                                   LogType::kCommit,
+                                   LogType::kBeginCheckpoint,
+                                   LogType::kEndCheckpoint,
+                                   LogType::kSystemAllocPage,
+                                   LogType::kSystemDestroyPage,
+                                   LogType::kLowestValue};
 
   // Act -- stream each type
   // Assert -- the common types print their canonical names
@@ -260,7 +286,8 @@ TEST_F(LogRecordTest, LogTypeStreamOperator) {
   std::stringstream unknown;
   // Deliberately out-of-range LogType to probe the "undefined" fallback arm
   // of operator<<.
-  unknown << static_cast<LogType>(0xffff);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+  unknown << static_cast<LogType>(
+      0xffff);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
   EXPECT_NE(unknown.str().find("undefined"), std::string::npos);
 }
 
@@ -322,9 +349,8 @@ TEST_F(LogRecordTest, DumpOperatorCoversAllRecordCategories) {
 
 TEST_F(LogRecordTest, DumpPositionOmittedString) {
   // Arrange -- a leaf insert with a key longer than the 20-byte dump threshold
-  LogRecord long_key =
-      LogRecord::InsertingLeafLogRecord(12, 3, 1, std::string(100, 'x'),
-                                        "redo");
+  LogRecord long_key = LogRecord::InsertingLeafLogRecord(
+      12, 3, 1, std::string(100, 'x'), "redo");
   std::stringstream ss;
   ss << long_key;
   // Act + Assert -- the truncated form keeps a head + tail and marks the
@@ -348,8 +374,7 @@ TEST_F(LogRecordTest, CompensatingFenceFosterAndLowestConstructors) {
       LogRecord::CompensateSetHighFenceLogRecord(12, 3, 1, IndexKey("redo"));
   LogRecord foster =
       LogRecord::CompensateSetFosterLogRecord(12, 3, 1, FosterPair("new", 4));
-  LogRecord lowest =
-      LogRecord::CompensateSetLowestValueLogRecord(3, 1, 4);
+  LogRecord lowest = LogRecord::CompensateSetLowestValueLogRecord(3, 1, 4);
 
   // Act + Assert -- the compensating log types and fields are set correctly
   EXPECT_EQ(low_fence.type, LogType::kCompensateSetLowFence);
@@ -469,11 +494,12 @@ TEST_F(LogRecordTest, DumpUnknownRecordType) {
 }
 
 TEST_F(LogRecordTest, SizeOfUnknownLogAborts) {
-  // Known gap: LogRecord::Size() asserts for LogType::kUnknown
-  // (log_record.cpp:649-650), so a default-constructed record must die.
-  // Requires assert()-based death checks; NDEBUG builds skip intentionally.
+  // LogRecord::Size() rejects LogType::kUnknown loudly: abort via assert() in
+  // debug builds, throw std::runtime_error under NDEBUG.  Either way the
+  // caller must never observe a size for an undefined record layout.
 #ifdef NDEBUG
-  GTEST_SKIP() << "Death tests require a Debug build (assert() is enabled)";
+  LogRecord unknown;
+  EXPECT_THROW((void)unknown.Size(), std::runtime_error);
 #else
   LogRecord unknown;
   EXPECT_DEATH((void)unknown.Size(), "unknown");
@@ -481,10 +507,11 @@ TEST_F(LogRecordTest, SizeOfUnknownLogAborts) {
 }
 
 TEST_F(LogRecordTest, SerializeUnknownLogAborts) {
-  // Known gap: serializing a kUnknown record trips an assert in
-  // operator<<(Encoder&) (log_record.cpp:722-723).
+  // Serializing a kUnknown record trips an assert in debug builds and throws
+  // std::runtime_error under NDEBUG; a garbage record must never be written.
 #ifdef NDEBUG
-  GTEST_SKIP() << "Death tests require a Debug build (assert() is enabled)";
+  LogRecord unknown;
+  EXPECT_THROW((void)unknown.Serialize(), std::runtime_error);
 #else
   LogRecord unknown;
   EXPECT_DEATH((void)unknown.Serialize(), "unknown");
@@ -497,10 +524,11 @@ TEST_F(LogRecordTest, DecodeUnknownLogTypeThrowsCleanly) {
   // never an assert): RecoveryManager skips such torn tails and the fuzzers
   // treat this as ordinary rejection.
   std::string bytes;
-  bytes.append(1, static_cast<char>(0xff)).append(1, static_cast<char>(0xff));  // uint16 LogType: 0xffff
-  bytes.append(8, '\x00');                // prev_lsn
-  bytes.append(8, '\x00');                // txn_id
-  bytes.append(1, '\x00');                // types: no pid / slot / key
+  bytes.append(1, static_cast<char>(0xff))
+      .append(1, static_cast<char>(0xff));  // uint16 LogType: 0xffff
+  bytes.append(8, '\x00');                  // prev_lsn
+  bytes.append(8, '\x00');                  // txn_id
+  bytes.append(1, '\x00');                  // types: no pid / slot / key
   std::istringstream ss(bytes, std::istringstream::binary);
 
   // Act + Assert -- the decoder reaches its default arm and throws.
@@ -608,8 +636,7 @@ TEST_F(LogRecordTest, DumpPositionVariants) {
   page_only.pid = 7;
   LogRecord slot_only = LogRecord::CompensatingInsertLogRecord(3, 0, 9);
   slot_only.pid = std::numeric_limits<page_id_t>::max();
-  LogRecord key_only =
-      LogRecord::CompensatingInsertLogRecord(3, 0, "the-key");
+  LogRecord key_only = LogRecord::CompensatingInsertLogRecord(3, 0, "the-key");
 
   // Act -- render each position.
   std::stringstream page_ss;
@@ -624,6 +651,24 @@ TEST_F(LogRecordTest, DumpPositionVariants) {
   EXPECT_EQ(page_ss.str().find('|'), std::string::npos);
   EXPECT_NE(slot_ss.str().find("| 9"), std::string::npos);
   EXPECT_NE(key_ss.str().find("the-key"), std::string::npos);
+}
+
+TEST_F(LogRecordTest, V2RecordsWithoutCrcStillDecode) {
+  // Writers emit v3 (with CRC); readers must keep accepting v1/v2 (no CRC)
+  // per log_record.hpp. Re-encode a kBegin record as v2 by stripping the
+  // trailing CRC and patching the big-endian version field (bytes [4, 8)).
+  const LogRecord begin(1, 2, LogType::kBegin);
+  std::string v3 = begin.Serialize();
+  ASSERT_GE(v3.size(), 4 + 4 + kWalRecordCrcSize);
+  std::string v2 = v3.substr(0, v3.size() - kWalRecordCrcSize);
+  ASSERT_EQ(static_cast<unsigned char>(v2[7]), 3);
+  v2[7] = static_cast<char>(2);
+  std::istringstream in(v2, std::istringstream::binary);
+  Decoder dec(in);
+  LogRecord decoded;
+  EXPECT_NO_THROW(dec >> decoded);
+  EXPECT_EQ(decoded.type, LogType::kBegin);
+  EXPECT_EQ(decoded.wire_version, 2U);
 }
 
 TEST_F(LogRecordTest, EqualityIsFieldSensitive) {
@@ -664,8 +709,12 @@ std::string FuzzShapedRecord(LogType type, uint8_t types_mask, size_t body_len,
   bytes.append(8, '\x01');  // prev_lsn
   bytes.append(8, '\x02');  // txn_id
   bytes.append(1, static_cast<char>(types_mask));
-  if ((types_mask & kMaskPageID) != 0) { bytes.append(4, '\x03'); }
-  if ((types_mask & kMaskSlot) != 0) { bytes.append(2, '\x04'); }
+  if ((types_mask & kMaskPageID) != 0) {
+    bytes.append(4, '\x03');
+  }
+  if ((types_mask & kMaskSlot) != 0) {
+    bytes.append(2, '\x04');
+  }
   if ((types_mask & kMaskKey) != 0) {
     const uint64_t key_len = 3;
     bytes.append(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
@@ -705,24 +754,17 @@ void RoundTripMustBeStable(const std::string& input) {
 
 }  // namespace
 
-
 TEST_F(LogRecordTest, TruncatedRecordsDecodeAndRoundTripStably) {
   // Every (record kind x field-mask x truncation point) combination behaves
   // like the fuzzer expects: clean decode of defined types and byte-stable
   // re-encode of whatever was decoded.
   const std::array<LogType, 13> kinds = {
-      LogType::kBegin,
-      LogType::kCommit,
-      LogType::kInsertRow,
-      LogType::kInsertLeaf,
-      LogType::kInsertBranch,
-      LogType::kUpdateRow,
-      LogType::kDeleteRow,
-      LogType::kUpdateBranch,
-      LogType::kSetFoster,
-      LogType::kCompensateInsertRow,
-      LogType::kEndCheckpoint,
-      LogType::kSystemAllocPage,
+      LogType::kBegin,         LogType::kCommit,
+      LogType::kInsertRow,     LogType::kInsertLeaf,
+      LogType::kInsertBranch,  LogType::kUpdateRow,
+      LogType::kDeleteRow,     LogType::kUpdateBranch,
+      LogType::kSetFoster,     LogType::kCompensateInsertRow,
+      LogType::kEndCheckpoint, LogType::kSystemAllocPage,
       LogType::kLowestValue,
   };
   const std::array<uint8_t, 4> masks = {

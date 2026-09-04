@@ -15,7 +15,8 @@ namespace tinylamb {
 
 // Per-operator working memory reservation and limit manager.
 // Tracks memory consumption, triggers spill / graceful degradation callbacks
-// when quotas are exceeded, and interfaces with the process-wide QueryMemoryBudget.
+// when quotas are exceeded, and interfaces with the process-wide
+// QueryMemoryBudget.
 class OperatorMemoryReservation {
  public:
   OperatorMemoryReservation() = default;
@@ -26,15 +27,19 @@ class OperatorMemoryReservation {
   ~OperatorMemoryReservation();
 
   OperatorMemoryReservation(const OperatorMemoryReservation&) = delete;
-  OperatorMemoryReservation& operator=(const OperatorMemoryReservation&) = delete;
+  OperatorMemoryReservation& operator=(const OperatorMemoryReservation&) =
+      delete;
   OperatorMemoryReservation(OperatorMemoryReservation&& other) noexcept;
-  OperatorMemoryReservation& operator=(OperatorMemoryReservation&& other) noexcept;
+  OperatorMemoryReservation& operator=(
+      OperatorMemoryReservation&& other) noexcept;
 
-  // Attempts to allocate `bytes`. If `limit_bytes_ > 0` and total exceeds limit,
-  // invokes `spill_callback_` (if registered), marks degraded, and returns false.
+  // Attempts to allocate `bytes`. If `limit_bytes_ > 0` and total exceeds
+  // limit, invokes `spill_callback_` (if registered), marks degraded, and
+  // returns false.
   bool TryAllocate(size_t bytes);
 
-  // Allocates memory regardless of limits (e.g. required structures), updating stats.
+  // Allocates memory regardless of limits (e.g. required structures), updating
+  // stats.
   void AllocateForced(size_t bytes);
 
   // Releases `bytes` of previously allocated memory.

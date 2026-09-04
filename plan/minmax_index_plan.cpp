@@ -22,9 +22,11 @@ MinMaxIndexPlan::MinMaxIndexPlan(Plan child, NamedExpression aggregate,
         ValueType value_type = ValueType::kInt64;
         if (aggregate_.expression &&
             aggregate_.expression->Type() == TypeTag::kAggregateExp) {
-          const auto& expression = aggregate_.expression->AsAggregateExpression();
+          const auto& expression =
+              aggregate_.expression->AsAggregateExpression();
           try {
-            const Type result = expression.Child()->ResultType(child_->GetSchema());
+            const Type result =
+                expression.Child()->ResultType(child_->GetSchema());
             switch (result.GetType()) {
               case TypeTag::kDouble:
                 value_type = ValueType::kDouble;

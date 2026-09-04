@@ -21,6 +21,7 @@
 #include <string>
 #include <unordered_set>
 
+#include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -28,6 +29,17 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+namespace {
+// Membership must use the same comparison as `=` (EvaluateBinary), which
+// promotes INT64/DOUBLE and honors unsigned/collation tags. The previous
+// `child == candidate` used Value::operator==, which returns false across
+// types, so `1 IN (1.0)` folded to FALSE while `1 = 1.0` was TRUE.
+bool Matches(const Value& child, const Value& candidate) {
+  const Value eq = EvaluateBinary(BinaryOperation::kEquals, child, candidate);
+  return !eq.IsNull() && eq.Truthy();
+}
+}  // namespace
 
 std::unordered_set<ColumnName> InExpression::TouchedColumns() const {
   std::unordered_set<ColumnName> result = child_->TouchedColumns();
@@ -43,7 +55,7 @@ Value InExpression::Evaluate(const Row& row, const Schema& schema) const {
   for (const auto& item : list_) {
     Value candidate = item->Evaluate(row, schema);
     saw_null |= candidate.IsNull();
-    if (!child.IsNull() && !candidate.IsNull() && child == candidate) {
+    if (!child.IsNull() && !candidate.IsNull() && Matches(child, candidate)) {
       return Value(true);
     }
   }
@@ -58,7 +70,7 @@ Value InExpression::Evaluate(const Row* left, const Schema& left_schema,
   for (const auto& item : list_) {
     Value candidate = item->Evaluate(left, left_schema, right, right_schema);
     saw_null |= candidate.IsNull();
-    if (!child.IsNull() && !candidate.IsNull() && child == candidate) {
+    if (!child.IsNull() && !candidate.IsNull() && Matches(child, candidate)) {
       return Value(true);
     }
   }
@@ -74,7 +86,7 @@ Value InExpression::Evaluate(const Row& row, const Schema& schema,
   for (const auto& item : list_) {
     const Value candidate = item->Evaluate(row, schema, context);
     saw_null |= candidate.IsNull();
-    if (!child.IsNull() && !candidate.IsNull() && child == candidate) {
+    if (!child.IsNull() && !candidate.IsNull() && Matches(child, candidate)) {
       return Value(true);
     }
   }

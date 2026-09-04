@@ -82,7 +82,8 @@ bool RemoteChannel::PopRow(Row* row, RowPosition* rp) {
 RemoteScan::RemoteScan(Schema schema, std::shared_ptr<RemoteChannel> channel)
     : schema_(std::move(schema)), channel_(std::move(channel)) {}
 
-RemoteScan::RemoteScan(Schema schema, std::vector<DataChunk> pre_buffered_chunks)
+RemoteScan::RemoteScan(Schema schema,
+                       std::vector<DataChunk> pre_buffered_chunks)
     : schema_(std::move(schema)),
       buffered_chunks_(std::move(pre_buffered_chunks)) {}
 
@@ -169,8 +170,6 @@ void RemoteScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "RemoteScan(schema=" << schema_.Name() << ")";
 }
 
-void RemoteScan::Explain(std::ostream& o, int indent) const {
-  Dump(o, indent);
-}
+void RemoteScan::Explain(std::ostream& o, int indent) const { Dump(o, indent); }
 
 }  // namespace tinylamb

@@ -17,10 +17,8 @@ namespace {
 // ordering expression so it can be matched against the child's physical
 // schema.
 Expression TranslateQualifier(const Expression& expression,
-                              const std::string& from,
-                              const std::string& to) {
-  if (!expression ||
-      expression->Type() != TypeTag::kColumnValue) {
+                              const std::string& from, const std::string& to) {
+  if (!expression || expression->Type() != TypeTag::kColumnValue) {
     return expression;
   }
   ColumnName column = expression->AsColumnValue().GetColumnName();
@@ -51,16 +49,26 @@ RelationRenamePlan::RelationRenamePlan(Plan src, std::string relation,
 
 const Schema& RelationRenamePlan::GetSchema() const { return renamed_schema_; }
 
-bool RelationRenamePlan::IsOrderedBy(
-    const std::vector<Expression>& expressions,
-    const std::vector<bool>& ascending) const {
+bool RelationRenamePlan::IsOrderedBy(const std::vector<Expression>& expressions,
+                                     const std::vector<bool>& ascending) const {
   std::vector<Expression> translated;
   translated.reserve(expressions.size());
   for (const Expression& expression : expressions) {
-    translated.push_back(
-        TranslateQualifier(expression, relation_, physical_));
+    translated.push_back(TranslateQualifier(expression, relation_, physical_));
   }
   return src_->IsOrderedBy(translated, ascending);
+}
+
+bool RelationRenamePlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
+  std::vector<Expression> translated;
+  translated.reserve(expressions.size());
+  for (const Expression& expression : expressions) {
+    translated.push_back(TranslateQualifier(expression, relation_, physical_));
+  }
+  return src_->IsOrderedBy(translated, ascending, nulls_first);
 }
 
 void RelationRenamePlan::Dump(std::ostream& o, int indent) const {

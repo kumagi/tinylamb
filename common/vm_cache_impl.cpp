@@ -41,7 +41,7 @@
 namespace tinylamb {
 namespace {
 uint64_t FileSize(int fd) {
-  struct stat s {};
+  struct stat s{};
   if (::fstat(fd, &s) == -1) {
     throw std::runtime_error(std::string("Cannot get filesize: ") +
                              strerror(errno));
@@ -236,8 +236,8 @@ void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
         }
         case PageState::kUnlocked: {
           if (!dequeued->compare_exchange_weak(prev, PageState::kMarked,
-                                                std::memory_order_relaxed,
-                                                std::memory_order_relaxed)) {
+                                               std::memory_order_relaxed,
+                                               std::memory_order_relaxed)) {
             continue;
           }
           // Two-phase eviction: MADV_DONTNEED only fires while queue_lock_ is
@@ -245,8 +245,7 @@ void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
           // the kMarked->kLocked race is guaranteed to be waiting for this
           // lock before it reloads the page, so its Activate() pread always
           // lands after our madvise (or wins the race and cancels it).
-          if (dequeued->load(std::memory_order_acquire) ==
-              PageState::kMarked) {
+          if (dequeued->load(std::memory_order_acquire) == PageState::kMarked) {
             Release(FindMetaPage(dequeued));
           }
           EnqueueToGhostFifo(dequeued);
@@ -268,7 +267,7 @@ void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
           }
           EnqueueToMainFifo(dequeued);
           break;
-        case PageState::kMarked:  // Ghost promotion raced the scan; leaving.
+        case PageState::kMarked:   // Ghost promotion raced the scan; leaving.
         case PageState::kEvicted:  // InvalidatePage retired this page in fifo.
           // The page is leaving anyway; just drop it from the small fifo.
           break;
@@ -312,8 +311,8 @@ void VMCacheImpl::EnqueueToMainFifo(  // NOLINT(misc-no-recursion)
         }
         case PageState::kUnlocked:
           if (!dequeued->compare_exchange_weak(prev, PageState::kEvicted,
-                                                std::memory_order_relaxed,
-                                                std::memory_order_relaxed)) {
+                                               std::memory_order_relaxed,
+                                               std::memory_order_relaxed)) {
             continue;
           }
           // Two-phase eviction (see EnqueueToSmallFifo): drop the page only
@@ -340,7 +339,7 @@ void VMCacheImpl::EnqueueToMainFifo(  // NOLINT(misc-no-recursion)
           }
           EnqueueToMainFifo(dequeued);
           break;
-        case PageState::kMarked:  // Ghost promotion raced the scan; leaving.
+        case PageState::kMarked:   // Ghost promotion raced the scan; leaving.
         case PageState::kEvicted:  // InvalidatePage retired this page in fifo.
           // The page is leaving anyway; just drop it from the main fifo.
           break;
@@ -477,8 +476,7 @@ void VMCacheImpl::Activate(size_t page) const {
     if (read_bytes < 0) {
       // A failed pread must not decrement rest_size below zero (the loop would
       // never terminate); treat it as fatal like the mmap failure path.
-      throw std::runtime_error(std::string("pread failed: ") +
-                               strerror(errno));
+      throw std::runtime_error(std::string("pread failed: ") + strerror(errno));
     }
     if (read_bytes == 0) {
       break;
@@ -558,8 +556,7 @@ std::string VMCacheImpl::Dump() const {
 }
 
 VMCacheImpl::~VMCacheImpl() {
-  if (buffer_ != nullptr &&
-      ::munmap(buffer_, max_size_) != 0) {
+  if (buffer_ != nullptr && ::munmap(buffer_, max_size_) != 0) {
     // Destructors must not throw; report loudly and continue shutdown.
     LOG(ERROR) << "Destructing cache: " << strerror(errno);
     assert(!"munmap failed");

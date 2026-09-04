@@ -19,7 +19,9 @@ namespace {
 // than within an epsilon.  Other types keep their ordinary equality so
 // interval-string and NULL handling are unchanged.
 bool DistinctEquals(const Row& a, const Row& b) {
-  if (a.values_.size() != b.values_.size()) { return false; }
+  if (a.values_.size() != b.values_.size()) {
+    return false;
+  }
   for (size_t i = 0; i < a.values_.size(); ++i) {
     const Value& x = a[i];
     const Value& y = b[i];
@@ -27,7 +29,9 @@ bool DistinctEquals(const Row& a, const Row& b) {
         (x.type == ValueType::kDouble && y.type == ValueType::kDouble)
             ? (CompareForOrderBy(x, y) == 0)
             : (x == y);
-    if (!equal) { return false; }
+    if (!equal) {
+      return false;
+    }
   }
   return true;
 }
@@ -49,7 +53,9 @@ bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
       if (!duplicate) {
         seen_.push_back(row);
         *dst = seen_.back();
-        if (rp != nullptr) { *rp = position; }
+        if (rp != nullptr) {
+          *rp = position;
+        }
         return true;
       }
     } else {
@@ -83,7 +89,9 @@ bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
       if (!duplicate) {
         seen_keys_.push_back(std::move(current_keys));
         *dst = std::move(row);
-        if (rp != nullptr) { *rp = position; }
+        if (rp != nullptr) {
+          *rp = position;
+        }
         return true;
       }
     }
@@ -99,11 +107,15 @@ bool SortDistinctExecutor::Next(Row* dst, RowPosition* rp) {
   Row row;
   RowPosition position;
   while (source_->Next(&row, &position)) {
-    if (have_previous_ && DistinctEquals(previous_, row)) { continue; }
+    if (have_previous_ && DistinctEquals(previous_, row)) {
+      continue;
+    }
     previous_ = row;
     have_previous_ = true;
     *dst = std::move(row);
-    if (rp != nullptr) { *rp = position; }
+    if (rp != nullptr) {
+      *rp = position;
+    }
     return true;
   }
   return false;

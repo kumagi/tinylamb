@@ -40,6 +40,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -135,7 +136,8 @@ class ParameterSlot final : public ExpressionBase {
                                const Schema& /*schema*/) const override {
     return values_->at(slot_index_);
   }
-  [[nodiscard]] Value Evaluate(const Row* /*left*/, const Schema& /*left_schema*/,
+  [[nodiscard]] Value Evaluate(const Row* /*left*/,
+                               const Schema& /*left_schema*/,
                                const Row* /*right*/,
                                const Schema& /*right_schema*/) const override {
     return values_->at(slot_index_);
@@ -202,8 +204,7 @@ inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)
     case TypeTag::kUnaryExp:
       return ContainsParameterSlot(expression->AsUnaryExpression().Child());
     case TypeTag::kAggregateExp:
-      return ContainsParameterSlot(
-          expression->AsAggregateExpression().Child());
+      return ContainsParameterSlot(expression->AsAggregateExpression().Child());
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
       for (const auto& clause : searched.when_clauses_) {
@@ -269,8 +270,8 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kUnaryExp: {
       const auto& unary = expression->AsUnaryExpression();
-      return UnaryExpressionExp(
-          CloneWithPreparedValues(unary.Child(), values), unary.Op());
+      return UnaryExpressionExp(CloneWithPreparedValues(unary.Child(), values),
+                                unary.Op());
     }
     case TypeTag::kAggregateExp: {
       const auto& aggregate = expression->AsAggregateExpression();
@@ -287,9 +288,9 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
         clauses.emplace_back(CloneWithPreparedValues(clause.first, values),
                              CloneWithPreparedValues(clause.second, values));
       }
-      return CaseExpressionExp(std::move(clauses),
-                               CloneWithPreparedValues(searched.else_clause_,
-                                                       values));
+      return CaseExpressionExp(
+          std::move(clauses),
+          CloneWithPreparedValues(searched.else_clause_, values));
     }
     case TypeTag::kInExp: {
       const auto& in = expression->AsInExpression();
@@ -419,8 +420,8 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kUnaryExp: {
       const auto& unary = expression->AsUnaryExpression();
-      return UnaryExpressionExp(
-          SlotizeLiterals(unary.Child(), slot_cursor, ok), unary.Op());
+      return UnaryExpressionExp(SlotizeLiterals(unary.Child(), slot_cursor, ok),
+                                unary.Op());
     }
     case TypeTag::kAggregateExp: {
       const auto& aggregate = expression->AsAggregateExpression();
@@ -532,6 +533,8 @@ struct CompiledPlan {
     std::vector<std::string> column_names;
     std::vector<Expression> order_expressions;
     std::vector<bool> order_ascending;
+    // Parallels order_expressions; absent entries mean the engine default.
+    std::vector<std::optional<bool>> order_nulls_first;
     std::vector<std::pair<Expression, bool>> sort_keys;
     bool distinct{false};
     bool has_limit{false};
@@ -575,7 +578,9 @@ inline bool IsVolatileSpecializedPlan(const std::string& fingerprint) {
 
 inline void NoteSpecializedParameterMismatch(const std::string& fingerprint) {
   uint8_t& mismatches = thread_specialized_mismatches[fingerprint];
-  if (++mismatches < 4) { return; }
+  if (++mismatches < 4) {
+    return;
+  }
   thread_volatile_specialized_plans.insert(fingerprint);
   thread_compiled_plans.erase(fingerprint);
 }
@@ -584,8 +589,9 @@ inline CompiledPlanPtr FindThreadCompiledPlan(const std::string& fingerprint,
                                               const Database* database,
                                               uint64_t epoch) {
   const auto found = thread_compiled_plans.find(fingerprint);
-  if (found == thread_compiled_plans.end()) { return nullptr;
-}
+  if (found == thread_compiled_plans.end()) {
+    return nullptr;
+  }
   if (found->second->database != database || found->second->epoch != epoch) {
     thread_compiled_plans.erase(found);
     PlanCacheStats().epoch_invalidations.fetch_add(1,

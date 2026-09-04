@@ -10,7 +10,9 @@
 namespace tinylamb {
 
 bool ValuesExecutor::Next(Row* row, RowPosition* /*rp*/) {
-  if (offset_ >= rows_.size()) { return false; }
+  if (offset_ >= rows_.size()) {
+    return false;
+  }
   *row = std::move(rows_[offset_++]);
   return true;
 }

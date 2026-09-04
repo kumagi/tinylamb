@@ -41,18 +41,17 @@ IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const Value& begin, const Value& end, bool ascending,
                      Expression where, const Schema& sc, bool lock_rows,
                      bool wait_for_write_intent)
-    : IndexScan(txn, table, index,
-                begin.IsNull() ? std::vector<Value>{}
-                               : std::vector<Value>{begin},
-                end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
-                ascending, std::move(where), sc, lock_rows,
-                wait_for_write_intent) {}
+    : IndexScan(
+          txn, table, index,
+          begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
+          end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
+          ascending, std::move(where), sc, lock_rows, wait_for_write_intent) {}
 
 IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const std::vector<Value>& begin_key,
-                     const std::vector<Value>& end_key,
-                     bool ascending, Expression where, Schema sc,
-                     bool lock_rows, bool wait_for_write_intent)
+                     const std::vector<Value>& end_key, bool ascending,
+                     Expression where, Schema sc, bool lock_rows,
+                     bool wait_for_write_intent)
     : txn_(txn),
       table_(table),
       index_(index),
@@ -100,28 +99,31 @@ void IndexScan::OpenRange(const std::vector<Value>& begin_key,
 bool IndexScan::Next(Row* dst, RowPosition* rp) {
   for (;;) {
     while (!iter_.IsValid()) {
-      if (pending_offset_ == pending_.size()) { return false;
-}
+      if (pending_offset_ == pending_.size()) {
+        return false;
+      }
       auto range = std::move(pending_[pending_offset_++]);
       OpenRange(range.first, range.second);
     }
     const RowPosition pointed_row = iter_.Position();
-    const bool locked = !lock_rows_ ||
-                        (wait_for_write_intent_
-                             ? txn_.AddWriteSet(pointed_row)
-                             : txn_.TryAddWriteSet(pointed_row));
+    const bool locked = !lock_rows_ || (wait_for_write_intent_
+                                            ? txn_.AddWriteSet(pointed_row)
+                                            : txn_.TryAddWriteSet(pointed_row));
     if (!locked) {
       throw std::runtime_error("write intent wait timed out on table " +
                                std::string(table_.GetSchema().Name()));
     }
     *dst = *iter_;
     ++iter_;
-    if (!dst->IsValid()) { continue;
-}
-    if (rp != nullptr) { *rp = pointed_row;
-}
-    if (cond_ && !cond_->Evaluate(*dst, schema_).Truthy()) { continue;
-}
+    if (!dst->IsValid()) {
+      continue;
+    }
+    if (rp != nullptr) {
+      *rp = pointed_row;
+    }
+    if (cond_ && !cond_->Evaluate(*dst, schema_).Truthy()) {
+      continue;
+    }
     return true;
   }
 }
@@ -133,7 +135,9 @@ void IndexScan::Dump(std::ostream& o, int /*indent*/) const {
   } else {
     o << "IndexScan: " << iter_;
   }
-  if (!ascending_) { o << " reverse"; }
+  if (!ascending_) {
+    o << " reverse";
+  }
   if (cond_) {
     o << " WHERE " << *cond_;
   }

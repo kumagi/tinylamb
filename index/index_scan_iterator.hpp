@@ -18,14 +18,13 @@
 #define TINYLAMB_UNIQUE_INDEX_SCAN_ITERATOR_HPP
 
 #include <cstdint>
+#include <vector>
 
 #include "index/b_plus_tree.hpp"
 #include "index/b_plus_tree_iterator.hpp"
 #include "table/iterator_base.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
-
-#include <vector>
 
 namespace tinylamb {
 class Index;
@@ -39,8 +38,7 @@ class IndexScanIterator : public IteratorBase {
                     bool ascending = true);
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
                     const std::vector<Value>& begin_key,
-                    const std::vector<Value>& end_key,
-                    bool ascending = true);
+                    const std::vector<Value>& end_key, bool ascending = true);
   IndexScanIterator(const IndexScanIterator&) = delete;
   IndexScanIterator(IndexScanIterator&&) = delete;
   IndexScanIterator& operator=(const IndexScanIterator&) = delete;

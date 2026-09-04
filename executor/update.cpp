@@ -25,7 +25,9 @@ namespace tinylamb {
 namespace {
 
 std::string UpdateKeyString(const Value& value) {
-  if (value.IsNull()) { return "\x01NULL"; }
+  if (value.IsNull()) {
+    return "\x01NULL";
+  }
   return value.AsString();
 }
 
@@ -51,8 +53,9 @@ bool Update::Next(Row* dst, RowPosition* rp) {
   if (enforce_primary_key_) {
     for (auto it = target_->BeginFullScan(*txn_); it.IsValid(); ++it) {
       const Row& current = *it;
-      if (current.values_.size() == 0) { continue;
-}
+      if (current.values_.size() == 0) {
+        continue;
+      }
       ++live_keys[UpdateKeyString(current[0])];
     }
     for (size_t i = 0; i < pending.size(); ++i) {
@@ -62,16 +65,20 @@ bool Update::Next(Row* dst, RowPosition* rp) {
                         : std::string();
       auto found = live_keys.find(old_keys[i]);
       if (found != live_keys.end()) {
-        if (--found->second == 0) { live_keys.erase(found); }
+        if (--found->second == 0) {
+          live_keys.erase(found);
+        }
       }
     }
     std::unordered_set<std::string> claimed;
     for (size_t i = 0; i < pending.size(); ++i) {
-      if (pending[i].first.values_.empty()) { continue; }
+      if (pending[i].first.values_.empty()) {
+        continue;
+      }
       const std::string new_key = UpdateKeyString(pending[i].first[0]);
       if (!claimed.insert(new_key).second || live_keys.contains(new_key)) {
-        throw std::runtime_error("Modification resulted in duplicate primary key (" +
-                                 new_key + ")");
+        throw std::runtime_error(
+            "Modification resulted in duplicate primary key (" + new_key + ")");
       }
     }
   }

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -11,13 +12,13 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
-#include <cctype>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
-#include <vector>
-#include "type/row.hpp"
 
 namespace tinylamb::pgwire {
 namespace {
@@ -71,23 +72,24 @@ struct PgType {
 PgType ToPgType(ValueType type) {
   switch (type) {
     case ValueType::kInt64:
-      return {.oid=20, .length=8};  // int8
+      return {.oid = 20, .length = 8};  // int8
     case ValueType::kDouble:
-      return {.oid=701, .length=8};  // float8
+      return {.oid = 701, .length = 8};  // float8
     case ValueType::kDate:
-      return {.oid=1082, .length=4};  // date
+      return {.oid = 1082, .length = 4};  // date
     case ValueType::kNull:
     case ValueType::kVarChar:
     case ValueType::kArray:
-      return {.oid=25, .length=-1};  // text
+      return {.oid = 25, .length = -1};  // text
   }
-  return {.oid=25, .length=-1};
+  return {.oid = 25, .length = -1};
 }
 
 std::string Trim(std::string_view value) {
   const size_t begin = value.find_first_not_of(" \t\r\n");
-  if (begin == std::string_view::npos) { return {};
-}
+  if (begin == std::string_view::npos) {
+    return {};
+  }
   const size_t end = value.find_last_not_of(" \t\r\n");
   return std::string(value.substr(begin, end - begin + 1));
 }

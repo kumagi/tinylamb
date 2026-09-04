@@ -26,16 +26,16 @@
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/hash_join_mode.hpp"
+#include "executor/incremental_sort.hpp"
 #include "executor/index_join.hpp"
 #include "executor/index_only_scan.hpp"
 #include "executor/index_scan.hpp"
-#include "executor/incremental_sort.hpp"
 #include "executor/join_kind.hpp"
 #include "executor/limit.hpp"
 #include "executor/max1_row.hpp"
-#include "executor/minmax_index.hpp"
 #include "executor/merge_append.hpp"
 #include "executor/merge_join.hpp"
+#include "executor/minmax_index.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/projection.hpp"
@@ -54,13 +54,14 @@
 #include "plan/distinct_plan.hpp"
 #include "plan/empty_plan.hpp"
 #include "plan/full_scan_plan.hpp"
+#include "plan/group_by_plan.hpp"
+#include "plan/incremental_sort_plan.hpp"
 #include "plan/index_only_scan_plan.hpp"
 #include "plan/index_scan_plan.hpp"
-#include "plan/incremental_sort_plan.hpp"
 #include "plan/limit_plan.hpp"
 #include "plan/max1_row_plan.hpp"
-#include "plan/minmax_index_plan.hpp"
 #include "plan/merge_join_plan.hpp"
+#include "plan/minmax_index_plan.hpp"
 #include "plan/parallel_thresholds.hpp"
 #include "plan/product_plan.hpp"
 #include "plan/projection_plan.hpp"
@@ -80,6 +81,10 @@ namespace tinylamb {
 
 Executor RelationalPlan::EmitExecutor(TransactionContext& context) const {
   return std::make_shared<RelationalExecutor>(context, statement_);
+}
+
+Executor GroupByPlan::EmitExecutor(TransactionContext& context) const {
+  return EmitGroupedFinishExecutor(context, child_, statement_);
 }
 
 // Streaming pass-through that surfaces a relation rename in EXPLAIN/Dump
@@ -287,12 +292,9 @@ Executor BitmapScanPlan::EmitExecutor(TransactionContext& context) const {
       positions = BitmapOr(positions, next);
     }
   }
-  return std::make_shared<BitmapHeapScan>(context.txn_, table_,
-                                          std::move(positions), where_,
-                                          table_.GetSchema(),
-                                          combine_ == BitmapCombine::kAnd
-                                              ? "BitmapAnd"
-                                              : "BitmapOr");
+  return std::make_shared<BitmapHeapScan>(
+      context.txn_, table_, std::move(positions), where_, table_.GetSchema(),
+      combine_ == BitmapCombine::kAnd ? "BitmapAnd" : "BitmapOr");
 }
 
 Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& txn) const {

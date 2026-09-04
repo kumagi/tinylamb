@@ -54,8 +54,8 @@ class PartialAggregate : public ExecutorBase {
   size_t cursor_{0};
 };
 
-// FinalizeAggregate: combines partial intermediate aggregation states into final
-// results (e.g. avg = sum / count).
+// FinalizeAggregate: combines partial intermediate aggregation states into
+// final results (e.g. avg = sum / count).
 class FinalizeAggregate : public ExecutorBase {
  public:
   FinalizeAggregate(Executor child, Schema input_schema,

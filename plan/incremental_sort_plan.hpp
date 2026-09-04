@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_INCREMENTAL_SORT_PLAN_HPP
 #define TINYLAMB_INCREMENTAL_SORT_PLAN_HPP
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,10 @@ class IncrementalSortPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

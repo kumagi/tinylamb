@@ -158,18 +158,6 @@ function(tinylamb_apply_options target)
     endif()
 endfunction()
 
-add_library(tinylamb_parser
-        STATIC
-        legacy/parser/tokenizer.cpp
-        legacy/parser/parser.cpp
-        legacy/parser/pratt_parser.cpp
-)
-add_library(tinylamb::parser ALIAS tinylamb_parser)
-target_compile_features(tinylamb_parser PUBLIC cxx_std_20)
-tinylamb_apply_options(tinylamb_parser)
-target_include_directories(tinylamb_parser
-        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-
 function(tinylamb_add_layer target)
     set(options "")
     set(oneValueArgs ALIAS)
@@ -408,6 +396,7 @@ tinylamb_add_layer(tinylamb_executor
         plan/optimizer.cpp
         plan/cascades.cpp
         plan/limit_plan.cpp
+        plan/group_by_plan.cpp
         plan/sort_plan.cpp
         plan/topn_plan.cpp
         plan/relation_rename_plan.cpp
@@ -452,6 +441,7 @@ add_library(tinylamb_sql
         query/sql_template.cpp
         query/sql_engine.cpp
         query/join_reduction.cpp
+        query/sql_oracle_fuzzer.cpp
 )
 add_library(tinylamb::sql ALIAS tinylamb_sql)
 target_compile_features(tinylamb_sql PUBLIC cxx_std_20)
@@ -488,12 +478,6 @@ add_library(tinylamb_test_util
 add_library(tinylamb::test_util ALIAS tinylamb_test_util)
 target_compile_features(tinylamb_test_util PUBLIC cxx_std_20)
 tinylamb_apply_options(tinylamb_test_util)
-
-target_include_directories(
-        tinylamb_parser
-        PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}
-)
 
 target_include_directories(
         tinylamb_core
@@ -643,7 +627,6 @@ if(BUILD_TESTING)
         target_link_libraries(${target_name}
                 PRIVATE
                 GTest::gtest_main
-                tinylamb::parser
                 tinylamb::sql
                 tinylamb::test_util
         )
@@ -704,9 +687,6 @@ add_simple_test(index/lsm_detail/blob_file_test.cpp)
 add_simple_test(index/lsm_detail/lsm_view_test.cpp)
 add_simple_test(index/lsm_detail/cache_test.cpp)
 add_simple_test(index/lsm_detail/sorted_run_test.cpp)
-add_simple_test(parser/parser_test.cpp)
-add_simple_test(parser/tokenizer_test.cpp)
-add_simple_test(parser/pratt_parser_test.cpp)
 add_simple_test(query/query_test.cpp)
 add_simple_test(query/googlesql_frontend_test.cpp)
 add_simple_test(query/googlesql_ast_test.cpp)
@@ -714,6 +694,7 @@ add_simple_test(query/sql_template_test.cpp)
 add_simple_test(query/sql_engine_tpcc_test.cpp)
 add_simple_test(query/sql_engine_tpch_test.cpp)
 add_simple_test(query/googlesql_compliance_test.cpp)
+add_simple_test(query/sql_oracle_fuzzer_test.cpp)
 target_sources(googlesql_compliance_test PRIVATE
         query/googlesql_compliance_file.cpp)
 target_compile_definitions(googlesql_compliance_test PRIVATE
@@ -738,7 +719,6 @@ add_simple_test(server/postgres_server_extra_test.cpp)
 target_link_libraries(postgres_server_extra_test PRIVATE tinylamb::postgres_server)
 add_simple_test(table/table_statistics_extra_test.cpp)
 add_simple_test(index/lsm_cache_extra_test.cpp)
-add_simple_test(parser/ast_extra_test.cpp)
 add_simple_test(query/sql_extra_test.cpp)
 add_simple_test(index/bplus_tree_extra_test.cpp)
 add_simple_test(type/value_extra_test.cpp)
@@ -791,9 +771,9 @@ add_fuzzer_test(index/lsm_tree_fuzzer.cpp)
 add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
 add_fuzzer_test(table/table_fuzzer.cpp)
 add_fuzzer_test(expression/expression_fuzzer.cpp)
-add_fuzzer_test(legacy/parser/parser_fuzzer.cpp tinylamb::parser)
 add_fuzzer_test(server/postgres_protocol_fuzzer.cpp tinylamb::postgres_server)
 add_fuzzer_test(query/googlesql_ast_fuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/sql_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
 endif()
 
 ########################################

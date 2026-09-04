@@ -38,7 +38,6 @@ struct GoogleSqlComplianceCase {
   std::string raw_result;
 };
 
-
 [[nodiscard]] std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
     std::string_view path, std::string_view contents);
 
