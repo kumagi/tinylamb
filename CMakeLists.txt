@@ -419,6 +419,7 @@ tinylamb_add_layer(tinylamb_executor
         plan/unnest_plan.cpp
         plan/apply_plan.cpp
         plan/recursive_cte_plan.cpp
+        plan/plan_memo_oracle.cpp
         plan/plan.cpp
         plan/index_scan_plan.cpp
         plan/bitmap_scan_plan.cpp
@@ -694,6 +695,7 @@ add_simple_test(plan/plan_test.cpp)
 add_simple_test(type/column_name_test.cpp)
 add_simple_test(plan/optimizer_test.cpp)
 add_simple_test(plan/cascades_test.cpp)
+add_simple_test(plan/plan_memo_oracle_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
 add_simple_test(table/hyper_log_log_test.cpp)
 add_simple_test(index/lsm_detail/blob_file_test.cpp)

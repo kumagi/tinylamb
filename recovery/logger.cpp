@@ -65,7 +65,7 @@ int FdataSync(int fd) {
 
 Logger::Logger(const std::filesystem::path& logfile, size_t buffer_size,
                size_t every_ms)
-    : buffer_(buffer_size, 0),
+    : buffer_(std::max<size_t>(1, buffer_size), 0),
       sync_interval_(std::chrono::milliseconds(std::max<size_t>(1, every_ms))),
       dst_(CreateFile(logfile)) {
   if (dst_ == -1) {
@@ -101,7 +101,16 @@ Logger::~Logger() {
   close(dst_);
 }
 
-void Logger::NotifyWorker() { work_cv_.notify_all(); }
+void Logger::NotifyWorker() {
+  // Notify under work_mu_: the full-buffer waiters in AddLog evaluate their
+  // predicate and block under this mutex, so an unlocked notify can fire
+  // between the predicate check and the block and be lost forever (the
+  // idle worker never re-notifies work_cv_ on its own).  No caller holds
+  // work_mu_ here, and the state stores that precede every call become
+  // visible to a later waiter through the mutex.
+  std::scoped_lock lock(work_mu_);
+  work_cv_.notify_all();
+}
 
 void Logger::SetFailed(int err) {
   error_number_.store(err, std::memory_order_relaxed);
@@ -153,6 +162,18 @@ void Logger::WaitForDurable(lsn_t lsn) {
   }
   pending_durable_waiters_.fetch_sub(1, std::memory_order_acq_rel);
   RaiseIfFailed();
+}
+
+void Logger::TruncateTo(lsn_t valid_end) {
+  // Serialize with producers: hold the enqueue latch so no AddLog can be
+  // in flight between the file truncation (done by the caller) and the LSN
+  // reset.  Recovery calls this before the database serves traffic, so the
+  // worker is idle with flushed == durable == buffered == old file size.
+  std::unique_lock enq_lk{enqueue_latch_};
+  flushed_lsn_.store(valid_end, std::memory_order_relaxed);
+  durable_lsn_.store(valid_end, std::memory_order_release);
+  buffered_lsn_.store(valid_end, std::memory_order_release);
+  durable_cv_.notify_all();
 }
 
 void Logger::AdviseOldBytesDurable(lsn_t before) const {

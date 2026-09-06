@@ -127,16 +127,16 @@ PageRef Page::AllocateNewPage(Transaction& txn, PagePool& pool,
                               PageType new_page_type) {
   ASSERT_PAGE_TYPE(PageType::kMetaPage);
   PageRef ret = body.meta_page.AllocateNewPage(txn, pool, new_page_type);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
+  SetPageLSN(txn.PrevRecordEndLSN());
+  SetRecLSN(txn.PrevRecordEndLSN());
   return ret;
 }
 
 void Page::DestroyPage(Transaction& txn, Page* target) {
   ASSERT_PAGE_TYPE(PageType::kMetaPage);
   body.meta_page.DestroyPage(txn, target);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
+  SetPageLSN(txn.PrevRecordEndLSN());
+  SetRecLSN(txn.PrevRecordEndLSN());
 }
 
 size_t Page::RowCount(Transaction& /*txn*/) const {
@@ -183,8 +183,8 @@ StatusOr<slot_t> Page::Insert(Transaction& txn, std::string_view record) {
   ASSERT_PAGE_TYPE(PageType::kRowPage);
   StatusOr<slot_t> result = body.row_page.Insert(PageID(), txn, record);
   if (result.GetStatus() == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -193,8 +193,8 @@ Status Page::Update(Transaction& txn, slot_t slot, std::string_view row) {
   ASSERT_PAGE_TYPE(PageType::kRowPage);
   Status result = body.row_page.Update(PageID(), txn, slot, row);
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -203,8 +203,8 @@ Status Page::Delete(Transaction& txn, const slot_t pos) {
   ASSERT_PAGE_TYPE(PageType::kRowPage);
   Status result = body.row_page.Delete(PageID(), txn, pos);
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -241,8 +241,8 @@ Status Page::InsertLeaf(Transaction& txn, std::string_view key,
   ASSERT_PAGE_TYPE(PageType::kLeafPage);
   Status result = body.leaf_page.Insert(PageID(), txn, key, value);
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -252,8 +252,8 @@ Status Page::Update(Transaction& txn, std::string_view key,
   ASSERT_PAGE_TYPE(PageType::kLeafPage);
   Status result = body.leaf_page.Update(PageID(), txn, key, value);
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -272,8 +272,8 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
                                PageTypeString(type));
   }
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -299,8 +299,8 @@ Status Page::InsertBranch(Transaction& txn, std::string_view key,
   ASSERT_PAGE_TYPE(PageType::kBranchPage);
   Status result = body.branch_page.Insert(PageID(), txn, key, pid);
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -310,8 +310,8 @@ Status Page::UpdateBranch(Transaction& txn, std::string_view key,
   ASSERT_PAGE_TYPE(PageType::kBranchPage);
   Status result = body.branch_page.Update(PageID(), txn, key, pid);
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -325,8 +325,8 @@ StatusOr<page_id_t> Page::GetPageForKey(Transaction& txn, std::string_view key,
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage);
   body.branch_page.SetLowestValue(PageID(), txn, v);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
+  SetPageLSN(txn.PrevRecordEndLSN());
+  SetRecLSN(txn.PrevRecordEndLSN());
 }
 
 void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
@@ -338,8 +338,8 @@ void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
 void Page::PageTypeChange(Transaction& txn, PageType new_type) {
   PageTypeChangeImpl(new_type);
   txn.AllocatePageLog(page_id, new_type);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
+  SetPageLSN(txn.PrevRecordEndLSN());
+  SetRecLSN(txn.PrevRecordEndLSN());
 }
 
 namespace {
@@ -413,8 +413,8 @@ Status Page::SetLowFence(Transaction& txn, const IndexKey& key) {
       throw std::runtime_error("Invalid page type");
   }
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -432,8 +432,8 @@ Status Page::SetHighFence(Transaction& txn, const IndexKey& key) {
       throw std::runtime_error("Invalid page type");
   }
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }
@@ -477,8 +477,8 @@ Status Page::SetFoster(Transaction& txn, const FosterPair& foster) {
       throw std::runtime_error("Invalid page type");
   }
   if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevRecordEndLSN());
   }
   return result;
 }

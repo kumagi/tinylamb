@@ -53,6 +53,7 @@
 #include "page/page_ref.hpp"
 #include "page/page_type.hpp"
 #include "recovery/log_record.hpp"
+#include "recovery/logger.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 
@@ -212,26 +213,35 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
   // LSN. Without this the page keeps recovery_lsn == MAX (set on load), a
   // checkpoint would record it clean in the DPT, and a crash before its
   // flush would silently drop the restored effect.
-  target->SetRecLSN(lsn);
-  target->SetPageLSN(lsn);
+  //
+  // Stamp with the record's END (start + on-disk size), matching the forward
+  // path's PrevRecordEndLSN stamping: the write-back durability gate waits
+  // for DurableLSN() >= page_lsn, and the record's start alone would not
+  // cover its own bytes.
+  const lsn_t record_end = lsn + log.Size();
+  target->SetRecLSN(record_end);
+  target->SetPageLSN(record_end);
 }
 
-void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
-             TransactionManager* tm) {
+lsn_t LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
+              TransactionManager* tm) {
+  lsn_t clr_end = 0;
   switch (log.type) {
     case LogType::kUnknown:
       LOG(FATAL) << "Unknown type log";
       throw std::runtime_error("broken log");
     case LogType::kInsertRow:
-      tm->CompensateInsertLog(log.txn_id, log.pid, log.slot);
+      clr_end = tm->CompensateInsertLog(log.txn_id, log.pid, log.slot);
       target->DeleteImpl(log.slot);
       break;
     case LogType::kUpdateRow:
-      tm->CompensateUpdateLog(log.txn_id, log.pid, log.slot, log.undo_data);
+      clr_end = tm->CompensateUpdateLog(log.txn_id, log.pid, log.slot,
+                                        log.undo_data);
       target->UpdateImpl(log.slot, log.undo_data);
       break;
     case LogType::kDeleteRow:
-      tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot, log.undo_data);
+      clr_end = tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot,
+                                        log.undo_data);
       target->InsertImpl(log.slot, log.undo_data);
       break;
     case LogType::kSystemDestroyPage: {
@@ -259,51 +269,54 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       break;
     }
     case LogType::kInsertLeaf:
-      tm->CompensateInsertLog(log.txn_id, log.pid, log.key);
+      clr_end = tm->CompensateInsertLog(log.txn_id, log.pid, log.key);
       target->DeleteImpl(log.key);
       break;
     case LogType::kInsertBranch:
-      tm->CompensateInsertBranchLog(log.txn_id, log.pid, log.key);
+      clr_end = tm->CompensateInsertBranchLog(log.txn_id, log.pid, log.key);
       target->DeleteBranchImpl(log.key);
       break;
     case LogType::kUpdateLeaf:
-      tm->CompensateUpdateLog(log.txn_id, log.pid, log.key, log.undo_data);
+      clr_end = tm->CompensateUpdateLog(log.txn_id, log.pid, log.key,
+                                        log.undo_data);
       target->UpdateImpl(log.key, log.undo_data);
       break;
     case LogType::kUpdateBranch:
-      tm->CompensateUpdateBranchLog(log.txn_id, log.pid, log.key,
-                                    log.undo_page);
+      clr_end = tm->CompensateUpdateBranchLog(log.txn_id, log.pid, log.key,
+                                              log.undo_page);
       target->UpdateBranchImpl(log.key, log.undo_page);
       break;
     case LogType::kDeleteLeaf:
-      tm->CompensateDeleteLog(log.txn_id, log.pid, log.key, log.undo_data);
+      clr_end = tm->CompensateDeleteLog(log.txn_id, log.pid, log.key,
+                                        log.undo_data);
       target->InsertImpl(log.key, log.undo_data);
       break;
     case LogType::kDeleteBranch:
-      tm->CompensateDeleteBranchLog(log.txn_id, log.pid, log.key,
-                                    log.undo_page);
+      clr_end = tm->CompensateDeleteBranchLog(log.txn_id, log.pid, log.key,
+                                              log.undo_page);
       target->InsertBranchImpl(log.key, log.undo_page);
       break;
     case LogType::kLowestValue: {
-      tm->CompensateSetLowestValueLog(log.txn_id, log.pid, log.undo_page);
+      clr_end = tm->CompensateSetLowestValueLog(log.txn_id, log.pid,
+                                                log.undo_page);
       target->SetLowestValueBranchImpl(log.undo_page);
       break;
     }
     case LogType::kSetLowFence: {
       auto undo_key = Decode<IndexKey>(log.undo_data);
-      tm->CompensateSetLowFenceLog(log.txn_id, log.pid, undo_key);
+      clr_end = tm->CompensateSetLowFenceLog(log.txn_id, log.pid, undo_key);
       target->SetLowFenceImpl(undo_key);
       break;
     }
     case LogType::kSetHighFence: {
       auto undo_key = Decode<IndexKey>(log.undo_data);
-      tm->CompensateSetHighFenceLog(log.txn_id, log.pid, undo_key);
+      clr_end = tm->CompensateSetHighFenceLog(log.txn_id, log.pid, undo_key);
       target->SetHighFenceImpl(undo_key);
       break;
     }
     case LogType::kSetFoster: {
       auto foster = Decode<FosterPair>(log.undo_data);
-      tm->CompensateSetFosterLog(log.txn_id, log.pid, foster);
+      clr_end = tm->CompensateSetFosterLog(log.txn_id, log.pid, foster);
       target->SetFosterImpl(foster);
       break;
     }
@@ -328,9 +341,17 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       break;
   }
   // See LogRedo: an undone page is dirty from this LSN for the next
-  // checkpoint's dirty-page table.
-  target->SetRecLSN(lsn);
-  target->SetPageLSN(lsn);
+  // checkpoint's dirty-page table.  Stamping with the undone record's END
+  // keeps the redo filter (`page_lsn < record_end`) from re-applying the
+  // change that was just compensated.  Recovery-time callers must use the
+  // undone record's end here (not the freshly appended CLR's): records
+  // replayed later in this same recovery pass sit BELOW the CLR's tail LSN
+  // and would be skipped by the redo filter.  The runtime caller
+  // (LogUndoWithPage) raises the stamp to the CLR's end separately.
+  const lsn_t record_end = lsn + log.Size();
+  target->SetRecLSN(record_end);
+  target->SetPageLSN(record_end);
+  return clr_end;
 }
 
 // Precondition: the page is locked by this thread.
@@ -354,7 +375,10 @@ void PageReplay(PageRef&& target,
     // "nothing applied yet". Flushed images with page_lsn == 0 can only
     // contain such an ALLOCATE, whose redo (PageInit) is a no-op on them.
     const bool nothing_applied_yet = target->PageLSN() == 0;
-    if (nothing_applied_yet || target->PageLSN() < lsn) {
+    // Page stamps hold the last applied record's END LSN, so the filter
+    // compares against this record's end: not-yet-applied means the page's
+    // stamp (<= this record's start) is strictly below its end.
+    if (nothing_applied_yet || target->PageLSN() < lsn + log.Size()) {
       if (RecoveryTraceEnabled()) {
         LOG(INFO) << "redo: " << log;
       }
@@ -572,6 +596,11 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     }
     LOG(INFO) << "Truncating torn log tail: " << on_disk << " -> " << valid_end;
     std::filesystem::resize_file(log_name_, valid_end);
+    // The Logger latched its three LSNs to the pre-truncation file size in
+    // its constructor.  O_APPEND writes would land at the new EOF while
+    // AddLog kept reporting offsets past it, desynchronizing every page
+    // stamp and loser-chain walk from the file.  Resync now.
+    tm->logger_->TruncateTo(valid_end);
   }
   const std::uintmax_t filesize = std::min<std::uintmax_t>(on_disk, valid_end);
 
@@ -909,10 +938,11 @@ void RecoveryManager::UndoLoserChains(const std::vector<lsn_t>& loser_heads,
         if (!target->IsValid()) {
           LOG(INFO) << "Loser undo rebuilds broken page " << log.pid;
           SinglePageRecovery(std::move(target), tm, undone, scan_end);
-        } else if (target->PageLSN() >= cur) {
-          // Only revert changes the page image actually reflects; older
-          // images never received this change (and the next recovery cycle
-          // redoes+undoes it deterministically).
+        } else if (target->PageLSN() >= cur + log.Size()) {
+          // Only revert changes the page image actually reflects; with END-
+          // LSN stamps "reflects" means the stamp reaches past this record's
+          // end (older images never received this change, and the next
+          // recovery cycle redoes+undoes it deterministically).
           LogUndo(target, cur, log, tm);
           undone->Record(cur);
         }
@@ -926,7 +956,17 @@ void RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
                                       TransactionManager* tm) {
   if (IsPageManipulation(log.type)) {
     PageRef target = pool_->GetPage(log.pid);
-    LogUndo(target, lsn, log, tm);
+    const lsn_t clr_end = LogUndo(target, lsn, log, tm);
+    // Runtime undo: the page image now reflects the CLR, which sits at the
+    // log tail ABOVE the undone record.  Leaving the stamp at the undone
+    // record's end would regress page_lsn below the CLR and let the
+    // write-back durability gate (DurableLSN >= page_lsn) release the page
+    // while its compensating record is still volatile.  No record for this
+    // page can land between the two stamps: the page latch is held for the
+    // whole undo, and every later record exceeds the CLR.
+    const lsn_t stamp = std::max(lsn + log.Size(), clr_end);
+    target->SetRecLSN(stamp);
+    target->SetPageLSN(stamp);
   }
 }
 

@@ -37,6 +37,8 @@ class NumaArenaPartition {
 
  private:
   struct Block {
+    // Runtime-sized buffer; array form is intentional (see AddBlock).
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
     std::unique_ptr<uint8_t[]> data;
     size_t size{0};
   };

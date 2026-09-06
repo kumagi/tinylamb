@@ -161,7 +161,7 @@ class CreateTableStatement : public Statement {
     } else {
       o << " columns=[";
       for (size_t i = 0; i < columns_.size(); i++) {
-        if (i != 0u) {
+        if (i != 0U) {
           o << ", ";
         }
         o << columns_[i];
@@ -369,14 +369,14 @@ class SelectStatement : public Statement {
   void Dump(std::ostream& o) const override {
     o << "select=[";
     for (size_t i = 0; i < select_list_.size(); i++) {
-      if (i != 0u) {
+      if (i != 0U) {
         o << ", ";
       }
       o << select_list_[i];
     }
     o << "] from=[";
     for (size_t i = 0; i < from_clause_.size(); i++) {
-      if (i != 0u) {
+      if (i != 0U) {
         o << ", ";
       }
       o << from_clause_[i];
@@ -471,12 +471,12 @@ class InsertStatement : public Statement {
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " values=[";
     for (size_t i = 0; i < values_.size(); i++) {
-      if (i != 0u) {
+      if (i != 0U) {
         o << "; ";
       }
       o << "(";
       for (size_t j = 0; j < values_[i].size(); j++) {
-        if (j != 0u) {
+        if (j != 0U) {
           o << ", ";
         }
         o << *values_[i][j];
@@ -556,7 +556,7 @@ class UpdateStatement : public Statement {
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " set=[";
     for (size_t i = 0; i < set_clause_.size(); i++) {
-      if (i != 0u) {
+      if (i != 0U) {
         o << ", ";
       }
       o << set_clause_[i].first << " = " << *set_clause_[i].second;

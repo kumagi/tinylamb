@@ -34,6 +34,7 @@
 // VALUES, relational-route SELECTs) is never stored; lookups miss and the
 // legacy Prepare path runs verbatim.
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -221,12 +222,9 @@ inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)
       if (ContainsParameterSlot(in.child_)) {
         return true;
       }
-      for (const Expression& item : in.list_) {
-        if (ContainsParameterSlot(item)) {
-          return true;
-        }
-      }
-      return false;
+      return std::ranges::any_of(in.list_, [](const Expression& item) {
+        return ContainsParameterSlot(item);
+      });
     }
     case TypeTag::kFunctionCallExp:
       for (const Expression& arg :
@@ -340,12 +338,9 @@ inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
       if (call.FuncName() == "current_timestamp") {
         return true;
       }
-      for (const Expression& arg : call.Args()) {
-        if (ContainsNonDeterministicCall(arg)) {
-          return true;
-        }
-      }
-      return false;
+      return std::ranges::any_of(call.Args(), [](const Expression& arg) {
+        return ContainsNonDeterministicCall(arg);
+      });
     }
     case TypeTag::kBinaryExp: {
       const auto& binary = expression->AsBinaryExpression();
@@ -373,10 +368,10 @@ inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
       if (ContainsNonDeterministicCall(in.child_)) {
         return true;
       }
-      for (const Expression& item : in.list_) {
-        if (ContainsNonDeterministicCall(item)) {
-          return true;
-        }
+      if (std::ranges::any_of(in.list_, [](const Expression& item) {
+            return ContainsNonDeterministicCall(item);
+          })) {
+        return true;
       }
       return false;
     }
@@ -499,7 +494,9 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
 struct CompiledPlan {
   enum class Kind : uint8_t { kSelect, kInsert, kUpdate, kDelete };
 
-  Kind kind;
+  // Defaulted so the implicit default constructor cannot leave it
+  // uninitialized (every caller overwrites it immediately after).
+  Kind kind{Kind::kSelect};
   // Plans retain Table/Index objects from the database that produced them.
   // Schema epochs are local to a Database, so an epoch alone cannot prevent a
   // plan compiled for another database instance from being replayed here.
@@ -700,7 +697,7 @@ class PreparedPlanCache {
     return shards_[std::hash<std::string>{}(fingerprint) % kShards];
   }
 
-  Shard shards_[kShards];
+  std::array<Shard, kShards> shards_{};
 };
 
 inline void StoreCompiledPlan(const std::string& fingerprint,

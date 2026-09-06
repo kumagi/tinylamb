@@ -14,8 +14,12 @@ Top of the layer DAG; may include anything below. Linux-only runtime
   read-worker pool (`PostgresServerOptions`: `port 54321`, `max_connections
   1024`, `max_message 16 MiB`,   `idle_timeout 3600s`, `force_recovery` for torn
   WAL tails). Executes **`Q` (Simple Query) only** — `Parse/Bind/Describe/
-  Execute/Sync` (extended protocol) are rejected with an error +
-  ReadyForQuery. DoS caps: pre-auth input 1024 B, queued output 64 MiB,
+  Execute` (extended protocol) are rejected with an ErrorResponse +
+  ReadyForQuery, while `Sync` is tolerated as a no-op that only answers
+  ReadyForQuery and `Flush` is a silent no-op. Read-only Query messages may
+  be offloaded to the worker pool; sessions that created a TEMP view or SQL
+  UDF stay on the event-loop thread (the frontend registries are
+  thread-local). DoS caps: pre-auth input 1024 B, queued output 64 MiB,
   oversized results abort with an error past 1M rows.
 
 ## Contract to preserve

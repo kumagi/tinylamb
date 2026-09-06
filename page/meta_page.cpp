@@ -98,6 +98,14 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target) {
   free_page.next_free_page = first_free_page;
   first_free_page = free_page_id;
   txn.DestroyPageLog(free_page_id, old_type, std::move(old_body));
+  // Stamp the freed image with the destroy record's end LSN.  Without this
+  // the PageInit'd page keeps page_lsn == 0, the write-back durability gate
+  // (WaitForDurable(0)) is a no-op, and the free-page image can reach disk
+  // before kSystemDestroyPage is durable: lose the record to a torn tail and
+  // the startup free-list rebuild links a page the catalog still references
+  // (double allocation).
+  target->SetPageLSN(txn.PrevRecordEndLSN());
+  target->SetRecLSN(txn.PrevRecordEndLSN());
 }
 
 void MetaPage::Dump(std::ostream& o, int /*unused*/) const {

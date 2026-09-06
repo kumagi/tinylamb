@@ -136,6 +136,22 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
           right_type == ValueType::kDouble) {
         operand_type = ValueType::kDouble;
       }
+      // Interval arithmetic (any VARCHAR operand under +,-,*,/,%) returns a
+      // VARCHAR interval string from EvaluateBinary, but BinaryResultType
+      // declares kBigInt for those shapes -- the program's static result
+      // type would then mismatch the Value appended per row ("column vector
+      // type mismatch").  Reject the shape so callers fall back to the AST
+      // evaluator, the semantic ground truth.
+      const bool arithmetic =
+          binary.Op() == BinaryOperation::kAdd ||
+          binary.Op() == BinaryOperation::kSubtract ||
+          binary.Op() == BinaryOperation::kMultiply ||
+          binary.Op() == BinaryOperation::kDivide ||
+          binary.Op() == BinaryOperation::kModulo;
+      if (arithmetic && (left_type == ValueType::kVarChar ||
+                         right_type == ValueType::kVarChar)) {
+        return false;
+      }
       program->AddInstruction({.opcode = BinaryOpcode(operand_type),
                                .operand = 0,
                                .binary = binary.Op()});

@@ -1943,6 +1943,12 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
   // result_column_names_); capture the outer statement's output names before
   // descending so the post-fold ORDER BY schema matches THIS statement.
   const std::vector<std::string> output_names = result_column_names_;
+  // Disarm the plan-cache fill sites for the operands (same guard INSERT
+  // ...SELECT uses): the armed fingerprint belongs to the WHOLE set-op
+  // statement, so each operand's optimizer-route fill site would otherwise
+  // cache its single-branch plan under it -- a replay would then serve only
+  // the last-prepared branch and silently drop every other one.
+  clear_plan_cache_candidate();
   std::vector<std::vector<Row>> term_rows;
   for (auto& term : terms) {
     // A WITH clause scopes over the whole set-operation statement, but the

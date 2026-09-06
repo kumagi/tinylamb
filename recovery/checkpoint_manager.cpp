@@ -147,15 +147,32 @@ lsn_t CheckpointManager::WriteCheckpoint(
 
   std::vector<std::pair<page_id_t, lsn_t> > dirty_page_table;
   {
-    // page_lsn/recovery_lsn are plain (non-atomic) fields mutated under the
-    // per-page latch; read them under the shared page latch so a concurrent
+    // Lock order: never take a page latch while holding pool_latch.  A
+    // GetPage miss acquires pool_latch exclusively while its caller holds a
+    // page latch (e.g. meta-page allocation across GetPage), so the old
+    // pool_latch -> page_latch nesting here could deadlock.  Pin every
+    // resident entry under the shared pool_latch first (pinning blocks
+    // DetachVictim, which needs pool_latch exclusively and rechecks pins
+    // under the stripe mutex), release pool_latch, then read each
+    // RecoveryLSN under the shared page latch so a concurrent
     // SetRecLSN/SetPageLSN cannot tear the DPT entries published here.
-    std::shared_lock latch(pp_->pool_latch);
-    dirty_page_table.reserve(pp_->pool_.size());
-    for (const auto& it : pp_->pool_) {
-      PagePool::Entry& entry = *it.second;
-      std::shared_lock page_latch(*entry.page_latch);
-      dirty_page_table.emplace_back(it.first, entry.page->RecoveryLSN());
+    std::vector<std::pair<PagePool::Entry*, page_id_t> > snapshot;
+    {
+      std::shared_lock latch(pp_->pool_latch);
+      snapshot.reserve(pp_->pool_.size());
+      for (const auto& it : pp_->pool_) {
+        PagePool::Entry& entry = *it.second;
+        entry.pin_count.fetch_add(1, std::memory_order_relaxed);
+        snapshot.emplace_back(&entry, it.first);
+      }
+    }
+    dirty_page_table.reserve(snapshot.size());
+    for (auto& [entry, pid] : snapshot) {
+      {
+        std::shared_lock page_latch(*entry->page_latch);
+        dirty_page_table.emplace_back(pid, entry->page->RecoveryLSN());
+      }
+      PagePool::ReleasePin(*entry, pid);
     }
   }
   std::vector<ActiveTransactionEntry> active_transaction_table;

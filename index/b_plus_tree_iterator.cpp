@@ -38,16 +38,30 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
   }
   if (ascending) {
     if (begin.empty()) {
+      // Land on the first leaf holding any key.  Foster links cover a
+      // deleted-and-emptied leftmost leaf whose split was already absorbed
+      // into the parent; when no foster remains, cross the high fence with
+      // the same walk PositionAtOrAbove uses (an empty begin matches every
+      // key, so a non-empty tree must never scan as empty).
       PageRef leaf = tree->LeftmostPage(*txn_);
-      while (leaf->body.leaf_page.row_count_ == 0) {
+      for (;;) {
+        if (0 < leaf->body.leaf_page.row_count_) {
+          break;
+        }
         if (auto foster = leaf->GetFoster(*txn_)) {
           PageRef child =
               txn_->GetPageManager()->GetPage(foster.Value().child_pid, true);
           leaf.PageUnlock();
           leaf = std::move(child);
-        } else {
-          break;
+          continue;
         }
+        const IndexKey high_fence = leaf->GetHighFence(*txn_);
+        if (high_fence.IsPlusInfinity()) {
+          break;  // Truly empty tree.
+        }
+        const std::string seek(high_fence.GetKey().Value());
+        leaf.PageUnlock();
+        leaf = tree_->FindLeafReadOnly(*txn_, seek, false);
       }
       pid_ = leaf->PageID();
       idx_ = 0;
@@ -78,6 +92,13 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
                  ? 0
                  : leaf->body.leaf_page.row_count_ - 1;
       valid_ = leaf->body.leaf_page.row_count_ > 0;
+      // Mirror the other construction branches: validate the OPPOSITE bound
+      // here too, or a DESC scan with only a lower bound emits the maximum
+      // key even when every key is below it.
+      if (valid_ && !begin.empty() &&
+          leaf->body.leaf_page.GetKey(idx_) < begin) {
+        valid_ = false;
+      }
     } else {
       // Find() is only a lower_bound: when `end` is absent we must not start
       // on a key above `end`, nor report an empty scan when keys below `end`
@@ -152,8 +173,32 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
       return *this;
     }
     ref.PageUnlock();
+    // Crossing the fence can land on a leaf emptied by deletions (the
+    // deleter only refeeds its own foster chain, and branch rebalance never
+    // merges a zero-row child).  Walk the same foster/fence chain the
+    // constructor's begin path uses: an in-range key may sit beyond any
+    // number of empty leaves, so a single landing is not conclusive.
     PageRef next_ref =
         tree_->FindLeafReadOnly(*txn_, high_fence.GetKey().Value(), false);
+    for (;;) {
+      if (next_ref->body.leaf_page.row_count_ != 0) {
+        break;
+      }
+      if (auto foster = next_ref->GetFoster(*txn_)) {
+        pid_ = foster.Value().child_pid;
+        PageRef child = txn_->GetPageManager()->GetPage(pid_, true);
+        next_ref.PageUnlock();
+        next_ref = std::move(child);
+        continue;
+      }
+      const IndexKey nested_fence = next_ref->GetHighFence(*txn_);
+      if (nested_fence.IsPlusInfinity()) {
+        break;
+      }
+      const std::string nested_seek(nested_fence.GetKey().Value());
+      next_ref.PageUnlock();
+      next_ref = tree_->FindLeafReadOnly(*txn_, nested_seek, false);
+    }
     idx_ = 0;
     pid_ = next_ref->PageID();
     if (next_ref->body.leaf_page.row_count_ == 0 ||

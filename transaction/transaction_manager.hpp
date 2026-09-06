@@ -123,31 +123,35 @@ class TransactionManager {
 
   void Abort(Transaction& txn);
 
-  void CompensateInsertLog(txn_id_t txn_id, page_id_t pid, slot_t slot);
-  void CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                           std::string_view key);
-  void CompensateInsertBranchLog(txn_id_t txn_id, page_id_t pid,
-                                 std::string_view key);
-  void CompensateUpdateLog(txn_id_t txn_id, page_id_t pid, slot_t slot,
-                           std::string_view redo);
-  void CompensateUpdateLog(txn_id_t txn_id, page_id_t pid, std::string_view key,
-                           std::string_view redo);
-  void CompensateUpdateBranchLog(txn_id_t txn_id, page_id_t pid,
-                                 std::string_view key, page_id_t redo);
-  void CompensateDeleteLog(txn_id_t txn_id, page_id_t pid, slot_t slot,
-                           std::string_view redo);
-  void CompensateDeleteLog(txn_id_t txn_id, page_id_t pid, std::string_view key,
-                           std::string_view redo);
-  void CompensateDeleteBranchLog(txn_id_t txn_id, page_id_t pid,
-                                 std::string_view key, page_id_t redo);
-  void CompensateSetLowestValueLog(txn_id_t txn_id, page_id_t pid,
-                                   page_id_t redo);
-  void CompensateSetLowFenceLog(txn_id_t txn_id, page_id_t pid,
-                                const IndexKey& redo);
-  void CompensateSetHighFenceLog(txn_id_t txn_id, page_id_t pid,
+  // Append a compensating (CLR) record and return its END LSN (start +
+  // on-disk size).  Callers that revert a page in the same critical section
+  // use it to keep page_lsn at or above the record whose effect the page
+  // now reflects (see RecoveryManager::LogUndoWithPage).
+  lsn_t CompensateInsertLog(txn_id_t txn_id, page_id_t pid, slot_t slot);
+  lsn_t CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
+                            std::string_view key);
+  lsn_t CompensateInsertBranchLog(txn_id_t txn_id, page_id_t pid,
+                                  std::string_view key);
+  lsn_t CompensateUpdateLog(txn_id_t txn_id, page_id_t pid, slot_t slot,
+                            std::string_view redo);
+  lsn_t CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
+                            std::string_view key, std::string_view redo);
+  lsn_t CompensateUpdateBranchLog(txn_id_t txn_id, page_id_t pid,
+                                  std::string_view key, page_id_t redo);
+  lsn_t CompensateDeleteLog(txn_id_t txn_id, page_id_t pid, slot_t slot,
+                            std::string_view redo);
+  lsn_t CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
+                            std::string_view key, std::string_view redo);
+  lsn_t CompensateDeleteBranchLog(txn_id_t txn_id, page_id_t pid,
+                                  std::string_view key, page_id_t redo);
+  lsn_t CompensateSetLowestValueLog(txn_id_t txn_id, page_id_t pid,
+                                    page_id_t redo);
+  lsn_t CompensateSetLowFenceLog(txn_id_t txn_id, page_id_t pid,
                                  const IndexKey& redo);
-  void CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
-                              const FosterPair& foster);
+  lsn_t CompensateSetHighFenceLog(txn_id_t txn_id, page_id_t pid,
+                                  const IndexKey& redo);
+  lsn_t CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
+                               const FosterPair& foster);
   // Non-waiting first-updater-wins reservation stored in the same shard as
   // the row's MVCC chain. A stale snapshot or another pending writer loses.
   // When `before` is supplied (update/delete of an existing row), the chain's

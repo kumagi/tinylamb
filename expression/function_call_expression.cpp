@@ -1158,7 +1158,23 @@ Value ExecuteFunction(const std::string& name,
     if (values[0].IsNull()) {
       return {};
     }
-    return Value(static_cast<int64_t>(raw_str(values[0]).size()));
+    const std::string input = raw_str(values[0]);
+    if (name == "char_length" || name == "character_length") {
+      // SQL CHAR_LENGTH counts CHARACTER CODE POINTS; the relational
+      // evaluator (expression_eval.cpp utf8_len) and the compliance golden
+      // (CHAR_LENGTH("€") = 1) already do.  Byte-counting here made the
+      // result depend on which evaluator the plan happened to pick.
+      size_t code_points = 0;
+      for (size_t i = 0; i < input.size(); ++i) {
+        const auto byte = static_cast<unsigned char>(input[i]);
+        if ((byte & 0xC0) != 0x80) {  // skip UTF-8 continuation bytes
+          ++code_points;
+        }
+      }
+      return Value(static_cast<int64_t>(code_points));
+    }
+    // length / octet_length / byte_length stay byte-oriented.
+    return Value(static_cast<int64_t>(input.size()));
   }
   if (name == "instr" || name == "strpos") {
     if (values.size() != 2) {

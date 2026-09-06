@@ -163,14 +163,19 @@ void BranchPage::UpdateImpl(std::string_view key, page_id_t pid) {
 void BranchPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
   // Redo/Impl callers reach here without the SetFence/SetFoster space checks;
   // refuse impossible requests instead of underflowing free_ptr_ and writing
-  // past the page body.
-  if (payload.size() > static_cast<size_t>(free_size_)) {
+  // past the page body.  The slot's own bytes are reclaimed by this update,
+  // so they must be credited back before the size test (mirrors
+  // LeafPage::UpdateSlotImpl); omitting them turned a fits-after-reclaim
+  // update into a silent post-log no-op -- the WAL record is already durable
+  // with the page stamped at its LSN, so redo skips it forever and the page
+  // diverges from the log.
+  if (payload.size() > static_cast<size_t>(free_size_) + pos.size) {
     assert(!"UpdateSlotImpl ran out of free space");
     LOG(ERROR) << "UpdateSlotImpl needs " << payload.size()
-               << " bytes but free_size_ is " << free_size_;
+               << " bytes but reclaimable is " << (free_size_ + pos.size);
     return;
   }
-  assert(payload.size() <= free_size_);
+  assert(payload.size() <= static_cast<size_t>(free_size_) + pos.size);
   if (Payload() + free_ptr_ - payload.size() <=
       reinterpret_cast<char*>(&rows_[row_count_ + kExtraIdx + 1])) {
     DeFragment();

@@ -35,6 +35,7 @@
 #include "page/page_type.hpp"
 #include "page/row_position.hpp"
 #include "recovery/log_record.hpp"
+#include "recovery/logger.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
@@ -55,6 +56,17 @@ std::ostream& operator<<(std::ostream& o, const TransactionStatus& t) {
       break;
   }
   return o;
+}
+
+Transaction::~Transaction() {
+  // Destroyed without commit/abort (e.g. an exception unwound a query after
+  // Begin): leaving the slot registered hands a dangling Transaction* to the
+  // checkpoint worker and the deadlock detector (use-after-free), and pins
+  // active_snapshots_ so MVCC GC can never advance.  ForgetTransaction on the
+  // normal paths already erased the entry, making this a no-op there.
+  if (transaction_manager_ != nullptr && !IsFinished()) {
+    transaction_manager_->ReleaseActiveTransaction(this);
+  }
 }
 
 Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm,
@@ -82,6 +94,7 @@ Transaction::Transaction(Transaction&& o) noexcept
       version_read_caches_(std::move(o.version_read_caches_)),
       read_state_mutex_(std::move(o.read_state_mutex_)),
       prev_lsn_(o.prev_lsn_.load(std::memory_order_relaxed)),
+      prev_end_lsn_(o.prev_end_lsn_.load(std::memory_order_relaxed)),
       durability_dependence_(
           o.durability_dependence_.load(std::memory_order_acquire)),
       status_(o.status_.load(std::memory_order_relaxed)),
@@ -309,123 +322,109 @@ bool Transaction::IndexKeysMayBeStale(page_id_t index_root) const {
          transaction_manager_->IndexKeysMayBeStale(*this, index_root);
 }
 
+lsn_t Transaction::AppendLog(const LogRecord& lr) {
+  const std::string data = lr.Serialize();
+  const lsn_t start = transaction_manager_->logger_->AddLog(data);
+  prev_lsn_ = start;
+  // AddLog returns the record's START offset; the record occupies
+  // [start, start + data.size()).  Page stamps use the END so the write-back
+  // durability gate cannot pass while the modifying record is still volatile.
+  prev_end_lsn_ = start + static_cast<lsn_t>(data.size());
+  // Known narrow window: a checkpoint's ATT snapshot can read a stale
+  // prev_lsn_ for the few instructions before the store lands.  Recovery
+  // tolerates it: any record at or above checkpoint begin_lsn is found by
+  // the scan itself, and an older never-durable record is dropped by the
+  // torn-tail truncation, so the stale snapshot alone cannot strand an
+  // uncompensated durable record below begin_lsn.
+  return start;
+}
+
 lsn_t Transaction::InsertLog(page_id_t pid, slot_t slot,
                              std::string_view redo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, slot, redo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, slot, redo));
 }
 lsn_t Transaction::InsertLeafLog(page_id_t pid, std::string_view key,
                                  std::string_view redo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::InsertingLeafLogRecord(prev_lsn_, txn_id_, pid, key, redo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::InsertingLeafLogRecord(prev_lsn_, txn_id_, pid, key, redo));
 }
 lsn_t Transaction::InsertBranchLog(page_id_t pid, std::string_view key,
                                    page_id_t redo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::InsertingBranchLogRecord(prev_lsn_, txn_id_, pid, key, redo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::InsertingBranchLogRecord(prev_lsn_, txn_id_, pid, key, redo));
 }
 
 lsn_t Transaction::UpdateLog(page_id_t pid, slot_t slot, std::string_view redo,
                              std::string_view undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
 }
 
 lsn_t Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
                                  std::string_view redo, std::string_view undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(LogRecord::UpdatingLeafLogRecord(
-      prev_lsn_, txn_id_, pid, key, redo, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::UpdatingLeafLogRecord( prev_lsn_, txn_id_, pid, key, redo, undo));
 }
 
 lsn_t Transaction::UpdateBranchLog(page_id_t pid, std::string_view key,
                                    page_id_t redo, page_id_t undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(LogRecord::UpdatingBranchLogRecord(
-      prev_lsn_, txn_id_, pid, key, redo, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::UpdatingBranchLogRecord( prev_lsn_, txn_id_, pid, key, redo, undo));
 }
 
 lsn_t Transaction::DeleteLog(page_id_t pid, slot_t slot,
                              std::string_view undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, slot, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, slot, undo));
 }
 
 lsn_t Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
                                  std::string_view undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::DeletingLeafLogRecord(prev_lsn_, txn_id_, pid, key, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::DeletingLeafLogRecord(prev_lsn_, txn_id_, pid, key, undo));
 }
 
 lsn_t Transaction::DeleteBranchLog(page_id_t pid, std::string_view key,
                                    page_id_t undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::DeletingBranchLogRecord(prev_lsn_, txn_id_, pid, key, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::DeletingBranchLogRecord(prev_lsn_, txn_id_, pid, key, undo));
 }
 
 lsn_t Transaction::SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
 lsn_t Transaction::SetLowFence(page_id_t pid, const IndexKey& redo,
                                const IndexKey& undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::SetLowFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::SetLowFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
 lsn_t Transaction::SetHighFence(page_id_t pid, const IndexKey& redo,
                                 const IndexKey& undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::SetHighFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::SetHighFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
 lsn_t Transaction::SetFoster(page_id_t pid, const FosterPair& redo,
                              const FosterPair& undo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::SetFosterLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
-  return prev_lsn_;
+  return AppendLog(LogRecord::SetFosterLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
 lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
                                    PageType new_page_type) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(LogRecord::AllocatePageLogRecord(
-      prev_lsn_, txn_id_, allocated_page_id, new_page_type));
-  return prev_lsn_;
+  return AppendLog(LogRecord::AllocatePageLogRecord( prev_lsn_, txn_id_, allocated_page_id, new_page_type));
 }
 
 lsn_t Transaction::DestroyPageLog(page_id_t destroyed_page_id,
                                   PageType old_page_type,
                                   std::string old_page_body) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id,
-                                      old_page_type, std::move(old_page_body)));
-  return prev_lsn_;
+  return AppendLog(LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id, old_page_type, std::move(old_page_body)));
 }
 
 // Using this function is discouraged to get performance of flush pipelining.

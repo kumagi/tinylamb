@@ -193,6 +193,27 @@ IntervalValue IntervalValue::Parse(std::string_view text,
     return {};
   }
 
+  // Saturate-with-error instead of wrapping: plain int64 arithmetic on
+  // stoll-parsed literals wraps silently (e.g. INTERVAL '922337203685477580
+  // 0 0'), yielding a wrong interval where every sibling path reports
+  // out-of-range.  Shared by the ISO branch below and the composite paths.
+  const auto checked_mul = [](int64_t a, int64_t b) -> int64_t {
+    int64_t result = 0;
+    if (__builtin_mul_overflow(a, b, &result)) {
+      throw std::runtime_error(
+          "generic::out_of_range: INTERVAL value out of range");
+    }
+    return result;
+  };
+  const auto checked_add = [](int64_t a, int64_t b) -> int64_t {
+    int64_t result = 0;
+    if (__builtin_add_overflow(a, b, &result)) {
+      throw std::runtime_error(
+          "generic::out_of_range: INTERVAL value out of range");
+    }
+    return result;
+  };
+
   // ISO 8601 (e.g. "P1Y2M3DT4H5M6.789S")
   if (s.front() == 'P' || s.front() == 'p') {
     size_t pos = 1;
@@ -285,25 +306,10 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         }
       }
     }
-    // Saturate instead of overflowing: the ISO-8601 designator path used a
-    // plain int64 multiply, so a literal like P999999999999Y wrapped into a
-    // negative interval rather than reporting an out-of-range value.
-    const auto checked_mul = [](int64_t a, int64_t b) -> int64_t {
-      int64_t result = 0;
-      if (__builtin_mul_overflow(a, b, &result)) {
-        throw std::runtime_error(
-            "generic::out_of_range: INTERVAL value out of range");
-      }
-      return result;
-    };
-    const auto checked_add = [](int64_t a, int64_t b) -> int64_t {
-      int64_t result = 0;
-      if (__builtin_add_overflow(a, b, &result)) {
-        throw std::runtime_error(
-            "generic::out_of_range: INTERVAL value out of range");
-      }
-      return result;
-    };
+    // The checked_mul/checked_add helpers defined at function scope cover
+    // the ISO-8601 designator path: a plain int64 multiply here used to
+    // wrap a literal like P999999999999Y into a negative interval instead
+    // of reporting an out-of-range value.
     int64_t tot_months = checked_add(checked_mul(parsed_y, 12), parsed_m);
     const int64_t hour_nanos = checked_mul(
         checked_add(checked_mul(parsed_h, 3600), checked_mul(parsed_min, 60)),
@@ -548,44 +554,50 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         switch (unit) {
           case 0: {
             int64_t years = 0;
-            if (__builtin_mul_overflow(val, 12, &years)) {
+            if (__builtin_mul_overflow(val, 12, &years) ||
+                __builtin_add_overflow(iv.months, years, &iv.months)) {
               ok = false;
               break;
             }
-            iv.months += years;
             break;
           }
           case 1:
-            iv.months += val;
-            break;
-          case 2:
-            iv.days += val;
-            break;
-          case 3: {
-            int64_t scaled = 0;
-            if (__builtin_mul_overflow(val, 3600LL * 1000000000LL, &scaled)) {
+            if (__builtin_add_overflow(iv.months, val, &iv.months)) {
               ok = false;
               break;
             }
-            iv.nanos += scaled;
+            break;
+          case 2:
+            if (__builtin_add_overflow(iv.days, val, &iv.days)) {
+              ok = false;
+              break;
+            }
+            break;
+          case 3: {
+            int64_t scaled = 0;
+            if (__builtin_mul_overflow(val, 3600LL * 1000000000LL, &scaled) ||
+                __builtin_add_overflow(iv.nanos, scaled, &iv.nanos)) {
+              ok = false;
+              break;
+            }
             break;
           }
           case 4: {
             int64_t scaled = 0;
-            if (__builtin_mul_overflow(val, 60LL * 1000000000LL, &scaled)) {
+            if (__builtin_mul_overflow(val, 60LL * 1000000000LL, &scaled) ||
+                __builtin_add_overflow(iv.nanos, scaled, &iv.nanos)) {
               ok = false;
               break;
             }
-            iv.nanos += scaled;
             break;
           }
           case 5: {
             int64_t scaled = 0;
-            if (__builtin_mul_overflow(val, 1000000000LL, &scaled)) {
+            if (__builtin_mul_overflow(val, 1000000000LL, &scaled) ||
+                __builtin_add_overflow(iv.nanos, scaled, &iv.nanos)) {
               ok = false;
               break;
             }
-            iv.nanos += scaled;
             break;
           }
           default:
@@ -618,8 +630,14 @@ IntervalValue IntervalValue::Parse(std::string_view text,
       auto s_int = static_cast<int64_t>(ts);
       double s_frac = ts - static_cast<double>(s_int);
       auto sub_ns = static_cast<int64_t>(std::round(s_frac * 1e9));
-      iv.nanos +=
-          (((th * 3600) + (tm * 60) + s_int) * 1000000000LL + sub_ns) * sign;
+      const int64_t day_seconds = checked_add(checked_mul(th, 3600),
+                                              checked_add(checked_mul(tm, 60),
+                                                          s_int));
+      iv.nanos = checked_add(
+          iv.nanos,
+          checked_mul(checked_add(checked_mul(day_seconds, 1000000000LL),
+                                  sub_ns),
+                      sign));
     } else if (p.find('-') != std::string::npos &&
                (p.size() > 1 && p.find_last_of('-') != 0)) {
       // Y-M
@@ -640,7 +658,9 @@ IntervalValue IntervalValue::Parse(std::string_view text,
           m = 0;
         }
       }
-      iv.months += ((y * 12) + m) * sign;
+      iv.months =
+          checked_add(iv.months, checked_mul(checked_add(checked_mul(y, 12), m),
+                                             sign));
     } else {
       // Numerical part
       int64_t val = 0;
@@ -651,46 +671,47 @@ IntervalValue IntervalValue::Parse(std::string_view text,
       }
       if (parts.size() == 3) {
         if (idx == 1) {
-          iv.days += val;
+          iv.days = checked_add(iv.days, val);
         } else if (idx == 0) {
-          iv.months += val * 12;
+          iv.months = checked_add(iv.months, checked_mul(val, 12));
         }
       } else if (parts.size() == 2) {
         if (u == "month to day") {  // NOLINT(bugprone-branch-clone)
           if (idx == 0) {
-            iv.months += val;
+            iv.months = checked_add(iv.months, val);
           } else {
-            iv.days += val;
+            iv.days = checked_add(iv.days, val);
           }
         } else if (u == "year to month") {
           if (idx == 0) {
-            iv.months += val * 12;
+            iv.months = checked_add(iv.months, checked_mul(val, 12));
           } else {
-            iv.months += val;
+            iv.months = checked_add(iv.months, val);
           }
         } else if (parts[0].find('-') != std::string::npos ||
                    parts[1].find(':') != std::string::npos) {
-          iv.days += val;
+          iv.days = checked_add(iv.days, val);
         } else {
           if (idx == 0) {
-            iv.months += val;
+            iv.months = checked_add(iv.months, val);
           } else {
-            iv.days += val;
+            iv.days = checked_add(iv.days, val);
           }
         }
       } else {
         // The unit prefixes intentionally share the same accumulation shape.
         // NOLINTNEXTLINE(bugprone-branch-clone)
         if (u.starts_with("year")) {
-          iv.months += val * 12;
+          iv.months = checked_add(iv.months, checked_mul(val, 12));
         } else if (u.starts_with("month")) {
-          iv.months += val;
+          iv.months = checked_add(iv.months, val);
         } else if (u.starts_with("hour")) {
-          iv.nanos += val * 3600LL * 1000000000LL;
+          iv.nanos = checked_add(
+              iv.nanos, checked_mul(val, 3600LL * 1000000000LL));
         } else if (u.starts_with("minute")) {
-          iv.nanos += val * 60LL * 1000000000LL;
+          iv.nanos = checked_add(iv.nanos, checked_mul(val, 60LL * 1000000000LL));
         } else {
-          iv.days += val;
+          iv.days = checked_add(iv.days, val);
         }
       }
     }

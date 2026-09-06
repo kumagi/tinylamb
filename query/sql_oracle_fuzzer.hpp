@@ -89,6 +89,8 @@ class OracleSession {
  private:
   std::unordered_set<std::string> plans_;
   std::vector<uint64_t> rewards_;
+  // Fixed seed: the oracle harness must reproduce a failing session.
+  // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp)
   std::mt19937 rng_{42};
 };
 

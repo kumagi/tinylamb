@@ -16,6 +16,15 @@ class Statement;
 // re-binding a cached template).
 std::string NormalizeTimestampText(const std::string& text);
 
+// Decodes the backslash escape sequences inside an already quote-stripped,
+// non-raw string literal body.  Shared by the AST visitor and the SQL
+// template scanner: the template cache must extract byte-identical literals
+// to the first parse, so both consumers decode through this one function
+// (a `\'` swallowed only by the parser made cached replays bind the raw
+// text and shift every following token).
+std::string DecodeStringEscapes(std::string_view value, bool is_bytes,
+                                bool is_triple, char quote);
+
 class GoogleSqlAstVisitor {
  public:
   // `source` is the original SQL the dump was produced from.  The dump does

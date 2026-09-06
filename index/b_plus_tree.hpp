@@ -92,8 +92,9 @@ class BPlusTree {
   static Status SetFosterRecursively(Transaction& txn, PageRef& parent,
                                      PageRef& new_child,
                                      std::string_view foster_key);
-  // Mutates the tree (allocates pages and rebuilds the root); deliberately
-  // non-const so read-only paths cannot grow the tree by accident.
+  // Grows the tree on demand (allocates pages and rebuilds the root) by
+  // mutating latched pages; const only because BPlusTree members are read,
+  // not written.  Read paths (FindLeaf after a foster split) may call it.
   void GrowTreeHeightIfNeeded(Transaction& txn) const;
   // Follows the foster chain rightwards while the chain key is <= `key`.
   static void FollowFosterChain(Transaction& txn, PageRef& leaf,

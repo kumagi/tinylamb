@@ -112,6 +112,7 @@ class RowPage {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): flexible trailing member
   RowPointer rows_[0];
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop

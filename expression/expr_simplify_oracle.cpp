@@ -278,9 +278,14 @@ TypedExpr GenBool(Gen& g, int depth, const ExprGenConfig& config) {
       static constexpr std::array<BinaryOperation, 3> kLogic{
           BinaryOperation::kAnd, BinaryOperation::kOr, BinaryOperation::kXor};
       BinaryOperation op = kLogic[static_cast<size_t>(g.Pick(0, 2))];
-      return {.expr = BinaryExpressionExp(
-                  GenTyped(g, GenType::kBool, depth - 1, config).expr, op,
-                  GenTyped(g, GenType::kBool, depth - 1, config).expr),
+      // Hoisted: as function arguments the two GenTyped calls had unspecified
+      // evaluation order, so gcc and clang consumed the RNG stream in
+      // opposite orders and the "same seed -> same tree" replay contract
+      // broke across compilers.
+      TypedExpr left = GenTyped(g, GenType::kBool, depth - 1, config);
+      TypedExpr right = GenTyped(g, GenType::kBool, depth - 1, config);
+      return {.expr = BinaryExpressionExp(std::move(left.expr), op,
+                                          std::move(right.expr)),
               .type = GenType::kBool};
     }
     case 4: {
@@ -356,8 +361,10 @@ TypedExpr GenBool(Gen& g, int depth, const ExprGenConfig& config) {
       std::vector<std::pair<Expression, Expression>> whens;
       whens.reserve(static_cast<size_t>(branches));
       for (int i = 0; i < branches; ++i) {
-        whens.emplace_back(GenTyped(g, GenType::kBool, depth - 1, config).expr,
-                           GenTyped(g, GenType::kBool, depth - 1, config).expr);
+        // Hoisted for a defined evaluation order (see GenBool logic case).
+        TypedExpr when = GenTyped(g, GenType::kBool, depth - 1, config);
+        TypedExpr then = GenTyped(g, GenType::kBool, depth - 1, config);
+        whens.emplace_back(std::move(when.expr), std::move(then.expr));
       }
       Expression otherwise =
           g.Chance(70) ? GenTyped(g, GenType::kBool, depth - 1, config).expr

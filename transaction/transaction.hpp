@@ -57,6 +57,9 @@ class Transaction final {
   Transaction() = default;  // For test purpose only.
   Transaction(txn_id_t txn_id, TransactionManager* tm, bool read_only = false);
   Transaction(const Transaction& o) = delete;
+  // Releases the TransactionManager registry slot when the transaction is
+  // destroyed without commit/abort (see the definition's comment).
+  ~Transaction();
   // Moving re-registers the transaction with its TransactionManager so a
   // Begin()-created object keeps its active_transactions_ entry valid at the
   // new address. The moved-from object is left manager-less.
@@ -83,6 +86,8 @@ class Transaction final {
     read_state_mutex_ = std::move(o.read_state_mutex_);
     prev_lsn_.store(o.prev_lsn_.load(std::memory_order_relaxed),
                     std::memory_order_relaxed);
+    prev_end_lsn_.store(o.prev_end_lsn_.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
     status_.store(o.status_.load(std::memory_order_relaxed),
                   std::memory_order_relaxed);
     transaction_manager_ = o.transaction_manager_;
@@ -117,6 +122,15 @@ class Transaction final {
            current == TransactionStatus::kAborted;
   }
   lsn_t PrevLSN() const { return prev_lsn_.load(std::memory_order_relaxed); }
+  // End LSN (= start + record bytes) of this transaction's most recently
+  // appended WAL record.  Page stamps must use this, not PrevLSN(): the
+  // durability gate waits for DurableLSN() >= page_lsn, and waiting on the
+  // record's START only proves the bytes BEFORE it are durable, so a page
+  // could reach disk while its own modifying record is still volatile
+  // (WAL-before-data violation, docs/recovery_invariants.md).
+  lsn_t PrevRecordEndLSN() const {
+    return prev_end_lsn_.load(std::memory_order_relaxed);
+  }
 
   // D4 (docs/design.md): WAL durability and external visibility are separate.
   // A reader that observes another transaction's committed MVCC version
@@ -172,6 +186,11 @@ class Transaction final {
 
   Status PreCommit();
   void Abort();
+
+  // Appends `lr` to the WAL, links it into this transaction's prev_lsn
+  // chain, and records the record's END LSN for page stamping.  Returns the
+  // record's start LSN (the chain pointer).
+  lsn_t AppendLog(const LogRecord& lr);
 
   // Log the action. Returns LSN.
   lsn_t InsertLog(page_id_t pid, slot_t slot, std::string_view redo);
@@ -303,6 +322,8 @@ class Transaction final {
   // fields for its ActiveTransactionTable snapshot while holding it.  The
   // atomics remove the data race; no cross-field ordering is required.
   std::atomic<lsn_t> prev_lsn_{0};
+  // End LSN of the record that starts at prev_lsn_ (see PrevRecordEndLSN).
+  std::atomic<lsn_t> prev_end_lsn_{0};
   // D4: highest dependency commit LSN observed by this transaction (see
   // RecordDurabilityDependence).  Updated from const read paths.
   mutable std::atomic<lsn_t> durability_dependence_{0};

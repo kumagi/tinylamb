@@ -88,6 +88,21 @@ python3 scripts/check_layering.py   # must exit 0
   `tinylamb_expression_jit_benchmark` are `EXCLUDE_FROM_ALL` — build by
   explicit target. TPC-H pulls an external `dbgen` build dependency
   (pinned commit; not fetched for normal builds).
+- Bug hunting with SQL oracle fuzzers: `sql_oracle_fuzzer_libfuzzer`
+  (TLP/NoREC/PQS/DQE/index-independence/txn-splitting oracles over the whole
+  engine), `expr_oracle_fuzzer_libfuzzer` (scalar rewrite + engine + Python
+  cross-check), `griffin_fuzzer_libfuzzer` (catalog-guided SQL sessions,
+  AST-vs-bytecode/JIT differential). Build with
+  `cmake -S . -B build-fuzz -DTINYLAMB_ENABLE_FUZZ=ON` and run e.g.
+  `./build-fuzz/sql_oracle_fuzzer_libfuzzer -max_total_time=3600` in a scratch
+  dir. On a mismatch each writes a self-contained
+  `*_fuzz-repro-<seed>.test` (already re-verified by the harness) next to an
+  `abort()`. Keep the file as a regression guard:
+  `SqlOracleFuzzer.ReplayCommittedRegressionFiles` replays every `.test` in
+  `TINYLAMB_ORACLE_REGRESSION_DIR` (expr/griffin traces replay through
+  `ReplayExprOracleTrace` / `ReplayGriffinTrace` in their `*_fuzzer_test`).
+  Logic bugs (wrong results), not just crashes, fail the run; run them long
+  after touching optimizer/executor/expression code.
 
 ## 4. Guidelines for Making Changes
 

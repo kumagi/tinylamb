@@ -223,8 +223,7 @@ void Row::DecodeMemcomparableFormat(std::string_view src) {
     Value v;
     // Self-delimiting memcomparable chunks: the callee consumes by offsets,
     // never as a C string.
-    size_t advanced = v.DecodeMemcomparableFormat(
-        src.data());  // NOLINT(bugprone-suspicious-stringview-data-usage)
+    size_t advanced = v.DecodeMemcomparableFormat(src);
     src.remove_prefix(advanced);
     values_.push_back(v);
   }

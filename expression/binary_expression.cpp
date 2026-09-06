@@ -689,28 +689,40 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       return s.find('-') != std::string_view::npos &&
              s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
     };
+    // The shape test admits strings that are not intervals ("P-100 model");
+    // a failing parse must fall back to ordinary comparison, not throw out
+    // of an equality on plain text (mirrors Value::operator==).
+    auto parse_iv = [](std::string_view s) -> std::optional<IntervalValue> {
+      try {
+        return IntervalValue::Parse(s);
+      } catch (const std::exception&) {
+        return std::nullopt;
+      }
+    };
     if (is_iv(left.value.varchar_value) && is_iv(right.value.varchar_value)) {
-      IntervalValue iv1 = IntervalValue::Parse(left.value.varchar_value);
-      IntervalValue iv2 = IntervalValue::Parse(right.value.varchar_value);
-      switch (op) {
-        case BinaryOperation::kAdd:
-          return Value((iv1 + iv2).ToString());
-        case BinaryOperation::kSubtract:
-          return Value((iv1 - iv2).ToString());
-        case BinaryOperation::kEquals:
-          return Value(iv1 == iv2);
-        case BinaryOperation::kNotEquals:
-          return Value(iv1 != iv2);
-        case BinaryOperation::kLessThan:
-          return Value(iv1 < iv2);
-        case BinaryOperation::kLessThanEquals:
-          return Value(iv1 <= iv2);
-        case BinaryOperation::kGreaterThan:
-          return Value(iv1 > iv2);
-        case BinaryOperation::kGreaterThanEquals:
-          return Value(iv1 >= iv2);
-        default:
-          break;
+      const auto iv1 = parse_iv(left.value.varchar_value);
+      const auto iv2 = parse_iv(right.value.varchar_value);
+      if (iv1 && iv2) {
+        switch (op) {
+          case BinaryOperation::kAdd:
+            return Value((*iv1 + *iv2).ToString());
+          case BinaryOperation::kSubtract:
+            return Value((*iv1 - *iv2).ToString());
+          case BinaryOperation::kEquals:
+            return Value(*iv1 == *iv2);
+          case BinaryOperation::kNotEquals:
+            return Value(*iv1 != *iv2);
+          case BinaryOperation::kLessThan:
+            return Value(*iv1 < *iv2);
+          case BinaryOperation::kLessThanEquals:
+            return Value(*iv1 <= *iv2);
+          case BinaryOperation::kGreaterThan:
+            return Value(*iv1 > *iv2);
+          case BinaryOperation::kGreaterThanEquals:
+            return Value(*iv1 >= *iv2);
+          default:
+            break;
+        }
       }
     }
   }

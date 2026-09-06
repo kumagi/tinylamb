@@ -32,11 +32,20 @@ struct IntervalValue {
     return total;
   }
 
+  // Field-wise comparison (months, then days, then time).  Deliberately NOT
+  // via TotalNanos(): that throws for perfectly representable intervals
+  // beyond ~3558 years and conflates calendar months with 30-day months.
   [[nodiscard]] bool operator==(const IntervalValue& o) const {
-    return TotalNanos() == o.TotalNanos();
+    return nanos == o.nanos && days == o.days && months == o.months;
   }
   [[nodiscard]] auto operator<=>(const IntervalValue& o) const {
-    return TotalNanos() <=> o.TotalNanos();
+    if (auto c = months <=> o.months; c != std::strong_ordering::equal) {
+      return c;
+    }
+    if (auto c = days <=> o.days; c != std::strong_ordering::equal) {
+      return c;
+    }
+    return nanos <=> o.nanos;
   }
 
   [[nodiscard]] IntervalValue operator+(const IntervalValue& o) const {

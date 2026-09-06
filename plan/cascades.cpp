@@ -182,7 +182,7 @@ bool RightSideJoinKeysAreUnique(const LogicalExpression& join,
     for (const LogicalExpression& expression : right_group.expressions) {
       for (size_t i = 0; i < expression.output_schema.ColumnCount(); ++i) {
         const Column& column = expression.output_schema.GetColumn(i);
-        if (column.Name().name == right_key->name &&
+        if (column.Name() == *right_key &&
             (column.GetConstraint().ctype == Constraint::kPrimaryKey ||
              column.GetConstraint().IsUnique())) {
           unique = true;
@@ -236,7 +236,9 @@ bool ConjunctionIsContradictory(const std::vector<Expression>& conjuncts) {
            unary.Op() == UnaryOperation::kIsNotNull) &&
           unary.Child()->Type() == TypeTag::kColumnValue) {
         ColPred p;
-        p.col_name = unary.Child()->AsColumnValue().GetColumnName().name;
+        // Qualified name: t1.id and t2.id are different columns.
+        p.col_name =
+            unary.Child()->AsColumnValue().GetColumnName().ToString();
         p.is_null_test = true;
         p.is_null_positive = (unary.Op() == UnaryOperation::kIsNull);
         preds.push_back(std::move(p));
@@ -244,7 +246,8 @@ bool ConjunctionIsContradictory(const std::vector<Expression>& conjuncts) {
                   unary.Op() == UnaryOperation::kIsFalse) &&
                  unary.Child()->Type() == TypeTag::kColumnValue) {
         ColPred p;
-        p.col_name = unary.Child()->AsColumnValue().GetColumnName().name;
+        p.col_name =
+            unary.Child()->AsColumnValue().GetColumnName().ToString();
         p.is_bool_test = true;
         p.is_true_assertion = (unary.Op() == UnaryOperation::kIsTrue);
         preds.push_back(std::move(p));
@@ -254,14 +257,14 @@ bool ConjunctionIsContradictory(const std::vector<Expression>& conjuncts) {
       if (bin.Left()->Type() == TypeTag::kColumnValue &&
           bin.Right()->Type() == TypeTag::kConstantValue) {
         ColPred p;
-        p.col_name = bin.Left()->AsColumnValue().GetColumnName().name;
+        p.col_name = bin.Left()->AsColumnValue().GetColumnName().ToString();
         p.op = bin.Op();
         p.val = bin.Right()->AsConstantValue().GetValue();
         preds.push_back(std::move(p));
       } else if (bin.Left()->Type() == TypeTag::kConstantValue &&
                  bin.Right()->Type() == TypeTag::kColumnValue) {
         ColPred p;
-        p.col_name = bin.Right()->AsColumnValue().GetColumnName().name;
+        p.col_name = bin.Right()->AsColumnValue().GetColumnName().ToString();
         p.val = bin.Left()->AsConstantValue().GetValue();
         switch (bin.Op()) {
           case BinaryOperation::kLessThan:
@@ -517,14 +520,17 @@ bool ContainsAggregate(const Expression& expression) {
 
 bool OutputMatchesColumn(const NamedExpression& output,
                          const ColumnName& column) {
-  if (!output.name.empty() &&
-      (output.name == column.name || output.name == column.ToString())) {
+  // Qualified-name matching only.  A bare-name fallback (output "a" vs
+  // predicate column t2.a) rewrites the predicate onto the FIRST output
+  // named "a" -- possibly a different relation's column -- and pushes the
+  // filter below the projection against the wrong data.
+  if (!output.name.empty() && output.name == column.ToString()) {
     return true;
   }
   if (output.expression && output.expression->Type() == TypeTag::kColumnValue) {
     const ColumnName& source =
         output.expression->AsColumnValue().GetColumnName();
-    return source == column || source.name == column.name;
+    return source == column;
   }
   return false;
 }
@@ -3009,10 +3015,12 @@ const RuleSet& RuleSet::Default() {
         },
         LogicalOperator::kProjection));
 
-    // limit_push_through_sort: Limit(Sort(X)) -> Sort(Limit(X)) when the
-    // limit is finite, offset-free, and the sort is stable. This allows early
-    // termination in the sort. OFFSET cannot be pushed below the sort
-    // (it must skip post-sort rows), so offset != 0 does not fire.
+    // limit_push_through_sort: Limit(Sort(X)) -> TopN(X).  LIMIT n OVER
+    // ORDER BY means "the n smallest"; a Limit pushed BELOW the sort would
+    // instead mean "sort an arbitrary n input rows" -- a cheaper but WRONG
+    // plan the cost model would prefer.  TopN is the sound fusion, so the
+    // rule now only ever produces that.  OFFSET cannot be pushed below the
+    // sort (it must skip post-sort rows), so offset != 0 does not fire.
     built.Add(Rule(
         "limit_push_through_sort", Limit(Sort(Any(), "sort")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
@@ -3023,26 +3031,19 @@ const RuleSet& RuleSet::Default() {
           const GroupId sort_group_id = bindings.at("sort");
           const Group& sort_group = memo.Get(sort_group_id);
           for (const LogicalExpression& sort : sort_group.expressions) {
-            if (sort.operation != LogicalOperator::kSort) {
+            if (sort.operation != LogicalOperator::kSort ||
+                sort.children.size() != 1) {
               continue;
             }
-            // Push the Limit below the Sort: Limit(X) becomes an alternative
-            // of the sort's own group, so the wrapping Sort keeps pointing
-            // at the sort group (AddExpression returns bool, not a GroupId).
-            memo.AddExpression(
-                sort_group_id,
-                LogicalExpression{.operation = LogicalOperator::kLimit,
-                                  .children = sort.children,
-                                  .limit_count = expression.limit_count,
-                                  .limit_offset = 0});
-            // Sort wraps the Limit.
             memo.AddExpression(
                 group,
-                LogicalExpression{.operation = LogicalOperator::kSort,
-                                  .children = {sort_group_id},
+                LogicalExpression{.operation = LogicalOperator::kTopN,
+                                  .children = sort.children,
                                   .target_list = sort.target_list,
                                   .sort_ascending = sort.sort_ascending,
                                   .sort_nulls_first = sort.sort_nulls_first,
+                                  .limit_count = expression.limit_count,
+                                  .limit_offset = 0,
                                   .output_schema = sort.output_schema});
             return;
           }
@@ -5122,40 +5123,32 @@ const RuleSet& RuleSet::Default() {
           }
           const Group& input_group = memo.Get(input_id);
 
-          bool is_unique_input = false;
-          std::unordered_set<std::string> unique_col_names;
+          // Uniqueness must be PROVEN by a UNIQUE/PRIMARY KEY constraint on
+          // the exact qualified grouping column.  A bare-name match merges
+          // t1.id with t2.id, and the old "column happens to be named id/pk"
+          // heuristic fabricated uniqueness for nullable columns, dropping
+          // duplicate elimination entirely (DISTINCT over a join became a
+          // bare Projection).
+          std::unordered_set<std::string> unique_cols;
           for (const auto& child_expr : input_group.expressions) {
             if (child_expr.output_schema.ColumnCount() > 0) {
               for (size_t i = 0; i < child_expr.output_schema.ColumnCount();
                    ++i) {
                 const auto& col = child_expr.output_schema.GetColumn(i);
-                if (col.GetConstraint().IsUnique()) {
-                  unique_col_names.insert(col.Name().name);
-                  unique_col_names.insert(col.Name().ToString());
+                if (col.GetConstraint().IsUnique() ||
+                    col.GetConstraint().ctype == Constraint::kPrimaryKey) {
+                  unique_cols.insert(col.Name().ToString());
                 }
               }
             }
           }
+          bool is_unique_input = !expression.grouping_sets.empty();
           for (const auto& g : expression.grouping_sets) {
-            if (g && g->Type() == TypeTag::kColumnValue) {
-              const ColumnName& cname = g->AsColumnValue().GetColumnName();
-              if (unique_col_names.contains(cname.name) ||
-                  unique_col_names.contains(cname.ToString()) ||
-                  cname.name == "id" || cname.name == "pk") {
-                is_unique_input = true;
-                break;
-              }
-            }
-          }
-          if (!is_unique_input && unique_col_names.empty()) {
-            for (const auto& g : expression.grouping_sets) {
-              if (g && g->Type() == TypeTag::kColumnValue) {
-                const ColumnName& cname = g->AsColumnValue().GetColumnName();
-                if (cname.name == "id" || cname.name == "pk") {
-                  is_unique_input = true;
-                  break;
-                }
-              }
+            if (!g || g->Type() != TypeTag::kColumnValue ||
+                !unique_cols.contains(
+                    g->AsColumnValue().GetColumnName().ToString())) {
+              is_unique_input = false;
+              break;
             }
           }
           if (!is_unique_input) {
@@ -5588,7 +5581,8 @@ const RuleSet& RuleSet::Default() {
                 // nullable, so neither is a sound proof.
                 if (col.GetConstraint().ctype == Constraint::kNotNull ||
                     col.GetConstraint().ctype == Constraint::kPrimaryKey) {
-                  not_null_cols.insert(col.Name().name);
+                  // Qualified name only: t2.x must not be proven NOT NULL by
+                  // another relation's NOT NULL x.
                   not_null_cols.insert(col.Name().ToString());
                 }
               }
@@ -5605,8 +5599,7 @@ const RuleSet& RuleSet::Default() {
               if (child && child->Type() == TypeTag::kColumnValue) {
                 const ColumnName& col_name =
                     child->AsColumnValue().GetColumnName();
-                if (not_null_cols.contains(col_name.name) ||
-                    not_null_cols.contains(col_name.ToString())) {
+                if (not_null_cols.contains(col_name.ToString())) {
                   changed = true;
                   continue;
                 }
@@ -5687,28 +5680,43 @@ const RuleSet& RuleSet::Default() {
             }
           }
 
-          bool left_is_fk = false;
-          bool right_is_pk = false;
-          for (const auto& expr : left_group.expressions) {
-            for (size_t i = 0; i < expr.output_schema.ColumnCount(); ++i) {
-              const auto& col = expr.output_schema.GetColumn(i);
-              if (col.GetConstraint().ctype == Constraint::kNotNull ||
-                  col.GetConstraint().ctype == Constraint::kForeign) {
-                left_is_fk = true;
-                break;
-              }
-            }
-          }
-          for (const auto& expr : right_group.expressions) {
-            for (size_t i = 0; i < expr.output_schema.ColumnCount(); ++i) {
-              const auto& col = expr.output_schema.GetColumn(i);
-              if (col.GetConstraint().IsUnique() ||
-                  col.GetConstraint().ctype == Constraint::kPrimaryKey) {
-                right_is_pk = true;
-                break;
-              }
-            }
-          }
+          // The proof must be about the JOIN COLUMNS, not "any column of
+          // the relation happens to be NOT NULL / UNIQUE": an inner join on
+          // a non-unique key rewritten to a semi join silently collapses
+          // duplicate matches.
+          const ColumnName& fk_side =
+              std::ranges::find(left_group.relations,
+                                bin.Left()->AsColumnValue()
+                                    .GetColumnName()
+                                    .schema) != left_group.relations.end()
+                  ? bin.Left()->AsColumnValue().GetColumnName()
+                  : bin.Right()->AsColumnValue().GetColumnName();
+          const ColumnName& pk_side =
+              fk_side.schema == bin.Left()->AsColumnValue().GetColumnName().schema
+                  ? bin.Right()->AsColumnValue().GetColumnName()
+                  : bin.Left()->AsColumnValue().GetColumnName();
+          auto column_constraint = [](const Group& grp, const ColumnName& column) {
+                for (const auto& expr : grp.expressions) {
+                  for (size_t i = 0; i < expr.output_schema.ColumnCount();
+                       ++i) {
+                    const auto& col = expr.output_schema.GetColumn(i);
+                    if (col.Name() == column) {
+                      return col.GetConstraint();
+                    }
+                  }
+                }
+                return Constraint{};
+              };
+          const Constraint fk_constraint =
+              column_constraint(left_group, fk_side);
+          const Constraint pk_constraint =
+              column_constraint(right_group, pk_side);
+          const bool left_is_fk =
+              fk_constraint.ctype == Constraint::kNotNull ||
+              fk_constraint.ctype == Constraint::kForeign;
+          const bool right_is_pk =
+              pk_constraint.IsUnique() ||
+              pk_constraint.ctype == Constraint::kPrimaryKey;
 
           if (proj_rels.contains(left_rel) && !proj_rels.contains(right_rel) &&
               left_is_fk && right_is_pk && !right_group.filter) {

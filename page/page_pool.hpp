@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <array>
 #include <functional>
 #include <list>
 #include <memory>
@@ -186,14 +187,14 @@ class PagePool {
   // Per-stripe fast maps for the GetPage/Unpin hot path; see PoolShard.
   // Mutations are nested under pool_latch (lock order pool_latch -> shard),
   // while hits and unpins take only their single stripe mutex.
-  PoolShard shards_[kPoolShards];
+  std::array<PoolShard, kPoolShards> shards_{};
 
   // Per-page-id file I/O latches. Held across pread/pwrite so two threads
   // never interleave accesses to the SAME page image, while distinct page
   // ids keep streaming in parallel. Lock order: a miss takes an IO latch
   // first and pool_latch (shared, briefly) inside it to check flushing_;
   // no path acquires an IO latch while holding pool_latch.
-  IoLatch io_latches_[kPoolShards];
+  std::array<IoLatch, kPoolShards> io_latches_{};
 };
 
 }  // namespace tinylamb

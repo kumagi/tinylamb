@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <random>
+#include <stdexcept>
 #include <string>
 
 #include "common/random_string.hpp"
@@ -40,9 +41,50 @@ std::string RunSingleCellSql(const std::string& sql) {
   return row[0].IsNull() ? "NULL" : row[0].AsString();
 }
 
-// Oracle-found pins through the full SQL frontend + optimizer + executor:
-// lazy COALESCE skips a throwing branch, and LIKE treats '%' as a wildcard
-// even against literal '%' in the value.
+// Oracle-found regression pin: uniform_case_result used to collapse
+// `CASE WHEN CAST(NaN AS INT64) = 0 THEN NULL ELSE NULL END` to NULL,
+// erasing the throw the AST reference raises.  The recorded trace (from
+// expr_oracle_fuzzer_libfuzzer, seed 0x831a3df2) must now replay clean.
+TEST(ExprOracleFuzzer, ReplayPinnedUniformCaseThrowRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 9446931280153951730\n"
+      "-- sql: SELECT (CAST(((CASE WHEN ((CASE WHEN 0 THEN "
+      "(-9223372036854775807 - 1) WHEN 0 THEN -469341141271522 ELSE "
+      "(-9223372036854775807 - 1) END) IN ((CAST((CAST('NaN' AS FLOAT64) * "
+      "-1.0) AS INT64)))) THEN (CAST((-(CAST((--5) AS FLOAT64))) AS INT64)) "
+      "END) + (CAST(((CASE WHEN 1 THEN (-9223372036854775807 - 1) ELSE "
+      "ABS(3954908965629019) END) + (CAST(LEAST((CAST('NaN' AS FLOAT64) / "
+      "CAST(NULL AS FLOAT64)), (-1.9 * 0.0)) AS INT64))) AS FLOAT64))) AS "
+      "INT64));\n"
+      "-- sexpr: (cast-int (add (case ((in (case ((b false) "
+      "(i -9223372036854775808)) ((b false) (i -469341141271522)) "
+      "(i -9223372036854775808)) (cast-int (mul (f nan) (f -1)))) "
+      "(cast-int (neg (cast-float (neg (i -5)))))) (n int)) (cast-float "
+      "(add (case ((b true) (i -9223372036854775808)) (abs "
+      "(i 3954908965629019))) (cast-int (least (div (f nan) (n int)) "
+      "(mul (f -1.9) (f 0))))))))\n"
+      "-- reference: THROW(cannot cast NaN/Inf float to int)\n"
+      "-- actual: REWRITE-MISMATCH shrunk=CAST((CASE WHEN CASE WHEN 0 THEN "
+      "-9223372036854775808 WHEN 0 THEN -469341141271522 ELSE "
+      "-9223372036854775808 END IN (CAST((nan * -1) AS INT64)) THEN "
+      "CAST((-CAST((--5) AS FLOAT64)) AS INT64) END + CAST((CASE WHEN 1 THEN "
+      "-9223372036854775808 ELSE abs(3954908965629019) END + CAST(least((nan "
+      "/ NULL), (-1.9 * 0)) AS INT64)) AS FLOAT64)) AS INT64) | engine "
+      "skipped\n"
+      "-- engine_ran: false\n"
+      "-- failure: rewrite equivalence failed\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
+}
+
+// Oracle-found regression pins through the full SQL frontend + optimizer +
+// executor:
+//   - lazy COALESCE skips a throwing branch, and LIKE treats '%' as a
+//     wildcard even against literal '%' in the value.
+//   - the executor's MOD fast path must raise on INT64_MIN % -1 exactly like
+//     the AST reference (Value::operator%), not return the mathematical 0.
 TEST(ExprOracleFuzzer, EngineAgreesOnShortCircuitAndLike) {
   EXPECT_EQ(RunSingleCellSql("SELECT COALESCE(7, 1/0);"), "7");
   EXPECT_EQ(RunSingleCellSql("SELECT COALESCE(CAST(NULL AS INT64), 9);"), "9");
@@ -54,6 +96,184 @@ TEST(ExprOracleFuzzer, EngineAgreesOnShortCircuitAndLike) {
   EXPECT_EQ(RunSingleCellSql("SELECT 1 + 2 AS x;"), "3");
   EXPECT_EQ(RunSingleCellSql("SELECT -9223372036854775807 - 1 AS lo;"),
             "-9223372036854775808");
+  EXPECT_THROW(RunSingleCellSql("SELECT MOD(-9223372036854775807 - 1, -1);"),
+               std::runtime_error);
+  EXPECT_THROW(RunSingleCellSql("SELECT MOD(1, 0.0);"), std::runtime_error);
+}
+
+// Oracle-found regression pin (seed 0x1c7f3d8c): the executor's MOD fast
+// path folded INT64_MIN % -1 to 0, so a CASE predicated on it silently
+// returned NULL instead of raising the AST's overflow error.
+TEST(ExprOracleFuzzer, ReplayPinnedModuloOverflowRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 2051287015386227372\n"
+      "-- sql: SELECT (CASE WHEN (ABS(MOD((-9223372036854775807 - 1), -1)) "
+      "= (CASE WHEN 1 THEN (-1) ELSE -3 END)) THEN ((CAST(ABS((CASE WHEN 0 "
+      "THEN 2635108465532378 WHEN 0 THEN 9223372036854775807 ELSE "
+      "-3081505891392267 END)) AS FLOAT64)) - CAST(NULL AS FLOAT64)) END);\n"
+      "-- sexpr: (case ((eq (abs (mod (i -9223372036854775808) (i -1))) "
+      "(case ((b true) (neg (i 1))) (i -3))) (sub (cast-float (abs (case ((b "
+      "false) (i 2635108465532378)) ((b false) (i 9223372036854775807)) (i "
+      "-3081505891392267)))) (n int))) (n int))\n"
+      "-- reference: THROW(integer overflow on '%')\n"
+      "-- actual: NULL\n"
+      "-- engine_ran: true\n"
+      "-- failure: engine mismatch vs AST reference\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
+}
+
+// Oracle-found regression pin (seed 0x16b1e7e6): boolean_identity folded
+// `x OR TRUE` to TRUE even when the AST evaluates x first (left side) and x
+// raises (`CAST(NaN/Inf AS INT64)`), erasing the throw.
+TEST(ExprOracleFuzzer, ReplayPinnedOrTrueThrowRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 1635862084609884134\n"
+      "-- sql: SELECT (CASE WHEN (((CAST(NULLIF(-CAST('Infinity' AS "
+      "FLOAT64), -1.9) AS INT64)) != -CAST('Infinity' AS FLOAT64)) OR ((-4.7 "
+      "* 2.5) < 3708171684520782)) THEN -1.0 END);\n"
+      "-- sexpr: (case ((or (ne (cast-int (nullif (f -inf) (f -1.9))) (f "
+      "-inf)) (lt (mul (f -4.7) (f 2.5)) (i 3708171684520782))) (f -1)) (n "
+      "int))\n"
+      "-- reference: THROW(cannot cast NaN/Inf float to int)\n"
+      "-- actual: REWRITE-MISMATCH shrunk=CASE WHEN ((CAST(nullif(-inf, -1.9)"
+      " AS INT64) != -inf) OR ((-4.7 * 2.5) < 3708171684520782)) THEN -1 END "
+      "| engine=THROW(cannot cast NaN/Inf float to int)\n"
+      "-- engine_ran: true\n"
+      "-- failure: rewrite equivalence failed\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
+}
+
+// Oracle-found regression pin (seed 0x16b1e8b4): `x IN (NULL)` folded to
+// NULL even when evaluating x raises (`INT64_MIN / 0`), dropping the throw.
+TEST(ExprOracleFuzzer, ReplayPinnedInNullDivisionThrowRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 1638306152930111172\n"
+      "-- sql: SELECT (NOT (((-9223372036854775807 - 1) / 0.0) IN (CAST("
+      "NULL AS FLOAT64))));\n"
+      "-- sexpr: (not (in (div (i -9223372036854775808) (f 0)) (n float)))\n"
+      "-- reference: THROW(division by zero)\n"
+      "-- actual: REWRITE-MISMATCH shrunk=(NOT (-9223372036854775808 / 0) IN "
+      "(NULL)) | engine=THROW(division by zero)\n"
+      "-- engine_ran: true\n"
+      "-- failure: rewrite equivalence failed\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
+}
+
+// Oracle-found regression pin (seed 0x83e4e3d5): contradiction_from_null_eq
+// folded `CAST(Inf AS INT64) >= ... = 0` chains that end in `x = NULL` to the
+// UNKNOWN constant, dropping the CAST(Inf) that the AST evaluates (and
+// raises) first.
+TEST(ExprOracleFuzzer, ReplayPinnedNullEqCastThrowRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 9506000356231616757\n"
+      "-- sql: SELECT ((NOT CAST(NULL AS BOOL)) IN (NULLIF(((CAST(NULLIF("
+      "CAST('Infinity' AS FLOAT64), 0.0) AS INT64)) >= (0.9 + CAST(NULL AS "
+      "FLOAT64))), 0)));\n"
+      "-- sexpr: (in (not (n bool)) (nullif (ge (cast-int (nullif (f inf) (f "
+      "0))) (add (f 0.9) (n int))) (b false)))\n"
+      "-- reference: THROW(cannot cast NaN/Inf float to int)\n"
+      "-- actual: REWRITE-MISMATCH shrunk=(NOT NULL) IN (nullif((CAST(nullif("
+      "inf, 0) AS INT64) >= (0.9 + NULL)), 0)) | engine=THROW(cannot cast "
+      "NaN/Inf float to int)\n"
+      "-- engine_ran: true\n"
+      "-- failure: rewrite equivalence failed\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
+}
+
+// Oracle-found regression pin (seed 0x835596c1): the executor's MOD raised on
+// a zero divisor only for int/int; the double path silently returned fmod's
+// NaN, diverging from the AST reference (THROW division by zero).
+TEST(ExprOracleFuzzer, ReplayPinnedModuloDoubleZeroRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 9476934689035179491\n"
+      "-- sql: SELECT (CAST(MOD((CAST(COALESCE(1.0, (0 / 1896039082833363)) "
+      "AS INT64)), (CASE WHEN CAST(NULL AS BOOL) THEN ABS((CAST(((-922337203"
+      "6854775807 - 1) * (-9223372036854775807 - 1)) AS FLOAT64))) WHEN 0 "
+      "THEN NULLIF((-CAST('NaN' AS FLOAT64)), (CAST(MOD(-2962346319136238, "
+      "(-9223372036854775807 - 1)) AS FLOAT64))) ELSE 0.0 END)) AS FLOAT64));\n"
+      "-- sexpr: (cast-float (mod (cast-int (coalesce (f 1) (div (i 0) (i "
+      "1896039082833363)))) (case ((n bool) (abs (cast-float (mul (i -92233"
+      "72036854775808) (i -9223372036854775808))))) ((b false) (nullif (neg "
+      "(f nan)) (cast-float (mod (i -2962346319136238) (i -9223372036854775808)"
+      ")))) (f 0))))\n"
+      "-- reference: THROW(division by zero)\n"
+      "-- actual: nan\n"
+      "-- engine_ran: true\n"
+      "-- failure: engine mismatch vs AST reference\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
+}
+
+// Oracle-found regression pin (seed 0x16b15447): the executor's MOD computed
+// fmod for two FLOAT64 arguments, but GoogleSQL MOD is integer-only and the
+// AST reference raises "unsupported binary operation".
+TEST(ExprOracleFuzzer, ReplayPinnedModuloDoubleDoubleRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 1635809587224612903\n"
+      "-- sql: SELECT (CAST(((CAST((CAST(MOD((CASE WHEN CAST(NULL AS BOOL) "
+      "THEN 2.5 ELSE -1.5 END), (CASE WHEN 0 THEN 0.5 WHEN 1 THEN -1.5 END)) "
+      "AS FLOAT64)) AS INT64)) + (-(CAST(((CAST(COALESCE(-4.3, -4.8) AS "
+      "INT64)) * (1.0 - -1305957821310940)) AS INT64)))) AS FLOAT64));\n"
+      "-- sexpr: (cast-float (add (cast-int (cast-float (mod (case ((n bool) "
+      "(f 2.5)) (f -1.5)) (case ((b false) (f 0.5)) ((b true) (f -1.5)) (n "
+      "int))))) (neg (cast-int (mul (cast-int (coalesce (f -4.3) (f -4.8))) "
+      "(sub (f 1) (i -1305957821310940)))))))\n"
+      "-- reference: THROW(unsupported binary operation)\n"
+      "-- actual: 5223831285243764\n"
+      "-- engine_ran: true\n"
+      "-- failure: engine mismatch vs AST reference\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
+}
+
+// Oracle-found regression pin (seed 0x5888d3c0): reassociate_add/subtract
+// folded `(x + a) + b -> x + (a + b)` even with opposite-sign constants,
+// eliding the intermediate `(-1 + INT64_MIN)` overflow the AST raises.
+TEST(ExprOracleFuzzer, ReplayPinnedReassociateAddOverflowRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 6383078004781039520\n"
+      "-- sql: SELECT (CASE WHEN 0 THEN (CAST(MOD((-9223372036854775807 - "
+      "1), (CAST(ABS(1.0) AS INT64))) AS FLOAT64)) ELSE (CAST(LEAST((CAST("
+      "((CAST(((-9223372036854775807 - 1) / -CAST('Infinity' AS FLOAT64)) AS "
+      "INT64)) * (CASE WHEN 0 THEN -1.5 WHEN 1 THEN CAST(NULL AS FLOAT64) "
+      "ELSE CAST('NaN' AS FLOAT64) END)) AS INT64)), ((-1 + "
+      "(-9223372036854775807 - 1)) - (CAST((-3160301361151923 + -3.1) AS "
+      "INT64)))) AS FLOAT64)) END);\n"
+      "-- sexpr: (case ((b false) (cast-float (mod (i -9223372036854775808) "
+      "(cast-int (abs (f 1)))))) (cast-float (least (cast-int (mul (cast-int "
+      "(div (i -9223372036854775808) (f -inf))) (case ((b false) (f -1.5)) "
+      "((b true) (n float)) (f nan)))) (sub (add (i -1) (i "
+      "-9223372036854775808)) (cast-int (add (i -3160301361151923) (f "
+      "-3.1)))))))\n"
+      "-- reference: THROW(integer overflow on '+')\n"
+      "-- actual: REWRITE-MISMATCH shrunk=CASE WHEN 0 THEN CAST((-92233720368"
+      "54775808 % CAST(abs(1) AS INT64)) AS FLOAT64) ELSE CAST(least(CAST("
+      "(CAST((-9223372036854775808 / -inf) AS INT64) * CASE WHEN 0 THEN -1.5 "
+      "WHEN 1 THEN NULL ELSE nan END) AS INT64), ((-1 + -9223372036854775808) "
+      "- CAST((-3160301361151923 + -3.1) AS INT64))) AS FLOAT64) END | "
+      "engine=THROW(integer overflow on '+')\n"
+      "-- engine_ran: true\n"
+      "-- failure: rewrite equivalence failed\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
 }
 
 }  // namespace

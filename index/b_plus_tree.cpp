@@ -114,6 +114,12 @@ void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
     while (0 < root_page.RowCount()) {
       COERCE(root->Delete(txn, root_page.GetKey(0)));
     }
+    // The copied separators were the subtree's upper bounds; the absorbed
+    // foster child now sits ABOVE this subtree, so the new left branch must
+    // carry the foster key as its high fence (mirrors the leaf-grow path).
+    // Leaving it at +inf lets later split/foster copies propagate a false
+    // "last page" fence, ending ascending scans early.
+    COERCE(new_left->SetHighFence(txn, IndexKey(new_right.key)));
     root->SetLowestValue(txn, new_left->PageID());
     // A separator larger than BranchPage accepts (kTooBigData) would leave an
     // empty branch root that routes lookups to garbage page ids: surface the
@@ -485,8 +491,15 @@ bool BPlusTree::PositionBelow(PageRef& leaf, size_t& idx, Transaction& txn,
         leaf = std::move(child);
       }
     }
-    if (leaf->PageID() == departed || leaf->body.leaf_page.row_count_ == 0) {
+    if (leaf->PageID() == departed) {
+      // Already the leftmost leaf of the subtree: nothing below `end`.
       return false;
+    }
+    if (leaf->body.leaf_page.row_count_ == 0) {
+      // An emptied leaf on the retreat path is not conclusive: the deleter
+      // only refeeds its own foster chain, so keys below `end` can sit
+      // further left.  Keep retreating the way operator-- does.
+      continue;
     }
     lp = &leaf->body.leaf_page;
     const size_t candidate = lp->Find(end);

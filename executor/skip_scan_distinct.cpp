@@ -219,6 +219,11 @@ size_t SkipScanDistinct::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
+  // ExecutorBase::NextBatch contract: the destination is reset per batch.
+  // Without it, consumers that reuse an input chunk (Projection) append on
+  // top of the previous batch and re-emit every stale row once the DISTINCT
+  // result exceeds one batch.
+  destination->Reset();
   size_t count = 0;
   Row row;
   RowPosition rp;

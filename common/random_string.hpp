@@ -20,36 +20,56 @@
 #include <cstddef>
 #include <random>
 #include <string>
+#include <string_view>
 
 namespace tinylamb {
 
 // mt19937 is not thread safe, so every thread gets its own pair of engines.
 // `device_random` seeds from random_device; `seeded_random` uses a fixed seed
 // (see https://xkcd.com/221/) so tests and fuzzers can reproduce sequences.
-inline std::random_device seed_gen;  // Kept for existing callers seeding their
-                                     // own engines (e.g. row_page tests).
-inline thread_local std::mt19937 device_random((std::random_device())());
-inline thread_local std::mt19937 seeded_random(4);
+// Function-local statics keep initialization lazy and thread-safe (a
+// throwing constructor at static-init time would otherwise be uncatchable).
+inline std::random_device& SeedGen() {  // Kept for existing callers seeding
+                                        // their own engines (e.g. row_page
+                                        // tests).
+  // NOLINTNEXTLINE(cert-err58-cpp)
+  static std::random_device seed_gen;
+  return seed_gen;
+}
 
-inline void RandomStringInitialize() { seeded_random = std::mt19937(4); }
+inline std::mt19937& DeviceRandom() {
+  // NOLINTNEXTLINE(cert-err58-cpp)
+  static thread_local std::mt19937 device_random((std::random_device())());
+  return device_random;
+}
+
+inline std::mt19937& SeededRandom() {
+  // Deterministic by design (fixed seed); static storage init cannot throw
+  // for mt19937.
+  // NOLINTNEXTLINE(cert-err58-cpp,cert-msc32-c,cert-msc51-cpp)
+  static thread_local std::mt19937 seeded_random(4);
+  return seeded_random;
+}
+
+inline void RandomStringInitialize() { SeededRandom() = std::mt19937(4); }
 
 inline std::string RandomString(size_t len = 16, bool use_random = true) {
-  static const char alphanum[] =
+  static constexpr std::string_view alphanum =
       "0123456789"
       "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
       "abcdefghijklmnopqrstuvwxyz";
   // uniform_int_distribution avoids the modulo bias of `% 62`.
   static thread_local std::uniform_int_distribution<size_t> dist(
-      0, sizeof(alphanum) - 2);
+      0, alphanum.size() - 1);
   std::string ret;
   ret.reserve(len);
   if (use_random) {
     for (size_t i = 0; i < len; ++i) {
-      ret.push_back(alphanum[dist(device_random)]);
+      ret.push_back(alphanum[dist(DeviceRandom())]);
     }
   } else {
     for (size_t i = 0; i < len; ++i) {
-      ret.push_back(alphanum[dist(seeded_random)]);
+      ret.push_back(alphanum[dist(SeededRandom())]);
     }
   }
   return ret;

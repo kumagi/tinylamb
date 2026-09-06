@@ -617,20 +617,33 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
     if (c == '\'') {
       const size_t quote_pos = i;
       ++i;
-      std::string literal;
+      std::string raw_literal;
       while (i < sql.size()) {
+        if (sql[i] == '\\' && i + 1 < sql.size()) {
+          // Backslash escapes the next character inside a single-quoted
+          // string (the parser decodes \' and the splitter swallows the
+          // pair); consume both so a \' does not terminate this scan.
+          raw_literal.push_back(sql[i]);
+          raw_literal.push_back(sql[i + 1]);
+          i += 2;
+          continue;
+        }
         if (sql[i] == '\'') {
           if (i + 1 < sql.size() && sql[i + 1] == '\'') {
-            literal.push_back('\'');
+            raw_literal.push_back('\'');
             i += 2;
             continue;
           }
           ++i;
           break;
         }
-        literal.push_back(sql[i]);
+        raw_literal.push_back(sql[i]);
         ++i;
       }
+      // Decode through the visitor's single escape table so the extracted
+      // parameter equals the constant the first parse produced.
+      const std::string literal =
+          DecodeStringEscapes(raw_literal, false, false, '\'');
       // PRODUCTION FIX (Q3): a TIMESTAMP '...' literal is UTC-normalized by
       // the visitor on the first parse, but the template/plan caches replayed
       // the RAW string parameter on later runs, so the same SQL returned a
@@ -644,8 +657,20 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
              std::isspace(static_cast<unsigned char>(sql[kw_end - 1])) != 0) {
         --kw_end;
       }
-      if (9 <= kw_end &&
-          std::string_view(sql.data() + kw_end - 9, 9) == "TIMESTAMP" &&
+      // Case-insensitive: the visitor normalizes typed literals regardless
+      // of keyword case (`timestamp '...'` included).
+      bool is_timestamp_kw = 9 <= kw_end;
+      if (is_timestamp_kw) {
+        const std::string_view kw(sql.data() + kw_end - 9, 9);
+        for (size_t k = 0; k < 9; ++k) {
+          if (std::toupper(static_cast<unsigned char>(kw[k])) !=
+              "TIMESTAMP"[k]) {
+            is_timestamp_kw = false;
+            break;
+          }
+        }
+      }
+      if (is_timestamp_kw &&
           (kw_end == 9 ||
            !IsIdentChar(static_cast<unsigned char>(sql[kw_end - 10])))) {
         literal = NormalizeTimestampText(literal);

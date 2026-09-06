@@ -317,9 +317,13 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
         shard.map.emplace(page_id, &*installed);
       }
     } catch (...) {
-      // Roll back the half-installed node: the maps never saw it, so just
-      // destroy the list entry (which frees the loaded image). The caller's
-      // PageRef was never created, so no pin is outstanding.
+      // Roll back the half-installed node.  pool_.emplace may have landed
+      // before the shard insert threw; leaving its entry would hand a
+      // dangling list iterator to the next miss-path recheck (and block
+      // re-installation forever), so undo whichever maps saw it.  The
+      // exclusive pool latch is still held, so erase(page_id) can only
+      // remove the entry emplace just created.
+      pool_.erase(page_id);
       pool_lru_.erase(installed);
       throw;
     }

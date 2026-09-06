@@ -27,6 +27,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -529,6 +530,38 @@ std::string FormatDoubleShortest(double value) {
   throw std::runtime_error("undefined type");
 }
 
+namespace {
+// VARCHAR values shaped like the interval text encoding are interpreted as
+// intervals by ==/<</>>/std::hash so a stored interval survives a varchar
+// detour.  The shape test admits strings that are not intervals ("P-100
+// model" carries a single-hyphen pre-space token), so a failing parse falls
+// back to byte-exact treatment instead of throwing out of an equality or
+// hash -- a throw here aborts GROUP BY/DISTINCT/hash joins over ordinary
+// text columns.
+bool LooksLikeIntervalText(std::string_view s) {
+  // Interval text carries a single-hyphen month token ("2014-1 0 ..."); a
+  // leading token shaped like an ISO date ("2014-01-01 ...") is a timestamp
+  // string and must compare byte-exact instead.
+  const size_t sp = s.find(' ');
+  if (sp == std::string_view::npos) {
+    return false;
+  }
+  const size_t hy = s.find('-');
+  if (hy == std::string_view::npos || hy > sp) {
+    return false;
+  }
+  return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
+}
+
+std::optional<IntervalValue> ParseAsInterval(std::string_view s) {
+  try {
+    return IntervalValue::Parse(s);
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+}  // namespace
+
 bool Value::operator==(const Value& rhs) const {
   if (type != rhs.type) {
     return false;
@@ -545,22 +578,12 @@ bool Value::operator==(const Value& rhs) const {
       if (sv1 == sv2) {
         return true;
       }
-      auto is_iv = [](std::string_view s) {
-        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
-        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
-        // timestamp string and must compare byte-exact instead.
-        const size_t sp = s.find(' ');
-        if (sp == std::string_view::npos) {
-          return false;
+      if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
+        const auto iv1 = ParseAsInterval(sv1);
+        const auto iv2 = ParseAsInterval(sv2);
+        if (iv1 && iv2) {
+          return *iv1 == *iv2;
         }
-        const size_t hy = s.find('-');
-        if (hy == std::string_view::npos || hy > sp) {
-          return false;
-        }
-        return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
-      };
-      if (is_iv(sv1) && is_iv(sv2)) {
-        return IntervalValue::Parse(sv1) == IntervalValue::Parse(sv2);
       }
       return false;
     }
@@ -595,7 +618,11 @@ std::string EncodeMemcomparableFormatInteger(int64_t in) {
   return ret;
 }
 
-size_t DecodeMemcomparableFormatInteger(const char* src, int64_t* dst) {
+size_t DecodeMemcomparableFormatInteger(const char* src, const char* end,
+                                        int64_t* dst) {
+  if (static_cast<size_t>(end - src) < sizeof(uint64_t)) {
+    throw std::runtime_error("corrupt memcomparable integer: truncated");
+  }
   uint64_t loaded = 0;
   ::memcpy(&loaded, src, sizeof(loaded));
   // Undo the sign flip the encoder applied to the top bit of the big-endian
@@ -630,11 +657,15 @@ std::string EncodeMemcomparableFormatVarchar(std::string_view in) {
   }
 }
 
-size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
+size_t DecodeMemcomparableFormatVarchar(const char* src, const char* end,
+                                        std::string* dst) {
   dst->clear();
   const char* buffer = nullptr;
   const char* const initial_offset = src;
   for (size_t size = 0;;) {
+    if (static_cast<size_t>(end - src) < 9) {
+      throw std::runtime_error("corrupt memcomparable varchar: truncated");
+    }
     buffer = src;
     const size_t offset = dst->size();
     // The flag byte is unsigned; reading it as signed char would turn a
@@ -686,7 +717,11 @@ std::string EncodeMemcomparableFormatDouble(double in) {
   return ret;
 }
 
-size_t DecodeMemcomparableFormatDouble(const char* src, double* dst) {
+size_t DecodeMemcomparableFormatDouble(const char* src, const char* end,
+                                       double* dst) {
+  if (static_cast<size_t>(end - src) < sizeof(int64_t)) {
+    throw std::runtime_error("corrupt memcomparable double: truncated");
+  }
   int64_t loaded = 0;
   std::memcpy(&loaded, src, sizeof(int64_t));
   uint64_t code = be64toh(static_cast<uint64_t>(loaded));
@@ -737,43 +772,57 @@ std::string Value::EncodeMemcomparableFormat() const {
   throw std::runtime_error("undefined type");
 }
 
-size_t Value::DecodeMemcomparableFormat(const char* src) {
-  switch (static_cast<ValueType>(*src++)) {
+size_t Value::DecodeMemcomparableFormat(std::string_view src) {
+  const char* cursor = src.data();
+  const char* const end = src.data() + src.size();
+  if (cursor == end) {
+    throw std::runtime_error("corrupt memcomparable value: empty buffer");
+  }
+  switch (static_cast<ValueType>(*cursor++)) {
     case ValueType::kNull:
       throw std::runtime_error("Cannot decode unknown type.");
     case ValueType::kInt64:
       type = ValueType::kInt64;
-      return DecodeMemcomparableFormatInteger(src, &value.int_value) + 1;
+      return DecodeMemcomparableFormatInteger(cursor, end, &value.int_value) +
+             1;
     case ValueType::kDate:
       type = ValueType::kDate;
-      return DecodeMemcomparableFormatInteger(src, &value.int_value) + 1;
+      return DecodeMemcomparableFormatInteger(cursor, end, &value.int_value) +
+             1;
     case ValueType::kVarChar: {
       type = ValueType::kVarChar;
-      size_t len = DecodeMemcomparableFormatVarchar(src, &owned_data);
+      size_t len = DecodeMemcomparableFormatVarchar(cursor, end, &owned_data);
       value.varchar_value = owned_data;
       return len + 1;
     }
     case ValueType::kDouble:
       type = ValueType::kDouble;
-      return DecodeMemcomparableFormatDouble(src, &value.double_value) + 1;
+      return DecodeMemcomparableFormatDouble(cursor, end, &value.double_value) +
+             1;
     case ValueType::kArray: {
       type = ValueType::kArray;
-      const char* cursor = src;
+      const char* p = cursor;
       uint32_t be = 0;
-      std::memcpy(&be, cursor, sizeof(be));
-      cursor += sizeof(be);
+      if (static_cast<size_t>(end - p) < sizeof(be)) {
+        throw std::runtime_error("corrupt memcomparable array: truncated");
+      }
+      std::memcpy(&be, p, sizeof(be));
+      p += sizeof(be);
       const uint32_t count = be32toh(be);
-      const char* type_begin = cursor;
+      const char* type_begin = p;
       // Bounded scan: a corrupt image without a terminator must not walk off
       // the key buffer.  Real SQL type names are far shorter than this cap.
-      while (*cursor != '\0') {
-        if (static_cast<size_t>(cursor - type_begin) >= 64) {
+      while (p != end && *p != '\0') {
+        if (static_cast<size_t>(p - type_begin) >= 64) {
           throw std::runtime_error("corrupt memcomparable array type name");
         }
-        ++cursor;
+        ++p;
       }
-      std::string sql_type(type_begin, cursor);
-      ++cursor;
+      if (p == end) {
+        throw std::runtime_error("corrupt memcomparable array type name");
+      }
+      std::string sql_type(type_begin, p);
+      ++p;
       // The count comes from the encoded image; a corrupt key may carry an
       // absurd value, so reject reservations beyond any real page-sized
       // array instead of attempting a multi-gigabyte allocation.
@@ -784,18 +833,23 @@ size_t Value::DecodeMemcomparableFormat(const char* src) {
       std::vector<Value> elements;
       elements.reserve(count);
       for (uint32_t i = 0; i < count; ++i) {
-        if (*cursor++ == 0) {
+        if (p == end) {
+          throw std::runtime_error("corrupt memcomparable array: truncated");
+        }
+        if (*p++ == 0) {
           elements.emplace_back();
           continue;
         }
         Value element;
-        cursor += element.DecodeMemcomparableFormat(cursor);
+        std::string_view rest(p, static_cast<size_t>(end - p));
+        const size_t advanced = element.DecodeMemcomparableFormat(rest);
+        p += advanced;
         elements.push_back(std::move(element));
       }
       array_ = std::make_shared<ArrayPayload>();
       array_->element_sql_type = std::move(sql_type);
       array_->elements = std::move(elements);
-      return static_cast<size_t>(cursor - (src - 1));
+      return static_cast<size_t>(p - cursor) + 1;
     }
   }
   throw std::runtime_error("broken data");
@@ -814,22 +868,12 @@ bool Value::operator<(const Value& rhs) const {
     case ValueType::kVarChar: {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
-      auto is_iv = [](std::string_view s) {
-        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
-        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
-        // timestamp string and must compare byte-exact instead.
-        const size_t sp = s.find(' ');
-        if (sp == std::string_view::npos) {
-          return false;
+      if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
+        const auto iv1 = ParseAsInterval(sv1);
+        const auto iv2 = ParseAsInterval(sv2);
+        if (iv1 && iv2) {
+          return *iv1 < *iv2;
         }
-        const size_t hy = s.find('-');
-        if (hy == std::string_view::npos || hy > sp) {
-          return false;
-        }
-        return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
-      };
-      if (is_iv(sv1) && is_iv(sv2)) {
-        return IntervalValue::Parse(sv1) < IntervalValue::Parse(sv2);
       }
       return value.varchar_value < rhs.value.varchar_value;
     }
@@ -854,22 +898,12 @@ bool Value::operator>(const Value& rhs) const {
     case ValueType::kVarChar: {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
-      auto is_iv = [](std::string_view s) {
-        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
-        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
-        // timestamp string and must compare byte-exact instead.
-        const size_t sp = s.find(' ');
-        if (sp == std::string_view::npos) {
-          return false;
+      if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
+        const auto iv1 = ParseAsInterval(sv1);
+        const auto iv2 = ParseAsInterval(sv2);
+        if (iv1 && iv2) {
+          return *iv1 > *iv2;
         }
-        const size_t hy = s.find('-');
-        if (hy == std::string_view::npos || hy > sp) {
-          return false;
-        }
-        return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
-      };
-      if (is_iv(sv1) && is_iv(sv2)) {
-        return IntervalValue::Parse(sv1) > IntervalValue::Parse(sv2);
       }
       return value.varchar_value > rhs.value.varchar_value;
     }
@@ -1164,24 +1198,15 @@ uint64_t std::hash<tinylamb::Value>::operator()(
       return std::hash<int64_t>()(v.value.int_value);
     case tinylamb::ValueType::kVarChar: {
       std::string_view sv = v.value.varchar_value;
-      auto is_iv = [](std::string_view s) {
-        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
-        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
-        // timestamp string and must compare byte-exact instead.
-        const size_t sp = s.find(' ');
-        if (sp == std::string_view::npos) {
-          return false;
+      if (tinylamb::LooksLikeIntervalText(sv)) {
+        if (const auto iv = tinylamb::ParseAsInterval(sv)) {
+          // Field-wise, matching IntervalValue::== / <=> (TotalNanos()
+          // throws for valid intervals beyond ~3558 years).
+          const uint64_t h1 = std::hash<int64_t>()(iv->nanos);
+          const uint64_t h2 = std::hash<int64_t>()(iv->days);
+          const uint64_t h3 = std::hash<int64_t>()(iv->months);
+          return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL) ^ (h3 << 1);
         }
-        const size_t hy = s.find('-');
-        if (hy == std::string_view::npos || hy > sp) {
-          return false;
-        }
-        return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
-      };
-      if (is_iv(sv)) {
-        tinylamb::IntervalValue iv = tinylamb::IntervalValue::Parse(sv);
-        // TotalNanos() is overflow-checked and matches IntervalValue::==.
-        return std::hash<int64_t>()(iv.TotalNanos());
       }
       return std::hash<std::string_view>()(sv);
     }

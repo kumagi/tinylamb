@@ -207,6 +207,23 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
   TableStatistics new_stat(schema);
   // CreateIndex full-scans the table and reacquires this page latch.
   table_page.PageUnlock();
+  // A failure after the allocation must not leak the fresh table page or
+  // any already-built index tree: unwind them the way DropTable would.  No
+  // rows were inserted, so the row-page chain is the single initial page.
+  const auto unwind_allocation = [&](Status failure) -> Status {
+    for (size_t i = 0; i < new_table.IndexCount(); ++i) {
+      for (const page_id_t idx_pid :
+           BPlusTree::CollectPageIds(ctx.txn_, new_table.GetIndex(i).Root())) {
+        PageRef page = storage_.pm_.GetPage(idx_pid);
+        storage_.pm_.DestroyPage(ctx.txn_, &*page);
+        page.PageUnlock();
+      }
+    }
+    PageRef page = storage_.pm_.GetPage(new_table.first_pid_);
+    storage_.pm_.DestroyPage(ctx.txn_, &*page);
+    page.PageUnlock();
+    return failure;
+  };
 
   // Prepare index for primary-key and unique-key.
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
@@ -217,14 +234,27 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
       IndexSchema new_idx(idx_name_stream.str(), {i}, {});
       // A failed unique-index build (oversized key, conflicts) must fail the
       // CREATE TABLE instead of silently registering an unconstrained table.
-      RETURN_IF_FAIL(new_table.CreateIndex(ctx.txn_, new_idx));
+      const Status index_status = new_table.CreateIndex(ctx.txn_, new_idx);
+      if (index_status != Status::kSuccess) {
+        return unwind_allocation(index_status);
+      }
     }
   }
 
-  RETURN_IF_FAIL(
-      catalog_.Insert(ctx.txn_, schema.Name(), Serialize(new_table)));
-  RETURN_IF_FAIL(
-      WriteSplitStatistics(statistics_, ctx.txn_, schema.Name(), new_stat));
+  {
+    const Status insert_status =
+        catalog_.Insert(ctx.txn_, schema.Name(), Serialize(new_table));
+    if (insert_status != Status::kSuccess) {
+      return unwind_allocation(insert_status);
+    }
+  }
+  {
+    const Status stats_status =
+        WriteSplitStatistics(statistics_, ctx.txn_, schema.Name(), new_stat);
+    if (stats_status != Status::kSuccess) {
+      return unwind_allocation(stats_status);
+    }
+  }
   // Compiled plans may reference the previous catalog shape; drop them.
   BumpSchemaEpoch();
   return new_table;

@@ -47,6 +47,17 @@
 
 namespace tinylamb {
 
+namespace {
+// Backstop poll for write-intent waits.  The cross-shard wound broadcasts
+// (Wound-Wait and the deadlock detector) notify without the target shard's
+// mutex -- acquiring every shard mutex there would need a global shard-lock
+// order the code does not have -- so a waiter between its predicate check
+// and its block can miss one notification.  Bounding the wait turns that
+// from a permanent stall into a one-interval delay; a delivered notify
+// still wakes the waiter immediately.
+constexpr auto kWriteIntentPollInterval = std::chrono::milliseconds(10);
+}  // namespace
+
 TransactionManager::~TransactionManager() {
   gc_stop_.store(true, std::memory_order_release);
   {
@@ -61,6 +72,20 @@ TransactionManager::~TransactionManager() {
   deadlock_detector_cv_.notify_all();
   if (deadlock_detector_.joinable()) {
     deadlock_detector_.join();
+  }
+  // Registered transactions may outlive this manager (a stack Transaction
+  // held across a fixture reset, an aborted query unwound after database
+  // teardown begins).  Null their manager pointers so the destructor of
+  // each such Transaction is a no-op instead of dereferencing freed
+  // memory; every still-live Transaction unregisters itself, so this map
+  // only holds live objects here.
+  {
+    std::scoped_lock lk(transaction_table_lock);
+    for (auto& [id, txn] : active_transactions_) {
+      if (txn != nullptr) {
+        txn->transaction_manager_ = nullptr;
+      }
+    }
   }
 }
 
@@ -249,12 +274,18 @@ Status TransactionManager::PreCommit(Transaction& txn) {
       commit_end = logger_->BufferedLSN();
     } catch (...) {
       // A dead logger cannot take compensation logs, so full rollback is
-      // impossible.  Still leave no half-finished state behind: drop the
-      // registry slot so the transaction cannot remain active forever, and
-      // report it as aborted, never committed.  No version was published.
+      // impossible.  Still leave no half-finished state behind: release the
+      // write intents (AbortVersions only resets pending owners and wakes
+      // waiters -- it appends nothing), drop the registry slot so the
+      // transaction cannot remain active forever, and report it as aborted,
+      // never committed.  No version was published.  Skipping AbortVersions
+      // here left the intents installed with a dead owner: waiters policy-
+      // allowed to wait on an older holder block forever, and with the
+      // wait-for edges dropped above the detector can never wound anyone.
       RemoveWaitForEdgesOf(txn.ID());
-      ForgetTransaction(txn);
+      AbortVersions(txn);
       txn.SetStatus(TransactionStatus::kAborted);
+      ForgetTransaction(txn);
       throw;
     }
     CommitVersions(txn, commit_end);
@@ -502,7 +533,11 @@ bool TransactionManager::AcquireWriteIntent(
         return false;  // Only let the wait continue while the holder is older
                        // (already checked) or gone. Re-check on each wake.
       };
-      shard.write_intent_released.wait(lock, available);
+      // Bounded wait: see kWriteIntentPollInterval for why a plain,
+      // unbounded wait() could sleep through a cross-shard wound forever.
+      while (!available()) {
+        shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
+      }
       if (txn.IsWounded()) {
         return false;
       }
@@ -546,7 +581,11 @@ bool TransactionManager::AcquireWriteIntent(
         }
         return false;
       };
-      shard.write_intent_released.wait(lock, available);
+      // Bounded wait: see kWriteIntentPollInterval for why a plain,
+      // unbounded wait() could sleep through a cross-shard wound forever.
+      while (!available()) {
+        shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
+      }
       if (txn.IsWounded()) {
         return false;
       }
@@ -576,7 +615,11 @@ bool TransactionManager::AcquireWriteIntent(
         }
         return false;
       };
-      shard.write_intent_released.wait(lock, available);
+      // Bounded wait: see kWriteIntentPollInterval for why a plain,
+      // unbounded wait() could sleep through a cross-shard wound forever.
+      while (!available()) {
+        shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
+      }
       // Whether we got the lock or were wounded, our wait-for edge is moot.
       RemoveWaitForEdge(txn.ID());
       if (txn.IsWounded()) {
@@ -890,9 +933,8 @@ void TransactionManager::UnregisterActiveTransaction(Transaction* txn) {
 
 void TransactionManager::ReleaseActiveTransaction(Transaction* txn) {
   std::scoped_lock lk(transaction_table_lock);
-  // A manager that never began a transaction owns a never-bucketed map;
-  // hashing into it would divide by zero.  An empty map has nothing to
-  // release either way.
+  // Early-out covers transactions whose manager was detached by our
+  // destructor path as well as finished ones; there is nothing to release.
   if (active_transactions_.empty()) {
     return;
   }
@@ -962,100 +1004,103 @@ void TransactionManager::GarbageCollectVersions() {
   }
 }
 
-void TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                             slot_t slot) {
-  logger_->AddLog(
-      LogRecord::CompensatingInsertLogRecord(txn_id, pid, slot).Serialize());
+lsn_t TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
+                                              slot_t slot) {
+  const LogRecord lr = LogRecord::CompensatingInsertLogRecord(txn_id, pid, slot);
+  return AddLog(lr) + lr.Size();
 }
-void TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                             std::string_view key) {
-  logger_->AddLog(
-      LogRecord::CompensatingInsertLogRecord(txn_id, pid, key).Serialize());
+lsn_t TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
+                                              std::string_view key) {
+  const LogRecord lr =
+      LogRecord::CompensatingInsertLogRecord(txn_id, pid, key);
+  return AddLog(lr) + lr.Size();
 }
-void TransactionManager::CompensateInsertBranchLog(txn_id_t txn_id,
-                                                   page_id_t pid,
-                                                   std::string_view key) {
-  logger_->AddLog(LogRecord::CompensatingInsertBranchLogRecord(txn_id, pid, key)
-                      .Serialize());
-}
-
-void TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
-                                             slot_t slot,
-                                             std::string_view redo) {
-  logger_->AddLog(
-      LogRecord::CompensatingUpdateLogRecord(txn_id, pid, slot, redo)
-          .Serialize());
-}
-void TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
-                                             std::string_view key,
-                                             std::string_view redo) {
-  logger_->AddLog(
-      LogRecord::CompensatingUpdateLeafLogRecord(txn_id, pid, key, redo)
-          .Serialize());
-}
-void TransactionManager::CompensateUpdateBranchLog(txn_id_t txn_id,
-                                                   page_id_t pid,
-                                                   std::string_view key,
-                                                   page_id_t redo) {
-  logger_->AddLog(
-      LogRecord::CompensatingUpdateBranchLogRecord(txn_id, pid, key, redo)
-          .Serialize());
+lsn_t TransactionManager::CompensateInsertBranchLog(txn_id_t txn_id,
+                                                    page_id_t pid,
+                                                    std::string_view key) {
+  const LogRecord lr =
+      LogRecord::CompensatingInsertBranchLogRecord(txn_id, pid, key);
+  return AddLog(lr) + lr.Size();
 }
 
-void TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
-                                             slot_t slot,
-                                             std::string_view redo) {
-  logger_->AddLog(
-      LogRecord::CompensatingDeleteLogRecord(txn_id, pid, slot, redo)
-          .Serialize());
+lsn_t TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
+                                              slot_t slot,
+                                              std::string_view redo) {
+  const LogRecord lr =
+      LogRecord::CompensatingUpdateLogRecord(txn_id, pid, slot, redo);
+  return AddLog(lr) + lr.Size();
+}
+lsn_t TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
+                                              std::string_view key,
+                                              std::string_view redo) {
+  const LogRecord lr =
+      LogRecord::CompensatingUpdateLeafLogRecord(txn_id, pid, key, redo);
+  return AddLog(lr) + lr.Size();
+}
+lsn_t TransactionManager::CompensateUpdateBranchLog(txn_id_t txn_id,
+                                                    page_id_t pid,
+                                                    std::string_view key,
+                                                    page_id_t redo) {
+  const LogRecord lr =
+      LogRecord::CompensatingUpdateBranchLogRecord(txn_id, pid, key, redo);
+  return AddLog(lr) + lr.Size();
 }
 
-void TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
-                                             std::string_view key,
-                                             std::string_view redo) {
-  logger_->AddLog(
-      LogRecord::CompensatingDeleteLeafLogRecord(txn_id, pid, key, redo)
-          .Serialize());
+lsn_t TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
+                                              slot_t slot,
+                                              std::string_view redo) {
+  const LogRecord lr =
+      LogRecord::CompensatingDeleteLogRecord(txn_id, pid, slot, redo);
+  return AddLog(lr) + lr.Size();
 }
 
-void TransactionManager::CompensateDeleteBranchLog(txn_id_t txn_id,
-                                                   page_id_t pid,
-                                                   std::string_view key,
-                                                   page_id_t redo) {
-  logger_->AddLog(
-      LogRecord::CompensatingDeleteBranchLogRecord(txn_id, pid, key, redo)
-          .Serialize());
+lsn_t TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
+                                              std::string_view key,
+                                              std::string_view redo) {
+  const LogRecord lr =
+      LogRecord::CompensatingDeleteLeafLogRecord(txn_id, pid, key, redo);
+  return AddLog(lr) + lr.Size();
 }
 
-void TransactionManager::CompensateSetLowestValueLog(txn_id_t txn_id,
-                                                     page_id_t pid,
-                                                     page_id_t redo) {
-  logger_->AddLog(
-      LogRecord::CompensateSetLowestValueLogRecord(txn_id, pid, redo)
-          .Serialize());
+lsn_t TransactionManager::CompensateDeleteBranchLog(txn_id_t txn_id,
+                                                    page_id_t pid,
+                                                    std::string_view key,
+                                                    page_id_t redo) {
+  const LogRecord lr =
+      LogRecord::CompensatingDeleteBranchLogRecord(txn_id, pid, key, redo);
+  return AddLog(lr) + lr.Size();
 }
 
-void TransactionManager::CompensateSetLowFenceLog(txn_id_t txn_id,
-                                                  page_id_t pid,
-                                                  const IndexKey& redo) {
-  logger_->AddLog(
-      LogRecord::CompensateSetLowFenceLogRecord(0, txn_id, pid, redo)
-          .Serialize());
+lsn_t TransactionManager::CompensateSetLowestValueLog(txn_id_t txn_id,
+                                                      page_id_t pid,
+                                                      page_id_t redo) {
+  const LogRecord lr =
+      LogRecord::CompensateSetLowestValueLogRecord(txn_id, pid, redo);
+  return AddLog(lr) + lr.Size();
 }
 
-void TransactionManager::CompensateSetHighFenceLog(txn_id_t txn_id,
+lsn_t TransactionManager::CompensateSetLowFenceLog(txn_id_t txn_id,
                                                    page_id_t pid,
                                                    const IndexKey& redo) {
-  logger_->AddLog(
-      LogRecord::CompensateSetHighFenceLogRecord(0, txn_id, pid, redo)
-          .Serialize());
+  const LogRecord lr =
+      LogRecord::CompensateSetLowFenceLogRecord(0, txn_id, pid, redo);
+  return AddLog(lr) + lr.Size();
 }
 
-void TransactionManager::CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
-                                                const FosterPair& foster) {
-  logger_->AddLog(
-      LogRecord::CompensateSetFosterLogRecord(0, txn_id, pid, foster)
-          .Serialize());
+lsn_t TransactionManager::CompensateSetHighFenceLog(txn_id_t txn_id,
+                                                    page_id_t pid,
+                                                    const IndexKey& redo) {
+  const LogRecord lr =
+      LogRecord::CompensateSetHighFenceLogRecord(0, txn_id, pid, redo);
+  return AddLog(lr) + lr.Size();
+}
+
+lsn_t TransactionManager::CompensateSetFosterLog(txn_id_t txn_id,
+                                                 page_id_t pid,
+                                                 const FosterPair& foster) {
+  const LogRecord lr =
+      LogRecord::CompensateSetFosterLogRecord(0, txn_id, pid, foster);
+  return AddLog(lr) + lr.Size();
 }
 
 uint64_t TransactionManager::AddLog(const LogRecord& lr) {

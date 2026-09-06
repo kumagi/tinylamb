@@ -111,7 +111,7 @@ TEST(ValueTest, Array_RoundTripSerializationAndMemcomparable_PreservesArray) {
 
   const std::string encoded = array.EncodeMemcomparableFormat();
   Value decoded;
-  size_t decoded_size = decoded.DecodeMemcomparableFormat(encoded.data());
+  size_t decoded_size = decoded.DecodeMemcomparableFormat(encoded);
 
   ASSERT_TRUE(array.IsArray());
   EXPECT_EQ(array.ArrayElementSqlType(), "INT64");
@@ -238,7 +238,7 @@ TEST(ValueTest,
   for (const Value& v : edge) {
     const std::string encoded = v.EncodeMemcomparableFormat();
     Value decoded;
-    const size_t consumed = decoded.DecodeMemcomparableFormat(encoded.data());
+    const size_t consumed = decoded.DecodeMemcomparableFormat(encoded);
     EXPECT_EQ(consumed, encoded.size());
     EXPECT_EQ(decoded.type, ValueType::kDouble);
     EXPECT_EQ(decoded.value.double_value, v.value.double_value);
@@ -247,7 +247,7 @@ TEST(ValueTest,
   // NaN round-trips to some NaN.
   const Value nan(std::numeric_limits<double>::quiet_NaN());
   Value decoded_nan;
-  decoded_nan.DecodeMemcomparableFormat(nan.EncodeMemcomparableFormat().data());
+  decoded_nan.DecodeMemcomparableFormat(nan.EncodeMemcomparableFormat());
   EXPECT_TRUE(std::isnan(decoded_nan.value.double_value));
 }
 
@@ -351,9 +351,7 @@ namespace {
 void EncodeDecodeTest(const Value& v) {
   std::string encoded = v.EncodeMemcomparableFormat();
   Value another;
-  const char* src = encoded.c_str();
-
-  another.DecodeMemcomparableFormat(src);
+  another.DecodeMemcomparableFormat(encoded);
   ASSERT_EQ(v, another);
 }
 
@@ -406,7 +404,7 @@ TEST(ValueTest, MemcomparableFormat_VarcharEmptyAndCorruptFlag) {
   corrupt.append(8, 'x');
   corrupt.push_back(static_cast<char>(12));  // invalid flag
   Value decoded;
-  EXPECT_THROW(decoded.DecodeMemcomparableFormat(corrupt.c_str()),
+  EXPECT_THROW(decoded.DecodeMemcomparableFormat(corrupt),
                std::runtime_error);
 }
 
@@ -431,7 +429,7 @@ void MemcomparableFormatDecodeTest(const std::vector<std::string>& input) {
   decoded.reserve(values.size());
   for (const auto& value : values) {
     Value v;
-    v.DecodeMemcomparableFormat(value.c_str());
+    v.DecodeMemcomparableFormat(value);
     decoded.push_back(v);
   }
   for (size_t i = 0; i < decoded.size(); ++i) {
@@ -679,7 +677,7 @@ TEST(ValueTest, Date_MemcomparableEncoding_PreservesDateAndDays) {
 
   std::string encoded = date.EncodeMemcomparableFormat();
   Value decoded;
-  decoded.DecodeMemcomparableFormat(encoded.c_str());
+  decoded.DecodeMemcomparableFormat(encoded);
 
   ASSERT_EQ(date.type, ValueType::kDate);
   EXPECT_EQ(decoded, date);
@@ -1017,7 +1015,7 @@ TEST(ValueTest,
 
   std::string encoded = arr.EncodeMemcomparableFormat();
   Value decoded;
-  decoded.DecodeMemcomparableFormat(encoded.data());
+  decoded.DecodeMemcomparableFormat(encoded);
 
   EXPECT_EQ(decoded, arr);
 }

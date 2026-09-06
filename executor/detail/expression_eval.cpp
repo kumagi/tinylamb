@@ -7729,19 +7729,42 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (arguments[1].value.int_value == 0) {
         throw std::runtime_error("division by zero in MOD");
       }
-      // INT64_MIN % -1 traps on x86 (idiv #DE); the mathematical result is 0.
+      // The AST reference (Value::operator%) raises on INT64_MIN % -1; the
+      // fast path must mirror it, not quietly return the mathematical 0
+      // (fuzzer-found: engine NULL vs AST throw through CASE).
       if (arguments[0].value.int_value == std::numeric_limits<int64_t>::min() &&
           arguments[1].value.int_value == -1) {
-        return Value(int64_t{0});
+        throw std::runtime_error("integer overflow on '%'");
       }
       return Value(arguments[0].value.int_value % arguments[1].value.int_value);
     }
-    const double l = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    const double r = arguments[1].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[1].value.int_value)
-                         : arguments[1].value.double_value;
+    // GoogleSQL MOD is integer-only; the AST reference rejects two doubles
+    // ("unsupported binary operation") while an int/double mix promotes to a
+    // floating fmod (raising on a zero divisor). Mirror both exactly
+    // (fuzzer-found: engine fmod'd two doubles the AST rejects).
+    const bool left_double = arguments[0].type == ValueType::kDouble;
+    const bool right_double = arguments[1].type == ValueType::kDouble;
+    if (left_double && right_double) {
+      throw std::runtime_error("unsupported binary operation");
+    }
+    // Anything else (VARCHAR, DATE, ...) must raise, not fall through into
+    // an out-of-type read of the Value union: reinterpretting a
+    // std::string_view as an integer fmod'd into silent garbage.
+    if (!left_double && arguments[0].type != ValueType::kInt64) {
+      throw std::runtime_error("unsupported argument type for MOD");
+    }
+    if (!right_double && arguments[1].type != ValueType::kInt64) {
+      throw std::runtime_error("unsupported argument type for MOD");
+    }
+    const double l = left_double ? arguments[0].value.double_value
+                                 : static_cast<double>(
+                                       arguments[0].value.int_value);
+    const double r = right_double ? arguments[1].value.double_value
+                                  : static_cast<double>(
+                                        arguments[1].value.int_value);
+    if (r == 0.0) {
+      throw std::runtime_error("division by zero");
+    }
     return Value(std::fmod(l, r));
   }
   if (name == "pow" || name == "power") {
@@ -7750,6 +7773,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (arguments[0].IsNull() || arguments[1].IsNull()) {
       return {};
+    }
+    // Guard the int-or-double assumption: any other type would be read out
+    // of the Value union (a std::string_view reinterpreted as a double and
+    // pow'd into silent garbage) instead of raising.
+    for (const Value& argument : arguments) {
+      if (argument.type != ValueType::kInt64 &&
+          argument.type != ValueType::kDouble) {
+        throw std::runtime_error("unsupported argument type for " + name);
+      }
     }
     const double l = arguments[0].type == ValueType::kInt64
                          ? static_cast<double>(arguments[0].value.int_value)

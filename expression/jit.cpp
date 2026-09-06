@@ -39,7 +39,7 @@
 // valid by construction, but clang's analyzer cannot model the allocation and
 // reports a bogus out-of-bounds read inside LLVM headers. Suppress the check
 // for this LLVM-integration TU only.
-#if defined(__clang__)
+#ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wanalyzer-security.ArrayBound"
 #endif
@@ -572,6 +572,6 @@ double JitInt64Kernels::CompileMilliseconds() const {
 
 }  // namespace tinylamb
 
-#if defined(__clang__)
+#ifdef __clang__
 #pragma clang diagnostic pop
 #endif

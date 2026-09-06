@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -54,7 +55,19 @@ std::string ValueText(const Value& value) {
     case ValueType::kDouble:
       // PostgreSQL emits the shortest round-tripping representation (0.1,
       // not 0.10000000000000001); max_digits10 with the default float format
-      // always printed 17 digits.
+      // always printed 17 digits.  Non-finite values use PostgreSQL's wire
+      // spelling (NaN / Infinity / -Infinity): strict clients (JDBC's
+      // Double.parseDouble) reject the C++ ostream "nan"/"inf" forms.
+      if (std::isnan(value.value.double_value)) {
+        return "NaN";
+      }
+      if (value.value.double_value == std::numeric_limits<double>::infinity()) {
+        return "Infinity";
+      }
+      if (value.value.double_value ==
+          -std::numeric_limits<double>::infinity()) {
+        return "-Infinity";
+      }
       return FormatDoubleShortest(value.value.double_value);
     case ValueType::kArray:
       return value.AsString();
@@ -340,11 +353,15 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
         continue;
       }
     }
-    // Backslash escapes the next character inside a single-quoted string
+    // Backslash escapes the next character inside a quoted string
     // (the parser decodes \', \" and \\): swallowing the pair here keeps
     // `SELECT 'It\'s'; SELECT 2;` in two statements and prevents a `;`
-    // inside a string from splitting statements.
-    if (single_quote && current_char == '\\' && i + 1 < sql.size()) {
+    // inside a string from splitting statements.  GoogleSQL double quotes
+    // are STRINGS too, so `"` must escape there as well -- restricting this
+    // to single quotes left the splitter "inside" a string after `"a\""`
+    // and silently merged every following statement into one parse error.
+    if ((single_quote || double_quote || backtick_quote) &&
+        current_char == '\\' && i + 1 < sql.size()) {
       Append(current_char);
       ++i;
       Append(sql[i]);

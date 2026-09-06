@@ -71,6 +71,14 @@ class Logger final {
   // Throws std::runtime_error if the worker hit an unrecoverable write error.
   void WaitForDurable(lsn_t lsn);
 
+  // Resynchronize after recovery truncated the log file to `valid_end`
+  // (torn-tail --force path).  The constructor latched the three LSNs to the
+  // pre-truncation file size; without this reset every later AddLog reports
+  // an LSN past the real record position (O_APPEND writes land at the new
+  // EOF), desynchronizing page stamps and chain walks from the file.  Must be
+  // called before the database serves any traffic.
+  void TruncateTo(lsn_t valid_end);
+
   // Tell the kernel that the bytes [0, before) are no longer needed in page
   // cache. Called by the checkpoint manager after a successful checkpoint so
   // fdatasync no longer has to wait for those pages to be flushed on the next

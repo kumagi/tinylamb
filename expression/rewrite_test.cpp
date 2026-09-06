@@ -2,6 +2,7 @@
 #include "expression/rewrite.hpp"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -1056,28 +1057,72 @@ TEST(ExpressionRewriteTest, MixedReassociationOfConstants) {
     return FunctionCallExp("extract_year", {ColumnValueExp("event_date")});
   };
 
-  // (x - 5) + 3 -> x - 2 (negative constants are canonicalized).
-  Expression subtract_then_add = BinaryExpressionExp(
+  // INT64 add/sub is not associative around overflow, so the reassociation
+  // rules fire only when both addends applied to the inner operand share a
+  // sign (monotone overflow). Mixed signs like `(x - 5) + 3` are NOT folded:
+  // the intermediate `x - 5` underflows near INT64_MIN where `x - 2` does not.
+  //
+  // (x - 5) - 3 -> x - 8 (both subtracted: same sign).
+  Expression subtract_then_subtract = BinaryExpressionExp(
       BinaryExpressionExp(int64_inner(), BinaryOperation::kSubtract,
                           ConstantValueExp(Value(5))),
-      BinaryOperation::kAdd, ConstantValueExp(Value(3)));
-  Expression rewritten = rewrite(subtract_then_add);
+      BinaryOperation::kSubtract, ConstantValueExp(Value(3)));
+  Expression rewritten = rewrite(subtract_then_subtract);
   ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
   EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kSubtract);
   EXPECT_EQ(
       rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
-      Value(2));
+      Value(8));
 
-  // (x + 5) - 3 -> x + 2
-  Expression add_then_subtract = BinaryExpressionExp(
+  // (x + 5) + 3 -> x + 8 (both added: same sign).
+  Expression add_then_add = BinaryExpressionExp(
       BinaryExpressionExp(int64_inner(), BinaryOperation::kAdd,
                           ConstantValueExp(Value(5))),
-      BinaryOperation::kSubtract, ConstantValueExp(Value(3)));
-  rewritten = rewrite(add_then_subtract);
+      BinaryOperation::kAdd, ConstantValueExp(Value(3)));
+  rewritten = rewrite(add_then_add);
   ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAdd);
   EXPECT_EQ(
       rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
-      Value(2));
+      Value(8));
+}
+
+// Oracle-found: Kleene-3VL Boolean algebra (absorption, and the absorption
+// branch of the factor/pullup rules) is value-identical but DROPS a operand
+// the AST still evaluates (and which may raise). `(NULL AND raising) OR NULL`
+// must keep the raise, not collapse to NULL.
+TEST(ExpressionRewriteTest, AbsorptionPreservesRaisingOperand) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression raise = CastExpressionExp(ConstantValueExp(Value(-INFINITY)),
+                                       "INT64");  // raises when evaluated
+  Expression null_c = ConstantValueExp(Value());
+  // (NULL AND raising) OR NULL  -- x = NULL, y = raising.
+  Expression t = BinaryExpressionExp(
+      BinaryExpressionExp(null_c, BinaryOperation::kAnd, raise),
+      BinaryOperation::kOr, null_c);
+  Expression rewritten = rewrite(t);
+  // Must still contain the raising CAST (not collapsed to a NULL constant).
+  EXPECT_NE(rewritten->ToString().find("CAST"), std::string::npos)
+      << "absorption erased a raising operand: " << rewritten->ToString();
+}
+
+// Oracle-found: `(x IS NULL) IS NOT NULL -> TRUE` (and the IS NULL twin)
+// drops x, so it must not erase a raising x.
+TEST(ExpressionRewriteTest, NullCheckOfNullCheckPreservesRaise) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression raise = CastExpressionExp(ConstantValueExp(Value(-INFINITY)),
+                                       "INT64");  // raises when evaluated
+  Expression t = UnaryExpressionExp(
+      UnaryExpressionExp(raise, UnaryOperation::kIsNotNull),
+      UnaryOperation::kIsNotNull);
+  Expression rewritten = rewrite(t);
+  EXPECT_NE(rewritten->ToString().find("CAST"), std::string::npos)
+      << "null-check-of-null-check erased a raising operand: "
+      << rewritten->ToString();
 }
 
 TEST(ExpressionRewriteTest, ComplementaryAbsorptionDisabled) {
@@ -1189,28 +1234,40 @@ TEST(ExpressionRewriteTest, NumericWideningCast) {
 
   Expression x = ColumnValueExp("x");
 
-  // CAST(CAST(x AS INT32) AS INT64) -> CAST(x AS INT64)
+  // Redundant same-target nesting CAST(CAST(x AS INT64) AS INT64)
+  // -> CAST(x AS INT64): the dropped cast can neither throw nor lose bits.
+  Expression doubled =
+      CastExpressionExp(CastExpressionExp(x, "INT64"), "INT64");
+  Expression rewritten_doubled = rewriter.Rewrite(doubled);
+  ASSERT_EQ(rewritten_doubled->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(rewritten_doubled->AsCastExpression().TargetTypeName(), "INT64");
+  EXPECT_EQ(rewritten_doubled->AsCastExpression().Child()->Type(),
+            TypeTag::kColumnValue);
+
+  // Cross-domain nesting must NOT collapse: the inner cast is partial or
+  // lossy (oracle-found: CAST(CAST(-inf AS INT64) AS FLOAT64) threw in the
+  // AST but the folded CAST(-inf AS FLOAT64) silently returned -inf).
+  Expression nested_float_to_int =
+      CastExpressionExp(CastExpressionExp(x, "INT64"), "FLOAT64");
+  Expression rewritten_f2i = rewriter.Rewrite(nested_float_to_int);
+  ASSERT_EQ(rewritten_f2i->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(rewritten_f2i->AsCastExpression().Child()->Type(),
+            TypeTag::kCastExp);
+
   Expression nested_int =
       CastExpressionExp(CastExpressionExp(x, "INT32"), "INT64");
   Expression rewritten_int = rewriter.Rewrite(nested_int);
   ASSERT_EQ(rewritten_int->Type(), TypeTag::kCastExp);
-  EXPECT_EQ(rewritten_int->AsCastExpression().TargetTypeName(), "INT64");
   EXPECT_EQ(rewritten_int->AsCastExpression().Child()->Type(),
-            TypeTag::kColumnValue);
+            TypeTag::kCastExp);
 
-  // CAST(CAST(x AS UINT8) AS INT32) -> CAST(x AS INT32)
-  Expression nested_uint =
-      CastExpressionExp(CastExpressionExp(x, "UINT8"), "INT32");
-  Expression rewritten_uint = rewriter.Rewrite(nested_uint);
-  ASSERT_EQ(rewritten_uint->Type(), TypeTag::kCastExp);
-  EXPECT_EQ(rewritten_uint->AsCastExpression().TargetTypeName(), "INT32");
-
-  // CAST(CAST(x AS FLOAT) AS DOUBLE) -> CAST(x AS DOUBLE)
-  Expression nested_float =
-      CastExpressionExp(CastExpressionExp(x, "FLOAT"), "DOUBLE");
-  Expression rewritten_float = rewriter.Rewrite(nested_float);
-  ASSERT_EQ(rewritten_float->Type(), TypeTag::kCastExp);
-  EXPECT_EQ(rewritten_float->AsCastExpression().TargetTypeName(), "DOUBLE");
+  // SAFE_CAST semantics are not mergeable with a plain inner cast.
+  Expression safe_nested =
+      CastExpressionExp(CastExpressionExp(x, "INT64", true), "INT64", false);
+  Expression rewritten_safe = rewriter.Rewrite(safe_nested);
+  ASSERT_EQ(rewritten_safe->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(rewritten_safe->AsCastExpression().Child()->Type(),
+            TypeTag::kCastExp);
 
   // Narrowing cast CAST(CAST(x AS INT64) AS INT32) should NOT be collapsed
   Expression narrowing =
@@ -1272,6 +1329,24 @@ TEST(ExpressionRewriteTest, OrOfRangesToIn) {
   Expression rewritten_in_or = rewriter.Rewrite(in_or_eq);
   ASSERT_EQ(rewritten_in_or->Type(), TypeTag::kInExp);
   EXPECT_EQ(rewritten_in_or->AsInExpression().list_.size(), 3);
+
+  // Order/throw safety (oracle-found): `(CAST(NaN AS INT64) + 1 IN (...) OR
+  // 1)`. Grouping must keep the disjunct order so the raising left operand
+  // stays before the trailing TRUE; otherwise a reordering lets boolean
+  // identity short-circuit `1 OR x` and erase the AST's throw.
+  Expression raise = BinaryExpressionExp(
+      CastExpressionExp(ConstantValueExp(Value(std::nan(""))), "INT64"),
+      BinaryOperation::kAdd, ConstantValueExp(Value(int64_t{1})));
+  Expression in_or_true = BinaryExpressionExp(
+      InExpressionExp(raise, {ConstantValueExp(Value(int64_t{5})),
+                              ConstantValueExp(Value(int64_t{6}))}),
+      BinaryOperation::kOr, ConstantValueExp(Value(int64_t{1})));
+  Expression rewritten_order = rewriter.Rewrite(in_or_true);
+  ASSERT_EQ(rewritten_order->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten_order->AsBinaryExpression().Op(), BinaryOperation::kOr);
+  // Left stays the IN (raising), right stays the constant TRUE.
+  EXPECT_EQ(rewritten_order->AsBinaryExpression().Left()->Type(),
+            TypeTag::kInExp);
 }
 
 TEST(ExpressionRewriteTest, IntervalNormalize) {
@@ -1633,11 +1708,19 @@ TEST(ExpressionRewriteTest, DeterministicFunctionCse) {
   ASSERT_EQ(rewritten_coalesce->Type(), TypeTag::kFunctionCallExp);
   EXPECT_EQ(rewritten_coalesce->AsFunctionCallExpression().FuncName(), "upper");
 
-  // NULLIF(upper(x), upper(x)) -> NULL
+  // NULLIF(upper(x), upper(x)): value-NULL, but upper(x) is a function call
+  // the rewriter cannot prove infallible, so it is kept (folding would drop
+  // the evaluation; oracle-found: nullif(CAST(-inf AS INT64), ...) erased a
+  // throw). Only provably-total args may collapse to the NULL constant.
   Expression nullif_dup = FunctionCallExp("nullif", {upper_x, upper_x});
   Expression rewritten_nullif = rewriter.Rewrite(nullif_dup);
-  ASSERT_EQ(rewritten_nullif->Type(), TypeTag::kConstantValue);
-  EXPECT_TRUE(rewritten_nullif->AsConstantValue().GetValue().IsNull());
+  ASSERT_EQ(rewritten_nullif->Type(), TypeTag::kFunctionCallExp);
+  // With total (column) arguments the fold still fires.
+  Expression nullif_col =
+      FunctionCallExp("nullif", {x, ColumnValueExp("x")});
+  Expression rewritten_nullif_col = rewriter.Rewrite(nullif_col);
+  ASSERT_TRUE(rewritten_nullif_col->Type() == TypeTag::kConstantValue);
+  EXPECT_TRUE(rewritten_nullif_col->AsConstantValue().GetValue().IsNull());
 
   // CASE WHEN c THEN upper(x) ELSE upper(x) END -> upper(x)
   Expression case_dup =

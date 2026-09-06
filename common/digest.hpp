@@ -6,6 +6,7 @@
 // GoogleSQL hashing functions (MD5(), SHA1(), SHA256(), SHA512()).  Raw
 // digests are returned as byte strings; TO_HEX() performs the encoding.
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -14,7 +15,7 @@
 namespace tinylamb::digest {
 
 inline std::string ToHex(std::string_view raw) {
-  static const char kDigits[] = "0123456789abcdef";
+  static constexpr std::string_view kDigits = "0123456789abcdef";
   std::string out;
   out.reserve(raw.size() * 2);
   for (const char c : raw) {
@@ -81,7 +82,7 @@ class Md5 {
  private:
   static uint32_t Rotl(uint32_t v, int s) { return (v << s) | (v >> (32 - s)); }
   void Block(const char* p) {
-    static const uint32_t kK[64] = {
+    static constexpr std::array<uint32_t, 64> kK = {
         0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a,
         0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
         0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340,
@@ -93,12 +94,12 @@ class Md5 {
         0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92,
         0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
         0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391};
-    static const int kS[64] = {
+    static constexpr std::array<int, 64> kS = {
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
         5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
         4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
         6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
-    uint32_t m[16];
+    std::array<uint32_t, 16> m{};
     for (size_t i = 0; i < 16; ++i) {
       m[i] =
           static_cast<uint8_t>(p[i * 4]) |
@@ -200,7 +201,7 @@ class Sha1 {
  private:
   static uint32_t Rotl(uint32_t v, int s) { return (v << s) | (v >> (32 - s)); }
   void Block(const char* p) {
-    uint32_t w[80];
+    std::array<uint32_t, 80> w{};
     for (size_t i = 0; i < 16; ++i) {
       w[i] =
           (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4])) << 24) |
@@ -240,7 +241,7 @@ class Sha1 {
     h_[3] += d;
     h_[4] += e;
   }
-  uint32_t h_[5]{};
+  std::array<uint32_t, 5> h_{};
   size_t total_{0};
   std::string buffer_;
 };
@@ -309,7 +310,7 @@ class Sha256 {
  private:
   static uint32_t Rotr(uint32_t v, int s) { return (v >> s) | (v << (32 - s)); }
   void Block(const char* p) {
-    static const uint32_t kK[64] = {
+    static constexpr std::array<uint32_t, 64> kK = {
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
         0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
         0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
@@ -321,7 +322,7 @@ class Sha256 {
         0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
         0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
         0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-    uint32_t w[64];
+    std::array<uint32_t, 64> w{};
     for (size_t i = 0; i < 16; ++i) {
       w[i] =
           (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4])) << 24) |
@@ -363,7 +364,7 @@ class Sha256 {
     h_[6] += g;
     h_[7] += h;
   }
-  uint32_t h_[8]{};
+  std::array<uint32_t, 8> h_{};
   size_t total_{0};
   std::string buffer_;
 };
@@ -437,7 +438,7 @@ class Sha512 {
  private:
   static uint64_t Rotr(uint64_t v, int s) { return (v >> s) | (v << (64 - s)); }
   void Block(const char* p) {
-    static const uint64_t kK[80] = {
+    static constexpr std::array<uint64_t, 80> kK = {
         0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL,
         0xe9b5dba58189dbbcULL, 0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
         0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL, 0xd807aa98a3030242ULL,
@@ -465,7 +466,7 @@ class Sha512 {
         0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL,
         0x431d67c49c100d4cULL, 0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
         0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL};
-    uint64_t w[80];
+    std::array<uint64_t, 80> w{};
     for (size_t i = 0; i < 16; ++i) {
       w[i] = 0;
       for (size_t j = 0; j < 8; ++j) {
@@ -506,7 +507,7 @@ class Sha512 {
     h_[6] += g;
     h_[7] += h;
   }
-  uint64_t h_[8]{};
+  std::array<uint64_t, 8> h_{};
   size_t total_{0};
   std::string buffer_;
 };

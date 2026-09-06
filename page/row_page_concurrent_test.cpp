@@ -112,7 +112,7 @@ TEST_F(RowPageConcurrentTest, UpdateUpdate) {
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
 
-  thread_local std::mt19937 engine(seed_gen());
+  thread_local std::mt19937 engine(SeedGen());
   while (InsertRow(RandomString(engine() % 64))) {
   }
   size_t rows = GetRowCount();

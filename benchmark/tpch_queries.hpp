@@ -235,14 +235,18 @@ inline constexpr std::array<std::string_view, 22> kTpchBenchmarkQueries = {
 inline std::string TpchBenchmarkQueryText(size_t query_index,
                                           double scale_factor) {
   const std::string_view query = kTpchBenchmarkQueries.at(query_index);
-  if (query_index != 10) return std::string(query);
+  if (query_index != 10) {
+    return std::string(query);
+  }
 
   std::ostringstream fraction;
   fraction << std::setprecision(17) << (0.0001 / scale_factor);
   std::string sql(query);
   const std::string placeholder = "0.0001000000";
   const auto position = sql.find(placeholder);
-  if (position == std::string::npos) return sql;
+  if (position == std::string::npos) {
+    return sql;
+  }
   sql.replace(position, placeholder.size(), fraction.str());
   return sql;
 }

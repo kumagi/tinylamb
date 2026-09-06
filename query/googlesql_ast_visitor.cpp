@@ -618,45 +618,9 @@ std::shared_ptr<SelectStatement> SubstituteInSelect(
   return result;
 }
 
-std::string DecodeSingleComponent(std::string_view value_view) {
-  std::string value = std::string(value_view);
-  bool is_raw = false;
-  bool is_bytes = false;
-  if (!value.empty() && (value.front() == 'r' || value.front() == 'R')) {
-    is_raw = true;
-    value = value.substr(1);
-  }
-  if (!value.empty() && (value.front() == 'b' || value.front() == 'B')) {
-    is_bytes = true;
-    value = value.substr(1);
-  }
-  if (!is_raw && !value.empty() &&
-      (value.front() == 'r' || value.front() == 'R')) {
-    is_raw = true;
-    value = value.substr(1);
-  }
-
-  bool is_triple = false;
-  char quote = '\0';
-  if (value.size() >= 6 &&
-      ((value.starts_with(R"(""")") && value.ends_with(R"(""")")) ||
-       (value.starts_with("'''") && value.ends_with("'''")))) {
-    is_triple = true;
-    quote = value.front();
-    value = value.substr(3, value.size() - 6);
-  } else if (value.size() >= 2 &&
-             ((value.front() == '\'' && value.back() == '\'') ||
-              (value.front() == '"' && value.back() == '"'))) {
-    quote = value.front();
-    value = value.substr(1, value.size() - 2);
-  } else {
-    return value;
-  }
-
-  if (is_raw) {
-    return value;
-  }
-
+std::string DecodeStringEscapes(std::string_view value_view, bool is_bytes,
+                                bool is_triple, char quote) {
+  const std::string value(value_view);
   std::string decoded;
   decoded.reserve(value.size());
   for (size_t i = 0; i < value.size(); ++i) {
@@ -794,6 +758,48 @@ std::string DecodeSingleComponent(std::string_view value_view) {
     }
   }
   return decoded;
+}
+
+std::string DecodeSingleComponent(std::string_view value_view) {
+  std::string value = std::string(value_view);
+  bool is_raw = false;
+  bool is_bytes = false;
+  if (!value.empty() && (value.front() == 'r' || value.front() == 'R')) {
+    is_raw = true;
+    value = value.substr(1);
+  }
+  if (!value.empty() && (value.front() == 'b' || value.front() == 'B')) {
+    is_bytes = true;
+    value = value.substr(1);
+  }
+  if (!is_raw && !value.empty() &&
+      (value.front() == 'r' || value.front() == 'R')) {
+    is_raw = true;
+    value = value.substr(1);
+  }
+
+  bool is_triple = false;
+  char quote = '\0';
+  if (value.size() >= 6 &&
+      ((value.starts_with(R"(""")") && value.ends_with(R"(""")")) ||
+       (value.starts_with("'''") && value.ends_with("'''")))) {
+    is_triple = true;
+    quote = value.front();
+    value = value.substr(3, value.size() - 6);
+  } else if (value.size() >= 2 &&
+             ((value.front() == '\'' && value.back() == '\'') ||
+              (value.front() == '"' && value.back() == '"'))) {
+    quote = value.front();
+    value = value.substr(1, value.size() - 2);
+  } else {
+    return value;
+  }
+
+  if (is_raw) {
+    return value;
+  }
+
+  return DecodeStringEscapes(value, is_bytes, is_triple, quote);
 }
 
 std::string DecodeString(const GoogleSqlAstNode& node) {

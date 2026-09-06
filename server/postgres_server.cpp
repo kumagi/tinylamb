@@ -322,6 +322,11 @@ class PostgresServer::Impl {
     std::unique_ptr<TransactionContext> transaction;
     char transaction_status{'I'};
     bool read_query_in_flight{false};
+    // CREATE VIEW / CREATE FUNCTION register into thread-local frontend
+    // registries on the event-loop thread; a read query offloaded to a
+    // worker would not see those session objects. Once a session created
+    // one, every later query stays on the loop thread.
+    bool session_has_temp_objects{false};
     // When a read is offloaded to a worker, last_activity stops advancing
     // until the completion returns. Track the offload time separately so a
     // hung worker cannot pin the fd (and its buffers) past idle_timeout:
@@ -468,8 +473,18 @@ class PostgresServer::Impl {
                                        ? options_.max_message_bytes + 5
                                        : kMaxPreAuthInputBytes;
         if (client.input.size() > input_limit) {
-          Queue(client,
-                pgwire::ErrorResponse("message exceeds server limit", "54000"));
+          // Queue() throws std::runtime_error once the 64 MiB output cap is
+          // exceeded -- a pipelining client that never reads can fill the
+          // buffer to within a message of the limit.  This call sits in the
+          // recv loop, OUTSIDE the ProcessInput try below, so an escaping
+          // throw would reach Run() and std::terminate the whole server.
+          try {
+            Queue(client, pgwire::ErrorResponse(
+                              "message exceeds server limit", "54000"));
+          } catch (const std::exception&) {
+            // Output is already at the cap: skip the error response and
+            // tear the connection down anyway.
+          }
           client.close_after_write = true;
           break;
         }
@@ -711,7 +726,8 @@ class PostgresServer::Impl {
       Queue(client, pgwire::ReadyForQuery(client.transaction_status));
       return;
     }
-    if (client.transaction_status == 'I' && IsReadOnly(statements)) {
+    if (client.transaction_status == 'I' && IsReadOnly(statements) &&
+        !client.session_has_temp_objects) {
       ScheduleReadQuery(client, statements);
       return;
     }
@@ -726,6 +742,9 @@ class PostgresServer::Impl {
     }
     bool ok = true;
     for (const std::string& statement : statements) {
+      if (RegistersTempObject(statement)) {
+        client.session_has_temp_objects = true;
+      }
       if (!ExecuteStatement(client, statement, implicit)) {
         ok = false;
         break;
@@ -954,6 +973,43 @@ class PostgresServer::Impl {
     return std::ranges::all_of(statements, [](const std::string& statement) {
       return UppercaseCommand(statement) == "SELECT";
     });
+  }
+
+  // True for the statement spellings whose frontend visit mutates the
+  // thread-local TEMP-view/UDF registries (CREATE [OR REPLACE] VIEW,
+  // CREATE [OR REPLACE] FUNCTION, CREATE TABLE FUNCTION).
+  static bool RegistersTempObject(std::string_view sql) {
+    std::vector<std::string> words;
+    size_t pos = sql.find_first_not_of(" \t\r\n");
+    while (pos != std::string_view::npos && words.size() < 4) {
+      const size_t end = sql.find_first_of(" \t\r\n", pos);
+      std::string word(sql.substr(pos, end == std::string_view::npos
+                                          ? sql.size() - pos
+                                          : end - pos));
+      for (char& c : word) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      }
+      words.push_back(std::move(word));
+      pos = sql.find_first_not_of(" \t\r\n", end);
+    }
+    if (words.empty() || words[0] != "CREATE") {
+      return false;
+    }
+    size_t index = 1;
+    if (index < words.size() && words[index] == "OR") {
+      if (++index >= words.size() || words[index] != "REPLACE") {
+        return false;
+      }
+      ++index;
+    }
+    if (index >= words.size()) {
+      return false;
+    }
+    if (words[index] == "VIEW" || words[index] == "FUNCTION") {
+      return true;
+    }
+    return words[index] == "TABLE" && index + 1 < words.size() &&
+           words[index + 1] == "FUNCTION";
   }
 
   void ScheduleReadQuery(Client& client,

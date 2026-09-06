@@ -2146,11 +2146,11 @@ TEST_F(QueryTest, EighthScanNumericEdgeCases) {
   EXPECT_THROW(RunScalar(ctx, *db_, "SELECT ABS(-9223372036854775808);"),
                std::exception);
 
-  // A9: MOD(INT64_MIN, -1) returns 0 (was SIGFPE).
-  const auto mod_min =
-      RunScalar(ctx, *db_, "SELECT MOD(-9223372036854775808, -1);");
-  ASSERT_EQ(mod_min.size(), 1U);
-  EXPECT_EQ(mod_min[0][0], Value(int64_t{0}));
+  // A9: MOD(INT64_MIN, -1) raises like the AST reference (was a raw SIGFPE;
+  // the fast path briefly returned the mathematical 0, diverging from
+  // Value::operator% and the sibling ABS/DIV edges pinned below).
+  EXPECT_THROW(RunScalar(ctx, *db_, "SELECT MOD(-9223372036854775808, -1);"),
+               std::exception);
 
   // B14: GREATEST/LEAST promote mixed INT64/DOUBLE (was a type error).
   const auto greatest = RunScalar(ctx, *db_, "SELECT GREATEST(1, 2.5);");

@@ -113,6 +113,14 @@ void LSMTree::RestoreRuns() {
     if (name == "blob.db") {
       continue;
     }
+    if (name.ends_with(".pending")) {
+      // A flush/merge that died before its blob payloads were durable.  The
+      // bytes it references may be gone; drop it (the mem-tree side of the
+      // write was acknowledged only after Sync registered the run).
+      LOG(WARN) << "LSM restore: removing unfinished run " << name;
+      std::filesystem::remove(entry.path(), ec);
+      continue;
+    }
     bool is_merged = false;
     unsigned long long id = 0;
     unsigned long long blob_high_water = 0;
@@ -236,7 +244,15 @@ void Flusher(LSMTree* tree) {
     if (target == flushed_version) {
       continue;
     }
-    tree->Sync();
+    // A throw here (dead blob writer, ENOSPC) would escape the thread's
+    // top-level function and terminate the whole process; the destructor's
+    // final flush already treats the same failures as survivable.
+    try {
+      tree->Sync();
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "background flush failed: " << error.what();
+      continue;
+    }
     // Record only the version observed before Sync(): writes that raced the
     // flush stay pending above `target` and trigger the next round.
     flushed_version = target;
@@ -249,7 +265,11 @@ void Merger(LSMTree* tree) {
     if (tree->stop_.load()) {
       break;
     }
-    tree->MergeAll();
+    try {
+      tree->MergeAll();
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "background merge failed: " << error.what();
+    }
     LOG(TRACE) << "Merged";
   }
 }
@@ -364,8 +384,12 @@ void LSMTree::Sync() {
                                   std::to_string(blob_.Written()));
     generation = generation_.fetch_add(1);
   }
+  // Build under a .pending name: until the blob payloads this run references
+  // are durable, the file must not carry a parseable generation-highwater
+  // name (see the rename below), or a crash could resurrect it.
+  const std::filesystem::path pending_file = new_index_file.string() + ".pending";
   if (const Status s =
-          SortedRun::Construct(new_index_file, to_flush, blob_, generation);
+          SortedRun::Construct(pending_file, to_flush, blob_, generation);
       s != Status::kSuccess) {
     // Merge the frozen snapshot back into mem_tree_ so writes made while the
     // flush was failing stay newer than the failed snapshot on re-flush.
@@ -384,6 +408,27 @@ void LSMTree::Sync() {
   // FlushInternal, and without this barrier a crash leaves a durable run
   // pointing at torn blob bytes (quarantined on restore: acked writes lost).
   blob_.Sync();
+  // The name's blob high-water must describe bytes that are durable: the
+  // pre-append Written() would let a run whose blob bytes were lost pass the
+  // RestoreRuns quarantine check.  After blob_.Sync(), CommittedLSN covers
+  // every payload this run references.
+  {
+    const std::filesystem::path durable_name =
+        root_dir_ / (std::to_string(generation) + "-" +
+                     std::to_string(blob_.Written()));
+    std::error_code ec;
+    std::filesystem::rename(pending_file, durable_name, ec);
+    if (ec) {
+      LOG(ERROR) << "flushing mem tree failed to rename run: "
+                 << ec.message();
+      std::filesystem::remove(pending_file, ec);
+      std::scoped_lock lk(mem_tree_lock_);
+      mem_tree_.merge(frozen_mem_tree_);
+      frozen_mem_tree_.clear();
+      return;
+    }
+    new_index_file = durable_name;
+  }
   {
     // Register the new run BEFORE dropping the frozen tree: readers must
     // always find flushed keys in mem_tree_, frozen_mem_tree_ or index_.
@@ -422,9 +467,11 @@ void LSMTree::MergeAll() {
   const size_t merged_generation =
       std::max(older.Generation(), newer.Generation());
   const size_t file_generation = generation_.fetch_add(1);
+  // Built under .pending; renamed to the durable high-water name only after
+  // blob_.Sync() below (see LSMTree::Sync for the full rationale).
   std::filesystem::path path =
       root_dir_ / ("merged-" + std::to_string(file_generation) + "-" +
-                   std::to_string(blob_.Written()));
+                   std::to_string(blob_.Written()) + ".pending");
   std::vector<SortedRun::Entry> merged;
   if (view.Size() != 0) {
     std::string min_key;
@@ -445,12 +492,42 @@ void LSMTree::MergeAll() {
     }
   }
 
+  if (!merged.empty()) {
+    // The merged run references every input's blob bytes; make them durable
+    // and stamp the final name with the post-Sync high-water before the
+    // inputs are removed.
+    blob_.Sync();
+    const std::filesystem::path durable_name =
+        root_dir_ / ("merged-" + std::to_string(file_generation) + "-" +
+                     std::to_string(blob_.Written()));
+    std::error_code ec;
+    std::filesystem::rename(path, durable_name, ec);
+    if (ec) {
+      LOG(ERROR) << "merge failed to rename run: " << ec.message();
+      std::filesystem::remove(path, ec);
+      return;
+    }
+    path = durable_name;
+  }
   files_.pop_back();
   files_.pop_back();
   index_.pop_back();
   index_.pop_back();
-  std::filesystem::remove(older_file);
-  std::filesystem::remove(newer_file);
+  // The inputs were already un-registered above, so a throwing remove here
+  // would both terminate the merger thread and leak the files; degrade to a
+  // logged error instead (the merged run supersedes their key ranges, and
+  // RestoreRuns quarantines anything malformed on the next start).
+  std::error_code remove_ec;
+  std::filesystem::remove(older_file, remove_ec);
+  if (remove_ec) {
+    LOG(ERROR) << "merge failed to remove " << older_file << ": "
+               << remove_ec.message();
+  }
+  std::filesystem::remove(newer_file, remove_ec);
+  if (remove_ec) {
+    LOG(ERROR) << "merge failed to remove " << newer_file << ": "
+               << remove_ec.message();
+  }
   if (!merged.empty()) {
     index_.emplace_back(path);
     files_.push_back(std::move(path));

@@ -32,11 +32,14 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
       bool nulls_first = key.nulls_first.value_or(key.ascending);
       return nulls_first ? 1 : -1;
     }
-    if (lv < rv) {
-      return key.ascending ? -1 : 1;
-    }
-    if (rv < lv) {
-      return key.ascending ? 1 : -1;
+    // CompareForOrderBy canonicalizes NaN (equal to itself, above +inf)
+    // like SortExecutor/TopN.  Raw `lv < rv` / `rv < lv` makes NaN compare
+    // "equal" to every value while 5 < 7 -- not a strict weak ordering, so
+    // std::sort below is UB (unguarded partitioning can read out of
+    // bounds) and NaN rows land in inconsistent positions.
+    const int cmp = CompareForOrderBy(lv, rv);
+    if (cmp != 0) {
+      return key.ascending ? cmp : -cmp;
     }
   }
   return 0;

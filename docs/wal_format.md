@@ -40,9 +40,13 @@ See `LogType` in `recovery/log_record.hpp` for the full list.
   kDelete* twins) are the B+ tree structural counterparts.
 - **kSetLowFence / kSetHighFence / kSetFoster** — B+ tree navigation metadata
   updates; each has a kCompensate* twin for undo.
-- **kCommit** — transaction commit. Aborted transactions write no terminal
-  record: recovery treats a transaction whose newest LSN has no matching
-  kCommit as a loser and undoes it.
+- **kCommit** — transaction commit. Recovery treats a transaction whose
+  newest LSN has no matching kCommit as a loser and undoes it. A runtime
+  `TransactionManager::Abort` that completed its undo walk also writes a
+  kCommit-typed marker: every compensation on the chain is already durable
+  at that point, and the marker reclassifies the aborted transaction as
+  committed so the next recovery neither redoes nor re-undoes it (the page
+  ops are idempotent; the marker just keeps the loser set exact).
 - **kBeginCheckpoint / kEndCheckpoint** — fuzzy checkpoint bracket; recovery
   truncates or replays from the last completed checkpoint (see
   `docs/recovery_invariants.md`).

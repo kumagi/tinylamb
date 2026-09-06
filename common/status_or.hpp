@@ -83,8 +83,8 @@
     LOG(FATAL) << "Crashed: " << value##_const_tmp.GetStatus();      \
     abort();                                                         \
   }                                                                  \
-  const type& value =                                                \
-      value##_const_tmp.Value() /* NOLINT(bugprone-macro-parentheses) */
+  /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                    \
+  const type& value = value##_const_tmp.Value()
 
 namespace tinylamb {
 

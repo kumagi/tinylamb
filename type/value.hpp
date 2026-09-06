@@ -137,7 +137,9 @@ class Value {
                                              ValueType as_type);
 
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
-  size_t DecodeMemcomparableFormat(const char* src);
+  // Decodes one self-delimiting chunk from the (possibly NUL-containing)
+  // buffer and returns the number of bytes consumed.  Throws on truncation.
+  size_t DecodeMemcomparableFormat(std::string_view src);
 
   bool operator==(const Value& rhs) const;
   bool operator!=(const Value& rhs) const { return !operator==(rhs); }

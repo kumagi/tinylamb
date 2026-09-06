@@ -191,11 +191,25 @@ void ParallelAggregationExecutor::AccumulateValue(PartialState* state,
       ++state->counts[index];
       break;
     case AggregationType::kMin:
+      // A NaN poisons the whole group (serial ground truth, aggregation.cpp):
+      // `value < best` is false for NaN, so without the explicit adoption a
+      // NaN arriving after the first value was silently dropped and the
+      // result depended on arrival order.
+      if (value.type == ValueType::kDouble &&
+          std::isnan(value.value.double_value)) {
+        state->values[index] = value;
+        break;
+      }
       if (state->values[index].IsNull() || value < state->values[index]) {
         state->values[index] = value;
       }
       break;
     case AggregationType::kMax:
+      if (value.type == ValueType::kDouble &&
+          std::isnan(value.value.double_value)) {
+        state->values[index] = value;
+        break;
+      }
       if (state->values[index].IsNull() || state->values[index] < value) {
         state->values[index] = value;
       }
@@ -648,12 +662,13 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
     const auto& aggregate =
         aggregates_[index].expression->AsAggregateExpression();
     if (aggregate.Distinct()) {
+      // Replay each worker's deduped set through the destination's OWN
+      // distinct_values: a value present in several workers' sets must be
+      // counted once globally, and statistical aggregates need the pair
+      // semantics of AccumulateValue's dedup path (an empty trailing_values
+      // would throw "requires two arguments" for CORR/COVAR with DISTINCT).
       for (const Value& value : source.distinct_values[index]) {
-        if (IsStatisticalAggregate(aggregate.GetType())) {
-          AccumulateStatValue(destination, index, value, {});
-        } else {
-          AccumulateValue(destination, index, value, true);
-        }
+        AccumulateValue(destination, index, value, true);
       }
       continue;
     }

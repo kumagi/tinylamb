@@ -77,10 +77,16 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
     const Status status = IndexInsert(txn, indexes_.back(), *it, it.Position());
     if (status != Status::kSuccess) {
       // Drop the half-built index so later Insert/Delete stop touching it,
-      // and recycle the root page onto the free list.
+      // and recycle every page it allocated.  The partial build may have
+      // grown past the root via splits and foster chains; destroying only
+      // the root would leak those pages off the free list forever.
       indexes_.pop_back();
-      PageRef root = txn.GetPageManager()->GetPage(root_pid);
-      txn.GetPageManager()->DestroyPage(txn, root.get());
+      for (const page_id_t pid :
+           BPlusTree::CollectPageIds(txn, root_pid)) {
+        PageRef page = txn.GetPageManager()->GetPage(pid);
+        txn.GetPageManager()->DestroyPage(txn, page.get());
+        page.PageUnlock();
+      }
       return status;
     }
     ++it;
@@ -360,13 +366,24 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
     if (deleted < indexes_.size()) {
       // The physical row was rewritten in place: put back the deleted keys
-      // and roll the row image back to the pre-update one.
+      // and roll the row image back to the pre-update one.  Release the
+      // in-place page's exclusive latch BEFORE reinstating: the
+      // versioned-unique probe in IndexInsert re-pins this same row page
+      // shared when a retained entry lives there (see the insert loop
+      // below); recursive shared_mutex acquisition on one thread is UB.
+      page.PageUnlock();
       reinstate_old_keys(deleted, pos);
-      page.PageUnlock();  // PRODUCTION FIX: self-deadlock guard
       restore_physical_row();
       return failure;
     }
     size_t inserted = 0;
+    // Release the in-place page's exclusive latch BEFORE the insert loop:
+    // a versioned-unique IndexInsert probes Read(txn, value.pos), which
+    // re-pins the same row page shared when a retained entry lives there --
+    // recursive shared_mutex acquisition on one thread is UB/hang (the
+    // relocation path below unlocks for the same reason).  The latch is
+    // re-taken by restore_physical_row's GetPage on failure.
+    page.PageUnlock();
     for (; inserted < indexes_.size(); ++inserted) {
       failure = IndexInsert(txn, indexes_[inserted], row, new_pos,
                             &idx_cursors[inserted]);
@@ -379,7 +396,6 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       // reinstate every original key, and rewrite the original row image.
       undo_index_inserts(inserted);
       reinstate_old_keys(indexes_.size(), pos);
-      page.PageUnlock();  // PRODUCTION FIX: self-deadlock guard
       restore_physical_row();
       return failure;
     }
@@ -607,7 +623,14 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
             }
             return Status::kSuccess;
           }
-          if (Read(txn, value.pos).HasValue()) {
+          // A retained entry only blocks this insert if the row it points
+          // at STILL owns this key: an UPDATE that moved the row to a
+          // different key leaves the old entry behind for old snapshots,
+          // and the key here is free (mirrors the scan-side recheck in
+          // IndexScanIterator::ResolveRow).
+          StatusOr<Row> conflicting = Read(txn, value.pos);
+          if (conflicting.HasValue() &&
+              idx.GenerateKey(conflicting.Value()) == key) {
             return Status::kDuplicates;
           }
         }

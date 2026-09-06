@@ -152,6 +152,14 @@ void NestedLoopJoin::Materialize() {
 }
 
 bool NestedLoopJoin::Next(Row* dst, RowPosition* rp) {
+  // A latched materialization error must surface on EVERY entry, not just
+  // the first: setting materialized_ below (to keep drained inputs from
+  // being re-scanned) used to make the latch unreachable, so a mid-
+  // materialization throw (e.g. "Single join violation") left the already
+  // emitted output_ blocks being served as a complete result.
+  if (materialize_error_ != nullptr) {
+    std::rethrow_exception(materialize_error_);
+  }
   if (!materialized_) {
     try {
       Materialize();
