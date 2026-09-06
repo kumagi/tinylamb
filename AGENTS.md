@@ -62,10 +62,10 @@ plain `add_library` targets.
    (`query/sql_engine.hpp`) over `TransactionContext`. `EXPLAIN [ANALYZE]`
    is a `Prepare`-level string prefix for SELECT/WITH only — there is no
    `kExplain` statement type.
-8. **Legacy parser is archived**: `parser/*.hpp` + `legacy/parser/` serve
-   historical unit tests only and are off the SQL execution path (canonical
-   frontend is `query/` + external `execute_query --mode=parse` child
-   process). Do not build on it.
+8. **Legacy parser is retired**: the hand-written `parser/` + `legacy/`
+   frontend was deleted (2026-09; A2-3 "keep + archive" rescinded). The only
+   SQL frontend is `query/` + external `execute_query --mode=parse` child
+   process. History lives in git only.
 9. **Server speaks Simple Query only**: extended protocol messages
    (Parse/Bind/Describe/Execute) are rejected with an ErrorResponse; Sync and
    Flush are tolerated as no-ops. Text format,
