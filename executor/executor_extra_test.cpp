@@ -1,47 +1,41 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
+#include "common/join_kind.hpp"
 #include "executor/aggregation.hpp"
-#include "executor/as_of_join.hpp"
 #include "executor/batch_nested_loop_join.hpp"
-#include "executor/cardinality_probe.hpp"
-#include "executor/chunked_scan.hpp"
-#include "executor/constant_executor.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/exchange.hpp"
 #include "executor/grouping_sets.hpp"
-#include "executor/incremental_sort.hpp"
-#include "executor/interval_join.hpp"
-#include "executor/materialize.hpp"
-#include "executor/merge.hpp"
 #include "executor/minmax_index.hpp"
-#include "executor/nested_loop_join.hpp"
-#include "executor/numa_arena.hpp"
-#include "executor/operator_memory.hpp"
+#include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_hash_join.hpp"
-#include "executor/parallel_merge_join.hpp"
-#include "executor/partial_aggregate.hpp"
 #include "executor/partial_sort.hpp"
-#include "executor/pipeline_breaker.hpp"
-#include "executor/selection_vector.hpp"
-#include "executor/simd_comparison.hpp"
-#include "executor/skip_scan_distinct.hpp"
 #include "executor/sort.hpp"
 #include "executor/two_phase_distinct_agg.hpp"
 #include "executor/values.hpp"
-#include "executor/vectorized_expression.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
-#include "expression/column_value.hpp"
-#include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
+#include "expression/window_function_expression.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -436,6 +430,374 @@ TEST(BatchNestedLoopJoinTest, PredicateErrorPropagatesForAntiJoin) {
         }
       },
       std::runtime_error);
+}
+
+// ===== Statistical aggregates (CORR / COVAR_* / VAR_* / STDDEV_*) =====
+//
+// The goldens mirror the GoogleSQL compliance corpus (stat_aggregation.test):
+// 3-valued NULL semantics, NaN/inf propagation, one-pair → NULL for
+// CORR/COVAR_SAMP but a computed value for COVAR_POP, zero-over-zero → NaN.
+
+namespace {
+
+// Builds a two-argument statistical aggregate whose second argument rides as
+// a trailing argument, exactly like the SQL frontend does for CORR(y, x).
+Expression StatAggregate(AggregationType type, const std::string& first,
+                         const std::string& second) {
+  auto aggregate =
+      std::make_shared<AggregateExpression>(type, ColumnValueExp(first));
+  aggregate->SetTrailingArgs({ColumnValueExp(second)});
+  return {std::move(aggregate)};
+}
+
+std::vector<NamedExpression> MakeCovarianceAggregates() {
+  return {
+      NamedExpression("corr", StatAggregate(AggregationType::kCorr, "y", "x")),
+      NamedExpression("covar_samp",
+                      StatAggregate(AggregationType::kCovarSamp, "y", "x")),
+      NamedExpression("covar_pop",
+                      StatAggregate(AggregationType::kCovarPop, "y", "x"))};
+}
+
+// Runs one scalar aggregation over `rows` through both the serial executor
+// (ground-truth accumulator delegation) and the parallel executor; the two
+// paths must agree on every statistical aggregate.
+std::vector<Row> RunStatAggregation(
+    const Schema& schema, const std::vector<Row>& rows,
+    const std::vector<NamedExpression>& aggregates) {
+  std::vector<Row> results;
+  AggregationExecutor serial(std::make_shared<ValuesExecutor>(rows), schema,
+                             aggregates);
+  Row serial_result;
+  EXPECT_TRUE(serial.Next(&serial_result, nullptr));
+  EXPECT_FALSE(serial.Next(&serial_result, nullptr));
+  results.push_back(serial_result);
+
+  ParallelAggregationExecutor parallel(std::make_shared<ValuesExecutor>(rows),
+                                       schema, aggregates, 2);
+  Row parallel_result;
+  EXPECT_TRUE(parallel.Next(&parallel_result, nullptr));
+  results.push_back(parallel_result);
+  return results;
+}
+
+void ExpectStatValue(const Row& row, size_t index, double expected) {
+  ASSERT_FALSE(row[index].IsNull());
+  EXPECT_EQ(row[index].type, ValueType::kDouble);
+  EXPECT_EQ(row[index].value.double_value, expected);
+}
+
+void ExpectStatNull(const Row& row, size_t index) {
+  EXPECT_TRUE(row[index].IsNull()) << "column " << index;
+}
+
+void ExpectStatNaN(const Row& row, size_t index) {
+  ASSERT_FALSE(row[index].IsNull());
+  EXPECT_TRUE(std::isnan(row[index].value.double_value)) << "column " << index;
+}
+
+}  // namespace
+
+TEST(StatAggregateTest, CorrAndCovarNormalValues) {
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  const std::vector<Row> rows = {
+      Row({Value(1.0), Value(5.0)}), Row({Value(3.0), Value(9.0)}),
+      Row({Value(4.0), Value(7.0)}), Row({Value(5.0), Value(1.0)}),
+      Row({Value(7.0), Value(13.0)})};
+  // GoogleSQL goldens: CORR=0.4, COVAR_SAMP=4, COVAR_POP=3.2.
+  for (const Row& result :
+       RunStatAggregation(schema, rows, MakeCovarianceAggregates())) {
+    ExpectStatValue(result, 0, 0.4);
+    ExpectStatValue(result, 1, 4.0);
+    ExpectStatValue(result, 2, 3.2);
+  }
+}
+
+TEST(StatAggregateTest, CorrAndCovarOnePair) {
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  const std::vector<Row> rows = {Row({Value(1.0), Value(1.0)})};
+  // One pair: COVAR_SAMP and CORR are NULL, COVAR_POP is 0.
+  for (const Row& result :
+       RunStatAggregation(schema, rows, MakeCovarianceAggregates())) {
+    ExpectStatNull(result, 0);
+    ExpectStatNull(result, 1);
+    ExpectStatValue(result, 2, 0.0);
+  }
+}
+
+TEST(StatAggregateTest, CorrAndCovarEmptyInput) {
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  for (const Row& result :
+       RunStatAggregation(schema, {}, MakeCovarianceAggregates())) {
+    ExpectStatNull(result, 0);
+    ExpectStatNull(result, 1);
+    ExpectStatNull(result, 2);
+  }
+}
+
+TEST(StatAggregateTest, CorrAndCovarSkipNullPairs) {
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  const Value null_value;
+  const std::vector<Row> rows = {
+      Row({Value(1.0), Value(1.0)}),    Row({Value(2.0), Value(2.0)}),
+      Row({Value(3.0), Value(3.0)}),    Row({Value(4.0), Value(4.0)}),
+      Row({Value(5.0), Value(5.0)}),    Row({null_value, Value(1000.0)}),
+      Row({Value(2000.0), null_value}), Row({null_value, null_value})};
+  // Only the five complete pairs count: COVAR_SAMP=2.5, COVAR_POP=2, CORR=1.
+  for (const Row& result :
+       RunStatAggregation(schema, rows, MakeCovarianceAggregates())) {
+    ExpectStatValue(result, 0, 1.0);
+    ExpectStatValue(result, 1, 2.5);
+    ExpectStatValue(result, 2, 2.0);
+  }
+}
+
+TEST(StatAggregateTest, CorrAndCovarPropagateInfAndNaN) {
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  const double inf = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  // A non-finite value in any complete pair makes every two-input form NaN.
+  const std::vector<std::pair<double, double>> non_finite = {
+      {inf, 4.0}, {3.0, inf}, {-inf, 4.0}, {3.0, -inf},
+      {nan, 4.0}, {3.0, nan}, {inf, inf},  {-inf, -inf}};
+  for (const auto& [y, x] : non_finite) {
+    for (const Row& result : RunStatAggregation(
+             schema, {Row({Value(1.0), Value(2.0)}), Row({Value(y), Value(x)})},
+             MakeCovarianceAggregates())) {
+      ExpectStatNaN(result, 0);
+      ExpectStatNaN(result, 1);
+      ExpectStatNaN(result, 2);
+    }
+  }
+}
+
+TEST(StatAggregateTest, CorrAndCovarTooFewArgsAreNullEvenNonFinite) {
+  // The compliance corpus pins "one pair containing inf/nan" to NULL for the
+  // sample forms (zero degrees of freedom), while COVAR_POP still evaluates
+  // its single pair and surfaces inf - inf as NaN.
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  const double inf = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const std::vector<std::pair<double, double>> single_pair = {
+      {1.0, inf}, {1.0, -inf}, {1.0, nan}, {inf, 1.0}, {nan, 1.0}};
+  for (const auto& [y, x] : single_pair) {
+    for (const Row& result : RunStatAggregation(
+             schema, {Row({Value(y), Value(x)})}, MakeCovarianceAggregates())) {
+      ExpectStatNull(result, 0);
+      ExpectStatNull(result, 1);
+      ExpectStatNaN(result, 2);
+    }
+  }
+}
+
+TEST(StatAggregateTest, CorrAndCovarExtremeNegativeSlope) {
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  const double inf = std::numeric_limits<double>::infinity();
+  // COVAR overflows to -inf while CORR stays exactly -1.
+  const std::vector<Row> covar_rows = {Row({Value(1.0), Value(1.0)}),
+                                       Row({Value(2.2e304), Value(-2.2e304)})};
+  for (const Row& result : RunStatAggregation(
+           schema, covar_rows,
+           {NamedExpression(
+                "covar_samp",
+                StatAggregate(AggregationType::kCovarSamp, "y", "x")),
+            NamedExpression(
+                "covar_pop",
+                StatAggregate(AggregationType::kCovarPop, "y", "x"))})) {
+    ASSERT_FALSE(result[0].IsNull());
+    EXPECT_EQ(result[0].value.double_value, -inf);
+    ASSERT_FALSE(result[1].IsNull());
+    EXPECT_EQ(result[1].value.double_value, -inf);
+  }
+  const std::vector<Row> corr_rows = {Row({Value(1.0), Value(-1.0)}),
+                                      Row({Value(2.2e154), Value(-2.2e154)})};
+  for (const Row& result : RunStatAggregation(
+           schema, corr_rows,
+           {NamedExpression(
+               "corr", StatAggregate(AggregationType::kCorr, "y", "x"))})) {
+    ExpectStatValue(result, 0, -1.0);
+  }
+}
+
+TEST(StatAggregateTest, CorrZeroOverZeroIsNaN) {
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  // Constant on both sides: 0/0 must surface as NaN, not NULL and not an
+  // error.
+  const std::vector<Row> rows = {Row({Value(1.0), Value(2.0)}),
+                                 Row({Value(1.0), Value(2.0)})};
+  for (const Row& result : RunStatAggregation(
+           schema, rows,
+           {NamedExpression(
+               "corr", StatAggregate(AggregationType::kCorr, "y", "x"))})) {
+    ExpectStatNaN(result, 0);
+  }
+}
+
+TEST(StatAggregateTest, VarianceAndStddevAcrossPaths) {
+  const Schema schema("t", {Column("x", ValueType::kDouble)});
+  auto variance_aggregates = [] {
+    return std::vector<NamedExpression>{
+        NamedExpression("var_samp",
+                        AggregateExpressionExp(AggregationType::kVarSamp,
+                                               ColumnValueExp("x"))),
+        NamedExpression("var_pop",
+                        AggregateExpressionExp(AggregationType::kVarPop,
+                                               ColumnValueExp("x"))),
+        NamedExpression("stddev_samp",
+                        AggregateExpressionExp(AggregationType::kStddevSamp,
+                                               ColumnValueExp("x"))),
+        NamedExpression("stddev_pop",
+                        AggregateExpressionExp(AggregationType::kStddevPop,
+                                               ColumnValueExp("x")))};
+  };
+  // VAR_SAMP([50,60,70])=100, VAR_POP=66.66.., STDDEV_SAMP=10, STDDEV_POP
+  // = 8.16..; goldens from stat_aggregation.test (var_samp_same_distance...).
+  const std::vector<Row> nice = {Row({Value(50.0)}), Row({Value(60.0)}),
+                                 Row({Value(70.0)})};
+  for (const Row& result :
+       RunStatAggregation(schema, nice, variance_aggregates())) {
+    ExpectStatValue(result, 0, 100.0);
+    ExpectStatValue(result, 1, 200.0 / 3.0);
+    ExpectStatValue(result, 2, 10.0);
+    ExpectStatValue(result, 3, 10.0 * std::sqrt(2.0 / 3.0));
+  }
+  // Same values: zero variance everywhere.
+  const std::vector<Row> same = {Row({Value(1.0)}), Row({Value(1.0)})};
+  for (const Row& result :
+       RunStatAggregation(schema, same, variance_aggregates())) {
+    ExpectStatValue(result, 0, 0.0);
+    ExpectStatValue(result, 1, 0.0);
+    ExpectStatValue(result, 2, 0.0);
+    ExpectStatValue(result, 3, 0.0);
+  }
+  // A single non-NULL value: the sample forms are NULL, the population forms
+  // are 0 -- even when that value is non-finite.
+  const double inf = std::numeric_limits<double>::infinity();
+  for (const Row& result :
+       RunStatAggregation(schema, {Row({Value(inf)})}, variance_aggregates())) {
+    ExpectStatNull(result, 0);
+    ExpectStatNaN(result, 1);
+    ExpectStatNull(result, 2);
+    ExpectStatNaN(result, 3);
+  }
+  // Two rows containing inf: every form is NaN.
+  for (const Row& result :
+       RunStatAggregation(schema, {Row({Value(1.0)}), Row({Value(inf)})},
+                          variance_aggregates())) {
+    ExpectStatNaN(result, 0);
+    ExpectStatNaN(result, 1);
+    ExpectStatNaN(result, 2);
+    ExpectStatNaN(result, 3);
+  }
+  // Empty input: NULL everywhere.
+  for (const Row& result :
+       RunStatAggregation(schema, {}, variance_aggregates())) {
+    ExpectStatNull(result, 0);
+    ExpectStatNull(result, 1);
+    ExpectStatNull(result, 2);
+    ExpectStatNull(result, 3);
+  }
+  // Extreme spread: VAR_* overflow to inf; STDDEV_SAMP survives as 2.2e304
+  // and STDDEV_POP as 1.7962924780409973e304 (GoogleSQL goldens).
+  const std::vector<Row> extreme = {Row({Value(1.0)}), Row({Value(2.2e304)}),
+                                    Row({Value(-2.2e304)})};
+  for (const Row& result :
+       RunStatAggregation(schema, extreme, variance_aggregates())) {
+    EXPECT_EQ(result[0].value.double_value, inf);
+    EXPECT_EQ(result[1].value.double_value, inf);
+    ExpectStatValue(result, 2, 2.2e304);
+    ExpectStatValue(result, 3, 1.7962924780409973e304);
+  }
+}
+
+TEST(StatAggregateTest, ParallelGenericPathHandlesExpressionArguments) {
+  // COVAR over expressions (not bare columns) exercises the parallel
+  // executor's per-row statistical path, including paired NULL skipping.
+  const Schema schema(
+      "t", {Column("y", ValueType::kDouble), Column("x", ValueType::kDouble)});
+  const Value null_value;
+  std::vector<Row> rows = {
+      Row({Value(1.0), Value(5.0)}),  Row({Value(3.0), Value(9.0)}),
+      Row({Value(4.0), Value(7.0)}),  Row({Value(5.0), Value(1.0)}),
+      Row({Value(7.0), Value(13.0)}), Row({null_value, Value(42.0)}),
+      Row({Value(42.0), null_value})};
+  auto y_expr = BinaryExpressionExp(ColumnValueExp("y"), BinaryOperation::kAdd,
+                                    ConstantValueExp(Value(0.0)));
+  auto x_expr = BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kAdd,
+                                    ConstantValueExp(Value(0.0)));
+  auto covar = std::make_shared<AggregateExpression>(
+      AggregationType::kCovarSamp, std::move(y_expr));
+  covar->SetTrailingArgs({std::move(x_expr)});
+  std::vector<NamedExpression> aggregates = {NamedExpression("covar", covar)};
+
+  AggregationExecutor serial(std::make_shared<ValuesExecutor>(rows), schema,
+                             aggregates);
+  Row serial_result;
+  ASSERT_TRUE(serial.Next(&serial_result, nullptr));
+  ExpectStatValue(serial_result, 0, 4.0);
+
+  ParallelAggregationExecutor parallel(std::make_shared<ValuesExecutor>(rows),
+                                       schema, aggregates, 2);
+  Row parallel_result;
+  ASSERT_TRUE(parallel.Next(&parallel_result, nullptr));
+  ExpectStatValue(parallel_result, 0, 4.0);
+}
+
+TEST(StatAggregateTest, ParallelPathLargeMixedInputMatchesSerial) {
+  // Above the parallel threshold shape: enough rows that workers split the
+  // input, mixing INT64 child columns with a DOUBLE trailing column and
+  // NULL gaps. Serial and parallel results must agree bit for bit.
+  const Schema schema(
+      "t", {Column("y", ValueType::kInt64), Column("x", ValueType::kDouble)});
+  std::vector<Row> rows;
+  for (int64_t i = 0; i < 500; ++i) {
+    if (i % 17 == 3) {
+      rows.push_back(Row({Value(), Value(static_cast<double>(i))}));
+    } else if (i % 17 == 9) {
+      rows.push_back(Row({Value(i), Value()}));
+    } else {
+      rows.push_back(Row({Value(i), Value(static_cast<double>(i) * 1.5)}));
+    }
+  }
+  const std::vector<NamedExpression> aggregates = {
+      NamedExpression("corr", StatAggregate(AggregationType::kCorr, "y", "x")),
+      NamedExpression("covar_samp",
+                      StatAggregate(AggregationType::kCovarSamp, "y", "x")),
+      NamedExpression("var_pop",
+                      AggregateExpressionExp(AggregationType::kVarPop,
+                                             ColumnValueExp("y")))};
+
+  AggregationExecutor serial(std::make_shared<ValuesExecutor>(rows), schema,
+                             aggregates);
+  Row serial_result;
+  ASSERT_TRUE(serial.Next(&serial_result, nullptr));
+
+  ParallelAggregationExecutor parallel(std::make_shared<ValuesExecutor>(rows),
+                                       schema, aggregates, 4);
+  Row parallel_result;
+  ASSERT_TRUE(parallel.Next(&parallel_result, nullptr));
+
+  ASSERT_EQ(serial_result.values_.size(), parallel_result.values_.size());
+  for (size_t i = 0; i < serial_result.values_.size(); ++i) {
+    SCOPED_TRACE(i);
+    if (serial_result[i].IsNull()) {
+      ExpectStatNull(parallel_result, i);
+    } else {
+      EXPECT_EQ(serial_result[i].type, ValueType::kDouble);
+      EXPECT_EQ(serial_result[i].value.double_value,
+                parallel_result[i].value.double_value);
+    }
+  }
+  // Sanity: the correlation of a perfect line is 1.
+  ExpectStatValue(serial_result, 0, 1.0);
 }
 
 }  // namespace tinylamb

@@ -87,7 +87,8 @@ RecursiveCtePlan::RecursiveCtePlan(Plan child, Plan recursive_child,
       stats_(MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10)) {}
 
 void RecursiveCtePlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "RecursiveCtePlan: [" << cte_name_ << "]";
+  output << Indent(static_cast<size_t>(indent)) << "RecursiveCtePlan: ["
+         << cte_name_ << "]";
   if (depth_spec_.has_value()) {
     output << " (depth_column: " << depth_spec_->column << ", range: ["
            << depth_spec_->lower << ", " << depth_spec_->upper << "])";

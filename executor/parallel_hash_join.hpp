@@ -3,6 +3,7 @@
 #define TINYLAMB_EXECUTOR_PARALLEL_HASH_JOIN_HPP
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
@@ -74,7 +75,7 @@ class SharedBuildParallelHashJoin : public ExecutorBase,
       Executor left, std::vector<slot_t> left_cols, Executor right,
       std::vector<slot_t> right_cols,
       size_t worker_count = std::thread::hardware_concurrency(),
-      JoinKind kind = JoinKind::kInner);
+      JoinKind kind = JoinKind::kInner, size_t right_width = 0);
 
   ~SharedBuildParallelHashJoin() override = default;
 
@@ -109,6 +110,14 @@ class SharedBuildParallelHashJoin : public ExecutorBase,
   std::vector<slot_t> right_cols_;
   size_t worker_count_{1};
   JoinKind kind_{JoinKind::kInner};
+  // Full right row width for left-outer NULL padding; inferred from the
+  // first build row when the build side is non-empty.
+  size_t right_width_{0};
+  // Seen while building: a NULL key anywhere in the build set makes every
+  // NOT IN comparison UNKNOWN (three-valued kNullAwareAnti emits nothing).
+  // Atomic: written concurrently by build workers; the build-side join()
+  // barrier makes the final value visible to probes.
+  std::atomic<bool> build_has_null_key_{false};
 
   ConcurrentJoinHashTable shared_hash_table_;
   std::vector<std::pair<Row, RowPosition>> output_;

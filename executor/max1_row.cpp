@@ -1,10 +1,14 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "max1_row.hpp"
 
+#include <cstddef>
+#include <ostream>
 #include <stdexcept>
 #include <utility>
 
 #include "common/constants.hpp"
+#include "page/row_position.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
 
@@ -26,7 +30,7 @@ bool Max1RowExecutor::Next(Row* destination, RowPosition* position) {
 }
 
 void Max1RowExecutor::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "Max1Row\n";
+  output << Indent(static_cast<size_t>(indent)) << "Max1Row\n";
   source_->Dump(output, indent + 2);
 }
 

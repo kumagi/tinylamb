@@ -17,8 +17,11 @@ plan is executed by tinylamb.
 ```console
 cmake -S . -B build
 cmake --build build -j
-echo "SELECT * FROM warehouse WHERE w_id = 1;" | ./build/tinylamb tpcc
+printf 'CREATE TABLE t (k INT64, v VARCHAR); INSERT INTO t VALUES (1, %s);\nSELECT * FROM t WHERE k = 1;\n' "'hello'" | ./build/tinylamb /tmp/demo.db
 ```
+
+`tinylamb` creates the database file on first use; it bootstraps only the
+catalog, so create your tables with DDL before querying.
 
 CMake downloads the pinned GoogleSQL `execute_query` release and verifies its
 SHA-256 checksum. Bazel is not required. GoogleSQL AST mode is required by the

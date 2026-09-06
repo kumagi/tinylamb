@@ -2,18 +2,24 @@
 
 #include "expression/sql_udf.hpp"
 
+#include <array>
 #include <charconv>
 #include <cstdio>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "expression/proto_text.hpp"
+#include "expression/expression.hpp"
+#include "type/column.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -72,8 +78,8 @@ SqlUdfBinding BindSqlUdfArguments(const SqlScalarFunction& function,
                                                  ? arguments[i].type
                                                  : ValueType::kNull);
   }
-  return SqlUdfBinding{Row(std::move(arguments)),
-                       Schema("", std::move(columns))};
+  return SqlUdfBinding{.row = Row(std::move(arguments)),
+                       .schema = Schema("", std::move(columns))};
 }
 
 SqlUdfDepthGuard::SqlUdfDepthGuard() {
@@ -97,9 +103,12 @@ std::string EncodeStructJson(
         out.push_back('\\');
         out.push_back(c);
       } else if (static_cast<unsigned char>(c) < 0x20) {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-        out += buf;
+        std::array<char, 8> buf{};
+        // Fixed-size escape output can neither fail nor truncate.
+        // NOLINTNEXTLINE(cert-err33-c)
+        (void)snprintf(buf.data(), buf.size(), "\\u%04x",
+                       static_cast<unsigned char>(c));
+        out += buf.data();
       } else {
         out.push_back(c);
       }
@@ -150,11 +159,12 @@ std::string EncodeStructJson(
         // Shortest round-trip representation so whole numbers render as "3"
         // rather than "3.000000" (matching the compliance goldens).
         {
-          char buffer[32];
-          auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer),
-                                         value.value.double_value);
+          std::array<char, 32> buffer{};
+          auto [end, ec] =
+              std::to_chars(buffer.data(), buffer.data() + buffer.size(),
+                            value.value.double_value);
           if (ec == std::errc()) {
-            text = std::string(buffer, end);
+            text = std::string(buffer.data(), end);
           } else {
             text = std::to_string(value.value.double_value);
           }

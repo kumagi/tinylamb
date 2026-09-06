@@ -20,7 +20,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +31,7 @@
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
+#include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
@@ -536,8 +540,10 @@ TEST_F(PlanTest, SortPlanOrdersRowsAndReportsOrdering) {
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
                         ctx.GetStats("Sc1"));
   Plan child(new FullScanPlan(*table, *stats));
-  Plan sorted(new SortPlan(child, {SortKey{ColumnValueExp(ColumnName("Sc1.c1")),
-                                           true, std::nullopt}}));
+  Plan sorted(new SortPlan(
+      child, {SortKey{.expression = ColumnValueExp(ColumnName("Sc1.c1")),
+                      .ascending = true,
+                      .nulls_first = std::nullopt}}));
 
   EXPECT_TRUE(
       sorted->IsOrderedBy({ColumnValueExp(ColumnName("Sc1.c1"))}, {true}));

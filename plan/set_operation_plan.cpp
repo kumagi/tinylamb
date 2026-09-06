@@ -1,12 +1,19 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "set_operation_plan.hpp"
 
+#include <cstddef>
 #include <ostream>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/set_operation.hpp"
+#include "expression/expression.hpp"
+#include "plan/plan.hpp"
 #include "type/column.hpp"
+#include "type/schema.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -48,7 +55,7 @@ Schema SetOperationPlan::GenerateSchema() const {
     }
     columns.emplace_back(first.GetColumn(column).Name(), type);
   }
-  return Schema(first.Name(), std::move(columns));
+  return {first.Name(), std::move(columns)};
 }
 
 size_t SetOperationPlan::AccessRowCount() const {
@@ -89,7 +96,7 @@ bool SetOperationPlan::IsOrderedBy(const std::vector<Expression>& expressions,
 }
 
 void SetOperationPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << ToString() << '\n';
+  output << Indent(static_cast<size_t>(indent)) << ToString() << '\n';
   for (const Plan& child : children_) {
     child->Dump(output, indent + 2);
   }

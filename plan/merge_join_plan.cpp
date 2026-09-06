@@ -2,11 +2,20 @@
 #include "plan/merge_join_plan.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <ostream>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "expression/column_value.hpp"
+#include "expression/expression.hpp"
+#include "plan/plan.hpp"
+#include "plan/product_plan.hpp"
+#include "type/column_name.hpp"
+#include "type/type.hpp"
 
 namespace tinylamb {
 
@@ -76,9 +85,9 @@ bool MergeJoinPlan::IsOrderedBy(const std::vector<Expression>& expressions,
 
 void MergeJoinPlan::Dump(std::ostream& o, int indent) const {
   o << ToString() << ": keys=" << left_keys_.size() << "\n"
-    << Indent(indent + 2);
+    << Indent(static_cast<size_t>(indent) + 2);
   left_->Dump(o, indent + 2);
-  o << "\n" << Indent(indent + 2);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   right_->Dump(o, indent + 2);
 }
 

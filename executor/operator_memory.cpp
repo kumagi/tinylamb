@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/operator_memory.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <string>

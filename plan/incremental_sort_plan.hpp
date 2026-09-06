@@ -16,7 +16,7 @@ class IncrementalSortPlan final : public PlanBase {
   IncrementalSortPlan(Plan child, std::vector<SortKey> prefix_keys,
                       std::vector<SortKey> suffix_keys);
 
-  Executor EmitExecutor(TransactionContext& context) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();
   }

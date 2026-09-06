@@ -40,7 +40,7 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
                     size_t worker_count = std::thread::hardware_concurrency(),
                     JoinKind kind = JoinKind::kInner,
                     Expression residual = Expression(),
-                    Schema residual_schema = Schema());
+                    Schema residual_schema = Schema(), size_t right_width = 0);
 
   ~ParallelMergeJoin() override = default;
 
@@ -71,8 +71,12 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
   void ComputeSteeringPartitions();
   void ExecuteParallelMerge();
 
-  int CompareKeys(const Row& left, const Row& right) const;
-  bool KeyIsNull(const Row& row, const std::vector<slot_t>& cols) const;
+  [[nodiscard]] int CompareKeys(const Row& left, const Row& right) const;
+  [[nodiscard]] static bool KeyIsNull(const Row& row,
+                                      const std::vector<slot_t>& cols);
+  // Residual (non-equi) predicate over the concatenated pair; always true
+  // when no residual was given.
+  [[nodiscard]] bool PairPasses(const Row& left, const Row& right) const;
 
   Executor left_;
   std::vector<slot_t> left_cols_;
@@ -82,6 +86,9 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
   JoinKind kind_{JoinKind::kInner};
   Expression residual_;
   Schema residual_schema_;
+  // Full right row width used for left-outer NULL padding; inferred from the
+  // first right row when the right side is non-empty.
+  size_t right_width_{0};
 
   std::vector<std::pair<Row, RowPosition>> left_rows_;
   std::vector<std::pair<Row, RowPosition>> right_rows_;

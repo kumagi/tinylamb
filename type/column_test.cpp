@@ -16,8 +16,10 @@
 
 #include "type/column.hpp"
 
+#include <cstddef>
 #include <functional>
 #include <sstream>
+#include <string>
 
 #include "column_name.hpp"
 #include "common/log_message.hpp"

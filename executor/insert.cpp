@@ -20,6 +20,7 @@
 
 #include "executor/insert.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <ostream>
 #include <stdexcept>
@@ -70,7 +71,7 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
   if (enforce_primary_key_) {
     for (auto it = target_->BeginFullScan(*txn_); it.IsValid(); ++it) {
       const Row& current = *it;
-      if (current.values_.size() == 0) {
+      if (current.values_.empty()) {
         continue;
       }
       std::string key = KeyString(current[0]);
@@ -157,7 +158,8 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
 }
 
 void Insert::Dump(std::ostream& o, int indent) const {
-  o << "Insert: " << target_->GetSchema().Name() << "\n" << Indent(indent + 2);
+  o << "Insert: " << target_->GetSchema().Name() << "\n"
+    << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 

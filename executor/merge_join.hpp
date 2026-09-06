@@ -36,12 +36,13 @@ class MergeJoin final : public ExecutorBase {
 
  private:
   void Materialize();
-  bool KeyIsNull(const Row& row, const std::vector<slot_t>& columns) const;
-  int CompareKeys(const Row& left, const Row& right) const;
+  [[nodiscard]] static bool KeyIsNull(const Row& row,
+                                      const std::vector<slot_t>& columns);
+  [[nodiscard]] int CompareKeys(const Row& left, const Row& right) const;
   // Evaluates the optional residual over `left_rows_[i] + right_rows_[j]`;
   // always true when no residual was supplied.
-  bool PairPasses(size_t i, size_t j) const;
-  Row Concatenate(size_t i, size_t j) const;
+  [[nodiscard]] bool PairPasses(size_t i, size_t j) const;
+  [[nodiscard]] Row Concatenate(size_t i, size_t j) const;
 
   Executor left_;
   Executor right_;

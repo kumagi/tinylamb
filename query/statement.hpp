@@ -122,7 +122,7 @@ class Statement {
  public:
   explicit Statement(StatementType type) : type_(type) {}
   virtual ~Statement() = default;
-  StatementType Type() const { return type_; }
+  [[nodiscard]] StatementType Type() const { return type_; }
   virtual void Dump(std::ostream& o) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const Statement& s) {
     o << StatementTypeName(s.Type()) << " ";
@@ -147,10 +147,12 @@ class CreateTableStatement : public Statement {
         table_name_(std::move(table_name)),
         as_query_(std::move(as_query)) {}
 
-  const std::string& TableName() const { return table_name_; }
-  const std::vector<Column>& Columns() const { return columns_; }
-  const std::shared_ptr<SelectStatement>& AsQuery() const { return as_query_; }
-  bool IsAsSelect() const { return as_query_ != nullptr; }
+  [[nodiscard]] const std::string& TableName() const { return table_name_; }
+  [[nodiscard]] const std::vector<Column>& Columns() const { return columns_; }
+  [[nodiscard]] const std::shared_ptr<SelectStatement>& AsQuery() const {
+    return as_query_;
+  }
+  [[nodiscard]] bool IsAsSelect() const { return as_query_ != nullptr; }
 
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_;
@@ -159,7 +161,7 @@ class CreateTableStatement : public Statement {
     } else {
       o << " columns=[";
       for (size_t i = 0; i < columns_.size(); i++) {
-        if (i) {
+        if (i != 0u) {
           o << ", ";
         }
         o << columns_[i];
@@ -180,7 +182,7 @@ class DropTableStatement : public Statement {
       : Statement(StatementType::kDropTable),
         table_name_(std::move(table_name)) {}
 
-  const std::string& TableName() const { return table_name_; }
+  [[nodiscard]] const std::string& TableName() const { return table_name_; }
   void Dump(std::ostream& o) const override { o << "table=" << table_name_; }
 
  private:
@@ -211,8 +213,7 @@ class SelectStatement : public Statement {
         offset_(offset),
         distinct_(distinct) {
     for (const std::string& table : from_clause_) {
-      sources_.push_back(
-          SelectSource{table, table, nullptr, JoinType::kCross, nullptr});
+      sources_.emplace_back(table, table, nullptr, JoinType::kCross, nullptr);
     }
   }
 
@@ -368,14 +369,14 @@ class SelectStatement : public Statement {
   void Dump(std::ostream& o) const override {
     o << "select=[";
     for (size_t i = 0; i < select_list_.size(); i++) {
-      if (i) {
+      if (i != 0u) {
         o << ", ";
       }
       o << select_list_[i];
     }
     o << "] from=[";
     for (size_t i = 0; i < from_clause_.size(); i++) {
-      if (i) {
+      if (i != 0u) {
         o << ", ";
       }
       o << from_clause_[i];
@@ -443,31 +444,39 @@ class InsertStatement : public Statement {
         values_(std::move(values)),
         columns_(std::move(columns)) {}
 
-  const std::string& TableName() const { return table_name_; }
-  const std::vector<std::vector<Expression>>& Values() const { return values_; }
-  const std::vector<std::string>& Columns() const { return columns_; }
+  [[nodiscard]] const std::string& TableName() const { return table_name_; }
+  [[nodiscard]] const std::vector<std::vector<Expression>>& Values() const {
+    return values_;
+  }
+  [[nodiscard]] const std::vector<std::string>& Columns() const {
+    return columns_;
+  }
   // INSERT ... SELECT: rows come from the query instead of VALUES tuples.
-  const std::shared_ptr<SelectStatement>& Query() const { return query_; }
+  [[nodiscard]] const std::shared_ptr<SelectStatement>& Query() const {
+    return query_;
+  }
   void SetQuery(std::shared_ptr<SelectStatement> query) {
     query_ = std::move(query);
   }
-  InsertMode Mode() const { return mode_; }
+  [[nodiscard]] InsertMode Mode() const { return mode_; }
   void SetMode(InsertMode mode) { mode_ = mode; }
   // -1 = no ASSERT_ROWS_MODIFIED clause.
-  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  [[nodiscard]] int64_t AssertRowsModified() const {
+    return assert_rows_modified_;
+  }
   void SetAssertRowsModified(int64_t expected) {
     assert_rows_modified_ = expected;
   }
-  bool HasAssert() const { return assert_rows_modified_ >= 0; }
+  [[nodiscard]] bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " values=[";
     for (size_t i = 0; i < values_.size(); i++) {
-      if (i) {
+      if (i != 0u) {
         o << "; ";
       }
       o << "(";
       for (size_t j = 0; j < values_[i].size(); j++) {
-        if (j) {
+        if (j != 0u) {
           o << ", ";
         }
         o << *values_[i][j];
@@ -518,33 +527,36 @@ class UpdateStatement : public Statement {
         set_clause_(std::move(set_clause)),
         where_clause_(std::move(where_clause)) {}
 
-  const std::string& TableName() const { return table_name_; }
+  [[nodiscard]] const std::string& TableName() const { return table_name_; }
   // UPDATE tbl AS alias: bare references to the alias denote the whole row
   // (value tables), so SET/WHERE may bind to the single physical column.
-  const std::string& Alias() const { return alias_; }
+  [[nodiscard]] const std::string& Alias() const { return alias_; }
   void SetAlias(std::string alias) { alias_ = std::move(alias); }
-  const std::vector<std::pair<ColumnName, Expression>>& SetClause() const {
+  [[nodiscard]] const std::vector<std::pair<ColumnName, Expression>>&
+  SetClause() const {
     return set_clause_;
   }
-  const Expression& WhereClause() const { return where_clause_; }
+  [[nodiscard]] const Expression& WhereClause() const { return where_clause_; }
   // Nested per-row array DML items (SET (DELETE/UPDATE/INSERT ...)).
-  const std::vector<NestedDmlItem>& NestedItems() const {
+  [[nodiscard]] const std::vector<NestedDmlItem>& NestedItems() const {
     return nested_items_;
   }
   void SetNestedItems(std::vector<NestedDmlItem> items) {
     nested_items_ = std::move(items);
   }
-  bool HasNestedDml() const { return !nested_items_.empty(); }
+  [[nodiscard]] bool HasNestedDml() const { return !nested_items_.empty(); }
   // -1 = no ASSERT_ROWS_MODIFIED clause.
-  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  [[nodiscard]] int64_t AssertRowsModified() const {
+    return assert_rows_modified_;
+  }
   void SetAssertRowsModified(int64_t expected) {
     assert_rows_modified_ = expected;
   }
-  bool HasAssert() const { return assert_rows_modified_ >= 0; }
+  [[nodiscard]] bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " set=[";
     for (size_t i = 0; i < set_clause_.size(); i++) {
-      if (i) {
+      if (i != 0u) {
         o << ", ";
       }
       o << set_clause_[i].first << " = " << *set_clause_[i].second;
@@ -573,16 +585,18 @@ class DeleteStatement : public Statement {
         table_name_(std::move(table_name)),
         where_clause_(std::move(where_clause)) {}
 
-  const std::string& TableName() const { return table_name_; }
-  const std::string& Alias() const { return alias_; }
+  [[nodiscard]] const std::string& TableName() const { return table_name_; }
+  [[nodiscard]] const std::string& Alias() const { return alias_; }
   void SetAlias(std::string alias) { alias_ = std::move(alias); }
-  const Expression& WhereClause() const { return where_clause_; }
+  [[nodiscard]] const Expression& WhereClause() const { return where_clause_; }
   // -1 = no ASSERT_ROWS_MODIFIED clause.
-  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  [[nodiscard]] int64_t AssertRowsModified() const {
+    return assert_rows_modified_;
+  }
   void SetAssertRowsModified(int64_t expected) {
     assert_rows_modified_ = expected;
   }
-  bool HasAssert() const { return assert_rows_modified_ >= 0; }
+  [[nodiscard]] bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " where=";
     if (where_clause_) {

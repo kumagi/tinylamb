@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -20,6 +21,8 @@
 #include "bitmap_scan_plan.hpp"
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "common/set_operation.hpp"
+#include "common/status_or.hpp"
 #include "distinct_plan.hpp"
 #include "empty_plan.hpp"
 #include "executor/detail/scan_filter.hpp"
@@ -36,6 +39,7 @@
 #include "index/index.hpp"
 #include "index_only_scan_plan.hpp"
 #include "index_scan_plan.hpp"
+#include "index_skip_scan_plan.hpp"
 #include "limit_plan.hpp"
 #include "max1_row_plan.hpp"
 #include "merge_join_plan.hpp"
@@ -51,8 +55,10 @@
 #include "recursive_cte_plan.hpp"
 #include "selection_plan.hpp"
 #include "set_operation_plan.hpp"
+#include "skip_scan_distinct_plan.hpp"
 #include "sort_distinct_plan.hpp"
 #include "sort_plan.hpp"
+#include "table/full_scan_iterator.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "topn_plan.hpp"
@@ -60,6 +66,7 @@
 #include "type/schema.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 #include "unnest_plan.hpp"
 #include "values_plan.hpp"
 
@@ -208,11 +215,11 @@ std::optional<std::pair<std::string, std::string>> LikePrefixBounds(
       prefix.find_first_of("%_\\") != std::string_view::npos) {
     return std::nullopt;
   }
-  for (const unsigned char byte : prefix) {
+  for (const char byte : prefix) {
     // The storage comparison currently has no collation contract. Restrict
     // the rewrite to byte-stable ASCII so a locale/UTF-8 collation cannot
     // turn the computed half-open range into a different language predicate.
-    if (byte >= 0x80) {
+    if (static_cast<unsigned char>(byte) >= 0x80) {
       return std::nullopt;
     }
   }
@@ -349,10 +356,18 @@ Plan BuildIndexScan(const Table& table, const Index& index,
         table, index, statistics, std::move(begin_key), std::move(end_key),
         ascending, predicate, std::move(provided_order));
   }
-  return std::make_shared<IndexScanPlan>(
+  Plan scan = std::make_shared<IndexScanPlan>(
       table, index, statistics, std::move(begin_key), std::move(end_key),
       ascending, predicate, std::move(provided_order), require_row_position,
       wait_for_write_intent);
+  // A range over a secondary index belongs to the skip-scan access family:
+  // the executor seeks range boundaries in the index instead of reading the
+  // table.  Covering (index-only) scans keep their dedicated node because
+  // DISTINCT planning pattern-matches on it.
+  if (!index.IsUnique()) {
+    return std::make_shared<IndexSkipScanPlan>(std::move(scan));
+  }
+  return scan;
 }
 
 // Top-K costing (Phase 5): an alternative that already delivers the required
@@ -385,7 +400,7 @@ double EqualityPrefixRows(const TableStatistics& statistics, const Index& index,
   if (statistics.Rows() == 0) {
     return 0;
   }
-  double rows = static_cast<double>(statistics.Rows());
+  auto rows = static_cast<double>(statistics.Rows());
   for (size_t key = 0;
        key < equality_values.size() && key < index.sc_.key_.size(); ++key) {
     const slot_t column = index.sc_.key_[key];
@@ -397,9 +412,9 @@ double EqualityPrefixRows(const TableStatistics& statistics, const Index& index,
     if (stats.NonNullCount() != 0) {
       const double frequency = stats.EstimateEqual(equality_values[key]);
       if (frequency > 0) {
-        selectivity = frequency / stats.NonNullCount();
+        selectivity = frequency / static_cast<double>(stats.NonNullCount());
       } else if (stats.Distinct() != 0) {
-        selectivity = 1.0 / stats.Distinct();
+        selectivity = 1.0 / static_cast<double>(stats.Distinct());
       }
     }
     rows *= std::clamp(selectivity, 0.0, 1.0);
@@ -740,7 +755,7 @@ std::vector<PlanAlternative> ScanAlternatives(
         for (size_t other_offset = 0; other_offset < table.IndexCount();
              ++other_offset) {
           const Index& other = table.GetIndex(other_offset);
-          const auto other_range = leading_key_range(other);
+          const auto* const other_range = leading_key_range(other);
           if (other_range == nullptr ||
               !seen_leading_slots.insert(other.sc_.key_.front()).second) {
             continue;
@@ -808,7 +823,8 @@ std::vector<PlanAlternative> ScanAlternatives(
             candidates.push_back(PlanAlternative{
                 .plan = std::move(bitmap),
                 .local_cost = 0.0,
-                .estimated_rows = filter_selectivity * statistics.Rows()});
+                .estimated_rows = filter_selectivity *
+                                  static_cast<double>(statistics.Rows())});
           }
         }
       }
@@ -867,8 +883,7 @@ std::vector<PlanAlternative> ScanAlternatives(
           has_point_column ? index.sc_.key_[point_key_offset] : slot_t{0};
       const auto points =
           has_point_column ? point_sets.find(point_key_slot) : point_sets.end();
-      if (points != point_sets.end() &&
-          ranges.find(point_key_slot) == ranges.end()) {
+      if (points != point_sets.end() && !ranges.contains(point_key_slot)) {
         std::vector<Value> values = points->second;
         std::ranges::sort(values);
         values.erase(std::ranges::unique(values).begin(), values.end());
@@ -906,7 +921,8 @@ std::vector<PlanAlternative> ScanAlternatives(
           double ndv = 1.0;
           if (point_key_slot < statistics.Columns()) {
             ndv = std::max<double>(
-                1.0, statistics.Column(point_key_slot).Distinct());
+                1.0, static_cast<double>(
+                         statistics.Column(point_key_slot).Distinct()));
           }
           double point_rows = std::min<double>(
               static_cast<double>(statistics.Rows()),
@@ -1099,10 +1115,16 @@ double JoinCardinality(
     const int ro = right.plan->GetSchema().Offset(right_column);
     double ndv = 0;
     if (lo >= 0 && static_cast<size_t>(lo) < left.plan->GetStats().Columns()) {
-      ndv = std::max<double>(ndv, left.plan->GetStats().Column(lo).Distinct());
+      ndv = std::max<double>(
+          ndv, static_cast<double>(left.plan->GetStats()
+                                       .Column(static_cast<size_t>(lo))
+                                       .Distinct()));
     }
     if (ro >= 0 && static_cast<size_t>(ro) < right.plan->GetStats().Columns()) {
-      ndv = std::max<double>(ndv, right.plan->GetStats().Column(ro).Distinct());
+      ndv = std::max<double>(
+          ndv, static_cast<double>(right.plan->GetStats()
+                                       .Column(static_cast<size_t>(ro))
+                                       .Distinct()));
     }
     max_ndv = std::max(max_ndv, ndv);
   }
@@ -1121,13 +1143,15 @@ std::vector<PlanAlternative> JoinAlternatives(
     JoinAlternativeKind kind = JoinAlternativeKind::kInner) {
   const Expression predicate = condition ? *condition : nullptr;
   std::vector<std::pair<ColumnName, ColumnName>> equalities;
+  std::vector<bool> equality_null_safe;
   std::vector<Expression> equi_conjuncts;
   for (const Expression& conjunct : SplitConjuncts(predicate)) {
     if (conjunct->Type() != TypeTag::kBinaryExp) {
       continue;
     }
     const auto& binary = conjunct->AsBinaryExpression();
-    if (binary.Op() != BinaryOperation::kEquals ||
+    const bool null_safe = binary.Op() == BinaryOperation::kIsNotDistinctFrom;
+    if ((binary.Op() != BinaryOperation::kEquals && !null_safe) ||
         binary.Left()->Type() != TypeTag::kColumnValue ||
         binary.Right()->Type() != TypeTag::kColumnValue) {
       continue;
@@ -1137,9 +1161,11 @@ std::vector<PlanAlternative> JoinAlternatives(
     if (left.plan->GetSchema().Offset(lhs) >= 0 &&
         right.plan->GetSchema().Offset(rhs) >= 0) {
       equalities.emplace_back(lhs, rhs);
+      equality_null_safe.push_back(null_safe);
     } else if (left.plan->GetSchema().Offset(rhs) >= 0 &&
                right.plan->GetSchema().Offset(lhs) >= 0) {
       equalities.emplace_back(rhs, lhs);
+      equality_null_safe.push_back(null_safe);
     } else {
       continue;
     }
@@ -1186,7 +1212,8 @@ std::vector<PlanAlternative> JoinAlternatives(
 
   std::vector<PlanAlternative> candidates;
   if (cross) {
-    Plan product = std::make_shared<ProductPlan>(left.plan, right.plan);
+    auto product_plan = std::make_shared<ProductPlan>(left.plan, right.plan);
+    Plan product = std::move(product_plan);
     const double cross_estimate =
         equi_conjuncts.empty() ? l_rows * r_rows : equi_estimate;
     // The cross-product executor does not consume join keys.  A nested-loop
@@ -1194,6 +1221,11 @@ std::vector<PlanAlternative> JoinAlternatives(
     // including equality conjuncts; `with_residual` is only valid for hash
     // and index joins that already enforce those equalities themselves.
     if (predicate) {
+      // A cross product that filters every pair by the join predicate IS a
+      // nested-loop join: carry the predicate into the plan node so the
+      // executor lowers to NestedLoopJoin.
+      std::static_pointer_cast<ProductPlan>(product)->SetJoinNotes({},
+                                                                   predicate);
       product = std::make_shared<SelectionPlan>(product, predicate,
                                                 product->GetStats());
     }
@@ -1240,7 +1272,7 @@ std::vector<PlanAlternative> JoinAlternatives(
       double local_cost = l_rows + r_rows;
       const double build_bytes = r_rows * kHashJoinRowBytesEstimate;
       if (mode == HashJoinMode::kInMemory &&
-          PreferHybridHashJoin(build_bytes)) {
+          PreferHybridHashJoin(static_cast<size_t>(build_bytes))) {
         local_cost += r_rows * 3;
       }
       const double estimate =
@@ -1251,6 +1283,9 @@ std::vector<PlanAlternative> JoinAlternatives(
                          kind == JoinAlternativeKind::kFullOuter
                      ? std::max(l_rows, r_rows)
                      : std::min(l_rows, equi_estimate));
+      if (auto* pp = dynamic_cast<ProductPlan*>(join.get())) {
+        pp->SetJoinNotes(equality_null_safe, residual);
+      }
       auto [plan, est] = with_residual(std::move(join), estimate);
       candidates.push_back(PlanAlternative{.plan = std::move(plan),
                                            .local_cost = local_cost,
@@ -1419,7 +1454,9 @@ std::vector<PlanAlternative> MergeJoinAlternative(
     std::vector<SortKey> keys;
     keys.reserve(left_columns.size());
     for (const ColumnName& column : left_columns) {
-      keys.push_back(SortKey{ColumnValueExp(column), true, std::nullopt});
+      keys.push_back(SortKey{.expression = ColumnValueExp(column),
+                             .ascending = true,
+                             .nulls_first = std::nullopt});
     }
     left_plan =
         std::make_shared<SortPlan>(std::move(left_plan), std::move(keys));
@@ -1429,13 +1466,15 @@ std::vector<PlanAlternative> MergeJoinAlternative(
     std::vector<SortKey> keys;
     keys.reserve(right_columns.size());
     for (const ColumnName& column : right_columns) {
-      keys.push_back(SortKey{ColumnValueExp(column), true, std::nullopt});
+      keys.push_back(SortKey{.expression = ColumnValueExp(column),
+                             .ascending = true,
+                             .nulls_first = std::nullopt});
     }
     right_plan =
         std::make_shared<SortPlan>(std::move(right_plan), std::move(keys));
     local_cost += sort_cost(right.estimated_rows);
   }
-  JoinKind physical_kind = JoinKind{};
+  auto physical_kind = JoinKind{};
   if (kind == JoinAlternativeKind::kSemi) {
     physical_kind = SemiJoinKind();
   } else if (kind == JoinAlternativeKind::kAnti) {
@@ -1552,7 +1591,8 @@ StatusOr<Plan> OptimizeSingleRelation(
                   index.RetainsDeletedEntries()) {
                 continue;
               }
-              const ColumnName provided = schema.GetColumn(target_slot).Name();
+              const ColumnName provided =
+                  schema.GetColumn(static_cast<size_t>(target_slot)).Name();
               Plan scan = std::make_shared<IndexOnlyScanPlan>(
                   table, index, statistics, std::vector<Value>{},
                   std::vector<Value>{}, is_min, ConstantValueExp(Value(true)),
@@ -1592,7 +1632,51 @@ StatusOr<Plan> OptimizeSingleRelation(
   }
 
   if (distinct) {
-    plan = std::make_shared<DistinctPlan>(std::move(plan));
+    // DISTINCT over a single-column covering index skip-scans distinct keys
+    // instead of hashing every row (the index order also satisfies an
+    // ascending ORDER BY on that column).  Projections between the DISTINCT
+    // and the scan are transparent for a pure column passthrough.
+    Plan scan_plan = plan;
+    std::vector<NamedExpression> distinct_items = projection_items;
+    while (true) {
+      const auto* projection =
+          dynamic_cast<const ProjectionPlan*>(scan_plan.get());
+      if (projection == nullptr) {
+        break;
+      }
+      distinct_items = projection->Columns();
+      scan_plan = projection->GetSource();
+    }
+    const auto* index_only =
+        dynamic_cast<const IndexOnlyScanPlan*>(scan_plan.get());
+    bool skip_scan_built = false;
+    if (index_only != nullptr && !required.require_row_position &&
+        distinct_items.size() == 1 && distinct_items[0].expression &&
+        distinct_items[0].expression->Type() == TypeTag::kColumnValue) {
+      const Index& index = index_only->GetIndex();
+      const ColumnName distinct_column =
+          distinct_items[0].expression->AsColumnValue().GetColumnName();
+      const Table* table = index_only->ScanSource();
+      const int offset = table->GetSchema().Offset(distinct_column);
+      if (!index.RetainsDeletedEntries() && index.sc_.key_.size() == 1 &&
+          index_only->BeginKey().empty() && index_only->EndKey().empty() &&
+          offset >= 0 &&
+          index.sc_.key_.front() == static_cast<slot_t>(offset)) {
+        std::vector<NamedExpression> select_items = index_only->SelectItems();
+        if (select_items.empty()) {
+          select_items.emplace_back(distinct_column.name,
+                                    ColumnValueExp(distinct_column));
+        }
+        const Schema& scan_schema = index_only->GetSchema();
+        plan = std::make_shared<SkipScanDistinctPlan>(
+            *table, index, index_only->GetStats(), index_only->IsAscending(),
+            std::move(select_items), scan_schema);
+        skip_scan_built = true;
+      }
+    }
+    if (!skip_scan_built) {
+      plan = std::make_shared<DistinctPlan>(std::move(plan));
+    }
   }
 
   const std::vector<Expression> sort_expressions =
@@ -1620,10 +1704,12 @@ StatusOr<Plan> OptimizeSingleRelation(
     size_t prefix_length = 0;
     for (size_t length = sort_expressions.size(); length > 1; --length) {
       std::vector<Expression> prefix_expressions(
-          sort_expressions.begin(), sort_expressions.begin() + length - 1);
+          sort_expressions.begin(),
+          sort_expressions.begin() + static_cast<std::ptrdiff_t>(length - 1));
       std::vector<bool> prefix_ascending(
           query.order_ascending_.begin(),
-          query.order_ascending_.begin() + length - 1);
+          query.order_ascending_.begin() +
+              static_cast<std::ptrdiff_t>(length - 1));
       if (plan->IsOrderedBy(prefix_expressions, prefix_ascending,
                             slice_nulls(length - 1))) {
         prefix_length = length - 1;
@@ -1636,10 +1722,11 @@ StatusOr<Plan> OptimizeSingleRelation(
       prefix_keys.reserve(prefix_length);
       suffix_keys.reserve(sort_expressions.size() - prefix_length);
       for (size_t i = 0; i < sort_expressions.size(); ++i) {
-        SortKey key{sort_expressions[i], query.order_ascending_[i],
-                    i < query.order_nulls_first_.size()
-                        ? query.order_nulls_first_[i]
-                        : std::nullopt};
+        SortKey key{.expression = sort_expressions[i],
+                    .ascending = query.order_ascending_[i],
+                    .nulls_first = i < query.order_nulls_first_.size()
+                                       ? query.order_nulls_first_[i]
+                                       : std::nullopt};
         (i < prefix_length ? prefix_keys : suffix_keys)
             .push_back(std::move(key));
       }
@@ -1653,10 +1740,12 @@ StatusOr<Plan> OptimizeSingleRelation(
       std::vector<TopNKey> keys;
       keys.reserve(sort_expressions.size());
       for (size_t i = 0; i < sort_expressions.size(); ++i) {
-        keys.push_back(TopNKey{sort_expressions[i], query.order_ascending_[i],
-                               i < query.order_nulls_first_.size()
-                                   ? query.order_nulls_first_[i]
-                                   : std::nullopt});
+        keys.push_back(
+            TopNKey{.expression = sort_expressions[i],
+                    .ascending = query.order_ascending_[i],
+                    .nulls_first = i < query.order_nulls_first_.size()
+                                       ? query.order_nulls_first_[i]
+                                       : std::nullopt});
       }
       plan =
           std::make_shared<TopNPlan>(std::move(plan), std::move(keys),
@@ -1665,10 +1754,12 @@ StatusOr<Plan> OptimizeSingleRelation(
       std::vector<SortKey> keys;
       keys.reserve(sort_expressions.size());
       for (size_t i = 0; i < sort_expressions.size(); ++i) {
-        keys.push_back(SortKey{sort_expressions[i], query.order_ascending_[i],
-                               i < query.order_nulls_first_.size()
-                                   ? query.order_nulls_first_[i]
-                                   : std::nullopt});
+        keys.push_back(
+            SortKey{.expression = sort_expressions[i],
+                    .ascending = query.order_ascending_[i],
+                    .nulls_first = i < query.order_nulls_first_.size()
+                                       ? query.order_nulls_first_[i]
+                                       : std::nullopt});
       }
       plan = std::make_shared<SortPlan>(std::move(plan), std::move(keys));
     }
@@ -1914,6 +2005,18 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           if (children.size() != 1 || required.require_row_position) {
             return std::vector<PlanAlternative>{};
           }
+          // The aggregate executors assume every target-list item names an
+          // aggregate function; a target list of bare columns (the
+          // distinct_and_group_by_interchange representation of DISTINCT)
+          // would make them throw.  DISTINCT keeps its dedicated
+          // Distinct/SortDistinct implementations in that shape.
+          const bool has_aggregate =
+              std::ranges::any_of(logical.target_list, [](const auto& item) {
+                return ContainsAggregateExpression(item.expression);
+              });
+          if (!has_aggregate) {
+            return std::vector<PlanAlternative>{};
+          }
           const double rows = children[0].estimated_rows;
           Plan hash = std::make_shared<HashAggregatePlan>(children[0].plan,
                                                           logical.target_list);
@@ -1925,7 +2028,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           // remains selectable by rule disabling/hints and is costed as a
           // materializing sort plus the accumulator pass.
           const double sort_cost =
-              rows <= 1.0 ? rows : rows * std::log2(rows) + rows;
+              rows <= 1.0 ? rows : (rows * std::log2(rows)) + rows;
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(hash),
                               .local_cost = rows,
@@ -1951,11 +2054,12 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           expressions.reserve(logical.target_list.size());
           for (size_t i = 0; i < logical.target_list.size(); ++i) {
             expressions.push_back(logical.target_list[i].expression);
-            keys.push_back(SortKey{logical.target_list[i].expression,
-                                   logical.sort_ascending[i],
-                                   i < logical.sort_nulls_first.size()
-                                       ? logical.sort_nulls_first[i]
-                                       : std::nullopt});
+            keys.push_back(
+                SortKey{.expression = logical.target_list[i].expression,
+                        .ascending = logical.sort_ascending[i],
+                        .nulls_first = i < logical.sort_nulls_first.size()
+                                           ? logical.sort_nulls_first[i]
+                                           : std::nullopt});
           }
           if (children[0].plan->IsOrderedBy(expressions,
                                             logical.sort_ascending)) {
@@ -1988,11 +2092,12 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           std::vector<TopNKey> keys;
           keys.reserve(logical.target_list.size());
           for (size_t i = 0; i < logical.target_list.size(); ++i) {
-            keys.push_back(TopNKey{logical.target_list[i].expression,
-                                   logical.sort_ascending[i],
-                                   i < logical.sort_nulls_first.size()
-                                       ? logical.sort_nulls_first[i]
-                                       : std::nullopt});
+            keys.push_back(
+                TopNKey{.expression = logical.target_list[i].expression,
+                        .ascending = logical.sort_ascending[i],
+                        .nulls_first = i < logical.sort_nulls_first.size()
+                                           ? logical.sort_nulls_first[i]
+                                           : std::nullopt});
           }
           Plan topn = std::make_shared<TopNPlan>(
               children[0].plan, std::move(keys), logical.limit_count,
@@ -2001,8 +2106,8 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           return std::vector<PlanAlternative>{PlanAlternative{
               .plan = std::move(topn),
               .local_cost = rows <= 1 ? rows : rows * std::log2(rows),
-              .estimated_rows = static_cast<double>(LimitOutputRows(
-                  rows, logical.limit_count, logical.limit_offset))}};
+              .estimated_rows = LimitOutputRows(rows, logical.limit_count,
+                                                logical.limit_offset)}};
         },
         c::LogicalOperator::kTopN));
     built.Add(c::ImplementationRule(
@@ -2049,7 +2154,9 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           for (size_t i = 0; i < schema.ColumnCount(); ++i) {
             const ColumnName column = schema.GetColumn(i).Name();
             ordering.push_back(ColumnValueExp(column));
-            keys.push_back(SortKey{ColumnValueExp(column), true, std::nullopt});
+            keys.push_back(SortKey{.expression = ColumnValueExp(column),
+                                   .ascending = true,
+                                   .nulls_first = std::nullopt});
           }
           Plan input = children[0].plan;
           double cost = children[0].estimated_rows;
@@ -2065,6 +2172,65 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               PlanAlternative{.plan = std::move(distinct),
                               .local_cost = cost,
                               .estimated_rows = children[0].estimated_rows}};
+        },
+        c::LogicalOperator::kDistinct));
+    // DISTINCT over a single-column covering index becomes a skip scan: the
+    // executor jumps past duplicate index keys instead of hashing every row,
+    // and the index order satisfies an ascending ORDER BY on that column.
+    built.Add(c::ImplementationRule(
+        "skip_scan_distinct", cascades::dsl::Distinct(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression&, const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          std::vector<PlanAlternative> alternatives;
+          if (children.size() != 1 || required.require_row_position) {
+            return alternatives;
+          }
+          // Accept both a bare index-only scan and a pure projection of the
+          // distinct column over it (DISTINCT is planned above a projection
+          // group).
+          Plan scan_plan = children[0].plan;
+          if (const auto* projection =
+                  dynamic_cast<const ProjectionPlan*>(scan_plan.get())) {
+            scan_plan = projection->GetSource();
+          }
+          const auto* index_only =
+              dynamic_cast<const IndexOnlyScanPlan*>(scan_plan.get());
+          if (index_only == nullptr) {
+            return alternatives;
+          }
+          const Index& index = index_only->GetIndex();
+          if (index.RetainsDeletedEntries() || index.sc_.key_.size() != 1 ||
+              !index_only->BeginKey().empty() ||
+              !index_only->EndKey().empty()) {
+            return alternatives;
+          }
+          const Schema& scan_schema = index_only->GetSchema();
+          if (scan_schema.ColumnCount() != 1) {
+            return alternatives;
+          }
+          const ColumnName distinct_column = scan_schema.GetColumn(0).Name();
+          const Table* table = index_only->ScanSource();
+          const int offset = table->GetSchema().Offset(distinct_column);
+          if (offset < 0 ||
+              index.sc_.key_.front() != static_cast<slot_t>(offset)) {
+            return alternatives;
+          }
+          std::vector<NamedExpression> select_items = index_only->SelectItems();
+          if (select_items.empty()) {
+            select_items.emplace_back(distinct_column.name,
+                                      ColumnValueExp(distinct_column));
+          }
+          Plan skip_scan = std::make_shared<SkipScanDistinctPlan>(
+              *table, index, index_only->GetStats(), index_only->IsAscending(),
+              std::move(select_items), scan_schema);
+          const double rows = std::max<double>(
+              1.0,
+              static_cast<double>(index_only->GetStats().Column(0).Distinct()));
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(skip_scan),
+                              .local_cost = rows,
+                              .estimated_rows = rows}};
         },
         c::LogicalOperator::kDistinct));
     built.Add(c::ImplementationRule(
@@ -2090,7 +2256,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           if (children.size() < 2) {
             return std::vector<PlanAlternative>{};
           }
-          SetOperationKind operation;
+          SetOperationKind operation{};
           switch (logical.operation) {
             case c::LogicalOperator::kUnion:
               operation = SetOperationKind::kUnion;
@@ -2131,8 +2297,9 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               ascending = context.query->order_ascending_;
             }
             for (size_t i = 0; i < order_expressions.size(); ++i) {
-              order_keys.push_back(
-                  SortKey{order_expressions[i], ascending[i], std::nullopt});
+              order_keys.push_back(SortKey{.expression = order_expressions[i],
+                                           .ascending = ascending[i],
+                                           .nulls_first = std::nullopt});
             }
           }
           for (const BestPlan& child : children) {
@@ -2201,8 +2368,9 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               std::vector<TopNKey> keys;
               keys.reserve(sort->Keys().size());
               for (const SortKey& key : sort->Keys()) {
-                keys.push_back(
-                    TopNKey{key.expression, key.ascending, key.nulls_first});
+                keys.push_back(TopNKey{.expression = key.expression,
+                                       .ascending = key.ascending,
+                                       .nulls_first = key.nulls_first});
               }
               Plan topn = std::make_shared<TopNPlan>(
                   sort->Child(), std::move(keys), logical.limit_count,
@@ -2450,7 +2618,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           }
           Plan values = std::make_shared<ValuesPlan>(logical.output_schema,
                                                      logical.values);
-          const double rows = static_cast<double>(logical.values.size());
+          const auto rows = static_cast<double>(logical.values.size());
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(values),
                               .local_cost = rows,
@@ -2464,7 +2632,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
            const PhysicalProperties&, const c::RuleContext&) {
           Plan values = std::make_shared<ValuesPlan>(logical.output_schema,
                                                      logical.values);
-          const double rows = static_cast<double>(logical.values.size());
+          const auto rows = static_cast<double>(logical.values.size());
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(values),
                               .local_cost = rows,

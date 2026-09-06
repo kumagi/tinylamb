@@ -52,10 +52,12 @@ PrattParser::PrattParser(std::vector<Token>::const_iterator begin,
 int PrattParser::GetPrecedence() {
   const Token& token = Peek();
   if (token.type == TokenType::kKeyword) {
-    if (token.value == "OR") { return kPrecedenceOr;
-}
-    if (token.value == "AND") { return kPrecedenceAnd;
-}
+    if (token.value == "OR") {
+      return kPrecedenceOr;
+    }
+    if (token.value == "AND") {
+      return kPrecedenceAnd;
+    }
     if (token.value == "IN" || token.value == "IS") {
       return kPrecedenceComparison;
     }
@@ -78,32 +80,45 @@ int PrattParser::GetPrecedence() {
 
 namespace {
 BinaryOperation GetBinaryOperation(const std::string& op_str) {
-  if (op_str == "=") { return BinaryOperation::kEquals;
-}
-  if (op_str == "!=" || op_str == "<>") { return BinaryOperation::kNotEquals;
-}
-  if (op_str == "<") { return BinaryOperation::kLessThan;
-}
-  if (op_str == "<=") { return BinaryOperation::kLessThanEquals;
-}
-  if (op_str == ">") { return BinaryOperation::kGreaterThan;
-}
-  if (op_str == ">=") { return BinaryOperation::kGreaterThanEquals;
-}
-  if (op_str == "+") { return BinaryOperation::kAdd;
-}
-  if (op_str == "-") { return BinaryOperation::kSubtract;
-}
-  if (op_str == "*") { return BinaryOperation::kMultiply;
-}
-  if (op_str == "/") { return BinaryOperation::kDivide;
-}
-  if (op_str == "%") { return BinaryOperation::kModulo;
-}
-  if (op_str == "AND") { return BinaryOperation::kAnd;
-}
-  if (op_str == "OR") { return BinaryOperation::kOr;
-}
+  if (op_str == "=") {
+    return BinaryOperation::kEquals;
+  }
+  if (op_str == "!=" || op_str == "<>") {
+    return BinaryOperation::kNotEquals;
+  }
+  if (op_str == "<") {
+    return BinaryOperation::kLessThan;
+  }
+  if (op_str == "<=") {
+    return BinaryOperation::kLessThanEquals;
+  }
+  if (op_str == ">") {
+    return BinaryOperation::kGreaterThan;
+  }
+  if (op_str == ">=") {
+    return BinaryOperation::kGreaterThanEquals;
+  }
+  if (op_str == "+") {
+    return BinaryOperation::kAdd;
+  }
+  if (op_str == "-") {
+    return BinaryOperation::kSubtract;
+  }
+  if (op_str == "*") {
+    return BinaryOperation::kMultiply;
+  }
+  if (op_str == "/") {
+    return BinaryOperation::kDivide;
+  }
+  if (op_str == "%") {
+    return BinaryOperation::kModulo;
+  }
+  if (op_str == "AND") {
+    return BinaryOperation::kAnd;
+  }
+  if (op_str == "OR") {
+    return BinaryOperation::kOr;
+  }
   throw std::runtime_error("Unsupported binary operation: " + op_str);
 }
 
@@ -141,7 +156,10 @@ struct DepthGuard {
 };
 }  // namespace
 
-Expression PrattParser::ParseExpression(int precedence) {  // NOLINT(misc-no-recursion) // Pratt parsing is inherently recursive; depth bounded by kMaxExpressionDepth guard below.
+Expression PrattParser::ParseExpression(
+    int precedence) {  // NOLINT(misc-no-recursion) // Pratt parsing is
+                       // inherently recursive; depth bounded by
+                       // kMaxExpressionDepth guard below.
   if (depth_ >= kMaxExpressionDepth) {
     throw std::runtime_error("expression too deeply nested");
   }
@@ -183,7 +201,10 @@ Expression PrattParser::ParseExpression(int precedence) {  // NOLINT(misc-no-rec
   return left;
 }
 
-Expression PrattParser::ParseUnary() {  // NOLINT(misc-no-recursion) // Recursive descent via ParseExpression; bounded by kMaxExpressionDepth.
+Expression
+PrattParser::ParseUnary() {  // NOLINT(misc-no-recursion) // Recursive descent
+                             // via ParseExpression; bounded by
+                             // kMaxExpressionDepth.
   if (Peek().type == TokenType::kOperator && Peek().value == "-") {
     Advance();
     return UnaryExpressionExp(ParseExpression(kPrecedenceMultiplicative),
@@ -197,7 +218,10 @@ Expression PrattParser::ParseUnary() {  // NOLINT(misc-no-recursion) // Recursiv
   return ParsePrimary();
 }
 
-Expression PrattParser::ParsePrimary() {  // NOLINT(misc-no-recursion) // Recursive descent via ParseExpression; bounded by kMaxExpressionDepth.
+Expression
+PrattParser::ParsePrimary() {  // NOLINT(misc-no-recursion) // Recursive descent
+                               // via ParseExpression; bounded by
+                               // kMaxExpressionDepth.
   if (Peek().type == TokenType::kLParen) {
     Advance();
     Expression expr = ParseExpression(0);
@@ -252,24 +276,27 @@ Expression PrattParser::ParsePrimary() {  // NOLINT(misc-no-recursion) // Recurs
       }
       Expect(TokenType::kRParen);  // Consume ')'
       std::string upper_name = func_name;
-      std::ranges::transform(upper_name, upper_name.begin(),
-                             [](unsigned char c) {
-                               return static_cast<char>(std::toupper(c));
-                             });
+      std::ranges::transform(
+          upper_name, upper_name.begin(),
+          [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
       if (upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" ||
           upper_name == "MIN" || upper_name == "MAX") {
         if (args.size() != 1) {
           throw std::runtime_error("aggregate function requires one argument");
         }
         AggregationType type = AggregationType::kCount;
-        if (upper_name == "SUM") { type = AggregationType::kSum;
-}
-        if (upper_name == "AVG") { type = AggregationType::kAvg;
-}
-        if (upper_name == "MIN") { type = AggregationType::kMin;
-}
-        if (upper_name == "MAX") { type = AggregationType::kMax;
-}
+        if (upper_name == "SUM") {
+          type = AggregationType::kSum;
+        }
+        if (upper_name == "AVG") {
+          type = AggregationType::kAvg;
+        }
+        if (upper_name == "MIN") {
+          type = AggregationType::kMin;
+        }
+        if (upper_name == "MAX") {
+          type = AggregationType::kMax;
+        }
         return AggregateExpressionExp(type, args[0], distinct);
       }
       if (distinct) {
@@ -307,7 +334,7 @@ Expression PrattParser::ParsePrimary() {  // NOLINT(misc-no-recursion) // Recurs
 }
 
 const Token& PrattParser::Peek() {
-  static const Token kEof{.type=TokenType::kEof, .value=""};
+  static const Token kEof{.type = TokenType::kEof, .value = ""};
   if (current_pos_ >= end_pos_) {
     return kEof;
   }
@@ -316,7 +343,7 @@ const Token& PrattParser::Peek() {
 
 Token PrattParser::Advance() {
   if (current_pos_ >= end_pos_) {
-    return {.type=TokenType::kEof, .value=""};
+    return {.type = TokenType::kEof, .value = ""};
   }
   return *current_pos_++;
 }

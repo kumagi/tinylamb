@@ -97,7 +97,8 @@ ApplyPlan::ApplyPlan(Plan child, Plan inner_child,
       stats_(MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10)) {}
 
 void ApplyPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "ApplyPlan: [kind: " << static_cast<int>(kind_)
+  output << Indent(static_cast<size_t>(indent))
+         << "ApplyPlan: [kind: " << static_cast<int>(kind_)
          << ", alias: " << alias_ << "]";
   if (predicate_) {
     output << " ON " << predicate_->ToString();

@@ -115,9 +115,10 @@ class Value {
   Value(const Value& o);
   Value(Value&& o) noexcept;
 
-  template <typename I,
-            typename std::enable_if<std::is_integral<I>::value, int>::type = 0>
-  explicit Value(I val) : type(ValueType::kInt64) {
+  template <typename I>
+  explicit Value(I val)
+    requires(std::is_integral<I>::value)
+      : type(ValueType::kInt64) {
     value.int_value = static_cast<int64_t>(val);
   }
   Value& operator=(const Value& rhs);

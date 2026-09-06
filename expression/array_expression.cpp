@@ -2,15 +2,18 @@
 #include "expression/array_expression.hpp"
 
 #include <cctype>
+#include <cstddef>
 #include <ostream>
 #include <sstream>
-#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "expression/evaluation_context.hpp"
+#include "expression/expression.hpp"
 #include "type/column_name.hpp"
-#include "type/date.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"

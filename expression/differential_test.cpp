@@ -18,34 +18,34 @@
 // x {non-NULL, left NULL, right NULL, both NULL} plus exception cells
 // (division by zero, INT64_MIN/-1, int64 overflow, type mismatch).
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "expression/bytecode.hpp"
 // Pulls the production EvaluationContext adapter, which transitively provides
 // the concrete TransactionContext needed by the relational_detail driver
 // below while keeping this expression-directory TU free of database/
 // includes.
+#include <array>
+
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
-#include "expression/binary_expression.hpp"
-#include "expression/case_expression.hpp"
 #include "expression/expression.hpp"
-#include "expression/function_call_expression.hpp"
-#include "expression/in_expression.hpp"
-#include "expression/interval_expression.hpp"
 #include "expression/jit.hpp"
 #include "gtest/gtest.h"
 #include "query/evaluation_context_impl.hpp"
 #include "type/column_name.hpp"
-#include "type/date.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -62,7 +62,7 @@ Value TextValue(std::string_view text) { return Value(std::string(text)); }
 DataChunk MakeSingleRowChunk(const Schema& schema, const Row& row) {
   Row padded(row);
   while (padded.values_.size() < schema.ColumnCount()) {
-    padded.values_.push_back(Value());
+    padded.values_.emplace_back();
   }
   DataChunk chunk(schema);
   chunk.Append(padded);
@@ -142,7 +142,8 @@ Attempt EvaluateBytecode(const std::optional<BytecodeProgram>& program,
 Attempt EvaluateDetailPath(const Expression& expression, const Row& row,
                            const Schema& schema) {
   TransactionContext context(Transaction{}, nullptr);
-  const relational_detail::Scope scope{&row, &schema, nullptr};
+  const relational_detail::Scope scope{
+      .row = &row, .schema = &schema, .outer = nullptr};
   const relational_detail::CteMap ctes;
   try {
     return Evaluated(
@@ -195,7 +196,7 @@ class DifferentialTally {
     for (const auto& path : paths) {
       if (path.second.kind == Attempt::Kind::kUnsupported) {
         std::cout << "[differential][skip] " << cell << " path=" << path.first
-                  << ": " << path.second.note << std::endl;
+                  << ": " << path.second.note << '\n';
         continue;
       }
       available.emplace_back(&path.first, &path.second);
@@ -217,7 +218,7 @@ class DifferentialTally {
 
   void Summarize(const std::string& suite) const {
     std::cout << "[differential] " << suite << ": " << compared_
-              << " cells compared, " << skipped_ << " path-skips" << std::endl;
+              << " cells compared, " << skipped_ << " path-skips" << '\n';
   }
 
  private:
@@ -847,18 +848,21 @@ TEST(DifferentialTest,
     if (!jit.has_value()) {
       std::cout << "[differential][skip] jit-filter/" << op_name
                 << ": kernel unavailable (LLVM disabled or op unsupported)"
-                << std::endl;
+                << '\n';
       continue;
     }
     const Expression expr = BinaryExpressionExp(
         ColumnValueExp("i"), op, ConstantValueExp(Value(kConstant)));
     auto program = BytecodeCompiler::Compile(expr, filter_schema);
-    ASSERT_TRUE(program.has_value()) << op_name;
+    if (!program.has_value()) {
+      FAIL() << "compilation unexpectedly failed: " << op_name;
+      return;
+    }
     for (const std::optional<int64_t>& sample : samples) {
       if (!sample.has_value()) {
         std::cout << "[differential][skip] jit-filter/" << op_name
                   << ": NULL input excluded by the JIT no-NULL contract"
-                  << std::endl;
+                  << '\n';
         continue;
       }
       const Row row({Value(*sample)});
@@ -889,7 +893,10 @@ TEST(DifferentialTest,
                           ConstantValueExp(Value(kMultiplier))),
       BinaryOperation::kAdd, ConstantValueExp(Value(kAddend)));
   auto program = BytecodeCompiler::Compile(expr, projection_schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+    FAIL() << "compilation unexpectedly failed";
+    return;
+  }
   for (const int64_t sample :
        {int64_t{0}, int64_t{1}, int64_t{-3}, int64_t{9999999}}) {
     const Row row({Value(sample)});
@@ -982,12 +989,12 @@ TEST(DifferentialTest, EvaluateDetailPath_ThreeValuedLogic_MatchesCanonical) {
       ColumnValueExp("i"), BinaryOperation::kOr, ColumnValueExp("j"));
   const Expression negation =
       UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kNot);
-  for (size_t r = 0; r < rows.size(); ++r) {
-    const std::string input = DescribeRow(schema, rows[r]);
+  for (const auto& row : rows) {
+    const std::string input = DescribeRow(schema, row);
     for (const auto& [name, expr] :
          {std::pair{"and", conjunction}, {"or", disjunction}}) {
-      const Attempt ast = EvaluateAst(expr, rows[r], schema);
-      const Attempt detail = EvaluateDetailPath(expr, rows[r], schema);
+      const Attempt ast = EvaluateAst(expr, row, schema);
+      const Attempt detail = EvaluateDetailPath(expr, row, schema);
       EXPECT_EQ(detail.kind, ast.kind)
           << "[differential][MISMATCH] " << name << " [" << input << "]";
       if (detail.kind == ast.kind && ast.kind == Attempt::Kind::kValue) {
@@ -997,8 +1004,8 @@ TEST(DifferentialTest, EvaluateDetailPath_ThreeValuedLogic_MatchesCanonical) {
             << " detail=" << Describe(detail);
       }
     }
-    const Attempt ast_not = EvaluateAst(negation, rows[r], schema);
-    const Attempt detail_not = EvaluateDetailPath(negation, rows[r], schema);
+    const Attempt ast_not = EvaluateAst(negation, row, schema);
+    const Attempt detail_not = EvaluateDetailPath(negation, row, schema);
     EXPECT_EQ(detail_not.kind, ast_not.kind)
         << "[differential][MISMATCH] not [" << input << "]";
     if (detail_not.kind == ast_not.kind &&
@@ -1059,15 +1066,16 @@ TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
     GTEST_SKIP() << "checked JIT sum kernel unavailable (LLVM disabled)";
   }
   {
-    const int64_t inputs[] = {std::numeric_limits<int64_t>::max(), int64_t{1}};
+    const std::array<int64_t, 2> inputs{std::numeric_limits<int64_t>::max(),
+                                        int64_t{1}};
     bool overflowed = false;
-    (void)sum->SumChecked(inputs, 2, &overflowed);
+    (void)sum->SumChecked(inputs.data(), inputs.size(), &overflowed);
     EXPECT_TRUE(overflowed);
   }
   {
-    const int64_t inputs[] = {int64_t{1}, int64_t{2}};
+    const std::array<int64_t, 2> inputs{int64_t{1}, int64_t{2}};
     bool overflowed = true;
-    (void)sum->SumChecked(inputs, 2, &overflowed);
+    (void)sum->SumChecked(inputs.data(), inputs.size(), &overflowed);
     EXPECT_FALSE(overflowed);
   }
   const auto proj = JitInt64Kernels::CompileProjectionChecked();

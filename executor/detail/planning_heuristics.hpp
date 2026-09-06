@@ -30,8 +30,8 @@ struct PredicateInfo {
 };
 
 struct EqualityKey {
-  size_t left;
-  size_t right;
+  size_t left{};
+  size_t right{};
   bool null_safe{false};
 };
 

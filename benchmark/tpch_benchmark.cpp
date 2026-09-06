@@ -1,6 +1,9 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include <stdlib.h>  // NOLINT(modernize-deprecated-headers) // POSIX setenv/unsetenv below are only provided by this header.
+// clang-format off
+// NOLINTNEXTLINE(modernize-deprecated-headers) // POSIX setenv/unsetenv live here.
+#include <stdlib.h>
+// clang-format on
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -33,8 +36,8 @@
 #include <vector>
 
 #include "benchmark/tpch_queries.hpp"
-#include "common/status_or.hpp"
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "executor/executor_base.hpp"
 #include "query/sql_engine.hpp"
@@ -71,72 +74,77 @@ struct TableSpec {
 
 const std::array<TableSpec, 8>& Tables() {
   static const std::array<TableSpec, 8> tables = {{
-      {.name="region",
-       .ddl="CREATE TABLE region (r_regionkey INT64, r_name STRING, r_comment "
-       "STRING);",
-       .fields={FieldKind::kInteger, FieldKind::kString, FieldKind::kString},
-       .sf1_rows=5,
-       .fixed_size=true},
-      {.name="nation",
-       .ddl="CREATE TABLE nation (n_nationkey INT64, n_name STRING, n_regionkey "
-       "INT64, n_comment STRING);",
-       .fields={FieldKind::kInteger, FieldKind::kString, FieldKind::kInteger,
-        FieldKind::kString},
-       .sf1_rows=25,
-       .fixed_size=true},
-      {.name="supplier",
-       .ddl="CREATE TABLE supplier (s_suppkey INT64, s_name STRING, s_address "
-       "STRING, s_nationkey INT64, s_phone STRING, s_acctbal NUMERIC, "
-       "s_comment STRING);",
-       .fields={FieldKind::kInteger, FieldKind::kString, FieldKind::kString,
-        FieldKind::kInteger, FieldKind::kString, FieldKind::kNumeric,
-        FieldKind::kString},
-       .sf1_rows=10000},
-      {.name="customer",
-       .ddl="CREATE TABLE customer (c_custkey INT64, c_name STRING, c_address "
-       "STRING, c_nationkey INT64, c_phone STRING, c_acctbal NUMERIC, "
-       "c_mktsegment STRING, c_comment STRING);",
-       .fields={FieldKind::kInteger, FieldKind::kString, FieldKind::kString,
-        FieldKind::kInteger, FieldKind::kString, FieldKind::kNumeric,
-        FieldKind::kString, FieldKind::kString},
-       .sf1_rows=150000},
-      {.name="part",
-       .ddl="CREATE TABLE part (p_partkey INT64, p_name STRING, p_mfgr STRING, "
-       "p_brand STRING, p_type STRING, p_size INT64, p_container STRING, "
-       "p_retailprice NUMERIC, p_comment STRING);",
-       .fields={FieldKind::kInteger, FieldKind::kString, FieldKind::kString,
-        FieldKind::kString, FieldKind::kString, FieldKind::kInteger,
-        FieldKind::kString, FieldKind::kNumeric, FieldKind::kString},
-       .sf1_rows=200000},
-      {.name="partsupp",
-       .ddl="CREATE TABLE partsupp (ps_partkey INT64, ps_suppkey INT64, "
-       "ps_availqty INT64, ps_supplycost NUMERIC, ps_comment STRING);",
-       .fields={FieldKind::kInteger, FieldKind::kInteger, FieldKind::kInteger,
-        FieldKind::kNumeric, FieldKind::kString},
-       .sf1_rows=800000},
-      {.name="orders",
-       .ddl="CREATE TABLE orders (o_orderkey INT64, o_custkey INT64, "
-       "o_orderstatus STRING, o_totalprice NUMERIC, o_orderdate DATE, "
-       "o_orderpriority STRING, o_clerk STRING, o_shippriority INT64, "
-       "o_comment STRING);",
-       .fields={FieldKind::kInteger, FieldKind::kInteger, FieldKind::kString,
-        FieldKind::kNumeric, FieldKind::kDate, FieldKind::kString,
-        FieldKind::kString, FieldKind::kInteger, FieldKind::kString},
-       .sf1_rows=1500000},
-      {.name="lineitem",
-       .ddl="CREATE TABLE lineitem (l_orderkey INT64, l_partkey INT64, "
-       "l_suppkey INT64, l_linenumber INT64, l_quantity NUMERIC, "
-       "l_extendedprice NUMERIC, l_discount NUMERIC, l_tax NUMERIC, "
-       "l_returnflag STRING, l_linestatus STRING, l_shipdate DATE, "
-       "l_commitdate DATE, l_receiptdate DATE, l_shipinstruct STRING, "
-       "l_shipmode STRING, l_comment STRING);",
-       .fields={FieldKind::kInteger, FieldKind::kInteger, FieldKind::kInteger,
-        FieldKind::kInteger, FieldKind::kNumeric, FieldKind::kNumeric,
-        FieldKind::kNumeric, FieldKind::kNumeric, FieldKind::kString,
-        FieldKind::kString, FieldKind::kDate, FieldKind::kDate,
-        FieldKind::kDate, FieldKind::kString, FieldKind::kString,
-        FieldKind::kString},
-       .sf1_rows=6001215},
+      {.name = "region",
+       .ddl =
+           "CREATE TABLE region (r_regionkey INT64, r_name STRING, r_comment "
+           "STRING);",
+       .fields = {FieldKind::kInteger, FieldKind::kString, FieldKind::kString},
+       .sf1_rows = 5,
+       .fixed_size = true},
+      {.name = "nation",
+       .ddl =
+           "CREATE TABLE nation (n_nationkey INT64, n_name STRING, n_regionkey "
+           "INT64, n_comment STRING);",
+       .fields = {FieldKind::kInteger, FieldKind::kString, FieldKind::kInteger,
+                  FieldKind::kString},
+       .sf1_rows = 25,
+       .fixed_size = true},
+      {.name = "supplier",
+       .ddl =
+           "CREATE TABLE supplier (s_suppkey INT64, s_name STRING, s_address "
+           "STRING, s_nationkey INT64, s_phone STRING, s_acctbal NUMERIC, "
+           "s_comment STRING);",
+       .fields = {FieldKind::kInteger, FieldKind::kString, FieldKind::kString,
+                  FieldKind::kInteger, FieldKind::kString, FieldKind::kNumeric,
+                  FieldKind::kString},
+       .sf1_rows = 10000},
+      {.name = "customer",
+       .ddl =
+           "CREATE TABLE customer (c_custkey INT64, c_name STRING, c_address "
+           "STRING, c_nationkey INT64, c_phone STRING, c_acctbal NUMERIC, "
+           "c_mktsegment STRING, c_comment STRING);",
+       .fields = {FieldKind::kInteger, FieldKind::kString, FieldKind::kString,
+                  FieldKind::kInteger, FieldKind::kString, FieldKind::kNumeric,
+                  FieldKind::kString, FieldKind::kString},
+       .sf1_rows = 150000},
+      {.name = "part",
+       .ddl =
+           "CREATE TABLE part (p_partkey INT64, p_name STRING, p_mfgr STRING, "
+           "p_brand STRING, p_type STRING, p_size INT64, p_container STRING, "
+           "p_retailprice NUMERIC, p_comment STRING);",
+       .fields = {FieldKind::kInteger, FieldKind::kString, FieldKind::kString,
+                  FieldKind::kString, FieldKind::kString, FieldKind::kInteger,
+                  FieldKind::kString, FieldKind::kNumeric, FieldKind::kString},
+       .sf1_rows = 200000},
+      {.name = "partsupp",
+       .ddl = "CREATE TABLE partsupp (ps_partkey INT64, ps_suppkey INT64, "
+              "ps_availqty INT64, ps_supplycost NUMERIC, ps_comment STRING);",
+       .fields = {FieldKind::kInteger, FieldKind::kInteger, FieldKind::kInteger,
+                  FieldKind::kNumeric, FieldKind::kString},
+       .sf1_rows = 800000},
+      {.name = "orders",
+       .ddl = "CREATE TABLE orders (o_orderkey INT64, o_custkey INT64, "
+              "o_orderstatus STRING, o_totalprice NUMERIC, o_orderdate DATE, "
+              "o_orderpriority STRING, o_clerk STRING, o_shippriority INT64, "
+              "o_comment STRING);",
+       .fields = {FieldKind::kInteger, FieldKind::kInteger, FieldKind::kString,
+                  FieldKind::kNumeric, FieldKind::kDate, FieldKind::kString,
+                  FieldKind::kString, FieldKind::kInteger, FieldKind::kString},
+       .sf1_rows = 1500000},
+      {.name = "lineitem",
+       .ddl = "CREATE TABLE lineitem (l_orderkey INT64, l_partkey INT64, "
+              "l_suppkey INT64, l_linenumber INT64, l_quantity NUMERIC, "
+              "l_extendedprice NUMERIC, l_discount NUMERIC, l_tax NUMERIC, "
+              "l_returnflag STRING, l_linestatus STRING, l_shipdate DATE, "
+              "l_commitdate DATE, l_receiptdate DATE, l_shipinstruct STRING, "
+              "l_shipmode STRING, l_comment STRING);",
+       .fields = {FieldKind::kInteger, FieldKind::kInteger, FieldKind::kInteger,
+                  FieldKind::kInteger, FieldKind::kNumeric, FieldKind::kNumeric,
+                  FieldKind::kNumeric, FieldKind::kNumeric, FieldKind::kString,
+                  FieldKind::kString, FieldKind::kDate, FieldKind::kDate,
+                  FieldKind::kDate, FieldKind::kString, FieldKind::kString,
+                  FieldKind::kString},
+       .sf1_rows = 6001215},
   }};
   return tables;
 }
@@ -189,8 +197,9 @@ bool ParseDouble(std::string_view text, double* destination) {
 }
 
 bool ParseOptions(int argc, char** argv, Options* options) {
-  if (argc < 2) { return false;
-}
+  if (argc < 2) {
+    return false;
+  }
   options->database_path = argv[1];
   for (int i = 2; i < argc; ++i) {
     const std::string_view argument(argv[i]);
@@ -210,8 +219,9 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->load_only = true;
       continue;
     }
-    if (argument == "--help" || i + 1 >= argc) { return false;
-}
+    if (argument == "--help" || i + 1 >= argc) {
+      return false;
+    }
     const std::string_view value(argv[++i]);
     bool parsed = true;
     if (argument == "--scale-factor" || argument == "--sf") {
@@ -229,13 +239,15 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     } else if (argument == "--query") {
       size_t query = 0;
       parsed = ParseInteger(value, &query);
-      if (parsed) { options->query = query;
-}
+      if (parsed) {
+        options->query = query;
+      }
     } else {
       parsed = false;
     }
-    if (!parsed) { return false;
-}
+    if (!parsed) {
+      return false;
+    }
   }
   if (options->data_dir.empty()) {
     options->data_dir = options->database_path.string() + ".tpch-data";
@@ -263,32 +275,39 @@ fs::path ManifestPath(const Options& options) {
 bool ReadManifestRowCounts(const Options& options,
                            std::vector<uint64_t>* row_counts) {
   std::ifstream manifest(ManifestPath(options));
-  if (!manifest) { return false;
-}
+  if (!manifest) {
+    return false;
+  }
   std::string key;
   double scale = 0;
-  if (!(manifest >> key >> scale) || key != "scale_factor") { return false;
-}
-  if (std::abs(scale - options.scale_factor) > 1e-12) { return false;
-}
+  if (!(manifest >> key >> scale) || key != "scale_factor") {
+    return false;
+  }
+  if (std::abs(scale - options.scale_factor) > 1e-12) {
+    return false;
+  }
   std::unordered_map<std::string, uint64_t> counts;
   while (manifest >> key) {
-    if (key != "rows") { continue;
-}
+    if (key != "rows") {
+      continue;
+    }
     std::string table;
     uint64_t rows = 0;
-    if (!(manifest >> table >> rows)) { return false;
-}
+    if (!(manifest >> table >> rows)) {
+      return false;
+    }
     counts.emplace(table, rows);
   }
-  if (counts.size() != Tables().size()) { return false;
-}
+  if (counts.size() != Tables().size()) {
+    return false;
+  }
   row_counts->clear();
   row_counts->reserve(Tables().size());
   for (const TableSpec& table : Tables()) {
     const auto found = counts.find(std::string(table.name));
-    if (found == counts.end()) { return false;
-}
+    if (found == counts.end()) {
+      return false;
+    }
     row_counts->push_back(found->second);
   }
   return true;
@@ -310,10 +329,12 @@ bool ExistingDataMatches(const Options& options) {
   std::ifstream manifest(ManifestPath(options));
   std::string key;
   double scale = 0;
-  if (!(manifest >> key >> scale) || key != "scale_factor") { return false;
-}
-  if (std::abs(scale - options.scale_factor) > 1e-12) { return false;
-}
+  if (!(manifest >> key >> scale) || key != "scale_factor") {
+    return false;
+  }
+  if (std::abs(scale - options.scale_factor) > 1e-12) {
+    return false;
+  }
   return std::ranges::all_of(Tables(), [&](const TableSpec& table) {
     return fs::is_regular_file(TablePath(options, table.name));
   });
@@ -392,12 +413,14 @@ bool GenerateData(const Options& options, std::string* error) {
 
 uint64_t CountLines(const fs::path& path) {
   std::ifstream input(path);
-  if (!input) { throw std::runtime_error("cannot read " + path.string());
-}
+  if (!input) {
+    throw std::runtime_error("cannot read " + path.string());
+  }
   uint64_t rows = 0;
   std::string line;
-  while (std::getline(input, line)) { ++rows;
-}
+  while (std::getline(input, line)) {
+    ++rows;
+  }
   return rows;
 }
 
@@ -416,8 +439,9 @@ bool ValidateGeneratedData(const Options& options,
     const uint64_t rows = CountLines(TablePath(options, table.name));
     row_counts->push_back(rows);
     std::cout << "generated_rows." << table.name << '=' << rows << '\n';
-    if (table.name == "orders") { order_rows = rows;
-}
+    if (table.name == "orders") {
+      order_rows = rows;
+    }
     if (table.name == "lineitem") {
       if (options.scale_factor == 1.0 && rows != table.sf1_rows) {
         *error = "lineitem cardinality does not match DBGEN SF1";
@@ -598,9 +622,11 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
 }
 
 size_t ResolveLoadWorkers(const Options& options) {
-  if (options.load_workers > 0) { return options.load_workers;
-}
-  const size_t hardware = std::max<size_t>(1, std::thread::hardware_concurrency());
+  if (options.load_workers > 0) {
+    return options.load_workers;
+  }
+  const size_t hardware =
+      std::max<size_t>(1, std::thread::hardware_concurrency());
   return std::min(Tables().size(), hardware);
 }
 
@@ -620,16 +646,18 @@ bool LoadAllTables(tinylamb::Database& database, const Options& options,
   auto worker = [&]() {
     while (!failed.load(std::memory_order_relaxed)) {
       const size_t index = next_table.fetch_add(1, std::memory_order_relaxed);
-      if (index >= Tables().size()) { return;
-}
+      if (index >= Tables().size()) {
+        return;
+      }
       const Clock::time_point begin = Clock::now();
       std::string local_error;
       if (!LoadTable(database, options, Tables()[index], row_counts[index],
                      &local_error, &output_mutex)) {
         failed.store(true, std::memory_order_relaxed);
         std::scoped_lock lock(error_mutex);
-        if (first_error.empty()) { first_error = std::move(local_error);
-}
+        if (first_error.empty()) {
+          first_error = std::move(local_error);
+        }
         return;
       }
       seconds[index] =
@@ -642,8 +670,9 @@ bool LoadAllTables(tinylamb::Database& database, const Options& options,
   for (size_t i = 0; i < workers; ++i) {
     threads.emplace_back(worker);
   }
-  for (std::thread& thread : threads) { thread.join();
-}
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
 
   if (failed.load(std::memory_order_relaxed)) {
     *error = first_error.empty() ? "parallel load failed" : first_error;
@@ -682,8 +711,7 @@ bool AnalyzeAllTables(tinylamb::Database& database, std::string* error) {
   tinylamb::StatusOr<tinylamb::QueryResult> result =
       engine.Execute(context, "ANALYZE;");
   if (!result.HasValue()) {
-    *error = engine.LastError().empty() ? "ANALYZE failed"
-                                        : engine.LastError();
+    *error = engine.LastError().empty() ? "ANALYZE failed" : engine.LastError();
     context.Abort();
     return false;
   }
@@ -730,7 +758,10 @@ bool RunQuery(tinylamb::Database& database, size_t query, double scale_factor,
     *error = "Q" + std::to_string(query) + ": read transaction failed";
     return false;
   }
-  *profile = {.query=query, .rows=rows, .milliseconds=milliseconds, .plan=plan.str()};
+  *profile = {.query = query,
+              .rows = rows,
+              .milliseconds = milliseconds,
+              .plan = plan.str()};
   std::cout << "TPCH_PROFILE Q" << query << ' ' << milliseconds
             << " ms rows=" << rows << ' ' << profile->plan << '\n';
   return true;
@@ -799,8 +830,9 @@ int main(int argc, char** argv) {
       << "generation_seconds="
       << std::chrono::duration<double>(Clock::now() - generation_begin).count()
       << '\n';
-  if (options.generate_only) { return 0;
-}
+  if (options.generate_only) {
+    return 0;
+  }
 
   const bool database_exists = DatabaseFilesExist(options.database_path);
   if (options.reuse_database && !database_exists) {
@@ -838,8 +870,9 @@ int main(int argc, char** argv) {
                                        : "load_seconds.total=")
             << std::chrono::duration<double>(Clock::now() - load_begin).count()
             << '\n';
-  if (options.load_only) { return 0;
-}
+  if (options.load_only) {
+    return 0;
+  }
 
   // Always refresh statistics before measurement so EXPLAIN/costing and
   // Hybrid vs in-memory join choice see real cardinalities (including
@@ -849,10 +882,10 @@ int main(int argc, char** argv) {
     std::cerr << "ANALYZE failed: " << error << '\n';
     return 1;
   }
-  std::cout << "analyze_seconds="
-            << std::chrono::duration<double>(Clock::now() - analyze_begin)
-                   .count()
-            << '\n';
+  std::cout
+      << "analyze_seconds="
+      << std::chrono::duration<double>(Clock::now() - analyze_begin).count()
+      << '\n';
 
   std::vector<QueryProfile> profiles;
   const size_t first_query = options.query.value_or(1);

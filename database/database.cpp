@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <ostream>
@@ -37,6 +38,7 @@
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/serdes.hpp"
 #include "common/status_or.hpp"
 #include "database/page_storage.hpp"
 #include "index/b_plus_tree_iterator.hpp"
@@ -133,7 +135,10 @@ uint64_t PeekUint64(std::string_view payload) {
     return 0;
   }
   uint64_t value = 0;
-  DeserializeU64(&payload[0], &value);
+  // Deserializes exactly sizeof(uint64_t) bytes; the size guard above proves
+  // the buffer is large enough.
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
+  DeserializeU64(payload.data(), &value);
   return value;
 }
 

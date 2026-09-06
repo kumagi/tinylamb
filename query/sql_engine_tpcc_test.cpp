@@ -31,12 +31,14 @@ class SqlEngineTpccTest : public ::testing::Test {
     StatusOr<Executor> result = engine.Prepare(context, sql);
     EXPECT_EQ(result.GetStatus(), Status::kSuccess) << sql << "\n"
                                                     << engine.LastError();
-    if (!result.HasValue()) { return {};
-}
+    if (!result.HasValue()) {
+      return {};
+    }
     std::vector<Row> rows;
     Row row;
-    while (result.Value()->Next(&row, nullptr)) { rows.push_back(row);
-}
+    while (result.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
     return rows;
   }
 

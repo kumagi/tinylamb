@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -51,8 +50,10 @@ NumaArenaPartition& NumaArenaPartition::operator=(
 
 void NumaArenaPartition::AddBlock(size_t min_size) {
   const size_t sz = std::max(default_block_size_, min_size);
+  // Runtime-sized buffer; Block::data owns unique_ptr<uint8_t[]> by design.
   blocks_.push_back(Block{
-      .data = std::make_unique<uint8_t[]>(sz),
+      .data =
+          std::make_unique<uint8_t[]>(sz),  // NOLINT(modernize-avoid-c-arrays)
       .size = sz,
   });
   capacity_ += sz;

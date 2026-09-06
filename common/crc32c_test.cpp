@@ -16,6 +16,8 @@
 
 #include "common/crc32c.hpp"
 
+#include <cstdint>
+
 #include "gtest/gtest.h"
 
 namespace tinylamb {

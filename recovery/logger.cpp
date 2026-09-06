@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 
@@ -75,11 +76,24 @@ Logger::Logger(const std::filesystem::path& logfile, size_t buffer_size,
   // All state must be consistent before the worker starts; otherwise the
   // worker may observe flushed_lsn_ == 0 and append zeros over an existing
   // WAL.
-  const lsn_t file_size = std::filesystem::file_size(logfile);
-  flushed_lsn_.store(file_size, std::memory_order_relaxed);
-  durable_lsn_.store(file_size, std::memory_order_release);
-  buffered_lsn_.store(file_size, std::memory_order_release);
-  worker_ = std::thread(&Logger::LoggerWork, this);
+  try {
+    const lsn_t file_size = std::filesystem::file_size(logfile);
+    flushed_lsn_.store(file_size, std::memory_order_relaxed);
+    durable_lsn_.store(file_size, std::memory_order_release);
+    buffered_lsn_.store(file_size, std::memory_order_release);
+  } catch (...) {
+    // The constructor must not leak dst_ when stat fails (no destructor runs).
+    close(dst_);
+    throw;
+  }
+  try {
+    worker_ = std::thread(&Logger::LoggerWork, this);
+  } catch (...) {
+    // Thread creation can throw (EAGAIN/ENOMEM); no destructor runs on a
+    // failed constructor, so the WAL descriptor must be closed here too.
+    close(dst_);
+    throw;
+  }
 }
 
 Logger::~Logger() {
@@ -141,7 +155,7 @@ void Logger::WaitForDurable(lsn_t lsn) {
   RaiseIfFailed();
 }
 
-void Logger::AdviseOldBytesDurable(lsn_t before) {
+void Logger::AdviseOldBytesDurable(lsn_t before) const {
   if (before == 0 || dst_ < 0) {
     return;
   }
@@ -297,7 +311,8 @@ void Logger::LoggerWork() {
         SetFailed(EIO);
         return;
       }
-      flushed_lsn_.store(flushed + flushed_size, std::memory_order_release);
+      flushed_lsn_.store(flushed + static_cast<size_t>(flushed_size),
+                         std::memory_order_release);
       dirty = true;
       NotifyWorker();
     }

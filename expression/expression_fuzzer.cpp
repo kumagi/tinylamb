@@ -15,10 +15,10 @@
  */
 
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -75,13 +75,9 @@ struct FuzzStream {
     return d;
   }
 
-  bool NextBool() {
-    return (NextU8() % 2) != 0;
-  }
+  bool NextBool() { return (NextU8() % 2) != 0; }
 
-  bool Exhausted() const {
-    return offset >= size;
-  }
+  bool Exhausted() const { return offset >= size; }
 };
 
 Value GenerateValue(FuzzStream& stream) {
@@ -139,16 +135,25 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
     case 2: {
       // Binary expression
       static const BinaryOperation ops[] = {
-          BinaryOperation::kAdd,        BinaryOperation::kSubtract,
-          BinaryOperation::kMultiply,   BinaryOperation::kDivide,
-          BinaryOperation::kModulo,     BinaryOperation::kEquals,
-          BinaryOperation::kNotEquals,  BinaryOperation::kLessThan,
-          BinaryOperation::kLessThanEquals, BinaryOperation::kGreaterThan,
-          BinaryOperation::kGreaterThanEquals, BinaryOperation::kAnd,
-          BinaryOperation::kOr,         BinaryOperation::kXor,
-          BinaryOperation::kLike,       BinaryOperation::kNotLike,
+          BinaryOperation::kAdd,
+          BinaryOperation::kSubtract,
+          BinaryOperation::kMultiply,
+          BinaryOperation::kDivide,
+          BinaryOperation::kModulo,
+          BinaryOperation::kEquals,
+          BinaryOperation::kNotEquals,
+          BinaryOperation::kLessThan,
+          BinaryOperation::kLessThanEquals,
+          BinaryOperation::kGreaterThan,
+          BinaryOperation::kGreaterThanEquals,
+          BinaryOperation::kAnd,
+          BinaryOperation::kOr,
+          BinaryOperation::kXor,
+          BinaryOperation::kLike,
+          BinaryOperation::kNotLike,
       };
-      BinaryOperation op = ops[stream.NextU8() % (sizeof(ops) / sizeof(ops[0]))];
+      BinaryOperation op =
+          ops[stream.NextU8() % (sizeof(ops) / sizeof(ops[0]))];
       Expression left = GenerateExpression(stream, depth - 1);
       Expression right = GenerateExpression(stream, depth - 1);
       return BinaryExpressionExp(std::move(left), op, std::move(right));
@@ -156,12 +161,13 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
     case 3: {
       // Unary expression
       static const UnaryOperation un_ops[] = {
-          UnaryOperation::kMinus,      UnaryOperation::kNot,
-          UnaryOperation::kIsNull,     UnaryOperation::kIsNotNull,
-          UnaryOperation::kIsTrue,     UnaryOperation::kIsNotTrue,
-          UnaryOperation::kIsFalse,    UnaryOperation::kIsNotFalse,
+          UnaryOperation::kMinus,   UnaryOperation::kNot,
+          UnaryOperation::kIsNull,  UnaryOperation::kIsNotNull,
+          UnaryOperation::kIsTrue,  UnaryOperation::kIsNotTrue,
+          UnaryOperation::kIsFalse, UnaryOperation::kIsNotFalse,
       };
-      UnaryOperation op = un_ops[stream.NextU8() % (sizeof(un_ops) / sizeof(un_ops[0]))];
+      UnaryOperation op =
+          un_ops[stream.NextU8() % (sizeof(un_ops) / sizeof(un_ops[0]))];
       Expression child = GenerateExpression(stream, depth - 1);
       return UnaryExpressionExp(std::move(child), op);
     }
@@ -220,10 +226,10 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
   FuzzStream stream{data, size};
 
   Schema schema("fuzz_schema", {
-      Column("col_i", ValueType::kInt64),
-      Column("col_d", ValueType::kDouble),
-      Column("col_s", ValueType::kVarChar),
-  });
+                                   Column("col_i", ValueType::kInt64),
+                                   Column("col_d", ValueType::kDouble),
+                                   Column("col_s", ValueType::kVarChar),
+                               });
 
   Row row({
       GenerateValue(stream),
@@ -271,7 +277,8 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
     TransactionContext context(Transaction{}, nullptr);
     const relational_detail::Scope scope{&row, &schema, nullptr};
     const relational_detail::CteMap ctes;
-    detail_result = relational_detail::Evaluate(exp, scope, nullptr, context, ctes);
+    detail_result =
+        relational_detail::Evaluate(exp, scope, nullptr, context, ctes);
   } catch (...) {
     detail_threw = true;
   }

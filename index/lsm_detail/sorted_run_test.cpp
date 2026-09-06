@@ -289,12 +289,14 @@ TEST_F(SortedRunTest, InlineValueRoundTripsThroughFind) {
   std::map<std::string, LSMValue> input;
   for (int len = 1; len <= 8; ++len) {
     input.emplace("k" + std::to_string(len),
-                  LSMValue(std::string(len, static_cast<char>('a' + len - 1))));
+                  LSMValue(std::string(static_cast<size_t>(len),
+                                       static_cast<char>('a' + len - 1))));
   }
   SortedRun::Construct(index_file, input, *blob, 1);
   const SortedRun run(index_file);
   for (int len = 1; len <= 8; ++len) {
-    const std::string expected(len, static_cast<char>('a' + len - 1));
+    const std::string expected(static_cast<size_t>(len),
+                               static_cast<char>('a' + len - 1));
     ASSERT_SUCCESS_AND_EQ(run.Find("k" + std::to_string(len), *blob), expected);
   }
   std::ignore = std::filesystem::remove(data_file);

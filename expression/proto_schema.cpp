@@ -4,8 +4,14 @@
 #include "expression/proto_schema.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <map>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace tinylamb {
 namespace {

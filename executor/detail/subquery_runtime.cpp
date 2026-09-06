@@ -2,9 +2,11 @@
 #include "executor/detail/subquery_runtime.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -1110,12 +1112,11 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
         return true;
       }
     }
-    for (const std::shared_ptr<SelectStatement>& query : current.UnionAll()) {
-      if (query && self(*query, self)) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(
+        current.UnionAll(),
+        [&self](const std::shared_ptr<SelectStatement>& query) {
+          return query && self(*query, self);
+        });
   };
   return statement_contains_volatile(statement, statement_contains_volatile);
 }
@@ -1369,7 +1370,7 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
       context.execution_runtime()->uncorrelated_results.emplace(
           &statement, std::make_shared<Relation>(std::move(result)));
   context.execution_runtime()->uncorrelated_results_by_fingerprint.emplace(
-      std::move(structural_key), iter->second);
+      structural_key, iter->second);
   return iter->second.get();
 }
 

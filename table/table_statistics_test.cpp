@@ -330,7 +330,7 @@ TEST_F(TableStatisticsTest,
 
   TableStatistics transformed =
       statistics.TransformBy(0, Value(int64_t{10}), Value(int64_t{19}));
-  EXPECT_NEAR(transformed.Rows(), 10, 2.0);
+  EXPECT_NEAR(static_cast<double>(transformed.Rows()), 10, 2.0);
 }
 
 TEST_F(TableStatisticsTest,

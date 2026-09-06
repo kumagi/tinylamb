@@ -1,14 +1,20 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "merge_append.hpp"
 
+#include <cstddef>
 #include <ostream>
 #include <stdexcept>
-#include <string>
+#include <utility>
 
 #include "common/constants.hpp"
+#include "executor/executor_base.hpp"
+#include "executor/sort.hpp"
 #include "expression/column_value.hpp"
+#include "page/row_position.hpp"
 #include "type/column_name.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -51,7 +57,7 @@ Value MergeAppendExecutor::KeyValue(const Head& head,
                 key.expression->AsColumnValue().GetColumnName())
           : -1;
   if (output_offset >= 0 &&
-      static_cast<size_t>(output_offset) < output_schema_.ColumnCount()) {
+      std::cmp_less(output_offset, output_schema_.ColumnCount())) {
     value = CoerceTo(
         value,
         output_schema_.GetColumn(static_cast<size_t>(output_offset)).Type());
@@ -125,7 +131,7 @@ bool MergeAppendExecutor::Next(Row* destination, RowPosition* position) {
 }
 
 void MergeAppendExecutor::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "MergeAppend: [";
+  output << Indent(static_cast<size_t>(indent)) << "MergeAppend: [";
   for (size_t i = 0; i < keys_.size(); ++i) {
     if (i != 0) {
       output << ", ";

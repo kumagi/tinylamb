@@ -208,6 +208,17 @@ TEST(PostgresProtocolTest, SplitSqlStatementsHandlesAllQuoting) {
   EXPECT_EQ(statements[2], "-- trailing ; comment\nSELECT 2");
 }
 
+// PostgreSQL nests block comments; a `;` inside an inner comment must not
+// split statements.
+TEST(PostgresProtocolTest, SplitSqlStatementsHandlesNestedBlockComments) {
+  const std::vector<std::string> statements = SplitSqlStatements(
+      "SELECT 1; /* outer /* inner ; comment */ still ; outer */ SELECT 2;");
+  ASSERT_EQ(statements.size(), 2U);
+  EXPECT_EQ(statements[0], "SELECT 1");
+  EXPECT_EQ(statements[1],
+            "/* outer /* inner ; comment */ still ; outer */ SELECT 2");
+}
+
 TEST(PostgresProtocolTest, SplitSqlStatementsDropsEmptyStatements) {
   // Act -- split a string of bare semicolons and whitespace
   const std::vector<std::string> statements = SplitSqlStatements(" ; ;  ; ");

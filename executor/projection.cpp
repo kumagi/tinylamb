@@ -22,6 +22,8 @@
 #include <optional>
 #include <ostream>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -66,11 +68,11 @@ bool Affine(  // NOLINT(misc-no-recursion)
   if (expression->Type() == tinylamb::TypeTag::kColumnValue) {
     const int offset =
         schema.Offset(expression->AsColumnValue().GetColumnName());
-    if (offset < 0 ||
-        schema.GetColumn(offset).Type() != tinylamb::ValueType::kInt64) {
+    if (offset < 0 || schema.GetColumn(static_cast<size_t>(offset)).Type() !=
+                          tinylamb::ValueType::kInt64) {
       return false;
     }
-    if (schema.GetColumn(offset).IsUnsigned()) {
+    if (schema.GetColumn(static_cast<size_t>(offset)).IsUnsigned()) {
       return false;
     }
     *column = static_cast<uint16_t>(offset);
@@ -207,7 +209,9 @@ Projection::Projection(std::vector<NamedExpression> expressions,
     cse_use_counts_.push_back(counts.at(keys[i]));
     cse_expressions_.push_back(samples.at(keys[i]));
     std::optional<BytecodeProgram> program =
-        BytecodeCompiler::Compile(cse_expressions_.back(), input_schema_);
+        BytecodeEnabled()
+            ? BytecodeCompiler::Compile(cse_expressions_.back(), input_schema_)
+            : std::nullopt;
     if (!program) {
       cse_names_.pop_back();
       cse_use_counts_.pop_back();
@@ -224,13 +228,15 @@ Projection::Projection(std::vector<NamedExpression> expressions,
   bytecodes_.reserve(expressions_.size());
   for (const NamedExpression& expression : expressions_) {
     const Expression rewritten = RewriteCse(expression.expression, slots);
-    bytecodes_.push_back(
-        BytecodeCompiler::Compile(rewritten, augmented_schema_));
+    bytecodes_.push_back(BytecodeEnabled() ? BytecodeCompiler::Compile(
+                                                 rewritten, augmented_schema_)
+                                           : std::nullopt);
   }
   jit_states_.resize(expressions_.size());
   for (size_t index = 0; index < expressions_.size(); ++index) {
     JitProjectionState& state = jit_states_[index];
-    state.eligible = Affine(expressions_[index].expression, input_schema_,
+    state.eligible = BytecodeEnabled() &&
+                     Affine(expressions_[index].expression, input_schema_,
                             &state.column, &state.multiplier, &state.addend);
   }
 }
@@ -261,6 +267,9 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
     std::vector<ColumnVector> cse_values;
     cse_values.reserve(cse_bytecodes_.size());
     for (const std::optional<BytecodeProgram>& program : cse_bytecodes_) {
+      if (!program) {
+        continue;
+      }
       cse_values.push_back(program->EvaluateBatch(input_batch_));
     }
     cse_input_batch_.Reset();
@@ -324,29 +333,28 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
       if (add_overflow) {
         throw std::runtime_error("integer overflow on '+'");
       }
-      evaluated[index].emplace(ValueType::kInt64, output.size());
+      ColumnVector& evaluated_column =
+          evaluated[index].emplace(ValueType::kInt64, output.size());
       for (int64_t value : output) {
-        evaluated[index]->Append(Value(value));
+        evaluated_column.Append(Value(value));
       }
       ++jit_batches_;
-    } else if (bytecodes_[index]) {
-      evaluated[index].emplace(
-          bytecodes_[index]->EvaluateBatch(*expression_input));
+    } else if (const std::optional<BytecodeProgram>& program =
+                   bytecodes_[index]) {
+      evaluated[index].emplace(program->EvaluateBatch(*expression_input));
     }
   }
   bool all_evaluated = true;
+  std::vector<const ColumnVector*> sources;
+  sources.reserve(evaluated.size());
   for (const std::optional<ColumnVector>& column : evaluated) {
     if (!column) {
       all_evaluated = false;
       break;
     }
+    sources.push_back(&*column);
   }
   if (all_evaluated) {
-    std::vector<const ColumnVector*> sources;
-    sources.reserve(evaluated.size());
-    for (const std::optional<ColumnVector>& column : evaluated) {
-      sources.push_back(&*column);
-    }
     for (size_t row_index = 0; row_index < expression_input->Size();
          ++row_index) {
       destination->AppendRowFromColumns(sources, row_index,
@@ -362,8 +370,10 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
     for (size_t expression_index = 0; expression_index < expressions_.size();
          ++expression_index) {
       const NamedExpression& named = expressions_[expression_index];
-      if (evaluated[expression_index]) {
-        result.push_back(evaluated[expression_index]->ValueAt(row_index));
+      const std::optional<ColumnVector>& evaluated_column =
+          evaluated[expression_index];
+      if (evaluated_column) {
+        result.push_back(evaluated_column->ValueAt(row_index));
         continue;
       }
       if (named.expression->Type() == TypeTag::kColumnValue) {
@@ -441,7 +451,7 @@ void Projection::Dump(std::ostream& o, int indent) const {
     }
     o << expressions_[i];
   }
-  o << "]\n" << Indent(indent + 2) << child_dump.str();
+  o << "]\n" << Indent(static_cast<size_t>(indent) + 2) << child_dump.str();
 }
 
 }  // namespace tinylamb

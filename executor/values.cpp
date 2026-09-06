@@ -1,11 +1,13 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under the Apache-2.0 license. */
 #include "values.hpp"
 
+#include <cstddef>
 #include <ostream>
 #include <utility>
 
-#include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
+#include "page/row_position.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
 

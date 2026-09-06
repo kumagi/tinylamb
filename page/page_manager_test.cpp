@@ -122,10 +122,8 @@ TEST_F(PageManagerTest, AllocateNewPage) {
   for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
     // Make sure no SEGV happen.
     // Union overlay: writes stay inside the kPageSize page allocation.
-    // Union overlay: writes stay inside the kPageSize page allocation.
-    buff[j] =
-        static_cast<char>((page->PageID() + j) &
-                          0xff);  // NOLINT(clang-analyzer-security.ArrayBound)
+    buff[j] = static_cast<char>(  // NOLINT(clang-analyzer-security.ArrayBound)
+        (page->PageID() + j) & 0xff);
   }
 
   // Assert -- implicit; no SEGV means the page body is writable and sized
@@ -142,9 +140,9 @@ TEST_F(PageManagerTest, AllocateMultipleNewPage) {
     char* buff = page->body.free_page.FreeBody();
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
       // Union overlay: writes stay inside the kPageSize page allocation.
-      buff[j] = static_cast<char>(
-          (page->PageID() + j) &
-          0xff);  // NOLINT(clang-analyzer-security.ArrayBound)
+      const size_t body_index = j;
+      buff[body_index] =  // NOLINT(clang-analyzer-security.ArrayBound)
+          static_cast<char>((page->PageID() + j) & 0xff);
     }
     allocated_ids.insert(page->PageID());
   }

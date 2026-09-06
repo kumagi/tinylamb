@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -311,6 +312,12 @@ Value BytecodeProgram::EvaluateRow(const Row& row) const {
     throw std::runtime_error("invalid bytecode stack");
   }
   return std::move(stack.back());
+}
+
+bool BytecodeEnabled() {
+  // Not cached: the differential harness flips the variable between the two
+  // executions of the same statement inside one process.
+  return std::getenv("TINYLAMB_DISABLE_BYTECODE") == nullptr;
 }
 
 }  // namespace tinylamb

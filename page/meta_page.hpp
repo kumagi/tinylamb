@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_META_PAGE_HPP
 #define TINYLAMB_META_PAGE_HPP
 
+#include <algorithm>
 #include <cstdint>
 
 #include "common/constants.hpp"
@@ -37,9 +38,7 @@ class MetaPage {
   // counter mutates outside the WAL, so RecoveryManager rebuilds it from
   // every page id the log touches (see RecoverFrom).
   void RestoreMaxPageCount(page_id_t high_water) {
-    if (max_page_count < high_water) {
-      max_page_count = high_water;
-    }
+    max_page_count = std::max(max_page_count, high_water);
   }
 
   // D3 (docs/design.md): the meta page mutates the free list outside the WAL,
@@ -76,7 +75,7 @@ class MetaPage {
   friend std::hash<tinylamb::MetaPage>;
 
   uint64_t first_free_page;
-  void Dump(std::ostream& o, int) const;
+  void Dump(std::ostream& o, int /*unused*/) const;
   uint64_t max_page_count;
   friend std::ostream& operator<<(std::ostream& o, const MetaPage& m) {
     m.Dump(o, 0);

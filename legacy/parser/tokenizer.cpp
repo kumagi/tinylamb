@@ -70,29 +70,29 @@ Token Tokenizer::NextToken() {
   }
   if (c == ',') {
     Advance();
-    return {.type=TokenType::kComma, .value=","};
+    return {.type = TokenType::kComma, .value = ","};
   }
   if (c == '.') {
     Advance();
-    return {.type=TokenType::kDot, .value="."};
+    return {.type = TokenType::kDot, .value = "."};
   }
   if (c == '(') {
     Advance();
-    return {.type=TokenType::kLParen, .value="("};
+    return {.type = TokenType::kLParen, .value = "("};
   }
   if (c == ')') {
     Advance();
-    return {.type=TokenType::kRParen, .value=")"};
+    return {.type = TokenType::kRParen, .value = ")"};
   }
   if (c == ';') {
     Advance();
-    return {.type=TokenType::kSemicolon, .value=";"};
+    return {.type = TokenType::kSemicolon, .value = ";"};
   }
   if (kOperatorChars.find(c) != std::string_view::npos) {
     return Operator();
   }
   Advance();
-  return {.type=TokenType::kUnknown, .value=std::string(1, c)};
+  return {.type = TokenType::kUnknown, .value = std::string(1, c)};
 }
 
 char Tokenizer::Peek() {
@@ -123,7 +123,8 @@ Token Tokenizer::Identifier() {
           sql_[pos_] == '_')) {
     pos_++;
   }
-  return {.type=TokenType::kIdentifier, .value=sql_.substr(start, pos_ - start)};
+  return {.type = TokenType::kIdentifier,
+          .value = sql_.substr(start, pos_ - start)};
 }
 
 Token Tokenizer::QuotedIdentifier() {
@@ -147,7 +148,7 @@ Token Tokenizer::QuotedIdentifier() {
   if (!terminated) {
     error_ = "unterminated quoted identifier";
   }
-  return {.type=TokenType::kIdentifier, .value=value};
+  return {.type = TokenType::kIdentifier, .value = value};
 }
 
 Token Tokenizer::Numeric() {
@@ -165,7 +166,8 @@ Token Tokenizer::Numeric() {
     }
     pos_++;
   }
-  return {.type=TokenType::kNumeric, .value=sql_.substr(start, pos_ - start)};
+  return {.type = TokenType::kNumeric,
+          .value = sql_.substr(start, pos_ - start)};
 }
 
 Token Tokenizer::String() {
@@ -189,7 +191,7 @@ Token Tokenizer::String() {
   if (!terminated) {
     error_ = "unterminated string literal";
   }
-  return {.type=TokenType::kString, .value=value};
+  return {.type = TokenType::kString, .value = value};
 }
 
 Token Tokenizer::Operator() {
@@ -198,7 +200,8 @@ Token Tokenizer::Operator() {
          kOperatorChars.find(sql_[pos_]) != std::string_view::npos) {
     pos_++;
   }
-  return {.type=TokenType::kOperator, .value=sql_.substr(start, pos_ - start)};
+  return {.type = TokenType::kOperator,
+          .value = sql_.substr(start, pos_ - start)};
 }
 
 Token Tokenizer::Keyword() {
@@ -210,10 +213,9 @@ Token Tokenizer::Keyword() {
   }
   std::string value = sql_.substr(start, pos_ - start);
   std::string upper_value;
-  std::ranges::transform(value, std::back_inserter(upper_value),
-                         [](unsigned char c) {
-                           return static_cast<char>(std::toupper(c));
-                         });
+  std::ranges::transform(
+      value, std::back_inserter(upper_value),
+      [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
   static const std::unordered_set<std::string> keywords = {
       "SELECT",   "FROM",   "WHERE",   "CREATE", "DROP",   "TABLE",
       "INSERT",   "INTO",   "VALUES",  "UPDATE", "SET",    "DELETE",
@@ -224,9 +226,9 @@ Token Tokenizer::Keyword() {
       "GROUP",    "HAVING", "PRIMARY", "KEY",    "UNIQUE", "REFERENCES",
       "DEFAULT",  "TRUE",   "FALSE"};
   if (keywords.contains(upper_value)) {
-    return {.type=TokenType::kKeyword, .value=upper_value};
+    return {.type = TokenType::kKeyword, .value = upper_value};
   }
-  return {.type=TokenType::kIdentifier, .value=value};
+  return {.type = TokenType::kIdentifier, .value = value};
 }
 
 }  // namespace tinylamb

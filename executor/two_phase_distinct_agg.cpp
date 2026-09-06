@@ -1,10 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/two_phase_distinct_agg.hpp"
 
-#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
+#include <limits>
 #include <ostream>
 #include <string>
 #include <unordered_map>
@@ -14,10 +14,11 @@
 
 #include "common/constants.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/aggregate_expression.hpp"
-#include "expression/column_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
 #include "type/column.hpp"
@@ -104,7 +105,7 @@ Schema MakeTwoPhaseDistinctSchema(
       cols.emplace_back(named.name, ValueType::kVarChar);
     }
   }
-  return Schema("two_phase_distinct_agg", std::move(cols));
+  return {"two_phase_distinct_agg", std::move(cols)};
 }
 
 }  // namespace
@@ -155,6 +156,9 @@ void TwoPhaseDistinctAgg::Materialize() {
     // For non-distinct aggregates: running partial states
     std::vector<int64_t> non_distinct_counts;
     std::vector<Value> non_distinct_sums;
+    // AVG accumulates in double (ground truth does): an int64 Value sum
+    // would raise integer overflow where AggregationExecutor succeeds.
+    std::vector<double> non_distinct_dsums;
     std::vector<Value> non_distinct_mins;
     std::vector<Value> non_distinct_maxs;
   };
@@ -163,6 +167,7 @@ void TwoPhaseDistinctAgg::Materialize() {
     s.distinct_sets.resize(aggregates_.size());
     s.non_distinct_counts.resize(aggregates_.size(), 0);
     s.non_distinct_sums.resize(aggregates_.size(), Value());
+    s.non_distinct_dsums.resize(aggregates_.size(), 0.0);
     s.non_distinct_mins.resize(aggregates_.size(), Value());
     s.non_distinct_maxs.resize(aggregates_.size(), Value());
   };
@@ -236,23 +241,36 @@ void TwoPhaseDistinctAgg::Materialize() {
             break;
           case AggregationType::kAvg:
             if (!val.IsNull()) {
-              curr_state->non_distinct_sums[i] =
-                  curr_state->non_distinct_sums[i].IsNull()
-                      ? val
-                      : (curr_state->non_distinct_sums[i] + val);
+              curr_state->non_distinct_dsums[i] +=
+                  val.type == ValueType::kDouble
+                      ? val.value.double_value
+                      : static_cast<double>(val.value.int_value);
               curr_state->non_distinct_counts[i]++;
             }
             break;
           case AggregationType::kMin:
-            if (!val.IsNull() && (curr_state->non_distinct_mins[i].IsNull() ||
-                                  val < curr_state->non_distinct_mins[i])) {
-              curr_state->non_distinct_mins[i] = val;
+            if (!val.IsNull()) {
+              if (val.type == ValueType::kDouble &&
+                  std::isnan(val.value.double_value)) {
+                // Any NaN makes the group MIN/MAX NaN (see ground truth).
+                curr_state->non_distinct_mins[i] =
+                    Value(std::numeric_limits<double>::quiet_NaN());
+              } else if (curr_state->non_distinct_mins[i].IsNull() ||
+                         val < curr_state->non_distinct_mins[i]) {
+                curr_state->non_distinct_mins[i] = val;
+              }
             }
             break;
           case AggregationType::kMax:
-            if (!val.IsNull() && (curr_state->non_distinct_maxs[i].IsNull() ||
-                                  curr_state->non_distinct_maxs[i] < val)) {
-              curr_state->non_distinct_maxs[i] = val;
+            if (!val.IsNull()) {
+              if (val.type == ValueType::kDouble &&
+                  std::isnan(val.value.double_value)) {
+                curr_state->non_distinct_maxs[i] =
+                    Value(std::numeric_limits<double>::quiet_NaN());
+              } else if (curr_state->non_distinct_maxs[i].IsNull() ||
+                         curr_state->non_distinct_maxs[i] < val) {
+                curr_state->non_distinct_maxs[i] = val;
+              }
             }
             break;
           default:
@@ -293,7 +311,14 @@ void TwoPhaseDistinctAgg::Materialize() {
               for (const Value& v : dset) {
                 total = total.IsNull() ? v : (total + v);
               }
-              row_vals.push_back(total);
+              // The declared schema carries SUM/AVG as kDouble; an int64
+              // total would make ColumnVector::Append throw on NextBatch.
+              if (total.type == ValueType::kInt64) {
+                row_vals.emplace_back(
+                    static_cast<double>(total.value.int_value));
+              } else {
+                row_vals.push_back(total);
+              }
             }
             break;
           }
@@ -352,21 +377,23 @@ void TwoPhaseDistinctAgg::Materialize() {
             row_vals.emplace_back(s.non_distinct_counts[i]);
             break;
           case AggregationType::kSum:
-            row_vals.push_back(s.non_distinct_sums[i]);
+            // Match the declared kDouble schema (see the distinct path).
+            if (s.non_distinct_sums[i].IsNull()) {
+              row_vals.emplace_back();
+            } else if (s.non_distinct_sums[i].type == ValueType::kInt64) {
+              row_vals.emplace_back(
+                  static_cast<double>(s.non_distinct_sums[i].value.int_value));
+            } else {
+              row_vals.push_back(s.non_distinct_sums[i]);
+            }
             break;
           case AggregationType::kAvg:
             if (s.non_distinct_counts[i] == 0) {
               row_vals.emplace_back();  // NULL
             } else {
-              double total = 0.0;
-              if (s.non_distinct_sums[i].type == ValueType::kInt64) {
-                total =
-                    static_cast<double>(s.non_distinct_sums[i].value.int_value);
-              } else if (s.non_distinct_sums[i].type == ValueType::kDouble) {
-                total = s.non_distinct_sums[i].value.double_value;
-              }
               row_vals.emplace_back(
-                  total / static_cast<double>(s.non_distinct_counts[i]));
+                  s.non_distinct_dsums[i] /
+                  static_cast<double>(s.non_distinct_counts[i]));
             }
             break;
           case AggregationType::kMin:
@@ -423,7 +450,7 @@ size_t TwoPhaseDistinctAgg::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 void TwoPhaseDistinctAgg::Dump(std::ostream& o, int indent) const {
-  o << "TwoPhaseDistinctAgg: \n" << Indent(indent + 2);
+  o << "TwoPhaseDistinctAgg: \n" << Indent(static_cast<size_t>(indent) + 2);
   child_->Dump(o, indent + 2);
 }
 

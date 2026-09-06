@@ -200,7 +200,7 @@ Expression InlineHavingAliases(const SelectStatement& statement,
         if (!value.ArrayElementSqlType().empty()) {
           rewritten->SetArrayElementSqlType(value.ArrayElementSqlType());
         }
-        return Expression(rewritten);
+        return {rewritten};
       }
       default:
         // Aggregates, subqueries and casts keep their own scope.
@@ -522,6 +522,21 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     } else {
       output_columns.emplace_back(ProjectionName(projection, i),
                                   ValueType::kNull);
+    }
+  }
+  // A star that matched nothing (unknown qualifier, or a bare `*` over an
+  // empty input) would otherwise silently shrink the select list; reject it
+  // like an unknown column.
+  for (size_t i = 0; i < statement.SelectList().size(); ++i) {
+    const NamedExpression& projection = statement.SelectList()[i];
+    if (projection.expression->Type() == TypeTag::kColumnValue &&
+        projection.expression->AsColumnValue().GetColumnName().name == "*" &&
+        !star_proto[i] && star_groups[i].empty()) {
+      const ColumnName& requested =
+          projection.expression->AsColumnValue().GetColumnName();
+      throw std::runtime_error(
+          "unknown relation in select list: " +
+          (requested.schema.empty() ? "*" : requested.schema + ".*"));
     }
   }
   // Hidden $win columns ride along until ordering completes, then get trimmed
@@ -924,7 +939,9 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input,
           break;
         }
       }
-      if (!tied) break;
+      if (!tied) {
+        break;
+      }
       ++end_idx;
     }
     for (size_t i = begin; i < end_idx; ++i) {
@@ -1020,9 +1037,7 @@ Relation FinishQuery(TransactionContext& context,
   }
   return LimitedRows(statement, std::move(output), &context, outer, &ctes);
 }
-Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
-    TransactionContext& context, const SelectStatement& statement,
-    const Scope* outer, const CteMap& inherited_ctes);
+namespace {
 
 bool ReferencesCte(const SelectStatement& statement, const std::string& name) {
   for (const SelectSource& source : statement.Sources()) {
@@ -1033,12 +1048,9 @@ bool ReferencesCte(const SelectStatement& statement, const std::string& name) {
       return true;
     }
   }
-  for (const auto& branch : statement.UnionAll()) {
-    if (branch && ReferencesCte(*branch, name)) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(statement.UnionAll(), [&name](const auto& branch) {
+    return branch && ReferencesCte(*branch, name);
+  });
 }
 
 bool IsIdentityDerived(const SelectStatement& statement) {
@@ -1096,9 +1108,8 @@ bool IsFlattenableProjection(const SelectStatement& statement) {
   return std::ranges::all_of(
       statement.SelectList(), [](const NamedExpression& item) {
         return item.expression &&
-               !(item.expression->Type() == TypeTag::kColumnValue &&
-                 item.expression->AsColumnValue().GetColumnName().name ==
-                     "*") &&
+               (item.expression->Type() != TypeTag::kColumnValue ||
+                item.expression->AsColumnValue().GetColumnName().name != "*") &&
                !ContainsQuery(item.expression) &&
                !ContainsAggregate(item.expression) &&
                IsDeterministicProjectionExpression(item.expression);
@@ -1210,8 +1221,10 @@ std::shared_ptr<SelectStatement> FlattenProjectionBoundary(
     if (!expression) {
       return nullptr;
     }
-    order_by.push_back(SelectStatement::OrderByTerm{
-        std::move(expression), term.ascending, term.nulls_first});
+    order_by.push_back(
+        SelectStatement::OrderByTerm{.expression = std::move(expression),
+                                     .ascending = term.ascending,
+                                     .nulls_first = term.nulls_first});
   }
 
   auto rewritten = std::make_shared<SelectStatement>(statement);
@@ -1324,6 +1337,8 @@ bool PredicateCanEnterDerived(const Expression& predicate,
   return !predicate->TouchedColumns().empty() &&
          RebindDerivedPredicate(predicate, derived, derived_alias) != nullptr;
 }
+
+}  // namespace
 
 std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
     const SelectStatement& statement, const CteMap& inherited_ctes) {
@@ -1504,6 +1519,8 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
   return nullptr;
 }
 
+namespace {
+
 bool SameRow(const Row& left, const Row& right) {
   if (left.values_.size() != right.values_.size()) {
     return false;
@@ -1526,6 +1543,8 @@ bool SameRow(const Row& left, const Row& right) {
     }
   }
   return true;
+}
+
 }  // namespace
 
 Relation ExecuteRecursiveCte(TransactionContext& context,
@@ -1581,7 +1600,7 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
     }
     Row stored = row;
     if (track_depth) {
-      stored.values_.push_back(Value(int64_t{0}));
+      stored.values_.emplace_back(int64_t{0});
     }
     delta.AddRow(stored);
     if (!track_depth || (depth_spec->lower <= 0 && 0 <= depth_spec->upper)) {
@@ -1613,9 +1632,11 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
         Row payload = row;
         if (by_name) {
           std::vector<Value> aligned;
-          aligned.reserve(result.schema.ColumnCount() - (track_depth ? 1 : 0));
+          aligned.reserve(static_cast<size_t>(result.schema.ColumnCount()) -
+                          (track_depth ? 1U : 0U));
           const size_t payload_width =
-              result.schema.ColumnCount() - (track_depth ? 1 : 0);
+              static_cast<size_t>(result.schema.ColumnCount()) -
+              (track_depth ? 1U : 0U);
           for (size_t target = 0; target < payload_width; ++target) {
             const std::string& wanted =
                 result.schema.GetColumn(target).Name().name;
@@ -1637,7 +1658,7 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
           return;
         }
         if (track_depth) {
-          payload.values_.push_back(Value(row_depth));
+          payload.values_.emplace_back(row_depth);
         }
         next.AddRow(std::move(payload));
       });

@@ -2,6 +2,9 @@
 
 #include "plan/group_by_plan.hpp"
 
+#include <cstddef>
+#include <ostream>
+
 namespace tinylamb {
 
 void GroupByPlan::Dump(std::ostream& o, int indent) const {

@@ -22,7 +22,7 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
   struct Key {
     Expression expression;
     bool ascending{true};
-    std::optional<bool> nulls_first;
+    std::optional<bool> nulls_first = std::nullopt;
   };
   SortExecutor(Executor source, Schema schema, std::vector<Key> keys,
                size_t worker_count = 1)

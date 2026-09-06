@@ -53,6 +53,7 @@ class IndexScanPlan final : public PlanBase {
   Executor EmitExecutor(TransactionContext& txn) const override;
 
   [[nodiscard]] const Table* ScanSource() const override { return &table_; }
+  [[nodiscard]] const Index& GetIndex() const { return index_; }
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return stats_;

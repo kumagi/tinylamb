@@ -19,7 +19,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -56,19 +58,25 @@
 #include "plan/values_plan.hpp"
 #include "query/query_data.hpp"
 #include "query/statement.hpp"
+#include "table/scan_options.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
+#include "type/constraint.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
 
 // Expands a literal "*" into every column of every FROM relation (Phase 8):
 // columns are qualified with the relation identity (alias when given, else
-// the table name) so they resolve against the renamed scan schemas.
+// the table name) so they resolve against the renamed scan schemas.  A
+// qualified star expands only over the matching relation; a star matching no
+// relation (unknown qualifier, or `*` with no FROM) is an error rather than a
+// silently shrunken select list.
 std::vector<NamedExpression> ExpandSelect(const QueryData& query,
                                           TransactionContext& context) {
   const bool has_star =
@@ -80,19 +88,42 @@ std::vector<NamedExpression> ExpandSelect(const QueryData& query,
     return query.select_;
   }
   std::vector<NamedExpression> expanded;
-  for (const std::string& relation : query.from_) {
-    const auto aliased = query.aliases_.find(relation);
-    const std::string& physical =
-        aliased == query.aliases_.end() ? relation : aliased->second;
-    const StatusOr<std::shared_ptr<Table>> found = context.GetTable(physical);
-    if (UNLIKELY(!found.HasValue())) {
-      // Matches ASSIGN_OR_CRASH semantics; LOG(FATAL) aborts the process.
-      LOG(FATAL) << "Crashed: " << found.GetStatus();
+  expanded.reserve(query.select_.size());
+  for (const NamedExpression& selected : query.select_) {
+    const bool is_star =
+        selected.expression->Type() == TypeTag::kColumnValue &&
+        selected.expression->AsColumnValue().GetColumnName().name == "*";
+    if (!is_star) {
+      expanded.push_back(selected);
+      continue;
     }
-    const std::shared_ptr<Table>& table = found.Value();
-    for (size_t i = 0; i < table->GetSchema().ColumnCount(); ++i) {
-      expanded.emplace_back(
-          ColumnName(relation, table->GetSchema().GetColumn(i).Name().name));
+    const ColumnName& requested =
+        selected.expression->AsColumnValue().GetColumnName();
+    bool matched_relation = false;
+    for (const std::string& relation : query.from_) {
+      const auto aliased = query.aliases_.find(relation);
+      const std::string& physical =
+          aliased == query.aliases_.end() ? relation : aliased->second;
+      if (!requested.schema.empty() && requested.schema != relation &&
+          requested.schema != physical) {
+        continue;
+      }
+      const StatusOr<std::shared_ptr<Table>> found = context.GetTable(physical);
+      if (UNLIKELY(!found.HasValue())) {
+        // Matches ASSIGN_OR_CRASH semantics; LOG(FATAL) aborts the process.
+        LOG(FATAL) << "Crashed: " << found.GetStatus();
+      }
+      matched_relation = true;
+      const std::shared_ptr<Table>& table = found.Value();
+      for (size_t i = 0; i < table->GetSchema().ColumnCount(); ++i) {
+        expanded.emplace_back(
+            ColumnName(relation, table->GetSchema().GetColumn(i).Name().name));
+      }
+    }
+    if (!matched_relation) {
+      throw std::runtime_error(
+          "unknown relation in select list: " +
+          (requested.schema.empty() ? "*" : requested.schema + ".*"));
     }
   }
   return expanded;
@@ -100,6 +131,340 @@ std::vector<NamedExpression> ExpandSelect(const QueryData& query,
 
 bool IsAggregate(const NamedExpression& expression) {
   return expression.expression->Type() == TypeTag::kAggregateExp;
+}
+
+// ---------------------------------------------------------------------------
+// Unused inner-join elimination with a data proven proof.
+//
+// `SELECT c.customer_id FROM customers c JOIN regions r
+//  ON c.region_id = r.region_id` can drop the join entirely when:
+//   1. no projected / ordered / filtered column references `r`,
+//   2. the only predicate touching `r` is `c.region_id = r.region_id`,
+//   3. `r.region_id` is UNIQUE / PRIMARY KEY (so the join preserves the
+//      left cardinality -- many-to-one), and
+//   4. every `c.region_id` value is observed, in the current snapshot, to
+//      be non-NULL and present in `r.region_id` (so the join drops no
+//      rows).  Without a declared FOREIGN KEY constraint the containment
+//      proof is checked against the transaction's own snapshot, which
+//      keeps the rewrite exact for the data the query will read.
+// The proof is limited to small tables so planning never scans a large
+// fact table just to remove a join.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kMaxJoinEliminationProofRows = 1 << 16;
+
+struct RelationRef {
+  std::unordered_set<std::string> relations;
+  bool ok = true;
+};
+
+// Maps a touched column to its relation identity (alias when given, else
+// the table name).  Unqualified columns resolve against every candidate
+// relation whose schema owns the column; ambiguity marks them all.
+std::unordered_set<std::string> ColumnRelations(
+    const ColumnName& column,
+    const std::unordered_map<std::string, std::shared_ptr<Table>>& tables) {
+  std::unordered_set<std::string> result;
+  if (!column.schema.empty()) {
+    // The qualifier is the relation identity (alias when given, else the
+    // physical table name).  Accept it only when the column really exists
+    // there; offsets below therefore always resolve by bare column name.
+    const auto found = tables.find(column.schema);
+    if (found != tables.end() &&
+        found->second->GetSchema().Offset(ColumnName("", column.name)) >= 0) {
+      result.insert(column.schema);
+      return result;
+    }
+    for (const auto& [relation, table] : tables) {
+      if (table->GetSchema().Name() == column.schema &&
+          table->GetSchema().Offset(ColumnName("", column.name)) >= 0) {
+        result.insert(relation);
+      }
+    }
+    return result;
+  }
+  for (const auto& [relation, table] : tables) {
+    if (table->GetSchema().Offset(ColumnName("", column.name)) >= 0) {
+      result.insert(relation);
+    }
+  }
+  return result;
+}
+
+RelationRef TouchedRelations(
+    const Expression& expression,
+    const std::unordered_map<std::string, std::shared_ptr<Table>>& tables) {
+  RelationRef ref;
+  if (!expression) {
+    return ref;
+  }
+  if (expression->Type() == TypeTag::kQueryExp ||
+      expression->Type() == TypeTag::kAggregateExp) {
+    ref.ok = false;
+    return ref;
+  }
+  for (const ColumnName& column : expression->TouchedColumns()) {
+    if (column.name == "*") {
+      ref.ok = false;
+      return ref;
+    }
+    const std::unordered_set<std::string> cols =
+        ColumnRelations(column, tables);
+    ref.relations.insert(cols.begin(), cols.end());
+  }
+  for (const Expression& child : ExpressionChildren(expression)) {
+    RelationRef child_ref = TouchedRelations(child, tables);
+    if (!child_ref.ok) {
+      ref.ok = false;
+      return ref;
+    }
+    ref.relations.insert(child_ref.relations.begin(),
+                         child_ref.relations.end());
+  }
+  return ref;
+}
+
+using JoinKeySet = std::unordered_set<Value>;
+
+std::optional<QueryData> TryEliminateUnusedJoins(
+    const QueryData& query, const std::vector<NamedExpression>& expanded_select,
+    TransactionContext& ctx) {
+  if (query.from_.size() < 2 || query.require_row_position_) {
+    return std::nullopt;
+  }
+  // Aggregate results (COUNT(*)) must observe the join's multiplicity.  The
+  // grouped bridge feeds a constant-only core projection, so any projection
+  // without a column reference keeps every join conservatively.
+  const bool projection_uses_columns =
+      std::ranges::any_of(expanded_select, [](const NamedExpression& item) {
+        return item.expression && !item.expression->TouchedColumns().empty();
+      });
+  if (!projection_uses_columns) {
+    return std::nullopt;
+  }
+
+  std::unordered_map<std::string, std::shared_ptr<Table>> tables;
+  for (const std::string& relation : query.from_) {
+    const auto aliased = query.aliases_.find(relation);
+    const std::string& physical =
+        aliased == query.aliases_.end() ? relation : aliased->second;
+    StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+    if (!found.HasValue()) {
+      return std::nullopt;
+    }
+    tables.emplace(relation, found.Value());
+  }
+
+  // Relations referenced by the projection or the ordering keys.
+  std::unordered_set<std::string> used;
+  for (const NamedExpression& item : expanded_select) {
+    const RelationRef ref = TouchedRelations(item.expression, tables);
+    if (!ref.ok) {
+      return std::nullopt;
+    }
+    used.insert(ref.relations.begin(), ref.relations.end());
+  }
+  for (const Expression& order : query.order_expressions_) {
+    const RelationRef ref = TouchedRelations(order, tables);
+    if (!ref.ok) {
+      return std::nullopt;
+    }
+    used.insert(ref.relations.begin(), ref.relations.end());
+  }
+
+  // Split the WHERE conjuncts once: pure column equalities are join edge
+  // candidates; everything else pins its relations.
+  struct JoinEdge {
+    Expression conjunct;
+    std::string left_relation;
+    ColumnName left_column;
+    std::string right_relation;
+    ColumnName right_column;
+  };
+  std::vector<JoinEdge> edges;
+  std::unordered_map<std::string, size_t> edge_count;
+  std::unordered_set<std::string> pinned;
+  std::vector<Expression> conjuncts = SplitConjuncts(query.where_);
+  for (const Expression& conjunct : conjuncts) {
+    if (!conjunct) {
+      continue;
+    }
+    bool is_edge = false;
+    if (conjunct->Type() == TypeTag::kBinaryExp &&
+        conjunct->AsBinaryExpression().Op() == BinaryOperation::kEquals &&
+        conjunct->AsBinaryExpression().Left()->Type() ==
+            TypeTag::kColumnValue &&
+        conjunct->AsBinaryExpression().Right()->Type() ==
+            TypeTag::kColumnValue) {
+      const ColumnName& left = conjunct->AsBinaryExpression()
+                                   .Left()
+                                   ->AsColumnValue()
+                                   .GetColumnName();
+      const ColumnName& right = conjunct->AsBinaryExpression()
+                                    .Right()
+                                    ->AsColumnValue()
+                                    .GetColumnName();
+      std::unordered_set<std::string> left_rels = ColumnRelations(left, tables);
+      std::unordered_set<std::string> right_rels =
+          ColumnRelations(right, tables);
+      if (left_rels.size() == 1 && right_rels.size() == 1 &&
+          *left_rels.begin() != *right_rels.begin()) {
+        JoinEdge edge;
+        edge.conjunct = conjunct;
+        edge.left_relation = *left_rels.begin();
+        edge.left_column = left;
+        edge.right_relation = *right_rels.begin();
+        edge.right_column = right;
+        ++edge_count[edge.left_relation];
+        ++edge_count[edge.right_relation];
+        edges.push_back(std::move(edge));
+        is_edge = true;
+      }
+    }
+    if (!is_edge) {
+      const RelationRef ref = TouchedRelations(conjunct, tables);
+      if (!ref.ok) {
+        return std::nullopt;
+      }
+      pinned.insert(ref.relations.begin(), ref.relations.end());
+    }
+  }
+
+  // A dimension candidate is referenced by exactly one equality edge and
+  // nothing else; the edge partner is the kept (fact) side.
+  struct EliminationPlan {
+    std::string dim;
+    std::string kept;
+    Expression conjunct;
+    ColumnName dim_column;
+    ColumnName kept_column;
+  };
+  std::vector<EliminationPlan> plans;
+  for (const JoinEdge& edge : edges) {
+    const std::string& dim = used.contains(edge.right_relation)
+                                 ? edge.left_relation
+                                 : edge.right_relation;
+    const std::string& kept =
+        dim == edge.left_relation ? edge.right_relation : edge.left_relation;
+    if (used.contains(dim) || pinned.contains(dim) || edge_count[dim] != 1) {
+      continue;
+    }
+    EliminationPlan plan;
+    plan.dim = dim;
+    plan.kept = kept;
+    plan.conjunct = edge.conjunct;
+    if (dim == edge.left_relation) {
+      plan.dim_column = edge.left_column;
+      plan.kept_column = edge.right_column;
+    } else {
+      plan.dim_column = edge.right_column;
+      plan.kept_column = edge.left_column;
+    }
+    plans.push_back(std::move(plan));
+  }
+  if (plans.empty()) {
+    return std::nullopt;
+  }
+
+  QueryData rewritten = query;
+  std::vector<Expression> kept_conjuncts = conjuncts;
+  bool changed = false;
+  for (const EliminationPlan& plan : plans) {
+    if (rewritten.from_.size() <= 1) {
+      break;
+    }
+    if (std::ranges::find(rewritten.from_, plan.dim) == rewritten.from_.end()) {
+      continue;  // already eliminated as part of an earlier hop
+    }
+    const auto dim_table = tables.find(plan.dim);
+    const auto kept_table = tables.find(plan.kept);
+    if (dim_table == tables.end() || kept_table == tables.end()) {
+      continue;
+    }
+    // (3) the dimension join key must be declared UNIQUE.
+    const int dim_offset = dim_table->second->GetSchema().Offset(
+        ColumnName("", plan.dim_column.name));
+    const int kept_offset = kept_table->second->GetSchema().Offset(
+        ColumnName("", plan.kept_column.name));
+    if (dim_offset < 0 || kept_offset < 0) {
+      continue;
+    }
+    const Constraint& dim_constraint =
+        dim_table->second->GetSchema()
+            .GetColumn(static_cast<size_t>(dim_offset))
+            .GetConstraint();
+    if (dim_constraint.ctype != Constraint::kPrimaryKey &&
+        !dim_constraint.IsUnique()) {
+      continue;
+    }
+    // Size gate: the proof scans both sides inside this snapshot.
+    const auto rows_of = [&ctx](std::string_view physical) -> size_t {
+      const auto stats = ctx.GetStats(physical);
+      return stats.HasValue() ? stats.Value()->Rows() : 0;
+    };
+    if (rows_of(dim_table->second->GetSchema().Name()) +
+            rows_of(kept_table->second->GetSchema().Name()) >
+        kMaxJoinEliminationProofRows) {
+      continue;
+    }
+    // (4) containment proof in the current transaction snapshot: every
+    // kept-side key value must be non-NULL and present on the dim side.
+    JoinKeySet dim_values;
+    bool proof_failed = false;
+    {
+      auto iterator = dim_table->second->BeginFullScan(
+          ctx.txn_, TableScanOptions{.projection = std::vector<slot_t>{
+                                         static_cast<slot_t>(dim_offset)}});
+      size_t scanned = 0;
+      for (; iterator.IsValid(); ++iterator) {
+        if (++scanned > kMaxJoinEliminationProofRows) {
+          proof_failed = true;
+          break;
+        }
+        const Value& cell = (*iterator)[0];
+        if (!cell.IsNull()) {
+          dim_values.insert(cell);
+        }
+      }
+      if (!proof_failed) {
+        auto kept_iterator = kept_table->second->BeginFullScan(
+            ctx.txn_, TableScanOptions{.projection = std::vector<slot_t>{
+                                           static_cast<slot_t>(kept_offset)}});
+        size_t kept_scanned = 0;
+        for (; kept_iterator.IsValid(); ++kept_iterator) {
+          if (++kept_scanned > kMaxJoinEliminationProofRows) {
+            proof_failed = true;
+            break;
+          }
+          const Value& cell = (*kept_iterator)[0];
+          if (cell.IsNull() || !dim_values.contains(cell)) {
+            // An unmatched or NULL kept key means the join filters rows;
+            // removal would change the result.
+            proof_failed = true;
+            break;
+          }
+        }
+      }
+    }
+    if (proof_failed) {
+      continue;
+    }
+    // Proof holds: drop the dimension and its equality conjunct.
+    rewritten.from_.erase(std::ranges::find(rewritten.from_, plan.dim));
+    rewritten.aliases_.erase(plan.dim);
+    kept_conjuncts.erase(std::remove(kept_conjuncts.begin(),
+                                     kept_conjuncts.end(), plan.conjunct),
+                         kept_conjuncts.end());
+    tables.erase(plan.dim);
+    changed = true;
+  }
+  if (!changed) {
+    return std::nullopt;
+  }
+  rewritten.where_ = kept_conjuncts.empty() ? ConstantValueExp(Value(true))
+                                            : CombineConjuncts(kept_conjuncts);
+  rewritten.select_ = expanded_select;
+  return rewritten;
 }
 
 std::vector<Expression> NormalizeOrderingForOutput(
@@ -244,7 +609,8 @@ std::optional<NullTest> ExtractNullTest(const Expression& expression) {
       unary.Op() != UnaryOperation::kIsNotNull) {
     return std::nullopt;
   }
-  return NullTest{unary.Child(), unary.Op() == UnaryOperation::kIsNull};
+  return NullTest{.child = unary.Child(),
+                  .is_null = unary.Op() == UnaryOperation::kIsNull};
 }
 
 struct InTest {
@@ -257,13 +623,16 @@ std::optional<InTest> ExtractInTest(const Expression& expression) {
     return std::nullopt;
   }
   if (expression->Type() == TypeTag::kInExp) {
-    return InTest{&expression->AsInExpression(), false};
+    return InTest{.expression = &expression->AsInExpression(),
+                  .negated = false};
   }
   if (expression->Type() == TypeTag::kUnaryExp &&
       expression->AsUnaryExpression().Op() == UnaryOperation::kNot &&
       expression->AsUnaryExpression().Child()->Type() == TypeTag::kInExp) {
-    return InTest{&expression->AsUnaryExpression().Child()->AsInExpression(),
-                  true};
+    return InTest{
+        .expression =
+            &expression->AsUnaryExpression().Child()->AsInExpression(),
+        .negated = true};
   }
   return std::nullopt;
 }
@@ -297,7 +666,8 @@ size_t FindEqualityClass(std::vector<EqualityClass>* classes,
       return i;
     }
   }
-  classes->push_back(EqualityClass{{member}, std::nullopt});
+  classes->push_back(
+      EqualityClass{.members = {member}, .constant = std::nullopt});
   return classes->size() - 1;
 }
 
@@ -337,11 +707,12 @@ bool PropagateEqualityConstants(std::vector<Expression>* conjuncts) {
       continue;
     }
     const size_t group = FindEqualityClass(&classes, comparison->key);
-    if (classes[group].constant &&
-        ConstantsDiffer(*classes[group].constant, comparison->constant)) {
+    EqualityClass& equality_class = classes[group];
+    if (equality_class.constant &&
+        ConstantsDiffer(*equality_class.constant, comparison->constant)) {
       return false;
     }
-    classes[group].constant = comparison->constant;
+    equality_class.constant = comparison->constant;
   }
 
   std::vector<Expression> rewritten;
@@ -365,10 +736,10 @@ bool PropagateEqualityConstants(std::vector<Expression>* conjuncts) {
     if (!equality.constant) {
       continue;
     }
+    const Value& constant = *equality.constant;
     for (const Expression& member : equality.members) {
-      rewritten.push_back(
-          BinaryExpressionExp(member, BinaryOperation::kEquals,
-                              ConstantValueExp(*equality.constant)));
+      rewritten.push_back(BinaryExpressionExp(member, BinaryOperation::kEquals,
+                                              ConstantValueExp(constant)));
     }
   }
   *conjuncts = std::move(rewritten);
@@ -400,7 +771,8 @@ std::optional<SimpleComparison> ExtractSimpleComparison(
   if (constant.IsNull()) {
     return std::nullopt;
   }
-  return SimpleComparison{binary.Left(), binary.Op(), constant};
+  return SimpleComparison{
+      .key = binary.Left(), .operation = binary.Op(), .constant = constant};
 }
 
 std::optional<bool> EvaluateConstantPredicate(BinaryOperation operation,
@@ -585,6 +957,35 @@ Expression SimplifyFilterPredicate(const Expression& predicate,
     }
   }
 
+  const auto boolean_assertion =
+      [](const Expression& expression) -> std::optional<bool> {
+    if (!expression || expression->Type() != TypeTag::kUnaryExp) {
+      return std::nullopt;
+    }
+    const auto& unary = expression->AsUnaryExpression();
+    if (unary.Op() == UnaryOperation::kIsTrue) {
+      return true;
+    }
+    if (unary.Op() == UnaryOperation::kIsFalse) {
+      return false;
+    }
+    return std::nullopt;
+  };
+  for (size_t i = 0; i < conjuncts.size(); ++i) {
+    const std::optional<bool> left_true = boolean_assertion(conjuncts[i]);
+    if (!left_true.has_value()) {
+      continue;
+    }
+    for (size_t j = i + 1; j < conjuncts.size(); ++j) {
+      const std::optional<bool> right_true = boolean_assertion(conjuncts[j]);
+      if (right_true.has_value() && *left_true != *right_true &&
+          SameExpression(conjuncts[i]->AsUnaryExpression().Child(),
+                         conjuncts[j]->AsUnaryExpression().Child())) {
+        return ConstantValueExp(Value(false));
+      }
+    }
+  }
+
   for (size_t i = 0; i < conjuncts.size(); ++i) {
     const std::optional<NullTest> left_null = ExtractNullTest(conjuncts[i]);
     const std::optional<InTest> left_in = ExtractInTest(conjuncts[i]);
@@ -629,6 +1030,44 @@ Expression SimplifyFilterPredicate(const Expression& predicate,
     }
   }
   RemoveSubsumedBounds(&conjuncts);
+
+  // A disjunction whose every branch is provably false is itself false. Each
+  // branch is simplified recursively (empty range, IS TRUE vs IS FALSE, ...),
+  // so `WHERE (x > 100 AND x < 10) OR (enabled IS TRUE AND enabled IS FALSE)`
+  // collapses to the constant FALSE and the scan is eliminated.
+  for (const Expression& conjunct : conjuncts) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp ||
+        conjunct->AsBinaryExpression().Op() != BinaryOperation::kOr) {
+      continue;
+    }
+    std::vector<Expression> branches;
+    std::vector<const Expression*> stack{&conjunct};
+    while (!stack.empty()) {
+      const Expression& node = *stack.back();
+      stack.pop_back();
+      if (node->Type() == TypeTag::kBinaryExp &&
+          node->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+        stack.push_back(&node->AsBinaryExpression().Right());
+        stack.push_back(&node->AsBinaryExpression().Left());
+        continue;
+      }
+      branches.push_back(node);
+    }
+    bool all_false = !branches.empty();
+    for (const Expression& branch : branches) {
+      const Expression folded = SimplifyFilterPredicate(branch, input_schema);
+      if (!folded || folded->Type() != TypeTag::kConstantValue ||
+          folded->AsConstantValue().GetValue().Truthy() ||
+          folded->AsConstantValue().GetValue().IsNull()) {
+        all_false = false;
+        break;
+      }
+    }
+    if (all_false) {
+      return ConstantValueExp(Value(false));
+    }
+  }
+
   return CombineConjuncts(conjuncts);
 }
 
@@ -824,7 +1263,11 @@ bool ColumnIsNonNull(const ScopeMaps& scope, const ColumnName& column,
     return false;
   }
   const Constraint::ConstraintType ctype =
-      table.Value()->GetSchema().GetColumn(offset).GetConstraint().ctype;
+      table.Value()
+          ->GetSchema()
+          .GetColumn(static_cast<size_t>(offset))
+          .GetConstraint()
+          .ctype;
   return ctype == Constraint::kNotNull || ctype == Constraint::kPrimaryKey;
 }
 
@@ -1109,14 +1552,20 @@ StatusOr<Plan> Optimizer::OptimizeRelational(
 StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                                    TransactionContext& ctx,
                                    const OptimizerOptions& options) {
-  const ExpressionRewriter scalar_rewriter(options.expression_rules);
+  // Value contexts (select items, ORDER BY keys) must not gain inferred
+  // predicates: `x IS NOT NULL AND ...` changes a NULL projection/sort key
+  // into FALSE.  The inference rule is only sound in a filter context, so
+  // it is stripped for these rewrites (WHERE keeps the full rule set).
+  ExpressionRuleSet value_context_rules = options.expression_rules;
+  value_context_rules.Remove("inner_join_not_null_inference");
+  const ExpressionRewriter value_rewriter(value_context_rules);
   bool order_rewritten = false;
   QueryData scalar_normalized = query;
   for (size_t i = 0; i < query.order_expressions_.size(); ++i) {
     if (!query.order_expressions_[i]) {
       continue;
     }
-    Expression rewritten = scalar_rewriter.Rewrite(query.order_expressions_[i]);
+    Expression rewritten = value_rewriter.Rewrite(query.order_expressions_[i]);
     if (rewritten->ToString() != query.order_expressions_[i]->ToString()) {
       order_rewritten = true;
       scalar_normalized.order_expressions_[i] = std::move(rewritten);
@@ -1153,7 +1602,17 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   std::vector<NamedExpression> expanded_select = ExpandSelect(query, ctx);
   for (NamedExpression& selected : expanded_select) {
     if (selected.expression) {
-      selected.expression = scalar_rewriter.Rewrite(selected.expression);
+      selected.expression = value_rewriter.Rewrite(selected.expression);
+    }
+  }
+
+  // Provable unused inner-join elimination: drop a dimension table whose
+  // unique-keyed equality join provably neither filters nor multiplies the
+  // kept rows (verified against the current snapshot for small tables).
+  if (query.from_.size() > 1) {
+    if (std::optional<QueryData> eliminated =
+            TryEliminateUnusedJoins(query, expanded_select, ctx)) {
+      return Optimize(*eliminated, ctx, options);
     }
   }
 
@@ -1228,6 +1687,10 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // order, and the memo has no operator between the two.
   std::vector<DecorrelationSpec> decorrelations;
   std::vector<NamedExpression> projection_items = expanded_select;
+  // True when a hidden `$semiN` correlation key was appended to
+  // projection_items: DISTINCT must then run above the final trim (over the
+  // caller-visible columns only), not over the hidden-key superset.
+  bool hidden_semi_keys_added = false;
   const Expression effective_predicate = [&] {
     std::vector<Expression> kept;
     if (query.limit_count_ == 0 && query.limit_offset_ == 0 &&
@@ -1235,6 +1698,11 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
         predicate->Type() != TypeTag::kConstantValue) {
       ++tls_decorrelation_depth;
       struct DepthGuard {
+        DepthGuard() = default;
+        DepthGuard(const DepthGuard&) = delete;
+        DepthGuard& operator=(const DepthGuard&) = delete;
+        DepthGuard(DepthGuard&&) = delete;
+        DepthGuard& operator=(DepthGuard&&) = delete;
         ~DepthGuard() { --tls_decorrelation_depth; }
       } guard;
       std::vector<std::pair<std::string, const Schema*>> outer_schemas;
@@ -1255,14 +1723,10 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       // The semi/anti join wraps ABOVE the root projection, so every probe
       // key must survive into the projection output; hidden `$semiN` items
       // keep unselected keys visible and the engine trims them afterwards.
-      for (size_t i = 0; i < candidates.size(); ++i) {
+      for (auto& candidate : candidates) {
         bool covered = true;
-        for (size_t key_index = 0;
-             key_index < candidates[i].first.outer_keys.size(); ++key_index) {
-          const ColumnName& key = candidates[i]
-                                      .first.outer_keys[key_index]
-                                      ->AsColumnValue()
-                                      .GetColumnName();
+        for (const Expression& outer_key : candidate.first.outer_keys) {
+          const ColumnName& key = outer_key->AsColumnValue().GetColumnName();
           const bool key_covered = std::ranges::any_of(
               expanded_select, [&](const NamedExpression& item) {
                 return item.expression->Type() == TypeTag::kColumnValue &&
@@ -1272,15 +1736,15 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
             // ProductPlan resolves its key against the left output schema.
             // Preserve the qualified source name here; an alias such as
             // `$semi0` would hide the key from the join contract.
-            projection_items.emplace_back(
-                "", candidates[i].first.outer_keys[key_index]);
+            projection_items.emplace_back("", outer_key);
+            hidden_semi_keys_added = true;
           }
           covered = covered && (key_covered || !has_aggregate);
         }
         if (covered) {
-          decorrelations.push_back(std::move(candidates[i].first));
+          decorrelations.push_back(std::move(candidate.first));
         } else {
-          kept.push_back(candidates[i].second);  // keep the old route
+          kept.push_back(candidate.second);  // keep the old route
         }
       }
     }
@@ -1371,6 +1835,22 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
 
   cascades::Memo memo;
   cascades::GroupId search_root = memo.Build(query.from_, conjuncts);
+  // Publish table schemas (including unique constraints) so join-elimination
+  // rules can prove key uniqueness instead of trusting column names.
+  {
+    std::unordered_map<std::string, Schema> table_schemas;
+    for (const std::string& relation : query.from_) {
+      const auto aliased = query.aliases_.find(relation);
+      const std::string& physical =
+          aliased == query.aliases_.end() ? relation : aliased->second;
+      StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+      if (!found.HasValue()) {
+        continue;
+      }
+      table_schemas.emplace(relation, found.Value()->GetSchema());
+    }
+    memo.SetTableSchemas(table_schemas);
+  }
   if (needs_root_selection) {
     const cascades::GroupId selection =
         memo.EnsureDerivedGroup(query.from_, "selection");
@@ -1404,7 +1884,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                            .target_list = projection_items});
     search_root = projection;
   }
-  if (query.distinct_) {
+  if (query.distinct_ && !hidden_semi_keys_added) {
     const cascades::GroupId distinct =
         memo.EnsureDerivedGroup(query.from_, "distinct");
     memo.AddExpression(distinct,
@@ -1452,8 +1932,8 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     search_root = sort;
   }
   if ((query.limit_count_ != 0 || query.limit_offset_ != 0) &&
-      !(query.limit_count_ != 0 && !query.order_expressions_.empty() &&
-        query.order_expressions_.size() == query.order_ascending_.size())) {
+      (query.limit_count_ == 0 || query.order_expressions_.empty() ||
+       query.order_expressions_.size() != query.order_ascending_.size())) {
     const cascades::GroupId limit =
         memo.EnsureDerivedGroup(query.from_, "limit");
     memo.AddExpression(limit,
@@ -1586,6 +2066,12 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // decorrelated predicate never leaks hidden key columns into the result.
   if (!has_aggregate && !decorrelations.empty()) {
     best->plan = std::make_shared<ProjectionPlan>(best->plan, expanded_select);
+    // With hidden semi-join keys in the core output, an in-search DISTINCT
+    // would dedupe over the implementation columns and leak duplicates that
+    // differ only in a key; dedupe above the trim instead.
+    if (query.distinct_ && hidden_semi_keys_added) {
+      best->plan = std::make_shared<DistinctPlan>(best->plan);
+    }
   }
 
   if (options.dump_memo) {

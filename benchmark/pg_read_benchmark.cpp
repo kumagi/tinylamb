@@ -61,8 +61,9 @@ bool SendAll(int fd, const std::string& bytes) {
       offset += static_cast<size_t>(sent);
       continue;
     }
-    if (sent < 0 && errno == EINTR) { continue;
-}
+    if (sent < 0 && errno == EINTR) {
+      continue;
+    }
     return false;
   }
   return true;
@@ -71,28 +72,34 @@ bool SendAll(int fd, const std::string& bytes) {
 bool ReadUntilReady(int fd, bool* server_error) {
   std::string input;
   while (true) {
-    pollfd descriptor{.fd=fd, .events=POLLIN, .revents=0};
-    if (poll(&descriptor, 1, 30000) <= 0) { return false;
-}
+    pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
+    if (poll(&descriptor, 1, 30000) <= 0) {
+      return false;
+    }
     std::array<char, 8192> buffer{};
     const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
-    if (received <= 0) { return false;
-}
+    if (received <= 0) {
+      return false;
+    }
     input.append(buffer.data(), static_cast<size_t>(received));
     size_t cursor = 0;
     while (cursor + 5 <= input.size()) {
       const uint32_t length = ReadUint32(input, cursor + 1);
-      if (length < 4 || cursor + 1 + length > input.size()) { break;
-}
+      if (length < 4 || cursor + 1 + length > input.size()) {
+        break;
+      }
       const char type = input[cursor];
-      if (type == 'E') { *server_error = true;
-}
+      if (type == 'E') {
+        *server_error = true;
+      }
       cursor += 1 + length;
-      if (type == 'Z') { return true;
-}
+      if (type == 'Z') {
+        return true;
+      }
     }
-    if (cursor != 0) { input.erase(0, cursor);
-}
+    if (cursor != 0) {
+      input.erase(0, cursor);
+    }
   }
 }
 
@@ -126,8 +133,9 @@ std::string QueryMessage(std::string_view query) {
 
 int Connect(const Options& options) {
   const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (fd < 0) { return -1;
-}
+  if (fd < 0) {
+    return -1;
+  }
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(options.port);
@@ -150,8 +158,9 @@ bool ParsePositive(std::string_view input, size_t* result) {
   char* end = nullptr;
   const std::string value(input);
   const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
-  if (end == value.c_str() || *end != '\0' || parsed == 0) { return false;
-}
+  if (end == value.c_str() || *end != '\0' || parsed == 0) {
+    return false;
+  }
   *result = static_cast<size_t>(parsed);
   return true;
 }
@@ -159,8 +168,9 @@ bool ParsePositive(std::string_view input, size_t* result) {
 bool ParseOptions(int argc, char** argv, Options* options) {
   for (int i = 1; i < argc; ++i) {
     const std::string_view argument(argv[i]);
-    if (i + 1 >= argc) { return false;
-}
+    if (i + 1 >= argc) {
+      return false;
+    }
     const std::string_view value(argv[++i]);
     if (argument == "--host") {
       options->host = value;
@@ -172,14 +182,17 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       }
       options->port = static_cast<uint16_t>(port);
     } else if (argument == "--clients") {
-      if (!ParsePositive(value, &options->clients)) { return false;
-}
+      if (!ParsePositive(value, &options->clients)) {
+        return false;
+      }
     } else if (argument == "--warmup") {
-      if (!ParsePositive(value, &options->warmup_seconds)) { return false;
-}
+      if (!ParsePositive(value, &options->warmup_seconds)) {
+        return false;
+      }
     } else if (argument == "--seconds") {
-      if (!ParsePositive(value, &options->measurement_seconds)) { return false;
-}
+      if (!ParsePositive(value, &options->measurement_seconds)) {
+        return false;
+      }
     } else if (argument == "--user") {
       options->user = value;
     } else if (argument == "--database") {
@@ -233,8 +246,9 @@ int main(int argc, char** argv) {
           errors.fetch_add(1);
           break;
         }
-        if (measuring.load()) { completed.fetch_add(1);
-}
+        if (measuring.load()) {
+          completed.fetch_add(1);
+        }
       }
       (void)SendAll(fd, std::string("X\0\0\0\4", 5));
       close(fd);
@@ -251,8 +265,9 @@ int main(int argc, char** argv) {
   const auto end = std::chrono::steady_clock::now();
   measuring.store(false);
   stopping.store(true);
-  for (std::thread& client : clients) { client.join();
-}
+  for (std::thread& client : clients) {
+    client.join();
+  }
   const double elapsed = std::chrono::duration<double>(end - start).count();
   const uint64_t transactions = completed.load();
 

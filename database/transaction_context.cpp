@@ -20,6 +20,7 @@
 
 #include "database/transaction_context.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -27,6 +28,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "database/catalog_reader.hpp"
 

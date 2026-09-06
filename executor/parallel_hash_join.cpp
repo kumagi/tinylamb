@@ -6,9 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <functional>
 #include <iostream>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -16,12 +14,13 @@
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
+#include "common/join_kind.hpp"
 #include "executor/data_chunk.hpp"
-#include "executor/join_kind.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
-#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -30,8 +29,8 @@ namespace {
 
 uint64_t Fnv1aHash(std::string_view bytes) {
   uint64_t hash = 14695981039346656037ULL;
-  for (unsigned char c : bytes) {
-    hash ^= static_cast<uint64_t>(c);
+  for (char byte : bytes) {
+    hash ^= static_cast<uint64_t>(static_cast<unsigned char>(byte));
     hash *= 1099511628211ULL;
   }
   return hash;
@@ -57,7 +56,7 @@ void ConcurrentJoinHashTable::Insert(uint64_t hash, std::string key_bytes,
                                      Row row, RowPosition position) {
   const size_t shard_idx = hash % kShardCount;
   auto& shard = shards_[shard_idx];
-  std::lock_guard<std::mutex> lock(shard.mutex);
+  std::scoped_lock lock(shard.mutex);
   const size_t entry_idx = shard.entries.size();
   const size_t slot = (hash >> 8) & shard.mask;
   const size_t next = shard.head_slots[slot];
@@ -76,7 +75,7 @@ std::vector<std::pair<Row, RowPosition>> ConcurrentJoinHashTable::FindMatches(
   const size_t shard_idx = hash % kShardCount;
   const auto& shard = shards_[shard_idx];
   std::vector<std::pair<Row, RowPosition>> matches;
-  std::lock_guard<std::mutex> lock(shard.mutex);
+  std::scoped_lock lock(shard.mutex);
   const size_t slot = (hash >> 8) & shard.mask;
   size_t curr = shard.head_slots[slot];
   while (curr != kNil) {
@@ -92,7 +91,7 @@ std::vector<std::pair<Row, RowPosition>> ConcurrentJoinHashTable::FindMatches(
 size_t ConcurrentJoinHashTable::Size() const {
   size_t total = 0;
   for (const auto& shard : shards_) {
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    std::scoped_lock lock(shard.mutex);
     total += shard.entries.size();
   }
   return total;
@@ -101,7 +100,7 @@ size_t ConcurrentJoinHashTable::Size() const {
 size_t ConcurrentJoinHashTable::EstimatedBytes() const {
   size_t bytes = 0;
   for (const auto& shard : shards_) {
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    std::scoped_lock lock(shard.mutex);
     bytes += shard.entries.capacity() * sizeof(Entry);
     for (const auto& e : shard.entries) {
       bytes += EstimateRowBytes(e.row) + e.key_bytes.capacity();
@@ -112,13 +111,15 @@ size_t ConcurrentJoinHashTable::EstimatedBytes() const {
 
 SharedBuildParallelHashJoin::SharedBuildParallelHashJoin(
     Executor left, std::vector<slot_t> left_cols, Executor right,
-    std::vector<slot_t> right_cols, size_t worker_count, JoinKind kind)
+    std::vector<slot_t> right_cols, size_t worker_count, JoinKind kind,
+    size_t right_width)
     : left_(std::move(left)),
       left_cols_(std::move(left_cols)),
       right_(std::move(right)),
       right_cols_(std::move(right_cols)),
       worker_count_(std::max<size_t>(1, worker_count)),
       kind_(kind),
+      right_width_(right_width),
       shared_hash_table_(2048) {}
 
 std::string SharedBuildParallelHashJoin::MakeKey(
@@ -144,12 +145,9 @@ std::string SharedBuildParallelHashJoin::MakeKey(
 
 bool SharedBuildParallelHashJoin::KeyHasNull(const Row& row,
                                              const std::vector<slot_t>& cols) {
-  for (slot_t col : cols) {
-    if (col < row.values_.size() && row[col].IsNull()) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(cols, [&row](slot_t col) {
+    return col < row.values_.size() && row[col].IsNull();
+  });
 }
 
 uint64_t SharedBuildParallelHashJoin::HashKey(std::string_view key) {
@@ -168,6 +166,13 @@ void SharedBuildParallelHashJoin::BuildSharedHashTable() {
   const size_t num_threads =
       std::min(worker_count_, std::max<size_t>(1, total_build / 16));
 
+  // NULL padding of unmatched left rows must widen to the right row's full
+  // COLUMN count (rows are only available to infer it when the build side is
+  // non-empty, mirroring the serial HashJoin width contract).
+  if (right_width_ == 0 && !build_tuples.empty()) {
+    right_width_ = build_tuples.front().first.values_.size();
+  }
+
   auto build_worker = [&](size_t thread_id) {
     const size_t chunk_sz = (total_build + num_threads - 1) / num_threads;
     const size_t start = thread_id * chunk_sz;
@@ -178,6 +183,7 @@ void SharedBuildParallelHashJoin::BuildSharedHashTable() {
       // collide with other NULL-keyed probes through the shared '\0' tag,
       // so it must not enter the hash table at all.
       if (KeyHasNull(t.first, right_cols_)) {
+        build_has_null_key_ = true;
         continue;
       }
       std::string key = MakeKey(t.first, right_cols_);
@@ -200,7 +206,7 @@ void SharedBuildParallelHashJoin::BuildSharedHashTable() {
         } catch (...) {
           // An exception escaping a raw thread terminates the process;
           // capture it and rethrow on the joining thread instead.
-          std::lock_guard<std::mutex> lock(error_mutex);
+          std::scoped_lock lock(error_mutex);
           if (build_error == nullptr) {
             build_error = std::current_exception();
           }
@@ -250,6 +256,12 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
                                ? std::vector<std::pair<Row, RowPosition>>{}
                                : shared_hash_table_.FindMatches(hash, key);
 
+      if (kind_ == JoinKind::kNullAwareAnti && build_has_null_key_) {
+        // NOT IN against a set containing NULL is UNKNOWN unless the probe
+        // key matches; UNKNOWN rows are filtered by the surrounding WHERE,
+        // so the whole join yields nothing (matches the serial HashJoin).
+        continue;
+      }
       switch (kind_) {
         case JoinKind::kInner:
           for (const auto& m : matches) {
@@ -271,8 +283,17 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
           }
           break;
         case JoinKind::kAnti:
-        case JoinKind::kNullAwareAnti:
+          // NOT EXISTS decorrelation: a NULL probe key can never match, so
+          // it takes the no-match path like the nested-loop/merge joins.
           if (matches.empty()) {
+            out.emplace_back(left_tuple.first, left_tuple.second);
+          }
+          break;
+        case JoinKind::kNullAwareAnti:
+          // NOT IN three-valued semantics: a NULL probe key is UNKNOWN and
+          // is filtered out, never emitted (matches probe_survives in the
+          // serial HashJoin).
+          if (!probe_has_null && matches.empty()) {
             out.emplace_back(left_tuple.first, left_tuple.second);
           }
           break;
@@ -292,15 +313,16 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
                                left_tuple.second);
             }
           } else {
-            // Null pad right side
+            // Null-pad the right side with its full column count so the
+            // output never mixes row widths downstream.
             std::vector<Value> joined_values;
             joined_values.reserve(left_tuple.first.values_.size() +
-                                  right_cols_.size());
+                                  right_width_);
             for (size_t c = 0; c < left_tuple.first.values_.size(); ++c) {
               joined_values.push_back(left_tuple.first[c]);
             }
-            for (size_t c = 0; c < right_cols_.size(); ++c) {
-              joined_values.push_back(Value());
+            for (size_t c = 0; c < right_width_; ++c) {
+              joined_values.emplace_back();
             }
             out.emplace_back(Row(std::move(joined_values)), left_tuple.second);
           }
@@ -316,11 +338,27 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
   } else {
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
+    std::mutex error_mutex;
+    std::exception_ptr probe_error;
     for (size_t i = 0; i < num_threads; ++i) {
-      workers.emplace_back(probe_worker, i);
+      workers.emplace_back([&, i] {
+        try {
+          probe_worker(i);
+        } catch (...) {
+          // An exception escaping a raw thread terminates the process;
+          // capture it and rethrow on the joining thread instead.
+          std::scoped_lock lock(error_mutex);
+          if (probe_error == nullptr) {
+            probe_error = std::current_exception();
+          }
+        }
+      });
     }
     for (auto& w : workers) {
       w.join();
+    }
+    if (probe_error != nullptr) {
+      std::rethrow_exception(probe_error);
     }
   }
 
@@ -335,7 +373,7 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
     }
   }
 
-  size_t bytes = output_.size() * (sizeof(RowPosition) + sizeof(Row)) +
+  size_t bytes = (output_.size() * (sizeof(RowPosition) + sizeof(Row))) +
                  shared_hash_table_.EstimatedBytes();
   charge_.Add(bytes);
 }

@@ -38,8 +38,8 @@ struct RowPointer {
   }
 };
 
-constexpr static RowPointer kMinusInfinity{1, 0};
-constexpr static RowPointer kPlusInfinity{2, 0};
+constexpr static RowPointer kMinusInfinity{.offset = 1, .size = 0};
+constexpr static RowPointer kPlusInfinity{.offset = 2, .size = 0};
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_ROW_POINTER_HPP

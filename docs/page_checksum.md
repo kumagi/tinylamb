@@ -3,10 +3,10 @@
 ## Algorithm
 
 On-disk pages carry a `uint64_t checksum` field in the page header
-(`page/page.hpp`). As of the Phase-2 change in `improvement.md` §M2, the
-value is **CRC-32C (Castagnoli)**, computed by `common/crc32c.hpp` over the
-page image excluding the runtime-only `recovery_lsn` and `checksum` slots.
-The 32-bit digest is stored zero-extended in the 64-bit checksum field.
+(`page/page.hpp`). The value is **CRC-32C (Castagnoli)**, computed by
+`common/crc32c.hpp` over the page image excluding the runtime-only
+`recovery_lsn` and `checksum` slots. The 32-bit digest is stored
+zero-extended in the 64-bit checksum field.
 
 `Page::SetChecksum()` writes the digest; `Page::IsValid()` recomputes and
 compares. `PagePool::WriteBack` always refreshes the checksum before I/O.

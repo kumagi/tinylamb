@@ -19,7 +19,7 @@
 namespace tinylamb {
 
 void RemoteChannel::Push(DataChunk chunk) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::scoped_lock lock(mutex_);
   if (closed_) {
     return;
   }
@@ -28,7 +28,7 @@ void RemoteChannel::Push(DataChunk chunk) {
 }
 
 void RemoteChannel::Push(Row row, RowPosition rp) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::scoped_lock lock(mutex_);
   if (closed_) {
     return;
   }
@@ -37,18 +37,18 @@ void RemoteChannel::Push(Row row, RowPosition rp) {
 }
 
 void RemoteChannel::Close() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::scoped_lock lock(mutex_);
   closed_ = true;
   cv_.notify_all();
 }
 
 bool RemoteChannel::IsClosed() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::scoped_lock lock(mutex_);
   return closed_ && queue_.empty() && row_queue_.empty();
 }
 
 size_t RemoteChannel::BufferedChunks() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::scoped_lock lock(mutex_);
   return queue_.size();
 }
 

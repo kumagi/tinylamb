@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <ostream>
 #include <string>
 #include <unordered_map>
@@ -14,6 +13,7 @@
 
 #include "common/constants.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -107,7 +107,7 @@ Schema MakeGroupingSetsSchema(
     }
     cols.emplace_back(named.name, vt);
   }
-  return Schema("grouping_sets_agg", std::move(cols));
+  return {"grouping_sets_agg", std::move(cols)};
 }
 
 }  // namespace
@@ -139,10 +139,9 @@ GroupingSetsExecutor GroupingSetsExecutor::Rollup(
     }
     sets.push_back(std::move(s));
   }
-  sets.push_back({});  // grand total
-  return GroupingSetsExecutor(std::move(child), std::move(input_schema),
-                              std::move(all_group_keys), std::move(sets),
-                              std::move(aggregates));
+  sets.emplace_back();  // grand total
+  return {std::move(child), std::move(input_schema), std::move(all_group_keys),
+          std::move(sets), std::move(aggregates)};
 }
 
 GroupingSetsExecutor GroupingSetsExecutor::Cube(
@@ -178,9 +177,8 @@ GroupingSetsExecutor GroupingSetsExecutor::Cube(
     sets.push_back(std::move(s));
   }
 
-  return GroupingSetsExecutor(std::move(child), std::move(input_schema),
-                              std::move(all_group_keys), std::move(sets),
-                              std::move(aggregates));
+  return {std::move(child), std::move(input_schema), std::move(all_group_keys),
+          std::move(sets), std::move(aggregates)};
 }
 
 void GroupingSetsExecutor::Materialize() {
@@ -478,7 +476,7 @@ size_t GroupingSetsExecutor::NextBatch(DataChunk* destination,
 }
 
 void GroupingSetsExecutor::Dump(std::ostream& o, int indent) const {
-  o << "GroupingSetsExecutor: \n" << Indent(indent + 2);
+  o << "GroupingSetsExecutor: \n" << Indent(static_cast<size_t>(indent) + 2);
   child_->Dump(o, indent + 2);
 }
 

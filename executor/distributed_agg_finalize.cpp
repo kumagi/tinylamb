@@ -1,21 +1,24 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/distributed_agg_finalize.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -41,7 +44,9 @@ void DistributedAggFinalize::MergePartialStreams() {
   group_map_.clear();
 
   for (auto& src : sources_) {
-    if (!src) continue;
+    if (!src) {
+      continue;
+    }
     Row row;
     RowPosition rp;
     while (src->Next(&row, &rp)) {

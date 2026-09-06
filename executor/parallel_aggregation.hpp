@@ -42,16 +42,27 @@ class ParallelAggregationExecutor final : public ExecutorBase {
     kRowCount,
     kInt64Column,
     kDoubleColumn,
+    kStatColumn,  // statistical aggregate over raw numeric storage
     kGeneric
   };
   struct AggregateInput {
     AggregateInputKind kind{AggregateInputKind::kGeneric};
     size_t column{0};
+    // Second input of a two-argument statistical aggregate (COVAR_* / CORR).
+    size_t trailing_column{0};
   };
 
   struct PartialState {
     std::vector<Value> values;
     std::vector<int64_t> counts;
+    // Long-double partial sums for statistical aggregates, indexed like
+    // values/counts.  They mirror AggregateAccumulator::StatState so merged
+    // partials finalize exactly like the serial ground-truth path.
+    std::vector<long double> stat_sx;   // Σ second COVAR arg (or sole input)
+    std::vector<long double> stat_sxx;  // Σ of its square
+    std::vector<long double> stat_sy;   // Σ first COVAR arg
+    std::vector<long double> stat_syy;  // Σ of its square
+    std::vector<long double> stat_sxy;  // Σ of the pairwise products
     std::vector<relational_detail::DistinctValueSet> distinct_values;
     // Every retained distinct value holds a forced global-budget reservation;
     // release the retained total when the state dies so the process-wide
@@ -75,8 +86,22 @@ class ParallelAggregationExecutor final : public ExecutorBase {
                              const ColumnVector& column) const;
   void AccumulateDoubleColumn(PartialState* state, size_t aggregate_index,
                               const ColumnVector& column) const;
+  // Fast-path statistical accumulation over raw numeric storage; `trailing`
+  // is null for the single-input forms (VAR_* / STDDEV_*).
+  static void AccumulateStatColumns(PartialState* state, size_t aggregate_index,
+                                    const ColumnVector& child,
+                                    const ColumnVector* trailing);
+  // Per-row statistical accumulation for expression arguments; mirrors
+  // AggregateAccumulator::ApplyCore's paired NULL semantics.
+  void AccumulateStatValue(PartialState* state, size_t aggregate_index,
+                           const Value& value,
+                           const std::vector<Value>& trailing_values) const;
   void AccumulateValue(PartialState* state, size_t aggregate_index,
                        const Value& value, bool apply_distinct) const;
+  // Applies the statistical finalize formulas (VAR/STDDEV/COVAR/CORR) to the
+  // merged long-double partials; NULL for inputs too few to divide.
+  [[nodiscard]] Value FinalizeStat(const PartialState& state,
+                                   size_t index) const;
   void Merge(PartialState* destination, const PartialState& source) const;
   [[nodiscard]] Row Finalize(PartialState state) const;
 
@@ -89,6 +114,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   std::vector<size_t> row_count_indices_;
   std::vector<size_t> int64_column_indices_;
   std::vector<size_t> double_column_indices_;
+  std::vector<size_t> stat_column_indices_;
   std::vector<size_t> generic_indices_;
   size_t worker_count_;
   bool executed_{false};

@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <ios>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -30,6 +31,7 @@
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/serdes.hpp"
 #include "gtest/gtest.h"
 #include "page/index_key.hpp"
 #include "page/page_type.hpp"
@@ -286,8 +288,9 @@ TEST_F(LogRecordTest, LogTypeStreamOperator) {
   std::stringstream unknown;
   // Deliberately out-of-range LogType to probe the "undefined" fallback arm
   // of operator<<.
-  unknown << static_cast<LogType>(
-      0xffff);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto unknown_log_type = static_cast<LogType>(0xffff);
+  unknown << unknown_log_type;
   EXPECT_NE(unknown.str().find("undefined"), std::string::npos);
 }
 

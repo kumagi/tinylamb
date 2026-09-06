@@ -97,8 +97,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     if (expected_it == expected.end()) {
       // The view enumerated more entries than the model: stop instead of
       // dereferencing past the map's end.
-      LOG(ERROR) << "view yields more keys than the model: "
-                 << actual_it.Key();
+      LOG(ERROR) << "view yields more keys than the model: " << actual_it.Key();
       exit(1);
     }
     if (actual_it.Key() != expected_it->first) {

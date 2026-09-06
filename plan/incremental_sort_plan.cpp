@@ -1,10 +1,17 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "plan/incremental_sort_plan.hpp"
 
+#include <cstddef>
+#include <optional>
 #include <ostream>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "expression/expression.hpp"
+#include "plan/plan.hpp"
+#include "plan/sort_plan.hpp"
 
 namespace tinylamb {
 
@@ -67,7 +74,7 @@ bool IncrementalSortPlan::IsOrderedBy(
 }
 
 void IncrementalSortPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << ToString() << "\n";
+  output << Indent(static_cast<size_t>(indent)) << ToString() << "\n";
   child_->Dump(output, indent + 2);
 }
 

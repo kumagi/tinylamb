@@ -1,14 +1,15 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/materialize.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <iostream>
-#include <memory>
 #include <utility>
 #include <vector>
 
 #include "executor/data_chunk.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -25,7 +26,6 @@ void MaterializeExecutor::EnsureMaterialized() {
   if (materialized_) {
     return;
   }
-  materialized_ = true;
   rows_.clear();
   read_offset_ = 0;
 
@@ -37,6 +37,10 @@ void MaterializeExecutor::EnsureMaterialized() {
     rows_.emplace_back(std::move(row), rp);
   }
   charge_.Add(est_bytes);
+  // Latch only after the drain completed: a child that throws mid-drain must
+  // leave the executor unmaterialized so a retry does not serve a truncated
+  // result (same contract as ExchangeExecutor::EnsureMaterialized).
+  materialized_ = true;
 }
 
 void MaterializeExecutor::Rewind() {

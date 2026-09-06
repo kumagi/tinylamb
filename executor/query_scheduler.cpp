@@ -2,6 +2,7 @@
 #include "executor/query_scheduler.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -144,14 +145,14 @@ size_t ScheduledExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
 void ScheduledExecutor::Dump(std::ostream& out, int indent) const {
   out << "ScheduledQuery (cpu=" << cpu_slots_ << ", memory=" << memory_bytes_
       << ")\n"
-      << Indent(indent + 2);
+      << Indent(static_cast<size_t>(indent) + 2);
   child_->Dump(out, indent + 2);
 }
 
 void ScheduledExecutor::Explain(std::ostream& out, int indent) const {
   out << "ScheduledQuery (cpu=" << cpu_slots_ << ", memory=" << memory_bytes_
       << ")\n"
-      << Indent(indent + 2);
+      << Indent(static_cast<size_t>(indent) + 2);
   child_->Explain(out, indent + 2);
 }
 

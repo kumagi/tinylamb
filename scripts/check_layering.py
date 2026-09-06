@@ -92,6 +92,19 @@ DEFAULT_ALLOWLIST = (
     #      移行期間中の直参照を許容する。
     "executor/detail/* -> query/statement.hpp",
     "executor/relational.cpp -> query/statement.hpp",
+    # apply / recursive_cte / unnest 物理演算子とその plan ノードは
+    # SelectStatement IR を直接扱う (relational と同じ V3' 系)。
+    "executor/apply.cpp -> query/statement.hpp",
+    "executor/apply.hpp -> query/statement.hpp",
+    "executor/recursive_cte.cpp -> query/statement.hpp",
+    "executor/recursive_cte.hpp -> query/statement.hpp",
+    "executor/unnest.cpp -> query/statement.hpp",
+    "plan/apply_plan.cpp -> query/statement.hpp",
+    "plan/apply_plan.hpp -> query/statement.hpp",
+    "plan/cascades.hpp -> query/statement.hpp",
+    "plan/implementation_rules.cpp -> query/statement.hpp",
+    "plan/recursive_cte_plan.cpp -> query/statement.hpp",
+    "plan/recursive_cte_plan.hpp -> query/statement.hpp",
     # --- 構造上既知だが未対処のエッジ (潰したらこのリストから削る) -------
     # common から type/value_type.hpp (依存ゼロの列挙型ヘッダ) を使う。
     "common/* -> type/value_type.hpp",

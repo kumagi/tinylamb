@@ -16,7 +16,10 @@
 
 #include "common/debug.hpp"
 
+#include <cstdint>
+#include <numbers>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,11 +29,12 @@
 #include "common/encoder.hpp"
 #include "common/status_or.hpp"
 #include "gtest/gtest.h"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
 TEST(DebugTest, Hex_WithAsciiStrings_ConvertsToHexPairs) {
-  const std::string s_empty = "";
+  const std::string s_empty;
   const std::string s_a = "a";
   const std::string s_ab = "ab";
 
@@ -115,7 +119,10 @@ TEST(DebugTest, HeadString_WhenLongerThanLimit_TruncatesTail) {
 TEST(DebugTest, ConstantsToString_ForAllEnums_RendersExpectedLabels) {
   EXPECT_EQ(ToString(BinaryOperation::kModulo), "%");
   EXPECT_EQ(ToString(BinaryOperation::kXor), "XOR");
-  EXPECT_EQ(ToString(static_cast<BinaryOperation>(99)), "INVALID");
+  // The out-of-range value must read as "INVALID".
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_binary_op = static_cast<BinaryOperation>(99);
+  EXPECT_EQ(ToString(invalid_binary_op), "INVALID");
 
   EXPECT_EQ(ToString(Status::kUnknown), "Unknown");
   EXPECT_EQ(ToString(Status::kSuccess), "Success");
@@ -130,7 +137,9 @@ TEST(DebugTest, ConstantsToString_ForAllEnums_RendersExpectedLabels) {
   EXPECT_EQ(ToString(Status::kIsInfinity), "IsInfinity");
   EXPECT_EQ(ToString(Status::kDeleted), "Deleted");
   EXPECT_EQ(ToString(Status::kCorrupt), "Corrupt");
-  EXPECT_EQ(ToString(static_cast<Status>(999)), "INVALID STATUS");
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_status = static_cast<Status>(static_cast<uint8_t>(999));
+  EXPECT_EQ(ToString(invalid_status), "INVALID STATUS");
 
   std::ostringstream oss;
   oss << Status::kSuccess;
@@ -145,7 +154,7 @@ TEST(DebugTest, EncoderDecoder_WithDiverseTypes_RoundTripsAccurately) {
   const slot_t slot = 99;
   const int64_t i64 = -9876543210LL;
   const uint64_t u64 = 9876543210ULL;
-  const double d = 3.1415926535;
+  const double d = std::numbers::pi;
   const ValueType vt = ValueType::kDouble;
   const bool b = true;
   const std::string str = "hello encoder";
@@ -228,7 +237,7 @@ TEST(StatusOrTest, MoveValue_SecondCallThrows) {
   // second (moved-from) copy instead of throwing as documented.
   StatusOr<std::string> so(std::string("x"));
   EXPECT_TRUE(so.HasValue());
-  std::string first = std::move(so).MoveValue();
+  std::string first = so.MoveValue();
   EXPECT_EQ(first, "x");
   EXPECT_FALSE(so.HasValue());
   EXPECT_THROW(std::ignore = so.MoveValue(), std::runtime_error);

@@ -1,14 +1,18 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "plan/minmax_index_plan.hpp"
 
+#include <cstddef>
 #include <ostream>
+#include <string>
 #include <utility>
 
 #include "common/constants.hpp"
-#include "expression/column_value.hpp"
+#include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
 #include "type/column.hpp"
 #include "type/type.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -40,14 +44,16 @@ MinMaxIndexPlan::MinMaxIndexPlan(Plan child, NamedExpression aggregate,
               default:
                 break;
             }
-          } catch (...) {
+          } catch (...) {  // NOLINT(bugprone-empty-catch)
+            // Best-effort schema derivation: if the aggregate's result type
+            // cannot be resolved, keep the default ValueType::kInt64.
           }
         }
         return Schema("", {Column(aggregate_.name, value_type)});
       }()) {}
 
 void MinMaxIndexPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << ToString() << "\n";
+  output << Indent(static_cast<size_t>(indent)) << ToString() << "\n";
   child_->Dump(output, indent + 2);
 }
 

@@ -18,9 +18,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 
+#include "common/constants.hpp"
 #include "page/meta_page.hpp"
 #include "page/page_ref.hpp"
 #include "page_type.hpp"

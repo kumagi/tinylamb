@@ -19,9 +19,14 @@ class TransactionContext;
 
 class UnnestExecutor final : public ExecutorBase {
  public:
+  // `output_schema` (optional) is the plan-level schema for the unnest
+  // section; per-row array shapes can disagree with it (a NULL element in one
+  // array decodes through the scalar path while another row flattens struct
+  // members), so emitted rows are re-projected onto the plan layout by name.
   UnnestExecutor(TransactionContext& ctx, Schema child_schema, Executor child,
                  Expression unnest_expr, std::string alias,
-                 std::string offset_alias);
+                 std::string offset_alias, bool left_outer = false,
+                 Schema output_schema = Schema("", {}));
 
   UnnestExecutor(const UnnestExecutor&) = delete;
   UnnestExecutor(UnnestExecutor&&) = delete;
@@ -39,6 +44,11 @@ class UnnestExecutor final : public ExecutorBase {
   Expression unnest_expr_;
   std::string alias_;
   std::string offset_alias_;
+  // LEFT / FULL OUTER UNNEST: when the array is empty (or NULL) the driving
+  // row still emits once with NULL-extended unnest columns instead of
+  // disappearing.  INNER (the default) drops the row entirely.
+  bool left_outer_{false};
+  Schema output_schema_;
 
   Row current_child_row_;
   std::vector<Row> current_unnested_rows_;

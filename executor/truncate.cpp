@@ -1,12 +1,14 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/truncate.hpp"
 
+#include <cstdint>
 #include <ostream>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "page/row_position.hpp"
 #include "table/table.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

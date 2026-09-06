@@ -2,21 +2,26 @@
 #include "executor/exchange.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
-#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -25,8 +30,8 @@ namespace {
 
 uint64_t HashBytesKey(std::string_view bytes) {
   uint64_t hash = 14695981039346656037ULL;
-  for (unsigned char c : bytes) {
-    hash ^= static_cast<uint64_t>(c);
+  for (char byte : bytes) {
+    hash ^= static_cast<uint64_t>(static_cast<unsigned char>(byte));
     hash *= 1099511628211ULL;
   }
   return hash;
@@ -165,13 +170,21 @@ void ExchangeExecutor::DistributeRows() {
 }
 
 void ExchangeExecutor::EnsureMaterialized() {
-  if (materialized_) {
+  if (materialized_.load(std::memory_order_acquire)) {
     return;
   }
-  materialized_ = true;
+  std::scoped_lock lk(materialize_mutex_);
+  if (materialized_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  // Latch only after the work completes: if DistributeRows throws (OOM, a
+  // failing child), a later retry must re-attempt distribution instead of
+  // observing the latch with empty partitions and silently returning no
+  // rows.
   DistributeRows();
   current_gather_part_ = 0;
   current_gather_offset_ = 0;
+  materialized_.store(true, std::memory_order_release);
 }
 
 void ExchangeExecutor::MaterializePipeline() { EnsureMaterialized(); }

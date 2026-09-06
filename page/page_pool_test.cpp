@@ -93,7 +93,7 @@ TEST_F(PagePoolTest, GetPageSeveralpattern) {
 
   // Act -- request pages in the given pattern
   for (int& i : pattern) {
-    PageRef page = pp->GetPage(i, nullptr);
+    PageRef page = pp->GetPage(static_cast<page_id_t>(i), nullptr);
 
     // Assert -- each requested page has the expected ID
     ASSERT_EQ(page->PageID(), i);
@@ -104,7 +104,7 @@ TEST_F(PagePoolTest, GetManyPage) {
   // Arrange -- nothing more than default PagePool (capacity 10) from SetUp()
   // Act -- request 5 distinct pages (0..4) from the pool
   for (int i = 0; i < 5; ++i) {
-    PageRef p = pp->GetPage(i, nullptr);
+    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr);
 
     // Assert -- each page has the expected ID and pool size grows accordingly
     ASSERT_EQ(p->PageID(), i);
@@ -116,7 +116,7 @@ TEST_F(PagePoolTest, EvictPage) {
   // Arrange -- default PagePool (capacity 10); nothing else to set up
   // Act -- request 15 pages (0..14), exceeding the pool capacity of 10
   for (int i = 0; i < 15; ++i) {
-    PageRef p = pp->GetPage(i, nullptr);
+    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr);
 
     // Assert -- each page has the expected ID; pool size caps at capacity (10)
     ASSERT_EQ(p->PageID(), i);
@@ -134,7 +134,8 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
       // The union overlay makes the whole kPageSize image writable; the
       // analyzer cannot see that FreeBody() stays inside the allocation.
-      buff[j] = i;  // NOLINT(clang-analyzer-security.ArrayBound)
+      // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+      buff[j] = static_cast<char>(i);
     }
   }
   // Reset();
@@ -406,7 +407,7 @@ TEST_F(PagePoolTest, CacheHitFlagReflectsMissAndHit) {
 TEST_F(PagePoolTest, DropAllPagesClearsPool) {
   // Arrange -- request 5 distinct pages so the pool is non-empty
   for (int i = 0; i < 5; ++i) {
-    PageRef p = pp->GetPage(i, nullptr);
+    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr);
     ASSERT_EQ(p->PageID(), i);
   }
   ASSERT_EQ(pp->Size(), 5);
@@ -437,8 +438,8 @@ TEST_F(PagePoolTest, DropAllPagesWithPinnedRefsRetiresEntries) {
     EXPECT_EQ(keep->PageID(), 4U);
     EXPECT_EQ(transient->PageID(), 5U);
     // Union overlay: the write stays inside the kPageSize allocation.
-    keep->body.free_page.FreeBody()[0] =
-        'r';  // NOLINT(clang-analyzer-security.ArrayBound)
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+    keep->body.free_page.FreeBody()[0] = 'r';
   }
   PageRef fresh = pp->GetPage(6);
   ASSERT_EQ(fresh->PageID(), 6U);
@@ -452,8 +453,8 @@ TEST_F(PagePoolTest, DurabilityGateFiresForDirtyPagesOnly) {
   PageRef page = pp->GetPage(8);
   page->SetPageLSN(77);
   // Union overlay: the write stays inside the kPageSize allocation.
-  page->body.free_page.FreeBody()[0] =
-      'z';  // NOLINT(clang-analyzer-security.ArrayBound)
+  // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+  page->body.free_page.FreeBody()[0] = 'z';
 
   // Act -- flushing the dirty page must gate its page LSN first
   pp->FlushPageForTest(8);
@@ -475,8 +476,8 @@ TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
     ASSERT_NE(buff, nullptr);
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
       // Union overlay: the write stays inside the kPageSize allocation.
-      buff[j] = static_cast<char>(
-          0x5a);  // NOLINT(clang-analyzer-security.ArrayBound)
+      // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+      buff[j] = static_cast<char>(0x5a);
     }
 
     // Act -- write back page 7; flushing a never-resident page is a no-op
@@ -517,8 +518,8 @@ TEST_F(PagePoolTest, OutOfRangePageIdIsHardError) {
 
   // Act -- ordinary ids keep working afterwards; the extra page forces one
   // clean eviction round.
-  for (int i = 0; i < kDefaultCapacity + 1; ++i) {
-    PageRef page = pp->GetPage(static_cast<page_id_t>(1000) + i, nullptr);
+  for (int64_t i = 0; i < kDefaultCapacity + 1; ++i) {
+    PageRef page = pp->GetPage(static_cast<page_id_t>(1000 + i), nullptr);
     ASSERT_EQ(page->PageID(), 1000 + i);
   }
   pp->DropAllPages();
@@ -623,7 +624,7 @@ TEST_F(PagePoolTest, ParallelGetPageStressMixedIdsWithDirtyReload) {
       }
       // Private id ranges are disjoint across threads (stride 1000), so the
       // payload assertions below have a single writer per page.
-      const page_id_t base = static_cast<page_id_t>(10000) + t * 1000;
+      const auto base = (static_cast<page_id_t>(t) * 1000) + 10000;
       for (int i = 0; i < kIterations; ++i) {
         // Hot fan-out: read-only shared pages; only the id is checked
         // because several threads overlap on these ids.
@@ -639,16 +640,13 @@ TEST_F(PagePoolTest, ParallelGetPageStressMixedIdsWithDirtyReload) {
         {
           PageRef page = pp->GetPage(mine, nullptr);
           // Union overlay: the write stays inside the kPageSize allocation.
-          page->body.free_page.FreeBody()[0] =
-              stamp;  // NOLINT(clang-analyzer-security.ArrayBound)
+          // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+          page->body.free_page.FreeBody()[0] = stamp;
         }
         {
           PageRef reloaded = pp->GetPage(mine, nullptr);
           EXPECT_EQ(reloaded->PageID(), mine);
-          EXPECT_EQ(
-              reloaded->body.free_page
-                  .FreeBody()[0],  // NOLINT(clang-analyzer-security.ArrayBound)
-              stamp);
+          EXPECT_EQ(reloaded->body.free_page.FreeBody()[0], stamp);
         }
       }
     });

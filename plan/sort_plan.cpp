@@ -1,11 +1,15 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under the Apache-2.0 license. */
 #include "sort_plan.hpp"
 
+#include <cstddef>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "expression/expression.hpp"
 
 namespace tinylamb {
 
@@ -51,7 +55,7 @@ bool SortPlan::IsOrderedBy(
 }
 
 void SortPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "Sort: [";
+  output << Indent(static_cast<size_t>(indent)) << "Sort: [";
   for (size_t i = 0; i < keys_.size(); ++i) {
     if (i > 0) {
       output << ", ";
@@ -59,7 +63,7 @@ void SortPlan::Dump(std::ostream& output, int indent) const {
     output << keys_[i].expression->ToString()
            << (keys_[i].ascending ? " ASC" : " DESC");
   }
-  output << "]\n" << Indent(indent + 2);
+  output << "]\n" << Indent(static_cast<size_t>(indent) + 2);
   child_->Dump(output, indent + 2);
 }
 

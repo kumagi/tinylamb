@@ -25,8 +25,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -35,8 +35,8 @@
 #include "parser/pratt_parser.hpp"
 #include "parser/token.hpp"
 #include "query/statement.hpp"
-#include "type/column_name.hpp"
 #include "type/column.hpp"
+#include "type/column_name.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -67,7 +67,9 @@ size_t ParseCountLiteral(const std::string& text) {
 Parser::Parser(const std::vector<Token>& tokens) : tokens_(tokens) {}
 Parser::Parser(std::vector<Token>&& tokens) : tokens_(std::move(tokens)) {}
 
-std::unique_ptr<Statement> Parser::Parse() {  // NOLINT(misc-no-recursion) // IN (SELECT ...) subqueries recurse into Parser::Parse by design.
+std::unique_ptr<Statement>
+Parser::Parse() {  // NOLINT(misc-no-recursion) // IN (SELECT ...) subqueries
+                   // recurse into Parser::Parse by design.
   Token token = Peek();
   if (token.type == TokenType::kKeyword) {
     if (token.value == "CREATE") {
@@ -90,9 +92,8 @@ std::unique_ptr<Statement> Parser::Parse() {  // NOLINT(misc-no-recursion) // IN
     }
   }
   throw std::runtime_error("Unsupported statement: " +
-                           (token.type == TokenType::kEof
-                                ? std::string("<eof>")
-                                : token.ToString()));
+                           (token.type == TokenType::kEof ? std::string("<eof>")
+                                                          : token.ToString()));
 }
 
 std::unique_ptr<Statement> Parser::ParseInsert() {
@@ -138,8 +139,11 @@ std::unique_ptr<Statement> Parser::ParseInsert() {
   return std::make_unique<InsertStatement>(table_name, values, columns);
 }
 
-std::unique_ptr<Statement> Parser::ParseSelect() {  // NOLINT(misc-no-recursion) // Recursion only via IN (SELECT ...) subquery parsing; SQL grammar is recursive by design.
-  Advance();  // SELECT
+std::unique_ptr<Statement>
+Parser::ParseSelect() {  // NOLINT(misc-no-recursion) // Recursion only via IN
+                         // (SELECT ...) subquery parsing; SQL grammar is
+                         // recursive by design.
+  Advance();             // SELECT
   bool distinct = false;
   if (Peek().type == TokenType::kKeyword && Peek().value == "DISTINCT") {
     Advance();
@@ -266,10 +270,9 @@ std::unique_ptr<Statement> Parser::ParseSelect() {  // NOLINT(misc-no-recursion)
     offset = ParseCountLiteral(Advance().value);
   }
   Expect(TokenType::kSemicolon);
-  auto statement =
-      std::make_unique<SelectStatement>(select_list, from_clause, where_clause,
-                                        order_by, limit.value_or(0), offset,
-                                        distinct);
+  auto statement = std::make_unique<SelectStatement>(
+      select_list, from_clause, where_clause, order_by, limit.value_or(0),
+      offset, distinct);
   statement->SetLimit(limit);
   for (auto& [alias, table] : aliases) {
     statement->AddAlias(alias, table);
@@ -340,28 +343,29 @@ std::unique_ptr<Statement> Parser::ParseCreateTable() {
     if (Peek().type == TokenType::kKeyword &&
         (Peek().value == "PRIMARY" || Peek().value == "UNIQUE")) {
       int constraint_depth = 0;
-      while (constraint_depth != 0 ||
-             (Peek().type != TokenType::kComma &&
-              Peek().type != TokenType::kRParen &&
-              Peek().type != TokenType::kEof)) {
+      while (constraint_depth != 0 || (Peek().type != TokenType::kComma &&
+                                       Peek().type != TokenType::kRParen &&
+                                       Peek().type != TokenType::kEof)) {
         Token token = Advance();
-        if (token.type == TokenType::kLParen) { ++constraint_depth;
-}
-        if (token.type == TokenType::kRParen) { --constraint_depth;
-}
+        if (token.type == TokenType::kLParen) {
+          ++constraint_depth;
+        }
+        if (token.type == TokenType::kRParen) {
+          --constraint_depth;
+        }
       }
-      if (Peek().type == TokenType::kComma) { Advance();
-}
+      if (Peek().type == TokenType::kComma) {
+        Advance();
+      }
       continue;
     }
     std::string column_name = Advance().value;
     std::string type_name = Advance().value;
     ValueType type = ValueType::kNull;
     std::string upper_type_name;
-    std::ranges::transform(type_name, std::back_inserter(upper_type_name),
-                           [](unsigned char c) {
-                             return static_cast<char>(std::toupper(c));
-                           });
+    std::ranges::transform(
+        type_name, std::back_inserter(upper_type_name),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     if (upper_type_name == "INT" || upper_type_name == "INT64" ||
         upper_type_name == "INTEGER" || upper_type_name == "BIGINT" ||
         upper_type_name == "BOOL" || upper_type_name == "BOOLEAN") {
@@ -404,15 +408,16 @@ std::unique_ptr<Statement> Parser::ParseCreateTable() {
     }
     columns.emplace_back(column_name, type);
     int constraint_depth = 0;
-    while (constraint_depth != 0 ||
-           (Peek().type != TokenType::kComma &&
-            Peek().type != TokenType::kRParen &&
-            Peek().type != TokenType::kEof)) {
+    while (constraint_depth != 0 || (Peek().type != TokenType::kComma &&
+                                     Peek().type != TokenType::kRParen &&
+                                     Peek().type != TokenType::kEof)) {
       Token token = Advance();
-      if (token.type == TokenType::kLParen) { ++constraint_depth;
-}
-      if (token.type == TokenType::kRParen) { --constraint_depth;
-}
+      if (token.type == TokenType::kLParen) {
+        ++constraint_depth;
+      }
+      if (token.type == TokenType::kRParen) {
+        --constraint_depth;
+      }
     }
     if (Peek().type == TokenType::kComma) {
       Advance();
@@ -425,7 +430,7 @@ std::unique_ptr<Statement> Parser::ParseCreateTable() {
 
 Token Parser::Peek() {
   if (pos_ >= tokens_.size()) {
-    return {.type=TokenType::kEof, .value=""};
+    return {.type = TokenType::kEof, .value = ""};
   }
   return tokens_[pos_];
 }
@@ -459,15 +464,21 @@ Expression Parser::ParseExpression() {
   return expr;
 }
 
-Expression Parser::ParseWhereClause(std::vector<std::string>* from_clause) {  // NOLINT(misc-no-recursion) // Recursion only via nested IN (SELECT ...) subquery; bounded by SQL nesting.
+Expression Parser::ParseWhereClause(
+    std::vector<std::string>*
+        from_clause) {  // NOLINT(misc-no-recursion) // Recursion only via
+                        // nested IN (SELECT ...) subquery; bounded by SQL
+                        // nesting.
   size_t clause_end = pos_;
   int depth = 0;
   for (; clause_end < tokens_.size(); ++clause_end) {
     const Token& token = tokens_[clause_end];
-    if (token.type == TokenType::kLParen) { ++depth;
-}
-    if (token.type == TokenType::kRParen) { --depth;
-}
+    if (token.type == TokenType::kLParen) {
+      ++depth;
+    }
+    if (token.type == TokenType::kRParen) {
+      --depth;
+    }
     if (depth == 0 && (token.type == TokenType::kSemicolon ||
                        (token.type == TokenType::kKeyword &&
                         (token.value == "ORDER" || token.value == "LIMIT" ||
@@ -481,10 +492,12 @@ Expression Parser::ParseWhereClause(std::vector<std::string>* from_clause) {  //
   size_t term_begin = pos_;
   depth = 0;
   for (size_t i = pos_; i < clause_end; ++i) {
-    if (tokens_[i].type == TokenType::kLParen) { ++depth;
-}
-    if (tokens_[i].type == TokenType::kRParen) { --depth;
-}
+    if (tokens_[i].type == TokenType::kLParen) {
+      ++depth;
+    }
+    if (tokens_[i].type == TokenType::kRParen) {
+      --depth;
+    }
     if (depth == 0 && tokens_[i].type == TokenType::kKeyword &&
         tokens_[i].value == "AND") {
       terms.emplace_back(term_begin, i);
@@ -498,10 +511,12 @@ Expression Parser::ParseWhereClause(std::vector<std::string>* from_clause) {  //
     size_t in_position = end;
     depth = 0;
     for (size_t i = begin; i < end; ++i) {
-      if (tokens_[i].type == TokenType::kLParen) { ++depth;
-}
-      if (tokens_[i].type == TokenType::kRParen) { --depth;
-}
+      if (tokens_[i].type == TokenType::kLParen) {
+        ++depth;
+      }
+      if (tokens_[i].type == TokenType::kRParen) {
+        --depth;
+      }
       if (depth == 0 && tokens_[i].type == TokenType::kKeyword &&
           tokens_[i].value == "IN" && i + 2 < end &&
           tokens_[i + 1].type == TokenType::kLParen &&

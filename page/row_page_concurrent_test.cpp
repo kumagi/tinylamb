@@ -88,11 +88,11 @@ TEST_F(RowPageConcurrentTest, InsertUpdate) {
   }
   for (int i = 0; i < kThreads / 2; ++i) {
     threads.emplace_back([&, i]() {
-      std::mt19937 rand(i);
+      std::mt19937 rand(static_cast<std::mt19937::result_type>(i));
       for (int j = 0; j < kRows; ++j) {
         // Act (updater) -- update a random existing row with a new random
         // string
-        UpdateRow(rand() % kRows, RandomString());
+        UpdateRow(static_cast<int>(rand() % kRows), RandomString());
       }
     });
   }
@@ -121,7 +121,8 @@ TEST_F(RowPageConcurrentTest, UpdateUpdate) {
     threads.emplace_back([&]() {
       // Act -- each thread updates 100 random rows with new random strings
       for (int j = 0; j < 100; ++j) {
-        UpdateRow(engine() % rows, RandomString(engine() % 64));
+        UpdateRow(static_cast<int>(engine() % rows),
+                  RandomString(engine() % 64));
       }
     });
   }

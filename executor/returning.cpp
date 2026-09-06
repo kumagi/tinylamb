@@ -1,11 +1,14 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/returning.hpp"
 
+#include <cstddef>
 #include <ostream>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "expression/named_expression.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -27,7 +30,7 @@ bool ReturningExecutor::Next(Row* dst, RowPosition* rp) {
 }
 
 void ReturningExecutor::Dump(std::ostream& o, int indent) const {
-  o << "ReturningExecutor: \n" << Indent(indent + 2);
+  o << "ReturningExecutor: \n" << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(o, indent + 2);
 }
 

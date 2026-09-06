@@ -53,7 +53,7 @@ class TransactionContext {
     execution_runtime_ = nullptr;
     return *this;
   }
-  CatalogReader* GetCatalog() { return catalog_; }
+  CatalogReader* GetCatalog() const { return catalog_; }
   StatusOr<std::shared_ptr<Table>> GetTable(std::string_view table_name);
   StatusOr<std::shared_ptr<TableStatistics>> GetStats(
       std::string_view table_name);

@@ -14,7 +14,7 @@ namespace tinylamb {
 struct TableScanOptions {
   std::optional<std::vector<slot_t>> projection;
   const std::unordered_set<int64_t>* key_filter = nullptr;
-  std::optional<slot_t> key_column;
+  std::optional<slot_t> key_column = std::nullopt;
   const std::vector<IntegerPeekCompare>* peek_compares = nullptr;
 };
 

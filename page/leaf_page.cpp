@@ -34,7 +34,6 @@
 #include "common/status_or.hpp"
 #include "page/index_key.hpp"
 #include "page/page.hpp"
-#include "page_type.hpp"
 #include "row_pointer.hpp"
 #include "transaction/transaction.hpp"
 
@@ -112,11 +111,12 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
     DeFragment();
   }
   assert((sizeof(RowPointer) * (row_count_ + 1)) + physical_size <= free_ptr_);
-  free_size_ -= static_cast<bin_size_t>(physical_size) + sizeof(RowPointer);
-  free_ptr_ -= physical_size;
+  free_size_ -= static_cast<bin_size_t>(physical_size + sizeof(RowPointer));
+  free_ptr_ -= static_cast<bin_size_t>(physical_size);
 
   bin_size_t write_offset = free_ptr_;
-  write_offset += SerializeStringView(Payload() + write_offset, key);
+  write_offset += static_cast<bin_size_t>(
+      SerializeStringView(Payload() + write_offset, key));
   SerializeStringView(Payload() + write_offset, value);
 
   size_t pos = Find(key);
@@ -189,12 +189,12 @@ void LeafPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
     }
     assert((sizeof(RowPointer) * (row_count_ + 1)) + physical_size <=
            free_ptr_);
-    free_ptr_ -= physical_size;
+    free_ptr_ -= static_cast<bin_size_t>(physical_size);
     pos.offset = free_ptr_;
   }
   // free_size_ += pos.size;
-  free_size_ -= physical_size;
-  pos.size = physical_size;
+  free_size_ -= static_cast<bin_size_t>(physical_size);
+  pos.size = static_cast<bin_size_t>(physical_size);
   memcpy(Payload() + pos.offset, payload.data(), payload.size());
 }
 
@@ -215,7 +215,7 @@ void LeafPage::DeleteImpl(std::string_view key) {
   if (pos >= row_count_ || GetKey(pos) != key) {
     return;
   }
-  free_size_ += rows_[pos].size + sizeof(RowPointer);
+  free_size_ += static_cast<bin_size_t>(rows_[pos].size + sizeof(RowPointer));
   memmove(rows_ + pos, rows_ + pos + 1,
           sizeof(RowPointer) * (row_count_ - pos - 1));
   --row_count_;
@@ -307,8 +307,8 @@ Status LeafPage::Split(page_id_t /*pid*/, Transaction& txn,
     RETURN_IF_FAIL(this_page->Delete(txn, GetKey(pivot)));
   }
 
-  if (right->RowCount() == 0 ||
-      right->GetKey(0) <= key) {  // NOLINT(bugprone-branch-clone)
+  if (right->RowCount() == 0 ||  // NOLINT(bugprone-branch-clone)
+      right->GetKey(0) <= key) {
     assert(expected_size <= right->body.leaf_page.free_size_);
   } else {
     assert(expected_size <= free_size_);
@@ -335,7 +335,7 @@ void LeafPage::DeFragment() {
   for (size_t i = 0; i < row_count_; ++i) {
     assert(payloads[i].size() <= free_ptr_);
     assert(payloads[i].size() == rows_[i].size);
-    free_ptr_ -= payloads[i].size();
+    free_ptr_ -= static_cast<bin_size_t>(payloads[i].size());
     rows_[i].offset = free_ptr_;
     memcpy(Payload() + free_ptr_, payloads[i].data(), payloads[i].size());
   }
@@ -371,14 +371,14 @@ size_t LeafPage::Find(std::string_view key) const {
   int right = row_count_;
   while (1 < right - left) {
     const int cur = (left + right) / 2;
-    std::string_view cur_key = GetKey(cur);
+    std::string_view cur_key = GetKey(static_cast<size_t>(cur));
     if (cur_key < key) {
       left = cur;
     } else {
       right = cur;
     }
   }
-  return right;
+  return static_cast<size_t>(right);
 }
 
 void LeafPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
@@ -513,8 +513,9 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
     << " FreePtr:" << free_ptr_;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
-      << Indent(indent) << OmittedString(GetKey(i), 40) << " ("
-      << GetKey(i).size() << "bytes) :" << OmittedString(GetValue(i), 20);
+      << Indent(static_cast<size_t>(indent)) << OmittedString(GetKey(i), 40)
+      << " (" << GetKey(i).size()
+      << "bytes) :" << OmittedString(GetValue(i), 20);
   }
   if (0 < foster_.size) {
     std::string_view serialized_key;
@@ -523,8 +524,9 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
         DeserializeStringView(Payload() + foster_.offset, &serialized_key);
     DeserializePID(Payload() + foster_.offset + offset, &child);
     o << "\n"
-      << Indent(indent) << "  FosterKey: " << HeadString(serialized_key, 10)
-      << " (" << serialized_key.size() << "bytes)"
+      << Indent(static_cast<size_t>(indent))
+      << "  FosterKey: " << HeadString(serialized_key, 10) << " ("
+      << serialized_key.size() << "bytes)"
       << " -> " << child;
   }
 }

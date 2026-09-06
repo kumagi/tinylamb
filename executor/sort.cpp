@@ -2,6 +2,7 @@
 #include "executor/sort.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -29,7 +30,9 @@
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -47,10 +50,10 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
     case ValueType::kDate: {
       out->push_back(static_cast<char>(v.type));
       const uint64_t be = BSwap64(static_cast<uint64_t>(v.value.int_value));
-      char buf[8];
-      std::memcpy(buf, &be, sizeof(buf));
+      std::array<char, 8> buf{};
+      std::memcpy(buf.data(), &be, buf.size());
       buf[0] ^= static_cast<char>(0x80);
-      out->append(buf, sizeof(buf));
+      out->append(buf.data(), buf.size());
       break;
     }
     case ValueType::kVarChar: {
@@ -100,9 +103,9 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
       } else {
         be = ~be;
       }
-      char buf[8];
-      std::memcpy(buf, &be, sizeof(buf));
-      out->append(buf, sizeof(buf));
+      std::array<char, 8> buf{};
+      std::memcpy(buf.data(), &be, buf.size());
+      out->append(buf.data(), buf.size());
       break;
     }
     case ValueType::kArray:
@@ -168,7 +171,7 @@ class SortKeyEncoder {
       return 0;
     }
     *is_null = false;
-    const uint64_t bits = static_cast<uint64_t>(v.value.int_value);
+    const auto bits = static_cast<uint64_t>(v.value.int_value);
     // Order-preserving map: sign flip for ASC. DESC must invert that map
     // (~(bits ^ sign)), not the raw two's-complement bits: ~bits keeps
     // negative keys below positive ones, so mixed-sign DESC came out wrong.
@@ -189,7 +192,11 @@ class SortKeyEncoder {
       const bool nulls_first = spec.nulls_first;
       if (spec.ascending) {
         if (v->IsNull()) {
-          out->push_back(nulls_first ? '\x00' : '\x02');
+          // Must sort above every non-null encoding ('\x01' + type byte
+          // 1..5).  '\x02' would collide with a VARCHAR value's type tag and
+          // sort below DOUBLE/DATE/ARRAY keys, silently flipping NULLS LAST
+          // into NULLS FIRST for those types.
+          out->push_back(nulls_first ? '\x00' : '\xff');
           continue;
         }
         out->push_back('\x01');
@@ -222,10 +229,10 @@ class SortKeyEncoder {
   Kind kind_{Kind::kEncoded};
 };
 
-void RadixSortIndices(size_t* begin, size_t* end,
+void RadixSortIndices(size_t* begin, const size_t* end,
                       const std::vector<uint64_t>& keys,
                       std::vector<size_t>* tmp) {
-  const size_t n = static_cast<size_t>(end - begin);
+  const auto n = static_cast<size_t>(end - begin);
   if (n < 2) {
     return;
   }
@@ -234,11 +241,11 @@ void RadixSortIndices(size_t* begin, size_t* end,
   size_t* dst = tmp->data();
   for (int pass = 0; pass < 8; ++pass) {
     const int shift = pass * 8;
-    size_t count[257]{};
+    std::array<size_t, 257> count{};
     for (size_t i = 0; i < n; ++i) {
       ++count[((keys[src[i]] >> shift) & 0xFF) + 1];
     }
-    for (int b = 0; b < 256; ++b) {
+    for (size_t b = 0; b < 256; ++b) {
       count[b + 1] += count[b];
     }
     for (size_t i = 0; i < n; ++i) {
@@ -261,10 +268,10 @@ class KeyOrdering {
       bool is_null = false;
       const uint64_t key = encoder_.SingleKey(row, &is_null);
       raw_keys_.push_back(key);
-      null_flags_.push_back(is_null);
+      null_flags_.push_back(static_cast<uint8_t>(is_null));
       return;
     }
-    const uint32_t begin = static_cast<uint32_t>(blob_.size());
+    const auto begin = static_cast<uint32_t>(blob_.size());
     encoder_.AppendEncoded(row, &blob_);
     spans_.emplace_back(begin, static_cast<uint32_t>(blob_.size() - begin));
   }
@@ -284,7 +291,8 @@ class KeyOrdering {
     return encoder_.GetKind();
   }
 
-  std::vector<size_t> BuildPermutation(size_t rows, size_t workers) const {
+  [[nodiscard]] std::vector<size_t> BuildPermutation(size_t rows,
+                                                     size_t workers) const {
     std::vector<size_t> perm(rows);
     for (size_t i = 0; i < rows; ++i) {
       perm[i] = i;
@@ -300,7 +308,7 @@ class KeyOrdering {
       std::vector<size_t> nulls;
       std::vector<size_t> non_nulls;
       for (size_t i = 0; i < rows; ++i) {
-        (null_flags_[i] ? nulls : non_nulls).push_back(i);
+        ((null_flags_[i] != 0U) ? nulls : non_nulls).push_back(i);
       }
       if (!nulls.empty()) {
         // Honor the explicit NULLS FIRST/LAST request (the encoder already
@@ -393,7 +401,7 @@ class KeyOrdering {
  private:
   [[nodiscard]] std::string_view SpanAt(size_t index) const {
     const Span span = spans_[index];
-    return std::string_view(blob_.data() + span.first, span.second);
+    return {blob_.data() + span.first, span.second};
   }
 
   SortKeyEncoder encoder_;
@@ -519,7 +527,7 @@ void SortExecutor::Materialize() {
         PositionedRow item;
         while (rows.size() < kMergeWindowRows && reader->Next(&item)) {
           charge.Add(EstimateRowBytes(item.first) + sizeof(RowPosition));
-          const uint32_t begin = static_cast<uint32_t>(keys.size());
+          const auto begin = static_cast<uint32_t>(keys.size());
           ord.AppendEncodedTo(item.first, &keys);
           spans.emplace_back(begin, static_cast<uint32_t>(keys.size() - begin));
           rows.push_back(std::move(item));
@@ -563,19 +571,24 @@ void SortExecutor::Materialize() {
     auto current_key = [&cursors](size_t id) -> std::string_view {
       const MergeWindow& w = *cursors[id].window;
       const auto span = w.spans[w.index];
-      return std::string_view(w.keys.data() + span.first, span.second);
+      return {w.keys.data() + span.first, span.second};
     };
     auto cursor_less = [&](size_t a, size_t b) {
       const int c = CompareSpans(current_key(a), current_key(b));
       if (c != 0) {
         return c > 0;
       }
+      // Tie-break: with this inverted (min-heap) comparator, "less" means
+      // the larger run id, so the heap pops the smaller run id first.  Rows
+      // from earlier runs appeared earlier in the pre-spill total order,
+      // keeping the external merge stable like std::stable_sort.
       return cursors[a].run_id > cursors[b].run_id;
     };
     std::priority_queue<size_t, std::vector<size_t>, decltype(cursor_less)>
         heap(cursor_less);
     for (size_t i = 0; i < cursors.size(); ++i) {
-      if (cursors[i].window && !cursors[i].window->rows.empty()) {
+      const std::optional<MergeWindow>& window = cursors[i].window;
+      if (window && !window->rows.empty()) {
         heap.push(i);
       }
     }
@@ -618,7 +631,7 @@ bool SortExecutor::Next(Row* dst, RowPosition* rp) {
 
 void SortExecutor::Dump(std::ostream& output, int indent) const {
   output << "ParallelSort (" << worker_count_ << " workers)\n"
-         << std::string(indent + 2, ' ');
+         << std::string(static_cast<size_t>(indent) + 2, ' ');
   source_->Dump(output, indent + 2);
 }
 

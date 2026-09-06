@@ -16,6 +16,7 @@
 
 #include "expression/aggregate_expression.hpp"
 
+#include <cstddef>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -105,7 +106,7 @@ std::string AggregateExpression::ToString() const {
   if (!inner_order_by_.empty()) {
     out += " ORDER BY ";
     for (size_t i = 0; i < inner_order_by_.size(); ++i) {
-      if (i) {
+      if (i != 0U) {
         out += ", ";
       }
       out += inner_order_by_[i].expression->ToString();

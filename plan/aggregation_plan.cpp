@@ -16,19 +16,15 @@
 
 #include "plan/aggregation_plan.hpp"
 
-#include <algorithm>
 #include <cstddef>
-#include <memory>
 #include <ostream>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/named_expression.hpp"
-#include "plan/parallel_thresholds.hpp"
 #include "plan/plan.hpp"
 #include "type/column.hpp"
 #include "type/schema.hpp"
@@ -86,7 +82,7 @@ std::string AggregationPlan::ToString() const {
 }
 
 void AggregationPlan::Dump(std::ostream& o, int indent) const {
-  o << Indent(indent) << ToString() << "\n";
+  o << Indent(static_cast<size_t>(indent)) << ToString() << "\n";
   child_->Dump(o, indent + 2);
 }
 

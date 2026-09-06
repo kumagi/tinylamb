@@ -167,6 +167,9 @@ int64_t AddDateIntervalDays(int64_t days, int64_t amount,
 }
 
 namespace {
+// std::string allocation at thread-local init is the accepted failure mode;
+// a bad_alloc here is fatal for the engine regardless of how it surfaces.
+// NOLINTNEXTLINE(cert-err58-cpp)
 thread_local std::string tls_default_time_zone = "America/Los_Angeles";
 }  // namespace
 

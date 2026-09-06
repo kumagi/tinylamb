@@ -21,6 +21,7 @@
 #include <ostream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -67,6 +68,11 @@ struct QueryData {
     return o;
   }
   Status Rewrite(TransactionContext& ctx);
+  // Records `status` in the return slot; kAmbiguousQuery also captures the
+  // colliding column name from `ambiguous_names` (single-entry sets only)
+  // into ambiguous_column_ so error messages can name it.
+  Status RecordAmbiguousColumn(
+      Status status, const std::unordered_set<std::string>& ambiguous_names);
   std::vector<std::string> from_;
   Expression where_;
   std::vector<NamedExpression> select_;
@@ -88,6 +94,9 @@ struct QueryData {
   // plan reports EnforcesLimit (D6).
   size_t limit_count_{0};
   size_t limit_offset_{0};
+  // Bare name of the ambiguous column that made Rewrite fail with
+  // kAmbiguousQuery (empty when several names collide or nothing matched).
+  std::string ambiguous_column_;
 };
 
 }  // namespace tinylamb

@@ -42,6 +42,10 @@ class ProjectionPlan : public PlanBase {
   [[nodiscard]] const Table* ScanSource() const override {
     return src_->ScanSource();
   }
+  [[nodiscard]] const Plan& GetSource() const { return src_; }
+  [[nodiscard]] const std::vector<NamedExpression>& Columns() const {
+    return columns_;
+  }
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return stats_;

@@ -51,9 +51,9 @@ class FunctionCallExpression : public ExpressionBase {
  public:
   FunctionCallExpression(std::string func_name, std::vector<Expression> args)
       : func_name_(std::move(func_name)), args_(std::move(args)) {
-    std::transform(
-        func_name_.begin(), func_name_.end(), func_name_.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::ranges::transform(func_name_, func_name_.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
   }
 
   [[nodiscard]] Value Evaluate(const Row& row,

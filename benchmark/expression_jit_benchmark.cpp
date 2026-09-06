@@ -21,8 +21,8 @@ int main() {
   std::cout << "compile_ms=" << kernel->CompileMilliseconds() << "\n";
   size_t break_even = 0;
   volatile uint64_t checksum = 0;
-  for (size_t rows : {64U, 256U, 1024U, 4096U, 16384U, 65536U,
-                      262144U, 1048576U}) {
+  for (size_t rows :
+       {64U, 256U, 1024U, 4096U, 16384U, 65536U, 262144U, 1048576U}) {
     std::vector<int64_t> input(rows);
     std::iota(input.begin(), input.end(), int64_t{0});
     std::vector<uint8_t> output(rows);

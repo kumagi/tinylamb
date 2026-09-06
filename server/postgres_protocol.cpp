@@ -7,10 +7,8 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
-#include <iomanip>
 #include <limits>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -275,6 +273,7 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
   bool backtick_quote = false;
   bool line_comment = false;
   bool block_comment = false;
+  int block_comment_depth = 0;
   const auto Append = [&](char c) {
     current.push_back(c);
     if (!std::isspace(static_cast<unsigned char>(c))) {
@@ -305,8 +304,20 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
     }
     if (block_comment) {
       current.push_back(current_char);
+      // PostgreSQL nests block comments: track depth so `/* outer /* inner */`
+      // does not end the comment (and splice the rest of the message into a
+      // bogus statement).
+      if (current_char == '/' && next == '*') {
+        ++block_comment_depth;
+        ++i;
+        current.push_back('*');
+        continue;
+      }
       if (current_char == '*' && next == '/') {
-        block_comment = false;
+        --block_comment_depth;
+        if (block_comment_depth <= 0) {
+          block_comment = false;
+        }
         ++i;
         current.push_back('/');
       }
@@ -322,6 +333,7 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
       }
       if (current_char == '/' && next == '*') {
         block_comment = true;
+        block_comment_depth = 1;
         ++i;
         current.push_back(current_char);
         current.push_back('*');

@@ -25,19 +25,20 @@
 #include <memory>
 #include <optional>
 #include <ostream>
-#include <ranges>
 #include <stdexcept>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/jit.hpp"
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
@@ -66,7 +67,9 @@ AggregationExecutor::AggregationExecutor(
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
       if (offset >= 0 &&
-          input_schema_.GetColumn(offset).Type() == ValueType::kInt64 &&
+          input_schema_.GetColumn(static_cast<size_t>(offset)).Type() ==
+              ValueType::kInt64 &&
+          BytecodeEnabled() &&
           aggregate.Child()->AsColumnValue().GetColumnName().name.find(
               "uint64") == std::string::npos) {
         jit_sum_eligible_ = true;
@@ -92,7 +95,8 @@ AggregationExecutor::AggregationExecutor(
         const int offset =
             input_schema_.Offset(agg.Child()->AsColumnValue().GetColumnName());
         if (offset >= 0) {
-          const ValueType declared = input_schema_.GetColumn(offset).Type();
+          const ValueType declared =
+              input_schema_.GetColumn(static_cast<size_t>(offset)).Type();
           if (declared == ValueType::kInt64 || declared == ValueType::kDouble) {
             input.kind = AggregateInputKind::kTypedColumn;
             input.column = static_cast<size_t>(offset);
@@ -270,7 +274,7 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
             (*results)[i] = Value(
                 ((*results)[i].IsNull() ? 0.0
                                         : (*results)[i].value.double_value) +
-                static_cast<double>(rows) * constant.value.double_value);
+                (static_cast<double>(rows) * constant.value.double_value));
           }
           break;
         case AggregationType::kAvg:
@@ -327,7 +331,7 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
               if (column.IsNull(row)) {
                 continue;
               }
-              const uint64_t value = static_cast<uint64_t>(integers[row]);
+              const auto value = static_cast<uint64_t>(integers[row]);
               if (batch_sum > std::numeric_limits<uint64_t>::max() - value) {
                 throw std::runtime_error("uint64 overflow in SUM");
               }
@@ -524,6 +528,12 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
   size_t distinct_charged_bytes = 0;
   struct DistinctChargeRelease {
     size_t* bytes;
+    explicit DistinctChargeRelease(size_t* charged_bytes)
+        : bytes(charged_bytes) {}
+    DistinctChargeRelease(const DistinctChargeRelease&) = delete;
+    DistinctChargeRelease& operator=(const DistinctChargeRelease&) = delete;
+    DistinctChargeRelease(DistinctChargeRelease&&) = delete;
+    DistinctChargeRelease& operator=(DistinctChargeRelease&&) = delete;
     ~DistinctChargeRelease() {
       if (*bytes != 0) {
         QueryMemoryBudget::Global().Release(*bytes);
@@ -825,9 +835,11 @@ void AggregationExecutor::Dump(std::ostream& o, int indent) const {
   // The Cascades path only creates scalar aggregates (no GROUP BY keys).
   o << "Aggregate strategy=scalar {";
   for (const auto& agg : aggregates_) {
-    o << "\n" << Indent(indent + 2) << agg.name << ": " << *agg.expression;
+    o << "\n"
+      << Indent(static_cast<size_t>(indent) + 2) << agg.name << ": "
+      << *agg.expression;
   }
-  o << "\n" << Indent(indent) << "}\n";
+  o << "\n" << Indent(static_cast<size_t>(indent)) << "}\n";
   child_->Dump(o, indent + 2);
 }
 

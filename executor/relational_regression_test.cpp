@@ -33,8 +33,8 @@
 
 #include <cstdint>
 #include <memory>
-#include <string_view>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -42,8 +42,8 @@
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
-#include "executor/executor_base.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/executor_base.hpp"
 #include "gtest/gtest.h"
 #include "query/sql_engine.hpp"
 #include "type/column.hpp"
@@ -83,22 +83,24 @@ class RelationalRegressionTest : public ::testing::Test {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(
         Table, agg,
-        rs_->CreateTable(ctx, Schema("AggTable", {Column("k", ValueType::kInt64),
-                                                  Column("v", ValueType::kInt64)})));
+        rs_->CreateTable(ctx,
+                         Schema("AggTable", {Column("k", ValueType::kInt64),
+                                             Column("v", ValueType::kInt64)})));
     for (int64_t i = 0; i < 200; ++i) {
-      ASSERT_SUCCESS(agg.Insert(ctx.txn_, Row({Value(i % 10), Value(1)}))
-                          .GetStatus());
+      ASSERT_SUCCESS(
+          agg.Insert(ctx.txn_, Row({Value(i % 10), Value(1)})).GetStatus());
     }
     ASSIGN_OR_ASSERT_FAIL(
         Table, small,
-        rs_->CreateTable(ctx, Schema("SmallKeys", {Column("k", ValueType::kInt64)})));
+        rs_->CreateTable(
+            ctx, Schema("SmallKeys", {Column("k", ValueType::kInt64)})));
     for (const int64_t key : {int64_t{1}, int64_t{2}, int64_t{3}, int64_t{4}}) {
-      ASSERT_SUCCESS(
-          small.Insert(ctx.txn_, Row({Value(key)})).GetStatus());
+      ASSERT_SUCCESS(small.Insert(ctx.txn_, Row({Value(key)})).GetStatus());
     }
     ASSIGN_OR_ASSERT_FAIL(
         Table, driver,
-        rs_->CreateTable(ctx, Schema("KeyTable", {Column("k", ValueType::kInt64)})));
+        rs_->CreateTable(ctx,
+                         Schema("KeyTable", {Column("k", ValueType::kInt64)})));
     for (int64_t i = 0; i < 10; ++i) {
       ASSERT_SUCCESS(driver.Insert(ctx.txn_, Row({Value(i)})).GetStatus());
     }
@@ -115,11 +117,12 @@ class RelationalRegressionTest : public ::testing::Test {
 // list pushdown (BuildInput stores table_key_filters["AggTable"]) and then
 // aggregates the same table in an uncorrelated scalar subquery. The subquery's
 // stream_agg cache fill must stay unfiltered; only its own read may filter.
-TEST_F(RelationalRegressionTest, Execute_StreamAggWithInListFilter_IgnoresStashedFilterInSubquery) {
-  const auto rows = RelationalRun(
-      *rs_,
-      "SELECT COUNT(*), (SELECT SUM(k + v) FROM AggTable) "
-      "FROM AggTable WHERE k IN (SELECT k FROM SmallKeys);");
+TEST_F(RelationalRegressionTest,
+       Execute_StreamAggWithInListFilter_IgnoresStashedFilterInSubquery) {
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT COUNT(*), (SELECT SUM(k + v) FROM AggTable) "
+                    "FROM AggTable WHERE k IN (SELECT k FROM SmallKeys);");
   ASSERT_EQ(rows.size(), 1U);
   // Outer aggregation sees exactly the IN-narrowed rows.
   EXPECT_EQ(rows[0][0], Value(80));
@@ -133,7 +136,8 @@ TEST_F(RelationalRegressionTest, Execute_StreamAggWithInListFilter_IgnoresStashe
 // set for that table. Because every reference of a reusable table shares one
 // projected cache entry, the driver below is a DIFFERENT table so the stash
 // exists before AggTable's first (and only) cache fill.
-TEST_F(RelationalRegressionTest, Execute_StreamAggWithJoinDerivedFilter_IgnoresStashedFilterInSubquery) {
+TEST_F(RelationalRegressionTest,
+       Execute_StreamAggWithJoinDerivedFilter_IgnoresStashedFilterInSubquery) {
   const auto rows = RelationalRun(
       *rs_,
       "SELECT COUNT(*), (SELECT SUM(k + v) FROM AggTable) "
@@ -149,12 +153,13 @@ TEST_F(RelationalRegressionTest, Execute_StreamAggWithJoinDerivedFilter_IgnoresS
 // required columns match. The first fills the cache while reading with
 // `k < 3`; the second must observe rows outside that predicate, proving the
 // cached content is not narrowed by the first consumer.
-TEST_F(RelationalRegressionTest, Execute_SharedBaseRelationCache_StaysUnfilteredAcrossConsumers) {
-  const auto rows = RelationalRun(
-      *rs_,
-      "SELECT (SELECT SUM(v) FROM AggTable WHERE k < 3), "
-      "       (SELECT SUM(v) FROM AggTable WHERE k >= 8) "
-      "FROM SmallKeys;");
+TEST_F(RelationalRegressionTest,
+       Execute_SharedBaseRelationCache_StaysUnfilteredAcrossConsumers) {
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT (SELECT SUM(v) FROM AggTable WHERE k < 3), "
+                    "       (SELECT SUM(v) FROM AggTable WHERE k >= 8) "
+                    "FROM SmallKeys;");
   ASSERT_EQ(rows.size(), 4U);
   for (const Row& row : rows) {
     EXPECT_EQ(row[0], Value(60));

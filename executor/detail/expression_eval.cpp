@@ -5,12 +5,17 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <exception>
+#include <functional>
+#include <iterator>
 #include <limits>
-#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -18,6 +23,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -38,13 +44,12 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
-#include "expression/lambda_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
-#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
 #include "type/date.hpp"
@@ -187,10 +192,12 @@ int FindColumn(const Schema& schema, const ColumnName& name,
 std::string TrimFieldToken(std::string_view s) {
   size_t begin = 0;
   size_t end = s.size();
-  while (begin < end && std::isspace(static_cast<unsigned char>(s[begin]))) {
+  while (begin < end &&
+         (std::isspace(static_cast<unsigned char>(s[begin])) != 0)) {
     ++begin;
   }
-  while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+  while (end > begin &&
+         (std::isspace(static_cast<unsigned char>(s[end - 1])) != 0)) {
     --end;
   }
   return std::string(s.substr(begin, end - begin));
@@ -304,7 +311,7 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
     return depth == 0 && !in_string;
   };
   size_t search_from = 1;
-  size_t pos;
+  size_t pos = 0;
   while ((pos = json.find(needle, search_from)) != std::string_view::npos &&
          !top_level_prefix(json.substr(1, pos - 1))) {
     search_from = pos + 1;
@@ -315,10 +322,10 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
   }
   size_t value_start = pos + needle.size();
   while (value_start < json.size() &&
-         std::isspace(static_cast<unsigned char>(json[value_start]))) {
+         (std::isspace(static_cast<unsigned char>(json[value_start])) != 0)) {
     ++value_start;
   }
-  size_t value_end;
+  size_t value_end = 0;
   size_t raw_begin = value_start;
   if (json[value_start] == '"') {
     value_end = value_start + 1;
@@ -386,7 +393,7 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
   // Struct constructors encode array-valued fields with Value::AsString(),
   // i.e. "ARRAY<ELEMENT_TYPE>[e0, e1, ...]".  Decode those into real arrays
   // so downstream UNNEST / field traversal sees array values.
-  if (raw.size() > 6 && raw.substr(0, 6) == "ARRAY<") {
+  if (raw.size() > 6 && raw.starts_with("ARRAY<")) {
     const size_t bracket = raw.find('[');
     if (bracket != std::string_view::npos && raw.back() == ']') {
       std::string_view inner =
@@ -655,7 +662,8 @@ bool JsonObjectFieldTexts(std::string_view json,
   const size_t end = json.size() - 1;
   while (i < end) {
     // Field name.
-    while (i < end && std::isspace(static_cast<unsigned char>(json[i]))) {
+    while (i < end &&
+           (std::isspace(static_cast<unsigned char>(json[i])) != 0)) {
       ++i;
     }
     if (i < end && json[i] == '"') {
@@ -674,14 +682,16 @@ bool JsonObjectFieldTexts(std::string_view json,
     } else {
       return false;
     }
-    while (i < end && std::isspace(static_cast<unsigned char>(json[i]))) {
+    while (i < end &&
+           (std::isspace(static_cast<unsigned char>(json[i])) != 0)) {
       ++i;
     }
     if (i >= end || json[i] != ':') {
       return false;
     }
     ++i;
-    while (i < end && std::isspace(static_cast<unsigned char>(json[i]))) {
+    while (i < end &&
+           (std::isspace(static_cast<unsigned char>(json[i])) != 0)) {
       ++i;
     }
     // Raw value through the matching close.
@@ -1327,14 +1337,16 @@ bool Like(std::string_view value, std::string_view pattern) {
   size_t wildcard = std::string_view::npos;
   size_t retry = 0;
   while (value_pos < value.size()) {
-    if (pattern_pos < pattern.size() &&
-        (pattern[pattern_pos] == '_' ||
-         pattern[pattern_pos] == value[value_pos])) {
-      ++value_pos;
-      ++pattern_pos;
-    } else if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
+    // A pattern '%' is a wildcard even when the value character is also '%':
+    // checking it before literal equality preserves the backtrack point.
+    if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
       wildcard = pattern_pos++;
       retry = value_pos;
+    } else if (pattern_pos < pattern.size() &&
+               (pattern[pattern_pos] == '_' ||
+                pattern[pattern_pos] == value[value_pos])) {
+      ++value_pos;
+      ++pattern_pos;
     } else if (wildcard != std::string_view::npos) {
       pattern_pos = wildcard + 1;
       value_pos = ++retry;
@@ -1587,8 +1599,7 @@ void AggregateAccumulator::ApplyCore(const Value& value,
       }
       sum_saw_minus_one = true;
     } else if (value.value.int_value >= 0) {
-      const uint64_t unsigned_value =
-          static_cast<uint64_t>(value.value.int_value);
+      const auto unsigned_value = static_cast<uint64_t>(value.value.int_value);
       if (sum_saw_minus_one) {
         sum_is_uint64 = true;
         uint_total = std::numeric_limits<uint64_t>::max();
@@ -1618,7 +1629,7 @@ void AggregateAccumulator::ApplyCore(const Value& value,
       } else if (value.type == ValueType::kInt64 ||
                  value.type == ValueType::kDate) {
         if (sum_is_uint64) {
-          const uint64_t unsigned_value =
+          const auto unsigned_value =
               static_cast<uint64_t>(value.value.int_value);
           if (uint_total >
               std::numeric_limits<uint64_t>::max() - unsigned_value) {
@@ -1820,7 +1831,7 @@ void AggregateAccumulator::ApplyCore(const Value& value,
       const double p = percentile.type == ValueType::kInt64
                            ? static_cast<double>(percentile.value.int_value)
                            : percentile.value.double_value;
-      if (!(p >= 0.0 && p <= 1.0)) {
+      if (p < 0.0 || p > 1.0) {
         throw std::runtime_error(
             "The second argument to PERCENTILE_CONT must be between 0 and 1");
       }
@@ -1984,10 +1995,11 @@ std::string FormatWeightDouble(double w) {
   if (std::isinf(w)) {
     return w > 0 ? "inf" : "-inf";
   }
-  char buffer[64];
-  auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), w);
+  std::array<char, 64> buffer{};
+  auto [ptr, ec] =
+      std::to_chars(buffer.data(), buffer.data() + buffer.size(), w);
   (void)ec;
-  return std::string(buffer, ptr - buffer);
+  return {buffer.data(), static_cast<size_t>(ptr - buffer.data())};
 }
 
 // ---------------------------------------------------------------------------
@@ -1999,7 +2011,7 @@ std::string FormatWeightDouble(double w) {
 // before they ride through BYTES columns.
 // ---------------------------------------------------------------------------
 
-constexpr char kSketchMagic[] = "TLHX1";
+constexpr std::string_view kSketchMagic = "TLHX1";
 
 int SketchTypeCode(AggregationType type, const Value& first) {
   switch (type) {
@@ -2039,11 +2051,11 @@ std::string SqlTypeNameForSketchCode(int code) {
 }
 
 std::string HexEncode(std::string_view raw) {
-  static const char kDigits[] = "0123456789abcdef";
+  static constexpr std::string_view kDigits = "0123456789abcdef";
   std::string out;
   out.reserve(raw.size() * 2);
   for (const char c : raw) {
-    const unsigned char byte = static_cast<unsigned char>(c);
+    const auto byte = static_cast<unsigned char>(c);
     out.push_back(kDigits[byte >> 4]);
     out.push_back(kDigits[byte & 0xF]);
   }
@@ -2142,7 +2154,7 @@ bool DecodeSketch(std::string_view bytes, int* typecode, int64_t* precision,
   const uint64_t count = ReadU64(raw, 14);
   size_t pos = 22;
   entries->clear();
-  entries->reserve(static_cast<size_t>(std::min<uint64_t>(count, 1u << 20)));
+  entries->reserve(static_cast<size_t>(std::min<uint64_t>(count, 1U << 20)));
   for (uint64_t i = 0; i < count; ++i) {
     if (pos + 4 > raw.size()) {
       return false;
@@ -2246,7 +2258,7 @@ Value ExtractSketchQuantilesStatic(const Value& sketch, int64_t number) {
   }
   std::sort(values.begin(), values.end(),
             [](const Value& a, const Value& b) { return a < b; });
-  const int64_t n = static_cast<int64_t>(values.size());
+  const auto n = static_cast<int64_t>(values.size());
   std::vector<Value> picked;
   for (int64_t i = 0; i <= number; ++i) {
     const int64_t index =
@@ -2291,7 +2303,8 @@ bool LooksLikeZonedTimestampText(std::string_view text) {
     return false;
   }
   for (const int idx : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15}) {
-    if (std::isdigit(static_cast<unsigned char>(text[idx])) == 0) {
+    if (std::isdigit(
+            static_cast<unsigned char>(text[static_cast<size_t>(idx)])) == 0) {
       return false;
     }
   }
@@ -2437,12 +2450,9 @@ Value AggregateAccumulator::FinishSketch(bool extract_count) const {
 }
 
 bool AggregateAccumulator::IsDone() const {
-  if (expression != nullptr &&
-      expression->GetType() == AggregationType::kAnyValue && saw_any_ &&
-      !extreme.IsNull()) {
-    return true;
-  }
-  return false;
+  return expression != nullptr &&
+         expression->GetType() == AggregationType::kAnyValue && saw_any_ &&
+         !extreme.IsNull();
 }
 
 void AggregateAccumulator::Add(AggregateInput input) {
@@ -2454,9 +2464,11 @@ void AggregateAccumulator::Add(AggregateInput input) {
     return;
   }
   buffer_->push_back(
-      BufferedRow{std::move(input.value), std::move(input.order_keys),
-                  std::move(input.condition), std::move(input.auxiliary),
-                  std::move(input.trailing_values)});
+      BufferedRow{.value = std::move(input.value),
+                  .order_keys = std::move(input.order_keys),
+                  .condition = std::move(input.condition),
+                  .auxiliary = std::move(input.auxiliary),
+                  .trailing_values = std::move(input.trailing_values)});
 }
 
 void AggregateAccumulator::Add(const Value& value) {
@@ -2464,7 +2476,11 @@ void AggregateAccumulator::Add(const Value& value) {
     return;
   }
   if (buffer_) {
-    buffer_->push_back(BufferedRow{value, {}, Value(), Value(), {}});
+    buffer_->push_back(BufferedRow{.value = value,
+                                   .order_keys = {},
+                                   .condition = Value(),
+                                   .auxiliary = Value(),
+                                   .trailing_values = {}});
     return;
   }
   ApplyCore(value);
@@ -2634,7 +2650,7 @@ Value AggregateAccumulator::Finish() const {
       }
       std::string out;
       for (size_t i = 0; i < array_values_.size(); ++i) {
-        if (i) {
+        if (i != 0U) {
           out += delimiter_.value_or(",");
         }
         // Raw text, not AsString(): AsString wraps VARCHAR values in quotes.
@@ -2657,7 +2673,7 @@ Value AggregateAccumulator::Finish() const {
         return {};
       }
       const long double mean = stat_.sx / count;
-      const long double ssd = stat_.sxx - count * mean * mean;
+      const long double ssd = stat_.sxx - (count * mean * mean);
       return Value(static_cast<double>(ssd / count));
     }
     case AggregationType::kVarSamp: {
@@ -2665,7 +2681,7 @@ Value AggregateAccumulator::Finish() const {
         return {};
       }
       const long double mean = stat_.sx / count;
-      const long double ssd = stat_.sxx - count * mean * mean;
+      const long double ssd = stat_.sxx - (count * mean * mean);
       return Value(static_cast<double>(ssd / (count - 1)));
     }
     case AggregationType::kStddevPop: {
@@ -2673,7 +2689,7 @@ Value AggregateAccumulator::Finish() const {
         return {};
       }
       const long double mean = stat_.sx / count;
-      const long double ssd = stat_.sxx - count * mean * mean;
+      const long double ssd = stat_.sxx - (count * mean * mean);
       return Value(static_cast<double>(std::sqrt(ssd / count)));
     }
     case AggregationType::kStddevSamp: {
@@ -2681,7 +2697,7 @@ Value AggregateAccumulator::Finish() const {
         return {};
       }
       const long double mean = stat_.sx / count;
-      const long double ssd = stat_.sxx - count * mean * mean;
+      const long double ssd = stat_.sxx - (count * mean * mean);
       return Value(static_cast<double>(std::sqrt(ssd / (count - 1))));
     }
     case AggregationType::kCovarPop: {
@@ -2690,7 +2706,7 @@ Value AggregateAccumulator::Finish() const {
       }
       const long double mx = stat_.sx / count;
       const long double my = stat_.sy / count;
-      const long double sdd = stat_.sxy - count * mx * my;
+      const long double sdd = stat_.sxy - (count * mx * my);
       return Value(static_cast<double>(sdd / count));
     }
     case AggregationType::kCovarSamp: {
@@ -2699,7 +2715,7 @@ Value AggregateAccumulator::Finish() const {
       }
       const long double mx = stat_.sx / count;
       const long double my = stat_.sy / count;
-      const long double sdd = stat_.sxy - count * mx * my;
+      const long double sdd = stat_.sxy - (count * mx * my);
       return Value(static_cast<double>(sdd / (count - 1)));
     }
     case AggregationType::kCorr: {
@@ -2708,9 +2724,9 @@ Value AggregateAccumulator::Finish() const {
       }
       const long double mx = stat_.sx / count;
       const long double my = stat_.sy / count;
-      const long double sdd = stat_.sxy - count * mx * my;
-      const long double vx = stat_.sxx - count * mx * mx;
-      const long double vy = stat_.syy - count * my * my;
+      const long double sdd = stat_.sxy - (count * mx * my);
+      const long double vx = stat_.sxx - (count * mx * mx);
+      const long double vy = stat_.syy - (count * my * my);
       return Value(static_cast<double>(sdd / std::sqrt(vx * vy)));
     }
     case AggregationType::kApproxQuantiles: {
@@ -2726,7 +2742,7 @@ Value AggregateAccumulator::Finish() const {
       std::sort(quantile_values_.begin(), quantile_values_.end(),
                 [](const Value& a, const Value& b) { return a < b; });
       std::vector<Value> picked;
-      const int64_t n = static_cast<int64_t>(quantile_values_.size());
+      const auto n = static_cast<int64_t>(quantile_values_.size());
       for (int64_t i = 0; i <= number; ++i) {
         const int64_t index = std::min<int64_t>((i * n) / number, n - 1);
         picked.push_back(quantile_values_[static_cast<size_t>(index)]);
@@ -2758,11 +2774,11 @@ Value AggregateAccumulator::Finish() const {
       });
       std::vector<Value> elements;
       for (size_t idx : order) {
-        if (static_cast<int64_t>(elements.size()) >= number) {
+        if (std::cmp_greater_equal(elements.size(), number)) {
           break;
         }
-        elements.push_back(Value(TopEntryString(
-            top_count_values_[idx], std::to_string(top_count_counts_[idx]))));
+        elements.emplace_back(TopEntryString(
+            top_count_values_[idx], std::to_string(top_count_counts_[idx])));
       }
       // Struct entries ride as text payloads; the "STRING" element type
       // lets the compliance matcher compare struct content field-wise.
@@ -2792,7 +2808,7 @@ Value AggregateAccumulator::Finish() const {
       }
       std::vector<Value> elements;
       for (size_t idx : order) {
-        if (static_cast<int64_t>(elements.size()) >= number) {
+        if (std::cmp_greater_equal(elements.size(), number)) {
           break;
         }
         const SumWeight& weight = top_sums_[idx];
@@ -2800,12 +2816,12 @@ Value AggregateAccumulator::Finish() const {
         if (weight.weights == 0) {
           sum_text = "NULL";
         } else {
-          const double as_double = static_cast<double>(weight.sum);
+          const auto as_double = static_cast<double>(weight.sum);
           sum_text = any_double
                          ? FormatWeightDouble(as_double)
                          : std::to_string(static_cast<int64_t>(weight.sum));
         }
-        elements.push_back(Value(TopEntryString(weight.value, sum_text)));
+        elements.emplace_back(TopEntryString(weight.value, sum_text));
       }
       return Value::Array(std::move(elements), "STRING");
     }
@@ -2850,7 +2866,7 @@ Value AggregateAccumulator::Finish() const {
       elements.reserve(ew_len_);
       for (size_t i = 0; i < ew_len_; ++i) {
         if (ew_count_[i] == 0) {
-          elements.push_back(Value());
+          elements.emplace_back();
           continue;
         }
         if (is_avg || ew_saw_double_[i]) {
@@ -2860,7 +2876,7 @@ Value AggregateAccumulator::Finish() const {
               is_avg ? Value(sum / static_cast<double>(ew_count_[i]))
                      : Value(sum));
         } else {
-          elements.push_back(Value(ew_int_sum_[i]));
+          elements.emplace_back(ew_int_sum_[i]);
         }
       }
       const std::string elem_type =
@@ -2904,7 +2920,7 @@ Value AggregateAccumulator::Finish() const {
                 nan_first);
       const double position =
           percentile_p_ * static_cast<double>(percentile_values_.size() - 1);
-      const size_t low = static_cast<size_t>(position);
+      const auto low = static_cast<size_t>(position);
       const size_t high = low + 1 < percentile_values_.size() ? low + 1 : low;
       const double a = percentile_values_[low];
       const double b = percentile_values_[high];
@@ -2918,7 +2934,7 @@ Value AggregateAccumulator::Finish() const {
       if (fraction >= 1.0 || a == b) {
         return Value(b);
       }
-      return Value(a * (1.0 - fraction) + b * fraction);
+      return Value((a * (1.0 - fraction)) + (b * fraction));
     }
   }
   return {};
@@ -2937,10 +2953,12 @@ struct CivilTime {
 };
 
 bool ParseCivilTime(std::string_view s, CivilTime* ct) {
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+  while (!s.empty() &&
+         (std::isspace(static_cast<unsigned char>(s.front())) != 0)) {
     s.remove_prefix(1);
   }
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+  while (!s.empty() &&
+         (std::isspace(static_cast<unsigned char>(s.back())) != 0)) {
     s.remove_suffix(1);
   }
   if (s.empty()) {
@@ -2948,7 +2966,8 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   }
   int Y = 0, M = 0, D = 0;
   if (s.size() == 10 &&
-      sscanf(std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
+      sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+          std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
     ct->year = Y;
     ct->month = M;
     ct->day = D;
@@ -2960,8 +2979,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   }
   int h = 0, m = 0, sec = 0;
   char sep = ' ';
-  if (sscanf(std::string(s).c_str(), "%d-%d-%d%c%d:%d:%d", &Y, &M, &D, &sep, &h,
-             &m, &sec) >= 6) {
+  if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+          std::string(s).c_str(), "%d-%d-%d%c%d:%d:%d", &Y, &M, &D, &sep, &h,
+          &m, &sec) >= 6) {
     ct->year = Y;
     ct->month = M;
     ct->day = D;
@@ -2987,7 +3007,8 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
     }
     return true;
   }
-  if (sscanf(std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
+  if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+          std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
     ct->year = 1970;
     ct->month = 1;
     ct->day = 1;
@@ -3037,8 +3058,8 @@ CivilTime ShiftCivilTimeHours(const CivilTime& ct, int offset_hours) {
     std::chrono::sys_days new_sd{std::chrono::days{days}};
     std::chrono::year_month_day new_ymd{new_sd};
     res.year = int(new_ymd.year());
-    res.month = unsigned(new_ymd.month());
-    res.day = unsigned(new_ymd.day());
+    res.month = static_cast<int>(static_cast<unsigned>(new_ymd.month()));
+    res.day = static_cast<int>(static_cast<unsigned>(new_ymd.day()));
   }
   return res;
 }
@@ -3059,11 +3080,14 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
     int h = 0, m = 0;
     std::string rem(tz_str.substr(4));
     if (rem.find(':') != std::string::npos) {
-      sscanf(rem.c_str(), "%d:%d", &h, &m);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%d:%d", &h, &m);
     } else if (rem.size() == 4) {
-      sscanf(rem.c_str(), "%2d%2d", &h, &m);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%2d%2d", &h, &m);
     } else {
-      sscanf(rem.c_str(), "%d", &h);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%d", &h);
     }
     return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
   }
@@ -3072,11 +3096,14 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
     int h = 0, m = 0;
     std::string rem(tz_str.substr(1));
     if (rem.find(':') != std::string::npos) {
-      sscanf(rem.c_str(), "%d:%d", &h, &m);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%d:%d", &h, &m);
     } else if (rem.size() == 4) {
-      sscanf(rem.c_str(), "%2d%2d", &h, &m);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%2d%2d", &h, &m);
     } else {
-      sscanf(rem.c_str(), "%d", &h);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%d", &h);
     }
     return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
   }
@@ -3086,16 +3113,14 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
   }
   try {
     const auto* zone = std::chrono::locate_zone(zone_name);
-    if (zone) {
-      int y = ct ? ct->year : 2000;
-      int mon = ct ? ct->month : 1;
-      int d = ct ? ct->day : 1;
-      int h = ct ? ct->hour : 0;
-      int min = ct ? ct->minute : 0;
-      int s = ct ? ct->second : 0;
-      if (y < 1970) {
-        y = 1970;
-      }
+    if (zone != nullptr) {
+      int y = (ct != nullptr) ? ct->year : 2000;
+      int mon = (ct != nullptr) ? ct->month : 1;
+      int d = (ct != nullptr) ? ct->day : 1;
+      int h = (ct != nullptr) ? ct->hour : 0;
+      int min = (ct != nullptr) ? ct->minute : 0;
+      int s = (ct != nullptr) ? ct->second : 0;
+      y = std::max(y, 1970);
       std::chrono::year_month_day ymd{
           std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(mon)},
           std::chrono::day{static_cast<unsigned>(d)}};
@@ -3142,17 +3167,17 @@ void ValidateTimeZoneName(std::string_view tz_str) {
 }
 
 std::string FormatTimeZoneOffset(int tz_offset_sec) {
-  char buf[16];
+  std::array<char, 16> buf{};
   int abs_sec = std::abs(tz_offset_sec);
   int h = abs_sec / 3600;
   int m = (abs_sec % 3600) / 60;
   char sign = tz_offset_sec < 0 ? '-' : '+';
   if (m == 0) {
-    snprintf(buf, sizeof(buf), "%c%02d", sign, h);
+    (void)snprintf(buf.data(), buf.size(), "%c%02d", sign, h);
   } else {
-    snprintf(buf, sizeof(buf), "%c%02d:%02d", sign, h, m);
+    (void)snprintf(buf.data(), buf.size(), "%c%02d:%02d", sign, h, m);
   }
-  return std::string(buf);
+  return {buf.data()};
 }
 
 CivilTime ValueToCivilTime(const Value& val) {
@@ -3161,8 +3186,8 @@ CivilTime ValueToCivilTime(const Value& val) {
     std::chrono::sys_days sys_d{std::chrono::days{val.DateDays()}};
     std::chrono::year_month_day ymd{sys_d};
     ct.year = int(ymd.year());
-    ct.month = unsigned(ymd.month());
-    ct.day = unsigned(ymd.day());
+    ct.month = static_cast<int>(static_cast<unsigned>(ymd.month()));
+    ct.day = static_cast<int>(static_cast<unsigned>(ymd.day()));
     return ct;
   }
   if (val.type == ValueType::kVarChar) {
@@ -3184,8 +3209,8 @@ int64_t CivilTimeToNanos(const CivilTime& ct) {
       std::chrono::day{static_cast<unsigned>(ct.day)}};
   int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
   int64_t secs =
-      days * 86400LL + ct.hour * 3600LL + ct.minute * 60LL + ct.second;
-  return secs * 1000000000LL + ct.subsecond_nanos;
+      (days * 86400LL) + (ct.hour * 3600LL) + (ct.minute * 60LL) + ct.second;
+  return (secs * 1000000000LL) + ct.subsecond_nanos;
 }
 
 CivilTime NanosToCivilTime(int64_t nanos) {
@@ -3194,50 +3219,53 @@ CivilTime NanosToCivilTime(int64_t nanos) {
     return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
   };
   int64_t secs = floor_div(nanos, 1000000000LL);
-  int64_t sub_ns = nanos - secs * 1000000000LL;
+  int64_t sub_ns = nanos - (secs * 1000000000LL);
   int64_t days = floor_div(secs, 86400LL);
-  int64_t day_secs = secs - days * 86400LL;
+  int64_t day_secs = secs - (days * 86400LL);
 
   std::chrono::sys_days sys_d{std::chrono::days{days}};
   std::chrono::year_month_day ymd{sys_d};
 
   CivilTime ct;
   ct.year = int(ymd.year());
-  ct.month = unsigned(ymd.month());
-  ct.day = unsigned(ymd.day());
-  ct.hour = day_secs / 3600;
-  ct.minute = (day_secs % 3600) / 60;
-  ct.second = day_secs % 60;
+  ct.month = static_cast<int>(static_cast<unsigned>(ymd.month()));
+  ct.day = static_cast<int>(static_cast<unsigned>(ymd.day()));
+  ct.hour = static_cast<int>(day_secs / 3600);
+  ct.minute = static_cast<int>((day_secs % 3600) / 60);
+  ct.second = static_cast<int>(day_secs % 60);
   ct.subsecond_nanos = sub_ns;
   return ct;
 }
 
 std::string FormatCivilTime(const CivilTime& ct, bool include_subsecond = true,
                             bool is_date_only = false) {
-  char buf[64];
+  std::array<char, 64> buf{};
   if (is_date_only) {
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", ct.year, ct.month, ct.day);
-    return std::string(buf);
+    (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d", ct.year, ct.month,
+                   ct.day);
+    return {buf.data()};
   }
   if (include_subsecond && ct.subsecond_nanos != 0) {
     if (ct.subsecond_nanos % 1000000 == 0) {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld", ct.year,
-               ct.month, ct.day, ct.hour, ct.minute, ct.second,
-               ct.subsecond_nanos / 1000000);
+      (void)snprintf(buf.data(), buf.size(),
+                     "%04d-%02d-%02d %02d:%02d:%02d.%03ld", ct.year, ct.month,
+                     ct.day, ct.hour, ct.minute, ct.second,
+                     ct.subsecond_nanos / 1000000);
     } else if (ct.subsecond_nanos % 1000 == 0) {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld", ct.year,
-               ct.month, ct.day, ct.hour, ct.minute, ct.second,
-               ct.subsecond_nanos / 1000);
+      (void)snprintf(buf.data(), buf.size(),
+                     "%04d-%02d-%02d %02d:%02d:%02d.%06ld", ct.year, ct.month,
+                     ct.day, ct.hour, ct.minute, ct.second,
+                     ct.subsecond_nanos / 1000);
     } else {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%09ld", ct.year,
-               ct.month, ct.day, ct.hour, ct.minute, ct.second,
-               ct.subsecond_nanos);
+      (void)snprintf(buf.data(), buf.size(),
+                     "%04d-%02d-%02d %02d:%02d:%02d.%09ld", ct.year, ct.month,
+                     ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
     }
-    return std::string(buf);
+    return {buf.data()};
   }
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", ct.year, ct.month,
-           ct.day, ct.hour, ct.minute, ct.second);
-  return std::string(buf);
+  (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d",
+                 ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second);
+  return {buf.data()};
 }
 
 // Mutual recursion with Evaluate above; expression trees are the intended
@@ -3356,7 +3384,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (is_timestamp) {
       int tz_offset_sec =
           ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-      int64_t ns = CivilTimeToNanos(ct) + tz_offset_sec * 1000000000LL;
+      int64_t ns = CivilTimeToNanos(ct) + (tz_offset_sec * 1000000000LL);
       ct = NanosToCivilTime(ns);
     }
     const bool is_date = (name == "date_add" || name == "date_sub" ||
@@ -3372,8 +3400,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         add_m = amount * 3;
       }
       int64_t total_m = (ct.year * 12 + (ct.month - 1)) + add_m;
-      int target_y = total_m / 12;
-      int target_m = (total_m % 12) + 1;
+      int target_y = static_cast<int>(total_m / 12);
+      int target_m = static_cast<int>((total_m % 12) + 1);
       if (target_m <= 0) {
         target_m += 12;
         target_y -= 1;
@@ -3385,13 +3413,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       year_month_day_last last_of_target{
           year{target_y},
           month_day_last{month{static_cast<unsigned>(target_m)}}};
-      unsigned target_d = ct.day;
-      if (target_d > unsigned(last_of_target.day())) {
-        target_d = unsigned(last_of_target.day());
-      }
+      auto target_d = static_cast<unsigned>(ct.day);
+      target_d =
+          std::min(target_d, static_cast<unsigned>(last_of_target.day()));
       ct.year = target_y;
       ct.month = target_m;
-      ct.day = target_d;
+      ct.day = static_cast<int>(target_d);
       if (ct.year < 1 || ct.year > 9999) {
         throw std::runtime_error("DATETIME out of range");
       }
@@ -3405,7 +3432,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (is_timestamp) {
         int tz_offset_sec =
             ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-        int64_t ns = CivilTimeToNanos(ct) - tz_offset_sec * 1000000000LL;
+        int64_t ns = CivilTimeToNanos(ct) - (tz_offset_sec * 1000000000LL);
         CivilTime utc_ct = NanosToCivilTime(ns);
         return Value(FormatCivilTime(utc_ct) + "+00");
       }
@@ -3455,7 +3482,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
 
     int64_t day_nanos =
-        (ct.hour * 3600LL + ct.minute * 60LL + ct.second) * 1000000000LL +
+        ((ct.hour * 3600LL + ct.minute * 60LL + ct.second) * 1000000000LL) +
         ct.subsecond_nanos + delta_sub_ns;
     int64_t total_day_nanos = 86400LL * 1000000000LL;
     auto floor_div = [](int64_t a, int64_t b) -> int64_t {
@@ -3463,7 +3490,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
     };
     int64_t extra_days = floor_div(day_nanos, total_day_nanos);
-    int64_t rem_day_nanos = day_nanos - extra_days * total_day_nanos;
+    int64_t rem_day_nanos = day_nanos - (extra_days * total_day_nanos);
 
     std::chrono::year_month_day cur_ymd{
         std::chrono::year{ct.year},
@@ -3477,13 +3504,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
 
     CivilTime res_ct;
     res_ct.year = int(target_ymd.year());
-    res_ct.month = unsigned(target_ymd.month());
-    res_ct.day = unsigned(target_ymd.day());
+    res_ct.month = static_cast<int>(static_cast<unsigned>(target_ymd.month()));
+    res_ct.day = static_cast<int>(static_cast<unsigned>(target_ymd.day()));
     int64_t rem_secs = rem_day_nanos / 1000000000LL;
     res_ct.subsecond_nanos = rem_day_nanos % 1000000000LL;
-    res_ct.hour = rem_secs / 3600;
-    res_ct.minute = (rem_secs % 3600) / 60;
-    res_ct.second = rem_secs % 60;
+    res_ct.hour = static_cast<int>(rem_secs / 3600);
+    res_ct.minute = static_cast<int>((rem_secs % 3600) / 60);
+    res_ct.second = static_cast<int>(rem_secs % 60);
 
     if (res_ct.year < 1 || res_ct.year > 9999) {
       throw std::runtime_error("DATETIME out of range");
@@ -3497,13 +3524,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value::DateFromDays(
             std::chrono::sys_days{ymd}.time_since_epoch().count());
       }
-      char buf[32];
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d", res_ct.year, res_ct.month,
-               res_ct.day);
-      return Value(std::string(buf));
+      std::array<char, 32> buf{};
+      (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d", res_ct.year,
+                     res_ct.month, res_ct.day);
+      return Value(std::string(buf.data()));
     }
     if (is_timestamp) {
-      int64_t ns = CivilTimeToNanos(res_ct) + (8 * 3600LL) * 1000000000LL;
+      int64_t ns = CivilTimeToNanos(res_ct) + ((8 * 3600LL) * 1000000000LL);
       CivilTime utc_ct = NanosToCivilTime(ns);
       return Value(FormatCivilTime(utc_ct) + "+00");
     }
@@ -3516,21 +3543,18 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   // (GoogleSQL coerces INT64 branch arms to FLOAT64 when any arm is a
   // float), keeping downstream comparisons type-consistent.
   auto promotes_to_double = [&](const std::vector<Expression>& exprs) {
-    for (const Expression& branch : exprs) {
+    return std::ranges::any_of(exprs, [&](const Expression& branch) {
       if (scope.schema == nullptr) {
-        continue;
+        return false;
       }
       try {
-        if (branch->ResultType(*scope.schema).GetType() == TypeTag::kDouble) {
-          return true;
-        }
+        return branch->ResultType(*scope.schema).GetType() == TypeTag::kDouble;
       } catch (const std::exception&) {
-        continue;
         // Static types are unavailable for subqueries/aggregates; the
         // runtime value types then stand on their own.
+        return false;
       }
-    }
-    return false;
+    });
   };
   auto normalize = [](Value value, bool to_double) {
     if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
@@ -3583,7 +3607,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     try {
       return Evaluate(call.Args()[0], scope, aggregates, context, ctes);
     } catch (const std::exception&) {
-      return Value();
+      return {};
     }
   }
   std::vector<Value> arguments;
@@ -3620,8 +3644,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         if (key == "a") {
           a = std::move(parsed);
-        }
-        if (key == "b") {
+        } else if (key == "b") {
           b = std::move(parsed);
         }
       }
@@ -3713,9 +3736,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         json += std::to_string(field_value.value.int_value);
       } else if (field_value.type == ValueType::kDouble) {
         const double d = field_value.value.double_value;
-        char buffer[64];
-        auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), d);
-        json.append(buffer, static_cast<size_t>(ptr - buffer));
+        std::array<char, 64> buffer{};
+        auto [ptr, ec] =
+            std::to_chars(buffer.data(), buffer.data() + buffer.size(), d);
+        (void)ec;
+        json.append(buffer.data(), static_cast<size_t>(ptr - buffer.data()));
       } else if (field_value.type == ValueType::kVarChar) {
         // Flag said unquoted: emit the text without JSON quoting.
         json += raw_str(field_value);
@@ -3817,23 +3842,25 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::sys_days{ymd}.time_since_epoch().count());
     }
     if (name == "extract_time") {
-      char buf[64];
+      std::array<char, 64> buf{};
       if (ct.subsecond_nanos != 0) {
         if (ct.subsecond_nanos % 1000000 == 0) {
-          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour, ct.minute,
-                   ct.second, ct.subsecond_nanos / 1000000);
+          (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
+                         ct.hour, ct.minute, ct.second,
+                         ct.subsecond_nanos / 1000000);
         } else if (ct.subsecond_nanos % 1000 == 0) {
-          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour, ct.minute,
-                   ct.second, ct.subsecond_nanos / 1000);
+          (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
+                         ct.hour, ct.minute, ct.second,
+                         ct.subsecond_nanos / 1000);
         } else {
-          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour, ct.minute,
-                   ct.second, ct.subsecond_nanos);
+          (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
+                         ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
         }
       } else {
-        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute,
-                 ct.second);
+        (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", ct.hour,
+                       ct.minute, ct.second);
       }
-      return Value(std::string(buf));
+      return Value(std::string(buf.data()));
     }
     if (name == "extract_datetime") {
       return Value(FormatCivilTime(ct));
@@ -3842,7 +3869,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(static_cast<int64_t>(ct.year));
     }
     if (name == "extract_quarter") {
-      return Value(static_cast<int64_t>((ct.month - 1) / 3 + 1));
+      return Value(static_cast<int64_t>(((ct.month - 1) / 3) + 1));
     }
     if (name == "extract_month") {
       return Value(static_cast<int64_t>(ct.month));
@@ -3866,7 +3893,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(static_cast<int64_t>(ct.subsecond_nanos / 1000LL));
     }
     if (name == "extract_nanosecond") {
-      return Value(static_cast<int64_t>(ct.subsecond_nanos));
+      return Value(ct.subsecond_nanos);
     }
     if (name == "extract_week") {
       std::chrono::year_month_day ymd{
@@ -3877,9 +3904,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       std::chrono::year_month_day year_start{std::chrono::year{ct.year},
                                              std::chrono::month{1},
                                              std::chrono::day{1}};
-      int start_wd =
-          std::chrono::weekday{std::chrono::sys_days{year_start}}.c_encoding();
-      int yday = (sd - std::chrono::sys_days{year_start}).count();
+      int start_wd = static_cast<int>(
+          std::chrono::weekday{std::chrono::sys_days{year_start}}.c_encoding());
+      int yday =
+          static_cast<int>((sd - std::chrono::sys_days{year_start}).count());
       int week_num = (yday + start_wd) / 7;
       return Value(static_cast<int64_t>(week_num));
     }
@@ -3888,7 +3916,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::year{ct.year},
           std::chrono::month{static_cast<unsigned>(ct.month)},
           std::chrono::day{static_cast<unsigned>(ct.day)}};
-      int wd = std::chrono::weekday{std::chrono::sys_days{ymd}}.c_encoding();
+      int wd = static_cast<int>(
+          std::chrono::weekday{std::chrono::sys_days{ymd}}.c_encoding());
       return Value(static_cast<int64_t>(wd + 1));
     }
     if (name == "extract_dayofyear") {
@@ -3899,10 +3928,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       std::chrono::year_month_day year_start{std::chrono::year{ct.year},
                                              std::chrono::month{1},
                                              std::chrono::day{1}};
-      int yday =
-          (std::chrono::sys_days{ymd} - std::chrono::sys_days{year_start})
-              .count() +
-          1;
+      int yday = static_cast<int>((std::chrono::sys_days{ymd} -
+                                   std::chrono::sys_days{year_start})
+                                      .count()) +
+                 1;
       return Value(static_cast<int64_t>(yday));
     }
     if (name == "extract_isoyear" || name == "extract_isoweek") {
@@ -3911,7 +3940,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::month{static_cast<unsigned>(ct.month)},
           std::chrono::day{static_cast<unsigned>(ct.day)}};
       std::chrono::sys_days sd{ymd};
-      int iso_wd = std::chrono::weekday{sd}.iso_encoding();
+      int iso_wd = static_cast<int>(std::chrono::weekday{sd}.iso_encoding());
       std::chrono::sys_days thu = sd + std::chrono::days{4 - iso_wd};
       std::chrono::year_month_day thu_ymd{thu};
       int isoyear = int(thu_ymd.year());
@@ -3921,11 +3950,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       std::chrono::year_month_day iso_start{std::chrono::year{isoyear},
                                             std::chrono::month{1},
                                             std::chrono::day{4}};
-      int start_iso_wd =
-          std::chrono::weekday{std::chrono::sys_days{iso_start}}.iso_encoding();
+      int start_iso_wd = static_cast<int>(std::chrono::weekday{
+          std::chrono::sys_days{iso_start}}.iso_encoding());
       std::chrono::sys_days first_mon = std::chrono::sys_days{iso_start} -
                                         std::chrono::days{start_iso_wd - 1};
-      int isoweek = (sd - first_mon).count() / 7 + 1;
+      int isoweek = (static_cast<int>((sd - first_mon).count()) / 7) + 1;
       return Value(static_cast<int64_t>(isoweek));
     }
     throw std::runtime_error("unsupported extract field: " + name);
@@ -4023,11 +4052,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         char sign = tz_str[0];
         int h = 0, m = 0;
         if (tz_str.find(':') != std::string::npos) {
-          if (sscanf(tz_str.c_str() + 1, "%d:%d", &h, &m) < 1) {
+          if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+                  tz_str.c_str() + 1, "%d:%d", &h, &m) < 1) {
             throw std::runtime_error("invalid timezone: " + tz_str);
           }
         } else {
-          if (sscanf(tz_str.c_str() + 1, "%d", &h) < 1) {
+          if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+                  tz_str.c_str() + 1, "%d", &h) < 1) {
             throw std::runtime_error("invalid timezone: " + tz_str);
           }
         }
@@ -4039,9 +4070,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
     gmtime_r(&now, &t);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-    return Value(std::string(buf));
+    std::array<char, 32> buf{};
+    (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", t.tm_hour,
+                   t.tm_min, t.tm_sec);
+    return Value(std::string(buf.data()));
   }
   if (name == "current_datetime") {
     if (arguments.size() > 1) {
@@ -4061,8 +4093,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
     gmtime_r(&now, &t);
-    CivilTime current{t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
-                      t.tm_min,         t.tm_sec,     0};
+    CivilTime current{.year = t.tm_year + 1900,
+                      .month = t.tm_mon + 1,
+                      .day = t.tm_mday,
+                      .hour = t.tm_hour,
+                      .minute = t.tm_min,
+                      .second = t.tm_sec,
+                      .subsecond_nanos = 0};
     return Value(FormatCivilTime(current));
   }
   if (name == "current_date") {
@@ -4143,7 +4180,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (s.size() > 10) {
         int Y = 0, M = 0, D = 0, h = 0, m = 0;
         double sec = 0;
-        if (sscanf(s.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h, &m, &sec) >=
+        if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+                s.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h, &m, &sec) >=
             5) {
           int tz_offset_sec = 0;
           bool has_tz = false;
@@ -4152,9 +4190,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             char sign = s[tz_pos];
             int tz_h = 0, tz_m = 0;
             if (s.find(':', tz_pos) != std::string::npos) {
-              sscanf(s.c_str() + tz_pos + 1, "%d:%d", &tz_h, &tz_m);
+              sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback.
+                  s.c_str() + tz_pos + 1, "%d:%d", &tz_h, &tz_m);
             } else {
-              sscanf(s.c_str() + tz_pos + 1, "%d", &tz_h);
+              sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback.
+                  s.c_str() + tz_pos + 1, "%d", &tz_h);
             }
             tz_offset_sec = (tz_h * 3600 + tz_m * 60) * (sign == '-' ? -1 : 1);
             has_tz = true;
@@ -4168,9 +4208,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
               char sign = tz2[0];
               int tz_h = 0, tz_m = 0;
               if (tz2.find(':') != std::string::npos) {
-                sscanf(tz2.c_str() + 1, "%d:%d", &tz_h, &tz_m);
+                sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback.
+                    tz2.c_str() + 1, "%d:%d", &tz_h, &tz_m);
               } else {
-                sscanf(tz2.c_str() + 1, "%d", &tz_h);
+                sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback.
+                    tz2.c_str() + 1, "%d", &tz_h);
               }
               tz2_sec = (tz_h * 3600 + tz_m * 60) * (sign == '-' ? -1 : 1);
             }
@@ -4190,8 +4232,14 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                 std::chrono::day{static_cast<unsigned>(target.tm_mday)}};
             return Value::DateFromDays(
                 std::chrono::sys_days{ymd}.time_since_epoch().count());
-          } else if (has_tz) {
-            CivilTime ct_tmp{Y, M, D, h, m, static_cast<int>(sec)};
+          }
+          if (has_tz) {
+            CivilTime ct_tmp{.year = Y,
+                             .month = M,
+                             .day = D,
+                             .hour = h,
+                             .minute = m,
+                             .second = static_cast<int>(sec)};
             int default_tz_sec =
                 ParseTimeZoneOffset(GetDefaultTimeZone(), &ct_tmp, -8 * 3600);
             struct tm t = {};
@@ -4233,7 +4281,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (s.find('+') != std::string::npos ||
           s.find('Z') != std::string::npos ||
           s.find('z') != std::string::npos) {
-        int64_t ns = CivilTimeToNanos(ct) + (-8 * 3600LL) * 1000000000LL;
+        int64_t ns = CivilTimeToNanos(ct) + ((-8 * 3600LL) * 1000000000LL);
         ct = NanosToCivilTime(ns);
       }
       return Value(FormatCivilTime(ct));
@@ -4251,7 +4299,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       CivilTime ct = ValueToCivilTime(arguments[0]);
       int tz_offset_sec = ParseTimeZoneOffset(arg1_str, &ct, 0);
       if (tz_offset_sec != 0) {
-        int64_t ns = CivilTimeToNanos(ct) + tz_offset_sec * 1000000000LL;
+        int64_t ns = CivilTimeToNanos(ct) + (tz_offset_sec * 1000000000LL);
         ct = NanosToCivilTime(ns);
       }
       return Value(FormatCivilTime(ct));
@@ -4268,22 +4316,22 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (arguments.size() >= 6) {
       int Y = arguments[0].type == ValueType::kInt64
-                  ? arguments[0].value.int_value
+                  ? static_cast<int>(arguments[0].value.int_value)
                   : std::stoi(raw_str(arguments[0]));
       int M = arguments[1].type == ValueType::kInt64
-                  ? arguments[1].value.int_value
+                  ? static_cast<int>(arguments[1].value.int_value)
                   : std::stoi(raw_str(arguments[1]));
       int D = arguments[2].type == ValueType::kInt64
-                  ? arguments[2].value.int_value
+                  ? static_cast<int>(arguments[2].value.int_value)
                   : std::stoi(raw_str(arguments[2]));
       int h = arguments[3].type == ValueType::kInt64
-                  ? arguments[3].value.int_value
+                  ? static_cast<int>(arguments[3].value.int_value)
                   : std::stoi(raw_str(arguments[3]));
       int m = arguments[4].type == ValueType::kInt64
-                  ? arguments[4].value.int_value
+                  ? static_cast<int>(arguments[4].value.int_value)
                   : std::stoi(raw_str(arguments[4]));
       int s = arguments[5].type == ValueType::kInt64
-                  ? arguments[5].value.int_value
+                  ? static_cast<int>(arguments[5].value.int_value)
                   : std::stoi(raw_str(arguments[5]));
       CivilTime ct;
       ct.year = Y;
@@ -4346,7 +4394,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         }
       }
     }
-    int64_t ns = CivilTimeToNanos(ct) - tz_offset_sec * 1000000000LL;
+    int64_t ns = CivilTimeToNanos(ct) - (tz_offset_sec * 1000000000LL);
     CivilTime utc_ct = NanosToCivilTime(ns);
     return Value(FormatCivilTime(utc_ct) + "+00");
   }
@@ -4368,27 +4416,29 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           if (tz_pos != std::string::npos) {
             tz_offset_sec = ParseTimeZoneOffset(s.substr(tz_pos), &ct, 0);
           }
-          int64_t ns = CivilTimeToNanos(ct) - tz_offset_sec * 1000000000LL +
-                       (-8 * 3600LL) * 1000000000LL;
+          int64_t ns = CivilTimeToNanos(ct) - (tz_offset_sec * 1000000000LL) +
+                       ((-8 * 3600LL) * 1000000000LL);
           ct = NanosToCivilTime(ns);
         }
-        char buf[64];
+        std::array<char, 64> buf{};
         if (ct.subsecond_nanos != 0) {
           if (ct.subsecond_nanos % 1000000 == 0) {
-            snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour,
-                     ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+            (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
+                           ct.hour, ct.minute, ct.second,
+                           ct.subsecond_nanos / 1000000);
           } else if (ct.subsecond_nanos % 1000 == 0) {
-            snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour,
-                     ct.minute, ct.second, ct.subsecond_nanos / 1000);
+            (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
+                           ct.hour, ct.minute, ct.second,
+                           ct.subsecond_nanos / 1000);
           } else {
-            snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour,
-                     ct.minute, ct.second, ct.subsecond_nanos);
+            (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
+                           ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
           }
         } else {
-          snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute,
-                   ct.second);
+          (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", ct.hour,
+                         ct.minute, ct.second);
         }
-        return Value(std::string(buf));
+        return Value(std::string(buf.data()));
       }
       size_t space = s.find(' ');
       if (space == std::string::npos) {
@@ -4408,47 +4458,50 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       std::string tz_str = raw_str(arguments[1]);
       int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct, 0);
       if (tz_offset_sec != 0) {
-        int64_t ns = CivilTimeToNanos(ct) + tz_offset_sec * 1000000000LL;
+        int64_t ns = CivilTimeToNanos(ct) + (tz_offset_sec * 1000000000LL);
         ct = NanosToCivilTime(ns);
       }
-      char buf[64];
+      std::array<char, 64> buf{};
       if (ct.subsecond_nanos != 0) {
         if (ct.subsecond_nanos % 1000000 == 0) {
-          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour, ct.minute,
-                   ct.second, ct.subsecond_nanos / 1000000);
+          (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
+                         ct.hour, ct.minute, ct.second,
+                         ct.subsecond_nanos / 1000000);
         } else if (ct.subsecond_nanos % 1000 == 0) {
-          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour, ct.minute,
-                   ct.second, ct.subsecond_nanos / 1000);
+          (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
+                         ct.hour, ct.minute, ct.second,
+                         ct.subsecond_nanos / 1000);
         } else {
-          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour, ct.minute,
-                   ct.second, ct.subsecond_nanos);
+          (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
+                         ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
         }
       } else {
-        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute,
-                 ct.second);
+        (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", ct.hour,
+                       ct.minute, ct.second);
       }
-      return Value(std::string(buf));
+      return Value(std::string(buf.data()));
     }
     if (arguments.size() >= 3) {
       int h = arguments[0].type == ValueType::kInt64
-                  ? arguments[0].value.int_value
+                  ? static_cast<int>(arguments[0].value.int_value)
                   : std::stoi(raw_str(arguments[0]));
       int m = arguments[1].type == ValueType::kInt64
-                  ? arguments[1].value.int_value
+                  ? static_cast<int>(arguments[1].value.int_value)
                   : std::stoi(raw_str(arguments[1]));
       int s = arguments[2].type == ValueType::kInt64
-                  ? arguments[2].value.int_value
+                  ? static_cast<int>(arguments[2].value.int_value)
                   : std::stoi(raw_str(arguments[2]));
-      char buf[64];
+      std::array<char, 64> buf{};
       if (arguments.size() == 4) {
         int sub = arguments[3].type == ValueType::kInt64
-                      ? arguments[3].value.int_value
+                      ? static_cast<int>(arguments[3].value.int_value)
                       : std::stoi(raw_str(arguments[3]));
-        snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06d", h, m, s, sub);
+        (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06d", h, m, s,
+                       sub);
       } else {
-        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+        (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", h, m, s);
       }
-      return Value(std::string(buf));
+      return Value(std::string(buf.data()));
     }
   }
   if (name == "__quantified__") {
@@ -4483,15 +4536,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       const char* text;
       BinaryOperation op;
     };
-    static constexpr OpEntry kOps[] = {
-        {"=", BinaryOperation::kEquals},
-        {"!=", BinaryOperation::kNotEquals},
-        {"<>", BinaryOperation::kNotEquals},
-        {"<", BinaryOperation::kLessThan},
-        {"<=", BinaryOperation::kLessThanEquals},
-        {">", BinaryOperation::kGreaterThan},
-        {">=", BinaryOperation::kGreaterThanEquals},
-    };
+    static constexpr std::array<OpEntry, 7> kOps = {{
+        {.text = "=", .op = BinaryOperation::kEquals},
+        {.text = "!=", .op = BinaryOperation::kNotEquals},
+        {.text = "<>", .op = BinaryOperation::kNotEquals},
+        {.text = "<", .op = BinaryOperation::kLessThan},
+        {.text = "<=", .op = BinaryOperation::kLessThanEquals},
+        {.text = ">", .op = BinaryOperation::kGreaterThan},
+        {.text = ">=", .op = BinaryOperation::kGreaterThanEquals},
+    }};
     BinaryOperation operation = BinaryOperation::kEquals;
     bool found = false;
     for (const auto& entry : kOps) {
@@ -4624,7 +4677,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (name.find("ordinal") != std::string::npos) {
       --index;
     }
-    if (index < 0 || index >= static_cast<int64_t>(elements.size())) {
+    if (index < 0 || std::cmp_greater_equal(index, elements.size())) {
       // Out-of-range plain accesses are errors in GoogleSQL; only the SAFE
       // variants yield NULL.
       if (!safe) {
@@ -4657,7 +4710,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (rhs < 0 || rhs >= 64) {
       throw std::out_of_range("shift amount out of range");
     }
-    const uint64_t ulhs = static_cast<uint64_t>(lhs);
+    const auto ulhs = static_cast<uint64_t>(lhs);
     const uint64_t shifted = name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
     return Value(static_cast<int64_t>(shifted));
   }
@@ -4992,13 +5045,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (s1.find('+') != std::string::npos ||
         s1.find('Z') != std::string::npos ||
         s1.find('z') != std::string::npos) {
-      int64_t ns = CivilTimeToNanos(ct1) + (-8 * 3600LL) * 1000000000LL;
+      int64_t ns = CivilTimeToNanos(ct1) + ((-8 * 3600LL) * 1000000000LL);
       ct1 = NanosToCivilTime(ns);
     }
     if (s2.find('+') != std::string::npos ||
         s2.find('Z') != std::string::npos ||
         s2.find('z') != std::string::npos) {
-      int64_t ns = CivilTimeToNanos(ct2) + (-8 * 3600LL) * 1000000000LL;
+      int64_t ns = CivilTimeToNanos(ct2) + ((-8 * 3600LL) * 1000000000LL);
       ct2 = NanosToCivilTime(ns);
     }
     if (unit == "year" || unit == "years") {
@@ -5006,11 +5059,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (unit == "quarter" || unit == "quarters") {
       return Value(
-          static_cast<int64_t>((ct1.year - ct2.year) * 4 +
+          static_cast<int64_t>(((ct1.year - ct2.year) * 4) +
                                ((ct1.month - 1) / 3 - (ct2.month - 1) / 3)));
     }
     if (unit == "month" || unit == "months") {
-      return Value(static_cast<int64_t>((ct1.year - ct2.year) * 12 +
+      return Value(static_cast<int64_t>(((ct1.year - ct2.year) * 12) +
                                         (ct1.month - ct2.month)));
     }
 
@@ -5021,13 +5074,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             std::chrono::month{static_cast<unsigned>(ct.month)},
             std::chrono::day{static_cast<unsigned>(ct.day)}};
         std::chrono::sys_days sd{ymd};
-        int wd = std::chrono::weekday{sd}.iso_encoding();
+        int wd = static_cast<int>(std::chrono::weekday{sd}.iso_encoding());
         int days_back = (wd == 7) ? 0 : wd;
         std::chrono::sys_days week_start = sd - std::chrono::days{days_back};
         std::chrono::year_month_day res_ymd{week_start};
         ct.year = int(res_ymd.year());
-        ct.month = unsigned(res_ymd.month());
-        ct.day = unsigned(res_ymd.day());
+        ct.month = static_cast<int>(static_cast<unsigned>(res_ymd.month()));
+        ct.day = static_cast<int>(static_cast<unsigned>(res_ymd.day()));
         ct.hour = 0;
         ct.minute = 0;
         ct.second = 0;
@@ -5141,7 +5194,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       int trunc_tz_sec = ParseTimeZoneOffset(trunc_tz, &ct, -8 * 3600);
       CivilTime trunc_local_ct =
-          NanosToCivilTime(d_utc_ns + trunc_tz_sec * 1000000000LL);
+          NanosToCivilTime(d_utc_ns + (trunc_tz_sec * 1000000000LL));
       if (unit == "year" || unit == "years") {
         trunc_local_ct.month = 1;
         trunc_local_ct.day = 1;
@@ -5150,7 +5203,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         trunc_local_ct.second = 0;
         trunc_local_ct.subsecond_nanos = 0;
       } else if (unit == "quarter" || unit == "quarters") {
-        trunc_local_ct.month = ((trunc_local_ct.month - 1) / 3) * 3 + 1;
+        trunc_local_ct.month = (((trunc_local_ct.month - 1) / 3) * 3) + 1;
         trunc_local_ct.day = 1;
         trunc_local_ct.hour = 0;
         trunc_local_ct.minute = 0;
@@ -5168,13 +5221,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             std::chrono::month{static_cast<unsigned>(trunc_local_ct.month)},
             std::chrono::day{static_cast<unsigned>(trunc_local_ct.day)}};
         std::chrono::sys_days sd{ymd};
-        int wd = std::chrono::weekday{sd}.iso_encoding();
+        int wd = static_cast<int>(std::chrono::weekday{sd}.iso_encoding());
         int days_back = (wd == 7) ? 0 : wd;
         std::chrono::sys_days week_start = sd - std::chrono::days{days_back};
         std::chrono::year_month_day res_ymd{week_start};
         trunc_local_ct.year = int(res_ymd.year());
-        trunc_local_ct.month = unsigned(res_ymd.month());
-        trunc_local_ct.day = unsigned(res_ymd.day());
+        trunc_local_ct.month =
+            static_cast<int>(static_cast<unsigned>(res_ymd.month()));
+        trunc_local_ct.day =
+            static_cast<int>(static_cast<unsigned>(res_ymd.day()));
         trunc_local_ct.hour = 0;
         trunc_local_ct.minute = 0;
         trunc_local_ct.second = 0;
@@ -5207,7 +5262,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       int new_trunc_tz_sec =
           ParseTimeZoneOffset(trunc_tz, &trunc_local_ct, -8 * 3600);
       int64_t res_utc_ns =
-          CivilTimeToNanos(trunc_local_ct) - new_trunc_tz_sec * 1000000000LL;
+          CivilTimeToNanos(trunc_local_ct) - (new_trunc_tz_sec * 1000000000LL);
       CivilTime res_utc_ct = NanosToCivilTime(res_utc_ns);
       return Value(FormatCivilTime(res_utc_ct) + "+00");
     }
@@ -5219,7 +5274,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       ct.second = 0;
       ct.subsecond_nanos = 0;
     } else if (unit == "quarter" || unit == "quarters") {
-      ct.month = ((ct.month - 1) / 3) * 3 + 1;
+      ct.month = (((ct.month - 1) / 3) * 3) + 1;
       ct.day = 1;
       ct.hour = 0;
       ct.minute = 0;
@@ -5237,13 +5292,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::month{static_cast<unsigned>(ct.month)},
           std::chrono::day{static_cast<unsigned>(ct.day)}};
       std::chrono::sys_days sd{ymd};
-      int wd = std::chrono::weekday{sd}.iso_encoding();
+      int wd = static_cast<int>(std::chrono::weekday{sd}.iso_encoding());
       int days_back = (wd == 7) ? 0 : wd;
       std::chrono::sys_days week_start = sd - std::chrono::days{days_back};
       std::chrono::year_month_day res_ymd{week_start};
       ct.year = int(res_ymd.year());
-      ct.month = unsigned(res_ymd.month());
-      ct.day = unsigned(res_ymd.day());
+      ct.month = static_cast<int>(static_cast<unsigned>(res_ymd.month()));
+      ct.day = static_cast<int>(static_cast<unsigned>(res_ymd.day()));
       ct.hour = 0;
       ct.minute = 0;
       ct.second = 0;
@@ -5326,11 +5381,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     tm.tm_min = ct.minute;
     tm.tm_sec = ct.second;
     timegm(&tm);
-    char buf[128];
+    std::array<char, 128> buf{};
     const auto format_time = static_cast<size_t (*)(
         char*, size_t, const char*, const struct tm*) noexcept>(&std::strftime);
-    format_time(buf, sizeof(buf), fmt.c_str(), &tm);
-    return Value(std::string(buf));
+    format_time(buf.data(), buf.size(), fmt.c_str(), &tm);
+    return Value(std::string(buf.data()));
   }
   if (name == "parse_timestamp") {
     if (arguments.size() < 2 || arguments.size() > 3) {
@@ -5408,7 +5463,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     bool is_ts = (name == "timestamp_bucket" || d_has_tz);
 
-    CivilTime orig_ct{1970, 1, 1, 0, 0, 0, 0};
+    CivilTime orig_ct{.year = 1970,
+                      .month = 1,
+                      .day = 1,
+                      .hour = 0,
+                      .minute = 0,
+                      .second = 0,
+                      .subsecond_nanos = 0};
     bool has_origin = false;
     bool orig_has_tz = false;
     if (call.Args().size() == 3) {
@@ -5467,12 +5528,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         if (step_m == 0) {
           throw std::runtime_error(name + ": interval must not be zero");
         }
-        int64_t m_diff = static_cast<int64_t>(d_ct.year - orig_ct.year) * 12 +
+        int64_t m_diff = (static_cast<int64_t>(d_ct.year - orig_ct.year) * 12) +
                          (d_ct.month - orig_ct.month);
         int64_t bucket_m = floor_div(m_diff, step_m) * step_m;
         int64_t total_m = (orig_ct.year * 12 + orig_ct.month - 1) + bucket_m;
-        int bucket_y = floor_div(total_m, 12);
-        int bucket_mon = total_m - static_cast<int64_t>(bucket_y) * 12 + 1;
+        int bucket_y = static_cast<int>(floor_div(total_m, 12));
+        int bucket_mon = static_cast<int>(
+            total_m - (static_cast<int64_t>(bucket_y) * 12) + 1);
         CivilTime res_ct = orig_ct;
         res_ct.year = bucket_y;
         res_ct.month = bucket_mon;
@@ -5537,7 +5599,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         orig_ns -= tz_sec * 1000000000LL;
       }
       int64_t diff_ns = d_ns - orig_ns;
-      int64_t bucket_ns = orig_ns + floor_div(diff_ns, step_ns) * step_ns;
+      int64_t bucket_ns = orig_ns + (floor_div(diff_ns, step_ns) * step_ns);
       CivilTime res_ct = NanosToCivilTime(bucket_ns);
 
       if (d.type == ValueType::kDate && name == "date_bucket") {
@@ -5603,10 +5665,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                                        std::chrono::day{1}};
       std::chrono::sys_days jan1_days{jan1};
       std::chrono::weekday wd{jan1_days};
-      int jan1_wd = wd.iso_encoding();  // 1=Monday .. 7=Sunday
+      int jan1_wd =
+          static_cast<int>(wd.iso_encoding());  // 1=Monday .. 7=Sunday
       int days_to_first_monday = (jan1_wd == 1) ? 0 : (8 - jan1_wd);
       std::chrono::sys_days target_days =
-          jan1_days + std::chrono::days{days_to_first_monday + (w - 1) * 7};
+          jan1_days + std::chrono::days{days_to_first_monday + ((w - 1) * 7)};
       return Value::DateFromDays(target_days.time_since_epoch().count());
     }
     struct tm tm = {};
@@ -5616,10 +5679,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (res == nullptr || *res != '\0') {
       throw std::runtime_error("failed to parse date: " + val);
     }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900,
-             tm.tm_mon + 1, tm.tm_mday);
-    return Value::Date(std::string(buf));
+    std::array<char, 32> buf{};
+    (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d", tm.tm_year + 1900,
+                   tm.tm_mon + 1, tm.tm_mday);
+    return Value::Date(std::string(buf.data()));
   }
   if (name == "last_day") {
     if (arguments.empty() || arguments.size() > 2) {
@@ -5679,7 +5742,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         last_day_iso = 6;
       }
       std::chrono::sys_days cur_days{std::chrono::days{days}};
-      int cur_iso = std::chrono::weekday{cur_days}.iso_encoding();
+      int cur_iso =
+          static_cast<int>(std::chrono::weekday{cur_days}.iso_encoding());
       int add_days = (last_day_iso >= cur_iso) ? (last_day_iso - cur_iso)
                                                : (7 + last_day_iso - cur_iso);
       return Value::DateFromDays(days + add_days);
@@ -5687,7 +5751,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (part == "isoyear") {
       year_month_day dec31{year{y}, month{12}, day{31}};
       sys_days dec31_days{dec31};
-      int iso_wd = std::chrono::weekday{dec31_days}.iso_encoding();
+      int iso_wd =
+          static_cast<int>(std::chrono::weekday{dec31_days}.iso_encoding());
       int days_to_sun =
           (iso_wd == 7) ? 0 : ((iso_wd >= 4) ? (7 - iso_wd) : -(iso_wd));
       return Value::DateFromDays((dec31_days + std::chrono::days{days_to_sun})
@@ -5727,13 +5792,14 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       const int64_t q = a / b;
       return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
     };
-    int64_t total_m = static_cast<int64_t>(int(ymd.year())) * 12 +
+    int64_t total_m = (static_cast<int64_t>(int(ymd.year())) * 12) +
                       unsigned(ymd.month()) - 1 + n;
-    int target_y = floor_div(total_m, 12);
+    int target_y = static_cast<int>(floor_div(total_m, 12));
     if (target_y < 1 || target_y > 9999) {
       throw std::runtime_error("DATE value out of range");
     }
-    int target_m = total_m - static_cast<int64_t>(target_y) * 12 + 1;
+    int target_m =
+        static_cast<int>(total_m - (static_cast<int64_t>(target_y) * 12) + 1);
 
     year_month_day_last last_of_target{
         year{target_y}, month_day_last{month{static_cast<unsigned>(target_m)}}};
@@ -5788,7 +5854,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
 
     std::chrono::sys_days cur_days{std::chrono::days{days}};
-    int cur_iso = std::chrono::weekday{cur_days}.iso_encoding();
+    int cur_iso =
+        static_cast<int>(std::chrono::weekday{cur_days}.iso_encoding());
     int diff = target_iso - cur_iso;
     int add_days = (diff > 0) ? diff : (diff + 7);
     int64_t res_days = days + add_days;
@@ -5823,10 +5890,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     int d1 = static_cast<int>(unsigned(ymd1.day()));
     int d2 = static_cast<int>(unsigned(ymd2.day()));
 
-    double full_months = static_cast<double>((y1 - y2) * 12 + (m1 - m2));
+    auto full_months = static_cast<double>(((y1 - y2) * 12) + (m1 - m2));
 
-    bool is_last1 = (d1 == static_cast<int>(unsigned(last1.day())));
-    bool is_last2 = (d2 == static_cast<int>(unsigned(last2.day())));
+    bool is_last1 = (std::cmp_equal(d1, unsigned(last1.day())));
+    bool is_last2 = (std::cmp_equal(d2, unsigned(last2.day())));
 
     if ((d1 == d2) || (is_last1 && is_last2)) {
       return Value(full_months);
@@ -5838,16 +5905,18 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     double time_frac2 = 0.0;
     int h = 0, m = 0, s = 0;
     if (s1.size() > 11 &&
-        sscanf(s1.c_str() + 11, "%d:%d:%d", &h, &m, &s) >= 2) {
+        sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+            s1.c_str() + 11, "%d:%d:%d", &h, &m, &s) >= 2) {
       time_frac1 = (h * 3600 + m * 60 + s) / 86400.0;
     }
     if (s2.size() > 11 &&
-        sscanf(s2.c_str() + 11, "%d:%d:%d", &h, &m, &s) >= 2) {
+        sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+            s2.c_str() + 11, "%d:%d:%d", &h, &m, &s) >= 2) {
       time_frac2 = (h * 3600 + m * 60 + s) / 86400.0;
     }
 
     double day_diff = (d1 + time_frac1) - (d2 + time_frac2);
-    return Value(full_months + day_diff / 31.0);
+    return Value(full_months + (day_diff / 31.0));
   }
 
   auto utf8_offsets = [](std::string_view s)
@@ -5856,17 +5925,19 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     offsets.reserve(s.size() + 1);
     for (size_t i = 0; i < s.size();) {
       offsets.push_back(i);
-      const unsigned char c = static_cast<unsigned char>(s[i]);
+      const auto c = static_cast<unsigned char>(s[i]);
       if ((c & 0x80) == 0) {  // NOLINT(bugprone-branch-clone)
         i += 1;
       } else if ((c & 0xE0) == 0xC0) {
-        i += (i + 1 < s.size()) ? 2 : 1;
+        i += static_cast<size_t>((i + 1 < s.size()) ? 2 : 1);
       } else if ((c & 0xF0) == 0xE0) {
-        i += (i + 2 < s.size()) ? 3 : (i + 1 < s.size() ? 2 : 1);
+        i += static_cast<size_t>(
+            (i + 2 < s.size()) ? 3 : (i + 1 < s.size() ? 2 : 1));
       } else if ((c & 0xF8) == 0xF0) {
-        i += (i + 3 < s.size())
-                 ? 4
-                 : (i + 2 < s.size() ? 3 : (i + 1 < s.size() ? 2 : 1));
+        i += static_cast<size_t>(
+            (i + 3 < s.size())
+                ? 4
+                : (i + 2 < s.size() ? 3 : (i + 1 < s.size() ? 2 : 1)));
       } else {
         i += 1;
       }
@@ -6061,8 +6132,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (
-            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
         }
       }
       return def;
@@ -6090,7 +6160,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
 
     std::vector<size_t> matches;
     if (position > 0) {
-      size_t start_cp = static_cast<size_t>(position - 1);
+      auto start_cp = static_cast<size_t>(position - 1);
       for (size_t cp = start_cp; cp + t_cps <= s_cps; ++cp) {
         size_t b_start = s_offsets[cp];
         size_t b_end = s_offsets[cp + t_cps];
@@ -6103,10 +6173,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (target_cp >= 0) {
         for (int64_t cp = target_cp; cp >= 0; --cp) {
           if (static_cast<size_t>(cp) + t_cps <= s_cps) {
-            size_t b_start = s_offsets[cp];
-            size_t b_end = s_offsets[cp + t_cps];
+            size_t b_start = s_offsets[static_cast<size_t>(cp)];
+            size_t b_end = s_offsets[static_cast<size_t>(cp) + t_cps];
             if (source.substr(b_start, b_end - b_start) == target) {
-              matches.push_back(cp + 1);
+              matches.push_back(static_cast<size_t>(cp) + 1);
             }
           }
         }
@@ -6114,7 +6184,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
 
     if (static_cast<size_t>(occurrence) <= matches.size()) {
-      return Value(static_cast<int64_t>(matches[occurrence - 1]));
+      return Value(
+          static_cast<int64_t>(matches[static_cast<size_t>(occurrence) - 1]));
     }
     return Value(int64_t{0});
   }
@@ -6157,8 +6228,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (
-            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
         }
       }
       return def;
@@ -6176,7 +6246,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           "Output of REPEAT exceeds max allowed output size of 1MB");
     }
     std::string res;
-    res.reserve(s.size() * n);
+    res.reserve(s.size() * static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
       res += s;
     }
@@ -6221,8 +6291,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (
-            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
         }
       }
       return def;
@@ -6247,10 +6316,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     } else {
       actual_start = 0;
     }
-    if (actual_start < 0) {
-      actual_start = 0;
-    }
-    if (actual_start >= static_cast<int64_t>(total_cps)) {
+    actual_start = std::max<int64_t>(actual_start, 0);
+    if (std::cmp_greater_equal(actual_start, total_cps)) {
       return Value(std::string());
     }
 
@@ -6280,8 +6347,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (
-            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
         }
       }
       return def;
@@ -6306,10 +6372,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     } else {
       actual_start = 0;
     }
-    if (actual_start < 0) {
-      actual_start = 0;
-    }
-    if (actual_start >= static_cast<int64_t>(total_bytes)) {
+    actual_start = std::max<int64_t>(actual_start, 0);
+    if (std::cmp_greater_equal(actual_start, total_bytes)) {
       return Value(std::string());
     }
 
@@ -6350,8 +6414,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (
-            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
         }
       }
       return def;
@@ -6388,8 +6451,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (
-            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
         }
       }
       return def;
@@ -6409,9 +6471,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(s.substr(start));
     }
     const size_t total_cps = utf8_len(s);
-    const size_t start_cp = total_cps >= static_cast<size_t>(len)
-                                ? total_cps - static_cast<size_t>(len)
-                                : 0;
+    const size_t start_cp =
+        std::cmp_greater_equal(total_cps, static_cast<size_t>(len))
+            ? total_cps - static_cast<size_t>(len)
+            : 0;
     return Value(utf8_substr(s, start_cp, static_cast<size_t>(len)));
   }
 
@@ -6434,8 +6497,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (
-            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
         }
       }
       return def;
@@ -6457,7 +6519,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       throw std::runtime_error("Pattern in LPAD/RPAD cannot be empty");
     }
     const size_t total_cps = utf8_len(s);
-    if (static_cast<size_t>(target_len) <= total_cps) {
+    if (std::cmp_less_equal(target_len, total_cps)) {
       return Value(utf8_substr(s, 0, static_cast<size_t>(target_len)));
     }
     const size_t pad_cps = utf8_len(pad);
@@ -6709,8 +6771,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (
-            ...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
         }
       }
       return def;
@@ -6797,14 +6858,16 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       while (it != end) {
         // RE2 does not return the terminal empty match for BYTES/STRING
         // REGEXP_EXTRACT_ALL; std::regex_iterator does, so discard it.
-        if (it->length() == 0 &&
+        // match_results::empty() reports "no submatches", not "empty match";
+        // test the matched length instead.
+        if (it->length(0) == 0 &&
             it->position() == static_cast<ptrdiff_t>(s.size())) {
           break;
         }
         if (it->size() > 1) {
-          results.push_back(Value(it->str(1)));
+          results.emplace_back(it->str(1));
         } else {
-          results.push_back(Value(it->str(0)));
+          results.emplace_back(it->str(0));
         }
         ++it;
       }
@@ -6881,7 +6944,6 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         try {
           return std::stoll(std::string(v.value.varchar_value));
           // NOLINTNEXTLINE(bugprone-empty-catch)
-          // NOLINTNEXTLINE(bugprone-empty-catch)
         } catch (...) {
         }
       }
@@ -6916,23 +6978,21 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     int64_t start_idx = 0;
     if (occ > 0) {
       start_idx = occ - 1;
-      if (start_idx >= static_cast<int64_t>(parts.size())) {
+      if (std::cmp_greater_equal(start_idx, parts.size())) {
         return Value(std::string());
       }
     } else if (occ < 0) {
       start_idx = static_cast<int64_t>(parts.size()) + occ;
-      if (start_idx < 0) {
-        start_idx = 0;
-      }
+      start_idx = std::max<int64_t>(start_idx, 0);
     } else {
       start_idx = 0;
     }
 
     int64_t end_idx =
         std::min(start_idx + len, static_cast<int64_t>(parts.size()));
-    std::string res = parts[start_idx];
+    std::string res = parts[static_cast<size_t>(start_idx)];
     for (int64_t i = start_idx + 1; i < end_idx; ++i) {
-      res += delim + parts[i];
+      res += delim + parts[static_cast<size_t>(i)];
     }
     return Value(std::move(res));
   }
@@ -6951,28 +7011,28 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::vector<Value> elems;
     if (delim.empty()) {
       if (s.empty()) {
-        elems.push_back(Value(std::string()));
+        elems.emplace_back(std::string());
         return Value::Array(std::move(elems), "STRING");
       }
       const auto offsets = utf8_offsets(s);
       for (size_t i = 1; i < offsets.size(); ++i) {
-        elems.push_back(
-            Value(s.substr(offsets[i - 1], offsets[i] - offsets[i - 1])));
+        elems.emplace_back(
+            s.substr(offsets[i - 1], offsets[i] - offsets[i - 1]));
       }
       return Value::Array(std::move(elems), "STRING");
     }
     if (s.empty()) {
-      elems.push_back(Value(std::string()));
+      elems.emplace_back(std::string());
       return Value::Array(std::move(elems), "STRING");
     }
     size_t start = 0;
     while (true) {
       size_t pos = s.find(delim, start);
       if (pos == std::string::npos) {
-        elems.push_back(Value(s.substr(start)));
+        elems.emplace_back(s.substr(start));
         break;
       }
-      elems.push_back(Value(s.substr(start, pos - start)));
+      elems.emplace_back(s.substr(start, pos - start));
       start = pos + delim.size();
     }
     return Value::Array(std::move(elems), "STRING");
@@ -6988,11 +7048,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::string s = raw_str(arguments[0]);
     size_t first_char = 0;
     while (first_char < s.size() &&
-           std::isspace(static_cast<unsigned char>(s[first_char]))) {
+           (std::isspace(static_cast<unsigned char>(s[first_char])) != 0)) {
       ++first_char;
     }
     if (first_char >= s.size() ||
-        !std::isalpha(static_cast<unsigned char>(s[first_char]))) {
+        (std::isalpha(static_cast<unsigned char>(s[first_char])) == 0)) {
       return Value(std::string());
     }
     std::string res;
@@ -7002,17 +7062,32 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
 
     auto soundex_code = [](char c) -> char {
       c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-      if (c == 'B' || c == 'F' || c == 'P' || c == 'V') return '1';
+      if (c == 'B' || c == 'F' || c == 'P' || c == 'V') {
+        return '1';
+      }
       if (c == 'C' || c == 'G' || c == 'J' || c == 'K' || c == 'Q' ||
-          c == 'S' || c == 'X' || c == 'Z')
+          c == 'S' || c == 'X' || c == 'Z') {
         return '2';
-      if (c == 'D' || c == 'T') return '3';
-      if (c == 'L') return '4';
-      if (c == 'M' || c == 'N') return '5';
-      if (c == 'R') return '6';
-      if (c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U' || c == 'Y')
+      }
+      if (c == 'D' || c == 'T') {
+        return '3';
+      }
+      if (c == 'L') {
+        return '4';
+      }
+      if (c == 'M' || c == 'N') {
+        return '5';
+      }
+      if (c == 'R') {
+        return '6';
+      }
+      if (c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U' ||
+          c == 'Y') {
         return 'V';
-      if (c == 'H' || c == 'W') return 'H';
+      }
+      if (c == 'H' || c == 'W') {
+        return 'H';
+      }
       return '0';
     };
 
@@ -7021,7 +7096,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       prev_code = '0';
     }
     for (size_t i = first_char + 1; i < s.size() && res.size() < 4; ++i) {
-      if (!std::isalpha(static_cast<unsigned char>(s[i]))) {
+      if (std::isalpha(static_cast<unsigned char>(s[i])) == 0) {
         continue;
       }
       char code = soundex_code(s[i]);
@@ -7123,7 +7198,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       std::vector<std::unique_ptr<JVal>> arr;
       std::vector<std::pair<std::string, std::unique_ptr<JVal>>> obj;
 
-      std::string canonical() const {
+      [[nodiscard]] std::string canonical() const {
         if (type == kNull) {
           return "null";
         }
@@ -7151,10 +7226,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             } else if (c == '\t') {
               res += "\\t";
             } else if (static_cast<unsigned char>(c) < 0x20) {
-              char buf[8];
-              snprintf(buf, sizeof(buf), "\\u%04x",
-                       static_cast<unsigned char>(c));
-              res += buf;
+              std::array<char, 8> buf{};
+              (void)snprintf(buf.data(), buf.size(), "\\u%04x",
+                             static_cast<unsigned char>(c));
+              res += buf.data();
             } else {
               res.push_back(c);
             }
@@ -7232,7 +7307,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           } else if (next == 'u' && pos + 4 < s.size()) {
             std::string hex_str = std::string(s.substr(pos + 1, 4));
             try {
-              uint32_t cp = std::stoul(hex_str, nullptr, 16);
+              auto cp = static_cast<uint32_t>(std::stoul(hex_str, nullptr, 16));
               if (cp <= 0x7F) {
                 out.push_back(static_cast<char>(cp));
               } else if (cp <= 0x7FF) {
@@ -7441,11 +7516,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           break;
         }
         if (cur->type != JVal::kArr || idx < 0 ||
-            idx >= static_cast<int64_t>(cur->arr.size())) {
+            std::cmp_greater_equal(idx, cur->arr.size())) {
           cur = nullptr;
           break;
         }
-        cur = cur->arr[idx].get();
+        cur = cur->arr[static_cast<size_t>(idx)].get();
       } else {
         cur = nullptr;
         break;
@@ -7464,14 +7539,14 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       for (const auto& item : cur->arr) {
         if (name == "json_value_array" || name == "json_extract_string_array") {
           if (item->type == JVal::kNull) {
-            elems.push_back(Value());
+            elems.emplace_back();
           } else if (item->type == JVal::kStr) {
-            elems.push_back(Value(std::string(item->str)));
+            elems.emplace_back(std::string(item->str));
           } else {
-            elems.push_back(Value(item->canonical()));
+            elems.emplace_back(item->canonical());
           }
         } else {
-          elems.push_back(Value(item->canonical()));
+          elems.emplace_back(item->canonical());
         }
       }
       return Value::Array(std::move(elems), "STRING");
@@ -7662,10 +7737,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(arguments[0].value.int_value % arguments[1].value.int_value);
     }
     const double l = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     const double r = arguments[1].type == ValueType::kInt64
-                         ? arguments[1].value.int_value
+                         ? static_cast<double>(arguments[1].value.int_value)
                          : arguments[1].value.double_value;
     return Value(std::fmod(l, r));
   }
@@ -7677,10 +7752,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double l = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     const double r = arguments[1].type == ValueType::kInt64
-                         ? arguments[1].value.int_value
+                         ? static_cast<double>(arguments[1].value.int_value)
                          : arguments[1].value.double_value;
     return Value(std::pow(l, r));
   }
@@ -7692,7 +7767,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     if (v < 0.0) {
       throw std::runtime_error("SQRT of negative number");
@@ -7707,7 +7782,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::cbrt(v));
   }
@@ -7764,7 +7839,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::log(v));
   }
@@ -7777,7 +7852,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     if (name == "log10") {
       return Value(std::log10(v));
@@ -7786,7 +7861,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::log(v));
     }
     const double base = arguments[1].type == ValueType::kInt64
-                            ? arguments[1].value.int_value
+                            ? static_cast<double>(arguments[1].value.int_value)
                             : arguments[1].value.double_value;
     // Reference quirk: the logarithm of 1 to an infinite base is undefined
     // (NaN), not zero; plain IEEE division would report +/-0 there.
@@ -7803,7 +7878,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::exp(v));
   }
@@ -7815,7 +7890,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::cos(v));
   }
@@ -7827,7 +7902,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::sin(v));
   }
@@ -7839,7 +7914,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::tan(v));
   }
@@ -7851,7 +7926,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::acos(v));
   }
@@ -7863,7 +7938,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::asin(v));
   }
@@ -7875,7 +7950,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::atan(v));
   }
@@ -7887,10 +7962,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double y = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     const double x = arguments[1].type == ValueType::kInt64
-                         ? arguments[1].value.int_value
+                         ? static_cast<double>(arguments[1].value.int_value)
                          : arguments[1].value.double_value;
     return Value(std::atan2(y, x));
   }
@@ -7951,7 +8026,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::cosh(v));
   }
@@ -7963,7 +8038,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::sinh(v));
   }
@@ -7975,7 +8050,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const double v = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     return Value(std::tanh(v));
   }
@@ -8008,10 +8083,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const double quotient = std::trunc(l / r);
     // static_cast<int64_t> of an out-of-range double is UB; DIV must raise.
-    if (!(quotient >=
-              static_cast<double>(std::numeric_limits<int64_t>::min()) &&
-          quotient <
-              -static_cast<double>(std::numeric_limits<int64_t>::min()))) {
+    if (quotient < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
+        quotient >= -static_cast<double>(std::numeric_limits<int64_t>::min())) {
       throw std::out_of_range("DIV result out of range for INT64");
     }
     return Value(static_cast<int64_t>(quotient));
@@ -8034,7 +8107,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const double res = l / r;
     if (name == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
-      return Value();
+      return {};
     }
     return Value(res);
   }
@@ -8074,10 +8147,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     }
     const double l = arguments[0].type == ValueType::kInt64
-                         ? arguments[0].value.int_value
+                         ? static_cast<double>(arguments[0].value.int_value)
                          : arguments[0].value.double_value;
     const double r = arguments[1].type == ValueType::kInt64
-                         ? arguments[1].value.int_value
+                         ? static_cast<double>(arguments[1].value.int_value)
                          : arguments[1].value.double_value;
     // SAFE_* return NULL on overflow; the double path must not leak +/-inf.
     const double checked =
@@ -8154,8 +8227,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           ++i;
         }
         while (i < fmt.size() &&
-               std::isdigit(static_cast<unsigned char>(fmt[i]))) {
-          width = width * 10 + (fmt[i] - '0');
+               (std::isdigit(static_cast<unsigned char>(fmt[i])) != 0)) {
+          width = (width * 10) + (fmt[i] - '0');
           ++i;
         }
         int precision = -1;
@@ -8180,8 +8253,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             precision = 0;
           }
           while (i < fmt.size() &&
-                 std::isdigit(static_cast<unsigned char>(fmt[i]))) {
-            precision = precision * 10 + (fmt[i] - '0');
+                 (std::isdigit(static_cast<unsigned char>(fmt[i])) != 0)) {
+            precision = (precision * 10) + (fmt[i] - '0');
             ++i;
           }
         }
@@ -8237,20 +8310,22 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             formatted_item = "NULL";
           } else if (arg.type == ValueType::kInt64) {
             if (spec == 'x') {
-              char buf[32];
-              snprintf(buf, sizeof(buf), hash_flag ? "0x%lx" : "%lx",
-                       static_cast<unsigned long>(arg.value.int_value));
-              formatted_item = buf;
+              std::array<char, 32> buf{};
+              (void)snprintf(buf.data(), buf.size(),
+                             hash_flag ? "0x%lx" : "%lx",
+                             static_cast<unsigned long>(arg.value.int_value));
+              formatted_item = buf.data();
             } else if (spec == 'X') {
-              char buf[32];
-              snprintf(buf, sizeof(buf), hash_flag ? "0X%lX" : "%lX",
-                       static_cast<unsigned long>(arg.value.int_value));
-              formatted_item = buf;
+              std::array<char, 32> buf{};
+              (void)snprintf(buf.data(), buf.size(),
+                             hash_flag ? "0X%lX" : "%lX",
+                             static_cast<unsigned long>(arg.value.int_value));
+              formatted_item = buf.data();
             } else if (spec == 'o') {
-              char buf[32];
-              snprintf(buf, sizeof(buf), hash_flag ? "0%lo" : "%lo",
-                       static_cast<unsigned long>(arg.value.int_value));
-              formatted_item = buf;
+              std::array<char, 32> buf{};
+              (void)snprintf(buf.data(), buf.size(), hash_flag ? "0%lo" : "%lo",
+                             static_cast<unsigned long>(arg.value.int_value));
+              formatted_item = buf.data();
             } else {
               formatted_item = std::to_string(arg.value.int_value);
             }
@@ -8420,7 +8495,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const Value& arg = arguments[0];
     if (arg.IsNull()) {
-      return Value();
+      return {};
     }
     if (arg.type != ValueType::kDouble) {
       return Value(int64_t{0});
@@ -8527,7 +8602,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const auto& elements = arr.ArrayElements();
-    const int64_t n = static_cast<int64_t>(elements.size());
+    const auto n = static_cast<int64_t>(elements.size());
     int64_t offset = arguments[1].value.int_value;
     int64_t size = arguments.size() == 3 ? arguments[2].value.int_value : n;
     if (size <= 0 || n == 0) {
@@ -8590,8 +8665,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         arguments[0].type == ValueType::kDouble ||
         arguments[1].type == ValueType::kDouble ||
         (arguments.size() == 3 && arguments[2].type == ValueType::kDouble);
-    double start_d = static_cast<double>(arguments[0].value.int_value);
-    double end_d = static_cast<double>(arguments[1].value.int_value);
+    auto start_d = static_cast<double>(arguments[0].value.int_value);
+    auto end_d = static_cast<double>(arguments[1].value.int_value);
     if (arguments[0].type == ValueType::kDouble) {
       start_d = arguments[0].value.double_value;
     }
@@ -8619,7 +8694,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::vector<Value> elements;
     elements.reserve(static_cast<size_t>(std::max<int64_t>(count, 0)));
     for (int64_t i = 0; i < count; ++i) {
-      const double v = start_d + static_cast<double>(i) * step_d;
+      const double v = start_d + (static_cast<double>(i) * step_d);
       elements.push_back(has_double ? Value(v)
                                     : Value(static_cast<int64_t>(v)));
     }
@@ -8705,7 +8780,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::vector<Value> values;
     constexpr size_t kMaxGeneratedElements = 1'000'000;
     for (double current = begin; (step > 0 ? current <= end : current >= end);
-         current += step) {
+         current += step) {  // NOLINT(cert-flp30-c) - float semantics pinned.
       if (values.size() == kMaxGeneratedElements) {
         throw std::runtime_error("GENERATE_SERIES generated too many elements");
       }
@@ -8806,7 +8881,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     };
     const auto& haystack = input.ArrayElements();
-    bool result;
+    bool result = false;
     if (name == "array_includes") {
       result = false;
       for (const Value& element : haystack) {
@@ -8881,7 +8956,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::string uuid;
     uuid.reserve(36);
     auto append_hex = [&uuid](uint64_t value, int nibbles) {
-      static const char kDigits[] = "0123456789abcdef";
+      static constexpr std::string_view kDigits = "0123456789abcdef";
       for (int i = nibbles - 1; i >= 0; --i) {
         uuid.push_back(kDigits[(value >> (4 * i)) & 0xF]);
       }
@@ -8937,7 +9012,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return {};
     }
-    static const char kAlphabet[] =
+    static constexpr std::string_view kAlphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const std::string input = raw_str(arguments[0]);
     std::string out;
@@ -9058,7 +9133,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (hi < 0 || lo < 0) {
         throw std::runtime_error("FROM_HEX: invalid hex string");
       }
-      out.push_back(static_cast<char>(hi * 16 + lo));
+      out.push_back(static_cast<char>((hi * 16) + lo));
     }
     return Value(std::move(out));
   }
@@ -9103,7 +9178,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     out.reserve(input.size());
     const std::string replacement = "\xEF\xBF\xBD";
     for (size_t i = 0; i < input.size();) {
-      const unsigned char lead = static_cast<unsigned char>(input[i]);
+      const auto lead = static_cast<unsigned char>(input[i]);
       size_t length = 0;
       unsigned char min_cont = 0x80;
       if (lead < 0x80) {
@@ -9125,7 +9200,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       bool valid = length > 0 && i + length <= input.size();
       for (size_t j = 1; valid && j < length; ++j) {
-        const unsigned char cont = static_cast<unsigned char>(input[i + j]);
+        const auto cont = static_cast<unsigned char>(input[i + j]);
         if (cont < (j == 1 ? min_cont : 0x80) || cont > 0xBF) {
           valid = false;
         }
@@ -9288,7 +9363,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                  : static_cast<int64_t>(v.value.double_value);
     };
     const auto& elements = array.ArrayElements();
-    const int64_t n = static_cast<int64_t>(elements.size());
+    const auto n = static_cast<int64_t>(elements.size());
     const int64_t start_raw = as_index(arguments[1]);
     const int64_t end_raw = arguments.size() == 3 ? as_index(arguments[2]) : n;
     const auto slice_normalize = [n](int64_t offset) -> int64_t {
@@ -9305,11 +9380,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     };
     int64_t start = slice_normalize(start_raw);
     int64_t end = slice_normalize(end_raw);
-    if (start > end) {
-      start = end;
-    }
-    std::vector<Value> sliced(elements.begin() + static_cast<size_t>(start),
-                              elements.begin() + static_cast<size_t>(end));
+    start = std::min(start, end);
+    std::vector<Value> sliced(
+        elements.begin() + static_cast<std::ptrdiff_t>(start),
+        elements.begin() + static_cast<std::ptrdiff_t>(end));
     return Value::Array(std::move(sliced), array.ArrayElementSqlType());
   }
 
@@ -9446,11 +9520,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     constexpr size_t kMaxGeneratedElements = 1000000;
     for (double value = start; elements.size() < kMaxGeneratedElements &&
                                (step > 0 ? value <= end : value >= end);
-         value += step) {
+         value += step) {  // NOLINT(cert-flp30-c) - float semantics pinned.
       if (integral) {
-        elements.push_back(Value(static_cast<int64_t>(value)));
+        elements.emplace_back(static_cast<int64_t>(value));
       } else {
-        elements.push_back(Value(value));
+        elements.emplace_back(value);
       }
     }
     return Value::Array(std::move(elements), element_type);
@@ -9491,8 +9565,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         long long years = 0, months = 0, days = 0, hours = 0, mins = 0,
                   secs = 0;
         const std::string encoded = raw_str(arguments[2]);
-        if (sscanf(encoded.c_str(), "%lld-%lld %lld %lld:%lld:%lld", &years,
-                   &months, &days, &hours, &mins, &secs) >= 3 &&
+        if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+                encoded.c_str(), "%lld-%lld %lld %lld:%lld:%lld", &years,
+                &months, &days, &hours, &mins, &secs) >= 3 &&
             years == 0 && months == 0 && hours == 0 && mins == 0 && secs == 0 &&
             days != 0) {
           step_days = static_cast<int64_t>(days);
@@ -9639,6 +9714,12 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         if (!found && !test.IsNull() && !candidate.IsNull() &&
             Binary(BinaryOperation::kEquals, test, candidate).Truthy()) {
           found = true;
+        }
+        if (found) {
+          // A match decides TRUE; remaining items cannot change the result
+          // and a throwing item (e.g. a type-mismatched comparison) must not
+          // fail an already-decided predicate (mirrors the subquery IN path).
+          break;
         }
       }
       if (found) {
@@ -9837,8 +9918,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           ++context.execution_runtime()->uncorrelated_hash_probes;
           found = !test.IsNull() && cached->second.contains(test);
           if (!found && !test.IsNull() &&
-              cached->second.size() <
-                  static_cast<size_t>(relation->TotalRows())) {
+              cached->second.size() < relation->TotalRows()) {
             // The hash set excludes NULL keys; a size shortfall means the
             // relation may contain NULLs that turn the miss into UNKNOWN.
             row_source.ForEachRow([&](const Row& row) {

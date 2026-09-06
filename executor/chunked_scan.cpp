@@ -1,17 +1,19 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/chunked_scan.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <iostream>
-#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/selection_vector.hpp"
 #include "executor/vectorized_expression.hpp"
+#include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "page/row_position.hpp"
 #include "table/table.hpp"
@@ -37,8 +39,8 @@ ChunkedScan::ChunkedScan(Transaction& txn, Table& table, Schema schema,
 }
 
 ChunkedScan::ChunkedScan(Transaction& txn, Table& table, const Index& index,
-                         Schema schema, const Value& begin, const Value& end,
-                         bool ascending, std::vector<slot_t> projection,
+                         Schema schema, Value begin, Value end, bool ascending,
+                         std::vector<slot_t> projection,
                          std::optional<Expression> filter)
     : txn_(txn),
       table_(table),
@@ -46,8 +48,8 @@ ChunkedScan::ChunkedScan(Transaction& txn, Table& table, const Index& index,
       projection_(std::move(projection)),
       filter_(std::move(filter)),
       index_(&index),
-      index_begin_(begin),
-      index_end_(end),
+      index_begin_(std::move(begin)),
+      index_end_(std::move(end)),
       ascending_(ascending),
       is_index_scan_(true) {
   index_iter_ = table_.BeginIndexScan(txn_, *index_, index_begin_, index_end_,
@@ -176,7 +178,7 @@ bool ChunkedScan::Next(Row* dst, RowPosition* rp) {
 void ChunkedScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "ChunkedScan(";
   if (is_index_scan_) {
-    o << "index=" << (index_ ? index_->sc_.name_ : "")
+    o << "index=" << ((index_ != nullptr) ? index_->sc_.name_ : "")
       << ", begin=" << index_begin_ << ", end=" << index_end_;
   } else {
     o << "table=" << schema_.Name() << ", morsels=" << morsels_.size();

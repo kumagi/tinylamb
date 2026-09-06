@@ -7,7 +7,8 @@
 #include <bits/pthreadtypes.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <signal.h>  // NOLINT(modernize-deprecated-headers) // POSIX sigaction/sigemptyset below are only provided by this header.
+// NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigaction/sigemptyset
+#include <signal.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>

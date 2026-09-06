@@ -101,7 +101,8 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
       db.EmulateCrash();
       Database recovered(db_name);
       TransactionContext verify_ctx = recovered.BeginContext();
-      ASSIGN_OR_CRASH(Table, verify_table, recovered.GetTable(verify_ctx, "FuzzerTable"));
+      ASSIGN_OR_CRASH(Table, verify_table,
+                      recovered.GetTable(verify_ctx, "FuzzerTable"));
       for (const auto& [rp, expected_row] : rows) {
         ASSIGN_OR_CRASH(Row, read_row, verify_table.Read(verify_ctx.txn_, rp));
         assert(expected_row == read_row);

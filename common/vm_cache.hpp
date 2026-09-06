@@ -41,7 +41,7 @@ class VMCache {
     const size_t rounded =
         ((around + kBlockSizeForAlign / 2) / kBlockSizeForAlign) *
         kBlockSizeForAlign;
-    return std::max(std::max(min_size, rounded), kBlockSizeForAlign);
+    return std::max({min_size, rounded, kBlockSizeForAlign});
   }
   VMCache(int fd, size_t memory_capacity, size_t offset = 0,
           size_t file_size = 0)

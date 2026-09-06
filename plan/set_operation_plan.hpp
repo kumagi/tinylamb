@@ -25,7 +25,7 @@ class SetOperationPlan final : public PlanBase {
         order_keys_(std::move(order_keys)),
         schema_(GenerateSchema()) {}
 
-  Executor EmitExecutor(TransactionContext& context) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return children_.front()->GetStats();

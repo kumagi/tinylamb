@@ -137,7 +137,8 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
     while (it.IsValid()) {
       Row row = *it;
       // Assert -- each row has int_value * 2 == double_value
-      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      ASSERT_DOUBLE_EQ(static_cast<double>(row[0].value.int_value * 2),
+                       row[2].value.double_value);
       ++it;
       ++counter;
     }
@@ -153,7 +154,8 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
     int counter = 0;
     while (it.IsValid()) {
       Row row = *it;
-      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      ASSERT_DOUBLE_EQ(static_cast<double>(row[0].value.int_value * 2),
+                       row[2].value.double_value);
       ++it;
       ++counter;
     }
@@ -183,7 +185,8 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
     int counter = 0;
     while (it.IsValid()) {
       Row row = *it;
-      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      ASSERT_DOUBLE_EQ(static_cast<double>(row[0].value.int_value * 2),
+                       row[2].value.double_value);
       ++it;
       ++counter;
     }
@@ -247,7 +250,8 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
     while (it.IsValid()) {
       Row row = *it;
       // Assert -- each row has int_value * 2 == double_value
-      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      ASSERT_DOUBLE_EQ(static_cast<double>(row[0].value.int_value * 2),
+                       row[2].value.double_value);
       --it;
       ++counter;
     }
@@ -264,7 +268,8 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
     int counter = 0;
     while (it.IsValid()) {
       Row row = *it;
-      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      ASSERT_DOUBLE_EQ(static_cast<double>(row[0].value.int_value * 2),
+                       row[2].value.double_value);
       --it;
       ++counter;
     }
@@ -319,7 +324,8 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescendingIncrement) {
   int counter = 0;
   while (it.IsValid()) {
     Row row = *it;
-    ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+    ASSERT_DOUBLE_EQ(static_cast<double>(row[0].value.int_value * 2),
+                     row[2].value.double_value);
     ++it;
     ++counter;
   }
@@ -507,7 +513,8 @@ TEST_F(IndexScanIteratorTest, CompositePrefixRangeScan) {
   int counter = 0;
   while (it.IsValid()) {
     Row row = *it;
-    EXPECT_NEAR(row[0].value.int_value, row[2].value.double_value - 0.1, 1e-9);
+    EXPECT_NEAR(static_cast<double>(row[0].value.int_value),
+                row[2].value.double_value - 0.1, 1e-9);
     ++it;
     ++counter;
   }

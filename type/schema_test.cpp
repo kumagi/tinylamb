@@ -16,6 +16,8 @@
 
 #include "schema.hpp"
 
+#include <sys/types.h>
+
 #include <sstream>
 #include <string>
 #include <unordered_set>

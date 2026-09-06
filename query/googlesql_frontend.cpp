@@ -8,7 +8,8 @@
 #include <bits/types/sigset_t.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <signal.h>  // NOLINT(modernize-deprecated-headers) // POSIX signal APIs below (sigemptyset, pthread_sigmask, SIGPIPE) are only provided by this header.
+// NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigset_t APIs
+#include <signal.h>
 #include <sys/poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -77,8 +79,8 @@ class BlockedSigPipe {
   BlockedSigPipe& operator=(BlockedSigPipe&&) = delete;
 
  private:
-  sigset_t set_;
-  sigset_t old_;
+  sigset_t set_{};
+  sigset_t old_{};
 };
 
 #if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(__unix__)
@@ -286,7 +288,7 @@ std::string MaskLiteralsAndComments(std::string_view sql) {
     if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
       const size_t begin = i;
       i += 2;
-      while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+      while (i + 1 < sql.size() && (sql[i] != '*' || sql[i + 1] != '/')) {
         ++i;
       }
       i = std::min(sql.size(), i + 2);
@@ -356,38 +358,44 @@ bool ExtractDistinctOn(std::string_view sql, size_t* out_start, size_t* out_end,
   size_t pos = 0;
   while (pos < lower.size()) {
     size_t found = mask.find("distinct", pos);
-    if (found == std::string::npos) break;
+    if (found == std::string::npos) {
+      break;
+    }
     if (found > 0 &&
-        (std::isalnum(static_cast<unsigned char>(lower[found - 1])) ||
+        ((std::isalnum(static_cast<unsigned char>(lower[found - 1])) != 0) ||
          lower[found - 1] == '_')) {
       pos = found + 8;
       continue;
     }
     size_t after_dist = found + 8;
     while (after_dist < lower.size() &&
-           std::isspace(static_cast<unsigned char>(lower[after_dist]))) {
+           (std::isspace(static_cast<unsigned char>(lower[after_dist])) != 0)) {
       ++after_dist;
     }
     if (lower.compare(after_dist, 2, "on") == 0) {
       size_t after_on = after_dist + 2;
       if (after_on < lower.size() &&
-          (std::isalnum(static_cast<unsigned char>(lower[after_on])) ||
+          ((std::isalnum(static_cast<unsigned char>(lower[after_on])) != 0) ||
            lower[after_on] == '_')) {
         pos = after_on;
         continue;
       }
       while (after_on < lower.size() &&
-             std::isspace(static_cast<unsigned char>(lower[after_on]))) {
+             (std::isspace(static_cast<unsigned char>(lower[after_on])) != 0)) {
         ++after_on;
       }
       if (after_on < lower.size() && lower[after_on] == '(') {
+        // Depth-count on the literal-masked copy: mask and sql share
+        // positions 1:1, and counting on raw text would let an unbalanced
+        // parenthesis inside a string literal (e.g. ON ('a)')) corrupt the
+        // slice.
         size_t open_paren = after_on;
         int depth = 1;
         size_t close_paren = open_paren + 1;
-        while (close_paren < sql.size() && depth > 0) {
-          if (sql[close_paren] == '(') {
+        while (close_paren < mask.size() && depth > 0) {
+          if (mask[close_paren] == '(') {
             ++depth;
-          } else if (sql[close_paren] == ')') {
+          } else if (mask[close_paren] == ')') {
             --depth;
           }
           ++close_paren;
@@ -428,29 +436,32 @@ bool ExtractFetchWithTies(std::string_view sql, std::string* out_rewritten,
     if (offset_pos != std::string::npos && offset_pos < fetch_pos) {
       size_t cur = offset_pos + 6;
       while (cur < fetch_pos &&
-             std::isspace(static_cast<unsigned char>(lower[cur]))) {
+             (std::isspace(static_cast<unsigned char>(lower[cur])) != 0)) {
         ++cur;
       }
       while (cur < fetch_pos &&
-             std::isdigit(static_cast<unsigned char>(lower[cur]))) {
+             (std::isdigit(static_cast<unsigned char>(lower[cur])) != 0)) {
         offset_val.push_back(lower[cur]);
         ++cur;
       }
     }
 
     size_t count_start = fetch_pos + 11;
-    while (count_start < lower.size() &&
-           std::isspace(static_cast<unsigned char>(lower[count_start]))) {
+    while (
+        count_start < lower.size() &&
+        (std::isspace(static_cast<unsigned char>(lower[count_start])) != 0)) {
       ++count_start;
     }
     std::string count_val;
     size_t count_cur = count_start;
     while (count_cur < lower.size() &&
-           std::isdigit(static_cast<unsigned char>(lower[count_cur]))) {
+           (std::isdigit(static_cast<unsigned char>(lower[count_cur])) != 0)) {
       count_val.push_back(lower[count_cur]);
       ++count_cur;
     }
-    if (count_val.empty()) count_val = "1";
+    if (count_val.empty()) {
+      count_val = "1";
+    }
 
     size_t cut_pos = (offset_pos != std::string::npos && offset_pos < fetch_pos)
                          ? offset_pos
@@ -497,7 +508,7 @@ std::string NormalizeGroupByDistinct(std::string_view sql) {
       return std::string(sql);
     }
     while (after < lower.size() &&
-           std::isspace(static_cast<unsigned char>(lower[after]))) {
+           (std::isspace(static_cast<unsigned char>(lower[after])) != 0)) {
       ++after;
     }
     if (lower.compare(after, 3, "all") == 0) {
@@ -569,12 +580,18 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
           ++next_line;
           while (next_line < keys_res.ast.size()) {
             size_t cur_end = keys_res.ast.find('\n', next_line);
-            if (cur_end == std::string::npos) cur_end = keys_res.ast.size();
+            if (cur_end == std::string::npos) {
+              cur_end = keys_res.ast.size();
+            }
             std::string line =
                 keys_res.ast.substr(next_line, cur_end - next_line);
             size_t sp = 0;
-            while (sp < line.size() && line[sp] == ' ') ++sp;
-            if (sp <= sl_indent && !line.empty()) break;
+            while (sp < line.size() && line[sp] == ' ') {
+              ++sp;
+            }
+            if (sp <= sl_indent && !line.empty()) {
+              break;
+            }
             if (!line.empty()) {
               size_t rel = sp - sl_indent;
               distinct_on_block += std::string(select_indent + 2 + rel, ' ') +

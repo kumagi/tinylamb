@@ -41,7 +41,9 @@ std::string OmittedString(std::string_view original, int length) {
   // the string is too short to split (or the limit is negative).
   if (0 < length && static_cast<size_t>(length) + 16 <= size) {
     std::string omitted_key = std::string(original).substr(0, 8);
-    omitted_key += "..(" + std::to_string(size - length + 4) + "bytes)..";
+    omitted_key += "..(" +
+                   std::to_string(size - static_cast<size_t>(length) + 4) +
+                   "bytes)..";
     omitted_key += original.substr(size - 8);
     return omitted_key;
   }
@@ -52,7 +54,9 @@ std::string HeadString(std::string_view original, int length) {
   if ((size_t)length < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
-        "..(" + std::to_string(original.length() - length + 8) + "bytes)";
+        "..(" +
+        std::to_string(original.length() - static_cast<size_t>(length) + 8) +
+        "bytes)";
     return omitted_key;
   }
   return std::string(original);

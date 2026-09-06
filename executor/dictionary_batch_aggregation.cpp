@@ -8,10 +8,12 @@
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -29,8 +31,12 @@ void DictionaryBatchAggregation::Accumulator::Accumulate(const Value& val,
     min_val = val;
     max_val = val;
   } else {
-    if (val < min_val) min_val = val;
-    if (max_val < val) max_val = val;
+    if (val < min_val) {
+      min_val = val;
+    }
+    if (max_val < val) {
+      max_val = val;
+    }
   }
 
   if (val.type == ValueType::kInt64) {
@@ -53,7 +59,7 @@ Value DictionaryBatchAggregation::Accumulator::Finalize(AggOp op) const {
     case AggOp::kMax:
       return has_val ? max_val : Value();
   }
-  return Value();
+  return {};
 }
 
 DictionaryBatchAggregation::DictionaryBatchAggregation(Schema schema,
@@ -70,7 +76,7 @@ uint32_t DictionaryBatchAggregation::GetOrCreateCode(const Value& group_val) {
   if (it != code_map_.end()) {
     return it->second;
   }
-  const uint32_t new_code = static_cast<uint32_t>(dictionary_.size());
+  const auto new_code = static_cast<uint32_t>(dictionary_.size());
   dictionary_.push_back(group_val);
   code_map_[group_val] = new_code;
   accumulators_.emplace_back();

@@ -16,7 +16,6 @@
 
 #include "b_plus_tree_iterator.hpp"
 
-#include <cstddef>
 #include <stdexcept>
 #include <string_view>
 #include <utility>

@@ -41,6 +41,9 @@ class UnnestPlan final : public PlanBase {
   [[nodiscard]] const Expression& UnnestExpr() const { return unnest_expr_; }
   [[nodiscard]] const std::string& Alias() const { return alias_; }
   [[nodiscard]] const std::string& OffsetAlias() const { return offset_alias_; }
+  // The unnest-produced columns of schema_ (without any prepended child
+  // relation columns); what the UnnestExecutor must emit per row.
+  [[nodiscard]] const Schema& UnnestSection() const { return unnest_section_; }
 
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
@@ -50,6 +53,7 @@ class UnnestPlan final : public PlanBase {
   Expression unnest_expr_;
   std::string alias_;
   std::string offset_alias_;
+  Schema unnest_section_;
   Schema schema_;
   TableStatistics stats_;
 };

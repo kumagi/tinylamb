@@ -1,19 +1,29 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "query/join_reduction.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "query/statement.hpp"
+#include "type/column_name.hpp"
+#include "type/type.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 namespace {
+
+bool RejectsNulls(const Expression& expression, const std::string& qualifier);
+bool NeverFalse(const Expression& expression, const std::string& qualifier);
 
 // True when evaluating `expression` with every column qualified by
 // `qualifier` bound to NULL can only yield FALSE or NULL, never TRUE.
@@ -41,15 +51,7 @@ bool RejectsNulls(const Expression& expression, const std::string& qualifier) {
           return RejectsNulls(binary.Left(), qualifier) ||
                  RejectsNulls(binary.Right(), qualifier);
         case BinaryOperation::kOr:
-          // Both sides must independently reject NULLs: `a IS NULL OR b > 1`
-          // is satisfied by a padded row whose `b` is a real NULL.
-          return RejectsNulls(binary.Left(), qualifier) &&
-                 RejectsNulls(binary.Right(), qualifier);
         case BinaryOperation::kXor:
-          // XOR of NULL is NULL, but NULL on one input does not force the
-          // result non-TRUE unless both sides reject.
-          return RejectsNulls(binary.Left(), qualifier) &&
-                 RejectsNulls(binary.Right(), qualifier);
         case BinaryOperation::kAdd:
         case BinaryOperation::kSubtract:
         case BinaryOperation::kMultiply:
@@ -57,8 +59,11 @@ bool RejectsNulls(const Expression& expression, const std::string& qualifier) {
         case BinaryOperation::kModulo:
         case BinaryOperation::kShiftLeft:
         case BinaryOperation::kShiftRight:
-          // NULL propagates through arithmetic only when every operand
-          // rejects; otherwise a non-NULL operand may keep the result TRUE.
+          // Both sides must independently reject NULLs: `a IS NULL OR b > 1`
+          // is satisfied by a padded row whose `b` is a real NULL, XOR of
+          // NULL is NULL, and NULL propagates through arithmetic only when
+          // every operand rejects; otherwise a non-NULL operand may keep the
+          // result TRUE.
           return RejectsNulls(binary.Left(), qualifier) &&
                  RejectsNulls(binary.Right(), qualifier);
         case BinaryOperation::kEquals:
@@ -87,8 +92,11 @@ bool RejectsNulls(const Expression& expression, const std::string& qualifier) {
       const UnaryExpression& unary = expression->AsUnaryExpression();
       switch (unary.Op()) {
         case UnaryOperation::kNot:
-          // NOT NULL is NULL: rejecting propagates.
-          return RejectsNulls(unary.Child(), qualifier);
+          // NOT flips the property: NOT(e) is FALSE or NULL exactly when e
+          // is TRUE or NULL ("never false").  RejectsNulls(child) alone is
+          // unsound: it also allows FALSE, and NOT FALSE = TRUE keeps a
+          // padded row alive (`NOT (padded.a > 5 AND other.x > 100)`).
+          return NeverFalse(unary.Child(), qualifier);
         case UnaryOperation::kMinus:
           // Arithmetic negation keeps NULL; a non-NULL child may stay TRUE
           // (e.g. IS TRUE wrappers), so require the child to reject.
@@ -121,18 +129,94 @@ bool RejectsNulls(const Expression& expression, const std::string& qualifier) {
   }
 }
 
+// True when evaluating `expression` with every column qualified by
+// `qualifier` bound to NULL can only yield TRUE or NULL, never FALSE.  This
+// is the dual property `NOT(...)` needs: NOT(e) is FALSE or NULL exactly
+// when e never evaluates FALSE on a padded row.
+bool NeverFalse(const Expression& expression, const std::string& qualifier) {
+  if (!expression) {
+    return false;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kColumnValue: {
+      // A padded column evaluates to NULL in filter (boolean) context.
+      const ColumnName& column = expression->AsColumnValue().GetColumnName();
+      return !column.schema.empty() && column.schema == qualifier;
+    }
+    case TypeTag::kConstantValue:
+      return expression->AsConstantValue().GetValue().Truthy();
+    case TypeTag::kBinaryExp: {
+      const BinaryExpression& binary = expression->AsBinaryExpression();
+      switch (binary.Op()) {
+        case BinaryOperation::kAnd:
+          // FALSE survives AND unless every operand is TRUE/NULL.
+          return NeverFalse(binary.Left(), qualifier) &&
+                 NeverFalse(binary.Right(), qualifier);
+        case BinaryOperation::kOr:
+          // FALSE OR NULL is NULL: one never-false side is enough.
+          return NeverFalse(binary.Left(), qualifier) ||
+                 NeverFalse(binary.Right(), qualifier);
+        case BinaryOperation::kXor:
+        case BinaryOperation::kAdd:
+        case BinaryOperation::kSubtract:
+        case BinaryOperation::kMultiply:
+        case BinaryOperation::kDivide:
+        case BinaryOperation::kModulo:
+        case BinaryOperation::kShiftLeft:
+        case BinaryOperation::kShiftRight:
+          // NULL on any operand keeps the result NULL; FALSE stays FALSE,
+          // so every operand must be TRUE/NULL.
+          return NeverFalse(binary.Left(), qualifier) &&
+                 NeverFalse(binary.Right(), qualifier);
+        case BinaryOperation::kEquals:
+        case BinaryOperation::kNotEquals:
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+        case BinaryOperation::kLike:
+        case BinaryOperation::kNotLike:
+          // Any NULL operand makes the comparison NULL: the rejecting-side
+          // proof carries over verbatim.
+          return RejectsNulls(binary.Left(), qualifier) ||
+                 RejectsNulls(binary.Right(), qualifier);
+        case BinaryOperation::kIsDistinctFrom:
+        case BinaryOperation::kIsNotDistinctFrom:
+          // Two-valued: a padded NULL side yields a concrete FALSE too.
+          return false;
+      }
+      return false;
+    }
+    case TypeTag::kUnaryExp: {
+      const UnaryExpression& unary = expression->AsUnaryExpression();
+      switch (unary.Op()) {
+        case UnaryOperation::kNot:
+          // NOT(e) is never false exactly when e never returns TRUE, which
+          // is precisely RejectsNulls(e).
+          return RejectsNulls(unary.Child(), qualifier);
+        case UnaryOperation::kMinus:
+          return NeverFalse(unary.Child(), qualifier);
+        default:
+          // IS-family predicates return concrete FALSE for many padded-row
+          // shapes (`padded.a IS NOT NULL`); no structural proof.
+          return false;
+      }
+    }
+    default:
+      return false;
+  }
+}
+
 // Column identifiers (bare names) the conjunct references on the given
 // source, using the same bare-name resolution the engine applies.
 bool ConjunctTouches(const Expression& conjunct, const std::string& qualifier) {
   if (!conjunct) {
     return false;
   }
-  for (const ColumnName& column : conjunct->TouchedColumns()) {
-    if (!column.schema.empty() && column.schema == qualifier) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(
+      conjunct->TouchedColumns(), [&](const ColumnName& column) {
+        return !column.schema.empty() && column.schema == qualifier;
+      });
 }
 
 }  // namespace

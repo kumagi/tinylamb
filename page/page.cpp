@@ -603,8 +603,7 @@ void* Page::operator new(size_t /*unused*/) {
 void Page::operator delete(void* page) noexcept {
   // Matches the class operator new above (new char[kPageSize]); the
   // deallocation type must stay char[] to pair with it.
-  delete[] reinterpret_cast<char*>(
-      page);  // NOLINT(cppcoreguidelines-owning-memory)
+  delete[] static_cast<char*>(page);  // NOLINT(cppcoreguidelines-owning-memory)
 }
 
 void Page::Dump(std::ostream& o, int indent) const {

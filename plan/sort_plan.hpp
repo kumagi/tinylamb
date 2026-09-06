@@ -26,7 +26,7 @@ class SortPlan final : public PlanBase {
   SortPlan& operator=(SortPlan&&) = delete;
   ~SortPlan() override = default;
 
-  Executor EmitExecutor(TransactionContext& context) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
 
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();

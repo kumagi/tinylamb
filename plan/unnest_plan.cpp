@@ -30,14 +30,21 @@ TableStatistics MakeStats(const Schema& schema, size_t rows) {
   return stats;
 }
 
-Schema BuildUnnestSchema(const Plan& child, const std::string& alias,
-                         const std::string& offset_alias, Schema schema) {
+// Returns the pair (full output schema, unnest-produced section): the section
+// is what UnnestExecutor emits per row, while the full schema additionally
+// carries the driving child's columns.  A caller-supplied schema is always
+// the section (the executor prepends the child row), so it is concatenated
+// unconditionally; duplicate names between child and section (two unaliased
+// UNNESTs) must not collapse the join.
+std::pair<Schema, Schema> BuildUnnestSchema(const Plan& child,
+                                            const std::string& alias,
+                                            const std::string& offset_alias,
+                                            const Schema& schema) {
   if (schema.ColumnCount() > 0) {
-    if (child && child->GetSchema().ColumnCount() > 0 &&
-        schema.Offset(child->GetSchema().GetColumn(0).Name()) == -1) {
-      return child->GetSchema() + schema;
+    if (child && child->GetSchema().ColumnCount() > 0) {
+      return {child->GetSchema() + schema, schema};
     }
-    return schema;
+    return {schema, schema};
   }
   std::vector<Column> cols;
   const std::string rel_name = alias.empty() ? "unnest" : alias;
@@ -47,25 +54,35 @@ Schema BuildUnnestSchema(const Plan& child, const std::string& alias,
   }
   Schema unnest_schema(rel_name, std::move(cols));
   if (child && child->GetSchema().ColumnCount() > 0) {
-    return child->GetSchema() + unnest_schema;
+    return {child->GetSchema() + unnest_schema, unnest_schema};
   }
-  return unnest_schema;
+  return {unnest_schema, unnest_schema};
 }
 
 }  // namespace
 
-UnnestPlan::UnnestPlan(Plan child, Expression unnest_expr, std::string alias,
-                       std::string offset_alias, Schema schema)
+UnnestPlan::UnnestPlan(
+    Plan child, Expression unnest_expr, std::string alias,
+    std::string offset_alias,
+    Schema schema  // NOLINT(performance-unnecessary-value-param)
+    )
     : child_(std::move(child)),
       unnest_expr_(std::move(unnest_expr)),
       alias_(std::move(alias)),
       offset_alias_(std::move(offset_alias)),
-      schema_(
-          BuildUnnestSchema(child_, alias_, offset_alias_, std::move(schema))),
-      stats_(MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10)) {}
+      unnest_section_(Schema("", {})),
+      schema_(Schema("", {})),
+      stats_(Schema("", {})) {
+  // `schema` is a sink consumed by schema construction; the declaration in
+  // unnest_plan.hpp takes it by value, so keep by-value here.
+  auto built = BuildUnnestSchema(child_, alias_, offset_alias_, schema);
+  unnest_section_ = std::move(built.second);
+  schema_ = std::move(built.first);
+  stats_ = MakeStats(schema_, (child_ ? child_->EmitRowCount() : 1) * 10);
+}
 
 void UnnestPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent)
+  output << Indent(static_cast<size_t>(indent))
          << "UnnestPlan: " << (unnest_expr_ ? unnest_expr_->ToString() : "");
   if (!alias_.empty()) {
     output << " AS " << alias_;

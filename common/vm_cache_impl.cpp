@@ -203,14 +203,15 @@ void VMCacheImpl::Invalidate(size_t offset, size_t length) {
 
 // The `dst` to `length` range must not go over any page boundaries.
 void VMCacheImpl::ReadInPage(void* dst, size_t length, void* src) const {
-  size_t page = (reinterpret_cast<char*>(src) - buffer_) / block_size_;
+  size_t page =
+      static_cast<size_t>(reinterpret_cast<char*>(src) - buffer_) / block_size_;
   FixPage(page);
   ::memcpy(dst, src, length);
   UnfixPage(page);
 }
 
 size_t VMCacheImpl::FindMetaPage(std::atomic<PageState>* page_ptr) const {
-  return page_ptr - meta_.data();
+  return static_cast<size_t>(page_ptr - meta_.data());
 }
 
 void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
@@ -471,8 +472,8 @@ void VMCacheImpl::Activate(size_t page) const {
   size_t offset = (page * block_size_);
   size_t rest_size = block_size_;
   while (0 < rest_size) {
-    ssize_t read_bytes =
-        ::pread(fd_, &buffer_[offset], rest_size, offset + offset_);
+    ssize_t read_bytes = ::pread(fd_, &buffer_[offset], rest_size,
+                                 static_cast<off_t>(offset + offset_));
     if (read_bytes < 0) {
       // A failed pread must not decrement rest_size below zero (the loop would
       // never terminate); treat it as fatal like the mmap failure path.
@@ -481,8 +482,8 @@ void VMCacheImpl::Activate(size_t page) const {
     if (read_bytes == 0) {
       break;
     }
-    rest_size -= read_bytes;
-    offset += read_bytes;
+    rest_size -= static_cast<size_t>(read_bytes);
+    offset += static_cast<size_t>(read_bytes);
   }
 }
 

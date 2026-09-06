@@ -487,19 +487,18 @@ TEST(
 TEST(ValueTest, ToString_UnaryAndAggregationEnums_FormatsExpectedStrings) {
   std::ostringstream unary;
   std::ostringstream agg;
+  // The out-of-range values must read as "UNKNOWN".
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_unary = static_cast<UnaryOperation>(99);
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_agg = static_cast<AggregationType>(99);
 
-  unary
-      << UnaryOperation::kIsNull << "|" << UnaryOperation::kIsNotNull << "|"
-      << UnaryOperation::kNot << "|" << UnaryOperation::kMinus << "|"
-      << static_cast<
-             UnaryOperation>(  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
-             99);
+  unary << UnaryOperation::kIsNull << "|" << UnaryOperation::kIsNotNull << "|"
+        << UnaryOperation::kNot << "|" << UnaryOperation::kMinus << "|"
+        << invalid_unary;
   agg << AggregationType::kCount << "|" << AggregationType::kSum << "|"
       << AggregationType::kAvg << "|" << AggregationType::kMin << "|"
-      << AggregationType::kMax << "|"
-      << static_cast<
-             AggregationType>(  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
-             99);
+      << AggregationType::kMax << "|" << invalid_agg;
 
   EXPECT_EQ(unary.str(), "IS NULL|IS NOT NULL|NOT|-|UNKNOWN");
   EXPECT_EQ(agg.str(), "COUNT|SUM|AVG|MIN|MAX|UNKNOWN");
@@ -872,18 +871,15 @@ TEST(ValueTest, Arithmetic_OnNonNumericTypes_ThrowsRuntimeError) {
 
 TEST(ValueTest, Operations_OnInvalidValueType_ThrowsRuntimeError) {
   Value broken;
-  broken.type = static_cast<ValueType>(
-      99);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_type = static_cast<ValueType>(99);
+  broken.type = invalid_type;
   std::array<char, 16> buffer{};
 
   EXPECT_THROW(std::ignore = broken.Size(), std::runtime_error);
   EXPECT_THROW(broken.Serialize(buffer.data()), std::runtime_error);
-  EXPECT_THROW(
-      broken.Deserialize(
-          buffer.data(),
-          static_cast<ValueType>(
-              99)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
-      std::runtime_error);
+  EXPECT_THROW(broken.Deserialize(buffer.data(), invalid_type),
+               std::runtime_error);
   EXPECT_THROW(std::ignore = broken.AsString(), std::runtime_error);
   EXPECT_THROW(std::ignore = broken.EncodeMemcomparableFormat(),
                std::runtime_error);
@@ -979,20 +975,22 @@ TEST(ValueTest, ToString_AllUnaryOperations_FormatsCorrectStrings) {
 
 TEST(ValueTest, Deserialize_WithUndefinedValueType_ThrowsRuntimeError) {
   Value v;
-  char buf[16]{};
+  std::array<char, 16> buf{};
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_type = static_cast<ValueType>(99);
 
-  EXPECT_THROW(v.Deserialize(buf, static_cast<ValueType>(99)),
-               std::runtime_error);
+  EXPECT_THROW(v.Deserialize(buf.data(), invalid_type), std::runtime_error);
 }
 
 TEST(ValueTest, SkipSerialized_WithNullOrUndefinedType_ThrowsRuntimeError) {
-  char buf[16]{};
+  std::array<char, 16> buf{};
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_type = static_cast<ValueType>(99);
 
   EXPECT_THROW(std::ignore = Value::SkipSerialized(nullptr, ValueType::kNull),
                std::runtime_error);
-  EXPECT_THROW(
-      std::ignore = Value::SkipSerialized(buf, static_cast<ValueType>(99)),
-      std::runtime_error);
+  EXPECT_THROW(std::ignore = Value::SkipSerialized(buf.data(), invalid_type),
+               std::runtime_error);
 }
 
 TEST(ValueTest, AsString_SpecialDoubles_FormatsInfAndNan) {
@@ -1114,10 +1112,11 @@ TEST(IntervalTest,
   IntervalValue iv = IntervalValue::Parse("  P1Y");
   SetSessionConstant("foo_cov", "bar_cov");
 
-  IntervalValue neg_days{0, -45, 0};
+  IntervalValue neg_days{.months = 0, .days = -45, .nanos = 0};
   IntervalValue justified_days = neg_days.JustifyDays();
 
-  IntervalValue neg_nanos{0, 0, -(35LL * 24LL * 3600LL * 1000000000LL)};
+  IntervalValue neg_nanos{
+      .months = 0, .days = 0, .nanos = -(35LL * 24LL * 3600LL * 1000000000LL)};
   IntervalValue justified_nanos = neg_nanos.JustifyInterval();
 
   IntervalValue iv_min = IntervalValue::Parse("5", "minute");
@@ -1221,8 +1220,9 @@ TEST(ValueTypeTest, ValueTypeToString_AllEnumValues_ReturnsExpectedString) {
   EXPECT_EQ(ValueTypeToString(ValueType::kDouble), "Double");
   EXPECT_EQ(ValueTypeToString(ValueType::kDate), "Date");
   EXPECT_EQ(ValueTypeToString(ValueType::kArray), "Array");
-  EXPECT_EQ(ValueTypeToString(static_cast<ValueType>(99)),
-            "unknown value type");
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_type = static_cast<ValueType>(99);
+  EXPECT_EQ(ValueTypeToString(invalid_type), "unknown value type");
 }
 
 TEST(FunctionTest, Serialize_CustomFunction_RoundTripsThroughDecoder) {

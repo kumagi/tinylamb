@@ -6,6 +6,7 @@
 #include "update.hpp"
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <ostream>
 #include <stdexcept>
@@ -53,7 +54,7 @@ bool Update::Next(Row* dst, RowPosition* rp) {
   if (enforce_primary_key_) {
     for (auto it = target_->BeginFullScan(*txn_); it.IsValid(); ++it) {
       const Row& current = *it;
-      if (current.values_.size() == 0) {
+      if (current.values_.empty()) {
         continue;
       }
       ++live_keys[UpdateKeyString(current[0])];
@@ -71,11 +72,11 @@ bool Update::Next(Row* dst, RowPosition* rp) {
       }
     }
     std::unordered_set<std::string> claimed;
-    for (size_t i = 0; i < pending.size(); ++i) {
-      if (pending[i].first.values_.empty()) {
+    for (auto& i : pending) {
+      if (i.first.values_.empty()) {
         continue;
       }
-      const std::string new_key = UpdateKeyString(pending[i].first[0]);
+      const std::string new_key = UpdateKeyString(i.first[0]);
       if (!claimed.insert(new_key).second || live_keys.contains(new_key)) {
         throw std::runtime_error(
             "Modification resulted in duplicate primary key (" + new_key + ")");
@@ -107,7 +108,8 @@ bool Update::Next(Row* dst, RowPosition* rp) {
 }
 
 void Update::Dump(std::ostream& o, int indent) const {
-  o << "Update: " << target_->GetSchema().Name() << "\n" << Indent(indent + 2);
+  o << "Update: " << target_->GetSchema().Name() << "\n"
+    << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 

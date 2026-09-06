@@ -25,11 +25,11 @@ struct BitmapIndexRange {
 
 class BitmapScanPlan final : public PlanBase {
  public:
-  BitmapScanPlan(const Table& table, const TableStatistics& statistics,
+  BitmapScanPlan(const Table& table, TableStatistics statistics,
                  std::vector<BitmapIndexRange> ranges, BitmapCombine combine,
                  Expression where, size_t estimated_rows, size_t access_rows);
 
-  Executor EmitExecutor(TransactionContext& txn) const override;
+  Executor EmitExecutor(TransactionContext& context) const override;
   [[nodiscard]] const Table* ScanSource() const override { return &table_; }
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {

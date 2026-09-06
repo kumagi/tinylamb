@@ -20,8 +20,8 @@
 #include <memory>
 #include <vector>
 
-#include "query/statement.hpp"
 #include "parser/token.hpp"
+#include "query/statement.hpp"
 
 namespace tinylamb {
 

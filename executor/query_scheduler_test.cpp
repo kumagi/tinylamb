@@ -5,13 +5,13 @@
 #include <future>
 #include <memory>
 #include <sstream>
-#include <utility>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "executor/constant_executor.hpp"
-#include "executor/executor_base.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/executor_base.hpp"
 #include "gtest/gtest.h"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -94,7 +94,10 @@ TEST(QuerySchedulerTest, Release_OnMovedFromLease_IsNoOp) {
   EXPECT_EQ(scheduler.UsedCpuSlots(), 1U);
   // Release on a moved-from lease must be a no-op; that contract is what
   // this test verifies.
-  lease.Release();  // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  // clang-format off
+  // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  lease.Release();
+  // clang-format on
   EXPECT_EQ(scheduler.UsedCpuSlots(), 1U);
   moved.Release();
   EXPECT_EQ(scheduler.UsedCpuSlots(), 0U);
@@ -131,10 +134,11 @@ TEST(QuerySchedulerTest, NextBatch_MultipleBatches_KeepsLeaseUntilExhausted) {
   EXPECT_EQ(scheduler.UsedMemoryBytes(), 0U);
 }
 
-TEST(QuerySchedulerTest, DumpAndExplain_ScheduledQuery_ContainsScheduledQueryString) {
+TEST(QuerySchedulerTest,
+     DumpAndExplain_ScheduledQuery_ContainsScheduledQueryString) {
   QueryScheduler scheduler(1, 128);
-  Executor values = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1)})});
+  Executor values =
+      std::make_shared<ConstantExecutor>(std::vector<Row>{Row({Value(1)})});
   ScheduledExecutor executor(std::move(values), scheduler, 1, 64);
   std::stringstream dump;
   executor.Dump(dump, 0);

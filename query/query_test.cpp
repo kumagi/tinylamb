@@ -34,6 +34,7 @@
 #include "executor/detail/relation.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/executor_base.hpp"
+#include "expression/expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "gtest/gtest.h"
 #include "index/index_schema.hpp"
@@ -42,9 +43,11 @@
 #include "query/statement.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -105,6 +108,31 @@ TEST_F(QueryTest, SimpleSelect) {
   EXPECT_EQ(rows[0][2], Value("hello"));
 
   // Act + Assert: PreCommit
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+// A qualified star with an unknown qualifier must be rejected; silently
+// erasing it used to produce an empty select list.
+TEST_F(QueryTest, QualifiedStarWithUnknownRelationFails) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t1 (c1 INT64, c2 INT64, c3 VARCHAR(10));");
+  SqlEngine engine(*db_);
+  // The engine may reject at prepare time or at first execution; both count.
+  bool rejected = false;
+  StatusOr<QueryResult> executed =
+      engine.Execute(ctx, "SELECT no_such_rel.* FROM t1;");
+  if (!executed.HasValue()) {
+    rejected = true;
+  } else {
+    try {
+      Row row;
+      while (executed.Value().Next(&row)) {
+      }
+    } catch (const std::exception&) {
+      rejected = true;
+    }
+  }
+  EXPECT_TRUE(rejected);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
@@ -489,6 +517,34 @@ TEST_F(QueryTest, SqlEngineSelectOrderByLimitOffset) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, DistinctWithInSubqueryOnNonProjectedColumn) {
+  // REGRESSION: the hidden $semiN correlation key of a decorrelated IN
+  // subquery used to sit below DISTINCT, so two rows equal on the selected
+  // column but differing in the probe column both survived dedup and the
+  // final trim re-emitted the duplicate.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (a INT64, x INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE u (y INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 10), (3, 30);");
+  RunSql(ctx, *db_, "INSERT INTO u VALUES (10), (20);");
+
+  // (a=1,x=10), (a=1,x=20), (a=2,x=10) satisfy `x IN (SELECT y FROM u)`;
+  // DISTINCT over the caller-visible column must collapse a=1's two rows
+  // while a=3 (no matching x) stays out.
+  std::vector<Row> rows = RunSql(
+      ctx, *db_, "SELECT DISTINCT a FROM t WHERE x IN (SELECT y FROM u);");
+  ASSERT_EQ(rows.size(), 2U);
+  std::vector<int64_t> as;
+  as.reserve(rows.size());
+  for (const Row& row : rows) {
+    as.push_back(row[0].value.int_value);
+  }
+  std::sort(as.begin(), as.end());
+  EXPECT_EQ(as, (std::vector<int64_t>{1, 2}));
+
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, OrderByAliasKeyResolvesAcrossSelfJoinScopes) {
   // REGRESSION: an aliased self-join evaluates ORDER BY keys against the
   // projected output schema first. A qualified key over the second input
@@ -585,12 +641,15 @@ TEST_F(QueryTest, WindowGroupsFrameUsesPeerGroups) {
   window->function = "SUM";
   window->args = {ColumnValueExp(ColumnName("v"))};
   window->order_by = {
-      WindowOrderTerm{ColumnValueExp(ColumnName("v")), true, std::nullopt}};
+      WindowOrderTerm{.expression = ColumnValueExp(ColumnName("v")),
+                      .ascending = true,
+                      .nulls_first = std::nullopt}};
   window->frame_unit = WindowFrameUnit::kGroups;
   window->has_frame = true;
-  window->frame_start = {WindowFrameBoundType::kOffsetPreceding,
-                         ConstantValueExp(Value(1))};
-  window->frame_end = {WindowFrameBoundType::kCurrentRow, nullptr};
+  window->frame_start = {.type = WindowFrameBoundType::kOffsetPreceding,
+                         .offset = ConstantValueExp(Value(1))};
+  window->frame_end = {.type = WindowFrameBoundType::kCurrentRow,
+                       .offset = nullptr};
   SelectStatement statement({NamedExpression("sum", Expression(window))}, {},
                             nullptr);
   relational_detail::Relation input;
@@ -615,11 +674,15 @@ TEST_F(QueryTest, WindowFrameExclusionRemovesCurrentRow) {
   window->function = "SUM";
   window->args = {ColumnValueExp(ColumnName("v"))};
   window->order_by = {
-      WindowOrderTerm{ColumnValueExp(ColumnName("v")), true, std::nullopt}};
+      WindowOrderTerm{.expression = ColumnValueExp(ColumnName("v")),
+                      .ascending = true,
+                      .nulls_first = std::nullopt}};
   window->frame_unit = WindowFrameUnit::kRows;
   window->has_frame = true;
-  window->frame_start = {WindowFrameBoundType::kUnboundedPreceding, nullptr};
-  window->frame_end = {WindowFrameBoundType::kCurrentRow, nullptr};
+  window->frame_start = {.type = WindowFrameBoundType::kUnboundedPreceding,
+                         .offset = nullptr};
+  window->frame_end = {.type = WindowFrameBoundType::kCurrentRow,
+                       .offset = nullptr};
   window->exclusion = WindowFrameExclusion::kCurrentRow;
   SelectStatement statement({NamedExpression("sum", Expression(window))}, {},
                             nullptr);
@@ -647,11 +710,15 @@ TEST_F(QueryTest, WindowFrameExclusionHandlesPeerGroupsAndTies) {
     window->function = "SUM";
     window->args = {ColumnValueExp(ColumnName("v"))};
     window->order_by = {
-        WindowOrderTerm{ColumnValueExp(ColumnName("v")), true, std::nullopt}};
+        WindowOrderTerm{.expression = ColumnValueExp(ColumnName("v")),
+                        .ascending = true,
+                        .nulls_first = std::nullopt}};
     window->frame_unit = WindowFrameUnit::kRows;
     window->has_frame = true;
-    window->frame_start = {WindowFrameBoundType::kUnboundedPreceding, nullptr};
-    window->frame_end = {WindowFrameBoundType::kUnboundedFollowing, nullptr};
+    window->frame_start = {.type = WindowFrameBoundType::kUnboundedPreceding,
+                           .offset = nullptr};
+    window->frame_end = {.type = WindowFrameBoundType::kUnboundedFollowing,
+                         .offset = nullptr};
     window->exclusion = exclusion;
     SelectStatement statement({NamedExpression("sum", Expression(window))}, {},
                               nullptr);
@@ -775,6 +842,175 @@ TEST_F(QueryTest, SqlEngineUnnestExpandsArraysAndEmitsOffsets) {
       "SELECT x FROM UNNEST([[1, 2], [3]]) arr, UNNEST(arr) x ORDER BY x;");
   EXPECT_EQ(lateral, (std::vector<Row>{Row({Value(1)}), Row({Value(2)}),
                                        Row({Value(3)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineUnnestStructColumnKeepsWholeElementWidth) {
+  // UNNEST over a STRUCT array column: the plan declares a single element
+  // column, so per-row member flattening (a NULL element decodes as a scalar
+  // cell, a sibling row flattens two members) must be re-projected back to a
+  // stable width or vectorized consumers reject the batch with "data chunk row
+  // width mismatch".
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE StructArr AS "
+         "SELECT ARRAY<STRUCT<int64, int64>>[(11, 12), NULL, "
+         "(31, 32)] arr "
+         "UNION ALL "
+         "SELECT ARRAY<STRUCT<int64, int64>>[NULL, (21, 22)];");
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_, "SELECT elem FROM StructArr t, t.arr elem ORDER BY elem;");
+  ASSERT_EQ(rows.size(), 5U);
+  for (const Row& row : rows) {
+    ASSERT_EQ(row.values_.size(), 1U);
+  }
+  EXPECT_EQ(rows[0][0], Value());
+  EXPECT_EQ(rows[1][0], Value());
+  EXPECT_EQ(rows[2], Row({Value(std::string("{\"f1\":11,\"f2\":12}"))}));
+  EXPECT_EQ(rows[3], Row({Value(std::string("{\"f1\":21,\"f2\":22}"))}));
+  EXPECT_EQ(rows[4], Row({Value(std::string("{\"f1\":31,\"f2\":32}"))}));
+
+  // A positional ORDER BY over an alias-qualified field reference must sort
+  // the rewritten accessor, not the pre-rewrite column (which the unnest
+  // output does not carry).
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT elem.f1 FROM StructArr t, t.arr elem ORDER BY 1;"),
+            (std::vector<Row>{Row({Value()}), Row({Value()}), Row({Value(11)}),
+                              Row({Value(21)}), Row({Value(31)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineUnnestFlattenedStructFeedsProjectionAndAggregate) {
+  // UNNEST([STRUCT(1 AS y, 2 AS x)]) flattens y and x to top-level columns;
+  // both the projection and an aggregate over them used to fail with "numeric
+  // value required" because the executor emitted the raw struct JSON cell.
+  TransactionContext ctx = db_->BeginContext();
+  EXPECT_EQ(
+      RunSql(ctx, *db_, "SELECT y, x FROM UNNEST([STRUCT(1 AS y, 2 AS x)]);"),
+      (std::vector<Row>{Row({Value(1), Value(2)})}));
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT SUM(y) FROM UNNEST([STRUCT(1 AS y)]) x;"),
+            (std::vector<Row>{Row({Value(1)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineNullSafeJoinMatchesNulls) {
+  // `IS NOT DISTINCT FROM` becomes a null-safe hash-join key: NULL must join
+  // to NULL (plain `=` would drop the NULL=NULL pair).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE ns_l (id INT64, k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE ns_r (id INT64, k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO ns_l VALUES (1, 5), (2, NULL);");
+  RunSql(ctx, *db_, "INSERT INTO ns_r VALUES (7, 5), (8, NULL);");
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.id FROM ns_l l JOIN ns_r r "
+             "ON l.k IS NOT DISTINCT FROM r.k ORDER BY l.id;"),
+      (std::vector<Row>{Row({Value(1), Value(7)}), Row({Value(2), Value(8)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineContradictoryOrPredicateEliminatesScan) {
+  // `(x > 100 AND x < 10) OR (b IS TRUE AND b IS FALSE)` is false for every
+  // row; the disjunction must collapse so the scan is eliminated (empty).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE contra (x INT64, b BOOL);");
+  RunSql(ctx, *db_, "INSERT INTO contra VALUES (1, true), (2, false);");
+  EXPECT_TRUE(
+      RunSql(ctx, *db_,
+             "SELECT x FROM contra "
+             "WHERE (x > 100 AND x < 10) OR (b IS TRUE AND b IS FALSE);")
+          .empty());
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineCompositeAndResidualEquiJoin) {
+  // Composite equality keys hash on both columns; a non-key residual conjunct
+  // rides above the hash join without demoting it to a nested loop.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE cj_l (id INT64, a INT64, amt INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE cj_r (id INT64, a INT64, qty INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO cj_l VALUES (1, 1, 50), (1, 2, 10), (2, 2, 5);");
+  RunSql(ctx, *db_,
+         "INSERT INTO cj_r VALUES (1, 1, 20), (1, 2, 40), (2, 2, 3);");
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.id FROM cj_l l JOIN cj_r r "
+             "ON l.id = r.id AND l.a = r.a AND l.amt > r.qty "
+             "ORDER BY l.id, r.id;"),
+      (std::vector<Row>{Row({Value(1), Value(1)}), Row({Value(2), Value(2)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineUnusedParentJoinEliminatedKeepsMultiplicity) {
+  // Eliminating an inner join to a unique parent whose columns are unused must
+  // preserve the child's rows exactly (no duplication, no filtering).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE up_parent (pid INT64, label STRING);");
+  RunSql(ctx, *db_, "CREATE TABLE up_child (cid INT64, pid INT64);");
+  RunSql(ctx, *db_, "INSERT INTO up_parent VALUES (1, 'a'), (2, 'b');");
+  RunSql(ctx, *db_, "INSERT INTO up_child VALUES (10, 1), (11, 1), (12, 2);");
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT c.cid FROM up_child c JOIN up_parent p "
+             "ON c.pid = p.pid ORDER BY c.cid;"),
+      (std::vector<Row>{Row({Value(10)}), Row({Value(11)}), Row({Value(12)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineOrderBySelectAliasOnJoin) {
+  // ORDER BY a SELECT-list alias over a self-join (`other_id`) must not push a
+  // Sort below the projection that produces the alias ("column not found").
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE ob (id INT64, k INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO ob VALUES (1, 10), (2, 10), (3, 20), (4, 20);");
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT a.id, b.id AS other_id FROM ob a JOIN ob b "
+             "ON a.k = b.k ORDER BY a.id, other_id;");
+  ASSERT_EQ(rows.size(), 8U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(1)}));
+  EXPECT_EQ(rows[1], Row({Value(1), Value(2)}));
+  EXPECT_EQ(rows.back(), Row({Value(4), Value(4)}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineUnnestDistinctOrderByOffsetAndUnionAll) {
+  TransactionContext ctx = db_->BeginContext();
+
+  // DISTINCT above UNNEST used to throw std::bad_cast: the optimizer's
+  // distinct-as-aggregation alternative built an aggregate executor whose
+  // target list held plain columns.
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT DISTINCT x FROM UNNEST([2, 1, 2, 3, 1]) x "
+             "ORDER BY x;"),
+      (std::vector<Row>{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})}));
+  EXPECT_TRUE(
+      RunSql(ctx, *db_, "SELECT DISTINCT x FROM UNNEST(ARRAY<INT64>[]) x;")
+          .empty());
+
+  // ORDER BY the WITH OFFSET pseudo-column: the sort node sits above the
+  // projection, so the engine must project a hidden key column it can sort
+  // on (and strip it from the output).
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT x FROM UNNEST([30, 10, 20]) AS x WITH OFFSET "
+             "ORDER BY OFFSET;"),
+      (std::vector<Row>{Row({Value(30)}), Row({Value(10)}), Row({Value(20)})}));
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT x FROM UNNEST([30, 10, 20]) AS x WITH OFFSET AS o "
+             "ORDER BY o DESC;"),
+      (std::vector<Row>{Row({Value(20)}), Row({Value(10)}), Row({Value(30)})}));
+
+  // Every UNION ALL branch must execute; the unnest route used to drop the
+  // non-head branches.
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT x FROM UNNEST([1]) x UNION ALL "
+                   "SELECT x FROM UNNEST([2]) x;"),
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
   ctx.txn_.Abort();
 }
 
@@ -1583,7 +1819,9 @@ TEST_F(QueryTest, BatchInsertChunking) {
   // Construct a large batch INSERT statement with 150 rows (> 2 chunks of 64)
   std::string sql = "INSERT INTO batch_tbl VALUES ";
   for (int i = 0; i < 150; ++i) {
-    if (i > 0) sql += ", ";
+    if (i > 0) {
+      sql += ", ";
+    }
     sql += "(" + std::to_string(i) + ", " + std::to_string(i * 10) + ")";
   }
   sql += ";";

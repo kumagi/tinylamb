@@ -732,3 +732,23 @@ adding a warehouse gate would make the number incomparable.
   expectations for the relational set-op/aggregation planner, and
   in-flight WIP tests from the concurrent agent (`join_queries` FULL
   OUTER JOIN fixtures, `timezones`, `SqlOracleFuzzer`).
+
+### Quiet-machine re-measurement (same day, integrated tree at `97d28de`)
+
+With the concurrent agent finished and the tree quiet (Wave 1 + Wave 2 M1-M3
+routing work and the relational-planner bytecode filter work integrated):
+
+- **TPC-H SF=0.01 (fresh fixture, cold run):** Q22 271.3, Q20 82.1, Q9 61.0,
+  Q1 52.2, Q4 49.1, Q17 34.3, Q18 30.1, Q2 29.8, Q7 27.1, Q8 21.8, Q13 21.8,
+  Q10 19.9, Q5 19.8, Q3 16.6, Q19 14.9, Q12 14.0, Q15 13.4, Q14 12.7,
+  Q11 12.6, Q6 12.6, Q16 12.6 ms. **Sum (excl. Q21) = 830 ms**, i.e.
+  **−22% vs. the 2026-09-03 baseline** (1,060 ms). Q21 still fails with the
+  pre-existing `spill write failed` error.
+- **TPC-C SF=1 (fresh fixture, 10 clients, warmup 3 s, measure 20 s):**
+  tps **6,384**, new_order_tpm **177,498**, 133,202 attempted / 127,677
+  committed, engine abort rate 3.7% (4,924), `sql_path_gate=PASS`. First
+  error: `delivery` write-intent wait timeout on `new_order` (known).
+  The earlier same-day figure (tps 3,879) was taken while the other
+  agent's builds were saturating the machine; treat 6,384 as the
+  representative quiet-tree figure.
+

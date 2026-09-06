@@ -8,6 +8,7 @@
 
 #include "common/constants.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -129,10 +130,7 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
   if (!minimum_ || !maximum_) {
     // Non-NULL values were observed but excluded from the envelope (arrays):
     // nothing can be proven, so keep every row.
-    if (value_count_ > 0) {
-      return true;
-    }
-    return false;
+    return value_count_ > 0;
   }
   // Cross-type comparisons (e.g. int constant vs double zone) may match after
   // implicit conversion; pruning them would silently drop rows.

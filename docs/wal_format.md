@@ -33,12 +33,20 @@ LSN. All fixed-width fields use big-endian order:
 
 ## Log types (selected)
 
-- **kInsert / kUpdate / kDelete** — row-level changes with table id and row
-  payload or position.
-- **kPageWrite** — full page image after modification (`page_id`, bytes).
-- **kCommit / kAbort** — transaction terminal states.
-- **kCheckpoint** — fuzzy checkpoint marker; recovery truncates or replays from
-  the last completed checkpoint (see `docs/recovery_invariants.md`).
+See `LogType` in `recovery/log_record.hpp` for the full list.
+
+- **kInsertRow / kUpdateRow / kDeleteRow** — row-level changes with table id
+  and row payload or position; kInsertLeaf/kInsertBranch (and the kUpdate*/
+  kDelete* twins) are the B+ tree structural counterparts.
+- **kSetLowFence / kSetHighFence / kSetFoster** — B+ tree navigation metadata
+  updates; each has a kCompensate* twin for undo.
+- **kCommit** — transaction commit. Aborted transactions write no terminal
+  record: recovery treats a transaction whose newest LSN has no matching
+  kCommit as a loser and undoes it.
+- **kBeginCheckpoint / kEndCheckpoint** — fuzzy checkpoint bracket; recovery
+  truncates or replays from the last completed checkpoint (see
+  `docs/recovery_invariants.md`).
+- **kSystemAllocPage / kSystemDestroyPage** — page allocation/destruction.
 
 ## Durability
 

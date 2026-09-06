@@ -43,7 +43,7 @@ class Function {
     return e;
   }
   friend Decoder& operator>>(Decoder& d, Function& f) {
-    int64_t argument_count;
+    int64_t argument_count = 0;
     d >> f.name_ >> f.args_ >> f.return_type_ >> argument_count;
     f.argument_count_ = static_cast<int>(argument_count);
     return d;

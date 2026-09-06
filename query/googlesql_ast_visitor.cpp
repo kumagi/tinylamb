@@ -1,14 +1,21 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "query/googlesql_ast_visitor.hpp"
 
+// NOLINTNEXTLINE(modernize-deprecated-headers) POSIX timegm/gmtime_r
+#include <time.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -16,17 +23,17 @@
 #include <memory>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
-#include "database/transaction_context.hpp"
+#include "common/set_operation.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
@@ -41,12 +48,12 @@
 #include "expression/named_expression.hpp"
 #include "expression/proto_schema.hpp"
 #include "expression/query_expression.hpp"
-#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/statement.hpp"
 #include "type/column.hpp"
+#include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
 #include "type/row.hpp"
@@ -70,6 +77,11 @@ class VisitSourceScope {
     t_visit_source = &source;
   }
   ~VisitSourceScope() { t_visit_source = previous_; }
+
+  VisitSourceScope(const VisitSourceScope&) = delete;
+  VisitSourceScope& operator=(const VisitSourceScope&) = delete;
+  VisitSourceScope(VisitSourceScope&&) = delete;
+  VisitSourceScope& operator=(VisitSourceScope&&) = delete;
 
  private:
   const std::string* previous_;
@@ -109,11 +121,14 @@ int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
     int th = 0, tm = 0;
     std::string rem(tz_str.substr(4));
     if (rem.find(':') != std::string::npos) {
-      sscanf(rem.c_str(), "%d:%d", &th, &tm);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%d:%d", &th, &tm);
     } else if (rem.size() == 4) {
-      sscanf(rem.c_str(), "%2d%2d", &th, &tm);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%2d%2d", &th, &tm);
     } else {
-      sscanf(rem.c_str(), "%d", &th);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%d", &th);
     }
     return (th * 3600 + tm * 60) * (sign == '-' ? -1 : 1);
   }
@@ -122,11 +137,14 @@ int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
     int th = 0, tm = 0;
     std::string rem(tz_str.substr(1));
     if (rem.find(':') != std::string::npos) {
-      sscanf(rem.c_str(), "%d:%d", &th, &tm);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%d:%d", &th, &tm);
     } else if (rem.size() == 4) {
-      sscanf(rem.c_str(), "%2d%2d", &th, &tm);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%2d%2d", &th, &tm);
     } else {
-      sscanf(rem.c_str(), "%d", &th);
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
+          rem.c_str(), "%d", &th);
     }
     return (th * 3600 + tm * 60) * (sign == '-' ? -1 : 1);
   }
@@ -136,7 +154,7 @@ int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
   }
   try {
     const auto* zone = std::chrono::locate_zone(zone_name);
-    if (zone) {
+    if (zone != nullptr) {
       int y = Y < 1970 ? 1970 : Y;
       std::chrono::year_month_day ymd{
           std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(M)},
@@ -368,6 +386,8 @@ class UdfExpansionDepthGuard {
   ~UdfExpansionDepthGuard() { --tls_udf_expansion_depth; }
   UdfExpansionDepthGuard(const UdfExpansionDepthGuard&) = delete;
   UdfExpansionDepthGuard& operator=(const UdfExpansionDepthGuard&) = delete;
+  UdfExpansionDepthGuard(UdfExpansionDepthGuard&&) = delete;
+  UdfExpansionDepthGuard& operator=(UdfExpansionDepthGuard&&) = delete;
 };
 
 Expression SubstituteParameters(
@@ -515,7 +535,7 @@ Expression SubstituteParameters(
           SubstituteParameters(query.Test(), bindings), query.Exists(),
           query.Negated(), query.Op(), query.Mode());
       rebuilt->SetArrayResult(query.ArrayResult());
-      return Expression(rebuilt);
+      return {rebuilt};
     }
     default:
       // Constants and intervals carry no parameter references.
@@ -602,15 +622,15 @@ std::string DecodeSingleComponent(std::string_view value_view) {
   std::string value = std::string(value_view);
   bool is_raw = false;
   bool is_bytes = false;
-  if (value.size() >= 1 && (value.front() == 'r' || value.front() == 'R')) {
+  if (!value.empty() && (value.front() == 'r' || value.front() == 'R')) {
     is_raw = true;
     value = value.substr(1);
   }
-  if (value.size() >= 1 && (value.front() == 'b' || value.front() == 'B')) {
+  if (!value.empty() && (value.front() == 'b' || value.front() == 'B')) {
     is_bytes = true;
     value = value.substr(1);
   }
-  if (!is_raw && value.size() >= 1 &&
+  if (!is_raw && !value.empty() &&
       (value.front() == 'r' || value.front() == 'R')) {
     is_raw = true;
     value = value.substr(1);
@@ -619,7 +639,7 @@ std::string DecodeSingleComponent(std::string_view value_view) {
   bool is_triple = false;
   char quote = '\0';
   if (value.size() >= 6 &&
-      ((value.starts_with("\"\"\"") && value.ends_with("\"\"\"")) ||
+      ((value.starts_with(R"(""")") && value.ends_with(R"(""")")) ||
        (value.starts_with("'''") && value.ends_with("'''")))) {
     is_triple = true;
     quote = value.front();
@@ -676,7 +696,8 @@ std::string DecodeSingleComponent(std::string_view value_view) {
           }
         }
         try {
-          uint32_t raw_byte = std::stoul(oct_str, nullptr, 8);
+          auto raw_byte =
+              static_cast<uint32_t>(std::stoul(oct_str, nullptr, 8));
           if (is_bytes || raw_byte <= 0x7F) {
             decoded.push_back(static_cast<char>(raw_byte));
           } else {
@@ -691,7 +712,8 @@ std::string DecodeSingleComponent(std::string_view value_view) {
         if (i + 2 < value.size()) {
           std::string hex_str = value.substr(i + 1, 2);
           try {
-            uint32_t raw_byte = std::stoul(hex_str, nullptr, 16);
+            auto raw_byte =
+                static_cast<uint32_t>(std::stoul(hex_str, nullptr, 16));
             if (is_bytes || raw_byte <= 0x7F) {
               decoded.push_back(static_cast<char>(raw_byte));
             } else {
@@ -710,7 +732,7 @@ std::string DecodeSingleComponent(std::string_view value_view) {
         if (i + 4 < value.size()) {
           std::string hex_str = value.substr(i + 1, 4);
           try {
-            uint32_t cp = std::stoul(hex_str, nullptr, 16);
+            auto cp = static_cast<uint32_t>(std::stoul(hex_str, nullptr, 16));
             if (cp <= 0x7F) {
               decoded.push_back(static_cast<char>(cp));
             } else if (cp <= 0x7FF) {
@@ -737,7 +759,7 @@ std::string DecodeSingleComponent(std::string_view value_view) {
         if (i + 8 < value.size()) {
           std::string hex_str = value.substr(i + 1, 8);
           try {
-            uint32_t cp = std::stoul(hex_str, nullptr, 16);
+            auto cp = static_cast<uint32_t>(std::stoul(hex_str, nullptr, 16));
             if (cp <= 0x7F) {
               decoded.push_back(static_cast<char>(cp));
             } else if (cp <= 0x7FF) {
@@ -901,7 +923,6 @@ BinaryOperation BinaryOp(std::string_view detail) {
 std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query);
 Expression ExpandUdfCall(const std::string& name,
                          std::vector<Expression> arguments);
-Expression VisitExpression(const GoogleSqlAstNode& node);
 
 bool NeedsRelationalEvaluation(
     const Expression&
@@ -1131,7 +1152,7 @@ Expression SubstituteUdfParameter(const std::string& path_name) {
     const UdfExpansionFrame& frame = t_udf_frames[f];
     while (mask_pos > frame.mask_depth) {
       --mask_pos;
-      if (t_udf_bound_masks[mask_pos].count(lower) != 0) {
+      if (t_udf_bound_masks[mask_pos].contains(lower)) {
         // Explicitly bound between this expansion and the occurrence: the
         // column/alias wins over every enclosing parameter.
         return nullptr;
@@ -1197,7 +1218,7 @@ void AnalyzeUdfBody(const GoogleSqlAstNode& node,  // NOLINT(misc-no-recursion)
       node.children.front()->kind == "PathExpression") {
     try {
       const std::string fn = Lower(Path(*node.children.front()));
-      if (kAggregateNames.count(fn) != 0) {
+      if (kAggregateNames.contains(fn)) {
         *simple = false;
       }
     } catch (const std::exception& error) {
@@ -1265,14 +1286,15 @@ void RejectUnsupportedHints(  // NOLINT(misc-no-recursion)
 bool IsValidUtf8Text(std::string_view text) {
   size_t i = 0;
   while (i < text.size()) {
-    const uint8_t lead = static_cast<uint8_t>(text[i]);
+    const auto lead = static_cast<uint8_t>(text[i]);
     size_t continuation_count = 0;
     uint8_t second_lower = 0x80;
     uint8_t second_upper = 0xBF;
     if (lead < 0x80) {
       ++i;
       continue;
-    } else if (lead >= 0xC2 && lead < 0xDF) {
+    }
+    if (lead >= 0xC2 && lead < 0xDF) {
       continuation_count = 1;
     } else if (lead >= 0xE0 && lead < 0xF0) {
       continuation_count = 2;
@@ -1289,7 +1311,7 @@ bool IsValidUtf8Text(std::string_view text) {
       return false;
     }
     for (size_t c = 1; c <= continuation_count; ++c) {
-      const uint8_t byte = static_cast<uint8_t>(text[i + c]);
+      const auto byte = static_cast<uint8_t>(text[i + c]);
       const uint8_t lower = c == 1 ? second_lower : 0x80;
       const uint8_t upper = c == 1 ? second_upper : 0xBF;
       if (byte < lower || byte > upper) {
@@ -1521,7 +1543,9 @@ LambdaBindingResult BindLambdaBody(const GoogleSqlAstNode& lambda) {
   if (params.size() == 2) {
     bound.push_back(ColumnValueExp(ColumnName("", result.offset_binding)));
   }
-  const UdfExpansionFrame frame{&frame_udf, &bound, t_udf_bound_masks.size()};
+  const UdfExpansionFrame frame{.udf = &frame_udf,
+                                .arguments = &bound,
+                                .mask_depth = t_udf_bound_masks.size()};
   t_udf_frames.push_back(frame);
   try {
     result.body = VisitExpression(*body);
@@ -1956,8 +1980,7 @@ Expression VisitFunction(
       return finish_aggregate(extended);
     }
   }
-  if (!UdfRegistry().empty() &&
-      UdfRegistry().find(name) != UdfRegistry().end()) {
+  if (!UdfRegistry().empty() && UdfRegistry().contains(name)) {
     if (Expression expanded = ExpandUdfCall(name, arguments)) {
       return expanded;
     }
@@ -2004,7 +2027,7 @@ Expression ExpandUdfCall(const std::string& name,
     // even when the body references the parameter repeatedly. Bind the
     // arguments as columns of a one-row derived table and select the body
     // from it, leaving parameter identifiers untouched.
-    t_udf_bound_masks.push_back({});
+    t_udf_bound_masks.emplace_back();
     Expression result;
     try {
       std::vector<NamedExpression> inner_projections;
@@ -2033,7 +2056,8 @@ Expression ExpandUdfCall(const std::string& name,
     t_udf_bound_masks.pop_back();
     return result;
   }
-  const UdfExpansionFrame frame{&udf, &args, t_udf_bound_masks.size()};
+  const UdfExpansionFrame frame{
+      .udf = &udf, .arguments = &args, .mask_depth = t_udf_bound_masks.size()};
   t_udf_frames.push_back(frame);
   Expression result;
   try {
@@ -2657,9 +2681,11 @@ std::string NormalizeTimestampTextImpl(const std::string& text) {
   }
   int Y = 0, M = 0, D = 0, h = 0, m = 0;
   double s_val = 0;
+  // NOLINTNEXTLINE(cert-err34-c) `matched` is checked below
   int matched = sscanf(base_time.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h,
                        &m, &s_val);
   if (matched < 3) {
+    // NOLINTNEXTLINE(cert-err34-c) `matched` is checked below
     matched = sscanf(base_time.c_str(), "%d-%d-%d", &Y, &M, &D);
   }
   if (matched < 3) {
@@ -2686,7 +2712,7 @@ std::string NormalizeTimestampTextImpl(const std::string& text) {
   time_t epoch = timegm(&t);
   struct tm utc = {};
   gmtime_r(&epoch, &utc);
-  char buf[64];
+  std::array<char, 64> buf{};
   size_t dot_pos = text.find('.');
   if (dot_pos != std::string::npos) {
     size_t end_digit = dot_pos + 1;
@@ -2695,15 +2721,15 @@ std::string NormalizeTimestampTextImpl(const std::string& text) {
       ++end_digit;
     }
     std::string frac_str = text.substr(dot_pos, end_digit - dot_pos);
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d%s+00",
-             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
-             utc.tm_min, utc.tm_sec, frac_str.c_str());
+    (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d%s+00",
+                   utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
+                   utc.tm_min, utc.tm_sec, frac_str.c_str());
   } else {
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d+00",
-             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
-             utc.tm_min, utc.tm_sec);
+    (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d+00",
+                   utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
+                   utc.tm_min, utc.tm_sec);
   }
-  return std::string(buf);
+  return std::string{buf.data()};
 }
 
 // Splits a JSON object text (as produced by the eager struct constructors
@@ -2889,7 +2915,7 @@ Expression VisitExpression(
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
       parsed = parsed.WithUnsigned();
     }
-    return ConstantValueExp(std::move(parsed));
+    return ConstantValueExp(parsed);
   }
   if (node.kind == "FloatLiteral") {
     return ConstantValueExp(Value(ParseFloatLiteral(node)));
@@ -2936,6 +2962,7 @@ Expression VisitExpression(
       std::string dt_str = text;
       if (dt_str.find(":59:60") != std::string::npos) {
         int Y = 0, M = 0, D = 0, h = 0;
+        // NOLINTNEXTLINE(cert-err34-c): outcome is checked via >= 4 below
         if (sscanf(dt_str.c_str(), "%d-%d-%d %d", &Y, &M, &D, &h) >= 4) {
           h += 1;
           std::chrono::year_month_day ymd{
@@ -2943,15 +2970,15 @@ Expression VisitExpression(
               std::chrono::month{static_cast<unsigned>(M)},
               std::chrono::day{static_cast<unsigned>(D)}};
           int64_t days =
-              std::chrono::sys_days{ymd}.time_since_epoch().count() + h / 24;
+              std::chrono::sys_days{ymd}.time_since_epoch().count() + (h / 24);
           h %= 24;
           std::chrono::sys_days new_sd{std::chrono::days{days}};
           std::chrono::year_month_day new_ymd{new_sd};
-          char buf[64];
-          snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02d:00:00",
-                   int(new_ymd.year()), unsigned(new_ymd.month()),
-                   unsigned(new_ymd.day()), h);
-          dt_str = buf;
+          std::array<char, 64> buf{};
+          (void)snprintf(buf.data(), buf.size(), "%04d-%02u-%02u %02d:00:00",
+                         int(new_ymd.year()), unsigned(new_ymd.month()),
+                         unsigned(new_ymd.day()), h);
+          dt_str = buf.data();
         }
       }
       return ConstantValueExp(Value(std::move(dt_str)));
@@ -3056,7 +3083,7 @@ Expression VisitExpression(
             query.Query(), nullptr, false, false);
         array_query->SetArrayResult(true);
         array_query->SetArrayElementSqlType(element_type);
-        return Expression(array_query);
+        return {array_query};
       }
     }
     AlignAnonymousStructFieldNames(&elements, struct_field_names.size() >= 2
@@ -3178,7 +3205,7 @@ Expression VisitExpression(
         const auto* grand = node.children[0]->children.empty()
                                 ? nullptr
                                 : node.children[0]->children[0].get();
-        if (grand && grand->kind == "NullLiteral") {
+        if ((grand != nullptr) && grand->kind == "NullLiteral") {
           throw std::runtime_error(
               "GoogleSQL AST: Operands of NOT cannot be literal NULL");
         }
@@ -3290,7 +3317,7 @@ Expression VisitExpression(
       fn = "array_element_ordinal";
     }
     if (fn.find("safe") == std::string::npos &&
-        (accessor.find("SAFE_") == 0 ||
+        (accessor.starts_with("SAFE_") ||
          accessor.find("_SAFE") != std::string::npos)) {
       fn += "_safe";
     }
@@ -3441,7 +3468,7 @@ Expression VisitExpression(
       array_query->SetArrayResult(true);
       array_query->SetArrayElementSqlType(
           InferSubqueryArrayElementType(*query));
-      return Expression(array_query);
+      return {array_query};
     }
     return QueryExpressionExp(VisitQuery(*query), nullptr,
                               node.detail == "modifier=EXISTS", false);
@@ -3701,7 +3728,7 @@ Expression VisitExpression(
           if (const GoogleSqlAstNode* id = child->Child("Identifier")) {
             field_names.push_back(Identifier(*id));
           } else {
-            field_names.push_back("");
+            field_names.emplace_back("");
           }
         }
       }
@@ -3935,7 +3962,7 @@ Expression VisitExpression(
       }
       if (!lhs) {
         lhs = VisitExpression(*child);
-      } else if (!collection) {
+      } else if (collection == nullptr) {
         // UNNEST(array) / bare array expression collections.
         collection = child.get();
       }
@@ -4118,31 +4145,32 @@ bool ContainsAggregate(const Expression& expression) {
     case TypeTag::kCaseExp: {
       const auto& val = expression->AsCaseExpression();
       for (const auto& [c, r] : val.when_clauses_) {
-        if (ContainsAggregate(c) || ContainsAggregate(r)) return true;
+        if (ContainsAggregate(c) || ContainsAggregate(r)) {
+          return true;
+        }
       }
       return ContainsAggregate(val.else_clause_);
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
-      for (const auto& arg : call.Args()) {
-        if (ContainsAggregate(arg)) return true;
-      }
-      return false;
+      return std::ranges::any_of(call.Args(), [](const Expression& arg) {
+        return ContainsAggregate(arg);
+      });
     }
     case TypeTag::kInExp: {
       const auto& in_exp = expression->AsInExpression();
-      if (ContainsAggregate(in_exp.child_)) return true;
-      for (const auto& item : in_exp.list_) {
-        if (ContainsAggregate(item)) return true;
+      if (ContainsAggregate(in_exp.child_)) {
+        return true;
       }
-      return false;
+      return std::ranges::any_of(in_exp.list_, [](const Expression& item) {
+        return ContainsAggregate(item);
+      });
     }
     case TypeTag::kArrayExp: {
       const auto& arr = expression->AsArrayExpression();
-      for (const auto& item : arr.Elements()) {
-        if (ContainsAggregate(item)) return true;
-      }
-      return false;
+      return std::ranges::any_of(arr.Elements(), [](const Expression& item) {
+        return ContainsAggregate(item);
+      });
     }
     default:
       return false;
@@ -4201,7 +4229,7 @@ SelectSource ExpandPivotSource(SelectSource base,
   std::vector<NamedExpression> projections;
   std::unordered_set<std::string> agg_column_names;
   for (const auto& agg : aggs) {
-    if (agg.arg_node && agg.arg_node->kind != "Star") {
+    if ((agg.arg_node != nullptr) && agg.arg_node->kind != "Star") {
       agg_column_names.insert(Path(*agg.arg_node));
     }
   }
@@ -4226,7 +4254,9 @@ SelectSource ExpandPivotSource(SelectSource base,
         break;
       }
     }
-    if (val_node == nullptr) continue;
+    if (val_node == nullptr) {
+      continue;
+    }
     Expression val_expr = VisitExpression(*val_node);
     std::string val_alias = Alias(*pv);
     if (val_alias.empty()) {
@@ -4261,7 +4291,7 @@ SelectSource ExpandPivotSource(SelectSource base,
           BinaryExpressionExp(ColumnValueExp(ColumnName(pivot_col_name)),
                               BinaryOperation::kEquals, val_expr);
       Expression inner_arg;
-      if (agg.arg_node && agg.arg_node->kind != "Star") {
+      if ((agg.arg_node != nullptr) && agg.arg_node->kind != "Star") {
         inner_arg = VisitExpression(*agg.arg_node);
       } else {
         inner_arg = ConstantValueExp(Value(1));
@@ -4285,8 +4315,7 @@ SelectSource ExpandPivotSource(SelectSource base,
 
       Expression agg_expression =
           AggregateExpressionExp(agg_type, std::move(case_expr), false);
-      projections.push_back(
-          NamedExpression(col_name, std::move(agg_expression)));
+      projections.emplace_back(col_name, std::move(agg_expression));
     }
   }
 
@@ -4336,7 +4365,9 @@ SelectSource ExpandUnpivotSource(const SelectSource& base,
 
   for (const GoogleSqlAstNode* item : in_items->Children("UnpivotInItem")) {
     const GoogleSqlAstNode* in_expr_list = item->Child("ExpressionList");
-    if (in_expr_list == nullptr || in_expr_list->children.empty()) continue;
+    if (in_expr_list == nullptr || in_expr_list->children.empty()) {
+      continue;
+    }
     std::string in_col_name = Path(*in_expr_list->children[0]);
     std::string in_label = in_col_name;
     if (const GoogleSqlAstNode* label_node =
@@ -4411,6 +4442,10 @@ SelectSource VisitTableSource(
         t_udf_bound_masks.push_back(std::move(restored));
       }
     }
+    SuspendInnermostMask(const SuspendInnermostMask&) = delete;
+    SuspendInnermostMask& operator=(const SuspendInnermostMask&) = delete;
+    SuspendInnermostMask(SuspendInnermostMask&&) = delete;
+    SuspendInnermostMask& operator=(SuspendInnermostMask&&) = delete;
   } suspend_mask;
   SelectSource source;
   source.join_type = join_type;
@@ -4535,8 +4570,12 @@ SelectSource VisitTableSource(
     } else if (source.query) {
       std::unordered_set<std::string> local_tables;
       for (const auto& s : source.query->Sources()) {
-        if (!s.alias.empty()) local_tables.insert(s.alias);
-        if (!s.table.empty()) local_tables.insert(s.table);
+        if (!s.alias.empty()) {
+          local_tables.insert(s.alias);
+        }
+        if (!s.table.empty()) {
+          local_tables.insert(s.table);
+        }
       }
       if (source.query->WhereClause()) {
         for (const auto& col : source.query->WhereClause()->TouchedColumns()) {
@@ -4697,7 +4736,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
             if (type_text.empty() && mode_text.empty()) {
               continue;
             }
-            SetOperationKind kind;
+            SetOperationKind kind = SetOperationKind::kUnion;
             if (type_text.find("INTERSECT") != std::string::npos) {
               kind = mode_text.find("ALL") != std::string::npos
                          ? SetOperationKind::kIntersectAll
@@ -4900,7 +4939,12 @@ std::shared_ptr<SelectStatement> VisitQuery(
   // The WindowClause hangs off the Select node, next to the FromClause.
   struct NamedWindowsScope {
     std::unordered_map<std::string, NamedWindowParts> previous;
+    NamedWindowsScope() = default;
     ~NamedWindowsScope() { t_named_windows.swap(previous); }
+    NamedWindowsScope(const NamedWindowsScope&) = delete;
+    NamedWindowsScope& operator=(const NamedWindowsScope&) = delete;
+    NamedWindowsScope(NamedWindowsScope&&) = delete;
+    NamedWindowsScope& operator=(NamedWindowsScope&&) = delete;
   } named_windows_scope;
   const GoogleSqlAstNode* window_clause =
       select->Child("WindowClause") != nullptr ? select->Child("WindowClause")
@@ -4951,11 +4995,16 @@ std::shared_ptr<SelectStatement> VisitQuery(
   }
   t_udf_bound_masks.push_back(std::move(bound_names));
   struct BoundMaskScope {
+    BoundMaskScope() = default;
     ~BoundMaskScope() {
       if (!t_udf_bound_masks.empty()) {
         t_udf_bound_masks.pop_back();
       }
     }
+    BoundMaskScope(const BoundMaskScope&) = delete;
+    BoundMaskScope& operator=(const BoundMaskScope&) = delete;
+    BoundMaskScope(BoundMaskScope&&) = delete;
+    BoundMaskScope& operator=(BoundMaskScope&&) = delete;
   } bound_mask_scope;
 
   std::vector<NamedExpression> projections;
@@ -5176,7 +5225,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
             parsed.expression->AsConstantValue().GetValue();
         if (ordinal_value.type == ValueType::kInt64 &&
             ordinal_value.value.int_value >= 0) {
-          const size_t ordinal =
+          const auto ordinal =
               static_cast<size_t>(ordinal_value.value.int_value);
           if (ordinal >= 1 && ordinal <= projections.size() &&
               projections[ordinal - 1].expression) {
@@ -5367,8 +5416,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
         const GoogleSqlAstNode& term = *item->children[0];
         if (term.kind == "IntLiteral") {
           // GoogleSQL: integer GROUP BY items are SELECT-list ordinals.
-          const size_t ordinal =
-              static_cast<size_t>(ParseUnsignedLiteral(term));
+          const auto ordinal = static_cast<size_t>(ParseUnsignedLiteral(term));
           if (ordinal >= 1 && ordinal <= statement->SelectList().size() &&
               statement->SelectList()[ordinal - 1].expression) {
             expressions.push_back(
@@ -5468,7 +5516,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
       NeedsRelationalEvaluation(statement->Having())) {
     statement->MarkComplex();
   }
-  if (as_value && !sources.empty()) {
+  if (as_value && !statement->Sources().empty()) {
     statement->MarkComplex();
   }
   // SELECT AS STRUCT / AS VALUE shape the projected value: STRUCT rows are
@@ -5506,7 +5554,7 @@ ValueType ColumnType(const GoogleSqlAstNode& definition) {
     }
   }
   const std::string lower = Lower(cleaned);
-  if (lower.rfind("proto<", 0) == 0 || lower.find('.') != std::string::npos) {
+  if (lower.starts_with("proto<") || lower.find('.') != std::string::npos) {
     return ValueType::kVarChar;
   }
   const std::string& type = lower;
@@ -5956,7 +6004,7 @@ void ValidateEnumLiteralValue(const std::string& message_name,
              enum_short_name);
       return;
     }
-    const int64_t ordinal = static_cast<int64_t>(magnitude);
+    const auto ordinal = static_cast<int64_t>(magnitude);
     const std::optional<std::string> member =
         EnumMemberForValue(enum_short_name, ordinal);
     if (!member.has_value() && !EnumIsOpen(enum_short_name)) {

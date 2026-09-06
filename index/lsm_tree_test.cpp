@@ -17,6 +17,7 @@
 #include "index/lsm_tree.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -180,7 +181,7 @@ TEST_F(LSMTreeTest, LongKeyRangeScan) {
   // wait for sync
   std::map<std::string, std::string> expected;
   for (int i = 0; i < 300; ++i) {
-    std::string key((i * i) + 1, 'x');
+    std::string key(static_cast<size_t>((i * i) + 1), 'x');
     t_->Write(key, std::to_string(i * 2));
     expected.emplace(key, std::to_string(i * 2));
   }

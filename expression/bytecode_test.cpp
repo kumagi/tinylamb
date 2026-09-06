@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <vector>
 
@@ -17,7 +18,9 @@
 
 namespace tinylamb {
 
-TEST(BytecodeTest, Compile_WithArithmeticAndPredicate_GeneratesTypedBytecodeAndEvaluatesBatch) {
+TEST(
+    BytecodeTest,
+    Compile_WithArithmeticAndPredicate_GeneratesTypedBytecodeAndEvaluatesBatch) {
   const Schema schema("input", {Column("id", ValueType::kInt64),
                                 Column("price", ValueType::kDouble),
                                 Column("date", ValueType::kDate)});
@@ -51,11 +54,11 @@ TEST(BytecodeTest, Compile_WithArithmeticAndPredicate_GeneratesTypedBytecodeAndE
 
 TEST(BytecodeTest, Compile_WithConstantExpressions_FoldsToOneLoadInstruction) {
   const Schema schema;
-  Expression constants = BinaryExpressionExp(
-      ConstantValueExp(Value(2)), BinaryOperation::kAdd,
-      BinaryExpressionExp(ConstantValueExp(Value(3)),
-                          BinaryOperation::kMultiply,
-                          ConstantValueExp(Value(4))));
+  Expression constants =
+      BinaryExpressionExp(ConstantValueExp(Value(2)), BinaryOperation::kAdd,
+                          BinaryExpressionExp(ConstantValueExp(Value(3)),
+                                              BinaryOperation::kMultiply,
+                                              ConstantValueExp(Value(4))));
 
   auto program = BytecodeCompiler::Compile(constants, schema);
   if (!program.has_value()) {
@@ -72,9 +75,9 @@ TEST(BytecodeTest, Compile_WithDateComparison_UsesTypedDateOpcode) {
   const Schema schema("dates", {Column("date", ValueType::kDate)});
   DataChunk input(schema);
   input.Append(Row({Value::Date("1995-06-01")}));
-  Expression predicate = BinaryExpressionExp(
-      ColumnValueExp("date"), BinaryOperation::kLessThan,
-      ConstantValueExp(Value::Date("1996-01-01")));
+  Expression predicate =
+      BinaryExpressionExp(ColumnValueExp("date"), BinaryOperation::kLessThan,
+                          ConstantValueExp(Value::Date("1996-01-01")));
 
   auto program = BytecodeCompiler::Compile(predicate, schema);
   if (!program.has_value()) {
@@ -89,7 +92,8 @@ TEST(BytecodeTest, Compile_WithDateComparison_UsesTypedDateOpcode) {
   EXPECT_EQ(output.ValueAt(0), Value(true));
 }
 
-TEST(BytecodeTest, EvaluateBatch_WithInt64Comparisons_MatchesAstAndJitSemantics) {
+TEST(BytecodeTest,
+     EvaluateBatch_WithInt64Comparisons_MatchesAstAndJitSemantics) {
   constexpr int64_t kConstant = 17;
   const Schema schema("input", {Column("x", ValueType::kInt64)});
   DataChunk chunk(schema);
@@ -100,9 +104,9 @@ TEST(BytecodeTest, EvaluateBatch_WithInt64Comparisons_MatchesAstAndJitSemantics)
   }
 
   const std::vector<BinaryOperation> operations{
-      BinaryOperation::kEquals,       BinaryOperation::kNotEquals,
-      BinaryOperation::kLessThan,     BinaryOperation::kLessThanEquals,
-      BinaryOperation::kGreaterThan,  BinaryOperation::kGreaterThanEquals,
+      BinaryOperation::kEquals,      BinaryOperation::kNotEquals,
+      BinaryOperation::kLessThan,    BinaryOperation::kLessThanEquals,
+      BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals,
   };
 
   for (const BinaryOperation op : operations) {
@@ -156,15 +160,18 @@ TEST(BytecodeTest, D7_CompilesAndOrToShortCircuitJumps) {
   // JumpIfTrue before the right operand, mirroring the AST evaluator.
   const Schema schema("input", {Column("i", ValueType::kInt64),
                                 Column("j", ValueType::kInt64)});
-  Expression lhs = BinaryExpressionExp(
-      ColumnValueExp("i"), BinaryOperation::kNotEquals,
-      ConstantValueExp(Value(0)));
-  Expression rhs = BinaryExpressionExp(
-      ColumnValueExp("j"), BinaryOperation::kGreaterThan,
-      ConstantValueExp(Value(1)));
+  Expression lhs =
+      BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kNotEquals,
+                          ConstantValueExp(Value(0)));
+  Expression rhs =
+      BinaryExpressionExp(ColumnValueExp("j"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(1)));
   Expression conj = BinaryExpressionExp(lhs, BinaryOperation::kAnd, rhs);
   auto program = BytecodeCompiler::Compile(conj, schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+    FAIL() << "compilation unexpectedly failed";
+    return;
+  }
   EXPECT_TRUE(std::ranges::any_of(
       program->Instructions(), [](const BytecodeInstruction& instruction) {
         return instruction.opcode == BytecodeOp::kJumpIfFalse;
@@ -172,7 +179,10 @@ TEST(BytecodeTest, D7_CompilesAndOrToShortCircuitJumps) {
 
   Expression disj = BinaryExpressionExp(lhs, BinaryOperation::kOr, rhs);
   auto or_program = BytecodeCompiler::Compile(disj, schema);
-  ASSERT_TRUE(or_program.has_value());
+  if (!or_program.has_value()) {
+    FAIL() << "compilation unexpectedly failed";
+    return;
+  }
   EXPECT_TRUE(std::ranges::any_of(
       or_program->Instructions(), [](const BytecodeInstruction& instruction) {
         return instruction.opcode == BytecodeOp::kJumpIfTrue;
@@ -183,10 +193,12 @@ TEST(BytecodeTest, D7_CompilesAndOrToShortCircuitJumps) {
     if (instruction.opcode == BytecodeOp::kJumpIfTrue ||
         instruction.opcode == BytecodeOp::kJumpIfFalse) {
       const long long target =
-          static_cast<long long>(&instruction - or_program->Instructions().data()) +
+          static_cast<long long>(&instruction -
+                                 or_program->Instructions().data()) +
           instruction.jump_target;
       EXPECT_GE(target, 0);
-      EXPECT_LE(target, static_cast<long long>(or_program->Instructions().size()));
+      EXPECT_LE(target,
+                static_cast<long long>(or_program->Instructions().size()));
     }
   }
 }
@@ -197,18 +209,21 @@ TEST(BytecodeTest, D7_RightHandSideErrorsAreSuppressedByShortCircuit) {
   // (identical to the AST semantics).
   const Schema schema("input", {Column("i", ValueType::kInt64),
                                 Column("j", ValueType::kInt64)});
-  Expression guard = BinaryExpressionExp(
-      ColumnValueExp("i"), BinaryOperation::kNotEquals,
-      ConstantValueExp(Value(0)));
-  Expression division = BinaryExpressionExp(
-      ConstantValueExp(Value(10)), BinaryOperation::kDivide,
-      ColumnValueExp("j"));
+  Expression guard =
+      BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kNotEquals,
+                          ConstantValueExp(Value(0)));
+  Expression division =
+      BinaryExpressionExp(ConstantValueExp(Value(10)), BinaryOperation::kDivide,
+                          ColumnValueExp("j"));
   Expression conj = BinaryExpressionExp(
       guard, BinaryOperation::kAnd,
       BinaryExpressionExp(division, BinaryOperation::kGreaterThan,
                           ConstantValueExp(Value(1))));
   auto program = BytecodeCompiler::Compile(conj, schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+    FAIL() << "compilation unexpectedly failed";
+    return;
+  }
 
   {
     DataChunk safe_rows(schema);
@@ -218,9 +233,10 @@ TEST(BytecodeTest, D7_RightHandSideErrorsAreSuppressedByShortCircuit) {
   }
   {
     DataChunk throwing_rows(schema);
-    throwing_rows.Append(Row({Value(1), Value(0)}));  // TRUE AND (10/0) -> error
+    throwing_rows.Append(
+        Row({Value(1), Value(0)}));  // TRUE AND (10/0) -> error
     EXPECT_THROW(static_cast<void>(program->EvaluateBatch(throwing_rows)),
-                  std::exception);
+                 std::exception);
   }
 }
 

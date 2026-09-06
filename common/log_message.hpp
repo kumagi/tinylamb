@@ -73,7 +73,7 @@ class LogStream {
   LogStream& operator=(const LogStream&) = delete;
   LogStream& operator=(LogStream&&) = delete;
 
-  template <int N>
+  template <size_t N>
   LogStream& operator<<(const std::array<char, N>& rhs) {
     // Route through string_view: streaming the raw array pointer makes the
     // ostream's internal length computation emit a sign-conversion warning

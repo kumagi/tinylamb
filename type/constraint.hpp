@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 #include "type/value.hpp"
 
@@ -52,7 +53,7 @@ struct Constraint {
 
   Constraint() = default;
   explicit Constraint(ConstraintType type) : ctype(type) {}
-  Constraint(ConstraintType type, const Value& v) : ctype(type), value(v) {}
+  Constraint(ConstraintType type, Value v) : ctype(type), value(std::move(v)) {}
 
   [[nodiscard]] size_t Size() const;
   bool operator==(const Constraint& rhs) const;

@@ -17,7 +17,6 @@
 #include "recovery_manager.hpp"
 
 #include <fcntl.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -52,6 +51,7 @@
 #include "common/serdes.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
+#include "page/page_type.hpp"
 #include "recovery/log_record.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -492,12 +492,10 @@ RecoveryManager::~RecoveryManager() {
 }
 
 bool RecoveryManager::OpenReadFd() const {
-  if (read_fd_ >= 0) {
-    return true;
-  }
   // read_fd_ is a mutable non-atomic member reachable from concurrent Abort()
-  // walks; serialize the lazy open so two threads cannot race the
-  // check-and-assign (and leak one of the descriptors).
+  // walks; every check and the lazy open itself must hold read_fd_mutex_ so
+  // two threads can neither race the check-and-assign (leaking a descriptor)
+  // nor read the fd while another thread assigns it.
   std::scoped_lock lock(read_fd_mutex_);
   if (read_fd_ >= 0) {
     return true;
@@ -791,19 +789,27 @@ lsn_t RecoveryManager::ValidLogEnd(lsn_t from) const {
   return offset;
 }
 
+int RecoveryManager::ReadFdSnapshot() const {
+  std::scoped_lock lock(read_fd_mutex_);
+  return read_fd_;
+}
+
 bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
   dst->Clear();
   if (read_fd_ < 0 && !OpenReadFd()) {
     return false;
   }
+  // Take a local snapshot of the descriptor: ReadLog runs concurrently with
+  // other readers, and read_fd_ itself is only stable under read_fd_mutex_.
+  const int read_fd = ReadFdSnapshot();
   // Validate the record type from a private pread snapshot BEFORE decoding:
   // garbage bytes must fail here instead of reaching LogRecord's decoder
   // switch, which asserts on unknown types in debug builds.
-  std::array<char, sizeof(uint32_t) * 2 + sizeof(uint16_t)> header{};
+  std::array<char, (sizeof(uint32_t) * 2) + sizeof(uint16_t)> header{};
   ssize_t nhead = 0;
   do {
-    nhead = ::pread(read_fd_, header.data(), header.size(),
-                    static_cast<off_t>(lsn));
+    nhead =
+        ::pread(read_fd, header.data(), header.size(), static_cast<off_t>(lsn));
   } while (nhead < 0 && errno == EINTR);
   uint32_t magic = 0;
   uint32_t version = 0;
@@ -811,7 +817,7 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
   if (!std::cmp_less(nhead, header.size())) {
     DeserializeU32(header.data(), &magic);
     DeserializeU32(header.data() + sizeof(uint32_t), &version);
-    DeserializeU16(header.data() + sizeof(uint32_t) * 2, &raw_type);
+    DeserializeU16(header.data() + (sizeof(uint32_t) * 2), &raw_type);
   }
   if (std::cmp_less(nhead, header.size()) || magic != kSerdesMagic ||
       (version < kLegacyWalRecordVersion || version > kWalRecordVersion) ||
@@ -827,7 +833,7 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
     std::string buffer(want, '\0');
     ssize_t nread = 0;
     do {
-      nread = ::pread(read_fd_, buffer.data(), want, static_cast<off_t>(lsn));
+      nread = ::pread(read_fd, buffer.data(), want, static_cast<off_t>(lsn));
     } while (nread < 0 && errno == EINTR);
     if (nread <= 0) {
       return false;
@@ -854,11 +860,10 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
       // it as the valid log end so nothing after it is replayed.
       if (dst->wire_version >= kWalRecordVersion) {
         const size_t total = dst->Size();  // record bytes + CRC field
-        if (want < total && nread == static_cast<ssize_t>(want) &&
-            want < kMaxWindow) {
+        if (want < total && std::cmp_equal(nread, want) && want < kMaxWindow) {
           continue;  // window too small to reach the CRC; grow and re-read.
         }
-        if (static_cast<size_t>(nread) < total) {
+        if (std::cmp_less(nread, total)) {
           return false;  // EOF before the CRC: torn tail.
         }
         const size_t body = total - kWalRecordCrcSize;

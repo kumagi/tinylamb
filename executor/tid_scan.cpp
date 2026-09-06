@@ -7,6 +7,11 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#include "page/row_position.hpp"
+#include "table/table.hpp"
+#include "transaction/transaction.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 

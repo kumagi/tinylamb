@@ -2,12 +2,15 @@
 #include "executor/detail/explain_format.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <iomanip>
 #include <ios>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -17,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
@@ -30,15 +34,19 @@
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
+#include "index/index.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
+#include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail {
@@ -897,17 +905,13 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
           if (!s) {
             return false;
           }
-          for (const auto& src : s->Sources()) {
-            if (src.table == name || src.alias == name) {
-              return true;
-            }
+          if (std::ranges::any_of(s->Sources(), [&](const auto& src) {
+                return src.table == name || src.alias == name;
+              })) {
+            return true;
           }
-          for (const auto& part : s->UnionAll()) {
-            if (refs_self(part)) {
-              return true;
-            }
-          }
-          return false;
+          return std::ranges::any_of(
+              s->UnionAll(), [&](const auto& part) { return refs_self(part); });
         };
         is_recursive = refs_self(cte);
       }
@@ -926,6 +930,122 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       }
       if (uses <= 1) {
         output << pad << "CteInline uses=1" << '\n';
+        // A single-use CTE whose body is an equality join can absorb the outer
+        // filter: an `outer_col = const` predicate on a projected base column
+        // is re-qualified to the base table and pushed through the join key
+        // equality to both sides. Surface those pushed filters as
+        // `Filter <table>.<col> = <const>` per input scan.
+        if (cte && cte->Sources().size() > 1 && statement.WhereClause()) {
+          struct Edge {
+            ColumnName left;
+            ColumnName right;
+          };
+          std::vector<Edge> edges;
+          for (const SelectSource& src : cte->Sources()) {
+            if (!src.join_condition ||
+                src.join_condition->Type() != TypeTag::kBinaryExp) {
+              continue;
+            }
+            const auto& join = src.join_condition->AsBinaryExpression();
+            if (join.Op() == BinaryOperation::kEquals &&
+                join.Left()->Type() == TypeTag::kColumnValue &&
+                join.Right()->Type() == TypeTag::kColumnValue) {
+              edges.push_back({join.Left()->AsColumnValue().GetColumnName(),
+                               join.Right()->AsColumnValue().GetColumnName()});
+            }
+          }
+          // Map a CTE output name to its underlying base-column expression.
+          const auto base_column =
+              [&](const std::string& out_name) -> const ColumnName* {
+            for (const NamedExpression& item : cte->SelectList()) {
+              const std::string display =
+                  item.name.empty() && item.expression &&
+                          item.expression->Type() == TypeTag::kColumnValue
+                      ? item.expression->AsColumnValue().GetColumnName().name
+                      : item.name;
+              if (display == out_name && item.expression &&
+                  item.expression->Type() == TypeTag::kColumnValue) {
+                return &item.expression->AsColumnValue().GetColumnName();
+              }
+            }
+            return nullptr;
+          };
+          const std::unordered_map<std::string, std::string> alias_to_table =
+              [&] {
+                std::unordered_map<std::string, std::string> map;
+                for (const SelectSource& src : cte->Sources()) {
+                  if (!src.table.empty()) {
+                    map[src.alias.empty() ? src.table : src.alias] = src.table;
+                  }
+                }
+                return map;
+              }();
+          std::vector<std::string> emitted;
+          const auto physical = [&](const ColumnName& column) {
+            ColumnName out = column;
+            const auto it = alias_to_table.find(column.schema);
+            if (it != alias_to_table.end()) {
+              out.schema = it->second;
+            }
+            return out;
+          };
+          const auto column_eq = [](const ColumnName& a, const ColumnName& b) {
+            const auto ie = [](std::string_view x, std::string_view y) {
+              return x.size() == y.size() &&
+                     std::equal(
+                         x.begin(), x.end(), y.begin(), [](char l, char r) {
+                           return std::tolower(static_cast<unsigned char>(l)) ==
+                                  std::tolower(static_cast<unsigned char>(r));
+                         });
+            };
+            return ie(a.name, b.name) &&
+                   (a.schema.empty() || b.schema.empty() ||
+                    ie(a.schema, b.schema));
+          };
+          for (const Expression& conjunct :
+               SplitConjuncts(statement.WhereClause())) {
+            if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+              continue;
+            }
+            const auto& cmp = conjunct->AsBinaryExpression();
+            if (cmp.Op() != BinaryOperation::kEquals ||
+                cmp.Right()->Type() != TypeTag::kConstantValue) {
+              continue;
+            }
+            const Expression& lhs = cmp.Left()->Type() == TypeTag::kColumnValue
+                                        ? cmp.Left()
+                                        : Expression();
+            if (!lhs) {
+              continue;
+            }
+            const ColumnName* base =
+                base_column(lhs->AsColumnValue().GetColumnName().name);
+            if (base == nullptr) {
+              continue;
+            }
+            const Value constant = cmp.Right()->AsConstantValue().GetValue();
+            const auto add_filter = [&](const ColumnName& column) {
+              const Expression pushed = BinaryExpressionExp(
+                  ColumnValueExp(physical(column)), BinaryOperation::kEquals,
+                  ConstantValueExp(constant));
+              const std::string text = "Filter " + CleanPredicateText(pushed);
+              if (std::ranges::find(emitted, text) == emitted.end()) {
+                emitted.push_back(text);
+              }
+            };
+            add_filter(*base);
+            for (const Edge& edge : edges) {
+              if (column_eq(edge.left, *base)) {
+                add_filter(edge.right);
+              } else if (column_eq(edge.right, *base)) {
+                add_filter(edge.left);
+              }
+            }
+          }
+          for (const std::string& text : emitted) {
+            output << pad << text << '\n';
+          }
+        }
       } else {
         output << pad << "CteMaterialize uses=" << uses << '\n';
         output << pad << "CteScan" << '\n';
@@ -1436,7 +1556,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     }
   }
   // Include QUALIFY window function in the list for detection.
-  if (qualify_window_fn) {
+  if (qualify_window_fn != nullptr) {
     window_fns.push_back(qualify_window_fn);
   }
   // Detect singleton partition elimination: PARTITION BY event_id where
@@ -1781,21 +1901,23 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     const bool all_trivial_aggs = std::ranges::all_of(
         statement.SelectList().begin(), statement.SelectList().end(),
         [](const NamedExpression& item) {
-          if (!item.expression) return true;
-          if (!relational_detail::ContainsAggregate(item.expression))
+          if (!item.expression) {
             return true;
+          }
+          if (!relational_detail::ContainsAggregate(item.expression)) {
+            return true;
+          }
           // Recursively check if all aggregates are MIN/MAX/ANY_VALUE.
           std::function<bool(const Expression&)> trivial_agg =
               [&](const Expression& e) -> bool {
-            if (!e) return true;
+            if (!e) {
+              return true;
+            }
             if (e->Type() == TypeTag::kAggregateExp) {
               const auto& agg = e->AsAggregateExpression();
-              if (agg.GetType() == AggregationType::kMin ||
-                  agg.GetType() == AggregationType::kMax ||
-                  agg.GetType() == AggregationType::kAnyValue) {
-                return true;
-              }
-              return false;
+              return agg.GetType() == AggregationType::kMin ||
+                     agg.GetType() == AggregationType::kMax ||
+                     agg.GetType() == AggregationType::kAnyValue;
             }
             // Check children (e.g. agg + 1).
             if (e->Type() == TypeTag::kBinaryExp) {
@@ -1823,8 +1945,12 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
               // Check if all GROUP BY keys reference the first column.
               pk_group_aggregate_eliminated = std::ranges::all_of(
                   statement.GroupBy(), [&](const Expression& key) {
-                    if (!key) return false;
-                    if (key->Type() != TypeTag::kColumnValue) return false;
+                    if (!key) {
+                      return false;
+                    }
+                    if (key->Type() != TypeTag::kColumnValue) {
+                      return false;
+                    }
                     const ColumnName& cname =
                         key->AsColumnValue().GetColumnName();
                     // Match with or without table prefix.
@@ -1867,6 +1993,54 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                                    source.join_type == JoinType::kCross;
                           })) {
     output << pad << "Aggregate below Join" << '\n';
+    // Eager aggregation: when every aggregate's input columns come from a
+    // single join input relation, the aggregate can be computed on that
+    // relation BEFORE the join (pre-aggregating the fact side). Record the
+    // owning table so EXPLAIN shows `Aggregate input=<table>`.
+    {
+      std::unordered_map<std::string, std::string> rel_to_table;
+      for (const SelectSource& source : statement.Sources()) {
+        if (!source.table.empty()) {
+          rel_to_table[source.alias.empty() ? source.table : source.alias] =
+              source.table;
+          rel_to_table[source.table] = source.table;
+        }
+      }
+      std::string shared_table;
+      bool single_side = true;
+      for (const NamedExpression& item : statement.SelectList()) {
+        if (!item.expression ||
+            !relational_detail::ContainsAggregate(item.expression)) {
+          continue;
+        }
+        std::string item_table;
+        for (const ColumnName& column : item.expression->TouchedColumns()) {
+          const auto it = rel_to_table.find(column.schema);
+          if (it == rel_to_table.end()) {
+            single_side = false;
+            break;
+          }
+          if (item_table.empty()) {
+            item_table = it->second;
+          } else if (item_table != it->second) {
+            single_side = false;
+            break;
+          }
+        }
+        if (!single_side) {
+          break;
+        }
+        if (shared_table.empty()) {
+          shared_table = item_table;
+        } else if (shared_table != item_table) {
+          single_side = false;
+          break;
+        }
+      }
+      if (single_side && !shared_table.empty()) {
+        output << pad << "Aggregate input=" << shared_table << '\n';
+      }
+    }
   }
 
   if (pk_group_aggregate_eliminated) {
@@ -1885,7 +2059,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         std::unordered_set<std::string> seen;
         std::function<void(const Expression&)> collect_agg;
         collect_agg = [&](const Expression& e) {
-          if (!e) return;
+          if (!e) {
+            return;
+          }
           if (e->Type() == TypeTag::kAggregateExp) {
             const auto& agg = e->AsAggregateExpression();
             std::string s = agg.ToString();
@@ -1911,7 +2087,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         if (!agg_strs.empty()) {
           output << " expressions=";
           for (size_t i = 0; i < agg_strs.size(); ++i) {
-            if (i > 0) output << ',';
+            if (i > 0) {
+              output << ',';
+            }
             output << agg_strs[i];
           }
         }
@@ -1931,7 +2109,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         std::ostringstream gk;
         gk << "group_keys=";
         for (size_t gi = 0; gi < statement.GroupBy().size(); ++gi) {
-          if (gi > 0) gk << ',';
+          if (gi > 0) {
+            gk << ',';
+          }
           gk << statement.GroupBy()[gi]->ToString();
         }
         const std::string group_keys_str = gk.str();
@@ -1946,8 +2126,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                                   return std::ranges::any_of(
                                       group_by.begin(), group_by.end(),
                                       [&term](const Expression& key) {
-                                        if (!term.expression || !key)
+                                        if (!term.expression || !key) {
                                           return false;
+                                        }
                                         return term.expression->ToString() ==
                                                key->ToString();
                                       });
@@ -1969,12 +2150,17 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         const bool all_decomposable = std::ranges::all_of(
             statement.SelectList().begin(), statement.SelectList().end(),
             [](const NamedExpression& item) {
-              if (!item.expression) return true;
-              if (!relational_detail::ContainsAggregate(item.expression))
+              if (!item.expression) {
                 return true;
+              }
+              if (!relational_detail::ContainsAggregate(item.expression)) {
+                return true;
+              }
               std::function<bool(const Expression&)> decomposable =
                   [&](const Expression& e) -> bool {
-                if (!e) return true;
+                if (!e) {
+                  return true;
+                }
                 if (e->Type() == TypeTag::kAggregateExp) {
                   const auto& agg = e->AsAggregateExpression();
                   return !agg.Distinct() && !agg.WhereFilter() &&
@@ -2107,8 +2293,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                                      const SelectStatement::OrderByTerm& term) {
               return std::ranges::any_of(group_by.begin(), group_by.end(),
                                          [&term](const Expression& key) {
-                                           if (!term.expression || !key)
+                                           if (!term.expression || !key) {
                                              return false;
+                                           }
                                            return term.expression->ToString() ==
                                                   key->ToString();
                                          });

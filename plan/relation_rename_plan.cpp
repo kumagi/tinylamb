@@ -1,14 +1,22 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "plan/relation_rename_plan.hpp"
 
+#include <cstddef>
+#include <optional>
 #include <ostream>
 #include <sstream>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "expression/column_value.hpp"
-#include "table/table_statistics.hpp"
+#include "expression/expression.hpp"
+#include "plan/plan.hpp"
 #include "type/column.hpp"
+#include "type/column_name.hpp"
+#include "type/schema.hpp"
+#include "type/type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -22,7 +30,9 @@ Expression TranslateQualifier(const Expression& expression,
     return expression;
   }
   ColumnName column = expression->AsColumnValue().GetColumnName();
-  if (column.schema != from) return expression;
+  if (column.schema != from) {
+    return expression;
+  }
   column.schema = to;
   return ColumnValueExp(column);
 }
@@ -73,7 +83,7 @@ bool RelationRenamePlan::IsOrderedBy(
 
 void RelationRenamePlan::Dump(std::ostream& o, int indent) const {
   o << "Rename: " << physical_ << " AS " << relation_ << "\n"
-    << Indent(indent + 2);
+    << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 

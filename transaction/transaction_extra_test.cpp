@@ -21,17 +21,23 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "gtest/gtest.h"
+#include "index/index.hpp"
 #include "index/index_schema.hpp"
 #include "page/row_position.hpp"
 #include "recovery/logger.hpp"
+#include "table/iterator.hpp"
 #include "table/table.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
@@ -84,10 +90,17 @@ TEST(CommitPublicationTest, ReaderNeverSeesLaterCommitWithoutEarlierOne) {
   commit_value(row_a, "0");
   commit_value(row_b, "0");
 
+  // Pin a snapshot for the duration of the test.  Raw manager-level version
+  // chains have no physical row image to fall back to, so an idle GC pass
+  // after every reader has temporarily finished would otherwise erase the
+  // latest committed values that this test is trying to observe.
+  Transaction version_pin = tm.Begin(true);
+
   std::atomic<bool> stop{false};
   std::atomic<int> violations{0};
   std::atomic<int> observations{0};
   std::vector<std::thread> readers;
+  readers.reserve(2);
   for (int i = 0; i < 2; ++i) {
     readers.emplace_back([&] {
       while (!stop.load(std::memory_order_relaxed)) {
@@ -103,11 +116,21 @@ TEST(CommitPublicationTest, ReaderNeverSeesLaterCommitWithoutEarlierOne) {
         // B is always committed after A within a round, so observing B_k
         // while seeing an older A would mean a snapshot ran ahead of the
         // stable watermark.
-        if (std::atoi(b.Value().c_str()) > std::atoi(a.Value().c_str())) {
+        // Values are std::to_string(round): conversion cannot fail here.
+        if (std::atoi(b.Value().c_str()) >   // NOLINT(cert-err34-c)
+            std::atoi(a.Value().c_str())) {  // NOLINT(cert-err34-c)
           ++violations;
         }
       }
     });
+  }
+
+  const auto observe_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (observations.load(std::memory_order_relaxed) == 0 &&
+         violations.load(std::memory_order_relaxed) == 0 &&
+         std::chrono::steady_clock::now() < observe_deadline) {
+    std::this_thread::yield();
   }
 
   for (int round = 1; round <= kRounds; ++round) {
@@ -129,6 +152,7 @@ TEST(CommitPublicationTest, ReaderNeverSeesLaterCommitWithoutEarlierOne) {
   ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(final_reader, row_b, std::nullopt),
                         std::to_string(kRounds));
   ASSERT_EQ(final_reader.PreCommit(), Status::kSuccess);
+  version_pin.Abort();
   ASSERT_EQ(std::remove(log_name.c_str()), 0);
 }
 
@@ -316,7 +340,7 @@ TEST_F(QueueTableTest, DeleteAffectsExactlyTheSnapshotSelectedRows) {
     }
   }
   EXPECT_TRUE(deleted_gone);
-  EXPECT_EQ(remaining, 256 * 8 - kExpectedGone);
+  EXPECT_EQ(remaining, (256 * 8) - kExpectedGone);
   ASSERT_EQ(ctx.PreCommit(), Status::kSuccess);
 
   // A fresh snapshot agrees with the delete.
@@ -328,7 +352,7 @@ TEST_F(QueueTableTest, DeleteAffectsExactlyTheSnapshotSelectedRows) {
        ++it) {
     ++total;
   }
-  EXPECT_EQ(total, 256 * 8 - kExpectedGone);
+  EXPECT_EQ(total, (256 * 8) - kExpectedGone);
   ASSERT_EQ(verify.PreCommit(), Status::kSuccess);
 }
 

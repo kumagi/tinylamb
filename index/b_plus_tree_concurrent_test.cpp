@@ -116,7 +116,7 @@ TEST_F(BPlusTreeConcurrentTest, InsertInsert) {
   // bpt_->Insert
   for (int i = 0; i < kThreads; ++i) {
     workers.emplace_back([&, i]() {
-      std::mt19937 rand(i);
+      std::mt19937 rand(static_cast<std::mt19937::result_type>(i));
       auto txn = tm_->Begin();
       for (int j = 0; j < kSize; ++j) {
         std::string key(RandomString((rand() % 1000) + 100));
@@ -126,7 +126,7 @@ TEST_F(BPlusTreeConcurrentTest, InsertInsert) {
           --j;
           continue;
         }
-        rows[i].emplace(key, value);
+        rows[static_cast<size_t>(i)].emplace(key, value);
       }
       ASSERT_SUCCESS(txn.PreCommit());
     });

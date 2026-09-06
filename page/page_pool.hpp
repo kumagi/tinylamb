@@ -55,18 +55,12 @@ class PagePool {
 
     Entry(const Entry&) = delete;
     Entry& operator=(const Entry&) = delete;
-    Entry(Entry&& other) noexcept
-        : pin_count(other.pin_count.load()),
-          page(std::move(other.page)),
-          page_latch(std::move(other.page_latch)) {}
-    Entry& operator=(Entry&& other) noexcept {
-      if (this != &other) {
-        pin_count.store(other.pin_count.load());
-        page = std::move(other.page);
-        page_latch = std::move(other.page_latch);
-      }
-      return *this;
-    }
+    // Never value-move a live Entry: the stripe maps publish Entry* and a
+    // move would leave them dangling while copying pin_count without
+    // synchronization. Touch/DetachVictim only splice list nodes, which keeps
+    // addresses stable.
+    Entry(Entry&& other) = delete;
+    Entry& operator=(Entry&& other) = delete;
   };
   typedef std::list<Entry> LruType;
 

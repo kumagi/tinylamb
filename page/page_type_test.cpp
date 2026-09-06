@@ -25,6 +25,14 @@
 
 namespace tinylamb {
 
+namespace {
+// Deliberately out-of-range PageType probe for the "(unknown)" fallback arm.
+PageType InvalidPageTypeForTest(uint8_t raw) {
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  return static_cast<PageType>(raw);
+}
+}  // namespace
+
 TEST(PageTypeTest, StreamOperator) {
   std::stringstream ss;
   ss << PageType::kUnknown << " " << PageType::kFreePage << " "
@@ -90,9 +98,7 @@ TEST(PageTypeTest, PageTypeStringHelper) {
   EXPECT_EQ(PageTypeString(PageType::kBranchPage), "BranchPage");
   EXPECT_EQ(PageTypeString(PageType::kUnknown), "(unknown)");
   // Deliberately invalid value: exercises the "(unknown)" fallback path.
-  EXPECT_EQ(PageTypeString(static_cast<PageType>(
-                999)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
-            "(unknown)");
+  EXPECT_EQ(PageTypeString(InvalidPageTypeForTest(uint8_t{255})), "(unknown)");
 }
 
 }  // namespace tinylamb

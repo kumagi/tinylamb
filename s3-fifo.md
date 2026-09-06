@@ -18,12 +18,13 @@ VM Cache（`common/vm_cache_impl.cpp`）へ収束させるための作業リス�
       境界付きスキャンに置換（`cache.cpp` の `scanned_locked` 方式を移植、2026-08-22）
 - [x] 小キュー満杯判定を `==` → `>=` に変更（一時オーバーフロー後も eviction が再開する自己修復。
       `cache.cpp` 側にはこの潜在バグが残っている、2026-08-22）
-- [ ] `index/lsm_detail/cache.cpp` と `common/vm_cache_impl.cpp` を単一実装に統合する
+- [ ] `index/lsm_detail/cache.hpp`（ヘッダオンリ実装）と `common/vm_cache_impl.cpp` を
+      単一実装に統合する
       - [ ] ブロックサイズをテンプレート／コンストラクタ引数化（4KiB vs 可変）
-      - [ ] `cache.cpp` の zero-copy `ReadAt(offset, length, string_view&)` + RAII `Locks`
+      - [ ] `cache.hpp` の zero-copy `ReadAt(offset, length, string_view&)` + RAII `Locks`
             API を共通版へ取り込む
-      - [ ] `cache_fuzzer_replay` 系テストが CMakeLists.txt:498-520 で無効化されているので、
-            統合後に再有効化または削除する
+      - [ ] `cache_fuzzer_replay` は `add_replay_test` (CMakeLists.txt 末尾) で登録済み。
+            統合時に対応テストも移行する
 - [ ] ghost FIFO を deque ポインタ列（8B/entry）からコンパクトなリングバッファに圧縮する
 
 ## Stage 1: PagePool 内部刷新（PageRef API 変更なし）
@@ -33,9 +34,11 @@ VM Cache（`common/vm_cache_impl.cpp`）へ収束させるための作業リス�
       - [ ] 検証: 10クライアントTPC-C で `invalid page type` 零を複数シードで確認済み（3回連続ゼロ）
       - [ ] 要確認: 1クライアント実行で tps 16 / `payment customer-name read returned no rows`
             を一度観測（履歴ベースライン tps 821）。負荷残留の可能性があるため再測が必要
-- [ ] `std::fstream` を廃止し `pread`/`pwrite` に置換（将来の O_DIRECT / io_uring への布石）
+- [x] `std::fstream` を廃止し `pread`/`pwrite` に置換（page_pool.cpp:516/:543。
+      将来の O_DIRECT / io_uring への布石）
 - [ ] dirty ビット導入: クリーンページの書き戻しを省略（現状は全evictionが32KiB無条件ライト）
-- [ ] `pin_count` を atomic 化し、ヒット経路からグローバル `pool_latch` を排除する
+- [x] `pin_count` を atomic 化し、ヒット経路からグローバル `pool_latch` を排除する
+      （page_pool.hpp:48 `std::atomic<uint32_t> pin_count`。ヒット経路は shard lock のみ）
       - [ ] pid→エントリの open-addressing 表（キャッシュフレンドリな配置）
       - [ ] `Touch()` の list erase+push_back をコア間 ping-pong なしの構造へ
 - [ ] Entry ごとの heap 確保 `std::shared_mutex` をインラインラッチに置換

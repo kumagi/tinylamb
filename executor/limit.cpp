@@ -35,7 +35,7 @@ void LimitExecutor::Dump(std::ostream& output, int indent) const {
   source_->Dump(output, indent + 2);
   if (early_stop_) {
     output << "\n"
-           << Indent(indent)
+           << Indent(static_cast<size_t>(indent))
            << "Limit early_stop=true consumed_rows=" << consumed_rows_;
   }
 }

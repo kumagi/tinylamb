@@ -121,7 +121,7 @@ TEST_F(LoggerTest, AppendMany) {
   // Act -- append each random string; accumulate LSN and total size; wait for
   // commit; read back file size
   for (int i = 0; i < 64; ++i) {
-    size_t random_size = ((i * 31) % 40) + 1;
+    auto random_size = static_cast<size_t>(((i * 31) % 40) + 1);
     lsn = l_->AddLog(RandomString(random_size)) + random_size;
     size += random_size;
     EXPECT_EQ(lsn, size);
@@ -142,10 +142,10 @@ TEST_F(LoggerTest, AppendExponential) {
   // Act -- append each string; accumulate LSN and total size; wait for commit;
   // read back file size
   for (int i = 0; i < 1000; ++i) {
-    std::string data((i * i) + 1, 'x');
+    std::string data(static_cast<size_t>((i * i) + 1), 'x');
     lsn = l_->AddLog(data);
     EXPECT_EQ(lsn, size);
-    size += (i * i) + 1;
+    size += static_cast<size_t>((i * i) + 1);
   }
   WaitForCommit(size);
 
@@ -298,7 +298,7 @@ std::string MakeD1Payload(uint32_t thread, uint32_t seq, size_t body_size) {
   push32(thread);
   push32(seq);
   push32(static_cast<uint32_t>(body_size));
-  out.append(body_size, static_cast<char>(thread * 31 + seq));
+  out.append(body_size, static_cast<char>((thread * 31) + seq));
   return out;
 }
 }  // namespace
@@ -315,6 +315,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
   auto logger = std::make_unique<Logger>(log_name_, kBufSize, 1);
 
   std::vector<std::thread> producers;
+  producers.reserve(kThreads);
   for (size_t t = 0; t < kThreads; ++t) {
     producers.emplace_back([&, t] {
       for (size_t s = 0; s < kRecordsPerThread; ++s) {
@@ -350,7 +351,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
     const uint32_t length = read32();
     ASSERT_LT(thread, kThreads);
     ASSERT_LT(seq, kRecordsPerThread);
-    const int fill = static_cast<unsigned char>(thread * 31 + seq);
+    const int fill = static_cast<unsigned char>((thread * 31) + seq);
     for (uint32_t i = 0; i < length; ++i) {
       ASSERT_EQ(file.get(), fill)
           << "record " << records << " (thread " << thread << " seq " << seq

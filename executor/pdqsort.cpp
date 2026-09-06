@@ -2,7 +2,6 @@
 #include "executor/pdqsort.hpp"
 
 #include <algorithm>
-#include <cstddef>
 #include <utility>
 #include <vector>
 
@@ -22,7 +21,9 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
   for (const auto& key : keys) {
     Value lv = key.expression->Evaluate(lhs, schema);
     Value rv = key.expression->Evaluate(rhs, schema);
-    if (lv.IsNull() && rv.IsNull()) continue;
+    if (lv.IsNull() && rv.IsNull()) {
+      continue;
+    }
     if (lv.IsNull()) {
       bool nulls_first = key.nulls_first.value_or(key.ascending);
       return nulls_first ? -1 : 1;
@@ -31,8 +32,12 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
       bool nulls_first = key.nulls_first.value_or(key.ascending);
       return nulls_first ? 1 : -1;
     }
-    if (lv < rv) return key.ascending ? -1 : 1;
-    if (rv < lv) return key.ascending ? 1 : -1;
+    if (lv < rv) {
+      return key.ascending ? -1 : 1;
+    }
+    if (rv < lv) {
+      return key.ascending ? 1 : -1;
+    }
   }
   return 0;
 }

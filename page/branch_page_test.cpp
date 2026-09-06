@@ -279,12 +279,14 @@ TEST_F(BranchPageTest, SplitInto) {
     page->SetLowestValue(txn, 0);
     for (int j = 0; j < 8; ++j) {
       ASSERT_SUCCESS(
-          page->InsertBranch(txn, std::string(4000, '0' + j), j + 1));
+          page->InsertBranch(txn, std::string(4000, static_cast<char>('0' + j)),
+                             static_cast<page_id_t>(j + 1)));
     }
 
     PageRef right = p_->AllocateNewPage(txn, PageType::kBranchPage);
     std::string mid;
-    page->SplitInto(txn, std::string(4000, '0' + i), right.get(), &mid);
+    page->SplitInto(txn, std::string(4000, static_cast<char>('0' + i)),
+                    right.get(), &mid);
   }
 
   // Assert -- implicit; SplitInto produces a valid right page with separator
@@ -539,7 +541,7 @@ TEST_F(BranchPageTest, UpdateHeavy) {
 
   // Act 1 -- insert kCount random keys with random page IDs
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 10);
+    std::string key = RandomString(static_cast<size_t>((19937 * i) % 12) + 10);
     page_id_t value = random() % 10000;
     ASSERT_SUCCESS(page->InsertBranch(txn, key, value));
     keys.push_back(key);
@@ -555,7 +557,7 @@ TEST_F(BranchPageTest, UpdateHeavy) {
       ASSERT_SUCCESS(page->Delete(txn, iter->first));
       kvp.erase(iter);
     }
-    std::string key = RandomString(((19937 * i) % 32) + 100);
+    std::string key = RandomString(static_cast<size_t>((19937 * i) % 32) + 100);
     page_id_t value = random() % 10000;
     ASSERT_SUCCESS(page->InsertBranch(txn, key, value));
     kvp[key] = value;
@@ -572,8 +574,10 @@ TEST_F(BranchPageTest, Fences) {
   Transaction txn = tm_->Begin();
   PageRef page = Page();
   for (int i = 0; i < 100; ++i) {
-    std::string low = RandomString(((19937 * i) % 12) + 5000, false);
-    std::string high = RandomString(((19937 * i) % 12) + 5000, false);
+    std::string low =
+        RandomString(static_cast<size_t>((19937 * i) % 12) + 5000, false);
+    std::string high =
+        RandomString(static_cast<size_t>((19937 * i) % 12) + 5000, false);
     ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey(low)));
     ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
     ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey(high)));
@@ -617,7 +621,8 @@ TEST_F(BranchPageTest, FosterChild) {
   // Act -- for 100 iterations, set/get foster pair, then clear it and verify
   // gone
   for (int i = 0; i < 100; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 5000, false);
+    std::string key =
+        RandomString(static_cast<size_t>((19937 * i) % 12) + 5000, false);
     ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
     ASSIGN_OR_ASSERT_FAIL_CONST(FosterPair, result, page->GetFoster(txn));
     ASSERT_EQ(result.key, key);
@@ -637,7 +642,8 @@ TEST_F(BranchPageTest, FosterChildCrash) {
 
   // Act -- for 5 iterations, set foster pair, commit, crash, recover, verify
   for (int i = 0; i < 5; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 10000, false);
+    std::string key =
+        RandomString(static_cast<size_t>((19937 * i) % 12) + 10000, false);
     {
       Transaction txn = tm_->Begin();
       PageRef page = Page();
@@ -759,7 +765,9 @@ TEST_F(BranchPageTest, SetFenceNoSpace) {
   PageRef page = Page();
   page->SetLowestValue(txn, 0);
   for (int i = 0; i < 8; ++i) {
-    ASSERT_SUCCESS(page->InsertBranch(txn, std::string(4000, '0' + i), i + 1));
+    ASSERT_SUCCESS(
+        page->InsertBranch(txn, std::string(4000, static_cast<char>('0' + i)),
+                           static_cast<page_id_t>(i + 1)));
   }
 
   // Act -- an oversized low fence cannot fit in the remaining space
@@ -782,7 +790,9 @@ TEST_F(BranchPageTest, SetFosterNoSpace) {
   PageRef page = Page();
   page->SetLowestValue(txn, 0);
   for (int i = 0; i < 8; ++i) {
-    ASSERT_SUCCESS(page->InsertBranch(txn, std::string(4000, '0' + i), i + 1));
+    ASSERT_SUCCESS(
+        page->InsertBranch(txn, std::string(4000, static_cast<char>('0' + i)),
+                           static_cast<page_id_t>(i + 1)));
   }
 
   // Act -- an oversized foster key cannot fit in the remaining space
@@ -841,7 +851,9 @@ TEST_F(BranchPageTest, InsertNoSpaceWhenSlotHeaderDoesNotFit) {
   PageRef page = Page();
   page->SetLowestValue(txn, 0);
   for (int i = 0; i < 8; ++i) {
-    ASSERT_SUCCESS(page->InsertBranch(txn, std::string(4000, '0' + i), i + 1));
+    ASSERT_SUCCESS(
+        page->InsertBranch(txn, std::string(4000, static_cast<char>('0' + i)),
+                           static_cast<page_id_t>(i + 1)));
   }
 
   // Act -- insert a 9th large key; physical payload fits, slot does not

@@ -16,6 +16,7 @@
 
 #include "cross_join.hpp"
 
+#include <cstddef>
 #include <ostream>
 #include <utility>
 
@@ -56,9 +57,9 @@ void CrossJoin::TableConstruct() {
 }
 
 void CrossJoin::Dump(std::ostream& o, int indent) const {
-  o << "CrossJoin: \n" << Indent(indent + 2);
+  o << "CrossJoin: \n" << Indent(static_cast<size_t>(indent) + 2);
   left_->Dump(o, indent + 2);
-  o << "\n" << Indent(indent + 2);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   right_->Dump(o, indent + 2);
 }
 }  // namespace tinylamb

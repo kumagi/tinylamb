@@ -58,7 +58,7 @@ class NumaArena {
       size_t default_block_size = size_t{64} * 1024);
 
   NumaArenaPartition& Partition(size_t index);
-  const NumaArenaPartition& Partition(size_t index) const;
+  [[nodiscard]] const NumaArenaPartition& Partition(size_t index) const;
 
   [[nodiscard]] size_t PartitionCount() const { return partitions_.size(); }
   [[nodiscard]] size_t TotalAllocatedBytes() const;

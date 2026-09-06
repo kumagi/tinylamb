@@ -156,4 +156,3 @@ class SqlEngine {
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_SQL_ENGINE_HPP
-#include <functional>

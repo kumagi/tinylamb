@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -13,8 +14,8 @@
 #include <string_view>
 
 #include "common/constants.hpp"
+#include "common/set_operation.hpp"
 #include "common/status_or.hpp"
-#include "expression/array_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/in_expression.hpp"
 #include "query/googlesql_ast_visitor.hpp"
@@ -59,6 +60,19 @@ std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
 
 }  // namespace
 
+// The dump parser must reject a depth jump deeper than one level per line
+// instead of grafting the node onto a stale ancestor (depths 0,1,2,1,3).
+TEST(GoogleSqlAstTest, ParserRejectsMalformedDepthJumps) {
+  const std::string dump =
+      "QueryStatement\n"
+      "  QueryExpression\n"
+      "    SelectStatement\n"
+      "  QueryExpression\n"
+      "      SelectStatement\n";
+  const auto ast = GoogleSqlAstParser::Parse(dump);
+  EXPECT_FALSE(ast.HasValue());
+}
+
 TEST(GoogleSqlAstTest, PreservesNestedSetOperationKinds) {
   const std::string sql =
       "(SELECT 1 UNION ALL SELECT 1) INTERSECT DISTINCT SELECT 1;";
@@ -92,9 +106,9 @@ TEST(GoogleSqlAstTest, PreservesExplicitNullOrdering) {
   const auto& select = dynamic_cast<const SelectStatement&>(*statement);
   ASSERT_EQ(select.OrderBy().size(), 2U);
   ASSERT_TRUE(select.OrderBy()[0].nulls_first.has_value());
-  EXPECT_FALSE(*select.OrderBy()[0].nulls_first);
+  EXPECT_FALSE(select.OrderBy()[0].nulls_first.value_or(true));
   ASSERT_TRUE(select.OrderBy()[1].nulls_first.has_value());
-  EXPECT_TRUE(*select.OrderBy()[1].nulls_first);
+  EXPECT_TRUE(select.OrderBy()[1].nulls_first.value_or(false));
 }
 
 TEST(GoogleSqlAstTest, VisitsRichQueryWithoutReparsingSql) {

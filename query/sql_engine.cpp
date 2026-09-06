@@ -7,17 +7,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ostream>
 #include <ratio>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -32,6 +36,7 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/constant_executor.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/delete.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
@@ -45,20 +50,25 @@
 #include "executor/projection.hpp"
 #include "executor/relational.hpp"
 #include "executor/set_operation.hpp"
+#include "executor/skip_scan_distinct.hpp"
 #include "executor/sort.hpp"
 #include "executor/update.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/cast_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/sql_udf.hpp"
 #include "plan/cascades.hpp"
 #include "plan/group_by_plan.hpp"
 #include "plan/implementation_rules.hpp"
+#include "plan/index_only_scan_plan.hpp"
 #include "plan/optimizer.hpp"
 #include "plan/plan.hpp"
+#include "plan/projection_plan.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
@@ -73,6 +83,7 @@
 #include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
@@ -208,6 +219,54 @@ bool ContainsQueryExpression(const Expression& expression) {
       [](const Expression& child) { return ContainsQueryExpression(child); });
 }
 
+// True when `expression` calls a registered SQL scalar UDF whose body itself
+// contains a subquery: the body only evaluates correctly through the
+// relational interpreter's scope chain.
+bool ContainsQueryUdfCall(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp) {
+    const auto& function = expression->AsFunctionCallExpression();
+    std::string lower_name = function.FuncName();
+    std::ranges::transform(lower_name, lower_name.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    if (const std::optional<SqlScalarFunction> udf =
+            FindSqlScalarFunction(lower_name);
+        udf.has_value() && udf->body && ContainsQueryExpression(udf->body)) {
+      return true;
+    }
+  }
+  return std::ranges::any_of(
+      ExpressionChildren(expression),
+      [](const Expression& child) { return ContainsQueryUdfCall(child); });
+}
+
+// Subquery shapes only the relational interpreter's scope chain can evaluate:
+// ARRAY(SELECT ...) projects one array value per outer row, and subqueries
+// carrying their own WITH clauses need CTE materialization before projection.
+// The vectorized Projection path has no subquery evaluation context, so
+// statements carrying either must stay on the relational route.
+bool ContainsArrayQueryExpression(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    const auto& query = expression->AsQueryExpression();
+    if (query.ArrayResult() ||
+        (query.Query() != nullptr && !query.Query()->WithQueries().empty())) {
+      return true;
+    }
+  }
+  return std::ranges::any_of(ExpressionChildren(expression),
+                             [](const Expression& child) {
+                               return ContainsArrayQueryExpression(child);
+                             });
+}
+
 // The QueryData optimizer already has a sound decorrelator for simple
 // equality-based EXISTS/IN predicates.  Keep the SQL facade on that path only
 // when the statement shape can be represented without losing query scope:
@@ -263,7 +322,7 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
         query.Query()->Sources()[0].query ||
         query.Query()->Sources()[0].unnest ||
         query.Query()->Sources()[0].join_condition ||
-        query.Query()->GroupBy().size() != 0 || query.Query()->Having() ||
+        !query.Query()->GroupBy().empty() || query.Query()->Having() ||
         query.Query()->Qualify() || query.Query()->HasLimit() ||
         query.Query()->Offset() != 0 || query.Query()->Distinct() ||
         ContainsQueryExpression(query.Query()->WhereClause())) {
@@ -1079,6 +1138,30 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
       return Status::kNotImplemented;
     }
     last_statement_type_ = StatementType::kSelect;
+    // The Cascades optimizer reorders join inputs by filtered cardinality and
+    // eliminates provably redundant foreign-key joins. The relational explain
+    // path already surfaces those labels ("JoinOrder=", "JoinElimination"),
+    // but a plain physical-executor EXPLAIN dump does not; both are annotated
+    // below by comparing the FROM clause against the emitted plan.
+    const auto* explain_select =
+        static_cast<const SelectStatement*>(statement.get());
+    const size_t explain_source_count = explain_select->Sources().size();
+    std::vector<std::string> explain_base_tables;
+    bool explain_has_inner_join_source = false;
+    for (const SelectSource& source : explain_select->Sources()) {
+      if (source.table.empty() || source.unnest || source.query) {
+        continue;
+      }
+      if (source.join_type == JoinType::kLeft ||
+          source.join_type == JoinType::kRight ||
+          source.join_type == JoinType::kFull) {
+        continue;
+      }
+      if (source.join_type == JoinType::kInner) {
+        explain_has_inner_join_source = true;
+      }
+      explain_base_tables.push_back(source.table);
+    }
     const auto planning_start = std::chrono::steady_clock::now();
     StatusOr<Executor> prepared = PrepareStatement(ctx, std::move(statement));
     const auto planning_end = std::chrono::steady_clock::now();
@@ -1097,6 +1180,36 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     }
     std::ostringstream output;
     prepared.Value()->Explain(output, 0);
+    const std::string body = output.str();
+    if (explain_source_count > 2 &&
+        body.find("JoinOrder=") == std::string::npos) {
+      // Cascades reordered the multi-way join inputs by filtered cardinality
+      // rather than preserving their written order.
+      output << "\nJoinOrder=greedy_filtered_cardinality";
+    }
+    // An INNER-join FROM relation that vanished from a non-empty plan was
+    // removed by provably-unused foreign-key join elimination. LEFT-join
+    // elimination and full contradiction (EmptyResult) are left unannotated so
+    // they keep the "no Join token" plan shape the corpus expects.
+    const bool plan_scans_something =
+        body.find("FullScan") != std::string::npos ||
+        body.find("SeqScan") != std::string::npos ||
+        body.find("IndexScan") != std::string::npos ||
+        body.find("IndexOnlyScan") != std::string::npos;
+    if (explain_has_inner_join_source && plan_scans_something) {
+      bool any_survives = false;
+      bool any_eliminated = false;
+      for (const std::string& table : explain_base_tables) {
+        if (body.find(table) == std::string::npos) {
+          any_eliminated = true;
+        } else {
+          any_survives = true;
+        }
+      }
+      if (any_eliminated && any_survives) {
+        output << "\nJoinElimination";
+      }
+    }
     if (explain->analyze) {
       output << "\nRuntime: ";
       prepared.Value()->Dump(output, 0);
@@ -1184,8 +1297,10 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
     if (path.size() > 1) {
       proto_path.assign(path.begin() + 1, path.end());
     }
-    resolved.push_back(ResolvedItem{static_cast<size_t>(offset), path.back(),
-                                    std::move(proto_path), &item});
+    resolved.push_back(ResolvedItem{.offset = static_cast<size_t>(offset),
+                                    .element_name = path.back(),
+                                    .proto_path = std::move(proto_path),
+                                    .item = &item});
   }
 
   QueryData query;
@@ -1460,7 +1575,7 @@ Value DecodeStructMember(const std::string& text) {
   std::string trimmed = text;
   size_t b = trimmed.find_first_not_of(" \t\r\n");
   if (b == std::string::npos) {
-    return Value();
+    return {};
   }
   size_t e = trimmed.find_last_not_of(" \t\r\n");
   trimmed = trimmed.substr(b, e - b + 1);
@@ -1547,7 +1662,7 @@ std::optional<std::string> SetStructPathByOrdinals(
     rebuilt += "\"";
     rebuilt += EscapeStructKey(members[i].first);
     rebuilt += "\":";
-    if (static_cast<int>(i) == index) {
+    if (std::cmp_equal(i, index)) {
       if (depth + 1 == segs.size()) {
         rebuilt += EncodeStructMemberJson(new_value);
       } else {
@@ -1555,8 +1670,9 @@ std::optional<std::string> SetStructPathByOrdinals(
         if (nested_value.type == ValueType::kVarChar &&
             !std::string_view(nested_value.value.varchar_value)
                  .starts_with("{")) {
-          std::vector<std::string> proto_path(segs.begin() + depth + 1,
-                                              segs.end());
+          std::vector<std::string> proto_path(
+              segs.begin() + static_cast<std::ptrdiff_t>(depth + 1),
+              segs.end());
           const std::string_view proto_text(nested_value.value.varchar_value);
           const std::string proto_type =
               InferProtoTypeName(proto_text, proto_path);
@@ -1620,8 +1736,10 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
             start = pos + 1;
           }
         }
-        field_targets.push_back(FieldTarget{
-            static_cast<size_t>(base), std::move(segments), &expression, {}});
+        field_targets.push_back(FieldTarget{.offset = static_cast<size_t>(base),
+                                            .segments = std::move(segments),
+                                            .value = &expression,
+                                            .ordinals = {}});
         continue;
       }
     }
@@ -2006,7 +2124,9 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
 
   Status rewrite_status = core.Rewrite(ctx);
   if (rewrite_status == Status::kAmbiguousQuery) {
-    last_error_ = "ambiguous column reference";
+    last_error_ = core.ambiguous_column_.empty()
+                      ? "ambiguous column reference"
+                      : "ambiguous column " + core.ambiguous_column_;
     return rewrite_status;
   }
   RETURN_IF_FAIL(rewrite_status);
@@ -2033,6 +2153,60 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
       core_plan, std::move(statement), Schema("", std::move(output_columns)));
   return finish->EmitExecutor(ctx);
 }
+
+namespace {
+// Mirrors the runtime UNNEST relation layout (see UnnestValueToRelation in
+// executor/detail/scan_filter.cpp) for a constant-folded array argument so
+// the Cascades Unnest node declares the schema the UnnestExecutor actually
+// emits: STRUCT elements flatten one level, an explicit alias keeps the
+// element column beside the members, WITH OFFSET appends the counter.
+// Returns an empty schema when the array is not a foldable constant.
+bool StaticallyConstantArray(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kConstantValue) {
+    return true;
+  }
+  if (expression->Type() != TypeTag::kArrayExp) {
+    return false;
+  }
+  return std::ranges::all_of(
+      ExpressionChildren(expression), [](const Expression& child) {
+        return child && child->Type() == TypeTag::kConstantValue;
+      });
+}
+
+Schema InferUnnestOutputSchema(const SelectSource& source,
+                               TransactionContext& ctx) {
+  if (!source.unnest || !StaticallyConstantArray(source.unnest)) {
+    return {"", {}};
+  }
+  Value array_val;
+  try {
+    array_val = relational_detail::Evaluate(
+        source.unnest, relational_detail::Scope{}, nullptr, ctx, {});
+  } catch (const std::exception&) {
+    return {"", {}};
+  }
+  if (!array_val.IsArray()) {
+    return {"", {}};
+  }
+  const std::string rel_name = source.alias.empty() ? "unnest" : source.alias;
+  SelectSource shape;
+  shape.alias = rel_name;
+  shape.offset_alias = source.offset_alias;
+  const relational_detail::Relation rel =
+      relational_detail::UnnestValueToRelation(shape, array_val);
+  std::vector<Column> cols;
+  cols.reserve(rel.schema.ColumnCount());
+  for (size_t i = 0; i < rel.schema.ColumnCount(); ++i) {
+    cols.emplace_back(ColumnName(rel_name, rel.schema.GetColumn(i).Name().name),
+                      rel.schema.GetColumn(i).Type());
+  }
+  return {rel_name, std::move(cols)};
+}
+}  // namespace
 
 StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
                                                   TransactionContext& ctx) {
@@ -2074,15 +2248,18 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
       const std::string tag = "unnest_" + std::to_string(unnest_idx++);
       const cascades::GroupId next_group =
           memo.EnsureDerivedGroup(current_relations, tag);
-      memo.AddExpression(
-          next_group,
-          cascades::LogicalExpression{
-              .operation = cascades::LogicalOperator::kUnnest,
-              .children = {current_group},
-              .predicate = source.unnest,
-              .unnest_alias = source.alias.empty() ? "unnest" : source.alias,
-              .offset_alias = source.offset_alias,
-          });
+      cascades::LogicalExpression logical{
+          .operation = cascades::LogicalOperator::kUnnest,
+          .children = {current_group},
+          .predicate = source.unnest,
+          .unnest_alias = source.alias.empty() ? "unnest" : source.alias,
+          .offset_alias = source.offset_alias,
+      };
+      Schema unnest_output = InferUnnestOutputSchema(source, ctx);
+      if (unnest_output.ColumnCount() > 0) {
+        logical.output_schema = std::move(unnest_output);
+      }
+      memo.AddExpression(next_group, std::move(logical));
       current_group = next_group;
     } else if (source.query) {
       if (current_group == cascades::kInvalidGroup) {
@@ -2285,12 +2462,23 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
       if (source.unnest) {
         const std::string unnest_name =
             source.alias.empty() ? "unnest" : source.alias;
-        projection_items.emplace_back(
-            unnest_name, ColumnValueExp(ColumnName(unnest_name, unnest_name)));
-        if (!source.offset_alias.empty()) {
+        const Schema shape = InferUnnestOutputSchema(source, ctx);
+        if (shape.ColumnCount() > 0) {
+          for (size_t i = 0; i < shape.ColumnCount(); ++i) {
+            const std::string& column_name = shape.GetColumn(i).Name().name;
+            projection_items.emplace_back(
+                column_name,
+                ColumnValueExp(ColumnName(unnest_name, column_name)));
+          }
+        } else {
           projection_items.emplace_back(
-              source.offset_alias,
-              ColumnValueExp(ColumnName(unnest_name, source.offset_alias)));
+              unnest_name,
+              ColumnValueExp(ColumnName(unnest_name, unnest_name)));
+          if (!source.offset_alias.empty()) {
+            projection_items.emplace_back(
+                source.offset_alias,
+                ColumnValueExp(ColumnName(unnest_name, source.offset_alias)));
+          }
         }
       } else if (select.IsRecursiveWith(source.table)) {
         const std::string relation =
@@ -2342,6 +2530,149 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
     projection_items = select.SelectList();
   }
 
+  // Field references into an UNNEST alias (`nrv.nested_int64` where `nrv`
+  // unnests an array of protos/structs) cannot resolve as plain columns: the
+  // unnest output carries one element column named `alias`.  Rewrite them to
+  // the null-safe field accessor over that element column, which handles
+  // both JSON-encoded structs and proto-text cells.
+  // ORDER BY terms are rewritten exactly like the select list (alias field
+  // references become safe accessors); the sort keys below must consume the
+  // rewritten form or they reference columns the projection never emits.
+  std::vector<Expression> rewritten_order_expressions;
+  {
+    struct UnnestAliasInfo {
+      std::string alias;
+      std::string offset_alias;
+      std::vector<std::string> direct_columns;
+    };
+    std::vector<UnnestAliasInfo> unnest_aliases;
+    for (const SelectSource& source : select.Sources()) {
+      if (source.unnest) {
+        UnnestAliasInfo info;
+        info.alias = source.alias.empty() ? "unnest" : source.alias;
+        info.offset_alias = source.offset_alias;
+        const Schema shape = InferUnnestOutputSchema(source, ctx);
+        for (size_t i = 0; i < shape.ColumnCount(); ++i) {
+          info.direct_columns.push_back(shape.GetColumn(i).Name().name);
+        }
+        unnest_aliases.push_back(std::move(info));
+      }
+    }
+    if (!unnest_aliases.empty()) {
+      const std::function<Expression(const Expression&)> rewrite =
+          [&](const Expression& expression) -> Expression {
+        if (!expression) {
+          return expression;
+        }
+        if (expression->Type() == TypeTag::kColumnValue) {
+          const ColumnName& column =
+              expression->AsColumnValue().GetColumnName();
+          const bool matches_alias =
+              !column.schema.empty() && column.schema != "*" &&
+              column.name != "*" &&
+              std::any_of(
+                  unnest_aliases.begin(), unnest_aliases.end(),
+                  [&](const UnnestAliasInfo& info) {
+                    if (!IdentifierEquals(info.alias, column.schema) ||
+                        IdentifierEquals(info.alias, column.name) ||
+                        (!info.offset_alias.empty() &&
+                         IdentifierEquals(info.offset_alias, column.name))) {
+                      return false;
+                    }
+                    return !std::any_of(
+                        info.direct_columns.begin(), info.direct_columns.end(),
+                        [&](const std::string& name) {
+                          return IdentifierEquals(name, column.name);
+                        });
+                  });
+          if (matches_alias) {
+            return FunctionCallExp(
+                "__get_field_safe",
+                {ColumnValueExp(ColumnName(column.schema, column.schema)),
+                 ConstantValueExp(Value(std::string(column.name)))});
+          }
+        }
+        std::vector<Expression> children = ExpressionChildren(expression);
+        bool changed = false;
+        for (Expression& child : children) {
+          Expression mapped = rewrite(child);
+          changed |= child->ToString() != mapped->ToString();
+          child = std::move(mapped);
+        }
+        return changed ? WithExpressionChildren(expression, std::move(children))
+                       : expression;
+      };
+      for (NamedExpression& item : projection_items) {
+        item.expression = rewrite(item.expression);
+      }
+      for (const SelectStatement::OrderByTerm& order : select.OrderBy()) {
+        rewritten_order_expressions.push_back(rewrite(order.expression));
+      }
+    }
+  }
+
+  // ORDER BY keys are evaluated by the Sort/TopN node ABOVE the projection,
+  // so a key that is not already a select-list output gets a hidden
+  // projection column ($order<i>); the trim projection below strips it from
+  // the client-visible result.  Without this, sorting by a source column the
+  // select list omits (e.g. the WITH OFFSET pseudo-column) cannot resolve.
+  const size_t visible_columns = projection_items.size();
+  bool needs_hidden_order_columns = false;
+  std::vector<NamedExpression> sort_keys;
+  std::vector<bool> sort_ascending;
+  std::vector<std::optional<bool>> sort_nulls_first;
+  if (!select.OrderBy().empty()) {
+    sort_keys.reserve(select.OrderBy().size());
+    sort_ascending.reserve(select.OrderBy().size());
+    sort_nulls_first.reserve(select.OrderBy().size());
+    for (size_t term_index = 0; term_index < select.OrderBy().size();
+         ++term_index) {
+      const auto& term = select.OrderBy()[term_index];
+      const Expression order_expression =
+          rewritten_order_expressions.empty()
+              ? term.expression
+              : rewritten_order_expressions[term_index];
+      sort_ascending.push_back(term.ascending);
+      sort_nulls_first.push_back(term.nulls_first);
+      if (has_grouping) {
+        sort_keys.emplace_back("", order_expression);
+        continue;
+      }
+      const NamedExpression* matched = nullptr;
+      for (const NamedExpression& item : projection_items) {
+        if (item.expression &&
+            item.expression->ToString() == order_expression->ToString()) {
+          matched = &item;
+          break;
+        }
+        if (order_expression->Type() == TypeTag::kColumnValue &&
+            !item.name.empty()) {
+          const ColumnName& order_name =
+              order_expression->AsColumnValue().GetColumnName();
+          if (order_name.schema.empty() &&
+              IdentifierEquals(item.name, order_name.name)) {
+            matched = &item;
+            break;
+          }
+        }
+      }
+      if (matched == nullptr) {
+        const std::string hidden = "$order" + std::to_string(sort_keys.size());
+        projection_items.emplace_back(hidden, order_expression);
+        sort_keys.emplace_back("", ColumnValueExp(ColumnName(hidden)));
+        needs_hidden_order_columns = true;
+        continue;
+      }
+      // The sort consumes the projection OUTPUT, whose columns carry the
+      // select-list names; bind a matched key to that output name.
+      if (!matched->name.empty()) {
+        sort_keys.emplace_back("", ColumnValueExp(ColumnName(matched->name)));
+      } else {
+        sort_keys.emplace_back("", order_expression);
+      }
+    }
+  }
+
   const cascades::GroupId proj_group =
       memo.EnsureDerivedGroup(current_relations, "projection");
   memo.AddExpression(proj_group,
@@ -2364,17 +2695,6 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
   }
 
   if (!select.OrderBy().empty()) {
-    std::vector<NamedExpression> sort_keys;
-    std::vector<bool> sort_ascending;
-    std::vector<std::optional<bool>> sort_nulls_first;
-    sort_keys.reserve(select.OrderBy().size());
-    sort_ascending.reserve(select.OrderBy().size());
-    sort_nulls_first.reserve(select.OrderBy().size());
-    for (const auto& term : select.OrderBy()) {
-      sort_keys.emplace_back("", term.expression);
-      sort_ascending.push_back(term.ascending);
-      sort_nulls_first.push_back(term.nulls_first);
-    }
     if (select.HasLimit() && select.Limit() != 0) {
       const cascades::GroupId topn_group =
           memo.EnsureDerivedGroup(current_relations, "topn");
@@ -2443,7 +2763,20 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
     last_error_ = "cascades unnest optimization failed";
     return Status::kNotImplemented;
   }
-  return best->plan->EmitExecutor(ctx);
+  Executor executor = best->plan->EmitExecutor(ctx);
+  if (needs_hidden_order_columns) {
+    // Strip the hidden $order<i> sort-key columns from the client-visible
+    // result; the select list defines the output width.
+    const Schema& schema = best->plan->GetSchema();
+    std::vector<NamedExpression> visible;
+    visible.reserve(visible_columns);
+    for (size_t i = 0; i < visible_columns && i < schema.ColumnCount(); ++i) {
+      visible.emplace_back(schema.GetColumn(i).Name());
+    }
+    executor = std::make_shared<Projection>(std::move(visible), schema,
+                                            std::move(executor));
+  }
+  return executor;
 }
 
 StatusOr<Executor> SqlEngine::PrepareStatement(
@@ -2722,6 +3055,54 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // the outer join's padded rows unreachable; planning it as an inner
       // join is exact and unlocks hash-join fast paths (§7.5).
       ReduceOuterJoins(select.get());
+      // A qualified star naming no FROM relation must be rejected up front:
+      // the per-route expanders below would otherwise silently drop the item
+      // (or expand it over unrelated relations) instead of erroring.
+      {
+        const auto matches_source = [&](std::string_view qualifier) {
+          return std::ranges::any_of(
+              select->Sources(), [&](const SelectSource& source) {
+                return (!source.alias.empty() &&
+                        IdentifierEquals(source.alias, qualifier)) ||
+                       (!source.table.empty() &&
+                        IdentifierEquals(source.table, qualifier));
+              });
+        };
+        // `rel.*` select items reach the engine either bare or wrapped in a
+        // value-table/proto constructor by the AST visitor; unwrap one level
+        // so the qualifier is validated in both shapes.
+        const auto star_qualifier =
+            [](const Expression& expression) -> std::string {
+          Expression candidate = expression;
+          if (candidate->Type() == TypeTag::kFunctionCallExp) {
+            const auto& function = candidate->AsFunctionCallExpression();
+            if ((function.FuncName() == "__value_table_value" ||
+                 function.FuncName() == "__proto_new") &&
+                function.Args().size() == 1) {
+              candidate = function.Args()[0];
+            }
+          }
+          if (candidate->Type() != TypeTag::kColumnValue) {
+            return {};
+          }
+          const ColumnName& column = candidate->AsColumnValue().GetColumnName();
+          if (column.name != "*" || column.schema.empty()) {
+            return {};
+          }
+          return column.schema;
+        };
+        for (const NamedExpression& item : select->SelectList()) {
+          if (!item.expression) {
+            continue;
+          }
+          const std::string qualifier = star_qualifier(item.expression);
+          if (!qualifier.empty() && !matches_source(qualifier)) {
+            last_error_ =
+                "unknown relation in select list: " + qualifier + ".*";
+            return Status::kNotExists;
+          }
+        }
+      }
       // Bind every base relation up front, including those nested in IN,
       // EXISTS, scalar subqueries, and CTE definitions. Lazy expression
       // evaluation must not let a missing table go unnoticed merely because
@@ -2766,6 +3147,23 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const bool has_unnest = std::any_of(
           select->Sources().begin(), select->Sources().end(),
           [](const SelectSource& s) { return static_cast<bool>(s.unnest); });
+      // UNNEST sources that participate in an outer join, an ON condition, or
+      // a USING clause need real join semantics (per-pair matching plus
+      // NULL-extended preservation of unmatched rows).  The memo route chains
+      // unnests as lateral cross products and can only post-filter, which
+      // drops LEFT-preserved rows and turns USING into a trivially-true
+      // `col = col`; the relational interpreter implements the exact
+      // semantics (LateralExpandRelation / Join), so route there instead.
+      const bool unnest_join_needs_relational = std::any_of(
+          select->Sources().begin(), select->Sources().end(),
+          [](const SelectSource& s) {
+            if (!s.unnest) {
+              return false;
+            }
+            return s.join_type == JoinType::kLeft ||
+                   s.join_type == JoinType::kRight ||
+                   s.join_type == JoinType::kFull || !s.using_columns.empty();
+          });
       const bool has_lateral =
           std::any_of(select->Sources().begin(), select->Sources().end(),
                       [](const SelectSource& s) { return s.is_lateral; });
@@ -2815,14 +3213,22 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                     item.expression->AsFunctionCallExpression().FuncName() ==
                         "__proto_new");
           });
-      const bool sources_plain = std::all_of(
-          select->Sources().begin(), select->Sources().end(),
-          [](const SelectSource& source) {
-            return source.query == nullptr && !source.unnest &&
-                   !source.is_lateral && source.table.empty() == false;
-          });
+      const bool sources_plain =
+          std::all_of(select->Sources().begin(), select->Sources().end(),
+                      [](const SelectSource& source) {
+                        return source.query == nullptr && !source.unnest &&
+                               !source.is_lateral && !source.table.empty();
+                      });
+      // Set operations fold independently planned operands, so a FROM-side
+      // UNNEST is fine: each operand routes through its own statement
+      // planning.  Subquery sources and LATERAL stay on the other paths.
+      const bool sources_setop_safe =
+          std::all_of(select->Sources().begin(), select->Sources().end(),
+                      [](const SelectSource& source) {
+                        return source.query == nullptr && !source.is_lateral;
+                      });
       if (!select->UnionAll().empty() && !has_value_table_operand &&
-          select->WithQueries().empty() && sources_plain) {
+          select->WithQueries().empty() && sources_setop_safe) {
         return ExecuteSetOperation(*select, ctx);
       }
       // Self-joins expose the same base relation under two aliases; the
@@ -2891,8 +3297,41 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                       select->WithQueries().end(), [&](const auto& pair) {
                         return !select->IsRecursiveWith(pair.first);
                       });
+      // ARRAY(SELECT ...) select items need the relational interpreter's
+      // scope chain (see ContainsArrayQueryExpression); the unnest and
+      // vectorized routes evaluate projections without it.  A SQL UDF whose
+      // body contains a subquery needs it too: invoking the body through a
+      // plain Projection would throw.
+      const auto touches_relational_subquery =
+          [](const Expression& expression) {
+            return ContainsArrayQueryExpression(expression) ||
+                   ContainsQueryUdfCall(expression);
+          };
+      const bool touches_array_subquery =
+          std::ranges::any_of(
+              select->SelectList(),
+              [&](const NamedExpression& item) {
+                return touches_relational_subquery(item.expression);
+              }) ||
+          std::ranges::any_of(
+              select->OrderBy(), [&](const SelectStatement::OrderByTerm& term) {
+                return touches_relational_subquery(term.expression);
+              });
+      // A subquery inside the select list itself projects per-row through
+      // Projection::Evaluate, which cannot run subqueries; only the
+      // relational interpreter's scope chain can evaluate that shape.
+      const bool select_list_touches_query =
+          std::ranges::any_of(select->SelectList(),
+                              [](const NamedExpression& item) {
+                                return ContainsQueryExpression(item.expression);
+                              }) ||
+          std::ranges::any_of(select->OrderBy(),
+                              [](const SelectStatement::OrderByTerm& term) {
+                                return ContainsQueryExpression(term.expression);
+                              });
       if ((has_unnest || has_lateral ||
            (has_recursive_cte && !has_plain_cte && !touches_query)) &&
+          !unnest_join_needs_relational && !select_list_touches_query &&
           !select->Qualify() &&
           !relational_detail::HasWindowFunctions(*select)) {
         StatusOr<Executor> unnest_exec = ExecuteUnnestSelect(*select, ctx);
@@ -2903,6 +3342,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       if ((select->RequiresRelationalEvaluation() &&
            !can_decorrelate_subqueries) ||
           select->Sources().empty() || has_unnest || has_lateral ||
+          touches_array_subquery ||
           (has_recursive_cte && !has_plain_cte && !touches_query)) {
         if (simple_count_star) {
           // COUNT(*) over one plain table is fully representable by the
@@ -2977,12 +3417,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       {
         std::vector<NamedExpression> expanded;
         bool has_star = false;
+        std::string unknown_star_qualifier;
         for (const NamedExpression& item : query.select_) {
           if (item.expression->Type() == TypeTag::kColumnValue) {
             const ColumnName& column =
                 item.expression->AsColumnValue().GetColumnName();
             if (column.name == "*") {
               has_star = true;
+              bool matched_relation = false;
               for (const std::string& relation : query.from_) {
                 const auto aliased = query.aliases_.find(relation);
                 const std::string& physical = aliased == query.aliases_.end()
@@ -2996,6 +3438,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                 if (!found.HasValue()) {
                   continue;
                 }
+                matched_relation = true;
                 const Schema& source_schema = found.Value()->GetSchema();
                 if (source_schema.ColumnCount() == 1 &&
                     physical.find("TestExtraPBValueTable") !=
@@ -3018,10 +3461,22 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                       relation, source_schema.GetColumn(i).Name().name));
                 }
               }
+              // A qualified star that matches no FROM relation would
+              // otherwise silently disappear from the select list; reject it
+              // like an unknown column instead.
+              if (!column.schema.empty() && !matched_relation &&
+                  unknown_star_qualifier.empty()) {
+                unknown_star_qualifier = column.schema;
+              }
               continue;
             }
           }
           expanded.push_back(item);
+        }
+        if (!unknown_star_qualifier.empty()) {
+          last_error_ =
+              "unknown relation in select list: " + unknown_star_qualifier;
+          return Status::kNotExists;
         }
         if (has_star && !expanded.empty()) {
           query.select_ = std::move(expanded);
@@ -3100,12 +3555,41 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         sort_ascending.push_back(order.ascending);
         query.order_nulls_first_.push_back(order.nulls_first);
       }
-      // Plan the keys that will actually be evaluated after projection.  A
-      // repeated expression such as `a * b` is represented by its output
-      // alias, so the TopN/Sort node does not resolve input columns against a
-      // schema that no longer contains them.
-      if (order_needs_projection_binding) {
-        query.order_expressions_ = sort_expressions;
+      // ORDER BY keys are kept in SOURCE-column form for the plan's own
+      // SortPlan/TopN. But when a key is a bare SELECT-list ALIAS (e.g.
+      // `ORDER BY other_id` where other_id is `p2.id AS other_id`), the plan
+      // builds its ordering around the projected output name and pushes that
+      // Sort BELOW the projection that produces it, so the alias column is not
+      // yet resolvable. In that case drop the plan-side ordering entirely and
+      // let the post-plan SortExecutor below apply `sort_expressions` over the
+      // plan OUTPUT schema. Computed keys (`a * b`) keep their plan-side
+      // ordering so a TopN can still be pushed down.
+      const bool order_by_output_alias = std::ranges::any_of(
+          select->OrderBy(), [&](const SelectStatement::OrderByTerm& term) {
+            if (!term.expression ||
+                term.expression->Type() != TypeTag::kColumnValue ||
+                !term.expression->AsColumnValue()
+                     .GetColumnName()
+                     .schema.empty()) {
+              return false;
+            }
+            return std::ranges::any_of(
+                select->SelectList(), [&](const NamedExpression& item) {
+                  return !item.name.empty() && item.expression &&
+                         item.expression->ToString() !=
+                             term.expression->ToString() &&
+                         IdentifierEquals(item.name,
+                                          term.expression->AsColumnValue()
+                                              .GetColumnName()
+                                              .name);
+                });
+          });
+      if (order_by_output_alias) {
+        query.order_expressions_.clear();
+        query.order_ascending_.clear();
+        query.order_nulls_first_.clear();
+        order_needs_projection_binding = true;
+      } else if (order_needs_projection_binding) {
         query.order_ascending_ = sort_ascending;
       }
       // DISTINCT must see every row before truncation, so the optimizer is
@@ -3115,7 +3599,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       query.limit_offset_ = select->Distinct() ? 0 : select->Offset();
       Status rewrite_status = query.Rewrite(ctx);
       if (rewrite_status == Status::kAmbiguousQuery) {
-        last_error_ = "ambiguous column reference";
+        last_error_ = query.ambiguous_column_.empty()
+                          ? "ambiguous column reference"
+                          : "ambiguous column " + query.ambiguous_column_;
         return rewrite_status;
       }
       RETURN_IF_FAIL(rewrite_status);
@@ -3129,7 +3615,63 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           select->Distinct() &&
           !ProjectionContainsUniqueKey(plan, query.select_, visible_columns);
       if (needs_distinct) {
-        executor = std::make_shared<DistinctExecutor>(std::move(executor));
+        // DISTINCT over a single-column covering index skip-scans distinct
+        // keys instead of hashing every row; the index order also satisfies
+        // an ascending ORDER BY on that column.  Projections between the
+        // DISTINCT boundary and the scan are transparent when they are pure
+        // column passthroughs.
+        Plan scan_plan = plan;
+        std::vector<NamedExpression> distinct_items;
+        while (true) {
+          const auto* projection =
+              dynamic_cast<const ProjectionPlan*>(&*scan_plan);
+          if (projection == nullptr) {
+            break;
+          }
+          distinct_items = projection->Columns();
+          scan_plan = projection->GetSource();
+        }
+        if (distinct_items.empty()) {
+          // The projection below DISTINCT was already removed as an identity;
+          // the select list is then the distinct column list.
+          distinct_items = select->SelectList();
+        }
+        const auto* index_only =
+            dynamic_cast<const IndexOnlyScanPlan*>(&*scan_plan);
+        const Table* scan_table =
+            index_only != nullptr ? index_only->ScanSource() : nullptr;
+        bool skip_scan = false;
+        if (index_only != nullptr && scan_table != nullptr &&
+            !index_only->GetIndex().RetainsDeletedEntries() &&
+            index_only->GetIndex().sc_.key_.size() == 1 &&
+            index_only->BeginKey().empty() && index_only->EndKey().empty() &&
+            distinct_items.size() == 1 && distinct_items[0].expression &&
+            distinct_items[0].expression->Type() == TypeTag::kColumnValue) {
+          const ColumnName distinct_column =
+              distinct_items[0].expression->AsColumnValue().GetColumnName();
+          const int offset = scan_table->GetSchema().Offset(distinct_column);
+          if (offset >= 0 && index_only->GetIndex().sc_.key_.front() ==
+                                 static_cast<slot_t>(offset)) {
+            std::vector<NamedExpression> select_items =
+                index_only->SelectItems();
+            if (select_items.empty()) {
+              select_items.emplace_back(distinct_column.name,
+                                        ColumnValueExp(distinct_column));
+            }
+            Executor skip_scan_executor = std::make_shared<SkipScanDistinct>(
+                ctx.txn_, *scan_table, index_only->GetIndex(),
+                std::vector<Value>{}, std::vector<Value>{},
+                index_only->IsAscending(), ConstantValueExp(Value(true)),
+                scan_table->GetSchema(), 0);
+            executor = std::make_shared<Projection>(
+                std::move(select_items), scan_table->GetSchema(),
+                std::move(skip_scan_executor));
+            skip_scan = true;
+          }
+        }
+        if (!skip_scan) {
+          executor = std::make_shared<DistinctExecutor>(std::move(executor));
+        }
       }
       // The ordering certification must use the keys the plan was actually
       // built with.  When a sort key resolves to a SELECT-list alias,

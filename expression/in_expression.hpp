@@ -41,12 +41,13 @@ class InExpression : public ExpressionBase {
   // value and list items.
   [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
                                EvaluationContext& context) const override;
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override {
-    return tinylamb::Type(TypeTag::kBigInt);
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/) const override {
+    return {TypeTag::kBigInt};
   }
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&,
-                                          const Schema&) const override {
-    return tinylamb::Type(TypeTag::kBigInt);
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/, const Schema& /*unused*/) const override {
+    return {TypeTag::kBigInt};
   }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;

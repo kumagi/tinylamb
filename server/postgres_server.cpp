@@ -59,6 +59,11 @@ constexpr int kIdleSweepIntervalMs = 1000;
 // Input cap per connection before authentication completes; unauthenticated
 // clients must not be able to pin max_message_bytes of memory each.
 constexpr size_t kMaxPreAuthInputBytes = 1024;
+// Per-connection bound on queued outbound bytes.  The input side is capped,
+// but a client that pipelines queries and never reads would otherwise let
+// `Client::output` grow without bound (each 'Q' can emit up to
+// kMaxServerResultRows rows) and OOM the process.
+constexpr size_t kMaxQueuedOutputBytes = 64U << 20;  // 64 MiB
 
 std::string ErrnoMessage(std::string_view operation) {
   return std::string(operation) + ": " + std::strerror(errno);
@@ -329,8 +334,8 @@ class PostgresServer::Impl {
   };
 
   struct ReadTask {
-    int client_fd;
-    uint64_t client_id;
+    int client_fd{};
+    uint64_t client_id{};
     std::vector<std::string> statements;
   };
 
@@ -481,7 +486,15 @@ class PostgresServer::Impl {
       }
       return false;
     }
-    ProcessInput(client);
+    try {
+      ProcessInput(client);
+    } catch (const std::exception&) {
+      // Queue() refuses to buffer past the per-connection output cap (and
+      // unexpected internal errors surface here the same way): drop the
+      // connection instead of propagating into the event loop.
+      CloseClient(fd);
+      return false;
+    }
     UpdateClientInterest(client);
     return !(client.close_after_write && client.output.empty());
   }
@@ -538,6 +551,12 @@ class PostgresServer::Impl {
     if (client.output_offset != 0) {
       client.output.erase(0, client.output_offset);
       client.output_offset = 0;
+    }
+    if (client.output.size() + message.size() > kMaxQueuedOutputBytes) {
+      // Backpressure: refuse further buffering for a client that does not
+      // drain its results.  The connection is torn down by the caller seeing
+      // the failure instead of letting output grow without bound.
+      throw std::runtime_error("client output buffer limit exceeded");
     }
     client.output += message;
   }
@@ -1005,8 +1024,8 @@ class PostgresServer::Impl {
             std::string("read worker failed: ") + exception.what(), "XX000");
         response += pgwire::ReadyForQuery('I');
       } catch (...) {
-        response = pgwire::ErrorResponse("read worker failed: unknown error",
-                                         "XX000");
+        response =
+            pgwire::ErrorResponse("read worker failed: unknown error", "XX000");
         response += pgwire::ReadyForQuery('I');
       }
       active_read_queries_.fetch_sub(1);
@@ -1087,9 +1106,16 @@ class PostgresServer::Impl {
       }
       Client& client = found->second;
       client.read_query_in_flight = false;
-      Queue(client, completion.response);
-      ProcessInput(client);
-      UpdateClientInterest(client);
+      // Queue throws when the output cap is hit; in the epoll loop nothing
+      // would catch it, so a single overflowing worker response would
+      // terminate the whole server.  Drop the offending client instead.
+      try {
+        Queue(client, completion.response);
+        ProcessInput(client);
+        UpdateClientInterest(client);
+      } catch (const std::exception&) {
+        CloseClient(completion.client_fd);
+      }
     }
   }
 

@@ -198,6 +198,10 @@ class Memo {
   void SetTableSchemas(const std::unordered_map<std::string, Schema>& schemas) {
     table_schemas_ = schemas;
   }
+  [[nodiscard]] const std::unordered_map<std::string, Schema>& GetTableSchemas()
+      const {
+    return table_schemas_;
+  }
 
   void Dump(std::ostream& out) const;
 

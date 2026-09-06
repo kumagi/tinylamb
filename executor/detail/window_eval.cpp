@@ -4,36 +4,48 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/relation.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/named_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
+#include "query/statement.hpp"
 #include "type/column.hpp"
+#include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
-namespace tinylamb {
-namespace relational_detail {
+namespace tinylamb::relational_detail {
 namespace {
 
 using WindowNodeMap = std::map<const WindowFunctionCallExpression*,
@@ -177,9 +189,6 @@ Expression Rebuild(const Expression& expression, const ReplacementMap& map) {
   }
 }
 
-std::vector<Expression> RebuildAll(const std::vector<Expression>& items,
-                                   const ReplacementMap& map);
-
 // NULLS FIRST on ASC / NULLS LAST on DESC by default, matching ApplyOrderBy;
 // an explicit NULLS FIRST/LAST overrides the default.
 bool ValueLess(const Value& a, const Value& b, bool ascending,
@@ -258,7 +267,7 @@ bool DistanceWithin(const Value& key, const Value& candidate, double off,
     const long double diff =
         static_cast<long double>(key.value.int_value) -
         static_cast<long double>(candidate.value.int_value);
-    const long double bound = static_cast<long double>(off);
+    const auto bound = static_cast<long double>(off);
     return inclusive_le ? diff <= bound : diff >= bound;
   }
   const double dk = NumericOf(key);
@@ -271,18 +280,19 @@ struct WindowRuntime {
   const CteMap* ctes{nullptr};
   const Schema* schema{nullptr};
 
-  Value EvalAt(const Expression& expression, const std::vector<Row>& rows,
-               size_t position) const {
+  [[nodiscard]] Value EvalAt(const Expression& expression,
+                             const std::vector<Row>& rows,
+                             size_t position) const {
     Scope scope{.row = &rows[position], .schema = schema, .outer = outer};
     return Evaluate(expression, scope, nullptr, context, *ctes);
   }
 
   // Resolves [lo, hi] (inclusive) frame bounds within the ordered partition.
-  std::pair<size_t, size_t> ResolveFrame(
+  [[nodiscard]] static std::pair<size_t, size_t> ResolveFrame(
       const WindowFunctionCallExpression& window,
       const std::vector<Row>& /*rows*/, const std::vector<size_t>& ordered,
       const std::vector<std::vector<Value>>& order_values, size_t position,
-      const std::vector<size_t>& peer_end) const {
+      const std::vector<size_t>& peer_end) {
     const size_t m = ordered.size();
     if (!window.has_frame) {
       if (window.order_by.empty()) {
@@ -485,7 +495,9 @@ struct WindowRuntime {
             }
             // DistanceWithin(candidate_value, key, off, false) checks
             // candidate_value - key >= off, i.e. value >= key + off.
-            if (DistanceWithin(candidate, key, off, false)) {
+            if (DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
+                    candidate, key, off,
+                    false)) {  // (scanned, current) order is intentional.
               return j;
             }
           }
@@ -520,7 +532,9 @@ struct WindowRuntime {
             if (candidate.IsNull()) {
               continue;
             }
-            if (DistanceWithin(candidate, key, off, true)) {
+            if (DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
+                    candidate, key, off,
+                    true)) {  // (scanned, current) order is intentional.
               reached = j;
             }
           }
@@ -576,17 +590,17 @@ struct WindowRuntime {
     return {*lo, *hi};
   }
 
-  Value AggregateOverFrame(const WindowFunctionCallExpression& window,
-                           const std::vector<Row>& rows,
-                           const std::vector<size_t>& ordered,
-                           const std::vector<std::vector<Value>>& order_values,
-                           size_t current, size_t lo, size_t hi) const {
+  [[nodiscard]] Value AggregateOverFrame(
+      const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
+      const std::vector<size_t>& ordered,
+      const std::vector<std::vector<Value>>& order_values, size_t current,
+      size_t lo, size_t hi) const {
     const std::string& fn = window.function;
     if (hi < lo || ordered.empty() || hi >= ordered.size()) {
       if (fn == "COUNT") {
         return Value(static_cast<int64_t>(0));
       }
-      return Value();
+      return {};
     }
     // The window expression carries an optional row-level WHERE filter.
     int64_t row_count = 0;
@@ -732,7 +746,7 @@ struct WindowRuntime {
       // Exact percentile interpolation over the frame; returns NUM quantiles
       // including both endpoints.
       if (non_null.empty() || window.args.size() < 2) {
-        return Value();
+        return {};
       }
       Value n_value = Evaluate(
           window.args[1],
@@ -740,7 +754,7 @@ struct WindowRuntime {
           nullptr, context, *ctes);
       const int64_t num = n_value.value.int_value;
       if (num <= 0) {
-        return Value();
+        return {};
       }
       std::vector<Value> sorted = non_null;
       std::sort(sorted.begin(), sorted.end(),
@@ -766,7 +780,7 @@ struct WindowRuntime {
       // Exact deterministic evaluation: count/sum occurrences per value over
       // the frame and return the top-k as ARRAY<STRUCT<value, number>>.
       if (non_null.empty() || window.args.empty()) {
-        return Value();
+        return {};
       }
       int64_t k = 1;
       if (!window.args.empty()) {
@@ -848,14 +862,14 @@ struct WindowRuntime {
       };
       std::vector<Value> out;
       std::string element_type;
-      for (size_t i = 0; i < stats.size() && static_cast<int64_t>(i) < k; ++i) {
+      for (size_t i = 0; i < stats.size() && std::cmp_less(i, k); ++i) {
         std::string json =
             "{\"value\":" + json_of(stats[i].first) + ",\"count\":" +
             (stats[i].second == std::floor(stats[i].second)
                  ? std::to_string(static_cast<int64_t>(stats[i].second))
                  : std::to_string(stats[i].second)) +
             "}";
-        out.push_back(Value(std::move(json)));
+        out.emplace_back(std::move(json));
       }
       if (!out.empty()) {
         std::string value_type = "STRING";
@@ -889,7 +903,7 @@ struct WindowRuntime {
       return Value(trues);
     }
     if (non_null.empty()) {
-      return Value();
+      return {};
     }
 
     if (fn == "SUM" || fn == "AVG") {
@@ -923,7 +937,7 @@ struct WindowRuntime {
       return Value(total);
     }
     if (fn == "MIN" || fn == "MAX") {
-      const Value* best = &non_null[0];
+      const Value* best = non_null.data();
       for (const Value& value : non_null) {
         if (fn == "MIN" ? ValueLess(value, *best, true)
                         : ValueLess(*best, value, true)) {
@@ -942,7 +956,7 @@ struct WindowRuntime {
         std::string sep = delimiter.IsNull() ? "," : delimiter.AsString();
         std::string out;
         for (size_t i = 0; i < final_values.size(); ++i) {
-          if (i) {
+          if (i != 0U) {
             out += sep;
           }
           out += final_values[i].AsString();
@@ -1037,14 +1051,14 @@ struct WindowRuntime {
       }
       const double mx = sx / static_cast<double>(n);
       const double my = sy / static_cast<double>(n);
-      const double covar_pop = sxy / static_cast<double>(n) - mx * my;
-      const double var_x = sxx / static_cast<double>(n) - mx * mx;
-      const double var_y = syy / static_cast<double>(n) - my * my;
+      const double covar_pop = (sxy / static_cast<double>(n)) - (mx * my);
+      const double var_x = (sxx / static_cast<double>(n)) - (mx * mx);
+      const double var_y = (syy / static_cast<double>(n)) - (my * my);
       return std::make_tuple(covar_pop, var_x, var_y, n);
     };
     auto frame_variance = [&](bool samp) -> Value {
       if (non_null.empty()) {
-        return Value();
+        return {};
       }
       const size_t n = non_null.size();
       double mean = 0.0;
@@ -1060,14 +1074,14 @@ struct WindowRuntime {
       double variance = ss / static_cast<double>(n);
       if (samp) {
         if (n < 2) {
-          return Value();
+          return {};
         }
         variance *= static_cast<double>(n) / static_cast<double>(n - 1);
       }
       return Value(variance);
     };
     if (fn == "VAR_POP" || fn == "VAR_SAMP" || fn == "VARIANCE") {
-      return frame_variance(fn == "VAR_POP" ? false : true);
+      return frame_variance(fn != "VAR_POP");
     }
     if (fn == "STDDEV_POP" || fn == "STDDEV_SAMP" || fn == "STDDEV") {
       Value variance = frame_variance(fn != "STDDEV_POP");
@@ -1082,7 +1096,7 @@ struct WindowRuntime {
     if (fn == "COVAR_POP" || fn == "COVAR_SAMP" || fn == "CORR") {
       auto stats = frame_pairs();
       if (!stats.has_value()) {
-        return Value();
+        return {};
       }
       const auto& [covar_pop, var_x, var_y, n] = *stats;
       if (fn == "COVAR_POP") {
@@ -1094,7 +1108,7 @@ struct WindowRuntime {
       }
       // CORR
       if (var_x <= 0.0 || var_y <= 0.0) {
-        return Value();
+        return {};
       }
       return Value(covar_pop / std::sqrt(var_x * var_y));
     }
@@ -1109,14 +1123,14 @@ struct WindowRuntime {
         }
       }
       if (frame_values.empty() || window.args.size() < 2) {
-        return Value();
+        return {};
       }
       Value p_value = Evaluate(
           window.args[1],
           Scope{.row = &rows[ordered[lo]], .schema = schema, .outer = outer},
           nullptr, context, *ctes);
       if (p_value.IsNull()) {
-        return Value();
+        return {};
       }
       double p = 0.0;
       if (p_value.type == ValueType::kDouble) {
@@ -1127,7 +1141,7 @@ struct WindowRuntime {
         try {
           p = std::stod(std::string(p_value.value.varchar_value));
         } catch (...) {
-          return Value();
+          return {};
         }
       }
       if (p < 0.0 || p > 1.0) {
@@ -1169,21 +1183,21 @@ struct WindowRuntime {
         // PERCENTILE_DISC rounds the rank UP to the next element.
         return sorted[static_cast<size_t>(std::ceil(rank))];
       }
-      const size_t lo_idx = static_cast<size_t>(std::floor(rank));
-      const size_t hi_idx = static_cast<size_t>(std::ceil(rank));
+      const auto lo_idx = static_cast<size_t>(std::floor(rank));
+      const auto hi_idx = static_cast<size_t>(std::ceil(rank));
       if (lo_idx == hi_idx) {
         return sorted[lo_idx];
       }
       // Interpolation across a NULL endpoint yields NULL.
       if (sorted[lo_idx].IsNull() || sorted[hi_idx].IsNull()) {
-        return Value();
+        return {};
       }
       const double a = NumericOf(sorted[lo_idx]);
       const double b = NumericOf(sorted[hi_idx]);
       const double frac = rank - static_cast<double>(lo_idx);
       // a*(1-frac) + b*frac (NOT a + (b-a)*frac): the former keeps infinite
       // endpoints as-is instead of collapsing to NaN.
-      return Value(a * (1.0 - frac) + b * frac);
+      return Value((a * (1.0 - frac)) + (b * frac));
     }
     if (fn == "ELEMENTWISE_SUM" || fn == "ELEMENTWISE_AVG") {
       bool saw_array = false;
@@ -1195,7 +1209,7 @@ struct WindowRuntime {
         }
       }
       if (!saw_array) {
-        return Value();
+        return {};
       }
       std::vector<Value> out;
       out.reserve(width);
@@ -1231,11 +1245,11 @@ struct WindowRuntime {
           element_type = any_double ? "FLOAT64" : "INT64";
         }
         if (fn == "ELEMENTWISE_AVG") {
-          out.push_back(Value(double_sum / static_cast<double>(seen)));
+          out.emplace_back(double_sum / static_cast<double>(seen));
         } else if (any_double) {
-          out.push_back(Value(double_sum));
+          out.emplace_back(double_sum);
         } else {
-          out.push_back(Value(int_sum));
+          out.emplace_back(int_sum);
         }
       }
       return Value::Array(std::move(out), element_type);
@@ -1400,7 +1414,8 @@ void ComputeOneWindow(TransactionContext& context,
     return;
   }
 
-  WindowRuntime runtime{context, outer, &ctes, &schema};
+  WindowRuntime runtime{
+      .context = context, .outer = outer, .ctes = &ctes, .schema = &schema};
 
   WindowOrderLayout local_layout;
   const WindowOrderLayout* layout = cached_layout;
@@ -1431,7 +1446,7 @@ void ComputeOneWindow(TransactionContext& context,
       while (k < m) {
         const size_t end = peer_end[k];
         ++dense;
-        const int64_t rank = static_cast<int64_t>(k + 1);
+        const auto rank = static_cast<int64_t>(k + 1);
         for (size_t p = k; p <= end; ++p) {
           if (fn == "RANK") {
             (*out)[ordered[p]] = Value(rank);
@@ -1481,22 +1496,22 @@ void ComputeOneWindow(TransactionContext& context,
       for (size_t k = 0; k < m; ++k) {
         const int64_t target = fn == "LAG" ? static_cast<int64_t>(k) - offset
                                            : static_cast<int64_t>(k) + offset;
-        if (target < 0 || target >= static_cast<int64_t>(m)) {
+        if (target < 0 || std::cmp_greater_equal(target, m)) {
           if (window.args.size() > 2) {
             (*out)[ordered[k]] =
                 runtime.EvalAt(window.args[2], rows, ordered[k]);
           }
           continue;
         }
-        (*out)[ordered[k]] =
-            runtime.EvalAt(window.args[0], rows, ordered[target]);
+        (*out)[ordered[k]] = runtime.EvalAt(
+            window.args[0], rows, ordered[static_cast<size_t>(target)]);
       }
       continue;
     }
     if (fn == "FIRST_VALUE" || fn == "LAST_VALUE" || fn == "NTH_VALUE") {
       for (size_t k = 0; k < m; ++k) {
-        const auto [lo, hi] = runtime.ResolveFrame(window, rows, ordered,
-                                                   order_values, k, peer_end);
+        const auto [lo, hi] = WindowRuntime::ResolveFrame(
+            window, rows, ordered, order_values, k, peer_end);
         if (hi < lo) {
           continue;
         }
@@ -1550,7 +1565,7 @@ void ComputeOneWindow(TransactionContext& context,
               ++frame_size;
             }
           }
-          if (nth <= 0 || static_cast<size_t>(nth) > frame_size) {
+          if (nth <= 0 || std::cmp_greater(nth, frame_size)) {
             continue;
           }
           for (size_t candidate = lo; candidate <= hi; ++candidate) {
@@ -1571,8 +1586,8 @@ void ComputeOneWindow(TransactionContext& context,
 
     // Everything else is treated as an aggregate over the frame.
     for (size_t k = 0; k < m; ++k) {
-      const auto [lo, hi] = runtime.ResolveFrame(window, rows, ordered,
-                                                 order_values, k, peer_end);
+      const auto [lo, hi] = WindowRuntime::ResolveFrame(
+          window, rows, ordered, order_values, k, peer_end);
       (*out)[ordered[k]] = runtime.AggregateOverFrame(window, rows, ordered,
                                                       order_values, k, lo, hi);
     }
@@ -1590,12 +1605,10 @@ bool HasWindowFunctions(const SelectStatement& statement) {
       return true;
     }
   }
-  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
-    if (ContainsWindow(term.expression)) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(statement.OrderBy(),
+                             [](const SelectStatement::OrderByTerm& term) {
+                               return ContainsWindow(term.expression);
+                             });
 }
 
 namespace {
@@ -1732,7 +1745,10 @@ WindowedInput ApplyWindows(TransactionContext& context,
     const std::string layout_key = WindowLayoutKey(*window_node);
     auto [layout_it, inserted] = layouts.try_emplace(layout_key);
     if (inserted) {
-      WindowRuntime runtime{context, outer, &ctes, &base_schema};
+      WindowRuntime runtime{.context = context,
+                            .outer = outer,
+                            .ctes = &ctes,
+                            .schema = &base_schema};
       layout_it->second = BuildWindowOrderLayout(*window_node, rows, runtime);
     }
     computed.emplace_back();
@@ -1801,5 +1817,4 @@ WindowedInput ApplyWindows(TransactionContext& context,
   return result;
 }
 
-}  // namespace relational_detail
-}  // namespace tinylamb
+}  // namespace tinylamb::relational_detail

@@ -51,7 +51,7 @@ struct ColumnName {
   }
   [[nodiscard]] std::string ToString() const;
   bool operator==(const ColumnName&) const = default;
-  bool operator<(const ColumnName&) const;
+  bool operator<(const ColumnName& /*rhs*/) const;
   [[nodiscard]] bool Empty() const { return schema.empty() && name.empty(); }
   friend std::ostream& operator<<(std::ostream& o, const ColumnName& c);
   friend Encoder& operator<<(Encoder& a, const ColumnName& c);

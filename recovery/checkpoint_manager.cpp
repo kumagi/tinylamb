@@ -32,6 +32,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>

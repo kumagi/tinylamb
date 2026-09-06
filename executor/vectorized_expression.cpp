@@ -5,9 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
-#include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/selection_vector.hpp"
 #include "expression/binary_expression.hpp"
@@ -16,9 +16,9 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
-#include "expression/function_call_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 

@@ -6,17 +6,15 @@
 #include "index_only_scan_plan.hpp"
 
 #include <cstddef>
-#include <memory>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "common/constants.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
-#include "expression/named_expression.hpp"
 #include "index/index.hpp"
 #include "index/index_schema.hpp"
 #include "table/table.hpp"

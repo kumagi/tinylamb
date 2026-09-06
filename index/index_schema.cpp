@@ -21,6 +21,7 @@
 #include "index_schema.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <ostream>
 #include <string>
 

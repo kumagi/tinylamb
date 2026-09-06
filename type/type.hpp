@@ -53,13 +53,13 @@ class Type {
  public:
   Type() : type_(TypeTag::kInvalid) {}
   Type(TypeTag type) : type_(type) {}
-  TypeTag GetType() const { return type_; }
-  bool IsValid() const { return type_ != TypeTag::kInvalid; }
-  bool IsVariableLength() const {
+  [[nodiscard]] TypeTag GetType() const { return type_; }
+  [[nodiscard]] bool IsValid() const { return type_ != TypeTag::kInvalid; }
+  [[nodiscard]] bool IsVariableLength() const {
     return type_ == TypeTag::kVarChar || type_ == TypeTag::kArray;
   }
-  size_t Size() const;
-  std::string ToString() const;
+  [[nodiscard]] size_t Size() const;
+  [[nodiscard]] std::string ToString() const;
 
   friend Encoder& operator<<(Encoder& e, const Type& t) {
     e << static_cast<uint8_t>(t.type_);
@@ -67,7 +67,7 @@ class Type {
   }
 
   friend Decoder& operator>>(Decoder& d, Type& t) {
-    uint8_t type_val;
+    uint8_t type_val = 0;
     d >> type_val;
     t.type_ = static_cast<TypeTag>(type_val);
     return d;

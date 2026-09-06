@@ -80,6 +80,43 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] 外側結合の null-supplying side をパターン DSL で制約
 - [ ] `NeedsRelationalEvaluation` 経路を段階的に Cascades へ移す計画表
 
+  2026-09-04 時点の経路地図（Wave 2 M1〜M3 実施済み、M9 未達）:
+
+  - **Cascades 経路済み**: no-FROM SELECT / 単一表（集計・ORDER BY 計算式・
+    エイリアス参照含む） / エイリアス・非エイリアス INNER/CROSS 結合 /
+    集合演算（`ExecuteSetOperation`、オペランド再帰 + 実行器レベル折り畳み、
+    INTERSECT 優先結合・BY NAME・per-pair 演算子対応） / 複数表 GROUP BY・
+    HAVING（`ExecuteGroupedSelect` + `GroupByPlan`。Cascades が FROM+WHERE
+    コアを最適化し、グルーピング仕上げは `FinishQuery` 経由）。
+    ただし集合演算は `plan_contains` が relational 形式の
+    `optimizer_subquery_setop_high_expectations` 等を結果契約のみに緩和済み。
+  - **残存する relational 経路（M4〜M8）と各移管要件**:
+    1. **CTE / 再帰 CTE**（M4）: Cascades コアが CTE 名を解決できない。
+       memo に materialized-scan 葉（派生スキャン）オペレータが必要。
+       再帰は `ExecuteRecursiveCte` 相当の物理演算子接続。
+    2. **FROM サブクエリ / LATERAL**（M5）: 派生スキャン葉に同じく依存。
+       LATERAL は相関パラメータの per-row 再実行が必要（subquery_runtime 相当）。
+    3. **OUTER JOIN**（M6）: `GroupByPlan` コアは外部結合条件の WHERE 平坦化が
+       意味論を壊すため除外済み。memo `kOuterJoin` に join-type 付き lowering
+       （`Memo::Build` の join 木構築拡張）が必要。
+       ※ SELECT COUNT(*) FROM a LEFT JOIN b は外部結合ガードで relational 保棄。
+    4. **UNNEST / TVF**（M7）: `kUnnest` 論理 op は enum に存在、実装規則未接続。
+    5. **相関サブクエリ残部**（M8）: `GroupedSelect` は式内 QueryExp で
+       フォールバック済み（`grouped_expressions_correlate` ガード）。
+       デコリレーション不能形状は subquery_runtime 依存を維持。
+  - **M9（planner 削除）の前提**: 上記 1〜5 の全移管後、
+    `executor/relational.cpp`（2,562 行）+ `executor/detail/planning_heuristics.cpp`
+    （1,853 行）+ `sql_engine.cpp` の `emit_relational` 3 箇所 +
+    `Optimizer::OptimizeRelational` / `kRelational` を削除する。
+    実行ヘルパ（expression_eval / window_eval / scan_filter / subquery_runtime の
+    評価器部分）は残す。`OptimizerAndRelationalPathsAgree` 監査テストは役目終了。
+  - **既知の未復帰修正**（stash 適用で復元済みのはずだが要確認）:
+    `sort.cpp SingleKey` DESC 符号混在修正（回帰テスト
+    `RelationalSortMixedSignDescendingKeepsOrder`）。
+  - **モノトニック索引順序保存**（`ORDER BY` 出力エイリアスが索引列の単調関数の
+    場合ソート省略）は optimizer 経路未実装。`optimizer_cse_projection_high_expectations`
+    を参照。
+
 ---
 
 ## P0 — 既にあるもの（再実装しない）

@@ -5,11 +5,14 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
-#include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "common/join_kind.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/join_kind.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/expression.hpp"

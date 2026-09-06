@@ -38,7 +38,7 @@ class FreePage {
   // D3 (docs/design.md): RecoveryManager rebuilds the free-list chain after
   // replaying kSystemDestroyPage redos; these are the only allocator-external
   // users of the link field.
-  page_id_t NextFreePage() const { return next_free_page; }
+  [[nodiscard]] page_id_t NextFreePage() const { return next_free_page; }
   void SetNextFreePage(page_id_t next) { next_free_page = next; }
 
  private:
@@ -47,7 +47,7 @@ class FreePage {
   friend std::hash<tinylamb::FreePage>;
 
   uint64_t next_free_page;
-  void Dump(std::ostream& o, int) const {
+  void Dump(std::ostream& o, int /*unused*/) const {
     o << "[NextFreePage: " << next_free_page << "]";
   }
   friend std::ostream& operator<<(std::ostream& o, const FreePage& f) {

@@ -238,7 +238,7 @@ class ColumnCollector {
         return;
       }
       if (value < lowest_[i].value) {
-        lowest_.insert(lowest_.begin() + i,
+        lowest_.insert(lowest_.begin() + static_cast<std::ptrdiff_t>(i),
                        ValueFrequency{.value = value, .count = 1});
         if (lowest_.size() > kBoundaryValueCount) {
           lowest_.pop_back();
@@ -258,7 +258,7 @@ class ColumnCollector {
         return;
       }
       if (highest_[i].value < value) {
-        highest_.insert(highest_.begin() + i,
+        highest_.insert(highest_.begin() + static_cast<std::ptrdiff_t>(i),
                         ValueFrequency{.value = value, .count = 1});
         if (highest_.size() > kBoundaryValueCount) {
           highest_.pop_back();
@@ -296,9 +296,8 @@ class ColumnCollector {
   std::vector<ValueFrequency> highest_;
   // Deterministic on purpose: reproducible samples keep query plans and
   // statistics tests stable across runs. Not used for any security purpose.
-  std::mt19937_64 rng_{
-      kStatisticsMagic ^
-      0x9E3779B97F4A7C15ULL};  // NOLINT(cert-msc32-c,cert-msc51-cpp)
+  std::mt19937_64 rng_{// NOLINT(cert-msc32-c,cert-msc51-cpp)
+                       kStatisticsMagic ^ 0x9E3779B97F4A7C15ULL};
 };
 
 long double Position(const Value& value) {
@@ -421,11 +420,14 @@ double ColumnConstantSelectivity(const ColumnStats& stats, size_t rows,
     case BinaryOperation::kLike:
     case BinaryOperation::kNotLike: {
       const double base =
-          stats.Distinct() == 0 ? 0 : 1.0 / std::sqrt(stats.Distinct());
-      const double matching = stats.NonNullCount() * std::min(0.25, base);
+          stats.Distinct() == 0
+              ? 0
+              : 1.0 / std::sqrt(static_cast<double>(stats.Distinct()));
+      const double matching =
+          static_cast<double>(stats.NonNullCount()) * std::min(0.25, base);
       count = operation == BinaryOperation::kLike
                   ? matching
-                  : stats.NonNullCount() - matching;
+                  : static_cast<double>(stats.NonNullCount()) - matching;
       break;
     }
     default:
@@ -553,7 +555,9 @@ double EstimatePredicate(const TableStatistics& table,
         return 0;
       }
       const double null_fraction =
-          table.Column(offset).NullCount() / static_cast<double>(table.Rows());
+          static_cast<double>(
+              table.Column(static_cast<size_t>(offset)).NullCount()) /
+          static_cast<double>(table.Rows());
       return unary.Op() == UnaryOperation::kIsNull ? null_fraction
                                                    : 1 - null_fraction;
     }
@@ -575,8 +579,8 @@ double EstimatePredicate(const TableStatistics& table,
         return 0.25;
       }
       selectivity += ColumnConstantSelectivity(
-          table.Column(offset), table.Rows(), BinaryOperation::kEquals,
-          item->AsConstantValue().GetValue());
+          table.Column(static_cast<size_t>(offset)), table.Rows(),
+          BinaryOperation::kEquals, item->AsConstantValue().GetValue());
     }
     return ClampProbability(selectivity);
   }
@@ -653,7 +657,7 @@ double EstimatePredicate(const TableStatistics& table,
       return 0.25;
     }
     return ColumnConstantSelectivity(
-        table.Column(offset), table.Rows(), binary.Op(),
+        table.Column(static_cast<size_t>(offset)), table.Rows(), binary.Op(),
         binary.Right()->AsConstantValue().GetValue());
   }
   if (left_constant && right_column) {
@@ -663,7 +667,8 @@ double EstimatePredicate(const TableStatistics& table,
       return 0.25;
     }
     return ColumnConstantSelectivity(
-        table.Column(offset), table.Rows(), ReverseComparison(binary.Op()),
+        table.Column(static_cast<size_t>(offset)), table.Rows(),
+        ReverseComparison(binary.Op()),
         binary.Left()->AsConstantValue().GetValue());
   }
   if (left_column && right_column && binary.Op() == BinaryOperation::kEquals) {
@@ -674,19 +679,21 @@ double EstimatePredicate(const TableStatistics& table,
     if (left_offset < 0 || right_offset < 0 || table.Rows() == 0) {
       return 0.1;
     }
-    const ColumnStats& left = table.Column(left_offset);
-    const ColumnStats& right = table.Column(right_offset);
+    const ColumnStats& left = table.Column(static_cast<size_t>(left_offset));
+    const ColumnStats& right = table.Column(static_cast<size_t>(right_offset));
     if (left_offset == right_offset) {
-      return left.NonNullCount() / static_cast<double>(table.Rows());
+      return static_cast<double>(left.NonNullCount()) /
+             static_cast<double>(table.Rows());
     }
     const size_t max_distinct = std::max(left.Distinct(), right.Distinct());
     if (max_distinct == 0) {
       return 0;
     }
-    const double both_non_null =
-        (left.NonNullCount() / static_cast<double>(table.Rows())) *
-        (right.NonNullCount() / static_cast<double>(table.Rows()));
-    return ClampProbability(both_non_null / max_distinct);
+    const double both_non_null = (static_cast<double>(left.NonNullCount()) /
+                                  static_cast<double>(table.Rows())) *
+                                 (static_cast<double>(right.NonNullCount()) /
+                                  static_cast<double>(table.Rows()));
+    return ClampProbability(both_non_null / static_cast<double>(max_distinct));
   }
   return 0.25;
 }
@@ -701,17 +708,17 @@ double ColumnStats::EstimateEqual(const Value& raw_value) const {
   *value = CompactValue(*value);
   for (const ValueFrequency& frequency : most_common_values_) {
     if (SameValue(frequency.value, *value)) {
-      return frequency.count;
+      return static_cast<double>(frequency.count);
     }
   }
   for (const ValueFrequency& frequency : lowest_values_) {
     if (SameValue(frequency.value, *value)) {
-      return frequency.count;
+      return static_cast<double>(frequency.count);
     }
   }
   for (const ValueFrequency& frequency : highest_values_) {
     if (SameValue(frequency.value, *value)) {
-      return frequency.count;
+      return static_cast<double>(frequency.count);
     }
   }
   for (const HistogramBucket& bucket : histogram_) {
@@ -721,11 +728,13 @@ double ColumnStats::EstimateEqual(const Value& raw_value) const {
     if (bucket.distinct == 0) {
       return 0;
     }
-    return static_cast<double>(bucket.count) / bucket.distinct;
+    return static_cast<double>(bucket.count) /
+           static_cast<double>(bucket.distinct);
   }
   // Legacy varchar statistics do not have persisted boundaries.
   if (histogram_.empty()) {
-    return static_cast<double>(non_null_count_) / distinct_count_;
+    return static_cast<double>(non_null_count_) /
+           static_cast<double>(distinct_count_);
   }
   return 0;
 }
@@ -737,7 +746,7 @@ double ColumnStats::EstimateLessThan(const Value& raw_value) const {
   }
   *value = CompactValue(*value);
   if (histogram_.empty()) {
-    return non_null_count_ * 0.5;
+    return static_cast<double>(non_null_count_) * 0.5;
   }
 
   double result = 0;
@@ -746,7 +755,7 @@ double ColumnStats::EstimateLessThan(const Value& raw_value) const {
       break;
     }
     if (bucket.upper < *value) {
-      result += bucket.count;
+      result += static_cast<double>(bucket.count);
       continue;
     }
     if (SameValue(*value, bucket.upper)) {
@@ -763,7 +772,7 @@ double ColumnStats::EstimateLessThan(const Value& raw_value) const {
             : std::clamp(
                   static_cast<double>((target - lower) / (upper - lower)), 0.0,
                   1.0);
-    result += bucket.count * fraction;
+    result += static_cast<double>(bucket.count) * fraction;
     break;
   }
   return std::clamp(result, 0.0, static_cast<double>(non_null_count_));
@@ -839,14 +848,15 @@ ColumnStats& ColumnStats::operator*=(double multiplier) {
 }
 
 void ColumnStats::Duplicate(size_t multiplier) {
-  non_null_count_ = ScaleCount(non_null_count_, multiplier);
-  null_count_ = ScaleCount(null_count_, multiplier);
+  non_null_count_ =
+      ScaleCount(non_null_count_, static_cast<double>(multiplier));
+  null_count_ = ScaleCount(null_count_, static_cast<double>(multiplier));
   for (HistogramBucket& bucket : histogram_) {
-    bucket.count = ScaleCount(bucket.count, multiplier);
+    bucket.count = ScaleCount(bucket.count, static_cast<double>(multiplier));
   }
   const auto multiply_frequencies = [&](std::vector<ValueFrequency>& values) {
     for (ValueFrequency& value : values) {
-      value.count = ScaleCount(value.count, multiplier);
+      value.count = ScaleCount(value.count, static_cast<double>(multiplier));
     }
   };
   multiply_frequencies(lowest_values_);
@@ -922,15 +932,16 @@ double TableStatistics::EstimateCount(int column_index, const Value& from,
   if (column_index < 0 || static_cast<size_t>(column_index) >= stats_.size()) {
     throw std::out_of_range("statistics column index");
   }
-  std::optional<Value> lower = CoerceValue(from, stats_[column_index].Type());
-  std::optional<Value> upper = CoerceValue(to, stats_[column_index].Type());
+  const ColumnStats& column_stats = stats_[static_cast<size_t>(column_index)];
+  std::optional<Value> lower = CoerceValue(from, column_stats.Type());
+  std::optional<Value> upper = CoerceValue(to, column_stats.Type());
   if (!lower || !upper) {
     return 0;
   }
   if (*upper < *lower) {
     std::swap(lower, upper);
   }
-  return stats_[column_index].EstimateRange(lower, true, upper, true);
+  return column_stats.EstimateRange(lower, true, upper, true);
 }
 
 TableStatistics TableStatistics::TransformBy(int column_index,
@@ -938,7 +949,8 @@ TableStatistics TableStatistics::TransformBy(int column_index,
                                              const Value& to) const {
   TableStatistics result(*this);
   const double estimated = EstimateCount(column_index, from, to);
-  const double multiplier = row_count_ == 0 ? 0 : estimated / row_count_;
+  const double multiplier =
+      row_count_ == 0 ? 0 : estimated / static_cast<double>(row_count_);
   result.row_count_ = ScaleCount(row_count_, multiplier);
   for (ColumnStats& stats : result.stats_) {
     stats *= multiplier;
@@ -960,7 +972,9 @@ TableStatistics TableStatistics::Filter(const Schema& schema,
 TableStatistics TableStatistics::ScaleToRows(size_t rows) const {
   TableStatistics result(*this);
   const double multiplier =
-      row_count_ == 0 ? 0 : rows / static_cast<double>(row_count_);
+      row_count_ == 0
+          ? 0
+          : static_cast<double>(rows) / static_cast<double>(row_count_);
   result.row_count_ = rows;
   for (ColumnStats& stats : result.stats_) {
     stats *= multiplier;
@@ -982,7 +996,8 @@ void TableStatistics::Assign(size_t rows, std::vector<ColumnStats> columns) {
 
 TableStatistics TableStatistics::operator*(size_t multiplier) const {
   TableStatistics result(*this);
-  result.row_count_ = ScaleCount(result.row_count_, multiplier);
+  result.row_count_ =
+      ScaleCount(result.row_count_, static_cast<double>(multiplier));
   for (ColumnStats& stats : result.stats_) {
     stats.Duplicate(multiplier);
   }

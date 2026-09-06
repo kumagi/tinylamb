@@ -31,8 +31,9 @@ namespace {
 std::vector<Row> DrainForStats(const Executor& executor) {
   std::vector<Row> drained;
   Row row;
-  while (executor->Next(&row, nullptr)) { drained.push_back(row);
-}
+  while (executor->Next(&row, nullptr)) {
+    drained.push_back(row);
+  }
   return drained;
 }
 
@@ -271,12 +272,14 @@ class SqlEngineTpchTest : public ::testing::Test {
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
                                                       << engine.LastError();
-    if (!prepared.HasValue()) { return {};
-}
+    if (!prepared.HasValue()) {
+      return {};
+    }
     std::vector<Row> rows;
     Row row;
-    while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row);
-}
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
     return rows;
   }
 
@@ -389,20 +392,21 @@ TEST_F(SqlEngineTpchTest, ExplainReturnsPlanAndAnalyzeReturnsRuntimeProfile) {
     EXPECT_EQ(engine.ResultColumnNames(),
               std::vector<std::string>({"QUERY PLAN"}));
     std::string plan;
-    if (!prepared.HasValue()) { return plan;
-}
+    if (!prepared.HasValue()) {
+      return plan;
+    }
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
-      if (!plan.empty()) { plan += '\n';
-}
+      if (!plan.empty()) {
+        plan += '\n';
+      }
       plan += std::string(row[0].value.varchar_value);
     }
     return plan;
   };
 
   const std::string plan = collect_plan("EXPLAIN ");
-  EXPECT_NE(plan.find("StreamAggregate"), std::string::npos)
-      << plan;
+  EXPECT_NE(plan.find("StreamAggregate"), std::string::npos) << plan;
   EXPECT_NE(plan.find("Relational Physical Plan"), std::string::npos) << plan;
   EXPECT_NE(plan.find("rows~"), std::string::npos) << plan;
   EXPECT_EQ(plan.find("rows~unknown"), std::string::npos) << plan;
@@ -431,7 +435,8 @@ TEST_F(SqlEngineTpchTest, FusesAllAggregatesIntoOnePassPerInputRow) {
   SqlEngine engine(*database_);
   StatusOr<Executor> prepared = engine.Prepare(
       context,
-      "SELECT g, COUNT(*) AS row_count, COUNT(v) AS value_count, SUM(v) AS total, "
+      "SELECT g, COUNT(*) AS row_count, COUNT(v) AS value_count, SUM(v) AS "
+      "total, "
       "AVG(v) AS mean, MIN(v) AS smallest, MAX(v) AS largest, "
       "COUNT(DISTINCT v) AS unique_values FROM metrics GROUP BY g "
       "HAVING COUNT(*) >= 1 ORDER BY g;");
@@ -482,8 +487,7 @@ TEST_F(SqlEngineTpchTest, FusesAllAggregatesIntoOnePassPerInputRow) {
 
 TEST_F(SqlEngineTpchTest, PrunesScanColumnsAndFiltersBeforeMaterialization) {
   TransactionContext context = database_->BeginContext();
-  Run(context,
-      "CREATE TABLE wide (a INT64, b INT64, c STRING, d NUMERIC);");
+  Run(context, "CREATE TABLE wide (a INT64, b INT64, c STRING, d NUMERIC);");
   Run(context,
       "INSERT INTO wide VALUES (1,10,'x',1.0),(2,20,'y',2.0),"
       "(3,30,'z',3.0),(4,40,'w',4.0);");
@@ -512,9 +516,8 @@ TEST_F(SqlEngineTpchTest, PrunesScanColumnsAndFiltersBeforeMaterialization) {
   EXPECT_NE(profile.str().find("aggregate_input_rows=2"), std::string::npos)
       << profile.str();
 
-  StatusOr<Executor> count =
-      engine.Prepare(context,
-                     "SELECT COUNT(*) FROM wide HAVING COUNT(*) >= 0;");
+  StatusOr<Executor> count = engine.Prepare(
+      context, "SELECT COUNT(*) FROM wide HAVING COUNT(*) >= 0;");
   ASSERT_TRUE(count.HasValue()) << engine.LastError();
   std::ostringstream count_profile;
   ASSERT_TRUE(count.Value()->Next(&result, nullptr));
@@ -622,11 +625,11 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
   ASSERT_GE(uncorrelated_rows.size(), 1U);
   EXPECT_EQ(uncorrelated_rows[0][0], Value(static_cast<int64_t>(kRows)));
 
-  StatusOr<Executor> reused_base = engine.Prepare(
-      context,
-      "SELECT COUNT(*) FROM lineitem WHERE l_orderkey IN "
-      "(SELECT l_orderkey FROM lineitem GROUP BY l_orderkey "
-      "HAVING SUM(l_quantity) > 0);");
+  StatusOr<Executor> reused_base =
+      engine.Prepare(context,
+                     "SELECT COUNT(*) FROM lineitem WHERE l_orderkey IN "
+                     "(SELECT l_orderkey FROM lineitem GROUP BY l_orderkey "
+                     "HAVING SUM(l_quantity) > 0);");
   ASSERT_TRUE(reused_base.HasValue()) << engine.LastError();
   std::ostringstream reused_base_plan;
   DrainForStats(reused_base.Value());

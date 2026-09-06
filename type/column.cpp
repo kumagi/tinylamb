@@ -50,7 +50,7 @@ Encoder& operator<<(Encoder& a, const Column& c) {
   // Keep the signed value representation while recording UINT64 in the
   // catalog's column metadata.  The high bit is not part of ValueType, so
   // existing signed column encodings remain byte-compatible.
-  uint8_t encoded_type = static_cast<uint8_t>(c.type_);
+  auto encoded_type = static_cast<uint8_t>(c.type_);
   if (c.unsigned_) {
     encoded_type |= 0x80;
   }

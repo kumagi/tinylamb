@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -318,11 +319,11 @@ TEST(SqlTemplateTest, BindsJoinConditionBeforeWhereClause) {
       BinaryExpressionExp(ColumnValueExp("wb"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(2))));
   std::vector<SelectSource> sources;
-  sources.push_back(SelectSource("t", "t", nullptr, JoinType::kCross, nullptr));
-  sources.push_back(SelectSource(
+  sources.emplace_back("t", "t", nullptr, JoinType::kCross, nullptr);
+  sources.emplace_back(
       "u", "u", nullptr, JoinType::kInner,
       BinaryExpressionExp(ColumnValueExp("ja"), BinaryOperation::kEquals,
-                          ConstantValueExp(Value(1)))));
+                          ConstantValueExp(Value(1))));
   cached->SetSources(std::move(sources));
 
   const SqlTemplate hit =

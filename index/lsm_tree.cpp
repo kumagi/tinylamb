@@ -22,12 +22,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -57,7 +59,7 @@ bool ParseRunFileName(const std::string& name, bool* is_merged,
   std::string body = name;
   *is_merged = false;
   constexpr std::string_view kPrefix = "merged-";
-  if (body.rfind(kPrefix, 0) == 0) {
+  if (body.starts_with(kPrefix)) {
     *is_merged = true;
     body.erase(0, kPrefix.size());
   }
@@ -377,6 +379,11 @@ void LSMTree::Sync() {
     frozen_mem_tree_.clear();
     return;
   }
+  // The blob payloads referenced by the new run must be durable BEFORE the
+  // run is registered: the run file itself was already fsynced by
+  // FlushInternal, and without this barrier a crash leaves a durable run
+  // pointing at torn blob bytes (quarantined on restore: acked writes lost).
+  blob_.Sync();
   {
     // Register the new run BEFORE dropping the frozen tree: readers must
     // always find flushed keys in mem_tree_, frozen_mem_tree_ or index_.
@@ -392,8 +399,10 @@ void LSMTree::Sync() {
 
 void LSMTree::MergeAll() {
   constexpr size_t kMaxRuns = 4;
-  std::scoped_lock mem_lk(mem_tree_lock_);
-  std::scoped_lock lk(file_tree_lock_);
+  // Single atomic acquisition in the canonical mem_tree_lock_ ->
+  // file_tree_lock_ order (same as Sync): two-step locking here would admit
+  // a future file->mem path and an ABBA deadlock.
+  std::scoped_lock lk(mem_tree_lock_, file_tree_lock_);
   if (index_.size() <= kMaxRuns) {
     return;
   }

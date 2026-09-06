@@ -34,8 +34,8 @@ namespace detail {
   for (uint8_t byte : data) {
     crc ^= byte;
     for (int bit = 0; bit < 8; ++bit) {
-      const uint32_t mask = -(crc & 1u);
-      crc = (crc >> 1) ^ (0x82f63b78u & mask);
+      const uint32_t mask = -(crc & 1U);
+      crc = (crc >> 1) ^ (0x82f63b78U & mask);
     }
   }
   return crc;
@@ -86,7 +86,7 @@ namespace detail {
 // instruction on x86-64 (SSE4.2) with a software bit-by-bit fallback.
 // Known vector: Crc32C("123456789") == 0xe3069283.
 [[nodiscard]] inline uint32_t Crc32C(std::span<const uint8_t> data) {
-  return detail::Crc32CRawHardware(0xffffffffu, data) ^ 0xffffffffu;
+  return detail::Crc32CRawHardware(0xffffffffU, data) ^ 0xffffffffU;
 }
 
 [[nodiscard]] inline uint32_t Crc32C(const void* data, size_t length) {

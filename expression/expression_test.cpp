@@ -17,15 +17,21 @@
 #include "expression/expression.hpp"
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/status_or.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -73,7 +79,8 @@ TEST(ExpressionTest, ConstantValue_Evaluate_ReturnsConstantValue) {
   ASSERT_EQ(cv_double->Evaluate(dummy, dummy_schema), Value(1.1));
 }
 
-TEST(ExpressionTest, BinaryAdd_WithIntVarcharAndDouble_ComputesSumOrConcatenates) {
+TEST(ExpressionTest,
+     BinaryAdd_WithIntVarcharAndDouble_ComputesSumOrConcatenates) {
   Expression int_plus =
       BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
                           ConstantValueExp(Value(2)));
@@ -136,7 +143,8 @@ TEST(ExpressionTest, BinaryDivide_WithIntAndDouble_ComputesQuotient) {
   Schema dummy_schema;
 
   ASSERT_EQ(int_div->Evaluate(dummy, dummy_schema), Value(5.0));
-  EXPECT_NEAR(double_div->Evaluate(dummy, dummy_schema).value.double_value, 4.0, 1e-6);
+  EXPECT_NEAR(double_div->Evaluate(dummy, dummy_schema).value.double_value, 4.0,
+              1e-6);
 }
 
 TEST(ExpressionTest, BinaryModulo_WithInt_ComputesRemainder) {
@@ -251,7 +259,8 @@ TEST(ExpressionTest, BinaryLessThan_WithVariousTypes_ReturnsCorrectBoolean) {
   ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(0));
 }
 
-TEST(ExpressionTest, BinaryLessThanEquals_WithVariousTypes_ReturnsCorrectBoolean) {
+TEST(ExpressionTest,
+     BinaryLessThanEquals_WithVariousTypes_ReturnsCorrectBoolean) {
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kLessThanEquals,
                                           ConstantValueExp(Value(12312)));
@@ -335,7 +344,8 @@ TEST(ExpressionTest, BinaryGreaterThan_WithVariousTypes_ReturnsCorrectBoolean) {
   ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(1));
 }
 
-TEST(ExpressionTest, BinaryGreaterThanEquals_WithVariousTypes_ReturnsCorrectBoolean) {
+TEST(ExpressionTest,
+     BinaryGreaterThanEquals_WithVariousTypes_ReturnsCorrectBoolean) {
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kGreaterThanEquals,
                                           ConstantValueExp(Value(12312)));
@@ -541,7 +551,8 @@ TEST(ExpressionTest, BinaryExpression_WithNestedExpressions_ComputesCorrectly) {
   ASSERT_EQ(exp5->Evaluate(dummy, dummy_schema), Value(true));
 }
 
-TEST(ExpressionTest, BinaryExpression_WithNullOperands_FollowsThreeValuedLogic) {
+TEST(ExpressionTest,
+     BinaryExpression_WithNullOperands_FollowsThreeValuedLogic) {
   const Row row;
   const Schema schema;
   const Expression null_value = ConstantValueExp(Value());
@@ -572,30 +583,28 @@ TEST(ExpressionTest, BinaryExpression_ArithmeticWithNull_PropagatesNull) {
   const Expression null_value = ConstantValueExp(Value());
   const Expression one = ConstantValueExp(Value(1));
 
-  for (const BinaryOperation op : {BinaryOperation::kAdd,
-                                   BinaryOperation::kSubtract,
-                                   BinaryOperation::kMultiply,
-                                   BinaryOperation::kDivide,
-                                   BinaryOperation::kModulo}) {
+  for (const BinaryOperation op :
+       {BinaryOperation::kAdd, BinaryOperation::kSubtract,
+        BinaryOperation::kMultiply, BinaryOperation::kDivide,
+        BinaryOperation::kModulo}) {
     const Value result =
         BinaryExpressionExp(null_value, op, one)->Evaluate(row, schema);
     EXPECT_TRUE(result.IsNull()) << "op " << static_cast<int>(op);
   }
-  for (const BinaryOperation op : {BinaryOperation::kLessThan,
-                                   BinaryOperation::kLessThanEquals,
-                                   BinaryOperation::kGreaterThan,
-                                   BinaryOperation::kGreaterThanEquals}) {
+  for (const BinaryOperation op :
+       {BinaryOperation::kLessThan, BinaryOperation::kLessThanEquals,
+        BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals}) {
     const Value result =
         BinaryExpressionExp(null_value, op, one)->Evaluate(row, schema);
     EXPECT_TRUE(result.IsNull()) << "op " << static_cast<int>(op);
   }
-  const Value neg =
-      UnaryExpressionExp(null_value, UnaryOperation::kMinus)
-          ->Evaluate(row, schema);
+  const Value neg = UnaryExpressionExp(null_value, UnaryOperation::kMinus)
+                        ->Evaluate(row, schema);
   EXPECT_TRUE(neg.IsNull());
 }
 
-TEST(ExpressionTest, BinaryExpression_WithMixedNumericTypes_InfersTypeAndComputes) {
+TEST(ExpressionTest,
+     BinaryExpression_WithMixedNumericTypes_InfersTypeAndComputes) {
   const Schema schema("numbers", {Column("integer", ValueType::kInt64),
                                   Column("floating", ValueType::kDouble)});
   const Row row({Value(2), Value(0.5)});
@@ -652,7 +661,8 @@ class BareExpression : public ExpressionBase {
 
 }  // namespace
 
-TEST(ExpressionTest, QueryExpression_Inspect_ReturnsTypeStringAndTouchedColumns) {
+TEST(ExpressionTest,
+     QueryExpression_Inspect_ReturnsTypeStringAndTouchedColumns) {
   std::shared_ptr<SelectStatement> no_query;
   Expression test = ColumnValueExp("x");
   Expression exists = QueryExpressionExp(no_query, test, true, false);
@@ -678,11 +688,12 @@ TEST(ExpressionTest, QueryExpression_Inspect_ReturnsTypeStringAndTouchedColumns)
   EXPECT_EQ(not_exists->AsQueryExpression().Negated(), true);
 }
 
-TEST(ExpressionTest, QueryExpression_EvaluateWithoutContext_ThrowsRuntimeError) {
+TEST(ExpressionTest,
+     QueryExpression_EvaluateWithoutContext_ThrowsRuntimeError) {
   Row row;
   Schema schema;
-  Expression scalar = QueryExpressionExp(
-      std::shared_ptr<SelectStatement>(), ColumnValueExp("x"));
+  Expression scalar = QueryExpressionExp(std::shared_ptr<SelectStatement>(),
+                                         ColumnValueExp("x"));
 
   EXPECT_THROW(scalar->Evaluate(row, schema), std::runtime_error);
 
@@ -695,16 +706,16 @@ TEST(ExpressionTest, AggregateExpression_EvaluateDirectly_ThrowsLogicError) {
   Schema schema("s", {Column("amount", ValueType::kInt64),
                       Column("rate", ValueType::kDouble)});
   Row row({Value(10), Value(0.5)});
-  Expression count = AggregateExpressionExp(AggregationType::kCount,
-                                            ColumnValueExp("amount"));
-  Expression avg = AggregateExpressionExp(AggregationType::kAvg,
-                                          ColumnValueExp("rate"));
-  Expression sum = AggregateExpressionExp(AggregationType::kSum,
-                                          ColumnValueExp("amount"));
-  Expression min = AggregateExpressionExp(AggregationType::kMin,
-                                          ColumnValueExp("rate"));
-  Expression max = AggregateExpressionExp(AggregationType::kMax,
-                                          ColumnValueExp("amount"));
+  Expression count =
+      AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("amount"));
+  Expression avg =
+      AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("rate"));
+  Expression sum =
+      AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("amount"));
+  Expression min =
+      AggregateExpressionExp(AggregationType::kMin, ColumnValueExp("rate"));
+  Expression max =
+      AggregateExpressionExp(AggregationType::kMax, ColumnValueExp("amount"));
 
   EXPECT_EQ(count->ResultType(schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(avg->ResultType(schema).GetType(), TypeTag::kDouble);
@@ -732,7 +743,8 @@ TEST(ExpressionTest, AggregateExpression_EvaluateDirectly_ThrowsLogicError) {
   EXPECT_EQ(oss.str(), "COUNT(amount)");
 }
 
-TEST(ExpressionTest, CaseExpression_WithNullConditionOrMissingElse_ReturnsNullOrElse) {
+TEST(ExpressionTest,
+     CaseExpression_WithNullConditionOrMissingElse_ReturnsNullOrElse) {
   Schema schema("s", {Column("v", ValueType::kInt64)});
   Row row({Value(5)});
   Expression no_else = CaseExpressionExp(
@@ -752,10 +764,9 @@ TEST(ExpressionTest, CaseExpression_WithNullConditionOrMissingElse_ReturnsNullOr
 
 TEST(ExpressionTest, CaseExpression_ResultType_InfersCorrectType) {
   Schema schema;
-  Expression with_when =
-      CaseExpressionExp({{ConstantValueExp(Value(true)),
-                          ConstantValueExp(Value(1))}},
-                        ConstantValueExp(Value(2)));
+  Expression with_when = CaseExpressionExp(
+      {{ConstantValueExp(Value(true)), ConstantValueExp(Value(1))}},
+      ConstantValueExp(Value(2)));
   Expression no_when_no_else = CaseExpressionExp({}, nullptr);
 
   EXPECT_EQ(with_when->ResultType(schema).GetType(), TypeTag::kBigInt);
@@ -780,14 +791,16 @@ TEST(ExpressionTest, CaseExpression_Inspect_ReturnsTouchedColumnsAndString) {
   EXPECT_EQ(oss.str(), "CASE WHEN a THEN b ELSE c END");
 }
 
-TEST(ExpressionTest, IntervalExpression_EvaluateAndToString_ReturnsFormattedInterval) {
+TEST(ExpressionTest,
+     IntervalExpression_EvaluateAndToString_ReturnsFormattedInterval) {
   Row row;
   Schema schema;
   Expression interval = IntervalExpressionExp(3, "day");
 
   EXPECT_EQ(interval->Type(), TypeTag::kIntervalExp);
   EXPECT_EQ(interval->Evaluate(row, schema), Value("0-0 3 0:0:0"));
-  EXPECT_EQ(interval->Evaluate(&row, schema, &row, schema), Value("0-0 3 0:0:0"));
+  EXPECT_EQ(interval->Evaluate(&row, schema, &row, schema),
+            Value("0-0 3 0:0:0"));
   EXPECT_EQ(interval->ResultType(schema).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(interval->ResultType(schema, schema).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(interval->ToString(), "INTERVAL 0-0 3 0:0:0");
@@ -804,35 +817,35 @@ TEST(ExpressionTest, IntervalExpression_EvaluateAndToString_ReturnsFormattedInte
 TEST(ExpressionTest, InExpression_WithNullValues_FollowsThreeValuedLogic) {
   Row row;
   Schema schema;
-  Expression child_null = InExpressionExp(
-      ConstantValueExp(Value()),
-      {ConstantValueExp(Value(1)), ConstantValueExp(Value(2))});
-  Expression candidate_null = InExpressionExp(
-      ConstantValueExp(Value(3)),
-      {ConstantValueExp(Value()), ConstantValueExp(Value(2))});
-  Expression candidate_null_match = InExpressionExp(
-      ConstantValueExp(Value(2)),
-      {ConstantValueExp(Value()), ConstantValueExp(Value(2))});
+  Expression child_null =
+      InExpressionExp(ConstantValueExp(Value()),
+                      {ConstantValueExp(Value(1)), ConstantValueExp(Value(2))});
+  Expression candidate_null =
+      InExpressionExp(ConstantValueExp(Value(3)),
+                      {ConstantValueExp(Value()), ConstantValueExp(Value(2))});
+  Expression candidate_null_match =
+      InExpressionExp(ConstantValueExp(Value(2)),
+                      {ConstantValueExp(Value()), ConstantValueExp(Value(2))});
 
   EXPECT_TRUE(child_null->Evaluate(row, schema).IsNull());
   EXPECT_TRUE(candidate_null->Evaluate(row, schema).IsNull());
   EXPECT_EQ(candidate_null_match->Evaluate(row, schema), Value(true));
-  EXPECT_TRUE(InExpressionExp(ConstantValueExp(Value(3)),
-                              {ConstantValueExp(Value())})
-                  ->Evaluate(&row, schema, &row, schema)
-                  .IsNull());
-  EXPECT_EQ(InExpressionExp(ConstantValueExp(Value(1)),
-                            {ConstantValueExp(Value(1))})
-                ->Evaluate(&row, schema, &row, schema),
-            Value(true));
+  EXPECT_TRUE(
+      InExpressionExp(ConstantValueExp(Value(3)), {ConstantValueExp(Value())})
+          ->Evaluate(&row, schema, &row, schema)
+          .IsNull());
+  EXPECT_EQ(
+      InExpressionExp(ConstantValueExp(Value(1)), {ConstantValueExp(Value(1))})
+          ->Evaluate(&row, schema, &row, schema),
+      Value(true));
 }
 
 TEST(ExpressionTest, InExpression_Inspect_ReturnsStringAndResultType) {
   Row row;
   Schema schema;
-  Expression in = InExpressionExp(
-      ColumnValueExp("x"), {ConstantValueExp(Value(1)),
-                            ConstantValueExp(Value(2))});
+  Expression in =
+      InExpressionExp(ColumnValueExp("x"),
+                      {ConstantValueExp(Value(1)), ConstantValueExp(Value(2))});
 
   EXPECT_EQ(in->Type(), TypeTag::kInExp);
   EXPECT_EQ(in->ToString(), "x IN (1, 2)");
@@ -845,19 +858,44 @@ TEST(ExpressionTest, InExpression_Inspect_ReturnsStringAndResultType) {
   EXPECT_EQ(oss.str(), "x IN (1, 2)");
 }
 
+// Explicit zone offsets name the string's own zone and must be converted to
+// UTC before comparison; treating every offset as UTC conflated instants.
+TEST(ExpressionTest, TimestampStringComparisonAppliesZoneOffsets) {
+  // 00:00+05:30 happens 5.5h BEFORE 00:00Z.
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kEquals,
+                           Value(std::string("2021-01-01 00:00:00+05:30")),
+                           Value(std::string("2021-01-01 00:00:00Z"))),
+            Value(false));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kEquals,
+                           Value(std::string("2021-01-01 00:00:00+05:30")),
+                           Value(std::string("2020-12-31 18:30:00Z"))),
+            Value(true));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kLessThan,
+                           Value(std::string("2021-01-01 00:00:00+05:30")),
+                           Value(std::string("2021-01-01 00:00:00Z"))),
+            Value(true));
+  // A negative offset shifts the other way.
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kEquals,
+                           Value(std::string("2021-01-01 00:00:00-08:00")),
+                           Value(std::string("2021-01-01 08:00:00Z"))),
+            Value(true));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kGreaterThan,
+                           Value(std::string("2021-01-01 00:00:00-08:00")),
+                           Value(std::string("2021-01-01 00:00:00+05:30"))),
+            Value(true));
+}
+
 TEST(ExpressionTest, EvaluateBinary_WithBooleanLogic_FollowsThreeValuedLogic) {
   const Value vtrue(true);
   const Value vfalse(false);
   const Value vnull;
 
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kAnd, vtrue, vtrue), Value(true));
-  EXPECT_EQ(EvaluateBinary(BinaryOperation::kAnd, vfalse, vnull),
-            Value(false));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kAnd, vfalse, vnull), Value(false));
   EXPECT_TRUE(EvaluateBinary(BinaryOperation::kAnd, vnull, vtrue).IsNull());
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kOr, vnull, vtrue), Value(true));
   EXPECT_TRUE(EvaluateBinary(BinaryOperation::kOr, vnull, vfalse).IsNull());
-  EXPECT_EQ(EvaluateBinary(BinaryOperation::kOr, vfalse, vfalse),
-            Value(false));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kOr, vfalse, vfalse), Value(false));
   EXPECT_TRUE(EvaluateBinary(BinaryOperation::kXor, vnull, vtrue).IsNull());
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kXor, vtrue, vfalse), Value(true));
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kXor, vtrue, vtrue), Value(false));
@@ -869,8 +907,9 @@ TEST(ExpressionTest, EvaluateBinary_WithLikePattern_MatchesCorrectly) {
   EXPECT_EQ(
       EvaluateBinary(BinaryOperation::kLike, Value("hello"), Value("h_llo")),
       Value(true));
-  EXPECT_EQ(EvaluateBinary(BinaryOperation::kLike, Value("hello"), Value("h%o")),
-            Value(true));
+  EXPECT_EQ(
+      EvaluateBinary(BinaryOperation::kLike, Value("hello"), Value("h%o")),
+      Value(true));
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kLike, Value("hello"), Value("H%")),
             Value(false));
   EXPECT_EQ(
@@ -888,24 +927,23 @@ TEST(ExpressionTest, EvaluateBinary_WithInvalidOperands_ThrowsOrReturnsNull) {
   EXPECT_THROW(std::ignore = EvaluateBinary(BinaryOperation::kLike, Value(1),
                                             Value("a%")),
                std::runtime_error);
-  EXPECT_THROW(std::ignore = EvaluateBinary(BinaryOperation::kLike, Value("a"),
-                                            Value(1)),
+  EXPECT_THROW(std::ignore =
+                   EvaluateBinary(BinaryOperation::kLike, Value("a"), Value(1)),
                std::runtime_error);
-  EXPECT_THROW(std::ignore = EvaluateBinary(BinaryOperation::kAdd, Value(1),
-                                            Value("a")),
-               std::runtime_error);
-  EXPECT_TRUE(EvaluateBinary(BinaryOperation::kAdd, Value(1), Value())
-                  .IsNull());
+  EXPECT_THROW(
+      std::ignore = EvaluateBinary(BinaryOperation::kAdd, Value(1), Value("a")),
+      std::runtime_error);
+  EXPECT_TRUE(
+      EvaluateBinary(BinaryOperation::kAdd, Value(1), Value()).IsNull());
 }
 
 TEST(ExpressionTest, EvaluateBinary_WithMixedNumeric_ComputesCorrectly) {
   const Value int_val(10);
   const Value double_val(2.5);
 
-  EXPECT_DOUBLE_EQ(
-      EvaluateBinary(BinaryOperation::kAdd, int_val, double_val)
-          .value.double_value,
-      12.5);
+  EXPECT_DOUBLE_EQ(EvaluateBinary(BinaryOperation::kAdd, int_val, double_val)
+                       .value.double_value,
+                   12.5);
   EXPECT_DOUBLE_EQ(
       EvaluateBinary(BinaryOperation::kSubtract, int_val, double_val)
           .value.double_value,
@@ -914,14 +952,12 @@ TEST(ExpressionTest, EvaluateBinary_WithMixedNumeric_ComputesCorrectly) {
       EvaluateBinary(BinaryOperation::kMultiply, double_val, int_val)
           .value.double_value,
       25.0);
-  EXPECT_DOUBLE_EQ(
-      EvaluateBinary(BinaryOperation::kDivide, int_val, double_val)
-          .value.double_value,
-      4.0);
-  EXPECT_DOUBLE_EQ(
-      EvaluateBinary(BinaryOperation::kModulo, int_val, double_val)
-          .value.double_value,
-      0.0);
+  EXPECT_DOUBLE_EQ(EvaluateBinary(BinaryOperation::kDivide, int_val, double_val)
+                       .value.double_value,
+                   4.0);
+  EXPECT_DOUBLE_EQ(EvaluateBinary(BinaryOperation::kModulo, int_val, double_val)
+                       .value.double_value,
+                   0.0);
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kEquals, int_val, double_val),
             Value(false));
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kNotEquals, int_val, double_val),
@@ -939,15 +975,14 @@ TEST(ExpressionTest, EvaluateBinary_WithMixedNumeric_ComputesCorrectly) {
 }
 
 TEST(ExpressionTest, BinaryExpression_ResultType_InfersCorrectType) {
-  Schema int_schema("s", {Column("a", ValueType::kInt64),
-                          Column("b", ValueType::kInt64)});
-  Schema double_schema("s", {Column("a", ValueType::kDouble),
-                             Column("b", ValueType::kInt64)});
+  Schema int_schema(
+      "s", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  Schema double_schema(
+      "s", {Column("a", ValueType::kDouble), Column("b", ValueType::kInt64)});
   Schema varchar_schema("s", {Column("a", ValueType::kVarChar),
                               Column("b", ValueType::kVarChar)});
-  Expression add = BinaryExpressionExp(ColumnValueExp("a"),
-                                       BinaryOperation::kAdd,
-                                       ColumnValueExp("b"));
+  Expression add = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kAdd, ColumnValueExp("b"));
 
   EXPECT_EQ(add->ResultType(int_schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(add->ResultType(double_schema).GetType(), TypeTag::kDouble);
@@ -975,14 +1010,14 @@ TEST(ExpressionTest, BinaryExpression_ResultType_InfersCorrectType) {
             TypeTag::kBigInt);
 }
 
-TEST(ExpressionTest, BinaryExpression_EvaluateWithTwoSchemas_ResolvesBothSchemas) {
+TEST(ExpressionTest,
+     BinaryExpression_EvaluateWithTwoSchemas_ResolvesBothSchemas) {
   Schema left_schema("l", {Column("a", ValueType::kInt64)});
   Schema right_schema("r", {Column("b", ValueType::kInt64)});
   Row left_row({Value(1)});
   Row right_row({Value(2)});
-  Expression expr = BinaryExpressionExp(ColumnValueExp("a"),
-                                        BinaryOperation::kAdd,
-                                        ColumnValueExp("b"));
+  Expression expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kAdd, ColumnValueExp("b"));
 
   EXPECT_EQ(expr->Evaluate(&left_row, left_schema, &right_row, right_schema),
             Value(3));
@@ -1025,9 +1060,8 @@ TEST(ExpressionTest, FunctionCall_Substr_EvaluatesCorrectly) {
   Expression substr2 = FunctionCallExp(
       "substr", {ConstantValueExp(Value("hello")), ConstantValueExp(Value(2))});
   Expression substring3 = FunctionCallExp(
-      "substring",
-      {ConstantValueExp(Value("hello")), ConstantValueExp(Value(2)),
-       ConstantValueExp(Value(3))});
+      "substring", {ConstantValueExp(Value("hello")),
+                    ConstantValueExp(Value(2)), ConstantValueExp(Value(3))});
   Expression substr_start_one = FunctionCallExp(
       "substr", {ConstantValueExp(Value("hello")), ConstantValueExp(Value(1)),
                  ConstantValueExp(Value(2))});
@@ -1035,8 +1069,7 @@ TEST(ExpressionTest, FunctionCall_Substr_EvaluatesCorrectly) {
       "substr",
       {ConstantValueExp(Value("hello")), ConstantValueExp(Value(99))});
   Expression substr_null = FunctionCallExp(
-      "substr",
-      {ConstantValueExp(Value("hello")), ConstantValueExp(Value())});
+      "substr", {ConstantValueExp(Value("hello")), ConstantValueExp(Value())});
 
   EXPECT_EQ(substr2->Evaluate(row, schema), Value("ello"));
   EXPECT_EQ(substring3->Evaluate(row, schema), Value("ell"));
@@ -1046,11 +1079,10 @@ TEST(ExpressionTest, FunctionCall_Substr_EvaluatesCorrectly) {
   EXPECT_THROW(FunctionCallExp("substr", {ConstantValueExp(Value("hello"))})
                    ->Evaluate(row, schema),
                std::runtime_error);
-  EXPECT_THROW(
-      FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
-                                 ConstantValueExp(Value("x"))})
-          ->Evaluate(row, schema),
-      std::runtime_error);
+  EXPECT_THROW(FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
+                                          ConstantValueExp(Value("x"))})
+                   ->Evaluate(row, schema),
+               std::runtime_error);
 
   Expression substr_negative_length = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(1)),
@@ -1065,15 +1097,14 @@ TEST(ExpressionTest, FunctionCall_Substr_EvaluatesCorrectly) {
   Expression substr_start_zero = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(0))});
   EXPECT_EQ(substr_start_zero->Evaluate(row, schema), Value("abc"));
-  // Fixed: a negative start counts from the end (GoogleSQL); -5 on "abc"
-  // points before the first character, yielding an empty string.
-  Expression substr_start_negative =
-      FunctionCallExp("substr", {ConstantValueExp(Value("abc")),
-                                 ConstantValueExp(Value(-5))});
-  EXPECT_EQ(substr_start_negative->Evaluate(row, schema), Value(std::string()));
-  Expression substr_start_negative_tail =
-      FunctionCallExp("substr", {ConstantValueExp(Value("abcde")),
-                                 ConstantValueExp(Value(-2))});
+  // A negative start counts from the end (GoogleSQL); -5 on "abc" lands
+  // before the first character, so the result starts at the first byte.
+  Expression substr_start_negative = FunctionCallExp(
+      "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(-5))});
+  EXPECT_EQ(substr_start_negative->Evaluate(row, schema), Value("abc"));
+  Expression substr_start_negative_tail = FunctionCallExp(
+      "substr",
+      {ConstantValueExp(Value("abcde")), ConstantValueExp(Value(-2))});
   EXPECT_EQ(substr_start_negative_tail->Evaluate(row, schema), Value("de"));
   EXPECT_EQ(substr2->ToString(), "substr(\"hello\", 2)");
 
@@ -1090,10 +1121,10 @@ TEST(ExpressionTest, FunctionCall_Extract_EvaluatesCorrectly) {
       "extract_year", {ConstantValueExp(Value::Date("1996-07-15"))});
   Expression month = FunctionCallExp(
       "extract_month", {ConstantValueExp(Value::Date("1996-07-15"))});
-  Expression day = FunctionCallExp(
-      "extract_day", {ConstantValueExp(Value("1996-07-15"))});
-  Expression null_extract = FunctionCallExp(
-      "extract_year", {ConstantValueExp(Value())});
+  Expression day =
+      FunctionCallExp("extract_day", {ConstantValueExp(Value("1996-07-15"))});
+  Expression null_extract =
+      FunctionCallExp("extract_year", {ConstantValueExp(Value())});
 
   EXPECT_EQ(year->Evaluate(row, schema), Value(1996));
   EXPECT_EQ(month->Evaluate(row, schema), Value(7));
@@ -1101,30 +1132,28 @@ TEST(ExpressionTest, FunctionCall_Extract_EvaluatesCorrectly) {
   EXPECT_TRUE(null_extract->Evaluate(row, schema).IsNull());
   EXPECT_THROW(FunctionCallExp("extract_year", {})->Evaluate(row, schema),
                std::runtime_error);
-  EXPECT_THROW(FunctionCallExp("extract_year",
-                               {ConstantValueExp(Value("bad"))})
+  EXPECT_THROW(FunctionCallExp("extract_year", {ConstantValueExp(Value("bad"))})
                    ->Evaluate(row, schema),
                std::runtime_error);
 }
 
-TEST(ExpressionTest, FunctionCall_CurrentTimestampAndResultType_EvaluatesAndInfersType) {
+TEST(ExpressionTest,
+     FunctionCall_CurrentTimestampAndResultType_EvaluatesAndInfersType) {
   Row row;
   Schema schema;
 
-  EXPECT_EQ(FunctionCallExp("current_timestamp", {})
-                ->Evaluate(row, schema)
-                .type,
-            ValueType::kVarChar);
-  EXPECT_THROW(FunctionCallExp("current_timestamp",
-                               {ConstantValueExp(Value(1))})
-                   ->Evaluate(row, schema),
-               std::runtime_error);
+  EXPECT_EQ(
+      FunctionCallExp("current_timestamp", {})->Evaluate(row, schema).type,
+      ValueType::kVarChar);
+  EXPECT_THROW(
+      FunctionCallExp("current_timestamp", {ConstantValueExp(Value(1))})
+          ->Evaluate(row, schema),
+      std::runtime_error);
   EXPECT_THROW(FunctionCallExp("unknown_func", {})->Evaluate(row, schema),
                std::runtime_error);
   EXPECT_EQ(FunctionCallExp("unknown_func", {})->ToString(), "unknown_func()");
-  EXPECT_EQ(FunctionCallExp("COALESCE",
-                            {ConstantValueExp(Value(1)),
-                             ConstantValueExp(Value(2))})
+  EXPECT_EQ(FunctionCallExp("COALESCE", {ConstantValueExp(Value(1)),
+                                         ConstantValueExp(Value(2))})
                 ->AsFunctionCallExpression()
                 .FuncName(),
             "coalesce");
@@ -1136,35 +1165,32 @@ TEST(ExpressionTest, FunctionCall_CurrentTimestampAndResultType_EvaluatesAndInfe
             TypeTag::kVarChar);
   EXPECT_EQ(FunctionCallExp("substr", {})->ResultType(schema).GetType(),
             TypeTag::kVarChar);
-  EXPECT_EQ(FunctionCallExp("current_timestamp", {})
-                ->ResultType(schema)
-                .GetType(),
-            TypeTag::kVarChar);
-  EXPECT_EQ(FunctionCallExp("extract_year", {})
-                ->ResultType(schema)
-                .GetType(),
+  EXPECT_EQ(
+      FunctionCallExp("current_timestamp", {})->ResultType(schema).GetType(),
+      TypeTag::kVarChar);
+  EXPECT_EQ(FunctionCallExp("extract_year", {})->ResultType(schema).GetType(),
             TypeTag::kBigInt);
   EXPECT_EQ(FunctionCallExp("unknown_func", {})->ResultType(schema).GetType(),
             TypeTag::kVarChar);
-  EXPECT_EQ(FunctionCallExp("coalesce", {ColumnValueExp("x"),
-                                         ColumnValueExp("y")})
-                ->TouchedColumns()
-                .size(),
-            2);
+  EXPECT_EQ(
+      FunctionCallExp("coalesce", {ColumnValueExp("x"), ColumnValueExp("y")})
+          ->TouchedColumns()
+          .size(),
+      2);
 }
 
 TEST(ExpressionTest, FunctionCall_DateAddSub_EvaluatesCorrectly) {
   Row row;
   Schema schema;
-  Expression date_add = FunctionCallExp(
-      "date_add", {ConstantValueExp(Value::Date("1994-01-01")),
-                   IntervalExpressionExp(1, "year")});
-  Expression date_sub = FunctionCallExp(
-      "date_sub", {ConstantValueExp(Value("1998-12-01")),
-                   IntervalExpressionExp(74, "day")});
-  Expression date_add_4 = FunctionCallExp(
-      "date_add", {ConstantValueExp(Value("1994-01-01")),
-                   IntervalExpressionExp(1, "year")});
+  Expression date_add =
+      FunctionCallExp("date_add", {ConstantValueExp(Value::Date("1994-01-01")),
+                                   IntervalExpressionExp(1, "year")});
+  Expression date_sub =
+      FunctionCallExp("date_sub", {ConstantValueExp(Value("1998-12-01")),
+                                   IntervalExpressionExp(74, "day")});
+  Expression date_add_4 =
+      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
+                                   IntervalExpressionExp(1, "year")});
   Expression date_add_null = FunctionCallExp(
       "date_add", {ConstantValueExp(Value()), IntervalExpressionExp(1, "day")});
 
@@ -1177,11 +1203,11 @@ TEST(ExpressionTest, FunctionCall_DateAddSub_EvaluatesCorrectly) {
       FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
           ->Evaluate(row, schema),
       std::runtime_error);
-  EXPECT_THROW(FunctionCallExp("date_add",
-                               {ConstantValueExp(Value("1994-01-01")),
-                                ConstantValueExp(Value(1))})
-                   ->Evaluate(row, schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
+                                   ConstantValueExp(Value(1))})
+          ->Evaluate(row, schema),
+      std::runtime_error);
 }
 
 TEST(ExpressionTest, ColumnValue_CaseInsensitiveLookup_ResolvesColumn) {
@@ -1218,19 +1244,21 @@ TEST(ExpressionTest, ColumnValue_EvaluateWithTwoSchemas_ResolvesCorrectSchema) {
   Row left_row({Value(1)});
   Row right_row({Value("two")});
 
-  EXPECT_EQ(ColumnValueExp("a")
-                ->Evaluate(&left_row, left_schema, &right_row, right_schema),
+  EXPECT_EQ(ColumnValueExp("a")->Evaluate(&left_row, left_schema, &right_row,
+                                          right_schema),
             Value(1));
-  EXPECT_EQ(ColumnValueExp("b")
-                ->Evaluate(&left_row, left_schema, &right_row, right_schema),
+  EXPECT_EQ(ColumnValueExp("b")->Evaluate(&left_row, left_schema, &right_row,
+                                          right_schema),
             Value("two"));
-  EXPECT_THROW(ColumnValueExp("zzz")
-                   ->Evaluate(&left_row, left_schema, &right_row, right_schema),
+  EXPECT_THROW(ColumnValueExp("zzz")->Evaluate(&left_row, left_schema,
+                                               &right_row, right_schema),
                std::runtime_error);
-  EXPECT_EQ(ColumnValueExp("b")->ResultType(left_schema, right_schema).GetType(),
-            TypeTag::kVarChar);
-  EXPECT_EQ(ColumnValueExp("a")->ResultType(left_schema, right_schema).GetType(),
-            TypeTag::kBigInt);
+  EXPECT_EQ(
+      ColumnValueExp("b")->ResultType(left_schema, right_schema).GetType(),
+      TypeTag::kVarChar);
+  EXPECT_EQ(
+      ColumnValueExp("a")->ResultType(left_schema, right_schema).GetType(),
+      TypeTag::kBigInt);
   EXPECT_THROW(ColumnValueExp("zzz")->ResultType(left_schema, right_schema),
                std::runtime_error);
 }
@@ -1252,18 +1280,19 @@ TEST(ExpressionTest, ColumnValue_Accessors_ReturnExpectedProperties) {
   EXPECT_EQ(oss.str(), "schema.col");
 }
 
-TEST(ExpressionTest, UnaryExpression_WithInvalidOrNullOperands_HandlesCorrectly) {
+TEST(ExpressionTest,
+     UnaryExpression_WithInvalidOrNullOperands_HandlesCorrectly) {
   Row row;
   Schema schema;
 
-  EXPECT_TRUE(UnaryExpressionExp(ConstantValueExp(Value()),
-                                 UnaryOperation::kMinus)
-                  ->Evaluate(row, schema)
-                  .IsNull());
-  EXPECT_THROW(UnaryExpressionExp(ConstantValueExp(Value("x")),
-                                  UnaryOperation::kMinus)
-                   ->Evaluate(row, schema),
-               std::runtime_error);
+  EXPECT_TRUE(
+      UnaryExpressionExp(ConstantValueExp(Value()), UnaryOperation::kMinus)
+          ->Evaluate(row, schema)
+          .IsNull());
+  EXPECT_THROW(
+      UnaryExpressionExp(ConstantValueExp(Value("x")), UnaryOperation::kMinus)
+          ->Evaluate(row, schema),
+      std::runtime_error);
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kMinus, Value(5)), Value(-5));
   EXPECT_DOUBLE_EQ(
       EvaluateUnary(UnaryOperation::kMinus, Value(2.5)).value.double_value,
@@ -1271,21 +1300,19 @@ TEST(ExpressionTest, UnaryExpression_WithInvalidOrNullOperands_HandlesCorrectly)
   EXPECT_TRUE(EvaluateUnary(UnaryOperation::kMinus, Value()).IsNull());
   EXPECT_TRUE(EvaluateUnary(UnaryOperation::kNot, Value()).IsNull());
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kIsNull, Value(1)), Value(false));
-  EXPECT_EQ(EvaluateUnary(UnaryOperation::kIsNotNull, Value()),
-            Value(false));
+  EXPECT_EQ(EvaluateUnary(UnaryOperation::kIsNotNull, Value()), Value(false));
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kNot, Value(true)), Value(false));
 }
 
 TEST(ExpressionTest, UnaryExpression_ResultType_InfersCorrectType) {
-  Schema schema("s", {Column("v", ValueType::kInt64),
-                      Column("d", ValueType::kDouble)});
+  Schema schema(
+      "s", {Column("v", ValueType::kInt64), Column("d", ValueType::kDouble)});
 
   EXPECT_EQ(UnaryExpressionExp(ColumnValueExp("v"), UnaryOperation::kIsNull)
                 ->ResultType(schema)
                 .GetType(),
             TypeTag::kBigInt);
-  EXPECT_EQ(UnaryExpressionExp(ColumnValueExp("v"),
-                               UnaryOperation::kIsNotNull)
+  EXPECT_EQ(UnaryExpressionExp(ColumnValueExp("v"), UnaryOperation::kIsNotNull)
                 ->ResultType(schema)
                 .GetType(),
             TypeTag::kBigInt);
@@ -1306,10 +1333,10 @@ TEST(ExpressionTest, UnaryExpression_ResultType_InfersCorrectType) {
 TEST(ExpressionTest, UnaryExpression_Inspect_ReturnsStringAndDump) {
   Row row;
   Schema schema;
-  Expression minus = UnaryExpressionExp(ColumnValueExp("x"),
-                                        UnaryOperation::kMinus);
-  Expression not_exp = UnaryExpressionExp(ColumnValueExp("x"),
-                                          UnaryOperation::kNot);
+  Expression minus =
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kMinus);
+  Expression not_exp =
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kNot);
 
   EXPECT_EQ(minus->ToString(), "(-x)");
   EXPECT_EQ(not_exp->ToString(), "(NOT x)");
@@ -1325,8 +1352,7 @@ TEST(ExpressionTest, UnaryExpression_Inspect_ReturnsStringAndDump) {
   EXPECT_EQ(minus->Type(), TypeTag::kUnaryExp);
   EXPECT_EQ(minus->TouchedColumns().size(), 1);
   EXPECT_EQ(minus->AsUnaryExpression().Op(), UnaryOperation::kMinus);
-  EXPECT_EQ(minus->AsUnaryExpression().Child()->Type(),
-            TypeTag::kColumnValue);
+  EXPECT_EQ(minus->AsUnaryExpression().Child()->Type(), TypeTag::kColumnValue);
 
   Schema schema2("s", {Column("x", ValueType::kInt64)});
   Row row2({Value(7)});
@@ -1339,9 +1365,9 @@ TEST(ExpressionTest, ExpressionBase_DynamicCasts_CastSuccessfully) {
   Expression column = ColumnValueExp("c");
   EXPECT_NO_THROW((void)column->AsColumnValue());
 
-  Expression binary = BinaryExpressionExp(ConstantValueExp(Value(1)),
-                                          BinaryOperation::kAdd,
-                                          ConstantValueExp(Value(2)));
+  Expression binary =
+      BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(2)));
   EXPECT_NO_THROW((void)binary->AsBinaryExpression());
 
   Expression constant = ConstantValueExp(Value(1));
@@ -1354,8 +1380,8 @@ TEST(ExpressionTest, ExpressionBase_DynamicCasts_CastSuccessfully) {
       AggregateExpressionExp(AggregationType::kCount, constant);
   EXPECT_NO_THROW((void)aggregate->AsAggregateExpression());
 
-  Expression case_exp = CaseExpressionExp(
-      {{ConstantValueExp(Value(true)), constant}}, constant);
+  Expression case_exp =
+      CaseExpressionExp({{ConstantValueExp(Value(true)), constant}}, constant);
   EXPECT_NO_THROW((void)case_exp->AsCaseExpression());
 
   Expression in = InExpressionExp(constant, {constant});
@@ -1367,8 +1393,8 @@ TEST(ExpressionTest, ExpressionBase_DynamicCasts_CastSuccessfully) {
   Expression interval = IntervalExpressionExp(1, "day");
   EXPECT_NO_THROW((void)interval->AsIntervalExpression());
 
-  Expression query = QueryExpressionExp(
-      std::shared_ptr<SelectStatement>(), constant);
+  Expression query =
+      QueryExpressionExp(std::shared_ptr<SelectStatement>(), constant);
   EXPECT_NO_THROW((void)query->AsQueryExpression());
 }
 
@@ -1399,27 +1425,27 @@ TEST(ExpressionTest, NamedExpression_OutputOperator_StreamsExpectedFormat) {
 }
 
 TEST(ExpressionTest, FunctionCall_EvaluateWithTwoRows_ResolvesBothRows) {
-  Schema left("", {Column("x", ValueType::kVarChar),
-                   Column("b", ValueType::kInt64)});
+  Schema left(
+      "", {Column("x", ValueType::kVarChar), Column("b", ValueType::kInt64)});
   Row left_row({Value("hello"), Value(2)});
   Schema right("", {Column("d", ValueType::kVarChar)});
   Row right_row({Value("1996-07-15")});
 
-  EXPECT_EQ(FunctionCallExp("coalesce",
-                            {ColumnValueExp("d"), ColumnValueExp("x")})
-                ->Evaluate(&left_row, left, &right_row, right),
-            Value("1996-07-15"));
+  EXPECT_EQ(
+      FunctionCallExp("coalesce", {ColumnValueExp("d"), ColumnValueExp("x")})
+          ->Evaluate(&left_row, left, &right_row, right),
+      Value("1996-07-15"));
   EXPECT_EQ(FunctionCallExp("extract_day", {ColumnValueExp("d")})
                 ->Evaluate(&left_row, left, &right_row, right),
             Value(15));
-  EXPECT_EQ(FunctionCallExp("substr",
-                            {ColumnValueExp("x"), ColumnValueExp("b")})
-                ->Evaluate(&left_row, left, &right_row, right),
-            Value("ello"));
-  EXPECT_EQ(FunctionCallExp("concat",
-                            {ColumnValueExp("x"), ColumnValueExp("x")})
-                ->Evaluate(&left_row, left, &right_row, right),
-            Value("hellohello"));
+  EXPECT_EQ(
+      FunctionCallExp("substr", {ColumnValueExp("x"), ColumnValueExp("b")})
+          ->Evaluate(&left_row, left, &right_row, right),
+      Value("ello"));
+  EXPECT_EQ(
+      FunctionCallExp("concat", {ColumnValueExp("x"), ColumnValueExp("x")})
+          ->Evaluate(&left_row, left, &right_row, right),
+      Value("hellohello"));
   EXPECT_EQ(FunctionCallExp("current_timestamp", {})
                 ->Evaluate(&left_row, left, &right_row, right)
                 .type,
@@ -1427,15 +1453,15 @@ TEST(ExpressionTest, FunctionCall_EvaluateWithTwoRows_ResolvesBothRows) {
 }
 
 TEST(ExpressionTest, FunctionCall_ResultTypeWithTwoSchemas_InfersCorrectType) {
-  Schema left("", {Column("i", ValueType::kInt64),
-                   Column("v", ValueType::kVarChar)});
+  Schema left(
+      "", {Column("i", ValueType::kInt64), Column("v", ValueType::kVarChar)});
   Schema right("", {Column("v", ValueType::kVarChar)});
 
-  EXPECT_EQ(FunctionCallExp("coalesce",
-                            {ColumnValueExp("i"), ColumnValueExp("v")})
-                ->ResultType(left, right)
-                .GetType(),
-            TypeTag::kBigInt);
+  EXPECT_EQ(
+      FunctionCallExp("coalesce", {ColumnValueExp("i"), ColumnValueExp("v")})
+          ->ResultType(left, right)
+          .GetType(),
+      TypeTag::kBigInt);
   EXPECT_EQ(FunctionCallExp("concat", {})->ResultType(left, right).GetType(),
             TypeTag::kVarChar);
   EXPECT_EQ(FunctionCallExp("substr", {})->ResultType(left, right).GetType(),
@@ -1460,19 +1486,20 @@ TEST(ExpressionTest, FunctionCall_ResultTypeWithTwoSchemas_InfersCorrectType) {
                 ->ResultType(left, right)
                 .GetType(),
             TypeTag::kBigInt);
-  EXPECT_EQ(FunctionCallExp("unknown_func", {})->ResultType(left, right).GetType(),
-            TypeTag::kVarChar);
+  EXPECT_EQ(
+      FunctionCallExp("unknown_func", {})->ResultType(left, right).GetType(),
+      TypeTag::kVarChar);
 }
 
-TEST(ExpressionTest, FunctionCall_WithNestedFunctions_TouchesAllColumnsAndRendersString) {
+TEST(ExpressionTest,
+     FunctionCall_WithNestedFunctions_TouchesAllColumnsAndRendersString) {
   Row row;
   Schema schema;
 
   Expression nested = FunctionCallExp(
-      "concat",
-      {FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
-                                  ConstantValueExp(Value(2))}),
-       ConstantValueExp(Value("!"))});
+      "concat", {FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
+                                            ConstantValueExp(Value(2))}),
+                 ConstantValueExp(Value("!"))});
 
   EXPECT_EQ(nested->Evaluate(row, schema), Value("ello!"));
   EXPECT_EQ(nested->ToString(), "concat(substr(\"hello\", 2), \"!\")");
@@ -1487,30 +1514,33 @@ TEST(ExpressionTest, FunctionCall_WithNestedFunctions_TouchesAllColumnsAndRender
   EXPECT_EQ(substring3->ToString(), "substring(\"hello\", 2, 3)");
 
   Expression columns = FunctionCallExp(
-      "coalesce",
-      {ColumnValueExp("a"),
-       FunctionCallExp("substr", {ColumnValueExp("b"),
-                                  ConstantValueExp(Value(1))})});
+      "coalesce", {ColumnValueExp("a"),
+                   FunctionCallExp("substr", {ColumnValueExp("b"),
+                                              ConstantValueExp(Value(1))})});
 
   EXPECT_EQ(columns->TouchedColumns().size(), 2);
   EXPECT_EQ(columns->Type(), TypeTag::kFunctionCallExp);
 }
 
-TEST(ExpressionTest, FunctionCall_DateAddSubWithInvalidArgs_ThrowsRuntimeError) {
+TEST(ExpressionTest,
+     FunctionCall_DateAddSubWithInvalidArgs_ThrowsRuntimeError) {
   Row row;
   Schema schema;
 
-  EXPECT_THROW(FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
-                                            ConstantValueExp(Value(1))})
-                   ->Evaluate(&row, schema, &row, schema),
-               std::runtime_error);
-  EXPECT_THROW(FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
-                   ->Evaluate(&row, schema, &row, schema),
-               std::runtime_error);
-  EXPECT_THROW(FunctionCallExp("date_sub", {ConstantValueExp(Value("1998-12-01")),
-                                            ConstantValueExp(Value(1))})
-                   ->Evaluate(&row, schema, &row, schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
+                                   ConstantValueExp(Value(1))})
+          ->Evaluate(&row, schema, &row, schema),
+      std::runtime_error);
+  EXPECT_THROW(
+      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
+          ->Evaluate(&row, schema, &row, schema),
+      std::runtime_error);
+  EXPECT_THROW(
+      FunctionCallExp("date_sub", {ConstantValueExp(Value("1998-12-01")),
+                                   ConstantValueExp(Value(1))})
+          ->Evaluate(&row, schema, &row, schema),
+      std::runtime_error);
 }
 
 class FakeEvaluationContext : public EvaluationContext {
@@ -1519,15 +1549,15 @@ class FakeEvaluationContext : public EvaluationContext {
   explicit FakeEvaluationContext(std::vector<std::vector<Value>> results)
       : results_(std::move(results)) {}
 
-  StatusOr<std::vector<Value>> RunSubquery(const SelectStatement&,
-                                           const Row*) override {
+  StatusOr<std::vector<Value>> RunSubquery(const SelectStatement& /*statement*/,
+                                           const Row* /*outer_row*/) override {
     ++subquery_calls_;
     if (next_result_ < results_.size()) {
-      return StatusOr<std::vector<Value>>(results_[next_result_++]);
+      return {results_[next_result_++]};
     }
-    return StatusOr<std::vector<Value>>(std::vector<Value>{});
+    return {std::vector<Value>{}};
   }
-  const AggregateResultMap* CurrentAggregates() const override {
+  [[nodiscard]] const AggregateResultMap* CurrentAggregates() const override {
     return nullptr;
   }
   Status GetOrAddFunction(std::string_view name, int argument_count) override {
@@ -1546,8 +1576,8 @@ class FakeEvaluationContext : public EvaluationContext {
 
 TEST(ExpressionTest, FunctionCall_Validate_RegistersThroughEvaluationContext) {
   Schema schema("s", {Column("a", ValueType::kVarChar)});
-  Expression concat =
-      FunctionCallExp("concat", {ColumnValueExp("a"), ConstantValueExp(Value("x"))});
+  Expression concat = FunctionCallExp(
+      "concat", {ColumnValueExp("a"), ConstantValueExp(Value("x"))});
 
   FakeEvaluationContext ctx;
   EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
@@ -1576,8 +1606,8 @@ TEST(ExpressionTest, QueryExpression_EvaluateWithContext_ExecutesSubquery) {
   Schema schema("s", {Column("i", ValueType::kInt64)});
   Row row({Value(int64_t{7})});
   auto statement = std::make_shared<SelectStatement>(
-      std::vector<NamedExpression>{NamedExpression("v")}, std::vector<std::string>{"t"},
-      nullptr);
+      std::vector<NamedExpression>{NamedExpression("v")},
+      std::vector<std::string>{"t"}, nullptr);
 
   FakeEvaluationContext empty_ctx;
   const Expression exists_empty =
@@ -1590,8 +1620,7 @@ TEST(ExpressionTest, QueryExpression_EvaluateWithContext_ExecutesSubquery) {
 
   FakeEvaluationContext filled_ctx({{Value(int64_t{7}), Value(int64_t{9})},
                                     {Value(int64_t{7}), Value(int64_t{9})}});
-  const Expression exists =
-      QueryExpressionExp(statement, nullptr, true, false);
+  const Expression exists = QueryExpressionExp(statement, nullptr, true, false);
   EXPECT_EQ(exists->Evaluate(row, schema, filled_ctx), Value(true));
   const Expression not_exists =
       QueryExpressionExp(statement, nullptr, true, true);
@@ -1609,15 +1638,14 @@ TEST(ExpressionTest, QueryExpression_EvaluateWithContext_ExecutesSubquery) {
   EXPECT_EQ(in_subquery->Evaluate(row, schema, hit_ctx), Value(true));
   const Expression miss_subquery = QueryExpressionExp(
       statement, ConstantValueExp(Value(int64_t{8})), false, false);
-  FakeEvaluationContext null_list_ctx({{Value(int64_t{1}), Value()},
-                                       {Value(int64_t{1}), Value()}});
+  FakeEvaluationContext null_list_ctx(
+      {{Value(int64_t{1}), Value()}, {Value(int64_t{1}), Value()}});
   EXPECT_EQ(miss_subquery->Evaluate(row, schema, null_list_ctx), Value());
-  FakeEvaluationContext plain_miss_ctx({{Value(int64_t{1})},
-                                        {Value(int64_t{1})}});
-  EXPECT_EQ(miss_subquery->Evaluate(row, schema, plain_miss_ctx),
-            Value(false));
-  const Expression null_test_subquery = QueryExpressionExp(
-      statement, ConstantValueExp(Value()), false, false);
+  FakeEvaluationContext plain_miss_ctx(
+      {{Value(int64_t{1})}, {Value(int64_t{1})}});
+  EXPECT_EQ(miss_subquery->Evaluate(row, schema, plain_miss_ctx), Value(false));
+  const Expression null_test_subquery =
+      QueryExpressionExp(statement, ConstantValueExp(Value()), false, false);
   FakeEvaluationContext fresh_ctx({{Value(int64_t{1})}});
   EXPECT_EQ(null_test_subquery->Evaluate(row, schema, fresh_ctx), Value());
 
@@ -1644,18 +1672,20 @@ TEST(ExpressionTest, Expression_EvaluateWithContext_MatchesPlainEvaluator) {
                             ConstantValueExp(Value(int64_t{3}))),
         ConstantValueExp(Value(int64_t{10}))}},
       ConstantValueExp(Value(int64_t{20})));
-  const Expression in_expr =
-      InExpressionExp(ColumnValueExp("i"), {ConstantValueExp(Value(int64_t{4})),
-                                            ConstantValueExp(Value(int64_t{5}))});
-  const Expression call =
-      FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
-                                 ConstantValueExp(Value(int64_t{2}))});
+  const Expression in_expr = InExpressionExp(
+      ColumnValueExp("i"), {ConstantValueExp(Value(int64_t{4})),
+                            ConstantValueExp(Value(int64_t{5}))});
+  const Expression call = FunctionCallExp(
+      "substr",
+      {ConstantValueExp(Value("hello")), ConstantValueExp(Value(int64_t{2}))});
 
   EXPECT_EQ(binary->Evaluate(row, schema, ctx), binary->Evaluate(row, schema));
-  EXPECT_EQ(negated->Evaluate(row, schema, ctx), negated->Evaluate(row, schema));
+  EXPECT_EQ(negated->Evaluate(row, schema, ctx),
+            negated->Evaluate(row, schema));
   EXPECT_EQ(case_expr->Evaluate(row, schema, ctx),
             case_expr->Evaluate(row, schema));
-  EXPECT_EQ(in_expr->Evaluate(row, schema, ctx), in_expr->Evaluate(row, schema));
+  EXPECT_EQ(in_expr->Evaluate(row, schema, ctx),
+            in_expr->Evaluate(row, schema));
   EXPECT_EQ(call->Evaluate(row, schema, ctx), call->Evaluate(row, schema));
 }
 
@@ -1684,7 +1714,8 @@ TEST(ExpressionTest, CastExpression_EvaluateAndResultType_HandlesTimestamps) {
   EXPECT_EQ(ts_cast->Evaluate(dummy, dummy_schema, ctx),
             ts_cast->Evaluate(dummy, dummy_schema));
   EXPECT_EQ(ts_cast->ResultType(dummy_schema).GetType(), TypeTag::kVarChar);
-  EXPECT_EQ(ts_cast->ResultType(dummy_schema, dummy_schema).GetType(), TypeTag::kVarChar);
+  EXPECT_EQ(ts_cast->ResultType(dummy_schema, dummy_schema).GetType(),
+            TypeTag::kVarChar);
   EXPECT_FALSE(ts_cast->ToString().empty());
 }
 
@@ -1701,15 +1732,17 @@ TEST(ExpressionTest, BinaryExpression_SpecialOperations_EvaluatesCorrectly) {
       ConstantValueExp(Value("world")));
   EXPECT_EQ(like_nomatch->Evaluate(dummy, dummy_schema), Value(false));
 
-  Expression div_nan = BinaryExpressionExp(
-      ConstantValueExp(Value(0.0)), BinaryOperation::kDivide,
-      ConstantValueExp(Value(0)));
-  EXPECT_THROW((void)div_nan->Evaluate(dummy, dummy_schema), std::runtime_error);
+  Expression div_nan =
+      BinaryExpressionExp(ConstantValueExp(Value(0.0)),
+                          BinaryOperation::kDivide, ConstantValueExp(Value(0)));
+  EXPECT_THROW((void)div_nan->Evaluate(dummy, dummy_schema),
+               std::runtime_error);
 
-  Expression div_mixed = BinaryExpressionExp(
-      ConstantValueExp(Value(10)), BinaryOperation::kDivide,
-      ConstantValueExp(Value(2.0)));
-  EXPECT_DOUBLE_EQ(div_mixed->Evaluate(dummy, dummy_schema).value.double_value, 5.0);
+  Expression div_mixed =
+      BinaryExpressionExp(ConstantValueExp(Value(10)), BinaryOperation::kDivide,
+                          ConstantValueExp(Value(2.0)));
+  EXPECT_DOUBLE_EQ(div_mixed->Evaluate(dummy, dummy_schema).value.double_value,
+                   5.0);
 
   Expression mult_iv = BinaryExpressionExp(
       ConstantValueExp(Value(int64_t{3})), BinaryOperation::kMultiply,
@@ -1718,32 +1751,37 @@ TEST(ExpressionTest, BinaryExpression_SpecialOperations_EvaluatesCorrectly) {
 
   Expression date_cmp = BinaryExpressionExp(
       ConstantValueExp(Value("2023-01-01")), BinaryOperation::kEquals,
-      ConstantValueExp(Value(Value::DateFromDays(ParseDateDays("2023-01-01")))));
+      ConstantValueExp(
+          Value(Value::DateFromDays(ParseDateDays("2023-01-01")))));
   EXPECT_EQ(date_cmp->Evaluate(dummy, dummy_schema), Value(true));
 
   Expression div_zero_double = BinaryExpressionExp(
       ConstantValueExp(Value(1.0)), BinaryOperation::kDivide,
       ConstantValueExp(Value(0.0)));
-  EXPECT_THROW((void)div_zero_double->Evaluate(dummy, dummy_schema), std::runtime_error);
+  EXPECT_THROW((void)div_zero_double->Evaluate(dummy, dummy_schema),
+               std::runtime_error);
 
   Expression div_overflow_double = BinaryExpressionExp(
       ConstantValueExp(Value(std::numeric_limits<double>::max())),
-      BinaryOperation::kDivide,
-      ConstantValueExp(Value(1e-300)));
-  EXPECT_THROW((void)div_overflow_double->Evaluate(dummy, dummy_schema), std::runtime_error);
+      BinaryOperation::kDivide, ConstantValueExp(Value(1e-300)));
+  EXPECT_THROW((void)div_overflow_double->Evaluate(dummy, dummy_schema),
+               std::runtime_error);
 
-  Expression and_short = BinaryExpressionExp(
-      ConstantValueExp(Value(false)), BinaryOperation::kAnd,
-      ColumnValueExp("unresolved"));
-  EXPECT_EQ(and_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema), Value(false));
+  Expression and_short =
+      BinaryExpressionExp(ConstantValueExp(Value(false)), BinaryOperation::kAnd,
+                          ColumnValueExp("unresolved"));
+  EXPECT_EQ(and_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema),
+            Value(false));
 
-  Expression or_short = BinaryExpressionExp(
-      ConstantValueExp(Value(true)), BinaryOperation::kOr,
-      ColumnValueExp("unresolved"));
-  EXPECT_EQ(or_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema), Value(true));
+  Expression or_short =
+      BinaryExpressionExp(ConstantValueExp(Value(true)), BinaryOperation::kOr,
+                          ColumnValueExp("unresolved"));
+  EXPECT_EQ(or_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema),
+            Value(true));
 }
 
-TEST(ExpressionTest, ArrayExpression_EvaluateAndResultType_HandlesVariousTypes) {
+TEST(ExpressionTest,
+     ArrayExpression_EvaluateAndResultType_HandlesVariousTypes) {
   Row dummy({});
   Schema dummy_schema;
 
@@ -1762,38 +1800,39 @@ TEST(ExpressionTest, ArrayExpression_EvaluateAndResultType_HandlesVariousTypes) 
   EXPECT_TRUE(v_dbl.IsArray());
 
   auto arr_date = std::make_shared<ArrayExpression>(
-      std::vector<Expression>{ConstantValueExp(Value(Value::DateFromDays(ParseDateDays("2023-01-01"))))},
+      std::vector<Expression>{ConstantValueExp(
+          Value(Value::DateFromDays(ParseDateDays("2023-01-01"))))},
       "");
   Value v_date = arr_date->Evaluate(dummy, dummy_schema);
   EXPECT_TRUE(v_date.IsArray());
 
   auto arr_bool = std::make_shared<ArrayExpression>(
-      std::vector<Expression>{ConstantValueExp(Value(int64_t{1}))},
-      "BOOL");
+      std::vector<Expression>{ConstantValueExp(Value(int64_t{1}))}, "BOOL");
   Value v_bool = arr_bool->Evaluate(dummy, dummy_schema);
   EXPECT_TRUE(v_bool.IsArray());
 
   auto arr_flt = std::make_shared<ArrayExpression>(
-      std::vector<Expression>{ConstantValueExp(Value(int64_t{2}))},
-      "FLOAT64");
+      std::vector<Expression>{ConstantValueExp(Value(int64_t{2}))}, "FLOAT64");
   Value v_flt = arr_flt->Evaluate(dummy, dummy_schema);
   EXPECT_TRUE(v_flt.IsArray());
 
   auto arr_date_coerce = std::make_shared<ArrayExpression>(
-      std::vector<Expression>{ConstantValueExp(Value("2023-06-15"))},
-      "DATE");
+      std::vector<Expression>{ConstantValueExp(Value("2023-06-15"))}, "DATE");
   Value v_date_coerce = arr_date_coerce->Evaluate(dummy, dummy_schema);
   EXPECT_TRUE(v_date_coerce.IsArray());
 
   FakeEvaluationContext ctx;
-  EXPECT_TRUE(arr_str->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema).IsArray());
+  EXPECT_TRUE(
+      arr_str->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema).IsArray());
   EXPECT_TRUE(arr_str->Evaluate(dummy, dummy_schema, ctx).IsArray());
   EXPECT_EQ(arr_str->ResultType(dummy_schema).GetType(), TypeTag::kArray);
-  EXPECT_EQ(arr_str->ResultType(dummy_schema, dummy_schema).GetType(), TypeTag::kArray);
+  EXPECT_EQ(arr_str->ResultType(dummy_schema, dummy_schema).GetType(),
+            TypeTag::kArray);
   EXPECT_FALSE(arr_str->ToString().empty());
 }
 
-TEST(ExpressionTest, WindowFunctionExpression_EvaluateAndInspect_ThrowsOnEvaluateAndRenders) {
+TEST(ExpressionTest,
+     WindowFunctionExpression_EvaluateAndInspect_ThrowsOnEvaluateAndRenders) {
   auto node = std::make_shared<WindowFunctionCallExpression>();
   node->function = "SUM";
   node->args = {ColumnValueExp("x")};
@@ -1803,8 +1842,10 @@ TEST(ExpressionTest, WindowFunctionExpression_EvaluateAndInspect_ThrowsOnEvaluat
   node->order_by = {{ColumnValueExp("o"), false, std::optional<bool>(true)}};
   node->has_frame = true;
   node->frame_unit = WindowFrameUnit::kRows;
-  node->frame_start = {WindowFrameBoundType::kUnboundedPreceding, nullptr};
-  node->frame_end = {WindowFrameBoundType::kUnboundedFollowing, nullptr};
+  node->frame_start = {.type = WindowFrameBoundType::kUnboundedPreceding,
+                       .offset = nullptr};
+  node->frame_end = {.type = WindowFrameBoundType::kUnboundedFollowing,
+                     .offset = nullptr};
 
   Row dummy({});
   Schema dummy_schema;
@@ -1822,6 +1863,7 @@ TEST(ExpressionTest, FunctionCall_VariousBuiltinFunctions_EvaluatesCorrectly) {
 
   auto eval = [&](const std::string& name, const std::vector<Value>& args) {
     std::vector<Expression> exprs;
+    exprs.reserve(args.size());
     for (const auto& a : args) {
       exprs.push_back(ConstantValueExp(a));
     }
@@ -1834,8 +1876,12 @@ TEST(ExpressionTest, FunctionCall_VariousBuiltinFunctions_EvaluatesCorrectly) {
   EXPECT_EQ(eval("concat", {Value(), Value("bar")}), Value());
 
   EXPECT_EQ(eval("substr", {Value("hello"), Value(int64_t{2})}), Value("ello"));
-  EXPECT_EQ(eval("substr", {Value("hello"), Value(int64_t{2}), Value(int64_t{3})}), Value("ell"));
-  EXPECT_EQ(eval("substr", {Value("hello"), Value(int64_t{2}), Value(int64_t{0})}), Value(""));
+  EXPECT_EQ(
+      eval("substr", {Value("hello"), Value(int64_t{2}), Value(int64_t{3})}),
+      Value("ell"));
+  EXPECT_EQ(
+      eval("substr", {Value("hello"), Value(int64_t{2}), Value(int64_t{0})}),
+      Value(""));
   EXPECT_EQ(eval("substr", {Value("hello"), Value(int64_t{10})}), Value(""));
 
   EXPECT_EQ(eval("extract_year", {Value("2023-08-25")}), Value(int64_t{2023}));
@@ -1848,32 +1894,40 @@ TEST(ExpressionTest, FunctionCall_VariousBuiltinFunctions_EvaluatesCorrectly) {
   EXPECT_FALSE(eval("current_date", {}).IsNull());
   EXPECT_FALSE(eval("current_date", {Value("UTC")}).IsNull());
 
-  EXPECT_EQ(eval("string", {Value("2023-01-01"), Value("UTC+0530")}).type, ValueType::kVarChar);
-  EXPECT_EQ(eval("string", {Value(Value::DateFromDays(100))}), Value("1970-04-11"));
+  EXPECT_EQ(eval("string", {Value("2023-01-01"), Value("UTC+0530")}).type,
+            ValueType::kVarChar);
+  EXPECT_EQ(eval("string", {Value(Value::DateFromDays(100))}),
+            Value("1970-04-11"));
   EXPECT_EQ(eval("string", {Value(int64_t{123})}), Value("123"));
 
-  EXPECT_EQ(eval("format_timestamp", {Value("%Y-%m-%d"), Value("2023-06-15 10:00:00"), Value("UTC")}),
-            Value("2023-06-15"));
-  EXPECT_EQ(eval("format_datetime", {Value("%Y/%m/%d"), Value("2023-06-15 10:00:00")}),
+  EXPECT_EQ(
+      eval("format_timestamp",
+           {Value("%Y-%m-%d"), Value("2023-06-15 10:00:00"), Value("UTC")}),
+      Value("2023-06-15"));
+  EXPECT_EQ(eval("format_datetime",
+                 {Value("%Y/%m/%d"), Value("2023-06-15 10:00:00")}),
             Value("2023/06/15"));
   EXPECT_EQ(eval("format_date", {Value("%Y"), Value("2023-06-15")}),
             Value("2023"));
 
-  EXPECT_EQ(eval("parse_timestamp", {Value("%Y-%m-%d %H:%M:%S"), Value("2023-06-15 10:00:00"), Value("UTC")}),
-            Value("2023-06-15 10:00:00+00"));
+  EXPECT_EQ(
+      eval("parse_timestamp", {Value("%Y-%m-%d %H:%M:%S"),
+                               Value("2023-06-15 10:00:00"), Value("UTC")}),
+      Value("2023-06-15 10:00:00+00"));
 }
 
-TEST(ExpressionTest, CaseExpression_WithTwoRowsAndUnifiedType_EvaluatesAndInfersType) {
+TEST(ExpressionTest,
+     CaseExpression_WithTwoRowsAndUnifiedType_EvaluatesAndInfersType) {
   Schema left_schema("L", {Column("a", ValueType::kInt64)});
   Schema right_schema("R", {Column("b", ValueType::kInt64)});
   Row left_row({Value(int64_t{10})});
   Row right_row({Value(int64_t{20})});
 
   CaseExpression case_exp(
-      {std::make_pair(BinaryExpressionExp(ColumnValueExp("a"),
-                                          BinaryOperation::kEquals,
-                                          ConstantValueExp(Value(int64_t{10}))),
-                      ColumnValueExp("b"))},
+      {std::make_pair(
+          BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value(int64_t{10}))),
+          ColumnValueExp("b"))},
       ConstantValueExp(Value(int64_t{99})));
   EXPECT_EQ(case_exp.Evaluate(&left_row, left_schema, &right_row, right_schema),
             Value(int64_t{20}));
@@ -1883,7 +1937,8 @@ TEST(ExpressionTest, CaseExpression_WithTwoRowsAndUnifiedType_EvaluatesAndInfers
                       ConstantValueExp(Value(int64_t{1})))},
       ConstantValueExp(Value(std::string("str"))));
   EXPECT_EQ(case_mismatch.ResultType(left_schema).GetType(), TypeTag::kInvalid);
-  EXPECT_EQ(case_mismatch.ResultType(left_schema, right_schema).GetType(), TypeTag::kInvalid);
+  EXPECT_EQ(case_mismatch.ResultType(left_schema, right_schema).GetType(),
+            TypeTag::kInvalid);
 
   CaseExpression case_empty({}, nullptr);
   EXPECT_EQ(case_empty.ResultType(left_schema).GetType(), TypeTag::kInvalid);
@@ -1895,14 +1950,16 @@ TEST(ExpressionTest, InExpression_EvaluateWithTwoRows_EvaluatesCorrectly) {
   Row left_row({Value(int64_t{10})});
   Row right_row({Value(int64_t{20})});
 
-  InExpression in_exp(ColumnValueExp("a"),
-                      {ColumnValueExp("b"), ConstantValueExp(Value(int64_t{10}))});
+  InExpression in_exp(
+      ColumnValueExp("a"),
+      {ColumnValueExp("b"), ConstantValueExp(Value(int64_t{10}))});
   EXPECT_EQ(in_exp.Evaluate(&left_row, left_schema, &right_row, right_schema),
             Value(true));
 
   InExpression in_nomatch(ColumnValueExp("a"), {ColumnValueExp("b")});
-  EXPECT_EQ(in_nomatch.Evaluate(&left_row, left_schema, &right_row, right_schema),
-            Value(false));
+  EXPECT_EQ(
+      in_nomatch.Evaluate(&left_row, left_schema, &right_row, right_schema),
+      Value(false));
 }
 
 TEST(ExpressionTest, Expression_PathologicalPatterns_EvaluatesCorrectly) {
@@ -1943,7 +2000,8 @@ TEST(ExpressionTest, Expression_PathologicalPatterns_EvaluatesCorrectly) {
   Expression exp_subnorm = BinaryExpressionExp(
       ConstantValueExp(Value(min_subnormal)), BinaryOperation::kMultiply,
       ConstantValueExp(Value(2.0)));
-  EXPECT_EQ(exp_subnorm->Evaluate(dummy, dummy_schema), Value(min_subnormal * 2.0));
+  EXPECT_EQ(exp_subnorm->Evaluate(dummy, dummy_schema),
+            Value(min_subnormal * 2.0));
 
   int64_t int_min = std::numeric_limits<int64_t>::min();
   int64_t int_max = std::numeric_limits<int64_t>::max();
@@ -1951,12 +2009,14 @@ TEST(ExpressionTest, Expression_PathologicalPatterns_EvaluatesCorrectly) {
   Expression exp_int_min_plus_zero = BinaryExpressionExp(
       ConstantValueExp(Value(int_min)), BinaryOperation::kAdd,
       ConstantValueExp(Value(int64_t{0})));
-  EXPECT_EQ(exp_int_min_plus_zero->Evaluate(dummy, dummy_schema), Value(int_min));
+  EXPECT_EQ(exp_int_min_plus_zero->Evaluate(dummy, dummy_schema),
+            Value(int_min));
 
   Expression exp_int_max_minus_zero = BinaryExpressionExp(
       ConstantValueExp(Value(int_max)), BinaryOperation::kSubtract,
       ConstantValueExp(Value(int64_t{0})));
-  EXPECT_EQ(exp_int_max_minus_zero->Evaluate(dummy, dummy_schema), Value(int_max));
+  EXPECT_EQ(exp_int_max_minus_zero->Evaluate(dummy, dummy_schema),
+            Value(int_max));
 
   Expression case_safe = CaseExpressionExp(
       {{ConstantValueExp(Value(true)), ConstantValueExp(Value(int64_t{42}))}},
@@ -1979,14 +2039,15 @@ TEST(ExpressionTest, Expression_PathologicalPatterns_EvaluatesCorrectly) {
                           ConstantValueExp(Value(int64_t{0}))));
   EXPECT_EQ(or_safe->Evaluate(dummy, dummy_schema), Value(true));
 
-  Expression mixed_eq = BinaryExpressionExp(
-      ConstantValueExp(Value("123")), BinaryOperation::kEquals,
-      ConstantValueExp(Value("123")));
+  Expression mixed_eq = BinaryExpressionExp(ConstantValueExp(Value("123")),
+                                            BinaryOperation::kEquals,
+                                            ConstantValueExp(Value("123")));
   EXPECT_EQ(mixed_eq->Evaluate(dummy, dummy_schema), Value(int64_t{1}));
 
   Expression unary_chain = ConstantValueExp(Value(int64_t{7}));
   for (int i = 0; i < 10; ++i) {
-    unary_chain = UnaryExpressionExp(std::move(unary_chain), UnaryOperation::kMinus);
+    unary_chain =
+        UnaryExpressionExp(std::move(unary_chain), UnaryOperation::kMinus);
   }
   EXPECT_EQ(unary_chain->Evaluate(dummy, dummy_schema), Value(int64_t{7}));
 }

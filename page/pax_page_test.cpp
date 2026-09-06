@@ -1,7 +1,16 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include <cstddef>
+#include <cstdint>
+
+#include "common/constants.hpp"
+#include "executor/data_chunk.hpp"
 #include "gtest/gtest.h"
 #include "page/page.hpp"
-#include "type/date.hpp"
+#include "page/page_type.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 

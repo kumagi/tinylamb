@@ -1,10 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/interval_join.hpp"
 
-#include <algorithm>
 #include <cstddef>
-#include <memory>
-#include <optional>
 #include <ostream>
 #include <string>
 #include <unordered_map>
@@ -12,9 +9,11 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/executor_base.hpp"
 #include "page/row_position.hpp"
+#include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -58,9 +57,8 @@ Schema MakeCombinedSchema(const Schema& left, const Schema& right) {
   for (size_t i = 0; i < right.ColumnCount(); ++i) {
     cols.push_back(right.GetColumn(i));
   }
-  return Schema(
-      std::string(left.Name()) + "_interval_" + std::string(right.Name()),
-      std::move(cols));
+  return {std::string(left.Name()) + "_interval_" + std::string(right.Name()),
+          std::move(cols)};
 }
 
 }  // namespace
@@ -219,9 +217,9 @@ size_t IntervalJoin::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 void IntervalJoin::Dump(std::ostream& o, int indent) const {
-  o << "IntervalJoin: \n" << Indent(indent + 2);
+  o << "IntervalJoin: \n" << Indent(static_cast<size_t>(indent) + 2);
   left_->Dump(o, indent + 2);
-  o << "\n" << Indent(indent + 2);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   right_->Dump(o, indent + 2);
 }
 

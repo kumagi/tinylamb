@@ -17,7 +17,6 @@
 #include "plan/selection_plan.hpp"
 
 #include <cstddef>
-#include <memory>
 #include <ostream>
 #include <string>
 
@@ -40,7 +39,8 @@ size_t SelectionPlan::EmitRowCount() const { return stats_.Rows(); }
 void SelectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Select: [";
   exp_->Dump(o);
-  o << "] (estimated cost: " << AccessRowCount() << ")\n" << Indent(indent + 2);
+  o << "] (estimated cost: " << AccessRowCount() << ")\n"
+    << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 

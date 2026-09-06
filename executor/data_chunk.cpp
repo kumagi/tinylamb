@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/data_chunk.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -433,7 +434,7 @@ Row DataChunk::RowAt(size_t row_index) const {
 
 Value ColumnVector::AggregateLogicalAnd(const SelectionVector* sel) const {
   if (size_ == 0 || (sel != nullptr && sel->Empty())) {
-    return Value();
+    return {};
   }
   bool has_non_null = false;
   if (sel == nullptr) {
@@ -476,14 +477,14 @@ Value ColumnVector::AggregateLogicalAnd(const SelectionVector* sel) const {
     }
   }
   if (!has_non_null) {
-    return Value();
+    return {};
   }
   return Value(int64_t{1});
 }
 
 Value ColumnVector::AggregateLogicalOr(const SelectionVector* sel) const {
   if (size_ == 0 || (sel != nullptr && sel->Empty())) {
-    return Value();
+    return {};
   }
   bool has_non_null = false;
   if (sel == nullptr) {
@@ -526,14 +527,14 @@ Value ColumnVector::AggregateLogicalOr(const SelectionVector* sel) const {
     }
   }
   if (!has_non_null) {
-    return Value();
+    return {};
   }
   return Value(int64_t{0});
 }
 
 Value ColumnVector::AggregateBitAnd(const SelectionVector* sel) const {
   if (size_ == 0 || (sel != nullptr && sel->Empty())) {
-    return Value();
+    return {};
   }
   if (type_ != ValueType::kInt64) {
     throw std::invalid_argument("BIT_AND requires int64 column");
@@ -549,7 +550,7 @@ Value ColumnVector::AggregateBitAnd(const SelectionVector* sel) const {
       const size_t limit = std::min(size_ - base, size_t{64});
       const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
-#if defined(__clang__)
+#ifdef __clang__
 #pragma clang loop vectorize(enable)
 #endif
         for (size_t i = 0; i < limit; ++i) {
@@ -577,14 +578,14 @@ Value ColumnVector::AggregateBitAnd(const SelectionVector* sel) const {
     }
   }
   if (!has_non_null) {
-    return Value();
+    return {};
   }
   return Value(static_cast<int64_t>(acc));
 }
 
 Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
   if (size_ == 0 || (sel != nullptr && sel->Empty())) {
-    return Value();
+    return {};
   }
   if (type_ != ValueType::kInt64) {
     throw std::invalid_argument("BIT_OR requires int64 column");
@@ -600,7 +601,7 @@ Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
       const size_t limit = std::min(size_ - base, size_t{64});
       const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
-#if defined(__clang__)
+#ifdef __clang__
 #pragma clang loop vectorize(enable)
 #endif
         for (size_t i = 0; i < limit; ++i) {
@@ -628,14 +629,14 @@ Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
     }
   }
   if (!has_non_null) {
-    return Value();
+    return {};
   }
   return Value(static_cast<int64_t>(acc));
 }
 
 Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
   if (size_ == 0 || (sel != nullptr && sel->Empty())) {
-    return Value();
+    return {};
   }
   if (type_ != ValueType::kInt64) {
     throw std::invalid_argument("BIT_XOR requires int64 column");
@@ -651,7 +652,7 @@ Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
       const size_t limit = std::min(size_ - base, size_t{64});
       const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
-#if defined(__clang__)
+#ifdef __clang__
 #pragma clang loop vectorize(enable)
 #endif
         for (size_t i = 0; i < limit; ++i) {
@@ -679,7 +680,7 @@ Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
     }
   }
   if (!has_non_null) {
-    return Value();
+    return {};
   }
   return Value(static_cast<int64_t>(acc));
 }

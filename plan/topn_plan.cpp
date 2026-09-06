@@ -2,14 +2,25 @@
 #include "topn_plan.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <optional>
 #include <ostream>
 #include <sstream>
+#include <string>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "expression/expression.hpp"
 
 namespace tinylamb {
 
 size_t TopNPlan::EmitRowCount() const {
+  // LIMIT 0 yields zero rows: TopNExecutor never emits for an empty bound,
+  // so the estimate must agree (the engine reads limit==0 as a real bound
+  // here, unlike the unordered-limit paths that treat 0 as "unbounded").
+  if (limit_ == 0 && !with_ties_) {
+    return 0;
+  }
   const size_t input = child_->EmitRowCount();
   if (input <= offset_) {
     return 0;
@@ -18,7 +29,7 @@ size_t TopNPlan::EmitRowCount() const {
   if (with_ties_) {
     return remaining;
   }
-  return limit_ == 0 ? remaining : std::min(remaining, limit_);
+  return std::min(remaining, limit_);
 }
 
 bool TopNPlan::IsOrderedBy(const std::vector<Expression>& expressions,
@@ -61,7 +72,8 @@ bool TopNPlan::IsOrderedBy(
 }
 
 void TopNPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << ToString() << "\n" << Indent(indent + 2);
+  output << Indent(static_cast<size_t>(indent)) << ToString() << "\n"
+         << Indent(static_cast<size_t>(indent) + 2);
   child_->Dump(output, indent + 2);
 }
 

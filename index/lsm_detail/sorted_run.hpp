@@ -44,7 +44,7 @@ struct LSMValue {
   std::string payload;
   // Returns a fresh tombstone by value: handing out a reference to a shared
   // static would let callers mutate its payload.
-  static LSMValue Delete() { return LSMValue(); }
+  static LSMValue Delete() { return {}; }
   LSMValue() : is_delete(true) {}
   explicit LSMValue(std::string p) : is_delete(false), payload(std::move(p)) {}
   LSMValue(const LSMValue& rhs) = default;
@@ -96,7 +96,8 @@ class SortedRun {
       if (kIndirectThreshold < e.length_) {
         o << " stored at offset: " << e.key_.reference_;
       } else {
-        o << " key: " << SortedRun::HeadString(e.key_.inline_);
+        o << " key: "
+          << SortedRun::HeadString(static_cast<uint32_t>(e.key_.inline_));
       }
       if (e.IsDeleted()) {
         o << "(deleted)";

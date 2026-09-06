@@ -9,9 +9,9 @@
 #include <string_view>
 
 #include "common/log_message.hpp"
-#include "query/statement.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
+#include "query/statement.hpp"
 
 namespace tinylamb {
 
@@ -33,8 +33,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     std::unique_ptr<Statement> statement =
         GoogleSqlAstVisitor::Visit(*ast.Value());
     if (verbose) {
-      LOG(TRACE) << "visited root: "
-                 << (statement != nullptr ? "ok" : "null");
+      LOG(TRACE) << "visited root: " << (statement != nullptr ? "ok" : "null");
     }
   } catch (const std::exception&) {
   }

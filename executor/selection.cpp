@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <optional>
 #include <ostream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -43,7 +44,7 @@ namespace {
 // OLAP early promotion: a stream of full batches this deep implies an
 // estimated row count far beyond the JIT compile break-even, so waiting for
 // the cumulative 20M-evaluation threshold would waste most of the scan.
-constexpr size_t kJitEarlyPromotionRows = 512 * 1024;
+constexpr size_t kJitEarlyPromotionRows = size_t{512} * 1024;
 
 BinaryOperation Flip(BinaryOperation operation) {
   switch (operation) {
@@ -106,7 +107,10 @@ Selection::Selection(Expression exp, Schema schema, Executor src,
       schema_(std::move(schema)),
       src_(std::move(src)),
       jit_threshold_rows_(jit_threshold_rows) {
-  bytecode_ = BytecodeCompiler::Compile(exp_, schema_);
+  // The JIT kernel below is derived from the compiled program, so disabling
+  // bytecode also disables the filter JIT (differential-testing hook).
+  bytecode_ = BytecodeEnabled() ? BytecodeCompiler::Compile(exp_, schema_)
+                                : std::nullopt;
 }
 
 bool Selection::Next(Row* dst, RowPosition* rp) {
@@ -246,7 +250,7 @@ void Selection::Dump(std::ostream& o, int indent) const {
         << " decoded_payloads=" << rows_selected_ << "\n";
     }
   }
-  o << Indent(indent + 2);
+  o << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 

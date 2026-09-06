@@ -1,20 +1,24 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include "query/googlesql_compliance_file.hpp"
-
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
-#include <unordered_set>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+#include <utility>
 #include <vector>
+
+#include "query/googlesql_compliance_file.hpp"
+#include "type/column_name.hpp"
 
 #ifdef TINYLAMB_GOOGLESQL_COMPLIANCE_RUN
 #include "common/constants.hpp"
@@ -48,21 +52,28 @@ std::string ReadFile(const std::filesystem::path& path) {
 
 #ifdef TINYLAMB_GOOGLESQL_COMPLIANCE_RUN
 std::vector<Row> Drain(SqlEngine& engine, TransactionContext& context,
-                       std::string_view sql, Status* status, std::string* error_msg = nullptr) {
+                       std::string_view sql, Status* status,
+                       std::string* error_msg = nullptr) {
   StatusOr<Executor> prepared = engine.Prepare(context, sql);
   if (!prepared.HasValue()) {
     *status = prepared.GetStatus();
-    if (error_msg != nullptr) { *error_msg = engine.LastError(); }
+    if (error_msg != nullptr) {
+      *error_msg = engine.LastError();
+    }
     return {};
   }
   *status = Status::kSuccess;
   std::vector<Row> rows;
   Row row;
   try {
-    while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row); }
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
   } catch (const std::exception& ex) {
     *status = Status::kUnknown;
-    if (error_msg != nullptr) { *error_msg = ex.what(); }
+    if (error_msg != nullptr) {
+      *error_msg = ex.what();
+    }
     return {};
   }
   return rows;
@@ -86,13 +97,14 @@ Status CreateComplianceSecondaryIndex(Database& database,
       specification.substr(open + 1, close - open - 1));
   ASSIGN_OR_RETURN(std::shared_ptr<Table>, table, context.GetTable(table_name));
   const int offset = table->GetSchema().Offset(ColumnName(column_name));
-  if (offset < 0) { return Status::kNotExists; }
+  if (offset < 0) {
+    return Status::kNotExists;
+  }
   return database.CreateIndex(
       context, table_name,
       IndexSchema(index_name, {static_cast<slot_t>(offset)}, {},
                   IndexMode::kNonUnique));
 }
-
 
 bool RowsMatch(const std::vector<Row>& actual,
                const GoogleSqlComplianceCase& test_case, std::string* detail) {
@@ -104,7 +116,9 @@ bool RowsMatch(const std::vector<Row>& actual,
     auto lower_trim = [](const std::string& s) {
       const char* ws = " \t\r\n";
       size_t b = s.find_first_not_of(ws);
-      if (b == std::string::npos) { return std::string(); }
+      if (b == std::string::npos) {
+        return std::string();
+      }
       size_t e = s.find_last_not_of(ws);
       std::string out = s.substr(b, e - b + 1);
       for (char& c : out) {
@@ -114,12 +128,16 @@ bool RowsMatch(const std::vector<Row>& actual,
     };
     if (expected.size() == 1 && lower_trim(expected[0]) == "null" &&
         row.values_.size() > 1) {
-      return std::all_of(row.values_.begin(), row.values_.end(),
-                         [](const Value& v) { return v.IsNull(); });
+      return std::ranges::all_of(row.values_,
+                                 [](const Value& v) { return v.IsNull(); });
     }
-    if (row.values_.size() != expected.size()) { return false; }
+    if (row.values_.size() != expected.size()) {
+      return false;
+    }
     for (size_t i = 0; i < expected.size(); ++i) {
-      if (!ComplianceValueMatches(row.values_[i], expected[i])) { return false; }
+      if (!ComplianceValueMatches(row.values_[i], expected[i])) {
+        return false;
+      }
     }
     return true;
   };
@@ -133,7 +151,9 @@ bool RowsMatch(const std::vector<Row>& actual,
     for (const auto& expected : test_case.expected_rows) {
       bool found = false;
       for (size_t i = 0; i < actual.size(); ++i) {
-        if (used[i]) { continue; }
+        if (used[i]) {
+          continue;
+        }
         if (matches_expected(actual[i], expected)) {
           used[i] = true;
           found = true;
@@ -143,22 +163,31 @@ bool RowsMatch(const std::vector<Row>& actual,
       if (!found) {
         std::string exp_str = "{";
         for (size_t k = 0; k < expected.size(); ++k) {
-          if (k != 0) { exp_str += ", "; }
+          if (k != 0) {
+            exp_str += ", ";
+          }
           exp_str += expected[k];
         }
         exp_str += "}";
         std::string act_str = "[";
         for (size_t a = 0; a < actual.size(); ++a) {
-          if (a != 0) { act_str += ", "; }
+          if (a != 0) {
+            act_str += ", ";
+          }
           act_str += "{";
           for (size_t b = 0; b < actual[a].values_.size(); ++b) {
-            if (b != 0) { act_str += ", "; }
+            if (b != 0) {
+              act_str += ", ";
+            }
             act_str += FormatComplianceValue(actual[a].values_[b]);
           }
           act_str += "}";
         }
         act_str += "]";
-        *detail = "missing expected row: " + exp_str + " actual rows: " + act_str;
+        *detail = "missing expected row: ";
+        *detail += exp_str;
+        *detail += " actual rows: ";
+        *detail += act_str;
         return false;
       }
     }
@@ -168,7 +197,9 @@ bool RowsMatch(const std::vector<Row>& actual,
     if (!matches_expected(actual[i], test_case.expected_rows[i])) {
       std::string row_str = "{";
       for (size_t j = 0; j < actual[i].values_.size(); ++j) {
-        if (j != 0) { row_str += ", "; }
+        if (j != 0) {
+          row_str += ", ";
+        }
         row_str += FormatComplianceValue(actual[i].values_[j]);
       }
       row_str += "}";
@@ -193,14 +224,18 @@ std::vector<std::string> SplitStatements(std::string_view sql) {
   bool triple = false;
   auto run_length = [&](size_t i) {
     size_t n = 0;
-    while (i + n < sql.size() && sql[i + n] == quote && n < 3) { ++n; }
+    while (i + n < sql.size() && sql[i + n] == quote && n < 3) {
+      ++n;
+    }
     return n;
   };
   for (size_t i = 0; i < sql.size(); ++i) {
     const char c = sql[i];
     if (mode == Mode::kComment) {
       current.push_back(c);
-      if (c == '\n') { mode = Mode::kCode; }
+      if (c == '\n') {
+        mode = Mode::kCode;
+      }
       continue;
     }
     if (mode == Mode::kString) {
@@ -240,7 +275,9 @@ std::vector<std::string> SplitStatements(std::string_view sql) {
         --e;
       }
       std::string trimmed = current.substr(b, e - b);
-      if (!trimmed.empty()) { stmts.push_back(std::move(trimmed)); }
+      if (!trimmed.empty()) {
+        stmts.push_back(std::move(trimmed));
+      }
       current.clear();
       continue;
     }
@@ -257,7 +294,9 @@ std::vector<std::string> SplitStatements(std::string_view sql) {
     --e;
   }
   std::string trimmed = current.substr(b, e - b);
-  if (!trimmed.empty()) { stmts.push_back(std::move(trimmed)); }
+  if (!trimmed.empty()) {
+    stmts.push_back(std::move(trimmed));
+  }
   return stmts;
 }
 
@@ -266,7 +305,6 @@ std::vector<std::string> SplitStatements(std::string_view sql) {
 }  // namespace
 
 TEST(GoogleSqlComplianceFile, ParsesLiteralsAndErrors) {
-
   constexpr std::string_view kFile = R"test(
 [name=one]
 SELECT 1
@@ -365,8 +403,7 @@ TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
   size_t error_count = 0;
   size_t prepare_count = 0;
   for (const std::string& name : files) {
-    const std::filesystem::path path =
-        std::filesystem::path(directory) / name;
+    const std::filesystem::path path = std::filesystem::path(directory) / name;
     const std::vector<GoogleSqlComplianceCase> cases =
         ParseGoogleSqlComplianceFile(path.string(), ReadFile(path));
     if (name == "no_tests.test") {
@@ -375,10 +412,13 @@ TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
     }
     EXPECT_FALSE(cases.empty()) << name;
     for (const GoogleSqlComplianceCase& test_case : cases) {
-
       ++case_count;
-      if (test_case.expect_error) { ++error_count; }
-      if (test_case.prepare_database) { ++prepare_count; }
+      if (test_case.expect_error) {
+        ++error_count;
+      }
+      if (test_case.prepare_database) {
+        ++prepare_count;
+      }
       EXPECT_FALSE(test_case.sql.empty()) << name << " / " << test_case.name;
     }
   }
@@ -390,13 +430,15 @@ TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
 
 TEST(GoogleSqlComplianceFile, SkipsDifferentialPrivacy) {
   GoogleSqlComplianceCase test_case;
-  test_case.sql = "SELECT * FROM t WITH DIFFERENTIAL_PRIVACY OPTIONS(epsilon=1)";
+  test_case.sql =
+      "SELECT * FROM t WITH DIFFERENTIAL_PRIVACY OPTIONS(epsilon=1)";
   EXPECT_TRUE(IsDifferentialPrivacyCase(test_case));
   test_case.sql = "SELECT 1";
   EXPECT_FALSE(IsDifferentialPrivacyCase(test_case));
 }
 
 #ifdef TINYLAMB_GOOGLESQL_COMPLIANCE_RUN
+namespace {
 // Features this engine claims for compliance feature-gating. A case tagged
 // with required_features outside this set is skipped, mirroring the reference
 // TestDriver contract (unsupported-feature cases are neither pass nor fail).
@@ -406,32 +448,39 @@ bool CaseFeatureSupported(const GoogleSqlComplianceCase& test_case) {
   // whole-file features), mirroring the reference TestDriver contract where
   // unsupported-feature cases are neither pass nor fail.
   static const std::unordered_set<std::string> kSupported = {
-      "INLINE_LAMBDA_ARGUMENT",        // ARRAY_TRANSFORM/ARRAY_FILTER lambdas
-      "TEMPLATE_FUNCTIONS",            // ANY TYPE templated SQL functions
-      "ANY_STRING_TEMPLATED_ARGUMENT", // ANY STRING templated parameters
-      "WITH_ON_SUBQUERY",              // WITH clauses inside function bodies
+      "INLINE_LAMBDA_ARGUMENT",         // ARRAY_TRANSFORM/ARRAY_FILTER lambdas
+      "TEMPLATE_FUNCTIONS",             // ANY TYPE templated SQL functions
+      "ANY_STRING_TEMPLATED_ARGUMENT",  // ANY STRING templated parameters
+      "WITH_ON_SUBQUERY",               // WITH clauses inside function bodies
   };
-  for (const std::string& feature : test_case.required_features) {
-    if (kSupported.find(feature) == kSupported.end()) { return false; }
-  }
-  return true;
+  return std::ranges::all_of(
+      test_case.required_features,
+      [&](const std::string& feature) { return kSupported.contains(feature); });
 }
 
 bool IsMutatingSql(std::string_view sql) {
   size_t begin = 0;
-  while (begin < sql.size() && std::isspace(static_cast<unsigned char>(sql[begin])) != 0) {
+  while (begin < sql.size() &&
+         std::isspace(static_cast<unsigned char>(sql[begin])) != 0) {
     ++begin;
   }
   sql = sql.substr(begin);
   auto prefix = [&sql](std::string_view keyword) {
-    if (sql.size() < keyword.size()) { return false; }
-    if (sql.substr(0, keyword.size()) != keyword) { return false; }
-    if (sql.size() == keyword.size()) { return true; }
+    if (sql.size() < keyword.size()) {
+      return false;
+    }
+    if (!sql.starts_with(keyword)) {
+      return false;
+    }
+    if (sql.size() == keyword.size()) {
+      return true;
+    }
     const char next = sql[keyword.size()];
     return !std::isalnum(static_cast<unsigned char>(next)) && next != '_';
   };
   return prefix("INSERT") || prefix("UPDATE") || prefix("DELETE");
 }
+}  // namespace
 
 class GoogleSqlComplianceFileTest
     : public ::testing::TestWithParam<std::string> {};
@@ -490,19 +539,26 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   };
 
   for (const GoogleSqlComplianceCase& test_case : cases) {
-    if (IsDifferentialPrivacyCase(test_case)) { continue; }
+    if (IsDifferentialPrivacyCase(test_case)) {
+      continue;
+    }
     // Feature gating applies to prepare_database setup too: whole-file
     // features (SQL_GRAPH, RANGE_TYPE, ...) gate their file's setup blocks,
     // exactly like the reference driver skips unsupported feature files.
-    if (!CaseFeatureSupported(test_case)) { continue; }
-    SetDefaultTimeZone(test_case.default_time_zone.empty() ? "America/Los_Angeles" : test_case.default_time_zone);
+    if (!CaseFeatureSupported(test_case)) {
+      continue;
+    }
+    SetDefaultTimeZone(test_case.default_time_zone.empty()
+                           ? "America/Los_Angeles"
+                           : test_case.default_time_zone);
     if (test_case.prepare_database) {
       const std::vector<std::string> stmts = SplitStatements(test_case.sql);
       const bool first_column_is_primary_key =
           test_case.primary_key_mode == "first_column_is_primary_key";
-      prepare_segments.push_back(
-          PreparedSegment{stmts, first_column_is_primary_key,
-                          test_case.secondary_indexes});
+      prepare_segments.push_back(PreparedSegment{
+          .statements = stmts,
+          .first_column_is_primary_key = first_column_is_primary_key,
+          .secondary_indexes = test_case.secondary_indexes});
       SqlEngine::SetCompliancePrimaryKeyMode(first_column_is_primary_key);
       for (const std::string& stmt : stmts) {
         Status s_status = Status::kSuccess;
@@ -544,8 +600,8 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       engine = std::make_unique<SqlEngine>(*database);
       replay_prepared_state();
     }
-    SqlEngine::SetCompliancePrimaryKeyMode(
-        test_case.primary_key_mode == "first_column_is_primary_key");
+    SqlEngine::SetCompliancePrimaryKeyMode(test_case.primary_key_mode ==
+                                           "first_column_is_primary_key");
 
     Status status = Status::kSuccess;
     std::string error_msg;
@@ -593,21 +649,21 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
         matched = false;
         detail = std::string("RowsMatch threw: ") + ex.what();
       }
-      EXPECT_TRUE(matched)
-          << GetParam() << " / " << test_case.name << " " << detail << "\n"
-          << test_case.sql << "\n"
-          << test_case.raw_result;
+      EXPECT_TRUE(matched) << GetParam() << " / " << test_case.name << " "
+                           << detail << "\n"
+                           << test_case.sql << "\n"
+                           << test_case.raw_result;
 
       if (!test_case.plan_contains.empty() ||
           !test_case.plan_not_contains.empty()) {
         Status explain_status = Status::kSuccess;
         std::string explain_error;
-        const std::string prefix =
-            test_case.mode == "explain_analyze" ? "EXPLAIN ANALYZE "
-                                                : "EXPLAIN ";
+        const std::string prefix = test_case.mode == "explain_analyze"
+                                       ? "EXPLAIN ANALYZE "
+                                       : "EXPLAIN ";
         const std::vector<Row> explain_rows =
-            Drain(*engine, *context, prefix + test_case.sql,
-                  &explain_status, &explain_error);
+            Drain(*engine, *context, prefix + test_case.sql, &explain_status,
+                  &explain_error);
         ASSERT_EQ(explain_status, Status::kSuccess)
             << GetParam() << " / " << test_case.name
             << " EXPLAIN failed: " << explain_error << "\n"
@@ -615,19 +671,23 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
         std::string plan;
         for (const Row& explain_row : explain_rows) {
           if (!explain_row.values_.empty()) {
-            if (!plan.empty()) { plan.push_back('\n'); }
+            if (!plan.empty()) {
+              plan.push_back('\n');
+            }
             plan += explain_row[0].AsString();
           }
         }
         for (const std::string& fragment : test_case.plan_contains) {
           EXPECT_NE(plan.find(fragment), std::string::npos)
               << GetParam() << " / " << test_case.name
-              << " missing plan fragment: " << fragment << "\n" << plan;
+              << " missing plan fragment: " << fragment << "\n"
+              << plan;
         }
         for (const std::string& fragment : test_case.plan_not_contains) {
           EXPECT_EQ(plan.find(fragment), std::string::npos)
               << GetParam() << " / " << test_case.name
-              << " unexpected plan fragment: " << fragment << "\n" << plan;
+              << " unexpected plan fragment: " << fragment << "\n"
+              << plan;
         }
       }
     }
@@ -635,15 +695,19 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   database->DeleteAll();
 }
 
+namespace {
 std::vector<std::string> ComplianceFileNames() {
   const std::string directory = TINYLAMB_GOOGLESQL_COMPLIANCE_DIR;
   if (directory.empty() || !std::filesystem::exists(directory)) {
     return {"<missing>"};
   }
   std::vector<std::string> files = ListGoogleSqlComplianceFiles(directory);
-  if (files.empty()) { return {"<empty>"}; }
+  if (files.empty()) {
+    return {"<empty>"};
+  }
   return files;
 }
+}  // namespace
 
 INSTANTIATE_TEST_SUITE_P(
     GoogleSqlCompliance, GoogleSqlComplianceFileTest,
@@ -651,7 +715,9 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<std::string>& param) {
       std::string name = param.param;
       for (char& c : name) {
-        if (std::isalnum(static_cast<unsigned char>(c)) == 0) { c = '_'; }
+        if (std::isalnum(static_cast<unsigned char>(c)) == 0) {
+          c = '_';
+        }
       }
       return name;
     });

@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <functional>
 #include <ostream>
+#include <string>
+#include <utility>
 
 #include "common/constants.hpp"
 #include "page/branch_page.hpp"

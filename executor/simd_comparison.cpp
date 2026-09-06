@@ -1,13 +1,15 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/simd_comparison.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string_view>
 
+#include "common/constants.hpp"
 #include "executor/selection_vector.hpp"
-#include "expression/binary_expression.hpp"
 
 namespace tinylamb {
 
@@ -71,28 +73,26 @@ void SimdComparisonKernel::CompareInt64(const int64_t* data, size_t count,
   assert(out_mask != nullptr);
   switch (op) {
     case BinaryOperation::kEquals:
-      EvaluateScalarComparison(data, count, target, std::equal_to<int64_t>(),
+      EvaluateScalarComparison(data, count, target, std::equal_to<>(),
                                out_mask);
       break;
     case BinaryOperation::kNotEquals:
-      EvaluateScalarComparison(data, count, target,
-                               std::not_equal_to<int64_t>(), out_mask);
-      break;
-    case BinaryOperation::kLessThan:
-      EvaluateScalarComparison(data, count, target, std::less<int64_t>(),
+      EvaluateScalarComparison(data, count, target, std::not_equal_to<>(),
                                out_mask);
       break;
+    case BinaryOperation::kLessThan:
+      EvaluateScalarComparison(data, count, target, std::less<>(), out_mask);
+      break;
     case BinaryOperation::kLessThanEquals:
-      EvaluateScalarComparison(data, count, target, std::less_equal<int64_t>(),
+      EvaluateScalarComparison(data, count, target, std::less_equal<>(),
                                out_mask);
       break;
     case BinaryOperation::kGreaterThan:
-      EvaluateScalarComparison(data, count, target, std::greater<int64_t>(),
-                               out_mask);
+      EvaluateScalarComparison(data, count, target, std::greater<>(), out_mask);
       break;
     case BinaryOperation::kGreaterThanEquals:
-      EvaluateScalarComparison(data, count, target,
-                               std::greater_equal<int64_t>(), out_mask);
+      EvaluateScalarComparison(data, count, target, std::greater_equal<>(),
+                               out_mask);
       break;
     default:
       out_mask->Reset(count, false);
@@ -106,28 +106,26 @@ void SimdComparisonKernel::CompareDouble(const double* data, size_t count,
   assert(out_mask != nullptr);
   switch (op) {
     case BinaryOperation::kEquals:
-      EvaluateScalarComparison(data, count, target, std::equal_to<double>(),
+      EvaluateScalarComparison(data, count, target, std::equal_to<>(),
                                out_mask);
       break;
     case BinaryOperation::kNotEquals:
-      EvaluateScalarComparison(data, count, target, std::not_equal_to<double>(),
+      EvaluateScalarComparison(data, count, target, std::not_equal_to<>(),
                                out_mask);
       break;
     case BinaryOperation::kLessThan:
-      EvaluateScalarComparison(data, count, target, std::less<double>(),
-                               out_mask);
+      EvaluateScalarComparison(data, count, target, std::less<>(), out_mask);
       break;
     case BinaryOperation::kLessThanEquals:
-      EvaluateScalarComparison(data, count, target, std::less_equal<double>(),
+      EvaluateScalarComparison(data, count, target, std::less_equal<>(),
                                out_mask);
       break;
     case BinaryOperation::kGreaterThan:
-      EvaluateScalarComparison(data, count, target, std::greater<double>(),
-                               out_mask);
+      EvaluateScalarComparison(data, count, target, std::greater<>(), out_mask);
       break;
     case BinaryOperation::kGreaterThanEquals:
-      EvaluateScalarComparison(data, count, target,
-                               std::greater_equal<double>(), out_mask);
+      EvaluateScalarComparison(data, count, target, std::greater_equal<>(),
+                               out_mask);
       break;
     default:
       out_mask->Reset(count, false);
@@ -142,28 +140,25 @@ void SimdComparisonKernel::CompareStringPrefix(const std::string_view* data,
   assert(out_mask != nullptr);
   switch (op) {
     case BinaryOperation::kEquals:
-      EvaluateScalarComparison(data, count, target,
-                               std::equal_to<std::string_view>(), out_mask);
+      EvaluateScalarComparison(data, count, target, std::equal_to<>(),
+                               out_mask);
       break;
     case BinaryOperation::kNotEquals:
-      EvaluateScalarComparison(data, count, target,
-                               std::not_equal_to<std::string_view>(), out_mask);
+      EvaluateScalarComparison(data, count, target, std::not_equal_to<>(),
+                               out_mask);
       break;
     case BinaryOperation::kLessThan:
-      EvaluateScalarComparison(data, count, target,
-                               std::less<std::string_view>(), out_mask);
+      EvaluateScalarComparison(data, count, target, std::less<>(), out_mask);
       break;
     case BinaryOperation::kLessThanEquals:
-      EvaluateScalarComparison(data, count, target,
-                               std::less_equal<std::string_view>(), out_mask);
+      EvaluateScalarComparison(data, count, target, std::less_equal<>(),
+                               out_mask);
       break;
     case BinaryOperation::kGreaterThan:
-      EvaluateScalarComparison(data, count, target,
-                               std::greater<std::string_view>(), out_mask);
+      EvaluateScalarComparison(data, count, target, std::greater<>(), out_mask);
       break;
     case BinaryOperation::kGreaterThanEquals:
-      EvaluateScalarComparison(data, count, target,
-                               std::greater_equal<std::string_view>(),
+      EvaluateScalarComparison(data, count, target, std::greater_equal<>(),
                                out_mask);
       break;
     default:
@@ -179,26 +174,23 @@ void SimdComparisonKernel::CompareInt64Vectors(const int64_t* lhs,
   assert(out_mask != nullptr);
   switch (op) {
     case BinaryOperation::kEquals:
-      EvaluateVectorComparison(lhs, rhs, count, std::equal_to<int64_t>(),
-                               out_mask);
+      EvaluateVectorComparison(lhs, rhs, count, std::equal_to<>(), out_mask);
       break;
     case BinaryOperation::kNotEquals:
-      EvaluateVectorComparison(lhs, rhs, count, std::not_equal_to<int64_t>(),
+      EvaluateVectorComparison(lhs, rhs, count, std::not_equal_to<>(),
                                out_mask);
       break;
     case BinaryOperation::kLessThan:
-      EvaluateVectorComparison(lhs, rhs, count, std::less<int64_t>(), out_mask);
+      EvaluateVectorComparison(lhs, rhs, count, std::less<>(), out_mask);
       break;
     case BinaryOperation::kLessThanEquals:
-      EvaluateVectorComparison(lhs, rhs, count, std::less_equal<int64_t>(),
-                               out_mask);
+      EvaluateVectorComparison(lhs, rhs, count, std::less_equal<>(), out_mask);
       break;
     case BinaryOperation::kGreaterThan:
-      EvaluateVectorComparison(lhs, rhs, count, std::greater<int64_t>(),
-                               out_mask);
+      EvaluateVectorComparison(lhs, rhs, count, std::greater<>(), out_mask);
       break;
     case BinaryOperation::kGreaterThanEquals:
-      EvaluateVectorComparison(lhs, rhs, count, std::greater_equal<int64_t>(),
+      EvaluateVectorComparison(lhs, rhs, count, std::greater_equal<>(),
                                out_mask);
       break;
     default:
@@ -214,26 +206,23 @@ void SimdComparisonKernel::CompareDoubleVectors(const double* lhs,
   assert(out_mask != nullptr);
   switch (op) {
     case BinaryOperation::kEquals:
-      EvaluateVectorComparison(lhs, rhs, count, std::equal_to<double>(),
-                               out_mask);
+      EvaluateVectorComparison(lhs, rhs, count, std::equal_to<>(), out_mask);
       break;
     case BinaryOperation::kNotEquals:
-      EvaluateVectorComparison(lhs, rhs, count, std::not_equal_to<double>(),
+      EvaluateVectorComparison(lhs, rhs, count, std::not_equal_to<>(),
                                out_mask);
       break;
     case BinaryOperation::kLessThan:
-      EvaluateVectorComparison(lhs, rhs, count, std::less<double>(), out_mask);
+      EvaluateVectorComparison(lhs, rhs, count, std::less<>(), out_mask);
       break;
     case BinaryOperation::kLessThanEquals:
-      EvaluateVectorComparison(lhs, rhs, count, std::less_equal<double>(),
-                               out_mask);
+      EvaluateVectorComparison(lhs, rhs, count, std::less_equal<>(), out_mask);
       break;
     case BinaryOperation::kGreaterThan:
-      EvaluateVectorComparison(lhs, rhs, count, std::greater<double>(),
-                               out_mask);
+      EvaluateVectorComparison(lhs, rhs, count, std::greater<>(), out_mask);
       break;
     case BinaryOperation::kGreaterThanEquals:
-      EvaluateVectorComparison(lhs, rhs, count, std::greater_equal<double>(),
+      EvaluateVectorComparison(lhs, rhs, count, std::greater_equal<>(),
                                out_mask);
       break;
     default:

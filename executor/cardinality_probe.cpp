@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <ostream>
 #include <string>
 
@@ -43,7 +44,7 @@ size_t CardinalityProbe::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 void CardinalityProbe::Dump(std::ostream& o, int indent) const {
-  o << std::string(indent, ' ') << "CardinalityProbe (op: "
+  o << std::string(static_cast<size_t>(indent), ' ') << "CardinalityProbe (op: "
     << (operator_name_.empty() ? "unnamed" : operator_name_)
     << ", est: " << estimated_cardinality_ << ", act: " << actual_rows_
     << ", error: " << CardinalityError() << "x)\n";

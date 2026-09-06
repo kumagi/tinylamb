@@ -40,11 +40,12 @@ class ConstantValue : public ExpressionBase {
     return val_;
   }
   [[nodiscard]] const Value& GetValue() const { return val_; }
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override {
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/) const override {
     return TypeForValue();
   }
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&,
-                                          const Schema&) const override {
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/, const Schema& /*unused*/) const override {
     return TypeForValue();
   }
 
@@ -62,19 +63,19 @@ class ConstantValue : public ExpressionBase {
   [[nodiscard]] tinylamb::Type TypeForValue() const {
     switch (val_.type) {
       case ValueType::kInt64:
-        return tinylamb::Type(TypeTag::kBigInt);
+        return {TypeTag::kBigInt};
       case ValueType::kDouble:
-        return tinylamb::Type(TypeTag::kDouble);
+        return {TypeTag::kDouble};
       case ValueType::kVarChar:
-        return tinylamb::Type(TypeTag::kVarChar);
+        return {TypeTag::kVarChar};
       case ValueType::kDate:
-        return tinylamb::Type(TypeTag::kDate);
+        return {TypeTag::kDate};
       case ValueType::kArray:
-        return tinylamb::Type(TypeTag::kArray);
+        return {TypeTag::kArray};
       case ValueType::kNull:
-        return tinylamb::Type(TypeTag::kInvalid);
+        return {TypeTag::kInvalid};
     }
-    return tinylamb::Type(TypeTag::kInvalid);
+    return {TypeTag::kInvalid};
   }
   Value val_;
 };

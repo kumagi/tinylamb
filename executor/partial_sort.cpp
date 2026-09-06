@@ -5,11 +5,11 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
-#include <memory>
 #include <utility>
 #include <vector>
 
 #include "executor/data_chunk.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/sort.hpp"
 #include "expression/expression.hpp"
@@ -27,7 +27,9 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
   for (const auto& key : keys) {
     Value lv = key.expression->Evaluate(lhs, schema);
     Value rv = key.expression->Evaluate(rhs, schema);
-    if (lv.IsNull() && rv.IsNull()) continue;
+    if (lv.IsNull() && rv.IsNull()) {
+      continue;
+    }
     if (lv.IsNull()) {
       bool nulls_first = key.nulls_first.value_or(key.ascending);
       return nulls_first ? -1 : 1;
@@ -36,8 +38,12 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
       bool nulls_first = key.nulls_first.value_or(key.ascending);
       return nulls_first ? 1 : -1;
     }
-    if (lv < rv) return key.ascending ? -1 : 1;
-    if (rv < lv) return key.ascending ? 1 : -1;
+    if (lv < rv) {
+      return key.ascending ? -1 : 1;
+    }
+    if (rv < lv) {
+      return key.ascending ? 1 : -1;
+    }
   }
   return 0;
 }
@@ -79,9 +85,10 @@ void PartialSortExecutor::ExecutePartialSort() {
       current_block.emplace_back(std::move(row), rp);
       if (current_block.size() >= block_size_) {
         if (top_k_ > 0 && top_k_ < current_block.size()) {
-          std::partial_sort(current_block.begin(),
-                            current_block.begin() + top_k_, current_block.end(),
-                            comp);
+          std::partial_sort(
+              current_block.begin(),
+              current_block.begin() + static_cast<std::ptrdiff_t>(top_k_),
+              current_block.end(), comp);
           current_block.resize(top_k_);
         } else {
           std::sort(current_block.begin(), current_block.end(), comp);
@@ -94,8 +101,10 @@ void PartialSortExecutor::ExecutePartialSort() {
     }
     if (!current_block.empty()) {
       if (top_k_ > 0 && top_k_ < current_block.size()) {
-        std::partial_sort(current_block.begin(), current_block.begin() + top_k_,
-                          current_block.end(), comp);
+        std::partial_sort(
+            current_block.begin(),
+            current_block.begin() + static_cast<std::ptrdiff_t>(top_k_),
+            current_block.end(), comp);
         current_block.resize(top_k_);
       } else {
         std::sort(current_block.begin(), current_block.end(), comp);
@@ -116,8 +125,10 @@ void PartialSortExecutor::ExecutePartialSort() {
     }
     const size_t limit_k = top_k_ > 0 ? (offset_ + top_k_) : input_rows.size();
     if (limit_k < input_rows.size()) {
-      std::partial_sort(input_rows.begin(), input_rows.begin() + limit_k,
-                        input_rows.end(), comp);
+      std::partial_sort(
+          input_rows.begin(),
+          input_rows.begin() + static_cast<std::ptrdiff_t>(limit_k),
+          input_rows.end(), comp);
       const size_t start = std::min(offset_, input_rows.size());
       const size_t end = std::min(limit_k, input_rows.size());
       for (size_t i = start; i < end; ++i) {

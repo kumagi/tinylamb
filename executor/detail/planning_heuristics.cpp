@@ -2,6 +2,7 @@
 #include "executor/detail/planning_heuristics.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -34,6 +35,7 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "query/statement.hpp"
@@ -42,9 +44,12 @@
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
+#include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail {
+
+namespace {
 
 bool IsVirtualValueTableField(const Schema& schema, const ColumnName& name) {
   if (schema.ColumnCount() != 1) {
@@ -70,6 +75,8 @@ bool IsVirtualValueTableField(const Schema& schema, const ColumnName& name) {
                               std::tolower(static_cast<unsigned char>(right));
                      }));
 }
+
+}  // namespace
 
 std::vector<PredicateInfo> AnalyzePredicates(
     const Expression& where, const std::vector<Relation>& relations) {
@@ -241,6 +248,8 @@ std::string EncodeJoinKey(const Row& row, const std::vector<slot_t>& columns) {
 // IS NOT DISTINCT FROM. Encode the NULL/non-NULL state explicitly instead of
 // passing Value::kNull to the regular mem-comparable encoder, which correctly
 // rejects untyped NULL for ordinary hash joins.
+namespace {
+
 std::string EncodeNullSafeJoinKey(const Row& row,
                                   const std::vector<slot_t>& columns) {
   std::string key;
@@ -256,6 +265,8 @@ std::string EncodeNullSafeJoinKey(const Row& row,
   }
   return key;
 }
+
+}  // namespace
 
 size_t EstimateJoinRows(const Relation& left, const Relation& right,
                         const std::vector<Expression>& predicates) {
@@ -422,8 +433,7 @@ Relation HybridHashJoin(Relation left, Relation right,
     if (!right_join || resident_right.empty()) {
       return;
     }
-    const size_t index =
-        static_cast<size_t>(&right_row - resident_right.data());
+    const auto index = static_cast<size_t>(&right_row - resident_right.data());
     if (index < resident_matched.size()) {
       resident_matched[index] = 1;
     }
@@ -541,7 +551,7 @@ Relation HybridHashJoin(Relation left, Relation right,
           Row combined = left_row + *iter->second;
           if (matches(combined)) {
             if (right_join) {
-              const size_t index =
+              const auto index =
                   static_cast<size_t>(iter->second - right_rows.data());
               if (index < part_matched.size()) {
                 part_matched[index] = 1;
@@ -559,7 +569,7 @@ Relation HybridHashJoin(Relation left, Relation right,
           Row combined = left_row + *iter->second;
           if (matches(combined)) {
             if (right_join) {
-              const size_t index =
+              const auto index =
                   static_cast<size_t>(iter->second - right_rows.data());
               if (index < part_matched.size()) {
                 part_matched[index] = 1;
@@ -650,7 +660,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
     if (!want_right_nulls || right_base == nullptr) {
       return;
     }
-    const size_t index = static_cast<size_t>(&right_row - right_base);
+    const auto index = static_cast<size_t>(&right_row - right_base);
     if (index < right_matched.size()) {
       right_matched[index] = 1;
     }
@@ -957,6 +967,8 @@ bool IsSubset(const std::unordered_set<size_t>& values,
 // Recursively gathers every column referenced by an expression, descending
 // into subqueries so UNNEST arguments like ARRAY(SELECT ... a ...) report
 // their correlated references.
+namespace {
+
 void CollectColumnsRecursive(  // NOLINT(misc-no-recursion)
     const Expression& expression, std::unordered_set<ColumnName>* columns) {
   if (!expression) {
@@ -975,6 +987,8 @@ void CollectColumnsRecursive(  // NOLINT(misc-no-recursion)
   }
 }
 
+}  // namespace
+
 // Expands a lateral (correlated) UNNEST source against the relation
 // accumulated from the preceding FROM items: for every prefix row the array
 // expression is evaluated with that row in scope and each element becomes an
@@ -984,6 +998,8 @@ void CollectColumnsRecursive(  // NOLINT(misc-no-recursion)
 // standard; suppress it just for this function.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+namespace {
+
 Relation LateralExpandRelation(TransactionContext& context,
                                const SelectSource& source, Relation& prefix,
                                const Scope* outer, const CteMap& ctes) {
@@ -1015,9 +1031,8 @@ Relation LateralExpandRelation(TransactionContext& context,
       if (!name.schema.empty()) {
         return false;
       }
-      return std::any_of(
-          source.using_columns.begin(), source.using_columns.end(),
-          [&](const std::string& candidate) {
+      return std::ranges::any_of(
+          source.using_columns, [&](const std::string& candidate) {
             return candidate.size() == name.name.size() &&
                    std::equal(
                        candidate.begin(), candidate.end(), name.name.begin(),
@@ -1151,7 +1166,7 @@ Relation LateralExpandRelation(TransactionContext& context,
       output.AddRow(std::move(combined));
     });
     if (!matched && left_outer &&
-        !(condition == nullptr && elements.TotalRows() > 0)) {
+        (condition != nullptr || elements.TotalRows() == 0)) {
       std::vector<Value> nulls(output.schema.ColumnCount() - row.values_.size(),
                                Value());
       output.AddRow(row + Row(std::move(nulls)));
@@ -1197,6 +1212,7 @@ Relation LateralExpandRelation(TransactionContext& context,
   output.FinishSpill();
   return output;
 }
+}  // namespace
 #pragma GCC diagnostic pop
 
 Relation BuildInput(TransactionContext& context,
@@ -1312,11 +1328,11 @@ Relation BuildInput(TransactionContext& context,
       // than this source needs breaks evaluation downstream.
       std::vector<slot_t> merged(projections[i]);
       for (const slot_t slot : *shared) {
-        if (std::find(merged.begin(), merged.end(), slot) == merged.end()) {
+        if (std::ranges::find(merged, slot) == merged.end()) {
           merged.push_back(slot);
         }
       }
-      std::sort(merged.begin(), merged.end());
+      std::ranges::sort(merged);
       projections[i] = std::move(merged);
     }
   }

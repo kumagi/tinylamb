@@ -49,7 +49,8 @@ class BlobFile final {
   ~BlobFile() = default;
 
   [[nodiscard]] std::string ReadAt(size_t offset, size_t length) const;
-  [[nodiscard]] Cache::Locks ReadAt(size_t, std::string_view& out) const;
+  [[nodiscard]] Cache::Locks ReadAt(size_t /*offset*/,
+                                    std::string_view& out) const;
   lsn_t Append(std::string_view payload);
   [[nodiscard]] lsn_t Written() const { return file_writer_.CommittedLSN(); }
   void Flush() const {
@@ -63,12 +64,17 @@ class BlobFile final {
       }
       std::this_thread::yield();
     }
-    // Wait for the bytes the run header will reference to survive fdatasync:
-    // SortedRun::FlushInternal fsyncs the run file itself, but a crash
-    // between that fsync and the blob's own group-commit window would leave
-    // a durable run pointing at torn blob payloads (quarantined on restore,
-    // torn reads while running).
-    file_writer_.WaitForDurable(lsn);
+  }
+  // Write-wait (as Flush) plus a durability wait: every byte referenced by a
+  // freshly flushed run must survive fdatasync BEFORE the run is registered.
+  // SortedRun::FlushInternal fsyncs the run file itself, but without this a
+  // crash between that fsync and the blob's own group-commit window leaves a
+  // durable run pointing at torn blob payloads (quarantined on restore:
+  // acknowledged writes lost). Called by LSMTree::Sync, not by readers, so
+  // the read path keeps its write-only wait.
+  void Sync() {
+    Flush();
+    file_writer_.WaitForDurable(file_writer_.BufferedLSN());
   }
 
   friend std::ostream& operator<<(std::ostream& o, const BlobFile& b) {

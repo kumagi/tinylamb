@@ -57,8 +57,7 @@ class RowPageTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(file_name_ + ".log");
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               r_.get());
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
   }
 
   void TearDown() override {
@@ -97,7 +96,7 @@ class RowPageTest : public ::testing::Test {
       auto txn = tm_->Begin();
       PageRef page = p_->GetPage(page_id_);
       ASSERT_EQ(page->Type(), PageType::kRowPage);
-      const Status status = page->Update(txn, slot, str);
+      const Status status = page->Update(txn, static_cast<slot_t>(slot), str);
       if (status == Status::kConflicts) {
         page.PageUnlock();
         txn.Abort();
@@ -121,7 +120,7 @@ class RowPageTest : public ::testing::Test {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(page_id_);
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-    ASSERT_SUCCESS(page->Delete(txn, slot));
+    ASSERT_SUCCESS(page->Delete(txn, static_cast<slot_t>(slot)));
     if (commit) {
       ASSERT_SUCCESS(txn.PreCommit());
     } else {
@@ -135,7 +134,8 @@ class RowPageTest : public ::testing::Test {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(page_id_);
     EXPECT_FALSE(page.IsNull());
-    ASSIGN_OR_CRASH(std::string_view, dst, page->Read(txn, slot));
+    ASSIGN_OR_CRASH(std::string_view, dst,
+                    page->Read(txn, static_cast<slot_t>(slot)));
     EXPECT_SUCCESS(txn.PreCommit());
     txn.CommitWait();
     return std::string(dst);

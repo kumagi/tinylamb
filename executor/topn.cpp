@@ -3,16 +3,16 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <functional>
 #include <ostream>
 #include <queue>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 void TopNExecutor::Materialize() {
@@ -152,13 +152,14 @@ bool TopNExecutor::Next(Row* dst, RowPosition* position) {
 }
 
 void TopNExecutor::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "TopN (limit=" << limit_ << ", offset=" << offset_
-         << (with_ties_ ? ", with ties" : "") << ")\n"
-         << Indent(indent + 2);
+  output << Indent(static_cast<size_t>(indent)) << "TopN (limit=" << limit_
+         << ", offset=" << offset_ << (with_ties_ ? ", with ties" : "") << ")\n"
+         << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(output, indent + 2);
   if (materialized_) {
     output << "\n"
-           << Indent(indent) << "TopN heap_capacity=" << heap_capacity_
+           << Indent(static_cast<size_t>(indent))
+           << "TopN heap_capacity=" << heap_capacity_
            << " input_rows=" << input_rows_ << " output_rows="
            << (output_end_ - std::min(offset_, rows_.size()));
   }

@@ -55,6 +55,14 @@ class TpccWorkloadTest : public ::testing::Test {
   std::unique_ptr<Database> database_;
 };
 
+namespace {
+// Deliberately out-of-range TpccTransactionType probe for fallback arms.
+TpccTransactionType InvalidTpccTypeForTest() {
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  return static_cast<TpccTransactionType>(99);
+}
+}  // namespace
+
 TEST(TpccScaleTest, OfficialMatchesClause43) {
   const TpccScale scale = TpccScale::Official(1);
   EXPECT_EQ(scale.ScaleFactor(), 1);
@@ -305,9 +313,7 @@ TEST(TpccScaleTest, ToStringCoversEveryTransactionType) {
   EXPECT_EQ(ToString(TpccTransactionType::kStockLevel), "stock_level");
   EXPECT_EQ(ToString(TpccTransactionType::kCount), "unknown");
   // Deliberately out-of-range value to probe the fallback arm.
-  EXPECT_EQ(ToString(static_cast<TpccTransactionType>(
-                99)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
-            "unknown");
+  EXPECT_EQ(ToString(InvalidTpccTypeForTest()), "unknown");
 }
 
 TEST_F(TpccWorkloadTest, ExecuteOnUninitializedDatabaseReportsError) {
@@ -326,8 +332,7 @@ TEST_F(TpccWorkloadTest, ExecuteOnUninitializedDatabaseReportsError) {
 
   // Act -- execute an invalid transaction type (deliberately out of range).
   const TpccTransactionResult invalid =
-      workload.Execute(static_cast<TpccTransactionType>(
-          99));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+      workload.Execute(InvalidTpccTypeForTest());
 
   // Assert -- the invalid type is reported precisely.
   EXPECT_FALSE(invalid.committed);
@@ -426,7 +431,9 @@ TEST_F(TpccWorkloadTest, PaymentRewritesBcCreditData) {
     ASSERT_TRUE(payment.committed) << payment.error;
     rewritten =
         Run("SELECT COUNT(*) FROM customer WHERE c_data <> 'customer data';");
-    if (rewritten[0][0].value.int_value != 0) { break; }
+    if (rewritten[0][0].value.int_value != 0) {
+      break;
+    }
   }
   ASSERT_EQ(rewritten.size(), 1);
   EXPECT_EQ(rewritten[0][0], Value(1));
@@ -451,7 +458,9 @@ TEST_F(TpccWorkloadTest, NewOrderRemoteSupplyUpdatesRemoteStock) {
     ASSERT_TRUE(new_order.committed || new_order.user_rollback)
         << new_order.error;
     remote = Run("SELECT SUM(s_remote_cnt) FROM stock WHERE s_w_id = 2;");
-    if (remote[0][0].value.int_value != 0) { break; }
+    if (remote[0][0].value.int_value != 0) {
+      break;
+    }
   }
   ASSERT_EQ(remote.size(), 1);
   EXPECT_GE(remote[0][0].value.int_value, 1);
@@ -575,8 +584,9 @@ TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
     const TpccTransactionResult result = RunNewOrder(*database, 1);
     EXPECT_FALSE(result.committed);
     EXPECT_FALSE(result.user_rollback);
-    EXPECT_NE(result.error.find("new-order district update affected too few rows"),
-              std::string::npos)
+    EXPECT_NE(
+        result.error.find("new-order district update affected too few rows"),
+        std::string::npos)
         << result.error;
     database->DeleteAll();
   }
@@ -963,8 +973,7 @@ TEST(TpccWorkloadFailPathTest, DeliveryAndStockLevelAbortWhenRowsMissing) {
     const TpccTransactionResult result =
         workload.Execute(TpccTransactionType::kStockLevel);
     EXPECT_FALSE(result.committed);
-    EXPECT_NE(result.error.find("SELECT s_i_id FROM stock"),
-              std::string::npos)
+    EXPECT_NE(result.error.find("SELECT s_i_id FROM stock"), std::string::npos)
         << result.error;
     database->DeleteAll();
   }

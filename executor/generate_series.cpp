@@ -4,9 +4,8 @@
 #include <cstdint>
 #include <ostream>
 #include <stdexcept>
-#include <string>
 
-#include "common/constants.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 

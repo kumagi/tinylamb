@@ -106,6 +106,7 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
     std::string_view dump) {
   std::unique_ptr<GoogleSqlAstNode> root;
   std::vector<GoogleSqlAstNode*> parents;
+  size_t previous_depth = 0;
   size_t cursor = 0;
   while (cursor < dump.size()) {
     size_t line_end = dump.find('\n', cursor);
@@ -156,7 +157,11 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
       }
       root = std::move(node);
     } else {
-      if (depth > parents.size()) {
+      // A child may descend only one level per line.  Attaching at
+      // parents[depth - 1] without that bound lets a malformed jump (e.g.
+      // depths 0,1,2,1,3) graft the node onto a stale ancestor two levels
+      // up, silently producing a corrupted tree instead of kUnknown.
+      if (depth > parents.size() || depth > previous_depth + 1) {
         return Status::kUnknown;
       }
       parents[depth - 1]->children.push_back(std::move(node));
@@ -166,6 +171,7 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
     }
     parents[depth] = raw;
     parents.resize(depth + 1);
+    previous_depth = depth;
   }
   if (!root) {
     return Status::kUnknown;

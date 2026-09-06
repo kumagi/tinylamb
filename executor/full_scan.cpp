@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <ostream>
 
 #include "executor/data_chunk.hpp"

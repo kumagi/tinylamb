@@ -56,7 +56,7 @@
 namespace tinylamb {
 namespace {
 int OpenFile(const std::filesystem::path& path) {
-  return ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666);
+  return ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
 }
 
 // Returns -1 if lhs is definitely bigger than `rhs`.
@@ -235,7 +235,7 @@ std::string SortedRun::Entry::BuildValue(const BlobFile& blob) const {
 }
 
 SortedRun::SortedRun(const std::filesystem::path& file) {
-  int fd = ::open(file.c_str(), O_RDONLY);
+  int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     // A constructor cannot report Status; a broken run must not survive as a
     // half-initialized object whose later GetEntry() dereferences null.
@@ -293,8 +293,8 @@ SortedRun::SortedRun(const std::filesystem::path& file) {
   // before promoting the run; incomplete images throw so the restore scan
   // quarantines them instead of serving corrupt reads.
   struct stat status{};
-  if (::fstat(fd, &status) != 0 ||
-      static_cast<size_t>(status.st_size) < offset + length_ * sizeof(Entry)) {
+  if (::fstat(fd, &status) != 0 || static_cast<size_t>(status.st_size) <
+                                       offset + (length_ * sizeof(Entry))) {
     ::close(fd);
     throw std::runtime_error("Incomplete run file: " + file.string());
   }
@@ -379,8 +379,8 @@ Status SortedRun::FlushInternal(const std::filesystem::path& path,
   size_t written_total = 0;
   size_t vec_index = 0;
   while (vec_index < vec.size()) {
-    const ssize_t written =
-        ::writev(fd, vec.data() + vec_index, vec.size() - vec_index);
+    const ssize_t written = ::writev(fd, vec.data() + vec_index,
+                                     static_cast<int>(vec.size() - vec_index));
     if (written < 0) {
       if (errno == EINTR) {
         continue;

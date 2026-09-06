@@ -1,16 +1,20 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "type/interval.hpp"
 
-#include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tinylamb {
@@ -19,11 +23,31 @@ namespace {
 
 thread_local std::unordered_map<std::string, std::string> tls_session_constants;
 
+// snprintf whose result is enforced: a negative return means an encoding
+// failure that would otherwise surface as stale buffer contents. Truncation
+// keeps the historical silently-clipped behavior. The C-style ellipsis is
+// required to forward to vsnprintf; the format attribute guards it.
+int CheckedSnprintf(char* buf, size_t size, const char* fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+// NOLINTNEXTLINE(cert-dcl50-cpp)
+int CheckedSnprintf(char* buf, size_t size, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = std::vsnprintf(buf, size, fmt, ap);
+  va_end(ap);
+  if (n < 0) {
+    throw std::runtime_error("INTERVAL formatting failed");
+  }
+  return n;
+}
+
 std::string Trim(std::string_view s) {
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+  while (!s.empty() &&
+         (std::isspace(static_cast<unsigned char>(s.front())) != 0)) {
     s.remove_prefix(1);
   }
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+  while (!s.empty() &&
+         (std::isspace(static_cast<unsigned char>(s.back())) != 0)) {
     s.remove_suffix(1);
   }
   return std::string(s);
@@ -72,9 +96,9 @@ IntervalValue IntervalValue::JustifyHours() const {
   int64_t res_nanos = abs_nanos % kDayNanos;
 
   if (neg) {
-    return {months, -res_days, -res_nanos};
+    return {.months = months, .days = -res_days, .nanos = -res_nanos};
   }
-  return {months, res_days, res_nanos};
+  return {.months = months, .days = res_days, .nanos = res_nanos};
 }
 
 IntervalValue IntervalValue::JustifyDays() const {
@@ -90,9 +114,9 @@ IntervalValue IntervalValue::JustifyDays() const {
   int64_t res_days = abs_days % 30;
 
   if (neg) {
-    return {-res_months, -res_days, nanos};
+    return {.months = -res_months, .days = -res_days, .nanos = nanos};
   }
-  return {res_months, res_days, nanos};
+  return {.months = res_months, .days = res_days, .nanos = nanos};
 }
 
 IntervalValue IntervalValue::JustifyInterval() const {
@@ -111,9 +135,9 @@ IntervalValue IntervalValue::JustifyInterval() const {
   int64_t res_nanos = rem_after_months % kDayNanos;
 
   if (neg) {
-    return {-res_months, -res_days, -res_nanos};
+    return {.months = -res_months, .days = -res_days, .nanos = -res_nanos};
   }
-  return {res_months, res_days, res_nanos};
+  return {.months = res_months, .days = res_days, .nanos = res_nanos};
 }
 
 std::string IntervalValue::ToString() const {
@@ -125,17 +149,18 @@ std::string IntervalValue::ToString() const {
   int64_t min = (total_sec % 3600) / 60;
   int64_t s = total_sec % 60;
 
-  char ym_buf[64];
+  std::array<char, 64> ym_buf{};
   if (months < 0) {
-    snprintf(ym_buf, sizeof(ym_buf), "-%ld-%ld", std::abs(y), std::abs(m));
+    CheckedSnprintf(ym_buf.data(), ym_buf.size(), "-%ld-%ld", std::abs(y),
+                    std::abs(m));
   } else {
-    snprintf(ym_buf, sizeof(ym_buf), "%ld-%ld", y, m);
+    CheckedSnprintf(ym_buf.data(), ym_buf.size(), "%ld-%ld", y, m);
   }
 
-  char d_buf[32];
-  snprintf(d_buf, sizeof(d_buf), "%ld", days);
+  std::array<char, 32> d_buf{};
+  CheckedSnprintf(d_buf.data(), d_buf.size(), "%ld", days);
 
-  char t_buf[64];
+  std::array<char, 64> t_buf{};
   bool neg_time = (nanos < 0);
   int64_t abs_h = std::abs(h);
   int64_t abs_min = std::abs(min);
@@ -143,21 +168,21 @@ std::string IntervalValue::ToString() const {
   int64_t abs_sub_ns = std::abs(sub_ns);
 
   if (abs_sub_ns != 0) {
-    char frac[16];
-    snprintf(frac, sizeof(frac), "%09ld", abs_sub_ns);
+    std::array<char, 16> frac{};
+    CheckedSnprintf(frac.data(), frac.size(), "%09ld", abs_sub_ns);
     size_t end = 9;
     while (end > 0 && frac[end - 1] == '0') {
       --end;
     }
     frac[end] = '\0';
-    snprintf(t_buf, sizeof(t_buf), "%s%ld:%ld:%ld.%s", neg_time ? "-" : "",
-             abs_h, abs_min, abs_s, frac);
+    CheckedSnprintf(t_buf.data(), t_buf.size(), "%s%ld:%ld:%ld.%s",
+                    neg_time ? "-" : "", abs_h, abs_min, abs_s, frac.data());
   } else {
-    snprintf(t_buf, sizeof(t_buf), "%s%ld:%ld:%ld", neg_time ? "-" : "", abs_h,
-             abs_min, abs_s);
+    CheckedSnprintf(t_buf.data(), t_buf.size(), "%s%ld:%ld:%ld",
+                    neg_time ? "-" : "", abs_h, abs_min, abs_s);
   }
 
-  return std::string(ym_buf) + " " + d_buf + " " + t_buf;
+  return std::string(ym_buf.data()) + " " + d_buf.data() + " " + t_buf.data();
 }
 
 IntervalValue IntervalValue::Parse(std::string_view text,
@@ -203,9 +228,9 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         ++pos;
       }
       size_t num_start = pos;
-      while (
-          pos < s.size() &&
-          (std::isdigit(static_cast<unsigned char>(s[pos])) || s[pos] == '.')) {
+      while (pos < s.size() &&
+             ((std::isdigit(static_cast<unsigned char>(s[pos])) != 0) ||
+              s[pos] == '.')) {
         ++pos;
       }
       if (num_start == pos) {
@@ -226,10 +251,10 @@ IntervalValue IntervalValue::Parse(std::string_view text,
       }
       char desig =
           static_cast<char>(std::toupper(static_cast<unsigned char>(s[pos++])));
-      double val = std::stod(num_str) * sign;
+      double val = std::stod(num_str) * static_cast<double>(sign);
       // C++20 makes an out-of-range double-to-integral cast undefined; a
       // literal like P9e300Y must be rejected, not cast to garbage.
-      if (!(val >= -9.3e18 && val <= 9.3e18)) {
+      if (val < -9.3e18 || val > 9.3e18) {
         throw std::runtime_error(
             "generic::out_of_range: INTERVAL value out of range");
       }
@@ -284,13 +309,13 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         checked_add(checked_mul(parsed_h, 3600), checked_mul(parsed_min, 60)),
         1000000000LL);
     const double sec_nanos = std::round(parsed_sec * 1000000000.0);
-    if (!(sec_nanos >= -9.2e18 && sec_nanos <= 9.2e18)) {
+    if (sec_nanos < -9.2e18 || sec_nanos > 9.2e18) {
       throw std::runtime_error(
           "generic::out_of_range: INTERVAL value out of range");
     }
     int64_t tot_nanos =
         checked_add(hour_nanos, static_cast<int64_t>(sec_nanos));
-    return {tot_months, parsed_d, tot_nanos};
+    return {.months = tot_months, .days = parsed_d, .nanos = tot_nanos};
   }
 
   // Single unit conversions
@@ -307,13 +332,13 @@ IntervalValue IntervalValue::Parse(std::string_view text,
       }
       size_t digits = 0;
       for (const char c : s) {
-        if (std::isdigit(static_cast<unsigned char>(c))) {
+        if (std::isdigit(static_cast<unsigned char>(c)) != 0) {
           ++digits;
         }
       }
       const auto [ptr, ec] = std::from_chars(begin, end, ival);
       return ec == std::errc() && ptr == end &&
-             digits == static_cast<size_t>(end - begin);
+             std::cmp_equal(digits, end - begin);
     }();
     if (!integral) {
       double dval = 0.0;
@@ -332,109 +357,125 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         return static_cast<int64_t>(rounded);
       };
       if (u == "year" || u == "years") {
-        return {to_int64(dval * 12), 0, 0};
+        return {.months = to_int64(dval * 12), .days = 0, .nanos = 0};
       }
       if (u == "quarter" || u == "quarters") {
-        return {to_int64(dval * 3), 0, 0};
+        return {.months = to_int64(dval * 3), .days = 0, .nanos = 0};
       }
       if (u == "month" || u == "months") {
-        return {to_int64(dval), 0, 0};
+        return {.months = to_int64(dval), .days = 0, .nanos = 0};
       }
       if (u == "week" || u == "weeks") {
-        return {0, to_int64(dval * 7), 0};
+        return {.months = 0, .days = to_int64(dval * 7), .nanos = 0};
       }
       if (u == "day" || u == "days") {
-        return {0, to_int64(dval), 0};
+        return {.months = 0, .days = to_int64(dval), .nanos = 0};
       }
       if (u == "hour" || u == "hours") {
-        return {0, 0, to_int64(dval * 3600.0 * 1e9)};
+        return {.months = 0, .days = 0, .nanos = to_int64(dval * 3600.0 * 1e9)};
       }
       if (u == "minute" || u == "minutes") {
-        return {0, 0, to_int64(dval * 60.0 * 1e9)};
+        return {.months = 0, .days = 0, .nanos = to_int64(dval * 60.0 * 1e9)};
       }
       if (u == "second" || u == "seconds") {
-        return {0, 0, to_int64(dval * 1e9)};
+        return {.months = 0, .days = 0, .nanos = to_int64(dval * 1e9)};
       }
       if (u == "millisecond" || u == "milliseconds") {
-        return {0, 0, to_int64(dval * 1e6)};
+        return {.months = 0, .days = 0, .nanos = to_int64(dval * 1e6)};
       }
       if (u == "microsecond" || u == "microseconds") {
-        return {0, 0, to_int64(dval * 1e3)};
+        return {.months = 0, .days = 0, .nanos = to_int64(dval * 1e3)};
       }
       if (u == "nanosecond" || u == "nanoseconds") {
-        return {0, 0, to_int64(dval)};
+        return {.months = 0, .days = 0, .nanos = to_int64(dval)};
       }
     }
     if (u == "year" || u == "years") {
-      return {__builtin_mul_overflow(ival, int64_t{12}, &ival)
+      return {
+          .months =
+              __builtin_mul_overflow(ival, int64_t{12}, &ival)
                   ? throw std::runtime_error(
                         "generic::out_of_range: INTERVAL value out of range")
                   : ival,
-              0, 0};
+          .days = 0,
+          .nanos = 0};
     }
     if (u == "quarter" || u == "quarters") {
-      return {__builtin_mul_overflow(ival, int64_t{3}, &ival)
+      return {
+          .months =
+              __builtin_mul_overflow(ival, int64_t{3}, &ival)
                   ? throw std::runtime_error(
                         "generic::out_of_range: INTERVAL value out of range")
                   : ival,
-              0, 0};
+          .days = 0,
+          .nanos = 0};
     }
     if (u == "month" || u == "months") {
-      return {ival, 0, 0};
+      return {.months = ival, .days = 0, .nanos = 0};
     }
     if (u == "week" || u == "weeks") {
-      return {0,
+      return {
+          .months = 0,
+          .days =
               __builtin_mul_overflow(ival, int64_t{7}, &ival)
                   ? throw std::runtime_error(
                         "generic::out_of_range: INTERVAL value out of range")
                   : ival,
-              0};
+          .nanos = 0};
     }
     if (u == "day" || u == "days") {
-      return {0, ival, 0};
+      return {.months = 0, .days = ival, .nanos = 0};
     }
     if (u == "hour" || u == "hours") {
-      return {0, 0,
-              __builtin_mul_overflow(ival, int64_t{3600} * 1000000000LL, &ival)
-                  ? throw std::runtime_error(
-                        "generic::out_of_range: INTERVAL value out of "
-                        "range")
-                  : ival};
+      return {.months = 0,
+              .days = 0,
+              .nanos = __builtin_mul_overflow(
+                           ival, int64_t{3600} * 1000000000LL, &ival)
+                           ? throw std::runtime_error(
+                                 "generic::out_of_range: INTERVAL value out of "
+                                 "range")
+                           : ival};
     }
     if (u == "minute" || u == "minutes") {
-      return {0, 0,
-              __builtin_mul_overflow(ival, int64_t{60} * 1000000000LL, &ival)
-                  ? throw std::runtime_error(
-                        "generic::out_of_range: INTERVAL value out of "
-                        "range")
-                  : ival};
+      return {.months = 0,
+              .days = 0,
+              .nanos = __builtin_mul_overflow(ival, int64_t{60} * 1000000000LL,
+                                              &ival)
+                           ? throw std::runtime_error(
+                                 "generic::out_of_range: INTERVAL value out of "
+                                 "range")
+                           : ival};
     }
     if (u == "second" || u == "seconds") {
-      return {0, 0,
-              __builtin_mul_overflow(ival, int64_t{1000000000LL}, &ival)
-                  ? throw std::runtime_error(
-                        "generic::out_of_range: INTERVAL value out of "
-                        "range")
-                  : ival};
+      return {
+          .months = 0,
+          .days = 0,
+          .nanos = __builtin_mul_overflow(ival, int64_t{1000000000LL}, &ival)
+                       ? throw std::runtime_error(
+                             "generic::out_of_range: INTERVAL value out of "
+                             "range")
+                       : ival};
     }
     if (u == "millisecond" || u == "milliseconds") {
-      return {0, 0,
-              __builtin_mul_overflow(ival, int64_t{1000000}, &ival)
-                  ? throw std::runtime_error(
-                        "generic::out_of_range: INTERVAL value out of "
-                        "range")
-                  : ival};
+      return {.months = 0,
+              .days = 0,
+              .nanos = __builtin_mul_overflow(ival, int64_t{1000000}, &ival)
+                           ? throw std::runtime_error(
+                                 "generic::out_of_range: INTERVAL value out of "
+                                 "range")
+                           : ival};
     }
     if (u == "microsecond" || u == "microseconds") {
-      return {0, 0,
-              __builtin_mul_overflow(ival, int64_t{1000}, &ival)
-                  ? throw std::runtime_error(
-                        "generic::out_of_range: INTERVAL value out of "
-                        "range")
-                  : ival};
+      return {.months = 0,
+              .days = 0,
+              .nanos = __builtin_mul_overflow(ival, int64_t{1000}, &ival)
+                           ? throw std::runtime_error(
+                                 "generic::out_of_range: INTERVAL value out of "
+                                 "range")
+                           : ival};
     }
     if (u == "nanosecond" || u == "nanoseconds") {
-      return {0, 0, ival};
+      return {.months = 0, .days = 0, .nanos = ival};
     }
   }
 
@@ -457,8 +498,8 @@ IntervalValue IntervalValue::Parse(std::string_view text,
   // Explicit unit ranges ("month to hour", "day to second", ...) assign one
   // component per whitespace-separated number starting at the low unit.
   if (u.find(" to ") != std::string::npos) {
-    static const char* kUnitNames[] = {"year", "month",  "day",
-                                       "hour", "minute", "second"};
+    static constexpr std::array<std::string_view, 6> kUnitNames = {
+        "year", "month", "day", "hour", "minute", "second"};
     const std::string& range = u;
     const size_t split = range.find(" to ");
     const std::string lo_unit = range.substr(0, split);
@@ -469,7 +510,7 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         base.pop_back();
       }
       for (int i = 5; i >= 0; --i) {
-        if (base.rfind(kUnitNames[i], 0) == 0) {
+        if (base.starts_with(kUnitNames[static_cast<size_t>(i)])) {
           return i;
         }
       }
@@ -486,9 +527,15 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         if (p.find(':') != std::string::npos) {
           int64_t th = 0, tm = 0;
           double ts = 0.0;
-          sscanf(p.c_str(), "%ld:%ld:%lf", &th, &tm, &ts);
-          iv.nanos += static_cast<int64_t>(
-              std::round((th * 3600 + tm * 60 + ts) * 1e9));
+          // The integer fields cannot report conversion failures, but a
+          // partially parsed time component is rejected by the != 3 check.
+          // NOLINTNEXTLINE(cert-err34-c)
+          if (sscanf(p.c_str(), "%ld:%ld:%lf", &th, &tm, &ts) != 3) {
+            ok = false;
+            break;
+          }
+          iv.nanos += static_cast<int64_t>(std::round(
+              (static_cast<double>((th * 3600) + (tm * 60)) + ts) * 1e9));
           continue;
         }
         int64_t val = 0;
@@ -564,12 +611,15 @@ IntervalValue IntervalValue::Parse(std::string_view text,
       }
       int64_t th = 0, tm = 0;
       double ts = 0.0;
-      sscanf(time_part.c_str(), "%ld:%ld:%lf", &th, &tm, &ts);
-      int64_t s_int = static_cast<int64_t>(ts);
-      double s_frac = ts - s_int;
-      int64_t sub_ns = static_cast<int64_t>(std::round(s_frac * 1e9));
+      // Failed conversions leave the zero-initialized fields, which is the
+      // accepted parse result for malformed composite parts here.
+      sscanf(  // NOLINT(cert-err33-c,cert-err34-c)
+          time_part.c_str(), "%ld:%ld:%lf", &th, &tm, &ts);
+      auto s_int = static_cast<int64_t>(ts);
+      double s_frac = ts - static_cast<double>(s_int);
+      auto sub_ns = static_cast<int64_t>(std::round(s_frac * 1e9));
       iv.nanos +=
-          ((th * 3600 + tm * 60 + s_int) * 1000000000LL + sub_ns) * sign;
+          (((th * 3600) + (tm * 60) + s_int) * 1000000000LL + sub_ns) * sign;
     } else if (p.find('-') != std::string::npos &&
                (p.size() > 1 && p.find_last_of('-') != 0)) {
       // Y-M
@@ -590,7 +640,7 @@ IntervalValue IntervalValue::Parse(std::string_view text,
           m = 0;
         }
       }
-      iv.months += (y * 12 + m) * sign;
+      iv.months += ((y * 12) + m) * sign;
     } else {
       // Numerical part
       int64_t val = 0;

@@ -18,8 +18,8 @@ TEST(JitTest, JitInt64Kernels_WhenCompiled_MatchScalarResults) {
   std::vector<int64_t> input(4096);
   std::iota(input.begin(), input.end(), int64_t{-2048});
 
-  auto filter = JitInt64Kernels::CompileFilter(
-      BinaryOperation::kGreaterThanEquals);
+  auto filter =
+      JitInt64Kernels::CompileFilter(BinaryOperation::kGreaterThanEquals);
   auto projection = JitInt64Kernels::CompileProjection();
   auto sum = JitInt64Kernels::CompileSum();
   if (!filter.has_value() || !projection.has_value() || !sum.has_value()) {
@@ -65,9 +65,9 @@ TEST(JitTest, CompileFilter_ForEveryComparisonOperator_MatchesScalarReference) {
   };
 
   const std::vector<BinaryOperation> operations{
-      BinaryOperation::kEquals,          BinaryOperation::kNotEquals,
-      BinaryOperation::kLessThan,        BinaryOperation::kLessThanEquals,
-      BinaryOperation::kGreaterThan,     BinaryOperation::kGreaterThanEquals,
+      BinaryOperation::kEquals,      BinaryOperation::kNotEquals,
+      BinaryOperation::kLessThan,    BinaryOperation::kLessThanEquals,
+      BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals,
   };
 
   for (const BinaryOperation op : operations) {
@@ -96,12 +96,13 @@ TEST(JitTest, JitKernel_MoveAssignment_TransfersKernel) {
 
   projection = std::move(filter);
 
-  EXPECT_THROW(projection->Project(input.data(), output.data(), input.size(),
-                                   2, 1),
-               std::logic_error);
+  EXPECT_THROW(
+      projection->Project(input.data(), output.data(), input.size(), 2, 1),
+      std::logic_error);
 }
 
-TEST(JitTest, CompileFilter_WhenCalledRepeatedly_ReusesCompiledKernelsProcessWide) {
+TEST(JitTest,
+     CompileFilter_WhenCalledRepeatedly_ReusesCompiledKernelsProcessWide) {
   auto first = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   if (!first.has_value()) {
     GTEST_FAIL() << "kernel compilation failed";
@@ -136,9 +137,9 @@ TEST(JitTest, JitKernel_WhenInvokingWrongAccessor_ThrowsLogicError) {
   std::vector<uint8_t> selected(input.size());
   std::vector<int64_t> output(input.size());
 
-  EXPECT_THROW(projection->Filter(input.data(), selected.data(), input.size(),
-                                  0),
-               std::logic_error);
+  EXPECT_THROW(
+      projection->Filter(input.data(), selected.data(), input.size(), 0),
+      std::logic_error);
   EXPECT_THROW(sum->Filter(input.data(), selected.data(), input.size(), 0),
                std::logic_error);
   EXPECT_THROW(std::ignore = filter->Sum(input.data(), input.size()),

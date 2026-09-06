@@ -2,10 +2,12 @@
 #ifndef TINYLAMB_EXECUTOR_EXCHANGE_HPP
 #define TINYLAMB_EXECUTOR_EXCHANGE_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -76,7 +78,11 @@ class ExchangeExecutor : public ExecutorBase,
   std::vector<std::vector<std::pair<Row, RowPosition>>> partitions_;
   size_t current_gather_part_{0};
   size_t current_gather_offset_{0};
-  bool materialized_{false};
+  // PartitionScanExecutors handed to several workers all funnel their
+  // IsMaterialized/MaterializePipeline calls into this shared exchange, so
+  // the materialization latch must be synchronized.
+  std::mutex materialize_mutex_;
+  std::atomic<bool> materialized_{false};
   QueryMemoryCharge charge_;
 };
 

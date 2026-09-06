@@ -69,7 +69,7 @@ size_t Row::Serialize(char* dst) const {
       dst += value.Serialize(dst);
     }
   }
-  return dst - original_offset;
+  return static_cast<size_t>(dst - original_offset);
 }
 
 size_t Row::Deserialize(const char* src, const Schema& sc) {
@@ -78,7 +78,7 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
   slot_t encoded_count = 0;
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
-  const slot_t count = encoded_count & ~kNullBitmapFlag;
+  const auto count = static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
   // The stored image always carries every schema column; a forged count
   // would otherwise drive sc.GetColumn(i) out of bounds below.
   if (count != sc.ColumnCount()) {
@@ -100,7 +100,7 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
     }
     values_.push_back(v);
   }
-  return src - original_offset;
+  return static_cast<size_t>(src - original_offset);
 }
 
 size_t Row::DeserializeProjected(const char* src, const Schema& sc,
@@ -110,7 +110,7 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
   slot_t encoded_count = 0;
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
-  const slot_t count = encoded_count & ~kNullBitmapFlag;
+  const auto count = static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
   // Projected reads still walk the full stored image to skip unkept columns,
   // so the count must match the full schema here as well.
   if (count != sc.ColumnCount()) {
@@ -146,7 +146,7 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
       src += Value::SkipSerialized(src, type);
     }
   }
-  return src - original_offset;
+  return static_cast<size_t>(src - original_offset);
 }
 
 std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
@@ -155,7 +155,7 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
   slot_t encoded_count = 0;
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
-  const slot_t count = encoded_count & ~kNullBitmapFlag;
+  const auto count = static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
   if (column >= count || count != sc.ColumnCount() ||
       column >= sc.ColumnCount()) {
     return std::nullopt;

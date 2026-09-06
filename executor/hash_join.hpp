@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_HASH_JOIN_HPP
 #define TINYLAMB_HASH_JOIN_HPP
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -112,7 +114,28 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
 
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
   [[nodiscard]] HashJoinMode Mode() const { return mode_; }
-  [[nodiscard]] JoinKind Kind() const { return kind_; }
+  [[nodiscard]] JoinKind Kind() const {
+    return kind_;
+  }  // Non-null only when a join key is null-safe; parallels left_cols_/
+  // right_cols_. Passed to the key encoders so a NULL component hashes and
+  // compares equal to another NULL (IS NOT DISTINCT FROM semantics) instead of
+  // rejecting the row.
+  [[nodiscard]] const std::vector<bool>* NullSafeArg() const {
+    return any_null_safe_ ? &key_null_safe_ : nullptr;
+  }
+
+  // EXPLAIN annotations from the physical plan: per-key null-safety (an IS
+  // NOT DISTINCT FROM equijoin matches NULL to NULL) and the residual
+  // predicate filtered above the join.  When any key is null-safe the key
+  // encoder folds NULL into a comparable sentinel so `NULL IS NOT DISTINCT
+  // FROM NULL` joins correctly.
+  void SetJoinAnnotations(std::vector<bool> key_null_safe,
+                          Expression residual_note) {
+    key_null_safe_ = std::move(key_null_safe);
+    residual_note_ = std::move(residual_note);
+    any_null_safe_ =
+        std::ranges::any_of(key_null_safe_, [](bool safe) { return safe; });
+  }
 
  private:
   struct JoinState;
@@ -132,7 +155,7 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
 
   void IntakeBothSides();
   void BuildShards();
-  uint32_t ShardOf(uint64_t hash) const;
+  [[nodiscard]] uint32_t ShardOf(uint64_t hash) const;
   bool FetchNextProbe();
   void SetupInMemoryJoin();
   void SetupOneSideSpilled();
@@ -162,6 +185,25 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   size_t actual_build_rows_{0};
   size_t actual_probe_rows_{0};
   size_t join_matches_{0};
+  // EXPLAIN-only join annotations (see SetJoinAnnotations).
+  std::vector<bool> key_null_safe_;
+  bool any_null_safe_{false};
+  Expression residual_note_;
+  // Adaptive small-build execution: the join starts as a nested loop over the
+  // tiny build side (and installs its key set as an exact runtime filter),
+  // then builds the hash index once the outer cardinality exceeds the
+  // nested-loop threshold. Rejected probe rows are counted by the filter.
+  static constexpr size_t kSmallBuildThreshold = 64;
+  static constexpr size_t kNestedLoopProbeLimit = 4;
+  bool runtime_filter_active_{false};
+  size_t runtime_filter_keys_{0};
+  std::atomic<size_t> probe_rows_rejected_{0};
+  std::atomic<size_t> probe_rows_null_rejected_{0};
+  bool adaptive_switched_{false};
+  bool adaptive_stayed_nested_loop_{false};
+  size_t memory_peak_bytes_{0};
+  size_t spill_partition_count_{0};
+  bool reopt_recorded_{false};
   // The hybrid path keeps its fully materialized output (frozen spill spec).
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};

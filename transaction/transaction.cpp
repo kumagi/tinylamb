@@ -81,10 +81,10 @@ Transaction::Transaction(Transaction&& o) noexcept
       write_epoch_(o.write_epoch_.load(std::memory_order_acquire)),
       version_read_caches_(std::move(o.version_read_caches_)),
       read_state_mutex_(std::move(o.read_state_mutex_)),
-      prev_lsn_(o.prev_lsn_),
+      prev_lsn_(o.prev_lsn_.load(std::memory_order_relaxed)),
       durability_dependence_(
           o.durability_dependence_.load(std::memory_order_acquire)),
-      status_(o.status_),
+      status_(o.status_.load(std::memory_order_relaxed)),
       read_only_(o.read_only_),
       transaction_manager_(o.transaction_manager_),
       wounded_(o.wounded_.load(std::memory_order_acquire)) {
@@ -108,8 +108,6 @@ Status Transaction::PreCommit() {
 }
 
 void Transaction::Abort() { transaction_manager_->Abort(*this); }
-
-void Transaction::SetStatus(TransactionStatus status) { status_ = status; }
 
 bool Transaction::AddReadSet(const RowPosition& rp) {
   assert(!IsFinished());
@@ -238,19 +236,37 @@ StatusOr<std::string_view> Transaction::ReadVersion(
   VersionCacheShard& shard = ThreadShard();
   std::scoped_lock shard_lock(shard.mutex);
   const uint64_t epoch = write_epoch_.load(std::memory_order_acquire);
+  // Retire the previously cached string for this key (if any): a caller may
+  // still hold a view into it from an earlier read of the same row.
+  auto existing = shard.entries.find(rp);
+  if (existing != shard.entries.end()) {
+    shard.retired.push_back(std::move(existing->second.value));
+  }
   auto [iter, inserted] = shard.entries.insert_or_assign(
       rp,
       VersionCacheEntry{.epoch = epoch, .value = std::move(visible.Value())});
   constexpr size_t kMaxVersionReadCache = 4096;
+  constexpr size_t kMaxRetiredViews = 4096;
   if (shard.entries.size() > kMaxVersionReadCache) {
-    // Evict a single entry (never the one just inserted): clearing the whole
-    // shard would invalidate every string_view this thread still holds from
-    // earlier reads.
+    // Evict a single entry (never the one just inserted): the retired pool
+    // keeps the evicted string readable for callers that still hold a view
+    // into it.
     auto victim = shard.entries.begin();
     if (victim == iter) {
       ++victim;
     }
+    shard.retired.push_back(std::move(victim->second.value));
     shard.entries.erase(victim);
+  }
+  // The retired pool exists so recently evicted strings stay alive while a
+  // consumer finishes with their views.  Once it grows past its bound the
+  // oldest half is beyond any plausible in-flight view window and is freed;
+  // this bounds total cache memory at roughly twice the live-entry budget.
+  if (shard.retired.size() > kMaxRetiredViews) {
+    shard.retired.erase(shard.retired.begin(),
+                        shard.retired.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                shard.retired.size() - (kMaxRetiredViews / 2)));
   }
   return std::string_view(iter->second.value);
 }

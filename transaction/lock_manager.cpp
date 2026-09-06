@@ -6,8 +6,11 @@
 #include "transaction/lock_manager.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <ostream>
 

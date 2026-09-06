@@ -84,8 +84,12 @@ struct Relation {
 
   [[nodiscard]] size_t TotalRows() const {
     size_t total = rows.size();
-    if (spill) total += spill->Count();
-    if (spill_tail_) total += spill_tail_->Count();
+    if (spill) {
+      total += spill->Count();
+    }
+    if (spill_tail_) {
+      total += spill_tail_->Count();
+    }
     return total;
   }
 

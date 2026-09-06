@@ -56,7 +56,7 @@ TEST(SpillFileTest, ForEachRow_ManyRows_StreamsAllRowsCorrectly) {
   int sum = 0;
   spill.ForEachRow([&](const Row& row) {
     ++count;
-    sum += row[0].value.int_value;
+    sum += static_cast<int>(row[0].value.int_value);
   });
   EXPECT_EQ(count, 100);
   EXPECT_EQ(sum, 4950);
@@ -75,7 +75,8 @@ TEST(SpillFileTest, ReadAllRows_WithoutFinishWriting_AutoFinishesAndReads) {
   EXPECT_EQ(again.size(), 2U);
 }
 
-TEST(SpillFileTest, ReadAllPositioned_WithoutFinishWriting_AutoFinishesAndReads) {
+TEST(SpillFileTest,
+     ReadAllPositioned_WithoutFinishWriting_AutoFinishesAndReads) {
   SpillFile spill;
   spill.Append(Row({Value(9)}), RowPosition(3, 7));
   spill.Append(Row({Value(10)}), RowPosition(4, 8));
@@ -199,7 +200,9 @@ TEST(SpillFileTest, MoveAssignment_ToExistingSpillFile_DeletesOldTargetFile) {
   EXPECT_FALSE(std::filesystem::exists(old_b));
   // The move must empty the source file handle; asserting that contract is
   // the purpose of this test.
-  EXPECT_TRUE(a.Empty());  // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_TRUE(
+      // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+      a.Empty());
   EXPECT_EQ(b.Count(), 1U);
   auto rows = b.ReadAllRows();
   ASSERT_EQ(rows.size(), 1U);

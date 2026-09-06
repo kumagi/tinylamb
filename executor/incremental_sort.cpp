@@ -5,11 +5,13 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
-#include <memory>
+#include <iterator>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/pdqsort.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/sort.hpp"
@@ -18,6 +20,7 @@
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -31,14 +34,11 @@ IncrementalSortExecutor::IncrementalSortExecutor(
       suffix_keys_(std::move(suffix_keys)) {}
 
 bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) const {
-  for (const auto& key : prefix_keys_) {
+  return std::ranges::all_of(prefix_keys_, [&](const auto& key) {
     Value va = key.expression->Evaluate(a, schema_);
     Value vb = key.expression->Evaluate(b, schema_);
-    if (va != vb) {
-      return false;
-    }
-  }
-  return true;
+    return va == vb;
+  });
 }
 
 void IncrementalSortExecutor::ExecuteIncrementalSort() {
@@ -69,8 +69,10 @@ void IncrementalSortExecutor::ExecuteIncrementalSort() {
 
     // Sort sub-range [start, end) on suffix_keys_
     std::vector<std::pair<Row, RowPosition>> group_rows(
-        std::make_move_iterator(input_rows.begin() + start),
-        std::make_move_iterator(input_rows.begin() + end));
+        std::make_move_iterator(input_rows.begin() +
+                                static_cast<std::ptrdiff_t>(start)),
+        std::make_move_iterator(input_rows.begin() +
+                                static_cast<std::ptrdiff_t>(end)));
 
     if (!suffix_keys_.empty() && group_rows.size() > 1) {
       PdqSort::Sort(group_rows, schema_, suffix_keys_);
@@ -141,7 +143,7 @@ void IncrementalSortExecutor::Dump(std::ostream& o, int indent) const {
   }
   o << " (prefix_keys=" << prefix_keys_.size()
     << ", suffix_keys=" << suffix_keys_.size() << ")\n"
-    << Indent(indent + 2);
+    << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(o, indent + 2);
 }
 

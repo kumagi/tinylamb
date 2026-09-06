@@ -49,7 +49,7 @@ class RecoveryManager {
     }
     [[nodiscard]] bool Contains(lsn_t lsn) {
       std::scoped_lock lock(mu_);
-      return lsns_.find(lsn) != lsns_.end();
+      return lsns_.contains(lsn);
     }
 
    private:
@@ -93,6 +93,8 @@ class RecoveryManager {
 
  private:
   [[nodiscard]] bool OpenReadFd() const;
+  // Consistent view of read_fd_ for readers that pread outside the mutex.
+  [[nodiscard]] int ReadFdSnapshot() const;
   void SinglePageRecovery(PageRef&& page, TransactionManager* tm,
                           UndoneRecorder* undone, std::uintmax_t scan_end);
   // Walks each loser transaction's prev_lsn chain newest-first and applies

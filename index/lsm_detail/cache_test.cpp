@@ -57,8 +57,8 @@ class CacheTest : public ::testing::Test {
       ssize_t wrote = ::write(
           fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
       ASSERT_LT(0, wrote);
-      written += wrote;
-      remaining -= wrote;
+      written += static_cast<size_t>(wrote);
+      remaining -= static_cast<size_t>(wrote);
     }
     ASSERT_EQ(written, value.size() * sizeof(int));
     ::fsync(fd_);
@@ -71,32 +71,37 @@ class CacheTest : public ::testing::Test {
     std::ignore = std::remove(path_.c_str());
   }
 
-  static int Expected(size_t pos) { return kSeed + std::hash<size_t>()(pos); }
+  static int Expected(size_t pos) {
+    return static_cast<int>(static_cast<size_t>(kSeed) +
+                            std::hash<size_t>()(pos));
+  }
 
-  constexpr static int kSeed = 0xdeadbeef;
-  int fd_;
+  constexpr static int kSeed = static_cast<int>(0xdeadbeef);
+  int fd_{};
   std::filesystem::path path_;
   std::unique_ptr<Cache> cache_;
 };
 
 TEST_F(CacheTest, one_page) {
-  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB cache
-  // Act -- read 1024 sequential 4-byte ints at stride 4
+  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB
+  // cache Act -- read 1024 sequential 4-byte ints at stride 4
   for (int i = 0; i < 1024; ++i) {
-    std::string data = cache_->ReadAt(i * sizeof(int), sizeof(int));
+    std::string data =
+        cache_->ReadAt(static_cast<size_t>(i) * sizeof(int), sizeof(int));
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
 
     // Assert -- each read yields the deterministic Expected(i) value
-    ASSERT_EQ(data_as_int, Expected(i));
+    ASSERT_EQ(data_as_int, Expected(static_cast<size_t>(i)));
   }
 }
 
 TEST_F(CacheTest, mega_page) {
-  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB cache
-  // Act -- read 1024 sequential 4-byte ints at stride 4096 (1 MiB page boundaries)
+  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB
+  // cache Act -- read 1024 sequential 4-byte ints at stride 4096 (1 MiB page
+  // boundaries)
   for (int i = 0; i < 1024; ++i) {
-    std::string data = cache_->ReadAt(static_cast<size_t>(i) * 1024 * sizeof(int),
-                                      sizeof(int));
+    std::string data = cache_->ReadAt(
+        static_cast<size_t>(i) * 1024 * sizeof(int), sizeof(int));
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
 
     // Assert -- each read yields the deterministic Expected(i*1024) value
@@ -105,12 +110,12 @@ TEST_F(CacheTest, mega_page) {
 }
 
 TEST_F(CacheTest, mega_pages) {
-  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB cache
-  // Act -- read 4 sequential 4-byte ints at stride 1 MiB (full page boundaries)
+  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB
+  // cache Act -- read 4 sequential 4-byte ints at stride 1 MiB (full page
+  // boundaries)
   for (int i = 0; i < 4; ++i) {
-    std::string data =
-        cache_->ReadAt(static_cast<size_t>(i) * 1024 * 1024 * sizeof(int),
-                       sizeof(int));
+    std::string data = cache_->ReadAt(
+        static_cast<size_t>(i) * 1024 * 1024 * sizeof(int), sizeof(int));
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
 
     // Assert -- each read yields the deterministic Expected(i*1024*1024) value
@@ -124,10 +129,11 @@ TEST_F(CacheTest, read_at_with_locks) {
   for (int i = 0; i < 1024; i += 32) {
     std::string_view out;
     {
-      Cache::Locks locks = cache_->ReadAt(i * sizeof(int), sizeof(int), out);
+      Cache::Locks locks = cache_->ReadAt(static_cast<size_t>(i) * sizeof(int),
+                                          sizeof(int), out);
       int data_as_int = *(reinterpret_cast<const int*>(out.data()));
       // Assert -- the locked view matches the deterministic file content
-      ASSERT_EQ(data_as_int, Expected(i));
+      ASSERT_EQ(data_as_int, Expected(static_cast<size_t>(i)));
     }
   }
 }
@@ -293,7 +299,8 @@ TEST_F(CacheTest, eviction_promotes_through_ghost_queue) {
   //   page i evicts page i-1 to the ghost queue, and re-reading a ghost page
   //   walks the kMarked -> kLocked and kUnlocked -> kLockedAccessed paths
   for (int i = 0; i < 7; ++i) {
-    ASSERT_EQ(read_int(i), Expected(static_cast<size_t>(i) * 1024));
+    ASSERT_EQ(read_int(static_cast<size_t>(i)),
+              Expected(static_cast<size_t>(i) * 1024));
   }
   // Assert -- re-reading pages that were promoted/re-evicted still returns the
   // same deterministic values (nothing corrupted by the queue transitions)
@@ -343,7 +350,8 @@ TEST_F(CacheTest, capped_max_size_limits_address_space) {
   for (int i = 0; i < 2; ++i) {
     std::string data =
         capped.ReadAt(static_cast<size_t>(i) * 4096, sizeof(int));
-    ASSERT_EQ(*(reinterpret_cast<int*>(data.data())), Expected(static_cast<size_t>(i) * 1024));
+    ASSERT_EQ(*(reinterpret_cast<int*>(data.data())),
+              Expected(static_cast<size_t>(i) * 1024));
   }
   // Assert -- a single-byte read at the very end of the address space works
   std::string boundary = capped.ReadAt((2 * 4096) - 1, 1);
@@ -360,7 +368,8 @@ TEST_F(CacheTest, invalidate_beyond_max_size_indexes_meta_out_of_bounds) {
   // count* (16384), so every page index in [5, 16383] passes the guard and
   // reads past the end of meta_.
   const std::string path = "cache_test_blob-" + RandomString();
-  constexpr size_t kMaxFileSize = size_t{4} * 4096;  // 16 KiB cache address space
+  constexpr size_t kMaxFileSize =
+      size_t{4} * 4096;  // 16 KiB cache address space
   {
     BlobFile blob(path, size_t{256} * 1024, kMaxFileSize);
 
@@ -384,10 +393,10 @@ TEST_F(CacheTest, locked_read_past_max_size_indexes_meta_out_of_bounds) {
   Cache capped(fd_, size_t{1024} * 1024, size_t{4} * 4096);
 
   // Act -- request 20 KiB through the lock-returning overload.  Cache::ReadAt()
-  // (cache.cpp:86) computes last_page == (offset + length) / kBlockSize == 5 and
-  // FixPage()es every page in [0, 5]; pages 5 (and beyond) are past the 5-entry
-  // meta_ vector, so FixPage(5) reads meta_[5] out of bounds.  Unlike Invalidate,
-  // no guard is attempted at all here.
+  // (cache.cpp:86) computes last_page == (offset + length) / kBlockSize == 5
+  // and FixPage()es every page in [0, 5]; pages 5 (and beyond) are past the
+  // 5-entry meta_ vector, so FixPage(5) reads meta_[5] out of bounds.  Unlike
+  // Invalidate, no guard is attempted at all here.
   std::string_view out;
   // (Crash happens inside ReadAt; the Locks are never returned.)
   Cache::Locks locks = capped.ReadAt(0, size_t{5} * 4096, out);
@@ -518,19 +527,19 @@ TEST_F(CacheTest, MultiEntryDumpCoversAllThreeQueues) {
   // Act -- re-read pages promote to the main queue; single-touch non-aligned
   // pages churn through the small -> ghost FIFO chain.  This leaves every
   // queue holding multiple entries so the Dump comma separators are emitted.
-  read_int(8);              // page 0
-  read_int(4096 + 8);       // page 1
-  read_int(8);              // page 0 (accessed)
-  read_int((2 * 4096) + 8);   // page 2 -> page 0 to main
-  read_int(4096 + 8);       // page 1 (accessed)
-  read_int((3 * 4096) + 8);   // page 3 -> page 1 to main
-  read_int((2 * 4096) + 8);   // page 2 (accessed)
-  read_int((4 * 4096) + 8);   // page 4 -> page 2 to main
-  read_int((3 * 4096) + 8);   // page 3 (accessed)
-  read_int((5 * 4096) + 8);   // page 5 -> page 3 to main
-  read_int((6 * 4096) + 8);   // page 6 -> page 4 to ghost
-  read_int((7 * 4096) + 8);   // page 7 -> page 5 to ghost
-  read_int((8 * 4096) + 8);   // page 8 -> page 6 to ghost
+  read_int(8);               // page 0
+  read_int(4096 + 8);        // page 1
+  read_int(8);               // page 0 (accessed)
+  read_int((2 * 4096) + 8);  // page 2 -> page 0 to main
+  read_int(4096 + 8);        // page 1 (accessed)
+  read_int((3 * 4096) + 8);  // page 3 -> page 1 to main
+  read_int((2 * 4096) + 8);  // page 2 (accessed)
+  read_int((4 * 4096) + 8);  // page 4 -> page 2 to main
+  read_int((3 * 4096) + 8);  // page 3 (accessed)
+  read_int((5 * 4096) + 8);  // page 5 -> page 3 to main
+  read_int((6 * 4096) + 8);  // page 6 -> page 4 to ghost
+  read_int((7 * 4096) + 8);  // page 7 -> page 5 to ghost
+  read_int((8 * 4096) + 8);  // page 8 -> page 6 to ghost
 
   // Assert -- small, main and ghost each hold multiple entries.
   EXPECT_EQ(wide.Dump(), "[7, 8] {0, 1, 2, 3} [4, 5, 6]");
@@ -610,8 +619,9 @@ TEST_F(CacheTest, LockedReadSpansPageWithCorrectContent) {
     ASSERT_EQ(out.size(), 16U);
     for (int i = 0; i < 4; ++i) {
       int value = 0;
-      ::memcpy(&value, out.data() + (i * sizeof(int)), sizeof(int));
-      ASSERT_EQ(value, Expected(1023 + i));
+      ::memcpy(&value, out.data() + (static_cast<size_t>(i) * sizeof(int)),
+               sizeof(int));
+      ASSERT_EQ(value, Expected(static_cast<size_t>(1023 + i)));
     }
   }
 }

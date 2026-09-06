@@ -19,15 +19,18 @@
 #include <endian.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -478,12 +481,13 @@ std::string FormatDoubleShortest(double value) {
   if (std::isinf(value)) {
     return value > 0 ? "inf" : "-inf";
   }
-  char buffer[64];
-  auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
+  std::array<char, 64> buffer{};
+  auto [ptr, ec] =
+      std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
   if (ec != std::errc()) {
     return std::to_string(value);
   }
-  return std::string(buffer, ptr - buffer);
+  return {buffer.data(), static_cast<size_t>(ptr - buffer.data())};
 }
 
 [[nodiscard]] std::string Value::AsString() const {
@@ -503,10 +507,10 @@ std::string FormatDoubleShortest(double value) {
       if (std::isinf(value.double_value)) {
         return value.double_value > 0 ? "inf" : "-inf";
       }
-      char buffer[64];
-      auto [ptr, ec] =
-          std::to_chars(buffer, buffer + sizeof(buffer), value.double_value);
-      return std::string(buffer, ptr - buffer);
+      std::array<char, 64> buffer{};
+      auto [ptr, ec] = std::to_chars(
+          buffer.data(), buffer.data() + buffer.size(), value.double_value);
+      return {buffer.data(), static_cast<size_t>(ptr - buffer.data())};
     }
 
     case ValueType::kArray: {
@@ -585,7 +589,7 @@ namespace {
 std::string EncodeMemcomparableFormatInteger(int64_t in) {
   std::string ret(1 + 8, '\0');
   ret[0] = static_cast<char>(ValueType::kInt64);  // Embeds prefix.
-  const uint64_t be = htobe64(in);
+  const uint64_t be = htobe64(static_cast<uint64_t>(in));
   ::memcpy(ret.data() + 1, &be, 8);
   ret[1] ^= static_cast<char>(0x80);  // plus/minus sign.
   return ret;
@@ -636,7 +640,7 @@ size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
     // The flag byte is unsigned; reading it as signed char would turn a
     // corrupt 0x80..0xFF image into a negative length and an underflowing
     // size_t accumulator.
-    const unsigned char flag = static_cast<unsigned char>(buffer[8]);
+    const auto flag = static_cast<unsigned char>(buffer[8]);
     if (flag == 9) {
       // Continuation group: eight payload bytes follow.
       size += 8;
@@ -658,7 +662,7 @@ size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
       break;
     }
   }
-  return src - initial_offset;
+  return static_cast<size_t>(src - initial_offset);
 }
 
 std::string EncodeMemcomparableFormatDouble(double in) {
@@ -685,7 +689,7 @@ std::string EncodeMemcomparableFormatDouble(double in) {
 size_t DecodeMemcomparableFormatDouble(const char* src, double* dst) {
   int64_t loaded = 0;
   std::memcpy(&loaded, src, sizeof(int64_t));
-  uint64_t code = be64toh(loaded);
+  uint64_t code = be64toh(static_cast<uint64_t>(loaded));
   if (0 < (src[0] & 0x80)) {
     code ^= 1LLU << 63;
   } else {
@@ -714,7 +718,7 @@ std::string Value::EncodeMemcomparableFormat() const {
     case ValueType::kArray: {
       std::string encoded(1, static_cast<char>(ValueType::kArray));
       const auto& elements = ArrayElements();
-      const uint32_t count = static_cast<uint32_t>(elements.size());
+      const auto count = static_cast<uint32_t>(elements.size());
       const uint32_t be = htobe32(count);
       encoded.append(reinterpret_cast<const char*>(&be), sizeof(be));
       encoded.append(ArrayElementSqlType());
@@ -770,6 +774,13 @@ size_t Value::DecodeMemcomparableFormat(const char* src) {
       }
       std::string sql_type(type_begin, cursor);
       ++cursor;
+      // The count comes from the encoded image; a corrupt key may carry an
+      // absurd value, so reject reservations beyond any real page-sized
+      // array instead of attempting a multi-gigabyte allocation.
+      constexpr uint32_t kMaxEncodedArrayElements = 1U << 20;
+      if (count > kMaxEncodedArrayElements) {
+        throw std::runtime_error("corrupt memcomparable array element count");
+      }
       std::vector<Value> elements;
       elements.reserve(count);
       for (uint32_t i = 0; i < count; ++i) {
@@ -999,8 +1010,8 @@ Value Value::operator^(const Value& rhs) const {
 int CompareForOrderBy(const Value& a, const Value& b) {
   // Type rank keeps cross-type keys in a deterministic total order; matching
   // types compare by value.
-  static constexpr int kRank[] = {0, 1, 4, 3,
-                                  5, 6};  // null,int,string,double,date,array
+  static constexpr std::array<int, 6> kRank = {
+      0, 1, 4, 3, 5, 6};  // null,int,string,double,date,array
   auto rank_of = [](const Value& v) {
     return v.type == ValueType::kNull
                ? 0
@@ -1042,16 +1053,28 @@ int CompareForOrderBy(const Value& a, const Value& b) {
       // compliance catalog uses this fixed TestEnum ordering, which differs
       // from lexical ordering (NEGATIVE precedes the numeric members).
       auto enum_rank = [](std::string_view value) -> int {
-        if (value == "TESTENUMNEGATIVE") return 0;
-        if (value == "TESTENUM0") return 1;
-        if (value == "TESTENUM1") return 2;
-        if (value == "TESTENUM2") return 3;
-        if (value == "TESTENUM2147483647") return 4;
+        if (value == "TESTENUMNEGATIVE") {
+          return 0;
+        }
+        if (value == "TESTENUM0") {
+          return 1;
+        }
+        if (value == "TESTENUM1") {
+          return 2;
+        }
+        if (value == "TESTENUM2") {
+          return 3;
+        }
+        if (value == "TESTENUM2147483647") {
+          return 4;
+        }
         return -1;
       };
       const int ar = enum_rank(a.value.varchar_value);
       const int br = enum_rank(b.value.varchar_value);
-      if (ar >= 0 && br >= 0 && ar != br) return ar < br ? -1 : 1;
+      if (ar >= 0 && br >= 0 && ar != br) {
+        return ar < br ? -1 : 1;
+      }
       return a.value.varchar_value < b.value.varchar_value
                  ? -1
                  : (b.value.varchar_value < a.value.varchar_value ? 1 : 0);

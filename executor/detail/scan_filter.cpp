@@ -3,9 +3,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -24,6 +27,7 @@
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -306,6 +310,8 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
 
 // Compile a single AND expression into a DisjunctiveBranch.
 // Splits conjuncts and tries to compile each as SimpleCompare.
+namespace {
+
 CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
     const Expression& and_expr, const Schema& schema) {
   CompiledScanFilter::DisjunctiveBranch branch;
@@ -319,6 +325,8 @@ CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
   }
   return branch;
 }
+
+}  // namespace
 
 CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
                                      const Schema& schema) {
@@ -361,7 +369,7 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
     }
   }
   // Pre-compute unsigned column info to avoid per-row schema iteration.
-  for (slot_t i = 0; i < static_cast<slot_t>(schema.ColumnCount()); ++i) {
+  for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
     if (schema.GetColumn(i).IsUnsigned()) {
       compiled.needs_unsigned_tagging = true;
       compiled.unsigned_columns.push_back(i);
@@ -388,7 +396,7 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
         }
       }
     }
-    if (!has_duplicate_cols) {
+    if (BytecodeEnabled() && !has_duplicate_cols) {
       Expression combined = compiled.residual[0];
       for (size_t i = 1; i < compiled.residual.size(); ++i) {
         combined = BinaryExpressionExp(combined, BinaryOperation::kAnd,
@@ -648,8 +656,14 @@ Relation UnnestValueToRelation(const SelectSource& source,
   std::vector<Value> elements;
   if (array_val.IsArray()) {
     elements = array_val.ArrayElements();
-    if (!elements.empty()) {
-      elem_type = elements[0].type;
+    // Infer from the first NON-NULL element: a leading NULL would pin the
+    // column to kNull while later rows carry real types — the per-row type
+    // flip vectorized consumers reject.
+    for (const Value& element : elements) {
+      if (!element.IsNull()) {
+        elem_type = element.type;
+        break;
+      }
     }
   } else if (!array_val.IsNull()) {
     elements.push_back(array_val);
@@ -710,7 +724,7 @@ Relation UnnestValueToRelation(const SelectSource& source,
         row_vals.push_back(std::move(fv));
       }
       if (!source.offset_alias.empty()) {
-        row_vals.push_back(Value(static_cast<int64_t>(row_idx)));
+        row_vals.emplace_back(static_cast<int64_t>(row_idx));
       }
       result.AddRow(Row(std::move(row_vals)));
     }
@@ -827,14 +841,16 @@ Relation UnnestValueToRelation(const SelectSource& source,
           std::string declared_text(parsed.value.varchar_value);
           if ((declared_type == "DATE" || declared_type == "date")) {
             int y = 0, m = 0, d = 0;
-            if (sscanf(declared_text.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {
+            if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+                    declared_text.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {
               parsed = Value::Date(declared_text);
             }
           } else if (declared_type == "TIMESTAMP" ||
                      declared_type == "timestamp" ||
                      declared_type == "DATETIME") {
             int y = 0, mo = 0, d = 0;
-            if (sscanf(declared_text.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
+            if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+                    declared_text.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
               parsed =
                   Value(std::move(declared_text));  // keep canonical text form
             }
@@ -889,7 +905,7 @@ Relation UnnestValueToRelation(const SelectSource& source,
         row_vals.push_back(elements[row_idx]);
       }
       if (!source.offset_alias.empty()) {
-        row_vals.push_back(Value(static_cast<int64_t>(row_idx)));
+        row_vals.emplace_back(static_cast<int64_t>(row_idx));
       }
       result.AddRow(Row(std::move(row_vals)));
     }

@@ -11,6 +11,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <ranges>
@@ -19,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -34,8 +36,11 @@
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "query/query_data.hpp"
+#include "type/column.hpp"
 #include "type/column_name.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb::cascades {
 namespace {
@@ -114,9 +119,269 @@ std::vector<std::string> UnionRelations(const std::vector<std::string>& left,
   return result;
 }
 
+// True when replacing the join by a semi join over the same children is
+// admissible.  Correlated conjuncts (touching both children) must be plain
+// column equalities whose right-side key carries a UNIQUE / PRIMARY KEY
+// constraint, so each left row matches at most one right row; without that
+// proof the semi join silently collapses duplicate matches (COUNT(*) over
+// p1 JOIN p2 ON p1.k = p2.k would report 7 instead of 11).  Conjuncts that
+// touch only one side are not join keys at all: they are filters, and the
+// semi join carries the whole predicate unchanged, so they cannot break the
+// EXISTS property the conversion preserves.
+bool RightSideJoinKeysAreUnique(const LogicalExpression& join,
+                                const Memo& memo) {
+  if (!join.predicate.has_value() || !*join.predicate ||
+      join.children.size() != 2) {
+    return false;
+  }
+  const Group& left_group = memo.Get(join.children[0]);
+  const Group& right_group = memo.Get(join.children[1]);
+  const auto mentions_relation = [](const Expression& expression,
+                                    const std::vector<std::string>& relations) {
+    return std::ranges::any_of(
+        expression->TouchedColumns(), [&relations](const ColumnName& col) {
+          return std::ranges::find(relations, col.schema) != relations.end();
+        });
+  };
+  for (const Expression& conjunct : SplitConjuncts(*join.predicate)) {
+    if (!conjunct) {
+      return false;
+    }
+    if (!mentions_relation(conjunct, right_group.relations) ||
+        !mentions_relation(conjunct, left_group.relations)) {
+      // Non-correlated conjunct (left-only, right-only, or constant): it
+      // filters instead of matching, so it is preserved by the semi join.
+      continue;
+    }
+    if (conjunct->Type() != TypeTag::kBinaryExp ||
+        conjunct->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+      // Non-equality conjuncts cannot be pinned to a unique key; the semi
+      // conversion is only provably multiplicity-preserving for pure
+      // column-equality join keys.
+      return false;
+    }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      return false;
+    }
+    const ColumnName& left_col = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& right_col =
+        binary.Right()->AsColumnValue().GetColumnName();
+    const ColumnName* right_key = nullptr;
+    if (std::ranges::find(right_group.relations, right_col.schema) !=
+        right_group.relations.end()) {
+      right_key = &right_col;
+    } else if (std::ranges::find(right_group.relations, left_col.schema) !=
+               right_group.relations.end()) {
+      right_key = &left_col;
+    } else {
+      return false;
+    }
+    bool unique = false;
+    for (const LogicalExpression& expression : right_group.expressions) {
+      for (size_t i = 0; i < expression.output_schema.ColumnCount(); ++i) {
+        const Column& column = expression.output_schema.GetColumn(i);
+        if (column.Name().name == right_key->name &&
+            (column.GetConstraint().ctype == Constraint::kPrimaryKey ||
+             column.GetConstraint().IsUnique())) {
+          unique = true;
+          break;
+        }
+      }
+      if (unique) {
+        break;
+      }
+    }
+    if (!unique) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Canonical conjunct form: split, sort by printed representation, drop
 // duplicates, recombine. Fingerprint stability for payload-bearing
 // expressions depends on this.
+//
+// Detects a provably-empty conjunction: two constraints on the same column
+// that no row can satisfy together. Patterns handled:
+//   1. col = const AND col IS NULL  (equality contradicts NULL test)
+//   2. col > const AND col IS NULL  (range contradicts NULL test)
+//   3. col < const AND col IS NULL  (range contradicts NULL test)
+//   4. col >= const AND col IS NULL (range contradicts NULL test)
+//   5. col <= const AND col IS NULL (range contradicts NULL test)
+//   6. col != const AND col = const (equality contradiction)
+//   7. col > A AND col < B where A >= B (empty range)
+//   8. col < A AND col > B where B >= A (empty range)
+//   9. col IS TRUE AND col IS FALSE (a value cannot be both)
+bool ConjunctionIsContradictory(const std::vector<Expression>& conjuncts) {
+  struct ColPred {
+    std::string col_name;
+    BinaryOperation op{};
+    Value val;
+    bool is_null_test{false};
+    bool is_null_positive{false};   // true = IS NULL, false = IS NOT NULL
+    bool is_bool_test{false};       // IS TRUE / IS FALSE
+    bool is_true_assertion{false};  // true = IS TRUE, false = IS FALSE
+  };
+  std::vector<ColPred> preds;
+  for (const auto& c : conjuncts) {
+    if (!c) {
+      continue;
+    }
+    if (c->Type() == TypeTag::kUnaryExp) {
+      const auto& unary = c->AsUnaryExpression();
+      if ((unary.Op() == UnaryOperation::kIsNull ||
+           unary.Op() == UnaryOperation::kIsNotNull) &&
+          unary.Child()->Type() == TypeTag::kColumnValue) {
+        ColPred p;
+        p.col_name = unary.Child()->AsColumnValue().GetColumnName().name;
+        p.is_null_test = true;
+        p.is_null_positive = (unary.Op() == UnaryOperation::kIsNull);
+        preds.push_back(std::move(p));
+      } else if ((unary.Op() == UnaryOperation::kIsTrue ||
+                  unary.Op() == UnaryOperation::kIsFalse) &&
+                 unary.Child()->Type() == TypeTag::kColumnValue) {
+        ColPred p;
+        p.col_name = unary.Child()->AsColumnValue().GetColumnName().name;
+        p.is_bool_test = true;
+        p.is_true_assertion = (unary.Op() == UnaryOperation::kIsTrue);
+        preds.push_back(std::move(p));
+      }
+    } else if (c->Type() == TypeTag::kBinaryExp) {
+      const auto& bin = c->AsBinaryExpression();
+      if (bin.Left()->Type() == TypeTag::kColumnValue &&
+          bin.Right()->Type() == TypeTag::kConstantValue) {
+        ColPred p;
+        p.col_name = bin.Left()->AsColumnValue().GetColumnName().name;
+        p.op = bin.Op();
+        p.val = bin.Right()->AsConstantValue().GetValue();
+        preds.push_back(std::move(p));
+      } else if (bin.Left()->Type() == TypeTag::kConstantValue &&
+                 bin.Right()->Type() == TypeTag::kColumnValue) {
+        ColPred p;
+        p.col_name = bin.Right()->AsColumnValue().GetColumnName().name;
+        p.val = bin.Left()->AsConstantValue().GetValue();
+        switch (bin.Op()) {
+          case BinaryOperation::kLessThan:
+            p.op = BinaryOperation::kGreaterThan;
+            break;
+          case BinaryOperation::kGreaterThan:
+            p.op = BinaryOperation::kLessThan;
+            break;
+          case BinaryOperation::kLessThanEquals:
+            p.op = BinaryOperation::kGreaterThanEquals;
+            break;
+          case BinaryOperation::kGreaterThanEquals:
+            p.op = BinaryOperation::kLessThanEquals;
+            break;
+          default:
+            p.op = bin.Op();
+            break;
+        }
+        preds.push_back(std::move(p));
+      }
+    }
+  }
+  for (size_t i = 0; i < preds.size(); ++i) {
+    for (size_t j = i + 1; j < preds.size(); ++j) {
+      if (preds[i].col_name != preds[j].col_name) {
+        continue;
+      }
+      // col IS TRUE AND col IS FALSE -> a value cannot be both.
+      if (preds[i].is_bool_test && preds[j].is_bool_test &&
+          preds[i].is_true_assertion != preds[j].is_true_assertion) {
+        return true;
+      }
+      // col = N AND col IS NULL -> contradiction
+      if (preds[i].is_null_test && preds[i].is_null_positive &&
+          !preds[j].is_null_test && !preds[j].is_bool_test &&
+          preds[j].op == BinaryOperation::kEquals && !preds[j].val.IsNull()) {
+        return true;
+      }
+      if (preds[j].is_null_test && preds[j].is_null_positive &&
+          !preds[i].is_null_test && !preds[i].is_bool_test &&
+          preds[i].op == BinaryOperation::kEquals && !preds[i].val.IsNull()) {
+        return true;
+      }
+      if (preds[i].is_null_test || preds[j].is_null_test ||
+          preds[i].is_bool_test || preds[j].is_bool_test) {
+        continue;
+      }
+      if (preds[i].val.type == preds[j].val.type &&
+          preds[i].val.type == ValueType::kInt64) {
+        const int64_t a = preds[i].val.value.int_value;
+        const int64_t b = preds[j].val.value.int_value;
+        const auto oi = preds[i].op;
+        const auto oj = preds[j].op;
+        if ((oi == BinaryOperation::kGreaterThan ||
+             oi == BinaryOperation::kGreaterThanEquals) &&
+            (oj == BinaryOperation::kLessThan ||
+             oj == BinaryOperation::kLessThanEquals)) {
+          if (a > b || (a == b && (oi == BinaryOperation::kGreaterThan ||
+                                   oj == BinaryOperation::kLessThan))) {
+            return true;
+          }
+        }
+        if ((oi == BinaryOperation::kLessThan ||
+             oi == BinaryOperation::kLessThanEquals) &&
+            (oj == BinaryOperation::kGreaterThan ||
+             oj == BinaryOperation::kGreaterThanEquals)) {
+          if (b > a || (b == a && (oj == BinaryOperation::kGreaterThan ||
+                                   oi == BinaryOperation::kLessThan))) {
+            return true;
+          }
+        }
+        if (oi == BinaryOperation::kEquals && oj == BinaryOperation::kEquals &&
+            a != b) {
+          return true;
+        }
+        if ((oi == BinaryOperation::kNotEquals &&
+             oj == BinaryOperation::kEquals && a == b) ||
+            (oj == BinaryOperation::kNotEquals &&
+             oi == BinaryOperation::kEquals && a == b)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// True when `expression` evaluates to FALSE (or NULL) for every row: a
+// contradictory conjunction, a constant false, or a disjunction whose every
+// branch is always false.
+bool ExpressionIsAlwaysFalse(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kConstantValue) {
+    const Value value = expression->AsConstantValue().GetValue();
+    return value.IsNull() || !value.Truthy();
+  }
+  if (expression->Type() != TypeTag::kBinaryExp) {
+    return false;
+  }
+  switch (expression->AsBinaryExpression().Op()) {
+    case BinaryOperation::kAnd: {
+      const std::vector<Expression> conjuncts = SplitConjuncts(expression);
+      if (ConjunctionIsContradictory(conjuncts)) {
+        return true;
+      }
+      return std::ranges::any_of(conjuncts, ExpressionIsAlwaysFalse);
+    }
+    case BinaryOperation::kOr: {
+      const std::vector<Expression> disjuncts =
+          relational_detail::SplitDisjuncts(expression);
+      return !disjuncts.empty() &&
+             std::ranges::all_of(disjuncts, ExpressionIsAlwaysFalse);
+    }
+    default:
+      return false;
+  }
+}
+
 Expression CanonicalizeConjuncts(const Expression& predicate) {
   if (!predicate) {
     return nullptr;
@@ -132,130 +397,11 @@ Expression CanonicalizeConjuncts(const Expression& predicate) {
                           })
           .begin(),
       conjuncts.end());
-  // Contradiction detection: if any conjunct is always false, the whole
-  // conjunction is false.  Patterns handled:
-  //   1. col = const AND col IS NULL  (equality contradicts NULL test)
-  //   2. col > const AND col IS NULL  (range contradicts NULL test)
-  //   3. col < const AND col IS NULL  (range contradicts NULL test)
-  //   4. col >= const AND col IS NULL (range contradicts NULL test)
-  //   5. col <= const AND col IS NULL (range contradicts NULL test)
-  //   6. col != const AND col = const (equality contradiction)
-  //   7. col > A AND col < B where A >= B (empty range)
-  //   8. col < A AND col > B where B >= A (empty range)
-  {
-    struct ColPred {
-      std::string col_name;
-      BinaryOperation op;
-      Value val;
-      bool is_null_test{false};
-      bool is_null_positive{false};  // true = IS NULL, false = IS NOT NULL
-    };
-    std::vector<ColPred> preds;
-    for (const auto& c : conjuncts) {
-      if (!c) continue;
-      if (c->Type() == TypeTag::kUnaryExp) {
-        const auto& unary = c->AsUnaryExpression();
-        if ((unary.Op() == UnaryOperation::kIsNull ||
-             unary.Op() == UnaryOperation::kIsNotNull) &&
-            unary.Child()->Type() == TypeTag::kColumnValue) {
-          ColPred p;
-          p.col_name = unary.Child()->AsColumnValue().GetColumnName().name;
-          p.is_null_test = true;
-          p.is_null_positive = (unary.Op() == UnaryOperation::kIsNull);
-          preds.push_back(std::move(p));
-        }
-      } else if (c->Type() == TypeTag::kBinaryExp) {
-        const auto& bin = c->AsBinaryExpression();
-        if (bin.Left()->Type() == TypeTag::kColumnValue &&
-            bin.Right()->Type() == TypeTag::kConstantValue) {
-          ColPred p;
-          p.col_name = bin.Left()->AsColumnValue().GetColumnName().name;
-          p.op = bin.Op();
-          p.val = bin.Right()->AsConstantValue().GetValue();
-          preds.push_back(std::move(p));
-        } else if (bin.Left()->Type() == TypeTag::kConstantValue &&
-                   bin.Right()->Type() == TypeTag::kColumnValue) {
-          ColPred p;
-          p.col_name = bin.Right()->AsColumnValue().GetColumnName().name;
-          p.val = bin.Left()->AsConstantValue().GetValue();
-          switch (bin.Op()) {
-            case BinaryOperation::kLessThan:
-              p.op = BinaryOperation::kGreaterThan;
-              break;
-            case BinaryOperation::kGreaterThan:
-              p.op = BinaryOperation::kLessThan;
-              break;
-            case BinaryOperation::kLessThanEquals:
-              p.op = BinaryOperation::kGreaterThanEquals;
-              break;
-            case BinaryOperation::kGreaterThanEquals:
-              p.op = BinaryOperation::kLessThanEquals;
-              break;
-            default:
-              p.op = bin.Op();
-              break;
-          }
-          preds.push_back(std::move(p));
-        }
-      }
-    }
-    bool contradiction = false;
-    for (size_t i = 0; i < preds.size() && !contradiction; ++i) {
-      for (size_t j = i + 1; j < preds.size() && !contradiction; ++j) {
-        if (preds[i].col_name != preds[j].col_name) continue;
-        // col = N AND col IS NULL -> contradiction
-        // is_null_positive=true means IS NULL; false means IS NOT NULL
-        if (preds[i].is_null_test && preds[i].is_null_positive &&
-            !preds[j].is_null_test && preds[j].op == BinaryOperation::kEquals &&
-            !preds[j].val.IsNull()) {
-          contradiction = true;
-        }
-        if (preds[j].is_null_test && preds[j].is_null_positive &&
-            !preds[i].is_null_test && preds[i].op == BinaryOperation::kEquals &&
-            !preds[i].val.IsNull()) {
-          contradiction = true;
-        }
-        if (!preds[i].is_null_test && !preds[j].is_null_test &&
-            preds[i].val.type == preds[j].val.type &&
-            preds[i].val.type == ValueType::kInt64) {
-          const int64_t a = preds[i].val.value.int_value;
-          const int64_t b = preds[j].val.value.int_value;
-          const auto oi = preds[i].op;
-          const auto oj = preds[j].op;
-          if ((oi == BinaryOperation::kGreaterThan ||
-               oi == BinaryOperation::kGreaterThanEquals) &&
-              (oj == BinaryOperation::kLessThan ||
-               oj == BinaryOperation::kLessThanEquals)) {
-            if (a > b || (a == b && (oi == BinaryOperation::kGreaterThan ||
-                                     oj == BinaryOperation::kLessThan))) {
-              contradiction = true;
-            }
-          }
-          if ((oi == BinaryOperation::kLessThan ||
-               oi == BinaryOperation::kLessThanEquals) &&
-              (oj == BinaryOperation::kGreaterThan ||
-               oj == BinaryOperation::kGreaterThanEquals)) {
-            if (b > a || (b == a && (oj == BinaryOperation::kGreaterThan ||
-                                     oi == BinaryOperation::kLessThan))) {
-              contradiction = true;
-            }
-          }
-          if (oi == BinaryOperation::kEquals &&
-              oj == BinaryOperation::kEquals && a != b) {
-            contradiction = true;
-          }
-          if ((oi == BinaryOperation::kNotEquals &&
-               oj == BinaryOperation::kEquals && a == b) ||
-              (oj == BinaryOperation::kNotEquals &&
-               oi == BinaryOperation::kEquals && a == b)) {
-            contradiction = true;
-          }
-        }
-      }
-    }
-    if (contradiction) {
-      return ConstantValueExp(Value(false));
-    }
+  // Provably-empty predicate: a contradictory conjunction, an always-false
+  // conjunct, or a disjunction whose every branch is contradictory.
+  if (ConjunctionIsContradictory(conjuncts) ||
+      std::ranges::any_of(conjuncts, ExpressionIsAlwaysFalse)) {
+    return ConstantValueExp(Value(false));
   }
   return CombineConjuncts(conjuncts);
 }
@@ -514,8 +660,12 @@ Expression BuildEqualityOnAllColumns(const Memo& memo,
       const auto& col = expression.output_schema.GetColumn(i);
       ColumnName left_col = col.Name();
       ColumnName right_col = col.Name();
-      if (!left_rel.empty()) left_col.schema = left_rel;
-      if (!right_rel.empty()) right_col.schema = right_rel;
+      if (!left_rel.empty()) {
+        left_col.schema = left_rel;
+      }
+      if (!right_rel.empty()) {
+        right_col.schema = right_rel;
+      }
       conjuncts.push_back(BinaryExpressionExp(ColumnValueExp(left_col),
                                               BinaryOperation::kEquals,
                                               ColumnValueExp(right_col)));
@@ -529,8 +679,12 @@ Expression BuildEqualityOnAllColumns(const Memo& memo,
         left_col = target.expression->AsColumnValue().GetColumnName();
         right_col = left_col;
       }
-      if (!left_rel.empty()) left_col.schema = left_rel;
-      if (!right_rel.empty()) right_col.schema = right_rel;
+      if (!left_rel.empty()) {
+        left_col.schema = left_rel;
+      }
+      if (!right_rel.empty()) {
+        right_col.schema = right_rel;
+      }
       conjuncts.push_back(BinaryExpressionExp(ColumnValueExp(left_col),
                                               BinaryOperation::kEquals,
                                               ColumnValueExp(right_col)));
@@ -561,10 +715,12 @@ Expression BuildEqualityOnAllColumns(const Memo& memo,
       for (size_t i = 0; i < left_sch.ColumnCount(); ++i) {
         ColumnName left_col = left_sch.GetColumn(i).Name();
         ColumnName right_col = right_sch.GetColumn(i).Name();
-        if (left_col.schema.empty() && !left_rel.empty())
+        if (left_col.schema.empty() && !left_rel.empty()) {
           left_col.schema = left_rel;
-        if (right_col.schema.empty() && !right_rel.empty())
+        }
+        if (right_col.schema.empty() && !right_rel.empty()) {
           right_col.schema = right_rel;
+        }
         conjuncts.push_back(BinaryExpressionExp(ColumnValueExp(left_col),
                                                 BinaryOperation::kEquals,
                                                 ColumnValueExp(right_col)));
@@ -625,7 +781,9 @@ bool AreFiltersEquivalent(const Expression& f1, const std::string& r1,
     return true;
   }
   auto normalize = [](std::string str, const std::string& rel) {
-    if (rel.empty()) return str;
+    if (rel.empty()) {
+      return str;
+    }
     size_t pos = 0;
     while ((pos = str.find(rel, pos)) != std::string::npos) {
       str.replace(pos, rel.length(), "$T");
@@ -636,32 +794,69 @@ bool AreFiltersEquivalent(const Expression& f1, const std::string& r1,
   return normalize(s1, r1) == normalize(s2, r2);
 }
 
-bool HasKeyEqualityPredicate(const Expression& predicate, const std::string& r1,
-                             const std::string& r2) {
+std::optional<std::string> SingleUniqueKeyEquality(
+    const Memo& memo, const Expression& predicate, const std::string& r1,
+    const std::string& r2, const std::string& unique_relation) {
   if (!predicate) {
+    return std::nullopt;
+  }
+  // The predicate must be EXACTLY the key equality: eliminating a join whose
+  // condition carries additional conjuncts would drop them.
+  const std::vector<Expression> conjuncts = SplitConjuncts(predicate);
+  if (conjuncts.size() != 1 || !conjuncts[0] ||
+      conjuncts[0]->Type() != TypeTag::kBinaryExp) {
+    return std::nullopt;
+  }
+  const auto& binary = conjuncts[0]->AsBinaryExpression();
+  if (binary.Op() != BinaryOperation::kEquals ||
+      binary.Left()->Type() != TypeTag::kColumnValue ||
+      binary.Right()->Type() != TypeTag::kColumnValue) {
+    return std::nullopt;
+  }
+  const ColumnName& c1 = binary.Left()->AsColumnValue().GetColumnName();
+  const ColumnName& c2 = binary.Right()->AsColumnValue().GetColumnName();
+  const bool forward = c1.schema == r1 && c2.schema == r2;
+  const bool backward = c1.schema == r2 && c2.schema == r1;
+  if ((!forward && !backward) || c1.name != c2.name) {
+    return std::nullopt;
+  }
+  // Uniqueness must be proven from the catalog-published schema; a name
+  // that merely looks like a key proves nothing.
+  const auto& schemas = memo.GetTableSchemas();
+  const auto found = schemas.find(unique_relation);
+  if (found == schemas.end()) {
+    return std::nullopt;
+  }
+  const int offset = found->second.Offset(ColumnName("", c1.name));
+  if (offset < 0) {
+    return std::nullopt;
+  }
+  if (!found->second.GetColumn(static_cast<size_t>(offset))
+           .GetConstraint()
+           .IsUnique()) {
+    return std::nullopt;
+  }
+  return c1.name;
+}
+
+// True when the column is declared NOT NULL (or a primary key) in the
+// relation's catalog-published schema.  Unknown schemas refuse.
+bool ColumnIsDeclaredNonNull(const Memo& memo, const std::string& relation,
+                             const ColumnName& column) {
+  const auto& schemas = memo.GetTableSchemas();
+  const auto found = schemas.find(relation);
+  if (found == schemas.end()) {
     return false;
   }
-  for (const Expression& conjunct : SplitConjuncts(predicate)) {
-    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
-      continue;
-    }
-    const auto& binary = conjunct->AsBinaryExpression();
-    if (binary.Op() != BinaryOperation::kEquals) {
-      continue;
-    }
-    if (binary.Left()->Type() == TypeTag::kColumnValue &&
-        binary.Right()->Type() == TypeTag::kColumnValue) {
-      const ColumnName& c1 = binary.Left()->AsColumnValue().GetColumnName();
-      const ColumnName& c2 = binary.Right()->AsColumnValue().GetColumnName();
-      if ((c1.schema == r1 && c2.schema == r2 && c1.name == c2.name) ||
-          (c1.schema == r2 && c2.schema == r1 && c1.name == c2.name) ||
-          (c1.name == c2.name &&
-           (c1.schema == r1 || c2.schema == r2 || r1 == r2))) {
-        return true;
-      }
-    }
+  const int offset = found->second.Offset(ColumnName("", column.name));
+  if (offset < 0) {
+    return false;
   }
-  return false;
+  const Constraint::ConstraintType ctype =
+      found->second.GetColumn(static_cast<size_t>(offset))
+          .GetConstraint()
+          .ctype;
+  return ctype == Constraint::kNotNull || ctype == Constraint::kPrimaryKey;
 }
 
 void InferJoinInequalities(Memo& memo, const Expression& join_predicate) {
@@ -1666,17 +1861,36 @@ const RuleSet& RuleSet::Default() {
             if (!is_setop || !expression.predicate) {
               continue;
             }
-            // Gate: every qualified column in the predicate must resolve in
-            // every branch; otherwise pushing would filter on a non-existent
-            // or wrong relation.
+            // Gate: every column in the predicate must resolve in every
+            // branch; otherwise pushing would filter on a non-existent or
+            // wrong relation.  Qualified columns resolve through the branch
+            // relation lists; an unqualified column is only pushable when it
+            // resolves by name in EVERY branch's catalog-published schema —
+            // when the schemas are unavailable the push must refuse.
             const auto touched = (*expression.predicate)->TouchedColumns();
+            const auto& schemas = memo.GetTableSchemas();
+            auto resolves_in_branch = [&](const Group& branch,
+                                          const ColumnName& column) {
+              if (!column.schema.empty()) {
+                return std::ranges::find(branch.relations, column.schema) !=
+                       branch.relations.end();
+              }
+              if (schemas.empty()) {
+                return false;
+              }
+              return std::ranges::all_of(
+                  branch.relations, [&](const auto& rel) {
+                    const auto found = schemas.find(rel);
+                    return found != schemas.end() &&
+                           found->second.Offset(ColumnName("", column.name)) >=
+                               0;
+                  });
+            };
             bool pushable = true;
             for (const GroupId child : setop.children) {
               const Group& child_group = memo.Get(child);
               for (const ColumnName& column : touched) {
-                if (!column.schema.empty() &&
-                    std::ranges::find(child_group.relations, column.schema) ==
-                        child_group.relations.end()) {
+                if (!resolves_in_branch(child_group, column)) {
                   pushable = false;
                   break;
                 }
@@ -2523,9 +2737,12 @@ const RuleSet& RuleSet::Default() {
 
     // push_filter_through_left_join_left_side: Selection(pred, OuterJoin(L, R))
     //   -> Selection(pred, OuterJoin(Selection(pred, L), R))
-    // when pred references only columns from L. Always safe because the
-    // Selection on L filters rows before the outer join, and unmatched L rows
-    // still get NULL-padded on the right.
+    // when pred references only columns from L and L is the preserved side
+    // (join_type 0 = LEFT). Safe because the Selection on L filters rows
+    // before the outer join, and unmatched L rows still get NULL-padded on
+    // the right. For RIGHT/FULL outer joins L is the NULL-supplying side:
+    // filtering it before the join would drop padded output rows, so the
+    // rule must not fire there.
     built.Add(Rule(
         "push_filter_through_left_join_left_side",
         Selection(OuterJoin(Any("left"), Any("right"), "join")),
@@ -2548,14 +2765,25 @@ const RuleSet& RuleSet::Default() {
           if (!ReferencesOnly(pred, left_relations)) {
             return;
           }
-          // Snapshot the join alternatives before mutating the join group.
-          std::vector<LogicalExpression> joins;
-          for (const LogicalExpression& join :
-               memo.Get(bindings.at("join")).expressions) {
-            if (join.operation == LogicalOperator::kOuterJoin) {
-              joins.push_back(join);
+          // Only the preserved (left) side may be filtered early. RIGHT and
+          // FULL outer joins NULL-supply the left side, so dropping left rows
+          // here would remove NULL-padded output rows from the result.
+          const std::vector<LogicalExpression> guarded_joins = [&] {
+            std::vector<LogicalExpression> kept;
+            for (const LogicalExpression& join :
+                 memo.Get(bindings.at("join")).expressions) {
+              if (join.operation == LogicalOperator::kOuterJoin &&
+                  join.join_type == 0) {
+                kept.push_back(join);
+              }
             }
+            return kept;
+          }();
+          if (guarded_joins.empty()) {
+            return;
           }
+          // Snapshot the guarded join alternatives before mutating the join
+          // group (guarded_joins above).
           // Selection(pred) filters the left input from a dedicated derived
           // group; adding it into the left group itself would be a
           // self-referencing expression.
@@ -2567,7 +2795,7 @@ const RuleSet& RuleSet::Default() {
               LogicalExpression{.operation = LogicalOperator::kSelection,
                                 .children = {bindings.at("left")},
                                 .predicate = pred});
-          for (const LogicalExpression& join : joins) {
+          for (const LogicalExpression& join : guarded_joins) {
             // Rebuild the outer join with the filtered left input.  The join
             // condition stays the original one: the Selection predicate is a
             // row filter on the left side, not an ON-clause conjunct.
@@ -3189,8 +3417,14 @@ const RuleSet& RuleSet::Default() {
             return;
           }
 
-          if (!expression.predicate ||
-              !HasKeyEqualityPredicate(*expression.predicate, r1, r2)) {
+          // The join condition must be EXACTLY a key equality whose column
+          // carries a UNIQUE/PRIMARY KEY constraint in the (shared) table
+          // schema; otherwise the join multiplies rows and eliminating it
+          // would change results.  Uniqueness is looked up under the left
+          // relation's name: both sides scan the same table.
+          if (!SingleUniqueKeyEquality(
+                  memo, expression.predicate.value_or(Expression()), r1, r2,
+                  r1)) {
             return;
           }
           // The replacement is a single scan of the left table: the join's
@@ -3217,10 +3451,11 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kJoin));
 
     // unique_semi_to_inner: Convert SemiJoin(L, R, p) to InnerJoin(L, R, p)
-    // when right side keys are unique. Uniqueness cannot be proven from the
-    // memo alone, so this fires only on a key-equality predicate between the
-    // two sides (the historical behavior of rewriting every non-empty right
-    // side unconditionally multiplied rows and is disabled).
+    // when right side keys are unique (each left row then has at most one
+    // match, so inner and semi keep the same multiplicity).  Uniqueness is
+    // proven from the catalog-published schema: the predicate must be
+    // exactly the key equality and the right-side column must carry a
+    // UNIQUE/PRIMARY KEY constraint.
     built.Add(Rule(
         "unique_semi_to_inner", SemiJoin(Any("left"), Any("right")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
@@ -3240,8 +3475,8 @@ const RuleSet& RuleSet::Default() {
             std::string r_right = right_group.relations.empty()
                                       ? ""
                                       : right_group.relations.front();
-            if (HasKeyEqualityPredicate(*expression.predicate, r_left,
-                                        r_right)) {
+            if (SingleUniqueKeyEquality(memo, *expression.predicate, r_left,
+                                        r_right, r_right)) {
               memo.AddExpression(
                   group,
                   LogicalExpression{.operation = LogicalOperator::kJoin,
@@ -3277,44 +3512,47 @@ const RuleSet& RuleSet::Default() {
             const Group& right_group = memo.Get(right_id);
             const std::unordered_set<std::string> right_rels(
                 right_group.relations.begin(), right_group.relations.end());
+            auto resolves_to_right = [&](const ColumnName& col) {
+              return right_rels.contains(col.schema) ||
+                     std::any_of(right_rels.begin(), right_rels.end(),
+                                 [&](const std::string& rel) {
+                                   return IsSameTable(rel, col.schema);
+                                 });
+            };
 
-            bool has_null_check_on_right = false;
-            bool has_other_right_ref = false;
+            // The Selection must be EXACTLY `right.col IS NULL` conjuncts:
+            // the AntiJoin replacement keeps only the join condition, so any
+            // residual conjunct (left- or right-referencing) would be lost.
+            size_t null_checks = 0;
+            bool convertible = true;
             for (const Expression& conjunct :
                  SplitConjuncts(*expression.predicate)) {
-              if (!conjunct) continue;
-              if (conjunct->Type() == TypeTag::kUnaryExp &&
-                  conjunct->AsUnaryExpression().Op() ==
+              if (!conjunct || conjunct->Type() != TypeTag::kUnaryExp ||
+                  conjunct->AsUnaryExpression().Op() !=
                       UnaryOperation::kIsNull) {
-                const auto& child = conjunct->AsUnaryExpression().Child();
-                if (child && child->Type() == TypeTag::kColumnValue) {
-                  const ColumnName& col =
-                      child->AsColumnValue().GetColumnName();
-                  if (right_rels.contains(col.schema) ||
-                      std::any_of(right_rels.begin(), right_rels.end(),
-                                  [&](const std::string& rel) {
-                                    return IsSameTable(rel, col.schema);
-                                  })) {
-                    has_null_check_on_right = true;
-                    continue;
-                  }
-                }
+                convertible = false;
+                break;
               }
-              // D5 gate: check if any other conjunct references right-side
-              // columns. If so, the AntiJoin conversion would lose those
-              // predicates (they need actual right-side data, not NULLs).
-              for (const ColumnName& col : conjunct->TouchedColumns()) {
-                if (right_rels.contains(col.schema) ||
-                    std::any_of(right_rels.begin(), right_rels.end(),
-                                [&](const std::string& rel) {
-                                  return IsSameTable(rel, col.schema);
-                                })) {
-                  has_other_right_ref = true;
-                  break;
-                }
+              const Expression& child = conjunct->AsUnaryExpression().Child();
+              if (!child || child->Type() != TypeTag::kColumnValue) {
+                convertible = false;
+                break;
               }
+              const ColumnName& col = child->AsColumnValue().GetColumnName();
+              if (!resolves_to_right(col)) {
+                convertible = false;
+                break;
+              }
+              // A matched row whose null-tested column is genuinely NULL
+              // satisfies `col IS NULL` but is dropped by the AntiJoin;
+              // the rewrite is only sound for NOT NULL columns.
+              if (!ColumnIsDeclaredNonNull(memo, col.schema, col)) {
+                convertible = false;
+                break;
+              }
+              ++null_checks;
             }
-            if (has_null_check_on_right && !has_other_right_ref) {
+            if (convertible && null_checks > 0) {
               memo.AddExpression(
                   group, LogicalExpression{
                              .operation = LogicalOperator::kAntiJoin,
@@ -3439,6 +3677,7 @@ const RuleSet& RuleSet::Default() {
             }
             const GroupId child_id = win_expr.children[0];
             size_t limit_val = 0;
+            size_t limit_offset = 0;
             for (const Expression& conjunct :
                  SplitConjuncts(*expression.predicate)) {
               if (conjunct && conjunct->Type() == TypeTag::kBinaryExp) {
@@ -3467,9 +3706,12 @@ const RuleSet& RuleSet::Default() {
                             ? val.value.int_value > 0
                         : binary.Op() == BinaryOperation::kLessThan
                             ? val.value.int_value > 1
-                            : val.value.int_value == 1;
+                            : val.value.int_value >= 1;
                     if (binary.Op() == BinaryOperation::kEquals) {
-                      limit_val = 1;
+                      // rn = k keeps exactly the k-th ranked row: take k
+                      // rows and drop the first k-1.
+                      limit_val = static_cast<size_t>(val.value.int_value);
+                      limit_offset = limit_val - 1;
                     } else if (positive) {
                       limit_val = static_cast<size_t>(
                           binary.Op() == BinaryOperation::kLessThanEquals
@@ -3492,7 +3734,7 @@ const RuleSet& RuleSet::Default() {
                              .sort_ascending = win_expr.sort_ascending,
                              .sort_nulls_first = win_expr.sort_nulls_first,
                              .limit_count = limit_val,
-                             .limit_offset = 0,
+                             .limit_offset = limit_offset,
                              .output_schema = expression.output_schema});
             }
           }
@@ -3615,7 +3857,9 @@ const RuleSet& RuleSet::Default() {
           std::vector<NamedExpression> unique_targets;
           std::unordered_set<std::string> seen;
           for (const auto& target : expression.target_list) {
-            if (!target.expression) continue;
+            if (!target.expression) {
+              continue;
+            }
             std::string sig = target.name + ":" + target.expression->ToString();
             if (!seen.contains(sig)) {
               seen.insert(sig);
@@ -3752,7 +3996,9 @@ const RuleSet& RuleSet::Default() {
               }
             }
             for (const auto& target : expression.target_list) {
-              if (!target.expression) continue;
+              if (!target.expression) {
+                continue;
+              }
               for (const auto& col : target.expression->TouchedColumns()) {
                 if (std::ranges::find(left_relations, col.schema) !=
                     left_relations.end()) {
@@ -3978,18 +4224,21 @@ const RuleSet& RuleSet::Default() {
           bool added = false;
           for (size_t i = 0; i < equalities.size(); ++i) {
             for (size_t j = 0; j < equalities.size(); ++j) {
-              if (i == j) continue;
+              if (i == j) {
+                continue;
+              }
               const auto& [a1, b1] = equalities[i];
               const auto& [a2, b2] = equalities[j];
               std::optional<std::pair<ColumnName, ColumnName>> inferred;
-              if (b1 == a2 && a1 != b2)
+              if (b1 == a2 && a1 != b2) {
                 inferred = {a1, b2};
-              else if (b1 == b2 && a1 != a2)
+              } else if (b1 == b2 && a1 != a2) {
                 inferred = {a1, a2};
-              else if (a1 == a2 && b1 != b2)
+              } else if (a1 == a2 && b1 != b2) {
                 inferred = {b1, b2};
-              else if (a1 == b2 && b1 != a2)
+              } else if (a1 == b2 && b1 != a2) {
                 inferred = {b1, a2};
+              }
 
               if (inferred &&
                   inferred->first.schema != inferred->second.schema) {
@@ -4968,21 +5217,16 @@ const RuleSet& RuleSet::Default() {
                 g.tag.find("one_row") != std::string::npos) {
               return true;
             }
-            for (const auto& expr : g.expressions) {
-              if (expr.operation == LogicalOperator::kConstantTable ||
-                  expr.operation == LogicalOperator::kMax1Row) {
-                return true;
-              }
-              if (expr.operation == LogicalOperator::kValues &&
-                  expr.values.size() == 1) {
-                return true;
-              }
-              if (expr.operation == LogicalOperator::kAggregation &&
-                  expr.grouping_sets.empty() && expr.partition_by.empty()) {
-                return true;
-              }
-            }
-            return false;
+            return std::ranges::any_of(
+                g.expressions, [](const LogicalExpression& expr) {
+                  return expr.operation == LogicalOperator::kConstantTable ||
+                         expr.operation == LogicalOperator::kMax1Row ||
+                         (expr.operation == LogicalOperator::kValues &&
+                          expr.values.size() == 1) ||
+                         (expr.operation == LogicalOperator::kAggregation &&
+                          expr.grouping_sets.empty() &&
+                          expr.partition_by.empty());
+                });
           };
 
           const bool left_one_row = is_one_row(memo.Get(left_id));
@@ -5165,7 +5409,9 @@ const RuleSet& RuleSet::Default() {
 
             std::unordered_set<std::string> partition_cols;
             for (const auto& part : win_expr.partition_by) {
-              if (!part) continue;
+              if (!part) {
+                continue;
+              }
               for (const auto& col : part->TouchedColumns()) {
                 partition_cols.insert(col.name);
                 partition_cols.insert(col.ToString());
@@ -5226,7 +5472,9 @@ const RuleSet& RuleSet::Default() {
             size_t degree = 0;
             const uint64_t r_mask = memo.RelationMask({r});
             for (const auto& other : relations) {
-              if (r == other) continue;
+              if (r == other) {
+                continue;
+              }
               const uint64_t o_mask = memo.RelationMask({other});
               if (memo.CutConnected(r_mask, r_mask | o_mask)) {
                 ++degree;
@@ -5334,8 +5582,11 @@ const RuleSet& RuleSet::Default() {
               for (size_t i = 0; i < child_expr.output_schema.ColumnCount();
                    ++i) {
                 const auto& col = child_expr.output_schema.GetColumn(i);
+                // Only a declared NOT NULL / PRIMARY KEY proves the column
+                // cannot hold NULL. SQL UNIQUE permits NULLs (multiple of
+                // them, even), and a column merely *named* id/pk may be
+                // nullable, so neither is a sound proof.
                 if (col.GetConstraint().ctype == Constraint::kNotNull ||
-                    col.GetConstraint().IsUnique() ||
                     col.GetConstraint().ctype == Constraint::kPrimaryKey) {
                   not_null_cols.insert(col.Name().name);
                   not_null_cols.insert(col.Name().ToString());
@@ -5355,8 +5606,7 @@ const RuleSet& RuleSet::Default() {
                 const ColumnName& col_name =
                     child->AsColumnValue().GetColumnName();
                 if (not_null_cols.contains(col_name.name) ||
-                    not_null_cols.contains(col_name.ToString()) ||
-                    col_name.name == "id" || col_name.name == "pk") {
+                    not_null_cols.contains(col_name.ToString())) {
                   changed = true;
                   continue;
                 }
@@ -5430,7 +5680,9 @@ const RuleSet& RuleSet::Default() {
           for (const auto& target : expression.target_list) {
             if (target.expression) {
               for (const auto& col : target.expression->TouchedColumns()) {
-                if (!col.schema.empty()) proj_rels.insert(col.schema);
+                if (!col.schema.empty()) {
+                  proj_rels.insert(col.schema);
+                }
               }
             }
           }
@@ -5477,7 +5729,10 @@ const RuleSet& RuleSet::Default() {
     // duplicates left rows when the right side matches more than once, so
     // the rewrite silently changed the result cardinality, and it also
     // dropped left-side-only predicate conjuncts.  A semi join preserves
-    // both properties without needing a uniqueness proof on the right.
+    // the filtering property but is still NOT multiplicity-preserving
+    // unless every right-side equality key is UNIQUE: the semi conversion
+    // therefore requires that uniqueness proof (COUNT(*) over
+    // p1 JOIN p2 ON p1.k = p2.k used to report 7 instead of 11).
     built.Add(Rule(
         "unused_join_elimination", Projection(Any("input")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
@@ -5488,6 +5743,15 @@ const RuleSet& RuleSet::Default() {
                                           bindings.at("input"))) {
             return;
           }
+          // Aggregation collapses the join output into single values, so a
+          // constant-only projection above this node (the grouped bridge's
+          // COUNT(*) core) must keep the join's multiplicity intact.
+          if (std::ranges::any_of(expression.target_list,
+                                  [](const NamedExpression& item) {
+                                    return ContainsAggregate(item.expression);
+                                  })) {
+            return;
+          }
           const GroupId input_id = bindings.at("input");
           for (const LogicalExpression& join : memo.Get(input_id).expressions) {
             if (join.operation != LogicalOperator::kJoin ||
@@ -5496,7 +5760,12 @@ const RuleSet& RuleSet::Default() {
               continue;
             }
             // A cross join (no predicate) duplicates every left row by the
-            // right cardinality; it must NOT be eliminated.
+            // right cardinality; it must NOT be eliminated.  The semi
+            // conversion additionally needs the right-side keys to be
+            // provably unique.
+            if (!RightSideJoinKeysAreUnique(join, memo)) {
+              continue;
+            }
             LogicalExpression semi = expression;
             semi.children = {join.children[0], join.children[1]};
             semi.operation = LogicalOperator::kSemiJoin;
@@ -5583,7 +5852,9 @@ const RuleSet& RuleSet::Default() {
                 }
               }
             }
-            if (contradiction) break;
+            if (contradiction) {
+              break;
+            }
           }
 
           if (contradiction) {
@@ -5615,7 +5886,9 @@ std::string PhysicalProperties::Key() const {
   if (!partition_by.empty()) {
     key.append("|p:");
     for (size_t i = 0; i < partition_by.size(); ++i) {
-      if (i > 0) key.push_back(',');
+      if (i > 0) {
+        key.push_back(',');
+      }
       key.append(partition_by[i].ToString());
     }
   }
@@ -5626,7 +5899,9 @@ std::string PhysicalProperties::Key() const {
   if (!bloom_filter_keys.empty()) {
     key.append("|bf:");
     for (size_t i = 0; i < bloom_filter_keys.size(); ++i) {
-      if (i > 0) key.push_back(',');
+      if (i > 0) {
+        key.push_back(',');
+      }
       key.append(bloom_filter_keys[i].ToString());
     }
   }
@@ -5678,7 +5953,7 @@ double EstimateMultiColumnSelectivity(const std::vector<double>& selectivities,
     min_sel = std::min(min_sel, s);
   }
   const double corr = std::clamp(correlation_factor, 0.0, 1.0);
-  return (1.0 - corr) * independent_prod + corr * min_sel;
+  return ((1.0 - corr) * independent_prod) + (corr * min_sel);
 }
 
 double EstimatePatternSelectivity(PatternMatchingKind kind,
@@ -5706,31 +5981,29 @@ double EstimatePatternSelectivity(PatternMatchingKind kind,
     }
     double sel = std::pow(0.2, static_cast<double>(prefix_len));
     return std::clamp(sel, 1.0 / std::max(1.0, domain_cardinality), 1.0);
-  } else {
-    // kRegexp
-    if (pattern.empty()) {
-      return 1.0;
-    }
-    size_t prefix_len = 0;
-    size_t start = 0;
-    if (pattern.front() == '^') {
-      start = 1;
-    }
-    for (size_t i = start; i < pattern.size(); ++i) {
-      char c = pattern[i];
-      if (c == '.' || c == '*' || c == '+' || c == '?' || c == '[' ||
-          c == ']' || c == '(' || c == ')' || c == '{' || c == '}' ||
-          c == '|' || c == '^' || c == '$' || c == '\\') {
-        break;
-      }
-      ++prefix_len;
-    }
-    if (prefix_len == 0) {
-      return std::min(0.5, 5.0 / std::max(1.0, domain_cardinality));
-    }
-    double sel = std::pow(0.2, static_cast<double>(prefix_len));
-    return std::clamp(sel, 1.0 / std::max(1.0, domain_cardinality), 1.0);
+  }  // kRegexp
+  if (pattern.empty()) {
+    return 1.0;
   }
+  size_t prefix_len = 0;
+  size_t start = 0;
+  if (pattern.front() == '^') {
+    start = 1;
+  }
+  for (size_t i = start; i < pattern.size(); ++i) {
+    char c = pattern[i];
+    if (c == '.' || c == '*' || c == '+' || c == '?' || c == '[' || c == ']' ||
+        c == '(' || c == ')' || c == '{' || c == '}' || c == '|' || c == '^' ||
+        c == '$' || c == '\\') {
+      break;
+    }
+    ++prefix_len;
+  }
+  if (prefix_len == 0) {
+    return std::min(0.5, 5.0 / std::max(1.0, domain_cardinality));
+  }
+  double sel = std::pow(0.2, static_cast<double>(prefix_len));
+  return std::clamp(sel, 1.0 / std::max(1.0, domain_cardinality), 1.0);
 }
 
 double EstimateHistogramJoinCardinality(
@@ -5750,7 +6023,7 @@ double EstimateHistogramJoinCardinality(
         const double overlap_span = overlap_high - overlap_low;
         const double overlap_ratio = overlap_span / std::max(l_span, r_span);
         const double max_ndv =
-            std::max(1.0, std::max(l.distinct_count, r.distinct_count));
+            std::max({1.0, l.distinct_count, r.distinct_count});
         const double bucket_join = (l.count * r.count / max_ndv) *
                                    std::clamp(overlap_ratio, 0.01, 1.0);
         total_join_rows += bucket_join;
@@ -5769,7 +6042,7 @@ double EstimateStarJoinCost(double fact_rows,
     const double dim_rows = dimension_rows[i];
     const double sel = (i < selectivities.size()) ? selectivities[i] : 1.0;
     // Hash join build cost on dimension + probe cost on fact stream
-    total_cost += dim_rows * 1.0 + current_rows * 1.5;
+    total_cost += (dim_rows * 1.0) + (current_rows * 1.5);
     current_rows *= sel;
   }
   return total_cost;
@@ -5798,10 +6071,10 @@ double CalibrateOperatorCost(OperatorCostKind kind, double input_rows_left,
   double cost = 0.0;
   switch (kind) {
     case OperatorCostKind::kHashJoin:
-      cost = input_rows_left * 1.2 + input_rows_right * 1.5;
+      cost = (input_rows_left * 1.2) + (input_rows_right * 1.5);
       break;
     case OperatorCostKind::kMergeJoin:
-      cost = input_rows_left * 1.1 + input_rows_right * 1.1;
+      cost = (input_rows_left * 1.1) + (input_rows_right * 1.1);
       break;
     case OperatorCostKind::kNestedLoopJoin:
       cost = input_rows_left * input_rows_right * 2.0;
@@ -5810,7 +6083,7 @@ double CalibrateOperatorCost(OperatorCostKind kind, double input_rows_left,
       cost = std::log2(std::max(2.0, input_rows_left)) * 1.5;
       break;
     case OperatorCostKind::kBitmapScan:
-      cost = input_rows_left * 0.8 + 10.0;
+      cost = (input_rows_left * 0.8) + 10.0;
       break;
     case OperatorCostKind::kSort:
       cost = input_rows_left <= 1.0
@@ -5819,7 +6092,7 @@ double CalibrateOperatorCost(OperatorCostKind kind, double input_rows_left,
       break;
   }
   if (!required.ordering.empty() && delivered.ordering != required.ordering) {
-    cost += input_rows_left * 5.0 + 50.0;
+    cost += (input_rows_left * 5.0) + 50.0;
   }
   return cost;
 }

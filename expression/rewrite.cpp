@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <stdexcept>
@@ -64,6 +66,18 @@ Volatility GetFunctionVolatility(std::string_view func_name) {
 
 namespace {
 
+// Mirrors the timestamp-shape detection in EvaluateBinary: `=` on two
+// timestamp-shaped varchars coerces both sides to epoch seconds, while
+// LIKE/NOT LIKE/REGEXP compare bytes.  Rules that replace byte-wise
+// matching with `=` must refuse timestamp-shaped constants or they change
+// results ('2020-01-01T12:00:00' = '2020-01-01 12:00:00' is true under the
+// coercion, but LIKE on the raw bytes is false).
+bool TimestampShapedConstant(std::string_view text) {
+  return text.size() >= 19 && text[4] == '-' && text[7] == '-' &&
+         (text[10] == ' ' || text[10] == 'T') && text[13] == ':' &&
+         text[16] == ':';
+}
+
 std::string ToUpper(std::string_view s) {
   std::string result;
   result.reserve(s.size());
@@ -81,28 +95,59 @@ bool IsNumericWideningCast(std::string_view from_str, std::string_view to_str) {
     return true;
   }
   auto rank = [](std::string_view t) -> int {
-    if (t == "INT8" || t == "TINYINT") return 1;
-    if (t == "INT16" || t == "SMALLINT") return 2;
-    if (t == "INT32" || t == "INT" || t == "INTEGER") return 3;
-    if (t == "INT64" || t == "BIGINT") return 4;
-    if (t == "UINT8") return 11;
-    if (t == "UINT16") return 12;
-    if (t == "UINT32") return 13;
-    if (t == "UINT64") return 14;
-    if (t == "FLOAT" || t == "FLOAT32") return 21;
-    if (t == "DOUBLE" || t == "FLOAT64") return 22;
+    if (t == "INT8" || t == "TINYINT") {
+      return 1;
+    }
+    if (t == "INT16" || t == "SMALLINT") {
+      return 2;
+    }
+    if (t == "INT32" || t == "INT" || t == "INTEGER") {
+      return 3;
+    }
+    if (t == "INT64" || t == "BIGINT") {
+      return 4;
+    }
+    if (t == "UINT8") {
+      return 11;
+    }
+    if (t == "UINT16") {
+      return 12;
+    }
+    if (t == "UINT32") {
+      return 13;
+    }
+    if (t == "UINT64") {
+      return 14;
+    }
+    if (t == "FLOAT" || t == "FLOAT32") {
+      return 21;
+    }
+    if (t == "DOUBLE" || t == "FLOAT64") {
+      return 22;
+    }
     return 0;
   };
   int r1 = rank(from);
   int r2 = rank(to);
   if (r1 > 0 && r2 > 0) {
-    if (r1 <= 4 && r2 <= 4 && r1 <= r2) return true;
-    if (r1 >= 11 && r1 <= 14 && r2 >= 11 && r2 <= 14 && r1 <= r2) return true;
-    if (r1 >= 11 && r1 <= 13 && r2 >= 3 && r2 <= 4 && (r1 - 10) < (r2))
+    if (r1 <= 4 && r2 <= 4 && r1 <= r2) {
       return true;
-    if (r1 >= 21 && r1 <= 22 && r2 >= 21 && r2 <= 22 && r1 <= r2) return true;
-    if (r1 <= 4 && r2 >= 21) return true;
-    if (r1 >= 11 && r1 <= 14 && r2 >= 21) return true;
+    }
+    if (r1 >= 11 && r1 <= 14 && r2 >= 11 && r2 <= 14 && r1 <= r2) {
+      return true;
+    }
+    if (r1 >= 11 && r1 <= 13 && r2 >= 3 && r2 <= 4 && (r1 - 10) < (r2)) {
+      return true;
+    }
+    if (r1 >= 21 && r1 <= 22 && r2 >= 21 && r2 <= 22 && r1 <= r2) {
+      return true;
+    }
+    if (r1 <= 4 && r2 >= 21) {
+      return true;
+    }
+    if (r1 >= 11 && r1 <= 14 && r2 >= 21) {
+      return true;
+    }
   }
   return false;
 }
@@ -118,7 +163,7 @@ struct JVal {
   std::vector<std::shared_ptr<JVal>> arr;
   std::vector<std::pair<std::string, std::shared_ptr<JVal>>> obj;
 
-  std::string canonical() const {
+  [[nodiscard]] std::string canonical() const {
     switch (type) {
       case kNull:
         return "null";
@@ -133,12 +178,13 @@ struct JVal {
       case kStr: {
         std::string res = "\"";
         for (char c : str) {
-          if (c == '"')
+          if (c == '"') {
             res += "\\\"";
-          else if (c == '\\')
+          } else if (c == '\\') {
             res += "\\\\";
-          else
+          } else {
             res += c;
+          }
         }
         res += "\"";
         return res;
@@ -146,8 +192,12 @@ struct JVal {
       case kArr: {
         std::string res = "[";
         for (size_t i = 0; i < arr.size(); ++i) {
-          if (i > 0) res += ",";
-          if (arr[i]) res += arr[i]->canonical();
+          if (i > 0) {
+            res += ",";
+          }
+          if (arr[i]) {
+            res += arr[i]->canonical();
+          }
         }
         res += "]";
         return res;
@@ -155,7 +205,9 @@ struct JVal {
       case kObj: {
         std::string res = "{";
         for (size_t i = 0; i < obj.size(); ++i) {
-          if (i > 0) res += ",";
+          if (i > 0) {
+            res += ",";
+          }
           res += "\"" + obj[i].first +
                  "\":" + (obj[i].second ? obj[i].second->canonical() : "null");
         }
@@ -178,23 +230,28 @@ void SkipWs(std::string_view& s) {
 
 std::string ParseJsonStringToken(std::string_view& s) {
   std::string res;
-  if (s.empty() || s.front() != '"') return res;
+  if (s.empty() || s.front() != '"') {
+    return res;
+  }
   s.remove_prefix(1);
   while (!s.empty()) {
     char c = s.front();
     s.remove_prefix(1);
-    if (c == '"') break;
+    if (c == '"') {
+      break;
+    }
     if (c == '\\' && !s.empty()) {
       char esc = s.front();
       s.remove_prefix(1);
-      if (esc == 'n')
+      if (esc == 'n') {
         res += '\n';
-      else if (esc == 't')
+      } else if (esc == 't') {
         res += '\t';
-      else if (esc == 'r')
+      } else if (esc == 'r') {
         res += '\r';
-      else
+      } else {
         res += esc;
+      }
     } else {
       res += c;
     }
@@ -205,7 +262,9 @@ std::string ParseJsonStringToken(std::string_view& s) {
 JVal ParseJsonSimple(std::string_view& s) {
   SkipWs(s);
   JVal v;
-  if (s.empty()) return v;
+  if (s.empty()) {
+    return v;
+  }
   std::string_view start = s;
   if (s.starts_with("null")) {
     s.remove_prefix(4);
@@ -245,7 +304,9 @@ JVal ParseJsonSimple(std::string_view& s) {
         SkipWs(s);
       }
     }
-    if (!s.empty() && s.front() == ']') s.remove_prefix(1);
+    if (!s.empty() && s.front() == ']') {
+      s.remove_prefix(1);
+    }
     v.raw = start.substr(0, start.size() - s.size());
     return v;
   }
@@ -255,7 +316,9 @@ JVal ParseJsonSimple(std::string_view& s) {
     SkipWs(s);
     while (!s.empty() && s.front() != '}') {
       SkipWs(s);
-      if (s.front() != '"') break;
+      if (s.front() != '"') {
+        break;
+      }
       std::string key = ParseJsonStringToken(s);
       SkipWs(s);
       if (!s.empty() && s.front() == ':') {
@@ -271,15 +334,18 @@ JVal ParseJsonSimple(std::string_view& s) {
         SkipWs(s);
       }
     }
-    if (!s.empty() && s.front() == '}') s.remove_prefix(1);
+    if (!s.empty() && s.front() == '}') {
+      s.remove_prefix(1);
+    }
     v.raw = start.substr(0, start.size() - s.size());
     return v;
   }
   // Number
   size_t len = 0;
   while (len < s.size() &&
-         (std::isdigit(static_cast<unsigned char>(s[len])) || s[len] == '-' ||
-          s[len] == '+' || s[len] == '.' || s[len] == 'e' || s[len] == 'E')) {
+         ((std::isdigit(static_cast<unsigned char>(s[len])) != 0) ||
+          s[len] == '-' || s[len] == '+' || s[len] == '.' || s[len] == 'e' ||
+          s[len] == 'E')) {
     ++len;
   }
   if (len > 0) {
@@ -299,8 +365,12 @@ JVal ParseJsonSimple(std::string_view& s) {
 
 const JVal* NavigateJsonPath(const JVal& root, std::string_view path) {
   const JVal* cur = &root;
-  if (path.empty() || path == "$") return cur;
-  if (path.front() == '$') path.remove_prefix(1);
+  if (path.empty() || path == "$") {
+    return cur;
+  }
+  if (path.front() == '$') {
+    path.remove_prefix(1);
+  }
   while (!path.empty()) {
     if (path.front() == '.') {
       path.remove_prefix(1);
@@ -313,7 +383,9 @@ const JVal* NavigateJsonPath(const JVal& root, std::string_view path) {
           path.remove_prefix(1);
         }
       }
-      if (cur->type != JVal::kObj) return nullptr;
+      if (cur->type != JVal::kObj) {
+        return nullptr;
+      }
       const JVal* found = nullptr;
       for (const auto& [k, child] : cur->obj) {
         if (k == key) {
@@ -321,23 +393,29 @@ const JVal* NavigateJsonPath(const JVal& root, std::string_view path) {
           break;
         }
       }
-      if (!found) return nullptr;
+      if (found == nullptr) {
+        return nullptr;
+      }
       cur = found;
     } else if (path.front() == '[') {
       path.remove_prefix(1);
       int idx = 0;
       while (!path.empty() &&
-             std::isdigit(static_cast<unsigned char>(path.front()))) {
-        idx = idx * 10 + (path.front() - '0');
+             (std::isdigit(static_cast<unsigned char>(path.front())) != 0)) {
+        idx = (idx * 10) + (path.front() - '0');
         path.remove_prefix(1);
       }
-      if (!path.empty() && path.front() == ']') path.remove_prefix(1);
+      if (!path.empty() && path.front() == ']') {
+        path.remove_prefix(1);
+      }
       if (cur->type != JVal::kArr || idx < 0 ||
           static_cast<size_t>(idx) >= cur->arr.size()) {
         return nullptr;
       }
       cur = cur->arr[static_cast<size_t>(idx)].get();
-      if (!cur) return nullptr;
+      if (cur == nullptr) {
+        return nullptr;
+      }
     } else {
       break;
     }
@@ -349,33 +427,42 @@ Value EvaluateJsonFunction(std::string_view func_name,
                            std::string_view json_str,
                            std::string_view path_str) {
   std::string name(func_name);
-  for (char& c : name)
+  for (char& c : name) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
   std::string_view s = json_str;
   JVal root = ParseJsonSimple(s);
   const JVal* cur = NavigateJsonPath(root, path_str);
-  if (!cur) return Value();
+  if (cur == nullptr) {
+    return {};
+  }
 
   if (name == "json_extract_array" || name == "json_query_array" ||
       name == "json_value_array" || name == "json_extract_string_array") {
-    if (cur->type != JVal::kArr) return Value();
+    if (cur->type != JVal::kArr) {
+      return {};
+    }
     std::vector<Value> elems;
     elems.reserve(cur->arr.size());
     for (const auto& item : cur->arr) {
       if (item) {
         if (name == "json_value_array" || name == "json_extract_string_array") {
-          elems.push_back(Value(
-              std::string(item->type == JVal::kStr ? item->str : item->raw)));
+          elems.emplace_back(
+              std::string(item->type == JVal::kStr ? item->str : item->raw));
         } else {
-          elems.push_back(Value(std::string(item->canonical())));
+          elems.emplace_back(std::string(item->canonical()));
         }
       }
     }
     return Value::Array(std::move(elems), "STRING");
   }
-  if (cur->type == JVal::kNull) return Value();
+  if (cur->type == JVal::kNull) {
+    return {};
+  }
   if (name == "json_value" || name == "json_extract_scalar") {
-    if (cur->type == JVal::kArr || cur->type == JVal::kObj) return Value();
+    if (cur->type == JVal::kArr || cur->type == JVal::kObj) {
+      return {};
+    }
     return Value(std::string(cur->type == JVal::kStr ? cur->str : cur->raw));
   }
   return Value(std::string(cur->canonical()));
@@ -609,6 +696,14 @@ bool SafeToReduceEvaluationCount(  // NOLINT(misc-no-recursion)
 }
 
 }  // namespace
+
+Value EvaluateJsonFunctionCall(std::string_view func_name,
+                               std::string_view json_str,
+                               std::string_view path_str) {
+  // Thin forwarder to the fold-side JSON evaluator so the constant-fold rule
+  // and row-wise AST execution share one implementation (no divergence).
+  return EvaluateJsonFunction(func_name, json_str, path_str);
+}
 
 ExpressionPattern ExpressionPattern::Any(std::string capture) {
   ExpressionPattern pattern;
@@ -1094,7 +1189,18 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         Unary(UnaryOperation::kMinus,
               Unary(UnaryOperation::kMinus, Any("child"))),
         [](const Expression&, const ExpressionBindings& bindings) {
-          return bindings.at("child");
+          // -INT64_MIN raises "integer overflow in unary minus" at runtime,
+          // so eliminating the negation around that constant would turn a
+          // throwing tree into a value. Foldable siblings below produce the
+          // constant before this rule fires (bottom-up), which is exactly
+          // how the constant reaches here.
+          const Expression& child = bindings.at("child");
+          if (IsInt64Constant(child) &&
+              child->AsConstantValue().GetValue().value.int_value ==
+                  std::numeric_limits<int64_t>::min()) {
+            return Expression{};
+          }
+          return child;
         }));
     built.Add(ExpressionRule(
         "reassociate_add_constants",
@@ -1196,7 +1302,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
             return Expression{};
           }
-          if (HasLikeWildcard(pattern.value.varchar_value)) {
+          if (HasLikeWildcard(pattern.value.varchar_value) ||
+              TimestampShapedConstant(pattern.value.varchar_value)) {
             return Expression{};
           }
           return BinaryExpressionExp(bindings.at("left"),
@@ -1220,7 +1327,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
             return Expression{};
           }
-          if (HasLikeWildcard(pattern.value.varchar_value)) {
+          if (HasLikeWildcard(pattern.value.varchar_value) ||
+              TimestampShapedConstant(pattern.value.varchar_value)) {
             return Expression{};
           }
           return BinaryExpressionExp(bindings.at("left"),
@@ -1372,6 +1480,12 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           if (IsConstant(fn.Args()[0]) &&
               fn.Args()[0]->AsConstantValue().GetValue().IsNull()) {
+            // Dropping the second argument must not remove a throwing
+            // evaluation (oracle-found: nullif(NULL, 2971756592411605 % 0)
+            // folded to NULL instead of raising "modulo by zero").
+            if (!IsConstant(fn.Args()[1])) {
+              return Expression{};
+            }
             return ConstantValueExp(Value());
           }
           if (IsConstant(fn.Args()[1]) &&
@@ -1424,7 +1538,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (fn.FuncName() != "greatest" && fn.FuncName() != "least") {
             return Expression{};
           }
-          if (fn.Args().size() < 1) {
+          if (fn.Args().empty()) {
             return Expression{};
           }
           // Check if any argument is the same function (flatten nesting).
@@ -1802,8 +1916,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
            const ExpressionBindings&) -> Expression {
           const auto& fn = expression->AsFunctionCallExpression();
           std::string name(fn.FuncName());
-          for (char& c : name)
+          for (char& c : name) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          }
           if (name == "coalesce") {
             if (fn.Args().empty()) {
               return ConstantValueExp(Value());
@@ -1811,7 +1926,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             std::vector<Expression> new_args;
             bool changed = false;
             for (const Expression& arg : fn.Args()) {
-              if (!arg) continue;
+              if (!arg) {
+                continue;
+              }
               // Flatten nested coalesce
               if (arg->Type() == TypeTag::kFunctionCallExp &&
                   arg->AsFunctionCallExpression().FuncName() == "coalesce") {
@@ -1875,6 +1992,12 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               return ConstantValueExp(Value());
             }
             if (IsConstant(a) && a->AsConstantValue().GetValue().IsNull()) {
+              // Dropping b must not remove a throwing evaluation
+              // (oracle-found: nullif(NULL, x % 0) folded to NULL instead
+              // of raising "modulo by zero").
+              if (!IsConstant(b)) {
+                return Expression{};
+              }
               return ConstantValueExp(Value());
             }
             if (IsConstant(b) && b->AsConstantValue().GetValue().IsNull()) {
@@ -1901,8 +2024,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
            const ExpressionBindings&) -> Expression {
           const auto& fn = expression->AsFunctionCallExpression();
           std::string name(fn.FuncName());
-          for (char& c : name)
+          for (char& c : name) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          }
           static const std::unordered_set<std::string> target_funcs = {
               "substring",        "substr",       "instr",
               "strpos",           "lpad",         "rpad",
@@ -2285,7 +2409,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         "interval_normalize", Any(),
         [](const Expression& expression,
            const ExpressionBindings&) -> Expression {
-          if (!expression) return Expression{};
+          if (!expression) {
+            return Expression{};
+          }
           if (expression->Type() == TypeTag::kBinaryExp) {
             const auto& binary = expression->AsBinaryExpression();
             const Expression& left = binary.Left();
@@ -2621,7 +2747,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 std::string remainder;
                 if (ExtractRegexPrefix(pat_val.value.varchar_value, prefix,
                                        remainder)) {
-                  if (remainder == "$") {
+                  if (remainder == "$" &&
+                      // `=` coerces timestamp-shaped varchars to epoch
+                      // comparison; REGEXP_LIKE compares bytes.  Refuse the
+                      // rewrite for timestamp-shaped matches.
+                      !TimestampShapedConstant(prefix)) {
                     return BinaryExpressionExp(
                         fn.Args()[0], BinaryOperation::kEquals,
                         ConstantValueExp(Value(std::string(prefix))));
@@ -2678,9 +2808,10 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (expression->Type() == TypeTag::kFunctionCallExp) {
             const auto& fn = expression->AsFunctionCallExpression();
             std::string name(fn.FuncName());
-            for (char& c : name)
+            for (char& c : name) {
               c = static_cast<char>(
                   std::tolower(static_cast<unsigned char>(c)));
+            }
             if (GetFunctionVolatility(name) == Volatility::kImmutable &&
                 fn.Args().size() >= 2) {
               if (name == "coalesce" || name == "greatest" || name == "least" ||
@@ -2917,9 +3048,39 @@ Expression WithExpressionChildren(const Expression& expression,
       if (children.size() != 1) {
         throw std::invalid_argument("aggregate arity");
       }
+      // Rebuild losslessly: a child rewrite must not silently drop FILTER
+      // (WHERE), HAVING MAX/MIN, inner ORDER BY/LIMIT, the STRING_AGG
+      // delimiter, trailing args, ARRAY_AGG's element type, or inner
+      // GROUP BY keys.
       const auto& aggregate = expression->AsAggregateExpression();
-      return AggregateExpressionExp(aggregate.GetType(), std::move(children[0]),
-                                    aggregate.Distinct());
+      auto rebuilt = std::make_shared<AggregateExpression>(
+          aggregate.GetType(), std::move(children[0]), aggregate.Distinct());
+      if (aggregate.Having() != AggregateHavingModifier::kNone ||
+          aggregate.HavingCondition()) {
+        rebuilt->SetHaving(aggregate.Having(), aggregate.HavingCondition());
+      }
+      if (!aggregate.InnerOrderBy().empty()) {
+        rebuilt->SetInnerOrderBy(aggregate.InnerOrderBy());
+      }
+      if (aggregate.InnerLimit().has_value()) {
+        rebuilt->SetInnerLimit(aggregate.InnerLimit());
+      }
+      if (aggregate.SecondaryArg()) {
+        rebuilt->SetSecondaryArg(aggregate.SecondaryArg());
+      }
+      if (!aggregate.TrailingArgs().empty()) {
+        rebuilt->SetTrailingArgs(aggregate.TrailingArgs());
+      }
+      if (aggregate.WhereFilter()) {
+        rebuilt->SetWhereFilter(aggregate.WhereFilter());
+      }
+      if (!aggregate.ArrayElementSqlType().empty()) {
+        rebuilt->SetArrayElementSqlType(aggregate.ArrayElementSqlType());
+      }
+      if (aggregate.HasInnerGroupBy()) {
+        rebuilt->SetInnerGroupBy(aggregate.InnerGroupBy());
+      }
+      return rebuilt;
     }
     case TypeTag::kCaseExp: {
       const auto& source = expression->AsCaseExpression();
@@ -2979,6 +3140,8 @@ Expression WithExpressionChildren(const Expression& expression,
       return expression;
   }
 }
+
+namespace {
 
 bool IsMinusOne(const Expression& expression) {
   if (!IsConstant(expression)) {
@@ -3092,6 +3255,8 @@ bool ColumnPlusConstantChain(const Expression& tree, const Schema& schema,
   return IsInt64Column(*column, schema);
 }
 
+}  // namespace
+
 Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
     const Expression& expression, const Schema& input_schema) {
   if (!expression) {
@@ -3144,9 +3309,8 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
           leaf_constant >= 0 && IsInt64Column(inner.Left(), input_schema)) {
         int64_t combined = 0;
         if (!__builtin_mul_overflow(leaf_constant, inner_constant, &combined)) {
-          return BinaryExpressionExp(
-              inner.Left(), BinaryOperation::kMultiply,
-              ConstantValueExp(Value(static_cast<int64_t>(combined))));
+          return BinaryExpressionExp(inner.Left(), BinaryOperation::kMultiply,
+                                     ConstantValueExp(Value(combined)));
         }
       }
     }
@@ -3196,13 +3360,11 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
           return current;
         }
         if (accumulated >= 0) {
-          return BinaryExpressionExp(
-              column, BinaryOperation::kAdd,
-              ConstantValueExp(Value(static_cast<int64_t>(accumulated))));
+          return BinaryExpressionExp(column, BinaryOperation::kAdd,
+                                     ConstantValueExp(Value(accumulated)));
         }
-        return BinaryExpressionExp(
-            column, BinaryOperation::kSubtract,
-            ConstantValueExp(Value(static_cast<int64_t>(-accumulated))));
+        return BinaryExpressionExp(column, BinaryOperation::kSubtract,
+                                   ConstantValueExp(Value((-accumulated))));
       }
     }
   }

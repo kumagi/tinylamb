@@ -20,15 +20,20 @@
 
 #include "query_data.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <memory>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "type/value.hpp"
 
 namespace {
 std::string ToLowerCopy(std::string value) {
@@ -44,7 +49,6 @@ std::string ToLowerCopy(std::string value) {
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
-#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
@@ -228,7 +232,8 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     const std::unordered_map<std::string, std::string>& col_table_map,
     const std::unordered_set<std::string>& ambiguous_colum_name,
     const std::unordered_set<std::string>& relations,
-    const std::vector<ColumnName>& all_cols, bool expand_proto_value_table) {
+    const std::vector<ColumnName>& all_cols, bool expand_proto_value_table,
+    std::string* ambiguous_column) {
   if (!exp) {
     return Status::kSuccess;
   }
@@ -246,6 +251,9 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
       return Status::kSuccess;
     }
     if (ambiguous_colum_name.contains(ToLowerCopy(col_name.name))) {
+      if (ambiguous_column != nullptr && ambiguous_column->empty()) {
+        *ambiguous_column = col_name.name;
+      }
       return Status::kAmbiguousQuery;
     }
     const auto it = col_table_map.find(ToLowerCopy(col_name.name));
@@ -280,17 +288,17 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
   if (exp->Type() == TypeTag::kBinaryExp) {
     Expression left = exp->AsBinaryExpression().Left();
     Expression right = exp->AsBinaryExpression().Right();
-    RETURN_IF_FAIL(ResolveExpression(left, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols,
-                                     expand_proto_value_table));
-    RETURN_IF_FAIL(ResolveExpression(right, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols,
-                                     expand_proto_value_table));
+    RETURN_IF_FAIL(ResolveExpression(
+        left, col_table_map, ambiguous_colum_name, relations, all_cols,
+        expand_proto_value_table, ambiguous_column));
+    RETURN_IF_FAIL(ResolveExpression(
+        right, col_table_map, ambiguous_colum_name, relations, all_cols,
+        expand_proto_value_table, ambiguous_column));
   } else if (exp->Type() == TypeTag::kUnaryExp) {
     Expression child = exp->AsUnaryExpression().Child();
-    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols,
-                                     expand_proto_value_table));
+    RETURN_IF_FAIL(ResolveExpression(
+        child, col_table_map, ambiguous_colum_name, relations, all_cols,
+        expand_proto_value_table, ambiguous_column));
   } else if (exp->Type() == TypeTag::kAggregateExp) {
     Expression child = exp->AsAggregateExpression().Child();
     if (!child) {
@@ -300,41 +308,41 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
         child->AsColumnValue().GetColumnName().name == "*") {
       return Status::kSuccess;
     }
-    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols,
-                                     expand_proto_value_table));
+    RETURN_IF_FAIL(ResolveExpression(
+        child, col_table_map, ambiguous_colum_name, relations, all_cols,
+        expand_proto_value_table, ambiguous_column));
   } else if (exp->Type() == TypeTag::kCaseExp) {
     const auto& case_expression = exp->AsCaseExpression();
     for (const auto& clause : case_expression.when_clauses_) {
       Expression condition = clause.first;
       Expression value = clause.second;
-      RETURN_IF_FAIL(ResolveExpression(condition, col_table_map,
-                                       ambiguous_colum_name, relations,
-                                       all_cols, expand_proto_value_table));
-      RETURN_IF_FAIL(ResolveExpression(value, col_table_map,
-                                       ambiguous_colum_name, relations,
-                                       all_cols, expand_proto_value_table));
+      RETURN_IF_FAIL(ResolveExpression(
+          condition, col_table_map, ambiguous_colum_name, relations, all_cols,
+          expand_proto_value_table, ambiguous_column));
+      RETURN_IF_FAIL(ResolveExpression(
+          value, col_table_map, ambiguous_colum_name, relations, all_cols,
+          expand_proto_value_table, ambiguous_column));
     }
     Expression otherwise = case_expression.else_clause_;
-    RETURN_IF_FAIL(ResolveExpression(otherwise, col_table_map,
-                                     ambiguous_colum_name, relations, all_cols,
-                                     expand_proto_value_table));
+    RETURN_IF_FAIL(ResolveExpression(
+        otherwise, col_table_map, ambiguous_colum_name, relations, all_cols,
+        expand_proto_value_table, ambiguous_column));
   } else if (exp->Type() == TypeTag::kInExp) {
     const auto& in = exp->AsInExpression();
     Expression child = in.child_;
-    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols,
-                                     expand_proto_value_table));
+    RETURN_IF_FAIL(ResolveExpression(
+        child, col_table_map, ambiguous_colum_name, relations, all_cols,
+        expand_proto_value_table, ambiguous_column));
     for (Expression item : in.list_) {
-      RETURN_IF_FAIL(ResolveExpression(item, col_table_map,
-                                       ambiguous_colum_name, relations,
-                                       all_cols, expand_proto_value_table));
+      RETURN_IF_FAIL(ResolveExpression(
+          item, col_table_map, ambiguous_colum_name, relations, all_cols,
+          expand_proto_value_table, ambiguous_column));
     }
   } else if (exp->Type() == TypeTag::kFunctionCallExp) {
     for (Expression argument : exp->AsFunctionCallExpression().Args()) {
-      RETURN_IF_FAIL(ResolveExpression(argument, col_table_map,
-                                       ambiguous_colum_name, relations,
-                                       all_cols, expand_proto_value_table));
+      RETURN_IF_FAIL(ResolveExpression(
+          argument, col_table_map, ambiguous_colum_name, relations, all_cols,
+          expand_proto_value_table, ambiguous_column));
     }
   }
   return Status::kSuccess;
@@ -346,7 +354,7 @@ Status ResolveSelect(
     const std::unordered_set<std::string>& ambiguous_colum_name,
     const std::vector<ColumnName>& all_cols,
     const std::unordered_set<std::string>& relations,
-    bool expand_proto_value_table) {
+    bool expand_proto_value_table, std::string* ambiguous_column) {
   for (auto it = select.begin(); it != select.end();) {
     if (it->expression->Type() == TypeTag::kColumnValue) {
       auto& cv = it->expression->AsColumnValue();
@@ -362,11 +370,19 @@ Status ResolveSelect(
               matched.push_back(column);
             }
           }
+          // An unknown qualifier would otherwise silently erase the star and
+          // leave an empty select list; reject it like a missing column.
+          if (matched.empty()) {
+            if (ambiguous_column != nullptr) {
+              *ambiguous_column = col_name.schema;
+            }
+            return Status::kNotExists;
+          }
           it = select.erase(it);
           if (expand_proto_value_table && matched.size() == 1 &&
               (matched.front().name == "$expr0" ||
                matched.front().name == "int32_val1")) {
-            const ColumnName base = matched.front();
+            const ColumnName& base = matched.front();
             for (const char* field :
                  {"int32_val1", "int32_val2", "str_value"}) {
               it = select.insert(
@@ -379,10 +395,9 @@ Status ResolveSelect(
               ++it;
             }
           } else {
-            for (auto column = matched.rbegin(); column != matched.rend();
-                 ++column) {
+            for (auto& column : std::ranges::reverse_view(matched)) {
               it = select.insert(
-                  it, NamedExpression(column->name, ColumnValueExp(*column)));
+                  it, NamedExpression(column.name, ColumnValueExp(column)));
             }
           }
           continue;
@@ -391,7 +406,7 @@ Status ResolveSelect(
         if (expand_proto_value_table && all_cols.size() == 1 &&
             (all_cols.front().name == "$expr0" ||
              all_cols.front().name == "int32_val1")) {
-          const ColumnName base = all_cols.front();
+          const ColumnName& base = all_cols.front();
           for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
             it = select.insert(
                 it,
@@ -416,13 +431,16 @@ Status ResolveSelect(
       }
       if (!col_name.schema.empty()) {
         Expression expression = it->expression;
-        RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                         ambiguous_colum_name, relations,
-                                         all_cols, expand_proto_value_table));
+        RETURN_IF_FAIL(ResolveExpression(
+            expression, col_table_map, ambiguous_colum_name, relations,
+            all_cols, expand_proto_value_table, ambiguous_column));
         ++it;
         continue;
       }
       if (ambiguous_colum_name.contains(ToLowerCopy(col_name.name))) {
+        if (ambiguous_column != nullptr && ambiguous_column->empty()) {
+          *ambiguous_column = col_name.name;
+        }
         return Status::kAmbiguousQuery;
       }
       const auto col_it = col_table_map.find(ToLowerCopy(col_name.name));
@@ -474,9 +492,9 @@ Status ResolveSelect(
       ++it;
     } else {
       Expression expression = it->expression;
-      RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                       ambiguous_colum_name, relations,
-                                       all_cols, expand_proto_value_table));
+      RETURN_IF_FAIL(ResolveExpression(
+          expression, col_table_map, ambiguous_colum_name, relations, all_cols,
+          expand_proto_value_table, ambiguous_column));
       ++it;
     }
   }
@@ -484,7 +502,7 @@ Status ResolveSelect(
       select.front().expression->Type() == TypeTag::kColumnValue &&
       select.front().expression->AsColumnValue().GetColumnName().name ==
           all_cols.front().name) {
-    const ColumnName base = all_cols.front();
+    const ColumnName& base = all_cols.front();
     select.clear();
     for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
       select.emplace_back(
@@ -562,18 +580,14 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   // Proto value tables (compliance harness) expose a single message column
   // whose fields are addressed by name; only those relations may absorb an
   // unknown bare column through __get_field_safe.
-  const bool expand_proto_value_table = [&] {
-    for (const std::string& relation : from_) {
-      const auto found = aliases_.find(relation);
-      const std::string& physical =
-          found == aliases_.end() ? relation : found->second;
-      if (physical.find("TestExtraPBValueTable") != std::string::npos ||
-          physical.find("WithProtoValueTable") != std::string::npos) {
-        return true;
-      }
-    }
-    return false;
-  }();
+  const bool expand_proto_value_table =
+      std::ranges::any_of(from_, [&](const std::string& relation) {
+        const auto found = aliases_.find(relation);
+        const std::string& physical =
+            found == aliases_.end() ? relation : found->second;
+        return physical.find("TestExtraPBValueTable") != std::string::npos ||
+               physical.find("WithProtoValueTable") != std::string::npos;
+      });
 
   // ORDER BY is evaluated after projection, so a bare identifier may refer
   // to a SELECT-list alias (for example `SELECT id + 10 AS shifted ...
@@ -601,16 +615,37 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
         }
       }
     }
-    RETURN_IF_FAIL(ResolveExpression(order, col_table_map, ambiguous_colum_name,
-                                     relations, all_cols,
-                                     expand_proto_value_table));
+    const Status order_status = ResolveExpression(
+        order, col_table_map, ambiguous_colum_name, relations, all_cols,
+        expand_proto_value_table, &ambiguous_column_);
+    if (order_status != Status::kSuccess) {
+      return RecordAmbiguousColumn(order_status, ambiguous_colum_name);
+    }
   }
-  RETURN_IF_FAIL(ResolveSelect(select_, col_table_map, ambiguous_colum_name,
-                               all_cols, relations, expand_proto_value_table));
+  const Status select_status =
+      ResolveSelect(select_, col_table_map, ambiguous_colum_name, all_cols,
+                    relations, expand_proto_value_table, &ambiguous_column_);
+  if (select_status != Status::kSuccess) {
+    return RecordAmbiguousColumn(select_status, ambiguous_colum_name);
+  }
 
   // Rewrite WHERE clause.
-  return ResolveExpression(where_, col_table_map, ambiguous_colum_name,
-                           relations, all_cols, expand_proto_value_table);
+  const Status where_status =
+      ResolveExpression(where_, col_table_map, ambiguous_colum_name, relations,
+                        all_cols, expand_proto_value_table, &ambiguous_column_);
+  if (where_status != Status::kSuccess) {
+    return RecordAmbiguousColumn(where_status, ambiguous_colum_name);
+  }
+  return where_status;
+}
+
+Status QueryData::RecordAmbiguousColumn(
+    Status status, const std::unordered_set<std::string>& ambiguous_names) {
+  if (status == Status::kAmbiguousQuery && ambiguous_column_.empty() &&
+      ambiguous_names.size() == 1) {
+    ambiguous_column_ = *ambiguous_names.begin();
+  }
+  return status;
 }
 
 }  // namespace tinylamb

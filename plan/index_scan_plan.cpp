@@ -7,24 +7,26 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <memory>
+#include <cstdint>
 #include <optional>
 #include <ostream>
-#include <ranges>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
+#include "plan/index_skip_scan_plan.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -48,10 +50,7 @@ bool AffineColumn(const Expression& expression, const ColumnName& target,
   }
   if (expression->Type() == TypeTag::kColumnValue) {
     const ColumnName& column = expression->AsColumnValue().GetColumnName();
-    if (column.name != target.name || column.schema != target.schema) {
-      return false;
-    }
-    return true;
+    return !(column.name != target.name || column.schema != target.schema);
   }
   if (expression->Type() != TypeTag::kBinaryExp) {
     return false;
@@ -245,5 +244,12 @@ std::string IndexScanPlan::ToString() const {
   s += " (estimated cost: " + std::to_string(AccessRowCount()) + ")";
   return s;
 }
+
+void IndexSkipScanPlan::Dump(std::ostream& o, int indent) const {
+  o << Indent(static_cast<size_t>(indent)) << "IndexSkipScan\n";
+  inner_->Dump(o, indent + 2);
+}
+
+std::string IndexSkipScanPlan::ToString() const { return "IndexSkipScan"; }
 
 }  // namespace tinylamb

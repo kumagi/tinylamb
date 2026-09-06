@@ -4,9 +4,12 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 #include <vector>
+
+#include "type/value.hpp"
 
 namespace tinylamb {
 namespace {
@@ -22,8 +25,8 @@ uint64_t Mix64(uint64_t k) {
 
 uint64_t Fnv1a64(std::string_view data) {
   uint64_t hash = 14695981039346656037ULL;
-  for (unsigned char c : data) {
-    hash ^= static_cast<uint64_t>(c);
+  for (char c : data) {
+    hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
     hash *= 1099511628211ULL;
   }
   return Mix64(hash);
@@ -74,7 +77,7 @@ double HyperLogLog::Estimate() const {
     }
   }
 
-  const double m = static_cast<double>(num_registers_);
+  const auto m = static_cast<double>(num_registers_);
   double raw_estimate = AlphaM() * m * m / sum;
 
   // Small range correction (LinearCounting)

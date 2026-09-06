@@ -92,11 +92,13 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   // reaching here, so an exact-key hit can only be a replay: overwrite the
   // child id in place instead.
   const int dup = Search(key, false);
-  if (dup >= 0 && std::cmp_less(dup, row_count_) && GetKey(dup) == key) {
-    SerializePID(Payload() + rows_[dup + kExtraIdx].offset, pid);
+  if (dup >= 0 && std::cmp_less(dup, row_count_) &&
+      GetKey(static_cast<size_t>(dup)) == key) {
+    SerializePID(Payload() + rows_[static_cast<size_t>(dup) + kExtraIdx].offset,
+                 pid);
     return;
   }
-  free_size_ -= physical_size + sizeof(RowPointer);
+  free_size_ -= static_cast<bin_size_t>(physical_size + sizeof(RowPointer));
   if ((Payload() + free_ptr_ - physical_size) <=
       reinterpret_cast<char*>(&rows_[row_count_ + kExtraIdx + 2])) {
     DeFragment();
@@ -104,13 +106,14 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   const int pos = SearchToInsert(key);
   ++row_count_;
   assert(physical_size <= free_ptr_);
-  free_ptr_ -= physical_size;
+  free_ptr_ -= static_cast<bin_size_t>(physical_size);
   SerializePID(Payload() + free_ptr_, pid);
   SerializeStringView(Payload() + free_ptr_ + sizeof(page_id_t), key);
   memmove(rows_ + kExtraIdx + pos + 1, rows_ + kExtraIdx + pos,
-          (row_count_ - pos) * sizeof(RowPointer));
-  rows_[kExtraIdx + pos].offset = free_ptr_;
-  rows_[kExtraIdx + pos].size = physical_size;
+          (row_count_ - static_cast<size_t>(pos)) * sizeof(RowPointer));
+  rows_[static_cast<size_t>(pos) + kExtraIdx].offset = free_ptr_;
+  rows_[static_cast<size_t>(pos) + kExtraIdx].size =
+      static_cast<bin_size_t>(physical_size);
 }
 
 Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
@@ -126,16 +129,18 @@ Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
   // Search returns -1 when no slot may hold |key|; keep the signed value so
   // the miss is an explicit check instead of a huge size_t.
   const int pos = Search(key, false);
-  if (pos < 0 || std::cmp_less_equal(row_count_, pos) || GetKey(pos) != key) {
+  if (pos < 0 || std::cmp_less_equal(row_count_, pos) ||
+      GetKey(static_cast<size_t>(pos)) != key) {
     return Status::kNotExists;
   }
   // |pos| is a logical index; the slot array is prefixed by the fence/foster
   // slots, so the size must be read from rows_[pos + kExtraIdx].
-  if (rows_[pos + kExtraIdx].size < physical_size &&
-      physical_size - rows_[pos + kExtraIdx].size > free_size_) {
+  if (rows_[static_cast<size_t>(pos) + kExtraIdx].size < physical_size &&
+      physical_size - rows_[static_cast<size_t>(pos) + kExtraIdx].size >
+          free_size_) {
     return Status::kNoSpace;
   }
-  txn.UpdateBranchLog(pid, key, value, GetValue(pos));
+  txn.UpdateBranchLog(pid, key, value, GetValue(static_cast<size_t>(pos)));
   UpdateImpl(key, value);
   return Status::kSuccess;
 }
@@ -147,10 +152,12 @@ void BranchPage::UpdateImpl(std::string_view key, page_id_t pid) {
   // Search's floor landing must never be allowed to overwrite a DIFFERENT
   // child id or alias the foster slot at kExtraIdx-1.
   const int pos = Search(key, false);
-  if (pos < 0 || std::cmp_less_equal(row_count_, pos) || GetKey(pos) != key) {
+  if (pos < 0 || std::cmp_less_equal(row_count_, pos) ||
+      GetKey(static_cast<size_t>(pos)) != key) {
     return;
   }
-  SerializePID(Payload() + rows_[pos + kExtraIdx].offset, pid);
+  SerializePID(Payload() + rows_[static_cast<size_t>(pos) + kExtraIdx].offset,
+               pid);
 }
 
 void BranchPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
@@ -168,10 +175,10 @@ void BranchPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
       reinterpret_cast<char*>(&rows_[row_count_ + kExtraIdx + 1])) {
     DeFragment();
   }
-  free_ptr_ -= payload.size();
+  free_ptr_ -= static_cast<bin_size_t>(payload.size());
   free_size_ += pos.size;
-  free_size_ -= payload.size();
-  pos.size = payload.size();
+  free_size_ -= static_cast<bin_size_t>(payload.size());
+  pos.size = static_cast<bin_size_t>(payload.size());
   pos.offset = free_ptr_;
   memcpy(Payload() + pos.offset, payload.data(), payload.size());
 }
@@ -185,7 +192,8 @@ Status BranchPage::Delete(page_id_t pid, Transaction& txn,
     txn.DeleteBranchLog(pid, GetKey(0), next_lowest);
     txn.SetLowestLog(pid, next_lowest, prev_lowest);
   } else {
-    txn.DeleteBranchLog(pid, GetKey(pos), GetValue(pos));
+    txn.DeleteBranchLog(pid, GetKey(static_cast<size_t>(pos)),
+                        GetValue(static_cast<size_t>(pos)));
   }
   DeleteImpl(key);
   return Status::kSuccess;
@@ -203,9 +211,10 @@ void BranchPage::DeleteImpl(std::string_view key) {
   // slot.  Missing the pointer here permanently inflated free_size_, and the
   // optimistic admission check then underflowed free_ptr_ into the slot array.
   free_size_ +=
-      SerializeSize(GetKey(pos)) + sizeof(page_id_t) + sizeof(RowPointer);
+      static_cast<bin_size_t>(SerializeSize(GetKey(static_cast<size_t>(pos))) +
+                              sizeof(page_id_t) + sizeof(RowPointer));
   memmove(rows_ + pos + kExtraIdx, rows_ + pos + kExtraIdx + 1,
-          sizeof(RowPointer) * (row_count_ - pos - 1));
+          sizeof(RowPointer) * (row_count_ - static_cast<size_t>(pos) - 1));
   --row_count_;
 }
 
@@ -216,7 +225,7 @@ StatusOr<page_id_t> BranchPage::GetPageForKey(Transaction& /*txn*/,
   if (key < GetKey(0) || (less_than && key == GetKey(0))) {
     return lowest_page_;
   }
-  return GetValue(Search(key, less_than));
+  return GetValue(static_cast<size_t>(Search(key, less_than)));
 }
 
 void BranchPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
@@ -389,8 +398,8 @@ Status BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
   for (size_t i = pivot; i < original_row_count; ++i) {
     RETURN_IF_FAIL(this_page->Delete(txn, GetKey(pivot)));
   }
-  if (right->RowCount() == 0 ||
-      right->GetKey(0) <= key) {  // NOLINT(bugprone-branch-clone)
+  if (right->RowCount() == 0 ||  // NOLINT(bugprone-branch-clone)
+      right->GetKey(0) <= key) {
     assert(expected_size <= right->body.branch_page.free_size_);
   } else {
     assert(expected_size <= free_size_);
@@ -403,14 +412,14 @@ bin_size_t BranchPage::SearchToInsert(std::string_view key) const {
   int right = row_count_ + static_cast<int>(kExtraIdx);
   while (1 < right - left) {
     const int cur = (left + right) / 2;
-    std::string_view cur_key = GetRow(cur);
+    std::string_view cur_key = GetRow(static_cast<size_t>(cur));
     if (key < cur_key) {
       right = cur;
     } else {
       left = cur;
     }
   }
-  return right - static_cast<int>(kExtraIdx);
+  return static_cast<bin_size_t>(right - static_cast<int>(kExtraIdx));
 }
 
 int BranchPage::Search(std::string_view key, bool less_than) const {
@@ -418,7 +427,7 @@ int BranchPage::Search(std::string_view key, bool less_than) const {
   int right = row_count_ + static_cast<int>(kExtraIdx);
   while (1 < right - left) {
     const int cur = (left + right) / 2;
-    std::string_view cur_key = GetRow(cur);
+    std::string_view cur_key = GetRow(static_cast<size_t>(cur));
     if (key < cur_key) {
       right = cur;
     } else {
@@ -470,11 +479,12 @@ void BranchPage::Dump(std::ostream& o, int indent) const {
   if (row_count_ == 0) {
     return;
   }
-  o << "\n" << Indent(indent + 2) << lowest_page_;
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2) << lowest_page_;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
-      << Indent(indent) << OmittedString(GetKey(i), 20) << "\n"
-      << Indent(indent + 2) << GetValue(i);
+      << Indent(static_cast<size_t>(indent)) << OmittedString(GetKey(i), 20)
+      << "\n"
+      << Indent(static_cast<size_t>(indent) + 2) << GetValue(i);
   }
   if (0 < rows_[kFosterIdx].size) {
     std::string_view serialized_key;
@@ -483,8 +493,9 @@ void BranchPage::Dump(std::ostream& o, int indent) const {
                                           &serialized_key);
     DeserializePID(Payload() + rows_[kFosterIdx].offset + offset, &child);
     o << "\n"
-      << Indent(indent) << "  FosterKey: " << OmittedString(serialized_key, 20)
-      << " -> " << child;
+      << Indent(static_cast<size_t>(indent))
+      << "  FosterKey: " << OmittedString(serialized_key, 20) << " -> "
+      << child;
   }
 }
 
@@ -583,7 +594,7 @@ void BranchPage::DeFragment() {
   }
   bin_size_t offset = kPageBodySize;
   for (size_t i = 0; i < row_count_ + kExtraIdx; ++i) {
-    offset -= payloads[i].size();
+    offset -= static_cast<bin_size_t>(payloads[i].size());
     if (0 < rows_[i].size) {
       rows_[i].offset = offset;
     }

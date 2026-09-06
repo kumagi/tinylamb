@@ -1,15 +1,18 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "query/sql_oracle_fuzzer.hpp"
+
+#include <dirent.h>
+
 #include <cstdint>
 #include <cstdlib>
-#include <dirent.h>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "query/sql_oracle_fuzzer.hpp"
 
 namespace tinylamb {
 
@@ -24,7 +27,10 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
   while (const dirent* entry = readdir(handle)) {
     const std::string name = entry->d_name;
     if (name.size() > 5 && name.substr(name.size() - 5) == ".test") {
-      files.push_back(dir + "/" + name);
+      std::string path = dir;
+      path += "/";
+      path += name;
+      files.push_back(std::move(path));
     }
   }
   closedir(handle);
@@ -41,6 +47,10 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int tlp_ran = 0;
   int norec_ran = 0;
+  int pqs_ran = 0;
+  int idx_ran = 0;
+  int dqe_ran = 0;
+  int troc_ran = 0;
   constexpr int kIterations = 64;
   for (uint32_t seed = 0; seed < kIterations; ++seed) {
     std::mt19937 rng(seed);
@@ -49,11 +59,47 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
     ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
     tlp_ran += stats.tlp_ran ? 1 : 0;
     norec_ran += stats.norec_ran ? 1 : 0;
+    pqs_ran += stats.pqs_ran ? 1 : 0;
+    idx_ran += stats.idx_ran ? 1 : 0;
+    dqe_ran += stats.dqe_ran ? 1 : 0;
+    troc_ran += stats.troc_ran ? 1 : 0;
   }
   EXPECT_GT(tlp_ran, kIterations / 2)
       << "TLP oracle almost never ran; harness is broken";
   EXPECT_GT(norec_ran, kIterations / 2)
       << "NoREC oracle almost never ran; harness is broken";
+  EXPECT_GT(pqs_ran, kIterations / 2)
+      << "PQS oracle almost never ran; harness is broken";
+  EXPECT_GT(idx_ran, kIterations / 2)
+      << "index oracle almost never ran; harness is broken";
+  EXPECT_GT(dqe_ran, kIterations / 2)
+      << "DQE oracle almost never ran; harness is broken";
+  EXPECT_GT(troc_ran, kIterations / 2)
+      << "transaction oracle almost never ran; harness is broken";
+}
+
+// Plan feedback: across a run the bandit must observe several distinct plan
+// shapes from EXPLAIN.
+TEST(SqlOracleFuzzer, PlanFeedbackObservesPlans) {
+  OracleSession session;
+  for (uint32_t seed = 0; seed < 48; ++seed) {
+    std::mt19937 rng(seed + 1000);
+    std::string report =
+        RunOracleIteration(rng, false, nullptr, nullptr, &session);
+    ASSERT_EQ(report, "") << "failing seed=" << seed + 1000 << "\n" << report;
+  }
+  EXPECT_GT(session.PlansSeen(), 1U)
+      << "plan feedback saw at most one plan shape; EXPLAIN path is broken";
+}
+
+// AMOEBA: equivalent predicates over a 2000-row table must not diverge
+// beyond the conservative thresholds.
+TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
+  for (uint32_t seed = 0; seed < 8; ++seed) {
+    std::mt19937 rng(seed);
+    std::string report = RunAmoebaIteration(rng, false);
+    ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
+  }
 }
 
 // End-to-end check of the failure->file->replay pipeline: a hand-crafted

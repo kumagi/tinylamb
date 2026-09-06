@@ -76,7 +76,7 @@ class RelationalEvaluationContext : public EvaluationContext {
       projected.push_back(relational_detail::ProjectSubqueryRow(
           row, as_struct, &subquery_schema));
     });
-    return StatusOr<std::vector<Value>>(std::move(projected));
+    return {std::move(projected)};
   }
 
   [[nodiscard]] const AggregateResultMap* CurrentAggregates() const override {

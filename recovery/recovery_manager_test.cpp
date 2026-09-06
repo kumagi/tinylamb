@@ -17,7 +17,8 @@
 #include "recovery/recovery_manager.hpp"
 
 #include <gtest/gtest.h>
-#include <stdlib.h>  // NOLINT(modernize-deprecated-headers) // POSIX setenv/unsetenv below are only provided by this header.
+// NOLINTNEXTLINE(modernize-deprecated-headers) POSIX setenv/unsetenv
+#include <stdlib.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -27,7 +28,9 @@
 #include <fstream>
 #include <functional>
 #include <ios>
+#include <iosfwd>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -87,7 +90,9 @@ class RecoveryManagerTest : public RowPageTest {
     RecoverBase([&]() {
       std::fstream db(file_name_ + ".db",
                       std::ios_base::out | std::ios_base::binary);
-      db.seekp(failed_page * kPageSize, std::ios_base::beg);
+      db.seekp(static_cast<std::streamoff>(failed_page) *
+                   static_cast<std::streamoff>(kPageSize),
+               std::ios_base::beg);
       ASSERT_FALSE(db.fail());
       for (size_t i = 0; i < kPageSize; ++i) {
         db.write("\xff", 1);
@@ -1238,7 +1243,9 @@ TEST_F(RecoveryManagerTest, ForceRecoversFromCorruptTail) {
   const auto valid_end = std::filesystem::file_size(file_name_ + ".log");
   {
     std::ofstream tail(file_name_ + ".log", std::ios::app | std::ios::binary);
-    tail << "\x00\x00garbage";
+    // operator<<(const char*) would stop at the first NUL and write nothing;
+    // write() puts the full 7 garbage bytes (2 NULs + "garbage") on the tail.
+    tail.write("\x00\x00garbage", 7);
     ASSERT_FALSE(tail.fail());
   }
   RecoveryManager::SetTornTailTruncationAllowed(true);
@@ -1325,7 +1332,7 @@ TEST_F(RecoveryManagerTest, CheckpointDirtyPageTablePreservesMaxPageId) {
     // A newly allocated page must not collide with any live page.
     Transaction alloc = tm_->Begin();
     const PageRef allocated = p_->AllocateNewPage(alloc, PageType::kRowPage);
-    EXPECT_GT(allocated->PageID(), 4)
+    EXPECT_GT(allocated->PageID(), 4U)
         << "allocator re-issued a pre-checkpoint page id";
     ASSERT_SUCCESS(alloc.PreCommit());
 
@@ -1357,8 +1364,8 @@ TEST_F(RecoveryManagerTest, MidRecordBitFlipStopsScanAtThatRecord) {
     std::fstream file(file_name_ + ".log",
                       std::ios::in | std::ios::out | std::ios::binary);
     // Flip the final payload byte (just before the CRC field).
-    const std::streampos target =
-        static_cast<std::streampos>(second_start + 20);
+    const std::streampos target = static_cast<std::streampos>(
+        static_cast<std::streamoff>(second_start) + 20);
     file.seekp(target);
     const int original = file.get();
     file.seekp(target);

@@ -23,7 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -32,10 +32,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "page/page_manager.hpp"
 #include "page/row_page.hpp"
@@ -69,7 +71,7 @@ void TransactionManager::StartGcWorker() {
 void TransactionManager::AddWaitForEdge(txn_id_t waiter, txn_id_t holder,
                                         RowPosition row) {
   std::scoped_lock lk(wait_for_mu_);
-  wait_for_edges_[waiter] = WaitForEdge{row, holder};
+  wait_for_edges_[waiter] = WaitForEdge{.row = row, .holder = holder};
 }
 
 void TransactionManager::RemoveWaitForEdge(txn_id_t waiter) {
@@ -99,8 +101,13 @@ void TransactionManager::DeadlockDetectorLoop() {
   while (!deadlock_detector_stop_.load(std::memory_order_acquire)) {
     std::unique_lock<std::mutex> lk(deadlock_detector_mu_);
     deadlock_detector_cv_.wait_for(lk, kPollInterval, [this] {
-      return deadlock_detector_stop_.load(std::memory_order_acquire) ||
-             !wait_for_edges_.empty();
+      if (deadlock_detector_stop_.load(std::memory_order_acquire)) {
+        return true;
+      }
+      // The edge map is guarded by wait_for_mu_, not by the cv mutex; take
+      // it here so the poll never races AddWaitForEdge/RemoveWaitForEdge.
+      std::scoped_lock g(wait_for_mu_);
+      return !wait_for_edges_.empty();
     });
     lk.unlock();
     if (deadlock_detector_stop_.load(std::memory_order_acquire)) {
@@ -115,7 +122,9 @@ void TransactionManager::DeadlockDetectorLoop() {
         edges.emplace_back(w, e.holder);
       }
     }
-    if (edges.empty()) continue;
+    if (edges.empty()) {
+      continue;
+    }
     // For every waiter, walk the chain forward (waiter -> its holder -> that
     // holder's waiters' holders -> ...). When a holder equals the original
     // waiter, we have a cycle. Wound the maximum-id (youngest) participant.
@@ -126,7 +135,7 @@ void TransactionManager::DeadlockDetectorLoop() {
       bool found_cycle = false;
       std::vector<txn_id_t> path;
       for (int safety = 0; safety < 64; ++safety) {
-        if (visited.insert(cur).second == false) {
+        if (!visited.insert(cur).second) {
           // Found a cycle. Truncate path back to the first visit.
           auto dup = std::find(path.begin(), path.end(), cur);
           if (dup != path.end()) {
@@ -142,10 +151,14 @@ void TransactionManager::DeadlockDetectorLoop() {
                                [cur](const std::pair<txn_id_t, txn_id_t>& e) {
                                  return e.first == cur;
                                });
-        if (it == edges.end()) break;  // cur is not waiting; no follow-on.
+        if (it == edges.end()) {
+          break;  // cur is not waiting; no follow-on.
+        }
         cur = it->second;
       }
-      if (!found_cycle) continue;
+      if (!found_cycle) {
+        continue;
+      }
       txn_id_t victim = *std::max_element(path.begin(), path.end());
       if (already_wounded.insert(victim).second) {
         std::scoped_lock registry_lock(transaction_table_lock);
@@ -285,7 +298,18 @@ Status TransactionManager::PreCommit(Transaction& txn) {
     // there is no own commit record to flush.
     const lsn_t dependence = txn.DurabilityDependence();
     if (dependence != 0) {
-      logger_->WaitForDurable(dependence);
+      try {
+        logger_->WaitForDurable(dependence);
+      } catch (...) {
+        // Nothing was published, but the registry slot and snapshot entry
+        // must not outlive this stack-allocated transaction: a later
+        // checkpoint, wounding, or deadlock scan would dereference freed
+        // memory, and the orphaned snapshot would pin MVCC GC forever.
+        RemoveWaitForEdgesOf(txn.ID());
+        ForgetTransaction(txn);
+        txn.SetStatus(TransactionStatus::kAborted);
+        throw;
+      }
     }
   }
   ForgetTransaction(txn);
@@ -398,7 +422,9 @@ bool TransactionManager::AcquireWriteIntent(
   };
   auto holder_id = [&]() -> txn_id_t {
     const auto found = shard.versions.find(rp);
-    if (found == shard.versions.end() || !found->second.pending) return 0;
+    if (found == shard.versions.end() || !found->second.pending) {
+      return 0;
+    }
     return found->second.pending->owner;
   };
   // Try-lock path: caller (TryAddWriteSet) does not want to wait, regardless
@@ -463,11 +489,16 @@ bool TransactionManager::AcquireWriteIntent(
         return false;
       }
       auto available = [&] {
-        if (txn.IsWounded()) return true;
-        const auto found = shard.versions.find(rp);
-        if (found == shard.versions.end() || !found->second.pending)
+        if (txn.IsWounded()) {
           return true;
-        if (found->second.pending->owner == txn.ID()) return true;
+        }
+        const auto found = shard.versions.find(rp);
+        if (found == shard.versions.end() || !found->second.pending) {
+          return true;
+        }
+        if (found->second.pending->owner == txn.ID()) {
+          return true;
+        }
         return false;  // Only let the wait continue while the holder is older
                        // (already checked) or gone. Re-check on each wake.
       };
@@ -503,11 +534,16 @@ bool TransactionManager::AcquireWriteIntent(
         }
       }
       auto available = [&] {
-        if (txn.IsWounded()) return true;
-        const auto found = shard.versions.find(rp);
-        if (found == shard.versions.end() || !found->second.pending)
+        if (txn.IsWounded()) {
           return true;
-        if (found->second.pending->owner == txn.ID()) return true;
+        }
+        const auto found = shard.versions.find(rp);
+        if (found == shard.versions.end() || !found->second.pending) {
+          return true;
+        }
+        if (found->second.pending->owner == txn.ID()) {
+          return true;
+        }
         return false;
       };
       shard.write_intent_released.wait(lock, available);
@@ -528,11 +564,16 @@ bool TransactionManager::AcquireWriteIntent(
         deadlock_detector_cv_.notify_all();
       }
       auto available = [&] {
-        if (txn.IsWounded()) return true;
-        const auto found = shard.versions.find(rp);
-        if (found == shard.versions.end() || !found->second.pending)
+        if (txn.IsWounded()) {
           return true;
-        if (found->second.pending->owner == txn.ID()) return true;
+        }
+        const auto found = shard.versions.find(rp);
+        if (found == shard.versions.end() || !found->second.pending) {
+          return true;
+        }
+        if (found->second.pending->owner == txn.ID()) {
+          return true;
+        }
         return false;
       };
       shard.write_intent_released.wait(lock, available);
@@ -696,9 +737,16 @@ bool TransactionManager::RequiresHistoricalRead(const Transaction& txn) const {
   return IndexKeysMayBeStale(txn);
 }
 
-void TransactionManager::RegisterPendingCommit(uint64_t ts) {
+uint64_t TransactionManager::AllocatePendingCommit() {
+  // Allocation and registration share pending_commits_mutex_: a timestamp
+  // must be in unpublished_commits_ before any other thread can observe it
+  // through commit_timestamp_, otherwise PublishCommit's empty-set branch
+  // could advance stable_timestamp_ past an in-flight commit and a new
+  // snapshot would later see that commit despite starting before it.
   std::scoped_lock lk(pending_commits_mutex_);
+  const uint64_t ts = commit_timestamp_.fetch_add(1) + 1;
   unpublished_commits_.insert(ts);
+  return ts;
 }
 
 void TransactionManager::PublishCommit(uint64_t ts) {
@@ -721,16 +769,16 @@ void TransactionManager::PublishCommit(uint64_t ts) {
 }
 
 void TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
-  // Publish row versions under shard locks alone; only the timestamp itself
-  // comes from an atomic fetch_add.  A concurrent Begin() takes its snapshot
-  // from stable_timestamp_, which lags commit_timestamp_ until this
-  // publication completes, so no global lock serializes commits anymore.
+  // Publish row versions under shard locks alone; the timestamp itself is
+  // allocated and registered unpublished under pending_commits_mutex_.  A
+  // concurrent Begin() takes its snapshot from stable_timestamp_, which only
+  // advances to fully published timestamps, so no global lock serializes
+  // commits anymore.
   std::array<bool, kVersionShardCount> needed{};
   for (const RowPosition& rp : txn.write_set_) {
     needed[VersionShardIndex(rp)] = true;
   }
-  const uint64_t commit_ts = commit_timestamp_.fetch_add(1) + 1;
-  RegisterPendingCommit(commit_ts);
+  const uint64_t commit_ts = AllocatePendingCommit();
   std::vector<std::unique_lock<std::mutex>> shard_locks;
   shard_locks.reserve(kVersionShardCount);
   for (size_t i = 0; i < kVersionShardCount; ++i) {
@@ -820,6 +868,9 @@ void TransactionManager::AbortVersions(Transaction& txn) {
 void TransactionManager::MoveActiveTransaction(Transaction* from,
                                                Transaction* to) {
   std::scoped_lock lk(transaction_table_lock);
+  if (active_transactions_.empty()) {
+    return;
+  }
   auto it = active_transactions_.find(from->txn_id_);
   if (it != active_transactions_.end() && it->second == from) {
     it->second = to;
@@ -828,16 +879,39 @@ void TransactionManager::MoveActiveTransaction(Transaction* from,
 
 void TransactionManager::UnregisterActiveTransaction(Transaction* txn) {
   std::scoped_lock lk(transaction_table_lock);
+  if (active_transactions_.empty()) {
+    return;
+  }
   auto it = active_transactions_.find(txn->txn_id_);
   if (it != active_transactions_.end() && it->second == txn) {
     active_transactions_.erase(it);
   }
 }
 
+void TransactionManager::ReleaseActiveTransaction(Transaction* txn) {
+  std::scoped_lock lk(transaction_table_lock);
+  // A manager that never began a transaction owns a never-bucketed map;
+  // hashing into it would divide by zero.  An empty map has nothing to
+  // release either way.
+  if (active_transactions_.empty()) {
+    return;
+  }
+  auto it = active_transactions_.find(txn->txn_id_);
+  if (it != active_transactions_.end() && it->second == txn) {
+    active_transactions_.erase(it);
+    active_snapshots_.erase(txn->txn_id_);
+    if (!txn->IsReadOnly()) {
+      commits_since_gc_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
 void TransactionManager::ForgetTransaction(Transaction& txn) {
   {
     std::scoped_lock lk(transaction_table_lock);
-    active_transactions_.erase(txn.txn_id_);
+    if (!active_transactions_.empty()) {
+      active_transactions_.erase(txn.txn_id_);
+    }
     active_snapshots_.erase(txn.txn_id_);
   }
   // GC no longer runs on the commit critical path: the background worker

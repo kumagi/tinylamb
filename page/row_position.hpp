@@ -35,8 +35,10 @@ struct RowPosition {
   // The page where the row exists.
   page_id_t page_id = ~0LLU;
 
-  // n-th row in the page.
-  slot_t slot = ~slot_t{0};
+  // n-th row in the page.  Written via static_cast: the naive `~slot_t{0}`
+  // promotes to int and every TU including this header warned about the
+  // narrowing conversion back to slot_t under -Wsign-conversion.
+  slot_t slot = static_cast<slot_t>(~0);
 
   [[nodiscard]] bool IsValid() const { return page_id != ~0LLU; }
 

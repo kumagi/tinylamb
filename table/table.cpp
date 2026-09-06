@@ -17,6 +17,7 @@
 #include "table/table.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -47,6 +48,7 @@
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -667,6 +669,9 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
 
 Iterator Table::BeginFullScan(Transaction& txn,
                               const TableScanOptions& options) const {
+  // FullScanIterator's ctors are private with Table as friend, so make_unique
+  // is unavailable; the unique_ptr is built from new inside this member and
+  // Iterator's explicit adopting ctor never throws.
   auto owned = std::unique_ptr<FullScanIterator>(
       new FullScanIterator(this, &txn, options.projection, options.key_filter,
                            options.key_column, options.peek_compares));
@@ -718,6 +723,8 @@ Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
                                const std::vector<Value>& begin_key,
                                const std::vector<Value>& end_key,
                                bool ascending) const {
+  // IndexScanIterator's vector-key ctor is public and Iterator's adopting
+  // ctor never throws.
   auto owned = std::make_unique<IndexScanIterator>(*this, index, txn, begin_key,
                                                    end_key, ascending);
   return Iterator(owned.release());

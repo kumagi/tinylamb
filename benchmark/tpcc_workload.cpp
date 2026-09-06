@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -95,7 +96,13 @@ constexpr std::array<std::string_view, 10> kLastNameSyllables = {
 
 int ComputeNURand(int a, int x, int y, int c, int rand_a, int rand_xy) {
   (void)a;
-  return (((rand_a | rand_xy) + c) % (y - x + 1)) + x;
+  // TPC-C callers guarantee x < y (fixed ranges or populated scale factors);
+  // the analyzer's "empty range" path already trips UB in Random(x, y) first.
+  const int range = y - x + 1;
+  const int numerator = (rand_a | rand_xy) + c;
+  // Callers guarantee x < y (see comment above), so the modulo is safe.
+  // NOLINTNEXTLINE(clang-analyzer-core.DivideZero)
+  return (numerator % range) + x;
 }
 
 std::string SqlLiteral(std::string_view text) {
@@ -682,7 +689,9 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   sql.str("");
   sql << "SELECT i_id, i_price FROM item WHERE i_id IN (";
   for (int line = 0; line < line_count; ++line) {
-    if (line != 0) { sql << ','; }
+    if (line != 0) {
+      sql << ',';
+    }
     sql << item_ids[static_cast<size_t>(line)];
   }
   sql << ");";
@@ -691,7 +700,9 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     if (rollback) {
       // Clause 2.4.3.4 requires the rolled-back O_ID to be displayed. Reserve
       // it transactionally, then abort it along with the invalid item.
-      if (!reserve_order_id()) { return fail(); }
+      if (!reserve_order_id()) {
+        return fail();
+      }
       result.user_rollback = true;
       result.error = "new-order unused item rollback";
     } else if (result.error.empty()) {
@@ -708,7 +719,7 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   // TPC-C is normally all-local at SF=1. At larger scales, one batch per
   // supplying warehouse preserves remote-stock semantics without N+1 SQL.
   std::unordered_map<int, std::vector<size_t>> lines_by_warehouse;
-  for (size_t line = 0; line < static_cast<size_t>(line_count); ++line) {
+  for (size_t line = 0; std::cmp_less(line, line_count); ++line) {
     lines_by_warehouse[supply_warehouses[line]].push_back(line);
   }
   for (const auto& [supply_warehouse, lines] : lines_by_warehouse) {
@@ -717,7 +728,9 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     sql << "SELECT s_i_id FROM stock WHERE s_w_id = " << supply_warehouse
         << " AND s_i_id IN (";
     for (size_t offset = 0; offset < lines.size(); ++offset) {
-      if (offset != 0) { sql << ','; }
+      if (offset != 0) {
+        sql << ',';
+      }
       sql << item_ids[lines[offset]];
     }
     sql << ");";
@@ -734,7 +747,9 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   // read-only validation. Strict write intent waiting makes the increment
   // observe the predecessor's committed value; the SELECT reads our staged
   // increment and derives the allocated O_ID.
-  if (!reserve_order_id()) { return fail(); }
+  if (!reserve_order_id()) {
+    return fail();
+  }
 
   for (const auto& [supply_warehouse, lines] : lines_by_warehouse) {
     rows.clear();
@@ -743,9 +758,10 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     for (size_t line : lines) {
       const int item_id = item_ids[line];
       const int quantity = quantities[line];
-      sql << " WHEN s_i_id = " << item_id << " THEN CASE WHEN s_quantity >= "
-          << quantity + 10 << " THEN s_quantity - " << quantity
-          << " ELSE s_quantity + 91 - " << quantity << " END";
+      sql << " WHEN s_i_id = " << item_id
+          << " THEN CASE WHEN s_quantity >= " << quantity + 10
+          << " THEN s_quantity - " << quantity << " ELSE s_quantity + 91 - "
+          << quantity << " END";
     }
     sql << " ELSE s_quantity END, s_ytd = s_ytd + CASE";
     for (size_t line : lines) {
@@ -757,7 +773,9 @@ TpccTransactionResult TpccWorkload::NewOrder() {
         << (supply_warehouse == result.warehouse_id ? 0 : 1)
         << " WHERE s_w_id = " << supply_warehouse << " AND s_i_id IN (";
     for (size_t offset = 0; offset < lines.size(); ++offset) {
-      if (offset != 0) { sql << ','; }
+      if (offset != 0) {
+        sql << ',';
+      }
       sql << item_ids[lines[offset]];
     }
     sql << ");";
@@ -791,12 +809,14 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   sql.str("");
   sql << "INSERT INTO order_line VALUES ";
   for (int line = 0; line < line_count; ++line) {
-    const size_t offset = static_cast<size_t>(line);
+    const auto offset = static_cast<size_t>(line);
     const int item_id = item_ids[offset];
     const int quantity = quantities[offset];
     const double line_amount = prices[item_id] * quantity;
     result.amount += line_amount;
-    if (line != 0) { sql << ','; }
+    if (line != 0) {
+      sql << ',';
+    }
     sql << '(' << result.warehouse_id << ',' << result.district_id << ','
         << result.order_id << ',' << (line + 1) << ',' << item_id << ','
         << supply_warehouses[offset] << ",NULL," << quantity << ','
@@ -1144,7 +1164,7 @@ TpccTransactionResult TpccWorkload::Delivery() {
     if (!context.IsFinished()) {
       try {
         context.Abort();
-      } catch (const std::exception&) {
+      } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
         // The undo path itself hit a broken WAL; the original error below
         // is the one worth propagating.
       }
@@ -1197,7 +1217,9 @@ TpccTransactionResult TpccWorkload::StockLevel() {
         << " AND s_quantity < " << threshold << " AND s_i_id IN (";
     bool first = true;
     for (int64_t item_id : items) {
-      if (!first) { sql << ','; }
+      if (!first) {
+        sql << ',';
+      }
       first = false;
       sql << item_id;
     }

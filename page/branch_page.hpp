@@ -52,7 +52,9 @@ class BranchPage final {
   [[nodiscard]] slot_t RowCount() const;
 
   void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
-  page_id_t GetLowestValue(Transaction&) { return lowest_page_; }
+  page_id_t GetLowestValue(Transaction& /*unused*/) const {
+    return lowest_page_;
+  }
 
   void SetLowestValueImpl(page_id_t value) { lowest_page_ = value; }
 
@@ -80,8 +82,8 @@ class BranchPage final {
   void SetFosterImpl(const FosterPair& foster);
   [[nodiscard]] StatusOr<FosterPair> GetFoster() const;
 
-  Status Split(page_id_t, Transaction& txn, std::string_view key, Page* right,
-               std::string* middle);
+  Status Split(page_id_t /*unused*/, Transaction& txn, std::string_view key,
+               Page* right, std::string* middle);
 
   // Return lowest page_id which may contain the specified |key|.
   [[nodiscard]] bin_size_t SearchToInsert(std::string_view key) const;

@@ -57,7 +57,9 @@ struct TypeStats {
 };
 
 std::string TruncateDiagnostic(std::string_view text, size_t maximum = 320) {
-  if (text.size() <= maximum) { return std::string(text); }
+  if (text.size() <= maximum) {
+    return std::string(text);
+  }
   return std::string(text.substr(0, maximum)) + "...<truncated>";
 }
 
@@ -78,7 +80,8 @@ void Usage(std::ostream& out, std::string_view program) {
       << "  --seed N            random seed\n"
       << "  --verify-only       run each transaction once and stop\n"
       << "  --reuse-existing    reuse an already initialized fixture\n"
-      << "  --no-sync-commit    diagnostic only: do not wait for WAL durability\n"
+      << "  --no-sync-commit    diagnostic only: do not wait for WAL "
+         "durability\n"
       << "  --profile-waits     collect WAL/MVCC/scheduler wait counters\n"
       << "  --transaction N     diagnostic: run only one transaction type\n"
       << "  --wal-sync-ms N     group-commit interval (default: 1)\n"
@@ -251,7 +254,9 @@ int main(int argc, char** argv) {
   // policy. The --deadlock-policy CLI argument overrides the env var.
   auto parse_policy =
       [](std::string_view s) -> tinylamb::Database::DeadlockPolicy {
-    if (s == "wait_die") return tinylamb::Database::DeadlockPolicy::kWaitDie;
+    if (s == "wait_die") {
+      return tinylamb::Database::DeadlockPolicy::kWaitDie;
+    }
     if (s == "wound_wait") {
       return tinylamb::Database::DeadlockPolicy::kWoundWait;
     }
@@ -264,14 +269,16 @@ int main(int argc, char** argv) {
   std::string deadlock_arg;
   for (int i = 2; i < argc; ++i) {
     if (std::string_view(argv[i]) == "--deadlock-policy") {
-      if (i + 1 < argc) { deadlock_arg = argv[++i]; }
+      if (i + 1 < argc) {
+        deadlock_arg = argv[++i];
+      }
     }
   }
-  const std::string policy_source = !deadlock_arg.empty()
-                                        ? deadlock_arg
-                                        : (deadlock_env != nullptr
-                                               ? std::string(deadlock_env)
-                                               : std::string("legacy"));
+  const std::string policy_source =
+      !deadlock_arg.empty()
+          ? deadlock_arg
+          : (deadlock_env != nullptr ? std::string(deadlock_env)
+                                     : std::string("legacy"));
   const tinylamb::Database::DeadlockPolicy deadlock_policy =
       parse_policy(policy_source);
   std::cout << "deadlock_policy=" << policy_source
@@ -382,8 +389,7 @@ int main(int argc, char** argv) {
       while (Clock::now() < measured_end) {
         const tinylamb::TpccTransactionType type = next_type();
         const Clock::time_point before = Clock::now();
-        const uint64_t sql_before =
-            tinylamb::SqlEngine::ThreadExecutionCount();
+        const uint64_t sql_before = tinylamb::SqlEngine::ThreadExecutionCount();
         tinylamb::TpccTransactionResult result;
         try {
           result = workload.Execute(type);
@@ -393,8 +399,8 @@ int main(int argc, char** argv) {
         }
         const uint64_t sql_invocations =
             tinylamb::SqlEngine::ThreadExecutionCount() - sql_before;
-        result.sql_statements = std::max(result.sql_statements,
-                                         sql_invocations);
+        result.sql_statements =
+            std::max(result.sql_statements, sql_invocations);
         const auto elapsed = Clock::now() - before;
         TypeStats& stats = worker_stats[static_cast<size_t>(worker)]
                                .types[static_cast<size_t>(type)];
@@ -418,7 +424,7 @@ int main(int argc, char** argv) {
           tinylamb::SqlEngine::ThreadRuntimeStats();
     });
   }
-#if defined(TINYLAMB_HAS_CALLGRIND)
+#ifdef TINYLAMB_HAS_CALLGRIND
   // Opt-in instruction profiling excludes database recovery, verification,
   // population and warmup.  Those phases otherwise dwarf a short OLTP run
   // under Callgrind and produce a confidently wrong optimization target.
@@ -554,8 +560,7 @@ int main(int argc, char** argv) {
             << "mix.stock_level.percent=" << stock_level_pct << '\n'
             << "mix_clause_542=" << (mix_ok ? "ok" : "short_interval") << '\n';
   if (!first_error.empty()) {
-    std::cout << "first_error=\"" << TruncateDiagnostic(first_error)
-              << "\"\n";
+    std::cout << "first_error=\"" << TruncateDiagnostic(first_error) << "\"\n";
   }
   const uint64_t plan_hits =
       tinylamb::PlanCacheStats().hits.load(std::memory_order_relaxed) -
@@ -571,8 +576,8 @@ int main(int argc, char** argv) {
   std::cout << "plan_cache_hits=" << plan_hits << '\n'
             << "plan_cache_misses=" << plan_misses << '\n'
             << "plan_cache_replays=" << plan_replays << '\n'
-            << "plan_cache_parameter_mismatches="
-            << plan_parameter_mismatches << '\n'
+            << "plan_cache_parameter_mismatches=" << plan_parameter_mismatches
+            << '\n'
             << "plan_cache_hit_percent=" << std::fixed << std::setprecision(3)
             << (plan_hits + plan_misses == 0
                     ? 0.0

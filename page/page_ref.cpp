@@ -16,12 +16,15 @@
 
 #include "page/page_ref.hpp"
 
+#include <atomic>
 #include <cassert>
+#include <cstdint>
 #include <ostream>
 
+#include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "page/page.hpp"
 #include "page/page_pool.hpp"
-#include "page_type.hpp"
 
 namespace tinylamb {
 namespace {

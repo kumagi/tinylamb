@@ -322,7 +322,7 @@ TEST_F(LeafPageTest, Split) {
   for (int i = 0; i < 8; ++i) {
     PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage);
     PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
-    std::string key = std::string(2000, '0' + i) + "k";
+    std::string key = std::string(2000, static_cast<char>('0' + i)) + "k";
     {
       for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
         ASSERT_SUCCESS(
@@ -336,11 +336,13 @@ TEST_F(LeafPageTest, Split) {
 
     StatusOr<std::string_view> lowest_key = right->LowestKey(txn);
     if (lowest_key.HasValue() && key < lowest_key.Value()) {
-      ASSERT_SUCCESS(left->InsertLeaf(txn, std::string(2000, '0' + i) + "k",
-                                      std::string(2000, 'p')));
+      ASSERT_SUCCESS(left->InsertLeaf(
+          txn, std::string(2000, static_cast<char>('0' + i)) + "k",
+          std::string(2000, 'p')));
     } else {
-      ASSERT_SUCCESS(right->InsertLeaf(txn, std::string(200, '0' + i) + "k",
-                                       std::string(2000, 'p')));
+      ASSERT_SUCCESS(right->InsertLeaf(
+          txn, std::string(200, static_cast<char>('0' + i)) + "k",
+          std::string(2000, 'p')));
     }
   }
 
@@ -611,8 +613,10 @@ TEST_F(LeafPageTest, UpdateHeavy) {
 
   // Act 1 -- insert kCount random key-value pairs
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 10, false);
-    std::string value = RandomString(((19937 * i) % 120) + 10, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 12) + 10), false);
+    std::string value =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10), false);
     ASSERT_SUCCESS(page->InsertLeaf(txn, key, value));
     keys.push_back(key);
     kvp.emplace(key, value);
@@ -621,7 +625,8 @@ TEST_F(LeafPageTest, UpdateHeavy) {
   // Act 2 -- update each key kCount*8 times with new random values
   for (int i = 0; i < kCount * 8; ++i) {
     const std::string& key = keys[(static_cast<size_t>(i) * 63) % keys.size()];
-    std::string value = RandomString(((19937 * i) % 320) + 100, false);
+    std::string value =
+        RandomString(static_cast<size_t>(((19937 * i) % 320) + 100), false);
     ASSERT_SUCCESS(page->Update(txn, key, value));
     kvp[key] = value;
   }
@@ -644,8 +649,10 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
 
   // Act 1 -- insert kCount random key-value pairs
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 10, false);
-    std::string value = RandomString(((19937 * i) % 120) + 10, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 12) + 10), false);
+    std::string value =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10), false);
     ASSERT_SUCCESS(page->InsertLeaf(txn, key, value));
     keys.push_back(key);
     kvp.emplace(key, value);
@@ -655,7 +662,8 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
   // value
   for (int i = 0; i < kCount * 8; ++i) {
     const std::string& key = keys[(static_cast<size_t>(i) * 63) % keys.size()];
-    std::string value = RandomString(((19937 * i) % 320) + 100, false);
+    std::string value =
+        RandomString(static_cast<size_t>(((19937 * i) % 320) + 100), false);
     ASSERT_SUCCESS(page->Delete(txn, key));
     ASSERT_SUCCESS(page->InsertLeaf(txn, key, value));
     kvp[key] = value;
@@ -674,7 +682,8 @@ TEST_F(LeafPageTest, FosterChild) {
   // Act -- for 5 iterations, set foster pairs with random keys and child page
   // IDs
   for (int i = 0; i < 5; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 10000, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 12) + 10000), false);
     {
       Transaction txn = tm_->Begin();
       PageRef page = Page();
@@ -702,8 +711,10 @@ TEST_F(LeafPageTest, Fences) {
   // Act -- for 100 iterations, set low/high fences with random strings and
   // verify
   for (int i = 0; i < 100; ++i) {
-    std::string low = RandomString(((19937 * i) % 12) + 10000, false);
-    std::string high = RandomString(((19937 * i) % 12) + 10000, false);
+    std::string low =
+        RandomString(static_cast<size_t>(((19937 * i) % 12) + 10000), false);
+    std::string high =
+        RandomString(static_cast<size_t>(((19937 * i) % 12) + 10000), false);
     ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey(low)));
     ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
     ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey(high)));
@@ -800,7 +811,8 @@ TEST_F(LeafPageTest, FosterChildCrash) {
 
   // Act -- for 5 iterations, set foster pair, commit, crash, recover, verify
   for (int i = 0; i < 5; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 10000, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 12) + 10000), false);
     {
       Transaction txn = tm_->Begin();
       PageRef page = Page();

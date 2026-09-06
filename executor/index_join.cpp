@@ -101,8 +101,9 @@ void IndexJoin::Dump(std::ostream& o, int indent) const {
     ss << right_cols_[i];
   }
   ss << "}";
-  o << "IndexJoin: " << ss.str() << "\n" << Indent(indent + 2);
+  o << "IndexJoin: " << ss.str() << "\n"
+    << Indent(static_cast<size_t>(indent) + 2);
   left_->Dump(o, indent + 2);
-  o << "\n" << Indent(indent + 2) << right_.GetSchema();
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2) << right_.GetSchema();
 }
 }  // namespace tinylamb

@@ -30,12 +30,15 @@ class IntervalExpression : public ExpressionBase {
     text_ = value_.ToString();
   }
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kIntervalExp; }
-  [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override;
-  [[nodiscard]] Value Evaluate(const Row*, const Schema&, const Row*,
-                               const Schema&) const override;
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override;
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&,
-                                          const Schema&) const override;
+  [[nodiscard]] Value Evaluate(const Row& /*row*/,
+                               const Schema& /*schema*/) const override;
+  [[nodiscard]] Value Evaluate(const Row* /*unused*/, const Schema& /*unused*/,
+                               const Row* /*unused*/,
+                               const Schema& /*unused*/) const override;
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/) const override;
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/, const Schema& /*unused*/) const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& output) const override;
   [[nodiscard]] int64_t Amount() const { return amount_; }

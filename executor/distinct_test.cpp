@@ -1,10 +1,16 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache License 2.0. */
+#include "executor/distinct.hpp"
+
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <ostream>
+#include <utility>
 #include <vector>
 
-#include "executor/distinct.hpp"
+#include "executor/data_chunk.hpp"
+#include "executor/executor_base.hpp"
 #include "gtest/gtest.h"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -17,13 +23,19 @@ class FakeSource : public ExecutorBase {
  public:
   explicit FakeSource(std::vector<Row> rows) : rows_(std::move(rows)) {}
   bool Next(Row* row, RowPosition* rp) override {
-    if (idx_ >= rows_.size()) { return false; }
+    if (idx_ >= rows_.size()) {
+      return false;
+    }
     *row = rows_[idx_++];
-    if (rp) { *rp = RowPosition{}; }
+    if (rp != nullptr) {
+      *rp = RowPosition{};
+    }
     return true;
   }
-  size_t NextBatch(DataChunk*, size_t) override { return 0; }
-  void Dump(std::ostream& o, int) const override { o << "fake"; }
+  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override {
+    return 0;
+  }
+  void Dump(std::ostream& o, int /*indent*/) const override { o << "fake"; }
 
  private:
   std::vector<Row> rows_;
@@ -33,7 +45,9 @@ class FakeSource : public ExecutorBase {
 std::vector<Row> Rows(std::vector<Value> values) {
   std::vector<Row> out;
   out.reserve(values.size());
-  for (auto& v : values) { out.emplace_back(std::vector<Value>{std::move(v)}); }
+  for (auto& v : values) {
+    out.emplace_back(std::vector<Value>{std::move(v)});
+  }
   return out;
 }
 
@@ -41,7 +55,9 @@ int CountDistinct(std::vector<Row> rows) {
   DistinctExecutor ex(std::make_shared<FakeSource>(std::move(rows)));
   Row r;
   int n = 0;
-  while (ex.Next(&r, nullptr)) { ++n; }
+  while (ex.Next(&r, nullptr)) {
+    ++n;
+  }
   return n;
 }
 
@@ -51,7 +67,9 @@ int CountSortDistinct(std::vector<Row> rows) {
   SortDistinctExecutor ex(std::make_shared<FakeSource>(std::move(rows)));
   Row r;
   int n = 0;
-  while (ex.Next(&r, nullptr)) { ++n; }
+  while (ex.Next(&r, nullptr)) {
+    ++n;
+  }
   return n;
 }
 
@@ -74,23 +92,27 @@ TEST(DistinctExecutorTest, CollapsesNulls) {
 
 TEST(DistinctExecutorTest, CollapsesInfinities) {
   std::vector<Value> vals{Value(INFINITY), Value(INFINITY), Value(-INFINITY),
-                           Value(-INFINITY)};
+                          Value(-INFINITY)};
   EXPECT_EQ(CountDistinct(Rows(std::move(vals))), 2);
 }
 
 TEST(DistinctExecutorTest, DistinctDoublesScenarioMatchesGoogleSQL) {
   const double nan = std::nan("");
   std::vector<Value> vals;
-  auto d = [&](double x) { vals.emplace_back(Value(x)); };
-  for (double x : {-0.0, +0.0, 0.0, -0.0, 0.0, +0.0, -0.0, 0.0}) { d(x); }
-  for (int k = 0; k < 9; ++k) { d(nan); }
+  auto d = [&](double x) { vals.emplace_back(x); };
+  for (double x : {-0.0, +0.0, 0.0, -0.0, 0.0, +0.0, -0.0, 0.0}) {
+    d(x);
+  }
+  for (int k = 0; k < 9; ++k) {
+    d(nan);
+  }
   d(INFINITY);
   d(-INFINITY);
   d(1.0);
   d(-1.0);
   d(1.0);
   d(-1.0);
-  vals.emplace_back(Value());
+  vals.emplace_back();
   // GoogleSQL DISTINCT collapses to {NULL, nan, -inf, -1, 0, 1, inf} = 7.
   EXPECT_EQ(CountDistinct(Rows(std::move(vals))), 7);
 }
@@ -109,8 +131,8 @@ TEST(SortDistinctExecutorTest, CollapsesAdjacentNans) {
 
 TEST(SortDistinctExecutorTest, CollapsesAdjacentSignedZeros) {
   std::vector<Row> rows{Row(std::vector<Value>{Value(-0.0)}),
-                         Row(std::vector<Value>{Value(0.0)}),
-                         Row(std::vector<Value>{Value(+0.0)})};
+                        Row(std::vector<Value>{Value(0.0)}),
+                        Row(std::vector<Value>{Value(+0.0)})};
   EXPECT_EQ(CountSortDistinct(std::move(rows)), 1);
 }
 

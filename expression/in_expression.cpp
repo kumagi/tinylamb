@@ -21,6 +21,7 @@
 #include <string>
 #include <unordered_set>
 
+#include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "type/column_name.hpp"

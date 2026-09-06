@@ -89,5 +89,11 @@ class BytecodeCompiler {
       const Expression& expression, const Schema& schema);
 };
 
+// Differential-testing hook: false when TINYLAMB_DISABLE_BYTECODE is set in
+// the environment. Compile call sites gate on this so the same query can be
+// executed through the AST evaluation path (the semantic reference) and
+// compared against the bytecode/JIT fast path.
+[[nodiscard]] bool BytecodeEnabled();
+
 }  // namespace tinylamb
 #endif

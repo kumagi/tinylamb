@@ -6,7 +6,7 @@
 #ifndef TINYLAMB_PLAN_CACHE_HPP
 #define TINYLAMB_PLAN_CACHE_HPP
 
-// Phase 2-1: compiled-plan cache ("prepared plans"), docs/tpcc-improvements.md.
+// Phase 2-1: compiled-plan cache ("prepared plans"), docs/next-actions.md.
 //
 // Key:    SQL fingerprint + database schema/statistics epoch.
 // Value:  a CompiledPlan, one of
@@ -142,11 +142,12 @@ class ParameterSlot final : public ExpressionBase {
                                const Schema& /*right_schema*/) const override {
     return values_->at(slot_index_);
   }
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override {
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/) const override {
     return TypeFor(expected_);
   }
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&,
-                                          const Schema&) const override {
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/, const Schema& /*unused*/) const override {
     return TypeFor(expected_);
   }
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override {
@@ -161,17 +162,17 @@ class ParameterSlot final : public ExpressionBase {
   static tinylamb::Type TypeFor(ValueType value_type) {
     switch (value_type) {
       case ValueType::kInt64:
-        return tinylamb::Type(TypeTag::kBigInt);
+        return {TypeTag::kBigInt};
       case ValueType::kDouble:
-        return tinylamb::Type(TypeTag::kDouble);
+        return {TypeTag::kDouble};
       case ValueType::kVarChar:
-        return tinylamb::Type(TypeTag::kVarChar);
+        return {TypeTag::kVarChar};
       case ValueType::kDate:
-        return tinylamb::Type(TypeTag::kDate);
+        return {TypeTag::kDate};
       case ValueType::kArray:
-        return tinylamb::Type(TypeTag::kArray);
+        return {TypeTag::kArray};
       default:
-        return tinylamb::Type(TypeTag::kInvalid);
+        return {TypeTag::kInvalid};
     }
   }
 
@@ -665,7 +666,8 @@ class PreparedPlanCache {
       shard.lru.splice(shard.lru.begin(), shard.lru, found->second);
       return;
     }
-    shard.lru.push_front(CacheEntry{fingerprint, std::move(plan)});
+    shard.lru.push_front(
+        CacheEntry{.fingerprint = fingerprint, .plan = std::move(plan)});
     shard.index.emplace(fingerprint, shard.lru.begin());
     if (shard.lru.size() > kCapacityPerShard) {
       shard.index.erase(shard.lru.back().fingerprint);

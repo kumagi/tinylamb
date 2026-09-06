@@ -37,8 +37,9 @@ void Bench(size_t count, const std::function<void()>& fun,
   auto begin = std::chrono::steady_clock::now();
   fun();
   auto finish = std::chrono::steady_clock::now();
-  int ms = std::chrono::duration_cast<std::chrono::milliseconds>(finish - begin)
-               .count();
+  int ms = static_cast<int>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(finish - begin)
+          .count());
   if (ms == 0) {
     ms = 1;
   }

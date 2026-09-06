@@ -3,13 +3,11 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <memory>
 #include <ostream>
 #include <sstream>
 #include <string>
 
 #include "common/constants.hpp"
-#include "database/transaction_context.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -32,7 +30,7 @@ size_t LimitPlan::EmitRowCount() const {
 
 void LimitPlan::Dump(std::ostream& o, int indent) const {
   o << "Limit: " << limit_count_ << " offset " << limit_offset_ << "\n"
-    << Indent(indent + 2);
+    << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 

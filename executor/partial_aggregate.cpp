@@ -1,11 +1,8 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/partial_aggregate.hpp"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <map>
-#include <memory>
 #include <ostream>
 #include <string>
 #include <unordered_map>
@@ -14,10 +11,11 @@
 
 #include "common/constants.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/aggregate_expression.hpp"
-#include "expression/column_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
 #include "type/column.hpp"
@@ -105,7 +103,7 @@ Schema MakePartialSchema(const std::vector<NamedExpression>& group_by_keys,
       cols.emplace_back(named.name, ValueType::kVarChar);
     }
   }
-  return Schema("partial_agg", std::move(cols));
+  return {"partial_agg", std::move(cols)};
 }
 
 Schema MakeFinalizeSchema(const std::vector<NamedExpression>& group_by_keys,
@@ -136,7 +134,7 @@ Schema MakeFinalizeSchema(const std::vector<NamedExpression>& group_by_keys,
       cols.emplace_back(named.name, ValueType::kVarChar);
     }
   }
-  return Schema("finalize_agg", std::move(cols));
+  return {"finalize_agg", std::move(cols)};
 }
 
 }  // namespace
@@ -373,7 +371,7 @@ size_t PartialAggregate::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 void PartialAggregate::Dump(std::ostream& o, int indent) const {
-  o << "PartialAggregate: \n" << Indent(indent + 2);
+  o << "PartialAggregate: \n" << Indent(static_cast<size_t>(indent) + 2);
   child_->Dump(o, indent + 2);
 }
 
@@ -607,7 +605,7 @@ size_t FinalizeAggregate::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 void FinalizeAggregate::Dump(std::ostream& o, int indent) const {
-  o << "FinalizeAggregate: \n" << Indent(indent + 2);
+  o << "FinalizeAggregate: \n" << Indent(static_cast<size_t>(indent) + 2);
   child_->Dump(o, indent + 2);
 }
 

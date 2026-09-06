@@ -15,7 +15,7 @@ struct PostgresServerOptions {
   std::string listen_address{"127.0.0.1"};
   uint16_t port{54321};
   int backlog{128};
-  size_t max_message_bytes{16U * 1024U * 1024U};
+  size_t max_message_bytes{static_cast<size_t>(16U * 1024U * 1024U)};
   // Zero selects std::thread::hardware_concurrency().
   size_t read_worker_threads{0};
   // Connections beyond this limit are shed immediately (client sees EOF).

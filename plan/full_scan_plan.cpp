@@ -19,13 +19,14 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
-#include <memory>
 #include <ostream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
-#include "plan/parallel_thresholds.hpp"
+#include "table/full_scan_iterator.hpp"
 #include "table/table.hpp"
 
 namespace tinylamb {

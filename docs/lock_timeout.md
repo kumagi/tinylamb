@@ -11,7 +11,11 @@ This prevents permanent hangs on simple 2-transaction exclusive conflicts.
 It is **not** full deadlock detection (wait-for graph); nested multi-lock
 cycles can still time out piecemeal.
 
-See `improvement.md` §7.1 / §M2.5.
+Write-intent acquisition (`TransactionManager::AcquireWriteIntent`) has its
+own deadlock policies (`DeadlockPolicy`: `kLegacy` 5ms abort,
+`kWaitDie`/`kWoundWait` timestamp ordering, `kDeadlockDetect` background
+wait-for graph with youngest-victim wounding); see
+`transaction/transaction_manager.hpp` and `docs/lock_order.md` §7-8.
 
 ## 実装上の注意(2026-08-24 レビュー反映)
 
@@ -20,4 +24,3 @@ See `improvement.md` §7.1 / §M2.5.
 - 5秒は個々の取得試行の上限。継続読者トラフィック下では排他取得が繰り返し失敗し得る(待機者優先制御なし、wait-for graph なし)。
 - 任意タイムアウトのオーバーロードあり。TryUpgradeLock は「共有保持者=自分1人かつ排他なし」でのみ成功。
 - LockManager は RowPosition ハッシュで64 shard に分割済み(操作は単一 shard mutex、ネストなし)。release_epoch_ は進捗検出のため全局。
-- 参照 improvement.md §7.1/M2.5 は git 履歴参照。

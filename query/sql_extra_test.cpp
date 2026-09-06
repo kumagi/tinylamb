@@ -2,7 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <exception>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -13,6 +16,7 @@
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

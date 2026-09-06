@@ -18,7 +18,7 @@ inline std::string ToHex(std::string_view raw) {
   std::string out;
   out.reserve(raw.size() * 2);
   for (const char c : raw) {
-    const unsigned char b = static_cast<unsigned char>(c);
+    const auto b = static_cast<unsigned char>(c);
     out.push_back(kDigits[b >> 4]);
     out.push_back(kDigits[b & 0xF]);
   }
@@ -69,7 +69,7 @@ class Md5 {
     buffer_.clear();
     std::string out(16, '\0');
     for (int i = 0; i < 4; ++i) {
-      const size_t k = static_cast<size_t>(i);
+      const auto k = static_cast<size_t>(i);
       out[k] = static_cast<char>((a_ >> (8 * i)) & 0xFF);
       out[4 + k] = static_cast<char>((b_ >> (8 * i)) & 0xFF);
       out[8 + k] = static_cast<char>((c_ >> (8 * i)) & 0xFF);
@@ -100,15 +100,16 @@ class Md5 {
         6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
     uint32_t m[16];
     for (size_t i = 0; i < 16; ++i) {
-      m[i] = static_cast<uint8_t>(p[i * 4]) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 1])) << 8) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 2])) << 16) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 3])) << 24);
+      m[i] =
+          static_cast<uint8_t>(p[i * 4]) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 1])) << 8) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 2])) << 16) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 3])) << 24);
     }
     uint32_t a = a_, b = b_, c = c_, d = d_;
     for (int i = 0; i < 64; ++i) {
-      uint32_t f;
-      int g;
+      uint32_t f = 0;
+      int g = 0;
       if (i < 16) {
         f = (b & c) | (~b & d);
         g = i;
@@ -190,7 +191,7 @@ class Sha1 {
     std::string out(20, '\0');
     for (size_t w = 0; w < 5; ++w) {
       for (size_t i = 0; i < 4; ++i) {
-        out[w * 4 + i] = static_cast<char>((h_[w] >> (24 - 8 * i)) & 0xFF);
+        out[(w * 4) + i] = static_cast<char>((h_[w] >> (24 - 8 * i)) & 0xFF);
       }
     }
     return out;
@@ -201,17 +202,18 @@ class Sha1 {
   void Block(const char* p) {
     uint32_t w[80];
     for (size_t i = 0; i < 16; ++i) {
-      w[i] = (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4])) << 24) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 1])) << 16) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 2])) << 8) |
-             static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 3]));
+      w[i] =
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4])) << 24) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 1])) << 16) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 2])) << 8) |
+          static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 3]));
     }
     for (size_t i = 16; i < 80; ++i) {
       w[i] = Rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
     }
     uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4];
     for (int i = 0; i < 80; ++i) {
-      uint32_t f, k;
+      uint32_t f = 0, k = 0;
       if (i < 20) {
         f = (b & c) | (~b & d);
         k = 0x5A827999;
@@ -298,7 +300,7 @@ class Sha256 {
     std::string out(32, '\0');
     for (size_t w = 0; w < 8; ++w) {
       for (size_t i = 0; i < 4; ++i) {
-        out[w * 4 + i] = static_cast<char>((h_[w] >> (24 - 8 * i)) & 0xFF);
+        out[(w * 4) + i] = static_cast<char>((h_[w] >> (24 - 8 * i)) & 0xFF);
       }
     }
     return out;
@@ -321,10 +323,11 @@ class Sha256 {
         0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
     uint32_t w[64];
     for (size_t i = 0; i < 16; ++i) {
-      w[i] = (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4])) << 24) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 1])) << 16) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 2])) << 8) |
-             static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4 + 3]));
+      w[i] =
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[i * 4])) << 24) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 1])) << 16) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 2])) << 8) |
+          static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 3]));
     }
     for (size_t i = 16; i < 64; ++i) {
       const uint32_t s0 =
@@ -425,7 +428,7 @@ class Sha512 {
     std::string out(64, '\0');
     for (size_t w = 0; w < 8; ++w) {
       for (size_t i = 0; i < 8; ++i) {
-        out[w * 8 + i] = static_cast<char>((h_[w] >> (56 - 8 * i)) & 0xFF);
+        out[(w * 8) + i] = static_cast<char>((h_[w] >> (56 - 8 * i)) & 0xFF);
       }
     }
     return out;
@@ -466,7 +469,7 @@ class Sha512 {
     for (size_t i = 0; i < 16; ++i) {
       w[i] = 0;
       for (size_t j = 0; j < 8; ++j) {
-        w[i] = (w[i] << 8) | static_cast<uint8_t>(p[i * 8 + j]);
+        w[i] = (w[i] << 8) | static_cast<uint8_t>(p[(i * 8) + j]);
       }
     }
     for (size_t i = 16; i < 80; ++i) {

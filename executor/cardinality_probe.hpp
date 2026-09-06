@@ -39,7 +39,7 @@ class CardinalityProbe : public ExecutorBase {
     if (estimated_cardinality_ <= 0.0) {
       return static_cast<double>(actual_rows_);
     }
-    const double act = static_cast<double>(actual_rows_);
+    const auto act = static_cast<double>(actual_rows_);
     const double est = estimated_cardinality_;
     return std::max(act, est) / std::max(std::min(act, est), 1.0);
   }

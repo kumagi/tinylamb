@@ -5,6 +5,7 @@
 // setenv/unsetenv below are POSIX APIs that <cstdlib> does not declare.
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <stdlib.h>
+
 #include <string>
 #include <utility>
 
@@ -42,7 +43,8 @@ TEST(QueryMemoryTest, CanReserve_PastSoftLimit_RejectsReservation) {
   EXPECT_TRUE(budget.Unlimited());
 }
 
-TEST(QueryMemoryTest, EstimateRowBytes_SampleRowAndValues_ReturnsExpectedEstimates) {
+TEST(QueryMemoryTest,
+     EstimateRowBytes_SampleRowAndValues_ReturnsExpectedEstimates) {
   Row row({Value(1), Value("hello")});
   EXPECT_GT(EstimateRowBytes(row), 0U);
   EXPECT_GE(EstimateValueBytes(Value("hello")), 5U);
@@ -106,7 +108,8 @@ TEST(QueryMemoryTest, CanReserve_AtBoundaries_ReturnsExpectedBoolean) {
   EXPECT_TRUE(budget.CanReserve(0));  // bytes==0 is always allowed
 }
 
-TEST(QueryMemoryTest, ReserveForcedAndRelease_VariousAmounts_ClampsUsageCorrectly) {
+TEST(QueryMemoryTest,
+     ReserveForcedAndRelease_VariousAmounts_ClampsUsageCorrectly) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   budget.ReserveForced(0);
@@ -160,12 +163,18 @@ TEST(QueryMemoryTest, QueryMemoryCharge_MoveSemantics_TransfersOwnership) {
   QueryMemoryCharge c(std::move(a));
   // The moved-from charge must report zero bytes; verifying that contract is
   // the point of this test (QueryMemoryCharge zeroes its source on move).
-  EXPECT_EQ(a.Bytes(), 0U);  // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  // clang-format off
+  // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_EQ(a.Bytes(), 0U);
+  // clang-format on
   EXPECT_EQ(c.Bytes(), 100U);
   EXPECT_EQ(budget.Used(), 100U);
   QueryMemoryCharge d(30);
   d = std::move(c);
-  EXPECT_EQ(c.Bytes(), 0U);  // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  // clang-format off
+  // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_EQ(c.Bytes(), 0U);
+  // clang-format on
   EXPECT_EQ(d.Bytes(), 100U);
   EXPECT_EQ(budget.Used(), 100U);
   // Self-move must be a no-op; go through a reference so the compiler cannot

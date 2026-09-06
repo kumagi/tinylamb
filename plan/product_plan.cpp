@@ -18,10 +18,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
-#include <memory>
 #include <ostream>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,6 +28,7 @@
 #include "common/constants.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/hash_join_mode.hpp"
+#include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "plan/plan.hpp"
 #include "table/table.hpp"
@@ -50,13 +50,13 @@ constexpr uint8_t kJoinKindRightOuter = 5;
 constexpr uint8_t kJoinKindFullOuter = 6;
 
 [[nodiscard]] bool IsSemiOrAnti(JoinKind kind) {
-  const uint8_t value = static_cast<uint8_t>(kind);
+  const auto value = static_cast<uint8_t>(kind);
   return value == kJoinKindSemi || value == kJoinKindAnti ||
          value == kJoinKindNullAwareAnti;
 }
 
 [[nodiscard]] bool IsOuter(JoinKind kind) {
-  const uint8_t value = static_cast<uint8_t>(kind);
+  const auto value = static_cast<uint8_t>(kind);
   return value == kJoinKindLeftOuter || value == kJoinKindRightOuter ||
          value == kJoinKindFullOuter;
 }
@@ -366,9 +366,9 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
     o << "} ";
   }
   o << " (estimated cost: " << EmitRowCount() << ")";
-  o << "\n" << Indent(indent + 2);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   left_src_->Dump(o, indent + 2);
-  o << "\n" << Indent(indent + 2);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   if (right_tbl_ == nullptr) {
     // CrossJoin or HashJoin.
     right_src_->Dump(o, indent + 2);

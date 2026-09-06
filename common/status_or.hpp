@@ -114,7 +114,7 @@ class StatusOr {
     status_ = Status::kUnknown;
     return std::move(*value_);
   }
-  const T& Value() const {
+  [[nodiscard]] const T& Value() const {
     if (status_ != Status::kSuccess || !value_.has_value()) {
       throw std::runtime_error("StatusOr has no value");
     }

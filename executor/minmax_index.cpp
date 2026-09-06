@@ -1,7 +1,11 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/minmax_index.hpp"
 
+#include <cstddef>
+#include <ostream>
+
 #include "common/constants.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -32,7 +36,7 @@ bool MinMaxIndexExecutor::Next(Row* destination, RowPosition* position) {
 }
 
 void MinMaxIndexExecutor::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "MinMaxIndex limit=1\n";
+  output << Indent(static_cast<size_t>(indent)) << "MinMaxIndex limit=1\n";
   source_->Dump(output, indent + 2);
 }
 

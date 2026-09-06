@@ -1,12 +1,13 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/selection_vector.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <numeric>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -170,8 +171,10 @@ SelectionVector SelectionVector::Slice(size_t offset, size_t count) const {
     return SelectionVector{};
   }
   const size_t actual_count = std::min(count, indices_.size() - offset);
-  std::vector<uint32_t> sliced(indices_.begin() + offset,
-                               indices_.begin() + offset + actual_count);
+  std::vector<uint32_t> sliced(
+      indices_.begin() + static_cast<std::ptrdiff_t>(offset),
+      indices_.begin() + static_cast<std::ptrdiff_t>(offset) +
+          static_cast<std::ptrdiff_t>(actual_count));
   return SelectionVector(std::move(sliced));
 }
 

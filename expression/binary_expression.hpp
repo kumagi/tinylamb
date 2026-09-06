@@ -53,7 +53,7 @@ class BinaryExpression : public ExpressionBase {
   [[nodiscard]] BinaryOperation Op() const { return op_; }
   [[nodiscard]] const Expression& Left() const { return left_; }
   [[nodiscard]] const Expression& Right() const { return right_; }
-  std::string ToString() const override;
+  [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 

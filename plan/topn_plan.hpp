@@ -26,7 +26,7 @@ class TopNPlan final : public PlanBase {
         offset_(offset),
         with_ties_(with_ties) {}
 
-  Executor EmitExecutor(TransactionContext& context) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();
   }

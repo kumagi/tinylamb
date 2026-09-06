@@ -13,7 +13,7 @@ class DistinctPlan final : public PlanBase {
   explicit DistinctPlan(Plan child, std::vector<Expression> distinct_on = {})
       : child_(std::move(child)), distinct_on_(std::move(distinct_on)) {}
 
-  Executor EmitExecutor(TransactionContext& context) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();
   }

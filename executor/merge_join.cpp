@@ -2,12 +2,19 @@
 #include "executor/merge_join.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <ostream>
 #include <stdexcept>
-#include <string>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
-#include "executor/detail/expression_eval.hpp"
+#include "common/join_kind.hpp"
+#include "executor/executor_base.hpp"
+#include "expression/expression.hpp"
+#include "page/row_position.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -31,8 +38,7 @@ MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
   }
 }
 
-bool MergeJoin::KeyIsNull(const Row& row,
-                          const std::vector<slot_t>& columns) const {
+bool MergeJoin::KeyIsNull(const Row& row, const std::vector<slot_t>& columns) {
   return std::ranges::any_of(
       columns, [&](slot_t column) { return row[column].IsNull(); });
 }

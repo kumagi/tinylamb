@@ -40,7 +40,8 @@ class QueryExpression : public ExpressionBase {
         mode_(mode) {}
 
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kQueryExp; }
-  [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override;
+  [[nodiscard]] Value Evaluate(const Row& /*row*/,
+                               const Schema& /*schema*/) const override;
   // Stage 1 of the A1 migration: subquery execution goes through the abstract
   // EvaluationContext instead of the relational_detail interpreter.
   [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,

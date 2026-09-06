@@ -19,8 +19,7 @@ class SelectStatement;
 // lives in the relational factory (executor/relational_factory.cpp).
 class GroupByPlan final : public PlanBase {
  public:
-  GroupByPlan(const Plan& child,
-              std::shared_ptr<const SelectStatement> statement,
+  GroupByPlan(Plan child, std::shared_ptr<const SelectStatement> statement,
               Schema output_schema)
       : child_(std::move(child)),
         statement_(std::move(statement)),
@@ -31,7 +30,7 @@ class GroupByPlan final : public PlanBase {
   GroupByPlan& operator=(const GroupByPlan&&) = delete;
   ~GroupByPlan() override = default;
 
-  Executor EmitExecutor(TransactionContext& ctx) const override;
+  Executor EmitExecutor(TransactionContext& context) const override;
 
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();

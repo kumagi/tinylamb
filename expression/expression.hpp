@@ -82,8 +82,10 @@ class ExpressionBase {
   [[nodiscard]] virtual std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
-  [[nodiscard]] virtual Value Evaluate(const Row*, const Schema&, const Row*,
-                                       const Schema&) const {
+  [[nodiscard]] virtual Value Evaluate(const Row* /*unused*/,
+                                       const Schema& /*unused*/,
+                                       const Row* /*unused*/,
+                                       const Schema& /*unused*/) const {
     throw std::runtime_error("not implemented");
   }
   // Context-aware evaluation (improvement3.md A1): subqueries and aggregates
@@ -94,20 +96,22 @@ class ExpressionBase {
   // route through the abstract interface as soon as every ancestor on their
   // path propagates it.
   [[nodiscard]] virtual Value Evaluate(const Row& row, const Schema& schema,
-                                       EvaluationContext&) const {
+                                       EvaluationContext& /*unused*/) const {
     return Evaluate(row, schema);
   }
-  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema&) const {
+  [[nodiscard]] virtual tinylamb::Type ResultType(
+      const Schema& /*unused*/) const {
     throw std::runtime_error("not implemented");
   }
-  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema&,
-                                                  const Schema&) const {
+  [[nodiscard]] virtual tinylamb::Type ResultType(
+      const Schema& /*unused*/, const Schema& /*unused*/) const {
     throw std::runtime_error("not implemented");
   }
   // Validates the expression against the schema, resolving function
   // signatures through EvaluationContext (improvement3.md A1: the database
   // type stays behind the context boundary).
-  virtual Status Validate(EvaluationContext&, const Schema&) const {
+  virtual Status Validate(EvaluationContext& /*unused*/,
+                          const Schema& /*unused*/) const {
     return Status::kSuccess;
   }
   [[nodiscard]] virtual std::string ToString() const = 0;

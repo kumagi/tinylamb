@@ -23,6 +23,7 @@
 #include <algorithm>  // NOLINT(misc-include-cleaner)
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -30,6 +31,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -275,16 +277,18 @@ TEST_F(BPlusTreeTest, MergeBranch) {
   //        reading the remaining keys after each delete to confirm they still
   //        exist
   for (size_t i = 0; i < kInserts; ++i) {
-    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, kPayloadSize), short_value));
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(static_cast<int>(i), kPayloadSize),
+                                short_value));
     ASSERT_TRUE(bpt_->SanityCheckForTest(txn.GetPageManager()));
   }
   for (size_t i = 0; i < kInserts; ++i) {
-    std::string key = KeyGen(i, kPayloadSize);
+    std::string key = KeyGen(static_cast<int>(i), kPayloadSize);
     SCOPED_TRACE(key);
     ASSERT_SUCCESS(bpt_->Delete(txn, key));
     for (size_t j = i + 1; j < kInserts; ++j) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
-                            bpt_->Read(txn, KeyGen(j, kPayloadSize)));
+      ASSIGN_OR_ASSERT_FAIL(
+          std::string_view, val,
+          bpt_->Read(txn, KeyGen(static_cast<int>(j), kPayloadSize)));
       if (val != short_value) {
         LOG(FATAL) << OmittedString(val, 20) << " not found";
       }
@@ -364,8 +368,9 @@ TEST_F(BPlusTreeTest, Update) {
   {
     auto txn = tm_->Begin();
     for (size_t i = 0; i < kCount; ++i) {
-      ASSERT_SUCCESS(
-          bpt_->Insert(txn, KeyGen(i, kPayloadSize), KeyGen(i * 10, 100)));
+      ASSERT_SUCCESS(bpt_->Insert(txn,
+                                  KeyGen(static_cast<int>(i), kPayloadSize),
+                                  KeyGen(static_cast<int>(i * 10), 100)));
     }
     txn.PreCommit();
   }
@@ -374,8 +379,9 @@ TEST_F(BPlusTreeTest, Update) {
   {
     auto txn = tm_->Begin();
     for (size_t i = 0; i < kCount; i += 2) {
-      ASSERT_SUCCESS(
-          bpt_->Update(txn, KeyGen(i, kPayloadSize), KeyGen(i * 2, 200)));
+      ASSERT_SUCCESS(bpt_->Update(txn,
+                                  KeyGen(static_cast<int>(i), kPayloadSize),
+                                  KeyGen(static_cast<int>(i * 2), 200)));
     }
     txn.PreCommit();
   }
@@ -386,12 +392,13 @@ TEST_F(BPlusTreeTest, Update) {
   {
     auto txn = tm_->Begin();
     for (size_t i = 0; i < kCount; ++i) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
-                            bpt_->Read(txn, KeyGen(i, kPayloadSize)));
+      ASSIGN_OR_ASSERT_FAIL(
+          std::string_view, val,
+          bpt_->Read(txn, KeyGen(static_cast<int>(i), kPayloadSize)));
       if (i % 2 == 0) {
-        ASSERT_EQ(val, KeyGen(i * 2, 200));
+        ASSERT_EQ(val, KeyGen(static_cast<int>(i * 2), 200));
       } else {
-        ASSERT_EQ(val, KeyGen(i * 10, 100));
+        ASSERT_EQ(val, KeyGen(static_cast<int>(i * 10), 100));
       }
     }
   }
@@ -958,8 +965,10 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
   std::unordered_map<std::string, std::string> kvp;
   keys.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 10, false);
-    std::string value = RandomString(((19937 * i) % 120) + 10, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 12) + 10), false);
+    std::string value =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10), false);
 
     // Act 1 -- insert each key; read back all keys after each insert to verify
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
@@ -976,7 +985,8 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
   // each update
   for (int i = 0; i < kCount * 4; ++i) {
     const std::string& key = keys[(static_cast<size_t>(i) * 63) % keys.size()];
-    std::string value = RandomString(((19937 * i) % 320) + 500, false);
+    std::string value =
+        RandomString(static_cast<size_t>(((19937 * i) % 320) + 500), false);
     ASSERT_SUCCESS(bpt_->Update(txn, key, value));
     kvp[key] = value;
     for (const auto& kv : kvp) {
@@ -999,7 +1009,8 @@ TEST_F(BPlusTreeTest, InsertDelete) {
   std::unordered_set<std::string> keys;
   keys.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString(((19937 * i) % 120) + 10, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10), false);
 
     // Act 1 -- insert each key with value "foo"
     ASSERT_SUCCESS(bpt_->Insert(txn, key, "foo"));
@@ -1015,7 +1026,7 @@ TEST_F(BPlusTreeTest, InsertDelete) {
     ASSERT_SUCCESS(bpt_->Delete(txn, *it));
     keys.erase(it);
     std::string inserting_key =
-        RandomString(((19937 * i) % 2000) + 2000, false);
+        RandomString(static_cast<size_t>(((19937 * i) % 2000) + 2000), false);
     ASSERT_SUCCESS(bpt_->Insert(txn, inserting_key, "bar"));
     keys.insert(inserting_key);
     ASSERT_TRUE(bpt_->SanityCheckForTest(txn.GetPageManager()));
@@ -1030,10 +1041,12 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
   int kCount = 100;
   Transaction txn = tm_->Begin();
   std::unordered_map<std::string, std::string> kvp;
-  kvp.reserve(kCount);
+  kvp.reserve(static_cast<size_t>(kCount));
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString(((19937 * i) % 120) + 10, false);
-    std::string value = RandomString(((19937 * i) % 120) + 10, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10), false);
+    std::string value =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10), false);
 
     // Act 1 -- insert each key; sanity-check after each insert
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
@@ -1059,8 +1072,10 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp.erase(iter);
 
-    std::string key = RandomString(((19937 * i) % 130) + 1000, false);
-    std::string value = RandomString(((19937 * i) % 320) + 3000, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 130) + 1000), false);
+    std::string value =
+        RandomString(static_cast<size_t>(((19937 * i) % 320) + 3000), false);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp[key] = value;
@@ -1449,7 +1464,7 @@ TEST_F(BPlusTreeTest, PrefixSeekCrossesSeparatorBoundary) {
       int seen = 0;
       for (BPlusTreeIterator it = bpt_->Begin(txn, prefix, end); it.IsValid();
            ++it) {
-        if (it.Key().rfind(prefix, 0) == 0) {
+        if (it.Key().starts_with(prefix)) {
           ++seen;
         } else {
           break;
@@ -1472,7 +1487,9 @@ TEST_F(BPlusTreeTest, UpdateHeavyChurnWithLargeValues) {
     for (int i = 0; i < kCount; ++i) {
       std::string key = KeyGen(i, 5000);
       ASSERT_SUCCESS(bpt_->Insert(
-          txn, key, RandomString(((19937 * i) % 300) + 3000, false)));
+          txn, key,
+          RandomString(static_cast<size_t>(((19937 * i) % 300) + 3000),
+                       false)));
     }
     txn.PreCommit();
   }
@@ -1483,7 +1500,9 @@ TEST_F(BPlusTreeTest, UpdateHeavyChurnWithLargeValues) {
     for (int i = 0; i < kCount; ++i) {
       std::string key = KeyGen(i, 5000);
       ASSERT_SUCCESS(bpt_->Update(
-          txn, key, RandomString(((19937 * i) % 500) + 5000, false)));
+          txn, key,
+          RandomString(static_cast<size_t>(((19937 * i) % 500) + 5000),
+                       false)));
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     }
     txn.PreCommit();
@@ -1906,8 +1925,9 @@ TEST_F(BPlusTreeTest, RandomChurnTenThousandOpsKeepsStructure) {
   // structural invariant after every batch and the full key set after each
   // checkpoint of the churn.
   constexpr int kOps = 10000;
-  constexpr int kLive = 140;  // keeps the working set inside the page pool
-  std::mt19937 rng(20260902);
+  constexpr int kLive = 140;   // keeps the working set inside the page pool
+  std::mt19937 rng(20260902);  // NOLINT(cert-msc32-c,cert-msc51-cpp): fixed
+                               // seed keeps the churn reproducible
   std::vector<int> live;
   std::unordered_set<int> live_set;
   int next_key = 0;
@@ -1937,11 +1957,12 @@ TEST_F(BPlusTreeTest, RandomChurnTenThousandOpsKeepsStructure) {
       for (BPlusTreeIterator it = bpt_->Begin(check, "", "", true);
            it.IsValid(); ++it) {
         scanned.push_back(
-            std::atoi(it.Key().substr(it.Key().size() - 8).c_str()));
+            std::atoi(  // NOLINT(cert-err34-c): keys are generated digits
+                it.Key().substr(it.Key().size() - 8).c_str()));
       }
-      std::sort(scanned.begin(), scanned.end());
+      std::ranges::sort(scanned);
       std::vector<int> expected(live_set.begin(), live_set.end());
-      std::sort(expected.begin(), expected.end());
+      std::ranges::sort(expected);
       ASSERT_EQ(scanned, expected) << "after op " << op;
       check.PreCommit();
     }
@@ -2074,7 +2095,8 @@ TEST_F(BPlusTreeTest, DeleteAlternatingSmallKeysAcrossLeaves) {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       std::string key = "key" + std::to_string(i);
-      ASSERT_SUCCESS(bpt_->Insert(txn, key, std::string(100, '0' + (i % 10))));
+      ASSERT_SUCCESS(bpt_->Insert(
+          txn, key, std::string(100, static_cast<char>('0' + (i % 10)))));
       remaining.insert(key);
     }
     txn.PreCommit();

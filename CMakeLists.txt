@@ -293,6 +293,7 @@ tinylamb_add_layer(tinylamb_expression
         expression/window_function_expression.cpp
         expression/proto_text.cpp
         expression/rewrite.cpp
+        expression/expr_simplify_oracle.cpp
         expression/sql_udf.cpp
         expression/proto_schema.cpp
 
@@ -448,6 +449,8 @@ add_library(tinylamb_sql
         query/sql_engine.cpp
         query/join_reduction.cpp
         query/sql_oracle_fuzzer.cpp
+        query/expr_oracle_fuzzer.cpp
+        query/griffin_fuzzer.cpp
 )
 add_library(tinylamb::sql ALIAS tinylamb_sql)
 target_compile_features(tinylamb_sql PUBLIC cxx_std_20)
@@ -679,6 +682,10 @@ add_simple_test(expression/jit_test.cpp)
 add_simple_test(executor/executor_test.cpp)
 add_simple_test(executor/relational_regression_test.cpp)
 add_simple_test(executor/data_chunk_test.cpp)
+add_simple_test(executor/distinct_test.cpp)
+add_simple_test(executor/merge_append_test.cpp)
+add_simple_test(expression/function_call_test.cpp)
+add_simple_test(query/join_reduction_test.cpp)
 add_simple_test(executor/query_scheduler_test.cpp)
 add_simple_test(executor/spill_file_test.cpp)
 add_simple_test(executor/query_memory_test.cpp)
@@ -701,6 +708,9 @@ add_simple_test(query/sql_engine_tpcc_test.cpp)
 add_simple_test(query/sql_engine_tpch_test.cpp)
 add_simple_test(query/googlesql_compliance_test.cpp)
 add_simple_test(query/sql_oracle_fuzzer_test.cpp)
+add_simple_test(query/expr_oracle_fuzzer_test.cpp)
+add_simple_test(query/griffin_fuzzer_test.cpp)
+add_simple_test(expression/expr_simplify_oracle_test.cpp)
 target_sources(googlesql_compliance_test PRIVATE
         query/googlesql_compliance_file.cpp)
 target_compile_definitions(googlesql_compliance_test PRIVATE
@@ -752,6 +762,12 @@ endif()
 if(TINYLAMB_ENABLE_FUZZ)
 function(add_fuzzer_test file_path)
     set(fuzzer_option "-fsanitize=fuzzer,undefined,bounds")
+    # When the global sanitizer interface lib is active the linked static
+    # libraries are ASAN-instrumented, so the link line must load the ASAN
+    # runtime too.
+    if(TINYLAMB_ENABLE_SANITIZERS)
+        set(fuzzer_option "${fuzzer_option},address")
+    endif()
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})
@@ -780,6 +796,8 @@ add_fuzzer_test(expression/expression_fuzzer.cpp)
 add_fuzzer_test(server/postgres_protocol_fuzzer.cpp tinylamb::postgres_server)
 add_fuzzer_test(query/googlesql_ast_fuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/expr_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/griffin_fuzzer_libfuzzer.cpp tinylamb::sql)
 endif()
 
 ########################################

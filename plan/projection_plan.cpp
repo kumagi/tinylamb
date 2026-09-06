@@ -17,7 +17,8 @@
 #include "plan/projection_plan.hpp"
 
 #include <cstddef>
-#include <memory>
+#include <exception>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -32,6 +33,7 @@
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -208,7 +210,8 @@ void ProjectionPlan::Dump(std::ostream& o, int indent) const {
     }
     o << columns_[i];
   }
-  o << "} (estimated cost: " << AccessRowCount() << ")\n" << Indent(indent + 2);
+  o << "} (estimated cost: " << AccessRowCount() << ")\n"
+    << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 

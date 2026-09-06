@@ -31,7 +31,6 @@
 
 #include "common/constants.hpp"
 #include "common/debug.hpp"
-#include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "page/row_position.hpp"
 #include "transaction/transaction.hpp"
@@ -155,10 +154,10 @@ StatusOr<slot_t> RowPage::InsertRowAt(slot_t slot, std::string_view new_row) {
 
   const size_t slot_growth =
       static_cast<size_t>(prospective_row_max - row_max_) * sizeof(RowPointer);
-  free_size_ -= new_row.size() + slot_growth;
-  free_ptr_ -= new_row.size();
+  free_size_ -= static_cast<bin_size_t>(new_row.size() + slot_growth);
+  free_ptr_ -= static_cast<bin_size_t>(new_row.size());
   rows_[slot].offset = free_ptr_;
-  rows_[slot].size = new_row.size();
+  rows_[slot].size = static_cast<bin_size_t>(new_row.size());
   memcpy(Payload() + free_ptr_, new_row.data(), new_row.size());
   row_count_++;
   row_max_ = prospective_row_max;
@@ -196,8 +195,8 @@ Status RowPage::UpdateRow(slot_t slot, std::string_view record) {
   const size_t previous_size = rows_[slot].size;
   if (record.size() <= previous_size) {
     // There is already enough space, just overwrite.
-    free_size_ += previous_size - record.size();
-    rows_[slot].size = record.size();
+    free_size_ += static_cast<bin_size_t>(previous_size - record.size());
+    rows_[slot].size = static_cast<bin_size_t>(record.size());
     memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
     return Status::kSuccess;
   }
@@ -223,13 +222,13 @@ Status RowPage::UpdateRow(slot_t slot, std::string_view record) {
     }
     DeFragmentExcept(slot);
   }
-  free_ptr_ -= record.size();
+  free_ptr_ -= static_cast<bin_size_t>(record.size());
   rows_[slot].offset = free_ptr_;
   if (already_contiguous) {
-    free_size_ += previous_size;
+    free_size_ += static_cast<bin_size_t>(previous_size);
   }
-  free_size_ -= record.size();
-  rows_[slot].size = record.size();
+  free_size_ -= static_cast<bin_size_t>(record.size());
+  rows_[slot].size = static_cast<bin_size_t>(record.size());
   memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
   return Status::kSuccess;
 }
@@ -272,7 +271,7 @@ void RowPage::DeFragmentExcept(slot_t excluded_slot) {
   // FIXME: replace it with inplace one?
   std::vector<std::string> tmp_buffer;
   tmp_buffer.reserve(row_max_);
-  for (size_t i = 0; i < row_max_; ++i) {
+  for (slot_t i = 0; i < row_max_; ++i) {
     if (rows_[i].offset == 0 || i == excluded_slot) {
       tmp_buffer.emplace_back("");
     } else {
@@ -288,14 +287,14 @@ void RowPage::DeFragmentExcept(slot_t excluded_slot) {
       continue;
     }
 
-    free_ptr_ -= tmp_buffer[i].size();
+    free_ptr_ -= static_cast<bin_size_t>(tmp_buffer[i].size());
     rows_[i].offset = free_ptr_;
     memcpy(Payload() + free_ptr_, tmp_buffer[i].data(), tmp_buffer[i].size());
   }
   const auto slot_bytes = static_cast<size_t>(
       reinterpret_cast<char*>(&rows_[row_max_]) - Payload());
   assert(slot_bytes <= free_ptr_);
-  free_size_ = free_ptr_ - slot_bytes;
+  free_size_ = static_cast<bin_size_t>(free_ptr_ - slot_bytes);
 }
 
 void RowPage::DeFragment() {
@@ -306,8 +305,10 @@ void RowPage::Dump(std::ostream& o, int indent) const {
   o << "Rows: " << row_count_ << " Prev: " << prev_page_id_
     << " Next: " << next_page_id_ << " FreeSize: " << free_size_
     << " FreePtr:" << free_ptr_;
-  for (size_t i = 0; i < row_max_; ++i) {
-    o << "\n" << Indent(indent) << i << ": " << OmittedString(GetRow(i), 40);
+  for (slot_t i = 0; i < row_max_; ++i) {
+    o << "\n"
+      << Indent(static_cast<size_t>(indent)) << i << ": "
+      << OmittedString(GetRow(i), 40);
   }
 }
 

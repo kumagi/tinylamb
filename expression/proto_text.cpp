@@ -6,27 +6,36 @@
 #include "expression/proto_text.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
-#include <sstream>
+#include <exception>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "type/date.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
 
 bool IsIdentStart(char c) {
-  return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
+  return (std::isalpha(static_cast<unsigned char>(c)) != 0) || c == '_';
 }
 bool IsIdentChar(char c) {
-  return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+  return (std::isalnum(static_cast<unsigned char>(c)) != 0) || c == '_';
 }
 bool IsSpaceChar(char c) {
   return std::isspace(static_cast<unsigned char>(c)) != 0;
@@ -179,18 +188,15 @@ std::string EscapeQuoted(std::string_view raw) {
 // True when the token is a bare enum-like member (UPPER_SNAKE_CASE), which
 // proto text renders without quotes.
 bool IsEnumLikeToken(std::string_view token) {
-  if (token.empty() || !std::isupper(static_cast<unsigned char>(token[0]))) {
+  if (token.empty() ||
+      (std::isupper(static_cast<unsigned char>(token[0])) == 0)) {
     // Numeric / negative numbers and keywords like true/false stay bare too.
     return !token.empty() &&
-           (std::isdigit(static_cast<unsigned char>(token[0])) ||
+           ((std::isdigit(static_cast<unsigned char>(token[0])) != 0) ||
             token[0] == '-' || token[0] == '+');
   }
-  for (const char c : token) {
-    if (!(IsIdentChar(c))) {
-      return false;
-    }
-  }
-  return true;
+  return std::ranges::all_of(token,
+                             [](const char c) { return IsIdentChar(c); });
 }
 
 // ---- civil time helpers (timestamp <-> text) --------------------------------
@@ -211,8 +217,8 @@ int64_t CivilToNanos(const SimpleCivilTime& ct) {
                                         std::chrono::day{ct.day}};
   const int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
   const int64_t secs =
-      days * 86400LL + ct.hour * 3600LL + ct.minute * 60LL + ct.second;
-  return secs * 1000000000LL + ct.nanos;
+      (days * 86400LL) + (ct.hour * 3600LL) + (ct.minute * 60LL) + ct.second;
+  return (secs * 1000000000LL) + ct.nanos;
 }
 
 SimpleCivilTime NanosToCivil(int64_t nanos) {
@@ -221,9 +227,9 @@ SimpleCivilTime NanosToCivil(int64_t nanos) {
     return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
   };
   const int64_t secs = floor_div(nanos, 1000000000LL);
-  const int64_t sub = nanos - secs * 1000000000LL;
+  const int64_t sub = nanos - (secs * 1000000000LL);
   const int64_t days = floor_div(secs, 86400LL);
-  const int64_t day_secs = secs - days * 86400LL;
+  const int64_t day_secs = secs - (days * 86400LL);
   const std::chrono::sys_days sd{std::chrono::days{days}};
   const std::chrono::year_month_day ymd{sd};
   SimpleCivilTime ct;
@@ -242,6 +248,7 @@ SimpleCivilTime NanosToCivil(int64_t nanos) {
 std::optional<int64_t> ParseTimestampText(std::string_view s) {
   SimpleCivilTime ct;
   int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
+  // NOLINTNEXTLINE(cert-err34-c)
   if (std::sscanf(std::string(s.substr(0, 10)).c_str(), "%d-%d-%d", &Y, &M,
                   &D) != 3) {
     return std::nullopt;
@@ -254,6 +261,7 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
     ++pos;
   }
   if (pos < s.size()) {
+    // NOLINTNEXTLINE(cert-err34-c)
     if (std::sscanf(std::string(s.substr(pos)).c_str(), "%d:%d:%d", &h, &m,
                     &sec) >= 2) {
       ct.hour = h;
@@ -266,7 +274,7 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
       if (pos < s.size() && s[pos] == '.') {
         const size_t begin = ++pos;
         while (pos < s.size() &&
-               std::isdigit(static_cast<unsigned char>(s[pos]))) {
+               (std::isdigit(static_cast<unsigned char>(s[pos])) != 0)) {
           ++pos;
         }
         std::string frac(s.substr(begin, pos - begin));
@@ -281,11 +289,12 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
       if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) {
         const char sign = s[pos];
         int th = 0, tm = 0;
+        // NOLINTNEXTLINE(cert-err34-c)
         if (std::sscanf(std::string(s.substr(pos + 1)).c_str(), "%d:%d", &th,
                         &tm) >= 1) {
-          const int offset = th * 3600 + tm * 60;
-          return CivilToNanos(ct) - static_cast<int64_t>(offset) *
-                                        1000000000LL * (sign == '-' ? -1 : 1);
+          const int offset = (th * 3600) + (tm * 60);
+          return CivilToNanos(ct) - (static_cast<int64_t>(offset) *
+                                     1000000000LL * (sign == '-' ? -1 : 1));
         }
       }
     }
@@ -297,18 +306,24 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
 // number of fractional digits to print (0 = whole seconds).
 std::string FormatTimestampNanos(int64_t nanos, int precision) {
   const SimpleCivilTime ct = NanosToCivil(nanos);
-  char buf[80];
+  std::array<char, 80> buf{};
   if (precision <= 0 || ct.nanos == 0) {
-    snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02d:%02d:%02d+00", ct.year,
-             ct.month, ct.day, ct.hour, ct.minute, ct.second);
+    // Formatting into fixed buffers cannot fail.
+    // NOLINTNEXTLINE(cert-err33-c)
+    snprintf(buf.data(), buf.size(), "%04d-%02u-%02u %02d:%02d:%02d+00",
+             ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second);
   } else {
-    char frac[16];
-    snprintf(frac, sizeof(frac), "%09lld", static_cast<long long>(ct.nanos));
-    frac[precision] = '\0';
-    snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02d:%02d:%02d.%s+00", ct.year,
-             ct.month, ct.day, ct.hour, ct.minute, ct.second, frac);
+    std::array<char, 16> frac{};
+    // NOLINTNEXTLINE(cert-err33-c)
+    snprintf(frac.data(), frac.size(), "%09lld",
+             static_cast<long long>(ct.nanos));
+    frac[static_cast<size_t>(precision)] = '\0';
+    // NOLINTNEXTLINE(cert-err33-c)
+    snprintf(buf.data(), buf.size(), "%04d-%02u-%02u %02d:%02d:%02d.%s+00",
+             ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second,
+             frac.data());
   }
-  return buf;
+  return std::string{buf.data()};
 }
 
 // ---- field FORMAT classification -------------------------------------------
@@ -328,7 +343,7 @@ enum class FieldFormat : uint8_t {
 
 FieldFormat ClassifyFieldFormat(std::string_view field) {
   std::string name = ToLowerCopy(field);
-  if (name.rfind("has_", 0) == 0) {
+  if (name.starts_with("has_")) {
     return FieldFormat::kNone;
   }
   // Strip trailing "_format" / width / default markers ("micros_u64",
@@ -391,7 +406,7 @@ Value ApplyReadConversion(FieldFormat format, Value v) {
       const int64_t dec = v.value.int_value;
       if (dec <= 0) {
         // Decimal-encoded 0 reads as NULL (unset DATE).
-        return Value();
+        return {};
       }
       if (dec < 9999999) {
         return v;
@@ -439,10 +454,14 @@ std::optional<Value> ApplyWriteConversion(FieldFormat format, const Value& v) {
         return std::nullopt;
       }
       const std::string text = FormatDateDays(v.DateDays());
-      const int yr = std::atoi(text.substr(0, 4).c_str());
-      const int mon = std::atoi(text.substr(5, 2).c_str());
-      const int day = std::atoi(text.substr(8, 2).c_str());
-      return Value(int64_t{yr} * 10000 + int64_t{mon} * 100 + day);
+      // The text is produced by FormatDateDays and is always a valid date.
+      const int yr =
+          std::atoi(text.substr(0, 4).c_str());  // NOLINT(cert-err34-c)
+      const int mon =
+          std::atoi(text.substr(5, 2).c_str());  // NOLINT(cert-err34-c)
+      const int day =
+          std::atoi(text.substr(8, 2).c_str());  // NOLINT(cert-err34-c)
+      return Value((int64_t{yr} * 10000) + (int64_t{mon} * 100) + day);
     }
     case FieldFormat::kTsSeconds:
     case FieldFormat::kTsMillis:
@@ -477,39 +496,41 @@ struct DefaultValueEntry {
   const char* name;
   const char* text;  // rendered token (DATE or timestamp text)
 };
-constexpr DefaultValueEntry kFieldDefaults[] = {
-    {"date_default", "2015-03-12"},
-    {"s_date_default", "2015-03-14"},
-    {"f_date_default", "2015-03-16"},
-    {"date_64_default", "2015-03-13"},
-    {"s_date_64_default", "2015-03-15"},
-    {"f_date_64_default", "2015-03-17"},
-    {"date_decimal_default", "2015-03-12"},
-    {"s_date_decimal_default", "2015-03-14"},
-    {"f_date_decimal_default", "2015-03-16"},
-    {"date_decimal_64_default", "2015-03-13"},
-    {"s_date_decimal_64_default", "2015-03-15"},
-    {"f_date_decimal_64_default", "2015-03-17"},
-    {"seconds_default", "2015-03-12 17:49:47+00"},
-    {"s_seconds_default", "2015-03-13 17:49:47+00"},
-    {"f_seconds_default", "2015-03-14 17:49:47+00"},
-    {"millis_default", "2015-03-12 17:49:47.555+00"},
-    {"s_millis_default", "2015-03-13 17:49:47.555+00"},
-    {"f_millis_default", "2015-03-14 17:49:47.555+00"},
-    {"micros_default", "2015-03-12 17:49:47.555666+00"},
-    {"s_micros_default", "2015-03-13 17:49:47.555666+00"},
-    {"f_micros_default", "2015-03-14 17:49:47.555666+00"},
-    {"seconds_default_format", "2015-03-12 17:49:47+00"},
-    {"s_seconds_default_format", "2015-03-13 17:49:47+00"},
-    {"f_seconds_default_format", "2015-03-14 17:49:47+00"},
-    {"millis_default_format", "2015-03-12 17:49:47.555+00"},
-    {"s_millis_default_format", "2015-03-13 17:49:47.555+00"},
-    {"f_millis_default_format", "2015-03-14 17:49:47.555+00"},
-    {"micros_default_format", "2015-03-12 17:49:47.555666+00"},
-    {"s_micros_default_format", "2015-03-13 17:49:47.555666+00"},
-    {"f_micros_default_format", "2015-03-14 17:49:47.555666+00"},
-    {"micros_u64_default", "2015-03-12 17:49:47.555777+00"},
-};
+constexpr std::array<DefaultValueEntry, 31> kFieldDefaults = {{
+    {.name = "date_default", .text = "2015-03-12"},
+    {.name = "s_date_default", .text = "2015-03-14"},
+    {.name = "f_date_default", .text = "2015-03-16"},
+    {.name = "date_64_default", .text = "2015-03-13"},
+    {.name = "s_date_64_default", .text = "2015-03-15"},
+    {.name = "f_date_64_default", .text = "2015-03-17"},
+    {.name = "date_decimal_default", .text = "2015-03-12"},
+    {.name = "s_date_decimal_default", .text = "2015-03-14"},
+    {.name = "f_date_decimal_default", .text = "2015-03-16"},
+    {.name = "date_decimal_64_default", .text = "2015-03-13"},
+    {.name = "s_date_decimal_64_default", .text = "2015-03-15"},
+    {.name = "f_date_decimal_64_default", .text = "2015-03-17"},
+    {.name = "seconds_default", .text = "2015-03-12 17:49:47+00"},
+    {.name = "s_seconds_default", .text = "2015-03-13 17:49:47+00"},
+    {.name = "f_seconds_default", .text = "2015-03-14 17:49:47+00"},
+    {.name = "millis_default", .text = "2015-03-12 17:49:47.555+00"},
+    {.name = "s_millis_default", .text = "2015-03-13 17:49:47.555+00"},
+    {.name = "f_millis_default", .text = "2015-03-14 17:49:47.555+00"},
+    {.name = "micros_default", .text = "2015-03-12 17:49:47.555666+00"},
+    {.name = "s_micros_default", .text = "2015-03-13 17:49:47.555666+00"},
+    {.name = "f_micros_default", .text = "2015-03-14 17:49:47.555666+00"},
+    {.name = "seconds_default_format", .text = "2015-03-12 17:49:47+00"},
+    {.name = "s_seconds_default_format", .text = "2015-03-13 17:49:47+00"},
+    {.name = "f_seconds_default_format", .text = "2015-03-14 17:49:47+00"},
+    {.name = "millis_default_format", .text = "2015-03-12 17:49:47.555+00"},
+    {.name = "s_millis_default_format", .text = "2015-03-13 17:49:47.555+00"},
+    {.name = "f_millis_default_format", .text = "2015-03-14 17:49:47.555+00"},
+    {.name = "micros_default_format", .text = "2015-03-12 17:49:47.555666+00"},
+    {.name = "s_micros_default_format",
+     .text = "2015-03-13 17:49:47.555666+00"},
+    {.name = "f_micros_default_format",
+     .text = "2015-03-14 17:49:47.555666+00"},
+    {.name = "micros_u64_default", .text = "2015-03-12 17:49:47.555777+00"},
+}};
 
 // Annotated int32 DATE_DECIMAL fields read as NULL when unset (and when
 // stored as 0); plain day-count DATE fields read as their epoch default.
@@ -618,7 +639,7 @@ bool ParseProtoTextEntries(std::string_view body,
       entry.name = "[" + std::string(body.substr(i + 1, close - i - 1)) + "]";
       i = close + 1;
     } else if (IsIdentStart(body[i]) ||
-               std::isdigit(static_cast<unsigned char>(body[i]))) {
+               (std::isdigit(static_cast<unsigned char>(body[i])) != 0)) {
       // Numeric names hold unknown-field reservations ("2: 7") that proto2
       // parsing keeps alongside the decoded entries.
       const size_t start = i;
@@ -678,7 +699,6 @@ bool ParseProtoTextEntries(std::string_view body,
         entry.text = std::string(body.substr(start, i - start));
       }
       entries->push_back(std::move(entry));
-      consumed_tail = i;
       continue;
     }
     if (i < body.size() && (body[i] == '{' || body[i] == '<')) {
@@ -709,13 +729,12 @@ bool ParseProtoTextEntries(std::string_view body,
       entry.text = std::string(body.substr(start, i - start));
       ++i;
       entries->push_back(std::move(entry));
-      consumed_tail = i;
       continue;
     }
     // Neither ':' nor '{' after the name: not proto text.
     return false;
   }
-  return entries->size() > 0 || consumed_tail >= body.size();
+  return !entries->empty() || consumed_tail >= body.size();
 }
 
 bool LooksLikeProtoText(std::string_view text) {
@@ -817,6 +836,8 @@ std::string FormatProtoTextScalar(std::string_view raw_token) {
   return "\"" + EscapeQuoted(token) + "\"";
 }
 
+namespace {
+
 // Decodes a stored TEXT token into a scalar Value: quoted strings lose their
 // quotes (escapes resolved), booleans become 0/1, numbers parse, everything
 // else (enum members) stays a bare string.
@@ -839,7 +860,7 @@ Value DecodeScalarToken(std::string_view raw_token) {
     return Value(int64_t{0});
   }
   if (token == "null") {
-    return Value();
+    return {};
   }
   try {
     size_t idx = 0;
@@ -887,7 +908,7 @@ bool IsKnownMessageField(std::string_view lower_name) {
           "string_int32_map",
           "value",  // extension wrapper message (KitchenSinkExtension.value)
       });
-  return kFields->find(std::string(lower_name)) != kFields->end();
+  return kFields->contains(std::string(lower_name));
 }
 
 // Absent enum-typed fields read as their type's first member.  The member
@@ -902,7 +923,8 @@ std::optional<std::string> AbsentEnumDefault(
       continue;
     }
     const std::string_view token = entry.text;
-    if (token.empty() || !std::isupper(static_cast<unsigned char>(token[0]))) {
+    if (token.empty() ||
+        (std::isupper(static_cast<unsigned char>(token[0])) == 0)) {
       continue;
     }
     bool member_shaped = true;
@@ -916,8 +938,9 @@ std::optional<std::string> AbsentEnumDefault(
       continue;
     }
     size_t digits = 0;
-    while (digits < token.size() && std::isdigit(static_cast<unsigned char>(
-                                        token[token.size() - 1 - digits]))) {
+    while (digits < token.size() &&
+           (std::isdigit(static_cast<unsigned char>(
+                token[token.size() - 1 - digits])) != 0)) {
       ++digits;
     }
     if (digits == 0 || digits >= token.size()) {
@@ -1017,6 +1040,8 @@ Value NormalizeEnumToken(const std::vector<std::string>& members,
   return Value(std::string(members[static_cast<size_t>(ord)]));
 }
 
+}  // namespace
+
 bool ProtoTextExtractField(std::string_view text, std::string_view key,
                            Value* out) {
   std::string_view body = text;
@@ -1043,7 +1068,7 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
       throw std::runtime_error("Field " + bare + " is repeated, so has_" +
                                bare + " is not allowed");
     }
-    *out = Value(int64_t{ProtoTextHasField(text, bare) ? int64_t{1} : 0});
+    *out = Value((ProtoTextHasField(text, bare) ? int64_t{1} : 0));
     return true;
   }
   // Bracketed extension keys ([pkg.Ext.field]) resolve directly.
@@ -1069,9 +1094,9 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
       continue;
     }
     if (entry.is_message) {
-      messages.push_back(Value("{ " + entry.text + " }"));
+      messages.emplace_back("{ " + entry.text + " }");
     } else {
-      scalars.push_back(Value(std::string(entry.text)));
+      scalars.emplace_back(std::string(entry.text));
     }
   }
   if (messages.empty() && scalars.empty()) {
@@ -1260,19 +1285,16 @@ bool ProtoTextHasField(std::string_view text, std::string_view key) {
   if (!ParseProtoTextEntries(body, &entries)) {
     return false;
   }
-  for (const ProtoTextEntry& entry : entries) {
-    if (NameEquals(entry.name, key)) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(entries, [&key](const ProtoTextEntry& entry) {
+    return NameEquals(entry.name, key);
+  });
 }
 
 namespace {
 
 // Rewrites the entries of one message body in place per the final path
 // segment semantics; helper for ProtoTextSetField.
-std::optional<std::string> SetFieldInBody(const std::string_view body,
+std::optional<std::string> SetFieldInBody(std::string_view body,
                                           const std::vector<std::string>& path,
                                           size_t depth, const Value& new_value,
                                           const std::string& type_name);
@@ -1389,13 +1411,11 @@ std::optional<std::string> SetFieldInBody(const std::string_view body,
   }
 
   // Intermediate segment: descend into matching message entries.
-  bool found_any = false;
   std::vector<ProtoTextEntry> rewritten = entries;
   for (ProtoTextEntry& entry : rewritten) {
     if (!NameEquals(entry.name, target) || !entry.is_message) {
       continue;
     }
-    found_any = true;
     auto nested =
         SetFieldInBody(entry.text, path, depth + 1, new_value, type_name);
     if (nested.has_value()) {
@@ -1411,10 +1431,6 @@ std::optional<std::string> SetFieldInBody(const std::string_view body,
         return out;
       }();
     }
-    found_any = false;  // keep searching later entries
-  }
-  if (found_any) {
-    return std::nullopt;
   }
   // GoogleSQL refuses to assign through a missing intermediate submessage
   // (it reads as NULL); creating it implicitly is not allowed.
@@ -1639,32 +1655,33 @@ WireFieldMaps() {
           // are dropped from their field and preserved as "<number>: <value>"
           // raw entries (proto2 semantics).
           {"googlesql_test.kitchensinkenumpb",
-           {{1, {"required_test_enum", false}},
-            {2, {"test_enum", false}},
-            {3, {"repeated_test_enum", true}}}},
+           {{1, {.name = "required_test_enum", .repeated = false}},
+            {2, {.name = "test_enum", .repeated = false}},
+            {3, {.name = "repeated_test_enum", .repeated = true}}}},
           // Only the Proto3KitchenSink bytes round trip appears in tests:
           // test_enum surfaces as field 50.  proto3 keeps unknown members.
-          {"googlesql_test.proto3kitchensink", {{50, {"test_enum", false}}}},
+          {"googlesql_test.proto3kitchensink",
+           {{50, {.name = "test_enum", .repeated = false}}}},
           // KitchenSinkPB's double_val is a protobuf fixed64 field.  Keeping
           // this small wire map lets CAST(bytes AS KitchenSinkPB).double_val
           // participate in NaN/INF comparisons instead of becoming NULL.
           {"googlesql_test.kitchensinkpb",
-           {{1, {"int64_key_1", false}},
-            {2, {"int64_key_2", false}},
-            {9, {"double_val", false}},
-            {22, {"nested_value", false}},
-            {27, {"OptionalGroup", false}}}},
+           {{1, {.name = "int64_key_1", .repeated = false}},
+            {2, {.name = "int64_key_2", .repeated = false}},
+            {9, {.name = "double_val", .repeated = false}},
+            {22, {.name = "nested_value", .repeated = false}},
+            {27, {.name = "OptionalGroup", .repeated = false}}}},
           {"googlesql_test.kitchensinkpb.nested",
-           {{1, {"nested_int64", false}},
-            {2, {"nested_repeated_int64", true}}}},
+           {{1, {.name = "nested_int64", .repeated = false}},
+            {2, {.name = "nested_repeated_int64", .repeated = true}}}},
           {"googlesql_test.kitchensinkpb.optionalgroup",
-           {{1, {"int64_val", false}},
-            {2, {"string_val", false}},
-            {3, {"OptionalGroupNested", true}}}},
+           {{1, {.name = "int64_val", .repeated = false}},
+            {2, {.name = "string_val", .repeated = false}},
+            {3, {.name = "OptionalGroupNested", .repeated = true}}}},
           {"googlesql_test.kitchensinkpb.optionalgroup.optionalgroupnested",
-           {{1, {"int64_val", false}}}},
+           {{1, {.name = "int64_val", .repeated = false}}}},
           {"googlesql_test.packedrepeatablepb",
-           {{7, {"repeated_bool_packed", true}}}},
+           {{7, {.name = "repeated_bool_packed", .repeated = true}}}},
       });
   return *kMap;
 }
@@ -1673,7 +1690,7 @@ bool ReadBase128(std::string_view bytes, size_t* i, uint64_t* out) {
   uint64_t result = 0;
   int shift = 0;
   while (*i < bytes.size()) {
-    const uint8_t byte = static_cast<uint8_t>(bytes[*i]);
+    const auto byte = static_cast<uint8_t>(bytes[*i]);
     ++*i;
     result |= static_cast<uint64_t>(byte & 0x7f) << shift;
     if ((byte & 0x80) == 0) {
@@ -1932,7 +1949,7 @@ bool IsKnownEnumTypeName(const std::string& type_name) {
           "googlesql_test.testproto3enum",
           "googlesql_test.enumannotations.nestedenum",
       });
-  return kEnums->find(ToLowerCopy(type_name)) != kEnums->end();
+  return kEnums->contains(ToLowerCopy(type_name));
 }
 
 std::string AppendProtoTypeMarker(const std::string& payload,
@@ -1953,7 +1970,7 @@ std::string ExtractProtoTypeMarker(std::string_view text) {
           text.substr(begin, end == std::string_view::npos ? end : end - begin);
       std::string trimmed = ToLowerCopy(name);
       while (!trimmed.empty() &&
-             std::isspace(static_cast<unsigned char>(trimmed.back()))) {
+             (std::isspace(static_cast<unsigned char>(trimmed.back())) != 0)) {
         trimmed.pop_back();
       }
       return trimmed;
@@ -2037,7 +2054,7 @@ std::string InferProtoTypeName(std::string_view payload,
   for (const KnownProtoType& type : KnownProtoTypes()) {
     size_t score = 0;
     for (const char* field : type.signature) {
-      if (present.count(field) != 0) {
+      if (present.contains(field)) {
         ++score;
       }
     }

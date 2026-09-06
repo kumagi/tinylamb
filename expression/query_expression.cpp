@@ -3,15 +3,19 @@
 
 #include <ostream>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/evaluation_context.hpp"
 #include "expression/expression.hpp"
 #include "type/column_name.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -134,7 +138,7 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
         found = true;
       }
     }
-    const Value membership =
+    Value membership =
         found ? Value(true) : (saw_null ? Value() : Value(false));
     if (!negated_) {
       return membership;

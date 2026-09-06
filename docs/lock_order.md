@@ -7,7 +7,8 @@ waiting on an outer one.
 1. Database / catalog latch (schema changes)
 2. PagePool shard latch → per-page latch
 3. B+ tree page latches (root → leaf, consistent with tree descent)
-4. LockManager row/table locks (txn order: lower table id first on multi-table)
+4. LockManager row locks (auxiliary, test-facing; primary conflict control is
+   MVCC write-intent via `TransactionManager::AcquireWriteIntent`)
 5. LSM memtable / run mutex (single writer per tree)
 6. Logger enqueue latch → Logger work mutex (D1, see below)
 7. MVCC version shard mutex → transaction table lock (Wound-Wait preemption
@@ -30,8 +31,9 @@ waiting on an outer one.
   record's byte stream is never fragmented by another producer.
 - **No lock while blocking on I/O**: release page latches before `pread`/`pwrite`
   miss paths where possible (PagePool miss path loads outside shard lock).
-- **LockManager timeout**: waits use `kLockWaitTimeoutMs`; failure returns
-  `Status::kTimeout` (see `docs/lock_timeout.md`).
+- **LockManager timeout**: waits use `ExclusiveWaitTimeout()` (5 s, extended
+  toward the 60 s durability floor during WAL stalls); on expiry the wait
+  gives up and the acquire returns `false` (see `docs/lock_timeout.md`).
 
 ## Known TSAN static lock-order reports (not deadlocks)
 
@@ -39,7 +41,7 @@ waiting on an outer one.
 "lock-order-inversion" cycles that pair the PagePool **pool latch (M0)** with a
 **per-page latch (M1)**:
 
-1. `MetaPage::AllocateNewPage` (`meta_page.cpp:42`) is invoked by
+1. `MetaPage::AllocateNewPage` (`meta_page.cpp:34`) is invoked by
    `PageManager::AllocateNewPage` while the CALLER holds the **meta page's own
    per-page latch (M1)**; inside, `pool.GetPage(new_page_id)` installs a fresh
    entry under the **pool latch (M0)** and constructs the new `PageRef`, whose

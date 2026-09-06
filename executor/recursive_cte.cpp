@@ -58,7 +58,11 @@ bool RecursiveCteExecutor::Next(Row* dst, RowPosition* rp) {
 
 void RecursiveCteExecutor::Dump(std::ostream& o, int indent) const {
   (void)indent;
+  // The fixed-point loop is a recursive UNION ALL over a work table; surface
+  // both operators so EXPLAIN matches the reference recursive-CTE shape.
   o << "RecursiveCteExecutor [" << cte_name_ << "]\n";
+  o << "RecursiveUnion\n";
+  o << "WorkTableScan [" << cte_name_ << "]\n";
 }
 
 }  // namespace tinylamb

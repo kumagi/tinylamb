@@ -2,19 +2,21 @@
 #include "plan/cascades.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
-#include <ranges>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
-#include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
@@ -23,7 +25,10 @@
 #include "plan/set_operation_plan.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
+#include "type/constraint.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb::cascades {
 
@@ -235,7 +240,9 @@ TEST(CascadesTest, DummyScanAndValuesHavePhysicalImplementationRules) {
   const auto dummy_plan = dummy_search.Optimize(
       dummy, PhysicalProperties{}, tinylamb::DefaultImplementationRules());
   ASSERT_TRUE(dummy_plan.has_value());
-  if (!dummy_plan) return;
+  if (!dummy_plan) {
+    return;
+  }
   EXPECT_NE(dummy_plan->plan->ToString().find("DummyScan"), std::string::npos);
 
   Memo values_memo;
@@ -250,7 +257,9 @@ TEST(CascadesTest, DummyScanAndValuesHavePhysicalImplementationRules) {
   const auto values_plan = values_search.Optimize(
       values, PhysicalProperties{}, tinylamb::DefaultImplementationRules());
   ASSERT_TRUE(values_plan.has_value());
-  if (!values_plan) return;
+  if (!values_plan) {
+    return;
+  }
   EXPECT_NE(values_plan->plan->ToString().find("Values"), std::string::npos);
 }
 
@@ -820,7 +829,9 @@ TEST(CascadesTest, UnionAllCanChooseMergeAppendForRequiredOrdering) {
   const std::optional<BestPlan> best =
       search.Optimize(root, required, tinylamb::DefaultImplementationRules());
   ASSERT_TRUE(best.has_value());
-  if (!best) return;
+  if (!best) {
+    return;
+  }
   const auto merged = std::dynamic_pointer_cast<SetOperationPlan>(best->plan);
   ASSERT_TRUE(merged);
   EXPECT_EQ(merged->ToString(), "MergeAppend");
@@ -830,6 +841,10 @@ TEST(CascadesTest, UnionAllCanChooseMergeAppendForRequiredOrdering) {
 TEST(CascadesTest, SelectionIsPushedIntoEverySetOperationBranch) {
   Memo memo;
   (void)memo.Build({"a", "b"});
+  // An unqualified predicate column must resolve in EVERY branch before the
+  // push; publish the branch schemas proving `v` exists in both.
+  memo.SetTableSchemas({{"a", Schema("a", {Column("v", ValueType::kInt64)})},
+                        {"b", Schema("b", {Column("v", ValueType::kInt64)})}});
   const GroupId left = memo.EnsureGroup({"a"});
   const GroupId right = memo.EnsureGroup({"b"});
   const GroupId setop = memo.EnsureDerivedGroup({"a", "b"}, "union");
@@ -1711,6 +1726,11 @@ TEST(CascadesTest, DistinctAndGroupByInterchangeBothDirections) {
 TEST(CascadesTest, SelfJoinEliminationReplacesJoinWithSingleScan) {
   Memo memo;
   (void)memo.Build({"t1_1", "t1_2"});
+  // Join elimination is only sound on a proven key: publish the table
+  // schemas with a PRIMARY KEY id column.
+  const Schema keyed("t1", {Column("id", ValueType::kInt64,
+                                   Constraint(Constraint::kPrimaryKey))});
+  memo.SetTableSchemas({{"t1_1", keyed}, {"t1_2", keyed}});
   const GroupId left_group = memo.EnsureDerivedGroup({"t1_1"}, "left_scan");
   memo.AddExpression(
       left_group,
@@ -1746,9 +1766,51 @@ TEST(CascadesTest, SelfJoinEliminationReplacesJoinWithSingleScan) {
   EXPECT_TRUE(found_scan);
 }
 
+TEST(CascadesTest, SelfJoinEliminationRequiresProvenUniqueKey) {
+  // Without a UNIQUE/PRIMARY KEY constraint the join can multiply rows;
+  // eliminating it would change results, so the rule must refuse.
+  Memo memo;
+  (void)memo.Build({"t1_1", "t1_2"});
+  const Schema unkeyed("t1", {Column("id", ValueType::kInt64)});
+  memo.SetTableSchemas({{"t1_1", unkeyed}, {"t1_2", unkeyed}});
+  const GroupId left_group = memo.EnsureDerivedGroup({"t1_1"}, "left_scan");
+  memo.AddExpression(
+      left_group,
+      LogicalExpression{.operation = LogicalOperator::kScan, .table = "t1"});
+
+  const GroupId right_group = memo.EnsureDerivedGroup({"t1_2"}, "right_scan");
+  memo.AddExpression(
+      right_group,
+      LogicalExpression{.operation = LogicalOperator::kScan, .table = "t1"});
+
+  const GroupId join_group =
+      memo.EnsureDerivedGroup({"t1_1", "t1_2"}, "self_join");
+  memo.AddExpression(
+      join_group,
+      LogicalExpression{.operation = LogicalOperator::kJoin,
+                        .children = {left_group, right_group},
+                        .predicate = BinaryExpressionExp(
+                            ColumnValueExp(ColumnName("t1_1", "id")),
+                            BinaryOperation::kEquals,
+                            ColumnValueExp(ColumnName("t1_2", "id")))});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(join_group);
+
+  const auto& exprs = search.GetMemo().Get(join_group).expressions;
+  const bool found_scan = std::ranges::any_of(exprs, [](const auto& expr) {
+    return expr.operation == LogicalOperator::kScan && expr.table == "t1";
+  });
+  EXPECT_FALSE(found_scan)
+      << "self_join_elimination fired without a proven unique key";
+}
+
 TEST(CascadesTest, UniqueSemiToInnerRewrite) {
   Memo memo;
   (void)memo.Build({"t1", "t2"});
+  memo.SetTableSchemas(
+      {{"t2", Schema("t2", {Column("id", ValueType::kInt64,
+                                   Constraint(Constraint::kPrimaryKey))})}});
   const GroupId left = memo.EnsureGroup({"t1"});
   const GroupId right = memo.EnsureGroup({"t2"});
   const GroupId semi_group =
@@ -1780,6 +1842,11 @@ TEST(CascadesTest, UniqueSemiToInnerRewrite) {
 TEST(CascadesTest, OuterToAntiJoinRewrite) {
   Memo memo;
   (void)memo.Build({"t1", "t2"});
+  // The rewrite is only sound when the null-tested column cannot be NULL in
+  // a matched row: publish t2.id as a PRIMARY KEY (implies NOT NULL).
+  memo.SetTableSchemas(
+      {{"t2", Schema("t2", {Column("id", ValueType::kInt64,
+                                   Constraint(Constraint::kPrimaryKey))})}});
   const GroupId left = memo.EnsureGroup({"t1"});
   const GroupId right = memo.EnsureGroup({"t2"});
   const GroupId outer_join_group =
@@ -1817,6 +1884,98 @@ TEST(CascadesTest, OuterToAntiJoinRewrite) {
     }
   }
   EXPECT_TRUE(found_anti);
+}
+
+TEST(CascadesTest, OuterToAntiJoinRefusesNullableNullTestedColumn) {
+  // A matched row whose t2.id is genuinely NULL satisfies `t2.id IS NULL`
+  // but would be dropped by the AntiJoin; without a NOT NULL/PK constraint
+  // the rewrite must refuse.
+  Memo memo;
+  (void)memo.Build({"t1", "t2"});
+  memo.SetTableSchemas(
+      {{"t2", Schema("t2", {Column("id", ValueType::kInt64)})}});
+  const GroupId left = memo.EnsureGroup({"t1"});
+  const GroupId right = memo.EnsureGroup({"t2"});
+  const GroupId outer_join_group =
+      memo.EnsureDerivedGroup({"t1", "t2"}, "outer_join");
+  memo.AddExpression(
+      outer_join_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kOuterJoin,
+          .children = {left, right},
+          .predicate = BinaryExpressionExp(
+              ColumnValueExp(ColumnName("t1", "id")), BinaryOperation::kEquals,
+              ColumnValueExp(ColumnName("t2", "id"))),
+          .join_type = 0});
+
+  const GroupId sel_group =
+      memo.EnsureDerivedGroup({"t1", "t2"}, "null_filter");
+  memo.AddExpression(
+      sel_group, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                   .children = {outer_join_group},
+                                   .predicate = UnaryExpressionExp(
+                                       ColumnValueExp(ColumnName("t2", "id")),
+                                       UnaryOperation::kIsNull)});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(sel_group);
+
+  const auto& exprs = search.GetMemo().Get(sel_group).expressions;
+  const bool found_anti2 =
+      std::ranges::any_of(exprs, [](const LogicalExpression& expr) {
+        return expr.operation == LogicalOperator::kAntiJoin;
+      });
+  EXPECT_FALSE(found_anti2)
+      << "outer_to_anti_join fired on a nullable null-tested column";
+}
+
+TEST(CascadesTest, OuterToAntiJoinRefusesLeftResidualConjunct) {
+  // `WHERE t2.id IS NULL AND t1.x = 5`: the AntiJoin alternative keeps only
+  // the join condition; converting would drop `t1.x = 5` and return rows
+  // that violate it.
+  Memo memo;
+  (void)memo.Build({"t1", "t2"});
+  memo.SetTableSchemas(
+      {{"t2", Schema("t2", {Column("id", ValueType::kInt64,
+                                   Constraint(Constraint::kPrimaryKey))})}});
+  const GroupId left = memo.EnsureGroup({"t1"});
+  const GroupId right = memo.EnsureGroup({"t2"});
+  const GroupId outer_join_group =
+      memo.EnsureDerivedGroup({"t1", "t2"}, "outer_join");
+  memo.AddExpression(
+      outer_join_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kOuterJoin,
+          .children = {left, right},
+          .predicate = BinaryExpressionExp(
+              ColumnValueExp(ColumnName("t1", "id")), BinaryOperation::kEquals,
+              ColumnValueExp(ColumnName("t2", "id"))),
+          .join_type = 0});
+
+  Expression residual = BinaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp(ColumnName("t2", "id")),
+                         UnaryOperation::kIsNull),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("t1", "x")),
+                          BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{5}))));
+  const GroupId sel_group =
+      memo.EnsureDerivedGroup({"t1", "t2"}, "null_filter");
+  memo.AddExpression(sel_group,
+                     LogicalExpression{.operation = LogicalOperator::kSelection,
+                                       .children = {outer_join_group},
+                                       .predicate = residual});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(sel_group);
+
+  const auto& exprs = search.GetMemo().Get(sel_group).expressions;
+  const bool found_anti3 =
+      std::ranges::any_of(exprs, [](const LogicalExpression& expr) {
+        return expr.operation == LogicalOperator::kAntiJoin;
+      });
+  EXPECT_FALSE(found_anti3)
+      << "outer_to_anti_join dropped a left-side residual conjunct";
 }
 
 TEST(CascadesTest, RightToLeftOuterJoinRewrite) {
@@ -2113,7 +2272,9 @@ TEST(CascadesTest, EagerAggregationOverJoin) {
           break;
         }
       }
-      if (found_join_with_eager_agg) break;
+      if (found_join_with_eager_agg) {
+        break;
+      }
     }
   }
   // D5 (docs/design.md): eager_aggregation_over_join is gated OFF.  Without
@@ -2244,10 +2405,14 @@ TEST(CascadesTest, PushProjectionBelowJoinWidthControl) {
               break;
             }
           }
-          if (found_width_control) break;
+          if (found_width_control) {
+            break;
+          }
         }
       }
-      if (found_width_control) break;
+      if (found_width_control) {
+        break;
+      }
     }
   }
   EXPECT_TRUE(found_width_control);
@@ -3003,7 +3168,7 @@ TEST(CascadesTest, FilterAggregatePushdown) {
         if (target.expression &&
             target.expression->Type() == TypeTag::kAggregateExp) {
           const auto& agg =
-              static_cast<const AggregateExpression&>(*target.expression);
+              dynamic_cast<const AggregateExpression&>(*target.expression);
           if (agg.WhereFilter() && agg.WhereFilter() == filter_pred) {
             found_where_filter = true;
             break;
@@ -3912,20 +4077,22 @@ TEST(CascadesTest, PushDownLimitThroughJoinSkipsNonUniqueJoin) {
 
   // The rule should NOT have pushed LIMIT into the join's left side.
   // Verify no Limit-over-Scan pattern exists inside the join.
-  const bool limit_pushed =
-      std::ranges::any_of(search.GetMemo().Get(limit_group).expressions,
-                          [&](const LogicalExpression& expr) {
-                            if (expr.operation != LogicalOperator::kJoin)
-                              return false;
-                            for (GroupId child : expr.children) {
-                              for (const LogicalExpression& cexpr :
-                                   search.GetMemo().Get(child).expressions) {
-                                if (cexpr.operation == LogicalOperator::kLimit)
-                                  return true;
-                              }
-                            }
-                            return false;
-                          });
+  const bool limit_pushed = std::ranges::any_of(
+      search.GetMemo().Get(limit_group).expressions,
+      [&](const LogicalExpression& expr) {
+        if (expr.operation != LogicalOperator::kJoin) {
+          return false;
+        }
+        for (GroupId child : expr.children) {
+          for (const LogicalExpression& cexpr :
+               search.GetMemo().Get(child).expressions) {
+            if (cexpr.operation == LogicalOperator::kLimit) {
+              return true;
+            }
+          }
+        }
+        return false;
+      });
   EXPECT_FALSE(limit_pushed)
       << "push_down_limit_through_join incorrectly pushed LIMIT into "
          "a non-unique join side";
@@ -4169,6 +4336,41 @@ TEST(CascadesTest, RankRowNumberToTopNSkipsNonWindowColumn) {
          "column into TopN";
 }
 
+TEST(CascadesTest, RankRowNumberToTopNEqualsUsesOffsetForKthRow) {
+  // `WHERE rn = 3` over row_number() must become TopN(limit=3, offset=2):
+  // the k-th ranked row is the 3rd row with the first 2 dropped.  The old
+  // rule emitted limit=1/offset=0, returning the FIRST row instead of the
+  // 3rd.
+  Memo memo;
+  const GroupId scan = memo.Build({"t"});
+  const GroupId win = memo.EnsureDerivedGroup({"t"}, "win");
+  ASSERT_TRUE(memo.AddExpression(
+      win, LogicalExpression{
+               .operation = LogicalOperator::kWindow,
+               .children = {scan},
+               .target_list = {NamedExpression("rn", ColumnValueExp("t.id"))},
+               .sort_ascending = {true},
+               .sort_nulls_first = {false}}));
+  Expression pred =
+      BinaryExpressionExp(ColumnValueExp("rn"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{3})));
+  const GroupId sel = memo.EnsureDerivedGroup({"t"}, "sel");
+  ASSERT_TRUE(memo.AddExpression(
+      sel, LogicalExpression{.operation = LogicalOperator::kSelection,
+                             .children = {win},
+                             .predicate = pred}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(sel);
+  const auto it = std::ranges::find_if(
+      search.GetMemo().Get(sel).expressions, [](const LogicalExpression& expr) {
+        return expr.operation == LogicalOperator::kTopN;
+      });
+  ASSERT_TRUE(it != search.GetMemo().Get(sel).expressions.end())
+      << "rank_row_number_to_topn did not convert rn = 3 to TopN";
+  EXPECT_EQ(it->limit_count, 3U);
+  EXPECT_EQ(it->limit_offset, 2U);
+}
+
 TEST(CascadesTest, InListToSemiJoinRejectsUncollectableBranch) {
   // D5 counterexample (収集できなかったOR枝を捨てない): three collectable
   // same-column equalities PLUS one range branch.  The old rule fired on the
@@ -4288,11 +4490,15 @@ TEST(CascadesTest, EagerAggregationOverJoinSkipsOuterJoin) {
   const bool agg_pushed = std::ranges::any_of(
       search.GetMemo().Get(agg_group).expressions,
       [&](const LogicalExpression& expr) {
-        if (expr.operation != LogicalOperator::kJoin) return false;
+        if (expr.operation != LogicalOperator::kJoin) {
+          return false;
+        }
         for (GroupId child : expr.children) {
           for (const LogicalExpression& cexpr :
                search.GetMemo().Get(child).expressions) {
-            if (cexpr.operation == LogicalOperator::kAggregation) return true;
+            if (cexpr.operation == LogicalOperator::kAggregation) {
+              return true;
+            }
           }
         }
         return false;
@@ -4339,11 +4545,15 @@ TEST(CascadesTest, AggregateJoinTransposeSkipsOuterJoin) {
   const bool agg_pushed = std::ranges::any_of(
       search.GetMemo().Get(agg_group).expressions,
       [&](const LogicalExpression& expr) {
-        if (expr.operation != LogicalOperator::kJoin) return false;
+        if (expr.operation != LogicalOperator::kJoin) {
+          return false;
+        }
         for (GroupId child : expr.children) {
           for (const LogicalExpression& cexpr :
                search.GetMemo().Get(child).expressions) {
-            if (cexpr.operation == LogicalOperator::kAggregation) return true;
+            if (cexpr.operation == LogicalOperator::kAggregation) {
+              return true;
+            }
           }
         }
         return false;
@@ -4411,6 +4621,43 @@ TEST(CascadesTest, PushFilterPastSetopRejectsUnresolvedQualifier) {
   EXPECT_FALSE(pushed_into_right)
       << "push_filter_past_setop must not push a t1-qualified predicate "
          "into the t2 branch";
+}
+
+TEST(CascadesTest, PushFilterPastSetopRejectsUnqualifiedColumnMissingInBranch) {
+  // `WHERE x > 1` over UNION ALL of (a.x) and (b.y): pushing x > 1 into the
+  // b branch would filter on a column b does not have.  The published
+  // schemas prove the name only resolves in one branch.
+  Memo memo;
+  (void)memo.Build({"a", "b"});
+  memo.SetTableSchemas({{"a", Schema("a", {Column("x", ValueType::kInt64)})},
+                        {"b", Schema("b", {Column("y", ValueType::kInt64)})}});
+  const GroupId left = memo.EnsureGroup({"a"});
+  const GroupId right = memo.EnsureGroup({"b"});
+  const GroupId union_group =
+      memo.EnsureDerivedGroup({"a", "b"}, "union_branch");
+  memo.AddExpression(union_group,
+                     LogicalExpression{.operation = LogicalOperator::kUnionAll,
+                                       .children = {left, right}});
+  const GroupId sel_group =
+      memo.EnsureDerivedGroup({"a", "b"}, "sel_over_union");
+  memo.AddExpression(sel_group,
+                     LogicalExpression{.operation = LogicalOperator::kSelection,
+                                       .children = {union_group},
+                                       .predicate = BinaryExpressionExp(
+                                           ColumnValueExp(ColumnName("x")),
+                                           BinaryOperation::kGreaterThan,
+                                           ConstantValueExp(Value(0)))});
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(sel_group);
+  const bool pushed_into_right = std::ranges::any_of(
+      search.GetMemo().Get(right).expressions,
+      [](const LogicalExpression& expr) {
+        return expr.operation == LogicalOperator::kSelection &&
+               expr.predicate.has_value();
+      });
+  EXPECT_FALSE(pushed_into_right)
+      << "push_filter_past_setop pushed an unqualified column that does not "
+         "resolve in every branch";
 }
 
 TEST(CascadesTest, LimitPushThroughSortKeepsOffsetOnTop) {

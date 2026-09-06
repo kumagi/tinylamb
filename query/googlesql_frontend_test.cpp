@@ -3,10 +3,11 @@
 #include "query/googlesql_frontend.hpp"
 
 #include <gtest/gtest.h>
-
-#include <signal.h>  // NOLINT(modernize-deprecated-headers) // POSIX sigaction/SIGALRM below are only provided by this header.
+// NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigaction/SIGALRM
+#include <signal.h>
 #include <sys/resource.h>
 #include <unistd.h>
+
 #include <string>
 #include <vector>
 
@@ -73,9 +74,7 @@ TEST(GoogleSqlFrontendTest, RejectsMalformedStatements) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
   const std::vector<std::string> invalid = {
-      "SELECT FROM WHERE;",
-      "CREATE TABLE (;",
-      "INSERT INTO VALUES;",
+      "SELECT FROM WHERE;", "CREATE TABLE (;", "INSERT INTO VALUES;",
       "SELECT * FROM t WHERE ;"};
   for (const std::string& sql : invalid) {
     GoogleSqlParseResult result = GoogleSqlFrontend::Parse(sql);
@@ -88,9 +87,9 @@ TEST(GoogleSqlFrontendTest, ParsesJoinQueries) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
-  const GoogleSqlParseResult result =
-      GoogleSqlFrontend::Parse("SELECT a.name, b.name FROM emp a JOIN dept b "
-                               "ON a.dept_id = b.id WHERE b.id = 1;");
+  const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
+      "SELECT a.name, b.name FROM emp a JOIN dept b "
+      "ON a.dept_id = b.id WHERE b.id = 1;");
   ASSERT_TRUE(result.ok) << result.error;
   EXPECT_NE(result.ast.find("Join"), std::string::npos);
   EXPECT_NE(result.ast.find("OnClause"), std::string::npos);
@@ -169,9 +168,9 @@ TEST(GoogleSqlFrontendTest, ParsesFunctionCallsAndLiterals) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
-  const GoogleSqlParseResult result =
-      GoogleSqlFrontend::Parse("SELECT COUNT(*), CAST(a AS STRING), 2.5, "
-                               "\"s\", true, false, NULL, 1 = 1 FROM t;");
+  const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
+      "SELECT COUNT(*), CAST(a AS STRING), 2.5, "
+      "\"s\", true, false, NULL, 1 = 1 FROM t;");
   ASSERT_TRUE(result.ok) << result.error;
   EXPECT_NE(result.ast.find("FunctionCall"), std::string::npos);
   EXPECT_NE(result.ast.find("CastExpression"), std::string::npos);
@@ -185,8 +184,8 @@ TEST(GoogleSqlFrontendTest, ParsesWithClauseAndDistinct) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
-  const GoogleSqlParseResult with_clause = GoogleSqlFrontend::Parse(
-      "WITH w AS (SELECT 1 AS x) SELECT * FROM w;");
+  const GoogleSqlParseResult with_clause =
+      GoogleSqlFrontend::Parse("WITH w AS (SELECT 1 AS x) SELECT * FROM w;");
   ASSERT_TRUE(with_clause.ok) << with_clause.error;
   EXPECT_NE(with_clause.ast.find("WithClause"), std::string::npos);
 
@@ -218,14 +217,13 @@ TEST(GoogleSqlFrontendTest, RejectsAdditionalMalformedStatements) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
-  const std::vector<std::string> invalid = {
-      "SELECT * FROM t WHERE;",
-      "SELECT * FROM;",
-      "INSERT INTO t VALUES;",
-      "SELECT $1;",
-      "CREATE TABLE t a;",
-      "SELECT a FROM t1 JOIN t2 ON;",
-      "SELECT (1;"};
+  const std::vector<std::string> invalid = {"SELECT * FROM t WHERE;",
+                                            "SELECT * FROM;",
+                                            "INSERT INTO t VALUES;",
+                                            "SELECT $1;",
+                                            "CREATE TABLE t a;",
+                                            "SELECT a FROM t1 JOIN t2 ON;",
+                                            "SELECT (1;"};
   for (const std::string& sql : invalid) {
     GoogleSqlParseResult result = GoogleSqlFrontend::Parse(sql);
     EXPECT_FALSE(result.ok) << sql;
@@ -240,10 +238,8 @@ TEST(GoogleSqlFrontendTest, CachesDistinctStatementTextsSeparately) {
   // Two statements that differ only in whitespace/case are distinct cache
   // keys but produce the same AST, so both must remain independently
   // parseable and must not collide in the cache.
-  const GoogleSqlParseResult upper =
-      GoogleSqlFrontend::Parse("SELECT 1;");
-  const GoogleSqlParseResult lower =
-      GoogleSqlFrontend::Parse("select 1 ;");
+  const GoogleSqlParseResult upper = GoogleSqlFrontend::Parse("SELECT 1;");
+  const GoogleSqlParseResult lower = GoogleSqlFrontend::Parse("select 1 ;");
   ASSERT_TRUE(upper.ok) << upper.error;
   ASSERT_TRUE(lower.ok) << lower.error;
   EXPECT_EQ(upper.ast, lower.ast);
@@ -289,18 +285,18 @@ TEST(GoogleSqlFrontendTest, ParsesRangeAndPatternPredicates) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
-  const GoogleSqlParseResult between = GoogleSqlFrontend::Parse(
-      "SELECT a FROM t WHERE a BETWEEN 1 AND 5;");
+  const GoogleSqlParseResult between =
+      GoogleSqlFrontend::Parse("SELECT a FROM t WHERE a BETWEEN 1 AND 5;");
   ASSERT_TRUE(between.ok) << between.error;
   EXPECT_NE(between.ast.find("BetweenExpression(BETWEEN)"), std::string::npos);
 
-  const GoogleSqlParseResult like = GoogleSqlFrontend::Parse(
-      "SELECT a FROM t WHERE b LIKE 'a%';");
+  const GoogleSqlParseResult like =
+      GoogleSqlFrontend::Parse("SELECT a FROM t WHERE b LIKE 'a%';");
   ASSERT_TRUE(like.ok) << like.error;
   EXPECT_NE(like.ast.find("BinaryExpression(LIKE)"), std::string::npos);
 
-  const GoogleSqlParseResult is_null = GoogleSqlFrontend::Parse(
-      "SELECT a FROM t WHERE a IS NULL;");
+  const GoogleSqlParseResult is_null =
+      GoogleSqlFrontend::Parse("SELECT a FROM t WHERE a IS NULL;");
   ASSERT_TRUE(is_null.ok) << is_null.error;
   EXPECT_NE(is_null.ast.find("BinaryExpression(IS)"), std::string::npos);
 }
@@ -329,8 +325,8 @@ TEST(GoogleSqlFrontendTest, ParsesExistsAndCorrelatedSubqueries) {
   EXPECT_NE(exists.ast.find("ExpressionSubquery(modifier=EXISTS)"),
             std::string::npos);
 
-  const GoogleSqlParseResult nested = GoogleSqlFrontend::Parse(
-      "SELECT a FROM t WHERE a IN (SELECT b FROM s);");
+  const GoogleSqlParseResult nested =
+      GoogleSqlFrontend::Parse("SELECT a FROM t WHERE a IN (SELECT b FROM s);");
   ASSERT_TRUE(nested.ok) << nested.error;
   EXPECT_NE(nested.ast.find("InExpression"), std::string::npos);
 }
@@ -351,8 +347,8 @@ TEST(GoogleSqlFrontendTest, ParsesDdlAndOtherStatementKinds) {
     ASSERT_TRUE(result.ok) << sql << "\n" << result.error;
     EXPECT_NE(result.ast.find("Statement"), std::string::npos) << sql;
   }
-  EXPECT_NE(GoogleSqlFrontend::Parse("TRUNCATE TABLE t;").ast.find(
-                "TruncateStatement"),
+  EXPECT_NE(GoogleSqlFrontend::Parse("TRUNCATE TABLE t;")
+                .ast.find("TruncateStatement"),
             std::string::npos);
   EXPECT_NE(GoogleSqlFrontend::Parse("SHOW TABLES;").ast.find("ShowStatement"),
             std::string::npos);
@@ -369,9 +365,7 @@ TEST(GoogleSqlFrontendTest, RejectsUnsupportedStatementKinds) {
   // The pinned GoogleSQL parser does not accept these statement kinds; each
   // must surface as a parse failure with a non-empty error payload.
   const std::vector<std::string> unsupported = {
-      "GRANT SELECT ON t TO u;",
-      "COPY t FROM 'f.csv';",
-      "VACUUM;",
+      "GRANT SELECT ON t TO u;", "COPY t FROM 'f.csv';", "VACUUM;",
       "CLUSTER t USING idx;"};
   for (const std::string& sql : unsupported) {
     GoogleSqlParseResult result = GoogleSqlFrontend::Parse(sql);

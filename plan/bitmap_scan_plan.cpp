@@ -2,23 +2,28 @@
 #include "plan/bitmap_scan_plan.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <ostream>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
+#include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "table/table.hpp"
+#include "table/table_statistics.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 
-BitmapScanPlan::BitmapScanPlan(const Table& table,
-                               const TableStatistics& statistics,
+BitmapScanPlan::BitmapScanPlan(const Table& table, TableStatistics statistics,
                                std::vector<BitmapIndexRange> ranges,
                                BitmapCombine combine, Expression where,
                                size_t estimated_rows, size_t access_rows)
     : table_(table),
-      statistics_(statistics),
+      statistics_(std::move(statistics)),
       ranges_(std::move(ranges)),
       combine_(combine),
       where_(std::move(where)),
@@ -28,12 +33,12 @@ BitmapScanPlan::BitmapScanPlan(const Table& table,
 const Schema& BitmapScanPlan::GetSchema() const { return table_.GetSchema(); }
 
 void BitmapScanPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent)
+  output << Indent(static_cast<size_t>(indent))
          << (combine_ == BitmapCombine::kAnd ? "BitmapAnd" : "BitmapOr")
          << " (estimated rows: " << estimated_rows_ << ")";
   for (const BitmapIndexRange& range : ranges_) {
     output << "\n"
-           << Indent(indent + 2)
+           << Indent(static_cast<size_t>(indent) + 2)
            << "BitmapIndexScan: " << range.index->sc_.name_ << " on "
            << table_.GetSchema().Name();
     if (!range.begin_key.empty() || !range.end_key.empty()) {
@@ -49,7 +54,8 @@ void BitmapScanPlan::Dump(std::ostream& output, int indent) const {
     }
   }
   if (where_) {
-    output << "\n" << Indent(indent + 2) << "Recheck: " << *where_;
+    output << "\n"
+           << Indent(static_cast<size_t>(indent) + 2) << "Recheck: " << *where_;
   }
 }
 

@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -34,6 +35,8 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "gtest/gtest.h"
+#include "index/index.hpp"
+#include "index/index_schema.hpp"
 #include "page/page_manager.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "table/iterator.hpp"
@@ -186,10 +189,10 @@ TEST_F(TableTest, Update_MultipleRowsRepeatedly_UpdatesSuccessfully) {
   }
   for (int i = 0; i < 260; ++i) {
     Row new_row({Value(i), Value(RandomString(40)), Value(i * 99e8)});
-    RowPosition pos = rps[i % rps.size()];
+    RowPosition pos = rps[static_cast<size_t>(i) % rps.size()];
     ASSIGN_OR_ASSERT_FAIL(RowPosition, new_pos,
                           tbl->Update(ctx.txn_, pos, new_row));
-    rps[i % rps.size()] = new_pos;
+    rps[static_cast<size_t>(i) % rps.size()] = new_pos;
   }
 }
 
@@ -538,7 +541,8 @@ TEST_F(TableTest, Update_ManyRowsUnderHeavyLoad_UpdatesSuccessfully) {
   rps.reserve(kCount);
 
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString(((19937 * i) % 120) + 10, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10), false);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Insert(ctx.txn_, new_row));
     rps.push_back(rp);
@@ -547,7 +551,8 @@ TEST_F(TableTest, Update_ManyRowsUnderHeavyLoad_UpdatesSuccessfully) {
   for (int i = 0; i < kCount * 4; ++i) {
     const size_t target = (static_cast<size_t>(i) * 63) % rps.size();
     RowPosition& pos = rps[target];
-    std::string key = RandomString(((19937 * i) % 1000) + 800, false);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 1000) + 800), false);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Update(ctx.txn_, pos, new_row));
     rps[target] = rp;
@@ -591,7 +596,8 @@ TEST_F(TableTest, Insert_WhenPageIsFull_AllocatesNewPage) {
 
   ASSERT_NE(rps.front().page_id, rps.back().page_id);
   for (int i = 0; i < 600; ++i) {
-    ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, rps[i]));
+    ASSIGN_OR_ASSERT_FAIL_CONST(
+        Row, read, tbl->Read(ctx.txn_, rps[static_cast<size_t>(i)]));
     ASSERT_EQ(read,
               Row({Value(i), Value(std::string(payload)), Value(i * 1.5)}));
   }
@@ -835,7 +841,7 @@ TEST_F(TableTest,
   size_t count = 0;
   for (; iter.IsValid(); ++iter) {
     ++count;
-    Row r = *iter;
+    const Row& r = *iter;
     EXPECT_EQ(r.values_.size(), 2U);
   }
   EXPECT_EQ(count, 3U);

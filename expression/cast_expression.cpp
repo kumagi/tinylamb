@@ -1,24 +1,29 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/cast_expression.hpp"
 
-#include <algorithm>
+#include <array>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
-#include <iomanip>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
 #include <limits>
-#include <memory>
+#include <optional>
 #include <ostream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
-#include "common/constants.hpp"
+#include "expression/expression.hpp"
 #include "expression/proto_schema.hpp"
 #include "expression/proto_text.hpp"
 #include "type/column_name.hpp"
@@ -44,10 +49,12 @@ struct CivilTime {
 };
 
 bool ParseCivilTime(std::string_view s, CivilTime* ct) {
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+  while (!s.empty() &&
+         (std::isspace(static_cast<unsigned char>(s.front())) != 0)) {
     s.remove_prefix(1);
   }
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+  while (!s.empty() &&
+         (std::isspace(static_cast<unsigned char>(s.back())) != 0)) {
     s.remove_suffix(1);
   }
   if (s.empty()) {
@@ -55,10 +62,11 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   }
   int Y = 0, M = 0, D = 0;
   if (s.size() == 10 &&
+      // NOLINTNEXTLINE(cert-err34-c)
       sscanf(std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
     ct->year = Y;
-    ct->month = M;
-    ct->day = D;
+    ct->month = static_cast<unsigned>(M);
+    ct->day = static_cast<unsigned>(D);
     ct->hour = 0;
     ct->minute = 0;
     ct->second = 0;
@@ -68,11 +76,12 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   int h = 0, m = 0, sec = 0;
   char sep = ' ';
   bool matched = false;
+  // NOLINTNEXTLINE(cert-err34-c)
   if (sscanf(std::string(s).c_str(), "%d-%d-%d%c%d:%d:%d", &Y, &M, &D, &sep, &h,
              &m, &sec) >= 6) {
     ct->year = Y;
-    ct->month = M;
-    ct->day = D;
+    ct->month = static_cast<unsigned>(M);
+    ct->day = static_cast<unsigned>(D);
     ct->hour = h;
     ct->minute = m;
     ct->second = sec;
@@ -94,7 +103,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       ct->subsecond_nanos = std::stoll(frac_str);
     }
     matched = true;
-  } else if (sscanf(std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
+  } else if (
+      // NOLINTNEXTLINE(cert-err34-c)
+      sscanf(std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
     ct->year = 1970;
     ct->month = 1;
     ct->day = 1;
@@ -130,10 +141,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       if (ct->hour >= 24) {
         int extra_days = ct->hour / 24;
         ct->hour %= 24;
-        std::chrono::year_month_day ymd{
-            std::chrono::year{ct->year},
-            std::chrono::month{static_cast<unsigned>(ct->month)},
-            std::chrono::day{static_cast<unsigned>(ct->day)}};
+        std::chrono::year_month_day ymd{std::chrono::year{ct->year},
+                                        std::chrono::month{ct->month},
+                                        std::chrono::day{ct->day}};
         int64_t days =
             std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
         std::chrono::sys_days new_sd{std::chrono::days{days}};
@@ -149,26 +159,31 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
 }
 
 std::string FormatCivilTime(const CivilTime& ct) {
-  char buf[64];
+  std::array<char, 64> buf{};
   if (ct.subsecond_nanos != 0) {
     if (ct.subsecond_nanos % 1000000 == 0) {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld", ct.year,
-               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+      // Formatting into a fixed buffer cannot fail.
+      // NOLINTNEXTLINE(cert-err33-c)
+      snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second,
                ct.subsecond_nanos / 1000000);
     } else if (ct.subsecond_nanos % 1000 == 0) {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld", ct.year,
-               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+      // NOLINTNEXTLINE(cert-err33-c)
+      snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
+               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second,
                ct.subsecond_nanos / 1000);
     } else {
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%09ld", ct.year,
-               ct.month, ct.day, ct.hour, ct.minute, ct.second,
+      // NOLINTNEXTLINE(cert-err33-c)
+      snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d.%09ld",
+               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second,
                ct.subsecond_nanos);
     }
   } else {
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", ct.year,
+    // NOLINTNEXTLINE(cert-err33-c)
+    snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d", ct.year,
              ct.month, ct.day, ct.hour, ct.minute, ct.second);
   }
-  return std::string(buf);
+  return std::string{buf.data()};
 }
 
 CivilTime ShiftCivilTimeHours(CivilTime ct, int add_hours) {
@@ -177,14 +192,13 @@ CivilTime ShiftCivilTimeHours(CivilTime ct, int add_hours) {
     const int64_t q = a / b;
     return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
   };
-  int extra_days = floor_div(total_h, 24);
-  int new_h = total_h - extra_days * 24;
+  int extra_days = static_cast<int>(floor_div(total_h, 24));
+  int new_h = total_h - (extra_days * 24);
   ct.hour = new_h;
   if (extra_days != 0) {
-    std::chrono::year_month_day ymd{
-        std::chrono::year{ct.year},
-        std::chrono::month{static_cast<unsigned>(ct.month)},
-        std::chrono::day{static_cast<unsigned>(ct.day)}};
+    std::chrono::year_month_day ymd{std::chrono::year{ct.year},
+                                    std::chrono::month{ct.month},
+                                    std::chrono::day{ct.day}};
     int64_t days =
         std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
     std::chrono::sys_days new_sd{std::chrono::days{days}};
@@ -204,17 +218,16 @@ CivilTime ShiftCivilTimeSeconds(CivilTime ct, int64_t add_seconds) {
     return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
   };
   int64_t day_secs =
-      ct.hour * 3600LL + ct.minute * 60LL + ct.second + add_seconds;
+      (ct.hour * 3600LL) + (ct.minute * 60LL) + ct.second + add_seconds;
   int64_t extra_days = floor_div(day_secs, 86400);
-  int64_t rem = day_secs - extra_days * 86400;
+  int64_t rem = day_secs - (extra_days * 86400);
   ct.second = static_cast<int>(rem % 60);
   ct.minute = static_cast<int>((rem / 60) % 60);
   ct.hour = static_cast<int>(rem / 3600);
   if (extra_days != 0) {
-    std::chrono::year_month_day ymd{
-        std::chrono::year{ct.year},
-        std::chrono::month{static_cast<unsigned>(ct.month)},
-        std::chrono::day{static_cast<unsigned>(ct.day)}};
+    std::chrono::year_month_day ymd{std::chrono::year{ct.year},
+                                    std::chrono::month{ct.month},
+                                    std::chrono::day{ct.day}};
     int64_t days =
         std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
     std::chrono::sys_days new_sd{std::chrono::days{days}};
@@ -241,11 +254,16 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
     char sign = tz_str[3];
     int th = 0, tm = 0;
     std::string rem(tz_str.substr(4));
+    // Unparsed tokens leave th/tm at 0, i.e. a UTC offset; conversion errors
+    // are tolerated by design for malformed zone strings.
     if (rem.find(':') != std::string::npos) {
+      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
       sscanf(rem.c_str(), "%d:%d", &th, &tm);
     } else if (rem.size() == 4) {
+      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
       sscanf(rem.c_str(), "%2d%2d", &th, &tm);
     } else {
+      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
       sscanf(rem.c_str(), "%d", &th);
     }
     return (th * 3600 + tm * 60) * (sign == '-' ? -1 : 1);
@@ -255,10 +273,13 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
     int th = 0, tm = 0;
     std::string rem(tz_str.substr(1));
     if (rem.find(':') != std::string::npos) {
+      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
       sscanf(rem.c_str(), "%d:%d", &th, &tm);
     } else if (rem.size() == 4) {
+      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
       sscanf(rem.c_str(), "%2d%2d", &th, &tm);
     } else {
+      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
       sscanf(rem.c_str(), "%d", &th);
     }
     return (th * 3600 + tm * 60) * (sign == '-' ? -1 : 1);
@@ -269,16 +290,14 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
   }
   try {
     const auto* zone = std::chrono::locate_zone(zone_name);
-    if (zone) {
-      int y = ct ? ct->year : 2000;
-      int mon = ct ? ct->month : 1;
-      int d = ct ? ct->day : 1;
-      int h = ct ? ct->hour : 0;
-      int min = ct ? ct->minute : 0;
-      int s = ct ? ct->second : 0;
-      if (y < 1970) {
-        y = 1970;
-      }
+    if (zone != nullptr) {
+      int y = (ct != nullptr) ? ct->year : 2000;
+      int mon = (ct != nullptr) ? static_cast<int>(ct->month) : 1;
+      int d = (ct != nullptr) ? static_cast<int>(ct->day) : 1;
+      int h = (ct != nullptr) ? ct->hour : 0;
+      int min = (ct != nullptr) ? ct->minute : 0;
+      int s = (ct != nullptr) ? ct->second : 0;
+      y = std::max(y, 1970);
       std::chrono::year_month_day ymd{
           std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(mon)},
           std::chrono::day{static_cast<unsigned>(d)}};
@@ -288,7 +307,8 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
       auto loc_info = zone->get_info(loc_tp);
       return static_cast<int>(loc_info.first.offset.count());
     }
-  } catch (...) {
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // Unknown zone identifiers fall back to the caller-provided default.
   }
   return default_offset;
 }
@@ -454,6 +474,9 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
       }
     } else if (lower.ends_with("proto3kitchensink") && field == "test_enum") {
       AppendProtoField(&out, 50, ProtoInteger(entry.text));
+      // Field-number dispatch tables repeat identical bodies by design: each
+      // branch maps a distinct (message, field) pair to its wire field number.
+      // NOLINTNEXTLINE(bugprone-branch-clone)
     } else if (lower.ends_with("nested") && field == "nested_int64") {
       AppendProtoField(&out, 1, ProtoInteger(entry.text));
     } else if (lower.ends_with("nested") && field == "nested_repeated_int64") {
@@ -540,7 +563,6 @@ std::vector<std::pair<std::string, std::string>> SplitStructMembers(
     if (end) {
       break;
     }
-    continue;
   }
   return members;
 }
@@ -598,11 +620,11 @@ std::string EncodeStructMemberText(const Value& value) {
     if (std::isinf(value.value.double_value)) {
       return value.value.double_value > 0 ? "\"Infinity\"" : "\"-Infinity\"";
     }
-    char buffer[64];
-    const auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer),
-                                         value.value.double_value);
+    std::array<char, 64> buffer{};
+    const auto [ptr, ec] = std::to_chars(
+        buffer.data(), buffer.data() + buffer.size(), value.value.double_value);
     (void)ec;
-    return std::string(buffer, ptr - buffer);
+    return std::string{buffer.data(), static_cast<size_t>(ptr - buffer.data())};
   }
   if (value.type == ValueType::kInt64) {
     return std::to_string(value.value.int_value);
@@ -762,7 +784,7 @@ void ValidateIntWidth(const std::string& upper, int64_t v) {
 Value CastValue(const Value& val, const std::string& type_name,
                 ValueType target_type, bool safe) {
   if (val.IsNull()) {
-    return Value();
+    return {};
   }
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
@@ -823,7 +845,7 @@ Value CastValue(const Value& val, const std::string& type_name,
     }
     if (compact.size() != 32) {
       if (safe) {
-        return Value();
+        return {};
       }
       throw std::runtime_error("invalid UUID string: " + hex);
     }
@@ -850,12 +872,12 @@ Value CastValue(const Value& val, const std::string& type_name,
             CastValue(converted, field_type, ParseType(field_type).first, safe);
       } catch (const std::exception&) {
         if (safe) {
-          return Value();
+          return {};
         }
         throw;
       }
       if (converted.IsNull()) {
-        return Value();
+        return {};
       }
       return Value("{\"" + key + "\":" + EncodeStructMemberText(converted) +
                    "}");
@@ -868,7 +890,7 @@ Value CastValue(const Value& val, const std::string& type_name,
       const auto members = SplitStructMembers(text.substr(1, text.size() - 2));
       auto fail = [&]() -> Value {
         if (safe) {
-          return Value();
+          return {};
         }
         throw std::runtime_error("cannot cast struct to " + type_name);
       };
@@ -944,7 +966,7 @@ Value CastValue(const Value& val, const std::string& type_name,
       IsKnownEnum(enum_short_name)) {
     auto out_of_range = [&](const std::string& message) -> Value {
       if (safe) {
-        return Value();
+        return {};
       }
       throw std::runtime_error(message);
     };
@@ -1001,9 +1023,9 @@ Value CastValue(const Value& val, const std::string& type_name,
         !member.empty() && static_cast<bool>(std::isupper(
                                static_cast<unsigned char>(member.front())));
     for (const char c : member) {
-      if (!(c == '_' ||
-            static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) ||
-            static_cast<bool>(std::isupper(static_cast<unsigned char>(c))))) {
+      if (c != '_' &&
+          !static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) &&
+          !static_cast<bool>(std::isupper(static_cast<unsigned char>(c)))) {
         member_shaped = false;
         break;
       }
@@ -1021,7 +1043,7 @@ Value CastValue(const Value& val, const std::string& type_name,
     }
     if (member_shaped) {
       if (safe) {
-        return Value();
+        return {};
       }
       throw std::runtime_error("Out of range cast of string '" + member +
                                "' to enum type " + type_name);
@@ -1037,15 +1059,15 @@ Value CastValue(const Value& val, const std::string& type_name,
     }();
     bool numeric_token = !trimmed_member.empty();
     for (const char c : trimmed_member) {
-      if (!(static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) ||
-            c == '-' || c == '+')) {
+      if (!static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) &&
+          c != '-' && c != '+') {
         numeric_token = false;
         break;
       }
     }
     if (numeric_token) {
       if (safe) {
-        return Value();
+        return {};
       }
       throw std::runtime_error("Out of range cast of string '" + member +
                                "' to enum type " + type_name);
@@ -1059,7 +1081,7 @@ Value CastValue(const Value& val, const std::string& type_name,
     const std::string upper_path = ToUpper(type_name);
     if (upper_path.find('.') != std::string::npos && !enum_target) {
       if (val.IsNull()) {
-        return Value();
+        return {};
       }
       if (val.type == ValueType::kVarChar || val.type == ValueType::kInt64 ||
           val.type == ValueType::kDouble) {
@@ -1087,7 +1109,7 @@ Value CastValue(const Value& val, const std::string& type_name,
         if (!safe) {
           throw std::runtime_error("invalid proto TEXT payload: " + raw);
         }
-        return Value();
+        return {};
       }
     }
   }
@@ -1163,11 +1185,11 @@ Value CastValue(const Value& val, const std::string& type_name,
                   ? static_cast<int64_t>(std::round(val.value.double_value))
                   : val.value.int_value;
           if (candidate < lo ||
-              (candidate >= 0 && static_cast<uint64_t>(candidate) > hi)) {
+              (candidate >= 0 && std::cmp_greater(candidate, hi))) {
             const std::string message =
                 ToLower(upper) + " out of range: " + std::to_string(candidate);
             if (safe) {
-              return Value();
+              return {};
             }
             throw std::out_of_range(message);
           }
@@ -1189,7 +1211,7 @@ Value CastValue(const Value& val, const std::string& type_name,
             throw std::runtime_error("int overflow casting from float: " +
                                      std::to_string(val.value.double_value));
           }
-          const int64_t narrowed = static_cast<int64_t>(rounded);
+          const auto narrowed = static_cast<int64_t>(rounded);
           ValidateIntWidth(upper, narrowed);
           return upper == "UINT64" ? Value(narrowed).WithUnsigned()
                                    : Value(narrowed);
@@ -1478,23 +1500,29 @@ Value CastValue(const Value& val, const std::string& type_name,
             if (ParseCivilTime(raw, &ct)) {
               int offset_hours = (ct.month >= 4 && ct.month <= 10) ? -7 : -8;
               ct = ShiftCivilTimeHours(ct, offset_hours);
-              char buf[64];
+              std::array<char, 64> buf{};
               if (ct.subsecond_nanos != 0) {
                 if (ct.subsecond_nanos % 1000000 == 0) {
-                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour,
-                           ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+                  // NOLINTNEXTLINE(cert-err33-c)
+                  snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
+                           ct.hour, ct.minute, ct.second,
+                           ct.subsecond_nanos / 1000000);
                 } else if (ct.subsecond_nanos % 1000 == 0) {
-                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour,
-                           ct.minute, ct.second, ct.subsecond_nanos / 1000);
+                  // NOLINTNEXTLINE(cert-err33-c)
+                  snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
+                           ct.hour, ct.minute, ct.second,
+                           ct.subsecond_nanos / 1000);
                 } else {
-                  snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour,
-                           ct.minute, ct.second, ct.subsecond_nanos);
+                  // NOLINTNEXTLINE(cert-err33-c)
+                  snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
+                           ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
                 }
               } else {
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute,
-                         ct.second);
+                // NOLINTNEXTLINE(cert-err33-c)
+                snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", ct.hour,
+                         ct.minute, ct.second);
               }
-              return Value(std::string(buf));
+              return Value(std::string{buf.data()});
             }
           }
           size_t tz_pos = s.find_first_of("+-Zz");
@@ -1503,23 +1531,29 @@ Value CastValue(const Value& val, const std::string& type_name,
           }
           CivilTime ct;
           if (ParseCivilTime(s, &ct)) {
-            char buf[64];
+            std::array<char, 64> buf{};
             if (ct.subsecond_nanos != 0) {
               if (ct.subsecond_nanos % 1000000 == 0) {
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour,
-                         ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+                // NOLINTNEXTLINE(cert-err33-c)
+                snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
+                         ct.hour, ct.minute, ct.second,
+                         ct.subsecond_nanos / 1000000);
               } else if (ct.subsecond_nanos % 1000 == 0) {
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour,
-                         ct.minute, ct.second, ct.subsecond_nanos / 1000);
+                // NOLINTNEXTLINE(cert-err33-c)
+                snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
+                         ct.hour, ct.minute, ct.second,
+                         ct.subsecond_nanos / 1000);
               } else {
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour,
-                         ct.minute, ct.second, ct.subsecond_nanos);
+                // NOLINTNEXTLINE(cert-err33-c)
+                snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
+                         ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
               }
             } else {
-              snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute,
-                       ct.second);
+              // NOLINTNEXTLINE(cert-err33-c)
+              snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", ct.hour,
+                       ct.minute, ct.second);
             }
-            return Value(std::string(buf));
+            return Value(std::string{buf.data()});
           }
           return Value(std::move(s));
         }
@@ -1551,10 +1585,11 @@ Value CastValue(const Value& val, const std::string& type_name,
                   ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
               ct = ShiftCivilTimeSeconds(ct, offset_sec);
             }
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%04d-%02u-%02u", ct.year, ct.month,
-                     ct.day);
-            return Value::Date(std::string(buf));
+            std::array<char, 32> buf{};
+            // NOLINTNEXTLINE(cert-err33-c)
+            snprintf(buf.data(), buf.size(), "%04d-%02u-%02u", ct.year,
+                     ct.month, ct.day);
+            return Value::Date(std::string{buf.data()});
           }
           size_t sp = s.find_first_of(" Tt");
           if (sp != std::string::npos) {
@@ -1597,10 +1632,11 @@ Value CastValue(const Value& val, const std::string& type_name,
                   ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
               ct = ShiftCivilTimeSeconds(ct, offset_sec);
             }
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%04d-%02u-%02u", ct.year, ct.month,
-                     ct.day);
-            return Value::Date(std::string(buf));
+            std::array<char, 32> buf{};
+            // NOLINTNEXTLINE(cert-err33-c)
+            snprintf(buf.data(), buf.size(), "%04d-%02u-%02u", ct.year,
+                     ct.month, ct.day);
+            return Value::Date(std::string{buf.data()});
           }
           size_t sp = s.find_first_of(" Tt");
           if (sp != std::string::npos) {
@@ -1617,7 +1653,7 @@ Value CastValue(const Value& val, const std::string& type_name,
         // CAST(x AS ARRAY<T>): retypes array literals (coercing elements to
         // the declared element type when they are scalar); NULL stays NULL.
         if (val.IsNull()) {
-          return Value();
+          return {};
         }
         if (!val.IsArray()) {
           break;
@@ -1651,7 +1687,7 @@ Value CastValue(const Value& val, const std::string& type_name,
         bool ok = true;
         for (const Value& element : val.ArrayElements()) {
           if (element.IsNull()) {
-            elements.push_back(Value());
+            elements.emplace_back();
             continue;
           }
           if (length_limit > 0 && element.type == ValueType::kVarChar &&
@@ -1684,13 +1720,13 @@ Value CastValue(const Value& val, const std::string& type_name,
     }
   } catch (const std::exception&) {
     if (safe) {
-      return Value();
+      return {};
     }
     throw;
   }
 
   if (safe) {
-    return Value();
+    return {};
   }
   throw std::runtime_error("unsupported cast to " + type_name);
 }
@@ -1732,12 +1768,13 @@ Value CastExpression::Evaluate(const Row& row, const Schema& schema,
                    return_null_on_error_);
 }
 
-tinylamb::Type CastExpression::ResultType(const Schema&) const {
-  return tinylamb::Type(target_type_tag_);
+tinylamb::Type CastExpression::ResultType(const Schema& /*unused*/) const {
+  return {target_type_tag_};
 }
 
-tinylamb::Type CastExpression::ResultType(const Schema&, const Schema&) const {
-  return tinylamb::Type(target_type_tag_);
+tinylamb::Type CastExpression::ResultType(const Schema& /*unused*/,
+                                          const Schema& /*unused*/) const {
+  return {target_type_tag_};
 }
 
 std::string CastExpression::ToString() const {

@@ -13,6 +13,7 @@
 #include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
 #include "page/row_position.hpp"
+#include "table/full_scan_iterator.hpp"
 #include "table/iterator.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"

@@ -24,6 +24,7 @@
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -32,6 +33,22 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+namespace {
+
+// Long-double conversion mirroring the ground-truth accumulator: numeric
+// values convert, anything else raises like the serial path's ToLongDouble.
+long double StatInputToLongDouble(const Value& value) {
+  if (value.type == ValueType::kDouble) {
+    return static_cast<long double>(value.value.double_value);
+  }
+  if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
+    return static_cast<long double>(value.value.int_value);
+  }
+  throw std::runtime_error("numeric value required");
+}
+
+}  // namespace
 
 ParallelAggregationExecutor::ParallelAggregationExecutor(
     std::shared_ptr<ExecutorBase> child, Schema input_schema,
@@ -53,12 +70,44 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
     if (IsCountStar(aggregate) && !has_filter) {
       input.kind = AggregateInputKind::kRowCount;
       row_count_indices_.push_back(index);
+    } else if (IsStatisticalAggregate(aggregate.GetType()) &&
+               !aggregate.Distinct() && !has_filter &&
+               aggregate.Child()->Type() == TypeTag::kColumnValue) {
+      // Statistical aggregates keep long-double partial sums.  Raw numeric
+      // storage for the child (and, for COVAR_*/CORR, the trailing argument
+      // column) takes the batched fast path; anything else is accumulated
+      // per row in the generic loop.
+      const int offset = input_schema_.Offset(
+          aggregate.Child()->AsColumnValue().GetColumnName());
+      const auto& trailing_args = aggregate.TrailingArgs();
+      const bool two_input =
+          aggregate.GetType() == AggregationType::kCovarSamp ||
+          aggregate.GetType() == AggregationType::kCovarPop ||
+          aggregate.GetType() == AggregationType::kCorr;
+      int trailing_offset = -1;
+      if (two_input && trailing_args.size() == 1 && trailing_args[0] &&
+          trailing_args[0]->Type() == TypeTag::kColumnValue) {
+        trailing_offset = input_schema_.Offset(
+            trailing_args[0]->AsColumnValue().GetColumnName());
+      }
+      if (offset >= 0 &&
+          (two_input ? trailing_offset >= 0 : trailing_args.empty())) {
+        input.kind = AggregateInputKind::kStatColumn;
+        input.column = static_cast<size_t>(offset);
+        if (trailing_offset >= 0) {
+          input.trailing_column = static_cast<size_t>(trailing_offset);
+        }
+        stat_column_indices_.push_back(index);
+      } else {
+        generic_indices_.push_back(index);
+      }
     } else if (!aggregate.Distinct() && !has_filter &&
                aggregate.Child()->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
       if (offset >= 0) {
-        if (input_schema_.GetColumn(offset).Type() == ValueType::kDouble) {
+        if (input_schema_.GetColumn(static_cast<size_t>(offset)).Type() ==
+            ValueType::kDouble) {
           input.kind = AggregateInputKind::kDoubleColumn;
           input.column = static_cast<size_t>(offset);
           double_column_indices_.push_back(index);
@@ -82,6 +131,11 @@ ParallelAggregationExecutor::MakeState() const {
   PartialState state;
   state.values.resize(aggregates_.size());
   state.counts.resize(aggregates_.size(), 0);
+  state.stat_sx.resize(aggregates_.size());
+  state.stat_sxx.resize(aggregates_.size());
+  state.stat_sy.resize(aggregates_.size());
+  state.stat_syy.resize(aggregates_.size());
+  state.stat_sxy.resize(aggregates_.size());
   state.distinct_values.resize(aggregates_.size());
   for (size_t index = 0; index < aggregates_.size(); ++index) {
     const AggregationType type =
@@ -201,6 +255,35 @@ void ParallelAggregationExecutor::Accumulate(PartialState* state,
       generic_scratch.push_back(index);
     }
   }
+  for (const size_t index : stat_column_indices_) {
+    const AggregateInput& input = inputs_[index];
+    const ColumnVector& child = chunk.ColumnAt(input.column);
+    const ValueType child_type = child.Type();
+    if (child_type != ValueType::kInt64 && child_type != ValueType::kDouble) {
+      // An all-null kNull column contributes nothing (paired semantics keep
+      // the result NULL); any other layout defers to the per-row loop.
+      if (child_type != ValueType::kNull) {
+        generic_scratch.push_back(index);
+      }
+      continue;
+    }
+    const ColumnVector* trailing = nullptr;
+    if (!aggregates_[index]
+             .expression->AsAggregateExpression()
+             .TrailingArgs()
+             .empty()) {
+      trailing = &chunk.ColumnAt(input.trailing_column);
+      const ValueType trailing_type = trailing->Type();
+      if (trailing_type != ValueType::kInt64 &&
+          trailing_type != ValueType::kDouble) {
+        if (trailing_type != ValueType::kNull) {
+          generic_scratch.push_back(index);
+        }
+        continue;
+      }
+    }
+    AccumulateStatColumns(state, index, child, trailing);
+  }
   if (!generic_indices_.empty() || !generic_scratch.empty()) {
     AccumulateGeneric(state, chunk, generic_indices_, generic_scratch);
   }
@@ -259,6 +342,35 @@ void ParallelAggregationExecutor::AccumulateGeneric(
         }
         value = aggregate.Child()->Evaluate(*materialized, input_schema_);
       }
+      if (IsStatisticalAggregate(aggregate.GetType())) {
+        if (value.IsNull()) {
+          continue;
+        }
+        std::vector<Value> trailing_values;
+        trailing_values.reserve(aggregate.TrailingArgs().size());
+        for (const Expression& extra : aggregate.TrailingArgs()) {
+          if (extra) {
+            if (!materialized) {
+              materialized = chunk.RowAt(row_index);
+            }
+            trailing_values.push_back(
+                extra->Evaluate(*materialized, input_schema_));
+          }
+        }
+        if (aggregate.Distinct()) {
+          const size_t bytes = EstimateValueBytes(value);
+          QueryMemoryBudget::Global().ReserveForced(bytes);
+          if (!state->distinct_values[index]
+                   .insert(relational_detail::CanonicalDistinctValue(value))
+                   .second) {
+            QueryMemoryBudget::Global().Release(bytes);
+            continue;
+          }
+          state->distinct_charged_bytes += bytes;
+        }
+        AccumulateStatValue(state, index, value, trailing_values);
+        continue;
+      }
       AccumulateValue(state, index, value, true);
     }
   }
@@ -305,7 +417,7 @@ void ParallelAggregationExecutor::AccumulateInt64Column(
            __builtin_add_overflow(total.value.int_value, sum, &sum))) {
         throw std::runtime_error("integer overflow on '+'");
       }
-      total = total.IsNull() ? Value(sum) : Value(sum);
+      total = Value(sum);
       break;
     }
     case AggregationType::kAvg: {
@@ -435,6 +547,101 @@ void ParallelAggregationExecutor::AccumulateDoubleColumn(
   }
 }
 
+void ParallelAggregationExecutor::AccumulateStatColumns(
+    PartialState* state, size_t aggregate_index, const ColumnVector& child,
+    const ColumnVector* trailing) {
+  const bool child_is_double = child.Type() == ValueType::kDouble;
+  const std::vector<int64_t>* child_ints =
+      child_is_double ? nullptr : &child.IntegerData();
+  const std::vector<double>* child_doubles =
+      child_is_double ? &child.DoubleData() : nullptr;
+  const bool trailing_is_double =
+      trailing != nullptr && trailing->Type() == ValueType::kDouble;
+  const std::vector<int64_t>* trailing_ints =
+      trailing != nullptr && !trailing_is_double ? &trailing->IntegerData()
+                                                 : nullptr;
+  const std::vector<double>* trailing_doubles =
+      trailing != nullptr && trailing_is_double ? &trailing->DoubleData()
+                                                : nullptr;
+  long double& sx = state->stat_sx[aggregate_index];
+  long double& sxx = state->stat_sxx[aggregate_index];
+  long double& sy = state->stat_sy[aggregate_index];
+  long double& syy = state->stat_syy[aggregate_index];
+  long double& sxy = state->stat_sxy[aggregate_index];
+  int64_t& count = state->counts[aggregate_index];
+  for (size_t row = 0; row < child.Size(); ++row) {
+    if (child.IsNull(row)) {
+      continue;
+    }
+    if (trailing != nullptr && trailing->IsNull(row)) {
+      // Paired-row semantics: rows where either side is NULL are skipped.
+      continue;
+    }
+    const long double y = child_is_double
+                              ? static_cast<long double>((*child_doubles)[row])
+                              : static_cast<long double>((*child_ints)[row]);
+    if (trailing == nullptr) {
+      // Single-input forms (VAR_* / STDDEV_*) fold into the x slot exactly
+      // like the ground-truth accumulator.
+      sx += y;
+      sxx += y * y;
+    } else {
+      const long double x =
+          trailing_is_double
+              ? static_cast<long double>((*trailing_doubles)[row])
+              : static_cast<long double>((*trailing_ints)[row]);
+      sy += y;
+      syy += y * y;
+      sx += x;
+      sxx += x * x;
+      sxy += x * y;
+    }
+    ++count;
+  }
+}
+
+void ParallelAggregationExecutor::AccumulateStatValue(
+    PartialState* state, size_t aggregate_index, const Value& value,
+    const std::vector<Value>& trailing_values) const {
+  if (value.IsNull()) {
+    return;
+  }
+  const AggregationType type = aggregates_[aggregate_index]
+                                   .expression->AsAggregateExpression()
+                                   .GetType();
+  const bool two_input = type == AggregationType::kCovarSamp ||
+                         type == AggregationType::kCovarPop ||
+                         type == AggregationType::kCorr;
+  Value other;
+  if (two_input) {
+    if (trailing_values.empty()) {
+      throw std::runtime_error(ToString(type) + " requires two arguments");
+    }
+    other = trailing_values[0];
+    if (other.IsNull()) {
+      return;
+    }
+  }
+  const long double y = StatInputToLongDouble(value);
+  long double& sx = state->stat_sx[aggregate_index];
+  long double& sxx = state->stat_sxx[aggregate_index];
+  long double& sy = state->stat_sy[aggregate_index];
+  long double& syy = state->stat_syy[aggregate_index];
+  long double& sxy = state->stat_sxy[aggregate_index];
+  if (two_input) {
+    const long double x = StatInputToLongDouble(other);
+    sy += y;
+    syy += y * y;
+    sx += x;
+    sxx += x * x;
+    sxy += x * y;
+  } else {
+    sx += y;
+    sxx += y * y;
+  }
+  ++state->counts[aggregate_index];
+}
+
 void ParallelAggregationExecutor::Merge(PartialState* destination,
                                         const PartialState& source) const {
   for (size_t index = 0; index < aggregates_.size(); ++index) {
@@ -442,8 +649,23 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
         aggregates_[index].expression->AsAggregateExpression();
     if (aggregate.Distinct()) {
       for (const Value& value : source.distinct_values[index]) {
-        AccumulateValue(destination, index, value, true);
+        if (IsStatisticalAggregate(aggregate.GetType())) {
+          AccumulateStatValue(destination, index, value, {});
+        } else {
+          AccumulateValue(destination, index, value, true);
+        }
       }
+      continue;
+    }
+    if (IsStatisticalAggregate(aggregate.GetType())) {
+      // Long-double partial sums and their paired-row counts combine
+      // additively; FinalizeStat applies the division/square-root.
+      destination->stat_sx[index] += source.stat_sx[index];
+      destination->stat_sxx[index] += source.stat_sxx[index];
+      destination->stat_sy[index] += source.stat_sy[index];
+      destination->stat_syy[index] += source.stat_syy[index];
+      destination->stat_sxy[index] += source.stat_sxy[index];
+      destination->counts[index] += source.counts[index];
       continue;
     }
     switch (aggregate.GetType()) {
@@ -469,8 +691,8 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
           break;
         }
         if (!source.values[index].IsNull() &&
-            !(destination->values[index].type == ValueType::kDouble &&
-              std::isnan(destination->values[index].value.double_value)) &&
+            (destination->values[index].type != ValueType::kDouble ||
+             !std::isnan(destination->values[index].value.double_value)) &&
             (destination->values[index].IsNull() ||
              source.values[index] < destination->values[index])) {
           destination->values[index] = source.values[index];
@@ -483,8 +705,8 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
           break;
         }
         if (!source.values[index].IsNull() &&
-            !(destination->values[index].type == ValueType::kDouble &&
-              std::isnan(destination->values[index].value.double_value)) &&
+            (destination->values[index].type != ValueType::kDouble ||
+             !std::isnan(destination->values[index].value.double_value)) &&
             (destination->values[index].IsNull() ||
              destination->values[index] < source.values[index])) {
           destination->values[index] = source.values[index];
@@ -527,10 +749,93 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
   }
 }
 
+Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
+                                                size_t index) const {
+  // Mirrors AggregateAccumulator::Finish's statistical cases expression for
+  // expression so both execution paths agree bit for bit.
+  const AggregationType type =
+      aggregates_[index].expression->AsAggregateExpression().GetType();
+  const long double sx = state.stat_sx[index];
+  const long double sxx = state.stat_sxx[index];
+  const long double sy = state.stat_sy[index];
+  const long double syy = state.stat_syy[index];
+  const long double sxy = state.stat_sxy[index];
+  const int64_t count = state.counts[index];
+  switch (type) {
+    case AggregationType::kVarPop: {
+      if (count == 0) {
+        return {};
+      }
+      const long double mean = sx / count;
+      const long double ssd = sxx - (count * mean * mean);
+      return Value(static_cast<double>(ssd / count));
+    }
+    case AggregationType::kVarSamp: {
+      if (count < 2) {
+        return {};
+      }
+      const long double mean = sx / count;
+      const long double ssd = sxx - (count * mean * mean);
+      return Value(static_cast<double>(ssd / (count - 1)));
+    }
+    case AggregationType::kStddevPop: {
+      if (count == 0) {
+        return {};
+      }
+      const long double mean = sx / count;
+      const long double ssd = sxx - (count * mean * mean);
+      return Value(static_cast<double>(std::sqrt(ssd / count)));
+    }
+    case AggregationType::kStddevSamp: {
+      if (count < 2) {
+        return {};
+      }
+      const long double mean = sx / count;
+      const long double ssd = sxx - (count * mean * mean);
+      return Value(static_cast<double>(std::sqrt(ssd / (count - 1))));
+    }
+    case AggregationType::kCovarPop: {
+      if (count == 0) {
+        return {};
+      }
+      const long double mx = sx / count;
+      const long double my = sy / count;
+      const long double sdd = sxy - (count * mx * my);
+      return Value(static_cast<double>(sdd / count));
+    }
+    case AggregationType::kCovarSamp: {
+      if (count < 2) {
+        return {};
+      }
+      const long double mx = sx / count;
+      const long double my = sy / count;
+      const long double sdd = sxy - (count * mx * my);
+      return Value(static_cast<double>(sdd / (count - 1)));
+    }
+    case AggregationType::kCorr: {
+      if (count < 2) {
+        return {};
+      }
+      const long double mx = sx / count;
+      const long double my = sy / count;
+      const long double sdd = sxy - (count * mx * my);
+      const long double vx = sxx - (count * mx * mx);
+      const long double vy = syy - (count * my * my);
+      return Value(static_cast<double>(sdd / std::sqrt(vx * vy)));
+    }
+    default:
+      return {};
+  }
+}
+
 Row ParallelAggregationExecutor::Finalize(PartialState state) const {
   for (size_t index = 0; index < aggregates_.size(); ++index) {
     const auto& aggregate =
         aggregates_[index].expression->AsAggregateExpression();
+    if (IsStatisticalAggregate(aggregate.GetType())) {
+      state.values[index] = FinalizeStat(state, index);
+      continue;
+    }
     if (aggregate.GetType() != AggregationType::kAvg) {
       continue;
     }
@@ -601,7 +906,7 @@ bool ParallelAggregationExecutor::Next(Row* destination,
   for (const PartialState& partial : partials) {
     Merge(&merged, partial);
   }
-  *destination = Finalize(std::move(merged));
+  *destination = Finalize(merged);
   executed_ = true;
   return true;
 }
@@ -624,10 +929,10 @@ void ParallelAggregationExecutor::Dump(std::ostream& out, int indent) const {
   out << "ParallelAggregationExecutor (" << worker_count_ << " workers) {";
   for (const NamedExpression& aggregate : aggregates_) {
     out << "\n"
-        << Indent(indent + 2) << aggregate.name << ": "
+        << Indent(static_cast<size_t>(indent) + 2) << aggregate.name << ": "
         << *aggregate.expression;
   }
-  out << "\n" << Indent(indent) << "}";
+  out << "\n" << Indent(static_cast<size_t>(indent)) << "}";
 }
 
 }  // namespace tinylamb

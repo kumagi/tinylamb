@@ -16,6 +16,7 @@
 
 #include "type/column_name.hpp"
 
+#include <cstddef>
 #include <sstream>
 
 #include "gtest/gtest.h"

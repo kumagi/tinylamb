@@ -1,12 +1,18 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under the Apache-2.0 license. */
 #include "values_plan.hpp"
 
+#include <cstddef>
 #include <ostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "expression/expression.hpp"
+#include "table/table_statistics.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 namespace {
@@ -44,7 +50,8 @@ bool ValuesPlan::IsOrderedBy(const std::vector<Expression>& expressions,
 }
 
 void ValuesPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "Values (rows=" << rows_.size() << ")";
+  output << Indent(static_cast<size_t>(indent))
+         << "Values (rows=" << rows_.size() << ")";
 }
 
 std::string ValuesPlan::ToString() const {
@@ -55,7 +62,7 @@ DummyScanPlan::DummyScanPlan()
     : schema_("", {}), stats_(MakeStats(schema_, 1)) {}
 
 void DummyScanPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "DummyScan (one row)";
+  output << Indent(static_cast<size_t>(indent)) << "DummyScan (one row)";
 }
 
 std::string DummyScanPlan::ToString() const { return "DummyScan (one row)"; }

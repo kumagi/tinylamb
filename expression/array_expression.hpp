@@ -24,12 +24,13 @@ class ArrayExpression : public ExpressionBase {
                                const Schema& right_schema) const override;
   [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
                                EvaluationContext& context) const override;
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override {
-    return tinylamb::Type(TypeTag::kArray);
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/) const override {
+    return {TypeTag::kArray};
   }
-  [[nodiscard]] tinylamb::Type ResultType(const Schema&,
-                                          const Schema&) const override {
-    return tinylamb::Type(TypeTag::kArray);
+  [[nodiscard]] tinylamb::Type ResultType(
+      const Schema& /*unused*/, const Schema& /*unused*/) const override {
+    return {TypeTag::kArray};
   }
   [[nodiscard]] const std::vector<Expression>& Elements() const {
     return elements_;

@@ -16,16 +16,25 @@
 
 #include "binary_expression.hpp"
 
+// NOLINTNEXTLINE(modernize-deprecated-headers) POSIX timegm
+#include <time.h>
+
+#include <cctype>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <exception>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
@@ -81,7 +90,9 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
       continue;
     }
     if (c == '}' || c == ']' || c == ')') {
-      if (depth > 0) --depth;
+      if (depth > 0) {
+        --depth;
+      }
       continue;
     }
     if (c == ',' && depth == 0) {
@@ -93,17 +104,19 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
     parts.push_back(inner.substr(start));
   }
   for (auto p : parts) {
-    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.front()))) {
+    while (!p.empty() &&
+           (std::isspace(static_cast<unsigned char>(p.front())) != 0)) {
       p.remove_prefix(1);
     }
-    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.back()))) {
+    while (!p.empty() &&
+           (std::isspace(static_cast<unsigned char>(p.back())) != 0)) {
       p.remove_suffix(1);
     }
     size_t colon = p.find(':');
     if (colon != std::string_view::npos) {
       p = p.substr(colon + 1);
       while (!p.empty() &&
-             std::isspace(static_cast<unsigned char>(p.front()))) {
+             (std::isspace(static_cast<unsigned char>(p.front())) != 0)) {
         p.remove_prefix(1);
       }
     }
@@ -176,14 +189,18 @@ bool Like(std::string_view value, std::string_view pattern) {
   size_t wildcard = std::string_view::npos;
   size_t retry = 0;
   while (value_pos < value.size()) {
-    if (pattern_pos < pattern.size() &&
-        (pattern[pattern_pos] == '_' ||
-         pattern[pattern_pos] == value[value_pos])) {
-      ++value_pos;
-      ++pattern_pos;
-    } else if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
+    // A pattern '%' is a wildcard even when the value character is also '%':
+    // checking it before literal equality preserves the backtrack point.
+    // (Oracle-found: '%%' LIKE '%' fell into the literal branch, consumed
+    // both positions without recording the wildcard, and returned false.)
+    if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
       wildcard = pattern_pos++;
       retry = value_pos;
+    } else if (pattern_pos < pattern.size() &&
+               (pattern[pattern_pos] == '_' ||
+                pattern[pattern_pos] == value[value_pos])) {
+      ++value_pos;
+      ++pattern_pos;
     } else if (wildcard != std::string_view::npos) {
       pattern_pos = wildcard + 1;
       value_pos = ++retry;
@@ -260,8 +277,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         return std::nullopt;
       }
     };
-    if ((left.type == ValueType::kDate || right.type == ValueType::kDate) &&
-        (left.type == ValueType::kDate || right.type == ValueType::kDate)) {
+    if (left.type == ValueType::kDate || right.type == ValueType::kDate) {
       const auto lhs = as_date(left);
       const auto rhs = as_date(right);
       if (lhs && rhs) {
@@ -292,6 +308,9 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         return std::nullopt;
       }
       int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+      // All six fields are required and rejected on mismatch; field values
+      // flow into std::tm which normalizes out-of-range values.
+      // NOLINTNEXTLINE(cert-err34-c)
       if (sscanf(std::string(text.substr(0, 19)).c_str(), "%d-%d-%d %d:%d:%d",
                  &year, &month, &day, &hour, &minute, &second) != 6) {
         return std::nullopt;
@@ -310,6 +329,22 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         // used by CAST(TIMESTAMP)), hence local wall time is eight hours
         // ahead when represented in UTC.
         epoch += 8LL * 60LL * 60LL;
+      } else if (text[zone] != 'Z' && text[zone] != 'z') {
+        // An explicit numeric offset names the string's own zone: convert to
+        // UTC instead of silently treating every offset as UTC.  "+05:30"
+        // means local time is 5h30 AHEAD of UTC, so UTC = civil - offset.
+        const std::string suffix(text.substr(zone));
+        const char sign = suffix[0];
+        std::string digits = suffix;
+        digits[0] = ' ';
+        int zone_hours = 0, zone_minutes = 0;
+        // Return value checked; an overlong digit run would simply produce a
+        // huge offset and the comparison itself stays well-defined.
+        // NOLINTNEXTLINE(cert-err34-c)
+        if (sscanf(digits.c_str(), " %d:%d", &zone_hours, &zone_minutes) >= 1) {
+          const int64_t offset = (zone_hours * 3600LL) + (zone_minutes * 60LL);
+          epoch += (sign == '-') ? offset : -offset;
+        }
       }
       return epoch;
     };
@@ -388,7 +423,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     if (amount >= 64) {
       return Value(static_cast<int64_t>(0));
     }
-    const uint64_t bits = static_cast<uint64_t>(left.value.int_value);
+    const auto bits = static_cast<uint64_t>(left.value.int_value);
     const uint64_t shifted =
         op == BinaryOperation::kShiftLeft ? bits << amount : bits >> amount;
     return Value(static_cast<int64_t>(shifted));
@@ -430,8 +465,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       right.type == ValueType::kInt64 &&
       (left.IsUnsigned() || right.IsUnsigned())) {
     const bool mixed_signedness = left.IsUnsigned() != right.IsUnsigned();
-    const uint64_t lhs_unsigned = static_cast<uint64_t>(left.value.int_value);
-    const uint64_t rhs_unsigned = static_cast<uint64_t>(right.value.int_value);
+    const auto lhs_unsigned = static_cast<uint64_t>(left.value.int_value);
+    const auto rhs_unsigned = static_cast<uint64_t>(right.value.int_value);
     const bool lhs_negative = !left.IsUnsigned() && left.value.int_value < 0;
     const bool rhs_negative = !right.IsUnsigned() && right.value.int_value < 0;
     auto compare = [&]() {
@@ -476,8 +511,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     if (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract ||
         op == BinaryOperation::kMultiply || op == BinaryOperation::kDivide ||
         op == BinaryOperation::kModulo) {
-      const uint64_t lhs = static_cast<uint64_t>(left.value.int_value);
-      const uint64_t rhs = static_cast<uint64_t>(right.value.int_value);
+      const auto lhs = static_cast<uint64_t>(left.value.int_value);
+      const auto rhs = static_cast<uint64_t>(right.value.int_value);
       if ((op == BinaryOperation::kDivide || op == BinaryOperation::kModulo) &&
           rhs == 0) {
         throw std::runtime_error("division by zero");
@@ -516,7 +551,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
             break;
         }
         if (fits_signed) {
-          return Value(static_cast<int64_t>(signed_result));
+          return Value(signed_result);
         }
       }
       uint64_t unsigned_result = 0;
@@ -702,7 +737,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     }
   }
   try {
-    auto preserve_unsigned = [&](Value result) {
+    auto preserve_unsigned = [&](const Value& result) {
       return (left.IsUnsigned() || right.IsUnsigned()) ? result.WithUnsigned()
                                                        : result;
     };

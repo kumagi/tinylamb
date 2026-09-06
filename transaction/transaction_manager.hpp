@@ -232,11 +232,15 @@ class TransactionManager {
   // ---- commit sequencing ----
   // Timestamps are handed out with a plain atomic fetch_add; versions are
   // then published under shard locks alone.  A freshly allocated timestamp is
-  // registered as "unpublished" before publication starts, and
+  // registered as "unpublished" under the same mutex that allocates it, and
   // stable_timestamp_ only ever advances to (smallest unpublished - 1), so a
   // snapshot taken from it can never observe a half-published commit.
-  void RegisterPendingCommit(uint64_t ts);
+  [[nodiscard]] uint64_t AllocatePendingCommit();
   void PublishCommit(uint64_t ts);
+  // Drops the registry entry and snapshot pin for a transaction whose slot
+  // still points at `txn` (pointer-identity checked).  Called from the
+  // Transaction destructor; no-op once ForgetTransaction already ran.
+  void ReleaseActiveTransaction(Transaction* txn);
 
   // ---- background GC ----
   static constexpr uint64_t kGcCommitThreshold = 8;
@@ -260,11 +264,11 @@ class TransactionManager {
   };
 
   [[nodiscard]] static size_t VersionShardIndex(const RowPosition& rp) {
-    return static_cast<size_t>((rp.page_id * 131ull) + rp.slot) %
+    return static_cast<size_t>((rp.page_id * 131ULL) + rp.slot) %
            kVersionShardCount;
   }
   [[nodiscard]] static size_t IndexMutationShardIndex(page_id_t root) {
-    return static_cast<size_t>(root * 11400714819323198485ull) %
+    return static_cast<size_t>(root * 11400714819323198485ULL) %
            kIndexMutationShardCount;
   }
 
@@ -320,7 +324,7 @@ class TransactionManager {
   // whose holder_id matches is dropped.
   struct WaitForEdge {
     RowPosition row;
-    txn_id_t holder;
+    txn_id_t holder{};
   };
   std::unordered_map<txn_id_t, WaitForEdge> wait_for_edges_;
   // Background detector body: scans wait_for_edges_ for cycles and aborts the

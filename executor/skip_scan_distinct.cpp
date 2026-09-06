@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -12,6 +11,8 @@
 
 #include "common/decoder.hpp"
 #include "common/status_or.hpp"
+#include "executor/data_chunk.hpp"
+#include "expression/expression.hpp"
 #include "index/b_plus_tree.hpp"
 #include "index/b_plus_tree_iterator.hpp"
 #include "index/index.hpp"

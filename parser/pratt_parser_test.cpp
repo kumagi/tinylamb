@@ -18,8 +18,8 @@
 
 #include <gtest/gtest.h>
 
-#include <string>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -228,10 +228,10 @@ TEST(ExpressionParserTest, DivideModuloAndOr) {
   // Assert -- OR has the lowest precedence, then AND, then the arithmetic ops
   ASSERT_EQ(expr->Type(), TypeTag::kBinaryExp);
   ASSERT_EQ(expr->AsBinaryExpression().Op(), BinaryOperation::kOr);
-  const auto& and_expr = expr->AsBinaryExpression().Left()->AsBinaryExpression();
+  const auto& and_expr =
+      expr->AsBinaryExpression().Left()->AsBinaryExpression();
   ASSERT_EQ(and_expr.Op(), BinaryOperation::kAnd);
-  const auto& modulo_expr =
-      and_expr.Left()->AsBinaryExpression();
+  const auto& modulo_expr = and_expr.Left()->AsBinaryExpression();
   ASSERT_EQ(modulo_expr.Op(), BinaryOperation::kModulo);
   const auto& divide_expr = modulo_expr.Left()->AsBinaryExpression();
   ASSERT_EQ(divide_expr.Op(), BinaryOperation::kDivide);
@@ -373,7 +373,8 @@ TEST(ExpressionParserTest, BooleanAndNullConstants) {
 TEST(ExpressionParserTest, ParseErrors) {
   // Arrange + Act + Assert -- malformed inputs throw
   EXPECT_THROW(ParseExpressionString("a IS 5"), std::runtime_error);
-  EXPECT_THROW(ParseExpressionString("CASE WHEN a THEN 1 b"), std::runtime_error);
+  EXPECT_THROW(ParseExpressionString("CASE WHEN a THEN 1 b"),
+               std::runtime_error);
   EXPECT_THROW(ParseExpressionString("CASE WHEN a THEN 1"), std::runtime_error);
   EXPECT_THROW(ParseExpressionString("COUNT(1, 2)"), std::runtime_error);
   EXPECT_THROW(ParseExpressionString("t.1"), std::runtime_error);

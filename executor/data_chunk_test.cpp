@@ -1,7 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/data_chunk.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -14,8 +17,6 @@
 #include "executor/vectorized_expression.hpp"
 #include "executor/zone_map.hpp"
 #include "expression/binary_expression.hpp"
-#include "expression/column_value.hpp"
-#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "type/column.hpp"
@@ -100,8 +101,8 @@ TEST(DataChunkTest, ZoneMap_ArrayValuesCountedOnColumnAppendPath) {
   src.Append(Row({Value::Array({Value(3)}, "INT64")}));
 
   DataChunk dst(schema, 4);
-  const uint32_t sel[] = {0, 1};
-  dst.AppendGather(src, sel, 2);
+  const std::array<uint32_t, 2> sel = {0, 1};
+  dst.AppendGather(src, sel.data(), 2);
 
   const ZoneMap& zone = dst.ZoneMapAt(0);
   EXPECT_EQ(zone.ValueCount(), 2U);
@@ -120,8 +121,12 @@ TEST(DataChunkTest, ZoneMap_NaNDoesNotPoisonEnvelope) {
   const ZoneMap& zone = chunk.ZoneMapAt(0);
   ASSERT_TRUE(zone.Minimum().has_value());
   // The envelope only covers real numbers; NaN keeps the zone eligible.
-  EXPECT_EQ(*zone.Minimum(), Value(3.0));
-  EXPECT_EQ(*zone.Maximum(), Value(3.0));
+  EXPECT_EQ(
+      *zone.Minimum(),  // NOLINT(bugprone-unchecked-optional-access) - guarded.
+      Value(3.0));
+  EXPECT_EQ(
+      *zone.Maximum(),  // NOLINT(bugprone-unchecked-optional-access) - guarded.
+      Value(3.0));
   EXPECT_TRUE(zone.MayMatch(BinaryOperation::kEquals, Value(3.0)));
   EXPECT_TRUE(zone.MayMatch(BinaryOperation::kLessThan, Value(5.0)));
 }
@@ -252,8 +257,10 @@ TEST(DataChunkTest, Reserve_ThenAppendBeyondCapacity_GrowsAndStoresData) {
   }
   ASSERT_EQ(chunk.Size(), 20);
   for (int i = 0; i < 20; ++i) {
-    EXPECT_EQ(chunk.RowAt(i), Row({Value(int64_t{i}), Value("row")}));
-    EXPECT_EQ(chunk.PositionAt(i), RowPosition(1, static_cast<slot_t>(i)));
+    EXPECT_EQ(chunk.RowAt(static_cast<size_t>(i)),
+              Row({Value(int64_t{i}), Value("row")}));
+    EXPECT_EQ(chunk.PositionAt(static_cast<size_t>(i)),
+              RowPosition(1, static_cast<slot_t>(i)));
   }
 }
 

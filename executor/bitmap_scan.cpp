@@ -3,12 +3,18 @@
 
 #include <algorithm>
 #include <ostream>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#include "expression/expression.hpp"
 #include "index/index_scan_iterator.hpp"
+#include "page/row_position.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

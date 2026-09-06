@@ -56,7 +56,8 @@ inline constexpr size_t kHashJoinRowBytesEstimate = 128;
   const size_t remaining = used >= soft ? 0 : soft - used;
   const size_t target = std::max(remaining / 2, size_t{1} << 20);
   const size_t needed =
-      estimated_build_bytes / target + (estimated_build_bytes % target != 0);
+      (estimated_build_bytes / target) +
+      static_cast<size_t>(estimated_build_bytes % target != 0);
   return std::clamp(std::max(needed, kMin), kMin, kMax);
 }
 

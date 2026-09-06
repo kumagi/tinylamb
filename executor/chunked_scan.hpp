@@ -34,8 +34,8 @@ class ChunkedScan : public ExecutorBase {
 
   // Index scan constructor.
   ChunkedScan(Transaction& txn, Table& table, const Index& index, Schema schema,
-              const Value& begin = Value(), const Value& end = Value(),
-              bool ascending = true, std::vector<slot_t> projection = {},
+              Value begin = Value(), Value end = Value(), bool ascending = true,
+              std::vector<slot_t> projection = {},
               std::optional<Expression> filter = std::nullopt);
 
   ~ChunkedScan() override = default;

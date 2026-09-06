@@ -13,7 +13,7 @@ class Max1RowPlan final : public PlanBase {
  public:
   explicit Max1RowPlan(Plan child) : child_(std::move(child)) {}
 
-  Executor EmitExecutor(TransactionContext& context) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();
   }

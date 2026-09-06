@@ -166,6 +166,15 @@ enum class Volatility : uint8_t {
 
 [[nodiscard]] Volatility GetFunctionVolatility(std::string_view func_name);
 
+// Executes the JSON_EXTRACT / JSON_QUERY / JSON_VALUE / JSON_EXTRACT_SCALAR /
+// JSON_EXTRACT_ARRAY / JSON_QUERY_ARRAY / JSON_VALUE_ARRAY /
+// JSON_EXTRACT_STRING_ARRAY family on raw JSON text.  Shared by the
+// json_path_constant_fold rule (compile-time fold) and the AST evaluator
+// (row-wise execution) so both paths produce identical results.
+Value EvaluateJsonFunctionCall(std::string_view func_name,
+                               std::string_view json_str,
+                               std::string_view path_str);
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_EXPRESSION_REWRITE_HPP

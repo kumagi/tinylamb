@@ -23,10 +23,10 @@
 #include <vector>
 
 #include "expression/binary_expression.hpp"
-#include "query/statement.hpp"
 #include "parser/parser.hpp"
 #include "parser/pratt_parser.hpp"
 #include "parser/tokenizer.hpp"
+#include "query/statement.hpp"
 
 namespace tinylamb {
 
@@ -51,8 +51,8 @@ std::string DumpStatement(const Statement& statement) {
 // Targets query/statement.hpp:96-105 (CreateTableStatement::Dump)
 TEST(AstDumpTest, CreateTableDump) {
   // Arrange -- tokenize CREATE TABLE with three columns
-  std::unique_ptr<Statement> stmt = ParseSql(
-      "CREATE TABLE users (id INT, name VARCHAR(20), score DOUBLE);");
+  std::unique_ptr<Statement> stmt =
+      ParseSql("CREATE TABLE users (id INT, name VARCHAR(20), score DOUBLE);");
 
   // Act -- dump the statement through Statement::operator<<
   std::string dump = DumpStatement(*stmt);
@@ -112,8 +112,8 @@ TEST(AstDumpTest, SelectDumpWithoutWhere) {
 // Targets query/statement.hpp:242-258 (InsertStatement::Dump)
 TEST(AstDumpTest, InsertDump) {
   // Arrange -- tokenize INSERT with a column list and two value tuples
-  std::unique_ptr<Statement> stmt = ParseSql(
-      "INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b');");
+  std::unique_ptr<Statement> stmt =
+      ParseSql("INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b');");
 
   // Act -- dump the statement
   std::string dump = DumpStatement(*stmt);
@@ -228,7 +228,8 @@ TEST(ParserBranchTest, SelectCommaSeparatedTables) {
   }
   // Arrange + Act + Assert -- second table with a bare alias
   {
-    std::unique_ptr<Statement> stmt = ParseSql("SELECT * FROM users, orders o;");
+    std::unique_ptr<Statement> stmt =
+        ParseSql("SELECT * FROM users, orders o;");
     const auto& select = dynamic_cast<SelectStatement&>(*stmt);
     ASSERT_EQ(select.FromClause().size(), 2);
     EXPECT_EQ(select.Aliases().at("o"), "orders");
@@ -292,9 +293,8 @@ TEST(ParserBranchTest, WhereTermWithTrailingTokenThrows) {
 // Targets parser/parser.cpp:439 (unterminated IN subquery)
 TEST(ParserBranchTest, InSubqueryWithoutClosingParenThrows) {
   // Arrange + Act + Assert -- IN (SELECT ... without ')' throws
-  EXPECT_THROW(
-      ParseSql("SELECT * FROM users WHERE x IN (SELECT a FROM other;"),
-      std::runtime_error);
+  EXPECT_THROW(ParseSql("SELECT * FROM users WHERE x IN (SELECT a FROM other;"),
+               std::runtime_error);
 }
 
 // Targets parser/parser.cpp:454 (IN subquery must select exactly one column)
@@ -365,9 +365,8 @@ TEST(PrattBranchTest, CaseWithoutEndAdvancesPastEndOfRange) {
   // token slice ends right after the last WHEN value
   // Act + Assert -- the final Advance() runs past the range and the parser
   // must throw instead of looping
-  EXPECT_THROW(
-      ParseSql("SELECT * FROM users WHERE CASE WHEN a THEN b;"),
-      std::runtime_error);
+  EXPECT_THROW(ParseSql("SELECT * FROM users WHERE CASE WHEN a THEN b;"),
+               std::runtime_error);
 }
 
 // Targets parser/pratt_parser.cpp:251 (Expect() mismatch throws)

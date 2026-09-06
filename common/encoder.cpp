@@ -16,8 +16,10 @@
 
 #include "encoder.hpp"
 
+#include <array>
 #include <cassert>
 #include <cstdint>
+#include <ios>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -35,10 +37,10 @@ Encoder& Encoder::operator<<(std::string_view sv) {
     throw std::runtime_error("string too long to encode");
   }
   const auto sz = static_cast<bin_size_t>(sv.size());
-  char prefix[sizeof(bin_size_t)];
-  SerializeU16(prefix, sz);
-  os_->write(prefix, sizeof(prefix));
-  os_->write(sv.data(), sv.size());
+  std::array<char, sizeof(bin_size_t)> prefix{};
+  SerializeU16(prefix.data(), sz);
+  os_->write(prefix.data(), prefix.size());
+  os_->write(sv.data(), static_cast<std::streamsize>(sv.size()));
   return *this;
 }
 
@@ -48,37 +50,37 @@ Encoder& Encoder::operator<<(uint8_t u8) {
 }
 
 Encoder& Encoder::operator<<(uint32_t u32) {
-  char bytes[sizeof(u32)];
-  SerializeU32(bytes, u32);
-  os_->write(bytes, sizeof(bytes));
+  std::array<char, sizeof(u32)> bytes{};
+  SerializeU32(bytes.data(), u32);
+  os_->write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(slot_t slot) {
-  char bytes[sizeof(slot)];
-  SerializeSlot(bytes, slot);
-  os_->write(bytes, sizeof(bytes));
+  std::array<char, sizeof(slot)> bytes{};
+  SerializeSlot(bytes.data(), slot);
+  os_->write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(int64_t i64) {
-  char bytes[sizeof(i64)];
-  SerializeInteger(bytes, i64);
-  os_->write(bytes, sizeof(bytes));
+  std::array<char, sizeof(i64)> bytes{};
+  SerializeInteger(bytes.data(), i64);
+  os_->write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(uint64_t u64) {
-  char bytes[sizeof(u64)];
-  SerializeU64(bytes, u64);
-  os_->write(bytes, sizeof(bytes));
+  std::array<char, sizeof(u64)> bytes{};
+  SerializeU64(bytes.data(), u64);
+  os_->write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(double d) {
-  char bytes[sizeof(d)];
-  SerializeDouble(bytes, d);
-  os_->write(bytes, sizeof(bytes));
+  std::array<char, sizeof(d)> bytes{};
+  SerializeDouble(bytes.data(), d);
+  os_->write(bytes.data(), bytes.size());
   return *this;
 }
 

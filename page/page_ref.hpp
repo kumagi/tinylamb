@@ -95,7 +95,9 @@ class PageRef final {
     if (this != &o) {
       // Self-move must not unlock: PageUnlock on our own state followed by
       // move-assigning the std lock types from ourselves is undefined.
-      if (page_ != nullptr) PageUnlock();
+      if (page_ != nullptr) {
+        PageUnlock();
+      }
       pool_ = o.pool_;
       page_ = o.page_;
       pin_count_ = o.pin_count_;

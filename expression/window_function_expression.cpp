@@ -1,9 +1,19 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/window_function_expression.hpp"
 
+#include <cstddef>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
+
+#include "expression/expression.hpp"
+#include "type/column_name.hpp"
+#include "type/type.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 
@@ -42,13 +52,14 @@ std::string FrameBoundToString(const WindowFrameBound& bound) {
 }
 }  // namespace
 
-Value WindowFunctionCallExpression::Evaluate(const Row&, const Schema&) const {
+Value WindowFunctionCallExpression::Evaluate(const Row& /*row*/,
+                                             const Schema& /*schema*/) const {
   throw std::runtime_error(
       "window function " + function +
       " evaluated without pre-computation (internal error)");
 }
 
-Type WindowFunctionCallExpression::ResultType(const Schema&) const {
+Type WindowFunctionCallExpression::ResultType(const Schema& /*unused*/) const {
   // The executor fixes the hidden column type from the computed values.
   return {TypeTag::kVarChar};
 }
@@ -94,7 +105,7 @@ std::string WindowFunctionCallExpression::ToString() const {
     out << "DISTINCT ";
   }
   for (size_t i = 0; i < args.size(); ++i) {
-    if (i) {
+    if (i != 0U) {
       out << ", ";
     }
     out << args[i]->ToString();
@@ -109,7 +120,7 @@ std::string WindowFunctionCallExpression::ToString() const {
   if (!partition_by.empty()) {
     out << "PARTITION BY ";
     for (size_t i = 0; i < partition_by.size(); ++i) {
-      if (i) {
+      if (i != 0U) {
         out << ", ";
       }
       out << partition_by[i]->ToString();

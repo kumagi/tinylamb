@@ -7,14 +7,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "common/set_operation.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -81,9 +82,11 @@ bool KeywordAt(std::string_view sql, size_t pos, std::string_view keyword) {
       return false;
     }
   }
-  const bool start_ok = pos == 0 || !IsIdentChar(sql[pos - 1]);
-  const bool end_ok = pos + keyword.size() == sql.size() ||
-                      !IsIdentChar(sql[pos + keyword.size()]);
+  const bool start_ok =
+      pos == 0 || !IsIdentChar(static_cast<unsigned char>(sql[pos - 1]));
+  const bool end_ok =
+      pos + keyword.size() == sql.size() ||
+      !IsIdentChar(static_cast<unsigned char>(sql[pos + keyword.size()]));
   return start_ok && end_ok;
 }
 
@@ -244,7 +247,7 @@ Expression BindExpression(
           query.Negated());
       // Preserve ARRAY(SELECT ...) semantics across template rebinding.
       bound->SetArrayResult(query.ArrayResult());
-      return Expression(bound);
+      return Expression{bound};
     }
     case TypeTag::kIntervalExp: {
       const auto& interval = expression->AsIntervalExpression();
@@ -544,7 +547,7 @@ size_t DollarQuoteDelimiterEnd(std::string_view sql, size_t pos) {
     return pos;
   }
   size_t j = pos + 1;
-  while (j < sql.size() && IsIdentChar(sql[j])) {
+  while (j < sql.size() && IsIdentChar(static_cast<unsigned char>(sql[j]))) {
     ++j;
   }
   if (j < sql.size() && sql[j] == '$') {
@@ -643,7 +646,8 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       }
       if (9 <= kw_end &&
           std::string_view(sql.data() + kw_end - 9, 9) == "TIMESTAMP" &&
-          (kw_end == 9 || !IsIdentChar(sql[kw_end - 10]))) {
+          (kw_end == 9 ||
+           !IsIdentChar(static_cast<unsigned char>(sql[kw_end - 10])))) {
         literal = NormalizeTimestampText(literal);
       }
       result.parameters.emplace_back(std::move(literal));
@@ -723,7 +727,8 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         std::isdigit(c) != 0 ||
         (sql[i] == '.' && i + 1 < sql.size() &&
          std::isdigit(static_cast<unsigned char>(sql[i + 1])) != 0);
-    if (number_start && (i == 0 || !IsIdentChar(sql[i - 1]))) {
+    if (number_start &&
+        (i == 0 || !IsIdentChar(static_cast<unsigned char>(sql[i - 1])))) {
       const size_t begin = i;
       bool is_float = false;
       while (i < sql.size() &&

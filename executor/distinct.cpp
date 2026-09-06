@@ -3,12 +3,14 @@
 
 #include <cstddef>
 #include <ostream>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {

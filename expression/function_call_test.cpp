@@ -1,7 +1,8 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache License 2.0. */
-#include <cmath>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/random_string.hpp"
@@ -21,7 +22,9 @@ namespace {
 // the AST-only Evaluate path leaves unimplemented.
 class ScalarFunctionSqlTest : public ::testing::Test {
  protected:
-  void SetUp() override { db_ = std::make_unique<Database>("fn_" + RandomString()); }
+  void SetUp() override {
+    db_ = std::make_unique<Database>("fn_" + RandomString());
+  }
 
   std::vector<Row> RunSql(std::string_view sql) {
     TransactionContext ctx = db_->BeginContext();
@@ -30,7 +33,9 @@ class ScalarFunctionSqlTest : public ::testing::Test {
     std::vector<Row> rows;
     if (prepared.HasValue()) {
       Row row;
-      while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row); }
+      while (prepared.Value()->Next(&row, nullptr)) {
+        rows.push_back(row);
+      }
     } else {
       ADD_FAILURE() << sql << " -> " << engine.LastError();
     }
@@ -40,9 +45,11 @@ class ScalarFunctionSqlTest : public ::testing::Test {
 
   Value Scalar(std::string_view sql) {
     auto rows = RunSql(sql);
-    EXPECT_EQ(rows.size(), 1u) << sql;
-    if (rows.empty()) { return Value(); }
-    EXPECT_EQ(rows[0].values_.size(), 1u) << sql;
+    EXPECT_EQ(rows.size(), 1U) << sql;
+    if (rows.empty()) {
+      return {};
+    }
+    EXPECT_EQ(rows[0].values_.size(), 1U) << sql;
     return rows[0].values_[0];
   }
 
@@ -100,10 +107,11 @@ TEST_F(ScalarFunctionSqlTest, StringFunctions) {
   EXPECT_EQ(Scalar("SELECT SUBSTR('hello', 2, 3)"), Value("ell"));
   EXPECT_EQ(Scalar("SELECT SUBSTRING('hello', 2, 3)"), Value("ell"));
   // Negative start counts from the end (GoogleSQL semantics; the old
-  // implementation clamped every start <= 1 to the first byte).
+  // implementation clamped every start <= 1 to the first byte). A start
+  // before the first byte behaves like start 0/1: from the first byte.
   EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', -2)"), Value("de"));
   EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', -2, 2)"), Value("de"));
-  EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', -10)"), Value(""));
+  EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', -10)"), Value("abcde"));
   EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', 0)"), Value("abcde"));
   EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', 10)"), Value(""));
   EXPECT_EQ(Scalar("SELECT LEFT('hello', 2)"), Value("he"));

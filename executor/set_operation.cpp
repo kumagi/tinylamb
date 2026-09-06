@@ -4,13 +4,17 @@
 #include <algorithm>
 #include <cstddef>
 #include <iterator>
+#include <ostream>
 #include <stdexcept>
-#include <string>
-#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "common/set_operation.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
+#include "executor/spill_file.hpp"
+#include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
@@ -225,7 +229,8 @@ void SetOperationExecutor::MaterializePartitioned() {
           spill_sources_[source][partition].ReadAllRows();
       rows[source].reserve(spilled.size());
       for (Row row : spilled) {
-        rows[source].push_back(Positioned{std::move(row), RowPosition()});
+        rows[source].push_back(
+            Positioned{.row = std::move(row), .position = RowPosition()});
       }
     }
     MaterializeRows(std::move(rows));
@@ -376,7 +381,8 @@ void SetOperationExecutor::Materialize() {
             .Append(row);
       } else {
         charge.Add(EstimateRowBytes(row));
-        rows[source].push_back(Positioned{std::move(row), position});
+        rows[source].push_back(
+            Positioned{.row = std::move(row), .position = position});
       }
     }
   }
@@ -404,7 +410,7 @@ bool SetOperationExecutor::Next(Row* destination, RowPosition* position) {
 }
 
 void SetOperationExecutor::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "SetOperation\n";
+  output << Indent(static_cast<size_t>(indent)) << "SetOperation\n";
   for (const Executor& source : sources_) {
     source->Dump(output, indent + 2);
     output << '\n';

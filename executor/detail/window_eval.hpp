@@ -8,8 +8,7 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "query/statement.hpp"
 
-namespace tinylamb {
-namespace relational_detail {
+namespace tinylamb::relational_detail {
 
 // True when any select-list / order-by / qualify expression of the statement
 // contains a window function call.
@@ -31,7 +30,6 @@ WindowedInput ApplyWindows(TransactionContext& context,
 
 // Drops the trailing $winN columns produced by ApplyWindows.
 
-}  // namespace relational_detail
-}  // namespace tinylamb
+}  // namespace tinylamb::relational_detail
 
 #endif  // TINYLAMB_WINDOW_EVAL_HPP

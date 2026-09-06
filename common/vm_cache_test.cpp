@@ -32,9 +32,11 @@
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
+#include "common/vm_cache_impl.hpp"
 #include "gtest/gtest.h"
 #include "random_string.hpp"
 
@@ -62,8 +64,8 @@ class VMCacheTest : public ::testing::Test {
       ssize_t wrote = ::write(
           fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
       EXPECT_LT(0, wrote);
-      written += wrote;
-      remaining -= wrote;
+      written += static_cast<size_t>(wrote);
+      remaining -= static_cast<size_t>(wrote);
     }
     EXPECT_EQ(written, value.size() * sizeof(T));
     ::fsync(fd_);
@@ -95,7 +97,7 @@ TEST_F(VMCacheTest, Read_OnePage_ReturnsExpectedData) {
   constexpr size_t kCount = 1024;
   auto cache = MakeCache<int32_t>(kCount);
 
-  for (int i = 0; i < 1024; ++i) {
+  for (size_t i = 0; i < 1024; ++i) {
     int32_t data = 0;
     cache->Read(&data, i, 1);
 
@@ -105,10 +107,10 @@ TEST_F(VMCacheTest, Read_OnePage_ReturnsExpectedData) {
 
 TEST_F(VMCacheTest, Read_WithOffsets_ReturnsExpectedData) {
   constexpr size_t kCount = 1024;
-  for (int i = 1; i < 4096; i += 127) {
+  for (size_t i = 1; i < 4096; i += 127) {
     auto cache = MakeCache<int32_t>(kCount, i);
 
-    for (int j = 0; j < 1024; ++j) {
+    for (size_t j = 0; j < 1024; ++j) {
       int32_t data = 0;
       cache->Read(&data, j, 1);
       if (data != Expected<int32_t>(j)) {
@@ -125,7 +127,9 @@ struct Data {
   char c;
   Data() = default;
   Data(size_t from)
-      : a(from & 0xffffffff), b(from & 0x0000ffff), c(from & 0xff) {}
+      : a(static_cast<int>(from & 0xffffffff)),
+        b(static_cast<int>(from & 0x0000ffff)),
+        c(static_cast<char>(from & 0xff)) {}
   bool operator==(const Data& rhs) const {
     return a == rhs.a && b == rhs.b && c == rhs.c;
   }
@@ -137,11 +141,11 @@ struct Data {
 
 TEST_F(VMCacheTest, Read_StructWithOffsets_ReturnsExpectedData) {
   constexpr size_t kCount = 1024;
-  for (int i = 1; i < 4096; i += 127) {
+  for (size_t i = 1; i < 4096; i += 127) {
     auto cache = MakeCache<Data>(kCount, i);
 
-    for (int j = 0; j < 1024; ++j) {
-      Data data;
+    for (size_t j = 0; j < 1024; ++j) {
+      Data data{};
       cache->Read(&data, j, 1);
 
       ASSERT_EQ(data, Expected<Data>(j));
@@ -168,7 +172,7 @@ TEST_F(VMCacheTest, Invalidate_RangeAcrossPages_ReloadsExpectedData) {
 
   cache->Invalidate(1023, 2);
 
-  for (int i = 1020; i < 1028; ++i) {
+  for (size_t i = 1020; i < 1028; ++i) {
     int32_t data = 0;
     cache->Read(&data, i, 1);
     ASSERT_EQ(data, Expected<int32_t>(i));
@@ -190,7 +194,7 @@ TEST_F(VMCacheTest, Dump_ResidentPages_OutputsExpectedFormat) {
   constexpr size_t kCount = 1024;
   auto cache = MakeCache<int32_t>(kCount);
 
-  for (int i = 0; i < 1024; ++i) {
+  for (size_t i = 0; i < 1024; ++i) {
     int32_t data = 0;
     cache->Read(&data, i, 1);
   }
@@ -227,8 +231,8 @@ TEST_F(VMCacheTest, Constructor_ExplicitFileSize_ReadsExpectedData) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   const size_t file_size = std::filesystem::file_size(path_);
@@ -255,8 +259,8 @@ TEST_F(VMCacheTest, Read_UnderEvictionPressure_TransparentlyReloadsData) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
@@ -284,8 +288,8 @@ TEST_F(VMCacheTest, Read_AccessedPages_PromotesToMainQueue) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
@@ -320,8 +324,8 @@ TEST_F(VMCacheTest, Read_MarkedGhostPage_PromotesToMainQueue) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
@@ -356,8 +360,8 @@ TEST_F(VMCacheTest, Read_FullMainQueue_EvictsAccessedPages) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(5) * 4096);
@@ -392,8 +396,8 @@ TEST_F(VMCacheTest, Dump_MultiEntrySmallAndMainQueues_OutputsExpectedFormat) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(20) * 4096);
@@ -431,8 +435,8 @@ TEST_F(VMCacheTest, Read_SingleTouchPages_AccumulatesInGhostQueue) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(20) * 4096);
@@ -474,14 +478,14 @@ TEST_F(VMCacheTest, Invalidate_BeyondFileEnd_IsClampedWithoutError) {
   cache->Read(&data, 0, 1);
   cache->Invalidate(1020, 80);
 
-  for (int i = 1000; i < 1020; ++i) {
+  for (size_t i = 1000; i < 1020; ++i) {
     cache->Read(&data, i, 1);
     ASSERT_EQ(data, Expected<int32_t>(i));
   }
 
   cache->Invalidate(1024LL * 1024 * 1024, 1);
 
-  for (int i = 0; i < 64; ++i) {
+  for (size_t i = 0; i < 64; ++i) {
     cache->Read(&data, i, 1);
     ASSERT_EQ(data, Expected<int32_t>(i));
   }
@@ -505,8 +509,8 @@ TEST_F(VMCacheTest, Invalidate_MarkedAndUnlockedPages_ReloadsCorrectly) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(20) * 4096);
@@ -549,8 +553,8 @@ TEST_F(VMCacheTest, Read_GhostFifoOverflow_EvictsMarkedEntry) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
@@ -586,8 +590,8 @@ TEST_F(VMCacheTest, Read_SmallQueueOverflow_EvictsSingleTouchedPageToGhost) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
@@ -618,13 +622,13 @@ TEST_F(VMCacheTest, Read_CrossPageTwelveByteStruct_ReturnsExpectedData) {
     ASSERT_EQ(buffer[i], Expected<Data>(2500 + i));
   }
 
-  Data tail;
+  Data tail{};
   cache->Read(&tail, kCount - 1, 1);
   ASSERT_EQ(tail, Expected<Data>(kCount - 1));
 
   cache->Invalidate(340, 2);
-  Data first;
-  Data second;
+  Data first{};
+  Data second{};
   cache->Read(&first, 340, 1);
   cache->Read(&second, 341, 1);
   ASSERT_EQ(first, Expected<Data>(340));
@@ -649,8 +653,8 @@ TEST_F(VMCacheTest, Constructor_ExplicitFileSizeAndOffset_ReadsExpectedData) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   const size_t file_size = std::filesystem::file_size(path_);
@@ -680,8 +684,8 @@ TEST_F(VMCacheTest, Dump_AllThreeQueuesMultiEntry_OutputsExpectedFormat) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(20) * 4096);
@@ -725,8 +729,8 @@ TEST_F(VMCacheTest, Invalidate_CachedPage_DropsFromSmallFifo) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
@@ -784,8 +788,8 @@ TEST_F(VMCacheTest, Constructor_ZeroCapacity_ThrowsException) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
 
@@ -855,8 +859,8 @@ TEST_F(VMCacheTest, Read_SpanningManyPagesWithTinyCache_ReadsAllDataCorrectly) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
@@ -888,8 +892,8 @@ TEST_F(VMCacheTest, Read_OffsetCacheWithEvictionPressure_ReadsExpectedData) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096, kOffset);
@@ -918,8 +922,8 @@ TEST_F(VMCacheTest, Read_GhostHit_PromotesToMainQueue) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
@@ -964,8 +968,8 @@ TEST_F(VMCacheTest, Read_AlignedAndUnalignedInterleaved_MaintainsConsistency) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
@@ -1000,8 +1004,8 @@ TEST_F(VMCacheTest, Invalidate_RepeatedCycles_MaintainsConsistency) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
@@ -1042,8 +1046,8 @@ TEST_F(VMCacheTest, Read_GhostRevivedPagesInMainQueue_EvictsUnderPressure) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(5) * 4096);
@@ -1095,8 +1099,8 @@ TEST_F(VMCacheTest,
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(5) * 4096);
@@ -1144,8 +1148,8 @@ TEST_F(VMCacheTest, Read_AlignedRead_EvictsToMainQueue) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
@@ -1186,8 +1190,8 @@ TEST_F(VMCacheTest, Read_UnalignedRead_EvictsToGhostQueue) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
@@ -1245,8 +1249,8 @@ TEST_F(VMCacheTest, Invalidate_WholeFile_ClearsAllQueues) {
     ssize_t wrote = ::write(
         fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
     ASSERT_LT(0, wrote);
-    written += wrote;
-    remaining -= wrote;
+    written += static_cast<size_t>(wrote);
+    remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
   VMCache<int32_t> cache(fd_, static_cast<size_t>(5) * 4096);

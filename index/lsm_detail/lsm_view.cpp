@@ -35,17 +35,19 @@ namespace {
 // Treats invalid iterator as infinity big.
 bool IsRightIteratorBigger(int left, int right,
                            const std::vector<SortedRun::Iterator>& iters) {
-  if (!iters[left].IsValid()) {
+  if (!iters[static_cast<size_t>(left)].IsValid()) {
     return false;
   }
-  if (!iters[right].IsValid()) {
+  if (!iters[static_cast<size_t>(right)].IsValid()) {
     return true;
   }
-  int result = iters[left].Compare(iters[right]);
+  int result = iters[static_cast<size_t>(left)].Compare(
+      iters[static_cast<size_t>(right)]);
   if (result != 0) {
     return 0 < result;
   }
-  return iters[right].Generation() < iters[left].Generation();
+  return iters[static_cast<size_t>(right)].Generation() <
+         iters[static_cast<size_t>(left)].Generation();
 }
 }  // namespace
 
@@ -174,7 +176,8 @@ void LSMView::Iterator::Forward() {
   std::swap(iters_[0], iters_[curr]);
   while (curr * 2 < iters_.size()) {
     if ((curr * 2) + 1 == iters_.size() ||
-        IsRightIteratorBigger(curr * 2, (curr * 2) + 1, iters_)) {
+        IsRightIteratorBigger(static_cast<int>(curr * 2),
+                              static_cast<int>((curr * 2) + 1), iters_)) {
       if (!iters_[curr].IsValid() ||
           (iters_[curr * 2].IsValid() &&
            (0 < iters_[curr * 2].Compare(iters_[curr]) ||
@@ -186,7 +189,8 @@ void LSMView::Iterator::Forward() {
         break;
       }
     } else {
-      if (IsRightIteratorBigger((curr * 2) + 1, curr, iters_)) {
+      if (IsRightIteratorBigger(static_cast<int>((curr * 2) + 1),
+                                static_cast<int>(curr), iters_)) {
         std::swap(iters_[curr], iters_[(curr * 2) + 1]);
         curr = (curr * 2) + 1;
       } else {

@@ -2,12 +2,17 @@
 #include "executor/nested_loop_join.hpp"
 
 #include <cstddef>
+#include <exception>
 #include <ostream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/join_kind.hpp"
+#include "executor/executor_base.hpp"
+#include "expression/expression.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -169,9 +174,9 @@ bool NestedLoopJoin::Next(Row* dst, RowPosition* rp) {
 }
 
 void NestedLoopJoin::Dump(std::ostream& o, int indent) const {
-  o << "NestedLoopJoin: \n" << Indent(indent + 2);
+  o << "NestedLoopJoin: \n" << Indent(static_cast<size_t>(indent) + 2);
   left_->Dump(o, indent + 2);
-  o << "\n" << Indent(indent + 2);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   right_->Dump(o, indent + 2);
 }
 

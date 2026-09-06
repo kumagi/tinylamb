@@ -63,7 +63,9 @@ class Transaction final {
   Transaction(Transaction&& o) noexcept;
   Transaction& operator=(const Transaction& o) = delete;
   Transaction& operator=(Transaction&& o) noexcept {
-    if (this == &o) return *this;
+    if (this == &o) {
+      return *this;
+    }
     // This object may itself be registered under its old identity; drop that
     // entry before adopting the source's fields and registration slot.
     if (transaction_manager_ != nullptr) {
@@ -79,8 +81,10 @@ class Transaction final {
                        std::memory_order_release);
     version_read_caches_ = std::move(o.version_read_caches_);
     read_state_mutex_ = std::move(o.read_state_mutex_);
-    prev_lsn_ = o.prev_lsn_;
-    status_ = o.status_;
+    prev_lsn_.store(o.prev_lsn_.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+    status_.store(o.status_.load(std::memory_order_relaxed),
+                  std::memory_order_relaxed);
     transaction_manager_ = o.transaction_manager_;
     read_only_ = o.read_only_;
     durability_dependence_.store(
@@ -99,14 +103,20 @@ class Transaction final {
     o.transaction_manager_ = nullptr;
     return *this;
   }
-  ~Transaction() = default;
 
-  void SetStatus(TransactionStatus status);
-  bool IsFinished() const {
-    return status_ == TransactionStatus::kCommitted ||
-           status_ == TransactionStatus::kAborted;
+  void SetStatus(TransactionStatus status) {
+    // Relaxed: the status and prev_lsn_ are read concurrently by the
+    // checkpoint thread (ATT snapshot) without transaction_table_lock; the
+    // atomic keeps those snapshot reads free of data races.  Consumers only
+    // need a self-consistent per-field value, not cross-field ordering.
+    status_.store(status, std::memory_order_relaxed);
   }
-  lsn_t PrevLSN() const { return prev_lsn_; }
+  bool IsFinished() const {
+    const TransactionStatus current = status_.load(std::memory_order_relaxed);
+    return current == TransactionStatus::kCommitted ||
+           current == TransactionStatus::kAborted;
+  }
+  lsn_t PrevLSN() const { return prev_lsn_.load(std::memory_order_relaxed); }
 
   // D4 (docs/design.md): WAL durability and external visibility are separate.
   // A reader that observes another transaction's committed MVCC version
@@ -240,6 +250,15 @@ class Transaction final {
   struct VersionCacheShard {
     std::mutex mutex;
     std::unordered_map<RowPosition, VersionCacheEntry> entries;
+    // Strings evicted from `entries` while a caller may still hold a
+    // string_view into them.  ReadVersion hands out views into this shard's
+    // strings; recycling a node's storage immediately would leave those
+    // views dangling after kMaxVersionReadCache subsequent reads of other
+    // rows.  Retired strings are freed in batches once the pool itself is
+    // refilled, which bounds memory at ~2x the live cache while making the
+    // safe-consumption window thousands of times wider than the eviction
+    // boundary.
+    std::vector<std::string> retired;
   };
   // Returns this calling thread's version cache shard in this transaction.
   VersionCacheShard& ThreadShard();
@@ -260,6 +279,10 @@ class Transaction final {
   uint64_t snapshot_ts_{0};
 
   std::unordered_set<RowPosition> read_set_{};
+  // Owner-thread confined: writes are issued from the transaction's owning
+  // thread only (reads may register concurrently from join workers, hence
+  // read_state_mutex_; writes also drive AcquireWriteIntent whose shard
+  // locks must never nest under a transaction-local mutex).
   std::unordered_set<RowPosition> write_set_{};
   std::unordered_set<page_id_t> mutated_index_roots_{};
   // Process-wide generation, unique across every Transaction ever created.
@@ -275,11 +298,15 @@ class Transaction final {
   // version cache and read set are transaction-local, so guard them while
   // preserving a single MVCC snapshot across those workers.
   std::unique_ptr<std::mutex> read_state_mutex_{std::make_unique<std::mutex>()};
-  lsn_t prev_lsn_{};
+  // Relaxed atomics: writers (the owning thread, via AddLog/SetStatus) do
+  // not hold transaction_table_lock, but the checkpoint thread reads both
+  // fields for its ActiveTransactionTable snapshot while holding it.  The
+  // atomics remove the data race; no cross-field ordering is required.
+  std::atomic<lsn_t> prev_lsn_{0};
   // D4: highest dependency commit LSN observed by this transaction (see
   // RecordDurabilityDependence).  Updated from const read paths.
   mutable std::atomic<lsn_t> durability_dependence_{0};
-  TransactionStatus status_ = TransactionStatus::kUnknown;
+  std::atomic<TransactionStatus> status_{TransactionStatus::kUnknown};
   bool read_only_{false};
 
   // Not owned by this class.

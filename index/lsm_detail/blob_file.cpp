@@ -45,12 +45,13 @@ Cache::Locks BlobFile::ReadAt(size_t offset, std::string_view& out) const {
   constexpr size_t kHeaderSize = sizeof(int32_t);
   int32_t key_size = 0;
   cache_.Copy(&key_size, offset, kHeaderSize);
-  key_size = be32toh(key_size);
+  key_size = static_cast<int32_t>(be32toh(static_cast<uint32_t>(key_size)));
   if (key_size < 0) {
     // Disk-derived length is bogus; refuse instead of propagating garbage.
     return {};
   }
-  return cache_.ReadAt(offset + kHeaderSize, key_size, out);
+  return cache_.ReadAt(offset + kHeaderSize, static_cast<size_t>(key_size),
+                       out);
 }
 
 lsn_t BlobFile::Append(std::string_view payload) {

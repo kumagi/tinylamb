@@ -14,10 +14,14 @@
  * limitations under the License.
  */
 
-#include <stdlib.h>  // NOLINT(modernize-deprecated-headers) // POSIX setenv/unsetenv below are only provided by this header.
+// clang-format off
+// NOLINTNEXTLINE(modernize-deprecated-headers) // POSIX setenv/unsetenv live here.
+#include <stdlib.h>
+// clang-format on
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <sstream>
 #include <string>

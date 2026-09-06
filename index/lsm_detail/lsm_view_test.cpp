@@ -16,6 +16,7 @@
 
 #include "index/lsm_detail/lsm_view.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -49,7 +50,8 @@ class LSMViewTest : public ::testing::Test {
                             LSMValue(std::to_string(i)));
         }
         std::string filepath = path_ / std::to_string(i);
-        SortedRun::Construct(filepath, mem_value, *blob_, i);
+        SortedRun::Construct(filepath, mem_value, *blob_,
+                             static_cast<size_t>(i));
         index_files.emplace_back(std::move(filepath));
       }
     }
@@ -69,8 +71,8 @@ class LSMViewTest : public ::testing::Test {
 };
 
 TEST_F(LSMViewTest, Find) {
-  // Arrange -- LSMView is pre-constructed by SetUp() with 10 SortedRuns of 100 keys each
-  // Act -- find 10 valid keys and 10 non-existent keys
+  // Arrange -- LSMView is pre-constructed by SetUp() with 10 SortedRuns of 100
+  // keys each Act -- find 10 valid keys and 10 non-existent keys
   ASSERT_SUCCESS_AND_EQ(view_->Find("343"), "3");
   ASSERT_EQ(view_->Find("a43").GetStatus(), Status::kNotExists);
   ASSERT_SUCCESS_AND_EQ(view_->Find("822"), "8");
@@ -84,7 +86,8 @@ TEST_F(LSMViewTest, Find) {
 }
 
 TEST_F(LSMViewTest, Iter) {
-  // Arrange -- LSMView is pre-constructed by SetUp() with 10 SortedRuns of 100 keys each
+  // Arrange -- LSMView is pre-constructed by SetUp() with 10 SortedRuns of 100
+  // keys each
   //            Build the expected map of 1000 keys (0..999) -> value (i/100)
   auto iter = view_->Begin();
   std::map<std::string, std::string> expected;
@@ -183,8 +186,7 @@ TEST_F(LSMViewTest, MergeSkipsDuplicateAndKeepsOrder) {
   new_run.emplace("k", LSMValue("z"));
   SortedRun::Construct(path_ / "new.idx", new_run, *blob_, 12);
 
-  std::vector<std::filesystem::path> files{path_ / "new.idx",
-                                           path_ / "mid.idx",
+  std::vector<std::filesystem::path> files{path_ / "new.idx", path_ / "mid.idx",
                                            path_ / "old.idx"};
   LSMView view(*blob_, files);
   auto iter = view.Begin();
@@ -226,7 +228,8 @@ TEST_F(LSMViewTest, FindEmptyKeySkipsEmptyRun) {
 }
 
 TEST_F(LSMViewTest, Merged) {
-  // Arrange -- LSMView is pre-constructed by SetUp() with 10 SortedRuns of 100 keys each
+  // Arrange -- LSMView is pre-constructed by SetUp() with 10 SortedRuns of 100
+  // keys each
   //            Build the expected map of 1000 keys (0..999) -> value (i/100)
   std::filesystem::path merged_file = path_ / "merged.idx";
   std::map<std::string, std::string> expected;
@@ -239,7 +242,8 @@ TEST_F(LSMViewTest, Merged) {
   SortedRun merged(merged_file);
   ASSERT_EQ(merged.Size(), 100 * 10);
 
-  // Act -- build a new LSMView from the single merged SortedRun and walk its iterator
+  // Act -- build a new LSMView from the single merged SortedRun and walk its
+  // iterator
   auto it = expected.begin();
   std::vector<SortedRun> sr{merged};
   LSMView new_merger(*blob_, sr);
@@ -256,7 +260,8 @@ TEST_F(LSMViewTest, Merged) {
 }
 
 TEST_F(LSMViewTest, Recover) {
-  // Arrange -- destroy the existing view_ and blob_ to emulate a crash+recover scenario
+  // Arrange -- destroy the existing view_ and blob_ to emulate a crash+recover
+  // scenario
   view_.reset();
   blob_ = std::make_unique<BlobFile>(path_ / "blob.db");
   std::vector<std::filesystem::path> idx;
@@ -279,7 +284,8 @@ TEST_F(LSMViewTest, Recover) {
 }
 
 TEST_F(LSMViewTest, Overwrite) {
-  // Arrange -- build a SortedRun with 1000 keys (0..999) all mapped to value (i*2)
+  // Arrange -- build a SortedRun with 1000 keys (0..999) all mapped to value
+  // (i*2)
   std::map<std::string, LSMValue> mem_value;
   for (int i = 0; i < 1000; ++i) {
     mem_value.emplace(std::to_string(i), LSMValue(std::to_string(i * 2)));
@@ -291,7 +297,8 @@ TEST_F(LSMViewTest, Overwrite) {
   std::vector<SortedRun> index_files{SortedRun(filepath)};
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
-  // Assert -- find each key; the overwrite run takes precedence so every key maps to i*2
+  // Assert -- find each key; the overwrite run takes precedence so every key
+  // maps to i*2
   for (int i = 0; i < 1000; ++i) {
     ASSERT_SUCCESS_AND_EQ(view_->Find(std::to_string(i)),
                           std::to_string(i * 2));
@@ -299,8 +306,10 @@ TEST_F(LSMViewTest, Overwrite) {
 }
 
 TEST_F(LSMViewTest, OverwriteAndScan) {
-  // Arrange -- build a SortedRun with 1000 keys where even keys (i%2==0) map to i*2
-  //            and odd keys (i%2==1) are absent (only 500 entries in the overwrite run)
+  // Arrange -- build a SortedRun with 1000 keys where even keys (i%2==0) map to
+  // i*2
+  //            and odd keys (i%2==1) are absent (only 500 entries in the
+  //            overwrite run)
   std::map<std::string, LSMValue> mem_value;
   for (int i = 0; i < 1000; i += 2) {
     mem_value.emplace(std::to_string(i), LSMValue(std::to_string(i * 2)));
@@ -308,7 +317,8 @@ TEST_F(LSMViewTest, OverwriteAndScan) {
   std::string filepath = path_ / "overwrites.idx";
   SortedRun::Construct(filepath, mem_value, *blob_, 11);
 
-  // Act -- build a new LSMView from the existing index files (including the overwrite run)
+  // Act -- build a new LSMView from the existing index files (including the
+  // overwrite run)
   std::vector<std::filesystem::path> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (!entry.path().string().ends_with(".db")) {
@@ -317,12 +327,13 @@ TEST_F(LSMViewTest, OverwriteAndScan) {
   }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
-  // Assert -- scan the view: even keys map to i*2, odd keys map to i/100 (from the original SetUp runs)
+  // Assert -- scan the view: even keys map to i*2, odd keys map to i/100 (from
+  // the original SetUp runs)
   auto iter = view_->Begin();
   while (iter.IsValid()) {
     std::string key = iter.Key();
     std::string value = iter.Value();
-    int key_int = std::stol(key);
+    int key_int = static_cast<int>(std::stol(key));
     if (key_int % 2 == 0) {
       ASSERT_EQ(value, std::to_string(key_int * 2));
     } else {
@@ -339,7 +350,8 @@ TEST_F(LSMViewTest, DeleteAndScan) {
   std::string filepath = path_ / "deletes.idx";
   SortedRun::Construct(filepath, mem_value, *blob_, 11);
 
-  // Act -- build a new LSMView from the existing index files (including the delete run)
+  // Act -- build a new LSMView from the existing index files (including the
+  // delete run)
   std::vector<std::filesystem::path> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (!entry.path().string().ends_with(".db")) {
@@ -348,13 +360,15 @@ TEST_F(LSMViewTest, DeleteAndScan) {
   }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
-  // Assert -- finding the deleted key "42" returns kNotExists (masked by the tombstone)
+  // Assert -- finding the deleted key "42" returns kNotExists (masked by the
+  // tombstone)
   StatusOr<std::string> result = view_->Find(std::to_string(42));
   ASSERT_EQ(result.GetStatus(), Status::kNotExists);
 }
 
 TEST_F(LSMViewTest, DeleteMultiAndScan) {
-  // Arrange -- build a SortedRun with 500 delete entries for even keys (0,2,...,998)
+  // Arrange -- build a SortedRun with 500 delete entries for even keys
+  // (0,2,...,998)
   std::map<std::string, LSMValue> mem_value;
   for (int i = 0; i < 1000; i += 2) {
     mem_value.emplace(std::to_string(i), LSMValue::Delete());
@@ -362,7 +376,8 @@ TEST_F(LSMViewTest, DeleteMultiAndScan) {
   std::filesystem::path filepath = path_ / "deletes.idx";
   SortedRun::Construct(filepath, mem_value, *blob_, 11);
 
-  // Act -- build a new LSMView from the existing index files (including the delete run)
+  // Act -- build a new LSMView from the existing index files (including the
+  // delete run)
   std::vector<std::filesystem::path> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (!entry.path().string().ends_with(".db")) {
@@ -371,18 +386,20 @@ TEST_F(LSMViewTest, DeleteMultiAndScan) {
   }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
-  // Assert -- scan the view; every remaining key must be odd (even keys are tombstoned)
+  // Assert -- scan the view; every remaining key must be odd (even keys are
+  // tombstoned)
   auto iter = view_->Begin();
   while (iter.IsValid()) {
     std::string key = iter.Key();
-    int key_int = std::stol(key);
+    int key_int = static_cast<int>(std::stol(key));
     ASSERT_EQ(key_int % 2, 1);
     ++iter;
   }
 }
 
 TEST_F(LSMViewTest, DeleteOverWriteScan) {
-  // Arrange -- build two SortedRuns: deletes.idx (500 deletes for even keys) and overwrite.idx (250 values for i%4==0)
+  // Arrange -- build two SortedRuns: deletes.idx (500 deletes for even keys)
+  // and overwrite.idx (250 values for i%4==0)
   {
     std::map<std::string, LSMValue> mem_value;
     for (int i = 0; i < 1000; i += 2) {
@@ -400,7 +417,8 @@ TEST_F(LSMViewTest, DeleteOverWriteScan) {
     SortedRun::Construct(filepath, mem_value, *blob_, 12);
   }
 
-  // Act -- build a new LSMView from all existing index files (deletes + overwrites + original 10 runs)
+  // Act -- build a new LSMView from all existing index files (deletes +
+  // overwrites + original 10 runs)
   std::vector<std::filesystem::path> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (!entry.path().string().ends_with(".db")) {
@@ -409,11 +427,12 @@ TEST_F(LSMViewTest, DeleteOverWriteScan) {
   }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
-  // Assert -- scan the view; for i%4==0 the value is "Hello", for other odd keys the value is i/100
+  // Assert -- scan the view; for i%4==0 the value is "Hello", for other odd
+  // keys the value is i/100
   auto iter = view_->Begin();
   while (iter.IsValid()) {
     std::string key = iter.Key();
-    int key_int = std::stol(key);
+    int key_int = static_cast<int>(std::stol(key));
     if (key_int % 4 == 0) {
       ASSERT_EQ(iter.Value(), "Hello");
       LOG(INFO) << key_int;

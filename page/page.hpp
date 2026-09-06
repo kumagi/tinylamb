@@ -209,7 +209,7 @@ class Page {
 #endif
 };
 
-static_assert(std::is_trivially_destructible<Page>::value == true,
+static_assert(std::is_trivially_destructible<Page>::value,
               "Page must be trivially destructible");
 static_assert(sizeof(Page) == kPageSize,
               "Page size must be equal to kPageSize");

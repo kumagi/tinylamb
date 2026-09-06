@@ -2,11 +2,16 @@
 #include "query/googlesql_compliance_file.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <ranges>
 #include <sstream>
@@ -236,7 +241,7 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
         const std::string expr = Trim(s.substr(0, as_pos));
         const std::string name = Trim(s.substr(as_pos + 4));
         if (!name.empty() && !expr.empty()) {
-          out->parameters.push_back({name, expr});
+          out->parameters.emplace_back(name, expr);
         }
         continue;
       }
@@ -249,7 +254,7 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
         const std::string expr = Trim(s.substr(0, split));
         const std::string name = Trim(s.substr(split));
         if (!name.empty() && !expr.empty()) {
-          out->parameters.push_back({name, expr});
+          out->parameters.emplace_back(name, expr);
         }
         continue;
       }
@@ -406,9 +411,7 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
       }
       if (c == '<' || c == '[' || c == '(' || c == '{') {
         ++depth;
-      } else if (c == '>' && depth > 0) {
-        --depth;
-      } else if ((c == ')' || c == '}') && depth > 0) {
+      } else if ((c == '>' || c == ')' || c == '}') && depth > 0) {
         --depth;
       } else if ((c == ',' && depth == 0) || c == ']') {
         break;
@@ -454,7 +457,7 @@ std::string ApplyParameters(
     while ((pos = sql.find(target, pos)) != std::string::npos) {
       const size_t end = pos + target.size();
       if (end < sql.size() &&
-          (std::isalnum(static_cast<unsigned char>(sql[end])) ||
+          ((std::isalnum(static_cast<unsigned char>(sql[end])) != 0) ||
            sql[end] == '_')) {
         pos = end;
         continue;
@@ -576,7 +579,7 @@ GoogleSqlComplianceCase ParseSegment(
 }
 
 std::string Unquote(std::string_view token) {
-  if (token.size() >= 1 && (token.front() == 'b' || token.front() == 'B')) {
+  if (!token.empty() && (token.front() == 'b' || token.front() == 'B')) {
     token.remove_prefix(1);
   }
   if (token.size() >= 2 && ((token.front() == '"' && token.back() == '"') ||
@@ -602,8 +605,6 @@ std::string Unquote(std::string_view token) {
           out.push_back('\t');
         } else if (next == 'r') {
           out.push_back('\r');
-        } else if (next == '\\' || next == '\'' || next == '"') {
-          out.push_back(next);
         } else {
           out.push_back(next);
         }
@@ -675,8 +676,7 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
                      bool* unordered = nullptr) {
   const std::string text = Trim(token);
   constexpr std::string_view kPrefix = "ARRAY<";
-  if (text.size() < kPrefix.size() ||
-      text.compare(0, kPrefix.size(), kPrefix) != 0) {
+  if (text.size() < kPrefix.size() || !text.starts_with(kPrefix)) {
     return false;
   }
   int depth = 1;
@@ -792,15 +792,13 @@ bool IsDifferentialPrivacyCase(const GoogleSqlComplianceCase& test_case) {
   if (hay.find("anon_") != std::string::npos) {
     return true;
   }
-  for (const std::string& feature : test_case.required_features) {
-    const std::string lower = ToLower(feature);
-    if (lower.find("anonym") != std::string::npos ||
-        lower.find("differential_privacy") != std::string::npos ||
-        lower.find("privacy") != std::string::npos) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(
+      test_case.required_features, [](const std::string& feature) {
+        const std::string lower = ToLower(feature);
+        return lower.find("anonym") != std::string::npos ||
+               lower.find("differential_privacy") != std::string::npos ||
+               lower.find("privacy") != std::string::npos;
+      });
 }
 
 std::string FormatComplianceValue(const Value& value) {
@@ -817,17 +815,18 @@ std::string FormatComplianceValue(const Value& value) {
       if (std::isinf(value.value.double_value)) {
         return value.value.double_value > 0 ? "inf" : "-inf";
       }
-      char buffer[64];
-      auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer),
-                                     value.value.double_value);
-      return std::string(buffer, ptr - buffer);
+      std::array<char, 64> buffer{};
+      auto [ptr, ec] =
+          std::to_chars(buffer.begin(), buffer.end(), value.value.double_value);
+      return std::string{buffer.data(),
+                         static_cast<size_t>(ptr - buffer.data())};
     }
     case ValueType::kVarChar:
       return std::string(value.value.varchar_value);
     case ValueType::kDate:
       return FormatDateDays(value.value.int_value);
     case ValueType::kArray: {
-      const std::string sql_type = value.ArrayElementSqlType();
+      const std::string& sql_type = value.ArrayElementSqlType();
       const auto& elements = value.ArrayElements();
       std::string inner;
       if (elements.size() >= 2) {
@@ -877,7 +876,7 @@ std::string NormalizeWsText(std::string_view str) {
   std::string out;
   bool in_space = false;
   for (char c : str) {
-    if (std::isspace(static_cast<unsigned char>(c))) {
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) {
       if (!in_space && !out.empty() && out.back() != '[' && out.back() != '(' &&
           out.back() != '{' && out.back() != ',') {
         out.push_back(' ');
@@ -920,8 +919,8 @@ void SplitProtoMembers(const std::string& body,
                    colon + 1 <= piece.size() - 1 && ProtoIsIdentStart(piece[0]);
       for (size_t k = 0; ident && k < colon; ++k) {
         const char c = piece[k];
-        if (!(std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
-              c == '.' || c == '[' || c == ']')) {
+        if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_' &&
+            c != '.' && c != '[' && c != ']') {
           ident = false;
           break;
         }
@@ -993,17 +992,19 @@ void SplitProtoMembers(const std::string& body,
     if (depth == 0 && (c == ',' || c == ';')) {
       flush(i);
       ++i;
-      while (i < n && std::isspace(static_cast<unsigned char>(body[i]))) {
+      while (i < n &&
+             (std::isspace(static_cast<unsigned char>(body[i])) != 0)) {
         ++i;
       }
       start = i;
       continue;
     }
-    if (depth == 0 && std::isspace(static_cast<unsigned char>(c))) {
+    if (depth == 0 && (std::isspace(static_cast<unsigned char>(c)) != 0)) {
       // Whitespace ends the member only when an identifier-colon follows
       // ("field: value field2: value2"); bare values keep their spaces.
       size_t j = i;
-      while (j < n && std::isspace(static_cast<unsigned char>(body[j]))) {
+      while (j < n &&
+             (std::isspace(static_cast<unsigned char>(body[j])) != 0)) {
         ++j;
       }
       if (j < n && ProtoIsIdentStart(body[j])) {
@@ -1013,7 +1014,8 @@ void SplitProtoMembers(const std::string& body,
                 body[k] == '_' || body[k] == '.' || body[k] == ']')) {
           ++k;
         }
-        while (k < n && std::isspace(static_cast<unsigned char>(body[k]))) {
+        while (k < n &&
+               (std::isspace(static_cast<unsigned char>(body[k])) != 0)) {
           ++k;
         }
         if (k < n && (body[k] == ':' || body[k] == '{' || body[k] == '<') &&
@@ -1104,15 +1106,13 @@ bool ProtoBodiesMatch(const std::string& want_body,
   return CanonicalizeProtoBody(want_body) == CanonicalizeProtoBody(actual_body);
 }
 
-}  // namespace
-
 // Decode a scalar extracted from an encoded STRUCT/PROTO JSON object before
 // comparing it with a typed golden.  Keeping everything as VARCHAR here
 // makes JSON-encoded BOOL/number members fail against `false`/numeric tokens.
 Value ParseEmbeddedComplianceValue(std::string token) {
   token = Trim(token);
   if (ToLower(token) == "null") {
-    return Value();
+    return {};
   }
   if (ToLower(token) == "true") {
     return Value(int64_t{1});
@@ -1123,24 +1123,30 @@ Value ParseEmbeddedComplianceValue(std::string token) {
   if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
     return Value(Unquote(token));
   }
+  size_t consumed = 0;
   try {
-    size_t consumed = 0;
     const int64_t value = std::stoll(token, &consumed);
     if (consumed == token.size()) {
       return Value(value);
     }
   } catch (...) {
+    // Not an integer (invalid or out of range): fall through to the double /
+    // VARCHAR fallbacks below.
+    consumed = 0;
   }
   try {
-    size_t consumed = 0;
     const double value = std::stod(token, &consumed);
     if (consumed == token.size()) {
       return Value(value);
     }
   } catch (...) {
+    // Not a number either: keep the raw token as a VARCHAR value.
+    consumed = 0;
   }
   return Value(std::move(token));
 }
+
+}  // namespace
 
 bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   const std::string want = Trim(expected);
@@ -1456,7 +1462,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
               }
             }
           }
-          if (matched) return true;
+          if (matched) {
+            return true;
+          }
         }
       }
     }
@@ -1520,7 +1528,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             break;
           }
         }
-        if (matched) return true;
+        if (matched) {
+          return true;
+        }
       }
     }
     if (actual_str == unquoted) {
@@ -1532,7 +1542,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     auto strip_order_annotations = [](const std::string& s) {
       std::string out = s;
       for (const char* note : {"known order:", "unknown order:"}) {
-        size_t pos;
+        size_t pos = 0;
         const size_t note_len = std::char_traits<char>::length(note);
         while ((pos = ToLower(out).find(note)) != std::string::npos) {
           out.erase(pos, note_len);
@@ -1682,10 +1692,10 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     if (unquoted.size() > 3 &&
         (unquoted[unquoted.size() - 3] == '-' ||
          unquoted[unquoted.size() - 3] == '+') &&
-        std::isdigit(
-            static_cast<unsigned char>(unquoted[unquoted.size() - 2])) &&
-        std::isdigit(
-            static_cast<unsigned char>(unquoted[unquoted.size() - 1]))) {
+        (std::isdigit(
+             static_cast<unsigned char>(unquoted[unquoted.size() - 2])) != 0) &&
+        (std::isdigit(
+             static_cast<unsigned char>(unquoted[unquoted.size() - 1])) != 0)) {
       if (actual_str == unquoted.substr(0, unquoted.size() - 3)) {
         return true;
       }
@@ -1695,9 +1705,10 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         unquoted[7] == '-') {
       auto parse_ts_utc = [](std::string_view s)
           -> std::pair<bool, std::pair<int64_t, int64_t>> {
+        const std::string str(s);
         int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
-        if (sscanf(s.data(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) <
-            6) {
+        if (sscanf(str.c_str(),  // NOLINT(cert-err34-c) field count validated
+                   "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) < 6) {
           return {false, {0, 0}};
         }
         int64_t sub_ns = 0;
@@ -1721,9 +1732,14 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         if (tz_pos != std::string_view::npos && tz_pos + 1 < s.size()) {
           int tzh = 0, tzm = 0;
           if (s.find(':', tz_pos) != std::string_view::npos) {
-            sscanf(s.data() + tz_pos + 1, "%d:%d", &tzh, &tzm);
-          } else {
-            sscanf(s.data() + tz_pos + 1, "%d", &tzh);
+            if (sscanf(str.c_str() + tz_pos + 1,  // NOLINT(cert-err34-c)
+                       "%d:%d", &tzh, &tzm) < 2) {
+              tzh = 0;
+              tzm = 0;
+            }
+          } else if (sscanf(str.c_str() + tz_pos + 1,  // NOLINT(cert-err34-c)
+                            "%d", &tzh) < 1) {
+            tzh = 0;
           }
           tz_sec = (tzh * 3600 + tzm * 60) * (s[tz_pos] == '-' ? -1 : 1);
         }
@@ -1732,7 +1748,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             std::chrono::day{static_cast<unsigned>(D)}};
         int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
         int64_t total_secs =
-            days * 86400LL + h * 3600LL + m * 60LL + sec - tz_sec;
+            (days * 86400LL) + (h * 3600LL) + (m * 60LL) + sec - tz_sec;
         return {true, {total_secs, sub_ns}};
       };
       auto [ok1, utc1] = parse_ts_utc(actual_str);

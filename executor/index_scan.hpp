@@ -82,6 +82,29 @@ class IndexScan : public ExecutorBase {
   Schema schema_;
 };
 
+// EXPLAIN-facing wrapper over an index scan executor: marks the access path
+// as the skip-scan family (seek-driven index navigation) while delegating
+// every operation to the wrapped scan.
+class IndexSkipScanExecutor final : public ExecutorBase {
+ public:
+  explicit IndexSkipScanExecutor(Executor inner) : inner_(std::move(inner)) {}
+  IndexSkipScanExecutor(const IndexSkipScanExecutor&) = delete;
+  IndexSkipScanExecutor& operator=(const IndexSkipScanExecutor&) = delete;
+  ~IndexSkipScanExecutor() override = default;
+
+  bool Next(Row* dst, RowPosition* rp) override {
+    return inner_->Next(dst, rp);
+  }
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    return inner_->NextBatch(destination, max_rows);
+  }
+  void Dump(std::ostream& o, int indent) const override;
+  void Explain(std::ostream& o, int indent) const override { Dump(o, indent); }
+
+ private:
+  Executor inner_;
+};
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_INDEX_SCAN_HPP

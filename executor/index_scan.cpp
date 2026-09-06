@@ -20,6 +20,8 @@
 
 #include "index_scan.hpp"
 
+#include <cstddef>
+#include <iterator>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -141,6 +143,14 @@ void IndexScan::Dump(std::ostream& o, int /*indent*/) const {
   if (cond_) {
     o << " WHERE " << *cond_;
   }
+}
+
+}  // namespace tinylamb
+namespace tinylamb {
+
+void IndexSkipScanExecutor::Dump(std::ostream& o, int indent) const {
+  o << "IndexSkipScan\n" << std::string(static_cast<size_t>(indent) + 2, ' ');
+  inner_->Dump(o, indent + 2);
 }
 
 }  // namespace tinylamb

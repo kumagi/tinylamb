@@ -80,6 +80,19 @@ class ProductPlan final : public PlanBase {
       const std::vector<bool>& ascending) const override;
   [[nodiscard]] HashJoinMode GetHashJoinMode() const { return hash_mode_; }
   [[nodiscard]] JoinKind Kind() const { return kind_; }
+  // Per-key null-safety (IS NOT DISTINCT FROM equijoins) and the residual
+  // predicate the implementation rule wraps in a Selection above this join.
+  // Both ride down to the executor purely so EXPLAIN can annotate the node.
+  void SetJoinNotes(std::vector<bool> key_null_safe, Expression residual_note) {
+    key_null_safe_ = std::move(key_null_safe);
+    residual_note_ = std::move(residual_note);
+  }
+  [[nodiscard]] const std::vector<bool>& KeyNullSafe() const {
+    return key_null_safe_;
+  }
+  [[nodiscard]] const Expression& ResidualNote() const {
+    return residual_note_;
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -93,6 +106,8 @@ class ProductPlan final : public PlanBase {
   const TableStatistics* right_ts_;
   HashJoinMode hash_mode_{};
   JoinKind kind_{};
+  std::vector<bool> key_null_safe_;
+  Expression residual_note_;
   Schema output_schema_;
   TableStatistics stats_;
 };

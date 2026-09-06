@@ -16,11 +16,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -32,6 +34,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/join_kind.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -83,7 +86,7 @@ class SyntheticBatchExecutor final : public ExecutorBase {
     }
     *destination = Row({Value(static_cast<int64_t>(next_row_ % 100))});
     if (position != nullptr) {
-      *position = RowPosition(1, next_row_);
+      *position = RowPosition(1, static_cast<slot_t>(next_row_));
     }
     ++next_row_;
     return true;
@@ -95,7 +98,7 @@ class SyntheticBatchExecutor final : public ExecutorBase {
     const size_t batch_rows = std::min<size_t>(max_rows, 64);
     while (next_row_ < row_count_ && destination->Size() < batch_rows) {
       destination->Append(Row({Value(static_cast<int64_t>(next_row_ % 100))}),
-                          RowPosition(1, next_row_));
+                          RowPosition(1, static_cast<slot_t>(next_row_)));
       ++next_row_;
     }
     return destination->Size();
@@ -1575,7 +1578,7 @@ class FailingBatchExecutor final : public ExecutorBase {
     }
     *dst = Row({Value(static_cast<int64_t>(emitted_))});
     if (position != nullptr) {
-      *position = RowPosition(1, emitted_);
+      *position = RowPosition(1, static_cast<slot_t>(emitted_));
     }
     ++emitted_;
     --remaining_;
@@ -1593,7 +1596,7 @@ class FailingBatchExecutor final : public ExecutorBase {
         throw std::runtime_error("synthetic aggregation failure");
       }
       destination->Append(Row({Value(static_cast<int64_t>(emitted_))}),
-                          RowPosition(1, emitted_));
+                          RowPosition(1, static_cast<slot_t>(emitted_)));
       ++emitted_;
       --remaining_;
     }
@@ -1772,11 +1775,17 @@ TEST_F(ExecutorTest, HashJoinSpilledBuildKeepsNullProbeKeyOutOfAntiOutput) {
   QueryMemoryBudget::Global().ResetForTest(8192);
   struct Restore {
     size_t value;
+    explicit Restore(size_t v) : value(v) {}
     ~Restore() { QueryMemoryBudget::Global().ResetForTest(value); }
+    Restore(const Restore&) = delete;
+    Restore& operator=(const Restore&) = delete;
+    Restore(Restore&&) = delete;
+    Restore& operator=(Restore&&) = delete;
   } restore{original};
 
   // Build side needs enough rows to exceed the tiny budget.
   std::vector<Row> build_rows;
+  build_rows.reserve(400);
   for (int64_t i = 0; i < 400; ++i) {
     build_rows.emplace_back(Row({Value(i)}));
   }
@@ -1814,6 +1823,7 @@ TEST_F(ExecutorTest, InMemoryShardedBuildKeepsNullBuildKeyOutOfMatches) {
       Row({Value(int64_t{4999})}),
   });
   std::vector<Row> probe_rows;
+  probe_rows.reserve(5000);
   for (int64_t i = 0; i < 5000; ++i) {
     probe_rows.emplace_back(Row({Value(i)}));
   }
@@ -3666,6 +3676,50 @@ TEST_F(ExecutorTest, SortNullsAscendingFirstDescendingLast) {
   EXPECT_EQ(desc.second, (std::vector<bool>{false, false, true, true}));
 }
 
+// Explicit NULLS LAST must place NULLs after VARCHAR/DOUBLE keys: the null
+// sentinel byte must not collide with the memcomparable type tags.
+TEST_F(ExecutorTest, SortVarcharNullsLastAfterValues) {
+  const Schema schema("synthetic", {Column("s", ValueType::kVarChar)});
+  auto collect = [&](bool nulls_first) {
+    auto input = std::make_shared<ConstantExecutor>(
+        std::vector<Row>{Row({Value("b")}), Row({Value()}), Row({Value("a")})});
+    SortExecutor sort(input, schema,
+                      {{ColumnValueExp("s"), true, nulls_first}});
+    Row row;
+    RowPosition pos;
+    std::vector<std::string> order;
+    while (sort.Next(&row, &pos)) {
+      order.push_back(
+          row[0].IsNull() ? "<NULL>" : std::string(row[0].value.varchar_value));
+    }
+    return order;
+  };
+
+  EXPECT_EQ(collect(false), (std::vector<std::string>{"a", "b", "<NULL>"}));
+  EXPECT_EQ(collect(true), (std::vector<std::string>{"<NULL>", "a", "b"}));
+}
+
+// Same contract for DOUBLE keys: the old '\x02' null sentinel sorted before
+// the '\x03' double type tag, flipping NULLS LAST into NULLS FIRST.
+TEST_F(ExecutorTest, SortDoubleNullsLastAfterValues) {
+  const Schema schema("synthetic", {Column("d", ValueType::kDouble)});
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(2.5)}), Row({Value()}), Row({Value(1.5)})});
+  SortExecutor sort(input, schema, {{ColumnValueExp("d"), true, false}});
+  Row row;
+  RowPosition pos;
+  std::vector<double> values;
+  std::vector<bool> null_flags;
+  while (sort.Next(&row, &pos)) {
+    null_flags.push_back(row[0].IsNull());
+    if (!row[0].IsNull()) {
+      values.push_back(row[0].value.double_value);
+    }
+  }
+  EXPECT_EQ(values, (std::vector<double>{1.5, 2.5}));
+  EXPECT_EQ(null_flags, (std::vector<bool>{false, false, true}));
+}
+
 TEST_F(ExecutorTest, SortNextBatchSplitsSortedOutput) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto input = std::make_shared<ConstantExecutor>(
@@ -3777,7 +3831,7 @@ TEST_F(ExecutorTest, HashJoinVarcharAndDoubleKeysAndGrowth) {
         Row({Value(std::string(v)), Value(d), Value(int64_t{i})}));
     if (i % 2 == 0) {
       right_rows.emplace_back(
-          Row({Value(std::string(v)), Value(d), Value(int64_t{i * 10})}));
+          Row({Value(std::string(v)), Value(d), Value(int64_t{i} * 10)}));
     }
   }
   for (const auto& r : left_rows) {
@@ -3810,6 +3864,7 @@ TEST_F(ExecutorTest, HashJoinVarcharAndDoubleKeysAndGrowth) {
 
 TEST_F(ExecutorTest, AggregationTypedConstantFastPath) {
   std::vector<Row> rows;
+  rows.reserve(100);
   for (int64_t i = 0; i < 100; ++i) {
     rows.emplace_back(std::vector<Value>{Value(i)});
   }
@@ -3969,7 +4024,7 @@ TEST_F(ExecutorTest, OptimizerAndRelationalPathsAgree) {
        "EXISTS (SELECT 1 FROM D5C AS e WHERE e.id = a.id);"},
   };
   for (const auto& [optimizer_sql, relational_sql] : pairs) {
-    const auto normalize = [](std::vector<Row> rows) {
+    const auto normalize = [](const std::vector<Row>& rows) {
       std::vector<std::string> lines;
       for (const Row& row : rows) {
         std::ostringstream out;

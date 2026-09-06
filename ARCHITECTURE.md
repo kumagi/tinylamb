@@ -63,7 +63,7 @@ server                server/          (postgres wire protocol)
 | storage | `page/` `recovery/` `transaction/` | `page_pool.hpp`, `logger.hpp`(WAL), `transaction_manager.hpp` | バッファ管理, 先書きログ, 分離レベル |
 | index | `index/` | `b_plus_tree.hpp`, `lsm_tree.hpp`, `index_schema.hpp` | 順次/LSM インデックス |
 | table | `table/` | `table.hpp`, `full_scan_iterator.hpp`, `table_statistics.hpp` | 行データアクセスと統計 |
-| database | `database/` | `database.hpp`, `catalog_test.cpp`, `transaction_context.hpp` | カタログ, DDL, トランザクション文脈 |
+| database | `database/` | `database.hpp`, `catalog_reader.hpp`, `transaction_context.hpp` | カタログ, DDL, トランザクション文脈 |
 | expression | `expression/` | `expression.hpp`, `bytecode.hpp`, `jit.hpp` | 式評価 (AST 正本・bytecode はバッチ実行用 IR・JIT はその compiler, docs/expression_evaluation.md) |
 | relational | `executor/detail/` | `relation.hpp`, `scan_filter.hpp`, `subquery_runtime.hpp` | 物理中間表現と実行補助 |
 | plan | `plan/` | `optimizer.hpp`, `cascades.hpp`, `plan.hpp` | 論理→物理計画, rule sets |
@@ -83,7 +83,7 @@ server                server/          (postgres wire protocol)
 | WAL レコード/リカバリ手続き | storage(`recovery`) | page, type, common | docs/wal_format.md, docs/recovery_invariants.md |
 | ロック/分離レベル | storage(`transaction`) | page, type, common | docs/lock_order.md のロック順序を守る |
 | インデックス構造 (B+木/LSM) | index | storage, type, common | table⇄index 循環に注意 (V2) |
-| スキャン API・統計 | table | index, storage, … | batch-first 原則 (docs/table_access.md 予定地) |
+| スキャン API・統計 | table | index, storage, … | batch-first 原則 (述語評価は `table_statistics` → `expression` の既知許容エッジ; `check_layering.py` の `table/* -> expression/*` 参照) |
 | カタログ/DDL | database | table 以下全部 | TransactionContext キャッシュ失効 |
 | SQL 構文・statement 形状 | sql (`query/statement.hpp`) | expression, type, … | executor からの参照が V3' の温床。増やさない |
 | wire protocol / サーバ挙動 | server | sql 以下全部 | postgres streaming 応答の契約を維持 |
@@ -111,17 +111,17 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
   許容している。修正が完了したらその行を削る (潰すごとにリストが減る)。
   新規に赤くなったら、allowlist 追加ではなく層の配置を見直すのが原則
 
-## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 50 辺)
+## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 63 辺)
 
 `python3 scripts/check_layering.py` のサマリ (2026-09 時点):
 
 | 区分 | エッジ | 辺数 |
 |---|---|---|
 | V1 | expression → database | 0 (解消済み) |
-| V3' | relational/executor → statement IR (query/statement.hpp) | relational→sql=11, executor→sql=1 |
+| V3' | relational/executor → statement IR (query/statement.hpp) | relational→sql=12, executor→sql=6 |
 | V4 | plan → executor | 2 (plan/product_plan.cpp, plan/implementation_rules.cpp → executor/hash_join_mode.hpp) |
 
 無番号の許容エッジ (詳細はスクリプト内コメント参照): common→type (5),
 type→storage/row_position (1), index→table (3), table→expression (7),
-expression→executor (bytecode/pax_block→data_chunk, 2), storage→executor (3),
-relational(detail)→executor 本体 (9), plan→sql (query_data/statement, 6)。
+expression→executor (bytecode/pax_block→data_chunk, 2), storage→executor (4),
+relational(detail)→executor 本体 (9), plan→sql (query_data/statement, 12)。

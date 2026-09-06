@@ -174,9 +174,11 @@ TEST_F(RowPageTest, DeleteMany) {
   PageRef page = p_->GetPage(page_id_);
   for (size_t i = 0; i < kRows; ++i) {
     if (i % 2 == 0) {
-      ASSERT_EQ(Status::kNotExists, page->Read(txn, i).GetStatus());
+      ASSERT_EQ(Status::kNotExists,
+                page->Read(txn, static_cast<slot_t>(i)).GetStatus());
     } else {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, got_row, page->Read(txn, i));
+      ASSIGN_OR_ASSERT_FAIL(std::string_view, got_row,
+                            page->Read(txn, static_cast<slot_t>(i)));
       ASSERT_NE(inserted.find(std::string(got_row)), inserted.end());
       inserted.erase(std::string(got_row));
     }
@@ -324,7 +326,7 @@ TEST_F(RowPageTest, UpdateHeavy) {
   PageRef ref = p_->GetPage(page_id_);
 
   // Act 1 -- insert kCount random keys and record their slots
-  for (int i = 0; i < kCount; ++i) {
+  for (size_t i = 0; i < kCount; ++i) {
     std::string key = RandomString(((19937 * i) % 120) + 100);
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn, key));
     slots.push_back(slot);
@@ -336,14 +338,16 @@ TEST_F(RowPageTest, UpdateHeavy) {
   Row read;
   for (int i = 0; i < kCount * 20; ++i) {
     slot_t slot = slots[(static_cast<size_t>(i) * 63) % slots.size()];
-    std::string key = RandomString(((19937 * i) % 120) + 10);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10));
     ASSERT_SUCCESS(ref->Update(txn, slot, key));
     rows[slot] = key;
   }
 
   // Assert -- every slot's final value matches the last written key
-  for (int i = 0; i < kCount; ++i) {
-    ASSIGN_OR_ASSERT_FAIL(std::string_view, row, ref->Read(txn, i));
+  for (size_t i = 0; i < kCount; ++i) {
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, row,
+                          ref->Read(txn, static_cast<slot_t>(i)));
     ASSERT_EQ(rows[i], row);
   }
 }
@@ -358,7 +362,7 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
   PageRef ref = p_->GetPage(page_id_);
 
   // Act 1 -- insert kCount random keys and record their slots
-  for (int i = 0; i < kCount; ++i) {
+  for (size_t i = 0; i < kCount; ++i) {
     std::string key = RandomString(((19937 * i) % 120) + 100);
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn, key));
     slots.push_back(slot);
@@ -369,7 +373,8 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
   Row read;
   for (int i = 0; i < kCount * 40; ++i) {
     slot_t slot = slots[(static_cast<size_t>(i) * 63) % slots.size()];
-    std::string key = RandomString(((19937 * i) % 120) + 10);
+    std::string key =
+        RandomString(static_cast<size_t>(((19937 * i) % 120) + 10));
     if (i % 2 == 0) {
       ASSERT_SUCCESS(ref->Update(txn, slot, key));
     } else {
@@ -380,8 +385,9 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
   }
 
   // Assert -- every slot's final value matches the last written key
-  for (int i = 0; i < kCount; ++i) {
-    ASSIGN_OR_ASSERT_FAIL(std::string_view, row, ref->Read(txn, i));
+  for (size_t i = 0; i < kCount; ++i) {
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, row,
+                          ref->Read(txn, static_cast<slot_t>(i)));
     ASSERT_EQ(rows[i], row);
   }
 }
@@ -548,7 +554,8 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
     PageRef scan = p_->GetPage(page_id_);
     EXPECT_EQ(scan->Read(probe, 0).GetStatus(), Status::kNotExists);
     for (int i = 1; i < 15; ++i) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, value, scan->Read(probe, i));
+      ASSIGN_OR_ASSERT_FAIL(std::string_view, value,
+                            scan->Read(probe, static_cast<slot_t>(i)));
       EXPECT_EQ(value, std::string(2000, 'a')) << "slot " << i;
     }
     ASSIGN_OR_ASSERT_FAIL(std::string_view, grown, scan->Read(probe, 15));

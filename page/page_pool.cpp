@@ -32,7 +32,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <ranges>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -202,9 +201,11 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
           } catch (...) {
             throw;
           }
-          (void)victim.release();
+          // Release only after the non-throwing point: the raw pointer is
+          // already handed to the list, so the released value is redundant.
+          victim.release();  // NOLINT(bugprone-unused-return-value)
           pool_lru_.back().pin_count.store(0, std::memory_order_relaxed);
-          const LruType::iterator restored = std::prev(pool_lru_.end());
+          const auto restored = std::prev(pool_lru_.end());
           pool_.emplace(victim_id, restored);
           PoolShard& shard = shards_[ShardIndex(victim_id)];
           std::scoped_lock shard_latch(shard.mu);
@@ -303,10 +304,11 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       // new_page still owns raw_page; nothing installed.
       throw;
     }
-    // The list node now owns the image.
-    (void)new_page.release();
+    // The list node now owns the image; the released pointer is already
+    // stored in the node, so discarding it is intentional.
+    new_page.release();  // NOLINT(bugprone-unused-return-value)
     pool_lru_.back().page_latch = std::move(new_page_latch);
-    const LruType::iterator installed = std::prev(pool_lru_.end());
+    const auto installed = std::prev(pool_lru_.end());
     try {
       pool_.emplace(page_id, installed);
       {
@@ -349,6 +351,10 @@ void PagePool::FlushPageForTest(page_id_t page_id) {
   // can never be detached, so this pointer outlives every path below.  The
   // guard releases the pin even when WriteBack throws.
   Entry* pinned = nullptr;
+  // True when the pin we take below is the only one: no PageRef exists
+  // anywhere, so the page latch is free and we can exclude mutators while
+  // WriteBack encodes the image.
+  bool exclusive_pin = false;
   {
     std::unique_lock latch(pool_latch);
     const auto it = pool_.find(page_id);
@@ -359,18 +365,34 @@ void PagePool::FlushPageForTest(page_id_t page_id) {
     // Page between unlocking pool_latch and WriteBack (the raw pointer would
     // dangle the moment the evictor's unique_ptr resets).
     pinned = &*it->second;
-    pinned->pin_count.fetch_add(1, std::memory_order_relaxed);
+    exclusive_pin =
+        pinned->pin_count.fetch_add(1, std::memory_order_relaxed) == 0;
     Touch(it->second);
   }
   struct UnpinGuard {
     Entry* entry;
     page_id_t id;
+    UnpinGuard(Entry* entry_, page_id_t id_) : entry(entry_), id(id_) {}
+    UnpinGuard(const UnpinGuard&) = delete;
+    UnpinGuard& operator=(const UnpinGuard&) = delete;
+    UnpinGuard(UnpinGuard&&) = delete;
+    UnpinGuard& operator=(UnpinGuard&&) = delete;
     ~UnpinGuard() { PagePool::ReleasePin(*entry, id); }
   } guard{pinned, page_id};
   std::scoped_lock io(io_latches_[ShardIndex(page_id)].mu);
-  // Safe without pool_latch: DetachVictim only moves Entry::page out when the
-  // pin count is zero, and this guard holds one pin until scope exit.
-  WriteBack(pinned->page.get());
+  // WriteBack reads the page image; a concurrent PageRef holder mutating it
+  // mid-encode could persist a torn snapshot.  When we hold the only pin,
+  // taking the page latch excludes every mutator.  When another pin exists,
+  // it belongs to the caller's own PageRef (this is a test-only helper and
+  // every caller flushes a page it holds); that PageRef's latch already
+  // excludes other mutators, and re-taking the shared_mutex here would
+  // self-deadlock.
+  if (exclusive_pin) {
+    std::unique_lock page_latch(*pinned->page_latch);
+    WriteBack(pinned->page.get());
+  } else {
+    WriteBack(pinned->page.get());
+  }
 }
 
 // Precondition: no latch requirement; operates on the entry atomically.
@@ -455,6 +477,15 @@ PagePool::~PagePool() {
       }
       if (!it.page->ChecksumMatches()) {
         dirty.push_back(it.page.get());
+      }
+    }
+    // Warn on pinned retired entries exactly like the live ones above: a
+    // PageRef still holding a retired page is a contract violation at this
+    // boundary; destruction proceeds as for the live list.
+    for (const auto& it : retired_) {
+      if (it.pin_count.load(std::memory_order_relaxed) != 0) {
+        LOG(ERROR) << "caution: pinned retired page(" << it.page->PageID()
+                   << ") is to be deleted with the pool";
       }
     }
     retired_.clear();
@@ -570,7 +601,7 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
       }
     }
   }
-  if (nread == kPageSize && !target->IsValid()) {
+  if (std::cmp_equal(nread, kPageSize) && !target->IsValid()) {
     if (target->type == PageType::kUnknown && target->checksum == 0) {
       // A freshly extended file region reads as zeros; uninitialized rather
       // than corrupt. (Genuine zero regions are caught by the all_zero check

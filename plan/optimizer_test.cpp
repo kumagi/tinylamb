@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -52,7 +53,6 @@
 #include "plan/product_plan.hpp"
 #include "plan/sort_distinct_plan.hpp"
 #include "plan/sort_plan.hpp"
-#include "plan/values_plan.hpp"
 #include "query/query_data.hpp"
 #include "query/statement.hpp"
 #include "table/iterator.hpp"
@@ -700,6 +700,9 @@ TEST_F(OptimizerTest, CascadesSemiAndAntiJoinImplementationsUseHashJoinKind) {
         search.Optimize(derived, cascades::PhysicalProperties{},
                         DefaultImplementationRules(), rule_context);
     ASSERT_TRUE(best.has_value());
+    if (!best.has_value()) {
+      continue;
+    }
     const auto product = std::dynamic_pointer_cast<ProductPlan>(best->plan);
     ASSERT_NE(product, nullptr);
     EXPECT_EQ(product->Kind(), expected_kind);
@@ -855,7 +858,8 @@ TEST_F(OptimizerTest, PhysicalRuleSubsetsPreserveOrderedLimitResults) {
   }
   // A fixed seed makes failures reproducible while avoiding reliance on rule
   // registration order during the subset sweep.
-  std::mt19937 rng(0x54494E59U);  // "TINY"
+  std::mt19937 rng(  // NOLINT(cert-msc51-cpp, cert-msc32-c)
+      0x54494E59U);  // "TINY": deterministic seed is intentional in a test.
   std::shuffle(masks.begin(), masks.end(), rng);
 
   size_t planned_subsets = 0;
@@ -896,7 +900,9 @@ TEST_F(OptimizerTest, PhysicalRuleSubsetsPreserveOrderedLimitResults) {
     if (!limited) {
       const size_t begin = std::min(query.limit_offset_, keys.size());
       const size_t end = std::min(begin + query.limit_count_, keys.size());
-      keys = std::vector<int64_t>(keys.begin() + begin, keys.begin() + end);
+      keys = std::vector<int64_t>(
+          keys.begin() + static_cast<std::ptrdiff_t>(begin),
+          keys.begin() + static_cast<std::ptrdiff_t>(end));
     }
 
     EXPECT_EQ(keys, (std::vector<int64_t>{1, 2})) << "rule mask=" << mask;
@@ -916,10 +922,9 @@ TEST_F(OptimizerTest, JoinChainMatchesGoldenResultUnderRuleSubsets) {
       {"Sc4", "Sc1", "Sc2", "Sc3"},
       BinaryExpressionExp(
           BinaryExpressionExp(
-              BinaryExpressionExp(
-                  ColumnValueExp(ColumnName("Sc4", "c1")),
-                  BinaryOperation::kEquals,
-                  ColumnValueExp(ColumnName("Sc1", "c1"))),
+              BinaryExpressionExp(ColumnValueExp(ColumnName("Sc4", "c1")),
+                                  BinaryOperation::kEquals,
+                                  ColumnValueExp(ColumnName("Sc1", "c1"))),
               BinaryOperation::kAnd,
               BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
                                   BinaryOperation::kEquals,
@@ -960,11 +965,15 @@ TEST_F(OptimizerTest, JoinChainMatchesGoldenResultUnderRuleSubsets) {
 
   const auto golden = drain(OptimizerOptions::Default());
   ASSERT_TRUE(golden.has_value());
+  if (!golden.has_value()) {
+    return;
+  }
+  const std::vector<std::array<int64_t, 3>>& golden_rows = *golden;
   // Sc4.c1 values in the filtered chain are distinct and ascending, so the
   // golden output is a deterministic sequence.
-  ASSERT_GE(golden->size(), 5U);
-  for (size_t i = 1; i < golden->size(); ++i) {
-    EXPECT_LT((*golden)[i - 1][0], (*golden)[i][0]) << "golden not ordered";
+  ASSERT_GE(golden_rows.size(), 5U);
+  for (size_t i = 1; i < golden_rows.size(); ++i) {
+    EXPECT_LT(golden_rows[i - 1][0], golden_rows[i][0]) << "golden not ordered";
   }
 
   const std::array<std::string, 4> order_rules = {
@@ -982,15 +991,15 @@ TEST_F(OptimizerTest, JoinChainMatchesGoldenResultUnderRuleSubsets) {
     }
   }
   // Fixed seed keeps failures reproducible.
-  std::mt19937 rng(0x4A4F494EU);  // "JOIN"
+  std::mt19937 rng(  // NOLINT(cert-msc51-cpp, cert-msc32-c)
+      0x4A4F494EU);  // "JOIN": deterministic seed is intentional in a test.
   std::shuffle(physical_masks.begin(), physical_masks.end(), rng);
 
   size_t planned = 0;
   auto check = [&](const OptimizerOptions& options, uint32_t order_mask,
                    uint32_t physical_mask) {
-    SCOPED_TRACE(::testing::Message()
-                 << "order_mask=" << order_mask
-                 << " physical_mask=" << physical_mask);
+    SCOPED_TRACE(::testing::Message() << "order_mask=" << order_mask
+                                      << " physical_mask=" << physical_mask);
     const auto rows = drain(options);
     if (!rows.has_value()) {
       return;
@@ -1998,8 +2007,7 @@ TEST_F(OptimizerTest, LimitWithOrderedIndexStreamsOnlyTopKRows) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest,
-       UnboundedIndexProvidesAscendingAndDescendingOrder) {
+TEST_F(OptimizerTest, UnboundedIndexProvidesAscendingAndDescendingOrder) {
   TransactionContext context = rs_->BeginContext();
   const auto optimize = [&](bool ascending) {
     QueryData query{
@@ -2571,7 +2579,7 @@ TEST_F(OptimizerTest, UpdateOverParallelScanStaysCorrect) {
 
 namespace {
 
-int CountRows(Executor executor) {
+int CountRows(const Executor& executor) {
   Row row;
   int count = 0;
   while (executor->Next(&row, nullptr)) {
@@ -2653,8 +2661,10 @@ TEST_F(OptimizerTest, CorrelatedExistsKeepsCompositeCorrelationKey) {
   ASSERT_SUCCESS(
       tbl.Insert(writer.txn_, Row({Value(0), Value(999.0)})).GetStatus());
   for (int64_t key = 1; key < 50; ++key) {
-    ASSERT_SUCCESS(tbl.Insert(writer.txn_, Row({Value(key), Value(key + 9.9)}))
-                       .GetStatus());
+    ASSERT_SUCCESS(
+        tbl.Insert(writer.txn_,
+                   Row({Value(key), Value(static_cast<double>(key) + 9.9)}))
+            .GetStatus());
   }
   ASSERT_SUCCESS(writer.PreCommit());
   auto stats_context = rs_->BeginContext();

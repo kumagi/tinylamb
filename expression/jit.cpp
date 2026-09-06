@@ -35,6 +35,15 @@
 #pragma GCC diagnostic pop
 #endif
 
+// LLVM's PHINode uses hung-off-operands: memory preceding the User object is
+// valid by construction, but clang's analyzer cannot model the allocation and
+// reports a bogus out-of-bounds read inside LLVM headers. Suppress the check
+// for this LLVM-integration TU only.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wanalyzer-security.ArrayBound"
+#endif
+
 namespace tinylamb {
 
 struct JitInt64Kernels::Impl {
@@ -370,9 +379,9 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileProjectionChecked() {
   llvm::Value* addend = argument++;
   llvm::Value* mul_overflow_out = argument++;
   llvm::Value* add_overflow_out = argument++;
-  llvm::Function* smul = llvm::Intrinsic::getDeclaration(
+  llvm::Function* smul = llvm::Intrinsic::getOrInsertDeclaration(
       module.get(), llvm::Intrinsic::smul_with_overflow, {i64});
-  llvm::Function* sadd = llvm::Intrinsic::getDeclaration(
+  llvm::Function* sadd = llvm::Intrinsic::getOrInsertDeclaration(
       module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
   auto* entry = llvm::BasicBlock::Create(*context, "entry", function);
   auto* loop = llvm::BasicBlock::Create(*context, "loop", function);
@@ -456,7 +465,7 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileSumChecked() {
   llvm::Value* input = argument++;
   llvm::Value* count = argument++;
   llvm::Value* overflow_out = argument++;
-  llvm::Function* sadd = llvm::Intrinsic::getDeclaration(
+  llvm::Function* sadd = llvm::Intrinsic::getOrInsertDeclaration(
       module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
   auto* entry = llvm::BasicBlock::Create(*context, "entry", function);
   auto* loop = llvm::BasicBlock::Create(*context, "loop", function);
@@ -562,3 +571,7 @@ double JitInt64Kernels::CompileMilliseconds() const {
 }
 
 }  // namespace tinylamb
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif

@@ -22,6 +22,7 @@
 // whether the page is served through the fast path or through the
 // ReadVersion fallback.
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,9 +35,11 @@
 #include "gtest/gtest.h"
 #include "iterator.hpp"
 #include "table/table.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 

@@ -47,6 +47,16 @@ class IndexOnlyScanPlan : public PlanBase {
   Executor EmitExecutor(TransactionContext& txn) const override;
 
   [[nodiscard]] const Table* ScanSource() const override { return &table_; }
+  [[nodiscard]] const Index& GetIndex() const { return index_; }
+  [[nodiscard]] const Expression& ScanPredicate() const { return where_; }
+  [[nodiscard]] const std::vector<Value>& BeginKey() const {
+    return begin_key_;
+  }
+  [[nodiscard]] const std::vector<Value>& EndKey() const { return end_key_; }
+  [[nodiscard]] bool IsAscending() const { return ascending_; }
+  [[nodiscard]] const std::vector<NamedExpression>& SelectItems() const {
+    return select_;
+  }
   [[nodiscard]] const Schema& GetSchema() const override {
     return output_schema_;
   }

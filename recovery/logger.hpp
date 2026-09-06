@@ -75,7 +75,7 @@ class Logger final {
   // cache. Called by the checkpoint manager after a successful checkpoint so
   // fdatasync no longer has to wait for those pages to be flushed on the next
   // barrier. No-op on platforms without posix_fadvise (e.g. macOS).
-  void AdviseOldBytesDurable(lsn_t before);
+  void AdviseOldBytesDurable(lsn_t before) const;
 
   [[nodiscard]] int Fd() const { return dst_; }
 

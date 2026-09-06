@@ -17,7 +17,7 @@ class MinMaxIndexPlan final : public PlanBase {
   MinMaxIndexPlan(Plan child, NamedExpression aggregate, size_t value_slot,
                   bool reverse);
 
-  Executor EmitExecutor(TransactionContext& context) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();
   }

@@ -2,7 +2,6 @@
 #include "executor/merge.hpp"
 
 #include <cstddef>
-#include <cstdint>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -11,6 +10,8 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#include "executor/executor_base.hpp"
+#include "expression/expression.hpp"
 #include "page/row_position.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
@@ -108,7 +109,8 @@ bool MergeExecutor::Next(Row* dst, RowPosition* rp) {
             entry.updated = true;
             ++updated_count_;
             break;
-          } else if (clause.action == WhenMatchedClause::Action::kDelete) {
+          }
+          if (clause.action == WhenMatchedClause::Action::kDelete) {
             Status st = target_table_->Delete(*txn_, entry.pos);
             if (st != Status::kSuccess) {
               throw std::runtime_error("MERGE delete failed on table " +
@@ -182,7 +184,7 @@ bool MergeExecutor::Next(Row* dst, RowPosition* rp) {
 
 void MergeExecutor::Dump(std::ostream& o, int indent) const {
   o << "MergeExecutor: " << target_table_->GetSchema().Name() << "\n"
-    << Indent(indent + 2);
+    << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(o, indent + 2);
 }
 
