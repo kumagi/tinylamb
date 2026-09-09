@@ -32,6 +32,7 @@
 #include <array>
 #include <cassert>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -85,8 +86,8 @@ int MemoryCompare(std::string_view lhs, std::string_view rhs) {
  * `rhs`: comparison target.
  * `blob`: backend storage for longer key.
  */
-int SortedRun::Entry::Compare(std::string_view rhs,
-                              const BlobFile& blob) const {
+StatusOr<int> SortedRun::Entry::Compare(std::string_view rhs,
+                                        const BlobFile& blob) const {
   uint32_t head = 0;
   const size_t head_bytes = std::min(4UL, rhs.size());
   if (0 < head_bytes) {
@@ -124,15 +125,15 @@ int SortedRun::Entry::Compare(std::string_view rhs,
     return static_cast<int>(rhs.length()) - static_cast<int>(length_);
   }
   // This is slow-path.
-  std::string body = blob.ReadAt(key_.reference_, length_);
+  ASSIGN_OR_RETURN(std::string, body, blob.ReadAt(key_.reference_, length_));
   return MemoryCompare(body, rhs);
 }
 
 // *this < rhs => positive value
 // *this = rhs => 0
 // *this > rhs => negative value
-int SortedRun::Entry::Compare(const SortedRun::Entry& rhs,
-                              const BlobFile& blob) const {
+StatusOr<int> SortedRun::Entry::Compare(const SortedRun::Entry& rhs,
+                                        const BlobFile& blob) const {
   if (rhs.key_head_ < key_head_) {
     return -1;
   }
@@ -163,8 +164,8 @@ int SortedRun::Entry::Compare(const SortedRun::Entry& rhs,
   assert(kIndirectThreshold < length_ || kIndirectThreshold < rhs.length_);
 
   // TODO(kumagi): below code is slow, make it faster.
-  std::string left = BuildKey(blob);
-  std::string right = rhs.BuildKey(blob);
+  ASSIGN_OR_RETURN(std::string, left, BuildKey(blob));
+  ASSIGN_OR_RETURN(std::string, right, rhs.BuildKey(blob));
   if (left < right) {
     return 1;
   }
@@ -174,45 +175,52 @@ int SortedRun::Entry::Compare(const SortedRun::Entry& rhs,
   return 0;
 }
 
-SortedRun::Entry::Entry(std::string_view key, const LSMValue& value,
-                        BlobFile& blob_) {
+StatusOr<SortedRun::Entry> SortedRun::Entry::Create(std::string_view key,
+                                                    const LSMValue& value,
+                                                    BlobFile& blob_) {
+  Entry entry;
+  Entry& e = entry;
   // Entry is written to disk as a fixed 40-byte image; a longer key cannot
-  // round-trip through the run format. Fail loudly here instead of storing
-  // a truncated length that BuildKey/Find can never reproduce.
+  // round-trip through the run format. Refuse instead of storing a truncated
+  // length that BuildKey/Find can never reproduce.
   if (key.length() > std::numeric_limits<uint32_t>::max()) {
-    throw std::length_error("LSM key exceeds 4GiB run entry limit");
+    return StatusError(StatusCode::kTooBigData,
+                       "LSM key exceeds 4GiB run entry limit");
   }
-  length_ = static_cast<uint32_t>(key.length());
-  key_head_ = 0;
+  e.length_ = static_cast<uint32_t>(key.length());
+  e.key_head_ = 0;
   const size_t head_bytes = std::min(key.size(), sizeof(uint32_t));
   if (0 < head_bytes) {
-    memcpy(&key_head_, key.data(), head_bytes);
+    memcpy(&e.key_head_, key.data(), head_bytes);
   }
-  key_head_ = be32toh(key_head_);
+  e.key_head_ = be32toh(e.key_head_);
   if (kIndirectThreshold < key.length()) {
-    key_.reference_ = blob_.Append(key);
-  } else if (sizeof(key_head_) < key.length()) {
+    ASSIGN_OR_RETURN(lsn_t, reference, blob_.Append(key));
+    e.key_.reference_ = reference;
+  } else if (sizeof(e.key_head_) < key.length()) {
     // Zero the inline tail so Compare() does not read uninitialized bytes
     // when the key is shorter than 12 bytes. For keys of at most 4 bytes the
     // pre-initialized key_{0} stays untouched; only key_head_ matters.
-    key_.inline_ = 0;
-    std::memcpy(&key_.inline_, key.data() + 4, key.length() - 4);
-    key_.inline_ = be64toh(key_.inline_);
+    e.key_.inline_ = 0;
+    std::memcpy(&e.key_.inline_, key.data() + 4, key.length() - 4);
+    e.key_.inline_ = be64toh(e.key_.inline_);
   }
   if (value.is_delete) {
-    value_.offset_ = kDeletedValue;
-    value_length_ = 0;
+    e.value_.offset_ = kDeletedValue;
+    e.value_length_ = 0;
   } else {
-    value_length_ = value.payload.length();
-    if (value_length_ <= sizeof(uint64_t)) {
-      ::memcpy(value_.inline_.data(), value.payload.data(), value_length_);
+    e.value_length_ = value.payload.length();
+    if (e.value_length_ <= sizeof(uint64_t)) {
+      ::memcpy(e.value_.inline_.data(), value.payload.data(), e.value_length_);
     } else {
-      value_.offset_ = blob_.Append(value.payload);
+      ASSIGN_OR_RETURN(lsn_t, offset, blob_.Append(value.payload));
+      e.value_.offset_ = offset;
     }
   }
+  return entry;
 }
 
-std::string SortedRun::Entry::BuildKey(const BlobFile& blob) const {
+StatusOr<std::string> SortedRun::Entry::BuildKey(const BlobFile& blob) const {
   if (length_ <= kIndirectThreshold) {
     std::string ret(length_, '\0');
     uint32_t head = htobe32(key_head_);
@@ -226,20 +234,20 @@ std::string SortedRun::Entry::BuildKey(const BlobFile& blob) const {
   return blob.ReadAt(key_.reference_, length_);
 }
 
-std::string SortedRun::Entry::BuildValue(const BlobFile& blob) const {
+StatusOr<std::string> SortedRun::Entry::BuildValue(const BlobFile& blob) const {
   assert(!IsDeleted());
   if (value_length_ <= sizeof(uint64_t)) {
-    return {value_.inline_.data(), value_length_};
+    return std::string{value_.inline_.data(), value_length_};
   }
   return blob.ReadAt(value_.offset_, value_length_);
 }
 
-SortedRun::SortedRun(const std::filesystem::path& file) {
-  int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+StatusOr<SortedRun> SortedRun::Restore(const std::filesystem::path& file) {
+  SortedRun run;
+  const int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
-    // A constructor cannot report Status; a broken run must not survive as a
-    // half-initialized object whose later GetEntry() dereferences null.
-    throw std::runtime_error("Failed to open file: " + file.string());
+    return StatusError(StatusCode::kIOError,
+                       "Failed to open file: " + file.string());
   }
   auto read_full = [&](void* dst, size_t bytes) -> bool {
     size_t done = 0;
@@ -256,57 +264,59 @@ SortedRun::SortedRun(const std::filesystem::path& file) {
   size_t len = 0;
   size_t offset = 0;
 
-  if (!read_full(&len, sizeof(len)) || len > (1LLU << 20)) {
+  auto fail = [&](const char* what) -> Status {
     ::close(fd);
-    throw std::runtime_error("Corrupted run header: " + file.string());
+    return StatusError(StatusCode::kCorrupt,
+                       std::string(what) + ": " + file.string());
+  };
+
+  if (!read_full(&len, sizeof(len)) || len > (1LLU << 20)) {
+    return fail("Corrupted run header");
   }
   offset += sizeof(len);
-  min_key_.resize(len);
-  if (!read_full(min_key_.data(), len)) {
-    ::close(fd);
-    throw std::runtime_error("Short read: " + file.string());
+  run.min_key_.resize(len);
+  if (!read_full(run.min_key_.data(), len)) {
+    return fail("Short read");
   }
   offset += len;
 
   len = 0;
   if (!read_full(&len, sizeof(len)) || len > (1LLU << 20)) {
-    ::close(fd);
-    throw std::runtime_error("Corrupted run header: " + file.string());
+    return fail("Corrupted run header");
   }
   offset += sizeof(len);
-  max_key_.resize(len);
-  if (!read_full(max_key_.data(), len)) {
-    ::close(fd);
-    throw std::runtime_error("Short read: " + file.string());
+  run.max_key_.resize(len);
+  if (!read_full(run.max_key_.data(), len)) {
+    return fail("Short read");
   }
   offset += len;
 
-  if (!read_full(&length_, sizeof(length_)) ||
-      !read_full(&generation_, sizeof(generation_))) {
-    ::close(fd);
-    throw std::runtime_error("Short read: " + file.string());
+  if (!read_full(&run.length_, sizeof(run.length_)) ||
+      !read_full(&run.generation_, sizeof(run.generation_))) {
+    return fail("Short read");
   }
-  offset += sizeof(length_) + sizeof(generation_);
+  offset += sizeof(run.length_) + sizeof(run.generation_);
   // D10 (docs/design.md): an interrupted flush leaves a valid header with a
   // truncated entry area behind (run files are written under their final
   // name).  Verify the file physically contains every advertised entry
-  // before promoting the run; incomplete images throw so the restore scan
+  // before promoting the run; incomplete images fail so the restore scan
   // quarantines them instead of serving corrupt reads.
   struct stat status{};
   if (::fstat(fd, &status) != 0 || static_cast<size_t>(status.st_size) <
-                                       offset + (length_ * sizeof(Entry))) {
-    ::close(fd);
-    throw std::runtime_error("Incomplete run file: " + file.string());
+                                       offset + (run.length_ * sizeof(Entry))) {
+    return fail("Incomplete run file");
   }
   // The cache takes ownership of fd and closes it on destruction; if its
-  // constructor throws (mmap/fstat failure under fd pressure), close the fd
+  // creation fails (mmap/fstat failure under fd pressure), close the fd
   // here so retries do not leak one descriptor per attempt.
-  try {
-    index_ = std::make_unique<VMCache<Entry> >(fd, 4096 * 4096, offset);
-  } catch (...) {
+  StatusOr<std::unique_ptr<VMCache<Entry>>> index =
+      VMCache<Entry>::Create(fd, static_cast<size_t>(4096 * 4096), offset);
+  if (!index.HasValue()) {
     ::close(fd);
-    throw;
+    return index.GetStatus();
   }
+  run.index_ = std::move(index.Value());
+  return run;
 }
 
 Status SortedRun::Construct(const std::filesystem::path& file,
@@ -321,7 +331,8 @@ Status SortedRun::Construct(const std::filesystem::path& file,
   std::vector<Entry> entries;
   entries.reserve(tree.size());
   for (const auto& t : tree) {
-    entries.emplace_back(t.first, t.second, blob);
+    ASSIGN_OR_RETURN(Entry, entry, Entry::Create(t.first, t.second, blob));
+    entries.push_back(std::move(entry));
   }
   return FlushInternal(file, min_key, max_key, entries, generation);
 }
@@ -423,15 +434,16 @@ auto SortedRun::Find(std::string_view key, const BlobFile& blob) const
   int64_t left = 0, right = static_cast<int64_t>(length_);
   while (1 < std::abs(right - left)) {
     const int64_t mid = left + ((right - left) / 2);
-    const Entry mid_entry = GetEntry(static_cast<size_t>(mid));
-    if (0 <= mid_entry.Compare(key, blob)) {
+    ASSIGN_OR_RETURN(Entry, mid_entry, GetEntry(static_cast<size_t>(mid)));
+    ASSIGN_OR_RETURN(int, cmp, mid_entry.Compare(key, blob));
+    if (0 <= cmp) {
       left = mid;
     } else {
       right = mid;
     }
   }
-  Entry left_entry = GetEntry(static_cast<size_t>(left));
-  int result = left_entry.Compare(key, blob);
+  ASSIGN_OR_RETURN(Entry, left_entry, GetEntry(static_cast<size_t>(left)));
+  ASSIGN_OR_RETURN(int, result, left_entry.Compare(key, blob));
   if (result == 0) {
     if (left_entry.IsDeleted()) {
       return Status::kDeleted;
@@ -449,17 +461,24 @@ bool SortedRun::Iterator::operator!=(const SortedRun::Iterator& rhs) const {
   return !operator==(rhs);
 }
 
-SortedRun::Entry SortedRun::GetEntry(size_t offset) const {
+StatusOr<SortedRun::Entry> SortedRun::GetEntry(size_t offset) const {
   SortedRun::Entry entry;
-  index_->Read(&entry, offset, 1);
+  RETURN_IF_FAIL(index_->Read(&entry, offset, 1));
   return entry;
 }
 
 std::ostream& operator<<(std::ostream& o, const SortedRun::Iterator& it) {
-  if (it.IsDeleted()) {
-    o << it.Key() << "=>(deleted)";
+  const StatusOr<bool> deleted = it.IsDeleted();
+  const StatusOr<std::string> key = it.Key();
+  if (!deleted.HasValue() || !key.HasValue()) {
+    o << "(unreadable entry)";
+    return o;
+  }
+  if (deleted.Value()) {
+    o << key.Value() << "=>(deleted)";
   } else {
-    o << it.Key() << "=>" << it.Value();
+    o << key.Value() << "=>"
+      << (it.Value().HasValue() ? it.Value().Value() : "<unreadable>");
   }
   return o;
 }
@@ -483,7 +502,8 @@ std::ostream& operator<<(std::ostream& o, const SortedRun& s) {
     if (0 < i) {
       o << ", ";
     }
-    SortedRun::Entry entry = s.GetEntry(i);
+    SortedRun::Entry entry =
+        s.GetEntry(i).HasValue() ? s.GetEntry(i).Value() : SortedRun::Entry();
     if (entry.IsDeleted()) {
       o << "(" << HeadString(entry.key_head_) << ")";
     } else {

@@ -50,11 +50,18 @@ std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
   return columns;
 }
 
-Value AggregateExpression::Evaluate(const Row& /*row*/,
-                                    const Schema& /*schema*/) const {
+StatusOr<Value> AggregateExpression::TryEvaluate(
+    const Row& /*row*/, const Schema& /*schema*/) const {
   // This method must not be called directly: the value of an aggregate
   // expression is calculated by the aggregator.
-  throw std::logic_error("aggregate expression cannot be evaluated directly");
+  return StatusError(StatusCode::kRuntimeError,
+                     "aggregate expression cannot be evaluated directly");
+}
+
+Value AggregateExpression::Evaluate(const Row& row,
+                                    const Schema& schema) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema),
+                       "AggregateExpression::Evaluate");
 }
 
 Type AggregateExpression::ResultType(const Schema& schema) const {
@@ -67,6 +74,11 @@ Type AggregateExpression::ResultType(const Schema& schema) const {
   }
   if (IsSketchAggregate(type_)) {
     return {TypeTag::kVarChar};
+  }
+  if (!child_) {
+    // Matches the two-schema overload: a childless aggregate (COUNT(*)
+    // built without a column child) must not dereference null.
+    return {TypeTag::kBigInt};
   }
   return child_->ResultType(schema);
 }

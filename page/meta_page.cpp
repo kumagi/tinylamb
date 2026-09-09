@@ -33,32 +33,33 @@
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
-PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
-                                  PageType new_page_type) {
+StatusOr<PageRef> MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
+                                            PageType new_page_type) {
   page_id_t new_page_id = 0;
-  PageRef ret = [&]() {
+  ASSIGN_OR_RETURN(PageRef, ret, [&]() -> StatusOr<PageRef> {
     if (first_free_page == 0) {
-      // Reserve nothing before the load succeeds: a throwing GetPage must not
-      // permanently advance max_page_count (that would strand a page-id hole).
+      // Reserve nothing before the load succeeds: a failing GetPage must not
+      // permanently advance max_page_count (that would strand a page-id
+      // hole).
       const page_id_t candidate = max_page_count + 1;
-      PageRef page = pool.GetPage(candidate, nullptr);
+      ASSIGN_OR_RETURN(PageRef, page, pool.GetPage(candidate, nullptr));
       new_page_id = candidate;
       max_page_count = candidate;
       return page;
     }
     new_page_id = first_free_page;
-    PageRef page = pool.GetPage(new_page_id, nullptr);
+    ASSIGN_OR_RETURN(PageRef, page, pool.GetPage(new_page_id, nullptr));
     first_free_page = page.GetFreePage().next_free_page;
     return page;
-  }();
+  }());
+  RETURN_IF_FAIL(txn.AllocatePageLog(new_page_id, new_page_type).GetStatus());
   ret->PageInit(new_page_id, new_page_type);
-  txn.AllocatePageLog(new_page_id, new_page_type);
 
   return ret;
 }
 
 // Precondition: latch of page is taken by txn.
-void MetaPage::DestroyPage(Transaction& txn, Page* target) {
+Status MetaPage::DestroyPage(Transaction& txn, Page* target) {
   page_id_t free_page_id = target->PageID();
   // D3 (docs/design.md): capture the destroyed page's type and -- when it
   // still holds rows -- its body image so undo of an aborted destroy can
@@ -97,7 +98,8 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target) {
   // Add the free page to the free page chain.
   free_page.next_free_page = first_free_page;
   first_free_page = free_page_id;
-  txn.DestroyPageLog(free_page_id, old_type, std::move(old_body));
+  RETURN_IF_FAIL(txn.DestroyPageLog(free_page_id, old_type, std::move(old_body))
+                     .GetStatus());
   // Stamp the freed image with the destroy record's end LSN.  Without this
   // the PageInit'd page keeps page_lsn == 0, the write-back durability gate
   // (WaitForDurable(0)) is a no-op, and the free-page image can reach disk
@@ -106,6 +108,7 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target) {
   // (double allocation).
   target->SetPageLSN(txn.PrevRecordEndLSN());
   target->SetRecLSN(txn.PrevRecordEndLSN());
+  return Status::kSuccess;
 }
 
 void MetaPage::Dump(std::ostream& o, int /*unused*/) const {

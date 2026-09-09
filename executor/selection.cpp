@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor_base.hpp"
 #include "expression/binary_expression.hpp"
@@ -133,6 +134,10 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
   while (destination->Size() < max_rows) {
     const size_t requested = max_rows - destination->Size();
     if (src_->NextBatch(&input_batch_, requested) == 0) {
+      if (src_->GetStatus() != Status::kSuccess) {
+        FailWith(src_->GetStatus());
+        return 0;
+      }
       break;
     }
     if (!BatchMayMatch(exp_, schema_, input_batch_)) {
@@ -192,7 +197,12 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
       }
       ++jit_batches_;
     } else if (bytecode_) {
-      predicates.emplace(bytecode_->EvaluateBatch(input_batch_));
+      StatusOr<ColumnVector> batch = bytecode_->TryEvaluateBatch(input_batch_);
+      if (!batch.HasValue()) {
+        FailWith(batch.GetStatus());
+        return 0;
+      }
+      predicates.emplace(batch.MoveValue());
     }
     selection_vector_.clear();
     if (predicates && predicates->Type() == ValueType::kInt64) {
@@ -206,10 +216,14 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
       }
     } else {
       for (size_t i = 0; i < input_batch_.Size(); ++i) {
-        const Value predicate =
-            predicates ? predicates->ValueAt(i)
-                       : exp_->Evaluate(input_batch_.RowAt(i), schema_);
-        if (!predicate.IsNull() && predicate.Truthy()) {
+        StatusOr<Value> predicate =
+            predicates ? StatusOr<Value>(predicates->ValueAt(i))
+                       : (exp_->TryEvaluate(input_batch_.RowAt(i), schema_));
+        if (!predicate.HasValue()) {
+          FailWith(predicate.GetStatus());
+          return 0;
+        }
+        if (!predicate.Value().IsNull() && predicate.Value().Truthy()) {
           selection_vector_.push_back(static_cast<uint32_t>(i));
         }
       }

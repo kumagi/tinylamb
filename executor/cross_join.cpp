@@ -52,6 +52,7 @@ void CrossJoin::TableConstruct() {
   while (right_->Next(&right_row, nullptr)) {
     right_table_.push_back(std::move(right_row));
   }
+  FailWithChildOf(*right_);
   right_iter_ = right_table_.end();
   table_constructed_ = true;
 }

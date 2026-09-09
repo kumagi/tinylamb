@@ -71,7 +71,7 @@ class VMCacheTest : public ::testing::Test {
     ::fsync(fd_);
     EXPECT_EQ(std::filesystem::file_size(path_),
               offset + (data_size * sizeof(T)));
-    return std::make_unique<VMCache<T>>(fd_, data_size * 1024, offset);
+    return VMCache<T>::Create(fd_, data_size * 1024, offset).MoveValue();
   }
 
   void TearDown() override {
@@ -84,7 +84,7 @@ class VMCacheTest : public ::testing::Test {
   }
 
   template <typename T>
-  static T Expected(size_t key) {
+  T Expected(size_t key) {
     return T(kSeed + std::hash<size_t>()(key));
   }
 
@@ -236,7 +236,10 @@ TEST_F(VMCacheTest, Constructor_ExplicitFileSize_ReadsExpectedData) {
   }
   ::fsync(fd_);
   const size_t file_size = std::filesystem::file_size(path_);
-  VMCache<int32_t> cache(fd_, kCount * 1024, 0, file_size);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, kCount * 1024, 0, file_size).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   cache.Read(&data, 42, 1);
@@ -263,7 +266,10 @@ TEST_F(VMCacheTest, Read_UnderEvictionPressure_TransparentlyReloadsData) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(2) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   for (size_t page = 0; page < kPages; ++page) {
     int32_t data = 0;
@@ -292,7 +298,10 @@ TEST_F(VMCacheTest, Read_AccessedPages_PromotesToMainQueue) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(2) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   cache.Read(&data, 0, 1);
@@ -328,7 +337,10 @@ TEST_F(VMCacheTest, Read_MarkedGhostPage_PromotesToMainQueue) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(2) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   cache.Read(&data, 0, 1);
@@ -364,7 +376,10 @@ TEST_F(VMCacheTest, Read_FullMainQueue_EvictsAccessedPages) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(5) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(5) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   for (size_t page = 0; page < 5; ++page) {
@@ -400,7 +415,10 @@ TEST_F(VMCacheTest, Dump_MultiEntrySmallAndMainQueues_OutputsExpectedFormat) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(20) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(20) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   cache.Read(&data, 0, 1);
@@ -439,7 +457,10 @@ TEST_F(VMCacheTest, Read_SingleTouchPages_AccumulatesInGhostQueue) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(20) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(20) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   for (size_t page = 0; page < 5; ++page) {
@@ -513,7 +534,10 @@ TEST_F(VMCacheTest, Invalidate_MarkedAndUnlockedPages_ReloadsCorrectly) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(20) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(20) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   for (size_t page = 0; page < 3; ++page) {
@@ -557,7 +581,10 @@ TEST_F(VMCacheTest, Read_GhostFifoOverflow_EvictsMarkedEntry) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(3) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   for (size_t page = 0; page < 4; ++page) {
@@ -594,7 +621,10 @@ TEST_F(VMCacheTest, Read_SmallQueueOverflow_EvictsSingleTouchedPageToGhost) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(2) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   cache.Read(&data, 1, 1);
@@ -659,8 +689,12 @@ TEST_F(VMCacheTest, Constructor_ExplicitFileSizeAndOffset_ReadsExpectedData) {
   ::fsync(fd_);
   const size_t file_size = std::filesystem::file_size(path_);
 
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(1024) * 1024, kOffset,
-                         file_size);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(1024) * 1024, kOffset,
+                               file_size)
+          .MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   for (size_t i = 0; i < kCount; ++i) {
     int32_t data = 0;
@@ -688,7 +722,10 @@ TEST_F(VMCacheTest, Dump_AllThreeQueuesMultiEntry_OutputsExpectedFormat) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(20) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(20) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   auto read1 = [&](size_t page) { cache.Read(&data, (page * 1024) + 2, 1); };
@@ -733,7 +770,10 @@ TEST_F(VMCacheTest, Invalidate_CachedPage_DropsFromSmallFifo) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(2) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   cache.Read(&data, 0, 1);
@@ -774,7 +814,7 @@ TEST_F(VMCacheTest, Read_RepeatedResidentPage_StaysConsistent) {
   EXPECT_EQ(cache->Dump(), "[0] {} []");
 }
 
-TEST_F(VMCacheTest, Constructor_ZeroCapacity_ThrowsException) {
+TEST_F(VMCacheTest, Create_ZeroCapacity_IsRejected) {
   path_ = "vm_cache_test-" + RandomString();
   fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
   constexpr size_t kCount = 16;
@@ -793,21 +833,11 @@ TEST_F(VMCacheTest, Constructor_ZeroCapacity_ThrowsException) {
   }
   ::fsync(fd_);
 
-  try {
-    VMCache<int32_t> zero(fd_, 0);
-    FAIL() << "zero-capacity constructor should throw";
-  } catch (const std::exception&) {
-    SUCCEED();
-  }
+  EXPECT_FALSE(VMCache<int32_t>::Create(fd_, 0).HasValue());
 }
 
-TEST_F(VMCacheTest, Constructor_InvalidFd_LogsFileSizeFailure) {
-  try {
-    VMCache<int32_t> cache(-1, 4096);
-    FAIL() << "meta_ allocation should throw after FileSize() failure";
-  } catch (const std::exception&) {
-    SUCCEED();
-  }
+TEST_F(VMCacheTest, Create_InvalidFd_ReportsFileSizeFailure) {
+  EXPECT_FALSE(VMCache<int32_t>::Create(-1, 4096).HasValue());
 }
 
 TEST_F(VMCacheTest, Invalidate_ZeroLength_DoesNothing) {
@@ -863,7 +893,10 @@ TEST_F(VMCacheTest, Read_SpanningManyPagesWithTinyCache_ReadsAllDataCorrectly) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(2) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   std::vector<int32_t> buffer(kCount);
   cache.Read(buffer.data(), 0, kCount);
@@ -896,7 +929,11 @@ TEST_F(VMCacheTest, Read_OffsetCacheWithEvictionPressure_ReadsExpectedData) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(2) * 4096, kOffset);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(2) * 4096, kOffset)
+          .MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   for (size_t page = 0; page < kPages; ++page) {
@@ -926,7 +963,10 @@ TEST_F(VMCacheTest, Read_GhostHit_PromotesToMainQueue) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(3) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   auto read1 = [&](size_t offset) {
@@ -972,7 +1012,10 @@ TEST_F(VMCacheTest, Read_AlignedAndUnalignedInterleaved_MaintainsConsistency) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(3) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   for (size_t page = 0; page < kPages; ++page) {
@@ -1008,7 +1051,10 @@ TEST_F(VMCacheTest, Invalidate_RepeatedCycles_MaintainsConsistency) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(3) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   for (int round = 0; round < 8; ++round) {
@@ -1050,7 +1096,10 @@ TEST_F(VMCacheTest, Read_GhostRevivedPagesInMainQueue_EvictsUnderPressure) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(5) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(5) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   auto read1 = [&](size_t offset) {
@@ -1103,7 +1152,10 @@ TEST_F(VMCacheTest,
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(5) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(5) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   auto read1 = [&](size_t offset) {
@@ -1152,7 +1204,10 @@ TEST_F(VMCacheTest, Read_AlignedRead_EvictsToMainQueue) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(3) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   auto read1 = [&](size_t offset) {
@@ -1194,7 +1249,10 @@ TEST_F(VMCacheTest, Read_UnalignedRead_EvictsToGhostQueue) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(3) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(3) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   auto read1 = [&](size_t offset) {
@@ -1253,7 +1311,10 @@ TEST_F(VMCacheTest, Invalidate_WholeFile_ClearsAllQueues) {
     remaining -= static_cast<size_t>(wrote);
   }
   ::fsync(fd_);
-  VMCache<int32_t> cache(fd_, static_cast<size_t>(5) * 4096);
+  auto cache_holder =
+      VMCache<int32_t>::Create(fd_, static_cast<size_t>(5) * 4096).MoveValue();
+  ASSERT_TRUE(cache_holder != nullptr);
+  VMCache<int32_t>& cache = *cache_holder;
 
   int32_t data = 0;
   auto read1 = [&](size_t offset) {
@@ -1292,17 +1353,18 @@ TEST_F(VMCacheTest, ReadAt_VariousOffsetsAndLengths_ReturnsExpectedResults) {
   ssize_t written = ::write(fd_, value.data(), value.size() * sizeof(int32_t));
   EXPECT_EQ(written, value.size() * sizeof(int32_t));
 
-  VMCacheImpl impl(fd_, 4096, 16384, 0, 0, false);
-  std::string s = impl.ReadAt(0, sizeof(int32_t) * 5);
+  auto impl = VMCacheImpl::Create(fd_, 4096, 16384, 0, 0, false).MoveValue();
+  ASSERT_TRUE(impl != nullptr);
+  std::string s = impl->ReadAt(0, sizeof(int32_t) * 5).Value();
   EXPECT_EQ(s.size(), sizeof(int32_t) * 5);
 
   std::string_view sv;
-  auto locks_zero = impl.ReadAt(0, 0, sv);
-  EXPECT_TRUE(locks_zero.empty());
+  auto locks_zero = impl->ReadAt(0, 0, sv);
+  EXPECT_TRUE(locks_zero.Value().empty());
   EXPECT_TRUE(sv.empty());
 
-  auto locks_oob = impl.ReadAt(100000000, 10, sv);
-  EXPECT_TRUE(locks_oob.empty());
+  auto locks_oob = impl->ReadAt(100000000, 10, sv);
+  EXPECT_TRUE(locks_oob.Value().empty());
   EXPECT_TRUE(sv.empty());
 }
 

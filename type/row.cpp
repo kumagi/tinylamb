@@ -49,9 +49,8 @@ size_t Row::Serialize(char* dst) const {
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
   // Slot width is 16 bits and the top bit is the null-bitmap flag; a row with
   // >= 32768 columns would silently wrap the count and corrupt the image.
-  if (values_.size() >= kNullBitmapFlag) {
-    throw std::runtime_error("too many columns to serialize a row");
-  }
+  CHECK_MSG(values_.size() < kNullBitmapFlag,
+            "too many columns to serialize a row");
   const auto count = static_cast<slot_t>(values_.size());
   dst += SerializeSlot(dst, has_null ? count | kNullBitmapFlag : count);
   if (has_null) {
@@ -72,7 +71,18 @@ size_t Row::Serialize(char* dst) const {
   return static_cast<size_t>(dst - original_offset);
 }
 
-size_t Row::Deserialize(const char* src, const Schema& sc) {
+Status Row::CheckSerializable() const {
+  if (values_.size() >= (slot_t{1} << 15)) {
+    return StatusError(StatusCode::kTooBigData,
+                       "too many columns to serialize a row");
+  }
+  for (const Value& value : values_) {
+    RETURN_IF_FAIL(value.CheckSerializable());
+  }
+  return Status::kSuccess;
+}
+
+StatusOr<size_t> Row::TryDeserialize(const char* src, const Schema& sc) {
   const char* const original_offset = src;
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
   slot_t encoded_count = 0;
@@ -82,7 +92,7 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
   // The stored image always carries every schema column; a forged count
   // would otherwise drive sc.GetColumn(i) out of bounds below.
   if (count != sc.ColumnCount()) {
-    throw std::runtime_error("row image column count mismatch");
+    return StatusError(StatusCode::kCorrupt, "row image column count mismatch");
   }
   const char* bitmap = nullptr;
   if (has_null) {
@@ -96,15 +106,17 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
         has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
     Value v;
     if (!is_null) {
-      src += v.Deserialize(src, sc.GetColumn(i).Type());
+      ASSIGN_OR_RETURN(size_t, consumed,
+                       v.TryDeserialize(src, sc.GetColumn(i).Type()));
+      src += consumed;
     }
     values_.push_back(v);
   }
   return static_cast<size_t>(src - original_offset);
 }
 
-size_t Row::DeserializeProjected(const char* src, const Schema& sc,
-                                 const std::vector<slot_t>& columns) {
+StatusOr<size_t> Row::TryDeserializeProjected(
+    const char* src, const Schema& sc, const std::vector<slot_t>& columns) {
   const char* const original_offset = src;
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
   slot_t encoded_count = 0;
@@ -114,7 +126,7 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
   // Projected reads still walk the full stored image to skip unkept columns,
   // so the count must match the full schema here as well.
   if (count != sc.ColumnCount()) {
-    throw std::runtime_error("row image column count mismatch");
+    return StatusError(StatusCode::kCorrupt, "row image column count mismatch");
   }
   const char* bitmap = nullptr;
   if (has_null) {
@@ -139,11 +151,13 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
     const ValueType type = sc.GetColumn(i).Type();
     if (keep) {
       Value value;
-      src += value.Deserialize(src, type);
+      ASSIGN_OR_RETURN(size_t, consumed, value.TryDeserialize(src, type));
+      src += consumed;
       values_.push_back(std::move(value));
       ++projection;
     } else {
-      src += Value::SkipSerialized(src, type);
+      ASSIGN_OR_RETURN(size_t, skipped, Value::TrySkipSerialized(src, type));
+      src += skipped;
     }
   }
   return static_cast<size_t>(src - original_offset);
@@ -209,24 +223,26 @@ std::string Row::ToString() const {
   return output.str();
 }
 
-std::string Row::EncodeMemcomparableFormat() const {
-  std::stringstream ss;
+StatusOr<std::string> Row::TryEncodeMemcomparableFormat() const {
+  std::string encoded;
   for (const auto& v : values_) {
-    ss << v.EncodeMemcomparableFormat();
+    ASSIGN_OR_RETURN(std::string, part, v.TryEncodeMemcomparableFormat());
+    encoded += part;
   }
-  return ss.str();
+  return encoded;
 }
 
-void Row::DecodeMemcomparableFormat(std::string_view src) {
+Status Row::TryDecodeMemcomparableFormat(std::string_view src) {
   values_.clear();
   while (!src.empty()) {
     Value v;
     // Self-delimiting memcomparable chunks: the callee consumes by offsets,
     // never as a C string.
-    size_t advanced = v.DecodeMemcomparableFormat(src);
+    ASSIGN_OR_RETURN(size_t, advanced, v.TryDecodeMemcomparableFormat(src));
     src.remove_prefix(advanced);
     values_.push_back(v);
   }
+  return Status::kSuccess;
 }
 
 Row Row::Extract(const std::vector<slot_t>& elms) const {

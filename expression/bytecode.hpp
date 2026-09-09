@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "expression/expression.hpp"
 #include "type/row.hpp"
@@ -46,10 +47,16 @@ struct BytecodeInstruction {
 
 class BytecodeProgram {
  public:
+  [[nodiscard]] StatusOr<ColumnVector> TryEvaluateBatch(
+      const DataChunk& input) const;
+  // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp); library
+  // callers use TryEvaluateBatch.
   [[nodiscard]] ColumnVector EvaluateBatch(const DataChunk& input) const;
   // Single-row evaluation for use in row-by-row filter paths (e.g.
   // MatchScanFilter).  Returns the result of evaluating the compiled
   // expression against the given row.
+  [[nodiscard]] StatusOr<Value> TryEvaluateRow(const Row& row) const;
+  // EXC-SHIM: deprecated throwing wrapper; library callers use TryEvaluateRow.
   [[nodiscard]] Value EvaluateRow(const Row& row) const;
   [[nodiscard]] const std::vector<BytecodeInstruction>& Instructions() const {
     return instructions_;
@@ -67,12 +74,13 @@ class BytecodeProgram {
   void SetJumpTarget(size_t index, int32_t relative_offset) {
     instructions_[index].jump_target = relative_offset;
   }
-  [[nodiscard]] uint16_t AddConstant(Value value) {
+  bool AddConstant(Value value, uint16_t* offset) {
     if (constants_.size() >= std::numeric_limits<uint16_t>::max()) {
-      throw std::runtime_error("too many bytecode constants");
+      return false;
     }
     constants_.push_back(std::move(value));
-    return static_cast<uint16_t>(constants_.size() - 1);
+    *offset = static_cast<uint16_t>(constants_.size() - 1);
+    return true;
   }
   void SetResultType(ValueType type) { result_type_ = type; }
 

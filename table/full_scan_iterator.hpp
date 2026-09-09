@@ -76,6 +76,12 @@ struct IntegerPeekCompare {
 // own their data and stay valid after the iterator's page latch is dropped.
 class FullScanIterator : public IteratorBase {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  FullScanIterator(const FullScanIterator&) = delete;
+  FullScanIterator& operator=(const FullScanIterator&) = delete;
+  FullScanIterator(FullScanIterator&&) = delete;
+  FullScanIterator& operator=(FullScanIterator&&) = delete;
   ~FullScanIterator() override = default;
   bool operator==(const FullScanIterator& rhs) const {
     return table_ == rhs.table_ && txn_ == rhs.txn_ &&
@@ -87,6 +93,7 @@ class FullScanIterator : public IteratorBase {
   }
 
   [[nodiscard]] bool IsValid() const override;
+  [[nodiscard]] Status GetStatus() const override { return status_; }
   [[nodiscard]] RowPosition Position() const override { return pos_; }
   IteratorBase& operator++() override;
   IteratorBase& operator--() override;
@@ -115,6 +122,9 @@ class FullScanIterator : public IteratorBase {
   [[nodiscard]] bool PassesPeekFilters(std::string_view row) const;
   void SeekVisibleRow();
   bool AdvancePage();
+  // Pins `page_id` with a shared latch. On failure records the status, leaves
+  // page_ empty, and returns false.
+  [[nodiscard]] bool PinPage(page_id_t page_id);
 
   const Table* table_;
   Transaction* txn_;
@@ -127,6 +137,7 @@ class FullScanIterator : public IteratorBase {
   const std::unordered_set<int64_t>* key_filter_{nullptr};
   std::optional<slot_t> key_column_;
   const std::vector<IntegerPeekCompare>* peek_compares_{nullptr};
+  Status status_{Status::kSuccess};
 };
 
 }  // namespace tinylamb

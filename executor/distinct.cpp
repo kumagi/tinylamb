@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -64,7 +65,11 @@ bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
       std::vector<Value> current_keys;
       current_keys.reserve(distinct_on_.size());
       for (const auto& expr : distinct_on_) {
-        current_keys.push_back(expr->Evaluate(row, schema_));
+        StatusOr<Value> key = expr->TryEvaluate(row, schema_);
+        if (!key.HasValue()) {
+          return FailWith(key.GetStatus());
+        }
+        current_keys.push_back(key.MoveValue());
       }
       bool duplicate = false;
       for (const auto& seen_k : seen_keys_) {
@@ -98,6 +103,7 @@ bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
       }
     }
   }
+  FailWithChildOf(*source_);
   return false;
 }
 void DistinctExecutor::Dump(std::ostream& output, int indent) const {
@@ -120,6 +126,7 @@ bool SortDistinctExecutor::Next(Row* dst, RowPosition* rp) {
     }
     return true;
   }
+  FailWithChildOf(*source_);
   return false;
 }
 

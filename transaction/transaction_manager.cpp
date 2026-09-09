@@ -267,59 +267,63 @@ Status TransactionManager::PreCommit(Transaction& txn) {
   if (!txn.IsReadOnly()) {
     LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
     lsn_t commit_end = 0;
-    try {
-      txn.prev_lsn_ = logger_->AddLog(commit_log.Serialize());
-      // AddLog returns the LSN *before* the payload; durable point is end of
-      // the buffered commit record.
-      commit_end = logger_->BufferedLSN();
-    } catch (...) {
-      // A dead logger cannot take compensation logs, so full rollback is
-      // impossible.  Still leave no half-finished state behind: release the
-      // write intents (AbortVersions only resets pending owners and wakes
-      // waiters -- it appends nothing), drop the registry slot so the
-      // transaction cannot remain active forever, and report it as aborted,
-      // never committed.  No version was published.  Skipping AbortVersions
-      // here left the intents installed with a dead owner: waiters policy-
-      // allowed to wait on an older holder block forever, and with the
-      // wait-for edges dropped above the detector can never wound anyone.
-      RemoveWaitForEdgesOf(txn.ID());
-      AbortVersions(txn);
-      txn.SetStatus(TransactionStatus::kAborted);
-      ForgetTransaction(txn);
-      throw;
+    {
+      StatusOr<lsn_t> appended = logger_->AddLog(commit_log.Serialize());
+      if (appended.HasValue()) {
+        txn.prev_lsn_ = appended.MoveValue();
+        // AddLog returns the LSN *before* the payload; durable point is end
+        // of the buffered commit record.
+        commit_end = logger_->BufferedLSN();
+      } else {
+        // A dead logger cannot take compensation logs, so full rollback is
+        // impossible.  Still leave no half-finished state behind: release the
+        // write intents (AbortVersions only resets pending owners and wakes
+        // waiters -- it appends nothing), drop the registry slot so the
+        // transaction cannot remain active forever, and report it as aborted,
+        // never committed.  No version was published.  Skipping AbortVersions
+        // here left the intents installed with a dead owner: waiters policy-
+        // allowed to wait on an older holder block forever, and with the
+        // wait-for edges dropped above the detector can never wound anyone.
+        RemoveWaitForEdgesOf(txn.ID());
+        AbortVersions(txn);
+        txn.SetStatus(TransactionStatus::kAborted);
+        ForgetTransaction(txn);
+        return appended.GetStatus();
+      }
     }
     CommitVersions(txn, commit_end);
     txn.SetStatus(TransactionStatus::kCommitted);
-    try {
-      if (synchronous_commit_) {
-        const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
-        const auto wait_start = measure
-                                    ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
-        logger_->WaitForDurable(commit_end);
-        if (measure) {
-          wal_wait_count_.fetch_add(1, std::memory_order_relaxed);
-          wal_wait_ns_.fetch_add(
-              static_cast<uint64_t>(
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::steady_clock::now() - wait_start)
-                      .count()),
-              std::memory_order_relaxed);
-        }
+    Status durable = Status::kSuccess;
+    if (synchronous_commit_) {
+      const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
+      const auto wait_start = measure ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+      durable = logger_->WaitForDurable(commit_end);
+      if (measure && durable == Status::kSuccess) {
+        wal_wait_count_.fetch_add(1, std::memory_order_relaxed);
+        wal_wait_ns_.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count()),
+            std::memory_order_relaxed);
       }
+    }
+    if (durable == Status::kSuccess) {
       // D4 barrier: the result this transaction produced depends on every
       // commit it observed, not only its own.  synchronous_commit may skip
       // the own-commit wait, but it never disables this dependency wait, and
       // a read-only transaction is subject to the same barrier.
       const lsn_t dependence = txn.DurabilityDependence();
       if (dependence != 0) {
-        logger_->WaitForDurable(dependence);
+        durable = logger_->WaitForDurable(dependence);
       }
-    } catch (...) {
+    }
+    if (durable != Status::kSuccess) {
       RemoveWaitForEdgesOf(txn.ID());
       ForgetTransaction(txn);
       txn.SetStatus(TransactionStatus::kAborted);
-      throw;
+      return durable;
     }
   } else {
     txn.SetStatus(TransactionStatus::kCommitted);
@@ -329,9 +333,8 @@ Status TransactionManager::PreCommit(Transaction& txn) {
     // there is no own commit record to flush.
     const lsn_t dependence = txn.DurabilityDependence();
     if (dependence != 0) {
-      try {
-        logger_->WaitForDurable(dependence);
-      } catch (...) {
+      const Status durable = logger_->WaitForDurable(dependence);
+      if (durable != Status::kSuccess) {
         // Nothing was published, but the registry slot and snapshot entry
         // must not outlive this stack-allocated transaction: a later
         // checkpoint, wounding, or deadlock scan would dereference freed
@@ -339,7 +342,7 @@ Status TransactionManager::PreCommit(Transaction& txn) {
         RemoveWaitForEdgesOf(txn.ID());
         ForgetTransaction(txn);
         txn.SetStatus(TransactionStatus::kAborted);
-        throw;
+        return durable;
       }
     }
   }
@@ -347,18 +350,18 @@ Status TransactionManager::PreCommit(Transaction& txn) {
   return Status::kSuccess;
 }
 
-void TransactionManager::Abort(Transaction& txn) {
+Status TransactionManager::Abort(Transaction& txn) {
   // Guard double-finish: calling Abort() after a successful PreCommit must
   // not roll back already-published committed writes (the undo walk would
   // silently revert data other transactions may already have read).
   if (txn.IsFinished()) {
-    return;
+    return Status::kSuccess;
   }
   if (txn.IsReadOnly()) {
     txn.SetStatus(TransactionStatus::kAborted);
     RemoveWaitForEdgesOf(txn.ID());
     ForgetTransaction(txn);
-    return;
+    return Status::kSuccess;
   }
   // Drop our hold on every wait-for edge before undoing: any later wait
   // waking up to find no holder should not see this transaction as a
@@ -375,49 +378,47 @@ void TransactionManager::Abort(Transaction& txn) {
     // is still in the logger buffer (strace-confirmed source of the -j32
     // "Invalid format log" flakiness).
     const uint64_t latest_log_end = logger_->BufferedLSN();
-    try {
-      logger_->WaitForDurable(latest_log_end);
-    } catch (const std::exception& error) {
+    const Status durable = logger_->WaitForDurable(latest_log_end);
+    if (durable != Status::kSuccess) {
       // Fall through; the undo replay reads what was flushed and the abort
       // log write reports the broken WAL.
-      LOG(WARN) << "WAL durability wait failed during abort: " << error.what();
+      LOG(WARN) << "WAL durability wait failed during abort: " << durable;
     }
   }
   lsn_t prev = txn.prev_lsn_;
-  // The undo walk can throw (corrupt page hand-back, dead logger).  A throw
+  // The undo walk can fail (corrupt page hand-back, dead logger).  A failure
   // must not skip AbortVersions/SetStatus: intents left installed plus a
   // transaction that stays active would block its rows for the process
-  // lifetime.  Clean up, then rethrow.
-  try {
-    while (prev != 0) {
-      LogRecord lr;
-      if (!recovery_->ReadLog(prev, &lr)) {
-        // The record never became durable (logger failure path above) or the
-        // tail was truncated: there is nothing on this chain left to undo.
-        LOG(WARN) << "Abort undo: unreadable log at " << prev << ", stopping";
-        break;
-      }
-      recovery_->LogUndoWithPage(prev, lr, txn.transaction_manager_);
-      prev = lr.prev_lsn;
+  // lifetime.  Clean up, then report the failure.
+  Status undo_status = Status::kSuccess;
+  while (prev != 0) {
+    LogRecord lr;
+    if (!recovery_->ReadLog(prev, &lr)) {
+      // The record never became durable (logger failure path above) or the
+      // tail was truncated: there is nothing on this chain left to undo.
+      LOG(WARN) << "Abort undo: unreadable log at " << prev << ", stopping";
+      break;
     }
-  } catch (...) {
-    AbortVersions(txn);
-    txn.SetStatus(TransactionStatus::kAborted);
-    ForgetTransaction(txn);
-    throw;
+    undo_status =
+        recovery_->LogUndoWithPage(prev, lr, txn.transaction_manager_);
+    if (undo_status != Status::kSuccess) {
+      break;
+    }
+    prev = lr.prev_lsn;
   }
   AbortVersions(txn);
   txn.SetStatus(TransactionStatus::kAborted);
-  try {
-    LogRecord abort_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
-    txn.prev_lsn_ = logger_->AddLog(abort_log.Serialize());
-  } catch (...) {
-    // Same contract as PreCommit: release locks and leave an aborted state
-    // rather than a half-finished transaction blocking everyone.
-    ForgetTransaction(txn);
-    throw;
+  LogRecord abort_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
+  StatusOr<lsn_t> appended = logger_->AddLog(abort_log.Serialize());
+  // Same contract as PreCommit: release locks and leave an aborted state
+  // rather than a half-finished transaction blocking everyone.
+  if (appended.HasValue()) {
+    txn.prev_lsn_ = appended.MoveValue();
+  } else if (undo_status == Status::kSuccess) {
+    undo_status = appended.GetStatus();
   }
   ForgetTransaction(txn);
+  return undo_status;
 }
 
 bool TransactionManager::AcquireWriteIntent(
@@ -1004,106 +1005,116 @@ void TransactionManager::GarbageCollectVersions() {
   }
 }
 
-lsn_t TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                              slot_t slot) {
-  const LogRecord lr = LogRecord::CompensatingInsertLogRecord(txn_id, pid, slot);
-  return AddLog(lr) + lr.Size();
-}
-lsn_t TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                              std::string_view key) {
+StatusOr<lsn_t> TransactionManager::CompensateInsertLog(txn_id_t txn_id,
+                                                        page_id_t pid,
+                                                        slot_t slot) {
   const LogRecord lr =
-      LogRecord::CompensatingInsertLogRecord(txn_id, pid, key);
-  return AddLog(lr) + lr.Size();
+      LogRecord::CompensatingInsertLogRecord(txn_id, pid, slot);
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
-lsn_t TransactionManager::CompensateInsertBranchLog(txn_id_t txn_id,
-                                                    page_id_t pid,
-                                                    std::string_view key) {
+StatusOr<lsn_t> TransactionManager::CompensateInsertLog(txn_id_t txn_id,
+                                                        page_id_t pid,
+                                                        std::string_view key) {
+  const LogRecord lr = LogRecord::CompensatingInsertLogRecord(txn_id, pid, key);
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
+}
+StatusOr<lsn_t> TransactionManager::CompensateInsertBranchLog(
+    txn_id_t txn_id, page_id_t pid, std::string_view key) {
   const LogRecord lr =
       LogRecord::CompensatingInsertBranchLogRecord(txn_id, pid, key);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-lsn_t TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
-                                              slot_t slot,
-                                              std::string_view redo) {
+StatusOr<lsn_t> TransactionManager::CompensateUpdateLog(txn_id_t txn_id,
+                                                        page_id_t pid,
+                                                        slot_t slot,
+                                                        std::string_view redo) {
   const LogRecord lr =
       LogRecord::CompensatingUpdateLogRecord(txn_id, pid, slot, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
-lsn_t TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
-                                              std::string_view key,
-                                              std::string_view redo) {
+StatusOr<lsn_t> TransactionManager::CompensateUpdateLog(txn_id_t txn_id,
+                                                        page_id_t pid,
+                                                        std::string_view key,
+                                                        std::string_view redo) {
   const LogRecord lr =
       LogRecord::CompensatingUpdateLeafLogRecord(txn_id, pid, key, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
-lsn_t TransactionManager::CompensateUpdateBranchLog(txn_id_t txn_id,
-                                                    page_id_t pid,
-                                                    std::string_view key,
-                                                    page_id_t redo) {
+StatusOr<lsn_t> TransactionManager::CompensateUpdateBranchLog(
+    txn_id_t txn_id, page_id_t pid, std::string_view key, page_id_t redo) {
   const LogRecord lr =
       LogRecord::CompensatingUpdateBranchLogRecord(txn_id, pid, key, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-lsn_t TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
-                                              slot_t slot,
-                                              std::string_view redo) {
+StatusOr<lsn_t> TransactionManager::CompensateDeleteLog(txn_id_t txn_id,
+                                                        page_id_t pid,
+                                                        slot_t slot,
+                                                        std::string_view redo) {
   const LogRecord lr =
       LogRecord::CompensatingDeleteLogRecord(txn_id, pid, slot, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-lsn_t TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
-                                              std::string_view key,
-                                              std::string_view redo) {
+StatusOr<lsn_t> TransactionManager::CompensateDeleteLog(txn_id_t txn_id,
+                                                        page_id_t pid,
+                                                        std::string_view key,
+                                                        std::string_view redo) {
   const LogRecord lr =
       LogRecord::CompensatingDeleteLeafLogRecord(txn_id, pid, key, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-lsn_t TransactionManager::CompensateDeleteBranchLog(txn_id_t txn_id,
-                                                    page_id_t pid,
-                                                    std::string_view key,
-                                                    page_id_t redo) {
+StatusOr<lsn_t> TransactionManager::CompensateDeleteBranchLog(
+    txn_id_t txn_id, page_id_t pid, std::string_view key, page_id_t redo) {
   const LogRecord lr =
       LogRecord::CompensatingDeleteBranchLogRecord(txn_id, pid, key, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-lsn_t TransactionManager::CompensateSetLowestValueLog(txn_id_t txn_id,
-                                                      page_id_t pid,
-                                                      page_id_t redo) {
+StatusOr<lsn_t> TransactionManager::CompensateSetLowestValueLog(
+    txn_id_t txn_id, page_id_t pid, page_id_t redo) {
   const LogRecord lr =
       LogRecord::CompensateSetLowestValueLogRecord(txn_id, pid, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-lsn_t TransactionManager::CompensateSetLowFenceLog(txn_id_t txn_id,
-                                                   page_id_t pid,
-                                                   const IndexKey& redo) {
+StatusOr<lsn_t> TransactionManager::CompensateSetLowFenceLog(
+    txn_id_t txn_id, page_id_t pid, const IndexKey& redo) {
   const LogRecord lr =
       LogRecord::CompensateSetLowFenceLogRecord(0, txn_id, pid, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-lsn_t TransactionManager::CompensateSetHighFenceLog(txn_id_t txn_id,
-                                                    page_id_t pid,
-                                                    const IndexKey& redo) {
+StatusOr<lsn_t> TransactionManager::CompensateSetHighFenceLog(
+    txn_id_t txn_id, page_id_t pid, const IndexKey& redo) {
   const LogRecord lr =
       LogRecord::CompensateSetHighFenceLogRecord(0, txn_id, pid, redo);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-lsn_t TransactionManager::CompensateSetFosterLog(txn_id_t txn_id,
-                                                 page_id_t pid,
-                                                 const FosterPair& foster) {
+StatusOr<lsn_t> TransactionManager::CompensateSetFosterLog(
+    txn_id_t txn_id, page_id_t pid, const FosterPair& foster) {
   const LogRecord lr =
       LogRecord::CompensateSetFosterLogRecord(0, txn_id, pid, foster);
-  return AddLog(lr) + lr.Size();
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
 }
 
-uint64_t TransactionManager::AddLog(const LogRecord& lr) {
+StatusOr<lsn_t> TransactionManager::AddLog(const LogRecord& lr) {
   return logger_->AddLog(lr.Serialize());
 }
 

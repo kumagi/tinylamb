@@ -63,7 +63,7 @@ class BPlusTreeTest : public ::testing::Test {
     master_record_name_ = prefix + ".master.log";
     Recover();
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
@@ -80,8 +80,8 @@ class BPlusTreeTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 110);
-    l_ = std::make_unique<Logger>(log_name_);
+    p_ = PageManager::Create(db_name_, 110).MoveValue();
+    l_ = Logger::Create(log_name_).MoveValue();
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
@@ -472,18 +472,21 @@ TEST_F(BPlusTreeTest, DeleteFosterBranch) {
   //           branch -> [foster_left "jj", foster_right "zz"]]
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     left->InsertLeaf(txn, "hello", "world");
     root->SetLowestValue(txn, left->PageID());
-    PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     right->InsertLeaf(txn, "jack", "chen");
     root->InsertBranch(txn, "jack", right->PageID());
-    PageRef foster = p_->AllocateNewPage(txn, PageType::kBranchPage);
-    PageRef foster_left = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef foster =
+        p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+    PageRef foster_left =
+        p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     foster_left->InsertLeaf(txn, "jj", "pp");
-    PageRef foster_right = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef foster_right =
+        p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     foster_right->InsertLeaf(txn, "zz", "adf");
     foster->SetLowestValue(txn, foster_left->PageID());
     foster->InsertBranch(txn, "zz", foster_right->PageID());
@@ -509,22 +512,24 @@ TEST_F(BPlusTreeTest, LiftUpBranch) {
   //           [leaf "b", leaf "bb"]]
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef a_branch = p_->AllocateNewPage(txn, PageType::kBranchPage);
-    PageRef b_branch = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef a_branch =
+        p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+    PageRef b_branch =
+        p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
     ASSERT_SUCCESS(b_branch->SetLowFence(txn, IndexKey("b")));
     root->SetLowestValue(txn, a_branch->PageID());
     root->InsertBranch(txn, "b", b_branch->PageID());
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, "a", "1");
-    PageRef aa = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef aa = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     aa->InsertLeaf(txn, "aa", "2");
     a_branch->SetLowestValue(txn, a->PageID());
     a_branch->InsertBranch(txn, "aa", aa->PageID());
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     b->InsertLeaf(txn, "b", "3");
-    PageRef bb = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef bb = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     bb->InsertLeaf(txn, "bb", "4");
 
     b_branch->SetLowestValue(txn, b->PageID());
@@ -564,34 +569,34 @@ void BuildBranchFosterTree(TransactionManager* tm, BPlusTree* bpt) {
  */
   PageManager* p = tm->GetPageManager();
   auto txn = tm->Begin();
-  PageRef root = p->GetPage(bpt->Root());
+  PageRef root = p->GetPage(bpt->Root()).MoveValue();
   root->PageTypeChange(txn, PageType::kBranchPage);
-  PageRef a_branch = p->AllocateNewPage(txn, PageType::kBranchPage);
-  PageRef b_branch = p->AllocateNewPage(txn, PageType::kBranchPage);
+  PageRef a_branch = p->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+  PageRef b_branch = p->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
   root->SetLowestValue(txn, a_branch->PageID());
   root->InsertBranch(txn, "aaaaa", b_branch->PageID());
-  PageRef a = p->AllocateNewPage(txn, PageType::kLeafPage);
+  PageRef a = p->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
   a->InsertLeaf(txn, "a", "1");
-  PageRef aa = p->AllocateNewPage(txn, PageType::kLeafPage);
+  PageRef aa = p->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
   aa->InsertLeaf(txn, "aa", "2");
   a_branch->SetLowestValue(txn, a->PageID());
   a_branch->InsertBranch(txn, "aa", aa->PageID());
-  PageRef a_foster = p->AllocateNewPage(txn, PageType::kBranchPage);
+  PageRef a_foster = p->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
   ASSERT_SUCCESS(
       a_branch->SetFoster(txn, FosterPair("aaa", a_foster->PageID())));
-  PageRef aaa = p->AllocateNewPage(txn, PageType::kLeafPage);
+  PageRef aaa = p->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
   aaa->InsertLeaf(txn, "aaa", "3");
   a_foster->SetLowestValue(txn, aaa->PageID());
-  PageRef aaaa = p->AllocateNewPage(txn, PageType::kLeafPage);
+  PageRef aaaa = p->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
   aaaa->InsertLeaf(txn, "aaaa", "4");
   a_foster->InsertBranch(txn, "aaaa", aaaa->PageID());
 
-  PageRef aaaaa = p->AllocateNewPage(txn, PageType::kLeafPage);
+  PageRef aaaaa = p->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
   aaaaa->InsertLeaf(txn, "aaaaa", "5");
   b_branch->SetLowestValue(txn, aaaaa->PageID());
   b_branch->SetLowFence(txn, IndexKey("aaaaa"));
 
-  PageRef b = p->AllocateNewPage(txn, PageType::kLeafPage);
+  PageRef b = p->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
   b->InsertLeaf(txn, "b", "6");
   b_branch->InsertBranch(txn, "b", b->PageID());
   txn.PreCommit();
@@ -682,20 +687,20 @@ TEST_F(BPlusTreeTest, DeleteFosterLeaf) {
   //           "d")]
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, "a", "a");
     root->SetLowestValue(txn, a->PageID());
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     b->InsertLeaf(txn, "b", "b");
     root->InsertBranch(txn, "b", b->PageID());
-    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     c->InsertLeaf(txn, "c", "c");
     c->InsertLeaf(txn, "cc", "cc");
     root->InsertBranch(txn, "c", c->PageID());
     c->InsertLeaf(txn, "c", "c");
-    PageRef d = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef d = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     d->InsertLeaf(txn, "d", "d");
     ASSERT_SUCCESS(c->SetFoster(txn, FosterPair("d", d->PageID())));
     txn.PreCommit();
@@ -837,7 +842,8 @@ TEST_F(BPlusTreeTest, Crash) {
 
   // Act -- flush every 2nd page (even indices) to disk, then emulate crash +
   // recovery
-  page_id_t max_page = p_->GetPage(0)->body.meta_page.MaxPageCountForTest();
+  page_id_t max_page =
+      p_->GetPage(0).Value()->body.meta_page.MaxPageCountForTest() ;
   for (size_t i = 0; i < max_page; i += 2) {
     Flush(i);
   }
@@ -885,7 +891,7 @@ TEST_F(BPlusTreeTest, NodeReclaimWALReplaysAfterCrash) {
     std::this_thread::yield();
   }
   const page_id_t pages_before =
-      p_->GetPage(kMetaPageId)->body.meta_page.MaxPageCountForTest();
+      p_->GetPage(kMetaPageId).Value()->body.meta_page.MaxPageCountForTest() ;
   Recover();
   r_->RecoverFrom(0, tm_.get());
 
@@ -901,7 +907,7 @@ TEST_F(BPlusTreeTest, NodeReclaimWALReplaysAfterCrash) {
   EXPECT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   // Reclaimed nodes are back on the free list: an allocation must not push
   // the high-water mark past what the tree used before the crash.
-  PageRef meta = p_->GetPage(kMetaPageId);
+  PageRef meta = p_->GetPage(kMetaPageId).MoveValue();
   EXPECT_NE(meta->body.meta_page.FirstFreePage(), 0U);
   txn.PreCommit();
   (void)pages_before;
@@ -922,12 +928,14 @@ TEST_F(BPlusTreeTest, CheckPoint) {
     }
 
     // Act 2 -- take a checkpoint (writes keys 10..19 during callback)
-    restart_point = cm_->WriteCheckpoint([&]() {
-      for (int i = 10; i < 20; ++i) {
-        ASSERT_SUCCESS(
-            bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
-      }
-    });
+    restart_point =
+        cm_->WriteCheckpoint([&]() {
+             for (int i = 10; i < 20; ++i) {
+               ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, kKeyLength),
+                                           KeyGen(i * 10, 1000)));
+             }
+           })
+            .Value();
 
     // Act 3 -- insert keys 20..29 after checkpoint
     for (int i = 20; i < 30; ++i) {
@@ -939,7 +947,8 @@ TEST_F(BPlusTreeTest, CheckPoint) {
 
   // Act 4 -- flush every 5th page to disk, then emulate crash + recovery from
   // checkpoint
-  page_id_t max_page = p_->GetPage(0)->body.meta_page.MaxPageCountForTest();
+  page_id_t max_page =
+      p_->GetPage(0).Value()->body.meta_page.MaxPageCountForTest() ;
   for (size_t i = 0; i < max_page; i += 5) {
     Flush(i);
   }
@@ -1124,9 +1133,9 @@ TEST_F(BPlusTreeTest, DumpEmptyBranchSlot) {
   // Arrange -- make the root a branch with zero keys but one leaf child
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef leaf = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef leaf = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf->InsertLeaf(txn, "a", "1");
     root->SetLowestValue(txn, leaf->PageID());
     txn.PreCommit();
@@ -1145,7 +1154,7 @@ TEST_F(BPlusTreeTest, SanityCheckRejectsInvalidRootType) {
   // Arrange -- corrupt the root page into an unrecognized page type
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kRowPage);
     txn.PreCommit();
   }
@@ -1236,15 +1245,15 @@ TEST_F(BPlusTreeTest, DeleteLiftUpLeafWithFoster) {
   //                                       leaf "b"]
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, "a", "1");
     root->SetLowestValue(txn, a->PageID());
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     b->InsertLeaf(txn, "b", "2");
     root->InsertBranch(txn, "b", b->PageID());
-    PageRef aa = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef aa = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     aa->InsertLeaf(txn, "aa", "3");
     ASSERT_SUCCESS(a->SetFoster(txn, FosterPair("aa", aa->PageID())));
     txn.PreCommit();
@@ -1273,12 +1282,12 @@ TEST_F(BPlusTreeTest, DeleteLiftUpLeafWithoutFoster) {
   // Arrange -- root (branch, 1 slot) -> [leaf "a", leaf "b"] with no fosters
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, "a", "1");
     root->SetLowestValue(txn, a->PageID());
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     b->InsertLeaf(txn, "b", "2");
     root->InsertBranch(txn, "b", b->PageID());
     txn.PreCommit();
@@ -1470,7 +1479,7 @@ TEST_F(BPlusTreeTest, PrefixSeekCrossesSeparatorBoundary) {
           break;
         }
       }
-      EXPECT_EQ(seen, kCount / kGroups) << "group " << group;
+      EXPECT_EQ(seen, kCount / kGroups) << true << (group != 0);
       ++checked_groups;
     }
     EXPECT_EQ(checked_groups, kGroups);
@@ -1527,7 +1536,7 @@ TEST_F(BPlusTreeTest, DumpInvalidPageTypeAborts) {
   // Arrange -- corrupt the root page type
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kRowPage);
     txn.PreCommit();
   }
@@ -1545,18 +1554,18 @@ TEST_F(BPlusTreeTest, DeleteLiftUpLeafWithDeepFosterChain) {
   // "ab"), leaf "b"], i.e. the lowest leaf carries a two-level foster chain
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, "a", "1");
     root->SetLowestValue(txn, a->PageID());
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     b->InsertLeaf(txn, "b", "2");
     root->InsertBranch(txn, "b", b->PageID());
-    PageRef aa = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef aa = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     aa->InsertLeaf(txn, "aa", "3");
     ASSERT_SUCCESS(a->SetFoster(txn, FosterPair("aa", aa->PageID())));
-    PageRef ab = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef ab = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     ab->InsertLeaf(txn, "ab", "4");
     ASSERT_SUCCESS(aa->SetFoster(txn, FosterPair("ab", ab->PageID())));
     txn.PreCommit();
@@ -1589,18 +1598,18 @@ TEST_F(BPlusTreeTest, SetFosterRecursivelyWalksFosterChain) {
   // deleting from the last child must rebalance through the foster parent
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, "a", "1");
     root->SetLowestValue(txn, a->PageID());
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     b->InsertLeaf(txn, "b", "2");
     root->InsertBranch(txn, "b", b->PageID());
-    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     c->InsertLeaf(txn, "c", "3");
     root->InsertBranch(txn, "c", c->PageID());
-    PageRef b2 = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b2 = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     b2->InsertLeaf(txn, "b2", "4");
     ASSERT_SUCCESS(b->SetFoster(txn, FosterPair("b2", b2->PageID())));
     txn.PreCommit();
@@ -1627,7 +1636,7 @@ TEST_F(BPlusTreeTest, SetFosterRecursivelyWalksFosterChain) {
 TEST_F(BPlusTreeTest, ConstructWithMissingRootAllocatesLeaf) {
   // Act -- build a tree whose default root page has never been allocated
   auto txn = tm_->Begin();
-  BPlusTree fresh(txn, 2);
+  BPlusTree fresh = BPlusTree::Open(txn, 2).MoveValue();
   ASSERT_SUCCESS(fresh.Insert(txn, "k", "v"));
 
   // Assert -- the constructor allocated a fresh leaf and made it the root
@@ -1854,14 +1863,14 @@ TEST_F(BPlusTreeTest, DeleteDescendsThroughEmptyFosterParent) {
   // the foster child without touching the empty parent's rebalancing.
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, "a", "1");
     root->SetLowestValue(txn, a->PageID());
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     root->InsertBranch(txn, "b", b->PageID());
-    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     c->InsertLeaf(txn, "c", "3");
     ASSERT_SUCCESS(b->SetFoster(txn, FosterPair("c", c->PageID())));
     txn.PreCommit();
@@ -1963,7 +1972,7 @@ TEST_F(BPlusTreeTest, RandomChurnTenThousandOpsKeepsStructure) {
       std::ranges::sort(scanned);
       std::vector<int> expected(live_set.begin(), live_set.end());
       std::ranges::sort(expected);
-      ASSERT_EQ(scanned, expected) << "after op " << op;
+      ASSERT_EQ(scanned, expected) << true << (op != 0);
       check.PreCommit();
     }
   }
@@ -1982,35 +1991,36 @@ TEST_F(BPlusTreeTest, LiftUpBranchOrphansSiblingRows) {
   //                             fbranch]
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef prev = p_->AllocateNewPage(txn, PageType::kBranchPage);
-    PageRef leaf_a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef prev = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+    PageRef leaf_a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf_a->InsertLeaf(txn, "a", "1");
     prev->SetLowestValue(txn, leaf_a->PageID());
-    PageRef leaf_aa = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef leaf_aa = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf_aa->InsertLeaf(txn, "aa", "2");
     prev->InsertBranch(txn, "aa", leaf_aa->PageID());
     root->SetLowestValue(txn, prev->PageID());
 
-    PageRef next = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef next = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
     // Leave the low fence empty so the lift-up takes the cleanup path instead
     // of the foster-set path (old_key <= deleted key holds for every key).
     ASSERT_SUCCESS(next->SetLowFence(txn, IndexKey("")));
-    PageRef leaf_b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef leaf_b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf_b->InsertLeaf(txn, "b", "3");
     next->SetLowestValue(txn, leaf_b->PageID());
-    PageRef leaf_c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef leaf_c = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf_c->InsertLeaf(txn, "c", "4");
     next->InsertBranch(txn, "c", leaf_c->PageID());
-    PageRef leaf_d = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef leaf_d = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf_d->InsertLeaf(txn, "d", "5");
     next->InsertBranch(txn, "d", leaf_d->PageID());
-    PageRef fbranch = p_->AllocateNewPage(txn, PageType::kBranchPage);
-    PageRef leaf_f = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef fbranch =
+        p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+    PageRef leaf_f = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf_f->InsertLeaf(txn, "f", "6");
     fbranch->SetLowestValue(txn, leaf_f->PageID());
-    PageRef leaf_ff = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef leaf_ff = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf_ff->InsertLeaf(txn, "ff", "7");
     fbranch->InsertBranch(txn, "ff", leaf_ff->PageID());
     ASSERT_SUCCESS(next->SetFoster(txn, FosterPair("f", fbranch->PageID())));
@@ -2057,9 +2067,9 @@ TEST_F(BPlusTreeTest, DeleteFromRootLeafWithFosterChild) {
   // Arrange -- make the root a leaf that carries a foster leaf child
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->InsertLeaf(txn, "a", "1");
-    PageRef foster = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef foster = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     foster->InsertLeaf(txn, "b", "2");
     ASSERT_SUCCESS(root->SetFoster(txn, FosterPair("b", foster->PageID())));
     txn.PreCommit();
@@ -2140,16 +2150,16 @@ TEST_F(BPlusTreeTest, DescendingScanSeeksAcrossFosterChain) {
   // The descending scan must seek across the foster link in read-only mode.
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     b->InsertLeaf(txn, "b", "1");
     root->SetLowestValue(txn, b->PageID());
-    PageRef d = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef d = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     d->InsertLeaf(txn, "d", "2");
     ASSERT_SUCCESS(d->SetLowFence(txn, IndexKey("d")));
     root->InsertBranch(txn, "d", d->PageID());
-    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     c->InsertLeaf(txn, "c", "3");
     ASSERT_SUCCESS(c->SetLowFence(txn, IndexKey("c")));
     ASSERT_SUCCESS(c->SetHighFence(txn, IndexKey("d")));
@@ -2197,7 +2207,7 @@ TEST_F(BPlusTreeTest, LeafInsertSplitPlacesNewKeyOnEmptyRight) {
   const std::string value(15000, 'v');
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     ASSERT_SUCCESS(root->SetLowFence(txn, IndexKey(huge_fence)));
     txn.PreCommit();
   }
@@ -2219,30 +2229,32 @@ TEST_F(BPlusTreeTest, SetFosterRecursivelySplitsFullBranch) {
   const std::string zlow = std::string(4999, 'z') + '0';
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
 
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, KeyGen(0, 5000), "v");
     root->SetLowestValue(txn, a->PageID());
 
-    PageRef b1 = p_->AllocateNewPage(txn, PageType::kBranchPage);
-    PageRef l1 = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b1 = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+    PageRef l1 = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     l1->InsertLeaf(txn, KeyGen(1, 5000), "v");
     b1->SetLowestValue(txn, l1->PageID());
     for (int i = 2; i <= 7; ++i) {
-      PageRef leaf = p_->AllocateNewPage(txn, PageType::kLeafPage);
+      PageRef leaf = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
       leaf->InsertLeaf(txn, KeyGen(i, 5000), "v");
       ASSERT_SUCCESS(b1->InsertBranch(txn, KeyGen(i, 5000), leaf->PageID()));
     }
     ASSERT_EQ(b1->RowCount(), 6);
     ASSERT_SUCCESS(root->InsertBranch(txn, KeyGen(1, 5000), b1->PageID()));
 
-    PageRef z = p_->AllocateNewPage(txn, PageType::kBranchPage);
-    PageRef zlow_leaf = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef z = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+    PageRef zlow_leaf =
+        p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     zlow_leaf->InsertLeaf(txn, zlow, "v");
     z->SetLowestValue(txn, zlow_leaf->PageID());
-    PageRef zzz_leaf = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef zzz_leaf =
+        p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     zzz_leaf->InsertLeaf(txn, zzz, "v");
     ASSERT_SUCCESS(z->InsertBranch(txn, zzz, zzz_leaf->PageID()));
     ASSERT_SUCCESS(root->InsertBranch(txn, zlow, z->PageID()));

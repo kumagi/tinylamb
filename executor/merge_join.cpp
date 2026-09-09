@@ -33,7 +33,8 @@ MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
       residual_(std::move(residual)),
       residual_schema_(std::move(residual_schema)) {
   if (left_columns_.empty() || left_columns_.size() != right_columns_.size()) {
-    throw std::invalid_argument(
+    CHECK_MSG(
+        !left_columns_.empty() && left_columns_.size() == right_columns_.size(),
         "MergeJoin requires equally-sized non-empty keys");
   }
 }
@@ -64,7 +65,12 @@ bool MergeJoin::PairPasses(size_t i, size_t j) const {
     return true;
   }
   const Row combined = Concatenate(i, j);
-  return residual_->Evaluate(combined, residual_schema_).Truthy();
+  StatusOr<Value> res = residual_->TryEvaluate(combined, residual_schema_);
+  if (!res.HasValue()) {
+    residual_error_ = res.GetStatus();
+    return false;
+  }
+  return res.Value().Truthy();
 }
 
 void MergeJoin::Materialize() {
@@ -78,9 +84,11 @@ void MergeJoin::Materialize() {
     left_rows_.push_back(row);
     left_positions_.push_back(position);
   }
+  FailWithChildOf(*left_);
   while (right_->Next(&row, nullptr)) {
     right_rows_.push_back(row);
   }
+  FailWithChildOf(*right_);
 
   if (left_width_ == 0 && !left_rows_.empty()) {
     left_width_ = left_rows_.front().values_.size();
@@ -266,6 +274,9 @@ void MergeJoin::Materialize() {
 
 bool MergeJoin::Next(Row* dst, RowPosition* rp) {
   Materialize();
+  if (residual_error_ != Status::kSuccess) {
+    return FailWith(residual_error_);
+  }
   if (output_index_ >= output_.size()) {
     return false;
   }

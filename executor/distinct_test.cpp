@@ -38,7 +38,7 @@ class FakeSource : public ExecutorBase {
   void Dump(std::ostream& o, int /*indent*/) const override { o << "fake"; }
 
  private:
-  std::vector<Row> rows_;
+  std::vector<Row> rows_{};
   size_t idx_{0};
 };
 

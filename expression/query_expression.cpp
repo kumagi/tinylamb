@@ -19,9 +19,9 @@
 
 namespace tinylamb {
 
-Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
-                                   const Value& test,
-                                   const std::vector<Value>& rows) {
+StatusOr<Value> TryEvaluateQuantifiedComparison(
+    BinaryOperation op, QuantifierMode mode, const Value& test,
+    const std::vector<Value>& rows) {
   const bool is_all = mode == QuantifierMode::kAll;
   // Collation resolution: an explicit case-insensitive collator on any
   // operand (test value or row) applies to the whole comparison set.
@@ -51,10 +51,11 @@ Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
         if (!candidate.IsNull() && candidate.type == ValueType::kVarChar &&
             std::string_view(candidate.value.varchar_value).find('_') !=
                 std::string_view::npos) {
-          throw std::runtime_error(
+          return StatusError(
+              StatusCode::kInvalidArgument,
               "LIKE pattern has '_' which is not allowed when its operands "
               "have collation: " +
-              std::string(candidate.value.varchar_value));
+                  std::string(candidate.value.varchar_value));
         }
       }
     }
@@ -62,11 +63,10 @@ Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
   for (const Value& candidate : candidates) {
     Value result;
     if (!test_value.IsNull() && !candidate.IsNull()) {
-      try {
-        result = EvaluateBinary(op, test_value, candidate);
-      } catch (...) {
-        result = Value();
-      }
+      // A comparison error on one row is UNKNOWN for that row (three-valued
+      // logic), matching the old catch-all around the throwing evaluator.
+      auto compared = TryEvaluateBinary(op, test_value, candidate);
+      result = compared.HasValue() ? compared.MoveValue() : Value();
     }
     if (result.IsNull()) {
       saw_unknown = true;
@@ -88,9 +88,14 @@ Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
   return saw_unknown ? Value() : Value(true);
 }
 
-Value QueryExpression::Evaluate(const Row& /*row*/,
-                                const Schema& /*schema*/) const {
-  throw std::runtime_error("query expression requires relational evaluation");
+StatusOr<Value> QueryExpression::TryEvaluate(const Row& /*row*/,
+                                             const Schema& /*schema*/) const {
+  return StatusError(StatusCode::kRuntimeError,
+                     "query expression requires relational evaluation");
+}
+
+Value QueryExpression::Evaluate(const Row& row, const Schema& schema) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema), "QueryExpression::Evaluate");
 }
 
 // Canonical subquery semantics, evaluated against the abstract context
@@ -101,12 +106,14 @@ Value QueryExpression::Evaluate(const Row& /*row*/,
 //                   three-valued NOT to that result
 //   quantified    : x <op> ANY/ALL(...) with three-valued OR/AND combination
 //   scalar        : first projected value, NULL when the subquery is empty
-Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
-                                EvaluationContext& context) const {
+StatusOr<Value> QueryExpression::TryEvaluate(const Row& row,
+                                             const Schema& schema,
+                                             EvaluationContext& context) const {
   StatusOr<std::vector<Value>> rows = context.RunSubquery(*query_, &row);
   if (!rows.HasValue()) {
-    throw std::runtime_error("subquery execution failed: " +
-                             std::string(tinylamb::ToString(rows.GetStatus())));
+    return StatusError(rows.GetStatus().GetCode(),
+                       "subquery execution failed: " +
+                           std::string(tinylamb::ToString(rows.GetStatus())));
   }
   const std::vector<Value> values = std::move(rows).MoveValue();
   if (array_result_) {
@@ -119,9 +126,10 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
     return Value(negated_ ? !any : any);
   }
   if (test_) {
-    const Value test_value = test_->Evaluate(row, schema, context);
+    ASSIGN_OR_RETURN(Value, test_value,
+                     test_->TryEvaluate(row, schema, context));
     if (mode_ != QuantifierMode::kIn) {
-      return EvaluateQuantifiedComparison(op_, mode_, test_value, values);
+      return TryEvaluateQuantifiedComparison(op_, mode_, test_value, values);
     }
     bool found = false;
     bool saw_null = test_value.IsNull();
@@ -129,13 +137,15 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
       if (!test_value.IsNull() && !candidate.IsNull() &&
           test_value.Collation() != 0 && candidate.Collation() != 0 &&
           test_value.Collation() != candidate.Collation()) {
-        throw std::runtime_error("Collation conflict between the IN operands");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Collation conflict between the IN operands");
       }
       saw_null = saw_null || candidate.IsNull();
-      if (!found && !test_value.IsNull() && !candidate.IsNull() &&
-          EvaluateBinary(BinaryOperation::kEquals, test_value, candidate)
-              .Truthy()) {
-        found = true;
+      if (!found && !test_value.IsNull() && !candidate.IsNull()) {
+        ASSIGN_OR_RETURN(
+            Value, equal,
+            TryEvaluateBinary(BinaryOperation::kEquals, test_value, candidate));
+        found = equal.Truthy();
       }
     }
     Value membership =
@@ -146,9 +156,23 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
     return membership.IsNull() ? Value() : Value(!membership.Truthy());
   }
   if (values.empty()) {
-    return {};
+    return Value();
   }
   return values.front();
+}
+
+Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
+                                EvaluationContext& context) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema, context),
+                       "QueryExpression::Evaluate");
+}
+
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
+Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
+                                   const Value& test,
+                                   const std::vector<Value>& rows) {
+  return ExcShimUnwrap(TryEvaluateQuantifiedComparison(op, mode, test, rows),
+                       "EvaluateQuantifiedComparison");
 }
 
 std::unordered_set<ColumnName> QueryExpression::TouchedColumns() const {

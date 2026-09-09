@@ -74,17 +74,21 @@ class SortedRun {
   struct Entry {
     constexpr static size_t kIndirectThreshold = 12;
     Entry() = default;
-    Entry(std::string_view key, const LSMValue& value, BlobFile& blob_writer);
+    // Builds the on-disk entry image, spilling long keys/values to the blob.
+    static StatusOr<Entry> Create(std::string_view key, const LSMValue& value,
+                                  BlobFile& blob_writer);
 
     // Returns +1 if the Entry is smaller than `rhs`.
     // Returns  0 if the Entry is equal to `rhs`.
     // Returns -1 if the Entry is bigger than `rhs`
-    [[nodiscard]] int Compare(std::string_view rhs, const BlobFile& blob) const;
-    [[nodiscard]] int Compare(const Entry& rhs, const BlobFile& blob) const;
+    [[nodiscard]] StatusOr<int> Compare(std::string_view rhs,
+                                        const BlobFile& blob) const;
+    [[nodiscard]] StatusOr<int> Compare(const Entry& rhs,
+                                        const BlobFile& blob) const;
 
     // Caution: These are slow, use mainly for debug.
-    [[nodiscard]] std::string BuildKey(const BlobFile& blob) const;
-    [[nodiscard]] std::string BuildValue(const BlobFile& blob) const;
+    [[nodiscard]] StatusOr<std::string> BuildKey(const BlobFile& blob) const;
+    [[nodiscard]] StatusOr<std::string> BuildValue(const BlobFile& blob) const;
 
     [[nodiscard]] bool IsDeleted() const {
       // Tombstones set value_length_ to 0; an 8-byte inline payload of 0xff
@@ -155,15 +159,17 @@ class SortedRun {
     Iterator& operator=(Iterator&& o) = default;
     Iterator& operator=(const Iterator& o) = default;
 
-    [[nodiscard]] std::string Key() const {
+    [[nodiscard]] StatusOr<std::string> Key() const {
       assert(IsValid());
-      return GetEntry().BuildKey(*blob_);
+      ASSIGN_OR_RETURN(Entry, entry, GetEntry());
+      return entry.BuildKey(*blob_);
     }
-    [[nodiscard]] std::string Value() const {
+    [[nodiscard]] StatusOr<std::string> Value() const {
       assert(IsValid());
-      return GetEntry().BuildValue(*blob_);
+      ASSIGN_OR_RETURN(Entry, entry, GetEntry());
+      return entry.BuildValue(*blob_);
     }
-    [[nodiscard]] int Compare(const Iterator& rhs) const {
+    [[nodiscard]] StatusOr<int> Compare(const Iterator& rhs) const {
       assert(IsValid());
       assert(blob_ == rhs.blob_);
       assert(offset_ < parent_->Size());
@@ -171,9 +177,13 @@ class SortedRun {
         LOG(ERROR) << rhs.offset_ << " vs " << rhs.parent_->Size();
       }
       assert(rhs.offset_ < rhs.parent_->Size());
-      return GetEntry().Compare(rhs.GetEntry(), *blob_);
+      ASSIGN_OR_RETURN(Entry, entry, GetEntry());
+      ASSIGN_OR_RETURN(Entry, rhs_entry, rhs.GetEntry());
+      return entry.Compare(rhs_entry, *blob_).Value();
     }
-    [[nodiscard]] Entry GetEntry() const { return parent_->GetEntry(offset_); }
+    [[nodiscard]] StatusOr<Entry> GetEntry() const {
+      return parent_->GetEntry(offset_);
+    }
     [[nodiscard]] bool IsValid() const { return offset_ < parent_->Size(); }
     Iterator& operator++() {
       ++offset_;
@@ -183,8 +193,9 @@ class SortedRun {
     bool operator!=(const Iterator& rhs) const;
     friend std::ostream& operator<<(std::ostream& o, const Iterator& it);
     [[nodiscard]] size_t Generation() const { return parent_->generation_; }
-    [[nodiscard]] bool IsDeleted() const {
-      return parent_->GetEntry(offset_).IsDeleted();
+    [[nodiscard]] StatusOr<bool> IsDeleted() const {
+      ASSIGN_OR_RETURN(Entry, entry, GetEntry());
+      return entry.IsDeleted();
     }
 
    private:
@@ -194,7 +205,8 @@ class SortedRun {
   };
 
   SortedRun() = default;
-  explicit SortedRun(const std::filesystem::path& file);
+  // Restores a previously flushed run for reading (mmaps its index area).
+  static StatusOr<SortedRun> Restore(const std::filesystem::path& file);
   static Status Construct(const std::filesystem::path& file,
                           const std::map<std::string, LSMValue>& tree,
                           BlobFile& blob_, size_t generation);
@@ -223,7 +235,7 @@ class SortedRun {
                               std::string_view min, std::string_view max,
                               const std::vector<Entry>& index,
                               size_t generation);
-  [[nodiscard]] Entry GetEntry(size_t offset) const;
+  [[nodiscard]] StatusOr<Entry> GetEntry(size_t offset) const;
 
  private:
   std::string min_key_;

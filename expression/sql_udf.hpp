@@ -57,7 +57,7 @@ struct SqlUdfBinding {
   Schema schema;
 };
 
-[[nodiscard]] SqlUdfBinding BindSqlUdfArguments(
+[[nodiscard]] StatusOr<SqlUdfBinding> BindSqlUdfArguments(
     const SqlScalarFunction& function, std::vector<Value> arguments);
 
 // RAII invocation-depth accounting shared by every evaluation path so a
@@ -72,6 +72,9 @@ class SqlUdfDepthGuard {
   SqlUdfDepthGuard& operator=(SqlUdfDepthGuard&&) = delete;
 
   [[nodiscard]] static int CurrentDepth();
+  // Depth precondition (no-exception-rule-migration Phase 5): check this
+  // before constructing the guard instead of relying on a throwing ctor.
+  [[nodiscard]] static Status CheckAvailable();
 };
 
 // Encodes one struct value as the engine's canonical struct text: a JSON

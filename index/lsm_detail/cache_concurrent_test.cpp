@@ -57,7 +57,7 @@ class CacheConcurrentTest : public ::testing::Test {
     ASSERT_EQ(written, value.size() * sizeof(int));
     ::fsync(fd_);
     ASSERT_EQ(std::filesystem::file_size(path_), kSize * sizeof(int));
-    cache_ = std::make_unique<Cache>(fd_, 128 * 1024);
+    cache_ = Cache::Create(fd_, static_cast<size_t>(128 * 1024)).MoveValue();
   }
 
   void TearDown() override {
@@ -65,7 +65,7 @@ class CacheConcurrentTest : public ::testing::Test {
     std::ignore = std::remove(path_.c_str());
   }
 
-  static int Expected(size_t pos) {
+  int Expected(size_t pos) {
     return static_cast<int>(static_cast<size_t>(kSeed) +
                             std::hash<size_t>()(pos));
   }
@@ -88,7 +88,8 @@ TEST_F(CacheConcurrentTest, ReadTwo) {
       for (int j = 0; j < 1000; ++j) {
         // Act -- read a 4-byte int at a random position
         size_t pos = rand() % kSize;
-        std::string data = cache_->ReadAt(pos * sizeof(int), sizeof(int));
+        std::string data =
+            cache_->ReadAt(pos * sizeof(int), sizeof(int)).MoveValue();
         int data_as_int = *(reinterpret_cast<int*>(data.data()));
 
         // Assert -- the read value matches the deterministic Expected()
@@ -116,7 +117,8 @@ TEST_F(CacheConcurrentTest, ReadFifteen) {
       for (int j = 0; j < 100; ++j) {
         // Act -- read a 4-byte int at a random position
         size_t pos = rand() % kSize;
-        std::string data = cache_->ReadAt(pos * sizeof(int), sizeof(int));
+        std::string data =
+            cache_->ReadAt(pos * sizeof(int), sizeof(int)).MoveValue();
         int data_as_int = *(reinterpret_cast<int*>(data.data()));
 
         // Assert -- the read value matches the deterministic Expected()

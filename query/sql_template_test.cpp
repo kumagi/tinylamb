@@ -40,7 +40,8 @@ std::unique_ptr<Statement> ParseSql(std::string_view sql) {
   if (!ast.HasValue()) {
     return nullptr;
   }
-  return GoogleSqlAstVisitor::Visit(*ast.Value());
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+  return visited.HasValue() ? visited.MoveValue() : nullptr;
 }
 
 TEST(SqlTemplateTest, FingerprintsIgnoreLiterals) {
@@ -68,14 +69,16 @@ TEST(SqlTemplateTest, LeavesLimitAndStringsTyped) {
 
 TEST(SqlTemplateTest, BindsCachedSelectTree) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   auto original = ParseSql(
       "SELECT c_discount FROM customer WHERE c_w_id = 1 AND c_id = 4;");
   ASSERT_TRUE(original);
   const SqlTemplate templated = ExtractSqlTemplate(
       "SELECT c_discount FROM customer WHERE c_w_id = 8 AND c_id = 9;");
-  auto bound = BindStatementLiterals(*original, templated.parameters);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   ASSERT_EQ(bound->Type(), StatementType::kSelect);
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_TRUE(select.WhereClause());
@@ -87,7 +90,7 @@ TEST(SqlTemplateTest, BindsCachedSelectTree) {
 
 TEST(SqlTemplateTest, BindSelectPreservesLimitAndAttributes) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // C1: BindSelect must re-apply has_limit_ (the constructor sets limit_ but
   // not has_limit_) and the QUALIFY/DISTINCT ON/WITH TIES/AS STRUCT clauses,
@@ -96,23 +99,27 @@ TEST(SqlTemplateTest, BindSelectPreservesLimitAndAttributes) {
   ASSERT_TRUE(original);
   const SqlTemplate templated =
       ExtractSqlTemplate("SELECT DISTINCT a FROM t WHERE a > 5 LIMIT 3;");
-  auto bound = BindStatementLiterals(*original, templated.parameters);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
-  EXPECT_TRUE(select.HasLimit()) << "has_limit_ lost during re-bind";
+  EXPECT_TRUE(select.HasLimit()) << true;
   EXPECT_EQ(select.Limit(), 3U);
   EXPECT_TRUE(select.Distinct());
 }
 
 TEST(SqlTemplateTest, BindsCompositeStockLookup) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   auto original = ParseSql(
       "SELECT s_quantity, s_data FROM stock WHERE s_w_id = 1 AND s_i_id = 2;");
   ASSERT_TRUE(original);
   const SqlTemplate templated = ExtractSqlTemplate(
       "SELECT s_quantity, s_data FROM stock WHERE s_w_id = 1 AND s_i_id = 7;");
-  auto bound = BindStatementLiterals(*original, templated.parameters);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   EXPECT_EQ(select.WhereClause()->ToString(),
             "((s_w_id = 1) AND (s_i_id = 7))");
@@ -120,14 +127,16 @@ TEST(SqlTemplateTest, BindsCompositeStockLookup) {
 
 TEST(SqlTemplateTest, BindsDateLiteralsPreservingTheDateType) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   auto original = ParseSql("SELECT d FROM t WHERE d <= date '1998-09-18';");
   ASSERT_TRUE(original);
   const SqlTemplate templated =
       ExtractSqlTemplate("SELECT d FROM t WHERE d <= date '1994-01-01';");
   ASSERT_TRUE(templated.templatable);
-  auto bound = BindStatementLiterals(*original, templated.parameters);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_TRUE(select.WhereClause());
   const auto& binary = select.WhereClause()->AsBinaryExpression();
@@ -147,12 +156,14 @@ TEST(SqlTemplateTest, ExtractsNegativeLiteralsWithoutTheSign) {
 
 TEST(SqlTemplateTest, BindsNegativeLiteralWithoutDoubleNegation) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   auto original = ParseSql("SELECT -5;");
   ASSERT_TRUE(original);
   const SqlTemplate templated = ExtractSqlTemplate("SELECT -7;");
-  auto bound = BindStatementLiterals(*original, templated.parameters);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_EQ(select.SelectList().size(), 1);
   EXPECT_EQ(select.SelectList()[0].expression->ToString(), "(-7)");
@@ -213,8 +224,7 @@ TEST(SqlTemplateTest, BindStatementLiteralsParameterUnderflowThrows) {
           BinaryOperation::kAnd,
           BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kEquals,
                               ConstantValueExp(Value(2)))));
-  EXPECT_THROW(BindStatementLiterals(*statement, {Value(9)}),
-               std::runtime_error);
+  EXPECT_FALSE(BindStatementLiterals(*statement, {Value(9)}).HasValue());
 }
 
 TEST(SqlTemplateTest, BindStatementLiteralsPreservesAliases) {
@@ -225,7 +235,9 @@ TEST(SqlTemplateTest, BindStatementLiteralsPreservesAliases) {
       BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(1))));
   statement->AddAlias("alias_t", "t");
-  auto bound = BindStatementLiterals(*statement, {Value(7)});
+  auto bound_or = BindStatementLiterals(*statement, {Value(7)});
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   ASSERT_EQ(bound->Type(), StatementType::kSelect);
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   EXPECT_EQ(select.WhereClause()->ToString(), "(k = 7)");
@@ -237,21 +249,21 @@ TEST(SqlTemplateTest, BindStatementLiteralsPreservesAliases) {
 
 TEST(SqlTemplateTest, BindStatementLiteralsRejectsDdl) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   auto create = ParseSql("CREATE TABLE t (a INT64);");
   ASSERT_TRUE(create);
-  EXPECT_THROW(BindStatementLiterals(*create, {}), std::runtime_error);
+  EXPECT_FALSE(BindStatementLiterals(*create, {}).HasValue());
 }
 
 TEST(SqlTemplateTest, BindStatementLiteralsParameterCountMismatchThrows) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   auto statement = ParseSql("SELECT 1;");
   ASSERT_TRUE(statement);
-  EXPECT_THROW(BindStatementLiterals(*statement, {Value(5), Value(6)}),
-               std::runtime_error);
+  EXPECT_FALSE(
+      BindStatementLiterals(*statement, {Value(5), Value(6)}).HasValue());
 }
 
 // Cached tree shaped like the parsed miss statement
@@ -279,7 +291,9 @@ TEST(SqlTemplateTest, BindsWhereBeforeOrderByInTextOrder) {
   ASSERT_EQ(hit.parameters.size(), 2U);
   EXPECT_EQ(hit.parameters[0], Value(7));
   EXPECT_EQ(hit.parameters[1], Value(9));
-  auto bound = BindStatementLiterals(*WhereOrderByTree(), hit.parameters);
+  auto bound_or = BindStatementLiterals(*WhereOrderByTree(), hit.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   ASSERT_EQ(bound->Type(), StatementType::kSelect);
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_TRUE(select.WhereClause());
@@ -294,8 +308,12 @@ TEST(SqlTemplateTest, RepeatedBindsOfSameParametersStayStable) {
   // identical tree every time (no double swap).
   const SqlTemplate hit =
       ExtractSqlTemplate("SELECT a FROM t WHERE a = 7 ORDER BY b + 9;");
-  auto first = BindStatementLiterals(*WhereOrderByTree(), hit.parameters);
-  auto second = BindStatementLiterals(*WhereOrderByTree(), hit.parameters);
+  auto first_or = BindStatementLiterals(*WhereOrderByTree(), hit.parameters);
+  ASSERT_TRUE(first_or.HasValue());
+  auto first = first_or.MoveValue();
+  auto second_or = BindStatementLiterals(*WhereOrderByTree(), hit.parameters);
+  ASSERT_TRUE(second_or.HasValue());
+  auto second = second_or.MoveValue();
   const auto& one = dynamic_cast<const SelectStatement&>(*first);
   const auto& two = dynamic_cast<const SelectStatement&>(*second);
   ASSERT_TRUE(one.WhereClause());
@@ -331,7 +349,9 @@ TEST(SqlTemplateTest, BindsJoinConditionBeforeWhereClause) {
   ASSERT_EQ(hit.parameters.size(), 2U);
   EXPECT_EQ(hit.parameters[0], Value(11));
   EXPECT_EQ(hit.parameters[1], Value(22));
-  auto bound = BindStatementLiterals(*cached, hit.parameters);
+  auto bound_or = BindStatementLiterals(*cached, hit.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_EQ(select.Sources().size(), 2U);
   ASSERT_TRUE(select.Sources()[1].join_condition);
@@ -361,7 +381,9 @@ TEST(SqlTemplateTest, BindsGroupingClausesBeforeOrderBy) {
   ASSERT_EQ(hit.parameters.size(), 2U);
   EXPECT_EQ(hit.parameters[0], Value(30));
   EXPECT_EQ(hit.parameters[1], Value(40));
-  auto bound = BindStatementLiterals(*cached, hit.parameters);
+  auto bound_or = BindStatementLiterals(*cached, hit.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_EQ(select.GroupBy().size(), 1U);
   EXPECT_EQ(select.GroupBy()[0]->ToString(), "k");
@@ -373,13 +395,15 @@ TEST(SqlTemplateTest, BindsGroupingClausesBeforeOrderBy) {
 
 TEST(SqlTemplateTest, RebindsParsedTreeWithoutSwappingClauses) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   auto miss = ParseSql("SELECT a FROM t WHERE a = 1 ORDER BY b + 2;");
   ASSERT_TRUE(miss);
   const SqlTemplate hit =
       ExtractSqlTemplate("SELECT a FROM t WHERE a = 7 ORDER BY b + 9;");
-  auto bound = BindStatementLiterals(*miss, hit.parameters);
+  auto bound_or = BindStatementLiterals(*miss, hit.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_TRUE(select.WhereClause());
   EXPECT_EQ(select.WhereClause()->ToString(), "(a = 7)");
@@ -389,7 +413,7 @@ TEST(SqlTemplateTest, RebindsParsedTreeWithoutSwappingClauses) {
 
 TEST(SqlTemplateTest, BindsWithQueriesBeforeMainSelect) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   auto miss = ParseSql("WITH w AS (SELECT 1 AS x) SELECT x + 2 FROM w;");
   ASSERT_TRUE(miss);
@@ -398,7 +422,9 @@ TEST(SqlTemplateTest, BindsWithQueriesBeforeMainSelect) {
   ASSERT_EQ(hit.parameters.size(), 2U);
   EXPECT_EQ(hit.parameters[0], Value(9));
   EXPECT_EQ(hit.parameters[1], Value(8));
-  auto bound = BindStatementLiterals(*miss, hit.parameters);
+  auto bound_or = BindStatementLiterals(*miss, hit.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_EQ(select.WithQueries().count("w"), 1U);
   const auto& w = *select.WithQueries().at("w");
@@ -518,7 +544,9 @@ TEST(SqlTemplateTest, BindsInSubqueryTestBeforeSubqueryBody) {
   ASSERT_EQ(hit.parameters.size(), 2U);
   EXPECT_EQ(hit.parameters[0], Value(11));
   EXPECT_EQ(hit.parameters[1], Value(22));
-  auto bound = BindStatementLiterals(*cached, hit.parameters);
+  auto bound_or = BindStatementLiterals(*cached, hit.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   ASSERT_TRUE(select.WhereClause());
   ASSERT_EQ(select.WhereClause()->Type(), TypeTag::kQueryExp);
@@ -553,8 +581,8 @@ TEST(SqlTemplateTest, MultiWithWithLiteralsRefusesTemplateBinding) {
   cached->AddWithQuery("zeta", LiteralCteBody("x", 1));
   cached->AddWithQuery("alpha", LiteralCteBody("y", 2));
   // Exact parameter count so only the ordering guard can throw.
-  EXPECT_THROW(BindStatementLiterals(*cached, {Value(7), Value(8), Value(9)}),
-               std::runtime_error);
+  EXPECT_FALSE(BindStatementLiterals(*cached, {Value(7), Value(8), Value(9)})
+                   .HasValue());
 }
 
 TEST(SqlTemplateTest, BindsMultipleLiteralFreeWithQueries) {
@@ -573,11 +601,68 @@ TEST(SqlTemplateTest, BindsMultipleLiteralFreeWithQueries) {
                           ConstantValueExp(Value(1))));
   cached->AddWithQuery("zeta", plain_body("x"));
   cached->AddWithQuery("alpha", plain_body("y"));
-  auto bound = BindStatementLiterals(*cached, {Value(42)});
+  auto bound_or = BindStatementLiterals(*cached, {Value(42)});
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   EXPECT_EQ(select.WithQueries().size(), 2U);
   ASSERT_TRUE(select.WhereClause());
   EXPECT_EQ(select.WhereClause()->ToString(), "(k = 42)");
+}
+
+TEST(SqlTemplateTest, BindSelectPreservesRecursiveWithMetadata) {
+  // A template-cache replay of WITH RECURSIVE must keep the recursion
+  // markers and the depth spec: losing them turns the self-reference into a
+  // plain CTE, and the executor never builds the work table.
+  auto body = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression("n", ColumnValueExp("n"))},
+      std::vector<std::string>{"t"}, Expression{});
+  auto cached = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression("n", ColumnValueExp("n"))},
+      std::vector<std::string>{"t"},
+      BinaryExpressionExp(ColumnValueExp("n"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(3))));
+  cached->AddRecursiveWithQuery("t", body);
+  cached->SetRecursiveDepth(
+      "t", RecursiveDepthSpec{.column = "depth", .lower = 1, .upper = 10});
+  auto bound_or = BindStatementLiterals(*cached, {Value(3)});
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
+  ASSERT_EQ(bound->Type(), StatementType::kSelect);
+  const auto& rebound = dynamic_cast<const SelectStatement&>(*bound);
+  EXPECT_TRUE(rebound.IsRecursiveWith("t"));
+  const RecursiveDepthSpec* depth = rebound.RecursiveDepthOf("t");
+  ASSERT_NE(depth, nullptr);
+  EXPECT_EQ(depth->column, "depth");
+  EXPECT_EQ(depth->upper, 10);
+}
+
+TEST(SqlTemplateTest, BindPreservesUpdateAndDeleteAliases) {
+  // "UPDATE tbl AS alias" / "DELETE FROM tbl AS alias" make bare alias
+  // references denote the whole row; a rebind must not drop the alias.
+  auto update = ParseSql("UPDATE t1 AS v SET c1 = 5 WHERE v.c2 = 3;");
+  ASSERT_NE(update, nullptr);
+  const SqlTemplate update_template =
+      ExtractSqlTemplate("UPDATE t1 AS v SET c1 = 5 WHERE v.c2 = 3;");
+  ASSERT_TRUE(update_template.templatable);
+  auto bound_update_or =
+      BindStatementLiterals(*update, update_template.parameters);
+  ASSERT_TRUE(bound_update_or.HasValue());
+  auto bound_update = bound_update_or.MoveValue();
+  ASSERT_EQ(bound_update->Type(), StatementType::kUpdate);
+  EXPECT_EQ(dynamic_cast<const UpdateStatement&>(*bound_update).Alias(), "v");
+
+  auto remove = ParseSql("DELETE FROM t1 AS v WHERE v.c2 = 3;");
+  ASSERT_NE(remove, nullptr);
+  const SqlTemplate delete_template =
+      ExtractSqlTemplate("DELETE FROM t1 AS v WHERE v.c2 = 3;");
+  ASSERT_TRUE(delete_template.templatable);
+  auto bound_delete_or =
+      BindStatementLiterals(*remove, delete_template.parameters);
+  ASSERT_TRUE(bound_delete_or.HasValue());
+  auto bound_delete = bound_delete_or.MoveValue();
+  ASSERT_EQ(bound_delete->Type(), StatementType::kDelete);
+  EXPECT_EQ(dynamic_cast<const DeleteStatement&>(*bound_delete).Alias(), "v");
 }
 
 }  // namespace

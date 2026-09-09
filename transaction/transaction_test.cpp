@@ -54,8 +54,8 @@ class TransactionTest : public ::testing::Test {
     pm_.reset();
     l_.reset();
     // Unique log file per run: parallel test suites must not share a WAL.
-    l_ =
-        std::make_unique<Logger>("transaction_test-" + RandomString() + ".log");
+    l_ = Logger::Create("transaction_test-" + RandomString() + ".log")
+             .MoveValue();
     lm_ = std::make_unique<LockManager>();
     // Fixture premise: pm_/recovery_ stay null on purpose.  The tests below
     // only exercise lock/version bookkeeping; any page-accessing method would
@@ -420,7 +420,7 @@ TEST_F(TransactionTest, PreCommitLoggerFailureLeavesAbortedNotHalfCommitted) {
   ASSERT_EQ(::dup2(full_fd, l_->Fd()), l_->Fd());
   ASSERT_EQ(::close(full_fd), 0);
 
-  EXPECT_THROW(txn.PreCommit(), std::runtime_error);
+  EXPECT_NE(txn.PreCommit(), Status::kSuccess);
 
   // No half-finished state: the transaction reports finished and its MVCC
   // write intent is released even though WAL durability failed.
@@ -437,8 +437,12 @@ TEST(TransactionManagerTest, AbortedWriteIsNotVisibleToLaterReaders) {
   const std::string db_name = "abort_txn-test-" + RandomString() + ".db";
   const std::string log_name = "abort_txn-test-" + RandomString() + ".log";
   {
-    PageManager pm(db_name, 10);
-    Logger logger(log_name);
+    auto pm_holder = PageManager::Create(db_name, 10).MoveValue();
+    CHECK(pm_holder != nullptr);
+    PageManager& pm = *pm_holder;
+    auto logger_holder = Logger::Create(log_name).MoveValue();
+    CHECK(logger_holder != nullptr);
+    Logger& logger = *logger_holder;
     LockManager lm;
     RecoveryManager rm(log_name, pm.GetPool());
     TransactionManager tm(&pm, &logger, &rm);
@@ -467,8 +471,12 @@ TEST(TransactionManagerTest, ReaderSeesRowWhileWriterHoldsUnstagedIntent) {
   const std::string db_name = "intent_window-test-" + RandomString() + ".db";
   const std::string log_name = "intent_window-test-" + RandomString() + ".log";
   {
-    PageManager pm(db_name, 10);
-    Logger logger(log_name);
+    auto pm_holder = PageManager::Create(db_name, 10).MoveValue();
+    CHECK(pm_holder != nullptr);
+    PageManager& pm = *pm_holder;
+    auto logger_holder = Logger::Create(log_name).MoveValue();
+    CHECK(logger_holder != nullptr);
+    Logger& logger = *logger_holder;
     LockManager lm;
     RecoveryManager rm(log_name, pm.GetPool());
     TransactionManager tm(&pm, &logger, &rm);
@@ -503,8 +511,12 @@ TEST(TransactionManagerTest, AbortAfterPreCommitIsNoOp) {
   const std::string log_name =
       "abort_after_commit-test-" + RandomString() + ".log";
   {
-    PageManager pm(db_name, 10);
-    Logger logger(log_name);
+    auto pm_holder = PageManager::Create(db_name, 10).MoveValue();
+    CHECK(pm_holder != nullptr);
+    PageManager& pm = *pm_holder;
+    auto logger_holder = Logger::Create(log_name).MoveValue();
+    CHECK(logger_holder != nullptr);
+    Logger& logger = *logger_holder;
     LockManager lm;
     RecoveryManager rm(log_name, pm.GetPool());
     TransactionManager tm(&pm, &logger, &rm);

@@ -80,12 +80,12 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                           const Schema& result_schema, const Scope* outer,
                           const CteMap& ctes, Relation* result);
 
-Relation LoadSource(TransactionContext& context, const SelectSource& source,
-                    const Scope* outer, const CteMap& ctes,
-                    const std::vector<slot_t>* projection = nullptr,
-                    const std::vector<Expression>* scan_predicates = nullptr,
-                    const std::unordered_set<int64_t>* int_key_filter = nullptr,
-                    std::optional<slot_t> int_key_column = std::nullopt);
+StatusOr<Relation> LoadSource(
+    TransactionContext& context, const SelectSource& source, const Scope* outer,
+    const CteMap& ctes, const std::vector<slot_t>* projection = nullptr,
+    const std::vector<Expression>* scan_predicates = nullptr,
+    const std::unordered_set<int64_t>* int_key_filter = nullptr,
+    std::optional<slot_t> int_key_column = std::nullopt);
 
 // Materializes one UNNEST'd array value into a single-column relation named
 // after the source alias (struct elements expand into per-field columns,

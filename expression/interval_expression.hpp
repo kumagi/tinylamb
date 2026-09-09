@@ -32,9 +32,14 @@ class IntervalExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kIntervalExp; }
   [[nodiscard]] Value Evaluate(const Row& /*row*/,
                                const Schema& /*schema*/) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& /*row*/, const Schema& /*schema*/) const override;
   [[nodiscard]] Value Evaluate(const Row* /*unused*/, const Schema& /*unused*/,
                                const Row* /*unused*/,
                                const Schema& /*unused*/) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row* /*unused*/, const Schema& /*unused*/, const Row* /*unused*/,
+      const Schema& /*unused*/) const override;
   [[nodiscard]] tinylamb::Type ResultType(
       const Schema& /*unused*/) const override;
   [[nodiscard]] tinylamb::Type ResultType(

@@ -41,7 +41,7 @@ namespace tinylamb {
 
 class LogRecordTest : public ::testing::Test {
  protected:
-  static void SerializeDeserializeCheck(const LogRecord& log) {
+  void SerializeDeserializeCheck(const LogRecord& log) {
     std::string serialized_log = log.Serialize();
     std::istringstream ss(serialized_log, std::istringstream::binary);
     LogRecord parsed_log;
@@ -497,35 +497,24 @@ TEST_F(LogRecordTest, DumpUnknownRecordType) {
 }
 
 TEST_F(LogRecordTest, SizeOfUnknownLogAborts) {
-  // LogRecord::Size() rejects LogType::kUnknown loudly: abort via assert() in
-  // debug builds, throw std::runtime_error under NDEBUG.  Either way the
-  // caller must never observe a size for an undefined record layout.
-#ifdef NDEBUG
-  LogRecord unknown;
-  EXPECT_THROW((void)unknown.Size(), std::runtime_error);
-#else
+  // LogRecord::Size() rejects LogType::kUnknown loudly (CHECK): the caller
+  // must never observe a size for an undefined record layout.
   LogRecord unknown;
   EXPECT_DEATH((void)unknown.Size(), "unknown");
-#endif
 }
 
 TEST_F(LogRecordTest, SerializeUnknownLogAborts) {
-  // Serializing a kUnknown record trips an assert in debug builds and throws
-  // std::runtime_error under NDEBUG; a garbage record must never be written.
-#ifdef NDEBUG
-  LogRecord unknown;
-  EXPECT_THROW((void)unknown.Serialize(), std::runtime_error);
-#else
+  // Serializing a kUnknown record trips CHECK in every build; a garbage
+  // record must never be written.
   LogRecord unknown;
   EXPECT_DEATH((void)unknown.Serialize(), "unknown");
-#endif
 }
 
-TEST_F(LogRecordTest, DecodeUnknownLogTypeThrowsCleanly) {
+TEST_F(LogRecordTest, DecodeUnknownLogTypeFailsCleanly) {
   // Arrange -- a byte stream whose type field is not a defined LogType.
-  // The decoder rejects it with a catchable exception (never a half-record,
-  // never an assert): RecoveryManager skips such torn tails and the fuzzers
-  // treat this as ordinary rejection.
+  // The decoder rejects it through the sticky fail state (never a
+  // half-record, never an assert): RecoveryManager skips such torn tails and
+  // the fuzzers treat this as ordinary rejection.
   std::string bytes;
   bytes.append(1, static_cast<char>(0xff))
       .append(1, static_cast<char>(0xff));  // uint16 LogType: 0xffff
@@ -534,10 +523,11 @@ TEST_F(LogRecordTest, DecodeUnknownLogTypeThrowsCleanly) {
   bytes.append(1, '\x00');                  // types: no pid / slot / key
   std::istringstream ss(bytes, std::istringstream::binary);
 
-  // Act + Assert -- the decoder reaches its default arm and throws.
+  // Act + Assert -- the decoder reaches its default arm and fails the stream.
   LogRecord record;
   Decoder dec(ss);
-  EXPECT_THROW(dec >> record, std::runtime_error);
+  dec >> record;
+  EXPECT_TRUE(dec.Failed());
 }
 
 TEST_F(LogRecordTest, ThreeArgConstructorSetsFields) {
@@ -789,9 +779,9 @@ TEST_F(LogRecordTest, TruncatedRecordsDecodeAndRoundTripStably) {
   }
 }
 
-TEST_F(LogRecordTest, UndefinedLogTypeInTruncatedTailThrowsCleanly) {
+TEST_F(LogRecordTest, UndefinedLogTypeInTruncatedTailFailsCleanly) {
   // An out-of-range type value must never return a half-record: the decoder
-  // rejects the torn tail with a catchable exception in every build type.
+  // rejects the torn tail through the sticky fail state in every build.
   std::string bytes;
   const uint16_t raw = 0xffff;  // not a defined LogType
   bytes.append(reinterpret_cast<const char*>(&raw), sizeof(raw));
@@ -799,7 +789,8 @@ TEST_F(LogRecordTest, UndefinedLogTypeInTruncatedTailThrowsCleanly) {
   std::istringstream ss(bytes, std::istringstream::binary);
   LogRecord record;
   Decoder dec(ss);
-  EXPECT_THROW(dec >> record, std::runtime_error);
+  dec >> record;
+  EXPECT_TRUE(dec.Failed());
 }
 
 }  // namespace tinylamb

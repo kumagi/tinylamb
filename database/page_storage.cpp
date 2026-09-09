@@ -68,55 +68,82 @@ lsn_t ReadMasterRecordLsn(const std::filesystem::path& path) {
 }
 }  // namespace
 
-PageStorage::PageStorage(std::string_view dbname, size_t wal_sync_ms)
-    : dbname_(dbname),
-      logger_(LogName(), static_cast<size_t>(8 * 1024 * 1024), wal_sync_ms),
-      pm_(DBName(), PagePoolCapacityFromEnv()),
-      rm_(LogName(), pm_.GetPool()),
-      tm_(&pm_, &logger_, &rm_),
-      cm_(MasterRecordName(), &tm_, pm_.GetPool()) {
+StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
+    std::string_view dbname, size_t wal_sync_ms) {
+  const std::string dbname_str(dbname);
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<Logger>, logger,
+      Logger::Create(dbname_str + ".log", static_cast<size_t>(8 * 1024 * 1024),
+                     wal_sync_ms));
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<PageManager>, pm,
+      PageManager::Create(dbname_str + ".db", PagePoolCapacityFromEnv()));
+  auto rm =
+      std::make_unique<RecoveryManager>(dbname_str + ".log", pm->GetPool());
+  auto tm =
+      std::make_unique<TransactionManager>(pm.get(), logger.get(), rm.get());
+  auto cm = std::make_unique<CheckpointManager>(dbname_str + ".last_checkpoint",
+                                                tm.get(), pm->GetPool());
+  auto storage = std::unique_ptr<PageStorage>(
+      new PageStorage(dbname, std::move(logger), std::move(pm), std::move(rm),
+                      std::move(tm), std::move(cm)));
   // WAL rule for evictions: a dirty page must never reach disk ahead of the
   // log records its page_lsn covers. The gate fires outside the pool latch,
   // so blocking on the group-commit flush here is deadlock-free. Declared
   // member order guarantees the pool drains before the logger shuts down.
-  pm_.GetPool()->SetDurabilityGate(
-      [this](lsn_t lsn) { logger_.WaitForDurable(lsn); });
+  storage->pm_->GetPool()->SetDurabilityGate([s = storage.get()](lsn_t lsn) {
+    return s->logger_->WaitForDurable(lsn);
+  });
   // Resume from the last durable checkpoint when the master record points at
   // a real one; otherwise fall back to replaying the whole log. The hint is
   // only trusted when it lands on a decodable kBeginCheckpoint record -- a
   // garbage or torn hint must widen the recovery window, never skip it.
-  lsn_t checkpoint = ReadMasterRecordLsn(MasterRecordName());
+  lsn_t checkpoint = ReadMasterRecordLsn(storage->MasterRecordName());
   if (checkpoint != 0) {
     LogRecord probe;
-    if (!rm_.ReadLog(checkpoint, &probe) ||
+    if (!storage->rm_->ReadLog(checkpoint, &probe) ||
         probe.type != LogType::kBeginCheckpoint) {
       LOG(WARN) << "Ignoring invalid master record at " << checkpoint << " for "
-                << dbname_;
+                << dbname;
       checkpoint = 0;
     }
   }
-  rm_.RecoverFrom(checkpoint, &tm_);
+  RETURN_IF_FAIL(storage->rm_->RecoverFrom(checkpoint, storage->tm_.get()));
   // Periodic checkpointing keeps the WAL bounded: without it fdatasync cost
   // scales with the file's dirty page cache footprint, which on a long TPC-C
   // run makes every commit barrier approach 1 ms regardless of group size.
   // Honor TINYLAMB_CHECKPOINT_SECONDS for tests (0 disables); the default 10 s
-  // balances checkpoint overhead with WAL growth on OLTP workloads.
+  // balances checkpoint overhead with WAL growth.
   const char* ckpt_env = std::getenv("TINYLAMB_CHECKPOINT_SECONDS");
   if (ckpt_env == nullptr || ckpt_env[0] == '\0') {
-    cm_.Start();
+    storage->cm_->Start();
   } else {
     const unsigned long long seconds = std::strtoull(ckpt_env, nullptr, 10);
     if (seconds > 0) {
-      cm_.Start();
+      storage->cm_->Start();
     }
   }
+  return storage;
 }
 
-void PageStorage::DiscardAllUpdates() { pm_.GetPool()->DropAllPages(); }
+PageStorage::PageStorage(std::string_view dbname,
+                         std::unique_ptr<Logger> logger,
+                         std::unique_ptr<PageManager> pm,
+                         std::unique_ptr<RecoveryManager> rm,
+                         std::unique_ptr<TransactionManager> tm,
+                         std::unique_ptr<CheckpointManager> cm)
+    : dbname_(dbname),
+      logger_(std::move(logger)),
+      pm_(std::move(pm)),
+      rm_(std::move(rm)),
+      tm_(std::move(tm)),
+      cm_(std::move(cm)) {}
 
-Transaction PageStorage::Begin() { return tm_.Begin(); }
+void PageStorage::DiscardAllUpdates() { pm_->GetPool()->DropAllPages(); }
 
-Transaction PageStorage::BeginReadOnly() { return tm_.Begin(true); }
+Transaction PageStorage::Begin() { return tm_->Begin(); }
+
+Transaction PageStorage::BeginReadOnly() { return tm_->Begin(true); }
 
 std::string PageStorage::DBName() const { return dbname_ + ".db"; }
 std::string PageStorage::LogName() const { return dbname_ + ".log"; }
@@ -125,9 +152,9 @@ std::string PageStorage::MasterRecordName() const {
 }
 
 std::ostream& operator<<(std::ostream& o, const PageStorage& ps) {
-  o << "PageStorage(dbname=" << ps.dbname_ << ", logger=" << ps.logger_
-    << ", page_manager=" << ps.pm_ << ", recovery_manager=" << ps.rm_
-    << ", transaction_manager=" << ps.tm_ << ", checkpoint_manager=" << ps.cm_
+  o << "PageStorage(dbname=" << ps.dbname_ << ", logger=" << *ps.logger_
+    << ", page_manager=" << *ps.pm_ << ", recovery_manager=" << *ps.rm_
+    << ", transaction_manager=" << *ps.tm_ << ", checkpoint_manager=" << *ps.cm_
     << ")";
   return o;
 }

@@ -19,7 +19,6 @@
 #include <array>
 #include <cstdint>
 #include <ios>
-#include <stdexcept>
 #include <string>
 
 #include "common/constants.hpp"
@@ -95,7 +94,8 @@ Decoder& Decoder::operator>>(ValueType& v) {
   uint8_t raw = 0;
   is_->read(reinterpret_cast<char*>(&raw), sizeof(raw));
   if (raw > static_cast<uint8_t>(ValueType::kArray)) {
-    throw std::runtime_error("undefined value type in decoder");
+    is_->setstate(std::ios::failbit);
+    return *this;
   }
   v = static_cast<ValueType>(raw);
   return *this;

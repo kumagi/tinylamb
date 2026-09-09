@@ -419,9 +419,9 @@ TEST(ExpressionTest, UnaryExpression_Evaluate_ComputesExpectedResults) {
   ASSERT_EQ(is_not_null_false->Evaluate(dummy, dummy_schema), Value(false));
 
   Expression not_true =
-      UnaryExpressionExp(ConstantValueExp(Value(true)), UnaryOperation::kNot);
+      UnaryExpressionExp(ConstantValueExp(Value(1)), UnaryOperation::kNot);
   Expression not_false =
-      UnaryExpressionExp(ConstantValueExp(Value(false)), UnaryOperation::kNot);
+      UnaryExpressionExp(ConstantValueExp(Value(0)), UnaryOperation::kNot);
   Expression not_null =
       UnaryExpressionExp(ConstantValueExp(Value()), UnaryOperation::kNot);
   ASSERT_EQ(not_true->Evaluate(dummy, dummy_schema), Value(false));
@@ -525,15 +525,15 @@ TEST(ExpressionTest, BinaryExpression_WithNestedExpressions_ComputesCorrectly) {
   ASSERT_EQ(exp2->Evaluate(dummy, dummy_schema), Value(7));
 
   Expression exp3 = BinaryExpressionExp(
-      BinaryExpressionExp(ConstantValueExp(Value(true)), BinaryOperation::kAnd,
-                          ConstantValueExp(Value(false))),
-      BinaryOperation::kOr, ConstantValueExp(Value(true)));
+      BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAnd,
+                          ConstantValueExp(Value(0))),
+      BinaryOperation::kOr, ConstantValueExp(Value(1)));
   ASSERT_EQ(exp3->Evaluate(dummy, dummy_schema), Value(true));
 
   Expression exp4 = BinaryExpressionExp(
-      ConstantValueExp(Value(true)), BinaryOperation::kAnd,
-      BinaryExpressionExp(ConstantValueExp(Value(false)), BinaryOperation::kOr,
-                          ConstantValueExp(Value(true))));
+      ConstantValueExp(Value(1)), BinaryOperation::kAnd,
+      BinaryExpressionExp(ConstantValueExp(Value(0)), BinaryOperation::kOr,
+                          ConstantValueExp(Value(1))));
   ASSERT_EQ(exp4->Evaluate(dummy, dummy_schema), Value(true));
 
   Expression exp5 = BinaryExpressionExp(
@@ -556,8 +556,8 @@ TEST(ExpressionTest,
   const Row row;
   const Schema schema;
   const Expression null_value = ConstantValueExp(Value());
-  const Expression true_value = ConstantValueExp(Value(true));
-  const Expression false_value = ConstantValueExp(Value(false));
+  const Expression true_value = ConstantValueExp(Value(1));
+  const Expression false_value = ConstantValueExp(Value(0));
 
   EXPECT_EQ(BinaryExpressionExp(null_value, BinaryOperation::kAnd, false_value)
                 ->Evaluate(row, schema),
@@ -702,7 +702,7 @@ TEST(ExpressionTest,
   EXPECT_EQ(oss.str(), "x IN(...)");
 }
 
-TEST(ExpressionTest, AggregateExpression_EvaluateDirectly_ThrowsLogicError) {
+TEST(ExpressionTest, AggregateExpression_EvaluateDirectly_ThrowsRuntimeError) {
   Schema schema("s", {Column("amount", ValueType::kInt64),
                       Column("rate", ValueType::kDouble)});
   Row row({Value(10), Value(0.5)});
@@ -725,7 +725,9 @@ TEST(ExpressionTest, AggregateExpression_EvaluateDirectly_ThrowsLogicError) {
   EXPECT_EQ(count->ResultType(schema, schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(avg->ResultType(schema, schema).GetType(), TypeTag::kDouble);
 
-  EXPECT_THROW(count->Evaluate(row, schema), std::logic_error);
+  // The no-exception migration keeps the direct-evaluation misuse observable
+  // as a runtime_error through the deprecated Evaluate shim.
+  EXPECT_THROW(count->Evaluate(row, schema), std::runtime_error);
   EXPECT_EQ(count->ToString(), "COUNT(amount)");
   EXPECT_EQ(AggregateExpressionExp(AggregationType::kCount,
                                    ColumnValueExp("amount"), true)
@@ -765,7 +767,7 @@ TEST(ExpressionTest,
 TEST(ExpressionTest, CaseExpression_ResultType_InfersCorrectType) {
   Schema schema;
   Expression with_when = CaseExpressionExp(
-      {{ConstantValueExp(Value(true)), ConstantValueExp(Value(1))}},
+      {{ConstantValueExp(Value(1)), ConstantValueExp(Value(1))}},
       ConstantValueExp(Value(2)));
   Expression no_when_no_else = CaseExpressionExp({}, nullptr);
 
@@ -886,8 +888,8 @@ TEST(ExpressionTest, TimestampStringComparisonAppliesZoneOffsets) {
 }
 
 TEST(ExpressionTest, EvaluateBinary_WithBooleanLogic_FollowsThreeValuedLogic) {
-  const Value vtrue(true);
-  const Value vfalse(false);
+  const Value vtrue(1);
+  const Value vfalse(0);
   const Value vnull;
 
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kAnd, vtrue, vtrue), Value(true));
@@ -1381,7 +1383,7 @@ TEST(ExpressionTest, ExpressionBase_DynamicCasts_CastSuccessfully) {
   EXPECT_NO_THROW((void)aggregate->AsAggregateExpression());
 
   Expression case_exp =
-      CaseExpressionExp({{ConstantValueExp(Value(true)), constant}}, constant);
+      CaseExpressionExp({{ConstantValueExp(Value(1)), constant}}, constant);
   EXPECT_NO_THROW((void)case_exp->AsCaseExpression());
 
   Expression in = InExpressionExp(constant, {constant});
@@ -1565,12 +1567,12 @@ class FakeEvaluationContext : public EvaluationContext {
     return registration_status;
   }
 
-  std::vector<std::pair<std::string, int>> registered;
+  std::vector<std::pair<std::string, int>> registered{};
   int subquery_calls_{0};
   Status registration_status = Status::kSuccess;
 
  private:
-  std::vector<std::vector<Value>> results_;
+  std::vector<std::vector<Value>> results_{};
   size_t next_result_{0};
 };
 
@@ -1768,13 +1770,13 @@ TEST(ExpressionTest, BinaryExpression_SpecialOperations_EvaluatesCorrectly) {
                std::runtime_error);
 
   Expression and_short =
-      BinaryExpressionExp(ConstantValueExp(Value(false)), BinaryOperation::kAnd,
+      BinaryExpressionExp(ConstantValueExp(Value(0)), BinaryOperation::kAnd,
                           ColumnValueExp("unresolved"));
   EXPECT_EQ(and_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema),
             Value(false));
 
   Expression or_short =
-      BinaryExpressionExp(ConstantValueExp(Value(true)), BinaryOperation::kOr,
+      BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kOr,
                           ColumnValueExp("unresolved"));
   EXPECT_EQ(or_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema),
             Value(true));
@@ -1933,7 +1935,7 @@ TEST(ExpressionTest,
             Value(int64_t{20}));
 
   CaseExpression case_mismatch(
-      {std::make_pair(ConstantValueExp(Value(true)),
+      {std::make_pair(ConstantValueExp(Value(1)),
                       ConstantValueExp(Value(int64_t{1})))},
       ConstantValueExp(Value(std::string("str"))));
   EXPECT_EQ(case_mismatch.ResultType(left_schema).GetType(), TypeTag::kInvalid);
@@ -2019,21 +2021,21 @@ TEST(ExpressionTest, Expression_PathologicalPatterns_EvaluatesCorrectly) {
             Value(int_max));
 
   Expression case_safe = CaseExpressionExp(
-      {{ConstantValueExp(Value(true)), ConstantValueExp(Value(int64_t{42}))}},
+      {{ConstantValueExp(Value(1)), ConstantValueExp(Value(int64_t{42}))}},
       BinaryExpressionExp(ConstantValueExp(Value(int64_t{1})),
                           BinaryOperation::kDivide,
                           ConstantValueExp(Value(int64_t{0}))));
   EXPECT_EQ(case_safe->Evaluate(dummy, dummy_schema), Value(int64_t{42}));
 
   Expression and_safe = BinaryExpressionExp(
-      ConstantValueExp(Value(false)), BinaryOperation::kAnd,
+      ConstantValueExp(Value(0)), BinaryOperation::kAnd,
       BinaryExpressionExp(ConstantValueExp(Value(int64_t{10})),
                           BinaryOperation::kDivide,
                           ConstantValueExp(Value(int64_t{0}))));
   EXPECT_EQ(and_safe->Evaluate(dummy, dummy_schema), Value(false));
 
   Expression or_safe = BinaryExpressionExp(
-      ConstantValueExp(Value(true)), BinaryOperation::kOr,
+      ConstantValueExp(Value(1)), BinaryOperation::kOr,
       BinaryExpressionExp(ConstantValueExp(Value(int64_t{10})),
                           BinaryOperation::kDivide,
                           ConstantValueExp(Value(int64_t{0}))));

@@ -23,9 +23,9 @@ TEST(GriffinFuzzer, SeededIterationsHoldOracles) {
     GriffinTrace trace;
     trace.seed = packed;
     std::string report = RunGriffinIteration(rng, false, &trace);
-    ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
+    ASSERT_EQ(report, "") << true << (seed != 0u) << true << report;
     EXPECT_EQ(trace.seed, packed);
-    EXPECT_FALSE(trace.statements.empty()) << "seed=" << seed;
+    EXPECT_FALSE(trace.statements.empty()) << true << (seed != 0u);
     if (trace.ran_select) {
       ++ran_select;
     }
@@ -33,7 +33,7 @@ TEST(GriffinFuzzer, SeededIterationsHoldOracles) {
   // The differential oracle must actually execute SELECTs (not skip every
   // iteration), or the sweep is vacuous.
   EXPECT_GT(ran_select, kIterations / 2)
-      << "differential oracle almost never ran; harness is broken";
+      << true;
 }
 
 // Failure->file->replay pipeline: serialize/parse round-trips, replay of a
@@ -51,13 +51,13 @@ TEST(GriffinFuzzer, TestFileRoundTripAndReplay) {
   ASSERT_TRUE(ParseGriffinTest(text, &parsed));
   EXPECT_EQ(parsed, trace);
   EXPECT_EQ(ReplayGriffinTrace(parsed, false), "")
-      << "healthy trace replayed as a mismatch";
+      << true;
 
   // Tampered statements must not replay clean.
   GriffinTrace tampered = parsed;
   tampered.statements[0] = "CREATE TABLE tampered (x INT64);";
   EXPECT_NE(ReplayGriffinTrace(tampered, false), "")
-      << "tampered trace replayed clean; pipeline is broken";
+      << true;
 
   // Malformed input is refused, never half-replayed.
   GriffinTrace junk;

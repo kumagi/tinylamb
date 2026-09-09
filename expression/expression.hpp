@@ -99,6 +99,26 @@ class ExpressionBase {
                                        EvaluationContext& /*unused*/) const {
     return Evaluate(row, schema);
   }
+
+  // No-exception evaluation contract (no-exception-rule-migration.md
+  // Phase 5).  Converted nodes override TryEvaluate and route their
+  // Evaluate through the EXC-SHIM wrapper; unconverted nodes keep the
+  // default here, which forwards to the still-throwing Evaluate.  When the
+  // last node is converted (Phase 7) the Evaluate overloads disappear and
+  // TryEvaluate becomes the pure virtual interface.
+  [[nodiscard]] virtual StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema) const {
+    return Evaluate(row, schema);
+  }
+  [[nodiscard]] virtual StatusOr<Value> TryEvaluate(
+      const Row* left, const Schema& left_schema, const Row* right,
+      const Schema& right_schema) const {
+    return Evaluate(left, left_schema, right, right_schema);
+  }
+  [[nodiscard]] virtual StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema, EvaluationContext& context) const {
+    return Evaluate(row, schema, context);
+  }
   [[nodiscard]] virtual tinylamb::Type ResultType(
       const Schema& /*unused*/) const {
     throw std::runtime_error("not implemented");

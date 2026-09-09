@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exc_shim.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
@@ -210,9 +211,10 @@ Expression InlineHavingAliases(const SelectStatement& statement,
   return walk(having);
 }
 
-Relation Project(TransactionContext& context, const SelectStatement& statement,
-                 Relation input, const Scope* outer, const CteMap& ctes,
-                 size_t hidden_columns) {
+StatusOr<Relation> Project(TransactionContext& context,
+                           const SelectStatement& statement, Relation input,
+                           const Scope* outer, const CteMap& ctes,
+                           size_t hidden_columns) {
   const auto project_begin = std::chrono::steady_clock::now();
   if (hidden_columns > 0 &&
       (!statement.GroupBy().empty() ||
@@ -222,7 +224,8 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
                    }))) {
     // Window functions over aggregated groups (multi-level aggregation) need
     // a second pass above the grouping result; not wired up yet.
-    throw std::runtime_error(
+    return StatusError(
+        StatusCode::kInvalidArgument,
         "window functions combined with GROUP BY are not supported here");
   }
   const bool grouped =
@@ -248,15 +251,17 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     size_t accumulator_offset{0};
   };
   std::deque<AggregateAccumulator> aggregate_states;
-  auto accumulate_row = [&](const Row& row, GroupKeyMap* offsets,
-                            std::vector<GroupState>* local_groups,
-                            std::deque<AggregateAccumulator>* local_states) {
+  auto accumulate_row =
+      [&](const Row& row, GroupKeyMap* offsets,
+          std::vector<GroupState>* local_groups,
+          std::deque<AggregateAccumulator>* local_states) -> Status {
     Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
     std::vector<Value> key_values;
     for (const Expression& key : statement.GroupBy()) {
+      ASSIGN_OR_RETURN(Value, hv9735_0,
+                       (TryEvaluate(key, scope, nullptr, context, ctes)));
       // Canonicalize so NaN/-0 keys fold like SQL equality demands.
-      key_values.push_back(
-          CanonicalDistinctValue(Evaluate(key, scope, nullptr, context, ctes)));
+      key_values.push_back(CanonicalDistinctValue(hv9735_0));
     }
     Row key(std::move(key_values));
     auto [iter, inserted] = offsets->emplace(key, local_groups->size());
@@ -277,35 +282,48 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         accumulator.Add(Value(1));
         continue;
       }
-      if (aggregate.WhereFilter() &&
-          !Truthy(Evaluate(aggregate.WhereFilter(), scope, nullptr, context,
-                           ctes))) {
-        continue;
+      if (aggregate.WhereFilter()) {
+        ASSIGN_OR_RETURN(Value, where_value,
+                         (TryEvaluate(aggregate.WhereFilter(), scope, nullptr,
+                                      context, ctes)));
+        if (!Truthy(where_value)) {
+          continue;
+        }
       }
       AggregateInput aggregate_input;
-      aggregate_input.value =
-          Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
+      ASSIGN_OR_RETURN(
+          Value, hv10912_0,
+          (TryEvaluate(aggregate.Child(), scope, nullptr, context, ctes)));
+      aggregate_input.value = std::move(hv10912_0);
       if (aggregate.Having() != AggregateHavingModifier::kNone &&
           aggregate.HavingCondition()) {
-        aggregate_input.condition = Evaluate(aggregate.HavingCondition(), scope,
-                                             nullptr, context, ctes);
+        ASSIGN_OR_RETURN(Value, hv11119_0,
+                         (TryEvaluate(aggregate.HavingCondition(), scope,
+                                      nullptr, context, ctes)));
+        aggregate_input.condition = std::move(hv11119_0);
       }
       for (const auto& term : aggregate.InnerOrderBy()) {
-        aggregate_input.order_keys.push_back(
-            Evaluate(term.expression, scope, nullptr, context, ctes));
+        ASSIGN_OR_RETURN(
+            Value, hv11336_0,
+            (TryEvaluate(term.expression, scope, nullptr, context, ctes)));
+        aggregate_input.order_keys.push_back(std::move(hv11336_0));
       }
       for (const Expression& extra : aggregate.ExtraArgs()) {
-        aggregate_input.order_keys.push_back(
-            Evaluate(extra, scope, nullptr, context, ctes));
+        ASSIGN_OR_RETURN(Value, hv11523_0,
+                         (TryEvaluate(extra, scope, nullptr, context, ctes)));
+        aggregate_input.order_keys.push_back(std::move(hv11523_0));
       }
       if (aggregate.SecondaryArg()) {
-        aggregate_input.auxiliary =
-            Evaluate(aggregate.SecondaryArg(), scope, nullptr, context, ctes);
+        ASSIGN_OR_RETURN(Value, hv11676_0,
+                         (TryEvaluate(aggregate.SecondaryArg(), scope, nullptr,
+                                      context, ctes)));
+        aggregate_input.auxiliary = std::move(hv11676_0);
       }
       for (const Expression& extra : aggregate.TrailingArgs()) {
         if (extra) {
-          aggregate_input.trailing_values.push_back(
-              Evaluate(extra, scope, nullptr, context, ctes));
+          ASSIGN_OR_RETURN(Value, hv11885_0,
+                           (TryEvaluate(extra, scope, nullptr, context, ctes)));
+          aggregate_input.trailing_values.push_back(std::move(hv11885_0));
         }
       }
       accumulator.Add(std::move(aggregate_input));
@@ -320,6 +338,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     if (context.execution_runtime() != nullptr) {
       ++context.execution_runtime()->aggregate_input_rows;
     }
+    return Status::kSuccess;
   };
   auto make_group = [&]() {
     GroupState group;
@@ -332,6 +351,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     return group;
   };
 
+  Status agg_error{Status::kSuccess};
   std::vector<GroupState> groups;
   if (grouped) {
     input.FinishSpill();
@@ -342,12 +362,19 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
                                  std::max<size_t>(1, input.TotalRows()) * 128));
     if (partition_agg) {
       std::vector<SpillFile> parts(kSpillPartitions);
-      input.ForEachRow([&](const Row& row) {
+      Status iterated = input.ForEachRow([&](const Row& row) {
         Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
         std::vector<Value> key_values;
         for (const Expression& key : statement.GroupBy()) {
-          key_values.push_back(CanonicalDistinctValue(
-              Evaluate(key, scope, nullptr, context, ctes)));
+          StatusOr<Value> hv13156_0 =
+              TryEvaluate(key, scope, nullptr, context, ctes);
+          if (!hv13156_0.HasValue()) {
+            if (agg_error == Status::kSuccess) {
+              agg_error = hv13156_0.GetStatus();
+            }
+            return;
+          }
+          key_values.push_back(CanonicalDistinctValue(hv13156_0.MoveValue()));
         }
         // EncodeMemcomparableFormat throws on NULL, but NULL group keys are
         // legal (the in-memory path below groups them normally).  Partition
@@ -362,20 +389,33 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
             encoded_key += key_value.EncodeMemcomparableFormat();
           }
         }
-        parts[SpillPartitionOf(encoded_key, kSpillPartitions)].Append(row);
+        Status st_append =
+            parts[SpillPartitionOf(encoded_key, kSpillPartitions)].Append(row);
+        if (st_append != Status::kSuccess && agg_error == Status::kSuccess) {
+          agg_error = st_append;
+        }
       });
-      for (SpillFile& part : parts) {
-        part.FinishWriting();
+      if (iterated != Status::kSuccess && agg_error == Status::kSuccess) {
+        agg_error = iterated;
       }
+      for (SpillFile& part : parts) {
+        RETURN_IF_FAIL(part.FinishWriting());
+      }
+      RETURN_IF_FAIL(agg_error);
       // Every row was copied into a partition above.
       input.ResetContents();
       for (size_t part = 0; part < kSpillPartitions; ++part) {
         GroupKeyMap offsets;
         std::vector<GroupState> local_groups;
         std::deque<AggregateAccumulator> local_states;
-        parts[part].ForEachRow([&](const Row& row) {
-          accumulate_row(row, &offsets, &local_groups, &local_states);
-        });
+        RETURN_IF_FAIL(parts[part].ForEachRow([&](const Row& row) {
+          Status st_acc =
+              accumulate_row(row, &offsets, &local_groups, &local_states);
+          if (st_acc != Status::kSuccess && agg_error == Status::kSuccess) {
+            agg_error = st_acc;
+          }
+        }));
+        RETURN_IF_FAIL(agg_error);
         // Stash into the shared group vectors used by emit below.
         for (GroupState& group : local_groups) {
           group.accumulator_offset += aggregate_states.size();
@@ -387,9 +427,17 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       }
     } else {
       GroupKeyMap offsets;
-      input.ForEachRow([&](const Row& row) {
-        accumulate_row(row, &offsets, &groups, &aggregate_states);
+      Status iterated = input.ForEachRow([&](const Row& row) {
+        Status st_acc =
+            accumulate_row(row, &offsets, &groups, &aggregate_states);
+        if (st_acc != Status::kSuccess && agg_error == Status::kSuccess) {
+          agg_error = st_acc;
+        }
       });
+      if (iterated != Status::kSuccess && agg_error == Status::kSuccess) {
+        agg_error = iterated;
+      }
+      RETURN_IF_FAIL(agg_error);
       if (input.TotalRows() == 0 && statement.GroupBy().empty()) {
         groups.push_back(make_group());
       }
@@ -534,9 +582,11 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         !star_proto[i] && star_groups[i].empty()) {
       const ColumnName& requested =
           projection.expression->AsColumnValue().GetColumnName();
-      throw std::runtime_error(
+      return StatusError(
+          StatusCode::kInvalidArgument,
           "unknown relation in select list: " +
-          (requested.schema.empty() ? "*" : requested.schema + ".*"));
+              (requested.schema.empty() ? std::string("*")
+                                        : requested.schema + ".*"));
     }
   }
   // Hidden $win columns ride along until ordering completes, then get trimmed
@@ -580,7 +630,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   Schema initial_output_schema("", output_columns);
 
   auto emit = [&](const Row& representative,
-                  const AggregateResultMap* aggregates) {
+                  const AggregateResultMap* aggregates) -> Status {
     Scope scope{
         .row = &representative, .schema = &input.schema, .outer = outer};
     if (aggregates != nullptr) {
@@ -591,9 +641,13 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     if (!lowered_using.empty()) {
       scope.using_columns = &lowered_using;
     }
-    if (having_expr &&
-        !Truthy(Evaluate(having_expr, scope, aggregates, context, ctes))) {
-      return;
+    if (having_expr) {
+      ASSIGN_OR_RETURN(
+          Value, having_value,
+          (TryEvaluate(having_expr, scope, aggregates, context, ctes)));
+      if (!Truthy(having_value)) {
+        return Status::kSuccess;
+      }
     }
     std::vector<Value> values;
     for (size_t item = 0; item < statement.SelectList().size(); ++item) {
@@ -603,11 +657,14 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         if (star_proto[item]) {
           const ColumnName base = input.schema.GetColumn(0).Name();
           for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
-            values.push_back(Evaluate(
-                FunctionCallExp("__get_field_safe",
-                                {ColumnValueExp(base),
-                                 ConstantValueExp(Value(std::string(field)))}),
-                scope, aggregates, context, ctes));
+            ASSIGN_OR_RETURN(
+                Value, hv25286_0,
+                (TryEvaluate(FunctionCallExp(
+                                 "__get_field_safe",
+                                 {ColumnValueExp(base),
+                                  ConstantValueExp(Value(std::string(field)))}),
+                             scope, aggregates, context, ctes)));
+            values.push_back(std::move(hv25286_0));
           }
           continue;
         }
@@ -623,8 +680,10 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
           values.push_back(std::move(merged));
         }
       } else {
-        values.push_back(
-            Evaluate(projection.expression, scope, aggregates, context, ctes));
+        ASSIGN_OR_RETURN(Value, projection_value,
+                         (TryEvaluate(projection.expression, scope, aggregates,
+                                      context, ctes)));
+        values.push_back(std::move(projection_value));
       }
     }
     // Carry hidden $win columns through projection; ORDER BY may reference
@@ -640,13 +699,17 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       std::vector<Value> keys;
       keys.reserve(order_by.size());
       for (const Expression& key : resolved_order_expressions) {
-        keys.push_back(Evaluate(key, proj_scope, aggregates, context, ctes));
+        ASSIGN_OR_RETURN(
+            Value, hv26761_0,
+            (TryEvaluate(key, proj_scope, aggregates, context, ctes)));
+        keys.push_back(std::move(hv26761_0));
       }
       sortable.push_back(
           KeyedRow{.keys = std::move(keys), .row = std::move(output_row)});
     } else {
       output.AddRow(std::move(output_row));
     }
+    return Status::kSuccess;
   };
 
   if (grouped) {
@@ -658,11 +721,21 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
             aggregate_states[group.accumulator_offset + i];
         aggregate_results.emplace(accumulator.expression, accumulator.Finish());
       }
-      emit(group.representative, &aggregate_results);
+      RETURN_IF_FAIL(emit(group.representative, &aggregate_results));
     }
   } else {
     input.FinishSpill();
-    input.ForEachRow([&](const Row& row) { emit(row, nullptr); });
+    Status emit_error{Status::kSuccess};
+    Status iterated = input.ForEachRow([&](const Row& row) {
+      Status st_emit = emit(row, nullptr);
+      if (st_emit != Status::kSuccess && emit_error == Status::kSuccess) {
+        emit_error = st_emit;
+      }
+    });
+    if (iterated != Status::kSuccess && emit_error == Status::kSuccess) {
+      emit_error = iterated;
+    }
+    RETURN_IF_FAIL(emit_error);
   }
 
   if (has_order_by) {
@@ -705,7 +778,8 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     // output.rows; trimming only the resident vector left spilled rows with
     // extra hidden columns. Walk every row instead.
     std::vector<Row> all_rows;
-    output.ForEachRow([&all_rows](const Row& row) { all_rows.push_back(row); });
+    RETURN_IF_FAIL(output.ForEachRow(
+        [&all_rows](const Row& row) { all_rows.push_back(row); }));
     output.ResetContents();
     for (Row& row : all_rows) {
       row.values_.resize(std::min(visible_width, row.values_.size()));
@@ -768,18 +842,18 @@ struct CanonicalRowHash {
 
 }  // namespace
 
-Relation DistinctOf(Relation input,
-                    const std::vector<Expression>& distinct_on = {},
-                    TransactionContext* ctx = nullptr,
-                    const Scope* outer = nullptr,
-                    const CteMap* ctes = nullptr) {
+StatusOr<Relation> DistinctOf(Relation input,
+                              const std::vector<Expression>& distinct_on = {},
+                              TransactionContext* ctx = nullptr,
+                              const Scope* outer = nullptr,
+                              const CteMap* ctes = nullptr) {
   if (distinct_on.empty()) {
     std::unordered_set<Row, CanonicalRowHash, CanonicalRowEqual> seen;
     Relation distinct;
     distinct.schema = input.schema;
     CopyExecutionStats(&distinct, input);
     input.FinishSpill();
-    input.ForEachRow([&](const Row& row) {
+    RETURN_IF_FAIL(input.ForEachRow([&](const Row& row) {
       // Canonicalize the emitted row so a representative value is chosen
       // consistently (NaN -> quiet NaN, -0.0 -> +0.0), matching GoogleSQL.
       Row canonical = row;
@@ -789,7 +863,7 @@ Relation DistinctOf(Relation input,
       if (seen.insert(canonical).second) {
         distinct.AddRow(std::move(canonical));
       }
-    });
+    }));
     distinct.FinishSpill();
     return distinct;
   }
@@ -798,15 +872,23 @@ Relation DistinctOf(Relation input,
   distinct.schema = input.schema;
   CopyExecutionStats(&distinct, input);
   input.FinishSpill();
-  input.ForEachRow([&](const Row& row) {
+  Status distinct_error{Status::kSuccess};
+  Status iterated = input.ForEachRow([&](const Row& row) {
     std::vector<Value> current_keys;
     current_keys.reserve(distinct_on.size());
     for (const auto& expr : distinct_on) {
       Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
-      Value val = ctx != nullptr && ctes != nullptr
-                      ? Evaluate(expr, scope, nullptr, *ctx, *ctes)
-                      : expr->Evaluate(row, input.schema);
-      current_keys.push_back(CanonicalDistinctValue(val));
+      StatusOr<Value> val_or =
+          ctx != nullptr && ctes != nullptr
+              ? TryEvaluate(expr, scope, nullptr, *ctx, *ctes)
+              : expr->TryEvaluate(row, input.schema);
+      if (!val_or.HasValue()) {
+        if (distinct_error == Status::kSuccess) {
+          distinct_error = val_or.GetStatus();
+        }
+        return;
+      }
+      current_keys.push_back(CanonicalDistinctValue(val_or.MoveValue()));
     }
     bool duplicate = false;
     for (const auto& seen_k : seen_keys) {
@@ -829,6 +911,10 @@ Relation DistinctOf(Relation input,
       distinct.AddRow(row);
     }
   });
+  if (iterated != Status::kSuccess && distinct_error == Status::kSuccess) {
+    distinct_error = iterated;
+  }
+  RETURN_IF_FAIL(distinct_error);
   distinct.FinishSpill();
   return distinct;
 }
@@ -837,8 +923,9 @@ Relation DistinctOf(Relation input,
 // evaluated once per row (not per comparison). All rows are copied out before
 // refilling so a previously spilled output is never appended to after its
 // spill files were finished.
-void ApplyOrderBy(TransactionContext& context, const SelectStatement& statement,
-                  Relation* output, const Scope* outer, const CteMap& ctes) {
+Status ApplyOrderBy(TransactionContext& context,
+                    const SelectStatement& statement, Relation* output,
+                    const Scope* outer, const CteMap& ctes) {
   const auto sort_begin = std::chrono::steady_clock::now();
   const std::vector<SelectStatement::OrderByTerm>& order_by =
       statement.OrderBy();
@@ -847,16 +934,27 @@ void ApplyOrderBy(TransactionContext& context, const SelectStatement& statement,
     Row row;
   };
   std::vector<KeyedRow> sortable;
-  output->FinishSpill();
-  output->ForEachRow([&](const Row& row) {
+  RETURN_IF_FAIL(output->FinishSpill());
+  Status sort_error{Status::kSuccess};
+  Status iterated = output->ForEachRow([&](const Row& row) -> void {
     Scope scope{.row = &row, .schema = &output->schema, .outer = outer};
     std::vector<Value> keys;
     keys.reserve(order_by.size());
     for (const auto& key : order_by) {
-      keys.push_back(Evaluate(key.expression, scope, nullptr, context, ctes));
+      if (sort_error != Status::kSuccess) {
+        return;
+      }
+      StatusOr<Value> hv33968_0 =
+          TryEvaluate(key.expression, scope, nullptr, context, ctes);
+      if (!hv33968_0.HasValue()) {
+        sort_error = hv33968_0.GetStatus();
+        return;
+      }
+      keys.push_back(hv33968_0.MoveValue());
     }
     sortable.push_back(KeyedRow{.keys = std::move(keys), .row = row});
   });
+  RETURN_IF_FAIL(sort_error);
   // Every row was copied into `sortable`; detach the finished spill files so
   // re-adding below cannot hit "Append after FinishWriting".
   output->ResetContents();
@@ -885,16 +983,22 @@ void ApplyOrderBy(TransactionContext& context, const SelectStatement& statement,
   for (KeyedRow& keyed : sortable) {
     output->AddRow(std::move(keyed.row));
   }
-  output->FinishSpill();
+  if (iterated != Status::kSuccess && sort_error == Status::kSuccess) {
+    sort_error = iterated;
+  }
+  RETURN_IF_FAIL(sort_error);
+  RETURN_IF_FAIL(output->FinishSpill());
   if (context.execution_runtime() != nullptr) {
     context.execution_runtime()->sort_ms += ElapsedMs(sort_begin);
   }
+  return Status::kSuccess;
 }
 
-Relation LimitedRows(const SelectStatement& statement, Relation&& input,
-                     TransactionContext* context = nullptr,
-                     const Scope* outer = nullptr,
-                     const CteMap* ctes = nullptr) {
+StatusOr<Relation> LimitedRows(const SelectStatement& statement,
+                               Relation&& input,
+                               TransactionContext* context = nullptr,
+                               const Scope* outer = nullptr,
+                               const CteMap* ctes = nullptr) {
   Relation limited;
   limited.schema = input.schema;
   CopyExecutionStats(&limited, input);
@@ -910,7 +1014,8 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input,
 
   std::vector<Row> all_rows;
   all_rows.reserve(total);
-  input.ForEachRow([&](const Row& row) { all_rows.push_back(row); });
+  RETURN_IF_FAIL(
+      input.ForEachRow([&](const Row& row) { all_rows.push_back(row); }));
 
   if (statement.WithTies() && !statement.OrderBy().empty() && count > 0 &&
       begin + count <= all_rows.size()) {
@@ -924,16 +1029,18 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input,
             .row = &last_row, .schema = &input.schema, .outer = outer};
         Scope scope_curr{
             .row = &all_rows[end_idx], .schema = &input.schema, .outer = outer};
-        Value val_last =
+        StatusOr<Value> last_or =
             context != nullptr && ctes != nullptr
-                ? Evaluate(term.expression, scope_last, nullptr, *context,
-                           *ctes)
-                : term.expression->Evaluate(last_row, input.schema);
-        Value val_curr =
+                ? TryEvaluate(term.expression, scope_last, nullptr, *context,
+                              *ctes)
+                : term.expression->TryEvaluate(last_row, input.schema);
+        ASSIGN_OR_RETURN(Value, val_last, (std::move(last_or)));
+        StatusOr<Value> curr_or =
             context != nullptr && ctes != nullptr
-                ? Evaluate(term.expression, scope_curr, nullptr, *context,
-                           *ctes)
-                : term.expression->Evaluate(all_rows[end_idx], input.schema);
+                ? TryEvaluate(term.expression, scope_curr, nullptr, *context,
+                              *ctes)
+                : term.expression->TryEvaluate(all_rows[end_idx], input.schema);
+        ASSIGN_OR_RETURN(Value, val_curr, (std::move(curr_or)));
         if (!CanonicalValuesEqual(val_last, val_curr)) {
           tied = false;
           break;
@@ -959,10 +1066,10 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input,
 
 }  // namespace
 
-Relation FinishQuery(TransactionContext& context,
-                     const SelectStatement& statement, Relation input,
-                     const Scope* outer, const CteMap& ctes, bool apply_where,
-                     size_t hidden_columns) {
+StatusOr<Relation> FinishQuery(TransactionContext& context,
+                               const SelectStatement& statement, Relation input,
+                               const Scope* outer, const CteMap& ctes,
+                               bool apply_where, size_t hidden_columns) {
   if (apply_where && statement.WhereClause()) {
     const auto filter_begin = std::chrono::steady_clock::now();
     // Use the compiled filter path for WHERE evaluation when possible.
@@ -991,12 +1098,12 @@ Relation FinishQuery(TransactionContext& context,
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);
       input.FinishSpill();
-      input.ForEachRow([&](const Row& row) {
+      RETURN_IF_FAIL(input.ForEachRow([&](const Row& row) {
         if (relational_detail::MatchScanFilter(row, input.schema, compiled,
                                                outer, context, ctes)) {
           filtered.AddRow(row);
         }
-      });
+      }));
       filtered.FinishSpill();
       input = std::move(filtered);
     } else {
@@ -1004,13 +1111,13 @@ Relation FinishQuery(TransactionContext& context,
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);
       input.FinishSpill();
-      input.ForEachRow([&](const Row& row) {
+      RETURN_IF_FAIL(input.ForEachRow([&](const Row& row) {
         Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
         if (Truthy(Evaluate(statement.WhereClause(), scope, nullptr, context,
                             ctes))) {
           filtered.AddRow(row);
         }
-      });
+      }));
       filtered.FinishSpill();
       input = std::move(filtered);
     }
@@ -1019,19 +1126,23 @@ Relation FinishQuery(TransactionContext& context,
     }
   }
 
-  Relation output = Project(context, statement, std::move(input), outer, ctes,
-                            hidden_columns);
+  ASSIGN_OR_RETURN(Relation, output,
+                   (Project(context, statement, std::move(input), outer, ctes,
+                            hidden_columns)));
   if (statement.Distinct()) {
     if (statement.HasDistinctOn()) {
       if (!statement.OrderBy().empty()) {
-        ApplyOrderBy(context, statement, &output, outer, ctes);
+        RETURN_IF_FAIL(ApplyOrderBy(context, statement, &output, outer, ctes));
       }
-      output = DistinctOf(std::move(output), statement.DistinctOn(), &context,
-                          outer, &ctes);
+      ASSIGN_OR_RETURN(Relation, distinct_of,
+                       (DistinctOf(std::move(output), statement.DistinctOn(),
+                                   &context, outer, &ctes)));
+      output = std::move(distinct_of);
     } else {
-      output = DistinctOf(std::move(output));
+      ASSIGN_OR_RETURN(Relation, distinct_of, (DistinctOf(std::move(output))));
+      output = std::move(distinct_of);
       if (!statement.OrderBy().empty()) {
-        ApplyOrderBy(context, statement, &output, outer, ctes);
+        RETURN_IF_FAIL(ApplyOrderBy(context, statement, &output, outer, ctes));
       }
     }
   }
@@ -1547,11 +1658,12 @@ bool SameRow(const Row& left, const Row& right) {
 
 }  // namespace
 
-Relation ExecuteRecursiveCte(TransactionContext& context,
-                             const std::string& name,
-                             const SelectStatement& body, const Scope* outer,
-                             const CteMap& inherited_ctes,
-                             const RecursiveDepthSpec* depth_spec) {
+StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
+                                       const std::string& name,
+                                       const SelectStatement& body,
+                                       const Scope* outer,
+                                       const CteMap& inherited_ctes,
+                                       const RecursiveDepthSpec* depth_spec) {
   constexpr size_t kMaxIterations = 1024;
   constexpr size_t kMaxRows = 10'000'000;
   if (body.UnionAll().empty()) {
@@ -1566,7 +1678,8 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
   anchor.SetOrderBy({});
   anchor.SetLimit(std::nullopt);
   anchor.SetOffset(0);
-  Relation anchor_result = ExecuteQuery(context, anchor, outer, inherited_ctes);
+  ASSIGN_OR_RETURN(Relation, anchor_result,
+                   (ExecuteQuery(context, anchor, outer, inherited_ctes)));
   anchor_result.FinishSpill();
 
   const bool track_depth = depth_spec != nullptr;
@@ -1607,7 +1720,7 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
       result.AddRow(std::move(stored));
     }
   };
-  anchor_result.ForEachRow(add_anchor);
+  RETURN_IF_FAIL(anchor_result.ForEachRow(add_anchor));
   delta.FinishSpill();
 
   for (size_t iteration = 0; iteration < kMaxIterations; ++iteration) {
@@ -1619,16 +1732,18 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
       break;
     }
     CteMap loop_ctes = inherited_ctes;
-    loop_ctes[name] = std::make_shared<Relation>(MaterializeRelation(delta));
+    ASSIGN_OR_RETURN(Relation, materialized_delta, MaterializeRelation(delta));
+    loop_ctes[name] = std::make_shared<Relation>(std::move(materialized_delta));
     Relation next(context.execution_runtime());
     next.schema = result.schema;
     for (const auto& branch_statement : body.UnionAll()) {
       if (!branch_statement) {
         continue;
       }
-      Relation branch =
-          ExecuteQuery(context, *branch_statement, outer, loop_ctes);
-      branch.ForEachRow([&](const Row& row) {
+      ASSIGN_OR_RETURN(
+          Relation, branch,
+          (ExecuteQuery(context, *branch_statement, outer, loop_ctes)));
+      RETURN_IF_FAIL(branch.ForEachRow([&](const Row& row) {
         Row payload = row;
         if (by_name) {
           std::vector<Value> aligned;
@@ -1661,19 +1776,20 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
           payload.values_.emplace_back(row_depth);
         }
         next.AddRow(std::move(payload));
-      });
+      }));
     }
     next.FinishSpill();
     if (next.TotalRows() == 0) {
       break;
     }
     if (result.TotalRows() + next.TotalRows() > kMaxRows) {
-      throw std::runtime_error("recursive CTE " + name +
-                               " exceeded the row budget");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "recursive CTE " + name + " exceeded the row budget");
     }
     if (!track_depth ||
         (row_depth >= depth_spec->lower && row_depth <= depth_spec->upper)) {
-      next.ForEachRow([&](const Row& row) { result.AddRow(row); });
+      RETURN_IF_FAIL(
+          next.ForEachRow([&](const Row& row) { result.AddRow(row); }));
     }
     result.FinishSpill();
     delta = std::move(next);
@@ -1681,7 +1797,7 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
   return result;
 }
 
-Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
+StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
     TransactionContext& context, const SelectStatement& statement,
     const Scope* outer, const CteMap& inherited_ctes) {
   EnsureReusableProjections(context, context.execution_runtime());
@@ -1718,10 +1834,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
           }
         }
         if (ready) {
-          ctes[name] = std::make_shared<Relation>(
+          StatusOr<Relation> cte_relation =
               recursive ? ExecuteRecursiveCte(context, name, query, outer, ctes,
                                               statement.RecursiveDepthOf(name))
-                        : ExecuteQuery(context, query, outer, ctes));
+                        : ExecuteQuery(context, query, outer, ctes);
+          if (!cte_relation.HasValue()) {
+            return cte_relation.GetStatus();
+          }
+          ctes[name] = std::make_shared<Relation>(cte_relation.MoveValue());
           iter = pending.erase(iter);
           progress = true;
         } else {
@@ -1732,8 +1852,11 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         // Cyclic references cannot be satisfied; run whatever remains in
         // map order so the failure mirrors a missing relation.
         for (const std::string& name : pending) {
-          ctes[name] = std::make_shared<Relation>(ExecuteQuery(
-              context, *statement.WithQueries().at(name), outer, ctes));
+          ASSIGN_OR_RETURN(
+              Relation, cte_relation,
+              (ExecuteQuery(context, *statement.WithQueries().at(name), outer,
+                            ctes)));
+          ctes[name] = std::make_shared<Relation>(std::move(cte_relation));
         }
         break;
       }
@@ -1749,11 +1872,13 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       statement.GetSetOperationTree()->grouped) {
     const SetOperationTree& tree = *statement.GetSetOperationTree();
     auto apply_pair = [&](Relation left, Relation right,
-                          SetOperationKind operation) {
+                          SetOperationKind operation) -> StatusOr<Relation> {
       std::vector<Row> left_rows;
       std::vector<Row> right_rows;
-      left.ForEachRow([&](const Row& row) { left_rows.push_back(row); });
-      right.ForEachRow([&](const Row& row) { right_rows.push_back(row); });
+      RETURN_IF_FAIL(
+          left.ForEachRow([&](const Row& row) { left_rows.push_back(row); }));
+      RETURN_IF_FAIL(
+          right.ForEachRow([&](const Row& row) { right_rows.push_back(row); }));
       SetOperationExecutor set_operation(
           {std::make_shared<ConstantExecutor>(std::move(left_rows)),
            std::make_shared<ConstantExecutor>(std::move(right_rows))},
@@ -1764,30 +1889,36 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       while (set_operation.Next(&row, nullptr)) {
         folded.AddRow(std::move(row));
       }
+      if (set_operation.GetStatus() != Status::kSuccess) {
+        return set_operation.GetStatus();
+      }
       folded.FinishSpill();
       return folded;
     };
 
-    Relation combined = ExecuteQuery(context, *tree.first, outer, ctes);
+    ASSIGN_OR_RETURN(Relation, combined,
+                     (ExecuteQuery(context, *tree.first, outer, ctes)));
     // PRODUCTION FIX: honor per-pair kinds with operator precedence
     // (INTERSECT binds tighter than UNION/EXCEPT).  The previous flat left
     // fold evaluated `1 UNION ALL 2 INTERSECT 2` as `(1 UNION ALL 2)
     // INTERSECT 2` and dropped the INTERSECT entirely.
-    auto run_term = [&](const SelectStatement& stmt) {
+    auto run_term = [&](const SelectStatement& stmt) -> StatusOr<Relation> {
       return ExecuteQuery(context, stmt, outer, ctes);
     };
     std::vector<Relation> terms;
     terms.push_back(std::move(combined));
     std::vector<SetOperationKind> low_ops;
     for (size_t i = 0; i < tree.branches.size(); ++i) {
-      Relation branch = run_term(*tree.branches[i]);
+      ASSIGN_OR_RETURN(Relation, branch, (run_term(*tree.branches[i])));
       const SetOperationKind operation =
           i < tree.kinds.size() ? tree.kinds[i] : SetOperationKind::kUnionAll;
       const bool intersects = operation == SetOperationKind::kIntersect ||
                               operation == SetOperationKind::kIntersectAll;
       if (intersects) {
-        terms.back() =
-            apply_pair(std::move(terms.back()), std::move(branch), operation);
+        ASSIGN_OR_RETURN(Relation, folded_pair,
+                         (apply_pair(std::move(terms.back()), std::move(branch),
+                                     operation)));
+        terms.back() = std::move(folded_pair);
       } else {
         low_ops.push_back(operation);
         terms.push_back(std::move(branch));
@@ -1795,12 +1926,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     }
     combined = std::move(terms.front());
     for (size_t j = 1; j < terms.size(); ++j) {
-      combined =
-          apply_pair(std::move(combined), std::move(terms[j]), low_ops[j - 1]);
+      ASSIGN_OR_RETURN(Relation, folded_pair,
+                       (apply_pair(std::move(combined), std::move(terms[j]),
+                                   low_ops[j - 1])));
+      combined = std::move(folded_pair);
     }
     combined.FinishSpill();
     if (!statement.OrderBy().empty()) {
-      ApplyOrderBy(context, statement, &combined, outer, ctes);
+      RETURN_IF_FAIL(ApplyOrderBy(context, statement, &combined, outer, ctes));
     }
     return LimitedRows(statement, std::move(combined));
   }
@@ -1811,17 +1944,20 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     head.SetOrderBy({});
     head.SetLimit(std::nullopt);
     head.SetOffset(0);
-    Relation combined = ExecuteQuery(context, head, outer, ctes);
+    ASSIGN_OR_RETURN(Relation, combined,
+                     (ExecuteQuery(context, head, outer, ctes)));
     // PRODUCTION FIX: apply per-pair kinds with operator precedence
     // (INTERSECT binds tighter than UNION/EXCEPT).  The previous flat left
     // fold computed `1 UNION ALL 2 INTERSECT 2` as `(1 UNION ALL 2)
     // INTERSECT 2` and returned the wrong rows.
     auto apply_pair = [&](Relation left, Relation right,
-                          SetOperationKind operation) {
+                          SetOperationKind operation) -> StatusOr<Relation> {
       std::vector<Row> left_rows;
       std::vector<Row> right_rows;
-      left.ForEachRow([&](const Row& row) { left_rows.push_back(row); });
-      right.ForEachRow([&](const Row& row) { right_rows.push_back(row); });
+      RETURN_IF_FAIL(
+          left.ForEachRow([&](const Row& row) { left_rows.push_back(row); }));
+      RETURN_IF_FAIL(
+          right.ForEachRow([&](const Row& row) { right_rows.push_back(row); }));
       SetOperationExecutor set_operation(
           {std::make_shared<ConstantExecutor>(std::move(left_rows)),
            std::make_shared<ConstantExecutor>(std::move(right_rows))},
@@ -1831,6 +1967,9 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       Row row;
       while (set_operation.Next(&row, nullptr)) {
         folded.AddRow(std::move(row));
+      }
+      if (set_operation.GetStatus() != Status::kSuccess) {
+        return set_operation.GetStatus();
       }
       folded.FinishSpill();
       if (folded.TotalRows() != 0) {
@@ -1843,7 +1982,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     std::vector<SetOperationKind> low_ops;
     for (size_t i = 0; i < statement.UnionAll().size(); ++i) {
       const auto& union_stmt = statement.UnionAll()[i];
-      Relation branch = ExecuteQuery(context, *union_stmt, outer, ctes);
+      ASSIGN_OR_RETURN(Relation, branch,
+                       (ExecuteQuery(context, *union_stmt, outer, ctes)));
       const SetOperationKind operation =
           i < statement.SetOperationKinds().size()
               ? statement.SetOperationKinds()[i]
@@ -1851,8 +1991,10 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       const bool intersects = operation == SetOperationKind::kIntersect ||
                               operation == SetOperationKind::kIntersectAll;
       if (intersects) {
-        terms.back() =
-            apply_pair(std::move(terms.back()), std::move(branch), operation);
+        ASSIGN_OR_RETURN(Relation, folded_pair,
+                         (apply_pair(std::move(terms.back()), std::move(branch),
+                                     operation)));
+        terms.back() = std::move(folded_pair);
       } else {
         low_ops.push_back(operation);
         terms.push_back(std::move(branch));
@@ -1860,12 +2002,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     }
     combined = std::move(terms.front());
     for (size_t j = 1; j < terms.size(); ++j) {
-      combined =
-          apply_pair(std::move(combined), std::move(terms[j]), low_ops[j - 1]);
+      ASSIGN_OR_RETURN(Relation, folded_pair,
+                       (apply_pair(std::move(combined), std::move(terms[j]),
+                                   low_ops[j - 1])));
+      combined = std::move(folded_pair);
     }
     combined.FinishSpill();
     if (!statement.OrderBy().empty()) {
-      ApplyOrderBy(context, statement, &combined, outer, ctes);
+      RETURN_IF_FAIL(ApplyOrderBy(context, statement, &combined, outer, ctes));
     }
     return LimitedRows(statement, std::move(combined));
   }
@@ -1895,7 +2039,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
             source.table);
     StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
     if (!table.HasValue()) {
-      throw std::runtime_error("table " + source.table + " not found");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "table " + source.table + " not found");
     }
     const Schema& table_schema = table.Value()->GetSchema();
     const std::string qualifier =
@@ -1999,7 +2144,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     }
 
     const auto scan_begin = std::chrono::steady_clock::now();
-    auto accumulate_row = [&](Row row) {
+    auto accumulate_row = [&](Row row) -> Status {
       if (context.execution_runtime() != nullptr) {
         ++context.execution_runtime()->scan_output_rows;
       }
@@ -2012,8 +2157,9 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         }
       } else {
         for (const Expression& key : stmt.GroupBy()) {
-          key_values.push_back(CanonicalDistinctValue(
-              Evaluate(key, scope, nullptr, context, ctes)));
+          ASSIGN_OR_RETURN(Value, hv81838_0,
+                           (TryEvaluate(key, scope, nullptr, context, ctes)));
+          key_values.push_back(CanonicalDistinctValue(hv81838_0));
         }
       }
       Row key(std::move(key_values));
@@ -2049,22 +2195,30 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
               Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
           if (aggregate.Having() != AggregateHavingModifier::kNone &&
               aggregate.HavingCondition()) {
-            aggregate_input.condition = Evaluate(aggregate.HavingCondition(),
-                                                 scope, nullptr, context, ctes);
+            ASSIGN_OR_RETURN(Value, hv83481_0,
+                             (TryEvaluate(aggregate.HavingCondition(), scope,
+                                          nullptr, context, ctes)));
+            aggregate_input.condition = std::move(hv83481_0);
           }
           for (const auto& term : aggregate.InnerOrderBy()) {
-            aggregate_input.order_keys.push_back(
-                Evaluate(term.expression, scope, nullptr, context, ctes));
+            ASSIGN_OR_RETURN(
+                Value, hv83714_0,
+                (TryEvaluate(term.expression, scope, nullptr, context, ctes)));
+            aggregate_input.order_keys.push_back(std::move(hv83714_0));
           }
           if (aggregate.GetType() == AggregationType::kStringAgg &&
               aggregate.SecondaryArg()) {
-            aggregate_input.auxiliary = Evaluate(aggregate.SecondaryArg(),
-                                                 scope, nullptr, context, ctes);
+            ASSIGN_OR_RETURN(Value, hv83961_0,
+                             (TryEvaluate(aggregate.SecondaryArg(), scope,
+                                          nullptr, context, ctes)));
+            aggregate_input.auxiliary = std::move(hv83961_0);
           }
           for (const Expression& extra : aggregate.TrailingArgs()) {
             if (extra) {
-              aggregate_input.trailing_values.push_back(
-                  Evaluate(extra, scope, nullptr, context, ctes));
+              ASSIGN_OR_RETURN(
+                  Value, hv84223_0,
+                  (TryEvaluate(extra, scope, nullptr, context, ctes)));
+              aggregate_input.trailing_values.push_back(std::move(hv84223_0));
             }
           }
           accumulator.Add(std::move(aggregate_input));
@@ -2076,6 +2230,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       if (context.execution_runtime() != nullptr) {
         ++context.execution_runtime()->aggregate_input_rows;
       }
+      return Status::kSuccess;
     };
 
     const std::vector<slot_t>* proj_ptr =
@@ -2121,14 +2276,24 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       }
       // Aggregation always reads through the shared cache so the first user
       // and later users see exactly the same rows.
+      Status scan_accumulate_error{Status::kSuccess};
       cached->second->FinishSpill();
-      cached->second->ForEachRow([&](const Row& row) {
+      Status scan_iterated = cached->second->ForEachRow([&](const Row& row) {
         if (!MatchScanFilter(row, scan_schema, scan_filter, outer, context,
                              ctes)) {
           return;
         }
-        accumulate_row(row);
+        if (Status st_acc = accumulate_row(row);
+            st_acc != Status::kSuccess &&
+            scan_accumulate_error == Status::kSuccess) {
+          scan_accumulate_error = st_acc;
+        }
       });
+      if (scan_iterated != Status::kSuccess &&
+          scan_accumulate_error == Status::kSuccess) {
+        scan_accumulate_error = scan_iterated;
+      }
+      RETURN_IF_FAIL(scan_accumulate_error);
     } else {
       // Stashed key filters are intentionally not applied here: they belong to
       // the statement that derived them, not to this aggregation.
@@ -2158,7 +2323,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
           context.execution_runtime()->scan_values_decoded +=
               scan_schema.ColumnCount();
         }
-        accumulate_row(*iterator);
+        RETURN_IF_FAIL(accumulate_row(*iterator));
         ++iterator;
       }
     }
@@ -2217,8 +2382,10 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       std::vector<Value> values;
       values.reserve(stmt.SelectList().size());
       for (const NamedExpression& projection_item : stmt.SelectList()) {
-        values.push_back(Evaluate(projection_item.expression, scope,
-                                  &aggregate_results, context, ctes));
+        ASSIGN_OR_RETURN(Value, hv90851_0,
+                         (TryEvaluate(projection_item.expression, scope,
+                                      &aggregate_results, context, ctes)));
+        values.push_back(std::move(hv90851_0));
       }
       Row output_row(std::move(values));
       // Sort keys may reference base columns of the grouped relation
@@ -2234,8 +2401,10 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         std::vector<Value> keys;
         keys.reserve(stmt.OrderBy().size());
         for (const auto& key : stmt.OrderBy()) {
-          keys.push_back(Evaluate(key.expression, proj_scope,
-                                  &aggregate_results, context, ctes));
+          ASSIGN_OR_RETURN(Value, hv91721_0,
+                           (TryEvaluate(key.expression, proj_scope,
+                                        &aggregate_results, context, ctes)));
+          keys.push_back(std::move(hv91721_0));
         }
         sortable.push_back(
             KeyedRow{.keys = std::move(keys), .row = std::move(output_row)});
@@ -2287,18 +2456,23 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     // preserves row order.
     if (stmt.Distinct()) {
       if (stmt.HasDistinctOn()) {
-        output = DistinctOf(std::move(output), stmt.DistinctOn(), &context,
-                            outer, &ctes);
+        ASSIGN_OR_RETURN(Relation, distinct_of,
+                         (DistinctOf(std::move(output), stmt.DistinctOn(),
+                                     &context, outer, &ctes)));
+        output = std::move(distinct_of);
       } else {
-        output = DistinctOf(std::move(output));
+        ASSIGN_OR_RETURN(Relation, distinct_of,
+                         (DistinctOf(std::move(output))));
+        output = std::move(distinct_of);
       }
     }
     return LimitedRows(statement, std::move(output), &context, outer, &ctes);
   }
 
   bool where_fully_applied = false;
-  Relation input =
-      BuildInput(context, statement, outer, ctes, &where_fully_applied);
+  ASSIGN_OR_RETURN(
+      Relation, input,
+      BuildInput(context, statement, outer, ctes, &where_fully_applied));
 
   size_t hidden_columns = 0;
   const SelectStatement* effective = &statement;
@@ -2312,16 +2486,18 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     }
   }
   if (HasWindowFunctions(*effective)) {
-    WindowedInput windowed =
-        ApplyWindows(context, *effective, std::move(input), outer, ctes);
+    ASSIGN_OR_RETURN(
+        WindowedInput, windowed,
+        (ApplyWindows(context, *effective, std::move(input), outer, ctes)));
     windowed_statement = windowed.statement;
     hidden_columns = windowed.hidden_columns;
     input = std::move(windowed.input);
     effective = windowed_statement.get();
   }
 
-  Relation result = FinishQuery(context, *effective, std::move(input), outer,
-                                ctes, !where_fully_applied, hidden_columns);
+  ASSIGN_OR_RETURN(Relation, result,
+                   (FinishQuery(context, *effective, std::move(input), outer,
+                                ctes, !where_fully_applied, hidden_columns)));
   result.FinishSpill();
   return result;
 }
@@ -2357,7 +2533,11 @@ class GroupedFinishExecutor final : public ExecutorBase {
 
   bool Next(Row* destination, RowPosition* position) override {
     if (!initialized_) {
-      Initialize();
+      const Status st = Initialize();
+      initialized_ = true;
+      if (st != Status::kSuccess) {
+        return FailWith(st);
+      }
     }
     if (offset_ >= rows_.size()) {
       return false;
@@ -2423,7 +2603,7 @@ class GroupedFinishExecutor final : public ExecutorBase {
   }
 
  private:
-  void Initialize() {
+  Status Initialize() {
     core_executor_ = core_plan_->EmitExecutor(*context_);
     Relation input(context_->execution_runtime());
     input.schema = core_plan_->GetSchema();
@@ -2432,15 +2612,23 @@ class GroupedFinishExecutor final : public ExecutorBase {
       input.AddRow(row);
       ++core_input_rows_;
     }
-    input.FinishSpill();
+    if (core_executor_->GetStatus() != Status::kSuccess) {
+      return core_executor_->GetStatus();
+    }
+    RETURN_IF_FAIL(input.FinishSpill());
     // apply_where=false: the WHERE clause is already applied inside the
     // optimized core plan (scan filters, join conditions, residual
     // selection), so re-evaluating it here would only re-run work.
-    Relation result = FinishQuery(*context_, *statement_, std::move(input),
-                                  nullptr, {}, false);
-    result.FinishSpill();
-    result.ForEachRow([&](const Row& finished) { rows_.push_back(finished); });
-    initialized_ = true;
+    StatusOr<Relation> finished = FinishQuery(
+        *context_, *statement_, std::move(input), nullptr, {}, false);
+    if (!finished.HasValue()) {
+      return finished.GetStatus();
+    }
+    Relation result = finished.MoveValue();
+    RETURN_IF_FAIL(result.FinishSpill());
+    RETURN_IF_FAIL(result.ForEachRow(
+        [&](const Row& finished_row) { rows_.push_back(finished_row); }));
+    return Status::kSuccess;
   }
 
   TransactionContext* context_;
@@ -2462,11 +2650,16 @@ Executor EmitGroupedFinishExecutor(
                                                  std::move(statement));
 }
 
-void RelationalExecutor::Initialize() {
+Status RelationalExecutor::Initialize() {
   if (initialized_) {
-    return;
+    return Status::kSuccess;
   }
-  ExecutionRuntime runtime;
+  // The runtime outlives this frame: lazy executors produced while
+  // evaluating the query (grouped finish, windowed streams) keep pointers
+  // into it and run from later Next() calls.
+  auto runtime_owner = std::make_unique<ExecutionRuntime>();
+  runtime_keep_ = std::move(runtime_owner);
+  ExecutionRuntime& runtime = *runtime_keep_;
   runtime.root_statement = statement_.get();
   std::unordered_map<std::string, size_t> table_counts;
   CountStatementTables(*statement_, &table_counts);
@@ -2477,17 +2670,15 @@ void RelationalExecutor::Initialize() {
   }
   ExecutionRuntime* previous_runtime = context_->execution_runtime();
   context_->set_execution_runtime(&runtime);
-  Relation result;
-  try {
-    result = ExecuteQuery(*context_, *statement_, nullptr, {});
-  } catch (...) {
-    context_->set_execution_runtime(previous_runtime);
-    throw;
-  }
+  StatusOr<Relation> executed =
+      ExecuteQuery(*context_, *statement_, nullptr, {});
   context_->set_execution_runtime(previous_runtime);
-  result.FinishSpill();
+  RETURN_IF_FAIL(executed.GetStatus());
+  Relation result = executed.MoveValue();
+  RETURN_IF_FAIL(result.FinishSpill());
   rows_.clear();
-  result.ForEachRow([&](const Row& row) { rows_.push_back(row); });
+  RETURN_IF_FAIL(
+      result.ForEachRow([&](const Row& row) { rows_.push_back(row); }));
   if (statement_->Sources().size() == 1 && statement_->Sources()[0].query &&
       statement_->Sources()[0].query->WhereClause() &&
       statement_->Sources()[0].query->WhereClause()->Type() ==
@@ -2549,10 +2740,18 @@ void RelationalExecutor::Initialize() {
       runtime.null_aware_anti_build_contains_null;
   relation_spills_ = runtime.relation_spills;
   initialized_ = true;
+  return Status::kSuccess;
 }
 
+RelationalExecutor::~RelationalExecutor() = default;
+
 bool RelationalExecutor::Next(Row* destination, RowPosition* position) {
-  Initialize();
+  if (!initialized_) {
+    const Status st = Initialize();
+    if (st != Status::kSuccess) {
+      return FailWith(st);
+    }
+  }
   if (offset_ >= rows_.size()) {
     return false;
   }

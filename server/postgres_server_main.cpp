@@ -108,15 +108,9 @@ int main(int argc, char** argv) {
   }
 
   std::unique_ptr<tinylamb::PostgresServer> instance;
-  try {
-    // The constructor opens (and recovers) the database; report failures
-    // instead of letting the exception terminate the process silently.
-    instance = std::make_unique<tinylamb::PostgresServer>(argv[1], options);
-  } catch (const std::exception& e) {
-    std::cerr << "failed to open database " << argv[1] << ": " << e.what()
-              << '\n';
-    return 1;
-  }
+  // The constructor opens (and recovers) the database; a startup failure is
+  // reported by Listen() below instead of terminating the process.
+  instance = std::make_unique<tinylamb::PostgresServer>(argv[1], options);
   std::string error;
   if (!instance->Listen(&error)) {
     std::cerr << "server startup failed: " << error << '\n';

@@ -83,8 +83,7 @@ std::string PredicateText(const std::optional<Expression>& predicate) {
 size_t ExploreRootCount(GeneratedJoinGraph graph,
                         const cascades::RuleSet& rules) {
   cascades::Memo memo;
-  const cascades::GroupId root =
-      memo.Build(graph.relations, graph.conjuncts);
+  const cascades::GroupId root = memo.Build(graph.relations, graph.conjuncts);
   cascades::SearchEngine search(std::move(memo), rules);
   search.Explore(root);
   return search.GetMemo().ExpressionCount(root);

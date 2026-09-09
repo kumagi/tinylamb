@@ -70,7 +70,7 @@ class TableTest : public ::testing::Test {
     if (rs_) {
       rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<Database>(prefix_);
+    rs_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { rs_->DeleteAll(); }
@@ -817,11 +817,11 @@ TEST_F(TableTest, Update_IndexedRow_ReadsBackUpdatedValues) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
-TEST_F(TableTest, Serialize_TooLargeRow_ThrowsRuntimeException) {
+TEST_F(TableTest, Serialize_TooLargeRow_Aborts) {
   std::string huge_payload(65536, 'x');
   Row huge_row({Value(1), Value(std::move(huge_payload)), Value(1.0)});
   std::vector<char> buf(huge_row.Size());
-  EXPECT_THROW((void)huge_row.Serialize(buf.data()), std::runtime_error);
+  EXPECT_DEATH((void)huge_row.Serialize(buf.data()), "too long");
 }
 
 TEST_F(TableTest,

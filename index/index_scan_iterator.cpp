@@ -93,20 +93,33 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
   }
   keys_.DecodeMemcomparableFormat(iter_.Key());
   if (is_unique_) {
-    auto val = Decode<Table::IndexValueType>(iter_.Value());
-    pos_ = val.pos;
-    include_ = val.include;
+    StatusOr<Table::IndexValueType> val =
+        Decode<Table::IndexValueType>(iter_.Value());
+    if (!val.HasValue()) {
+      status_ = val.GetStatus();
+      Clear();
+      return;
+    }
+    pos_ = val.Value().pos;
+    include_ = val.Value().include;
   } else {
-    auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-    if (val.empty()) {
+    StatusOr<std::vector<Table::IndexValueType> > val =
+        Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+    if (!val.HasValue()) {
+      status_ = val.GetStatus();
+      Clear();
+      return;
+    }
+    if (val.Value().empty()) {
       // A corrupted (or future empty) value list must not underflow the
       // offset below; leave the row state cleared.
       Clear();
       return;
     }
-    value_offset_ = ascending_ ? 0 : static_cast<int64_t>(val.size()) - 1;
-    pos_ = val[static_cast<size_t>(value_offset_)].pos;
-    include_ = val[static_cast<size_t>(value_offset_)].include;
+    value_offset_ =
+        ascending_ ? 0 : static_cast<int64_t>(val.Value().size()) - 1;
+    pos_ = val.Value()[static_cast<size_t>(value_offset_)].pos;
+    include_ = val.Value()[static_cast<size_t>(value_offset_)].include;
   }
 }
 
@@ -140,29 +153,46 @@ void IndexScanIterator::UpdateIteratorState() {
   }
   keys_.DecodeMemcomparableFormat(iter_.Key());
   if (is_unique_) {
-    auto rp = Decode<Table::IndexValueType>(GetValue());
-    pos_ = rp.pos;
-    include_ = rp.include;
+    StatusOr<Table::IndexValueType> rp =
+        Decode<Table::IndexValueType>(GetValue());
+    if (!rp.HasValue()) {
+      status_ = rp.GetStatus();
+      Clear();
+      return;
+    }
+    pos_ = rp.Value().pos;
+    include_ = rp.Value().include;
   } else {
-    auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-    if (val.empty() || value_offset_ < 0 ||
-        static_cast<size_t>(value_offset_) >= val.size()) {
+    StatusOr<std::vector<Table::IndexValueType> > val =
+        Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+    if (!val.HasValue()) {
+      status_ = val.GetStatus();
+      Clear();
+      return;
+    }
+    if (val.Value().empty() || value_offset_ < 0 ||
+        static_cast<size_t>(value_offset_) >= val.Value().size()) {
       Clear();
       return;
     }
     const Table::IndexValueType& row_value =
-        val[static_cast<size_t>(value_offset_)];
+        val.Value()[static_cast<size_t>(value_offset_)];
     pos_ = row_value.pos;
     include_ = row_value.include;
   }
 }
 
 void IndexScanIterator::ResolveRow() const {
-  PageRef ref = txn_.GetPageManager()->GetPage(pos_.page_id, true);
-  if (!ref.IsValid()) {
+  StatusOr<PageRef> ref = txn_.GetPageManager()->GetPage(pos_.page_id, true);
+  if (!ref.HasValue()) {
+    // const method: record the failure through the mutable sticky status.
+    const_cast<IndexScanIterator*>(this)->status_ = ref.GetStatus();
     return;
   }
-  StatusOr<std::string_view> row = ref->Read(txn_, pos_.slot);
+  if (!ref.Value().IsValid()) {
+    return;
+  }
+  StatusOr<std::string_view> row = ref.Value()->Read(txn_, pos_.slot);
   if (!row.HasValue()) {
     current_row_.Clear();
     current_row_resolved_ = true;
@@ -200,8 +230,14 @@ IteratorBase& IndexScanIterator::operator++() {
     } else {
       --iter_;
       if (iter_.IsValid()) {
-        auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-        value_offset_ = static_cast<int64_t>(val.size()) - 1;
+        StatusOr<std::vector<Table::IndexValueType> > val =
+            Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+        if (!val.HasValue()) {
+          status_ = val.GetStatus();
+          Clear();
+          return *this;
+        }
+        value_offset_ = static_cast<int64_t>(val.Value().size()) - 1;
       }
     }
     UpdateIteratorState();
@@ -210,9 +246,15 @@ IteratorBase& IndexScanIterator::operator++() {
   if (is_unique_) {
     ++iter_;
   } else {
-    auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+    StatusOr<std::vector<Table::IndexValueType> > val =
+        Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+    if (!val.HasValue()) {
+      status_ = val.GetStatus();
+      Clear();
+      return *this;
+    }
     ++value_offset_;
-    if (std::cmp_less_equal(val.size(), value_offset_)) {
+    if (std::cmp_less_equal(val.Value().size(), value_offset_)) {
       ++iter_;
       value_offset_ = 0;
     }
@@ -234,8 +276,14 @@ IteratorBase& IndexScanIterator::operator--() {
     } else {
       --iter_;
       if (iter_.IsValid()) {
-        auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-        value_offset_ = static_cast<int64_t>(val.size()) - 1;
+        StatusOr<std::vector<Table::IndexValueType> > val =
+            Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+        if (!val.HasValue()) {
+          status_ = val.GetStatus();
+          Clear();
+          return *this;
+        }
+        value_offset_ = static_cast<int64_t>(val.Value().size()) - 1;
       }
     }
   }

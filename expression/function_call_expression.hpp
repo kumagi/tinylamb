@@ -39,11 +39,18 @@ bool JsonTextToValue(const std::string& text, Value* parsed);
 
 // Encodes an evaluated value as struct-member JSON text (strings quoted and
 // escaped, numbers bare, nested objects/arrays embedded verbatim).
+[[nodiscard]] StatusOr<std::string> TryEncodeStructMemberJson(
+    const Value& value);
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 std::string EncodeStructMemberJson(const Value& value);
 
 // Sets a (possibly dotted) field on a struct-typed JSON text value and
 // returns the rewritten JSON. Missing intermediates are created; a NULL base
 // stays NULL.
+[[nodiscard]] StatusOr<Value> TryStructSetField(const Value& json,
+                                                const std::string& path,
+                                                const Value& new_value);
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 Value StructSetField(const Value& json, const std::string& path,
                      const Value& new_value);
 
@@ -65,6 +72,14 @@ class FunctionCallExpression : public ExpressionBase {
   // EvaluationContext.
   [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
                                EvaluationContext& context) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row* left, const Schema& left_schema, const Row* right,
+      const Schema& right_schema) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema,
+      EvaluationContext& context) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;

@@ -9,10 +9,11 @@ A simple implementation of RDBMS.
 SQL frontend
 ============
 
-The `tinylamb` executable reads one SQL statement from standard input. The
-pinned GoogleSQL parser produces its parser AST, a visitor converts that tree
-directly to tinylamb expressions and relational query nodes, and the resulting
-plan is executed by tinylamb.
+The `tinylamb` executable reads a SQL script from standard input and executes
+every statement as one implicit transaction. The pinned GoogleSQL parser
+produces its parser AST, a visitor converts that tree directly to tinylamb
+expressions and relational query nodes, and the resulting plan is executed by
+tinylamb.
 
 ```console
 cmake -S . -B build
@@ -37,10 +38,9 @@ and `DELETE`. End-to-end coverage lives in `query/sql_engine_tpcc_test.cpp` and
 `query/sql_engine_tpch_test.cpp`.
 
 `EXPLAIN` returns the selected physical execution strategy without running the
-query. `EXPLAIN ANALYZE` executes it and adds actual row count, planning and
-execution time, scan/filter/join/project/sort timings, join comparison counts,
-peak intermediate rows, and subquery/index cache counters. Both forms work
-through standard input and PostgreSQL simple-query clients such as `psql`.
+query. `EXPLAIN ANALYZE` executes it and adds the actual row count plus total
+planning and execution time to the plan dump. Both forms work through standard
+input and PostgreSQL simple-query clients such as `psql`.
 
 ```sql
 EXPLAIN SELECT * FROM lineitem WHERE l_orderkey = 1;
@@ -85,8 +85,10 @@ psql -X "host=127.0.0.1 port=54321 user=tinylamb dbname=warehouse sslmode=prefer
 
 The server supports PostgreSQL startup negotiation, trust authentication,
 simple queries, text result rows and NULLs, command tags, error responses,
-and `BEGIN`/`COMMIT`/`ROLLBACK`. Autocommit `SELECT`/`WITH` queries run on a
-worker pool, so independent clients execute read-only transactions in parallel
+and `BEGIN`/`COMMIT`/`ROLLBACK`. Autocommit `SELECT` messages run on a
+worker pool (statements that start with `WITH` or `EXPLAIN` take the normal
+execution path because they can wrap writes), so independent clients execute
+read-only transactions in parallel
 without blocking the epoll I/O loop. The default worker count is the detected
 hardware concurrency and can be set with `--read-workers`. TLS/GSS encryption
 requests are declined and

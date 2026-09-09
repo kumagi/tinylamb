@@ -67,6 +67,7 @@ struct IndexValueType {
 
 class IndexSchema {
  public:
+  ~IndexSchema() = default;
   IndexSchema() = default;
   IndexSchema(std::string_view name, std::vector<slot_t> key,
               std::vector<slot_t> include = {},

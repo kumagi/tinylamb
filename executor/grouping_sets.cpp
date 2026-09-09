@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -181,9 +182,9 @@ GroupingSetsExecutor GroupingSetsExecutor::Cube(
           std::move(sets), std::move(aggregates)};
 }
 
-void GroupingSetsExecutor::Materialize() {
+Status GroupingSetsExecutor::Materialize() {
   if (materialized_) {
-    return;
+    return Status::kSuccess;
   }
   materialized_ = true;
   output_rows_.clear();
@@ -246,8 +247,14 @@ void GroupingSetsExecutor::Materialize() {
       key_vals.reserve(key_count);
       for (size_t k = 0; k < key_count; ++k) {
         if (active.contains(k)) {
-          key_vals.push_back(relational_detail::CanonicalDistinctValue(
-              all_group_keys_[k].expression->Evaluate(row, input_schema_)));
+          StatusOr<Value> key =
+              all_group_keys_[k].expression->TryEvaluate(row, input_schema_);
+          if (!key.HasValue()) {
+            FailWith(key.GetStatus());
+            return key.GetStatus();
+          }
+          key_vals.push_back(
+              relational_detail::CanonicalDistinctValue(key.MoveValue()));
         } else {
           key_vals.emplace_back();  // NULL
         }
@@ -263,15 +270,25 @@ void GroupingSetsExecutor::Materialize() {
       for (size_t i = 0; i < aggregates_.size(); ++i) {
         const auto& agg = aggregates_[i].expression->AsAggregateExpression();
         if (agg.WhereFilter()) {
-          Value fval = agg.WhereFilter()->Evaluate(row, input_schema_);
-          if (fval.IsNull() || !fval.Truthy()) {
+          StatusOr<Value> fval =
+              agg.WhereFilter()->TryEvaluate(row, input_schema_);
+          if (!fval.HasValue()) {
+            FailWith(fval.GetStatus());
+            return fval.GetStatus();
+          }
+          if (fval.Value().IsNull() || !fval.Value().Truthy()) {
             continue;
           }
         }
 
         Value val;
         if (!IsCountStar(agg) && agg.Child()) {
-          val = agg.Child()->Evaluate(row, input_schema_);
+          StatusOr<Value> input = agg.Child()->TryEvaluate(row, input_schema_);
+          if (!input.HasValue()) {
+            FailWith(input.GetStatus());
+            return input.GetStatus();
+          }
+          val = input.MoveValue();
         }
 
         if (agg.Distinct()) {
@@ -443,11 +460,15 @@ void GroupingSetsExecutor::Materialize() {
       output_rows_.emplace_back(std::move(row_vals));
     }
   }
+  RETURN_IF_FAIL(child_->GetStatus());
+  return Status::kSuccess;
 }
 
 bool GroupingSetsExecutor::Next(Row* dst, RowPosition* rp) {
   if (!materialized_) {
-    Materialize();
+    if (Materialize() != Status::kSuccess) {
+      return false;
+    }
   }
   if (cursor_ >= output_rows_.size()) {
     return false;

@@ -28,7 +28,8 @@ Relation::Relation(Relation&& other) noexcept
       join_comparisons(other.join_comparisons),
       peak_intermediate_rows(other.peak_intermediate_rows),
       spilled_rows_(other.spilled_rows_),
-      runtime_(other.runtime_) {
+      runtime_(other.runtime_),
+      spill_error_(other.spill_error_) {
   other.charged_bytes_ = 0;
   other.hash_joins = 0;
   other.hybrid_hash_joins = 0;
@@ -56,6 +57,7 @@ Relation& Relation::operator=(Relation&& other) noexcept {
     join_comparisons = other.join_comparisons;
     peak_intermediate_rows = other.peak_intermediate_rows;
     spilled_rows_ = other.spilled_rows_;
+    spill_error_ = other.spill_error_;
     runtime_ = other.runtime_;
     other.hash_joins = 0;
     other.hybrid_hash_joins = 0;
@@ -83,15 +85,16 @@ void Relation::EnsureSpill() {
   }
   NoteRelationSpill(runtime_);
   spill = std::make_shared<SpillFile>();
-  try {
-    for (const Row& row : rows) {
-      spill->Append(row);
-    }
-    spill->FinishWriting();
-  } catch (const std::exception& e) {
-    // Spill failed (e.g. disk quota exceeded).  Keep the rows in memory
+  for (const Row& row : rows) {
+    // Spill failure (e.g. disk quota exceeded) keeps the rows in memory
     // rather than crashing; the soft memory budget may be exceeded but the
     // query can still produce a result.
+    if (spill->Append(row) != Status::kSuccess) {
+      spill.reset();
+      return;
+    }
+  }
+  if (spill->FinishWriting() != Status::kSuccess) {
     spill.reset();
     return;
   }
@@ -109,17 +112,24 @@ void Relation::AddRow(Row row) {
     }
     if (!spill_tail_) {
       // EnsureSpill failed (e.g. disk quota).  Keep rows in memory.
+      if (spill_error_ == Status::kSuccess) {
+        spill_error_ = StatusError(StatusCode::kNoSpace,
+                                   "relation spill failed; keeping rows in "
+                                   "memory");
+      }
       QueryMemoryBudget::Global().ReserveForced(bytes);
       charged_bytes_ += bytes;
       rows.push_back(std::move(row));
       peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
       return;
     }
-    try {
-      spill_tail_->Append(row);
-    } catch (const std::exception&) {
+    if (Status append = spill_tail_->Append(row); append != Status::kSuccess) {
       // Spill write failed (e.g. disk quota exceeded).  Drop the row and
-      // continue with degraded results rather than crashing.
+      // continue with degraded results rather than crashing; the sticky
+      // error lets callers with an error channel surface the truncation.
+      if (spill_error_ == Status::kSuccess) {
+        spill_error_ = append;
+      }
       spill_tail_.reset();
       ++spilled_rows_;
       return;
@@ -135,10 +145,11 @@ void Relation::AddRow(Row row) {
   peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
 }
 
-void Relation::FinishSpill() {
+Status Relation::FinishSpill() {
   if (spill_tail_) {
-    spill_tail_->FinishWriting();
+    return spill_tail_->FinishWriting();
   }
+  return Status::kSuccess;
 }
 
 void Relation::ResetContents() {
@@ -156,10 +167,20 @@ void NoteRelationSpill(ExecutionRuntime* runtime) {
   }
 }
 
-Relation MaterializeRelation(const Relation& source) {
+StatusOr<Relation> MaterializeRelation(const Relation& source) {
   Relation out(source.runtime());
   out.schema = source.schema;
-  source.ForEachRow([&](const Row& row) { out.AddRow(row); });
+  Status copied = source.ForEachRow([&](const Row& row) { out.AddRow(row); });
+  if (copied == Status::kSuccess) {
+    // A source that already degraded (dropped/kept-in-memory rows on spill
+    // failure) must not silently copy as a clean, complete relation.
+    copied = source.GetStatus();
+  }
+  if (copied != Status::kSuccess) {
+    // A truncated copy presented as complete would silently drop rows from
+    // joins/snapshots; surface the failure instead.
+    return copied;
+  }
   return out;
 }
 

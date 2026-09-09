@@ -22,11 +22,13 @@
 #define TINYLAMB_STATUS_OR_HPP
 
 #include <cassert>
+#include <cstdlib>
 #include <optional>
 #include <ostream>
-#include <stdexcept>
+#include <type_traits>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 
 #define UNLIKELY(x) __builtin_expect((x), 0)
 
@@ -83,7 +85,7 @@
     LOG(FATAL) << "Crashed: " << value##_const_tmp.GetStatus();      \
     abort();                                                         \
   }                                                                  \
-  /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                    \
+  /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                   \
   const type& value = value##_const_tmp.Value()
 
 namespace tinylamb {
@@ -94,29 +96,43 @@ class StatusOr {
  public:
   // Constructors are intentionally implicit!
   StatusOr(Status s) : status_(s), value_(std::nullopt) {}            // NOLINT
+  StatusOr(StatusCode code) : status_(code), value_(std::nullopt) {}  // NOLINT
   StatusOr(T v) : status_(Status::kSuccess), value_(std::move(v)) {}  // NOLINT
+  // Implicit conversion from anything convertible to T (e.g. string literals
+  // into StatusOr<std::string>) so `return "abc";` keeps working.
+  template <typename U>
+    requires(std::is_convertible_v<U &&, T> &&
+             !std::is_same_v<std::decay_t<U>, StatusOr<T>> &&
+             !std::is_same_v<std::decay_t<U>, T> &&
+             !std::is_same_v<std::decay_t<U>, Status> &&
+             !std::is_same_v<std::decay_t<U>, StatusCode>)
+  StatusOr(U&& v)  // NOLINT
+      : status_(Status::kSuccess), value_(std::forward<U>(v)) {}
 
   [[nodiscard]] bool HasValue() const { return status_ == Status::kSuccess; }
   // Callers must check HasValue() first: accessing the value of a failed
-  // StatusOr throws instead of dereferencing an empty optional (UB).
+  // StatusOr is a contract violation and aborts (no exceptions).
   T& Value() {
-    if (status_ != Status::kSuccess || !value_.has_value()) {
-      throw std::runtime_error("StatusOr has no value");
+    if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
+      LOG(FATAL) << "StatusOr has no value: " << status_;
+      std::abort();
     }
     return *value_;
   }
   // Moves the value out and consumes the StatusOr: a second MoveValue() (or
-  // Value()) on the same object throws.
+  // Value()) on the same object aborts.
   T&& MoveValue() {
-    if (status_ != Status::kSuccess || !value_.has_value()) {
-      throw std::runtime_error("StatusOr has no value");
+    if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
+      LOG(FATAL) << "StatusOr has no value: " << status_;
+      std::abort();
     }
     status_ = Status::kUnknown;
     return std::move(*value_);
   }
   [[nodiscard]] const T& Value() const {
-    if (status_ != Status::kSuccess || !value_.has_value()) {
-      throw std::runtime_error("StatusOr has no value");
+    if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
+      LOG(FATAL) << "StatusOr has no value: " << status_;
+      std::abort();
     }
     return *value_;
   }

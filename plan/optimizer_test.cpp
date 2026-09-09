@@ -167,7 +167,7 @@ class OptimizerTest : public ::testing::Test {
     if (rs_) {
       rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<Database>(prefix_);
+    rs_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { rs_->DeleteAll(); }
@@ -219,7 +219,7 @@ TEST_F(OptimizerTest, Simple) {
 
 TEST_F(OptimizerTest, ConstantFalseSelectionBecomesEmptyPlan) {
   QueryData query{
-      {"Sc1"}, ConstantValueExp(Value(false)), {NamedExpression("c1")}};
+      {"Sc1"}, ConstantValueExp(Value(0)), {NamedExpression("c1")}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -973,7 +973,7 @@ TEST_F(OptimizerTest, JoinChainMatchesGoldenResultUnderRuleSubsets) {
   // golden output is a deterministic sequence.
   ASSERT_GE(golden_rows.size(), 5U);
   for (size_t i = 1; i < golden_rows.size(); ++i) {
-    EXPECT_LT(golden_rows[i - 1][0], golden_rows[i][0]) << "golden not ordered";
+    EXPECT_LT(golden_rows[i - 1][0], golden_rows[i][0]) << true;
   }
 
   const std::array<std::string, 4> order_rules = {
@@ -1591,7 +1591,7 @@ TEST_F(OptimizerTest, HashJoinPreferredOverCrossProductForEquiJoin) {
 
 TEST_F(OptimizerTest, UnqualifiedJoinBecomesExplicitCrossJoin) {
   QueryData query{{"Sc1", "Sc2"},
-                  ConstantValueExp(Value(true)),
+                  ConstantValueExp(Value(1)),
                   {NamedExpression(ColumnName("Sc1", "c1")),
                    NamedExpression(ColumnName("Sc2", "d1"))}};
   TransactionContext context = rs_->BeginContext();
@@ -1904,7 +1904,7 @@ TEST_F(OptimizerTest, SortDistinctRuleAddsSortForUnorderedInput) {
 TEST_F(OptimizerTest, OptimizeWithoutFromUsesDummyScanForConstantProjection) {
   QueryData query;
   query.select_ = {NamedExpression("answer", ConstantValueExp(Value(42)))};
-  query.where_ = ConstantValueExp(Value(true));
+  query.where_ = ConstantValueExp(Value(1));
   TransactionContext context = rs_->BeginContext();
 
   const auto plan_or = Optimizer::Optimize(query, context);
@@ -1922,7 +1922,7 @@ TEST_F(OptimizerTest, OptimizeWithoutFromUsesDummyScanForConstantProjection) {
 TEST_F(OptimizerTest, OptimizeWithoutFromFalsePredicateProducesNoRows) {
   QueryData query;
   query.select_ = {NamedExpression("answer", ConstantValueExp(Value(42)))};
-  query.where_ = ConstantValueExp(Value(false));
+  query.where_ = ConstantValueExp(Value(0));
   TransactionContext context = rs_->BeginContext();
 
   const auto plan_or = Optimizer::Optimize(query, context);

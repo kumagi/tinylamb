@@ -23,7 +23,7 @@ namespace {
 class ScalarFunctionSqlTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    db_ = std::make_unique<Database>("fn_" + RandomString());
+    db_ = Database::Create("fn_" + RandomString()).MoveValue();
   }
 
   std::vector<Row> RunSql(std::string_view sql) {

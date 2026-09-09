@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exc_shim.hpp"
 #include "executor/data_chunk.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
@@ -43,7 +44,7 @@ ValueType ValueTypeFor(const Type& type) {
   }
 }
 
-BytecodeOp BinaryOpcode(ValueType type) {
+std::optional<BytecodeOp> BinaryOpcode(ValueType type) {
   switch (type) {
     case ValueType::kInt64:
       return BytecodeOp::kBinaryInt64;
@@ -55,9 +56,9 @@ BytecodeOp BinaryOpcode(ValueType type) {
       return BytecodeOp::kBinaryDate;
     case ValueType::kArray:
     case ValueType::kNull:
-      throw std::runtime_error("untyped bytecode operand");
+      return std::nullopt;
   }
-  throw std::runtime_error("untyped bytecode operand");
+  return std::nullopt;
 }
 
 bool CompileNode(  // NOLINT(misc-no-recursion)
@@ -76,8 +77,11 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       return true;
     }
     case TypeTag::kConstantValue: {
-      const uint16_t offset =
-          program->AddConstant(expression->AsConstantValue().GetValue());
+      uint16_t offset = 0;
+      if (!program->AddConstant(expression->AsConstantValue().GetValue(),
+                                &offset)) {
+        return false;
+      }
       program->AddInstruction(
           {.opcode = BytecodeOp::kLoadConstant, .operand = offset});
       return true;
@@ -142,19 +146,21 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       // type would then mismatch the Value appended per row ("column vector
       // type mismatch").  Reject the shape so callers fall back to the AST
       // evaluator, the semantic ground truth.
-      const bool arithmetic =
-          binary.Op() == BinaryOperation::kAdd ||
-          binary.Op() == BinaryOperation::kSubtract ||
-          binary.Op() == BinaryOperation::kMultiply ||
-          binary.Op() == BinaryOperation::kDivide ||
-          binary.Op() == BinaryOperation::kModulo;
+      const bool arithmetic = binary.Op() == BinaryOperation::kAdd ||
+                              binary.Op() == BinaryOperation::kSubtract ||
+                              binary.Op() == BinaryOperation::kMultiply ||
+                              binary.Op() == BinaryOperation::kDivide ||
+                              binary.Op() == BinaryOperation::kModulo;
       if (arithmetic && (left_type == ValueType::kVarChar ||
                          right_type == ValueType::kVarChar)) {
         return false;
       }
-      program->AddInstruction({.opcode = BinaryOpcode(operand_type),
-                               .operand = 0,
-                               .binary = binary.Op()});
+      const std::optional<BytecodeOp> opcode = BinaryOpcode(operand_type);
+      if (!opcode.has_value()) {
+        return false;
+      }
+      program->AddInstruction(
+          {.opcode = *opcode, .operand = 0, .binary = binary.Op()});
       return true;
     }
     case TypeTag::kUnaryExp: {
@@ -186,8 +192,15 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
 std::optional<BytecodeProgram> BytecodeCompiler::Compile(
     const Expression& expression, const Schema& schema) {
   try {
-    const Expression folded =
-        ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+    const ExpressionRewriter rewriter(
+        ContainsNotOfOrderedDoubleComparison(expression, schema)
+            ? NotComparisonFreeRules()
+            : ExpressionRuleSet::Default());
+    StatusOr<Expression> folded_or = rewriter.TryRewrite(expression);
+    if (!folded_or.HasValue()) {
+      return std::nullopt;
+    }
+    const Expression folded = folded_or.MoveValue();
     BytecodeProgram program;
     if (!CompileNode(folded, schema, &program)) {
       return std::nullopt;
@@ -205,7 +218,8 @@ std::optional<BytecodeProgram> BytecodeCompiler::Compile(
   }
 }
 
-ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
+StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
+    const DataChunk& input) const {
   ColumnVector result(result_type_, input.Size());
   std::vector<Value> stack;
   stack.reserve(instructions_.size());
@@ -251,7 +265,10 @@ ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
           assert(!stack.empty());
           Value left = std::move(stack.back());
           stack.pop_back();
-          stack.push_back(EvaluateBinary(instruction.binary, left, right));
+          ASSIGN_OR_RETURN(
+              Value, combined,
+              (TryEvaluateBinary(instruction.binary, left, right)));
+          stack.push_back(std::move(combined));
           break;
         }
         case BytecodeOp::kUnaryInt64:
@@ -259,20 +276,27 @@ ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
           assert(!stack.empty());
           Value child = std::move(stack.back());
           stack.pop_back();
-          stack.push_back(EvaluateUnary(instruction.unary, child));
+          ASSIGN_OR_RETURN(Value, result_value,
+                           (TryEvaluateUnary(instruction.unary, child)));
+          stack.push_back(std::move(result_value));
           break;
         }
       }
     }
     if (stack.size() != 1) {
-      throw std::runtime_error("invalid bytecode stack");
+      return StatusError(StatusCode::kRuntimeError, "invalid bytecode stack");
     }
     result.Append(stack.back());
   }
   return result;
 }
 
-Value BytecodeProgram::EvaluateRow(const Row& row) const {
+ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
+  return ExcShimUnwrap(TryEvaluateBatch(input),
+                       "BytecodeProgram::EvaluateBatch");
+}
+
+StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
   std::vector<Value> stack;
   stack.reserve(instructions_.size());
   for (size_t pc = 0; pc < instructions_.size(); ++pc) {
@@ -311,7 +335,9 @@ Value BytecodeProgram::EvaluateRow(const Row& row) const {
         assert(!stack.empty());
         Value left = std::move(stack.back());
         stack.pop_back();
-        stack.push_back(EvaluateBinary(instruction.binary, left, right));
+        ASSIGN_OR_RETURN(Value, combined,
+                         (TryEvaluateBinary(instruction.binary, left, right)));
+        stack.push_back(std::move(combined));
         break;
       }
       case BytecodeOp::kUnaryInt64:
@@ -319,15 +345,21 @@ Value BytecodeProgram::EvaluateRow(const Row& row) const {
         assert(!stack.empty());
         Value child = std::move(stack.back());
         stack.pop_back();
-        stack.push_back(EvaluateUnary(instruction.unary, child));
+        ASSIGN_OR_RETURN(Value, result_value,
+                         (TryEvaluateUnary(instruction.unary, child)));
+        stack.push_back(std::move(result_value));
         break;
       }
     }
   }
   if (stack.size() != 1) {
-    throw std::runtime_error("invalid bytecode stack");
+    return StatusError(StatusCode::kRuntimeError, "invalid bytecode stack");
   }
   return std::move(stack.back());
+}
+
+Value BytecodeProgram::EvaluateRow(const Row& row) const {
+  return ExcShimUnwrap(TryEvaluateRow(row), "BytecodeProgram::EvaluateRow");
 }
 
 bool BytecodeEnabled() {

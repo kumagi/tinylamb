@@ -24,6 +24,10 @@
 #include <iostream>
 #include <tuple>
 
+namespace tinylamb::detail {
+[[noreturn]] void LogFatalAbort() { std::abort(); }
+}  // namespace tinylamb::detail
+
 LogStream::~LogStream() {
   std::cerr << message_.str() << "\033[0;39;49m\n";
   if (fatal_) {

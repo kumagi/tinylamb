@@ -64,38 +64,50 @@ void* NumaArenaPartition::Allocate(size_t bytes, size_t alignment) {
     return nullptr;
   }
 
-  // Calculate aligned offset
-  auto align_up = [](size_t val, size_t align) {
-    return (val + align - 1) & ~(align - 1);
+  // First block-relative offset >= `from` whose ABSOLUTE address (base +
+  // offset) honors the alignment.  operator new[] only guarantees
+  // max_align_t for a block base, so requests above that (SIMD 32/64B)
+  // must compensate for the base's own misalignment or the returned
+  // pointer violates the contract depending on the heap state.
+  auto aligned_from = [](const uint8_t* base, size_t from, size_t align) {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(base) + from;
+    if (const auto misalign = addr % align; misalign != 0) {
+      from += align - misalign;
+    }
+    return from;
   };
 
-  size_t aligned_offset = align_up(current_offset_, alignment);
-  if (current_block_idx_ < blocks_.size() &&
-      aligned_offset + bytes <= blocks_[current_block_idx_].size) {
-    void* result = blocks_[current_block_idx_].data.get() + aligned_offset;
-    current_offset_ = aligned_offset + bytes;
-    allocated_ += bytes;
-    return result;
-  }
-
-  // Next block or allocate new large block
-  if (current_block_idx_ + 1 < blocks_.size()) {
-    ++current_block_idx_;
-    current_offset_ = 0;
-    aligned_offset = 0;
-    if (aligned_offset + bytes <= blocks_[current_block_idx_].size) {
-      void* result = blocks_[current_block_idx_].data.get();
-      current_offset_ = bytes;
+  if (current_block_idx_ < blocks_.size()) {
+    const Block& block = blocks_[current_block_idx_];
+    const auto offset =
+        aligned_from(block.data.get(), current_offset_, alignment);
+    if (offset + bytes <= block.size) {
+      void* result = block.data.get() + offset;
+      current_offset_ = offset + bytes;
       allocated_ += bytes;
       return result;
     }
   }
 
+  // Next block or allocate new large block
+  if (current_block_idx_ + 1 < blocks_.size()) {
+    ++current_block_idx_;
+    const Block& block = blocks_[current_block_idx_];
+    const auto offset = aligned_from(block.data.get(), 0, alignment);
+    if (offset + bytes <= block.size) {
+      current_offset_ = offset + bytes;
+      allocated_ += bytes;
+      return block.data.get() + offset;
+    }
+  }
+
   AddBlock(bytes + alignment);
   current_block_idx_ = blocks_.size() - 1;
-  current_offset_ = bytes;
+  const Block& block = blocks_[current_block_idx_];
+  const auto offset = aligned_from(block.data.get(), 0, alignment);
+  current_offset_ = offset + bytes;
   allocated_ += bytes;
-  return blocks_[current_block_idx_].data.get();
+  return block.data.get() + offset;
 }
 
 void NumaArenaPartition::Reset() {

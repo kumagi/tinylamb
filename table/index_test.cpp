@@ -66,7 +66,7 @@ class IndexTest : public ::testing::Test {
     if (rs_) {
       rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<Database>(prefix_);
+    rs_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { rs_->DeleteAll(); }

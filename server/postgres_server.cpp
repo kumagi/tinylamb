@@ -69,13 +69,48 @@ std::string ErrnoMessage(std::string_view operation) {
   return std::string(operation) + ": " + std::strerror(errno);
 }
 
-std::string StatusMessage(Status status) {
+std::string StatusMessage(const Status& status) {
   std::ostringstream output;
   output << status;
   return output.str();
 }
 
+// Skips whitespace and leading comments (`--`, `#`, `/* */`) so keyword
+// extraction sees the first real statement token even when a client prepends
+// a comment to a routing keyword (`-- init\nBEGIN`).
+std::string_view StripLeadingComments(std::string_view sql) {
+  size_t pos = 0;
+  for (;;) {
+    while (pos < sql.size() &&
+           std::isspace(static_cast<unsigned char>(sql[pos])) != 0) {
+      ++pos;
+    }
+    if (pos + 1 < sql.size() && sql[pos] == '-' && sql[pos + 1] == '-') {
+      while (pos < sql.size() && sql[pos] != '\n') {
+        ++pos;
+      }
+      continue;
+    }
+    if (pos < sql.size() && sql[pos] == '#') {
+      while (pos < sql.size() && sql[pos] != '\n') {
+        ++pos;
+      }
+      continue;
+    }
+    if (pos + 1 < sql.size() && sql[pos] == '/' && sql[pos + 1] == '*') {
+      pos += 2;
+      while (pos + 1 < sql.size() && (sql[pos] != '*' || sql[pos + 1] != '/')) {
+        ++pos;
+      }
+      pos = std::min(sql.size(), pos + 2);
+      continue;
+    }
+    return sql.substr(std::min(pos, sql.size()));
+  }
+}
+
 std::string UppercaseCommand(std::string_view sql) {
+  sql = StripLeadingComments(sql);
   const size_t begin = sql.find_first_not_of(" \t\r\n");
   if (begin == std::string_view::npos) {
     return {};
@@ -113,7 +148,17 @@ std::string CommandTag(StatementType type, int64_t affected_rows) {
 class PostgresServer::Impl {
  public:
   Impl(const std::string& database_path, PostgresServerOptions options)
-      : database_(database_path), options_(std::move(options)) {
+      : options_(std::move(options)) {
+    // Opening (and recovering) the database is fallible; keep the failure
+    // for Listen() instead of throwing out of the constructor.
+    StatusOr<std::unique_ptr<Database>> created =
+        Database::Create(database_path);
+    if (created.HasValue()) {
+      database_ = created.MoveValue();
+    } else {
+      startup_error_ = "failed to open database " + database_path + ": " +
+                       ToString(created.GetStatus());
+    }
     read_worker_count_ = options_.read_worker_threads;
     if (read_worker_count_ == 0) {
       read_worker_count_ =
@@ -149,6 +194,10 @@ class PostgresServer::Impl {
   bool Listen(std::string* error) {
     if (listener_fd_ >= 0) {
       return true;
+    }
+    if (database_ == nullptr) {
+      *error = startup_error_;
+      return false;
     }
 
     addrinfo hints{};
@@ -274,8 +323,17 @@ class PostgresServer::Impl {
         if (alive && clients_.contains(fd) && (flags & EPOLLOUT) != 0U) {
           alive = WriteClient(fd);
         }
-        if ((flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U) {
+        if ((flags & (EPOLLERR | EPOLLHUP)) != 0U) {
           alive = false;
+        } else if ((flags & EPOLLRDHUP) != 0U && alive &&
+                   clients_.contains(fd)) {
+          // Half-close: stop reading, but let an already-produced response
+          // (or a worker read still in flight) drain before the socket
+          // closes instead of discarding the answer.
+          const Client& client = clients_.at(fd);
+          if (client.output.empty() && !client.read_query_in_flight) {
+            alive = false;
+          }
         }
         if (!alive) {
           CloseClient(fd);
@@ -336,6 +394,7 @@ class PostgresServer::Impl {
     std::chrono::steady_clock::time_point read_started_at{};
     std::chrono::steady_clock::time_point last_activity{
         std::chrono::steady_clock::now()};
+    bool output_overflow = false;
   };
 
   struct ReadTask {
@@ -464,6 +523,7 @@ class PostgresServer::Impl {
     }
     Client& client = found->second;
     std::array<char, 8192> buffer{};
+    bool eof_seen = false;
     while (true) {
       const ssize_t size = recv(fd, buffer.data(), buffer.size(), 0);
       if (size > 0) {
@@ -473,25 +533,26 @@ class PostgresServer::Impl {
                                        ? options_.max_message_bytes + 5
                                        : kMaxPreAuthInputBytes;
         if (client.input.size() > input_limit) {
-          // Queue() throws std::runtime_error once the 64 MiB output cap is
-          // exceeded -- a pipelining client that never reads can fill the
-          // buffer to within a message of the limit.  This call sits in the
-          // recv loop, OUTSIDE the ProcessInput try below, so an escaping
-          // throw would reach Run() and std::terminate the whole server.
-          try {
-            Queue(client, pgwire::ErrorResponse(
-                              "message exceeds server limit", "54000"));
-          } catch (const std::exception&) {
-            // Output is already at the cap: skip the error response and
-            // tear the connection down anyway.
-          }
+          // Queue() latches output_overflow once the 64 MiB queued-output
+          // cap is exceeded -- a pipelining client that never reads can fill
+          // the buffer to within a message of the limit.  This call sits in
+          // the recv loop, OUTSIDE the ProcessInput try below.  The refused
+          // error response trips the overflow check after ProcessInput and
+          // the socket closes right after.
+          Queue(client,
+                pgwire::ErrorResponse("message exceeds server limit", "54000"));
           client.close_after_write = true;
           break;
         }
         continue;
       }
       if (size == 0) {
-        return false;
+        // Peer half-closed (shutdown(SHUT_WR)) or closed.  Do NOT latch
+        // close_after_write here: ProcessInput's `while (!close_after_write)`
+        // guard would then skip the message that arrived just before the
+        // EOF.  Process it first, answer it, and close afterwards.
+        eof_seen = true;
+        break;
       }
       if (errno == EINTR) {
         continue;
@@ -501,17 +562,22 @@ class PostgresServer::Impl {
       }
       return false;
     }
-    try {
-      ProcessInput(client);
-    } catch (const std::exception&) {
-      // Queue() refuses to buffer past the per-connection output cap (and
-      // unexpected internal errors surface here the same way): drop the
-      // connection instead of propagating into the event loop.
+    ProcessInput(client);
+    if (eof_seen) {
+      client.close_after_write = true;
+    }
+    if (client.output_overflow) {
+      // Queue() refuses to buffer past the per-connection output cap: drop
+      // the connection instead of propagating into the event loop.
       CloseClient(fd);
       return false;
     }
     UpdateClientInterest(client);
-    return !(client.close_after_write && client.output.empty());
+    // A half-close (close_after_write) must not close the connection while a
+    // read query is still running on a worker: its completion queues the
+    // response, which WriteClient() then flushes before closing.
+    return client.read_query_in_flight || !client.close_after_write ||
+           !client.output.empty();
   }
 
   bool WriteClient(int fd) {
@@ -539,6 +605,9 @@ class PostgresServer::Impl {
     }
     if (client.output_offset == client.output.size()) {
       client.output.clear();
+      // release the (up to 64 MiB) capacity: an idle connection would
+      // otherwise pin its high-water output buffer until close.
+      client.output.shrink_to_fit();
       client.output_offset = 0;
       if (client.close_after_write) {
         return false;
@@ -570,8 +639,9 @@ class PostgresServer::Impl {
     if (client.output.size() + message.size() > kMaxQueuedOutputBytes) {
       // Backpressure: refuse further buffering for a client that does not
       // drain its results.  The connection is torn down by the caller seeing
-      // the failure instead of letting output grow without bound.
-      throw std::runtime_error("client output buffer limit exceeded");
+      // the flag instead of letting output grow without bound.
+      client.output_overflow = true;
+      return;
     }
     client.output += message;
   }
@@ -590,12 +660,12 @@ class PostgresServer::Impl {
       if (client.input.size() < 5) {
         return;
       }
-      uint32_t length = 0;
-      try {
-        length = pgwire::ReadUint32(client.input, 1);
-      } catch (const std::exception&) {
+      const StatusOr<uint32_t> length_field =
+          pgwire::ReadUint32(client.input, 1);
+      if (!length_field.HasValue()) {
         return;
       }
+      const uint32_t length = length_field.Value();
       if (length < 4 || length > options_.max_message_bytes) {
         Queue(client, pgwire::ErrorResponse("invalid frontend message length",
                                             "08P01"));
@@ -609,6 +679,11 @@ class PostgresServer::Impl {
       const char type = client.input[0];
       const std::string payload = client.input.substr(5, length - 4);
       client.input.erase(0, total);
+      // The input cap is max_message_bytes + 5 (16 MiB); give the capacity
+      // back once the backlog drains so an idle connection does not pin it.
+      if (client.input.empty()) {
+        client.input.shrink_to_fit();
+      }
       if (type == 'X') {
         client.close_after_write = true;
         return;
@@ -641,12 +716,11 @@ class PostgresServer::Impl {
     if (client.input.size() < 4) {
       return false;
     }
-    uint32_t length = 0;
-    try {
-      length = pgwire::ReadUint32(client.input, 0);
-    } catch (const std::exception&) {
+    const StatusOr<uint32_t> length_field = pgwire::ReadUint32(client.input, 0);
+    if (!length_field.HasValue()) {
       return false;
     }
+    const uint32_t length = length_field.Value();
     if (length < 8 || length > kMaxPreAuthInputBytes) {
       Queue(client, pgwire::ErrorResponse("invalid startup packet", "08P01"));
       client.close_after_write = true;
@@ -657,7 +731,13 @@ class PostgresServer::Impl {
     }
     const std::string packet = client.input.substr(0, length);
     client.input.erase(0, length);
-    const uint32_t code = pgwire::ReadUint32(packet, 4);
+    const StatusOr<uint32_t> code_field = pgwire::ReadUint32(packet, 4);
+    if (!code_field.HasValue()) {
+      Queue(client, pgwire::ErrorResponse("invalid startup packet", "08P01"));
+      client.close_after_write = true;
+      return false;
+    }
+    const uint32_t code = code_field.Value();
     if (code == pgwire::kSslRequestCode || code == pgwire::kGssEncRequestCode) {
       Queue(client, "N");
       return true;
@@ -738,7 +818,8 @@ class PostgresServer::Impl {
     std::unique_ptr<TransactionContext> implicit;
     if (!ContainsTransactionControl(statements) &&
         client.transaction == nullptr && client.transaction_status != 'E') {
-      implicit = std::make_unique<TransactionContext>(database_.BeginContext());
+      implicit =
+          std::make_unique<TransactionContext>(database_->BeginContext());
     }
     bool ok = true;
     for (const std::string& statement : statements) {
@@ -794,7 +875,7 @@ class PostgresServer::Impl {
       }
       if (!client.transaction) {
         client.transaction =
-            std::make_unique<TransactionContext>(database_.BeginContext());
+            std::make_unique<TransactionContext>(database_->BeginContext());
       }
       client.transaction_status = 'T';
       Queue(client, pgwire::CommandComplete("BEGIN"));
@@ -849,13 +930,13 @@ class PostgresServer::Impl {
         context = implicit.get();
       } else {
         automatic =
-            std::make_unique<TransactionContext>(database_.BeginContext());
+            std::make_unique<TransactionContext>(database_->BeginContext());
         context = automatic.get();
       }
     }
 
     try {
-      SqlEngine engine(database_);
+      SqlEngine engine(*database_);
       StatusOr<QueryResult> executed = engine.Execute(*context, sql);
       if (!executed.HasValue()) {
         const std::string error = engine.LastError().empty()
@@ -872,7 +953,13 @@ class PostgresServer::Impl {
       }
       const StatementType type = *result.Statement();
       if (type == StatementType::kSelect) {
-        Queue(client, StreamSelectResult(result));
+        StatusOr<std::string> wire = StreamSelectResult(result);
+        if (!wire.HasValue()) {
+          FailStatement(client, automatic, implicit,
+                        wire.GetStatus().GetMessage(), "XX000");
+          return false;
+        }
+        Queue(client, wire.MoveValue());
       } else {
         Queue(client,
               pgwire::CommandComplete(CommandTag(type, result.AffectedRows())));
@@ -914,14 +1001,19 @@ class PostgresServer::Impl {
     return columns;
   }
 
-  static std::string StreamSelectResult(QueryResult& query_result) {
+  static StatusOr<std::string> StreamSelectResult(QueryResult& query_result) {
     const std::vector<std::string>& names = query_result.ColumnNames();
     std::string result;
     size_t row_count = 0;
     bool header_sent = false;
+    bool row_limit_exceeded = false;
     query_result.ForEach([&](const Row& row) {
+      if (row_limit_exceeded) {
+        return;
+      }
       if (++row_count > kMaxServerResultRows) {
-        throw std::runtime_error("result row limit exceeded");
+        row_limit_exceeded = true;
+        return;
       }
       if (!header_sent) {
         result += pgwire::RowDescription(
@@ -930,38 +1022,17 @@ class PostgresServer::Impl {
       }
       result += pgwire::DataRow(row);
     });
+    if (row_limit_exceeded) {
+      return Status(Status::kTooBigData, "result row limit exceeded");
+    }
+    if (const Status st = query_result.GetStatus(); st != Status::kSuccess) {
+      return st;
+    }
     if (!header_sent) {
       result += pgwire::RowDescription(
           BuildColumnDescriptions(names, Row(), names.size()));
     }
     result += pgwire::CommandComplete("SELECT " + std::to_string(row_count));
-    return result;
-  }
-
-  static std::string EncodeSelectResult(const std::vector<std::string>& names,
-                                        const std::vector<Row>& rows) {
-    std::string result;
-    size_t column_count = names.size();
-    if (!rows.empty()) {
-      column_count = rows.front().values_.size();
-    }
-    std::vector<pgwire::ColumnDescription> columns(column_count);
-    for (size_t i = 0; i < column_count; ++i) {
-      columns[i].name =
-          i < names.size() && !names[i].empty() ? names[i] : "?column?";
-      columns[i].type = ValueType::kVarChar;
-      for (const Row& row : rows) {
-        if (i < row.values_.size() && !row[i].IsNull()) {
-          columns[i].type = row[i].type;
-          break;
-        }
-      }
-    }
-    result += pgwire::RowDescription(columns);
-    for (const Row& row : rows) {
-      result += pgwire::DataRow(row);
-    }
-    result += pgwire::CommandComplete("SELECT " + std::to_string(rows.size()));
     return result;
   }
 
@@ -976,16 +1047,19 @@ class PostgresServer::Impl {
   }
 
   // True for the statement spellings whose frontend visit mutates the
-  // thread-local TEMP-view/UDF registries (CREATE [OR REPLACE] VIEW,
-  // CREATE [OR REPLACE] FUNCTION, CREATE TABLE FUNCTION).
+  // thread-local TEMP-view/UDF/constant registries (CREATE [OR REPLACE]
+  // [TEMP] VIEW, CREATE [OR REPLACE] [TEMP] [AGGREGATE] FUNCTION,
+  // CREATE [OR REPLACE] [TEMP] TABLE FUNCTION, CREATE [OR REPLACE]
+  // [TEMP] CONSTANT).  Missing a spelling here offloads a later all-SELECT
+  // message to a worker whose thread-local registries never saw the object.
   static bool RegistersTempObject(std::string_view sql) {
     std::vector<std::string> words;
+    sql = StripLeadingComments(sql);
     size_t pos = sql.find_first_not_of(" \t\r\n");
-    while (pos != std::string_view::npos && words.size() < 4) {
+    while (pos != std::string_view::npos && words.size() < 6) {
       const size_t end = sql.find_first_of(" \t\r\n", pos);
-      std::string word(sql.substr(pos, end == std::string_view::npos
-                                          ? sql.size() - pos
-                                          : end - pos));
+      std::string word(sql.substr(
+          pos, end == std::string_view::npos ? sql.size() - pos : end - pos));
       for (char& c : word) {
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
       }
@@ -1002,10 +1076,20 @@ class PostgresServer::Impl {
       }
       ++index;
     }
+    // "CREATE TEMP VIEW" / "CREATE TEMPORARY AGGREGATE FUNCTION ..." land in
+    // the same thread-local tables; skip the location modifiers.
+    while (index < words.size() &&
+           (words[index] == "TEMP" || words[index] == "TEMPORARY")) {
+      ++index;
+    }
+    if (index < words.size() && words[index] == "AGGREGATE") {
+      ++index;
+    }
     if (index >= words.size()) {
       return false;
     }
-    if (words[index] == "VIEW" || words[index] == "FUNCTION") {
+    if (words[index] == "VIEW" || words[index] == "FUNCTION" ||
+        words[index] == "CONSTANT") {
       return true;
     }
     return words[index] == "TABLE" && index + 1 < words.size() &&
@@ -1104,11 +1188,11 @@ class PostgresServer::Impl {
     // One snapshot for the whole message so multi-statement reads observe a
     // consistent database image.
     std::unique_ptr<TransactionContext> context =
-        std::make_unique<TransactionContext>(database_.BeginReadOnlyContext());
+        std::make_unique<TransactionContext>(database_->BeginReadOnlyContext());
     bool ok = true;
     for (const std::string& statement : statements) {
       try {
-        SqlEngine engine(database_);
+        SqlEngine engine(*database_);
         StatusOr<QueryResult> executed = engine.Execute(*context, statement);
         if (!executed.HasValue()) {
           const std::string error = engine.LastError().empty()
@@ -1126,7 +1210,14 @@ class PostgresServer::Impl {
           ok = false;
           break;
         }
-        response += StreamSelectResult(result);
+        StatusOr<std::string> wire = StreamSelectResult(result);
+        if (!wire.HasValue()) {
+          response +=
+              pgwire::ErrorResponse(wire.GetStatus().GetMessage(), "XX000");
+          ok = false;
+          break;
+        }
+        response += wire.MoveValue();
       } catch (const std::exception& exception) {
         response += pgwire::ErrorResponse(exception.what(), "XX000");
         ok = false;
@@ -1162,16 +1253,17 @@ class PostgresServer::Impl {
       }
       Client& client = found->second;
       client.read_query_in_flight = false;
-      // Queue throws when the output cap is hit; in the epoll loop nothing
-      // would catch it, so a single overflowing worker response would
-      // terminate the whole server.  Drop the offending client instead.
-      try {
-        Queue(client, completion.response);
-        ProcessInput(client);
-        UpdateClientInterest(client);
-      } catch (const std::exception&) {
+      Queue(client, completion.response);
+      if (client.output_overflow) {
+        // Queue() latched output_overflow: the response exceeds the queued
+        // output cap and was dropped.  Close the connection so the client
+        // does not idle until the timeout waiting for an answer that will
+        // never arrive (the epoll-path ReadClient does the same).
         CloseClient(completion.client_fd);
+        continue;
       }
+      ProcessInput(client);
+      UpdateClientInterest(client);
     }
   }
 
@@ -1216,7 +1308,8 @@ class PostgresServer::Impl {
 
   // Member order minimizes padding (see clang-analyzer-optin.performance.
   // Padding): small scalars are grouped ahead of the larger containers.
-  Database database_;
+  std::unique_ptr<Database> database_;
+  std::string startup_error_;
   uint64_t next_client_id_{1};
   size_t read_worker_count_{1};
   std::atomic<size_t> active_read_queries_{0};

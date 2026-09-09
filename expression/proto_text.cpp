@@ -1042,8 +1042,8 @@ Value NormalizeEnumToken(const std::vector<std::string>& members,
 
 }  // namespace
 
-bool ProtoTextExtractField(std::string_view text, std::string_view key,
-                           Value* out) {
+StatusOr<bool> TryProtoTextExtractField(std::string_view text,
+                                        std::string_view key, Value* out) {
   std::string_view body = text;
   while (!body.empty() && IsSpaceChar(body.front())) {
     body.remove_prefix(1);
@@ -1065,8 +1065,9 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
     const std::string bare(key.substr(4));
     const std::string lower_bare = ToLowerCopy(bare);
     if (lower_bare.find("repeated") != std::string::npos) {
-      throw std::runtime_error("Field " + bare + " is repeated, so has_" +
-                               bare + " is not allowed");
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Field " + bare + " is repeated, so has_" + bare + " is not allowed");
     }
     *out = Value((ProtoTextHasField(text, bare) ? int64_t{1} : 0));
     return true;
@@ -1105,8 +1106,9 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
     if (!extension_key) {
       const std::string inferred = InferProtoTypeName(text, {std::string(key)});
       if (!inferred.empty() && RequiredProtoField(inferred, std::string(key))) {
-        throw std::runtime_error("Protocol buffer missing required field " +
-                                 inferred + "." + std::string(key));
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Protocol buffer missing required field " +
+                               inferred + "." + std::string(key));
       }
     }
     // Schema-level defaults take precedence over per-type defaults.
@@ -1270,6 +1272,41 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
   return true;
 }
 
+// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+bool ProtoTextExtractField(std::string_view text, std::string_view key,
+                           Value* out) {
+  return ExcShimUnwrap(TryProtoTextExtractField(text, key, out),
+                       "ProtoTextExtractField");
+}
+
+bool TryProtoTextGetField(std::string_view text, std::string_view key,
+                          Value* out) {
+  return ExcShimUnwrap(TryReadProtoTextField(text, key, out),
+                       "TryProtoTextGetField");
+}
+
+std::optional<std::string> ProtoTextSetField(
+    std::string_view text, const std::vector<std::string>& path,
+    const Value& new_value, const std::string& type_name) {
+  return ExcShimUnwrap(TryProtoTextSetField(text, path, new_value, type_name),
+                       "ProtoTextSetField");
+}
+
+std::string ConstructProtoText(
+    const std::string& type_name,
+    const std::vector<std::pair<std::string, Value>>& fields) {
+  return ExcShimUnwrap(TryConstructProtoText(type_name, fields),
+                       "ConstructProtoText");
+}
+
+void ValidateEnumFieldValue(const std::string& type_name,
+                            const std::string& field_name, const Value& value) {
+  const Status status = TryValidateEnumFieldValue(type_name, field_name, value);
+  if (status != Status::kSuccess) {
+    detail::ExcShimThrow("ValidateEnumFieldValue", status);
+  }
+}
+
 bool ProtoTextHasField(std::string_view text, std::string_view key) {
   std::string_view body = text;
   while (!body.empty() && IsSpaceChar(body.front())) {
@@ -1294,10 +1331,9 @@ namespace {
 
 // Rewrites the entries of one message body in place per the final path
 // segment semantics; helper for ProtoTextSetField.
-std::optional<std::string> SetFieldInBody(std::string_view body,
-                                          const std::vector<std::string>& path,
-                                          size_t depth, const Value& new_value,
-                                          const std::string& type_name);
+StatusOr<std::optional<std::string>> SetFieldInBody(
+    std::string_view body, const std::vector<std::string>& path, size_t depth,
+    const Value& new_value, const std::string& type_name);
 
 std::string RenderEntry(const ProtoTextEntry& entry) {
   if (entry.is_message) {
@@ -1306,14 +1342,12 @@ std::string RenderEntry(const ProtoTextEntry& entry) {
   return entry.name + ": " + entry.text;
 }
 
-std::optional<std::string> SetFieldInBody(const std::string_view body,
-                                          const std::vector<std::string>& path,
-                                          const size_t depth,
-                                          const Value& new_value,
-                                          const std::string& type_name) {
+StatusOr<std::optional<std::string>> SetFieldInBody(
+    const std::string_view body, const std::vector<std::string>& path,
+    const size_t depth, const Value& new_value, const std::string& type_name) {
   std::vector<ProtoTextEntry> entries;
   if (!ParseProtoTextEntries(body, &entries) && !entries.empty()) {
-    return std::nullopt;
+    return std::optional<std::string>{};
   }
   const std::string& target = path[depth];
   const bool final_segment = depth + 1 == path.size();
@@ -1322,8 +1356,9 @@ std::optional<std::string> SetFieldInBody(const std::string_view body,
     // Clearing: drop every matching entry (required-field violations throw).
     if (new_value.IsNull()) {
       if (RequiredProtoField(type_name, target)) {
-        throw std::runtime_error("Cannot clear required proto field " +
-                                 type_name + "." + target);
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "Cannot clear required proto field " + type_name + "." + target);
       }
       std::string out;
       for (const ProtoTextEntry& entry : entries) {
@@ -1335,7 +1370,7 @@ std::optional<std::string> SetFieldInBody(const std::string_view body,
         }
         out += RenderEntry(entry);
       }
-      return out;
+      return std::optional<std::string>(std::move(out));
     }
     // Setting: convert the value per field-name FORMAT annotations, then
     // replace the first matching entry in place (or append at the end).
@@ -1352,7 +1387,7 @@ std::optional<std::string> SetFieldInBody(const std::string_view body,
           message += type_name;
           message.push_back('.');
           message += target;
-          throw std::runtime_error(message);
+          return StatusError(StatusCode::kInvalidArgument, message);
         }
         if (element.type == ValueType::kVarChar &&
             LooksLikeProtoText(RawTextOfValue(element))) {
@@ -1407,7 +1442,7 @@ std::optional<std::string> SetFieldInBody(const std::string_view body,
         out += RenderEntry(rep);
       }
     }
-    return out;
+    return std::optional<std::string>(std::move(out));
   }
 
   // Intermediate segment: descend into matching message entries.
@@ -1416,38 +1451,38 @@ std::optional<std::string> SetFieldInBody(const std::string_view body,
     if (!NameEquals(entry.name, target) || !entry.is_message) {
       continue;
     }
-    auto nested =
-        SetFieldInBody(entry.text, path, depth + 1, new_value, type_name);
+    ASSIGN_OR_RETURN(
+        std::optional<std::string>, nested,
+        SetFieldInBody(entry.text, path, depth + 1, new_value, type_name));
     if (nested.has_value()) {
       entry.text = *nested;
-      return [&] {
-        std::string out;
-        for (const ProtoTextEntry& e : rewritten) {
-          if (!out.empty()) {
-            out.push_back(' ');
-          }
-          out += RenderEntry(e);
+      std::string merged;
+      for (const ProtoTextEntry& e : rewritten) {
+        if (!merged.empty()) {
+          merged.push_back(' ');
         }
-        return out;
-      }();
+        merged += RenderEntry(e);
+      }
+      return std::optional<std::string>(std::move(merged));
     }
   }
   // GoogleSQL refuses to assign through a missing intermediate submessage
   // (it reads as NULL); creating it implicitly is not allowed.
   if (!target.empty()) {
-    throw std::runtime_error("Cannot set field of NULL `" + type_name + "." +
-                             target + "`");
+    return StatusError(
+        StatusCode::kInvalidArgument,
+        "Cannot set field of NULL `" + type_name + "." + target + "`");
   }
-  return std::nullopt;
+  return std::optional<std::string>{};
 }
 
 }  // namespace
 
-std::optional<std::string> ProtoTextSetField(
+StatusOr<std::optional<std::string>> TryProtoTextSetField(
     const std::string_view text, const std::vector<std::string>& path,
     const Value& new_value, const std::string& type_name) {
   if (path.empty()) {
-    return std::nullopt;
+    return std::optional<std::string>{};
   }
   std::string_view body = text;
   while (!body.empty() && IsSpaceChar(body.front())) {
@@ -1479,14 +1514,16 @@ bool RequiredProtoField(const std::string& type_name,
          it->second.end();
 }
 
-void ValidateEnumFieldValue(const std::string& type_name,
-                            const std::string& field_name, const Value& value) {
+Status TryValidateEnumFieldValue(const std::string& type_name,
+                                 const std::string& field_name,
+                                 const Value& value) {
   const std::string key =
       ToLowerCopy(type_name) + "/" + ToLowerCopy(field_name);
   const auto& known = KnownEnumFields();
   const auto it = known.find(key);
   if (it == known.end()) {
-    return;  // no metadata for this (type, field): accept as-is
+    return Status::kSuccess;  // no metadata for this (type, field): accept
+                              // as-is
   }
   // Proto3 enums accept numeric values verbatim (unknown members are
   // preserved); proto2 requires known member names.
@@ -1494,29 +1531,33 @@ void ValidateEnumFieldValue(const std::string& type_name,
       ToLowerCopy(type_name).find("proto3") != std::string::npos;
   if (value.type == ValueType::kInt64 || value.type == ValueType::kDouble) {
     if (proto3) {
-      return;
+      return Status::kSuccess;
     }
-    throw std::runtime_error(
+    return StatusError(
+        StatusCode::kInvalidArgument,
         "Could not store value with type INT64 into proto field " + type_name +
-        "." + field_name + " which has an SQL enum type");
+            "." + field_name + " which has an SQL enum type");
   }
   if (value.type != ValueType::kVarChar) {
-    return;
+    return Status::kSuccess;
   }
   const Value member_value = DecodeScalarToken(RawTextOfValue(value));
   if (member_value.IsNull()) {
-    return;  // null enum members cannot appear in TEXT payloads
+    return Status::kSuccess;  // null enum members cannot appear in TEXT
+                              // payloads
   }
   const std::string member = RawTextOfValue(member_value);
   if (std::find(it->second.begin(), it->second.end(), member) ==
       it->second.end()) {
-    throw std::runtime_error("Out of range cast of string '" + member +
-                             "' to enum type of field " + type_name + "." +
-                             field_name);
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Out of range cast of string '" + member +
+                           "' to enum type of field " + type_name + "." +
+                           field_name);
   }
+  return Status::kSuccess;
 }
 
-std::string ConstructProtoText(
+StatusOr<std::string> TryConstructProtoText(
     const std::string& type_name,
     const std::vector<std::pair<std::string, Value>>& fields) {
   std::string out;
@@ -1545,11 +1586,11 @@ std::string ConstructProtoText(
         message += type_name;
         message.push_back('.');
         message += field_name;
-        throw std::runtime_error(message);
+        return StatusError(StatusCode::kInvalidArgument, message);
       }
       continue;
     }
-    ValidateEnumFieldValue(type_name, field_name, raw_value);
+    RETURN_IF_FAIL(TryValidateEnumFieldValue(type_name, field_name, raw_value));
     std::optional<Value> converted =
         ApplyWriteConversion(ClassifyFieldFormat(field_name), raw_value);
     Value value = converted.has_value() ? *converted : raw_value;
@@ -1588,9 +1629,10 @@ std::string ConstructProtoText(
           message += type_name;
           message.push_back('.');
           message += field_name;
-          throw std::runtime_error(message);
+          return StatusError(StatusCode::kInvalidArgument, message);
         }
-        ValidateEnumFieldValue(type_name, field_name, element);
+        RETURN_IF_FAIL(
+            TryValidateEnumFieldValue(type_name, field_name, element));
         const std::string text = RawTextOfValue(element);
         if (element.type == ValueType::kVarChar && LooksLikeProtoText(text)) {
           append_entry(field_name, NormalizeProtoText(text).value_or(text),
@@ -1633,7 +1675,7 @@ std::string ConstructProtoText(
         message += " because required field ";
         message += required;
         message += " is missing";
-        throw std::runtime_error(message);
+        return StatusError(StatusCode::kInvalidArgument, message);
       }
     }
   }
@@ -1879,14 +1921,14 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
   return out;
 }
 
-bool TryProtoTextGetField(std::string_view text, std::string_view key,
-                          Value* out) {
+StatusOr<bool> TryReadProtoTextField(std::string_view text,
+                                     std::string_view key, Value* out) {
   // An empty payload behaves as an empty message: absent-field defaults
   // apply (scalar zeros, has_ bits, empty repeated arrays).
   if (!text.empty() && !LooksLikeProtoText(text)) {
     return false;
   }
-  return ProtoTextExtractField(text, key, out);
+  return TryProtoTextExtractField(text, key, out);
 }
 
 std::optional<int64_t> ParseTimestampTextNanos(std::string_view text) {

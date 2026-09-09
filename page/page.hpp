@@ -49,10 +49,10 @@ class Page {
   void SetRecLSN(lsn_t lsn) { recovery_lsn = std::min(lsn, recovery_lsn); }
 
   // Meta page manipulations.
-  PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
-                          PageType new_page_type);
+  StatusOr<PageRef> AllocateNewPage(Transaction& txn, PagePool& pool,
+                                    PageType new_page_type);
 
-  void DestroyPage(Transaction& txn, Page* target);
+  Status DestroyPage(Transaction& txn, Page* target);
 
   size_t RowCount(Transaction& txn) const;
 
@@ -118,12 +118,12 @@ class Page {
   StatusOr<page_id_t> GetPageForKey(Transaction& txn, std::string_view key,
                                     bool less_than) const;
 
-  void SetLowestValue(Transaction& txn, page_id_t v);
+  Status SetLowestValue(Transaction& txn, page_id_t v);
 
   void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                  std::string* middle);
 
-  void PageTypeChange(Transaction& txn, PageType new_type);
+  Status PageTypeChange(Transaction& txn, PageType new_type);
 
   // Internal methods exposed for recovery.
   void InsertImpl(slot_t slot, std::string_view redo);
@@ -159,7 +159,7 @@ class Page {
   // Version-1 disk codec. The in-memory Page remains a directly addressable
   // object, while its fixed header is emitted/accepted in big-endian order.
   void EncodeDisk(char* destination) const;
-  void DecodeDisk(const char* source);
+  Status DecodeDisk(const char* source);
 
   void* operator new(size_t /*byte size, always kPageSize*/);
 

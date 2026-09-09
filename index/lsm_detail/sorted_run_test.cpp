@@ -47,13 +47,16 @@ class SortedRunEntryTest : public ::testing::Test {
 
 TEST_F(SortedRunEntryTest, Generate) {
   // Arrange -- create a BlobFile and three entries (short, middle, long key)
-  auto l = std::make_unique<BlobFile>(filepath_);
-  SortedRun::Entry short_entry = SortedRun::Entry("abc", LSMValue("val"), *l);
+  auto l = BlobFile::Create(filepath_).MoveValue();
+  SortedRun::Entry short_entry =
+      SortedRun::Entry::Create("abc", LSMValue("val"), *l).MoveValue();
   SortedRun::Entry middle_entry =
-      SortedRun::Entry("abcdefhijk", LSMValue("foobar"), *l);
+      SortedRun::Entry::Create("abcdefhijk", LSMValue("foobar"), *l)
+          .MoveValue();
   std::string long_key(200, 'a');
   SortedRun::Entry long_entry =
-      SortedRun::Entry(long_key, LSMValue("long value"), *l);
+      SortedRun::Entry::Create(long_key, LSMValue("long value"), *l)
+          .MoveValue();
 
   // Act -- wait for 6 writes to land, then destroy the writer
   while (l->Written() < 6) {
@@ -63,22 +66,29 @@ TEST_F(SortedRunEntryTest, Generate) {
 
   // Assert -- read back the three entries via a fresh BlobFile and verify
   // key/value
-  BlobFile blob(filepath_);
-  ASSERT_EQ(short_entry.BuildKey(blob), "abc");
-  ASSERT_EQ(short_entry.BuildValue(blob), "val");
-  ASSERT_EQ(middle_entry.BuildKey(blob), "abcdefhijk");
-  ASSERT_EQ(middle_entry.BuildValue(blob), "foobar");
-  ASSERT_EQ(long_entry.BuildKey(blob), long_key);
-  ASSERT_EQ(long_entry.BuildValue(blob), "long value");
+  auto blob_holder = BlobFile::Create(filepath_).MoveValue();
+  CHECK(blob_holder != nullptr);
+  BlobFile& blob = *blob_holder;
+  ASSERT_EQ(short_entry.BuildKey(blob).Value(), "abc");
+  ASSERT_EQ(short_entry.BuildValue(blob).Value(), "val");
+  ASSERT_EQ(middle_entry.BuildKey(blob).Value(), "abcdefhijk");
+  ASSERT_EQ(middle_entry.BuildValue(blob).Value(), "foobar");
+  ASSERT_EQ(long_entry.BuildKey(blob).Value(), long_key);
+  ASSERT_EQ(long_entry.BuildValue(blob).Value(), "long value");
 }
 
 TEST_F(SortedRunEntryTest, Compare) {
   // Arrange -- create a BlobFile and three entries (short, middle, long key)
-  auto l = std::make_unique<BlobFile>(filepath_);
-  SortedRun::Entry short_entry("abc", LSMValue("val"), *l);
-  SortedRun::Entry middle_entry("abcdefhijk", LSMValue("foobar"), *l);
+  auto l = BlobFile::Create(filepath_).MoveValue();
+  SortedRun::Entry short_entry =
+      SortedRun::Entry::Create("abc", LSMValue("val"), *l).MoveValue();
+  SortedRun::Entry middle_entry =
+      SortedRun::Entry::Create("abcdefhijk", LSMValue("foobar"), *l)
+          .MoveValue();
   std::string long_key("abcdefghijklmnopqrstuvwxyz");
-  SortedRun::Entry long_entry(long_key, LSMValue("long value"), *l);
+  SortedRun::Entry long_entry =
+      SortedRun::Entry::Create(long_key, LSMValue("long value"), *l)
+          .MoveValue();
 
   // Act -- wait for 6 writes to land, then destroy the writer
   while (l->Written() < 6) {
@@ -87,22 +97,24 @@ TEST_F(SortedRunEntryTest, Compare) {
   l.reset();
 
   // Assert -- comparisons against external keys yield expected ordering
-  BlobFile blob(filepath_);
-  ASSERT_LT(short_entry.Compare("abb", blob), 0);
-  ASSERT_EQ(short_entry.Compare("abc", blob), 0);
-  ASSERT_GT(short_entry.Compare("abd", blob), 0);
-  ASSERT_LT(middle_entry.Compare("abcdefhijj", blob), 0);
-  ASSERT_EQ(middle_entry.Compare("abcdefhijk", blob), 0);
-  ASSERT_GT(middle_entry.Compare("abcdefhijkl", blob), 0);
+  auto blob_holder = BlobFile::Create(filepath_).MoveValue();
+  CHECK(blob_holder != nullptr);
+  BlobFile& blob = *blob_holder;
+  ASSERT_LT(short_entry.Compare("abb", blob).Value(), 0);
+  ASSERT_EQ(short_entry.Compare("abc", blob).Value(), 0);
+  ASSERT_GT(short_entry.Compare("abd", blob).Value(), 0);
+  ASSERT_LT(middle_entry.Compare("abcdefhijj", blob).Value(), 0);
+  ASSERT_EQ(middle_entry.Compare("abcdefhijk", blob).Value(), 0);
+  ASSERT_GT(middle_entry.Compare("abcdefhijkl", blob).Value(), 0);
 
   std::string long_smaller_key(long_key);
   long_smaller_key[long_smaller_key.size() - 1]--;
-  ASSERT_EQ(long_entry.Compare(long_smaller_key, blob), -1);
-  ASSERT_EQ(long_entry.Compare(long_key, blob), 0);
+  ASSERT_EQ(long_entry.Compare(long_smaller_key, blob).Value(), -1);
+  ASSERT_EQ(long_entry.Compare(long_key, blob).Value(), 0);
 
   std::string long_bigger_key(long_key);
   long_bigger_key[long_smaller_key.size() - 1]++;
-  ASSERT_EQ(long_entry.Compare(long_bigger_key, blob), 1);
+  ASSERT_EQ(long_entry.Compare(long_bigger_key, blob).Value(), 1);
 }
 
 TEST_F(SortedRunEntryTest, MoreCompare) {
@@ -117,16 +129,21 @@ TEST_F(SortedRunEntryTest, MoreCompare) {
       keys[11][11] = 1;
   std::vector<std::string> candidates;
   std::vector<SortedRun::Entry> entries;
-  BlobFile blob(filepath_);
+  auto blob_holder = BlobFile::Create(filepath_).MoveValue();
+  CHECK(blob_holder != nullptr);
+  BlobFile& blob = *blob_holder;
 
   // Act -- for each key, create an entry; also create entries for key+ext pairs
   {
     for (const auto& key : keys) {
       candidates.push_back(key);
-      entries.emplace_back(key, LSMValue(""), blob);
+      entries.push_back(
+          SortedRun::Entry::Create(key, LSMValue(""), blob).MoveValue());
       for (const auto& ext : keys) {
         candidates.push_back(key + ext);
-        entries.emplace_back(key + ext, LSMValue(""), blob);
+        entries.push_back(
+            SortedRun::Entry::Create(key + ext, LSMValue(""), blob)
+                .MoveValue());
       }
     }
   }
@@ -136,14 +153,14 @@ TEST_F(SortedRunEntryTest, MoreCompare) {
   for (size_t i = 0; i < candidates.size(); ++i) {
     for (size_t j = 0; j < candidates.size(); ++j) {
       if (candidates[i] < candidates[j]) {
-        ASSERT_GT(entries[i].Compare(candidates[j], blob), 0);
-        ASSERT_GT(entries[i].Compare(entries[j], blob), 0);
+        ASSERT_GT(entries[i].Compare(candidates[j], blob).Value(), 0);
+        ASSERT_GT(entries[i].Compare(entries[j], blob).Value(), 0);
       } else if (candidates[i] > candidates[j]) {
-        ASSERT_LT(entries[i].Compare(candidates[j], blob), 0);
-        ASSERT_LT(entries[i].Compare(entries[j], blob), 0);
+        ASSERT_LT(entries[i].Compare(candidates[j], blob).Value(), 0);
+        ASSERT_LT(entries[i].Compare(entries[j], blob).Value(), 0);
       } else {
-        ASSERT_EQ(entries[i].Compare(candidates[j], blob), 0);
-        ASSERT_EQ(entries[i].Compare(entries[j], blob), 0);
+        ASSERT_EQ(entries[i].Compare(candidates[j], blob).Value(), 0);
+        ASSERT_EQ(entries[i].Compare(entries[j], blob).Value(), 0);
       }
     }
   }
@@ -159,9 +176,10 @@ class SortedRunTest : public ::testing::Test {
     }
     data_file_ = "sorted_run_build-test-" + RandomString() + ".db";
     index_file_ = "sorted_run_build-test-index-" + RandomString() + ".idx";
-    blob_ = std::make_unique<BlobFile>(data_file_);
+    blob_ = BlobFile::Create(data_file_).MoveValue();
     SortedRun::Construct(index_file_, input, *blob_, 1);
-    sr_ = std::make_unique<SortedRun>(index_file_);
+    sr_ = std::make_unique<SortedRun>(
+        SortedRun::Restore(index_file_).MoveValue());
   }
 
   void TearDown() override {
@@ -219,10 +237,10 @@ TEST_F(SortedRunTest, FindOnEmptyRunIsNotExists) {
       "sorted_run_empty-test-" + RandomString() + ".db";
   std::filesystem::path index_file =
       "sorted_run_empty-test-index-" + RandomString() + ".idx";
-  auto blob = std::make_unique<BlobFile>(data_file);
+  auto blob = BlobFile::Create(data_file).MoveValue();
   const std::map<std::string, LSMValue> empty;
   SortedRun::Construct(index_file, empty, *blob, 1);
-  const SortedRun run(index_file);
+  const SortedRun run = SortedRun::Restore(index_file).MoveValue();
   ASSERT_EQ(run.Find("", *blob).GetStatus(), Status::kNotExists);
   ASSERT_EQ(run.Find("any key", *blob).GetStatus(), Status::kNotExists);
   std::ignore = std::filesystem::remove(data_file);
@@ -241,12 +259,12 @@ TEST_F(SortedRunTest, FindValueEqualToDeletedMarkerIsNotTombstone) {
       "sorted_run_ff-test-" + RandomString() + ".db";
   std::filesystem::path index_file =
       "sorted_run_ff-test-index-" + RandomString() + ".idx";
-  auto blob = std::make_unique<BlobFile>(data_file);
+  auto blob = BlobFile::Create(data_file).MoveValue();
   const std::string value(8, '\xff');
   std::map<std::string, LSMValue> input;
   input.emplace("key", LSMValue(value));
   SortedRun::Construct(index_file, input, *blob, 1);
-  const SortedRun run(index_file);
+  const SortedRun run = SortedRun::Restore(index_file).MoveValue();
   ASSERT_SUCCESS_AND_EQ(run.Find("key", *blob), value);
   std::ignore = std::filesystem::remove(data_file);
   std::ignore = std::filesystem::remove(index_file);
@@ -265,12 +283,12 @@ TEST_F(SortedRunTest, FindDistinguishesKeysSharingTheFirstFourBytes) {
       "sorted_run_inline-test-" + RandomString() + ".db";
   std::filesystem::path index_file =
       "sorted_run_inline-test-index-" + RandomString() + ".idx";
-  auto blob = std::make_unique<BlobFile>(data_file);
+  auto blob = BlobFile::Create(data_file).MoveValue();
   std::map<std::string, LSMValue> input;
   input.emplace(key_a, LSMValue(std::string("\x00\x00", 2)));
   input.emplace(key_b, LSMValue::Delete());
   SortedRun::Construct(index_file, input, *blob, 1);
-  const SortedRun run(index_file);
+  const SortedRun run = SortedRun::Restore(index_file).MoveValue();
   ASSERT_SUCCESS_AND_EQ(run.Find(key_a, *blob), std::string("\x00\x00", 2));
   std::ignore = std::filesystem::remove(data_file);
   std::ignore = std::filesystem::remove(index_file);
@@ -285,7 +303,7 @@ TEST_F(SortedRunTest, InlineValueRoundTripsThroughFind) {
       "sorted_run_inlineval-test-" + RandomString() + ".db";
   std::filesystem::path index_file =
       "sorted_run_inlineval-test-index-" + RandomString() + ".idx";
-  auto blob = std::make_unique<BlobFile>(data_file);
+  auto blob = BlobFile::Create(data_file).MoveValue();
   std::map<std::string, LSMValue> input;
   for (int len = 1; len <= 8; ++len) {
     input.emplace("k" + std::to_string(len),
@@ -293,7 +311,7 @@ TEST_F(SortedRunTest, InlineValueRoundTripsThroughFind) {
                                        static_cast<char>('a' + len - 1))));
   }
   SortedRun::Construct(index_file, input, *blob, 1);
-  const SortedRun run(index_file);
+  const SortedRun run = SortedRun::Restore(index_file).MoveValue();
   for (int len = 1; len <= 8; ++len) {
     const std::string expected(static_cast<size_t>(len),
                                static_cast<char>('a' + len - 1));
@@ -319,10 +337,11 @@ TEST_F(SortedRunTest, Delete) {
     }
     data_file = "sorted_run_build-test-" + RandomString() + ".db";
     index_file = "sorted_run_build-test-index-" + RandomString() + ".idx";
-    auto l = std::make_unique<BlobFile>(data_file);
-    blob_ = std::make_unique<BlobFile>(data_file);
+    auto l = BlobFile::Create(data_file).MoveValue();
+    blob_ = BlobFile::Create(data_file).MoveValue();
     SortedRun::Construct(index_file, input, *blob_, 1);
-    sr_ = std::make_unique<SortedRun>(index_file);
+    sr_ =
+        std::make_unique<SortedRun>(SortedRun::Restore(index_file).MoveValue());
   }
 
   // Act -- find all 1000 keys in the run
@@ -371,17 +390,18 @@ TEST_F(SortedRunTest, DeleteScan) {
     }
     data_file = "sorted_run_build-test-" + RandomString() + ".db";
     index_file = "sorted_run_build-test-index-" + RandomString() + ".idx";
-    auto l = std::make_unique<BlobFile>(data_file);
-    blob_ = std::make_unique<BlobFile>(data_file);
+    auto l = BlobFile::Create(data_file).MoveValue();
+    blob_ = BlobFile::Create(data_file).MoveValue();
     SortedRun::Construct(index_file, input, *blob_, 1);
-    sr_ = std::make_unique<SortedRun>(index_file);
+    sr_ =
+        std::make_unique<SortedRun>(SortedRun::Restore(index_file).MoveValue());
   }
 
   // Act -- walk the iterator; for non-deleted entries, verify key%3==1
   SortedRun::Iterator it = sr_->Begin(*blob_);
   while (it.IsValid()) {
-    if (!it.IsDeleted()) {
-      ASSERT_EQ(std::stoi(it.Key()) % 3, 1);
+    if (!it.IsDeleted().Value()) {
+      ASSERT_EQ(std::stoi(it.Key().Value()) % 3, 1);
     }
     ++it;
   }
@@ -408,7 +428,7 @@ TEST_F(SortedRunTest, IteratorStreamOperator) {
   // Arrange -- an iterator pointing at a live (non-deleted) entry
   SortedRun::Iterator it = sr_->Begin(*blob_);
   ASSERT_TRUE(it.IsValid());
-  ASSERT_FALSE(it.IsDeleted());
+  ASSERT_FALSE(it.IsDeleted().Value());
 
   // Act -- stream the iterator
   std::stringstream ss;
@@ -417,7 +437,7 @@ TEST_F(SortedRunTest, IteratorStreamOperator) {
   // Assert -- the dump contains the key and the value
   std::string dumped = ss.str();
   EXPECT_NE(dumped.find("=>"), std::string::npos);
-  EXPECT_NE(dumped.find(it.Key()), std::string::npos);
+  EXPECT_NE(dumped.find(it.Key().Value()), std::string::npos);
 }
 TEST_F(SortedRunTest, SortedRunStreamOperator) {
   // Arrange -- the fixture SortedRun holds 1000 entries
@@ -434,12 +454,20 @@ TEST_F(SortedRunTest, SortedRunStreamOperator) {
 TEST_F(SortedRunTest, EntryStreamOperatorVariants) {
   // Arrange -- entries with short/inline, long/indirect, deleted, and large
   // value payloads
-  SortedRun::Entry short_key("abc", LSMValue("val"), *blob_);
-  SortedRun::Entry long_key(std::string(20, 'a'), LSMValue("long value"),
-                            *blob_);
-  SortedRun::Entry deleted("del", LSMValue::Delete(), *blob_);
-  SortedRun::Entry inline_value("k2", LSMValue(std::string(3, 'x')), *blob_);
-  SortedRun::Entry long_value("k3", LSMValue(std::string(100, 'y')), *blob_);
+  SortedRun::Entry short_key =
+      SortedRun::Entry::Create("abc", LSMValue("val"), *blob_).MoveValue();
+  SortedRun::Entry long_key =
+      SortedRun::Entry::Create(std::string(20, 'a'), LSMValue("long value"),
+                               *blob_)
+          .MoveValue();
+  SortedRun::Entry deleted =
+      SortedRun::Entry::Create("del", LSMValue::Delete(), *blob_).MoveValue();
+  SortedRun::Entry inline_value =
+      SortedRun::Entry::Create("k2", LSMValue(std::string(3, 'x')), *blob_)
+          .MoveValue();
+  SortedRun::Entry long_value =
+      SortedRun::Entry::Create("k3", LSMValue(std::string(100, 'y')), *blob_)
+          .MoveValue();
 
   // Act -- stream every entry
   std::stringstream ss;

@@ -23,7 +23,7 @@ TEST(PlanMemoOracle, SeededIterationsPreserveMemoEquivalence) {
     std::mt19937 rng(seed);
     const GeneratedJoinGraph graph = GenerateJoinGraph(rng);
     EXPECT_TRUE(CheckExploreEquivalence(graph).empty())
-        << "seed=" << seed << "\n"
+        << true << (seed != 0u) << true
         << CheckExploreEquivalence(graph);
     ++ran;
   }

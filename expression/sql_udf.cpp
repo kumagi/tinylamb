@@ -55,21 +55,27 @@ std::optional<SqlScalarFunction> FindSqlScalarFunction(
   return found->second;
 }
 
-SqlUdfBinding BindSqlUdfArguments(const SqlScalarFunction& function,
-                                  std::vector<Value> arguments) {
+StatusOr<SqlUdfBinding> BindSqlUdfArguments(const SqlScalarFunction& function,
+                                            std::vector<Value> arguments) {
   const size_t required = function.RequiredArgs();
   if (arguments.size() < required ||
       arguments.size() > function.params.size()) {
-    throw std::runtime_error("function " + function.name + " expects between " +
-                             std::to_string(required) + " and " +
-                             std::to_string(function.params.size()) +
-                             " arguments but got " +
-                             std::to_string(arguments.size()));
+    return StatusError(StatusCode::kInvalidArgument,
+                       "function " + function.name + " expects between " +
+                           std::to_string(required) + " and " +
+                           std::to_string(function.params.size()) +
+                           " arguments but got " +
+                           std::to_string(arguments.size()));
   }
   while (arguments.size() < function.defaults.size()) {
     const Expression& default_value = function.defaults[arguments.size()];
-    arguments.push_back(default_value ? default_value->Evaluate(Row(), Schema())
-                                      : Value());
+    if (default_value) {
+      ASSIGN_OR_RETURN(Value, evaluated,
+                       default_value->TryEvaluate(Row(), Schema()));
+      arguments.push_back(std::move(evaluated));
+    } else {
+      arguments.emplace_back();
+    }
   }
   std::vector<Column> columns;
   columns.reserve(function.params.size());
@@ -82,12 +88,15 @@ SqlUdfBinding BindSqlUdfArguments(const SqlScalarFunction& function,
                        .schema = Schema("", std::move(columns))};
 }
 
-SqlUdfDepthGuard::SqlUdfDepthGuard() {
+SqlUdfDepthGuard::SqlUdfDepthGuard() { ++tls_udf_depth; }
+
+Status SqlUdfDepthGuard::CheckAvailable() {
   if (tls_udf_depth >= kMaxUdfInvocationDepth) {
-    throw std::runtime_error("SQL UDF invocation depth exceeds " +
-                             std::to_string(kMaxUdfInvocationDepth));
+    return StatusError(StatusCode::kInvalidArgument,
+                       "SQL UDF invocation depth exceeds " +
+                           std::to_string(kMaxUdfInvocationDepth));
   }
-  ++tls_udf_depth;
+  return Status::kSuccess;
 }
 
 SqlUdfDepthGuard::~SqlUdfDepthGuard() { --tls_udf_depth; }

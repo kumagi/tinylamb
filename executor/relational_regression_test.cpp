@@ -79,7 +79,7 @@ class RelationalRegressionTest : public ::testing::Test {
  protected:
   void SetUp() override {
     prefix_ = "relational_regression-" + RandomString();
-    rs_ = std::make_unique<Database>(prefix_);
+    rs_ = Database::Create(prefix_).MoveValue();
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(
         Table, agg,

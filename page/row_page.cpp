@@ -97,7 +97,7 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
   }
   txn.RegisterVersionWrite(RowPosition(page_id, inserted.Value()), std::nullopt,
                            record);
-  txn.InsertLog(page_id, inserted.Value(), record);
+  RETURN_IF_FAIL(txn.InsertLog(page_id, inserted.Value(), record).GetStatus());
   return inserted.Value();
 }
 
@@ -184,7 +184,7 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
   // not leave a log record describing an update that never reached the page.
   RETURN_IF_FAIL(UpdateRow(pos.slot, record));
   txn.RegisterVersionWrite(pos, prev_row, record);
-  txn.UpdateLog(page_id, slot, record, prev_row);
+  RETURN_IF_FAIL(txn.UpdateLog(page_id, slot, record, prev_row).GetStatus());
   return Status::kSuccess;
 }
 
@@ -243,7 +243,7 @@ Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
     return Status::kConflicts;
   }
   txn.RegisterVersionWrite(pos, previous, std::nullopt);
-  txn.DeleteLog(page_id, slot, previous);
+  RETURN_IF_FAIL(txn.DeleteLog(page_id, slot, previous).GetStatus());
   DeleteRow(slot);
   return Status::kSuccess;
 }

@@ -19,9 +19,12 @@
 
 #include <cstring>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "common/exc_shim.hpp"
+#include "common/status_or.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -39,18 +42,44 @@ struct Row {
 
   Value& operator[](size_t i);
   const Value& operator[](size_t i) const;
+  // Serialize assumes the row image fits the on-disk widths; callers taking
+  // user-supplied rows must check CheckSerializable() first (VARCHAR values
+  // are length-prefixed with 16 bits and the column count carries a flag
+  // bit).
+  [[nodiscard]] Status CheckSerializable() const;
   size_t Serialize(char* dst) const;
-  size_t Deserialize(const char* src, const Schema& sc);
+  [[nodiscard]] StatusOr<size_t> TryDeserialize(const char* src,
+                                                const Schema& sc);
+  [[nodiscard]] StatusOr<size_t> TryDeserializeProjected(
+      const char* src, const Schema& sc, const std::vector<slot_t>& columns);
+  // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+  size_t Deserialize(const char* src, const Schema& sc) {
+    return ExcShimUnwrap(TryDeserialize(src, sc), "Row::Deserialize");
+  }
   size_t DeserializeProjected(const char* src, const Schema& sc,
-                              const std::vector<slot_t>& columns);
+                              const std::vector<slot_t>& columns) {
+    return ExcShimUnwrap(TryDeserializeProjected(src, sc, columns),
+                         "Row::DeserializeProjected");
+  }
   // Read a single INT64/DATE column without materializing other values.
   [[nodiscard]] static std::optional<int64_t> TryPeekInteger(const char* src,
                                                              const Schema& sc,
                                                              slot_t column);
   [[nodiscard]] size_t Size() const;
   [[nodiscard]] std::string ToString() const;
-  [[nodiscard]] std::string EncodeMemcomparableFormat() const;
-  void DecodeMemcomparableFormat(std::string_view src);
+  [[nodiscard]] StatusOr<std::string> TryEncodeMemcomparableFormat() const;
+  [[nodiscard]] Status TryDecodeMemcomparableFormat(std::string_view src);
+  // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+  [[nodiscard]] std::string EncodeMemcomparableFormat() const {
+    return ExcShimUnwrap(TryEncodeMemcomparableFormat(),
+                         "Row::EncodeMemcomparableFormat");
+  }
+  void DecodeMemcomparableFormat(std::string_view src) {
+    const Status status = TryDecodeMemcomparableFormat(src);
+    if (status != Status::kSuccess) {
+      detail::ExcShimThrow("Row::DecodeMemcomparableFormat", status);
+    }
+  }
   void Clear() { values_.clear(); }
   [[nodiscard]] bool IsValid() const { return !values_.empty(); }
   [[nodiscard]] Row Extract(const std::vector<slot_t>& elms) const;

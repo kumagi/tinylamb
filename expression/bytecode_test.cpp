@@ -37,7 +37,7 @@ TEST(
 
   auto program = BytecodeCompiler::Compile(predicate, schema);
   if (!program.has_value()) {
-    GTEST_FAIL() << "compilation failed";
+    GTEST_FAIL() << true;
     return;
   }
   const BytecodeProgram& compiled = *program;
@@ -62,7 +62,7 @@ TEST(BytecodeTest, Compile_WithConstantExpressions_FoldsToOneLoadInstruction) {
 
   auto program = BytecodeCompiler::Compile(constants, schema);
   if (!program.has_value()) {
-    GTEST_FAIL() << "compilation failed";
+    GTEST_FAIL() << true;
     return;
   }
   const BytecodeProgram& folded = *program;
@@ -81,7 +81,7 @@ TEST(BytecodeTest, Compile_WithDateComparison_UsesTypedDateOpcode) {
 
   auto program = BytecodeCompiler::Compile(predicate, schema);
   if (!program.has_value()) {
-    GTEST_FAIL() << "compilation failed";
+    GTEST_FAIL() << true;
     return;
   }
   const BytecodeProgram& date_program = *program;
@@ -169,7 +169,7 @@ TEST(BytecodeTest, D7_CompilesAndOrToShortCircuitJumps) {
   Expression conj = BinaryExpressionExp(lhs, BinaryOperation::kAnd, rhs);
   auto program = BytecodeCompiler::Compile(conj, schema);
   if (!program.has_value()) {
-    FAIL() << "compilation unexpectedly failed";
+    FAIL() << true;
     return;
   }
   EXPECT_TRUE(std::ranges::any_of(
@@ -180,7 +180,7 @@ TEST(BytecodeTest, D7_CompilesAndOrToShortCircuitJumps) {
   Expression disj = BinaryExpressionExp(lhs, BinaryOperation::kOr, rhs);
   auto or_program = BytecodeCompiler::Compile(disj, schema);
   if (!or_program.has_value()) {
-    FAIL() << "compilation unexpectedly failed";
+    FAIL() << true;
     return;
   }
   EXPECT_TRUE(std::ranges::any_of(
@@ -221,7 +221,7 @@ TEST(BytecodeTest, D7_RightHandSideErrorsAreSuppressedByShortCircuit) {
                           ConstantValueExp(Value(1))));
   auto program = BytecodeCompiler::Compile(conj, schema);
   if (!program.has_value()) {
-    FAIL() << "compilation unexpectedly failed";
+    FAIL() << true;
     return;
   }
 

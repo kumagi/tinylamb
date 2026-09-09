@@ -77,7 +77,8 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   // EvaluateBinary (e.g. UINT64_MAX, stored as bit pattern -1, is NOT < 0).
   if ((value.type == ValueType::kInt64 || value.type == ValueType::kDate) &&
       (value.IsUnsigned() || pred.constant.IsUnsigned())) {
-    return Binary(pred.op, value, pred.constant).Truthy();
+    StatusOr<Value> cmp = TryBinary(pred.op, value, pred.constant);
+    return cmp.HasValue() && cmp.Value().Truthy();
   }
 
   // The scan fast path must use the same coercions as the full expression
@@ -111,7 +112,8 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   }
   if (value.type == ValueType::kVarChar &&
       pred.constant.type == ValueType::kVarChar) {
-    return Binary(pred.op, value, pred.constant).Truthy();
+    StatusOr<Value> cmp = TryBinary(pred.op, value, pred.constant);
+    return cmp.HasValue() && cmp.Value().Truthy();
   }
 
   if (pred.int_payload &&
@@ -267,8 +269,19 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
   if (!predicate || predicate->Type() != TypeTag::kBinaryExp) {
     return std::nullopt;
   }
-  Expression folded =
-      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(predicate);
+  // The type-blind rewrite may turn NOT(x < y) into NaN-unsound x >= y (see
+  // BytecodeCompiler::Compile); a pre-filter built from that would silently
+  // drop rows, so use the same suppression when doubles can reach a negated
+  // ordered comparison.
+  const ExpressionRewriter rewriter(
+      ContainsNotOfOrderedDoubleComparison(predicate, schema)
+          ? NotComparisonFreeRules()
+          : ExpressionRuleSet::Default());
+  StatusOr<Expression> folded_or = rewriter.TryRewrite(predicate);
+  if (!folded_or.HasValue()) {
+    return std::nullopt;
+  }
+  Expression folded = folded_or.MoveValue();
   if (!folded || folded->Type() != TypeTag::kBinaryExp) {
     return std::nullopt;
   }
@@ -452,7 +465,9 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
       if (branch_ok && !branch.residual.empty()) {
         Scope scope{.row = match_row, .schema = &schema, .outer = outer};
         for (const Expression& predicate : branch.residual) {
-          if (!Truthy(Evaluate(predicate, scope, nullptr, context, ctes))) {
+          StatusOr<Value> res =
+              TryEvaluate(predicate, scope, nullptr, context, ctes);
+          if (!res.HasValue() || !Truthy(res.Value())) {
             branch_ok = false;
             break;
           }
@@ -474,12 +489,19 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
   // traversal and virtual dispatch, which is the dominant cost for complex
   // residual predicates like TPC-H Q20's 3-way OR filter.
   if (filter.residual_bytecode) {
-    const Value result = filter.residual_bytecode->EvaluateRow(*match_row);
-    return !result.IsNull() && result.Truthy();
+    StatusOr<Value> result =
+        filter.residual_bytecode->TryEvaluateRow(*match_row);
+    if (!result.HasValue()) {
+      // Row filters cannot surface a Status; treat the failure as
+      // non-matching, consistent with the converted AST residual path below.
+      return false;
+    }
+    return !result.Value().IsNull() && result.Value().Truthy();
   }
   Scope scope{.row = match_row, .schema = &schema, .outer = outer};
   for (const Expression& predicate : filter.residual) {
-    if (!Truthy(Evaluate(predicate, scope, nullptr, context, ctes))) {
+    StatusOr<Value> res = TryEvaluate(predicate, scope, nullptr, context, ctes);
+    if (!res.HasValue() || !Truthy(res.Value())) {
       return false;
     }
   }
@@ -931,19 +953,23 @@ Relation UnnestValueToRelation(const SelectSource& source,
   return result;
 }
 
-Relation LoadSource(TransactionContext& context, const SelectSource& source,
-                    const Scope* outer, const CteMap& ctes,
-                    const std::vector<slot_t>* projection,
-                    const std::vector<Expression>* scan_predicates,
-                    const std::unordered_set<int64_t>* int_key_filter,
-                    std::optional<slot_t> int_key_column) {
+StatusOr<Relation> LoadSource(TransactionContext& context,
+                              const SelectSource& source, const Scope* outer,
+                              const CteMap& ctes,
+                              const std::vector<slot_t>* projection,
+                              const std::vector<Expression>* scan_predicates,
+                              const std::unordered_set<int64_t>* int_key_filter,
+                              std::optional<slot_t> int_key_column) {
   Relation result(context.execution_runtime());
   if (source.unnest) {
-    const Value array_val =
-        Evaluate(source.unnest, Scope{.outer = outer}, nullptr, context, ctes);
+    ASSIGN_OR_RETURN(Value, array_val,
+                     (TryEvaluate(source.unnest, Scope{.outer = outer}, nullptr,
+                                  context, ctes)));
     result = UnnestValueToRelation(source, array_val);
   } else if (source.query) {
-    result = ExecuteQuery(context, *source.query, outer, ctes);
+    ASSIGN_OR_RETURN(Relation, sub,
+                     (ExecuteQuery(context, *source.query, outer, ctes)));
+    result = std::move(sub);
   } else if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
     const Relation& cte_relation = *cte->second;
     result.schema = cte_relation.schema;
@@ -1032,7 +1058,8 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
               return ContainsQuery(predicate);
             });
         if (needs_snapshot) {
-          Relation snapshot = MaterializeRelation(cached_relation);
+          ASSIGN_OR_RETURN(Relation, snapshot,
+                           MaterializeRelation(cached_relation));
           snapshot.FinishSpill();
           emit_filtered(snapshot);
         } else {
@@ -1044,7 +1071,8 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
     } else {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
       if (!table.HasValue()) {
-        throw std::runtime_error("table " + source.table + " not found");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "table " + source.table + " not found");
       }
       const Schema& table_schema = table.Value()->GetSchema();
       result.schema = projection != nullptr

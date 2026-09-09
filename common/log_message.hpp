@@ -36,6 +36,30 @@
     }                                         \
   } while (0)
 
+// Google-style assertion for invariant violations (programmer errors):
+// logs FATAL and aborts instead of throwing. DB logic propagates runtime
+// errors as Status/StatusOr; only "this branch must be unreachable" and
+// "the caller violated a precondition" belong here.
+#define CHECK(condition)                            \
+  do {                                              \
+    if (!(condition)) {                             \
+      LOG(FATAL) << "CHECK failed: " << #condition; \
+      ::tinylamb::detail::LogFatalAbort();          \
+    }                                               \
+  } while (0)
+
+#define CHECK_MSG(condition, message)              \
+  do {                                             \
+    if (!(condition)) {                            \
+      LOG(FATAL) << "CHECK failed: " << (message); \
+      ::tinylamb::detail::LogFatalAbort();         \
+    }                                              \
+  } while (0)
+
+namespace tinylamb::detail {
+[[noreturn]] void LogFatalAbort();
+}  // namespace tinylamb::detail
+
 #ifndef ERROR_CODES_DEFINE
 #define ERROR_CODES_DEFINE
 

@@ -21,7 +21,9 @@
 #include <memory>
 #include <vector>
 
+#include "common/exc_shim.hpp"
 #include "common/serdes.hpp"
+#include "common/status_or.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -104,7 +106,11 @@ class Value {
   explicit Value(int64_t int_val);
   explicit Value(std::string&& str_val);
   explicit Value(double double_value);
-  [[nodiscard]] static Value Date(std::string_view date);
+  [[nodiscard]] static StatusOr<Value> TryDate(std::string_view date);
+  // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
+  [[nodiscard]] static Value Date(std::string_view date) {
+    return ExcShimUnwrap(TryDate(date), "Value::Date");
+  }
   [[nodiscard]] static Value DateFromDays(int64_t days);
   [[nodiscard]] static Value Array(std::vector<Value> elements,
                                    std::string element_sql_type);
@@ -128,23 +134,57 @@ class Value {
   [[nodiscard]] bool Truthy() const;
 
   [[nodiscard]] size_t Size() const;
+  // True when this value's image fits the on-disk widths (VARCHAR length is
+  // prefixed with bin_size_t).  Row::CheckSerializable applies it per column.
+  [[nodiscard]] Status CheckSerializable() const;
 
-  // Read/Write without type info.
+  // Read/Write without type info.  Serialize assumes a value whose payload
+  // fits the on-disk width (see Row::CheckSerializable); the typed
+  // read/skip paths report corrupt or mistyped streams as Status.
   size_t Serialize(char* dst) const;
-  size_t Deserialize(const char* src, ValueType as_type);
+  [[nodiscard]] StatusOr<size_t> TryDeserialize(const char* src,
+                                                ValueType as_type);
+  // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
+  size_t Deserialize(const char* src, ValueType as_type) {
+    return ExcShimUnwrap(TryDeserialize(src, as_type), "Value::Deserialize");
+  }
   // Advance past a serialized value without constructing it (projection skip).
+  [[nodiscard]] static StatusOr<size_t> TrySkipSerialized(const char* src,
+                                                          ValueType as_type);
+  // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
   [[nodiscard]] static size_t SkipSerialized(const char* src,
-                                             ValueType as_type);
+                                             ValueType as_type) {
+    return ExcShimUnwrap(TrySkipSerialized(src, as_type),
+                         "Value::SkipSerialized");
+  }
 
-  [[nodiscard]] std::string EncodeMemcomparableFormat() const;
+  [[nodiscard]] StatusOr<std::string> TryEncodeMemcomparableFormat() const;
+  // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
+  [[nodiscard]] std::string EncodeMemcomparableFormat() const {
+    return ExcShimUnwrap(TryEncodeMemcomparableFormat(),
+                         "Value::EncodeMemcomparableFormat");
+  }
   // Decodes one self-delimiting chunk from the (possibly NUL-containing)
-  // buffer and returns the number of bytes consumed.  Throws on truncation.
-  size_t DecodeMemcomparableFormat(std::string_view src);
+  // buffer and returns the number of bytes consumed.  Errors on truncation.
+  [[nodiscard]] StatusOr<size_t> TryDecodeMemcomparableFormat(
+      std::string_view src);
+  // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
+  size_t DecodeMemcomparableFormat(std::string_view src) {
+    return ExcShimUnwrap(TryDecodeMemcomparableFormat(src),
+                         "Value::DecodeMemcomparableFormat");
+  }
 
   bool operator==(const Value& rhs) const;
   bool operator!=(const Value& rhs) const { return !operator==(rhs); }
-  bool operator<(const Value& rhs) const;
-  bool operator>(const Value& rhs) const;
+  [[nodiscard]] StatusOr<bool> TryLess(const Value& rhs) const;
+  [[nodiscard]] StatusOr<bool> TryGreater(const Value& rhs) const;
+  // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+  bool operator<(const Value& rhs) const {
+    return ExcShimUnwrap(TryLess(rhs), "Value::operator<");
+  }
+  bool operator>(const Value& rhs) const {
+    return ExcShimUnwrap(TryGreater(rhs), "Value::operator>");
+  }
   // Derived from < and == (not from negating >) so that NaN, which compares
   // false against everything in both < and >, stays consistent: the old
   // `!(a > b)` form made `NaN <= x` true while `NaN < x` and `NaN == x` were
@@ -156,15 +196,45 @@ class Value {
     return operator>(rhs) || operator==(rhs);
   }
 
-  Value operator+(const Value& rhs) const;
-  Value operator-(const Value& rhs) const;
-  Value operator*(const Value& rhs) const;
-  Value operator/(const Value& rhs) const;
-  Value operator%(const Value& rhs) const;
+  // Arithmetic and bitwise evaluation with SQL semantics: type mismatches,
+  // integer overflow and division by zero surface as Status instead of
+  // exceptions.
+  [[nodiscard]] StatusOr<Value> TryArithmetic(const Value& rhs,
+                                              BinaryOperation op) const;
 
-  Value operator&(const Value& rhs) const;
-  Value operator|(const Value& rhs) const;
-  Value operator^(const Value& rhs) const;
+  // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+  Value operator+(const Value& rhs) const {
+    return ExcShimUnwrap(TryArithmetic(rhs, BinaryOperation::kAdd),
+                         "Value::operator+");
+  }
+  Value operator-(const Value& rhs) const {
+    return ExcShimUnwrap(TryArithmetic(rhs, BinaryOperation::kSubtract),
+                         "Value::operator-");
+  }
+  Value operator*(const Value& rhs) const {
+    return ExcShimUnwrap(TryArithmetic(rhs, BinaryOperation::kMultiply),
+                         "Value::operator*");
+  }
+  Value operator/(const Value& rhs) const {
+    return ExcShimUnwrap(TryArithmetic(rhs, BinaryOperation::kDivide),
+                         "Value::operator/");
+  }
+  Value operator%(const Value& rhs) const {
+    return ExcShimUnwrap(TryArithmetic(rhs, BinaryOperation::kModulo),
+                         "Value::operator%");
+  }
+  Value operator&(const Value& rhs) const {
+    return ExcShimUnwrap(TryArithmetic(rhs, BinaryOperation::kAnd),
+                         "Value::operator&");
+  }
+  Value operator|(const Value& rhs) const {
+    return ExcShimUnwrap(TryArithmetic(rhs, BinaryOperation::kOr),
+                         "Value::operator|");
+  }
+  Value operator^(const Value& rhs) const {
+    return ExcShimUnwrap(TryArithmetic(rhs, BinaryOperation::kXor),
+                         "Value::operator^");
+  }
 
   [[nodiscard]] std::string AsString() const;
   friend std::ostream& operator<<(std::ostream& o, const Value& v);

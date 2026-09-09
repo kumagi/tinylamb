@@ -17,6 +17,8 @@ class TransactionContext;
 // The catalog capability required by a transaction/query. Keeping this
 // separate from Database prevents executor state from acquiring DDL, crash,
 // filesystem, and lifecycle operations through TransactionContext.
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions): interface with
+// an implicit copy/move-free lifecycle; no resources are held here.
 class CatalogReader {
  public:
   virtual ~CatalogReader() = default;

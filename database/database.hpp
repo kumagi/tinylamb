@@ -47,30 +47,35 @@ class Function;
 
 class Database final : public CatalogReader {
  public:
-  explicit Database(std::string_view dbname, size_t wal_sync_ms = 1);
+  // Opens (creating when needed) the database files and initializes the
+  // system relations. Startup failures surface as Status.
+  static StatusOr<std::unique_ptr<Database>> Create(std::string_view dbname,
+                                                    size_t wal_sync_ms = 1);
+  Database(const Database&) = delete;
+  Database& operator=(const Database&) = delete;
 
   // Transaction Begin() { return storage_.Begin(); }
-  TransactionContext BeginContext() { return {storage_.Begin(), this}; }
+  TransactionContext BeginContext() { return {storage_->Begin(), this}; }
   TransactionContext BeginReadOnlyContext() {
-    return {storage_.BeginReadOnly(), this};
+    return {storage_->BeginReadOnly(), this};
   }
   void SetSynchronousCommit(bool enabled) {
-    storage_.tm_.SetSynchronousCommit(enabled);
+    storage_->tm_->SetSynchronousCommit(enabled);
   }
   void SetTransactionMetricsEnabled(bool enabled) {
-    storage_.tm_.SetMetricsEnabled(enabled);
+    storage_->tm_->SetMetricsEnabled(enabled);
   }
   // Deadlock policy for write-intent acquisition. See
   // TransactionManager::DeadlockPolicy for the trade-offs.
   using DeadlockPolicy = TransactionManager::DeadlockPolicy;
   void SetDeadlockPolicy(DeadlockPolicy policy) {
-    storage_.tm_.SetDeadlockPolicy(policy);
+    storage_->tm_->SetDeadlockPolicy(policy);
   }
   [[nodiscard]] DeadlockPolicy GetDeadlockPolicy() const {
-    return storage_.tm_.GetDeadlockPolicy();
+    return storage_->tm_->GetDeadlockPolicy();
   }
   [[nodiscard]] TransactionRuntimeStats TransactionStats() const {
-    return storage_.tm_.RuntimeStats();
+    return storage_->tm_->RuntimeStats();
   }
 
   StatusOr<Table> CreateTable(TransactionContext& ctx, const Schema& schema);
@@ -153,7 +158,9 @@ class Database final : public CatalogReader {
   // the destroyed predecessor's tables.
   std::atomic<uint64_t> schema_epoch_{next_database_epoch_base()};
 
-  PageStorage storage_;
+  std::unique_ptr<PageStorage> storage_;
+
+  Database(std::string_view dbname, std::unique_ptr<PageStorage> storage);
 };
 
 }  // namespace tinylamb

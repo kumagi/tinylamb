@@ -17,9 +17,9 @@
 #ifndef TINYLAMB_PAGE_POOL_HPP
 #define TINYLAMB_PAGE_POOL_HPP
 
+#include <array>
 #include <atomic>
 #include <cassert>
-#include <array>
 #include <functional>
 #include <list>
 #include <memory>
@@ -31,6 +31,7 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "page/page.hpp"
 
 namespace tinylamb {
@@ -41,9 +42,15 @@ class RecoveryManager;
 
 class PagePool {
  private:
+  // Non-copyable: the pool is referenced by raw pointers pool-wide.
+  PagePool(const PagePool&) = delete;
+  PagePool& operator=(const PagePool&) = delete;
+  PagePool(PagePool&&) = delete;
+  PagePool& operator=(PagePool&&) = delete;
   struct Entry {
     explicit Entry(Page* p)
         : pin_count(1), page(p), page_latch(new std::shared_mutex()) {}
+    ~Entry() = default;
 
     // If pinned, this page will never been evicted.
     std::atomic<uint32_t> pin_count{0};
@@ -75,16 +82,20 @@ class PagePool {
   }
 
  public:
-  PagePool(std::string_view file_name, size_t capacity);
+  // Opens (creating when needed) the backing file. A failed open is a
+  // Status, not an exception.
+  static StatusOr<std::unique_ptr<PagePool>> Create(std::string_view file_name,
+                                                    size_t capacity);
   ~PagePool();
 
-  PageRef GetPage(page_id_t page_id, bool* cache_hit = nullptr,
-                  bool shared = false);
+  StatusOr<PageRef> GetPage(page_id_t page_id, bool* cache_hit = nullptr,
+                            bool shared = false);
 
   // Like GetPage, but a corrupt on-disk image is returned verbatim instead of
   // rejected. RecoveryManager needs the raw bytes to run Single Page
   // Recovery; every other caller should use GetPage.
-  PageRef GetPageForRecovery(page_id_t page_id, bool* cache_hit = nullptr);
+  StatusOr<PageRef> GetPageForRecovery(page_id_t page_id,
+                                       bool* cache_hit = nullptr);
 
   page_id_t Size() const {
     std::shared_lock latch(pool_latch);
@@ -109,7 +120,7 @@ class PagePool {
   // The gate runs while the pool latch is NOT held; it may block on fsync.
   // Must be wired before the pool is used concurrently. An empty gate keeps
   // the previous behavior of writing back without any durability check.
-  void SetDurabilityGate(std::function<void(lsn_t)> gate);
+  void SetDurabilityGate(std::function<Status(lsn_t)> gate);
 
  private:
   friend class PageRef;
@@ -143,17 +154,19 @@ class PagePool {
   // Write `target` page into the file. Caller must hold the IO latch of the
   // target's page id (io_latches_[ShardIndex(...)].mu) but NOT pool_latch,
   // so the durability gate may block without stalling the pool.
-  void WriteBack(const Page* target);
+  Status WriteBack(const Page* target);
 
   // Read page at `pid` from the file to `target`. Caller must hold the IO
   // latch of pid and must have observed flushing_ without pid under
   // pool_latch inside that same IO latch scope. With validate, a non-zero
-  // but corrupt checksum throws; without it, broken images are handed back
-  // for Single Page Recovery.
-  void ReadFrom(Page* target, page_id_t pid, bool validate) const;
+  // but corrupt checksum is reported as kCorrupt; without it, broken images
+  // are handed back for Single Page Recovery.
+  Status ReadFrom(Page* target, page_id_t pid, bool validate) const;
 
-  PageRef GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
-                      bool validate);
+  StatusOr<PageRef> GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
+                                bool validate);
+
+  PagePool(std::string_view file_name, size_t capacity, int fd);
 
   std::string file_name_;
 
@@ -180,7 +193,7 @@ class PagePool {
 
   // WAL durability hook; see SetDurabilityGate. Read without extra locking,
   // so it must be installed before the pool is used concurrently.
-  std::function<void(lsn_t)> durability_gate_;
+  std::function<Status(lsn_t)> durability_gate_;
 
   mutable std::shared_mutex pool_latch;
 

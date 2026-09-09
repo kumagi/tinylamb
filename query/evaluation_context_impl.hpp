@@ -64,8 +64,12 @@ class RelationalEvaluationContext : public EvaluationContext {
     }
     std::optional<relational_detail::Relation> executed;
     if (relation == nullptr) {
-      executed =
+      StatusOr<relational_detail::Relation> executed_query =
           relational_detail::ExecuteQuery(context_, statement, scope_, ctes_);
+      if (!executed_query.HasValue()) {
+        return executed_query.GetStatus();
+      }
+      executed = executed_query.MoveValue();
       relation = &*executed;
     }
     std::vector<Value> projected;

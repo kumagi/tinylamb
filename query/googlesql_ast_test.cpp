@@ -43,7 +43,8 @@ std::unique_ptr<Statement> VisitSql(std::string_view sql) {
   if (!ast.HasValue()) {
     return nullptr;
   }
-  return GoogleSqlAstVisitor::Visit(*ast.Value());
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+  return visited.HasValue() ? visited.MoveValue() : nullptr;
 }
 
 std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
@@ -55,7 +56,11 @@ std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
   if (!ast.HasValue()) {
     return nullptr;
   }
-  return GoogleSqlAstVisitor::Visit(*ast.Value());
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+  if (!visited.HasValue()) {
+    throw std::runtime_error(visited.GetStatus().GetMessage());
+  }
+  return visited.MoveValue();
 }
 
 }  // namespace
@@ -82,7 +87,7 @@ TEST(GoogleSqlAstTest, PreservesNestedSetOperationKinds) {
       GoogleSqlAstParser::Parse(parsed.ast);
   ASSERT_TRUE(ast.HasValue());
   std::unique_ptr<Statement> statement =
-      GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+      GoogleSqlAstVisitor::Visit(*ast.Value(), sql).MoveValue();
   ASSERT_NE(statement, nullptr);
   const auto* select = dynamic_cast<const SelectStatement*>(statement.get());
   ASSERT_NE(select, nullptr);
@@ -102,7 +107,7 @@ TEST(GoogleSqlAstTest, PreservesExplicitNullOrdering) {
       GoogleSqlAstParser::Parse(parsed.ast);
   ASSERT_TRUE(ast.HasValue());
   std::unique_ptr<Statement> statement =
-      GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+      GoogleSqlAstVisitor::Visit(*ast.Value(), sql).MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*statement);
   ASSERT_EQ(select.OrderBy().size(), 2U);
   ASSERT_TRUE(select.OrderBy()[0].nulls_first.has_value());
@@ -124,7 +129,7 @@ TEST(GoogleSqlAstTest, VisitsRichQueryWithoutReparsingSql) {
   EXPECT_EQ(ast.Value()->kind, "QueryStatement");
 
   std::unique_ptr<Statement> statement =
-      GoogleSqlAstVisitor::Visit(*ast.Value());
+      GoogleSqlAstVisitor::Visit(*ast.Value()).MoveValue();
   ASSERT_EQ(statement->Type(), StatementType::kSelect);
   const auto& select = dynamic_cast<const SelectStatement&>(*statement);
   EXPECT_TRUE(select.RequiresRelationalEvaluation());
@@ -538,7 +543,7 @@ TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
   // nesting beyond the depth cap with an exception instead of overflowing
   // the C++ stack (a stack overflow is unrecoverable).
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   std::string sql = "SELECT 1";
   for (int i = 0; i < 600; ++i) {
@@ -623,13 +628,10 @@ TEST(GoogleSqlAstTest, UnknownStatementKindThrowsDiagnosticForVisitor) {
   const StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse("Statement\n  WeirdThing(zzz)\n");
   ASSERT_TRUE(ast.HasValue());
-  try {
-    const std::unique_ptr<Statement> statement =
-        GoogleSqlAstVisitor::Visit(*ast.Value());
-    FAIL() << "expected a throw for an unsupported statement kind";
-  } catch (const std::exception& error) {
-    EXPECT_NE(std::string(error.what()).find("unsupported"), std::string::npos);
-  }
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_NE(visited.GetStatus().GetMessage().find("unsupported"),
+            std::string::npos);
 }
 
 TEST(GoogleSqlAstTest, ChildAccessorOccurrenceSemantics) {
@@ -661,7 +663,8 @@ TEST(GoogleSqlAstTest, ParsesLateralTableSubquery) {
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
   ASSERT_TRUE(ast.HasValue());
-  std::unique_ptr<Statement> stmt = GoogleSqlAstVisitor::Visit(*ast.Value());
+  std::unique_ptr<Statement> stmt =
+      GoogleSqlAstVisitor::Visit(*ast.Value()).MoveValue();
   ASSERT_NE(stmt, nullptr);
   auto* select = dynamic_cast<SelectStatement*>(stmt.get());
   ASSERT_NE(select, nullptr);
@@ -678,7 +681,8 @@ TEST(GoogleSqlAstTest, DistinctOnAstVisitor) {
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
   ASSERT_TRUE(ast.HasValue());
-  std::unique_ptr<Statement> stmt = GoogleSqlAstVisitor::Visit(*ast.Value());
+  std::unique_ptr<Statement> stmt =
+      GoogleSqlAstVisitor::Visit(*ast.Value()).MoveValue();
   ASSERT_NE(stmt, nullptr);
   auto* select = dynamic_cast<SelectStatement*>(stmt.get());
   ASSERT_NE(select, nullptr);
@@ -696,7 +700,8 @@ TEST(GoogleSqlAstTest, FetchFirstWithTiesAstVisitor) {
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
   ASSERT_TRUE(ast.HasValue());
-  std::unique_ptr<Statement> stmt = GoogleSqlAstVisitor::Visit(*ast.Value());
+  std::unique_ptr<Statement> stmt =
+      GoogleSqlAstVisitor::Visit(*ast.Value()).MoveValue();
   ASSERT_NE(stmt, nullptr);
   auto* select = dynamic_cast<SelectStatement*>(stmt.get());
   ASSERT_NE(select, nullptr);
@@ -724,7 +729,7 @@ TEST(GoogleSqlAstTest, GroupByAllAndDistinctAstVisitor) {
       GoogleSqlAstParser::Parse(parsed_all.ast);
   ASSERT_TRUE(ast_all.HasValue());
   std::unique_ptr<Statement> stmt_all =
-      GoogleSqlAstVisitor::Visit(*ast_all.Value());
+      GoogleSqlAstVisitor::Visit(*ast_all.Value()).MoveValue();
   ASSERT_NE(stmt_all, nullptr);
   auto* select_all = dynamic_cast<SelectStatement*>(stmt_all.get());
   ASSERT_NE(select_all, nullptr);
@@ -738,7 +743,7 @@ TEST(GoogleSqlAstTest, GroupByAllAndDistinctAstVisitor) {
       GoogleSqlAstParser::Parse(parsed_dist.ast);
   ASSERT_TRUE(ast_dist.HasValue());
   std::unique_ptr<Statement> stmt_dist =
-      GoogleSqlAstVisitor::Visit(*ast_dist.Value());
+      GoogleSqlAstVisitor::Visit(*ast_dist.Value()).MoveValue();
   ASSERT_NE(stmt_dist, nullptr);
   auto* select_dist = dynamic_cast<SelectStatement*>(stmt_dist.get());
   ASSERT_NE(select_dist, nullptr);
@@ -754,7 +759,8 @@ TEST(GoogleSqlAstTest, QualifyAstVisitor) {
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
   ASSERT_TRUE(ast.HasValue());
-  std::unique_ptr<Statement> stmt = GoogleSqlAstVisitor::Visit(*ast.Value());
+  std::unique_ptr<Statement> stmt =
+      GoogleSqlAstVisitor::Visit(*ast.Value()).MoveValue();
   ASSERT_NE(stmt, nullptr);
   auto* select = dynamic_cast<SelectStatement*>(stmt.get());
   ASSERT_NE(select, nullptr);
@@ -771,7 +777,7 @@ TEST(GoogleSqlAstTest, PivotAndUnpivotAstVisitor) {
       GoogleSqlAstParser::Parse(parsed_p.ast);
   ASSERT_TRUE(ast_p.HasValue());
   std::unique_ptr<Statement> stmt_p =
-      GoogleSqlAstVisitor::Visit(*ast_p.Value());
+      GoogleSqlAstVisitor::Visit(*ast_p.Value()).MoveValue();
   ASSERT_NE(stmt_p, nullptr);
   auto* select_p = dynamic_cast<SelectStatement*>(stmt_p.get());
   ASSERT_NE(select_p, nullptr);
@@ -786,7 +792,7 @@ TEST(GoogleSqlAstTest, PivotAndUnpivotAstVisitor) {
       GoogleSqlAstParser::Parse(parsed_u.ast);
   ASSERT_TRUE(ast_u.HasValue());
   std::unique_ptr<Statement> stmt_u =
-      GoogleSqlAstVisitor::Visit(*ast_u.Value());
+      GoogleSqlAstVisitor::Visit(*ast_u.Value()).MoveValue();
   ASSERT_NE(stmt_u, nullptr);
   auto* select_u = dynamic_cast<SelectStatement*>(stmt_u.get());
   ASSERT_NE(select_u, nullptr);

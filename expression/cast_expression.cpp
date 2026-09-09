@@ -186,30 +186,6 @@ std::string FormatCivilTime(const CivilTime& ct) {
   return std::string{buf.data()};
 }
 
-CivilTime ShiftCivilTimeHours(CivilTime ct, int add_hours) {
-  int total_h = ct.hour + add_hours;
-  auto floor_div = [](int64_t a, int64_t b) -> int64_t {
-    const int64_t q = a / b;
-    return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
-  };
-  int extra_days = static_cast<int>(floor_div(total_h, 24));
-  int new_h = total_h - (extra_days * 24);
-  ct.hour = new_h;
-  if (extra_days != 0) {
-    std::chrono::year_month_day ymd{std::chrono::year{ct.year},
-                                    std::chrono::month{ct.month},
-                                    std::chrono::day{ct.day}};
-    int64_t days =
-        std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
-    std::chrono::sys_days new_sd{std::chrono::days{days}};
-    std::chrono::year_month_day new_ymd{new_sd};
-    ct.year = int(new_ymd.year());
-    ct.month = unsigned(new_ymd.month());
-    ct.day = unsigned(new_ymd.day());
-  }
-  return ct;
-}
-
 // Zone shifts must stay in whole seconds: routing through nanosecond
 // arithmetic overflows int64 for dates older than ~1678 / newer than ~2262.
 CivilTime ShiftCivilTimeSeconds(CivilTime ct, int64_t add_seconds) {
@@ -750,7 +726,7 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
 
 // Narrowed integer targets reject values outside their width: GoogleSQL
 // raises out_of_range instead of truncating (INT64 keeps every int64 value).
-void ValidateIntWidth(const std::string& upper, int64_t v) {
+Status ValidateIntWidth(const std::string& upper, int64_t v) {
   bool out_of_width = false;
   std::string width_name;
   if (upper == "INT32") {
@@ -776,15 +752,19 @@ void ValidateIntWidth(const std::string& upper, int64_t v) {
     width_name = "uint64";
   }
   if (out_of_width) {
-    throw std::runtime_error(width_name +
-                             " out of range: " + std::to_string(v));
+    return StatusError(StatusCode::kIsInfinity,
+                       width_name + " out of range: " + std::to_string(v));
   }
+  return Status::kSuccess;
 }
 
-Value CastValue(const Value& val, const std::string& type_name,
-                ValueType target_type, bool safe) {
+StatusOr<Value> TryCastValue(const Value& val, const std::string& type_name,
+                             ValueType target_type, bool safe);
+
+StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
+                                 ValueType target_type, bool safe) {
   if (val.IsNull()) {
-    return {};
+    return Value();
   }
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
@@ -845,9 +825,10 @@ Value CastValue(const Value& val, const std::string& type_name,
     }
     if (compact.size() != 32) {
       if (safe) {
-        return {};
+        return Value();
       }
-      throw std::runtime_error("invalid UUID string: " + hex);
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid UUID string: " + hex);
     }
     std::string canonical;
     for (size_t i = 0; i < compact.size(); ++i) {
@@ -867,17 +848,14 @@ Value CastValue(const Value& val, const std::string& type_name,
       const auto& [field_name, field_type] = fields.front();
       const std::string key = field_name.empty() ? "f1" : ToLower(field_name);
       Value converted = val;
-      try {
-        converted =
-            CastValue(converted, field_type, ParseType(field_type).first, safe);
-      } catch (const std::exception&) {
-        if (safe) {
-          return {};
-        }
-        throw;
+      auto casted = TryCastValue(converted, field_type,
+                                 ParseType(field_type).first, safe);
+      if (!casted.HasValue()) {
+        return casted.GetStatus();
       }
+      converted = casted.MoveValue();
       if (converted.IsNull()) {
-        return {};
+        return Value();
       }
       return Value("{\"" + key + "\":" + EncodeStructMemberText(converted) +
                    "}");
@@ -888,11 +866,9 @@ Value CastValue(const Value& val, const std::string& type_name,
     if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
       const auto fields = ParseStructTypeFields(upper);
       const auto members = SplitStructMembers(text.substr(1, text.size() - 2));
-      auto fail = [&]() -> Value {
-        if (safe) {
-          return {};
-        }
-        throw std::runtime_error("cannot cast struct to " + type_name);
+      const auto fail = [&]() -> Status {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "cannot cast struct to " + type_name);
       };
       std::string rebuilt = "{";
       bool first = true;
@@ -916,8 +892,9 @@ Value CastValue(const Value& val, const std::string& type_name,
             (raw_member.starts_with("[") && raw_member.ends_with("]"))) {
           if (ToUpper(field_type).starts_with("STRUCT") &&
               raw.starts_with("{")) {
-            Value nested = CastValue(Value(std::move(raw)), field_type,
-                                     ParseType(field_type).first, safe);
+            ASSIGN_OR_RETURN(Value, nested,
+                             TryCastValue(Value(std::move(raw)), field_type,
+                                          ParseType(field_type).first, safe));
             if (nested.IsNull()) {
               return fail();
             }
@@ -945,12 +922,12 @@ Value CastValue(const Value& val, const std::string& type_name,
                              ? Value(parsed_int)
                              : Value(std::string(raw));
         }
-        try {
-          member_value = CastValue(member_value, field_type,
-                                   ParseType(field_type).first, safe);
-        } catch (const std::exception&) {
+        auto casted_member = TryCastValue(member_value, field_type,
+                                          ParseType(field_type).first, safe);
+        if (!casted_member.HasValue()) {
           return fail();
         }
+        member_value = casted_member.MoveValue();
         if (member_value.IsNull()) {
           return fail();
         }
@@ -964,11 +941,8 @@ Value CastValue(const Value& val, const std::string& type_name,
   // engine stores enums as their member-name strings.
   if (!is_bool && upper.find("ENUM") != std::string::npos &&
       IsKnownEnum(enum_short_name)) {
-    auto out_of_range = [&](const std::string& message) -> Value {
-      if (safe) {
-        return {};
-      }
-      throw std::runtime_error(message);
+    const auto out_of_range = [&](const std::string& message) -> Status {
+      return StatusError(StatusCode::kIsInfinity, message);
     };
     if (val.type == ValueType::kInt64) {
       const int64_t ordinal = val.value.int_value;
@@ -1043,10 +1017,11 @@ Value CastValue(const Value& val, const std::string& type_name,
     }
     if (member_shaped) {
       if (safe) {
-        return {};
+        return Value();
       }
-      throw std::runtime_error("Out of range cast of string '" + member +
-                               "' to enum type " + type_name);
+      return StatusError(StatusCode::kIsInfinity,
+                         "Out of range cast of string '" + member +
+                             "' to enum type " + type_name);
     }
     // Numeric-looking strings into enum types never name a member.
     const std::string trimmed_member = [&] {
@@ -1067,10 +1042,11 @@ Value CastValue(const Value& val, const std::string& type_name,
     }
     if (numeric_token) {
       if (safe) {
-        return {};
+        return Value();
       }
-      throw std::runtime_error("Out of range cast of string '" + member +
-                               "' to enum type " + type_name);
+      return StatusError(StatusCode::kIsInfinity,
+                         "Out of range cast of string '" + member +
+                             "' to enum type " + type_name);
     }
   }
 
@@ -1081,7 +1057,7 @@ Value CastValue(const Value& val, const std::string& type_name,
     const std::string upper_path = ToUpper(type_name);
     if (upper_path.find('.') != std::string::npos && !enum_target) {
       if (val.IsNull()) {
-        return {};
+        return Value();
       }
       if (val.type == ValueType::kVarChar || val.type == ValueType::kInt64 ||
           val.type == ValueType::kDouble) {
@@ -1107,9 +1083,10 @@ Value CastValue(const Value& val, const std::string& type_name,
           return Value(std::move(verbatim));
         }
         if (!safe) {
-          throw std::runtime_error("invalid proto TEXT payload: " + raw);
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid proto TEXT payload: " + raw);
         }
-        return {};
+        return Value();
       }
     }
   }
@@ -1130,7 +1107,8 @@ Value CastValue(const Value& val, const std::string& type_name,
         if (s == "false" || s == "f" || s == "0") {
           return Value(int64_t{0});
         }
-        throw std::runtime_error("cannot cast string to bool: " + s);
+        return StatusError(StatusCode::kInvalidArgument,
+                           "cannot cast string to bool: " + s);
       }
     }
 
@@ -1189,9 +1167,9 @@ Value CastValue(const Value& val, const std::string& type_name,
             const std::string message =
                 ToLower(upper) + " out of range: " + std::to_string(candidate);
             if (safe) {
-              return {};
+              return Value();
             }
-            throw std::out_of_range(message);
+            return StatusError(StatusCode::kIsInfinity, message);
           }
         }
         if (val.type == ValueType::kInt64) {
@@ -1200,7 +1178,8 @@ Value CastValue(const Value& val, const std::string& type_name,
         if (val.type == ValueType::kDouble) {
           if (std::isnan(val.value.double_value) ||
               std::isinf(val.value.double_value)) {
-            throw std::runtime_error("cannot cast NaN/Inf float to int");
+            return StatusError(StatusCode::kIsInfinity,
+                               "cannot cast NaN/Inf float to int");
           }
           const double rounded = std::round(val.value.double_value);
           // 2^63 as a double is exactly representable; values at or above it
@@ -1208,11 +1187,12 @@ Value CastValue(const Value& val, const std::string& type_name,
           static constexpr double kInt64MaxAsDouble = 9223372036854775808.0;
           static constexpr double kInt64MinAsDouble = -9223372036854775808.0;
           if (rounded >= kInt64MaxAsDouble || rounded < kInt64MinAsDouble) {
-            throw std::runtime_error("int overflow casting from float: " +
-                                     std::to_string(val.value.double_value));
+            return StatusError(StatusCode::kIsInfinity,
+                               "int overflow casting from float: " +
+                                   std::to_string(val.value.double_value));
           }
           const auto narrowed = static_cast<int64_t>(rounded);
-          ValidateIntWidth(upper, narrowed);
+          RETURN_IF_FAIL(ValidateIntWidth(upper, narrowed));
           return upper == "UINT64" ? Value(narrowed).WithUnsigned()
                                    : Value(narrowed);
         }
@@ -1220,7 +1200,8 @@ Value CastValue(const Value& val, const std::string& type_name,
           std::string s(val.value.varchar_value);
           size_t start = s.find_first_not_of(" \t\r\n");
           if (start == std::string::npos) {
-            throw std::runtime_error("cannot cast empty string to int");
+            return StatusError(StatusCode::kInvalidArgument,
+                               "cannot cast empty string to int");
           }
           size_t end = s.find_last_not_of(" \t\r\n");
           s = s.substr(start, end - start + 1);
@@ -1241,48 +1222,38 @@ Value CastValue(const Value& val, const std::string& type_name,
             const char* d_end = digits.data() + digits.size();
             auto [d_ptr, d_ec] = std::from_chars(d_begin, d_end, magnitude, 16);
             if (d_ec != std::errc() || d_ptr != d_end) {
-              throw std::runtime_error("invalid integer string: " + s);
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "invalid integer string: " + s);
             }
             const bool unsigned_target = upper == "UINT8" ||
                                          upper == "UINT16" ||
                                          upper == "UINT32" || upper == "UINT64";
-            const bool int32_target = upper == "INT32" || upper == "INT" ||
-                                      upper == "INTEGER" || upper == "INT16" ||
-                                      upper == "INT8";
-            const bool uint32_target =
-                upper == "UINT32" || upper == "UINT16" || upper == "UINT8";
             if (hex_negative &&
                 (unsigned_target || magnitude > 0x8000000000000000ULL)) {
-              throw std::runtime_error("Bad " + upper + " value: " + s);
-            }
-            if (!hex_negative && magnitude > 0x7fffffffffffffffULL &&
-                !unsigned_target) {
-              throw std::runtime_error("int overflow casting from string: " +
-                                       s);
-            }
-            auto out_of_range = [&](uint64_t magnitude_value) {
-              if (int32_target &&
-                  magnitude_value >
-                      (hex_negative ? 0x80000000ULL : 0x7FFFFFFFULL)) {
-                return true;
-              }
-              if (unsigned_target && !hex_negative) {
-                const uint64_t limit = uint32_target ? 0xFFFFFFFFULL
-                                       : upper == "UINT64"
-                                           ? 0xFFFFFFFFFFFFFFFFULL
-                                           : 0xFFFFULL;
-                return magnitude_value > limit;
-              }
-              return false;
-            };
-            if (out_of_range(magnitude)) {
-              throw std::runtime_error(upper + " out of range: " + s);
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "Bad " + upper + " value: " + s);
             }
             if (hex_negative) {
-              return Value(static_cast<int64_t>(~magnitude + 1));
+              // Two's-complement of the magnitude; the narrowed widths must
+              // still hold the resulting negative value (INT8 "-0x80" is
+              // fine, "-0x81" is not).
+              const auto signed_value = static_cast<int64_t>(~magnitude + 1);
+              RETURN_IF_FAIL(ValidateIntWidth(upper, signed_value));
+              return Value(signed_value);
             }
-            Value result(static_cast<int64_t>(magnitude));
-            return upper == "UINT64" ? result.WithUnsigned() : result;
+            if (magnitude <= 0x7fffffffffffffffULL) {
+              const auto signed_magnitude =
+                  static_cast<int64_t>(magnitude);
+              Value result(signed_magnitude);
+              RETURN_IF_FAIL(ValidateIntWidth(upper, signed_magnitude));
+              return upper == "UINT64" ? result.WithUnsigned() : result;
+            }
+            // Above the signed range only UINT64 can represent the value.
+            if (upper != "UINT64") {
+              return StatusError(StatusCode::kIsInfinity,
+                                 upper + " out of range: " + s);
+            }
+            return Value(static_cast<int64_t>(magnitude)).WithUnsigned();
           }
           int64_t result = 0;
           const char* begin_ptr = s.data();
@@ -1291,16 +1262,19 @@ Value CastValue(const Value& val, const std::string& type_name,
           // its registry ordinal before plain integer parsing applies.
           if (std::optional<int64_t> ordinal = OrdinalForEnumMemberName(s);
               ordinal.has_value()) {
-            ValidateIntWidth(upper, *ordinal);
+            RETURN_IF_FAIL(ValidateIntWidth(upper, *ordinal));
             return Value(*ordinal);
           }
           auto [ptr, ec] = std::from_chars(begin_ptr, end_ptr, result);
           if (ec == std::errc::result_out_of_range) {
-            throw std::runtime_error("int overflow casting from string: " + s);
+            return StatusError(StatusCode::kIsInfinity,
+                               "int overflow casting from string: " + s);
           }
           if (ec != std::errc() || ptr != end_ptr) {
-            throw std::runtime_error("invalid integer string: " + s);
+            return StatusError(StatusCode::kInvalidArgument,
+                               "invalid integer string: " + s);
           }
+          RETURN_IF_FAIL(ValidateIntWidth(upper, result));
           Value converted(result);
           return upper == "UINT64" ? converted.WithUnsigned() : converted;
         }
@@ -1340,10 +1314,11 @@ Value CastValue(const Value& val, const std::string& type_name,
           errno = 0;
           const double parsed = std::strtod(s.c_str(), &end);
           if (end == s.c_str() || *end != '\0') {
-            throw std::runtime_error("invalid float string: " + s);
+            return StatusError(StatusCode::kInvalidArgument,
+                               "invalid float string: " + s);
           }
           if (errno == ERANGE && (parsed == HUGE_VAL || parsed == -HUGE_VAL)) {
-            throw std::runtime_error("float overflow: " + s);
+            return StatusError(StatusCode::kIsInfinity, "float overflow: " + s);
           }
           return finish_double(parsed);
         }
@@ -1397,8 +1372,12 @@ Value CastValue(const Value& val, const std::string& type_name,
                     ct.hour == 7 && ct.minute == 52 && ct.second == 58) {
                   return Value(std::string("0001-01-01 00:00:00"));
                 }
-                int offset_hours = (ct.month >= 4 && ct.month <= 10) ? -7 : -8;
-                ct = ShiftCivilTimeHours(ct, offset_hours);
+                // Resolve the session default zone (DST-aware) exactly like
+                // the TIMESTAMP branch; a month-based DST heuristic gets
+                // March/October transition dates wrong.
+                const int64_t offset_sec =
+                    ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+                ct = ShiftCivilTimeSeconds(ct, offset_sec);
               }
               return Value(FormatCivilTime(ct));
             }
@@ -1498,8 +1477,11 @@ Value CastValue(const Value& val, const std::string& type_name,
               raw.find('z') != std::string::npos) {
             CivilTime ct;
             if (ParseCivilTime(raw, &ct)) {
-              int offset_hours = (ct.month >= 4 && ct.month <= 10) ? -7 : -8;
-              ct = ShiftCivilTimeHours(ct, offset_hours);
+              // Session-default zone (DST-aware), mirroring the DATETIME and
+              // TIMESTAMP branches instead of a month-based heuristic.
+              const int64_t offset_sec =
+                  ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+              ct = ShiftCivilTimeSeconds(ct, offset_sec);
               std::array<char, 64> buf{};
               if (ct.subsecond_nanos != 0) {
                 if (ct.subsecond_nanos % 1000000 == 0) {
@@ -1589,13 +1571,13 @@ Value CastValue(const Value& val, const std::string& type_name,
             // NOLINTNEXTLINE(cert-err33-c)
             snprintf(buf.data(), buf.size(), "%04d-%02u-%02u", ct.year,
                      ct.month, ct.day);
-            return Value::Date(std::string{buf.data()});
+            return Value::TryDate(std::string{buf.data()});
           }
           size_t sp = s.find_first_of(" Tt");
           if (sp != std::string::npos) {
             s = s.substr(0, sp);
           }
-          return Value::Date(s);
+          return Value::TryDate(s);
         }
         return Value(std::move(s));
       }
@@ -1636,13 +1618,13 @@ Value CastValue(const Value& val, const std::string& type_name,
             // NOLINTNEXTLINE(cert-err33-c)
             snprintf(buf.data(), buf.size(), "%04d-%02u-%02u", ct.year,
                      ct.month, ct.day);
-            return Value::Date(std::string{buf.data()});
+            return Value::TryDate(std::string{buf.data()});
           }
           size_t sp = s.find_first_of(" Tt");
           if (sp != std::string::npos) {
             s = s.substr(0, sp);
           }
-          return Value::Date(s);
+          return Value::TryDate(s);
         }
         if (val.type == ValueType::kInt64) {
           return Value::DateFromDays(val.value.int_value);
@@ -1653,7 +1635,7 @@ Value CastValue(const Value& val, const std::string& type_name,
         // CAST(x AS ARRAY<T>): retypes array literals (coercing elements to
         // the declared element type when they are scalar); NULL stays NULL.
         if (val.IsNull()) {
-          return {};
+          return Value();
         }
         if (!val.IsArray()) {
           break;
@@ -1693,22 +1675,23 @@ Value CastValue(const Value& val, const std::string& type_name,
           if (length_limit > 0 && element.type == ValueType::kVarChar &&
               element.value.varchar_value.size() > length_limit) {
             if (!safe) {
-              throw std::runtime_error(
+              return StatusError(
+                  StatusCode::kInvalidArgument,
                   length_base + "(" + std::to_string(length_limit) +
-                  ") has maximum length " + std::to_string(length_limit) +
-                  " but got a value with length " +
-                  std::to_string(element.value.varchar_value.size()));
+                      ") has maximum length " + std::to_string(length_limit) +
+                      " but got a value with length " +
+                      std::to_string(element.value.varchar_value.size()));
             }
             ok = false;
             break;
           }
-          try {
-            elements.push_back(CastValue(element, element_type,
-                                         ParseType(element_type).first, safe));
-          } catch (const std::exception&) {
+          auto casted_element = TryCastValue(
+              element, element_type, ParseType(element_type).first, safe);
+          if (!casted_element.HasValue()) {
             ok = false;
             break;
           }
+          elements.push_back(casted_element.MoveValue());
         }
         if (!ok) {
           break;
@@ -1720,15 +1703,28 @@ Value CastValue(const Value& val, const std::string& type_name,
     }
   } catch (const std::exception&) {
     if (safe) {
-      return {};
+      return Value();
     }
     throw;
   }
 
   if (safe) {
-    return {};
+    return Value();
   }
-  throw std::runtime_error("unsupported cast to " + type_name);
+  return StatusError(StatusCode::kInvalidArgument,
+                     "unsupported cast to " + type_name);
+}
+
+// SAFE_CAST contract in one place: with `safe` set every failure collapses
+// to NULL; otherwise the Status surfaces (and the EXC-SHIM wrappers rethrow
+// it until the executor/query layers propagate Status, Phase 6).
+StatusOr<Value> TryCastValue(const Value& val, const std::string& type_name,
+                             ValueType target_type, bool safe) {
+  StatusOr<Value> casted = TryCastValueCore(val, type_name, target_type, safe);
+  if (!casted.HasValue() && safe) {
+    return Value();
+  }
+  return casted;
 }
 
 }  // namespace
@@ -1747,25 +1743,47 @@ std::unordered_set<ColumnName> CastExpression::TouchedColumns() const {
   return child_->TouchedColumns();
 }
 
+StatusOr<Value> CastExpression::TryEvaluate(const Row& row,
+                                            const Schema& schema) const {
+  ASSIGN_OR_RETURN(Value, val, child_->TryEvaluate(row, schema));
+  return TryCastValue(val, target_type_name_, target_value_type_,
+                      return_null_on_error_);
+}
+
+StatusOr<Value> CastExpression::TryEvaluate(const Row* left,
+                                            const Schema& left_schema,
+                                            const Row* right,
+                                            const Schema& right_schema) const {
+  ASSIGN_OR_RETURN(Value, val,
+                   child_->TryEvaluate(left, left_schema, right, right_schema));
+  return TryCastValue(val, target_type_name_, target_value_type_,
+                      return_null_on_error_);
+}
+
+StatusOr<Value> CastExpression::TryEvaluate(const Row& row,
+                                            const Schema& schema,
+                                            EvaluationContext& context) const {
+  ASSIGN_OR_RETURN(Value, val, child_->TryEvaluate(row, schema, context));
+  return TryCastValue(val, target_type_name_, target_value_type_,
+                      return_null_on_error_);
+}
+
+// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
 Value CastExpression::Evaluate(const Row& row, const Schema& schema) const {
-  const Value val = child_->Evaluate(row, schema);
-  return CastValue(val, target_type_name_, target_value_type_,
-                   return_null_on_error_);
+  return ExcShimUnwrap(TryEvaluate(row, schema), "CastExpression::Evaluate");
 }
 
 Value CastExpression::Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
                                const Schema& right_schema) const {
-  const Value val = child_->Evaluate(left, left_schema, right, right_schema);
-  return CastValue(val, target_type_name_, target_value_type_,
-                   return_null_on_error_);
+  return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "CastExpression::Evaluate");
 }
 
 Value CastExpression::Evaluate(const Row& row, const Schema& schema,
                                EvaluationContext& context) const {
-  const Value val = child_->Evaluate(row, schema, context);
-  return CastValue(val, target_type_name_, target_value_type_,
-                   return_null_on_error_);
+  return ExcShimUnwrap(TryEvaluate(row, schema, context),
+                       "CastExpression::Evaluate");
 }
 
 tinylamb::Type CastExpression::ResultType(const Schema& /*unused*/) const {

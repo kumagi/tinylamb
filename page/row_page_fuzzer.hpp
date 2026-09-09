@@ -64,8 +64,8 @@ class RowPageEnvironment {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
+    p_ = PageManager::Create(db_name_, 10).MoveValue();
+    l_ = Logger::Create(log_name_).MoveValue();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     lm_ = std::make_unique<LockManager>();
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());

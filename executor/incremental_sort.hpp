@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/pipeline_breaker.hpp"
@@ -25,6 +26,12 @@ namespace tinylamb {
 // only trailing suffix columns within each prefix group.
 class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  IncrementalSortExecutor(const IncrementalSortExecutor&) = delete;
+  IncrementalSortExecutor& operator=(const IncrementalSortExecutor&) = delete;
+  IncrementalSortExecutor(IncrementalSortExecutor&&) = delete;
+  IncrementalSortExecutor& operator=(IncrementalSortExecutor&&) = delete;
   IncrementalSortExecutor(Executor source, Schema schema,
                           std::vector<SortExecutor::Key> prefix_keys,
                           std::vector<SortExecutor::Key> suffix_keys);
@@ -50,7 +57,7 @@ class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
  private:
   void EnsureMaterialized();
   void ExecuteIncrementalSort();
-  [[nodiscard]] bool ArePrefixEqual(const Row& a, const Row& b) const;
+  [[nodiscard]] bool ArePrefixEqual(const Row& a, const Row& b);
 
   Executor source_;
   Schema schema_;
@@ -59,6 +66,7 @@ class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
 
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};
+  Status sort_error_{Status::kSuccess};
   bool materialized_{false};
   QueryMemoryCharge charge_;
 };

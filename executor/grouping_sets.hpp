@@ -45,7 +45,7 @@ class GroupingSetsExecutor : public ExecutorBase {
   [[nodiscard]] const Schema& OutputSchema() const { return output_schema_; }
 
  private:
-  void Materialize();
+  Status Materialize();
 
   Executor child_;
   Schema input_schema_;

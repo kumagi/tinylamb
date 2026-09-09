@@ -51,7 +51,7 @@ class BranchPage final {
   }
   [[nodiscard]] slot_t RowCount() const;
 
-  void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
+  Status SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
   page_id_t GetLowestValue(Transaction& /*unused*/) const {
     return lowest_page_;
   }

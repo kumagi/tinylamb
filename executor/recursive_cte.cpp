@@ -27,24 +27,32 @@ RecursiveCteExecutor::RecursiveCteExecutor(
       depth_spec_(std::move(depth_spec)),
       output_schema_(std::move(output_schema)) {}
 
-void RecursiveCteExecutor::Initialize() {
+Status RecursiveCteExecutor::Initialize() {
   if (initialized_) {
-    return;
+    return Status::kSuccess;
   }
   initialized_ = true;
   if (!body_) {
-    return;
+    return Status::kSuccess;
   }
   const RecursiveDepthSpec* depth_spec =
       depth_spec_.has_value() ? &depth_spec_.value() : nullptr;
-  relational_detail::Relation rel = relational_detail::ExecuteRecursiveCte(
-      context_, cte_name_, *body_, nullptr, {}, depth_spec);
-  rel.ForEachRow([&](const Row& r) { rows_.push_back(r); });
+  StatusOr<relational_detail::Relation> executed =
+      relational_detail::ExecuteRecursiveCte(context_, cte_name_, *body_,
+                                             nullptr, {}, depth_spec);
+  if (!executed.HasValue()) {
+    return executed.GetStatus();
+  }
+  relational_detail::Relation rel = executed.MoveValue();
+  return rel.ForEachRow([&](const Row& r) { rows_.push_back(r); });
 }
 
 bool RecursiveCteExecutor::Next(Row* dst, RowPosition* rp) {
   if (!initialized_) {
-    Initialize();
+    const Status st = Initialize();
+    if (st != Status::kSuccess) {
+      return FailWith(st);
+    }
   }
   if (row_idx_ >= rows_.size()) {
     return false;

@@ -52,6 +52,10 @@ class ParallelAggregationExecutor final : public ExecutorBase {
     size_t trailing_column{0};
   };
 
+  // Partial states are default-built, moved between shards, and merged by
+  // copy; the conditional-release destructor must keep its implicit
+  // copy/move semantics, so the rule-of-five check is silenced here.
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
   struct PartialState {
     std::vector<Value> values;
     std::vector<int64_t> counts;
@@ -76,33 +80,34 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   };
 
   [[nodiscard]] PartialState MakeState() const;
-  void Accumulate(PartialState* state, const DataChunk& chunk) const;
+  Status Accumulate(PartialState* state, const DataChunk& chunk) const;
   // Walks `always_generic` and `fallback` (both ascending, disjoint) as one
   // ascending index sequence.
-  void AccumulateGeneric(PartialState* state, const DataChunk& chunk,
-                         const std::vector<size_t>& always_generic,
-                         const std::vector<size_t>& fallback) const;
-  void AccumulateInt64Column(PartialState* state, size_t aggregate_index,
-                             const ColumnVector& column) const;
-  void AccumulateDoubleColumn(PartialState* state, size_t aggregate_index,
-                              const ColumnVector& column) const;
+  Status AccumulateGeneric(PartialState* state, const DataChunk& chunk,
+                           const std::vector<size_t>& always_generic,
+                           const std::vector<size_t>& fallback) const;
+  Status AccumulateInt64Column(PartialState* state, size_t aggregate_index,
+                               const ColumnVector& column) const;
+  Status AccumulateDoubleColumn(PartialState* state, size_t aggregate_index,
+                                const ColumnVector& column) const;
   // Fast-path statistical accumulation over raw numeric storage; `trailing`
   // is null for the single-input forms (VAR_* / STDDEV_*).
-  static void AccumulateStatColumns(PartialState* state, size_t aggregate_index,
-                                    const ColumnVector& child,
-                                    const ColumnVector* trailing);
+  static Status AccumulateStatColumns(PartialState* state,
+                                      size_t aggregate_index,
+                                      const ColumnVector& child,
+                                      const ColumnVector* trailing);
   // Per-row statistical accumulation for expression arguments; mirrors
   // AggregateAccumulator::ApplyCore's paired NULL semantics.
-  void AccumulateStatValue(PartialState* state, size_t aggregate_index,
-                           const Value& value,
-                           const std::vector<Value>& trailing_values) const;
-  void AccumulateValue(PartialState* state, size_t aggregate_index,
-                       const Value& value, bool apply_distinct) const;
+  Status AccumulateStatValue(PartialState* state, size_t aggregate_index,
+                             const Value& value,
+                             const std::vector<Value>& trailing_values) const;
+  Status AccumulateValue(PartialState* state, size_t aggregate_index,
+                         const Value& value, bool apply_distinct) const;
   // Applies the statistical finalize formulas (VAR/STDDEV/COVAR/CORR) to the
   // merged long-double partials; NULL for inputs too few to divide.
   [[nodiscard]] Value FinalizeStat(const PartialState& state,
                                    size_t index) const;
-  void Merge(PartialState* destination, const PartialState& source) const;
+  Status Merge(PartialState* destination, const PartialState& source) const;
   [[nodiscard]] Row Finalize(PartialState state) const;
 
   std::shared_ptr<ExecutorBase> child_;
@@ -121,7 +126,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   // A failed execution must never degrade into a normal-looking empty
   // aggregate on a subsequent Next(); the original error is rethrown.
   bool errored_{false};
-  std::exception_ptr error_;
+  Status error_{Status::kSuccess};
 };
 
 }  // namespace tinylamb

@@ -19,6 +19,12 @@ namespace tinylamb {
 
 class CardinalityProbe : public ExecutorBase {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  CardinalityProbe(const CardinalityProbe&) = delete;
+  CardinalityProbe& operator=(const CardinalityProbe&) = delete;
+  CardinalityProbe(CardinalityProbe&&) = delete;
+  CardinalityProbe& operator=(CardinalityProbe&&) = delete;
   CardinalityProbe(Executor child, std::string operator_name = {},
                    double estimated_cardinality = 0.0)
       : child_(std::move(child)),

@@ -154,15 +154,16 @@ void EnsureReusableProjections(TransactionContext& context,
 const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
                                               std::string_view table);
 
-Relation ExecuteQuery(TransactionContext& context,
-                      const SelectStatement& statement, const Scope* outer,
-                      const CteMap& inherited_ctes);
+StatusOr<Relation> ExecuteQuery(TransactionContext& context,
+                                const SelectStatement& statement,
+                                const Scope* outer,
+                                const CteMap& inherited_ctes);
 
-Relation ExecuteRecursiveCte(TransactionContext& context,
-                             const std::string& name,
-                             const SelectStatement& body, const Scope* outer,
-                             const CteMap& inherited_ctes,
-                             const RecursiveDepthSpec* depth_spec = nullptr);
+StatusOr<Relation> ExecuteRecursiveCte(
+    TransactionContext& context, const std::string& name,
+    const SelectStatement& body, const Scope* outer,
+    const CteMap& inherited_ctes,
+    const RecursiveDepthSpec* depth_spec = nullptr);
 
 // Applies one safe top-level derived-table boundary rewrite.  The relational
 // executor repeatedly calls this until it reaches a fixed point; EXPLAIN uses
@@ -170,10 +171,11 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
 std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
     const SelectStatement& statement, const CteMap& inherited_ctes);
 
-Relation FinishQuery(TransactionContext& context,
-                     const SelectStatement& statement, Relation input,
-                     const Scope* outer, const CteMap& ctes,
-                     bool apply_where = true, size_t hidden_columns = 0);
+StatusOr<Relation> FinishQuery(TransactionContext& context,
+                               const SelectStatement& statement, Relation input,
+                               const Scope* outer, const CteMap& ctes,
+                               bool apply_where = true,
+                               size_t hidden_columns = 0);
 
 // GoogleSQL name resolution for grouped queries: GROUP BY / HAVING items may
 // reference SELECT-list aliases or ordinals when they do not resolve against

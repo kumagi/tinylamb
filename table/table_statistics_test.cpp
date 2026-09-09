@@ -110,7 +110,7 @@ class TableStatisticsTest : public ::testing::Test {
     if (db_) {
       db_->EmulateCrash();
     }
-    db_ = std::make_unique<Database>(prefix_);
+    db_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { db_->DeleteAll(); }
@@ -568,18 +568,19 @@ TEST(TableStatisticsSerializationTest,
 }
 
 TEST(TableStatisticsSerializationTest,
-     Deserialize_LegacyNullColumn_ThrowsRuntimeException) {
+     Deserialize_LegacyNullColumn_FailsDecoder) {
   std::stringstream stream;
   Encoder encoder(stream);
   encoder << uint64_t{1} << ValueType::kNull;
   TableStatistics statistics(Schema("T", {Column("n", ValueType::kNull)}));
   Decoder decoder(stream);
 
-  EXPECT_THROW(decoder >> statistics, std::runtime_error);
+  decoder >> statistics;
+  EXPECT_TRUE(decoder.Failed());
 }
 
 TEST(TableStatisticsSerializationTest,
-     Deserialize_UnsupportedVersion_ThrowsRuntimeException) {
+     Deserialize_UnsupportedVersion_FailsDecoder) {
   std::stringstream stream;
   Encoder encoder(stream);
   encoder << uint64_t{0x544C535441545302ULL} << uint64_t{99};
@@ -587,7 +588,8 @@ TEST(TableStatisticsSerializationTest,
   TableStatistics statistics(Schema("T", {Column("v", ValueType::kInt64)}));
   Decoder decoder(stream);
 
-  EXPECT_THROW(decoder >> statistics, std::runtime_error);
+  decoder >> statistics;
+  EXPECT_TRUE(decoder.Failed());
 }
 
 TEST(
@@ -841,16 +843,16 @@ TEST_F(TableStatisticsTest,
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(TableStatisticsTest, EstimateCount_InvalidColumnIndex_ThrowsOutOfRange) {
+TEST_F(TableStatisticsTest, EstimateCount_InvalidColumnIndex_Aborts) {
   TransactionContext context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
 
-  EXPECT_THROW(std::ignore = statistics.EstimateCount(3, Value(0), Value(1)),
-               std::out_of_range);
-  EXPECT_THROW(std::ignore = statistics.EstimateCount(-1, Value(0), Value(1)),
-               std::out_of_range);
-  ASSERT_SUCCESS(context.PreCommit());
+  EXPECT_DEATH(std::ignore = statistics.EstimateCount(3, Value(0), Value(1)),
+               "statistics column index");
+  EXPECT_DEATH(std::ignore = statistics.EstimateCount(-1, Value(0), Value(1)),
+               "statistics column index");
+  std::ignore = context.PreCommit();
 }
 
 TEST_F(TableStatisticsTest,

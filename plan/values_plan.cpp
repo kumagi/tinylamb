@@ -36,10 +36,9 @@ ValuesPlan::ValuesPlan(Schema schema, std::vector<Row> rows)
       stats_(MakeStats(schema_, rows_.size())) {
   for (const Row& row : rows_) {
     if (row.values_.size() != schema_.ColumnCount()) {
-      throw std::invalid_argument(
-          "ValuesPlan row/schema width mismatch: row=" +
-          std::to_string(row.values_.size()) +
-          " schema=" + std::to_string(schema_.ColumnCount()));
+      CHECK_MSG(false, "ValuesPlan row/schema width mismatch: row=" +
+                           std::to_string(row.values_.size()) +
+                           " schema=" + std::to_string(schema_.ColumnCount()));
     }
   }
 }

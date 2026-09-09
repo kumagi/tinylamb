@@ -13,13 +13,13 @@ namespace tinylamb {
 
 GenerateSeriesExecutor::GenerateSeriesExecutor(int64_t start, int64_t stop,
                                                int64_t step)
-    : start_(start), stop_(stop), step_(step), current_(start) {
-  if (step_ == 0) {
-    throw std::runtime_error("step size cannot be zero in GENERATE_SERIES");
-  }
-}
+    : start_(start), stop_(stop), step_(step), current_(start) {}
 
 bool GenerateSeriesExecutor::Next(Row* dst, RowPosition* /*rp*/) {
+  if (step_ == 0) {
+    return FailWith(StatusError(StatusCode::kInvalidArgument,
+                                "step size cannot be zero in GENERATE_SERIES"));
+  }
   if (finished_) {
     return false;
   }

@@ -81,29 +81,30 @@ size_t EstimateJoinRows(const Relation& left, const Relation& right,
 // D8 (docs/design.md): the hybrid operator supports null-safe equality
 // (NULL matches NULL), LEFT/RIGHT/FULL outer, and reprocesses every spilled
 // partition, so spilled rows are never dropped against the resident portion.
-Relation HybridHashJoin(Relation left, Relation right,
-                        const std::vector<slot_t>& left_columns,
-                        const std::vector<slot_t>& right_columns,
-                        const std::function<bool(const Row&)>& matches,
-                        bool left_join, size_t* join_comparisons,
-                        bool null_safe = false, bool right_join = false);
+StatusOr<Relation> HybridHashJoin(
+    Relation left, Relation right, const std::vector<slot_t>& left_columns,
+    const std::vector<slot_t>& right_columns,
+    const std::function<bool(const Row&)>& matches, bool left_join,
+    size_t* join_comparisons, bool null_safe = false, bool right_join = false);
 
 bool ShouldHybridJoin(const Relation& left, const Relation& right);
 
-Relation Join(TransactionContext& context, Relation left, Relation right,
-              const SelectSource& source, const Scope* outer,
-              const CteMap& ctes);
+StatusOr<Relation> Join(TransactionContext& context, Relation left,
+                        Relation right, const SelectSource& source,
+                        const Scope* outer, const CteMap& ctes);
 
-Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
-                   const std::vector<Expression>& predicates,
-                   const Scope* outer, const CteMap& ctes);
+StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
+                             Relation right,
+                             const std::vector<Expression>& predicates,
+                             const Scope* outer, const CteMap& ctes);
 
 bool IsSubset(const std::unordered_set<size_t>& values,
               const std::unordered_set<size_t>& superset);
 
-Relation BuildInput(TransactionContext& context,
-                    const SelectStatement& statement, const Scope* outer,
-                    const CteMap& ctes, bool* where_fully_applied);
+StatusOr<Relation> BuildInput(TransactionContext& context,
+                              const SelectStatement& statement,
+                              const Scope* outer, const CteMap& ctes,
+                              bool* where_fully_applied);
 
 size_t SpillPartitionOf(const std::string& key, size_t partitions);
 

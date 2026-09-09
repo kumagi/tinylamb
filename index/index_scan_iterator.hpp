@@ -49,6 +49,7 @@ class IndexScanIterator : public IteratorBase {
            current_row_ == rhs.current_row_;
   }
   [[nodiscard]] bool IsValid() const override;
+  [[nodiscard]] Status GetStatus() const override { return status_; }
   [[nodiscard]] bool IsUnique() const { return is_unique_; }
   [[nodiscard]] const Row& GetKey() const { return keys_; }
   [[nodiscard]] const Row& Include() const { return include_; }
@@ -78,6 +79,7 @@ class IndexScanIterator : public IteratorBase {
   // Set by Clear(): once cleared the iterator must never report valid again
   // even though the underlying BPlusTreeIterator may still iterate.
   bool invalidated_{false};
+  Status status_{Status::kSuccess};
   // -1 means "not positioned"; otherwise an index into the non-unique
   // value list of the current key. Signed so the sentinel cannot wrap.
   int64_t value_offset_{-1};

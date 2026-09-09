@@ -35,7 +35,7 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
 
   // PipelineBreaker interface
   [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
-  void MaterializePipeline() override { Materialize(); }
+  void MaterializePipeline() override { FailWith(Materialize()); }
   [[nodiscard]] size_t MaterializedRowCount() const override {
     return rows_.size();
   }
@@ -44,7 +44,7 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
   }
 
  private:
-  void Materialize();
+  Status Materialize();
   Executor source_;
   Schema schema_;
   std::vector<Key> keys_;

@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include "common/exc_shim.hpp"
 #include "executor/spill_file.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -42,7 +43,7 @@ struct Relation {
   void ReleaseCharge();
   void EnsureSpill();
   void AddRow(Row row);
-  void FinishSpill();
+  Status FinishSpill();
   // Drop every buffered or spilled row (and its memory charge). Callers must
   // have copied the contents out beforehand (e.g. via ForEachRow); re-adding
   // rows afterwards starts a fresh spill cycle instead of appending to the
@@ -50,32 +51,57 @@ struct Relation {
   void ResetContents();
   void set_runtime(ExecutionRuntime* runtime) { runtime_ = runtime; }
   [[nodiscard]] ExecutionRuntime* runtime() const { return runtime_; }
+  // Sticky first-error for spill-write failures on the void AddRow() path
+  // (the degraded in-memory fallback and the dropped-row branch).  Callers
+  // with an error channel can surface the truncation instead of reporting
+  // success over a partial result.
+  [[nodiscard]] Status GetStatus() const { return spill_error_; }
 
   template <typename Fn>
-  void ForEachRow(Fn&& fn) {
+  Status ForEachRow(Fn&& fn) {
+    Status first{Status::kSuccess};
     for (const Row& row : rows) {
       fn(row);
     }
     if (spill) {
-      spill->ForEachRow(fn);
+      const Status st = spill->ForEachRow(fn);
+      if (st != Status::kSuccess) {
+        first = st;
+      }
     }
     if (spill_tail_) {
-      spill_tail_->ForEachRow(fn);
+      const Status st = spill_tail_->ForEachRow(fn);
+      if (st != Status::kSuccess && first == Status::kSuccess) {
+        first = st;
+      }
     }
+    return first;
   }
 
   template <typename Fn>
-  void ForEachRow(Fn&& fn) const {
+  Status ForEachRow(Fn&& fn) const {
+    Status first{Status::kSuccess};
     for (const Row& row : rows) {
       fn(row);
     }
     if (spill) {
-      const_cast<SpillFile*>(spill.get())->ForEachRow(fn);
+      const Status st = const_cast<SpillFile*>(spill.get())->ForEachRow(fn);
+      if (st != Status::kSuccess) {
+        first = st;
+      }
     }
     if (spill_tail_) {
-      const_cast<Relation*>(this)->FinishSpill();
-      const_cast<SpillFile*>(spill_tail_.get())->ForEachRow(fn);
+      const Status fs = const_cast<Relation*>(this)->FinishSpill();
+      if (fs != Status::kSuccess && first == Status::kSuccess) {
+        first = fs;
+      }
+      const Status st =
+          const_cast<SpillFile*>(spill_tail_.get())->ForEachRow(fn);
+      if (st != Status::kSuccess && first == Status::kSuccess) {
+        first = st;
+      }
     }
+    return first;
   }
 
   [[nodiscard]] bool HasSpill() const {
@@ -95,11 +121,12 @@ struct Relation {
 
  private:
   ExecutionRuntime* runtime_{nullptr};
+  Status spill_error_{Status::kSuccess};
 };
 
 using RelationPtr = std::shared_ptr<Relation>;
 
-Relation MaterializeRelation(const Relation& source);
+StatusOr<Relation> MaterializeRelation(const Relation& source);
 
 void CopyExecutionStats(Relation* destination, const Relation& source);
 

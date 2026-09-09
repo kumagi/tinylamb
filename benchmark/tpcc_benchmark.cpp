@@ -284,7 +284,14 @@ int main(int argc, char** argv) {
   std::cout << "deadlock_policy=" << policy_source
             << " (0=legacy 1=wait_die 2=wound_wait 3=deadlock_detect)\n";
 
-  tinylamb::Database database(options.database_path, options.wal_sync_ms);
+  auto database_or_status =
+      tinylamb::Database::Create(options.database_path, options.wal_sync_ms);
+  if (!database_or_status.HasValue()) {
+    std::cerr << "failed to open database " << options.database_path << ": "
+              << database_or_status.GetStatus() << '\n';
+    return 1;
+  }
+  tinylamb::Database& database = *database_or_status.Value();
   database.SetDeadlockPolicy(deadlock_policy);
   std::string error;
   if (!options.reuse_existing) {

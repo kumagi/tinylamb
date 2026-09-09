@@ -57,9 +57,11 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
   }
   if (mode_ != InsertExecutionMode::kDefault && !enforce_primary_key_) {
     // Conflict handling is only defined for tables with a primary key.
-    throw std::runtime_error(
+    return FailWith(StatusError(
+        StatusCode::kDuplicates,
+
         "INSERT conflict clause is not allowed because the table does not "
-        "have a primary key");
+        "have a primary key"));
   }
   int64_t insertion_count = 0;
   Row new_row;
@@ -104,8 +106,11 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
           }
           if (target_->Update(*txn_, pos, updated).GetStatus() !=
               Status::kSuccess) {
-            throw std::runtime_error("insert failed on table " +
-                                     std::string(target_->GetSchema().Name()));
+            return FailWith(
+                StatusError(StatusCode::kConflicts,
+
+                            "insert failed on table " +
+                                std::string(target_->GetSchema().Name())));
           }
           if (!in_batch) {
             ++insertion_count;
@@ -116,8 +121,11 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
           const RowPosition& pos = existing_positions[key];
           if (target_->Update(*txn_, pos, new_row).GetStatus() !=
               Status::kSuccess) {
-            throw std::runtime_error("insert failed on table " +
-                                     std::string(target_->GetSchema().Name()));
+            return FailWith(
+                StatusError(StatusCode::kConflicts,
+
+                            "insert failed on table " +
+                                std::string(target_->GetSchema().Name())));
           }
           if (!in_batch) {
             ++insertion_count;
@@ -125,16 +133,22 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
           continue;
         }
         case InsertExecutionMode::kDefault:
-          throw std::runtime_error("Failed to insert row with primary key (" +
-                                   key + ") due to previously existing row");
+          return FailWith(
+              StatusError(StatusCode::kDuplicates,
+
+                          "Failed to insert row with primary key (" + key +
+                              ") due to previously existing row"));
       }
     }
     StatusOr<RowPosition> inserted = target_->Insert(*txn_, new_row);
     if (inserted.GetStatus() != Status::kSuccess) {
       // A failed insert (e.g. UNIQUE violation) must not be counted as
       // inserted; surface the failure instead of reporting success.
-      throw std::runtime_error("insert failed on table " +
-                               std::string(target_->GetSchema().Name()));
+      return FailWith(
+          StatusError(StatusCode::kConflicts,
+
+                      "insert failed on table " +
+                          std::string(target_->GetSchema().Name())));
     }
     if (has_key) {
       existing_keys.insert(key);
@@ -143,11 +157,16 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
     }
     insertion_count++;
   }
+  if (src_->GetStatus() != Status::kSuccess) {
+    return FailWith(src_->GetStatus());
+  }
   if (assert_rows_modified_ >= 0 && insertion_count != assert_rows_modified_) {
-    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
-                             std::to_string(assert_rows_modified_) +
-                             " rows, but " + std::to_string(insertion_count) +
-                             " rows were modified");
+    return FailWith(StatusError(
+        StatusCode::kInvalidArgument,
+
+        "ASSERT_ROWS_MODIFIED was specified with " +
+            std::to_string(assert_rows_modified_) + " rows, but " +
+            std::to_string(insertion_count) + " rows were modified"));
   }
   *dst = Row({Value("Insert Rows"), Value(insertion_count)});
   if (rp != nullptr) {

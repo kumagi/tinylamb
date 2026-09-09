@@ -11,6 +11,13 @@ namespace tinylamb {
 // before producing output tuples.
 class PipelineBreaker {
  public:
+  PipelineBreaker() = default;
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  PipelineBreaker(const PipelineBreaker&) = delete;
+  PipelineBreaker& operator=(const PipelineBreaker&) = delete;
+  PipelineBreaker(PipelineBreaker&&) = delete;
+  PipelineBreaker& operator=(PipelineBreaker&&) = delete;
   virtual ~PipelineBreaker() = default;
 
   [[nodiscard]] virtual bool IsPipelineBreaker() const { return true; }

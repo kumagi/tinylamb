@@ -38,6 +38,8 @@ class AggregateExpression : public ExpressionBase {
                       bool distinct = false)
       : type_(type), child_(std::move(child)), distinct_(distinct) {}
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kAggregateExp; }
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema) const override;
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;

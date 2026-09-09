@@ -29,7 +29,7 @@ std::string Upper(std::string text) {
   return text;
 }
 
-Value CoerceArrayElement(Value value, std::string_view sql_type) {
+StatusOr<Value> TryCoerceArrayElement(Value value, std::string_view sql_type) {
   if (value.IsNull()) {
     return value;
   }
@@ -46,7 +46,7 @@ Value CoerceArrayElement(Value value, std::string_view sql_type) {
     }
   }
   if (type == "DATE" && value.type == ValueType::kVarChar) {
-    return Value::Date(std::string(value.value.varchar_value));
+    return Value::TryDate(value.value.varchar_value);
   }
   if (type.starts_with("ARRAY<") && value.IsArray()) {
     return value;
@@ -56,12 +56,16 @@ Value CoerceArrayElement(Value value, std::string_view sql_type) {
 
 }  // namespace
 
-Value ArrayExpression::Evaluate(const Row& row, const Schema& schema) const {
+namespace {
+template <typename... Args>
+StatusOr<Value> TryBuildArray(const std::vector<Expression>& elements,
+                              const std::string& declared_type,
+                              Args&&... args) {
   std::vector<Value> values;
-  values.reserve(elements_.size());
-  std::string inferred_type = element_sql_type_;
-  for (const Expression& element : elements_) {
-    Value v = element->Evaluate(row, schema);
+  values.reserve(elements.size());
+  std::string inferred_type = declared_type;
+  for (const Expression& element : elements) {
+    ASSIGN_OR_RETURN(Value, v, element->TryEvaluate(args...));
     if ((inferred_type.empty() || inferred_type == "INT64") && !v.IsNull()) {
       if (v.type == ValueType::kVarChar) {
         inferred_type = "STRING";
@@ -79,68 +83,49 @@ Value ArrayExpression::Evaluate(const Row& row, const Schema& schema) const {
     inferred_type = "INT64";
   }
   for (auto& val : values) {
-    val = CoerceArrayElement(std::move(val), inferred_type);
+    ASSIGN_OR_RETURN(Value, coerced,
+                     TryCoerceArrayElement(std::move(val), inferred_type));
+    val = std::move(coerced);
   }
   return Value::Array(std::move(values), inferred_type);
+}
+}  // namespace
+
+StatusOr<Value> ArrayExpression::TryEvaluate(const Row& row,
+                                             const Schema& schema) const {
+  return TryBuildArray(elements_, element_sql_type_, row, schema);
+}
+
+StatusOr<Value> ArrayExpression::TryEvaluate(const Row* left,
+                                             const Schema& left_schema,
+                                             const Row* right,
+                                             const Schema& right_schema) const {
+  return TryBuildArray(elements_, element_sql_type_, left, left_schema, right,
+                       right_schema);
+}
+
+StatusOr<Value> ArrayExpression::TryEvaluate(const Row& row,
+                                             const Schema& schema,
+                                             EvaluationContext& context) const {
+  return TryBuildArray(elements_, element_sql_type_, row, schema, context);
+}
+
+// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+Value ArrayExpression::Evaluate(const Row& row, const Schema& schema) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema), "ArrayExpression::Evaluate");
 }
 
 Value ArrayExpression::Evaluate(const Row* left, const Schema& left_schema,
                                 const Row* right,
                                 const Schema& right_schema) const {
-  std::vector<Value> values;
-  values.reserve(elements_.size());
-  std::string inferred_type = element_sql_type_;
-  for (const Expression& element : elements_) {
-    Value v = element->Evaluate(left, left_schema, right, right_schema);
-    if ((inferred_type.empty() || inferred_type == "INT64") && !v.IsNull()) {
-      if (v.type == ValueType::kVarChar) {
-        inferred_type = "STRING";
-      } else if (v.type == ValueType::kDouble) {
-        inferred_type = "DOUBLE";
-      } else if (v.type == ValueType::kDate) {
-        inferred_type = "DATE";
-      } else if (v.IsArray()) {
-        inferred_type = "ARRAY<" + v.ArrayElementSqlType() + ">";
-      }
-    }
-    values.push_back(std::move(v));
-  }
-  if (inferred_type.empty()) {
-    inferred_type = "INT64";
-  }
-  for (auto& val : values) {
-    val = CoerceArrayElement(std::move(val), inferred_type);
-  }
-  return Value::Array(std::move(values), inferred_type);
+  return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "ArrayExpression::Evaluate");
 }
 
 Value ArrayExpression::Evaluate(const Row& row, const Schema& schema,
                                 EvaluationContext& context) const {
-  std::vector<Value> values;
-  values.reserve(elements_.size());
-  std::string inferred_type = element_sql_type_;
-  for (const Expression& element : elements_) {
-    Value v = element->Evaluate(row, schema, context);
-    if ((inferred_type.empty() || inferred_type == "INT64") && !v.IsNull()) {
-      if (v.type == ValueType::kVarChar) {
-        inferred_type = "STRING";
-      } else if (v.type == ValueType::kDouble) {
-        inferred_type = "DOUBLE";
-      } else if (v.type == ValueType::kDate) {
-        inferred_type = "DATE";
-      } else if (v.IsArray()) {
-        inferred_type = "ARRAY<" + v.ArrayElementSqlType() + ">";
-      }
-    }
-    values.push_back(std::move(v));
-  }
-  if (inferred_type.empty()) {
-    inferred_type = "INT64";
-  }
-  for (auto& val : values) {
-    val = CoerceArrayElement(std::move(val), inferred_type);
-  }
-  return Value::Array(std::move(values), inferred_type);
+  return ExcShimUnwrap(TryEvaluate(row, schema, context),
+                       "ArrayExpression::Evaluate");
 }
 
 std::string ArrayExpression::ToString() const {

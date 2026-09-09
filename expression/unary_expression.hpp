@@ -24,6 +24,10 @@
 
 namespace tinylamb {
 
+// Core unary semantics with StatusOr propagation (no-exception-rule-migration
+// Phase 5); EvaluateUnary is its deprecated EXC-SHIM wrapper.
+[[nodiscard]] StatusOr<Value> TryEvaluateUnary(UnaryOperation operation,
+                                               const Value& child);
 [[nodiscard]] Value EvaluateUnary(UnaryOperation operation, const Value& child);
 
 class UnaryExpression : public ExpressionBase {
@@ -33,6 +37,11 @@ class UnaryExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kUnaryExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row* left, const Schema& left_schema, const Row* right,
+      const Schema& right_schema) const override;
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
                                const Schema& right_schema) const override;

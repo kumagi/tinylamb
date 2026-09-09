@@ -52,15 +52,19 @@ class IndexKey final {
   // the readable payload region (page images are only trusted up to the page
   // body); a corrupt or partially written image is reported instead of
   // producing a string_view that runs past the 32 KiB page.
+  // The page image reaching here has passed the PagePool checksum gate, so
+  // a truncated or out-of-range key is an invariant violation: abort.
   static IndexKey Deserialize(const char* src, const char* end) {
     if (end < src || static_cast<size_t>(end - src) < sizeof(bin_size_t)) {
-      throw std::runtime_error("corrupt index key: truncated header");
+      CHECK_MSG(false, "corrupt index key: truncated header");
+      return {};
     }
     bin_size_t size = 0;
     DeserializeU16(src, &size);
     if (static_cast<size_t>(size) >
         static_cast<size_t>(end - src) - sizeof(bin_size_t)) {
-      throw std::runtime_error("corrupt index key: length prefix out of range");
+      CHECK_MSG(false, "corrupt index key: length prefix out of range");
+      return {};
     }
     return IndexKey(std::string_view{src + sizeof(bin_size_t), size});
   }
@@ -129,10 +133,11 @@ class IndexKey final {
         break;
       }
       default:
-        // Unknown type bytes mean a broken image; failing loudly keeps the
-        // caller's stale |key| from being mistaken for a decode result.
-        throw std::runtime_error("corrupt index key: unknown encoding " +
-                                 std::to_string(static_cast<int>(type)));
+        // Unknown type bytes mean a broken image; the sticky decoder
+        // failure keeps the caller's stale |key| from being mistaken for a
+        // decode result.
+        d.Fail();
+        break;
     }
     return d;
   }

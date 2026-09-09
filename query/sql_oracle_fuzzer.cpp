@@ -919,7 +919,10 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
 
   // Plan feedback: reward flavours that surface unseen plan shapes.
   if (session != nullptr) {
-    Database db("sql_oracle_fuzz-" + RandomString(8));
+    auto db_holder =
+        Database::Create("sql_oracle_fuzz-" + RandomString(8)).MoveValue();
+    CHECK(db_holder != nullptr);
+    Database& db = *db_holder;
     TransactionContext ctx = db.BeginContext();
     if (RunSetup(db, ctx, t.setup, verbose)) {
       std::string error;
@@ -950,7 +953,10 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   if (trace.setup.empty() || !trace.setup[0].starts_with("CREATE TABLE")) {
     return "malformed trace: no CREATE TABLE in setup";
   }
-  Database db("sql_oracle_replay-" + RandomString(8));
+  auto db_holder =
+      Database::Create("sql_oracle_replay-" + RandomString(8)).MoveValue();
+  CHECK(db_holder != nullptr);
+  Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
   if (!RunSetup(db, ctx, trace.setup, verbose)) {
     return "setup statement failed";
@@ -1093,7 +1099,10 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
 
 std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
   Gen g(rng);
-  Database db("sql_oracle_amoeba-" + RandomString(8));
+  auto db_holder =
+      Database::Create("sql_oracle_amoeba-" + RandomString(8)).MoveValue();
+  CHECK(db_holder != nullptr);
+  Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
   const std::string tab =
       "t" +

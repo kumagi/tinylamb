@@ -27,9 +27,9 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
-#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 
 #include "common/constants.hpp"
@@ -38,11 +38,25 @@
 namespace tinylamb {
 
 namespace {
-int CreateFile(const std::filesystem::path& path) {
+StatusOr<int> CreateFile(const std::filesystem::path& path) {
+  std::error_code ec;
   if (path.has_parent_path()) {
-    std::filesystem::create_directories(path.parent_path());
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to create log directory for " + path.string() +
+                             ": " + ec.message());
+    }
   }
-  return ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+  const int fd =
+      ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+  if (fd == -1) {
+    return StatusError(
+        StatusCode::kIOError,
+        "Failed to open log file: " + std::string(std::strerror(errno)) +
+            " for " + path.string());
+  }
+  return fd;
 }
 
 // fdatasync (F_FULLFSYNC on macOS) with EINTR retry. The caller must check
@@ -63,37 +77,42 @@ int FdataSync(int fd) {
 
 }  // namespace
 
-Logger::Logger(const std::filesystem::path& logfile, size_t buffer_size,
-               size_t every_ms)
-    : buffer_(std::max<size_t>(1, buffer_size), 0),
-      sync_interval_(std::chrono::milliseconds(std::max<size_t>(1, every_ms))),
-      dst_(CreateFile(logfile)) {
-  if (dst_ == -1) {
-    throw std::runtime_error(
-        "Failed to open log file: " + std::string(std::strerror(errno)) +
-        " for " + logfile.string());
-  }
+StatusOr<std::unique_ptr<Logger>> Logger::Create(
+    const std::filesystem::path& logfile, size_t buffer_size, size_t every_ms) {
+  ASSIGN_OR_RETURN(int, fd, CreateFile(logfile));
+  std::error_code ec;
   // All state must be consistent before the worker starts; otherwise the
   // worker may observe flushed_lsn_ == 0 and append zeros over an existing
   // WAL.
-  try {
-    const lsn_t file_size = std::filesystem::file_size(logfile);
-    flushed_lsn_.store(file_size, std::memory_order_relaxed);
-    durable_lsn_.store(file_size, std::memory_order_release);
-    buffered_lsn_.store(file_size, std::memory_order_release);
-  } catch (...) {
-    // The constructor must not leak dst_ when stat fails (no destructor runs).
-    close(dst_);
-    throw;
+  const lsn_t file_size = std::filesystem::file_size(logfile, ec);
+  if (ec) {
+    close(fd);
+    return StatusError(
+        StatusCode::kIOError,
+        "Failed to stat log file " + logfile.string() + ": " + ec.message());
   }
+  // std::thread has no noexcept construction path; EAGAIN/ENOMEM from the
+  // pthread layer is caught at this boundary and mapped to a Status.
+  auto logger = std::unique_ptr<Logger>(
+      new Logger(logfile, buffer_size, every_ms));  // NOLINT
+  logger->dst_ = fd;
+  logger->flushed_lsn_.store(file_size, std::memory_order_relaxed);
+  logger->durable_lsn_.store(file_size, std::memory_order_release);
+  logger->buffered_lsn_.store(file_size, std::memory_order_release);
   try {
-    worker_ = std::thread(&Logger::LoggerWork, this);
-  } catch (...) {
-    // Thread creation can throw (EAGAIN/ENOMEM); no destructor runs on a
-    // failed constructor, so the WAL descriptor must be closed here too.
-    close(dst_);
-    throw;
+    logger->worker_ = std::thread(&Logger::LoggerWork, logger.get());
+  } catch (const std::system_error& error) {
+    close(fd);
+    return StatusError(StatusCode::kIOError, "Failed to start logger worker: " +
+                                                 std::string(error.what()));
   }
+  return logger;
+}
+
+Logger::Logger(const std::filesystem::path& /*logfile*/, size_t buffer_size,
+               size_t every_ms)
+    : buffer_(std::max<size_t>(1, buffer_size), 0),
+      sync_interval_(std::chrono::milliseconds(std::max<size_t>(1, every_ms))) {
 }
 
 Logger::~Logger() {
@@ -126,13 +145,14 @@ void Logger::SetFailed(int err) {
   work_cv_.notify_all();
 }
 
-void Logger::RaiseIfFailed() const {
+Status Logger::CheckFailed() const {
   if (!failed_.load(std::memory_order_acquire)) {
-    return;
+    return Status::kSuccess;
   }
-  throw std::runtime_error("Logger write failed: " +
-                           std::string(std::strerror(
-                               error_number_.load(std::memory_order_acquire))));
+  return StatusError(StatusCode::kIOError,
+                     "Logger write failed: " +
+                         std::string(std::strerror(
+                             error_number_.load(std::memory_order_acquire))));
 }
 
 void Logger::AdvanceDurable(lsn_t to) {
@@ -145,7 +165,7 @@ void Logger::AdvanceDurable(lsn_t to) {
   durable_cv_.notify_all();
 }
 
-void Logger::WaitForDurable(lsn_t lsn) {
+Status Logger::WaitForDurable(lsn_t lsn) {
   pending_durable_waiters_.fetch_add(1, std::memory_order_acq_rel);
   const bool already_satisfied =
       failed_.load(std::memory_order_acquire) ||
@@ -161,7 +181,7 @@ void Logger::WaitForDurable(lsn_t lsn) {
     });
   }
   pending_durable_waiters_.fetch_sub(1, std::memory_order_acq_rel);
-  RaiseIfFailed();
+  return CheckFailed();
 }
 
 void Logger::TruncateTo(lsn_t valid_end) {
@@ -210,18 +230,19 @@ void Logger::DrainAndStopWorker() {
   }
 }
 
-void Logger::Finish() {
+Status Logger::Finish() {
   DrainAndStopWorker();
-  RaiseIfFailed();
+  return CheckFailed();
 }
 
-lsn_t Logger::AddLog(std::string_view payload) {
-  RaiseIfFailed();
+StatusOr<lsn_t> Logger::AddLog(std::string_view payload) {
+  RETURN_IF_FAIL(CheckFailed());
   // D1: refuse records the recovery reader could never parse back.
   if (payload.size() > kMaxRecordSize) {
-    throw std::invalid_argument("WAL record exceeds Logger::kMaxRecordSize: " +
-                                std::to_string(payload.size()) + " > " +
-                                std::to_string(kMaxRecordSize));
+    return StatusError(StatusCode::kTooBigData,
+                       "WAL record exceeds Logger::kMaxRecordSize: " +
+                           std::to_string(payload.size()) + " > " +
+                           std::to_string(kMaxRecordSize));
   }
   std::unique_lock enq_lk{enqueue_latch_};
   const lsn_t lsn = buffered_lsn_.load(std::memory_order_relaxed);
@@ -242,7 +263,7 @@ lsn_t Logger::AddLog(std::string_view payload) {
                        flushed_lsn_.load(std::memory_order_acquire) <
                    buffer_.size();
       });
-      RaiseIfFailed();
+      RETURN_IF_FAIL(CheckFailed());
       continue;
     }
     const size_t buffered = buffered_lsn % buffer_.size();

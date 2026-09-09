@@ -52,11 +52,17 @@ std::string FrameBoundToString(const WindowFrameBound& bound) {
 }
 }  // namespace
 
-Value WindowFunctionCallExpression::Evaluate(const Row& /*row*/,
-                                             const Schema& /*schema*/) const {
-  throw std::runtime_error(
-      "window function " + function +
-      " evaluated without pre-computation (internal error)");
+StatusOr<Value> WindowFunctionCallExpression::TryEvaluate(
+    const Row& /*row*/, const Schema& /*schema*/) const {
+  return StatusError(StatusCode::kRuntimeError,
+                     "window function " + function +
+                         " evaluated without pre-computation (internal error)");
+}
+
+Value WindowFunctionCallExpression::Evaluate(const Row& row,
+                                             const Schema& schema) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema),
+                       "WindowFunctionCallExpression::Evaluate");
 }
 
 Type WindowFunctionCallExpression::ResultType(const Schema& /*unused*/) const {

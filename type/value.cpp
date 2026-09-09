@@ -38,6 +38,7 @@
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
@@ -221,8 +222,9 @@ Value::Value(double double_value) {
   value.double_value = double_value;
 }
 
-Value Value::Date(std::string_view date) {
-  return DateFromDays(ParseDateDays(date));
+StatusOr<Value> Value::TryDate(std::string_view date) {
+  ASSIGN_OR_RETURN(int64_t, days, TryParseDateDays(date));
+  return DateFromDays(days);
 }
 
 Value Value::DateFromDays(int64_t days) {
@@ -233,9 +235,7 @@ Value Value::DateFromDays(int64_t days) {
 }
 
 int64_t Value::DateDays() const {
-  if (type != ValueType::kDate) {
-    throw std::runtime_error("DATE value required");
-  }
+  CHECK_MSG(type == ValueType::kDate, "DATE value required");
   return value.int_value;
 }
 
@@ -361,7 +361,36 @@ bool Value::Truthy() const {
       return bytes;
     }
   }
-  throw std::runtime_error("undefined type");
+  CHECK_MSG(false, "undefined type");
+  return 0;
+}
+
+Status Value::CheckSerializable() const {
+  switch (type) {
+    case ValueType::kNull:
+    case ValueType::kInt64:
+    case ValueType::kDate:
+    case ValueType::kDouble:
+      return Status::kSuccess;
+    case ValueType::kVarChar:
+      if (value.varchar_value.size() > std::numeric_limits<bin_size_t>::max()) {
+        return StatusError(StatusCode::kTooBigData,
+                           "string too long to serialize");
+      }
+      return Status::kSuccess;
+    case ValueType::kArray:
+      if (ArrayElementSqlType().size() >
+          std::numeric_limits<bin_size_t>::max()) {
+        return StatusError(StatusCode::kTooBigData,
+                           "array type name too long to serialize");
+      }
+      for (const Value& element : ArrayElements()) {
+        RETURN_IF_FAIL(element.CheckSerializable());
+      }
+      return Status::kSuccess;
+  }
+  CHECK_MSG(false, "undefined type");
+  return Status::kSuccess;
 }
 
 size_t Value::Serialize(char* dst) const {
@@ -392,14 +421,16 @@ size_t Value::Serialize(char* dst) const {
       return static_cast<size_t>(cursor - dst);
     }
   }
-  throw std::runtime_error("undefined type");
+  CHECK_MSG(false, "undefined type");
+  return 0;
 }
 
-size_t Value::Deserialize(const char* src, ValueType as_type) {
+StatusOr<size_t> Value::TryDeserialize(const char* src, ValueType as_type) {
   type = as_type;
   switch (as_type) {
     case ValueType::kNull:
-      throw std::runtime_error("Cannot parse without type.");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Cannot parse without type.");
     case ValueType::kInt64:
     case ValueType::kDate:
       return DeserializeInteger(src, &value.int_value);
@@ -429,7 +460,9 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
         }
         const auto elem_type = static_cast<ValueType>(*cursor++);
         Value element;
-        cursor += element.Deserialize(cursor, elem_type);
+        ASSIGN_OR_RETURN(size_t, consumed,
+                         element.TryDeserialize(cursor, elem_type));
+        cursor += consumed;
         elements.push_back(std::move(element));
       }
       array_ = std::make_shared<ArrayPayload>();
@@ -438,13 +471,14 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
       return static_cast<size_t>(cursor - src);
     }
   }
-  throw std::runtime_error("undefined type");
+  return StatusError(StatusCode::kCorrupt, "undefined type");
 }
 
-size_t Value::SkipSerialized(const char* src, ValueType as_type) {
+StatusOr<size_t> Value::TrySkipSerialized(const char* src, ValueType as_type) {
   switch (as_type) {
     case ValueType::kNull:
-      throw std::runtime_error("Cannot skip without type.");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Cannot skip without type.");
     case ValueType::kInt64:
     case ValueType::kDate:
       return sizeof(int64_t);
@@ -467,12 +501,14 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
           continue;
         }
         const auto elem_type = static_cast<ValueType>(*cursor++);
-        cursor += SkipSerialized(cursor, elem_type);
+        ASSIGN_OR_RETURN(size_t, consumed,
+                         TrySkipSerialized(cursor, elem_type));
+        cursor += consumed;
       }
       return static_cast<size_t>(cursor - src);
     }
   }
-  throw std::runtime_error("undefined type");
+  return StatusError(StatusCode::kCorrupt, "undefined type");
 }
 
 std::string FormatDoubleShortest(double value) {
@@ -527,7 +563,8 @@ std::string FormatDoubleShortest(double value) {
       return out;
     }
   }
-  throw std::runtime_error("undefined type");
+  CHECK_MSG(false, "undefined type");
+  return "";
 }
 
 namespace {
@@ -554,9 +591,10 @@ bool LooksLikeIntervalText(std::string_view s) {
 }
 
 std::optional<IntervalValue> ParseAsInterval(std::string_view s) {
-  try {
-    return IntervalValue::Parse(s);
-  } catch (const std::exception&) {
+  if (auto parsed = IntervalValue::TryParse(s); parsed.HasValue()) {
+    return parsed.MoveValue();
+  }
+  {
     return std::nullopt;
   }
 }
@@ -605,7 +643,8 @@ bool Value::operator==(const Value& rhs) const {
       return ArrayElementSqlType() == rhs.ArrayElementSqlType() &&
              ArrayElements() == rhs.ArrayElements();
   }
-  throw std::runtime_error("undefined type");
+  CHECK_MSG(false, "undefined type");
+  return false;
 }
 
 namespace {
@@ -618,10 +657,12 @@ std::string EncodeMemcomparableFormatInteger(int64_t in) {
   return ret;
 }
 
-size_t DecodeMemcomparableFormatInteger(const char* src, const char* end,
-                                        int64_t* dst) {
+StatusOr<size_t> DecodeMemcomparableFormatInteger(const char* src,
+                                                  const char* end,
+                                                  int64_t* dst) {
   if (static_cast<size_t>(end - src) < sizeof(uint64_t)) {
-    throw std::runtime_error("corrupt memcomparable integer: truncated");
+    return StatusError(StatusCode::kCorrupt,
+                       "corrupt memcomparable integer: truncated");
   }
   uint64_t loaded = 0;
   ::memcpy(&loaded, src, sizeof(loaded));
@@ -657,14 +698,16 @@ std::string EncodeMemcomparableFormatVarchar(std::string_view in) {
   }
 }
 
-size_t DecodeMemcomparableFormatVarchar(const char* src, const char* end,
-                                        std::string* dst) {
+StatusOr<size_t> DecodeMemcomparableFormatVarchar(const char* src,
+                                                  const char* end,
+                                                  std::string* dst) {
   dst->clear();
   const char* buffer = nullptr;
   const char* const initial_offset = src;
   for (size_t size = 0;;) {
     if (static_cast<size_t>(end - src) < 9) {
-      throw std::runtime_error("corrupt memcomparable varchar: truncated");
+      return StatusError(StatusCode::kCorrupt,
+                         "corrupt memcomparable varchar: truncated");
     }
     buffer = src;
     const size_t offset = dst->size();
@@ -684,7 +727,8 @@ size_t DecodeMemcomparableFormatVarchar(const char* src, const char* end,
       src += 9;
       break;
     } else if (8 < flag) {
-      throw std::runtime_error("corrupt memcomparable varchar length");
+      return StatusError(StatusCode::kCorrupt,
+                         "corrupt memcomparable varchar length");
     } else {
       size += flag;
       src += 9;
@@ -717,10 +761,11 @@ std::string EncodeMemcomparableFormatDouble(double in) {
   return ret;
 }
 
-size_t DecodeMemcomparableFormatDouble(const char* src, const char* end,
-                                       double* dst) {
+StatusOr<size_t> DecodeMemcomparableFormatDouble(const char* src,
+                                                 const char* end, double* dst) {
   if (static_cast<size_t>(end - src) < sizeof(int64_t)) {
-    throw std::runtime_error("corrupt memcomparable double: truncated");
+    return StatusError(StatusCode::kCorrupt,
+                       "corrupt memcomparable double: truncated");
   }
   int64_t loaded = 0;
   std::memcpy(&loaded, src, sizeof(int64_t));
@@ -735,10 +780,11 @@ size_t DecodeMemcomparableFormatDouble(const char* src, const char* end,
 }
 }  // anonymous namespace
 
-std::string Value::EncodeMemcomparableFormat() const {
+StatusOr<std::string> Value::TryEncodeMemcomparableFormat() const {
   switch (type) {
     case ValueType::kNull:
-      throw std::runtime_error("Cannot encode unknown type.");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Cannot encode unknown type.");
     case ValueType::kInt64:
       return EncodeMemcomparableFormatInteger(value.int_value);
     case ValueType::kDate: {
@@ -764,47 +810,63 @@ std::string Value::EncodeMemcomparableFormat() const {
           continue;
         }
         encoded.push_back(1);
-        encoded += element.EncodeMemcomparableFormat();
+        ASSIGN_OR_RETURN(std::string, element_encoded,
+                         element.TryEncodeMemcomparableFormat());
+        encoded += element_encoded;
       }
       return encoded;
     }
   }
-  throw std::runtime_error("undefined type");
+  CHECK_MSG(false, "undefined type");
+  return std::string();
 }
 
-size_t Value::DecodeMemcomparableFormat(std::string_view src) {
+StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
   const char* cursor = src.data();
   const char* const end = src.data() + src.size();
   if (cursor == end) {
-    throw std::runtime_error("corrupt memcomparable value: empty buffer");
+    return StatusError(StatusCode::kCorrupt,
+                       "corrupt memcomparable value: empty buffer");
   }
   switch (static_cast<ValueType>(*cursor++)) {
     case ValueType::kNull:
-      throw std::runtime_error("Cannot decode unknown type.");
-    case ValueType::kInt64:
+      return StatusError(StatusCode::kCorrupt, "Cannot decode unknown type.");
+    case ValueType::kInt64: {
       type = ValueType::kInt64;
-      return DecodeMemcomparableFormatInteger(cursor, end, &value.int_value) +
-             1;
-    case ValueType::kDate:
+      ASSIGN_OR_RETURN(
+          size_t, len,
+          DecodeMemcomparableFormatInteger(cursor, end, &value.int_value));
+      return len + 1;
+    }
+    case ValueType::kDate: {
       type = ValueType::kDate;
-      return DecodeMemcomparableFormatInteger(cursor, end, &value.int_value) +
-             1;
+      ASSIGN_OR_RETURN(
+          size_t, len,
+          DecodeMemcomparableFormatInteger(cursor, end, &value.int_value));
+      return len + 1;
+    }
     case ValueType::kVarChar: {
       type = ValueType::kVarChar;
-      size_t len = DecodeMemcomparableFormatVarchar(cursor, end, &owned_data);
+      ASSIGN_OR_RETURN(
+          size_t, len,
+          DecodeMemcomparableFormatVarchar(cursor, end, &owned_data));
       value.varchar_value = owned_data;
       return len + 1;
     }
-    case ValueType::kDouble:
+    case ValueType::kDouble: {
       type = ValueType::kDouble;
-      return DecodeMemcomparableFormatDouble(cursor, end, &value.double_value) +
-             1;
+      ASSIGN_OR_RETURN(
+          size_t, len,
+          DecodeMemcomparableFormatDouble(cursor, end, &value.double_value));
+      return len + 1;
+    }
     case ValueType::kArray: {
       type = ValueType::kArray;
       const char* p = cursor;
       uint32_t be = 0;
       if (static_cast<size_t>(end - p) < sizeof(be)) {
-        throw std::runtime_error("corrupt memcomparable array: truncated");
+        return StatusError(StatusCode::kCorrupt,
+                           "corrupt memcomparable array: truncated");
       }
       std::memcpy(&be, p, sizeof(be));
       p += sizeof(be);
@@ -814,12 +876,14 @@ size_t Value::DecodeMemcomparableFormat(std::string_view src) {
       // the key buffer.  Real SQL type names are far shorter than this cap.
       while (p != end && *p != '\0') {
         if (static_cast<size_t>(p - type_begin) >= 64) {
-          throw std::runtime_error("corrupt memcomparable array type name");
+          return StatusError(StatusCode::kCorrupt,
+                             "corrupt memcomparable array type name");
         }
         ++p;
       }
       if (p == end) {
-        throw std::runtime_error("corrupt memcomparable array type name");
+        return StatusError(StatusCode::kCorrupt,
+                           "corrupt memcomparable array type name");
       }
       std::string sql_type(type_begin, p);
       ++p;
@@ -828,13 +892,15 @@ size_t Value::DecodeMemcomparableFormat(std::string_view src) {
       // array instead of attempting a multi-gigabyte allocation.
       constexpr uint32_t kMaxEncodedArrayElements = 1U << 20;
       if (count > kMaxEncodedArrayElements) {
-        throw std::runtime_error("corrupt memcomparable array element count");
+        return StatusError(StatusCode::kCorrupt,
+                           "corrupt memcomparable array element count");
       }
       std::vector<Value> elements;
       elements.reserve(count);
       for (uint32_t i = 0; i < count; ++i) {
         if (p == end) {
-          throw std::runtime_error("corrupt memcomparable array: truncated");
+          return StatusError(StatusCode::kCorrupt,
+                             "corrupt memcomparable array: truncated");
         }
         if (*p++ == 0) {
           elements.emplace_back();
@@ -842,7 +908,8 @@ size_t Value::DecodeMemcomparableFormat(std::string_view src) {
         }
         Value element;
         std::string_view rest(p, static_cast<size_t>(end - p));
-        const size_t advanced = element.DecodeMemcomparableFormat(rest);
+        ASSIGN_OR_RETURN(size_t, advanced,
+                         element.TryDecodeMemcomparableFormat(rest));
         p += advanced;
         elements.push_back(std::move(element));
       }
@@ -852,16 +919,18 @@ size_t Value::DecodeMemcomparableFormat(std::string_view src) {
       return static_cast<size_t>(p - cursor) + 1;
     }
   }
-  throw std::runtime_error("broken data");
+  return StatusError(StatusCode::kCorrupt, "broken data");
 }
 
-bool Value::operator<(const Value& rhs) const {
+StatusOr<bool> Value::TryLess(const Value& rhs) const {
   if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot be compared.");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Different type cannot be compared.");
   }
   switch (type) {
     case ValueType::kNull:
-      throw std::runtime_error("Unknown type cannot be compared.");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Unknown type cannot be compared.");
     case ValueType::kInt64:
     case ValueType::kDate:
       return value.int_value < rhs.value.int_value;
@@ -882,16 +951,18 @@ bool Value::operator<(const Value& rhs) const {
     case ValueType::kArray:
       return ArrayElements() < rhs.ArrayElements();
   }
-  throw std::runtime_error("undefined type");
+  return StatusError(StatusCode::kInvalidArgument, "undefined type");
 }
 
-bool Value::operator>(const Value& rhs) const {
+StatusOr<bool> Value::TryGreater(const Value& rhs) const {
   if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot be compared.");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Different type cannot be compared.");
   }
   switch (type) {
     case ValueType::kNull:
-      throw std::runtime_error("Unknown type cannot be compared.");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Unknown type cannot be compared.");
     case ValueType::kInt64:
     case ValueType::kDate:
       return value.int_value > rhs.value.int_value;
@@ -912,133 +983,131 @@ bool Value::operator>(const Value& rhs) const {
     case ValueType::kArray:
       return ArrayElements() > rhs.ArrayElements();
   }
-  throw std::runtime_error("undefined type");
+  return StatusError(StatusCode::kInvalidArgument, "undefined type");
 }
 
-Value Value::operator+(const Value& rhs) const {
-  if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot be added.");
+StatusOr<Value> Value::TryArithmetic(const Value& rhs,
+                                     BinaryOperation op) const {
+  const auto invalid = [](std::string_view message) -> Status {
+    return StatusError(StatusCode::kInvalidArgument, std::string(message));
+  };
+  switch (op) {
+    case BinaryOperation::kAdd:
+      if (type != rhs.type) {
+        return invalid("Different type cannot be added.");
+      }
+      if (type == ValueType::kInt64) {
+        int64_t result = 0;
+        if (__builtin_add_overflow(value.int_value, rhs.value.int_value,
+                                   &result)) {
+          return invalid("integer overflow on '+'");
+        }
+        return Value(result);
+      }
+      if (type == ValueType::kDouble) {
+        return Value(value.double_value + rhs.value.double_value);
+      }
+      if (type == ValueType::kVarChar) {
+        std::string new_string(value.varchar_value);
+        new_string += rhs.value.varchar_value;
+        return Value(std::move(new_string));
+      }
+      return invalid("Cannot do '+' against this type");
+    case BinaryOperation::kSubtract:
+      if (type != rhs.type) {
+        return invalid("Different type cannot be subtracted.");
+      }
+      if (type == ValueType::kInt64) {
+        int64_t result = 0;
+        if (__builtin_sub_overflow(value.int_value, rhs.value.int_value,
+                                   &result)) {
+          return invalid("integer overflow on '-'");
+        }
+        return Value(result);
+      }
+      if (type == ValueType::kDouble) {
+        return Value(value.double_value - rhs.value.double_value);
+      }
+      return invalid("Cannot do '-' against this type");
+    case BinaryOperation::kMultiply:
+      if (type != rhs.type) {
+        return invalid("Different type cannot be multiplied.");
+      }
+      if (type == ValueType::kInt64) {
+        int64_t result = 0;
+        if (__builtin_mul_overflow(value.int_value, rhs.value.int_value,
+                                   &result)) {
+          return invalid("integer overflow on '*'");
+        }
+        return Value(result);
+      }
+      if (type == ValueType::kDouble) {
+        return Value(value.double_value * rhs.value.double_value);
+      }
+      return invalid("Cannot do '*' against this type");
+    case BinaryOperation::kDivide:
+      if (type != rhs.type) {
+        return invalid("Different type cannot be divided.");
+      }
+      if (type == ValueType::kInt64) {
+        if (rhs.value.int_value == 0) {
+          return StatusError(StatusCode::kIsInfinity, "division by zero");
+        }
+        // INT64_MIN / -1 overflows int64 and would raise SIGFPE.
+        if (value.int_value == std::numeric_limits<int64_t>::min() &&
+            rhs.value.int_value == -1) {
+          return invalid("integer overflow on '/'");
+        }
+        return Value(value.int_value / rhs.value.int_value);
+      }
+      if (type == ValueType::kDouble) {
+        return Value(value.double_value / rhs.value.double_value);
+      }
+      return invalid("Cannot do '/' against this type");
+    case BinaryOperation::kModulo:
+      if (type != rhs.type) {
+        return invalid("Different type cannot do modulo.");
+      }
+      if (type == ValueType::kInt64) {
+        if (rhs.value.int_value == 0) {
+          return StatusError(StatusCode::kIsInfinity, "modulo by zero");
+        }
+        // INT64_MIN % -1 would raise SIGFPE on x86 despite the mathematical
+        // result (0) being representable.
+        if (value.int_value == std::numeric_limits<int64_t>::min() &&
+            rhs.value.int_value == -1) {
+          return invalid("integer overflow on '%'");
+        }
+        return Value(value.int_value % rhs.value.int_value);
+      }
+      return invalid("Cannot do '%' against this type");
+    case BinaryOperation::kAnd:
+      if (type != rhs.type) {
+        return invalid("Different type cannot do AND.");
+      }
+      if (type == ValueType::kInt64) {
+        return Value(value.int_value & rhs.value.int_value);
+      }
+      return invalid("Cannot do '&' against this type");
+    case BinaryOperation::kOr:
+      if (type != rhs.type) {
+        return invalid("Different type cannot do OR.");
+      }
+      if (type == ValueType::kInt64) {
+        return Value(value.int_value | rhs.value.int_value);
+      }
+      return invalid("Cannot do '|' against this type");
+    case BinaryOperation::kXor:
+      if (type != rhs.type) {
+        return invalid("Different type cannot do XOR.");
+      }
+      if (type == ValueType::kInt64) {
+        return Value(value.int_value ^ rhs.value.int_value);
+      }
+      return invalid("Cannot do '^' against this type");
+    default:
+      return invalid("Cannot do arithmetic against this type");
   }
-  if (type == ValueType::kInt64) {
-    int64_t result = 0;
-    if (__builtin_add_overflow(value.int_value, rhs.value.int_value, &result)) {
-      throw std::runtime_error("integer overflow on '+'");
-    }
-    return Value(result);
-  }
-  if (type == ValueType::kDouble) {
-    return Value(value.double_value + rhs.value.double_value);
-  }
-  if (type == ValueType::kVarChar) {
-    std::string new_string(value.varchar_value);
-    new_string += rhs.value.varchar_value;
-    return Value(std::move(new_string));
-  }
-  throw std::runtime_error("Cannot do '+' against this type");
-}
-
-Value Value::operator-(const Value& rhs) const {
-  if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot be subtracted.");
-  }
-  if (type == ValueType::kInt64) {
-    int64_t result = 0;
-    if (__builtin_sub_overflow(value.int_value, rhs.value.int_value, &result)) {
-      throw std::runtime_error("integer overflow on '-'");
-    }
-    return Value(result);
-  }
-  if (type == ValueType::kDouble) {
-    return Value(value.double_value - rhs.value.double_value);
-  }
-  throw std::runtime_error("Cannot do '-' against this type");
-}
-
-Value Value::operator*(const Value& rhs) const {
-  if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot be multiplied.");
-  }
-  if (type == ValueType::kInt64) {
-    int64_t result = 0;
-    if (__builtin_mul_overflow(value.int_value, rhs.value.int_value, &result)) {
-      throw std::runtime_error("integer overflow on '*'");
-    }
-    return Value(result);
-  }
-  if (type == ValueType::kDouble) {
-    return Value(value.double_value * rhs.value.double_value);
-  }
-  throw std::runtime_error("Cannot do '*' against this type");
-}
-
-Value Value::operator/(const Value& rhs) const {
-  if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot be divided.");
-  }
-  if (type == ValueType::kInt64) {
-    if (rhs.value.int_value == 0) {
-      throw std::runtime_error("division by zero");
-    }
-    // INT64_MIN / -1 overflows int64 and would raise SIGFPE.
-    if (value.int_value == std::numeric_limits<int64_t>::min() &&
-        rhs.value.int_value == -1) {
-      throw std::runtime_error("integer overflow on '/'");
-    }
-    return Value(value.int_value / rhs.value.int_value);
-  }
-  if (type == ValueType::kDouble) {
-    return Value(value.double_value / rhs.value.double_value);
-  }
-  throw std::runtime_error("Cannot do '/' against this type");
-}
-
-Value Value::operator%(const Value& rhs) const {
-  if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot do modulo.");
-  }
-  if (type == ValueType::kInt64) {
-    if (rhs.value.int_value == 0) {
-      throw std::runtime_error("modulo by zero");
-    }
-    // INT64_MIN % -1 would raise SIGFPE on x86 despite the mathematical
-    // result (0) being representable.
-    if (value.int_value == std::numeric_limits<int64_t>::min() &&
-        rhs.value.int_value == -1) {
-      throw std::runtime_error("integer overflow on '%'");
-    }
-    return Value(value.int_value % rhs.value.int_value);
-  }
-  throw std::runtime_error("Cannot do '%' against this type");
-}
-
-Value Value::operator&(const Value& rhs) const {
-  if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot do AND.");
-  }
-  if (type == ValueType::kInt64) {
-    return Value(value.int_value & rhs.value.int_value);
-  }
-  throw std::runtime_error("Cannot do '&' against this type");
-}
-
-Value Value::operator|(const Value& rhs) const {
-  if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot do OR.");
-  }
-  if (type == ValueType::kInt64) {
-    return Value(value.int_value | rhs.value.int_value);
-  }
-  throw std::runtime_error("Cannot do '|' against this type");
-}
-
-Value Value::operator^(const Value& rhs) const {
-  if (type != rhs.type) {
-    throw std::runtime_error("Different type cannot do XOR.");
-  }
-  if (type == ValueType::kInt64) {
-    return Value(value.int_value ^ rhs.value.int_value);
-  }
-  throw std::runtime_error("Cannot do '^' against this type");
 }
 
 int CompareForOrderBy(const Value& a, const Value& b) {
@@ -1182,7 +1251,10 @@ Decoder& operator>>(Decoder& e, Value& v) {
     }
     default:
       // Corrupted stream: the raw byte read into v.type was not a ValueType.
-      throw std::runtime_error("undefined type");
+      // Sticky decoder failure so callers that check Decoder::Failed() can
+      // reject the stream; CHECK in debug keeps plumbing bugs loud.
+      e.Fail();
+      break;
   }
   return e;
 }
@@ -1228,5 +1300,6 @@ uint64_t std::hash<tinylamb::Value>::operator()(
       return h;
     }
   }
-  throw std::runtime_error("undefined type");
+  CHECK_MSG(false, "undefined type");
+  return 0;
 }

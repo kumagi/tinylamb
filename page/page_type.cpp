@@ -67,8 +67,9 @@ Decoder& operator>>(Decoder& d, PageType& type) {
   d >> raw;
   if (raw > kMaxValid) {
     // Broken images must not leak out-of-range enum values into downstream
-    // switches; fail loudly instead.
-    throw std::runtime_error("corrupt page type: " + std::to_string(raw));
+    // switches; the sticky decoder failure propagates as kCorrupt.
+    d.Fail();
+    return d;
   }
   type = static_cast<PageType>(raw);
   return d;

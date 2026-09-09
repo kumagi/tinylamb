@@ -234,6 +234,7 @@ tinylamb_add_layer(tinylamb_page
         page/branch_page.cpp
         recovery/logger.cpp
         recovery/log_record.cpp
+        recovery/log_record_oracle.cpp
         recovery/recovery_manager.cpp
         recovery/checkpoint_manager.cpp
         transaction/lock_manager.cpp
@@ -247,6 +248,8 @@ tinylamb_add_layer(tinylamb_index
         SOURCES
         index/b_plus_tree.cpp
         index/b_plus_tree_iterator.cpp
+        index/b_plus_tree_oracle.cpp
+        index/lsm_tree_oracle.cpp
         index/index.cpp
         index/index_schema.cpp
         index/lsm_tree.cpp
@@ -663,9 +666,12 @@ add_simple_test(page/pax_page_test.cpp)
 add_simple_test(page/page_type_test.cpp)
 add_simple_test(recovery/logger_test.cpp)
 add_simple_test(recovery/log_record_test.cpp)
+add_simple_test(recovery/log_record_oracle_test.cpp)
 add_simple_test(recovery/recovery_manager_test.cpp)
 add_simple_test(recovery/checkpoint_manager_test.cpp)
 add_simple_test(index/b_plus_tree_test.cpp)
+add_simple_test(index/b_plus_tree_oracle_test.cpp)
+add_simple_test(index/lsm_tree_oracle_test.cpp)
 add_simple_test(index/b_plus_tree_iterator_test.cpp)
 add_simple_test(index/lsm_tree_test.cpp)
 add_simple_test(table/table_test.cpp)
@@ -750,6 +756,8 @@ add_simple_test(transaction/transaction_extra_test.cpp)
 add_simple_test(page/page_extra_test.cpp)
 add_simple_test(expression/expr_extra_test.cpp)
 add_simple_test(cli_main_test.cpp)
+# The CLI end-to-end test spawns the tinylamb executable next to itself.
+add_dependencies(cli_main_test tinylamb)
 
 # Concurrency tests.
 add_simple_test(page/row_page_concurrent_test.cpp)

@@ -23,6 +23,12 @@ namespace tinylamb {
 // inputs.
 class MaterializeExecutor : public ExecutorBase, public PipelineBreaker {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  MaterializeExecutor(const MaterializeExecutor&) = delete;
+  MaterializeExecutor& operator=(const MaterializeExecutor&) = delete;
+  MaterializeExecutor(MaterializeExecutor&&) = delete;
+  MaterializeExecutor& operator=(MaterializeExecutor&&) = delete;
   MaterializeExecutor(Executor child, Schema schema);
   ~MaterializeExecutor() override = default;
 

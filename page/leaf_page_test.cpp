@@ -47,7 +47,7 @@ class LeafPageTest : public ::testing::Test {
     log_name_ = prefix + ".log";
     Recover();
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     leaf_page_id_ = page->PageID();
     EXPECT_SUCCESS(txn.PreCommit());
   }
@@ -61,14 +61,14 @@ class LeafPageTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
+    p_ = PageManager::Create(db_name_, 10).MoveValue();
+    l_ = Logger::Create(log_name_).MoveValue();
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
   }
 
-  PageRef Page() { return p_->GetPage(leaf_page_id_); }
+  PageRef Page() { return p_->GetPage(leaf_page_id_).MoveValue(); }
 
   void TearDown() override {
     std::ignore = std::remove(db_name_.c_str());
@@ -320,8 +320,8 @@ TEST_F(LeafPageTest, Split) {
   //        then insert a separator key into either left or right depending on
   //        the lowest key of the right page after the split
   for (int i = 0; i < 8; ++i) {
-    PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage);
-    PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
+    PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     std::string key = std::string(2000, static_cast<char>('0' + i)) + "k";
     {
       for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {

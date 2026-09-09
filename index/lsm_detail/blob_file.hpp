@@ -23,7 +23,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -38,9 +37,11 @@ namespace tinylamb {
 
 class BlobFile final {
  public:
-  BlobFile(const std::filesystem::path& path,
-           size_t memory_capacity = size_t{128} * 1024 * 1024,
-           size_t max_filesize = 1024LLU * 1024 * 1024);
+  // Opens (creating) the blob file and the read cache over it.
+  static StatusOr<std::unique_ptr<BlobFile>> Create(
+      const std::filesystem::path& path,
+      size_t memory_capacity = size_t{128} * 1024 * 1024,
+      size_t max_filesize = 1024LLU * 1024 * 1024);
 
   BlobFile(BlobFile&& o) = delete;
   BlobFile(const BlobFile& o) = delete;
@@ -48,22 +49,26 @@ class BlobFile final {
   BlobFile& operator=(const BlobFile& o) = delete;
   ~BlobFile() = default;
 
-  [[nodiscard]] std::string ReadAt(size_t offset, size_t length) const;
-  [[nodiscard]] Cache::Locks ReadAt(size_t /*offset*/,
-                                    std::string_view& out) const;
-  lsn_t Append(std::string_view payload);
-  [[nodiscard]] lsn_t Written() const { return file_writer_.CommittedLSN(); }
-  void Flush() const {
-    const lsn_t lsn = file_writer_.BufferedLSN();
-    while (file_writer_.CommittedLSN() < lsn) {
+  [[nodiscard]] StatusOr<std::string> ReadAt(size_t offset,
+                                             size_t length) const;
+  [[nodiscard]] StatusOr<Cache::Locks> ReadAt(size_t offset,
+                                              std::string_view& out) const;
+  StatusOr<lsn_t> Append(std::string_view payload);
+  [[nodiscard]] lsn_t Written() const { return file_writer_->CommittedLSN(); }
+  [[nodiscard]] Status Flush() const {
+    const Logger* writer = file_writer_.get();
+    const lsn_t lsn = writer->BufferedLSN();
+    while (writer->CommittedLSN() < lsn) {
       // A dead writer would stall this loop forever; surface its error.
-      if (file_writer_.Failed()) {
-        throw std::runtime_error(
+      if (writer->Failed()) {
+        return StatusError(
+            StatusCode::kIOError,
             "BlobFile flush failed: " +
-            std::string(std::strerror(file_writer_.ErrorNumber())));
+                std::string(std::strerror(writer->ErrorNumber())));
       }
       std::this_thread::yield();
     }
+    return Status::kSuccess;
   }
   // Write-wait (as Flush) plus a durability wait: every byte referenced by a
   // freshly flushed run must survive fdatasync BEFORE the run is registered.
@@ -72,21 +77,23 @@ class BlobFile final {
   // durable run pointing at torn blob payloads (quarantined on restore:
   // acknowledged writes lost). Called by LSMTree::Sync, not by readers, so
   // the read path keeps its write-only wait.
-  void Sync() {
-    Flush();
-    file_writer_.WaitForDurable(file_writer_.BufferedLSN());
+  Status Sync() {
+    RETURN_IF_FAIL(Flush());
+    return file_writer_->WaitForDurable(file_writer_->BufferedLSN());
   }
 
   friend std::ostream& operator<<(std::ostream& o, const BlobFile& b) {
-    o << "BlobFile(written=" << b.Written() << ", cache=" << b.cache_ << ")";
+    o << "BlobFile(written=" << b.Written() << ", cache=" << *b.cache_ << ")";
     return o;
   }
 
  private:
+  BlobFile(std::unique_ptr<Logger> file_writer, std::unique_ptr<Cache> cache);
+
   // Member order matters: `file_writer_` owns the fd, `cache_` only borrows
   // it (Cache never closes), so the Logger is the sole closer of the file.
-  mutable Logger file_writer_;
-  Cache cache_;
+  std::unique_ptr<Logger> file_writer_;
+  std::unique_ptr<Cache> cache_;
   std::mutex writer_lock_;
 };
 

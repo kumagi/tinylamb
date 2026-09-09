@@ -40,8 +40,8 @@ class LSMViewTest : public ::testing::Test {
     path_ = "tmp_view_merger_test-" + RandomString();
     std::filesystem::create_directory(path_);
     std::string blob_path = path_ / "blob.db";
-    std::vector<std::filesystem::path> index_files;
-    blob_ = std::make_unique<BlobFile>(blob_path);
+    std::vector<SortedRun> index_files;
+    blob_ = BlobFile::Create(blob_path).MoveValue();
     {
       for (int i = 0; i < 10; ++i) {
         std::map<std::string, LSMValue> mem_value;
@@ -52,7 +52,7 @@ class LSMViewTest : public ::testing::Test {
         std::string filepath = path_ / std::to_string(i);
         SortedRun::Construct(filepath, mem_value, *blob_,
                              static_cast<size_t>(i));
-        index_files.emplace_back(std::move(filepath));
+        index_files.emplace_back(SortedRun::Restore(filepath).MoveValue());
       }
     }
     view_ = std::make_unique<LSMView>(*blob_, index_files);
@@ -89,7 +89,7 @@ TEST_F(LSMViewTest, Iter) {
   // Arrange -- LSMView is pre-constructed by SetUp() with 10 SortedRuns of 100
   // keys each
   //            Build the expected map of 1000 keys (0..999) -> value (i/100)
-  auto iter = view_->Begin();
+  auto iter = view_->Begin().MoveValue();
   std::map<std::string, std::string> expected;
   for (int i = 0; i < 1000; ++i) {
     expected.emplace(std::to_string(i), std::to_string(i / 100));
@@ -98,8 +98,8 @@ TEST_F(LSMViewTest, Iter) {
 
   // Act -- walk the iterator and compare each entry with the expected map
   while (iter.IsValid()) {
-    ASSERT_EQ(iter.Key(), it->first);
-    ASSERT_EQ(iter.Value(), it->second);
+    ASSERT_EQ(iter.Key().Value(), it->first);
+    ASSERT_EQ(iter.Value().Value(), it->second);
     ++iter;
     ++it;
   }
@@ -114,8 +114,8 @@ TEST_F(LSMViewTest, BeginOnViewWithoutRunsIsSafe) {
   // run produced a valid entry, so Begin() faults on the empty vector.  This
   // test documents that bug and should turn green once the empty case is
   // guarded.
-  LSMView empty_view(*blob_, std::vector<std::filesystem::path>{});
-  LSMView::Iterator iter = empty_view.Begin();
+  LSMView empty_view(*blob_, std::vector<SortedRun>{});
+  LSMView::Iterator iter = empty_view.Begin().MoveValue();
   EXPECT_FALSE(iter.IsValid());
 }
 
@@ -132,7 +132,7 @@ TEST_F(LSMViewTest, ConstructEmptyRunIsSafe) {
   std::map<std::string, LSMValue> empty;
   std::string filepath = path_ / "empty_run.idx";
   SortedRun::Construct(filepath, empty, *blob_, 0);
-  SortedRun run(filepath);
+  SortedRun run = SortedRun::Restore(filepath).MoveValue();
   EXPECT_EQ(run.Size(), 0);
 }
 
@@ -154,13 +154,14 @@ TEST_F(LSMViewTest, DuplicateKeyAcrossTwoRunsIteratorExhausts) {
   new_run.emplace("k", LSMValue("b"));
   SortedRun::Construct(path_ / "new.idx", new_run, *blob_, 11);
 
-  std::vector<std::filesystem::path> files{path_ / "new.idx",
-                                           path_ / "old.idx"};
+  std::vector<SortedRun> files{
+      SortedRun::Restore(path_ / "new.idx").MoveValue(),
+      SortedRun::Restore(path_ / "old.idx").MoveValue()};
   LSMView view(*blob_, files);
-  auto iter = view.Begin();
+  auto iter = view.Begin().MoveValue();
   ASSERT_TRUE(iter.IsValid());
-  EXPECT_EQ(iter.Key(), "k");
-  EXPECT_EQ(iter.Value(), "b");
+  EXPECT_EQ(iter.Key().Value(), "k");
+  EXPECT_EQ(iter.Value().Value(), "b");
   ++iter;
   EXPECT_FALSE(iter.IsValid());
 }
@@ -186,17 +187,19 @@ TEST_F(LSMViewTest, MergeSkipsDuplicateAndKeepsOrder) {
   new_run.emplace("k", LSMValue("z"));
   SortedRun::Construct(path_ / "new.idx", new_run, *blob_, 12);
 
-  std::vector<std::filesystem::path> files{path_ / "new.idx", path_ / "mid.idx",
-                                           path_ / "old.idx"};
+  std::vector<SortedRun> files{
+      SortedRun::Restore(path_ / "new.idx").MoveValue(),
+      SortedRun::Restore(path_ / "mid.idx").MoveValue(),
+      SortedRun::Restore(path_ / "old.idx").MoveValue()};
   LSMView view(*blob_, files);
-  auto iter = view.Begin();
+  auto iter = view.Begin().MoveValue();
   ASSERT_TRUE(iter.IsValid());
-  EXPECT_EQ(iter.Key(), "a");
-  EXPECT_EQ(iter.Value(), "1");
+  EXPECT_EQ(iter.Key().Value(), "a");
+  EXPECT_EQ(iter.Value().Value(), "1");
   ++iter;
   ASSERT_TRUE(iter.IsValid());
-  EXPECT_EQ(iter.Key(), "k");
-  EXPECT_EQ(iter.Value(), "z");
+  EXPECT_EQ(iter.Key().Value(), "k");
+  EXPECT_EQ(iter.Value().Value(), "z");
   ++iter;
   EXPECT_FALSE(iter.IsValid());
 }
@@ -220,8 +223,9 @@ TEST_F(LSMViewTest, FindEmptyKeySkipsEmptyRun) {
   std::map<std::string, LSMValue> empty;
   SortedRun::Construct(path_ / "empty.idx", empty, *blob_, 1);
 
-  std::vector<std::filesystem::path> files{path_ / "empty.idx",
-                                           path_ / "data.idx"};
+  std::vector<SortedRun> files{
+      SortedRun::Restore(path_ / "empty.idx").MoveValue(),
+      SortedRun::Restore(path_ / "data.idx").MoveValue()};
   LSMView view(*blob_, files);
   StatusOr<std::string> result = view.Find("");
   ASSERT_SUCCESS_AND_EQ(result, "\x05\x05");
@@ -238,8 +242,8 @@ TEST_F(LSMViewTest, Merged) {
   }
 
   // Act -- merge the 10 SortedRuns into a single SortedRun at merged_file
-  view_->CreateSingleRun(merged_file);
-  SortedRun merged(merged_file);
+  ASSERT_EQ(view_->CreateSingleRun(merged_file), Status::kSuccess);
+  SortedRun merged = SortedRun::Restore(merged_file).MoveValue();
   ASSERT_EQ(merged.Size(), 100 * 10);
 
   // Act -- build a new LSMView from the single merged SortedRun and walk its
@@ -247,10 +251,10 @@ TEST_F(LSMViewTest, Merged) {
   auto it = expected.begin();
   std::vector<SortedRun> sr{merged};
   LSMView new_merger(*blob_, sr);
-  auto iter = new_merger.Begin();
+  auto iter = new_merger.Begin().MoveValue();
   while (iter.IsValid()) {
-    ASSERT_EQ(iter.Key(), it->first);
-    ASSERT_EQ(iter.Value(), it->second);
+    ASSERT_EQ(iter.Key().Value(), it->first);
+    ASSERT_EQ(iter.Value().Value(), it->second);
     ++iter;
     ++it;
   }
@@ -263,11 +267,11 @@ TEST_F(LSMViewTest, Recover) {
   // Arrange -- destroy the existing view_ and blob_ to emulate a crash+recover
   // scenario
   view_.reset();
-  blob_ = std::make_unique<BlobFile>(path_ / "blob.db");
-  std::vector<std::filesystem::path> idx;
+  blob_ = BlobFile::Create(path_ / "blob.db").MoveValue();
+  std::vector<SortedRun> idx;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (entry.path() != path_ / "blob.db") {
-      idx.push_back(entry.path());
+      idx.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
 
@@ -294,7 +298,7 @@ TEST_F(LSMViewTest, Overwrite) {
   SortedRun::Construct(filepath, mem_value, *blob_, 12);
 
   // Act -- build a new LSMView from the single overwrite SortedRun
-  std::vector<SortedRun> index_files{SortedRun(filepath)};
+  std::vector<SortedRun> index_files{SortedRun::Restore(filepath).MoveValue()};
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
   // Assert -- find each key; the overwrite run takes precedence so every key
@@ -319,20 +323,20 @@ TEST_F(LSMViewTest, OverwriteAndScan) {
 
   // Act -- build a new LSMView from the existing index files (including the
   // overwrite run)
-  std::vector<std::filesystem::path> index_files;
+  std::vector<SortedRun> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (!entry.path().string().ends_with(".db")) {
-      index_files.push_back(entry.path());
+      index_files.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
   // Assert -- scan the view: even keys map to i*2, odd keys map to i/100 (from
   // the original SetUp runs)
-  auto iter = view_->Begin();
+  auto iter = view_->Begin().MoveValue();
   while (iter.IsValid()) {
-    std::string key = iter.Key();
-    std::string value = iter.Value();
+    std::string key = iter.Key().Value();
+    std::string value = iter.Value().Value();
     int key_int = static_cast<int>(std::stol(key));
     if (key_int % 2 == 0) {
       ASSERT_EQ(value, std::to_string(key_int * 2));
@@ -352,10 +356,10 @@ TEST_F(LSMViewTest, DeleteAndScan) {
 
   // Act -- build a new LSMView from the existing index files (including the
   // delete run)
-  std::vector<std::filesystem::path> index_files;
+  std::vector<SortedRun> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (!entry.path().string().ends_with(".db")) {
-      index_files.push_back(entry.path());
+      index_files.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
@@ -378,19 +382,19 @@ TEST_F(LSMViewTest, DeleteMultiAndScan) {
 
   // Act -- build a new LSMView from the existing index files (including the
   // delete run)
-  std::vector<std::filesystem::path> index_files;
+  std::vector<SortedRun> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (!entry.path().string().ends_with(".db")) {
-      index_files.push_back(entry.path());
+      index_files.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
   // Assert -- scan the view; every remaining key must be odd (even keys are
   // tombstoned)
-  auto iter = view_->Begin();
+  auto iter = view_->Begin().MoveValue();
   while (iter.IsValid()) {
-    std::string key = iter.Key();
+    std::string key = iter.Key().Value();
     int key_int = static_cast<int>(std::stol(key));
     ASSERT_EQ(key_int % 2, 1);
     ++iter;
@@ -419,22 +423,22 @@ TEST_F(LSMViewTest, DeleteOverWriteScan) {
 
   // Act -- build a new LSMView from all existing index files (deletes +
   // overwrites + original 10 runs)
-  std::vector<std::filesystem::path> index_files;
+  std::vector<SortedRun> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
     if (!entry.path().string().ends_with(".db")) {
-      index_files.push_back(entry.path());
+      index_files.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
   // Assert -- scan the view; for i%4==0 the value is "Hello", for other odd
   // keys the value is i/100
-  auto iter = view_->Begin();
+  auto iter = view_->Begin().MoveValue();
   while (iter.IsValid()) {
-    std::string key = iter.Key();
+    std::string key = iter.Key().Value();
     int key_int = static_cast<int>(std::stol(key));
     if (key_int % 4 == 0) {
-      ASSERT_EQ(iter.Value(), "Hello");
+      ASSERT_EQ(iter.Value().Value(), "Hello");
       LOG(INFO) << key_int;
     } else {
       ASSERT_EQ(key_int % 2, 1);
@@ -445,8 +449,8 @@ TEST_F(LSMViewTest, DeleteOverWriteScan) {
 
 TEST_F(LSMViewTest, IteratorEquality) {
   // Arrange -- two fresh iterators over the same view
-  LSMView::Iterator first = view_->Begin();
-  LSMView::Iterator second = view_->Begin();
+  LSMView::Iterator first = view_->Begin().MoveValue();
+  LSMView::Iterator second = view_->Begin().MoveValue();
   ASSERT_TRUE(first.IsValid());
   ASSERT_TRUE(second.IsValid());
 
@@ -459,21 +463,21 @@ TEST_F(LSMViewTest, IteratorEquality) {
 
 TEST_F(LSMViewTest, IteratorGetEntry) {
   // Arrange -- begin iteration over the fixture view
-  LSMView::Iterator iter = view_->Begin();
+  LSMView::Iterator iter = view_->Begin().MoveValue();
   ASSERT_TRUE(iter.IsValid());
 
   // Act -- fetch the raw entry behind the top heap slot
-  SortedRun::Entry entry = iter.GetEntry();
+  SortedRun::Entry entry = iter.GetEntry().MoveValue();
 
   // Assert -- the entry is live (not a tombstone) and matches the view key
   ASSERT_FALSE(entry.IsDeleted());
-  ASSERT_EQ(iter.Key(), std::string("0"));
-  ASSERT_EQ(iter.Value(), std::string("0"));
+  ASSERT_EQ(iter.Key().Value(), std::string("0"));
+  ASSERT_EQ(iter.Value().Value(), std::string("0"));
 }
 
 TEST_F(LSMViewTest, IteratorStreamOperator) {
   // Arrange -- begin iteration over the fixture view
-  LSMView::Iterator iter = view_->Begin();
+  LSMView::Iterator iter = view_->Begin().MoveValue();
   ASSERT_TRUE(iter.IsValid());
 
   // Act -- stream the iterator
@@ -500,12 +504,12 @@ TEST_F(LSMViewTest, ViewStreamOperator) {
 
 TEST_F(LSMViewTest, CreateSingleRunOnEmptyView) {
   // Arrange -- a view backed by no sorted runs
-  LSMView empty_view(*blob_, std::vector<std::filesystem::path>{});
+  LSMView empty_view(*blob_, std::vector<SortedRun>{});
   std::filesystem::path merged_file = path_ / "empty_merged.idx";
 
   // Act -- merge the (empty) view into a single run
-  empty_view.CreateSingleRun(merged_file);
-  SortedRun merged(merged_file);
+  (void)empty_view.CreateSingleRun(merged_file);
+  SortedRun merged = SortedRun::Restore(merged_file).MoveValue();
 
   // Assert -- the merged run is a valid empty run
   EXPECT_EQ(merged.Size(), 0);

@@ -12,6 +12,7 @@ bool LimitExecutor::Next(Row* dst, RowPosition* rp) {
   Row ignored;
   while (skipped_ < offset_) {
     if (!source_->Next(&ignored, nullptr)) {
+      FailWithChildOf(*source_);
       return false;
     }
     ++skipped_;
@@ -22,6 +23,7 @@ bool LimitExecutor::Next(Row* dst, RowPosition* rp) {
     return false;
   }
   if (!source_->Next(dst, rp)) {
+    FailWithChildOf(*source_);
     return false;
   }
   ++emitted_;

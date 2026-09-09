@@ -41,7 +41,7 @@ class RowPageConcurrentTest : public RowPageTest {
     file_name_ = "row_page_concurrent_test-" + current_test + RandomString();
     Recover();
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     page_id_ = page->PageID();
     EXPECT_SUCCESS(txn.PreCommit());
   }
@@ -112,7 +112,7 @@ TEST_F(RowPageConcurrentTest, UpdateUpdate) {
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
 
-  thread_local std::mt19937 engine(SeedGen());
+  thread_local std::mt19937 engine(SeedGen()());
   while (InsertRow(RandomString(engine() % 64))) {
   }
   size_t rows = GetRowCount();
@@ -140,13 +140,13 @@ TEST_F(RowPageConcurrentTest, ReaderUsesSnapshotWhileWriterIsUncommitted) {
   ASSERT_TRUE(InsertRow("committed"));
 
   Transaction writer = tm_->Begin();
-  PageRef writer_page = p_->GetPage(page_id_);
+  PageRef writer_page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS(writer_page->Update(writer, 0, "uncommitted"));
   writer_page.PageUnlock();
 
   auto reader = std::async(std::launch::async, [this]() {
     Transaction txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     StatusOr<std::string_view> value = page->Read(txn, 0);
     std::string result = value.HasValue() ? std::string(value.Value()) : "";
     page.PageUnlock();
@@ -169,12 +169,12 @@ TEST_F(RowPageConcurrentTest, SnapshotRemainsStableAfterWriterCommits) {
   Transaction reader = tm_->Begin();
 
   Transaction writer = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS(page->Update(writer, 0, "version-2"));
   page.PageUnlock();
   ASSERT_SUCCESS(writer.PreCommit());
 
-  PageRef reader_page = p_->GetPage(page_id_);
+  PageRef reader_page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS_AND_EQ(reader_page->Read(reader, 0), "version-1");
   reader_page.PageUnlock();
   ASSERT_SUCCESS(reader.PreCommit());
@@ -186,23 +186,23 @@ TEST_F(RowPageConcurrentTest, DeleteAndInsertRespectSnapshotVisibility) {
   Transaction old_reader = tm_->Begin();
 
   Transaction deleter = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS(page->Delete(deleter, 0));
   page.PageUnlock();
   ASSERT_SUCCESS(deleter.PreCommit());
 
-  PageRef old_page = p_->GetPage(page_id_);
+  PageRef old_page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS_AND_EQ(old_page->Read(old_reader, 0), "existing");
   old_page.PageUnlock();
 
   Transaction inserter = tm_->Begin();
-  PageRef insert_page = p_->GetPage(page_id_);
+  PageRef insert_page = p_->GetPage(page_id_).MoveValue();
   ASSIGN_OR_ASSERT_FAIL(slot_t, reused,
                         insert_page->Insert(inserter, "replacement"));
   ASSERT_EQ(reused, 0);
   insert_page.PageUnlock();
 
-  PageRef still_old_page = p_->GetPage(page_id_);
+  PageRef still_old_page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS_AND_EQ(still_old_page->Read(old_reader, 0), "existing");
   still_old_page.PageUnlock();
   ASSERT_SUCCESS(inserter.PreCommit());
@@ -213,12 +213,12 @@ TEST_F(RowPageConcurrentTest, DeleteAndInsertRespectSnapshotVisibility) {
 TEST_F(RowPageConcurrentTest, AbortedVersionNeverBecomesVisible) {
   ASSERT_TRUE(InsertRow("durable"));
   Transaction writer = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS(page->Update(writer, 0, "discarded"));
   page.PageUnlock();
 
   Transaction reader = tm_->Begin();
-  PageRef reader_page = p_->GetPage(page_id_);
+  PageRef reader_page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS_AND_EQ(reader_page->Read(reader, 0), "durable");
   reader_page.PageUnlock();
   ASSERT_SUCCESS(reader.PreCommit());
@@ -230,25 +230,24 @@ TEST_F(RowPageConcurrentTest, AbortedVersionNeverBecomesVisible) {
 TEST_F(RowPageConcurrentTest, FirstUpdaterWinsDoesNotWait) {
   ASSERT_TRUE(InsertRow("base"));
   Transaction first = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS(page->Update(first, 0, "first"));
   page.PageUnlock();
 
-  std::atomic<Status> second_status{Status::kUnknown};
+  Status second_status = Status::kUnknown;
   std::thread contender([&] {
     Transaction second = tm_->Begin();
-    PageRef second_page = p_->GetPage(page_id_);
-    second_status.store(second_page->Update(second, 0, "second"),
-                        std::memory_order_release);
+    PageRef second_page = p_->GetPage(page_id_).MoveValue();
+    second_status = second_page->Update(second, 0, "second");
     second_page.PageUnlock();
     second.Abort();
   });
   contender.join();
-  EXPECT_EQ(second_status.load(std::memory_order_acquire), Status::kConflicts);
+  EXPECT_EQ(second_status, Status::kConflicts);
 
   ASSERT_SUCCESS(first.PreCommit());
   Transaction retry = tm_->Begin();
-  PageRef retry_page = p_->GetPage(page_id_);
+  PageRef retry_page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS(retry_page->Update(retry, 0, "second"));
   retry_page.PageUnlock();
   ASSERT_SUCCESS(retry.PreCommit());

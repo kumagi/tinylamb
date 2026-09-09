@@ -142,7 +142,7 @@ class PlanTest : public ::testing::Test {
     if (rs_) {
       rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<Database>(prefix_);
+    rs_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { rs_->DeleteAll(); }
@@ -186,7 +186,7 @@ TEST_F(PlanTest, ValuesPlanEmitsTypedMultiColumnRowsAndValidatesWidth) {
   EXPECT_EQ(row, Row({Value(2), Value("two")}));
   EXPECT_FALSE(executor->Next(&row, nullptr));
 
-  EXPECT_THROW(ValuesPlan(schema, {Row({Value(1)})}), std::invalid_argument);
+  EXPECT_DEATH(ValuesPlan(schema, {Row({Value(1)})}), "width mismatch");
 }
 
 TEST_F(PlanTest, SetOperationPlanPublishesNumericCommonSchema) {

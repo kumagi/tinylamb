@@ -57,7 +57,13 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  tinylamb::Database database(args[0]);
+  auto database_or_status = tinylamb::Database::Create(args[0]);
+  if (!database_or_status.HasValue()) {
+    std::cerr << "failed to open database " << args[0] << ": "
+              << database_or_status.GetStatus() << '\n';
+    return 1;
+  }
+  tinylamb::Database& database = *database_or_status.Value();
   tinylamb::TransactionContext context = database.BeginContext();
   tinylamb::SqlEngine engine(database);
   // One implicit transaction wraps every statement of the script; the first

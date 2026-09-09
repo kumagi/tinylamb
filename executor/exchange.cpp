@@ -87,8 +87,8 @@ ExchangeExecutor::ExchangeExecutor(Executor child, ExchangeType type,
   // every routing decision.
   if (type_ == ExchangeType::kRange && partition_count_ > 1 &&
       range_bounds_.size() != partition_count_ - 1) {
-    throw std::invalid_argument(
-        "range exchange requires partition_count - 1 range bounds");
+    CHECK_MSG(range_bounds_.size() == partition_count_ - 1,
+              "range exchange requires partition_count - 1 range bounds");
   }
   partitions_.resize(partition_count_);
 }

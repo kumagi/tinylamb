@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/join_kind.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/join_kind.hpp"
@@ -43,10 +44,17 @@ bool BatchNestedLoopJoin::EvaluatePredicate(const Row& left,
   }
   // Predicate errors (e.g. division by zero) must propagate to the caller:
   // swallowing them as FALSE corrupts Anti-join output (a failed match would
-  // emit the outer row instead of erroring).
+  // emit the outer row instead of erroring).  The error is recorded in the
+  // sticky predicate_error_ and re-surfaced by Next().
   Row combined = left + right;
-  Value res = predicate_->Evaluate(combined, combined_schema_);
-  return !res.IsNull() && res.Truthy();
+  StatusOr<Value> res = predicate_->TryEvaluate(combined, combined_schema_);
+  if (!res.HasValue()) {
+    if (predicate_error_.ok()) {
+      predicate_error_ = res.GetStatus();
+    }
+    return false;
+  }
+  return !res.Value().IsNull() && res.Value().Truthy();
 }
 
 void BatchNestedLoopJoin::ExecuteBlockJoin() {
@@ -126,9 +134,9 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
         }
       }
     } else if (kind_ != JoinKind::kInner && kind_ != JoinKind::kRightOuter) {
-      throw std::runtime_error(
-          std::string("BatchNestedLoopJoin: unsupported join kind ") +
-          std::string(JoinKindName(kind_)));
+      CHECK_MSG(false,
+                std::string("BatchNestedLoopJoin: unsupported join kind ") +
+                    std::string(JoinKindName(kind_)));
     }
   }
   if (kind_ == JoinKind::kRightOuter || kind_ == JoinKind::kFullOuter) {
@@ -156,6 +164,9 @@ void BatchNestedLoopJoin::EnsureMaterialized() {
 void BatchNestedLoopJoin::MaterializePipeline() { EnsureMaterialized(); }
 
 bool BatchNestedLoopJoin::Next(Row* dst, RowPosition* rp) {
+  if (!predicate_error_.ok()) {
+    return FailWith(predicate_error_);
+  }
   assert(dst != nullptr);
   EnsureMaterialized();
   if (output_offset_ >= output_.size()) {
@@ -175,6 +186,10 @@ size_t BatchNestedLoopJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   }
   destination->Reset();
   EnsureMaterialized();
+  if (!predicate_error_.ok()) {
+    FailWith(predicate_error_);
+    return 0;
+  }
   if (output_offset_ >= output_.size()) {
     return 0;
   }

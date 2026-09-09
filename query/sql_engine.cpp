@@ -459,11 +459,12 @@ bool NarrowIntegerFits(const ColumnName& column, const Value& value) {
   return true;
 }
 
-void ValidateNarrowInteger(const ColumnName& column, const Value& value) {
+Status ValidateNarrowInteger(const ColumnName& column, const Value& value) {
   if (!NarrowIntegerFits(column, value)) {
-    throw std::runtime_error("assignment out of range for column " +
-                             column.name);
+    return {Status::kInvalidArgument,
+            "assignment out of range for column " + column.name};
   }
+  return Status::kSuccess;
 }
 
 // INSERT accepts a single STRUCT (or NULL) expression for a multi-column
@@ -982,8 +983,13 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
     for (const Expression& cell : cells) {
       // Slots receive this execution's values; slot-free subtrees are shared
       // immutable nodes, so cloning cost is proportional to literals only.
-      evaluated.push_back(
-          CloneWithPreparedValues(cell, values)->Evaluate(Row(), Schema()));
+      StatusOr<Value> value =
+          CloneWithPreparedValues(cell, values)->TryEvaluate(Row(), Schema());
+      if (!value.HasValue()) {
+        // The slow path re-evaluates and surfaces the diagnostic.
+        return std::nullopt;
+      }
+      evaluated.push_back(value.MoveValue());
     }
     if (shape.has_named_columns) {
       // Destination offsets were validated at fill time; replay them.
@@ -997,7 +1003,11 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
       // Same coercion rules as the legacy INSERT path so behavior is
       // identical for every parameter combination.
       const ValueType expected = shape.schema.GetColumn(i).Type();
-      ValidateNarrowInteger(shape.schema.GetColumn(i).Name(), evaluated[i]);
+      if (ValidateNarrowInteger(shape.schema.GetColumn(i).Name(),
+                                evaluated[i]) != Status::kSuccess) {
+        // The slow path re-validates and surfaces the diagnostic.
+        return std::nullopt;
+      }
       if (evaluated[i].IsNull() || evaluated[i].type == expected) {
         continue;
       }
@@ -1104,13 +1114,13 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   if (templated.templatable) {
     if (const std::shared_ptr<Statement> cached =
             FindTemplate(templated.fingerprint)) {
-      try {
-        statement = BindStatementLiterals(*cached, templated.parameters);
+      if (auto rebound = BindStatementLiterals(*cached, templated.parameters);
+          rebound.HasValue()) {
+        statement = rebound.MoveValue();
         cache_hit = true;
-      } catch (const std::exception&) {
-        // Literal shape drifted from the cached tree; parse the original SQL.
-        statement = nullptr;
       }
+      // A literal shape that drifted from the cached tree falls through and
+      // parses the original SQL.
     }
   }
   if (!statement) {
@@ -1124,7 +1134,12 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
                        GoogleSqlAstParser::Parse(parsed.ast));
       // Pass the source SQL: per-pair set-operator kinds are recovered by
       // slicing the recorded byte ranges (the dump carries no text).
-      statement = GoogleSqlAstVisitor::Visit(*ast, query_sql);
+      auto visited = GoogleSqlAstVisitor::Visit(*ast, query_sql);
+      if (!visited.HasValue()) {
+        last_error_ = visited.GetStatus().GetMessage();
+        return Status::kUnknown;
+      }
+      statement = visited.MoveValue();
     } catch (const std::exception& error) {
       last_error_ = error.what();
       return Status::kUnknown;
@@ -1230,14 +1245,20 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
         std::make_shared<ConstantExecutor>(ExplainRows(output.str())));
   }
 
+  if (statement->Type() == StatementType::kUpdate &&
+      static_cast<const UpdateStatement&>(*statement).HasNestedDml()) {
+    // BindStatementLiterals walks SET/WHERE/NestedItems structurally while
+    // Templatize extracts literals in text order: rebinding a nested-DML
+    // template mis-binds the slots (the outer WHERE takes the first nested
+    // constant), so keep such statements out of the template cache.
+    templated.templatable = false;
+  }
   if (templated.templatable && !cache_hit && !IsExplicitZeroLimit(*statement)) {
-    try {
-      RememberTemplate(templated.fingerprint,
-                       BindStatementLiterals(*statement, templated.parameters));
-    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) //
-                                       // Template caching is best-effort; any
-                                       // bind failure just means the statement
-                                       // is parsed verbatim next time.
+    // Template caching is best-effort; a bind failure just means the
+    // statement is parsed verbatim next time.
+    if (auto rebound = BindStatementLiterals(*statement, templated.parameters);
+        rebound.HasValue()) {
+      RememberTemplate(templated.fingerprint, rebound.MoveValue());
     }
   }
   // Arm the compiled-plan fill sites inside PrepareStatement; the guard
@@ -1285,13 +1306,13 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       }
     }
     if (path.empty() || path.front().empty()) {
-      throw std::runtime_error("nested DML target not found: " +
-                               item.target_path);
+      return Status(Status::kInvalidArgument,
+                    "nested DML target not found: " + item.target_path);
     }
     const int offset = schema.Offset(ColumnName(path.front()));
     if (offset < 0) {
-      throw std::runtime_error("nested DML target not found: " +
-                               item.target_path);
+      return Status(Status::kInvalidArgument,
+                    "nested DML target not found: " + item.target_path);
     }
     std::vector<std::string> proto_path;
     if (path.size() > 1) {
@@ -1342,8 +1363,8 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       std::string proto_type;
       if (proto_target) {
         if (cell.IsNull() || cell.type != ValueType::kVarChar) {
-          throw std::runtime_error(
-              "Cannot execute nested DML on a NULL protocol message");
+          return Status(Status::kInvalidArgument,
+                        "Cannot execute nested DML on a NULL protocol message");
         }
         proto_type = InferProtoTypeName(
             std::string_view(cell.value.varchar_value), entry.proto_path);
@@ -1351,10 +1372,10 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
         if (!TryProtoTextGetField(cell.value.varchar_value,
                                   entry.proto_path.back(), &extracted) ||
             !extracted.IsArray()) {
-          throw std::runtime_error(
-              "nested DML target is not a repeated "
-              "protocol field: " +
-              item.target_path);
+          return Status(Status::kInvalidArgument,
+                        "nested DML target is not a repeated "
+                        "protocol field: " +
+                            item.target_path);
         }
         array_cell = std::move(extracted);
       }
@@ -1367,7 +1388,7 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       relational_detail::Scope outer_scope{
           .row = &new_row, .schema = &schema, .outer = nullptr};
       auto eval_on_element = [&](const Expression& expr,
-                                 const Value& element) -> Value {
+                                 const Value& element) -> StatusOr<Value> {
         if (!expr) {
           return Value(true);
         }
@@ -1375,8 +1396,8 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
         relational_detail::Scope element_scope{.row = &element_row,
                                                .schema = &element_schema,
                                                .outer = &outer_scope};
-        return relational_detail::Evaluate(expr, element_scope, nullptr, ctx,
-                                           relational_detail::CteMap{});
+        return relational_detail::TryEvaluate(expr, element_scope, nullptr, ctx,
+                                              relational_detail::CteMap{});
       };
       ArrayEditState& state = edit_state[entry.offset];
       auto load_working = [&]() {
@@ -1390,22 +1411,24 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       switch (item.kind) {
         case NestedDmlItem::Kind::kDelete: {
           if (edit_cell.IsNull()) {
-            throw std::runtime_error(
+            return Status(
+                Status::kInvalidArgument,
                 "Cannot execute a nested DELETE statement on a NULL array "
                 "value");
           }
           if (!edit_cell.IsArray()) {
-            throw std::runtime_error(
-                "nested DELETE requires an ARRAY value "
-                "in column " +
-                item.target_path);
+            return Status(Status::kInvalidArgument,
+                          "nested DELETE requires an ARRAY value "
+                          "in column " +
+                              item.target_path);
           }
           load_working();
           std::vector<Value> kept;
           kept.reserve(state.working.size());
           int64_t touched = 0;
           for (Value& element : state.working) {
-            const Value matches = eval_on_element(item.predicate, element);
+            ASSIGN_OR_RETURN(Value, matches,
+                             (eval_on_element(item.predicate, element)));
             if (!matches.IsNull() && relational_detail::Truthy(matches)) {
               ++touched;
             } else {
@@ -1418,7 +1441,7 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
             message << "ASSERT_ROWS_MODIFIED expected "
                     << item.assert_rows_modified
                     << " array elements modified, but found " << touched;
-            throw std::runtime_error(message.str());
+            return Status(Status::kInvalidArgument, message.str());
           }
           state.working = std::move(kept);
           state.update_baseline = state.working;
@@ -1429,24 +1452,27 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
         }
         case NestedDmlItem::Kind::kUpdate: {
           if (edit_cell.IsNull()) {
-            throw std::runtime_error(
+            return Status(
+                Status::kInvalidArgument,
                 "Cannot execute a nested UPDATE statement on a NULL array "
                 "value");
           }
           if (!edit_cell.IsArray()) {
-            throw std::runtime_error(
-                "nested UPDATE requires an ARRAY value "
-                "in column " +
-                item.target_path);
+            return Status(Status::kInvalidArgument,
+                          "nested UPDATE requires an ARRAY value "
+                          "in column " +
+                              item.target_path);
           }
           load_working();
           int64_t touched = 0;
           for (size_t i = 0; i < state.working.size(); ++i) {
-            const Value matches =
-                eval_on_element(item.predicate, state.update_baseline[i]);
+            ASSIGN_OR_RETURN(
+                Value, matches,
+                (eval_on_element(item.predicate, state.update_baseline[i])));
             if (!matches.IsNull() && relational_detail::Truthy(matches)) {
               if (i < state.update_touched.size() && state.update_touched[i]) {
-                throw std::runtime_error(
+                return Status(
+                    Status::kInvalidArgument,
                     "Attempted to modify an array element with multiple "
                     "nested UPDATE statements");
               }
@@ -1454,8 +1480,10 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
               if (i < state.update_touched.size()) {
                 state.update_touched[i] = true;
               }
-              state.working[i] =
-                  eval_on_element(item.set_value, state.update_baseline[i]);
+              ASSIGN_OR_RETURN(
+                  Value, assigned,
+                  (eval_on_element(item.set_value, state.update_baseline[i])));
+              state.working[i] = std::move(assigned);
             }
           }
           if (item.assert_rows_modified >= 0 &&
@@ -1464,7 +1492,7 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
             message << "ASSERT_ROWS_MODIFIED expected "
                     << item.assert_rows_modified
                     << " array elements modified, but found " << touched;
-            throw std::runtime_error(message.str());
+            return Status(Status::kInvalidArgument, message.str());
           }
           edit_cell =
               Value::Array(state.working, edit_cell.ArrayElementSqlType());
@@ -1472,22 +1500,29 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
         }
         case NestedDmlItem::Kind::kInsert: {
           if (edit_cell.IsNull()) {
-            throw std::runtime_error(
+            return Status(
+                Status::kInvalidArgument,
                 "Cannot execute a nested INSERT statement on a NULL array "
                 "value");
           }
           if (!edit_cell.IsArray()) {
-            throw std::runtime_error(
-                "nested INSERT requires an ARRAY value "
-                "in column " +
-                item.target_path);
+            return Status(Status::kInvalidArgument,
+                          "nested INSERT requires an ARRAY value "
+                          "in column " +
+                              item.target_path);
           }
           load_working();
           int64_t inserted = 0;
           if (item.insert_query != nullptr) {
-            relational_detail::Relation produced =
+            StatusOr<relational_detail::Relation> produced_query =
                 relational_detail::ExecuteQuery(ctx, *item.insert_query,
                                                 nullptr, {});
+            if (!produced_query.HasValue()) {
+              return Status(
+                  Status::kInvalidArgument,
+                  std::string(produced_query.GetStatus().GetMessage()));
+            }
+            relational_detail::Relation produced = produced_query.MoveValue();
             produced.ForEachRow([&](const Row& row) {
               if (!row.values_.empty()) {
                 state.working.push_back(row.values_.front());
@@ -1499,9 +1534,11 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
               if (values.empty()) {
                 continue;
               }
-              state.working.push_back(relational_detail::Evaluate(
-                  values.front(), outer_scope, nullptr, ctx,
-                  relational_detail::CteMap{}));
+              ASSIGN_OR_RETURN(Value, item_value,
+                               (relational_detail::TryEvaluate(
+                                   values.front(), outer_scope, nullptr, ctx,
+                                   relational_detail::CteMap{})));
+              state.working.push_back(std::move(item_value));
               ++inserted;
             }
           }
@@ -1511,7 +1548,7 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
             message << "ASSERT_ROWS_MODIFIED expected "
                     << item.assert_rows_modified
                     << " array elements modified, but found " << inserted;
-            throw std::runtime_error(message.str());
+            return Status(Status::kInvalidArgument, message.str());
           }
           state.update_baseline = state.working;
           edit_cell =
@@ -1530,16 +1567,17 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
     }
     StatusOr<RowPosition> updated = table->Update(ctx.txn_, position, new_row);
     if (updated.GetStatus() != Status::kSuccess) {
-      throw std::runtime_error("update failed on table " +
-                               std::string(schema.Name()));
+      return Status(Status::kInvalidArgument,
+                    "update failed on table " + std::string(schema.Name()));
     }
     ++modified_rows;
   }
   if (update.HasAssert() && modified_rows != update.AssertRowsModified()) {
-    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
-                             std::to_string(update.AssertRowsModified()) +
-                             " rows, but " + std::to_string(modified_rows) +
-                             " rows were modified");
+    return Status(Status::kInvalidArgument,
+                  "ASSERT_ROWS_MODIFIED was specified with " +
+                      std::to_string(update.AssertRowsModified()) +
+                      " rows, but " + std::to_string(modified_rows) +
+                      " rows were modified");
   }
   return Executor(std::make_shared<ConstantExecutor>(
       Row({Value("Update Rows"), Value(modified_rows)})));
@@ -1640,12 +1678,12 @@ std::optional<std::vector<int>> FindStructPathOrdinals(
 
 // Rewrites `json` by replacing the member addressed by `ordinals` (one index
 // per path segment). Missing positions leave the document untouched.
-std::optional<std::string> SetStructPathByOrdinals(
+StatusOr<std::optional<std::string>> SetStructPathByOrdinals(
     const std::string& json, const std::vector<std::string>& segs,
     const std::vector<int>& ordinals, size_t depth, const Value& new_value) {
   if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
     // Assigning through a NULL / non-object intermediate.
-    throw std::runtime_error("Cannot set field of NULL STRUCT");
+    return Status(Status::kInvalidArgument, "Cannot set field of NULL STRUCT");
   }
   const auto members = SplitJsonObjectMembers(json.substr(1, json.size() - 2));
   const int index = ordinals[depth];
@@ -1682,12 +1720,14 @@ std::optional<std::string> SetStructPathByOrdinals(
                          ? EncodeStructMemberJson(Value(std::string(*proto)))
                          : members[i].second;
         } else {
-          auto nested = SetStructPathByOrdinals(
-              nested_value.IsNull() ? std::string("null")
-              : nested_value.type == ValueType::kVarChar
-                  ? std::string(nested_value.value.varchar_value)
-                  : std::string("null"),
-              segs, ordinals, depth + 1, new_value);
+          ASSIGN_OR_RETURN(
+              std::optional<std::string>, nested,
+              (SetStructPathByOrdinals(
+                  nested_value.IsNull() ? std::string("null")
+                  : nested_value.type == ValueType::kVarChar
+                      ? std::string(nested_value.value.varchar_value)
+                      : std::string("null"),
+                  segs, ordinals, depth + 1, new_value)));
           rebuilt += nested.has_value() ? *nested : members[i].second;
         }
       }
@@ -1748,8 +1788,8 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
       offset = column_index(target.name);
     }
     if (offset < 0) {
-      throw std::runtime_error("UPDATE SET target not found: " +
-                               target.ToString());
+      return Status(Status::kInvalidArgument,
+                    "UPDATE SET target not found: " + target.ToString());
     }
     plain_targets.emplace_back(
         ColumnName(update.TableName(),
@@ -1799,9 +1839,15 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     Row row = *source;
     relational_detail::Scope scope{
         .row = &row, .schema = &schema, .outer = nullptr};
-    if (!where_clause ||
-        relational_detail::Truthy(relational_detail::Evaluate(
-            where_clause, scope, nullptr, ctx, relational_detail::CteMap{}))) {
+    bool matches_where = true;
+    if (where_clause) {
+      ASSIGN_OR_RETURN(
+          Value, where_value,
+          (relational_detail::TryEvaluate(where_clause, scope, nullptr, ctx,
+                                          relational_detail::CteMap{})));
+      matches_where = relational_detail::Truthy(where_value);
+    }
+    if (matches_where) {
       pending.emplace_back(std::move(row), source.Position());
     }
     ++source;
@@ -1852,14 +1898,15 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
       const bool proto_cell = !json_cell && !proto_type.empty();
       if (proto_cell) {
         if (cell.IsNull()) {
-          throw std::runtime_error("Cannot set field of NULL `" + proto_type +
-                                   "`");
+          return Status(Status::kInvalidArgument,
+                        "Cannot set field of NULL `" + proto_type + "`");
         }
         relational_detail::Scope row_scope{
             .row = &new_row, .schema = &schema, .outer = nullptr};
-        const Value assigned =
-            relational_detail::Evaluate(*target.value, row_scope, nullptr, ctx,
-                                        relational_detail::CteMap{});
+        ASSIGN_OR_RETURN(
+            Value, assigned,
+            (relational_detail::TryEvaluate(*target.value, row_scope, nullptr,
+                                            ctx, relational_detail::CteMap{})));
         ValidateEnumFieldValue(
             proto_type,
             target.segments.empty() ? std::string() : target.segments.back(),
@@ -1872,15 +1919,19 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
         continue;
       }
       if (cell.IsNull()) {
-        throw std::runtime_error("Cannot set field of NULL STRUCT");
+        return Status(Status::kInvalidArgument,
+                      "Cannot set field of NULL STRUCT");
       }
       const std::string text(cell.value.varchar_value);
       relational_detail::Scope row_scope{
           .row = &new_row, .schema = &schema, .outer = nullptr};
-      const Value assigned = relational_detail::Evaluate(
-          *target.value, row_scope, nullptr, ctx, relational_detail::CteMap{});
-      auto rewritten = SetStructPathByOrdinals(text, target.segments,
-                                               target.ordinals, 0, assigned);
+      ASSIGN_OR_RETURN(
+          Value, assigned,
+          (relational_detail::TryEvaluate(*target.value, row_scope, nullptr,
+                                          ctx, relational_detail::CteMap{})));
+      ASSIGN_OR_RETURN(std::optional<std::string>, rewritten,
+                       (SetStructPathByOrdinals(text, target.segments,
+                                                target.ordinals, 0, assigned)));
       if (rewritten.has_value()) {
         cell = Value(std::move(*rewritten));
       }
@@ -1888,16 +1939,17 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     StatusOr<RowPosition> updated =
         table->Update(ctx.txn_, row_position, new_row);
     if (updated.GetStatus() != Status::kSuccess) {
-      throw std::runtime_error("update failed on table " +
-                               std::string(schema.Name()));
+      return Status(Status::kInvalidArgument,
+                    "update failed on table " + std::string(schema.Name()));
     }
     ++modified_rows;
   }
   if (update.HasAssert() && modified_rows != update.AssertRowsModified()) {
-    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
-                             std::to_string(update.AssertRowsModified()) +
-                             " rows, but " + std::to_string(modified_rows) +
-                             " rows were modified");
+    return Status(Status::kInvalidArgument,
+                  "ASSERT_ROWS_MODIFIED was specified with " +
+                      std::to_string(update.AssertRowsModified()) +
+                      " rows, but " + std::to_string(modified_rows) +
+                      " rows were modified");
   }
   return Executor(std::make_shared<ConstantExecutor>(
       Row({Value("Update Rows"), Value(modified_rows)})));
@@ -2188,13 +2240,12 @@ Schema InferUnnestOutputSchema(const SelectSource& source,
   if (!source.unnest || !StaticallyConstantArray(source.unnest)) {
     return {"", {}};
   }
-  Value array_val;
-  try {
-    array_val = relational_detail::Evaluate(
-        source.unnest, relational_detail::Scope{}, nullptr, ctx, {});
-  } catch (const std::exception&) {
+  StatusOr<Value> evaluated = relational_detail::TryEvaluate(
+      source.unnest, relational_detail::Scope{}, nullptr, ctx, {});
+  if (!evaluated.HasValue()) {
     return {"", {}};
   }
+  Value array_val = evaluated.MoveValue();
   if (!array_val.IsArray()) {
     return {"", {}};
   }
@@ -2798,9 +2849,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // Materialize through the relational engine so the star-expanded
         // output schema is available: a raw select list still holds the
         // literal "*" directive, whose width/name cannot define the catalog.
-        relational_detail::Relation materialized =
+        StatusOr<relational_detail::Relation> materialized_query =
             relational_detail::ExecuteQuery(ctx, *create.AsQuery(), nullptr,
                                             {});
+        if (!materialized_query.HasValue()) {
+          last_error_ = materialized_query.GetStatus().GetMessage();
+          return Status::kUnknown;
+        }
+        relational_detail::Relation materialized =
+            materialized_query.MoveValue();
         std::vector<Row> rows;
         materialized.ForEachRow(
             [&rows](const Row& row) { rows.push_back(row); });
@@ -2876,8 +2933,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // rows through the same column mapping / coercion as VALUES rows.
         plan_cache_fingerprint_.clear();
         plan_cache_parameters_.clear();
-        relational_detail::Relation materialized =
+        StatusOr<relational_detail::Relation> materialized_query =
             relational_detail::ExecuteQuery(ctx, *insert.Query(), nullptr, {});
+        if (!materialized_query.HasValue()) {
+          last_error_ = materialized_query.GetStatus().GetMessage();
+          return Status::kUnknown;
+        }
+        relational_detail::Relation materialized =
+            materialized_query.MoveValue();
         materialized.ForEachRow(
             [&rows](Row row) { rows.push_back(std::move(row)); });
       } else {
@@ -2898,7 +2961,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             std::vector<Value> row;
             row.reserve(values.size());
             for (const auto& value : values) {
-              row.push_back(value->Evaluate(Row(), Schema()));
+              StatusOr<Value> item = value->TryEvaluate(Row(), Schema());
+              if (!item.HasValue()) {
+                last_error_ = item.GetStatus().GetMessage();
+                return Status::kUnknown;
+              }
+              row.push_back(item.MoveValue());
             }
             rows.emplace_back(std::move(row));
           }
@@ -2954,7 +3022,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         for (size_t i = 0; i < row.values_.size(); ++i) {
           const ValueType expected = table->GetSchema().GetColumn(i).Type();
-          ValidateNarrowInteger(table->GetSchema().GetColumn(i).Name(), row[i]);
+          if (Status st_ni = ValidateNarrowInteger(
+                  table->GetSchema().GetColumn(i).Name(), row[i]);
+              st_ni != Status::kSuccess) {
+            last_error_ = st_ni.GetMessage();
+            return Status::kUnknown;
+          }
           if (row[i].IsNull() || row[i].type == expected) {
             continue;
           }
@@ -3783,7 +3856,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // dotted path below only rewrites field_targets), so refuse the mixed
         // shape instead of committing a partial update.
         if (dotted_target && plain_target) {
-          throw std::runtime_error(
+          return Status(
+              Status::kInvalidArgument,
               "UPDATE cannot mix dotted STRUCT field targets with plain column "
               "targets in one SET clause");
         }

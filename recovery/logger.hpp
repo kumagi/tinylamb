@@ -28,9 +28,12 @@
 #include <thread>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 
 namespace tinylamb {
 
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): fields are
+// grouped by locking domain (enqueue/work/durable), not by size.
 class Logger final {
  public:
   // D1: a WAL record must stay within the bound the recovery reader accepts
@@ -41,16 +44,20 @@ class Logger final {
   static constexpr size_t kMaxRecordSize =
       (size_t{16} << 20) - (size_t{64} << 10);
 
-  explicit Logger(const std::filesystem::path& logfile,
-                  size_t buffer_size = size_t{1024} * 1024 * 8,
-                  size_t every_ms = 1);
+  // Opens (creating when needed) `logfile` and starts the flush worker.
+  // Failure to open the file, stat it, or spawn the worker is reported as a
+  // Status instead of an exception; no partially started logger leaks.
+  static StatusOr<std::unique_ptr<Logger>> Create(
+      const std::filesystem::path& logfile,
+      size_t buffer_size = size_t{1024} * 1024 * 8, size_t every_ms = 1);
   Logger(const Logger&) = delete;
   Logger(Logger&&) = delete;
   Logger& operator=(const Logger&) = delete;
   Logger& operator=(Logger&&) = delete;
   ~Logger();
 
-  void Finish();
+  // Drains the worker and reports a write failure, if one occurred.
+  Status Finish();
 
   // Bytes written to the log file (may not be fsynced yet).
   [[nodiscard]] lsn_t CommittedLSN() const { return flushed_lsn_; }
@@ -65,11 +72,13 @@ class Logger final {
   // To wait for the record's own durability, pass BufferedLSN() read AFTER
   // this call to WaitForDurable() (AddLog()'s return value alone only
   // guarantees the PREVIOUS records are durable).
-  lsn_t AddLog(std::string_view payload);
+  // Returns a failure Status when the worker has died or the payload exceeds
+  // kMaxRecordSize.
+  StatusOr<lsn_t> AddLog(std::string_view payload);
 
   // Block until DurableLSN() >= lsn (group commit).
-  // Throws std::runtime_error if the worker hit an unrecoverable write error.
-  void WaitForDurable(lsn_t lsn);
+  // Returns a failure Status if the worker hit an unrecoverable write error.
+  Status WaitForDurable(lsn_t lsn);
 
   // Resynchronize after recovery truncated the log file to `valid_end`
   // (torn-tail --force path).  The constructor latched the three LSNs to the
@@ -88,7 +97,7 @@ class Logger final {
   [[nodiscard]] int Fd() const { return dst_; }
 
   // True once the worker thread gave up after a write error (e.g. ENOSPC,
-  // EIO). Every subsequent AddLog/WaitForDurable/Finish throws.
+  // EIO). Every subsequent AddLog/WaitForDurable/Finish returns a failure.
   [[nodiscard]] bool Failed() const {
     return failed_.load(std::memory_order_acquire);
   }
@@ -106,13 +115,19 @@ class Logger final {
   }
 
  private:
+  // Only Create() may construct; use it so open/stat/thread-start failures
+  // surface as Status.
+  explicit Logger(const std::filesystem::path& logfile,
+                  size_t buffer_size = size_t{1024} * 1024 * 8,
+                  size_t every_ms = 1);
+
   void LoggerWork();
   void AdvanceDurable(lsn_t to);
   void NotifyWorker();
   // Marks the logger as failed, wakes every waiter and stops the worker.
   void SetFailed(int err);
-  // Throws std::runtime_error when Failed().
-  void RaiseIfFailed() const;
+  // Returns a failure Status when Failed(), success otherwise.
+  [[nodiscard]] Status CheckFailed() const;
   // Signals the worker to quit and joins it. Never throws.
   void DrainAndStopWorker();
 

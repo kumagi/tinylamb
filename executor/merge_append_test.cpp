@@ -42,7 +42,7 @@ class FakeSortedSource : public ExecutorBase {
   void Dump(std::ostream& o, int /*indent*/) const override { o << "fake"; }
 
  private:
-  std::vector<int64_t> keys_;
+  std::vector<int64_t> keys_{};
   size_t idx_{0};
 };
 

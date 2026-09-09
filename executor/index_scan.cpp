@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
@@ -112,8 +113,9 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
                                             ? txn_.AddWriteSet(pointed_row)
                                             : txn_.TryAddWriteSet(pointed_row));
     if (!locked) {
-      throw std::runtime_error("write intent wait timed out on table " +
-                               std::string(table_.GetSchema().Name()));
+      return FailWith(StatusError(StatusCode::kConflicts,
+                                  "write intent wait timed out on table " +
+                                      std::string(table_.GetSchema().Name())));
     }
     *dst = *iter_;
     ++iter_;
@@ -123,8 +125,14 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
     if (rp != nullptr) {
       *rp = pointed_row;
     }
-    if (cond_ && !cond_->Evaluate(*dst, schema_).Truthy()) {
-      continue;
+    if (cond_) {
+      StatusOr<Value> res = cond_->TryEvaluate(*dst, schema_);
+      if (!res.HasValue()) {
+        return FailWith(res.GetStatus());
+      }
+      if (!res.Value().Truthy()) {
+        continue;
+      }
     }
     return true;
   }

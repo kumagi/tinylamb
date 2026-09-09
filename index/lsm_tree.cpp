@@ -94,7 +94,7 @@ bool ParseRunFileName(const std::string& name, bool* is_merged,
 // duplicate generation); nothing is silently ignored, and only valid runs
 // are restored.  Runs are ordered by the numeric generation from the run
 // HEADER (newest first), never by lexicographic file-name order.
-void LSMTree::RestoreRuns() {
+Status LSMTree::RestoreRuns() {
   struct Discovered {
     size_t generation;
     std::filesystem::path path;
@@ -103,7 +103,7 @@ void LSMTree::RestoreRuns() {
   std::vector<Discovered> runs;
   std::set<size_t> names_seen;  // numeric ids used in file names
   std::set<size_t> gens_seen;   // generations from run headers
-  const uint64_t blob_size = blob_.Written();
+  const uint64_t blob_size = blob_->Written();
   std::error_code ec;
   for (const auto& entry : std::filesystem::directory_iterator(root_dir_, ec)) {
     if (!entry.is_regular_file()) {
@@ -140,9 +140,15 @@ void LSMTree::RestoreRuns() {
       std::filesystem::rename(entry.path(), entry.path().string() + ".bad", ec);
       continue;
     }
-    try {
-      SortedRun run(entry.path());  // throws on corrupt/incomplete header
-      const size_t generation = run.Generation();
+    StatusOr<SortedRun> run = SortedRun::Restore(entry.path());
+    if (!run.HasValue()) {  // corrupt/incomplete header
+      LOG(WARN) << "LSM restore: quarantining unreadable run " << name << ": "
+                << run.GetStatus();
+      std::filesystem::rename(entry.path(), entry.path().string() + ".bad", ec);
+      continue;
+    }
+    {
+      const size_t generation = run.Value().Generation();
       if (!gens_seen.insert(generation).second) {
         LOG(WARN) << "LSM restore: duplicate generation " << generation
                   << " from " << name << "; quarantining";
@@ -150,11 +156,8 @@ void LSMTree::RestoreRuns() {
                                 ec);
         continue;
       }
-      runs.push_back({generation, entry.path(), std::move(run)});
-    } catch (const std::exception& error) {
-      LOG(WARN) << "LSM restore: quarantining unreadable run " << name << ": "
-                << error.what();
-      std::filesystem::rename(entry.path(), entry.path().string() + ".bad", ec);
+      runs.push_back(
+          {generation, entry.path(), std::move(run.Value())});  // NOLINT
     }
   }
   // Newest generation first: Read/Contains scan index_ front-to-back and
@@ -178,27 +181,48 @@ void LSMTree::RestoreRuns() {
     LOG(INFO) << "LSM restore: reopened " << runs.size()
               << " run(s), next generation " << high_water;
   }
+  return Status::kSuccess;
 }
 
-LSMTree::LSMTree(std::filesystem::path directory_path)
+StatusOr<std::unique_ptr<LSMTree>> LSMTree::Create(
+    std::filesystem::path directory_path) {
+  std::error_code ec;
+  std::filesystem::create_directory(directory_path, ec);
+  if (ec) {
+    return StatusError(StatusCode::kIOError, "failed to create LSM directory " +
+                                                 directory_path.string() +
+                                                 ": " + ec.message());
+  }
+  ASSIGN_OR_RETURN(std::unique_ptr<BlobFile>, blob,
+                   BlobFile::Create(BlobPath(directory_path)));
+  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+  auto tree = std::unique_ptr<LSMTree>(
+      new LSMTree(std::move(directory_path), std::move(blob)));  // NOLINT
+  // D10: restore flushed runs BEFORE the background threads can flush.
+  RETURN_IF_FAIL(tree->RestoreRuns());
+  // std::thread construction is the one remaining exception source (EAGAIN
+  // from pthread_create); translate it at this boundary.
+  try {
+    tree->flusher_ = std::thread([t = tree.get()]() { Flusher(t); });
+    tree->merger_ = std::thread([t = tree.get()]() { Merger(t); });
+  } catch (const std::system_error& error) {
+    // Do not leak a half-constructed background thread pool.
+    tree->stop_ = true;
+    if (tree->flusher_.joinable()) {
+      tree->flusher_.join();
+    }
+    return StatusError(
+        StatusCode::kRuntimeError,
+        "failed to start LSM background workers: " + std::string(error.what()));
+  }
+  return tree;
+}
+
+LSMTree::LSMTree(std::filesystem::path directory_path,
+                 std::unique_ptr<BlobFile> blob)
     : every_us_(1000),
       root_dir_(std::move(directory_path)),
-      blob_(BlobPath(root_dir_)) {
-  std::filesystem::create_directory(root_dir_);
-  // D10: restore flushed runs BEFORE the background threads can flush.
-  RestoreRuns();
-  try {
-    flusher_ = std::thread([&]() { Flusher(this); });
-    merger_ = std::thread([&]() { Merger(this); });
-  } catch (...) {
-    // Do not leak a half-constructed background thread pool.
-    stop_ = true;
-    if (flusher_.joinable()) {
-      flusher_.join();
-    }
-    throw;
-  }
-}
+      blob_(std::move(blob)) {}
 
 LSMTree::~LSMTree() {
   stop_ = true;
@@ -215,10 +239,8 @@ LSMTree::~LSMTree() {
   // Final durability barrier: a well-behaved close flushes whatever the
   // periodic flusher had not picked up yet, so a clean stop never drops
   // writes that a Read() had already acknowledged.
-  try {
-    Sync();
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "LSMTree final flush failed: " << e.what();
+  if (const Status status = Sync(); status != Status::kSuccess) {
+    LOG(ERROR) << "LSMTree final flush failed: " << status;
   }
 }
 
@@ -244,13 +266,10 @@ void Flusher(LSMTree* tree) {
     if (target == flushed_version) {
       continue;
     }
-    // A throw here (dead blob writer, ENOSPC) would escape the thread's
-    // top-level function and terminate the whole process; the destructor's
-    // final flush already treats the same failures as survivable.
-    try {
-      tree->Sync();
-    } catch (const std::exception& error) {
-      LOG(ERROR) << "background flush failed: " << error.what();
+    // A dead blob writer or ENOSPC here is survivable (same contract as
+    // the destructor's final flush): log and retry on the next tick.
+    if (const Status status = tree->Sync(); status != Status::kSuccess) {
+      LOG(ERROR) << "background flush failed: " << status;
       continue;
     }
     // Record only the version observed before Sync(): writes that raced the
@@ -265,10 +284,8 @@ void Merger(LSMTree* tree) {
     if (tree->stop_.load()) {
       break;
     }
-    try {
-      tree->MergeAll();
-    } catch (const std::exception& error) {
-      LOG(ERROR) << "background merge failed: " << error.what();
+    if (const Status status = tree->MergeAll(); status != Status::kSuccess) {
+      LOG(ERROR) << "background merge failed: " << status;
     }
     LOG(TRACE) << "Merged";
   }
@@ -295,7 +312,7 @@ StatusOr<std::string> LSMTree::Read(std::string_view key) const {
 
   std::unique_lock file_lk(file_tree_lock_);
   for (const auto& it : index_) {
-    auto result = it.Find(key, blob_);
+    auto result = it.Find(key, *blob_);
     if (result.GetStatus() == Status::kDeleted) {
       return Status::kNotExists;
     }
@@ -306,7 +323,7 @@ StatusOr<std::string> LSMTree::Read(std::string_view key) const {
   return Status::kNotExists;
 }
 
-bool LSMTree::Contains(std::string_view key) const {
+StatusOr<bool> LSMTree::Contains(std::string_view key) const {
   {
     std::scoped_lock lk(mem_tree_lock_);
     auto iter = mem_tree_.find(std::string(key));
@@ -327,7 +344,7 @@ bool LSMTree::Contains(std::string_view key) const {
 
   std::unique_lock file_lk(file_tree_lock_);
   for (const auto& it : index_) {
-    auto result = it.Find(key, blob_);
+    auto result = it.Find(key, *blob_);
     if (result.GetStatus() == Status::kDeleted) {
       return false;
     }
@@ -338,7 +355,7 @@ bool LSMTree::Contains(std::string_view key) const {
   return false;
 }
 
-void LSMTree::Write(std::string_view key, std::string_view value, bool sync) {
+Status LSMTree::Write(std::string_view key, std::string_view value, bool sync) {
   {
     std::scoped_lock lk(mem_tree_lock_);
     mem_tree_[std::string(key)] = LSMValue(std::string(value));
@@ -349,11 +366,12 @@ void LSMTree::Write(std::string_view key, std::string_view value, bool sync) {
   // non-recursive mutex), so calling it while holding the lock deadlocked
   // the calling thread.
   if (sync) {
-    Sync();
+    return Sync();
   }
+  return Status::kSuccess;
 }
 
-void LSMTree::Delete(std::string_view key, bool flush) {
+Status LSMTree::Delete(std::string_view key, bool flush) {
   {
     std::scoped_lock lk(mem_tree_lock_);
     mem_tree_[std::string(key)] = LSMValue::Delete();
@@ -361,11 +379,12 @@ void LSMTree::Delete(std::string_view key, bool flush) {
     mem_tree_cv_.notify_one();
   }
   if (flush) {
-    Sync();
+    return Sync();
   }
+  return Status::kSuccess;
 }
 
-void LSMTree::Sync() {
+Status LSMTree::Sync() {
   // One flush at a time: snapshots must reach disk in mem_tree_ mutation
   // order or a newer run can shadow an older tombstone (deleted-key
   // resurrection) and identical runs get flushed twice.
@@ -376,20 +395,21 @@ void LSMTree::Sync() {
   {
     std::unique_lock lk(mem_tree_lock_);
     if (mem_tree_.empty()) {
-      return;
+      return Status::kSuccess;
     }
     std::swap(mem_tree_, frozen_mem_tree_);
     to_flush = frozen_mem_tree_;
     new_index_file = root_dir_ / (std::to_string(generation_) + "-" +
-                                  std::to_string(blob_.Written()));
+                                  std::to_string(blob_->Written()));
     generation = generation_.fetch_add(1);
   }
   // Build under a .pending name: until the blob payloads this run references
   // are durable, the file must not carry a parseable generation-highwater
   // name (see the rename below), or a crash could resurrect it.
-  const std::filesystem::path pending_file = new_index_file.string() + ".pending";
+  const std::filesystem::path pending_file =
+      new_index_file.string() + ".pending";
   if (const Status s =
-          SortedRun::Construct(pending_file, to_flush, blob_, generation);
+          SortedRun::Construct(pending_file, to_flush, *blob_, generation);
       s != Status::kSuccess) {
     // Merge the frozen snapshot back into mem_tree_ so writes made while the
     // flush was failing stay newer than the failed snapshot on re-flush.
@@ -401,31 +421,31 @@ void LSMTree::Sync() {
     std::scoped_lock lk(mem_tree_lock_);
     mem_tree_.merge(frozen_mem_tree_);
     frozen_mem_tree_.clear();
-    return;
+    return s;
   }
   // The blob payloads referenced by the new run must be durable BEFORE the
   // run is registered: the run file itself was already fsynced by
   // FlushInternal, and without this barrier a crash leaves a durable run
   // pointing at torn blob bytes (quarantined on restore: acked writes lost).
-  blob_.Sync();
+  RETURN_IF_FAIL(blob_->Sync());
   // The name's blob high-water must describe bytes that are durable: the
   // pre-append Written() would let a run whose blob bytes were lost pass the
   // RestoreRuns quarantine check.  After blob_.Sync(), CommittedLSN covers
   // every payload this run references.
   {
     const std::filesystem::path durable_name =
-        root_dir_ / (std::to_string(generation) + "-" +
-                     std::to_string(blob_.Written()));
+        root_dir_ /
+        (std::to_string(generation) + "-" + std::to_string(blob_->Written()));
     std::error_code ec;
     std::filesystem::rename(pending_file, durable_name, ec);
     if (ec) {
-      LOG(ERROR) << "flushing mem tree failed to rename run: "
-                 << ec.message();
+      LOG(ERROR) << "flushing mem tree failed to rename run: " << ec.message();
       std::filesystem::remove(pending_file, ec);
       std::scoped_lock lk(mem_tree_lock_);
       mem_tree_.merge(frozen_mem_tree_);
       frozen_mem_tree_.clear();
-      return;
+      return StatusError(StatusCode::kIOError,
+                         "failed to rename flushed run: " + ec.message());
     }
     new_index_file = durable_name;
   }
@@ -436,20 +456,22 @@ void LSMTree::Sync() {
     // the data entirely (kNotExists). Both locks are taken in the canonical
     // mem_tree_lock_ -> file_tree_lock_ order.
     std::scoped_lock lk(mem_tree_lock_, file_tree_lock_);
+    ASSIGN_OR_RETURN(SortedRun, run, SortedRun::Restore(new_index_file));
     files_.push_front(new_index_file);
-    index_.emplace_front(new_index_file);
+    index_.push_front(std::move(run));
     frozen_mem_tree_.clear();
   }
+  return Status::kSuccess;
 }
 
-void LSMTree::MergeAll() {
+Status LSMTree::MergeAll() {
   constexpr size_t kMaxRuns = 4;
   // Single atomic acquisition in the canonical mem_tree_lock_ ->
   // file_tree_lock_ order (same as Sync): two-step locking here would admit
   // a future file->mem path and an ABBA deadlock.
   std::scoped_lock lk(mem_tree_lock_, file_tree_lock_);
   if (index_.size() <= kMaxRuns) {
-    return;
+    return Status::kSuccess;
   }
   // Copy the merge inputs first and only mutate the deques after the merged
   // file is durable: an exception mid-merge must not orphan the source runs.
@@ -459,7 +481,7 @@ void LSMTree::MergeAll() {
   const std::filesystem::path newer_file = files_[files_.size() - 2];
 
   const std::vector<SortedRun> merge_inputs{older, newer};
-  LSMView view(blob_, merge_inputs);
+  LSMView view(*blob_, merge_inputs);
   // The merged run must NOT take a fresh generation: its payload is older
   // than every run flushed after these inputs, and a fresh number would let
   // it shadow newer tombstones (deleted keys resurface in scans). It instead
@@ -471,24 +493,30 @@ void LSMTree::MergeAll() {
   // blob_.Sync() below (see LSMTree::Sync for the full rationale).
   std::filesystem::path path =
       root_dir_ / ("merged-" + std::to_string(file_generation) + "-" +
-                   std::to_string(blob_.Written()) + ".pending");
+                   std::to_string(blob_->Written()) + ".pending");
   std::vector<SortedRun::Entry> merged;
   if (view.Size() != 0) {
     std::string min_key;
     std::string max_key;
-    for (LSMView::Iterator it = view.Begin(); it.IsValid(); ++it) {
+    ASSIGN_OR_RETURN(LSMView::Iterator, it, view.Begin());
+    for (; it.IsValid(); ++it) {
+      RETURN_IF_FAIL(it.GetStatus());
       if (merged.empty()) {
-        min_key = it.Key();
+        ASSIGN_OR_RETURN(std::string, key, it.Key());
+        min_key = std::move(key);
       }
-      merged.push_back(it.TopIterator().GetEntry());
-      max_key = it.Key();
+      ASSIGN_OR_RETURN(SortedRun::Entry, entry, it.GetEntry());
+      merged.push_back(entry);
+      ASSIGN_OR_RETURN(std::string, key, it.Key());
+      max_key = std::move(key);
     }
+    RETURN_IF_FAIL(it.GetStatus());
     if (const Status s = SortedRun::FlushInternal(path, min_key, max_key,
                                                   merged, merged_generation);
         s != Status::kSuccess) {
       // Sources stay registered; the merge is retried on a later tick.
       LOG(ERROR) << "merge failed: " << s;
-      return;
+      return s;
     }
   }
 
@@ -496,16 +524,17 @@ void LSMTree::MergeAll() {
     // The merged run references every input's blob bytes; make them durable
     // and stamp the final name with the post-Sync high-water before the
     // inputs are removed.
-    blob_.Sync();
+    RETURN_IF_FAIL(blob_->Sync());
     const std::filesystem::path durable_name =
         root_dir_ / ("merged-" + std::to_string(file_generation) + "-" +
-                     std::to_string(blob_.Written()));
+                     std::to_string(blob_->Written()));
     std::error_code ec;
     std::filesystem::rename(path, durable_name, ec);
     if (ec) {
       LOG(ERROR) << "merge failed to rename run: " << ec.message();
       std::filesystem::remove(path, ec);
-      return;
+      return StatusError(StatusCode::kIOError,
+                         "failed to rename merged run: " + ec.message());
     }
     path = durable_name;
   }
@@ -529,8 +558,10 @@ void LSMTree::MergeAll() {
                << remove_ec.message();
   }
   if (!merged.empty()) {
-    index_.emplace_back(path);
+    ASSIGN_OR_RETURN(SortedRun, run, SortedRun::Restore(path));
+    index_.push_back(std::move(run));
     files_.push_back(std::move(path));
   }
+  return Status::kSuccess;
 }
 }  // namespace tinylamb

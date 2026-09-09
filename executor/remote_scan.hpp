@@ -47,6 +47,12 @@ class RemoteChannel {
 // a RemoteChannel or pre-buffered distributed chunks.
 class RemoteScan : public ExecutorBase {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  RemoteScan(const RemoteScan&) = delete;
+  RemoteScan& operator=(const RemoteScan&) = delete;
+  RemoteScan(RemoteScan&&) = delete;
+  RemoteScan& operator=(RemoteScan&&) = delete;
   RemoteScan(Schema schema, std::shared_ptr<RemoteChannel> channel);
   RemoteScan(Schema schema, std::vector<DataChunk> pre_buffered_chunks);
 

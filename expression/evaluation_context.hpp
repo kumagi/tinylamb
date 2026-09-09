@@ -33,6 +33,13 @@ using AggregateResultMap =
 //     exercised without a Database.
 class EvaluationContext {
  public:
+  EvaluationContext() = default;
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  EvaluationContext(const EvaluationContext&) = delete;
+  EvaluationContext& operator=(const EvaluationContext&) = delete;
+  EvaluationContext(EvaluationContext&&) = delete;
+  EvaluationContext& operator=(EvaluationContext&&) = delete;
   virtual ~EvaluationContext() = default;
 
   // Executes `statement` scoped to `outer_row` (nullptr when the subquery is

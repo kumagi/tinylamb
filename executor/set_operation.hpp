@@ -44,15 +44,15 @@ class SetOperationExecutor : public ExecutorBase {
     RowPosition position;
   };
 
-  void Materialize();
+  Status Materialize();
   void AppendAll(const std::vector<Positioned>& source);
   void AppendDistinct(const std::vector<Positioned>& source,
                       SetOperationRowSet* seen);
   void AppendIntersection(const std::vector<std::vector<Positioned>>& rows,
                           bool all);
   void AppendExcept(const std::vector<std::vector<Positioned>>& rows, bool all);
-  void MaterializePartitioned();
-  void MaterializeRows(std::vector<std::vector<Positioned>> rows);
+  Status MaterializePartitioned();
+  Status MaterializeRows(std::vector<std::vector<Positioned>> rows);
 
   std::vector<Executor> sources_;
   SetOperationKind operation_{SetOperationKind::kUnionAll};

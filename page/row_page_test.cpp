@@ -57,7 +57,7 @@ TEST_F(RowPageTest, InsertMany) {
   // Arrange
   constexpr int kInserts = 100;
   size_t consumed = 0;
-  PageRef ref = p_->GetPage(page_id_);
+  PageRef ref = p_->GetPage(page_id_).MoveValue();
   RowPage& page = ref.GetRowPage();
   size_t before_size = page.FreeSizeForTest();
   ref.PageUnlock();
@@ -171,7 +171,7 @@ TEST_F(RowPageTest, DeleteMany) {
   // Act 3 -- verify remaining odd-indexed rows still readable, even-indexed
   // gone
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   for (size_t i = 0; i < kRows; ++i) {
     if (i % 2 == 0) {
       ASSERT_EQ(Status::kNotExists,
@@ -191,7 +191,7 @@ TEST_F(RowPageTest, DeleteMany) {
 TEST_F(RowPageTest, InsertZeroLenAbort) {
   // Arrange
   auto txn = tm_->Begin();
-  PageRef ref = p_->GetPage(page_id_);
+  PageRef ref = p_->GetPage(page_id_).MoveValue();
 
   // Act -- insert a zero-length string into slot 0 then abort the txn
   ASSIGN_OR_ASSERT_FAIL(slot_t, s, ref->Insert(txn, ""));
@@ -252,7 +252,7 @@ TEST_F(RowPageTest, RepeatedGrowingUpdatesPreserveAllRows) {
     const std::string expected =
         std::to_string(i) +
         std::string(i < kGrowingRows ? 80 : 60, i < kGrowingRows ? 'b' : 'a');
-    EXPECT_EQ(ReadRow(i), expected) << "slot " << i;
+    EXPECT_EQ(ReadRow(i), expected) << true << (i != 0);
   }
 }
 
@@ -274,12 +274,12 @@ TEST_F(RowPageTest, ReusingManyHolesDoesNotOverwriteSlotArray) {
   ASSERT_GT(replacements, 0);
 
   for (int i = kDeletedRows; i < kRows; ++i) {
-    EXPECT_EQ(ReadRow(i), "original-" + std::to_string(i)) << "slot " << i;
+    EXPECT_EQ(ReadRow(i), "original-" + std::to_string(i)) << true << (i != 0);
   }
   for (int i = 0; i < replacements; ++i) {
     const int slot = i < kDeletedRows ? i : kRows + i - kDeletedRows;
     EXPECT_EQ(ReadRow(slot), replacement + std::to_string(i))
-        << "slot " << slot;
+        << true << (slot != 0);
   }
 }
 
@@ -291,21 +291,21 @@ TEST_F(RowPageTest, InsertTwoThreads) {
   // Act -- interleave inserts from two transactions on the same page
   {
     // txn1
-    PageRef ref = p_->GetPage(page_id_);
+    PageRef ref = p_->GetPage(page_id_).MoveValue();
     std::string message = "message1";
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn1, message));
     ASSERT_EQ(slot, 0);
   }
   {
     // txn2
-    PageRef ref = p_->GetPage(page_id_);
+    PageRef ref = p_->GetPage(page_id_).MoveValue();
     std::string message = "message2";
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn2, message));
     ASSERT_EQ(slot, 1);
   }
   {
     // txn1 again
-    PageRef ref = p_->GetPage(page_id_);
+    PageRef ref = p_->GetPage(page_id_).MoveValue();
     std::string message = "message1-again";
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn1, message));
     ASSERT_EQ(slot, 2);
@@ -323,7 +323,7 @@ TEST_F(RowPageTest, UpdateHeavy) {
   std::vector<std::string> rows(kCount);
   std::vector<slot_t> slots;
   slots.reserve(kCount);
-  PageRef ref = p_->GetPage(page_id_);
+  PageRef ref = p_->GetPage(page_id_).MoveValue();
 
   // Act 1 -- insert kCount random keys and record their slots
   for (size_t i = 0; i < kCount; ++i) {
@@ -359,7 +359,7 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
   std::vector<std::string> rows(kCount);
   std::vector<slot_t> slots;
   slots.reserve(kCount);
-  PageRef ref = p_->GetPage(page_id_);
+  PageRef ref = p_->GetPage(page_id_).MoveValue();
 
   // Act 1 -- insert kCount random keys and record their slots
   for (size_t i = 0; i < kCount; ++i) {
@@ -419,7 +419,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
   // Act 1 -- an uncommitted transaction shrinks slot 0, freeing ~1900 bytes.
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Update(txn, 0, std::string(100, 'b')));
     page.PageUnlock();
     // Deliberately never commit or abort: recovery must roll it back.
@@ -428,7 +428,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
   // Act 2 -- a second, committed transaction consumes the freed space.
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     StatusOr<slot_t> slot = page->Insert(txn, std::string(1900, 'c'));
     ASSERT_SUCCESS(slot.GetStatus());
     ASSERT_SUCCESS(txn.PreCommit());
@@ -443,7 +443,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
   // the slot array end, every live row must sit fully inside the page body,
   // and no live row may be lost.
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   const RowPage& rp = page.GetRowPage();
   const char* const body = reinterpret_cast<const char*>(&rp);
   const char* const slot_array_end =
@@ -466,12 +466,12 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
   // stays readable without any structural damage.
   (void)ReadRow(0);
   for (int i = 1; i < 16; ++i) {
-    EXPECT_EQ(ReadRow(i), std::string(2000, 'a')) << "slot " << i;
+    EXPECT_EQ(ReadRow(i), std::string(2000, 'a')) << true << (i != 0);
   }
   bool found_committed_insert = false;
   {
     auto probe = tm_->Begin();
-    PageRef scan = p_->GetPage(page_id_);
+    PageRef scan = p_->GetPage(page_id_).MoveValue();
     const RowPage& body_rp = scan.GetRowPage();
     for (slot_t i = 0; i < body_rp.RowMax(); ++i) {
       if (body_rp.rows_[i].offset != 0 &&
@@ -505,7 +505,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
   // Act 1 -- an uncommitted transaction deletes slot 0, freeing 2000 bytes.
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Delete(txn, 0));
     page.PageUnlock();
     // Deliberately never commit or abort: recovery must roll it back.
@@ -515,7 +515,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
   // a position txn 1 does not lock) to consume the freed ~1900 bytes.
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Update(txn, 15, std::string(3900, 'c')));
     ASSERT_SUCCESS(txn.PreCommit());
   }
@@ -528,7 +528,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
   // Assert -- the page layout must stay intact: free_ptr_ never drops below
   // the slot array end, every live row must sit fully inside the page body.
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   const RowPage& rp = page.GetRowPage();
   const char* const body = reinterpret_cast<const char*>(&rp);
   const char* const slot_array_end =
@@ -551,12 +551,12 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
   // row survives.
   {
     auto probe = tm_->Begin();
-    PageRef scan = p_->GetPage(page_id_);
+    PageRef scan = p_->GetPage(page_id_).MoveValue();
     EXPECT_EQ(scan->Read(probe, 0).GetStatus(), Status::kNotExists);
     for (int i = 1; i < 15; ++i) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, value,
                             scan->Read(probe, static_cast<slot_t>(i)));
-      EXPECT_EQ(value, std::string(2000, 'a')) << "slot " << i;
+      EXPECT_EQ(value, std::string(2000, 'a')) << true << (i != 0);
     }
     ASSIGN_OR_ASSERT_FAIL(std::string_view, grown, scan->Read(probe, 15));
     EXPECT_EQ(grown, std::string(3900, 'c'));
@@ -569,7 +569,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
 TEST_F(RowPageTest, UpdateAndDeleteOutOfRangeSlot) {
   // Arrange -- a fresh, empty row page
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
 
   // Act/Assert -- updating a non-existent slot reports kNotExists
   ASSERT_EQ(page->Update(txn, 0, "x"), Status::kNotExists);
@@ -588,7 +588,7 @@ TEST_F(RowPageTest, ReadOnlyTransactionRejectedForWrites) {
 
   // A read-only transaction cannot acquire write locks
   auto txn = tm_->Begin(true);
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
 
   // Act/Assert -- insert conflicts on a read-only transaction
   ASSERT_EQ(page->Insert(txn, "hello").GetStatus(), Status::kConflicts);
@@ -608,7 +608,7 @@ TEST_F(RowPageTest, ConflictedInsertConsumesNoPhysicalSlot) {
   // Act -- an insert whose lock acquisition fails must not touch the page.
   {
     auto ro = tm_->Begin(true);
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_EQ(page->Insert(ro, "ghost").GetStatus(), Status::kConflicts);
     page.PageUnlock();
     ro.Abort();
@@ -625,7 +625,7 @@ TEST_F(RowPageTest, ConflictedInsertConsumesNoPhysicalSlot) {
   // reuses slot 0 and reads back its own image.
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, "real"));
     EXPECT_EQ(slot, 0U);
     ASSERT_SUCCESS(txn.PreCommit());
@@ -640,13 +640,13 @@ TEST_F(RowPageTest, InsertSkipsHoleReservedByConcurrentDelete) {
 
   auto deleter = tm_->Begin();
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Delete(deleter, 0));
   }
 
   auto inserter = tm_->Begin();
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(inserter, "replacement"));
     EXPECT_EQ(slot, 2U);
   }
@@ -662,7 +662,7 @@ TEST_F(RowPageTest, InsertSkipsHoleReservedByConcurrentDelete) {
 TEST_F(RowPageTest, DeFragmentAndDump) {
   // Arrange -- populate the page then leave a hole via delete
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   ASSERT_SUCCESS(page->Insert(txn, "row0").GetStatus());
   ASSERT_SUCCESS(page->Insert(txn, "row1").GetStatus());
   ASSERT_SUCCESS(page->Delete(txn, 0));
@@ -703,7 +703,7 @@ TEST_F(RowPageTest, DeleteRowReappliedIsIdempotent) {
   ASSERT_TRUE(InsertRow("row-b"));
   DeleteRow(0);  // committed delete of slot 0
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     const bin_size_t free_before = page->body.row_page.FreeSizeForTest();
     page->body.row_page.DeleteRow(0);   // already deleted: no-op
     page->body.row_page.DeleteRow(99);  // out of range: no-op

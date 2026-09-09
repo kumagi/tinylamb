@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
@@ -144,6 +145,7 @@ bool UnnestExecutor::Next(Row* dst, RowPosition* rp) {
     current_child_row_ = Row();
     RowPosition child_rp;
     if (!child_->Next(&current_child_row_, &child_rp)) {
+      FailWithChildOf(*child_);
       child_exhausted_ = true;
       return false;
     }
@@ -158,8 +160,12 @@ bool UnnestExecutor::Next(Row* dst, RowPosition* rp) {
     }
     relational_detail::CteMap ctes;
 
-    Value array_val =
-        relational_detail::Evaluate(unnest_expr_, scope, nullptr, ctx_, ctes);
+    StatusOr<Value> evaluated = relational_detail::TryEvaluate(
+        unnest_expr_, scope, nullptr, ctx_, ctes);
+    if (!evaluated.HasValue()) {
+      return FailWith(evaluated.GetStatus());
+    }
+    Value array_val = evaluated.MoveValue();
     CoerceElementsToDeclaredType(&array_val);
 
     SelectSource source;

@@ -26,7 +26,7 @@ std::unique_ptr<SelectStatement> ParseSelect(const std::string& sql) {
     return nullptr;
   }
   std::unique_ptr<Statement> statement =
-      GoogleSqlAstVisitor::Visit(*ast.Value());
+      GoogleSqlAstVisitor::Visit(*ast.Value()).MoveValue();
   if (statement == nullptr || statement->Type() != StatementType::kSelect) {
     return nullptr;
   }

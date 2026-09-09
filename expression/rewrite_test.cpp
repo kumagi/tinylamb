@@ -109,8 +109,8 @@ TEST(ExpressionRewriteTest, FoldsInAndSimplifiesCase) {
   EXPECT_TRUE(folded->AsConstantValue().GetValue().Truthy());
 
   Expression case_expression = CaseExpressionExp(
-      {{ConstantValueExp(Value(false)), ConstantValueExp(Value(1))},
-       {ConstantValueExp(Value(true)), ConstantValueExp(Value(2))}},
+      {{ConstantValueExp(Value(0)), ConstantValueExp(Value(1))},
+       {ConstantValueExp(Value(1)), ConstantValueExp(Value(2))}},
       ConstantValueExp(Value(3)));
   Expression simplified =
       ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(case_expression);
@@ -243,13 +243,13 @@ TEST(ExpressionRewriteTest, BooleanIdentity) {
   Expression rewritten_or =
       ExpressionRewriter(ExpressionRuleSet::Default())
           .Rewrite(BinaryExpressionExp(x, BinaryOperation::kOr,
-                                       ConstantValueExp(Value(true))));
+                                       ConstantValueExp(Value(1))));
   ASSERT_EQ(rewritten_or->Type(), TypeTag::kConstantValue);
   EXPECT_EQ(rewritten_or->AsConstantValue().GetValue(), Value(true));
   Expression rewritten_and =
       ExpressionRewriter(ExpressionRuleSet::Default())
           .Rewrite(BinaryExpressionExp(x, BinaryOperation::kAnd,
-                                       ConstantValueExp(Value(false))));
+                                       ConstantValueExp(Value(0))));
   ASSERT_EQ(rewritten_and->Type(), TypeTag::kConstantValue);
   EXPECT_EQ(rewritten_and->AsConstantValue().GetValue(), Value(false));
   EXPECT_EQ(ExpressionRewriter(ExpressionRuleSet::Default())
@@ -283,7 +283,7 @@ TEST(ExpressionRewriteTest, DoubleNegationAndDeMorgan) {
 TEST(ExpressionRewriteTest, SimplifyCaseVariants) {
   // All-false conditions leave the else clause.
   Expression case_all_false = CaseExpressionExp(
-      {{ConstantValueExp(Value(false)), ConstantValueExp(Value(1))}},
+      {{ConstantValueExp(Value(0)), ConstantValueExp(Value(1))}},
       ConstantValueExp(Value(9)));
   Expression simplified2 =
       ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(case_all_false);
@@ -355,17 +355,18 @@ TEST(ExpressionRewriteTest, ExpressionChildrenAndWithChildren) {
   EXPECT_TRUE(ExpressionChildren(ColumnValueExp("x")).empty());
   EXPECT_TRUE(ExpressionChildren(nullptr).empty());
 
-  EXPECT_THROW(std::ignore = WithExpressionChildren(
+  // Arity violations are broken rewriter plumbing: the no-exception
+  // contract turns them into CHECK aborts.
+  EXPECT_DEATH(std::ignore = WithExpressionChildren(
                    ConstantValueExp(Value(1)), {ConstantValueExp(Value(2))}),
-               std::invalid_argument);
-  EXPECT_THROW(
+               "leaf has children");
+  EXPECT_DEATH(
       std::ignore = WithExpressionChildren(binary, {ColumnValueExp("x")}),
-      std::invalid_argument);
-  EXPECT_THROW(std::ignore = WithExpressionChildren(in, {}),
-               std::invalid_argument);
-  EXPECT_THROW(std::ignore = WithExpressionChildren(
+      "binary arity");
+  EXPECT_DEATH(std::ignore = WithExpressionChildren(in, {}), "in arity");
+  EXPECT_DEATH(std::ignore = WithExpressionChildren(
                    query, {ColumnValueExp("x"), ColumnValueExp("y")}),
-               std::invalid_argument);
+               "query arity");
 }
 
 TEST(ExpressionRewriteTest, SplitCombineEdgeCases) {
@@ -376,7 +377,7 @@ TEST(ExpressionRewriteTest, SplitCombineEdgeCases) {
   EXPECT_TRUE(SplitConjuncts(nullptr).empty());
   Expression deep = BinaryExpressionExp(
       BinaryExpressionExp(
-          BinaryExpressionExp(ConstantValueExp(Value(true)),
+          BinaryExpressionExp(ConstantValueExp(Value(1)),
                               BinaryOperation::kAnd, ColumnValueExp("a")),
           BinaryOperation::kAnd, ColumnValueExp("b")),
       BinaryOperation::kAnd, ColumnValueExp("c"));
@@ -540,12 +541,12 @@ TEST(ExpressionRewriteTest, XorBooleanIdentity) {
   Expression x = ColumnValueExp("x");
 
   Expression xor_true = BinaryExpressionExp(x, BinaryOperation::kXor,
-                                            ConstantValueExp(Value(true)));
+                                            ConstantValueExp(Value(1)));
   Expression rewritten = rewrite(xor_true);
   ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
   EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kNot);
 
-  Expression false_xor = BinaryExpressionExp(ConstantValueExp(Value(false)),
+  Expression false_xor = BinaryExpressionExp(ConstantValueExp(Value(0)),
                                              BinaryOperation::kXor, x);
   rewritten = rewrite(false_xor);
   EXPECT_EQ(rewritten->Type(), TypeTag::kColumnValue);
@@ -1105,7 +1106,7 @@ TEST(ExpressionRewriteTest, AbsorptionPreservesRaisingOperand) {
   Expression rewritten = rewrite(t);
   // Must still contain the raising CAST (not collapsed to a NULL constant).
   EXPECT_NE(rewritten->ToString().find("CAST"), std::string::npos)
-      << "absorption erased a raising operand: " << rewritten->ToString();
+      << true << rewritten->ToString();
 }
 
 // Oracle-found: `(x IS NULL) IS NOT NULL -> TRUE` (and the IS NULL twin)
@@ -1116,12 +1117,12 @@ TEST(ExpressionRewriteTest, NullCheckOfNullCheckPreservesRaise) {
   };
   Expression raise = CastExpressionExp(ConstantValueExp(Value(-INFINITY)),
                                        "INT64");  // raises when evaluated
-  Expression t = UnaryExpressionExp(
-      UnaryExpressionExp(raise, UnaryOperation::kIsNotNull),
-      UnaryOperation::kIsNotNull);
+  Expression t =
+      UnaryExpressionExp(UnaryExpressionExp(raise, UnaryOperation::kIsNotNull),
+                         UnaryOperation::kIsNotNull);
   Expression rewritten = rewrite(t);
   EXPECT_NE(rewritten->ToString().find("CAST"), std::string::npos)
-      << "null-check-of-null-check erased a raising operand: "
+      << true
       << rewritten->ToString();
 }
 
@@ -1716,8 +1717,7 @@ TEST(ExpressionRewriteTest, DeterministicFunctionCse) {
   Expression rewritten_nullif = rewriter.Rewrite(nullif_dup);
   ASSERT_EQ(rewritten_nullif->Type(), TypeTag::kFunctionCallExp);
   // With total (column) arguments the fold still fires.
-  Expression nullif_col =
-      FunctionCallExp("nullif", {x, ColumnValueExp("x")});
+  Expression nullif_col = FunctionCallExp("nullif", {x, ColumnValueExp("x")});
   Expression rewritten_nullif_col = rewriter.Rewrite(nullif_col);
   ASSERT_TRUE(rewritten_nullif_col->Type() == TypeTag::kConstantValue);
   EXPECT_TRUE(rewritten_nullif_col->AsConstantValue().GetValue().IsNull());
@@ -2156,7 +2156,7 @@ TEST(ExpressionRewriteTest, LikeEqualityRefusesTimestampShapedPattern) {
   Expression rewritten_ts = rewrite(like_timestamp);
   ASSERT_EQ(rewritten_ts->Type(), TypeTag::kBinaryExp);
   EXPECT_EQ(rewritten_ts->AsBinaryExpression().Op(), BinaryOperation::kLike)
-      << "LIKE must stay byte-wise for timestamp-shaped constants";
+      << true;
 }
 
 TEST(ExpressionRewriteTest, ChildRewritePreservesAggregateMetadata) {
@@ -2182,7 +2182,7 @@ TEST(ExpressionRewriteTest, ChildRewritePreservesAggregateMetadata) {
   const auto& rebuilt_agg = rebuilt->AsAggregateExpression();
   EXPECT_EQ(rebuilt_agg.GetType(), AggregationType::kSum);
   EXPECT_TRUE(rebuilt_agg.WhereFilter())
-      << "WHERE filter was dropped by the child rewrite";
+      << true;
   EXPECT_EQ(rebuilt_agg.WhereFilter()->ToString(),
             agg->WhereFilter()->ToString());
   EXPECT_TRUE(rebuilt_agg.InnerLimit().has_value());

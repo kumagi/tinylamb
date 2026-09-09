@@ -47,11 +47,12 @@
 namespace tinylamb {
 slot_t BranchPage::RowCount() const { return row_count_; }
 
-void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
-                                page_id_t value) {
+Status BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
+                                  page_id_t value) {
   page_id_t old_lowest_value = lowest_page_;
   SetLowestValueImpl(value);
-  txn.SetLowestLog(pid, value, old_lowest_value);
+  RETURN_IF_FAIL(txn.SetLowestLog(pid, value, old_lowest_value).GetStatus());
+  return Status::kSuccess;
 }
 
 Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
@@ -76,7 +77,7 @@ Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
     return Status::kDuplicates;
   }
   InsertImpl(key, value);
-  txn.InsertBranchLog(pid, key, value);
+  RETURN_IF_FAIL(txn.InsertBranchLog(pid, key, value).GetStatus());
   return Status::kSuccess;
 }
 
@@ -140,7 +141,9 @@ Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
           free_size_) {
     return Status::kNoSpace;
   }
-  txn.UpdateBranchLog(pid, key, value, GetValue(static_cast<size_t>(pos)));
+  RETURN_IF_FAIL(
+      txn.UpdateBranchLog(pid, key, value, GetValue(static_cast<size_t>(pos)))
+          .GetStatus());
   UpdateImpl(key, value);
   return Status::kSuccess;
 }
@@ -194,11 +197,13 @@ Status BranchPage::Delete(page_id_t pid, Transaction& txn,
   if (pos < 0) {
     page_id_t next_lowest = GetValue(0);
     page_id_t prev_lowest = lowest_page_;
-    txn.DeleteBranchLog(pid, GetKey(0), next_lowest);
-    txn.SetLowestLog(pid, next_lowest, prev_lowest);
+    RETURN_IF_FAIL(
+        txn.DeleteBranchLog(pid, GetKey(0), next_lowest).GetStatus());
+    RETURN_IF_FAIL(txn.SetLowestLog(pid, next_lowest, prev_lowest).GetStatus());
   } else {
-    txn.DeleteBranchLog(pid, GetKey(static_cast<size_t>(pos)),
-                        GetValue(static_cast<size_t>(pos)));
+    RETURN_IF_FAIL(txn.DeleteBranchLog(pid, GetKey(static_cast<size_t>(pos)),
+                                       GetValue(static_cast<size_t>(pos)))
+                       .GetStatus());
   }
   DeleteImpl(key);
   return Status::kSuccess;
@@ -256,7 +261,7 @@ Status BranchPage::SetLowFence(page_id_t pid, Transaction& txn,
       return Status::kNoSpace;
     }
   }
-  txn.SetLowFence(pid, lf, GetLowFence());
+  RETURN_IF_FAIL(txn.SetLowFence(pid, lf, GetLowFence()).GetStatus());
   SetFence(rows_[kLowFenceIdx], lf);
   return Status::kSuccess;
 }
@@ -273,7 +278,7 @@ Status BranchPage::SetHighFence(page_id_t pid, Transaction& txn,
       return Status::kNoSpace;
     }
   }
-  txn.SetHighFence(pid, hf, GetHighFence());
+  RETURN_IF_FAIL(txn.SetHighFence(pid, hf, GetHighFence()).GetStatus());
   SetFence(rows_[kHighFenceIdx], hf);
   return Status::kSuccess;
 }
@@ -314,9 +319,10 @@ Status BranchPage::SetFoster(page_id_t pid, Transaction& txn,
     return Status::kNoSpace;
   }
   if (auto prev_foster = GetFoster()) {
-    txn.SetFoster(pid, new_foster, prev_foster.Value());
+    RETURN_IF_FAIL(
+        txn.SetFoster(pid, new_foster, prev_foster.Value()).GetStatus());
   } else {
-    txn.SetFoster(pid, new_foster, {});
+    RETURN_IF_FAIL(txn.SetFoster(pid, new_foster, {}).GetStatus());
   }
   SetFosterImpl(new_foster);
   return Status::kSuccess;
@@ -552,7 +558,7 @@ bool BranchPage::SanityCheckForTest(
   // Violations are reported through the boolean result instead of
   // LOG(FATAL)-and-continue: FATAL is about to become an aborting level, and
   // continuing after a detected corruption only obscures the diagnosis.
-  bool sanity = SanityCheck(pm->GetPage(lowest_page_), pm);
+  bool sanity = SanityCheck(pm->GetPage(lowest_page_).MoveValue(), pm);
   if (!sanity) {
     return false;
   }
@@ -570,25 +576,25 @@ bool BranchPage::SanityCheckForTest(
       Dump(std::cerr, 0);
       return false;
     }
-    std::string smallest = SmallestKey(pm->GetPage(GetValue(i)));
+    std::string smallest = SmallestKey(pm->GetPage(GetValue(i)).MoveValue());
     if (smallest < GetKey(i)) {
       LOG(ERROR) << "Child smallest key is smaller than parent slot: "
                  << smallest << " vs " << GetKey(i);
       return false;
     }
-    std::string biggest = BiggestKey(pm->GetPage(GetValue(i)));
+    std::string biggest = BiggestKey(pm->GetPage(GetValue(i)).MoveValue());
     if (GetKey(i + 1) < biggest) {
       LOG(WARN) << *this;
       LOG(ERROR) << "Child biggest key is bigger than parent next slot: "
                  << GetKey(i + 1) << " vs " << biggest;
       return false;
     }
-    sanity = SanityCheck(pm->GetPage(GetValue(i)), pm);
+    sanity = SanityCheck(pm->GetPage(GetValue(i)).MoveValue(), pm);
     if (!sanity) {
       return false;
     }
   }
-  return SanityCheck(pm->GetPage(GetValue(row_count_ - 1)), pm);
+  return SanityCheck(pm->GetPage(GetValue(row_count_ - 1)).MoveValue(), pm);
 }
 
 void BranchPage::DeFragment() {

@@ -108,9 +108,9 @@ class Md5 {
           (static_cast<uint32_t>(static_cast<uint8_t>(p[(i * 4) + 3])) << 24);
     }
     uint32_t a = a_, b = b_, c = c_, d = d_;
-    for (int i = 0; i < 64; ++i) {
+    for (size_t i = 0; i < 64; ++i) {
       uint32_t f = 0;
-      int g = 0;
+      size_t g = 0;
       if (i < 16) {
         f = (b & c) | (~b & d);
         g = i;
@@ -213,7 +213,7 @@ class Sha1 {
       w[i] = Rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
     }
     uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4];
-    for (int i = 0; i < 80; ++i) {
+    for (size_t i = 0; i < 80; ++i) {
       uint32_t f = 0, k = 0;
       if (i < 20) {
         f = (b & c) | (~b & d);
@@ -339,7 +339,7 @@ class Sha256 {
     }
     uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3];
     uint32_t e = h_[4], f = h_[5], g = h_[6], h = h_[7];
-    for (int i = 0; i < 64; ++i) {
+    for (size_t i = 0; i < 64; ++i) {
       const uint32_t s1 = Rotr(e, 6) ^ Rotr(e, 11) ^ Rotr(e, 25);
       const uint32_t ch = (e & f) ^ (~e & g);
       const uint32_t t1 = h + s1 + ch + kK[i] + w[i];
@@ -482,7 +482,7 @@ class Sha512 {
     }
     uint64_t a = h_[0], b = h_[1], c = h_[2], d = h_[3];
     uint64_t e = h_[4], f = h_[5], g = h_[6], h = h_[7];
-    for (int i = 0; i < 80; ++i) {
+    for (size_t i = 0; i < 80; ++i) {
       const uint64_t s1 = Rotr(e, 14) ^ Rotr(e, 18) ^ Rotr(e, 41);
       const uint64_t ch = (e & f) ^ (~e & g);
       const uint64_t t1 = h + s1 + ch + kK[i] + w[i];

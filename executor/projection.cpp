@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/binary_expression.hpp"
@@ -260,6 +261,9 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
   destination->Reserve(max_rows);
   if (src_->NextBatch(&input_batch_, max_rows) == 0) {
+    if (src_->GetStatus() != Status::kSuccess) {
+      FailWith(src_->GetStatus());
+    }
     return 0;
   }
   const DataChunk* expression_input = &input_batch_;
@@ -270,7 +274,12 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
       if (!program) {
         continue;
       }
-      cse_values.push_back(program->EvaluateBatch(input_batch_));
+      StatusOr<ColumnVector> batch = program->TryEvaluateBatch(input_batch_);
+      if (!batch.HasValue()) {
+        FailWith(batch.GetStatus());
+        return 0;
+      }
+      cse_values.push_back(batch.MoveValue());
     }
     cse_input_batch_.Reset();
     std::vector<const ColumnVector*> sources;
@@ -322,16 +331,25 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
           int64_t projected = 0;
           if (__builtin_mul_overflow(inputs[r], jit.multiplier, &product) ||
               __builtin_add_overflow(product, jit.addend, &projected)) {
-            throw std::runtime_error("integer overflow on '*'");
+            FailWith(StatusError(StatusCode::kIsInfinity,
+
+                                 "integer overflow on '*'"));
+            return 0;
           }
           output[r] = projected;
         }
       }
       if (mul_overflow) {
-        throw std::runtime_error("integer overflow on '*'");
+        FailWith(StatusError(StatusCode::kIsInfinity,
+
+                             "integer overflow on '*'"));
+        return 0;
       }
       if (add_overflow) {
-        throw std::runtime_error("integer overflow on '+'");
+        FailWith(StatusError(StatusCode::kIsInfinity,
+
+                             "integer overflow on '+'"));
+        return 0;
       }
       ColumnVector& evaluated_column =
           evaluated[index].emplace(ValueType::kInt64, output.size());
@@ -341,7 +359,13 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
       ++jit_batches_;
     } else if (const std::optional<BytecodeProgram>& program =
                    bytecodes_[index]) {
-      evaluated[index].emplace(program->EvaluateBatch(*expression_input));
+      StatusOr<ColumnVector> batch =
+          program->TryEvaluateBatch(*expression_input);
+      if (!batch.HasValue()) {
+        FailWith(batch.GetStatus());
+        return 0;
+      }
+      evaluated[index].emplace(batch.MoveValue());
     }
   }
   bool all_evaluated = true;
@@ -389,7 +413,13 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
       if (!row) {
         row = expression_input->RowAt(row_index);
       }
-      result.push_back(named.expression->Evaluate(*row, augmented_schema_));
+      StatusOr<Value> value =
+          named.expression->TryEvaluate(*row, augmented_schema_);
+      if (!value.HasValue()) {
+        FailWith(value.GetStatus());
+        return 0;
+      }
+      result.push_back(value.MoveValue());
     }
     destination->Append(Row(std::move(result)),
                         input_batch_.PositionAt(row_index));

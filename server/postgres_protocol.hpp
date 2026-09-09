@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "type/row.hpp"
 #include "type/value_type.hpp"
 
@@ -31,8 +32,8 @@ struct ColumnDescription {
   ValueType type{ValueType::kVarChar};
 };
 
-uint16_t ReadUint16(std::string_view bytes, size_t offset);
-uint32_t ReadUint32(std::string_view bytes, size_t offset);
+StatusOr<uint16_t> ReadUint16(std::string_view bytes, size_t offset);
+StatusOr<uint32_t> ReadUint32(std::string_view bytes, size_t offset);
 void AppendUint16(std::string* output, uint16_t value);
 void AppendUint32(std::string* output, uint32_t value);
 

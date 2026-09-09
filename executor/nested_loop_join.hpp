@@ -34,8 +34,9 @@ class NestedLoopJoin : public ExecutorBase {
   [[nodiscard]] bool AssertUnique() const { return assert_unique_; }
 
  private:
-  void Materialize();
-  [[nodiscard]] bool EvaluatePredicate(const Row& left, const Row& right) const;
+  Status Materialize();
+  [[nodiscard]] StatusOr<bool> EvaluatePredicate(const Row& left,
+                                                 const Row& right) const;
 
   Executor left_;
   Schema left_schema_;
@@ -48,10 +49,10 @@ class NestedLoopJoin : public ExecutorBase {
   Schema combined_schema_;
 
   bool materialized_{false};
-  // Latched when Materialize() throws: both children are drained by then, so
+  // Latched when Materialize() fails: both children are drained by then, so
   // a retry would observe empty inputs and silently return zero rows.  The
   // original error is rethrown instead.
-  std::exception_ptr materialize_error_;
+  Status materialize_error_{Status::kSuccess};
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};
 };

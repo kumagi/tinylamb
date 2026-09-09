@@ -32,13 +32,33 @@
 namespace tinylamb {
 
 namespace {
-// Membership must use the same comparison as `=` (EvaluateBinary), which
+// Membership must use the same comparison as `=` (TryEvaluateBinary), which
 // promotes INT64/DOUBLE and honors unsigned/collation tags. The previous
 // `child == candidate` used Value::operator==, which returns false across
 // types, so `1 IN (1.0)` folded to FALSE while `1 = 1.0` was TRUE.
-bool Matches(const Value& child, const Value& candidate) {
-  const Value eq = EvaluateBinary(BinaryOperation::kEquals, child, candidate);
+StatusOr<bool> TryMatches(const Value& child, const Value& candidate) {
+  ASSIGN_OR_RETURN(
+      Value, eq, TryEvaluateBinary(BinaryOperation::kEquals, child, candidate));
   return !eq.IsNull() && eq.Truthy();
+}
+
+template <typename... Args>
+StatusOr<Value> TryMembership(const ExpressionBase& child,
+                              const std::vector<Expression>& list,
+                              Args&&... args) {
+  ASSIGN_OR_RETURN(Value, child_value, child.TryEvaluate(args...));
+  bool saw_null = child_value.IsNull();
+  for (const auto& item : list) {
+    ASSIGN_OR_RETURN(Value, candidate, item->TryEvaluate(args...));
+    saw_null |= candidate.IsNull();
+    if (!child_value.IsNull() && !candidate.IsNull()) {
+      ASSIGN_OR_RETURN(bool, matched, TryMatches(child_value, candidate));
+      if (matched) {
+        return Value(true);
+      }
+    }
+  }
+  return saw_null ? Value() : Value(false);
 }
 }  // namespace
 
@@ -50,48 +70,41 @@ std::unordered_set<ColumnName> InExpression::TouchedColumns() const {
   return result;
 }
 
+StatusOr<Value> InExpression::TryEvaluate(const Row& row,
+                                          const Schema& schema) const {
+  return TryMembership(*child_, list_, row, schema);
+}
+
+StatusOr<Value> InExpression::TryEvaluate(const Row* left,
+                                          const Schema& left_schema,
+                                          const Row* right,
+                                          const Schema& right_schema) const {
+  return TryMembership(*child_, list_, left, left_schema, right, right_schema);
+}
+
+// Context-aware form: same three-valued membership as the plain evaluator
+// with the context threaded into every child (A1 stage 2).
+StatusOr<Value> InExpression::TryEvaluate(const Row& row, const Schema& schema,
+                                          EvaluationContext& context) const {
+  return TryMembership(*child_, list_, row, schema, context);
+}
+
+// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
 Value InExpression::Evaluate(const Row& row, const Schema& schema) const {
-  Value child = child_->Evaluate(row, schema);
-  bool saw_null = child.IsNull();
-  for (const auto& item : list_) {
-    Value candidate = item->Evaluate(row, schema);
-    saw_null |= candidate.IsNull();
-    if (!child.IsNull() && !candidate.IsNull() && Matches(child, candidate)) {
-      return Value(true);
-    }
-  }
-  return saw_null ? Value() : Value(false);
+  return ExcShimUnwrap(TryEvaluate(row, schema), "InExpression::Evaluate");
 }
 
 Value InExpression::Evaluate(const Row* left, const Schema& left_schema,
                              const Row* right,
                              const Schema& right_schema) const {
-  Value child = child_->Evaluate(left, left_schema, right, right_schema);
-  bool saw_null = child.IsNull();
-  for (const auto& item : list_) {
-    Value candidate = item->Evaluate(left, left_schema, right, right_schema);
-    saw_null |= candidate.IsNull();
-    if (!child.IsNull() && !candidate.IsNull() && Matches(child, candidate)) {
-      return Value(true);
-    }
-  }
-  return saw_null ? Value() : Value(false);
+  return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "InExpression::Evaluate");
 }
 
-// Context-aware form: same three-valued membership as the plain evaluator
-// with the context threaded into every child (A1 stage 2).
 Value InExpression::Evaluate(const Row& row, const Schema& schema,
                              EvaluationContext& context) const {
-  const Value child = child_->Evaluate(row, schema, context);
-  bool saw_null = child.IsNull();
-  for (const auto& item : list_) {
-    const Value candidate = item->Evaluate(row, schema, context);
-    saw_null |= candidate.IsNull();
-    if (!child.IsNull() && !candidate.IsNull() && Matches(child, candidate)) {
-      return Value(true);
-    }
-  }
-  return saw_null ? Value() : Value(false);
+  return ExcShimUnwrap(TryEvaluate(row, schema, context),
+                       "InExpression::Evaluate");
 }
 
 std::string InExpression::ToString() const {

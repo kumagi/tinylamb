@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/join_kind.hpp"
@@ -25,6 +26,12 @@ namespace tinylamb {
 // relation matches in batches to minimize rescans.
 class BatchNestedLoopJoin : public ExecutorBase, public PipelineBreaker {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  BatchNestedLoopJoin(const BatchNestedLoopJoin&) = delete;
+  BatchNestedLoopJoin& operator=(const BatchNestedLoopJoin&) = delete;
+  BatchNestedLoopJoin(BatchNestedLoopJoin&&) = delete;
+  BatchNestedLoopJoin& operator=(BatchNestedLoopJoin&&) = delete;
   BatchNestedLoopJoin(Executor left, Schema left_schema, Executor right,
                       Schema right_schema, Expression predicate = Expression(),
                       JoinKind kind = JoinKind::kInner,
@@ -53,6 +60,7 @@ class BatchNestedLoopJoin : public ExecutorBase, public PipelineBreaker {
 
  private:
   void EnsureMaterialized();
+  mutable Status predicate_error_{Status::kSuccess};
   void ExecuteBlockJoin();
   [[nodiscard]] bool EvaluatePredicate(const Row& left, const Row& right) const;
 

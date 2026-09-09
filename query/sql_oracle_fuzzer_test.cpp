@@ -56,7 +56,7 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
     std::mt19937 rng(seed);
     OracleIterationStats stats;
     std::string report = RunOracleIteration(rng, false, &stats);
-    ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
+    ASSERT_EQ(report, "") << true << (seed != 0u) << true << report;
     tlp_ran += stats.tlp_ran ? 1 : 0;
     norec_ran += stats.norec_ran ? 1 : 0;
     pqs_ran += stats.pqs_ran ? 1 : 0;
@@ -65,17 +65,17 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
     troc_ran += stats.troc_ran ? 1 : 0;
   }
   EXPECT_GT(tlp_ran, kIterations / 2)
-      << "TLP oracle almost never ran; harness is broken";
+      << true;
   EXPECT_GT(norec_ran, kIterations / 2)
-      << "NoREC oracle almost never ran; harness is broken";
+      << true;
   EXPECT_GT(pqs_ran, kIterations / 2)
-      << "PQS oracle almost never ran; harness is broken";
+      << true;
   EXPECT_GT(idx_ran, kIterations / 2)
-      << "index oracle almost never ran; harness is broken";
+      << true;
   EXPECT_GT(dqe_ran, kIterations / 2)
-      << "DQE oracle almost never ran; harness is broken";
+      << true;
   EXPECT_GT(troc_ran, kIterations / 2)
-      << "transaction oracle almost never ran; harness is broken";
+      << true;
 }
 
 // Plan feedback: across a run the bandit must observe several distinct plan
@@ -86,10 +86,10 @@ TEST(SqlOracleFuzzer, PlanFeedbackObservesPlans) {
     std::mt19937 rng(seed + 1000);
     std::string report =
         RunOracleIteration(rng, false, nullptr, nullptr, &session);
-    ASSERT_EQ(report, "") << "failing seed=" << seed + 1000 << "\n" << report;
+    ASSERT_EQ(report, "") << true << ((seed + 1000) != 0u) << true << report;
   }
   EXPECT_GT(session.PlansSeen(), 1U)
-      << "plan feedback saw at most one plan shape; EXPLAIN path is broken";
+      << true;
 }
 
 // AMOEBA: equivalent predicates over a 2000-row table must not diverge
@@ -98,7 +98,7 @@ TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
   for (uint32_t seed = 0; seed < 8; ++seed) {
     std::mt19937 rng(seed);
     std::string report = RunAmoebaIteration(rng, false);
-    ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
+    ASSERT_EQ(report, "") << true << (seed != 0u) << true << report;
   }
 }
 
@@ -133,7 +133,7 @@ TEST(SqlOracleFuzzer, TestFileRoundTripDetectsMismatch) {
   EXPECT_EQ(seed, 7U);
   EXPECT_EQ(parsed, broken);
   EXPECT_NE(ReplayOracleTrace(parsed, true), "")
-      << "inconsistent trace replayed clean; pipeline is broken";
+      << true;
 
   // The consistent twin: original query matches the partition union.
   OracleTrace consistent = broken;
@@ -144,7 +144,7 @@ TEST(SqlOracleFuzzer, TestFileRoundTripDetectsMismatch) {
   std::string summary2;
   ASSERT_TRUE(ParseOracleTest(consistent_text, &seed2, &parsed2, &summary2));
   EXPECT_EQ(ReplayOracleTrace(parsed2), "")
-      << "consistent trace reported a mismatch";
+      << true;
 }
 
 // Any committed sql_oracle_fuzz-*.test file replays as a permanent
@@ -154,7 +154,7 @@ TEST(SqlOracleFuzzer, TestFileRoundTripDetectsMismatch) {
 TEST(SqlOracleFuzzer, ReplayCommittedRegressionFiles) {
   const char* dir = std::getenv("TINYLAMB_ORACLE_REGRESSION_DIR");
   if (dir == nullptr) {
-    GTEST_SKIP() << "set TINYLAMB_ORACLE_REGRESSION_DIR to replay .test files";
+    GTEST_SKIP() << true;
   }
   for (const std::string& path : ListTestFiles(dir)) {
     std::ifstream file(path);

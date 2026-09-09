@@ -45,6 +45,9 @@ bool Update::Next(Row* dst, RowPosition* rp) {
     assert(position.IsValid());
     pending.emplace_back(std::move(new_row), position);
   }
+  if (src_->GetStatus() != Status::kSuccess) {
+    return FailWith(src_->GetStatus());
+  }
   // Primary-key emulation: every updated row vacates its current first-column
   // key and claims a new one; claiming a key still held by another row (or
   // claimed twice within this statement) is a duplicate-key error, and NULL
@@ -78,8 +81,11 @@ bool Update::Next(Row* dst, RowPosition* rp) {
       }
       const std::string new_key = UpdateKeyString(i.first[0]);
       if (!claimed.insert(new_key).second || live_keys.contains(new_key)) {
-        throw std::runtime_error(
-            "Modification resulted in duplicate primary key (" + new_key + ")");
+        return FailWith(
+            StatusError(StatusCode::kDuplicates,
+
+                        "Modification resulted in duplicate primary key (" +
+                            new_key + ")"));
       }
     }
   }
@@ -88,16 +94,21 @@ bool Update::Next(Row* dst, RowPosition* rp) {
     StatusOr<RowPosition> p = target_->Update(*txn_, row_position, row);
     if (p.GetStatus() != Status::kSuccess) {
       // Do not report a partial update as successful.
-      throw std::runtime_error("update failed on table " +
-                               std::string(target_->GetSchema().Name()));
+      return FailWith(
+          StatusError(StatusCode::kConflicts,
+
+                      "update failed on table " +
+                          std::string(target_->GetSchema().Name())));
     }
     update_count++;
   }
   if (assert_rows_modified_ >= 0 && update_count != assert_rows_modified_) {
-    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
-                             std::to_string(assert_rows_modified_) +
-                             " rows, but " + std::to_string(update_count) +
-                             " rows were modified");
+    return FailWith(
+        StatusError(StatusCode::kInvalidArgument,
+
+                    "ASSERT_ROWS_MODIFIED was specified with " +
+                        std::to_string(assert_rows_modified_) + " rows, but " +
+                        std::to_string(update_count) + " rows were modified"));
   }
   *dst = Row({Value("Update Rows"), Value(update_count)});
   if (rp != nullptr) {

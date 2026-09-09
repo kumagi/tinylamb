@@ -30,17 +30,29 @@
 
 namespace tinylamb {
 
-PageManager::PageManager(std::string_view db_name, size_t capacity)
-    : pool_(db_name, capacity) {
-  GetMetaPage();
+StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
+    std::string_view db_name, size_t capacity) {
+  ASSIGN_OR_RETURN(std::unique_ptr<PagePool>, pool,
+                   PagePool::Create(db_name, capacity));
+  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+  auto manager = std::unique_ptr<PageManager>(
+      new PageManager(db_name, capacity, std::move(pool)));  // NOLINT
+  // Initialize the meta page (idempotent: existing images are kept).
+  RETURN_IF_FAIL(manager->GetMetaPage().GetStatus());
+  return manager;
 }
 
-PageRef PageManager::GetPage(uint64_t page_id, bool shared) {
+PageManager::PageManager(std::string_view /*db_name*/, size_t /*capacity*/,
+                         std::unique_ptr<PagePool> pool)
+    : pool_(std::move(pool)) {}
+
+StatusOr<PageRef> PageManager::GetPage(uint64_t page_id, bool shared) {
   bool cache_hit = false;
-  PageRef ref = pool_.GetPage(page_id, &cache_hit, shared);
+  ASSIGN_OR_RETURN(PageRef, ref, pool_->GetPage(page_id, &cache_hit, shared));
   if (!cache_hit && !ref->IsValid()) {
-    // Found a broken or new page.
-    return {};
+    // Found a broken or new page: hand back the empty PageRef the existing
+    // callers (BPlusTree bootstrap) test with IsValid().
+    return PageRef{};
   }
   return ref;
 }
@@ -61,26 +73,28 @@ void PageManager::AdvanceTableTail(page_id_t first_page, page_id_t expected,
 }
 
 // Logically delete the page.
-void PageManager::DestroyPage(Transaction& system_txn, Page* target) {
-  GetMetaPage()->DestroyPage(system_txn, target);
+Status PageManager::DestroyPage(Transaction& system_txn, Page* target) {
+  ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
+  return meta->DestroyPage(system_txn, target);
 }
 
 // D3 (docs/design.md): undo restored the destroyed page; drop it from the
 // allocator free stack so the next AllocateNewPage cannot re-issue it.
 void PageManager::PopFreePageHead(page_id_t pid, page_id_t next) {
-  PageRef meta = GetMetaPage();
+  PageRef meta = GetMetaPage().MoveValue();
   meta->body.meta_page.PopFreePageHead(pid, next);
 }
 
-PageRef PageManager::AllocateNewPage(Transaction& system_txn,
-                                     PageType new_page_type) {
-  return GetMetaPage()->AllocateNewPage(system_txn, pool_, new_page_type);
+StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& system_txn,
+                                               PageType new_page_type) {
+  ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
+  return meta->AllocateNewPage(system_txn, *pool_, new_page_type);
 }
 
-PageRef PageManager::GetMetaPage() {
-  PageRef meta_page = pool_.GetPage(kMetaPageId, nullptr);
+StatusOr<PageRef> PageManager::GetMetaPage() {
+  ASSIGN_OR_RETURN(PageRef, meta_page, pool_->GetPage(kMetaPageId, nullptr));
   if (meta_page.IsNull()) {
-    throw std::runtime_error("failed to get meta page");
+    return StatusError(StatusCode::kIOError, "failed to get meta page");
   }
   if (meta_page->Type() != PageType::kMetaPage) {
     meta_page->PageInit(kMetaPageId, PageType::kMetaPage);

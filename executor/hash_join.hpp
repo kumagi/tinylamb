@@ -140,26 +140,26 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
  private:
   struct JoinState;
 
-  void Materialize();
-  void MaterializeInMemory();
-  void MaterializeHybrid();
-  void MaterializeOrThrow();
+  Status Materialize();
+  Status MaterializeInMemory();
+  Status MaterializeHybrid();
+  bool MaterializeOrThrow();
   // Dedicated semi/anti pipeline: materialize both sides (reactive spill
   // aware), index the right side, and stream left rows through an existence
   // check. Output rows are the untouched probe rows, so row positions are
   // preserved for UPDATE/DELETE consumers.
-  void MaterializeSemiAnti();
-  void MaterializeOuter();
-  void MaterializeMarkJoin();
-  void MaterializeSingle();
+  Status MaterializeSemiAnti();
+  Status MaterializeOuter();
+  Status MaterializeMarkJoin();
+  Status MaterializeSingle();
 
-  void IntakeBothSides();
+  Status IntakeBothSides();
   void BuildShards();
   [[nodiscard]] uint32_t ShardOf(uint64_t hash) const;
   bool FetchNextProbe();
   void SetupInMemoryJoin();
   void SetupOneSideSpilled();
-  void SetupBothSpilled();
+  Status SetupBothSpilled();
   template <typename RightCont>
   void JoinPartitionPair(
       const std::vector<std::pair<Row, RowPosition>>& left_part,
@@ -180,6 +180,7 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   size_t worker_count_;
   bool materialized_{false};
   bool materialize_failed_{false};
+  Status materialize_error_{Status::kSuccess};
   bool pipelined_{false};
   bool build_left_side_{false};
   size_t actual_build_rows_{0};

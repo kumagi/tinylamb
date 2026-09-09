@@ -129,7 +129,10 @@ std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
   }
 
   // Oracle (b): full engine execution of the same expression text.
-  Database db("expr_oracle_fuzz-" + RandomString(8));
+  auto db_holder =
+      Database::Create("expr_oracle_fuzz-" + RandomString(8)).MoveValue();
+  CHECK(db_holder != nullptr);
+  Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
   const EngineOutcome engine = RunScalar(db, ctx, t.sql);
   t.engine_ran = engine.ran;

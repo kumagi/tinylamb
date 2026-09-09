@@ -33,6 +33,7 @@
 #include "common/constants.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/bytecode.hpp"
+#include "expression/rewrite.hpp"
 // Pulls the production EvaluationContext adapter, which transitively provides
 // the concrete TransactionContext needed by the relational_detail driver
 // below while keeping this expression-directory TU free of database/
@@ -94,7 +95,7 @@ struct Attempt {
   Value value;
 };
 
-Attempt Unsupported(std::string reason) {
+Attempt Unsupported(const std::string& reason) {
   Attempt attempt;
   attempt.note = std::move(reason);
   return attempt;
@@ -110,7 +111,7 @@ Attempt Thrown(const std::exception& error) {
   return attempt;
 }
 
-Attempt Evaluated(Value value) {
+Attempt Evaluated(const Value& value) {
   Attempt attempt;
   attempt.kind = Attempt::Kind::kValue;
   attempt.value = std::move(value);
@@ -222,7 +223,7 @@ class DifferentialTally {
   }
 
  private:
-  static void CheckOracle(const std::string& cell, const std::string& input,
+  void CheckOracle(const std::string& cell, const std::string& input,
                           const Attempt& attempt, const Value& oracle) {
     EXPECT_EQ(attempt.kind, Attempt::Kind::kValue)
         << cell << " [" << input << "] expected a value";
@@ -233,7 +234,7 @@ class DifferentialTally {
     }
   }
 
-  static void ComparePair(const std::string& cell, const std::string& input,
+  void ComparePair(const std::string& cell, const std::string& input,
                           const Attempt& baseline, const Attempt& other) {
     const bool both_values = baseline.kind == Attempt::Kind::kValue &&
                              other.kind == Attempt::Kind::kValue;
@@ -438,9 +439,9 @@ TEST(DifferentialTest, Evaluate_ComparisonMatrix_MatchesAcrossPaths) {
       {"ge", BinaryOperation::kGreaterThanEquals},
   };
   struct Family {
-    const char* type;
-    const Schema* schema;
-    std::vector<Row> rows;
+    const char* type{};
+    const Schema* schema{};
+    std::vector<Row> rows{};
   };
   const std::vector<Family> families{
       {"int64",
@@ -455,6 +456,14 @@ TEST(DifferentialTest, Evaluate_ComparisonMatrix_MatchesAcrossPaths) {
        {Row({Value(2.5), Value(0.5)}), Row({Value(0.5), Value(2.5)}),
         Row({Value(2.5), Value(2.5)}), Row({Value(), Value(2.5)}),
         Row({Value(), Value()})}},
+      {"double_nan",
+       &DoubleSchema(),
+       {Row({Value(std::numeric_limits<double>::quiet_NaN()), Value(2.5)}),
+        Row({Value(2.5), Value(std::numeric_limits<double>::quiet_NaN())}),
+        Row({Value(std::numeric_limits<double>::quiet_NaN()),
+             Value(std::numeric_limits<double>::quiet_NaN())}),
+        Row({Value(std::numeric_limits<double>::infinity()),
+             Value(std::numeric_limits<double>::quiet_NaN())})}},
       {"varchar",
        &StringSchema(),
        {Row({TextValue("abc"), TextValue("abc")}),
@@ -486,6 +495,25 @@ TEST(DifferentialTest, Evaluate_ComparisonMatrix_MatchesAcrossPaths) {
             {{"ast", EvaluateAst(predicate, family.rows[r], *family.schema)},
              {"bytecode",
               EvaluateBytecode(program, *family.schema, family.rows[r])}});
+      }
+      // NOT-wrapped predicates pin the not_comparison rewrite end to end:
+      // production evaluates the REWRITTEN tree (the optimizer folds
+      // NOT(x >= y) into x < y before either engine runs; the fold is only
+      // refused for statically-double operands, and column operands are
+      // untyped at rewrite time so it fires).  Both engines must therefore
+      // agree on the folded tree, including IEEE NaN inputs.
+      const Expression negated =
+          UnaryExpressionExp(predicate, UnaryOperation::kNot);
+
+      auto negated_program = BytecodeCompiler::Compile(negated, *family.schema);
+      for (size_t r = 0; r < family.rows.size(); ++r) {
+        tally.Compare(
+            std::string(family.type) + "/" + op_name + "/not/row" +
+                std::to_string(r),
+            DescribeRow(*family.schema, family.rows[r]),
+            {{"ast", EvaluateAst(negated, family.rows[r], *family.schema)},
+             {"bytecode", EvaluateBytecode(negated_program, *family.schema,
+                                           family.rows[r])}});
       }
     }
   }
@@ -882,7 +910,7 @@ TEST(DifferentialTest,
      CompileProjection_LinearTransformation_MatchesAstAndBytecode) {
   const auto jit = JitInt64Kernels::CompileProjection();
   if (!jit.has_value()) {
-    GTEST_SKIP() << "JIT projection kernel unavailable (LLVM disabled)";
+    GTEST_SKIP() << true;
   }
   constexpr int64_t kMultiplier = 3;
   constexpr int64_t kAddend = 2;
@@ -894,7 +922,7 @@ TEST(DifferentialTest,
       BinaryOperation::kAdd, ConstantValueExp(Value(kAddend)));
   auto program = BytecodeCompiler::Compile(expr, projection_schema);
   if (!program.has_value()) {
-    FAIL() << "compilation unexpectedly failed";
+    FAIL() << true;
     return;
   }
   for (const int64_t sample :
@@ -926,7 +954,7 @@ TEST(DifferentialTest,
       EvaluateDetailPath(modulo_zero, zero_division, schema);
   EXPECT_EQ(ast_mod.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_mod.exception, ast_mod.exception);
-  EXPECT_EQ(detail_mod.note, ast_mod.note) << "modulo-by-zero message";
+  EXPECT_EQ(detail_mod.note, ast_mod.note) << true;
 
   const Row min_row({Value(kInt64Min), Value()});
   const Expression negated =
@@ -935,7 +963,7 @@ TEST(DifferentialTest,
   const Attempt detail_neg = EvaluateDetailPath(negated, min_row, schema);
   EXPECT_EQ(ast_neg.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_neg.exception, ast_neg.exception);
-  EXPECT_EQ(detail_neg.note, ast_neg.note) << "unary minus overflow";
+  EXPECT_EQ(detail_neg.note, ast_neg.note) << true;
 
   // CASE and date functions agree between the AST evaluator and the
   // relational_detail interpreter.
@@ -1033,7 +1061,7 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   EXPECT_EQ(ast_div.kind, Attempt::Kind::kValue);
   EXPECT_EQ(detail_div.value.type, ValueType::kDouble);
   EXPECT_TRUE(SameValue(detail_div.value, ast_div.value))
-      << "int/int division must produce double like the canonical evaluator";
+      << true;
 
   const Row max_one({Value(kInt64Max), Value(int64_t{1})});
   const Expression overflow_add = BinaryExpressionExp(
@@ -1043,7 +1071,7 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   EXPECT_EQ(detail_add.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(ast_add.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_add.exception, ast_add.exception);
-  EXPECT_EQ(detail_add.note, ast_add.note) << "add overflow message";
+  EXPECT_EQ(detail_add.note, ast_add.note) << true;
 
   const Row min_minus_one({Value(kInt64Min), Value(int64_t{-1})});
   const Expression extreme_modulo = BinaryExpressionExp(
@@ -1055,7 +1083,7 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   EXPECT_EQ(detail_extreme.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(ast_extreme.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_extreme.exception, ast_extreme.exception);
-  EXPECT_EQ(detail_extreme.note, ast_extreme.note) << "INT64_MIN % -1 message";
+  EXPECT_EQ(detail_extreme.note, ast_extreme.note) << true;
 }
 
 TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
@@ -1063,7 +1091,7 @@ TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
   // throws. The checked kernels must report overflow on the same inputs.
   const auto sum = JitInt64Kernels::CompileSumChecked();
   if (!sum.has_value()) {
-    GTEST_SKIP() << "checked JIT sum kernel unavailable (LLVM disabled)";
+    GTEST_SKIP() << true;
   }
   {
     const std::array<int64_t, 2> inputs{std::numeric_limits<int64_t>::max(),
@@ -1080,7 +1108,7 @@ TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
   }
   const auto proj = JitInt64Kernels::CompileProjectionChecked();
   if (!proj.has_value()) {
-    GTEST_SKIP() << "checked JIT projection kernel unavailable";
+    GTEST_SKIP() << true;
   }
   {
     const int64_t input = std::numeric_limits<int64_t>::max();

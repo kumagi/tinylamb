@@ -35,7 +35,7 @@ class TopNExecutor final : public ExecutorBase {
   void Dump(std::ostream& output, int indent) const override;
 
  private:
-  void Materialize();
+  Status Materialize();
 
   struct Candidate {
     Row row;

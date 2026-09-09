@@ -50,7 +50,12 @@ bool ParallelMergeJoin::PairPasses(const Row& left, const Row& right) const {
     return true;
   }
   const Row combined = left + right;
-  return residual_->Evaluate(combined, residual_schema_).Truthy();
+  StatusOr<Value> res = residual_->TryEvaluate(combined, residual_schema_);
+  if (!res.HasValue()) {
+    residual_error_ = res.GetStatus();
+    return false;
+  }
+  return res.Value().Truthy();
 }
 
 int ParallelMergeJoin::CompareKeys(const Row& left, const Row& right) const {
@@ -154,6 +159,23 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
       vals.resize(left_row.values_.size() + right_width_);
       out.emplace_back(Row(std::move(vals)), left_rows_[li].second);
     };
+    // Right-outer mirror: NULL-padded left side with the full left width.
+    auto emit_padded_right = [&](size_t ri) {
+      const Row& right_row = right_rows_[ri].first;
+      std::vector<Value> vals;
+      vals.reserve(right_row.values_.size() + left_width_);
+      vals.resize(left_width_);
+      vals.insert(vals.end(), right_row.values_.begin(),
+                  right_row.values_.end());
+      out.emplace_back(Row(std::move(vals)), right_rows_[ri].second);
+    };
+    const bool emits_matched =
+        kind_ == JoinKind::kInner || kind_ == JoinKind::kLeftOuter ||
+        kind_ == JoinKind::kRightOuter || kind_ == JoinKind::kFullOuter;
+    const bool pads_left =
+        kind_ == JoinKind::kLeftOuter || kind_ == JoinKind::kFullOuter;
+    const bool pads_right =
+        kind_ == JoinKind::kRightOuter || kind_ == JoinKind::kFullOuter;
 
     size_t l = range.left_start;
     size_t r = range.right_start;
@@ -162,13 +184,17 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
       if (KeyIsNull(left_rows_[l].first, left_cols_)) {
         if (kind_ == JoinKind::kAnti) {
           out.emplace_back(left_rows_[l].first, left_rows_[l].second);
-        } else if (kind_ == JoinKind::kLeftOuter) {
+        } else if (pads_left) {
           emit_padded_left(l);
         }
         ++l;
         continue;
       }
       if (KeyIsNull(right_rows_[r].first, right_cols_)) {
+        // NULL keys never match; RIGHT/FULL outer still keep the row.
+        if (pads_right) {
+          emit_padded_right(r);
+        }
         ++r;
         continue;
       }
@@ -177,11 +203,14 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
       if (cmp < 0) {
         if (kind_ == JoinKind::kAnti) {
           out.emplace_back(left_rows_[l].first, left_rows_[l].second);
-        } else if (kind_ == JoinKind::kLeftOuter) {
+        } else if (pads_left) {
           emit_padded_left(l);
         }
         ++l;
       } else if (cmp > 0) {
+        if (pads_right) {
+          emit_padded_right(r);
+        }
         ++r;
       } else {
         // Equal key cluster match.  The residual decides which pairs count
@@ -200,13 +229,15 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
         }
 
         std::vector<char> matched_left(l_end - l, 0);
+        std::vector<char> matched_right(r_end - r, 0);
         for (size_t li = l; li < l_end; ++li) {
           for (size_t ri = r; ri < r_end; ++ri) {
             if (!PairPasses(left_rows_[li].first, right_rows_[ri].first)) {
               continue;
             }
             matched_left[li - l] = 1;
-            if (kind_ == JoinKind::kInner || kind_ == JoinKind::kLeftOuter) {
+            matched_right[ri - r] = 1;
+            if (emits_matched) {
               const std::vector<Value>& left_values =
                   left_rows_[li].first.values_;
               const std::vector<Value>& right_values =
@@ -221,9 +252,24 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
         }
         switch (kind_) {
           case JoinKind::kLeftOuter:
+          case JoinKind::kFullOuter:
             for (size_t li = l; li < l_end; ++li) {
               if (matched_left[li - l] == 0) {
                 emit_padded_left(li);
+              }
+            }
+            if (kind_ == JoinKind::kFullOuter) {
+              for (size_t ri = r; ri < r_end; ++ri) {
+                if (matched_right[ri - r] == 0) {
+                  emit_padded_right(ri);
+                }
+              }
+            }
+            break;
+          case JoinKind::kRightOuter:
+            for (size_t ri = r; ri < r_end; ++ri) {
+              if (matched_right[ri - r] == 0) {
+                emit_padded_right(ri);
               }
             }
             break;
@@ -254,10 +300,17 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
     while (l < range.left_end) {
       if (kind_ == JoinKind::kAnti) {
         out.emplace_back(left_rows_[l].first, left_rows_[l].second);
-      } else if (kind_ == JoinKind::kLeftOuter) {
+      } else if (pads_left) {
         emit_padded_left(l);
       }
       ++l;
+    }
+    // Trailing right rows (RIGHT/FULL outer keep unmatched right rows).
+    while (r < range.right_end) {
+      if (pads_right) {
+        emit_padded_right(r);
+      }
+      ++r;
     }
   };
 
@@ -328,6 +381,11 @@ void ParallelMergeJoin::EnsureMaterialized() {
   if (right_width_ == 0 && !right_rows_.empty()) {
     right_width_ = right_rows_.front().first.values_.size();
   }
+  if (left_width_ == 0 && !left_rows_.empty()) {
+    left_width_ = left_rows_.front().first.values_.size();
+  }
+  FailWithChildOf(*left_);
+  FailWithChildOf(*right_);
 
   // Latch only after the work completes so a failed materialization can be
   // retried instead of silently yielding an empty output.
@@ -341,6 +399,9 @@ void ParallelMergeJoin::MaterializePipeline() { EnsureMaterialized(); }
 bool ParallelMergeJoin::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
   EnsureMaterialized();
+  if (residual_error_ != Status::kSuccess) {
+    return FailWith(residual_error_);
+  }
   if (output_offset_ >= output_.size()) {
     return false;
   }

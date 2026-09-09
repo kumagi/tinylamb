@@ -855,7 +855,14 @@ int main(int argc, char** argv) {
     setenv("TINYLAMB_QUERY_MEMORY_BYTES", "8589934592", 0);  // 8 GiB
   }
   const Clock::time_point load_begin = Clock::now();
-  tinylamb::Database database(options.database_path.string());
+  auto database_or_status =
+      tinylamb::Database::Create(options.database_path.string());
+  if (!database_or_status.HasValue()) {
+    std::cerr << "failed to open database " << options.database_path << ": "
+              << database_or_status.GetStatus() << '\n';
+    return 1;
+  }
+  tinylamb::Database& database = *database_or_status.Value();
   if (!options.reuse_database) {
     if (!CreateSchema(database, &error)) {
       std::cerr << "schema initialization failed: " << error << '\n';

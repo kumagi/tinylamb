@@ -34,6 +34,10 @@ namespace tinylamb {
 
 class LSMView {
  public:
+  ~LSMView() = default;
+  LSMView(const LSMView&) = delete;
+  LSMView& operator=(const LSMView&) = delete;
+  LSMView& operator=(LSMView&&) = default;
   template <typename FilesType>
   LSMView(const BlobFile& blob, const FilesType& files) : blob_(blob) {
     for (const auto& file : files) {
@@ -48,7 +52,6 @@ class LSMView {
 
   class Iterator {
    public:
-    Iterator(const LSMView* vm, bool head);
     ~Iterator() = default;
     // Note: a moved-from view leaves previously created Iterators dangling
     // (they keep a back pointer to the view). Treat LSMView as effectively
@@ -60,29 +63,39 @@ class LSMView {
     [[nodiscard]] const SortedRun::Iterator& TopIterator() const {
       return iters_[0];
     }
-    [[nodiscard]] std::string Key() const { return iters_[0].Key(); }
-    [[nodiscard]] std::string Value() const;
+    [[nodiscard]] StatusOr<std::string> Key() const { return iters_[0].Key(); }
+    [[nodiscard]] StatusOr<std::string> Value() const;
     Iterator& operator++();
-    [[nodiscard]] SortedRun::Entry GetEntry() const;
+    // Sticky error: advancement failures (blob/cache IO) mark the iterator
+    // invalid and remain readable here so callers can tell "exhausted" from
+    // "corrupt".
+    [[nodiscard]] Status GetStatus() const { return status_; }
+    [[nodiscard]] StatusOr<SortedRun::Entry> GetEntry() const;
     bool operator==(const Iterator& rhs) const;
     [[nodiscard]] bool IsValid() const;
     friend std::ostream& operator<<(std::ostream& o,
                                     const LSMView::Iterator& it);
 
    private:
-    void Forward();
+    friend class LSMView;
+    explicit Iterator(const LSMView* vm) : vm_(vm) {}
+    // Positions every run iterator and heapifies; failures here mean a run
+    // header/first entry could not be read.
+    Status Init();
+    Status Forward();
     // Advances until the top entry holds a fresh, live key: skips duplicate
     // keys (keeping the newest generation's value) and tombstones.
-    void AdvanceSkippingTombstones();
+    Status AdvanceSkippingTombstones();
 
     const LSMView* vm_;
     std::vector<SortedRun::Iterator> iters_;
     size_t remaining_iters_{0};
+    Status status_{Status::kSuccess};
   };
-  [[nodiscard]] Iterator Begin() const;
+  [[nodiscard]] StatusOr<Iterator> Begin() const;
   [[nodiscard]] StatusOr<std::string> Find(std::string_view key) const;
   [[nodiscard]] size_t Size() const;
-  void CreateSingleRun(const std::filesystem::path& path) const;
+  [[nodiscard]] Status CreateSingleRun(const std::filesystem::path& path) const;
   friend std::ostream& operator<<(std::ostream& o, const LSMView& v);
 
  private:

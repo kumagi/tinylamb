@@ -5,9 +5,9 @@
 #include <algorithm>
 #include <bit>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <cmath>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -107,18 +107,18 @@ std::string Trim(std::string_view value) {
 
 }  // namespace
 
-uint16_t ReadUint16(std::string_view bytes, size_t offset) {
+StatusOr<uint16_t> ReadUint16(std::string_view bytes, size_t offset) {
   if (offset + sizeof(uint16_t) > bytes.size()) {
-    throw std::out_of_range("short PostgreSQL protocol field");
+    return Status(Status::kCorrupt, "short PostgreSQL protocol field");
   }
   const auto* data = reinterpret_cast<const unsigned char*>(bytes.data());
   return static_cast<uint16_t>((static_cast<uint16_t>(data[offset]) << 8U) |
                                static_cast<uint16_t>(data[offset + 1]));
 }
 
-uint32_t ReadUint32(std::string_view bytes, size_t offset) {
+StatusOr<uint32_t> ReadUint32(std::string_view bytes, size_t offset) {
   if (offset + sizeof(uint32_t) > bytes.size()) {
-    throw std::out_of_range("short PostgreSQL protocol field");
+    return Status(Status::kCorrupt, "short PostgreSQL protocol field");
   }
   const auto* data = reinterpret_cast<const unsigned char*>(bytes.data());
   return (static_cast<uint32_t>(data[offset]) << 24U) |
@@ -141,12 +141,19 @@ void AppendUint32(std::string* output, uint32_t value) {
 
 std::optional<StartupPacket> ParseStartupPacket(std::string_view packet,
                                                 std::string* error) {
-  if (packet.size() < 8 || ReadUint32(packet, 0) != packet.size()) {
+  const StatusOr<uint32_t> declared = ReadUint32(packet, 0);
+  if (packet.size() < 8 || !declared.HasValue() ||
+      declared.Value() != packet.size()) {
     *error = "malformed PostgreSQL startup packet";
     return std::nullopt;
   }
   StartupPacket result;
-  result.protocol_version = ReadUint32(packet, 4);
+  const StatusOr<uint32_t> version = ReadUint32(packet, 4);
+  if (!version.HasValue()) {
+    *error = "malformed PostgreSQL startup packet";
+    return std::nullopt;
+  }
+  result.protocol_version = version.Value();
   size_t cursor = 8;
   while (cursor < packet.size()) {
     const size_t name_end = packet.find('\0', cursor);
@@ -220,7 +227,7 @@ std::string RowDescription(const std::vector<ColumnDescription>& columns) {
   if (columns.size() > std::numeric_limits<uint16_t>::max()) {
     // The wire format declares the column count as uint16; truncating would
     // desynchronize the protocol stream.
-    throw std::runtime_error("too many columns for PostgreSQL protocol");
+    CHECK_MSG(false, "too many columns for PostgreSQL protocol");
   }
   std::string payload;
   AppendUint16(&payload, static_cast<uint16_t>(columns.size()));
@@ -238,9 +245,8 @@ std::string RowDescription(const std::vector<ColumnDescription>& columns) {
 }
 
 std::string DataRow(const Row& row) {
-  if (row.values_.size() > std::numeric_limits<uint16_t>::max()) {
-    throw std::runtime_error("too many values for PostgreSQL protocol");
-  }
+  CHECK_MSG(row.values_.size() <= std::numeric_limits<uint16_t>::max(),
+            "too many values for PostgreSQL protocol");
   std::string payload;
   AppendUint16(&payload, static_cast<uint16_t>(row.values_.size()));
   for (const Value& value : row.values_) {
@@ -284,6 +290,8 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
   bool single_quote = false;
   bool double_quote = false;
   bool backtick_quote = false;
+  bool dollar_quote = false;
+  std::string dollar_tag;
   bool line_comment = false;
   bool block_comment = false;
   int block_comment_depth = 0;
@@ -336,7 +344,7 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
       }
       continue;
     }
-    if (!single_quote && !double_quote && !backtick_quote) {
+    if (!single_quote && !double_quote && !backtick_quote && !dollar_quote) {
       if (current_char == '-' && next == '-') {
         line_comment = true;
         ++i;
@@ -352,6 +360,39 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
         current.push_back('*');
         continue;
       }
+      if (current_char == '$') {
+        // Dollar-quoted string ($tag$...$tag$, tag optional): a ';' inside
+        // it must not split statements.  Scan the optional identifier tag
+        // and require the closing '$' of the opener; otherwise the '$' is a
+        // placeholder and stays ordinary text.
+        size_t j = i + 1;
+        while (j < sql.size() &&
+               (std::isalnum(static_cast<unsigned char>(sql[j])) != 0 ||
+                sql[j] == '_')) {
+          ++j;
+        }
+        if (j < sql.size() && sql[j] == '$') {
+          dollar_tag = std::string(sql.substr(i, j - i + 1));
+          dollar_quote = true;
+          for (const char tag_char : dollar_tag) {
+            Append(tag_char);
+          }
+          i = j;
+          continue;
+        }
+      }
+    }
+    if (dollar_quote) {
+      if (sql.substr(i, dollar_tag.size()) == dollar_tag) {
+        for (const char tag_char : dollar_tag) {
+          Append(tag_char);
+        }
+        i += dollar_tag.size() - 1;
+        dollar_quote = false;
+        continue;
+      }
+      Append(current_char);
+      continue;
     }
     // Backslash escapes the next character inside a quoted string
     // (the parser decodes \', \" and \\): swallowing the pair here keeps

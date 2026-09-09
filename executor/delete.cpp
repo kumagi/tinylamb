@@ -24,20 +24,28 @@ bool DeleteExecutor::Next(Row* dst, RowPosition* rp) {
   while (source_->Next(&row, &position)) {
     pending.push_back(position);
   }
+  if (source_->GetStatus() != Status::kSuccess) {
+    return FailWith(source_->GetStatus());
+  }
   int64_t count = 0;
   for (const RowPosition& row_position : pending) {
     if (target_->Delete(*txn_, row_position) != Status::kSuccess) {
       // Do not report a partial delete as successful.
-      throw std::runtime_error("delete failed on table " +
-                               std::string(target_->GetSchema().Name()));
+      return FailWith(
+          StatusError(StatusCode::kConflicts,
+
+                      "delete failed on table " +
+                          std::string(target_->GetSchema().Name())));
     }
     ++count;
   }
   if (assert_rows_modified_ >= 0 && count != assert_rows_modified_) {
-    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
-                             std::to_string(assert_rows_modified_) +
-                             " rows, but " + std::to_string(count) +
-                             " rows were modified");
+    return FailWith(StatusError(StatusCode::kInvalidArgument,
+
+                                "ASSERT_ROWS_MODIFIED was specified with " +
+                                    std::to_string(assert_rows_modified_) +
+                                    " rows, but " + std::to_string(count) +
+                                    " rows were modified"));
   }
   *dst = Row({Value("Delete Rows"), Value(count)});
   if (rp != nullptr) {

@@ -69,7 +69,7 @@ class FullScanMvccFastPathTest : public ::testing::Test {
  public:
   void SetUp() override {
     prefix_ = "full_scan_mvcc_fastpath-" + RandomString();
-    db_ = std::make_unique<Database>(prefix_);
+    db_ = Database::Create(prefix_).MoveValue();
     TransactionContext ctx = db_->BeginContext();
     ASSERT_SUCCESS(db_->CreateTable(ctx, SampleSchema()).GetStatus());
     ASSERT_SUCCESS(ctx.PreCommit());

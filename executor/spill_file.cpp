@@ -90,61 +90,72 @@ SpillFile::~SpillFile() {
   }
 }
 
-void SpillFile::OpenForWrite() {
+Status SpillFile::OpenForWrite() {
   if (writing_) {
-    return;
+    return Status::kSuccess;
   }
   stream_.open(path_, std::ios::binary | std::ios::out | std::ios::trunc);
   if (!stream_) {
-    throw std::runtime_error("failed to create spill file: " + path_.string());
+    return StatusError(StatusCode::kIOError,
+                       "failed to create spill file: " + path_.string());
   }
   // Placeholder for count; rewritten in FinishWriting.
   const uint64_t zero = 0;
   stream_.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
   if (!stream_) {
-    throw std::runtime_error("spill write failed: " + path_.string());
+    return StatusError(StatusCode::kIOError,
+                       "spill write failed: " + path_.string());
   }
   writing_ = true;
+  return Status::kSuccess;
 }
 
-void SpillFile::Append(const Row& row) {
+Status SpillFile::Append(const Row& row) {
   if (finished_) {
-    throw std::runtime_error("Append after FinishWriting");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Append after FinishWriting");
   }
   if (count_ > 0 && has_positions_) {
-    throw std::runtime_error("SpillFile position mode mismatch");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "SpillFile position mode mismatch");
   }
   has_positions_ = false;
-  OpenForWrite();
+  RETURN_IF_FAIL(OpenForWrite());
   Encoder enc(stream_);
   enc << row;
   if (!stream_) {
-    throw std::runtime_error("spill write failed: " + path_.string());
+    return StatusError(StatusCode::kIOError,
+                       "spill write failed: " + path_.string());
   }
   ++count_;
+  return Status::kSuccess;
 }
 
-void SpillFile::Append(const Row& row, const RowPosition& position) {
+Status SpillFile::Append(const Row& row, const RowPosition& position) {
   if (finished_) {
-    throw std::runtime_error("Append after FinishWriting");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Append after FinishWriting");
   }
   if (count_ > 0 && !has_positions_) {
-    throw std::runtime_error("SpillFile position mode mismatch");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "SpillFile position mode mismatch");
   }
   has_positions_ = true;
-  OpenForWrite();
+  RETURN_IF_FAIL(OpenForWrite());
   Encoder enc(stream_);
   enc << row << position;
   if (!stream_) {
-    throw std::runtime_error("spill write failed: " + path_.string());
+    return StatusError(StatusCode::kIOError,
+                       "spill write failed: " + path_.string());
   }
   ++count_;
+  return Status::kSuccess;
 }
 
-void SpillFile::FinishWriting() {
+Status SpillFile::FinishWriting() {
   if (!writing_ || finished_) {
     finished_ = true;
-    return;
+    return Status::kSuccess;
   }
   stream_.seekp(0);
   stream_.write(reinterpret_cast<const char*>(&count_), sizeof(count_));
@@ -152,50 +163,56 @@ void SpillFile::FinishWriting() {
   if (!stream_) {
     // Leave the stream open so the destructor still cleans up the file; the
     // failed query must not pretend the spill succeeded.
-    throw std::runtime_error("failed to finalize spill file: " +
-                             path_.string());
+    return StatusError(StatusCode::kIOError,
+                       "failed to finalize spill file: " + path_.string());
   }
   stream_.close();
   writing_ = false;
   finished_ = true;
+  return Status::kSuccess;
 }
 
-void SpillFile::EnsureReader() {
+Status SpillFile::EnsureReader() {
   if (!finished_) {
-    FinishWriting();
+    RETURN_IF_FAIL(FinishWriting());
   }
   if (stream_.is_open()) {
     stream_.close();
   }
   stream_.open(path_, std::ios::binary | std::ios::in);
   if (!stream_) {
-    throw std::runtime_error("failed to open spill file: " + path_.string());
+    return StatusError(StatusCode::kIOError,
+                       "failed to open spill file: " + path_.string());
   }
+  return Status::kSuccess;
 }
 
-uint64_t SpillFile::ReadStoredCount() {
+StatusOr<uint64_t> SpillFile::ReadStoredCount() {
   uint64_t stored = 0;
   stream_.read(reinterpret_cast<char*>(&stored), sizeof(stored));
   if (stream_.gcount() != static_cast<std::streamsize>(sizeof(stored))) {
-    throw std::runtime_error("truncated spill file header: " + path_.string());
+    return StatusError(StatusCode::kCorrupt,
+                       "truncated spill file header: " + path_.string());
   }
   // The header was rewritten by this process; a mismatch means the file is
   // corrupt. It also bounds the loop below by a value we trust.
   if (stored != count_) {
-    throw std::runtime_error("spill file header mismatch: " + path_.string());
+    return StatusError(StatusCode::kCorrupt,
+                       "spill file header mismatch: " + path_.string());
   }
   return stored;
 }
 
-std::vector<Row> SpillFile::ReadAllRows() {
+StatusOr<std::vector<Row>> SpillFile::ReadAllRows() {
   if (count_ == 0) {
-    return {};
+    return std::vector<Row>{};
   }
   if (has_positions_) {
-    throw std::runtime_error("ReadAllRows on positioned spill");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "ReadAllRows on positioned spill");
   }
-  EnsureReader();
-  const uint64_t stored = ReadStoredCount();
+  RETURN_IF_FAIL(EnsureReader());
+  ASSIGN_OR_RETURN(uint64_t, stored, ReadStoredCount());
   Decoder dec(stream_);
   std::vector<Row> rows;
   rows.reserve(static_cast<size_t>(stored));
@@ -203,22 +220,25 @@ std::vector<Row> SpillFile::ReadAllRows() {
     Row row;
     dec >> row;
     if (!stream_) {
-      throw std::runtime_error("truncated spill file: " + path_.string());
+      return StatusError(StatusCode::kCorrupt,
+                         "truncated spill file: " + path_.string());
     }
     rows.push_back(std::move(row));
   }
   return rows;
 }
 
-std::vector<std::pair<Row, RowPosition>> SpillFile::ReadAllPositioned() {
+StatusOr<std::vector<std::pair<Row, RowPosition>>>
+SpillFile::ReadAllPositioned() {
   if (count_ == 0) {
-    return {};
+    return std::vector<std::pair<Row, RowPosition>>{};
   }
   if (!has_positions_) {
-    throw std::runtime_error("ReadAllPositioned on row-only spill");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "ReadAllPositioned on row-only spill");
   }
-  EnsureReader();
-  const uint64_t stored = ReadStoredCount();
+  RETURN_IF_FAIL(EnsureReader());
+  ASSIGN_OR_RETURN(uint64_t, stored, ReadStoredCount());
   Decoder dec(stream_);
   std::vector<std::pair<Row, RowPosition>> rows;
   rows.reserve(static_cast<size_t>(stored));
@@ -227,7 +247,8 @@ std::vector<std::pair<Row, RowPosition>> SpillFile::ReadAllPositioned() {
     RowPosition position;
     dec >> row >> position;
     if (!stream_) {
-      throw std::runtime_error("truncated spill file: " + path_.string());
+      return StatusError(StatusCode::kCorrupt,
+                         "truncated spill file: " + path_.string());
     }
     rows.emplace_back(std::move(row), position);
   }

@@ -411,8 +411,8 @@ void BuildKeyOffsets(const Schema& schema,
       }
     }
     if (!found) {
-      throw std::runtime_error("ProductPlan: join key column not found: " +
-                               col.ToString());
+      CHECK_MSG(false,
+                "ProductPlan: join key column not found: " + col.ToString());
     }
   }
 }

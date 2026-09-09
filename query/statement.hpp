@@ -118,6 +118,8 @@ inline std::string StatementTypeName(StatementType t) {
   return "Unknown";
 }
 
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions): statement
+// nodes are value-copied by the view/UDF expansion clones.
 class Statement {
  public:
   explicit Statement(StatementType type) : type_(type) {}

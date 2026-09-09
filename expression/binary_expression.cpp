@@ -216,8 +216,8 @@ bool Like(std::string_view value, std::string_view pattern) {
 
 }  // namespace
 
-Value EvaluateBinary(BinaryOperation op, const Value& left,
-                     const Value& right) {
+StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
+                                  const Value& right) {
   // These predicates are two-valued even when either operand is NULL.  Keep
   // them ahead of the ordinary comparison NULL propagation below.
   if (op == BinaryOperation::kIsDistinctFrom ||
@@ -233,7 +233,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       return Value(false);
     }
     if (left.IsNull() || right.IsNull()) {
-      return {};
+      return Value();
     }
     return Value(true);
   }
@@ -243,18 +243,18 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       return Value(true);
     }
     if (left.IsNull() || right.IsNull()) {
-      return {};
+      return Value();
     }
     return Value(false);
   }
   if (op == BinaryOperation::kXor) {
     if (left.IsNull() || right.IsNull()) {
-      return {};
+      return Value();
     }
     return Value(left.Truthy() != right.Truthy());
   }
   if (left.IsNull() || right.IsNull()) {
-    return {};
+    return Value();
   }
   // IN lists are typed by the left-hand expression in GoogleSQL.  The AST
   // represents a bare DATE literal as STRING, so coerce it when it is
@@ -271,11 +271,10 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       if (text.size() != 10 || text[4] != '-' || text[7] != '-') {
         return std::nullopt;
       }
-      try {
-        return ParseDateDays(text);
-      } catch (...) {
-        return std::nullopt;
+      if (auto days = TryParseDateDays(text); days.HasValue()) {
+        return days.Value();
       }
+      return std::nullopt;
     };
     if (left.type == ValueType::kDate || right.type == ValueType::kDate) {
       const auto lhs = as_date(left);
@@ -309,10 +308,16 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       }
       int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
       // All six fields are required and rejected on mismatch; field values
-      // flow into std::tm which normalizes out-of-range values.
+      // flow into std::tm which normalizes out-of-range values.  The 'T'
+      // separator accepted by the shape check is normalized to ' ' because
+      // the format string below matches a literal space only.
       // NOLINTNEXTLINE(cert-err34-c)
-      if (sscanf(std::string(text.substr(0, 19)).c_str(), "%d-%d-%d %d:%d:%d",
-                 &year, &month, &day, &hour, &minute, &second) != 6) {
+      std::string head(text.substr(0, 19));
+      if (head[10] == 'T') {
+        head[10] = ' ';
+      }
+      if (sscanf(head.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour,
+                 &minute, &second) != 6) {
         return std::nullopt;
       }
       std::tm tm{};
@@ -414,11 +419,13 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   // negative amounts raise OUT_OF_RANGE.
   if (op == BinaryOperation::kShiftLeft || op == BinaryOperation::kShiftRight) {
     if (left.type != ValueType::kInt64 || right.type != ValueType::kInt64) {
-      throw std::runtime_error("bitwise shift requires integer operands");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "bitwise shift requires integer operands");
     }
     const int64_t amount = right.value.int_value;
     if (amount < 0) {
-      throw std::runtime_error("Bitwise shift by negative offset.");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Bitwise shift by negative offset.");
     }
     if (amount >= 64) {
       return Value(static_cast<int64_t>(0));
@@ -445,15 +452,17 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
     if (folded_left.type != ValueType::kVarChar ||
         folded_right.type != ValueType::kVarChar) {
-      throw std::runtime_error("LIKE requires string operands");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LIKE requires string operands");
     }
     const std::string_view pattern = folded_right.value.varchar_value;
     if ((folded_left.IsCaseInsensitive() || folded_right.IsCaseInsensitive()) &&
         pattern.find('_') != std::string_view::npos) {
-      throw std::runtime_error(
+      return StatusError(
+          StatusCode::kInvalidArgument,
           "LIKE pattern has '_' which is not allowed when its operands have "
           "collation: " +
-          std::string(pattern));
+              std::string(pattern));
     }
     const bool matched = Like(folded_left.value.varchar_value, pattern);
     return Value(op == BinaryOperation::kLike ? matched : !matched);
@@ -509,14 +518,14 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         break;
     }
     if (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract ||
-        op == BinaryOperation::kMultiply || op == BinaryOperation::kDivide ||
-        op == BinaryOperation::kModulo) {
+        op == BinaryOperation::kMultiply) {
+      // NOTE: division/modulo are excluded from this unsigned fast path —
+      // every type contract (BinaryResultType) declares kDivide to produce a
+      // DOUBLE, and returning a kInt64 value under a declared-kDouble result
+      // makes typed column appends abort.  They fall through to the double
+      // path below.
       const auto lhs = static_cast<uint64_t>(left.value.int_value);
       const auto rhs = static_cast<uint64_t>(right.value.int_value);
-      if ((op == BinaryOperation::kDivide || op == BinaryOperation::kModulo) &&
-          rhs == 0) {
-        throw std::runtime_error("division by zero");
-      }
       // Keep ordinary signed-looking results signed when a UINT64 value is
       // still in INT64's range.  This preserves SQL's `0 - 1 == -1` behavior,
       // while values crossing the signed boundary use UINT64 wraparound.
@@ -565,12 +574,6 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         case BinaryOperation::kMultiply:
           unsigned_result = lhs * rhs;
           break;
-        case BinaryOperation::kDivide:
-          unsigned_result = lhs / rhs;
-          break;
-        case BinaryOperation::kModulo:
-          unsigned_result = lhs % rhs;
-          break;
         default:
           break;
       }
@@ -585,11 +588,11 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
                            ? right.value.double_value
                            : static_cast<double>(right.value.int_value);
     if (rhs == 0.0) {
-      throw std::runtime_error("division by zero");
+      return StatusError(StatusCode::kIsInfinity, "division by zero");
     }
     const double result = lhs / rhs;
     if (std::isfinite(lhs) && std::isfinite(rhs) && std::isinf(result)) {
-      throw std::runtime_error("double overflow");
+      return StatusError(StatusCode::kIsInfinity, "double overflow");
     }
     return Value(result);
   }
@@ -625,12 +628,12 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         return Value(lhs * rhs);
       case BinaryOperation::kDivide:
         if (rhs == 0.0) {
-          throw std::runtime_error("division by zero");
+          return StatusError(StatusCode::kIsInfinity, "division by zero");
         }
         return Value(lhs / rhs);
       case BinaryOperation::kModulo:
         if (rhs == 0.0) {
-          throw std::runtime_error("division by zero");
+          return StatusError(StatusCode::kIsInfinity, "division by zero");
         }
         return Value(std::fmod(lhs, rhs));
       case BinaryOperation::kEquals:
@@ -656,33 +659,43 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     };
     if (left.type == ValueType::kVarChar && right.type == ValueType::kInt64 &&
         is_iv(left.value.varchar_value) && op == BinaryOperation::kMultiply) {
-      IntervalValue iv = IntervalValue::Parse(left.value.varchar_value);
-      return Value((iv * right.value.int_value).ToString());
+      ASSIGN_OR_RETURN(IntervalValue, iv,
+                       IntervalValue::TryParse(left.value.varchar_value));
+      ASSIGN_OR_RETURN(IntervalValue, scaled,
+                       iv.TryMultiply(right.value.int_value));
+      ASSIGN_OR_RETURN(std::string, text, scaled.TryToString());
+      return Value(std::move(text));
     }
     if (left.type == ValueType::kInt64 && right.type == ValueType::kVarChar &&
         is_iv(right.value.varchar_value) && op == BinaryOperation::kMultiply) {
-      IntervalValue iv = IntervalValue::Parse(right.value.varchar_value);
-      return Value((iv * left.value.int_value).ToString());
+      ASSIGN_OR_RETURN(IntervalValue, iv,
+                       IntervalValue::TryParse(right.value.varchar_value));
+      ASSIGN_OR_RETURN(IntervalValue, scaled,
+                       iv.TryMultiply(left.value.int_value));
+      ASSIGN_OR_RETURN(std::string, text, scaled.TryToString());
+      return Value(std::move(text));
     }
     if (left.type == ValueType::kDate && right.type == ValueType::kVarChar) {
-      try {
-        return EvaluateBinary(
-            op, left,
-            Value::DateFromDays(ParseDateDays(right.value.varchar_value)));
-      } catch (const std::exception& error) {
-        (void)error;
+      auto days = TryParseDateDays(right.value.varchar_value);
+      if (days.HasValue()) {
+        auto coerced =
+            TryEvaluateBinary(op, left, Value::DateFromDays(days.MoveValue()));
+        if (coerced.HasValue()) {
+          return coerced;
+        }
       }
     } else if (left.type == ValueType::kVarChar &&
                right.type == ValueType::kDate) {
-      try {
-        return EvaluateBinary(
-            op, Value::DateFromDays(ParseDateDays(left.value.varchar_value)),
-            right);
-      } catch (const std::exception& error) {
-        (void)error;
+      auto days = TryParseDateDays(left.value.varchar_value);
+      if (days.HasValue()) {
+        auto coerced =
+            TryEvaluateBinary(op, Value::DateFromDays(days.MoveValue()), right);
+        if (coerced.HasValue()) {
+          return coerced;
+        }
       }
     }
-    throw std::runtime_error("type mismatch");
+    return StatusError(StatusCode::kInvalidArgument, "type mismatch");
   }
   if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
     auto is_iv = [](std::string_view s) {
@@ -693,21 +706,27 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     // a failing parse must fall back to ordinary comparison, not throw out
     // of an equality on plain text (mirrors Value::operator==).
     auto parse_iv = [](std::string_view s) -> std::optional<IntervalValue> {
-      try {
-        return IntervalValue::Parse(s);
-      } catch (const std::exception&) {
-        return std::nullopt;
+      auto parsed = IntervalValue::TryParse(s);
+      if (parsed.HasValue()) {
+        return parsed.MoveValue();
       }
+      return std::nullopt;
     };
     if (is_iv(left.value.varchar_value) && is_iv(right.value.varchar_value)) {
       const auto iv1 = parse_iv(left.value.varchar_value);
       const auto iv2 = parse_iv(right.value.varchar_value);
       if (iv1 && iv2) {
         switch (op) {
-          case BinaryOperation::kAdd:
-            return Value((*iv1 + *iv2).ToString());
-          case BinaryOperation::kSubtract:
-            return Value((*iv1 - *iv2).ToString());
+          case BinaryOperation::kAdd: {
+            ASSIGN_OR_RETURN(IntervalValue, sum, iv1->TryPlus(*iv2));
+            ASSIGN_OR_RETURN(std::string, text, sum.TryToString());
+            return Value(std::move(text));
+          }
+          case BinaryOperation::kSubtract: {
+            ASSIGN_OR_RETURN(IntervalValue, diff, iv1->TryMinus(*iv2));
+            ASSIGN_OR_RETURN(std::string, text, diff.TryToString());
+            return Value(std::move(text));
+          }
           case BinaryOperation::kEquals:
             return Value(*iv1 == *iv2);
           case BinaryOperation::kNotEquals:
@@ -748,43 +767,34 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       }
     }
   }
-  try {
+  {
     auto preserve_unsigned = [&](const Value& result) {
       return (left.IsUnsigned() || right.IsUnsigned()) ? result.WithUnsigned()
                                                        : result;
     };
     switch (op) {
       case BinaryOperation::kAdd:
-        return preserve_unsigned(left + right);
       case BinaryOperation::kSubtract:
-        return preserve_unsigned(left - right);
       case BinaryOperation::kMultiply:
-        return preserve_unsigned(left * right);
-      case BinaryOperation::kDivide: {
-        if (left.type == ValueType::kDouble) {
-          if (right.value.double_value == 0.0) {
-            throw std::runtime_error("division by zero");
+      case BinaryOperation::kDivide:
+      case BinaryOperation::kModulo: {
+        StatusOr<Value> arithmetic = left.TryArithmetic(right, op);
+        if (!arithmetic.HasValue()) {
+          const Status& status = arithmetic.GetStatus();
+          // Value reports an operand mix it cannot handle with "Cannot do";
+          // the canonical user-facing text is "unsupported binary
+          // operation".
+          if (status.GetMessage().starts_with("Cannot do ")) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "unsupported binary operation");
           }
-          const double result =
-              left.value.double_value / right.value.double_value;
-          if (std::isfinite(left.value.double_value) &&
-              std::isfinite(right.value.double_value) && std::isinf(result)) {
-            throw std::runtime_error("double overflow");
-          }
-          return preserve_unsigned(Value(result));
+          return status;
         }
-        return preserve_unsigned(left / right);
+        return preserve_unsigned(arithmetic.MoveValue());
       }
-      case BinaryOperation::kModulo:
-        return preserve_unsigned(left % right);
       default:
         break;
     }
-  } catch (const std::runtime_error& error) {
-    if (std::string_view(error.what()).starts_with("Cannot do ")) {
-      throw std::runtime_error("unsupported binary operation");
-    }
-    throw;
   }
   switch (op) {
     case BinaryOperation::kAdd:
@@ -809,7 +819,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         const Value equal = StructJsonCompare(folded_left.value.varchar_value,
                                               folded_right.value.varchar_value);
         if (equal.IsNull()) {
-          return {};
+          return Value();
         }
         return Value(!equal.Truthy());
       }
@@ -835,57 +845,75 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       break;
   }
 
-  throw std::logic_error("invalid binary operation");
+  return StatusError(StatusCode::kRuntimeError, "invalid binary operation");
 }
 
-Value BinaryExpression::Evaluate(const Row& row, const Schema& schema) const {
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp) kept for the
+// remaining planner/executor const-folding callers.
+Value EvaluateBinary(BinaryOperation op, const Value& left,
+                     const Value& right) {
+  return ExcShimUnwrap(TryEvaluateBinary(op, left, right), "EvaluateBinary");
+}
+
+namespace {
+template <typename... Args>
+StatusOr<Value> EvaluateMaybeShortCircuited(BinaryOperation op,
+                                            const ExpressionBase& left,
+                                            const ExpressionBase& right,
+                                            Args&&... args) {
+  if (op == BinaryOperation::kAnd || op == BinaryOperation::kOr) {
+    ASSIGN_OR_RETURN(Value, left_value, left.TryEvaluate(args...));
+    if (!left_value.IsNull() &&
+        left_value.Truthy() != (op == BinaryOperation::kAnd)) {
+      return Value(op == BinaryOperation::kOr);
+    }
+    ASSIGN_OR_RETURN(Value, right_value, right.TryEvaluate(args...));
+    return TryEvaluateBinary(op, left_value, right_value);
+  }
+  ASSIGN_OR_RETURN(Value, left_value, left.TryEvaluate(args...));
+  ASSIGN_OR_RETURN(Value, right_value, right.TryEvaluate(args...));
+  return TryEvaluateBinary(op, left_value, right_value);
+}
+}  // namespace
+
+StatusOr<Value> BinaryExpression::TryEvaluate(const Row& row,
+                                              const Schema& schema) const {
   // AND/OR are short-circuited: the right child must not be evaluated when
   // the left operand already decides the result (three-valued logic).
-  if (op_ == BinaryOperation::kAnd || op_ == BinaryOperation::kOr) {
-    const Value left = left_->Evaluate(row, schema);
-    if (!left.IsNull() && left.Truthy() != (op_ == BinaryOperation::kAnd)) {
-      return Value(op_ == BinaryOperation::kOr);
-    }
-    return EvaluateBinary(op_, left, right_->Evaluate(row, schema));
-  }
-  return EvaluateBinary(op_, left_->Evaluate(row, schema),
-                        right_->Evaluate(row, schema));
+  return EvaluateMaybeShortCircuited(op_, *left_, *right_, row, schema);
+}
+
+StatusOr<Value> BinaryExpression::TryEvaluate(
+    const Row* left, const Schema& left_schema, const Row* right,
+    const Schema& right_schema) const {
+  return EvaluateMaybeShortCircuited(op_, *left_, *right_, left, left_schema,
+                                     right, right_schema);
+}
+
+// Context-aware form: identical dispatch to the plain evaluator, with the
+// context threaded into both children (A1 stage 2).
+StatusOr<Value> BinaryExpression::TryEvaluate(
+    const Row& row, const Schema& schema, EvaluationContext& context) const {
+  return EvaluateMaybeShortCircuited(op_, *left_, *right_, row, schema,
+                                     context);
+}
+
+// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+Value BinaryExpression::Evaluate(const Row& row, const Schema& schema) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema), "BinaryExpression::Evaluate");
 }
 
 Value BinaryExpression::Evaluate(const Row* left, const Schema& left_schema,
                                  const Row* right,
                                  const Schema& right_schema) const {
-  if (op_ == BinaryOperation::kAnd || op_ == BinaryOperation::kOr) {
-    const Value left_value =
-        left_->Evaluate(left, left_schema, right, right_schema);
-    if (!left_value.IsNull() &&
-        left_value.Truthy() != (op_ == BinaryOperation::kAnd)) {
-      return Value(op_ == BinaryOperation::kOr);
-    }
-    return EvaluateBinary(
-        op_, left_value,
-        right_->Evaluate(left, left_schema, right, right_schema));
-  }
-  return EvaluateBinary(
-      op_, left_->Evaluate(left, left_schema, right, right_schema),
-      right_->Evaluate(left, left_schema, right, right_schema));
+  return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "BinaryExpression::Evaluate");
 }
 
-// Context-aware form: identical dispatch to the plain evaluator, with the
-// context threaded into both children (A1 stage 2).
 Value BinaryExpression::Evaluate(const Row& row, const Schema& schema,
                                  EvaluationContext& context) const {
-  if (op_ == BinaryOperation::kAnd || op_ == BinaryOperation::kOr) {
-    const Value left_value = left_->Evaluate(row, schema, context);
-    if (!left_value.IsNull() &&
-        left_value.Truthy() != (op_ == BinaryOperation::kAnd)) {
-      return Value(op_ == BinaryOperation::kOr);
-    }
-    return EvaluateBinary(op_, left_value,
-                          right_->Evaluate(row, schema, context));
-  }
-  return EvaluateBinary(op_, left_->Evaluate(row, schema, context),
-                        right_->Evaluate(row, schema, context));
+  return ExcShimUnwrap(TryEvaluate(row, schema, context),
+                       "BinaryExpression::Evaluate");
 }
 
 namespace {

@@ -28,6 +28,12 @@ namespace tinylamb {
 // merges intermediate accumulator states per group, and emits finalized rows.
 class DistributedAggFinalize : public ExecutorBase, public PipelineBreaker {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  DistributedAggFinalize(const DistributedAggFinalize&) = delete;
+  DistributedAggFinalize& operator=(const DistributedAggFinalize&) = delete;
+  DistributedAggFinalize(DistributedAggFinalize&&) = delete;
+  DistributedAggFinalize& operator=(DistributedAggFinalize&&) = delete;
   enum class AggType : uint8_t {
     kCount,
     kSum,

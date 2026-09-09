@@ -37,7 +37,7 @@ class LSMTreeTest : public ::testing::Test {
  protected:
   void SetUp() override {
     dir_path_ = "lsm_tree_test-" + RandomString();
-    t_ = std::make_unique<LSMTree>(dir_path_);
+    t_ = LSMTree::Create(dir_path_).MoveValue();
   }
 
   void TearDown() override {
@@ -111,14 +111,14 @@ TEST_F(LSMTreeTest, RangeScan) {
   // Act -- sync LSMTree, then scan via iterator
   t_->Sync();
   LSMView v = t_->GetView();
-  LSMView::Iterator it = v.Begin();
+  LSMView::Iterator it = v.Begin().MoveValue();
   auto expected_iter = expected.begin();
 
   // Assert -- iterator yields every key-value pair in sorted order, matching
   // expected
   while (it.IsValid()) {
-    ASSERT_EQ(expected_iter->first, it.Key());
-    ASSERT_EQ(expected_iter->second, it.Value());
+    ASSERT_EQ(expected_iter->first, it.Key().Value());
+    ASSERT_EQ(expected_iter->second, it.Value().Value());
     ++it;
     ++expected_iter;
   }
@@ -189,14 +189,14 @@ TEST_F(LSMTreeTest, LongKeyRangeScan) {
   // Act -- sync LSMTree, then scan via iterator
   t_->Sync();
   LSMView v = t_->GetView();
-  LSMView::Iterator it = v.Begin();
+  LSMView::Iterator it = v.Begin().MoveValue();
   auto expected_iter = expected.begin();
 
   // Assert -- iterator yields every key-value pair in sorted order, matching
   // expected
   while (it.IsValid()) {
-    ASSERT_EQ(expected_iter->first, it.Key());
-    ASSERT_EQ(expected_iter->second, it.Value());
+    ASSERT_EQ(expected_iter->first, it.Key().Value());
+    ASSERT_EQ(expected_iter->second, it.Value().Value());
     ++it;
     ++expected_iter;
   }
@@ -240,13 +240,13 @@ TEST_F(LSMTreeTest, DeleteRangeScan) {
 
   // Act -- scan via iterator after deletion
   LSMView v = t_->GetView();
-  LSMView::Iterator iter = v.Begin();
+  LSMView::Iterator iter = v.Begin().MoveValue();
 
   // Assert -- iterator yields only even-indexed keys with their original values
   while (iter.IsValid()) {
-    int key = std::stoi(iter.Key());
+    int key = std::stoi(iter.Key().Value());
     ASSERT_EQ(key % 2, 0);
-    ASSERT_EQ(iter.Value(), std::to_string(key * 2));
+    ASSERT_EQ(iter.Value().Value(), std::to_string(key * 2));
     ++iter;
   }
 }
@@ -281,7 +281,7 @@ TEST_F(LSMTreeTest, EmptyViewBegin) {
   LSMView v = t_->GetView();
 
   // Act -- begin iteration over the empty view.
-  LSMView::Iterator it = v.Begin();
+  LSMView::Iterator it = v.Begin().MoveValue();
 
   // Assert -- an iterator over an empty view is invalid, not a null deref.
   ASSERT_FALSE(it.IsValid());
@@ -317,13 +317,13 @@ TEST_F(LSMTreeTest, ContainsMemoryThenFile) {
   // Act -- flush to a sorted run and query through the file path
   t_->Sync();
   // Assert -- the key is visible from the on-disk run
-  EXPECT_TRUE(t_->Contains("present"));
-  EXPECT_FALSE(t_->Contains("absent"));
+  EXPECT_TRUE(t_->Contains("present").Value());
+  EXPECT_FALSE(t_->Contains("absent").Value());
 
   // Act -- delete the key and verify it disappears after the tombstone flushes
   t_->Delete("present");
   t_->Sync();
-  EXPECT_FALSE(t_->Contains("present"));
+  EXPECT_FALSE(t_->Contains("present").Value());
 }
 
 TEST_F(LSMTreeTest, MergeAllReadsBack) {
@@ -379,12 +379,12 @@ TEST_F(LSMTreeTest, ReadTombstoneFromMemoryTree) {
 TEST_F(LSMTreeTest, ContainsFromMemoryTree) {
   // Arrange -- write a key; nothing has been flushed yet
   t_->Write("present", "value");
-  EXPECT_TRUE(t_->Contains("present"));
+  EXPECT_TRUE(t_->Contains("present").Value());
 
   // Act -- delete the key while it is still in mem_tree_
   t_->Delete("present");
   // Assert -- the in-memory tombstone makes Contains return false
-  EXPECT_FALSE(t_->Contains("present"));
+  EXPECT_FALSE(t_->Contains("present").Value());
 }
 
 TEST_F(LSMTreeTest, WriteWithSyncFlag) {
@@ -407,7 +407,7 @@ TEST_F(LSMTreeTest, DeleteWithSyncFlag) {
 
   // Assert -- the flushed tombstone hides the key from both Read and Contains
   ASSERT_EQ(t_->Read("doomed").GetStatus(), Status::kNotExists);
-  EXPECT_FALSE(t_->Contains("doomed"));
+  EXPECT_FALSE(t_->Contains("doomed").Value());
 }
 
 TEST_F(LSMTreeTest, MergeAllThenDeleteAll) {
@@ -499,7 +499,7 @@ TEST_F(LSMTreeTest, MergeRunsWithTombstones) {
 
   // Assert -- the tombstone wins over the older live value
   ASSERT_EQ(t_->Read("zombie").GetStatus(), Status::kNotExists);
-  EXPECT_FALSE(t_->Contains("zombie"));
+  EXPECT_FALSE(t_->Contains("zombie").Value());
 }
 
 TEST_F(LSMTreeTest, LargeValuesRoundTrip) {
@@ -515,7 +515,7 @@ TEST_F(LSMTreeTest, LargeValuesRoundTrip) {
 
   // Assert -- the blob-stored payload round-trips byte-for-byte
   ASSERT_SUCCESS_AND_EQ(result, value);
-  EXPECT_TRUE(t_->Contains(key));
+  EXPECT_TRUE(t_->Contains(key).Value());
 
   // Act -- overwrite with a different large value and delete afterwards
   const std::string value2(8192, 'w');
@@ -542,11 +542,11 @@ TEST_F(LSMTreeTest, ContainsAfterMultipleMerges) {
 
   // Act -- query membership across both key ranges and a missing key
   // Assert -- both ranges remain present, the missing key stays absent
-  EXPECT_TRUE(t_->Contains("a0"));
-  EXPECT_TRUE(t_->Contains("a29"));
-  EXPECT_TRUE(t_->Contains("b0"));
-  EXPECT_TRUE(t_->Contains("b29"));
-  EXPECT_FALSE(t_->Contains("zzz"));
+  EXPECT_TRUE(t_->Contains("a0").Value());
+  EXPECT_TRUE(t_->Contains("a29").Value());
+  EXPECT_TRUE(t_->Contains("b0").Value());
+  EXPECT_TRUE(t_->Contains("b29").Value());
+  EXPECT_FALSE(t_->Contains("zzz").Value());
 }
 TEST_F(LSMTreeTest, ReopenRestoresFlushedRunsAndKeepsAppending) {
   // D10 (docs/design.md): flushed data must survive restart.  Write+Sync,
@@ -567,7 +567,9 @@ TEST_F(LSMTreeTest, ReopenRestoresFlushedRunsAndKeepsAppending) {
 
   std::map<std::string, std::string> generation2;
   {
-    LSMTree reopened(dir_path_);
+    auto reopened_holder = LSMTree::Create(dir_path_).MoveValue();
+    CHECK(reopened_holder != nullptr);
+    LSMTree& reopened = *reopened_holder;
     for (const auto& [key, value] : generation1) {
       ASSERT_SUCCESS_AND_EQ(reopened.Read(key), value);
     }
@@ -584,7 +586,9 @@ TEST_F(LSMTreeTest, ReopenRestoresFlushedRunsAndKeepsAppending) {
   // Third open: generations 1 and 2 both present, ordering by generation so
   // the newest value for an overlapping key wins.
   {
-    LSMTree third(dir_path_);
+    auto third_holder = LSMTree::Create(dir_path_).MoveValue();
+    CHECK(third_holder != nullptr);
+    LSMTree& third = *third_holder;
     for (const auto& [key, value] : generation1) {
       ASSERT_SUCCESS_AND_EQ(third.Read(key), value);
     }
@@ -595,7 +599,9 @@ TEST_F(LSMTreeTest, ReopenRestoresFlushedRunsAndKeepsAppending) {
     third.Sync();
   }
   {
-    LSMTree fourth(dir_path_);
+    auto fourth_holder = LSMTree::Create(dir_path_).MoveValue();
+    CHECK(fourth_holder != nullptr);
+    LSMTree& fourth = *fourth_holder;
     ASSERT_SUCCESS_AND_EQ(fourth.Read("200"), std::string("v3-override"));
     ASSERT_SUCCESS_AND_EQ(fourth.Read("201"), std::string("v2-201"));
     ASSERT_SUCCESS_AND_EQ(fourth.Read("0"), generation1.at("0"));
@@ -615,13 +621,13 @@ TEST_F(LSMTreeTest, ReopenRejectsMalformedRunFile) {
     out << "garbage";
   }
 
-  ASSERT_NO_THROW(t_ = std::make_unique<LSMTree>(dir_path_));
+  ASSERT_NO_THROW(t_ = LSMTree::Create(dir_path_).MoveValue());
   ASSERT_SUCCESS_AND_EQ(t_->Read("keep"), std::string("me"));
   // The malformed file was quarantined IN THE RUN DIRECTORY (the rename
   // destination must be an absolute path; a bare "name.bad" would land in the
   // process CWD instead).
   EXPECT_TRUE(std::filesystem::exists(junk.string() + ".bad"))
-      << "quarantined file must be beside the run directory";
+      << true;
   EXPECT_FALSE(std::filesystem::exists(junk));
 }
 
@@ -645,7 +651,7 @@ TEST_F(LSMTreeTest, ReopenQuarantinesIncompleteRunFile) {
   std::filesystem::resize_file(run, original / 2);
   ASSERT_LT(std::filesystem::file_size(run), original);
 
-  ASSERT_NO_THROW(t_ = std::make_unique<LSMTree>(dir_path_));
+  ASSERT_NO_THROW(t_ = LSMTree::Create(dir_path_).MoveValue());
   // The truncated run was quarantined; writing the same key still works.
   t_->Write("a", "recovered");
   ASSERT_SUCCESS_AND_EQ(t_->Read("a"), std::string("recovered"));

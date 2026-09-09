@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/exc_shim.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
@@ -148,9 +149,19 @@ class Memo {
   explicit Memo(size_t expression_cap = kDefaultExpressionCap)
       : expression_cap_(expression_cap) {}
 
-  GroupId Build(const std::vector<std::string>& relations);
-  GroupId Build(const std::vector<std::string>& relations,
-                const std::vector<ConjunctInfo>& conjuncts);
+  [[nodiscard]] StatusOr<GroupId> TryBuild(
+      const std::vector<std::string>& relations);
+  [[nodiscard]] StatusOr<GroupId> TryBuild(
+      const std::vector<std::string>& relations,
+      const std::vector<ConjunctInfo>& conjuncts);
+  // EXC-SHIM (see no-exception-rule-migration.md).
+  [[nodiscard]] GroupId Build(const std::vector<std::string>& relations) {
+    return ExcShimUnwrap(TryBuild(relations), "Memo::Build");
+  }
+  [[nodiscard]] GroupId Build(const std::vector<std::string>& relations,
+                              const std::vector<ConjunctInfo>& conjuncts) {
+    return ExcShimUnwrap(TryBuild(relations, conjuncts), "Memo::Build");
+  }
   GroupId EnsureGroup(std::vector<std::string> relations);
   // Root-layer groups for Selection/Projection/Aggregation/Limit chains. They
   // share the relation set with their child group but carry a distinct tag so

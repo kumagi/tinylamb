@@ -46,7 +46,7 @@ class LoggerTest : public ::testing::Test {
   void SetUp() override {
     std::string prefix = "logger_test-" + RandomString();
     log_name_ = prefix + ".log";
-    l_ = std::make_unique<Logger>(log_name_, 32, 1);
+    l_ = Logger::Create(log_name_, 32, 1).MoveValue();
   }
 
   void TearDown() override {
@@ -79,7 +79,7 @@ TEST_F(LoggerTest, AppendOne) {
   LogRecord l(0xcafebabe, 0xdeadbeef, LogType::kBegin);
 
   // Act -- append the serialized log; wait for commit; read back via ifstream
-  lsn_t lsn = l_->AddLog(l.Serialize());
+  lsn_t lsn = l_->AddLog(l.Serialize()).Value() ;
   ASSERT_EQ(0, lsn);  // Inserted place must be the beginning of the log.
   WaitForCommit(0 + l.Size());
   EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size());
@@ -122,7 +122,7 @@ TEST_F(LoggerTest, AppendMany) {
   // commit; read back file size
   for (int i = 0; i < 64; ++i) {
     auto random_size = static_cast<size_t>(((i * 31) % 40) + 1);
-    lsn = l_->AddLog(RandomString(random_size)) + random_size;
+    lsn = l_->AddLog(RandomString(random_size)).Value() + random_size;
     size += random_size;
     EXPECT_EQ(lsn, size);
   }
@@ -135,7 +135,7 @@ TEST_F(LoggerTest, AppendMany) {
 TEST_F(LoggerTest, AppendExponential) {
   // Arrange -- reset Logger to a fresh instance; prepare 1000 exponential-size
   // strings ('x' repeated)
-  l_ = std::make_unique<Logger>(log_name_);
+  l_ = Logger::Create(log_name_).MoveValue();
   lsn_t lsn = 0;
   size_t size = 0;
 
@@ -143,7 +143,7 @@ TEST_F(LoggerTest, AppendExponential) {
   // read back file size
   for (int i = 0; i < 1000; ++i) {
     std::string data(static_cast<size_t>((i * i) + 1), 'x');
-    lsn = l_->AddLog(data);
+    lsn = l_->AddLog(data).Value();
     EXPECT_EQ(lsn, size);
     size += static_cast<size_t>((i * i) + 1);
   }
@@ -171,7 +171,7 @@ TEST_F(LoggerTest, Verify) {
 
 TEST_F(LoggerTest, WaitForDurableObservesFsync) {
   std::string payload = RandomString(256);
-  const lsn_t lsn = l_->AddLog(payload);
+  const lsn_t lsn = l_->AddLog(payload).Value() ;
   l_->WaitForDurable(lsn + payload.size());
   EXPECT_GE(l_->DurableLSN(), lsn + payload.size());
   EXPECT_GE(l_->CommittedLSN(), lsn + payload.size());
@@ -191,14 +191,14 @@ TEST_F(LoggerTest, ReopenExistingWalKeepsContent) {
   // were seeded with the on-disk size, so reopening an existing WAL could
   // append zero-filled buffer bytes over the tail of the log.
   const std::string first(128, 'x');
-  ASSERT_EQ(l_->AddLog(first), 0);
+  ASSERT_EQ(l_->AddLog(first).Value(), 0);
   l_->WaitForDurable(first.size());
   l_.reset();
 
-  auto second = std::make_unique<Logger>(log_name_, 32, 1);
+  auto second = Logger::Create(log_name_, 32, 1).MoveValue();
   EXPECT_EQ(second->BufferedLSN(), first.size());
   const std::string appended(64, 'y');
-  const lsn_t lsn = second->AddLog(appended);
+  const lsn_t lsn = second->AddLog(appended).Value();
   EXPECT_EQ(lsn, first.size());
   second->WaitForDurable(first.size() + appended.size());
   EXPECT_EQ(std::filesystem::file_size(log_name_),
@@ -245,10 +245,9 @@ TEST_F(LoggerTest, WriteErrorUnblocksAllWaiters) {
   EXPECT_TRUE(failed);
   EXPECT_TRUE(l_->Failed());
   EXPECT_EQ(l_->ErrorNumber(), ENOSPC);
-  EXPECT_THROW(l_->AddLog(std::string(16, 'b')), std::runtime_error);
-  EXPECT_THROW(l_->WaitForDurable(l_->BufferedLSN() + 4096),
-               std::runtime_error);
-  EXPECT_THROW(l_->Finish(), std::runtime_error);
+  EXPECT_FALSE(l_->AddLog(std::string(16, 'b')).HasValue());
+  EXPECT_NE(l_->WaitForDurable(l_->BufferedLSN() + 4096), Status::kSuccess);
+  EXPECT_NE(l_->Finish(), Status::kSuccess);
 }
 
 TEST_F(LoggerTest, AddLogReturnsFreshLsnAfterBufferFullWait) {
@@ -257,7 +256,7 @@ TEST_F(LoggerTest, AddLogReturnsFreshLsnAfterBufferFullWait) {
   // space, corrupting prev_lsn chains.
   constexpr size_t kBufSize = 512;
   l_.reset();
-  auto logger = std::make_unique<Logger>(log_name_, kBufSize, 1);
+  auto logger = Logger::Create(log_name_, kBufSize, 1).MoveValue();
 
   // Arrange -- exactly fill the ring buffer so both producers must park.
   logger->AddLog(std::string(kBufSize, 'f'));
@@ -265,8 +264,10 @@ TEST_F(LoggerTest, AddLogReturnsFreshLsnAfterBufferFullWait) {
   lsn_t second_lsn = 0;
 
   // Act -- two concurrent producers race for the freed space.
-  std::thread a([&] { first_lsn = logger->AddLog(std::string(16, 'a')); });
-  std::thread b([&] { second_lsn = logger->AddLog(std::string(16, 'b')); });
+  std::thread a(
+      [&] { first_lsn = logger->AddLog(std::string(16, 'a')).Value(); });
+  std::thread b(
+      [&] { second_lsn = logger->AddLog(std::string(16, 'b')).Value(); });
   a.join();
   b.join();
   logger->WaitForDurable(kBufSize + 32);
@@ -312,7 +313,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
   constexpr size_t kThreads = 8;
   constexpr size_t kRecordsPerThread = 8;
   l_.reset();
-  auto logger = std::make_unique<Logger>(log_name_, kBufSize, 1);
+  auto logger = Logger::Create(log_name_, kBufSize, 1).MoveValue();
 
   std::vector<std::thread> producers;
   producers.reserve(kThreads);
@@ -322,8 +323,8 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
         // 16KB-class bodies against a 4KB ring: every record spans many
         // full-buffer waits and several wrap-around copies.
         const size_t body = (s % 2 == 0) ? 16384 : 64;
-        logger->AddLog(MakeD1Payload(static_cast<uint32_t>(t),
-                                     static_cast<uint32_t>(s), body));
+        (void)logger->AddLog(MakeD1Payload(static_cast<uint32_t>(t),
+                                           static_cast<uint32_t>(s), body));
       }
     });
   }
@@ -345,7 +346,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
   size_t records = 0;
   while (file.peek() != std::ifstream::traits_type::eof()) {
     const uint32_t magic = read32();
-    ASSERT_EQ(magic, kD1Magic) << "record " << records << ": interleave";
+    ASSERT_EQ(magic, kD1Magic) << true << (records != 0u) << true;
     const uint32_t thread = read32();
     const uint32_t seq = read32();
     const uint32_t length = read32();
@@ -354,8 +355,8 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
     const int fill = static_cast<unsigned char>((thread * 31) + seq);
     for (uint32_t i = 0; i < length; ++i) {
       ASSERT_EQ(file.get(), fill)
-          << "record " << records << " (thread " << thread << " seq " << seq
-          << "): fragmented payload";
+          << true << (records != 0u) << true << (thread != 0u) << true << (seq != 0u)
+          << true;
     }
     ++records;
   }
@@ -364,10 +365,12 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
 
 TEST_F(LoggerTest, D1RejectsRecordOverMaxSize) {
   l_.reset();
-  auto logger = std::make_unique<Logger>(log_name_, 4096, 1);
-  EXPECT_THROW(logger->AddLog(std::string(Logger::kMaxRecordSize + 1, 'x')),
-               std::invalid_argument);
-  EXPECT_NO_THROW(logger->AddLog(std::string(Logger::kMaxRecordSize, 'x')));
-  logger->Finish();
+  auto logger = Logger::Create(log_name_, 4096, 1).MoveValue();
+  ASSERT_TRUE(logger != nullptr);
+  EXPECT_FALSE(
+      logger->AddLog(std::string(Logger::kMaxRecordSize + 1, 'x')).HasValue());
+  EXPECT_TRUE(
+      logger->AddLog(std::string(Logger::kMaxRecordSize, 'x')).HasValue());
+  EXPECT_EQ(logger->Finish(), Status::kSuccess);
 }
 }  // namespace tinylamb

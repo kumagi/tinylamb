@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "executor/sort.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -19,12 +20,16 @@ namespace tinylamb {
 // collections.
 class PdqSort {
  public:
+  // `error` receives the first key-evaluation failure (comparators cannot
+  // abort mid-sort; callers must check it afterwards).
   static void Sort(std::vector<std::pair<Row, RowPosition>>& rows,
                    const Schema& schema,
-                   const std::vector<SortExecutor::Key>& keys);
+                   const std::vector<SortExecutor::Key>& keys,
+                   Status* error = nullptr);
 
   static void Sort(std::vector<Row>& rows, const Schema& schema,
-                   const std::vector<SortExecutor::Key>& keys);
+                   const std::vector<SortExecutor::Key>& keys,
+                   Status* error = nullptr);
 };
 
 }  // namespace tinylamb

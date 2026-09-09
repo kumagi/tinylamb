@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exc_shim.hpp"
 #include "common/set_operation.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
@@ -24,7 +25,7 @@ namespace {
 
 constexpr size_t kSetOperationPartitions = 32;
 
-ValueType CommonSetValueType(ValueType left, ValueType right) {
+StatusOr<ValueType> CommonSetValueType(ValueType left, ValueType right) {
   if (left == ValueType::kNull) {
     return right;
   }
@@ -53,7 +54,8 @@ ValueType CommonSetValueType(ValueType left, ValueType right) {
                       left == ValueType::kDate))) {
     return ValueType::kVarChar;
   }
-  throw std::invalid_argument("set operation inputs have incompatible types");
+  return StatusError(StatusCode::kInvalidArgument,
+                     "set operation inputs have incompatible types");
 }
 
 }  // namespace
@@ -79,10 +81,11 @@ bool SetOperationRowEqual::operator()(const Row& left, const Row& right) const {
   return true;
 }
 
-void SetOperationExecutor::MaterializeRows(
+Status SetOperationExecutor::MaterializeRows(
     std::vector<std::vector<Positioned>> rows) {
   if (rows.empty()) {
-    throw std::invalid_argument("set operation needs at least one source");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "set operation needs at least one source");
   }
   size_t width = 0;
   bool width_known = false;
@@ -92,7 +95,8 @@ void SetOperationExecutor::MaterializeRows(
         width = item.row.values_.size();
         width_known = true;
       } else if (item.row.values_.size() != width) {
-        throw std::invalid_argument(
+        return StatusError(
+            StatusCode::kInvalidArgument,
             "set operation inputs must have the same column count");
       }
     }
@@ -102,8 +106,10 @@ void SetOperationExecutor::MaterializeRows(
     for (const auto& source : rows) {
       for (const Positioned& item : source) {
         for (size_t column = 0; column < width; ++column) {
-          common_types[column] = CommonSetValueType(
-              common_types[column], item.row.values_[column].type);
+          ASSIGN_OR_RETURN(ValueType, common,
+                           (CommonSetValueType(common_types[column],
+                                               item.row.values_[column].type)));
+          common_types[column] = common;
         }
       }
     }
@@ -121,14 +127,17 @@ void SetOperationExecutor::MaterializeRows(
           }
           if (common_types[column] == ValueType::kDate &&
               value.type == ValueType::kVarChar) {
-            value = Value::Date(value.value.varchar_value);
+            ASSIGN_OR_RETURN(Value, date_value,
+                             (Value::TryDate(value.value.varchar_value)));
+            value = std::move(date_value);
             continue;
           }
           if (common_types[column] == ValueType::kVarChar) {
             value = Value(value.AsString());
             continue;
           }
-          throw std::invalid_argument(
+          return StatusError(
+              StatusCode::kInvalidArgument,
               "set operation value cannot be coerced to common type");
         }
       }
@@ -162,12 +171,13 @@ void SetOperationExecutor::MaterializeRows(
       AppendExcept(rows, true);
       break;
   }
+  return Status::kSuccess;
 }
 
-void SetOperationExecutor::MaterializePartitioned() {
+Status SetOperationExecutor::MaterializePartitioned() {
   for (auto& source : spill_sources_) {
     for (SpillFile& partition : source) {
-      partition.FinishWriting();
+      RETURN_IF_FAIL(partition.FinishWriting());
     }
   }
   // A value's physical type participates in Row's hash. Repartition after
@@ -179,11 +189,17 @@ void SetOperationExecutor::MaterializePartitioned() {
   }
   for (size_t source = 0; source < spill_sources_.size(); ++source) {
     for (SpillFile& raw_partition : spill_sources_[source]) {
-      raw_partition.ForEachRow([&](const Row& raw) {
+      Status row_error = Status::kSuccess;
+      RETURN_IF_FAIL(raw_partition.ForEachRow([&](const Row& raw) {
+        if (row_error != Status::kSuccess) {
+          return;
+        }
         Row row = raw;
         if (spill_width_.has_value() && row.values_.size() != *spill_width_) {
-          throw std::invalid_argument(
+          row_error = StatusError(
+              StatusCode::kInvalidArgument,
               "set operation inputs must have the same column count");
+          return;
         }
         for (size_t column = 0; column < row.values_.size(); ++column) {
           Value& value = row.values_[column];
@@ -198,25 +214,41 @@ void SetOperationExecutor::MaterializePartitioned() {
           }
           if (expected == ValueType::kDate &&
               value.type == ValueType::kVarChar) {
-            value = Value::Date(value.value.varchar_value);
+            StatusOr<Value> date_value =
+                Value::TryDate(value.value.varchar_value);
+            if (!date_value.HasValue()) {
+              row_error = date_value.GetStatus();
+              return;
+            }
+            value = date_value.MoveValue();
             continue;
           }
           if (expected == ValueType::kVarChar) {
             value = Value(value.AsString());
             continue;
           }
-          throw std::invalid_argument(
+          row_error = StatusError(
+              StatusCode::kInvalidArgument,
               "set operation value cannot be coerced to common type");
+          return;
         }
-        normalized[source][std::hash<Row>{}(row) % kSetOperationPartitions]
-            .Append(row);
-      });
+        if (Status append = normalized[source][std::hash<Row>{}(row) %
+                                               kSetOperationPartitions]
+                                .Append(row);
+            append != Status::kSuccess && row_error == Status::kSuccess) {
+          row_error = append;
+        }
+      }));
+      // The callback latches the first coercion/append failure and skips the
+      // remaining rows of this partition; propagate it like the in-memory
+      // path instead of silently dropping the offending rows.
+      RETURN_IF_FAIL(row_error);
     }
   }
   spill_sources_ = std::move(normalized);
   for (auto& source : spill_sources_) {
     for (SpillFile& partition : source) {
-      partition.FinishWriting();
+      RETURN_IF_FAIL(partition.FinishWriting());
     }
   }
   output_.clear();
@@ -225,21 +257,22 @@ void SetOperationExecutor::MaterializePartitioned() {
   for (size_t partition = 0; partition < kSetOperationPartitions; ++partition) {
     std::vector<std::vector<Positioned>> rows(spill_sources_.size());
     for (size_t source = 0; source < spill_sources_.size(); ++source) {
-      const std::vector<Row> spilled =
-          spill_sources_[source][partition].ReadAllRows();
+      ASSIGN_OR_RETURN(std::vector<Row>, spilled,
+                       (spill_sources_[source][partition].ReadAllRows()));
       rows[source].reserve(spilled.size());
       for (Row row : spilled) {
         rows[source].push_back(
             Positioned{.row = std::move(row), .position = RowPosition()});
       }
     }
-    MaterializeRows(std::move(rows));
+    RETURN_IF_FAIL(MaterializeRows(std::move(rows)));
     accumulated.insert(accumulated.end(),
                        std::make_move_iterator(output_.begin()),
                        std::make_move_iterator(output_.end()));
   }
   output_ = std::move(accumulated);
   output_offset_ = 0;
+  return Status::kSuccess;
 }
 
 void SetOperationExecutor::AppendAll(const std::vector<Positioned>& source) {
@@ -332,25 +365,29 @@ void SetOperationExecutor::AppendExcept(
   }
 }
 
-void SetOperationExecutor::Materialize() {
+Status SetOperationExecutor::Materialize() {
   std::vector<std::vector<Positioned>> rows(sources_.size());
   QueryMemoryCharge charge;
   bool spilling = false;
-  const auto observe_types = [&](const Row& row) {
+  const auto observe_types = [&](const Row& row) -> Status {
     if (!spill_width_.has_value()) {
       spill_width_ = row.values_.size();
       spill_common_types_.assign(*spill_width_, ValueType::kNull);
     }
     if (row.values_.size() != *spill_width_) {
-      throw std::invalid_argument(
+      return StatusError(
+          StatusCode::kInvalidArgument,
           "set operation inputs must have the same column count");
     }
     for (size_t column = 0; column < row.values_.size(); ++column) {
-      spill_common_types_[column] = CommonSetValueType(
-          spill_common_types_[column], row.values_[column].type);
+      ASSIGN_OR_RETURN(ValueType, common,
+                       (CommonSetValueType(spill_common_types_[column],
+                                           row.values_[column].type)));
+      spill_common_types_[column] = common;
     }
+    return Status::kSuccess;
   };
-  auto begin_spill = [&]() {
+  auto begin_spill = [&]() -> Status {
     spilling = true;
     spill_sources_.resize(sources_.size());
     for (auto& source : spill_sources_) {
@@ -358,45 +395,54 @@ void SetOperationExecutor::Materialize() {
     }
     for (size_t source = 0; source < rows.size(); ++source) {
       for (const Positioned& item : rows[source]) {
-        spill_sources_[source]
-                      [std::hash<Row>{}(item.row) % kSetOperationPartitions]
-                          .Append(item.row);
+        RETURN_IF_FAIL(spill_sources_[source][std::hash<Row>{}(item.row) %
+                                              kSetOperationPartitions]
+                           .Append(item.row));
       }
       rows[source].clear();
       rows[source].shrink_to_fit();
     }
     charge.ReleaseAll();
+    return Status::kSuccess;
   };
   for (size_t source = 0; source < sources_.size(); ++source) {
     Row row;
     RowPosition position;
     while (sources_[source]->Next(&row, &position)) {
-      observe_types(row);
+      RETURN_IF_FAIL(observe_types(row));
       if (!spilling && operation_ != SetOperationKind::kUnionAll &&
           !QueryMemoryBudget::Global().CanReserve(EstimateRowBytes(row))) {
-        begin_spill();
+        RETURN_IF_FAIL(begin_spill());
       }
       if (spilling) {
-        spill_sources_[source][std::hash<Row>{}(row) % kSetOperationPartitions]
-            .Append(row);
+        RETURN_IF_FAIL(spill_sources_[source][std::hash<Row>{}(row) %
+                                              kSetOperationPartitions]
+                           .Append(row));
       } else {
         charge.Add(EstimateRowBytes(row));
         rows[source].push_back(
             Positioned{.row = std::move(row), .position = position});
       }
     }
+    if (auto st = sources_[source]->GetStatus(); st != Status::kSuccess) {
+      return st;
+    }
   }
   if (spilling) {
-    MaterializePartitioned();
+    RETURN_IF_FAIL(MaterializePartitioned());
   } else {
-    MaterializeRows(std::move(rows));
+    RETURN_IF_FAIL(MaterializeRows(std::move(rows)));
   }
   materialized_ = true;
+  return Status::kSuccess;
 }
 
 bool SetOperationExecutor::Next(Row* destination, RowPosition* position) {
   if (!materialized_) {
-    Materialize();
+    Status st = Materialize();
+    if (st != Status::kSuccess) {
+      return FailWith(st);
+    }
   }
   if (output_offset_ == output_.size()) {
     return false;

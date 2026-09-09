@@ -28,6 +28,7 @@
 
 #include "common/constants.hpp"
 #include "common/crc32c.hpp"
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
 #include "common/status_or.hpp"
 #include "index_key.hpp"
@@ -40,12 +41,12 @@
 
 // do/while wrap keeps the macro a single statement so it cannot glue onto a
 // dangling `else`; the message carries the offending type for diagnosis.
-#define ASSERT_PAGE_TYPE(expected_type)                       \
-  do {                                                        \
-    if (type != (expected_type)) {                            \
-      throw std::runtime_error("Invalid page type: actual=" + \
-                               PageTypeString(type));         \
-    }                                                         \
+#define ASSERT_PAGE_TYPE(expected_type)                                      \
+  do {                                                                       \
+    if (type != (expected_type)) {                                           \
+      CHECK_MSG(false, "Invalid page type: actual=" + PageTypeString(type) + \
+                           " expected=" + PageTypeString(expected_type));    \
+    }                                                                        \
   } while (false)
 
 namespace tinylamb {
@@ -93,21 +94,22 @@ void Page::EncodeDisk(char* destination) const {
   offset += SerializeU64(destination + offset, recovery_lsn);
   offset += SerializeU64(destination + offset, static_cast<uint64_t>(type));
   offset += SerializeU64(destination + offset, checksum);
-  if (offset != kPageHeaderSize) {
-    throw std::runtime_error("page header codec size mismatch");
-  }
+  CHECK(offset == kPageHeaderSize);
+
   std::memcpy(destination + offset, &body, kPageBodySize);
 }
 
-void Page::DecodeDisk(const char* source) {
+Status Page::DecodeDisk(const char* source) {
   size_t offset = 0;
   offset += DeserializeU32(source + offset, &format_magic);
   offset += DeserializeU32(source + offset, &format_version);
   if (format_magic != kSerdesMagic) {
-    throw std::runtime_error("invalid page magic");
+    return StatusError(StatusCode::kCorrupt, "invalid page magic");
   }
   if (format_version != kSerdesVersion) {
-    throw std::runtime_error("unsupported page version");
+    return StatusError(
+        StatusCode::kCorrupt,
+        "unsupported page version: " + std::to_string(format_version));
   }
   offset += DeserializeU64(source + offset, &page_id);
   offset += DeserializeU64(source + offset, &page_lsn);
@@ -116,27 +118,28 @@ void Page::DecodeDisk(const char* source) {
   offset += DeserializeU64(source + offset, &raw_type);
   type = static_cast<PageType>(raw_type);
   offset += DeserializeU64(source + offset, &checksum);
-  if (offset != kPageHeaderSize) {
-    throw std::runtime_error("page header codec size mismatch");
-  }
+  CHECK(offset == kPageHeaderSize);
   std::memcpy(&body, source + offset, kPageBodySize);
+  return Status::kSuccess;
 }
 
 // Meta page functions.
-PageRef Page::AllocateNewPage(Transaction& txn, PagePool& pool,
-                              PageType new_page_type) {
+StatusOr<PageRef> Page::AllocateNewPage(Transaction& txn, PagePool& pool,
+                                        PageType new_page_type) {
   ASSERT_PAGE_TYPE(PageType::kMetaPage);
-  PageRef ret = body.meta_page.AllocateNewPage(txn, pool, new_page_type);
+  ASSIGN_OR_RETURN(PageRef, ret,
+                   body.meta_page.AllocateNewPage(txn, pool, new_page_type));
   SetPageLSN(txn.PrevRecordEndLSN());
   SetRecLSN(txn.PrevRecordEndLSN());
   return ret;
 }
 
-void Page::DestroyPage(Transaction& txn, Page* target) {
+Status Page::DestroyPage(Transaction& txn, Page* target) {
   ASSERT_PAGE_TYPE(PageType::kMetaPage);
-  body.meta_page.DestroyPage(txn, target);
+  RETURN_IF_FAIL(body.meta_page.DestroyPage(txn, target));
   SetPageLSN(txn.PrevRecordEndLSN());
   SetRecLSN(txn.PrevRecordEndLSN());
+  return Status::kSuccess;
 }
 
 size_t Page::RowCount(Transaction& /*txn*/) const {
@@ -149,7 +152,8 @@ size_t Page::RowCount(Transaction& /*txn*/) const {
   if (type == PageType::kBranchPage) {
     return body.branch_page.RowCount();
   }
-  throw std::runtime_error("invalid page type");
+  CHECK_MSG(false, "invalid page type: " + PageTypeString(type));
+  return 0;
 }
 
 StatusOr<std::string_view> Page::Read(Transaction& txn, slot_t slot) const {
@@ -159,7 +163,8 @@ StatusOr<std::string_view> Page::Read(Transaction& txn, slot_t slot) const {
   if (type == PageType::kLeafPage) {
     return body.leaf_page.Read(PageID(), txn, slot);
   }
-  throw std::runtime_error("invalid page type");
+  return StatusError(StatusCode::kInvalidArgument,
+                     "Page::Read(slot) on " + PageTypeString(type));
 }
 
 std::string_view Page::GetKey(slot_t slot) const {
@@ -169,8 +174,9 @@ std::string_view Page::GetKey(slot_t slot) const {
     case PageType::kBranchPage:
       return body.branch_page.GetKey(slot);
     default:
-      throw std::runtime_error("GetKey is not implemented for: " +
-                               PageTypeString(type));
+      CHECK_MSG(false,
+                "GetKey is not implemented for: " + PageTypeString(type));
+      return "";
   }
 }
 
@@ -218,7 +224,9 @@ slot_t Page::RowCount() const {
     case PageType::kBranchPage:
       return body.branch_page.RowCount();
     default:
-      throw std::runtime_error("RowCount is not implemented");
+      CHECK_MSG(false,
+                "RowCount is not implemented for " + PageTypeString(type));
+      return 0;
   }
 }
 
@@ -231,7 +239,9 @@ StatusOr<std::string_view> Page::ReadKey(Transaction& txn, slot_t slot) const {
     case PageType::kBranchPage:
       return body.branch_page.GetKey(slot);
     default:
-      throw std::runtime_error("ReadKey is not implemented");
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "ReadKey is not implemented for " + PageTypeString(type));
   }
 }
 
@@ -268,8 +278,9 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
       result = body.branch_page.Delete(PageID(), txn, key);
       break;
     default:
-      throw std::runtime_error("Invalid page type for delete: " +
-                               PageTypeString(type));
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Invalid page type for delete: " + PageTypeString(type));
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
@@ -322,11 +333,12 @@ StatusOr<page_id_t> Page::GetPageForKey(Transaction& txn, std::string_view key,
   return body.branch_page.GetPageForKey(txn, key, less_than);
 }
 
-void Page::SetLowestValue(Transaction& txn, page_id_t v) {
+Status Page::SetLowestValue(Transaction& txn, page_id_t v) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage);
-  body.branch_page.SetLowestValue(PageID(), txn, v);
+  RETURN_IF_FAIL(body.branch_page.SetLowestValue(PageID(), txn, v));
   SetPageLSN(txn.PrevRecordEndLSN());
   SetRecLSN(txn.PrevRecordEndLSN());
+  return Status::kSuccess;
 }
 
 void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
@@ -335,11 +347,12 @@ void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
   body.branch_page.Split(PageID(), txn, new_key, right, middle);
 }
 
-void Page::PageTypeChange(Transaction& txn, PageType new_type) {
+Status Page::PageTypeChange(Transaction& txn, PageType new_type) {
   PageTypeChangeImpl(new_type);
-  txn.AllocatePageLog(page_id, new_type);
+  RETURN_IF_FAIL(txn.AllocatePageLog(page_id, new_type).GetStatus());
   SetPageLSN(txn.PrevRecordEndLSN());
   SetRecLSN(txn.PrevRecordEndLSN());
+  return Status::kSuccess;
 }
 
 namespace {
@@ -410,7 +423,8 @@ Status Page::SetLowFence(Transaction& txn, const IndexKey& key) {
       result = body.branch_page.SetLowFence(PageID(), txn, key);
       break;
     default:
-      throw std::runtime_error("Invalid page type");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Invalid page type: " + PageTypeString(type));
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
@@ -429,7 +443,8 @@ Status Page::SetHighFence(Transaction& txn, const IndexKey& key) {
       result = body.branch_page.SetHighFence(PageID(), txn, key);
       break;
     default:
-      throw std::runtime_error("Invalid page type");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Invalid page type: " + PageTypeString(type));
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
@@ -439,29 +454,21 @@ Status Page::SetHighFence(Transaction& txn, const IndexKey& key) {
 }
 
 IndexKey Page::GetLowFence(Transaction& /*txn*/) const {
-  switch (type) {
-    case PageType::kLeafPage:
-      return body.leaf_page.GetLowFence();
-      break;
-    case PageType::kBranchPage:
-      return body.branch_page.GetLowFence();
-      break;
-    default:
-      throw std::runtime_error("Invalid page type");
+  CHECK_MSG(type == PageType::kLeafPage || type == PageType::kBranchPage,
+            "GetLowFence on invalid page type: " + PageTypeString(type));
+  if (type == PageType::kLeafPage) {
+    return body.leaf_page.GetLowFence();
   }
+  return body.branch_page.GetLowFence();
 }
 
 IndexKey Page::GetHighFence(Transaction& /*txn*/) const {
-  switch (type) {
-    case PageType::kLeafPage:
-      return body.leaf_page.GetHighFence();
-      break;
-    case PageType::kBranchPage:
-      return body.branch_page.GetHighFence();
-      break;
-    default:
-      throw std::runtime_error("Invalid page type");
+  CHECK_MSG(type == PageType::kLeafPage || type == PageType::kBranchPage,
+            "GetHighFence on invalid page type: " + PageTypeString(type));
+  if (type == PageType::kLeafPage) {
+    return body.leaf_page.GetHighFence();
   }
+  return body.branch_page.GetHighFence();
 }
 
 Status Page::SetFoster(Transaction& txn, const FosterPair& foster) {
@@ -474,7 +481,8 @@ Status Page::SetFoster(Transaction& txn, const FosterPair& foster) {
       result = body.branch_page.SetFoster(PageID(), txn, foster);
       break;
     default:
-      throw std::runtime_error("Invalid page type");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Invalid page type: " + PageTypeString(type));
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
@@ -487,13 +495,12 @@ StatusOr<FosterPair> Page::GetFoster(Transaction& /*txn*/) const {
   switch (type) {
     case PageType::kLeafPage:
       return body.leaf_page.GetFoster();
-      break;
     case PageType::kBranchPage:
       return body.branch_page.GetFoster();
-      break;
     default:
-      throw std::runtime_error("Invalid page type for GetFoster: " +
-                               PageTypeString(type));
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Invalid page type for GetFoster: " + PageTypeString(type));
   }
 }
 
@@ -504,7 +511,8 @@ Status Page::MoveRightToFoster(Transaction& txn, Page& foster) {
     case PageType::kBranchPage:
       return body.branch_page.MoveRightToFoster(txn, foster);
     default:
-      throw std::runtime_error("Invalid page type");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Invalid page type: " + PageTypeString(type));
   }
 }
 
@@ -515,7 +523,8 @@ Status Page::MoveLeftFromFoster(Transaction& txn, Page& foster) {
     case PageType::kBranchPage:
       return body.branch_page.MoveLeftFromFoster(txn, foster);
     default:
-      throw std::runtime_error("Invalid page type");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Invalid page type: " + PageTypeString(type));
   }
 }
 
@@ -528,7 +537,8 @@ void Page::SetLowFenceImpl(const IndexKey& key) {
       body.branch_page.SetLowFenceImpl(key);
       return;
     default:
-      throw std::runtime_error("Invalid page type");
+      CHECK_MSG(false, "SetLowFenceImpl on invalid page type: " +
+                           PageTypeString(type));
   }
 }
 
@@ -541,7 +551,8 @@ void Page::SetHighFenceImpl(const IndexKey& key) {
       body.branch_page.SetHighFenceImpl(key);
       return;
     default:
-      throw std::runtime_error("Invalid page type");
+      CHECK_MSG(false, "SetHighFenceImpl on invalid page type: " +
+                           PageTypeString(type));
   }
 }
 
@@ -554,7 +565,8 @@ void Page::SetFosterImpl(const FosterPair& foster) {
       body.branch_page.SetFosterImpl(foster);
       return;
     default:
-      throw std::runtime_error("Invalid page type");
+      CHECK_MSG(false,
+                "SetFosterImpl on invalid page type: " + PageTypeString(type));
   }
 }
 

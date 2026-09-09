@@ -24,6 +24,12 @@ class Transaction;
 // statically owning a table partition, which balances uneven page occupancy.
 class ParallelScan final : public ExecutorBase {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  ParallelScan(const ParallelScan&) = delete;
+  ParallelScan& operator=(const ParallelScan&) = delete;
+  ParallelScan(ParallelScan&&) = delete;
+  ParallelScan& operator=(ParallelScan&&) = delete;
   ParallelScan(Transaction& txn, const Table& table,
                size_t worker_count = std::thread::hardware_concurrency(),
                size_t pages_per_morsel = 8,

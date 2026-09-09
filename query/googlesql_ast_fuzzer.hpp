@@ -29,13 +29,9 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   if (!ast.HasValue()) {
     return;
   }
-  try {
-    std::unique_ptr<Statement> statement =
-        GoogleSqlAstVisitor::Visit(*ast.Value());
-    if (verbose) {
-      LOG(TRACE) << "visited root: " << (statement != nullptr ? "ok" : "null");
-    }
-  } catch (const std::exception&) {
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+  if (verbose) {
+    LOG(TRACE) << "visited root: " << (visited.HasValue() ? "ok" : "error");
   }
 }
 

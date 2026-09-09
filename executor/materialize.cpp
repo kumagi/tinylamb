@@ -36,6 +36,9 @@ void MaterializeExecutor::EnsureMaterialized() {
     est_bytes += EstimateRowBytes(row) + sizeof(RowPosition) + sizeof(void*);
     rows_.emplace_back(std::move(row), rp);
   }
+  if (child_) {
+    FailWithChildOf(*child_);
+  }
   charge_.Add(est_bytes);
   // Latch only after the drain completed: a child that throws mid-drain must
   // leave the executor unmaterialized so a retry does not serve a truncated

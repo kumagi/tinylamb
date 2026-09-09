@@ -63,7 +63,7 @@ class CacheTest : public ::testing::Test {
     ASSERT_EQ(written, value.size() * sizeof(int));
     ::fsync(fd_);
     ASSERT_EQ(std::filesystem::file_size(path_), kSize * sizeof(int));
-    cache_ = std::make_unique<Cache>(fd_, 32 * 1024);
+    cache_ = Cache::Create(fd_, static_cast<size_t>(32 * 1024)).MoveValue();
   }
 
   void TearDown() override {
@@ -71,7 +71,7 @@ class CacheTest : public ::testing::Test {
     std::ignore = std::remove(path_.c_str());
   }
 
-  static int Expected(size_t pos) {
+  int Expected(size_t pos) {
     return static_cast<int>(static_cast<size_t>(kSeed) +
                             std::hash<size_t>()(pos));
   }
@@ -87,7 +87,8 @@ TEST_F(CacheTest, one_page) {
   // cache Act -- read 1024 sequential 4-byte ints at stride 4
   for (int i = 0; i < 1024; ++i) {
     std::string data =
-        cache_->ReadAt(static_cast<size_t>(i) * sizeof(int), sizeof(int));
+        cache_->ReadAt(static_cast<size_t>(i) * sizeof(int), sizeof(int))
+            .MoveValue();
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
 
     // Assert -- each read yields the deterministic Expected(i) value
@@ -100,8 +101,9 @@ TEST_F(CacheTest, mega_page) {
   // cache Act -- read 1024 sequential 4-byte ints at stride 4096 (1 MiB page
   // boundaries)
   for (int i = 0; i < 1024; ++i) {
-    std::string data = cache_->ReadAt(
-        static_cast<size_t>(i) * 1024 * sizeof(int), sizeof(int));
+    std::string data =
+        cache_->ReadAt(static_cast<size_t>(i) * 1024 * sizeof(int), sizeof(int))
+            .MoveValue();
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
 
     // Assert -- each read yields the deterministic Expected(i*1024) value
@@ -114,8 +116,11 @@ TEST_F(CacheTest, mega_pages) {
   // cache Act -- read 4 sequential 4-byte ints at stride 1 MiB (full page
   // boundaries)
   for (int i = 0; i < 4; ++i) {
-    std::string data = cache_->ReadAt(
-        static_cast<size_t>(i) * 1024 * 1024 * sizeof(int), sizeof(int));
+    std::string data =
+        cache_
+            ->ReadAt(static_cast<size_t>(i) * 1024 * 1024 * sizeof(int),
+                     sizeof(int))
+            .MoveValue();
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
 
     // Assert -- each read yields the deterministic Expected(i*1024*1024) value
@@ -129,8 +134,9 @@ TEST_F(CacheTest, read_at_with_locks) {
   for (int i = 0; i < 1024; i += 32) {
     std::string_view out;
     {
-      Cache::Locks locks = cache_->ReadAt(static_cast<size_t>(i) * sizeof(int),
-                                          sizeof(int), out);
+      Cache::Locks locks =
+          cache_->ReadAt(static_cast<size_t>(i) * sizeof(int), sizeof(int), out)
+              .MoveValue();
       int data_as_int = *(reinterpret_cast<const int*>(out.data()));
       // Assert -- the locked view matches the deterministic file content
       ASSERT_EQ(data_as_int, Expected(static_cast<size_t>(i)));
@@ -150,7 +156,7 @@ TEST_F(CacheTest, copy_unaligned_across_page_boundary) {
   ASSERT_EQ(second, Expected(1024));
 
   // Act -- read an unaligned 4-byte window that overlaps the boundary
-  std::string raw = cache_->ReadAt(4094, 4);
+  std::string raw = cache_->ReadAt(4094, 4).MoveValue();
   // Assert -- the window is the tail of Expected(1023) then the head of
   // Expected(1024) under little-endian byte order
   const int lo = Expected(1023);
@@ -169,10 +175,10 @@ TEST_F(CacheTest, copy_unaligned_across_page_boundary) {
 TEST_F(CacheTest, read_zero_length_and_boundary_bytes) {
   // Arrange -- default 4 MiB file
   // Act -- read zero bytes and a single byte at page boundaries
-  std::string empty = cache_->ReadAt(4096, 0);
+  std::string empty = cache_->ReadAt(4096, 0).MoveValue();
   ASSERT_TRUE(empty.empty());
-  std::string first_byte = cache_->ReadAt(0, 1);
-  std::string last_page_first_byte = cache_->ReadAt(4096, 1);
+  std::string first_byte = cache_->ReadAt(0, 1).MoveValue();
+  std::string last_page_first_byte = cache_->ReadAt(4096, 1).MoveValue();
   // Assert -- both boundary reads return exactly one byte of file content
   ASSERT_EQ(first_byte.size(), 1U);
   ASSERT_EQ(last_page_first_byte.size(), 1U);
@@ -184,12 +190,14 @@ TEST_F(CacheTest, invalidate_then_reread) {
   // small queue holds exactly one page; after Invalidate() the evicted page is
   // still queued, so a re-read re-locks it while it is the queue front and
   // Cache::EnqueueToSmallFifo() spins forever in the kLocked arm.)
-  Cache wide(fd_, size_t{256} * 1024);
-  ASSERT_EQ(wide.ReadAt(0, sizeof(int)).size(), sizeof(int));
+  auto wide_holder = Cache::Create(fd_, size_t{256} * 1024).MoveValue();
+  CHECK(wide_holder != nullptr);
+  Cache& wide = *wide_holder;
+  ASSERT_EQ(wide.ReadAt(0, sizeof(int)).Value().size(), sizeof(int));
 
   // Act -- invalidate the first 4 KiB and read the same int again
   wide.Invalidate(0, size_t{4} * 1024);
-  std::string data = wide.ReadAt(0, sizeof(int));
+  std::string data = wide.ReadAt(0, sizeof(int)).MoveValue();
 
   // Assert -- the page is transparently reloaded from the file
   int data_as_int = *(reinterpret_cast<int*>(data.data()));
@@ -200,7 +208,7 @@ TEST_F(CacheTest, invalidate_fresh_pages_is_noop) {
   // Arrange -- default 4 MiB file; the first two pages were never touched
   // Act -- invalidate a never-cached range, then read through it
   cache_->Invalidate(0, size_t{4} * 1024);
-  std::string data = cache_->ReadAt(0, sizeof(int));
+  std::string data = cache_->ReadAt(0, sizeof(int)).MoveValue();
   int data_as_int = *(reinterpret_cast<int*>(data.data()));
   ASSERT_EQ(data_as_int, Expected(0));
 
@@ -226,11 +234,16 @@ TEST_F(CacheTest, dump_and_stream_operator) {
 TEST_F(CacheTest, explicit_max_size_constructor) {
   // Arrange -- construct a cache whose max_size is given explicitly instead of
   // being derived from the file size
-  Cache capped(fd_, size_t{32} * 1024, size_t{2} * 1024 * 1024);
+  auto capped_holder =
+      Cache::Create(fd_, size_t{32} * 1024, size_t{2} * 1024 * 1024)
+          .MoveValue();
+  CHECK(capped_holder != nullptr);
+  Cache& capped = *capped_holder;
   // Act -- read ints spread across the capped address space
   for (int i = 0; i < 128; ++i) {
     std::string data =
-        capped.ReadAt(static_cast<size_t>(i) * 1024 * sizeof(int), sizeof(int));
+        capped.ReadAt(static_cast<size_t>(i) * 1024 * sizeof(int), sizeof(int))
+            .MoveValue();
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
     // Assert -- each read yields the deterministic Expected(i*1024) value
     ASSERT_EQ(data_as_int, Expected(static_cast<size_t>(i) * 1024));
@@ -240,10 +253,13 @@ TEST_F(CacheTest, explicit_max_size_constructor) {
 TEST_F(CacheTest, eviction_across_tiny_cache) {
   // Arrange -- a 2-page cache forces the small/ghost queues to evict on every
   // other distinct page touch
-  Cache tiny(fd_, size_t{2} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{2} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   // Act -- touch 16 distinct pages, far more than fit in the 2-page cache
   for (int i = 0; i < 16; ++i) {
-    std::string data = tiny.ReadAt(static_cast<size_t>(i) * 4096, sizeof(int));
+    std::string data =
+        tiny.ReadAt(static_cast<size_t>(i) * 4096, sizeof(int)).MoveValue();
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
     // Assert -- eviction never corrupts the read value
     ASSERT_EQ(data_as_int, Expected(static_cast<size_t>(i) * 1024));
@@ -256,7 +272,7 @@ TEST_F(CacheTest, locked_read_spans_page_boundary) {
   // lock-returning overload (fixes two pages at once)
   std::string_view out;
   {
-    Cache::Locks locks = cache_->ReadAt(4090, 20, out);
+    Cache::Locks locks = cache_->ReadAt(4090, 20, out).MoveValue();
     ASSERT_EQ(out.size(), 20U);
   }
 }
@@ -266,7 +282,7 @@ TEST_F(CacheTest, locked_read_within_single_page) {
   // Act -- read one int via the lock-returning overload within a single page
   std::string_view out;
   {
-    Cache::Locks locks = cache_->ReadAt(1000, sizeof(int), out);
+    Cache::Locks locks = cache_->ReadAt(1000, sizeof(int), out).MoveValue();
     ASSERT_EQ(out.size(), sizeof(int));
     int value = 0;
     ::memcpy(&value, out.data(), sizeof(int));
@@ -279,7 +295,7 @@ TEST_F(CacheTest, reaccess_promotes_to_accessed_state) {
   // Act -- read the same page repeatedly; the second FixPage sees kUnlocked
   // and promotes to kLockedAccessed, so UnfixPage demotes to kUnlockedAccessed
   for (int i = 0; i < 4; ++i) {
-    std::string data = cache_->ReadAt(0, sizeof(int));
+    std::string data = cache_->ReadAt(0, sizeof(int)).MoveValue();
     ASSERT_EQ(*(reinterpret_cast<int*>(data.data())), Expected(0));
   }
   // Act -- stream the cache; SanityCheck runs over the (multi-access) queue
@@ -290,9 +306,11 @@ TEST_F(CacheTest, reaccess_promotes_to_accessed_state) {
 
 TEST_F(CacheTest, eviction_promotes_through_ghost_queue) {
   // Arrange -- 3-page cache: small_queue=1, main_queue=2, ghost_queue=2
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t page) {
-    std::string data = tiny.ReadAt(page * 4096, sizeof(int));
+    std::string data = tiny.ReadAt(page * 4096, sizeof(int)).MoveValue();
     return *(reinterpret_cast<int*>(data.data()));
   };
   // Act -- a sequence that pushes pages through small -> ghost -> main queues:
@@ -329,7 +347,9 @@ TEST_F(CacheTest, copy_spanning_multiple_pages) {
 
 TEST_F(CacheTest, invalidate_spanning_pages) {
   // Arrange -- a cache large enough to hold all four pages at once
-  Cache wide(fd_, size_t{256} * 1024);
+  auto wide_holder = Cache::Create(fd_, size_t{256} * 1024).MoveValue();
+  CHECK(wide_holder != nullptr);
+  Cache& wide = *wide_holder;
   for (int i = 0; i < 4; ++i) {
     std::ignore = wide.ReadAt(static_cast<size_t>(i) * 4096, sizeof(int));
   }
@@ -337,7 +357,8 @@ TEST_F(CacheTest, invalidate_spanning_pages) {
   wide.Invalidate(0, size_t{2} * 4096);
   // Assert -- every page transparently reloads from the file afterwards
   for (int i = 0; i < 4; ++i) {
-    std::string data = wide.ReadAt(static_cast<size_t>(i) * 4096, sizeof(int));
+    std::string data =
+        wide.ReadAt(static_cast<size_t>(i) * 4096, sizeof(int)).MoveValue();
     ASSERT_EQ(*(reinterpret_cast<int*>(data.data())),
               Expected(static_cast<size_t>(i) * 1024));
   }
@@ -345,16 +366,19 @@ TEST_F(CacheTest, invalidate_spanning_pages) {
 
 TEST_F(CacheTest, capped_max_size_limits_address_space) {
   // Arrange -- a cache whose max_size (2 pages) is smaller than the 4 MiB file
-  Cache capped(fd_, size_t{16} * 1024, size_t{2} * 4096);
+  auto capped_holder =
+      Cache::Create(fd_, size_t{16} * 1024, size_t{2} * 4096).MoveValue();
+  CHECK(capped_holder != nullptr);
+  Cache& capped = *capped_holder;
   // Act -- read the first int of each of the two mapped pages
   for (int i = 0; i < 2; ++i) {
     std::string data =
-        capped.ReadAt(static_cast<size_t>(i) * 4096, sizeof(int));
+        capped.ReadAt(static_cast<size_t>(i) * 4096, sizeof(int)).MoveValue();
     ASSERT_EQ(*(reinterpret_cast<int*>(data.data())),
               Expected(static_cast<size_t>(i) * 1024));
   }
   // Assert -- a single-byte read at the very end of the address space works
-  std::string boundary = capped.ReadAt((2 * 4096) - 1, 1);
+  std::string boundary = capped.ReadAt((2 * 4096) - 1, 1).MoveValue();
   ASSERT_EQ(boundary.size(), 1U);
 }
 
@@ -371,7 +395,10 @@ TEST_F(CacheTest, invalidate_beyond_max_size_indexes_meta_out_of_bounds) {
   constexpr size_t kMaxFileSize =
       size_t{4} * 4096;  // 16 KiB cache address space
   {
-    BlobFile blob(path, size_t{256} * 1024, kMaxFileSize);
+    auto blob_holder =
+        BlobFile::Create(path, size_t{256} * 1024, kMaxFileSize).MoveValue();
+    CHECK(blob_holder != nullptr);
+    BlobFile& blob = *blob_holder;
 
     // Act -- append 16 KiB, filling the file to exactly max_size_, then append
     // a second page.  The second Append() runs Cache::Invalidate(16384, 4096),
@@ -379,7 +406,7 @@ TEST_F(CacheTest, invalidate_beyond_max_size_indexes_meta_out_of_bounds) {
     // meta_[5], one past the 5-entry meta_ vector (heap-buffer-overflow).
     blob.Append(std::string(size_t{4} * 4096, 'a'));
     blob.Append(std::string(4096, 'b'));
-    blob.Flush();
+    (void)blob.Flush();
   }
   std::filesystem::remove(path);
 }
@@ -390,7 +417,10 @@ TEST_F(CacheTest, locked_read_past_max_size_indexes_meta_out_of_bounds) {
   // small queue never fills while the first pages are being fixed (a full
   // 1-page small queue would otherwise spin in EnqueueToSmallFifo on a kLocked
   // front element).  The file backing the cache is the 4 MiB SetUp file.
-  Cache capped(fd_, size_t{1024} * 1024, size_t{4} * 4096);
+  auto capped_holder =
+      Cache::Create(fd_, size_t{1024} * 1024, size_t{4} * 4096).MoveValue();
+  CHECK(capped_holder != nullptr);
+  Cache& capped = *capped_holder;
 
   // Act -- request 20 KiB through the lock-returning overload.  Cache::ReadAt()
   // (cache.cpp:86) computes last_page == (offset + length) / kBlockSize == 5
@@ -399,16 +429,18 @@ TEST_F(CacheTest, locked_read_past_max_size_indexes_meta_out_of_bounds) {
   // Invalidate, no guard is attempted at all here.
   std::string_view out;
   // (Crash happens inside ReadAt; the Locks are never returned.)
-  Cache::Locks locks = capped.ReadAt(0, size_t{5} * 4096, out);
+  Cache::Locks locks = capped.ReadAt(0, size_t{5} * 4096, out).MoveValue();
   (void)locks;
   (void)out;
 }
 
 TEST_F(CacheTest, UnalignedReadsFillGhostQueue) {
   // Arrange -- a 3-page cache (small=1, main=2, ghost=2).
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     int value = 0;
     ::memcpy(&value, data.data(), sizeof(int));
     return value;
@@ -434,9 +466,11 @@ TEST_F(CacheTest, UnalignedReadsFillGhostQueue) {
 
 TEST_F(CacheTest, GhostOverflowEvictsMarkedEntry) {
   // Arrange -- a 3-page cache (small=1, main=2, ghost=2).
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     int value = 0;
     ::memcpy(&value, data.data(), sizeof(int));
     return value;
@@ -461,9 +495,11 @@ TEST_F(CacheTest, RevivedGhostPageMovesToMainQueueOnOverflow) {
   // Arrange -- a 3-page cache (small=1, main=2, ghost=2).  VMCacheImpl FixPage
   // on a kMarked (ghost) page removes it from the ghost FIFO and enqueues it
   // to the main queue immediately.
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     int value = 0;
     ::memcpy(&value, data.data(), sizeof(int));
     return value;
@@ -491,9 +527,11 @@ TEST_F(CacheTest, RevivedGhostPageMovesToMainQueueOnOverflow) {
 TEST_F(CacheTest, AccessedGhostPageMovesToMainQueueOnOverflow) {
   // Arrange -- a 3-page cache.  Re-reading a revived ghost page a second time
   // leaves it kUnlockedAccessed inside the ghost FIFO.
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     int value = 0;
     ::memcpy(&value, data.data(), sizeof(int));
     return value;
@@ -516,9 +554,11 @@ TEST_F(CacheTest, AccessedGhostPageMovesToMainQueueOnOverflow) {
 
 TEST_F(CacheTest, MultiEntryDumpCoversAllThreeQueues) {
   // Arrange -- a 20-page cache (small=2, main=18, ghost=18).
-  Cache wide(fd_, size_t{20} * 4096);
+  auto wide_holder = Cache::Create(fd_, size_t{20} * 4096).MoveValue();
+  CHECK(wide_holder != nullptr);
+  Cache& wide = *wide_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = wide.ReadAt(byte_offset, sizeof(int));
+    std::string data = wide.ReadAt(byte_offset, sizeof(int)).MoveValue();
     int value = 0;
     ::memcpy(&value, data.data(), sizeof(int));
     return value;
@@ -556,39 +596,34 @@ TEST_F(CacheTest, LockedReadEarlyReturnsForOutOfRangeAndEmpty) {
   // Act -- lock-returning read at and beyond max_size_, and zero length.
   std::string_view out;
   {
-    Cache::Locks locks = cache_->ReadAt(kMaxSize, sizeof(int), out);
+    Cache::Locks locks = cache_->ReadAt(kMaxSize, sizeof(int), out).MoveValue();
     ASSERT_TRUE(locks.empty());
     ASSERT_EQ(out.size(), 0U);
   }
   {
-    Cache::Locks locks = cache_->ReadAt(0, 0, out);
+    Cache::Locks locks = cache_->ReadAt(0, 0, out).MoveValue();
     ASSERT_TRUE(locks.empty());
     ASSERT_EQ(out.size(), 0U);
   }
 
   // Act -- a lock-returning read clamped to the very end of the address space.
   {
-    Cache::Locks locks = cache_->ReadAt(kMaxSize - 2, 4, out);
+    Cache::Locks locks = cache_->ReadAt(kMaxSize - 2, 4, out).MoveValue();
     ASSERT_EQ(out.size(), 2U);
     ASSERT_EQ(locks.size(), 1U);
   }
 }
 
-TEST_F(CacheTest, ZeroCapacityConstructorThrows) {
-  // A zero-byte memory budget is rejected by the constructor: the cache would
-  // be unusable, so it throws instead of completing.
-  EXPECT_THROW(Cache zero(fd_, 0), std::exception);
+TEST_F(CacheTest, ZeroCapacityIsRejected) {
+  // A zero-byte memory budget is rejected at creation: the cache would be
+  // unusable, so Create reports a Status instead of constructing.
+  EXPECT_FALSE(Cache::Create(fd_, 0).HasValue());
 }
 
-TEST(CacheInvalidFd, ConstructorLogsFileSizeFailure) {
-  // Invalid fd makes FileSize() throw before meta_/mmap, so the constructor
-  // fails without expanding max_size_ to SIZE_MAX.
-  try {
-    Cache bad(-1, 4096);
-    FAIL() << "Cache constructor should throw after FileSize() failure";
-  } catch (const std::exception&) {
-    SUCCEED();
-  }
+TEST(CacheInvalidFd, ReportsFileSizeFailure) {
+  // An invalid fd fails FileSize() before meta_/mmap, so creation reports an
+  // error instead of expanding max_size_ to SIZE_MAX.
+  EXPECT_FALSE(Cache::Create(-1, 4096).HasValue());
 }
 
 TEST_F(CacheTest, InvalidateZeroLengthIsNoop) {
@@ -597,7 +632,7 @@ TEST_F(CacheTest, InvalidateZeroLengthIsNoop) {
   cache_->Invalidate(4096, 0);
 
   // Assert -- the (never-cached) first page is untouched and reads correctly.
-  std::string data = cache_->ReadAt(0, sizeof(int));
+  std::string data = cache_->ReadAt(0, sizeof(int)).MoveValue();
   ASSERT_EQ(data.size(), sizeof(int));
   ASSERT_EQ(*(reinterpret_cast<int*>(data.data())), Expected(0));
 }
@@ -607,12 +642,14 @@ TEST_F(CacheTest, LockedReadSpansPageWithCorrectContent) {
   // within the same ReadAt call (the lock-returning overload only pins pages
   // weakly, so a small cache zeroes earlier pages -- see
   // UnalignedLockedReadAcrossPageBoundary).
-  Cache wide(fd_, size_t{1024} * 1024);
+  auto wide_holder = Cache::Create(fd_, size_t{1024} * 1024).MoveValue();
+  CHECK(wide_holder != nullptr);
+  Cache& wide = *wide_holder;
 
   // Act -- read 16 bytes starting exactly at the page boundary.
   std::string_view out;
   {
-    Cache::Locks locks = wide.ReadAt(4092, 16, out);
+    Cache::Locks locks = wide.ReadAt(4092, 16, out).MoveValue();
 
     // Assert -- two pages are fixed and the window decodes to four ints.
     ASSERT_EQ(locks.size(), 2U);
@@ -645,7 +682,7 @@ TEST_F(CacheTest, UnalignedLockedReadAcrossPageBoundary) {
   // window crosses the boundary without being int-aligned.
   std::string_view out;
   {
-    Cache::Locks locks = cache_->ReadAt(4094, 6, out);
+    Cache::Locks locks = cache_->ReadAt(4094, 6, out).MoveValue();
     ASSERT_EQ(locks.size(), 2U);
     ASSERT_EQ(out.size(), 6U);
     const int lo = Expected(1023);
@@ -672,9 +709,11 @@ TEST_F(CacheTest, AccessedMainQueueOverflowReenqueuesFront) {
   // Arrange -- a 3-page cache (small=1, main=2, ghost=2).  Revived ghost
   // pages move into the main queue on FixPage; overflow then promotes accessed
   // ghost pages and demotes the main-queue front.
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     int value = 0;
     ::memcpy(&value, data.data(), sizeof(int));
     return value;
@@ -724,10 +763,13 @@ TEST_F(CacheTest, AccessedMainQueueOverflowReenqueuesFront) {
 TEST_F(CacheTest, ReadingPastFileEndInMaxSizeLargerCacheReturnsZeroes) {
   // Arrange -- max_size (32 MiB) is larger than the 16 MiB fixture file, so
   // page 4096 lies entirely past the end of the real file.
-  Cache beyond(fd_, size_t{1024} * 1024, 32L * 1024 * 1024);
+  auto beyond_holder =
+      Cache::Create(fd_, size_t{1024} * 1024, 32L * 1024 * 1024).MoveValue();
+  CHECK(beyond_holder != nullptr);
+  Cache& beyond = *beyond_holder;
 
   // Act -- read 4 bytes at the real file end (offset 16 MiB).
-  std::string z = beyond.ReadAt(16L * 1024 * 1024, 4);
+  std::string z = beyond.ReadAt(16L * 1024 * 1024, 4).MoveValue();
 
   // Assert -- Activate()'s EOF short-read path leaves the anonymous buffer
   // zeroed rather than crashing or returning garbage.
@@ -737,7 +779,7 @@ TEST_F(CacheTest, ReadingPastFileEndInMaxSizeLargerCacheReturnsZeroes) {
   }
 
   // Act -- read a 4-byte window straddling the real EOF.
-  std::string straddle = beyond.ReadAt((16L * 1024 * 1024) - 2, 4);
+  std::string straddle = beyond.ReadAt((16L * 1024 * 1024) - 2, 4).MoveValue();
 
   // Assert -- the last two bytes (past the file end) read as zeroes.
   ASSERT_EQ(straddle.size(), 4U);
@@ -752,9 +794,11 @@ TEST_F(CacheTest, ReadingPastFileEndInMaxSizeLargerCacheReturnsZeroes) {
 // page 2 is evicted to the ghost queue instead.
 TEST_F(CacheTest, SmallFifoRotatesPinnedPagesThenEvictsUnlockedFront) {
   // Arrange -- a cache whose small FIFO holds exactly three entries.
-  Cache wide(fd_, size_t{24} * 4096);
+  auto wide_holder = Cache::Create(fd_, size_t{24} * 4096).MoveValue();
+  CHECK(wide_holder != nullptr);
+  Cache& wide = *wide_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = wide.ReadAt(byte_offset, sizeof(int));
+    std::string data = wide.ReadAt(byte_offset, sizeof(int)).MoveValue();
     return *(reinterpret_cast<const int*>(data.data()));
   };
 
@@ -762,8 +806,8 @@ TEST_F(CacheTest, SmallFifoRotatesPinnedPagesThenEvictsUnlockedFront) {
   // unlocked pages 2 and 3.
   std::string_view out;
   {
-    Cache::Locks locks0 = wide.ReadAt(0, 8, out);
-    Cache::Locks locks1 = wide.ReadAt(4096, 8, out);
+    Cache::Locks locks0 = wide.ReadAt(0, 8, out).MoveValue();
+    Cache::Locks locks1 = wide.ReadAt(4096, 8, out).MoveValue();
     ASSERT_EQ(wide.Dump(), "[0, 1] {} []");
     read_int((2 * 4096) + 8);
     read_int((3 * 4096) + 8);
@@ -784,9 +828,11 @@ TEST_F(CacheTest, SmallFifoRotatesPinnedPagesThenEvictsUnlockedFront) {
 // EnqueueToSmallFifo) rather than being evicted.
 TEST_F(CacheTest, SmallFifoPromotesPinnedAccessedPageToMainQueue) {
   // Arrange -- a 3-page budget (small=1, main=2, ghost=2).
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     return *(reinterpret_cast<const int*>(data.data()));
   };
 
@@ -797,7 +843,7 @@ TEST_F(CacheTest, SmallFifoPromotesPinnedAccessedPageToMainQueue) {
   ASSERT_EQ(tiny.Dump(), "[0] {} []");
   std::string_view out;
   {
-    Cache::Locks locks = tiny.ReadAt(0, sizeof(int), out);
+    Cache::Locks locks = tiny.ReadAt(0, sizeof(int), out).MoveValue();
     read_int(4096 + 8);
   }
 
@@ -813,9 +859,11 @@ TEST_F(CacheTest, SmallFifoPromotesPinnedAccessedPageToMainQueue) {
 // EnqueueToMainFifo).
 TEST_F(CacheTest, MainFifoDemotesPinnedAccessedFrontThenEvictsUnlocked) {
   // Arrange -- a 3-page budget.
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     return *(reinterpret_cast<const int*>(data.data()));
   };
 
@@ -829,7 +877,7 @@ TEST_F(CacheTest, MainFifoDemotesPinnedAccessedFrontThenEvictsUnlocked) {
   ASSERT_EQ(tiny.Dump(), "[2] {0} [1]");
   std::string_view out;
   {
-    Cache::Locks locks = tiny.ReadAt(0, sizeof(int), out);
+    Cache::Locks locks = tiny.ReadAt(0, sizeof(int), out).MoveValue();
     read_int((3 * 4096) + 8);
     read_int((3 * 4096) + 8);
     read_int((4 * 4096) + 8);
@@ -848,9 +896,11 @@ TEST_F(CacheTest, MainFifoDemotesPinnedAccessedFrontThenEvictsUnlocked) {
 // sibling (the kLocked arm of EnqueueToMainFifo).
 TEST_F(CacheTest, MainFifoRotatesPinnedPageThenEvictsUnlockedSibling) {
   // Arrange -- a 3-page budget.
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     return *(reinterpret_cast<const int*>(data.data()));
   };
 
@@ -862,10 +912,10 @@ TEST_F(CacheTest, MainFifoRotatesPinnedPageThenEvictsUnlockedSibling) {
   ASSERT_EQ(tiny.Dump(), "[2] {} [0, 1]");
   std::string_view out;
   {
-    Cache::Locks locks0 = tiny.ReadAt(0, sizeof(int), out);
+    Cache::Locks locks0 = tiny.ReadAt(0, sizeof(int), out).MoveValue();
     {
       std::string_view out2;
-      Cache::Locks locks1 = tiny.ReadAt(4096, sizeof(int), out2);
+      Cache::Locks locks1 = tiny.ReadAt(4096, sizeof(int), out2).MoveValue();
       read_int((3 * 4096) + 8);
       read_int((4 * 4096) + 8);
       ASSERT_EQ(tiny.Dump(), "[4] {0, 1} [2, 3]");
@@ -887,9 +937,11 @@ TEST_F(CacheTest, MainFifoRotatesPinnedPageThenEvictsUnlockedSibling) {
 // overflow rather than spinning forever.
 TEST_F(CacheTest, MainFifoAllPagesPinnedAllowsTemporaryOverflow) {
   // Arrange -- a 3-page budget.
-  Cache tiny(fd_, size_t{3} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{3} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
   auto read_int = [&](size_t byte_offset) {
-    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int)).MoveValue();
     return *(reinterpret_cast<const int*>(data.data()));
   };
 
@@ -901,9 +953,9 @@ TEST_F(CacheTest, MainFifoAllPagesPinnedAllowsTemporaryOverflow) {
   ASSERT_EQ(tiny.Dump(), "[2] {} [0, 1]");
   std::string_view out;
   {
-    Cache::Locks locks0 = tiny.ReadAt(0, sizeof(int), out);
+    Cache::Locks locks0 = tiny.ReadAt(0, sizeof(int), out).MoveValue();
     std::string_view out2;
-    Cache::Locks locks1 = tiny.ReadAt(4096, sizeof(int), out2);
+    Cache::Locks locks1 = tiny.ReadAt(4096, sizeof(int), out2).MoveValue();
     read_int((3 * 4096) + 8);
     read_int((4 * 4096) + 8);
     ASSERT_EQ(tiny.Dump(), "[4] {0, 1} [2, 3]");
@@ -922,10 +974,12 @@ TEST_F(CacheTest, MainFifoAllPagesPinnedAllowsTemporaryOverflow) {
 // so every FixPage/UnfixPage pair stays balanced.
 TEST_F(CacheTest, ReadLargeSpanningBufferOnTinyCache) {
   // Arrange -- a 2-page budget.
-  Cache tiny(fd_, size_t{2} * 4096);
+  auto tiny_holder = Cache::Create(fd_, size_t{2} * 4096).MoveValue();
+  CHECK(tiny_holder != nullptr);
+  Cache& tiny = *tiny_holder;
 
   // Act -- read 64 KiB in one call; the read crosses 16 page boundaries.
-  std::string data = tiny.ReadAt(0, size_t{64} * 1024);
+  std::string data = tiny.ReadAt(0, size_t{64} * 1024).MoveValue();
 
   // Assert -- every int across the span is intact.
   ASSERT_EQ(data.size(), 64U * 1024U);

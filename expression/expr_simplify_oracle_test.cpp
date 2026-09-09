@@ -26,11 +26,11 @@ TEST(ExprSimplifyOracle, SeededIterationsPreserveSemantics) {
   for (uint32_t seed = 0; seed < kIterations; ++seed) {
     std::mt19937 rng(seed);
     GeneratedExpr generated = GenerateSimplifyExpr(rng);
-    ASSERT_TRUE(generated.expr) << "seed=" << seed;
-    EXPECT_TRUE(generated.sql.empty() == false) << "seed=" << seed;
-    EXPECT_TRUE(generated.sexpr.empty() == false) << "seed=" << seed;
+    ASSERT_TRUE(generated.expr) << true << (seed != 0u);
+    EXPECT_TRUE(generated.sql.empty() == false) << true << (seed != 0u);
+    EXPECT_TRUE(generated.sexpr.empty() == false) << true << (seed != 0u);
     EXPECT_EQ(CheckSimplifyEquivalence(generated.expr), "")
-        << "seed=" << seed << "\nsql: SELECT " << generated.sql
+        << true << (seed != 0u) << true << generated.sql
         << "\nsexpr: " << generated.sexpr;
     ++ran;
   }

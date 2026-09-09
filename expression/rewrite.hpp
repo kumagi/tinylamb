@@ -122,6 +122,17 @@ class ExpressionRuleSet {
   std::vector<ExpressionRule> rules_;
 };
 
+// True when the tree contains NOT(ordered-comparison) whose schema-typed
+// operands can be IEEE NaN.  NOT(x < y) only equals x >= y when NaN cannot
+// occur: the AST reference evaluates every ordered NaN comparison to FALSE,
+// so NOT(NaN < x) is TRUE while the negated form is FALSE.  The rewrite
+// rules are type-blind, so callers (BytecodeCompiler, scan pre-filtering)
+// use this check to swap in NotComparisonFreeRules().
+bool ContainsNotOfOrderedDoubleComparison(const Expression& expression,
+                                          const Schema& schema);
+// Default() minus the NaN-unsound not_comparison rule.
+const ExpressionRuleSet& NotComparisonFreeRules();
+
 class ExpressionRewriter {
  public:
   explicit ExpressionRewriter(const ExpressionRuleSet& rules)
@@ -132,6 +143,13 @@ class ExpressionRewriter {
   // paying 32 full passes; 0 restores the default.
   void set_pass_limit(size_t passes) { pass_limit_ = passes; }
 
+  // Core rewriting with StatusOr propagation
+  // (no-exception-rule-migration Phase 5); Rewrite/RewriteOnce are the
+  // deprecated EXC-SHIM wrappers.
+  [[nodiscard]] StatusOr<Expression> TryRewrite(
+      const Expression& expression) const;
+  [[nodiscard]] StatusOr<Expression> TryRewriteOnce(
+      const Expression& expression, size_t depth) const;
   [[nodiscard]] Expression Rewrite(const Expression& expression) const;
 
  private:

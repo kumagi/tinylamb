@@ -55,7 +55,7 @@ class QueryTest : public ::testing::Test {
  public:
   void SetUp() override {
     prefix_ = "query_test-" + RandomString();
-    db_ = std::make_unique<Database>(prefix_);
+    db_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { db_->DeleteAll(); }
@@ -656,8 +656,9 @@ TEST_F(QueryTest, WindowGroupsFrameUsesPeerGroups) {
   input.schema = Schema("", {Column("v", ValueType::kInt64)});
   input.rows = {Row({Value(10)}), Row({Value(10)}), Row({Value(20)}),
                 Row({Value(30)})};
-  auto windowed = relational_detail::ApplyWindows(
-      ctx, statement, std::move(input), nullptr, {});
+  auto windowed = relational_detail::ApplyWindows(ctx, statement,
+                                                  std::move(input), nullptr, {})
+                      .MoveValue();
   std::vector<Row> rows;
   windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
   ASSERT_EQ(rows.size(), 4U);
@@ -689,8 +690,9 @@ TEST_F(QueryTest, WindowFrameExclusionRemovesCurrentRow) {
   relational_detail::Relation input;
   input.schema = Schema("", {Column("v", ValueType::kInt64)});
   input.rows = {Row({Value(10)}), Row({Value(20)}), Row({Value(30)})};
-  auto windowed = relational_detail::ApplyWindows(
-      ctx, statement, std::move(input), nullptr, {});
+  auto windowed = relational_detail::ApplyWindows(ctx, statement,
+                                                  std::move(input), nullptr, {})
+                      .MoveValue();
   std::vector<Row> rows;
   windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
   ASSERT_EQ(rows.size(), 3U);
@@ -726,7 +728,8 @@ TEST_F(QueryTest, WindowFrameExclusionHandlesPeerGroupsAndTies) {
     input.schema = Schema("", {Column("v", ValueType::kInt64)});
     input.rows = {Row({Value(10)}), Row({Value(10)}), Row({Value(20)})};
     auto windowed = relational_detail::ApplyWindows(
-        ctx, statement, std::move(input), nullptr, {});
+                        ctx, statement, std::move(input), nullptr, {})
+                        .MoveValue();
     std::vector<Row> rows;
     windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
     ASSERT_EQ(rows.size(), expected.size());
@@ -1448,9 +1451,9 @@ TEST_F(QueryTest, SqlEngineSelfJoinAmbiguousColumnRejected) {
     } catch (const std::exception& error) {
       rejected = true;
       EXPECT_NE(std::string(error.what()).find("ambiguous"), std::string::npos)
-          << error.what();
+          << (error.what() != nullptr);
     }
-    EXPECT_TRUE(rejected) << "ambiguous column was silently resolved";
+    EXPECT_TRUE(rejected) << true;
   }
 
   ctx.txn_.Abort();
@@ -2080,7 +2083,7 @@ TEST_F(QueryTest, StructConstantFoldingEscapesQuotesAndBackslashes) {
   const std::string json(rows[0][0].value.varchar_value);
   // The quote and backslash must be escaped inside the JSON string value.
   EXPECT_NE(json.find(R"(a\"b\\c)"), std::string::npos)
-      << "unparseable struct JSON: " << json;
+      << true << json;
   EXPECT_NE(json.find(R"("n":3)"), std::string::npos) << json;
   ctx.txn_.Abort();
 }
@@ -2098,7 +2101,9 @@ TEST_F(QueryTest, MixedDottedAndPlainSetTargetsAreRejected) {
   const StatusOr<Executor> prepared =
       engine.Prepare(ctx, "UPDATE mix SET s.a = 20, id = 2 WHERE id = 1;");
   EXPECT_FALSE(prepared.HasValue());
-  EXPECT_EQ(prepared.GetStatus(), Status::kUnknown);
+  EXPECT_EQ(prepared.GetStatus(), Status::kInvalidArgument);
+  EXPECT_NE(prepared.GetStatus().GetMessage().find("cannot mix dotted"),
+            std::string::npos);
   ctx.txn_.Abort();
 }
 
@@ -2118,6 +2123,10 @@ std::vector<Row> RunScalar(TransactionContext& ctx, Database& db,
   Row row;
   while (prepared.Value()->Next(&row, nullptr)) {
     rows.push_back(row);
+  }
+  const Status st = prepared.Value()->GetStatus();
+  if (st != Status::kSuccess) {
+    throw std::runtime_error(st.GetMessage());
   }
   return rows;
 }
@@ -2300,6 +2309,25 @@ TEST_F(QueryTest, SqlEngineRecursiveCteCascadesPlan) {
              "FROM t WHERE n < 5) SELECT SUM(n) FROM t;");
   ASSERT_EQ(total.size(), 1U);
   EXPECT_EQ(total[0][0], Value(15));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineWholeRowRefNestedInExpressionResolves) {
+  // A bare FROM-relation name denotes that relation's whole row (rewritten
+  // into __struct_json__).  When the reference sits INSIDE a composite
+  // expression, the rewrite used to be resolved into a temporary and
+  // dropped, leaving an unresolvable column behind.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE wr (k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO wr VALUES (1);");
+  // Row compared with itself: the struct JSON must round-trip through the
+  // rewrite on both sides of the equality.
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT s = s FROM wr s;"),
+            (std::vector<Row>{Row({Value(true)})}));
+  // A CASE branch and a NOT wrapper carry nested rewrites the same way.
+  EXPECT_EQ(
+      RunSql(ctx, *db_, "SELECT CASE WHEN s = s THEN 7 ELSE 0 END FROM wr s;"),
+      (std::vector<Row>{Row({Value(7)})}));
   ctx.txn_.Abort();
 }
 

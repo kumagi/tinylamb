@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -22,7 +23,7 @@ struct SqlTemplate {
 
 SqlTemplate ExtractSqlTemplate(std::string_view sql);
 
-std::unique_ptr<Statement> BindStatementLiterals(
+StatusOr<std::unique_ptr<Statement>> BindStatementLiterals(
     const Statement& statement, const std::vector<Value>& parameters);
 
 }  // namespace tinylamb

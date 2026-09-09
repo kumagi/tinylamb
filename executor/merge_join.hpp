@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/join_kind.hpp"
 #include "expression/expression.hpp"
@@ -42,6 +43,7 @@ class MergeJoin final : public ExecutorBase {
   // Evaluates the optional residual over `left_rows_[i] + right_rows_[j]`;
   // always true when no residual was supplied.
   [[nodiscard]] bool PairPasses(size_t i, size_t j) const;
+  mutable Status residual_error_{Status::kSuccess};
   [[nodiscard]] Row Concatenate(size_t i, size_t j) const;
 
   Executor left_;

@@ -77,8 +77,8 @@ namespace {
 // qualified star expands only over the matching relation; a star matching no
 // relation (unknown qualifier, or `*` with no FROM) is an error rather than a
 // silently shrunken select list.
-std::vector<NamedExpression> ExpandSelect(const QueryData& query,
-                                          TransactionContext& context) {
+StatusOr<std::vector<NamedExpression>> ExpandSelect(
+    const QueryData& query, TransactionContext& context) {
   const bool has_star =
       std::ranges::any_of(query.select_, [](const NamedExpression& selected) {
         return selected.expression->Type() == TypeTag::kColumnValue &&
@@ -121,9 +121,11 @@ std::vector<NamedExpression> ExpandSelect(const QueryData& query,
       }
     }
     if (!matched_relation) {
-      throw std::runtime_error(
+      return StatusError(
+          StatusCode::kInvalidArgument,
           "unknown relation in select list: " +
-          (requested.schema.empty() ? "*" : requested.schema + ".*"));
+              (requested.schema.empty() ? std::string("*")
+                                        : requested.schema + ".*"));
     }
   }
   return expanded;
@@ -778,15 +780,11 @@ std::optional<SimpleComparison> ExtractSimpleComparison(
 std::optional<bool> EvaluateConstantPredicate(BinaryOperation operation,
                                               const Value& left,
                                               const Value& right) {
-  try {
-    const Value result = EvaluateBinary(operation, left, right);
-    if (result.IsNull()) {
-      return std::nullopt;
-    }
-    return result.Truthy();
-  } catch (const std::exception&) {
+  StatusOr<Value> result = TryEvaluateBinary(operation, left, right);
+  if (!result.HasValue() || result.Value().IsNull()) {
     return std::nullopt;
   }
+  return result.Value().Truthy();
 }
 
 bool ComparisonPairIsContradictory(const SimpleComparison& left,
@@ -1565,7 +1563,8 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     if (!query.order_expressions_[i]) {
       continue;
     }
-    Expression rewritten = value_rewriter.Rewrite(query.order_expressions_[i]);
+    ASSIGN_OR_RETURN(Expression, rewritten,
+                     (value_rewriter.TryRewrite(query.order_expressions_[i])));
     if (rewritten->ToString() != query.order_expressions_[i]->ToString()) {
       order_rewritten = true;
       scalar_normalized.order_expressions_[i] = std::move(rewritten);
@@ -1599,10 +1598,13 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     }
     return Optimize(normalized, ctx, options);
   }
-  std::vector<NamedExpression> expanded_select = ExpandSelect(query, ctx);
+  ASSIGN_OR_RETURN(std::vector<NamedExpression>, expanded_select,
+                   (ExpandSelect(query, ctx)));
   for (NamedExpression& selected : expanded_select) {
     if (selected.expression) {
-      selected.expression = value_rewriter.Rewrite(selected.expression);
+      ASSIGN_OR_RETURN(Expression, rewritten,
+                       (value_rewriter.TryRewrite(selected.expression)));
+      selected.expression = std::move(rewritten);
     }
   }
 
@@ -1626,10 +1628,14 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       return Status::kNotImplemented;
     }
     Plan source = std::make_shared<DummyScanPlan>();
-    const Expression predicate =
-        query.where_
-            ? ExpressionRewriter(options.expression_rules).Rewrite(query.where_)
-            : ConstantValueExp(Value(true));
+    Expression predicate =
+        query.where_ ? Expression{} : ConstantValueExp(Value(true));
+    if (query.where_) {
+      ASSIGN_OR_RETURN(Expression, rewritten,
+                       (ExpressionRewriter(options.expression_rules)
+                            .TryRewrite(query.where_)));
+      predicate = std::move(rewritten);
+    }
     if (predicate && predicate->Type() == TypeTag::kConstantValue) {
       const Value value = predicate->AsConstantValue().GetValue();
       if (value.IsNull() || !value.Truthy()) {
@@ -1652,8 +1658,9 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
 
   const Expression source_predicate =
       query.where_ ? query.where_ : ConstantValueExp(Value(true));
-  Expression predicate =
-      ExpressionRewriter(options.expression_rules).Rewrite(source_predicate);
+  ASSIGN_OR_RETURN(Expression, predicate,
+                   (ExpressionRewriter(options.expression_rules)
+                        .TryRewrite(source_predicate)));
 
   cascades::RuleContext rule_context;
   rule_context.transaction = &ctx;

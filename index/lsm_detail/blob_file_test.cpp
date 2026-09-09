@@ -34,13 +34,13 @@ class BlobFileTest : public ::testing::Test {
  protected:
   void SetUp() override {
     path_ = "tmp_blob_file_test-" + RandomString();
-    blob_ = std::make_unique<BlobFile>(path_);
+    blob_ = BlobFile::Create(path_).MoveValue();
   }
 
   void TearDown() override {
     // Drain the writer explicitly instead of sleeping and hoping.
     if (blob_) {
-      blob_->Flush();
+      (void)blob_->Flush();
     }
     blob_.reset();
     std::filesystem::remove_all(path_);
@@ -55,7 +55,7 @@ TEST_F(BlobFileTest, ReadAt) {
   std::map<std::string, std::string> tree;
   tree.emplace("foo", "barr");
   tree.emplace("value", "notice");
-  auto lg = std::make_unique<Logger>(path_);
+  auto lg = Logger::Create(path_).MoveValue();
 
   // Act -- write each key and value through the Logger, then destroy the logger
   for (const auto& it : tree) {
@@ -65,10 +65,10 @@ TEST_F(BlobFileTest, ReadAt) {
   lg.reset();
 
   // Assert -- read back each entry at the expected offset via BlobFile::ReadAt
-  ASSERT_EQ(blob_->ReadAt(0, 3), "foo");
-  ASSERT_EQ(blob_->ReadAt(3, 4), "barr");
-  ASSERT_EQ(blob_->ReadAt(7, 5), "value");
-  ASSERT_EQ(blob_->ReadAt(12, 6), "notice");
+  ASSERT_EQ(blob_->ReadAt(0, 3).Value(), "foo");
+  ASSERT_EQ(blob_->ReadAt(3, 4).Value(), "barr");
+  ASSERT_EQ(blob_->ReadAt(7, 5).Value(), "value");
+  ASSERT_EQ(blob_->ReadAt(12, 6).Value(), "notice");
 }
 
 namespace {
@@ -85,7 +85,7 @@ std::string EncodeRecord(std::string_view payload) {
 
 TEST_F(BlobFileTest, ReadAtWithLengthPrefix) {
   // Arrange -- write two length-prefixed records through a Logger
-  auto lg = std::make_unique<Logger>(path_);
+  auto lg = Logger::Create(path_).MoveValue();
   lg->AddLog(EncodeRecord("hello"));
   lg->AddLog(EncodeRecord("world of blob"));
   lg.reset();
@@ -93,11 +93,11 @@ TEST_F(BlobFileTest, ReadAtWithLengthPrefix) {
   // Act -- read each record with the locked, length-prefix aware overload
   std::string_view out;
   {
-    Cache::Locks locks = blob_->ReadAt(0, out);
+    Cache::Locks locks = blob_->ReadAt(0, out).MoveValue();
     ASSERT_EQ(std::string(out), "hello");
   }
   {
-    Cache::Locks locks = blob_->ReadAt(4 + 5, out);
+    Cache::Locks locks = blob_->ReadAt(4 + 5, out).MoveValue();
     ASSERT_EQ(std::string(out), "world of blob");
   }
 }
@@ -107,9 +107,9 @@ TEST_F(BlobFileTest, AppendWrittenAndFlush) {
   ASSERT_EQ(blob_->Written(), 0);
 
   // Act -- append three payloads
-  const lsn_t first = blob_->Append("first");
-  const lsn_t second = blob_->Append("second");
-  const lsn_t third = blob_->Append("third");
+  const lsn_t first = blob_->Append("first").Value() ;
+  const lsn_t second = blob_->Append("second").Value() ;
+  const lsn_t third = blob_->Append("third").Value() ;
 
   // Assert -- offsets are sequential and Written() advances past them
   ASSERT_EQ(first, 0);
@@ -117,19 +117,19 @@ TEST_F(BlobFileTest, AppendWrittenAndFlush) {
   ASSERT_EQ(third, static_cast<lsn_t>(second + 6));
 
   // Act -- wait for the writer to flush, then read the appended bytes
-  blob_->Flush();
+  (void)blob_->Flush();
   ASSERT_GE(blob_->Written(), static_cast<lsn_t>(third + 5));
 
   // Assert -- each appended payload reads back verbatim
-  ASSERT_EQ(blob_->ReadAt(first, 5), "first");
-  ASSERT_EQ(blob_->ReadAt(second, 6), "second");
-  ASSERT_EQ(blob_->ReadAt(third, 5), "third");
+  ASSERT_EQ(blob_->ReadAt(first, 5).Value(), "first");
+  ASSERT_EQ(blob_->ReadAt(second, 6).Value(), "second");
+  ASSERT_EQ(blob_->ReadAt(third, 5).Value(), "third");
 }
 
 TEST_F(BlobFileTest, StreamOperator) {
   // Arrange -- a BlobFile with a couple of writes
   blob_->Append("stream");
-  blob_->Flush();
+  (void)blob_->Flush();
 
   // Act -- stream the file
   std::stringstream ss;

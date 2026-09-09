@@ -31,14 +31,17 @@ ValueType CommonSetValueType(ValueType left, ValueType right) {
       (left == ValueType::kDouble && right == ValueType::kInt64)) {
     return ValueType::kDouble;
   }
-  throw std::invalid_argument("set operation schemas have incompatible types");
+  // Incompatible element domains (e.g. INT64 vs DATE) are a user-query
+  // error; keep a best-effort type here and let SetOperationExecutor
+  // reject the row at execution time (no-exception-rule-migration.md).
+  return left;
 }
 
 }  // namespace
 
 Schema SetOperationPlan::GenerateSchema() const {
   if (children_.empty()) {
-    throw std::invalid_argument("set operation needs at least one child");
+    return {};
   }
   const Schema& first = children_.front()->GetSchema();
   std::vector<Column> columns;
@@ -47,9 +50,9 @@ Schema SetOperationPlan::GenerateSchema() const {
     ValueType type = first.GetColumn(column).Type();
     for (size_t child = 1; child < children_.size(); ++child) {
       const Schema& schema = children_[child]->GetSchema();
-      if (schema.ColumnCount() != first.ColumnCount()) {
-        throw std::invalid_argument(
-            "set operation inputs must have the same column count");
+      if (column >= schema.ColumnCount()) {
+        // Width mismatch is validated by the executor at execution time.
+        break;
       }
       type = CommonSetValueType(type, schema.GetColumn(column).Type());
     }

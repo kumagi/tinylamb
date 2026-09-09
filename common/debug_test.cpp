@@ -138,8 +138,16 @@ TEST(DebugTest, ConstantsToString_ForAllEnums_RendersExpectedLabels) {
   EXPECT_EQ(ToString(Status::kDeleted), "Deleted");
   EXPECT_EQ(ToString(Status::kCorrupt), "Corrupt");
   // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
-  const auto invalid_status = static_cast<Status>(static_cast<uint8_t>(999));
+  const auto invalid_status = static_cast<StatusCode>(99);
   EXPECT_EQ(ToString(invalid_status), "INVALID STATUS");
+
+  const Status with_message(StatusCode::kCorrupt, "bad header");
+  EXPECT_EQ(ToString(with_message), "Corrupt: bad header");
+  EXPECT_EQ(with_message, Status::kCorrupt);
+  EXPECT_NE(with_message, Status::kSuccess);
+  EXPECT_EQ(with_message.GetMessage(), "bad header");
+  EXPECT_TRUE(Status(Status::kSuccess).ok());
+  EXPECT_FALSE(with_message.ok());
 
   std::ostringstream oss;
   oss << Status::kSuccess;
@@ -222,32 +230,34 @@ TEST(DecoderTest, Bool_NonCanonicalByte_NormalizesToTrue) {
   EXPECT_FALSE(v_zero);
 }
 
-TEST(DecoderTest, ValueType_OutOfRangeByte_ThrowsInsteadOfPoisoning) {
+TEST(DecoderTest, ValueType_OutOfRangeByte_FailsStreamInsteadOfPoisoning) {
   // Fixed: the raw byte became the ValueType enum without validation, so a
-  // corrupted stream materialized an invalid discriminant.
+  // corrupted stream materialized an invalid discriminant. The decoder now
+  // reports it through the sticky fail state (no exceptions).
   std::stringstream ss;
   ss.put(static_cast<char>(99));
   Decoder dec(ss);
   ValueType v = ValueType::kNull;
-  EXPECT_THROW(dec >> v, std::runtime_error);
+  dec >> v;
+  EXPECT_TRUE(dec.Failed());
 }
 
-TEST(StatusOrTest, MoveValue_SecondCallThrows) {
+TEST(StatusOrTest, MoveValue_SecondCallAborts) {
   // Fixed: MoveValue() left the optional engaged, so a second call returned a
-  // second (moved-from) copy instead of throwing as documented.
+  // second (moved-from) copy instead of aborting as documented.
   StatusOr<std::string> so(std::string("x"));
   EXPECT_TRUE(so.HasValue());
   std::string first = so.MoveValue();
   EXPECT_EQ(first, "x");
   EXPECT_FALSE(so.HasValue());
-  EXPECT_THROW(std::ignore = so.MoveValue(), std::runtime_error);
-  EXPECT_THROW(std::ignore = so.Value(), std::runtime_error);
+  EXPECT_DEATH((void)so.MoveValue(), "no value");
+  EXPECT_DEATH((void)so.Value(), "no value");
 }
 
-TEST(StatusOrTest, Value_OnFailedStatus_Throws) {
+TEST(StatusOrTest, Value_OnFailedStatus_Aborts) {
   StatusOr<int> failed(Status::kNotExists);
-  EXPECT_THROW(std::ignore = failed.Value(), std::runtime_error);
-  EXPECT_THROW(std::ignore = failed.MoveValue(), std::runtime_error);
+  EXPECT_DEATH((void)failed.Value(), "no value");
+  EXPECT_DEATH((void)failed.MoveValue(), "no value");
 }
 
 }  // namespace tinylamb

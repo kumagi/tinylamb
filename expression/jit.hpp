@@ -13,6 +13,8 @@ namespace tinylamb {
 
 class JitInt64Kernels {
  public:
+  JitInt64Kernels(const JitInt64Kernels&) = delete;
+  JitInt64Kernels& operator=(const JitInt64Kernels&) = delete;
   struct Impl;
   using FilterFn = void (*)(const int64_t*, uint8_t*, uint64_t, int64_t);
   using ProjectionFn = void (*)(const int64_t*, int64_t*, uint64_t, int64_t,

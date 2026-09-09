@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
@@ -103,8 +104,14 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
     if (!dst->IsValid()) {
       continue;
     }
-    if (cond_ && !cond_->Evaluate(*dst, output_schema_).Truthy()) {
-      continue;
+    if (cond_) {
+      StatusOr<Value> res = cond_->TryEvaluate(*dst, output_schema_);
+      if (!res.HasValue()) {
+        return FailWith(res.GetStatus());
+      }
+      if (!res.Value().Truthy()) {
+        continue;
+      }
     }
     return true;
   }

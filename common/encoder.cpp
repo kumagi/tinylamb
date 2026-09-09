@@ -19,11 +19,12 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <ios>
 #include <limits>
-#include <stdexcept>
 #include <string_view>
 
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
 #include "constants.hpp"
 #include "type/value_type.hpp"
@@ -33,8 +34,11 @@ namespace tinylamb {
 Encoder& Encoder::operator<<(std::string_view sv) {
   // bin_size_t cannot represent longer strings; truncating silently would
   // corrupt the stream (the length prefix would no longer match the payload).
+  // Callers guarantee sizes upstream (page-size / kTooBigData checks), so an
+  // oversize string here is an invariant violation, not a runtime error.
   if (sv.size() > std::numeric_limits<bin_size_t>::max()) {
-    throw std::runtime_error("string too long to encode");
+    LOG(FATAL) << "string too long to encode: " << sv.size();
+    abort();
   }
   const auto sz = static_cast<bin_size_t>(sv.size());
   std::array<char, sizeof(bin_size_t)> prefix{};

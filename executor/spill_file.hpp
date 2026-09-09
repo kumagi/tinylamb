@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/decoder.hpp"
+#include "common/status_or.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 
@@ -27,47 +28,51 @@ class SpillFile {
   SpillFile& operator=(SpillFile&& other) noexcept;
   ~SpillFile();
 
-  void Append(const Row& row);
-  void Append(const Row& row, const RowPosition& position);
-  void FinishWriting();
+  Status Append(const Row& row);
+  Status Append(const Row& row, const RowPosition& position);
+  Status FinishWriting();
 
   [[nodiscard]] uint64_t Count() const { return count_; }
   [[nodiscard]] bool Empty() const { return count_ == 0; }
   [[nodiscard]] const std::filesystem::path& Path() const { return path_; }
 
   // Sequential read of all rows (positions ignored if written without them).
-  std::vector<Row> ReadAllRows();
-  std::vector<std::pair<Row, RowPosition>> ReadAllPositioned();
+  StatusOr<std::vector<Row>> ReadAllRows();
+  StatusOr<std::vector<std::pair<Row, RowPosition>>> ReadAllPositioned();
 
   // Stream rows without buffering the full file in memory.
   template <typename Fn>
-  void ForEachRow(Fn&& fn) {
+  Status ForEachRow(Fn&& fn) {
     if (count_ == 0) {
-      return;
+      return Status::kSuccess;
     }
     if (has_positions_) {
-      throw std::runtime_error("ForEachRow on positioned spill");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ForEachRow on positioned spill");
     }
-    EnsureReader();
-    const uint64_t stored = ReadStoredCount();
+    RETURN_IF_FAIL(EnsureReader());
+    ASSIGN_OR_RETURN(uint64_t, stored, ReadStoredCount());
     Decoder dec(stream_);
     for (uint64_t i = 0; i < stored; ++i) {
       Row row;
       dec >> row;
       if (!stream_) {
-        throw std::runtime_error("truncated spill file: " + path_.string());
+        return StatusError(
+            StatusCode::kCorrupt,
+            "truncated spill file: " + path_.string());  // NOLINT(readability)
       }
       fn(row);
     }
+    return Status::kSuccess;
   }
 
   static std::filesystem::path TempDirectory();
 
  private:
-  void OpenForWrite();
-  void EnsureReader();
+  Status OpenForWrite();
+  Status EnsureReader();
   // Reads and validates the row-count header at the start of the file.
-  [[nodiscard]] uint64_t ReadStoredCount();
+  [[nodiscard]] StatusOr<uint64_t> ReadStoredCount();
 
   std::filesystem::path path_;
   std::fstream stream_;

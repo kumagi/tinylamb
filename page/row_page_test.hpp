@@ -40,7 +40,7 @@ class RowPageTest : public ::testing::Test {
     file_name_ = "row_page_test-" + RandomString();
     Recover();
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     page_id_ = page->PageID();
     EXPECT_SUCCESS(txn.PreCommit());
   }
@@ -53,8 +53,8 @@ class RowPageTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(file_name_ + ".db", 10);
-    l_ = std::make_unique<Logger>(file_name_ + ".log");
+    p_ = PageManager::Create(file_name_ + ".db", 10).MoveValue();
+    l_ = Logger::Create(file_name_ + ".log").MoveValue();
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
@@ -69,7 +69,7 @@ class RowPageTest : public ::testing::Test {
 
   bool InsertRow(std::string_view str, bool commit = true) {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     const RowPage& rp = page.GetRowPage();
     EXPECT_FALSE(page.IsNull());
     EXPECT_EQ(page->Type(), PageType::kRowPage);
@@ -94,7 +94,7 @@ class RowPageTest : public ::testing::Test {
     constexpr size_t kMaxFirstUpdaterRetries = 1000;
     for (size_t attempt = 0; attempt < kMaxFirstUpdaterRetries; ++attempt) {
       auto txn = tm_->Begin();
-      PageRef page = p_->GetPage(page_id_);
+      PageRef page = p_->GetPage(page_id_).MoveValue();
       ASSERT_EQ(page->Type(), PageType::kRowPage);
       const Status status = page->Update(txn, static_cast<slot_t>(slot), str);
       if (status == Status::kConflicts) {
@@ -118,7 +118,7 @@ class RowPageTest : public ::testing::Test {
 
   void DeleteRow(int slot, bool commit = true) {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Delete(txn, static_cast<slot_t>(slot)));
     if (commit) {
@@ -132,7 +132,7 @@ class RowPageTest : public ::testing::Test {
 
   std::string ReadRow(int slot) {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     EXPECT_FALSE(page.IsNull());
     ASSIGN_OR_CRASH(std::string_view, dst,
                     page->Read(txn, static_cast<slot_t>(slot)));
@@ -143,7 +143,7 @@ class RowPageTest : public ::testing::Test {
 
   size_t GetRowCount() {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     EXPECT_FALSE(page.IsNull());
     EXPECT_EQ(page->Type(), PageType::kRowPage);
     size_t row_count = page->RowCount();

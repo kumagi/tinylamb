@@ -33,22 +33,20 @@ NestedLoopJoin::NestedLoopJoin(Executor left, Schema left_schema,
       assert_unique_(assert_unique),
       combined_schema_(left_schema_ + right_schema_) {}
 
-bool NestedLoopJoin::EvaluatePredicate(const Row& left,
-                                       const Row& right) const {
+StatusOr<bool> NestedLoopJoin::EvaluatePredicate(const Row& left,
+                                                 const Row& right) const {
   if (!predicate_) {
     return true;
   }
   // Predicate errors must propagate (see BatchNestedLoopJoin): swallowing
   // them as FALSE corrupts Anti-join output.
   Row combined = left + right;
-  Value res = predicate_->Evaluate(combined, combined_schema_);
+  ASSIGN_OR_RETURN(Value, res,
+                   (predicate_->TryEvaluate(combined, combined_schema_)));
   return !res.IsNull() && res.Truthy();
 }
 
-void NestedLoopJoin::Materialize() {
-  if (materialize_error_ != nullptr) {
-    std::rethrow_exception(materialize_error_);
-  }
+Status NestedLoopJoin::Materialize() {
   output_.clear();
   output_offset_ = 0;
 
@@ -59,6 +57,9 @@ void NestedLoopJoin::Materialize() {
   RowPosition r_pos;
   while (right_->Next(&r_row, &r_pos)) {
     right_rows.emplace_back(std::move(r_row), r_pos);
+  }
+  if (right_->GetStatus() != Status::kSuccess) {
+    return right_->GetStatus();
   }
 
   // Stream left side in blocks.
@@ -73,6 +74,9 @@ void NestedLoopJoin::Materialize() {
     while (left_block.size() < block_size_ && left_->Next(&l_row, &l_pos)) {
       left_block.emplace_back(std::move(l_row), l_pos);
     }
+    if (left_->GetStatus() != Status::kSuccess) {
+      return left_->GetStatus();
+    }
     if (left_block.empty()) {
       break;
     }
@@ -85,16 +89,21 @@ void NestedLoopJoin::Materialize() {
 
     for (const auto& r_item : right_rows) {
       for (size_t i = 0; i < left_block.size(); ++i) {
-        if (EvaluatePredicate(left_block[i].first, r_item.first)) {
+        ASSIGN_OR_RETURN(
+            bool, matches,
+            (EvaluatePredicate(left_block[i].first, r_item.first)));
+        if (matches) {
           ++left_match_count[i];
           if (kind_ == JoinKind::kSingle && left_match_count[i] > 1) {
-            throw std::runtime_error(
+            return StatusError(
+                StatusCode::kInvalidArgument,
                 "Single join violation: more than one match found for outer "
                 "row");
           }
           if (assert_unique_ && kind_ == JoinKind::kSemi &&
               left_match_count[i] > 1) {
-            throw std::runtime_error(
+            return StatusError(
+                StatusCode::kInvalidArgument,
                 "Semi join uniqueness assertion failed: multiple matches for "
                 "outer row");
           }
@@ -149,6 +158,7 @@ void NestedLoopJoin::Materialize() {
       }
     }
   }
+  return Status::kSuccess;
 }
 
 bool NestedLoopJoin::Next(Row* dst, RowPosition* rp) {
@@ -157,17 +167,14 @@ bool NestedLoopJoin::Next(Row* dst, RowPosition* rp) {
   // being re-scanned) used to make the latch unreachable, so a mid-
   // materialization throw (e.g. "Single join violation") left the already
   // emitted output_ blocks being served as a complete result.
-  if (materialize_error_ != nullptr) {
-    std::rethrow_exception(materialize_error_);
+  if (materialize_error_ != Status::kSuccess) {
+    return FailWith(materialize_error_);
   }
   if (!materialized_) {
-    try {
-      Materialize();
-      materialized_ = true;
-    } catch (...) {
-      materialize_error_ = std::current_exception();
-      materialized_ = true;  // Prevent a retry that would see drained inputs.
-      throw;
+    materialize_error_ = Materialize();
+    materialized_ = true;  // Prevent a retry that would see drained inputs.
+    if (materialize_error_ != Status::kSuccess) {
+      return FailWith(materialize_error_);
     }
   }
   if (output_offset_ >= output_.size()) {

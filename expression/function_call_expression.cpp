@@ -334,20 +334,26 @@ std::string FormatTimeZoneOffset(int tz_offset_sec) {
   return std::string{buf.data()};
 }
 
-Value AddOrSubInterval(const std::string& func_name, const Value& date,
-                       const IntervalExpression& interval) {
+StatusOr<Value> AddOrSubInterval(const std::string& func_name,
+                                 const Value& date,
+                                 const IntervalExpression& interval) {
   const int64_t amount =
       func_name == "date_sub" ? -interval.Amount() : interval.Amount();
-  const int64_t days = date.type == ValueType::kDate
-                           ? date.DateDays()
-                           : ParseDateDays(date.value.varchar_value);
-  const int64_t result = AddDateIntervalDays(days, amount, interval.Unit());
-  return date.type == ValueType::kDate ? Value::DateFromDays(result)
-                                       : Value(FormatDateDays(result));
+  ASSIGN_OR_RETURN(int64_t, days,
+                   date.type == ValueType::kDate
+                       ? StatusOr<int64_t>(date.DateDays())
+                       : TryParseDateDays(date.value.varchar_value));
+  ASSIGN_OR_RETURN(int64_t, result,
+                   TryAddDateIntervalDays(days, amount, interval.Unit()));
+  if (date.type == ValueType::kDate) {
+    return Value::DateFromDays(result);
+  }
+  ASSIGN_OR_RETURN(std::string, text, TryFormatDateDays(result));
+  return Value(std::move(text));
 }
 
 // Decodes one proto-text scalar token (`5`, `1.5`, `true`, `"str"`).
-Value ProtoTextScalar(std::string_view raw) {
+StatusOr<Value> TryProtoTextScalar(std::string_view raw) {
   while (!raw.empty() &&
          (std::isspace(static_cast<unsigned char>(raw.front())) != 0)) {
     raw.remove_prefix(1);
@@ -357,7 +363,7 @@ Value ProtoTextScalar(std::string_view raw) {
     raw.remove_suffix(1);
   }
   if (raw.empty() || raw == "null") {
-    return {};
+    return Value();
   }
   if (raw == "true") {
     return Value(int64_t{1});
@@ -384,12 +390,14 @@ Value ProtoTextScalar(std::string_view raw) {
 // Minimal proto text-format field extraction: repeated `field: value`
 // entries and `field { ... }` message blocks; multiple matches become an
 // array.  Mirrors the interpreter-side extractor for plan-executor use.
-bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
-                               Value* out) {
+StatusOr<bool> ProtoTextExtractFieldShim(std::string_view text,
+                                         std::string_view key, Value* out) {
   // Proto presence fields (`has_xxx`) report whether `xxx` occurs.
   if (key.size() > 4 && key.starts_with("has_")) {
     Value probe;
-    if (!ProtoTextExtractFieldShim(text, key.substr(4), &probe)) {
+    ASSIGN_OR_RETURN(bool, present,
+                     ProtoTextExtractFieldShim(text, key.substr(4), &probe));
+    if (!present) {
       *out = Value(int64_t{0});
       return true;
     }
@@ -504,8 +512,10 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
                      return std::tolower(static_cast<unsigned char>(a)) ==
                             std::tolower(static_cast<unsigned char>(b));
                    })) {
-      matches.push_back(
-          ProtoTextScalar(text.substr(value_begin, value_end - value_begin)));
+      ASSIGN_OR_RETURN(Value, field_value,
+                       TryProtoTextScalar(
+                           text.substr(value_begin, value_end - value_begin)));
+      matches.push_back(std::move(field_value));
     }
   }
   if (matches.empty()) {
@@ -526,8 +536,8 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
 // %t/%T render values in STRING form (strings quoted); %d/%i/%u/%x/%X/%o
 // take integers; %f/%g/%e/%E take numerics.  `%*` / `%.*` consume
 // width/precision from the argument list.
-Value FormatFunction(const std::string& name,
-                     const std::vector<Value>& arguments) {
+StatusOr<Value> FormatFunction(const std::string& name,
+                               const std::vector<Value>& arguments) {
   (void)name;
   auto raw_str = [](const Value& val) -> std::string {
     if (val.type == ValueType::kVarChar) {
@@ -536,17 +546,18 @@ Value FormatFunction(const std::string& name,
     return val.AsString();
   };
   if (arguments.empty()) {
-    throw std::runtime_error("FORMAT requires at least 1 argument");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "FORMAT requires at least 1 argument");
   }
   if (arguments[0].IsNull()) {
-    return {};
+    return Value();
   }
   // FORMAT propagates NULL from a value or a dynamic width/precision
   // argument; rendering it as the literal text "NULL" changes the result
   // from SQL NULL to a non-null STRING.
   for (size_t i = 1; i < arguments.size(); ++i) {
     if (arguments[i].IsNull()) {
-      return {};
+      return Value();
     }
   }
   const std::string fmt = raw_str(arguments[0]);
@@ -572,15 +583,16 @@ Value FormatFunction(const std::string& name,
       int width = 0;
       if (i < fmt.size() && fmt[i] == '*') {
         if (arg_idx >= arguments.size()) {
-          throw std::runtime_error(
-              "FORMAT: not enough arguments for format string");
+          return StatusError(StatusCode::kInvalidArgument,
+                             "FORMAT: not enough arguments for format string");
         }
         const Value& width_arg = arguments[arg_idx++];
         if (width_arg.IsNull()) {
-          return {};
+          return Value();
         }
         if (width_arg.type != ValueType::kInt64) {
-          throw std::runtime_error("FORMAT: dynamic width must be an integer");
+          return StatusError(StatusCode::kInvalidArgument,
+                             "FORMAT: dynamic width must be an integer");
         }
         width = static_cast<int>(width_arg.value.int_value);
         ++i;
@@ -595,16 +607,17 @@ Value FormatFunction(const std::string& name,
         ++i;
         if (i < fmt.size() && fmt[i] == '*') {
           if (arg_idx >= arguments.size()) {
-            throw std::runtime_error(
+            return StatusError(
+                StatusCode::kInvalidArgument,
                 "FORMAT: not enough arguments for format string");
           }
           const Value& precision_arg = arguments[arg_idx++];
           if (precision_arg.IsNull()) {
-            return {};
+            return Value();
           }
           if (precision_arg.type != ValueType::kInt64) {
-            throw std::runtime_error(
-                "FORMAT: dynamic precision must be an integer");
+            return StatusError(StatusCode::kInvalidArgument,
+                               "FORMAT: dynamic precision must be an integer");
           }
           precision = static_cast<int>(precision_arg.value.int_value);
           ++i;
@@ -623,8 +636,8 @@ Value FormatFunction(const std::string& name,
       char spec = fmt[i];
 
       if (arg_idx >= arguments.size()) {
-        throw std::runtime_error(
-            "FORMAT: not enough arguments for format string");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "FORMAT: not enough arguments for format string");
       }
       const Value& arg = arguments[arg_idx++];
       std::string formatted_item;
@@ -693,7 +706,8 @@ Value FormatFunction(const std::string& name,
           formatted_item =
               std::to_string(static_cast<int64_t>(arg.value.double_value));
         } else {
-          throw std::runtime_error(
+          return StatusError(
+              StatusCode::kInvalidArgument,
               "FORMAT: invalid argument type for integer specifier");
         }
       } else if (spec == 'f' || spec == 'g' || spec == 'e' || spec == 'E') {
@@ -705,7 +719,8 @@ Value FormatFunction(const std::string& name,
           formatted_item =
               std::to_string(static_cast<double>(arg.value.int_value));
         } else {
-          throw std::runtime_error(
+          return StatusError(
+              StatusCode::kInvalidArgument,
               "FORMAT: invalid argument type for float specifier");
         }
       } else {
@@ -740,13 +755,14 @@ Value FormatFunction(const std::string& name,
     }
   }
   if (arg_idx < arguments.size()) {
-    throw std::runtime_error("FORMAT: too many arguments for format string");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "FORMAT: too many arguments for format string");
   }
   return Value(std::move(result));
 }
 
-Value ExecuteFunction(const std::string& name,
-                      const std::vector<Value>& values) {
+StatusOr<Value> ExecuteFunction(const std::string& name,
+                                const std::vector<Value>& values) {
   auto raw_str = [](const Value& val) -> std::string {
     if (val.type == ValueType::kVarChar) {
       return std::string(val.value.varchar_value);
@@ -759,40 +775,45 @@ Value ExecuteFunction(const std::string& name,
   // silently dropped from the text-format representation.
   if (name == "$proto_repeated_guard") {
     if (values.size() != 2) {
-      throw std::runtime_error("$proto_repeated_guard requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "$proto_repeated_guard requires 2 arguments");
     }
     if (values[0].IsArray()) {
       for (const Value& element : values[0].ArrayElements()) {
         if (element.IsNull()) {
-          throw std::runtime_error(
+          return StatusError(
+              StatusCode::kInvalidArgument,
               "Cannot encode a null value in a repeated protocol message "
               "field");
         }
       }
     } else if (!values[0].IsNull()) {
-      throw std::runtime_error("repeated proto field requires an array");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "repeated proto field requires an array");
     }
     return values[1];
   }
   if (name == "$proto_field_guard" || name == "$proto_enum_guard") {
     const size_t expected = name == "$proto_field_guard" ? 3 : 2;
     if (values.size() != expected) {
-      throw std::runtime_error(name + " argument count mismatch");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " argument count mismatch");
     }
     if (!values[0].IsNull()) {
       Row dummy_row;
       Schema dummy_schema;
       Expression checked = CastExpressionExp(ConstantValueExp(values[0]),
                                              raw_str(values[1]), false);
-      // Full CAST validation against the enum registry; throws on unknown
+      // Full CAST validation against the enum registry; raises on unknown
       // members or out-of-range ordinals.
-      static_cast<void>(checked->Evaluate(dummy_row, dummy_schema));
+      RETURN_IF_FAIL(checked->TryEvaluate(dummy_row, dummy_schema).GetStatus());
     }
     return expected == 3 ? values[2] : values[0];
   }
   if (name == "__pipe_concat") {
     if (values.size() != 2 || !values[0].IsArray()) {
-      throw std::runtime_error("__pipe_concat requires an array and separator");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__pipe_concat requires an array and separator");
     }
     const std::string separator = raw_str(values[1]);
     struct Pair {
@@ -837,55 +858,69 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "__struct_set") {
     if (values.size() != 3) {
-      throw std::runtime_error("__struct_set requires 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__struct_set requires 3 arguments");
     }
-    return StructSetField(values[0], raw_str(values[1]), values[2]);
+    return TryStructSetField(values[0], raw_str(values[1]), values[2]);
   }
   if (name == "get_field") {
     if (values.size() != 2) {
-      throw std::runtime_error("get_field requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "get_field requires 2 arguments");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
     // Proto TEXT payloads resolve through the shared extractor (defaults,
     // has_ bits, repeated arrays) instead of the JSON member scan.
     Value proto_value;
-    if (TryProtoTextGetField(object, field, &proto_value)) {
+    auto proto_hit = TryReadProtoTextField(object, field, &proto_value);
+    if (!proto_hit.HasValue()) {
+      return proto_hit.GetStatus();
+    }
+    if (proto_hit.Value()) {
       return proto_value;
     }
     if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
-      throw std::runtime_error("get_field requires a STRUCT");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "get_field requires a STRUCT");
     }
     for (const auto& [key, text] :
          SplitJsonObjectMembers(object.substr(1, object.size() - 2))) {
       if (IdentifierEquals(key, field)) {
         Value parsed;
         if (!JsonTextToValue(text, &parsed)) {
-          throw std::runtime_error("get_field: malformed member value");
+          return StatusError(StatusCode::kInvalidArgument,
+                             "get_field: malformed member value");
         }
         return parsed;
       }
     }
-    throw std::runtime_error("field not found: " + field);
+    return StatusError(StatusCode::kInvalidArgument,
+                       "field not found: " + field);
   }
   if (name == "__get_field_safe") {
     // Field access that tolerates NULL bases and missing members by
     // returning NULL; used for dotted references in DML predicates.
     if (values.size() != 2) {
-      throw std::runtime_error("__get_field_safe requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__get_field_safe requires 2 arguments");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
     // Proto field reads need scalar defaults even when an empty proto is
     // represented by an empty text payload.
     Value proto_field;
-    if (TryProtoTextGetField(object, field, &proto_field)) {
+    auto proto_field_hit = TryReadProtoTextField(object, field, &proto_field);
+    if (!proto_field_hit.HasValue()) {
+      return proto_field_hit.GetStatus();
+    }
+    if (proto_field_hit.Value()) {
       return proto_field;
     }
     if (object.size() >= 2 && object.front() == '{' && object.back() == '}') {
@@ -895,7 +930,7 @@ Value ExecuteFunction(const std::string& name,
         if (IdentifierEquals(key, field)) {
           Value parsed;
           if (!JsonTextToValue(text, &parsed)) {
-            return {};
+            return Value();
           }
           return parsed;
         }
@@ -906,57 +941,28 @@ Value ExecuteFunction(const std::string& name,
       if (members.size() == 1) {
         Value parsed;
         if (!JsonTextToValue(members.front().second, &parsed)) {
-          return {};
+          return Value();
         }
         return parsed;
       }
     }
     // Proto text-format cells (`i1: 5 i2: 5`) carry the same field
     // semantics: extract the first (or repeated) occurrence of `field`.
-    if (ProtoTextExtractFieldShim(object, field, &proto_field)) {
+    ASSIGN_OR_RETURN(bool, extracted,
+                     ProtoTextExtractFieldShim(object, field, &proto_field));
+    if (extracted) {
       return proto_field;
     }
-    return {};
+    return Value();
   }
 
-  if (name == "__struct_set") {
-    if (values.size() != 3) {
-      throw std::runtime_error("__struct_set requires 3 arguments");
-    }
-    return StructSetField(values[0], raw_str(values[1]), values[2]);
-  }
-  if (name == "get_field") {
-    if (values.size() != 2) {
-      throw std::runtime_error("get_field requires 2 arguments");
-    }
-    if (values[0].IsNull()) {
-      return {};
-    }
-    const std::string object = raw_str(values[0]);
-    const std::string field = raw_str(values[1]);
-    Value proto_value;
-    if (TryProtoTextGetField(object, field, &proto_value)) {
-      return proto_value;
-    }
-    if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
-      throw std::runtime_error("get_field requires a STRUCT");
-    }
-    const auto members =
-        SplitJsonObjectMembers(object.substr(1, object.size() - 2));
-    for (const auto& [key, text] : members) {
-      if (IdentifierEquals(key, field)) {
-        Value parsed;
-        if (!JsonTextToValue(text, &parsed)) {
-          throw std::runtime_error("get_field: malformed member value");
-        }
-        return parsed;
-      }
-    }
-    throw std::runtime_error("field not found: " + field);
-  }
+  // NOTE: `__struct_set` / `get_field` are handled by the earlier blocks
+  // above, which return on every path; the copies that used to sit here were
+  // unreachable merge artifacts and have been removed.
   if (name == "rand") {
     if (!values.empty()) {
-      throw std::runtime_error("RAND requires no arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "RAND requires no arguments");
     }
     static thread_local std::mt19937_64 rng(
         std::random_device{}() ^
@@ -972,7 +978,7 @@ Value ExecuteFunction(const std::string& name,
         return val;
       }
     }
-    return {};
+    return Value();
   }
   // NULLIF / IFNULL / GREATEST / LEAST: the AST ground truth must implement
   // every scalar the scope-based relational evaluator supports
@@ -984,26 +990,29 @@ Value ExecuteFunction(const std::string& name,
   // promote mixed INT64/DOUBLE numerically.
   if (name == "nullif") {
     if (values.size() != 2) {
-      throw std::runtime_error("NULLIF requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "NULLIF requires 2 arguments");
     }
     if (values[0] == values[1]) {
-      return {};
+      return Value();
     }
     return values[0];
   }
   if (name == "ifnull") {
     if (values.size() != 2) {
-      throw std::runtime_error("IFNULL requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFNULL requires 2 arguments");
     }
     return !values[0].IsNull() ? values[0] : values[1];
   }
   if (name == "greatest" || name == "least") {
     if (values.empty()) {
-      throw std::runtime_error(name + " requires at least 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires at least 1 argument");
     }
     for (const auto& val : values) {
       if (val.IsNull()) {
-        return {};
+        return Value();
       }
     }
     Value best = values[0];
@@ -1037,10 +1046,11 @@ Value ExecuteFunction(const std::string& name,
     std::string result;
     for (const auto& value : values) {
       if (value.IsNull()) {
-        return {};
+        return Value();
       }
       if (value.type != ValueType::kVarChar) {
-        throw std::runtime_error("CONCAT currently requires string arguments");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "CONCAT currently requires string arguments");
       }
       result.append(value.value.varchar_value);
     }
@@ -1048,10 +1058,11 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "upper") {
     if (values.size() != 1) {
-      throw std::runtime_error("UPPER requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "UPPER requires 1 argument");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     std::string s = raw_str(values[0]);
     for (char& c : s) {
@@ -1061,10 +1072,11 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "lower") {
     if (values.size() != 1) {
-      throw std::runtime_error("LOWER requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LOWER requires 1 argument");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     std::string s = raw_str(values[0]);
     for (char& c : s) {
@@ -1074,30 +1086,33 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "abs") {
     if (values.size() != 1) {
-      throw std::runtime_error("ABS requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ABS requires 1 argument");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     if (values[0].type == ValueType::kInt64) {
       // std::abs(INT64_MIN) is UB (wraps to INT64_MIN); the relational
       // evaluator raises instead, so the ground truth must agree.
       if (values[0].value.int_value == std::numeric_limits<int64_t>::min()) {
-        throw std::runtime_error("integer overflow in ABS");
+        return StatusError(StatusCode::kIsInfinity, "integer overflow in ABS");
       }
       return Value(std::abs(values[0].value.int_value));
     }
     if (values[0].type == ValueType::kDouble) {
       return Value(std::abs(values[0].value.double_value));
     }
-    throw std::runtime_error("ABS requires numeric argument");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "ABS requires numeric argument");
   }
   if (name == "sqrt") {
     if (values.size() != 1) {
-      throw std::runtime_error("SQRT requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SQRT requires 1 argument");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     double val = values[0].type == ValueType::kInt64
                      ? static_cast<double>(values[0].value.int_value)
@@ -1108,22 +1123,25 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "substr" || name == "substring") {
     if (values.size() < 2 || values.size() > 3) {
-      throw std::runtime_error("SUBSTR requires two or three arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SUBSTR requires two or three arguments");
     }
     if (values[0].IsNull() || values[1].IsNull() ||
         (values.size() == 3 && values[2].IsNull())) {
-      return {};
+      return Value();
     }
     if (values[0].type != ValueType::kVarChar ||
         values[1].type != ValueType::kInt64 ||
         (values.size() == 3 && values[2].type != ValueType::kInt64)) {
-      throw std::runtime_error("SUBSTR argument type mismatch");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SUBSTR argument type mismatch");
     }
     const std::string input(values[0].value.varchar_value);
     const int64_t start = values[1].value.int_value;
     if (values.size() == 3 && values[2].type == ValueType::kInt64) {
       if (values[2].value.int_value < 0) {
-        throw std::runtime_error("SUBSTR length cannot be negative");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "SUBSTR length cannot be negative");
       }
       if (values[2].value.int_value == 0) {
         return Value(std::string());
@@ -1153,10 +1171,11 @@ Value ExecuteFunction(const std::string& name,
   if (name == "length" || name == "char_length" || name == "character_length" ||
       name == "octet_length" || name == "byte_length") {
     if (values.size() != 1) {
-      throw std::runtime_error(name + " requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 argument");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string input = raw_str(values[0]);
     if (name == "char_length" || name == "character_length") {
@@ -1165,8 +1184,8 @@ Value ExecuteFunction(const std::string& name,
       // (CHAR_LENGTH("€") = 1) already do.  Byte-counting here made the
       // result depend on which evaluator the plan happened to pick.
       size_t code_points = 0;
-      for (size_t i = 0; i < input.size(); ++i) {
-        const auto byte = static_cast<unsigned char>(input[i]);
+      for (char i : input) {
+        const auto byte = static_cast<unsigned char>(i);
         if ((byte & 0xC0) != 0x80) {  // skip UTF-8 continuation bytes
           ++code_points;
         }
@@ -1178,10 +1197,11 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "instr" || name == "strpos") {
     if (values.size() != 2) {
-      throw std::runtime_error(name + " requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 2 arguments");
     }
     if (values[0].IsNull() || values[1].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string hay = raw_str(values[0]);
     const std::string needle = raw_str(values[1]);
@@ -1193,18 +1213,20 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "lpad" || name == "rpad") {
     if (values.size() < 2 || values.size() > 3) {
-      throw std::runtime_error(name + " requires 2 or 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 2 or 3 arguments");
     }
     if (values[0].IsNull() || values[1].IsNull() ||
         (values.size() == 3 && values[2].IsNull())) {
-      return {};
+      return Value();
     }
     const std::string input = raw_str(values[0]);
     int64_t target_len = values[1].type == ValueType::kInt64
                              ? values[1].value.int_value
                              : std::stoll(raw_str(values[1]));
     if (target_len < 0) {
-      throw std::runtime_error(name + " target length cannot be negative");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " target length cannot be negative");
     }
     const auto target_size = static_cast<size_t>(target_len);
     if (target_size == 0) {
@@ -1232,20 +1254,22 @@ Value ExecuteFunction(const std::string& name,
   if (name == "extract_year" || name == "extract_month" ||
       name == "extract_day") {
     if (values.size() != 1) {
-      throw std::runtime_error("EXTRACT requires one argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "EXTRACT requires one argument");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     if (values[0].type != ValueType::kDate &&
         values[0].type != ValueType::kVarChar) {
-      throw std::runtime_error("EXTRACT requires DATE or STRING");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "EXTRACT requires DATE or STRING");
     }
     const std::string date = values[0].type == ValueType::kDate
                                  ? values[0].AsString()
                                  : std::string(values[0].value.varchar_value);
     if (date.size() < 10) {
-      throw std::runtime_error("invalid DATE value");
+      return StatusError(StatusCode::kInvalidArgument, "invalid DATE value");
     }
     int64_t part = 0;
     try {
@@ -1257,13 +1281,15 @@ Value ExecuteFunction(const std::string& name,
         part = std::stoll(date.substr(8, 2));
       }
     } catch (const std::logic_error&) {
-      throw std::runtime_error("invalid DATE value: " + date);
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid DATE value: " + date);
     }
     return Value(part);
   }
   if (name == "current_timestamp") {
     if (!values.empty()) {
-      throw std::runtime_error("CURRENT_TIMESTAMP takes no arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CURRENT_TIMESTAMP takes no arguments");
     }
     const std::time_t now =
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -1275,16 +1301,18 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "current_datetime") {
     if (values.size() > 1) {
-      throw std::runtime_error("CURRENT_DATETIME takes at most 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CURRENT_DATETIME takes at most 1 argument");
     }
     if (values.size() == 1 && values[0].IsNull()) {
-      return {};
+      return Value();
     }
     int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
     if (values.size() == 1 && !values[0].IsNull()) {
       std::string tz_str = raw_str(values[0]);
       if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        throw std::runtime_error("invalid timezone: " + tz_str);
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid timezone: " + tz_str);
       }
       tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
@@ -1302,16 +1330,18 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "current_date") {
     if (values.size() > 1) {
-      throw std::runtime_error("CURRENT_DATE takes at most 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CURRENT_DATE takes at most 1 argument");
     }
     if (values.size() == 1 && values[0].IsNull()) {
-      return {};
+      return Value();
     }
     int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
     if (values.size() == 1 && !values[0].IsNull()) {
       std::string tz_str = raw_str(values[0]);
       if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        throw std::runtime_error("invalid timezone: " + tz_str);
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid timezone: " + tz_str);
       }
       tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
@@ -1327,16 +1357,18 @@ Value ExecuteFunction(const std::string& name,
   }
   if (name == "string") {
     if (values.empty() || values.size() > 2) {
-      throw std::runtime_error("STRING requires 1 or 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "STRING requires 1 or 2 arguments");
     }
     if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
-      return {};
+      return Value();
     }
     if (values.size() == 2) {
       CivilTime ct = ValueToCivilTime(values[0]);
       std::string tz_str = raw_str(values[1]);
       if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        throw std::runtime_error("invalid timezone: " + tz_str);
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid timezone: " + tz_str);
       }
       int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
       ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
@@ -1363,21 +1395,23 @@ Value ExecuteFunction(const std::string& name,
   if (name == "format_timestamp" || name == "format_datetime" ||
       name == "format_date") {
     if (values.size() < 2 || values.size() > 3) {
-      throw std::runtime_error(name + " takes 2 or 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " takes 2 or 3 arguments");
     }
     if (values[0].IsNull() || values[1].IsNull()) {
-      return {};
+      return Value();
     }
     std::string fmt = raw_str(values[0]);
     CivilTime ct = ValueToCivilTime(values[1]);
     int tz_offset_sec = 0;
     if (values.size() == 3) {
       if (values[2].IsNull()) {
-        return {};
+        return Value();
       }
       std::string tz_str = raw_str(values[2]);
       if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        throw std::runtime_error("invalid timezone: " + tz_str);
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid timezone: " + tz_str);
       }
       tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
     } else if (name == "format_datetime" || name == "format_timestamp") {
@@ -1411,19 +1445,21 @@ Value ExecuteFunction(const std::string& name,
     const size_t formatted =
         format_time(buf.data(), buf.size(), fmt.c_str(), &tm);
     if (formatted == 0) {
-      throw std::runtime_error("TIMESTAMP format produced no output: " + fmt);
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TIMESTAMP format produced no output: " + fmt);
     }
     return Value(std::string{buf.data()});
   }
   if (name == "parse_timestamp") {
     if (values.size() < 2 || values.size() > 3) {
-      throw std::runtime_error("PARSE_TIMESTAMP requires 2 or 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "PARSE_TIMESTAMP requires 2 or 3 arguments");
     }
     if (values[0].IsNull() || values[1].IsNull()) {
-      return {};
+      return Value();
     }
     if (values.size() == 3 && values[2].IsNull()) {
-      return {};
+      return Value();
     }
     std::string fmt = raw_str(values[0]);
     std::string input = raw_str(values[1]);
@@ -1432,7 +1468,8 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() == 3) {
       std::string tz_str = raw_str(values[2]);
       if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        throw std::runtime_error("invalid timezone: " + tz_str);
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid timezone: " + tz_str);
       }
       tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
@@ -1442,7 +1479,8 @@ Value ExecuteFunction(const std::string& name,
     tm.tm_mday = 1;
     char* parsed_end = strptime(input.c_str(), fmt.c_str(), &tm);
     if (parsed_end == nullptr) {
-      throw std::runtime_error("PARSE_TIMESTAMP failed for: " + input);
+      return StatusError(StatusCode::kInvalidArgument,
+                         "PARSE_TIMESTAMP failed for: " + input);
     }
     CivilTime ct;
     ct.year = tm.tm_year + 1900;
@@ -1498,7 +1536,8 @@ Value ExecuteFunction(const std::string& name,
     // (type_name, value1, field1, value2, field2, ...).  Builds the proto
     // TEXT payload; required-field and enum-member violations throw.
     if (values.size() % 2 != 1) {
-      throw std::runtime_error("__proto_new requires (type, v, f, ...)");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__proto_new requires (type, v, f, ...)");
     }
     const std::string type_name = raw_str(values[0]);
     std::vector<std::pair<std::string, Value>> fields;
@@ -1506,20 +1545,24 @@ Value ExecuteFunction(const std::string& name,
     for (size_t i = 1; i < values.size(); i += 2) {
       fields.emplace_back(raw_str(values[i + 1]), values[i]);
     }
-    return Value(ConstructProtoText(type_name, fields));
+    ASSIGN_OR_RETURN(std::string, proto_text,
+                     TryConstructProtoText(type_name, fields));
+    return Value(std::move(proto_text));
   }
   if (name == "__value_table_value") {
     if (values.size() != 1) {
-      throw std::runtime_error("__value_table_value requires one argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__value_table_value requires one argument");
     }
     return values.front();
   }
   if (name == "__value_table_proto") {
     if (values.size() != 2) {
-      throw std::runtime_error("__value_table_proto requires two arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__value_table_proto requires two arguments");
     }
     if (values[1].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string type_name = raw_str(values[0]);
     if (type_name.find("TestExtraPB") == std::string::npos) {
@@ -1528,19 +1571,25 @@ Value ExecuteFunction(const std::string& name,
     std::vector<std::pair<std::string, Value>> fields;
     for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
       Value value;
-      if (TryProtoTextGetField(raw_str(values[1]), field, &value)) {
+      auto proto_hit = TryReadProtoTextField(raw_str(values[1]), field, &value);
+      if (!proto_hit.HasValue()) {
+        return proto_hit.GetStatus();
+      }
+      if (proto_hit.Value()) {
         fields.emplace_back(field, std::move(value));
       }
     }
-    return Value(ConstructProtoText(type_name, fields));
+    ASSIGN_OR_RETURN(std::string, proto_text,
+                     TryConstructProtoText(type_name, fields));
+    return Value(std::move(proto_text));
   }
   if (name == "__value_table_proto_existing") {
     if (values.size() != 2) {
-      throw std::runtime_error(
-          "__value_table_proto_existing requires two arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__value_table_proto_existing requires two arguments");
     }
     if (values[1].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string type_name = raw_str(values[0]);
     if (type_name.find("TestExtraPB") == std::string::npos) {
@@ -1553,16 +1602,23 @@ Value ExecuteFunction(const std::string& name,
         continue;
       }
       Value value;
-      if (TryProtoTextGetField(payload, field, &value)) {
+      auto proto_hit = TryReadProtoTextField(payload, field, &value);
+      if (!proto_hit.HasValue()) {
+        return proto_hit.GetStatus();
+      }
+      if (proto_hit.Value()) {
         fields.emplace_back(field, std::move(value));
       }
     }
-    return Value(ConstructProtoText(type_name, fields));
+    ASSIGN_OR_RETURN(std::string, proto_text,
+                     TryConstructProtoText(type_name, fields));
+    return Value(std::move(proto_text));
   }
   if (name == "__proto_set") {
     // Dotted SET targets over proto TEXT columns: (payload, path, new_value).
     if (values.size() != 3) {
-      throw std::runtime_error("__proto_set requires 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__proto_set requires 3 arguments");
     }
     std::vector<std::string> path;
     {
@@ -1581,44 +1637,50 @@ Value ExecuteFunction(const std::string& name,
     const std::string type_name = InferProtoTypeName(
         values[0].IsNull() ? std::string_view() : raw_str(values[0]), path);
     if (values[0].IsNull()) {
-      throw std::runtime_error(
+      return StatusError(
+          StatusCode::kInvalidArgument,
           "Cannot set field of NULL `" +
-          (type_name.empty() ? std::string("PROTO") : type_name) + "`");
+              (type_name.empty() ? std::string("PROTO") : type_name) + "`");
     }
     const std::string payload = raw_str(values[0]);
-    auto rewritten = ProtoTextSetField(payload, path, values[2], type_name);
+    ASSIGN_OR_RETURN(std::optional<std::string>, rewritten,
+                     TryProtoTextSetField(payload, path, values[2], type_name));
     return Value(rewritten.value_or(payload));
   }
   if (name == "__get_extension") {
     // value.(pkg.Ext.field): reads the bracketed extension entry from a
     // proto TEXT payload; NULL bases yield NULL.
     if (values.size() != 2) {
-      throw std::runtime_error("__get_extension requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__get_extension requires 2 arguments");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string base = raw_str(values[0]);
     const std::string key = "[" + raw_str(values[1]) + "]";
     Value out;
-    if (!TryProtoTextGetField(base, key, &out)) {
-      throw std::runtime_error("extension " + raw_str(values[1]) +
-                               " not found");
+    ASSIGN_OR_RETURN(bool, ext_found, TryReadProtoTextField(base, key, &out));
+    if (!ext_found) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "extension " + raw_str(values[1]) + " not found");
     }
     return out;
   }
   if (name == "unix_seconds" || name == "unix_millis" ||
       name == "unix_micros" || name == "unix_date") {
     if (values.size() != 1) {
-      throw std::runtime_error(name + " requires one TIMESTAMP argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires one TIMESTAMP argument");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     const std::optional<int64_t> nanos =
         ParseTimestampTextNanos(raw_str(values[0]));
     if (!nanos.has_value()) {
-      throw std::runtime_error("invalid TIMESTAMP: " + raw_str(values[0]));
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid TIMESTAMP: " + raw_str(values[0]));
     }
     auto floor_div = [](int64_t a, int64_t b) {
       const int64_t q = a / b;
@@ -1642,11 +1704,11 @@ Value ExecuteFunction(const std::string& name,
   // a working query into "not yet executable".
   if (name == "is_inf" || name == "is_nan") {
     if (values.size() != 1) {
-      return {};
+      return Value();
     }
     const Value& arg = values[0];
     if (arg.IsNull()) {
-      return {};
+      return Value();
     }
     if (arg.type != ValueType::kDouble) {
       return Value(int64_t{0});
@@ -1667,10 +1729,11 @@ Value ExecuteFunction(const std::string& name,
   // Hashing family: raw digest bytes (BYTES semantics), hex via TO_HEX.
   if (name == "md5" || name == "sha1" || name == "sha256" || name == "sha512") {
     if (values.size() != 1) {
-      throw std::runtime_error(name + " requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 argument");
     }
     if (values[0].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string input = raw_str(values[0]);
     if (name == "md5") {
@@ -1693,10 +1756,11 @@ Value ExecuteFunction(const std::string& name,
       name == "json_query_array" || name == "json_value_array" ||
       name == "json_extract_string_array") {
     if (values.empty() || values.size() > 2) {
-      throw std::runtime_error(name + " requires 1 or 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 or 2 arguments");
     }
     if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
-      return {};
+      return Value();
     }
     const std::string path = values.size() == 2 ? raw_str(values[1]) : "$";
     return EvaluateJsonFunctionCall(name, raw_str(values[0]), path);
@@ -1707,10 +1771,11 @@ Value ExecuteFunction(const std::string& name,
   // generate_date_array and interval arithmetic consume.
   if (name == "make_interval") {
     if (values.size() < 2) {
-      throw std::runtime_error("make_interval requires at least 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "make_interval requires at least 2 arguments");
     }
     if (values[0].IsNull() || values[1].IsNull()) {
-      return {};
+      return Value();
     }
     const std::string val_str = raw_str(values[0]);
     const std::string unit_str = raw_str(values[1]);
@@ -1720,7 +1785,8 @@ Value ExecuteFunction(const std::string& name,
 
   if (name == "generate_date_array") {
     if (values.size() < 2 || values.size() > 3) {
-      throw std::runtime_error("GENERATE_DATE_ARRAY requires 2 or 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GENERATE_DATE_ARRAY requires 2 or 3 arguments");
     }
     const Value& start = values[0];
     const Value& end = values[1];
@@ -1735,13 +1801,13 @@ Value ExecuteFunction(const std::string& name,
     if (start_date.IsNull() || end_date.IsNull() ||
         start_date.type != ValueType::kDate ||
         end_date.type != ValueType::kDate) {
-      throw std::runtime_error("DATE value required");
+      return StatusError(StatusCode::kInvalidArgument, "DATE value required");
     }
     int64_t step_days = 1;
     if (values.size() == 3) {
       const Value& step = values[2];
       if (step.IsNull()) {
-        return {};
+        return Value();
       }
       if (step.type == ValueType::kInt64) {
         step_days = step.value.int_value;
@@ -1753,13 +1819,14 @@ Value ExecuteFunction(const std::string& name,
         const IntervalValue parsed =
             text.empty() ? IntervalValue{} : IntervalValue::Parse(text);
         if (parsed.months != 0 || parsed.nanos != 0) {
-          throw std::runtime_error("unsupported GENERATE_DATE_ARRAY step unit");
+          return StatusError(StatusCode::kInvalidArgument,
+                             "unsupported GENERATE_DATE_ARRAY step unit");
         }
         step_days = parsed.days;
       }
     }
     if (step_days == 0) {
-      throw std::out_of_range("Sequence step cannot be 0.");
+      return StatusError(StatusCode::kIsInfinity, "Sequence step cannot be 0.");
     }
     const int64_t start_days = start_date.DateDays();
     const int64_t end_days = end_date.DateDays();
@@ -1774,11 +1841,13 @@ Value ExecuteFunction(const std::string& name,
   // SQL scalar UDFs registered by CREATE FUNCTION: evaluate the body against
   // a synthetic single-row scope holding the argument values.
   if (std::optional<SqlScalarFunction> udf = FindSqlScalarFunction(name)) {
-    SqlUdfBinding binding = BindSqlUdfArguments(*udf, values);
+    ASSIGN_OR_RETURN(SqlUdfBinding, binding, BindSqlUdfArguments(*udf, values));
+    RETURN_IF_FAIL(SqlUdfDepthGuard::CheckAvailable());
     SqlUdfDepthGuard depth_guard;
-    return udf->body->Evaluate(binding.row, binding.schema);
+    return udf->body->TryEvaluate(binding.row, binding.schema);
   }
-  throw std::runtime_error("Function calls are not yet executable: " + name);
+  return StatusError(StatusCode::kInvalidArgument,
+                     "Function calls are not yet executable: " + name);
 }
 
 }  // namespace
@@ -2069,9 +2138,9 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
   return false;
 }
 
-std::string EncodeStructMemberJson(const Value& value) {
+StatusOr<std::string> TryEncodeStructMemberJson(const Value& value) {
   if (value.IsNull()) {
-    return "null";
+    return std::string("null");
   }
   switch (value.type) {
     case ValueType::kInt64:
@@ -2104,20 +2173,23 @@ std::string EncodeStructMemberJson(const Value& value) {
     default:
       break;
   }
-  throw std::runtime_error("cannot encode struct member");
+  return StatusError(StatusCode::kInvalidArgument,
+                     "cannot encode struct member");
 }
 
-Value StructSetField(const Value& json, const std::string& path,
-                     const Value& new_value) {
+StatusOr<Value> TryStructSetField(const Value& json, const std::string& path,
+                                  const Value& new_value) {
   if (json.IsNull()) {
     return json;
   }
   if (json.type != ValueType::kVarChar) {
-    throw std::runtime_error("struct field assignment requires a STRUCT");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "struct field assignment requires a STRUCT");
   }
   const std::string text(json.value.varchar_value);
   if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
-    throw std::runtime_error("struct field assignment requires a STRUCT");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "struct field assignment requires a STRUCT");
   }
   size_t dot = path.find('.');
   const std::string head =
@@ -2137,12 +2209,17 @@ Value StructSetField(const Value& json, const std::string& path,
       replaced = true;
       rebuilt += "\"" + EscapeJsonText(key) + "\":";
       if (rest.empty()) {
-        rebuilt += EncodeStructMemberJson(new_value);
+        ASSIGN_OR_RETURN(std::string, encoded_new,
+                         TryEncodeStructMemberJson(new_value));
+        rebuilt += encoded_new;
       } else {
         Value nested;
         JsonTextToValue(value_text, &nested);
-        rebuilt +=
-            EncodeStructMemberJson(StructSetField(nested, rest, new_value));
+        ASSIGN_OR_RETURN(Value, sub,
+                         TryStructSetField(nested, rest, new_value));
+        ASSIGN_OR_RETURN(std::string, encoded_sub,
+                         TryEncodeStructMemberJson(sub));
+        rebuilt += encoded_sub;
       }
     } else {
       rebuilt += "\"" + EscapeJsonText(key) + "\":" + value_text;
@@ -2154,14 +2231,33 @@ Value StructSetField(const Value& json, const std::string& path,
     }
     rebuilt += "\"" + EscapeJsonText(head) + "\":";
     if (rest.empty()) {
-      rebuilt += EncodeStructMemberJson(new_value);
+      ASSIGN_OR_RETURN(std::string, encoded_new,
+                       TryEncodeStructMemberJson(new_value));
+      rebuilt += encoded_new;
     } else {
-      rebuilt += EncodeStructMemberJson(
-          StructSetField(Value(std::string("{}")), rest, new_value));
+      ASSIGN_OR_RETURN(
+          Value, sub,
+          TryStructSetField(Value(std::string("{}")), rest, new_value));
+      ASSIGN_OR_RETURN(std::string, encoded_sub,
+                       TryEncodeStructMemberJson(sub));
+      rebuilt += encoded_sub;
     }
   }
   rebuilt += "}";
   return Value(std::move(rebuilt));
+}
+
+// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp); the
+// query/executor callers switch to the Try* forms in Phase 6/7.
+Value StructSetField(const Value& json, const std::string& path,
+                     const Value& new_value) {
+  return ExcShimUnwrap(TryStructSetField(json, path, new_value),
+                       "StructSetField");
+}
+
+std::string EncodeStructMemberJson(const Value& value) {
+  return ExcShimUnwrap(TryEncodeStructMemberJson(value),
+                       "EncodeStructMemberJson");
 }
 
 std::unordered_set<ColumnName> FunctionCallExpression::TouchedColumns() const {
@@ -2172,14 +2268,58 @@ std::unordered_set<ColumnName> FunctionCallExpression::TouchedColumns() const {
   return result;
 }
 
-Value FunctionCallExpression::Evaluate(const Row& row,
-                                       const Schema& schema) const {
+namespace {
+// IF/IFERROR branch results are normalized to the common supertype of every
+// branch (int64 results promote to double when any branch is double) so
+// downstream comparisons and sort keys stay type-consistent.  Shared by all
+// three TryEvaluate overloads so the join/context forms cannot diverge from
+// the plain one.
+bool IfBranchesPromoteToDouble(const std::vector<Expression>& args,
+                               const Schema& schema, const size_t from) {
+  for (size_t i = from; i < args.size(); ++i) {
+    try {
+      if (args[i]->ResultType(schema).GetType() == TypeTag::kDouble) {
+        return true;
+      }
+    } catch (const std::exception&) {
+      continue;
+    }
+  }
+  return false;
+}
+
+bool IfBranchesPromoteToDouble(const std::vector<Expression>& args,
+                               const Schema& left, const Schema& right,
+                               const size_t from) {
+  for (size_t i = from; i < args.size(); ++i) {
+    try {
+      if (args[i]->ResultType(left, right).GetType() == TypeTag::kDouble) {
+        return true;
+      }
+    } catch (const std::exception&) {
+      continue;
+    }
+  }
+  return false;
+}
+
+Value NormalizeIfBranch(Value value, const bool to_double) {
+  if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
+    return Value(static_cast<double>(value.value.int_value));
+  }
+  return value;
+}
+}  // namespace
+
+StatusOr<Value> FunctionCallExpression::TryEvaluate(
+    const Row& row, const Schema& schema) const {
   if (func_name_ == "__row_struct") {
     // Bare alias row reference ("SELECT s FROM t s"): encodes the columns
     // qualified by the given alias as a struct JSON object.  Evaluated with
     // the scope's full row so multi-source queries pick their own columns.
     if (args_.size() != 1 || args_[0]->Type() != TypeTag::kConstantValue) {
-      throw std::runtime_error("__row_struct requires an alias literal");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__row_struct requires an alias literal");
     }
     std::string alias;
     const Value& alias_value = args_[0]->AsConstantValue().GetValue();
@@ -2200,79 +2340,60 @@ Value FunctionCallExpression::Evaluate(const Row& row,
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
-      throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DATE_ADD/DATE_SUB requires DATE and INTERVAL");
     }
-    const Value date = args_[0]->Evaluate(row, schema);
+    ASSIGN_OR_RETURN(Value, date, args_[0]->TryEvaluate(row, schema));
     if (date.IsNull()) {
-      return {};
+      return Value();
     }
     return AddOrSubInterval(func_name_, date, args_[1]->AsIntervalExpression());
   }
   // Conditional-evaluation semantics: only the taken (or error-handled)
   // branch is evaluated, so errors inside untaken branches never surface.
-  // Branch results are normalized to the common supertype of every branch so
-  // downstream comparisons and sort keys stay type-consistent.
-  auto promotes_to_double = [&](const Schema& schema_for_types, size_t from) {
-    for (size_t i = from; i < args_.size(); ++i) {
-      try {
-        if (args_[i]->ResultType(schema_for_types).GetType() ==
-            TypeTag::kDouble) {
-          return true;
-        }
-      } catch (const std::exception& error) {
-        (void)error;
-        continue;
-      }
-    }
-    return false;
-  };
-  auto normalize = [](Value value, bool to_double) {
-    if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
-      return Value(static_cast<double>(value.value.int_value));
-    }
-    return value;
-  };
+  // Branch results are normalized via NormalizeIfBranch (see above).
   if (func_name_ == "if") {
     if (args_.size() != 3) {
-      throw std::runtime_error("IF requires 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IF requires 3 arguments");
     }
-    const bool as_double = promotes_to_double(schema, 1);
-    return normalize(
-        args_[args_[0]->Evaluate(row, schema).Truthy() ? 1 : 2]->Evaluate(
-            row, schema),
-        as_double);
+    const bool as_double = IfBranchesPromoteToDouble(args_, schema, 1);
+    ASSIGN_OR_RETURN(Value, condition, args_[0]->TryEvaluate(row, schema));
+    ASSIGN_OR_RETURN(
+        Value, taken,
+        args_[condition.Truthy() ? 1 : 2]->TryEvaluate(row, schema));
+    return NormalizeIfBranch(std::move(taken), as_double);
   }
   if (func_name_ == "iferror") {
     if (args_.size() != 2) {
-      throw std::runtime_error("IFERROR requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFERROR requires 2 arguments");
     }
-    const bool as_double = promotes_to_double(schema, 0);
-    try {
-      return normalize(args_[0]->Evaluate(row, schema), as_double);
-    } catch (const std::exception&) {
-      return normalize(args_[1]->Evaluate(row, schema), as_double);
-    }
+    const bool as_double = IfBranchesPromoteToDouble(args_, schema, 0);
+    auto primary = args_[0]->TryEvaluate(row, schema);
+    ASSIGN_OR_RETURN(Value, taken,
+                     primary.HasValue() ? std::move(primary)
+                                        : args_[1]->TryEvaluate(row, schema));
+    return NormalizeIfBranch(std::move(taken), as_double);
   }
   if (func_name_ == "iserror") {
     if (args_.size() != 1) {
-      throw std::runtime_error("ISERROR requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ISERROR requires 1 argument");
     }
-    try {
-      args_[0]->Evaluate(row, schema);
-      return Value(int64_t{0});
-    } catch (const std::exception&) {
-      return Value(int64_t{1});
-    }
+    auto evaluated = args_[0]->TryEvaluate(row, schema);
+    return Value(evaluated.HasValue() ? int64_t{0} : int64_t{1});
   }
   if (func_name_ == "nulliferror") {
     if (args_.size() != 1) {
-      throw std::runtime_error("NULLIFERROR requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "NULLIFERROR requires 1 argument");
     }
-    try {
-      return args_[0]->Evaluate(row, schema);
-    } catch (const std::exception&) {
-      return {};
+    auto result = args_[0]->TryEvaluate(row, schema);
+    if (!result.HasValue()) {
+      return Value();
     }
+    return result;
   }
   // COALESCE / IFNULL short-circuit left to right like the relational
   // evaluator: errors inside unevaluated branches never surface. Evaluating
@@ -2280,24 +2401,29 @@ Value FunctionCallExpression::Evaluate(const Row& row,
   // third branch after a non-NULL first) into spurious failures.
   if (func_name_ == "coalesce") {
     for (const auto& arg : args_) {
-      Value value = arg->Evaluate(row, schema);
+      ASSIGN_OR_RETURN(Value, value, arg->TryEvaluate(row, schema));
       if (!value.IsNull()) {
         return value;
       }
     }
-    return {};
+    return Value();
   }
   if (func_name_ == "ifnull") {
     if (args_.size() != 2) {
-      throw std::runtime_error("IFNULL requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFNULL requires 2 arguments");
     }
-    Value first = args_[0]->Evaluate(row, schema);
-    return !first.IsNull() ? first : args_[1]->Evaluate(row, schema);
+    ASSIGN_OR_RETURN(Value, first, args_[0]->TryEvaluate(row, schema));
+    if (!first.IsNull()) {
+      return first;
+    }
+    return args_[1]->TryEvaluate(row, schema);
   }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
-    values.emplace_back(arg->Evaluate(row, schema));
+    ASSIGN_OR_RETURN(Value, value, arg->TryEvaluate(row, schema));
+    values.push_back(std::move(value));
   }
   return ExecuteFunction(func_name_, values);
 }
@@ -2317,169 +2443,219 @@ std::string FunctionCallExpression::ToString() const {
 
 void FunctionCallExpression::Dump(std::ostream& o) const { o << ToString(); }
 
-Value FunctionCallExpression::Evaluate(const Row* left,
-                                       const Schema& left_schema,
-                                       const Row* right,
-                                       const Schema& right_schema) const {
+StatusOr<Value> FunctionCallExpression::TryEvaluate(
+    const Row* left, const Schema& left_schema, const Row* right,
+    const Schema& right_schema) const {
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
-      throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DATE_ADD/DATE_SUB requires DATE and INTERVAL");
     }
-    const Value date =
-        args_[0]->Evaluate(left, left_schema, right, right_schema);
+    ASSIGN_OR_RETURN(
+        Value, date,
+        (args_[0]->TryEvaluate(left, left_schema, right, right_schema)));
     if (date.IsNull()) {
-      return {};
+      return Value();
     }
     return AddOrSubInterval(func_name_, date, args_[1]->AsIntervalExpression());
   }
-  // Lazy conditional-evaluation semantics (mirrors the plain overload).
+  // Lazy conditional-evaluation semantics (mirrors the plain overload,
+  // including the branch-type normalization).
   if (func_name_ == "if") {
     if (args_.size() != 3) {
-      throw std::runtime_error("IF requires 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IF requires 3 arguments");
     }
-    const Value condition =
-        args_[0]->Evaluate(left, left_schema, right, right_schema);
-    return args_[condition.Truthy() ? 1 : 2]->Evaluate(left, left_schema, right,
-                                                       right_schema);
+    const bool as_double =
+        IfBranchesPromoteToDouble(args_, left_schema, right_schema, 1);
+    ASSIGN_OR_RETURN(
+        Value, condition,
+        (args_[0]->TryEvaluate(left, left_schema, right, right_schema)));
+    ASSIGN_OR_RETURN(Value, branch,
+                     (args_[condition.Truthy() ? 1 : 2]->TryEvaluate(
+                         left, left_schema, right, right_schema)));
+    return NormalizeIfBranch(std::move(branch), as_double);
   }
   if (func_name_ == "iferror") {
     if (args_.size() != 2) {
-      throw std::runtime_error("IFERROR requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFERROR requires 2 arguments");
     }
-    try {
-      return args_[0]->Evaluate(left, left_schema, right, right_schema);
-    } catch (const std::exception&) {
-      return args_[1]->Evaluate(left, left_schema, right, right_schema);
+    if (auto attempt =
+            args_[0]->TryEvaluate(left, left_schema, right, right_schema);
+        attempt.HasValue()) {
+      return attempt;
     }
+    return args_[1]->TryEvaluate(left, left_schema, right, right_schema);
   }
   if (func_name_ == "iserror") {
     if (args_.size() != 1) {
-      throw std::runtime_error("ISERROR requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ISERROR requires 1 argument");
     }
-    try {
-      args_[0]->Evaluate(left, left_schema, right, right_schema);
-      return Value(int64_t{0});
-    } catch (const std::exception&) {
-      return Value(int64_t{1});
-    }
+    auto evaluated =
+        args_[0]->TryEvaluate(left, left_schema, right, right_schema);
+    return Value(evaluated.HasValue() ? int64_t{0} : int64_t{1});
   }
   if (func_name_ == "nulliferror") {
     if (args_.size() != 1) {
-      throw std::runtime_error("NULLIFERROR requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "NULLIFERROR requires 1 argument");
     }
-    try {
-      return args_[0]->Evaluate(left, left_schema, right, right_schema);
-    } catch (const std::exception&) {
-      return {};
+    auto result = args_[0]->TryEvaluate(left, left_schema, right, right_schema);
+    if (!result.HasValue()) {
+      return Value();
     }
+    return result;
   }
   // COALESCE / IFNULL short-circuit left to right like the relational
   // evaluator (see the plain overload): errors inside unevaluated branches
   // never surface.
   if (func_name_ == "coalesce") {
     for (const auto& arg : args_) {
-      Value value = arg->Evaluate(left, left_schema, right, right_schema);
+      ASSIGN_OR_RETURN(
+          Value, value,
+          arg->TryEvaluate(left, left_schema, right, right_schema));
       if (!value.IsNull()) {
         return value;
       }
     }
-    return {};
+    return Value();
   }
   if (func_name_ == "ifnull") {
     if (args_.size() != 2) {
-      throw std::runtime_error("IFNULL requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFNULL requires 2 arguments");
     }
-    Value first = args_[0]->Evaluate(left, left_schema, right, right_schema);
-    return !first.IsNull()
-               ? first
-               : args_[1]->Evaluate(left, left_schema, right, right_schema);
+    ASSIGN_OR_RETURN(
+        Value, first,
+        (args_[0]->TryEvaluate(left, left_schema, right, right_schema)));
+    if (!first.IsNull()) {
+      return first;
+    }
+    return args_[1]->TryEvaluate(left, left_schema, right, right_schema);
   }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
-    values.emplace_back(arg->Evaluate(left, left_schema, right, right_schema));
+    ASSIGN_OR_RETURN(Value, value,
+                     arg->TryEvaluate(left, left_schema, right, right_schema));
+    values.push_back(std::move(value));
   }
   return ExecuteFunction(func_name_, values);
 }
 
 // Context-aware form: same dispatch as the plain evaluator with the context
 // threaded into every argument (A1 stage 3).
-Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
-                                       EvaluationContext& context) const {
+StatusOr<Value> FunctionCallExpression::TryEvaluate(
+    const Row& row, const Schema& schema, EvaluationContext& context) const {
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
-      throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DATE_ADD/DATE_SUB requires DATE and INTERVAL");
     }
-    const Value date = args_[0]->Evaluate(row, schema, context);
+    ASSIGN_OR_RETURN(Value, date, args_[0]->TryEvaluate(row, schema, context));
     if (date.IsNull()) {
-      return {};
+      return Value();
     }
     return AddOrSubInterval(func_name_, date, args_[1]->AsIntervalExpression());
   }
-  // Lazy conditional-evaluation semantics (mirrors the plain overload).
+  // Lazy conditional-evaluation semantics (mirrors the plain overload,
+  // including the branch-type normalization).
   if (func_name_ == "if") {
     if (args_.size() != 3) {
-      throw std::runtime_error("IF requires 3 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IF requires 3 arguments");
     }
-    const Value condition = args_[0]->Evaluate(row, schema, context);
-    return args_[condition.Truthy() ? 1 : 2]->Evaluate(row, schema, context);
+    const bool as_double = IfBranchesPromoteToDouble(args_, schema, 1);
+    ASSIGN_OR_RETURN(Value, condition,
+                     (args_[0]->TryEvaluate(row, schema, context)));
+    ASSIGN_OR_RETURN(
+        Value, branch,
+        (args_[condition.Truthy() ? 1 : 2]->TryEvaluate(row, schema, context)));
+    return NormalizeIfBranch(std::move(branch), as_double);
   }
   if (func_name_ == "iferror") {
     if (args_.size() != 2) {
-      throw std::runtime_error("IFERROR requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFERROR requires 2 arguments");
     }
-    try {
-      return args_[0]->Evaluate(row, schema, context);
-    } catch (const std::exception&) {
-      return args_[1]->Evaluate(row, schema, context);
+    if (auto attempt = args_[0]->TryEvaluate(row, schema, context);
+        attempt.HasValue()) {
+      return attempt;
     }
+    return args_[1]->TryEvaluate(row, schema, context);
   }
   if (func_name_ == "iserror") {
     if (args_.size() != 1) {
-      throw std::runtime_error("ISERROR requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ISERROR requires 1 argument");
     }
-    try {
-      args_[0]->Evaluate(row, schema, context);
-      return Value(int64_t{0});
-    } catch (const std::exception&) {
-      return Value(int64_t{1});
-    }
+    auto evaluated = args_[0]->TryEvaluate(row, schema, context);
+    return Value(evaluated.HasValue() ? int64_t{0} : int64_t{1});
   }
   if (func_name_ == "nulliferror") {
     if (args_.size() != 1) {
-      throw std::runtime_error("NULLIFERROR requires 1 argument");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "NULLIFERROR requires 1 argument");
     }
-    try {
-      return args_[0]->Evaluate(row, schema, context);
-    } catch (const std::exception&) {
-      return {};
+    auto result = args_[0]->TryEvaluate(row, schema, context);
+    if (!result.HasValue()) {
+      return Value();
     }
+    return result;
   }
   // COALESCE / IFNULL short-circuit left to right like the relational
   // evaluator (see the plain overload): errors inside unevaluated branches
   // never surface.
   if (func_name_ == "coalesce") {
     for (const auto& arg : args_) {
-      Value value = arg->Evaluate(row, schema, context);
+      ASSIGN_OR_RETURN(Value, value, arg->TryEvaluate(row, schema, context));
       if (!value.IsNull()) {
         return value;
       }
     }
-    return {};
+    return Value();
   }
   if (func_name_ == "ifnull") {
     if (args_.size() != 2) {
-      throw std::runtime_error("IFNULL requires 2 arguments");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFNULL requires 2 arguments");
     }
-    Value first = args_[0]->Evaluate(row, schema, context);
-    return !first.IsNull() ? first : args_[1]->Evaluate(row, schema, context);
+    ASSIGN_OR_RETURN(Value, first, args_[0]->TryEvaluate(row, schema, context));
+    if (!first.IsNull()) {
+      return first;
+    }
+    return args_[1]->TryEvaluate(row, schema, context);
   }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
-    values.emplace_back(arg->Evaluate(row, schema, context));
+    ASSIGN_OR_RETURN(Value, value, arg->TryEvaluate(row, schema, context));
+    values.push_back(std::move(value));
   }
   return ExecuteFunction(func_name_, values);
+}
+
+// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+Value FunctionCallExpression::Evaluate(const Row& row,
+                                       const Schema& schema) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema),
+                       "FunctionCallExpression::Evaluate");
+}
+
+Value FunctionCallExpression::Evaluate(const Row* left,
+                                       const Schema& left_schema,
+                                       const Row* right,
+                                       const Schema& right_schema) const {
+  return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "FunctionCallExpression::Evaluate");
+}
+
+Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
+                                       EvaluationContext& context) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema, context),
+                       "FunctionCallExpression::Evaluate");
 }
 
 Type FunctionCallExpression::ResultType(const Schema& schema) const {

@@ -21,8 +21,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <ostream>
+#include <string>
 #include <string_view>
+#include <utility>
 
 namespace tinylamb {
 
@@ -55,7 +58,7 @@ static constexpr size_t kDefaultPagePoolCapacity =
     if (tmp_status != Status::kSuccess) return tmp_status; \
   }
 
-enum class Status : uint8_t {
+enum class StatusCode : uint8_t {
   kUnknown,
   kSuccess,
   kNoSpace,
@@ -69,7 +72,65 @@ enum class Status : uint8_t {
   kIsInfinity,
   kDeleted,
   kCorrupt,
+  kIOError,
+  kInvalidArgument,
+  kRuntimeError,
 };
+
+// A status code plus an optional human-readable message. Equality (and every
+// `== Status::kXxx` style check) compares the code only; the message is
+// diagnostic payload propagated to user-facing error reporting instead of
+// C++ exceptions.
+class Status {
+ public:
+  Status() = default;
+  Status(StatusCode code) : code_(code) {}  // NOLINT(runtime/explicit)
+  Status(StatusCode code, std::string message)
+      : code_(code),
+        message_(std::make_shared<const std::string>(std::move(message))) {}
+
+  // Named constants keep the historical `Status::kXxx` spelling.
+  static const inline StatusCode kUnknown{StatusCode::kUnknown};
+  static const inline StatusCode kSuccess{StatusCode::kSuccess};
+  static const inline StatusCode kNoSpace{StatusCode::kNoSpace};
+  static const inline StatusCode kConflicts{StatusCode::kConflicts};
+  static const inline StatusCode kDuplicates{StatusCode::kDuplicates};
+  static const inline StatusCode kUnknownType{StatusCode::kUnknownType};
+  static const inline StatusCode kNotExists{StatusCode::kNotExists};
+  static const inline StatusCode kNotImplemented{StatusCode::kNotImplemented};
+  static const inline StatusCode kTooBigData{StatusCode::kTooBigData};
+  static const inline StatusCode kAmbiguousQuery{StatusCode::kAmbiguousQuery};
+  static const inline StatusCode kIsInfinity{StatusCode::kIsInfinity};
+  static const inline StatusCode kDeleted{StatusCode::kDeleted};
+  static const inline StatusCode kCorrupt{StatusCode::kCorrupt};
+  static const inline StatusCode kIOError{StatusCode::kIOError};
+  static const inline StatusCode kInvalidArgument{StatusCode::kInvalidArgument};
+  static const inline StatusCode kRuntimeError{StatusCode::kRuntimeError};
+
+  [[nodiscard]] StatusCode GetCode() const { return code_; }
+  [[nodiscard]] bool ok() const { return code_ == StatusCode::kSuccess; }
+  [[nodiscard]] const std::string& GetMessage() const {
+    static const std::string kEmpty;
+    return message_ != nullptr ? *message_ : kEmpty;
+  }
+
+  friend bool operator==(const Status& lhs, const Status& rhs) {
+    return lhs.code_ == rhs.code_;
+  }
+  friend bool operator!=(const Status& lhs, const Status& rhs) {
+    return !(lhs == rhs);
+  }
+
+ private:
+  StatusCode code_{StatusCode::kUnknown};
+  std::shared_ptr<const std::string> message_;
+};
+
+// Convenience factory for error paths: StatusError(StatusCode::kCorrupt,
+// "bad header").
+inline Status StatusError(StatusCode code, std::string message) {
+  return {code, std::move(message)};
+}
 
 enum class BinaryOperation : uint8_t {
   // Calculations.
@@ -172,40 +233,59 @@ constexpr page_id_t kMetaPageId = 0;
 static_assert(kPageSize <= std::numeric_limits<slot_t>::max());
 static_assert(kPageSize <= std::numeric_limits<bin_size_t>::max());
 
-inline std::string_view ToString(Status s) {
+inline std::string_view ToString(StatusCode s) {
   switch (s) {
-    case Status::kUnknown:
+    case StatusCode::kUnknown:
       return "Unknown";
-    case Status::kSuccess:
+    case StatusCode::kSuccess:
       return "Success";
-    case Status::kNoSpace:
+    case StatusCode::kNoSpace:
       return "NoSpace";
-    case Status::kDuplicates:
+    case StatusCode::kDuplicates:
       return "Duplicates";
-    case Status::kConflicts:
+    case StatusCode::kConflicts:
       return "Conflicts";
-    case Status::kUnknownType:
+    case StatusCode::kUnknownType:
       return "UnknownType";
-    case Status::kNotExists:
+    case StatusCode::kNotExists:
       return "NotExists";
-    case Status::kNotImplemented:
+    case StatusCode::kNotImplemented:
       return "NotImplemented";
-    case Status::kTooBigData:
+    case StatusCode::kTooBigData:
       return "TooBigData";
-    case Status::kAmbiguousQuery:
+    case StatusCode::kAmbiguousQuery:
       return "AmbiguousQuery";
-    case Status::kIsInfinity:
+    case StatusCode::kIsInfinity:
       return "IsInfinity";
-    case Status::kDeleted:
+    case StatusCode::kDeleted:
       return "Deleted";
-    case Status::kCorrupt:
+    case StatusCode::kCorrupt:
       return "Corrupt";
-    default:
-      return "INVALID STATUS";
+    case StatusCode::kIOError:
+      return "IOError";
+    case StatusCode::kInvalidArgument:
+      return "InvalidArgument";
+    case StatusCode::kRuntimeError:
+      return "RuntimeError";
   }
+  return "INVALID STATUS";
 }
 
-inline std::ostream& operator<<(std::ostream& o, const Status s) {
+inline std::string ToString(const Status& s) {
+  std::string result(ToString(s.GetCode()));
+  if (!s.GetMessage().empty()) {
+    result += ": ";
+    result += s.GetMessage();
+  }
+  return result;
+}
+
+inline std::ostream& operator<<(std::ostream& o, const StatusCode& s) {
+  o << ToString(s);
+  return o;
+}
+
+inline std::ostream& operator<<(std::ostream& o, const Status& s) {
   o << ToString(s);
   return o;
 }

@@ -18,6 +18,12 @@ class SelectStatement;
 // Three-valued ANY/ALL kernel shared by the AST and relational interpreters:
 // ANY is a three-valued OR over per-row comparisons, ALL its dual.  An empty
 // row set is vacuous (ALL -> TRUE, ANY -> FALSE).
+// Core semantics with StatusOr propagation
+// (no-exception-rule-migration Phase 5); EvaluateQuantifiedComparison is the
+// deprecated EXC-SHIM wrapper kept for the relational interpreter caller.
+[[nodiscard]] StatusOr<Value> TryEvaluateQuantifiedComparison(
+    BinaryOperation op, QuantifierMode mode, const Value& test,
+    const std::vector<Value>& rows);
 Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
                                    const Value& test,
                                    const std::vector<Value>& rows);
@@ -46,6 +52,11 @@ class QueryExpression : public ExpressionBase {
   // EvaluationContext instead of the relational_detail interpreter.
   [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
                                EvaluationContext& context) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema,
+      EvaluationContext& context) const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& output) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;

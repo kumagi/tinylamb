@@ -69,6 +69,8 @@ class WindowFunctionCallExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override {
     return TypeTag::kWindowFunctionExp;
   }
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema) const override;
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;

@@ -13,9 +13,14 @@
 
 namespace tinylamb {
 
-Value LambdaExpression::Evaluate(const Row& /*row*/,
-                                 const Schema& /*schema*/) const {
-  throw std::runtime_error("lambda must be applied by a higher-order function");
+StatusOr<Value> LambdaExpression::TryEvaluate(const Row& /*row*/,
+                                              const Schema& /*schema*/) const {
+  return StatusError(StatusCode::kRuntimeError,
+                     "lambda must be applied by a higher-order function");
+}
+
+Value LambdaExpression::Evaluate(const Row& row, const Schema& schema) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema), "LambdaExpression::Evaluate");
 }
 
 std::string LambdaExpression::ToString() const {

@@ -85,13 +85,20 @@ void SkipScanDistinct::ResolveCurrentRow() const {
   if (current_row_resolved_) {
     return;
   }
-  PageRef ref = txn_.GetPageManager()->GetPage(current_pos_.page_id, true);
-  if (!ref.IsValid()) {
+  StatusOr<PageRef> ref =
+      txn_.GetPageManager()->GetPage(current_pos_.page_id, true);
+  if (!ref.HasValue()) {
+    status_ = ref.GetStatus();
     current_row_.Clear();
     current_row_resolved_ = true;
     return;
   }
-  StatusOr<std::string_view> row = ref->Read(txn_, current_pos_.slot);
+  if (!ref.Value().IsValid()) {
+    current_row_.Clear();
+    current_row_resolved_ = true;
+    return;
+  }
+  StatusOr<std::string_view> row = ref.Value()->Read(txn_, current_pos_.slot);
   if (!row.HasValue()) {
     current_row_.Clear();
     current_row_resolved_ = true;
@@ -175,11 +182,23 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
     current_index_key_.DecodeMemcomparableFormat(iter_.Key());
 
     if (is_unique_) {
-      auto val = Decode<Table::IndexValueType>(iter_.Value());
-      current_pos_ = val.pos;
+      StatusOr<Table::IndexValueType> val =
+          Decode<Table::IndexValueType>(iter_.Value());
+      if (!val.HasValue()) {
+        status_ = val.GetStatus();
+        finished_ = true;
+        return false;
+      }
+      current_pos_ = val.Value().pos;
     } else {
-      auto val = Decode<std::vector<Table::IndexValueType>>(iter_.Value());
-      if (val.empty()) {
+      StatusOr<std::vector<Table::IndexValueType>> val =
+          Decode<std::vector<Table::IndexValueType>>(iter_.Value());
+      if (!val.HasValue()) {
+        status_ = val.GetStatus();
+        finished_ = true;
+        return false;
+      }
+      if (val.Value().empty()) {
         if (ascending_) {
           ++iter_;
         } else {
@@ -187,7 +206,7 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
         }
         continue;
       }
-      current_pos_ = val[0].pos;
+      current_pos_ = val.Value()[0].pos;
     }
 
     current_row_resolved_ = false;
@@ -195,7 +214,11 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
 
     bool matched = true;
     if (where_) {
-      matched = where_->Evaluate(current_row_, schema_).Truthy();
+      StatusOr<Value> res = where_->TryEvaluate(current_row_, schema_);
+      if (!res.HasValue()) {
+        return FailWith(res.GetStatus());
+      }
+      matched = res.Value().Truthy();
     }
 
     std::string prev_encoded_key = iter_.Key();

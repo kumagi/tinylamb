@@ -111,7 +111,10 @@ bool IsKnownLogType(LogType type) {
 bool IsPageManipulation(LogType type) {
   switch (type) {
     case LogType::kUnknown:
-      throw std::runtime_error("Invalid format log");
+      // ReadLog validates every decoded record's type before any caller
+      // reaches this predicate; an unknown type here is broken plumbing.
+      CHECK_MSG(false, "Invalid format log");
+      return false;
 
     case LogType::kBegin:
     case LogType::kCommit:
@@ -124,18 +127,19 @@ bool IsPageManipulation(LogType type) {
   }
 }
 
-void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
+Status LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
   // The apply/no-apply decision (page_lsn vs record LSN) belongs to
   // PageReplay, which is this function's only caller. In particular a
   // kSystemAllocPage at LSN 0 on a freshly recovered page must run even
   // though page_lsn also reads 0 there.
   if (!IsPageManipulation(log.type)) {
-    return;
+    return Status::kSuccess;
   }
 
   switch (log.type) {
     case LogType::kUnknown:
-      assert(!"unknown log type must not be parsed");
+      CHECK_MSG(false, "unknown log type must not be parsed");
+      break;
     case LogType::kInsertRow:
     case LogType::kCompensateDeleteRow:
       target->InsertImpl(log.slot, log.redo_data);
@@ -179,7 +183,8 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       break;
     case LogType::kSetFoster:
     case LogType::kCompensateSetFoster: {
-      auto new_foster = Decode<FosterPair>(log.redo_data);
+      ASSIGN_OR_RETURN(FosterPair, new_foster,
+                       Decode<FosterPair>(log.redo_data));
       target->SetFosterImpl(new_foster);
       break;
     }
@@ -196,18 +201,19 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       break;
     case LogType::kSetLowFence:
     case LogType::kCompensateSetLowFence: {
-      auto ik = Decode<IndexKey>(log.redo_data);
+      ASSIGN_OR_RETURN(IndexKey, ik, Decode<IndexKey>(log.redo_data));
       target->SetLowFenceImpl(ik);
       break;
     }
     case LogType::kSetHighFence:
     case LogType::kCompensateSetHighFence: {
-      auto ik = Decode<IndexKey>(log.redo_data);
+      ASSIGN_OR_RETURN(IndexKey, ik, Decode<IndexKey>(log.redo_data));
       target->SetHighFenceImpl(ik);
       break;
     }
     default:
-      assert(!"must not reach here");
+      CHECK_MSG(false, "must not reach here");
+      break;
   }
   // ARIES: a page modified during replay is dirty from the earliest applied
   // LSN. Without this the page keeps recovery_lsn == MAX (set on load), a
@@ -221,27 +227,37 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
   const lsn_t record_end = lsn + log.Size();
   target->SetRecLSN(record_end);
   target->SetPageLSN(record_end);
+  return Status::kSuccess;
 }
 
-lsn_t LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
-              TransactionManager* tm) {
+StatusOr<lsn_t> LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
+                        TransactionManager* tm) {
   lsn_t clr_end = 0;
   switch (log.type) {
     case LogType::kUnknown:
-      LOG(FATAL) << "Unknown type log";
-      throw std::runtime_error("broken log");
-    case LogType::kInsertRow:
-      clr_end = tm->CompensateInsertLog(log.txn_id, log.pid, log.slot);
+      CHECK_MSG(false, "Unknown type log: broken log");
+      break;
+    case LogType::kInsertRow: {
+      ASSIGN_OR_RETURN(lsn_t, clr7731,
+                       tm->CompensateInsertLog(log.txn_id, log.pid, log.slot));
+      clr_end = clr7731;
+    }
       target->DeleteImpl(log.slot);
       break;
-    case LogType::kUpdateRow:
-      clr_end = tm->CompensateUpdateLog(log.txn_id, log.pid, log.slot,
-                                        log.undo_data);
+    case LogType::kUpdateRow: {
+      ASSIGN_OR_RETURN(lsn_t, clr7947,
+                       tm->CompensateUpdateLog(log.txn_id, log.pid, log.slot,
+                                               log.undo_data));
+      clr_end = clr7947;
+    }
       target->UpdateImpl(log.slot, log.undo_data);
       break;
-    case LogType::kDeleteRow:
-      clr_end = tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot,
-                                        log.undo_data);
+    case LogType::kDeleteRow: {
+      ASSIGN_OR_RETURN(lsn_t, clr8193,
+                       tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot,
+                                               log.undo_data));
+      clr_end = clr8193;
+    }
       target->InsertImpl(log.slot, log.undo_data);
       break;
     case LogType::kSystemDestroyPage: {
@@ -268,55 +284,93 @@ lsn_t LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       }
       break;
     }
-    case LogType::kInsertLeaf:
-      clr_end = tm->CompensateInsertLog(log.txn_id, log.pid, log.key);
+    case LogType::kInsertLeaf: {
+      ASSIGN_OR_RETURN(lsn_t, clr9745,
+                       tm->CompensateInsertLog(log.txn_id, log.pid, log.key));
+      clr_end = clr9745;
+    }
       target->DeleteImpl(log.key);
       break;
-    case LogType::kInsertBranch:
-      clr_end = tm->CompensateInsertBranchLog(log.txn_id, log.pid, log.key);
+    case LogType::kInsertBranch: {
+      ASSIGN_OR_RETURN(
+          lsn_t, clr9962,
+          tm->CompensateInsertBranchLog(log.txn_id, log.pid, log.key));
+      clr_end = clr9962;
+    }
       target->DeleteBranchImpl(log.key);
       break;
-    case LogType::kUpdateLeaf:
-      clr_end = tm->CompensateUpdateLog(log.txn_id, log.pid, log.key,
-                                        log.undo_data);
+    case LogType::kUpdateLeaf: {
+      ASSIGN_OR_RETURN(
+          lsn_t, clr10189,
+          tm->CompensateUpdateLog(log.txn_id, log.pid, log.key, log.undo_data));
+      clr_end = clr10189;
+    }
       target->UpdateImpl(log.key, log.undo_data);
       break;
-    case LogType::kUpdateBranch:
-      clr_end = tm->CompensateUpdateBranchLog(log.txn_id, log.pid, log.key,
-                                              log.undo_page);
+    case LogType::kUpdateBranch: {
+      ASSIGN_OR_RETURN(lsn_t, clr10436,
+                       tm->CompensateUpdateBranchLog(log.txn_id, log.pid,
+                                                     log.key, log.undo_page));
+      clr_end = clr10436;
+    }
       target->UpdateBranchImpl(log.key, log.undo_page);
       break;
-    case LogType::kDeleteLeaf:
-      clr_end = tm->CompensateDeleteLog(log.txn_id, log.pid, log.key,
-                                        log.undo_data);
+    case LogType::kDeleteLeaf: {
+      ASSIGN_OR_RETURN(
+          lsn_t, clr10693,
+          tm->CompensateDeleteLog(log.txn_id, log.pid, log.key, log.undo_data));
+      clr_end = clr10693;
+    }
       target->InsertImpl(log.key, log.undo_data);
       break;
-    case LogType::kDeleteBranch:
-      clr_end = tm->CompensateDeleteBranchLog(log.txn_id, log.pid, log.key,
-                                              log.undo_page);
+    case LogType::kDeleteBranch: {
+      ASSIGN_OR_RETURN(lsn_t, clr10940,
+                       tm->CompensateDeleteBranchLog(log.txn_id, log.pid,
+                                                     log.key, log.undo_page));
+      clr_end = clr10940;
+    }
       target->InsertBranchImpl(log.key, log.undo_page);
       break;
     case LogType::kLowestValue: {
-      clr_end = tm->CompensateSetLowestValueLog(log.txn_id, log.pid,
-                                                log.undo_page);
+      {
+        ASSIGN_OR_RETURN(lsn_t, clr11200,
+                         tm->CompensateSetLowestValueLog(log.txn_id, log.pid,
+                                                         log.undo_page));
+        clr_end = clr11200;
+      }
       target->SetLowestValueBranchImpl(log.undo_page);
       break;
     }
     case LogType::kSetLowFence: {
-      auto undo_key = Decode<IndexKey>(log.undo_data);
-      clr_end = tm->CompensateSetLowFenceLog(log.txn_id, log.pid, undo_key);
+      ASSIGN_OR_RETURN(IndexKey, undo_key, Decode<IndexKey>(log.undo_data));
+      {
+        ASSIGN_OR_RETURN(
+            lsn_t, clr11513,
+            tm->CompensateSetLowFenceLog(log.txn_id, log.pid, undo_key));
+        clr_end = clr11513;
+      }
       target->SetLowFenceImpl(undo_key);
       break;
     }
     case LogType::kSetHighFence: {
-      auto undo_key = Decode<IndexKey>(log.undo_data);
-      clr_end = tm->CompensateSetHighFenceLog(log.txn_id, log.pid, undo_key);
+      ASSIGN_OR_RETURN(IndexKey, undo_key, Decode<IndexKey>(log.undo_data));
+      {
+        ASSIGN_OR_RETURN(
+            lsn_t, clr11805,
+            tm->CompensateSetHighFenceLog(log.txn_id, log.pid, undo_key));
+        clr_end = clr11805;
+      }
       target->SetHighFenceImpl(undo_key);
       break;
     }
     case LogType::kSetFoster: {
-      auto foster = Decode<FosterPair>(log.undo_data);
-      clr_end = tm->CompensateSetFosterLog(log.txn_id, log.pid, foster);
+      ASSIGN_OR_RETURN(FosterPair, foster, Decode<FosterPair>(log.undo_data));
+      {
+        ASSIGN_OR_RETURN(
+            lsn_t, clr12096,
+            tm->CompensateSetFosterLog(log.txn_id, log.pid, foster));
+        clr_end = clr12096;
+      }
       target->SetFosterImpl(foster);
       break;
     }
@@ -355,11 +409,11 @@ lsn_t LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
 }
 
 // Precondition: the page is locked by this thread.
-void PageReplay(PageRef&& target,
-                const std::vector<std::pair<lsn_t, LogRecord>>& logs,
-                const std::unordered_set<txn_id_t>& committed_txn,
-                TransactionManager* tm,
-                RecoveryManager::UndoneRecorder* undone) {
+Status PageReplay(PageRef&& target,
+                  const std::vector<std::pair<lsn_t, LogRecord>>& logs,
+                  const std::unordered_set<txn_id_t>& committed_txn,
+                  TransactionManager* tm,
+                  RecoveryManager::UndoneRecorder* undone) {
   // Redo & Undo a specific page.
 
   // Redo phase.
@@ -382,7 +436,7 @@ void PageReplay(PageRef&& target,
       if (RecoveryTraceEnabled()) {
         LOG(INFO) << "redo: " << log;
       }
-      LogRedo(target, lsn, log);
+      RETURN_IF_FAIL(LogRedo(target, lsn, log));
     }
   }
 
@@ -395,7 +449,7 @@ void PageReplay(PageRef&& target,
       if (RecoveryTraceEnabled()) {
         LOG(INFO) << "undo: " << undo_log;
       }
-      LogUndo(target, log.first, undo_log, tm);
+      RETURN_IF_FAIL(LogUndo(target, log.first, undo_log, tm).GetStatus());
       if (undone != nullptr) {
         undone->Record(log.first);
       }
@@ -407,6 +461,7 @@ void PageReplay(PageRef&& target,
     LOG(INFO) << "SPR " << target->PageID() << " finished";
   }
   target.PageUnlock();
+  return Status::kSuccess;
 }
 
 size_t RecoveryWorkerCount(size_t jobs) {
@@ -430,48 +485,48 @@ size_t RecoveryWorkerCount(size_t jobs) {
   return std::min(jobs, workers);
 }
 
-void ReplayPagesInParallel(
+Status ReplayPagesInParallel(
     PagePool* pool,
     std::vector<std::pair<page_id_t, std::vector<std::pair<lsn_t, LogRecord>>>>*
         jobs,
     const std::unordered_set<txn_id_t>& committed_txn, TransactionManager* tm,
     RecoveryManager::UndoneRecorder* undone) {
   if (jobs->empty()) {
-    return;
+    return Status::kSuccess;
   }
   const size_t workers = RecoveryWorkerCount(jobs->size());
-  auto replay_one = [&](size_t index) {
+  auto replay_one = [&](size_t index) -> Status {
     auto& [page_id, logs] = (*jobs)[index];
     // Lock and unlock on this worker thread. Moving a PageRef (and its
     // unique_lock) across threads is undefined for std::shared_mutex.
-    PageRef page = pool->GetPage(page_id, nullptr);
-    PageReplay(std::move(page), logs, committed_txn, tm, undone);
+    ASSIGN_OR_RETURN(PageRef, page, pool->GetPage(page_id, nullptr));
+    return PageReplay(std::move(page), logs, committed_txn, tm, undone);
   };
   if (workers <= 1) {
     for (size_t i = 0; i < jobs->size(); ++i) {
-      replay_one(i);
+      RETURN_IF_FAIL(replay_one(i));
     }
-    return;
+    return Status::kSuccess;
   }
 
   std::atomic<size_t> next{0};
   std::mutex error_mutex;
-  std::exception_ptr first_error;
+  Status first_error = Status::kSuccess;
   auto worker = [&]() {
-    try {
-      for (;;) {
-        const size_t index = next.fetch_add(1, std::memory_order_relaxed);
-        if (index >= jobs->size()) {
-          return;
+    for (;;) {
+      const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+      if (index >= jobs->size()) {
+        return;
+      }
+      const Status status = replay_one(index);
+      if (status != Status::kSuccess) {
+        std::scoped_lock lock(error_mutex);
+        if (first_error == Status::kSuccess) {
+          first_error = status;
         }
-        replay_one(index);
+        next.store(jobs->size(), std::memory_order_relaxed);
+        return;
       }
-    } catch (...) {
-      std::scoped_lock lock(error_mutex);
-      if (!first_error) {
-        first_error = std::current_exception();
-      }
-      next.store(jobs->size(), std::memory_order_relaxed);
     }
   };
 
@@ -483,9 +538,7 @@ void ReplayPagesInParallel(
   for (std::thread& thread : threads) {
     thread.join();
   }
-  if (first_error) {
-    std::rethrow_exception(first_error);
-  }
+  return first_error;
 }
 
 }  // namespace
@@ -530,14 +583,17 @@ bool RecoveryManager::OpenReadFd() const {
   return read_fd_ >= 0;
 }
 
-void RecoveryManager::SinglePageRecovery(PageRef&& page, TransactionManager* tm,
-                                         UndoneRecorder* undone) {
-  SinglePageRecovery(std::move(page), tm, undone, LogFileSizeOrZero(log_name_));
+Status RecoveryManager::SinglePageRecovery(PageRef&& page,
+                                           TransactionManager* tm,
+                                           UndoneRecorder* undone) {
+  return SinglePageRecovery(std::move(page), tm, undone,
+                            LogFileSizeOrZero(log_name_));
 }
 
-void RecoveryManager::SinglePageRecovery(PageRef&& page, TransactionManager* tm,
-                                         UndoneRecorder* undone,
-                                         std::uintmax_t scan_end) {
+Status RecoveryManager::SinglePageRecovery(PageRef&& page,
+                                           TransactionManager* tm,
+                                           UndoneRecorder* undone,
+                                           std::uintmax_t scan_end) {
   // Collects all logs to redo & undo for each page. RecoverFrom truncates a
   // torn tail beforehand; this break is only a standalone-call safety net.
   const std::uintmax_t filesize =
@@ -562,17 +618,17 @@ void RecoveryManager::SinglePageRecovery(PageRef&& page, TransactionManager* tm,
     }
   }
 
-  PageReplay(std::move(page), page_logs, committed_txn, tm, undone);
+  return PageReplay(std::move(page), page_logs, committed_txn, tm, undone);
 }
 
-void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
-                                  TransactionManager* tm) {
+Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
+                                    TransactionManager* tm) {
   const std::uintmax_t on_disk = LogFileSizeOrZero(log_name_);
   if (on_disk == 0) {
     // Missing or empty log (e.g. first boot of a fresh database): nothing
     // to replay.
     LOG(INFO) << "Log file absent or empty, skipping recovery: " << log_name_;
-    return;
+    return Status::kSuccess;
   }
 
   // Torn tail policy (single authority, section 1.9): the first unparseable
@@ -592,10 +648,17 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     }
     if (read_fd_ < 0) {
       LOG(ERROR) << "Log file unreadable, skipping recovery";
-      return;
+      return Status::kSuccess;
     }
     LOG(INFO) << "Truncating torn log tail: " << on_disk << " -> " << valid_end;
-    std::filesystem::resize_file(log_name_, valid_end);
+    std::error_code resize_ec;
+    std::filesystem::resize_file(log_name_, valid_end, resize_ec);
+    if (resize_ec) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to truncate torn WAL tail of " +
+                             std::string(log_name_) + ": " +
+                             resize_ec.message());
+    }
     // The Logger latched its three LSNs to the pre-truncation file size in
     // its constructor.  O_APPEND writes would land at the new EOF while
     // AddLog kept reporting offsets past it, desynchronizing every page
@@ -706,12 +769,14 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
   for (const auto& it : dirty_page_table) {
     // A broken on-disk image must reach the SPR check below verbatim, so this
     // loop bypasses PagePool checksum enforcement.
-    PageRef&& page = pool_->GetPageForRecovery(it.first, nullptr);
+    ASSIGN_OR_RETURN(PageRef, page,
+                     pool_->GetPageForRecovery(it.first, nullptr));
     if (!page->IsValid()) {
       page->page_lsn = 0;
       page->page_id = it.first;
       LOG(INFO) << "Page " << it.first << " is broken, start SPR.";
-      SinglePageRecovery(std::move(page), tm, &undone, valid_end);
+      RETURN_IF_FAIL(
+          SinglePageRecovery(std::move(page), tm, &undone, valid_end));
     } else {
       pages.emplace(it.first, std::move(page));
     }
@@ -754,12 +819,13 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     replay_jobs.emplace_back(page_id, std::move(logs));
   }
   pages.clear();
-  ReplayPagesInParallel(pool_, &replay_jobs, committed_txn, tm, &undone);
+  RETURN_IF_FAIL(
+      ReplayPagesInParallel(pool_, &replay_jobs, committed_txn, tm, &undone));
 
   // Global loser UNDO (section 1.7): compensate every record on each loser's
   // prev_lsn chain that per-page replay could not see -- pages outside the
   // dirty page table or records below redo_start_point.
-  UndoLoserChains(loser_heads, &undone, tm, valid_end);
+  RETURN_IF_FAIL(UndoLoserChains(loser_heads, &undone, tm, valid_end));
 
   // Restore the MetaPage allocator high-water mark. AllocateNewPage bumps
   // max_page_count in place without a dedicated WAL record, so a crash right
@@ -768,7 +834,8 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
   // re-issuing live page ids (which would let a later AllocateNewPage
   // PageInit over an existing tree root). Freed pages may leak (never
   // reused) but are never handed out twice.
-  PageRef meta = pool_->GetPageForRecovery(kMetaPageId, nullptr);
+  ASSIGN_OR_RETURN(PageRef, meta,
+                   pool_->GetPageForRecovery(kMetaPageId, nullptr));
   if (!meta->IsValid()) {
     meta->page_id = kMetaPageId;
     meta->page_lsn = 0;
@@ -793,7 +860,7 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
   page_id_t free_head = 0;
   size_t rebuilt_free_pages = 0;
   for (page_id_t pid = high_water; 1 <= pid; --pid) {
-    PageRef p = pool_->GetPageForRecovery(pid, nullptr);
+    ASSIGN_OR_RETURN(PageRef, p, pool_->GetPageForRecovery(pid, nullptr));
     if (p->Type() != PageType::kFreePage) {
       continue;
     }
@@ -806,6 +873,7 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     LOG(INFO) << "Rebuilt free list: " << rebuilt_free_pages
               << " pages, head=" << free_head;
   }
+  return Status::kSuccess;
 }
 
 lsn_t RecoveryManager::ValidLogEnd(lsn_t from) const {
@@ -872,13 +940,20 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
     in.str(buffer);
     Decoder dec(in);
     // ReadLog's contract is bool (false == torn/corrupt tail, treated as the
-    // valid log end). The decoder throws on an out-of-range PageType/enum or
-    // unknown log type, so a mid-record bit rot must be caught here rather
-    // than propagating out of analysis/redo and aborting startup.
-    try {
-      dec >> *dst;
-    } catch (const std::exception& error) {
-      LOG(WARN) << "WAL decode failed at LSN " << lsn << ": " << error.what();
+    // valid log end). The decoder reports an out-of-range PageType/enum or
+    // unknown log type through its sticky fail state, so a mid-record bit
+    // rot stops the scan here instead of escaping out of analysis/redo.
+    dec >> *dst;
+    if (dec.Failed()) {
+      // The sticky fail state conflates two cases: a window too small for
+      // this record (the normal first iteration for large payloads) and a
+      // genuinely corrupt discriminant. A full-window read means more bytes
+      // may exist, so grow and retry before condemning the record; only a
+      // short read (EOF) or the window ceiling proves the record torn.
+      if (std::cmp_equal(nread, want) && want < kMaxWindow) {
+        continue;
+      }
+      LOG(WARN) << "WAL decode failed at LSN " << lsn;
       return false;
     }
     if (in.good() && IsKnownLogType(dst->type)) {
@@ -920,9 +995,10 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
   }
 }
 
-void RecoveryManager::UndoLoserChains(const std::vector<lsn_t>& loser_heads,
-                                      UndoneRecorder* undone,
-                                      TransactionManager* tm, lsn_t scan_end) {
+Status RecoveryManager::UndoLoserChains(const std::vector<lsn_t>& loser_heads,
+                                        UndoneRecorder* undone,
+                                        TransactionManager* tm,
+                                        lsn_t scan_end) {
   for (lsn_t head : loser_heads) {
     std::unordered_set<lsn_t> visited;
     for (lsn_t cur = head; cur != 0;) {
@@ -934,29 +1010,32 @@ void RecoveryManager::UndoLoserChains(const std::vector<lsn_t>& loser_heads,
         break;
       }
       if (IsPageManipulation(log.type) && !undone->Contains(cur)) {
-        PageRef target = pool_->GetPageForRecovery(log.pid, nullptr);
+        ASSIGN_OR_RETURN(PageRef, target,
+                         pool_->GetPageForRecovery(log.pid, nullptr));
         if (!target->IsValid()) {
           LOG(INFO) << "Loser undo rebuilds broken page " << log.pid;
-          SinglePageRecovery(std::move(target), tm, undone, scan_end);
+          RETURN_IF_FAIL(
+              SinglePageRecovery(std::move(target), tm, undone, scan_end));
         } else if (target->PageLSN() >= cur + log.Size()) {
           // Only revert changes the page image actually reflects; with END-
           // LSN stamps "reflects" means the stamp reaches past this record's
           // end (older images never received this change, and the next
           // recovery cycle redoes+undoes it deterministically).
-          LogUndo(target, cur, log, tm);
+          RETURN_IF_FAIL(LogUndo(target, cur, log, tm).GetStatus());
           undone->Record(cur);
         }
       }
       cur = log.prev_lsn;
     }
   }
+  return Status::kSuccess;
 }
 
-void RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
-                                      TransactionManager* tm) {
+Status RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
+                                        TransactionManager* tm) {
   if (IsPageManipulation(log.type)) {
-    PageRef target = pool_->GetPage(log.pid);
-    const lsn_t clr_end = LogUndo(target, lsn, log, tm);
+    ASSIGN_OR_RETURN(PageRef, target, pool_->GetPage(log.pid));
+    ASSIGN_OR_RETURN(lsn_t, clr_end, LogUndo(target, lsn, log, tm));
     // Runtime undo: the page image now reflects the CLR, which sits at the
     // log tail ABOVE the undone record.  Leaving the stamp at the undone
     // record's end would regress page_lsn below the CLR and let the
@@ -968,6 +1047,7 @@ void RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
     target->SetRecLSN(stamp);
     target->SetPageLSN(stamp);
   }
+  return Status::kSuccess;
 }
 
 }  // namespace tinylamb

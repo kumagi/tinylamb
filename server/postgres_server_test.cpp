@@ -60,7 +60,7 @@ std::string ReadUntilReady(int fd) {
 
     size_t cursor = 0;
     while (cursor + 5 <= result.size()) {
-      const uint32_t length = pgwire::ReadUint32(result, cursor + 1);
+      const uint32_t length = pgwire::ReadUint32(result, cursor + 1).Value();
       if (length < 4 || cursor + 1 + length > result.size()) {
         break;
       }
@@ -192,7 +192,9 @@ TEST(PostgresServerTest, ExecutesQueriesOverTcpProtocol) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -252,7 +254,9 @@ TEST(PostgresServerTest, ExecutesIndependentReadsConcurrently) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -336,7 +340,9 @@ TEST(PostgresServerTest, TransactionsOverTcpProtocol) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -396,7 +402,9 @@ TEST(PostgresServerTest, ServerProtocolErrorResponses) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -429,7 +437,9 @@ TEST(PostgresServerTest, ReadWorkerReportsPrepareErrors) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -460,7 +470,9 @@ TEST(PostgresServerTest, EmptyQueryResponseOverTcp) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -606,7 +618,9 @@ TEST(PostgresServerTest, StartupPacketVariants) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -667,7 +681,9 @@ TEST(PostgresServerTest, TransactionAbortErrorState) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -713,7 +729,9 @@ TEST(PostgresServerTest, OversizedMessageLimit) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -758,7 +776,9 @@ TEST(PostgresServerTest, SyncAndFlushMessages) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -803,7 +823,9 @@ TEST(PostgresServerTest, DropTableCommandTagOverTcp) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -848,7 +870,9 @@ TEST(PostgresServerTest, SelectInsideExplicitTransaction) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -900,7 +924,9 @@ TEST(PostgresServerTest, InvalidStartupPacketLength) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -961,7 +987,9 @@ TEST(PostgresServerTest, MalformedStartupPacketWithoutTerminator) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -988,7 +1016,9 @@ TEST(PostgresServerTest, ServerDestructorClosesLiveClients) {
   // Assert -- the destructor closed the still-registered client socket
   // (the server reaches the connection and the peer observes EOF)
   {
-    Database database(path);
+    auto database_holder = Database::Create(path).MoveValue();
+    CHECK(database_holder != nullptr);
+    Database& database = *database_holder;
     database.DeleteAll();
   }
 }
@@ -1024,7 +1054,9 @@ TEST(PostgresServerTest, ListenFailsWhenPortAlreadyInUse) {
   EXPECT_NE(listen_error.find("could not bind"), std::string::npos);
 
   close(conflict);
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1041,7 +1073,9 @@ TEST(PostgresServerTest, ListenOnIpv6Loopback) {
   }
   EXPECT_NE(server.BoundPort(), 0);
   server.RequestStop();
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1080,7 +1114,9 @@ TEST(PostgresServerTest, FailedAutomaticTransactionRecoversSession) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1095,7 +1131,9 @@ TEST(PostgresServerTest, ListenFailsOnUnresolvableListenAddress) {
   EXPECT_FALSE(server.Listen(&listen_error));
   // Assert -- the error names the getaddrinfo step
   EXPECT_NE(listen_error.find("getaddrinfo"), std::string::npos);
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1156,7 +1194,9 @@ TEST(PostgresServerTest, StartTransactionAndEndAliases) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1213,7 +1253,9 @@ TEST(PostgresServerTest, MultiStatementSimpleQueryMessage) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1270,7 +1312,9 @@ TEST(PostgresServerTest, MultiStatementImplicitTransactionIsAtomic) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1330,7 +1374,9 @@ TEST(PostgresServerTest, ReadCompletionAfterClientCloseIsIgnored) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1442,7 +1488,9 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1495,7 +1543,9 @@ TEST(PostgresServerTest, DropAndRecreateTableOverTcp) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1558,7 +1608,9 @@ TEST(PostgresServerTest, ConcurrentWriteTransactionsOverTcp) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1619,7 +1671,9 @@ TEST(PostgresServerTest, ReadWorkerRejectsDataModifyingWith) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1665,7 +1719,9 @@ TEST(PostgresServerTest, SelectConstantExpressionNoTable) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1721,7 +1777,9 @@ TEST(PostgresServerTest, ExtendedQueryMessagesRejectedKeepSessionAlive) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1798,7 +1856,9 @@ TEST(PostgresServerTest, DisconnectDuringLargeResponse) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1845,7 +1905,9 @@ TEST(PostgresServerTest, ClientResetForcesRecvError) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1901,7 +1963,9 @@ TEST(PostgresServerTest, SignalInterruptsEpollWaitAndServerSurvives) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1949,7 +2013,9 @@ TEST(PostgresServerTest, GssEncRequestDeclinedThenNormalStartup) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -1994,7 +2060,9 @@ TEST(PostgresServerTest, MultiStatementDdlInsertSelectOverTcp) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -2050,7 +2118,9 @@ TEST(PostgresServerTest, RollbackAfterStatementErrorClearsAbortedState) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -2111,7 +2181,9 @@ TEST(PostgresServerTest, ReadWorkerCompletionForDisconnectedClientIsDropped) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -2156,7 +2228,9 @@ TEST(PostgresServerTest, DropTableInsideExplicitTransactionCommits) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -2210,7 +2284,9 @@ TEST(PostgresServerTest, RuntimeErrorInSynchronousTransaction) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -2258,7 +2334,9 @@ TEST(PostgresServerTest, RuntimeErrorInReadWorker) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -2313,7 +2391,9 @@ TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorStopsBatch) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -2388,7 +2468,9 @@ TEST(PostgresServerTest, StaleReadCompletionDroppedAfterFdReuse) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 
@@ -2435,7 +2517,9 @@ TEST(PostgresServerTest, DropTableInsideAbortedTransaction) {
     server_thread.join();
     EXPECT_EQ(run_result, 0) << run_error;
   }
-  Database database(path);
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
   database.DeleteAll();
 }
 

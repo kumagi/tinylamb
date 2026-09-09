@@ -91,8 +91,10 @@ FullScanIterator::FullScanIterator(
   // Scans only read: always take a shared page latch, even for writable
   // transactions, so concurrent scan workers never convoy on exclusive
   // latches.  Row-level unpinning below keeps same-thread mutations safe.
-  page_ = std::make_unique<PageRef>(
-      txn->GetPageManager()->GetPage(pos_.page_id, /*shared=*/true));
+  if (!PinPage(pos_.page_id)) {
+    pos_.page_id = ~0ULL;
+    return;
+  }
   SeekVisibleRow();
 }
 
@@ -113,8 +115,10 @@ FullScanIterator::FullScanIterator(
   if (!pos_.IsValid()) {
     return;
   }
-  page_ = std::make_unique<PageRef>(
-      txn->GetPageManager()->GetPage(pos_.page_id, /*shared=*/true));
+  if (!PinPage(pos_.page_id)) {
+    pos_.page_id = ~0ULL;
+    return;
+  }
   SeekVisibleRow();
 }
 
@@ -123,9 +127,9 @@ IteratorBase& FullScanIterator::operator++() {
     return *this;
   }
   ++pos_.slot;
-  if (page_ == nullptr) {
-    page_ = std::make_unique<PageRef>(
-        txn_->GetPageManager()->GetPage(pos_.page_id, /*shared=*/true));
+  if (page_ == nullptr && !PinPage(pos_.page_id)) {
+    pos_.page_id = ~0ULL;
+    return *this;
   }
   SeekVisibleRow();
   return *this;
@@ -233,8 +237,18 @@ bool FullScanIterator::AdvancePage() {
     return false;
   }
   pos_ = RowPosition(next_page, 0);
-  page_ = std::make_unique<PageRef>(
-      txn_->GetPageManager()->GetPage(next_page, /*shared=*/true));
+  return PinPage(next_page);
+}
+
+bool FullScanIterator::PinPage(page_id_t page_id) {
+  StatusOr<PageRef> ref =
+      txn_->GetPageManager()->GetPage(page_id, /*shared=*/true);
+  if (!ref.HasValue()) {
+    status_ = ref.GetStatus();
+    page_.reset();
+    return false;
+  }
+  page_ = std::make_unique<PageRef>(ref.MoveValue());
   return true;
 }
 
@@ -255,7 +269,8 @@ IteratorBase& FullScanIterator::operator--() {
   // Backward iteration is not implemented; the interface keeps operator--
   // because IndexScanIterator supports it.  Fail loudly instead of silently
   // breaking the iteration contract in NDEBUG builds.
-  throw std::logic_error("FullScanIterator does not support operator--");
+  CHECK_MSG(false, "FullScanIterator does not support operator--");
+  return *this;
 }
 
 void FullScanIterator::DropPageLatch() { page_.reset(); }

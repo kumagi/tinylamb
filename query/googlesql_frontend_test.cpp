@@ -23,7 +23,7 @@ TEST(GoogleSqlFrontendTest, ReturnsParserAst) {
 
 TEST(GoogleSqlFrontendTest, RejectsInvalidSqlWhenAvailable) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   GoogleSqlParseResult result = GoogleSqlFrontend::Parse("SELECT 1 + ;");
   EXPECT_FALSE(result.ok);
@@ -32,7 +32,7 @@ TEST(GoogleSqlFrontendTest, RejectsInvalidSqlWhenAvailable) {
 
 TEST(GoogleSqlFrontendTest, ParsesAndCachesCommonStatementKinds) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const std::vector<std::string> statements = {
       "CREATE TABLE t (a INT64, b STRING);",
@@ -54,7 +54,7 @@ TEST(GoogleSqlFrontendTest, ParsesAndCachesCommonStatementKinds) {
 
 TEST(GoogleSqlFrontendTest, CacheEvictsOldestStatementsPastLimit) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // The parse cache holds kMaxCachedStatements entries; feed it well beyond
   // that so the oldest-entry eviction path runs for every statement.
@@ -71,7 +71,7 @@ TEST(GoogleSqlFrontendTest, CacheEvictsOldestStatementsPastLimit) {
 
 TEST(GoogleSqlFrontendTest, RejectsMalformedStatements) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const std::vector<std::string> invalid = {
       "SELECT FROM WHERE;", "CREATE TABLE (;", "INSERT INTO VALUES;",
@@ -85,7 +85,7 @@ TEST(GoogleSqlFrontendTest, RejectsMalformedStatements) {
 
 TEST(GoogleSqlFrontendTest, ParsesJoinQueries) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
       "SELECT a.name, b.name FROM emp a JOIN dept b "
@@ -97,7 +97,7 @@ TEST(GoogleSqlFrontendTest, ParsesJoinQueries) {
 
 TEST(GoogleSqlFrontendTest, ParsesLeftOuterJoin) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
       "SELECT a.id FROM t1 a LEFT JOIN t2 b USING (id);");
@@ -107,7 +107,7 @@ TEST(GoogleSqlFrontendTest, ParsesLeftOuterJoin) {
 
 TEST(GoogleSqlFrontendTest, ParsesSubqueries) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult scalar =
       GoogleSqlFrontend::Parse("SELECT (SELECT max(x) FROM s) FROM t;");
@@ -122,7 +122,7 @@ TEST(GoogleSqlFrontendTest, ParsesSubqueries) {
 
 TEST(GoogleSqlFrontendTest, ParsesGroupByHavingOrderLimitOffset) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
       "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 ORDER BY a DESC LIMIT 5 "
@@ -137,7 +137,7 @@ TEST(GoogleSqlFrontendTest, ParsesGroupByHavingOrderLimitOffset) {
 
 TEST(GoogleSqlFrontendTest, ParsesInsertVariants) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult multi = GoogleSqlFrontend::Parse(
       R"(INSERT INTO t (a, b) VALUES (1, "x"), (2, "y");)");
@@ -153,7 +153,7 @@ TEST(GoogleSqlFrontendTest, ParsesInsertVariants) {
 
 TEST(GoogleSqlFrontendTest, ParsesCreateTableWithConstraints) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
       "CREATE TABLE t (a INT64 NOT NULL, b STRING(10) NOT NULL, PRIMARY "
@@ -166,7 +166,7 @@ TEST(GoogleSqlFrontendTest, ParsesCreateTableWithConstraints) {
 
 TEST(GoogleSqlFrontendTest, ParsesFunctionCallsAndLiterals) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
       "SELECT COUNT(*), CAST(a AS STRING), 2.5, "
@@ -182,7 +182,7 @@ TEST(GoogleSqlFrontendTest, ParsesFunctionCallsAndLiterals) {
 
 TEST(GoogleSqlFrontendTest, ParsesWithClauseAndDistinct) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult with_clause =
       GoogleSqlFrontend::Parse("WITH w AS (SELECT 1 AS x) SELECT * FROM w;");
@@ -197,7 +197,7 @@ TEST(GoogleSqlFrontendTest, ParsesWithClauseAndDistinct) {
 
 TEST(GoogleSqlFrontendTest, ParsesUpdateDeleteDropAndTransactionStatements) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const std::vector<std::string> statements = {
       "UPDATE t SET b = \"z\", a = 2 WHERE a = 1;",
@@ -215,7 +215,7 @@ TEST(GoogleSqlFrontendTest, ParsesUpdateDeleteDropAndTransactionStatements) {
 
 TEST(GoogleSqlFrontendTest, RejectsAdditionalMalformedStatements) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const std::vector<std::string> invalid = {"SELECT * FROM t WHERE;",
                                             "SELECT * FROM;",
@@ -233,7 +233,7 @@ TEST(GoogleSqlFrontendTest, RejectsAdditionalMalformedStatements) {
 
 TEST(GoogleSqlFrontendTest, CachesDistinctStatementTextsSeparately) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // Two statements that differ only in whitespace/case are distinct cache
   // keys but produce the same AST, so both must remain independently
@@ -247,7 +247,7 @@ TEST(GoogleSqlFrontendTest, CachesDistinctStatementTextsSeparately) {
 
 TEST(GoogleSqlFrontendTest, ParsesSetOperations) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const std::vector<std::string> statements = {
       "SELECT a FROM t UNION ALL SELECT b FROM s;",
@@ -266,7 +266,7 @@ TEST(GoogleSqlFrontendTest, ParsesSetOperations) {
 
 TEST(GoogleSqlFrontendTest, ParsesCaseExpressions) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult simple = GoogleSqlFrontend::Parse(
       "SELECT CASE WHEN a > 1 THEN 'x' ELSE 'y' END FROM t;");
@@ -283,7 +283,7 @@ TEST(GoogleSqlFrontendTest, ParsesCaseExpressions) {
 
 TEST(GoogleSqlFrontendTest, ParsesRangeAndPatternPredicates) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult between =
       GoogleSqlFrontend::Parse("SELECT a FROM t WHERE a BETWEEN 1 AND 5;");
@@ -303,7 +303,7 @@ TEST(GoogleSqlFrontendTest, ParsesRangeAndPatternPredicates) {
 
 TEST(GoogleSqlFrontendTest, ParsesWindowFunctions) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
       "SELECT SUM(a) OVER (PARTITION BY b ORDER BY c ROWS BETWEEN UNBOUNDED "
@@ -317,7 +317,7 @@ TEST(GoogleSqlFrontendTest, ParsesWindowFunctions) {
 
 TEST(GoogleSqlFrontendTest, ParsesExistsAndCorrelatedSubqueries) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const GoogleSqlParseResult exists = GoogleSqlFrontend::Parse(
       "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM s);");
@@ -333,7 +333,7 @@ TEST(GoogleSqlFrontendTest, ParsesExistsAndCorrelatedSubqueries) {
 
 TEST(GoogleSqlFrontendTest, ParsesDdlAndOtherStatementKinds) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   const std::vector<std::string> statements = {
       "TRUNCATE TABLE t;",
@@ -360,7 +360,7 @@ TEST(GoogleSqlFrontendTest, ParsesDdlAndOtherStatementKinds) {
 
 TEST(GoogleSqlFrontendTest, RejectsUnsupportedStatementKinds) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // The pinned GoogleSQL parser does not accept these statement kinds; each
   // must surface as a parse failure with a non-empty error payload.
@@ -376,7 +376,7 @@ TEST(GoogleSqlFrontendTest, RejectsUnsupportedStatementKinds) {
 
 TEST(GoogleSqlFrontendTest, EmptyInputReportsSuccessWithoutAst) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // Quirk of the subprocess protocol: an empty input makes the parser exit 0
   // with no output, which the frontend reports as a successful (but empty)
@@ -393,7 +393,7 @@ TEST(GoogleSqlFrontendTest, EmptyInputReportsSuccessWithoutAst) {
 
 TEST(GoogleSqlFrontendTest, PipeCreationFailureReportsError) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // Shrink the fd table so pipe() inside Parse() fails with EMFILE.
   struct rlimit original = {};
@@ -425,7 +425,7 @@ TEST(GoogleSqlFrontendTest, PipeCreationFailureReportsError) {
 
 TEST(GoogleSqlFrontendTest, ForkFailureReportsError) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // Cap the process count so the parser subprocess cannot be forked.
   struct rlimit original = {};
@@ -444,7 +444,7 @@ TEST(GoogleSqlFrontendTest, ForkFailureReportsError) {
 
 TEST(GoogleSqlFrontendTest, NonZeroParserExitIsReportedAsFailure) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // A NUL byte is rejected by the pinned parser with a hard error (exit 1),
   // which the frontend must surface as a failed parse rather than ok.
@@ -458,7 +458,7 @@ TEST(GoogleSqlFrontendTest, NonZeroParserExitIsReportedAsFailure) {
 
 TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
   // Arm a SIGALRM while Parse() is blocked reading a slow-to-parse query.
   // Without SA_RESTART the blocking read/write returns EINTR and must retry.

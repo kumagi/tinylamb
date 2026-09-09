@@ -49,14 +49,14 @@ class BranchPageTest : public ::testing::Test {
     log_name_ = prefix + ".log";
     Recover();
     auto txn = tm_->Begin();
-    PageRef page_ = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef page_ = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
     branch_page_id_ = page_->PageID();
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
   void Flush() { p_->GetPool()->FlushPageForTest(branch_page_id_); }
 
-  PageRef Page() { return p_->GetPage(branch_page_id_); }
+  PageRef Page() { return p_->GetPage(branch_page_id_).MoveValue(); }
 
   void AssertPIDForKey(std::string_view key, page_id_t expected) {
     auto txn = tm_->Begin();
@@ -74,8 +74,8 @@ class BranchPageTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
+    p_ = PageManager::Create(db_name_, 10).MoveValue();
+    l_ = Logger::Create(log_name_).MoveValue();
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
@@ -118,7 +118,7 @@ TEST_F(BranchPageTest, SetMinimumTree) {
 TEST_F(BranchPageTest, GetPageForKeyMinimum) {
   // Arrange
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(branch_page_id_);
+  PageRef page = p_->GetPage(branch_page_id_).MoveValue();
 
   // Act -- set lowest 100, insert "b"→200, then look up various keys
   page->SetLowestValue(txn, 100);
@@ -275,7 +275,7 @@ TEST_F(BranchPageTest, SplitInto) {
   // Act -- for 8 iterations, fill a branch page with 8 keys, split it into a
   //        new right page using a separator key from a different prefix
   for (int i = 0; i < 8; ++i) {
-    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
     page->SetLowestValue(txn, 0);
     for (int j = 0; j < 8; ++j) {
       ASSERT_SUCCESS(
@@ -283,7 +283,7 @@ TEST_F(BranchPageTest, SplitInto) {
                              static_cast<page_id_t>(j + 1)));
     }
 
-    PageRef right = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef right = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
     std::string mid;
     page->SplitInto(txn, std::string(4000, static_cast<char>('0' + i)),
                     right.get(), &mid);
@@ -674,8 +674,9 @@ TEST_F(BranchPageTest, MoveLeftFromFoster1) {
   PageRef page = Page();
   page->SetLowestValue(txn, 12);
   page->InsertBranch(txn, "a", 13);
-  PageRef foster =
-      txn.GetPageManager()->AllocateNewPage(txn, PageType::kBranchPage);
+  PageRef foster = txn.GetPageManager()
+                       ->AllocateNewPage(txn, PageType::kBranchPage)
+                       .MoveValue();
   foster->SetLowestValue(txn, 14);
   foster->InsertBranch(txn, "c", 15);
   foster->InsertBranch(txn, "d", 16);
@@ -831,7 +832,7 @@ TEST_F(BranchPageTest, SplitPivotAdjustment) {
   page->SetLowestValue(txn, 1);
   ASSERT_SUCCESS(page->InsertBranch(txn, "a", 2));
   ASSERT_SUCCESS(page->InsertBranch(txn, "b", 3));
-  PageRef right = p_->AllocateNewPage(txn, PageType::kBranchPage);
+  PageRef right = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
 
   // Act -- split with a separator between the two existing keys
   std::string middle;
@@ -890,8 +891,9 @@ TEST_F(BranchPageTest, FosterMergeEmptiesFosterSafely) {
   PageRef page = Page();
   page->SetLowestValue(txn, 12);
   ASSERT_SUCCESS(page->InsertBranch(txn, "a", 13));
-  PageRef foster =
-      txn.GetPageManager()->AllocateNewPage(txn, PageType::kBranchPage);
+  PageRef foster = txn.GetPageManager()
+                       ->AllocateNewPage(txn, PageType::kBranchPage)
+                       .MoveValue();
   foster->SetLowestValue(txn, 14);
   ASSERT_SUCCESS(foster->InsertBranch(txn, "c", 15));
   ASSERT_SUCCESS(page->SetFoster(txn, FosterPair("b", foster->PageID())));
@@ -921,8 +923,9 @@ TEST_F(BranchPageTest, MoveRightToFosterKeepsLookupsOrdered) {
   ASSERT_SUCCESS(page->InsertBranch(txn, "a", 2));
   ASSERT_SUCCESS(page->InsertBranch(txn, "b", 3));
   ASSERT_SUCCESS(page->InsertBranch(txn, "c", 4));
-  PageRef foster =
-      txn.GetPageManager()->AllocateNewPage(txn, PageType::kBranchPage);
+  PageRef foster = txn.GetPageManager()
+                       ->AllocateNewPage(txn, PageType::kBranchPage)
+                       .MoveValue();
   foster->SetLowestValue(txn, 5);
   ASSERT_SUCCESS(foster->InsertBranch(txn, "e", 6));
   ASSERT_SUCCESS(page->SetFoster(txn, FosterPair("d", foster->PageID())));

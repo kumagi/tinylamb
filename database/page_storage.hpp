@@ -29,15 +29,22 @@
 
 namespace tinylamb {
 
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): ownership
+// order (logger, pool, catalog managers) documents the teardown order.
 class PageStorage {
  public:
-  explicit PageStorage(std::string_view dbname, size_t wal_sync_ms = 1);
+  // Opens the WAL + page files and runs recovery. Construction failures that
+  // previously escaped as exceptions surface as Status.
+  static StatusOr<std::unique_ptr<PageStorage>> Create(std::string_view dbname,
+                                                       size_t wal_sync_ms = 1);
+  PageStorage(const PageStorage&) = delete;
+  PageStorage& operator=(const PageStorage&) = delete;
 
   Transaction Begin();
   Transaction BeginReadOnly();
-  std::string DBName() const;
-  std::string LogName() const;
-  std::string MasterRecordName() const;
+  [[nodiscard]] std::string DBName() const;
+  [[nodiscard]] std::string LogName() const;
+  [[nodiscard]] std::string MasterRecordName() const;
 
   void DiscardAllUpdates();
 
@@ -56,12 +63,20 @@ class PageStorage {
   //    background worker, which keeps dereferencing tm_/pp_/logger_ until
   //    that join completes. Any other order risks use-after-free at
   //    shutdown or a failed startup.
+  PageStorage(std::string_view dbname, std::unique_ptr<Logger> logger,
+              std::unique_ptr<PageManager> pm,
+              std::unique_ptr<RecoveryManager> rm,
+              std::unique_ptr<TransactionManager> tm,
+              std::unique_ptr<CheckpointManager> cm);
+
   std::string dbname_;
-  Logger logger_;
-  PageManager pm_;
-  RecoveryManager rm_;
-  TransactionManager tm_;
-  CheckpointManager cm_;
+  std::unique_ptr<Logger> logger_;
+  std::unique_ptr<PageManager> pm_;
+  // rm_/tm_/cm_ keep raw pointers into logger_/pm_, so they must be
+  // constructed after them and destroyed before them (declaration order).
+  std::unique_ptr<RecoveryManager> rm_;
+  std::unique_ptr<TransactionManager> tm_;
+  std::unique_ptr<CheckpointManager> cm_;
 };
 
 }  // namespace tinylamb

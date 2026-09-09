@@ -65,14 +65,16 @@ std::vector<Row> Drain(SqlEngine& engine, TransactionContext& context,
   *status = Status::kSuccess;
   std::vector<Row> rows;
   Row row;
-  try {
-    while (prepared.Value()->Next(&row, nullptr)) {
-      rows.push_back(row);
-    }
-  } catch (const std::exception& ex) {
+  while (prepared.Value()->Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  // Executors surface query errors as a sticky status (Next returns false
+  // at EOF and on failure); inspect it after the drain to tell the two
+  // apart (no-exception-rule-migration.md Phase 6).
+  if (const Status st = prepared.Value()->GetStatus(); st != Status::kSuccess) {
     *status = Status::kUnknown;
     if (error_msg != nullptr) {
-      *error_msg = ex.what();
+      *error_msg = ToString(st);
     }
     return {};
   }
@@ -394,7 +396,7 @@ ARRAY<STRUCT<id INT64, category INT64, score INT64>>[]
 TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
   const std::string directory = TINYLAMB_GOOGLESQL_COMPLIANCE_DIR;
   if (directory.empty() || !std::filesystem::exists(directory)) {
-    GTEST_SKIP() << "compliance testdata directory is not configured";
+    GTEST_SKIP() << true;
   }
   const std::vector<std::string> files =
       ListGoogleSqlComplianceFiles(directory);
@@ -422,7 +424,7 @@ TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
       EXPECT_FALSE(test_case.sql.empty()) << name << " / " << test_case.name;
     }
   }
-  EXPECT_GE(files.size(), 200U) << "vendored corpus looks truncated";
+  EXPECT_GE(files.size(), 200U) << true;
   EXPECT_GE(case_count, 1000U);
   EXPECT_GT(error_count, 0U);
   EXPECT_GT(prepare_count, 0U);
@@ -488,10 +490,10 @@ class GoogleSqlComplianceFileTest
 TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   const std::string directory = TINYLAMB_GOOGLESQL_COMPLIANCE_DIR;
   if (directory.empty() || !std::filesystem::exists(directory)) {
-    GTEST_SKIP() << "compliance testdata directory is not configured";
+    GTEST_SKIP() << true;
   }
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+    GTEST_SKIP() << true;
   }
 
   const std::filesystem::path path =
@@ -508,7 +510,7 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   }
 
   const std::string path_prefix = "googlesql_compliance-" + RandomString(8);
-  auto database = std::make_unique<Database>(path_prefix);
+  auto database = Database::Create(path_prefix).MoveValue();
   auto context = std::make_unique<TransactionContext>(database->BeginContext());
   auto engine = std::make_unique<SqlEngine>(*database);
 
@@ -518,9 +520,9 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   // storage prefix per rebuild keeps a destroyed instance's WAL from being
   // recovered into its replacement.
   struct PreparedSegment {
-    std::vector<std::string> statements;
+    std::vector<std::string> statements{};
     bool first_column_is_primary_key{false};
-    std::vector<std::string> secondary_indexes;
+    std::vector<std::string> secondary_indexes{};
   };
   std::vector<PreparedSegment> prepare_segments;
   int environment_generation = 0;
@@ -595,7 +597,7 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       database.reset();
       const std::string case_prefix =
           path_prefix + "-" + std::to_string(++environment_generation);
-      database = std::make_unique<Database>(case_prefix);
+      database = Database::Create(case_prefix).MoveValue();
       context = std::make_unique<TransactionContext>(database->BeginContext());
       engine = std::make_unique<SqlEngine>(*database);
       replay_prepared_state();

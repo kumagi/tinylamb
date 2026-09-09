@@ -63,7 +63,7 @@ class FullScanIteratorTest : public ::testing::Test {
     if (db_) {
       db_->EmulateCrash();
     }
-    db_ = std::make_unique<Database>(prefix_);
+    db_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { db_->DeleteAll(); }

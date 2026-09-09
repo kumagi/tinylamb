@@ -46,6 +46,10 @@ std::string FormatProtoTextScalar(std::string_view raw_token);
 // optional).  A single match yields the scalar/message value; repeated
 // matches yield an array.  Date/timestamp FORMAT annotations implied by the
 // field name are applied to the produced values.  Returns false when absent.
+[[nodiscard]] StatusOr<bool> TryProtoTextExtractField(std::string_view text,
+                                                      std::string_view key,
+                                                      Value* out);
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 bool ProtoTextExtractField(std::string_view text, std::string_view key,
                            Value* out);
 
@@ -56,6 +60,10 @@ bool ProtoTextHasField(std::string_view text, std::string_view key);
 // a dotted path inside a proto TEXT payload.  Existing entries keep their
 // position; new entries append at the end of their containing message.
 // Throws std::runtime_error for required-field violations.
+[[nodiscard]] StatusOr<std::optional<std::string>> TryProtoTextSetField(
+    std::string_view text, const std::vector<std::string>& path,
+    const Value& new_value, const std::string& type_name);
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 std::optional<std::string> ProtoTextSetField(
     std::string_view text, const std::vector<std::string>& path,
     const Value& new_value, const std::string& type_name);
@@ -64,6 +72,10 @@ std::optional<std::string> ProtoTextSetField(
 // NULL scalars are omitted, arrays fan out into repeated entries, message-
 // looking strings nest as "field { ... }".  Enforces required fields for the
 // known compliance protos; throws std::runtime_error on violation.
+[[nodiscard]] StatusOr<std::string> TryConstructProtoText(
+    const std::string& type_name,
+    const std::vector<std::pair<std::string, Value>>& fields);
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 std::string ConstructProtoText(
     const std::string& type_name,
     const std::vector<std::pair<std::string, Value>>& fields);
@@ -71,6 +83,10 @@ std::string ConstructProtoText(
 // Rejects values that cannot be stored into an enum-typed field: INT64 into
 // proto2 enums (proto3 keeps unknown numeric members), and strings outside
 // the declared member list.  No-op for unmodelled (type, field) pairs.
+[[nodiscard]] Status TryValidateEnumFieldValue(const std::string& type_name,
+                                               const std::string& field_name,
+                                               const Value& value);
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 void ValidateEnumFieldValue(const std::string& type_name,
                             const std::string& field_name, const Value& value);
 
@@ -81,6 +97,10 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
 
 // One-stop proto TEXT field read used by scalar field access: only applies
 // when the text plausibly holds proto TEXT entries; false otherwise.
+[[nodiscard]] StatusOr<bool> TryReadProtoTextField(std::string_view text,
+                                                   std::string_view key,
+                                                   Value* out);
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 bool TryProtoTextGetField(std::string_view text, std::string_view key,
                           Value* out);
 

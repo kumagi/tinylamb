@@ -115,9 +115,7 @@ class ColumnCollector {
       ++null_count_;
       return;
     }
-    if (value.type != type_) {
-      throw std::runtime_error("column statistics type mismatch");
-    }
+    CHECK_MSG(value.type == type_, "column statistics type mismatch");
     ++non_null_count_;
     const Value compacted = CompactValue(value);
     TrackLowest(compacted);
@@ -530,15 +528,14 @@ double EstimatePredicate(const TableStatistics& table,
     return 1;
   }
   if (predicate->TouchedColumns().empty()) {
-    try {
-      const Value value = predicate->Evaluate(Row(), Schema());
-      if (value.IsNull()) {
-        return 0;
-      }
-      return value.Truthy() ? 1 : 0;
-    } catch (const std::exception&) {
+    StatusOr<Value> value = predicate->TryEvaluate(Row(), Schema());
+    if (!value.HasValue()) {
       return 1;
     }
+    if (value.Value().IsNull()) {
+      return 0;
+    }
+    return value.Value().Truthy() ? 1 : 0;
   }
 
   if (predicate->Type() == TypeTag::kUnaryExp) {
@@ -929,8 +926,11 @@ double TableStatistics::ReductionFactor(const Schema& schema,
 
 double TableStatistics::EstimateCount(int column_index, const Value& from,
                                       const Value& to) const {
+  CHECK_MSG(
+      column_index >= 0 && static_cast<size_t>(column_index) < stats_.size(),
+      "statistics column index");
   if (column_index < 0 || static_cast<size_t>(column_index) >= stats_.size()) {
-    throw std::out_of_range("statistics column index");
+    return 0;
   }
   const ColumnStats& column_stats = stats_[static_cast<size_t>(column_index)];
   std::optional<Value> lower = CoerceValue(from, column_stats.Type());
@@ -1067,7 +1067,8 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
     uint64_t rows = 0;
     decoder >> version;
     if (version != kStatisticsVersion) {
-      throw std::runtime_error("unsupported table statistics version");
+      decoder.Fail();
+      return decoder;
     }
     decoder >> rows >> stats.stats_;
     stats.row_count_ = rows;
@@ -1078,7 +1079,8 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
   constexpr uint64_t kMaxLegacyColumnCount = 4096;
   if (marker > kMaxLegacyColumnCount) {
     // Corrupt/fuzzed input must not turn the marker into an allocation bomb.
-    throw std::runtime_error("corrupt legacy table statistics header");
+    decoder.Fail();
+    return decoder;
   }
   stats.stats_.clear();
   stats.stats_.resize(marker);
@@ -1130,7 +1132,8 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
         decoder >> count >> distinct;
         break;
       case ValueType::kNull:
-        throw std::runtime_error("invalid legacy column statistics");
+        decoder.Fail();
+        return decoder;
     }
     column.non_null_count_ = count;
     column.distinct_count_ = distinct;

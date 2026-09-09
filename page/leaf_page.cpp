@@ -78,7 +78,7 @@ Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
   }
 
   InsertImpl(key, value);
-  txn.InsertLeafLog(page_id, key, value);
+  RETURN_IF_FAIL(txn.InsertLeafLog(page_id, key, value).GetStatus());
   return Status::kSuccess;
 }
 
@@ -146,7 +146,7 @@ Status LeafPage::Update(page_id_t page_id, Transaction& txn,
     return Status::kNoSpace;
   }
 
-  txn.UpdateLeafLog(page_id, key, value, old_value);
+  RETURN_IF_FAIL(txn.UpdateLeafLog(page_id, key, value, old_value).GetStatus());
   UpdateImpl(key, value);
   return Status::kSuccess;
 }
@@ -201,7 +201,7 @@ void LeafPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
 Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
                         std::string_view key) {
   ASSIGN_OR_RETURN(std::string_view, existing_value, Read(page_id, txn, key));
-  txn.DeleteLeafLog(page_id, key, existing_value);
+  RETURN_IF_FAIL(txn.DeleteLeafLog(page_id, key, existing_value).GetStatus());
   DeleteImpl(key);
   return Status::kSuccess;
 }
@@ -421,7 +421,7 @@ Status LeafPage::SetLowFence(page_id_t pid, Transaction& txn,
       space != Status::kSuccess) {
     return space;
   }
-  txn.SetLowFence(pid, lf, GetLowFence());
+  RETURN_IF_FAIL(txn.SetLowFence(pid, lf, GetLowFence()).GetStatus());
   SetFence(low_fence_, lf);
   return Status::kSuccess;
 }
@@ -432,7 +432,7 @@ Status LeafPage::SetHighFence(page_id_t pid, Transaction& txn,
       space != Status::kSuccess) {
     return space;
   }
-  txn.SetHighFence(pid, hf, GetHighFence());
+  RETURN_IF_FAIL(txn.SetHighFence(pid, hf, GetHighFence()).GetStatus());
   SetFence(high_fence_, hf);
   return Status::kSuccess;
 }
@@ -474,9 +474,11 @@ Status LeafPage::SetFoster(page_id_t pid, Transaction& txn,
   }
   StatusOr<FosterPair> prev_foster = GetFoster();
   if (prev_foster.HasValue()) {
-    txn.SetFoster(pid, new_foster, prev_foster.Value());
+    RETURN_IF_FAIL(
+        txn.SetFoster(pid, new_foster, prev_foster.Value()).GetStatus());
   } else {
-    txn.SetFoster(pid, new_foster, FosterPair("", 0));
+    RETURN_IF_FAIL(
+        txn.SetFoster(pid, new_foster, FosterPair("", 0)).GetStatus());
   }
   SetFosterImpl(new_foster);
   return Status::kSuccess;

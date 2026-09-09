@@ -59,25 +59,36 @@ constexpr page_id_t kDefaultTableRoot = 1;
 constexpr page_id_t kDefaultStatisticsRoot = 2;
 constexpr page_id_t kDefaultFunctionRoot = 3;
 
-Database::Database(std::string_view dbname, size_t wal_sync_ms)
+StatusOr<std::unique_ptr<Database>> Database::Create(std::string_view dbname,
+                                                     size_t wal_sync_ms) {
+  ASSIGN_OR_RETURN(std::unique_ptr<PageStorage>, storage,
+                   PageStorage::Create(dbname, wal_sync_ms));
+  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+  auto database = std::unique_ptr<Database>(
+      new Database(dbname, std::move(storage)));  // NOLINT
+  auto ctx = database->BeginContext();
+  ASSIGN_OR_RETURN(BPlusTree, catalog,
+                   BPlusTree::Open(ctx.txn_, kDefaultTableRoot));
+  database->catalog_ = catalog;
+  ASSIGN_OR_RETURN(BPlusTree, statistics,
+                   BPlusTree::Open(ctx.txn_, kDefaultStatisticsRoot));
+  database->statistics_ = statistics;
+  ASSIGN_OR_RETURN(BPlusTree, functions,
+                   BPlusTree::Open(ctx.txn_, kDefaultFunctionRoot));
+  database->functions_ = functions;
+  RETURN_IF_FAIL(ctx.txn_.PreCommit());
+  return database;
+}
+
+Database::Database(std::string_view /*dbname*/,
+                   std::unique_ptr<PageStorage> storage)
     : catalog_(kDefaultTableRoot),
       statistics_(kDefaultStatisticsRoot),
       functions_(kDefaultFunctionRoot),
-      storage_(dbname, wal_sync_ms) {
-  auto ctx = BeginContext();
-  catalog_ = BPlusTree(ctx.txn_, kDefaultTableRoot);
-  statistics_ = BPlusTree(ctx.txn_, kDefaultStatisticsRoot);
-  functions_ = BPlusTree(ctx.txn_, kDefaultFunctionRoot);
-  if (ctx.txn_.PreCommit() != Status::kSuccess) {
-    // Let the embedder decide how to fail (the CLI main catches this);
-    // exit(1) here would skip Logger fsync and PagePool cleanup.
-    throw std::runtime_error("Failed to initialize relations: " +
-                             std::string(dbname));
-  }
-}
+      storage_(std::move(storage)) {}
 
 std::ostream& operator<<(std::ostream& o, const Database& db) {
-  o << "Database(storage=" << db.storage_
+  o << "Database(storage=" << *db.storage_
     << ", catalogs=<BPlusTree; use DebugDump(txn, o) for details>)";
   return o;
 }
@@ -197,12 +208,20 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
         }
       }
     }
-    if (exists || read_result.GetStatus() != Status::kNotExists) {
+    if (exists) {
       return Status::kConflicts;
     }
+    const Status read_status = read_result.GetStatus();
+    if (read_status != Status::kNotExists) {
+      // A corrupt or unreadable catalog entry is not "table already
+      // exists"; surface the real failure instead of a misleading
+      // kConflicts.
+      return read_status;
+    }
   }
-  PageRef table_page =
-      storage_.pm_.AllocateNewPage(ctx.txn_, PageType::kRowPage);
+  ASSIGN_OR_RETURN(
+      PageRef, table_page,
+      storage_->pm_->AllocateNewPage(ctx.txn_, PageType::kRowPage));
   Table new_table(schema, table_page->PageID());
   TableStatistics new_stat(schema);
   // CreateIndex full-scans the table and reacquires this page latch.
@@ -214,14 +233,20 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
     for (size_t i = 0; i < new_table.IndexCount(); ++i) {
       for (const page_id_t idx_pid :
            BPlusTree::CollectPageIds(ctx.txn_, new_table.GetIndex(i).Root())) {
-        PageRef page = storage_.pm_.GetPage(idx_pid);
-        storage_.pm_.DestroyPage(ctx.txn_, &*page);
-        page.PageUnlock();
+        auto page = storage_->pm_->GetPage(idx_pid);
+        if (page.HasValue()) {
+          storage_->pm_->DestroyPage(ctx.txn_, &*page.Value());
+          page.Value().PageUnlock();
+        }
       }
     }
-    PageRef page = storage_.pm_.GetPage(new_table.first_pid_);
-    storage_.pm_.DestroyPage(ctx.txn_, &*page);
-    page.PageUnlock();
+    {
+      auto page = storage_->pm_->GetPage(new_table.first_pid_);
+      if (page.HasValue()) {
+        storage_->pm_->DestroyPage(ctx.txn_, &*page.Value());
+        page.Value().PageUnlock();
+      }
+    }
     return failure;
   };
 
@@ -293,27 +318,27 @@ Status Database::DropTable(TransactionContext& ctx,
   {
     page_id_t pid = tbl.first_pid_;
     while (pid != 0) {
-      PageRef page = storage_.pm_.GetPage(pid);
+      ASSIGN_OR_RETURN(PageRef, page, storage_->pm_->GetPage(pid));
       if (!page.IsValid()) {
         break;
       }
       const page_id_t next = page->body.row_page.next_page_id_;
-      storage_.pm_.DestroyPage(ctx.txn_, &*page);
+      RETURN_IF_FAIL(storage_->pm_->DestroyPage(ctx.txn_, &*page));
       page.PageUnlock();
       pid = next;
     }
     for (size_t i = 0; i < tbl.IndexCount(); ++i) {
       for (const page_id_t idx_pid :
            BPlusTree::CollectPageIds(ctx.txn_, tbl.GetIndex(i).Root())) {
-        PageRef page = storage_.pm_.GetPage(idx_pid);
+        ASSIGN_OR_RETURN(PageRef, page, storage_->pm_->GetPage(idx_pid));
         if (!page.IsValid()) {
           continue;
         }
-        storage_.pm_.DestroyPage(ctx.txn_, &*page);
+        RETURN_IF_FAIL(storage_->pm_->DestroyPage(ctx.txn_, &*page));
         page.PageUnlock();
       }
     }
-    storage_.pm_.ForgetTableTail(tbl.first_pid_);
+    storage_->pm_->ForgetTableTail(tbl.first_pid_);
   }
   // Invalidate cached images so later lookups observe the drop.
   ctx.tables_.erase(canonical);
@@ -519,13 +544,13 @@ Status Database::RefreshStatistics(TransactionContext& ctx,
   return UpdateStatistics(ctx, schema_name, stats);
 }
 
-void Database::EmulateCrash() { storage_.DiscardAllUpdates(); }
+void Database::EmulateCrash() { storage_->DiscardAllUpdates(); }
 
 void Database::DeleteAll() {
   EmulateCrash();
-  std::ignore = std::remove(storage_.DBName().c_str());
-  std::ignore = std::remove(storage_.LogName().c_str());
-  std::ignore = std::remove(storage_.MasterRecordName().c_str());
+  std::ignore = std::remove(storage_->DBName().c_str());
+  std::ignore = std::remove(storage_->LogName().c_str());
+  std::ignore = std::remove(storage_->MasterRecordName().c_str());
 }
 
 }  // namespace tinylamb

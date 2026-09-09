@@ -12,6 +12,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/constants.hpp"
+#include "common/exc_shim.hpp"
+#include "common/status_or.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
@@ -27,9 +30,23 @@ class TransactionContext;
 namespace tinylamb::relational_detail {
 
 bool Truthy(const Value& value);
-Value Lookup(const ColumnName& name, const Scope& scope);
+StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope);
+
+// EXC-SHIM: remove with the boundary catch (see
+// no-exception-rule-migration.md).
+inline Value Lookup(const ColumnName& name, const Scope& scope) {
+  return ExcShimUnwrap(TryLookup(name, scope), "Lookup");
+}
 bool Like(std::string_view value, std::string_view pattern);
-Value Binary(BinaryOperation operation, const Value& left, const Value& right);
+StatusOr<Value> TryBinary(BinaryOperation operation, const Value& left,
+                          const Value& right);
+
+// EXC-SHIM: remove with the boundary catch (see
+// no-exception-rule-migration.md).
+inline Value Binary(BinaryOperation operation, const Value& left,
+                    const Value& right) {
+  return ExcShimUnwrap(TryBinary(operation, left, right), "Binary");
+}
 
 bool ContainsAggregate(const Expression& expression);
 
@@ -67,6 +84,8 @@ using DistinctValueSet =
 // where raw IEEE bit patterns would otherwise count NaNs as distinct.
 [[nodiscard]] Value CanonicalDistinctValue(const Value& value);
 
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): the layout
+// mirrors the per-stat switch structure for readability.
 struct AggregateAccumulator {
   explicit AggregateAccumulator(const AggregateExpression* aggregate);
 
@@ -75,7 +94,9 @@ struct AggregateAccumulator {
   // Full-input accumulation: buffers rows for aggregates that need whole-group
   // context (HAVING modifier, inner ORDER BY/LIMIT, ARRAY_AGG, STRING_AGG).
   void Add(AggregateInput input);
-  Value Finish() const;
+  StatusOr<Value> TryFinish() const;
+  // EXC-SHIM (see no-exception-rule-migration.md).
+  Value Finish() const { return ExcShimUnwrap(TryFinish(), "Finish"); }
   [[nodiscard]] bool IsDone() const;
 
   const AggregateExpression* expression;
@@ -171,28 +192,60 @@ struct AggregateAccumulator {
   // APPROX_COUNT_DISTINCT distinct-value tracking (exact within engine).
   std::unique_ptr<std::unordered_set<Value>> approx_distinct_;
 
-  void ApplyCore(const Value& value,
-                 const std::vector<Value>& trailing_values = {},
-                 const std::vector<Value>& order_keys = {});
-  void RecordQuantileParam(const std::vector<Value>& trailing_values);
-  void RecordLimitParam(const std::vector<Value>& trailing_values);
+  Status TryApplyCore(const Value& value,
+                      const std::vector<Value>& trailing_values = {},
+                      const std::vector<Value>& order_keys = {});
+  // EXC-SHIM (see no-exception-rule-migration.md).
+  void ApplyCore(const Value& value, const std::vector<Value>& trailing = {},
+                 const std::vector<Value>& order = {}) {
+    ExcShimCheck("ApplyCore", TryApplyCore(value, trailing, order));
+  }
+
+  Status TryRecordQuantileParam(const std::vector<Value>& trailing_values);
+  // EXC-SHIM (see no-exception-rule-migration.md).
+  void RecordQuantileParam(const std::vector<Value>& t) {
+    ExcShimCheck("RecordQuantileParam", TryRecordQuantileParam(t));
+  }
+  Status TryRecordLimitParam(const std::vector<Value>& trailing_values);
+  // EXC-SHIM (see no-exception-rule-migration.md).
+  void RecordLimitParam(const std::vector<Value>& t) {
+    ExcShimCheck("RecordLimitParam", TryRecordLimitParam(t));
+  }
   SumWeight& FindOrAddTopSum(const Value& value);
   int64_t& FindOrAddTopCount(const Value& value);
-  void SketchAdd(const Value& value, const std::vector<Value>& trailing_values);
-  void SketchMerge(const Value& sketch_bytes);
+  Status SketchAdd(const Value& value,
+                   const std::vector<Value>& trailing_values);
+  Status TrySketchMerge(const Value& sketch_bytes);
+  // EXC-SHIM (see no-exception-rule-migration.md).
+  void SketchMerge(const Value& sketch_bytes) {
+    ExcShimCheck("SketchMerge", TrySketchMerge(sketch_bytes));
+  }
   // HLL_COUNT.MERGE folds EXTRACT into the aggregate; MERGE_PARTIAL returns
   // the merged sketch bytes instead.
   Value FinishSketch(bool extract_count) const;
-  void ElementwiseApply(const Value& array);
+  Status TryElementwiseApply(const Value& array);
+  // EXC-SHIM (see no-exception-rule-migration.md).
+  void ElementwiseApply(const Value& array) {
+    ExcShimCheck("ElementwiseApply", TryElementwiseApply(array));
+  }
   Value FinishApproxTop(const std::vector<BufferedRow>& rows) const;
 };
 
 using AggregateResultMap =
     std::unordered_map<const AggregateExpression*, Value>;
 
-Value Evaluate(const Expression& expression, const Scope& scope,
-               const AggregateResultMap* aggregates,
-               TransactionContext& context, const CteMap& ctes);
+StatusOr<Value> TryEvaluate(const Expression& expression, const Scope& scope,
+                            const AggregateResultMap* aggregates,
+                            TransactionContext& context, const CteMap& ctes);
+
+// EXC-SHIM: remove with the boundary catch (see
+// no-exception-rule-migration.md).
+inline Value Evaluate(const Expression& expression, const Scope& scope,
+                      const AggregateResultMap* aggregates,
+                      TransactionContext& context, const CteMap& ctes) {
+  return ExcShimUnwrap(
+      TryEvaluate(expression, scope, aggregates, context, ctes), "Evaluate");
+}
 
 Schema QualifySchema(const Schema& schema, std::string_view qualifier);
 

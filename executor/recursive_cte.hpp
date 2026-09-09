@@ -35,7 +35,7 @@ class RecursiveCteExecutor final : public ExecutorBase {
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  void Initialize();
+  Status Initialize();
 
   TransactionContext& context_;
   std::string cte_name_;

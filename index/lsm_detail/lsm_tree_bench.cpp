@@ -68,7 +68,9 @@ int main(int argc, char** argv) {
   if (opts.contains('k')) {
     std::filesystem::path path = "tmp_blob_file_test-" + RandomString();
     std::filesystem::create_directory(path);
-    LSMTree tree(path);
+    auto tree_holder = LSMTree::Create(path).MoveValue();
+    CHECK(tree_holder != nullptr);
+    LSMTree& tree = *tree_holder;
     Bench(
         kCount,
         [&]() {
@@ -107,9 +109,10 @@ int main(int argc, char** argv) {
           kCount,
           [&]() {
             volatile size_t sink = 0;
-            for (LSMView::Iterator it = vm.Begin(); it.IsValid(); ++it) {
-              std::string key = it.Key();
-              std::string value = it.Value();
+            for (LSMView::Iterator it = vm.Begin().MoveValue(); it.IsValid();
+                 ++it) {
+              std::string key = it.Key().Value();
+              std::string value = it.Value().Value();
               sink += key.size() + value.size();
             }
           },
@@ -144,9 +147,10 @@ int main(int argc, char** argv) {
             kCount,
             [&]() {
               volatile size_t sink = 0;
-              for (LSMView::Iterator it = vm2.Begin(); it.IsValid(); ++it) {
-                std::string key = it.Key();
-                std::string value = it.Value();
+              for (LSMView::Iterator it = vm2.Begin().MoveValue(); it.IsValid();
+                   ++it) {
+                std::string key = it.Key().Value();
+                std::string value = it.Value().Value();
                 sink += key.size() + value.size();
               }
             },

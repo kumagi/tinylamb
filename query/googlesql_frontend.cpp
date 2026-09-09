@@ -334,6 +334,29 @@ std::string MaskLiteralsAndComments(std::string_view sql) {
       blank(begin, i);
       continue;
     }
+    if (c == '$') {
+      // Dollar-quoted string: $tag$ ... $tag$ with an optional identifier
+      // tag.  GoogleSQL literals can legitimately contain quotes and
+      // keyword-bearing text, so they must be masked like the quoted forms.
+      const size_t begin = i;
+      size_t j = i + 1;
+      while (j < sql.size() &&
+             (std::isalnum(static_cast<unsigned char>(sql[j])) != 0 ||
+              sql[j] == '_')) {
+        ++j;
+      }
+      if (j < sql.size() && sql[j] == '$') {
+        const std::string tag(sql.substr(i, j - i + 1));
+        const size_t end = sql.find(tag, j + 1);
+        i = end == std::string_view::npos ? sql.size() : end + tag.size();
+        blank(begin, std::min(i, sql.size()));
+        continue;
+      }
+      // Not a dollar quote (parameter placeholder or similar); leave the
+      // byte in place.
+      ++i;
+      continue;
+    }
     if (c == '`') {
       const size_t begin = i;
       ++i;
@@ -541,7 +564,9 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
     GoogleSqlParseResult keys_res =
         ParseViaSubprocess("SELECT " + distinct_keys + ";");
     if (!keys_res.ok) {
-      return main_res;
+      // A malformed DISTINCT ON key list is a parse error, not a silent
+      // downgrade to plain DISTINCT (which would run different semantics).
+      return keys_res;
     }
 
     size_t select_pos = std::string::npos;

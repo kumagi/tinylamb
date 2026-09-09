@@ -38,11 +38,15 @@ class PageManager {
   static constexpr page_id_t kMetaPageId = 0;
 
  public:
-  PageManager(std::string_view db_name, size_t capacity);
+  // Opens the backing page file and initializes the meta page.
+  static StatusOr<std::unique_ptr<PageManager>> Create(std::string_view db_name,
+                                                       size_t capacity);
+  PageManager(const PageManager&) = delete;
+  PageManager& operator=(const PageManager&) = delete;
 
-  PageRef GetPage(page_id_t page_id, bool shared = false);
+  StatusOr<PageRef> GetPage(page_id_t page_id, bool shared = false);
 
-  PageRef AllocateNewPage(Transaction& txn, PageType new_page_type);
+  StatusOr<PageRef> AllocateNewPage(Transaction& txn, PageType new_page_type);
 
   // Table metadata on disk records a conservative append starting point.
   // Keep the live tail per table in the PageManager so independently decoded
@@ -65,20 +69,23 @@ class PageManager {
   void PopFreePageHead(page_id_t pid, page_id_t next);
 
   // Logically delete the page.
-  void DestroyPage(Transaction& txn, Page* target);
+  Status DestroyPage(Transaction& txn, Page* target);
 
-  PagePool* GetPool() { return &pool_; }
+  PagePool* GetPool() { return pool_.get(); }
 
   friend std::ostream& operator<<(std::ostream& o, const PageManager& pm) {
-    o << "PageManager(pool=" << pm.pool_ << ")";
+    o << "PageManager(pool=" << *pm.pool_ << ")";
     return o;
   }
 
  private:
-  PageRef GetMetaPage();
+  PageManager(std::string_view db_name, size_t capacity,
+              std::unique_ptr<PagePool> pool);
+
+  StatusOr<PageRef> GetMetaPage();
 
   friend class RecoveryManager;
-  PagePool pool_;
+  std::unique_ptr<PagePool> pool_;
   std::mutex table_tails_mu_;
   std::unordered_map<page_id_t, page_id_t> table_tails_;
 };

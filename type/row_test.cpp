@@ -183,7 +183,9 @@ TEST(RowTest, Serialize_WithTooManyColumns_ThrowsInsteadOfCorrupting) {
   // collided with the null-bitmap flag, silently corrupting the image.
   const Row big(std::vector<Value>(32768, Value(int64_t{1})));
   std::vector<char> buf(big.Size() + 16);
-  EXPECT_THROW(std::ignore = big.Serialize(buf.data()), std::runtime_error);
+  EXPECT_EQ(big.CheckSerializable(), Status::kTooBigData);
+  EXPECT_DEATH(std::ignore = big.Serialize(buf.data()),
+               "too many columns to serialize a row");
 
   // 32767 columns must still round-trip.
   std::vector<Column> cols;

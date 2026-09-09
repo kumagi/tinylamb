@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/join_kind.hpp"
@@ -28,6 +29,12 @@ namespace tinylamb {
 // merge join concurrently across worker threads.
 class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  ParallelMergeJoin(const ParallelMergeJoin&) = delete;
+  ParallelMergeJoin& operator=(const ParallelMergeJoin&) = delete;
+  ParallelMergeJoin(ParallelMergeJoin&&) = delete;
+  ParallelMergeJoin& operator=(ParallelMergeJoin&&) = delete;
   struct PartitionRange {
     size_t left_start{0};
     size_t left_end{0};
@@ -77,6 +84,7 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
   // Residual (non-equi) predicate over the concatenated pair; always true
   // when no residual was given.
   [[nodiscard]] bool PairPasses(const Row& left, const Row& right) const;
+  mutable Status residual_error_{Status::kSuccess};
 
   Executor left_;
   std::vector<slot_t> left_cols_;
@@ -89,6 +97,9 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
   // Full right row width used for left-outer NULL padding; inferred from the
   // first right row when the right side is non-empty.
   size_t right_width_{0};
+  // Full left row width used for right-outer NULL padding; inferred the same
+  // way from the first left row.
+  size_t left_width_{0};
 
   std::vector<std::pair<Row, RowPosition>> left_rows_;
   std::vector<std::pair<Row, RowPosition>> right_rows_;

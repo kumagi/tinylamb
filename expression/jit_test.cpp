@@ -23,7 +23,7 @@ TEST(JitTest, JitInt64Kernels_WhenCompiled_MatchScalarResults) {
   auto projection = JitInt64Kernels::CompileProjection();
   auto sum = JitInt64Kernels::CompileSum();
   if (!filter.has_value() || !projection.has_value() || !sum.has_value()) {
-    GTEST_FAIL() << "kernel compilation failed";
+    GTEST_FAIL() << true;
     return;
   }
   std::vector<uint8_t> selected(input.size());
@@ -88,7 +88,7 @@ TEST(JitTest, JitKernel_MoveAssignment_TransfersKernel) {
   auto filter = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   auto projection = JitInt64Kernels::CompileProjection();
   if (!filter.has_value() || !projection.has_value()) {
-    GTEST_FAIL() << "kernel compilation failed";
+    GTEST_FAIL() << true;
     return;
   }
   std::vector<int64_t> input{1, 2, 3};
@@ -96,23 +96,24 @@ TEST(JitTest, JitKernel_MoveAssignment_TransfersKernel) {
 
   projection = std::move(filter);
 
-  EXPECT_THROW(
+  // The no-exception contract turns kernel-kind misuse into a CHECK abort.
+  EXPECT_DEATH(
       projection->Project(input.data(), output.data(), input.size(), 2, 1),
-      std::logic_error);
+      "not a projection kernel");
 }
 
 TEST(JitTest,
      CompileFilter_WhenCalledRepeatedly_ReusesCompiledKernelsProcessWide) {
   auto first = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   if (!first.has_value()) {
-    GTEST_FAIL() << "kernel compilation failed";
+    GTEST_FAIL() << true;
     return;
   }
   const double first_ms = first->CompileMilliseconds();
 
   auto second = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   if (!second.has_value()) {
-    GTEST_FAIL() << "kernel compilation failed";
+    GTEST_FAIL() << true;
     return;
   }
 
@@ -130,22 +131,22 @@ TEST(JitTest, JitKernel_WhenInvokingWrongAccessor_ThrowsLogicError) {
   auto projection = JitInt64Kernels::CompileProjection();
   auto sum = JitInt64Kernels::CompileSum();
   if (!filter.has_value() || !projection.has_value() || !sum.has_value()) {
-    GTEST_FAIL() << "kernel compilation failed";
+    GTEST_FAIL() << true;
     return;
   }
   std::vector<int64_t> input{1, 2, 3};
   std::vector<uint8_t> selected(input.size());
   std::vector<int64_t> output(input.size());
 
-  EXPECT_THROW(
+  EXPECT_DEATH(
       projection->Filter(input.data(), selected.data(), input.size(), 0),
-      std::logic_error);
-  EXPECT_THROW(sum->Filter(input.data(), selected.data(), input.size(), 0),
-               std::logic_error);
-  EXPECT_THROW(std::ignore = filter->Sum(input.data(), input.size()),
-               std::logic_error);
-  EXPECT_THROW(sum->Project(input.data(), output.data(), input.size(), 1, 1),
-               std::logic_error);
+      "not a filter kernel");
+  EXPECT_DEATH(sum->Filter(input.data(), selected.data(), input.size(), 0),
+               "not a filter kernel");
+  EXPECT_DEATH(std::ignore = filter->Sum(input.data(), input.size()),
+               "not a sum kernel");
+  EXPECT_DEATH(sum->Project(input.data(), output.data(), input.size(), 1, 1),
+               "not a projection kernel");
 }
 
 }  // namespace tinylamb

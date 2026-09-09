@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
@@ -46,6 +47,10 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail {
+
+namespace {
+using FrameBounds = std::pair<size_t, size_t>;
+}  // namespace
 namespace {
 
 using WindowNodeMap = std::map<const WindowFunctionCallExpression*,
@@ -280,26 +285,30 @@ struct WindowRuntime {
   const CteMap* ctes{nullptr};
   const Schema* schema{nullptr};
 
-  [[nodiscard]] Value EvalAt(const Expression& expression,
-                             const std::vector<Row>& rows,
-                             size_t position) const {
+  [[nodiscard]] StatusOr<Value> EvalAt(const Expression& expression,
+                                       const std::vector<Row>& rows,
+                                       size_t position) const {
     Scope scope{.row = &rows[position], .schema = schema, .outer = outer};
-    return Evaluate(expression, scope, nullptr, context, *ctes);
+    return TryEvaluate(expression, scope, nullptr, context, *ctes);
   }
 
   // Resolves [lo, hi] (inclusive) frame bounds within the ordered partition.
-  [[nodiscard]] static std::pair<size_t, size_t> ResolveFrame(
+  [[nodiscard]] static StatusOr<std::pair<size_t, size_t>> ResolveFrame(
       const WindowFunctionCallExpression& window,
       const std::vector<Row>& /*rows*/, const std::vector<size_t>& ordered,
       const std::vector<std::vector<Value>>& order_values, size_t position,
       const std::vector<size_t>& peer_end) {
     const size_t m = ordered.size();
+    // EXC-SHIM bridge (no-exception-rule-migration.md): the nested bound
+    // lambdas below record validation failures here and return a sentinel;
+    // each branch checks frame_error after computing the bounds.
+    Status frame_error = Status::kSuccess;
     if (!window.has_frame) {
       if (window.order_by.empty()) {
-        return {0, m - 1};
+        return std::pair<size_t, size_t>{0, m - 1};
       }
       // Default frame: RANGE UNBOUNDED PRECEDING .. CURRENT ROW.
-      return {0, peer_end[position]};
+      return std::pair<size_t, size_t>{0, peer_end[position]};
     }
     if (window.frame_unit == WindowFrameUnit::kRows) {
       // Physical row offsets: CURRENT ROW excludes peers.
@@ -307,7 +316,9 @@ struct WindowRuntime {
         if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue ||
             bound.offset->AsConstantValue().GetValue().type !=
                 ValueType::kInt64) {
-          throw std::runtime_error("ROWS offset must be a constant integer");
+          frame_error = StatusError(StatusCode::kInvalidArgument,
+                                    "ROWS offset must be a constant integer");
+          return 0;
         }
         return bound.offset->AsConstantValue().GetValue().value.int_value;
       };
@@ -371,14 +382,18 @@ struct WindowRuntime {
       };
       const auto lo = rows_start(window.frame_start);
       const auto hi = rows_end(window.frame_end);
-      if (!lo.has_value() || !hi.has_value() || *lo > *hi) {
-        return {1, 0};  // empty frame
+      if (frame_error != Status::kSuccess) {
+        return frame_error;
       }
-      return {*lo, *hi};
+      if (!lo.has_value() || !hi.has_value() || *lo > *hi) {
+        return std::pair<size_t, size_t>{1, 0};  // empty frame
+      }
+      return std::pair<size_t, size_t>{*lo, *hi};
     }
     if (window.frame_unit == WindowFrameUnit::kGroups) {
       if (window.order_by.empty()) {
-        throw std::runtime_error("GROUPS frame requires an ORDER BY key");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GROUPS frame requires an ORDER BY key");
       }
       std::vector<size_t> group_start;
       std::vector<size_t> group_end;
@@ -393,14 +408,18 @@ struct WindowRuntime {
         ++current_group;
       }
       const size_t group_count = group_start.size();
-      auto offset_of = [](const WindowFrameBound& bound) -> size_t {
+      auto offset_of = [&](const WindowFrameBound& bound) -> size_t {
         if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue) {
-          throw std::runtime_error("GROUPS offset requires a constant value");
+          frame_error = StatusError(StatusCode::kInvalidArgument,
+                                    "GROUPS offset requires a constant value");
+          return 0;
         }
         const double value =
             NumericOf(bound.offset->AsConstantValue().GetValue());
         if (value < 0) {
-          throw std::runtime_error("GROUPS offset is negative");
+          frame_error = StatusError(StatusCode::kInvalidArgument,
+                                    "GROUPS offset is negative");
+          return 0;
         }
         return static_cast<size_t>(value);
       };
@@ -442,20 +461,44 @@ struct WindowRuntime {
       };
       const size_t lo = groups_start(window.frame_start);
       const size_t hi = groups_end(window.frame_end);
+      if (frame_error != Status::kSuccess) {
+        return frame_error;
+      }
       return lo > hi ? std::pair<size_t, size_t>{1, 0}
                      : std::pair<size_t, size_t>{lo, hi};
     }
+    // First row of the current row's peer group; RANGE `CURRENT ROW` start
+    // bounds open at the group head (the end bound already closes on
+    // peer_end), matching the aggregate-with-peers default frame.
+    auto first_peer = [&](size_t idx) {
+      size_t j = idx;
+      while (j > 0) {
+        const std::vector<Value>& above = order_values[j - 1];
+        const std::vector<Value>& mine = order_values[idx];
+        bool peer = above.size() == mine.size();
+        for (size_t t = 0; peer && t < mine.size(); ++t) {
+          peer = ValuesEqual(above[t], mine[t]);
+        }
+        if (!peer) {
+          break;
+        }
+        --j;
+      }
+      return j;
+    };
     auto start_of =
         [&](const WindowFrameBound& bound) -> std::optional<size_t> {
       switch (bound.type) {
         case WindowFrameBoundType::kUnboundedPreceding:
           return 0;
         case WindowFrameBoundType::kCurrentRow:
-          return position;
+          return first_peer(position);
         case WindowFrameBoundType::kOffsetPreceding: {
           if (window.order_by.size() != 1 || !bound.offset ||
               bound.offset->Type() != TypeTag::kConstantValue) {
-            throw std::runtime_error("RANGE offset requires one constant key");
+            frame_error = StatusError(StatusCode::kInvalidArgument,
+                                      "RANGE offset requires one constant key");
+            return std::nullopt;
           }
           const double off =
               NumericOf(bound.offset->AsConstantValue().GetValue());
@@ -480,7 +523,9 @@ struct WindowRuntime {
           // collapsing every frame start onto the partition's last row.
           if (window.order_by.size() != 1 || !bound.offset ||
               bound.offset->Type() != TypeTag::kConstantValue) {
-            throw std::runtime_error("RANGE offset requires one constant key");
+            frame_error = StatusError(StatusCode::kInvalidArgument,
+                                      "RANGE offset requires one constant key");
+            return std::nullopt;
           }
           const double off =
               NumericOf(bound.offset->AsConstantValue().GetValue());
@@ -518,7 +563,9 @@ struct WindowRuntime {
         case WindowFrameBoundType::kOffsetFollowing: {
           if (window.order_by.size() != 1 || !bound.offset ||
               bound.offset->Type() != TypeTag::kConstantValue) {
-            throw std::runtime_error("RANGE offset requires one constant key");
+            frame_error = StatusError(StatusCode::kInvalidArgument,
+                                      "RANGE offset requires one constant key");
+            return std::nullopt;
           }
           const double off =
               NumericOf(bound.offset->AsConstantValue().GetValue());
@@ -545,7 +592,9 @@ struct WindowRuntime {
         case WindowFrameBoundType::kOffsetPreceding: {
           if (window.order_by.size() != 1 || !bound.offset ||
               bound.offset->Type() != TypeTag::kConstantValue) {
-            throw std::runtime_error("RANGE offset requires one constant key");
+            frame_error = StatusError(StatusCode::kInvalidArgument,
+                                      "RANGE offset requires one constant key");
+            return std::nullopt;
           }
           const double off =
               NumericOf(bound.offset->AsConstantValue().GetValue());
@@ -584,13 +633,16 @@ struct WindowRuntime {
 
     const auto lo = start_of(window.frame_start);
     const auto hi = end_of(window.frame_end);
-    if (!lo.has_value() || !hi.has_value() || *lo > *hi) {
-      return {1, 0};  // empty frame
+    if (frame_error != Status::kSuccess) {
+      return frame_error;
     }
-    return {*lo, *hi};
+    if (!lo.has_value() || !hi.has_value() || *lo > *hi) {
+      return std::pair<size_t, size_t>{1, 0};  // empty frame
+    }
+    return std::pair<size_t, size_t>{*lo, *hi};
   }
 
-  [[nodiscard]] Value AggregateOverFrame(
+  [[nodiscard]] StatusOr<Value> AggregateOverFrame(
       const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
       const std::vector<size_t>& ordered,
       const std::vector<std::vector<Value>>& order_values, size_t current,
@@ -600,7 +652,7 @@ struct WindowRuntime {
       if (fn == "COUNT") {
         return Value(static_cast<int64_t>(0));
       }
-      return {};
+      return Value();
     }
     // The window expression carries an optional row-level WHERE filter.
     int64_t row_count = 0;
@@ -657,12 +709,9 @@ struct WindowRuntime {
       Scope scope{.row = &row, .schema = schema, .outer = outer};
       // AGG(x WHERE cond) OVER (...): skip rows failing the filter.
       if (window.where_filter) {
-        Value keep;
-        try {
-          keep = Evaluate(window.where_filter, scope, nullptr, context, *ctes);
-        } catch (...) {
-          keep = Value();
-        }
+        StatusOr<Value> keep_or =
+            TryEvaluate(window.where_filter, scope, nullptr, context, *ctes);
+        const Value keep = keep_or.HasValue() ? keep_or.MoveValue() : Value();
         if (!Truthy(keep)) {
           continue;
         }
@@ -672,11 +721,18 @@ struct WindowRuntime {
         continue;
       }
       if (!window.args.empty()) {
-        values.push_back(
-            Evaluate(window.args[0], scope, nullptr, context, *ctes));
+        ASSIGN_OR_RETURN(
+            Value, arg_value,
+            (TryEvaluate(window.args[0], scope, nullptr, context, *ctes)));
+        values.push_back(std::move(arg_value));
       }
       if (fn == "STRING_AGG" && window.args.size() > 1) {
-        delimiter = Evaluate(window.args[1], scope, nullptr, context, *ctes);
+        StatusOr<Value> delimiter_or =
+            TryEvaluate(window.args[1], scope, nullptr, context, *ctes);
+        if (!delimiter_or.HasValue()) {
+          return delimiter_or.GetStatus();
+        }
+        delimiter = delimiter_or.MoveValue();
       }
     }
 
@@ -746,15 +802,17 @@ struct WindowRuntime {
       // Exact percentile interpolation over the frame; returns NUM quantiles
       // including both endpoints.
       if (non_null.empty() || window.args.size() < 2) {
-        return {};
+        return Value();
       }
-      Value n_value = Evaluate(
-          window.args[1],
-          Scope{.row = &rows[ordered[lo]], .schema = schema, .outer = outer},
-          nullptr, context, *ctes);
+      ASSIGN_OR_RETURN(Value, n_value,
+                       (TryEvaluate(window.args[1],
+                                    (Scope{.row = &rows[ordered[lo]],
+                                           .schema = schema,
+                                           .outer = outer}),
+                                    nullptr, context, *ctes)));
       const int64_t num = n_value.value.int_value;
       if (num <= 0) {
-        return {};
+        return Value();
       }
       std::vector<Value> sorted = non_null;
       std::sort(sorted.begin(), sorted.end(),
@@ -780,17 +838,18 @@ struct WindowRuntime {
       // Exact deterministic evaluation: count/sum occurrences per value over
       // the frame and return the top-k as ARRAY<STRUCT<value, number>>.
       if (non_null.empty() || window.args.empty()) {
-        return {};
+        return Value();
       }
       int64_t k = 1;
       if (!window.args.empty()) {
         const size_t n_arg = fn == "APPROX_TOP_COUNT" ? 1 : 2;
         if (window.args.size() > n_arg) {
-          Value n_value = Evaluate(
-              window.args[n_arg],
-              Scope{
-                  .row = &rows[ordered[lo]], .schema = schema, .outer = outer},
-              nullptr, context, *ctes);
+          ASSIGN_OR_RETURN(Value, n_value,
+                           (TryEvaluate(window.args[n_arg],
+                                        (Scope{.row = &rows[ordered[lo]],
+                                               .schema = schema,
+                                               .outer = outer}),
+                                        nullptr, context, *ctes)));
           if (!n_value.IsNull()) {
             k = n_value.value.int_value;
           }
@@ -800,13 +859,17 @@ struct WindowRuntime {
       for (size_t r = lo; r <= hi; ++r) {
         const size_t row = ordered[r];
         const Scope scope{.row = &rows[row], .schema = schema, .outer = outer};
-        Value v = Evaluate(window.args[0], scope, nullptr, context, *ctes);
+        ASSIGN_OR_RETURN(
+            Value, v,
+            (TryEvaluate(window.args[0], scope, nullptr, context, *ctes)));
         if (v.IsNull()) {
           continue;
         }
         double weight = 1.0;
         if (fn == "APPROX_TOP_SUM" && window.args.size() > 1) {
-          Value w = Evaluate(window.args[1], scope, nullptr, context, *ctes);
+          ASSIGN_OR_RETURN(
+              Value, w,
+              (TryEvaluate(window.args[1], scope, nullptr, context, *ctes)));
           if (!w.IsNull()) {
             weight = w.type == ValueType::kDouble
                          ? w.value.double_value
@@ -815,15 +878,13 @@ struct WindowRuntime {
         }
         bool found = false;
         for (auto& [value, total] : stats) {
-          try {
-            if (!EvaluateBinary(BinaryOperation::kEquals, value, v).IsNull() &&
-                EvaluateBinary(BinaryOperation::kEquals, value, v).Truthy()) {
-              total += weight;
-              found = true;
-              break;
-            }
-          } catch (const std::exception& error) {
-            (void)error;
+          StatusOr<Value> eq =
+              TryEvaluateBinary(BinaryOperation::kEquals, value, v);
+          if (eq.HasValue() && !eq.Value().IsNull() &&
+              Truthy(eq.Value())) {  // Incomparable pairs start a new bucket.
+            total += weight;
+            found = true;
+            break;
           }
         }
         if (!found) {
@@ -903,7 +964,7 @@ struct WindowRuntime {
       return Value(trues);
     }
     if (non_null.empty()) {
-      return {};
+      return Value();
     }
 
     if (fn == "SUM" || fn == "AVG") {
@@ -927,7 +988,8 @@ struct WindowRuntime {
       int64_t total = 0;
       for (const Value& value : non_null) {
         if (__builtin_add_overflow(total, value.value.int_value, &total)) {
-          throw std::runtime_error("integer overflow in " + fn);
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in " + fn);
         }
       }
       if (fn == "AVG") {
@@ -953,13 +1015,20 @@ struct WindowRuntime {
         final_values.resize(*window.inner_limit);
       }
       if (fn == "STRING_AGG") {
-        std::string sep = delimiter.IsNull() ? "," : delimiter.AsString();
+        // Raw text for VARCHAR parts: AsString would wrap them in display
+        // quotes, diverging from the streaming STRING_AGG accumulator.
+        const auto raw_text = [](const Value& value) {
+          return value.type == ValueType::kVarChar
+                     ? std::string(value.value.varchar_value)
+                     : value.AsString();
+        };
+        std::string sep = delimiter.IsNull() ? "," : raw_text(delimiter);
         std::string out;
         for (size_t i = 0; i < final_values.size(); ++i) {
           if (i != 0U) {
             out += sep;
           }
-          out += final_values[i].AsString();
+          out += raw_text(final_values[i]);
         }
         return Value(std::move(out));
       }
@@ -1012,6 +1081,7 @@ struct WindowRuntime {
                  ? v.value.double_value
                  : static_cast<double>(v.value.int_value);
     };
+    Status pairs_error{Status::kSuccess};
     auto frame_pairs =
         [&]() -> std::optional<std::tuple<double, double, double, size_t>> {
       // Evaluates both arguments per aligned row (NULL on either side skips
@@ -1021,15 +1091,26 @@ struct WindowRuntime {
         const size_t row = ordered[r];
         const Scope pair_scope{
             .row = &rows[row], .schema = schema, .outer = outer};
-        Value x = Evaluate(window.args[0], pair_scope, nullptr, context, *ctes);
+        StatusOr<Value> x_or =
+            TryEvaluate(window.args[0], pair_scope, nullptr, context, *ctes);
+        if (!x_or.HasValue()) {
+          pairs_error = x_or.GetStatus();
+          return std::nullopt;
+        }
+        Value x = x_or.MoveValue();
         if (x.IsNull()) {
           continue;
         }
         double xv = numeric_of(x);
         double yv = xv;
         if (window.args.size() > 1) {
-          Value y =
-              Evaluate(window.args[1], pair_scope, nullptr, context, *ctes);
+          StatusOr<Value> y_or =
+              TryEvaluate(window.args[1], pair_scope, nullptr, context, *ctes);
+          if (!y_or.HasValue()) {
+            pairs_error = y_or.GetStatus();
+            return std::nullopt;
+          }
+          Value y = y_or.MoveValue();
           if (y.IsNull()) {
             continue;
           }
@@ -1041,7 +1122,7 @@ struct WindowRuntime {
       if (n < 2) {
         return std::nullopt;
       }
-      double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+      double sx = 0, sy = 0, sxx = 0, syy = 0, sxy;
       for (const auto& [xv, yv] : pairs) {
         sx += xv;
         sy += yv;
@@ -1095,8 +1176,11 @@ struct WindowRuntime {
     }
     if (fn == "COVAR_POP" || fn == "COVAR_SAMP" || fn == "CORR") {
       auto stats = frame_pairs();
+      if (pairs_error != Status::kSuccess) {
+        return pairs_error;
+      }
       if (!stats.has_value()) {
-        return {};
+        return Value();
       }
       const auto& [covar_pop, var_x, var_y, n] = *stats;
       if (fn == "COVAR_POP") {
@@ -1108,7 +1192,7 @@ struct WindowRuntime {
       }
       // CORR
       if (var_x <= 0.0 || var_y <= 0.0) {
-        return {};
+        return Value();
       }
       return Value(covar_pop / std::sqrt(var_x * var_y));
     }
@@ -1123,14 +1207,16 @@ struct WindowRuntime {
         }
       }
       if (frame_values.empty() || window.args.size() < 2) {
-        return {};
+        return Value();
       }
-      Value p_value = Evaluate(
-          window.args[1],
-          Scope{.row = &rows[ordered[lo]], .schema = schema, .outer = outer},
-          nullptr, context, *ctes);
+      ASSIGN_OR_RETURN(Value, p_value,
+                       (TryEvaluate(window.args[1],
+                                    (Scope{.row = &rows[ordered[lo]],
+                                           .schema = schema,
+                                           .outer = outer}),
+                                    nullptr, context, *ctes)));
       if (p_value.IsNull()) {
-        return {};
+        return Value();
       }
       double p = 0.0;
       if (p_value.type == ValueType::kDouble) {
@@ -1141,11 +1227,12 @@ struct WindowRuntime {
         try {
           p = std::stod(std::string(p_value.value.varchar_value));
         } catch (...) {
-          return {};
+          return Value();
         }
       }
       if (p < 0.0 || p > 1.0) {
-        throw std::runtime_error("PERCENTILE argument must be between 0 and 1");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "PERCENTILE argument must be between 0 and 1");
       }
       std::vector<Value> sorted = frame_values;
       // PERCENTILE sorts NULLs first, then NaN (unlike ORDER BY, where NaN
@@ -1190,7 +1277,7 @@ struct WindowRuntime {
       }
       // Interpolation across a NULL endpoint yields NULL.
       if (sorted[lo_idx].IsNull() || sorted[hi_idx].IsNull()) {
-        return {};
+        return Value();
       }
       const double a = NumericOf(sorted[lo_idx]);
       const double b = NumericOf(sorted[hi_idx]);
@@ -1209,7 +1296,7 @@ struct WindowRuntime {
         }
       }
       if (!saw_array) {
-        return {};
+        return Value();
       }
       std::vector<Value> out;
       out.reserve(width);
@@ -1254,7 +1341,8 @@ struct WindowRuntime {
       }
       return Value::Array(std::move(out), element_type);
     }
-    throw std::runtime_error("unsupported window aggregate " + fn);
+    return StatusError(StatusCode::kInvalidArgument,
+                       "unsupported window aggregate " + fn);
   }
 };
 
@@ -1290,7 +1378,7 @@ std::string WindowLayoutKey(const WindowFunctionCallExpression& window) {
   return key;
 }
 
-WindowOrderLayout BuildWindowOrderLayout(
+StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
     const WindowFunctionCallExpression& window, std::vector<Row>& rows,
     const WindowRuntime& runtime) {
   WindowOrderLayout layout;
@@ -1299,7 +1387,8 @@ WindowOrderLayout BuildWindowOrderLayout(
     std::vector<Value> keys;
     keys.reserve(window.partition_by.size());
     for (const Expression& key : window.partition_by) {
-      keys.push_back(runtime.EvalAt(key, rows, i));
+      ASSIGN_OR_RETURN(Value, partition_key, (runtime.EvalAt(key, rows, i)));
+      keys.push_back(std::move(partition_key));
     }
     size_t group = layout.partitions.size();
     for (size_t g = 0; g < partition_keys.size(); ++g) {
@@ -1328,8 +1417,9 @@ WindowOrderLayout BuildWindowOrderLayout(
         auto& values = partition.order_values[k];
         values.reserve(window.order_by.size());
         for (const WindowOrderTerm& term : window.order_by) {
-          Value key =
-              runtime.EvalAt(term.expression, rows, partition.ordered[k]);
+          ASSIGN_OR_RETURN(
+              Value, key,
+              (runtime.EvalAt(term.expression, rows, partition.ordered[k])));
           // COLLATE-wrapped keys sort case-insensitively (und:ci style);
           // folding the hidden sort key is sufficient.
           if (term.expression->Type() == TypeTag::kFunctionCallExp) {
@@ -1402,16 +1492,16 @@ WindowOrderLayout BuildWindowOrderLayout(
   return layout;
 }
 
-void ComputeOneWindow(TransactionContext& context,
-                      const WindowFunctionCallExpression& window,
-                      std::vector<Row>& rows, const Schema& schema,
-                      const Scope* outer, const CteMap& ctes,
-                      std::vector<Value>* out,
-                      const WindowOrderLayout* cached_layout = nullptr) {
+Status ComputeOneWindow(TransactionContext& context,
+                        const WindowFunctionCallExpression& window,
+                        std::vector<Row>& rows, const Schema& schema,
+                        const Scope* outer, const CteMap& ctes,
+                        std::vector<Value>* out,
+                        const WindowOrderLayout* cached_layout = nullptr) {
   const size_t n = rows.size();
   out->assign(n, Value());
   if (n == 0) {
-    return;
+    return Status::kSuccess;
   }
 
   WindowRuntime runtime{
@@ -1420,7 +1510,9 @@ void ComputeOneWindow(TransactionContext& context,
   WindowOrderLayout local_layout;
   const WindowOrderLayout* layout = cached_layout;
   if (layout == nullptr) {
-    local_layout = BuildWindowOrderLayout(window, rows, runtime);
+    ASSIGN_OR_RETURN(WindowOrderLayout, built_layout,
+                     (BuildWindowOrderLayout(window, rows, runtime)));
+    local_layout = std::move(built_layout);
     layout = &local_layout;
   }
 
@@ -1467,13 +1559,15 @@ void ComputeOneWindow(TransactionContext& context,
     }
     if (fn == "NTILE") {
       if (window.args.empty()) {
-        throw std::runtime_error("NTILE requires an argument");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "NTILE requires an argument");
       }
-      const Value buckets_value =
-          runtime.EvalAt(window.args[0], rows, ordered[0]);
+      ASSIGN_OR_RETURN(Value, buckets_value,
+                       (runtime.EvalAt(window.args[0], rows, ordered[0])));
       const int64_t buckets = buckets_value.value.int_value;
       if (buckets <= 0) {
-        throw std::runtime_error("NTILE requires a positive bucket count");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "NTILE requires a positive bucket count");
       }
       const int64_t base = static_cast<int64_t>(m) / buckets;
       const int64_t extra = static_cast<int64_t>(m) % buckets;
@@ -1489,8 +1583,8 @@ void ComputeOneWindow(TransactionContext& context,
     if (fn == "LAG" || fn == "LEAD") {
       int64_t offset = 1;
       if (window.args.size() > 1) {
-        const Value offset_value =
-            runtime.EvalAt(window.args[1], rows, ordered[0]);
+        ASSIGN_OR_RETURN(Value, offset_value,
+                         (runtime.EvalAt(window.args[1], rows, ordered[0])));
         offset = offset_value.IsNull() ? 1 : offset_value.value.int_value;
       }
       for (size_t k = 0; k < m; ++k) {
@@ -1498,20 +1592,29 @@ void ComputeOneWindow(TransactionContext& context,
                                            : static_cast<int64_t>(k) + offset;
         if (target < 0 || std::cmp_greater_equal(target, m)) {
           if (window.args.size() > 2) {
-            (*out)[ordered[k]] =
-                runtime.EvalAt(window.args[2], rows, ordered[k]);
+            ASSIGN_OR_RETURN(
+                Value, default_value,
+                (runtime.EvalAt(window.args[2], rows, ordered[k])));
+            (*out)[ordered[k]] = std::move(default_value);
           }
           continue;
         }
-        (*out)[ordered[k]] = runtime.EvalAt(
-            window.args[0], rows, ordered[static_cast<size_t>(target)]);
+        ASSIGN_OR_RETURN(
+            Value, lag_value,
+            (runtime.EvalAt(window.args[0], rows,
+                            ordered[static_cast<size_t>(target)])));
+        (*out)[ordered[k]] = std::move(lag_value);
       }
       continue;
     }
     if (fn == "FIRST_VALUE" || fn == "LAST_VALUE" || fn == "NTH_VALUE") {
       for (size_t k = 0; k < m; ++k) {
-        const auto [lo, hi] = WindowRuntime::ResolveFrame(
-            window, rows, ordered, order_values, k, peer_end);
+        ASSIGN_OR_RETURN(
+            FrameBounds, frame_bounds,
+            (WindowRuntime::ResolveFrame(window, rows, ordered, order_values, k,
+                                         peer_end)));
+        const size_t lo = frame_bounds.first;
+        const size_t hi = frame_bounds.second;
         if (hi < lo) {
           continue;
         }
@@ -1554,10 +1657,11 @@ void ComputeOneWindow(TransactionContext& context,
           }
         } else {
           if (window.args.size() < 2) {
-            throw std::runtime_error("NTH_VALUE requires two arguments");
+            return StatusError(StatusCode::kInvalidArgument,
+                               "NTH_VALUE requires two arguments");
           }
-          const Value nth_value =
-              runtime.EvalAt(window.args[1], rows, ordered[k]);
+          ASSIGN_OR_RETURN(Value, nth_value,
+                           (runtime.EvalAt(window.args[1], rows, ordered[k])));
           int64_t nth = nth_value.value.int_value;
           size_t frame_size = 0;
           for (size_t candidate = lo; candidate <= hi; ++candidate) {
@@ -1578,20 +1682,27 @@ void ComputeOneWindow(TransactionContext& context,
         if (target < lo || target > hi || excluded(target)) {
           continue;
         }
-        (*out)[ordered[k]] =
-            runtime.EvalAt(window.args[0], rows, ordered[target]);
+        ASSIGN_OR_RETURN(
+            Value, edge_value,
+            (runtime.EvalAt(window.args[0], rows, ordered[target])));
+        (*out)[ordered[k]] = std::move(edge_value);
       }
       continue;
     }
 
     // Everything else is treated as an aggregate over the frame.
     for (size_t k = 0; k < m; ++k) {
-      const auto [lo, hi] = WindowRuntime::ResolveFrame(
-          window, rows, ordered, order_values, k, peer_end);
-      (*out)[ordered[k]] = runtime.AggregateOverFrame(window, rows, ordered,
-                                                      order_values, k, lo, hi);
+      ASSIGN_OR_RETURN(FrameBounds, frame_bounds,
+                       (WindowRuntime::ResolveFrame(
+                           window, rows, ordered, order_values, k, peer_end)));
+      ASSIGN_OR_RETURN(Value, agg_value,
+                       (runtime.AggregateOverFrame(
+                           window, rows, ordered, order_values, k,
+                           frame_bounds.first, frame_bounds.second)));
+      (*out)[ordered[k]] = std::move(agg_value);
     }
   }
+  return Status::kSuccess;
 }
 
 }  // namespace
@@ -1672,9 +1783,10 @@ Expression InlineAliases(
 
 }  // namespace
 
-WindowedInput ApplyWindows(TransactionContext& context,
-                           const SelectStatement& statement, Relation&& input,
-                           const Scope* outer, const CteMap& ctes) {
+StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
+                                     const SelectStatement& statement,
+                                     Relation&& input, const Scope* outer,
+                                     const CteMap& ctes) {
   WindowedInput result;
   result.statement = std::make_shared<SelectStatement>(statement);
 
@@ -1700,13 +1812,26 @@ WindowedInput ApplyWindows(TransactionContext& context,
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);
       input.FinishSpill();
+      Status qualify_error{Status::kSuccess};
       input.ForEachRow([&](const Row& row) {
         Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
-        if (Truthy(Evaluate(qualify, scope, nullptr, context, ctes))) {
+        if (qualify_error != Status::kSuccess) {
+          return;
+        }
+        StatusOr<Value> keep =
+            TryEvaluate(qualify, scope, nullptr, context, ctes);
+        if (!keep.HasValue()) {
+          qualify_error = keep.GetStatus();
+          return;
+        }
+        if (Truthy(keep.Value())) {
           filtered.AddRow(row);
         }
       });
-      filtered.FinishSpill();
+      if (qualify_error != Status::kSuccess) {
+        return qualify_error;
+      }
+      RETURN_IF_FAIL(filtered.FinishSpill());
       result.input = std::move(filtered);
     } else {
       result.input = std::move(input);
@@ -1749,11 +1874,14 @@ WindowedInput ApplyWindows(TransactionContext& context,
                             .outer = outer,
                             .ctes = &ctes,
                             .schema = &base_schema};
-      layout_it->second = BuildWindowOrderLayout(*window_node, rows, runtime);
+      ASSIGN_OR_RETURN(WindowOrderLayout, built_layout,
+                       (BuildWindowOrderLayout(*window_node, rows, runtime)));
+      layout_it->second = std::move(built_layout);
     }
     computed.emplace_back();
-    ComputeOneWindow(context, *window_node, rows, base_schema, outer, ctes,
-                     &computed.back(), &layout_it->second);
+    RETURN_IF_FAIL(ComputeOneWindow(context, *window_node, rows, base_schema,
+                                    outer, ctes, &computed.back(),
+                                    &layout_it->second));
   }
   for (size_t r = 0; r < rows.size(); ++r) {
     for (size_t w = 0; w < windows.size(); ++w) {
@@ -1802,13 +1930,26 @@ WindowedInput ApplyWindows(TransactionContext& context,
         Rebuild(statement.Qualify(), replacements), aliases, extended.schema);
     Relation filtered(context.execution_runtime());
     filtered.schema = extended.schema;
+    Status qualify_error{Status::kSuccess};
     extended.ForEachRow([&](const Row& row) {
       Scope scope{.row = &row, .schema = &extended.schema, .outer = outer};
-      if (Truthy(Evaluate(qualify, scope, nullptr, context, ctes))) {
+      if (qualify_error != Status::kSuccess) {
+        return;
+      }
+      StatusOr<Value> keep =
+          TryEvaluate(qualify, scope, nullptr, context, ctes);
+      if (!keep.HasValue()) {
+        qualify_error = keep.GetStatus();
+        return;
+      }
+      if (Truthy(keep.Value())) {
         filtered.AddRow(row);
       }
     });
-    filtered.FinishSpill();
+    if (qualify_error != Status::kSuccess) {
+      return qualify_error;
+    }
+    RETURN_IF_FAIL(filtered.FinishSpill());
     result.input = std::move(filtered);
   } else {
     result.input = std::move(extended);

@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_ITERATOR_BASE_HPP
 #define TINYLAMB_ITERATOR_BASE_HPP
 
+#include "common/constants.hpp"
 #include "page/row_position.hpp"
 #include "type/value.hpp"
 
@@ -46,6 +47,11 @@ class IteratorBase {
   // workers before they may block on a full output queue, so a blocked
   // worker never stands between a writer and its page.
   virtual void DropPageLatch() {}
+  // Sticky page-access failure: iterators that cannot surface errors through
+  // their return values mark themselves invalid and keep the first failure
+  // here. Scans that must distinguish "exhausted" from "corrupt" check this
+  // after the loop.
+  [[nodiscard]] virtual Status GetStatus() const { return Status::kSuccess; }
   virtual void Dump(std::ostream& o, int indent) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const IteratorBase& it) {
     it.Dump(o, 0);

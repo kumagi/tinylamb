@@ -404,8 +404,7 @@ TEST(ValueTest, MemcomparableFormat_VarcharEmptyAndCorruptFlag) {
   corrupt.append(8, 'x');
   corrupt.push_back(static_cast<char>(12));  // invalid flag
   Value decoded;
-  EXPECT_THROW(decoded.DecodeMemcomparableFormat(corrupt),
-               std::runtime_error);
+  EXPECT_THROW(decoded.DecodeMemcomparableFormat(corrupt), std::runtime_error);
 }
 
 TEST(ValueTest, MemcomparableFormat_WithDoubleValues_RoundTripsAccurately) {
@@ -802,16 +801,16 @@ TEST(DateTest, ValueDateFromDays_ValidDays_ConstructsExpectedValue) {
   }
 }
 
-TEST(ValueTest, DateDays_OnNonDateTypes_ThrowsRuntimeError) {
+TEST(ValueTest, DateDays_OnNonDateTypes_Aborts) {
   Value v_int(1);
   Value v_str("x");
   Value v_double(1.5);
   Value v_null;
 
-  EXPECT_THROW(std::ignore = v_int.DateDays(), std::runtime_error);
-  EXPECT_THROW(std::ignore = v_str.DateDays(), std::runtime_error);
-  EXPECT_THROW(std::ignore = v_double.DateDays(), std::runtime_error);
-  EXPECT_THROW(std::ignore = v_null.DateDays(), std::runtime_error);
+  EXPECT_DEATH(std::ignore = v_int.DateDays(), "DATE value required");
+  EXPECT_DEATH(std::ignore = v_str.DateDays(), "DATE value required");
+  EXPECT_DEATH(std::ignore = v_double.DateDays(), "DATE value required");
+  EXPECT_DEATH(std::ignore = v_null.DateDays(), "DATE value required");
 }
 
 TEST(ValueTest, Comparison_BetweenDifferentTypes_ThrowsRuntimeError) {
@@ -867,24 +866,27 @@ TEST(ValueTest, Arithmetic_OnNonNumericTypes_ThrowsRuntimeError) {
   EXPECT_THROW(std::ignore = (d1 - d2), std::runtime_error);
 }
 
-TEST(ValueTest, Operations_OnInvalidValueType_ThrowsRuntimeError) {
+TEST(ValueTest, Operations_OnInvalidValueType_AbortOrThrow) {
   Value broken;
   // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   const auto invalid_type = static_cast<ValueType>(99);
   broken.type = invalid_type;
   std::array<char, 16> buffer{};
 
-  EXPECT_THROW(std::ignore = broken.Size(), std::runtime_error);
-  EXPECT_THROW(broken.Serialize(buffer.data()), std::runtime_error);
+  // A bogus ValueType tag on an in-memory value is broken plumbing: the
+  // no-exception contract aborts on these paths.
+  EXPECT_DEATH(std::ignore = broken.Size(), "undefined type");
+  EXPECT_DEATH(broken.Serialize(buffer.data()), "undefined type");
+  EXPECT_DEATH(std::ignore = broken.AsString(), "undefined type");
+  EXPECT_DEATH(std::ignore = (broken == broken), "undefined type");
+  EXPECT_DEATH(std::hash<Value>{}(broken), "undefined type");
+  // Typed stream / index-image decoding reports corruption instead.
   EXPECT_THROW(broken.Deserialize(buffer.data(), invalid_type),
                std::runtime_error);
-  EXPECT_THROW(std::ignore = broken.AsString(), std::runtime_error);
-  EXPECT_THROW(std::ignore = broken.EncodeMemcomparableFormat(),
-               std::runtime_error);
+  EXPECT_DEATH(std::ignore = broken.EncodeMemcomparableFormat(),
+               "undefined type");
   EXPECT_THROW(std::ignore = (broken < broken), std::runtime_error);
   EXPECT_THROW(std::ignore = (broken > broken), std::runtime_error);
-  EXPECT_THROW(std::ignore = (broken == broken), std::runtime_error);
-  EXPECT_THROW(std::hash<Value>{}(broken), std::runtime_error);
 }
 
 TEST(ValueTest,

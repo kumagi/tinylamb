@@ -17,10 +17,20 @@ namespace tinylamb {
 namespace {
 
 int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
-                   const std::vector<SortExecutor::Key>& keys) {
+                   const std::vector<SortExecutor::Key>& keys, Status* error) {
   for (const auto& key : keys) {
-    Value lv = key.expression->Evaluate(lhs, schema);
-    Value rv = key.expression->Evaluate(rhs, schema);
+    StatusOr<Value> lv_or = key.expression->TryEvaluate(lhs, schema);
+    StatusOr<Value> rv_or = key.expression->TryEvaluate(rhs, schema);
+    if (!lv_or.HasValue() || !rv_or.HasValue()) {
+      // Comparators cannot abort mid-sort: record the first failure and
+      // treat the pair as equal.
+      if (error != nullptr && *error == Status::kSuccess) {
+        *error = lv_or.HasValue() ? rv_or.GetStatus() : lv_or.GetStatus();
+      }
+      return 0;
+    }
+    Value lv = lv_or.MoveValue();
+    Value rv = rv_or.MoveValue();
     if (lv.IsNull() && rv.IsNull()) {
       continue;
     }
@@ -49,18 +59,18 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
 
 void PdqSort::Sort(std::vector<std::pair<Row, RowPosition>>& rows,
                    const Schema& schema,
-                   const std::vector<SortExecutor::Key>& keys) {
+                   const std::vector<SortExecutor::Key>& keys, Status* error) {
   std::sort(rows.begin(), rows.end(),
             [&](const std::pair<Row, RowPosition>& a,
                 const std::pair<Row, RowPosition>& b) {
-              return CompareRowKeys(a.first, b.first, schema, keys) < 0;
+              return CompareRowKeys(a.first, b.first, schema, keys, error) < 0;
             });
 }
 
 void PdqSort::Sort(std::vector<Row>& rows, const Schema& schema,
-                   const std::vector<SortExecutor::Key>& keys) {
+                   const std::vector<SortExecutor::Key>& keys, Status* error) {
   std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
-    return CompareRowKeys(a, b, schema, keys) < 0;
+    return CompareRowKeys(a, b, schema, keys, error) < 0;
   });
 }
 

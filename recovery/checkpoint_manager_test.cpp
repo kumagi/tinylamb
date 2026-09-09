@@ -45,7 +45,7 @@ class CheckpointTest : public RowPageTest {
     master_record_name_ = prefix + ".master.log";
     Recover();
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     page_id_ = page->PageID();
     EXPECT_SUCCESS(txn.PreCommit());
   }
@@ -67,8 +67,8 @@ class CheckpointTest : public RowPageTest {
     l_.reset();
     r_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
+    p_ = PageManager::Create(db_name_, 10).MoveValue();
+    l_ = Logger::Create(log_name_).MoveValue();
     lm_ = std::make_unique<LockManager>();
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), nullptr);
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
@@ -97,14 +97,14 @@ TEST_F(CheckpointTest, DoCheckpoint) {
   Transaction txn = tm_->Begin();
   slot_t slot = 0;
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSIGN_OR_ASSERT_FAIL(slot_t, inserted, page->Insert(txn, "inserted"));
     slot = inserted;
   }
   p_->GetPool()->FlushPageForTest(page_id_);
   cm_->WriteCheckpoint();
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Update(txn, slot, "expect to be redone"));
     txn.PreCommit();
   }
@@ -125,13 +125,13 @@ TEST_F(CheckpointTest, CheckpointRecovery) {
   lsn_t restart_point = 0;
   slot_t result = 0;
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSIGN_OR_ASSERT_FAIL(slot_t, inserted, page->Insert(txn, "inserted"));
     result = inserted;
   }
-  restart_point = cm_->WriteCheckpoint();
+  restart_point = cm_->WriteCheckpoint().Value();
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Update(txn, result, "expect to be redone"));
     txn.PreCommit();
   }
@@ -151,9 +151,9 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
   const slot_t slot = 0;
 
   // Act 1 -- checkpoint, then update+insert without committing
-  const lsn_t restart_point = cm_->WriteCheckpoint();
+  const lsn_t restart_point = cm_->WriteCheckpoint().Value() ;
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Update(txn, slot, "aborted"));
     ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
   }
@@ -176,11 +176,13 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   // Act 1 -- checkpoint with lambda that updates+inserts but does not commit;
   // the lambda acquires its own page latch so the checkpoint's DPT snapshot
   // never overlaps a foreign exclusive latch.
-  const lsn_t restart_point = cm_->WriteCheckpoint([&]() {
-    PageRef page = p_->GetPage(page_id_);
-    ASSERT_SUCCESS(page->Update(txn, slot, "aborted"));
-    ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
-  });
+  const lsn_t restart_point =
+      cm_->WriteCheckpoint([&]() {
+           PageRef page = p_->GetPage(page_id_).MoveValue();
+           ASSERT_SUCCESS(page->Update(txn, slot, "aborted"));
+           ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
+         })
+          .Value();
 
   // Act 2 -- recover from restart_point; uncommitted changes discarded
   Recover();
@@ -212,7 +214,7 @@ TEST_F(CheckpointTest, LoserBelowCheckpointIsUndoneGlobally) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction loser = tm_->Begin();
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Update(loser, 0, "loser residue"));
     page.PageUnlock();
   }
@@ -221,7 +223,7 @@ TEST_F(CheckpointTest, LoserBelowCheckpointIsUndoneGlobally) {
   }
   p_->GetPool()->FlushPageForTest(page_id_);
   p_->GetPool()->DropAllPages();
-  const lsn_t restart_point = cm_->WriteCheckpoint();
+  const lsn_t restart_point = cm_->WriteCheckpoint().Value() ;
 
   // Act -- crash-reopen and recover from the checkpoint LSN.
   Recover();

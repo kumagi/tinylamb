@@ -140,7 +140,7 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
         // really has the declared layout before trusting it.
         if (!input_batch_.HasLayout(input_schema_) ||
             column.Type() != ValueType::kInt64) {
-          throw std::runtime_error("aggregation input layout mismatch");
+          CHECK_MSG(false, "aggregation input layout mismatch");
         }
         bool batch_overflow = false;
         const int64_t partial = jit_sum_->SumChecked(
@@ -148,10 +148,14 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
         // The checked kernel reports intra-batch overflow exactly like the
         // AST evaluator; merging into the running total is checked too.
         if (batch_overflow) {
-          throw std::runtime_error("integer overflow on '+'");
+          return FailWith(StatusError(StatusCode::kIsInfinity,
+
+                                      "integer overflow on '+'"));
         }
         if (__builtin_add_overflow(total, partial, &total)) {
-          throw std::runtime_error("integer overflow on '+'");
+          return FailWith(StatusError(StatusCode::kIsInfinity,
+
+                                      "integer overflow on '+'"));
         }
         any = any || column.Size() != 0;
         ++jit_batches_;
@@ -162,7 +166,9 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
           }
           if (__builtin_add_overflow(total, column.ValueAt(row).value.int_value,
                                      &total)) {
-            throw std::runtime_error("integer overflow on '+'");
+            return FailWith(StatusError(StatusCode::kIsInfinity,
+
+                                        "integer overflow on '+'"));
           }
           any = true;
         }
@@ -178,18 +184,18 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
 namespace {
 
 // int64 accumulation mirrors Value::operator+ overflow semantics.
-int64_t CheckedAdd(int64_t lhs, int64_t rhs) {
+StatusOr<int64_t> CheckedAdd(int64_t lhs, int64_t rhs) {
   int64_t result = 0;
   if (__builtin_add_overflow(lhs, rhs, &result)) {
-    throw std::runtime_error("integer overflow on '+'");
+    return StatusError(StatusCode::kIsInfinity, "integer overflow on '+'");
   }
   return result;
 }
 
-double CheckedDoubleAdd(double lhs, double rhs) {
+StatusOr<double> CheckedDoubleAdd(double lhs, double rhs) {
   const double result = lhs + rhs;
   if (std::isinf(result) && std::isfinite(lhs) && std::isfinite(rhs)) {
-    throw std::runtime_error("double overflow in SUM");
+    return StatusError(StatusCode::kIsInfinity, "double overflow in SUM");
   }
   return result;
 }
@@ -264,12 +270,18 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
             int64_t scaled = 0;
             if (__builtin_mul_overflow(static_cast<int64_t>(rows),
                                        constant.value.int_value, &scaled)) {
-              throw std::runtime_error("integer overflow on '+'");
+              return FailWith(StatusError(StatusCode::kIsInfinity,
+
+                                          "integer overflow on '+'"));
             }
-            (*results)[i] =
+            StatusOr<int64_t> acc =
                 (*results)[i].IsNull()
-                    ? Value(CheckedAdd(0, scaled))
-                    : Value(CheckedAdd((*results)[i].value.int_value, scaled));
+                    ? CheckedAdd(0, scaled)
+                    : CheckedAdd((*results)[i].value.int_value, scaled);
+            if (!acc.HasValue()) {
+              return FailWith(acc.GetStatus());
+            }
+            (*results)[i] = Value(acc.MoveValue());
           } else {
             (*results)[i] = Value(
                 ((*results)[i].IsNull() ? 0.0
@@ -333,7 +345,9 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
               }
               const auto value = static_cast<uint64_t>(integers[row]);
               if (batch_sum > std::numeric_limits<uint64_t>::max() - value) {
-                throw std::runtime_error("uint64 overflow in SUM");
+                return FailWith(StatusError(StatusCode::kIsInfinity,
+
+                                            "uint64 overflow in SUM"));
               }
               batch_sum += value;
               any = true;
@@ -346,7 +360,9 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
                 total.IsNull() ? 0
                                : static_cast<uint64_t>(total.value.int_value);
             if (prior > std::numeric_limits<uint64_t>::max() - batch_sum) {
-              throw std::runtime_error("uint64 overflow in SUM");
+              return FailWith(StatusError(StatusCode::kIsInfinity,
+
+                                          "uint64 overflow in SUM"));
             }
             total = Value(
                 static_cast<int64_t>(static_cast<uint64_t>(prior + batch_sum)));
@@ -358,16 +374,27 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
             if (column.IsNull(row)) {
               continue;
             }
-            batch_sum = CheckedAdd(batch_sum, integers[row]);
+            StatusOr<int64_t> next = CheckedAdd(batch_sum, integers[row]);
+            if (!next.HasValue()) {
+              return FailWith(next.GetStatus());
+            }
+            batch_sum = next.Value();
             any = true;
           }
           if (!any) {
             break;
           }
           Value& total = (*results)[i];
-          total = total.IsNull()
-                      ? Value(batch_sum)
-                      : Value(CheckedAdd(total.value.int_value, batch_sum));
+          if (total.IsNull()) {
+            total = Value(batch_sum);
+          } else {
+            StatusOr<int64_t> next =
+                CheckedAdd(total.value.int_value, batch_sum);
+            if (!next.HasValue()) {
+              return FailWith(next.GetStatus());
+            }
+            total = Value(next.Value());
+          }
         } else {
           double batch_sum = 0.0;
           bool any = false;
@@ -375,16 +402,27 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
             if (column.IsNull(row)) {
               continue;
             }
-            batch_sum = CheckedDoubleAdd(batch_sum, doubles[row]);
+            StatusOr<double> next = CheckedDoubleAdd(batch_sum, doubles[row]);
+            if (!next.HasValue()) {
+              return FailWith(next.GetStatus());
+            }
+            batch_sum = next.Value();
             any = true;
           }
           if (!any) {
             break;
           }
           Value& total = (*results)[i];
-          total = total.IsNull() ? Value(batch_sum)
-                                 : Value(CheckedDoubleAdd(
-                                       total.value.double_value, batch_sum));
+          if (total.IsNull()) {
+            total = Value(batch_sum);
+          } else {
+            StatusOr<double> next =
+                CheckedDoubleAdd(total.value.double_value, batch_sum);
+            if (!next.HasValue()) {
+              return FailWith(next.GetStatus());
+            }
+            total = Value(next.Value());
+          }
         }
         break;
       }
@@ -596,6 +634,16 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
     if (all_done && !aggregates_.empty()) {
       break;
     }
+    Status agg_error{Status::kSuccess};
+    auto eval_input = [&](const Expression& e,
+                          const Row& row) -> std::optional<Value> {
+      StatusOr<Value> v = e->TryEvaluate(row, input_schema_);
+      if (!v.HasValue()) {
+        agg_error = v.GetStatus();
+        return std::nullopt;
+      }
+      return v.MoveValue();
+    };
     for (size_t row_index = 0; row_index < input_batch_.Size(); ++row_index) {
       std::optional<Row> materialized;
       auto materialize = [&]() -> const Row& {
@@ -612,44 +660,61 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             continue;
           }
           if (agg.WhereFilter()) {
-            relational_detail::Scope scope{.row = &materialize(),
-                                           .schema = &input_schema_,
-                                           .outer = nullptr};
-            if (!relational_detail::Truthy(
-                    agg.WhereFilter()->Evaluate(*scope.row, *scope.schema))) {
+            std::optional<Value> keep =
+                eval_input(agg.WhereFilter(), materialize());
+            if (!keep.has_value()) {
+              return FailWith(agg_error);
+            }
+            if (!relational_detail::Truthy(*keep)) {
               continue;
             }
           }
           relational_detail::AggregateInput input;
           if (!IsCountStar(agg)) {
-            input.value = agg.Child()->Evaluate(materialize(), input_schema_);
+            std::optional<Value> value = eval_input(agg.Child(), materialize());
+            if (!value.has_value()) {
+              return FailWith(agg_error);
+            }
+            input.value = std::move(*value);
           } else {
             input.value = Value(1);
           }
           for (const auto& term : agg.InnerOrderBy()) {
-            input.order_keys.push_back(
-                term.expression->Evaluate(materialize(), input_schema_));
+            std::optional<Value> key =
+                eval_input(term.expression, materialize());
+            if (!key.has_value()) {
+              return FailWith(agg_error);
+            }
+            input.order_keys.push_back(std::move(*key));
           }
           if (agg.GetType() == AggregationType::kStringAgg &&
               agg.SecondaryArg()) {
-            input.auxiliary =
-                agg.SecondaryArg()->Evaluate(materialize(), input_schema_);
+            std::optional<Value> aux =
+                eval_input(agg.SecondaryArg(), materialize());
+            if (!aux.has_value()) {
+              return FailWith(agg_error);
+            }
+            input.auxiliary = std::move(*aux);
           }
           for (const Expression& extra : agg.TrailingArgs()) {
             if (extra) {
-              input.trailing_values.push_back(
-                  extra->Evaluate(materialize(), input_schema_));
+              std::optional<Value> trail = eval_input(extra, materialize());
+              if (!trail.has_value()) {
+                return FailWith(agg_error);
+              }
+              input.trailing_values.push_back(std::move(*trail));
             }
           }
           accumulators[i]->Add(std::move(input));
           continue;
         }
         if (agg.WhereFilter()) {
-          relational_detail::Scope scope{.row = &materialize(),
-                                         .schema = &input_schema_,
-                                         .outer = nullptr};
-          if (!relational_detail::Truthy(
-                  agg.WhereFilter()->Evaluate(*scope.row, *scope.schema))) {
+          std::optional<Value> keep =
+              eval_input(agg.WhereFilter(), materialize());
+          if (!keep.has_value()) {
+            return FailWith(agg_error);
+          }
+          if (!relational_detail::Truthy(*keep)) {
             continue;
           }
         }
@@ -663,10 +728,18 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             val = input_batch_.ColumnAt(static_cast<size_t>(offset))
                       .ValueAt(row_index);
           } else {
-            val = agg.Child()->Evaluate(materialize(), input_schema_);
+            std::optional<Value> value = eval_input(agg.Child(), materialize());
+            if (!value.has_value()) {
+              return FailWith(agg_error);
+            }
+            val = std::move(*value);
           }
         } else {
-          val = agg.Child()->Evaluate(materialize(), input_schema_);
+          std::optional<Value> value = eval_input(agg.Child(), materialize());
+          if (!value.has_value()) {
+            return FailWith(agg_error);
+          }
+          val = std::move(*value);
         }
         if (val.IsNull()) {
           continue;
@@ -690,7 +763,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             // degrade to string concatenation).
             if (val.type != ValueType::kInt64 &&
                 val.type != ValueType::kDouble) {
-              throw std::runtime_error("numeric value required");
+              return FailWith(StatusError(StatusCode::kInvalidArgument,
+
+                                          "numeric value required"));
             }
             break;
           default:
@@ -702,8 +777,12 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
               results[i] = val;
             } else if (val.type == ValueType::kDouble &&
                        results[i].type == ValueType::kDouble) {
-              results[i] = Value(CheckedDoubleAdd(results[i].value.double_value,
-                                                  val.value.double_value));
+              StatusOr<double> next = CheckedDoubleAdd(
+                  results[i].value.double_value, val.value.double_value);
+              if (!next.HasValue()) {
+                return FailWith(next.GetStatus());
+              }
+              results[i] = Value(next.Value());
             } else {
               results[i] = results[i] + val;
             }
@@ -792,6 +871,7 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       }
     }
   }
+  FailWithChildOf(*child_);
   for (size_t i = 0; i < aggregates_.size(); ++i) {
     const auto& agg = aggregates_[i].expression->AsAggregateExpression();
     switch (agg.GetType()) {
@@ -809,7 +889,11 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
   }
   for (size_t i = 0; i < aggregates_.size(); ++i) {
     if (accumulators[i]) {
-      results[i] = accumulators[i]->Finish();
+      StatusOr<Value> finished_value = accumulators[i]->TryFinish();
+      if (!finished_value.HasValue()) {
+        return FailWith(finished_value.GetStatus());
+      }
+      results[i] = finished_value.MoveValue();
     }
   }
 

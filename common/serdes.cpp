@@ -18,11 +18,12 @@
 
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <stdexcept>
 #include <string_view>
 
+#include "common/log_message.hpp"
 #include "constants.hpp"
 
 namespace tinylamb {
@@ -76,8 +77,11 @@ size_t DeserializeU64(const char* pos, uint64_t* out) {
 size_t SerializeStringView(char* pos, std::string_view bin) {
   // bin_size_t cannot represent longer strings; truncating silently would
   // corrupt the serialized image (length prefix vs payload mismatch).
+  // Callers guarantee sizes upstream (page-size / kTooBigData checks), so an
+  // oversize string here is an invariant violation, not a runtime error.
   if (bin.size() > std::numeric_limits<bin_size_t>::max()) {
-    throw std::runtime_error("string too long to serialize");
+    LOG(FATAL) << "string too long to serialize: " << bin.size();
+    abort();
   }
   const auto len = static_cast<bin_size_t>(bin.size());
   SerializeU16(pos, len);

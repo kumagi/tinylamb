@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/pipeline_breaker.hpp"
@@ -25,6 +26,12 @@ namespace tinylamb {
 // blocks without sorting entire runs.
 class PartialSortExecutor : public ExecutorBase, public PipelineBreaker {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  PartialSortExecutor(const PartialSortExecutor&) = delete;
+  PartialSortExecutor& operator=(const PartialSortExecutor&) = delete;
+  PartialSortExecutor(PartialSortExecutor&&) = delete;
+  PartialSortExecutor& operator=(PartialSortExecutor&&) = delete;
   PartialSortExecutor(Executor source, Schema schema,
                       std::vector<SortExecutor::Key> keys, size_t top_k,
                       size_t offset = 0, size_t block_size = 0);
@@ -61,6 +68,7 @@ class PartialSortExecutor : public ExecutorBase, public PipelineBreaker {
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};
   bool materialized_{false};
+  Status sort_error_{Status::kSuccess};
   QueryMemoryCharge charge_;
 };
 

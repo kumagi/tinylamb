@@ -553,13 +553,22 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // NOTE: table_key_filters are intentionally NOT applied here. The stash
       // is owned by the statement that derived it; applying it to correlated
       // subqueries silently narrowed unrelated scans.
-      source = LoadSource(context, from, &outer, ctes,
-                          projection.empty() ? nullptr : &projection, nullptr,
-                          nullptr, std::nullopt);
+      StatusOr<Relation> loaded =
+          LoadSource(context, from, &outer, ctes,
+                     projection.empty() ? nullptr : &projection, nullptr,
+                     nullptr, std::nullopt);
+      if (!loaded.HasValue()) {
+        return std::nullopt;
+      }
+      source = loaded.MoveValue();
     } else {
       bool predicates_applied = false;
-      source =
+      StatusOr<Relation> built =
           BuildInput(context, statement, &outer, ctes, &predicates_applied);
+      if (!built.HasValue()) {
+        return std::nullopt;
+      }
+      source = built.MoveValue();
     }
     auto created = std::make_unique<CorrelatedIndex>();
     created->schema = source.schema;
@@ -672,6 +681,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     }
 
     source.FinishSpill();
+    Status group_error{Status::kSuccess};
     const bool integer_key =
         SingleIntegerJoinKey(source.schema, created->local_columns);
     if (aggregate_only) {
@@ -721,43 +731,80 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           }
         }
         Scope scope{.row = &row, .schema = &source.schema, .outer = nullptr};
+        auto eval_group_value =
+            [&](const Expression& expr) -> std::optional<Value> {
+          if (group_error != Status::kSuccess) {
+            return std::nullopt;
+          }
+          StatusOr<Value> v = TryEvaluate(expr, scope, nullptr, context, ctes);
+          if (!v.HasValue()) {
+            group_error = v.GetStatus();
+            return std::nullopt;
+          }
+          return v.MoveValue();
+        };
         for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
           const AggregateExpression& aggregate = *aggregate_expressions[i];
-          if (aggregate.WhereFilter() &&
-              !Truthy(Evaluate(aggregate.WhereFilter(), scope, nullptr, context,
-                               ctes))) {
-            continue;
+          if (aggregate.WhereFilter()) {
+            std::optional<Value> keep =
+                eval_group_value(aggregate.WhereFilter());
+            if (!keep.has_value()) {
+              return;
+            }
+            if (!Truthy(*keep)) {
+              continue;
+            }
           }
           if (IsCountStar(aggregate)) {
             group->accumulators[i].Add(Value(1));
             continue;
           }
           AggregateInput input;
-          input.value =
-              Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
+          std::optional<Value> value = eval_group_value(aggregate.Child());
+          if (!value.has_value()) {
+            return;
+          }
+          input.value = std::move(*value);
           if (aggregate.Having() != AggregateHavingModifier::kNone &&
               aggregate.HavingCondition()) {
-            input.condition = Evaluate(aggregate.HavingCondition(), scope,
-                                       nullptr, context, ctes);
+            std::optional<Value> cond =
+                eval_group_value(aggregate.HavingCondition());
+            if (!cond.has_value()) {
+              return;
+            }
+            input.condition = std::move(*cond);
           }
           for (const auto& term : aggregate.InnerOrderBy()) {
-            input.order_keys.push_back(
-                Evaluate(term.expression, scope, nullptr, context, ctes));
+            std::optional<Value> key = eval_group_value(term.expression);
+            if (!key.has_value()) {
+              return;
+            }
+            input.order_keys.push_back(std::move(*key));
           }
           if (aggregate.GetType() == AggregationType::kStringAgg &&
               aggregate.SecondaryArg()) {
-            input.auxiliary = Evaluate(aggregate.SecondaryArg(), scope, nullptr,
-                                       context, ctes);
+            std::optional<Value> aux =
+                eval_group_value(aggregate.SecondaryArg());
+            if (!aux.has_value()) {
+              return;
+            }
+            input.auxiliary = std::move(*aux);
           }
           for (const Expression& extra : aggregate.TrailingArgs()) {
             if (extra) {
-              input.trailing_values.push_back(
-                  Evaluate(extra, scope, nullptr, context, ctes));
+              std::optional<Value> trail = eval_group_value(extra);
+              if (!trail.has_value()) {
+                return;
+              }
+              input.trailing_values.push_back(std::move(*trail));
             }
           }
           group->accumulators[i].Add(std::move(input));
         }
       });
+      if (group_error != Status::kSuccess) {
+        return std::nullopt;  // Fall back to the generic (diagnostic) path.
+      }
       auto emit_group = [&](const std::string& key, GroupAggs& group) {
         AggregateResultMap aggregate_results;
         aggregate_results.reserve(group.accumulators.size());
@@ -773,16 +820,33 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         // must simply not enter the cache; evaluating the group as if it
         // survived would return a value where SQL requires the scalar NULL
         // / zero-row semantics.
-        if (statement.Having() &&
-            !Truthy(Evaluate(statement.Having(), scope, &aggregate_results,
-                             context, ctes))) {
-          return;
+        if (statement.Having()) {
+          if (group_error != Status::kSuccess) {
+            return;
+          }
+          StatusOr<Value> keep = TryEvaluate(statement.Having(), scope,
+                                             &aggregate_results, context, ctes);
+          if (!keep.HasValue()) {
+            group_error = keep.GetStatus();
+            return;
+          }
+          if (!Truthy(keep.Value())) {
+            return;
+          }
         }
         std::vector<Value> values;
         values.reserve(statement.SelectList().size());
         for (const NamedExpression& item : statement.SelectList()) {
-          values.push_back(Evaluate(item.expression, scope, &aggregate_results,
-                                    context, ctes));
+          if (group_error != Status::kSuccess) {
+            return;
+          }
+          StatusOr<Value> v = TryEvaluate(item.expression, scope,
+                                          &aggregate_results, context, ctes);
+          if (!v.HasValue()) {
+            group_error = v.GetStatus();
+            return;
+          }
+          values.push_back(v.MoveValue());
         }
         // Build the schema from the local values directly: AddRow may spill
         // and empty `finished.rows`, so rows[0] is not safe to read back.
@@ -816,7 +880,16 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         if (!local_predicates.empty()) {
           Scope scope{.row = &row, .schema = &source.schema, .outer = nullptr};
           for (const Expression& predicate : local_predicates) {
-            if (!Truthy(Evaluate(predicate, scope, nullptr, context, ctes))) {
+            if (group_error != Status::kSuccess) {
+              return;
+            }
+            StatusOr<Value> keep =
+                TryEvaluate(predicate, scope, nullptr, context, ctes);
+            if (!keep.HasValue()) {
+              group_error = keep.GetStatus();
+              return;
+            }
+            if (!Truthy(keep.Value())) {
               return;
             }
           }
@@ -824,6 +897,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         const std::string key = EncodeJoinKey(row, created->local_columns);
         created->rows.emplace(key, row);
       });
+      if (group_error != Status::kSuccess) {
+        return std::nullopt;  // Fall back to the generic (diagnostic) path.
+      }
     }
     source.rows.clear();
     source.rows.shrink_to_fit();
@@ -842,7 +918,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
   std::vector<Value> cache_values;
   cache_values.reserve(index->cache_outer_columns.size());
   for (const ColumnName& column : index->cache_outer_columns) {
-    cache_values.push_back(Lookup(column, outer));
+    StatusOr<Value> cached_value = TryLookup(column, outer);
+    if (!cached_value.HasValue()) {
+      return std::nullopt;  // Fall back to the generic (diagnostic) path.
+    }
+    cache_values.push_back(cached_value.MoveValue());
   }
   // A NULL correlated value is not a valid equality key.  In particular,
   // LEFT JOIN null-extension reaches this path before the indexed equality
@@ -858,7 +938,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     if (const auto cached_result = index->cached_results.find(*cache_key);
         cached_result != index->cached_results.end()) {
       ++context.execution_runtime()->correlated_result_cache_hits;
-      return MaterializeRelation(*cached_result->second);
+      StatusOr<Relation> replayed = MaterializeRelation(*cached_result->second);
+      if (!replayed.HasValue()) {
+        return std::nullopt;
+      }
+      return replayed.MoveValue();
     }
   } else {
     // NULL equality parameters do not participate in the result cache, but
@@ -881,18 +965,31 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     if (capped_by_limit) {
       ++context.execution_runtime()->exists_short_circuit_queries;
     }
-    return FinishQuery(context, *result_statement, std::move(empty), &outer,
-                       ctes, false);
+    StatusOr<Relation> finished = FinishQuery(
+        context, *result_statement, std::move(empty), &outer, ctes, false);
+    if (!finished.HasValue()) {
+      return std::nullopt;
+    }
+    return finished.MoveValue();
   }
 
   std::vector<Value> outer_values;
   outer_values.reserve(index->outer_columns.size());
   for (const ColumnName& column : index->outer_columns) {
-    Value value = Lookup(column, outer);
+    StatusOr<Value> outer_value = TryLookup(column, outer);
+    if (!outer_value.HasValue()) {
+      return std::nullopt;  // Fall back to the generic (diagnostic) path.
+    }
+    Value value = outer_value.MoveValue();
     if (value.IsNull()) {
       Relation empty;
       empty.schema = index->schema;
-      return FinishQuery(context, statement, std::move(empty), &outer, ctes);
+      StatusOr<Relation> finished =
+          FinishQuery(context, statement, std::move(empty), &outer, ctes);
+      if (!finished.HasValue()) {
+        return std::nullopt;
+      }
+      return finished.MoveValue();
     }
     outer_values.push_back(std::move(value));
   }
@@ -917,14 +1014,26 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
   if (capped_by_limit) {
     ++context.execution_runtime()->exists_short_circuit_queries;
   }
-  Relation result = FinishQuery(context, *result_statement,
-                                std::move(candidates), &outer, ctes);
+  StatusOr<Relation> finished_final = FinishQuery(
+      context, *result_statement, std::move(candidates), &outer, ctes);
+  if (!finished_final.HasValue()) {
+    return std::nullopt;
+  }
+  Relation result = finished_final.MoveValue();
   if (!cache_key.has_value()) {
-    return MaterializeRelation(result);
+    StatusOr<Relation> copied = MaterializeRelation(result);
+    if (!copied.HasValue()) {
+      return std::nullopt;
+    }
+    return copied.MoveValue();
   }
   auto [iter, inserted] = index->cached_results.emplace(
       *cache_key, std::make_shared<Relation>(std::move(result)));
-  return MaterializeRelation(*iter->second);
+  StatusOr<Relation> copied = MaterializeRelation(*iter->second);
+  if (!copied.HasValue()) {
+    return std::nullopt;
+  }
+  return copied.MoveValue();
 }
 
 bool ExpressionUsesOnlyScopes(  // NOLINT(misc-no-recursion)
@@ -1365,7 +1474,12 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     context.execution_runtime()->retained_statements.push_back(capped);
     ++context.execution_runtime()->exists_short_circuit_queries;
   }
-  Relation result = ExecuteQuery(context, *execution_statement, nullptr, ctes);
+  StatusOr<Relation> executed =
+      ExecuteQuery(context, *execution_statement, nullptr, ctes);
+  if (!executed.HasValue()) {
+    return nullptr;
+  }
+  Relation result = executed.MoveValue();
   auto [iter, inserted] =
       context.execution_runtime()->uncorrelated_results.emplace(
           &statement, std::make_shared<Relation>(std::move(result)));

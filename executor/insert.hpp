@@ -44,6 +44,12 @@ enum class InsertExecutionMode : uint8_t {
 
 class Insert : public ExecutorBase {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  Insert(const Insert&) = delete;
+  Insert& operator=(const Insert&) = delete;
+  Insert(Insert&&) = delete;
+  Insert& operator=(Insert&&) = delete;
   explicit Insert(Transaction& txn, Table* target, Executor src)
       : txn_(&txn), target_(target), src_(std::move(src)) {}
 

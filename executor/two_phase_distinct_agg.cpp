@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -142,9 +143,9 @@ TwoPhaseDistinctAgg::TwoPhaseDistinctAgg(
       MakeTwoPhaseDistinctSchema(group_by_keys_, aggregates_, input_schema_);
 }
 
-void TwoPhaseDistinctAgg::Materialize() {
+Status TwoPhaseDistinctAgg::Materialize() {
   if (materialized_) {
-    return;
+    return Status::kSuccess;
   }
   materialized_ = true;
   output_rows_.clear();
@@ -191,8 +192,14 @@ void TwoPhaseDistinctAgg::Materialize() {
       std::vector<Value> key_vals;
       key_vals.reserve(g_count);
       for (const auto& g_named : group_by_keys_) {
-        key_vals.push_back(relational_detail::CanonicalDistinctValue(
-            g_named.expression->Evaluate(in_row, input_schema_)));
+        StatusOr<Value> key =
+            g_named.expression->TryEvaluate(in_row, input_schema_);
+        if (!key.HasValue()) {
+          FailWith(key.GetStatus());
+          return key.GetStatus();
+        }
+        key_vals.push_back(
+            relational_detail::CanonicalDistinctValue(key.MoveValue()));
       }
       Row g_key(std::move(key_vals));
       auto [it, inserted] = groups.try_emplace(g_key, GroupState{});
@@ -206,15 +213,25 @@ void TwoPhaseDistinctAgg::Materialize() {
     for (size_t i = 0; i < aggregates_.size(); ++i) {
       const auto& agg = aggregates_[i].expression->AsAggregateExpression();
       if (agg.WhereFilter()) {
-        Value fval = agg.WhereFilter()->Evaluate(in_row, input_schema_);
-        if (fval.IsNull() || !fval.Truthy()) {
+        StatusOr<Value> fval =
+            agg.WhereFilter()->TryEvaluate(in_row, input_schema_);
+        if (!fval.HasValue()) {
+          FailWith(fval.GetStatus());
+          return fval.GetStatus();
+        }
+        if (fval.Value().IsNull() || !fval.Value().Truthy()) {
           continue;
         }
       }
 
       Value val;
       if (!IsCountStar(agg) && agg.Child()) {
-        val = agg.Child()->Evaluate(in_row, input_schema_);
+        StatusOr<Value> input = agg.Child()->TryEvaluate(in_row, input_schema_);
+        if (!input.HasValue()) {
+          FailWith(input.GetStatus());
+          return input.GetStatus();
+        }
+        val = input.MoveValue();
       }
 
       if (agg.Distinct()) {
@@ -418,11 +435,15 @@ void TwoPhaseDistinctAgg::Materialize() {
       emit_group(&k, groups[k]);
     }
   }
+  RETURN_IF_FAIL(child_->GetStatus());
+  return Status::kSuccess;
 }
 
 bool TwoPhaseDistinctAgg::Next(Row* dst, RowPosition* rp) {
   if (!materialized_) {
-    Materialize();
+    if (Materialize() != Status::kSuccess) {
+      return false;
+    }
   }
   if (cursor_ >= output_rows_.size()) {
     return false;

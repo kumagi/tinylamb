@@ -36,6 +36,12 @@ class ExchangeExecutor : public ExecutorBase,
                          public PipelineBreaker,
                          public std::enable_shared_from_this<ExchangeExecutor> {
  public:
+  // Non-copyable by design: instances are owned by unique_ptr and
+  // referenced by raw pointers throughout the executor graph.
+  ExchangeExecutor(const ExchangeExecutor&) = delete;
+  ExchangeExecutor& operator=(const ExchangeExecutor&) = delete;
+  ExchangeExecutor(ExchangeExecutor&&) = delete;
+  ExchangeExecutor& operator=(ExchangeExecutor&&) = delete;
   ExchangeExecutor(Executor child, ExchangeType type, size_t partition_count,
                    std::vector<slot_t> key_cols = {},
                    std::vector<Value> range_bounds = {});

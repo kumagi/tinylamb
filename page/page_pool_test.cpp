@@ -64,7 +64,9 @@ class PagePoolTest : public ::testing::Test {
     filename_ = "page_pool_test-" + RandomString();
     Reset();
   }
-  void Reset() { pp = std::make_unique<PagePool>(filename_, kDefaultCapacity); }
+  void Reset() {
+    pp = PagePool::Create(filename_, kDefaultCapacity).MoveValue();
+  }
   void TearDown() override { std::ignore = std::remove(filename_.c_str()); }
 
   std::string filename_;
@@ -81,7 +83,7 @@ TEST_F(PagePoolTest, Construct) {
 TEST_F(PagePoolTest, GetPage) {
   // Arrange -- nothing more than default PagePool (capacity 10) from SetUp()
   // Act -- request page 0 from the pool
-  PageRef page = pp->GetPage(0, nullptr);
+  PageRef page = pp->GetPage(0, nullptr).MoveValue();
 
   // Assert -- pool size grows to 1 and the returned page has ID 0
   ASSERT_EQ(pp->Size(), 1);
@@ -93,7 +95,7 @@ TEST_F(PagePoolTest, GetPageSeveralpattern) {
 
   // Act -- request pages in the given pattern
   for (int& i : pattern) {
-    PageRef page = pp->GetPage(static_cast<page_id_t>(i), nullptr);
+    PageRef page = pp->GetPage(static_cast<page_id_t>(i), nullptr).MoveValue();
 
     // Assert -- each requested page has the expected ID
     ASSERT_EQ(page->PageID(), i);
@@ -104,7 +106,7 @@ TEST_F(PagePoolTest, GetManyPage) {
   // Arrange -- nothing more than default PagePool (capacity 10) from SetUp()
   // Act -- request 5 distinct pages (0..4) from the pool
   for (int i = 0; i < 5; ++i) {
-    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr);
+    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr).MoveValue();
 
     // Assert -- each page has the expected ID and pool size grows accordingly
     ASSERT_EQ(p->PageID(), i);
@@ -116,7 +118,7 @@ TEST_F(PagePoolTest, EvictPage) {
   // Arrange -- default PagePool (capacity 10); nothing else to set up
   // Act -- request 15 pages (0..14), exceeding the pool capacity of 10
   for (int i = 0; i < 15; ++i) {
-    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr);
+    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr).MoveValue();
 
     // Assert -- each page has the expected ID; pool size caps at capacity (10)
     ASSERT_EQ(p->PageID(), i);
@@ -128,7 +130,7 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
   // Arrange -- request 11 pages and write a deterministic byte pattern to each
   constexpr size_t kPages = 11;
   for (size_t i = 0; i < kPages; ++i) {
-    PageRef p = pp->GetPage(i, nullptr);
+    PageRef p = pp->GetPage(i, nullptr).MoveValue();
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
@@ -141,7 +143,7 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
   // Reset();
   // Act -- re-request the same 11 pages and read back the byte patterns
   for (size_t i = 0; i < kPages; ++i) {
-    PageRef p = pp->GetPage(i, nullptr);
+    PageRef p = pp->GetPage(i, nullptr).MoveValue();
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
 
@@ -155,7 +157,7 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
 TEST_F(PagePoolTest, PageAccessorsLSNAndChecksum) {
   // Arrange -- fetch a fresh page from the pool (materialized as a free page)
   // Act -- read and mutate the Page base-class accessors
-  PageRef page = pp->GetPage(5, nullptr);
+  PageRef page = pp->GetPage(5, nullptr).MoveValue();
 
   // Assert -- ID/LSN accessors behave as documented
   ASSERT_EQ(page->PageID(), 5);
@@ -176,7 +178,7 @@ TEST_F(PagePoolTest, PageAccessorsLSNAndChecksum) {
 
 TEST_F(PagePoolTest, ReadFromRejectsCorruptChecksum) {
   {
-    PageRef page = pp->GetPage(3, nullptr);
+    PageRef page = pp->GetPage(3, nullptr).MoveValue();
     page->PageInit(3, PageType::kFreePage);
     page->SetPageLSN(1);
     page->SetChecksum();
@@ -195,7 +197,7 @@ TEST_F(PagePoolTest, ReadFromRejectsCorruptChecksum) {
     ASSERT_TRUE(file.good());
   }
 
-  EXPECT_THROW(pp->GetPage(3, nullptr), std::runtime_error);
+  EXPECT_EQ(pp->GetPage(3, nullptr).GetStatus(), Status::kCorrupt);
 }
 
 TEST_F(PagePoolTest, PageInitForEveryPageType) {
@@ -248,13 +250,13 @@ TEST_F(PagePoolTest, PageRowCountOverloads) {
   ASSERT_EQ(row.RowCount(txn), 0U);
   ASSERT_EQ(leaf.RowCount(txn), 0U);
   ASSERT_EQ(branch.RowCount(txn), 0U);
-  EXPECT_THROW(std::ignore = meta.RowCount(txn), std::runtime_error);
+  EXPECT_DEATH(std::ignore = meta.RowCount(txn), "invalid page type");
 
   // Act/Assert -- slot_t overload dispatches on page type
   ASSERT_EQ(row.RowCount(), 0U);
   ASSERT_EQ(leaf.RowCount(), 0U);
   ASSERT_EQ(branch.RowCount(), 0U);
-  EXPECT_THROW(std::ignore = meta.RowCount(), std::runtime_error);
+  EXPECT_DEATH(std::ignore = meta.RowCount(), "RowCount is not implemented");
 }
 
 TEST_F(PagePoolTest, PageReadKeyAndReadByType) {
@@ -277,15 +279,15 @@ TEST_F(PagePoolTest, PageReadKeyAndReadByType) {
   // Act/Assert -- ReadKey on a branch page returns the stored key
   ASSERT_EQ(branch.ReadKey(txn, 0).Value(), "k");
 
-  // Act/Assert -- ReadKey on unsupported types throws
-  EXPECT_THROW(meta.ReadKey(txn, 0), std::runtime_error);
+  // Act/Assert -- ReadKey on unsupported types reports kInvalidArgument
+  EXPECT_EQ(meta.ReadKey(txn, 0).GetStatus(), Status::kInvalidArgument);
 
   // Act/Assert -- Read(slot) on a leaf page; out-of-range fails
   ASSERT_EQ(leaf.Read(txn, 0).Value(), "1");
   ASSERT_EQ(leaf.Read(txn, 1).GetStatus(), Status::kNotExists);
 
-  // Act/Assert -- Read(slot) on an unsupported type throws
-  EXPECT_THROW(meta.Read(txn, 0), std::runtime_error);
+  // Act/Assert -- Read(slot) on an unsupported type reports kInvalidArgument
+  EXPECT_EQ(meta.Read(txn, 0).GetStatus(), Status::kInvalidArgument);
 }
 
 TEST_F(PagePoolTest, PageLowestHighestKeyOnEmptyLeaf) {
@@ -303,31 +305,31 @@ TEST_F(PagePoolTest, PageLowestHighestKeyOnEmptyLeaf) {
   ASSERT_EQ(leaf.HighestKey(txn).Value(), "a");
 }
 
-TEST_F(PagePoolTest, PageUnsupportedOperationsThrow) {
+TEST_F(PagePoolTest, PageUnsupportedOperations) {
   // Arrange -- a row page cannot serve leaf/branch-only operations
   Transaction txn;
   Page row(1, PageType::kRowPage);
   Page other(2, PageType::kLeafPage);
 
-  // Act/Assert -- each unsupported operation throws "Invalid page type"
-  EXPECT_THROW(row.Delete(txn, "key"), std::runtime_error);
-  EXPECT_THROW(row.SetLowFence(txn, IndexKey("a")), std::runtime_error);
-  EXPECT_THROW(row.SetHighFence(txn, IndexKey("z")), std::runtime_error);
-  EXPECT_THROW(std::ignore = row.GetLowFence(txn), std::runtime_error);
-  EXPECT_THROW(std::ignore = row.GetHighFence(txn), std::runtime_error);
-  EXPECT_THROW((void)row.SetFoster(txn, FosterPair("k", 1)),
-               std::runtime_error);
-  EXPECT_THROW((void)row.GetFoster(txn), std::runtime_error);
-  EXPECT_THROW((void)row.MoveRightToFoster(txn, other), std::runtime_error);
-  EXPECT_THROW((void)row.MoveLeftFromFoster(txn, other), std::runtime_error);
-  EXPECT_THROW(row.SetLowFenceImpl(IndexKey("a")), std::runtime_error);
-  EXPECT_THROW(row.SetHighFenceImpl(IndexKey("z")), std::runtime_error);
-  EXPECT_THROW(row.SetFosterImpl(FosterPair("k", 1)), std::runtime_error);
+  // Act/Assert -- query/mutation paths report kInvalidArgument; the
+  // redo/undo Impl setters are caller-contract violations and abort.
+  EXPECT_EQ(row.Delete(txn, "key"), Status::kInvalidArgument);
+  EXPECT_EQ(row.SetLowFence(txn, IndexKey("a")), Status::kInvalidArgument);
+  EXPECT_EQ(row.SetHighFence(txn, IndexKey("z")), Status::kInvalidArgument);
+  EXPECT_DEATH(std::ignore = row.GetLowFence(txn), "GetLowFence");
+  EXPECT_DEATH(std::ignore = row.GetHighFence(txn), "GetHighFence");
+  EXPECT_EQ(row.SetFoster(txn, FosterPair("k", 1)), Status::kInvalidArgument);
+  EXPECT_EQ(row.GetFoster(txn).GetStatus(), Status::kInvalidArgument);
+  EXPECT_EQ(row.MoveRightToFoster(txn, other), Status::kInvalidArgument);
+  EXPECT_EQ(row.MoveLeftFromFoster(txn, other), Status::kInvalidArgument);
+  EXPECT_DEATH(row.SetLowFenceImpl(IndexKey("a")), "SetLowFenceImpl");
+  EXPECT_DEATH(row.SetHighFenceImpl(IndexKey("z")), "SetHighFenceImpl");
+  EXPECT_DEATH(row.SetFosterImpl(FosterPair("k", 1)), "SetFosterImpl");
 }
 
 TEST_F(PagePoolTest, PageRefStreamInsertion) {
   // Arrange -- a live pinned page
-  PageRef page = pp->GetPage(3, nullptr);
+  PageRef page = pp->GetPage(3, nullptr).MoveValue();
 
   // Act -- stream the PageRef itself
   std::ostringstream oss;
@@ -339,16 +341,20 @@ TEST_F(PagePoolTest, PageRefStreamInsertion) {
 
 TEST_F(PagePoolTest, MetaPageAllocateDestroyReuse) {
   // Arrange -- full page manager + transaction machinery
-  PageManager pm(filename_, kDefaultCapacity);
-  Logger log(filename_ + ".log");
+  auto pm_holder = PageManager::Create(filename_, kDefaultCapacity).MoveValue();
+  CHECK(pm_holder != nullptr);
+  PageManager& pm = *pm_holder;
+  auto log_holder = Logger::Create(filename_ + ".log").MoveValue();
+  CHECK(log_holder != nullptr);
+  Logger& log = *log_holder;
   LockManager lm;
   RecoveryManager rm(filename_ + ".log", pm.GetPool());
   TransactionManager tm(&pm, &log, &rm);
 
   // Act 1 -- allocate two pages through the meta page
   Transaction txn = tm.Begin();
-  PageRef p1 = pm.AllocateNewPage(txn, PageType::kRowPage);
-  PageRef p2 = pm.AllocateNewPage(txn, PageType::kLeafPage);
+  PageRef p1 = pm.AllocateNewPage(txn, PageType::kRowPage).MoveValue();
+  PageRef p2 = pm.AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
   ASSERT_NE(p1->PageID(), p2->PageID());
 
   // Act 2 -- destroy p2 (turns it into a free page on the free chain)
@@ -357,11 +363,11 @@ TEST_F(PagePoolTest, MetaPageAllocateDestroyReuse) {
   p2.PageUnlock();
 
   // Act 3 -- the next allocation must reuse the freed page ID
-  PageRef p3 = pm.AllocateNewPage(txn, PageType::kBranchPage);
+  PageRef p3 = pm.AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
   ASSERT_EQ(p3->PageID(), p2->PageID());
 
   // Assert -- the meta page tracks the allocated max page count
-  PageRef meta = pm.GetPool()->GetPage(0, nullptr);
+  PageRef meta = pm.GetPool()->GetPage(0, nullptr).MoveValue();
   ASSERT_GE(meta->body.meta_page.MaxPageCountForTest(), p3->PageID());
   ASSERT_SUCCESS(txn.PreCommit());
 }
@@ -370,14 +376,14 @@ TEST_F(PagePoolTest, EvictionResumesAfterPoolGrewPastCapacity) {
   std::vector<PageRef> pinned;
   pinned.reserve(kDefaultCapacity);
   for (int i = 0; i < kDefaultCapacity; ++i) {
-    pinned.push_back(pp->GetPage(static_cast<page_id_t>(i)));
+    pinned.push_back(pp->GetPage(static_cast<page_id_t>(i)).MoveValue());
   }
   {
-    PageRef extra = pp->GetPage(kDefaultCapacity);
+    PageRef extra = pp->GetPage(kDefaultCapacity).MoveValue();
     EXPECT_GT(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));
     pinned.clear();
   }
-  PageRef newer = pp->GetPage(kDefaultCapacity + 1);
+  PageRef newer = pp->GetPage(kDefaultCapacity + 1).MoveValue();
   EXPECT_LE(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));
   EXPECT_EQ(newer->PageID(), static_cast<page_id_t>(kDefaultCapacity + 1));
 }
@@ -389,14 +395,14 @@ TEST_F(PagePoolTest, CacheHitFlagReflectsMissAndHit) {
   // wait for the first ref to be destroyed.
   bool hit = true;
   {
-    PageRef miss = pp->GetPage(9, &hit);
+    PageRef miss = pp->GetPage(9, &hit).MoveValue();
 
     // Assert -- the first request was a miss
     ASSERT_FALSE(hit);
   }
   hit = false;
   {
-    PageRef hit_ref = pp->GetPage(9, &hit);
+    PageRef hit_ref = pp->GetPage(9, &hit).MoveValue();
 
     // Assert -- the second request was served from the pool
     ASSERT_TRUE(hit);
@@ -407,7 +413,7 @@ TEST_F(PagePoolTest, CacheHitFlagReflectsMissAndHit) {
 TEST_F(PagePoolTest, DropAllPagesClearsPool) {
   // Arrange -- request 5 distinct pages so the pool is non-empty
   for (int i = 0; i < 5; ++i) {
-    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr);
+    PageRef p = pp->GetPage(static_cast<page_id_t>(i), nullptr).MoveValue();
     ASSERT_EQ(p->PageID(), i);
   }
   ASSERT_EQ(pp->Size(), 5);
@@ -417,16 +423,16 @@ TEST_F(PagePoolTest, DropAllPagesClearsPool) {
 
   // Assert -- the pool is empty and still serves fresh pages afterwards
   ASSERT_EQ(pp->Size(), 0);
-  PageRef again = pp->GetPage(2, nullptr);
+  PageRef again = pp->GetPage(2, nullptr).MoveValue();
   ASSERT_EQ(again->PageID(), 2);
   ASSERT_EQ(pp->Size(), 1);
 }
 
 TEST_F(PagePoolTest, DropAllPagesWithPinnedRefsRetiresEntries) {
   // Arrange -- pin one page for the whole test and another transiently
-  auto keep = pp->GetPage(4);
+  PageRef keep = pp->GetPage(4).MoveValue();
   {
-    PageRef transient = pp->GetPage(5);
+    PageRef transient = pp->GetPage(5).MoveValue();
     ASSERT_EQ(pp->Size(), 2);
 
     // Act -- discard every buffered page while both refs are alive
@@ -441,16 +447,19 @@ TEST_F(PagePoolTest, DropAllPagesWithPinnedRefsRetiresEntries) {
     // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
     keep->body.free_page.FreeBody()[0] = 'r';
   }
-  PageRef fresh = pp->GetPage(6);
+  PageRef fresh = pp->GetPage(6).MoveValue();
   ASSERT_EQ(fresh->PageID(), 6U);
 }
 
 TEST_F(PagePoolTest, DurabilityGateFiresForDirtyPagesOnly) {
   // Arrange -- record every LSN the gate observes before a pwrite
   std::vector<lsn_t> gated;
-  pp->SetDurabilityGate([&gated](lsn_t lsn) { gated.push_back(lsn); });
+  pp->SetDurabilityGate([&gated](lsn_t lsn) {
+    gated.push_back(lsn);
+    return Status::kSuccess;
+  });
 
-  PageRef page = pp->GetPage(8);
+  PageRef page = pp->GetPage(8).MoveValue();
   page->SetPageLSN(77);
   // Union overlay: the write stays inside the kPageSize allocation.
   // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
@@ -471,7 +480,7 @@ TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
   // Arrange -- fill page 7's body with a deterministic pattern, then release
   // the pin so the pool entry is unpinned before it is dropped below.
   {
-    PageRef p = pp->GetPage(7, nullptr);
+    PageRef p = pp->GetPage(7, nullptr).MoveValue();
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
@@ -488,7 +497,7 @@ TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
   // Act -- discard the pool (without a second flush) and reload the page
   pp->DropAllPages();
   ASSERT_EQ(pp->Size(), 0);
-  PageRef reloaded = pp->GetPage(7, nullptr);
+  PageRef reloaded = pp->GetPage(7, nullptr).MoveValue();
 
   // Assert -- the flushed pattern survived the drop-and-reload cycle
   ASSERT_EQ(reloaded->PageID(), 7);
@@ -501,9 +510,9 @@ TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
 TEST_F(PagePoolTest, ConstructorThrowsForUnopenablePath) {
   // Arrange/Act -- a pool whose backing file cannot be created (missing parent
   // directory); the constructor retries with O_TRUNC then throws
-  // Assert -- the constructor reports failure instead of silently proceeding
-  EXPECT_THROW(PagePool("/nonexistent_dir_tinylamb/foo.db", 10),
-               std::runtime_error);
+  // Assert -- Create reports failure instead of silently proceeding
+  EXPECT_FALSE(
+      PagePool::Create("/nonexistent_dir_tinylamb/foo.db", 10).HasValue());
 }
 
 TEST_F(PagePoolTest, OutOfRangePageIdIsHardError) {
@@ -513,13 +522,14 @@ TEST_F(PagePoolTest, OutOfRangePageIdIsHardError) {
 
   // Act/Assert -- loading must report a hard error instead of silently
   // materializing an empty free page that could later be persisted.
-  EXPECT_THROW(pp->GetPage(kHuge, nullptr), std::runtime_error);
+  EXPECT_EQ(pp->GetPage(kHuge, nullptr).GetStatus(), Status::kCorrupt);
   ASSERT_EQ(pp->Size(), 0);
 
   // Act -- ordinary ids keep working afterwards; the extra page forces one
   // clean eviction round.
   for (int64_t i = 0; i < kDefaultCapacity + 1; ++i) {
-    PageRef page = pp->GetPage(static_cast<page_id_t>(1000 + i), nullptr);
+    PageRef page =
+        pp->GetPage(static_cast<page_id_t>(1000 + i), nullptr).MoveValue();
     ASSERT_EQ(page->PageID(), 1000 + i);
   }
   pp->DropAllPages();
@@ -529,13 +539,13 @@ TEST_F(PagePoolTest, OutOfRangePageIdIsHardError) {
 TEST_F(PagePoolTest, WriteBackFailureOnFullDeviceThrows) {
   // Arrange -- /dev/full answers reads with zeros but rejects every write
   // with ENOSPC, so the write-back path during eviction must throw
-  auto pool = std::make_unique<PagePool>("/dev/full", 2);
+  auto pool = PagePool::Create("/dev/full", 2).MoveValue();
   pool->GetPage(0);
   pool->GetPage(1);
 
   // Act -- the third distinct page forces an eviction of page 0, whose
-  // write-back fails
-  EXPECT_THROW(pool->GetPage(2), std::runtime_error);
+  // write-back fails and is reported through the GetPage StatusOr
+  EXPECT_EQ(pool->GetPage(2).GetStatus(), Status::kIOError);
 
   // Tear down without another write-back so the destructor does not rethrow.
   pool->DropAllPages();
@@ -554,7 +564,7 @@ TEST_F(PagePoolTest, ConcurrentLoadsOfSamePageInstallOnce) {
         std::this_thread::yield();
       }
       {
-        PageRef page = pp->GetPage(77, nullptr);
+        PageRef page = pp->GetPage(77, nullptr).MoveValue();
         EXPECT_EQ(page->PageID(), 77U);
       }
       std::scoped_lock lock(mu);
@@ -589,7 +599,7 @@ TEST_F(PagePoolTest, ConcurrentEvictionAcrossThreads) {
       for (int i = 0; i < 50; ++i) {
         const auto pid = static_cast<page_id_t>(1000) +
                          static_cast<page_id_t>((t * 100) + i);
-        PageRef page = pp->GetPage(pid, nullptr);
+        PageRef page = pp->GetPage(pid, nullptr).MoveValue();
         EXPECT_EQ(page->PageID(), pid);
       }
     });
@@ -630,7 +640,7 @@ TEST_F(PagePoolTest, ParallelGetPageStressMixedIdsWithDirtyReload) {
         // because several threads overlap on these ids.
         const auto hot = static_cast<page_id_t>(i % kHotPages);
         {
-          PageRef page = pp->GetPage(hot, nullptr);
+          PageRef page = pp->GetPage(hot, nullptr).MoveValue();
           ASSERT_EQ(page->PageID(), hot);
         }
         // Private churn: dirty the page, release it (forcing a write-back on
@@ -638,13 +648,13 @@ TEST_F(PagePoolTest, ParallelGetPageStressMixedIdsWithDirtyReload) {
         const page_id_t mine = base + static_cast<page_id_t>(i);
         const auto stamp = static_cast<char>((i % 200) + 1);
         {
-          PageRef page = pp->GetPage(mine, nullptr);
+          PageRef page = pp->GetPage(mine, nullptr).MoveValue();
           // Union overlay: the write stays inside the kPageSize allocation.
           // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
           page->body.free_page.FreeBody()[0] = stamp;
         }
         {
-          PageRef reloaded = pp->GetPage(mine, nullptr);
+          PageRef reloaded = pp->GetPage(mine, nullptr).MoveValue();
           EXPECT_EQ(reloaded->PageID(), mine);
           EXPECT_EQ(reloaded->body.free_page.FreeBody()[0], stamp);
         }
@@ -659,8 +669,10 @@ TEST_F(PagePoolTest, ParallelGetPageStressMixedIdsWithDirtyReload) {
   // Quiet phase: push the working set out so the pool shrinks back under its
   // capacity now that every pin is gone.
   for (int i = 0; i <= kDefaultCapacity; ++i) {
-    PageRef page = pp->GetPage(
-        static_cast<page_id_t>(900000) + static_cast<page_id_t>(i), nullptr);
+    PageRef page =
+        pp->GetPage(static_cast<page_id_t>(900000) + static_cast<page_id_t>(i),
+                    nullptr)
+            .MoveValue();
     ASSERT_EQ(page->PageID(), 900000 + i);
   }
   EXPECT_LE(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));
@@ -670,8 +682,8 @@ TEST_F(PagePoolTest, DestructorWarnsOnPinnedPage) {
   // Arrange -- pin page 3 and intentionally leak the PageRef so the pool is
   // destroyed while the page is still pinned
   auto* leaked = new PageRef(
-      pp->GetPage(3, nullptr));  // Intentional leak: pins page across pool
-                                 // destruction for the test below.
+      pp->GetPage(3, nullptr).MoveValue());  // Intentional leak: pins page
+  // across pool destruction for the test below.
   (void)leaked;
 #ifdef TINYLAMB_HAS_LSAN
   // The leak above is deliberate; keep LeakSanitizer from flagging it.

@@ -21,10 +21,11 @@
 #include <ios>
 #include <memory>
 #include <sstream>
-#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -65,23 +66,29 @@ class Decoder {
     return *this;
   }
 
+  // Sticky failure signal for decode helpers that must reject a value after
+  // it has already been read (unknown discriminants, torn payloads).
+  void Fail() { is_->setstate(std::ios::failbit); }
+  [[nodiscard]] bool Failed() const { return is_->fail(); }
+
  private:
   std::istream* is_;
 };
 
-// Decode an object from its in-memory encoded form. Throws when the stream
-// runs out mid-decode so callers never receive a partially built object.
-// T must be default constructible and provide `Decoder& operator>>(Decoder&,
-// T&)`.
+// Decode an object from its in-memory encoded form. Returns a Corrupt status
+// when the stream runs out mid-decode so callers never receive a partially
+// built object. T must be default constructible and provide `Decoder&
+// operator>>(Decoder&, T&)`.
 template <typename T>
-T Decode(std::string_view src) {
+StatusOr<T> Decode(std::string_view src) {
   std::string buffer(src);
   std::stringstream ss(buffer);
   Decoder dec(ss);
   T ret;
   dec >> ret;
   if (!ss) {
-    throw std::runtime_error("Decode failed: truncated or corrupt input");
+    return StatusError(StatusCode::kCorrupt,
+                       "Decode failed: truncated or corrupt input");
   }
   return ret;
 }

@@ -45,6 +45,7 @@ class QueryResult {
         column_names_(std::move(column_names)) {}
 
   bool Next(Row* row);
+  [[nodiscard]] Status GetStatus() const { return executor_->GetStatus(); }
   size_t ForEach(const std::function<void(const Row&)>& sink);
   size_t Drain();
   std::vector<Row> Collect();
@@ -137,6 +138,12 @@ class SqlEngine {
   // Disarms the fill sites no matter how Prepare() exits.
   class PlanCacheCandidateGuard {
    public:
+    // Non-copyable by design: instances are owned by smart pointers and
+    // referenced by raw pointers throughout the executor/graph object web.
+    PlanCacheCandidateGuard(const PlanCacheCandidateGuard&) = delete;
+    PlanCacheCandidateGuard& operator=(const PlanCacheCandidateGuard&) = delete;
+    PlanCacheCandidateGuard(PlanCacheCandidateGuard&&) = delete;
+    PlanCacheCandidateGuard& operator=(PlanCacheCandidateGuard&&) = delete;
     explicit PlanCacheCandidateGuard(SqlEngine* engine) : engine_(engine) {}
     ~PlanCacheCandidateGuard() { engine_->clear_plan_cache_candidate(); }
 

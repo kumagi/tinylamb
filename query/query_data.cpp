@@ -285,65 +285,50 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     cv.SetSchemaName(it->second);
     return Status::kSuccess;
   }
-  if (exp->Type() == TypeTag::kBinaryExp) {
-    Expression left = exp->AsBinaryExpression().Left();
-    Expression right = exp->AsBinaryExpression().Right();
-    RETURN_IF_FAIL(ResolveExpression(
-        left, col_table_map, ambiguous_colum_name, relations, all_cols,
-        expand_proto_value_table, ambiguous_column));
-    RETURN_IF_FAIL(ResolveExpression(
-        right, col_table_map, ambiguous_colum_name, relations, all_cols,
-        expand_proto_value_table, ambiguous_column));
-  } else if (exp->Type() == TypeTag::kUnaryExp) {
-    Expression child = exp->AsUnaryExpression().Child();
-    RETURN_IF_FAIL(ResolveExpression(
-        child, col_table_map, ambiguous_colum_name, relations, all_cols,
-        expand_proto_value_table, ambiguous_column));
-  } else if (exp->Type() == TypeTag::kAggregateExp) {
-    Expression child = exp->AsAggregateExpression().Child();
-    if (!child) {
+  // Composite nodes: resolve through the shared children helper and rebuild
+  // the node when a child was REPLACED (whole-row relation refs become
+  // __struct_json__; proto value-table fields become __get_field_safe__).
+  // Plain in-place mutations (ColumnValue::SetSchemaName) alias the same node
+  // and propagate either way, but a replacement assigned to a local child
+  // handle is invisible to the parent unless the node is rebuilt.
+  switch (exp->Type()) {
+    case TypeTag::kBinaryExp:
+    case TypeTag::kUnaryExp:
+    case TypeTag::kCaseExp:
+    case TypeTag::kInExp:
+    case TypeTag::kFunctionCallExp:
+      break;
+    case TypeTag::kAggregateExp: {
+      Expression child = exp->AsAggregateExpression().Child();
+      if (!child) {
+        return Status::kSuccess;
+      }
+      if (child->Type() == TypeTag::kColumnValue &&
+          child->AsColumnValue().GetColumnName().name == "*") {
+        return Status::kSuccess;
+      }
+      RETURN_IF_FAIL(ResolveExpression(
+          child, col_table_map, ambiguous_colum_name, relations, all_cols,
+          expand_proto_value_table, ambiguous_column));
+      exp = WithExpressionChildren(exp, {std::move(child)});
       return Status::kSuccess;
     }
-    if (child->Type() == TypeTag::kColumnValue &&
-        child->AsColumnValue().GetColumnName().name == "*") {
+    default:
+      // Other node kinds (CAST/ARRAY literals, subquery tests, ...) carry no
+      // bare-column references this pass is responsible for.
       return Status::kSuccess;
-    }
+  }
+  std::vector<Expression> children = ExpressionChildren(exp);
+  bool changed = false;
+  for (Expression& child : children) {
+    const Expression before = child;
     RETURN_IF_FAIL(ResolveExpression(
         child, col_table_map, ambiguous_colum_name, relations, all_cols,
         expand_proto_value_table, ambiguous_column));
-  } else if (exp->Type() == TypeTag::kCaseExp) {
-    const auto& case_expression = exp->AsCaseExpression();
-    for (const auto& clause : case_expression.when_clauses_) {
-      Expression condition = clause.first;
-      Expression value = clause.second;
-      RETURN_IF_FAIL(ResolveExpression(
-          condition, col_table_map, ambiguous_colum_name, relations, all_cols,
-          expand_proto_value_table, ambiguous_column));
-      RETURN_IF_FAIL(ResolveExpression(
-          value, col_table_map, ambiguous_colum_name, relations, all_cols,
-          expand_proto_value_table, ambiguous_column));
-    }
-    Expression otherwise = case_expression.else_clause_;
-    RETURN_IF_FAIL(ResolveExpression(
-        otherwise, col_table_map, ambiguous_colum_name, relations, all_cols,
-        expand_proto_value_table, ambiguous_column));
-  } else if (exp->Type() == TypeTag::kInExp) {
-    const auto& in = exp->AsInExpression();
-    Expression child = in.child_;
-    RETURN_IF_FAIL(ResolveExpression(
-        child, col_table_map, ambiguous_colum_name, relations, all_cols,
-        expand_proto_value_table, ambiguous_column));
-    for (Expression item : in.list_) {
-      RETURN_IF_FAIL(ResolveExpression(
-          item, col_table_map, ambiguous_colum_name, relations, all_cols,
-          expand_proto_value_table, ambiguous_column));
-    }
-  } else if (exp->Type() == TypeTag::kFunctionCallExp) {
-    for (Expression argument : exp->AsFunctionCallExpression().Args()) {
-      RETURN_IF_FAIL(ResolveExpression(
-          argument, col_table_map, ambiguous_colum_name, relations, all_cols,
-          expand_proto_value_table, ambiguous_column));
-    }
+    changed |= before != child;
+  }
+  if (changed) {
+    exp = WithExpressionChildren(exp, std::move(children));
   }
   return Status::kSuccess;
 }
@@ -434,6 +419,9 @@ Status ResolveSelect(
         RETURN_IF_FAIL(ResolveExpression(
             expression, col_table_map, ambiguous_colum_name, relations,
             all_cols, expand_proto_value_table, ambiguous_column));
+        // ResolveExpression may replace the node (whole-row/proto rewrites);
+        // the rebuilt tree must be written back to the select item.
+        it->expression = std::move(expression);
         ++it;
         continue;
       }
@@ -495,6 +483,8 @@ Status ResolveSelect(
       RETURN_IF_FAIL(ResolveExpression(
           expression, col_table_map, ambiguous_colum_name, relations, all_cols,
           expand_proto_value_table, ambiguous_column));
+      // See the qualified branch above: write back replaced subtrees.
+      it->expression = std::move(expression);
       ++it;
     }
   }

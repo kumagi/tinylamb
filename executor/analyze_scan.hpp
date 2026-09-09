@@ -23,6 +23,12 @@ class Database;
 
 class AnalyzeScan : public ExecutorBase {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  AnalyzeScan(const AnalyzeScan&) = delete;
+  AnalyzeScan& operator=(const AnalyzeScan&) = delete;
+  AnalyzeScan(AnalyzeScan&&) = delete;
+  AnalyzeScan& operator=(AnalyzeScan&&) = delete;
   AnalyzeScan(TransactionContext& ctx, std::string_view schema_name,
               const Table& table, size_t sample_size = 1024,
               size_t bucket_count = 16, Database* db = nullptr);

@@ -64,7 +64,7 @@ class CatalogTest : public ::testing::Test {
     if (rs_) {
       rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<Database>(prefix_);
+    rs_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { rs_->DeleteAll(); }
@@ -341,7 +341,10 @@ TEST_F(CatalogTest, PageStoragePoolCapacityFromEnvironment) {
   // Arrange -- a pool capacity far above one page but below the default
   ASSERT_EQ(setenv("TINYLAMB_PAGE_POOL_BYTES", "8388608", 1), 0);
   {
-    Database env_db("catalog_test_env_pool-" + RandomString());
+    auto env_db_holder =
+        Database::Create("catalog_test_env_pool-" + RandomString()).MoveValue();
+    CHECK(env_db_holder != nullptr);
+    Database& env_db = *env_db_holder;
     TransactionContext ctx = env_db.BeginContext();
     Schema schema("env_tbl", {Column("c", ValueType::kInt64)});
     ASSERT_SUCCESS(env_db.CreateTable(ctx, schema).GetStatus());
@@ -353,7 +356,11 @@ TEST_F(CatalogTest, PageStoragePoolCapacityFromEnvironment) {
   // Arrange -- an env value below one page falls back to the default pool
   ASSERT_EQ(setenv("TINYLAMB_PAGE_POOL_BYTES", "1000", 1), 0);
   {
-    Database small_env_db("catalog_test_small_env-" + RandomString());
+    auto small_env_db_holder =
+        Database::Create("catalog_test_small_env-" + RandomString())
+            .MoveValue();
+    CHECK(small_env_db_holder != nullptr);
+    Database& small_env_db = *small_env_db_holder;
     TransactionContext ctx = small_env_db.BeginContext();
     Schema schema("small_tbl", {Column("c", ValueType::kVarChar)});
     ASSERT_SUCCESS(small_env_db.CreateTable(ctx, schema).GetStatus());
@@ -372,7 +379,7 @@ TEST_F(CatalogTest, PageStoragePageSlotsAllocateReuse) {
   page_id_t first_pid = 0;
   {
     // Act -- allocate a row page and write two slots into it
-    PageRef first = pm->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef first = pm->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     first_pid = first->PageID();
     ASSERT_GT(first_pid, 0);
 
@@ -406,7 +413,7 @@ TEST_F(CatalogTest, PageStoragePageSlotsAllocateReuse) {
   }
 
   // Assert -- the next allocation reuses the freed page id
-  PageRef second = pm->AllocateNewPage(txn, PageType::kRowPage);
+  PageRef second = pm->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
   EXPECT_EQ(second->PageID(), first_pid);
 
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -420,7 +427,8 @@ TEST_F(CatalogTest, PageStorageAllocatesGrowingPageIds) {
   // Act -- allocate several row pages and record their ids
   std::vector<page_id_t> pids;
   for (int i = 0; i < 5; ++i) {
-    PageRef page = pm->AllocateNewPage(ctx.txn_, PageType::kRowPage);
+    PageRef page =
+        pm->AllocateNewPage(ctx.txn_, PageType::kRowPage).MoveValue();
     pids.push_back(page->PageID());
   }
 
@@ -432,7 +440,7 @@ TEST_F(CatalogTest, PageStorageAllocatesGrowingPageIds) {
   }
 
   // Act -- read back a slot written into the first allocated page
-  PageRef first = pm->GetPage(pids.front());
+  PageRef first = pm->GetPage(pids.front()).MoveValue();
   StatusOr<slot_t> slot = first->Insert(ctx.txn_, "growth-check");
   ASSERT_SUCCESS(slot.GetStatus());
   StatusOr<std::string_view> read = first->Read(ctx.txn_, slot.Value());
@@ -731,7 +739,7 @@ TEST_F(CatalogTest, EmptyReadCommitBeforeCrashKeepsTable) {
   // can resurrect buffer-pool images that never reached the disk.
   rs_->EmulateCrash();
   rs_.reset();
-  rs_ = std::make_unique<Database>(prefix_);
+  rs_ = Database::Create(prefix_).MoveValue();
 
   // Assert -- the table survives.
   TransactionContext ctx = rs_->BeginContext();
@@ -795,15 +803,16 @@ TEST_F(CatalogTest, DropTableCrashRecoveryReclaimsPages) {
   EXPECT_FALSE(ctx.GetTable("drop_reclaim").HasValue());
   PageManager* pm = ctx.txn_.GetPageManager();
   {
-    PageRef meta = pm->GetPage(kMetaPageId);
+    PageRef meta = pm->GetPage(kMetaPageId).MoveValue();
     const page_id_t head = meta->body.meta_page.FirstFreePage();
-    EXPECT_NE(head, 0U) << "free list must hold the dropped table's pages";
-    PageRef freed = pm->GetPage(head);
+    EXPECT_NE(head, 0U) << true;
+    PageRef freed = pm->GetPage(head).MoveValue();
     ASSERT_FALSE(freed.IsNull());
     EXPECT_EQ(freed->Type(), PageType::kFreePage);
   }
   // The dropped pages are reusable by the very next allocation.
-  PageRef reused = pm->AllocateNewPage(ctx.txn_, PageType::kRowPage);
+  PageRef reused =
+      pm->AllocateNewPage(ctx.txn_, PageType::kRowPage).MoveValue();
   ASSERT_FALSE(reused.IsNull());
   ASSERT_TRUE(reused->Insert(ctx.txn_, "reused-row").HasValue());
   reused.PageUnlock();
@@ -949,7 +958,7 @@ TEST_F(CatalogTest, ColumnStatisticsResolveForAnyCase) {
                         rs_->GetStatistics(ctx2, "casestats"));
   ASSERT_EQ(stats.Rows(), 5U);
   EXPECT_GT(stats.Column(0).Count(), 0U)
-      << "column statistics must be populated for a differently-cased read";
+      << true;
   ASSERT_SUCCESS(ctx2.txn_.PreCommit());
 }
 

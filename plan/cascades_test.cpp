@@ -132,7 +132,7 @@ TEST(CascadesTest, MemoBuildRejectsDuplicateRelations) {
   // Arrange + Act + Assert: a join graph that repeats a relation cannot form a
   // valid memo group.
   Memo memo;
-  EXPECT_THROW(memo.Build({"a", "a"}), std::invalid_argument);
+  EXPECT_FALSE(memo.TryBuild({"a", "a"}).HasValue());
 }
 
 TEST(CascadesTest, MemoAddExpressionRejectsScanWithChildren) {
@@ -141,11 +141,11 @@ TEST(CascadesTest, MemoAddExpressionRejectsScanWithChildren) {
   const GroupId root = memo.Build({"a"});
 
   // Act + Assert: a scan carrying child groups does not belong to the group.
-  EXPECT_THROW(memo.AddExpression(
+  EXPECT_DEATH(memo.AddExpression(
                    root, LogicalExpression{.operation = LogicalOperator::kScan,
                                            .children = {root},
                                            .table = "a"}),
-               std::invalid_argument);
+               "does not belong");
 }
 
 TEST(CascadesTest, MemoAddExpressionRejectsJoinWithWrongArity) {
@@ -154,10 +154,10 @@ TEST(CascadesTest, MemoAddExpressionRejectsJoinWithWrongArity) {
   const GroupId root = memo.Build({"a"});
 
   // Act + Assert: a join must have exactly two child groups.
-  EXPECT_THROW(memo.AddExpression(
+  EXPECT_DEATH(memo.AddExpression(
                    root, LogicalExpression{.operation = LogicalOperator::kJoin,
                                            .children = {root, root, root}}),
-               std::invalid_argument);
+               "one or two child groups");
 }
 
 TEST(CascadesTest, MemoAddExpressionRejectsNonEquivalentJoin) {
@@ -171,11 +171,11 @@ TEST(CascadesTest, MemoAddExpressionRejectsNonEquivalentJoin) {
 
   // Act + Assert: joining {b} with {a} inside the {a} group produces a union
   // that is not equivalent to the target group's relations.
-  EXPECT_THROW(
+  EXPECT_DEATH(
       memo.AddExpression(a_group,
                          LogicalExpression{.operation = LogicalOperator::kJoin,
                                            .children = {b_group, a_group}}),
-      std::invalid_argument);
+      "not equivalent");
 }
 
 TEST(CascadesTest, PatternChildMismatchFailsToMatch) {
@@ -366,20 +366,20 @@ TEST(CascadesTest, MemoAddExpressionValidatesSingleChildOperators) {
   LogicalExpression no_predicate;
   no_predicate.operation = LogicalOperator::kSelection;
   no_predicate.children = {scan};
-  EXPECT_THROW(memo.AddExpression(derived, no_predicate),
-               std::invalid_argument);
+  EXPECT_DEATH(memo.AddExpression(derived, no_predicate),
+               "selection must carry a predicate");
   // ...and must preserve the group's relation set.
   LogicalExpression wrong_relations;
   wrong_relations.operation = LogicalOperator::kSelection;
   wrong_relations.children = {join_root};
   wrong_relations.predicate = EqExp("a.x", Value(1));
-  EXPECT_THROW(memo.AddExpression(derived, wrong_relations),
-               std::invalid_argument);
+  EXPECT_DEATH(memo.AddExpression(derived, wrong_relations),
+               "preserve the group");
   // Projections need a target list.
   LogicalExpression no_targets;
   no_targets.operation = LogicalOperator::kProjection;
   no_targets.children = {scan};
-  EXPECT_THROW(memo.AddExpression(derived, no_targets), std::invalid_argument);
+  EXPECT_DEATH(memo.AddExpression(derived, no_targets), "target list");
 }
 
 TEST(CascadesTest, SelectionWithinPatternMatchesOnlyCoveredPredicates) {
@@ -677,7 +677,7 @@ TEST(CascadesTest, SetOperationValidatesArityRelationsAndDropsProperties) {
 
   LogicalExpression invalid = expression;
   invalid.children = {left};
-  EXPECT_THROW(memo.AddExpression(set, invalid), std::invalid_argument);
+  EXPECT_DEATH(memo.AddExpression(set, invalid), "at least two children");
 }
 
 TEST(CascadesTest, UnionDistinctRewriteAddsUnionAllAndDistinctAlternative) {
@@ -1199,7 +1199,7 @@ TEST(CascadesTest, EliminateTrueSelectionCopiesChildScan) {
   LogicalExpression tautology;
   tautology.operation = LogicalOperator::kSelection;
   tautology.children = {scan};
-  tautology.predicate = ConstantValueExp(Value(true));
+  tautology.predicate = ConstantValueExp(Value(1));
   ASSERT_TRUE(memo.AddExpression(selection, tautology));
   SearchEngine search(std::move(memo), RuleSet::Default());
 
@@ -1236,7 +1236,7 @@ TEST(CascadesTest, FalseSelectionAddsEmptyLogicalAlternative) {
   LogicalExpression expression;
   expression.operation = LogicalOperator::kSelection;
   expression.children = {scan};
-  expression.predicate = ConstantValueExp(Value(false));
+  expression.predicate = ConstantValueExp(Value(0));
   ASSERT_TRUE(memo.AddExpression(selection, expression));
 
   SearchEngine search(std::move(memo), RuleSet::Default());
@@ -1802,7 +1802,7 @@ TEST(CascadesTest, SelfJoinEliminationRequiresProvenUniqueKey) {
     return expr.operation == LogicalOperator::kScan && expr.table == "t1";
   });
   EXPECT_FALSE(found_scan)
-      << "self_join_elimination fired without a proven unique key";
+      << true;
 }
 
 TEST(CascadesTest, UniqueSemiToInnerRewrite) {
@@ -1926,7 +1926,7 @@ TEST(CascadesTest, OuterToAntiJoinRefusesNullableNullTestedColumn) {
         return expr.operation == LogicalOperator::kAntiJoin;
       });
   EXPECT_FALSE(found_anti2)
-      << "outer_to_anti_join fired on a nullable null-tested column";
+      << true;
 }
 
 TEST(CascadesTest, OuterToAntiJoinRefusesLeftResidualConjunct) {
@@ -1975,7 +1975,7 @@ TEST(CascadesTest, OuterToAntiJoinRefusesLeftResidualConjunct) {
         return expr.operation == LogicalOperator::kAntiJoin;
       });
   EXPECT_FALSE(found_anti3)
-      << "outer_to_anti_join dropped a left-side residual conjunct";
+      << true;
 }
 
 TEST(CascadesTest, RightToLeftOuterJoinRewrite) {
@@ -2089,8 +2089,7 @@ TEST(CascadesTest, PushDownLimitThroughJoin) {
     }
   }
   EXPECT_FALSE(found_limit_pushed)
-      << "push_down_limit_through_join should be disabled (D5 gate: "
-         "uniqueness cannot be proven from Memo)";
+      << true;
 }
 
 TEST(CascadesTest, RankRowNumberToTopNRewrite) {
@@ -2529,7 +2528,7 @@ TEST(CascadesTest, CostModelCalibration) {
 
 TEST(CascadesTest, DynamicFilterPushdownJoin) {
   Memo memo;
-  memo.Build({"t1", "t2"});
+  (void)memo.Build({"t1", "t2"});
   const GroupId g1 = memo.EnsureGroup({"t1"});
   const GroupId g2 = memo.EnsureGroup({"t2"});
   const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "root_join");
@@ -2562,7 +2561,7 @@ TEST(CascadesTest, DynamicFilterPushdownJoin) {
 
 TEST(CascadesTest, JoinPredicateTransitivity) {
   Memo memo;
-  memo.Build({"t1", "t2", "t3"});
+  (void)memo.Build({"t1", "t2", "t3"});
   const GroupId g3 = memo.EnsureGroup({"t3"});
   const GroupId join12 = memo.EnsureGroup({"t1", "t2"});
   const GroupId root = memo.EnsureDerivedGroup({"t1", "t2", "t3"}, "root");
@@ -2602,7 +2601,7 @@ TEST(CascadesTest, JoinPredicateTransitivity) {
 
 TEST(CascadesTest, InferredInequalityPushdown) {
   Memo memo;
-  memo.Build({"t1", "t2"});
+  (void)memo.Build({"t1", "t2"});
   const GroupId g1 = memo.EnsureGroup({"t1"});
   const GroupId g2 = memo.EnsureGroup({"t2"});
   const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "root_join");
@@ -2634,7 +2633,7 @@ TEST(CascadesTest, InferredInequalityPushdown) {
 
 TEST(CascadesTest, RedundantJoinPredicateElimination) {
   Memo memo;
-  memo.Build({"t1", "t2", "t3"});
+  (void)memo.Build({"t1", "t2", "t3"});
   const GroupId g12 = memo.EnsureGroup({"t1", "t2"});
   const GroupId g3 = memo.EnsureGroup({"t3"});
   const GroupId root = memo.EnsureDerivedGroup({"t1", "t2", "t3"}, "root");
@@ -2686,7 +2685,7 @@ TEST(CascadesTest, RedundantJoinPredicateElimination) {
 
 TEST(CascadesTest, IntersectExceptCostBasedLowering) {
   Memo memo;
-  memo.Build({"t1", "t2"});
+  (void)memo.Build({"t1", "t2"});
   const GroupId g1 = memo.EnsureGroup({"t1"});
   const GroupId g2 = memo.EnsureGroup({"t2"});
   const GroupId intersect_group =
@@ -2735,7 +2734,7 @@ TEST(CascadesTest, IntersectExceptCostBasedLowering) {
 
 TEST(CascadesTest, UnionDistinctHashSortChoice) {
   Memo memo;
-  memo.Build({"t1", "t2"});
+  (void)memo.Build({"t1", "t2"});
   const GroupId g1 = memo.EnsureGroup({"t1"});
   const GroupId g2 = memo.EnsureGroup({"t2"});
   const GroupId union_group =
@@ -2764,7 +2763,7 @@ TEST(CascadesTest, UnionDistinctHashSortChoice) {
 
 TEST(CascadesTest, WindowFrameSortSharing) {
   Memo memo;
-  memo.Build({"t1"});
+  (void)memo.Build({"t1"});
   const GroupId scan = memo.EnsureGroup({"t1"});
   const GroupId inner_win = memo.EnsureDerivedGroup({"t1"}, "inner_w");
   const GroupId outer_win = memo.EnsureDerivedGroup({"t1"}, "outer_w");
@@ -2930,7 +2929,7 @@ TEST(CascadesTest, InListToSemiJoin) {
 
 TEST(CascadesTest, FilterPullUpForExtremeSelectivity) {
   Memo memo;
-  memo.Build({"t1", "t2"});
+  (void)memo.Build({"t1", "t2"});
   const GroupId g1 = memo.EnsureGroup({"t1"});
   const GroupId g2 = memo.EnsureGroup({"t2"});
   const GroupId sel_left = memo.EnsureDerivedGroup({"t1"}, "sel_left");
@@ -3981,8 +3980,7 @@ TEST(CascadesTest, UnusedJoinEliminationRewritesToSemiJoin) {
     }
   }
   EXPECT_TRUE(semi_join_added)
-      << "unused_join_elimination should rewrite the unused-right-side inner "
-         "join into a semi join";
+      << true;
 }
 
 TEST(CascadesTest, UnusedJoinEliminationDoesNotFireWithoutPredicate) {
@@ -4013,7 +4011,7 @@ TEST(CascadesTest, UnusedJoinEliminationDoesNotFireWithoutPredicate) {
     }
   }
   EXPECT_FALSE(semi_join_added)
-      << "cross join (no predicate) must not be rewritten into a semi join";
+      << true;
 }
 
 // Note: contradiction detection and join elimination effectiveness are
@@ -4094,8 +4092,7 @@ TEST(CascadesTest, PushDownLimitThroughJoinSkipsNonUniqueJoin) {
         return false;
       });
   EXPECT_FALSE(limit_pushed)
-      << "push_down_limit_through_join incorrectly pushed LIMIT into "
-         "a non-unique join side";
+      << true;
 }
 
 TEST(CascadesTest, EliminateDoubleSortRequiresSameKeyExpressions) {
@@ -4143,8 +4140,7 @@ TEST(CascadesTest, EliminateDoubleSortRequiresSameKeyExpressions) {
                    });
       });
   EXPECT_FALSE(eliminated)
-      << "eliminate_double_sort incorrectly eliminated sort with "
-         "different key expressions";
+      << true;
 }
 
 TEST(CascadesTest, EliminateDoubleSortRequiresSameNullsFirst) {
@@ -4190,8 +4186,7 @@ TEST(CascadesTest, EliminateDoubleSortRequiresSameNullsFirst) {
                    });
       });
   EXPECT_FALSE(eliminated)
-      << "eliminate_double_sort incorrectly eliminated sort with "
-         "different nulls_first setting";
+      << true;
 }
 
 TEST(CascadesTest, InListToSemiJoinRejectsMixedColumnOr) {
@@ -4217,8 +4212,7 @@ TEST(CascadesTest, InListToSemiJoinRejectsMixedColumnOr) {
         return expr.operation == LogicalOperator::kSemiJoin;
       });
   EXPECT_FALSE(has_semi_join)
-      << "in_list_to_semi_join incorrectly transformed mixed-column OR "
-         "into a semi join";
+      << true;
 }
 
 TEST(CascadesTest, OuterToAntiJoinRequiresNullCheckOnAllRightColumns) {
@@ -4261,8 +4255,7 @@ TEST(CascadesTest, OuterToAntiJoinRequiresNullCheckOnAllRightColumns) {
         return expr.operation == LogicalOperator::kAntiJoin;
       });
   EXPECT_FALSE(has_anti_join)
-      << "outer_to_anti_join incorrectly converted when remaining "
-         "predicates reference right-side columns";
+      << true;
 }
 
 TEST(CascadesTest, RankRowNumberToTopNSkipsPartitionedWindow) {
@@ -4299,8 +4292,7 @@ TEST(CascadesTest, RankRowNumberToTopNSkipsPartitionedWindow) {
         return expr.operation == LogicalOperator::kTopN;
       });
   EXPECT_FALSE(has_topn)
-      << "rank_row_number_to_topn incorrectly converted partitioned "
-         "window to TopN";
+      << true;
 }
 
 TEST(CascadesTest, RankRowNumberToTopNSkipsNonWindowColumn) {
@@ -4332,8 +4324,7 @@ TEST(CascadesTest, RankRowNumberToTopNSkipsNonWindowColumn) {
         return expr.operation == LogicalOperator::kTopN;
       });
   EXPECT_FALSE(has_topn)
-      << "rank_row_number_to_topn converted a predicate on a non-window "
-         "column into TopN";
+      << true;
 }
 
 TEST(CascadesTest, RankRowNumberToTopNEqualsUsesOffsetForKthRow) {
@@ -4366,7 +4357,7 @@ TEST(CascadesTest, RankRowNumberToTopNEqualsUsesOffsetForKthRow) {
         return expr.operation == LogicalOperator::kTopN;
       });
   ASSERT_TRUE(it != search.GetMemo().Get(sel).expressions.end())
-      << "rank_row_number_to_topn did not convert rn = 3 to TopN";
+      << true;
   EXPECT_EQ(it->limit_count, 3U);
   EXPECT_EQ(it->limit_offset, 2U);
 }
@@ -4397,7 +4388,7 @@ TEST(CascadesTest, InListToSemiJoinRejectsUncollectableBranch) {
         return expr.operation == LogicalOperator::kSemiJoin;
       });
   EXPECT_FALSE(has_semi_join)
-      << "in_list_to_semi_join dropped the uncollectable range branch";
+      << true;
 }
 
 TEST(CascadesTest, DerivedGroupFingerprintSeparatesDifferentInLists) {
@@ -4448,8 +4439,7 @@ TEST(CascadesTest, DerivedGroupFingerprintSeparatesDifferentInLists) {
   ASSERT_TRUE(found_a);
   ASSERT_TRUE(found_b);
   EXPECT_NE(const_a, const_b)
-      << "same-size IN-lists with different constants collided into one "
-         "derived group";
+      << true;
 }
 
 TEST(CascadesTest, EagerAggregationOverJoinSkipsOuterJoin) {
@@ -4504,8 +4494,7 @@ TEST(CascadesTest, EagerAggregationOverJoinSkipsOuterJoin) {
         return false;
       });
   EXPECT_FALSE(agg_pushed)
-      << "eager_aggregation_over_join incorrectly pushed aggregation "
-         "below an outer join";
+      << true;
 }
 
 TEST(CascadesTest, AggregateJoinTransposeSkipsOuterJoin) {
@@ -4559,8 +4548,7 @@ TEST(CascadesTest, AggregateJoinTransposeSkipsOuterJoin) {
         return false;
       });
   EXPECT_FALSE(agg_pushed)
-      << "aggregate_join_transpose incorrectly pushed aggregation "
-         "below an outer join";
+      << true;
 }
 
 TEST(CascadesTest, UniqueSemiToInnerDoesNotFireWithoutKeyEquality) {
@@ -4586,8 +4574,7 @@ TEST(CascadesTest, UniqueSemiToInnerDoesNotFireWithoutKeyEquality) {
     }
   }
   EXPECT_FALSE(found_inner)
-      << "unique_semi_to_inner must not rewrite a semi join without a "
-         "key-equality predicate (it would multiply rows)";
+      << true;
 }
 
 TEST(CascadesTest, PushFilterPastSetopRejectsUnresolvedQualifier) {
@@ -4619,8 +4606,7 @@ TEST(CascadesTest, PushFilterPastSetopRejectsUnresolvedQualifier) {
     }
   }
   EXPECT_FALSE(pushed_into_right)
-      << "push_filter_past_setop must not push a t1-qualified predicate "
-         "into the t2 branch";
+      << true;
 }
 
 TEST(CascadesTest, PushFilterPastSetopRejectsUnqualifiedColumnMissingInBranch) {
@@ -4656,8 +4642,7 @@ TEST(CascadesTest, PushFilterPastSetopRejectsUnqualifiedColumnMissingInBranch) {
                expr.predicate.has_value();
       });
   EXPECT_FALSE(pushed_into_right)
-      << "push_filter_past_setop pushed an unqualified column that does not "
-         "resolve in every branch";
+      << true;
 }
 
 TEST(CascadesTest, LimitPushThroughSortKeepsOffsetOnTop) {
@@ -4694,8 +4679,7 @@ TEST(CascadesTest, LimitPushThroughSortKeepsOffsetOnTop) {
     }
   }
   EXPECT_TRUE(offset_preserved)
-      << "OFFSET must survive limit_push_through_sort without being pushed "
-         "below the sort";
+      << true;
 }
 
 TEST(CascadesTest, JoinOnFalseToEmptyPreservesRelationSet) {
@@ -4711,7 +4695,7 @@ TEST(CascadesTest, JoinOnFalseToEmptyPreservesRelationSet) {
       join_group,
       LogicalExpression{.operation = LogicalOperator::kJoin,
                         .children = {left, right},
-                        .predicate = ConstantValueExp(Value(false))});
+                        .predicate = ConstantValueExp(Value(0))});
   SearchEngine search(std::move(memo), RuleSet::Default());
   search.Explore(join_group);
   bool found_empty = false;

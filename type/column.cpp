@@ -19,12 +19,12 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
-#include <stdexcept>
 #include <string_view>
 #include <utility>
 
 #include "column_name.hpp"
 #include "common/encoder.hpp"
+#include "common/log_message.hpp"
 #include "constraint.hpp"
 #include "value_type.hpp"
 
@@ -64,7 +64,11 @@ Decoder& operator>>(Decoder& e, Column& c) {
   c.unsigned_ = (encoded_type & 0x80) != 0;
   const uint8_t raw_type = encoded_type & 0x7f;
   if (raw_type > static_cast<uint8_t>(ValueType::kArray)) {
-    throw std::runtime_error("undefined column type in decoder");
+    // Corrupted persisted schema: sticky decoder failure so the enclosing
+    // Schema/Table decode surfaces kCorrupt instead of a throw.
+    e.Fail();
+    c.type_ = ValueType::kNull;
+    return e;
   }
   c.type_ = static_cast<ValueType>(raw_type);
   return e;

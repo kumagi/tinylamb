@@ -65,8 +65,9 @@ Decoder& operator>>(Decoder& d, Table::IndexValueType& t) {
 Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   page_id_t root_pid = 0;
   {
-    PageRef root_page =
-        txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage);
+    ASSIGN_OR_RETURN(
+        PageRef, root_page,
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage));
     root_pid = root_page->PageID();
     indexes_.emplace_back(idx.name_, idx.key_, root_pid, idx.include_,
                           idx.mode_);
@@ -81,9 +82,8 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
       // grown past the root via splits and foster chains; destroying only
       // the root would leak those pages off the free list forever.
       indexes_.pop_back();
-      for (const page_id_t pid :
-           BPlusTree::CollectPageIds(txn, root_pid)) {
-        PageRef page = txn.GetPageManager()->GetPage(pid);
+      for (const page_id_t pid : BPlusTree::CollectPageIds(txn, root_pid)) {
+        ASSIGN_OR_RETURN(PageRef, page, txn.GetPageManager()->GetPage(pid));
         txn.GetPageManager()->DestroyPage(txn, page.get());
         page.PageUnlock();
       }
@@ -103,7 +103,7 @@ constexpr bin_size_t kTailPreallocateThreshold = kPageBodySize / 16;
 // Best-effort compensations run after the primary failure is already decided;
 // their own failures must stay observable instead of vanishing into
 // std::ignore, or heap/index divergence goes undiagnosed.
-void LogCompensationFailure(std::string_view operation, Status status) {
+void LogCompensationFailure(std::string_view operation, const Status& status) {
   if (status != Status::kSuccess) {
     LOG(WARN) << "Table compensation " << operation << " failed: " << status;
   }
@@ -112,9 +112,10 @@ void LogCompensationFailure(std::string_view operation, Status status) {
 
 StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   PageManager* const page_manager = txn.GetPageManager();
+  RETURN_IF_FAIL(row.CheckSerializable());
   const page_id_t cached_tail =
       page_manager->GetTableTail(first_pid_, last_pid_);
-  PageRef ref = page_manager->GetPage(cached_tail);
+  ASSIGN_OR_RETURN(PageRef, ref, page_manager->GetPage(cached_tail));
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   StatusOr<slot_t> pos = ref->Insert(txn, serialized_row);
@@ -126,7 +127,8 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     bool finished = false;
     while (ref->body.row_page.next_page_id_ != 0) {
       const page_id_t previous = ref->PageID();
-      PageRef next = page_manager->GetPage(ref->body.row_page.next_page_id_);
+      ASSIGN_OR_RETURN(PageRef, next,
+                       page_manager->GetPage(ref->body.row_page.next_page_id_));
       page_manager->AdvanceTableTail(first_pid_, previous, next->PageID());
       ref = std::move(next);
       StatusOr<slot_t> next_pos = ref->Insert(txn, serialized_row);
@@ -144,8 +146,9 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       }
     }
     if (!finished) {
-      PageRef new_page =
-          txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
+      ASSIGN_OR_RETURN(
+          PageRef, new_page,
+          txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage));
       StatusOr<slot_t> new_pos = new_page->Insert(txn, serialized_row);
       if (!new_pos.HasValue()) {
         // The page is still unlinked, so recycle it instead of leaking it;
@@ -176,8 +179,9 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   // and skips. Chain order and last_pid_'s "tail" meaning are unchanged.
   if (ref->body.row_page.free_size_ < kTailPreallocateThreshold &&
       ref->body.row_page.next_page_id_ == 0) {
-    PageRef successor =
-        txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
+    ASSIGN_OR_RETURN(
+        PageRef, successor,
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage));
     successor->body.row_page.prev_page_id_ = ref->PageID();
     ref->body.row_page.next_page_id_ = successor->PageID();
     page_manager->AdvanceTableTail(first_pid_, ref->PageID(),
@@ -194,7 +198,8 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
         LogCompensationFailure("insert-rollback IndexDelete",
                                IndexDelete(txn, indexes_[j], rp));
       }
-      PageRef written = txn.GetPageManager()->GetPage(rp.page_id);
+      ASSIGN_OR_RETURN(PageRef, written,
+                       txn.GetPageManager()->GetPage(rp.page_id));
       LogCompensationFailure("insert-rollback heap Delete",
                              written->Delete(txn, rp.slot));
       return status;
@@ -315,7 +320,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // phases below so the second descent on the same tree reuses the leaf the
   // first one landed on whenever the live routing agrees.
   std::vector<page_id_t> idx_cursors(indexes_.size(), 0);
-  PageRef page = txn.GetPageManager()->GetPage(new_pos.page_id);
+  RETURN_IF_FAIL(row.CheckSerializable());
+  ASSIGN_OR_RETURN(PageRef, page,
+                   txn.GetPageManager()->GetPage(new_pos.page_id));
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   // Best-effort compensations: a failed index mutation must not leave applied
@@ -345,9 +352,15 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     // NOTE: callers must release the exclusive latch on pos.page_id first
     // (page.PageUnlock()); re-entering GetPage() on the same page while the
     // in-place update path still holds it deadlocks on the shared_mutex.
-    PageRef written = txn.GetPageManager()->GetPage(pos.page_id);
-    LogCompensationFailure("update-rollback physical row restore",
-                           written->Update(txn, pos.slot, original_image));
+    StatusOr<PageRef> written = txn.GetPageManager()->GetPage(pos.page_id);
+    if (written.GetStatus() != Status::kSuccess) {
+      LogCompensationFailure("update-rollback physical row re-fetch",
+                             written.GetStatus());
+      return;
+    }
+    LogCompensationFailure(
+        "update-rollback physical row restore",
+        written.Value()->Update(txn, pos.slot, original_image));
   };
 
   Status s = page->Update(txn, new_pos.slot, serialized_row);
@@ -412,7 +425,11 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   bool finished = false;
   while (page->body.row_page.next_page_id_ != 0) {
     page_id_t next_page = page->body.row_page.next_page_id_;
-    page = txn.GetPageManager()->GetPage(next_page);
+    {
+      ASSIGN_OR_RETURN(PageRef, ref_tmp1,
+                       txn.GetPageManager()->GetPage(next_page));
+      page = std::move(ref_tmp1);
+    }
     StatusOr<slot_t> next_pos = page->Insert(txn, serialized_row);
     if (next_pos.HasValue()) {
       new_pos.page_id = page->PageID();
@@ -430,8 +447,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
   }
   if (!finished) {
-    PageRef new_page =
-        txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
+    ASSIGN_OR_RETURN(
+        PageRef, new_page,
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage));
     StatusOr<slot_t> new_slot = new_page->Insert(txn, serialized_row);
     if (!new_slot.HasValue()) {
       txn.GetPageManager()->DestroyPage(txn, new_page.get());
@@ -444,7 +462,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     const page_id_t tail_page_id = page->PageID();
     page.PageUnlock();
     {
-      PageRef last_page = txn.GetPageManager()->GetPage(tail_page_id);
+      ASSIGN_OR_RETURN(PageRef, last_page,
+                       txn.GetPageManager()->GetPage(tail_page_id));
       last_page->body.row_page.next_page_id_ = new_page->PageID();
       new_page->body.row_page.prev_page_id_ = last_page->PageID();
     }
@@ -471,19 +490,22 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     // Drop the reserved copy; the original row survives at pos, but the
     // first `deleted` index entries were already removed and must be
     // reinstated or the row would go missing from those index scans.
-    PageRef copy_page = txn.GetPageManager()->GetPage(new_pos.page_id);
+    ASSIGN_OR_RETURN(PageRef, copy_page,
+                     txn.GetPageManager()->GetPage(new_pos.page_id));
     LogCompensationFailure("update-rollback reserved-copy Delete",
                            copy_page->Delete(txn, new_pos.slot));
     copy_page.PageUnlock();
     reinstate_old_keys(deleted, pos);
     return failure;
   }
-  const Status delete_status =
-      txn.GetPageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
+  ASSIGN_OR_RETURN(PageRef, source_page,
+                   txn.GetPageManager()->GetPage(pos.page_id));
+  const Status delete_status = source_page->Delete(txn, pos.slot);
   if (delete_status != Status::kSuccess) {
     // The original row survives at pos; drop the reserved copy and roll the
     // index deletes back.
-    PageRef copy_page = txn.GetPageManager()->GetPage(new_pos.page_id);
+    ASSIGN_OR_RETURN(PageRef, copy_page,
+                     txn.GetPageManager()->GetPage(new_pos.page_id));
     LogCompensationFailure("update-rollback reserved-copy Delete",
                            copy_page->Delete(txn, new_pos.slot));
     copy_page.PageUnlock();
@@ -534,8 +556,9 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
     }
     return failure;
   }
-  const Status delete_status =
-      txn.GetPageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
+  ASSIGN_OR_RETURN(PageRef, source_page,
+                   txn.GetPageManager()->GetPage(pos.page_id));
+  const Status delete_status = source_page->Delete(txn, pos.slot);
   if (delete_status == Status::kNotExists) {
     // The snapshot read above proved the row is logically visible, yet its
     // physical image is gone from the slot: RowPage::Read fell back to the
@@ -573,7 +596,8 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   // buffer, which is only guaranteed stable while the page stays pinned.
   // (The resulting Row owns its strings; Value::Deserialize copies varchar
   // data out of the buffer.)
-  PageRef page = txn.GetPageManager()->GetPage(pos.page_id, true);
+  ASSIGN_OR_RETURN(PageRef, page,
+                   txn.GetPageManager()->GetPage(pos.page_id, true));
   ASSIGN_OR_RETURN(std::string_view, read_row, page->Read(txn, pos.slot));
   Row result;
   // Length-prefixed row image from a checksummed page: consumed by offsets,
@@ -611,7 +635,8 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
     StatusOr<std::string_view> existing_value = bpt.Read(txn, key, &cursor);
     if (existing_value.HasValue()) {
       std::string_view existing_data = existing_value.Value();
-      auto rps = Decode<std::vector<IndexValueType>>(existing_data);
+      ASSIGN_OR_RETURN(std::vector<IndexValueType>, rps,
+                       Decode<std::vector<IndexValueType>>(existing_data));
       if (idx.IsUnique()) {
         for (const IndexValueType& value : rps) {
           if (value.pos == pos) {
@@ -674,7 +699,8 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
   } else {
     ASSIGN_OR_RETURN(std::string_view, existing_data,
                      bpt.Read(txn, key, &cursor));
-    auto values = Decode<std::vector<IndexValueType>>(existing_data);
+    ASSIGN_OR_RETURN(std::vector<IndexValueType>, values,
+                     Decode<std::vector<IndexValueType>>(existing_data));
     std::erase_if(values,
                   [&](const IndexValueType& v) { return v.pos == pos; });
     if (values.empty()) {
@@ -727,8 +753,13 @@ std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
       morsels.back().reserve(pages_per_morsel);
     }
     morsels.back().push_back(page_id);
-    PageRef page = txn.GetPageManager()->GetPage(page_id, true);
-    page_id = page->body.row_page.next_page_id_;
+    StatusOr<PageRef> page = txn.GetPageManager()->GetPage(page_id, true);
+    if (!page.HasValue()) {
+      // Unreadable page: treat as the end of the chain (same as the
+      // cycle-corruption guard below).
+      break;
+    }
+    page_id = page.Value()->body.row_page.next_page_id_;
   }
   return morsels;
 }

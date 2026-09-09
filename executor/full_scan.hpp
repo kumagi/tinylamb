@@ -31,6 +31,12 @@ struct RowPosition;
 
 class FullScan : public ExecutorBase {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  FullScan(const FullScan&) = delete;
+  FullScan& operator=(const FullScan&) = delete;
+  FullScan(FullScan&&) = delete;
+  FullScan& operator=(FullScan&&) = delete;
   FullScan(Transaction& txn, const Table& table,
            size_t max_rows = std::numeric_limits<size_t>::max());
   ~FullScan() override = default;

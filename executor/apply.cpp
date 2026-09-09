@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/join_kind.hpp"
+#include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
@@ -54,8 +55,13 @@ bool ApplyExecutor::Next(Row* dst, RowPosition* rp) {
         relational_detail::Scope scope{.row = &current_outer_row_,
                                        .schema = &outer_schema_,
                                        .outer = nullptr};
-        relational_detail::Relation rel = relational_detail::ExecuteQuery(
-            context_, *inner_query_, &scope, {});
+        StatusOr<relational_detail::Relation> executed =
+            relational_detail::ExecuteQuery(context_, *inner_query_, &scope,
+                                            {});
+        if (!executed.HasValue()) {
+          return FailWith(executed.GetStatus());
+        }
+        relational_detail::Relation rel = executed.MoveValue();
         if (inner_schema_.ColumnCount() == 0) {
           inner_schema_ =
               inner_alias_.empty()
@@ -82,8 +88,12 @@ bool ApplyExecutor::Next(Row* dst, RowPosition* rp) {
       Row combined = current_outer_row_ + inner_row;
       bool match = true;
       if (predicate_) {
-        Value res = predicate_->Evaluate(combined, combined_schema_);
-        match = !res.IsNull() && res.Truthy();
+        StatusOr<Value> res =
+            predicate_->TryEvaluate(combined, combined_schema_);
+        if (!res.HasValue()) {
+          return FailWith(res.GetStatus());
+        }
+        match = !res.Value().IsNull() && res.Value().Truthy();
       }
       if (match) {
         matched_any_ = true;

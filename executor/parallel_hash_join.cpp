@@ -154,12 +154,15 @@ uint64_t SharedBuildParallelHashJoin::HashKey(std::string_view key) {
   return Fnv1aHash(key);
 }
 
-void SharedBuildParallelHashJoin::BuildSharedHashTable() {
+Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
   std::vector<std::pair<Row, RowPosition>> build_tuples;
   Row row;
   RowPosition rp;
   while (right_ && right_->Next(&row, &rp)) {
     build_tuples.emplace_back(std::move(row), rp);
+  }
+  if (right_ && right_->GetStatus() != Status::kSuccess) {
+    return right_->GetStatus();
   }
 
   const size_t total_build = build_tuples.size();
@@ -198,17 +201,23 @@ void SharedBuildParallelHashJoin::BuildSharedHashTable() {
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
     std::mutex error_mutex;
-    std::exception_ptr build_error;
+    Status build_error{Status::kSuccess};
     for (size_t i = 0; i < num_threads; ++i) {
       workers.emplace_back([&, i] {
         try {
           build_worker(i);
-        } catch (...) {
+        } catch (const std::exception& error) {
           // An exception escaping a raw thread terminates the process;
-          // capture it and rethrow on the joining thread instead.
+          // capture it as a Status and surface it on the joining thread.
           std::scoped_lock lock(error_mutex);
-          if (build_error == nullptr) {
-            build_error = std::current_exception();
+          if (build_error.ok()) {
+            build_error = StatusError(StatusCode::kRuntimeError, error.what());
+          }
+        } catch (...) {
+          std::scoped_lock lock(error_mutex);
+          if (build_error.ok()) {
+            build_error = StatusError(StatusCode::kRuntimeError,
+                                      "parallel build worker failed");
           }
         }
       });
@@ -216,13 +225,14 @@ void SharedBuildParallelHashJoin::BuildSharedHashTable() {
     for (auto& w : workers) {
       w.join();
     }
-    if (build_error != nullptr) {
-      std::rethrow_exception(build_error);
+    if (!build_error.ok()) {
+      return build_error;
     }
   }
+  return Status::kSuccess;
 }
 
-void SharedBuildParallelHashJoin::ParallelProbe() {
+Status SharedBuildParallelHashJoin::ParallelProbe() {
   std::vector<std::pair<Row, RowPosition>> probe_tuples;
   Row row;
   RowPosition rp;
@@ -339,17 +349,23 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
     std::mutex error_mutex;
-    std::exception_ptr probe_error;
+    Status probe_error{Status::kSuccess};
     for (size_t i = 0; i < num_threads; ++i) {
       workers.emplace_back([&, i] {
         try {
           probe_worker(i);
-        } catch (...) {
+        } catch (const std::exception& error) {
           // An exception escaping a raw thread terminates the process;
-          // capture it and rethrow on the joining thread instead.
+          // capture it as a Status and surface it on the joining thread.
           std::scoped_lock lock(error_mutex);
-          if (probe_error == nullptr) {
-            probe_error = std::current_exception();
+          if (probe_error.ok()) {
+            probe_error = StatusError(StatusCode::kRuntimeError, error.what());
+          }
+        } catch (...) {
+          std::scoped_lock lock(error_mutex);
+          if (probe_error.ok()) {
+            probe_error = StatusError(StatusCode::kRuntimeError,
+                                      "parallel probe worker failed");
           }
         }
       });
@@ -357,8 +373,8 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
     for (auto& w : workers) {
       w.join();
     }
-    if (probe_error != nullptr) {
-      std::rethrow_exception(probe_error);
+    if (!probe_error.ok()) {
+      return probe_error;
     }
   }
 
@@ -376,29 +392,36 @@ void SharedBuildParallelHashJoin::ParallelProbe() {
   size_t bytes = (output_.size() * (sizeof(RowPosition) + sizeof(Row))) +
                  shared_hash_table_.EstimatedBytes();
   charge_.Add(bytes);
+  if (left_ && left_->GetStatus() != Status::kSuccess) {
+    return left_->GetStatus();
+  }
+  return Status::kSuccess;
 }
 
-void SharedBuildParallelHashJoin::EnsureMaterialized() {
+Status SharedBuildParallelHashJoin::EnsureMaterialized() {
   if (materialized_) {
-    return;
+    return materialization_failure_;
   }
   output_.clear();
   output_offset_ = 0;
 
-  try {
-    BuildSharedHashTable();
-    ParallelProbe();
-  } catch (...) {
-    // Latch the failure so a retried Next() rethrows instead of reporting the
-    // half-built output_ as a complete result.
-    materialized_ = true;
-    throw;
+  Status status = BuildSharedHashTable();
+  if (status == Status::kSuccess) {
+    status = ParallelProbe();
+  }
+  if (status != Status::kSuccess) {
+    // Latch the failure so a retried Next() keeps reporting it instead of
+    // treating the half-built output_ as a complete result.
+    materialization_failure_ = status;
   }
   materialized_ = true;
+  return status;
 }
 
 void SharedBuildParallelHashJoin::MaterializePipeline() {
-  EnsureMaterialized();
+  if (Status status = EnsureMaterialized(); status != Status::kSuccess) {
+    FailWith(status);
+  }
 }
 
 size_t SharedBuildParallelHashJoin::MaterializedRowCount() const {
@@ -411,7 +434,9 @@ size_t SharedBuildParallelHashJoin::MaterializedBytes() const {
 
 bool SharedBuildParallelHashJoin::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
-  EnsureMaterialized();
+  if (Status status = EnsureMaterialized(); status != Status::kSuccess) {
+    return FailWith(status);
+  }
   if (output_offset_ >= output_.size()) {
     return false;
   }
@@ -428,7 +453,10 @@ size_t SharedBuildParallelHashJoin::NextBatch(DataChunk* destination,
   if (destination == nullptr || max_rows == 0) {
     return 0;
   }
-  EnsureMaterialized();
+  if (Status status = EnsureMaterialized(); status != Status::kSuccess) {
+    FailWith(status);
+    return 0;
+  }
   if (output_offset_ >= output_.size()) {
     return 0;
   }

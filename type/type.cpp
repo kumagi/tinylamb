@@ -18,8 +18,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <stdexcept>
 #include <string>
+
+#include "common/log_message.hpp"
 
 namespace tinylamb {
 
@@ -38,7 +39,8 @@ size_t Type::Size() const {
     case TypeTag::kArray:
       return 0;
     default:
-      throw std::runtime_error("Invalid type");
+      CHECK_MSG(false, "Invalid type");
+      return 0;
   }
 }
 

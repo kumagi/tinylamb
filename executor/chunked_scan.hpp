@@ -26,6 +26,12 @@ class Transaction;
 // batches for vectorized execution without per-row allocation.
 class ChunkedScan : public ExecutorBase {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  ChunkedScan(const ChunkedScan&) = delete;
+  ChunkedScan& operator=(const ChunkedScan&) = delete;
+  ChunkedScan(ChunkedScan&&) = delete;
+  ChunkedScan& operator=(ChunkedScan&&) = delete;
   // Table scan constructor (partitioned by page morsels).
   ChunkedScan(Transaction& txn, Table& table, Schema schema,
               std::vector<slot_t> projection = {},

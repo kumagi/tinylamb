@@ -43,25 +43,32 @@ class VMCache {
         kBlockSizeForAlign;
     return std::max({min_size, rounded, kBlockSizeForAlign});
   }
-  VMCache(int fd, size_t memory_capacity, size_t offset = 0,
-          size_t file_size = 0)
-      : cache_(fd, FindNearestSize(), memory_capacity, offset, file_size) {}
+  static StatusOr<std::unique_ptr<VMCache>> Create(int fd,
+                                                   size_t memory_capacity,
+                                                   size_t offset = 0,
+                                                   size_t file_size = 0) {
+    ASSIGN_OR_RETURN(std::unique_ptr<VMCacheImpl>, cache,
+                     VMCacheImpl::Create(fd, FindNearestSize(), memory_capacity,
+                                         offset, file_size));
+    // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+    return std::unique_ptr<VMCache>(new VMCache(std::move(cache)));  // NOLINT
+  }
   VMCache(const VMCache&) = delete;
   VMCache(VMCache&&) = delete;
   VMCache& operator=(const VMCache&) = delete;
   VMCache& operator=(VMCache&&) = delete;
   ~VMCache() = default;
 
-  void Read(T* dst, size_t offset, size_t size) const {
-    cache_.Read(dst, offset * sizeof(T), size * sizeof(T));
+  Status Read(T* dst, size_t offset, size_t size) const {
+    return cache_->Read(dst, offset * sizeof(T), size * sizeof(T));
   }
   void Invalidate(size_t offset, size_t length) {
     // Element units like Read(): the offset was previously passed through
     // as raw bytes while the length was scaled, so any non-zero offset
     // invalidated the wrong range.
-    cache_.Invalidate(offset * sizeof(T), length * sizeof(T));
+    cache_->Invalidate(offset * sizeof(T), length * sizeof(T));
   }
-  [[nodiscard]] std::string Dump() const { return cache_.Dump(); }
+  [[nodiscard]] std::string Dump() const { return cache_->Dump(); }
 
   friend std::ostream& operator<<(std::ostream& o, const VMCache<T>& c) {
     o << c.Dump();
@@ -69,7 +76,10 @@ class VMCache {
   }
 
  private:
-  VMCacheImpl cache_;
+  explicit VMCache(std::unique_ptr<VMCacheImpl> cache)
+      : cache_(std::move(cache)) {}
+
+  std::unique_ptr<VMCacheImpl> cache_;
 };
 
 }  // namespace tinylamb

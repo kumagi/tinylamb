@@ -30,6 +30,8 @@ struct PostgresServerOptions {
 
 class PostgresServer {
  public:
+  PostgresServer(PostgresServer&&) = delete;
+  PostgresServer& operator=(PostgresServer&&) = delete;
   PostgresServer(const std::string& database_path,
                  PostgresServerOptions options);
   ~PostgresServer();

@@ -14,6 +14,10 @@ class SelectStatement;
 class TransactionContext;
 class PlanBase;
 
+namespace relational_detail {
+struct ExecutionRuntime;
+}  // namespace relational_detail
+
 // Bridge for plan/GroupByPlan: materializes `core_plan` (the Cascades-
 // optimized FROM + WHERE core) and runs the statement's grouping finish
 // pipeline (Project / HAVING / DISTINCT / ORDER BY / LIMIT) over it.
@@ -25,17 +29,19 @@ class RelationalExecutor : public ExecutorBase {
  public:
   RelationalExecutor(TransactionContext& context,
                      std::shared_ptr<const SelectStatement> statement);
+  ~RelationalExecutor() override;
   bool Next(Row* destination, RowPosition* position) override;
   void Dump(std::ostream& output, int indent) const override;
   void Explain(std::ostream& output, int indent) const override;
 
  private:
-  void Initialize();
+  Status Initialize();
 
   // Not owned. The executor must not outlive the TransactionContext it was
   // created with (same lifetime contract as full_scan.hpp's `table_`).
   TransactionContext* context_;
   std::shared_ptr<const SelectStatement> statement_;
+  std::unique_ptr<relational_detail::ExecutionRuntime> runtime_keep_;
   std::vector<Row> rows_;
   size_t offset_{0};
   bool initialized_{false};

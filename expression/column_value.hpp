@@ -38,6 +38,11 @@ class ColumnValue : public ExpressionBase {
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
                                const Schema& right_schema) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema) const override;
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row* left, const Schema& left_schema, const Row* right,
+      const Schema& right_schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;

@@ -10,6 +10,7 @@
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <stdlib.h>
 
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -18,11 +19,11 @@ namespace tinylamb {
 
 TEST(SpillFileTest, Append_MultipleRows_ReadsAllRowsCorrectly) {
   SpillFile spill;
-  spill.Append(Row({Value(1), Value("a")}));
-  spill.Append(Row({Value(2), Value("b")}));
-  spill.FinishWriting();
+  ASSERT_SUCCESS(spill.Append(Row({Value(1), Value("a")})));
+  ASSERT_SUCCESS(spill.Append(Row({Value(2), Value("b")})));
+  ASSERT_SUCCESS(spill.FinishWriting());
   ASSERT_EQ(spill.Count(), 2U);
-  std::vector<Row> rows = spill.ReadAllRows();
+  std::vector<Row> rows = spill.ReadAllRows().MoveValue();
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0], Row({Value(1), Value("a")}));
   EXPECT_EQ(rows[1], Row({Value(2), Value("b")}));
@@ -30,17 +31,17 @@ TEST(SpillFileTest, Append_MultipleRows_ReadsAllRowsCorrectly) {
 
 TEST(SpillFileTest, FinishWriting_OnEmptySpill_HasZeroRows) {
   SpillFile spill;
-  spill.FinishWriting();
+  ASSERT_SUCCESS(spill.FinishWriting());
   EXPECT_TRUE(spill.Empty());
   EXPECT_EQ(spill.Count(), 0U);
-  EXPECT_TRUE(spill.ReadAllRows().empty());
+  EXPECT_TRUE(spill.ReadAllRows().Value().empty());
 }
 
 TEST(SpillFileTest, Append_PositionedRow_ReadsPositionedRowCorrectly) {
   SpillFile spill;
-  spill.Append(Row({Value(7)}), RowPosition(1, 42));
-  spill.FinishWriting();
-  auto positioned = spill.ReadAllPositioned();
+  ASSERT_SUCCESS(spill.Append(Row({Value(7)}), RowPosition(1, 42)));
+  ASSERT_SUCCESS(spill.FinishWriting());
+  auto positioned = spill.ReadAllPositioned().MoveValue();
   ASSERT_EQ(positioned.size(), 1U);
   EXPECT_EQ(positioned[0].first, Row({Value(7)}));
   EXPECT_EQ(positioned[0].second, RowPosition(1, 42));
@@ -49,38 +50,38 @@ TEST(SpillFileTest, Append_PositionedRow_ReadsPositionedRowCorrectly) {
 TEST(SpillFileTest, ForEachRow_ManyRows_StreamsAllRowsCorrectly) {
   SpillFile spill;
   for (int i = 0; i < 100; ++i) {
-    spill.Append(Row({Value(i)}));
+    ASSERT_SUCCESS(spill.Append(Row({Value(i)})));
   }
-  spill.FinishWriting();
+  ASSERT_SUCCESS(spill.FinishWriting());
   int count = 0;
   int sum = 0;
-  spill.ForEachRow([&](const Row& row) {
+  ASSERT_SUCCESS(spill.ForEachRow([&](const Row& row) {
     ++count;
     sum += static_cast<int>(row[0].value.int_value);
-  });
+  }));
   EXPECT_EQ(count, 100);
   EXPECT_EQ(sum, 4950);
 }
 
 TEST(SpillFileTest, ReadAllRows_WithoutFinishWriting_AutoFinishesAndReads) {
   SpillFile spill;
-  spill.Append(Row({Value(7), Value("x")}));
-  spill.Append(Row({Value(8), Value("y")}));
-  std::vector<Row> rows = spill.ReadAllRows();
+  ASSERT_SUCCESS(spill.Append(Row({Value(7), Value("x")})));
+  ASSERT_SUCCESS(spill.Append(Row({Value(8), Value("y")})));
+  std::vector<Row> rows = spill.ReadAllRows().MoveValue();
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0], Row({Value(7), Value("x")}));
   EXPECT_EQ(rows[1], Row({Value(8), Value("y")}));
   EXPECT_EQ(spill.Count(), 2U);
-  std::vector<Row> again = spill.ReadAllRows();
+  std::vector<Row> again = spill.ReadAllRows().MoveValue();
   EXPECT_EQ(again.size(), 2U);
 }
 
 TEST(SpillFileTest,
      ReadAllPositioned_WithoutFinishWriting_AutoFinishesAndReads) {
   SpillFile spill;
-  spill.Append(Row({Value(9)}), RowPosition(3, 7));
-  spill.Append(Row({Value(10)}), RowPosition(4, 8));
-  auto positioned = spill.ReadAllPositioned();
+  ASSERT_SUCCESS(spill.Append(Row({Value(9)}), RowPosition(3, 7)));
+  ASSERT_SUCCESS(spill.Append(Row({Value(10)}), RowPosition(4, 8)));
+  auto positioned = spill.ReadAllPositioned().MoveValue();
   ASSERT_EQ(positioned.size(), 2U);
   EXPECT_EQ(positioned[0].first, Row({Value(9)}));
   EXPECT_EQ(positioned[0].second, RowPosition(3, 7));
@@ -89,66 +90,64 @@ TEST(SpillFileTest,
 
 TEST(SpillFileTest, Append_AfterFinishWriting_ThrowsRuntimeError) {
   SpillFile spill;
-  spill.Append(Row({Value(1)}));
-  spill.FinishWriting();
+  ASSERT_SUCCESS(spill.Append(Row({Value(1)})));
+  ASSERT_SUCCESS(spill.FinishWriting());
   EXPECT_EQ(spill.Count(), 1U);
-  EXPECT_THROW(spill.Append(Row({Value(2)})), std::runtime_error);
-  EXPECT_THROW(spill.Append(Row({Value(2)}), RowPosition(0, 0)),
-               std::runtime_error);
+  EXPECT_NE(spill.Append(Row({Value(2)})), Status::kSuccess);
+  EXPECT_NE(spill.Append(Row({Value(2)}), RowPosition(0, 0)), Status::kSuccess);
   EXPECT_EQ(spill.Count(), 1U);
 }
 
 TEST(SpillFileTest, Append_PositionedAfterPlain_ThrowsRuntimeError) {
   SpillFile spill;
-  spill.Append(Row({Value(1)}));
-  EXPECT_THROW(spill.Append(Row({Value(2)}), RowPosition(0, 0)),
-               std::runtime_error);
+  ASSERT_SUCCESS(spill.Append(Row({Value(1)})));
+  EXPECT_NE(spill.Append(Row({Value(2)}), RowPosition(0, 0)), Status::kSuccess);
 }
 
 TEST(SpillFileTest, Append_PlainAfterPositioned_ThrowsRuntimeError) {
   SpillFile spill;
-  spill.Append(Row({Value(1)}), RowPosition(0, 0));
-  EXPECT_THROW(spill.Append(Row({Value(2)})), std::runtime_error);
+  ASSERT_SUCCESS(spill.Append(Row({Value(1)}), RowPosition(0, 0)));
+  EXPECT_NE(spill.Append(Row({Value(2)})), Status::kSuccess);
 }
 
 TEST(SpillFileTest, ReadAllRows_OnPositionedSpill_ThrowsRuntimeError) {
   SpillFile spill;
-  spill.Append(Row({Value(1)}), RowPosition(1, 2));
-  spill.FinishWriting();
-  EXPECT_THROW(spill.ReadAllRows(), std::runtime_error);
+  ASSERT_SUCCESS(spill.Append(Row({Value(1)}), RowPosition(1, 2)));
+  ASSERT_SUCCESS(spill.FinishWriting());
+  EXPECT_FALSE(spill.ReadAllRows().HasValue());
 }
 
 TEST(SpillFileTest, ReadAllPositioned_OnRowOnlySpill_ThrowsRuntimeError) {
   SpillFile spill;
-  spill.Append(Row({Value(1)}));
-  spill.FinishWriting();
-  EXPECT_THROW(spill.ReadAllPositioned(), std::runtime_error);
+  ASSERT_SUCCESS(spill.Append(Row({Value(1)})));
+  ASSERT_SUCCESS(spill.FinishWriting());
+  EXPECT_FALSE(spill.ReadAllPositioned().HasValue());
 }
 
 TEST(SpillFileTest, ForEachRow_OnPositionedSpill_ThrowsRuntimeError) {
   SpillFile spill;
-  spill.Append(Row({Value(1)}), RowPosition(0, 0));
-  spill.FinishWriting();
-  EXPECT_THROW(spill.ForEachRow([](const Row&) {}), std::runtime_error);
+  ASSERT_SUCCESS(spill.Append(Row({Value(1)}), RowPosition(0, 0)));
+  ASSERT_SUCCESS(spill.FinishWriting());
+  EXPECT_NE(spill.ForEachRow([](const Row&) {}), Status::kSuccess);
 }
 
 TEST(SpillFileTest, ForEachRow_OnEmptySpill_IsNoOp) {
   SpillFile spill;
-  spill.FinishWriting();
+  ASSERT_SUCCESS(spill.FinishWriting());
   int calls = 0;
-  spill.ForEachRow([&](const Row&) { ++calls; });
+  ASSERT_SUCCESS(spill.ForEachRow([&](const Row&) { ++calls; }));
   EXPECT_EQ(calls, 0);
-  EXPECT_TRUE(spill.ReadAllPositioned().empty());
-  EXPECT_TRUE(spill.ReadAllRows().empty());
+  EXPECT_TRUE(spill.ReadAllPositioned().Value().empty());
+  EXPECT_TRUE(spill.ReadAllRows().Value().empty());
 }
 
 TEST(SpillFileTest, FinishWriting_CalledMultipleTimes_IsIdempotent) {
   SpillFile spill;
-  spill.Append(Row({Value(3)}));
-  spill.FinishWriting();
-  spill.FinishWriting();
+  ASSERT_SUCCESS(spill.Append(Row({Value(3)})));
+  ASSERT_SUCCESS(spill.FinishWriting());
+  ASSERT_SUCCESS(spill.FinishWriting());
   EXPECT_TRUE(spill.Count() == 1U && !spill.Empty());
-  auto rows = spill.ReadAllRows();
+  auto rows = spill.ReadAllRows().MoveValue();
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(3)}));
 }
@@ -159,9 +158,9 @@ namespace {
 // destroyed while the destination is still alive elsewhere.
 std::pair<SpillFile, std::filesystem::path> MoveTwoRowSpillOutOfScope() {
   SpillFile src;
-  src.Append(Row({Value(1), Value("a")}));
-  src.Append(Row({Value(2), Value("b")}));
-  src.FinishWriting();
+  EXPECT_SUCCESS(src.Append(Row({Value(1), Value("a")})));
+  EXPECT_SUCCESS(src.Append(Row({Value(2), Value("b")})));
+  EXPECT_SUCCESS(src.FinishWriting());
   const std::filesystem::path path = src.Path();
   SpillFile dst(std::move(src));
   return {std::move(dst), path};  // src's destructor runs on return
@@ -175,7 +174,7 @@ TEST(SpillFileTest, MoveConstructor_FromValidSpillFile_TransfersRows) {
   EXPECT_TRUE(std::filesystem::exists(path));
   EXPECT_EQ(dst.Count(), 2U);
   EXPECT_EQ(dst.Path(), path);
-  auto rows = dst.ReadAllRows();
+  auto rows = dst.ReadAllRows().MoveValue();
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0], Row({Value(1), Value("a")}));
   EXPECT_EQ(rows[1], Row({Value(2), Value("b")}));
@@ -189,11 +188,11 @@ TEST(SpillFileTest, MoveConstructor_FromValidSpillFile_TransfersRows) {
 
 TEST(SpillFileTest, MoveAssignment_ToExistingSpillFile_DeletesOldTargetFile) {
   SpillFile a;
-  a.Append(Row({Value(10)}));
-  a.FinishWriting();
+  ASSERT_SUCCESS(a.Append(Row({Value(10)})));
+  ASSERT_SUCCESS(a.FinishWriting());
   SpillFile b;
-  b.Append(Row({Value(20)}));
-  b.FinishWriting();
+  ASSERT_SUCCESS(b.Append(Row({Value(20)})));
+  ASSERT_SUCCESS(b.FinishWriting());
   const std::filesystem::path old_b = b.Path();
   EXPECT_TRUE(std::filesystem::exists(old_b));
   b = std::move(a);
@@ -204,15 +203,15 @@ TEST(SpillFileTest, MoveAssignment_ToExistingSpillFile_DeletesOldTargetFile) {
       // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
       a.Empty());
   EXPECT_EQ(b.Count(), 1U);
-  auto rows = b.ReadAllRows();
+  auto rows = b.ReadAllRows().Value();
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(10)}));
 }
 
 TEST(SpillFileTest, SelfMoveAssignment_OnValidSpillFile_PreservesState) {
   SpillFile spill;
-  spill.Append(Row({Value(5)}));
-  spill.FinishWriting();
+  ASSERT_SUCCESS(spill.Append(Row({Value(5)})));
+  ASSERT_SUCCESS(spill.FinishWriting());
   const std::filesystem::path path = spill.Path();
   // Self-move must be safe; go through a reference so the compiler cannot
   // prove the self-move and warn about it.
@@ -220,7 +219,7 @@ TEST(SpillFileTest, SelfMoveAssignment_OnValidSpillFile_PreservesState) {
   spill = std::move(spill_alias);
   EXPECT_EQ(spill.Count(), 1U);
   EXPECT_TRUE(std::filesystem::exists(path));
-  auto rows = spill.ReadAllRows();
+  auto rows = spill.ReadAllRows().MoveValue();
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(5)}));
 }
@@ -229,8 +228,8 @@ TEST(SpillFileTest, Destructor_WhenSpillFileDestroyed_RemovesUnderlyingFile) {
   std::filesystem::path path;
   {
     SpillFile spill;
-    spill.Append(Row({Value(1), Value("z")}));
-    spill.FinishWriting();
+    ASSERT_SUCCESS(spill.Append(Row({Value(1), Value("z")})));
+    ASSERT_SUCCESS(spill.FinishWriting());
     path = spill.Path();
     EXPECT_TRUE(std::filesystem::exists(path));
   }
@@ -246,8 +245,8 @@ TEST(SpillFileTest, TempDirectory_WhenEnvSet_HonorsEnvPath) {
   EXPECT_EQ(SpillFile::TempDirectory(), tmp);
   {
     SpillFile spill;
-    spill.Append(Row({Value(42)}));
-    spill.FinishWriting();
+    ASSERT_SUCCESS(spill.Append(Row({Value(42)})));
+    ASSERT_SUCCESS(spill.FinishWriting());
     EXPECT_EQ(spill.Path().parent_path(), tmp);
     EXPECT_TRUE(std::filesystem::exists(spill.Path()));
   }
@@ -258,10 +257,10 @@ TEST(SpillFileTest, TempDirectory_WhenEnvSet_HonorsEnvPath) {
 
 TEST(SpillFileTest, ReadAllRows_WhenFileDeleted_ThrowsRuntimeError) {
   SpillFile spill;
-  spill.Append(Row({Value(1)}));
-  spill.FinishWriting();
+  ASSERT_SUCCESS(spill.Append(Row({Value(1)})));
+  ASSERT_SUCCESS(spill.FinishWriting());
   std::filesystem::remove(spill.Path());
-  EXPECT_THROW(spill.ReadAllRows(), std::runtime_error);
+  EXPECT_FALSE(spill.ReadAllRows().HasValue());
 }
 
 }  // namespace tinylamb

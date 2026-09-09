@@ -77,7 +77,7 @@ TEST(DataChunkTest, ZoneMap_AfterAppendsAndReset_MaintainsStatistics) {
   chunk.Append(Row({Value(7)}));
   const ZoneMap& zone = chunk.ZoneMapAt(0);
   if (!zone.Minimum() || !zone.Maximum()) {
-    GTEST_FAIL() << "zone map not populated";
+    GTEST_FAIL() << true;
     return;
   }
   EXPECT_EQ(*zone.Minimum(), Value(2));
@@ -156,12 +156,10 @@ TEST(DataChunkTest, Append_NullThenNonNull_InfersAndPromotesType) {
 
 TEST(DataChunkTest, Append_TypeMismatch_ThrowsInvalidArgument) {
   DataChunk chunk(std::vector<ValueType>{ValueType::kInt64});
-  // Appending a double into an int64 column must be rejected.
-  EXPECT_THROW(chunk.Append(Row({Value(1.5)})), std::invalid_argument);
-  // A failed append must not poison zone maps: a later int64 append succeeds.
-  EXPECT_NO_THROW(chunk.Append(Row({Value(int64_t{3})})));
-  ASSERT_EQ(chunk.Size(), 1);
-  EXPECT_EQ(chunk.ColumnAt(0).ValueAt(0), Value(int64_t{3}));
+  // Appending a double into an int64 column aborts (CHECK; migration
+  // Phase 6).  Only the aborting append is exercised: the process cannot
+  // continue after a CHECK.
+  EXPECT_DEATH(chunk.Append(Row({Value(1.5)})), "type mismatch");
 }
 
 TEST(DataChunkTest, Append_NullToDoubleColumn_PreservesType) {
@@ -210,7 +208,7 @@ TEST(DataChunkTest, Append_ChunkWidthMismatch_Throws) {
       std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar});
   source.Append(Row({Value(1), Value("x")}));
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
-  EXPECT_ANY_THROW(target.Append(source, 0));
+  EXPECT_DEATH(target.Append(source, 0), ".*");
 }
 
 TEST(DataChunkTest, Append_LvalueRowWithPositions_StoresCorrectly) {
@@ -287,7 +285,7 @@ TEST(DataChunkTest,
   EXPECT_EQ(projected.PositionAt(1), RowPosition(2, 2));
   const ZoneMap& names = projected.ZoneMapAt(0);
   if (!names.Minimum() || !names.Maximum()) {
-    GTEST_FAIL() << "zone map not populated";
+    GTEST_FAIL() << true;
     return;
   }
   EXPECT_EQ(*names.Minimum(), Value("one"));
@@ -319,7 +317,7 @@ TEST(DataChunkTest, AppendRowFromColumns_WidthMismatch_Throws) {
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
   std::vector<const ColumnVector*> sources = {&input.ColumnAt(0),
                                               &input.ColumnAt(1)};
-  EXPECT_ANY_THROW(target.AppendRowFromColumns(sources, 0));
+  EXPECT_DEATH(target.AppendRowFromColumns(sources, 0), ".*");
 }
 
 TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
@@ -339,7 +337,7 @@ TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
   // Zone maps must survive the unboxed copy, including the date type.
   const std::optional<Value> date_minimum = output.ZoneMapAt(2).Minimum();
   if (!date_minimum) {
-    GTEST_FAIL() << "zone map not populated";
+    GTEST_FAIL() << true;
     return;
   }
   EXPECT_EQ(*date_minimum, Value::DateFromDays(9));
@@ -356,9 +354,7 @@ TEST(DataChunkTest,
   DataChunk source(std::vector<ValueType>{ValueType::kDouble});
   source.Append(Row({Value(1.5)}));
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});
-  EXPECT_THROW(target.Append(source, 0), std::invalid_argument);
-  EXPECT_EQ(target.Size(), 0U);
-  EXPECT_NO_THROW(target.Append(Row({Value(int64_t{2})})));
+  EXPECT_DEATH(target.Append(source, 0), "type mismatch");
 }
 
 TEST(ValidityBitmapTest, BasicOperationsAndBitwiseOps) {
@@ -444,7 +440,7 @@ TEST(VectorizedExpressionTest, EvaluateArithmeticAndComparison) {
   Expression add_expr = BinaryExpressionExp(
       ColumnValueExp("a"), BinaryOperation::kAdd, ColumnValueExp("b"));
   ColumnVector add_res =
-      VectorizedExpression::Evaluate(add_expr, schema, chunk);
+      VectorizedExpression::Evaluate(add_expr, schema, chunk).MoveValue();
   ASSERT_EQ(add_res.Size(), 3);
   EXPECT_EQ(add_res.ValueAt(0), Value(int64_t{12}));
   EXPECT_EQ(add_res.ValueAt(1), Value(int64_t{25}));
@@ -455,7 +451,7 @@ TEST(VectorizedExpressionTest, EvaluateArithmeticAndComparison) {
       BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kGreaterThan,
                           ConstantValueExp(Value(int64_t{15})));
   ValidityBitmap filter_mask =
-      VectorizedExpression::EvaluateFilter(cmp_expr, schema, chunk);
+      VectorizedExpression::EvaluateFilter(cmp_expr, schema, chunk).MoveValue();
   ASSERT_EQ(filter_mask.Size(), 3);
   EXPECT_FALSE(filter_mask.Get(0));
   EXPECT_TRUE(filter_mask.Get(1));
@@ -592,7 +588,7 @@ TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
   Expression and_expr = BinaryExpressionExp(
       ColumnValueExp("a"), BinaryOperation::kAnd, ColumnValueExp("b"));
   ColumnVector and_res =
-      VectorizedExpression::Evaluate(and_expr, schema, chunk);
+      VectorizedExpression::Evaluate(and_expr, schema, chunk).MoveValue();
   ASSERT_EQ(and_res.Size(), 3);
   EXPECT_EQ(and_res.ValueAt(0), Value(int64_t{0}));
   EXPECT_EQ(and_res.ValueAt(1), Value(int64_t{0}));
@@ -601,7 +597,8 @@ TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
   // a OR b
   Expression or_expr = BinaryExpressionExp(
       ColumnValueExp("a"), BinaryOperation::kOr, ColumnValueExp("b"));
-  ColumnVector or_res = VectorizedExpression::Evaluate(or_expr, schema, chunk);
+  ColumnVector or_res =
+      VectorizedExpression::Evaluate(or_expr, schema, chunk).MoveValue();
   ASSERT_EQ(or_res.Size(), 3);
   EXPECT_EQ(or_res.ValueAt(0), Value(int64_t{1}));
   EXPECT_EQ(or_res.ValueAt(1), Value(int64_t{1}));
@@ -611,7 +608,7 @@ TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
   Expression xor_expr = BinaryExpressionExp(
       ColumnValueExp("a"), BinaryOperation::kXor, ColumnValueExp("b"));
   ColumnVector xor_res =
-      VectorizedExpression::Evaluate(xor_expr, schema, chunk);
+      VectorizedExpression::Evaluate(xor_expr, schema, chunk).MoveValue();
   ASSERT_EQ(xor_res.Size(), 3);
   EXPECT_EQ(xor_res.ValueAt(0), Value(int64_t{1}));
   EXPECT_EQ(xor_res.ValueAt(1), Value(int64_t{1}));
@@ -631,7 +628,7 @@ TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
   const Expression and_expr = BinaryExpressionExp(
       ColumnValueExp("a"), BinaryOperation::kAnd, ColumnValueExp("b"));
   const ColumnVector and_res =
-      VectorizedExpression::Evaluate(and_expr, schema, chunk);
+      VectorizedExpression::Evaluate(and_expr, schema, chunk).MoveValue();
   ASSERT_EQ(and_res.Size(), 4);
   // FALSE AND NULL -> FALSE (ground truth in binary_expression.cpp)
   EXPECT_EQ(and_res.ValueAt(0), Value(int64_t{0}));
@@ -643,13 +640,13 @@ TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
     const Value expected =
         EvaluateBinary(BinaryOperation::kAnd, chunk.ColumnAt(0).ValueAt(i),
                        chunk.ColumnAt(1).ValueAt(i));
-    EXPECT_EQ(and_res.ValueAt(i), expected) << "row " << i;
+    EXPECT_EQ(and_res.ValueAt(i), expected) << true << (i != 0u);
   }
 
   const Expression or_expr = BinaryExpressionExp(
       ColumnValueExp("a"), BinaryOperation::kOr, ColumnValueExp("b"));
   const ColumnVector or_res =
-      VectorizedExpression::Evaluate(or_expr, schema, chunk);
+      VectorizedExpression::Evaluate(or_expr, schema, chunk).MoveValue();
   ASSERT_EQ(or_res.Size(), 4);
   // FALSE OR NULL -> NULL, TRUE OR NULL -> TRUE (ground truth).
   EXPECT_TRUE(or_res.ValueAt(0).IsNull());
@@ -660,7 +657,7 @@ TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
     const Value expected =
         EvaluateBinary(BinaryOperation::kOr, chunk.ColumnAt(0).ValueAt(i),
                        chunk.ColumnAt(1).ValueAt(i));
-    EXPECT_EQ(or_res.ValueAt(i), expected) << "row " << i;
+    EXPECT_EQ(or_res.ValueAt(i), expected) << true << (i != 0u);
   }
 }
 

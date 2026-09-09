@@ -51,13 +51,13 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     log_name_ = prefix + ".log";
     Recover();
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     ASSERT_EQ(page->PageID(), 1);
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
   void Insert(Transaction& txn, const char c, size_t key_len,
-              size_t value_len) const {
+              size_t value_len) {
     ASSERT_SUCCESS(
         bpt_->Insert(txn, std::string(key_len, c), std::string(value_len, c)));
   }
@@ -75,8 +75,8 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
+    p_ = PageManager::Create(db_name_, 10).MoveValue();
+    l_ = Logger::Create(log_name_).MoveValue();
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
@@ -328,16 +328,16 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
 }
 
 // The invalid-range guard throws std::runtime_error since
-// b_plus_tree_iterator.cpp grew a real `throw` (the old "computes but never
-// throws" bug is fixed); these expectations pin that behavior.
-TEST_F(BPlusTreeIteratorTest, ThrowsOnInvalidRange) {
+// BPlusTreeIterator treats an inverted begin/end range as a caller-contract
+// violation (CHECK abort); these expectations pin that behavior.
+TEST_F(BPlusTreeIteratorTest, AbortsOnInvalidRange) {
   // Arrange -- begin transaction, no inserts needed
   auto txn = tm_->Begin();
 
   // Act/Assert -- a range whose begin sorts after end is rejected in both
   // directions.
-  EXPECT_THROW(bpt_->Begin(txn, "z", "a"), std::runtime_error);
-  EXPECT_THROW(bpt_->Begin(txn, "z", "a", false), std::runtime_error);
+  EXPECT_DEATH(bpt_->Begin(txn, "z", "a"), "invalid begin & end");
+  EXPECT_DEATH(bpt_->Begin(txn, "z", "a", false), "invalid begin & end");
 
   // A well-ordered range is accepted for both directions.
   EXPECT_NO_THROW(bpt_->Begin(txn, "a", "z"));
@@ -589,16 +589,16 @@ TEST_F(BPlusTreeIteratorTest, ForwardScanDescendsEmptyLeafWithFoster) {
   // empty foster parent B and must follow B's foster pointer to the row.
   {
     auto txn = tm_->Begin();
-    PageRef root = p_->GetPage(bpt_->Root());
+    PageRef root = p_->GetPage(bpt_->Root()).MoveValue();
     root->PageTypeChange(txn, PageType::kBranchPage);
-    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     a->InsertLeaf(txn, "a", "1");
     COERCE(a->SetHighFence(txn, IndexKey("b")));
     root->SetLowestValue(txn, a->PageID());
-    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     COERCE(b->SetLowFence(txn, IndexKey("b")));
     root->InsertBranch(txn, "b", b->PageID());
-    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     c->InsertLeaf(txn, "b", "2");
     COERCE(c->SetLowFence(txn, IndexKey("b")));
     ASSERT_SUCCESS(b->SetFoster(txn, FosterPair("b", c->PageID())));

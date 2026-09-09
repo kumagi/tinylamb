@@ -24,9 +24,10 @@ struct WindowedInput {
 // `$winN` columns appended to the input rows, and rewrites the statement so
 // those calls become plain column references.  Must run after WHERE filtering
 // and before projection (SQL: WHERE -> window -> QUALIFY -> ORDER BY).
-WindowedInput ApplyWindows(TransactionContext& context,
-                           const SelectStatement& statement, Relation&& input,
-                           const Scope* outer, const CteMap& ctes);
+StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
+                                     const SelectStatement& statement,
+                                     Relation&& input, const Scope* outer,
+                                     const CteMap& ctes);
 
 // Drops the trailing $winN columns produced by ApplyWindows.
 

@@ -655,10 +655,10 @@ size_t LogRecord::Size() const {
   size += offset;
   switch (type) {
     case LogType::kUnknown:
-      // kUnknown has no defined record layout: abort in debug, throw in
-      // NDEBUG instead of silently returning a redo_data-based size.
-      assert(!"Don't call Size() of unknown log");
-      throw std::runtime_error("Size() of unknown log record");
+      // kUnknown has no defined record layout: this is a caller bug, not a
+      // runtime condition (recovery rejects unknown types before sizing).
+      CHECK_MSG(false, "Don't call Size() of unknown log");
+      break;
     case LogType::kInsertRow:
     case LogType::kInsertLeaf:
     case LogType::kCompensateUpdateRow:
@@ -746,10 +746,9 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
   }
   switch (l.type) {
     case LogType::kUnknown:
-      // Fail loudly in NDEBUG builds instead of serializing a garbage
-      // record.
-      assert(!"unknown type log must not be serialized");
-      throw std::runtime_error("unknown type log must not be serialized");
+      // Fail loudly instead of serializing a garbage record.
+      CHECK_MSG(false, "unknown type log must not be serialized");
+      break;
     case LogType::kInsertRow:
     case LogType::kCompensateUpdateLeaf:
     case LogType::kInsertLeaf:
@@ -822,12 +821,14 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
   uint32_t version = 0;
   d >> magic >> version;
   if (magic != kSerdesMagic) {
-    throw std::runtime_error("invalid WAL record magic");
+    d.Fail();
+    return d;
   }
   // Accept v1/v2/v3 (header contract in log_record.hpp): v1 is
   // kSerdesVersion, v2 added the destroy-page payload, v3 added the CRC.
   if (version < kLegacyWalRecordVersion || version > kWalRecordVersion) {
-    throw std::runtime_error("unsupported WAL record version");
+    d.Fail();
+    return d;
   }
   l.wire_version = version;
   uint16_t type_raw = 0;
@@ -906,10 +907,11 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
     }
     default:
       // Never return a half-decoded record with an undefined type: reject
-      // with a catchable exception so RecoveryManager can skip torn tails
-      // and the fuzzers treat it as ordinary rejection.
+      // through the decoder's sticky fail state so RecoveryManager can skip
+      // torn tails and the fuzzers treat it as ordinary rejection.
       LOG(ERROR) << "unknown log type: " << l.type;
-      throw std::runtime_error("unknown log type");
+      d.Fail();
+      break;
   }
   return d;
 }

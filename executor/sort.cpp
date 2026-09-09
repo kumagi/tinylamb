@@ -24,6 +24,8 @@
 #include <vector>
 
 #include "common/decoder.hpp"
+#include "common/exc_shim.hpp"
+#include "common/status_or.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
 #include "expression/column_value.hpp"
@@ -112,7 +114,7 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
       out->append(v.EncodeMemcomparableFormat());
       break;
     case ValueType::kNull:
-      throw std::runtime_error("Cannot encode unknown type.");
+      CHECK_MSG(false, "Cannot encode unknown type.");
   }
 }
 
@@ -179,14 +181,23 @@ class SortKeyEncoder {
     return specs_[0].ascending ? flipped : ~flipped;
   }
 
-  void AppendEncoded(const Row& row, std::string* out) const {
+  void AppendEncoded(const Row& row, std::string* out,
+                     Status* error = nullptr) const {
     for (const Spec& spec : specs_) {
       Value evaluated;
       const Value* v = nullptr;
       if (spec.column >= 0) {
         v = &row.values_[static_cast<size_t>(spec.column)];
       } else {
-        evaluated = spec.expr->Evaluate(row, *schema_);
+        StatusOr<Value> res = spec.expr->TryEvaluate(row, *schema_);
+        if (!res.HasValue()) {
+          if (error != nullptr && error->ok()) {
+            *error = res.GetStatus();
+          }
+          evaluated = Value();
+        } else {
+          evaluated = res.MoveValue();
+        }
         v = &evaluated;
       }
       const bool nulls_first = spec.nulls_first;
@@ -263,7 +274,7 @@ class KeyOrdering {
   KeyOrdering(const std::vector<SortExecutor::Key>& keys, const Schema& schema)
       : encoder_(keys, schema) {}
 
-  void AppendRow(const Row& row) {
+  void AppendRow(const Row& row, Status* error = nullptr) {
     if (encoder_.GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
       bool is_null = false;
       const uint64_t key = encoder_.SingleKey(row, &is_null);
@@ -272,12 +283,13 @@ class KeyOrdering {
       return;
     }
     const auto begin = static_cast<uint32_t>(blob_.size());
-    encoder_.AppendEncoded(row, &blob_);
+    encoder_.AppendEncoded(row, &blob_, error);
     spans_.emplace_back(begin, static_cast<uint32_t>(blob_.size() - begin));
   }
 
-  void AppendEncodedTo(const Row& row, std::string* out) const {
-    encoder_.AppendEncoded(row, out);
+  void AppendEncodedTo(const Row& row, std::string* out,
+                       Status* error = nullptr) const {
+    encoder_.AppendEncoded(row, out, error);
   }
 
   void ResetForNewChunk() {
@@ -417,20 +429,24 @@ class RunReader {
       : stream_(run.Path(), std::ios::binary | std::ios::in),
         remaining_(run.Count()) {
     if (!stream_) {
-      throw std::runtime_error("failed to open spill run: " +
-                               run.Path().string());
+      status_ = StatusError(StatusCode::kIOError,
+                            "failed to open spill run: " + run.Path().string());
+      return;
     }
     uint64_t stored = 0;
     stream_.read(reinterpret_cast<char*>(&stored), sizeof(stored));
     if (stream_.gcount() != static_cast<std::streamsize>(sizeof(stored)) ||
         stored != remaining_) {
-      throw std::runtime_error("spill run header mismatch: " +
-                               run.Path().string());
+      status_ =
+          StatusError(StatusCode::kCorrupt,
+                      "spill run header mismatch: " + run.Path().string());
     }
   }
 
+  [[nodiscard]] Status GetStatus() const { return status_; }
+
   bool Next(PositionedRow* dst) {
-    if (remaining_ == 0) {
+    if (remaining_ == 0 || status_ != Status::kSuccess) {
       return false;
     }
     Row row;
@@ -438,7 +454,8 @@ class RunReader {
     Decoder dec(stream_);
     dec >> row >> position;
     if (!stream_) {
-      throw std::runtime_error("truncated spill run");
+      status_ = StatusError(StatusCode::kCorrupt, "truncated spill run");
+      return false;
     }
     --remaining_;
     *dst = PositionedRow(std::move(row), position);
@@ -448,6 +465,7 @@ class RunReader {
  private:
   std::ifstream stream_;
   uint64_t remaining_{0};
+  Status status_{Status::kSuccess};
 };
 
 void ApplyPermutation(std::vector<PositionedRow>* rows,
@@ -465,37 +483,44 @@ void ApplyPermutation(std::vector<PositionedRow>* rows,
 
 }  // namespace
 
-void SortExecutor::Materialize() {
+Status SortExecutor::Materialize() {
   KeyOrdering ordering(keys_, schema_);
   std::vector<SpillFile> runs;
-  const auto write_sorted_run = [&]() {
+  const auto write_sorted_run = [&]() -> Status {
     ApplyPermutation(&rows_,
                      ordering.BuildPermutation(rows_.size(), worker_count_));
     SpillFile run;
     for (const auto& item : rows_) {
-      run.Append(item.first, item.second);
+      RETURN_IF_FAIL(run.Append(item.first, item.second));
     }
-    run.FinishWriting();
+    RETURN_IF_FAIL(run.FinishWriting());
     runs.push_back(std::move(run));
     ordering.ResetForNewChunk();
     rows_.clear();
     rows_.shrink_to_fit();
+    return Status::kSuccess;
   };
 
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   QueryMemoryCharge charge;
+  Status encode_error{Status::kSuccess};
   Row row;
   RowPosition position;
   while (source_->Next(&row, &position)) {
     const size_t bytes = EstimateRowBytes(row) + sizeof(RowPosition);
     const bool spill_now = !budget.CanReserve(bytes);
     if (spill_now && !rows_.empty()) {
-      write_sorted_run();
+      RETURN_IF_FAIL(write_sorted_run());
       charge.ReleaseAll();
     }
     charge.Add(bytes);
-    ordering.AppendRow(row);
+    ordering.AppendRow(row, &encode_error);
+    RETURN_IF_FAIL(encode_error);
     rows_.emplace_back(std::move(row), position);
+  }
+  RETURN_IF_FAIL(encode_error);
+  if (auto st = source_->GetStatus(); st != Status::kSuccess) {
+    return st;
   }
 
   if (runs.empty()) {
@@ -507,7 +532,7 @@ void SortExecutor::Materialize() {
     rows_charge_ = std::move(charge);
   } else {
     if (!rows_.empty()) {
-      write_sorted_run();
+      RETURN_IF_FAIL(write_sorted_run());
       charge.ReleaseAll();
     }
 
@@ -518,7 +543,8 @@ void SortExecutor::Materialize() {
       std::vector<std::pair<uint32_t, uint32_t>> spans;
       size_t index{0};
 
-      bool Fill(const KeyOrdering& ord, RunReader* reader) {
+      bool Fill(const KeyOrdering& ord, RunReader* reader,
+                Status* error = nullptr) {
         charge.ReleaseAll();
         rows.clear();
         keys.clear();
@@ -528,7 +554,7 @@ void SortExecutor::Materialize() {
         while (rows.size() < kMergeWindowRows && reader->Next(&item)) {
           charge.Add(EstimateRowBytes(item.first) + sizeof(RowPosition));
           const auto begin = static_cast<uint32_t>(keys.size());
-          ord.AppendEncodedTo(item.first, &keys);
+          ord.AppendEncodedTo(item.first, &keys, error);
           spans.emplace_back(begin, static_cast<uint32_t>(keys.size() - begin));
           rows.push_back(std::move(item));
         }
@@ -540,17 +566,11 @@ void SortExecutor::Materialize() {
       std::unique_ptr<RunReader> reader;
       std::optional<MergeWindow> window;
 
-      [[nodiscard]] const PositionedRow& Current() const {
-        if (!window || window->index >= window->rows.size()) {
-          throw std::runtime_error("merge cursor has no current row");
-        }
-        return window->rows[window->index];
-      }
-      bool FillInitial(const KeyOrdering& ord) {
+      bool FillInitial(const KeyOrdering& ord, Status* error) {
         window.emplace();
-        return window->Fill(ord, reader.get());
+        return window->Fill(ord, reader.get(), error);
       }
-      bool Advance(const KeyOrdering& ord) {
+      bool Advance(const KeyOrdering& ord, Status* error) {
         if (!window) {
           return false;
         }
@@ -558,7 +578,7 @@ void SortExecutor::Materialize() {
         if (window->index < window->rows.size()) {
           return true;
         }
-        return window->Fill(ord, reader.get());
+        return window->Fill(ord, reader.get(), error);
       }
     };
 
@@ -566,7 +586,10 @@ void SortExecutor::Materialize() {
     for (size_t i = 0; i < cursors.size(); ++i) {
       cursors[i].run_id = i;
       cursors[i].reader = std::make_unique<RunReader>(runs[i]);
-      cursors[i].FillInitial(ordering);
+      if (auto st = cursors[i].reader->GetStatus(); st != Status::kSuccess) {
+        return st;
+      }
+      cursors[i].FillInitial(ordering, &encode_error);
     }
     auto current_key = [&cursors](size_t id) -> std::string_view {
       const MergeWindow& w = *cursors[id].window;
@@ -603,20 +626,30 @@ void SortExecutor::Materialize() {
       }
       rows_.push_back(std::move(cursor.window->rows[cursor.window->index]));
       output_charge.Add(EstimateRowBytes(rows_.back().first));
-      if (cursor.Advance(ordering)) {
+      if (cursor.Advance(ordering, &encode_error)) {
         heap.push(id);
       }
     }
+    RETURN_IF_FAIL(encode_error);
     charge.ReleaseAll();
     rows_charge_ = std::move(output_charge);
+    for (const RunCursor& cursor : cursors) {
+      if (auto st = cursor.reader->GetStatus(); st != Status::kSuccess) {
+        return st;
+      }
+    }
   }
 
   materialized_ = true;
+  return Status::kSuccess;
 }
 
 bool SortExecutor::Next(Row* dst, RowPosition* rp) {
   if (!materialized_) {
-    Materialize();
+    Status st = Materialize();
+    if (st != Status::kSuccess) {
+      return FailWith(st);
+    }
   }
   if (offset_ >= rows_.size()) {
     return false;

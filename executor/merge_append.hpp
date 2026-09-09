@@ -36,10 +36,10 @@ class MergeAppendExecutor final : public ExecutorBase {
     size_t source{0};
   };
 
-  [[nodiscard]] Value KeyValue(const Head& head,
-                               const SortExecutor::Key& key) const;
+  [[nodiscard]] StatusOr<Value> KeyValue(const Head& head,
+                                         const SortExecutor::Key& key) const;
   [[nodiscard]] bool Before(const Head& left, const Head& right) const;
-  void Initialize();
+  Status Initialize();
 
   std::vector<Executor> sources_;
   std::vector<Schema> schemas_;

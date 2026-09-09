@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/log_message.hpp"
 #include "executor/selection_vector.hpp"
 #include "executor/zone_map.hpp"
 #include "page/row_position.hpp"
@@ -63,7 +64,7 @@ void ColumnVector::Append(const Value& value) {
     type_ = value.type;
     MaterializeInferredStorage();
   } else if (!is_null && type_ != value.type) {
-    throw std::invalid_argument("column vector type mismatch");
+    CHECK_MSG(false, "column vector type mismatch");
   }
   EnsureNullBit(size_, is_null);
   if (is_null) {
@@ -96,7 +97,7 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
     type_ = source.type_;
     MaterializeInferredStorage();
   } else if (!is_null && source.type_ != type_) {
-    throw std::invalid_argument("column vector type mismatch");
+    CHECK_MSG(false, "column vector type mismatch");
   }
   EnsureNullBit(size_, is_null);
   if (is_null) {
@@ -313,7 +314,7 @@ void DataChunk::EnsureLayout(const Row& row) {
     return;
   }
   if (row.values_.size() != columns_.size()) {
-    throw std::invalid_argument("data chunk row width mismatch");
+    CHECK_MSG(false, "data chunk row width mismatch");
   }
 }
 
@@ -342,7 +343,7 @@ void DataChunk::Append(Row&& row, RowPosition position) {
 
 void DataChunk::Append(const DataChunk& source, size_t row_index) {
   if (row_index >= source.Size()) {
-    throw std::out_of_range("data chunk append row out of range");
+    CHECK_MSG(false, "data chunk append row out of range");
   }
   if (columns_.empty() && size_ == 0) {
     std::vector<ValueType> types;
@@ -353,7 +354,7 @@ void DataChunk::Append(const DataChunk& source, size_t row_index) {
     Initialize(types);
   }
   if (ColumnCount() != source.ColumnCount()) {
-    throw std::invalid_argument("data chunk width mismatch");
+    CHECK_MSG(false, "data chunk width mismatch");
   }
   for (size_t i = 0; i < columns_.size(); ++i) {
     const ColumnVector& column = source.ColumnAt(i);
@@ -369,7 +370,7 @@ void DataChunk::AppendRowFromColumns(
     RowPosition position) {
   for (const ColumnVector* source : sources) {
     if (row_index >= source->Size()) {
-      throw std::out_of_range("data chunk append row out of range");
+      CHECK_MSG(false, "data chunk append row out of range");
     }
   }
   if (columns_.empty() && size_ == 0) {
@@ -381,7 +382,7 @@ void DataChunk::AppendRowFromColumns(
     Initialize(types);
   }
   if (columns_.size() != sources.size()) {
-    throw std::invalid_argument("data chunk row width mismatch");
+    CHECK_MSG(false, "data chunk row width mismatch");
   }
   for (size_t i = 0; i < columns_.size(); ++i) {
     const ColumnVector* source = sources[i];
@@ -396,7 +397,7 @@ void DataChunk::AppendGather(const DataChunk& source, const uint32_t* selection,
                              size_t count) {
   for (size_t i = 0; i < count; ++i) {
     if (selection[i] >= source.Size()) {
-      throw std::out_of_range("data chunk append row out of range");
+      CHECK_MSG(false, "data chunk append row out of range");
     }
   }
   if (columns_.empty() && size_ == 0) {
@@ -408,7 +409,7 @@ void DataChunk::AppendGather(const DataChunk& source, const uint32_t* selection,
     Initialize(types);
   }
   if (ColumnCount() != source.ColumnCount()) {
-    throw std::invalid_argument("data chunk width mismatch");
+    CHECK_MSG(false, "data chunk width mismatch");
   }
   for (size_t i = 0; i < count; ++i) {
     const size_t row_index = selection[i];
@@ -537,7 +538,7 @@ Value ColumnVector::AggregateBitAnd(const SelectionVector* sel) const {
     return {};
   }
   if (type_ != ValueType::kInt64) {
-    throw std::invalid_argument("BIT_AND requires int64 column");
+    CHECK_MSG(false, "BIT_AND requires int64 column");
   }
   const int64_t* data = integers_.data();
   uint64_t acc = ~uint64_t{0};
@@ -588,7 +589,7 @@ Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
     return {};
   }
   if (type_ != ValueType::kInt64) {
-    throw std::invalid_argument("BIT_OR requires int64 column");
+    CHECK_MSG(false, "BIT_OR requires int64 column");
   }
   const int64_t* data = integers_.data();
   uint64_t acc = 0;
@@ -639,7 +640,7 @@ Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
     return {};
   }
   if (type_ != ValueType::kInt64) {
-    throw std::invalid_argument("BIT_XOR requires int64 column");
+    CHECK_MSG(false, "BIT_XOR requires int64 column");
   }
   const int64_t* data = integers_.data();
   uint64_t acc = 0;
@@ -688,8 +689,7 @@ Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
 Value DataChunk::AggregateLogicalAnd(size_t col_idx,
                                      const SelectionVector* sel) const {
   if (col_idx >= columns_.size()) {
-    throw std::out_of_range(
-        "DataChunk::AggregateLogicalAnd col_idx out of range");
+    CHECK_MSG(false, "DataChunk::AggregateLogicalAnd col_idx out of range");
   }
   return columns_[col_idx].AggregateLogicalAnd(sel);
 }
@@ -697,8 +697,7 @@ Value DataChunk::AggregateLogicalAnd(size_t col_idx,
 Value DataChunk::AggregateLogicalOr(size_t col_idx,
                                     const SelectionVector* sel) const {
   if (col_idx >= columns_.size()) {
-    throw std::out_of_range(
-        "DataChunk::AggregateLogicalOr col_idx out of range");
+    CHECK_MSG(false, "DataChunk::AggregateLogicalOr col_idx out of range");
   }
   return columns_[col_idx].AggregateLogicalOr(sel);
 }
@@ -706,7 +705,7 @@ Value DataChunk::AggregateLogicalOr(size_t col_idx,
 Value DataChunk::AggregateBitAnd(size_t col_idx,
                                  const SelectionVector* sel) const {
   if (col_idx >= columns_.size()) {
-    throw std::out_of_range("DataChunk::AggregateBitAnd col_idx out of range");
+    CHECK_MSG(false, "DataChunk::AggregateBitAnd col_idx out of range");
   }
   return columns_[col_idx].AggregateBitAnd(sel);
 }
@@ -714,7 +713,7 @@ Value DataChunk::AggregateBitAnd(size_t col_idx,
 Value DataChunk::AggregateBitOr(size_t col_idx,
                                 const SelectionVector* sel) const {
   if (col_idx >= columns_.size()) {
-    throw std::out_of_range("DataChunk::AggregateBitOr col_idx out of range");
+    CHECK_MSG(false, "DataChunk::AggregateBitOr col_idx out of range");
   }
   return columns_[col_idx].AggregateBitOr(sel);
 }
@@ -722,7 +721,7 @@ Value DataChunk::AggregateBitOr(size_t col_idx,
 Value DataChunk::AggregateBitXor(size_t col_idx,
                                  const SelectionVector* sel) const {
   if (col_idx >= columns_.size()) {
-    throw std::out_of_range("DataChunk::AggregateBitXor col_idx out of range");
+    CHECK_MSG(false, "DataChunk::AggregateBitXor col_idx out of range");
   }
   return columns_[col_idx].AggregateBitXor(sel);
 }

@@ -120,7 +120,7 @@ Status Transaction::PreCommit() {
   return result;
 }
 
-void Transaction::Abort() { transaction_manager_->Abort(*this); }
+Status Transaction::Abort() { return transaction_manager_->Abort(*this); }
 
 bool Transaction::AddReadSet(const RowPosition& rp) {
   assert(!IsFinished());
@@ -322,9 +322,9 @@ bool Transaction::IndexKeysMayBeStale(page_id_t index_root) const {
          transaction_manager_->IndexKeysMayBeStale(*this, index_root);
 }
 
-lsn_t Transaction::AppendLog(const LogRecord& lr) {
+StatusOr<lsn_t> Transaction::AppendLog(const LogRecord& lr) {
   const std::string data = lr.Serialize();
-  const lsn_t start = transaction_manager_->logger_->AddLog(data);
+  ASSIGN_OR_RETURN(lsn_t, start, transaction_manager_->logger_->AddLog(data));
   prev_lsn_ = start;
   // AddLog returns the record's START offset; the record occupies
   // [start, start + data.size()).  Page stamps use the END so the write-back
@@ -339,92 +339,114 @@ lsn_t Transaction::AppendLog(const LogRecord& lr) {
   return start;
 }
 
-lsn_t Transaction::InsertLog(page_id_t pid, slot_t slot,
-                             std::string_view redo) {
+StatusOr<lsn_t> Transaction::InsertLog(page_id_t pid, slot_t slot,
+                                       std::string_view redo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, slot, redo));
+  return AppendLog(
+      LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, slot, redo));
 }
-lsn_t Transaction::InsertLeafLog(page_id_t pid, std::string_view key,
-                                 std::string_view redo) {
+StatusOr<lsn_t> Transaction::InsertLeafLog(page_id_t pid, std::string_view key,
+                                           std::string_view redo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::InsertingLeafLogRecord(prev_lsn_, txn_id_, pid, key, redo));
+  return AppendLog(
+      LogRecord::InsertingLeafLogRecord(prev_lsn_, txn_id_, pid, key, redo));
 }
-lsn_t Transaction::InsertBranchLog(page_id_t pid, std::string_view key,
-                                   page_id_t redo) {
+StatusOr<lsn_t> Transaction::InsertBranchLog(page_id_t pid,
+                                             std::string_view key,
+                                             page_id_t redo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::InsertingBranchLogRecord(prev_lsn_, txn_id_, pid, key, redo));
-}
-
-lsn_t Transaction::UpdateLog(page_id_t pid, slot_t slot, std::string_view redo,
-                             std::string_view undo) {
-  assert(!IsFinished());
-  return AppendLog(LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
+  return AppendLog(
+      LogRecord::InsertingBranchLogRecord(prev_lsn_, txn_id_, pid, key, redo));
 }
 
-lsn_t Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
-                                 std::string_view redo, std::string_view undo) {
+StatusOr<lsn_t> Transaction::UpdateLog(page_id_t pid, slot_t slot,
+                                       std::string_view redo,
+                                       std::string_view undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::UpdatingLeafLogRecord( prev_lsn_, txn_id_, pid, key, redo, undo));
+  return AppendLog(
+      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
 }
 
-lsn_t Transaction::UpdateBranchLog(page_id_t pid, std::string_view key,
-                                   page_id_t redo, page_id_t undo) {
+StatusOr<lsn_t> Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
+                                           std::string_view redo,
+                                           std::string_view undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::UpdatingBranchLogRecord( prev_lsn_, txn_id_, pid, key, redo, undo));
+  return AppendLog(LogRecord::UpdatingLeafLogRecord(prev_lsn_, txn_id_, pid,
+                                                    key, redo, undo));
 }
 
-lsn_t Transaction::DeleteLog(page_id_t pid, slot_t slot,
-                             std::string_view undo) {
+StatusOr<lsn_t> Transaction::UpdateBranchLog(page_id_t pid,
+                                             std::string_view key,
+                                             page_id_t redo, page_id_t undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, slot, undo));
+  return AppendLog(LogRecord::UpdatingBranchLogRecord(prev_lsn_, txn_id_, pid,
+                                                      key, redo, undo));
 }
 
-lsn_t Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
-                                 std::string_view undo) {
+StatusOr<lsn_t> Transaction::DeleteLog(page_id_t pid, slot_t slot,
+                                       std::string_view undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::DeletingLeafLogRecord(prev_lsn_, txn_id_, pid, key, undo));
+  return AppendLog(
+      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, slot, undo));
 }
 
-lsn_t Transaction::DeleteBranchLog(page_id_t pid, std::string_view key,
-                                   page_id_t undo) {
+StatusOr<lsn_t> Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
+                                           std::string_view undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::DeletingBranchLogRecord(prev_lsn_, txn_id_, pid, key, undo));
+  return AppendLog(
+      LogRecord::DeletingLeafLogRecord(prev_lsn_, txn_id_, pid, key, undo));
 }
 
-lsn_t Transaction::SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo) {
+StatusOr<lsn_t> Transaction::DeleteBranchLog(page_id_t pid,
+                                             std::string_view key,
+                                             page_id_t undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
+  return AppendLog(
+      LogRecord::DeletingBranchLogRecord(prev_lsn_, txn_id_, pid, key, undo));
 }
 
-lsn_t Transaction::SetLowFence(page_id_t pid, const IndexKey& redo,
-                               const IndexKey& undo) {
+StatusOr<lsn_t> Transaction::SetLowestLog(page_id_t pid, page_id_t redo,
+                                          page_id_t undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::SetLowFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
+  return AppendLog(
+      LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
-lsn_t Transaction::SetHighFence(page_id_t pid, const IndexKey& redo,
-                                const IndexKey& undo) {
+StatusOr<lsn_t> Transaction::SetLowFence(page_id_t pid, const IndexKey& redo,
+                                         const IndexKey& undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::SetHighFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
+  return AppendLog(
+      LogRecord::SetLowFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
-lsn_t Transaction::SetFoster(page_id_t pid, const FosterPair& redo,
-                             const FosterPair& undo) {
+StatusOr<lsn_t> Transaction::SetHighFence(page_id_t pid, const IndexKey& redo,
+                                          const IndexKey& undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::SetFosterLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
+  return AppendLog(
+      LogRecord::SetHighFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
-lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
-                                   PageType new_page_type) {
+StatusOr<lsn_t> Transaction::SetFoster(page_id_t pid, const FosterPair& redo,
+                                       const FosterPair& undo) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::AllocatePageLogRecord( prev_lsn_, txn_id_, allocated_page_id, new_page_type));
+  return AppendLog(
+      LogRecord::SetFosterLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
-lsn_t Transaction::DestroyPageLog(page_id_t destroyed_page_id,
-                                  PageType old_page_type,
-                                  std::string old_page_body) {
+StatusOr<lsn_t> Transaction::AllocatePageLog(page_id_t allocated_page_id,
+                                             PageType new_page_type) {
   assert(!IsFinished());
-  return AppendLog(LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id, old_page_type, std::move(old_page_body)));
+  return AppendLog(LogRecord::AllocatePageLogRecord(
+      prev_lsn_, txn_id_, allocated_page_id, new_page_type));
+}
+
+StatusOr<lsn_t> Transaction::DestroyPageLog(page_id_t destroyed_page_id,
+                                            PageType old_page_type,
+                                            std::string old_page_body) {
+  assert(!IsFinished());
+  return AppendLog(
+      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id,
+                                      old_page_type, std::move(old_page_body)));
 }
 
 // Using this function is discouraged to get performance of flush pipelining.

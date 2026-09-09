@@ -168,17 +168,17 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 - [ ] Transaction commit and catalog sync for CTAS
 
 #### 2.3 Explicit `CREATE TABLE` DDL
-- [ ] Parse explicit column definitions (`column_name TYPE [NOT NULL] [DEFAULT expr]`)
-- [ ] Support all scalar column types (`INT64`, `DOUBLE`, `STRING`, `BOOL`, `DATE`, `TIMESTAMP`)
-- [ ] Support primary key column annotations (`PRIMARY KEY`)
-- [ ] Create table metadata in system catalog
+- [x] Parse explicit column definitions (`column_name TYPE [NOT NULL] [DEFAULT expr]`)
+- [x] Support all scalar column types (`INT64`, `DOUBLE`, `STRING`, `BOOL`, `DATE`, `TIMESTAMP`)
+- [x] Support primary key column annotations (`PRIMARY KEY`)
+- [x] Create table metadata in system catalog
 
 #### 2.4 DML Statements (`INSERT`, `UPDATE`, `DELETE`)
-- [ ] Multi-row bulk `INSERT INTO table VALUES (...), (...), ...`
-- [ ] `INSERT INTO table (col1, col2) VALUES (...)` with column reordering
-- [ ] `INSERT INTO table SELECT ...` (insert from query)
-- [ ] `UPDATE table SET col = expr WHERE condition`
-- [ ] `DELETE FROM table WHERE condition`
+- [x] Multi-row bulk `INSERT INTO table VALUES (...), (...), ...`
+- [x] `INSERT INTO table (col1, col2) VALUES (...)` with column reordering
+- [x] `INSERT INTO table SELECT ...` (insert from query)
+- [x] `UPDATE table SET col = expr WHERE condition`
+- [x] `DELETE FROM table WHERE condition`
 - [ ] DML `RETURNING` clause support (`INSERT/UPDATE/DELETE ... RETURNING col1, col2`)
 
 ---

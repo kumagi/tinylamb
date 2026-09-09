@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common/set_operation.hpp"
+#include "common/status_or.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -115,22 +116,25 @@ bool IsStructuralCallArg(std::string_view func, size_t index) {
   return false;
 }
 
-Expression BindExpression(const Expression& expression,
-                          const std::vector<Value>& parameters, size_t* index);
+StatusOr<Expression> BindExpression(const Expression& expression,
+                                    const std::vector<Value>& parameters,
+                                    size_t* index);
 
-NamedExpression BindNamed(
+StatusOr<NamedExpression> BindNamed(
     const NamedExpression&
         item,  // NOLINT(misc-no-recursion) // Recursive expression-tree binding
                // by design; trees are parser-bounded in depth.
     const std::vector<Value>& parameters, size_t* index) {
-  return {item.name, BindExpression(item.expression, parameters, index)};
+  ASSIGN_OR_RETURN(Expression, bound_expr,
+                   (BindExpression(item.expression, parameters, index)));
+  return NamedExpression{item.name, std::move(bound_expr)};
 }
 
-std::shared_ptr<SelectStatement> BindSelect(
+StatusOr<std::shared_ptr<SelectStatement>> BindSelect(
     const SelectStatement& select, const std::vector<Value>& parameters,
     size_t* index);
 
-Expression BindExpression(
+StatusOr<Expression> BindExpression(
     const Expression&
         expression,  // NOLINT(misc-no-recursion) // Recursive expression-tree
                      // binding by design; trees are parser-bounded in depth.
@@ -145,7 +149,8 @@ Expression BindExpression(
         return expression;
       }
       if (*index >= parameters.size()) {
-        throw std::runtime_error("SQL template parameter underflow");
+        return Status(Status::kInvalidArgument,
+                      "SQL template parameter underflow");
       }
       Value parameter = parameters[(*index)++];
       // The extractor reads `date '...'` from the SQL text as a bare string and
@@ -163,9 +168,9 @@ Expression BindExpression(
       // back to parsing the statement verbatim.
       if (current.type == ValueType::kVarChar &&
           parameter.type == ValueType::kDate) {
-        throw std::runtime_error(
-            "SQL template literal type mismatch: date "
-            "literal bound into a string slot");
+        return Status(Status::kInvalidArgument,
+                      "SQL template literal type mismatch: date "
+                      "literal bound into a string slot");
       }
       return ConstantValueExp(parameter);
     }
@@ -173,43 +178,54 @@ Expression BindExpression(
       return ColumnValueExp(expression->AsColumnValue().GetColumnName());
     case TypeTag::kBinaryExp: {
       const auto& binary = expression->AsBinaryExpression();
-      Expression left = BindExpression(binary.Left(), parameters, index);
-      Expression right = BindExpression(binary.Right(), parameters, index);
+      ASSIGN_OR_RETURN(Expression, left,
+                       (BindExpression(binary.Left(), parameters, index)));
+      ASSIGN_OR_RETURN(Expression, right,
+                       (BindExpression(binary.Right(), parameters, index)));
       return BinaryExpressionExp(std::move(left), binary.Op(),
                                  std::move(right));
     }
     case TypeTag::kUnaryExp: {
       const auto& unary = expression->AsUnaryExpression();
-      return UnaryExpressionExp(
-          BindExpression(unary.Child(), parameters, index), unary.Op());
+      ASSIGN_OR_RETURN(Expression, h_child,
+                       (BindExpression(unary.Child(), parameters, index)));
+      return UnaryExpressionExp(std::move(h_child), unary.Op());
     }
     case TypeTag::kAggregateExp: {
       const auto& aggregate = expression->AsAggregateExpression();
-      return AggregateExpressionExp(
-          aggregate.GetType(),
-          BindExpression(aggregate.Child(), parameters, index),
-          aggregate.Distinct());
+      ASSIGN_OR_RETURN(Expression, h_agg,
+                       (BindExpression(aggregate.Child(), parameters, index)));
+      return AggregateExpressionExp(aggregate.GetType(), std::move(h_agg),
+                                    aggregate.Distinct());
     }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
       std::vector<std::pair<Expression, Expression>> clauses;
       clauses.reserve(searched.when_clauses_.size());
       for (const auto& clause : searched.when_clauses_) {
-        Expression when = BindExpression(clause.first, parameters, index);
-        Expression then = BindExpression(clause.second, parameters, index);
+        ASSIGN_OR_RETURN(Expression, hv7531_0,
+                         (BindExpression(clause.first, parameters, index)));
+        Expression when = std::move(hv7531_0);
+        ASSIGN_OR_RETURN(Expression, hv7606_0,
+                         (BindExpression(clause.second, parameters, index)));
+        Expression then = std::move(hv7606_0);
         clauses.emplace_back(std::move(when), std::move(then));
       }
-      return CaseExpressionExp(
-          std::move(clauses),
-          BindExpression(searched.else_clause_, parameters, index));
+      ASSIGN_OR_RETURN(
+          Expression, h_else,
+          (BindExpression(searched.else_clause_, parameters, index)));
+      return CaseExpressionExp(std::move(clauses), std::move(h_else));
     }
     case TypeTag::kInExp: {
       const auto& in = expression->AsInExpression();
-      Expression child = BindExpression(in.child_, parameters, index);
+      ASSIGN_OR_RETURN(Expression, child,
+                       (BindExpression(in.child_, parameters, index)));
       std::vector<Expression> list;
       list.reserve(in.list_.size());
       for (const Expression& item : in.list_) {
-        list.push_back(BindExpression(item, parameters, index));
+        ASSIGN_OR_RETURN(Expression, hv8164_0,
+                         (BindExpression(item, parameters, index)));
+        list.push_back(std::move(hv8164_0));
       }
       return InExpressionExp(std::move(child), std::move(list));
     }
@@ -222,7 +238,9 @@ Expression BindExpression(
         if (IsStructuralCallArg(func, i)) {
           args.push_back(call.Args()[i]);
         } else {
-          args.push_back(BindExpression(call.Args()[i], parameters, index));
+          ASSIGN_OR_RETURN(Expression, h_arg,
+                           (BindExpression(call.Args()[i], parameters, index)));
+          args.push_back(std::move(h_arg));
         }
       }
       return FunctionCallExp(call.FuncName(), std::move(args));
@@ -232,7 +250,9 @@ Expression BindExpression(
       std::vector<Expression> elements;
       elements.reserve(array.Elements().size());
       for (const Expression& element : array.Elements()) {
-        elements.push_back(BindExpression(element, parameters, index));
+        ASSIGN_OR_RETURN(Expression, hv9098_0,
+                         (BindExpression(element, parameters, index)));
+        elements.push_back(std::move(hv9098_0));
       }
       return ArrayExpressionExp(std::move(elements), array.ElementSqlType());
     }
@@ -240,8 +260,10 @@ Expression BindExpression(
       const auto& query = expression->AsQueryExpression();
       // Text order inside "test IN (SELECT ...)": the tested expression comes
       // first, the subquery body afterwards.
-      Expression test = BindExpression(query.Test(), parameters, index);
-      auto subquery = BindSelect(*query.Query(), parameters, index);
+      ASSIGN_OR_RETURN(Expression, test,
+                       (BindExpression(query.Test(), parameters, index)));
+      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, subquery,
+                       (BindSelect(*query.Query(), parameters, index)));
       auto bound = std::make_shared<QueryExpression>(
           std::move(subquery), std::move(test), query.Exists(),
           query.Negated());
@@ -255,7 +277,8 @@ Expression BindExpression(
     }
     case TypeTag::kCastExp: {
       const auto& cast = expression->AsCastExpression();
-      Expression child = BindExpression(cast.Child(), parameters, index);
+      ASSIGN_OR_RETURN(Expression, child,
+                       (BindExpression(cast.Child(), parameters, index)));
       return std::make_shared<CastExpression>(
           std::move(child), cast.TargetTypeName(), cast.ReturnNullOnError());
     }
@@ -269,16 +292,22 @@ Expression BindExpression(
 }
 
 // Binding must consume parameters in SQL text order -- the order
-// ExtractSqlTemplate emits them: WITH -> SELECT list -> FROM/JOIN conditions
-// -> WHERE -> GROUP BY -> HAVING -> ORDER BY.  Binding clauses in any other
-// order silently swaps parameters between clauses of same-fingerprint
-// statements (improvements2.md §7.1).
+// ExtractSqlTemplate emits them: WITH -> DISTINCT ON keys -> SELECT list ->
+// FROM/JOIN conditions -> WHERE -> GROUP BY -> HAVING -> QUALIFY -> ORDER BY
+// -> UNION ALL branches.  Binding clauses in any other order silently swaps
+// parameters between clauses of same-fingerprint statements
+// (improvements2.md §7.1).
 bool ContainsBindableConstant(const Expression& expression);
 
 bool SelectHasBindableConstant(
     const SelectStatement&
         select) {  // NOLINT(misc-no-recursion) // Recursive statement-tree scan
                    // by design; trees are parser-bounded in depth.
+  for (const Expression& key : select.DistinctOn()) {
+    if (ContainsBindableConstant(key)) {
+      return true;
+    }
+  }
   for (const NamedExpression& item : select.SelectList()) {
     if (ContainsBindableConstant(item.expression)) {
       return true;
@@ -293,6 +322,9 @@ bool SelectHasBindableConstant(
     }
   }
   if (ContainsBindableConstant(select.Having())) {
+    return true;
+  }
+  if (ContainsBindableConstant(select.Qualify())) {
     return true;
   }
   for (const auto& term : select.OrderBy()) {
@@ -386,7 +418,7 @@ bool ContainsBindableConstant(
   }
 }
 
-std::shared_ptr<SelectStatement>
+StatusOr<std::shared_ptr<SelectStatement>>
 BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
              // design; trees are parser-bounded in depth.
     const SelectStatement& select, const std::vector<Value>& parameters,
@@ -402,8 +434,8 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     for (const auto& [name, query] : select.WithQueries()) {
       (void)name;
       if (SelectHasBindableConstant(*query)) {
-        throw std::runtime_error(
-            "SQL template cannot recover WITH declaration order");
+        return Status(Status::kInvalidArgument,
+                      "SQL template cannot recover WITH declaration order");
       }
     }
   }
@@ -417,16 +449,33 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     }
     std::ranges::sort(names);
     for (const std::string& name : names) {
-      auto bound =
-          BindSelect(*select.WithQueries().at(name), parameters, index);
+      ASSIGN_OR_RETURN(
+          std::shared_ptr<SelectStatement>, hv16241_0,
+          (BindSelect(*select.WithQueries().at(name), parameters, index)));
+      auto bound = std::move(hv16241_0);
       withs.emplace_back(name, std::move(bound));
+    }
+  }
+
+  std::vector<Expression> bound_distinct_on;
+  if (select.HasDistinctOn()) {
+    // DISTINCT ON keys sit immediately after SELECT in the SQL text -- before
+    // the select list -- so bind them first to keep parameter consumption in
+    // text order (ExtractSqlTemplate emits strictly left-to-right).
+    bound_distinct_on.reserve(select.DistinctOn().size());
+    for (const Expression& item : select.DistinctOn()) {
+      ASSIGN_OR_RETURN(Expression, hv18863_0,
+                       (BindExpression(item, parameters, index)));
+      bound_distinct_on.push_back(std::move(hv18863_0));
     }
   }
 
   std::vector<NamedExpression> items;
   items.reserve(select.SelectList().size());
   for (const NamedExpression& item : select.SelectList()) {
-    items.push_back(BindNamed(item, parameters, index));
+    ASSIGN_OR_RETURN(NamedExpression, hv16537_0,
+                     (BindNamed(item, parameters, index)));
+    items.push_back(std::move(hv16537_0));
   }
 
   std::vector<SelectSource> sources;
@@ -434,31 +483,50 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
   for (const SelectSource& source : select.Sources()) {
     SelectSource copied = source;
     if (source.query) {
-      copied.query = BindSelect(*source.query, parameters, index);
+      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv16794_0,
+                       (BindSelect(*source.query, parameters, index)));
+      copied.query = std::move(hv16794_0);
     }
-    copied.join_condition =
-        BindExpression(source.join_condition, parameters, index);
+    ASSIGN_OR_RETURN(
+        Expression, hv16867_0,
+        (BindExpression(source.join_condition, parameters, index)));
+    copied.join_condition = std::move(hv16867_0);
     sources.push_back(std::move(copied));
   }
-
-  Expression where = BindExpression(select.WhereClause(), parameters, index);
+  ASSIGN_OR_RETURN(Expression, hv17007_0,
+                   (BindExpression(select.WhereClause(), parameters, index)));
+  Expression where = std::move(hv17007_0);
 
   std::vector<Expression> group;
   group.reserve(select.GroupBy().size());
   for (const Expression& item : select.GroupBy()) {
-    group.push_back(BindExpression(item, parameters, index));
+    ASSIGN_OR_RETURN(Expression, hv17214_0,
+                     (BindExpression(item, parameters, index)));
+    group.push_back(std::move(hv17214_0));
   }
 
   Expression having;
   if (select.Having()) {
-    having = BindExpression(select.Having(), parameters, index);
+    ASSIGN_OR_RETURN(Expression, hv17327_0,
+                     (BindExpression(select.Having(), parameters, index)));
+    having = std::move(hv17327_0);
+  }
+
+  // QUALIFY precedes ORDER BY in the SQL text (SELECT ... [QUALIFY ...]
+  // [ORDER BY ...]), so bind it before the ORDER BY terms.
+  Expression bound_qualify;
+  if (select.Qualify()) {
+    ASSIGN_OR_RETURN(Expression, hv18599_0,
+                     (BindExpression(select.Qualify(), parameters, index)));
+    bound_qualify = std::move(hv18599_0);
   }
 
   std::vector<SelectStatement::OrderByTerm> order;
   order.reserve(select.OrderBy().size());
   for (const auto& term : select.OrderBy()) {
-    order.push_back({BindExpression(term.expression, parameters, index),
-                     term.ascending, term.nulls_first});
+    ASSIGN_OR_RETURN(Expression, hv17536_0,
+                     (BindExpression(term.expression, parameters, index)));
+    order.push_back({std::move(hv17536_0), term.ascending, term.nulls_first});
   }
 
   auto result = std::make_shared<SelectStatement>(
@@ -480,16 +548,11 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
   if (having) {
     result->SetHaving(std::move(having));
   }
-  if (select.Qualify()) {
-    result->SetQualify(BindExpression(select.Qualify(), parameters, index));
+  if (bound_qualify) {
+    result->SetQualify(std::move(bound_qualify));
   }
-  if (select.HasDistinctOn()) {
-    std::vector<Expression> distinct_on;
-    distinct_on.reserve(select.DistinctOn().size());
-    for (const Expression& item : select.DistinctOn()) {
-      distinct_on.push_back(BindExpression(item, parameters, index));
-    }
-    result->SetDistinctOn(std::move(distinct_on));
+  if (!bound_distinct_on.empty()) {
+    result->SetDistinctOn(std::move(bound_distinct_on));
   }
   result->SetWithTies(select.WithTies());
   result->SetAsStruct(select.AsStruct());
@@ -505,19 +568,24 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     const SetOperationMatch match = branch_index < select.Matches().size()
                                         ? select.Matches()[branch_index]
                                         : SetOperationMatch{};
-    result->AddSetOperation(
-        kind, BindSelect(*select.UnionAll()[branch_index], parameters, index),
-        match);
+    ASSIGN_OR_RETURN(
+        std::shared_ptr<SelectStatement>, hv19796_0,
+        (BindSelect(*select.UnionAll()[branch_index], parameters, index)));
+    result->AddSetOperation(kind, std::move(hv19796_0), match);
   }
   if (select.GetSetOperationTree() != nullptr) {
     auto tree = std::make_shared<SetOperationTree>();
-    tree->first =
-        BindSelect(*select.GetSetOperationTree()->first, parameters, index);
+    ASSIGN_OR_RETURN(
+        std::shared_ptr<SelectStatement>, hv20027_0,
+        (BindSelect(*select.GetSetOperationTree()->first, parameters, index)));
+    tree->first = std::move(hv20027_0);
     tree->kinds = select.GetSetOperationTree()->kinds;
     tree->grouped = select.GetSetOperationTree()->grouped;
     tree->branches.reserve(select.GetSetOperationTree()->branches.size());
     for (const auto& branch : select.GetSetOperationTree()->branches) {
-      tree->branches.push_back(BindSelect(*branch, parameters, index));
+      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv20383_0,
+                       (BindSelect(*branch, parameters, index)));
+      tree->branches.push_back(std::move(hv20383_0));
     }
     result->SetSetOperationTree(std::move(tree));
   }
@@ -525,7 +593,17 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     result->MarkUnionDistinct(select.UnionByName());
   }
   for (auto& [name, query] : withs) {
-    result->AddWithQuery(name, std::move(query));
+    // WITH RECURSIVE markers and depth specs must survive a re-bind, or a
+    // template-cache hit replays a recursive CTE as a plain one (the
+    // executor's work-table route and the depth column both disappear).
+    if (select.IsRecursiveWith(name)) {
+      result->AddRecursiveWithQuery(name, std::move(query));
+    } else {
+      result->AddWithQuery(name, std::move(query));
+    }
+    if (const RecursiveDepthSpec* depth = select.RecursiveDepthOf(name)) {
+      result->SetRecursiveDepth(name, *depth);
+    }
   }
   if (select.RequiresRelationalEvaluation()) {
     result->MarkComplex();
@@ -641,9 +719,39 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         ++i;
       }
       // Decode through the visitor's single escape table so the extracted
-      // parameter equals the constant the first parse produced.
-      const std::string literal =
-          DecodeStringEscapes(raw_literal, false, false, '\'');
+      // parameter equals the constant the first parse produced.  A b/B
+      // prefix (up to two r/B letters, like the visitor's own
+      // DecodeSingleComponent) marks a bytes literal: decoding it as text
+      // would UTF-8-encode its high bytes, so a cache replay bound a
+      // different constant than the first parse evaluated.
+      bool is_raw_prefix = false;
+      bool is_bytes_prefix = false;
+      size_t prefix_end = quote_pos;
+      for (int taken = 0; taken < 2 && 0 < prefix_end; ++taken) {
+        const char p = sql[prefix_end - 1];
+        if (p == 'b' || p == 'B') {
+          is_bytes_prefix = true;
+          --prefix_end;
+        } else if (p == 'r' || p == 'R') {
+          is_raw_prefix = true;
+          --prefix_end;
+        } else {
+          break;
+        }
+      }
+      if (0 < prefix_end) {
+        const char before = sql[prefix_end - 1];
+        if (std::isalnum(static_cast<unsigned char>(before)) != 0 ||
+            before == '_') {
+          // The letters belong to a longer identifier, not a literal prefix.
+          is_bytes_prefix = false;
+          is_raw_prefix = false;
+        }
+      }
+      std::string literal =
+          is_raw_prefix
+              ? raw_literal
+              : DecodeStringEscapes(raw_literal, is_bytes_prefix, false, '\'');
       // PRODUCTION FIX (Q3): a TIMESTAMP '...' literal is UTC-normalized by
       // the visitor on the first parse, but the template/plan caches replayed
       // the RAW string parameter on later runs, so the same SQL returned a
@@ -814,14 +922,16 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
   return result;
 }
 
-std::unique_ptr<Statement> BindStatementLiterals(
+StatusOr<std::unique_ptr<Statement>> BindStatementLiterals(
     const Statement& statement, const std::vector<Value>& parameters) {
   size_t index = 0;
   std::unique_ptr<Statement> bound;
   switch (statement.Type()) {
     case StatementType::kSelect: {
-      auto select = BindSelect(dynamic_cast<const SelectStatement&>(statement),
-                               parameters, &index);
+      ASSIGN_OR_RETURN(
+          std::shared_ptr<SelectStatement>, select,
+          (BindSelect(dynamic_cast<const SelectStatement&>(statement),
+                      parameters, &index)));
       bound = std::make_unique<SelectStatement>(std::move(*select));
       break;
     }
@@ -833,7 +943,9 @@ std::unique_ptr<Statement> BindStatementLiterals(
         std::vector<Expression> values;
         values.reserve(row.size());
         for (const Expression& value : row) {
-          values.push_back(BindExpression(value, parameters, &index));
+          ASSIGN_OR_RETURN(Expression, hv33047_0,
+                           (BindExpression(value, parameters, &index)));
+          values.push_back(std::move(hv33047_0));
         }
         rows.push_back(std::move(values));
       }
@@ -853,33 +965,80 @@ std::unique_ptr<Statement> BindStatementLiterals(
       std::vector<std::pair<ColumnName, Expression>> assignments;
       assignments.reserve(update.SetClause().size());
       for (const auto& assignment : update.SetClause()) {
-        assignments.emplace_back(
-            assignment.first,
-            BindExpression(assignment.second, parameters, &index));
+        ASSIGN_OR_RETURN(
+            Expression, hv34015_0,
+            (BindExpression(assignment.second, parameters, &index)));
+        assignments.emplace_back(assignment.first, std::move(hv34015_0));
       }
+      ASSIGN_OR_RETURN(
+          Expression, h_where,
+          (BindExpression(update.WhereClause(), parameters, &index)));
       auto bound_update = std::make_unique<UpdateStatement>(
-          update.TableName(), std::move(assignments),
-          BindExpression(update.WhereClause(), parameters, &index));
+          update.TableName(), std::move(assignments), std::move(h_where));
       bound_update->SetAssertRowsModified(update.AssertRowsModified());
+      // "UPDATE tbl AS alias" makes bare alias references denote the whole
+      // row; dropping the alias changed name resolution on a cache replay.
+      bound_update->SetAlias(update.Alias());
+      // Nested per-row array DML carries expressions that may hold bound
+      // constants; rebind them like the SET/WHERE expressions above.
+      if (update.HasNestedDml()) {
+        std::vector<NestedDmlItem> items;
+        items.reserve(update.NestedItems().size());
+        for (const NestedDmlItem& item : update.NestedItems()) {
+          NestedDmlItem bound_item = item;
+          if (bound_item.predicate) {
+            ASSIGN_OR_RETURN(
+                Expression, hv35028_0,
+                (BindExpression(bound_item.predicate, parameters, &index)));
+            bound_item.predicate = std::move(hv35028_0);
+          }
+          if (bound_item.set_value) {
+            ASSIGN_OR_RETURN(
+                Expression, hv35187_0,
+                (BindExpression(bound_item.set_value, parameters, &index)));
+            bound_item.set_value = std::move(hv35187_0);
+          }
+          for (auto& row : bound_item.insert_values) {
+            for (Expression& value : row) {
+              ASSIGN_OR_RETURN(Expression, hv35407_0,
+                               (BindExpression(value, parameters, &index)));
+              value = std::move(hv35407_0);
+            }
+          }
+          if (bound_item.insert_query) {
+            ASSIGN_OR_RETURN(
+                std::shared_ptr<SelectStatement>, hv35539_0,
+                (BindSelect(*bound_item.insert_query, parameters, &index)));
+            bound_item.insert_query = std::move(hv35539_0);
+          }
+          items.push_back(std::move(bound_item));
+        }
+        bound_update->SetNestedItems(std::move(items));
+      }
       bound = std::move(bound_update);
       break;
     }
     case StatementType::kDelete: {
       const auto& remove = dynamic_cast<const DeleteStatement&>(statement);
-      auto bound_delete = std::make_unique<DeleteStatement>(
-          remove.TableName(),
-          BindExpression(remove.WhereClause(), parameters, &index));
+      ASSIGN_OR_RETURN(
+          Expression, h_where,
+          (BindExpression(remove.WhereClause(), parameters, &index)));
+      auto bound_delete = std::make_unique<DeleteStatement>(remove.TableName(),
+                                                            std::move(h_where));
       bound_delete->SetAssertRowsModified(remove.AssertRowsModified());
+      // See the UPDATE branch: the whole-row alias must survive a re-bind.
+      bound_delete->SetAlias(remove.Alias());
       bound = std::move(bound_delete);
       break;
     }
     case StatementType::kCreateTable:
     case StatementType::kDropTable:
     case StatementType::kAnalyze:
-      throw std::runtime_error("SQL template does not bind DDL");
+      return Status(Status::kInvalidArgument, "SQL template does not bind DDL");
   }
   if (index != parameters.size()) {
-    throw std::runtime_error("SQL template parameter count mismatch");
+    return Status(Status::kInvalidArgument,
+                  "SQL template parameter count mismatch");
   }
   return bound;
 }

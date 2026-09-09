@@ -19,7 +19,9 @@
 
 #include <iosfwd>
 #include <memory>
+#include <utility>
 
+#include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
 
 namespace tinylamb {
@@ -43,6 +45,35 @@ class ExecutorBase {
     e.Dump(o, 0);
     return o;
   }
+
+  // Sticky execution error. Next()/NextBatch() return false/0 both at EOF
+  // and on failure; callers must inspect GetStatus() after exhaustion to
+  // tell the two apart. The first recorded error wins (ARIES-style
+  // fail-fast cursor semantics).
+  [[nodiscard]] Status GetStatus() const { return status_; }
+  [[nodiscard]] bool ok() const { return status_ == Status::kSuccess; }
+
+ protected:
+  // Records the first error; returns false so callers can write
+  // `return FailWith(...)` inside Next().
+  bool FailWith(Status status) const {
+    if (status_ == Status::kSuccess) {
+      status_ = std::move(status);
+    }
+    return false;
+  }
+  // Copies a child's sticky error when the child stops without one of its
+  // own rows; returns true if a failure was forwarded (caller returns
+  // false).
+  bool FailWithChildOf(const ExecutorBase& child) const {
+    if (child.GetStatus() != Status::kSuccess) {
+      return FailWith(child.GetStatus());
+    }
+    return false;
+  }
+
+ private:
+  mutable Status status_{Status::kSuccess};
 };
 
 using Executor = std::shared_ptr<ExecutorBase>;

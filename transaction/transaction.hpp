@@ -185,46 +185,50 @@ class Transaction final {
   }
 
   Status PreCommit();
-  void Abort();
+  Status Abort();
 
   // Appends `lr` to the WAL, links it into this transaction's prev_lsn
   // chain, and records the record's END LSN for page stamping.  Returns the
   // record's start LSN (the chain pointer).
-  lsn_t AppendLog(const LogRecord& lr);
+  StatusOr<lsn_t> AppendLog(const LogRecord& lr);
 
   // Log the action. Returns LSN.
-  lsn_t InsertLog(page_id_t pid, slot_t slot, std::string_view redo);
-  lsn_t InsertLeafLog(page_id_t pid, std::string_view key,
-                      std::string_view redo);
-  lsn_t InsertBranchLog(page_id_t pid, std::string_view key, page_id_t redo);
+  StatusOr<lsn_t> InsertLog(page_id_t pid, slot_t slot, std::string_view redo);
+  StatusOr<lsn_t> InsertLeafLog(page_id_t pid, std::string_view key,
+                                std::string_view redo);
+  StatusOr<lsn_t> InsertBranchLog(page_id_t pid, std::string_view key,
+                                  page_id_t redo);
 
-  lsn_t UpdateLog(page_id_t pid, slot_t slot, std::string_view redo,
-                  std::string_view undo);
-  lsn_t UpdateLeafLog(page_id_t pid, std::string_view key,
-                      std::string_view redo, std::string_view undo);
-  lsn_t UpdateBranchLog(page_id_t pid, std::string_view key, page_id_t redo,
-                        page_id_t undo);
+  StatusOr<lsn_t> UpdateLog(page_id_t pid, slot_t slot, std::string_view redo,
+                            std::string_view undo);
+  StatusOr<lsn_t> UpdateLeafLog(page_id_t pid, std::string_view key,
+                                std::string_view redo, std::string_view undo);
+  StatusOr<lsn_t> UpdateBranchLog(page_id_t pid, std::string_view key,
+                                  page_id_t redo, page_id_t undo);
 
-  lsn_t DeleteLog(page_id_t pid, slot_t slot, std::string_view undo);
-  lsn_t DeleteLeafLog(page_id_t pid, std::string_view key,
-                      std::string_view undo);
-  lsn_t DeleteBranchLog(page_id_t pid, std::string_view key, page_id_t undo);
+  StatusOr<lsn_t> DeleteLog(page_id_t pid, slot_t slot, std::string_view undo);
+  StatusOr<lsn_t> DeleteLeafLog(page_id_t pid, std::string_view key,
+                                std::string_view undo);
+  StatusOr<lsn_t> DeleteBranchLog(page_id_t pid, std::string_view key,
+                                  page_id_t undo);
 
-  lsn_t SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo);
+  StatusOr<lsn_t> SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo);
 
-  lsn_t SetLowFence(page_id_t pid, const IndexKey& redo, const IndexKey& undo);
-  lsn_t SetHighFence(page_id_t pid, const IndexKey& redo, const IndexKey& undo);
-  lsn_t SetFoster(page_id_t pid, const FosterPair& redo,
-                  const FosterPair& undo);
+  StatusOr<lsn_t> SetLowFence(page_id_t pid, const IndexKey& redo,
+                              const IndexKey& undo);
+  StatusOr<lsn_t> SetHighFence(page_id_t pid, const IndexKey& redo,
+                               const IndexKey& undo);
+  StatusOr<lsn_t> SetFoster(page_id_t pid, const FosterPair& redo,
+                            const FosterPair& undo);
 
-  lsn_t AllocatePageLog(page_id_t page_id, PageType new_page_type);
+  StatusOr<lsn_t> AllocatePageLog(page_id_t page_id, PageType new_page_type);
 
   // D3 (docs/design.md): destroy records carry the old page type and, when
   // the page held rows, a full body image so undo restores an aborted
   // destroy exactly.
-  lsn_t DestroyPageLog(page_id_t page_id,
-                       PageType old_page_type = PageType::kUnknown,
-                       std::string old_page_body = {});
+  StatusOr<lsn_t> DestroyPageLog(page_id_t page_id,
+                                 PageType old_page_type = PageType::kUnknown,
+                                 std::string old_page_body = {});
 
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.

@@ -323,12 +323,11 @@ size_t SpillPartitionOf(int64_t key, size_t partitions) {
 // EVERY spilled partition -- spilled rows are never dropped or double-counted
 // against the resident portion alone.  Over-budget partitions spill further;
 // nothing is silently lost.
-Relation HybridHashJoin(Relation left, Relation right,
-                        const std::vector<slot_t>& left_columns,
-                        const std::vector<slot_t>& right_columns,
-                        const std::function<bool(const Row&)>& matches,
-                        bool left_join, size_t* join_comparisons,
-                        bool null_safe, bool right_join) {
+StatusOr<Relation> HybridHashJoin(
+    Relation left, Relation right, const std::vector<slot_t>& left_columns,
+    const std::vector<slot_t>& right_columns,
+    const std::function<bool(const Row&)>& matches, bool left_join,
+    size_t* join_comparisons, bool null_safe, bool right_join) {
   size_t build_estimate = 0;
   if (right.HasSpill()) {
     build_estimate = right.TotalRows() * 128;
@@ -522,7 +521,8 @@ Relation HybridHashJoin(Relation left, Relation right,
     if (left_parts[part].Empty() && right_parts[part].Empty()) {
       continue;
     }
-    std::vector<Row> right_rows = right_parts[part].ReadAllRows();
+    ASSIGN_OR_RETURN(std::vector<Row>, right_rows,
+                     (right_parts[part].ReadAllRows()));
     QueryMemoryCharge part_charge;
     for (const Row& row : right_rows) {
       part_charge.Add(EstimateRowBytes(row));
@@ -613,9 +613,9 @@ bool ShouldHybridJoin(const Relation& left, const Relation& right) {
   return PreferHybridHashJoin(estimate);
 }
 
-Relation Join(TransactionContext& context, Relation left, Relation right,
-              const SelectSource& source, const Scope* outer,
-              const CteMap& ctes) {
+StatusOr<Relation> Join(TransactionContext& context, Relation left,
+                        Relation right, const SelectSource& source,
+                        const Scope* outer, const CteMap& ctes) {
   const auto join_begin = std::chrono::steady_clock::now();
   Relation result(context.execution_runtime());
   result.schema = left.schema + right.schema;
@@ -651,7 +651,8 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
   // inputs are materialized up front (the relational join is the fallback
   // path, so this keeps semantics without touching the hybrid operator).
   if (want_right_nulls && right.HasSpill()) {
-    right = MaterializeRelation(right);
+    ASSIGN_OR_RETURN(Relation, materialized_right, MaterializeRelation(right));
+    right = std::move(materialized_right);
   }
   right.FinishSpill();
   const Row* right_base = right.rows.empty() ? nullptr : right.rows.data();
@@ -671,13 +672,23 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       EqualityKeys(left.schema, right.schema, predicates);
   const std::vector<Expression> residual =
       ResidualJoinPredicates(left.schema, right.schema, predicates);
+  Status residual_error{Status::kSuccess};
   auto matches = [&](const Row& combined) {
     if (residual.empty()) {
       return true;
     }
     Scope scope{.row = &combined, .schema = &result.schema, .outer = outer};
     return std::ranges::all_of(residual, [&](const Expression& predicate) {
-      return Truthy(Evaluate(predicate, scope, nullptr, context, ctes));
+      if (residual_error != Status::kSuccess) {
+        return false;
+      }
+      StatusOr<Value> value =
+          TryEvaluate(predicate, scope, nullptr, context, ctes);
+      if (!value.HasValue()) {
+        residual_error = value.GetStatus();
+        return false;
+      }
+      return Truthy(value.Value());
     });
   };
   auto emit_unmatched = [&](const Row& left_row) {
@@ -721,10 +732,12 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
         equality_keys, [](const EqualityKey& key) { return key.null_safe; });
     if (ShouldHybridJoin(left, right)) {
       ++result.hybrid_hash_joins;
-      Relation joined = HybridHashJoin(
-          std::move(left), std::move(right), left_columns, right_columns,
-          matches, want_left_nulls, &result.join_comparisons, has_null_safe_key,
-          want_right_nulls);
+      ASSIGN_OR_RETURN(
+          Relation, joined,
+          (HybridHashJoin(std::move(left), std::move(right), left_columns,
+                          right_columns, matches, want_left_nulls,
+                          &result.join_comparisons, has_null_safe_key,
+                          want_right_nulls)));
       joined.hash_joins = result.hash_joins;
       joined.hybrid_hash_joins = result.hybrid_hash_joins;
       joined.in_memory_hash_joins = result.in_memory_hash_joins;
@@ -734,6 +747,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       if (context.execution_runtime() != nullptr) {
         context.execution_runtime()->join_ms += ElapsedMs(join_begin);
       }
+      RETURN_IF_FAIL(residual_error);
       return joined;
     }
     ++result.in_memory_hash_joins;
@@ -818,12 +832,14 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
   if (context.execution_runtime() != nullptr) {
     context.execution_runtime()->join_ms += ElapsedMs(join_begin);
   }
+  RETURN_IF_FAIL(residual_error);
   return result;
 }
 
-Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
-                   const std::vector<Expression>& predicates,
-                   const Scope* outer, const CteMap& ctes) {
+StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
+                             Relation right,
+                             const std::vector<Expression>& predicates,
+                             const Scope* outer, const CteMap& ctes) {
   const auto join_begin = std::chrono::steady_clock::now();
   Relation result(context.execution_runtime());
   result.schema = left.schema + right.schema;
@@ -840,13 +856,23 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
   const std::vector<Expression> residual =
       ResidualJoinPredicates(left.schema, right.schema, predicates);
 
+  Status residual_error{Status::kSuccess};
   auto matches = [&](const Row& combined) {
     if (residual.empty()) {
       return true;
     }
     Scope scope{.row = &combined, .schema = &result.schema, .outer = outer};
     return std::ranges::all_of(residual, [&](const Expression& predicate) {
-      return Truthy(Evaluate(predicate, scope, nullptr, context, ctes));
+      if (residual_error != Status::kSuccess) {
+        return false;
+      }
+      StatusOr<Value> value =
+          TryEvaluate(predicate, scope, nullptr, context, ctes);
+      if (!value.HasValue()) {
+        residual_error = value.GetStatus();
+        return false;
+      }
+      return Truthy(value.Value());
     });
   };
 
@@ -879,9 +905,11 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
     // spilled input is never silently reduced to its resident prefix.
     if (ShouldHybridJoin(left, right)) {
       ++result.hybrid_hash_joins;
-      Relation joined = HybridHashJoin(
-          std::move(left), std::move(right), left_columns, right_columns,
-          matches, false, &result.join_comparisons, has_null_safe_key, false);
+      ASSIGN_OR_RETURN(
+          Relation, joined,
+          (HybridHashJoin(std::move(left), std::move(right), left_columns,
+                          right_columns, matches, false,
+                          &result.join_comparisons, has_null_safe_key, false)));
       joined.hash_joins = result.hash_joins;
       joined.hybrid_hash_joins = result.hybrid_hash_joins;
       joined.in_memory_hash_joins = result.in_memory_hash_joins;
@@ -890,6 +918,7 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
       if (context.execution_runtime() != nullptr) {
         context.execution_runtime()->join_ms += ElapsedMs(join_begin);
       }
+      RETURN_IF_FAIL(residual_error);
       return joined;
     }
     ++result.in_memory_hash_joins;
@@ -955,6 +984,7 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
   if (context.execution_runtime() != nullptr) {
     context.execution_runtime()->join_ms += ElapsedMs(join_begin);
   }
+  RETURN_IF_FAIL(residual_error);
   return result;
 }
 
@@ -1000,9 +1030,10 @@ void CollectColumnsRecursive(  // NOLINT(misc-no-recursion)
 #pragma GCC diagnostic ignored "-Wfree-nonheap-object"
 namespace {
 
-Relation LateralExpandRelation(TransactionContext& context,
-                               const SelectSource& source, Relation& prefix,
-                               const Scope* outer, const CteMap& ctes) {
+StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
+                                         const SelectSource& source,
+                                         Relation& prefix, const Scope* outer,
+                                         const CteMap& ctes) {
   Relation output(context.execution_runtime());
   const std::string qualifier = source.alias.empty() ? "unnest" : source.alias;
   auto element_schema_of = [&](const Value& array_val) {
@@ -1096,16 +1127,30 @@ Relation LateralExpandRelation(TransactionContext& context,
   bool any_prefix_row = false;
   bool schema_initialized = false;
   prefix.FinishSpill();
-  prefix.ForEachRow([&](const Row& row) {
+  Status elements_status = Status::kSuccess;
+  prefix.ForEachRow([&](const Row& row) -> void {
     any_prefix_row = true;
     Scope scope{.row = &row, .schema = &prefix.schema, .outer = outer};
     Relation elements(context.execution_runtime());
     if (source.unnest) {
-      const Value array_val =
-          Evaluate(source.unnest, scope, nullptr, context, ctes);
+      StatusOr<Value> array_or =
+          TryEvaluate(source.unnest, scope, nullptr, context, ctes);
+      if (!array_or.HasValue()) {
+        if (elements_status == Status::kSuccess) {
+          elements_status = array_or.GetStatus();
+        }
+        return;
+      }
+      const Value array_val = array_or.MoveValue();
       elements = element_schema_of(array_val);
     } else if (source.query) {
-      elements = ExecuteQuery(context, *source.query, &scope, ctes);
+      StatusOr<Relation> elements_query =
+          ExecuteQuery(context, *source.query, &scope, ctes);
+      if (!elements_query.HasValue()) {
+        elements_status = elements_query.GetStatus();
+        return;
+      }
+      elements = elements_query.MoveValue();
       if (!source.alias.empty()) {
         elements.schema = QualifySchema(elements.schema, source.alias);
       }
@@ -1148,8 +1193,15 @@ Relation LateralExpandRelation(TransactionContext& context,
         }
         if (all_match) {
           for (const Expression& conjunct : residual_condition) {
-            if (!Truthy(Evaluate(conjunct, combined_scope, nullptr, context,
-                                 ctes))) {
+            StatusOr<Value> conjunct_value =
+                TryEvaluate(conjunct, combined_scope, nullptr, context, ctes);
+            if (!conjunct_value.HasValue()) {
+              if (elements_status == Status::kSuccess) {
+                elements_status = conjunct_value.GetStatus();
+              }
+              return;
+            }
+            if (!Truthy(conjunct_value.Value())) {
               all_match = false;
               break;
             }
@@ -1196,11 +1248,20 @@ Relation LateralExpandRelation(TransactionContext& context,
           .row = &representative, .schema = &prefix.schema, .outer = outer};
       Relation elements(context.execution_runtime());
       if (source.unnest) {
-        const Value array_val =
-            Evaluate(source.unnest, scope, nullptr, context, ctes);
+        StatusOr<Value> array_or =
+            TryEvaluate(source.unnest, scope, nullptr, context, ctes);
+        if (!array_or.HasValue()) {
+          return array_or.GetStatus();
+        }
+        const Value array_val = array_or.MoveValue();
         elements = element_schema_of(array_val);
       } else if (source.query) {
-        elements = ExecuteQuery(context, *source.query, &scope, ctes);
+        StatusOr<Relation> elements_query =
+            ExecuteQuery(context, *source.query, &scope, ctes);
+        if (!elements_query.HasValue()) {
+          return elements_query.GetStatus();
+        }
+        elements = elements_query.MoveValue();
         if (!source.alias.empty()) {
           elements.schema = QualifySchema(elements.schema, source.alias);
         }
@@ -1210,14 +1271,18 @@ Relation LateralExpandRelation(TransactionContext& context,
     }
   }
   output.FinishSpill();
+  if (elements_status != Status::kSuccess) {
+    return elements_status;
+  }
   return output;
 }
 }  // namespace
 #pragma GCC diagnostic pop
 
-Relation BuildInput(TransactionContext& context,
-                    const SelectStatement& statement, const Scope* outer,
-                    const CteMap& ctes, bool* where_fully_applied) {
+StatusOr<Relation> BuildInput(TransactionContext& context,
+                              const SelectStatement& statement,
+                              const Scope* outer, const CteMap& ctes,
+                              bool* where_fully_applied) {
   *where_fully_applied = false;
   if (statement.Sources().empty()) {
     Relation singleton;
@@ -1259,22 +1324,34 @@ Relation BuildInput(TransactionContext& context,
             singleton.schema = Schema("", std::vector<Column>{});
             singleton.rows.emplace_back();
             singleton.peak_intermediate_rows = 1;
-            relation =
+            StatusOr<Relation> expanded =
                 LateralExpandRelation(context, source, singleton, outer, ctes);
+            if (!expanded.HasValue()) {
+              return expanded.GetStatus();
+            }
+            relation = expanded.MoveValue();
           } else {
-            relation =
+            StatusOr<Relation> expanded =
                 LateralExpandRelation(context, source, result, outer, ctes);
+            if (!expanded.HasValue()) {
+              return expanded.GetStatus();
+            }
+            relation = expanded.MoveValue();
           }
           result = std::move(relation);
           first = false;
         } else {
-          relation = LoadSource(context, source, outer, ctes);
+          ASSIGN_OR_RETURN(Relation, relation_r,
+                           (LoadSource(context, source, outer, ctes)));
+          relation = std::move(relation_r);
           if (first) {
             result = std::move(relation);
             first = false;
           } else {
-            result = Join(context, std::move(result), std::move(relation),
-                          source, outer, ctes);
+            ASSIGN_OR_RETURN(Relation, result_r,
+                             (Join(context, std::move(result),
+                                   std::move(relation), source, outer, ctes)));
+            result = std::move(result_r);
           }
         }
       }
@@ -1290,7 +1367,9 @@ Relation BuildInput(TransactionContext& context,
     base_sources[i] =
         !source.query && !source.unnest && !ctes.contains(source.table);
     if (!base_sources[i]) {
-      relations[i] = LoadSource(context, source, outer, ctes);
+      ASSIGN_OR_RETURN(Relation, loaded_rel,
+                       (LoadSource(context, source, outer, ctes)));
+      relations[i] = std::move(loaded_rel);
       // A non-aggregate derived SELECT with a literal FALSE filter is known
       // to be empty independently of its source table.  Preserve the derived
       // schema but discard the rows before the outer join-order loop, so an
@@ -1311,7 +1390,8 @@ Relation BuildInput(TransactionContext& context,
 
     StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
     if (!table.HasValue()) {
-      throw std::runtime_error("table " + source.table + " not found");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "table " + source.table + " not found");
     }
     const std::string qualifier =
         source.alias.empty() ? source.table : source.alias;
@@ -1388,19 +1468,27 @@ Relation BuildInput(TransactionContext& context,
     }
     for (size_t i = 0; i < relations.size(); ++i) {
       if (base_sources[i]) {
-        relations[i] = LoadSource(context, statement.Sources()[i], outer, ctes,
-                                  &projections[i]);
+        ASSIGN_OR_RETURN(Relation, loaded_rel,
+                         (LoadSource(context, statement.Sources()[i], outer,
+                                     ctes, &projections[i])));
+        relations[i] = std::move(loaded_rel);
       }
     }
     Relation prefix = std::move(relations.front());
     for (size_t i = 1; i < nested_begin; ++i) {
-      prefix = Join(context, std::move(prefix), std::move(relations[i]),
-                    statement.Sources()[i], outer, ctes);
+      ASSIGN_OR_RETURN(
+          Relation, prefix_r,
+          (Join(context, std::move(prefix), std::move(relations[i]),
+                statement.Sources()[i], outer, ctes)));
+      prefix = std::move(prefix_r);
     }
     Relation nested = std::move(relations[nested_begin]);
     for (size_t i = nested_begin + 1; i < relations.size(); ++i) {
-      nested = Join(context, std::move(nested), std::move(relations[i]),
-                    statement.Sources()[i], outer, ctes);
+      ASSIGN_OR_RETURN(
+          Relation, nested_r,
+          (Join(context, std::move(nested), std::move(relations[i]),
+                statement.Sources()[i], outer, ctes)));
+      nested = std::move(nested_r);
     }
     return Join(context, std::move(prefix), std::move(nested),
                 statement.Sources()[nested_begin], outer, ctes);
@@ -1408,14 +1496,19 @@ Relation BuildInput(TransactionContext& context,
   if (has_ordered_join) {
     for (size_t i = 0; i < relations.size(); ++i) {
       if (base_sources[i]) {
-        relations[i] = LoadSource(context, statement.Sources()[i], outer, ctes,
-                                  &projections[i]);
+        ASSIGN_OR_RETURN(Relation, loaded_rel,
+                         (LoadSource(context, statement.Sources()[i], outer,
+                                     ctes, &projections[i])));
+        relations[i] = std::move(loaded_rel);
       }
     }
     Relation result = std::move(relations.front());
     for (size_t i = 1; i < relations.size(); ++i) {
-      result = Join(context, std::move(result), std::move(relations[i]),
-                    statement.Sources()[i], outer, ctes);
+      ASSIGN_OR_RETURN(
+          Relation, result_r,
+          (Join(context, std::move(result), std::move(relations[i]),
+                statement.Sources()[i], outer, ctes)));
+      result = std::move(result_r);
     }
     return result;
   }
@@ -1801,9 +1894,11 @@ Relation BuildInput(TransactionContext& context,
         }
       }
     }
-    relations[idx] = LoadSource(context, statement.Sources()[idx], outer, ctes,
-                                &projections[idx], &local_predicates[idx],
-                                filter_ptr, filter_col);
+    ASSIGN_OR_RETURN(Relation, loaded_rel,
+                     (LoadSource(context, statement.Sources()[idx], outer, ctes,
+                                 &projections[idx], &local_predicates[idx],
+                                 filter_ptr, filter_col)));
+    relations[idx] = std::move(loaded_rel);
     loaded[idx] = true;
   }
 
@@ -1922,8 +2017,11 @@ Relation BuildInput(TransactionContext& context,
       applicable.push_back(predicate.expression);
       mark_applied(predicate.expression);
     }
-    result = InnerJoin(context, std::move(result), std::move(relations[next]),
-                       applicable, outer, ctes);
+    ASSIGN_OR_RETURN(
+        Relation, result_r,
+        (InnerJoin(context, std::move(result), std::move(relations[next]),
+                   applicable, outer, ctes)));
+    result = std::move(result_r);
     joined.insert(next);
     remaining.erase(next);
   }

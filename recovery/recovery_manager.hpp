@@ -38,6 +38,8 @@ struct LogRecord;
 
 class RecoveryManager {
  public:
+  RecoveryManager(RecoveryManager&&) = delete;
+  RecoveryManager& operator=(RecoveryManager&&) = delete;
   // LSNs already compensated during the current recovery. Shared by the
   // parallel per-page replay and the global loser-chain pass so an undo is
   // applied exactly once.
@@ -73,10 +75,10 @@ class RecoveryManager {
   RecoveryManager(const RecoveryManager&) = delete;
   RecoveryManager& operator=(const RecoveryManager&) = delete;
 
-  void SinglePageRecovery(PageRef&& page, TransactionManager* tm,
-                          UndoneRecorder* undone = nullptr);
+  Status SinglePageRecovery(PageRef&& page, TransactionManager* tm,
+                            UndoneRecorder* undone = nullptr);
 
-  void RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm);
+  Status RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm);
 
   bool ReadLog(lsn_t lsn, LogRecord* dst) const;
 
@@ -84,7 +86,8 @@ class RecoveryManager {
   // torn-tail authority; see D9 in docs/design.md for the CRC extension).
   [[nodiscard]] lsn_t ValidLogEnd(lsn_t from) const;
 
-  void LogUndoWithPage(lsn_t lsn, const LogRecord& log, TransactionManager* tm);
+  Status LogUndoWithPage(lsn_t lsn, const LogRecord& log,
+                         TransactionManager* tm);
 
   friend std::ostream& operator<<(std::ostream& o, const RecoveryManager& rm) {
     o << "RecoveryManager(log=" << rm.log_name_ << ")";
@@ -95,13 +98,13 @@ class RecoveryManager {
   [[nodiscard]] bool OpenReadFd() const;
   // Consistent view of read_fd_ for readers that pread outside the mutex.
   [[nodiscard]] int ReadFdSnapshot() const;
-  void SinglePageRecovery(PageRef&& page, TransactionManager* tm,
-                          UndoneRecorder* undone, std::uintmax_t scan_end);
+  Status SinglePageRecovery(PageRef&& page, TransactionManager* tm,
+                            UndoneRecorder* undone, std::uintmax_t scan_end);
   // Walks each loser transaction's prev_lsn chain newest-first and applies
   // undo to every record not already compensated by the per-page replay.
-  void UndoLoserChains(const std::vector<lsn_t>& loser_heads,
-                       UndoneRecorder* undone, TransactionManager* tm,
-                       lsn_t scan_end);
+  Status UndoLoserChains(const std::vector<lsn_t>& loser_heads,
+                         UndoneRecorder* undone, TransactionManager* tm,
+                         lsn_t scan_end);
 
   inline static std::atomic<bool> torn_tail_truncation_allowed_{false};
 

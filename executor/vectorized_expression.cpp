@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/selection_vector.hpp"
 #include "expression/binary_expression.hpp"
@@ -26,17 +27,16 @@ namespace tinylamb {
 
 namespace {
 
-Value EvaluateRowFallback(const Expression& expr, const Row& row,
-                          const Schema& schema) {
-  return expr->Evaluate(row, schema);
+StatusOr<Value> EvaluateRowFallback(const Expression& expr, const Row& row,
+                                    const Schema& schema) {
+  return expr->TryEvaluate(row, schema);
 }
 
 }  // namespace
 
-ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
-                                            const Schema& schema,
-                                            const DataChunk& chunk,
-                                            const SelectionVector* sel) {
+StatusOr<ColumnVector> VectorizedExpression::Evaluate(
+    const Expression& expr, const Schema& schema, const DataChunk& chunk,
+    const SelectionVector* sel) {
   if (!expr) {
     return ColumnVector(ValueType::kNull, 0);
   }
@@ -60,8 +60,8 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
       const auto& col_val = expr->AsColumnValue();
       const int offset = schema.Offset(col_val.GetColumnName());
       if (offset < 0 || static_cast<size_t>(offset) >= chunk.ColumnCount()) {
-        throw std::runtime_error("column not found in schema: " +
-                                 col_val.GetColumnName().ToString());
+        CHECK_MSG(false, "column not found in schema: " +
+                             col_val.GetColumnName().ToString());
       }
       const ColumnVector& src = chunk.ColumnAt(static_cast<size_t>(offset));
       if (sel == nullptr) {
@@ -79,20 +79,23 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
     }
     case TypeTag::kUnaryExp: {
       const auto& unary = expr->AsUnaryExpression();
-      const ColumnVector child_vec =
-          Evaluate(unary.Child(), schema, chunk, sel);
+      ASSIGN_OR_RETURN(ColumnVector, child_vec,
+                       (Evaluate(unary.Child(), schema, chunk, sel)));
       ColumnVector result(ValueType::kNull, active_count);
       for (size_t i = 0; i < active_count; ++i) {
         const Value child_val = child_vec.ValueAt(i);
-        result.Append(EvaluateUnary(unary.Op(), child_val));
+        ASSIGN_OR_RETURN(Value, unary_value,
+                         (TryEvaluateUnary(unary.Op(), child_val)));
+        result.Append(unary_value);
       }
       return result;
     }
     case TypeTag::kBinaryExp: {
       const auto& binary = expr->AsBinaryExpression();
-      const ColumnVector left_vec = Evaluate(binary.Left(), schema, chunk, sel);
-      const ColumnVector right_vec =
-          Evaluate(binary.Right(), schema, chunk, sel);
+      ASSIGN_OR_RETURN(ColumnVector, left_vec,
+                       (Evaluate(binary.Left(), schema, chunk, sel)));
+      ASSIGN_OR_RETURN(ColumnVector, right_vec,
+                       (Evaluate(binary.Right(), schema, chunk, sel)));
       if (left_vec.Type() == ValueType::kInt64 &&
           right_vec.Type() == ValueType::kInt64) {
         const auto op = binary.Op();
@@ -139,13 +142,16 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
       for (size_t i = 0; i < active_count; ++i) {
         const Value left_val = left_vec.ValueAt(i);
         const Value right_val = right_vec.ValueAt(i);
-        result.Append(EvaluateBinary(binary.Op(), left_val, right_val));
+        ASSIGN_OR_RETURN(Value, bin_value,
+                         (TryEvaluateBinary(binary.Op(), left_val, right_val)));
+        result.Append(bin_value);
       }
       return result;
     }
     case TypeTag::kCastExp: {
       const auto& cast = expr->AsCastExpression();
-      const ColumnVector child_vec = Evaluate(cast.Child(), schema, chunk, sel);
+      ASSIGN_OR_RETURN(ColumnVector, child_vec,
+                       (Evaluate(cast.Child(), schema, chunk, sel)));
       ColumnVector result(ValueType::kNull, active_count);
       for (size_t i = 0; i < active_count; ++i) {
         const Value child_val = child_vec.ValueAt(i);
@@ -154,7 +160,9 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
         } else {
           Row tmp_row({child_val});
           Schema tmp_schema("tmp", {Column("c", child_val.type)});
-          result.Append(cast.Evaluate(tmp_row, tmp_schema));
+          ASSIGN_OR_RETURN(Value, casted,
+                           (cast.TryEvaluate(tmp_row, tmp_schema)));
+          result.Append(casted);
         }
       }
       return result;
@@ -165,7 +173,9 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
       for (size_t i = 0; i < active_count; ++i) {
         const size_t row_idx = sel != nullptr ? (*sel)[i] : i;
         const Row row = chunk.RowAt(row_idx);
-        result.Append(case_expr.Evaluate(row, schema));
+        ASSIGN_OR_RETURN(Value, branch_value,
+                         (case_expr.TryEvaluate(row, schema)));
+        result.Append(branch_value);
       }
       return result;
     }
@@ -174,14 +184,16 @@ ColumnVector VectorizedExpression::Evaluate(const Expression& expr,
       for (size_t i = 0; i < active_count; ++i) {
         const size_t row_idx = sel != nullptr ? (*sel)[i] : i;
         const Row row = chunk.RowAt(row_idx);
-        result.Append(EvaluateRowFallback(expr, row, schema));
+        ASSIGN_OR_RETURN(Value, fallback,
+                         (EvaluateRowFallback(expr, row, schema)));
+        result.Append(fallback);
       }
       return result;
     }
   }
 }
 
-ValidityBitmap VectorizedExpression::EvaluateFilter(
+StatusOr<ValidityBitmap> VectorizedExpression::EvaluateFilter(
     const Expression& expr, const Schema& schema, const DataChunk& chunk,
     const SelectionVector* sel) {
   const size_t total_rows = chunk.Size();
@@ -192,10 +204,10 @@ ValidityBitmap VectorizedExpression::EvaluateFilter(
   if (sel != nullptr && sel->Empty()) {
     return ValidityBitmap(total_rows, false);
   }
-
-  // Evaluate only the selected rows: evaluating masked-out rows can throw
+  // Evaluate only the selected rows: evaluating masked-out rows can raise
   // (e.g. division by zero) for rows the caller already excluded.
-  const ColumnVector result_vec = Evaluate(expr, schema, chunk, sel);
+  ASSIGN_OR_RETURN(ColumnVector, result_vec,
+                   (Evaluate(expr, schema, chunk, sel)));
   ValidityBitmap bitmap(total_rows, false);
 
   if (sel == nullptr) {
@@ -216,18 +228,20 @@ ValidityBitmap VectorizedExpression::EvaluateFilter(
   return bitmap;
 }
 
-void VectorizedExpression::FilterDataChunk(const Expression& expr,
-                                           const Schema& schema,
-                                           const DataChunk& chunk,
-                                           SelectionVector* output_sel,
-                                           const SelectionVector* input_sel) {
+Status VectorizedExpression::FilterDataChunk(const Expression& expr,
+                                             const Schema& schema,
+                                             const DataChunk& chunk,
+                                             SelectionVector* output_sel,
+                                             const SelectionVector* input_sel) {
   assert(output_sel != nullptr);
-  const ValidityBitmap mask = EvaluateFilter(expr, schema, chunk, input_sel);
+  ASSIGN_OR_RETURN(ValidityBitmap, mask,
+                   (EvaluateFilter(expr, schema, chunk, input_sel)));
   if (input_sel != nullptr) {
     input_sel->Filter(mask, output_sel);
   } else {
     mask.ToSelectionVector(output_sel);
   }
+  return Status::kSuccess;
 }
 
 Value VectorizedExpression::Aggregate(AggregationType type,
@@ -245,7 +259,7 @@ Value VectorizedExpression::Aggregate(AggregationType type,
     case AggregationType::kBitXor:
       return col.AggregateBitXor(sel);
     default:
-      throw std::invalid_argument("unsupported vectorized aggregate type");
+      CHECK_MSG(false, "unsupported vectorized aggregate type");
   }
 }
 

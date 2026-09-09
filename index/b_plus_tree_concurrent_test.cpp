@@ -50,7 +50,7 @@ class BPlusTreeConcurrentTest : public ::testing::Test {
     master_record_name_ = prefix + ".master.log";
     Recover();
     auto txn = tm_->Begin();
-    PageRef page_ = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page_ = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
@@ -67,8 +67,8 @@ class BPlusTreeConcurrentTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 110);
-    l_ = std::make_unique<Logger>(log_name_);
+    p_ = PageManager::Create(db_name_, 110).MoveValue();
+    l_ = Logger::Create(log_name_).MoveValue();
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());

@@ -18,6 +18,7 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 
 #ifdef TINYLAMB_HAS_LLVM
 #pragma GCC diagnostic push
@@ -516,7 +517,7 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileSumChecked() {
 void JitInt64Kernels::Filter(const int64_t* input, uint8_t* output,
                              size_t count, int64_t constant) const {
   if (impl_ == nullptr || impl_->filter == nullptr) {
-    throw std::logic_error("not a filter kernel");
+    CHECK_MSG(false, "not a filter kernel");
   }
   impl_->filter(input, output, static_cast<uint64_t>(count), constant);
 }
@@ -524,14 +525,15 @@ void JitInt64Kernels::Project(const int64_t* input, int64_t* output,
                               size_t count, int64_t multiplier,
                               int64_t addend) const {
   if (impl_ == nullptr || impl_->projection == nullptr) {
-    throw std::logic_error("not a projection kernel");
+    CHECK_MSG(false, "not a projection kernel");
   }
   impl_->projection(input, output, static_cast<uint64_t>(count), multiplier,
                     addend);
 }
 int64_t JitInt64Kernels::Sum(const int64_t* input, size_t count) const {
   if (impl_ == nullptr || impl_->sum == nullptr) {
-    throw std::logic_error("not a sum kernel");
+    CHECK_MSG(false, "not a sum kernel");
+    return 0;
   }
   return impl_->sum(input, static_cast<uint64_t>(count));
 }
@@ -540,7 +542,7 @@ void JitInt64Kernels::ProjectChecked(const int64_t* input, int64_t* output,
                                      int64_t addend, bool* multiply_overflowed,
                                      bool* add_overflowed) const {
   if (impl_ == nullptr || impl_->projection_checked == nullptr) {
-    throw std::logic_error("not a checked projection kernel");
+    CHECK_MSG(false, "not a checked projection kernel");
   }
   uint8_t mul_of = 0;
   uint8_t add_of = 0;
@@ -556,7 +558,8 @@ void JitInt64Kernels::ProjectChecked(const int64_t* input, int64_t* output,
 int64_t JitInt64Kernels::SumChecked(const int64_t* input, size_t count,
                                     bool* overflowed) const {
   if (impl_ == nullptr || impl_->sum_checked == nullptr) {
-    throw std::logic_error("not a checked sum kernel");
+    CHECK_MSG(false, "not a checked sum kernel");
+    return 0;
   }
   uint8_t of = 0;
   const int64_t total =

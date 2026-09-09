@@ -21,10 +21,13 @@
 #include <cstdint>
 #include <deque>
 #include <iosfwd>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/status_or.hpp"
 
 namespace tinylamb {
 
@@ -100,28 +103,32 @@ class VMCacheImpl {
   // If `own_fd` is true (default) the destructor closes `fd`. Pass false when
   // the descriptor is owned by someone else (e.g. BlobFile's Logger) so two
   // objects never close the same fd.
-  VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
-              size_t offset = 0, size_t file_size = 0, bool own_fd = true);
+  // Open failures (fstat, zero capacity, mmap) are reported as Status.
+  static StatusOr<std::unique_ptr<VMCacheImpl>> Create(
+      int fd, size_t block_size, size_t memory_capacity, size_t offset = 0,
+      size_t file_size = 0, bool own_fd = true);
   ~VMCacheImpl();
   VMCacheImpl(const VMCacheImpl&) = delete;
   VMCacheImpl(VMCacheImpl&&) = delete;
   VMCacheImpl& operator=(const VMCacheImpl&) = delete;
   VMCacheImpl& operator=(VMCacheImpl&&) = delete;
-  void Read(void* dst, size_t offset, size_t length) const;
-  [[nodiscard]] std::string ReadAt(size_t offset, size_t length) const;
-  Locks ReadAt(size_t offset, size_t length, std::string_view& out) const;
-  void Copy(void* dst, size_t offset, size_t length) const {
-    Read(dst, offset, length);
+  Status Read(void* dst, size_t offset, size_t length) const;
+  [[nodiscard]] StatusOr<std::string> ReadAt(size_t offset,
+                                             size_t length) const;
+  StatusOr<Locks> ReadAt(size_t offset, size_t length,
+                         std::string_view& out) const;
+  Status Copy(void* dst, size_t offset, size_t length) const {
+    return Read(dst, offset, length);
   }
   void Invalidate(size_t offset, size_t length);
   [[nodiscard]] std::string Dump() const;
 
  private:
-  void ReadInPage(void* dst, size_t length, void* src) const;
-  void FixPage(size_t page) const;
+  Status ReadInPage(void* dst, size_t length, void* src) const;
+  Status FixPage(size_t page) const;
   void UnfixPage(size_t page) const;
   void InvalidatePage(size_t page) const;
-  void Activate(size_t page) const;
+  Status Activate(size_t page) const;
   void Release(size_t page) const;
 
   size_t FindMetaPage(std::atomic<PageState>* page_ptr) const;
@@ -130,6 +137,9 @@ class VMCacheImpl {
   void EnqueueToGhostFifo(std::atomic<PageState>* page_ptr) const;
 
   bool SanityCheck() const;
+
+  VMCacheImpl(int fd, size_t block_size, size_t memory_capacity, size_t offset,
+              size_t max_size, bool own_fd, char* buffer);
 
   int fd_;
   const bool own_fd_;

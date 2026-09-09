@@ -47,6 +47,7 @@ class SkipScanDistinct : public ExecutorBase {
   bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
+  [[nodiscard]] Status GetStatus() const { return status_; }
   void Dump(std::ostream& o, int indent) const override;
   void Explain(std::ostream& o, int indent) const override;
 
@@ -73,6 +74,9 @@ class SkipScanDistinct : public ExecutorBase {
   mutable Row current_row_;
   mutable bool current_row_resolved_{false};
   bool finished_{false};
+  // Sticky page/decode failure: Next()'s bool contract cannot report it, so
+  // the scan stops and the first failure is kept here for GetStatus().
+  mutable Status status_{Status::kSuccess};
 };
 
 using SkipScanDistinctExecutor = SkipScanDistinct;

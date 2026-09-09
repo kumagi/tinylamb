@@ -32,6 +32,11 @@ class BPlusTreeIterator {
  public:
   // Lifetime contract: `tree` and `txn` must both outlive this iterator, and
   // the iterator is only valid within the transaction that created it.
+  //
+  // Page-access failures during positioning or advancement are sticky: the
+  // iterator becomes invalid and records the failure in GetStatus(). Loops
+  // that must distinguish "scan exhausted" from "IO corrupt" check
+  // GetStatus() after the loop.
   BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
                     std::string_view begin = "", std::string_view end = "",
                     bool ascending = true);
@@ -40,6 +45,7 @@ class BPlusTreeIterator {
   BPlusTreeIterator& operator++();
   BPlusTreeIterator& operator--();
   [[nodiscard]] bool IsValid() const { return valid_; }
+  [[nodiscard]] Status GetStatus() const { return status_; }
 
   friend std::ostream& operator<<(std::ostream& o,
                                   const BPlusTreeIterator& it) {
@@ -60,6 +66,7 @@ class BPlusTreeIterator {
   std::string begin_;
   std::string end_;
   bool valid_;
+  mutable Status status_{Status::kSuccess};
 };
 
 }  // namespace tinylamb

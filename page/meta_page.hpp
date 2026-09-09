@@ -21,6 +21,7 @@
 #include <cstdint>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "page/page_ref.hpp"
 #include "page/page_type.hpp"
 
@@ -65,9 +66,9 @@ class MetaPage {
     first_free_page = 0;
   }
 
-  PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
-                          PageType new_page_type);
-  void DestroyPage(Transaction& txn, Page* target);
+  StatusOr<PageRef> AllocateNewPage(Transaction& txn, PagePool& pool,
+                                    PageType new_page_type);
+  Status DestroyPage(Transaction& txn, Page* target);
 
   // Note that all member of this class is private.
   // Only Page class can access these members.

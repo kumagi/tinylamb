@@ -78,7 +78,12 @@ size_t ChunkedScan::FillFromIndex(DataChunk* destination, size_t max_rows) {
 
   if (filter_) {
     SelectionVector sel;
-    VectorizedExpression::FilterDataChunk(*filter_, schema_, raw_batch, &sel);
+    if (Status st_filter = VectorizedExpression::FilterDataChunk(
+            *filter_, schema_, raw_batch, &sel);
+        st_filter != Status::kSuccess) {
+      FailWith(st_filter);
+      return 0;
+    }
     destination->AppendGather(raw_batch, sel.Data(), sel.Size());
     return sel.Size();
   }
@@ -126,8 +131,12 @@ size_t ChunkedScan::FillFromTableMorsels(DataChunk* destination,
     if (!raw_batch.Empty()) {
       if (filter_) {
         SelectionVector sel;
-        VectorizedExpression::FilterDataChunk(*filter_, schema_, raw_batch,
-                                              &sel);
+        if (Status st_filter = VectorizedExpression::FilterDataChunk(
+                *filter_, schema_, raw_batch, &sel);
+            st_filter != Status::kSuccess) {
+          FailWith(st_filter);
+          return 0;
+        }
         destination->AppendGather(raw_batch, sel.Data(), sel.Size());
       } else {
         for (size_t i = 0; i < raw_batch.Size(); ++i) {

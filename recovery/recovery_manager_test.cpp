@@ -70,8 +70,8 @@ class RecoveryManagerTest : public RowPageTest {
     r_.reset();
     p_.reset();
     f();
-    p_ = std::make_unique<PageManager>(file_name_ + ".db", 10);
-    l_ = std::make_unique<Logger>(file_name_ + ".log");
+    p_ = PageManager::Create(file_name_ + ".db", 10).MoveValue();
+    l_ = Logger::Create(file_name_ + ".log").MoveValue();
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
@@ -107,7 +107,7 @@ class RecoveryManagerTest : public RowPageTest {
     std::ignore = std::remove((file_name_ + ".log").c_str());
   }
 
-  std::unique_ptr<RecoveryManager> r_;
+  std::unique_ptr<RecoveryManager> r_{};
 };
 
 TEST_F(RecoveryManagerTest, EmptyRecovery) {
@@ -121,7 +121,7 @@ TEST_F(RecoveryManagerTest, InsertAbort) {
   // Arrange
   auto txn = tm_->Begin();
   std::string record = "blah~blah";
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
@@ -144,7 +144,7 @@ TEST_F(RecoveryManagerTest, UpdateAbort) {
   std::string before = "before string hello world!", after = "replaced by this";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
@@ -168,7 +168,7 @@ TEST_F(RecoveryManagerTest, DeleteAbort) {
   std::string before = "living row";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
 
   // Act 1 -- delete row 0
   page->Delete(txn, 0);
@@ -282,7 +282,7 @@ TEST_F(RecoveryManagerTest, InsertCrash) {
 
   // Act 1 -- insert record into row page (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
@@ -307,7 +307,7 @@ TEST_F(RecoveryManagerTest, UpdateCrash) {
 
   // Act 1 -- update row 0 (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Update(txn, 0, record));
@@ -329,7 +329,7 @@ TEST_F(RecoveryManagerTest, DeleteCrash) {
 
   // Act 1 -- delete row 0 (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Delete(txn, 0));
@@ -351,7 +351,7 @@ TEST_F(RecoveryManagerTest, InsertMediaCrash) {
 
   // Act 1 -- insert record into row page (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
@@ -376,7 +376,7 @@ TEST_F(RecoveryManagerTest, UpdateMediaCrash) {
 
   // Act 1 -- update row 0 (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Update(txn, 0, record));
@@ -398,7 +398,7 @@ TEST_F(RecoveryManagerTest, DeleteMediaCrash) {
 
   // Act 1 -- delete row 0 (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Delete(txn, 0));
@@ -420,7 +420,7 @@ TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
 
   // Act 1 -- insert record into row page (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
@@ -445,7 +445,7 @@ TEST_F(RecoveryManagerTest, UpdateSinglePageFailure) {
 
   // Act 1 -- update row 0 (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Update(txn, 0, record));
@@ -467,7 +467,7 @@ TEST_F(RecoveryManagerTest, DeleteSinglePageFailure) {
 
   // Act 1 -- delete row 0 (txn not committed)
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Delete(txn, 0));
@@ -482,12 +482,12 @@ TEST_F(RecoveryManagerTest, DeleteSinglePageFailure) {
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
-TEST_F(RecoveryManagerTest, LogUndoWithUnknownLogThrows) {
+TEST_F(RecoveryManagerTest, LogUndoWithUnknownLogAborts) {
   // Arrange -- a default-constructed LogRecord has LogType::kUnknown
   LogRecord unknown;
   // Act -- ask for an undo of the unknown record
-  // Assert -- IsPageManipulation rejects it with a runtime error
-  EXPECT_THROW(r_->LogUndoWithPage(0, unknown, tm_.get()), std::runtime_error);
+  // Assert -- IsPageManipulation treats it as broken plumbing and aborts
+  EXPECT_DEATH(r_->LogUndoWithPage(0, unknown, tm_.get()), "Invalid format");
 }
 
 TEST_F(RecoveryManagerTest, LoserUndoSurvivesRepeatedRecoveryPasses) {
@@ -502,7 +502,7 @@ TEST_F(RecoveryManagerTest, LoserUndoSurvivesRepeatedRecoveryPasses) {
   {
     // Loser DELETE: writes the delete record, then dies without commit.
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Delete(txn, 0));
     page.PageUnlock();
     while (l_->CommittedLSN() < l_->BufferedLSN()) {
@@ -519,16 +519,16 @@ TEST_F(RecoveryManagerTest, LoserUndoSurvivesRepeatedRecoveryPasses) {
     const size_t count = GetRowCount();
     const std::string row = ReadRow(0);
     if (pass > 0) {
-      EXPECT_EQ(count, prev_count) << "pass " << pass;
-      EXPECT_EQ(row, prev_row) << "pass " << pass;
+      EXPECT_EQ(count, prev_count) << true << (pass != 0);
+      EXPECT_EQ(row, prev_row) << true << (pass != 0);
     }
     // The loser insert and the loser delete must both be undone: only
     // "committed-1" at slot 0 survives the second delete's undo restoring
     // slot 0... but "committed-1" was physically deleted? No: the committed
     // DELETE removed slot 1 ("committed-2"); the loser DELETE targeted slot
     // 0 and must be rolled back.
-    EXPECT_EQ(count, 1U) << "pass " << pass;
-    EXPECT_EQ(row, "committed-1") << "pass " << pass;
+    EXPECT_EQ(count, 1U) << true << (pass != 0);
+    EXPECT_EQ(row, "committed-1") << true << (pass != 0);
     prev_count = count;
     prev_row = row;
   }
@@ -551,19 +551,19 @@ TEST_F(RecoveryManagerTest, DestroyPageRedoInitializesFreePageAndRebuildsList) {
   r_->RecoverFrom(0, tm_.get());
 
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     EXPECT_EQ(page->Type(), PageType::kFreePage);
     page.PageUnlock();
   }
   {
-    PageRef meta = p_->GetPage(kMetaPageId);
+    PageRef meta = p_->GetPage(kMetaPageId).MoveValue();
     EXPECT_EQ(meta->body.meta_page.FirstFreePage(), page_id_);
   }
 
   // The freed page is handed out again by the allocator.
   auto txn = tm_->Begin();
-  PageRef reused = p_->AllocateNewPage(txn, PageType::kRowPage);
+  PageRef reused = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
   EXPECT_EQ(reused->PageID(), page_id_);
   reused.PageUnlock();
   ASSERT_SUCCESS(txn.PreCommit());
@@ -573,7 +573,7 @@ TEST_F(RecoveryManagerTest, DestroyPageRedoInitializesFreePageAndRebuildsList) {
   Recover();
   r_->RecoverFrom(0, tm_.get());
   r_->RecoverFrom(0, tm_.get());
-  PageRef again = p_->GetPage(page_id_);
+  PageRef again = p_->GetPage(page_id_).MoveValue();
   ASSERT_FALSE(again.IsNull());
   EXPECT_NE(again->Type(), PageType::kUnknown);
 }
@@ -600,7 +600,7 @@ TEST_F(RecoveryManagerTest, DestroyPageRedoTwiceOnSamePageIsIdempotent) {
   // second crash.
   p_->GetPool()->FlushPageForTest(page_id_);
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_FALSE(page.IsNull());
     EXPECT_EQ(page->Type(), PageType::kFreePage);
     EXPECT_TRUE(page->IsValid());
@@ -608,7 +608,7 @@ TEST_F(RecoveryManagerTest, DestroyPageRedoTwiceOnSamePageIsIdempotent) {
     page.PageUnlock();
   }
   {
-    PageRef meta = p_->GetPage(kMetaPageId);
+    PageRef meta = p_->GetPage(kMetaPageId).MoveValue();
     EXPECT_EQ(meta->body.meta_page.FirstFreePage(), page_id_);
   }
 }
@@ -620,21 +620,21 @@ TEST_F(RecoveryManagerTest, DestroyPageUndoRestoresRowContent) {
   const page_id_t doomed = page_id_;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(doomed);
+    PageRef page = p_->GetPage(doomed).MoveValue();
     ASSERT_FALSE(page.IsNull());
     p_->DestroyPage(txn, &*page);
     page.PageUnlock();
     txn.Abort();
   }
   {
-    PageRef after = p_->GetPage(doomed);
+    PageRef after = p_->GetPage(doomed).MoveValue();
     ASSERT_FALSE(after.IsNull());
     EXPECT_EQ(after->Type(), PageType::kRowPage);
   }
   ASSERT_EQ(GetRowCount(), 1);
   EXPECT_EQ(ReadRow(0), "keepme");
   // The restored page must not linger on the allocator free stack.
-  PageRef meta = p_->GetPage(kMetaPageId);
+  PageRef meta = p_->GetPage(kMetaPageId).MoveValue();
   EXPECT_NE(meta->body.meta_page.FirstFreePage(), doomed);
 }
 
@@ -665,7 +665,7 @@ TEST_F(RecoveryManagerTest, LegacyV1DestroyRecordStillParses) {
   EXPECT_EQ(decoded.Size(), v1.size());  // v1 has no CRC tail
 
   // Scanning over a legacy record must stay byte-synchronized.
-  const lsn_t start = l_->BufferedLSN();
+  const lsn_t start = l_->BufferedLSN() ;
   l_->AddLog(v1);
   while (l_->CommittedLSN() < l_->BufferedLSN()) {
     std::this_thread::yield();
@@ -732,7 +732,7 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoBranchLowestValue) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
     pid = page->PageID();
     page.PageUnlock();
     txn.PreCommit();
@@ -750,7 +750,7 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoSetFoster) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     pid = page->PageID();
     page.PageUnlock();
     txn.PreCommit();
@@ -769,7 +769,7 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoSetFences) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     pid = page->PageID();
     page.PageUnlock();
     txn.PreCommit();
@@ -791,7 +791,7 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageCompensateSetFosterIsNoop) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     pid = page->PageID();
     page.PageUnlock();
     txn.PreCommit();
@@ -809,7 +809,7 @@ TEST_F(RecoveryManagerTest, RecoverFromMidLogRedoFromCheckpoint) {
   // Arrange -- commit row "first", flush the page, then commit row "second"
   ASSERT_TRUE(InsertRow("first"));
   Flush();
-  lsn_t restart_point = l_->CommittedLSN();
+  lsn_t restart_point = l_->CommittedLSN() ;
   ASSERT_TRUE(InsertRow("second"));
 
   // Act -- crash and recover from the LSN captured after the first commit
@@ -842,7 +842,7 @@ TEST_F(RecoveryManagerTest, SinglePageRecoverySkipsRedoWhenLsnAlreadyApplied) {
 
   // Act -- replay the page's logs; LogRedo short-circuits on lsn <= PageLSN
   // for both the allocation and the insert record.
-  PageRef page = p_->GetPage(page_id_);
+  PageRef page = p_->GetPage(page_id_).MoveValue();
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
   r_->SinglePageRecovery(std::move(page), tm_.get());
@@ -858,7 +858,7 @@ TEST_F(RecoveryManagerTest, ReplayLeafPageLogsRedoAndUndo) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     pid = page->PageID();
     page.PageUnlock();
     ASSERT_SUCCESS(txn.PreCommit());
@@ -887,7 +887,7 @@ TEST_F(RecoveryManagerTest, ReplayLeafPageLogsRedoAndUndo) {
   // Act -- replay every log of this page (redo then undo; txn 42 is not
   // committed so the undo phase runs too).
   {
-    PageRef page = p_->GetPage(pid);
+    PageRef page = p_->GetPage(pid).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kLeafPage);
     r_->SinglePageRecovery(std::move(page), tm_.get());
@@ -896,7 +896,7 @@ TEST_F(RecoveryManagerTest, ReplayLeafPageLogsRedoAndUndo) {
   // Assert -- the redo phase applied and the undo phase fully reversed the
   // uncommitted writes, leaving an empty leaf page.
   {
-    PageRef page = p_->GetPage(pid);
+    PageRef page = p_->GetPage(pid).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kLeafPage);
     ASSERT_EQ(page->RowCount(), 0);
@@ -909,7 +909,7 @@ TEST_F(RecoveryManagerTest, ReplayBranchPageLogsRedoAndUndo) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
     pid = page->PageID();
     page.PageUnlock();
     ASSERT_SUCCESS(txn.PreCommit());
@@ -927,7 +927,7 @@ TEST_F(RecoveryManagerTest, ReplayBranchPageLogsRedoAndUndo) {
 
   // Act -- replay every log of this page (redo then undo).
   {
-    PageRef page = p_->GetPage(pid);
+    PageRef page = p_->GetPage(pid).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kBranchPage);
     r_->SinglePageRecovery(std::move(page), tm_.get());
@@ -935,7 +935,7 @@ TEST_F(RecoveryManagerTest, ReplayBranchPageLogsRedoAndUndo) {
 
   // Assert -- the branch-page redo and undo both ran; the page is empty again.
   {
-    PageRef page = p_->GetPage(pid);
+    PageRef page = p_->GetPage(pid).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kBranchPage);
     ASSERT_EQ(page->RowCount(), 0);
@@ -947,7 +947,7 @@ TEST_F(RecoveryManagerTest, BrokenLeafPageRecoveryRedoAllocPageLog) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     pid = page->PageID();
     page.PageUnlock();
     ASSERT_SUCCESS(txn.PreCommit());
@@ -960,7 +960,7 @@ TEST_F(RecoveryManagerTest, BrokenLeafPageRecoveryRedoAllocPageLog) {
   r_->RecoverFrom(0, tm_.get());
 
   // Assert -- the allocation redo re-initialized the page as a leaf page.
-  PageRef page = p_->GetPage(pid);
+  PageRef page = p_->GetPage(pid).MoveValue();
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kLeafPage);
 }
@@ -987,7 +987,7 @@ TEST_F(RecoveryManagerTest, RecoverFromParallelWithMultipleDirtyPages) {
   page_id_t second_pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     second_pid = page->PageID();
     ASSERT_SUCCESS(page->Insert(txn, "second").GetStatus());
     page.PageUnlock();
@@ -1009,7 +1009,7 @@ TEST_F(RecoveryManagerTest, RecoverFromParallelWithMultipleDirtyPages) {
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "first");
   {
-    PageRef page = p_->GetPage(second_pid);
+    PageRef page = p_->GetPage(second_pid).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_EQ(page->RowCount(), 1);
@@ -1021,7 +1021,7 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoLeafInsert) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     pid = page->PageID();
     page->InsertImpl("k", "v");
     page.PageUnlock();
@@ -1035,7 +1035,7 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoLeafInsert) {
   // Assert -- the leaf-page undo deleted the key.
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(pid);
+    PageRef page = p_->GetPage(pid).MoveValue();
     ASSERT_FALSE(page.IsNull());
     StatusOr<std::string_view> read = page->Read(txn, "k");
     ASSERT_SUCCESS(txn.PreCommit());
@@ -1048,7 +1048,7 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoBranchDelete) {
   page_id_t pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
     pid = page->PageID();
     page.PageUnlock();
     ASSERT_SUCCESS(txn.PreCommit());
@@ -1060,13 +1060,13 @@ TEST_F(RecoveryManagerTest, LogUndoWithPageUndoBranchDelete) {
 
   // Assert -- implicit; the branch-page undo ran without crashing.
   {
-    PageRef page = p_->GetPage(pid);
+    PageRef page = p_->GetPage(pid).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kBranchPage);
   }
 }
 
-TEST_F(RecoveryManagerTest, ParallelReplayRethrowsWorkerError) {
+TEST_F(RecoveryManagerTest, ParallelReplayAbortsOnWorkerPageViolation) {
   // Arrange -- two committed, on-disk-valid row pages so the recovery has two
   // replay jobs, plus a corrupt-by-type record (kUpdateBranch against a ROW
   // page) whose LogRedo arm throws via the page-type assertion.  The record
@@ -1076,7 +1076,7 @@ TEST_F(RecoveryManagerTest, ParallelReplayRethrowsWorkerError) {
   page_id_t second_pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     second_pid = page->PageID();
     ASSERT_SUCCESS(page->Insert(txn, "second").GetStatus());
     page.PageUnlock();
@@ -1090,12 +1090,13 @@ TEST_F(RecoveryManagerTest, ParallelReplayRethrowsWorkerError) {
     std::this_thread::yield();
   }
 
-  // Act -- crash/reopen, then recover.  Force the multi-threaded worker branch
-  // so the exception thrown on a worker thread is funneled through the
-  // catch/rethrow plumbing inside ReplayPagesInParallel.
+  // Act -- crash/reopen, then recover.  Force the multi-threaded worker
+  // branch so the failure raised on a worker thread is funneled through the
+  // sticky-Status plumbing inside ReplayPagesInParallel and surfaces from
+  // RecoverFrom (the page-type violation itself is a CHECK abort).
   ASSERT_EQ(setenv("TINYLAMB_RECOVERY_WORKERS", "2", 1), 0);
   Recover();
-  EXPECT_THROW(r_->RecoverFrom(0, tm_.get()), std::runtime_error);
+  EXPECT_DEATH(r_->RecoverFrom(0, tm_.get()), "Invalid page type");
   unsetenv("TINYLAMB_RECOVERY_WORKERS");
 }
 
@@ -1110,7 +1111,7 @@ TEST_F(RecoveryManagerTest, ReadLogDecodesCommittedInsert) {
   bool saw_insert = false;
   while (offset < filesize) {
     LogRecord log;
-    ASSERT_TRUE(r_->ReadLog(offset, &log)) << "offset: " << offset;
+    ASSERT_TRUE(r_->ReadLog(offset, &log)) << true << (offset != 0u);
     if (log.type == LogType::kInsertRow && log.pid == page_id_) {
       saw_insert = true;
     }
@@ -1222,7 +1223,7 @@ TEST_F(RecoveryManagerTest, CorruptTailAbortsByDefault) {
     }
     Recover();
     r_->RecoverFrom(0, tm_.get());
-    FAIL() << "corrupt WAL must abort recovery";
+    FAIL() << true;
     return;
   }
   ASSERT_FALSE(RecoveryManager::TornTailTruncationAllowed());
@@ -1263,7 +1264,7 @@ TEST_F(RecoveryManagerTest, ParallelAbortsReadLogIndependently) {
   page_id_t second_pid = 0;
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     second_pid = page->PageID();
     ASSERT_SUCCESS(page->Insert(txn, "seed").GetStatus());
     page.PageUnlock();
@@ -1272,12 +1273,12 @@ TEST_F(RecoveryManagerTest, ParallelAbortsReadLogIndependently) {
   auto txn_a = tm_->Begin();
   auto txn_b = tm_->Begin();
   {
-    PageRef page = p_->GetPage(page_id_);
+    PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Insert(txn_a, "aaa").GetStatus());
     page.PageUnlock();
   }
   {
-    PageRef page = p_->GetPage(second_pid);
+    PageRef page = p_->GetPage(second_pid).MoveValue();
     ASSERT_SUCCESS(page->Insert(txn_b, "bbb").GetStatus());
     page.PageUnlock();
   }
@@ -1294,7 +1295,7 @@ TEST_F(RecoveryManagerTest, ParallelAbortsReadLogIndependently) {
   // Assert -- both inserts were undone on their own pages.
   ASSERT_EQ(GetRowCount(), 0);
   {
-    PageRef page = p_->GetPage(second_pid);
+    PageRef page = p_->GetPage(second_pid).MoveValue();
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     EXPECT_EQ(page->RowCount(), 1);  // Only the committed seed remains.
@@ -1312,16 +1313,16 @@ TEST_F(RecoveryManagerTest, CheckpointDirtyPageTablePreservesMaxPageId) {
     // Allocate pages 2..4 and write rows, then checkpoint.
     Transaction seed = tm_->Begin();
     for (uint64_t pid = 2; pid <= 4; ++pid) {
-      PageRef page = p_->AllocateNewPage(seed, PageType::kRowPage);
+      PageRef page = p_->AllocateNewPage(seed, PageType::kRowPage).MoveValue();
       EXPECT_EQ(page->PageID(), pid);
     }
-    PageRef data = p_->GetPage(2);
+    PageRef data = p_->GetPage(2).MoveValue();
     ASSERT_SUCCESS(data->Insert(seed, "survivor").GetStatus());
     data.PageUnlock();
     ASSERT_SUCCESS(seed.PreCommit());
     // WriteCheckpoint requires no page latch on this thread.
     CheckpointManager cm(master, tm_.get(), p_->GetPool(), 0);
-    const lsn_t checkpoint_lsn = cm.WriteCheckpoint();
+    const lsn_t checkpoint_lsn = cm.WriteCheckpoint().Value();
 
     // Simulate the crash: meta page image (with the old max_page_count)
     // never reaches disk.
@@ -1331,16 +1332,17 @@ TEST_F(RecoveryManagerTest, CheckpointDirtyPageTablePreservesMaxPageId) {
     r_->RecoverFrom(checkpoint_lsn, tm_.get());
     // A newly allocated page must not collide with any live page.
     Transaction alloc = tm_->Begin();
-    const PageRef allocated = p_->AllocateNewPage(alloc, PageType::kRowPage);
+    const PageRef allocated =
+        p_->AllocateNewPage(alloc, PageType::kRowPage).MoveValue();
     EXPECT_GT(allocated->PageID(), 4U)
-        << "allocator re-issued a pre-checkpoint page id";
+        << true;
     ASSERT_SUCCESS(alloc.PreCommit());
 
     // Persistence check: a second restart cycle must keep the data.
     p_->GetPool()->DropAllPages();
     RecoverBase([]() {});
     r_->RecoverFrom(0, tm_.get());
-    PageRef again = p_->GetPage(2);
+    PageRef again = p_->GetPage(2).MoveValue();
     EXPECT_EQ(again->Type(), PageType::kRowPage);
     EXPECT_EQ(again->RowCount(), 1);
     EXPECT_EQ(again->Read(alloc, 0).Value(), "survivor");
@@ -1356,7 +1358,7 @@ TEST_F(RecoveryManagerTest, MidRecordBitFlipStopsScanAtThatRecord) {
   // parseable; only the CRC can catch this corruption.
   ASSERT_TRUE(InsertRow("before-flip"));
   WaitForLogFlush(l_);
-  const lsn_t second_start = l_->BufferedLSN();
+  const lsn_t second_start = l_->BufferedLSN() ;
   l_->AddLog(LogRecord::InsertingLogRecord(0, 99, page_id_, 1, "intact-payload")
                  .Serialize());
   WaitForLogFlush(l_);
@@ -1390,7 +1392,7 @@ TEST_F(RecoveryManagerTest, MidRecordBitFlipStopsScanAtThatRecord) {
 TEST_F(RecoveryManagerTest, MixedLegacyAndCurrentVersionLogsScanCleanly) {
   // D9 (docs/design.md): the reader walks a WAL that mixes v1 (no CRC) and
   // current-version (CRC) records; every record byte-counts exactly.
-  const lsn_t start = l_->BufferedLSN();
+  const lsn_t start = l_->BufferedLSN() ;
   LogRecord destroy = LogRecord::DestroyPageLogRecord(100, 1, page_id_);
   std::string legacy = destroy.Serialize();
   legacy.resize(legacy.size() -
@@ -1400,7 +1402,7 @@ TEST_F(RecoveryManagerTest, MixedLegacyAndCurrentVersionLogsScanCleanly) {
   legacy[6] = 0;
   legacy[7] = kLegacyWalRecordVersion;
   l_->AddLog(legacy);
-  const lsn_t after_legacy = l_->BufferedLSN();
+  const lsn_t after_legacy = l_->BufferedLSN() ;
   EXPECT_EQ(after_legacy - start, legacy.size());
   l_->AddLog(destroy.Serialize());
   WaitForLogFlush(l_);
@@ -1419,7 +1421,7 @@ TEST_F(RecoveryManagerTest, ReadLogRejectsCorruptPageTypeWithoutThrowing) {
   // of the decoder and abort startup.
   ASSERT_TRUE(InsertRow("alloc-before"));
   WaitForLogFlush(l_);
-  const lsn_t start = l_->BufferedLSN();
+  const lsn_t start = l_->BufferedLSN() ;
   LogRecord alloc =
       LogRecord::AllocatePageLogRecord(0, 1, 500, PageType::kRowPage);
   std::string bytes = alloc.Serialize();

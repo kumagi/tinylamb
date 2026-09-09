@@ -38,6 +38,7 @@ class EvaluationContext;
 
 class TransactionContext {
  public:
+  ~TransactionContext() = default;
   TransactionContext(Transaction&& txn, CatalogReader* catalog)
       : txn_(std::move(txn)), catalog_(catalog) {}
   TransactionContext(const TransactionContext&) = delete;

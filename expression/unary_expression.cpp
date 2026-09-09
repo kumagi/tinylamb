@@ -33,7 +33,7 @@
 
 namespace tinylamb {
 
-Value EvaluateUnary(UnaryOperation operation, const Value& child) {
+StatusOr<Value> TryEvaluateUnary(UnaryOperation operation, const Value& child) {
   switch (operation) {
     case UnaryOperation::kIsNull:
       return Value(child.IsNull());
@@ -51,20 +51,28 @@ Value EvaluateUnary(UnaryOperation operation, const Value& child) {
       return child.IsNull() ? Value() : Value(!child.Truthy());
     case UnaryOperation::kMinus:
       if (child.IsNull()) {
-        return {};
+        return Value();
       }
       if (child.type == ValueType::kDouble) {
         return Value(-child.value.double_value);
       }
       if (child.type == ValueType::kInt64) {
         if (child.value.int_value == std::numeric_limits<int64_t>::min()) {
-          throw std::runtime_error("integer overflow in unary minus");
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in unary minus");
         }
         return Value(-child.value.int_value);
       }
-      throw std::runtime_error("unary minus requires a number");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unary minus requires a number");
   }
-  throw std::logic_error("invalid unary operation");
+  return StatusError(StatusCode::kRuntimeError, "invalid unary operation");
+}
+
+// EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp); bytecode.cpp
+// switches to TryEvaluateUnary in the executor conversion.
+Value EvaluateUnary(UnaryOperation operation, const Value& child) {
+  return ExcShimUnwrap(TryEvaluateUnary(operation, child), "EvaluateUnary");
 }
 
 namespace {
@@ -88,15 +96,30 @@ std::unordered_set<ColumnName> UnaryExpression::TouchedColumns() const {
   return child_->TouchedColumns();
 }
 
+StatusOr<Value> UnaryExpression::TryEvaluate(const Row& row,
+                                             const Schema& schema) const {
+  ASSIGN_OR_RETURN(Value, child, child_->TryEvaluate(row, schema));
+  return TryEvaluateUnary(operation_, child);
+}
+
 Value UnaryExpression::Evaluate(const Row& row, const Schema& schema) const {
-  return EvaluateUnary(operation_, child_->Evaluate(row, schema));
+  return ExcShimUnwrap(TryEvaluate(row, schema), "UnaryExpression::Evaluate");
+}
+
+StatusOr<Value> UnaryExpression::TryEvaluate(const Row* left,
+                                             const Schema& left_schema,
+                                             const Row* right,
+                                             const Schema& right_schema) const {
+  ASSIGN_OR_RETURN(Value, child,
+                   child_->TryEvaluate(left, left_schema, right, right_schema));
+  return TryEvaluateUnary(operation_, child);
 }
 
 Value UnaryExpression::Evaluate(const Row* left, const Schema& left_schema,
                                 const Row* right,
                                 const Schema& right_schema) const {
-  return EvaluateUnary(
-      operation_, child_->Evaluate(left, left_schema, right, right_schema));
+  return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "UnaryExpression::Evaluate");
 }
 
 Type UnaryExpression::ResultType(const Schema& schema) const {

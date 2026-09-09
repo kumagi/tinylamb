@@ -3,6 +3,10 @@
 #define TINYLAMB_GOOGLESQL_AST_VISITOR_HPP
 
 #include <memory>
+#include <string>
+#include <string_view>
+
+#include "common/status_or.hpp"
 
 namespace tinylamb {
 
@@ -30,8 +34,8 @@ class GoogleSqlAstVisitor {
   // `source` is the original SQL the dump was produced from.  The dump does
   // not carry per-pair set-operator text, so Visit slices it out of the
   // source via the recorded byte ranges; pass it whenever available.
-  static std::unique_ptr<Statement> Visit(const GoogleSqlAstNode& root,
-                                          std::string_view source = {});
+  static StatusOr<std::unique_ptr<Statement>> Visit(
+      const GoogleSqlAstNode& root, std::string_view source = {});
 };
 
 }  // namespace tinylamb

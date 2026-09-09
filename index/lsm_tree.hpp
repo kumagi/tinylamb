@@ -43,7 +43,10 @@ void Merger(LSMTree* tree);
 
 class LSMTree final {
  public:
-  LSMTree(std::filesystem::path directory_path);
+  // Opens (creating) the tree directory and its blob file, restores valid
+  // runs and starts the flush/merge workers.
+  static StatusOr<std::unique_ptr<LSMTree>> Create(
+      std::filesystem::path directory_path);
   ~LSMTree();
 
   // Neither movable nor copyable.
@@ -53,17 +56,17 @@ class LSMTree final {
   LSMTree& operator=(LSMTree&&) = delete;
 
   StatusOr<std::string> Read(std::string_view key) const;
-  bool Contains(std::string_view key) const;
-  void Write(std::string_view key, std::string_view value, bool sync = false);
-  void Delete(std::string_view key, bool flush = false);
-  void Sync();
+  StatusOr<bool> Contains(std::string_view key) const;
+  Status Write(std::string_view key, std::string_view value, bool sync = false);
+  Status Delete(std::string_view key, bool flush = false);
+  Status Sync();
 
   LSMView GetView() const {
     std::scoped_lock lk(file_tree_lock_);
     return GetViewImpl();
   }
 
-  void MergeAll();
+  Status MergeAll();
 
   friend std::ostream& operator<<(std::ostream& o, const LSMTree& t) {
     o << "LSMTree(dir=" << t.root_dir_
@@ -85,11 +88,11 @@ class LSMTree final {
  private:
   friend void Flusher(LSMTree* tree);
   friend void Merger(LSMTree* tree);
-  LSMView GetViewImpl() const { return {blob_, index_}; }
+  LSMView GetViewImpl() const { return {*blob_, index_}; }
   // D10 (docs/design.md): scan the run directory at open and restore
   // index_/files_ in numeric generation order (newest first); corrupt,
   // incomplete, malformed or duplicate-generation files are quarantined.
-  void RestoreRuns();
+  Status RestoreRuns();
 
   struct FileAndIndex {
     std::filesystem::path filepath;
@@ -111,7 +114,9 @@ class LSMTree final {
   uint64_t mem_tree_version_{0};
   std::condition_variable_any mem_tree_cv_;
 
-  BlobFile blob_;
+  std::unique_ptr<BlobFile> blob_;
+
+  LSMTree(std::filesystem::path directory_path, std::unique_ptr<BlobFile> blob);
 
   std::atomic<bool> stop_{false};
   // Serializes whole Sync() bodies (swap -> construct -> register). Two

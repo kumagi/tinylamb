@@ -73,8 +73,11 @@ bool BitmapHeapScan::Next(Row* dst, RowPosition* rp) {
       continue;
     }
     if (where_) {
-      Value res = where_->Evaluate(row_or.Value(), schema_);
-      if (res.IsNull() || !res.Truthy()) {
+      StatusOr<Value> res = where_->TryEvaluate(row_or.Value(), schema_);
+      if (!res.HasValue()) {
+        return FailWith(res.GetStatus());
+      }
+      if (res.Value().IsNull() || !res.Value().Truthy()) {
         continue;
       }
     }

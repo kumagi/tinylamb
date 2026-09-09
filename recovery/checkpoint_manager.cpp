@@ -53,20 +53,21 @@ namespace {
 // path. The directory fsync afterwards is best-effort -- without it a crash
 // may revert the rename, but the previous (still valid) master record simply
 // keeps recovery conservative.
-void WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
+Status WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
   const std::filesystem::path tmp = path.string() + ".tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     if (!out) {
-      throw std::runtime_error("Failed to open master record: " + tmp.string());
+      return StatusError(StatusCode::kIOError,
+                         "Failed to open master record: " + tmp.string());
     }
     std::array<char, sizeof(lsn_t)> encoded{};
     SerializeU64(encoded.data(), lsn);
     out.write(encoded.data(), encoded.size());
     out.flush();
     if (!out) {
-      throw std::runtime_error("Failed to write master record: " +
-                               tmp.string());
+      return StatusError(StatusCode::kIOError,
+                         "Failed to write master record: " + tmp.string());
     }
     // The comment contract above promises a file fsync before the rename:
     // without it a crash can leave an empty/torn master record behind even
@@ -93,11 +94,18 @@ void WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
     if (rc != 0) {
       std::error_code ec;
       std::filesystem::remove(tmp, ec);
-      throw std::runtime_error("Failed to fsync master record: " +
-                               tmp.string() + ": " + std::strerror(errno));
+      return StatusError(StatusCode::kIOError,
+                         "Failed to fsync master record: " + tmp.string() +
+                             ": " + std::strerror(errno));
     }
   }
-  std::filesystem::rename(tmp, path);
+  std::error_code rename_ec;
+  std::filesystem::rename(tmp, path, rename_ec);
+  if (rename_ec) {
+    return StatusError(StatusCode::kIOError,
+                       "Failed to rename master record to " + path.string() +
+                           ": " + rename_ec.message());
+  }
   const std::filesystem::path dir =
       path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
   const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
@@ -105,6 +113,7 @@ void WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
     ::fsync(dir_fd);
     ::close(dir_fd);
   }
+  return Status::kSuccess;
 }
 
 }  // namespace
@@ -125,25 +134,25 @@ void CheckpointManager::WorkerThreadTask() {
     }
     if (!stop_) {
       LOG(INFO) << "Start periodic checkpointing";
-      try {
-        WriteCheckpoint();
-      } catch (const std::exception& e) {
+      const StatusOr<lsn_t> checkpoint_lsn = WriteCheckpoint();
+      if (!checkpoint_lsn.HasValue()) {
         // The worker thread must never die from an IO failure; log and keep
         // retrying on the next tick.
-        LOG(ERROR) << "Periodic checkpoint failed: " << e.what();
+        LOG(ERROR) << "Periodic checkpoint failed: "
+                   << checkpoint_lsn.GetStatus();
       }
     }
   }
 }
 
-lsn_t CheckpointManager::WriteCheckpoint(
+StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
     const std::function<void()>& func_for_test) {
   // The DPT snapshot takes each page's shared latch; callers must not hold
   // any page latch (PageRef) on this thread while checkpointing.
   LogRecord begin = LogRecord::BeginCheckpointLogRecord();
 
   // Write [BeginFullScan-Checkpoint] log.
-  lsn_t begin_lsn = tm_->logger_->AddLog(begin.Serialize());
+  ASSIGN_OR_RETURN(lsn_t, begin_lsn, tm_->logger_->AddLog(begin.Serialize()));
 
   std::vector<std::pair<page_id_t, lsn_t> > dirty_page_table;
   {
@@ -191,12 +200,12 @@ lsn_t CheckpointManager::WriteCheckpoint(
   func_for_test();
 
   // Write [End-Checkpoint] log.
-  tm_->AddLog(end);
+  RETURN_IF_FAIL(tm_->AddLog(end).GetStatus());
   // The master record must not overtake the WAL: wait until every record up
   // to (and including) EndCheckpoint is on stable storage, so a reader that
   // trusts begin_lsn always finds a complete checkpoint pair behind it.
   const lsn_t durable_end = tm_->logger_->BufferedLSN();
-  tm_->logger_->WaitForDurable(durable_end);
+  RETURN_IF_FAIL(tm_->logger_->WaitForDurable(durable_end));
 
   // Once the checkpoint is durable, every byte before begin_lsn is safe to
   // release from page cache: the next recovery starts from begin_lsn, so the
@@ -204,7 +213,7 @@ lsn_t CheckpointManager::WriteCheckpoint(
   // multi-hundred-MB WAL otherwise has to wait for all of them.
   tm_->logger_->AdviseOldBytesDurable(begin_lsn);
 
-  WriteMasterRecord(master_record_path, begin_lsn);
+  RETURN_IF_FAIL(WriteMasterRecord(master_record_path, begin_lsn));
   return begin_lsn;
 }
 }  // namespace tinylamb

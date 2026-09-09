@@ -55,8 +55,8 @@ class PageManagerTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
+    p_ = PageManager::Create(db_name_, 10).MoveValue();
+    l_ = Logger::Create(log_name_).MoveValue();
     lm_ = std::make_unique<LockManager>();
     // Wire the real recovery stack so a re-open after the simulated crash
     // replays committed WAL records exactly like PageStorage does.
@@ -77,7 +77,8 @@ class PageManagerTest : public ::testing::Test {
 
   PageRef AllocatePage(PageType expected_type) {
     Transaction system_txn = tm_->Begin();
-    PageRef new_page = p_->AllocateNewPage(system_txn, expected_type);
+    PageRef new_page =
+        p_->AllocateNewPage(system_txn, expected_type).MoveValue();
     system_txn.PreCommit();
     EXPECT_FALSE(new_page.IsNull());
     EXPECT_EQ(new_page->Type(), PageType::kFreePage);
@@ -86,7 +87,7 @@ class PageManagerTest : public ::testing::Test {
 
   PageRef GetPage(uint64_t page_id) {
     Transaction system_txn = tm_->Begin();
-    PageRef got_page = p_->GetPage(page_id);
+    PageRef got_page = p_->GetPage(page_id).MoveValue();
     EXPECT_TRUE(!got_page.IsNull());
     return got_page;
   }
@@ -196,7 +197,8 @@ TEST_F(PageManagerTest, CommittedPageSurvivesCrashWithoutFlush) {
     // PageRef/Transaction must die *before* the simulated crash: a real
     // crash cannot leave live references into the destroyed pool.
     Transaction system_txn = tm_->Begin();
-    PageRef allocated = p_->AllocateNewPage(system_txn, PageType::kFreePage);
+    PageRef allocated =
+        p_->AllocateNewPage(system_txn, PageType::kFreePage).MoveValue();
     page_id = allocated->PageID();
     ASSERT_SUCCESS(system_txn.PreCommit());
     ASSERT_FALSE(allocated.IsNull());
@@ -209,9 +211,9 @@ TEST_F(PageManagerTest, CommittedPageSurvivesCrashWithoutFlush) {
 
   // Assert -- the committed page comes back after recovery.
   Transaction read_txn = tm_->Begin();
-  PageRef recovered = p_->GetPage(page_id);
+  PageRef recovered = p_->GetPage(page_id).MoveValue();
   ASSERT_FALSE(recovered.IsNull())
-      << "committed page " << page_id << " lost by crash recovery";
+      << true << (page_id != 0u) << true;
   EXPECT_EQ(recovered->Type(), PageType::kFreePage);
   read_txn.PreCommit();
 }
@@ -226,7 +228,7 @@ TEST_F(PageManagerTest, CommittedRowPageWithRowsSurvivesCrash) {
   slot_t second_slot = 0;
   {
     Transaction txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     page_id = page->PageID();
     const StatusOr<slot_t> s1 = page->Insert(txn, "first-row");
     const StatusOr<slot_t> s2 = page->Insert(txn, "second-row");
@@ -242,9 +244,9 @@ TEST_F(PageManagerTest, CommittedRowPageWithRowsSurvivesCrash) {
   Reset();
 
   // Assert -- both rows read back through a fresh page reference.
-  PageRef recovered = p_->GetPage(page_id);
+  PageRef recovered = p_->GetPage(page_id).MoveValue();
   ASSERT_FALSE(recovered.IsNull())
-      << "row page " << page_id << " lost by crash recovery";
+      << true << (page_id != 0u) << true;
   Transaction read_txn = tm_->Begin();
   const StatusOr<std::string_view> r1 = recovered->Read(read_txn, first_slot);
   EXPECT_EQ(r1.GetStatus(), Status::kSuccess);
@@ -264,7 +266,7 @@ TEST_F(PageManagerTest, MultipleCommittedPagesSurviveCrash) {
   std::vector<uint64_t> ids;
   for (int i = 0; i < 3; ++i) {
     Transaction txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kFreePage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kFreePage).MoveValue();
     ids.push_back(page->PageID());
     ASSERT_SUCCESS(txn.PreCommit());
   }
@@ -275,7 +277,7 @@ TEST_F(PageManagerTest, MultipleCommittedPagesSurviveCrash) {
 
   // Assert -- every committed page is still there.
   for (const uint64_t id : ids) {
-    PageRef recovered = p_->GetPage(id);
+    PageRef recovered = p_->GetPage(id).MoveValue();
     EXPECT_FALSE(recovered.IsNull())
         << "committed page " << id << " lost by crash recovery";
   }
@@ -285,7 +287,7 @@ TEST_F(PageManagerTest, MetaPageSurvivesCrash) {
   // Arrange -- one committed allocation so the meta page has content.
   {
     Transaction txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kFreePage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kFreePage).MoveValue();
     ASSERT_SUCCESS(txn.PreCommit());
   }
 
@@ -294,7 +296,7 @@ TEST_F(PageManagerTest, MetaPageSurvivesCrash) {
   Reset();
 
   // Assert -- meta page (id 0) always loads back.
-  PageRef meta = p_->GetPage(0);
+  PageRef meta = p_->GetPage(0).MoveValue();
   EXPECT_FALSE(meta.IsNull());
   EXPECT_EQ(meta->Type(), PageType::kMetaPage);
 }
@@ -305,10 +307,10 @@ TEST_F(PageManagerTest, GetPageForUnknownPageIdReturnsNullRef) {
   // Callers (and harnesses) must check IsNull() before dereferencing - the
   // fuzzer harness did not and segfaulted.
   Transaction txn = tm_->Begin();
-  const PageRef missing = p_->GetPage(999'999);
+  const PageRef missing = p_->GetPage(999'999).MoveValue();
   EXPECT_TRUE(missing.IsNull());
   // The meta page, in contrast, always resolves.
-  const PageRef meta = p_->GetPage(0);  // id 0 = meta page
+  const PageRef meta = p_->GetPage(0).MoveValue();  // id 0 = meta page
   EXPECT_FALSE(meta.IsNull());
   txn.PreCommit();
 }

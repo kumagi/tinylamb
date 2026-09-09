@@ -27,38 +27,49 @@
 #include "common/constants.hpp"
 
 namespace tinylamb {
-BlobFile::BlobFile(const std::filesystem::path& path, size_t memory_capacity,
-                   size_t max_filesize)
-    : file_writer_(path),
-      cache_(file_writer_.Fd(), memory_capacity, max_filesize) {}
-
-std::string BlobFile::ReadAt(size_t offset, size_t length) const {
-  // Appends are asynchronous. A reader on the same BlobFile must nevertheless
-  // observe every offset already returned by Append().
-  Flush();
-  return cache_.ReadAt(offset, length);
+StatusOr<std::unique_ptr<BlobFile>> BlobFile::Create(
+    const std::filesystem::path& path, size_t memory_capacity,
+    size_t max_filesize) {
+  ASSIGN_OR_RETURN(std::unique_ptr<Logger>, writer, Logger::Create(path));
+  ASSIGN_OR_RETURN(std::unique_ptr<Cache>, cache,
+                   Cache::Create(writer->Fd(), memory_capacity, max_filesize));
+  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+  return std::unique_ptr<BlobFile>(
+      new BlobFile(std::move(writer), std::move(cache)));  // NOLINT
 }
 
-Cache::Locks BlobFile::ReadAt(size_t offset, std::string_view& out) const {
-  Flush();
+BlobFile::BlobFile(std::unique_ptr<Logger> file_writer,
+                   std::unique_ptr<Cache> cache)
+    : file_writer_(std::move(file_writer)), cache_(std::move(cache)) {}
+
+StatusOr<std::string> BlobFile::ReadAt(size_t offset, size_t length) const {
+  // Appends are asynchronous. A reader on the same BlobFile must nevertheless
+  // observe every offset already returned by Append().
+  RETURN_IF_FAIL(Flush());
+  return cache_->ReadAt(offset, length);
+}
+
+StatusOr<Cache::Locks> BlobFile::ReadAt(size_t offset,
+                                        std::string_view& out) const {
+  RETURN_IF_FAIL(Flush());
   out = {};
   constexpr size_t kHeaderSize = sizeof(int32_t);
   int32_t key_size = 0;
-  cache_.Copy(&key_size, offset, kHeaderSize);
+  RETURN_IF_FAIL(cache_->Copy(&key_size, offset, kHeaderSize));
   key_size = static_cast<int32_t>(be32toh(static_cast<uint32_t>(key_size)));
   if (key_size < 0) {
     // Disk-derived length is bogus; refuse instead of propagating garbage.
-    return {};
+    return StatusError(StatusCode::kCorrupt, "blob entry header is negative");
   }
-  return cache_.ReadAt(offset + kHeaderSize, static_cast<size_t>(key_size),
-                       out);
+  return cache_->ReadAt(offset + kHeaderSize, static_cast<size_t>(key_size),
+                        out);
 }
 
-lsn_t BlobFile::Append(std::string_view payload) {
+StatusOr<lsn_t> BlobFile::Append(std::string_view payload) {
   std::scoped_lock<std::mutex> lk(writer_lock_);
-  size_t before = file_writer_.BufferedLSN();
-  lsn_t lsn = file_writer_.AddLog(payload);
-  cache_.Invalidate(before, payload.length());
+  const size_t before = file_writer_->BufferedLSN();
+  ASSIGN_OR_RETURN(lsn_t, lsn, file_writer_->AddLog(payload));
+  cache_->Invalidate(before, payload.length());
   return lsn;
 }
 }  // namespace tinylamb

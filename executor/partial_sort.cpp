@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
@@ -23,10 +24,18 @@ namespace tinylamb {
 namespace {
 
 int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
-                   const std::vector<SortExecutor::Key>& keys) {
+                   const std::vector<SortExecutor::Key>& keys, Status* error) {
   for (const auto& key : keys) {
-    Value lv = key.expression->Evaluate(lhs, schema);
-    Value rv = key.expression->Evaluate(rhs, schema);
+    StatusOr<Value> lv_or = key.expression->TryEvaluate(lhs, schema);
+    StatusOr<Value> rv_or = key.expression->TryEvaluate(rhs, schema);
+    if (!lv_or.HasValue() || !rv_or.HasValue()) {
+      if (error != nullptr && *error == Status::kSuccess) {
+        *error = lv_or.HasValue() ? rv_or.GetStatus() : lv_or.GetStatus();
+      }
+      return 0;
+    }
+    Value lv = lv_or.MoveValue();
+    Value rv = rv_or.MoveValue();
     if (lv.IsNull() && rv.IsNull()) {
       continue;
     }
@@ -65,9 +74,10 @@ void PartialSortExecutor::ExecutePartialSort() {
   output_.clear();
   output_offset_ = 0;
 
+  Status sort_error{Status::kSuccess};
   auto comp = [&](const std::pair<Row, RowPosition>& a,
                   const std::pair<Row, RowPosition>& b) {
-    return CompareRowKeys(a.first, b.first, schema_, keys_) < 0;
+    return CompareRowKeys(a.first, b.first, schema_, keys_, &sort_error) < 0;
   };
 
   Row row;
@@ -144,6 +154,11 @@ void PartialSortExecutor::ExecutePartialSort() {
   }
 
   charge_.Add(total_bytes);
+  if (source_ && source_->GetStatus() != Status::kSuccess &&
+      sort_error == Status::kSuccess) {
+    sort_error = source_->GetStatus();
+  }
+  sort_error_ = sort_error;
 }
 
 void PartialSortExecutor::EnsureMaterialized() {
@@ -159,6 +174,9 @@ void PartialSortExecutor::MaterializePipeline() { EnsureMaterialized(); }
 bool PartialSortExecutor::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
   EnsureMaterialized();
+  if (sort_error_ != Status::kSuccess) {
+    return FailWith(sort_error_);
+  }
   if (output_offset_ >= output_.size()) {
     return false;
   }

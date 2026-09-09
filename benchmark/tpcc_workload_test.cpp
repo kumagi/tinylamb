@@ -30,7 +30,7 @@ class TpccWorkloadTest : public ::testing::Test {
  protected:
   void SetUp() override {
     path_ = "tpcc_workload_test-" + RandomString();
-    database_ = std::make_unique<Database>(path_);
+    database_ = Database::Create(path_).MoveValue();
   }
 
   void TearDown() override { database_->DeleteAll(); }
@@ -90,10 +90,10 @@ TEST(TpccScaleTest, NurandCLastDelta) {
     const TpccNurand nurand = TpccNurand::FromSeed(seed);
     ASSERT_TRUE(nurand.valid);
     const int delta = std::abs(nurand.c_last_load - nurand.c_last_run);
-    EXPECT_GE(delta, 65) << seed;
-    EXPECT_LE(delta, 119) << seed;
-    EXPECT_NE(delta, 96) << seed;
-    EXPECT_NE(delta, 112) << seed;
+    EXPECT_GE(delta, 65) << (seed != 0u);
+    EXPECT_LE(delta, 119) << (seed != 0u);
+    EXPECT_NE(delta, 96) << (seed != 0u);
+    EXPECT_NE(delta, 112) << (seed != 0u);
     EXPECT_GE(nurand.c_last_load, 0);
     EXPECT_LE(nurand.c_last_load, 255);
     EXPECT_GE(nurand.c_last_run, 0);
@@ -546,7 +546,7 @@ TEST_F(TpccWorkloadTest, InitializeTwiceRejectsExistingSchema) {
 TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
   auto MakeDb = []() -> std::unique_ptr<Database> {
     const std::string path = "tpcc_workload_failpath_test-" + RandomString();
-    auto database = std::make_unique<Database>(path);
+    auto database = Database::Create(path).MoveValue();
     std::string error;
     if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
         Status::kSuccess) {
@@ -652,7 +652,7 @@ TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
 TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
   auto MakeDb = []() -> std::unique_ptr<Database> {
     const std::string path = "tpcc_workload_payment_test-" + RandomString();
-    auto database = std::make_unique<Database>(path);
+    auto database = Database::Create(path).MoveValue();
     std::string error;
     if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
         Status::kSuccess) {
@@ -726,7 +726,7 @@ TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
                  std::string::npos) {
         saw_id_lookup = true;
       } else {
-        ADD_FAILURE() << "unexpected payment failure: " << result.error;
+        ADD_FAILURE() << true << result.error;
       }
     }
     EXPECT_TRUE(saw_name_lookup);
@@ -751,7 +751,7 @@ TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
 TEST(TpccWorkloadFailPathTest, OrderStatusAbortsWhenSupportingRowsMissing) {
   auto MakeDb = []() -> std::unique_ptr<Database> {
     const std::string path = "tpcc_workload_orderstatus_test-" + RandomString();
-    auto database = std::make_unique<Database>(path);
+    auto database = Database::Create(path).MoveValue();
     std::string error;
     if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
         Status::kSuccess) {
@@ -810,7 +810,7 @@ TEST(TpccWorkloadFailPathTest, OrderStatusAbortsWhenSupportingRowsMissing) {
                  std::string::npos) {
         saw_id_lookup = true;
       } else {
-        ADD_FAILURE() << "unexpected order-status failure: " << result.error;
+        ADD_FAILURE() << true << result.error;
       }
     }
     EXPECT_TRUE(saw_name_lookup);
@@ -850,7 +850,7 @@ TEST(TpccWorkloadFailPathTest, OrderStatusAbortsWhenSupportingRowsMissing) {
 TEST(TpccWorkloadFailPathTest, DeliveryAndStockLevelAbortWhenRowsMissing) {
   auto MakeDb = []() -> std::unique_ptr<Database> {
     const std::string path = "tpcc_workload_delivery_test-" + RandomString();
-    auto database = std::make_unique<Database>(path);
+    auto database = Database::Create(path).MoveValue();
     std::string error;
     if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
         Status::kSuccess) {

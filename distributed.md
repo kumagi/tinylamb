@@ -25,12 +25,14 @@
     ファイル先頭からのバイトオフセット)、`WaitForDurable(lsn)`(group commit 待ち)、
     `DurableLSN()/BufferedLSN()`。fsync は最大 10ms バッチ。
   - `recovery/log_record.hpp:31` — `LogType` 32 種。txn 毎の `prev_lsn` 逆連鎖。
-    **レコード/WAL にチェックサム・バージョン・長さ枠は無い**(§5.2 で対策)。
-  - `recovery/recovery_manager.hpp` — `RecoverFrom` / `SinglePageRecovery`
+    レコードは `kWalRecordVersion`(:49)と CRC32C チェックサム・長さ枠を持つ
+    (D9、docs/wal_format.md 参照)。複製では §5.2 のヘッダ拡張を再利用する。
+  - `recovery/recovery_manager.hpp` — `RecoverFrom(checkpoint_lsn, tm)` /
+    `SinglePageRecovery`
     (CRC 不良ページのログ再構築)。page_lsn ガードで REDO 冪等
     (recovery_manager.cpp:74)。
-  - `recovery/checkpoint_manager.hpp` — fuzzy checkpoint。ただし
-    **master record は書かれるが読まれず、常に offset 0 から全走査する**
+  - `recovery/checkpoint_manager.hpp` — fuzzy checkpoint。master record の
+    checkpoint LSN は `RecoverFrom` の起点として読まれる
     (page_storage.cpp:52)。WAL 切り詰めも存在しない(§8)。
   - `transaction/transaction_manager.cpp:57` — `PreCommit` は
     ①`CommitVersions`(MVCC 可視化、:59)→ ②kCommit 記録(:62)→ ③`WaitForDurable`
@@ -47,8 +49,8 @@
     seal 待ち化には callback 完了への改修が要る(§9)。
 - コンパイル規約・スタイルはリポジトリ従来通り(Apache 2.0 ヘッダ、clang-format、
   コメント最小限)。CMake は `add_simple_test`(CMakeLists.txt:382)と
-  `tinylamb::*` エイリアスの慣例に従う。**fuzzer セクションは現状コメントアウト
-  されている**(CMakeLists.txt:472-524)。Phase 0 で harness を復活させる(§12)。
+  `tinylamb::*` エイリアスの慣例に従う。fuzzer ターゲットは
+  `TINYLAMB_ENABLE_FUZZ=ON`(CMakeLists.txt:772)でビルドできる(§12)。
 
 ## 1. 設計の核心(要約)
 
@@ -227,8 +229,8 @@ router や admin からの構成読み取りは制御ノードの ReadIndex
 - `LogType` に追加:
   - `kEpochBegin` — payload に epoch_t。ストリーム内で epoch 境界を刻むマーカ
   - `kShardHeader` — ファイル先頭固定位置に書く {shard_id, stream_id, creation_view}
-- 既存 WAL にはチェックサム・長さ枠が無い。単一ノードでは「解析失敗=末尾」規約で
-  成立しているが、配送では**バッチヘッダ
+- 既存 WAL レコードはレコード毎の CRC32C と長さ枠を持つが、配送ではストリーム
+  全体の完全性を**バッチヘッダ
   `{stream_id, start_lsn, end_lsn, first_epoch, last_epoch, view, crc32c}`** で
   バッチ単位の完全性を検証する(`common/crc32c.hpp` を使用)。
 - `LogRecord` 本体への epoch 埋め込みはしない。エポック帰属は「直前の

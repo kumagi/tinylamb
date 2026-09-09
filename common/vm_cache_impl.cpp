@@ -40,23 +40,23 @@
 
 namespace tinylamb {
 namespace {
-uint64_t FileSize(int fd) {
+StatusOr<uint64_t> FileSize(int fd) {
   struct stat s{};
   if (::fstat(fd, &s) == -1) {
-    throw std::runtime_error(std::string("Cannot get filesize: ") +
-                             strerror(errno));
+    return StatusError(StatusCode::kIOError,
+                       std::string("Cannot get filesize: ") + strerror(errno));
   }
   if (s.st_size < 0) {
-    throw std::runtime_error("Negative filesize from fstat");
+    return StatusError(StatusCode::kCorrupt, "Negative filesize from fstat");
   }
   return static_cast<uint64_t>(s.st_size);
 }
 
-size_t AddressableSize(int fd, size_t offset, size_t file_size) {
+StatusOr<size_t> AddressableSize(int fd, size_t offset, size_t file_size) {
   if (file_size != 0) {
     return file_size;
   }
-  const uint64_t on_disk = FileSize(fd);
+  ASSIGN_OR_RETURN(uint64_t, on_disk, FileSize(fd));
   return on_disk >= offset ? static_cast<size_t>(on_disk - offset) : 0;
 }
 }  // namespace
@@ -88,18 +88,38 @@ std::ostream& operator<<(std::ostream& o, const VMCacheImpl::PageState& s) {
   return o;
 }
 
+StatusOr<std::unique_ptr<VMCacheImpl>> VMCacheImpl::Create(
+    int fd, size_t block_size, size_t memory_capacity, size_t offset,
+    size_t file_size, bool own_fd) {
+  if (memory_capacity == 0) {
+    return StatusError(StatusCode::kInvalidArgument, "Cache size is 0");
+  }
+  ASSIGN_OR_RETURN(size_t, addressable, AddressableSize(fd, offset, file_size));
+  // An explicit `file_size` is the addressable window (e.g. a blob's
+  // maximum size, since the file keeps growing); otherwise fall back to
+  // the current on-disk size. Always map at least one block so empty
+  // files stay usable.
+  const size_t max_size = std::max<size_t>(addressable, block_size);
+  char* buffer = reinterpret_cast<char*>(
+      ::mmap(nullptr, max_size, PROT_READ | PROT_WRITE,
+             MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0));
+  if (buffer == MAP_FAILED) {
+    return StatusError(StatusCode::kIOError,
+                       std::string("mmap failed: ") + strerror(errno));
+  }
+  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+  return std::unique_ptr<VMCacheImpl>(new VMCacheImpl(  // NOLINT
+      fd, block_size, memory_capacity, offset, max_size, own_fd, buffer));
+}
+
 VMCacheImpl::VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
-                         size_t offset, size_t file_size, bool own_fd)
+                         size_t offset, size_t max_size, bool own_fd,
+                         char* buffer)
     : fd_(fd),
       own_fd_(own_fd),
       block_size_(block_size),
       max_memory_pages_((memory_capacity + block_size - 1) / block_size),
-      // An explicit `file_size` is the addressable window (e.g. a blob's
-      // maximum size, since the file keeps growing); otherwise fall back to
-      // the current on-disk size. Always map at least one block so empty
-      // files stay usable.
-      max_size_(
-          std::max<size_t>(AddressableSize(fd, offset, file_size), block_size)),
+      max_size_(max_size),
       offset_(offset),
       meta_(((max_size_ / block_size)) + 1),
       // Degenerated configurations (e.g. memory_capacity < block_size) would
@@ -109,34 +129,18 @@ VMCacheImpl::VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
           1, max_memory_pages_ - ((max_memory_pages_ + 9) / 10))),
       ghost_queue_size_(std::max<size_t>(
           1, max_memory_pages_ - ((max_memory_pages_ + 9) / 10))) {
-  if (memory_capacity == 0) {
-    throw std::runtime_error("Cache size is 0");
-  }
-  buffer_ = reinterpret_cast<char*>(
-      ::mmap(nullptr, max_size_, PROT_READ | PROT_WRITE,
-             MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0));
-  if (buffer_ == MAP_FAILED) {
-    buffer_ = nullptr;
-    throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
-  }
+  buffer_ = buffer;
   for (auto& m : meta_) {
     m.store(PageState::kEvicted, std::memory_order_relaxed);
   }
-  /*
-  LOG(TRACE) << "VMCacheImpl: " << max_memory_pages_ << " pages in memory"
-             << " total: " << meta_.size()
-             << " pages Small: " << small_queue_size_
-             << " Main: " << main_queue_size_
-             << " Ghost: " << ghost_queue_size_;
-             */
 }
 
-void VMCacheImpl::Read(void* dst, size_t offset, size_t length) const {
+Status VMCacheImpl::Read(void* dst, size_t offset, size_t length) const {
   char* dst_ptr = reinterpret_cast<char*>(dst);
   // Clamp to the mapped window exactly like the string-returning ReadAt();
   // reading past max_size_ would touch unmapped memory.
   if (length == 0 || max_size_ <= offset) {
-    return;
+    return Status::kSuccess;
   }
   length = std::min(length, max_size_ - offset);
   // NOTE: deliberately the ceil-style formula. For block-aligned offsets it
@@ -147,22 +151,23 @@ void VMCacheImpl::Read(void* dst, size_t offset, size_t length) const {
       (((offset + block_size_ - 1) / block_size_) * block_size_) - offset;
   size_t read_size = std::min(to_next_boundary, length);
   while (0 < length) {
-    ReadInPage(dst_ptr, read_size, buffer_ + offset);
+    RETURN_IF_FAIL(ReadInPage(dst_ptr, read_size, buffer_ + offset));
     offset += read_size;
     length -= read_size;
     dst_ptr += read_size;
     read_size = std::min(block_size_, length);
   }
+  return Status::kSuccess;
 }
 
-std::string VMCacheImpl::ReadAt(size_t offset, size_t length) const {
+StatusOr<std::string> VMCacheImpl::ReadAt(size_t offset, size_t length) const {
   std::string result(length, '\0');
-  Copy(result.data(), offset, length);
+  RETURN_IF_FAIL(Copy(result.data(), offset, length));
   return result;
 }
 
-VMCacheImpl::Locks VMCacheImpl::ReadAt(size_t offset, size_t length,
-                                       std::string_view& out) const {
+StatusOr<VMCacheImpl::Locks> VMCacheImpl::ReadAt(size_t offset, size_t length,
+                                                 std::string_view& out) const {
   Locks locks;
   if (offset >= max_size_ || length == 0) {
     out = {};
@@ -176,7 +181,7 @@ VMCacheImpl::Locks VMCacheImpl::ReadAt(size_t offset, size_t length,
 
   locks.reserve(clamped_last >= first_page ? clamped_last - first_page + 1 : 0);
   for (size_t page = first_page; page <= clamped_last; ++page) {
-    FixPage(page);
+    RETURN_IF_FAIL(FixPage(page));
     locks.push_back(PageLock::Pin(meta_[page]));
   }
   out = std::string_view(&buffer_[offset], take);
@@ -202,12 +207,13 @@ void VMCacheImpl::Invalidate(size_t offset, size_t length) {
 }
 
 // The `dst` to `length` range must not go over any page boundaries.
-void VMCacheImpl::ReadInPage(void* dst, size_t length, void* src) const {
+Status VMCacheImpl::ReadInPage(void* dst, size_t length, void* src) const {
   size_t page =
       static_cast<size_t>(reinterpret_cast<char*>(src) - buffer_) / block_size_;
-  FixPage(page);
+  RETURN_IF_FAIL(FixPage(page));
   ::memcpy(dst, src, length);
   UnfixPage(page);
+  return Status::kSuccess;
 }
 
 size_t VMCacheImpl::FindMetaPage(std::atomic<PageState>* page_ptr) const {
@@ -274,8 +280,7 @@ void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
           break;
         case PageState::kUnknown:
         default:
-          assert(!"never reach here");
-          throw std::runtime_error("VMCacheImpl: unknown page state");
+          CHECK_MSG(false, "VMCacheImpl: unknown page state");
       }
       break;
     }
@@ -346,8 +351,7 @@ void VMCacheImpl::EnqueueToMainFifo(  // NOLINT(misc-no-recursion)
           break;
         case PageState::kUnknown:
         default:
-          assert(!"never reach here");
-          throw std::runtime_error("VMCacheImpl: unknown page state");
+          CHECK_MSG(false, "VMCacheImpl: unknown page state");
       }
       break;
     }
@@ -391,7 +395,7 @@ void VMCacheImpl::EnqueueToGhostFifo(std::atomic<PageState>* page_ptr) const {
   assert(ghost_queue_.size() <= ghost_queue_size_);
 }
 
-void VMCacheImpl::FixPage(size_t page) const {
+Status VMCacheImpl::FixPage(size_t page) const {
   std::atomic<PageState>& target = meta_[page];
   for (;;) {
     PageState state = target.load(std::memory_order_acquire);
@@ -407,14 +411,13 @@ void VMCacheImpl::FixPage(size_t page) const {
             EnqueueToMainFifo(&target);
           }
         }
-        Activate(page);
-        return;
+        return Activate(page);
       }
     } else if (state == PageState::kUnlocked ||
                state == PageState::kUnlockedAccessed) {
       if (std::atomic_compare_exchange_weak(&target, &state,
                                             PageState::kLockedAccessed)) {
-        return;
+        return Status::kSuccess;
       }
     } else {
       // kLocked/kLockedAccessed: another thread pins this page. Back off so
@@ -431,8 +434,7 @@ void VMCacheImpl::UnfixPage(size_t page) const {
   } else if (state == PageState::kLockedAccessed) {
     meta_[page].store(PageState::kUnlockedAccessed, std::memory_order_release);
   } else {
-    assert(!"Invalid state sequence");
-    throw std::runtime_error("UnfixPage: invalid state sequence");
+    CHECK_MSG(false, "UnfixPage: invalid state sequence");
   }
 }
 
@@ -468,16 +470,17 @@ void VMCacheImpl::InvalidatePage(size_t page) const {
   }
 }
 
-void VMCacheImpl::Activate(size_t page) const {
+Status VMCacheImpl::Activate(size_t page) const {
   size_t offset = (page * block_size_);
   size_t rest_size = block_size_;
   while (0 < rest_size) {
     ssize_t read_bytes = ::pread(fd_, &buffer_[offset], rest_size,
                                  static_cast<off_t>(offset + offset_));
     if (read_bytes < 0) {
-      // A failed pread must not decrement rest_size below zero (the loop would
-      // never terminate); treat it as fatal like the mmap failure path.
-      throw std::runtime_error(std::string("pread failed: ") + strerror(errno));
+      // A failed pread must not decrement rest_size below zero (the loop
+      // would never terminate); report it like the mmap failure path.
+      return StatusError(StatusCode::kIOError,
+                         std::string("pread failed: ") + strerror(errno));
     }
     if (read_bytes == 0) {
       break;
@@ -485,6 +488,7 @@ void VMCacheImpl::Activate(size_t page) const {
     rest_size -= static_cast<size_t>(read_bytes);
     offset += static_cast<size_t>(read_bytes);
   }
+  return Status::kSuccess;
 }
 
 void VMCacheImpl::Release(size_t page) const {
@@ -505,22 +509,19 @@ bool VMCacheImpl::SanityCheck() const {
   std::set<std::atomic<PageState>*> pages;
   for (const auto& c : small_queue_) {
     if (pages.contains(c)) {
-      assert(!"Duplicate fifo entry");
-      throw std::runtime_error("SanityCheck: duplicate entry in small fifo");
+      CHECK_MSG(false, "SanityCheck: duplicate entry in small fifo");
     }
     pages.emplace(c);
   }
   for (const auto& c : main_queue_) {
     if (pages.contains(c)) {
-      assert(!"Duplicate fifo entry");
-      throw std::runtime_error("SanityCheck: duplicate entry in main fifo");
+      CHECK_MSG(false, "SanityCheck: duplicate entry in main fifo");
     }
     pages.emplace(c);
   }
   for (const auto& c : ghost_queue_) {
     if (pages.contains(c)) {
-      assert(!"Duplicate fifo entry");
-      throw std::runtime_error("SanityCheck: duplicate entry in ghost fifo");
+      CHECK_MSG(false, "SanityCheck: duplicate entry in ghost fifo");
     }
     pages.emplace(c);
   }

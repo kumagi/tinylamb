@@ -21,6 +21,8 @@ class LambdaExpression : public ExpressionBase {
       : parameters_(std::move(parameters)), body_(std::move(body)) {}
 
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kLambdaExp; }
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& /*row*/, const Schema& /*schema*/) const override;
   [[nodiscard]] Value Evaluate(const Row& /*row*/,
                                const Schema& /*schema*/) const override;
   [[nodiscard]] tinylamb::Type ResultType(

@@ -51,12 +51,13 @@ namespace tinylamb {
 
 namespace {
 
-int OpenPageFile(std::string_view file_name) {
+StatusOr<int> OpenPageFile(std::string_view file_name) {
   const int fd = ::open(std::string(file_name).c_str(),
                         O_RDWR | O_CREAT | O_CLOEXEC, 0666);
   if (fd < 0) {
-    throw std::runtime_error("failed to open file: " + std::string(file_name) +
-                             ": " + std::strerror(errno));
+    return StatusError(StatusCode::kIOError,
+                       "failed to open file: " + std::string(file_name) + ": " +
+                           std::strerror(errno));
   }
   return fd;
 }
@@ -92,25 +93,33 @@ bool PageOffset(page_id_t pid, off_t* out) {
 
 }  // namespace
 
-PagePool::PagePool(std::string_view file_name, size_t capacity)
-    : file_name_(file_name),
-      fd_(OpenPageFile(file_name)),
-      capacity_(capacity) {}
+StatusOr<std::unique_ptr<PagePool>> PagePool::Create(std::string_view file_name,
+                                                     size_t capacity) {
+  ASSIGN_OR_RETURN(int, fd, OpenPageFile(file_name));
+  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+  return std::unique_ptr<PagePool>(
+      new PagePool(file_name, capacity, fd));  // NOLINT
+}
 
-void PagePool::SetDurabilityGate(std::function<void(lsn_t)> gate) {
+PagePool::PagePool(std::string_view file_name, size_t capacity, int fd)
+    : file_name_(file_name), fd_(fd), capacity_(capacity) {}
+
+void PagePool::SetDurabilityGate(std::function<Status(lsn_t)> gate) {
   durability_gate_ = std::move(gate);
 }
 
-PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit, bool shared) {
+StatusOr<PageRef> PagePool::GetPage(page_id_t page_id, bool* cache_hit,
+                                    bool shared) {
   return GetPageImpl(page_id, cache_hit, shared, true);
 }
 
-PageRef PagePool::GetPageForRecovery(page_id_t page_id, bool* cache_hit) {
+StatusOr<PageRef> PagePool::GetPageForRecovery(page_id_t page_id,
+                                               bool* cache_hit) {
   return GetPageImpl(page_id, cache_hit, false, false);
 }
 
-PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
-                              bool validate) {
+StatusOr<PageRef> PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit,
+                                        bool shared, bool validate) {
   // The install below releases pool_latch for file I/O, so concurrent misses
   // can refill the pool meanwhile. Retry the miss path a few times so the
   // eviction loop can restore capacity_ before installing; the cap keeps a
@@ -153,7 +162,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
           }
         }
       }
-      return {this, hit_page, hit_page_latch, shared, hit_pin_count};
+      return PageRef(this, hit_page, hit_page_latch, shared, hit_pin_count);
     }
 
     std::unique_lock latch(pool_latch);
@@ -171,7 +180,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
         *cache_hit = true;
       }
       latch.unlock();
-      return {this, page, page_latch, shared, pin_count};
+      return PageRef(this, page, page_latch, shared, pin_count);
     }
 
     while (pool_lru_.size() >= capacity_) {
@@ -182,38 +191,47 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       const uint64_t victim_id = victim->PageID();
       flushing_.insert(victim_id);
       latch.unlock();
-      try {
+      Status write_back = Status::kSuccess;
+      {
         std::scoped_lock io(io_latches_[ShardIndex(victim_id)].mu);
-        WriteBack(victim.get());
-      } catch (...) {
+        write_back = WriteBack(victim.get());
+      }
+      if (write_back != Status::kSuccess) {
         latch.lock();
         flushing_.erase(victim_id);
         // Keep the victim resident: dropping it here would silently lose its
-        // dirty image. Reattach under pool_latch so a racing miss either pins
-        // this entry or waits for it; only an id that raced back into the
-        // pool cannot be reattached. Keep victim owning the image until the
-        // node is constructed: Entry's latch allocation may throw, and a
-        // released raw pointer would leak.
+        // dirty image. Reattach under pool_latch so a racing miss either
+        // pins this entry or waits for it; only an id that raced back into
+        // the pool cannot be reattached. Keep victim owning the image until
+        // the node is constructed (std::bad_alloc from Entry's latch
+        // allocation or the list node is the only remaining throw here).
         if (!pool_.contains(victim_id)) {
           Page* const raw_victim = victim.get();
           try {
             pool_lru_.emplace_back(raw_victim);
-          } catch (...) {
-            throw;
+          } catch (const std::bad_alloc& error) {
+            LOG(ERROR) << "cannot reattach unwritten victim page " << victim_id
+                       << ": " << error.what();
           }
-          // Release only after the non-throwing point: the raw pointer is
-          // already handed to the list, so the released value is redundant.
-          victim.release();  // NOLINT(bugprone-unused-return-value)
-          pool_lru_.back().pin_count.store(0, std::memory_order_relaxed);
-          const auto restored = std::prev(pool_lru_.end());
-          pool_.emplace(victim_id, restored);
-          PoolShard& shard = shards_[ShardIndex(victim_id)];
-          std::scoped_lock shard_latch(shard.mu);
-          shard.map.emplace(victim_id, &*restored);
-        } else {
-          victim.reset();
+          if (!pool_lru_.empty() && pool_lru_.back().page.get() == raw_victim) {
+            // Release only after the node owns the image: the raw pointer
+            // is stored in the list, so the released value is redundant.
+            victim.release();  // NOLINT(bugprone-unused-return-value)
+            pool_lru_.back().pin_count.store(0, std::memory_order_relaxed);
+            const auto restored = std::prev(pool_lru_.end());
+            pool_.emplace(victim_id, restored);
+            PoolShard& shard = shards_[ShardIndex(victim_id)];
+            std::scoped_lock shard_latch(shard.mu);
+            shard.map.emplace(victim_id, &*restored);
+          } else {
+            victim.reset();
+          }
+          latch.unlock();
+          return write_back;
         }
-        throw;
+        victim.reset();
+        latch.unlock();
+        return write_back;
       }
       victim.reset();
       latch.lock();
@@ -243,7 +261,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
         std::shared_lock check(pool_latch);
         pending = flushing_.contains(page_id);
         if (!pending) {
-          ReadFrom(new_page.get(), page_id, validate);
+          RETURN_IF_FAIL(ReadFrom(new_page.get(), page_id, validate));
           break;
         }
       }
@@ -258,7 +276,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       std::shared_mutex* const page_latch = refreshed->page_latch.get();
       std::atomic<uint32_t>* const pin_count = &refreshed->pin_count;
       latch.unlock();
-      return {this, page, page_latch, shared, pin_count};
+      return PageRef(this, page, page_latch, shared, pin_count);
     }
 
     // A racing eviction may have detached this very page id after our read
@@ -281,8 +299,9 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       LOG(ERROR) << "loaded page image id mismatch: requested=" << page_id
                  << " image=" << new_page->PageID()
                  << " status=" << Status::kCorrupt;
-      throw std::runtime_error("page id mismatch on load: page_id=" +
-                               std::to_string(page_id));
+      return StatusError(
+          StatusCode::kCorrupt,
+          "page id mismatch on load: page_id=" + std::to_string(page_id));
     }
 
     // Capacity was last validated before the latch was released for I/O; a
@@ -300,9 +319,14 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
     std::shared_mutex* const raw_latch = new_page_latch.get();
     try {
       pool_lru_.emplace_back(raw_page);
-    } catch (...) {
-      // new_page still owns raw_page; nothing installed.
-      throw;
+    } catch (const std::bad_alloc& error) {
+      // new_page still owns raw_page; nothing installed. std::bad_alloc
+      // from the list node is a memory-exhaustion condition, not a DB
+      // logic error: report it like any other GetPage failure.
+      latch.unlock();
+      return StatusError(
+          StatusCode::kRuntimeError,
+          std::string("cannot allocate pool entry: ") + error.what());
     }
     // The list node now owns the image; the released pointer is already
     // stored in the node, so discarding it is intentional.
@@ -316,7 +340,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
         std::scoped_lock shard_latch(shard.mu);
         shard.map.emplace(page_id, &*installed);
       }
-    } catch (...) {
+    } catch (const std::bad_alloc& error) {
       // Roll back the half-installed node.  pool_.emplace may have landed
       // before the shard insert threw; leaving its entry would hand a
       // dangling list iterator to the next miss-path recheck (and block
@@ -325,13 +349,16 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       // remove the entry emplace just created.
       pool_.erase(page_id);
       pool_lru_.erase(installed);
-      throw;
+      latch.unlock();
+      return StatusError(
+          StatusCode::kRuntimeError,
+          std::string("cannot register pool entry: ") + error.what());
     }
     std::atomic<uint32_t>* const installed_pin_count = &installed->pin_count;
     latch.unlock();
     // Page content was loaded without holding page_latch, so the caller may
     // take a shared page latch when requested.
-    return {this, raw_page, raw_latch, shared, installed_pin_count};
+    return PageRef(this, raw_page, raw_latch, shared, installed_pin_count);
   }
 }
 
@@ -494,17 +521,18 @@ PagePool::~PagePool() {
     }
     retired_.clear();
   }
-  try {
-    for (Page* page : dirty) {
-      std::scoped_lock io(io_latches_[ShardIndex(page->PageID())].mu);
-      WriteBack(page);
+  size_t lost = 0;
+  for (Page* page : dirty) {
+    std::scoped_lock io(io_latches_[ShardIndex(page->PageID())].mu);
+    if (WriteBack(page) != Status::kSuccess) {
+      ++lost;
     }
-    if (fd_ >= 0) {
-      SyncFileChecked(fd_);
-    }
-  } catch (...) {
-    LOG(ERROR) << "page pool destruction lost " << dirty.size()
-               << " dirty pages";
+  }
+  if (fd_ >= 0) {
+    SyncFileChecked(fd_);
+  }
+  if (lost != 0) {
+    LOG(ERROR) << "page pool destruction lost " << lost << " dirty pages";
   }
   // Close the descriptor even when write-back failed: leaking it turns a
   // recoverable shutdown error into a permanent fd leak, and this is the
@@ -515,20 +543,24 @@ PagePool::~PagePool() {
   }
 }
 
-void PagePool::WriteBack(const Page* target) {
+Status PagePool::WriteBack(const Page* target) {
   // WAL rule: before a modified page image reaches the file, every log record
   // up to its page LSN must be durable. The gate may block (fsync), which is
   // why callers must not hold pool_latch here.
   if (durability_gate_ && !target->ChecksumMatches()) {
-    durability_gate_(target->PageLSN());
+    const Status gate = durability_gate_(target->PageLSN());
+    if (gate != Status::kSuccess) {
+      return gate;
+    }
   }
   target->SetChecksum();
   std::array<char, kPageSize> disk_image{};
   target->EncodeDisk(disk_image.data());
   off_t offset = 0;
   if (!PageOffset(target->PageID(), &offset)) {
-    throw std::runtime_error("page offset out of range: page_id=" +
-                             std::to_string(target->PageID()));
+    return StatusError(StatusCode::kIOError,
+                       "page offset out of range: page_id=" +
+                           std::to_string(target->PageID()));
   }
   const char* buffer = disk_image.data();
   size_t remaining = kPageSize;
@@ -538,24 +570,27 @@ void PagePool::WriteBack(const Page* target) {
       if (RetryableErrno(errno)) {
         continue;
       }
-      throw std::runtime_error("cannot write back page " +
-                               std::to_string(target->PageID()) + ": " +
-                               std::strerror(errno));
+      return StatusError(StatusCode::kIOError,
+                         "cannot write back page " +
+                             std::to_string(target->PageID()) + ": " +
+                             std::strerror(errno));
     }
     buffer += written;
     offset += written;
     remaining -= static_cast<size_t>(written);
   }
+  return Status::kSuccess;
 }
 
 // Precondition: target has allocated memory at kPageSize.
-void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
+Status PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
   off_t offset = 0;
   if (!PageOffset(pid, &offset)) {
     LOG(ERROR) << "page offset out of range: page_id=" << pid
                << " status=" << Status::kCorrupt;
-    throw std::runtime_error("page offset out of range: page_id=" +
-                             std::to_string(pid));
+    return StatusError(
+        StatusCode::kCorrupt,
+        "page offset out of range: page_id=" + std::to_string(pid));
   }
   std::array<char, kPageSize> disk_image{};
   ssize_t nread = 0;
@@ -566,8 +601,9 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
     // EINVAL (offset overflow) and friends are hard failures, never a
     // silent empty-page materialization.
     LOG(ERROR) << "cannot read page " << pid << ": " << std::strerror(errno);
-    throw std::runtime_error("cannot read page " + std::to_string(pid) + ": " +
-                             std::strerror(errno));
+    return StatusError(StatusCode::kIOError, "cannot read page " +
+                                                 std::to_string(pid) + ": " +
+                                                 std::strerror(errno));
   }
   if (nread == 0) {
     // Past EOF: a cleanly never-written region; materialize a free page in
@@ -588,9 +624,8 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
       target->PageInit(pid, PageType::kFreePage);
       nread = 0;  // Fresh sparse region has no checksum to validate.
     } else {
-      try {
-        target->DecodeDisk(disk_image.data());
-      } catch (const std::runtime_error& error) {
+      const Status decode = target->DecodeDisk(disk_image.data());
+      if (decode != Status::kSuccess) {
         // Preserve a recoverable, checksum-invalid placeholder. Recovery
         // opens pages without validation and reconstructs this image from
         // WAL; ordinary readers still hit the validation failure below.
@@ -598,7 +633,7 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
         // page from a genuine all-zero fresh region, so the free-page
         // materialization below does NOT silently reclaim live data.
         LOG(ERROR) << "invalid page format on page_id=" << pid << ": "
-                   << error.what();
+                   << decode;
         target->PageInit(pid, PageType::kUnknown);
         target->format_magic = 0;
         target->checksum = 1;
@@ -616,8 +651,9 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
     } else if (validate) {
       LOG(ERROR) << "corrupt page checksum on page_id=" << pid
                  << " status=" << Status::kCorrupt;
-      throw std::runtime_error("corrupt page checksum: page_id=" +
-                               std::to_string(pid));
+      return StatusError(
+          StatusCode::kCorrupt,
+          "corrupt page checksum: page_id=" + std::to_string(pid));
     }
     // Otherwise hand the broken image back verbatim: the recovery manager
     // detects it via IsValid() and rebuilds the page from the log.
@@ -625,6 +661,7 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
 
   // RecLSN = MAX means a clean page.
   target->recovery_lsn = std::numeric_limits<lsn_t>::max();
+  return Status::kSuccess;
 }
 
 }  // namespace tinylamb

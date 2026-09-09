@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 
+#include "common/status_or.hpp"
 #include "common/vm_cache_impl.hpp"
 
 namespace tinylamb {
@@ -36,27 +37,35 @@ class Cache final {
   // The caller keeps ownership of `fd`: this Cache (and the wrapped
   // VMCacheImpl) never closes it. BlobFile relies on this so that only the
   // Logger ever closes the shared descriptor.
-  Cache(int fd, size_t memory_capacity, size_t max_size = 0)
-      : impl_(fd, kBlockSize, memory_capacity, 0, max_size, false) {}
+  static StatusOr<std::unique_ptr<Cache>> Create(int fd, size_t memory_capacity,
+                                                 size_t max_size = 0) {
+    ASSIGN_OR_RETURN(std::unique_ptr<VMCacheImpl>, impl,
+                     VMCacheImpl::Create(fd, kBlockSize, memory_capacity, 0,
+                                         max_size, false));
+    // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+    return std::unique_ptr<Cache>(new Cache(std::move(impl)));  // NOLINT
+  }
   ~Cache() = default;
   Cache(const Cache&) = delete;
   Cache(Cache&&) = delete;
   Cache& operator=(const Cache&) = delete;
   Cache& operator=(Cache&&) = delete;
 
-  [[nodiscard]] std::string ReadAt(size_t offset, size_t length) const {
-    return impl_.ReadAt(offset, length);
+  [[nodiscard]] StatusOr<std::string> ReadAt(size_t offset,
+                                             size_t length) const {
+    return impl_->ReadAt(offset, length);
   }
-  Locks ReadAt(size_t offset, size_t length, std::string_view& out) const {
-    return impl_.ReadAt(offset, length, out);
+  StatusOr<Locks> ReadAt(size_t offset, size_t length,
+                         std::string_view& out) const {
+    return impl_->ReadAt(offset, length, out);
   }
-  void Copy(void* dst, size_t offset, size_t length) const {
-    impl_.Copy(dst, offset, length);
+  Status Copy(void* dst, size_t offset, size_t length) const {
+    return impl_->Copy(dst, offset, length);
   }
   void Invalidate(size_t offset, size_t length) {
-    impl_.Invalidate(offset, length);
+    impl_->Invalidate(offset, length);
   }
-  [[nodiscard]] std::string Dump() const { return impl_.Dump(); }
+  [[nodiscard]] std::string Dump() const { return impl_->Dump(); }
 
   friend std::ostream& operator<<(std::ostream& o, const Cache& c) {
     o << c.Dump();
@@ -64,7 +73,9 @@ class Cache final {
   }
 
  private:
-  VMCacheImpl impl_;
+  explicit Cache(std::unique_ptr<VMCacheImpl> impl) : impl_(std::move(impl)) {}
+
+  std::unique_ptr<VMCacheImpl> impl_;
 };
 
 }  // namespace tinylamb

@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/named_expression.hpp"
@@ -43,7 +44,7 @@ class TwoPhaseDistinctAgg : public ExecutorBase {
   [[nodiscard]] const Schema& OutputSchema() const { return output_schema_; }
 
  private:
-  void Materialize();
+  Status Materialize();
 
   Executor child_;
   Schema input_schema_;

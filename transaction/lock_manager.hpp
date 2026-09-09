@@ -72,6 +72,8 @@ class LockManager {
     ~DurabilityWaitGuard() { lm_->EndDurabilityWait(); }
     DurabilityWaitGuard(const DurabilityWaitGuard&) = delete;
     DurabilityWaitGuard& operator=(const DurabilityWaitGuard&) = delete;
+    DurabilityWaitGuard(DurabilityWaitGuard&&) = delete;
+    DurabilityWaitGuard& operator=(DurabilityWaitGuard&&) = delete;
 
    private:
     LockManager* lm_;

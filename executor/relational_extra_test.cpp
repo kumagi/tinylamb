@@ -42,7 +42,7 @@ TEST(ParallelMergeJoinExtraTest, LeftOuterPadsFullRightWidth) {
   std::vector<Row> rows;
   while (join.Next(&row, &pos)) {
     ASSERT_EQ(row.values_.size(), 5U)
-        << "padded row must carry left(2) + right(3) values";
+        << true;
     rows.push_back(row);
   }
   ASSERT_EQ(rows.size(), 2U);

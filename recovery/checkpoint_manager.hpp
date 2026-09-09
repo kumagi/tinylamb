@@ -34,6 +34,12 @@ class PagePool;
 
 class CheckpointManager {
  public:
+  // Non-copyable by design: instances are owned by smart pointers and
+  // referenced by raw pointers throughout the executor/graph object web.
+  CheckpointManager(const CheckpointManager&) = delete;
+  CheckpointManager& operator=(const CheckpointManager&) = delete;
+  CheckpointManager(CheckpointManager&&) = delete;
+  CheckpointManager& operator=(CheckpointManager&&) = delete;
   CheckpointManager(std::string_view path, TransactionManager* tm, PagePool* pp,
                     size_t interval = 5)
       : master_record_path(path),
@@ -79,8 +85,8 @@ class CheckpointManager {
   };
 
   // This function is intentionally public for test.
-  uint64_t WriteCheckpoint(const std::function<void()>& func_for_test = []() {
-  });
+  StatusOr<lsn_t> WriteCheckpoint(const std::function<void()>& func_for_test =
+                                      []() {});
 
   friend std::ostream& operator<<(std::ostream& o,
                                   const CheckpointManager& cm) {

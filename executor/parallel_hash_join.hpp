@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/join_kind.hpp"
@@ -71,6 +72,14 @@ class ConcurrentJoinHashTable {
 class SharedBuildParallelHashJoin : public ExecutorBase,
                                     public PipelineBreaker {
  public:
+  // Non-copyable by design: instances are owned by unique_ptr and
+  // referenced by raw pointers throughout the executor graph.
+  SharedBuildParallelHashJoin(const SharedBuildParallelHashJoin&) = delete;
+  SharedBuildParallelHashJoin& operator=(const SharedBuildParallelHashJoin&) =
+      delete;
+  SharedBuildParallelHashJoin(SharedBuildParallelHashJoin&&) = delete;
+  SharedBuildParallelHashJoin& operator=(SharedBuildParallelHashJoin&&) =
+      delete;
   SharedBuildParallelHashJoin(
       Executor left, std::vector<slot_t> left_cols, Executor right,
       std::vector<slot_t> right_cols,
@@ -95,9 +104,9 @@ class SharedBuildParallelHashJoin : public ExecutorBase,
   [[nodiscard]] JoinKind Kind() const { return kind_; }
 
  private:
-  void EnsureMaterialized();
-  void BuildSharedHashTable();
-  void ParallelProbe();
+  Status EnsureMaterialized();
+  Status BuildSharedHashTable();
+  Status ParallelProbe();
   [[nodiscard]] static std::string MakeKey(const Row& row,
                                            const std::vector<slot_t>& cols);
   [[nodiscard]] static bool KeyHasNull(const Row& row,
@@ -123,6 +132,10 @@ class SharedBuildParallelHashJoin : public ExecutorBase,
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};
   bool materialized_{false};
+  // Latched by EnsureMaterialized when materialization throws, so a retried
+  // Next() rethrows the same failure instead of reporting the half-built
+  // output_ as a complete result.
+  Status materialization_failure_{Status::kSuccess};
   QueryMemoryCharge charge_;
 };
 

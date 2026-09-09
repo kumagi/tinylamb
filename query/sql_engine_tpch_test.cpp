@@ -263,7 +263,7 @@ class SqlEngineTpchTest : public ::testing::Test {
  protected:
   void SetUp() override {
     path_ = "sql_engine_tpch_test-" + RandomString();
-    database_ = std::make_unique<Database>(path_);
+    database_ = Database::Create(path_).MoveValue();
   }
   void TearDown() override { database_->DeleteAll(); }
 

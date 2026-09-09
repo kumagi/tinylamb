@@ -9,17 +9,18 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
-void TopNExecutor::Materialize() {
+Status TopNExecutor::Materialize() {
   if (limit_ == 0) {
     output_end_ = 0;
     materialized_ = true;
-    return;
+    return Status::kSuccess;
   }
   const size_t capacity = offset_ > static_cast<size_t>(-1) - limit_
                               ? static_cast<size_t>(-1)
@@ -70,11 +71,18 @@ void TopNExecutor::Materialize() {
                           .sequence = sequence++};
       candidate.keys.reserve(keys_.size());
       for (const Key& key : keys_) {
-        candidate.keys.push_back(
-            key.expression->Evaluate(candidate.row, schema_));
+        StatusOr<Value> key_value =
+            key.expression->TryEvaluate(candidate.row, schema_);
+        if (!key_value.HasValue()) {
+          const Status key_error = key_value.GetStatus();
+          FailWith(key_error);
+          return key_error;
+        }
+        candidate.keys.push_back(key_value.MoveValue());
       }
       rows_.push_back(std::move(candidate));
     }
+    FailWithChildOf(*source_);
     std::ranges::sort(rows_, precedes);
     output_index_ = std::min(offset_, rows_.size());
     output_end_ = output_index_;
@@ -101,7 +109,7 @@ void TopNExecutor::Materialize() {
       }
     }
     materialized_ = true;
-    return;
+    return GetStatus();
   }
 
   std::priority_queue<Candidate, std::vector<Candidate>, decltype(worse_first)>
@@ -115,8 +123,14 @@ void TopNExecutor::Materialize() {
                         .sequence = sequence++};
     candidate.keys.reserve(keys_.size());
     for (const Key& key : keys_) {
-      candidate.keys.push_back(
-          key.expression->Evaluate(candidate.row, schema_));
+      StatusOr<Value> key_value =
+          key.expression->TryEvaluate(candidate.row, schema_);
+      if (!key_value.HasValue()) {
+        const Status key_error = key_value.GetStatus();
+        FailWith(key_error);
+        return key_error;
+      }
+      candidate.keys.push_back(key_value.MoveValue());
     }
     if (heap.size() < capacity) {
       heap.push(std::move(candidate));
@@ -125,6 +139,7 @@ void TopNExecutor::Materialize() {
       heap.push(std::move(candidate));
     }
   }
+  FailWithChildOf(*source_);
   rows_.reserve(heap.size());
   while (!heap.empty()) {
     rows_.push_back(std::move(const_cast<Candidate&>(heap.top())));
@@ -134,11 +149,14 @@ void TopNExecutor::Materialize() {
   output_index_ = std::min(offset_, rows_.size());
   output_end_ = rows_.size();
   materialized_ = true;
+  return GetStatus();
 }
 
 bool TopNExecutor::Next(Row* dst, RowPosition* position) {
   if (!materialized_) {
-    Materialize();
+    if (Materialize() != Status::kSuccess) {
+      return false;
+    }
   }
   if (output_index_ >= output_end_) {
     return false;

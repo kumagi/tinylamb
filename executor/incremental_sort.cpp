@@ -33,17 +33,26 @@ IncrementalSortExecutor::IncrementalSortExecutor(
       prefix_keys_(std::move(prefix_keys)),
       suffix_keys_(std::move(suffix_keys)) {}
 
-bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) const {
+bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
   return std::ranges::all_of(prefix_keys_, [&](const auto& key) {
-    Value va = key.expression->Evaluate(a, schema_);
-    Value vb = key.expression->Evaluate(b, schema_);
-    return va == vb;
+    StatusOr<Value> va_or = key.expression->TryEvaluate(a, schema_);
+    StatusOr<Value> vb_or = key.expression->TryEvaluate(b, schema_);
+    if (!va_or.HasValue() || !vb_or.HasValue()) {
+      if (sort_error_ == Status::kSuccess) {
+        sort_error_ = va_or.HasValue() ? vb_or.GetStatus() : va_or.GetStatus();
+      }
+      return false;
+    }
+    return va_or.Value() == vb_or.Value();
   });
 }
 
 void IncrementalSortExecutor::ExecuteIncrementalSort() {
   output_.clear();
   output_offset_ = 0;
+  sort_error_ = Status::kSuccess;
+  Status* const error_ = &sort_error_;
+  (void)error_;
 
   std::vector<std::pair<Row, RowPosition>> input_rows;
   Row row;
@@ -53,6 +62,10 @@ void IncrementalSortExecutor::ExecuteIncrementalSort() {
   while (source_ && source_->Next(&row, &rp)) {
     total_bytes += EstimateRowBytes(row) + sizeof(RowPosition);
     input_rows.emplace_back(std::move(row), rp);
+  }
+  if (source_ && source_->GetStatus() != Status::kSuccess &&
+      sort_error_ == Status::kSuccess) {
+    sort_error_ = source_->GetStatus();
   }
 
   if (input_rows.empty()) {
@@ -75,7 +88,7 @@ void IncrementalSortExecutor::ExecuteIncrementalSort() {
                                 static_cast<std::ptrdiff_t>(end)));
 
     if (!suffix_keys_.empty() && group_rows.size() > 1) {
-      PdqSort::Sort(group_rows, schema_, suffix_keys_);
+      PdqSort::Sort(group_rows, schema_, suffix_keys_, &sort_error_);
     }
 
     for (auto& item : group_rows) {
@@ -101,6 +114,9 @@ void IncrementalSortExecutor::MaterializePipeline() { EnsureMaterialized(); }
 bool IncrementalSortExecutor::Next(Row* dst, RowPosition* rp) {
   assert(dst != nullptr);
   EnsureMaterialized();
+  if (sort_error_ != Status::kSuccess) {
+    return FailWith(sort_error_);
+  }
   if (output_offset_ >= output_.size()) {
     return false;
   }

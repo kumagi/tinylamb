@@ -124,14 +124,14 @@ TEST(PostgresProtocolTest, ReadUintEndiannessAndBounds) {
   bytes[3] = static_cast<char>(0xCD);
   bytes[4] = static_cast<char>(0xEF);
   bytes[5] = static_cast<char>(0x01);
-  EXPECT_EQ(ReadUint16(bytes, 0), 0x1234);
-  EXPECT_EQ(ReadUint32(bytes, 2), 0xABCDEF01);
+  EXPECT_EQ(ReadUint16(bytes, 0).Value(), 0x1234);
+  EXPECT_EQ(ReadUint32(bytes, 2).Value(), 0xABCDEF01U);
 
   // Assert -- out-of-range reads throw rather than returning garbage
-  EXPECT_THROW(ReadUint16(bytes, 5), std::out_of_range);
-  EXPECT_THROW(ReadUint16(bytes, 6), std::out_of_range);
-  EXPECT_THROW(ReadUint32(bytes, 3), std::out_of_range);
-  EXPECT_THROW(ReadUint32(bytes, 6), std::out_of_range);
+  EXPECT_FALSE(ReadUint16(bytes, 5).HasValue());
+  EXPECT_FALSE(ReadUint16(bytes, 6).HasValue());
+  EXPECT_FALSE(ReadUint32(bytes, 3).HasValue());
+  EXPECT_FALSE(ReadUint32(bytes, 6).HasValue());
 }
 
 TEST(PostgresProtocolTest, EncodesDoubleAndDateValues) {
@@ -151,7 +151,7 @@ TEST(PostgresProtocolTest, EncodesDoubleAndDateValues) {
   // 0.1 into "0.10000000000000001".
   const std::string short_row = DataRow(Row({Value(0.1), Value(1e20)}));
   EXPECT_NE(short_row.find("0.1\x00", 0), std::string::npos)
-      << "raw=" << short_row;
+      << true << short_row;
   EXPECT_EQ(short_row.find("0.10000000000000001"), std::string::npos);
 
   // float8 OID 701 then date OID 1082 in the row description
@@ -170,9 +170,9 @@ TEST(PostgresProtocolTest, EmptyQueryAndNegotiateProtocolVersion) {
       NegotiateProtocolVersion(3, {"_pq_.foo", "_pq_.bar"});
   // Assert -- 'v' type byte, minor version, count, then the names
   EXPECT_EQ(negotiated[0], 'v');
-  EXPECT_EQ(ReadUint32(negotiated, 1), negotiated.size() - 1);
-  EXPECT_EQ(ReadUint32(negotiated, 5), 3);
-  EXPECT_EQ(ReadUint32(negotiated, 9), 2);
+  EXPECT_EQ(ReadUint32(negotiated, 1).Value(), negotiated.size() - 1);
+  EXPECT_EQ(ReadUint32(negotiated, 5).Value(), 3U);
+  EXPECT_EQ(ReadUint32(negotiated, 9).Value(), 2U);
   EXPECT_NE(negotiated.find("_pq_.foo"), std::string::npos);
   EXPECT_NE(negotiated.find("_pq_.bar"), std::string::npos);
 }
@@ -243,6 +243,28 @@ TEST(PostgresProtocolTest, SplitSqlStatementsRespectsBackslashEscapes) {
   EXPECT_EQ(two[1], "SELECT 2");
 }
 
+// A ';' inside a dollar-quoted string ($$...$$ / $tag$...$tag$) must not
+// split statements; the rest of the stack parses dollar quotes, so the
+// splitter ignoring them sent valid SQL as two parse errors.
+TEST(PostgresProtocolTest, SplitSqlStatementsHandlesDollarQuotes) {
+  const std::vector<std::string> plain = SplitSqlStatements("SELECT $$a;b$$;");
+  ASSERT_EQ(plain.size(), 1U);
+  EXPECT_EQ(plain[0], "SELECT $$a;b$$");
+
+  const std::vector<std::string> tagged =
+      SplitSqlStatements("SELECT $fn$ a;b $$;c$fn$; SELECT 2;");
+  ASSERT_EQ(tagged.size(), 2U);
+  EXPECT_EQ(tagged[0], "SELECT $fn$ a;b $$;c$fn$");
+  EXPECT_EQ(tagged[1], "SELECT 2");
+
+  // A bare $1 placeholder is not a dollar quote.
+  const std::vector<std::string> placeholder =
+      SplitSqlStatements("SELECT $1; SELECT 2;");
+  ASSERT_EQ(placeholder.size(), 2U);
+  EXPECT_EQ(placeholder[0], "SELECT $1");
+  EXPECT_EQ(placeholder[1], "SELECT 2");
+}
+
 TEST(PostgresProtocolTest, RowDescriptionDefaultNameAndTypes) {
   // Act -- describe columns with empty names and every wire type
   const std::string description = RowDescription({{"", ValueType::kVarChar},
@@ -264,8 +286,8 @@ TEST(PostgresProtocolTest, EncodesTextAndNullDataRows) {
       DataRow(Row({Value(int64_t{42}), Value(std::string("hello")), Value()}));
   ASSERT_GE(message.size(), 5U);
   EXPECT_EQ(message[0], 'D');
-  EXPECT_EQ(ReadUint32(message, 1), message.size() - 1);
-  EXPECT_EQ(ReadUint16(message, 5), 3);
+  EXPECT_EQ(ReadUint32(message, 1).Value(), message.size() - 1);
+  EXPECT_EQ(ReadUint16(message, 5).Value(), 3);
   EXPECT_NE(message.find("hello"), std::string::npos);
   const std::string null_length(4, static_cast<char>(0xff));
   EXPECT_NE(message.find(null_length), std::string::npos);
@@ -293,13 +315,13 @@ TEST(PostgresProtocolTest, EncodesExpectedBackendMessageTypes) {
 TEST(PostgresProtocolTest, RejectsMoreThanUint16Columns) {
   std::vector<ColumnDescription> columns(
       static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1);
-  EXPECT_THROW(RowDescription(columns), std::runtime_error);
+  EXPECT_DEATH(RowDescription(columns), ".*");
 }
 
 TEST(PostgresProtocolTest, RejectsMoreThanUint16Values) {
   Row row(std::vector<Value>(
       static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1));
-  EXPECT_THROW(DataRow(row), std::runtime_error);
+  EXPECT_DEATH(DataRow(row), ".*");
 }
 
 // Tests derived from postgres_protocol_fuzzer corpus analysis.  The fuzzer

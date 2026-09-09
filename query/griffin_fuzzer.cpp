@@ -397,7 +397,10 @@ std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
   }
   std::shuffle(statements.begin(), statements.end(), rng);
 
-  Database db("griffin_fuzz-" + RandomString(8));
+  auto db_holder =
+      Database::Create("griffin_fuzz-" + RandomString(8)).MoveValue();
+  CHECK(db_holder != nullptr);
+  Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
 
   // 2. Metadata-guided substitution: the snapshot refreshes per statement, so
@@ -430,7 +433,10 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose) {
 
   // Re-run the recorded session verbatim (identity mutation) and report
   // whether the failure still reproduces. "" means fixed or flaky-clean.
-  Database db("griffin_replay-" + RandomString(8));
+  auto db_holder =
+      Database::Create("griffin_replay-" + RandomString(8)).MoveValue();
+  CHECK(db_holder != nullptr);
+  Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
   GriffinTrace fresh;
   fresh.seed = trace.seed;

@@ -43,17 +43,27 @@ std::unordered_set<ColumnName> CaseExpression::TouchedColumns() const {
   return result;
 }
 
-Value CaseExpression::Evaluate(const Row& row, const Schema& schema) const {
-  for (const auto& when : when_clauses_) {
-    const Value condition = when.first->Evaluate(row, schema);
+namespace {
+template <typename... Args>
+StatusOr<Value> TryPickBranch(
+    const std::vector<std::pair<Expression, Expression>>& when_clauses,
+    ExpressionBase* else_clause, Args&&... args) {
+  for (const auto& when : when_clauses) {
+    ASSIGN_OR_RETURN(Value, condition, when.first->TryEvaluate(args...));
     if (!condition.IsNull() && condition.Truthy()) {
-      return when.second->Evaluate(row, schema);
+      return when.second->TryEvaluate(args...);
     }
   }
-  if (else_clause_) {
-    return else_clause_->Evaluate(row, schema);
+  if (else_clause != nullptr) {
+    return else_clause->TryEvaluate(args...);
   }
-  return {};
+  return Value();
+}
+}  // namespace
+
+StatusOr<Value> CaseExpression::TryEvaluate(const Row& row,
+                                            const Schema& schema) const {
+  return TryPickBranch(when_clauses_, else_clause_.get(), row, schema);
 }
 
 namespace {
@@ -75,32 +85,38 @@ Type UnifiedBranchType(std::vector<Type> branch_types) {
 
 }  // namespace
 
-Value CaseExpression::Evaluate(const Row* left, const Schema& left_schema,
-                               const Row* right,
-                               const Schema& right_schema) const {
-  for (const auto& when : when_clauses_) {
-    Value condition =
-        when.first->Evaluate(left, left_schema, right, right_schema);
-    if (!condition.IsNull() && condition.Truthy()) {
-      return when.second->Evaluate(left, left_schema, right, right_schema);
-    }
-  }
-  return else_clause_
-             ? else_clause_->Evaluate(left, left_schema, right, right_schema)
-             : Value();
+StatusOr<Value> CaseExpression::TryEvaluate(const Row* left,
+                                            const Schema& left_schema,
+                                            const Row* right,
+                                            const Schema& right_schema) const {
+  return TryPickBranch(when_clauses_, else_clause_.get(), left, left_schema,
+                       right, right_schema);
 }
 
 // Context-aware form: same dispatch as the plain evaluator with the context
 // threaded into every child expression (A1 stage 2).
+StatusOr<Value> CaseExpression::TryEvaluate(const Row& row,
+                                            const Schema& schema,
+                                            EvaluationContext& context) const {
+  return TryPickBranch(when_clauses_, else_clause_.get(), row, schema, context);
+}
+
+// EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+Value CaseExpression::Evaluate(const Row& row, const Schema& schema) const {
+  return ExcShimUnwrap(TryEvaluate(row, schema), "CaseExpression::Evaluate");
+}
+
+Value CaseExpression::Evaluate(const Row* left, const Schema& left_schema,
+                               const Row* right,
+                               const Schema& right_schema) const {
+  return ExcShimUnwrap(TryEvaluate(left, left_schema, right, right_schema),
+                       "CaseExpression::Evaluate");
+}
+
 Value CaseExpression::Evaluate(const Row& row, const Schema& schema,
                                EvaluationContext& context) const {
-  for (const auto& when : when_clauses_) {
-    const Value condition = when.first->Evaluate(row, schema, context);
-    if (!condition.IsNull() && condition.Truthy()) {
-      return when.second->Evaluate(row, schema, context);
-    }
-  }
-  return else_clause_ ? else_clause_->Evaluate(row, schema, context) : Value();
+  return ExcShimUnwrap(TryEvaluate(row, schema, context),
+                       "CaseExpression::Evaluate");
 }
 
 Type CaseExpression::ResultType(const Schema& schema) const {

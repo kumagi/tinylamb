@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -170,9 +171,9 @@ PartialAggregate::PartialAggregate(Executor child, Schema input_schema,
       MakePartialSchema(group_by_keys_, aggregates_, input_schema_);
 }
 
-void PartialAggregate::Materialize() {
+Status PartialAggregate::Materialize() {
   if (materialized_) {
-    return;
+    return Status::kSuccess;
   }
   materialized_ = true;
   output_rows_.clear();
@@ -211,8 +212,16 @@ void PartialAggregate::Materialize() {
       std::vector<Value> key_vals;
       key_vals.reserve(group_by_keys_.size());
       for (const auto& g_named : group_by_keys_) {
-        key_vals.push_back(relational_detail::CanonicalDistinctValue(
-            g_named.expression->Evaluate(in_row, input_schema_)));
+        StatusOr<Value> key =
+            g_named.expression->TryEvaluate(in_row, input_schema_);
+        if (!key.HasValue()) {
+          {
+            FailWith(key.GetStatus());
+            return key.GetStatus();
+          }
+        }
+        key_vals.push_back(
+            relational_detail::CanonicalDistinctValue(key.MoveValue()));
       }
       Row g_key(std::move(key_vals));
       auto [it, inserted] = groups.try_emplace(g_key, GroupPartialState{});
@@ -226,15 +235,29 @@ void PartialAggregate::Materialize() {
     for (size_t i = 0; i < aggregates_.size(); ++i) {
       const auto& agg = aggregates_[i].expression->AsAggregateExpression();
       if (agg.WhereFilter()) {
-        Value fval = agg.WhereFilter()->Evaluate(in_row, input_schema_);
-        if (fval.IsNull() || !fval.Truthy()) {
+        StatusOr<Value> fval =
+            agg.WhereFilter()->TryEvaluate(in_row, input_schema_);
+        if (!fval.HasValue()) {
+          {
+            FailWith(fval.GetStatus());
+            return fval.GetStatus();
+          }
+        }
+        if (fval.Value().IsNull() || !fval.Value().Truthy()) {
           continue;
         }
       }
 
       Value val;
       if (!IsCountStar(agg) && agg.Child()) {
-        val = agg.Child()->Evaluate(in_row, input_schema_);
+        StatusOr<Value> input = agg.Child()->TryEvaluate(in_row, input_schema_);
+        if (!input.HasValue()) {
+          {
+            FailWith(input.GetStatus());
+            return input.GetStatus();
+          }
+        }
+        val = input.MoveValue();
       }
 
       switch (agg.GetType()) {
@@ -339,11 +362,17 @@ void PartialAggregate::Materialize() {
       emit_group(&k, groups[k]);
     }
   }
+  if (child_->GetStatus() != Status::kSuccess) {
+    return child_->GetStatus();
+  }
+  return Status::kSuccess;
 }
 
 bool PartialAggregate::Next(Row* dst, RowPosition* rp) {
   if (!materialized_) {
-    Materialize();
+    if (Materialize() != Status::kSuccess) {
+      return false;
+    }
   }
   if (cursor_ >= output_rows_.size()) {
     return false;

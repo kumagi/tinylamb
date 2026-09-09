@@ -237,8 +237,7 @@ bool ConjunctionIsContradictory(const std::vector<Expression>& conjuncts) {
           unary.Child()->Type() == TypeTag::kColumnValue) {
         ColPred p;
         // Qualified name: t1.id and t2.id are different columns.
-        p.col_name =
-            unary.Child()->AsColumnValue().GetColumnName().ToString();
+        p.col_name = unary.Child()->AsColumnValue().GetColumnName().ToString();
         p.is_null_test = true;
         p.is_null_positive = (unary.Op() == UnaryOperation::kIsNull);
         preds.push_back(std::move(p));
@@ -246,8 +245,7 @@ bool ConjunctionIsContradictory(const std::vector<Expression>& conjuncts) {
                   unary.Op() == UnaryOperation::kIsFalse) &&
                  unary.Child()->Type() == TypeTag::kColumnValue) {
         ColPred p;
-        p.col_name =
-            unary.Child()->AsColumnValue().GetColumnName().ToString();
+        p.col_name = unary.Child()->AsColumnValue().GetColumnName().ToString();
         p.is_bool_test = true;
         p.is_true_assertion = (unary.Op() == UnaryOperation::kIsTrue);
         preds.push_back(std::move(p));
@@ -1058,20 +1056,22 @@ std::string Memo::GroupKey(const std::vector<std::string>& relations) {
   return key;
 }
 
-GroupId Memo::Build(const std::vector<std::string>& relations) {
-  return Build(relations, {});
+StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations) {
+  return TryBuild(relations, {});
 }
 
-GroupId Memo::Build(const std::vector<std::string>& relations,
-                    const std::vector<ConjunctInfo>& conjuncts) {
+StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations,
+                                 const std::vector<ConjunctInfo>& conjuncts) {
   if (relations.empty()) {
-    throw std::invalid_argument("empty join graph");
+    return StatusError(StatusCode::kInvalidArgument, "empty join graph");
   }
   if (Normalize(relations).size() != relations.size()) {
-    throw std::invalid_argument("duplicate relation in join graph");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "duplicate relation in join graph");
   }
   if (relations.size() >= std::numeric_limits<uint64_t>::digits) {
-    throw std::invalid_argument("join graph is too large for enumeration");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "join graph is too large for enumeration");
   }
   relation_index_.clear();
   const std::vector<std::string> normalized = Normalize(relations);
@@ -1104,8 +1104,7 @@ uint64_t Memo::RelationMask(const std::vector<std::string>& relations) const {
   for (const std::string& relation : relations) {
     const auto found = relation_index_.find(relation);
     if (found == relation_index_.end()) {
-      throw std::invalid_argument("relation outside the join graph: " +
-                                  relation);
+      CHECK_MSG(false, "relation outside the join graph: " + relation);
     }
     mask |= uint64_t{1} << found->second;
   }
@@ -1190,7 +1189,7 @@ LogicalExpression Memo::NewJoin(GroupId left, GroupId right) const {
 void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
   Group& target = Get(group);
   if (target.relations.size() != 1) {
-    throw std::invalid_argument("scan filter requires a single-relation group");
+    CHECK_MSG(false, "scan filter requires a single-relation group");
   }
   const Expression next = CanonicalizeConjuncts(
       target.filter
@@ -1229,7 +1228,7 @@ GroupId Memo::EnsureGroup(
                       // is bounded (kMaxJoinEnumerationRelations).
   relations = Normalize(std::move(relations));
   if (relations.empty()) {
-    throw std::invalid_argument("empty memo group");
+    CHECK_MSG(false, "empty memo group");
   }
   const std::string key = GroupKey(relations);
   if (const auto found = groups_by_key_.find(key);
@@ -1303,7 +1302,7 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
                      target.relations, [&](const std::string& rel) {
                        return IsSameTable(rel, expression.table);
                      }))) {
-        throw std::invalid_argument("scan does not belong to memo group");
+        CHECK_MSG(false, "scan does not belong to memo group");
       }
       break;
     case LogicalOperator::kValues:
@@ -1321,13 +1320,12 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
     case LogicalOperator::kApply: {
       if (expression.children.size() == 1) {
         if (expression.children[0] == target.id) {
-          throw std::invalid_argument(
-              "logical operator references its own group");
+          CHECK_MSG(false, "logical operator references its own group");
         }
         break;
       }
       if (expression.children.size() != 2) {
-        throw std::invalid_argument("apply must have one or two child groups");
+        CHECK_MSG(false, "apply must have one or two child groups");
       }
       const Group& left = Get(expression.children[0]);
       const Group& right = Get(expression.children[1]);
@@ -1336,8 +1334,7 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
                                     std::back_inserter(intersection));
       if (!intersection.empty() ||
           UnionRelations(left.relations, right.relations) != target.relations) {
-        throw std::invalid_argument(
-            "apply children are not equivalent to group");
+        CHECK_MSG(false, "apply children are not equivalent to group");
       }
       break;
     }
@@ -1346,8 +1343,7 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
         break;
       }
       if (expression.children.size() != 2) {
-        throw std::invalid_argument(
-            "recursive cte must have at most two child groups");
+        CHECK_MSG(false, "recursive cte must have at most two child groups");
       }
       const Group& left = Get(expression.children[0]);
       const Group& right = Get(expression.children[1]);
@@ -1357,8 +1353,7 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
       if (!intersection.empty() ||
           UnionRelations(left.relations, right.relations) != target.relations) {
         if (target.tag.empty()) {
-          throw std::invalid_argument(
-              "join children are not equivalent to group");
+          CHECK_MSG(false, "join children are not equivalent to group");
         }
       }
       break;
@@ -1366,15 +1361,13 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
     case LogicalOperator::kSemiJoin:
     case LogicalOperator::kAntiJoin: {
       if (expression.children.size() != 2) {
-        throw std::invalid_argument(
-            "semi/anti join must have two child groups");
+        CHECK_MSG(false, "semi/anti join must have two child groups");
       }
       const Group& left = Get(expression.children[0]);
       const Group& right = Get(expression.children[1]);
       if (left.relations != target.relations &&
           UnionRelations(left.relations, right.relations) != target.relations) {
-        throw std::invalid_argument(
-            "join children are not equivalent to group");
+        CHECK_MSG(false, "join children are not equivalent to group");
       }
       break;
     }
@@ -1385,16 +1378,14 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
     case LogicalOperator::kExcept:
     case LogicalOperator::kExceptAll: {
       if (expression.children.size() < 2) {
-        throw std::invalid_argument(
-            "set operation needs at least two children");
+        CHECK_MSG(false, "set operation needs at least two children");
       }
       std::vector<std::string> relations;
       for (const GroupId child : expression.children) {
         relations = UnionRelations(relations, Get(child).relations);
       }
       if (relations != target.relations) {
-        throw std::invalid_argument(
-            "set operation children are not equivalent to group");
+        CHECK_MSG(false, "set operation children are not equivalent to group");
       }
       break;
     }
@@ -1420,35 +1411,32 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
     case LogicalOperator::kSample:
     case LogicalOperator::kAssert: {
       if (expression.children.size() != 1) {
-        throw std::invalid_argument("single-child logical operator");
+        CHECK_MSG(false, "single-child logical operator");
       }
       if (expression.children[0] == group) {
-        throw std::invalid_argument(
-            "logical operator references its own group");
+        CHECK_MSG(false, "logical operator references its own group");
       }
       if (Get(expression.children[0]).relations != target.relations) {
-        throw std::invalid_argument(
-            "operator must preserve the group's relation set");
+        CHECK_MSG(false, "operator must preserve the group's relation set");
       }
       if (expression.operation == LogicalOperator::kSelection &&
           (!expression.predicate || !*expression.predicate)) {
-        throw std::invalid_argument("selection must carry a predicate");
+        CHECK_MSG(false, "selection must carry a predicate");
       }
       if ((expression.operation == LogicalOperator::kProjection ||
            expression.operation == LogicalOperator::kAggregation) &&
           expression.target_list.empty()) {
-        throw std::invalid_argument(
-            "projection/aggregation needs a target list");
+        CHECK_MSG(false, "projection/aggregation needs a target list");
       }
       if ((expression.operation == LogicalOperator::kSort ||
            expression.operation == LogicalOperator::kTopN) &&
           (expression.target_list.empty() ||
            expression.target_list.size() != expression.sort_ascending.size())) {
-        throw std::invalid_argument("sort needs one direction per key");
+        CHECK_MSG(false, "sort needs one direction per key");
       }
       if (expression.operation == LogicalOperator::kTopN &&
           expression.limit_count == 0) {
-        throw std::invalid_argument("top-n needs a finite limit");
+        CHECK_MSG(false, "top-n needs a finite limit");
       }
       break;
     }
@@ -1474,16 +1462,12 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
 }
 
 const Group& Memo::Get(GroupId group) const {
-  if (group >= groups_.size()) {
-    throw std::out_of_range("memo group");
-  }
+  CHECK_MSG(group < groups_.size(), "memo group");
   return groups_[group];
 }
 
 Group& Memo::Get(GroupId group) {
-  if (group >= groups_.size()) {
-    throw std::out_of_range("memo group");
-  }
+  CHECK_MSG(group < groups_.size(), "memo group");
   return groups_[group];
 }
 
@@ -5685,35 +5669,35 @@ const RuleSet& RuleSet::Default() {
           // a non-unique key rewritten to a semi join silently collapses
           // duplicate matches.
           const ColumnName& fk_side =
-              std::ranges::find(left_group.relations,
-                                bin.Left()->AsColumnValue()
-                                    .GetColumnName()
-                                    .schema) != left_group.relations.end()
+              std::ranges::find(
+                  left_group.relations,
+                  bin.Left()->AsColumnValue().GetColumnName().schema) !=
+                      left_group.relations.end()
                   ? bin.Left()->AsColumnValue().GetColumnName()
                   : bin.Right()->AsColumnValue().GetColumnName();
           const ColumnName& pk_side =
-              fk_side.schema == bin.Left()->AsColumnValue().GetColumnName().schema
+              fk_side.schema ==
+                      bin.Left()->AsColumnValue().GetColumnName().schema
                   ? bin.Right()->AsColumnValue().GetColumnName()
                   : bin.Left()->AsColumnValue().GetColumnName();
-          auto column_constraint = [](const Group& grp, const ColumnName& column) {
-                for (const auto& expr : grp.expressions) {
-                  for (size_t i = 0; i < expr.output_schema.ColumnCount();
-                       ++i) {
-                    const auto& col = expr.output_schema.GetColumn(i);
-                    if (col.Name() == column) {
-                      return col.GetConstraint();
-                    }
-                  }
+          auto column_constraint = [](const Group& grp,
+                                      const ColumnName& column) {
+            for (const auto& expr : grp.expressions) {
+              for (size_t i = 0; i < expr.output_schema.ColumnCount(); ++i) {
+                const auto& col = expr.output_schema.GetColumn(i);
+                if (col.Name() == column) {
+                  return col.GetConstraint();
                 }
-                return Constraint{};
-              };
+              }
+            }
+            return Constraint{};
+          };
           const Constraint fk_constraint =
               column_constraint(left_group, fk_side);
           const Constraint pk_constraint =
               column_constraint(right_group, pk_side);
-          const bool left_is_fk =
-              fk_constraint.ctype == Constraint::kNotNull ||
-              fk_constraint.ctype == Constraint::kForeign;
+          const bool left_is_fk = fk_constraint.ctype == Constraint::kNotNull ||
+                                  fk_constraint.ctype == Constraint::kForeign;
           const bool right_is_pk =
               pk_constraint.IsUnique() ||
               pk_constraint.ctype == Constraint::kPrimaryKey;

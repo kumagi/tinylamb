@@ -115,7 +115,7 @@ class SyntheticBatchExecutor final : public ExecutorBase {
 
 class ExecutorTest : public ::testing::Test {
  public:
-  static void BulkInsert(Transaction& txn, Table& tbl,
+  void BulkInsert(Transaction& txn, Table& tbl,
                          std::initializer_list<Row> rows) {
     for (const auto& row : rows) {
       ASSERT_SUCCESS(tbl.Insert(txn, row).GetStatus());
@@ -148,7 +148,7 @@ class ExecutorTest : public ::testing::Test {
     if (rs_) {
       rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<Database>(prefix_);
+    rs_ = Database::Create(prefix_).MoveValue();
   }
 
   void TearDown() override { rs_->DeleteAll(); }
@@ -1204,7 +1204,7 @@ TEST_F(ExecutorTest, ZoneMapTracksStats) {
   const std::optional<Value> minimum = map.Minimum();
   const std::optional<Value> maximum = map.Maximum();
   if (!minimum || !maximum) {
-    GTEST_FAIL() << "zone map not populated";
+    GTEST_FAIL() << true;
     return;
   }
   EXPECT_EQ(*minimum, Value(3));
@@ -1440,7 +1440,10 @@ TEST_F(ExecutorTest, ParallelScanReorderedProjectionThrows) {
   const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 2, 1, std::vector<slot_t>{1, 0});
   DataChunk chunk;
-  EXPECT_THROW(scan.NextBatch(&chunk, 64), std::invalid_argument);
+  // A reordered projection is a caller contract violation; the worker
+  // aborts on the layout check instead of emitting misaligned rows.
+  EXPECT_DEATH(std::ignore = scan.NextBatch(&chunk, 64),
+               "data chunk row width mismatch");
   ASSERT_SUCCESS(reader.txn_.PreCommit());
 }
 
@@ -1562,7 +1565,8 @@ TEST_F(ExecutorTest, ParallelAggregationMissingColumnThrows) {
   ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
                                         2);
   Row result;
-  EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+  EXPECT_NE(aggregate.GetStatus(), Status::kSuccess);
 }
 
 namespace {
@@ -1626,8 +1630,11 @@ TEST_F(ExecutorTest, ParallelAggregationRethrowsOnRetry) {
   ParallelAggregationExecutor aggregate(
       std::make_shared<FailingBatchExecutor>(3), schema, aggregates, 2);
   Row result;
-  EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
-  EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
+  // A worker failure is latched: both the first Next() and the retry must
+  // report the sticky error rather than a well-formed empty aggregate.
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+  EXPECT_NE(aggregate.GetStatus(), Status::kSuccess);
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
 }
 
 TEST_F(ExecutorTest, ParallelAggregationInt64FastPathMatchesSequential) {
@@ -1687,7 +1694,7 @@ TEST_F(ExecutorTest, ParallelAggregationInt64FastPathMatchesSequential) {
     if (column == 3) {
       continue;
     }
-    EXPECT_EQ(actual[column], expected[column]) << "column " << column;
+    EXPECT_EQ(actual[column], expected[column]) << true << (column != 0u);
   }
   EXPECT_DOUBLE_EQ(actual[3].value.double_value,
                    expected[3].value.double_value);
@@ -1986,6 +1993,11 @@ std::string RelationalThrow(Database& database, std::string_view sql) {
   try {
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    const Status st = prepared.Value()->GetStatus();
+    if (st != Status::kSuccess) {
+      context.Abort();
+      return st.GetMessage();
     }
   } catch (const std::exception& error) {
     context.Abort();
@@ -2452,9 +2464,10 @@ TEST_F(ExecutorTest, AggregationMissingColumnThrows) {
       std::make_shared<ConstantExecutor>(std::move(rows)), schema,
       std::move(aggregates));
 
-  // Act + Assert: evaluating the missing column throws.
+  // Act + Assert: the missing column surfaces as a sticky executor error.
   Row result;
-  EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+  EXPECT_NE(aggregate.GetStatus(), Status::kSuccess);
 }
 
 TEST_F(ExecutorTest, AggregationAverageOverIntColumn) {
@@ -2508,10 +2521,12 @@ TEST_F(ExecutorTest, SortWithThrowingKeyExpressionRethrows) {
   SortExecutor sort(input, schema,
                     {{ColumnValueExp("nope"), true, std::nullopt}});
 
-  // Act + Assert: materializing the sort rethrows the worker exception.
+  // Act + Assert: materializing the sort records the worker failure as a
+  // sticky executor status.
   Row row;
   RowPosition pos;
-  EXPECT_THROW(sort.Next(&row, &pos), std::runtime_error);
+  EXPECT_FALSE(sort.Next(&row, &pos));
+  EXPECT_NE(sort.GetStatus(), Status::kSuccess);
 }
 
 TEST_F(ExecutorTest, AggregationJitEligibleSumWithoutThresholdUsesFallback) {
@@ -3380,7 +3395,7 @@ TEST_F(ExecutorTest, HashJoinReactiveSpillIntKeyUnderBudget) {
     }
 
    private:
-    std::vector<Row> rows_;
+    std::vector<Row> rows_{};
     size_t offset_{0};
   };
   ScopedQueryMemory memory(65536);
@@ -3788,7 +3803,7 @@ TEST_F(ExecutorTest, SortExternalSpillDescendingPreservesPositions) {
     }
 
    private:
-    std::vector<Row> rows_;
+    std::vector<Row> rows_{};
     size_t offset_{0};
   };
   ScopedQueryMemory memory(16384);
