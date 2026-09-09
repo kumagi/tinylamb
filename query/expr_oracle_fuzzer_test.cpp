@@ -389,4 +389,48 @@ TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
   EXPECT_FALSE(ParseExprOracleTest("-- tinylamb-expr-oracle-test v1\n", &junk));
 }
 
+TEST(ExprOracleFuzzer, RowAwareNullRejectAndDifferentialEquivalence) {
+  constexpr int kIterations = 64;
+  int null_reject_verified_count = 0;
+  int engine_ran_count = 0;
+
+  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+    const auto seed32 = seed;
+    const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
+    std::mt19937 rng(seed32);
+    RowExprOracleTrace trace;
+    trace.seed = packed;
+    std::string report = RunRowExprOracleIteration(rng, false, &trace);
+    ASSERT_EQ(report, "") << "Seed " << seed << " failed:\n" << report;
+    EXPECT_EQ(trace.seed, packed);
+    EXPECT_FALSE(trace.predicate_sql.empty());
+    EXPECT_GT(trace.total_rows, 0U);
+    if (trace.null_reject_verified) {
+      ++null_reject_verified_count;
+    }
+    if (trace.engine_ran) {
+      ++engine_ran_count;
+    }
+  }
+
+  EXPECT_EQ(engine_ran_count, kIterations);
+  EXPECT_GT(null_reject_verified_count, 0)
+      << "Expected null rejection verification to trigger on generated predicates";
+}
+
+TEST(ExprOracleFuzzer, RowTraceReplayEquivalence) {
+  const uint32_t seed32 = 42;
+  std::mt19937 rng(seed32);
+  RowExprOracleTrace trace;
+  trace.seed = (static_cast<uint64_t>(seed32) << 32) | seed32;
+  ASSERT_EQ(RunRowExprOracleIteration(rng, false, &trace), "");
+
+  EXPECT_EQ(ReplayRowExprOracleTrace(trace, false), "");
+
+  // Tampering with trace IDs should cause replay to detect discrepancy
+  RowExprOracleTrace tampered = trace;
+  tampered.matched_ids.push_back(999999);
+  EXPECT_NE(ReplayRowExprOracleTrace(tampered, false), "");
+}
+
 }  // namespace tinylamb

@@ -764,6 +764,15 @@ add_simple_test(page/row_page_concurrent_test.cpp)
 add_simple_test(index/b_plus_tree_concurrent_test.cpp)
 add_simple_test(index/lsm_detail/cache_concurrent_test.cpp)
 
+add_executable(rule_fuzzer plan/rule_fuzzer.cpp)
+tinylamb_apply_options(rule_fuzzer)
+target_link_libraries(rule_fuzzer
+        PRIVATE
+        tinylamb::sql
+        tinylamb::test_util
+        Threads::Threads
+)
+
 endif()
 
 ########################################

@@ -72,6 +72,49 @@ bool ParseExprOracleTest(std::string_view text, ExprOracleTrace* trace);
 // aborts. Compatible with sudden-death fuzzing: no state escapes the call.
 void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose);
 
+// ---------------------------------------------------------------------------
+// Row-Aware NULL-Rejection & Differential Execution Fuzzer
+// ---------------------------------------------------------------------------
+
+struct RowExprOracleTrace {
+  uint64_t seed = 0;
+  std::string predicate_sql;
+  std::string predicate_ast;
+  size_t total_rows = 0;
+  size_t matched_rows = 0;
+  std::vector<int64_t> matched_ids;
+  bool null_reject_claimed = false;
+  std::string null_reject_col;
+  bool null_reject_verified = false;
+  bool engine_ran = false;
+  std::string failure;
+
+  bool operator==(const RowExprOracleTrace&) const = default;
+};
+
+// Generates a table `t_fuzz(id INT64, i INT64, f FLOAT64, b BOOL, s VARCHAR(32))`
+// populated with edge-case rows (all-NULL, alternating NULLs, extremes, 0, +/-1,
+// NaN, Inf, empty/wildcard strings), synthesizes a column-aware predicate,
+// and checks three oracles:
+//
+//   (1) Null-Rejection Soundness Oracle:
+//       If cascades::ExpressionRejectsNullsOnColumn(expr, C) claims true, then on
+//       EVERY test row where row[C] is NULL, expr->TryEvaluate(row).Truthy() MUST be false.
+//   (2) Rewrite 3-Valued Logic Equivalence Oracle:
+//       For every row, expr and its rewritten form (ExpressionRuleSet::Default() +
+//       RewriteTypedArithmetic) must agree on truthiness (filter context: TRUE vs FALSE/NULL).
+//   (3) Differential Execution Engine Oracle:
+//       On a real database table populated with the test rows:
+//       - Ground-truth AST reference filter
+//       - Rewritten tree in-memory filter
+//       - Engine SQL execution: `SELECT id FROM t_fuzz WHERE <predicate_sql> ORDER BY id;`
+//       Must all return the identical set of row IDs.
+std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
+                                      RowExprOracleTrace* trace = nullptr);
+
+std::string ReplayRowExprOracleTrace(const RowExprOracleTrace& trace,
+                                     bool verbose = false);
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_EXPR_ORACLE_FUZZER_HPP
