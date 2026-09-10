@@ -77,10 +77,8 @@ FORBIDDEN_PATTERNS = (
 
 # Accepted violations (fnmatch patterns over "<file> -> <include>").
 DEFAULT_ALLOWLIST = (
-    # --- 過去レビューで既知だった違反 (V1 / V3' / V4) -------------------
-    # V1: expression -> database。A1 EvaluationContext 導入で解消予定。
-    "expression/expression.hpp -> database/transaction_context.hpp",
-    "expression/function_call_expression.cpp -> database/*",
+    # --- 過去レビューで既知だった違反 (V3' / V4) -------------------------
+    # V1 (expression -> database) は解消済みのためエントリ削除済み。
     # V4: plan -> executor。A5 relational ファクトリ移設でほぼ解消
     # (plan/plan.hpp は不透明前方宣言、各 *_plan.cpp の EmitExecutor 実装は
     #  executor/relational_factory.cpp へ移設済み)。残存はハイブリッド
@@ -127,8 +125,6 @@ DEFAULT_ALLOWLIST = (
     "executor/detail/* -> executor/*",
     # optimizer は query_data を使う (CMake 上 tinylamb_executor 所属)。
     "plan/* -> query/query_data.hpp",
-    # concurrent session added implementation_rules; allowlist until reviewed.
-    "plan/implementation_rules.cpp -> executor/join_kind.hpp",
     # サブクエリ脱相関 (tpch Phase2-4) のため optimizer が QueryExpression
     # 内の SelectStatement を解析する。sql 局のステートメント IR を読むだけ
     # で、実行は relational/subquery_runtime 側に留まる。

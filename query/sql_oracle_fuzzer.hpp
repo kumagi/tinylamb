@@ -17,7 +17,12 @@ namespace tinylamb {
 // optimizer and executor logic bugs), following arXiv:2311.06728 taxonomy:
 //
 // - TLP (Query Partitioning): Q == Q[p AND c] U Q[p AND NOT c] U Q[p AND
-//   c IS NULL].
+//   c IS NULL].  Q ranges over single-table, DISTINCT, and join FROM
+//   clauses (inner/left/right/full/cross); c may be a mirrored predicate or
+//   a SQL-only fragment (IN list, BETWEEN, LIKE, arithmetic, CASE, or a
+//   subquery).
+// - Aggregate TLP: grouped COUNT(*)/SUM over Q[p] must equal the three
+//   partitions merged group-wise.
 // - NoREC (Non-Optimizing Reference Engine): COUNT(*) WHERE p ==
 //   SUM(CASE WHEN p THEN 1 ELSE 0 END).
 // - Constraint-solving / PQS-flavoured oracle: the harness mirrors every
@@ -52,6 +57,9 @@ struct OracleTrace {
   std::string pqs_u;      // SELECT u WHERE p'
   int64_t pqs_expected{0};
   int64_t pqs_pivot_u{0};
+  // Aggregate TLP: grouped COUNT/SUM over the full predicate must equal the
+  // per-partition results merged group-wise.
+  std::vector<std::string> tlp_agg;  // original, part1, part2, part3
   // Constraint rewriting: probe before/after the DDL must agree.
   std::vector<std::string> index_ddl;
   std::string index_probe;
@@ -66,6 +74,7 @@ struct OracleTrace {
 
 struct OracleIterationStats {
   bool tlp_ran{false};
+  bool tlp_agg_ran{false};
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};

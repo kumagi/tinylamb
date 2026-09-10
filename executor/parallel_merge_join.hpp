@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <iosfwd>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -84,6 +85,11 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
   // Residual (non-equi) predicate over the concatenated pair; always true
   // when no residual was given.
   [[nodiscard]] bool PairPasses(const Row& left, const Row& right) const;
+  // Latches the first residual-evaluation failure. Partition workers run on
+  // their own threads, so writes go through this mutex-protected sink and
+  // Next() reads the merged result strictly after the workers joined.
+  void RecordResidualError(const Status& status) const;
+  mutable std::mutex residual_error_mutex_;
   mutable Status residual_error_{Status::kSuccess};
 
   Executor left_;

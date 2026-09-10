@@ -75,7 +75,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
 
   Iterator it = BeginFullScan(txn);
   while (it.IsValid()) {
-    const Status status = IndexInsert(txn, indexes_.back(), *it, it.Position());
+    Status status = IndexInsert(txn, indexes_.back(), *it, it.Position());
     if (status != Status::kSuccess) {
       // Drop the half-built index so later Insert/Delete stop touching it,
       // and recycle every page it allocated.  The partial build may have
@@ -558,7 +558,7 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
   }
   ASSIGN_OR_RETURN(PageRef, source_page,
                    txn.GetPageManager()->GetPage(pos.page_id));
-  const Status delete_status = source_page->Delete(txn, pos.slot);
+  Status delete_status = source_page->Delete(txn, pos.slot);
   if (delete_status == Status::kNotExists) {
     // The snapshot read above proved the row is logically visible, yet its
     // physical image is gone from the slot: RowPage::Read fell back to the
@@ -608,6 +608,17 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   return result;
 }
 
+// A NULL anywhere in the key columns; SQL unique semantics say NULL !=
+// NULL, so such keys never collide (they still occupy the 1-byte NULL
+// encoding in the B+Tree so scans can reach them).
+namespace {
+bool KeyHasNull(const Index& idx, const Row& row) {
+  return std::ranges::any_of(idx.sc_.key_, [&row](const slot_t key_column) {
+    return row[key_column].IsNull();
+  });
+}
+}  // namespace
+
 Status Table::IndexInsert(Transaction& txn, const Index& idx,
                           const Row& new_row, const RowPosition& pos,
                           page_id_t* hint_leaf) const {
@@ -637,7 +648,7 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
       std::string_view existing_data = existing_value.Value();
       ASSIGN_OR_RETURN(std::vector<IndexValueType>, rps,
                        Decode<std::vector<IndexValueType>>(existing_data));
-      if (idx.IsUnique()) {
+      if (idx.IsUnique() && !KeyHasNull(idx, new_row)) {
         for (const IndexValueType& value : rps) {
           if (value.pos == pos) {
             // An UPDATE whose key did not change needs no second entry.  The

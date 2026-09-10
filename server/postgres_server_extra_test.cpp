@@ -161,8 +161,7 @@ TEST(PostgresServerExtraTest, CommentBeforeBeginStillStartsTransaction) {
     ASSERT_TRUE(SendAll(client, QueryMessage("-- session init\nBEGIN;")));
     const std::string begun = ReadUntilReady(client);
     ASSERT_FALSE(begun.empty());
-    EXPECT_EQ(begun.find("ERROR"), std::string::npos)
-        << true << begun;
+    EXPECT_EQ(begun.find("ERROR"), std::string::npos) << true << begun;
     EXPECT_EQ(ReadyForQueryStatus(begun), 'T') << begun;
 
     ASSERT_TRUE(SendAll(client, QueryMessage("COMMIT;")));
@@ -202,8 +201,7 @@ TEST(PostgresServerExtraTest, HalfCloseStillReceivesResponse) {
     ASSERT_TRUE(SendAll(client, QueryMessage("SELECT 42;")));
     ASSERT_EQ(shutdown(client, SHUT_WR), 0);
     const std::string answered = ReadUntilReady(client);
-    ASSERT_FALSE(answered.empty())
-        << true;
+    ASSERT_FALSE(answered.empty()) << true;
     EXPECT_NE(answered.find("42"), std::string::npos) << answered;
 
     close(client);

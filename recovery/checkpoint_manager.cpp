@@ -66,6 +66,8 @@ Status WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
     out.write(encoded.data(), encoded.size());
     out.flush();
     if (!out) {
+      std::error_code ec;
+      std::filesystem::remove(tmp, ec);
       return StatusError(StatusCode::kIOError,
                          "Failed to write master record: " + tmp.string());
     }
@@ -102,6 +104,8 @@ Status WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
   std::error_code rename_ec;
   std::filesystem::rename(tmp, path, rename_ec);
   if (rename_ec) {
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
     return StatusError(StatusCode::kIOError,
                        "Failed to rename master record to " + path.string() +
                            ": " + rename_ec.message());

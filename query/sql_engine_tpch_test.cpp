@@ -267,8 +267,9 @@ class SqlEngineTpchTest : public ::testing::Test {
   }
   void TearDown() override { database_->DeleteAll(); }
 
-  std::vector<Row> Run(TransactionContext& context, std::string_view sql) {
-    SqlEngine engine(*database_);
+  static std::vector<Row> Run(Database& database, TransactionContext& context,
+                              std::string_view sql) {
+    SqlEngine engine(database);
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
                                                       << engine.LastError();
@@ -283,34 +284,34 @@ class SqlEngineTpchTest : public ::testing::Test {
     return rows;
   }
 
-  void CreateSchema(TransactionContext& context) {
-    Run(context,
+  static void CreateSchema(Database& database, TransactionContext& context) {
+    Run(database, context,
         "CREATE TABLE region (r_regionkey INT64, r_name STRING, "
         "r_comment STRING);");
-    Run(context,
+    Run(database, context,
         "CREATE TABLE nation (n_nationkey INT64, n_name STRING, "
         "n_regionkey INT64, n_comment STRING);");
-    Run(context,
+    Run(database, context,
         "CREATE TABLE supplier (s_suppkey INT64, s_name STRING, "
         "s_address STRING, s_nationkey INT64, s_phone STRING, "
         "s_acctbal NUMERIC, s_comment STRING);");
-    Run(context,
+    Run(database, context,
         "CREATE TABLE part (p_partkey INT64, p_name STRING, "
         "p_mfgr STRING, p_brand STRING, p_type STRING, p_size INT64, "
         "p_container STRING, p_retailprice NUMERIC, p_comment STRING);");
-    Run(context,
+    Run(database, context,
         "CREATE TABLE partsupp (ps_partkey INT64, ps_suppkey INT64, "
         "ps_availqty INT64, ps_supplycost NUMERIC, ps_comment STRING);");
-    Run(context,
+    Run(database, context,
         "CREATE TABLE customer (c_custkey INT64, c_name STRING, "
         "c_address STRING, c_nationkey INT64, c_phone STRING, "
         "c_acctbal NUMERIC, c_mktsegment STRING, c_comment STRING);");
-    Run(context,
+    Run(database, context,
         "CREATE TABLE orders (o_orderkey INT64, o_custkey INT64, "
         "o_orderstatus STRING, o_totalprice NUMERIC, "
         "o_orderdate DATE, o_orderpriority STRING, o_clerk STRING, "
         "o_shippriority INT64, o_comment STRING);");
-    Run(context,
+    Run(database, context,
         "CREATE TABLE lineitem (l_orderkey INT64, l_partkey INT64, "
         "l_suppkey INT64, l_linenumber INT64, l_quantity NUMERIC, "
         "l_extendedprice NUMERIC, l_discount NUMERIC, l_tax NUMERIC, "
@@ -319,42 +320,42 @@ class SqlEngineTpchTest : public ::testing::Test {
         "l_shipmode STRING, l_comment STRING);");
   }
 
-  void Seed(TransactionContext& context) {
-    Run(context,
+  static void Seed(Database& database, TransactionContext& context) {
+    Run(database, context,
         "INSERT INTO region VALUES (1,'AMERICA',''), (2,'AFRICA',''), "
         "(3,'MIDDLE EAST','');");
-    Run(context,
+    Run(database, context,
         "INSERT INTO nation VALUES (1,'PERU',1,''), "
         "(2,'SAUDI ARABIA',3,''), (3,'UNITED KINGDOM',3,'');");
-    Run(context,
+    Run(database, context,
         "INSERT INTO supplier VALUES "
         "(1,'Supplier#1','Address 1',1,'10-111',100.0,'ok'), "
         "(2,'Supplier#2','Address 2',2,'19-222',200.0,'ok');");
-    Run(context,
+    Run(database, context,
         "INSERT INTO part VALUES "
         "(1,'tan tomato part','MFGR','Brand#33',"
         "'STANDARD POLISHED TIN',19,'LG DRUM',10.0,''), "
         "(2,'promo part','MFGR','Brand#53','PROMO COPPER',5,"
         "'SM BOX',20.0,'');");
-    Run(context,
+    Run(database, context,
         "INSERT INTO partsupp VALUES "
         "(1,1,500,2.0,''), (2,2,300,3.0,'');");
-    Run(context,
+    Run(database, context,
         "INSERT INTO customer VALUES "
         "(1,'Customer#1','C Address',1,'10-123456',100.0,"
         "'FURNITURE',''), (2,'Customer#2','C Address',3,"
         "'19-123456',50.0,'BUILDING','');");
-    Run(context,
+    Run(database, context,
         "INSERT INTO orders VALUES "
         "(1,1,'F',1000.0,'1994-02-15','1-URGENT','Clerk',0,'normal'), "
         "(2,2,'F',500.0,'1997-06-15','2-HIGH','Clerk',0,'normal');");
-    Run(context,
+    Run(database, context,
         "INSERT INTO lineitem VALUES "
         "(1,1,1,1,10.0,100.0,0.08,0.02,'R','O','1994-03-15',"
         "'1994-03-20','1994-03-25','DELIVER IN PERSON','AIR',''), "
         "(2,2,2,1,20.0,200.0,0.05,0.01,'N','F','1997-06-20',"
         "'1997-06-21','1997-06-22','DELIVER IN PERSON','MAIL','');");
-    Run(context, "ANALYZE;");
+    Run(database, context, "ANALYZE;");
   }
 
   std::string path_;
@@ -363,13 +364,13 @@ class SqlEngineTpchTest : public ::testing::Test {
 
 TEST_F(SqlEngineTpchTest, ExecutesAllTwentyTwoQueries) {
   TransactionContext context = database_->BeginContext();
-  CreateSchema(context);
-  Seed(context);
+  CreateSchema(*database_, context);
+  Seed(*database_, context);
   constexpr std::array<size_t, 22> kExpectedRowCounts = {
       2, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0};
   for (size_t i = 0; i < kTpchQueries.size(); ++i) {
     SCOPED_TRACE("TPC-H Q" + std::to_string(i + 1));
-    std::vector<Row> rows = Run(context, kTpchQueries[i]);
+    std::vector<Row> rows = Run(*database_, context, kTpchQueries[i]);
     EXPECT_EQ(rows.size(), kExpectedRowCounts[i]);
     if (i == 5) {
       ASSERT_EQ(rows.size(), 1);
@@ -381,8 +382,8 @@ TEST_F(SqlEngineTpchTest, ExecutesAllTwentyTwoQueries) {
 
 TEST_F(SqlEngineTpchTest, ExplainReturnsPlanAndAnalyzeReturnsRuntimeProfile) {
   TransactionContext context = database_->BeginContext();
-  CreateSchema(context);
-  Seed(context);
+  CreateSchema(*database_, context);
+  Seed(*database_, context);
 
   auto collect_plan = [&](std::string_view prefix) {
     SqlEngine engine(*database_);
@@ -427,8 +428,8 @@ TEST_F(SqlEngineTpchTest, ExplainReturnsPlanAndAnalyzeReturnsRuntimeProfile) {
 
 TEST_F(SqlEngineTpchTest, FusesAllAggregatesIntoOnePassPerInputRow) {
   TransactionContext context = database_->BeginContext();
-  Run(context, "CREATE TABLE metrics (g STRING, v NUMERIC);");
-  Run(context,
+  Run(*database_, context, "CREATE TABLE metrics (g STRING, v NUMERIC);");
+  Run(*database_, context,
       "INSERT INTO metrics VALUES ('A',1.0),('A',2.0),('A',2.0),"
       "('A',NULL),('B',NULL);");
 
@@ -472,9 +473,9 @@ TEST_F(SqlEngineTpchTest, FusesAllAggregatesIntoOnePassPerInputRow) {
   EXPECT_NE(profile.str().find("aggregate_groups=2"), std::string::npos)
       << profile.str();
 
-  Run(context, "CREATE TABLE empty_metrics (v NUMERIC);");
+  Run(*database_, context, "CREATE TABLE empty_metrics (v NUMERIC);");
   std::vector<Row> empty =
-      Run(context,
+      Run(*database_, context,
           "SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) "
           "FROM empty_metrics;");
   ASSERT_EQ(empty.size(), 1);
@@ -487,8 +488,9 @@ TEST_F(SqlEngineTpchTest, FusesAllAggregatesIntoOnePassPerInputRow) {
 
 TEST_F(SqlEngineTpchTest, PrunesScanColumnsAndFiltersBeforeMaterialization) {
   TransactionContext context = database_->BeginContext();
-  Run(context, "CREATE TABLE wide (a INT64, b INT64, c STRING, d NUMERIC);");
-  Run(context,
+  Run(*database_, context,
+      "CREATE TABLE wide (a INT64, b INT64, c STRING, d NUMERIC);");
+  Run(*database_, context,
       "INSERT INTO wide VALUES (1,10,'x',1.0),(2,20,'y',2.0),"
       "(3,30,'z',3.0),(4,40,'w',4.0);");
 
@@ -531,7 +533,7 @@ TEST_F(SqlEngineTpchTest, PrunesScanColumnsAndFiltersBeforeMaterialization) {
 
 TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
   TransactionContext context = database_->BeginContext();
-  CreateSchema(context);
+  CreateSchema(*database_, context);
 
   std::ostringstream customers;
   std::ostringstream orders;
@@ -557,9 +559,9 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
   customers << ";";
   orders << ";";
   lineitems << ";";
-  Run(context, customers.str());
-  Run(context, orders.str());
-  Run(context, lineitems.str());
+  Run(*database_, context, customers.str());
+  Run(*database_, context, orders.str());
+  Run(*database_, context, lineitems.str());
 
   SqlEngine engine(*database_);
   StatusOr<Executor> prepared = engine.Prepare(

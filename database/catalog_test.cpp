@@ -957,8 +957,7 @@ TEST_F(CatalogTest, ColumnStatisticsResolveForAnyCase) {
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, stats,
                         rs_->GetStatistics(ctx2, "casestats"));
   ASSERT_EQ(stats.Rows(), 5U);
-  EXPECT_GT(stats.Column(0).Count(), 0U)
-      << true;
+  EXPECT_GT(stats.Column(0).Count(), 0U) << true;
   ASSERT_SUCCESS(ctx2.txn_.PreCommit());
 }
 

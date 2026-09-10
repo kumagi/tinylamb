@@ -480,13 +480,17 @@ class PostgresServer::Impl {
         close(fd);
         continue;
       }
+      // Register the client before adding the fd to epoll: if the map insert
+      // throws, the fd is still ours to close; registered the other way
+      // around, an epoll-enrolled fd with no client entry would be ignored
+      // by the event loop until shutdown.
+      clients_.try_emplace(fd, fd, next_client_id_++, NextSecret());
       std::string error;
       if (!AddEpollFd(fd, EPOLLIN | EPOLLRDHUP, &error)) {
         std::cerr << error << '\n';
-        close(fd);
+        CloseClient(fd);
         continue;
       }
-      clients_.try_emplace(fd, fd, next_client_id_++, NextSecret());
     }
   }
 

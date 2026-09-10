@@ -32,8 +32,16 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
                                      std::string_view begin,
                                      std::string_view end, bool ascending)
     : tree_(tree), txn_(txn), begin_(begin), end_(end) {
-  CHECK_MSG(end.empty() || begin.empty() || !(end < begin),
-            "invalid begin & end");
+  // A begin past the end is a legitimately empty range, not a programming
+  // error: SQL like `b BETWEEN 9 AND 3` or an IN-list whose encoded bounds
+  // invert must yield zero rows.  CHECK-aborting here turned any such query
+  // (surfaced by the index-independence fuzzer) into a whole-process crash.
+  if (!begin.empty() && !end.empty() && end < begin) {
+    pid_ = 0;
+    idx_ = 0;
+    valid_ = false;
+    return;
+  }
   const Status init = [&]() -> Status {
     if (ascending) {
       if (begin.empty()) {

@@ -70,7 +70,7 @@ class BPlusTreeTest : public ::testing::Test {
   void Flush(page_id_t pid) const { p_->GetPool()->FlushPageForTest(pid); }
 
   void Recover() {
-    page_id_t root = bpt_ ? bpt_->Root() : 1;
+    const page_id_t root = bpt_ ? bpt_->Root() : 1;
     if (p_) {
       p_->GetPool()->DropAllPages();
     }
@@ -843,7 +843,7 @@ TEST_F(BPlusTreeTest, Crash) {
   // Act -- flush every 2nd page (even indices) to disk, then emulate crash +
   // recovery
   page_id_t max_page =
-      p_->GetPage(0).Value()->body.meta_page.MaxPageCountForTest() ;
+      p_->GetPage(0).Value()->body.meta_page.MaxPageCountForTest();
   for (size_t i = 0; i < max_page; i += 2) {
     Flush(i);
   }
@@ -891,7 +891,7 @@ TEST_F(BPlusTreeTest, NodeReclaimWALReplaysAfterCrash) {
     std::this_thread::yield();
   }
   const page_id_t pages_before =
-      p_->GetPage(kMetaPageId).Value()->body.meta_page.MaxPageCountForTest() ;
+      p_->GetPage(kMetaPageId).Value()->body.meta_page.MaxPageCountForTest();
   Recover();
   r_->RecoverFrom(0, tm_.get());
 
@@ -948,7 +948,7 @@ TEST_F(BPlusTreeTest, CheckPoint) {
   // Act 4 -- flush every 5th page to disk, then emulate crash + recovery from
   // checkpoint
   page_id_t max_page =
-      p_->GetPage(0).Value()->body.meta_page.MaxPageCountForTest() ;
+      p_->GetPage(0).Value()->body.meta_page.MaxPageCountForTest();
   for (size_t i = 0; i < max_page; i += 5) {
     Flush(i);
   }

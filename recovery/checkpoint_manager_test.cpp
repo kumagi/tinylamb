@@ -151,7 +151,7 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
   const slot_t slot = 0;
 
   // Act 1 -- checkpoint, then update+insert without committing
-  const lsn_t restart_point = cm_->WriteCheckpoint().Value() ;
+  const lsn_t restart_point = cm_->WriteCheckpoint().Value();
   {
     PageRef page = p_->GetPage(page_id_).MoveValue();
     ASSERT_SUCCESS(page->Update(txn, slot, "aborted"));
@@ -223,7 +223,7 @@ TEST_F(CheckpointTest, LoserBelowCheckpointIsUndoneGlobally) {
   }
   p_->GetPool()->FlushPageForTest(page_id_);
   p_->GetPool()->DropAllPages();
-  const lsn_t restart_point = cm_->WriteCheckpoint().Value() ;
+  const lsn_t restart_point = cm_->WriteCheckpoint().Value();
 
   // Act -- crash-reopen and recover from the checkpoint LSN.
   Recover();

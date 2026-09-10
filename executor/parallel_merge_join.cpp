@@ -52,10 +52,19 @@ bool ParallelMergeJoin::PairPasses(const Row& left, const Row& right) const {
   const Row combined = left + right;
   StatusOr<Value> res = residual_->TryEvaluate(combined, residual_schema_);
   if (!res.HasValue()) {
-    residual_error_ = res.GetStatus();
+    RecordResidualError(res.GetStatus());
     return false;
   }
   return res.Value().Truthy();
+}
+
+void ParallelMergeJoin::RecordResidualError(const Status& status) const {
+  // Multiple partition workers can hit the same predicate failure at once;
+  // keep the first message and drop the rest.
+  std::scoped_lock lock(residual_error_mutex_);
+  if (residual_error_ == Status::kSuccess) {
+    residual_error_ = status;
+  }
 }
 
 int ParallelMergeJoin::CompareKeys(const Row& left, const Row& right) const {
@@ -317,7 +326,7 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
   if (partitions_.size() <= 1) {
     worker_func(0);
   } else {
-    std::vector<std::thread> workers;
+    std::vector<std::jthread> workers;
     std::exception_ptr worker_failure;
     std::mutex failure_mutex;
     workers.reserve(partitions_.size());

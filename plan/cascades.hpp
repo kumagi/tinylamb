@@ -741,13 +741,12 @@ class SearchEngine {
   std::unordered_map<GroupId, size_t> next_expression_;
   std::unordered_map<std::string, std::optional<BestPlan>> best_;
 };
- 
+
 bool IsStrictOnRelations(const Expression& expr,
                          const std::vector<std::string>& relations);
 
 bool ExpressionRejectsNullsOnRelations(
-    const Expression& expr,
-    const std::vector<std::string>& relations);
+    const Expression& expr, const std::vector<std::string>& relations);
 
 bool IsStrictOnColumn(const Expression& expr, const std::string& column_name);
 

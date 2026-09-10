@@ -198,7 +198,7 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
   if (num_threads <= 1) {
     build_worker(0);
   } else {
-    std::vector<std::thread> workers;
+    std::vector<std::jthread> workers;
     workers.reserve(num_threads);
     std::mutex error_mutex;
     Status build_error{Status::kSuccess};
@@ -346,7 +346,7 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
   if (num_threads <= 1) {
     probe_worker(0);
   } else {
-    std::vector<std::thread> workers;
+    std::vector<std::jthread> workers;
     workers.reserve(num_threads);
     std::mutex error_mutex;
     Status probe_error{Status::kSuccess};

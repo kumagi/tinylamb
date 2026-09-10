@@ -1122,7 +1122,7 @@ struct WindowRuntime {
       if (n < 2) {
         return std::nullopt;
       }
-      double sx = 0, sy = 0, sxx = 0, syy = 0, sxy;
+      double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
       for (const auto& [xv, yv] : pairs) {
         sx += xv;
         sy += yv;

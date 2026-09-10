@@ -21,6 +21,7 @@ class RelationalPlan final : public PlanBase {
                  Schema output_schema)
       : statement_(std::move(statement)),
         output_schema_(std::move(output_schema)),
+        // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.UninitializedObject)
         statistics_(output_schema_) {}
 
   Executor EmitExecutor(TransactionContext& context) const override;

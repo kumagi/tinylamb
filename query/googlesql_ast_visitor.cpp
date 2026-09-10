@@ -199,7 +199,12 @@ std::string Lower(std::string value) {
 // Deeply nested expressions (e.g. "1+1+1+..." chained 100k times) parse fine
 // but would overflow the C++ stack during recursive visitation; a stack
 // overflow is unrecoverable, so cap the visitation depth explicitly.
-constexpr size_t kMaxExpressionDepth = 512;
+// VisitExpression carries a very large frame (every branch's locals live in
+// one activation), and sanitizer builds inflate it further: with ASan the
+// usable depth is only ~140 on an 8 MiB stack, so the cap must stay far
+// below that to keep Debug/ASan runs from overflowing before the guard
+// fires.
+constexpr size_t kMaxExpressionDepth = 96;
 
 size_t& ExpressionDepthCounter() {
   static thread_local size_t depth = 0;
@@ -1835,7 +1840,7 @@ StatusOr<Expression> VisitFunction(
       if (const GoogleSqlAstNode* limit_node = child.Child("Limit")) {
         if (const GoogleSqlAstNode* value = limit_node->Child("IntLiteral")) {
           ASSIGN_OR_RETURN(uint64_t, hv65738_0, (ParseUnsignedLiteral(*value)));
-          inner_limit = static_cast<size_t>(std::move(hv65738_0));
+          inner_limit = static_cast<size_t>(hv65738_0);
         }
       }
       continue;
@@ -2736,7 +2741,7 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
       if (const GoogleSqlAstNode* limit_node = child.Child("Limit")) {
         if (const GoogleSqlAstNode* value = limit_node->Child("IntLiteral")) {
           ASSIGN_OR_RETURN(uint64_t, hv94767_0, (ParseUnsignedLiteral(*value)));
-          window->inner_limit = static_cast<size_t>(std::move(hv94767_0));
+          window->inner_limit = static_cast<size_t>(hv94767_0);
         }
       }
       continue;
@@ -5131,8 +5136,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
               if (child->kind == "IntLiteral") {
                 ASSIGN_OR_RETURN(uint64_t, hv180703_0,
                                  (ParseUnsignedLiteral(*child)));
-                first_stmt->SetLimit(
-                    static_cast<size_t>(std::move(hv180703_0)));
+                first_stmt->SetLimit(static_cast<size_t>(hv180703_0));
                 break;
               }
               auto folded_or = VisitExpression(*child);
@@ -5691,7 +5695,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         if (child->kind == "IntLiteral") {
           ASSIGN_OR_RETURN(uint64_t, hv202084_0,
                            (ParseUnsignedLiteral(*child)));
-          limit = static_cast<size_t>(std::move(hv202084_0));
+          limit = static_cast<size_t>(hv202084_0);
         } else if (auto folded = fold_int(*child)) {
           if (*folded < 0) {
             return AstError<std::shared_ptr<SelectStatement>>(
@@ -6188,8 +6192,11 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
                               Expression* predicate,
                               int64_t* assert_rows) -> Status {
     std::vector<const GoogleSqlAstNode*> candidates;
+    const GoogleSqlAstNode* nested_target = node.Child("PathExpression");
     for (const auto& child : node.children) {
-      if (child->kind == "PathExpression" || child->kind == "UpdateItemList" ||
+      // Identity skip for the target: bare-column predicates (`WHERE flag`)
+      // are PathExpressions too (see VisitDelete).
+      if (child.get() == nested_target || child->kind == "UpdateItemList" ||
           child->kind == "Location" || child->kind == "Hint" ||
           child->kind == "AssertRowsModified") {
         continue;
@@ -6327,7 +6334,10 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
   // WHERE candidates.
   std::vector<const GoogleSqlAstNode*> where_candidates;
   for (const auto& child : root.children) {
-    if (child->kind == "PathExpression" || child->kind == "UpdateItemList" ||
+    // The target is skipped by IDENTITY: `WHERE flag` also arrives as a
+    // PathExpression, and a kind-based skip dropped bare-column predicates
+    // (the UPDATE then touched every row).
+    if (child.get() == path || child->kind == "UpdateItemList" ||
         child->kind == "Location" || child->kind == "Hint" ||
         child->kind == "Alias" || child->kind == "AssertRowsModified" ||
         child->kind == "ReturningClause" || child->kind == "FromClause") {
@@ -6369,7 +6379,12 @@ StatusOr<std::unique_ptr<Statement>> VisitDelete(const GoogleSqlAstNode& root) {
   }
   std::vector<const GoogleSqlAstNode*> where_candidates;
   for (const auto& child : root.children) {
-    if (child->kind == "PathExpression" || child->kind == "Location" ||
+    // Skip the target by IDENTITY, not by kind: a bare-column predicate
+    // (`WHERE flag`) is itself a PathExpression in the dump, and skipping
+    // every PathExpression silently dropped it -- the DELETE then matched
+    // every row (sql_oracle_fuzz find: DQE DELETE WHERE flag deleted the
+    // whole table).
+    if (child.get() == path || child->kind == "Location" ||
         child->kind == "Hint" || child->kind == "Alias" ||
         child->kind == "AssertRowsModified" ||
         child->kind == "ReturningClause" || child->kind == "FromClause") {

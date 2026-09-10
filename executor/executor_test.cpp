@@ -115,7 +115,7 @@ class SyntheticBatchExecutor final : public ExecutorBase {
 
 class ExecutorTest : public ::testing::Test {
  public:
-  void BulkInsert(Transaction& txn, Table& tbl,
+  static void BulkInsert(Transaction& txn, Table& tbl,
                          std::initializer_list<Row> rows) {
     for (const auto& row : rows) {
       ASSERT_SUCCESS(tbl.Insert(txn, row).GetStatus());
@@ -1694,7 +1694,7 @@ TEST_F(ExecutorTest, ParallelAggregationInt64FastPathMatchesSequential) {
     if (column == 3) {
       continue;
     }
-    EXPECT_EQ(actual[column], expected[column]) << true << (column != 0u);
+    EXPECT_EQ(actual[column], expected[column]) << true << (column != 0U);
   }
   EXPECT_DOUBLE_EQ(actual[3].value.double_value,
                    expected[3].value.double_value);

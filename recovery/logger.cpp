@@ -93,8 +93,20 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
   }
   // std::thread has no noexcept construction path; EAGAIN/ENOMEM from the
   // pthread layer is caught at this boundary and mapped to a Status.
-  auto logger = std::unique_ptr<Logger>(
-      new Logger(logfile, buffer_size, every_ms));  // NOLINT
+  std::unique_ptr<Logger> logger;
+  try {
+    logger = std::unique_ptr<Logger>(
+        new Logger(logfile, buffer_size, every_ms));  // NOLINT
+  } catch (const std::bad_alloc&) {
+    // The fd is still owned by this frame; ~Logger has not run, so close it
+    // here or the descriptor leaks on an allocation failure.
+    close(fd);
+    return StatusError(StatusCode::kIOError,
+                       "Failed to allocate logger for " + logfile.string());
+  }
+  // Transfer fd ownership before anything that can throw: the destructor
+  // closes dst_, so a Logger constructor failure must not leave the fd
+  // stored nowhere, and a spawn failure must not double-close.
   logger->dst_ = fd;
   logger->flushed_lsn_.store(file_size, std::memory_order_relaxed);
   logger->durable_lsn_.store(file_size, std::memory_order_release);
@@ -102,7 +114,7 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
   try {
     logger->worker_ = std::thread(&Logger::LoggerWork, logger.get());
   } catch (const std::system_error& error) {
-    close(fd);
+    // ~Logger already closed dst_ via the unique_ptr destruction above.
     return StatusError(StatusCode::kIOError, "Failed to start logger worker: " +
                                                  std::string(error.what()));
   }

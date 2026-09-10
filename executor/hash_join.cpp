@@ -690,7 +690,10 @@ Status HashJoin::Materialize() {
     RETURN_IF_FAIL(MaterializeHybrid());
     pipelined_ = false;
   } else {
-    MaterializeInMemory();
+    // Ignoring the status here left a half-built JoinState (probe_rows ==
+    // nullptr) behind: the pipelined probe then dereferenced it and crashed
+    // instead of surfacing the intake/spill error (sql_oracle_fuzz find).
+    RETURN_IF_FAIL(MaterializeInMemory());
     pipelined_ = true;
   }
   materialized_ = true;

@@ -665,7 +665,7 @@ TEST_F(RecoveryManagerTest, LegacyV1DestroyRecordStillParses) {
   EXPECT_EQ(decoded.Size(), v1.size());  // v1 has no CRC tail
 
   // Scanning over a legacy record must stay byte-synchronized.
-  const lsn_t start = l_->BufferedLSN() ;
+  const lsn_t start = l_->BufferedLSN();
   l_->AddLog(v1);
   while (l_->CommittedLSN() < l_->BufferedLSN()) {
     std::this_thread::yield();
@@ -809,7 +809,7 @@ TEST_F(RecoveryManagerTest, RecoverFromMidLogRedoFromCheckpoint) {
   // Arrange -- commit row "first", flush the page, then commit row "second"
   ASSERT_TRUE(InsertRow("first"));
   Flush();
-  lsn_t restart_point = l_->CommittedLSN() ;
+  lsn_t restart_point = l_->CommittedLSN();
   ASSERT_TRUE(InsertRow("second"));
 
   // Act -- crash and recover from the LSN captured after the first commit
@@ -1111,7 +1111,7 @@ TEST_F(RecoveryManagerTest, ReadLogDecodesCommittedInsert) {
   bool saw_insert = false;
   while (offset < filesize) {
     LogRecord log;
-    ASSERT_TRUE(r_->ReadLog(offset, &log)) << true << (offset != 0u);
+    ASSERT_TRUE(r_->ReadLog(offset, &log)) << true << (offset != 0U);
     if (log.type == LogType::kInsertRow && log.pid == page_id_) {
       saw_insert = true;
     }
@@ -1330,23 +1330,28 @@ TEST_F(RecoveryManagerTest, CheckpointDirtyPageTablePreservesMaxPageId) {
     // Recovery pass 1 (rebuilds the allocator from the WAL).
     RecoverBase([]() {});
     r_->RecoverFrom(checkpoint_lsn, tm_.get());
-    // A newly allocated page must not collide with any live page.
-    Transaction alloc = tm_->Begin();
-    const PageRef allocated =
-        p_->AllocateNewPage(alloc, PageType::kRowPage).MoveValue();
-    EXPECT_GT(allocated->PageID(), 4U)
-        << true;
-    ASSERT_SUCCESS(alloc.PreCommit());
+    // A newly allocated page must not collide with any live page.  The
+    // pinned PageRef must die before the second RecoverBase() tears the
+    // pool down, so keep it in its own scope.
+    {
+      Transaction alloc = tm_->Begin();
+      const PageRef allocated =
+          p_->AllocateNewPage(alloc, PageType::kRowPage).MoveValue();
+      EXPECT_GT(allocated->PageID(), 4U) << true;
+      ASSERT_SUCCESS(alloc.PreCommit());
+    }
 
     // Persistence check: a second restart cycle must keep the data.
     p_->GetPool()->DropAllPages();
     RecoverBase([]() {});
     r_->RecoverFrom(0, tm_.get());
+    Transaction read_txn = tm_->Begin();
     PageRef again = p_->GetPage(2).MoveValue();
     EXPECT_EQ(again->Type(), PageType::kRowPage);
     EXPECT_EQ(again->RowCount(), 1);
-    EXPECT_EQ(again->Read(alloc, 0).Value(), "survivor");
+    EXPECT_EQ(again->Read(read_txn, 0).Value(), "survivor");
     again.PageUnlock();
+    read_txn.PreCommit();
   }
   std::ignore = std::remove(master.c_str());
 }
@@ -1358,7 +1363,7 @@ TEST_F(RecoveryManagerTest, MidRecordBitFlipStopsScanAtThatRecord) {
   // parseable; only the CRC can catch this corruption.
   ASSERT_TRUE(InsertRow("before-flip"));
   WaitForLogFlush(l_);
-  const lsn_t second_start = l_->BufferedLSN() ;
+  const lsn_t second_start = l_->BufferedLSN();
   l_->AddLog(LogRecord::InsertingLogRecord(0, 99, page_id_, 1, "intact-payload")
                  .Serialize());
   WaitForLogFlush(l_);
@@ -1392,7 +1397,7 @@ TEST_F(RecoveryManagerTest, MidRecordBitFlipStopsScanAtThatRecord) {
 TEST_F(RecoveryManagerTest, MixedLegacyAndCurrentVersionLogsScanCleanly) {
   // D9 (docs/design.md): the reader walks a WAL that mixes v1 (no CRC) and
   // current-version (CRC) records; every record byte-counts exactly.
-  const lsn_t start = l_->BufferedLSN() ;
+  const lsn_t start = l_->BufferedLSN();
   LogRecord destroy = LogRecord::DestroyPageLogRecord(100, 1, page_id_);
   std::string legacy = destroy.Serialize();
   legacy.resize(legacy.size() -
@@ -1402,7 +1407,7 @@ TEST_F(RecoveryManagerTest, MixedLegacyAndCurrentVersionLogsScanCleanly) {
   legacy[6] = 0;
   legacy[7] = kLegacyWalRecordVersion;
   l_->AddLog(legacy);
-  const lsn_t after_legacy = l_->BufferedLSN() ;
+  const lsn_t after_legacy = l_->BufferedLSN();
   EXPECT_EQ(after_legacy - start, legacy.size());
   l_->AddLog(destroy.Serialize());
   WaitForLogFlush(l_);
@@ -1421,7 +1426,7 @@ TEST_F(RecoveryManagerTest, ReadLogRejectsCorruptPageTypeWithoutThrowing) {
   // of the decoder and abort startup.
   ASSERT_TRUE(InsertRow("alloc-before"));
   WaitForLogFlush(l_);
-  const lsn_t start = l_->BufferedLSN() ;
+  const lsn_t start = l_->BufferedLSN();
   LogRecord alloc =
       LogRecord::AllocatePageLogRecord(0, 1, 500, PageType::kRowPage);
   std::string bytes = alloc.Serialize();

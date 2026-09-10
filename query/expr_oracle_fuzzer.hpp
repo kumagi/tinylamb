@@ -92,23 +92,25 @@ struct RowExprOracleTrace {
   bool operator==(const RowExprOracleTrace&) const = default;
 };
 
-// Generates a table `t_fuzz(id INT64, i INT64, f FLOAT64, b BOOL, s VARCHAR(32))`
-// populated with edge-case rows (all-NULL, alternating NULLs, extremes, 0, +/-1,
-// NaN, Inf, empty/wildcard strings), synthesizes a column-aware predicate,
-// and checks three oracles:
+// Generates a table `t_fuzz(id INT64, i INT64, f FLOAT64, b BOOL, s
+// VARCHAR(32))` populated with edge-case rows (all-NULL, alternating NULLs,
+// extremes, 0, +/-1, NaN, Inf, empty/wildcard strings), synthesizes a
+// column-aware predicate, and checks three oracles:
 //
 //   (1) Null-Rejection Soundness Oracle:
-//       If cascades::ExpressionRejectsNullsOnColumn(expr, C) claims true, then on
-//       EVERY test row where row[C] is NULL, expr->TryEvaluate(row).Truthy() MUST be false.
+//       If cascades::ExpressionRejectsNullsOnColumn(expr, C) claims true, then
+//       on EVERY test row where row[C] is NULL, expr->TryEvaluate(row).Truthy()
+//       MUST be false.
 //   (2) Rewrite 3-Valued Logic Equivalence Oracle:
-//       For every row, expr and its rewritten form (ExpressionRuleSet::Default() +
-//       RewriteTypedArithmetic) must agree on truthiness (filter context: TRUE vs FALSE/NULL).
+//       For every row, expr and its rewritten form
+//       (ExpressionRuleSet::Default() + RewriteTypedArithmetic) must agree on
+//       truthiness (filter context: TRUE vs FALSE/NULL).
 //   (3) Differential Execution Engine Oracle:
 //       On a real database table populated with the test rows:
 //       - Ground-truth AST reference filter
 //       - Rewritten tree in-memory filter
-//       - Engine SQL execution: `SELECT id FROM t_fuzz WHERE <predicate_sql> ORDER BY id;`
-//       Must all return the identical set of row IDs.
+//       - Engine SQL execution: `SELECT id FROM t_fuzz WHERE <predicate_sql>
+//       ORDER BY id;` Must all return the identical set of row IDs.
 std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
                                       RowExprOracleTrace* trace = nullptr);
 

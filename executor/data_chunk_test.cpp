@@ -640,7 +640,7 @@ TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
     const Value expected =
         EvaluateBinary(BinaryOperation::kAnd, chunk.ColumnAt(0).ValueAt(i),
                        chunk.ColumnAt(1).ValueAt(i));
-    EXPECT_EQ(and_res.ValueAt(i), expected) << true << (i != 0u);
+    EXPECT_EQ(and_res.ValueAt(i), expected) << true << (i != 0U);
   }
 
   const Expression or_expr = BinaryExpressionExp(
@@ -657,7 +657,7 @@ TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
     const Value expected =
         EvaluateBinary(BinaryOperation::kOr, chunk.ColumnAt(0).ValueAt(i),
                        chunk.ColumnAt(1).ValueAt(i));
-    EXPECT_EQ(or_res.ValueAt(i), expected) << true << (i != 0u);
+    EXPECT_EQ(or_res.ValueAt(i), expected) << true << (i != 0U);
   }
 }
 

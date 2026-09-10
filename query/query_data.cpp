@@ -620,7 +620,7 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   }
 
   // Rewrite WHERE clause.
-  const Status where_status =
+  Status where_status =
       ResolveExpression(where_, col_table_map, ambiguous_colum_name, relations,
                         all_cols, expand_proto_value_table, &ambiguous_column_);
   if (where_status != Status::kSuccess) {

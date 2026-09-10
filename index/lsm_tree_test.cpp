@@ -626,8 +626,7 @@ TEST_F(LSMTreeTest, ReopenRejectsMalformedRunFile) {
   // The malformed file was quarantined IN THE RUN DIRECTORY (the rename
   // destination must be an absolute path; a bare "name.bad" would land in the
   // process CWD instead).
-  EXPECT_TRUE(std::filesystem::exists(junk.string() + ".bad"))
-      << true;
+  EXPECT_TRUE(std::filesystem::exists(junk.string() + ".bad")) << true;
   EXPECT_FALSE(std::filesystem::exists(junk));
 }
 

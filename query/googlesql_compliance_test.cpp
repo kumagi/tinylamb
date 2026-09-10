@@ -610,9 +610,10 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
     std::vector<Row> rows;
     try {
       rows = Drain(*engine, *context, test_case.sql, &status, &error_msg);
-      if (status == Status::kSuccess &&
-          engine->LastStatementType().has_value()) {
-        const StatementType executed = *engine->LastStatementType();
+      const std::optional<StatementType> executed_type =
+          engine->LastStatementType();
+      if (status == Status::kSuccess && executed_type.has_value()) {
+        const StatementType executed = *executed_type;
         if (executed == StatementType::kInsert ||
             executed == StatementType::kUpdate ||
             executed == StatementType::kDelete) {

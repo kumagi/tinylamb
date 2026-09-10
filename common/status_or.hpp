@@ -54,7 +54,7 @@
 
 #define COERCE(x)                                              \
   {                                                            \
-    Status tmp_status = (x);                                   \
+    const Status& tmp_status = (x);                            \
     if (UNLIKELY(tmp_status != Status::kSuccess)) {            \
       LOG(FATAL) << "Crashed: " << #x << " is " << tmp_status; \
       abort();                                                 \

@@ -65,7 +65,7 @@ class CacheConcurrentTest : public ::testing::Test {
     std::ignore = std::remove(path_.c_str());
   }
 
-  int Expected(size_t pos) {
+  static int Expected(size_t pos) {
     return static_cast<int>(static_cast<size_t>(kSeed) +
                             std::hash<size_t>()(pos));
   }

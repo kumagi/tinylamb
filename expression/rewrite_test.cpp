@@ -377,8 +377,8 @@ TEST(ExpressionRewriteTest, SplitCombineEdgeCases) {
   EXPECT_TRUE(SplitConjuncts(nullptr).empty());
   Expression deep = BinaryExpressionExp(
       BinaryExpressionExp(
-          BinaryExpressionExp(ConstantValueExp(Value(1)),
-                              BinaryOperation::kAnd, ColumnValueExp("a")),
+          BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAnd,
+                              ColumnValueExp("a")),
           BinaryOperation::kAnd, ColumnValueExp("b")),
       BinaryOperation::kAnd, ColumnValueExp("c"));
   EXPECT_EQ(SplitConjuncts(deep).size(), 4);
@@ -540,14 +540,14 @@ TEST(ExpressionRewriteTest, XorBooleanIdentity) {
   };
   Expression x = ColumnValueExp("x");
 
-  Expression xor_true = BinaryExpressionExp(x, BinaryOperation::kXor,
-                                            ConstantValueExp(Value(1)));
+  Expression xor_true =
+      BinaryExpressionExp(x, BinaryOperation::kXor, ConstantValueExp(Value(1)));
   Expression rewritten = rewrite(xor_true);
   ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
   EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kNot);
 
-  Expression false_xor = BinaryExpressionExp(ConstantValueExp(Value(0)),
-                                             BinaryOperation::kXor, x);
+  Expression false_xor =
+      BinaryExpressionExp(ConstantValueExp(Value(0)), BinaryOperation::kXor, x);
   rewritten = rewrite(false_xor);
   EXPECT_EQ(rewritten->Type(), TypeTag::kColumnValue);
 
@@ -1122,8 +1122,7 @@ TEST(ExpressionRewriteTest, NullCheckOfNullCheckPreservesRaise) {
                          UnaryOperation::kIsNotNull);
   Expression rewritten = rewrite(t);
   EXPECT_NE(rewritten->ToString().find("CAST"), std::string::npos)
-      << true
-      << rewritten->ToString();
+      << true << rewritten->ToString();
 }
 
 TEST(ExpressionRewriteTest, ComplementaryAbsorptionDisabled) {
@@ -2181,8 +2180,7 @@ TEST(ExpressionRewriteTest, ChildRewritePreservesAggregateMetadata) {
   ASSERT_EQ(rebuilt->Type(), TypeTag::kAggregateExp);
   const auto& rebuilt_agg = rebuilt->AsAggregateExpression();
   EXPECT_EQ(rebuilt_agg.GetType(), AggregationType::kSum);
-  EXPECT_TRUE(rebuilt_agg.WhereFilter())
-      << true;
+  EXPECT_TRUE(rebuilt_agg.WhereFilter()) << true;
   EXPECT_EQ(rebuilt_agg.WhereFilter()->ToString(),
             agg->WhereFilter()->ToString());
   EXPECT_TRUE(rebuilt_agg.InnerLimit().has_value());

@@ -5184,7 +5184,8 @@ TEST(CascadesTest, OuterToInnerJoinCoalesceDoesNotRewrite) {
   (void)memo.Build({"t1", "t2"});
   const GroupId left = memo.EnsureGroup({"t1"});
   const GroupId right = memo.EnsureGroup({"t2"});
-  const GroupId oj_group = memo.EnsureDerivedGroup({"t1", "t2"}, "loj_coalesce");
+  const GroupId oj_group =
+      memo.EnsureDerivedGroup({"t1", "t2"}, "loj_coalesce");
   memo.AddExpression(
       oj_group, LogicalExpression{.operation = LogicalOperator::kOuterJoin,
                                   .children = {left, right},
@@ -5197,14 +5198,15 @@ TEST(CascadesTest, OuterToInnerJoinCoalesceDoesNotRewrite) {
   const GroupId sel_group =
       memo.EnsureDerivedGroup({"t1", "t2"}, "sel_coalesce");
   memo.AddExpression(
-      sel_group, LogicalExpression{.operation = LogicalOperator::kSelection,
-                                   .children = {oj_group},
-                                   .predicate = BinaryExpressionExp(
-                                       FunctionCallExp("coalesce", {
-                                           ColumnValueExp(ColumnName("t2", "val")),
-                                           ConstantValueExp(Value(0L))}),
-                                       BinaryOperation::kEquals,
-                                       ConstantValueExp(Value(0L)))});
+      sel_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kSelection,
+          .children = {oj_group},
+          .predicate = BinaryExpressionExp(
+              FunctionCallExp("coalesce",
+                              {ColumnValueExp(ColumnName("t2", "val")),
+                               ConstantValueExp(Value(0L))}),
+              BinaryOperation::kEquals, ConstantValueExp(Value(0L)))});
 
   SearchEngine search(std::move(memo), RuleSet::Default());
   search.Explore(sel_group);

@@ -332,7 +332,7 @@ Status SortedRun::Construct(const std::filesystem::path& file,
   entries.reserve(tree.size());
   for (const auto& t : tree) {
     ASSIGN_OR_RETURN(Entry, entry, Entry::Create(t.first, t.second, blob));
-    entries.push_back(std::move(entry));
+    entries.push_back(entry);
   }
   return FlushInternal(file, min_key, max_key, entries, generation);
 }

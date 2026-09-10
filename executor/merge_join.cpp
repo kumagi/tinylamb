@@ -32,11 +32,9 @@ MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
       right_width_(right_width),
       residual_(std::move(residual)),
       residual_schema_(std::move(residual_schema)) {
-  if (left_columns_.empty() || left_columns_.size() != right_columns_.size()) {
-    CHECK_MSG(
-        !left_columns_.empty() && left_columns_.size() == right_columns_.size(),
-        "MergeJoin requires equally-sized non-empty keys");
-  }
+  const bool keys_valid =
+      !left_columns_.empty() && left_columns_.size() == right_columns_.size();
+  CHECK_MSG(keys_valid, "MergeJoin requires equally-sized non-empty keys");
 }
 
 bool MergeJoin::KeyIsNull(const Row& row, const std::vector<slot_t>& columns) {

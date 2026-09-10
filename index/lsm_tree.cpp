@@ -427,7 +427,18 @@ Status LSMTree::Sync() {
   // run is registered: the run file itself was already fsynced by
   // FlushInternal, and without this barrier a crash leaves a durable run
   // pointing at torn blob bytes (quarantined on restore: acked writes lost).
-  RETURN_IF_FAIL(blob_->Sync());
+  if (const Status blob_sync = blob_->Sync(); blob_sync != Status::kSuccess) {
+    // Do not leak the .pending run file on a failed blob sync: each retry
+    // would otherwise strand another orphaned file (self-healing only at
+    // the next startup's RestoreRuns cleanup).
+    std::error_code remove_ec;
+    std::filesystem::remove(pending_file, remove_ec);
+    LOG(ERROR) << "flushing mem tree failed to sync blob: " << blob_sync;
+    std::scoped_lock lk(mem_tree_lock_);
+    mem_tree_.merge(frozen_mem_tree_);
+    frozen_mem_tree_.clear();
+    return blob_sync;
+  }
   // The name's blob high-water must describe bytes that are durable: the
   // pre-append Written() would let a run whose blob bytes were lost pass the
   // RestoreRuns quarantine check.  After blob_.Sync(), CommittedLSN covers
@@ -456,9 +467,22 @@ Status LSMTree::Sync() {
     // the data entirely (kNotExists). Both locks are taken in the canonical
     // mem_tree_lock_ -> file_tree_lock_ order.
     std::scoped_lock lk(mem_tree_lock_, file_tree_lock_);
-    ASSIGN_OR_RETURN(SortedRun, run, SortedRun::Restore(new_index_file));
+    StatusOr<SortedRun> run = SortedRun::Restore(new_index_file);
+    if (!run.HasValue()) {
+      // A durable but unregistered run file would never be re-read until the
+      // next restart, and skipping the merge-back below would let the next
+      // Sync() discard the frozen snapshot (acked writes lost). Roll the
+      // frozen tree back and drop the orphan file instead; the flush retries.
+      std::error_code remove_ec;
+      std::filesystem::remove(new_index_file, remove_ec);
+      LOG(ERROR) << "flushing mem tree failed to restore run: "
+                 << run.GetStatus();
+      mem_tree_.merge(frozen_mem_tree_);
+      frozen_mem_tree_.clear();
+      return run.GetStatus();
+    }
     files_.push_front(new_index_file);
-    index_.push_front(std::move(run));
+    index_.push_front(run.MoveValue());
     frozen_mem_tree_.clear();
   }
   return Status::kSuccess;
@@ -524,7 +548,14 @@ Status LSMTree::MergeAll() {
     // The merged run references every input's blob bytes; make them durable
     // and stamp the final name with the post-Sync high-water before the
     // inputs are removed.
-    RETURN_IF_FAIL(blob_->Sync());
+    if (const Status blob_sync = blob_->Sync(); blob_sync != Status::kSuccess) {
+      // Remove the freshly written .pending run instead of leaking it (the
+      // inputs stay registered, so the merge simply retries later).
+      std::error_code remove_ec;
+      std::filesystem::remove(path, remove_ec);
+      LOG(ERROR) << "merge failed to sync blob: " << blob_sync;
+      return blob_sync;
+    }
     const std::filesystem::path durable_name =
         root_dir_ / ("merged-" + std::to_string(file_generation) + "-" +
                      std::to_string(blob_->Written()));
@@ -546,6 +577,15 @@ Status LSMTree::MergeAll() {
   // would both terminate the merger thread and leak the files; degrade to a
   // logged error instead (the merged run supersedes their key ranges, and
   // RestoreRuns quarantines anything malformed on the next start).
+  if (!merged.empty()) {
+    // Open the merged run while the inputs are still registered: if the
+    // Restore fails (fd pressure, malformed write), removing the inputs
+    // first would leave their keys reachable only through the un-registered
+    // merged file. Leaving the inputs in place lets the merge simply retry.
+    ASSIGN_OR_RETURN(SortedRun, run, SortedRun::Restore(path));
+    index_.push_back(std::move(run));
+    files_.push_back(std::move(path));
+  }
   std::error_code remove_ec;
   std::filesystem::remove(older_file, remove_ec);
   if (remove_ec) {
@@ -556,11 +596,6 @@ Status LSMTree::MergeAll() {
   if (remove_ec) {
     LOG(ERROR) << "merge failed to remove " << newer_file << ": "
                << remove_ec.message();
-  }
-  if (!merged.empty()) {
-    ASSIGN_OR_RETURN(SortedRun, run, SortedRun::Restore(path));
-    index_.push_back(std::move(run));
-    files_.push_back(std::move(path));
   }
   return Status::kSuccess;
 }

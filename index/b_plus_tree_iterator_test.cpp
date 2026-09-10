@@ -56,8 +56,8 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
-  void Insert(Transaction& txn, const char c, size_t key_len,
-              size_t value_len) {
+  void Insert(Transaction& txn, char c, size_t key_len,
+              size_t value_len) const {
     ASSERT_SUCCESS(
         bpt_->Insert(txn, std::string(key_len, c), std::string(value_len, c)));
   }
@@ -149,6 +149,25 @@ TEST_F(BPlusTreeIteratorTest, RangeAcending) {
 
   // Assert -- iterator reaches the upper bound "d" and then exhausts
   EXPECT_FALSE(it.IsValid());
+}
+
+TEST_F(BPlusTreeIteratorTest, ReversedRangeIsEmptyNotCrash) {
+  // Regression (sql_oracle_fuzz): a range whose begin sorts past its end --
+  // e.g. `b BETWEEN 9 AND 3` compiled to an inverted encoded range -- is a
+  // legitimate EMPTY result.  The constructor used to CHECK-fail and abort
+  // the process (killing the whole server on one bad query).
+  auto txn = tm_->Begin();
+  for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
+    Insert(txn, c, 1000, 100);
+  }
+
+  BPlusTreeIterator ascending = bpt_->Begin(txn, "d", "b");
+  EXPECT_FALSE(ascending.IsValid());
+
+  BPlusTreeIterator descending = bpt_->Begin(txn, "d", "b", false);
+  EXPECT_FALSE(descending.IsValid());
+
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(BPlusTreeIteratorTest, RangeDescending) {
@@ -330,16 +349,18 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
 // The invalid-range guard throws std::runtime_error since
 // BPlusTreeIterator treats an inverted begin/end range as a caller-contract
 // violation (CHECK abort); these expectations pin that behavior.
-TEST_F(BPlusTreeIteratorTest, AbortsOnInvalidRange) {
-  // Arrange -- begin transaction, no inserts needed
+TEST_F(BPlusTreeIteratorTest, ReversedRangeYieldsEmptyNotDeath) {
+  // A range whose begin sorts after end (e.g. `b BETWEEN 9 AND 3`) is a
+  // legitimate empty result, not a fatal programming error.  It used to
+  // CHECK-abort the process -- sql_oracle_fuzzer turned one such query into a
+  // whole-server crash -- so it must now construct cleanly and report empty.
   auto txn = tm_->Begin();
+  EXPECT_NO_THROW(bpt_->Begin(txn, "z", "a"));
+  EXPECT_NO_THROW(bpt_->Begin(txn, "z", "a", false));
+  EXPECT_FALSE(bpt_->Begin(txn, "z", "a").IsValid());
+  EXPECT_FALSE(bpt_->Begin(txn, "z", "a", false).IsValid());
 
-  // Act/Assert -- a range whose begin sorts after end is rejected in both
-  // directions.
-  EXPECT_DEATH(bpt_->Begin(txn, "z", "a"), "invalid begin & end");
-  EXPECT_DEATH(bpt_->Begin(txn, "z", "a", false), "invalid begin & end");
-
-  // A well-ordered range is accepted for both directions.
+  // A well-ordered range is still accepted for both directions.
   EXPECT_NO_THROW(bpt_->Begin(txn, "a", "z"));
   EXPECT_NO_THROW(bpt_->Begin(txn, "a", "z", false));
 }

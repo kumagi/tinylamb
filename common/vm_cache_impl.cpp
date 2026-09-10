@@ -107,9 +107,19 @@ StatusOr<std::unique_ptr<VMCacheImpl>> VMCacheImpl::Create(
     return StatusError(StatusCode::kIOError,
                        std::string("mmap failed: ") + strerror(errno));
   }
-  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
-  return std::unique_ptr<VMCacheImpl>(new VMCacheImpl(  // NOLINT
-      fd, block_size, memory_capacity, offset, max_size, own_fd, buffer));
+  // The meta_ member below allocates (max_size/block_size + 1) atomics,
+  // which can realistically fail for a large blob window; munmap the buffer
+  // if construction throws, or the whole mapping leaks.
+  std::unique_ptr<VMCacheImpl> cache;
+  try {
+    // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+    cache = std::unique_ptr<VMCacheImpl>(new VMCacheImpl(  // NOLINT
+        fd, block_size, memory_capacity, offset, max_size, own_fd, buffer));
+  } catch (const std::bad_alloc&) {
+    ::munmap(buffer, max_size);
+    return StatusError(StatusCode::kIOError, "Failed to allocate VM cache");
+  }
+  return cache;
 }
 
 VMCacheImpl::VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
@@ -411,7 +421,21 @@ Status VMCacheImpl::FixPage(size_t page) const {
             EnqueueToMainFifo(&target);
           }
         }
-        return Activate(page);
+        Status activated = Activate(page);
+        if (activated != Status::kSuccess) {
+          // A failed pread must not leave the page pinned in kLocked forever:
+          // every later FixPage would spin in the yield loop below and hang
+          // the thread. Roll the state back to kEvicted under the queue lock
+          // (mirroring InvalidatePage's erase discipline) so a retry can
+          // re-register and reload it.
+          std::scoped_lock lk(queue_lock_);
+          std::erase(small_queue_, &target);
+          std::erase(main_queue_, &target);
+          std::erase(ghost_queue_, &target);
+          target.store(PageState::kEvicted, std::memory_order_release);
+          return activated;
+        }
+        return Status::kSuccess;
       }
     } else if (state == PageState::kUnlocked ||
                state == PageState::kUnlockedAccessed) {

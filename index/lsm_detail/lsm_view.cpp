@@ -202,12 +202,9 @@ Status LSMView::Iterator::Forward() {
       bool swap_left = !iters_[curr].IsValid();
       if (!swap_left && iters_[curr * 2].IsValid()) {
         ASSIGN_OR_RETURN(int, cmp1, iters_[curr * 2].Compare(iters_[curr]));
-        if (0 < cmp1) {
-          swap_left = true;
-        } else if (0 == cmp1 &&
-                   iters_[curr].Generation() < iters_[curr * 2].Generation()) {
-          swap_left = true;
-        }
+        swap_left = 0 < cmp1 ||
+                    (0 == cmp1 &&
+                     iters_[curr].Generation() < iters_[curr * 2].Generation());
       }
       if (swap_left) {
         std::swap(iters_[curr], iters_[curr * 2]);

@@ -79,7 +79,7 @@ TEST_F(LoggerTest, AppendOne) {
   LogRecord l(0xcafebabe, 0xdeadbeef, LogType::kBegin);
 
   // Act -- append the serialized log; wait for commit; read back via ifstream
-  lsn_t lsn = l_->AddLog(l.Serialize()).Value() ;
+  lsn_t lsn = l_->AddLog(l.Serialize()).Value();
   ASSERT_EQ(0, lsn);  // Inserted place must be the beginning of the log.
   WaitForCommit(0 + l.Size());
   EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size());
@@ -171,7 +171,7 @@ TEST_F(LoggerTest, Verify) {
 
 TEST_F(LoggerTest, WaitForDurableObservesFsync) {
   std::string payload = RandomString(256);
-  const lsn_t lsn = l_->AddLog(payload).Value() ;
+  const lsn_t lsn = l_->AddLog(payload).Value();
   l_->WaitForDurable(lsn + payload.size());
   EXPECT_GE(l_->DurableLSN(), lsn + payload.size());
   EXPECT_GE(l_->CommittedLSN(), lsn + payload.size());
@@ -346,7 +346,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
   size_t records = 0;
   while (file.peek() != std::ifstream::traits_type::eof()) {
     const uint32_t magic = read32();
-    ASSERT_EQ(magic, kD1Magic) << true << (records != 0u) << true;
+    ASSERT_EQ(magic, kD1Magic) << true << (records != 0U) << true;
     const uint32_t thread = read32();
     const uint32_t seq = read32();
     const uint32_t length = read32();
@@ -355,8 +355,8 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
     const int fill = static_cast<unsigned char>((thread * 31) + seq);
     for (uint32_t i = 0; i < length; ++i) {
       ASSERT_EQ(file.get(), fill)
-          << true << (records != 0u) << true << (thread != 0u) << true << (seq != 0u)
-          << true;
+          << true << (records != 0U) << true << (thread != 0U) << true
+          << (seq != 0U) << true;
     }
     ++records;
   }

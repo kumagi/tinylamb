@@ -729,7 +729,10 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
   }
   return parsed;
 #else
-  return {false, {}, "GoogleSQL AST support is unavailable on this platform"};
+  (void)sql;
+  return {.ok = false,
+          .ast = {},
+          .error = "GoogleSQL AST support is unavailable on this platform"};
 #endif
 }
 

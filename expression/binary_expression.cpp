@@ -311,11 +311,11 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       // flow into std::tm which normalizes out-of-range values.  The 'T'
       // separator accepted by the shape check is normalized to ' ' because
       // the format string below matches a literal space only.
-      // NOLINTNEXTLINE(cert-err34-c)
       std::string head(text.substr(0, 19));
       if (head[10] == 'T') {
         head[10] = ' ';
       }
+      // NOLINTNEXTLINE(cert-err34-c)
       if (sscanf(head.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour,
                  &minute, &second) != 6) {
         return std::nullopt;

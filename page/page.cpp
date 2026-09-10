@@ -454,21 +454,25 @@ Status Page::SetHighFence(Transaction& txn, const IndexKey& key) {
 }
 
 IndexKey Page::GetLowFence(Transaction& /*txn*/) const {
-  CHECK_MSG(type == PageType::kLeafPage || type == PageType::kBranchPage,
+  const bool leaf_or_branch =
+      type == PageType::kLeafPage || type == PageType::kBranchPage;
+  CHECK_MSG(leaf_or_branch,
             "GetLowFence on invalid page type: " + PageTypeString(type));
-  if (type == PageType::kLeafPage) {
-    return body.leaf_page.GetLowFence();
+  if (type != PageType::kLeafPage) {
+    return body.branch_page.GetLowFence();
   }
-  return body.branch_page.GetLowFence();
+  return body.leaf_page.GetLowFence();
 }
 
 IndexKey Page::GetHighFence(Transaction& /*txn*/) const {
-  CHECK_MSG(type == PageType::kLeafPage || type == PageType::kBranchPage,
+  const bool leaf_or_branch =
+      type == PageType::kLeafPage || type == PageType::kBranchPage;
+  CHECK_MSG(leaf_or_branch,
             "GetHighFence on invalid page type: " + PageTypeString(type));
-  if (type == PageType::kLeafPage) {
-    return body.leaf_page.GetHighFence();
+  if (type != PageType::kLeafPage) {
+    return body.branch_page.GetHighFence();
   }
-  return body.branch_page.GetHighFence();
+  return body.leaf_page.GetHighFence();
 }
 
 Status Page::SetFoster(Transaction& txn, const FosterPair& foster) {

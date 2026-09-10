@@ -979,6 +979,64 @@ TEST_F(QueryTest, SqlEngineOrderBySelectAliasOnJoin) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, SqlEngineUnresolvedColumnInSubqueryPredicateFailsCleanly) {
+  // An unresolvable qualified reference inside a correlated subquery
+  // predicate (`tree.grp`, `d.parent` with `tree` out of scope) used to
+  // escape as a std::runtime_error from the per-row WHERE evaluation (found
+  // by the Griffin fuzzer).  It must fail through the Status channel like
+  // the top-level form of the same mistake does.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE rs_c (id INT64, grp INT64, val INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE rs_tree (id INT64, parent INT64);");
+  RunSql(ctx, *db_, "INSERT INTO rs_c VALUES (1, 1, 10), (2, NULL, 30);");
+  SqlEngine engine(*db_);
+  StatusOr<QueryResult> executed = engine.Execute(
+      ctx,
+      "SELECT val FROM rs_c WHERE EXISTS (SELECT 1 FROM rs_c d WHERE "
+      "d.parent = rs_c.val AND d.val > rs_tree.grp);");
+  if (executed.HasValue()) {
+    // Rejection may surface at Execute or lazily during drain; either way it
+    // must be a Status, and iterating must not throw.
+    Row row;
+    EXPECT_NO_THROW({
+      while (executed.Value().Next(&row)) {
+      }
+    });
+    EXPECT_NE(executed.Value().GetStatus(), Status::kSuccess);
+  }
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, DmlWhereBareBoolColumnOnlyTouchesTrueRows) {
+  // `DELETE FROM t WHERE flag` / `UPDATE ... WHERE flag`: a bare column in
+  // the DELETE/UPDATE WHERE arrives as a PathExpression in the GoogleSQL
+  // dump -- the same node kind as the target table.  The visitor skipped
+  // every PathExpression while hunting for the predicate, so the WHERE was
+  // silently dropped and the statement hit the WHOLE table (found by
+  // sql_oracle_fuzzer's DQE oracle: DELETE WHERE flag removed FALSE and
+  // NULL rows too).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE bb (u INT64, flag BOOL);");
+  RunSql(ctx, *db_,
+         "INSERT INTO bb VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE);");
+  const std::vector<Row> deleted =
+      RunSql(ctx, *db_, "DELETE FROM bb WHERE flag;");
+  ASSERT_EQ(deleted.size(), 1U);
+  EXPECT_EQ(deleted[0][1], Value(int64_t{2}));
+  const std::vector<Row> rest =
+      RunSql(ctx, *db_, "SELECT u FROM bb ORDER BY u;");
+  ASSERT_EQ(rest.size(), 2U);
+  EXPECT_EQ(rest[0][0], Value(int64_t{2}));
+  EXPECT_EQ(rest[1][0], Value(int64_t{3}));
+
+  RunSql(ctx, *db_, "UPDATE bb SET u = 9 WHERE flag;");
+  const std::vector<Row> untouched =
+      RunSql(ctx, *db_, "SELECT COUNT(*) FROM bb WHERE u = 9;");
+  ASSERT_EQ(untouched.size(), 1U);
+  EXPECT_EQ(untouched[0][0], Value(int64_t{0}));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, SqlEngineUnnestDistinctOrderByOffsetAndUnionAll) {
   TransactionContext ctx = db_->BeginContext();
 
@@ -2082,8 +2140,7 @@ TEST_F(QueryTest, StructConstantFoldingEscapesQuotesAndBackslashes) {
   ASSERT_TRUE(rows[0][0].type == ValueType::kVarChar);
   const std::string json(rows[0][0].value.varchar_value);
   // The quote and backslash must be escaped inside the JSON string value.
-  EXPECT_NE(json.find(R"(a\"b\\c)"), std::string::npos)
-      << true << json;
+  EXPECT_NE(json.find(R"(a\"b\\c)"), std::string::npos) << true << json;
   EXPECT_NE(json.find(R"("n":3)"), std::string::npos) << json;
   ctx.txn_.Abort();
 }

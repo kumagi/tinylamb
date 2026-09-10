@@ -783,8 +783,12 @@ StatusOr<size_t> DecodeMemcomparableFormatDouble(const char* src,
 StatusOr<std::string> Value::TryEncodeMemcomparableFormat() const {
   switch (type) {
     case ValueType::kNull:
-      return StatusError(StatusCode::kInvalidArgument,
-                         "Cannot encode unknown type.");
+      // NULL keys are real index keys (the table has one row per NULL that
+      // indexes the column): encode as the bare type tag.  kNull is the
+      // smallest tag, so NULL entries sort below every encoded value,
+      // matching SQL's "NULLS FIRST" scan order.  Callers that must reject
+      // NULL keys (unique-collision checks) test the Value directly.
+      return std::string(1, static_cast<char>(ValueType::kNull));
     case ValueType::kInt64:
       return EncodeMemcomparableFormatInteger(value.int_value);
     case ValueType::kDate: {
@@ -830,7 +834,11 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
   }
   switch (static_cast<ValueType>(*cursor++)) {
     case ValueType::kNull:
-      return StatusError(StatusCode::kCorrupt, "Cannot decode unknown type.");
+      // Mirror of the 1-byte NULL encoding above: an index key carrying a
+      // NULL component decodes back to a NULL value consuming exactly one
+      // byte (key-only reads never dereference `value` further).
+      *this = Value();
+      return 1;
     case ValueType::kInt64: {
       type = ValueType::kInt64;
       ASSIGN_OR_RETURN(

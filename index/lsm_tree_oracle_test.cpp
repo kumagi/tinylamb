@@ -23,8 +23,7 @@ TEST(LsmTreeOracle, SeededIterationsMatchModel) {
     const std::vector<BPlusTreeOp> ops = GenerateLsmTreeOps(rng);
     const std::string tag = "seed-" + std::to_string(seed);
     EXPECT_TRUE(CheckLsmTreeEquivalence(ops, tag).empty())
-        << true << (seed != 0u) << true
-        << CheckLsmTreeEquivalence(ops, tag);
+        << true << (seed != 0U) << true << CheckLsmTreeEquivalence(ops, tag);
     ++ran;
   }
   EXPECT_EQ(ran, kIterations);

@@ -530,12 +530,15 @@ Status ReplayPagesInParallel(
     }
   };
 
-  std::vector<std::thread> threads;
+  // jthread: a spawn failure (pthread_create EAGAIN) must not strand the
+  // already-started workers as joinable threads in a throwing vector dtor
+  // (std::terminate); jthread's destructor joins them instead.
+  std::vector<std::jthread> threads;
   threads.reserve(workers);
   for (size_t i = 0; i < workers; ++i) {
     threads.emplace_back(worker);
   }
-  for (std::thread& thread : threads) {
+  for (std::jthread& thread : threads) {
     thread.join();
   }
   return first_error;

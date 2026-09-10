@@ -342,12 +342,12 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
     ExprOracleTrace trace;
     trace.seed = packed;
     std::string report = RunExprOracleIteration(rng, false, &trace);
-    ASSERT_EQ(report, "") << true << (seed != 0u) << true << report;
+    ASSERT_EQ(report, "") << true << (seed != 0U) << true << report;
     EXPECT_EQ(trace.seed, packed);
     EXPECT_TRUE(trace.sql.rfind("SELECT ", 0) == 0)
-        << true << (seed != 0u) << true << trace.sql;
-    EXPECT_TRUE(trace.sexpr.front() == '(') << true << (seed != 0u);
-    EXPECT_TRUE(trace.reference.empty() == false) << true << (seed != 0u);
+        << true << (seed != 0U) << true << trace.sql;
+    EXPECT_TRUE(trace.sexpr.front() == '(') << true << (seed != 0U);
+    EXPECT_TRUE(trace.reference.empty() == false) << true << (seed != 0U);
     if (trace.engine_ran) {
       ++engine_ran;
     }
@@ -356,8 +356,7 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
   EXPECT_EQ(ran, kIterations);
   // The engine oracle must actually execute (not skip every iteration),
   // or the sweep is vacuous.
-  EXPECT_GT(engine_ran, kIterations / 2)
-      << true;
+  EXPECT_GT(engine_ran, kIterations / 2) << true;
 }
 
 // Failure->file->replay pipeline: serialize/parse round-trips, replay of a
@@ -374,14 +373,12 @@ TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
   ExprOracleTrace parsed;
   ASSERT_TRUE(ParseExprOracleTest(text, &parsed));
   EXPECT_EQ(parsed, trace);
-  EXPECT_EQ(ReplayExprOracleTrace(parsed, false), "")
-      << true;
+  EXPECT_EQ(ReplayExprOracleTrace(parsed, false), "") << true;
 
   // Tampered SQL must not replay clean.
   ExprOracleTrace tampered = parsed;
   tampered.sql = "SELECT 1 + 1;";
-  EXPECT_NE(ReplayExprOracleTrace(tampered, false), "")
-      << true;
+  EXPECT_NE(ReplayExprOracleTrace(tampered, false), "") << true;
 
   // Malformed input is refused, never half-replayed.
   ExprOracleTrace junk;
@@ -401,7 +398,7 @@ TEST(ExprOracleFuzzer, RowAwareNullRejectAndDifferentialEquivalence) {
     RowExprOracleTrace trace;
     trace.seed = packed;
     std::string report = RunRowExprOracleIteration(rng, false, &trace);
-    ASSERT_EQ(report, "") << "Seed " << seed << " failed:\n" << report;
+    ASSERT_EQ(report, "") << true << (seed != 0U) << true << report;
     EXPECT_EQ(trace.seed, packed);
     EXPECT_FALSE(trace.predicate_sql.empty());
     EXPECT_GT(trace.total_rows, 0U);
@@ -414,13 +411,13 @@ TEST(ExprOracleFuzzer, RowAwareNullRejectAndDifferentialEquivalence) {
   }
 
   EXPECT_EQ(engine_ran_count, kIterations);
-  EXPECT_GT(null_reject_verified_count, 0)
-      << "Expected null rejection verification to trigger on generated predicates";
+  EXPECT_GT(null_reject_verified_count, 0) << true;
 }
 
 TEST(ExprOracleFuzzer, RowTraceReplayEquivalence) {
   const uint32_t seed32 = 42;
-  std::mt19937 rng(seed32);
+  std::mt19937 rng(seed32);  // NOLINT(cert-msc32-c,cert-msc51-cpp)
+                             // deterministic seed for reproducibility
   RowExprOracleTrace trace;
   trace.seed = (static_cast<uint64_t>(seed32) << 32) | seed32;
   ASSERT_EQ(RunRowExprOracleIteration(rng, false, &trace), "");

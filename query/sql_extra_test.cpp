@@ -447,7 +447,7 @@ TEST_F(WindowSqlTest, VarianceCovarianceAndPercentilesOverFrame) {
   for (size_t i = 0; i < rows.size(); ++i) {
     EXPECT_DOUBLE_EQ(rows[i][0].value.double_value,
                      rows[i][2].value.double_value)
-        << true << (i != 0u);
+        << true << (i != 0U);
   }
   // VAR_SAMP is undefined for a single-row frame.
   EXPECT_TRUE(rows[0][1].IsNull());
@@ -544,7 +544,7 @@ class WindowEvalDirectTest : public ::testing::Test {
     return out;
   }
 
-  std::shared_ptr<WindowFunctionCallExpression> MakeSumFrame(
+  static std::shared_ptr<WindowFunctionCallExpression> MakeSumFrame(
       WindowFrameUnit unit, size_t preceding) {
     auto window = std::make_shared<WindowFunctionCallExpression>();
     window->function = "SUM";

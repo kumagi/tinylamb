@@ -29,7 +29,7 @@ Relation::Relation(Relation&& other) noexcept
       peak_intermediate_rows(other.peak_intermediate_rows),
       spilled_rows_(other.spilled_rows_),
       runtime_(other.runtime_),
-      spill_error_(other.spill_error_) {
+      spill_error_(std::move(other.spill_error_)) {
   other.charged_bytes_ = 0;
   other.hash_joins = 0;
   other.hybrid_hash_joins = 0;
@@ -57,7 +57,7 @@ Relation& Relation::operator=(Relation&& other) noexcept {
     join_comparisons = other.join_comparisons;
     peak_intermediate_rows = other.peak_intermediate_rows;
     spilled_rows_ = other.spilled_rows_;
-    spill_error_ = other.spill_error_;
+    spill_error_ = std::move(other.spill_error_);
     runtime_ = other.runtime_;
     other.hash_joins = 0;
     other.hybrid_hash_joins = 0;

@@ -1242,8 +1242,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
               return Value(signed_value);
             }
             if (magnitude <= 0x7fffffffffffffffULL) {
-              const auto signed_magnitude =
-                  static_cast<int64_t>(magnitude);
+              const auto signed_magnitude = static_cast<int64_t>(magnitude);
               Value result(signed_magnitude);
               RETURN_IF_FAIL(ValidateIntWidth(upper, signed_magnitude));
               return upper == "UINT64" ? result.WithUnsigned() : result;

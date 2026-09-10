@@ -41,8 +41,7 @@ TEST(ParallelMergeJoinExtraTest, LeftOuterPadsFullRightWidth) {
   RowPosition pos;
   std::vector<Row> rows;
   while (join.Next(&row, &pos)) {
-    ASSERT_EQ(row.values_.size(), 5U)
-        << true;
+    ASSERT_EQ(row.values_.size(), 5U) << true;
     rows.push_back(row);
   }
   ASSERT_EQ(rows.size(), 2U);

@@ -1003,11 +1003,22 @@ TEST(ValueTest, AsString_SpecialDoubles_FormatsInfAndNan) {
   EXPECT_EQ(nan_val.AsString(), "nan");
 }
 
-TEST(ValueTest, EncodeMemcomparableFormat_OnNullValue_ThrowsRuntimeError) {
+TEST(ValueTest, EncodeMemcomparableFormat_OnNullValue_EncodesNullTag) {
+  // NULL keys must be indexable: the memcomparable format encodes NULL as
+  // the bare kNull tag (one byte), which sorts below every typed encoding
+  // and round-trips back to NULL (index maintenance over nullable columns
+  // used to throw "Cannot encode unknown type." and kill INSERTs).
   Value null_val;
 
-  EXPECT_THROW(std::ignore = null_val.EncodeMemcomparableFormat(),
-               std::runtime_error);
+  const std::string encoded = null_val.EncodeMemcomparableFormat();
+  ASSERT_EQ(encoded.size(), 1U);
+  Value decoded;
+  ASSERT_EQ(decoded.DecodeMemcomparableFormat(encoded), 1U);
+  EXPECT_TRUE(decoded.IsNull());
+
+  // Ordering: NULL below a non-NULL integer encoding.
+  const Value zero(int64_t{0});
+  EXPECT_LT(encoded, zero.EncodeMemcomparableFormat());
 }
 
 TEST(ValueTest,

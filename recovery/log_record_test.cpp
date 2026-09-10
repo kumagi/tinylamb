@@ -41,7 +41,7 @@ namespace tinylamb {
 
 class LogRecordTest : public ::testing::Test {
  protected:
-  void SerializeDeserializeCheck(const LogRecord& log) {
+  static void SerializeDeserializeCheck(const LogRecord& log) {
     std::string serialized_log = log.Serialize();
     std::istringstream ss(serialized_log, std::istringstream::binary);
     LogRecord parsed_log;

@@ -46,6 +46,7 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 // a silently-all-skipping harness fails this test.
 TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int tlp_ran = 0;
+  int tlp_agg_ran = 0;
   int norec_ran = 0;
   int pqs_ran = 0;
   int idx_ran = 0;
@@ -56,26 +57,22 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
     std::mt19937 rng(seed);
     OracleIterationStats stats;
     std::string report = RunOracleIteration(rng, false, &stats);
-    ASSERT_EQ(report, "") << true << (seed != 0u) << true << report;
+    ASSERT_EQ(report, "") << true << (seed != 0U) << true << report;
     tlp_ran += stats.tlp_ran ? 1 : 0;
+    tlp_agg_ran += stats.tlp_agg_ran ? 1 : 0;
     norec_ran += stats.norec_ran ? 1 : 0;
     pqs_ran += stats.pqs_ran ? 1 : 0;
     idx_ran += stats.idx_ran ? 1 : 0;
     dqe_ran += stats.dqe_ran ? 1 : 0;
     troc_ran += stats.troc_ran ? 1 : 0;
   }
-  EXPECT_GT(tlp_ran, kIterations / 2)
-      << true;
-  EXPECT_GT(norec_ran, kIterations / 2)
-      << true;
-  EXPECT_GT(pqs_ran, kIterations / 2)
-      << true;
-  EXPECT_GT(idx_ran, kIterations / 2)
-      << true;
-  EXPECT_GT(dqe_ran, kIterations / 2)
-      << true;
-  EXPECT_GT(troc_ran, kIterations / 2)
-      << true;
+  EXPECT_GT(tlp_ran, kIterations / 2) << true;
+  EXPECT_GT(tlp_agg_ran, kIterations / 2) << true;
+  EXPECT_GT(norec_ran, kIterations / 2) << true;
+  EXPECT_GT(pqs_ran, kIterations / 2) << true;
+  EXPECT_GT(idx_ran, kIterations / 2) << true;
+  EXPECT_GT(dqe_ran, kIterations / 2) << true;
+  EXPECT_GT(troc_ran, kIterations / 2) << true;
 }
 
 // Plan feedback: across a run the bandit must observe several distinct plan
@@ -86,10 +83,9 @@ TEST(SqlOracleFuzzer, PlanFeedbackObservesPlans) {
     std::mt19937 rng(seed + 1000);
     std::string report =
         RunOracleIteration(rng, false, nullptr, nullptr, &session);
-    ASSERT_EQ(report, "") << true << ((seed + 1000) != 0u) << true << report;
+    ASSERT_EQ(report, "") << true << ((seed + 1000) != 0U) << true << report;
   }
-  EXPECT_GT(session.PlansSeen(), 1U)
-      << true;
+  EXPECT_GT(session.PlansSeen(), 1U) << true;
 }
 
 // AMOEBA: equivalent predicates over a 2000-row table must not diverge
@@ -98,7 +94,7 @@ TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
   for (uint32_t seed = 0; seed < 8; ++seed) {
     std::mt19937 rng(seed);
     std::string report = RunAmoebaIteration(rng, false);
-    ASSERT_EQ(report, "") << true << (seed != 0u) << true << report;
+    ASSERT_EQ(report, "") << true << (seed != 0U) << true << report;
   }
 }
 
@@ -132,8 +128,7 @@ TEST(SqlOracleFuzzer, TestFileRoundTripDetectsMismatch) {
   ASSERT_TRUE(ParseOracleTest(text, &seed, &parsed, &summary)) << text;
   EXPECT_EQ(seed, 7U);
   EXPECT_EQ(parsed, broken);
-  EXPECT_NE(ReplayOracleTrace(parsed, true), "")
-      << true;
+  EXPECT_NE(ReplayOracleTrace(parsed, true), "") << true;
 
   // The consistent twin: original query matches the partition union.
   OracleTrace consistent = broken;
@@ -143,8 +138,7 @@ TEST(SqlOracleFuzzer, TestFileRoundTripDetectsMismatch) {
   OracleTrace parsed2;
   std::string summary2;
   ASSERT_TRUE(ParseOracleTest(consistent_text, &seed2, &parsed2, &summary2));
-  EXPECT_EQ(ReplayOracleTrace(parsed2), "")
-      << true;
+  EXPECT_EQ(ReplayOracleTrace(parsed2), "") << true;
 }
 
 // Any committed sql_oracle_fuzz-*.test file replays as a permanent

@@ -45,11 +45,14 @@ struct Stats {
 
 class PushdownDb {
  public:
+  PushdownDb(const PushdownDb&) = delete;
+  PushdownDb& operator=(const PushdownDb&) = delete;
+  PushdownDb(PushdownDb&&) = delete;
+  PushdownDb& operator=(PushdownDb&&) = delete;
   static std::unique_ptr<PushdownDb> Create(int thread_id) {
     std::string dbname =
         (std::filesystem::temp_directory_path() /
-         ("rule_fuzz_db_t" + std::to_string(thread_id) + "_" +
-          RandomString(8)))
+         ("rule_fuzz_db_t" + std::to_string(thread_id) + "_" + RandomString(8)))
             .string();
     auto db_res = Database::Create(dbname);
     if (!db_res.HasValue()) {
@@ -80,37 +83,41 @@ class PushdownDb {
     TransactionContext ctx = db_->BeginContext();
     SqlEngine engine(*db_);
 
-    const std::vector<std::string> setup_sqls = {
-        "CREATE TABLE t1 (id INT64, val INT64, flag INT64, note VARCHAR(16));",
-        "CREATE TABLE t2 (id INT64, t1_id INT64, val INT64, flag INT64, note "
-        "VARCHAR(16));",
-        "CREATE TABLE t3 (id INT64, t2_id INT64, val INT64, flag INT64, note "
-        "VARCHAR(16));",
-        // Rows for t1
-        "INSERT INTO t1 VALUES (1, 10, 1, 'a1');",
-        "INSERT INTO t1 VALUES (2, 20, 0, 'a2');",
-        "INSERT INTO t1 VALUES (3, NULL, NULL, 'a3');",
-        "INSERT INTO t1 VALUES (4, 40, 1, 'a4');",
-        "INSERT INTO t1 VALUES (5, 0, 0, 'a5');",
-        "INSERT INTO t1 VALUES (6, -10, 1, 'a6');",
-        "INSERT INTO t1 VALUES (7, NULL, 0, 'a7');",
-        "INSERT INTO t1 VALUES (8, 20, 1, 'a8');",
-        // Rows for t2
-        "INSERT INTO t2 VALUES (101, 1, 10, 1, 'b1');",
-        "INSERT INTO t2 VALUES (102, 1, NULL, 0, 'b1_dup');",
-        "INSERT INTO t2 VALUES (103, 2, 25, NULL, 'b2');",
-        "INSERT INTO t2 VALUES (104, 3, 30, 1, 'b3');",
-        "INSERT INTO t2 VALUES (105, 999, 50, 0, 'b_orphan');",
-        "INSERT INTO t2 VALUES (106, NULL, 60, 1, 'b_nullfk');",
-        "INSERT INTO t2 VALUES (107, 4, 0, 0, 'b4');",
-        "INSERT INTO t2 VALUES (108, 4, -5, 1, 'b4_dup');",
-        // Rows for t3
-        "INSERT INTO t3 VALUES (201, 101, 100, 1, 'c1');",
-        "INSERT INTO t3 VALUES (202, 101, 200, 0, 'c1_dup');",
-        "INSERT INTO t3 VALUES (203, 103, NULL, NULL, 'c3');",
-        "INSERT INTO t3 VALUES (204, 9999, 300, 1, 'c_orphan');",
-        "INSERT INTO t3 VALUES (205, 104, 0, 1, 'c4');",
-    };
+    const std::vector<std::string> setup_sqls =
+        {
+            "CREATE TABLE t1 (id INT64, val INT64, flag INT64, note "
+            "VARCHAR(16));",
+            "CREATE TABLE t2 (id INT64, t1_id INT64, val INT64, flag INT64, "
+            "note "  // NOLINT(bugprone-suspicious-missing-comma)
+            "VARCHAR(16));",
+            "CREATE TABLE t3 (id INT64, t2_id INT64, val INT64, flag INT64, "
+            "note "
+            "VARCHAR(16));",
+            // Rows for t1
+            "INSERT INTO t1 VALUES (1, 10, 1, 'a1');",
+            "INSERT INTO t1 VALUES (2, 20, 0, 'a2');",
+            "INSERT INTO t1 VALUES (3, NULL, NULL, 'a3');",
+            "INSERT INTO t1 VALUES (4, 40, 1, 'a4');",
+            "INSERT INTO t1 VALUES (5, 0, 0, 'a5');",
+            "INSERT INTO t1 VALUES (6, -10, 1, 'a6');",
+            "INSERT INTO t1 VALUES (7, NULL, 0, 'a7');",
+            "INSERT INTO t1 VALUES (8, 20, 1, 'a8');",
+            // Rows for t2
+            "INSERT INTO t2 VALUES (101, 1, 10, 1, 'b1');",
+            "INSERT INTO t2 VALUES (102, 1, NULL, 0, 'b1_dup');",
+            "INSERT INTO t2 VALUES (103, 2, 25, NULL, 'b2');",
+            "INSERT INTO t2 VALUES (104, 3, 30, 1, 'b3');",
+            "INSERT INTO t2 VALUES (105, 999, 50, 0, 'b_orphan');",
+            "INSERT INTO t2 VALUES (106, NULL, 60, 1, 'b_nullfk');",
+            "INSERT INTO t2 VALUES (107, 4, 0, 0, 'b4');",
+            "INSERT INTO t2 VALUES (108, 4, -5, 1, 'b4_dup');",
+            // Rows for t3
+            "INSERT INTO t3 VALUES (201, 101, 100, 1, 'c1');",
+            "INSERT INTO t3 VALUES (202, 101, 200, 0, 'c1_dup');",
+            "INSERT INTO t3 VALUES (203, 103, NULL, NULL, 'c3');",
+            "INSERT INTO t3 VALUES (204, 9999, 300, 1, 'c_orphan');",
+            "INSERT INTO t3 VALUES (205, 104, 0, 1, 'c4');",
+        };
 
     for (const auto& sql : setup_sqls) {
       StatusOr<QueryResult> res = engine.Execute(ctx, sql);
@@ -126,10 +133,11 @@ class PushdownDb {
     auto add_idx = [&](std::string_view tbl, std::string_view idx_name,
                        std::vector<slot_t> cols,
                        IndexMode mode = IndexMode::kUnique) {
-      Status s =
-          db_->CreateIndex(ctx, tbl, IndexSchema(idx_name, cols, {}, mode));
+      Status s = db_->CreateIndex(
+          ctx, tbl, IndexSchema(idx_name, std::move(cols), {}, mode));
       if (s != Status::kSuccess) {
-        std::cerr << "Setup index failed on " << tbl << " (" << idx_name << ")\n";
+        std::cerr << "Setup index failed on " << tbl << " (" << idx_name
+                  << ")\n";
       }
     };
     add_idx("t1", "t1_pk", {0}, IndexMode::kUnique);
@@ -148,7 +156,9 @@ std::optional<int64_t> RunScalarCount(Database& db, TransactionContext& ctx,
   SqlEngine engine(db);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
-    if (error) *error = engine.LastError();
+    if (error != nullptr) {
+      *error = engine.LastError();
+    }
     return std::nullopt;
   }
   std::vector<Row> rows;
@@ -157,7 +167,9 @@ std::optional<int64_t> RunScalarCount(Database& db, TransactionContext& ctx,
     rows.push_back(row);
   }
   if (rows.size() != 1 || rows[0].Size() == 0) {
-    if (error) *error = "expected 1 row, got " + std::to_string(rows.size());
+    if (error != nullptr) {
+      *error = "expected 1 row, got " + std::to_string(rows.size());
+    }
     return std::nullopt;
   }
   const Value& val = rows[0][0];
@@ -208,7 +220,8 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
           "(t1.val = 10 AND t2.flag = 1) OR (t1.val = 20 AND t2.flag = 0)",
           "t1.flag = 1 OR t2.flag = 1",
           "t1.id = 1 OR t2.id = 103",
-          "(t1.val IS NULL AND t2.val = 30) OR (t1.val = 20 AND t2.val IS NULL)",
+          "(t1.val IS NULL AND t2.val = 30) OR (t1.val = 20 AND t2.val IS "
+          "NULL)",
           "t1.val = 0 OR t2.val = 0",
       };
       predicate = kPreds[rng() % kPreds.size()];
@@ -257,10 +270,14 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
           "t2.t1_id;";
       std::string err;
       auto opt_cnt = RunScalarCount(db, ctx, opt_sql, &err);
-      if (!opt_cnt) return true;
+      if (!opt_cnt) {
+        return true;
+      }
       SqlEngine engine(db);
       StatusOr<QueryResult> ref_res = engine.Execute(ctx, ref_sql);
-      if (!ref_res.HasValue()) return true;
+      if (!ref_res.HasValue()) {
+        return true;
+      }
       int64_t actual_rows = 0;
       Row r;
       while (ref_res.Value().Next(&r) && actual_rows < 3) {
@@ -312,13 +329,13 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
       static const std::array<const char*, 4> kConsts = {"0", "1", "10", "20"};
       const int col_idx1 = static_cast<int>(rng() % kCols.size());
       const int col_idx2 = static_cast<int>(rng() % kCols.size());
-      std::string part1 = std::string(kCols[col_idx1]) + " " +
-                          kOps[rng() % kOps.size()] + " " +
+      std::string part1 = std::string(kCols[static_cast<size_t>(col_idx1)]) +
+                          " " + kOps[rng() % kOps.size()] + " " +
                           kConsts[rng() % kConsts.size()];
       std::string part2 =
           (rng() % 2 == 0)
-              ? (std::string(kCols[col_idx2]) + " IS NULL")
-              : (std::string(kCols[col_idx2]) + " " +
+              ? (std::string(kCols[static_cast<size_t>(col_idx2)]) + " IS NULL")
+              : (std::string(kCols[static_cast<size_t>(col_idx2)]) + " " +
                  kOps[rng() % kOps.size()] + " " +
                  kConsts[rng() % kConsts.size()]);
       const char* log_op = (rng() % 2 == 0) ? " AND " : " OR ";
@@ -330,9 +347,9 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
   TransactionContext ctx = db.BeginReadOnlyContext();
   const std::string opt_query =
       "SELECT COUNT(*) FROM " + from_clause + " WHERE " + predicate + ";";
-  const std::string ref_query =
-      "SELECT COALESCE(SUM(CASE WHEN " + predicate +
-      " THEN 1 ELSE 0 END), 0) FROM " + from_clause + ";";
+  const std::string ref_query = "SELECT COALESCE(SUM(CASE WHEN " + predicate +
+                                " THEN 1 ELSE 0 END), 0) FROM " + from_clause +
+                                ";";
 
   std::string opt_err;
   std::string ref_err;
@@ -362,8 +379,8 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
 void Worker(int thread_id, uint64_t base_seed,
             std::atomic<bool>& stop_requested,
             std::chrono::steady_clock::time_point deadline, Stats& stats) {
-  std::mt19937_64 rng(base_seed +
-                      static_cast<uint64_t>(thread_id) * 1000003ULL);
+  const auto seed = base_seed + (static_cast<uint64_t>(thread_id) * 1000003U);
+  auto rng = std::mt19937_64(static_cast<std::mt19937_64::result_type>(seed));
 
   auto db_holder = PushdownDb::Create(thread_id);
   if (!db_holder) {
@@ -377,7 +394,7 @@ void Worker(int thread_id, uint64_t base_seed,
 
   while (!stop_requested.load(std::memory_order_relaxed) &&
          std::chrono::steady_clock::now() < deadline) {
-    const uint32_t pass = rng() % 5;
+    const auto pass = static_cast<uint32_t>(rng() % 5);
     if (pass == 0) {
       // Pass 0: Semantic Pushdown & NoREC Differential Execution Oracle
       std::string mismatch;
@@ -504,47 +521,59 @@ void Worker(int thread_id, uint64_t base_seed,
 int main(int argc, char** argv) {
   int duration_sec = 1800;  // Default 30 minutes
   int num_threads = static_cast<int>(std::thread::hardware_concurrency());
-  if (num_threads <= 0) num_threads = 4;
+  if (num_threads <= 0) {
+    num_threads = 4;
+  }
 
   int positional_idx = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
+    // std::stoi over a materialized std::string: atoi cannot report parse
+    // errors and string_view::data() is not guaranteed null-terminated.
+    const auto parse_int = [](std::string_view text, int fallback) {
+      try {
+        return std::stoi(std::string(text));
+      } catch (const std::logic_error&) {
+        return fallback;
+      }
+    };
     if (arg.starts_with("--duration_sec=")) {
-      duration_sec = std::atoi(arg.substr(15).data());
+      duration_sec = parse_int(arg.substr(15), duration_sec);
     } else if (arg.starts_with("--duration=")) {
-      duration_sec = std::atoi(arg.substr(11).data());
+      duration_sec = parse_int(arg.substr(11), duration_sec);
     } else if (arg.starts_with("--threads=")) {
-      num_threads = std::atoi(arg.substr(10).data());
+      num_threads = parse_int(arg.substr(10), num_threads);
     } else if (!arg.starts_with("-")) {
       if (positional_idx == 0) {
-        duration_sec = std::atoi(arg.data());
+        duration_sec = parse_int(arg, duration_sec);
         positional_idx++;
       } else if (positional_idx == 1) {
-        num_threads = std::atoi(arg.data());
+        num_threads = parse_int(arg, num_threads);
         positional_idx++;
       }
     }
   }
 
   if (const char* env_dur = std::getenv("FUZZ_DURATION_SEC")) {
-    duration_sec = std::atoi(env_dur);
+    duration_sec = std::atoi(env_dur);  // NOLINT(cert-err34-c)
   }
   if (const char* env_threads = std::getenv("FUZZ_THREADS")) {
-    num_threads = std::atoi(env_threads);
+    num_threads = std::atoi(env_threads);  // NOLINT(cert-err34-c)
   }
 
-  std::cout << "============================================================\n"
-            << "Starting Ferocious TinyLamb Rule & Pushdown Fuzzer\n"
-            << "Concurrency: " << num_threads << " threads\n"
-            << "Duration:    " << duration_sec << " seconds ("
-            << (duration_sec / 60) << "m " << (duration_sec % 60) << "s)\n"
-            << "Oracles:     1. Semantic Execution Pushdown Oracle (NoREC)\n"
-            << "             2. Complex Multi-Operator Cascades Memo (105 Rules)\n"
-            << "             3. Complex Memo Random Rule-Subset Exploration\n"
-            << "             4. Scalar Expression AST Simplification Oracle\n"
-            << "             5. Row-Aware NULL-Rejection & Differential Oracle\n"
-            << "============================================================\n"
-            << std::flush;
+  std::cout
+      << "============================================================\n"
+      << "Starting Ferocious TinyLamb Rule & Pushdown Fuzzer\n"
+      << "Concurrency: " << num_threads << " threads\n"
+      << "Duration:    " << duration_sec << " seconds (" << (duration_sec / 60)
+      << "m " << (duration_sec % 60) << "s)\n"
+      << "Oracles:     1. Semantic Execution Pushdown Oracle (NoREC)\n"
+      << "             2. Complex Multi-Operator Cascades Memo (105 Rules)\n"
+      << "             3. Complex Memo Random Rule-Subset Exploration\n"
+      << "             4. Scalar Expression AST Simplification Oracle\n"
+      << "             5. Row-Aware NULL-Rejection & Differential Oracle\n"
+      << "============================================================\n"
+      << std::flush;
 
   const auto start_time = std::chrono::steady_clock::now();
   const auto deadline = start_time + std::chrono::seconds(duration_sec);
@@ -556,7 +585,7 @@ int main(int argc, char** argv) {
   std::atomic<bool> stop_requested{false};
 
   std::vector<std::thread> workers;
-  workers.reserve(num_threads);
+  workers.reserve(static_cast<size_t>(num_threads));
   for (int t = 0; t < num_threads; ++t) {
     workers.emplace_back(tinylamb::Worker, t, base_seed,
                          std::ref(stop_requested), deadline, std::ref(stats));
@@ -568,7 +597,9 @@ int main(int argc, char** argv) {
   while (!stop_requested.load()) {
     std::this_thread::sleep_for(std::chrono::seconds(2));
     const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) break;
+    if (now >= deadline) {
+      break;
+    }
 
     const auto elapsed_sec =
         std::chrono::duration_cast<std::chrono::seconds>(now - start_time)
@@ -579,7 +610,8 @@ int main(int argc, char** argv) {
             .count();
     const uint64_t cur_total =
         stats.total_iterations.load(std::memory_order_relaxed);
-    const double cur_rate = (cur_total - prev_total) / step_sec;
+    const double cur_rate =
+        static_cast<double>(cur_total - prev_total) / step_sec;
     prev_total = cur_total;
     prev_time = now;
 
@@ -604,10 +636,11 @@ int main(int argc, char** argv) {
               << std::setw(2) << ss << " / " << std::setw(2) << tmm << ":"
               << std::setw(2) << tss << "] "
               << "Total: " << cur_total << " (" << std::fixed
-              << std::setprecision(1) << cur_rate << " it/s) | NoRECPushdown: "
-              << norec_cnt << " | ComplexMemo: " << complex_cnt
-              << " | ComplexSubset: " << subset_cnt << " | ExprRule: "
-              << expr_cnt << " | RowNullReject: " << row_cnt
+              << std::setprecision(1) << cur_rate
+              << " it/s) | NoRECPushdown: " << norec_cnt
+              << " | ComplexMemo: " << complex_cnt
+              << " | ComplexSubset: " << subset_cnt
+              << " | ExprRule: " << expr_cnt << " | RowNullReject: " << row_cnt
               << " | Failures: " << fails << "\n"
               << std::flush;
   }
@@ -632,19 +665,20 @@ int main(int argc, char** argv) {
   const uint64_t final_row = stats.row_expr_null_reject_runs.load();
   const uint64_t final_fails = stats.failures.load();
 
-  std::cout << "\n============================================================\n"
-            << "Ferocious Rule Fuzzing Finished!\n"
-            << "Elapsed:          " << (total_elapsed / 60) << "m "
-            << (total_elapsed % 60) << "s (" << total_elapsed << "s)\n"
-            << "Total Iterations: " << final_total << "\n"
-            << "  - Semantic NoREC Pushdown: " << final_norec << "\n"
-            << "  - Complex Multi-Op Memo:   " << final_complex << "\n"
-            << "  - Complex Rule Subsets:    " << final_subset << "\n"
-            << "  - Expression Rule Simpl:   " << final_expr << "\n"
-            << "  - Row Null-Reject / Diff:  " << final_row << "\n"
-            << "Total Failures:   " << final_fails << "\n"
-            << "============================================================\n"
-            << std::flush;
+  std::cout
+      << "\n============================================================\n"
+      << "Ferocious Rule Fuzzing Finished!\n"
+      << "Elapsed:          " << (total_elapsed / 60) << "m "
+      << (total_elapsed % 60) << "s (" << total_elapsed << "s)\n"
+      << "Total Iterations: " << final_total << "\n"
+      << "  - Semantic NoREC Pushdown: " << final_norec << "\n"
+      << "  - Complex Multi-Op Memo:   " << final_complex << "\n"
+      << "  - Complex Rule Subsets:    " << final_subset << "\n"
+      << "  - Expression Rule Simpl:   " << final_expr << "\n"
+      << "  - Row Null-Reject / Diff:  " << final_row << "\n"
+      << "Total Failures:   " << final_fails << "\n"
+      << "============================================================\n"
+      << std::flush;
 
   return final_fails == 0 ? 0 : 1;
 }

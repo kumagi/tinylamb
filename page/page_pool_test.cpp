@@ -36,6 +36,7 @@
 
 #ifdef __has_include
 #if __has_include(<sanitizer/lsan_interface.h>)
+#include <sanitizer/lsan_interface.h>
 #if defined(__SANITIZE_ADDRESS__) || \
     (defined(__has_feature) && __has_feature(address_sanitizer))
 #define TINYLAMB_HAS_LSAN 1

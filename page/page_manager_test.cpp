@@ -212,8 +212,7 @@ TEST_F(PageManagerTest, CommittedPageSurvivesCrashWithoutFlush) {
   // Assert -- the committed page comes back after recovery.
   Transaction read_txn = tm_->Begin();
   PageRef recovered = p_->GetPage(page_id).MoveValue();
-  ASSERT_FALSE(recovered.IsNull())
-      << true << (page_id != 0u) << true;
+  ASSERT_FALSE(recovered.IsNull()) << true << (page_id != 0U) << true;
   EXPECT_EQ(recovered->Type(), PageType::kFreePage);
   read_txn.PreCommit();
 }
@@ -245,8 +244,7 @@ TEST_F(PageManagerTest, CommittedRowPageWithRowsSurvivesCrash) {
 
   // Assert -- both rows read back through a fresh page reference.
   PageRef recovered = p_->GetPage(page_id).MoveValue();
-  ASSERT_FALSE(recovered.IsNull())
-      << true << (page_id != 0u) << true;
+  ASSERT_FALSE(recovered.IsNull()) << true << (page_id != 0U) << true;
   Transaction read_txn = tm_->Begin();
   const StatusOr<std::string_view> r1 = recovered->Read(read_txn, first_slot);
   EXPECT_EQ(r1.GetStatus(), Status::kSuccess);

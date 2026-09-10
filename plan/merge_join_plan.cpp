@@ -33,10 +33,9 @@ MergeJoinPlan::MergeJoinPlan(Plan left, std::vector<ColumnName> left_keys,
                   : left_->GetSchema() + right_->GetSchema()),
       stats_(left_->GetStats().ScaleToRows(
           std::min(left_->GetStats().Rows(), right_->GetStats().Rows()))) {
-  if (left_keys_.empty() || left_keys_.size() != right_keys_.size()) {
-    CHECK_MSG(!left_keys_.empty() && left_keys_.size() == right_keys_.size(),
-              "MergeJoinPlan requires equally-sized non-empty keys");
-  }
+  const bool keys_valid =
+      !left_keys_.empty() && left_keys_.size() == right_keys_.size();
+  CHECK_MSG(keys_valid, "MergeJoinPlan requires equally-sized non-empty keys");
   stats_.Concat(right_->GetStats().ScaleToRows(stats_.Rows()));
 }
 

@@ -95,7 +95,7 @@ struct Attempt {
   Value value;
 };
 
-Attempt Unsupported(const std::string& reason) {
+Attempt Unsupported(std::string reason) {
   Attempt attempt;
   attempt.note = std::move(reason);
   return attempt;
@@ -111,7 +111,7 @@ Attempt Thrown(const std::exception& error) {
   return attempt;
 }
 
-Attempt Evaluated(const Value& value) {
+Attempt Evaluated(Value value) {
   Attempt attempt;
   attempt.kind = Attempt::Kind::kValue;
   attempt.value = std::move(value);
@@ -223,7 +223,7 @@ class DifferentialTally {
   }
 
  private:
-  void CheckOracle(const std::string& cell, const std::string& input,
+  static void CheckOracle(const std::string& cell, const std::string& input,
                           const Attempt& attempt, const Value& oracle) {
     EXPECT_EQ(attempt.kind, Attempt::Kind::kValue)
         << cell << " [" << input << "] expected a value";
@@ -234,7 +234,7 @@ class DifferentialTally {
     }
   }
 
-  void ComparePair(const std::string& cell, const std::string& input,
+  static void ComparePair(const std::string& cell, const std::string& input,
                           const Attempt& baseline, const Attempt& other) {
     const bool both_values = baseline.kind == Attempt::Kind::kValue &&
                              other.kind == Attempt::Kind::kValue;
@@ -242,21 +242,19 @@ class DifferentialTally {
                              other.kind == Attempt::Kind::kThrow;
     if (both_values) {
       EXPECT_TRUE(SameValue(baseline.value, other.value))
-          << "[differential][MISMATCH] " << cell << " input[" << input
+          << true << cell << " input[" << input
           << "] baseline=" << Describe(baseline)
           << " other=" << Describe(other);
       return;
     }
     if (both_throws) {
       EXPECT_EQ(baseline.exception, other.exception)
-          << "[differential][MISMATCH] " << cell << " input[" << input
-          << "] exception type differs";
-      EXPECT_EQ(baseline.note, other.note)
-          << "[differential][MISMATCH] " << cell << " input[" << input
-          << "] exception message differs";
+          << true << cell << " input[" << input << "] exception type differs";
+      EXPECT_EQ(baseline.note, other.note) << true << cell << " input[" << input
+                                           << "] exception message differs";
       return;
     }
-    ADD_FAILURE() << "[differential][MISMATCH] " << cell << " input[" << input
+    ADD_FAILURE() << true << cell << " input[" << input
                   << "] one path threw, another returned: baseline="
                   << Describe(baseline) << " other=" << Describe(other);
   }
@@ -331,16 +329,16 @@ std::vector<CaseCell> BuildCaseCells() {
   });
   cells.push_back({
       "case/constant-true",
-      CaseExpressionExp({{ConstantValueExp(Value(true)),
-                          ConstantValueExp(Value(int64_t{1}))}},
-                        ConstantValueExp(Value(int64_t{2}))),
+      CaseExpressionExp(
+          {{ConstantValueExp(Value(1)), ConstantValueExp(Value(int64_t{1}))}},
+          ConstantValueExp(Value(int64_t{2}))),
       {Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{1})},
   });
   cells.push_back({
       "case/constant-false",
-      CaseExpressionExp({{ConstantValueExp(Value(false)),
-                          ConstantValueExp(Value(int64_t{1}))}},
-                        ConstantValueExp(Value(int64_t{2}))),
+      CaseExpressionExp(
+          {{ConstantValueExp(Value(0)), ConstantValueExp(Value(int64_t{1}))}},
+          ConstantValueExp(Value(int64_t{2}))),
       {Value(int64_t{2}), Value(int64_t{2}), Value(int64_t{2})},
   });
   return cells;
@@ -353,7 +351,7 @@ std::vector<InCell> BuildInCells() {
       InExpressionExp(ColumnValueExp("i"),
                       {ConstantValueExp(Value(int64_t{1})),
                        ConstantValueExp(Value(int64_t{7}))}),
-      {Value(false), Value(false), Value()},
+      {Value(0), Value(0), Value()},
   });
   cells.push_back({
       "in/null-in-list",
@@ -361,20 +359,20 @@ std::vector<InCell> BuildInCells() {
           ColumnValueExp("i"),
           {ConstantValueExp(Value(int64_t{1})), ConstantValueExp(Value()),
            ConstantValueExp(Value(int64_t{2}))}),
-      {Value(), Value(true), Value()},
+      {Value(), Value(1), Value()},
   });
   cells.push_back({
       "in/single-element",
       InExpressionExp(ColumnValueExp("i"),
                       {ConstantValueExp(Value(int64_t{7}))}),
-      {Value(false), Value(false), Value()},
+      {Value(0), Value(0), Value()},
   });
   cells.push_back({
       "in/all-constants",
       InExpressionExp(ConstantValueExp(Value(int64_t{7})),
                       {ConstantValueExp(Value(int64_t{1})),
                        ConstantValueExp(Value(int64_t{7}))}),
-      {Value(true), Value(true), Value(true)},
+      {Value(1), Value(1), Value(1)},
   });
   return cells;
 }
@@ -547,7 +545,7 @@ TEST(DifferentialTest, Evaluate_LogicalThreeValuedLogic_MatchesAcrossPaths) {
     }
   }
   // Constant truth table: exercises folding inside the bytecode compiler.
-  const std::vector<Value> booleans{Value(true), Value(false), Value()};
+  const std::vector<Value> booleans{Value(1), Value(0), Value()};
   for (const auto& [op_name, op] : operations) {
     for (const Value& left : booleans) {
       for (const Value& right : booleans) {
@@ -1060,8 +1058,7 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   EXPECT_EQ(detail_div.kind, Attempt::Kind::kValue);
   EXPECT_EQ(ast_div.kind, Attempt::Kind::kValue);
   EXPECT_EQ(detail_div.value.type, ValueType::kDouble);
-  EXPECT_TRUE(SameValue(detail_div.value, ast_div.value))
-      << true;
+  EXPECT_TRUE(SameValue(detail_div.value, ast_div.value)) << true;
 
   const Row max_one({Value(kInt64Max), Value(int64_t{1})});
   const Expression overflow_add = BinaryExpressionExp(

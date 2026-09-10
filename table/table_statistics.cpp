@@ -861,7 +861,7 @@ void ColumnStats::Duplicate(size_t multiplier) {
   multiply_frequencies(most_common_values_);
 }
 
-TableStatistics::TableStatistics(const Schema& schema) {
+TableStatistics::TableStatistics(const Schema& schema) : row_count_(0) {
   stats_.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     stats_.emplace_back(schema.GetColumn(i).Type());
@@ -926,10 +926,10 @@ double TableStatistics::ReductionFactor(const Schema& schema,
 
 double TableStatistics::EstimateCount(int column_index, const Value& from,
                                       const Value& to) const {
-  CHECK_MSG(
-      column_index >= 0 && static_cast<size_t>(column_index) < stats_.size(),
-      "statistics column index");
-  if (column_index < 0 || static_cast<size_t>(column_index) >= stats_.size()) {
+  const bool index_valid =
+      column_index >= 0 && static_cast<size_t>(column_index) < stats_.size();
+  CHECK_MSG(index_valid, "statistics column index");
+  if (!index_valid) {
     return 0;
   }
   const ColumnStats& column_stats = stats_[static_cast<size_t>(column_index)];

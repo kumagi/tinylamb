@@ -341,6 +341,10 @@ struct ScopedDb {
   std::unique_ptr<Database> db;
   ScopedDb(std::string n, std::unique_ptr<Database> d)
       : name(std::move(n)), db(std::move(d)) {}
+  ScopedDb(const ScopedDb&) = delete;
+  ScopedDb& operator=(const ScopedDb&) = delete;
+  ScopedDb(ScopedDb&&) = delete;
+  ScopedDb& operator=(ScopedDb&&) = delete;
   ~ScopedDb() {
     db.reset();
     std::error_code ec;
@@ -357,18 +361,17 @@ struct RowGenPred {
 
 std::pair<Schema, std::vector<Row>> BuildRowFuzzDataset(std::mt19937& rng) {
   Schema schema("t_fuzz", {
-      Column("id", ValueType::kInt64),
-      Column("i", ValueType::kInt64),
-      Column("f", ValueType::kDouble),
-      Column("b", ValueType::kInt64),
-      Column("s", ValueType::kVarChar),
-  });
+                              Column("id", ValueType::kInt64),
+                              Column("i", ValueType::kInt64),
+                              Column("f", ValueType::kDouble),
+                              Column("b", ValueType::kInt64),
+                              Column("s", ValueType::kVarChar),
+                          });
 
   std::vector<Row> rows;
   int64_t id = 0;
 
-  auto add_row = [&](std::optional<int64_t> i_val,
-                     std::optional<double> f_val,
+  auto add_row = [&](std::optional<int64_t> i_val, std::optional<double> f_val,
                      std::optional<int64_t> b_val,
                      std::optional<std::string> s_val) {
     std::vector<Value> vals;
@@ -390,7 +393,7 @@ std::pair<Schema, std::vector<Row>> BuildRowFuzzDataset(std::mt19937& rng) {
       vals.emplace_back();
     }
     if (s_val.has_value()) {
-      vals.push_back(Value(std::string(*s_val)));
+      vals.emplace_back(std::string(*s_val));
     } else {
       vals.emplace_back();
     }
@@ -433,19 +436,18 @@ std::pair<Schema, std::vector<Row>> BuildRowFuzzDataset(std::mt19937& rng) {
             : std::optional<int64_t>(
                   std::uniform_int_distribution<int64_t>(-50, 50)(rng));
     std::optional<double> f_v =
-        (pick_f < 20) ? std::nullopt
-                      : std::optional<double>(
-                            std::uniform_int_distribution<int>(-50, 50)(rng) /
-                            10.0);
-    std::optional<int64_t> b_v =
-        (pick_b < 20)
+        (pick_f < 20)
             ? std::nullopt
-            : std::optional<int64_t>(
-                  std::uniform_int_distribution<int>(0, 1)(rng));
+            : std::optional<double>(
+                  std::uniform_int_distribution<int>(-50, 50)(rng) / 10.0);
+    std::optional<int64_t> b_v =
+        (pick_b < 20) ? std::nullopt
+                      : std::optional<int64_t>(
+                            std::uniform_int_distribution<int>(0, 1)(rng));
     std::optional<std::string> s_v =
-        (pick_s < 20) ? std::nullopt
-                      : std::optional<std::string>(pick_s % 2 == 0 ? "abc"
-                                                                   : "xyz");
+        (pick_s < 20)
+            ? std::nullopt
+            : std::optional<std::string>(pick_s % 2 == 0 ? "abc" : "xyz");
     add_row(i_v, f_v, b_v, s_v);
   }
 
@@ -461,84 +463,87 @@ RowGenPred GenRowPred(std::mt19937& rng, int depth = 0) {
     switch (pick(0, 13)) {
       case 0: {
         int64_t c = pick(-3, 3);
-        return {BinaryExpressionExp(ColumnValueExp("i"),
-                                    BinaryOperation::kEquals,
-                                    ConstantValueExp(Value(c))),
-                "(i = " + std::to_string(c) + ")"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("i"),
+                                            BinaryOperation::kEquals,
+                                            ConstantValueExp(Value(c))),
+                .sql = "(i = " + std::to_string(c) + ")"};
       }
       case 1: {
         int64_t c = pick(-3, 3);
-        return {BinaryExpressionExp(ColumnValueExp("i"),
-                                    BinaryOperation::kGreaterThan,
-                                    ConstantValueExp(Value(c))),
-                "(i > " + std::to_string(c) + ")"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("i"),
+                                            BinaryOperation::kGreaterThan,
+                                            ConstantValueExp(Value(c))),
+                .sql = "(i > " + std::to_string(c) + ")"};
       }
       case 2: {
         int64_t c = pick(-3, 3);
-        return {BinaryExpressionExp(ColumnValueExp("i"),
-                                    BinaryOperation::kLessThanEquals,
-                                    ConstantValueExp(Value(c))),
-                "(i <= " + std::to_string(c) + ")"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("i"),
+                                            BinaryOperation::kLessThanEquals,
+                                            ConstantValueExp(Value(c))),
+                .sql = "(i <= " + std::to_string(c) + ")"};
       }
       case 3: {
         double f = pick(-20, 20) / 10.0;
-        return {BinaryExpressionExp(ColumnValueExp("f"),
-                                    BinaryOperation::kGreaterThan,
-                                    ConstantValueExp(Value(f))),
-                "(f > " + std::to_string(f) + ")"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("f"),
+                                            BinaryOperation::kGreaterThan,
+                                            ConstantValueExp(Value(f))),
+                .sql = "(f > " + std::to_string(f) + ")"};
       }
       case 4:
-        return {BinaryExpressionExp(ColumnValueExp("s"),
-                                    BinaryOperation::kEquals,
-                                    ConstantValueExp(Value("foo"))),
-                "(s = 'foo')"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("s"),
+                                            BinaryOperation::kEquals,
+                                            ConstantValueExp(Value("foo"))),
+                .sql = "(s = 'foo')"};
       case 5:
-        return {BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kLike,
-                                    ConstantValueExp(Value("a%"))),
-                "(s LIKE 'a%')"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("s"),
+                                            BinaryOperation::kLike,
+                                            ConstantValueExp(Value("a%"))),
+                .sql = "(s LIKE 'a%')"};
       case 6:
-        return {UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kIsNull),
-                "(i IS NULL)"};
+        return {.expr = UnaryExpressionExp(ColumnValueExp("i"),
+                                           UnaryOperation::kIsNull),
+                .sql = "(i IS NULL)"};
       case 7:
-        return {
-            UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kIsNotNull),
-            "(i IS NOT NULL)"};
+        return {.expr = UnaryExpressionExp(ColumnValueExp("i"),
+                                           UnaryOperation::kIsNotNull),
+                .sql = "(i IS NOT NULL)"};
       case 8:
-        return {UnaryExpressionExp(ColumnValueExp("f"), UnaryOperation::kIsNull),
-                "(f IS NULL)"};
+        return {.expr = UnaryExpressionExp(ColumnValueExp("f"),
+                                           UnaryOperation::kIsNull),
+                .sql = "(f IS NULL)"};
       case 9:
-        return {
-            UnaryExpressionExp(ColumnValueExp("s"), UnaryOperation::kIsNotNull),
-            "(s IS NOT NULL)"};
+        return {.expr = UnaryExpressionExp(ColumnValueExp("s"),
+                                           UnaryOperation::kIsNotNull),
+                .sql = "(s IS NOT NULL)"};
       case 10:
-        return {BinaryExpressionExp(
-                    FunctionCallExp("coalesce",
-                                    {ColumnValueExp("i"),
-                                     ConstantValueExp(Value(int64_t{0}))}),
-                    BinaryOperation::kEquals,
-                    ConstantValueExp(Value(int64_t{0}))),
-                "(COALESCE(i, 0) = 0)"};
+        return {
+            .expr = BinaryExpressionExp(
+                FunctionCallExp(
+                    "coalesce",
+                    {ColumnValueExp("i"), ConstantValueExp(Value(int64_t{0}))}),
+                BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0}))),
+            .sql = "(COALESCE(i, 0) = 0)"};
       case 11:
-        return {BinaryExpressionExp(
-                    FunctionCallExp("coalesce",
-                                    {ColumnValueExp("s"),
-                                     ConstantValueExp(Value("bar"))}),
-                    BinaryOperation::kEquals, ConstantValueExp(Value("bar"))),
-                "(COALESCE(s, 'bar') = 'bar')"};
+        return {
+            .expr = BinaryExpressionExp(
+                FunctionCallExp("coalesce", {ColumnValueExp("s"),
+                                             ConstantValueExp(Value("bar"))}),
+                BinaryOperation::kEquals, ConstantValueExp(Value("bar"))),
+            .sql = "(COALESCE(s, 'bar') = 'bar')"};
       case 12: {
         int64_t v1 = pick(-1, 1);
         int64_t v2 = pick(2, 5);
-        return {InExpressionExp(ColumnValueExp("i"),
-                                {ConstantValueExp(Value(v1)),
-                                 ConstantValueExp(Value(v2))}),
-                "(i IN (" + std::to_string(v1) + ", " + std::to_string(v2) +
-                    "))"};
+        return {.expr = InExpressionExp(
+                    ColumnValueExp("i"),
+                    {ConstantValueExp(Value(v1)), ConstantValueExp(Value(v2))}),
+                .sql = "(i IN (" + std::to_string(v1) + ", " +
+                       std::to_string(v2) + "))"};
       }
       default:
-        return {BinaryExpressionExp(ColumnValueExp("b"),
-                                    BinaryOperation::kEquals,
-                                    ConstantValueExp(Value(int64_t{1}))),
-                "(b = TRUE)"};
+        return {.expr = BinaryExpressionExp(
+                    ColumnValueExp("b"), BinaryOperation::kEquals,
+                    ConstantValueExp(Value(int64_t{1}))),
+                .sql = "(b = TRUE)"};
     }
   }
 
@@ -546,19 +551,20 @@ RowGenPred GenRowPred(std::mt19937& rng, int depth = 0) {
     case 0: {
       auto l = GenRowPred(rng, depth + 1);
       auto r = GenRowPred(rng, depth + 1);
-      return {BinaryExpressionExp(l.expr, BinaryOperation::kAnd, r.expr),
-              "(" + l.sql + " AND " + r.sql + ")"};
+      return {
+          .expr = BinaryExpressionExp(l.expr, BinaryOperation::kAnd, r.expr),
+          .sql = "(" + l.sql + " AND " + r.sql + ")"};
     }
     case 1: {
       auto l = GenRowPred(rng, depth + 1);
       auto r = GenRowPred(rng, depth + 1);
-      return {BinaryExpressionExp(l.expr, BinaryOperation::kOr, r.expr),
-              "(" + l.sql + " OR " + r.sql + ")"};
+      return {.expr = BinaryExpressionExp(l.expr, BinaryOperation::kOr, r.expr),
+              .sql = "(" + l.sql + " OR " + r.sql + ")"};
     }
     default: {
       auto inner = GenRowPred(rng, depth + 1);
-      return {UnaryExpressionExp(inner.expr, UnaryOperation::kNot),
-              "(NOT " + inner.sql + ")"};
+      return {.expr = UnaryExpressionExp(inner.expr, UnaryOperation::kNot),
+              .sql = "(NOT " + inner.sql + ")"};
     }
   }
 }
@@ -585,18 +591,22 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
     if (cascades::ExpressionRejectsNullsOnColumn(pred.expr, col_name)) {
       t.null_reject_claimed = true;
       t.null_reject_col = col_name;
-      for (size_t r_idx = 0; r_idx < rows.size(); ++r_idx) {
-        if (rows[r_idx][col_idx].IsNull()) {
-          StatusOr<Value> v = pred.expr->TryEvaluate(rows[r_idx], schema);
+      for (const auto& r_idx : rows) {
+        if (r_idx[col_idx].IsNull()) {
+          StatusOr<Value> v = pred.expr->TryEvaluate(r_idx, schema);
           if (v.HasValue() && !v.Value().IsNull() && v.Value().Truthy()) {
-            report += "[NULL-REJECT SOUNDNESS VIOLATION]\n"
-                      "  Predicate claims to reject NULL on column '" +
-                      col_name + "':\n"
-                      "  Expression SQL: " + pred.sql + "\n"
-                      "  Expression AST: " + pred.expr->ToString() + "\n"
-                      "  Evaluated to TRUE on row where " + col_name +
-                      " is NULL:\n"
-                      "  Row:            " + rows[r_idx].ToString() + "\n";
+            report += "[NULL-REJECT SOUNDNESS VIOLATION]\n";
+            report += "  Predicate claims to reject NULL on column '";
+            report += col_name;
+            report += "':\n  Expression SQL: ";
+            report += pred.sql;
+            report += "\n  Expression AST: ";
+            report += pred.expr->ToString();
+            report += "\n  Evaluated to TRUE on row where ";
+            report += col_name;
+            report += " is NULL:\n  Row:            ";
+            report += r_idx.ToString();
+            report += "\n";
             t.failure = "null-reject soundness violation on column " + col_name;
             return report;
           }
@@ -610,18 +620,26 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
   Expression rewritten =
       ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(pred.expr);
   rewritten = RewriteTypedArithmetic(rewritten, schema);
-  for (size_t r_idx = 0; r_idx < rows.size(); ++r_idx) {
-    StatusOr<Value> orig_v = pred.expr->TryEvaluate(rows[r_idx], schema);
-    StatusOr<Value> rew_v = rewritten->TryEvaluate(rows[r_idx], schema);
+  for (const auto& r_idx : rows) {
+    StatusOr<Value> orig_v = pred.expr->TryEvaluate(r_idx, schema);
+    StatusOr<Value> rew_v = rewritten->TryEvaluate(r_idx, schema);
     if (!orig_v.HasValue() || !rew_v.HasValue()) {
       if (orig_v.HasValue() != rew_v.HasValue()) {
-        report += "[REWRITE THROW MISMATCH]\n"
-                  "  Expression SQL: " + pred.sql + "\n"
-                  "  Original AST:   " + pred.expr->ToString() + " => " +
-                  (orig_v.HasValue() ? orig_v.Value().AsString() : "THROW") + "\n"
-                  "  Rewritten AST:  " + rewritten->ToString() + " => " +
-                  (rew_v.HasValue() ? rew_v.Value().AsString() : "THROW") + "\n"
-                  "  On Row:         " + rows[r_idx].ToString() + "\n";
+        report +=
+            "[REWRITE THROW MISMATCH]\n"
+            "  Expression SQL: " +
+            pred.sql +
+            "\n"
+            "  Original AST:   " +
+            pred.expr->ToString() + " => " +
+            (orig_v.HasValue() ? orig_v.Value().AsString() : "THROW") +
+            "\n"
+            "  Rewritten AST:  " +
+            rewritten->ToString() + " => " +
+            (rew_v.HasValue() ? rew_v.Value().AsString() : "THROW") +
+            "\n"
+            "  On Row:         " +
+            r_idx.ToString() + "\n";
         t.failure = "rewrite throw mismatch";
         return report;
       }
@@ -630,13 +648,19 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
     bool orig_pass = !orig_v.Value().IsNull() && orig_v.Value().Truthy();
     bool rew_pass = !rew_v.Value().IsNull() && rew_v.Value().Truthy();
     if (orig_pass != rew_pass) {
-      report += "[REWRITE TRUTHINESS MISMATCH]\n"
-                "  Expression SQL: " + pred.sql + "\n"
-                "  Original AST:   " + pred.expr->ToString() + " => " +
-                (orig_pass ? "PASS" : "REJECT") + "\n"
-                "  Rewritten AST:  " + rewritten->ToString() + " => " +
-                (rew_pass ? "PASS" : "REJECT") + "\n"
-                "  On Row:         " + rows[r_idx].ToString() + "\n";
+      report +=
+          "[REWRITE TRUTHINESS MISMATCH]\n"
+          "  Expression SQL: " +
+          pred.sql +
+          "\n"
+          "  Original AST:   " +
+          pred.expr->ToString() + " => " + (orig_pass ? "PASS" : "REJECT") +
+          "\n"
+          "  Rewritten AST:  " +
+          rewritten->ToString() + " => " + (rew_pass ? "PASS" : "REJECT") +
+          "\n"
+          "  On Row:         " +
+          r_idx.ToString() + "\n";
       t.failure = "rewrite truthiness mismatch";
       return report;
     }
@@ -721,10 +745,15 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
   Status engine_status = qr.Value().GetStatus();
   if (ast_threw) {
     if (engine_status == Status::kSuccess) {
-      report += "[ENGINE DIFFERENTIAL MISMATCH: ENGINE DID NOT THROW]\n"
-                "  Query SQL:     " + sql + "\n"
-                "  AST threw:     " + ast_error + "\n"
-                "  Engine status: Success\n";
+      report +=
+          "[ENGINE DIFFERENTIAL MISMATCH: ENGINE DID NOT THROW]\n"
+          "  Query SQL:     " +
+          sql +
+          "\n"
+          "  AST threw:     " +
+          ast_error +
+          "\n"
+          "  Engine status: Success\n";
       t.failure = "engine did not throw on error row";
       return report;
     }
@@ -732,10 +761,15 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
   }
 
   if (engine_status != Status::kSuccess) {
-    report += "[ENGINE EXECUTION ERROR]\n"
-              "  Query SQL:     " + sql + "\n"
-              "  Engine error:  " + engine_status.GetMessage() + "\n"
-              "  AST evaluated: Success\n";
+    report +=
+        "[ENGINE EXECUTION ERROR]\n"
+        "  Query SQL:     " +
+        sql +
+        "\n"
+        "  Engine error:  " +
+        engine_status.GetMessage() +
+        "\n"
+        "  AST evaluated: Success\n";
     t.failure = "engine failed unexpectedly";
     return report;
   }
@@ -746,17 +780,27 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
     auto fmt = [](const std::vector<int64_t>& ids) {
       std::string out = "[";
       for (size_t i = 0; i < ids.size(); ++i) {
-        if (i > 0) out += ", ";
+        if (i > 0) {
+          out += ", ";
+        }
         out += std::to_string(ids[i]);
       }
       out += "]";
       return out;
     };
-    report += "[ENGINE DIFFERENTIAL MISMATCH]\n"
-              "  Query SQL:   " + sql + "\n"
-              "  Expression:  " + pred.expr->ToString() + "\n"
-              "  Expected IDs (AST ground truth): " + fmt(expected_ids) + "\n"
-              "  Actual IDs   (SQL Engine):       " + fmt(engine_ids) + "\n";
+    report +=
+        "[ENGINE DIFFERENTIAL MISMATCH]\n"
+        "  Query SQL:   " +
+        sql +
+        "\n"
+        "  Expression:  " +
+        pred.expr->ToString() +
+        "\n"
+        "  Expected IDs (AST ground truth): " +
+        fmt(expected_ids) +
+        "\n"
+        "  Actual IDs   (SQL Engine):       " +
+        fmt(engine_ids) + "\n";
     t.failure = "engine differential mismatch";
   }
 

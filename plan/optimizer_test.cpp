@@ -172,8 +172,8 @@ class OptimizerTest : public ::testing::Test {
 
   void TearDown() override { rs_->DeleteAll(); }
 
-  [[nodiscard]] Status DumpAll(const QueryData& qd) const {
-    // Arrange: open context + rewrite query for debugging
+  [[nodiscard]] Status DumpAll(const QueryData& qd)
+      const {  // Arrange: open context + rewrite query for debugging
     TransactionContext ctx = rs_->BeginContext();
     QueryData qd_resolved = qd;
     qd_resolved.Rewrite(ctx);
@@ -218,8 +218,7 @@ TEST_F(OptimizerTest, Simple) {
 }
 
 TEST_F(OptimizerTest, ConstantFalseSelectionBecomesEmptyPlan) {
-  QueryData query{
-      {"Sc1"}, ConstantValueExp(Value(0)), {NamedExpression("c1")}};
+  QueryData query{{"Sc1"}, ConstantValueExp(Value(0)), {NamedExpression("c1")}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -347,8 +346,8 @@ TEST_F(OptimizerTest, SimplifiesSelfComparisonsInFilterContext) {
 
 TEST_F(OptimizerTest, ContradictoryConjunctsBecomeEmptyResult) {
   TransactionContext context = rs_->BeginContext();
-  const auto check_empty = [&](Expression predicate) {
-    QueryData query{{"Sc1"}, std::move(predicate), {NamedExpression("c1")}};
+  const auto check_empty = [&](const Expression& predicate) {
+    QueryData query{{"Sc1"}, predicate, {NamedExpression("c1")}};
     ASSERT_SUCCESS(query.Rewrite(context));
     const auto plan_or = Optimizer::Optimize(query, context);
     ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
@@ -439,8 +438,8 @@ TEST_F(OptimizerTest, EqualityClassesPropagateAndRejectConstants) {
 
 TEST_F(OptimizerTest, NullAndInComplementsBecomeEmptyResult) {
   TransactionContext context = rs_->BeginContext();
-  const auto assert_empty = [&](Expression predicate) {
-    QueryData query{{"Sc1"}, std::move(predicate), {NamedExpression("c1")}};
+  const auto assert_empty = [&](const Expression& predicate) {
+    QueryData query{{"Sc1"}, predicate, {NamedExpression("c1")}};
     EXPECT_EQ(query.Rewrite(context), Status::kSuccess);
     const auto plan_or = Optimizer::Optimize(query, context);
     ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);

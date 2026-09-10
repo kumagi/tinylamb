@@ -74,10 +74,11 @@ GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph);
 // ---------------------------------------------------------------------------
 // Complex Multi-Operator Memo Oracle
 //
-// Synthesizes rich Cascades Memos with schemas, candidate-key/not-null/foreign-key
-// constraints, and multi-operator pipelines (Selection, Projection, Aggregation,
-// Distinct, Sort, Limit, Window, OuterJoin, SemiJoin, AntiJoin) so all 105
-// transformation rules are actively exercised during exploration.
+// Synthesizes rich Cascades Memos with schemas,
+// candidate-key/not-null/foreign-key constraints, and multi-operator pipelines
+// (Selection, Projection, Aggregation, Distinct, Sort, Limit, Window,
+// OuterJoin, SemiJoin, AntiJoin) so all 105 transformation rules are actively
+// exercised during exploration.
 // ---------------------------------------------------------------------------
 
 struct ComplexMemoGenConfig {

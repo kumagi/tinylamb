@@ -369,10 +369,13 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
     const std::string rel = "t" + std::to_string(i);
     gen.relations.push_back(rel);
     std::vector<Column> cols;
-    cols.emplace_back("c0", ValueType::kInt64, Constraint(Constraint::kPrimaryKey));
+    cols.emplace_back("c0", ValueType::kInt64,
+                      Constraint(Constraint::kPrimaryKey));
     cols.emplace_back("c1", ValueType::kInt64, Constraint(Constraint::kUnique));
-    cols.emplace_back("c2", ValueType::kInt64, Constraint(Constraint::kNotNull));
-    cols.emplace_back("c3", ValueType::kInt64, Constraint(Constraint::kNothing));
+    cols.emplace_back("c2", ValueType::kInt64,
+                      Constraint(Constraint::kNotNull));
+    cols.emplace_back("c3", ValueType::kInt64,
+                      Constraint(Constraint::kNothing));
     gen.schemas.emplace(rel, Schema(rel, std::move(cols)));
   }
 
@@ -381,7 +384,8 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
   for (int i = 0; i < conjunct_count; ++i) {
     if (relation_count >= 2 && rng() % 2 == 0) {
       const size_t left_idx = static_cast<size_t>(rng()) % gen.relations.size();
-      size_t right_idx = static_cast<size_t>(rng()) % (gen.relations.size() - 1);
+      size_t right_idx =
+          static_cast<size_t>(rng()) % (gen.relations.size() - 1);
       if (right_idx >= left_idx) {
         ++right_idx;
       }
@@ -403,9 +407,9 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
             ColumnValueExp(rel + ".c1"), BinaryOperation::kEquals,
             ConstantValueExp(Value(static_cast<int64_t>(rng() % 5))));
       } else if (pred_kind == 1) {
-        pred = BinaryExpressionExp(
-            ColumnValueExp(rel + ".c0"), BinaryOperation::kGreaterThan,
-            ConstantValueExp(Value(int64_t{0})));
+        pred = BinaryExpressionExp(ColumnValueExp(rel + ".c0"),
+                                   BinaryOperation::kGreaterThan,
+                                   ConstantValueExp(Value(int64_t{0})));
       } else if (pred_kind == 2) {
         pred = UnaryExpressionExp(ColumnValueExp(rel + ".c2"),
                                   UnaryOperation::kIsNotNull);
@@ -417,15 +421,16 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
     }
   }
 
-  const int depth = 1 + static_cast<int>(
-      rng() % static_cast<uint32_t>(std::max(1, config.max_operator_depth)));
+  const int depth =
+      1 + static_cast<int>(rng() % static_cast<uint32_t>(
+                                       std::max(1, config.max_operator_depth)));
   std::vector<int> op_choices;
-  op_choices.reserve(depth);
+  op_choices.reserve(static_cast<size_t>(depth));
   for (int d = 0; d < depth; ++d) {
     op_choices.push_back(static_cast<int>(rng() % 7));
   }
   const bool use_outer_join_root = (relation_count >= 2 && rng() % 3 == 0);
-  const uint8_t outer_join_type = static_cast<uint8_t>(rng() % 3);
+  const auto outer_join_type = static_cast<uint8_t>(rng() % 3);
 
   std::ostringstream desc;
   desc << "relations{" << gen.relations.size() << "} ops[";
@@ -442,7 +447,8 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
     cascades::GroupId current = memo.Build(relations, conjuncts);
     if (use_outer_join_root && relations.size() >= 2) {
       const std::vector<std::string> left_rels = {relations[0]};
-      std::vector<std::string> right_rels(relations.begin() + 1, relations.end());
+      std::vector<std::string> right_rels(relations.begin() + 1,
+                                          relations.end());
       const cascades::GroupId left_group = memo.EnsureGroup(left_rels);
       const cascades::GroupId right_group = memo.EnsureGroup(right_rels);
       current = memo.EnsureDerivedGroup(relations, "root_outer_join");
@@ -481,11 +487,10 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
                                     ConstantValueExp(Value(int64_t{0})));
           }
           memo.AddExpression(
-              sel_group,
-              cascades::LogicalExpression{
-                  .operation = cascades::LogicalOperator::kSelection,
-                  .children = {current},
-                  .predicate = std::move(p)});
+              sel_group, cascades::LogicalExpression{
+                             .operation = cascades::LogicalOperator::kSelection,
+                             .children = {current},
+                             .predicate = std::move(p)});
           current = sel_group;
           break;
         }
@@ -511,9 +516,11 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
                   .operation = cascades::LogicalOperator::kAggregation,
                   .children = {current},
                   .target_list = {NamedExpression(rel0 + ".c0"),
-                                  NamedExpression("cnt", AggregateExpressionExp(
-                                                             AggregationType::kCount,
-                                                             ColumnValueExp(rel0 + ".c1")))},
+                                  NamedExpression(
+                                      "cnt",
+                                      AggregateExpressionExp(
+                                          AggregationType::kCount,
+                                          ColumnValueExp(rel0 + ".c1")))},
                   .grouping_sets = {ColumnValueExp(rel0 + ".c0")}});
           current = agg_group;
           break;
@@ -522,37 +529,34 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
           const cascades::GroupId dist_group =
               memo.EnsureDerivedGroup(relations, tag + "distinct");
           memo.AddExpression(
-              dist_group,
-              cascades::LogicalExpression{
-                  .operation = cascades::LogicalOperator::kDistinct,
-                  .children = {current}});
+              dist_group, cascades::LogicalExpression{
+                              .operation = cascades::LogicalOperator::kDistinct,
+                              .children = {current}});
           current = dist_group;
           break;
         }
         case 4: {  // Sort
           const cascades::GroupId sort_group =
               memo.EnsureDerivedGroup(relations, tag + "sort");
-          memo.AddExpression(
-              sort_group,
-              cascades::LogicalExpression{
-                  .operation = cascades::LogicalOperator::kSort,
-                  .children = {current},
-                  .target_list = {NamedExpression(rel0 + ".c0")},
-                  .sort_ascending = {true},
-                  .sort_nulls_first = {std::nullopt}});
+          memo.AddExpression(sort_group,
+                             cascades::LogicalExpression{
+                                 .operation = cascades::LogicalOperator::kSort,
+                                 .children = {current},
+                                 .target_list = {NamedExpression(rel0 + ".c0")},
+                                 .sort_ascending = {true},
+                                 .sort_nulls_first = {std::nullopt}});
           current = sort_group;
           break;
         }
         case 5: {  // Limit
           const cascades::GroupId limit_group =
               memo.EnsureDerivedGroup(relations, tag + "limit");
-          memo.AddExpression(
-              limit_group,
-              cascades::LogicalExpression{
-                  .operation = cascades::LogicalOperator::kLimit,
-                  .children = {current},
-                  .limit_count = 5,
-                  .limit_offset = 0});
+          memo.AddExpression(limit_group,
+                             cascades::LogicalExpression{
+                                 .operation = cascades::LogicalOperator::kLimit,
+                                 .children = {current},
+                                 .limit_count = 5,
+                                 .limit_offset = 0});
           current = limit_group;
           break;
         }
@@ -560,11 +564,10 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
           const cascades::GroupId win_group =
               memo.EnsureDerivedGroup(relations, tag + "window");
           memo.AddExpression(
-              win_group,
-              cascades::LogicalExpression{
-                  .operation = cascades::LogicalOperator::kWindow,
-                  .children = {current},
-                  .partition_by = {ColumnValueExp(rel0 + ".c0")}});
+              win_group, cascades::LogicalExpression{
+                             .operation = cascades::LogicalOperator::kWindow,
+                             .children = {current},
+                             .partition_by = {ColumnValueExp(rel0 + ".c0")}});
           current = win_group;
           break;
         }

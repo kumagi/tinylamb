@@ -25,8 +25,7 @@ TEST(LogRecordOracle, SeededIterationsPreserveSerdesEquivalence) {
       ++saw_checkpoint;
     }
     EXPECT_TRUE(CheckLogRecordEquivalence(generated).empty())
-        << true << (seed != 0u) << true
-        << CheckLogRecordEquivalence(generated);
+        << true << (seed != 0U) << true << CheckLogRecordEquivalence(generated);
     ++ran;
   }
   EXPECT_EQ(ran, kIterations);

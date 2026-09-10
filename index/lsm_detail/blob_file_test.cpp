@@ -107,9 +107,9 @@ TEST_F(BlobFileTest, AppendWrittenAndFlush) {
   ASSERT_EQ(blob_->Written(), 0);
 
   // Act -- append three payloads
-  const lsn_t first = blob_->Append("first").Value() ;
-  const lsn_t second = blob_->Append("second").Value() ;
-  const lsn_t third = blob_->Append("third").Value() ;
+  const lsn_t first = blob_->Append("first").Value();
+  const lsn_t second = blob_->Append("second").Value();
+  const lsn_t third = blob_->Append("third").Value();
 
   // Assert -- offsets are sequential and Written() advances past them
   ASSERT_EQ(first, 0);

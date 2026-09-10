@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -48,6 +49,7 @@ class CliMainTest : public ::testing::Test {
                                 (dir_ / "db").string() + " < " +
                                 input.string() + " > " + stdout_path.string() +
                                 " 2> " + stderr_path.string() + "'";
+    // NOLINTNEXTLINE(cert-env33-c)
     const int status = std::system(command.c_str());
     ReadFile(stdout_path, out);
     ReadFile(stderr_path, err);
@@ -58,17 +60,18 @@ class CliMainTest : public ::testing::Test {
   }
 
  private:
-  std::filesystem::path BinaryPath(std::string_view name) {
-    char self[4096];
-    const ssize_t len = ::readlink("/proc/self/exe", self, sizeof(self) - 1);
+  static std::filesystem::path BinaryPath(std::string_view name) {
+    std::array<char, 4096> self{};
+    const ssize_t len =
+        ::readlink("/proc/self/exe", self.data(), self.size() - 1);
     if (len <= 0) {
-      return std::filesystem::path(name);
+      return {name};
     }
-    self[len] = '\0';
-    return std::filesystem::path(self).parent_path() / name;
+    self[static_cast<size_t>(len)] = '\0';
+    return std::filesystem::path(self.data()).parent_path() / name;
   }
 
-  void ReadFile(const std::filesystem::path& path, std::string* out) {
+  static void ReadFile(const std::filesystem::path& path, std::string* out) {
     std::ifstream in(path, std::ios::binary);
     out->assign(std::istreambuf_iterator<char>(in),
                 std::istreambuf_iterator<char>());

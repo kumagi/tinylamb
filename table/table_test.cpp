@@ -48,8 +48,7 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
-static constexpr std::string_view kTableName = "SampleTable";
-
+constexpr std::string_view kTableName = "SampleTable";
 class TableTest : public ::testing::Test {
  public:
   void SetUp() override {

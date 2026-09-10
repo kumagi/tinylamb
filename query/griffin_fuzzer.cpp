@@ -29,61 +29,225 @@ constexpr const char* kTestHeader = "-- tinylamb-griffin-test v1";
 
 // Built-in seed cases. The pool is static so a 32-bit seed fully determines
 // an iteration: statement selection, shuffle order, and substitutions are all
-// draws from one std::mt19937 stream.
+// draws from one std::mt19937 stream.  Coverage budget: every iteration merges
+// two cases, so the pool is organised as a feature matrix -- outer joins,
+// set operations, windows, CTEs, subqueries (IN/EXISTS/scalar), grouping
+// variants, and INT64/DOUBLE/string boundary literals -- each row exercising a
+// different corner so merged sessions mix unrelated operators.
 const std::vector<std::vector<std::string>>& SeedPool() {
-  static const std::vector<std::vector<std::string>>* pool =
-      new std::vector<std::vector<std::string>>{
-          {
-              "CREATE TABLE t1 (a INT64, b STRING, c DOUBLE);",
-              // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
-              "INSERT INTO t1 (a, b, c) VALUES (1, 'x', 1.5), (2, 'y', "
-              "NULL), "  // NOLINT(bugprone-suspicious-missing-comma)
-              "(NULL, 'z', 3.25);",
-              "SELECT a * 3 + 1 FROM t1 WHERE a > 0;",
-              "SELECT b, COUNT(*) FROM t1 GROUP BY b;",
-              "SELECT t1.a, t2.d FROM t1 JOIN t2 ON t1.a = t2.d ORDER "
-              "BY "
-              "t1.a;",
-          },
-          {
-              "CREATE TABLE t2 (d INT64, e STRING);",
-              "INSERT INTO t2 VALUES (1, 'p'), (2, NULL), (3, 'q');",
-              "SELECT d, e FROM t2 WHERE d >= 2 OR e IS NULL;",
-              "SELECT SUM(d) FROM t2;",
-              "SELECT d * -1 AS neg FROM t2;",
-          },
-          {
-              // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
-              "CREATE TABLE items (id INT64, price DOUBLE, name "
-              "STRING);",
-              // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
-              "INSERT INTO items VALUES (1, 10.0, 'aa'), (2, 20.5, "
-              "'bb'), "  // NOLINT(bugprone-suspicious-missing-comma)
-              "(3, NULL, 'cc'), (4, -5.0, NULL);",
-              "SELECT name, price * 2 AS double_price FROM items WHERE "
-              "price "
-              "< 100.0 ORDER BY price DESC;",
-              "UPDATE items SET price = price + 1 WHERE id = 1;",
-              "SELECT COUNT(*), MIN(price), MAX(price) FROM items;",
-              "DELETE FROM items WHERE id = 3;",
-              "SELECT id FROM items;",
-          },
-          {
-              "CREATE TABLE emp (id INT64, mgr INT64, sal INT64);",
-              // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
-              "INSERT INTO emp VALUES (1, NULL, 100), (2, 1, 50), (3, "
-              "1, 70), "  // NOLINT(bugprone-suspicious-missing-comma)
-              "(4, 2, NULL);",
-              "SELECT e.id FROM emp e JOIN emp m ON e.mgr = m.id WHERE "
-              "m.sal "
-              "> 60;",
-              "SELECT mgr, SUM(sal) FROM emp GROUP BY mgr HAVING "
-              "SUM(sal) > "
-              "0;",
-              "SELECT id, sal + 1000 * 2 FROM emp WHERE sal IS NOT "
-              "NULL;",
-          },
-      };
+  static const std::vector<std::vector<std::string>>*
+      pool =
+          new std::
+              vector<std::vector<std::string>>{
+                  // Boundary literals: INT64 extremes, signed zeros, empty
+                  // string.
+                  {
+                      "CREATE TABLE edge (k INT64, d FLOAT64, s STRING);",
+                      "INSERT INTO edge VALUES (-9223372036854775808, 1.5, "
+                      "''), "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "(9223372036854775807, -0.0, 'x'), (0, 3.25, 'a%b');",
+                      "SELECT k, d FROM edge ORDER BY k;",
+                      "SELECT k FROM edge WHERE k > 9223372036854775806;",
+                      "SELECT k FROM edge WHERE k < -9223372036854775807;",
+                      "SELECT MIN(k), MAX(k), COUNT(*) FROM edge;",
+                      "UPDATE edge SET k = 0 WHERE s = '';",
+                      "SELECT k FROM edge;",
+                  },
+                  // Outer joins with NULL keys on both sides.
+                  {
+                      "CREATE TABLE l (lk INT64, lv STRING);",
+                      "INSERT INTO l VALUES (1, 'a'), (2, NULL), (NULL, 'c'), "
+                      "(2, 'd');",
+                      "CREATE TABLE r (rk INT64, rv INT64);",
+                      "INSERT INTO r VALUES (2, 20), (2, 21), (NULL, 0), (3, "
+                      "30);",
+                      "SELECT l.lk, r.rv FROM l LEFT JOIN r ON l.lk = r.rk "
+                      "ORDER BY "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "l.lk;",
+                      "SELECT l.lk, r.rv FROM l RIGHT JOIN r ON l.lk = r.rk "
+                      "ORDER BY "
+                      "r.rv;",
+                      "SELECT l.lk, r.rv FROM l FULL JOIN r ON l.lk = r.rk;",
+                      "SELECT COUNT(*) FROM l LEFT JOIN r ON l.lk = r.rk WHERE "
+                      "r.rv "
+                      "IS NULL;",
+                      "SELECT COALESCE(l.lv, '?') v, r.rv FROM l LEFT JOIN r "
+                      "ON "
+                      "l.lk = r.rk;",
+                  },
+                  // Set operations.
+                  {
+                      "CREATE TABLE s1 (x INT64);",
+                      "INSERT INTO s1 VALUES (1), (2), (2), (NULL);",
+                      "CREATE TABLE s2 (x INT64);",
+                      "INSERT INTO s2 VALUES (2), (3), (NULL);",
+                      "SELECT x FROM s1 UNION ALL SELECT x FROM s2 ORDER BY x;",
+                      "SELECT x FROM s1 UNION SELECT x FROM s2;",
+                      "SELECT x FROM s1 INTERSECT ALL SELECT x FROM s2;",
+                      "SELECT x FROM s1 EXCEPT ALL SELECT x FROM s2;",
+                  },
+                  // Window functions.
+                  {
+                      "CREATE TABLE w (g INT64, v INT64, t STRING);",
+                      "INSERT INTO w VALUES (1, 10, 'a'), (1, NULL, 'b'), (2, "
+                      "30, 'a'), "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "(2, 30, 'c'), (NULL, 5, NULL);",
+                      "SELECT g, v, ROW_NUMBER() OVER (ORDER BY v) rn FROM w;",
+                      "SELECT g, v, RANK() OVER (PARTITION BY g ORDER BY v) rk "
+                      "FROM w;",
+                      "SELECT g, SUM(v) OVER (PARTITION BY g) FROM w;",
+                      "SELECT g, COUNT(*) OVER () c FROM w ORDER BY c;",
+                  },
+                  // CTE + correlated and uncorrelated subqueries.
+                  {
+                      "CREATE TABLE c (id INT64, grp INT64, val INT64);",
+                      "INSERT INTO c VALUES (1, 1, 10), (2, 1, NULL), (3, 2, "
+                      "30), "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "(4, NULL, 5);",
+                      "WITH big AS (SELECT grp, SUM(val) sv FROM c GROUP BY "
+                      "grp) "
+                      "SELECT c.id FROM c JOIN big ON c.grp = big.grp WHERE "
+                      "big.sv > "
+                      "20;",
+                      "SELECT id FROM c WHERE grp IN (SELECT grp FROM c WHERE "
+                      "val > "
+                      "20);",
+                      "SELECT id FROM c WHERE EXISTS (SELECT 1 FROM c d WHERE "
+                      "d.grp = "
+                      "c.grp AND d.val > c.val);",
+                      "SELECT id, (SELECT MAX(val) FROM c d WHERE d.grp = "
+                      "c.grp) mx "
+                      "FROM c ORDER BY id;",
+                      "SELECT COUNT(*) FROM c WHERE val > (SELECT AVG(val) "
+                      "FROM c);",
+                  },
+                  // GROUPING SETS / FILTER / DISTINCT aggregates.
+                  {
+                      "CREATE TABLE gs (region STRING, product STRING, qty "
+                      "INT64);",
+                      "INSERT INTO gs VALUES ('e','p1',3), ('w','p2',NULL), "
+                      "('e','p2',"  // NOLINT(bugprone-suspicious-missing-comma)
+                      "7), ('e','p1',-2);",
+                      "SELECT region, SUM(qty) FROM gs GROUP BY region;",
+                      "SELECT region, COUNT(DISTINCT product) FROM gs GROUP BY "
+                      "region;",
+                      "SELECT SUM(qty) FILTER (WHERE qty > 0) FROM gs;",
+                      "SELECT region, product, SUM(qty) FROM gs GROUP BY "
+                      "GROUPING "
+                      "SETS ((region), (region, product));",
+                  },
+                  // CASE / COALESCE / NULLIF / boolean 3VL stress.
+                  {
+                      "CREATE TABLE cs (i INT64, s STRING);",
+                      "INSERT INTO cs VALUES (1, 'x'), (NULL, 'y'), (-2, "
+                      "NULL), (0, "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "'');",
+                      "SELECT i, CASE WHEN i > 0 THEN 'pos' WHEN i < 0 THEN "
+                      "'neg' "
+                      "WHEN i IS NULL THEN 'null' ELSE 'zero' END c FROM cs;",
+                      "SELECT COALESCE(s, 'dflt'), NULLIF(i, 0) FROM cs;",
+                      "SELECT i FROM cs WHERE (i > 0) OR (s IS NULL);",
+                      "SELECT i FROM cs WHERE NOT (i > 0 AND s IS NOT NULL);",
+                      "SELECT i IS NULL IS NULL nn FROM cs;",
+                  },
+                  // LIKE / BETWEEN / IN-lists with NULLs.
+                  {
+                      "CREATE TABLE pat (id INT64, txt STRING);",
+                      "INSERT INTO pat VALUES (1, 'abc'), (2, 'a%c'), (3, "
+                      "'_x'), "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "(4, ''), (NULL, NULL), (6, 'ABC');",
+                      "SELECT id FROM pat WHERE txt LIKE 'a%';",
+                      "SELECT id FROM pat WHERE txt LIKE '%c';",
+                      "SELECT id FROM pat WHERE txt LIKE '_x';",
+                      "SELECT id FROM pat WHERE id BETWEEN 2 AND 4;",
+                      "SELECT id FROM pat WHERE id IN (1, NULL, 6);",
+                      "SELECT id FROM pat WHERE id NOT IN (1, 2);",
+                  },
+                  // UPDATE/DELETE with expressions and subquery predicates.
+                  {
+                      "CREATE TABLE dm (id INT64, v INT64, tag STRING);",
+                      "INSERT INTO dm VALUES (1, 100, 'a'), (2, -5, 'b'), (3, "
+                      "NULL, "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "'a'), (4, 7, NULL);",
+                      "UPDATE dm SET v = v * 2 WHERE tag = 'a';",
+                      "UPDATE dm SET v = NULL WHERE v < 0;",
+                      "DELETE FROM dm WHERE id IN (SELECT id FROM dm WHERE v "
+                      "IS NULL);",
+                      "SELECT COUNT(*), MIN(v), MAX(v) FROM dm;",
+                      "UPDATE dm SET tag = 'z' WHERE v > (SELECT MIN(v) FROM "
+                      "dm);",
+                      "SELECT id, tag FROM dm ORDER BY id;",
+                  },
+                  // Self-join / CROSS JOIN with duplicate and NULL keys.
+                  {
+                      "CREATE TABLE tree (id INT64, parent INT64, w DOUBLE);",
+                      "INSERT INTO tree VALUES (1, NULL, 1.0), (2, 1, 2.5), "
+                      "(3, 1, "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "2.5), (4, 2, NULL), (5, 5, 0.0);",
+                      "SELECT c.id, p.id FROM tree c JOIN tree p ON c.parent = "
+                      "p.id "
+                      "ORDER BY c.id;",
+                      "SELECT a.id, b.id FROM tree a CROSS JOIN tree b WHERE "
+                      "a.id = "
+                      "b.id;",
+                      "SELECT t.id FROM tree t LEFT JOIN tree k ON t.parent = "
+                      "k.id "
+                      "WHERE k.id IS NULL;",
+                      "SELECT parent, COUNT(*) FROM tree GROUP BY parent "
+                      "HAVING "
+                      "COUNT(*) > 1;",
+                  },
+                  {
+                      "CREATE TABLE t1 (a INT64, b STRING, c DOUBLE);",
+                      // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
+                      "INSERT INTO t1 (a, b, c) VALUES (1, 'x', 1.5), (2, 'y', "
+                      "NULL), "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "(NULL, 'z', 3.25);",
+                      "SELECT a * 3 + 1 FROM t1 WHERE a > 0;",
+                      "SELECT b, COUNT(*) FROM t1 GROUP BY b;",
+                      "SELECT t1.a, t2.d FROM t1 JOIN t2 ON t1.a = t2.d ORDER "
+                      "BY "
+                      "t1.a;",
+                  },
+                  {
+                      "CREATE TABLE t2 (d INT64, e STRING);",
+                      "INSERT INTO t2 VALUES (1, 'p'), (2, NULL), (3, 'q');",
+                      "SELECT d, e FROM t2 WHERE d >= 2 OR e IS NULL;",
+                      "SELECT SUM(d) FROM t2;",
+                      "SELECT d * -1 AS neg FROM t2;",
+                  },
+                  {
+                      // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
+                      "CREATE TABLE items (id INT64, price DOUBLE, name "
+                      "STRING);",
+                      // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
+                      "INSERT INTO items VALUES (1, 10.0, 'aa'), (2, 20.5, "
+                      "'bb'), "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "(3, NULL, 'cc'), (4, -5.0, NULL);",
+                      "SELECT name, price * 2 AS double_price FROM items WHERE "
+                      "price "
+                      "< 100.0 ORDER BY price DESC;",
+                      "UPDATE items SET price = price + 1 WHERE id = 1;",
+                      "SELECT COUNT(*), MIN(price), MAX(price) FROM items;",
+                      "DELETE FROM items WHERE id = 3;",
+                      "SELECT id FROM items;",
+                  },
+                  {
+                      "CREATE TABLE emp (id INT64, mgr INT64, sal INT64);",
+                      // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
+                      "INSERT INTO emp VALUES (1, NULL, 100), (2, 1, 50), (3, "
+                      "1, 70), "  // NOLINT(bugprone-suspicious-missing-comma)
+                      "(4, 2, NULL);",
+                      "SELECT e.id FROM emp e JOIN emp m ON e.mgr = m.id WHERE "
+                      "m.sal "
+                      "> 60;",
+                      "SELECT mgr, SUM(sal) FROM emp GROUP BY mgr HAVING "
+                      "SUM(sal) > "
+                      "0;",
+                      "SELECT id, sal + 1000 * 2 FROM emp WHERE sal IS NOT "
+                      "NULL;",
+                  },
+              };
   return *pool;
 }
 
@@ -272,11 +436,16 @@ RunOutcome RunStatement(Database& db, TransactionContext& ctx,
   } catch (const std::exception& error) {
     // "column/table X not found"-class messages are the engine's ordinary
     // rejection mechanism on some paths (cf. executor_test expectations), so
-    // they count as rejections, not findings. Anything else escaping is
-    // oracle (1) material.
+    // they count as rejections, not findings.  The transitional EXC-SHIM
+    // boundary (no-exception-rule-migration.md Phase 7) still re-raises data-
+    // dependent runtime errors (SUM/+ overflow, struct-field access on a
+    // non-struct) as C++ exceptions; those carry the same messages the
+    // StatusOr channel would report, so they too are rejections.  Anything
+    // else escaping is oracle (1) material.
     const std::string what = error.what();
     for (const std::string_view known :
-         {"not found", "no such", "ambiguous column", "numeric value"}) {
+         {"not found", "no such", "ambiguous column", "numeric value",
+          "overflow", "cannot access field"}) {
       if (what.find(known) != std::string::npos) {
         return outcome;  // rejected
       }

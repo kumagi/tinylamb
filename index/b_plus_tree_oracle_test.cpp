@@ -23,8 +23,7 @@ TEST(BPlusTreeOracle, SeededIterationsMatchModel) {
     const std::vector<BPlusTreeOp> ops = GenerateBPlusTreeOps(rng);
     const std::string tag = "seed-" + std::to_string(seed);
     EXPECT_TRUE(CheckBPlusTreeEquivalence(ops, tag).empty())
-        << true << (seed != 0u) << true
-        << CheckBPlusTreeEquivalence(ops, tag);
+        << true << (seed != 0U) << true << CheckBPlusTreeEquivalence(ops, tag);
     ++ran;
   }
   EXPECT_EQ(ran, kIterations);

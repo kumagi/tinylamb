@@ -1111,13 +1111,30 @@ StatusOr<Relation> FinishQuery(TransactionContext& context,
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);
       input.FinishSpill();
+      // EXC-SHIM replacement (Phase 7, no-exception-rule-migration.md): the
+      // per-row evaluation must not use the throwing Evaluate wrapper.  An
+      // unresolvable qualified reference inside a subquery predicate
+      // (sql_oracle_fuzz find: `WHERE EXISTS (... d.parent ...)` over a
+      // 1-column subquery) came back as a Status from TryEvaluate, and the
+      // shim re-raised it as a C++ exception that escaped the whole
+      // executor boundary instead of surfacing through GetStatus.
+      Status filter_error{Status::kSuccess};
       RETURN_IF_FAIL(input.ForEachRow([&](const Row& row) {
+        if (filter_error != Status::kSuccess) {
+          return;
+        }
         Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
-        if (Truthy(Evaluate(statement.WhereClause(), scope, nullptr, context,
-                            ctes))) {
+        StatusOr<Value> keep =
+            TryEvaluate(statement.WhereClause(), scope, nullptr, context, ctes);
+        if (!keep.HasValue()) {
+          filter_error = keep.GetStatus();
+          return;
+        }
+        if (Truthy(keep.Value())) {
           filtered.AddRow(row);
         }
       }));
+      RETURN_IF_FAIL(filter_error);
       filtered.FinishSpill();
       input = std::move(filtered);
     }
@@ -2641,6 +2658,29 @@ class GroupedFinishExecutor final : public ExecutorBase {
   bool initialized_{false};
 };
 
+// Registers `runtime` in the context for the duration of one query
+// execution and restores the previous pointer on every exit, including the
+// exception unwind: some statement paths (legacy ResultType resolution)
+// still throw through here, and a skipped restore would leave a dangling
+// ExecutionRuntime* in the context for the next query on the same
+// transaction (heap-use-after-free at the next aggregation).
+class ScopedExecutionRuntime {
+ public:
+  ScopedExecutionRuntime(TransactionContext& context, ExecutionRuntime& runtime)
+      : context_(context), previous_(context.execution_runtime()) {
+    context_.set_execution_runtime(&runtime);
+  }
+  ScopedExecutionRuntime(const ScopedExecutionRuntime&) = delete;
+  ScopedExecutionRuntime& operator=(const ScopedExecutionRuntime&) = delete;
+  ScopedExecutionRuntime(ScopedExecutionRuntime&&) = delete;
+  ScopedExecutionRuntime& operator=(ScopedExecutionRuntime&&) = delete;
+  ~ScopedExecutionRuntime() { context_.set_execution_runtime(previous_); }
+
+ private:
+  TransactionContext& context_;
+  ExecutionRuntime* previous_;
+};
+
 }  // namespace
 
 Executor EmitGroupedFinishExecutor(
@@ -2668,11 +2708,9 @@ Status RelationalExecutor::Initialize() {
       runtime.reusable_base_relations.insert(table);
     }
   }
-  ExecutionRuntime* previous_runtime = context_->execution_runtime();
-  context_->set_execution_runtime(&runtime);
+  const ScopedExecutionRuntime runtime_guard(*context_, runtime);
   StatusOr<Relation> executed =
       ExecuteQuery(*context_, *statement_, nullptr, {});
-  context_->set_execution_runtime(previous_runtime);
   RETURN_IF_FAIL(executed.GetStatus());
   Relation result = executed.MoveValue();
   RETURN_IF_FAIL(result.FinishSpill());
@@ -2743,7 +2781,15 @@ Status RelationalExecutor::Initialize() {
   return Status::kSuccess;
 }
 
-RelationalExecutor::~RelationalExecutor() = default;
+RelationalExecutor::~RelationalExecutor() {
+  // A statement path that threw through Initialize() can leave the context
+  // pointing at this executor's runtime; drop that stale pointer before the
+  // unique_ptr frees the object, so the next query on the same context reads
+  // nullptr instead of freed memory.
+  if (context_->execution_runtime() == runtime_keep_.get()) {
+    context_->set_execution_runtime(nullptr);
+  }
+}
 
 bool RelationalExecutor::Next(Row* destination, RowPosition* position) {
   if (!initialized_) {

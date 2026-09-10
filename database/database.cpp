@@ -155,7 +155,7 @@ uint64_t PeekUint64(std::string_view payload) {
 
 Status UpsertStatistics(BPlusTree& tree, Transaction& txn, std::string_view key,
                         std::string_view value) {
-  const Status updated = tree.Update(txn, key, value);
+  Status updated = tree.Update(txn, key, value);
   if (updated == Status::kNotExists) {
     return tree.Insert(txn, key, value);
   }
@@ -551,6 +551,9 @@ void Database::DeleteAll() {
   std::ignore = std::remove(storage_->DBName().c_str());
   std::ignore = std::remove(storage_->LogName().c_str());
   std::ignore = std::remove(storage_->MasterRecordName().c_str());
+  // A failed WriteMasterRecord used to strand its temp file; sweep it here
+  // so repeated DeleteAll/Create cycles don't accumulate strays.
+  std::ignore = std::remove((storage_->MasterRecordName() + ".tmp").c_str());
 }
 
 }  // namespace tinylamb

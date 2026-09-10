@@ -41,7 +41,7 @@ waiting on an outer one.
 "lock-order-inversion" cycles that pair the PagePool **pool latch (M0)** with a
 **per-page latch (M1)**:
 
-1. `MetaPage::AllocateNewPage` (`meta_page.cpp:34`) is invoked by
+1. `MetaPage::AllocateNewPage` (`meta_page.cpp:36`) is invoked by
    `PageManager::AllocateNewPage` while the CALLER holds the **meta page's own
    per-page latch (M1)**; inside, `pool.GetPage(new_page_id)` installs a fresh
    entry under the **pool latch (M0)** and constructs the new `PageRef`, whose
