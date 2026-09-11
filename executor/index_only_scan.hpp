@@ -64,6 +64,7 @@ class IndexOnlyScan : public ExecutorBase {
   Schema key_schema_;
   Schema value_schema_;
   Schema output_schema_;
+  std::vector<slot_t> include_offsets_;
   bool ascending_{true};
 };
 

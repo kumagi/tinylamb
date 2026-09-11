@@ -57,6 +57,14 @@ StatusOr<Value> TryEvaluateUnary(UnaryOperation operation, const Value& child) {
         return Value(-child.value.double_value);
       }
       if (child.type == ValueType::kInt64) {
+        if (child.IsUnsigned()) {
+          const auto u = static_cast<uint64_t>(child.value.int_value);
+          if (u == 0) {
+            return child;
+          }
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in unary minus");
+        }
         if (child.value.int_value == std::numeric_limits<int64_t>::min()) {
           return StatusError(StatusCode::kIsInfinity,
                              "integer overflow in unary minus");
@@ -65,6 +73,17 @@ StatusOr<Value> TryEvaluateUnary(UnaryOperation operation, const Value& child) {
       }
       return StatusError(StatusCode::kInvalidArgument,
                          "unary minus requires a number");
+    case UnaryOperation::kBitwiseNot:
+      if (child.IsNull()) {
+        return Value();
+      }
+      if (child.type == ValueType::kInt64) {
+        Value res(
+            static_cast<int64_t>(~static_cast<uint64_t>(child.value.int_value)));
+        return child.IsUnsigned() ? res.WithUnsigned() : res;
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "bitwise not requires an integer");
   }
   return StatusError(StatusCode::kRuntimeError, "invalid unary operation");
 }
@@ -132,7 +151,8 @@ Type UnaryExpression::ResultType(const Schema& left,
 }
 
 std::string UnaryExpression::ToString() const {
-  if (operation_ == UnaryOperation::kMinus) {
+  if (operation_ == UnaryOperation::kMinus ||
+      operation_ == UnaryOperation::kBitwiseNot) {
     return "(" + ::tinylamb::ToString(operation_) + child_->ToString() + ")";
   }
   return "(" + ::tinylamb::ToString(operation_) + " " + child_->ToString() +
@@ -140,7 +160,8 @@ std::string UnaryExpression::ToString() const {
 }
 
 void UnaryExpression::Dump(std::ostream& o) const {
-  if (operation_ == UnaryOperation::kMinus) {
+  if (operation_ == UnaryOperation::kMinus ||
+      operation_ == UnaryOperation::kBitwiseNot) {
     o << "(" << ::tinylamb::ToString(operation_) << *child_ << ")";
   } else {
     o << "(" << ::tinylamb::ToString(operation_) << " " << *child_ << ")";

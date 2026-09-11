@@ -209,6 +209,19 @@ TEST(ValueTest, EncodeMemcomparableFormat_WithIntValues_PreservesTotalOrder) {
 }
 
 TEST(ValueTest,
+     EncodeMemcomparableFormat_WithUint64Values_PreservesTotalOrder) {
+  std::vector<Value> values = {
+      Value(int64_t{0}).WithUnsigned(),
+      Value(int64_t{1}).WithUnsigned(),
+      Value(int64_t{10}).WithUnsigned(),
+      Value(std::numeric_limits<int64_t>::max()).WithUnsigned(),
+      Value(static_cast<int64_t>(1ULL << 63)).WithUnsigned(),
+      Value(static_cast<int64_t>(std::numeric_limits<uint64_t>::max()))
+          .WithUnsigned()};
+  MemcomparableFormatEncodeTest(values);
+}
+
+TEST(ValueTest,
      EncodeMemcomparableFormat_WithDoubleValues_PreservesOrderAndSignFlag) {
   // Fixed: the sign flag used to be written via `be |= 0x80`, which only
   // landed on the first image byte on little-endian hosts.  The flag byte is
@@ -369,6 +382,28 @@ TEST(ValueTest, MemcomparableFormat_WithInt64Values_RoundTripsAccurately) {
   EncodeDecodeTest(v_min);
 }
 
+TEST(ValueTest, MemcomparableFormat_WithUint64Values_RoundTripsAccurately) {
+  Value u_0 = Value(int64_t{0}).WithUnsigned();
+  Value u_1 = Value(int64_t{1}).WithUnsigned();
+  Value u_12 = Value(int64_t{12}).WithUnsigned();
+  Value u_mid = Value(static_cast<int64_t>(1ULL << 63)).WithUnsigned();
+  Value u_max =
+      Value(static_cast<int64_t>(std::numeric_limits<uint64_t>::max()))
+          .WithUnsigned();
+
+  EncodeDecodeTest(u_0);
+  EncodeDecodeTest(u_1);
+  EncodeDecodeTest(u_12);
+  EncodeDecodeTest(u_mid);
+  EncodeDecodeTest(u_max);
+
+  std::string enc = u_max.EncodeMemcomparableFormat();
+  Value decoded;
+  decoded.DecodeMemcomparableFormat(enc);
+  EXPECT_TRUE(decoded.IsUnsigned());
+  EXPECT_EQ(decoded, u_max);
+}
+
 TEST(ValueTest, MemcomparableFormat_WithVarcharValues_RoundTripsAccurately) {
   Value v_a("a");
   Value v_empty("");
@@ -492,12 +527,13 @@ TEST(ValueTest, ToString_UnaryAndAggregationEnums_FormatsExpectedStrings) {
 
   unary << UnaryOperation::kIsNull << "|" << UnaryOperation::kIsNotNull << "|"
         << UnaryOperation::kNot << "|" << UnaryOperation::kMinus << "|"
+        << UnaryOperation::kBitwiseNot << "|"
         << invalid_unary;
   agg << AggregationType::kCount << "|" << AggregationType::kSum << "|"
       << AggregationType::kAvg << "|" << AggregationType::kMin << "|"
       << AggregationType::kMax << "|" << invalid_agg;
 
-  EXPECT_EQ(unary.str(), "IS NULL|IS NOT NULL|NOT|-|UNKNOWN");
+  EXPECT_EQ(unary.str(), "IS NULL|IS NOT NULL|NOT|-|~|UNKNOWN");
   EXPECT_EQ(agg.str(), "COUNT|SUM|AVG|MIN|MAX|UNKNOWN");
 }
 
@@ -1275,6 +1311,145 @@ TEST(ValueTest,
   EXPECT_FALSE(iv1 > iv2);
   EXPECT_TRUE(s1 < s2 || s2 < s1);
   EXPECT_TRUE(s1 > s2 || s2 > s1);
+}
+
+TEST(ValueTest, UnsignedInt64_ComparisonAndOrdering) {
+  const Value u0 = Value(0ULL).WithUnsigned();
+  const Value u10 = Value(10ULL).WithUnsigned();
+  const Value umax =
+      Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
+
+  const Value s_neg = Value(-1);
+  const Value s_0 = Value(0);
+  const Value s_10 = Value(10);
+  const Value s_max = Value(std::numeric_limits<int64_t>::max());
+
+  // Unsigned vs Unsigned
+  EXPECT_TRUE(u0 < u10);
+  EXPECT_FALSE(u10 < u0);
+  EXPECT_TRUE(u10 < umax);
+  EXPECT_FALSE(umax < u10);
+  EXPECT_TRUE(u0 < umax);
+  EXPECT_FALSE(umax < u0);
+
+  EXPECT_TRUE(umax > u10);
+  EXPECT_TRUE(u10 > u0);
+  EXPECT_FALSE(u0 > umax);
+
+  EXPECT_TRUE(u10 <= u10);
+  EXPECT_TRUE(u10 >= u10);
+  EXPECT_TRUE(u10 == u10);
+  EXPECT_TRUE(umax == umax);
+  EXPECT_FALSE(u10 == umax);
+  EXPECT_TRUE(u10 != umax);
+
+  EXPECT_EQ(CompareForOrderBy(u0, umax), -1);
+  EXPECT_EQ(CompareForOrderBy(umax, u0), 1);
+  EXPECT_EQ(CompareForOrderBy(u10, umax), -1);
+  EXPECT_EQ(CompareForOrderBy(umax, u10), 1);
+  EXPECT_EQ(CompareForOrderBy(umax, umax), 0);
+  EXPECT_EQ(CompareForOrderBy(u0, u0), 0);
+
+  // Signed vs Unsigned (mixed signedness)
+  EXPECT_TRUE(s_neg < u0);
+  EXPECT_FALSE(u0 < s_neg);
+  EXPECT_TRUE(s_neg < u10);
+  EXPECT_FALSE(u10 < s_neg);
+  EXPECT_TRUE(s_neg < umax);
+  EXPECT_FALSE(umax < s_neg);
+
+  EXPECT_FALSE(s_neg == umax);
+  EXPECT_FALSE(umax == s_neg);
+  EXPECT_TRUE(s_neg != umax);
+  EXPECT_TRUE(s_10 == u10);
+  EXPECT_TRUE(u10 == s_10);
+  EXPECT_TRUE(s_0 == u0);
+
+  EXPECT_TRUE(s_10 < umax);
+  EXPECT_TRUE(umax > s_10);
+  EXPECT_TRUE(s_max < umax);
+  EXPECT_TRUE(umax > s_max);
+
+  EXPECT_EQ(CompareForOrderBy(s_neg, u0), -1);
+  EXPECT_EQ(CompareForOrderBy(u0, s_neg), 1);
+  EXPECT_EQ(CompareForOrderBy(s_neg, umax), -1);
+  EXPECT_EQ(CompareForOrderBy(umax, s_neg), 1);
+  EXPECT_EQ(CompareForOrderBy(s_10, u10), 0);
+  EXPECT_EQ(CompareForOrderBy(u10, s_10), 0);
+  EXPECT_EQ(CompareForOrderBy(s_max, umax), -1);
+  EXPECT_EQ(CompareForOrderBy(umax, s_max), 1);
+}
+
+TEST(ValueTest, UnsignedInt64_ArithmeticAndStringConversion) {
+  const Value u0 = Value(int64_t{0}).WithUnsigned();
+  const Value u10 = Value(int64_t{10}).WithUnsigned();
+  const Value umax =
+      Value(static_cast<int64_t>(std::numeric_limits<uint64_t>::max()))
+          .WithUnsigned();
+  const Value u_half = Value(static_cast<int64_t>(1ULL << 63)).WithUnsigned();
+
+  // AsString
+  EXPECT_EQ(umax.AsString(), "18446744073709551615");
+  EXPECT_EQ(u0.AsString(), "0");
+  EXPECT_EQ(u10.AsString(), "10");
+
+  // Addition
+  auto add_res = (umax - u10) + u10;
+  ASSERT_TRUE(add_res.IsUnsigned());
+  EXPECT_EQ(add_res, umax);
+
+  auto add_overflow = umax.TryArithmetic(Value(int64_t{1}).WithUnsigned(),
+                                         BinaryOperation::kAdd);
+  EXPECT_FALSE(add_overflow.HasValue());
+
+  // Subtraction
+  auto sub_res = umax - u10;
+  ASSERT_TRUE(sub_res.IsUnsigned());
+  EXPECT_EQ(sub_res + u10, umax);
+
+  auto sub_overflow = u0.TryArithmetic(Value(int64_t{1}).WithUnsigned(),
+                                       BinaryOperation::kSubtract);
+  EXPECT_FALSE(sub_overflow.HasValue());
+
+  // Multiplication
+  auto mul_res = u_half.TryArithmetic(Value(int64_t{1}).WithUnsigned(),
+                                      BinaryOperation::kMultiply);
+  ASSERT_TRUE(mul_res.HasValue());
+  EXPECT_EQ(mul_res.Value(), u_half);
+
+  auto mul_overflow = umax.TryArithmetic(Value(int64_t{2}).WithUnsigned(),
+                                         BinaryOperation::kMultiply);
+  EXPECT_FALSE(mul_overflow.HasValue());
+
+  // Division
+  auto div_res = umax / Value(int64_t{2}).WithUnsigned();
+  ASSERT_TRUE(div_res.IsUnsigned());
+  EXPECT_EQ(static_cast<uint64_t>(div_res.value.int_value),
+            9223372036854775807ULL);
+
+  auto div_zero = umax.TryArithmetic(u0, BinaryOperation::kDivide);
+  EXPECT_FALSE(div_zero.HasValue());
+
+  // Modulo
+  auto mod_res = umax % u10;
+  ASSERT_TRUE(mod_res.IsUnsigned());
+  EXPECT_EQ(static_cast<uint64_t>(mod_res.value.int_value), 5ULL);
+
+  auto mod_zero = umax.TryArithmetic(u0, BinaryOperation::kModulo);
+  EXPECT_FALSE(mod_zero.HasValue());
+
+  // Bitwise
+  auto and_res = umax & u10;
+  EXPECT_TRUE(and_res.IsUnsigned());
+  EXPECT_EQ(and_res, u10);
+
+  auto or_res = u0 | u10;
+  EXPECT_TRUE(or_res.IsUnsigned());
+  EXPECT_EQ(or_res, u10);
+
+  auto xor_res = umax ^ u10;
+  EXPECT_TRUE(xor_res.IsUnsigned());
+  EXPECT_EQ(xor_res ^ u10, umax);
 }
 
 }  // namespace tinylamb

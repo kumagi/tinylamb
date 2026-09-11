@@ -69,6 +69,7 @@ AggregationExecutor::AggregationExecutor(
       if (offset >= 0 &&
           input_schema_.GetColumn(static_cast<size_t>(offset)).Type() ==
               ValueType::kInt64 &&
+          !input_schema_.GetColumn(static_cast<size_t>(offset)).IsUnsigned() &&
           BytecodeEnabled() &&
           aggregate.Child()->AsColumnValue().GetColumnName().name.find(
               "uint64") == std::string::npos) {
@@ -267,21 +268,41 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
           break;
         case AggregationType::kSum:
           if (constant.type == ValueType::kInt64) {
-            int64_t scaled = 0;
-            if (__builtin_mul_overflow(static_cast<int64_t>(rows),
-                                       constant.value.int_value, &scaled)) {
-              return FailWith(StatusError(StatusCode::kIsInfinity,
-
-                                          "integer overflow on '+'"));
+            if (constant.IsUnsigned()) {
+              uint64_t scaled = 0;
+              if (__builtin_mul_overflow(
+                      static_cast<uint64_t>(rows),
+                      static_cast<uint64_t>(constant.value.int_value),
+                      &scaled)) {
+                return FailWith(StatusError(StatusCode::kIsInfinity,
+                                            "uint64 overflow in SUM"));
+              }
+              const uint64_t prior =
+                  (*results)[i].IsNull()
+                      ? 0
+                      : static_cast<uint64_t>((*results)[i].value.int_value);
+              uint64_t next = 0;
+              if (__builtin_add_overflow(prior, scaled, &next)) {
+                return FailWith(StatusError(StatusCode::kIsInfinity,
+                                            "uint64 overflow in SUM"));
+              }
+              (*results)[i] = Value(static_cast<int64_t>(next)).WithUnsigned();
+            } else {
+              int64_t scaled = 0;
+              if (__builtin_mul_overflow(static_cast<int64_t>(rows),
+                                         constant.value.int_value, &scaled)) {
+                return FailWith(StatusError(StatusCode::kIsInfinity,
+                                            "integer overflow on '+'"));
+              }
+              StatusOr<int64_t> acc =
+                  (*results)[i].IsNull()
+                      ? CheckedAdd(0, scaled)
+                      : CheckedAdd((*results)[i].value.int_value, scaled);
+              if (!acc.HasValue()) {
+                return FailWith(acc.GetStatus());
+              }
+              (*results)[i] = Value(acc.MoveValue());
             }
-            StatusOr<int64_t> acc =
-                (*results)[i].IsNull()
-                    ? CheckedAdd(0, scaled)
-                    : CheckedAdd((*results)[i].value.int_value, scaled);
-            if (!acc.HasValue()) {
-              return FailWith(acc.GetStatus());
-            }
-            (*results)[i] = Value(acc.MoveValue());
           } else {
             (*results)[i] = Value(
                 ((*results)[i].IsNull() ? 0.0
@@ -293,7 +314,10 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
           (*results)[i].value.double_value +=
               static_cast<double>(rows) *
               (constant.type == ValueType::kInt64
-                   ? static_cast<double>(constant.value.int_value)
+                   ? (constant.IsUnsigned()
+                          ? static_cast<double>(
+                                static_cast<uint64_t>(constant.value.int_value))
+                          : static_cast<double>(constant.value.int_value))
                    : constant.value.double_value);
           (*counts)[i] += static_cast<int64_t>(rows);
           break;
@@ -335,6 +359,7 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
                                    return static_cast<char>(std::tolower(c));
                                  });
           const bool is_uint64 =
+              column.IsUnsigned() ||
               column_name.find("uint64") != std::string::npos;
           if (is_uint64) {
             uint64_t batch_sum = 0;
@@ -346,7 +371,6 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
               const auto value = static_cast<uint64_t>(integers[row]);
               if (batch_sum > std::numeric_limits<uint64_t>::max() - value) {
                 return FailWith(StatusError(StatusCode::kIsInfinity,
-
                                             "uint64 overflow in SUM"));
               }
               batch_sum += value;
@@ -361,11 +385,11 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
                                : static_cast<uint64_t>(total.value.int_value);
             if (prior > std::numeric_limits<uint64_t>::max() - batch_sum) {
               return FailWith(StatusError(StatusCode::kIsInfinity,
-
                                           "uint64 overflow in SUM"));
             }
             total = Value(
-                static_cast<int64_t>(static_cast<uint64_t>(prior + batch_sum)));
+                static_cast<int64_t>(static_cast<uint64_t>(prior + batch_sum)))
+                .WithUnsigned();
             break;
           }
           int64_t batch_sum = 0;
@@ -432,7 +456,12 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
           if (column.IsNull(row)) {
             continue;
           }
-          total += is_int ? static_cast<double>(integers[row]) : doubles[row];
+          total += is_int
+                       ? (column.IsUnsigned()
+                              ? static_cast<double>(
+                                    static_cast<uint64_t>(integers[row]))
+                              : static_cast<double>(integers[row]))
+                       : doubles[row];
           ++(*counts)[i];
         }
         break;
@@ -445,8 +474,16 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
           }
           if (is_int) {
             const int64_t candidate = integers[row];
-            if (best.IsNull() || candidate < best.value.int_value) {
-              best = Value(candidate);
+            if (column.IsUnsigned()) {
+              if (best.IsNull() ||
+                  static_cast<uint64_t>(candidate) <
+                      static_cast<uint64_t>(best.value.int_value)) {
+                best = Value(candidate).WithUnsigned();
+              }
+            } else {
+              if (best.IsNull() || candidate < best.value.int_value) {
+                best = Value(candidate);
+              }
             }
           } else {
             const double candidate = doubles[row];
@@ -472,8 +509,16 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
           }
           if (is_int) {
             const int64_t candidate = integers[row];
-            if (best.IsNull() || best.value.int_value < candidate) {
-              best = Value(candidate);
+            if (column.IsUnsigned()) {
+              if (best.IsNull() ||
+                  static_cast<uint64_t>(best.value.int_value) <
+                      static_cast<uint64_t>(candidate)) {
+                best = Value(candidate).WithUnsigned();
+              }
+            } else {
+              if (best.IsNull() || best.value.int_value < candidate) {
+                best = Value(candidate);
+              }
             }
           } else {
             const double candidate = doubles[row];
@@ -492,10 +537,15 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
         const Value batch_val = column.AggregateBitAnd();
         if (!batch_val.IsNull()) {
           if ((*results)[i].IsNull()) {
-            (*results)[i] = batch_val;
+            (*results)[i] =
+                column.IsUnsigned() ? batch_val.WithUnsigned() : batch_val;
           } else {
-            (*results)[i] = Value(static_cast<int64_t>(
+            Value res = Value(static_cast<int64_t>(
                 (*results)[i].value.int_value & batch_val.value.int_value));
+            if (column.IsUnsigned()) {
+              res = res.WithUnsigned();
+            }
+            (*results)[i] = res;
           }
         }
         break;
@@ -504,10 +554,15 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
         const Value batch_val = column.AggregateBitOr();
         if (!batch_val.IsNull()) {
           if ((*results)[i].IsNull()) {
-            (*results)[i] = batch_val;
+            (*results)[i] =
+                column.IsUnsigned() ? batch_val.WithUnsigned() : batch_val;
           } else {
-            (*results)[i] = Value(static_cast<int64_t>(
+            Value res = Value(static_cast<int64_t>(
                 (*results)[i].value.int_value | batch_val.value.int_value));
+            if (column.IsUnsigned()) {
+              res = res.WithUnsigned();
+            }
+            (*results)[i] = res;
           }
         }
         break;
@@ -516,10 +571,15 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
         const Value batch_val = column.AggregateBitXor();
         if (!batch_val.IsNull()) {
           if ((*results)[i].IsNull()) {
-            (*results)[i] = batch_val;
+            (*results)[i] =
+                column.IsUnsigned() ? batch_val.WithUnsigned() : batch_val;
           } else {
-            (*results)[i] = Value(static_cast<int64_t>(
+            Value res = Value(static_cast<int64_t>(
                 (*results)[i].value.int_value ^ batch_val.value.int_value));
+            if (column.IsUnsigned()) {
+              res = res.WithUnsigned();
+            }
+            (*results)[i] = res;
           }
         }
         break;
@@ -791,7 +851,10 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             results[i].value.double_value +=
                 val.type == ValueType::kDouble
                     ? val.value.double_value
-                    : static_cast<double>(val.value.int_value);
+                    : (val.IsUnsigned()
+                           ? static_cast<double>(
+                                 static_cast<uint64_t>(val.value.int_value))
+                           : static_cast<double>(val.value.int_value));
             ++counts[i];
             break;
           case AggregationType::kMin:
@@ -839,13 +902,23 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             const int64_t v = val.value.int_value;
             int64_t& cur = results[i].value.int_value;
             if (results[i].IsNull()) {
-              results[i] = Value(v);
+              results[i] =
+                  val.IsUnsigned() ? Value(v).WithUnsigned() : Value(v);
             } else if (agg.GetType() == AggregationType::kBitAnd) {
               cur &= v;
+              if (val.IsUnsigned()) {
+                results[i] = results[i].WithUnsigned();
+              }
             } else if (agg.GetType() == AggregationType::kBitOr) {
               cur |= v;
+              if (val.IsUnsigned()) {
+                results[i] = results[i].WithUnsigned();
+              }
             } else {
               cur ^= v;
+              if (val.IsUnsigned()) {
+                results[i] = results[i].WithUnsigned();
+              }
             }
             break;
           }

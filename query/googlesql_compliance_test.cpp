@@ -514,6 +514,20 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   auto context = std::make_unique<TransactionContext>(database->BeginContext());
   auto engine = std::make_unique<SqlEngine>(*database);
 
+  struct DatabaseCleaner {
+    std::unique_ptr<SqlEngine>& engine;
+    std::unique_ptr<TransactionContext>& context;
+    std::unique_ptr<Database>& database;
+    ~DatabaseCleaner() {
+      engine.reset();
+      context.reset();
+      if (database != nullptr) {
+        database->DeleteAll();
+        database.reset();
+      }
+    }
+  } cleaner{engine, context, database};
+
   // Files whose cases mutate tables get per-case isolation: each case runs
   // against a freshly created database with the prepared state replayed,
   // mirroring the reference driver's per-case test database. A distinct
@@ -694,7 +708,7 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       }
     }
   }
-  database->DeleteAll();
+  // database->DeleteAll() handled by cleaner RAII
 }
 
 namespace {

@@ -87,6 +87,18 @@ Database::Database(std::string_view /*dbname*/,
       functions_(kDefaultFunctionRoot),
       storage_(std::move(storage)) {}
 
+uint64_t Database::CacheHits() const noexcept {
+  return storage_ && storage_->pm_ ? storage_->pm_->CacheHits() : 0;
+}
+
+uint64_t Database::CacheMisses() const noexcept {
+  return storage_ && storage_->pm_ ? storage_->pm_->CacheMisses() : 0;
+}
+
+size_t Database::PinnedPageCount() const noexcept {
+  return storage_ && storage_->pm_ ? storage_->pm_->PinnedPageCount() : 0;
+}
+
 std::ostream& operator<<(std::ostream& o, const Database& db) {
   o << "Database(storage=" << *db.storage_
     << ", catalogs=<BPlusTree; use DebugDump(txn, o) for details>)";
@@ -548,9 +560,15 @@ void Database::EmulateCrash() { storage_->DiscardAllUpdates(); }
 
 void Database::DeleteAll() {
   EmulateCrash();
-  std::ignore = std::remove(storage_->DBName().c_str());
-  std::ignore = std::remove(storage_->LogName().c_str());
-  std::ignore = std::remove(storage_->MasterRecordName().c_str());
+  if (storage_ != nullptr) {
+    const std::string db_name = storage_->DBName();
+    const std::string log_name = storage_->LogName();
+    const std::string master_name = storage_->MasterRecordName();
+    storage_.reset();
+    std::ignore = std::remove(db_name.c_str());
+    std::ignore = std::remove(log_name.c_str());
+    std::ignore = std::remove(master_name.c_str());
+  }
 }
 
 }  // namespace tinylamb

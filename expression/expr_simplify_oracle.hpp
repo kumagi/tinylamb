@@ -30,6 +30,9 @@ struct ExprGenConfig {
   int max_depth = 4;
   // Probability (0-100) that a leaf is a typed NULL.
   int null_percent = 15;
+  // If true, generate extended operations (bitwise, string functions, IS DISTINCT FROM).
+  // Kept false by default to preserve deterministic RNG replay of pinned test cases.
+  bool extended_ops = false;
 };
 
 struct GeneratedExpr {

@@ -108,13 +108,14 @@ Value MakeFloatLeaf(Gen& g) {
   }
 }
 
-std::string MakeStringLeaf(Gen& g) {
-  // Small alphabet plus LIKE metacharacters so prefix-range rewrites fire.
-  static constexpr std::string_view kAlphabet = "ab%_";
+std::string MakeStringLeaf(Gen& g, bool extended) {
+  // Small alphabet plus LIKE metacharacters; space added in extended mode for trim rewrites.
+  static constexpr std::string_view kAlphabet = "ab%_ ";
   const int len = g.Pick(0, 3);
   std::string s;
+  const int max_char_idx = extended ? 4 : 3;
   for (int i = 0; i < len; ++i) {
-    s.push_back(kAlphabet[static_cast<size_t>(g.Pick(0, 3))]);
+    s.push_back(kAlphabet[static_cast<size_t>(g.Pick(0, max_char_idx))]);
   }
   return s;
 }
@@ -131,7 +132,7 @@ TypedExpr GenLeaf(Gen& g, GenType type, const ExprGenConfig& config) {
     case GenType::kBool:
       return {.expr = ConstantValueExp(Value(g.Chance(50))), .type = type};
     case GenType::kString: {
-      std::string s = MakeStringLeaf(g);
+      std::string s = MakeStringLeaf(g, config.extended_ops);
       return {.expr = ConstantValueExp(Value(std::move(s))), .type = type};
     }
   }
@@ -175,7 +176,8 @@ TypedExpr GenNumeric(Gen& g, int depth, const ExprGenConfig& config) {
                                                  std::move(right.expr)),
                      .type = result};
   };
-  switch (g.Pick(0, 9)) {
+  const int choice_limit = config.extended_ops ? 19 : 9;
+  switch (g.Pick(0, choice_limit)) {
     case 0:
       return binary(BinaryOperation::kAdd);
     case 1:
@@ -201,29 +203,64 @@ TypedExpr GenNumeric(Gen& g, int depth, const ExprGenConfig& config) {
               .type = result};
     }
     case 6: {
-      // GREATEST/LEAST over a homogeneous numeric list.
-      GenType elem = g.Chance(50) ? GenType::kInt : GenType::kFloat;
+      if (!config.extended_ops) {
+        // GREATEST/LEAST over a homogeneous numeric list.
+        GenType elem = g.Chance(50) ? GenType::kInt : GenType::kFloat;
+        std::vector<Expression> args;
+        const int count = g.Pick(2, 3);
+        args.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) {
+          args.push_back(GenTyped(g, elem, depth - 1, config).expr);
+        }
+        return {.expr = FunctionCallExp(g.Chance(50) ? "greatest" : "least",
+                                        std::move(args)),
+                .type = elem};
+      }
+      // GREATEST/LEAST over numeric arguments (supports mixed int/float).
       std::vector<Expression> args;
       const int count = g.Pick(2, 3);
       args.reserve(static_cast<size_t>(count));
+      GenType result_type = GenType::kInt;
       for (int i = 0; i < count; ++i) {
-        args.push_back(GenTyped(g, elem, depth - 1, config).expr);
+        GenType arg_type = g.Chance(50) ? GenType::kInt : GenType::kFloat;
+        if (arg_type == GenType::kFloat) {
+          result_type = GenType::kFloat;
+        }
+        args.push_back(GenTyped(g, arg_type, depth - 1, config).expr);
       }
       return {.expr = FunctionCallExp(g.Chance(50) ? "greatest" : "least",
                                       std::move(args)),
-              .type = elem};
+              .type = result_type};
     }
     case 7: {
       TypedExpr child = GenTyped(
           g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
       GenType result = child.type;
       return {.expr = UnaryExpressionExp(std::move(child.expr),
-                                         UnaryOperation::kMinus),
+                                          UnaryOperation::kMinus),
               .type = result};
     }
     case 8: {
-      GenType elem = g.Chance(50) ? GenType::kInt : GenType::kFloat;
+      if (!config.extended_ops) {
+        GenType elem = g.Chance(50) ? GenType::kInt : GenType::kFloat;
+        if (g.Chance(50)) {
+          std::vector<Expression> args;
+          const int count = g.Pick(2, 3);
+          args.reserve(static_cast<size_t>(count));
+          for (int i = 0; i < count; ++i) {
+            args.push_back(GenTyped(g, elem, depth - 1, config).expr);
+          }
+          return {.expr = FunctionCallExp("coalesce", std::move(args)),
+                  .type = elem};
+        }
+        // NULLIF takes exactly 2 arguments.
+        return {.expr = FunctionCallExp(
+                    "nullif", {GenTyped(g, elem, depth - 1, config).expr,
+                               GenTyped(g, elem, depth - 1, config).expr}),
+                .type = elem};
+      }
       if (g.Chance(50)) {
+        GenType elem = g.Chance(50) ? GenType::kInt : GenType::kFloat;
         std::vector<Expression> args;
         const int count = g.Pick(2, 3);
         args.reserve(static_cast<size_t>(count));
@@ -233,13 +270,147 @@ TypedExpr GenNumeric(Gen& g, int depth, const ExprGenConfig& config) {
         return {.expr = FunctionCallExp("coalesce", std::move(args)),
                 .type = elem};
       }
-      // NULLIF takes exactly 2 arguments.
+      // NULLIF takes 2 arguments and returns the type of the first argument.
+      TypedExpr left = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      TypedExpr right = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      GenType result_type = left.type;
       return {.expr = FunctionCallExp(
-                  "nullif", {GenTyped(g, elem, depth - 1, config).expr,
-                             GenTyped(g, elem, depth - 1, config).expr}),
-              .type = elem};
+                  "nullif", {std::move(left.expr), std::move(right.expr)}),
+              .type = result_type};
     }
-    default: {
+    case 9: {
+      if (!config.extended_ops) {
+        GenType from = g.Chance(50) ? GenType::kInt : GenType::kFloat;
+        TypedExpr child = GenTyped(g, from, depth - 1, config);
+        GenType to = (from == GenType::kInt) ? GenType::kFloat : GenType::kInt;
+        return {
+            .expr = CastExpressionExp(std::move(child.expr),
+                                      to == GenType::kInt ? "INT64" : "FLOAT64"),
+            .type = to};
+      }
+      // Bitwise ops: __bit_and, __bit_or, __bit_xor
+      static constexpr std::array<const char*, 3> kBitOps = {
+          "__bit_and", "__bit_or", "__bit_xor"};
+      const char* fn = kBitOps[static_cast<size_t>(g.Pick(0, 2))];
+      TypedExpr left = GenTyped(g, GenType::kInt, depth - 1, config);
+      if (left.type != GenType::kInt) {
+        left = {.expr = CastExpressionExp(std::move(left.expr), "INT64"),
+                .type = GenType::kInt};
+      }
+      TypedExpr right = GenTyped(g, GenType::kInt, depth - 1, config);
+      if (right.type != GenType::kInt) {
+        right = {.expr = CastExpressionExp(std::move(right.expr), "INT64"),
+                 .type = GenType::kInt};
+      }
+      return {.expr = FunctionCallExp(
+                  fn, {std::move(left.expr), std::move(right.expr)}),
+              .type = GenType::kInt};
+    }
+    case 10: {
+      // Bit shifts: __shift_left, __shift_right with safe shift amount (0..63)
+      const char* fn = g.Chance(50) ? "__shift_left" : "__shift_right";
+      TypedExpr left = GenTyped(g, GenType::kInt, depth - 1, config);
+      if (left.type != GenType::kInt) {
+        left = {.expr = CastExpressionExp(std::move(left.expr), "INT64"),
+                .type = GenType::kInt};
+      }
+      Expression right =
+          ConstantValueExp(Value(static_cast<int64_t>(g.Pick(-2, 70))));
+      return {.expr = FunctionCallExp(
+                  fn, {std::move(left.expr), std::move(right)}),
+              .type = GenType::kInt};
+    }
+    case 11: {
+      // length(string)
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      return {.expr = FunctionCallExp("length", {std::move(child.expr)}),
+              .type = GenType::kInt};
+    }
+    case 12: {
+      static constexpr std::array<const char*, 3> kSafeOps = {
+          "safe_add", "safe_subtract", "safe_multiply"};
+      const char* fn = kSafeOps[static_cast<size_t>(g.Pick(0, 2))];
+      TypedExpr left = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      TypedExpr right = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      GenType result =
+          (left.type == GenType::kFloat || right.type == GenType::kFloat)
+              ? GenType::kFloat
+              : GenType::kInt;
+      return {.expr = FunctionCallExp(
+                  fn, {std::move(left.expr), std::move(right.expr)}),
+              .type = result};
+    }
+    case 13: {
+      static constexpr std::array<const char*, 4> kRoundingOps = {
+          "ceil", "floor", "round", "trunc"};
+      const char* fn = kRoundingOps[static_cast<size_t>(g.Pick(0, 3))];
+      TypedExpr child = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      GenType result = child.type;
+      if (std::string_view(fn) == "round" && g.Chance(50)) {
+        Expression digits =
+            ConstantValueExp(Value(static_cast<int64_t>(g.Pick(-2, 4))));
+        return {.expr = FunctionCallExp(
+                    fn, {std::move(child.expr), std::move(digits)}),
+                .type = result};
+      }
+      return {.expr = FunctionCallExp(fn, {std::move(child.expr)}),
+              .type = result};
+    }
+    case 14: {
+      TypedExpr child = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      return {.expr = FunctionCallExp("sign", {std::move(child.expr)}),
+              .type = child.type};
+    }
+    case 15: {
+      static constexpr std::array<const char*, 8> kMathOps = {
+          "sqrt", "cbrt", "exp", "ln", "cos", "sin", "tan", "pow"};
+      const char* fn = kMathOps[static_cast<size_t>(g.Pick(0, 7))];
+      if (std::string_view(fn) == "pow") {
+        TypedExpr left = GenTyped(
+            g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+        TypedExpr right = GenTyped(
+            g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+        return {.expr = FunctionCallExp(
+                    fn, {std::move(left.expr), std::move(right.expr)}),
+                .type = GenType::kFloat};
+      }
+      TypedExpr child = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      return {.expr = FunctionCallExp(fn, {std::move(child.expr)}),
+              .type = GenType::kFloat};
+    }
+    case 16: {
+      if (g.Chance(33)) {
+        TypedExpr left = GenTyped(g, GenType::kInt, depth - 1, config);
+        TypedExpr right = GenTyped(g, GenType::kInt, depth - 1, config);
+        return {.expr = FunctionCallExp(
+                    "div", {std::move(left.expr), std::move(right.expr)}),
+                .type = GenType::kInt};
+      }
+      const char* fn = g.Chance(50) ? "safe_divide" : "ieee_divide";
+      TypedExpr left = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      TypedExpr right = GenTyped(
+          g, g.Chance(50) ? GenType::kInt : GenType::kFloat, depth - 1, config);
+      return {.expr = FunctionCallExp(
+                  fn, {std::move(left.expr), std::move(right.expr)}),
+              .type = GenType::kFloat};
+    }
+    case 17: {
+      static constexpr std::array<const char*, 4> kStrToIntOps = {
+          "length", "char_length", "ascii", "unicode"};
+      const char* fn = kStrToIntOps[static_cast<size_t>(g.Pick(0, 3))];
+      TypedExpr str = GenTyped(g, GenType::kString, depth - 1, config);
+      return {.expr = FunctionCallExp(fn, {std::move(str.expr)}),
+              .type = GenType::kInt};
+    }
+    case 18: {
       // Numeric CAST exercises cast folding/pushdown.
       GenType from = g.Chance(50) ? GenType::kInt : GenType::kFloat;
       TypedExpr child = GenTyped(g, from, depth - 1, config);
@@ -249,18 +420,28 @@ TypedExpr GenNumeric(Gen& g, int depth, const ExprGenConfig& config) {
                                     to == GenType::kInt ? "INT64" : "FLOAT64"),
           .type = to};
     }
+    case 19:
+    default: {
+      TypedExpr child = GenTyped(g, GenType::kInt, depth - 1, config);
+      return {.expr = UnaryExpressionExp(std::move(child.expr),
+                                          UnaryOperation::kBitwiseNot),
+              .type = GenType::kInt};
+    }
   }
 }
 
 TypedExpr GenBool(Gen& g, int depth, const ExprGenConfig& config) {
-  switch (g.Pick(0, 11)) {
+  const int choice_limit = config.extended_ops ? 12 : 11;
+  switch (g.Pick(0, choice_limit)) {
     case 0:
     case 1: {
-      static constexpr std::array<BinaryOperation, 6> kComparisons{
-          BinaryOperation::kEquals,      BinaryOperation::kNotEquals,
-          BinaryOperation::kLessThan,    BinaryOperation::kLessThanEquals,
-          BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals};
-      BinaryOperation op = kComparisons[static_cast<size_t>(g.Pick(0, 5))];
+      static constexpr std::array<BinaryOperation, 8> kComparisons{
+          BinaryOperation::kEquals,          BinaryOperation::kNotEquals,
+          BinaryOperation::kLessThan,        BinaryOperation::kLessThanEquals,
+          BinaryOperation::kGreaterThan,     BinaryOperation::kGreaterThanEquals,
+          BinaryOperation::kIsDistinctFrom,  BinaryOperation::kIsNotDistinctFrom};
+      const int cmp_limit = config.extended_ops ? 7 : 5;
+      BinaryOperation op = kComparisons[static_cast<size_t>(g.Pick(0, cmp_limit))];
       TypedExpr left = GenTyped(g, GenType::kInt, depth - 1, config);
       TypedExpr right = GenTyped(g, GenType::kInt, depth - 1, config);
       if (g.Chance(40)) {
@@ -284,12 +465,43 @@ TypedExpr GenBool(Gen& g, int depth, const ExprGenConfig& config) {
       // broke across compilers.
       TypedExpr left = GenTyped(g, GenType::kBool, depth - 1, config);
       TypedExpr right = GenTyped(g, GenType::kBool, depth - 1, config);
+      if (config.extended_ops) {
+        if (g.Chance(15)) {
+          right = {.expr = left.expr, .type = left.type};
+        } else if (g.Chance(15)) {
+          BinaryOperation inner_op = (op == BinaryOperation::kAnd)
+                                         ? BinaryOperation::kOr
+                                         : BinaryOperation::kAnd;
+          TypedExpr y = GenTyped(g, GenType::kBool, depth - 1, config);
+          right = {.expr = BinaryExpressionExp(left.expr, inner_op,
+                                               std::move(y.expr)),
+                   .type = GenType::kBool};
+        } else if (g.Chance(15)) {
+          GenType operand_type = g.Chance(50) ? GenType::kInt : GenType::kFloat;
+          left = GenTyped(g, operand_type, depth - 1, config);
+          if (g.Chance(30)) {
+            right = {.expr = left.expr, .type = left.type};
+          } else {
+            right = GenTyped(g, operand_type, depth - 1, config);
+          }
+        }
+      }
       return {.expr = BinaryExpressionExp(std::move(left.expr), op,
                                           std::move(right.expr)),
               .type = GenType::kBool};
     }
     case 4: {
       TypedExpr child = GenTyped(g, GenType::kBool, depth - 1, config);
+      if (config.extended_ops) {
+        if (g.Chance(20)) {
+          child = {.expr = UnaryExpressionExp(std::move(child.expr),
+                                              UnaryOperation::kNot),
+                   .type = GenType::kBool};
+        } else if (g.Chance(15)) {
+          child = GenTyped(g, g.Chance(50) ? GenType::kInt : GenType::kFloat,
+                           depth - 1, config);
+        }
+      }
       return {.expr = UnaryExpressionExp(std::move(child.expr),
                                          UnaryOperation::kNot),
               .type = GenType::kBool};
@@ -372,8 +584,166 @@ TypedExpr GenBool(Gen& g, int depth, const ExprGenConfig& config) {
       return {.expr = CaseExpressionExp(std::move(whens), std::move(otherwise)),
               .type = GenType::kBool};
     }
+    case 11: {
+      if (!config.extended_ops) {
+        return GenLeaf(g, GenType::kBool, config);
+      }
+      // String prefix/suffix predicates: starts_with, ends_with
+      TypedExpr hay = GenTyped(g, GenType::kString, depth - 1, config);
+      TypedExpr prefix = GenTyped(g, GenType::kString, depth - 1, config);
+      const char* fn = g.Chance(50) ? "starts_with" : "ends_with";
+      return {.expr = FunctionCallExp(
+                  fn, {std::move(hay.expr), std::move(prefix.expr)}),
+              .type = GenType::kBool};
+    }
+    case 12: {
+      if (!config.extended_ops) {
+        return GenLeaf(g, GenType::kBool, config);
+      }
+      TypedExpr left = GenTyped(g, GenType::kString, depth - 1, config);
+      TypedExpr right = GenTyped(g, GenType::kString, depth - 1, config);
+      BinaryOperation op =
+          g.Chance(50) ? BinaryOperation::kEquals : BinaryOperation::kNotEquals;
+      return {.expr = BinaryExpressionExp(std::move(left.expr), op,
+                                          std::move(right.expr)),
+              .type = GenType::kBool};
+    }
     default:
       return GenLeaf(g, GenType::kBool, config);
+  }
+}
+
+TypedExpr GenString(Gen& g, int depth, const ExprGenConfig& config) {
+  if (!config.extended_ops || depth <= 0 || g.Chance(30)) {
+    return GenLeaf(g, GenType::kString, config);
+  }
+  switch (g.Pick(0, 13)) {
+    case 0: {
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      return {.expr = FunctionCallExp("upper", {std::move(child.expr)}),
+              .type = GenType::kString};
+    }
+    case 1: {
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      return {.expr = FunctionCallExp("lower", {std::move(child.expr)}),
+              .type = GenType::kString};
+    }
+    case 2: {
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      return {.expr = FunctionCallExp("trim", {std::move(child.expr)}),
+              .type = GenType::kString};
+    }
+    case 3: {
+      const int count = g.Pick(2, 3);
+      std::vector<Expression> args;
+      args.reserve(static_cast<size_t>(count));
+      for (int i = 0; i < count; ++i) {
+        args.push_back(GenTyped(g, GenType::kString, depth - 1, config).expr);
+      }
+      return {.expr = FunctionCallExp("concat", std::move(args)),
+              .type = GenType::kString};
+    }
+    case 4: {
+      TypedExpr str = GenTyped(g, GenType::kString, depth - 1, config);
+      Expression pos =
+          ConstantValueExp(Value(static_cast<int64_t>(g.Pick(-3, 4))));
+      if (g.Chance(50)) {
+        Expression len =
+            ConstantValueExp(Value(static_cast<int64_t>(g.Pick(0, 4))));
+        return {.expr = FunctionCallExp(
+                    "substr",
+                    {std::move(str.expr), std::move(pos), std::move(len)}),
+                .type = GenType::kString};
+      }
+      return {.expr = FunctionCallExp("substr",
+                                      {std::move(str.expr), std::move(pos)}),
+              .type = GenType::kString};
+    }
+    case 5: {
+      TypedExpr str = GenTyped(g, GenType::kString, depth - 1, config);
+      TypedExpr from = GenLeaf(g, GenType::kString, config);
+      TypedExpr to = GenLeaf(g, GenType::kString, config);
+      return {.expr = FunctionCallExp(
+                  "replace",
+                  {std::move(str.expr), std::move(from.expr), std::move(to.expr)}),
+              .type = GenType::kString};
+    }
+    case 6: {
+      if (g.Chance(50)) {
+        const int count = g.Pick(2, 3);
+        std::vector<Expression> args;
+        args.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) {
+          args.push_back(GenTyped(g, GenType::kString, depth - 1, config).expr);
+        }
+        return {.expr = FunctionCallExp("coalesce", std::move(args)),
+                .type = GenType::kString};
+      }
+      // NULLIF takes exactly 2 arguments.
+      TypedExpr first = GenTyped(g, GenType::kString, depth - 1, config);
+      TypedExpr second = GenTyped(g, GenType::kString, depth - 1, config);
+      return {.expr = FunctionCallExp(
+                  "nullif", {std::move(first.expr), std::move(second.expr)}),
+              .type = GenType::kString};
+    }
+    case 7: {
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      return {.expr = FunctionCallExp("reverse", {std::move(child.expr)}),
+              .type = GenType::kString};
+    }
+    case 8: {
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      Expression count =
+          ConstantValueExp(Value(static_cast<int64_t>(g.Pick(0, 3))));
+      return {.expr = FunctionCallExp(
+                  "repeat", {std::move(child.expr), std::move(count)}),
+              .type = GenType::kString};
+    }
+    case 9: {
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      return {.expr = FunctionCallExp("initcap", {std::move(child.expr)}),
+              .type = GenType::kString};
+    }
+    case 10: {
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      Expression len =
+          ConstantValueExp(Value(static_cast<int64_t>(g.Pick(0, 6))));
+      Expression pad = ConstantValueExp(Value(std::string("*")));
+      const char* fn = g.Chance(50) ? "lpad" : "rpad";
+      return {.expr = FunctionCallExp(
+                  fn, {std::move(child.expr), std::move(len), std::move(pad)}),
+              .type = GenType::kString};
+    }
+    case 11: {
+      const char* fn = g.Chance(50) ? "left" : "right";
+      TypedExpr child = GenTyped(g, GenType::kString, depth - 1, config);
+      Expression len =
+          ConstantValueExp(Value(static_cast<int64_t>(g.Pick(0, 4))));
+      return {.expr = FunctionCallExp(
+                  fn, {std::move(child.expr), std::move(len)}),
+              .type = GenType::kString};
+    }
+    case 12: {
+      Expression code =
+          ConstantValueExp(Value(static_cast<int64_t>(g.Pick(65, 90))));
+      return {.expr = FunctionCallExp("chr", {std::move(code)}),
+              .type = GenType::kString};
+    }
+    default: {
+      const int branches = g.Pick(1, 2);
+      std::vector<std::pair<Expression, Expression>> whens;
+      whens.reserve(static_cast<size_t>(branches));
+      for (int i = 0; i < branches; ++i) {
+        TypedExpr when = GenTyped(g, GenType::kBool, depth - 1, config);
+        TypedExpr then = GenTyped(g, GenType::kString, depth - 1, config);
+        whens.emplace_back(std::move(when.expr), std::move(then.expr));
+      }
+      Expression otherwise =
+          g.Chance(70) ? GenTyped(g, GenType::kString, depth - 1, config).expr
+                       : nullptr;
+      return {.expr = CaseExpressionExp(std::move(whens), std::move(otherwise)),
+              .type = GenType::kString};
+    }
   }
 }
 
@@ -426,19 +796,8 @@ TypedExpr GenTyped(Gen& g, GenType want, int depth,
     }
     case GenType::kBool:
       return GenBool(g, depth, config);
-    case GenType::kString: {
-      if (g.Chance(25) && depth > 1) {
-        std::vector<Expression> args;
-        const int count = g.Pick(2, 3);
-        args.reserve(static_cast<size_t>(count));
-        for (int i = 0; i < count; ++i) {
-          args.push_back(GenTyped(g, GenType::kString, depth - 1, config).expr);
-        }
-        return {.expr = FunctionCallExp("coalesce", std::move(args)),
-                .type = GenType::kString};
-      }
-      return GenLeaf(g, GenType::kString, config);
-    }
+    case GenType::kString:
+      return GenString(g, depth, config);
   }
   return GenLeaf(g, want, config);
 }
@@ -560,10 +919,14 @@ GenType InferType(const Expression& expr) {
           bin.Op() == BinaryOperation::kLessThan ||
           bin.Op() == BinaryOperation::kLessThanEquals ||
           bin.Op() == BinaryOperation::kGreaterThan ||
-          bin.Op() == BinaryOperation::kGreaterThanEquals) {
+          bin.Op() == BinaryOperation::kGreaterThanEquals ||
+          bin.Op() == BinaryOperation::kIsDistinctFrom ||
+          bin.Op() == BinaryOperation::kIsNotDistinctFrom) {
         return GenType::kBool;
       }
-      if (bin.Op() == BinaryOperation::kModulo) {
+      if (bin.Op() == BinaryOperation::kModulo ||
+          bin.Op() == BinaryOperation::kShiftLeft ||
+          bin.Op() == BinaryOperation::kShiftRight) {
         return GenType::kInt;
       }
       if (bin.Op() == BinaryOperation::kDivide) {
@@ -577,6 +940,7 @@ GenType InferType(const Expression& expr) {
     case TypeTag::kUnaryExp:
       switch (expr->AsUnaryExpression().Op()) {
         case UnaryOperation::kMinus:
+        case UnaryOperation::kBitwiseNot:
           return InferType(expr->AsUnaryExpression().Child());
         default:
           return GenType::kBool;
@@ -616,11 +980,87 @@ GenType InferType(const Expression& expr) {
     case TypeTag::kInExp:
       return GenType::kBool;
     case TypeTag::kFunctionCallExp: {
-      const std::string& name = expr->AsFunctionCallExpression().FuncName();
-      if (!expr->AsFunctionCallExpression().Args().empty() &&
-          (name == "greatest" || name == "least" || name == "abs" ||
-           name == "coalesce" || name == "nullif")) {
-        return InferType(expr->AsFunctionCallExpression().Args().front());
+      const auto& call = expr->AsFunctionCallExpression();
+      const std::string& name = call.FuncName();
+      if (name == "upper" || name == "lower" || name == "concat" ||
+          name == "substr" || name == "substring" || name == "trim" ||
+          name == "ltrim" || name == "rtrim" || name == "replace" ||
+          name == "repeat" || name == "reverse") {
+        return GenType::kString;
+      }
+      if (name == "starts_with" || name == "ends_with") {
+        return GenType::kBool;
+      }
+      if (name == "length" || name == "char_length" ||
+          name == "character_length" || name == "byte_length" ||
+          name == "strpos" || name == "instr" ||
+          name == "__bit_and" || name == "__bit_or" ||
+          name == "__bit_xor" || name == "__shift_left" ||
+          name == "__shift_right" || name == "div") {
+        return GenType::kInt;
+      }
+      if (name == "pow" || name == "power" || name == "sqrt" ||
+          name == "cbrt" || name == "ln" || name == "log" ||
+          name == "log10" || name == "exp" || name == "cos" ||
+          name == "sin" || name == "tan" || name == "acos" ||
+          name == "asin" || name == "atan" || name == "atan2" ||
+          name == "cosh" || name == "sinh" || name == "tanh" ||
+          name == "pi" || name == "radians" || name == "degrees" ||
+          name == "ieee_divide" || name == "safe_divide") {
+        return GenType::kFloat;
+      }
+      if (name == "greatest" || name == "least") {
+        for (const auto& arg : call.Args()) {
+          if (InferType(arg) == GenType::kFloat) {
+            return GenType::kFloat;
+          }
+        }
+        if (!call.Args().empty()) {
+          return InferType(call.Args().front());
+        }
+        return GenType::kInt;
+      }
+      if (name == "safe_add" || name == "safe_subtract" ||
+          name == "safe_multiply") {
+        for (const auto& arg : call.Args()) {
+          if (InferType(arg) == GenType::kFloat) {
+            return GenType::kFloat;
+          }
+        }
+        return GenType::kInt;
+      }
+      if (name == "abs" || name == "round" || name == "trunc" ||
+          name == "truncate" || name == "ceil" || name == "ceiling" ||
+          name == "floor" || name == "sign") {
+        if (!call.Args().empty()) {
+          return InferType(call.Args().front());
+        }
+        return GenType::kInt;
+      }
+      if (name == "nullif" || name == "ifnull") {
+        if (!call.Args().empty()) {
+          return InferType(call.Args().front());
+        }
+        return GenType::kInt;
+      }
+      if (name == "coalesce") {
+        for (const auto& arg : call.Args()) {
+          if (InferType(arg) == GenType::kFloat) {
+            return GenType::kFloat;
+          }
+        }
+        if (!call.Args().empty()) {
+          return InferType(call.Args().front());
+        }
+        return GenType::kInt;
+      }
+      if (name == "mod") {
+        for (const auto& arg : call.Args()) {
+          if (InferType(arg) == GenType::kFloat) {
+            return GenType::kFloat;
+          }
+        }
+        return GenType::kInt;
       }
       return GenType::kInt;
     }
@@ -711,6 +1151,14 @@ std::string BinarySql(BinaryOperation op) {
       return "OR";
     case BinaryOperation::kXor:
       return "XOR";
+    case BinaryOperation::kShiftLeft:
+      return "<<";
+    case BinaryOperation::kShiftRight:
+      return ">>";
+    case BinaryOperation::kIsDistinctFrom:
+      return "IS DISTINCT FROM";
+    case BinaryOperation::kIsNotDistinctFrom:
+      return "IS NOT DISTINCT FROM";
     default:
       return "+";
   }
@@ -722,6 +1170,8 @@ std::string UnarySql(UnaryOperation op, const std::string& child) {
       return "(NOT " + child + ")";
     case UnaryOperation::kMinus:
       return "(-" + child + ")";
+    case UnaryOperation::kBitwiseNot:
+      return "(~" + child + ")";
     case UnaryOperation::kIsNull:
       return "(" + child + " IS NULL)";
     case UnaryOperation::kIsNotNull:
@@ -760,6 +1210,18 @@ std::string SerializeSql(const Expression& expr, GenType type) {
         return "MOD(" + SerializeSql(bin.Left(), GenType::kInt) + ", " +
                SerializeSql(bin.Right(), GenType::kInt) + ")";
       }
+      if (bin.Op() == BinaryOperation::kShiftLeft ||
+          bin.Op() == BinaryOperation::kShiftRight) {
+        return "(" + SerializeSql(bin.Left(), GenType::kInt) + " " +
+               BinarySql(bin.Op()) + " " +
+               SerializeSql(bin.Right(), GenType::kInt) + ")";
+      }
+      if (bin.Op() == BinaryOperation::kIsDistinctFrom ||
+          bin.Op() == BinaryOperation::kIsNotDistinctFrom) {
+        return "(" + SerializeSql(bin.Left(), InferType(bin.Left())) + " " +
+               BinarySql(bin.Op()) + " " +
+               SerializeSql(bin.Right(), InferType(bin.Right())) + ")";
+      }
       GenType element = GenType::kInt;
       if (bin.Op() == BinaryOperation::kAnd ||
           bin.Op() == BinaryOperation::kOr ||
@@ -783,7 +1245,8 @@ std::string SerializeSql(const Expression& expr, GenType type) {
     case TypeTag::kUnaryExp: {
       const auto& unary = expr->AsUnaryExpression();
       GenType child_type =
-          unary.Op() == UnaryOperation::kMinus
+          (unary.Op() == UnaryOperation::kMinus ||
+           unary.Op() == UnaryOperation::kBitwiseNot)
               ? InferType(expr)
               : (unary.Op() == UnaryOperation::kNot ||
                          unary.Op() == UnaryOperation::kIsTrue ||
@@ -821,14 +1284,77 @@ std::string SerializeSql(const Expression& expr, GenType type) {
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expr->AsFunctionCallExpression();
-      const std::string name = Upper(call.FuncName());
-      GenType element = InferType(expr);
+      const std::string& fname = call.FuncName();
+      if (fname == "__bit_and" && call.Args().size() == 2) {
+        return "(" + SerializeSql(call.Args()[0], GenType::kInt) + " & " +
+               SerializeSql(call.Args()[1], GenType::kInt) + ")";
+      }
+      if (fname == "__bit_or" && call.Args().size() == 2) {
+        return "(" + SerializeSql(call.Args()[0], GenType::kInt) + " | " +
+               SerializeSql(call.Args()[1], GenType::kInt) + ")";
+      }
+      if (fname == "__bit_xor" && call.Args().size() == 2) {
+        return "(" + SerializeSql(call.Args()[0], GenType::kInt) + " ^ " +
+               SerializeSql(call.Args()[1], GenType::kInt) + ")";
+      }
+      if (fname == "__shift_left" && call.Args().size() == 2) {
+        return "(" + SerializeSql(call.Args()[0], GenType::kInt) + " << " +
+               SerializeSql(call.Args()[1], GenType::kInt) + ")";
+      }
+      if (fname == "__shift_right" && call.Args().size() == 2) {
+        return "(" + SerializeSql(call.Args()[0], GenType::kInt) + " >> " +
+               SerializeSql(call.Args()[1], GenType::kInt) + ")";
+      }
+      if ((fname == "substr" || fname == "substring") &&
+          call.Args().size() >= 2) {
+        std::string out =
+            "SUBSTR(" + SerializeSql(call.Args()[0], GenType::kString);
+        for (size_t i = 1; i < call.Args().size(); ++i) {
+          out += ", " + SerializeSql(call.Args()[i], GenType::kInt);
+        }
+        return out + ")";
+      }
+      if (fname == "length" || fname == "char_length" ||
+          fname == "character_length" || fname == "byte_length") {
+        return Upper(fname) + "(" +
+               SerializeSql(call.Args()[0], GenType::kString) + ")";
+      }
+      if (fname == "starts_with" || fname == "ends_with" ||
+          fname == "strpos" || fname == "instr") {
+        return Upper(fname) + "(" +
+               SerializeSql(call.Args()[0], GenType::kString) + ", " +
+               SerializeSql(call.Args()[1], GenType::kString) + ")";
+      }
+      if (fname == "upper" || fname == "lower" || fname == "trim" ||
+          fname == "ltrim" || fname == "rtrim" || fname == "reverse") {
+        std::string out = Upper(fname) + "(";
+        for (size_t i = 0; i < call.Args().size(); ++i) {
+          if (i != 0) out += ", ";
+          out += SerializeSql(call.Args()[i], GenType::kString);
+        }
+        return out + ")";
+      }
+      if (fname == "replace" || fname == "concat") {
+        std::string out = Upper(fname) + "(";
+        for (size_t i = 0; i < call.Args().size(); ++i) {
+          if (i != 0) out += ", ";
+          out += SerializeSql(call.Args()[i], GenType::kString);
+        }
+        return out + ")";
+      }
+      const std::string name = Upper(fname);
       std::string out = name + "(";
+      GenType element = InferType(expr);
       for (size_t i = 0; i < call.Args().size(); ++i) {
         if (i != 0) {
           out += ", ";
         }
-        out += SerializeSql(call.Args()[i], element);
+        GenType arg_type = element;
+        if ((fname == "round" || fname == "trunc" || fname == "truncate") &&
+            i == 1) {
+          arg_type = GenType::kInt;
+        }
+        out += SerializeSql(call.Args()[i], arg_type);
       }
       return out + ")";
     }
@@ -918,6 +1444,14 @@ std::string BinarySExpr(BinaryOperation op) {
       return "or";
     case BinaryOperation::kXor:
       return "xor";
+    case BinaryOperation::kShiftLeft:
+      return "shl";
+    case BinaryOperation::kShiftRight:
+      return "shr";
+    case BinaryOperation::kIsDistinctFrom:
+      return "distinct";
+    case BinaryOperation::kIsNotDistinctFrom:
+      return "notdistinct";
     default:
       return "add";
   }
@@ -929,6 +1463,8 @@ std::string UnarySExpr(UnaryOperation op) {
       return "not";
     case UnaryOperation::kMinus:
       return "neg";
+    case UnaryOperation::kBitwiseNot:
+      return "bitnot";
     case UnaryOperation::kIsNull:
       return "isnull";
     case UnaryOperation::kIsNotNull:
@@ -968,7 +1504,9 @@ std::string SerializeSExpr(const Expression& expr, GenType type) {
                  bin.Op() == BinaryOperation::kNotLike) {
         left_type = GenType::kString;
         right_type = GenType::kString;
-      } else if (bin.Op() == BinaryOperation::kModulo) {
+      } else if (bin.Op() == BinaryOperation::kModulo ||
+                 bin.Op() == BinaryOperation::kShiftLeft ||
+                 bin.Op() == BinaryOperation::kShiftRight) {
         left_type = GenType::kInt;
         right_type = GenType::kInt;
       }
@@ -978,9 +1516,13 @@ std::string SerializeSExpr(const Expression& expr, GenType type) {
     }
     case TypeTag::kUnaryExp: {
       const auto& unary = expr->AsUnaryExpression();
-      GenType child = unary.Op() == UnaryOperation::kMinus ? InferType(expr)
-                                                           : GenType::kBool;
+      GenType child =
+          (unary.Op() == UnaryOperation::kMinus ||
+           unary.Op() == UnaryOperation::kBitwiseNot)
+              ? InferType(expr)
+              : GenType::kBool;
       if (unary.Op() != UnaryOperation::kMinus &&
+          unary.Op() != UnaryOperation::kBitwiseNot &&
           unary.Op() != UnaryOperation::kNot &&
           unary.Op() != UnaryOperation::kIsTrue &&
           unary.Op() != UnaryOperation::kIsNotTrue &&
@@ -1015,10 +1557,43 @@ std::string SerializeSExpr(const Expression& expr, GenType type) {
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expr->AsFunctionCallExpression();
-      GenType element = InferType(expr);
-      std::string out = "(" + call.FuncName();
-      for (const Expression& arg : call.Args()) {
-        out += " " + SerializeSExpr(arg, element);
+      const std::string& fname = call.FuncName();
+      std::string out = "(" + fname;
+      if (fname == "__bit_and" || fname == "__bit_or" ||
+          fname == "__bit_xor" || fname == "__shift_left" ||
+          fname == "__shift_right") {
+        for (const Expression& arg : call.Args()) {
+          out += " " + SerializeSExpr(arg, GenType::kInt);
+        }
+      } else if (fname == "substr" || fname == "substring") {
+        if (!call.Args().empty()) {
+          out += " " + SerializeSExpr(call.Args()[0], GenType::kString);
+          for (size_t i = 1; i < call.Args().size(); ++i) {
+            out += " " + SerializeSExpr(call.Args()[i], GenType::kInt);
+          }
+        }
+      } else if (fname == "length" || fname == "char_length" ||
+                 fname == "character_length" || fname == "byte_length") {
+        for (const Expression& arg : call.Args()) {
+          out += " " + SerializeSExpr(arg, GenType::kString);
+        }
+      } else if (fname == "starts_with" || fname == "ends_with" ||
+                 fname == "upper" || fname == "lower" || fname == "trim" ||
+                 fname == "ltrim" || fname == "rtrim" || fname == "reverse" ||
+                 fname == "replace" || fname == "concat") {
+        for (const Expression& arg : call.Args()) {
+          out += " " + SerializeSExpr(arg, GenType::kString);
+        }
+      } else {
+        GenType element = InferType(expr);
+        for (size_t i = 0; i < call.Args().size(); ++i) {
+          GenType arg_type = element;
+          if ((fname == "round" || fname == "trunc" || fname == "truncate") &&
+              i == 1) {
+            arg_type = GenType::kInt;
+          }
+          out += " " + SerializeSExpr(call.Args()[i], arg_type);
+        }
       }
       return out + ")";
     }

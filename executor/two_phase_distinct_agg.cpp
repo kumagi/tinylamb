@@ -332,7 +332,10 @@ Status TwoPhaseDistinctAgg::Materialize() {
               // total would make ColumnVector::Append throw on NextBatch.
               if (total.type == ValueType::kInt64) {
                 row_vals.emplace_back(
-                    static_cast<double>(total.value.int_value));
+                    total.IsUnsigned()
+                        ? static_cast<double>(
+                              static_cast<uint64_t>(total.value.int_value))
+                        : static_cast<double>(total.value.int_value));
               } else {
                 row_vals.push_back(total);
               }
@@ -346,7 +349,10 @@ Status TwoPhaseDistinctAgg::Materialize() {
               double total = 0.0;
               for (const Value& v : dset) {
                 if (v.type == ValueType::kInt64) {
-                  total += static_cast<double>(v.value.int_value);
+                  total += v.IsUnsigned()
+                               ? static_cast<double>(
+                                     static_cast<uint64_t>(v.value.int_value))
+                               : static_cast<double>(v.value.int_value);
                 } else if (v.type == ValueType::kDouble) {
                   total += v.value.double_value;
                 }

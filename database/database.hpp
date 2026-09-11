@@ -77,6 +77,9 @@ class Database final : public CatalogReader {
   [[nodiscard]] TransactionRuntimeStats TransactionStats() const {
     return storage_->tm_->RuntimeStats();
   }
+  [[nodiscard]] uint64_t CacheHits() const noexcept;
+  [[nodiscard]] uint64_t CacheMisses() const noexcept;
+  [[nodiscard]] size_t PinnedPageCount() const noexcept;
 
   StatusOr<Table> CreateTable(TransactionContext& ctx, const Schema& schema);
 

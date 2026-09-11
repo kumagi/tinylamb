@@ -244,9 +244,13 @@ bool ValuesEqual(const Value& a, const Value& b) {
 }
 
 double NumericOf(const Value& value) {
-  return value.type == ValueType::kDouble
-             ? value.value.double_value
-             : static_cast<double>(value.value.int_value);
+  if (value.type == ValueType::kDouble) {
+    return value.value.double_value;
+  }
+  if (value.type == ValueType::kInt64) {
+    return static_cast<double>(value.value.int_value);
+  }
+  return std::numeric_limits<double>::quiet_NaN();
 }
 
 std::string ElementSqlTypeOf(const Value& value) {
@@ -313,14 +317,31 @@ struct WindowRuntime {
     if (window.frame_unit == WindowFrameUnit::kRows) {
       // Physical row offsets: CURRENT ROW excludes peers.
       auto rows_offset = [&](const WindowFrameBound& bound) -> int64_t {
-        if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue ||
-            bound.offset->AsConstantValue().GetValue().type !=
-                ValueType::kInt64) {
+        if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue) {
           frame_error = StatusError(StatusCode::kInvalidArgument,
                                     "ROWS offset must be a constant integer");
           return 0;
         }
-        return bound.offset->AsConstantValue().GetValue().value.int_value;
+        const Value& val = bound.offset->AsConstantValue().GetValue();
+        if (val.IsNull()) {
+          frame_error = StatusError(
+              StatusCode::kInvalidArgument,
+              "Window frame offset for PRECEDING or FOLLOWING cannot be NULL");
+          return 0;
+        }
+        if (val.type != ValueType::kInt64) {
+          frame_error = StatusError(StatusCode::kInvalidArgument,
+                                    "ROWS offset must be a constant integer");
+          return 0;
+        }
+        const int64_t off = val.value.int_value;
+        if (off < 0) {
+          frame_error = StatusError(
+              StatusCode::kInvalidArgument,
+              "Window frame offset for PRECEDING or FOLLOWING must be non-negative");
+          return 0;
+        }
+        return off;
       };
       auto rows_start =
           [&](const WindowFrameBound& bound) -> std::optional<size_t> {
@@ -333,13 +354,10 @@ struct WindowRuntime {
             const int64_t off = rows_offset(bound);
             // A start bound reaching past the partition start clamps to it;
             // emptiness is decided by lo > hi afterwards.
-            if (off >= 0) {
-              return static_cast<int64_t>(position) - off >= 0
-                         ? std::optional<size_t>(position -
-                                                 static_cast<size_t>(off))
-                         : std::optional<size_t>(size_t{0});
-            }
-            return std::min(position + static_cast<size_t>(-off), m - 1);
+            return static_cast<int64_t>(position) - off >= 0
+                       ? std::optional<size_t>(position -
+                                               static_cast<size_t>(off))
+                       : std::optional<size_t>(size_t{0});
           }
           case WindowFrameBoundType::kOffsetFollowing: {
             const int64_t off = rows_offset(bound);
@@ -414,11 +432,29 @@ struct WindowRuntime {
                                     "GROUPS offset requires a constant value");
           return 0;
         }
-        const double value =
-            NumericOf(bound.offset->AsConstantValue().GetValue());
-        if (value < 0) {
+        const Value& val = bound.offset->AsConstantValue().GetValue();
+        if (val.IsNull()) {
+          frame_error = StatusError(
+              StatusCode::kInvalidArgument,
+              "Window frame offset for PRECEDING or FOLLOWING cannot be NULL");
+          return 0;
+        }
+        if (val.type != ValueType::kInt64 && val.type != ValueType::kDouble) {
           frame_error = StatusError(StatusCode::kInvalidArgument,
-                                    "GROUPS offset is negative");
+                                    "GROUPS offset must be numeric");
+          return 0;
+        }
+        const double value = NumericOf(val);
+        if (std::isnan(value)) {
+          frame_error = StatusError(
+              StatusCode::kInvalidArgument,
+              "Window frame offset for PRECEDING or FOLLOWING cannot be NaN");
+          return 0;
+        }
+        if (value < 0) {
+          frame_error = StatusError(
+              StatusCode::kInvalidArgument,
+              "Window frame offset for PRECEDING or FOLLOWING must be non-negative");
           return 0;
         }
         return static_cast<size_t>(value);
@@ -486,6 +522,42 @@ struct WindowRuntime {
       }
       return j;
     };
+    auto range_offset =
+        [&](const WindowFrameBound& bound) -> std::optional<double> {
+      if (window.order_by.size() != 1 || !bound.offset ||
+          bound.offset->Type() != TypeTag::kConstantValue) {
+        frame_error = StatusError(StatusCode::kInvalidArgument,
+                                  "RANGE offset requires one constant key");
+        return std::nullopt;
+      }
+      const Value& off_val = bound.offset->AsConstantValue().GetValue();
+      if (off_val.IsNull()) {
+        frame_error = StatusError(
+            StatusCode::kInvalidArgument,
+            "Window frame offset for PRECEDING or FOLLOWING cannot be NULL");
+        return std::nullopt;
+      }
+      if (off_val.type != ValueType::kInt64 &&
+          off_val.type != ValueType::kDouble) {
+        frame_error = StatusError(StatusCode::kInvalidArgument,
+                                  "RANGE offset must be numeric");
+        return std::nullopt;
+      }
+      const double off = NumericOf(off_val);
+      if (std::isnan(off)) {
+        frame_error = StatusError(
+            StatusCode::kInvalidArgument,
+            "Window frame offset for PRECEDING or FOLLOWING cannot be NaN");
+        return std::nullopt;
+      }
+      if (off < 0) {
+        frame_error = StatusError(
+            StatusCode::kInvalidArgument,
+            "Window frame offset for PRECEDING or FOLLOWING must be non-negative");
+        return std::nullopt;
+      }
+      return off;
+    };
     auto start_of =
         [&](const WindowFrameBound& bound) -> std::optional<size_t> {
       switch (bound.type) {
@@ -494,14 +566,11 @@ struct WindowRuntime {
         case WindowFrameBoundType::kCurrentRow:
           return first_peer(position);
         case WindowFrameBoundType::kOffsetPreceding: {
-          if (window.order_by.size() != 1 || !bound.offset ||
-              bound.offset->Type() != TypeTag::kConstantValue) {
-            frame_error = StatusError(StatusCode::kInvalidArgument,
-                                      "RANGE offset requires one constant key");
+          const auto opt_off = range_offset(bound);
+          if (!opt_off.has_value()) {
             return std::nullopt;
           }
-          const double off =
-              NumericOf(bound.offset->AsConstantValue().GetValue());
+          const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
             return position;
@@ -519,16 +588,12 @@ struct WindowRuntime {
         }
         case WindowFrameBoundType::kOffsetFollowing: {
           // Start bound `N FOLLOWING`: the FIRST row whose key is >=
-          // `key + off`.  The old implementation fell through to `m - 1`,
-          // collapsing every frame start onto the partition's last row.
-          if (window.order_by.size() != 1 || !bound.offset ||
-              bound.offset->Type() != TypeTag::kConstantValue) {
-            frame_error = StatusError(StatusCode::kInvalidArgument,
-                                      "RANGE offset requires one constant key");
+          // `key + off`.
+          const auto opt_off = range_offset(bound);
+          if (!opt_off.has_value()) {
             return std::nullopt;
           }
-          const double off =
-              NumericOf(bound.offset->AsConstantValue().GetValue());
+          const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
             return position;
@@ -561,14 +626,11 @@ struct WindowRuntime {
         case WindowFrameBoundType::kCurrentRow:
           return peer_end[position];
         case WindowFrameBoundType::kOffsetFollowing: {
-          if (window.order_by.size() != 1 || !bound.offset ||
-              bound.offset->Type() != TypeTag::kConstantValue) {
-            frame_error = StatusError(StatusCode::kInvalidArgument,
-                                      "RANGE offset requires one constant key");
+          const auto opt_off = range_offset(bound);
+          if (!opt_off.has_value()) {
             return std::nullopt;
           }
-          const double off =
-              NumericOf(bound.offset->AsConstantValue().GetValue());
+          const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
             return peer_end[position];
@@ -590,14 +652,11 @@ struct WindowRuntime {
         case WindowFrameBoundType::kUnboundedPreceding:
           return peer_end[position];
         case WindowFrameBoundType::kOffsetPreceding: {
-          if (window.order_by.size() != 1 || !bound.offset ||
-              bound.offset->Type() != TypeTag::kConstantValue) {
-            frame_error = StatusError(StatusCode::kInvalidArgument,
-                                      "RANGE offset requires one constant key");
+          const auto opt_off = range_offset(bound);
+          if (!opt_off.has_value()) {
             return std::nullopt;
           }
-          const double off =
-              NumericOf(bound.offset->AsConstantValue().GetValue());
+          const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
             return peer_end[position];
@@ -1122,7 +1181,7 @@ struct WindowRuntime {
       if (n < 2) {
         return std::nullopt;
       }
-      double sx = 0, sy = 0, sxx = 0, syy = 0, sxy;
+      double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
       for (const auto& [xv, yv] : pairs) {
         sx += xv;
         sy += yv;
@@ -1564,10 +1623,20 @@ Status ComputeOneWindow(TransactionContext& context,
       }
       ASSIGN_OR_RETURN(Value, buckets_value,
                        (runtime.EvalAt(window.args[0], rows, ordered[0])));
+      if (buckets_value.IsNull()) {
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "The N value (number of buckets) for the NTILE function must not be NULL");
+      }
+      if (buckets_value.type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "NTILE requires an integer bucket count");
+      }
       const int64_t buckets = buckets_value.value.int_value;
       if (buckets <= 0) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "NTILE requires a positive bucket count");
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "The N value (number of buckets) for the NTILE function must be positive");
       }
       const int64_t base = static_cast<int64_t>(m) / buckets;
       const int64_t extra = static_cast<int64_t>(m) % buckets;
@@ -1581,13 +1650,38 @@ Status ComputeOneWindow(TransactionContext& context,
       continue;
     }
     if (fn == "LAG" || fn == "LEAD") {
-      int64_t offset = 1;
-      if (window.args.size() > 1) {
-        ASSIGN_OR_RETURN(Value, offset_value,
-                         (runtime.EvalAt(window.args[1], rows, ordered[0])));
-        offset = offset_value.IsNull() ? 1 : offset_value.value.int_value;
+      if (window.args.empty()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           fn + " requires at least one argument");
       }
       for (size_t k = 0; k < m; ++k) {
+        int64_t offset = 1;
+        if (window.args.size() > 1) {
+          ASSIGN_OR_RETURN(Value, offset_value,
+                           (runtime.EvalAt(window.args[1], rows, ordered[k])));
+          if (offset_value.IsNull()) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                fn == "LAG"
+                    ? "The offset to the function LAG must not be null"
+                    : "The offset to the function LEAD must not be null");
+          }
+          if (offset_value.type != ValueType::kInt64) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                fn == "LAG"
+                    ? "The offset to the function LAG must be an integer"
+                    : "The offset to the function LEAD must be an integer");
+          }
+          offset = offset_value.value.int_value;
+          if (offset < 0) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                fn == "LAG"
+                    ? "The offset to the function LAG must not be negative"
+                    : "The offset to the function LEAD must not be negative");
+          }
+        }
         const int64_t target = fn == "LAG" ? static_cast<int64_t>(k) - offset
                                            : static_cast<int64_t>(k) + offset;
         if (target < 0 || std::cmp_greater_equal(target, m)) {
@@ -1608,6 +1702,10 @@ Status ComputeOneWindow(TransactionContext& context,
       continue;
     }
     if (fn == "FIRST_VALUE" || fn == "LAST_VALUE" || fn == "NTH_VALUE") {
+      if (window.args.empty()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           fn + " requires at least one argument");
+      }
       for (size_t k = 0; k < m; ++k) {
         ASSIGN_OR_RETURN(
             FrameBounds, frame_bounds,
@@ -1662,14 +1760,29 @@ Status ComputeOneWindow(TransactionContext& context,
           }
           ASSIGN_OR_RETURN(Value, nth_value,
                            (runtime.EvalAt(window.args[1], rows, ordered[k])));
+          if (nth_value.IsNull()) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "The N value for the NthValue function must not be NULL");
+          }
+          if (nth_value.type != ValueType::kInt64) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "The N value for the NthValue function must be an integer");
+          }
           int64_t nth = nth_value.value.int_value;
+          if (nth <= 0) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "The N value for the NthValue function must be positive");
+          }
           size_t frame_size = 0;
           for (size_t candidate = lo; candidate <= hi; ++candidate) {
             if (!excluded(candidate)) {
               ++frame_size;
             }
           }
-          if (nth <= 0 || std::cmp_greater(nth, frame_size)) {
+          if (std::cmp_greater(nth, frame_size)) {
             continue;
           }
           for (size_t candidate = lo; candidate <= hi; ++candidate) {

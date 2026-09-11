@@ -1544,7 +1544,20 @@ Status AggregateAccumulator::TryApplyCore(
               "the second argument; got " +
                   std::to_string(weight.value.int_value));
         }
-        entry.sum += static_cast<long double>(weight.value.int_value);
+        if (!entry.is_double) {
+          int64_t next_sum = 0;
+          if (__builtin_add_overflow(entry.int_sum, weight.value.int_value,
+                                     &next_sum)) {
+            return StatusError(
+                StatusCode::kIsInfinity,
+                "int64 overflow: " + std::to_string(entry.int_sum) + " + " +
+                    std::to_string(weight.value.int_value));
+          }
+          entry.int_sum = next_sum;
+          entry.sum = static_cast<long double>(next_sum);
+        } else {
+          entry.sum += static_cast<long double>(weight.value.int_value);
+        }
       } else if (weight.type == ValueType::kDouble) {
         const double w = weight.value.double_value;
         if (std::isnan(w)) {
@@ -1559,6 +1572,10 @@ Status AggregateAccumulator::TryApplyCore(
               "APPROX_TOP_SUM does not support negative or NaN weights in "
               "the second argument; got " +
                   FormatWeightDouble(w));
+        }
+        if (!entry.is_double) {
+          entry.is_double = true;
+          entry.sum = static_cast<long double>(entry.int_sum);
         }
         entry.sum += static_cast<long double>(w);
         entry.is_double = true;
@@ -1648,7 +1665,8 @@ Status AggregateAccumulator::TryApplyCore(
         total_is_double = true;
       } else if (value.type == ValueType::kInt64 ||
                  value.type == ValueType::kDate) {
-        if (sum_is_uint64) {
+        if (sum_is_uint64 || value.IsUnsigned()) {
+          sum_is_uint64 = true;
           const auto unsigned_value =
               static_cast<uint64_t>(value.value.int_value);
           if (uint_total >
@@ -1682,7 +1700,9 @@ Status AggregateAccumulator::TryApplyCore(
         total += value.value.double_value;
       } else if (value.type == ValueType::kInt64 ||
                  value.type == ValueType::kDate) {
-        total += static_cast<double>(value.value.int_value);
+        total += value.IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                          value.value.int_value))
+                                    : static_cast<double>(value.value.int_value);
       } else {
         return StatusError(StatusCode::kInvalidArgument,
                            "numeric value required");
@@ -1740,6 +1760,9 @@ Status AggregateAccumulator::TryApplyCore(
     case AggregationType::kBitOr:
     case AggregationType::kBitXor: {
       const int64_t next = value.value.int_value;
+      if (value.IsUnsigned()) {
+        bit_is_uint64_ = true;
+      }
       if (!bit_saw_value_) {
         bit_acc_ = next;
         bit_saw_value_ = true;
@@ -2656,7 +2679,8 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         return Value();
       }
       if (sum_is_uint64) {
-        return Value(static_cast<int64_t>(static_cast<uint64_t>(uint_total)));
+        return Value(static_cast<int64_t>(static_cast<uint64_t>(uint_total)))
+            .WithUnsigned();
       }
       if (!total_is_double && total == 0.0) {
         return Value(static_cast<int64_t>(int_total));
@@ -2881,7 +2905,7 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
           const auto as_double = static_cast<double>(weight.sum);
           sum_text = any_double
                          ? FormatWeightDouble(as_double)
-                         : std::to_string(static_cast<int64_t>(weight.sum));
+                         : std::to_string(weight.int_sum);
         }
         elements.emplace_back(TopEntryString(weight.value, sum_text));
       }
@@ -2890,7 +2914,10 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
     case AggregationType::kBitAnd:
     case AggregationType::kBitOr:
     case AggregationType::kBitXor:
-      return bit_saw_value_ ? Value(bit_acc_) : Value();
+      return bit_saw_value_
+                 ? (bit_is_uint64_ ? Value(bit_acc_).WithUnsigned()
+                                   : Value(bit_acc_))
+                 : Value();
     case AggregationType::kArrayConcatAgg:
       if (concat_elem_type_.empty() && array_values_.empty()) {
         // No non-NULL input arrays reached the accumulator: NULL array.
@@ -3030,6 +3057,16 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   if (s.size() == 10 &&
       sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
           std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
+    if (Y < 1 || Y > 9999 || M < 1 || M > 12 || D < 1 || D > 31) {
+      return false;
+    }
+    const std::chrono::year_month_day ymd{
+        std::chrono::year{Y},
+        std::chrono::month{static_cast<unsigned>(M)},
+        std::chrono::day{static_cast<unsigned>(D)}};
+    if (!ymd.ok()) {
+      return false;
+    }
     ct->year = Y;
     ct->month = M;
     ct->day = D;
@@ -3041,6 +3078,7 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   }
   int h = 0, m = 0, sec = 0;
   char sep = ' ';
+  bool matched = false;
   if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
           std::string(s).c_str(), "%d-%d-%d%c%d:%d:%d", &Y, &M, &D, &sep, &h,
           &m, &sec) >= 6) {
@@ -3067,10 +3105,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       }
       ct->subsecond_nanos = std::stoll(frac_str);
     }
-    return true;
-  }
-  if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
-          std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
+    matched = true;
+  } else if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
+                 std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
     ct->year = 1970;
     ct->month = 1;
     ct->day = 1;
@@ -3093,6 +3130,43 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
         frac_str = frac_str.substr(0, 9);
       }
       ct->subsecond_nanos = std::stoll(frac_str);
+    }
+    matched = true;
+  }
+  if (matched) {
+    if (ct->year < 1 || ct->year > 9999 || ct->month < 1 || ct->month > 12 ||
+        ct->day < 1 || ct->day > 31 || ct->hour < 0 || ct->hour > 23 ||
+        ct->minute < 0 || ct->minute > 59 || ct->second < 0 || ct->second > 60 ||
+        ct->subsecond_nanos < 0 || ct->subsecond_nanos > 999999999) {
+      return false;
+    }
+    const std::chrono::year_month_day ymd{
+        std::chrono::year{ct->year},
+        std::chrono::month{static_cast<unsigned>(ct->month)},
+        std::chrono::day{static_cast<unsigned>(ct->day)}};
+    if (!ymd.ok()) {
+      return false;
+    }
+    if (ct->second == 60) {
+      ct->second = 0;
+      ct->subsecond_nanos = 0;
+      ct->minute += 1;
+      ct->hour += ct->minute / 60;
+      ct->minute %= 60;
+      if (ct->hour >= 24) {
+        int extra_days = ct->hour / 24;
+        ct->hour %= 24;
+        int64_t days =
+            std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
+        std::chrono::sys_days new_sd{std::chrono::days{days}};
+        std::chrono::year_month_day new_ymd{new_sd};
+        if (int(new_ymd.year()) < 1 || int(new_ymd.year()) > 9999) {
+          return false;
+        }
+        ct->year = int(new_ymd.year());
+        ct->month = static_cast<int>(static_cast<unsigned>(new_ymd.month()));
+        ct->day = static_cast<int>(static_cast<unsigned>(new_ymd.day()));
+      }
     }
     return true;
   }
@@ -4098,7 +4172,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "NULLIF requires 2 arguments");
     }
-    if (arguments[0] == arguments[1]) {
+    if (arguments[0].IsNull() || arguments[1].IsNull()) {
+      return arguments[0];
+    }
+    ASSIGN_OR_RETURN(Value, eq,
+                     TryEvaluateBinary(BinaryOperation::kEquals, arguments[0],
+                                       arguments[1]));
+    if (eq.Truthy()) {
       return Value();
     }
     return arguments[0];
@@ -4833,23 +4913,34 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull() || arguments[1].IsNull()) {
       return Value();
     }
+    if (arguments[0].type != ValueType::kInt64 ||
+        arguments[1].type != ValueType::kInt64) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires integer arguments");
+    }
     const int64_t lhs = arguments[0].value.int_value;
     const int64_t rhs = arguments[1].value.int_value;
+    const bool is_u = arguments[0].IsUnsigned() || arguments[1].IsUnsigned();
+    auto with_u = [&](Value v) { return is_u ? v.WithUnsigned() : v; };
     if (name == "__bit_and") {
-      return Value(lhs & rhs);
+      return with_u(Value(lhs & rhs));
     }
     if (name == "__bit_or") {
-      return Value(lhs | rhs);
+      return with_u(Value(lhs | rhs));
     }
     if (name == "__bit_xor") {
-      return Value(lhs ^ rhs);
+      return with_u(Value(lhs ^ rhs));
     }
-    if (rhs < 0 || rhs >= 64) {
-      return StatusError(StatusCode::kIsInfinity, "shift amount out of range");
+    if (rhs < 0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Bitwise shift by negative offset.");
+    }
+    if (rhs >= 64) {
+      return with_u(Value(static_cast<int64_t>(0)));
     }
     const auto ulhs = static_cast<uint64_t>(lhs);
     const uint64_t shifted = name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
-    return Value(static_cast<int64_t>(shifted));
+    return with_u(Value(static_cast<int64_t>(shifted)));
   }
   if (name == "__proto_new") {
     // NEW ProtoType(v1 AS f1, ...) / SELECT AS ProtoType: argument layout is
@@ -7823,6 +7914,20 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   }
 
   // Math functions
+  auto to_numeric_double = [](const Value& val,
+                              const std::string& fname) -> StatusOr<double> {
+    if (val.type == ValueType::kInt64) {
+      if (val.IsUnsigned()) {
+        return static_cast<double>(static_cast<uint64_t>(val.value.int_value));
+      }
+      return static_cast<double>(val.value.int_value);
+    }
+    if (val.type == ValueType::kDouble) {
+      return val.value.double_value;
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       fname + " requires a numeric argument");
+  };
   if (name == "abs") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -7832,6 +7937,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     if (arguments[0].type == ValueType::kInt64) {
+      if (arguments[0].IsUnsigned()) {
+        return arguments[0];
+      }
       // std::abs(INT64_MIN) is UB (returns INT64_MIN); GoogleSQL raises
       // "overflow" for ABS of the most-negative integer.
       if (arguments[0].value.int_value == std::numeric_limits<int64_t>::min()) {
@@ -7854,11 +7962,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     if (arguments[0].type == ValueType::kInt64) {
+      if (arguments[0].IsUnsigned()) {
+        const auto v = static_cast<uint64_t>(arguments[0].value.int_value);
+        return Value(v > 0 ? int64_t{1} : int64_t{0});
+      }
       const int64_t v = arguments[0].value.int_value;
       return Value(v > 0 ? int64_t{1} : (v < 0 ? int64_t{-1} : int64_t{0}));
     }
     if (arguments[0].type == ValueType::kDouble) {
       const double v = arguments[0].value.double_value;
+      if (std::isnan(v)) {
+        return Value(v);
+      }
       return Value(v > 0.0 ? 1.0 : (v < 0.0 ? -1.0 : 0.0));
     }
     return StatusError(StatusCode::kInvalidArgument,
@@ -7873,15 +7988,43 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return Value();
     }
-    const int64_t digits = arguments.size() == 2
-                               ? (arguments[1].type == ValueType::kInt64
-                                      ? arguments[1].value.int_value
-                                      : 0)
-                               : 0;
+    int64_t digits = 0;
+    if (arguments.size() == 2) {
+      if (arguments[1].type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ROUND digits must be an integer");
+      }
+      digits = arguments[1].value.int_value;
+    }
     // INT64 input must not round-trip through double: |v| > 2^53 loses
     // precision and INT64_MAX (== 2^63 as a double) casts back to INT64_MIN
     // (UB). Round on integers directly.
     if (arguments[0].type == ValueType::kInt64) {
+      if (arguments[0].IsUnsigned()) {
+        const auto v = static_cast<uint64_t>(arguments[0].value.int_value);
+        if (digits >= 0) {
+          return arguments[0];
+        }
+        uint64_t scale = 1;
+        for (int64_t i = 0; i < -digits; ++i) {
+          if (scale > std::numeric_limits<uint64_t>::max() / 10) {
+            return Value(int64_t{0}).WithUnsigned();
+          }
+          scale *= 10;
+        }
+        uint64_t q = v / scale;
+        const uint64_t rem = v % scale;
+        const uint64_t half = scale / 2;
+        if (rem >= half) {
+          q += 1;
+        }
+        uint64_t result = 0;
+        if (__builtin_mul_overflow(q, scale, &result)) {
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in ROUND");
+        }
+        return Value(static_cast<int64_t>(result)).WithUnsigned();
+      }
       const int64_t v = arguments[0].value.int_value;
       if (digits >= 0) {
         return Value(v);  // an integer is already rounded to >=0 places
@@ -7908,10 +8051,17 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       return Value(result);
     }
-    const double val = arguments[0].value.double_value;
-    const double factor = std::pow(10.0, digits);
-    const double res = std::round(val * factor) / factor;
-    return Value(res);
+    if (arguments[0].type == ValueType::kDouble) {
+      const double val = arguments[0].value.double_value;
+      if (std::isnan(val)) {
+        return Value(val);
+      }
+      const double factor = std::pow(10.0, digits);
+      const double res = std::round(val * factor) / factor;
+      return Value(res);
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "ROUND requires a numeric argument");
   }
   if (name == "trunc" || name == "truncate") {
     if (arguments.empty() || arguments.size() > 2) {
@@ -7922,13 +8072,30 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return Value();
     }
-    const int64_t digits = arguments.size() == 2
-                               ? (arguments[1].type == ValueType::kInt64
-                                      ? arguments[1].value.int_value
-                                      : 0)
-                               : 0;
+    int64_t digits = 0;
+    if (arguments.size() == 2) {
+      if (arguments[1].type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           name + " digits must be an integer");
+      }
+      digits = arguments[1].value.int_value;
+    }
     // INT64 input: truncation never needs a double round-trip (see ROUND).
     if (arguments[0].type == ValueType::kInt64) {
+      if (arguments[0].IsUnsigned()) {
+        const auto v = static_cast<uint64_t>(arguments[0].value.int_value);
+        if (digits >= 0) {
+          return arguments[0];
+        }
+        uint64_t scale = 1;
+        for (int64_t i = 0; i < -digits; ++i) {
+          if (scale > std::numeric_limits<uint64_t>::max() / 10) {
+            return Value(int64_t{0}).WithUnsigned();
+          }
+          scale *= 10;
+        }
+        return Value(static_cast<int64_t>(v / scale * scale)).WithUnsigned();
+      }
       const int64_t v = arguments[0].value.int_value;
       if (digits >= 0) {
         return Value(v);
@@ -7943,10 +8110,17 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       // (v / scale) * scale never overflows: its magnitude is <= |v|.
       return Value(v / scale * scale);
     }
-    const double val = arguments[0].value.double_value;
-    const double factor = std::pow(10.0, digits);
-    const double res = std::trunc(val * factor) / factor;
-    return Value(res);
+    if (arguments[0].type == ValueType::kDouble) {
+      const double val = arguments[0].value.double_value;
+      if (std::isnan(val)) {
+        return Value(val);
+      }
+      const double factor = std::pow(10.0, digits);
+      const double res = std::trunc(val * factor) / factor;
+      return Value(res);
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       name + " requires a numeric argument");
   }
   if (name == "ceil" || name == "ceiling") {
     if (arguments.size() != 1) {
@@ -7959,7 +8133,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].type == ValueType::kInt64) {
       return arguments[0];
     }
-    return Value(std::ceil(arguments[0].value.double_value));
+    if (arguments[0].type == ValueType::kDouble) {
+      return Value(std::ceil(arguments[0].value.double_value));
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       name + " requires a numeric argument");
   }
   if (name == "floor") {
     if (arguments.size() != 1) {
@@ -7972,7 +8150,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].type == ValueType::kInt64) {
       return arguments[0];
     }
-    return Value(std::floor(arguments[0].value.double_value));
+    if (arguments[0].type == ValueType::kDouble) {
+      return Value(std::floor(arguments[0].value.double_value));
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "FLOOR requires a numeric argument");
   }
   if (name == "mod") {
     if (arguments.size() != 2) {
@@ -7984,6 +8166,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (arguments[0].type == ValueType::kInt64 &&
         arguments[1].type == ValueType::kInt64) {
+      if (arguments[0].IsUnsigned() || arguments[1].IsUnsigned()) {
+        const auto r = static_cast<uint64_t>(arguments[1].value.int_value);
+        if (r == 0) {
+          return StatusError(StatusCode::kIsInfinity, "division by zero in MOD");
+        }
+        const auto l = static_cast<uint64_t>(arguments[0].value.int_value);
+        return Value(static_cast<int64_t>(l % r)).WithUnsigned();
+      }
       if (arguments[1].value.int_value == 0) {
         return StatusError(StatusCode::kIsInfinity, "division by zero in MOD");
       }
@@ -8017,12 +8207,20 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "unsupported argument type for MOD");
     }
-    const double l = left_double
-                         ? arguments[0].value.double_value
-                         : static_cast<double>(arguments[0].value.int_value);
-    const double r = right_double
-                         ? arguments[1].value.double_value
-                         : static_cast<double>(arguments[1].value.int_value);
+    const double l =
+        left_double
+            ? arguments[0].value.double_value
+            : (arguments[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                             arguments[0].value.int_value))
+                                         : static_cast<double>(
+                                               arguments[0].value.int_value));
+    const double r =
+        right_double
+            ? arguments[1].value.double_value
+            : (arguments[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                             arguments[1].value.int_value))
+                                         : static_cast<double>(
+                                               arguments[1].value.int_value));
     if (r == 0.0) {
       return StatusError(StatusCode::kIsInfinity, "division by zero");
     }
@@ -8046,13 +8244,34 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                            "unsupported argument type for " + name);
       }
     }
-    const double l = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    const double r = arguments[1].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[1].value.int_value)
-                         : arguments[1].value.double_value;
-    return Value(std::pow(l, r));
+    const double l =
+        arguments[0].type == ValueType::kInt64
+            ? (arguments[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                             arguments[0].value.int_value))
+                                         : static_cast<double>(
+                                               arguments[0].value.int_value))
+            : arguments[0].value.double_value;
+    const double r =
+        arguments[1].type == ValueType::kInt64
+            ? (arguments[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                             arguments[1].value.int_value))
+                                         : static_cast<double>(
+                                               arguments[1].value.int_value))
+            : arguments[1].value.double_value;
+    if (l < 0.0 && !std::isinf(l) && !std::isnan(r) && std::floor(r) != r) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Floating point error in function: POW");
+    }
+    if (l == 0.0 && r < 0.0 && !std::isinf(r)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "division by zero in POW");
+    }
+    const double res = std::pow(l, r);
+    if (std::isinf(res) && !std::isinf(l) && !std::isinf(r)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "Floating point overflow in function: POW");
+    }
+    return Value(res);
   }
   if (name == "sqrt") {
     if (arguments.size() != 1) {
@@ -8062,9 +8281,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "SQRT"));
     if (v < 0.0) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SQRT of negative number");
@@ -8079,9 +8296,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "CBRT"));
     return Value(std::cbrt(v));
   }
   if (name == "greatest" || name == "least") {
@@ -8094,6 +8309,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value();
       }
     }
+    for (const auto& v : arguments) {
+      if (v.type == ValueType::kDouble && std::isnan(v.value.double_value)) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
+    }
     Value best = arguments[0];
     // Mixed INT64/DOUBLE arguments promote to DOUBLE (GoogleSQL); the raw
     // Value::operator< throws across types, so compare numerically.
@@ -8101,32 +8321,45 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return v.type == ValueType::kInt64 || v.type == ValueType::kDouble;
     };
     const auto as_double = [](const Value& v) {
-      return v.type == ValueType::kDouble
-                 ? v.value.double_value
-                 : static_cast<double>(v.value.int_value);
-    };
-    const auto greater = [&](const Value& a, const Value& b) {
-      if (numeric(a) && numeric(b)) {
-        return as_double(a) > as_double(b);
+      if (v.type == ValueType::kDouble) {
+        return v.value.double_value;
       }
-      return a > b;
-    };
-    const auto less = [&](const Value& a, const Value& b) {
-      if (numeric(a) && numeric(b)) {
-        return as_double(a) < as_double(b);
+      if (v.IsUnsigned()) {
+        return static_cast<double>(static_cast<uint64_t>(v.value.int_value));
       }
-      return a < b;
+      return static_cast<double>(v.value.int_value);
     };
     for (size_t i = 1; i < arguments.size(); ++i) {
-      if (name == "greatest") {
-        if (greater(arguments[i], best)) {
+      if (best.type == ValueType::kInt64 && arguments[i].type == ValueType::kInt64) {
+        const bool takes =
+            name == "greatest" ? arguments[i] > best : arguments[i] < best;
+        if (takes) {
           best = arguments[i];
         }
-      } else {
-        if (less(arguments[i], best)) {
+      } else if (numeric(best) && numeric(arguments[i])) {
+        const bool takes = name == "greatest"
+                               ? as_double(arguments[i]) > as_double(best)
+                               : as_double(arguments[i]) < as_double(best);
+        if (takes) {
           best = arguments[i];
         }
+      } else if (name == "greatest") {
+        if (arguments[i] > best) {
+          best = arguments[i];
+        }
+      } else if (arguments[i] < best) {
+        best = arguments[i];
       }
+    }
+    bool has_double = false;
+    for (const auto& v : arguments) {
+      if (v.type == ValueType::kDouble) {
+        has_double = true;
+        break;
+      }
+    }
+    if (has_double && best.type == ValueType::kInt64) {
+      best = Value(as_double(best));
     }
     return best;
   }
@@ -8138,13 +8371,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "LN"));
     return Value(std::log(v));
   }
   if (name == "log" || name == "log10") {
-    if (arguments.empty() || arguments.size() > 2) {
+    if (name == "log10" ? arguments.size() != 1
+                        : (arguments.empty() || arguments.size() > 2)) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " argument count mismatch");
     }
@@ -8152,20 +8384,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], name));
     if (name == "log10") {
       return Value(std::log10(v));
     }
     if (arguments.size() == 1) {
       return Value(std::log(v));
     }
-    const double base = arguments[1].type == ValueType::kInt64
-                            ? static_cast<double>(arguments[1].value.int_value)
-                            : arguments[1].value.double_value;
-    // Reference quirk: the logarithm of 1 to an infinite base is undefined
-    // (NaN), not zero; plain IEEE division would report +/-0 there.
+    ASSIGN_OR_RETURN(double, base, to_numeric_double(arguments[1], "LOG base"));
     if (v == 1.0 && std::isinf(base)) {
       return Value(std::numeric_limits<double>::quiet_NaN());
     }
@@ -8179,10 +8405,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    return Value(std::exp(v));
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "EXP"));
+    const double res = std::exp(v);
+    if (std::isinf(res) && !std::isinf(v)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "Floating point overflow in function: EXP");
+    }
+    return Value(res);
   }
   if (name == "cos") {
     if (arguments.size() != 1) {
@@ -8192,9 +8421,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "COS"));
     return Value(std::cos(v));
   }
   if (name == "sin") {
@@ -8205,9 +8432,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "SIN"));
     return Value(std::sin(v));
   }
   if (name == "tan") {
@@ -8218,9 +8443,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "TAN"));
     return Value(std::tan(v));
   }
   if (name == "acos") {
@@ -8231,9 +8454,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "ACOS"));
+    if (v < -1.0 || v > 1.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ACOS argument out of domain [-1, 1]");
+    }
     return Value(std::acos(v));
   }
   if (name == "asin") {
@@ -8244,9 +8469,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "ASIN"));
+    if (v < -1.0 || v > 1.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ASIN argument out of domain [-1, 1]");
+    }
     return Value(std::asin(v));
   }
   if (name == "atan") {
@@ -8257,9 +8484,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "ATAN"));
     return Value(std::atan(v));
   }
   if (name == "atan2") {
@@ -8270,12 +8495,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull() || arguments[1].IsNull()) {
       return Value();
     }
-    const double y = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    const double x = arguments[1].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[1].value.int_value)
-                         : arguments[1].value.double_value;
+    ASSIGN_OR_RETURN(double, y, to_numeric_double(arguments[0], "ATAN2"));
+    ASSIGN_OR_RETURN(double, x, to_numeric_double(arguments[1], "ATAN2"));
     return Value(std::atan2(y, x));
   }
   if (name == "pi") {
@@ -8292,20 +8513,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    auto to_double_val = [](const Value& val) -> StatusOr<double> {
-      if (val.type == ValueType::kInt64) {
-        return static_cast<double>(val.value.int_value);
-      }
-      if (val.type == ValueType::kDouble) {
-        return val.value.double_value;
-      }
-      if (val.type == ValueType::kVarChar) {
-        return std::stod(std::string(val.value.varchar_value));
-      }
-      return StatusError(StatusCode::kInvalidArgument,
-                         "cannot convert value to double");
-    };
-    ASSIGN_OR_RETURN(double, r0, (to_double_val(arguments[0])));
+    ASSIGN_OR_RETURN(double, r0, to_numeric_double(arguments[0], "RADIANS"));
     return Value(r0 * (M_PI / 180.0));
   }
   if (name == "degrees") {
@@ -8316,20 +8524,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    auto to_double_val = [](const Value& val) -> StatusOr<double> {
-      if (val.type == ValueType::kInt64) {
-        return static_cast<double>(val.value.int_value);
-      }
-      if (val.type == ValueType::kDouble) {
-        return val.value.double_value;
-      }
-      if (val.type == ValueType::kVarChar) {
-        return std::stod(std::string(val.value.varchar_value));
-      }
-      return StatusError(StatusCode::kInvalidArgument,
-                         "cannot convert value to double");
-    };
-    ASSIGN_OR_RETURN(double, r0, (to_double_val(arguments[0])));
+    ASSIGN_OR_RETURN(double, r0, to_numeric_double(arguments[0], "DEGREES"));
     return Value(r0 * (180.0 / M_PI));
   }
 
@@ -8341,10 +8536,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    return Value(std::cosh(v));
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "COSH"));
+    const double res = std::cosh(v);
+    if (std::isinf(res) && !std::isinf(v)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "Floating point overflow in function: COSH");
+    }
+    return Value(res);
   }
   if (name == "sinh") {
     if (arguments.size() != 1) {
@@ -8354,10 +8552,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    return Value(std::sinh(v));
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "SINH"));
+    const double res = std::sinh(v);
+    if (std::isinf(res) && !std::isinf(v)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "Floating point overflow in function: SINH");
+    }
+    return Value(res);
   }
   if (name == "tanh") {
     if (arguments.size() != 1) {
@@ -8367,9 +8568,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const double v = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "TANH"));
     return Value(std::tanh(v));
   }
   if (name == "div") {
@@ -8382,6 +8581,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (arguments[0].type == ValueType::kInt64 &&
         arguments[1].type == ValueType::kInt64) {
+      if (arguments[0].IsUnsigned() || arguments[1].IsUnsigned()) {
+        const auto r = static_cast<uint64_t>(arguments[1].value.int_value);
+        if (r == 0) {
+          return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
+        }
+        const auto l = static_cast<uint64_t>(arguments[0].value.int_value);
+        return Value(static_cast<int64_t>(l / r)).WithUnsigned();
+      }
       if (arguments[1].value.int_value == 0) {
         return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
       }
@@ -8391,18 +8598,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       return Value(arguments[0].value.int_value / arguments[1].value.int_value);
     }
-    const double l = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    const double r = arguments[1].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[1].value.int_value)
-                         : arguments[1].value.double_value;
+    ASSIGN_OR_RETURN(double, l, to_numeric_double(arguments[0], "DIV"));
+    ASSIGN_OR_RETURN(double, r, to_numeric_double(arguments[1], "DIV"));
     if (r == 0.0) {
       return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
     }
     const double quotient = std::trunc(l / r);
     // static_cast<int64_t> of an out-of-range double is UB; DIV must raise.
-    if (quotient < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
+    if (std::isnan(quotient) || std::isinf(quotient) ||
+        quotient < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
         quotient >= -static_cast<double>(std::numeric_limits<int64_t>::min())) {
       return StatusError(StatusCode::kIsInfinity,
                          "DIV result out of range for INT64");
@@ -8417,12 +8621,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull() || arguments[1].IsNull()) {
       return Value();
     }
-    const double l = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    const double r = arguments[1].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[1].value.int_value)
-                         : arguments[1].value.double_value;
+    ASSIGN_OR_RETURN(double, l, to_numeric_double(arguments[0], name));
+    ASSIGN_OR_RETURN(double, r, to_numeric_double(arguments[1], name));
     if (r == 0.0) {
       return name == "safe_divide" ? Value() : Value(l / r);
     }
@@ -8442,8 +8642,38 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull() || arguments[1].IsNull()) {
       return Value();
     }
+    if ((arguments[0].type != ValueType::kInt64 &&
+         arguments[0].type != ValueType::kDouble) ||
+        (arguments[1].type != ValueType::kInt64 &&
+         arguments[1].type != ValueType::kDouble)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires numeric arguments");
+    }
     if (arguments[0].type == ValueType::kInt64 &&
         arguments[1].type == ValueType::kInt64) {
+      if (arguments[0].IsUnsigned() || arguments[1].IsUnsigned()) {
+        const auto l = static_cast<uint64_t>(arguments[0].value.int_value);
+        const auto r = static_cast<uint64_t>(arguments[1].value.int_value);
+        uint64_t res = 0;
+        if (name == "safe_add") {
+          if (__builtin_add_overflow(l, r, &res)) {
+            return Value();
+          }
+          return Value(static_cast<int64_t>(res)).WithUnsigned();
+        }
+        if (name == "safe_subtract") {
+          if (__builtin_sub_overflow(l, r, &res)) {
+            return Value();
+          }
+          return Value(static_cast<int64_t>(res)).WithUnsigned();
+        }
+        if (name == "safe_multiply") {
+          if (__builtin_mul_overflow(l, r, &res)) {
+            return Value();
+          }
+          return Value(static_cast<int64_t>(res)).WithUnsigned();
+        }
+      }
       const int64_t l = arguments[0].value.int_value;
       const int64_t r = arguments[1].value.int_value;
       if (name == "safe_add") {
@@ -8468,12 +8698,20 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value(res);
       }
     }
-    const double l = arguments[0].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[0].value.int_value)
-                         : arguments[0].value.double_value;
-    const double r = arguments[1].type == ValueType::kInt64
-                         ? static_cast<double>(arguments[1].value.int_value)
-                         : arguments[1].value.double_value;
+    const double l =
+        arguments[0].type == ValueType::kInt64
+            ? (arguments[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                             arguments[0].value.int_value))
+                                         : static_cast<double>(
+                                               arguments[0].value.int_value))
+            : arguments[0].value.double_value;
+    const double r =
+        arguments[1].type == ValueType::kInt64
+            ? (arguments[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                             arguments[1].value.int_value))
+                                         : static_cast<double>(
+                                               arguments[1].value.int_value))
+            : arguments[1].value.double_value;
     // SAFE_* return NULL on overflow; the double path must not leak +/-inf.
     const double checked =
         name == "safe_add" ? l + r : (name == "safe_subtract" ? l - r : l * r);
@@ -8490,7 +8728,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
+    if (arguments[0].type != ValueType::kInt64 &&
+        arguments[0].type != ValueType::kDouble) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SAFE_NEGATE requires numeric argument");
+    }
     if (arguments[0].type == ValueType::kInt64) {
+      if (arguments[0].IsUnsigned()) {
+        if (arguments[0].value.int_value == 0) {
+          return arguments[0];
+        }
+        return Value();
+      }
       if (arguments[0].value.int_value == std::numeric_limits<int64_t>::min()) {
         return Value();
       }
@@ -9011,49 +9260,92 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "GENERATE_ARRAY requires 2 or 3 arguments");
     }
-    if (arguments[0].IsNull() || arguments[1].IsNull()) {
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() == 3 && arguments[2].IsNull())) {
       return Value();
     }
-    const bool has_double =
+    auto numeric = [](const Value& v) -> StatusOr<double> {
+      if (v.type == ValueType::kInt64) {
+        if (v.IsUnsigned()) {
+          return static_cast<double>(static_cast<uint64_t>(v.value.int_value));
+        }
+        return static_cast<double>(v.value.int_value);
+      }
+      if (v.type == ValueType::kDouble) {
+        return v.value.double_value;
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GENERATE_ARRAY requires numeric arguments");
+    };
+    ASSIGN_OR_RETURN(double, start, (numeric(arguments[0])));
+    ASSIGN_OR_RETURN(double, end, (numeric(arguments[1])));
+    ASSIGN_OR_RETURN(double, step,
+                     (arguments.size() == 3 ? numeric(arguments[2])
+                                            : StatusOr<double>(0.0)));
+    if (step == 0.0) {
+      if (arguments.size() == 3) {
+        return StatusError(StatusCode::kIsInfinity,
+                           "Sequence step cannot be 0.");
+      }
+      step = start <= end ? 1.0 : -1.0;
+    }
+    const bool saw_double =
         arguments[0].type == ValueType::kDouble ||
         arguments[1].type == ValueType::kDouble ||
         (arguments.size() == 3 && arguments[2].type == ValueType::kDouble);
-    auto start_d = static_cast<double>(arguments[0].value.int_value);
-    auto end_d = static_cast<double>(arguments[1].value.int_value);
-    if (arguments[0].type == ValueType::kDouble) {
-      start_d = arguments[0].value.double_value;
-    }
-    if (arguments[1].type == ValueType::kDouble) {
-      end_d = arguments[1].value.double_value;
-    }
-    double step_d = 1.0;
-    if (arguments.size() == 3) {
-      if (arguments[2].IsNull()) {
-        return Value();
+    bool saw_uint = false;
+    for (const Value& v : arguments) {
+      if (v.IsUnsigned()) {
+        saw_uint = true;
       }
-      step_d = arguments[2].type == ValueType::kDouble
-                   ? arguments[2].value.double_value
-                   : static_cast<double>(arguments[2].value.int_value);
     }
-    if (step_d == 0.0) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "GENERATE_ARRAY step must be nonzero");
+    for (const Expression& argument : call.Args()) {
+      if (argument->Type() != TypeTag::kCastExp) {
+        continue;
+      }
+      std::string target = argument->AsCastExpression().TargetTypeName();
+      for (char& c : target) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      }
+      if (target.find("UINT") != std::string::npos) {
+        saw_uint = true;
+      }
     }
-    if ((step_d > 0 && end_d < start_d) || (step_d < 0 && end_d > start_d)) {
-      return has_double ? Value::Array({}, "DOUBLE")
-                        : Value::Array({}, "INT64");
+    const bool integral =
+        !saw_double &&
+        start == static_cast<double>(static_cast<int64_t>(start)) &&
+        step == static_cast<double>(static_cast<int64_t>(step));
+    const std::string element_type =
+        integral ? (saw_uint ? "UINT64" : "INT64") : "DOUBLE";
+
+    if ((step > 0 && start > end) || (step < 0 && start < end)) {
+      return Value::Array({}, element_type);
     }
-    const int64_t count =
-        static_cast<int64_t>(std::floor((end_d - start_d) / step_d)) + 1;
+
     std::vector<Value> elements;
-    elements.reserve(static_cast<size_t>(std::max<int64_t>(count, 0)));
-    for (int64_t i = 0; i < count; ++i) {
-      const double v = start_d + (static_cast<double>(i) * step_d);
-      elements.push_back(has_double ? Value(v)
-                                    : Value(static_cast<int64_t>(v)));
+    constexpr size_t kMaxGeneratedElements = 1'000'000;
+    for (double value = start; (step > 0 ? value <= end : value >= end);
+         value += step) {
+      if (elements.size() == kMaxGeneratedElements) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_ARRAY generated too many elements");
+      }
+      if (integral) {
+        if (saw_uint) {
+          elements.emplace_back(
+              Value(static_cast<int64_t>(static_cast<uint64_t>(value)))
+                  .WithUnsigned());
+        } else {
+          elements.emplace_back(static_cast<int64_t>(value));
+        }
+      } else {
+        elements.emplace_back(value);
+      }
+      if (!std::isfinite(value + step)) {
+        break;
+      }
     }
-    return has_double ? Value::Array(std::move(elements), "DOUBLE")
-                      : Value::Array(std::move(elements), "INT64");
+    return Value::Array(std::move(elements), element_type);
   }
 
   // GENERATE_SERIES is the PostgreSQL-compatible spelling of the numeric
@@ -9152,24 +9444,40 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   }
 
   if (name == "generate_date_array") {
-    if (call.Args().size() < 2 || call.Args().size() > 3) {
+    if (call.Args().size() < 2 || call.Args().size() > 3 ||
+        arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "GENERATE_DATE_ARRAY requires 2 or 3 arguments");
     }
-    const Value start = arguments.empty() ? Value() : arguments[0];
-    const Value end = arguments.size() > 1 ? arguments[1] : Value();
-    auto as_date = [](const Value& v) -> Value {
-      if (v.type == ValueType::kVarChar) {
-        return Value::Date(std::string_view(v.value.varchar_value));
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() == 3 && arguments[2].IsNull())) {
+      return Value();
+    }
+    auto to_days = [](const Value& v) -> StatusOr<int64_t> {
+      if (v.type == ValueType::kDate) {
+        return v.DateDays();
       }
-      return v;
-    };
-    const Value start_date = as_date(start);
-    const Value end_date = as_date(end);
-    if (start_date.IsNull() || end_date.IsNull() ||
-        start_date.type != ValueType::kDate ||
-        end_date.type != ValueType::kDate) {
+      if (v.type == ValueType::kVarChar) {
+        auto parsed = TryParseDateDays(v.value.varchar_value);
+        if (parsed.HasValue()) {
+          return parsed.Value();
+        }
+      }
       return StatusError(StatusCode::kInvalidArgument, "DATE value required");
+    };
+    auto start_days_or = to_days(arguments[0]);
+    if (!start_days_or.HasValue()) {
+      return StatusError(StatusCode::kInvalidArgument, "DATE value required");
+    }
+    auto end_days_or = to_days(arguments[1]);
+    if (!end_days_or.HasValue()) {
+      return StatusError(StatusCode::kInvalidArgument, "DATE value required");
+    }
+    const int64_t start_days = start_days_or.Value();
+    const int64_t end_days = end_days_or.Value();
+    if (start_days < -11000000 || start_days > 11000000 ||
+        end_days < -11000000 || end_days > 11000000) {
+      return StatusError(StatusCode::kInvalidArgument, "DATE value out of range");
     }
     int64_t step_days = 1;
     if (call.Args().size() == 3) {
@@ -9188,9 +9496,6 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
       } else {
         const Value& step = arguments[2];
-        if (step.IsNull()) {
-          return Value();
-        }
         if (step.type == ValueType::kInt64) {
           step_days = step.value.int_value;
         } else {
@@ -9210,12 +9515,27 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (step_days == 0) {
       return StatusError(StatusCode::kIsInfinity, "Sequence step cannot be 0.");
     }
-    const int64_t start_days = start_date.DateDays();
-    const int64_t end_days = end_date.DateDays();
+    if ((step_days > 0 && start_days > end_days) ||
+        (step_days < 0 && start_days < end_days)) {
+      return Value::Array({}, "DATE");
+    }
     std::vector<Value> elements;
-    for (int64_t d = start_days; step_days > 0 ? d <= end_days : d >= end_days;
+    constexpr size_t kMaxGeneratedDates = 1'000'000;
+    for (int64_t d = start_days;
+         step_days > 0 ? d <= end_days : d >= end_days;
          d += step_days) {
+      if (elements.size() == kMaxGeneratedDates) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_DATE_ARRAY generated too many elements");
+      }
+      if (d < -11000000 || d > 11000000) {
+        return StatusError(StatusCode::kInvalidArgument, "DATE value out of range");
+      }
       elements.push_back(Value::DateFromDays(d));
+      int64_t next = 0;
+      if (__builtin_add_overflow(d, step_days, &next)) {
+        break;
+      }
     }
     return Value::Array(std::move(elements), "DATE");
   }
@@ -9858,144 +10178,6 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return array.ArrayElements().front();
   }
 
-  if (name == "generate_array") {
-    if (arguments.size() < 2 || arguments.size() > 3) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         name + " requires two or three arguments");
-    }
-    if (arguments[0].IsNull() || arguments[1].IsNull() ||
-        (arguments.size() == 3 && arguments[2].IsNull())) {
-      return Value();
-    }
-    auto numeric = [](const Value& v) -> StatusOr<double> {
-      if (v.type == ValueType::kInt64) {
-        return static_cast<double>(v.value.int_value);
-      }
-      if (v.type == ValueType::kDouble) {
-        return v.value.double_value;
-      }
-      return StatusError(StatusCode::kInvalidArgument,
-                         "GENERATE_ARRAY requires numeric arguments");
-    };
-    ASSIGN_OR_RETURN(double, start, (numeric(arguments[0])));
-    ASSIGN_OR_RETURN(double, end, (numeric(arguments[1])));
-    ASSIGN_OR_RETURN(double, step,
-                     (arguments.size() == 3 ? numeric(arguments[2])
-                                            : StatusOr<double>(0.0)));
-    if (step == 0.0) {
-      if (arguments.size() == 3) {
-        return StatusError(StatusCode::kIsInfinity,
-                           "Sequence step cannot be 0.");
-      }
-      step = start <= end ? 1.0 : -1.0;
-    }
-    if ((start < end && step < 0) || (start > end && step > 0)) {
-      return Value::Array({}, "INT64");
-    }
-    bool saw_double =
-        arguments[0].type == ValueType::kDouble ||
-        arguments[1].type == ValueType::kDouble ||
-        (arguments.size() == 3 && arguments[2].type == ValueType::kDouble);
-    bool saw_uint = false;
-    for (const Expression& argument : call.Args()) {
-      if (argument->Type() != TypeTag::kCastExp) {
-        continue;
-      }
-      std::string target = argument->AsCastExpression().TargetTypeName();
-      for (char& c : target) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-      }
-      if (target.find("UINT") != std::string::npos) {
-        saw_uint = true;
-      }
-    }
-    const bool integral =
-        !saw_double &&
-        start == static_cast<double>(static_cast<int64_t>(start)) &&
-        step == static_cast<double>(static_cast<int64_t>(step));
-    const std::string element_type =
-        integral ? (saw_uint ? "UINT64" : "INT64") : "DOUBLE";
-    std::vector<Value> elements;
-    constexpr size_t kMaxGeneratedElements = 1000000;
-    for (double value = start; elements.size() < kMaxGeneratedElements &&
-                               (step > 0 ? value <= end : value >= end);
-         value += step) {  // NOLINT(cert-flp30-c) - float semantics pinned.
-      if (integral) {
-        elements.emplace_back(static_cast<int64_t>(value));
-      } else {
-        elements.emplace_back(value);
-      }
-    }
-    return Value::Array(std::move(elements), element_type);
-  }
-
-  if (name == "generate_date_array") {
-    if (arguments.size() < 2 || arguments.size() > 4) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "GENERATE_DATE_ARRAY requires two or more arguments");
-    }
-    if (arguments[0].IsNull() || arguments[1].IsNull()) {
-      return Value();
-    }
-    auto to_days = [](const Value& v) -> StatusOr<int64_t> {
-      if (v.type == ValueType::kDate) {
-        return v.DateDays();
-      }
-      return TryParseDateDays(v.AsString());
-    };
-    int64_t step_days = 1;
-    if (arguments.size() >= 3 && !arguments[2].IsNull()) {
-      // INTERVAL steps ride as unevaluated IntervalExpression arguments.
-      if (call.Args().size() >= 3 &&
-          call.Args()[2]->Type() == TypeTag::kIntervalExp) {
-        const auto& interval = call.Args()[2]->AsIntervalExpression();
-        std::string unit = std::string(interval.Unit());
-        for (char& c : unit) {
-          c = static_cast<char>(std::tolower(c));
-        }
-        step_days = unit == "day" || unit == "days" ? interval.Amount() : 0;
-      } else if (arguments[2].type == ValueType::kVarChar) {
-        // Dynamic steps arrive as make_interval(...) results encoded
-        // "Y-M D H:M:S"; only whole-day counts are supported here.
-        long long years = 0, months = 0, days = 0, hours = 0, mins = 0,
-                  secs = 0;
-        const std::string encoded = raw_str(arguments[2]);
-        if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
-                encoded.c_str(), "%lld-%lld %lld %lld:%lld:%lld", &years,
-                &months, &days, &hours, &mins, &secs) >= 3 &&
-            years == 0 && months == 0 && hours == 0 && mins == 0 && secs == 0 &&
-            days != 0) {
-          step_days = static_cast<int64_t>(days);
-        } else {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "GENERATE_DATE_ARRAY requires an INTERVAL step");
-        }
-      } else {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "GENERATE_DATE_ARRAY requires an INTERVAL step");
-      }
-      if (step_days == 0) {
-        return StatusError(
-            StatusCode::kInvalidArgument,
-            "GENERATE_DATE_ARRAY supports only whole-DAY intervals");
-      }
-    }
-    ASSIGN_OR_RETURN(int64_t, start_day, (to_days(arguments[0])));
-    ASSIGN_OR_RETURN(int64_t, end_day, (to_days(arguments[1])));
-    std::vector<Value> elements;
-    constexpr size_t kMaxGeneratedDates = 1000000;
-    if ((step_days > 0 && start_day <= end_day) ||
-        (step_days < 0 && start_day >= end_day)) {
-      for (int64_t day = start_day;
-           elements.size() < kMaxGeneratedDates &&
-           (step_days > 0 ? day <= end_day : day >= end_day);
-           day += step_days) {
-        elements.push_back(Value::DateFromDays(day));
-      }
-    }
-    return Value::Array(std::move(elements), "DATE");
-  }
-
   return StatusError(StatusCode::kInvalidArgument,
                      "unsupported function " + name);
 }
@@ -10074,7 +10256,7 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       ASSIGN_OR_RETURN(
           Value, child,
           (TryEvaluate(value.Child(), scope, aggregates, context, ctes)));
-      return EvaluateUnary(value.Op(), child);
+      return TryEvaluateUnary(value.Op(), child);
     }
     case TypeTag::kAggregateExp: {
       // Subqueries nested inside grouped queries have no explicit aggregate

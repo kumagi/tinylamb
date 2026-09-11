@@ -31,6 +31,7 @@
 #include "executor/partial_sort.hpp"
 #include "executor/pdqsort.hpp"
 #include "executor/sort.hpp"
+#include "executor/topn.hpp"
 #include "executor/two_phase_distinct_agg.hpp"
 #include "executor/values.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -379,6 +380,116 @@ TEST(ScanFilterTest, UnsignedComparisonsMatchGroundTruth) {
   Row tagged = row;
   tagged[0] = tagged[0].WithUnsigned();
   EXPECT_FALSE(relational_detail::MatchSimpleCompare(tagged, pred));
+}
+
+TEST(SortExecutorTest, UnsignedInt64AscendingAndDescendingOrder) {
+  Column unsigned_col("id", ValueType::kInt64);
+  unsigned_col.SetUnsigned(true);
+  const Schema schema("t", {unsigned_col});
+
+  const Value u0 = Value(0ULL).WithUnsigned();
+  const Value u10 = Value(10ULL).WithUnsigned();
+  const Value umax =
+      Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
+
+  // Test single-column path (SingleKey optimization) and multi-column path (AppendEncoded).
+  for (bool single_key : {true, false}) {
+    auto make_src = [&]() {
+      return std::make_shared<ValuesExecutor>(std::vector<Row>{
+          Row({umax}),
+          Row({u0}),
+          Row({u10}),
+      });
+    };
+
+    // Ascending
+    std::vector<SortExecutor::Key> asc_keys;
+    if (single_key) {
+      asc_keys.push_back(SortExecutor::Key{.expression = ColumnValueExp("id"),
+                                           .ascending = true,
+                                           .nulls_first = std::nullopt});
+    } else {
+      asc_keys.push_back(SortExecutor::Key{.expression = ColumnValueExp("id"),
+                                           .ascending = true,
+                                           .nulls_first = std::nullopt});
+      asc_keys.push_back(SortExecutor::Key{.expression = ColumnValueExp("id"),
+                                           .ascending = true,
+                                           .nulls_first = std::nullopt});
+    }
+    SortExecutor sort_asc(make_src(), schema, asc_keys);
+    sort_asc.MaterializePipeline();
+    std::vector<Value> asc_results;
+    Row row;
+    RowPosition rp;
+    while (sort_asc.Next(&row, &rp)) {
+      asc_results.push_back(row[0]);
+    }
+    ASSERT_EQ(asc_results.size(), 3U);
+    EXPECT_EQ(asc_results[0], u0);
+    EXPECT_EQ(asc_results[1], u10);
+    EXPECT_EQ(asc_results[2], umax);
+
+    // Descending
+    std::vector<SortExecutor::Key> desc_keys;
+    if (single_key) {
+      desc_keys.push_back(SortExecutor::Key{.expression = ColumnValueExp("id"),
+                                            .ascending = false,
+                                            .nulls_first = std::nullopt});
+    } else {
+      desc_keys.push_back(SortExecutor::Key{.expression = ColumnValueExp("id"),
+                                            .ascending = false,
+                                            .nulls_first = std::nullopt});
+      desc_keys.push_back(SortExecutor::Key{.expression = ColumnValueExp("id"),
+                                            .ascending = false,
+                                            .nulls_first = std::nullopt});
+    }
+    SortExecutor sort_desc(make_src(), schema, desc_keys);
+    sort_desc.MaterializePipeline();
+    std::vector<Value> desc_results;
+    while (sort_desc.Next(&row, &rp)) {
+      desc_results.push_back(row[0]);
+    }
+    ASSERT_EQ(desc_results.size(), 3U);
+    EXPECT_EQ(desc_results[0], umax);
+    EXPECT_EQ(desc_results[1], u10);
+    EXPECT_EQ(desc_results[2], u0);
+  }
+}
+
+TEST(TopNExecutorTest, UnsignedInt64TopNMatchesSort) {
+  Column unsigned_col("id", ValueType::kInt64);
+  unsigned_col.SetUnsigned(true);
+  const Schema schema("t", {unsigned_col});
+
+  const Value u0 = Value(0ULL).WithUnsigned();
+  const Value u10 = Value(10ULL).WithUnsigned();
+  const Value umax =
+      Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
+
+  auto make_src = [&]() {
+    return std::make_shared<ValuesExecutor>(std::vector<Row>{
+        Row({umax}),
+        Row({u0}),
+        Row({u10}),
+    });
+  };
+
+  std::vector<TopNExecutor::Key> keys = {
+      TopNExecutor::Key{.expression = ColumnValueExp("id"),
+                        .ascending = true,
+                        .nulls_first = std::nullopt}};
+
+  TopNExecutor topn(make_src(), schema, keys, /*limit=*/2, /*offset=*/0);
+
+  std::vector<Value> results;
+  Row row;
+  RowPosition rp;
+  while (topn.Next(&row, &rp)) {
+    results.push_back(row[0]);
+  }
+  ASSERT_EQ(results.size(), 2U);
+  EXPECT_EQ(results[0], u0);
+  EXPECT_EQ(results[1], u10);
 }
 
 TEST(GroupingSetsTest, OutputSchemaMatchesAggregateResultTypes) {

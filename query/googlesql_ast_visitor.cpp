@@ -3408,9 +3408,13 @@ StatusOr<Expression> VisitExpression(
       return UnaryExpressionExp(std::move(unk_e), UnaryOperation::kIsNotNull);
     }
     ASSIGN_OR_RETURN(Expression, not_e, (VisitExpression(*node.children[0])));
-    return UnaryExpressionExp(std::move(not_e), node.detail == "NOT"
-                                                    ? UnaryOperation::kNot
-                                                    : UnaryOperation::kMinus);
+    UnaryOperation op = UnaryOperation::kMinus;
+    if (node.detail == "NOT") {
+      op = UnaryOperation::kNot;
+    } else if (node.detail == "~") {
+      op = UnaryOperation::kBitwiseNot;
+    }
+    return UnaryExpressionExp(std::move(not_e), op);
   }
 
   if (node.kind == "ConcatExpr") {
@@ -5952,12 +5956,22 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
   return statement;
 }
 
-StatusOr<ValueType> ColumnType(const GoogleSqlAstNode& definition) {
+struct ColumnTypeInfo {
+  ValueType type{ValueType::kNull};
+  bool is_unsigned{false};
+};
+
+StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
   const GoogleSqlAstNode* schema = definition.Child("SimpleColumnSchema");
+  if (schema == nullptr) {
+    if (definition.Child("ArrayColumnSchema") != nullptr) {
+      return ColumnTypeInfo{ValueType::kArray, false};
+    }
+  }
   const GoogleSqlAstNode* path =
       schema != nullptr ? schema->Child("PathExpression") : nullptr;
   if (path == nullptr) {
-    return AstError<ValueType>("GoogleSQL AST: column type missing");
+    return AstError<ColumnTypeInfo>("GoogleSQL AST: column type missing");
   }
   ASSIGN_OR_RETURN(std::string, hv212301_0, (Path(*path)));
   // Proto / user-defined type names arrive as backticked dotted paths
@@ -5972,25 +5986,35 @@ StatusOr<ValueType> ColumnType(const GoogleSqlAstNode& definition) {
   }
   const std::string lower = Lower(cleaned);
   if (lower.starts_with("proto<") || lower.find('.') != std::string::npos) {
-    return ValueType::kVarChar;
+    return ColumnTypeInfo{ValueType::kVarChar, false};
   }
   const std::string& type = lower;
   if (type == "int" || type == "int64" || type == "integer" ||
-      type == "bigint" || type == "bool" || type == "boolean") {
-    return ValueType::kInt64;
+      type == "bigint" || type == "bool" || type == "boolean" ||
+      type == "int32" || type == "int16" || type == "int8") {
+    return ColumnTypeInfo{ValueType::kInt64, false};
+  }
+  if (type == "uint" || type == "uint64" || type == "uint32" ||
+      type == "uint16" || type == "uint8") {
+    return ColumnTypeInfo{ValueType::kInt64, true};
   }
   if (type == "numeric" || type == "decimal" || type == "double" ||
-      type == "float" || type == "float64") {
-    return ValueType::kDouble;
+      type == "float" || type == "float64" || type == "float32" ||
+      type == "bignumeric") {
+    return ColumnTypeInfo{ValueType::kDouble, false};
   }
   if (type == "date") {
-    return ValueType::kDate;
+    return ColumnTypeInfo{ValueType::kDate, false};
   }
   if (type == "string" || type == "varchar" || type == "char" ||
-      type == "timestamp" || type == "datetime") {
-    return ValueType::kVarChar;
+      type == "timestamp" || type == "datetime" || type == "time" ||
+      type == "interval" || type == "bytes" || type == "json") {
+    return ColumnTypeInfo{ValueType::kVarChar, false};
   }
-  return AstError<ValueType>("GoogleSQL AST: unsupported column type " + type);
+  if (type == "array" || type.starts_with("array<")) {
+    return ColumnTypeInfo{ValueType::kArray, false};
+  }
+  return AstError<ColumnTypeInfo>("GoogleSQL AST: unsupported column type " + type);
 }
 
 StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
@@ -6008,9 +6032,13 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
         return AstError<std::unique_ptr<Statement>>(
             "GoogleSQL AST: unnamed column");
       }
-      ASSIGN_OR_RETURN(ValueType, hv214138_0, (ColumnType(*definition)));
-      ASSIGN_OR_RETURN(std::string, hv214138_1, (Identifier(*name)));
-      columns.emplace_back(std::move(hv214138_1), hv214138_0);
+      ASSIGN_OR_RETURN(ColumnTypeInfo, col_info, (ColumnType(*definition)));
+      ASSIGN_OR_RETURN(std::string, col_name, (Identifier(*name)));
+      Column col(std::move(col_name), col_info.type);
+      if (col_info.is_unsigned) {
+        col.SetUnsigned(true);
+      }
+      columns.push_back(std::move(col));
     }
     ASSIGN_OR_RETURN(std::string, h_tbl, (Path(*path)));
     return std::make_unique<CreateTableStatement>(std::move(h_tbl),

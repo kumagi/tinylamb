@@ -511,8 +511,12 @@ bool ExpressionCannotThrow(const Expression& expression) {  // NOLINT
           // absorption/pullup expectation files pin those rewrites, and the
           // expr oracle fuzzers exercise them on well-typed trees).
           if (IsConstant(binary.Left()) && IsConstant(binary.Right())) {
-            return binary.Left()->AsConstantValue().GetValue().type ==
-                   binary.Right()->AsConstantValue().GetValue().type;
+            const auto lt = binary.Left()->AsConstantValue().GetValue().type;
+            const auto rt = binary.Right()->AsConstantValue().GetValue().type;
+            const bool numeric =
+                (lt == ValueType::kInt64 || lt == ValueType::kDouble) &&
+                (rt == ValueType::kInt64 || rt == ValueType::kDouble);
+            return lt == rt || numeric;
           }
           return true;
         }
@@ -557,7 +561,11 @@ bool ConstantBool(const Expression& expression, bool* value) {
   if (constant.IsNull()) {
     return false;
   }
-  *value = constant.Truthy();
+  if (constant.type != ValueType::kInt64 ||
+      (constant.value.int_value != 0 && constant.value.int_value != 1)) {
+    return false;
+  }
+  *value = constant.value.int_value != 0;
   return true;
 }
 
@@ -672,6 +680,24 @@ bool StaticallyInt64(const Expression& expression) {
   }
 }
 
+bool StaticallyNonNumeric(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kConstantValue) {
+    const Value& val = expression->AsConstantValue().GetValue();
+    return !val.IsNull() && val.type != ValueType::kInt64 &&
+           val.type != ValueType::kDouble;
+  }
+  try {
+    const TypeTag type = expression->ResultType(Schema()).GetType();
+    return type != TypeTag::kBigInt && type != TypeTag::kDouble &&
+           type != TypeTag::kInvalid;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 bool StaticallyNumeric(const Expression& expression) {
   if (!expression) {
     return false;
@@ -695,6 +721,62 @@ bool StaticallyDouble(const Expression& expression) {
   } catch (const std::exception&) {
     return false;
   }
+}
+
+// True when an expression is statically known NOT to produce a boolean result
+// (0, 1, or NULL). Boolean simplification rules (AND, OR, NOT NOT, XOR) must
+// never collapse into an expression of non-boolean type (such as VARCHAR or
+// DOUBLE) or non-boolean values (e.g. 2).
+bool StaticallyNonBoolean(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (StaticallyNonNumeric(expression) || StaticallyDouble(expression)) {
+    return true;
+  }
+  if (IsInt64Constant(expression)) {
+    const Value& val = expression->AsConstantValue().GetValue();
+    if (!val.IsNull()) {
+      const int64_t v = val.value.int_value;
+      return v != 0 && v != 1;
+    }
+  }
+  if (expression->Type() == TypeTag::kBinaryExp) {
+    const auto op = expression->AsBinaryExpression().Op();
+    switch (op) {
+      case BinaryOperation::kAdd:
+      case BinaryOperation::kSubtract:
+      case BinaryOperation::kMultiply:
+      case BinaryOperation::kDivide:
+      case BinaryOperation::kModulo:
+      case BinaryOperation::kShiftLeft:
+      case BinaryOperation::kShiftRight:
+        return true;
+      default:
+        break;
+    }
+  }
+  if (expression->Type() == TypeTag::kUnaryExp) {
+    const UnaryOperation op = expression->AsUnaryExpression().Op();
+    if (op == UnaryOperation::kMinus || op == UnaryOperation::kBitwiseNot) {
+      return true;
+    }
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp) {
+    const std::string& name =
+        expression->AsFunctionCallExpression().FuncName();
+    static const std::unordered_set<std::string> kNonBooleanFuncs = {
+        "abs",        "sign",      "round",       "trunc",
+        "truncate",   "ceil",      "ceiling",     "floor",
+        "safe_negate","length",    "char_length", "character_length",
+        "byte_length","strpos",    "instr",       "div",
+        "__bit_and",  "__bit_or",  "__bit_xor",   "__shift_left",
+        "__shift_right"};
+    if (kNonBooleanFuncs.contains(name) || name.starts_with("extract_")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Reducing x + x to x * 2 must not change the number of evaluations of a
@@ -827,6 +909,96 @@ bool ExpressionRuleSet::Contains(std::string_view name) const {
       rules_, [&](const ExpressionRule& rule) { return rule.Name() == name; });
 }
 
+Expression FactorCommonAndImpl(const Expression& expression) {
+  if (!expression || expression->Type() != TypeTag::kBinaryExp) {
+    return Expression{};
+  }
+  const auto& binary = expression->AsBinaryExpression();
+  if (binary.Op() != BinaryOperation::kOr) {
+    return Expression{};
+  }
+  const std::vector<Expression> left = SplitConjuncts(binary.Left());
+  const std::vector<Expression> right = SplitConjuncts(binary.Right());
+  if (left.empty() || right.empty()) {
+    return Expression{};
+  }
+
+  // Identify common conjuncts that can safely be factored out.
+  // Safety requirements:
+  // 1. SafeToReduceEvaluationCount: volatile functions (e.g. RAND()) must not
+  //    have their evaluation count collapsed.
+  // 2. Short-circuit order preservation: any conjunct in `left` (or `right`)
+  //    that appeared before a factored conjunct must be guaranteed not to
+  //    throw (ExpressionCannotThrow). Otherwise, moving the common conjunct
+  //    ahead of it could evaluate to FALSE and skip evaluating the throwing
+  //    preceding conjunct, silently erasing an error.
+  std::vector<Expression> common;
+  std::vector<Expression> left_rest;
+  std::vector<Expression> right_rest;
+
+  std::vector<size_t> matched_right_indices;
+  bool left_saw_throwing = false;
+
+  for (const Expression& l : left) {
+    if (!left_saw_throwing && SafeToReduceEvaluationCount(l)) {
+      bool found = false;
+      bool right_saw_throwing = false;
+      for (size_t r_idx = 0; r_idx < right.size(); ++r_idx) {
+        if (!right_saw_throwing &&
+            std::ranges::find(matched_right_indices, r_idx) ==
+                matched_right_indices.end() &&
+            Same(l, right[r_idx])) {
+          matched_right_indices.push_back(r_idx);
+          common.push_back(l);
+          found = true;
+          break;
+        }
+        if (!ExpressionCannotThrow(right[r_idx])) {
+          right_saw_throwing = true;
+        }
+      }
+      if (!found) {
+        left_rest.push_back(l);
+      }
+    } else {
+      left_rest.push_back(l);
+    }
+    if (!ExpressionCannotThrow(l)) {
+      left_saw_throwing = true;
+    }
+  }
+
+  if (common.empty()) {
+    return Expression{};
+  }
+
+  for (size_t r_idx = 0; r_idx < right.size(); ++r_idx) {
+    if (std::ranges::find(matched_right_indices, r_idx) ==
+        matched_right_indices.end()) {
+      right_rest.push_back(right[r_idx]);
+    }
+  }
+
+  if (left_rest.empty() || right_rest.empty()) {
+    const std::vector<Expression>& dropped =
+        left_rest.empty() ? right_rest : left_rest;
+    if (!std::ranges::all_of(dropped, [](const Expression& e) {
+          return ExpressionCannotThrow(e);
+        })) {
+      return Expression{};
+    }
+    if (common.size() == 1 && StaticallyNonBoolean(common[0])) {
+      return Expression{};
+    }
+    return CombineConjuncts(common);
+  }
+
+  return BinaryExpressionExp(
+      CombineConjuncts(common), BinaryOperation::kAnd,
+      BinaryExpressionExp(CombineConjuncts(left_rest), BinaryOperation::kOr,
+                          CombineConjuncts(right_rest)));
+}
+
 const ExpressionRuleSet& ExpressionRuleSet::Default() {
   static const ExpressionRuleSet rules = [] {
     using namespace expression_dsl;
@@ -935,9 +1107,15 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           // (oracle-found: `CAST(NaN AS INT64) != -inf OR TRUE`).
           if (operation == BinaryOperation::kAnd) {
             if (has_left && left) {
+              if (StaticallyNonBoolean(bindings.at("right"))) {
+                return Expression{};
+              }
               return bindings.at("right");
             }
             if (has_right && right) {
+              if (StaticallyNonBoolean(bindings.at("left"))) {
+                return Expression{};
+              }
               return bindings.at("left");
             }
             if (has_left && !left) {
@@ -950,9 +1128,15 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           if (operation == BinaryOperation::kOr) {
             if (has_left && !left) {
+              if (StaticallyNonBoolean(bindings.at("right"))) {
+                return Expression{};
+              }
               return bindings.at("right");
             }
             if (has_right && !right) {
+              if (StaticallyNonBoolean(bindings.at("left"))) {
+                return Expression{};
+              }
               return bindings.at("left");
             }
             if (has_left && left) {
@@ -969,7 +1153,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         "double_negation",
         Unary(UnaryOperation::kNot, Unary(UnaryOperation::kNot, Any("child"))),
         [](const Expression&, const ExpressionBindings& bindings) {
-          return bindings.at("child");
+          const Expression& child = bindings.at("child");
+          if (StaticallyNonBoolean(child)) {
+            return Expression{};
+          }
+          return child;
         }));
     built.Add(ExpressionRule(
         "de_morgan",
@@ -1096,12 +1284,18 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               return UnaryExpressionExp(bindings.at("left"),
                                         UnaryOperation::kNot);
             }
+            if (StaticallyNonBoolean(bindings.at("left"))) {
+              return Expression{};
+            }
             return bindings.at("left");
           }
           if (has_left) {
             if (left) {
               return UnaryExpressionExp(bindings.at("right"),
                                         UnaryOperation::kNot);
+            }
+            if (StaticallyNonBoolean(bindings.at("right"))) {
+              return Expression{};
             }
             return bindings.at("right");
           }
@@ -1110,57 +1304,74 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     built.Add(ExpressionRule(
         "and_idempotent", Binary(BinaryOperation::kAnd, Any("x"), Any("x")),
         [](const Expression&, const ExpressionBindings& bindings) {
-          return bindings.at("x");
+          const Expression& x = bindings.at("x");
+          if (StaticallyNonBoolean(x) || !SafeToReduceEvaluationCount(x)) {
+            return Expression{};
+          }
+          return x;
         }));
     built.Add(ExpressionRule(
         "or_idempotent", Binary(BinaryOperation::kOr, Any("x"), Any("x")),
         [](const Expression&, const ExpressionBindings& bindings) {
-          return bindings.at("x");
+          const Expression& x = bindings.at("x");
+          if (StaticallyNonBoolean(x) || !SafeToReduceEvaluationCount(x)) {
+            return Expression{};
+          }
+          return x;
         }));
     // Absorption laws (x AND (x OR y) -> x, etc.).  Value-identical under
     // Kleene 3-valued logic, but they DROP y: the AST short-circuits only
     // when x decides, so when x is UNKNOWN/FALSE-but-undecided it still
     // evaluates y, and a raising y (oracle-found: `(NULL AND CAST(-inf AS
     // INT64) <= c) OR NULL`) must not be erased.  Fire only if y is total.
+    // Furthermore, x must be safe to reduce evaluations and cannot be non-boolean.
     built.Add(ExpressionRule(
         "absorption_and",
         Binary(BinaryOperation::kAnd, Any("x"),
                Binary(BinaryOperation::kOr, Any("x"), Any("y"))),
         [](const Expression&, const ExpressionBindings& bindings) {
-          if (!ExpressionCannotThrow(bindings.at("y"))) {
+          const Expression& x = bindings.at("x");
+          if (!ExpressionCannotThrow(bindings.at("y")) ||
+              StaticallyNonBoolean(x) || !SafeToReduceEvaluationCount(x)) {
             return Expression{};
           }
-          return bindings.at("x");
+          return x;
         }));
     built.Add(ExpressionRule(
         "absorption_and_reversed",
         Binary(BinaryOperation::kAnd,
                Binary(BinaryOperation::kOr, Any("x"), Any("y")), Any("x")),
         [](const Expression&, const ExpressionBindings& bindings) {
-          if (!ExpressionCannotThrow(bindings.at("y"))) {
+          const Expression& x = bindings.at("x");
+          if (!ExpressionCannotThrow(bindings.at("y")) ||
+              StaticallyNonBoolean(x) || !SafeToReduceEvaluationCount(x)) {
             return Expression{};
           }
-          return bindings.at("x");
+          return x;
         }));
     built.Add(ExpressionRule(
         "absorption_or",
         Binary(BinaryOperation::kOr, Any("x"),
                Binary(BinaryOperation::kAnd, Any("x"), Any("y"))),
         [](const Expression&, const ExpressionBindings& bindings) {
-          if (!ExpressionCannotThrow(bindings.at("y"))) {
+          const Expression& x = bindings.at("x");
+          if (!ExpressionCannotThrow(bindings.at("y")) ||
+              StaticallyNonBoolean(x) || !SafeToReduceEvaluationCount(x)) {
             return Expression{};
           }
-          return bindings.at("x");
+          return x;
         }));
     built.Add(ExpressionRule(
         "absorption_or_reversed",
         Binary(BinaryOperation::kOr,
                Binary(BinaryOperation::kAnd, Any("x"), Any("y")), Any("x")),
         [](const Expression&, const ExpressionBindings& bindings) {
-          if (!ExpressionCannotThrow(bindings.at("y"))) {
+          const Expression& x = bindings.at("x");
+          if (!ExpressionCannotThrow(bindings.at("y")) ||
+              StaticallyNonBoolean(x) || !SafeToReduceEvaluationCount(x)) {
             return Expression{};
           }
-          return bindings.at("x");
+          return x;
         }));
     built.Add(ExpressionRule(
         "identity_add_zero",
@@ -1171,11 +1382,19 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           // file): the identities fire on numeric/int columns even though
           // the AST types e.g. `a + 0.0` as double.  Known IEEE gap: a
           // -0.0 survivor is normalized to +0.0.
-          if (IsZero(bindings.at("left"))) {
-            return bindings.at("right");
+          const Expression& left = bindings.at("left");
+          const Expression& right = bindings.at("right");
+          if (IsZero(left)) {
+            if (StaticallyNonNumeric(right)) {
+              return Expression{};
+            }
+            return right;
           }
-          if (IsZero(bindings.at("right"))) {
-            return bindings.at("left");
+          if (IsZero(right)) {
+            if (StaticallyNonNumeric(left)) {
+              return Expression{};
+            }
+            return left;
           }
           return Expression{};
         }));
@@ -1186,17 +1405,28 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (!IsZero(bindings.at("right"))) {
             return Expression{};
           }
+          if (StaticallyNonNumeric(bindings.at("left"))) {
+            return Expression{};
+          }
           return bindings.at("left");
         }));
     built.Add(ExpressionRule(
         "identity_multiply_one",
         Binary(BinaryOperation::kMultiply, Any("left"), Any("right")),
         [](const Expression&, const ExpressionBindings& bindings) {
-          if (IsOne(bindings.at("left"))) {
-            return bindings.at("right");
+          const Expression& left = bindings.at("left");
+          const Expression& right = bindings.at("right");
+          if (IsOne(left)) {
+            if (StaticallyNonNumeric(right)) {
+              return Expression{};
+            }
+            return right;
           }
-          if (IsOne(bindings.at("right"))) {
-            return bindings.at("left");
+          if (IsOne(right)) {
+            if (StaticallyNonNumeric(left)) {
+              return Expression{};
+            }
+            return left;
           }
           return Expression{};
         }));
@@ -1207,6 +1437,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (!IsOne(bindings.at("right"))) {
             return Expression{};
           }
+          if (StaticallyNonNumeric(bindings.at("left"))) {
+            return Expression{};
+          }
           return bindings.at("left");
         }));
     built.Add(ExpressionRule(
@@ -1214,6 +1447,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         Binary(BinaryOperation::kAdd, Any("left"),
                Is(TypeTag::kConstantValue, "right")),
         [](const Expression&, const ExpressionBindings& bindings) {
+          if (StaticallyNonNumeric(bindings.at("left"))) {
+            return Expression{};
+          }
           const std::optional<int64_t> value =
               NegativeInt64Constant(bindings.at("right"));
           if (!value) {
@@ -1228,6 +1464,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         Binary(BinaryOperation::kSubtract, Any("left"),
                Is(TypeTag::kConstantValue, "right")),
         [](const Expression&, const ExpressionBindings& bindings) {
+          if (StaticallyNonNumeric(bindings.at("left"))) {
+            return Expression{};
+          }
           const std::optional<int64_t> value =
               NegativeInt64Constant(bindings.at("right"));
           if (!value) {
@@ -1279,13 +1518,38 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           // throwing tree into a value. Foldable siblings below produce the
           // constant before this rule fires (bottom-up), which is exactly
           // how the constant reaches here.
+          // Likewise, unary minus requires a numeric operand, so non-numeric
+          // inputs raise invalid argument and must not be erased.
           const Expression& child = bindings.at("child");
-          if (IsInt64Constant(child) &&
-              child->AsConstantValue().GetValue().value.int_value ==
-                  std::numeric_limits<int64_t>::min()) {
+          if (StaticallyNonNumeric(child)) {
             return Expression{};
           }
+          if (IsInt64Constant(child)) {
+            const Value val = child->AsConstantValue().GetValue();
+            if (val.IsUnsigned()) {
+              if (static_cast<uint64_t>(val.value.int_value) > 0) {
+                return Expression{};
+              }
+            } else if (val.value.int_value ==
+                       std::numeric_limits<int64_t>::min()) {
+              return Expression{};
+            }
+          }
           return child;
+        }));
+    built.Add(ExpressionRule(
+        "double_bitwise_negation",
+        Unary(UnaryOperation::kBitwiseNot,
+              Unary(UnaryOperation::kBitwiseNot, Any("child"))),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Expression& child = bindings.at("child");
+          if (StaticallyNonNumeric(child) || StaticallyDouble(child)) {
+            return Expression{};
+          }
+          if (IsInt64Constant(child) || StaticallyInt64(child)) {
+            return child;
+          }
+          return Expression{};
         }));
     built.Add(ExpressionRule(
         "reassociate_add_constants",
@@ -1395,9 +1659,10 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               return Expression{};
             }
             // Collapsing drops every condition evaluation; a throwing
-            // condition (oracle-found: CAST(NaN AS INT64) = 0) must survive
-            // or the rewrite erases an error the AST interpreter raises.
-            if (!ExpressionCannotThrow(condition)) {
+            // condition (oracle-found: CAST(NaN AS INT64) = 0) or volatile
+            // condition must survive or the rewrite erases an error or side-effect.
+            if (!ExpressionCannotThrow(condition) ||
+                !SafeToReduceEvaluationCount(condition)) {
               return Expression{};
             }
           }
@@ -1540,55 +1805,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     built.Add(ExpressionRule(
         "factor_or_common_and", AnyBinary(Any("left"), Any("right")),
         [](const Expression& expression, const ExpressionBindings&) {
-          const auto& binary = expression->AsBinaryExpression();
-          if (binary.Op() != BinaryOperation::kOr) {
-            return Expression{};
-          }
-          const std::vector<Expression> left = SplitConjuncts(binary.Left());
-          const std::vector<Expression> right = SplitConjuncts(binary.Right());
-          if (left.empty() || right.empty()) {
-            return Expression{};
-          }
-          std::vector<Expression> common;
-          std::vector<Expression> left_rest;
-          for (const Expression& conjunct : left) {
-            const bool shared =
-                std::ranges::any_of(right, [&](const Expression& candidate) {
-                  return Same(conjunct, candidate);
-                });
-            (shared ? common : left_rest).push_back(conjunct);
-          }
-          if (common.empty()) {
-            return Expression{};
-          }
-          std::vector<Expression> right_rest;
-          for (const Expression& conjunct : right) {
-            const bool shared =
-                std::ranges::any_of(common, [&](const Expression& candidate) {
-                  return Same(conjunct, candidate);
-                });
-            if (!shared) {
-              right_rest.push_back(conjunct);
-            }
-          }
-          if (left_rest.empty() || right_rest.empty()) {
-            // Absorption: emitting just `common` drops the non-empty rest
-            // side.  Only sound if those dropped conjuncts cannot raise (the
-            // AST would have evaluated them on the common-decides path).
-            const std::vector<Expression>& dropped =
-                left_rest.empty() ? right_rest : left_rest;
-            if (!std::ranges::all_of(dropped, [](const Expression& e) {
-                  return ExpressionCannotThrow(e);
-                })) {
-              return Expression{};
-            }
-            return CombineConjuncts(common);
-          }
-          return BinaryExpressionExp(
-              CombineConjuncts(common), BinaryOperation::kAnd,
-              BinaryExpressionExp(CombineConjuncts(left_rest),
-                                  BinaryOperation::kOr,
-                                  CombineConjuncts(right_rest)));
+          return FactorCommonAndImpl(expression);
         }));
     built.Add(ExpressionRule(
         "reassociate_add_subtract_constants",
@@ -1640,9 +1857,27 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (fn.FuncName() != "nullif" || fn.Args().size() != 2) {
             return Expression{};
           }
+          if (IsConstant(fn.Args()[0]) && IsConstant(fn.Args()[1])) {
+            const Value& val_a = fn.Args()[0]->AsConstantValue().GetValue();
+            const Value& val_b = fn.Args()[1]->AsConstantValue().GetValue();
+            if (val_a.IsNull() || val_b.IsNull()) {
+              return fn.Args()[0];
+            }
+            auto eq = TryEvaluateBinary(BinaryOperation::kEquals, val_a, val_b);
+            if (eq.HasValue()) {
+              if (eq.Value().Truthy()) {
+                return ConstantValueExp(Value());
+              }
+              return fn.Args()[0];
+            }
+            return Expression{};
+          }
           if (Same(fn.Args()[0], fn.Args()[1])) {
-            // nullif(a, a) -> NULL drops a; only sound when a cannot raise.
-            if (!ExpressionCannotThrow(fn.Args()[0])) {
+            // nullif(a, a) -> NULL drops a; only sound when a cannot raise,
+            // is not volatile, and cannot evaluate to NaN (NaN = NaN is false in SQL).
+            if (StaticallyDouble(fn.Args()[0]) ||
+                !ExpressionCannotThrow(fn.Args()[0]) ||
+                !SafeToReduceEvaluationCount(fn.Args()[0])) {
               return Expression{};
             }
             return ConstantValueExp(Value());
@@ -1661,12 +1896,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               fn.Args()[1]->AsConstantValue().GetValue().IsNull()) {
             return fn.Args()[0];
           }
-          if (IsConstant(fn.Args()[0]) && IsConstant(fn.Args()[1])) {
-            if (fn.Args()[0]->AsConstantValue().GetValue() ==
-                fn.Args()[1]->AsConstantValue().GetValue()) {
-              return ConstantValueExp(Value());
-            }
-            return fn.Args()[0];
+          if (!SafeToReduceEvaluationCount(fn.Args()[0])) {
+            return Expression{};
           }
           return CaseExpressionExp(
               {{BinaryExpressionExp(fn.Args()[0], BinaryOperation::kEquals,
@@ -2166,11 +2397,26 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           } else if (name == "nullif" && fn.Args().size() == 2) {
             const auto& a = fn.Args()[0];
             const auto& b = fn.Args()[1];
+            if (IsConstant(a) && IsConstant(b)) {
+              const Value& val_a = a->AsConstantValue().GetValue();
+              const Value& val_b = b->AsConstantValue().GetValue();
+              if (val_a.IsNull() || val_b.IsNull()) {
+                return a;
+              }
+              auto eq = TryEvaluateBinary(BinaryOperation::kEquals, val_a, val_b);
+              if (eq.HasValue()) {
+                if (eq.Value().Truthy()) {
+                  return ConstantValueExp(Value());
+                }
+                return a;
+              }
+              return Expression{};
+            }
             if (Same(a, b)) {
-              // nullif(a, a) is always NULL, but evaluating a still happens
-              // and may raise; don't erase a raising a (oracle-found:
-              // nullif(CAST(-inf AS INT64), CAST(-inf AS INT64))).
-              if (!ExpressionCannotThrow(a)) {
+              // nullif(a, a) -> NULL drops a; only sound when a cannot raise,
+              // is not volatile, and cannot evaluate to NaN (NaN = NaN is false in SQL).
+              if (StaticallyDouble(a) || !ExpressionCannotThrow(a) ||
+                  !SafeToReduceEvaluationCount(a)) {
                 return Expression{};
               }
               return ConstantValueExp(Value());
@@ -2185,13 +2431,6 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               return ConstantValueExp(Value());
             }
             if (IsConstant(b) && b->AsConstantValue().GetValue().IsNull()) {
-              return a;
-            }
-            if (IsConstant(a) && IsConstant(b)) {
-              if (a->AsConstantValue().GetValue() ==
-                  b->AsConstantValue().GetValue()) {
-                return ConstantValueExp(Value());
-              }
               return a;
             }
           }
@@ -2248,147 +2487,6 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                    fn.Args()[2]);
         }));
 
-    // x __bit_and 0 -> 0
-    built.Add(ExpressionRule(
-        "bit_and_zero", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (fn.FuncName() != "__bit_and" || fn.Args().size() != 2) {
-            return Expression{};
-          }
-          for (const Expression& arg : fn.Args()) {
-            if (arg && arg->Type() == TypeTag::kConstantValue) {
-              const Value val = arg->AsConstantValue().GetValue();
-              if (!val.IsNull() && val.type == ValueType::kInt64 &&
-                  val.value.int_value == 0) {
-                return ConstantValueExp(Value(int64_t(0)));
-              }
-            }
-          }
-          return Expression{};
-        }));
-
-    // x __bit_or 0 -> x
-    built.Add(ExpressionRule(
-        "bit_or_zero", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (fn.FuncName() != "__bit_or" || fn.Args().size() != 2) {
-            return Expression{};
-          }
-          for (size_t i = 0; i < 2; ++i) {
-            if (fn.Args()[i] &&
-                fn.Args()[i]->Type() == TypeTag::kConstantValue) {
-              const Value val = fn.Args()[i]->AsConstantValue().GetValue();
-              if (!val.IsNull() && val.type == ValueType::kInt64 &&
-                  val.value.int_value == 0) {
-                return fn.Args()[1 - i];
-              }
-            }
-          }
-          return Expression{};
-        }));
-
-    // safe_add(x, 0) -> x, safe_add(0, x) -> x
-    built.Add(ExpressionRule(
-        "safe_add_zero", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if ((fn.FuncName() != "safe_add" || fn.Args().size() != 2)) {
-            return Expression{};
-          }
-          for (size_t i = 0; i < 2; ++i) {
-            if (fn.Args()[i] &&
-                fn.Args()[i]->Type() == TypeTag::kConstantValue) {
-              const Value val = fn.Args()[i]->AsConstantValue().GetValue();
-              if (!val.IsNull()) {
-                bool is_zero = (val.type == ValueType::kInt64 &&
-                                val.value.int_value == 0) ||
-                               (val.type == ValueType::kDouble &&
-                                val.value.double_value == 0.0);
-                if (is_zero) {
-                  return fn.Args()[1 - i];
-                }
-              }
-            }
-          }
-          return Expression{};
-        }));
-
-    // safe_subtract(x, 0) -> x
-    built.Add(ExpressionRule(
-        "safe_subtract_zero", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (fn.FuncName() != "safe_subtract" || fn.Args().size() != 2) {
-            return Expression{};
-          }
-          if (fn.Args()[1] && fn.Args()[1]->Type() == TypeTag::kConstantValue) {
-            const Value val = fn.Args()[1]->AsConstantValue().GetValue();
-            if (!val.IsNull()) {
-              bool is_zero =
-                  (val.type == ValueType::kInt64 && val.value.int_value == 0) ||
-                  (val.type == ValueType::kDouble &&
-                   val.value.double_value == 0.0);
-              if (is_zero) {
-                return fn.Args()[0];
-              }
-            }
-          }
-          return Expression{};
-        }));
-
-    // safe_multiply(x, 1) -> x, safe_multiply(1, x) -> x
-    built.Add(ExpressionRule(
-        "safe_multiply_one", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (fn.FuncName() != "safe_multiply" || fn.Args().size() != 2) {
-            return Expression{};
-          }
-          for (size_t i = 0; i < 2; ++i) {
-            if (fn.Args()[i] &&
-                fn.Args()[i]->Type() == TypeTag::kConstantValue) {
-              const Value val = fn.Args()[i]->AsConstantValue().GetValue();
-              if (!val.IsNull()) {
-                bool is_one = (val.type == ValueType::kInt64 &&
-                               val.value.int_value == 1) ||
-                              (val.type == ValueType::kDouble &&
-                               val.value.double_value == 1.0);
-                if (is_one) {
-                  return fn.Args()[1 - i];
-                }
-              }
-            }
-          }
-          return Expression{};
-        }));
-
-    // safe_multiply(x, 0) -> 0, safe_multiply(0, x) -> 0
-    built.Add(ExpressionRule(
-        "safe_multiply_zero", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (fn.FuncName() != "safe_multiply" || fn.Args().size() != 2) {
-            return Expression{};
-          }
-          for (size_t i = 0; i < 2; ++i) {
-            if (fn.Args()[i] &&
-                fn.Args()[i]->Type() == TypeTag::kConstantValue) {
-              const Value val = fn.Args()[i]->AsConstantValue().GetValue();
-              if (!val.IsNull()) {
-                bool is_zero = (val.type == ValueType::kInt64 &&
-                                val.value.int_value == 0) ||
-                               (val.type == ValueType::kDouble &&
-                                val.value.double_value == 0.0);
-                if (is_zero) {
-                  return ConstantValueExp(Value(int64_t(0)));
-                }
-              }
-            }
-          }
-          return Expression{};
-        }));
 
     // ABS(ABS(x)) -> ABS(x)
     built.Add(ExpressionRule(
@@ -2516,35 +2614,64 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             return Expression{};
           }
           // Order-preserving grouping: `(x = 1 OR x = 2 OR y) -> x IN (1, 2)
-          // OR y`, keeping each disjunct's original slot.  Reordering (the
-          // old two-phase "append grouped INs at the end") could move a
-          // raising disjunct past a value-deciding TRUE, changing which
-          // operands the short-circuiting AST ever evaluates (oracle-found:
-          // `CAST(NaN AS INT64) + 1 IN (...) OR 1` collapsed to 1).
+          // OR y`, keeping each disjunct's original slot.
+          // Safety rules:
+          // 1. Target expression must be safe to reduce evaluation count
+          //    (volatiles like RAND() must not collapse evaluations).
+          // 2. An intervening disjunct that can throw (!ExpressionCannotThrow)
+          //    is a barrier: moving a later disjunct before it could evaluate
+          //    to TRUE and short-circuit the throw away. All active groups
+          //    must be sealed at the barrier.
+          // 3. Only mark `changed = true` when multiple disjuncts actually
+          //    merge into a single slot.
+          // 4. Empty IN lists (x IN ()) are not equality ranges and must
+          //    never be grouped or dereferenced via front().
           struct Group {
             Expression target;
+            Expression original_expr;
             std::vector<Expression> items;
-            size_t slot;
+            size_t merge_count{1};
+            size_t slot{0};
           };
           std::vector<Expression> kept;
-          std::vector<Group> groups;
+          std::vector<Group> active_groups;
+          bool changed = false;
+
           auto find_group = [&](const Expression& target) -> Group* {
-            for (Group& g : groups) {
+            for (Group& g : active_groups) {
               if (Same(g.target, target)) {
                 return &g;
               }
             }
             return nullptr;
           };
-          auto new_group = [&](const Expression& target) -> Group& {
-            kept.push_back(Expression{});  // placeholder for grouped IN
-            groups.push_back(Group{.target = target,
-                                   .items = std::vector<Expression>{},
-                                   .slot = kept.size() - 1});
-            return groups.back();
+
+          auto seal_groups = [&]() {
+            for (const Group& g : active_groups) {
+              if (g.merge_count > 1) {
+                if (g.items.size() >= 2) {
+                  kept[g.slot] = InExpressionExp(g.target, g.items);
+                  changed = true;
+                } else if (g.items.size() == 1) {
+                  kept[g.slot] = BinaryExpressionExp(
+                      g.target, BinaryOperation::kEquals, g.items.front());
+                  changed = true;
+                } else {
+                  kept[g.slot] = g.original_expr;
+                }
+              } else {
+                kept[g.slot] = g.original_expr;
+              }
+            }
+            active_groups.clear();
           };
-          bool changed = false;
+
           for (const Expression& d : disjuncts) {
+            if (!ExpressionCannotThrow(d)) {
+              seal_groups();
+              kept.push_back(d);
+              continue;
+            }
             if (d->Type() == TypeTag::kBinaryExp &&
                 d->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
               const auto& bin = d->AsBinaryExpression();
@@ -2557,29 +2684,47 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                     right_const ? bin.Left() : bin.Right();
                 const Expression& value =
                     right_const ? bin.Right() : bin.Left();
-                Group* g = find_group(target);
-                if (g == nullptr) {
-                  Group& fresh = new_group(target);
-                  fresh.items.push_back(value);
-                } else {
-                  if (std::ranges::none_of(g->items, [&](const Expression& e) {
-                        return Same(e, value);
-                      })) {
-                    g->items.push_back(value);
+                if (SafeToReduceEvaluationCount(target)) {
+                  Group* g = find_group(target);
+                  if (g == nullptr) {
+                    const size_t slot = kept.size();
+                    kept.push_back(Expression{});
+                    active_groups.push_back(Group{
+                        .target = target,
+                        .original_expr = d,
+                        .items = {value},
+                        .merge_count = 1,
+                        .slot = slot,
+                    });
+                  } else {
+                    g->merge_count++;
+                    if (std::ranges::none_of(g->items, [&](const Expression& e) {
+                          return Same(e, value);
+                        })) {
+                      g->items.push_back(value);
+                    }
                   }
-                  changed = true;
+                  continue;
                 }
-                continue;
               }
             } else if (d->Type() == TypeTag::kInExp) {
               const auto& in = d->AsInExpression();
-              if (!IsConstant(in.child_) &&
-                  std::ranges::all_of(in.list_, IsConstant)) {
+              if (!IsConstant(in.child_) && !in.list_.empty() &&
+                  std::ranges::all_of(in.list_, IsConstant) &&
+                  SafeToReduceEvaluationCount(in.child_)) {
                 Group* g = find_group(in.child_);
                 if (g == nullptr) {
-                  Group& fresh = new_group(in.child_);
-                  fresh.items = in.list_;
+                  const size_t slot = kept.size();
+                  kept.push_back(Expression{});
+                  active_groups.push_back(Group{
+                      .target = in.child_,
+                      .original_expr = d,
+                      .items = in.list_,
+                      .merge_count = 1,
+                      .slot = slot,
+                  });
                 } else {
+                  g->merge_count++;
                   for (const auto& item : in.list_) {
                     if (std::ranges::none_of(g->items,
                                              [&](const Expression& e) {
@@ -2588,23 +2733,16 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                       g->items.push_back(item);
                     }
                   }
-                  changed = true;
                 }
                 continue;
               }
             }
+
+            // Non-grouped disjunct
             kept.push_back(d);
           }
 
-          for (const Group& g : groups) {
-            if (g.items.size() >= 2) {
-              changed = true;
-              kept[g.slot] = InExpressionExp(g.target, g.items);
-            } else {
-              kept[g.slot] = BinaryExpressionExp(
-                  g.target, BinaryOperation::kEquals, g.items.front());
-            }
-          }
+          seal_groups();
 
           if (!changed) {
             return Expression{};
@@ -2775,36 +2913,47 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           // Binary expression where Left or Right is CASE
           if (expression->Type() == TypeTag::kBinaryExp) {
             const auto& binary = expression->AsBinaryExpression();
+            const auto op = binary.Op();
+            if (!IsComparison(op) && op != BinaryOperation::kLike &&
+                op != BinaryOperation::kNotLike &&
+                op != BinaryOperation::kIsDistinctFrom &&
+                op != BinaryOperation::kIsNotDistinctFrom) {
+              return Expression{};
+            }
             const Expression& left = binary.Left();
             const Expression& right = binary.Right();
-            if (left && left->Type() == TypeTag::kCaseExp) {
+            if (left && left->Type() == TypeTag::kCaseExp && right &&
+                right->Type() != TypeTag::kCaseExp &&
+                SafeToReduceEvaluationCount(right)) {
               const auto& c = left->AsCaseExpression();
               std::vector<std::pair<Expression, Expression>> new_whens;
               new_whens.reserve(c.when_clauses_.size());
               for (const auto& w : c.when_clauses_) {
                 new_whens.emplace_back(
-                    w.first, BinaryExpressionExp(w.second, binary.Op(), right));
+                    w.first, BinaryExpressionExp(w.second, op, right));
               }
               Expression new_else =
                   c.else_clause_
-                      ? BinaryExpressionExp(c.else_clause_, binary.Op(), right)
+                      ? BinaryExpressionExp(c.else_clause_, op, right)
                       : BinaryExpressionExp(ConstantValueExp(Value()),
-                                            binary.Op(), right);
+                                            op, right);
               return CaseExpressionExp(std::move(new_whens),
                                        std::move(new_else));
             }
-            if (right && right->Type() == TypeTag::kCaseExp) {
+            if (right && right->Type() == TypeTag::kCaseExp && left &&
+                left->Type() != TypeTag::kCaseExp &&
+                SafeToReduceEvaluationCount(left)) {
               const auto& c = right->AsCaseExpression();
               std::vector<std::pair<Expression, Expression>> new_whens;
               new_whens.reserve(c.when_clauses_.size());
               for (const auto& w : c.when_clauses_) {
                 new_whens.emplace_back(
-                    w.first, BinaryExpressionExp(left, binary.Op(), w.second));
+                    w.first, BinaryExpressionExp(left, op, w.second));
               }
               Expression new_else =
                   c.else_clause_
-                      ? BinaryExpressionExp(left, binary.Op(), c.else_clause_)
-                      : BinaryExpressionExp(left, binary.Op(),
+                      ? BinaryExpressionExp(left, op, c.else_clause_)
+                      : BinaryExpressionExp(left, op,
                                             ConstantValueExp(Value()));
               return CaseExpressionExp(std::move(new_whens),
                                        std::move(new_else));
@@ -2814,6 +2963,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (expression->Type() == TypeTag::kInExp) {
             const auto& in = expression->AsInExpression();
             if (in.child_ && in.child_->Type() == TypeTag::kCaseExp) {
+              if (!std::ranges::all_of(in.list_, SafeToReduceEvaluationCount)) {
+                return Expression{};
+              }
               const auto& c = in.child_->AsCaseExpression();
               std::vector<std::pair<Expression, Expression>> new_whens;
               new_whens.reserve(c.when_clauses_.size());
@@ -3023,8 +3175,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             }
             if (GetFunctionVolatility(name) == Volatility::kImmutable &&
                 fn.Args().size() >= 2) {
-              if (name == "coalesce" || name == "greatest" || name == "least" ||
-                  name == "ifnull") {
+              if (name == "coalesce" || name == "greatest" || name == "least") {
                 bool all_same = true;
                 for (size_t i = 1; i < fn.Args().size(); ++i) {
                   if (!Same(fn.Args()[0], fn.Args()[i])) {
@@ -3032,12 +3183,21 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                     break;
                   }
                 }
-                if (all_same) {
+                if (all_same && SafeToReduceEvaluationCount(fn.Args()[0])) {
                   return fn.Args()[0];
                 }
-              } else if (name == "nullif") {
+              } else if (name == "ifnull" && fn.Args().size() == 2) {
                 if (Same(fn.Args()[0], fn.Args()[1]) &&
-                    ExpressionCannotThrow(fn.Args()[0])) {
+                    SafeToReduceEvaluationCount(fn.Args()[0])) {
+                  return fn.Args()[0];
+                }
+              } else if (name == "nullif" && fn.Args().size() == 2) {
+                if (IsConstant(fn.Args()[0])) {
+                  // Constant folding handles constant cases.
+                } else if (Same(fn.Args()[0], fn.Args()[1]) &&
+                           !StaticallyDouble(fn.Args()[0]) &&
+                           ExpressionCannotThrow(fn.Args()[0]) &&
+                           SafeToReduceEvaluationCount(fn.Args()[0])) {
                   return ConstantValueExp(Value());
                 }
               }
@@ -3062,11 +3222,12 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 }
                 if (all_same) {
                   // Returning the else drops all WHEN-condition evaluations;
-                  // only sound when none of them can raise (cf.
+                  // only sound when none of them can raise or are volatile (cf.
                   // uniform_case_result).
                   const bool conditions_total =
                       std::ranges::all_of(c.when_clauses_, [](const auto& w) {
-                        return ExpressionCannotThrow(w.first);
+                        return ExpressionCannotThrow(w.first) &&
+                               SafeToReduceEvaluationCount(w.first);
                       });
                   if (!conditions_total) {
                     return Expression{};
@@ -3098,54 +3259,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     built.Add(ExpressionRule(
         "boolean_filter_pullup", AnyBinary(Any("left"), Any("right")),
         [](const Expression& expression, const ExpressionBindings&) {
-          const auto& binary = expression->AsBinaryExpression();
-          if (binary.Op() != BinaryOperation::kOr) {
-            return Expression{};
-          }
-          const std::vector<Expression> left = SplitConjuncts(binary.Left());
-          const std::vector<Expression> right = SplitConjuncts(binary.Right());
-          if (left.empty() || right.empty()) {
-            return Expression{};
-          }
-          std::vector<Expression> common;
-          std::vector<Expression> left_rest;
-          for (const Expression& conjunct : left) {
-            const bool shared =
-                std::ranges::any_of(right, [&](const Expression& candidate) {
-                  return Same(conjunct, candidate);
-                });
-            (shared ? common : left_rest).push_back(conjunct);
-          }
-          if (common.empty()) {
-            return Expression{};
-          }
-          std::vector<Expression> right_rest;
-          for (const Expression& conjunct : right) {
-            const bool shared =
-                std::ranges::any_of(common, [&](const Expression& candidate) {
-                  return Same(conjunct, candidate);
-                });
-            if (!shared) {
-              right_rest.push_back(conjunct);
-            }
-          }
-          if (left_rest.empty() || right_rest.empty()) {
-            // Absorption drops the non-empty rest side; only sound when those
-            // conjuncts cannot raise (see factor_or_common_and).
-            const std::vector<Expression>& dropped =
-                left_rest.empty() ? right_rest : left_rest;
-            if (!std::ranges::all_of(dropped, [](const Expression& e) {
-                  return ExpressionCannotThrow(e);
-                })) {
-              return Expression{};
-            }
-            return CombineConjuncts(common);
-          }
-          return BinaryExpressionExp(
-              CombineConjuncts(common), BinaryOperation::kAnd,
-              BinaryExpressionExp(CombineConjuncts(left_rest),
-                                  BinaryOperation::kOr,
-                                  CombineConjuncts(right_rest)));
+          return FactorCommonAndImpl(expression);
         }));
 
     return built;
@@ -3496,6 +3610,14 @@ bool ColumnPlusConstantChain(const Expression& tree, const Schema& schema,
   }
   // Accumulate the inner chain's constant toward the column. Negative steps
   // fold through subtraction: (x - c1) + c2 keeps c1 in the accumulator.
+  if (inner_op == BinaryOperation::kSubtract &&
+      inner_constant == std::numeric_limits<int64_t>::min()) {
+    return false;
+  }
+  if (op == BinaryOperation::kSubtract &&
+      right_constant == std::numeric_limits<int64_t>::min()) {
+    return false;
+  }
   const int64_t inner_step =
       inner_op == BinaryOperation::kAdd ? inner_constant : -inner_constant;
   const int64_t outer_step =
@@ -3606,13 +3728,22 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
       int64_t inner_constant = 0;
       if (ColumnPlusConstantChain(*chain, input_schema, &inner_op, &column,
                                   &inner_constant)) {
+        if (inner_op == BinaryOperation::kSubtract &&
+            inner_constant == std::numeric_limits<int64_t>::min()) {
+          return current;
+        }
+        if (op == BinaryOperation::kSubtract &&
+            outer_constant == std::numeric_limits<int64_t>::min()) {
+          return current;
+        }
         const int64_t inner_step = inner_op == BinaryOperation::kAdd
                                        ? inner_constant
                                        : -inner_constant;
         const int64_t outer_step =
             op == BinaryOperation::kAdd ? outer_constant : -outer_constant;
         int64_t accumulated = 0;
-        if (__builtin_add_overflow(inner_step, outer_step, &accumulated)) {
+        if (__builtin_add_overflow(inner_step, outer_step, &accumulated) ||
+            accumulated == std::numeric_limits<int64_t>::min()) {
           return current;
         }
         if (accumulated >= 0) {

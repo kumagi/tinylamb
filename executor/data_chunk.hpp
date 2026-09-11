@@ -52,6 +52,9 @@ class ColumnVector {
     return strings_;
   }
 
+  [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
+  void SetUnsigned(bool value) { unsigned_ = value; }
+
   [[nodiscard]] Value AggregateLogicalAnd(
       const SelectionVector* sel = nullptr) const;
   [[nodiscard]] Value AggregateLogicalOr(
@@ -69,6 +72,7 @@ class ColumnVector {
   void MaterializeInferredStorage();
 
   ValueType type_;
+  bool unsigned_{false};
   size_t size_{0};
   std::vector<uint64_t> null_bitmap_;
   std::vector<int64_t> integers_;

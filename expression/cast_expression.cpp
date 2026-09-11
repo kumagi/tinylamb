@@ -64,6 +64,16 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   if (s.size() == 10 &&
       // NOLINTNEXTLINE(cert-err34-c)
       sscanf(std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
+    if (Y < 1 || Y > 9999 || M < 1 || M > 12 || D < 1 || D > 31) {
+      return false;
+    }
+    const std::chrono::year_month_day ymd{
+        std::chrono::year{Y},
+        std::chrono::month{static_cast<unsigned>(M)},
+        std::chrono::day{static_cast<unsigned>(D)}};
+    if (!ymd.ok()) {
+      return false;
+    }
     ct->year = Y;
     ct->month = static_cast<unsigned>(M);
     ct->day = static_cast<unsigned>(D);
@@ -132,6 +142,19 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
     matched = true;
   }
   if (matched) {
+    if (ct->year < 1 || ct->year > 9999 || ct->month < 1 || ct->month > 12 ||
+        ct->day < 1 || ct->day > 31 || ct->hour < 0 || ct->hour > 23 ||
+        ct->minute < 0 || ct->minute > 59 || ct->second < 0 || ct->second > 60 ||
+        ct->subsecond_nanos < 0 || ct->subsecond_nanos > 999999999) {
+      return false;
+    }
+    const std::chrono::year_month_day ymd{
+        std::chrono::year{ct->year},
+        std::chrono::month{static_cast<unsigned>(ct->month)},
+        std::chrono::day{static_cast<unsigned>(ct->day)}};
+    if (!ymd.ok()) {
+      return false;
+    }
     if (ct->second == 60) {
       ct->second = 0;
       ct->subsecond_nanos = 0;
@@ -141,13 +164,13 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       if (ct->hour >= 24) {
         int extra_days = ct->hour / 24;
         ct->hour %= 24;
-        std::chrono::year_month_day ymd{std::chrono::year{ct->year},
-                                        std::chrono::month{ct->month},
-                                        std::chrono::day{ct->day}};
         int64_t days =
             std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
         std::chrono::sys_days new_sd{std::chrono::days{days}};
         std::chrono::year_month_day new_ymd{new_sd};
+        if (int(new_ymd.year()) < 1 || int(new_ymd.year()) > 9999) {
+          return false;
+        }
         ct->year = int(new_ymd.year());
         ct->month = unsigned(new_ymd.month());
         ct->day = unsigned(new_ymd.day());
@@ -726,9 +749,45 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
 
 // Narrowed integer targets reject values outside their width: GoogleSQL
 // raises out_of_range instead of truncating (INT64 keeps every int64 value).
-Status ValidateIntWidth(const std::string& upper, int64_t v) {
+Status ValidateIntWidth(const std::string& upper, int64_t v,
+                        bool is_unsigned = false) {
   bool out_of_width = false;
   std::string width_name;
+  if (is_unsigned) {
+    const auto u = static_cast<uint64_t>(v);
+    if (upper == "INT64") {
+      out_of_width =
+          u > static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+      width_name = "int64";
+    } else if (upper == "INT32") {
+      out_of_width = u > 2147483647ULL;
+      width_name = "int32";
+    } else if (upper == "INT16") {
+      out_of_width = u > 32767ULL;
+      width_name = "int16";
+    } else if (upper == "INT8") {
+      out_of_width = u > 127ULL;
+      width_name = "int8";
+    } else if (upper == "UINT32") {
+      out_of_width = u > 4294967295ULL;
+      width_name = "uint32";
+    } else if (upper == "UINT16") {
+      out_of_width = u > 65535ULL;
+      width_name = "uint16";
+    } else if (upper == "UINT8") {
+      out_of_width = u > 255ULL;
+      width_name = "uint8";
+    } else if (upper == "UINT64") {
+      out_of_width = false;
+      width_name = "uint64";
+    }
+    if (out_of_width) {
+      return StatusError(StatusCode::kIsInfinity,
+                         width_name + " out of range: " + std::to_string(u));
+    }
+    return Status::kSuccess;
+  }
+
   if (upper == "INT32") {
     out_of_width = v < -2147483648LL || v > 2147483647LL;
     width_name = "int32";
@@ -1114,66 +1173,16 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
 
     switch (target_type) {
       case ValueType::kInt64: {
-        // Narrow integer targets validate their declared range: the engine
-        // stores every integer as INT64 but CAST semantics still reject
-        // out-of-range values.
-        auto narrow_bounds = [](const std::string& t, int64_t* lo,
-                                uint64_t* hi) -> bool {
-          if (t == "INT8") {
-            *lo = -128;
-            *hi = 127;
-            return true;
-          }
-          if (t == "INT16") {
-            *lo = -32768;
-            *hi = 32767;
-            return true;
-          }
-          if (t == "INT32") {
-            *lo = -2147483648LL;
-            *hi = 2147483647LL;
-            return true;
-          }
-          if (t == "UINT8") {
-            *lo = 0;
-            *hi = 255;
-            return true;
-          }
-          if (t == "UINT16") {
-            *lo = 0;
-            *hi = 65535;
-            return true;
-          }
-          if (t == "UINT32") {
-            *lo = 0;
-            *hi = 4294967295ULL;
-            return true;
-          }
-          // UINT64 is intentionally NOT range-checked here: a hex literal such
-          // as 0x8000000000000000 arrives as the INT64 bit pattern -2^63 and
-          // must reinterpret to 2^63 (GoogleSQL CAST semantics), which a
-          // signed lower-bound check would wrongly reject.
-          return false;
-        };
-        int64_t lo = 0;
-        uint64_t hi = 0;
-        if (narrow_bounds(upper, &lo, &hi)) {
-          const int64_t candidate =
-              val.type == ValueType::kDouble
-                  ? static_cast<int64_t>(std::round(val.value.double_value))
-                  : val.value.int_value;
-          if (candidate < lo ||
-              (candidate >= 0 && std::cmp_greater(candidate, hi))) {
-            const std::string message =
-                ToLower(upper) + " out of range: " + std::to_string(candidate);
-            if (safe) {
-              return Value();
-            }
-            return StatusError(StatusCode::kIsInfinity, message);
-          }
-        }
         if (val.type == ValueType::kInt64) {
-          return upper == "UINT64" ? val.WithUnsigned() : val;
+          RETURN_IF_FAIL(
+              ValidateIntWidth(upper, val.value.int_value, val.IsUnsigned()));
+          if (upper == "UINT64") {
+            return val.WithUnsigned();
+          }
+          if (val.IsUnsigned()) {
+            return Value(val.value.int_value);
+          }
+          return val;
         }
         if (val.type == ValueType::kDouble) {
           if (std::isnan(val.value.double_value) ||
@@ -1182,6 +1191,16 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                                "cannot cast NaN/Inf float to int");
           }
           const double rounded = std::round(val.value.double_value);
+          if (upper == "UINT64") {
+            static constexpr double kUint64MaxAsDouble = 18446744073709551616.0;
+            if (rounded >= kUint64MaxAsDouble || rounded < 0.0) {
+              return StatusError(StatusCode::kIsInfinity,
+                                 "int overflow casting from float: " +
+                                     std::to_string(val.value.double_value));
+            }
+            const auto u = static_cast<uint64_t>(rounded);
+            return Value(static_cast<int64_t>(u)).WithUnsigned();
+          }
           // 2^63 as a double is exactly representable; values at or above it
           // (including INT64_MAX itself after rounding) are out of range.
           static constexpr double kInt64MaxAsDouble = 9223372036854775808.0;
@@ -1192,9 +1211,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                                    std::to_string(val.value.double_value));
           }
           const auto narrowed = static_cast<int64_t>(rounded);
-          RETURN_IF_FAIL(ValidateIntWidth(upper, narrowed));
-          return upper == "UINT64" ? Value(narrowed).WithUnsigned()
-                                   : Value(narrowed);
+          RETURN_IF_FAIL(ValidateIntWidth(upper, narrowed, false));
+          return Value(narrowed);
         }
         if (val.type == ValueType::kVarChar) {
           std::string s(val.value.varchar_value);
@@ -1263,7 +1281,25 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           if (std::optional<int64_t> ordinal = OrdinalForEnumMemberName(s);
               ordinal.has_value()) {
             RETURN_IF_FAIL(ValidateIntWidth(upper, *ordinal));
-            return Value(*ordinal);
+            return upper == "UINT64" ? Value(*ordinal).WithUnsigned()
+                                     : Value(*ordinal);
+          }
+          if (upper == "UINT64") {
+            if (!s.empty() && s[0] == '-') {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "Bad UINT64 value: " + s);
+            }
+            uint64_t u_result = 0;
+            auto [ptr, ec] = std::from_chars(begin_ptr, end_ptr, u_result);
+            if (ec == std::errc::result_out_of_range) {
+              return StatusError(StatusCode::kIsInfinity,
+                                 "int overflow casting from string: " + s);
+            }
+            if (ec != std::errc() || ptr != end_ptr) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "invalid integer string: " + s);
+            }
+            return Value(static_cast<int64_t>(u_result)).WithUnsigned();
           }
           auto [ptr, ec] = std::from_chars(begin_ptr, end_ptr, result);
           if (ec == std::errc::result_out_of_range) {
@@ -1276,7 +1312,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           }
           RETURN_IF_FAIL(ValidateIntWidth(upper, result));
           Value converted(result);
-          return upper == "UINT64" ? converted.WithUnsigned() : converted;
+          return converted;
         }
         if (val.type == ValueType::kDate) {
           return Value(val.DateDays());
@@ -1288,15 +1324,25 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         // subnormal doubles (e.g. -1e-46) round to signed zero like the
         // reference engine instead of surviving at double precision.
         const bool is_float32 = upper == "FLOAT" || upper == "FLOAT32";
-        auto finish_double = [&](double d) -> Value {
-          return is_float32 ? Value(static_cast<double>(static_cast<float>(d)))
-                            : Value(d);
+        auto finish_double = [&](double d) -> StatusOr<Value> {
+          if (is_float32 && std::isfinite(d)) {
+            if (d > std::numeric_limits<float>::max() ||
+                d < std::numeric_limits<float>::lowest()) {
+              return StatusError(StatusCode::kIsInfinity,
+                                 "float overflow: " + std::to_string(d));
+            }
+            return Value(static_cast<double>(static_cast<float>(d)));
+          }
+          return Value(d);
         };
         if (val.type == ValueType::kDouble) {
           return finish_double(val.value.double_value);
         }
         if (val.type == ValueType::kInt64) {
-          return finish_double(static_cast<double>(val.value.int_value));
+          return finish_double(val.IsUnsigned()
+                                   ? static_cast<double>(static_cast<uint64_t>(
+                                         val.value.int_value))
+                                   : static_cast<double>(val.value.int_value));
         }
         if (val.type == ValueType::kVarChar) {
           std::string s = ToLower(std::string(val.value.varchar_value));
@@ -1335,7 +1381,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             : (is_bool && val.type == ValueType::kInt64)
                 ? (val.value.int_value != 0 ? "true" : "false")
             : (val.type == ValueType::kInt64)
-                ? std::to_string(val.value.int_value)
+                ? (val.IsUnsigned() ? std::to_string(static_cast<uint64_t>(
+                                          val.value.int_value))
+                                    : std::to_string(val.value.int_value))
             : (val.type == ValueType::kDouble)
                 ? ([&]() {
                     if (std::isnan(val.value.double_value)) {
@@ -1386,7 +1434,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           if (ParseCivilTime(s, &ct)) {
             return Value(FormatCivilTime(ct));
           }
-          return Value(std::move(s));
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid DATETIME string: " + raw);
         }
         if (upper == "TIMESTAMP") {
           std::string raw = s;
@@ -1449,7 +1498,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                              ct, -static_cast<int64_t>(offset_sec))) +
                          "+00");
           }
-          return Value(std::move(s));
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid TIMESTAMP string: " + s);
         }
         if (upper == "INTERVAL") {
           IntervalValue iv = IntervalValue::Parse(s);
@@ -1537,7 +1587,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             }
             return Value(std::string{buf.data()});
           }
-          return Value(std::move(s));
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid TIME string: " + raw);
         }
         if (upper == "DATE") {
           CivilTime ct;
@@ -1627,6 +1678,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           return Value::TryDate(s);
         }
         if (val.type == ValueType::kInt64) {
+          RETURN_IF_FAIL(TryFormatDateDays(val.value.int_value).GetStatus());
           return Value::DateFromDays(val.value.int_value);
         }
         break;

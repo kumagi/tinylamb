@@ -35,6 +35,7 @@
 #include <optional>
 #include <ostream>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -45,6 +46,7 @@
 
 #include "common/constants.hpp"
 #include "common/digest.hpp"
+#include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/evaluation_context.hpp"
 #include "expression/expression.hpp"
@@ -119,6 +121,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   }
   // NOLINTNEXTLINE(cert-err34-c)
   else if (sscanf(input.c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
+    ct->year = 1970;
+    ct->month = 1;
+    ct->day = 1;
     ct->hour = h;
     ct->minute = m;
     ct->second = sec;
@@ -142,6 +147,19 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
     matched = true;
   }
   if (matched) {
+    if (ct->year < 1 || ct->year > 9999 || ct->month < 1 || ct->month > 12 ||
+        ct->day < 1 || ct->day > 31 || ct->hour < 0 || ct->hour > 23 ||
+        ct->minute < 0 || ct->minute > 59 || ct->second < 0 || ct->second > 60 ||
+        ct->subsecond_nanos < 0 || ct->subsecond_nanos > 999999999) {
+      return false;
+    }
+    const std::chrono::year_month_day ymd{
+        std::chrono::year{ct->year},
+        std::chrono::month{static_cast<unsigned>(ct->month)},
+        std::chrono::day{static_cast<unsigned>(ct->day)}};
+    if (!ymd.ok()) {
+      return false;
+    }
     if (ct->second == 60) {
       ct->second = 0;
       ct->subsecond_nanos = 0;
@@ -151,14 +169,13 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       if (ct->hour >= 24) {
         int extra_days = ct->hour / 24;
         ct->hour %= 24;
-        std::chrono::year_month_day ymd{
-            std::chrono::year{ct->year},
-            std::chrono::month{static_cast<unsigned>(ct->month)},
-            std::chrono::day{static_cast<unsigned>(ct->day)}};
         int64_t days =
             std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
         std::chrono::sys_days new_sd{std::chrono::days{days}};
         std::chrono::year_month_day new_ymd{new_sd};
+        if (int(new_ymd.year()) < 1 || int(new_ymd.year()) > 9999) {
+          return false;
+        }
         ct->year = int(new_ymd.year());
         ct->month = static_cast<int>(static_cast<unsigned>(new_ymd.month()));
         ct->day = static_cast<int>(static_cast<unsigned>(new_ymd.day()));
@@ -664,7 +681,12 @@ StatusOr<Value> FormatFunction(const std::string& name,
           }
           formatted_item += "\"";
         } else if (arg.type == ValueType::kInt64) {
-          formatted_item = std::to_string(arg.value.int_value);
+          if (arg.IsUnsigned()) {
+            formatted_item =
+                std::to_string(static_cast<uint64_t>(arg.value.int_value));
+          } else {
+            formatted_item = std::to_string(arg.value.int_value);
+          }
         } else if (arg.type == ValueType::kDouble) {
           formatted_item = std::to_string(arg.value.double_value);
         } else {
@@ -699,6 +721,9 @@ StatusOr<Value> FormatFunction(const std::string& name,
             snprintf(buf.data(), buf.size(), hash_flag ? "0%lo" : "%lo",
                      static_cast<unsigned long>(arg.value.int_value));
             formatted_item = buf.data();
+          } else if (spec == 'u' || arg.IsUnsigned()) {
+            formatted_item =
+                std::to_string(static_cast<uint64_t>(arg.value.int_value));
           } else {
             formatted_item = std::to_string(arg.value.int_value);
           }
@@ -716,8 +741,12 @@ StatusOr<Value> FormatFunction(const std::string& name,
         } else if (arg.type == ValueType::kDouble) {
           formatted_item = std::to_string(arg.value.double_value);
         } else if (arg.type == ValueType::kInt64) {
-          formatted_item =
-              std::to_string(static_cast<double>(arg.value.int_value));
+          const double d =
+              arg.IsUnsigned()
+                  ? static_cast<double>(
+                        static_cast<uint64_t>(arg.value.int_value))
+                  : static_cast<double>(arg.value.int_value);
+          formatted_item = std::to_string(d);
         } else {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -768,6 +797,61 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return std::string(val.value.varchar_value);
     }
     return val.AsString();
+  };
+  auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+    if (v.type == ValueType::kInt64) {
+      return v.value.int_value;
+    }
+    if (v.type == ValueType::kDouble) {
+      return static_cast<int64_t>(v.value.double_value);
+    }
+    if (v.type == ValueType::kVarChar) {
+      try {
+        return std::stoll(std::string(v.value.varchar_value));
+      } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
+      }
+    }
+    return def;
+  };
+  auto utf8_offsets = [](std::string_view s) -> std::vector<size_t> {
+    std::vector<size_t> offsets;
+    offsets.reserve(s.size() + 1);
+    for (size_t i = 0; i < s.size();) {
+      offsets.push_back(i);
+      const auto c = static_cast<unsigned char>(s[i]);
+      if ((c & 0x80) == 0) {
+        i += 1;
+      } else if ((c & 0xE0) == 0xC0) {
+        i += static_cast<size_t>((i + 1 < s.size()) ? 2 : 1);
+      } else if ((c & 0xF0) == 0xE0) {
+        i += static_cast<size_t>(
+            (i + 2 < s.size()) ? 3 : (i + 1 < s.size() ? 2 : 1));
+      } else if ((c & 0xF8) == 0xF0) {
+        i += static_cast<size_t>(
+            (i + 3 < s.size())
+                ? 4
+                : (i + 2 < s.size() ? 3 : (i + 1 < s.size() ? 2 : 1)));
+      } else {
+        i += 1;
+      }
+    }
+    offsets.push_back(s.size());
+    return offsets;
+  };
+  auto utf8_len = [&](std::string_view s) -> size_t {
+    return utf8_offsets(s).size() - 1;
+  };
+  auto utf8_substr = [&](std::string_view s, size_t start_cp,
+                         size_t count_cp) -> std::string {
+    const auto offsets = utf8_offsets(s);
+    const size_t total_cps = offsets.size() - 1;
+    if (start_cp >= total_cps) {
+      return "";
+    }
+    const size_t end_cp = std::min(start_cp + count_cp, total_cps);
+    const size_t byte_start = offsets[start_cp];
+    const size_t byte_end = offsets[end_cp];
+    return std::string(s.substr(byte_start, byte_end - byte_start));
   };
   // Proto-field guards emitted by the GoogleSQL frontend: NEW constructors
   // and SELECT AS <proto> route non-constant repeated-field arrays and enum
@@ -993,7 +1077,13 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "NULLIF requires 2 arguments");
     }
-    if (values[0] == values[1]) {
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return values[0];
+    }
+    ASSIGN_OR_RETURN(
+        Value, eq,
+        TryEvaluateBinary(BinaryOperation::kEquals, values[0], values[1]));
+    if (eq.Truthy()) {
       return Value();
     }
     return values[0];
@@ -1015,17 +1105,32 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
         return Value();
       }
     }
+    for (const auto& val : values) {
+      if (val.type == ValueType::kDouble && std::isnan(val.value.double_value)) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
+    }
     Value best = values[0];
     const auto numeric = [](const Value& val) {
       return val.type == ValueType::kInt64 || val.type == ValueType::kDouble;
     };
     const auto as_double = [](const Value& val) {
-      return val.type == ValueType::kDouble
-                 ? val.value.double_value
-                 : static_cast<double>(val.value.int_value);
+      if (val.type == ValueType::kDouble) {
+        return val.value.double_value;
+      }
+      if (val.IsUnsigned()) {
+        return static_cast<double>(static_cast<uint64_t>(val.value.int_value));
+      }
+      return static_cast<double>(val.value.int_value);
     };
     for (size_t i = 1; i < values.size(); ++i) {
-      if (numeric(best) && numeric(values[i])) {
+      if (best.type == ValueType::kInt64 && values[i].type == ValueType::kInt64) {
+        const bool takes =
+            name == "greatest" ? values[i] > best : values[i] < best;
+        if (takes) {
+          best = values[i];
+        }
+      } else if (numeric(best) && numeric(values[i])) {
         const bool takes = name == "greatest"
                                ? as_double(values[i]) > as_double(best)
                                : as_double(values[i]) < as_double(best);
@@ -1033,12 +1138,26 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
           best = values[i];
         }
       } else if (name == "greatest") {
-        if (values[i] > best) {
+        ASSIGN_OR_RETURN(bool, takes, values[i].TryGreater(best));
+        if (takes) {
           best = values[i];
         }
-      } else if (values[i] < best) {
-        best = values[i];
+      } else {
+        ASSIGN_OR_RETURN(bool, takes, values[i].TryLess(best));
+        if (takes) {
+          best = values[i];
+        }
       }
+    }
+    bool has_double = false;
+    for (const auto& val : values) {
+      if (val.type == ValueType::kDouble) {
+        has_double = true;
+        break;
+      }
+    }
+    if (has_double && best.type == ValueType::kInt64) {
+      best = Value(as_double(best));
     }
     return best;
   }
@@ -1084,6 +1203,20 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     }
     return Value(std::move(s));
   }
+  auto to_numeric_double = [](const Value& val,
+                              const std::string& fname) -> StatusOr<double> {
+    if (val.type == ValueType::kInt64) {
+      if (val.IsUnsigned()) {
+        return static_cast<double>(static_cast<uint64_t>(val.value.int_value));
+      }
+      return static_cast<double>(val.value.int_value);
+    }
+    if (val.type == ValueType::kDouble) {
+      return val.value.double_value;
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       fname + " requires numeric argument");
+  };
   if (name == "abs") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -1093,6 +1226,9 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return Value();
     }
     if (values[0].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned()) {
+        return values[0];
+      }
       // std::abs(INT64_MIN) is UB (wraps to INT64_MIN); the relational
       // evaluator raises instead, so the ground truth must agree.
       if (values[0].value.int_value == std::numeric_limits<int64_t>::min()) {
@@ -1106,6 +1242,300 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        "ABS requires numeric argument");
   }
+  if (name == "sign") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SIGN requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    if (values[0].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned()) {
+        const auto v = static_cast<uint64_t>(values[0].value.int_value);
+        return Value(v > 0 ? int64_t{1} : int64_t{0});
+      }
+      const int64_t v = values[0].value.int_value;
+      return Value(v > 0 ? int64_t{1} : (v < 0 ? int64_t{-1} : int64_t{0}));
+    }
+    if (values[0].type == ValueType::kDouble) {
+      const double v = values[0].value.double_value;
+      if (std::isnan(v)) {
+        return Value(v);
+      }
+      return Value(v > 0.0 ? 1.0 : (v < 0.0 ? -1.0 : 0.0));
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "SIGN requires numeric argument");
+  }
+  if (name == "round") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ROUND requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    int64_t digits = 0;
+    if (values.size() == 2) {
+      if (values[1].type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ROUND digits must be an integer");
+      }
+      digits = values[1].value.int_value;
+    }
+    if (values[0].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned()) {
+        const auto v = static_cast<uint64_t>(values[0].value.int_value);
+        if (digits >= 0) {
+          return values[0];
+        }
+        uint64_t scale = 1;
+        for (int64_t i = 0; i < -digits; ++i) {
+          if (scale > std::numeric_limits<uint64_t>::max() / 10) {
+            return Value(int64_t{0}).WithUnsigned();
+          }
+          scale *= 10;
+        }
+        uint64_t q = v / scale;
+        const uint64_t rem = v % scale;
+        const uint64_t half = scale / 2;
+        if (rem >= half) {
+          q += 1;
+        }
+        uint64_t result = 0;
+        if (__builtin_mul_overflow(q, scale, &result)) {
+          return StatusError(StatusCode::kIsInfinity, "integer overflow in ROUND");
+        }
+        return Value(static_cast<int64_t>(result)).WithUnsigned();
+      }
+      const int64_t v = values[0].value.int_value;
+      if (digits >= 0) {
+        return Value(v);
+      }
+      int64_t scale = 1;
+      for (int64_t i = 0; i < -digits; ++i) {
+        if (scale > std::numeric_limits<int64_t>::max() / 10) {
+          return Value(int64_t{0});
+        }
+        scale *= 10;
+      }
+      int64_t q = v / scale;
+      const int64_t rem = v % scale;
+      const int64_t half = scale / 2;
+      const bool negative = v < 0;
+      if ((negative ? -rem : rem) >= half) {
+        q += negative ? -1 : 1;
+      }
+      int64_t result = 0;
+      if (__builtin_mul_overflow(q, scale, &result)) {
+        return StatusError(StatusCode::kIsInfinity, "integer overflow in ROUND");
+      }
+      return Value(result);
+    }
+    if (values[0].type == ValueType::kDouble) {
+      const double val = values[0].value.double_value;
+      if (std::isnan(val)) {
+        return Value(val);
+      }
+      const double factor = std::pow(10.0, digits);
+      return Value(std::round(val * factor) / factor);
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "ROUND requires numeric argument");
+  }
+  if (name == "trunc" || name == "truncate") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    int64_t digits = 0;
+    if (values.size() == 2) {
+      if (values[1].type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           name + " digits must be an integer");
+      }
+      digits = values[1].value.int_value;
+    }
+    if (values[0].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned()) {
+        const auto v = static_cast<uint64_t>(values[0].value.int_value);
+        if (digits >= 0) {
+          return values[0];
+        }
+        uint64_t scale = 1;
+        for (int64_t i = 0; i < -digits; ++i) {
+          if (scale > std::numeric_limits<uint64_t>::max() / 10) {
+            return Value(int64_t{0}).WithUnsigned();
+          }
+          scale *= 10;
+        }
+        return Value(static_cast<int64_t>(v / scale * scale)).WithUnsigned();
+      }
+      const int64_t v = values[0].value.int_value;
+      if (digits >= 0) {
+        return Value(v);
+      }
+      int64_t scale = 1;
+      for (int64_t i = 0; i < -digits; ++i) {
+        if (scale > std::numeric_limits<int64_t>::max() / 10) {
+          return Value(int64_t{0});
+        }
+        scale *= 10;
+      }
+      return Value(v / scale * scale);
+    }
+    if (values[0].type == ValueType::kDouble) {
+      const double val = values[0].value.double_value;
+      if (std::isnan(val)) {
+        return Value(val);
+      }
+      const double factor = std::pow(10.0, digits);
+      return Value(std::trunc(val * factor) / factor);
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       name + " requires numeric argument");
+  }
+  if (name == "ceil" || name == "ceiling") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    if (values[0].type == ValueType::kInt64) {
+      return values[0];
+    }
+    if (values[0].type == ValueType::kDouble) {
+      return Value(std::ceil(values[0].value.double_value));
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       name + " requires numeric argument");
+  }
+  if (name == "floor") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "FLOOR requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    if (values[0].type == ValueType::kInt64) {
+      return values[0];
+    }
+    if (values[0].type == ValueType::kDouble) {
+      return Value(std::floor(values[0].value.double_value));
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "FLOOR requires numeric argument");
+  }
+  if (name == "mod") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "MOD requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    if (values[0].type == ValueType::kInt64 &&
+        values[1].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned() || values[1].IsUnsigned()) {
+        const auto r = static_cast<uint64_t>(values[1].value.int_value);
+        if (r == 0) {
+          return StatusError(StatusCode::kIsInfinity, "division by zero in MOD");
+        }
+        const auto l = static_cast<uint64_t>(values[0].value.int_value);
+        return Value(static_cast<int64_t>(l % r)).WithUnsigned();
+      }
+      if (values[1].value.int_value == 0) {
+        return StatusError(StatusCode::kIsInfinity, "division by zero in MOD");
+      }
+      if (values[0].value.int_value == std::numeric_limits<int64_t>::min() &&
+          values[1].value.int_value == -1) {
+        return StatusError(StatusCode::kIsInfinity, "integer overflow on '%'");
+      }
+      return Value(values[0].value.int_value % values[1].value.int_value);
+    }
+    const bool left_double = values[0].type == ValueType::kDouble;
+    const bool right_double = values[1].type == ValueType::kDouble;
+    if (left_double && right_double) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unsupported binary operation");
+    }
+    if (!left_double && values[0].type != ValueType::kInt64) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unsupported argument type for MOD");
+    }
+    if (!right_double && values[1].type != ValueType::kInt64) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unsupported argument type for MOD");
+    }
+    const double l =
+        left_double
+            ? values[0].value.double_value
+            : (values[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                          values[0].value.int_value))
+                                      : static_cast<double>(
+                                            values[0].value.int_value));
+    const double r =
+        right_double
+            ? values[1].value.double_value
+            : (values[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                          values[1].value.int_value))
+                                      : static_cast<double>(
+                                            values[1].value.int_value));
+    if (r == 0.0) {
+      return StatusError(StatusCode::kIsInfinity, "division by zero");
+    }
+    return Value(std::fmod(l, r));
+  }
+  if (name == "pow" || name == "power") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    for (const Value& val : values) {
+      if (val.type != ValueType::kInt64 && val.type != ValueType::kDouble) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "unsupported argument type for " + name);
+      }
+    }
+    const double l =
+        values[0].type == ValueType::kInt64
+            ? (values[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                          values[0].value.int_value))
+                                      : static_cast<double>(
+                                            values[0].value.int_value))
+            : values[0].value.double_value;
+    const double r =
+        values[1].type == ValueType::kInt64
+            ? (values[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                          values[1].value.int_value))
+                                      : static_cast<double>(
+                                            values[1].value.int_value))
+            : values[1].value.double_value;
+    if (l < 0.0 && !std::isinf(l) && !std::isnan(r) && std::floor(r) != r) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Floating point error in function: POW");
+    }
+    if (l == 0.0 && r < 0.0 && !std::isinf(r)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "division by zero in POW");
+    }
+    const double res = std::pow(l, r);
+    if (std::isinf(res) && !std::isinf(l) && !std::isinf(r)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "Floating point overflow in function: POW");
+    }
+    return Value(res);
+  }
   if (name == "sqrt") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -1114,12 +1544,289 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    double val = values[0].type == ValueType::kInt64
-                     ? static_cast<double>(values[0].value.int_value)
-                     : (values[0].type == ValueType::kDouble
-                            ? values[0].value.double_value
-                            : 0.0);
-    return Value(std::sqrt(val));
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "SQRT"));
+    if (v < 0.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SQRT of negative number");
+    }
+    return Value(std::sqrt(v));
+  }
+  if (name == "cbrt") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CBRT requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "CBRT"));
+    return Value(std::cbrt(v));
+  }
+  if (name == "ln") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LN requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "LN"));
+    return Value(std::log(v));
+  }
+  if (name == "log" || name == "log10") {
+    if (name == "log10" ? values.size() != 1
+                        : (values.empty() || values.size() > 2)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " argument count mismatch");
+    }
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], name));
+    if (name == "log10") {
+      return Value(std::log10(v));
+    }
+    if (values.size() == 1) {
+      return Value(std::log(v));
+    }
+    ASSIGN_OR_RETURN(double, base, to_numeric_double(values[1], "LOG base"));
+    if (v == 1.0 && std::isinf(base)) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+    return Value(std::log(v) / std::log(base));
+  }
+  if (name == "exp") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "EXP requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "EXP"));
+    const double res = std::exp(v);
+    if (std::isinf(res) && !std::isinf(v)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "Floating point overflow in function: EXP");
+    }
+    return Value(res);
+  }
+  if (name == "cos") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "COS requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "COS"));
+    return Value(std::cos(v));
+  }
+  if (name == "sin") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SIN requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "SIN"));
+    return Value(std::sin(v));
+  }
+  if (name == "tan") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TAN requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "TAN"));
+    return Value(std::tan(v));
+  }
+  if (name == "acos") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ACOS requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "ACOS"));
+    if (v < -1.0 || v > 1.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ACOS argument out of domain [-1, 1]");
+    }
+    return Value(std::acos(v));
+  }
+  if (name == "asin") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ASIN requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "ASIN"));
+    if (v < -1.0 || v > 1.0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ASIN argument out of domain [-1, 1]");
+    }
+    return Value(std::asin(v));
+  }
+  if (name == "atan") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ATAN requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "ATAN"));
+    return Value(std::atan(v));
+  }
+  if (name == "atan2") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ATAN2 requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, y, to_numeric_double(values[0], "ATAN2"));
+    ASSIGN_OR_RETURN(double, x, to_numeric_double(values[1], "ATAN2"));
+    return Value(std::atan2(y, x));
+  }
+  if (name == "pi") {
+    if (!values.empty()) {
+      return StatusError(StatusCode::kInvalidArgument, "PI takes no arguments");
+    }
+    return Value(M_PI);
+  }
+  if (name == "radians") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "RADIANS requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, r0, to_numeric_double(values[0], "RADIANS"));
+    return Value(r0 * (M_PI / 180.0));
+  }
+  if (name == "degrees") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DEGREES requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, r0, to_numeric_double(values[0], "DEGREES"));
+    return Value(r0 * (180.0 / M_PI));
+  }
+  if (name == "cosh") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "COSH requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "COSH"));
+    const double res = std::cosh(v);
+    if (std::isinf(res) && !std::isinf(v)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "Floating point overflow in function: COSH");
+    }
+    return Value(res);
+  }
+  if (name == "sinh") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SINH requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "SINH"));
+    const double res = std::sinh(v);
+    if (std::isinf(res) && !std::isinf(v)) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "Floating point overflow in function: SINH");
+    }
+    return Value(res);
+  }
+  if (name == "tanh") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TANH requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "TANH"));
+    return Value(std::tanh(v));
+  }
+  if (name == "div") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DIV requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    if (values[0].type == ValueType::kInt64 &&
+        values[1].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned() || values[1].IsUnsigned()) {
+        const auto r = static_cast<uint64_t>(values[1].value.int_value);
+        if (r == 0) {
+          return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
+        }
+        const auto l = static_cast<uint64_t>(values[0].value.int_value);
+        return Value(static_cast<int64_t>(l / r)).WithUnsigned();
+      }
+      if (values[1].value.int_value == 0) {
+        return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
+      }
+      if (values[0].value.int_value == std::numeric_limits<int64_t>::min() &&
+          values[1].value.int_value == -1) {
+        return StatusError(StatusCode::kIsInfinity, "integer overflow in DIV");
+      }
+      return Value(values[0].value.int_value / values[1].value.int_value);
+    }
+    ASSIGN_OR_RETURN(double, l, to_numeric_double(values[0], "DIV"));
+    ASSIGN_OR_RETURN(double, r, to_numeric_double(values[1], "DIV"));
+    if (r == 0.0) {
+      return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
+    }
+    const double quotient = std::trunc(l / r);
+    if (std::isnan(quotient) || std::isinf(quotient) ||
+        quotient < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
+        quotient >= -static_cast<double>(std::numeric_limits<int64_t>::min())) {
+      return StatusError(StatusCode::kIsInfinity,
+                         "DIV result out of range for INT64");
+    }
+    return Value(static_cast<int64_t>(quotient));
+  }
+  if (name == "ieee_divide" || name == "safe_divide") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    ASSIGN_OR_RETURN(double, l, to_numeric_double(values[0], name));
+    ASSIGN_OR_RETURN(double, r, to_numeric_double(values[1], name));
+    if (r == 0.0) {
+      return name == "safe_divide" ? Value() : Value(l / r);
+    }
+    const double res = l / r;
+    if (name == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
+      return Value();
+    }
+    return Value(res);
   }
   if (name == "substr" || name == "substring") {
     if (values.size() < 2 || values.size() > 3) {
@@ -1136,37 +1843,87 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "SUBSTR argument type mismatch");
     }
-    const std::string input(values[0].value.varchar_value);
+    const std::string input = raw_str(values[0]);
     const int64_t start = values[1].value.int_value;
-    if (values.size() == 3 && values[2].type == ValueType::kInt64) {
-      if (values[2].value.int_value < 0) {
+    if (values.size() == 3) {
+      const int64_t len = values[2].value.int_value;
+      if (len < 0) {
         return StatusError(StatusCode::kInvalidArgument,
                            "SUBSTR length cannot be negative");
       }
-      if (values[2].value.int_value == 0) {
+      if (len == 0) {
         return Value(std::string());
       }
     }
-    // GoogleSQL semantics: a negative start counts back from the end of the
-    // string; start == 0 behaves like start == 1. When the computed start
-    // lands before the first byte, the result starts at the first byte
-    // (SUBSTR('abcde', -10) == 'abcde'), matching SUBSTR('abcde', 0).
-    const size_t size = input.size();
-    size_t begin = 0;
-    if (start < 0) {
-      const uint64_t back = static_cast<uint64_t>(-(start + 1)) + 1;
-      begin = back >= size ? 0 : size - static_cast<size_t>(back);
-    } else {
-      begin = start <= 1 ? 0 : static_cast<size_t>(start - 1);
-    }
-    const size_t length = values.size() == 3
-                              ? static_cast<size_t>(values[2].value.int_value)
-                              : std::string::npos;
 
-    if (begin >= size) {
+    const size_t total_cps = utf8_len(input);
+    int64_t actual_start = 0;
+    if (start > 0) {
+      actual_start = start - 1;
+    } else if (start < 0) {
+      actual_start = static_cast<int64_t>(total_cps) + start;
+    } else {
+      actual_start = 0;
+    }
+    actual_start = std::max<int64_t>(actual_start, 0);
+    if (std::cmp_greater_equal(actual_start, total_cps)) {
       return Value(std::string());
     }
-    return Value(input.substr(begin, length));
+
+    const size_t length =
+        values.size() == 3
+            ? static_cast<size_t>(std::max(int64_t{0}, values[2].value.int_value))
+            : total_cps;
+    return Value(utf8_substr(input, static_cast<size_t>(actual_start), length));
+  }
+
+  if (name == "byte_substr") {
+    if (values.size() < 2 || values.size() > 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SUBSTR requires two or three arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() == 3 && values[2].IsNull())) {
+      return Value();
+    }
+    if (values[0].type != ValueType::kVarChar ||
+        values[1].type != ValueType::kInt64 ||
+        (values.size() == 3 && values[2].type != ValueType::kInt64)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "BYTE_SUBSTR argument type mismatch");
+    }
+    const std::string input = raw_str(values[0]);
+    const int64_t start = values[1].value.int_value;
+    if (values.size() == 3) {
+      const int64_t len = values[2].value.int_value;
+      if (len < 0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "SUBSTR length cannot be negative");
+      }
+      if (len == 0) {
+        return Value(std::string());
+      }
+    }
+
+    const size_t total_bytes = input.size();
+    int64_t actual_start = 0;
+    if (start > 0) {
+      actual_start = start - 1;
+    } else if (start < 0) {
+      actual_start = static_cast<int64_t>(total_bytes) + start;
+    } else {
+      actual_start = 0;
+    }
+    actual_start = std::max<int64_t>(actual_start, 0);
+    if (std::cmp_greater_equal(actual_start, total_bytes)) {
+      return Value(std::string());
+    }
+
+    const size_t length =
+        values.size() == 3
+            ? static_cast<size_t>(std::max(int64_t{0}, to_i64(values[2], 0)))
+            : total_bytes;
+    return Value(input.substr(static_cast<size_t>(actual_start), length));
   }
   if (name == "length" || name == "char_length" || name == "character_length" ||
       name == "octet_length" || name == "byte_length") {
@@ -1220,36 +1977,1025 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
         (values.size() == 3 && values[2].IsNull())) {
       return Value();
     }
-    const std::string input = raw_str(values[0]);
-    int64_t target_len = values[1].type == ValueType::kInt64
-                             ? values[1].value.int_value
-                             : std::stoll(raw_str(values[1]));
+    const std::string s = raw_str(values[0]);
+    const int64_t target_len = to_i64(values[1], 0);
     if (target_len < 0) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         name + " target length cannot be negative");
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Second argument (output size) for LPAD/RPAD cannot be negative");
     }
-    const auto target_size = static_cast<size_t>(target_len);
-    if (target_size == 0) {
+    if (target_len > 1000000) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Output of LPAD/RPAD exceeds max allowed output size of 1MB");
+    }
+    if (target_len == 0) {
       return Value(std::string());
-    }
-    if (input.size() >= target_size) {
-      return Value(input.substr(0, target_size));
     }
     const std::string pad = values.size() == 3 ? raw_str(values[2]) : " ";
     if (pad.empty()) {
-      return Value(input.substr(0, target_size));
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Pattern in LPAD/RPAD cannot be empty");
     }
-    const size_t pad_needed = target_size - input.size();
-    std::string padding;
-    padding.reserve(pad_needed + pad.size());
-    while (padding.size() < pad_needed) {
-      padding.append(pad);
+    const size_t total_cps = utf8_len(s);
+    if (std::cmp_less_equal(target_len, total_cps)) {
+      return Value(utf8_substr(s, 0, static_cast<size_t>(target_len)));
     }
-    padding.resize(pad_needed);
-    if (name == "lpad") {
-      return Value(padding + input);
+    const size_t pad_cps = utf8_len(pad);
+    const size_t needed = static_cast<size_t>(target_len) - total_cps;
+    std::string pad_str;
+    for (size_t i = 0; i < needed / pad_cps; ++i) {
+      pad_str += pad;
     }
-    return Value(input + padding);
+    if (needed % pad_cps != 0) {
+      pad_str += utf8_substr(pad, 0, needed % pad_cps);
+    }
+    return Value(name == "lpad" ? pad_str + s : s + pad_str);
+  }
+  if (name == "trim") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TRIM requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() ||
+        (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    std::string s = raw_str(values[0]);
+    const std::string cutset =
+        values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
+    const size_t start = s.find_first_not_of(cutset);
+    if (start == std::string::npos) {
+      return Value(std::string());
+    }
+    const size_t end = s.find_last_not_of(cutset);
+    return Value(s.substr(start, end - start + 1));
+  }
+  if (name == "ltrim") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LTRIM requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() ||
+        (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    std::string s = raw_str(values[0]);
+    const std::string cutset =
+        values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
+    const size_t start = s.find_first_not_of(cutset);
+    if (start == std::string::npos) {
+      return Value(std::string());
+    }
+    return Value(s.substr(start));
+  }
+  if (name == "rtrim") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "RTRIM requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() ||
+        (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    std::string s = raw_str(values[0]);
+    const std::string cutset =
+        values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
+    const size_t end = s.find_last_not_of(cutset);
+    if (end == std::string::npos) {
+      return Value(std::string());
+    }
+    return Value(s.substr(0, end + 1));
+  }
+  if (name == "replace") {
+    if (values.size() != 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REPLACE requires 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() || values[2].IsNull()) {
+      return Value();
+    }
+    std::string s = raw_str(values[0]);
+    const std::string from = raw_str(values[1]);
+    const std::string to = raw_str(values[2]);
+    if (from.empty()) {
+      return Value(std::move(s));
+    }
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+      s.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+    return Value(std::move(s));
+  }
+  if (name == "starts_with") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "STARTS_WITH requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    return Value(raw_str(values[0]).starts_with(raw_str(values[1])));
+  }
+  if (name == "ends_with") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ENDS_WITH requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    return Value(raw_str(values[0]).ends_with(raw_str(values[1])));
+  }
+
+  if (name == "reverse") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REVERSE requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const auto offsets = utf8_offsets(s);
+    const size_t total_cps = offsets.size() - 1;
+    std::string res;
+    res.reserve(s.size());
+    for (size_t i = total_cps; i > 0; --i) {
+      const size_t start = offsets[i - 1];
+      const size_t len = offsets[i] - start;
+      res.append(s, start, len);
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "byte_reverse") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REVERSE requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    std::string s = raw_str(values[0]);
+    std::reverse(s.begin(), s.end());
+    return Value(std::move(s));
+  }
+
+  if (name == "repeat") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REPEAT requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const int64_t n = to_i64(values[1], 0);
+    if (n < 0) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Second argument (repeat count) for REPEAT cannot be negative");
+    }
+    if (n == 0) {
+      return Value(std::string());
+    }
+    if (static_cast<uint64_t>(s.size()) * static_cast<uint64_t>(n) > 1000000) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Output of REPEAT exceeds max allowed output size of 1MB");
+    }
+    std::string res;
+    res.reserve(s.size() * static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      res += s;
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "left" || name == "byte_left") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LEFT requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const int64_t len = to_i64(values[1], 0);
+    if (len < 0) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Second argument (length) for LEFT cannot be negative");
+    }
+    if (len == 0) {
+      return Value(std::string());
+    }
+    if (name == "byte_left") {
+      return Value(s.substr(0, static_cast<size_t>(len)));
+    }
+    return Value(utf8_substr(s, 0, static_cast<size_t>(len)));
+  }
+
+  if (name == "right" || name == "byte_right") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "RIGHT requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const int64_t len = to_i64(values[1], 0);
+    if (len < 0) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "Second argument (length) for RIGHT cannot be negative");
+    }
+    if (len == 0) {
+      return Value(std::string());
+    }
+    if (name == "byte_right") {
+      const size_t start = s.size() >= static_cast<size_t>(len)
+                               ? s.size() - static_cast<size_t>(len)
+                               : 0;
+      return Value(s.substr(start));
+    }
+    const size_t total_cps = utf8_len(s);
+    const size_t start_cp =
+        std::cmp_greater_equal(total_cps, static_cast<size_t>(len))
+            ? total_cps - static_cast<size_t>(len)
+            : 0;
+    return Value(utf8_substr(s, start_cp, static_cast<size_t>(len)));
+  }
+
+  if (name == "ascii") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ASCII requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    if (s.empty()) {
+      return Value(int64_t{0});
+    }
+    return Value(static_cast<int64_t>(static_cast<unsigned char>(s[0])));
+  }
+
+  if (name == "unicode") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "UNICODE requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    if (s.empty()) {
+      return Value(int64_t{0});
+    }
+    const auto offsets = utf8_offsets(s);
+    const size_t first_len = offsets[1];
+    uint32_t code = 0;
+    if (first_len == 1) {
+      code = static_cast<unsigned char>(s[0]);
+    } else if (first_len == 2) {
+      code = ((static_cast<unsigned char>(s[0]) & 0x1F) << 6) |
+             (static_cast<unsigned char>(s[1]) & 0x3F);
+    } else if (first_len == 3) {
+      code = ((static_cast<unsigned char>(s[0]) & 0x0F) << 12) |
+             ((static_cast<unsigned char>(s[1]) & 0x3F) << 6) |
+             (static_cast<unsigned char>(s[2]) & 0x3F);
+    } else if (first_len == 4) {
+      code = ((static_cast<unsigned char>(s[0]) & 0x07) << 18) |
+             ((static_cast<unsigned char>(s[1]) & 0x3F) << 12) |
+             ((static_cast<unsigned char>(s[2]) & 0x3F) << 6) |
+             (static_cast<unsigned char>(s[3]) & 0x3F);
+    }
+    return Value(static_cast<int64_t>(code));
+  }
+
+  if (name == "chr") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CHR requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    const int64_t code =
+        values[0].type == ValueType::kInt64 ? values[0].value.int_value : 0;
+    std::string res;
+    if (code < 0 || code > 0x10FFFF) {
+      return StatusError(StatusCode::kIsInfinity, "CHR argument out of range");
+    }
+    if (code <= 0x7F) {
+      res.push_back(static_cast<char>(code));
+    } else if (code <= 0x7FF) {
+      res.push_back(static_cast<char>(0xC0 | ((code >> 6) & 0x1F)));
+      res.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    } else if (code <= 0xFFFF) {
+      res.push_back(static_cast<char>(0xE0 | ((code >> 12) & 0x0F)));
+      res.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+      res.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    } else {
+      res.push_back(static_cast<char>(0xF0 | ((code >> 18) & 0x07)));
+      res.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
+      res.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+      res.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "code_points_to_string") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CODE_POINTS_TO_STRING requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    const Value& arr = values[0];
+    if (arr.type != ValueType::kArray) {
+      return Value();
+    }
+    std::string res;
+    for (const Value& elem : arr.ArrayElements()) {
+      if (elem.IsNull()) {
+        return Value();
+      }
+      int64_t cp = elem.type == ValueType::kInt64 ? elem.value.int_value : 0;
+      if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid code point for CODE_POINTS_TO_STRING: " +
+                               std::to_string(cp));
+      }
+      if (cp <= 0x7F) {
+        res.push_back(static_cast<char>(cp));
+      } else if (cp <= 0x7FF) {
+        res.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+        res.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      } else if (cp <= 0xFFFF) {
+        res.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+        res.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        res.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      } else {
+        res.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+        res.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        res.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        res.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      }
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "code_points_to_bytes") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CODE_POINTS_TO_BYTES requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    const Value& arr = values[0];
+    if (arr.type != ValueType::kArray) {
+      return Value();
+    }
+    std::string res;
+    for (const Value& elem : arr.ArrayElements()) {
+      if (elem.IsNull()) {
+        return Value();
+      }
+      int64_t b = elem.type == ValueType::kInt64 ? elem.value.int_value : 0;
+      if (b < 0 || b > 255) {
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "invalid byte for CODE_POINTS_TO_BYTES: " + std::to_string(b));
+      }
+      res.push_back(static_cast<char>(b));
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "initcap") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "INITCAP requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    std::string s = raw_str(values[0]);
+    const bool has_delim = values.size() == 2;
+    const std::string delims = has_delim ? raw_str(values[1]) : "";
+    auto is_delim = [&](char c) {
+      if (has_delim) {
+        return delims.find(c) != std::string::npos;
+      }
+      return !std::isalnum(static_cast<unsigned char>(c));
+    };
+    bool new_word = true;
+    for (char& c : s) {
+      if (!is_delim(c)) {
+        if (new_word) {
+          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+          new_word = false;
+        } else {
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+      } else {
+        new_word = true;
+      }
+    }
+    return Value(std::move(s));
+  }
+
+  if (name == "translate") {
+    if (values.size() != 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "TRANSLATE requires 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() || values[2].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string src = raw_str(values[1]);
+    const std::string dst = raw_str(values[2]);
+    const auto s_offsets = utf8_offsets(s);
+    const auto src_offsets = utf8_offsets(src);
+    const auto dst_offsets = utf8_offsets(dst);
+    const size_t s_len = s_offsets.size() - 1;
+    const size_t src_len = src_offsets.size() - 1;
+    const size_t dst_len = dst_offsets.size() - 1;
+
+    std::vector<std::string> src_chars;
+    src_chars.reserve(src_len);
+    for (size_t i = 0; i < src_len; ++i) {
+      src_chars.push_back(
+          src.substr(src_offsets[i], src_offsets[i + 1] - src_offsets[i]));
+    }
+    std::vector<std::string> dst_chars;
+    dst_chars.reserve(dst_len);
+    for (size_t i = 0; i < dst_len; ++i) {
+      dst_chars.push_back(
+          dst.substr(dst_offsets[i], dst_offsets[i + 1] - dst_offsets[i]));
+    }
+
+    std::string res;
+    for (size_t i = 0; i < s_len; ++i) {
+      std::string ch = s.substr(s_offsets[i], s_offsets[i + 1] - s_offsets[i]);
+      bool replaced = false;
+      for (size_t j = 0; j < src_chars.size(); ++j) {
+        if (ch == src_chars[j]) {
+          if (j < dst_chars.size()) {
+            res += dst_chars[j];
+          }
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) {
+        res += ch;
+      }
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "soundex") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SOUNDEX requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    std::string s = raw_str(values[0]);
+    size_t first_char = 0;
+    while (first_char < s.size() &&
+           (std::isspace(static_cast<unsigned char>(s[first_char])) != 0)) {
+      ++first_char;
+    }
+    if (first_char >= s.size() ||
+        (std::isalpha(static_cast<unsigned char>(s[first_char])) == 0)) {
+      return Value(std::string());
+    }
+    std::string res;
+    char first_letter = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(s[first_char])));
+    res.push_back(first_letter);
+
+    auto soundex_code = [](char c) -> char {
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      if (c == 'B' || c == 'F' || c == 'P' || c == 'V') {
+        return '1';
+      }
+      if (c == 'C' || c == 'G' || c == 'J' || c == 'K' || c == 'Q' ||
+          c == 'S' || c == 'X' || c == 'Z') {
+        return '2';
+      }
+      if (c == 'D' || c == 'T') {
+        return '3';
+      }
+      if (c == 'L') {
+        return '4';
+      }
+      if (c == 'M' || c == 'N') {
+        return '5';
+      }
+      if (c == 'R') {
+        return '6';
+      }
+      if (c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U' ||
+          c == 'Y') {
+        return 'V';
+      }
+      if (c == 'H' || c == 'W') {
+        return 'H';
+      }
+      return '0';
+    };
+
+    char prev_code = soundex_code(first_letter);
+    if (prev_code == 'V' || prev_code == 'H') {
+      prev_code = '0';
+    }
+    for (size_t i = first_char + 1; i < s.size() && res.size() < 4; ++i) {
+      if (std::isalpha(static_cast<unsigned char>(s[i])) == 0) {
+        continue;
+      }
+      char code = soundex_code(s[i]);
+      if (code == 'H') {
+        continue;
+      }
+      if (code == 'V' || code == '0') {
+        prev_code = '0';
+        continue;
+      }
+      if (code != prev_code) {
+        res.push_back(code);
+        prev_code = code;
+      }
+    }
+    while (res.size() < 4) {
+      res.push_back('0');
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "split") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SPLIT requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string delim = values.size() == 2 ? raw_str(values[1]) : ",";
+    std::vector<Value> elems;
+    if (delim.empty()) {
+      if (s.empty()) {
+        elems.emplace_back(std::string());
+        return Value::Array(std::move(elems), "STRING");
+      }
+      const auto offsets = utf8_offsets(s);
+      for (size_t i = 1; i < offsets.size(); ++i) {
+        elems.emplace_back(
+            s.substr(offsets[i - 1], offsets[i] - offsets[i - 1]));
+      }
+      return Value::Array(std::move(elems), "STRING");
+    }
+    if (s.empty()) {
+      elems.emplace_back(std::string());
+      return Value::Array(std::move(elems), "STRING");
+    }
+    size_t start = 0;
+    while (true) {
+      size_t pos = s.find(delim, start);
+      if (pos == std::string::npos) {
+        elems.emplace_back(s.substr(start));
+        break;
+      }
+      elems.emplace_back(s.substr(start, pos - start));
+      start = pos + delim.size();
+    }
+    return Value::Array(std::move(elems), "STRING");
+  }
+
+  if (name == "split_substr") {
+    if (values.size() < 2 || values.size() > 4) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SPLIT_SUBSTR requires 2 to 4 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() >= 3 && values[2].IsNull()) ||
+        (values.size() == 4 && values[3].IsNull())) {
+      return Value();
+    }
+    const std::string str = raw_str(values[0]);
+    const std::string delim = raw_str(values[1]);
+    const int64_t occ = values.size() >= 3 ? to_i64(values[2], 1) : 1;
+
+    std::vector<std::string> parts;
+    if (delim.empty()) {
+      parts.push_back(str);
+    } else {
+      size_t start = 0;
+      while (true) {
+        size_t pos = str.find(delim, start);
+        if (pos == std::string::npos) {
+          parts.push_back(str.substr(start));
+          break;
+        }
+        parts.push_back(str.substr(start, pos - start));
+        start = pos + delim.size();
+      }
+    }
+
+    const int64_t len =
+        values.size() == 4
+            ? to_i64(values[3], 1)
+            : ((occ == 0 || occ == 1) ? static_cast<int64_t>(parts.size()) : 1);
+    if (len <= 0) {
+      return Value(std::string());
+    }
+
+    int64_t start_idx = 0;
+    if (occ > 0) {
+      start_idx = occ - 1;
+      if (std::cmp_greater_equal(start_idx, parts.size())) {
+        return Value(std::string());
+      }
+    } else if (occ < 0) {
+      start_idx = static_cast<int64_t>(parts.size()) + occ;
+      start_idx = std::max<int64_t>(start_idx, 0);
+    } else {
+      start_idx = 0;
+    }
+
+    int64_t end_idx =
+        std::min(start_idx + len, static_cast<int64_t>(parts.size()));
+    std::string res = parts[static_cast<size_t>(start_idx)];
+    for (int64_t i = start_idx + 1; i < end_idx; ++i) {
+      res += delim + parts[static_cast<size_t>(i)];
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "regexp_contains") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REGEXP_CONTAINS requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string pat = raw_str(values[1]);
+    try {
+      const std::regex re(pat);
+      return Value(std::regex_search(s, re));
+    } catch (...) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid regular expression: " + pat);
+    }
+  }
+
+  if (name == "regexp_match") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REGEXP_MATCH requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string pat = raw_str(values[1]);
+    try {
+      const std::regex re(pat);
+      return Value(std::regex_match(s, re));
+    } catch (...) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid regular expression: " + pat);
+    }
+  }
+
+  if (name == "regexp_instr" || name == "byte_regexp_instr") {
+    if (values.size() < 2 || values.size() > 5) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REGEXP_INSTR requires 2 to 5 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() >= 3 && values[2].IsNull()) ||
+        (values.size() >= 4 && values[3].IsNull()) ||
+        (values.size() == 5 && values[4].IsNull())) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string pat = raw_str(values[1]);
+    if (pat.empty()) {
+      return Value(int64_t{0});
+    }
+    const int64_t pos_arg = values.size() >= 3 ? to_i64(values[2], 1) : 1;
+    const int64_t occ_arg = values.size() >= 4 ? to_i64(values[3], 1) : 1;
+    const int64_t return_pos = values.size() == 5 ? to_i64(values[4], 0) : 0;
+    if (pos_arg <= 0 || occ_arg <= 0) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "REGEXP_INSTR position and occurrence must be positive");
+    }
+    const bool byte_mode = name == "byte_regexp_instr";
+    const auto offsets = utf8_offsets(s);
+    const size_t total_cps = offsets.size() - 1;
+    if (static_cast<size_t>(pos_arg) > (byte_mode ? s.size() : total_cps) + 1) {
+      return Value(int64_t{0});
+    }
+    const size_t byte_start = byte_mode
+                                  ? static_cast<size_t>(pos_arg - 1)
+                                  : offsets[static_cast<size_t>(pos_arg - 1)];
+    try {
+      const std::regex re(pat);
+      std::string search_str = s.substr(byte_start);
+      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
+      std::sregex_iterator end;
+      int64_t current_occ = 1;
+      while (it != end) {
+        if (current_occ == occ_arg) {
+          const auto& match = *it;
+          const bool has_capture = match.size() > 1 && match[1].matched;
+          const size_t target_start =
+              has_capture && return_pos == 0
+                  ? byte_start + static_cast<size_t>(match.position(1))
+                  : byte_start + static_cast<size_t>(match.position());
+          const size_t target_end = byte_start +
+                                    static_cast<size_t>(match.position()) +
+                                    static_cast<size_t>(match.length());
+          if (byte_mode) {
+            return Value(static_cast<int64_t>(
+                return_pos == 1 ? target_end : target_start + 1));
+          }
+          size_t match_cp_start = 1;
+          size_t match_cp_end = 1;
+          for (size_t i = 0; i + 1 < offsets.size(); ++i) {
+            if (offsets[i] <= target_start && target_start < offsets[i + 1]) {
+              match_cp_start = i + 1;
+            }
+            if (offsets[i] < target_end && target_end <= offsets[i + 1]) {
+              match_cp_end = i + 1;
+            }
+          }
+          if (target_end >= s.size()) {
+            match_cp_end = total_cps;
+          }
+          return Value(static_cast<int64_t>(return_pos == 1 ? match_cp_end
+                                                            : match_cp_start));
+        }
+        ++current_occ;
+        ++it;
+      }
+      return Value(int64_t{0});
+    } catch (...) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid regular expression: " + pat);
+    }
+  }
+
+  if (name == "regexp_extract_all" || name == "byte_regexp_extract_all") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REGEXP_EXTRACT_ALL requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string pat = raw_str(values[1]);
+    try {
+      const std::regex re(pat);
+      std::vector<Value> results;
+      std::sregex_iterator it(s.begin(), s.end(), re);
+      std::sregex_iterator end;
+      while (it != end) {
+        if (it->length(0) == 0 &&
+            it->position() == static_cast<ptrdiff_t>(s.size())) {
+          break;
+        }
+        if (it->size() > 1) {
+          results.emplace_back(it->str(1));
+        } else {
+          results.emplace_back(it->str(0));
+        }
+        ++it;
+      }
+      return Value::Array(std::move(results), name == "byte_regexp_extract_all"
+                                                  ? "BYTES"
+                                                  : "STRING");
+    } catch (...) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid regular expression: " + pat);
+    }
+  }
+
+  if (name == "regexp_extract") {
+    if (values.size() < 2 || values.size() > 4) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REGEXP_EXTRACT requires 2 to 4 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string pat = raw_str(values[1]);
+    try {
+      const std::regex re(pat);
+      std::smatch match;
+      if (std::regex_search(s, match, re)) {
+        if (match.size() > 1) {
+          return Value(match[1].str());
+        }
+        return Value(match[0].str());
+      }
+      return Value();
+    } catch (...) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid regular expression: " + pat);
+    }
+  }
+
+  if (name == "regexp_replace") {
+    if (values.size() != 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "REGEXP_REPLACE requires 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() || values[2].IsNull()) {
+      return Value();
+    }
+    const std::string s = raw_str(values[0]);
+    const std::string pat = raw_str(values[1]);
+    const std::string rep = raw_str(values[2]);
+    try {
+      const std::regex re(pat);
+      return Value(std::regex_replace(s, re, rep));
+    } catch (...) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "invalid regular expression: " + pat);
+    }
+  }
+
+  if (name == "__bit_and" || name == "__bit_or" || name == "__bit_xor" ||
+      name == "__shift_left" || name == "__shift_right") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    if (values[0].type != ValueType::kInt64 ||
+        values[1].type != ValueType::kInt64) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires integer arguments");
+    }
+    const int64_t lhs = values[0].value.int_value;
+    const int64_t rhs = values[1].value.int_value;
+    const bool is_u = values[0].IsUnsigned() || values[1].IsUnsigned();
+    auto with_u = [&](Value v) { return is_u ? v.WithUnsigned() : v; };
+    if (name == "__bit_and") {
+      return with_u(Value(lhs & rhs));
+    }
+    if (name == "__bit_or") {
+      return with_u(Value(lhs | rhs));
+    }
+    if (name == "__bit_xor") {
+      return with_u(Value(lhs ^ rhs));
+    }
+    if (rhs < 0) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "Bitwise shift by negative offset.");
+    }
+    if (rhs >= 64) {
+      return with_u(Value(static_cast<int64_t>(0)));
+    }
+    const auto ulhs = static_cast<uint64_t>(lhs);
+    const uint64_t shifted =
+        name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
+    return with_u(Value(static_cast<int64_t>(shifted)));
+  }
+  if (name == "safe_add" || name == "safe_subtract" ||
+      name == "safe_multiply") {
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    if ((values[0].type != ValueType::kInt64 &&
+         values[0].type != ValueType::kDouble) ||
+        (values[1].type != ValueType::kInt64 &&
+         values[1].type != ValueType::kDouble)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires numeric arguments");
+    }
+    if (values[0].type == ValueType::kInt64 &&
+        values[1].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned() || values[1].IsUnsigned()) {
+        const auto l = static_cast<uint64_t>(values[0].value.int_value);
+        const auto r = static_cast<uint64_t>(values[1].value.int_value);
+        uint64_t res = 0;
+        if (name == "safe_add") {
+          if (__builtin_add_overflow(l, r, &res)) {
+            return Value();
+          }
+          return Value(static_cast<int64_t>(res)).WithUnsigned();
+        }
+        if (name == "safe_subtract") {
+          if (__builtin_sub_overflow(l, r, &res)) {
+            return Value();
+          }
+          return Value(static_cast<int64_t>(res)).WithUnsigned();
+        }
+        if (name == "safe_multiply") {
+          if (__builtin_mul_overflow(l, r, &res)) {
+            return Value();
+          }
+          return Value(static_cast<int64_t>(res)).WithUnsigned();
+        }
+      }
+      const int64_t l = values[0].value.int_value;
+      const int64_t r = values[1].value.int_value;
+      if (name == "safe_add") {
+        int64_t res = 0;
+        if (__builtin_add_overflow(l, r, &res)) {
+          return Value();
+        }
+        return Value(res);
+      }
+      if (name == "safe_subtract") {
+        int64_t res = 0;
+        if (__builtin_sub_overflow(l, r, &res)) {
+          return Value();
+        }
+        return Value(res);
+      }
+      if (name == "safe_multiply") {
+        int64_t res = 0;
+        if (__builtin_mul_overflow(l, r, &res)) {
+          return Value();
+        }
+        return Value(res);
+      }
+    }
+    const double l =
+        values[0].type == ValueType::kInt64
+            ? (values[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                          values[0].value.int_value))
+                                      : static_cast<double>(
+                                            values[0].value.int_value))
+            : values[0].value.double_value;
+    const double r =
+        values[1].type == ValueType::kInt64
+            ? (values[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                          values[1].value.int_value))
+                                      : static_cast<double>(
+                                            values[1].value.int_value))
+            : values[1].value.double_value;
+    const double checked =
+        name == "safe_add" ? l + r : (name == "safe_subtract" ? l - r : l * r);
+    if (std::isinf(checked) || std::isnan(checked)) {
+      return Value();
+    }
+    return Value(checked);
+  }
+  if (name == "safe_negate") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SAFE_NEGATE requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    if (values[0].type != ValueType::kInt64 &&
+        values[0].type != ValueType::kDouble) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SAFE_NEGATE requires numeric argument");
+    }
+    if (values[0].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned()) {
+        if (values[0].value.int_value == 0) {
+          return values[0];
+        }
+        return Value();
+      }
+      if (values[0].value.int_value == std::numeric_limits<int64_t>::min()) {
+        return Value();
+      }
+      return Value(-values[0].value.int_value);
+    }
+    return Value(-values[0].value.double_value);
   }
   if (name == "extract_year" || name == "extract_month" ||
       name == "extract_day") {
@@ -1783,38 +3529,128 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     return Value(iv.ToString());
   }
 
+  if (name == "generate_array") {
+    if (values.size() < 2 || values.size() > 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GENERATE_ARRAY requires 2 or 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() == 3 && values[2].IsNull())) {
+      return Value();
+    }
+    auto numeric = [](const Value& v) -> StatusOr<double> {
+      if (v.type == ValueType::kInt64) {
+        if (v.IsUnsigned()) {
+          return static_cast<double>(static_cast<uint64_t>(v.value.int_value));
+        }
+        return static_cast<double>(v.value.int_value);
+      }
+      if (v.type == ValueType::kDouble) {
+        return v.value.double_value;
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GENERATE_ARRAY requires numeric arguments");
+    };
+    ASSIGN_OR_RETURN(double, start, (numeric(values[0])));
+    ASSIGN_OR_RETURN(double, end, (numeric(values[1])));
+    ASSIGN_OR_RETURN(double, step,
+                     (values.size() == 3 ? numeric(values[2])
+                                         : StatusOr<double>(0.0)));
+    if (step == 0.0) {
+      if (values.size() == 3) {
+        return StatusError(StatusCode::kIsInfinity,
+                           "Sequence step cannot be 0.");
+      }
+      step = start <= end ? 1.0 : -1.0;
+    }
+    const bool saw_double =
+        values[0].type == ValueType::kDouble ||
+        values[1].type == ValueType::kDouble ||
+        (values.size() == 3 && values[2].type == ValueType::kDouble);
+    bool saw_uint = false;
+    for (const Value& v : values) {
+      if (v.IsUnsigned()) {
+        saw_uint = true;
+      }
+    }
+    const bool integral =
+        !saw_double &&
+        start == static_cast<double>(static_cast<int64_t>(start)) &&
+        step == static_cast<double>(static_cast<int64_t>(step));
+    const std::string element_type =
+        integral ? (saw_uint ? "UINT64" : "INT64") : "DOUBLE";
+
+    if ((step > 0 && start > end) || (step < 0 && start < end)) {
+      return Value::Array({}, element_type);
+    }
+
+    std::vector<Value> elements;
+    constexpr size_t kMaxGeneratedElements = 1'000'000;
+    for (double value = start; (step > 0 ? value <= end : value >= end);
+         value += step) {
+      if (elements.size() == kMaxGeneratedElements) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_ARRAY generated too many elements");
+      }
+      if (integral) {
+        if (saw_uint) {
+          elements.emplace_back(
+              Value(static_cast<int64_t>(static_cast<uint64_t>(value)))
+                  .WithUnsigned());
+        } else {
+          elements.emplace_back(static_cast<int64_t>(value));
+        }
+      } else {
+        elements.emplace_back(value);
+      }
+      if (!std::isfinite(value + step)) {
+        break;
+      }
+    }
+    return Value::Array(std::move(elements), element_type);
+  }
+
   if (name == "generate_date_array") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "GENERATE_DATE_ARRAY requires 2 or 3 arguments");
     }
-    const Value& start = values[0];
-    const Value& end = values[1];
-    auto as_date = [](const Value& v) -> Value {
-      if (v.type == ValueType::kVarChar) {
-        return Value::Date(std::string_view(v.value.varchar_value));
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() == 3 && values[2].IsNull())) {
+      return Value();
+    }
+    auto to_days = [](const Value& v) -> StatusOr<int64_t> {
+      if (v.type == ValueType::kDate) {
+        return v.DateDays();
       }
-      return v;
-    };
-    const Value start_date = as_date(start);
-    const Value end_date = as_date(end);
-    if (start_date.IsNull() || end_date.IsNull() ||
-        start_date.type != ValueType::kDate ||
-        end_date.type != ValueType::kDate) {
+      if (v.type == ValueType::kVarChar) {
+        auto parsed = TryParseDateDays(v.value.varchar_value);
+        if (parsed.HasValue()) {
+          return parsed.Value();
+        }
+      }
       return StatusError(StatusCode::kInvalidArgument, "DATE value required");
+    };
+    auto start_days_or = to_days(values[0]);
+    if (!start_days_or.HasValue()) {
+      return StatusError(StatusCode::kInvalidArgument, "DATE value required");
+    }
+    auto end_days_or = to_days(values[1]);
+    if (!end_days_or.HasValue()) {
+      return StatusError(StatusCode::kInvalidArgument, "DATE value required");
+    }
+    const int64_t start_days = start_days_or.Value();
+    const int64_t end_days = end_days_or.Value();
+    if (start_days < -11000000 || start_days > 11000000 ||
+        end_days < -11000000 || end_days > 11000000) {
+      return StatusError(StatusCode::kInvalidArgument, "DATE value out of range");
     }
     int64_t step_days = 1;
     if (values.size() == 3) {
       const Value& step = values[2];
-      if (step.IsNull()) {
-        return Value();
-      }
       if (step.type == ValueType::kInt64) {
         step_days = step.value.int_value;
       } else {
-        // Column-valued INTERVAL steps arrive as the encoded text of a
-        // make_interval call (INTERVAL col DAY) or an evaluated INTERVAL
-        // expression ("Y-M D H:M:S"); only whole-day counts are supported.
         const std::string text = raw_str(step);
         const IntervalValue parsed =
             text.empty() ? IntervalValue{} : IntervalValue::Parse(text);
@@ -1828,12 +3664,27 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     if (step_days == 0) {
       return StatusError(StatusCode::kIsInfinity, "Sequence step cannot be 0.");
     }
-    const int64_t start_days = start_date.DateDays();
-    const int64_t end_days = end_date.DateDays();
+    if ((step_days > 0 && start_days > end_days) ||
+        (step_days < 0 && start_days < end_days)) {
+      return Value::Array({}, "DATE");
+    }
     std::vector<Value> elements;
-    for (int64_t d = start_days; step_days > 0 ? d <= end_days : d >= end_days;
+    constexpr size_t kMaxGeneratedDates = 1'000'000;
+    for (int64_t d = start_days;
+         step_days > 0 ? d <= end_days : d >= end_days;
          d += step_days) {
+      if (elements.size() == kMaxGeneratedDates) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_DATE_ARRAY generated too many elements");
+      }
+      if (d < -11000000 || d > 11000000) {
+        return StatusError(StatusCode::kInvalidArgument, "DATE value out of range");
+      }
       elements.push_back(Value::DateFromDays(d));
+      int64_t next = 0;
+      if (__builtin_add_overflow(d, step_days, &next)) {
+        break;
+      }
     }
     return Value::Array(std::move(elements), "DATE");
   }
@@ -2144,6 +3995,9 @@ StatusOr<std::string> TryEncodeStructMemberJson(const Value& value) {
   }
   switch (value.type) {
     case ValueType::kInt64:
+      if (value.IsUnsigned()) {
+        return std::to_string(static_cast<uint64_t>(value.value.int_value));
+      }
       return std::to_string(value.value.int_value);
     case ValueType::kDouble: {
       std::array<char, 64> buffer{};
@@ -2305,6 +4159,10 @@ bool IfBranchesPromoteToDouble(const std::vector<Expression>& args,
 
 Value NormalizeIfBranch(Value value, const bool to_double) {
   if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
+    if (value.IsUnsigned()) {
+      return Value(
+          static_cast<double>(static_cast<uint64_t>(value.value.int_value)));
+    }
     return Value(static_cast<double>(value.value.int_value));
   }
   return value;
@@ -2676,9 +4534,19 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
     }
     return {TypeTag::kVarChar};
   }
+  if (func_name_ == "greatest" || func_name_ == "least") {
+    if (args_.empty()) {
+      return {TypeTag::kInvalid};
+    }
+    for (const auto& arg : args_) {
+      if (arg && arg->ResultType(schema).GetType() == TypeTag::kDouble) {
+        return {TypeTag::kDouble};
+      }
+    }
+    return args_[0]->ResultType(schema);
+  }
   if (func_name_ == "coalesce" || func_name_ == "nullif" ||
-      func_name_ == "ifnull" || func_name_ == "greatest" ||
-      func_name_ == "least") {
+      func_name_ == "ifnull") {
     if (args_.empty()) {
       return {TypeTag::kInvalid};
     }
@@ -2727,16 +4595,30 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
       func_name_ == "ascii" || func_name_ == "unicode" ||
       func_name_ == "regexp_contains" || func_name_ == "regexp_match" ||
       func_name_ == "regexp_instr" || func_name_ == "div" ||
-      func_name_.starts_with("extract_")) {
+      func_name_.starts_with("extract_") ||
+      func_name_ == "__bit_and" || func_name_ == "__bit_or" ||
+      func_name_ == "__bit_xor" || func_name_ == "__shift_left" ||
+      func_name_ == "__shift_right") {
     return {TypeTag::kBigInt};
+  }
+
+  if (func_name_ == "safe_add" || func_name_ == "safe_subtract" ||
+      func_name_ == "safe_multiply" || func_name_ == "mod") {
+    if (args_.empty()) {
+      return {TypeTag::kBigInt};
+    }
+    for (const auto& arg : args_) {
+      if (arg && arg->ResultType(schema).GetType() == TypeTag::kDouble) {
+        return {TypeTag::kDouble};
+      }
+    }
+    return args_[0]->ResultType(schema);
   }
 
   if (func_name_ == "abs" || func_name_ == "sign" || func_name_ == "round" ||
       func_name_ == "trunc" || func_name_ == "truncate" ||
       func_name_ == "ceil" || func_name_ == "ceiling" ||
-      func_name_ == "floor" || func_name_ == "mod" ||
-      func_name_ == "safe_add" || func_name_ == "safe_subtract" ||
-      func_name_ == "safe_multiply" || func_name_ == "safe_negate") {
+      func_name_ == "floor" || func_name_ == "safe_negate") {
     if (args_.empty()) {
       return {TypeTag::kBigInt};
     }
@@ -2778,9 +4660,19 @@ Type FunctionCallExpression::ResultType(const Schema& left,
     }
     return {TypeTag::kVarChar};
   }
+  if (func_name_ == "greatest" || func_name_ == "least") {
+    if (args_.empty()) {
+      return {TypeTag::kInvalid};
+    }
+    for (const auto& arg : args_) {
+      if (arg && arg->ResultType(left, right).GetType() == TypeTag::kDouble) {
+        return {TypeTag::kDouble};
+      }
+    }
+    return args_[0]->ResultType(left, right);
+  }
   if (func_name_ == "coalesce" || func_name_ == "nullif" ||
-      func_name_ == "ifnull" || func_name_ == "greatest" ||
-      func_name_ == "least") {
+      func_name_ == "ifnull") {
     if (args_.empty()) {
       return {TypeTag::kInvalid};
     }
@@ -2829,16 +4721,30 @@ Type FunctionCallExpression::ResultType(const Schema& left,
       func_name_ == "ascii" || func_name_ == "unicode" ||
       func_name_ == "regexp_contains" || func_name_ == "regexp_match" ||
       func_name_ == "regexp_instr" || func_name_ == "div" ||
-      func_name_.starts_with("extract_")) {
+      func_name_.starts_with("extract_") ||
+      func_name_ == "__bit_and" || func_name_ == "__bit_or" ||
+      func_name_ == "__bit_xor" || func_name_ == "__shift_left" ||
+      func_name_ == "__shift_right") {
     return {TypeTag::kBigInt};
+  }
+
+  if (func_name_ == "safe_add" || func_name_ == "safe_subtract" ||
+      func_name_ == "safe_multiply" || func_name_ == "mod") {
+    if (args_.empty()) {
+      return {TypeTag::kBigInt};
+    }
+    for (const auto& arg : args_) {
+      if (arg && arg->ResultType(left, right).GetType() == TypeTag::kDouble) {
+        return {TypeTag::kDouble};
+      }
+    }
+    return args_[0]->ResultType(left, right);
   }
 
   if (func_name_ == "abs" || func_name_ == "sign" || func_name_ == "round" ||
       func_name_ == "trunc" || func_name_ == "truncate" ||
       func_name_ == "ceil" || func_name_ == "ceiling" ||
-      func_name_ == "floor" || func_name_ == "mod" ||
-      func_name_ == "safe_add" || func_name_ == "safe_subtract" ||
-      func_name_ == "safe_multiply" || func_name_ == "safe_negate") {
+      func_name_ == "floor" || func_name_ == "safe_negate") {
     if (args_.empty()) {
       return {TypeTag::kBigInt};
     }

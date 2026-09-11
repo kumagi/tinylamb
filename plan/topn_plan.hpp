@@ -50,6 +50,9 @@ class TopNPlan final : public PlanBase {
   [[nodiscard]] bool EnforcesLimit(size_t limit, size_t offset) const override {
     return !with_ties_ && limit == limit_ && offset == offset_;
   }
+  [[nodiscard]] bool EnforcesDistinct() const override {
+    return (!with_ties_ && limit_ <= 1) || child_->EnforcesDistinct();
+  }
   [[nodiscard]] const Plan& Child() const { return child_; }
   [[nodiscard]] const std::vector<TopNKey>& Keys() const { return keys_; }
   [[nodiscard]] size_t Limit() const { return limit_; }

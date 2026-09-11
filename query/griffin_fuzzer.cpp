@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -24,6 +25,20 @@
 
 namespace tinylamb {
 namespace {
+
+struct ScopedDb {
+  std::string name;
+  std::unique_ptr<Database> db;
+  ScopedDb(std::string n, std::unique_ptr<Database> d)
+      : name(std::move(n)), db(std::move(d)) {}
+  ~ScopedDb() {
+    db.reset();
+    std::error_code ec;
+    std::filesystem::remove(name + ".log", ec);
+    std::filesystem::remove(name + ".db", ec);
+    std::filesystem::remove(name + ".last_checkpoint", ec);
+  }
+};
 
 constexpr const char* kTestHeader = "-- tinylamb-griffin-test v1";
 
@@ -82,6 +97,36 @@ const std::vector<std::vector<std::string>>& SeedPool() {
               "0;",
               "SELECT id, sal + 1000 * 2 FROM emp WHERE sal IS NOT "
               "NULL;",
+          },
+          {
+              "CREATE TABLE t_bit (id INT64, val INT64, mask INT64);",
+              "INSERT INTO t_bit VALUES (1, 5, 1), (2, -3, 2), (3, 0, 7), (4, "
+              "NULL, 1), (5, 12, NULL);",
+              "SELECT id, ~val, val & mask, val | mask, val ^ mask FROM t_bit;",
+              "SELECT id, val << 1, val >> 1 FROM t_bit WHERE val > 0;",
+              "SELECT id FROM t_bit WHERE (~val) < 0;",
+              "SELECT id FROM t_bit WHERE (val & 1) = 1;",
+          },
+          {
+              "CREATE TABLE t_str (id INT64, s STRING, prefix STRING);",
+              "INSERT INTO t_str VALUES (1, 'hello', 'he'), (2, 'WORLD', 'WO'), "
+              "(3, '  test  ', ' te'), (4, NULL, 'x'), (5, 'foo', NULL);",
+              "SELECT id, UPPER(s), LOWER(s), LENGTH(s), TRIM(s) FROM t_str;",
+              "SELECT id, SUBSTR(s, 1, 3) FROM t_str WHERE LENGTH(s) > 3;",
+              "SELECT id, COALESCE(s, 'default') FROM t_str WHERE s IS NOT "
+              "NULL;",
+              "SELECT id, NULLIF(s, 'hello') FROM t_str;",
+              "SELECT id, CASE WHEN s = 'hello' THEN 1 ELSE 0 END AS flag FROM "
+              "t_str;",
+          },
+          {
+              "CREATE TABLE t_math (x INT64, y DOUBLE);",
+              "INSERT INTO t_math VALUES (1, 2.5), (2, -3.7), (3, 0.0), (4, "
+              "NULL), (5, 10.2);",
+              "SELECT x, ABS(x), SIGN(x), y, ROUND(y), CEIL(y), FLOOR(y) FROM "
+              "t_math;",
+              "SELECT x, IFNULL(x, 0) FROM t_math WHERE ABS(x) > 1;",
+              "SELECT x, GREATEST(x, 2), LEAST(x, 2) FROM t_math;",
           },
       };
   return *pool;
@@ -264,6 +309,9 @@ RunOutcome RunStatement(Database& db, TransactionContext& ctx,
     while (result.Value().Next(&row)) {
       rows.push_back(row);
     }
+    if (result.Value().GetStatus() != Status::kSuccess) {
+      return outcome;  // rejected during execution
+    }
     for (Row& r : rows) {
       outcome.rows.push_back(r.ToString());
     }
@@ -276,7 +324,9 @@ RunOutcome RunStatement(Database& db, TransactionContext& ctx,
     // oracle (1) material.
     const std::string what = error.what();
     for (const std::string_view known :
-         {"not found", "no such", "ambiguous column", "numeric value"}) {
+         {"not found", "no such", "ambiguous column", "numeric value",
+          "cannot be compared", "Different type", "Unknown type",
+          "requires an integer", "requires a number"}) {
       if (what.find(known) != std::string::npos) {
         return outcome;  // rejected
       }
@@ -397,10 +447,14 @@ std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
   }
   std::shuffle(statements.begin(), statements.end(), rng);
 
-  auto db_holder =
-      Database::Create("griffin_fuzz-" + RandomString(8)).MoveValue();
+  const std::string db_name =
+      (std::filesystem::temp_directory_path() /
+       ("griffin_fuzz-" + RandomString(8)))
+          .string();
+  auto db_holder = Database::Create(db_name).MoveValue();
   CHECK(db_holder != nullptr);
-  Database& db = *db_holder;
+  ScopedDb sdb(db_name, std::move(db_holder));
+  Database& db = *sdb.db;
   TransactionContext ctx = db.BeginContext();
 
   // 2. Metadata-guided substitution: the snapshot refreshes per statement, so
@@ -411,6 +465,7 @@ std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
     return SubstituteIdentifiers(sql, meta, rng);
   };
   const std::string report = RunSession(db, ctx, statements, &t, substitute);
+  db.DeleteAll();
 
   if (verbose && report.empty()) {
     std::cerr << "[griffin_fuzz][ok] " << t.statements.size()
@@ -433,15 +488,20 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose) {
 
   // Re-run the recorded session verbatim (identity mutation) and report
   // whether the failure still reproduces. "" means fixed or flaky-clean.
-  auto db_holder =
-      Database::Create("griffin_replay-" + RandomString(8)).MoveValue();
+  const std::string db_name =
+      (std::filesystem::temp_directory_path() /
+       ("griffin_replay-" + RandomString(8)))
+          .string();
+  auto db_holder = Database::Create(db_name).MoveValue();
   CHECK(db_holder != nullptr);
-  Database& db = *db_holder;
+  ScopedDb sdb(db_name, std::move(db_holder));
+  Database& db = *sdb.db;
   TransactionContext ctx = db.BeginContext();
   GriffinTrace fresh;
   fresh.seed = trace.seed;
   const std::string report =
       RunSession(db, ctx, trace.statements, &fresh, nullptr);
+  db.DeleteAll();
   if (verbose && report.empty()) {
     std::cerr << "[griffin_fuzz][replay-clean] seed=" << trace.seed << "\n";
   }

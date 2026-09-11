@@ -692,13 +692,22 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       }
       continue;
     }
-    if (c == '\'') {
+    const bool is_triple_single =
+        (c == '\'' && i + 2 < sql.size() && sql[i + 1] == '\'' &&
+         sql[i + 2] == '\'');
+    const bool is_triple_double =
+        (c == '"' && i + 2 < sql.size() && sql[i + 1] == '"' &&
+         sql[i + 2] == '"');
+    if (c == '\'' || is_triple_double) {
+      const bool is_triple = is_triple_single || is_triple_double;
+      const char quote = is_triple_double ? '"' : '\'';
       const size_t quote_pos = i;
-      ++i;
+      i += is_triple ? 3 : 1;
       std::string raw_literal;
+      bool closed = false;
       while (i < sql.size()) {
         if (sql[i] == '\\' && i + 1 < sql.size()) {
-          // Backslash escapes the next character inside a single-quoted
+          // Backslash escapes the next character inside a quoted
           // string (the parser decodes \' and the splitter swallows the
           // pair); consume both so a \' does not terminate this scan.
           raw_literal.push_back(sql[i]);
@@ -706,17 +715,32 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
           i += 2;
           continue;
         }
-        if (sql[i] == '\'') {
-          if (i + 1 < sql.size() && sql[i + 1] == '\'') {
-            raw_literal.push_back('\'');
-            i += 2;
-            continue;
+        if (is_triple) {
+          if (sql[i] == quote && i + 2 < sql.size() && sql[i + 1] == quote &&
+              sql[i + 2] == quote) {
+            i += 3;
+            closed = true;
+            break;
           }
+          raw_literal.push_back(sql[i]);
           ++i;
-          break;
+        } else {
+          if (sql[i] == '\'') {
+            if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+              raw_literal.push_back('\'');
+              i += 2;
+              continue;
+            }
+            ++i;
+            closed = true;
+            break;
+          }
+          raw_literal.push_back(sql[i]);
+          ++i;
         }
-        raw_literal.push_back(sql[i]);
-        ++i;
+      }
+      if (!closed) {
+        result.templatable = false;
       }
       // Decode through the visitor's single escape table so the extracted
       // parameter equals the constant the first parse produced.  A b/B
@@ -751,7 +775,8 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       std::string literal =
           is_raw_prefix
               ? raw_literal
-              : DecodeStringEscapes(raw_literal, is_bytes_prefix, false, '\'');
+              : DecodeStringEscapes(raw_literal, is_bytes_prefix, is_triple,
+                                    quote);
       // PRODUCTION FIX (Q3): a TIMESTAMP '...' literal is UTC-normalized by
       // the visitor on the first parse, but the template/plan caches replayed
       // the RAW string parameter on later runs, so the same SQL returned a

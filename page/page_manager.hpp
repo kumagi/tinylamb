@@ -73,6 +73,16 @@ class PageManager {
 
   PagePool* GetPool() { return pool_.get(); }
 
+  [[nodiscard]] uint64_t CacheHits() const noexcept {
+    return pool_ ? pool_->CacheHits() : 0;
+  }
+  [[nodiscard]] uint64_t CacheMisses() const noexcept {
+    return pool_ ? pool_->CacheMisses() : 0;
+  }
+  [[nodiscard]] size_t PinnedPageCount() const noexcept {
+    return pool_ ? pool_->PinnedPageCount() : 0;
+  }
+
   friend std::ostream& operator<<(std::ostream& o, const PageManager& pm) {
     o << "PageManager(pool=" << *pm.pool_ << ")";
     return o;

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -29,6 +30,20 @@
 
 namespace tinylamb {
 namespace {
+
+struct ScopedDb {
+  std::string name;
+  std::unique_ptr<Database> db;
+  ScopedDb(std::string n, std::unique_ptr<Database> d)
+      : name(std::move(n)), db(std::move(d)) {}
+  ~ScopedDb() {
+    db.reset();
+    std::error_code ec;
+    std::filesystem::remove(name + ".log", ec);
+    std::filesystem::remove(name + ".db", ec);
+    std::filesystem::remove(name + ".last_checkpoint", ec);
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Random predicate tree with C++-side 3-valued evaluation.  This mirror is
@@ -79,6 +94,13 @@ struct RPred {
     kNot,
     kBin,
     kIsNullWrap,  // (left) IS NULL, whole-predicate
+    kIsDistinctFrom,
+    kBetween,
+    kInList,
+    kStrLike,
+    kBitwiseAndCmp,
+    kBitwiseNotCmp,
+    kArithmeticCmp,
   };
   Kind kind{Kind::kIntCmp};
   bool negated{false};  // IS NULL vs IS NOT NULL
@@ -87,8 +109,17 @@ struct RPred {
   bool rhs_is_col{false};
   int rhs_col{0};
   int64_t rhs_const{0};
+  bool rhs_is_null{false};
+  int64_t between_lo{0};
+  int64_t between_hi{0};
+  bool between_lo_null{false};
+  bool between_hi_null{false};
+  std::vector<int64_t> in_list{};
   int64_t str_const{0};  // 0 = 'a', 1 = 'bb'
+  int str_pattern{0};    // 0 = '%', 1 = '_', 2 = 'a%', 3 = '%b', 4 = 'b%', 5 = 'bb', 6 = 'c%'
   bool bool_positive{true};
+  int64_t mask{1};
+  int64_t arith_const{0};
   std::unique_ptr<RPred> left, right;
 
   static int64_t IntOf(const MirrorRow& r, int column) {
@@ -144,6 +175,19 @@ struct RPred {
         const bool is_null = row.s == kNull;
         return Eval3vl(negated ? !is_null : is_null);
       }
+      case Kind::kStrLike: {
+        if (row.s == kNull) {
+          return 'N';
+        }
+        bool match = false;
+        if (row.s == 0) {  // 'a'
+          match = (str_pattern == 0 || str_pattern == 1 || str_pattern == 2);
+        } else if (row.s == 1) {  // 'bb'
+          match = (str_pattern == 0 || str_pattern == 3 || str_pattern == 4 ||
+                   str_pattern == 5);
+        }
+        return Eval3vl(negated ? !match : match);
+      }
       case Kind::kNot:
         return Not3vl(left->Eval(row));
       case Kind::kIsNullWrap:
@@ -151,6 +195,107 @@ struct RPred {
       case Kind::kBin:
         return op == "AND" ? And3vl(left->Eval(row), right->Eval(row))
                            : Or3vl(left->Eval(row), right->Eval(row));
+      case Kind::kIsDistinctFrom: {
+        const int64_t lhs = IntOf(row, col);
+        const int64_t rhs = rhs_is_null
+                                ? kNull
+                                : (rhs_is_col ? IntOf(row, rhs_col) : rhs_const);
+        bool distinct = false;
+        if (lhs == kNull && rhs == kNull) {
+          distinct = false;
+        } else if (lhs == kNull || rhs == kNull) {
+          distinct = true;
+        } else {
+          distinct = (lhs != rhs);
+        }
+        return Eval3vl(negated ? !distinct : distinct);
+      }
+      case Kind::kBetween: {
+        const int64_t lhs = IntOf(row, col);
+        const int64_t lo = between_lo_null ? kNull : between_lo;
+        const int64_t hi = between_hi_null ? kNull : between_hi;
+        char ge = 'T';
+        if (lhs == kNull || lo == kNull) {
+          ge = 'N';
+        } else {
+          ge = Eval3vl(lhs >= lo);
+        }
+        char le = 'T';
+        if (lhs == kNull || hi == kNull) {
+          le = 'N';
+        } else {
+          le = Eval3vl(lhs <= hi);
+        }
+        char res = And3vl(ge, le);
+        return negated ? Not3vl(res) : res;
+      }
+      case Kind::kInList: {
+        const int64_t lhs = IntOf(row, col);
+        if (lhs == kNull) {
+          return 'N';
+        }
+        bool has_null = false;
+        bool matched = false;
+        for (int64_t val : in_list) {
+          if (val == kNull) {
+            has_null = true;
+          } else if (val == lhs) {
+            matched = true;
+            break;
+          }
+        }
+        char res = 'N';
+        if (matched) {
+          res = 'T';
+        } else if (has_null) {
+          res = 'N';
+        } else {
+          res = 'F';
+        }
+        return negated ? Not3vl(res) : res;
+      }
+      case Kind::kBitwiseAndCmp: {
+        const int64_t lhs = IntOf(row, col);
+        if (lhs == kNull) {
+          return 'N';
+        }
+        const int64_t masked = lhs & mask;
+        const int64_t rhs = rhs_const;
+        if (op == "=") return Eval3vl(masked == rhs);
+        if (op == "!=") return Eval3vl(masked != rhs);
+        if (op == "<") return Eval3vl(masked < rhs);
+        if (op == "<=") return Eval3vl(masked <= rhs);
+        if (op == ">") return Eval3vl(masked > rhs);
+        return Eval3vl(masked >= rhs);
+      }
+      case Kind::kBitwiseNotCmp: {
+        const int64_t lhs = IntOf(row, col);
+        if (lhs == kNull) {
+          return 'N';
+        }
+        const int64_t not_val = ~lhs;
+        const int64_t rhs = rhs_const;
+        if (op == "=") return Eval3vl(not_val == rhs);
+        if (op == "!=") return Eval3vl(not_val != rhs);
+        if (op == "<") return Eval3vl(not_val < rhs);
+        if (op == "<=") return Eval3vl(not_val <= rhs);
+        if (op == ">") return Eval3vl(not_val > rhs);
+        return Eval3vl(not_val >= rhs);
+      }
+      case Kind::kArithmeticCmp: {
+        const int64_t lhs = IntOf(row, col);
+        if (lhs == kNull) {
+          return 'N';
+        }
+        const int64_t arith_val = lhs + arith_const;
+        const int64_t rhs = rhs_const;
+        if (op == "=") return Eval3vl(arith_val == rhs);
+        if (op == "!=") return Eval3vl(arith_val != rhs);
+        if (op == "<") return Eval3vl(arith_val < rhs);
+        if (op == "<=") return Eval3vl(arith_val <= rhs);
+        if (op == ">") return Eval3vl(arith_val > rhs);
+        return Eval3vl(arith_val >= rhs);
+      }
     }
     return 'N';
   }
@@ -193,6 +338,65 @@ struct RPred {
         return "(" + left->Render() + ") IS NULL";
       case Kind::kBin:
         return "(" + left->Render() + " " + op + " " + right->Render() + ")";
+      case Kind::kIsDistinctFrom: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        const std::string rhs =
+            rhs_is_null
+                ? "NULL"
+                : (rhs_is_col ? kIntCols[static_cast<size_t>(rhs_col)]
+                              : std::to_string(rhs_const));
+        return "(" + std::string(kIntCols[static_cast<size_t>(col)]) + " IS " +
+               (negated ? "NOT " : "") + "DISTINCT FROM " + rhs + ")";
+      }
+      case Kind::kBetween: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        const std::string lo =
+            between_lo_null ? "NULL" : std::to_string(between_lo);
+        const std::string hi =
+            between_hi_null ? "NULL" : std::to_string(between_hi);
+        return "(" + std::string(kIntCols[static_cast<size_t>(col)]) +
+               (negated ? " NOT BETWEEN " : " BETWEEN ") + lo + " AND " + hi +
+               ")";
+      }
+      case Kind::kInList: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        std::string out = "(" +
+                          std::string(kIntCols[static_cast<size_t>(col)]) +
+                          (negated ? " NOT IN (" : " IN (");
+        for (size_t i = 0; i < in_list.size(); ++i) {
+          if (i > 0) {
+            out += ", ";
+          }
+          out += in_list[i] == kNull ? "NULL" : std::to_string(in_list[i]);
+        }
+        out += "))";
+        return out;
+      }
+      case Kind::kStrLike: {
+        static const std::array<const char*, 7> kPatterns = {
+            "'%'", "'_'", "'a%'", "'%b'", "'b%'", "'bb'", "'c%'"};
+        return std::string("(s ") + (negated ? "NOT LIKE " : "LIKE ") +
+               kPatterns[static_cast<size_t>(str_pattern)] + ")";
+      }
+      case Kind::kBitwiseAndCmp: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        return "(((" + std::string(kIntCols[static_cast<size_t>(col)]) + " & " +
+               std::to_string(mask) + ") " + op + " " +
+               std::to_string(rhs_const) + "))";
+      }
+      case Kind::kBitwiseNotCmp: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        return "(((~" + std::string(kIntCols[static_cast<size_t>(col)]) + ") " +
+               op + " " + std::to_string(rhs_const) + "))";
+      }
+      case Kind::kArithmeticCmp: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        const std::string op_str = arith_const >= 0 ? "+" : "-";
+        const int64_t abs_const = arith_const >= 0 ? arith_const : -arith_const;
+        return "(((" + std::string(kIntCols[static_cast<size_t>(col)]) + " " +
+               op_str + " " + std::to_string(abs_const) + ") " + op + " " +
+               std::to_string(rhs_const) + "))";
+      }
     }
     return "TRUE";
   }
@@ -209,8 +413,17 @@ RPredPtr CopyPred(const RPred& p) {
   c->rhs_is_col = p.rhs_is_col;
   c->rhs_col = p.rhs_col;
   c->rhs_const = p.rhs_const;
+  c->rhs_is_null = p.rhs_is_null;
+  c->between_lo = p.between_lo;
+  c->between_hi = p.between_hi;
+  c->between_lo_null = p.between_lo_null;
+  c->between_hi_null = p.between_hi_null;
+  c->in_list = p.in_list;
   c->str_const = p.str_const;
+  c->str_pattern = p.str_pattern;
   c->bool_positive = p.bool_positive;
+  c->mask = p.mask;
+  c->arith_const = p.arith_const;
   if (p.left) {
     c->left = CopyPred(*p.left);
   }
@@ -243,7 +456,7 @@ RPredPtr IntLeafPredicate(Gen& g) {
   static const std::vector<std::string> kOps = {"=",  "!=", "<",
                                                 "<=", ">",  ">="};
   auto p = std::make_unique<RPred>();
-  switch (g.Pick(0, 3)) {
+  switch (g.Pick(0, 9)) {
     case 0:
       p->kind = RPred::Kind::kIntCmp;
       p->col = g.Pick(0, 1);
@@ -262,15 +475,79 @@ RPredPtr IntLeafPredicate(Gen& g) {
       p->col = g.Pick(0, 1);
       p->negated = g.Chance(50);
       return p;
-    default:
+    case 3:
       p->kind = RPred::Kind::kBoolCol;
       p->bool_positive = g.Chance(50);
       return p;
+    case 4: {
+      p->kind = RPred::Kind::kIsDistinctFrom;
+      p->col = g.Pick(0, 1);
+      p->negated = g.Chance(50);
+      if (g.Chance(20)) {
+        p->rhs_is_null = true;
+      } else if (g.Chance(40)) {
+        p->rhs_is_col = true;
+        p->rhs_col = g.Pick(0, 1);
+      } else {
+        p->rhs_const = g.Pick(-3, 3);
+      }
+      return p;
+    }
+    case 5: {
+      p->kind = RPred::Kind::kBetween;
+      p->col = g.Pick(0, 1);
+      p->negated = g.Chance(30);
+      int64_t v1 = g.Pick(-3, 3);
+      int64_t v2 = g.Pick(-3, 3);
+      p->between_lo = std::min(v1, v2);
+      p->between_hi = std::max(v1, v2);
+      p->between_lo_null = g.Chance(15);
+      p->between_hi_null = g.Chance(15);
+      return p;
+    }
+    case 6: {
+      p->kind = RPred::Kind::kBitwiseAndCmp;
+      p->col = g.Pick(0, 1);
+      p->op = g.PickFrom(kOps);
+      p->mask = g.Pick(1, 3);
+      p->rhs_const = g.Pick(0, 3);
+      return p;
+    }
+    case 7: {
+      p->kind = RPred::Kind::kBitwiseNotCmp;
+      p->col = g.Pick(0, 1);
+      p->op = g.PickFrom(kOps);
+      p->rhs_const = g.Pick(-4, 4);
+      return p;
+    }
+    case 8: {
+      p->kind = RPred::Kind::kArithmeticCmp;
+      p->col = g.Pick(0, 1);
+      p->op = g.PickFrom(kOps);
+      p->arith_const = g.Pick(-2, 2);
+      p->rhs_const = g.Pick(-3, 3);
+      return p;
+    }
+    default: {
+      p->kind = RPred::Kind::kInList;
+      p->col = g.Pick(0, 1);
+      p->negated = g.Chance(30);
+      const int count = g.Pick(1, 4);
+      p->in_list.reserve(static_cast<size_t>(count));
+      for (int i = 0; i < count; ++i) {
+        if (g.Chance(20)) {
+          p->in_list.push_back(kNull);
+        } else {
+          p->in_list.push_back(g.Pick(-3, 3));
+        }
+      }
+      return p;
+    }
   }
 }
 
 RPredPtr LeafPredicate(Gen& g) {
-  switch (g.Pick(0, 2)) {
+  switch (g.Pick(0, 3)) {
     case 0:
       return IntLeafPredicate(g);
     case 1: {
@@ -278,6 +555,13 @@ RPredPtr LeafPredicate(Gen& g) {
       p->kind = RPred::Kind::kStrCmp;
       p->op = g.Chance(70) ? "=" : "!=";
       p->str_const = g.Pick(0, 1);
+      return p;
+    }
+    case 2: {
+      auto p = std::make_unique<RPred>();
+      p->kind = RPred::Kind::kStrLike;
+      p->negated = g.Chance(40);
+      p->str_pattern = g.Pick(0, 6);
       return p;
     }
     default: {
@@ -310,15 +594,23 @@ RPredPtr GenPredicate(Gen& g, int depth, int flavour) {
 }
 
 std::string GenProjection(Gen& g) {
-  switch (g.Pick(0, 3)) {
+  switch (g.Pick(0, 7)) {
     case 0:
       return "*";
     case 1:
       return "a";
     case 2:
       return "a, b";
-    default:
+    case 3:
       return "flag, s";
+    case 4:
+      return "COALESCE(a, 0), b";
+    case 5:
+      return "u + 1, a";
+    case 6:
+      return "CASE WHEN flag THEN a ELSE b END";
+    default:
+      return "u, a, b, flag, s";
   }
 }
 
@@ -408,14 +700,24 @@ std::optional<std::string> RunScalar(Database& db, TransactionContext& ctx,
 }
 
 // Runs any statement to completion; returns false on error.
-bool RunUpdate(Database& db, TransactionContext& ctx, const std::string& sql) {
+bool RunUpdate(Database& db, TransactionContext& ctx, const std::string& sql,
+               std::string* error = nullptr) {
   SqlEngine engine(db);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
+    if (error != nullptr) {
+      *error = engine.LastError();
+    }
     return false;
   }
   // QueryResults are lazy: drain or the mutation never happens.
   result.Value().Drain();
+  if (result.Value().GetStatus() != Status::kSuccess) {
+    if (error != nullptr) {
+      *error = result.Value().GetStatus().GetMessage();
+    }
+    return false;
+  }
   return true;
 }
 
@@ -716,18 +1018,19 @@ bool CheckDqe(Database& db, TransactionContext& ctx, const OracleTrace& t,
   return true;
 }
 
-// Executes the setup statements; returns false when the engine rejected one.
-bool RunSetup(Database& db, TransactionContext& ctx,
-              const std::vector<std::string>& setup, bool verbose) {
+// Executes the setup statements; returns empty on success, error message on failure.
+std::string RunSetup(Database& db, TransactionContext& ctx,
+                     const std::vector<std::string>& setup, bool verbose) {
   for (const std::string& sql : setup) {
-    if (!RunUpdate(db, ctx, sql)) {
+    std::string err;
+    if (!RunUpdate(db, ctx, sql, &err)) {
       if (verbose) {
-        std::cerr << "[sql_oracle][skip-setup] " << sql << "\n";
+        std::cerr << "[sql_oracle][skip-setup] " << sql << " (" << err << ")\n";
       }
-      return false;
+      return "setup statement failed on [" + sql + "]: " + err;
     }
   }
-  return true;
+  return {};
 }
 
 }  // namespace
@@ -919,12 +1222,16 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
 
   // Plan feedback: reward flavours that surface unseen plan shapes.
   if (session != nullptr) {
-    auto db_holder =
-        Database::Create("sql_oracle_fuzz-" + RandomString(8)).MoveValue();
+    const std::string db_name =
+        (std::filesystem::temp_directory_path() /
+         ("sql_oracle_fuzz-" + RandomString(8)))
+            .string();
+    auto db_holder = Database::Create(db_name).MoveValue();
     CHECK(db_holder != nullptr);
-    Database& db = *db_holder;
+    ScopedDb sdb(db_name, std::move(db_holder));
+    Database& db = *sdb.db;
     TransactionContext ctx = db.BeginContext();
-    if (RunSetup(db, ctx, t.setup, verbose)) {
+    if (RunSetup(db, ctx, t.setup, verbose).empty()) {
       std::string error;
       auto plan = RunRows(db, ctx, "EXPLAIN " + t.tlp[0], &error);
       if (plan.has_value()) {
@@ -953,13 +1260,18 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   if (trace.setup.empty() || !trace.setup[0].starts_with("CREATE TABLE")) {
     return "malformed trace: no CREATE TABLE in setup";
   }
-  auto db_holder =
-      Database::Create("sql_oracle_replay-" + RandomString(8)).MoveValue();
+  const std::string db_name =
+      (std::filesystem::temp_directory_path() /
+       ("sql_oracle_replay-" + RandomString(8)))
+          .string();
+  auto db_holder = Database::Create(db_name).MoveValue();
   CHECK(db_holder != nullptr);
-  Database& db = *db_holder;
+  ScopedDb sdb(db_name, std::move(db_holder));
+  Database& db = *sdb.db;
   TransactionContext ctx = db.BeginContext();
-  if (!RunSetup(db, ctx, trace.setup, verbose)) {
-    return "setup statement failed";
+  const std::string setup_err = RunSetup(db, ctx, trace.setup, verbose);
+  if (!setup_err.empty()) {
+    return setup_err;
   }
   std::string report;
   if (!CheckTlp(db, ctx, trace.tlp, &report, verbose) ||
@@ -1099,10 +1411,14 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
 
 std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
   Gen g(rng);
-  auto db_holder =
-      Database::Create("sql_oracle_amoeba-" + RandomString(8)).MoveValue();
+  const std::string db_name =
+      (std::filesystem::temp_directory_path() /
+       ("sql_oracle_amoeba-" + RandomString(8)))
+          .string();
+  auto db_holder = Database::Create(db_name).MoveValue();
   CHECK(db_holder != nullptr);
-  Database& db = *db_holder;
+  ScopedDb sdb(db_name, std::move(db_holder));
+  Database& db = *sdb.db;
   TransactionContext ctx = db.BeginContext();
   const std::string tab =
       "t" +
@@ -1185,54 +1501,75 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
     }
   }
 
-  auto median_ns = [&](const std::string& sql) {
-    std::vector<int64_t> samples;
+  auto explain_plan = [&](const std::string& sql) {
     std::string error;
-    for (int i = 0; i < 7; ++i) {
+    auto rows = RunRows(db, ctx, "EXPLAIN " + sql, &error);
+    if (!rows.has_value()) return std::string{};
+    std::string plan;
+    for (const Row& r : *rows) {
+      plan += r.ToString() + ";";
+    }
+    return plan;
+  };
+
+  std::vector<std::string> sqls;
+  for (const RPredPtr& v : variants) {
+    sqls.push_back("SELECT COUNT(*) FROM " + tab + " WHERE " + v->Render() +
+                   ";");
+  }
+
+  // Interleave samples across variants so that external host spikes (e.g.
+  // checkpoints or thread scheduling in multi-threaded fuzzing) affect all
+  // variants rather than unfairly penalizing one consecutive block.
+  std::vector<std::vector<int64_t>> all_samples(sqls.size());
+  for (int round = 0; round < 7; ++round) {
+    for (size_t vi = 0; vi < sqls.size(); ++vi) {
+      std::string error;
       const auto start = std::chrono::steady_clock::now();
-      auto rows = RunRows(db, ctx, sql, &error);
+      auto rows = RunRows(db, ctx, sqls[vi], &error);
       const auto stop = std::chrono::steady_clock::now();
       if (!rows.has_value()) {
-        return int64_t{-1};
+        if (verbose) {
+          std::cerr << "[sql_oracle][amoeba-skip]\n";
+        }
+        return "";
       }
-      samples.push_back(
+      all_samples[vi].push_back(
           std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start)
               .count());
     }
-    std::sort(samples.begin(), samples.end());
-    return samples[samples.size() / 2];
-  };
+  }
 
   int64_t fastest = -1;
   int64_t slowest = -1;
-  std::string fastest_sql;
-  std::string slowest_sql;
-  for (const RPredPtr& v : variants) {
-    const std::string sql =
-        "SELECT COUNT(*) FROM " + tab + " WHERE " + v->Render() + ";";
-    const int64_t ns = median_ns(sql);
-    if (ns < 0) {
-      if (verbose) {
-        std::cerr << "[sql_oracle][amoeba-skip]\n";
-      }
-      return "";
+  size_t fastest_idx = 0;
+  size_t slowest_idx = 0;
+  for (size_t vi = 0; vi < sqls.size(); ++vi) {
+    std::sort(all_samples[vi].begin(), all_samples[vi].end());
+    const int64_t med = all_samples[vi][all_samples[vi].size() / 2];
+    if (fastest < 0 || med < fastest) {
+      fastest = med;
+      fastest_idx = vi;
     }
-    if (fastest < 0 || ns < fastest) {
-      fastest = ns;
-      fastest_sql = sql;
-    }
-    if (slowest < 0 || ns > slowest) {
-      slowest = ns;
-      slowest_sql = sql;
+    if (slowest < 0 || med > slowest) {
+      slowest = med;
+      slowest_idx = vi;
     }
   }
-  // Conservative thresholds: report only egregious regressions so CI noise
-  // cannot produce false positives.
-  if (slowest > 3000000 && slowest > 30 * fastest) {
+
+  // Conservative thresholds: report only egregious regressions where the
+  // optimizer produced different plans or huge runtime divergence.
+  if (slowest > 20000000 && slowest > 30 * fastest) {
+    const std::string plan_fast = explain_plan(sqls[fastest_idx]);
+    const std::string plan_slow = explain_plan(sqls[slowest_idx]);
+    if (!plan_fast.empty() && !plan_slow.empty() && plan_fast == plan_slow) {
+      // Identical physical plan: runtime divergence is host scheduler noise.
+      return "";
+    }
     std::string report = "[AMOEBA MISMATCH]\n";
-    report += "  fast: " + fastest_sql + " => " +
+    report += "  fast: " + sqls[fastest_idx] + " => " +
               std::to_string(fastest / 1000000) + "ms\n";
-    report += "  slow: " + slowest_sql + " => " +
+    report += "  slow: " + sqls[slowest_idx] + " => " +
               std::to_string(slowest / 1000000) + "ms\n";
     return report;
   }

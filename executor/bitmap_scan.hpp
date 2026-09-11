@@ -69,7 +69,7 @@ class BitmapHeapScan : public ExecutorBase {
  public:
   BitmapHeapScan(Transaction& txn, const Table& table,
                  std::vector<RowPosition> positions, Expression where,
-                 Schema schema, std::string bitmap_operation);
+                 Schema schema, std::string bitmap_operation = "BitmapIndexScan");
   BitmapHeapScan(const BitmapHeapScan&) = delete;
   BitmapHeapScan(BitmapHeapScan&&) = delete;
   BitmapHeapScan& operator=(const BitmapHeapScan&) = delete;

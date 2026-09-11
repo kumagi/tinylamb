@@ -1227,14 +1227,19 @@ TEST_F(RecoveryManagerTest, CorruptTailAbortsByDefault) {
     return;
   }
   ASSERT_FALSE(RecoveryManager::TornTailTruncationAllowed());
+  const std::string probe_prefix = "corrupt_tail_probe-" + RandomString();
   const std::string self =
       std::filesystem::read_symlink("/proc/self/exe").string();
   const std::string filter =
       "--gtest_filter=RecoveryManagerTest.CorruptTailAbortsByDefault";
-  const std::string cmd = "TINYLAMB_CORRUPT_TAIL_PROBE=1 '" + self + "' " +
+  const std::string cmd = "TINYLAMB_CORRUPT_TAIL_PROBE='" + probe_prefix + "' '" + self + "' " +
                           filter + " --gtest_brief=1 >/dev/null 2>&1";
   // Non-zero exit = the fresh process aborted on corruption, as required.
-  EXPECT_NE(std::system(cmd.c_str()), 0);  // NOLINT(cert-env33-c)
+  const int rc = std::system(cmd.c_str());  // NOLINT(cert-env33-c)
+  std::error_code ec;
+  std::filesystem::remove(probe_prefix + ".db", ec);
+  std::filesystem::remove(probe_prefix + ".log", ec);
+  EXPECT_NE(rc, 0);
 }
 
 // --force: truncate at the corruption point, then recover the intact prefix.

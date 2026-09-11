@@ -3,6 +3,7 @@
 #include "query/expr_oracle_fuzzer.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -18,11 +19,29 @@
 namespace tinylamb {
 namespace {
 
+struct ScopedDb {
+  std::string name;
+  std::unique_ptr<Database> db;
+  ScopedDb(std::string n, std::unique_ptr<Database> d)
+      : name(std::move(n)), db(std::move(d)) {}
+  ~ScopedDb() {
+    db.reset();
+    std::error_code ec;
+    std::filesystem::remove(name + ".log", ec);
+    std::filesystem::remove(name + ".db", ec);
+    std::filesystem::remove(name + ".last_checkpoint", ec);
+  }
+};
+
 std::string RunSingleCellSql(const std::string& sql) {
-  auto db_holder =
-      Database::Create("expr_oracle_pin-" + RandomString(8)).MoveValue();
+  const std::string db_name =
+      (std::filesystem::temp_directory_path() /
+       ("expr_oracle_pin-" + RandomString(8)))
+          .string();
+  auto db_holder = Database::Create(db_name).MoveValue();
   CHECK(db_holder != nullptr);
-  Database& db = *db_holder;
+  ScopedDb sdb(db_name, std::move(db_holder));
+  Database& db = *sdb.db;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
   // Probe: does table presence change scalar-select row widths?
@@ -360,6 +379,32 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
       << true;
 }
 
+TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
+  int ran = 0;
+  int engine_ran = 0;
+  constexpr int kIterations = 200;
+  ExprGenConfig config;
+  config.extended_ops = true;
+  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+    const auto seed32 = seed + 3000;
+    const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
+    std::mt19937 rng(seed32);
+    ExprOracleTrace trace;
+    trace.seed = packed;
+    std::string report = RunExprOracleIteration(rng, false, &trace, config);
+    ASSERT_EQ(report, "") << "Seed " << seed32 << " failed:\n" << report;
+    EXPECT_EQ(trace.seed, packed);
+    EXPECT_TRUE(trace.sql.rfind("SELECT ", 0) == 0);
+    EXPECT_TRUE(trace.sexpr.front() == '(');
+    EXPECT_TRUE(trace.reference.empty() == false);
+    if (trace.engine_ran) {
+      ++engine_ran;
+    }
+    ++ran;
+  }
+  EXPECT_EQ(ran, kIterations);
+}
+
 // Failure->file->replay pipeline: serialize/parse round-trips, replay of a
 // healthy trace holds, and a tampered trace is reported, not replayed clean.
 TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
@@ -387,6 +432,74 @@ TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
   ExprOracleTrace junk;
   EXPECT_FALSE(ParseExprOracleTest("SELECT 1;", &junk));
   EXPECT_FALSE(ParseExprOracleTest("-- tinylamb-expr-oracle-test v1\n", &junk));
+}
+
+TEST(ExprOracleFuzzer, RowAwareNullRejectAndDifferentialEquivalence) {
+  constexpr int kIterations = 64;
+  int null_reject_verified_count = 0;
+  int engine_ran_count = 0;
+
+  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+    const auto seed32 = seed;
+    const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
+    std::mt19937 rng(seed32);
+    RowExprOracleTrace trace;
+    trace.seed = packed;
+    std::string report = RunRowExprOracleIteration(rng, false, &trace);
+    ASSERT_EQ(report, "") << "Seed " << seed << " failed:\n" << report;
+    EXPECT_EQ(trace.seed, packed);
+    EXPECT_FALSE(trace.predicate_sql.empty());
+    EXPECT_GT(trace.total_rows, 0U);
+    if (trace.null_reject_verified) {
+      ++null_reject_verified_count;
+    }
+    if (trace.engine_ran) {
+      ++engine_ran_count;
+    }
+  }
+
+  EXPECT_EQ(engine_ran_count, kIterations);
+  EXPECT_GT(null_reject_verified_count, 0)
+      << "Expected null rejection verification to trigger on generated predicates";
+}
+
+TEST(ExprOracleFuzzer, RowTraceReplayEquivalence) {
+  const uint32_t seed32 = 42;
+  std::mt19937 rng(seed32);
+  RowExprOracleTrace trace;
+  trace.seed = (static_cast<uint64_t>(seed32) << 32) | seed32;
+  ASSERT_EQ(RunRowExprOracleIteration(rng, false, &trace), "");
+
+  EXPECT_EQ(ReplayRowExprOracleTrace(trace, false), "");
+
+  // Tampering with trace IDs should cause replay to detect discrepancy
+  RowExprOracleTrace tampered = trace;
+  tampered.matched_ids.push_back(999999);
+  EXPECT_NE(ReplayRowExprOracleTrace(tampered, false), "");
+}
+
+TEST(ExprOracleFuzzer, RowAwareExtendedOpsEquivalence) {
+  ExprGenConfig config;
+  config.extended_ops = true;
+  constexpr int kIterations = 100;
+  int null_reject_verified_count = 0;
+  int engine_ran_count = 0;
+
+  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+    std::mt19937 rng(seed + 1000);
+    RowExprOracleTrace trace;
+    trace.seed = (static_cast<uint64_t>(seed + 1000) << 32) | (seed + 1000);
+    std::string report = RunRowExprOracleIteration(rng, false, &trace, config);
+    ASSERT_EQ(report, "") << "Seed " << seed << " failed:\n" << report;
+    if (trace.null_reject_verified) {
+      ++null_reject_verified_count;
+    }
+    if (trace.engine_ran) {
+      ++engine_ran_count;
+    }
+  }
+
+  EXPECT_EQ(engine_ran_count, kIterations);
 }
 
 }  // namespace tinylamb

@@ -67,7 +67,11 @@ class PagePoolTest : public ::testing::Test {
   void Reset() {
     pp = PagePool::Create(filename_, kDefaultCapacity).MoveValue();
   }
-  void TearDown() override { std::ignore = std::remove(filename_.c_str()); }
+  void TearDown() override {
+    pp.reset();
+    std::ignore = std::remove(filename_.c_str());
+    std::ignore = std::remove((filename_ + ".log").c_str());
+  }
 
   std::string filename_;
   std::unique_ptr<PagePool> pp = nullptr;
@@ -394,11 +398,15 @@ TEST_F(PagePoolTest, CacheHitFlagReflectsMissAndHit) {
   // The PageRef holds the page's exclusive latch, so the second request must
   // wait for the first ref to be destroyed.
   bool hit = true;
+  const uint64_t misses_before = pp->CacheMisses();
+  const uint64_t hits_before = pp->CacheHits();
   {
     PageRef miss = pp->GetPage(9, &hit).MoveValue();
 
     // Assert -- the first request was a miss
     ASSERT_FALSE(hit);
+    EXPECT_EQ(pp->CacheMisses(), misses_before + 1);
+    EXPECT_EQ(pp->CacheHits(), hits_before);
   }
   hit = false;
   {
@@ -407,6 +415,8 @@ TEST_F(PagePoolTest, CacheHitFlagReflectsMissAndHit) {
     // Assert -- the second request was served from the pool
     ASSERT_TRUE(hit);
     ASSERT_EQ(hit_ref->PageID(), 9U);
+    EXPECT_EQ(pp->CacheMisses(), misses_before + 1);
+    EXPECT_EQ(pp->CacheHits(), hits_before + 1);
   }
 }
 

@@ -438,22 +438,46 @@ bool NarrowIntegerFits(const ColumnName& column, const Value& value) {
     return static_cast<char>(std::tolower(c));
   });
   const int64_t number = value.value.int_value;
+  if (name.find("uint64") != std::string::npos) {
+    if (!value.IsUnsigned() && number < 0) {
+      return false;
+    }
+    return true;
+  }
   if (name.find("uint32") != std::string::npos) {
-    return number >= 0 && number <= 4294967295LL;
+    if (!value.IsUnsigned() && number < 0) {
+      return false;
+    }
+    return static_cast<uint64_t>(number) <= 4294967295ULL;
   }
   if (name.find("int32") != std::string::npos) {
+    if (value.IsUnsigned()) {
+      return static_cast<uint64_t>(number) <= 2147483647ULL;
+    }
     return number >= -2147483648LL && number <= 2147483647LL;
   }
   if (name.find("uint16") != std::string::npos) {
-    return number >= 0 && number <= 65535;
+    if (!value.IsUnsigned() && number < 0) {
+      return false;
+    }
+    return static_cast<uint64_t>(number) <= 65535ULL;
   }
   if (name.find("int16") != std::string::npos) {
+    if (value.IsUnsigned()) {
+      return static_cast<uint64_t>(number) <= 32767ULL;
+    }
     return number >= -32768 && number <= 32767;
   }
   if (name.find("uint8") != std::string::npos) {
-    return number >= 0 && number <= 255;
+    if (!value.IsUnsigned() && number < 0) {
+      return false;
+    }
+    return static_cast<uint64_t>(number) <= 255ULL;
   }
   if (name.find("int8") != std::string::npos) {
+    if (value.IsUnsigned()) {
+      return static_cast<uint64_t>(number) <= 127ULL;
+    }
     return number >= -128 && number <= 127;
   }
   return true;
@@ -933,7 +957,7 @@ std::optional<Executor> ServeCompiledSelect(TransactionContext& ctx,
   // shape metadata was captured from an identical bound statement at fill.
   const CompiledPlan::SelectShape& shape = *compiled.select_shape;
   Executor executor = compiled.plan->EmitExecutor(ctx);
-  if (shape.distinct) {
+  if (shape.distinct && !compiled.plan->EnforcesDistinct()) {
     executor = std::make_shared<DistinctExecutor>(std::move(executor));
   }
   if (!shape.order_expressions.empty() &&
@@ -1002,11 +1026,23 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
     for (size_t i = 0; i < evaluated.size(); ++i) {
       // Same coercion rules as the legacy INSERT path so behavior is
       // identical for every parameter combination.
-      const ValueType expected = shape.schema.GetColumn(i).Type();
-      if (ValidateNarrowInteger(shape.schema.GetColumn(i).Name(),
-                                evaluated[i]) != Status::kSuccess) {
+      const auto& col = shape.schema.GetColumn(i);
+      const ValueType expected = col.Type();
+      if (ValidateNarrowInteger(col.Name(), evaluated[i]) != Status::kSuccess) {
         // The slow path re-validates and surfaces the diagnostic.
         return std::nullopt;
+      }
+      if (col.IsUnsigned()) {
+        if (!evaluated[i].IsNull()) {
+          if (evaluated[i].type != ValueType::kInt64) {
+            return std::nullopt;
+          }
+          if (!evaluated[i].IsUnsigned() && evaluated[i].value.int_value < 0) {
+            return std::nullopt;
+          }
+          evaluated[i] = evaluated[i].WithUnsigned();
+        }
+        continue;
       }
       if (evaluated[i].IsNull() || evaluated[i].type == expected) {
         continue;
@@ -1105,7 +1141,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   }
   // Phase 2-1: consult the compiled-plan cache before any parse/bind/plan
   // work. Only non-EXPLAIN, templatable statements participate.
-  if (!explain && templated.templatable) {
+  if (!explain && !force_relational_fallback_ && templated.templatable) {
     if (std::optional<Executor> served = ServeFromPlanCache(
             ctx, templated.fingerprint, templated.parameters)) {
       return std::move(*served);
@@ -1186,6 +1222,16 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
 
     uint64_t rows = 0;
     std::chrono::steady_clock::time_point execution_end = planning_end;
+    uint64_t initial_hits = 0;
+    uint64_t initial_misses = 0;
+    PageManager* pm = ctx.txn_.GetPageManager();
+    if (pm != nullptr) {
+      initial_hits = pm->CacheHits();
+      initial_misses = pm->CacheMisses();
+    } else if (database_ != nullptr) {
+      initial_hits = database_->CacheHits();
+      initial_misses = database_->CacheMisses();
+    }
     if (explain->analyze) {
       Row row;
       while (prepared.Value()->Next(&row, nullptr)) {
@@ -1239,6 +1285,15 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
                                       .count();
       output << "\nActual Rows: " << rows
              << "\nExecution Time: " << execution_ms << " ms";
+      if (pm != nullptr) {
+        const uint64_t hits = pm->CacheHits() - initial_hits;
+        const uint64_t misses = pm->CacheMisses() - initial_misses;
+        output << "\nBuffer Pool: " << hits << " hits, " << misses << " misses";
+      } else if (database_ != nullptr) {
+        const uint64_t hits = database_->CacheHits() - initial_hits;
+        const uint64_t misses = database_->CacheMisses() - initial_misses;
+        output << "\nBuffer Pool: " << hits << " hits, " << misses << " misses";
+      }
     }
     result_column_names_ = {"QUERY PLAN"};
     return Executor(
@@ -1253,7 +1308,8 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     // constant), so keep such statements out of the template cache.
     templated.templatable = false;
   }
-  if (templated.templatable && !cache_hit && !IsExplicitZeroLimit(*statement)) {
+  if (templated.templatable && !cache_hit && !force_relational_fallback_ &&
+      !IsExplicitZeroLimit(*statement)) {
     // Template caching is best-effort; a bind failure just means the
     // statement is parsed verbatim next time.
     if (auto rebound = BindStatementLiterals(*statement, templated.parameters);
@@ -1263,7 +1319,9 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   }
   // Arm the compiled-plan fill sites inside PrepareStatement; the guard
   // disarms them on every exit (including EXPLAIN, which never sets one).
-  set_plan_cache_candidate(templated.fingerprint, templated.parameters);
+  if (!force_relational_fallback_) {
+    set_plan_cache_candidate(templated.fingerprint, templated.parameters);
+  }
   PlanCacheCandidateGuard candidate_guard{this};
   // Statement execution (e.g. eager DML application) must uphold the
   // StatusOr contract: runtime errors surface as Status values, never as
@@ -3021,12 +3079,26 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           return Status::kUnknown;
         }
         for (size_t i = 0; i < row.values_.size(); ++i) {
-          const ValueType expected = table->GetSchema().GetColumn(i).Type();
-          if (Status st_ni = ValidateNarrowInteger(
-                  table->GetSchema().GetColumn(i).Name(), row[i]);
+          const auto& col = table->GetSchema().GetColumn(i);
+          const ValueType expected = col.Type();
+          if (Status st_ni = ValidateNarrowInteger(col.Name(), row[i]);
               st_ni != Status::kSuccess) {
             last_error_ = st_ni.GetMessage();
             return Status::kUnknown;
+          }
+          if (col.IsUnsigned()) {
+            if (!row[i].IsNull()) {
+              if (row[i].type != ValueType::kInt64) {
+                last_error_ = "INSERT type mismatch for column " + col.Name().name;
+                return Status::kUnknown;
+              }
+              if (!row[i].IsUnsigned() && row[i].value.int_value < 0) {
+                last_error_ = "assignment out of range for column " + col.Name().name;
+                return Status::kUnknown;
+              }
+              row[i] = row[i].WithUnsigned();
+            }
+            continue;
           }
           if (row[i].IsNull() || row[i].type == expected) {
             continue;
@@ -3042,7 +3114,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             continue;
           }
           last_error_ = "INSERT type mismatch for column " +
-                        table->GetSchema().GetColumn(i).Name().name;
+                        col.Name().name;
           return Status::kUnknown;
         }
       }
@@ -3345,8 +3417,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // The bridge executes multi-relation and single-relation grouped
         // queries through the Cascades core (join ordering, access paths,
         // filter pushdown), feeding the grouping finish pipeline (GroupByPlan).
-        if (select->Sources().size() > 1 && has_grouping &&
-            !simple_count_star && !select->Qualify() &&
+        if (!force_relational_fallback_ && select->Sources().size() > 1 &&
+            has_grouping && !simple_count_star && !select->Qualify() &&
             !relational_detail::HasWindowFunctions(*select) &&
             select->WithQueries().empty() && sources_plain &&
             (!select->RequiresRelationalEvaluation() ||
@@ -3418,12 +3490,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           return unnest_exec;
         }
       }
-      if ((select->RequiresRelationalEvaluation() &&
+      if (force_relational_fallback_ ||
+          (select->RequiresRelationalEvaluation() &&
            !can_decorrelate_subqueries) ||
           select->Sources().empty() || has_unnest || has_lateral ||
           touches_array_subquery ||
           (has_recursive_cte && !has_plain_cte && !touches_query)) {
-        if (simple_count_star) {
+        if (simple_count_star && !force_relational_fallback_) {
           // COUNT(*) over one plain table is fully representable by the
           // Cascades single-relation path, including a covering index-only
           // scan. Let that path handle the query even if the visitor marked
@@ -3692,7 +3765,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       Executor executor = plan->EmitExecutor(ctx);
       const bool needs_distinct =
           select->Distinct() &&
-          !ProjectionContainsUniqueKey(plan, query.select_, visible_columns);
+          !ProjectionContainsUniqueKey(plan, query.select_, visible_columns) &&
+          !plan->EnforcesDistinct();
       if (needs_distinct) {
         // DISTINCT over a single-column covering index skip-scans distinct
         // keys instead of hashing every row; the index order also satisfies
@@ -4018,12 +4092,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
               });
               return out;
             }();
-            if (lower_name.find("int32") != std::string::npos ||
-                lower_name.find("uint32") != std::string::npos ||
-                lower_name.find("int16") != std::string::npos ||
+            if (lower_name.find("uint32") != std::string::npos ||
+                lower_name.find("int32") != std::string::npos ||
                 lower_name.find("uint16") != std::string::npos ||
+                lower_name.find("int16") != std::string::npos ||
+                lower_name.find("uint8") != std::string::npos ||
                 lower_name.find("int8") != std::string::npos ||
-                lower_name.find("uint8") != std::string::npos) {
+                column.IsUnsigned() ||
+                lower_name.find("uint64") != std::string::npos) {
               expression = std::make_shared<CastExpression>(
                   std::move(expression),
                   lower_name.find("uint32") != std::string::npos   ? "UINT32"
@@ -4031,7 +4107,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                   : lower_name.find("uint16") != std::string::npos ? "UINT16"
                   : lower_name.find("int16") != std::string::npos  ? "INT16"
                   : lower_name.find("uint8") != std::string::npos  ? "UINT8"
-                                                                   : "INT8",
+                  : lower_name.find("int8") != std::string::npos   ? "INT8"
+                                                                   : "UINT64",
                   false);
             }
             applied[j] = true;

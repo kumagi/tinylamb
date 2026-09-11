@@ -71,6 +71,35 @@ std::string CheckExploreEquivalence(const GeneratedJoinGraph& graph);
 // input when nothing shrinks).
 GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph);
 
+// ---------------------------------------------------------------------------
+// Complex Multi-Operator Memo Oracle
+//
+// Synthesizes rich Cascades Memos with schemas, candidate-key/not-null/foreign-key
+// constraints, and multi-operator pipelines (Selection, Projection, Aggregation,
+// Distinct, Sort, Limit, Window, OuterJoin, SemiJoin, AntiJoin) so all 105
+// transformation rules are actively exercised during exploration.
+// ---------------------------------------------------------------------------
+
+struct ComplexMemoGenConfig {
+  int min_relations = 2;
+  int max_relations = 4;
+  int max_conjuncts = 6;
+  int max_operator_depth = 4;
+};
+
+struct GeneratedComplexMemo {
+  std::vector<std::string> relations;
+  std::unordered_map<std::string, Schema> schemas;
+  std::vector<cascades::ConjunctInfo> conjuncts;
+  std::function<cascades::GroupId(cascades::Memo&)> builder;
+  std::string description;
+};
+
+GeneratedComplexMemo GenerateComplexMemo(
+    std::mt19937& rng, const ComplexMemoGenConfig& config = {});
+
+std::string CheckComplexMemoEquivalence(const GeneratedComplexMemo& gen);
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_PLAN_MEMO_ORACLE_HPP

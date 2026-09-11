@@ -1093,17 +1093,24 @@ StatusOr<Relation> FinishQuery(TransactionContext& context,
     // path avoids recursive expression tree traversal for residual predicates,
     // which is the dominant cost for complex WHERE clauses like TPC-H Q20.
     if (!compiled.simple.empty() || !compiled.disjunctive_branches.empty() ||
-        compiled.residual_bytecode.has_value()) {
+        compiled.residual_bytecode.has_value() ||
+        !compiled.residual.empty()) {
       Relation filtered(context.execution_runtime());
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);
       input.FinishSpill();
+      Status eval_error{Status::kSuccess};
       RETURN_IF_FAIL(input.ForEachRow([&](const Row& row) {
+        if (!eval_error.ok()) {
+          return;
+        }
         if (relational_detail::MatchScanFilter(row, input.schema, compiled,
-                                               outer, context, ctes)) {
+                                               outer, context, ctes,
+                                               &eval_error)) {
           filtered.AddRow(row);
         }
       }));
+      RETURN_IF_FAIL(eval_error);
       filtered.FinishSpill();
       input = std::move(filtered);
     } else {
@@ -1111,13 +1118,23 @@ StatusOr<Relation> FinishQuery(TransactionContext& context,
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);
       input.FinishSpill();
+      Status eval_error{Status::kSuccess};
       RETURN_IF_FAIL(input.ForEachRow([&](const Row& row) {
+        if (!eval_error.ok()) {
+          return;
+        }
         Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
-        if (Truthy(Evaluate(statement.WhereClause(), scope, nullptr, context,
-                            ctes))) {
+        StatusOr<Value> res = TryEvaluate(statement.WhereClause(), scope,
+                                          nullptr, context, ctes);
+        if (!res.HasValue()) {
+          eval_error = res.GetStatus();
+          return;
+        }
+        if (Truthy(res.Value())) {
           filtered.AddRow(row);
         }
       }));
+      RETURN_IF_FAIL(eval_error);
       filtered.FinishSpill();
       input = std::move(filtered);
     }
@@ -2279,8 +2296,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       Status scan_accumulate_error{Status::kSuccess};
       cached->second->FinishSpill();
       Status scan_iterated = cached->second->ForEachRow([&](const Row& row) {
+        if (!scan_accumulate_error.ok()) {
+          return;
+        }
         if (!MatchScanFilter(row, scan_schema, scan_filter, outer, context,
-                             ctes)) {
+                             ctes, &scan_accumulate_error)) {
           return;
         }
         if (Status st_acc = accumulate_row(row);
@@ -2310,9 +2330,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         }
         return table.Value()->BeginFullScan(context.txn_, projection);
       }();
+      Status scan_filter_error{Status::kSuccess};
       while (iterator.IsValid()) {
         if (!MatchScanFilter(*iterator, scan_schema, scan_filter, outer,
-                             context, ctes)) {
+                             context, ctes, &scan_filter_error)) {
+          RETURN_IF_FAIL(scan_filter_error);
           ++iterator;
           continue;
         }
@@ -2326,6 +2348,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         RETURN_IF_FAIL(accumulate_row(*iterator));
         ++iterator;
       }
+      RETURN_IF_FAIL(scan_filter_error);
     }
     if (context.execution_runtime() != nullptr) {
       context.execution_runtime()->scan_ms += ElapsedMs(scan_begin);

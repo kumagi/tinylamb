@@ -242,7 +242,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
   if (s.front() == 'P' || s.front() == 'p') {
     size_t pos = 1;
     bool in_time = false;
-    int64_t parsed_y = 0, parsed_m = 0, parsed_d;
+    int64_t parsed_y = 0, parsed_m = 0, parsed_d = 0;
     int64_t parsed_h = 0, parsed_min = 0;
     double parsed_sec = 0.0;
     int64_t sign = 1;

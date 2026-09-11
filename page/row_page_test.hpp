@@ -37,7 +37,12 @@ namespace tinylamb {
 class RowPageTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    file_name_ = "row_page_test-" + RandomString();
+    const char* probe = std::getenv("TINYLAMB_CORRUPT_TAIL_PROBE");
+    if (probe != nullptr && probe[0] != '\0') {
+      file_name_ = probe;
+    } else {
+      file_name_ = "row_page_test-" + RandomString();
+    }
     Recover();
     auto txn = tm_->Begin();
     PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
@@ -61,6 +66,14 @@ class RowPageTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    tm_.reset();
+    lm_.reset();
+    r_.reset();
+    l_.reset();
+    if (p_) {
+      p_->GetPool()->DropAllPages();
+    }
+    p_.reset();
     std::ignore = std::remove((file_name_ + ".db").c_str());
     std::ignore = std::remove((file_name_ + ".log").c_str());
   }

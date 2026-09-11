@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -34,6 +35,9 @@
 #include "executor/detail/relation.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/parallel_scan.hpp"
+#include "executor/query_memory.hpp"
+#include "executor/spill_file.hpp"
 #include "expression/expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "gtest/gtest.h"
@@ -209,6 +213,7 @@ TEST_F(QueryTest, SqlEngineExplainAnalyzeSelect) {
   EXPECT_NE(text.find("Planning Time"), std::string::npos) << text;
   EXPECT_NE(text.find("Actual Rows"), std::string::npos) << text;
   EXPECT_NE(text.find("Execution Time"), std::string::npos) << text;
+  EXPECT_NE(text.find("Buffer Pool"), std::string::npos) << text;
   ctx.txn_.Abort();
 }
 
@@ -331,6 +336,49 @@ TEST_F(QueryTest, SqlEngineDistinctAndDropTable) {
   // Act + Assert -- DROP TABLE removes the table from the catalog.
   ASSERT_TRUE(engine.Prepare(ctx, "DROP TABLE t;").HasValue());
   EXPECT_FALSE(ctx.GetTable("t").HasValue());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(QueryTest, SqlEngineDistinctDoesNotStackDuplicateDistinctExecutor) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE t_nodup (a INT64, b INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t_nodup VALUES (1, 10), (1, 20), (2, 30);");
+
+  auto count_distinct_in_explain = [&](std::string_view sql) -> size_t {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
+    if (!prepared.HasValue()) {
+      return 0;
+    }
+    Row row;
+    std::string explain_text;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      explain_text += row[0].AsString();
+    }
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = explain_text.find("Distinct", pos)) != std::string::npos) {
+      ++count;
+      pos += 8;
+    }
+    return count;
+  };
+
+  EXPECT_EQ(count_distinct_in_explain("EXPLAIN SELECT DISTINCT a FROM t_nodup;"),
+            1);
+  EXPECT_EQ(count_distinct_in_explain(
+                "EXPLAIN SELECT DISTINCT a FROM t_nodup ORDER BY a;"),
+            1);
+  EXPECT_EQ(count_distinct_in_explain(
+                "EXPLAIN SELECT DISTINCT a FROM t_nodup LIMIT 2;"),
+            1);
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT DISTINCT a FROM t_nodup ORDER BY a;");
+  ASSERT_EQ(rows.size(), 2);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(2));
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
@@ -2331,4 +2379,534 @@ TEST_F(QueryTest, SqlEngineWholeRowRefNestedInExpressionResolves) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, UnsignedInt64_CreateInsertOrderAndIndex) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE u_tbl (u UINT64);");
+  Status idx_st = db_->CreateIndex(
+      ctx, "u_tbl", IndexSchema("upk", {0}, {}, IndexMode::kUnique));
+  ASSERT_EQ(idx_st, Status::kSuccess);
+
+  // Rejects negative numbers
+  {
+    SqlEngine engine(*db_);
+    auto prep = engine.Prepare(ctx, "INSERT INTO u_tbl VALUES (-1);");
+    EXPECT_FALSE(prep.HasValue());
+    EXPECT_NE(engine.LastError().find("assignment out of range for column u"),
+              std::string::npos);
+  }
+
+  // Accepts 0, 10, and 2^64 - 1
+  RunSql(ctx, *db_,
+         "INSERT INTO u_tbl VALUES (10), (18446744073709551615), (0);");
+
+  // ORDER BY u ASC
+  const std::vector<Row> asc =
+      RunSql(ctx, *db_, "SELECT u FROM u_tbl ORDER BY u ASC;");
+  ASSERT_EQ(asc.size(), 3U);
+  EXPECT_EQ(asc[0][0].AsString(), "0");
+  EXPECT_EQ(asc[1][0].AsString(), "10");
+  EXPECT_EQ(asc[2][0].AsString(), "18446744073709551615");
+  EXPECT_TRUE(asc[0][0].IsUnsigned());
+  EXPECT_TRUE(asc[1][0].IsUnsigned());
+  EXPECT_TRUE(asc[2][0].IsUnsigned());
+
+  // ORDER BY u DESC
+  const std::vector<Row> desc =
+      RunSql(ctx, *db_, "SELECT u FROM u_tbl ORDER BY u DESC;");
+  ASSERT_EQ(desc.size(), 3U);
+  EXPECT_EQ(desc[0][0].AsString(), "18446744073709551615");
+  EXPECT_EQ(desc[1][0].AsString(), "10");
+  EXPECT_EQ(desc[2][0].AsString(), "0");
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, UnsignedInt64_CastQuerySemantics) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE u_cast_tbl (u UINT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO u_cast_tbl VALUES (10), (18446744073709551615);");
+
+  // String to UINT64 cast
+  std::vector<Row> parsed =
+      RunSql(ctx, *db_, "SELECT CAST('18446744073709551615' AS UINT64);");
+  ASSERT_EQ(parsed.size(), 1U);
+  EXPECT_TRUE(parsed[0][0].IsUnsigned());
+  EXPECT_EQ(parsed[0][0].AsString(), "18446744073709551615");
+
+  // SAFE_CAST to INT64 returns NULL for UINT64_MAX
+  std::vector<Row> safe_rows = RunSql(
+      ctx, *db_,
+      "SELECT SAFE_CAST(u AS INT64), CAST(u AS STRING), CAST(u AS DOUBLE) "
+      "FROM u_cast_tbl WHERE u = 18446744073709551615;");
+  ASSERT_EQ(safe_rows.size(), 1U);
+  EXPECT_TRUE(safe_rows[0][0].IsNull());
+  EXPECT_EQ(std::string(safe_rows[0][1].value.varchar_value),
+            "18446744073709551615");
+  EXPECT_GT(safe_rows[0][2].value.double_value, 1.8e19);
+
+  // In-range UINT64 converts to signed INT64
+  std::vector<Row> in_range = RunSql(
+      ctx, *db_, "SELECT CAST(u AS INT64) FROM u_cast_tbl WHERE u = 10;");
+  ASSERT_EQ(in_range.size(), 1U);
+  EXPECT_FALSE(in_range[0][0].IsUnsigned());
+  EXPECT_EQ(in_range[0][0].value.int_value, 10LL);
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, UnsignedInt64_AggregationSemantics) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE u_agg_tbl (g INT64, u UINT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO u_agg_tbl VALUES "
+         "(1, 10), (1, 18446744073709551600), (1, 5), "
+         "(2, 0), (2, 18446744073709551615);");
+
+  // MIN and MAX on unsigned int64 columns (scalar aggregate)
+  std::vector<Row> min_max =
+      RunSql(ctx, *db_, "SELECT MIN(u), MAX(u) FROM u_agg_tbl WHERE g = 1;");
+  ASSERT_EQ(min_max.size(), 1U);
+  EXPECT_TRUE(min_max[0][0].IsUnsigned());
+  EXPECT_EQ(min_max[0][0].AsString(), "5");
+  EXPECT_TRUE(min_max[0][1].IsUnsigned());
+  EXPECT_EQ(min_max[0][1].AsString(), "18446744073709551600");
+
+  // SUM on unsigned int64 columns
+  std::vector<Row> sum_rows =
+      RunSql(ctx, *db_, "SELECT SUM(u) FROM u_agg_tbl WHERE g = 1;");
+  ASSERT_EQ(sum_rows.size(), 1U);
+  EXPECT_TRUE(sum_rows[0][0].IsUnsigned());
+  EXPECT_EQ(sum_rows[0][0].AsString(), "18446744073709551615");
+
+  // AVG on unsigned int64 columns (must be positive double)
+  std::vector<Row> avg_rows =
+      RunSql(ctx, *db_, "SELECT AVG(u) FROM u_agg_tbl WHERE g = 2;");
+  ASSERT_EQ(avg_rows.size(), 1U);
+  EXPECT_GT(avg_rows[0][0].value.double_value, 9.0e18);
+
+  // BIT_AND and BIT_OR on unsigned int64 columns
+  std::vector<Row> bit_rows = RunSql(
+      ctx, *db_, "SELECT BIT_AND(u), BIT_OR(u) FROM u_agg_tbl WHERE g = 2;");
+  ASSERT_EQ(bit_rows.size(), 1U);
+  EXPECT_TRUE(bit_rows[0][0].IsUnsigned());
+  EXPECT_EQ(bit_rows[0][0].AsString(), "0");
+  EXPECT_TRUE(bit_rows[0][1].IsUnsigned());
+  EXPECT_EQ(bit_rows[0][1].AsString(), "18446744073709551615");
+
+  // GROUP BY aggregations on unsigned int64
+  std::vector<Row> group_rows = RunSql(
+      ctx, *db_,
+      "SELECT g, MIN(u), MAX(u) FROM u_agg_tbl GROUP BY g ORDER BY g;");
+  ASSERT_EQ(group_rows.size(), 2U);
+  EXPECT_EQ(group_rows[0][0].value.int_value, 1LL);
+  EXPECT_EQ(group_rows[0][1].AsString(), "5");
+  EXPECT_EQ(group_rows[0][2].AsString(), "18446744073709551600");
+  EXPECT_EQ(group_rows[1][0].value.int_value, 2LL);
+  EXPECT_EQ(group_rows[1][1].AsString(), "0");
+  EXPECT_EQ(group_rows[1][2].AsString(), "18446744073709551615");
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, OuterJoinNullPadGolden) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE oj_a (id INT64, name STRING, val INT64);");
+  RunSql(ctx, *db_,
+         "CREATE TABLE oj_b (id INT64, b_name STRING, score INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE oj_c (id INT64, extra STRING);");
+
+  RunSql(ctx, *db_,
+         "INSERT INTO oj_a VALUES (1, 'Alice', 10), (2, 'Bob', 20), (3, "
+         "'Charlie', 30);");
+  RunSql(ctx, *db_,
+         "INSERT INTO oj_b VALUES (1, 'B-Alice', 100), (2, 'B-Bob', 5), (4, "
+         "'B-David', 400);");
+  RunSql(ctx, *db_, "INSERT INTO oj_c VALUES (1, 'C-One'), (4, 'C-Four');");
+
+  // 1. Basic LEFT JOIN with null-padding:
+  // Charlie (id=3) has no match in oj_b.
+  // Projections test expressions on NULL-padded columns:
+  // - COALESCE(b.score, -1) -> -1
+  // - IFNULL(b.score, -2) -> -2
+  // - b.score + 10 -> NULL
+  // - b.score = 100 -> NULL
+  // - b.score IS NULL -> TRUE
+  // - b.score IS NOT NULL -> FALSE
+  // - CASE WHEN b.score IS NULL THEN 'absent' ELSE 'present' END -> 'absent'
+  // - CONCAT('name:', b.b_name) -> NULL
+  std::vector<Row> left_res = RunSql(
+      ctx, *db_,
+      "SELECT a.id, b.score, COALESCE(b.score, -1), IFNULL(b.score, -2), "
+      "b.score + 10, b.score IS NULL, b.score IS NOT NULL, "
+      "CASE WHEN b.score IS NULL THEN 'absent' ELSE 'present' END, "
+      "CONCAT('name:', b.b_name) "
+      "FROM oj_a a LEFT JOIN oj_b b ON a.id = b.id ORDER BY a.id;");
+  ASSERT_EQ(left_res.size(), 3U);
+  // Row 1 (Alice)
+  EXPECT_EQ(left_res[0][0], Value(1));
+  EXPECT_EQ(left_res[0][1], Value(100));
+  EXPECT_EQ(left_res[0][2], Value(100));
+  EXPECT_EQ(left_res[0][3], Value(100));
+  EXPECT_EQ(left_res[0][4], Value(110));
+  EXPECT_EQ(left_res[0][5], Value(false));
+  EXPECT_EQ(left_res[0][6], Value(true));
+  EXPECT_EQ(left_res[0][7], Value("present"));
+  EXPECT_EQ(left_res[0][8], Value("name:B-Alice"));
+  // Row 3 (Charlie - NULL padded)
+  EXPECT_EQ(left_res[2][0], Value(3));
+  EXPECT_TRUE(left_res[2][1].IsNull());
+  EXPECT_EQ(left_res[2][2], Value(-1));
+  EXPECT_EQ(left_res[2][3], Value(-2));
+  EXPECT_TRUE(left_res[2][4].IsNull());
+  EXPECT_EQ(left_res[2][5], Value(true));
+  EXPECT_EQ(left_res[2][6], Value(false));
+  EXPECT_EQ(left_res[2][7], Value("absent"));
+  EXPECT_TRUE(left_res[2][8].IsNull());
+
+  // 2. LEFT JOIN with residual ON predicate:
+  // ON a.id = b.id AND a.val < b.score
+  // For Bob (id=2), a.val=20, b.score=5 -> 20 < 5 is FALSE!
+  // So Bob must NOT match and should be NULL-padded!
+  std::vector<Row> res_pred = RunSql(
+      ctx, *db_,
+      "SELECT a.id, a.name, b.score FROM oj_a a LEFT JOIN oj_b b "
+      "ON a.id = b.id AND a.val < b.score ORDER BY a.id;");
+  ASSERT_EQ(res_pred.size(), 3U);
+  EXPECT_EQ(res_pred[0][0], Value(1));
+  EXPECT_EQ(res_pred[0][2], Value(100));
+  EXPECT_EQ(res_pred[1][0], Value(2));
+  EXPECT_TRUE(res_pred[1][2].IsNull());
+  EXPECT_EQ(res_pred[2][0], Value(3));
+  EXPECT_TRUE(res_pred[2][2].IsNull());
+
+  // 3. RIGHT JOIN with null-padding:
+  // oj_b has David (id=4) which is not in oj_a.
+  std::vector<Row> right_res = RunSql(
+      ctx, *db_,
+      "SELECT a.id, a.name, b.id, b.b_name FROM oj_a a RIGHT JOIN oj_b b "
+      "ON a.id = b.id ORDER BY b.id;");
+  ASSERT_EQ(right_res.size(), 3U);
+  EXPECT_EQ(right_res[2][2], Value(4));
+  EXPECT_TRUE(right_res[2][0].IsNull());
+  EXPECT_TRUE(right_res[2][1].IsNull());
+
+  // 4. FULL OUTER JOIN:
+  // Both Charlie (id=3 in a) and David (id=4 in b) must be present.
+  std::vector<Row> full_res = RunSql(
+      ctx, *db_,
+      "SELECT a.id, b.id FROM oj_a a FULL JOIN oj_b b ON a.id = b.id "
+      "ORDER BY COALESCE(a.id, b.id);");
+  ASSERT_EQ(full_res.size(), 4U);
+  EXPECT_EQ(full_res[0][0], Value(1));
+  EXPECT_EQ(full_res[0][1], Value(1));
+  EXPECT_EQ(full_res[1][0], Value(2));
+  EXPECT_EQ(full_res[1][1], Value(2));
+  EXPECT_EQ(full_res[2][0], Value(3));
+  EXPECT_TRUE(full_res[2][1].IsNull());
+  EXPECT_TRUE(full_res[3][0].IsNull());
+  EXPECT_EQ(full_res[3][1], Value(4));
+
+  // 5. Aggregations on NULL-padded rows:
+  // Charlie has NULL b.score.
+  // COUNT(*) = 1, COUNT(b.score) = 0, SUM(b.score) = NULL, AVG = NULL.
+  std::vector<Row> agg_res = RunSql(
+      ctx, *db_,
+      "SELECT a.id, COUNT(*), COUNT(b.score), SUM(b.score), AVG(b.score), "
+      "MIN(b.score), MAX(b.score) FROM oj_a a LEFT JOIN oj_b b ON a.id = b.id "
+      "GROUP BY a.id ORDER BY a.id;");
+  ASSERT_EQ(agg_res.size(), 3U);
+  EXPECT_EQ(agg_res[2][0], Value(3));
+  EXPECT_EQ(agg_res[2][1], Value(1));
+  EXPECT_EQ(agg_res[2][2], Value(0));
+  EXPECT_TRUE(agg_res[2][3].IsNull());
+  EXPECT_TRUE(agg_res[2][4].IsNull());
+  EXPECT_TRUE(agg_res[2][5].IsNull());
+  EXPECT_TRUE(agg_res[2][6].IsNull());
+
+  // 6. Multi-table chained LEFT JOIN:
+  // a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id
+  // Charlie (id=3): b is null, so b.id = c.id fails -> c is also null!
+  std::vector<Row> chain_res = RunSql(
+      ctx, *db_,
+      "SELECT a.id, b.b_name, c.extra FROM oj_a a "
+      "LEFT JOIN oj_b b ON a.id = b.id "
+      "LEFT JOIN oj_c c ON b.id = c.id "
+      "ORDER BY a.id;");
+  ASSERT_EQ(chain_res.size(), 3U);
+  EXPECT_EQ(chain_res[0][0], Value(1));
+  EXPECT_EQ(chain_res[0][1], Value("B-Alice"));
+  EXPECT_EQ(chain_res[0][2], Value("C-One"));
+  EXPECT_EQ(chain_res[1][0], Value(2));
+  EXPECT_EQ(chain_res[1][1], Value("B-Bob"));
+  EXPECT_TRUE(chain_res[1][2].IsNull());
+  EXPECT_EQ(chain_res[2][0], Value(3));
+  EXPECT_TRUE(chain_res[2][1].IsNull());
+  EXPECT_TRUE(chain_res[2][2].IsNull());
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, CancellationResourceLeakVerification) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE cancel_t (id INT64, val INT64, str STRING);");
+
+  for (int i = 0; i < 300; ++i) {
+    std::string sql = "INSERT INTO cancel_t VALUES (" + std::to_string(i) +
+                      ", " + std::to_string(300 - i) + ", '" +
+                      std::string(80, 'A' + (i % 26)) + "');";
+    RunSql(ctx, *db_, sql);
+  }
+
+  Table tbl = db_->GetTable(ctx, "cancel_t").Value();
+
+  // Part 1: ParallelScan early destruction and worker join.
+  // 1a. ParallelScan destroyed after 0 rows read.
+  {
+    auto scan = std::make_unique<ParallelScan>(ctx.txn_, tbl, 4);
+    scan.reset();
+    EXPECT_EQ(db_->PinnedPageCount(), 0U);
+  }
+
+  // 1b. ParallelScan destroyed after reading 1 row.
+  {
+    auto scan = std::make_unique<ParallelScan>(ctx.txn_, tbl, 4);
+    Row r;
+    RowPosition p;
+    EXPECT_TRUE(scan->Next(&r, &p));
+    scan.reset();
+    EXPECT_EQ(db_->PinnedPageCount(), 0U);
+  }
+
+  // 1c. ParallelScan destroyed after reading 1 batch.
+  {
+    auto scan = std::make_unique<ParallelScan>(ctx.txn_, tbl, 4);
+    DataChunk chunk;
+    EXPECT_GT(scan->NextBatch(&chunk, 16), 0U);
+    scan.reset();
+    EXPECT_EQ(db_->PinnedPageCount(), 0U);
+  }
+
+  // Part 2: QueryMemoryBudget and SpillFile cleanup on Sort mid-execution destruction.
+  auto count_spill_files = []() -> size_t {
+    size_t count = 0;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             SpillFile::TempDirectory(), ec)) {
+      if (entry.path().filename().string().starts_with("tinylamb-spill-") &&
+          entry.path().extension() == ".bin") {
+        ++count;
+      }
+    }
+    return count;
+  };
+
+  const size_t baseline_memory = QueryMemoryBudget::Global().Used();
+  const size_t baseline_spills = count_spill_files();
+
+  {
+    // Restrict memory to force spilling.
+    QueryMemoryBudget::Global().ResetForTest(2048);
+    SqlEngine engine(*db_);
+    StatusOr<Executor> exec =
+        engine.Prepare(ctx, "SELECT * FROM cancel_t ORDER BY val;");
+    ASSERT_EQ(exec.GetStatus(), Status::kSuccess);
+
+    // Read 1 row: triggers Materialize() -> external sort / spilling.
+    Row r;
+    EXPECT_TRUE(exec.Value()->Next(&r, nullptr));
+
+    // Destroy executor midway without exhausting result rows.
+    exec = StatusError(StatusCode::kUnknown, "cancelled");
+
+    EXPECT_EQ(QueryMemoryBudget::Global().Used(), baseline_memory);
+    EXPECT_EQ(count_spill_files(), baseline_spills);
+    EXPECT_EQ(db_->PinnedPageCount(), 0U);
+  }
+
+  // Part 3: QueryMemoryBudget and SpillFile cleanup on HashJoin mid-execution destruction.
+  RunSql(ctx, *db_, "CREATE TABLE cancel_t2 (id INT64, val INT64, info STRING);");
+  for (int i = 0; i < 200; ++i) {
+    std::string sql = "INSERT INTO cancel_t2 VALUES (" + std::to_string(i) +
+                      ", " + std::to_string(i) + ", '" +
+                      std::string(80, 'x') + "');";
+    RunSql(ctx, *db_, sql);
+  }
+
+  {
+    QueryMemoryBudget::Global().ResetForTest(2048);
+    SqlEngine engine(*db_);
+    StatusOr<Executor> exec = engine.Prepare(
+        ctx,
+        "SELECT a.id, b.id FROM cancel_t a JOIN cancel_t2 b ON a.id = b.id;");
+    ASSERT_EQ(exec.GetStatus(), Status::kSuccess);
+
+    // Read 1 row: triggers join build and probe.
+    Row r;
+    EXPECT_TRUE(exec.Value()->Next(&r, nullptr));
+
+    // Destroy executor midway.
+    exec = StatusError(StatusCode::kUnknown, "cancelled");
+
+    EXPECT_EQ(QueryMemoryBudget::Global().Used(), baseline_memory);
+    EXPECT_EQ(count_spill_files(), baseline_spills);
+    EXPECT_EQ(db_->PinnedPageCount(), 0U);
+  }
+
+  // Part 4: Reset budget to unlimited.
+  QueryMemoryBudget::Global().ResetForTest(0);
+  EXPECT_EQ(QueryMemoryBudget::Global().Used(), baseline_memory);
+  EXPECT_EQ(count_spill_files(), baseline_spills);
+  EXPECT_EQ(db_->PinnedPageCount(), 0U);
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, DifferentialTestCascadesVsRelationalFallback) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE diff_t1 (id INT64, val INT64, name STRING, score "
+         "NUMERIC);");
+  RunSql(ctx, *db_,
+         "CREATE TABLE diff_t2 (id INT64, t1_id INT64, note STRING, bonus "
+         "NUMERIC);");
+
+  for (int i = 1; i <= 60; ++i) {
+    std::string sql1 = "INSERT INTO diff_t1 VALUES (" + std::to_string(i) +
+                       ", " + std::to_string(i % 10) + ", 'user_" +
+                       std::to_string(i % 7) + "', " + std::to_string(i * 1.5) +
+                       ");";
+    RunSql(ctx, *db_, sql1);
+  }
+  // Add a row with NULLs in diff_t1:
+  RunSql(ctx, *db_, "INSERT INTO diff_t1 VALUES (61, NULL, NULL, 0.0);");
+
+  for (int i = 1; i <= 50; ++i) {
+    std::string sql2 = "INSERT INTO diff_t2 VALUES (" + std::to_string(i) +
+                       ", " + std::to_string((i * 2) % 60 + 1) + ", 'note_" +
+                       std::to_string(i % 5) + "', " + std::to_string(i * 2.0) +
+                       ");";
+    RunSql(ctx, *db_, sql2);
+  }
+
+  auto run_differential = [&](std::string_view sql, bool ordered = true) {
+    SCOPED_TRACE(sql);
+    SqlEngine engine_cascades(*db_);
+    engine_cascades.SetForceRelationalFallback(false);
+
+    SqlEngine engine_relational(*db_);
+    engine_relational.SetForceRelationalFallback(true);
+
+    StatusOr<Executor> exec_cascades = engine_cascades.Prepare(ctx, sql);
+    StatusOr<Executor> exec_relational = engine_relational.Prepare(ctx, sql);
+
+    ASSERT_EQ(exec_cascades.GetStatus(), Status::kSuccess)
+        << "Cascades error: " << engine_cascades.LastError()
+        << " for SQL: " << sql;
+    ASSERT_EQ(exec_relational.GetStatus(), Status::kSuccess)
+        << "Relational error: " << engine_relational.LastError()
+        << " for SQL: " << sql;
+
+    std::vector<Row> rows_cascades;
+    Row r;
+    while (exec_cascades.Value()->Next(&r, nullptr)) {
+      rows_cascades.push_back(r);
+    }
+
+    std::vector<Row> rows_relational;
+    while (exec_relational.Value()->Next(&r, nullptr)) {
+      rows_relational.push_back(r);
+    }
+
+    ASSERT_EQ(rows_cascades.size(), rows_relational.size())
+        << "Row count mismatch for SQL: " << sql;
+
+    if (ordered) {
+      for (size_t i = 0; i < rows_cascades.size(); ++i) {
+        EXPECT_EQ(rows_cascades[i], rows_relational[i])
+            << "Row " << i << " mismatch for SQL: " << sql;
+      }
+    } else {
+      auto row_less = [](const Row& a, const Row& b) {
+        return a.ToString() < b.ToString();
+      };
+      std::sort(rows_cascades.begin(), rows_cascades.end(), row_less);
+      std::sort(rows_relational.begin(), rows_relational.end(), row_less);
+      for (size_t i = 0; i < rows_cascades.size(); ++i) {
+        EXPECT_EQ(rows_cascades[i], rows_relational[i])
+            << "Row " << i << " mismatch (sorted) for SQL: " << sql;
+      }
+    }
+  };
+
+  // 1. Basic scans, filters, and projections:
+  run_differential("SELECT id, val FROM diff_t1 WHERE val > 3 ORDER BY id;");
+  run_differential(
+      "SELECT id, val * 2 + 10, CONCAT('Hello ', name) FROM diff_t1 WHERE val "
+      "> 5 ORDER BY id;");
+  run_differential(
+      "SELECT id, name FROM diff_t1 WHERE val BETWEEN 2 AND 7 AND name LIKE "
+      "'%user%' ORDER BY id;");
+
+  // 2. Arithmetic, NULL functions, and conditionals:
+  run_differential(
+      "SELECT id, CASE WHEN val < 3 THEN 'low' WHEN val < 7 THEN 'mid' ELSE "
+      "'high' END FROM diff_t1 ORDER BY id;");
+  run_differential(
+      "SELECT id, COALESCE(val, -1), IFNULL(name, 'missing') FROM diff_t1 "
+      "ORDER BY id;");
+
+  // 3. Filtering with IN and OR:
+  run_differential(
+      "SELECT id, val FROM diff_t1 WHERE val IN (1, 3, 5, 7) ORDER BY id;");
+  run_differential(
+      "SELECT id, val FROM diff_t1 WHERE (val = 2 OR val = 8) AND id > 20 "
+      "ORDER BY id;");
+
+  // 4. Distinct, Limit, and Offset:
+  run_differential("SELECT DISTINCT val FROM diff_t1 ORDER BY val;");
+  run_differential(
+      "SELECT id, val FROM diff_t1 ORDER BY val DESC, id ASC LIMIT 10 OFFSET "
+      "5;");
+  run_differential(
+      "SELECT DISTINCT val, name FROM diff_t1 ORDER BY val, name;");
+
+  // 5. Aggregations and GROUP BY:
+  run_differential(
+      "SELECT val, COUNT(*), SUM(id), MIN(id), MAX(id) FROM diff_t1 GROUP BY "
+      "val ORDER BY val;");
+  run_differential(
+      "SELECT val, COUNT(*) FROM diff_t1 GROUP BY val HAVING COUNT(*) > 5 "
+      "ORDER BY val;");
+  run_differential("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM diff_t1;");
+
+  // 6. Joins:
+  run_differential(
+      "SELECT a.id, b.id, a.val, b.note FROM diff_t1 a JOIN diff_t2 b ON a.id = "
+      "b.t1_id ORDER BY a.id, b.id;");
+  run_differential(
+      "SELECT a.id, b.id, a.name, b.note FROM diff_t1 a JOIN diff_t2 b ON a.id = "
+      "b.t1_id WHERE a.val > 5 AND b.bonus > 10 ORDER BY a.id, b.id;");
+  run_differential(
+      "SELECT a.id, b.bonus + a.val FROM diff_t1 a JOIN diff_t2 b ON a.id = "
+      "b.t1_id ORDER BY a.id, b.id;");
+
+  // 7. Subqueries:
+  run_differential(
+      "SELECT id, val FROM diff_t1 WHERE id IN (SELECT t1_id FROM diff_t2 "
+      "WHERE bonus > 50) ORDER BY id;");
+  run_differential(
+      "SELECT a.id, a.val FROM diff_t1 a WHERE EXISTS (SELECT * FROM diff_t2 b "
+      "WHERE b.t1_id = a.id AND b.bonus > 20) ORDER BY a.id;");
+
+  // 8. Queries without explicit ORDER BY (compared as multisets):
+  run_differential("SELECT val, COUNT(*) FROM diff_t1 GROUP BY val;", false);
+  run_differential("SELECT id, val FROM diff_t1 WHERE val = 5;", false);
+
+  ctx.txn_.Abort();
+}
+
 }  // namespace tinylamb
+
+
+

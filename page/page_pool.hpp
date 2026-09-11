@@ -102,6 +102,16 @@ class PagePool {
     return pool_lru_.size();
   }
 
+  [[nodiscard]] uint64_t CacheHits() const noexcept {
+    return cache_hits_.load(std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] uint64_t CacheMisses() const noexcept {
+    return cache_misses_.load(std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] size_t PinnedPageCount() const noexcept;
+
   friend std::ostream& operator<<(std::ostream& o, const PagePool& pp) {
     std::shared_lock latch(pp.pool_latch);
     o << "PagePool(file=" << pp.file_name_ << ", capacity=" << pp.capacity_
@@ -208,6 +218,9 @@ class PagePool {
   // first and pool_latch (shared, briefly) inside it to check flushing_;
   // no path acquires an IO latch while holding pool_latch.
   std::array<IoLatch, kPoolShards> io_latches_{};
+
+  mutable std::atomic<uint64_t> cache_hits_{0};
+  mutable std::atomic<uint64_t> cache_misses_{0};
 };
 
 }  // namespace tinylamb

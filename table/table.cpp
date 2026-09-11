@@ -221,6 +221,10 @@ bool KeyColumnChanged(const Value& a, const Value& b) {
   }
   switch (a.type) {
     case ValueType::kInt64:
+      if (a.IsUnsigned() != b.IsUnsigned()) {
+        return true;
+      }
+      return a.value.int_value != b.value.int_value;
     case ValueType::kDate:
       return a.value.int_value != b.value.int_value;
     case ValueType::kVarChar:
@@ -638,11 +642,15 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
       ASSIGN_OR_RETURN(std::vector<IndexValueType>, rps,
                        Decode<std::vector<IndexValueType>>(existing_data));
       if (idx.IsUnique()) {
-        for (const IndexValueType& value : rps) {
+        for (IndexValueType& value : rps) {
           if (value.pos == pos) {
-            // An UPDATE whose key did not change needs no second entry.  The
-            // heap supplies the versioned row; index-only scans are not used
-            // for this mode because INCLUDE values are not versioned here.
+            // An UPDATE whose key did not change needs no second entry. The
+            // heap supplies the versioned row; update the latest unversioned
+            // INCLUDE columns in place if they changed.
+            if (value.include != include) {
+              value.include = include;
+              RETURN_IF_FAIL(bpt.Update(txn, key, Encode(rps), &cursor));
+            }
             if (hint_leaf != nullptr) {
               *hint_leaf = cursor;
             }

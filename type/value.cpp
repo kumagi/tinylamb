@@ -73,6 +73,8 @@ std::string ToString(UnaryOperation type) {
       return "NOT";
     case UnaryOperation::kMinus:
       return "-";
+    case UnaryOperation::kBitwiseNot:
+      return "~";
   }
   return "UNKNOWN";
 }
@@ -532,6 +534,9 @@ std::string FormatDoubleShortest(double value) {
     case ValueType::kNull:
       return "NULL";
     case ValueType::kInt64:
+      if (IsUnsigned()) {
+        return std::to_string(static_cast<uint64_t>(value.int_value));
+      }
       return std::to_string(value.int_value);
     case ValueType::kDate:
       return FormatDateDays(value.int_value);
@@ -608,6 +613,12 @@ bool Value::operator==(const Value& rhs) const {
     case ValueType::kNull:
       return true;
     case ValueType::kInt64:
+      if (IsUnsigned() != rhs.IsUnsigned()) {
+        if (value.int_value < 0 || rhs.value.int_value < 0) {
+          return false;
+        }
+      }
+      return value.int_value == rhs.value.int_value;
     case ValueType::kDate:
       return value.int_value == rhs.value.int_value;
     case ValueType::kVarChar: {
@@ -654,6 +665,16 @@ std::string EncodeMemcomparableFormatInteger(int64_t in) {
   const uint64_t be = htobe64(static_cast<uint64_t>(in));
   ::memcpy(ret.data() + 1, &be, 8);
   ret[1] ^= static_cast<char>(0x80);  // plus/minus sign.
+  return ret;
+}
+
+constexpr uint8_t kMemcomparableUint64 = 6;
+
+std::string EncodeMemcomparableFormatUint64(int64_t in) {
+  std::string ret(1 + 8, '\0');
+  ret[0] = static_cast<char>(kMemcomparableUint64);  // Embeds UINT64 prefix.
+  const uint64_t be = htobe64(static_cast<uint64_t>(in));
+  ::memcpy(ret.data() + 1, &be, 8);
   return ret;
 }
 
@@ -786,6 +807,9 @@ StatusOr<std::string> Value::TryEncodeMemcomparableFormat() const {
       return StatusError(StatusCode::kInvalidArgument,
                          "Cannot encode unknown type.");
     case ValueType::kInt64:
+      if (IsUnsigned()) {
+        return EncodeMemcomparableFormatUint64(value.int_value);
+      }
       return EncodeMemcomparableFormatInteger(value.int_value);
     case ValueType::kDate: {
       std::string encoded = EncodeMemcomparableFormatInteger(value.int_value);
@@ -828,24 +852,37 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
     return StatusError(StatusCode::kCorrupt,
                        "corrupt memcomparable value: empty buffer");
   }
-  switch (static_cast<ValueType>(*cursor++)) {
-    case ValueType::kNull:
+  const uint8_t prefix = static_cast<uint8_t>(*cursor++);
+  switch (prefix) {
+    case static_cast<uint8_t>(ValueType::kNull):
       return StatusError(StatusCode::kCorrupt, "Cannot decode unknown type.");
-    case ValueType::kInt64: {
+    case static_cast<uint8_t>(ValueType::kInt64): {
       type = ValueType::kInt64;
       ASSIGN_OR_RETURN(
           size_t, len,
           DecodeMemcomparableFormatInteger(cursor, end, &value.int_value));
       return len + 1;
     }
-    case ValueType::kDate: {
+    case kMemcomparableUint64: {
+      type = ValueType::kInt64;
+      collation_ = 3;
+      if (static_cast<size_t>(end - cursor) < sizeof(uint64_t)) {
+        return StatusError(StatusCode::kCorrupt,
+                           "corrupt memcomparable uint64: truncated");
+      }
+      uint64_t loaded = 0;
+      ::memcpy(&loaded, cursor, sizeof(loaded));
+      value.int_value = static_cast<int64_t>(be64toh(loaded));
+      return sizeof(uint64_t) + 1;
+    }
+    case static_cast<uint8_t>(ValueType::kDate): {
       type = ValueType::kDate;
       ASSIGN_OR_RETURN(
           size_t, len,
           DecodeMemcomparableFormatInteger(cursor, end, &value.int_value));
       return len + 1;
     }
-    case ValueType::kVarChar: {
+    case static_cast<uint8_t>(ValueType::kVarChar): {
       type = ValueType::kVarChar;
       ASSIGN_OR_RETURN(
           size_t, len,
@@ -853,14 +890,14 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       value.varchar_value = owned_data;
       return len + 1;
     }
-    case ValueType::kDouble: {
+    case static_cast<uint8_t>(ValueType::kDouble): {
       type = ValueType::kDouble;
       ASSIGN_OR_RETURN(
           size_t, len,
           DecodeMemcomparableFormatDouble(cursor, end, &value.double_value));
       return len + 1;
     }
-    case ValueType::kArray: {
+    case static_cast<uint8_t>(ValueType::kArray): {
       type = ValueType::kArray;
       const char* p = cursor;
       uint32_t be = 0;
@@ -931,7 +968,26 @@ StatusOr<bool> Value::TryLess(const Value& rhs) const {
     case ValueType::kNull:
       return StatusError(StatusCode::kInvalidArgument,
                          "Unknown type cannot be compared.");
-    case ValueType::kInt64:
+    case ValueType::kInt64: {
+      if (IsUnsigned() || rhs.IsUnsigned()) {
+        const bool mixed = IsUnsigned() != rhs.IsUnsigned();
+        const auto lhs_u = static_cast<uint64_t>(value.int_value);
+        const auto rhs_u = static_cast<uint64_t>(rhs.value.int_value);
+        const bool lhs_neg = !IsUnsigned() && value.int_value < 0;
+        const bool rhs_neg = !rhs.IsUnsigned() && rhs.value.int_value < 0;
+        if (!mixed) {
+          return lhs_u < rhs_u;
+        }
+        if (lhs_neg) {
+          return true;
+        }
+        if (rhs_neg) {
+          return false;
+        }
+        return lhs_u < rhs_u;
+      }
+      return value.int_value < rhs.value.int_value;
+    }
     case ValueType::kDate:
       return value.int_value < rhs.value.int_value;
     case ValueType::kVarChar: {
@@ -963,7 +1019,26 @@ StatusOr<bool> Value::TryGreater(const Value& rhs) const {
     case ValueType::kNull:
       return StatusError(StatusCode::kInvalidArgument,
                          "Unknown type cannot be compared.");
-    case ValueType::kInt64:
+    case ValueType::kInt64: {
+      if (IsUnsigned() || rhs.IsUnsigned()) {
+        const bool mixed = IsUnsigned() != rhs.IsUnsigned();
+        const auto lhs_u = static_cast<uint64_t>(value.int_value);
+        const auto rhs_u = static_cast<uint64_t>(rhs.value.int_value);
+        const bool lhs_neg = !IsUnsigned() && value.int_value < 0;
+        const bool rhs_neg = !rhs.IsUnsigned() && rhs.value.int_value < 0;
+        if (!mixed) {
+          return lhs_u > rhs_u;
+        }
+        if (lhs_neg) {
+          return false;
+        }
+        if (rhs_neg) {
+          return true;
+        }
+        return lhs_u > rhs_u;
+      }
+      return value.int_value > rhs.value.int_value;
+    }
     case ValueType::kDate:
       return value.int_value > rhs.value.int_value;
     case ValueType::kVarChar: {
@@ -997,6 +1072,15 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
         return invalid("Different type cannot be added.");
       }
       if (type == ValueType::kInt64) {
+        if (IsUnsigned() || rhs.IsUnsigned()) {
+          uint64_t result = 0;
+          if (__builtin_add_overflow(static_cast<uint64_t>(value.int_value),
+                                     static_cast<uint64_t>(rhs.value.int_value),
+                                     &result)) {
+            return invalid("integer overflow on '+'");
+          }
+          return Value(static_cast<int64_t>(result)).WithUnsigned();
+        }
         int64_t result = 0;
         if (__builtin_add_overflow(value.int_value, rhs.value.int_value,
                                    &result)) {
@@ -1018,6 +1102,15 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
         return invalid("Different type cannot be subtracted.");
       }
       if (type == ValueType::kInt64) {
+        if (IsUnsigned() || rhs.IsUnsigned()) {
+          uint64_t result = 0;
+          if (__builtin_sub_overflow(static_cast<uint64_t>(value.int_value),
+                                     static_cast<uint64_t>(rhs.value.int_value),
+                                     &result)) {
+            return invalid("integer overflow on '-'");
+          }
+          return Value(static_cast<int64_t>(result)).WithUnsigned();
+        }
         int64_t result = 0;
         if (__builtin_sub_overflow(value.int_value, rhs.value.int_value,
                                    &result)) {
@@ -1034,6 +1127,15 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
         return invalid("Different type cannot be multiplied.");
       }
       if (type == ValueType::kInt64) {
+        if (IsUnsigned() || rhs.IsUnsigned()) {
+          uint64_t result = 0;
+          if (__builtin_mul_overflow(static_cast<uint64_t>(value.int_value),
+                                     static_cast<uint64_t>(rhs.value.int_value),
+                                     &result)) {
+            return invalid("integer overflow on '*'");
+          }
+          return Value(static_cast<int64_t>(result)).WithUnsigned();
+        }
         int64_t result = 0;
         if (__builtin_mul_overflow(value.int_value, rhs.value.int_value,
                                    &result)) {
@@ -1050,6 +1152,14 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
         return invalid("Different type cannot be divided.");
       }
       if (type == ValueType::kInt64) {
+        if (IsUnsigned() || rhs.IsUnsigned()) {
+          uint64_t u_rhs = static_cast<uint64_t>(rhs.value.int_value);
+          if (u_rhs == 0) {
+            return StatusError(StatusCode::kIsInfinity, "division by zero");
+          }
+          uint64_t u_lhs = static_cast<uint64_t>(value.int_value);
+          return Value(static_cast<int64_t>(u_lhs / u_rhs)).WithUnsigned();
+        }
         if (rhs.value.int_value == 0) {
           return StatusError(StatusCode::kIsInfinity, "division by zero");
         }
@@ -1069,6 +1179,14 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
         return invalid("Different type cannot do modulo.");
       }
       if (type == ValueType::kInt64) {
+        if (IsUnsigned() || rhs.IsUnsigned()) {
+          uint64_t u_rhs = static_cast<uint64_t>(rhs.value.int_value);
+          if (u_rhs == 0) {
+            return StatusError(StatusCode::kIsInfinity, "modulo by zero");
+          }
+          uint64_t u_lhs = static_cast<uint64_t>(value.int_value);
+          return Value(static_cast<int64_t>(u_lhs % u_rhs)).WithUnsigned();
+        }
         if (rhs.value.int_value == 0) {
           return StatusError(StatusCode::kIsInfinity, "modulo by zero");
         }
@@ -1086,7 +1204,11 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
         return invalid("Different type cannot do AND.");
       }
       if (type == ValueType::kInt64) {
-        return Value(value.int_value & rhs.value.int_value);
+        Value res(value.int_value & rhs.value.int_value);
+        if (IsUnsigned() || rhs.IsUnsigned()) {
+          return res.WithUnsigned();
+        }
+        return res;
       }
       return invalid("Cannot do '&' against this type");
     case BinaryOperation::kOr:
@@ -1094,7 +1216,11 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
         return invalid("Different type cannot do OR.");
       }
       if (type == ValueType::kInt64) {
-        return Value(value.int_value | rhs.value.int_value);
+        Value res(value.int_value | rhs.value.int_value);
+        if (IsUnsigned() || rhs.IsUnsigned()) {
+          return res.WithUnsigned();
+        }
+        return res;
       }
       return invalid("Cannot do '|' against this type");
     case BinaryOperation::kXor:
@@ -1102,7 +1228,11 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
         return invalid("Different type cannot do XOR.");
       }
       if (type == ValueType::kInt64) {
-        return Value(value.int_value ^ rhs.value.int_value);
+        Value res(value.int_value ^ rhs.value.int_value);
+        if (IsUnsigned() || rhs.IsUnsigned()) {
+          return res.WithUnsigned();
+        }
+        return res;
       }
       return invalid("Cannot do '^' against this type");
     default:
@@ -1134,7 +1264,28 @@ int CompareForOrderBy(const Value& a, const Value& b) {
     return ra < rb ? -1 : 1;
   }
   switch (a.type) {
-    case ValueType::kInt64:
+    case ValueType::kInt64: {
+      if (a.IsUnsigned() || b.IsUnsigned()) {
+        const bool mixed = a.IsUnsigned() != b.IsUnsigned();
+        const auto ua = static_cast<uint64_t>(a.value.int_value);
+        const auto ub = static_cast<uint64_t>(b.value.int_value);
+        const bool a_neg = !a.IsUnsigned() && a.value.int_value < 0;
+        const bool b_neg = !b.IsUnsigned() && b.value.int_value < 0;
+        if (!mixed) {
+          return ua < ub ? -1 : (ub < ua ? 1 : 0);
+        }
+        if (a_neg) {
+          return -1;
+        }
+        if (b_neg) {
+          return 1;
+        }
+        return ua < ub ? -1 : (ub < ua ? 1 : 0);
+      }
+      return a.value.int_value < b.value.int_value
+                 ? -1
+                 : (b.value.int_value < a.value.int_value ? 1 : 0);
+    }
     case ValueType::kDate:
       return a.value.int_value < b.value.int_value
                  ? -1

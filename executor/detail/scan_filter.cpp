@@ -425,7 +425,8 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
 
 bool MatchScanFilter(const Row& row, const Schema& schema,
                      const CompiledScanFilter& filter, const Scope* outer,
-                     TransactionContext& context, const CteMap& ctes) {
+                     TransactionContext& context, const CteMap& ctes,
+                     Status* error) {
   // Stored rows carry INT64 bit patterns for UINT64 columns; the catalog
   // schema retains the unsigned declaration. Reattach it before matching so
   // both the simple fast path and residual evaluation observe the same
@@ -454,6 +455,7 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
   // (e.g. TPC-H Q20's 3-way brand filter).
   if (!filter.disjunctive_branches.empty()) {
     bool any_branch_passed = false;
+    Status first_branch_error{Status::kSuccess};
     for (const auto& branch : filter.disjunctive_branches) {
       bool branch_ok = true;
       for (const SimpleComparePredicate& pred : branch.simple) {
@@ -464,12 +466,26 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
       }
       if (branch_ok && !branch.residual.empty()) {
         Scope scope{.row = match_row, .schema = &schema, .outer = outer};
+        Status branch_residual_error{Status::kSuccess};
         for (const Expression& predicate : branch.residual) {
           StatusOr<Value> res =
               TryEvaluate(predicate, scope, nullptr, context, ctes);
-          if (!res.HasValue() || !Truthy(res.Value())) {
+          if (!res.HasValue()) {
+            if (branch_residual_error.ok()) {
+              branch_residual_error = res.GetStatus();
+            }
+            continue;
+          }
+          if (!Truthy(res.Value())) {
             branch_ok = false;
+            branch_residual_error = Status{Status::kSuccess};
             break;
+          }
+        }
+        if (!branch_residual_error.ok()) {
+          branch_ok = false;
+          if (first_branch_error.ok()) {
+            first_branch_error = std::move(branch_residual_error);
           }
         }
       }
@@ -479,6 +495,9 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
       }
     }
     if (!any_branch_passed) {
+      if (!first_branch_error.ok() && error != nullptr && error->ok()) {
+        *error = std::move(first_branch_error);
+      }
       return false;
     }
   }
@@ -492,18 +511,35 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
     StatusOr<Value> result =
         filter.residual_bytecode->TryEvaluateRow(*match_row);
     if (!result.HasValue()) {
-      // Row filters cannot surface a Status; treat the failure as
-      // non-matching, consistent with the converted AST residual path below.
+      if (error != nullptr && error->ok()) {
+        *error = result.GetStatus();
+      }
       return false;
     }
     return !result.Value().IsNull() && result.Value().Truthy();
   }
   Scope scope{.row = match_row, .schema = &schema, .outer = outer};
+  Status residual_error{Status::kSuccess};
   for (const Expression& predicate : filter.residual) {
     StatusOr<Value> res = TryEvaluate(predicate, scope, nullptr, context, ctes);
-    if (!res.HasValue() || !Truthy(res.Value())) {
+    if (!res.HasValue()) {
+      if (residual_error.ok()) {
+        residual_error = res.GetStatus();
+      }
+      continue;
+    }
+    if (!Truthy(res.Value())) {
+      // In SQL, conjunction is commutative: if any conjunct cleanly evaluates
+      // to FALSE or NULL, the row is discarded by the WHERE filter. Any error
+      // in another conjunct on this row must not abort the query.
       return false;
     }
+  }
+  if (!residual_error.ok()) {
+    if (error != nullptr && error->ok()) {
+      *error = std::move(residual_error);
+    }
+    return false;
   }
   return true;
 }
@@ -554,7 +590,8 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                           bool filter_during_scan,
                           const CompiledScanFilter* scan_filter,
                           const Schema& result_schema, const Scope* outer,
-                          const CteMap& ctes, Relation* result) {
+                          const CteMap& ctes, Relation* result,
+                          Status* error) {
   std::vector<Table::ScanMorsel> morsels =
       table.BuildScanMorsels(context.txn_, 8);
   const size_t workers =
@@ -571,7 +608,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
   std::vector<size_t> shard_seen(workers, 0);
   std::vector<size_t> shard_out(workers, 0);
   std::mutex error_mu;
-  std::exception_ptr error;
+  std::exception_ptr error_ex;
   std::optional<std::vector<slot_t>> proj_opt;
   if (projection != nullptr) {
     proj_opt = *projection;
@@ -617,15 +654,15 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
           }
         } catch (...) {
           std::scoped_lock lock(error_mu);
-          if (!error) {
-            error = std::current_exception();
+          if (!error_ex) {
+            error_ex = std::current_exception();
           }
         }
       });
     }
   }
-  if (error) {
-    std::rethrow_exception(error);
+  if (error_ex) {
+    std::rethrow_exception(error_ex);
   }
   if (filter_during_scan && scan_filter != nullptr &&
       !scan_filter->residual.empty()) {
@@ -636,7 +673,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       shards[w].FinishSpill();
       shards[w].ForEachRow([&](const Row& row) {
         if (!MatchScanFilter(row, result_schema, residual_only, outer, context,
-                             ctes)) {
+                             ctes, error)) {
           return;
         }
         result->AddRow(row);
@@ -1029,8 +1066,12 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
         const Schema filter_view = filter_view_of(cached_relation.schema);
         const CompiledScanFilter scan_filter =
             CompileScanFilter(*scan_predicates, filter_view);
+        Status eval_error{Status::kSuccess};
         auto emit_filtered = [&](const Relation& source_rel) {
           source_rel.ForEachRow([&](const Row& row) {
+            if (!eval_error.ok()) {
+              return;
+            }
             if (int_key_filter && int_key_column) {
               const Value& key = row[*int_key_column];
               if (key.IsNull() ||
@@ -1045,7 +1086,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
               }
             }
             if (MatchScanFilter(row, filter_view, scan_filter, outer, context,
-                                ctes)) {
+                                ctes, &eval_error)) {
               result.AddRow(row);
             }
           });
@@ -1065,6 +1106,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
         } else {
           emit_filtered(cached_relation);
         }
+        RETURN_IF_FAIL(eval_error);
         context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
       }
       ++context.execution_runtime()->base_scan_cache_hits;
@@ -1103,6 +1145,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       // profiling an integer key filter and account each candidate below.
       const bool iterator_handles_key_filter =
           full_key_column.has_value() && context.execution_runtime() == nullptr;
+      Status eval_error{Status::kSuccess};
       const bool parallel_ok =
           context.execution_runtime() == nullptr || int_key_filter == nullptr
               ? TryParallelTableScan(
@@ -1112,8 +1155,9 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                                                 : std::nullopt,
                     filter_during_scan,
                     filter_during_scan ? &scan_filter : nullptr, filter_view,
-                    outer, ctes, &result)
+                    outer, ctes, &result, &eval_error)
               : false;
+      RETURN_IF_FAIL(eval_error);
       if (!parallel_ok) {
         Iterator iterator = [&] {
           if (iterator_handles_key_filter) {
@@ -1154,7 +1198,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           }
           if (matches && filter_during_scan) {
             matches = MatchScanFilter(*iterator, filter_view, scan_filter,
-                                      outer, context, ctes);
+                                      outer, context, ctes, &eval_error);
+            RETURN_IF_FAIL(eval_error);
           }
           if (matches) {
             result.AddRow(*iterator);
@@ -1164,6 +1209,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           }
           ++iterator;
         }
+        RETURN_IF_FAIL(eval_error);
       }
       if (context.execution_runtime() != nullptr) {
         context.execution_runtime()->scan_ms += ElapsedMs(scan_begin);
@@ -1186,7 +1232,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
         // the stored schema stays neutral for cache sharing across aliases.
         const Schema saved_schema = result.schema;
         result.schema = filter_view_of(saved_schema);
-        FilterRelation(context, &result, *scan_predicates, outer, ctes);
+        RETURN_IF_FAIL(
+            FilterRelation(context, &result, *scan_predicates, outer, ctes));
         result.schema = saved_schema;
       }
     }
@@ -1306,11 +1353,11 @@ Expression CombineDisjuncts(const std::vector<Expression>& expressions) {
   }
   return result;
 }
-void FilterRelation(TransactionContext& context, Relation* relation,
-                    const std::vector<Expression>& predicates,
-                    const Scope* outer, const CteMap& ctes) {
+Status FilterRelation(TransactionContext& context, Relation* relation,
+                      const std::vector<Expression>& predicates,
+                      const Scope* outer, const CteMap& ctes) {
   if (predicates.empty()) {
-    return;
+    return Status::kSuccess;
   }
   const auto filter_begin = std::chrono::steady_clock::now();
   const CompiledScanFilter scan_filter =
@@ -1319,17 +1366,23 @@ void FilterRelation(TransactionContext& context, Relation* relation,
   filtered.schema = relation->schema;
   CopyExecutionStats(&filtered, *relation);
   relation->FinishSpill();
+  Status eval_error{Status::kSuccess};
   relation->ForEachRow([&](const Row& row) {
+    if (!eval_error.ok()) {
+      return;
+    }
     if (MatchScanFilter(row, relation->schema, scan_filter, outer, context,
-                        ctes)) {
+                        ctes, &eval_error)) {
       filtered.AddRow(row);
     }
   });
+  RETURN_IF_FAIL(eval_error);
   filtered.FinishSpill();
   *relation = std::move(filtered);
   if (context.execution_runtime() != nullptr) {
     context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
   }
+  return Status::kSuccess;
 }
 
 }  // namespace tinylamb::relational_detail

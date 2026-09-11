@@ -72,6 +72,11 @@ class PlanBase {
                                            size_t /*limit_offset*/) const {
     return false;
   }
+  // True when the plan guarantees that all output rows are distinct, so callers
+  // must not apply a redundant DistinctExecutor wrapper (D6: single enforcement point).
+  [[nodiscard]] virtual bool EnforcesDistinct() const {
+    return false;
+  }
 
   virtual void Dump(std::ostream& o, int indent) const = 0;
   [[nodiscard]] virtual std::string ToString() const = 0;

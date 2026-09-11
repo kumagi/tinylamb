@@ -665,5 +665,46 @@ TEST(SqlTemplateTest, BindPreservesUpdateAndDeleteAliases) {
   EXPECT_EQ(dynamic_cast<const DeleteStatement&>(*bound_delete).Alias(), "v");
 }
 
+TEST(SqlTemplateTest, TripleQuotedStringsExtractedCorrectly) {
+  const SqlTemplate single =
+      ExtractSqlTemplate("SELECT '''abc\\ndef''';");
+  ASSERT_TRUE(single.templatable);
+  ASSERT_EQ(single.parameters.size(), 1U);
+  EXPECT_EQ(single.parameters[0], Value(std::string("abc\ndef")));
+  EXPECT_EQ(single.fingerprint, "SELECT '?';");
+
+  const SqlTemplate multiline =
+      ExtractSqlTemplate("SELECT '''abc\ndef''';");
+  ASSERT_TRUE(multiline.templatable);
+  ASSERT_EQ(multiline.parameters.size(), 1U);
+  EXPECT_EQ(multiline.parameters[0], Value(std::string("abc\ndef")));
+
+  const SqlTemplate triple_double =
+      ExtractSqlTemplate("SELECT \"\"\"hello\nworld\"\"\";");
+  ASSERT_TRUE(triple_double.templatable);
+  ASSERT_EQ(triple_double.parameters.size(), 1U);
+  EXPECT_EQ(triple_double.parameters[0], Value(std::string("hello\nworld")));
+  EXPECT_EQ(triple_double.fingerprint, "SELECT '?';");
+
+  const SqlTemplate unescaped =
+      ExtractSqlTemplate("SELECT '''a'b\"''';");
+  ASSERT_TRUE(unescaped.templatable);
+  ASSERT_EQ(unescaped.parameters.size(), 1U);
+  EXPECT_EQ(unescaped.parameters[0], Value(std::string("a'b\"")));
+
+  const SqlTemplate doubled =
+      ExtractSqlTemplate("SELECT '''a''b''';");
+  ASSERT_TRUE(doubled.templatable);
+  ASSERT_EQ(doubled.parameters.size(), 1U);
+  EXPECT_EQ(doubled.parameters[0], Value(std::string("a'b")));
+
+  const SqlTemplate raw =
+      ExtractSqlTemplate("SELECT r'''abc\\ndef''';");
+  ASSERT_TRUE(raw.templatable);
+  ASSERT_EQ(raw.parameters.size(), 1U);
+  EXPECT_EQ(raw.parameters[0], Value(std::string("abc\\ndef")));
+  EXPECT_EQ(raw.fingerprint, "SELECT r'?';");
+}
+
 }  // namespace
 }  // namespace tinylamb

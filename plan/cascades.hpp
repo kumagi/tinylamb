@@ -119,19 +119,34 @@ struct LogicalExpression {
   [[nodiscard]] std::string Fingerprint() const;
 };
 
+struct LogicalProperties {
+  std::vector<std::unordered_set<std::string>> candidate_keys{};
+  std::unordered_set<std::string> not_null_columns{};
+  std::vector<std::unordered_set<std::string>> equivalence_classes{};
+  bool max_1_row{false};
+
+  [[nodiscard]] bool IsUniqueOn(
+      const std::unordered_set<std::string>& columns) const;
+  [[nodiscard]] bool HasKey(const std::string& column) const;
+  [[nodiscard]] bool IsNotNull(const std::string& column) const;
+  [[nodiscard]] bool AreEqual(const std::string& col_a,
+                              const std::string& col_b) const;
+};
+
 struct Group {
   GroupId id{kInvalidGroup};
-  std::vector<std::string> relations;
-  std::vector<LogicalExpression> expressions;
+  std::vector<std::string> relations{};
+  std::vector<LogicalExpression> expressions{};
   // Single-relation conjuncts of the query predicate, applied by every scan
   // implementation of this group (D1: the group, not the expression, owns the
   // scan filter so all alternatives filter identically).
-  Expression filter;
+  Expression filter{};
   // Bitset over the memo-wide relation index (D5 join-graph metadata).
   uint64_t relation_mask{0};
   // Non-empty for derived root-layer groups (Selection/Projection/
   // Aggregation/Limit chains); distinguishes groups that share a relation set.
-  std::string tag;
+  std::string tag{};
+  LogicalProperties logical_properties{};
 };
 
 // A WHERE conjunct together with the relations it touches (D5).
@@ -208,6 +223,9 @@ class Memo {
   // constraint-based optimization rules.
   void SetTableSchemas(const std::unordered_map<std::string, Schema>& schemas) {
     table_schemas_ = schemas;
+    for (size_t i = 0; i < groups_.size(); ++i) {
+      DeriveLogicalProperties(i);
+    }
   }
   [[nodiscard]] const std::unordered_map<std::string, Schema>& GetTableSchemas()
       const {
@@ -220,6 +238,8 @@ class Memo {
   [[nodiscard]] Expression ScanFilterFor(const Group& group) const;
   [[nodiscard]] Expression JoinConditionFor(const Group& left,
                                             const Group& right) const;
+
+  void DeriveLogicalProperties(GroupId group);
 
  private:
   [[nodiscard]] static std::string GroupKey(
@@ -721,6 +741,17 @@ class SearchEngine {
   std::unordered_map<GroupId, size_t> next_expression_;
   std::unordered_map<std::string, std::optional<BestPlan>> best_;
 };
+
+bool IsStrictOnRelations(const Expression& expr,
+                         const std::vector<std::string>& relations);
+
+bool ExpressionRejectsNullsOnRelations(
+    const Expression& expr, const std::vector<std::string>& relations);
+
+bool IsStrictOnColumn(const Expression& expr, const std::string& column_name);
+
+bool ExpressionRejectsNullsOnColumn(const Expression& expr,
+                                    const std::string& column_name);
 
 }  // namespace tinylamb::cascades
 

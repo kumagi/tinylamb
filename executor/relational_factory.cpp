@@ -139,7 +139,20 @@ class RelationRenameExecutor final : public ExecutorBase {
         relation_(std::move(relation)),
         physical_(std::move(physical)) {}
 
-  bool Next(Row* dst, RowPosition* rp) override { return src_->Next(dst, rp); }
+  bool Next(Row* dst, RowPosition* rp) override {
+    if (!src_->Next(dst, rp)) {
+      FailWithChildOf(*src_);
+      return false;
+    }
+    return true;
+  }
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    const size_t count = src_->NextBatch(destination, max_rows);
+    if (count == 0) {
+      FailWithChildOf(*src_);
+    }
+    return count;
+  }
   void Dump(std::ostream& o, int indent) const override;
 
  private:

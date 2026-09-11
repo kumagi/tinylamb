@@ -41,6 +41,7 @@ class EmptyPlan final : public PlanBase {
                                    size_t /*limit_offset*/) const override {
     return true;
   }
+  [[nodiscard]] bool EnforcesDistinct() const override { return true; }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

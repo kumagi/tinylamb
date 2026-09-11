@@ -54,6 +54,9 @@ class RelationRenamePlan final : public PlanBase {
                                    size_t limit_offset) const override {
     return src_->EnforcesLimit(limit_count, limit_offset);
   }
+  [[nodiscard]] bool EnforcesDistinct() const override {
+    return src_->EnforcesDistinct();
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

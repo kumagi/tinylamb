@@ -45,6 +45,9 @@ class DistinctPlan final : public PlanBase {
     return distinct_on_;
   }
   [[nodiscard]] bool HasDistinctOn() const { return !distinct_on_.empty(); }
+  [[nodiscard]] bool EnforcesDistinct() const override {
+    return distinct_on_.empty();
+  }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

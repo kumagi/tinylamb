@@ -56,6 +56,9 @@ class SortPlan final : public PlanBase {
                                    size_t limit_offset) const override {
     return child_->EnforcesLimit(limit_count, limit_offset);
   }
+  [[nodiscard]] bool EnforcesDistinct() const override {
+    return child_->EnforcesDistinct();
+  }
 
   [[nodiscard]] const std::vector<SortKey>& Keys() const { return keys_; }
   [[nodiscard]] const Plan& Child() const { return child_; }

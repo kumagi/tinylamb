@@ -32,6 +32,7 @@
 //   SmallKeys: k in {1, 2, 3, 4}
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -167,6 +168,151 @@ TEST_F(RelationalRegressionTest,
     // k < 3 subset: no remaining row could satisfy k >= 8.
     EXPECT_EQ(row[1], Value(40));
   }
+}
+
+TEST_F(RelationalRegressionTest, WherePredicateError_PropagatesFailure) {
+  TransactionContext context = rs_->BeginContext();
+  SqlEngine engine(*rs_);
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, t,
+      rs_->CreateTable(
+          context,
+          Schema("ErrTable", {Column("id", ValueType::kInt64),
+                              Column("val", ValueType::kInt64)})));
+  ASSERT_SUCCESS(
+      t.Insert(context.txn_,
+               Row({Value(1), Value(std::numeric_limits<int64_t>::min())}))
+          .GetStatus());
+  ASSERT_SUCCESS(context.txn_.PreCommit());
+
+  TransactionContext run_ctx = rs_->BeginContext();
+  StatusOr<Executor> prepared =
+      engine.Prepare(run_ctx, "SELECT id FROM ErrTable WHERE ABS(val) <= 0;");
+  ASSERT_TRUE(prepared.HasValue());
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+  }
+  EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
+  run_ctx.Abort();
+}
+
+TEST_F(RelationalRegressionTest, ConjunctEvaluationToleratesErrorOnRejectedRow) {
+  TransactionContext context = rs_->BeginContext();
+  SqlEngine engine(*rs_);
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, t,
+      rs_->CreateTable(
+          context,
+          Schema("ErrTable2", {Column("id", ValueType::kInt64),
+                               Column("i", ValueType::kInt64),
+                               Column("f", ValueType::kDouble)})));
+  ASSERT_SUCCESS(
+      t.Insert(context.txn_,
+               Row({Value(1), Value(std::numeric_limits<int64_t>::min()),
+                    Value(-100.0)}))
+          .GetStatus());
+  ASSERT_SUCCESS(t.Insert(context.txn_, Row({Value(2), Value(0), Value(10.0)}))
+                     .GetStatus());
+  ASSERT_SUCCESS(context.txn_.PreCommit());
+
+  // Simple compare rejects row 1 (f > 0 is false for row 1):
+  // Both orders of conjuncts must succeed and return id = 2.
+  {
+    std::vector<Row> r1 = RelationalRun(
+        *rs_, "SELECT id FROM ErrTable2 WHERE f > 0 AND ABS(i) <= 3;");
+    ASSERT_EQ(r1.size(), 1U);
+    EXPECT_EQ(r1[0][0], Value(2));
+
+    std::vector<Row> r2 = RelationalRun(
+        *rs_, "SELECT id FROM ErrTable2 WHERE ABS(i) <= 3 AND f > 0;");
+    ASSERT_EQ(r2.size(), 1U);
+    EXPECT_EQ(r2[0][0], Value(2));
+  }
+
+  // Residual compare rejects row 1 (SAFE_ADD(i, -1) = 0 is false/null for row 1):
+  // Both orders of conjuncts must succeed and return empty.
+  {
+    std::vector<Row> r1 = RelationalRun(
+        *rs_,
+        "SELECT id FROM ErrTable2 WHERE (SAFE_ADD(i, -1) = 0) AND ABS(i) <= 3;");
+    EXPECT_TRUE(r1.empty());
+
+    std::vector<Row> r2 = RelationalRun(
+        *rs_,
+        "SELECT id FROM ErrTable2 WHERE ABS(i) <= 3 AND (SAFE_ADD(i, -1) = 0);");
+    EXPECT_TRUE(r2.empty());
+  }
+
+  // When no conjunct rejects row 1 (f < 0 is true for row 1), ABS(i) must throw.
+  {
+    TransactionContext run_ctx = rs_->BeginContext();
+    StatusOr<Executor> prepared = engine.Prepare(
+        run_ctx, "SELECT id FROM ErrTable2 WHERE f < 0 AND ABS(i) <= 3;");
+    ASSERT_TRUE(prepared.HasValue());
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
+    run_ctx.Abort();
+  }
+}
+
+TEST_F(RelationalRegressionTest, WindowFunctions_ArgumentAndFrameValidation) {
+  auto check_fails = [&](std::string_view sql) {
+    TransactionContext run_ctx = rs_->BeginContext();
+    SqlEngine engine(*rs_);
+    StatusOr<Executor> prepared = engine.Prepare(run_ctx, sql);
+    if (!prepared.HasValue()) {
+      run_ctx.Abort();
+      return;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
+    run_ctx.Abort();
+  };
+
+  // NTILE validations
+  check_fails("SELECT NTILE(NULL) OVER () FROM KeyTable;");
+  check_fails("SELECT NTILE(-1) OVER () FROM KeyTable;");
+  check_fails("SELECT NTILE(0) OVER () FROM KeyTable;");
+
+  // LAG / LEAD validations
+  check_fails("SELECT LAG(k, NULL) OVER (ORDER BY k) FROM KeyTable;");
+  check_fails("SELECT LAG(k, -1) OVER (ORDER BY k) FROM KeyTable;");
+  check_fails("SELECT LEAD(k, NULL) OVER (ORDER BY k) FROM KeyTable;");
+  check_fails("SELECT LEAD(k, -1) OVER (ORDER BY k) FROM KeyTable;");
+
+  // Row-dependent offset evaluation in LAG
+  {
+    std::vector<Row> rows = RelationalRun(
+        *rs_, "SELECT LAG(k, k) OVER (ORDER BY k) FROM KeyTable;");
+    ASSERT_EQ(rows.size(), 10U);
+    for (size_t i = 0; i < 10; ++i) {
+      // Offset is k, so target is i - i = 0 for each row; always yields row 0 (Value(0)).
+      EXPECT_EQ(rows[i][0], Value(0));
+    }
+  }
+
+  // NTH_VALUE validations
+  check_fails("SELECT NTH_VALUE(k, NULL) OVER (ORDER BY k) FROM KeyTable;");
+  check_fails("SELECT NTH_VALUE(k, 0) OVER (ORDER BY k) FROM KeyTable;");
+  check_fails("SELECT NTH_VALUE(k, -1) OVER (ORDER BY k) FROM KeyTable;");
+
+  // Window frame bound validations
+  check_fails(
+      "SELECT SUM(k) OVER (ORDER BY k ROWS BETWEEN -1 PRECEDING AND CURRENT "
+      "ROW) FROM KeyTable;");
+  check_fails(
+      "SELECT SUM(k) OVER (ORDER BY k ROWS BETWEEN NULL PRECEDING AND CURRENT "
+      "ROW) FROM KeyTable;");
+  check_fails(
+      "SELECT SUM(k) OVER (ORDER BY k RANGE BETWEEN -1 PRECEDING AND CURRENT "
+      "ROW) FROM KeyTable;");
+  check_fails(
+      "SELECT SUM(k) OVER (ORDER BY k RANGE BETWEEN NULL PRECEDING AND CURRENT "
+      "ROW) FROM KeyTable;");
 }
 
 }  // namespace

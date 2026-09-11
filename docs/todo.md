@@ -314,7 +314,7 @@ Cascades rule / cost / statistics
 
 ### Scalar rewrite（ExpressionRuleSet）
 
-（以下はExpressionRuleSetに実装済み: fold_binary/unary/in/function, singleton_in, canonicalize_comparison, boolean_identity, double_negation, de_morgan, simplify_case, not_comparison/not_like/not_is_null/not_is_not_null, xor_boolean_identity, and/or_idempotent, absorption_and/or, identity_add/subtract_zero, identity_multiply/divide_one, double_negation_arithmetic, reassociate_add/subtract_constants, dedupe_in_list, uniform_case_result, like_equality, is_null/is_not_null_of_null_check, collapse_nested_identical_cast, factor_or_common_and, nullif_to_case, self_inequality, contradiction_from_null_eq, greatest_least_fold, in_single_null, concat_flatten, xor_to_or_and_not, is_distinct_from_rewrite, boolean_eq_true_false_three_valued, nondeterministic_barrier, safe_divide_rewrite, abs_of_abs, empty_in_list, coalesce_and_nullif_simplification, datetime_and_string_fold_extent, if_to_case, bit_and_zero, bit_or_zero, safe_add_zero, safe_subtract_zero, safe_multiply_one, safe_multiply_zero, array_length_array_exp, bit_and_identity, bit_or_identity, json_path_constant_fold, numeric_widening_cast, or_of_ranges_to_in, interval_normalize, predicate_pushdown_case, inner_join_not_null_inference, regexp_prefix_extraction, cast_pushdown_comparison, deterministic_function_cse, function_volatility_classification, boolean_filter_pullup, not_in_null_semantics, array_flatten_optimization）
+（以下はExpressionRuleSetに実装済み: fold_binary/unary/in/function, singleton_in, canonicalize_comparison, boolean_identity, double_negation, de_morgan, simplify_case, not_comparison/not_like/not_is_null/not_is_not_null, xor_boolean_identity, and/or_idempotent, absorption_and/or, identity_add/subtract_zero, identity_multiply/divide_one, double_negation_arithmetic, reassociate_add/subtract_constants, dedupe_in_list, uniform_case_result, like_equality, is_null/is_not_null_of_null_check, collapse_nested_identical_cast, factor_or_common_and, nullif_to_case, self_inequality, contradiction_from_null_eq, greatest_least_fold, in_single_null, concat_flatten, xor_to_or_and_not, is_distinct_from_rewrite, boolean_eq_true_false_three_valued, nondeterministic_barrier, safe_divide_rewrite, abs_of_abs, empty_in_list, coalesce_and_nullif_simplification, datetime_and_string_fold_extent, if_to_case, array_length_array_exp, json_path_constant_fold, numeric_widening_cast, or_of_ranges_to_in, interval_normalize, predicate_pushdown_case, inner_join_not_null_inference, regexp_prefix_extraction, cast_pushdown_comparison, deterministic_function_cse, function_volatility_classification, boolean_filter_pullup, not_in_null_semantics, array_flatten_optimization）
 
 - [x] numeric widening cast簡約とDATE/TIMESTAMP cast正規化を実装する。
 - [x] NOT IN with NULL listの警告・計画を実装する。
@@ -322,7 +322,7 @@ Cascades rule / cost / statistics
 - [x] JSON path constant foldを実装する。
 - [x] projection以外も含むdeterministic function CSEを実装する。
 - [x] stable / immutable / volatileの関数分類を実装する。
-- [x] OR of ranges to INを実装する。
+- [x] OR of ranges to INを実装する（空INクラッシュ回避、非スロー境界、評価順・短絡例外保存）。
 - [x] DATE_ADD/SUB、SUBSTRING等のfold適用範囲を回帰テストで固定する。
 - [x] NOT BETWEENを実装する。
 
@@ -439,16 +439,16 @@ Cascades rule / cost / statistics
 
 - [x] 全新規operatorのDump / EXPLAIN名を追加する。
 - [x] ANALYZEに実時間、行数、loop、spill、batch数を追加する。
-- [ ] buffer pool cache hitを実行統計へ追加する。
-- [ ] MVCC snapshot visibilityをIndexOnly / Bitmapで検証する。
-- [ ] cancel途中のresource leakを検証する。
-- [ ] Sort / Limit / Distinctのengine safety net二重適用を検証する。
+- [x] buffer pool cache hitを実行統計へ追加する。
+- [x] MVCC snapshot visibilityをIndexOnly / Bitmapで検証する。
+- [x] cancel途中のresource leakを検証する。
+- [x] Sort / Limit / Distinctのengine safety net二重適用を検証する。
 - [x] 全ruleの代数テストを追加する（`expression_rewrites.test`, `executor_expectations.test`, `unsupported_future_features.test` 追加）。
-- [ ] random rule subset fuzzingを追加する。
-- [ ] outer join null-pad goldenを追加する。
-- [ ] TPC-H Q8/Q9 join order goldenを追加する。
-- [ ] 関係fallbackとCascadesの差分テストを追加する。
-- [ ] cost monotonicityを近似検査する。
+- [x] random rule subset fuzzingを追加する。
+- [x] outer join null-pad goldenを追加する。
+- [x] TPC-H Q8/Q9 join order goldenを追加する。
+- [x] 関係fallbackとCascadesの差分テストを追加する。
+- [x] cost monotonicityを近似検査する。
 
 ---
 

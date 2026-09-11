@@ -658,5 +658,142 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
 }
 
+TEST_F(SqlEngineTpchTest, TpchQ8Q9JoinOrderGolden) {
+  TransactionContext context = database_->BeginContext();
+  CreateSchema(context);
+  Seed(context);
+
+  auto explain_plan = [&](std::string_view prefix,
+                          std::string_view sql) -> std::string {
+    SqlEngine engine(*database_);
+    StatusOr<Executor> prepared =
+        engine.Prepare(context, std::string(prefix) + std::string(sql));
+    EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
+    std::string plan;
+    if (!prepared.HasValue()) {
+      return plan;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      if (!plan.empty()) {
+        plan += '\n';
+      }
+      plan += std::string(row[0].value.varchar_value);
+    }
+    return plan;
+  };
+
+  auto count_occurrences = [](std::string_view text,
+                              std::string_view pattern) -> size_t {
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(pattern, pos)) != std::string::npos) {
+      ++count;
+      pos += pattern.size();
+    }
+    return count;
+  };
+
+  // 1. TPC-H Q8: 8 relations join order golden verification.
+  // Relations: part, supplier, lineitem, orders, customer, nation n1, nation n2, region.
+  constexpr std::string_view kQ8InnerSql =
+      "SELECT EXTRACT(year FROM o_orderdate) AS o_year, "
+      "l_extendedprice * (1 - l_discount) AS volume, "
+      "n2.n_name AS nation "
+      "FROM part, supplier, lineitem, orders, customer, nation n1, nation n2, region "
+      "WHERE p_partkey = l_partkey AND s_suppkey = l_suppkey "
+      "AND l_orderkey = o_orderkey AND o_custkey = c_custkey "
+      "AND c_nationkey = n1.n_nationkey "
+      "AND n1.n_regionkey = r_regionkey AND r_name = 'AMERICA' "
+      "AND s_nationkey = n2.n_nationkey "
+      "AND o_orderdate BETWEEN date '1993-01-01' AND date '1997-12-31' "
+      "AND p_type = 'STANDARD POLISHED TIN';";
+
+  const std::string q8_plan = explain_plan("EXPLAIN ", kTpchQueries[7]);
+  EXPECT_NE(q8_plan.find("SubqueryScan AS all_nations"), std::string::npos)
+      << q8_plan;
+  EXPECT_NE(q8_plan.find("StreamAggregate group_keys=o_year"),
+            std::string::npos)
+      << q8_plan;
+
+  const std::string q8_inner_plan = explain_plan("EXPLAIN ", kQ8InnerSql);
+  EXPECT_NE(q8_inner_plan.find("JoinOrder=greedy_filtered_cardinality"),
+            std::string::npos)
+      << q8_inner_plan;
+  // All 8 relation scans present.
+  EXPECT_NE(q8_inner_plan.find("SeqScan part"), std::string::npos);
+  EXPECT_NE(q8_inner_plan.find("SeqScan lineitem"), std::string::npos);
+  EXPECT_NE(q8_inner_plan.find("SeqScan orders"), std::string::npos);
+  EXPECT_NE(q8_inner_plan.find("SeqScan customer"), std::string::npos);
+  EXPECT_NE(q8_inner_plan.find("SeqScan supplier"), std::string::npos);
+  EXPECT_NE(q8_inner_plan.find("SeqScan nation AS n2"), std::string::npos);
+  EXPECT_NE(q8_inner_plan.find("SeqScan nation AS n1"), std::string::npos);
+  EXPECT_NE(q8_inner_plan.find("SeqScan region"), std::string::npos);
+  // 8 relations -> exactly 7 HashJoins.
+  EXPECT_EQ(count_occurrences(q8_inner_plan, "HashJoin"), 7U);
+
+  // 2. TPC-H Q9: 6 relations join order golden verification.
+  // Relations: part, supplier, lineitem, partsupp, orders, nation.
+  constexpr std::string_view kQ9InnerSql =
+      "SELECT n_name AS nation, EXTRACT(year FROM o_orderdate) AS o_year, "
+      "l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount "
+      "FROM part, supplier, lineitem, partsupp, orders, nation "
+      "WHERE s_suppkey = l_suppkey AND ps_suppkey = l_suppkey "
+      "AND ps_partkey = l_partkey AND p_partkey = l_partkey "
+      "AND o_orderkey = l_orderkey AND s_nationkey = n_nationkey "
+      "AND p_name LIKE '%tomato%';";
+
+  const std::string q9_plan = explain_plan("EXPLAIN ", kTpchQueries[8]);
+  EXPECT_NE(q9_plan.find("SubqueryScan AS profit"), std::string::npos)
+      << q9_plan;
+  EXPECT_NE(q9_plan.find("StreamAggregate group_keys=nation,o_year"),
+            std::string::npos)
+      << q9_plan;
+
+  const std::string q9_inner_plan = explain_plan("EXPLAIN ", kQ9InnerSql);
+  EXPECT_NE(q9_inner_plan.find("JoinOrder=greedy_filtered_cardinality"),
+            std::string::npos)
+      << q9_inner_plan;
+  // All 6 relation scans present.
+  EXPECT_NE(q9_inner_plan.find("SeqScan part"), std::string::npos);
+  EXPECT_NE(q9_inner_plan.find("SeqScan lineitem"), std::string::npos);
+  EXPECT_NE(q9_inner_plan.find("SeqScan orders"), std::string::npos);
+  EXPECT_NE(q9_inner_plan.find("SeqScan partsupp"), std::string::npos);
+  EXPECT_NE(q9_inner_plan.find("SeqScan supplier"), std::string::npos);
+  EXPECT_NE(q9_inner_plan.find("SeqScan nation"), std::string::npos);
+  // 6 relations -> exactly 5 HashJoins.
+  EXPECT_EQ(count_occurrences(q9_inner_plan, "HashJoin"), 5U);
+  // Composite join key on partsupp (ps_suppkey and ps_partkey).
+  EXPECT_NE(q9_inner_plan.find("HashJoin keys=2"), std::string::npos);
+
+  // 3. EXPLAIN ANALYZE runtime profiling golden verification.
+  const std::string q8_analyzed =
+      explain_plan("EXPLAIN ANALYZE ", kTpchQueries[7]);
+  EXPECT_NE(q8_analyzed.find("Actual Rows: 1"), std::string::npos)
+      << q8_analyzed;
+  EXPECT_NE(q8_analyzed.find("Buffer Pool:"), std::string::npos) << q8_analyzed;
+
+  const std::string q9_analyzed =
+      explain_plan("EXPLAIN ANALYZE ", kTpchQueries[8]);
+  EXPECT_NE(q9_analyzed.find("Actual Rows: 1"), std::string::npos)
+      << q9_analyzed;
+  EXPECT_NE(q9_analyzed.find("Buffer Pool:"), std::string::npos) << q9_analyzed;
+
+  // 4. Execution output correctness verification.
+  std::vector<Row> q8_rows = Run(context, kTpchQueries[7]);
+  ASSERT_EQ(q8_rows.size(), 1U);
+  EXPECT_EQ(q8_rows[0][0], Value(1994));
+  EXPECT_NEAR(q8_rows[0][1].value.double_value, 1.0, 1e-6);
+
+  std::vector<Row> q9_rows = Run(context, kTpchQueries[8]);
+  ASSERT_EQ(q9_rows.size(), 1U);
+  EXPECT_EQ(q9_rows[0][0], Value("PERU"));
+  EXPECT_EQ(q9_rows[0][1], Value(1994));
+  EXPECT_NEAR(q9_rows[0][2].value.double_value, 72.0, 1e-6);
+
+  EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+}
+
 }  // namespace
 }  // namespace tinylamb
+

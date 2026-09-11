@@ -24,6 +24,7 @@
 #include "plan/incremental_sort_plan.hpp"
 #include "plan/max1_row_plan.hpp"
 #include "plan/plan.hpp"
+#include "plan/relation_rename_plan.hpp"
 #include "plan/relational_plan.hpp"
 #include "plan/set_operation_plan.hpp"
 #include "plan/skip_scan_distinct_plan.hpp"
@@ -335,6 +336,33 @@ TEST_F(SkipScanDistinctPlanExtraTest, StatsDrivenRowCountsAndOrdering) {
                             {NamedExpression("a", ColumnValueExp("a"))}, out);
   EXPECT_EQ(none.EmitRowCount(), 1U);
   EXPECT_EQ(none.AccessRowCount(), 0U);
+}
+
+TEST(PlanExtraTest, RelationRenamePreservesColumnTypeAndConstraint) {
+  Column col1("c1", ValueType::kInt64, Constraint(Constraint::kUnique));
+  col1.SetUnsigned(true);
+  Column col2("c2", ValueType::kVarChar, Constraint(Constraint::kNothing));
+  Schema src_schema("orig_table", {col1, col2});
+  Plan values = std::make_shared<ValuesPlan>(src_schema, std::vector<Row>{});
+  RelationRenamePlan rename(values, "renamed_alias", "orig_table");
+
+  const Schema& renamed_schema = rename.GetSchema();
+  ASSERT_EQ(renamed_schema.ColumnCount(), 2U);
+
+  const Column& rcol1 = renamed_schema.GetColumn(0);
+  EXPECT_EQ(rcol1.Name().schema, "renamed_alias");
+  EXPECT_EQ(rcol1.Name().name, "c1");
+  EXPECT_EQ(rcol1.Type(), ValueType::kInt64);
+  EXPECT_TRUE(rcol1.IsUnsigned());
+  EXPECT_TRUE(rcol1.GetConstraint().IsUnique());
+
+  const Column& rcol2 = renamed_schema.GetColumn(1);
+  EXPECT_EQ(rcol2.Name().schema, "renamed_alias");
+  EXPECT_EQ(rcol2.Name().name, "c2");
+  EXPECT_EQ(rcol2.Type(), ValueType::kVarChar);
+  EXPECT_FALSE(rcol2.IsUnsigned());
+
+  EXPECT_EQ(rename.ToString(), "Rename: orig_table AS renamed_alias");
 }
 
 }  // namespace tinylamb
