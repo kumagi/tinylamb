@@ -90,6 +90,8 @@ class IndexSkipScanExecutor final : public ExecutorBase {
   explicit IndexSkipScanExecutor(Executor inner) : inner_(std::move(inner)) {}
   IndexSkipScanExecutor(const IndexSkipScanExecutor&) = delete;
   IndexSkipScanExecutor& operator=(const IndexSkipScanExecutor&) = delete;
+  IndexSkipScanExecutor(IndexSkipScanExecutor&&) = delete;
+  IndexSkipScanExecutor& operator=(IndexSkipScanExecutor&&) = delete;
   ~IndexSkipScanExecutor() override = default;
 
   bool Next(Row* dst, RowPosition* rp) override {

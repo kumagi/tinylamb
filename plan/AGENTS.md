@@ -19,11 +19,12 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   alternatives stay semantically identical; expression cap 4096 degrades
   gracefully (`Degraded`).
 - Rule families: `ExpressionRuleSet::Default` (folds, De Morgan, comparison
-  canonicalization…) → `cascades::RuleSet::Default` (80+ logical equivalences:
+  canonicalization…) → `cascades::RuleSet::Default` (110+ logical equivalences:
   join commutativity/associativity/enumeration, selection merge/pushdown,
   set-op transparency…) → `implementation_rules.{hpp,cpp}`
   (`DefaultImplementationRules`: range-sliced Index/Bitmap/MinMax, Hash/Merge/
-  NL/IndexJoin; `OptimizeSingleRelation` fast path).
+  NL/IndexJoin, outer NL, StreamAgg, Materialize/Spool, Exchange no-ops;
+  `OptimizeSingleRelation` fast path).
 - `optimizer.{hpp,cpp}` (`Optimizer/OptimizerOptions`) — entry point; reads
   `query/query_data` and (read-only, allowlisted V3') `query/statement.hpp`
   for decorrelation analysis. Execution stays in `subquery_runtime`.

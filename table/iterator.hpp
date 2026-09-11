@@ -28,6 +28,10 @@ class Iterator {
  public:
   explicit Iterator(IteratorBase* iter) : iter_(iter) {}
   [[nodiscard]] bool IsValid() const { return iter_->IsValid(); }
+  // Sticky failure of the underlying scan (IteratorBase contract): callers
+  // must distinguish "exhausted" from "IO/corruption failure" via this after
+  // IsValid() turns false.
+  [[nodiscard]] Status GetStatus() const { return iter_->GetStatus(); }
   [[nodiscard]] RowPosition Position() const { return iter_->Position(); }
   Row* operator->() { return &**iter_; }
   const Row& operator*() const { return **iter_; }

@@ -23,6 +23,12 @@ namespace tinylamb {
 //   subquery).
 // - Aggregate TLP: grouped COUNT(*)/SUM over Q[p] must equal the three
 //   partitions merged group-wise.
+// - UNION ALL partitioning: the same split, but recombined by the engine's
+//   set-operation executor instead of the harness (covers UNION ALL bags,
+//   row ordering and spill paths).
+// - Subquery differential: COUNT over t matching j spelled three ways
+//   (IN subquery / correlated EXISTS / JOIN+DISTINCT semi-join) must agree;
+//   exercises decorrelation, apply and hash-join against each other.
 // - NoREC (Non-Optimizing Reference Engine): COUNT(*) WHERE p ==
 //   SUM(CASE WHEN p THEN 1 ELSE 0 END).
 // - Constraint-solving / PQS-flavoured oracle: the harness mirrors every
@@ -60,6 +66,12 @@ struct OracleTrace {
   // Aggregate TLP: grouped COUNT/SUM over the full predicate must equal the
   // per-partition results merged group-wise.
   std::vector<std::string> tlp_agg;  // original, part1, part2, part3
+  // UNION ALL partitioning: Q[p] as a bag must equal the three partitions
+  // combined through the set-operation executor (not a harness-side merge).
+  std::vector<std::string> unionall;  // original, 3-way UNION ALL
+  // Subquery differential: three spellings of "t rows matching j" (IN
+  // subquery / correlated EXISTS / semi-join via JOIN+DISTINCT) must agree.
+  std::vector<std::string> subq;  // exactly 3 when active
   // Constraint rewriting: probe before/after the DDL must agree.
   std::vector<std::string> index_ddl;
   std::string index_probe;
@@ -75,6 +87,8 @@ struct OracleTrace {
 struct OracleIterationStats {
   bool tlp_ran{false};
   bool tlp_agg_ran{false};
+  bool unionall_ran{false};
+  bool subq_ran{false};
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};

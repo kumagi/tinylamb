@@ -2188,4 +2188,98 @@ TEST(ExpressionRewriteTest, ChildRewritePreservesAggregateMetadata) {
   EXPECT_TRUE(rebuilt_agg.SecondaryArg());
 }
 
+TEST(ExpressionRewriteTest, CanonicalizeBooleanKeepsBooleanExpression) {
+  const Expression and_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kAnd, ColumnValueExp("b"));
+  const Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(BinaryExpressionExp(and_expr, BinaryOperation::kEquals,
+                                       ConstantValueExp(Value(1))));
+  EXPECT_EQ(rewritten->ToString(), and_expr->ToString());
+}
+
+TEST(ExpressionRewriteTest, CanonicalizeBooleanComplementsFalseComparison) {
+  const Expression or_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kOr, ColumnValueExp("b"));
+  const Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(BinaryExpressionExp(or_expr, BinaryOperation::kEquals,
+                                       ConstantValueExp(Value(0))));
+  // = FALSE complements (NOT (a OR b)), and De Morgan then pushes the NOT
+  // to (NOT a) AND (NOT b). Either shape proves the comparison folded.
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAnd);
+}
+
+TEST(ExpressionRewriteTest, CanonicalizeBooleanRejectsNonBooleanColumn) {
+  const Expression expression =
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(1)));
+  const Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  // An integer column is not boolean-valued: `x = 1` keeps its comparison
+  // semantics (x = 5 must stay FALSE, not truthy).
+  EXPECT_EQ(rewritten->ToString(), expression->ToString());
+}
+
+TEST(ExpressionRewriteTest, DistributeOrOverAndBudgeted) {
+  const Expression distributed =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(BinaryExpressionExp(
+              BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kAnd,
+                                  ColumnValueExp("y")),
+              BinaryOperation::kOr, ColumnValueExp("z")));
+  // (x AND y) OR z -> (x OR z) AND (y OR z).
+  ASSERT_EQ(distributed->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(distributed->AsBinaryExpression().Op(), BinaryOperation::kAnd);
+  EXPECT_EQ(distributed->AsBinaryExpression().Left()->Type(),
+            TypeTag::kBinaryExp);
+  EXPECT_EQ(distributed->AsBinaryExpression().Right()->Type(),
+            TypeTag::kBinaryExp);
+}
+TEST(ExpressionRewriteTest, PowIdentitiesFold) {
+  // pow(x, 1) -> CAST(x AS FLOAT64): value-preserving for every x including
+  // NULL, and it keeps pow's declared DOUBLE result type (a bare column
+  // rewrite turned `pow(int_col, 1) / 2` into integer division).
+  const Expression to_first =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(FunctionCallExp(
+              "pow", {ColumnValueExp("x"), ConstantValueExp(Value(1))}));
+  ASSERT_EQ(to_first->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(to_first->AsCastExpression().Child()->ToString(),
+            ColumnValueExp("x")->ToString());
+  // pow(x, 0) is NOT folded: the evaluator returns NULL for a NULL base
+  // (any NULL argument propagates), which the constant 1 would erase.
+  const Expression to_one =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(FunctionCallExp(
+              "pow", {ColumnValueExp("x"), ConstantValueExp(Value(0))}));
+  ASSERT_EQ(to_one->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(to_one->AsFunctionCallExpression().FuncName(), "pow");
+}
+
+TEST(ExpressionRewriteTest, BitAndOrIdentities) {
+  const Expression idempotent =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(FunctionCallExp("__bit_and",
+                                   {ColumnValueExp("x"), ColumnValueExp("x")}));
+  EXPECT_EQ(idempotent->ToString(), ColumnValueExp("x")->ToString());
+  // x & -1 -> x is NULL-safe (the surviving operand still yields NULL).
+  const Expression identity =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(FunctionCallExp(
+              "__bit_and",
+              {ColumnValueExp("x"), ConstantValueExp(Value(int64_t(-1)))}));
+  EXPECT_EQ(identity->ToString(), ColumnValueExp("x")->ToString());
+  // x | -1 is deliberately NOT folded to -1: `NULL | -1` must stay NULL,
+  // and the constant would erase the NULL-producing operand.
+  const Expression absorb =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(FunctionCallExp(
+              "__bit_or",
+              {ColumnValueExp("x"), ConstantValueExp(Value(int64_t(-1)))}));
+  ASSERT_EQ(absorb->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(absorb->AsFunctionCallExpression().FuncName(), "__bit_or");
+}
+
 }  // namespace tinylamb

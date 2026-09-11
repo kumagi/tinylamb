@@ -53,6 +53,9 @@ class Database final : public CatalogReader {
                                                     size_t wal_sync_ms = 1);
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;
+  Database(Database&&) = delete;
+  Database& operator=(Database&&) = delete;
+  ~Database() override = default;
 
   // Transaction Begin() { return storage_.Begin(); }
   TransactionContext BeginContext() { return {storage_->Begin(), this}; }

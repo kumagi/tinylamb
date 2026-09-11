@@ -18,8 +18,8 @@
 
 #include <gtest/gtest.h>
 
-#include <stdexcept>
 #include <cstddef>
+#include <stdexcept>
 #include <vector>
 
 #include "parser/token.hpp"
@@ -288,7 +288,8 @@ TEST(TokenizerTest, AllKeywords) {
 }
 
 TEST(TokenizerTest, IdentifierWithDigitsAndUnderscore) {
-  // Act -- tokenize identifiers containing digits, underscores, leading underscore
+  // Act -- tokenize identifiers containing digits, underscores, leading
+  // underscore
   Tokenizer tokenizer("col1 my_table _private");
   std::vector<Token> tokens = tokenizer.Tokenize();
 

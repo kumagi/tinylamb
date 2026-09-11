@@ -418,6 +418,7 @@ tinylamb_add_layer(tinylamb_executor
         plan/sort_distinct_plan.cpp
         plan/values_plan.cpp
         plan/max1_row_plan.cpp
+        plan/materialize_plan.cpp
         plan/minmax_index_plan.cpp
         plan/incremental_sort_plan.cpp
         plan/merge_join_plan.cpp
@@ -655,12 +656,17 @@ if(BUILD_TESTING)
             # detect_deadlocks=0 turns off lock-order reporting only; data
             # race detection stays on. die_after_fork=0 lets gtest death
             # tests (fork + worker threads) run their scenario in the child.
-            gtest_discover_tests(${target_name} PROPERTIES
-                    ENVIRONMENT
-                    "TSAN_OPTIONS=detect_deadlocks=0 die_after_fork=0")
+            set(_test_env "TSAN_OPTIONS=detect_deadlocks=0 die_after_fork=0")
         else()
-            gtest_discover_tests(${target_name})
+            set(_test_env "")
         endif()
+        # Always replay the committed oracle regression files; without the
+        # directory the guard test silently skips (no-exception-rule-migration
+        # .md / AGENTS.md fuzzing workflow).
+        list(APPEND _test_env
+             "TINYLAMB_ORACLE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/oracle_regressions")
+        gtest_discover_tests(${target_name} PROPERTIES ENVIRONMENT
+                                                       "${_test_env}")
     endfunction()
 
 add_simple_test(common/vm_cache_test.cpp)

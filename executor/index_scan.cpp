@@ -102,6 +102,13 @@ void IndexScan::OpenRange(const std::vector<Value>& begin_key,
 bool IndexScan::Next(Row* dst, RowPosition* rp) {
   for (;;) {
     while (!iter_.IsValid()) {
+      // A range iterator that stopped early latched the reason (page-pool /
+      // IO failure) in GetStatus(); advancing to the next pending range
+      // would silently truncate the result set (table/iterator_base.hpp).
+      const Status status = iter_.GetStatus();
+      if (status != Status::kSuccess) {
+        return FailWith(status);
+      }
       if (pending_offset_ == pending_.size()) {
         return false;
       }

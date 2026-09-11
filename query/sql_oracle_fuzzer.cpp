@@ -26,6 +26,7 @@
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "index/index_schema.hpp"
+#include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "table/table.hpp"
 #include "type/column.hpp"
@@ -513,8 +514,13 @@ std::string GenProjection(Gen& g, bool with_join) {
 // SQL boolean fragments the mirror does not track: subqueries, arithmetic,
 // CASE and coalesce.  Used only by the metamorphic oracles (TLP partition
 // predicate, NoREC filter), whose checks never need a ground truth.
+// `allow_subquery=false` restricts to the subquery-free subset: DELETE/UPDATE
+// reject a WHERE containing a query expression ("query expression requires
+// relational evaluation"), so feeding one to the transaction oracle would
+// skip the whole iteration.
 std::string GenSqlOnlyPred(Gen& g, const std::string& tab,
-                           const std::string& jtab) {
+                           const std::string& jtab,
+                           bool allow_subquery = true) {
   switch (g.Pick(0, 8)) {
     case 0:
       return g.Chance(50) ? "(a IN (1, 2, NULL))" : "(b NOT IN (0, -1, 3))";
@@ -530,13 +536,22 @@ std::string GenSqlOnlyPred(Gen& g, const std::string& tab,
     case 5:
       return "(s LIKE 'a%' OR s = '')";
     case 6:
+      if (!allow_subquery) {
+        return "(a IS NOT NULL AND b IS NOT NULL)";
+      }
       return jtab.empty() ? "(u IN (SELECT u FROM " + tab + " WHERE a > 0))"
                           : "(a IN (SELECT x FROM " + jtab + "))";
     case 7:
+      if (!allow_subquery) {
+        return "(flag IS NOT NULL OR a != b)";
+      }
       return jtab.empty() ? "(SELECT COUNT(*) FROM " + tab + ") >= 0"
                           : "(EXISTS (SELECT 1 FROM " + jtab + " WHERE x > " +
                                 tab + ".a))";
     default:
+      if (!allow_subquery) {
+        return "(NOT (a IS NULL AND b IS NULL))";
+      }
       return jtab.empty()
                  ? "(NOT (a IS NULL AND b IS NULL))"
                  : "((SELECT MAX(x) FROM " + jtab + ") > " + tab + ".b)";
@@ -709,7 +724,11 @@ bool CheckTlp(Database& db, TransactionContext& ctx,
   auto r3 = RunRows(db, ctx, tlp[3], &error);
   if (!(r0.has_value() && r1.has_value() && r2.has_value() && r3.has_value())) {
     if (verbose) {
-      std::cerr << "[sql_oracle][tlp-error] " << error << "\n";
+      const std::size_t failed =
+          (!r0.has_value() ? 0
+                           : (!r1.has_value() ? 1 : (!r2.has_value() ? 2 : 3)));
+      std::cerr << "[sql_oracle][tlp-error] part=" << failed << ": " << error
+                << " :: " << tlp[failed] << "\n";
     }
     return false;
   }
@@ -814,6 +833,77 @@ bool CheckTlpAgg(Database& db, TransactionContext& ctx,
   };
   *report += "  merged partitions:\n" + dump(expected);
   *report += "  original result:\n" + dump(actual);
+  return true;
+}
+
+// UNION ALL partitioning: the engine itself must recombine the partitions.
+// Q[p] as a BAG equals part1 UNION ALL part2 UNION ALL part3 (the WHERE
+// splits are disjoint, so plain rows never duplicate across parts).  A
+// DISTINCT projection breaks the bag invariant: one value projected in two
+// parts is deduplicated per branch yet appears twice in the concatenation,
+// so DISTINCT queries compare as SETS instead (same rule as CheckTlp).
+bool CheckUnionAll(Database& db, TransactionContext& ctx,
+                   const std::vector<std::string>& unionall,
+                   std::string* report, bool verbose) {
+  if (unionall.size() != 2) {
+    return true;
+  }
+  std::string error;
+  auto original = RunRows(db, ctx, unionall[0], &error);
+  auto merged = RunRows(db, ctx, unionall[1], &error);
+  if (!(original.has_value() && merged.has_value())) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][unionall-error] " << error << "\n";
+    }
+    return false;
+  }
+  std::vector<std::string> s0 = SerializeSorted(*original);
+  std::vector<std::string> s1 = SerializeSorted(*merged);
+  if (unionall[0].find("DISTINCT") != std::string::npos) {
+    s0.erase(std::unique(s0.begin(), s0.end()), s0.end());
+    s1.erase(std::unique(s1.begin(), s1.end()), s1.end());
+  }
+  if (s0 == s1) {
+    return true;
+  }
+  *report += "[UNION-ALL MISMATCH]\n";
+  *report += "  original: " + unionall[0] + " (" + std::to_string(s0.size()) +
+             " rows)\n" + DumpRows(s0);
+  *report += "  union:    " + unionall[1] + " (" + std::to_string(s1.size()) +
+             " rows)\n" + DumpRows(s1);
+  return true;
+}
+
+// Subquery differential: the three COUNT spellings must be identical.
+bool CheckSubq(Database& db, TransactionContext& ctx,
+               const std::vector<std::string>& subq, std::string* report,
+               bool verbose) {
+  if (subq.size() != 3) {
+    return true;
+  }
+  std::string error;
+  std::vector<std::string> counts;
+  counts.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    std::optional<std::string> count =
+        RunScalar(db, ctx, subq[static_cast<size_t>(i)], &error);
+    if (!count.has_value()) {
+      if (verbose) {
+        std::cerr << "[sql_oracle][subq-error] " << error << "\n";
+      }
+      return false;
+    }
+    counts.push_back(std::move(*count));
+  }
+  if (counts[0] == counts[1] && counts[1] == counts[2]) {
+    return true;
+  }
+  *report += "[SUBQ MISMATCH]\n";
+  for (int i = 0; i < 3; ++i) {
+    const char* tag = i == 0 ? "IN     " : (i == 1 ? "EXISTS " : "JOIN   ");
+    *report += std::string("  ") + tag + subq[static_cast<size_t>(i)] + " => " +
+               counts[static_cast<size_t>(i)] + "\n";
+  }
   return true;
 }
 
@@ -1013,9 +1103,8 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
   std::string error;
 
   // Branch A: setup + mutations inside ONE transaction.
-  auto holder_a =
-      Database::Create("sql_oracle_trocA-" + RandomString(8)).MoveValue();
-  if (holder_a == nullptr) {
+  ScopedDb holder_a("sql_oracle_trocA");
+  if (!holder_a) {
     return false;
   }
   Database& db_a = *holder_a;
@@ -1048,9 +1137,8 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
   }
 
   // Branch B: same statements, each in its own transaction (autocommit).
-  auto holder_b =
-      Database::Create("sql_oracle_trocB-" + RandomString(8)).MoveValue();
-  if (holder_b == nullptr) {
+  ScopedDb holder_b("sql_oracle_trocB");
+  if (!holder_b) {
     return false;
   }
   Database& db_b = *holder_b;
@@ -1085,11 +1173,48 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
     return false;
   }
 
+  // Branch C: the same mutations, then ABORT.  The visible state must be
+  // exactly the pristine setup state (MVCC undo + write-intent release).
+  ScopedDb holder_c("sql_oracle_trocC");
+  if (!holder_c) {
+    return false;
+  }
+  Database& db_c = *holder_c;
+  TransactionContext ctx_c = db_c.BeginContext();
+  for (const std::string& sql : t.setup) {
+    if (!RunUpdate(db_c, ctx_c, sql)) {
+      return false;
+    }
+  }
+  ctx_c.txn_.PreCommit();
+  TransactionContext ctx_c0 = db_c.BeginContext();
+  auto pristine = RunRows(db_c, ctx_c0, t.troc_probe, &error);
+  TransactionContext ctx_c2 = db_c.BeginContext();
+  for (const std::string& sql : t.troc) {
+    if (!RunUpdate(db_c, ctx_c2, sql)) {
+      return false;
+    }
+  }
+  ctx_c2.txn_.Abort();
+  TransactionContext ctx_c3 = db_c.BeginContext();
+  auto after_c = RunRows(db_c, ctx_c3, t.troc_probe, &error);
+  if (!(after_c.has_value() && pristine.has_value())) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][troc-error-c] " << error << "\n";
+    }
+    return false;
+  }
+
   const std::string state_inside =
       inside->empty() ? "" : (*inside)[0].ToString();
   const std::string state_a = after_a->empty() ? "" : (*after_a)[0].ToString();
   const std::string state_b = after_b->empty() ? "" : (*after_b)[0].ToString();
-  if (state_inside == state_a && state_a == state_b) {
+  const std::string state_pristine =
+      pristine->empty() ? "" : (*pristine)[0].ToString();
+  const std::string state_aborted =
+      after_c->empty() ? "" : (*after_c)[0].ToString();
+  if (state_inside == state_a && state_a == state_b &&
+      state_pristine == state_aborted) {
     return true;
   }
   *report += "[TRANSACTION MISMATCH]\n";
@@ -1097,6 +1222,10 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
   *report += "  inside txn: " + state_inside + "\n";
   *report += "  committed:  " + state_a + "\n";
   *report += "  autocommit: " + state_b + "\n";
+  if (state_pristine != state_aborted) {
+    *report += "  !! ABORT NOT ATOMIC: pristine=" + state_pristine +
+               " after-abort=" + state_aborted + "\n";
+  }
   return true;
 }
 
@@ -1315,6 +1444,31 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
                    from_main + ";"};
   }
 
+  // ---- UNION ALL partitioning (engine recombines, harness does not) ----
+  {
+    const std::string aux = GenAuxPredicate(g, flavour, tab, jtab);
+    const std::string prefix = "SELECT " + GenProjection(g, with_join) +
+                               " FROM " + from_main + " WHERE ";
+    t.unionall = {
+        prefix + t.predicate + ";",
+        prefix + "(" + t.predicate + ") AND (" + aux + ") UNION ALL " + prefix +
+            "(" + t.predicate + ") AND NOT (" + aux + ") UNION ALL " + prefix +
+            "(" + t.predicate + ") AND (" + aux + ") IS NULL;",
+    };
+  }
+
+  // ---- Subquery differential (needs a join partner to reference) ----
+  if (with_join) {
+    const std::string count_prefix = "SELECT COUNT(*) FROM " + tab + " WHERE ";
+    t.subq = {
+        count_prefix + "a IN (SELECT x FROM " + jtab + ");",
+        count_prefix + "EXISTS (SELECT 1 FROM " + jtab + " WHERE " + jtab +
+            ".x = " + tab + ".a);",
+        "SELECT COUNT(*) FROM (SELECT DISTINCT " + tab + ".u FROM " + tab +
+            " JOIN " + jtab + " ON " + tab + ".a = " + jtab + ".x) sub;",
+    };
+  }
+
   // ---- PQS: adjust the predicate so the pivot row must be included ----
   {
     const MirrorRow& pivot = mirror[static_cast<size_t>(
@@ -1415,7 +1569,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
           break;
         }
         case 2: {
-          const std::string cond = GenSqlOnlyPred(g, tab, "");
+          const std::string cond = GenSqlOnlyPred(g, tab, "", false);
           std::string delete_sql = "DELETE FROM " + tab + " WHERE ";
           delete_sql += cond;
           delete_sql += ";";
@@ -1451,9 +1605,8 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
 
   // Plan feedback: reward flavours that surface unseen plan shapes.
   if (session != nullptr) {
-    auto db_holder =
-        Database::Create("sql_oracle_fuzz-" + RandomString(8)).MoveValue();
-    CHECK(db_holder != nullptr);
+    ScopedDb db_holder("sql_oracle_fuzz");
+    CHECK(db_holder.get() != nullptr);
     Database& db = *db_holder;
     TransactionContext ctx = db.BeginContext();
     if (RunSetup(db, ctx, t.setup, verbose)) {
@@ -1473,6 +1626,8 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   if (stats != nullptr) {
     stats->tlp_ran = t.tlp.size() == 4;
     stats->tlp_agg_ran = t.tlp_agg.size() == 4;
+    stats->unionall_ran = t.unionall.size() == 2;
+    stats->subq_ran = t.subq.size() == 3;
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
     stats->idx_ran = !t.index_ddl.empty() && !t.index_probe.empty();
@@ -1486,9 +1641,8 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   if (trace.setup.empty() || !trace.setup[0].starts_with("CREATE TABLE")) {
     return "malformed trace: no CREATE TABLE in setup";
   }
-  auto db_holder =
-      Database::Create("sql_oracle_replay-" + RandomString(8)).MoveValue();
-  CHECK(db_holder != nullptr);
+  ScopedDb db_holder("sql_oracle_replay");
+  CHECK(db_holder.get() != nullptr);
   Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
   if (!RunSetup(db, ctx, trace.setup, verbose)) {
@@ -1497,6 +1651,8 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   std::string report;
   if (!CheckTlp(db, ctx, trace.tlp, &report, verbose) ||
       !CheckTlpAgg(db, ctx, trace.tlp_agg, &report, verbose) ||
+      !CheckUnionAll(db, ctx, trace.unionall, &report, verbose) ||
+      !CheckSubq(db, ctx, trace.subq, &report, verbose) ||
       !CheckNoRec(db, ctx, trace.norec, &report, verbose) ||
       !CheckPqs(db, ctx, trace, &report, verbose) ||
       !CheckIdx(db, ctx, trace, &report, verbose) ||
@@ -1529,6 +1685,12 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.tlp_agg) {
     out += "-- tlpagg: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.unionall) {
+    out += "-- unionall: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.subq) {
+    out += "-- subq: " + sql + "\n";
   }
   for (const std::string& sql : trace.norec) {
     out += "-- norec: " + sql + "\n";
@@ -1603,6 +1765,10 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->tlp.push_back(value);
     } else if (consume("-- tlpagg: ", &value)) {
       trace->tlp_agg.push_back(value);
+    } else if (consume("-- unionall: ", &value)) {
+      trace->unionall.push_back(value);
+    } else if (consume("-- subq: ", &value)) {
+      trace->subq.push_back(value);
     } else if (consume("-- norec: ", &value)) {
       trace->norec.push_back(value);
     } else if (consume("-- pqs: ", &value)) {
@@ -1638,9 +1804,8 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
 
 std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
   Gen g(rng);
-  auto db_holder =
-      Database::Create("sql_oracle_amoeba-" + RandomString(8)).MoveValue();
-  CHECK(db_holder != nullptr);
+  ScopedDb db_holder("sql_oracle_amoeba");
+  CHECK(db_holder.get() != nullptr);
   Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
   const std::string tab =

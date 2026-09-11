@@ -37,7 +37,10 @@ class LSMView {
   ~LSMView() = default;
   LSMView(const LSMView&) = delete;
   LSMView& operator=(const LSMView&) = delete;
-  LSMView& operator=(LSMView&&) = default;
+  // The blob_ reference makes move assignment implicitly deleted anyway;
+  // spell it out so the effectively-immovable view (see the Iterator note
+  // below) never silently depends on a defaulted-then-deleted member.
+  LSMView& operator=(LSMView&&) = delete;
   template <typename FilesType>
   LSMView(const BlobFile& blob, const FilesType& files) : blob_(blob) {
     for (const auto& file : files) {

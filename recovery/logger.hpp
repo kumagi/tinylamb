@@ -32,8 +32,8 @@
 
 namespace tinylamb {
 
-// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): fields are
-// grouped by locking domain (enqueue/work/durable), not by size.
+// Fields are grouped by locking domain (enqueue/work/durable), not by size.
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 class Logger final {
  public:
   // D1: a WAL record must stay within the bound the recovery reader accepts

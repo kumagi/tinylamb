@@ -15,9 +15,10 @@ VM Cache（`common/vm_cache_impl.cpp`）へ収束させるための作業リス�
 ## Stage 0: 二重実装の統合と既知バグ修正
 
 - [x] `vm_cache_impl.cpp` の `EnqueueToSmallFifo`/`EnqueueToMainFifo` の全pin時無限回転を
-      境界付きスキャンに置換（`cache.cpp` の `scanned_locked` 方式を移植、2026-08-22）
-- [x] 小キュー満杯判定を `==` → `>=` に変更（一時オーバーフロー後も eviction が再開する自己修復。
-      `cache.cpp` 側にはこの潜在バグが残っている、2026-08-22）
+      境界付きスキャンに置換（旧 `cache.cpp` の `scanned_locked` 方式を移植、2026-08-22。
+      同ファイルはマージ済みで削除済み）
+- [x] 小キュー満杯判定を `==` → `>=` に変更（一時オーバーフロー後も eviction が再開する自己修復、
+      2026-08-22。旧 `cache.cpp` 側に残っていた同種の潜在バグはファイル削除とともに解消）
 - [ ] `index/lsm_detail/cache.hpp`（ヘッダオンリ実装）と `common/vm_cache_impl.cpp` を
       単一実装に統合する
       - [ ] ブロックサイズをテンプレート／コンストラクタ引数化（4KiB vs 可変）

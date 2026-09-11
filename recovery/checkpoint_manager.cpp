@@ -79,17 +79,22 @@ Status WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
 #ifdef __APPLE__
     const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
     int rc = -1;
+    int sync_errno = errno;
     if (fd >= 0) {
       rc = ::fcntl(fd, F_FULLFSYNC);
+      sync_errno = errno;
       ::close(fd);
     }
 #else
     const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
     int rc = -1;
+    int sync_errno = errno;
     if (fd >= 0) {
       do {
         rc = ::fdatasync(fd);
       } while (rc < 0 && errno == EINTR);
+      // ::close below can overwrite errno; keep the sync error for reporting.
+      sync_errno = errno;
       ::close(fd);
     }
 #endif
@@ -98,7 +103,7 @@ Status WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
       std::filesystem::remove(tmp, ec);
       return StatusError(StatusCode::kIOError,
                          "Failed to fsync master record: " + tmp.string() +
-                             ": " + std::strerror(errno));
+                             ": " + std::strerror(sync_errno));
     }
   }
   std::error_code rename_ec;

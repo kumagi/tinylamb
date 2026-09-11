@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
-#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -29,6 +28,7 @@
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "plan/cascades.hpp"
+#include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "table/table.hpp"
 #include "type/column.hpp"
@@ -145,9 +145,8 @@ std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
   }
 
   // Oracle (b): full engine execution of the same expression text.
-  auto db_holder =
-      Database::Create("expr_oracle_fuzz-" + RandomString(8)).MoveValue();
-  CHECK(db_holder != nullptr);
+  ScopedDb db_holder("expr_oracle_fuzz");
+  CHECK(db_holder.get() != nullptr);
   Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
   const EngineOutcome engine = RunScalar(db, ctx, t.sql);
@@ -335,24 +334,6 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
 }
 
 namespace {
-
-struct ScopedDb {
-  std::string name;
-  std::unique_ptr<Database> db;
-  ScopedDb(std::string n, std::unique_ptr<Database> d)
-      : name(std::move(n)), db(std::move(d)) {}
-  ScopedDb(const ScopedDb&) = delete;
-  ScopedDb& operator=(const ScopedDb&) = delete;
-  ScopedDb(ScopedDb&&) = delete;
-  ScopedDb& operator=(ScopedDb&&) = delete;
-  ~ScopedDb() {
-    db.reset();
-    std::error_code ec;
-    std::filesystem::remove(name + ".log", ec);
-    std::filesystem::remove(name + ".db", ec);
-    std::filesystem::remove(name + ".last_checkpoint", ec);
-  }
-};
 
 struct RowGenPred {
   Expression expr;
@@ -685,11 +666,9 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
   t.matched_rows = expected_ids.size();
   t.matched_ids = expected_ids;
 
-  const std::string db_name = "row_expr_fuzz-" + RandomString(8);
-  auto db_holder = Database::Create(db_name).MoveValue();
-  CHECK(db_holder != nullptr);
-  ScopedDb sdb(db_name, std::move(db_holder));
-  Database& db = *sdb.db;
+  ScopedDb sdb("row_expr_fuzz");
+  CHECK(sdb.get() != nullptr);
+  Database& db = *sdb;
 
   const std::string tab = "t_fuzz_" + RandomString(6);
   {

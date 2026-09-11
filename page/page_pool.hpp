@@ -41,12 +41,14 @@ class PageRef;
 class RecoveryManager;
 
 class PagePool {
- private:
+ public:
   // Non-copyable: the pool is referenced by raw pointers pool-wide.
   PagePool(const PagePool&) = delete;
   PagePool& operator=(const PagePool&) = delete;
   PagePool(PagePool&&) = delete;
   PagePool& operator=(PagePool&&) = delete;
+
+ private:
   struct Entry {
     explicit Entry(Page* p)
         : pin_count(1), page(p), page_latch(new std::shared_mutex()) {}

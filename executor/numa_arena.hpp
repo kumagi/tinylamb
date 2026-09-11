@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace tinylamb {
@@ -26,7 +27,14 @@ class NumaArenaPartition {
 
   template <typename T, typename... Args>
   T* New(Args&&... args) {
+    // The arena only reclaims raw bytes: Reset() rewinds the bump offset and
+    // the destructor frees the blocks, neither runs destructors. Objects must
+    // therefore be trivially destructible (all current callers hold PODs).
+    static_assert(std::is_trivially_destructible_v<T>,
+                  "NumaArenaPartition::New would leak non-trivial "
+                  "destructors; the arena never destroys placed objects");
     void* ptr = Allocate(sizeof(T), alignof(T));
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     return new (ptr) T(std::forward<Args>(args)...);
   }
 

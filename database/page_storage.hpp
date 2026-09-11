@@ -29,8 +29,9 @@
 
 namespace tinylamb {
 
-// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): ownership
-// order (logger, pool, catalog managers) documents the teardown order.
+// Member order documents the teardown order (logger, pool, catalog
+// managers).
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 class PageStorage {
  public:
   // Opens the WAL + page files and runs recovery. Construction failures that
@@ -39,6 +40,9 @@ class PageStorage {
                                                        size_t wal_sync_ms = 1);
   PageStorage(const PageStorage&) = delete;
   PageStorage& operator=(const PageStorage&) = delete;
+  PageStorage(PageStorage&&) = delete;
+  PageStorage& operator=(PageStorage&&) = delete;
+  ~PageStorage() = default;
 
   Transaction Begin();
   Transaction BeginReadOnly();

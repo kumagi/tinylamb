@@ -496,6 +496,40 @@ TEST(SqlTemplateTest, FingerprintSeparatesIdentifierFromLiteralShapes) {
   EXPECT_NE(quoted.fingerprint, bare.fingerprint);
 }
 
+TEST(SqlTemplateTest, HexIntegerLiteralsStayOutOfTemplates) {
+  // PRODUCTION BUG (fixed): the template scanner only understood decimal
+  // digits, so SELECT 0x2A parameterized a poisoned Int64(0) while the AST
+  // visitor decodes the literal as 42 -- the first execution answered 42 and
+  // every template-cache hit afterwards answered 0.  Hex literals are raw
+  // bit patterns (0xFFFFFFFFFFFFFFFF == -1); they must never be bound from
+  // a decimal parameter.
+  const SqlTemplate extracted = ExtractSqlTemplate("SELECT 0x2A;");
+  EXPECT_FALSE(extracted.templatable);
+  EXPECT_TRUE(extracted.parameters.empty());
+  EXPECT_EQ(extracted.fingerprint, "SELECT 0x2A;");
+
+  const SqlTemplate uppercase = ExtractSqlTemplate("SELECT 0XFF;");
+  EXPECT_FALSE(uppercase.templatable);
+  EXPECT_TRUE(uppercase.parameters.empty());
+  EXPECT_EQ(uppercase.fingerprint, "SELECT 0XFF;");
+
+  // In a predicate: the literal keeps the statement verbatim, but the
+  // ordinary decimal on the other side still parameterizes (statement is
+  // non-templatable as a whole).
+  const SqlTemplate mixed =
+      ExtractSqlTemplate("SELECT a FROM t WHERE a = 0x10 AND b = 7;");
+  EXPECT_FALSE(mixed.templatable);
+  ASSERT_EQ(mixed.parameters.size(), 1U);
+  EXPECT_EQ(mixed.parameters[0], Value(7));
+  EXPECT_EQ(mixed.fingerprint, "SELECT a FROM t WHERE a = 0x10 AND b = 0;");
+
+  // A bare "0x" (no hex digits) is not a hex literal: the decimal scanner
+  // keeps its ordinary path (the query would not parse anyway).
+  const SqlTemplate bare = ExtractSqlTemplate("SELECT 0x;");
+  ASSERT_EQ(bare.parameters.size(), 1U);
+  EXPECT_EQ(bare.parameters[0], Value(0));
+}
+
 TEST(SqlTemplateTest, TimestampLiteralParametersAreUtcNormalized) {
   // PRODUCTION BUG (fixed): the first parse normalized a TIMESTAMP '...'
   // literal to UTC, but the template/plan caches replayed the RAW string

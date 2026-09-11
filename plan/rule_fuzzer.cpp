@@ -83,41 +83,40 @@ class PushdownDb {
     TransactionContext ctx = db_->BeginContext();
     SqlEngine engine(*db_);
 
-    const std::vector<std::string> setup_sqls =
-        {
-            "CREATE TABLE t1 (id INT64, val INT64, flag INT64, note "
-            "VARCHAR(16));",
-            "CREATE TABLE t2 (id INT64, t1_id INT64, val INT64, flag INT64, "
-            "note "  // NOLINT(bugprone-suspicious-missing-comma)
-            "VARCHAR(16));",
-            "CREATE TABLE t3 (id INT64, t2_id INT64, val INT64, flag INT64, "
-            "note "
-            "VARCHAR(16));",
-            // Rows for t1
-            "INSERT INTO t1 VALUES (1, 10, 1, 'a1');",
-            "INSERT INTO t1 VALUES (2, 20, 0, 'a2');",
-            "INSERT INTO t1 VALUES (3, NULL, NULL, 'a3');",
-            "INSERT INTO t1 VALUES (4, 40, 1, 'a4');",
-            "INSERT INTO t1 VALUES (5, 0, 0, 'a5');",
-            "INSERT INTO t1 VALUES (6, -10, 1, 'a6');",
-            "INSERT INTO t1 VALUES (7, NULL, 0, 'a7');",
-            "INSERT INTO t1 VALUES (8, 20, 1, 'a8');",
-            // Rows for t2
-            "INSERT INTO t2 VALUES (101, 1, 10, 1, 'b1');",
-            "INSERT INTO t2 VALUES (102, 1, NULL, 0, 'b1_dup');",
-            "INSERT INTO t2 VALUES (103, 2, 25, NULL, 'b2');",
-            "INSERT INTO t2 VALUES (104, 3, 30, 1, 'b3');",
-            "INSERT INTO t2 VALUES (105, 999, 50, 0, 'b_orphan');",
-            "INSERT INTO t2 VALUES (106, NULL, 60, 1, 'b_nullfk');",
-            "INSERT INTO t2 VALUES (107, 4, 0, 0, 'b4');",
-            "INSERT INTO t2 VALUES (108, 4, -5, 1, 'b4_dup');",
-            // Rows for t3
-            "INSERT INTO t3 VALUES (201, 101, 100, 1, 'c1');",
-            "INSERT INTO t3 VALUES (202, 101, 200, 0, 'c1_dup');",
-            "INSERT INTO t3 VALUES (203, 103, NULL, NULL, 'c3');",
-            "INSERT INTO t3 VALUES (204, 9999, 300, 1, 'c_orphan');",
-            "INSERT INTO t3 VALUES (205, 104, 0, 1, 'c4');",
-        };
+    const std::vector<std::string> setup_sqls = {
+        "CREATE TABLE t1 (id INT64, val INT64, flag INT64, note "
+        "VARCHAR(16));",
+        "CREATE TABLE t2 (id INT64, t1_id INT64, val INT64, flag INT64, "
+        "note "
+        "VARCHAR(16));",
+        "CREATE TABLE t3 (id INT64, t2_id INT64, val INT64, flag INT64, "
+        "note "
+        "VARCHAR(16));",
+        // Rows for t1
+        "INSERT INTO t1 VALUES (1, 10, 1, 'a1');",
+        "INSERT INTO t1 VALUES (2, 20, 0, 'a2');",
+        "INSERT INTO t1 VALUES (3, NULL, NULL, 'a3');",
+        "INSERT INTO t1 VALUES (4, 40, 1, 'a4');",
+        "INSERT INTO t1 VALUES (5, 0, 0, 'a5');",
+        "INSERT INTO t1 VALUES (6, -10, 1, 'a6');",
+        "INSERT INTO t1 VALUES (7, NULL, 0, 'a7');",
+        "INSERT INTO t1 VALUES (8, 20, 1, 'a8');",
+        // Rows for t2
+        "INSERT INTO t2 VALUES (101, 1, 10, 1, 'b1');",
+        "INSERT INTO t2 VALUES (102, 1, NULL, 0, 'b1_dup');",
+        "INSERT INTO t2 VALUES (103, 2, 25, NULL, 'b2');",
+        "INSERT INTO t2 VALUES (104, 3, 30, 1, 'b3');",
+        "INSERT INTO t2 VALUES (105, 999, 50, 0, 'b_orphan');",
+        "INSERT INTO t2 VALUES (106, NULL, 60, 1, 'b_nullfk');",
+        "INSERT INTO t2 VALUES (107, 4, 0, 0, 'b4');",
+        "INSERT INTO t2 VALUES (108, 4, -5, 1, 'b4_dup');",
+        // Rows for t3
+        "INSERT INTO t3 VALUES (201, 101, 100, 1, 'c1');",
+        "INSERT INTO t3 VALUES (202, 101, 200, 0, 'c1_dup');",
+        "INSERT INTO t3 VALUES (203, 103, NULL, NULL, 'c3');",
+        "INSERT INTO t3 VALUES (204, 9999, 300, 1, 'c_orphan');",
+        "INSERT INTO t3 VALUES (205, 104, 0, 1, 'c4');",
+    };
 
     for (const auto& sql : setup_sqls) {
       StatusOr<QueryResult> res = engine.Execute(ctx, sql);

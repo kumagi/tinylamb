@@ -99,6 +99,12 @@ struct LogicalExpression {
   std::vector<Row> values{};
   size_t limit_count{0};
   size_t limit_offset{0};
+  // FETCH FIRST ... WITH TIES: the TopN boundary keeps peers of the last
+  // row. Carried through costing (TopNPlan::EnforcesLimit is false for ties,
+  // so the engine remains the safety net) and ready for the Cascades
+  // migration of WITH TIES queries, which still route to the relational
+  // engine via SelectStatement::complex_.
+  bool with_ties{false};
   // Opaque JoinKind value for kOuterJoin (0 = LEFT, 1 = RIGHT, 2 = FULL).
   uint8_t join_type{0};
   std::shared_ptr<const SelectStatement> relational_statement{};
@@ -212,6 +218,14 @@ class Memo {
   [[nodiscard]] uint64_t RelationMask(
       const std::vector<std::string>& relations) const;
 
+  // True when every named relation is registered in the memo's join graph.
+  // Rule bodies probing whether a conjunct's tables belong to this memo must
+  // use this instead of try/catch around RelationMask: RelationMask signals
+  // an out-of-graph relation with CHECK (abort), which is a programmer-error
+  // channel, not a control-flow one.
+  [[nodiscard]] bool ContainsRelation(
+      const std::vector<std::string>& relations) const;
+
   // Groups that received new expressions since the last drain; the search
   // engine re-enqueues them (Phase 7 worklist).
   std::vector<GroupId> DrainTouchedGroups();
@@ -269,6 +283,11 @@ struct PayloadConstraint {
   // relation set; unqualified names cannot be proven to belong to the child
   // and therefore fail the constraint (strict interpretation).
   std::optional<size_t> predicate_within_child;
+  // The matched OuterJoin must carry this join type (0 = LEFT, 1 = RIGHT,
+  // 2 = FULL). Unset matches any type. Lets pushdown rules constrain the
+  // null-supplying side in the pattern instead of re-checking join_type in
+  // every transform lambda.
+  std::optional<uint8_t> outer_join_type;
 };
 
 class Pattern {
@@ -314,6 +333,34 @@ inline Pattern OuterJoin(Pattern left = Any(), Pattern right = Any(),
                          std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kOuterJoin,
                      {std::move(left), std::move(right)}, std::move(capture));
+}
+// Outer joins constrained by null-supplying side (P0): the type gate lives in
+// the pattern so rules over non-null-preserving (LEFT) vs null-preserving
+// sides cannot silently mix them up. join_type encoding: 0 = LEFT,
+// 1 = RIGHT, 2 = FULL.
+inline Pattern LeftOuterJoin(Pattern left = Any(), Pattern right = Any(),
+                             std::string capture = {}) {
+  PayloadConstraint payload;
+  payload.outer_join_type = 0;
+  return Pattern::Op(LogicalOperator::kOuterJoin,
+                     {std::move(left), std::move(right)}, std::move(capture),
+                     payload);
+}
+inline Pattern RightOuterJoin(Pattern left = Any(), Pattern right = Any(),
+                              std::string capture = {}) {
+  PayloadConstraint payload;
+  payload.outer_join_type = 1;
+  return Pattern::Op(LogicalOperator::kOuterJoin,
+                     {std::move(left), std::move(right)}, std::move(capture),
+                     payload);
+}
+inline Pattern FullOuterJoin(Pattern left = Any(), Pattern right = Any(),
+                             std::string capture = {}) {
+  PayloadConstraint payload;
+  payload.outer_join_type = 2;
+  return Pattern::Op(LogicalOperator::kOuterJoin,
+                     {std::move(left), std::move(right)}, std::move(capture),
+                     payload);
 }
 inline Pattern CrossJoin(Pattern left = Any(), Pattern right = Any(),
                          std::string capture = {}) {
@@ -709,6 +756,10 @@ class SearchEngine {
       : memo_(std::move(memo)), rules_(&rules) {}
 
   void Explore(GroupId root);
+  // Caps logical rule applications during Explore (0 = unlimited). See
+  // OptimizerOptions::search_step_budget.
+  void SetStepBudget(size_t budget) { step_budget_ = budget; }
+  [[nodiscard]] bool BudgetExhausted() const { return budget_exhausted_; }
   [[nodiscard]] std::optional<BestPlan> Optimize(
       GroupId root, const PhysicalProperties& properties,
       const Implement& implement, const RuleContext& context);
@@ -723,6 +774,12 @@ class SearchEngine {
 
   [[nodiscard]] const Memo& GetMemo() const { return memo_; }
   [[nodiscard]] Memo& GetMemo() { return memo_; }
+  // Names of logical rules that added at least one memo alternative during
+  // exploration (EXPLAIN / dump_memo diagnostics).
+  [[nodiscard]] const std::unordered_set<std::string>& AppliedRuleNames()
+      const {
+    return applied_rules_;
+  }
 
   // D2: per-operator derivation of child requirements. Only operators that
   // preserve row position or ordering forward those requirements; joins and
@@ -740,6 +797,10 @@ class SearchEngine {
   const RuleSet* rules_;
   std::unordered_map<GroupId, size_t> next_expression_;
   std::unordered_map<std::string, std::optional<BestPlan>> best_;
+  std::unordered_set<std::string> applied_rules_;
+  size_t step_budget_{0};
+  size_t steps_{0};
+  bool budget_exhausted_{false};
 };
 
 bool IsStrictOnRelations(const Expression& expr,

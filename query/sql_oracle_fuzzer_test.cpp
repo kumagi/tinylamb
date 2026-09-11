@@ -47,6 +47,8 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int tlp_ran = 0;
   int tlp_agg_ran = 0;
+  int unionall_ran = 0;
+  int subq_ran = 0;
   int norec_ran = 0;
   int pqs_ran = 0;
   int idx_ran = 0;
@@ -60,6 +62,8 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
     ASSERT_EQ(report, "") << true << (seed != 0U) << true << report;
     tlp_ran += stats.tlp_ran ? 1 : 0;
     tlp_agg_ran += stats.tlp_agg_ran ? 1 : 0;
+    unionall_ran += stats.unionall_ran ? 1 : 0;
+    subq_ran += stats.subq_ran ? 1 : 0;
     norec_ran += stats.norec_ran ? 1 : 0;
     pqs_ran += stats.pqs_ran ? 1 : 0;
     idx_ran += stats.idx_ran ? 1 : 0;

@@ -32,7 +32,17 @@ FullScan::FullScan(Transaction& txn, const Table& table, size_t max_rows)
     : table_(&table), iter_(table_->BeginFullScan(txn)), max_rows_(max_rows) {}
 
 bool FullScan::Next(Row* dst, RowPosition* rp) {
-  if (!iter_.IsValid() || emitted_ >= max_rows_) {
+  if (emitted_ >= max_rows_) {
+    return false;
+  }
+  if (!iter_.IsValid()) {
+    // Iterator contract (table/iterator_base.hpp): a scan that stops early
+    // latches the failure in GetStatus(). Treating it as plain exhaustion
+    // would serve a truncated result set as a success.
+    const Status status = iter_.GetStatus();
+    if (status != Status::kSuccess) {
+      return FailWith(status);
+    }
     return false;
   }
   *dst = *iter_;
@@ -53,6 +63,14 @@ size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
     destination->Append(*iter_, iter_.Position());
     ++iter_;
     ++emitted_;
+  }
+  if (!iter_.IsValid() && destination->Size() < batch_limit) {
+    // See FullScan::Next: a mid-scan iterator failure is not EOF.
+    const Status status = iter_.GetStatus();
+    if (status != Status::kSuccess) {
+      FailWith(status);
+      return 0;
+    }
   }
   return destination->Size();
 }

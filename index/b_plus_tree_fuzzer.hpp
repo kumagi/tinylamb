@@ -44,15 +44,16 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::string db_name = RandomString();
   std::string log_name = db_name + ".log";
-  PageManager page_manager(db_name + ".db", 20);
-  Logger logger(log_name);
+  auto page_manager = PageManager::Create(db_name + ".db", 20).MoveValue();
+  auto logger = Logger::Create(log_name).MoveValue();
   LockManager lm;
-  RecoveryManager rm(log_name, page_manager.GetPool());
-  TransactionManager tm(&page_manager, &logger, &rm);
+  RecoveryManager rm(log_name, page_manager->GetPool());
+  TransactionManager tm(page_manager.get(), logger.get(), &rm);
   page_id_t root;
   {
     auto txn = tm.Begin();
-    PageRef page = page_manager.AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page =
+        page_manager->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
     root = page->PageID();
     assert(txn.PreCommit() == Status::kSuccess);
   }
@@ -71,7 +72,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         if (bpt.Insert(txn, key, value) == Status::kSuccess) {
           kvp[key] = value;
         }
-        assert(bpt.SanityCheckForTest(&page_manager));
+        assert(bpt.SanityCheckForTest(page_manager.get()));
         break;
       }
       case 1: {  // Delete
@@ -82,7 +83,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         if (bpt.Delete(txn, key) == Status::kSuccess) {
           kvp.erase(key);
         }
-        assert(bpt.SanityCheckForTest(&page_manager));
+        assert(bpt.SanityCheckForTest(page_manager.get()));
         break;
       }
       case 2: {  // Read a key from the model.

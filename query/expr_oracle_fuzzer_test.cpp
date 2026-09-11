@@ -176,6 +176,46 @@ TEST(ExprOracleFuzzer, ReplayPinnedInNullDivisionThrowRegression) {
   EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
 }
 
+// Oracle-found regression pin: a COALESCE/NULLIF tower whose eager NULLIF
+// arguments raise `cannot cast NaN/Inf float to int` must keep raising after
+// the rewriter folds CASE/IN constants; folding may not drop the throw.
+TEST(ExprOracleFuzzer, ReplayPinnedNullifCoalesceThrowRegression) {
+  static const char* kTrace =
+      "-- tinylamb-expr-oracle-test v1\n"
+      "-- seed: 1638323354274135657\n"
+      "-- sql: SELECT ((CAST(((CAST(((0 * 9223372036854775807) + "
+      "1803856200320681) AS FLOAT64)) * (-2959661964383290 - (CASE WHEN 0 "
+      "THEN CAST(NULL AS INT64) WHEN 0 THEN CAST(NULL AS INT64) END))) AS "
+      "INT64)) > (CAST(COALESCE(NULLIF((CAST((-1939353828762478 + "
+      "-CAST('Infinity' AS FLOAT64)) AS INT64)), (CAST((-CAST('Infinity' AS "
+      "FLOAT64) - -3425790469862174) AS INT64))), (CASE WHEN CAST(NULL AS "
+      "BOOL) THEN (CAST(-CAST('Infinity' AS FLOAT64) AS INT64)) END), (CASE "
+      "WHEN (CAST(NULL AS INT64) IN (905452120508842, 427095843553405, "
+      "3023283314291129)) THEN MOD(3847358689358039, 1) END)) AS FLOAT64)));\n"
+      "-- sexpr: (gt (cast-int (mul (cast-float (add (mul (i 0) (i "
+      "9223372036854775807)) (i 1803856200320681))) (sub (i -2959661964383290)"
+      " (case ((b false) (n int)) ((b false) (n int)) (n int))))) (cast-float "
+      "(coalesce (nullif (cast-int (add (i -1939353828762478) (f -inf))) "
+      "(cast-int (sub (f -inf) (i -3425790469862174)))) (case ((n bool) "
+      "(cast-int (f -inf))) (n int)) (case ((in (n int) (i 905452120508842) "
+      "(i 427095843553405) (i 3023283314291129)) (mod (i 3847358689358039) "
+      "(i 1))) (n int)))))\n"
+      "-- reference: THROW(cannot cast NaN/Inf float to int)\n"
+      "-- actual: REWRITE-MISMATCH shrunk=(CAST((CAST(((0 * "
+      "9223372036854775807) + 1803856200320681) AS FLOAT64) * "
+      "(-2959661964383290 - CASE WHEN 0 THEN NULL WHEN 0 THEN NULL END)) AS "
+      "INT64) > CAST(coalesce(nullif(CAST((-1939353828762478 + -inf) AS "
+      "INT64), CAST((-inf - -3425790469862174) AS INT64)), CASE WHEN NULL "
+      "THEN CAST(-inf AS INT64) END, CASE WHEN NULL IN (905452120508842, "
+      "427095843553405, 3023283314291129) THEN (3847358689358039 % 1) END) AS "
+      "FLOAT64)) | engine=THROW(cannot cast NaN/Inf float to int)\n"
+      "-- engine_ran: true\n"
+      "-- failure: rewrite equivalence failed\n";
+  ExprOracleTrace trace;
+  ASSERT_TRUE(ParseExprOracleTest(kTrace, &trace));
+  EXPECT_EQ(ReplayExprOracleTrace(trace, false), "");
+}
+
 // Oracle-found regression pin (seed 0x83e4e3d5): contradiction_from_null_eq
 // folded `CAST(Inf AS INT64) >= ... = 0` chains that end in `x = NULL` to the
 // UNKNOWN constant, dropping the CAST(Inf) that the AST evaluates (and

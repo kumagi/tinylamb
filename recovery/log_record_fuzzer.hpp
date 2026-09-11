@@ -31,6 +31,12 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     std::istringstream stream(input);
     Decoder decoder(stream);
     decoder >> record;
+    // A failed stream covers malformed payloads AND unknown log types; the
+    // decoder deliberately leaves such a record undecodable, so serialize is
+    // off-limits (operator<< CHECK-fails on kUnknown by design).
+    if (decoder.Failed()) {
+      return;
+    }
   } catch (const std::exception&) {
     return;
   }

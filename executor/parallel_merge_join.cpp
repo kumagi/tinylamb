@@ -428,6 +428,14 @@ size_t ParallelMergeJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   }
   destination->Reset();
   EnsureMaterialized();
+  // PairPasses latches a failed residual as "no match", so the materialized
+  // output can hold rows that only LOOK like inner-join drops or anti-join
+  // matches. Next() surfaces the sticky error; the batched path must not
+  // serve those rows as a successful, silently wrong result.
+  if (residual_error_ != Status::kSuccess) {
+    FailWith(residual_error_);
+    return 0;
+  }
   if (output_offset_ >= output_.size()) {
     return 0;
   }

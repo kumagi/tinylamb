@@ -51,6 +51,9 @@ inline std::mt19937& SeededRandom() {
   return seeded_random;
 }
 
+// Resets the seeded engine to its canonical fixed seed (deterministic by
+// design, mirroring SeededRandom()).
+// NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp)
 inline void RandomStringInitialize() { SeededRandom() = std::mt19937(4); }
 
 inline std::string RandomString(size_t len = 16, bool use_random = true) {

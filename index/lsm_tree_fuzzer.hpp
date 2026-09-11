@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_LSM_TREE_FUZZER_HPP
 #define TINYLAMB_LSM_TREE_FUZZER_HPP
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -46,11 +47,11 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     std::filesystem::remove_all(base_path);
   }
   std::map<std::string, std::string> expected;
-  LSMTree tree(base_path);
+  auto tree = LSMTree::Create(base_path).MoveValue();
 
   auto Scan = [&]() {
     for (const auto& it : expected) {
-      if (!tree.Contains(it.first)) {
+      if (!tree->Contains(it.first).MoveValue()) {
         LOG(FATAL) << it.first << "not found";
         exit(1);
       }
@@ -66,7 +67,8 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         if (verbose) {
           LOG(TRACE) << "Insert: " << key << " => " << value;
         }
-        tree.Write(key, value, stream.Pick(1) == 0);
+        assert(tree->Write(key, value, stream.Pick(1) == 0) ==
+               Status::kSuccess);
         expected[key] = value;
         break;
       }
@@ -74,7 +76,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         if (verbose) {
           LOG(TRACE) << "Delete: " << key;
         }
-        tree.Delete(key, stream.Pick(1) == 0);
+        assert(tree->Delete(key, stream.Pick(1) == 0) == Status::kSuccess);
         expected.erase(key);
         break;
       }
@@ -84,33 +86,35 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
       }
     }
   }
-  tree.Sync();
+  assert(tree->Sync() == Status::kSuccess);
   Scan();
-  LSMView v = tree.GetView();
+  LSMView v = tree->GetView();
   if (verbose) {
     LOG(TRACE) << v;
-    LOG(WARN) << v.Begin();
+    LOG(WARN) << v.Begin().MoveValue();
   }
   auto expected_it = expected.begin();
-  for (auto actual_it = v.Begin(); actual_it.IsValid();
+  for (auto actual_it = v.Begin().MoveValue(); actual_it.IsValid();
        ++actual_it, ++expected_it) {
     if (expected_it == expected.end()) {
       // The view enumerated more entries than the model: stop instead of
       // dereferencing past the map's end.
-      LOG(ERROR) << "view yields more keys than the model: " << actual_it.Key();
+      LOG(ERROR) << "view yields more keys than the model: "
+                 << actual_it.Key().MoveValue();
       exit(1);
     }
-    if (actual_it.Key() != expected_it->first) {
-      LOG(ERROR) << actual_it.Key() << " != " << expected_it->first;
+    if (actual_it.Key().MoveValue() != expected_it->first) {
+      LOG(ERROR) << actual_it.Key().MoveValue() << " != " << expected_it->first;
       exit(1);
     }
-    if (actual_it.Value() != expected_it->second) {
-      LOG(ERROR) << actual_it.Key() << " -- " << actual_it.Value()
+    if (actual_it.Value().MoveValue() != expected_it->second) {
+      LOG(ERROR) << actual_it.Key().MoveValue() << " -- "
+                 << actual_it.Value().MoveValue()
                  << " != " << expected_it->second;
       exit(1);
     }
-    if (!tree.Contains(actual_it.Key())) {
-      LOG(ERROR) << actual_it.Key() << " not found";
+    if (!tree->Contains(actual_it.Key().MoveValue()).MoveValue()) {
+      LOG(ERROR) << actual_it.Key().MoveValue() << " not found";
       exit(1);
     }
   }

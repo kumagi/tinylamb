@@ -35,6 +35,7 @@
 #include "executor/index_only_scan.hpp"
 #include "executor/index_scan.hpp"
 #include "executor/limit.hpp"
+#include "executor/materialize.hpp"
 #include "executor/max1_row.hpp"
 #include "executor/merge_append.hpp"
 #include "executor/merge_join.hpp"
@@ -68,6 +69,7 @@
 #include "plan/index_scan_plan.hpp"
 #include "plan/index_skip_scan_plan.hpp"
 #include "plan/limit_plan.hpp"
+#include "plan/materialize_plan.hpp"
 #include "plan/max1_row_plan.hpp"
 #include "plan/merge_join_plan.hpp"
 #include "plan/minmax_index_plan.hpp"
@@ -235,6 +237,11 @@ Executor SortDistinctPlan::EmitExecutor(TransactionContext& ctx) const {
 
 Executor Max1RowPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<Max1RowExecutor>(child_->EmitExecutor(ctx));
+}
+
+Executor MaterializePlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<MaterializeExecutor>(child_->EmitExecutor(ctx),
+                                               child_->GetSchema());
 }
 
 Executor MinMaxIndexPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -440,11 +447,22 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   if (left_cols_.empty() && right_cols_.empty()) {
     // A cross product filtered by the full join predicate is a nested-loop
     // join; lower it to the executor that evaluates the predicate per pair.
+    // LeftOuter carries the kind through so unmatched outer rows are
+    // null-padded by the executor; RIGHT is normalized to LEFT by the
+    // optimizer and FULL has hash/merge implementations.
     if (residual_note_ && !IsSemiJoinKind(kind_) && !IsAntiJoinKind(kind_)) {
+      if (kind_ != JoinKind::kInner && !IsLeftOuterJoinKind(kind_)) {
+        // Falling through to CrossJoin would silently DROP the residual and
+        // emit an unfiltered product; no current rule constructs this shape,
+        // so a residual with an unsupported kind is a planner bug. Fail
+        // loudly (programmer-error category) instead of returning wrong rows.
+        CHECK_MSG(false, "ProductPlan: residual predicate on unsupported "
+                         "join kind (expected INNER/LEFT OUTER)");
+      }
       return std::make_shared<NestedLoopJoin>(
           left_src_->EmitExecutor(ctx), left_src_->GetSchema(),
           right_src_->EmitExecutor(ctx), right_src_->GetSchema(),
-          residual_note_);
+          residual_note_, kind_);
     }
     // Cross Join
     return std::make_shared<CrossJoin>(left_src_->EmitExecutor(ctx),

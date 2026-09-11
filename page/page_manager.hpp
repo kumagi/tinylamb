@@ -43,6 +43,9 @@ class PageManager {
                                                        size_t capacity);
   PageManager(const PageManager&) = delete;
   PageManager& operator=(const PageManager&) = delete;
+  PageManager(PageManager&&) = delete;
+  PageManager& operator=(PageManager&&) = delete;
+  ~PageManager() = default;
 
   StatusOr<PageRef> GetPage(page_id_t page_id, bool shared = false);
 

@@ -2067,6 +2067,12 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
                           low_ops[j - 1]);
   }
 
+  // The recursive operand prepares above clobbered result_column_names_;
+  // restore the outer statement's labels.  PostgreSQL derives set-operation
+  // output names from the FIRST branch, and Execute() publishes this member
+  // in the QueryResult (pgwire RowDescription follows it).
+  result_column_names_ = output_names;
+
   Executor executor = std::make_shared<ConstantExecutor>(std::move(combined));
   if (!select.OrderBy().empty()) {
     std::vector<Column> columns;

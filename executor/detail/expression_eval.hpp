@@ -84,8 +84,8 @@ using DistinctValueSet =
 // where raw IEEE bit patterns would otherwise count NaNs as distinct.
 [[nodiscard]] Value CanonicalDistinctValue(const Value& value);
 
-// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): the layout
-// mirrors the per-stat switch structure for readability.
+// The layout mirrors the per-stat switch structure for readability.
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct AggregateAccumulator {
   explicit AggregateAccumulator(const AggregateExpression* aggregate);
 

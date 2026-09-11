@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_LSM_VIEW_FUZZER_HPP
 #define TINYLAMB_LSM_VIEW_FUZZER_HPP
 
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -44,7 +45,9 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   std::filesystem::path base = "lsm_view_fuzzer-" + RandomString(20, false);
   std::filesystem::create_directory(base);
   std::string blob_path = base / "blob.db";
-  BlobFile blob(blob_path, 1024 * 1024LLU, 1024LLU * 1024 * 1024 * 8);
+  auto blob =
+      BlobFile::Create(blob_path, 1024 * 1024LLU, 1024LLU * 1024 * 1024 * 8)
+          .MoveValue();
   std::vector<std::filesystem::path> index_files;
 
   const int files = static_cast<int>(stream.Pick(10)) + 2;
@@ -72,23 +75,29 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
       }
     }
     std::filesystem::path path = base / (std::to_string(file) + ".idx");
-    SortedRun::Construct(path, mem_value, blob, file);
+    assert(SortedRun::Construct(path, mem_value, *blob, file) ==
+           Status::kSuccess);
     index_files.emplace_back(path);
   }
-  blob.Flush();
+  assert(blob->Flush() == Status::kSuccess);
   if (verbose) {
     for (const auto& file : index_files) {
-      SortedRun run(file);
+      SortedRun run = SortedRun::Restore(file).MoveValue();
       LOG(DEBUG) << run;
     }
   }
 
-  LSMView view(blob, index_files);
-  auto iter = view.Begin();
+  std::vector<SortedRun> runs;
+  runs.reserve(index_files.size());
+  for (const auto& file : index_files) {
+    runs.push_back(SortedRun::Restore(file).MoveValue());
+  }
+  LSMView view(*blob, runs);
+  auto iter = view.Begin().MoveValue();
   auto expected_iter = expected.begin();
   while (iter.IsValid()) {
-    std::string key = iter.Key();
-    std::string value = iter.Value();
+    std::string key = iter.Key().MoveValue();
+    std::string value = iter.Value().MoveValue();
     if (expected_iter == expected.end()) {
       // The view enumerated more entries than the model: stop instead of
       // dereferencing past the map's end.

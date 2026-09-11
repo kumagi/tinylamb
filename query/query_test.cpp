@@ -775,6 +775,27 @@ TEST_F(QueryTest, SqlEngineUnionAllConcatenatesMultipleBranches) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, SetOperationKeepsFirstBranchColumnNames) {
+  // PRODUCTION BUG (fixed): the recursive operand prepares overwrote
+  // result_column_names_, so a set operation reported the LAST branch's
+  // labels; PostgreSQL derives set-operation output names from the FIRST
+  // branch and pgwire RowDescription follows this member.
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  StatusOr<Executor> prepared =
+      engine.Prepare(ctx,
+                     "SELECT 1 AS first_col UNION ALL "
+                     "SELECT 2 AS second_col UNION ALL "
+                     "SELECT 3 AS third_col;");
+  ASSERT_EQ(prepared.GetStatus(), Status::kSuccess) << engine.LastError();
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+  }
+  EXPECT_EQ(engine.ResultColumnNames(),
+            (std::vector<std::string>{"first_col"}));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, MixedSetOperationChainsHonorPerPairOperators) {
   // PRODUCTION BUG (fixed): the visitor derived ONE kind from the
   // SetOperation detail and applied it to every pair, so
@@ -1034,6 +1055,71 @@ TEST_F(QueryTest, DmlWhereBareBoolColumnOnlyTouchesTrueRows) {
       RunSql(ctx, *db_, "SELECT COUNT(*) FROM bb WHERE u = 9;");
   ASSERT_EQ(untouched.size(), 1U);
   EXPECT_EQ(untouched[0][0], Value(int64_t{0}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, ComparisonAgainstNullLiteralIsUnknownNotError) {
+  // `WHERE a > NULL` must evaluate to UNKNOWN for every row (zero rows).
+  // The Cascades range-extraction pass narrowed the scan envelope with
+  // Value::operator< (ExcShim) using the NULL literal as a bound, which
+  // made PLANNING abort with "Different type cannot be compared."
+  // (found by sql_oracle_fuzzer's TLP oracle partitioning on
+  // `(a > NULL) AND (a IN (-3))`).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE nl (a INT64, b INT64);");
+  RunSql(ctx, *db_, "INSERT INTO nl VALUES (1, 2), (NULL, 5), (7, 2);");
+  EXPECT_TRUE(RunSql(ctx, *db_, "SELECT a FROM nl WHERE a > NULL;").empty());
+  EXPECT_TRUE(RunSql(ctx, *db_, "SELECT a FROM nl WHERE NULL < a;").empty());
+  EXPECT_TRUE(RunSql(ctx, *db_, "SELECT a FROM nl WHERE a = NULL;").empty());
+  EXPECT_TRUE(RunSql(ctx, *db_, "SELECT a FROM nl WHERE a >= NULL;")
+                  .empty());  // LCOV_EXCL_LINE
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT COUNT(*) FROM nl WHERE a > 0;"),
+            (std::vector<Row>{Row({Value(int64_t{2})})}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT COUNT(*) FROM nl WHERE (a > NULL) AND (a > 0);"),
+            (std::vector<Row>{Row({Value(int64_t{0})})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, AndOfOrPredicatesKeepConjunctionInScanFilter) {
+  // CompileScanFilter decomposes each top-level OR conjunct into
+  // disjunctive branches; appending the branch lists of SEPARATE OR
+  // predicates evaluated the whole WHERE as one flat OR, accepting rows
+  // that satisfied only one of the two conjuncts (sql_oracle_fuzzer
+  // AGG-TLP oracle: `(s >= 'a' OR s != 'zz') AND (s = 'zz' OR s < 'a')`
+  // returned every p-true row on the relational fallback path).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE ao (a INT64, b INT64, s VARCHAR(8));");
+  RunSql(ctx, *db_,
+         "INSERT INTO ao VALUES (1, 3, 'zz'), (1, 4, 'a'), (2, 5, 'zz'), "
+         "(7, 7, 'a'), (3, 3, NULL);");
+  // (a IN {1,2}) AND (b IN {3,4}) as OR-of-equals: intersection, not union.
+  const std::vector<Row> joined =
+      RunSql(ctx, *db_,
+             "SELECT a, b FROM ao WHERE (a = 1 OR a = 2) AND (b = 3 OR b = 4) "
+             "ORDER BY a, b;");
+  ASSERT_EQ(joined.size(), 2U);
+  EXPECT_EQ(joined[0][0], Value(int64_t{1}));
+  EXPECT_EQ(joined[0][1], Value(int64_t{3}));
+  EXPECT_EQ(joined[1][0], Value(int64_t{1}));
+  EXPECT_EQ(joined[1][1], Value(int64_t{4}));
+  // The fuzzer shape: q is true only for s = 'zz' rows here, so the
+  // conjunction keeps exactly those; the flat-OR bug kept s = 'a' too.
+  const std::vector<Row> strings =
+      RunSql(ctx, *db_,
+             "SELECT a FROM ao WHERE (s >= 'a' OR s != 'zz') AND (s = 'zz' OR "
+             "s < 'a') ORDER BY a;");
+  ASSERT_EQ(strings.size(), 2U);
+  EXPECT_EQ(strings[0][0], Value(int64_t{1}));
+  EXPECT_EQ(strings[1][0], Value(int64_t{2}));
+  // Same filter under GROUP BY (the plan that surfaced the bug).
+  const std::vector<Row> grouped =
+      RunSql(ctx, *db_,
+             "SELECT a, COUNT(*) FROM ao WHERE (s >= 'a' OR s != 'zz') AND "
+             "(s = 'zz' OR s < 'a') GROUP BY a ORDER BY a;");
+  ASSERT_EQ(grouped.size(), 2U);
+  EXPECT_EQ(grouped[0][0], Value(int64_t{1}));
+  EXPECT_EQ(grouped[0][1], Value(int64_t{1}));
   ctx.txn_.Abort();
 }
 

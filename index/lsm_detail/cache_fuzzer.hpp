@@ -38,14 +38,16 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   std::filesystem::path blob_path =
       "cache_fuzzer-" + RandomString(20, false) + ".db";
   const size_t kMemoryPages = stream.Pick(1024) + 8;
-  BlobFile blob(blob_path, kMemoryPages * kCachePageSize, kFileSize);
+  auto blob =
+      BlobFile::Create(blob_path, kMemoryPages * kCachePageSize, kFileSize)
+          .MoveValue();
   std::string expected(kFileSize, '0');
   auto* expected_ptr = reinterpret_cast<uint64_t*>(expected.data());
   for (size_t i = 0; i < kFileSize / sizeof(uint64_t); ++i) {
     expected_ptr[i] = Generate(i);
   }
-  blob.Append(expected);
-  blob.Flush();
+  (void)blob->Append(expected);
+  assert(blob->Flush() == Status::kSuccess);
   if (verbose) {
     LOG(TRACE) << "Written " << kFileSize << " bytes";
   }
@@ -61,7 +63,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     if (verbose) {
       LOG(DEBUG) << "Read: [" << pos << " - " << pos + read_size << "]";
     }
-    std::string actual_piece = blob.ReadAt(pos, read_size);
+    std::string actual_piece = blob->ReadAt(pos, read_size).MoveValue();
     std::string expected_piece(&expected[pos], read_size);
     if (actual_piece != expected_piece) {
       LOG(FATAL) << "Miss match at " << pos << " size: " << read_size;

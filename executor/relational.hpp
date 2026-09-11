@@ -30,6 +30,10 @@ class RelationalExecutor : public ExecutorBase {
   RelationalExecutor(TransactionContext& context,
                      std::shared_ptr<const SelectStatement> statement);
   ~RelationalExecutor() override;
+  RelationalExecutor(const RelationalExecutor&) = delete;
+  RelationalExecutor& operator=(const RelationalExecutor&) = delete;
+  RelationalExecutor(RelationalExecutor&&) = delete;
+  RelationalExecutor& operator=(RelationalExecutor&&) = delete;
   bool Next(Row* destination, RowPosition* position) override;
   void Dump(std::ostream& output, int indent) const override;
   void Explain(std::ostream& output, int indent) const override;

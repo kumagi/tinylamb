@@ -43,6 +43,11 @@ struct OptimizerOptions {
   cascades::AccessMethod access_method{cascades::AccessMethod::kAny};
   // Phase 9 diagnostics: log the explored memo and the chosen plan.
   bool dump_memo{false};
+  // Exploration budget: maximum logical rule applications during Explore
+  // (0 = unlimited, still guarded by the worklist step cap). Exhaustion
+  // degrades gracefully: Explore stops adding alternatives and Optimize
+  // returns the best plan found so far.
+  size_t search_step_budget{0};
 
   [[nodiscard]] static const OptimizerOptions& Default() {
     static const OptimizerOptions options = [] {

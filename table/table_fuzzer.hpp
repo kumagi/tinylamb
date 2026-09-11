@@ -38,25 +38,25 @@ namespace tinylamb {
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::string db_name = RandomString();
-  Database db(db_name);
+  auto db = Database::Create(db_name).MoveValue();
 
   Schema schema("FuzzerTable", {Column("f_id", ValueType::kInt64,
                                        Constraint(Constraint::kIndex)),
                                 Column("name", ValueType::kVarChar),
                                 Column("double", ValueType::kDouble)});
   {
-    TransactionContext ctx = db.BeginContext();
-    db.CreateTable(ctx, schema);
-    db.CreateIndex(ctx, "FuzzerTable", {"num_idx", {0}});
-    db.CreateIndex(ctx, "FuzzerTable", {"str_idx", {1}});
+    TransactionContext ctx = db->BeginContext();
+    db->CreateTable(ctx, schema);
+    db->CreateIndex(ctx, "FuzzerTable", {"num_idx", {0}});
+    db->CreateIndex(ctx, "FuzzerTable", {"str_idx", {1}});
     assert(ctx.txn_.PreCommit() == Status::kSuccess);
   }
 
   std::unordered_map<RowPosition, Row> rows;
   constexpr size_t kMaxOps = 200;
   for (size_t i = 0; i < kMaxOps && stream.Remaining(); ++i) {
-    TransactionContext ctx = db.BeginContext();
-    ASSIGN_OR_CRASH(Table, table, db.GetTable(ctx, "FuzzerTable"));
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_CRASH(Table, table, db->GetTable(ctx, "FuzzerTable"));
     switch (stream.Pick(3)) {
       case 0: {  // Insert
         Row new_row({Value(static_cast<int64_t>(stream.Pick(1000))),
@@ -98,21 +98,21 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     }
     assert(ctx.txn_.PreCommit() == Status::kSuccess);
     if (stream.Pick(4) == 0) {
-      db.EmulateCrash();
-      Database recovered(db_name);
-      TransactionContext verify_ctx = recovered.BeginContext();
+      db->EmulateCrash();
+      auto recovered = Database::Create(db_name).MoveValue();
+      TransactionContext verify_ctx = recovered->BeginContext();
       ASSIGN_OR_CRASH(Table, verify_table,
-                      recovered.GetTable(verify_ctx, "FuzzerTable"));
+                      recovered->GetTable(verify_ctx, "FuzzerTable"));
       for (const auto& [rp, expected_row] : rows) {
         ASSIGN_OR_CRASH(Row, read_row, verify_table.Read(verify_ctx.txn_, rp));
         assert(expected_row == read_row);
       }
       assert(verify_ctx.txn_.PreCommit() == Status::kSuccess);
-      db.DeleteAll();
+      db->DeleteAll();
       return;
     }
   }
-  db.DeleteAll();
+  db->DeleteAll();
 }
 
 }  // namespace tinylamb

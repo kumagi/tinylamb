@@ -33,6 +33,11 @@
 namespace tinylamb {
 namespace {
 
+// Everything in this anonymous namespace is only reachable when the external
+// GoogleSQL parser is wired in; guard the definitions themselves so builds
+// without TINYLAMB_GOOGLESQL_EXECUTABLE stay warning-clean.
+#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(__unix__)
+
 constexpr size_t kParseCacheShards = 16;
 constexpr size_t kMaxCachedStatements = 1024;
 constexpr size_t kMaxCachedStatementsPerShard =
@@ -83,7 +88,6 @@ class BlockedSigPipe {
   sigset_t old_{};
 };
 
-#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(__unix__)
 GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   std::array<int, 2> input_pipe{};
   std::array<int, 2> output_pipe{};
@@ -174,6 +178,10 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
 
     if (output_open && (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
       std::array<char, 4096> buffer{};
+      // Blocking syscalls under the caller's parse-cache shard mutex are the
+      // documented per-shard miss serialization; every syscall here is
+      // poll-driven with a deadline, so the critical section stays bounded.
+      // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection)
       const ssize_t count = read(output_pipe[0], buffer.data(), buffer.size());
       if (count > 0) {
         output.append(buffer.data(), static_cast<size_t>(count));
@@ -664,7 +672,8 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
 
   return ParseRawSubprocess(current_sql);
 }
-#endif
+
+#endif  // TINYLAMB_GOOGLESQL_EXECUTABLE && defined(__unix__)
 
 }  // namespace
 
@@ -679,13 +688,15 @@ bool GoogleSqlFrontend::Available() {
 GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
 #if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(__unix__)
   // The parser is an external process. Sharded caches avoid a single global
-  // reader/writer lock on OLTP parse bursts; misses still serialize per shard
-  // so a burst of distinct statements does not exhaust the process limit.
+  // reader/writer lock on OLTP parse bursts; the shard lock is deliberately
+  // HELD across a cache-miss parse so a burst of distinct statements
+  // serializes per shard (at most kParseCacheShards concurrent parser
+  // processes) instead of forking one child per racing thread.
   const std::string cache_key(sql);
   ParseShard& shard = ShardFor(cache_key);
+  std::scoped_lock cache_lock(shard.mutex);
   const auto now = std::chrono::steady_clock::now();
   {
-    std::scoped_lock cache_lock(shard.mutex);
     const auto cached = shard.cache.find(cache_key);
     if (cached != shard.cache.end()) {
       return {.ok = true, .ast = cached->second, .error = {}};
@@ -702,30 +713,23 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
   }
 
   GoogleSqlParseResult parsed = ParseViaSubprocess(sql);
-  {
-    std::scoped_lock cache_lock(shard.mutex);
-    if (parsed.ok) {
-      const auto cached = shard.cache.find(cache_key);
-      if (cached != shard.cache.end()) {
-        return {.ok = true, .ast = cached->second, .error = {}};
-      }
-      if (shard.cache.size() >= kMaxCachedStatementsPerShard) {
-        // unordered_map iteration order is unspecified, so this evicts an
-        // ARBITRARY entry, deliberately not the oldest: entries are equally
-        // likely to be re-parsed in OLTP bursts and a true LRU/FIFO list
-        // would add bookkeeping per lookup. Tests only require that the
-        // bound holds.
-        shard.cache.erase(shard.cache.begin());
-      }
-      shard.cache.emplace(cache_key, parsed.ast);
-      shard.negative_cache.erase(cache_key);
-    } else {
-      if (shard.negative_cache.size() >= kMaxCachedStatementsPerShard) {
-        shard.negative_cache.erase(shard.negative_cache.begin());
-      }
-      shard.negative_cache.insert_or_assign(cache_key,
-                                            std::chrono::steady_clock::now());
+  if (parsed.ok) {
+    if (shard.cache.size() >= kMaxCachedStatementsPerShard) {
+      // unordered_map iteration order is unspecified, so this evicts an
+      // ARBITRARY entry, deliberately not the oldest: entries are equally
+      // likely to be re-parsed in OLTP bursts and a true LRU/FIFO list
+      // would add bookkeeping per lookup. Tests only require that the
+      // bound holds.
+      shard.cache.erase(shard.cache.begin());
     }
+    shard.cache.emplace(cache_key, parsed.ast);
+    shard.negative_cache.erase(cache_key);
+  } else {
+    if (shard.negative_cache.size() >= kMaxCachedStatementsPerShard) {
+      shard.negative_cache.erase(shard.negative_cache.begin());
+    }
+    shard.negative_cache.insert_or_assign(cache_key,
+                                          std::chrono::steady_clock::now());
   }
   return parsed;
 #else

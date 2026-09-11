@@ -3148,6 +3148,213 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                   CombineConjuncts(right_rest)));
         }));
 
+    // canonicalize_boolean: x = TRUE -> x, x != FALSE -> x,
+    // x = FALSE -> NOT x, x != TRUE -> NOT x, for boolean-valued x only.
+    // AND / OR / NOT / IS-test / IN evaluate to TRUE/FALSE/NULL, so the
+    // comparison against a TRUE/FALSE constant is exactly x (or its
+    // complement); NULL propagates identically on both sides. Gated to
+    // boolean producers because `int_col = TRUE` follows non-boolean
+    // comparison semantics.
+    built.Add(ExpressionRule(
+        "canonicalize_boolean", Any(),
+        [](const Expression& expression,
+           const ExpressionBindings&) -> Expression {
+          if (!expression || expression->Type() != TypeTag::kBinaryExp) {
+            return Expression{};
+          }
+          const auto& binary = expression->AsBinaryExpression();
+          if (binary.Op() != BinaryOperation::kEquals &&
+              binary.Op() != BinaryOperation::kNotEquals) {
+            return Expression{};
+          }
+          const bool is_equals = binary.Op() == BinaryOperation::kEquals;
+          const Expression* boolean_side = nullptr;
+          const Expression* const_side = nullptr;
+          if (binary.Right()->Type() == TypeTag::kConstantValue) {
+            boolean_side = &binary.Left();
+            const_side = &binary.Right();
+          } else if (binary.Left()->Type() == TypeTag::kConstantValue) {
+            boolean_side = &binary.Right();
+            const_side = &binary.Left();
+          } else {
+            return Expression{};
+          }
+          const Value constant = (*const_side)->AsConstantValue().GetValue();
+          if (constant.IsNull() || constant.type != ValueType::kInt64 ||
+              (constant.value.int_value != 0 &&
+               constant.value.int_value != 1)) {
+            // TRUE/FALSE surface as 1/0; any other constant (including 2,
+            // which a boolean never equals) keeps its comparison semantics.
+            return Expression{};
+          }
+          if (!*boolean_side) {
+            return Expression{};
+          }
+          bool boolean_valued = false;
+          switch ((*boolean_side)->Type()) {
+            case TypeTag::kBinaryExp: {
+              const auto op = (*boolean_side)->AsBinaryExpression().Op();
+              boolean_valued = op == BinaryOperation::kAnd ||
+                               op == BinaryOperation::kOr ||
+                               op == BinaryOperation::kEquals ||
+                               op == BinaryOperation::kNotEquals ||
+                               op == BinaryOperation::kLessThan ||
+                               op == BinaryOperation::kLessThanEquals ||
+                               op == BinaryOperation::kGreaterThan ||
+                               op == BinaryOperation::kGreaterThanEquals;
+              break;
+            }
+            case TypeTag::kUnaryExp: {
+              const auto op = (*boolean_side)->AsUnaryExpression().Op();
+              boolean_valued = op == UnaryOperation::kNot ||
+                               op == UnaryOperation::kIsNull ||
+                               op == UnaryOperation::kIsNotNull ||
+                               op == UnaryOperation::kIsTrue ||
+                               op == UnaryOperation::kIsNotTrue ||
+                               op == UnaryOperation::kIsFalse ||
+                               op == UnaryOperation::kIsNotFalse;
+              break;
+            }
+            case TypeTag::kInExp:
+              boolean_valued = true;
+              break;
+            default:
+              break;
+          }
+          if (!boolean_valued) {
+            return Expression{};
+          }
+          const bool const_true = constant.value.int_value == 1;
+          // = TRUE / != FALSE keep x; = FALSE / != TRUE complement it.
+          const bool keep = (is_equals == const_true);
+          if (keep) {
+            return *boolean_side;
+          }
+          return UnaryExpressionExp(*boolean_side, UnaryOperation::kNot);
+        }));
+
+    // distribute_or_over_and_budgeted: (x AND y) OR z ->
+    // (x OR z) AND (y OR z), capped so the cross product cannot explode.
+    // Holds in Kleene three-valued logic, and the rewriter's fixpoint turns
+    // the capped one-step distribution into a budgeted CNF conversion: small
+    // predicates normalize (unlocking sargable ConjunctInfo splits and index
+    // range extraction) while large ones are left factored. Only one side
+    // may be a conjunction (which also bounds growth); the dual AND-over-OR
+    // direction is deliberately absent: it oscillates with
+    // factor_or_common_and / boolean_filter_pullup (each undoes the other
+    // past the pass cap) and rewrites the shape pinned by
+    // ComplementaryAbsorptionDisabled.
+    built.Add(ExpressionRule(
+        "distribute_or_over_and_budgeted",
+        Binary(BinaryOperation::kOr, Any("left"), Any("right")),
+        [](const Expression& expression,
+           const ExpressionBindings&) -> Expression {
+          if (expression->Type() != TypeTag::kBinaryExp ||
+              expression->AsBinaryExpression().Op() != BinaryOperation::kOr) {
+            return Expression{};
+          }
+          const auto& binary = expression->AsBinaryExpression();
+          const std::vector<Expression> left = SplitConjuncts(binary.Left());
+          const std::vector<Expression> right = SplitConjuncts(binary.Right());
+          const std::vector<Expression>* and_side = nullptr;
+          const Expression* other = nullptr;
+          if (left.size() > 1 && right.size() == 1) {
+            and_side = &left;
+            other = &binary.Right();
+          } else if (right.size() > 1 && left.size() == 1) {
+            and_side = &right;
+            other = &binary.Left();
+          } else {
+            return Expression{};
+          }
+          if (and_side->size() > 4) {
+            return Expression{};
+          }
+          std::vector<Expression> distributed;
+          distributed.reserve(and_side->size());
+          for (const Expression& conjunct : *and_side) {
+            distributed.push_back(
+                BinaryExpressionExp(conjunct, BinaryOperation::kOr, *other));
+          }
+          return CombineConjuncts(distributed);
+        }));
+
+    // pow_identities: pow(x, 1) -> CAST(x AS FLOAT64). Only the exponent-1
+    // form is rewritten, and it must (a) preserve the declared DOUBLE result
+    // type -- replacing a kDouble call with a raw kInt64 column changed
+    // `pow(int_col, 1) / 2` from floating to integer division -- and (b)
+    // keep NULL propagation, which the CAST does for free. pow(x, 0) is
+    // deliberately NOT folded to 1: the evaluator returns NULL when any
+    // argument is NULL, so folding would answer 1 for a NULL base.
+    built.Add(ExpressionRule(
+        "pow_identities", Any(),
+        [](const Expression& expression,
+           const ExpressionBindings&) -> Expression {
+          if (!expression || expression->Type() != TypeTag::kFunctionCallExp) {
+            return Expression{};
+          }
+          const auto& fn = expression->AsFunctionCallExpression();
+          if ((fn.FuncName() != "pow" && fn.FuncName() != "power") ||
+              fn.Args().size() != 2 || !fn.Args()[0] || !fn.Args()[1] ||
+              fn.Args()[1]->Type() != TypeTag::kConstantValue) {
+            return Expression{};
+          }
+          const Value exponent = fn.Args()[1]->AsConstantValue().GetValue();
+          if (exponent.IsNull()) {
+            return Expression{};
+          }
+          bool is_one = false;
+          if (exponent.type == ValueType::kInt64) {
+            is_one = exponent.value.int_value == 1;
+          } else if (exponent.type == ValueType::kDouble) {
+            is_one = exponent.value.double_value == 1.0;
+          }
+          if (is_one) {
+            return CastExpressionExp(fn.Args()[0], "FLOAT64");
+          }
+          return Expression{};
+        }));
+
+    // bit_and_or_identities: x & x -> x, x | x -> x (idempotence),
+    // x & -1 -> x (two's-complement identity). Gated to INT64 constants:
+    // -1 is all-ones only for the 64-bit domain. The x | -1 -> -1
+    // absorption form is deliberately NOT rewritten: `x | -1` still
+    // propagates a NULL from x, while the folded constant would erase it.
+    built.Add(ExpressionRule(
+        "bit_and_or_identities", Any(),
+        [](const Expression& expression,
+           const ExpressionBindings&) -> Expression {
+          if (!expression || expression->Type() != TypeTag::kFunctionCallExp) {
+            return Expression{};
+          }
+          const auto& fn = expression->AsFunctionCallExpression();
+          if ((fn.FuncName() != "__bit_and" && fn.FuncName() != "__bit_or") ||
+              fn.Args().size() != 2 || !fn.Args()[0] || !fn.Args()[1]) {
+            return Expression{};
+          }
+          const bool is_and = fn.FuncName() == "__bit_and";
+          if (Same(fn.Args()[0], fn.Args()[1])) {
+            return fn.Args()[0];
+          }
+          if (!is_and) {
+            return Expression{};
+          }
+          for (size_t constant_side = 0; constant_side < 2; ++constant_side) {
+            const Expression& constant = fn.Args()[constant_side];
+            if (!constant || constant->Type() != TypeTag::kConstantValue) {
+              continue;
+            }
+            const Value value = constant->AsConstantValue().GetValue();
+            if (value.IsNull() || value.type != ValueType::kInt64) {
+              continue;
+            }
+            if (value.value.int_value == -1) {
+              return fn.Args()[1 - constant_side];
+            }
+          }
+          return Expression{};
+        }));
+
     return built;
   }();
   return rules;

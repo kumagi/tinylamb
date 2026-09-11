@@ -48,19 +48,20 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   std::string filename = RandomString(16) + "-fuzzer.log";
   std::remove(filename.c_str());
   std::vector<std::string> written;
+  std::unique_ptr<Logger> logger =
+      Logger::Create(filename, kBufferSize, 1).MoveValue();
   {
-    Logger logger(filename, kBufferSize, 1);
     lsn_t total = 0;
     for (size_t i = 0; i < kMaxLogs && stream.Remaining(); ++i) {
       std::string log_data(stream.Bytes(stream.Pick(256)));
-      logger.AddLog(log_data);
+      logger->AddLog(log_data);
       if (verbose) {
         LOG(TRACE) << log_data;
       }
       total += log_data.size();
       written.emplace_back(log_data);
     }
-    while (logger.CommittedLSN() < total) {
+    while (logger->CommittedLSN() < total) {
     }
   }
 

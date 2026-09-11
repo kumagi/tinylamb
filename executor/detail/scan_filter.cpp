@@ -325,6 +325,10 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
 // Splits conjuncts and tries to compile each as SimpleCompare.
 namespace {
 
+// Ceiling for the AND-of-OR cross product; beyond this the OR conjunct is
+// evaluated as an ordinary residual instead of multiplying branch count.
+constexpr size_t kMaxDisjunctiveBranches = 32;
+
 CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
     const Expression& and_expr, const Schema& schema) {
   CompiledScanFilter::DisjunctiveBranch branch;
@@ -344,6 +348,11 @@ CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
 CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
                                      const Schema& schema) {
   CompiledScanFilter compiled;
+  // Accumulated AND-of-OR state: every OR predicate contributes its own
+  // branch list, and the conjunction across predicates is the cross
+  // product (AND) of the lists -- NOT a concatenation (OR), which would
+  // silently accept rows matching only one of several OR conjuncts.
+  std::vector<CompiledScanFilter::DisjunctiveBranch> branches;
   for (const Expression& predicate : predicates) {
     if (!predicate) {
       continue;
@@ -358,18 +367,39 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
       std::vector<Expression> disjuncts = SplitDisjuncts(predicate);
       if (disjuncts.size() >= 2 && !ContainsQuery(predicate)) {
         bool all_branches_usable = true;
-        std::vector<CompiledScanFilter::DisjunctiveBranch> branches;
+        std::vector<CompiledScanFilter::DisjunctiveBranch> new_branches;
         for (const Expression& disjunct : disjuncts) {
           auto branch = CompileAndBranch(disjunct, schema);
           if (branch.simple.empty()) {
             all_branches_usable = false;
             break;
           }
-          branches.push_back(std::move(branch));
+          new_branches.push_back(std::move(branch));
         }
-        if (all_branches_usable) {
-          for (auto& b : branches) {
-            compiled.disjunctive_branches.push_back(std::move(b));
+        // Cross-product size guard: keep the branch list bounded and push
+        // the predicate into the ordinary residual when it would explode.
+        const bool too_wide =
+            !branches.empty() &&
+            branches.size() * new_branches.size() > kMaxDisjunctiveBranches;
+        if (all_branches_usable && !too_wide) {
+          if (branches.empty()) {
+            branches = std::move(new_branches);
+          } else {
+            std::vector<CompiledScanFilter::DisjunctiveBranch> crossed;
+            for (const auto& left : branches) {
+              for (const auto& right : new_branches) {
+                CompiledScanFilter::DisjunctiveBranch merged;
+                merged.simple = left.simple;
+                merged.simple.insert(merged.simple.end(), right.simple.begin(),
+                                     right.simple.end());
+                merged.residual = left.residual;
+                merged.residual.insert(merged.residual.end(),
+                                       right.residual.begin(),
+                                       right.residual.end());
+                crossed.push_back(std::move(merged));
+              }
+            }
+            branches = std::move(crossed);
           }
           continue;
         }
@@ -381,6 +411,7 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
       compiled.residual.push_back(predicate);
     }
   }
+  compiled.disjunctive_branches = std::move(branches);
   // Pre-compute unsigned column info to avoid per-row schema iteration.
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
     if (schema.GetColumn(i).IsUnsigned()) {

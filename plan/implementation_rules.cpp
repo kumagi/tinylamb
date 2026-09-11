@@ -41,6 +41,7 @@
 #include "index_scan_plan.hpp"
 #include "index_skip_scan_plan.hpp"
 #include "limit_plan.hpp"
+#include "materialize_plan.hpp"
 #include "max1_row_plan.hpp"
 #include "merge_join_plan.hpp"
 #include "minmax_index_plan.hpp"
@@ -102,6 +103,15 @@ struct Range {
 
   void Update(BinaryOperation operation, const Value& value,
               Direction direction) {
+    // A comparison against a literal NULL constant evaluates to UNKNOWN for
+    // every row, so it proves nothing about the column's range: leave the
+    // envelope unconstrained (the Selection above the scan drops the rows).
+    // Without this guard the min/max narrowing below runs Value::operator<
+    // (ExcShim) with a NULL bound and planning aborts with
+    // "Different type cannot be compared." on e.g. `WHERE a > NULL`.
+    if (value.IsNull()) {
+      return;
+    }
     switch (operation) {
       case BinaryOperation::kEquals:
         min = max = value;
@@ -2029,13 +2039,24 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           // materializing sort plus the accumulator pass.
           const double sort_cost =
               rows <= 1.0 ? rows : (rows * std::log2(rows)) + rows;
-          return std::vector<PlanAlternative>{
+          std::vector<PlanAlternative> agg_alternatives{
               PlanAlternative{.plan = std::move(hash),
                               .local_cost = rows,
                               .estimated_rows = 1.0},
               PlanAlternative{.plan = std::move(sort),
                               .local_cost = sort_cost,
                               .estimated_rows = 1.0}};
+          // stream_aggregate_if_sorted: the streaming accumulator shares the
+          // scalar implementation and needs no hash table or sort, so it is
+          // offered as a third alternative at a single-pass cost. Scalar
+          // aggregation has exactly one group, which makes the stream shape
+          // valid over any input order.
+          Plan stream = std::make_shared<StreamAggregatePlan>(
+              children[0].plan, logical.target_list);
+          agg_alternatives.push_back(PlanAlternative{.plan = std::move(stream),
+                                                     .local_cost = rows,
+                                                     .estimated_rows = 1.0});
+          return agg_alternatives;
         },
         c::LogicalOperator::kAggregation));
     built.Add(c::ImplementationRule(
@@ -2101,7 +2122,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           }
           Plan topn = std::make_shared<TopNPlan>(
               children[0].plan, std::move(keys), logical.limit_count,
-              logical.limit_offset);
+              logical.limit_offset, logical.with_ties);
           const double rows = children[0].estimated_rows;
           return std::vector<PlanAlternative>{PlanAlternative{
               .plan = std::move(topn),
@@ -2639,6 +2660,136 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                               .estimated_rows = rows}};
         },
         c::LogicalOperator::kGenerateSeries));
+    // outer_nested_loop: LEFT OUTER join via block nested loop. Hash/merge
+    // cover equi-outer joins; this rule carries non-equi (and small) outer
+    // joins into cost-based planning instead of the heuristic fallback. The
+    // full predicate rides in the plan node (evaluated per pair) and the
+    // executor null-pads unmatched outer rows. RIGHT arrives normalized to
+    // LEFT (right_to_left_outer_join); FULL stays on hash/merge/fallback
+    // because the executor has no full-outer nested loop.
+    built.Add(c::ImplementationRule(
+        "outer_nested_loop", c::dsl::LeftOuterJoin(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position ||
+              logical.operation != c::LogicalOperator::kOuterJoin ||
+              logical.join_type != 0 || !logical.predicate ||
+              !*logical.predicate) {
+            return std::vector<PlanAlternative>{};
+          }
+          if ((*logical.predicate)->Type() == TypeTag::kConstantValue) {
+            const Value constant =
+                (*logical.predicate)->AsConstantValue().GetValue();
+            if (!constant.IsNull() && constant.Truthy()) {
+              // ON TRUE over an empty inner side must still pad; the plain
+              // cross shape cannot prove non-emptiness, so leave it out.
+              return std::vector<PlanAlternative>{};
+            }
+            if (constant.IsNull() ||
+                (!constant.IsNull() && !constant.Truthy())) {
+              // ON FALSE / NULL never matches: every outer row pads. That is
+              // a scan-wide projection, not a join worth nesting; the logical
+              // layer already short-circuits it.
+              return std::vector<PlanAlternative>{};
+            }
+          }
+          Plan join = std::make_shared<ProductPlan>(
+              children[0].plan, children[1].plan, LeftOuterJoinKind());
+          // The executor evaluates the full predicate while pairing and
+          // null-pads unmatched outer rows, so unlike the inner nested loop
+          // no Selection wrapper may be added: it would filter the padded
+          // rows back out (same reason JoinAlternatives refuses residuals
+          // for non-inner hash joins).
+          std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes(
+              {}, *logical.predicate);
+          const double estimate =
+              std::max(children[0].estimated_rows, children[1].estimated_rows);
+          const double local_cost =
+              children[0].estimated_rows * children[1].estimated_rows;
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(join),
+                              .local_cost = local_cost,
+                              .estimated_rows = estimate}};
+        },
+        c::LogicalOperator::kOuterJoin));
+    // exchange_noop: single-node distribution enforcement. kExchange /
+    // kGather / kBroadcast / kRedistribute exist for the distributed
+    // property model (PhysicalProperties::distribution); with one node every
+    // distribution is already satisfied, so the rule passes the child plan
+    // through at zero cost and keeps exchange shapes plannable.
+    const auto exchange_passthrough =
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children, const PhysicalProperties&,
+           const c::RuleContext&) {
+          if (children.size() != 1) {
+            return std::vector<PlanAlternative>{};
+          }
+          switch (logical.operation) {
+            case c::LogicalOperator::kExchange:
+            case c::LogicalOperator::kGather:
+            case c::LogicalOperator::kBroadcast:
+            case c::LogicalOperator::kRedistribute:
+              break;
+            default:
+              return std::vector<PlanAlternative>{};
+          }
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = children[0].plan,
+                              .local_cost = 0.0,
+                              .estimated_rows = children[0].estimated_rows}};
+        };
+    built.Add(c::ImplementationRule("exchange_noop", c::dsl::Exchange(),
+                                    exchange_passthrough,
+                                    c::LogicalOperator::kExchange));
+    built.Add(c::ImplementationRule("gather_noop", c::dsl::Gather(),
+                                    exchange_passthrough,
+                                    c::LogicalOperator::kGather));
+    built.Add(c::ImplementationRule("broadcast_noop", c::dsl::Broadcast(),
+                                    exchange_passthrough,
+                                    c::LogicalOperator::kBroadcast));
+    built.Add(c::ImplementationRule("redistribute_noop", c::dsl::Redistribute(),
+                                    exchange_passthrough,
+                                    c::LogicalOperator::kRedistribute));
+    // materialize / spool: cache the child for multi-pass consumers (CTE
+    // references read twice, recurring work-table scans). The executor
+    // replays rows in insertion order, so ordering and row counts pass
+    // through; the local cost is the single caching pass. Eager and lazy
+    // spools share the implementation (the executor materializes on first
+    // read) and stay separately addressable for hints.
+    const auto materialize_child =
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 1 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          switch (logical.operation) {
+            case c::LogicalOperator::kMaterialize:
+            case c::LogicalOperator::kEagerSpool:
+            case c::LogicalOperator::kLazySpool:
+              break;
+            default:
+              return std::vector<PlanAlternative>{};
+          }
+          Plan plan = std::make_shared<MaterializePlan>(children[0].plan);
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(plan),
+                              .local_cost = children[0].estimated_rows,
+                              .estimated_rows = children[0].estimated_rows}};
+        };
+    built.Add(c::ImplementationRule("materialize", c::dsl::Materialize(),
+                                    materialize_child,
+                                    c::LogicalOperator::kMaterialize));
+    built.Add(c::ImplementationRule("eager_spool", c::dsl::EagerSpool(),
+                                    materialize_child,
+                                    c::LogicalOperator::kEagerSpool));
+    built.Add(c::ImplementationRule("lazy_spool", c::dsl::LazySpool(),
+                                    materialize_child,
+                                    c::LogicalOperator::kLazySpool));
     return built;
   }();
   return rules;

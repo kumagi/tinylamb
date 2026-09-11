@@ -31,8 +31,8 @@
 #include "parser/token.hpp"
 #include "parser/tokenizer.hpp"
 #include "query/statement.hpp"
-#include "type/value_type.hpp"
 #include "type/type.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -443,8 +443,7 @@ TEST(ParserTest, CreateTableTypeAliases) {
 
 TEST(ParserTest, CreateTableWithUniqueTableConstraint) {
   // Arrange -- tokenize CREATE TABLE with a table-level UNIQUE constraint
-  Tokenizer tokenizer(
-      "CREATE TABLE t (a INT, b INT, UNIQUE (a, b));");
+  Tokenizer tokenizer("CREATE TABLE t (a INT, b INT, UNIQUE (a, b));");
   // Act -- parse into CreateTableStatement
   Parser parser(tokenizer.Tokenize());
   std::unique_ptr<Statement> stmt = parser.Parse();
@@ -475,8 +474,7 @@ TEST(ParserTest, InsertColumnListMustTerminateAtEof) {
   const std::string sql = "INSERT INTO users (id";
   // Act + Assert -- parsing must throw, not loop forever at end of input
   RunWithHangWatchdog([&sql] {
-    EXPECT_THROW(Parser(Tokenizer(sql).Tokenize()).Parse(),
-                 std::runtime_error);
+    EXPECT_THROW(Parser(Tokenizer(sql).Tokenize()).Parse(), std::runtime_error);
   });
 }
 
@@ -487,8 +485,7 @@ TEST(ParserTest, CreateTableColumnConstraintMustTerminateAtEof) {
   const std::string sql = "CREATE TABLE users (id INT";
   // Act + Assert -- parsing must throw, not loop forever at end of input
   RunWithHangWatchdog([&sql] {
-    EXPECT_THROW(Parser(Tokenizer(sql).Tokenize()).Parse(),
-                 std::runtime_error);
+    EXPECT_THROW(Parser(Tokenizer(sql).Tokenize()).Parse(), std::runtime_error);
   });
 }
 
@@ -499,8 +496,7 @@ TEST(ParserTest, CreateTableTableConstraintMustTerminateAtEof) {
   const std::string sql = "CREATE TABLE users (PRIMARY";
   // Act + Assert -- parsing must throw, not loop forever at end of input
   RunWithHangWatchdog([&sql] {
-    EXPECT_THROW(Parser(Tokenizer(sql).Tokenize()).Parse(),
-                 std::runtime_error);
+    EXPECT_THROW(Parser(Tokenizer(sql).Tokenize()).Parse(), std::runtime_error);
   });
 }
 
@@ -511,8 +507,7 @@ TEST(ParserTest, CreateTableNumericTypeMustTerminateAtEof) {
   const std::string sql = "CREATE TABLE users (score NUMERIC(";
   // Act + Assert -- parsing must throw, not loop forever at end of input
   RunWithHangWatchdog([&sql] {
-    EXPECT_THROW(Parser(Tokenizer(sql).Tokenize()).Parse(),
-                 std::runtime_error);
+    EXPECT_THROW(Parser(Tokenizer(sql).Tokenize()).Parse(), std::runtime_error);
   });
 }
 
@@ -615,8 +610,7 @@ TEST(ParserTest, TrailingTokenInWhereThrows) {
 
 TEST(ParserTest, UnterminatedInSubqueryThrows) {
   // Arrange -- IN (SELECT ...) without a closing parenthesis
-  Tokenizer tokenizer(
-      "SELECT * FROM users WHERE id IN (SELECT id FROM other");
+  Tokenizer tokenizer("SELECT * FROM users WHERE id IN (SELECT id FROM other");
   // Act + Assert -- the unterminated IN subquery is rejected
   EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
 }

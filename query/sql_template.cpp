@@ -862,6 +862,24 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
          std::isdigit(static_cast<unsigned char>(sql[i + 1])) != 0);
     if (number_start &&
         (i == 0 || !IsIdentChar(static_cast<unsigned char>(sql[i - 1])))) {
+      // Hex integer literal (0x1F): the AST visitor decodes it as a raw
+      // INT64 bit pattern, which a decimal-only re-scan would poison into a
+      // different bound value (0xFFFFFFFFFFFFFFFF -> parameter 0). Keep the
+      // statement out of the template cache so it always parses verbatim.
+      if (c == '0' && i + 1 < sql.size() &&
+          (sql[i + 1] == 'x' || sql[i + 1] == 'X')) {
+        size_t hex_end = i + 2;
+        while (hex_end < sql.size() &&
+               std::isxdigit(static_cast<unsigned char>(sql[hex_end])) != 0) {
+          ++hex_end;
+        }
+        if (hex_end > i + 2) {
+          result.templatable = false;
+          result.fingerprint.append(sql.substr(i, hex_end - i));
+          i = hex_end;
+          continue;
+        }
+      }
       const size_t begin = i;
       bool is_float = false;
       while (i < sql.size() &&

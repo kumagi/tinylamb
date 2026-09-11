@@ -2011,6 +2011,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   }
 
   cascades::SearchEngine search(std::move(memo), options.relational_rules);
+  search.SetStepBudget(options.search_step_budget);
   std::optional<cascades::BestPlan> best = search.Optimize(
       search_root, properties, *implementation_rules, rule_context);
   if (!best) {
@@ -2084,7 +2085,17 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   if (options.dump_memo) {
     std::ostringstream dump;
     search.GetMemo().Dump(dump);
-    dump << "chosen plan:\n" << *best->plan;
+    std::vector<std::string> applied(search.AppliedRuleNames().begin(),
+                                     search.AppliedRuleNames().end());
+    std::ranges::sort(applied);
+    dump << "applied rules:";
+    for (const std::string& name : applied) {
+      dump << ' ' << name;
+    }
+    if (search.BudgetExhausted()) {
+      dump << "\n[exploration budget exhausted: best-so-far plan]";
+    }
+    dump << "\nchosen plan:\n" << *best->plan;
     LOG(INFO) << "cascades memo:\n" << dump.str();
   }
   return best->plan;

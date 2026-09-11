@@ -48,14 +48,15 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
   std::string db_name = RandomString();
   std::string log_name = db_name + ".log";
   {
-    PageManager page_manager(db_name + ".db", 20);
-    Logger logger(log_name);
+    auto page_manager = PageManager::Create(db_name + ".db", 20).MoveValue();
+    auto logger = Logger::Create(log_name).MoveValue();
     LockManager lm;
-    RecoveryManager rm(log_name, page_manager.GetPool());
-    TransactionManager tm(&page_manager, &logger, &rm);
+    RecoveryManager rm(log_name, page_manager->GetPool());
+    TransactionManager tm(page_manager.get(), logger.get(), &rm);
     Transaction txn = tm.Begin();
     {
-      PageRef page = page_manager.AllocateNewPage(txn, PageType::kLeafPage);
+      PageRef page =
+          page_manager->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
       std::map<std::string, std::string> kvp;
       constexpr size_t kMaxOps = 300;
       for (size_t op = 0; op < kMaxOps && stream.Remaining(); ++op) {

@@ -35,6 +35,7 @@
 | # | 項目 | 保留理由と再開条件 |
 |---|---|---|
 | D-6 | **分散実行**(`distributed*.md`) | Raft、replication、network transport、snapshot/install、障害試験が未実装の新サブシステムで、小規模リファクタではない。分散化をロードマップに戻したとき、最初のスライスで `LogStorage` interface と単一ノード動作テストを追加 |
+| D-8 | **DML WHERE の非相関サブクエリ** | `DELETE/UPDATE ... WHERE u IN (SELECT ...)` は planning の range extraction が通らず "query expression requires relational evaluation" で Status 拒否(SELECT 側には `emit_relational()` フォールバックあり)。fuzzer は正しく skip 処理済み。再開条件: PrepareStatement の kDelete/kUpdate で非相関 IN/EXISTS/スカラーを事前評価して定数化(相関検出は外部名スキャン) |
 
 意味論・公開API・disk formatを理由に保留していた項目は残っていない。
 ユーザー判断により破壊的変更を許容してD-1〜D-5/D-7を消化済みで、継続保留は

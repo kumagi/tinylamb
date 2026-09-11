@@ -59,6 +59,11 @@ class ProductPlan final : public PlanBase {
               std::vector<ColumnName> right_cols,
               const TableStatistics& right_ts, Schema declared_output);
   ProductPlan(Plan left_src, Plan right_src);
+  // Cross / nested-loop shape with an explicit join kind. Inner lowers to a
+  // cross product (or NestedLoopJoin when a residual note is attached);
+  // LeftOuter lowers to a null-padding NestedLoopJoin. Other kinds are
+  // rejected by the factory.
+  ProductPlan(Plan left_src, Plan right_src, JoinKind kind);
   ProductPlan(const ProductPlan&) = delete;
   ProductPlan(ProductPlan&&) = delete;
   ProductPlan& operator=(const ProductPlan&) = delete;

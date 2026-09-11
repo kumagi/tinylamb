@@ -259,6 +259,20 @@ ProductPlan::ProductPlan(Plan left_src, Plan right_src)
       output_schema_(left_src_->GetSchema() + right_src_->GetSchema()),
       stats_(CrossJoinStats(left_src_->GetStats(), right_src_->GetStats())) {}
 
+ProductPlan::ProductPlan(Plan left_src, Plan right_src, JoinKind kind)
+    : left_src_(std::move(left_src)),
+      right_src_(std::move(right_src)),
+      right_tbl_(nullptr),
+      right_idx_(nullptr),
+      right_ts_(nullptr),
+      hash_mode_(HashJoinMode::kInMemory),
+      kind_(kind),
+      output_schema_(left_src_->GetSchema() + right_src_->GetSchema()),
+      stats_(IsOuter(kind)
+                 ? OuterJoinStats(left_src_->GetStats(), right_src_->GetStats())
+                 : CrossJoinStats(left_src_->GetStats(),
+                                  right_src_->GetStats())) {}
+
 // EmitExecutor lives in the relational factory
 // (executor/relational_factory.cpp).
 

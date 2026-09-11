@@ -51,7 +51,7 @@ class RowPageEnvironment {
     std::remove(log_name_.c_str());
     Recover();
     auto txn = tm_->Begin();
-    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
     page_id_ = page->PageID();
     txn.PreCommit();
   }
@@ -90,7 +90,7 @@ class Operation {
  public:
   explicit Operation(RowPageEnvironment* env)
       : env_(env),
-        page_(env_->p_->GetPage(env_->page_id_)),
+        page_(env_->p_->GetPage(env_->page_id_).MoveValue()),
         txn_(env_->tm_->Begin()) {}
 
   void StartTransaction() { txn_ = env_->tm_->Begin(); }
@@ -184,7 +184,7 @@ class Operation {
         page_.PageUnlock();
         txn_.Abort();
         StartTransaction();
-        page_ = env_->p_->GetPage(env_->page_id_);
+        page_ = env_->p_->GetPage(env_->page_id_).MoveValue();
         return 1;
       }
       case 6: {  // Crash
@@ -196,7 +196,7 @@ class Operation {
         page_.PageUnlock();
         env_->Recover();
         StartTransaction();
-        page_ = env_->p_->GetPage(env_->page_id_);
+        page_ = env_->p_->GetPage(env_->page_id_).MoveValue();
         return 1;
       }
       default:
