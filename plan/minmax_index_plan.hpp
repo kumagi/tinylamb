@@ -28,6 +28,7 @@ class MinMaxIndexPlan final : public PlanBase {
   [[nodiscard]] size_t AccessRowCount() const override { return 1; }
   [[nodiscard]] size_t EmitRowCount() const override { return 1; }
   [[nodiscard]] size_t ValueSlot() const { return value_slot_; }
+  [[nodiscard]] bool EnforcesDistinct() const override { return true; }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

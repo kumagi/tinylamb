@@ -65,7 +65,8 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
 
 bool MatchScanFilter(const Row& row, const Schema& schema,
                      const CompiledScanFilter& filter, const Scope* outer,
-                     TransactionContext& context, const CteMap& ctes);
+                     TransactionContext& context, const CteMap& ctes,
+                     Status* error = nullptr);
 
 std::vector<IntegerPeekCompare> BuildIntegerPeeks(
     const CompiledScanFilter& filter, const std::vector<slot_t>* projection,
@@ -78,7 +79,8 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                           bool filter_during_scan,
                           const CompiledScanFilter* scan_filter,
                           const Schema& result_schema, const Scope* outer,
-                          const CteMap& ctes, Relation* result);
+                          const CteMap& ctes, Relation* result,
+                          Status* error = nullptr);
 
 StatusOr<Relation> LoadSource(
     TransactionContext& context, const SelectSource& source, const Scope* outer,
@@ -98,9 +100,9 @@ bool ContainsQuery(const Expression& expression);
 std::optional<size_t> LocalColumnOffset(const Schema& schema,
                                         const ColumnName& name);
 
-void FilterRelation(TransactionContext& context, Relation* relation,
-                    const std::vector<Expression>& predicates,
-                    const Scope* outer, const CteMap& ctes);
+Status FilterRelation(TransactionContext& context, Relation* relation,
+                      const std::vector<Expression>& predicates,
+                      const Scope* outer, const CteMap& ctes);
 
 std::vector<Expression> SplitDisjuncts(const Expression& expression);
 

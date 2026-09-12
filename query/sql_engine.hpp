@@ -97,6 +97,13 @@ class SqlEngine {
   static void SetCompliancePrimaryKeyMode(bool enabled);
   [[nodiscard]] static bool CompliancePrimaryKeyMode();
 
+  void SetForceRelationalFallback(bool force) {
+    force_relational_fallback_ = force;
+  }
+  [[nodiscard]] bool ForceRelationalFallback() const {
+    return force_relational_fallback_;
+  }
+
  private:
   StatusOr<Executor> PrepareStatement(TransactionContext& ctx,
                                       std::unique_ptr<Statement> statement);
@@ -158,6 +165,7 @@ class SqlEngine {
   std::vector<std::string> result_column_names_;
   std::string plan_cache_fingerprint_;
   std::vector<Value> plan_cache_parameters_;
+  bool force_relational_fallback_{false};
 };
 
 }  // namespace tinylamb

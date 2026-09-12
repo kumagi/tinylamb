@@ -40,6 +40,7 @@ class SortDistinctPlan final : public PlanBase {
     return child_->IsOrderedBy(expressions, ascending, nulls_first);
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
+  [[nodiscard]] bool EnforcesDistinct() const override { return true; }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

@@ -62,6 +62,7 @@ void ColumnVector::Append(const Value& value) {
   const bool is_null = value.IsNull();
   if (!is_null && type_ == ValueType::kNull) {
     type_ = value.type;
+    unsigned_ = value.IsUnsigned();
     MaterializeInferredStorage();
   } else if (!is_null && type_ != value.type) {
     CHECK_MSG(false, "column vector type mismatch");
@@ -95,6 +96,7 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
   const bool is_null = source.IsNull(index);
   if (!is_null && type_ == ValueType::kNull) {
     type_ = source.type_;
+    unsigned_ = source.unsigned_;
     MaterializeInferredStorage();
   } else if (!is_null && source.type_ != type_) {
     CHECK_MSG(false, "column vector type mismatch");
@@ -126,6 +128,7 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
 
 void ColumnVector::Reset() {
   size_ = 0;
+  unsigned_ = false;
   null_bitmap_.clear();
   integers_.clear();
   doubles_.clear();
@@ -219,7 +222,8 @@ Value ColumnVector::ValueAt(size_t index) const {
   }
   switch (type_) {
     case ValueType::kInt64:
-      return Value(integers_[index]);
+      return unsigned_ ? Value(integers_[index]).WithUnsigned()
+                       : Value(integers_[index]);
     case ValueType::kDate:
       return Value::DateFromDays(integers_[index]);
     case ValueType::kDouble:
@@ -243,12 +247,19 @@ DataChunk::DataChunk(const std::vector<ValueType>& types, size_t capacity) {
 }
 
 void DataChunk::Initialize(const Schema& schema, size_t capacity) {
-  std::vector<ValueType> types;
-  types.reserve(schema.ColumnCount());
+  columns_.clear();
+  columns_.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-    types.push_back(schema.GetColumn(i).Type());
+    columns_.emplace_back(schema.GetColumn(i).Type(), capacity);
+    if (schema.GetColumn(i).IsUnsigned()) {
+      columns_.back().SetUnsigned(true);
+    }
   }
-  Initialize(types, capacity);
+  zone_maps_.clear();
+  zone_maps_.resize(schema.ColumnCount());
+  positions_.clear();
+  positions_.reserve(capacity);
+  size_ = 0;
 }
 
 void DataChunk::Initialize(const std::vector<ValueType>& types,
@@ -311,6 +322,11 @@ void DataChunk::EnsureLayout(const Row& row) {
       types.push_back(value.IsNull() ? ValueType::kNull : value.type);
     }
     Initialize(types);
+    for (size_t i = 0; i < row.values_.size(); ++i) {
+      if (row.values_[i].IsUnsigned()) {
+        columns_[i].SetUnsigned(true);
+      }
+    }
     return;
   }
   if (row.values_.size() != columns_.size()) {
@@ -352,6 +368,11 @@ void DataChunk::Append(const DataChunk& source, size_t row_index) {
       types.push_back(source.ColumnAt(i).Type());
     }
     Initialize(types);
+    for (size_t i = 0; i < source.ColumnCount(); ++i) {
+      if (source.ColumnAt(i).IsUnsigned()) {
+        columns_[i].SetUnsigned(true);
+      }
+    }
   }
   if (ColumnCount() != source.ColumnCount()) {
     CHECK_MSG(false, "data chunk width mismatch");
@@ -380,6 +401,11 @@ void DataChunk::AppendRowFromColumns(
       types.push_back(source->Type());
     }
     Initialize(types);
+    for (size_t i = 0; i < sources.size(); ++i) {
+      if (sources[i]->IsUnsigned()) {
+        columns_[i].SetUnsigned(true);
+      }
+    }
   }
   if (columns_.size() != sources.size()) {
     CHECK_MSG(false, "data chunk row width mismatch");
@@ -581,7 +607,8 @@ Value ColumnVector::AggregateBitAnd(const SelectionVector* sel) const {
   if (!has_non_null) {
     return {};
   }
-  return Value(static_cast<int64_t>(acc));
+  Value res_and(static_cast<int64_t>(acc));
+  return unsigned_ ? res_and.WithUnsigned() : res_and;
 }
 
 Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
@@ -632,7 +659,8 @@ Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
   if (!has_non_null) {
     return {};
   }
-  return Value(static_cast<int64_t>(acc));
+  Value res_or(static_cast<int64_t>(acc));
+  return unsigned_ ? res_or.WithUnsigned() : res_or;
 }
 
 Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
@@ -683,7 +711,8 @@ Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
   if (!has_non_null) {
     return {};
   }
-  return Value(static_cast<int64_t>(acc));
+  Value res_xor(static_cast<int64_t>(acc));
+  return unsigned_ ? res_xor.WithUnsigned() : res_xor;
 }
 
 Value DataChunk::AggregateLogicalAnd(size_t col_idx,

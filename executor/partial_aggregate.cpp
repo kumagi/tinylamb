@@ -572,7 +572,10 @@ void FinalizeAggregate::Materialize() {
         } else {
           double total = 0.0;
           if (s.sums[i].type == ValueType::kInt64) {
-            total = static_cast<double>(s.sums[i].value.int_value);
+            total = s.sums[i].IsUnsigned()
+                        ? static_cast<double>(
+                              static_cast<uint64_t>(s.sums[i].value.int_value))
+                        : static_cast<double>(s.sums[i].value.int_value);
           } else if (s.sums[i].type == ValueType::kDouble) {
             total = s.sums[i].value.double_value;
           }

@@ -61,6 +61,9 @@ class SelectionPlan final : public PlanBase {
       const std::vector<std::optional<bool>>& nulls_first) const override {
     return src_->IsOrderedBy(expressions, ascending, nulls_first);
   }
+  [[nodiscard]] bool EnforcesDistinct() const override {
+    return src_->EnforcesDistinct();
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

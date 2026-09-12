@@ -8,6 +8,8 @@
 #include <string>
 #include <string_view>
 
+#include "expression/expr_simplify_oracle.hpp"
+
 namespace tinylamb {
 
 // Expression-oracle fuzzing of scalar simplification and evaluation.
@@ -51,7 +53,8 @@ struct ExprOracleTrace {
 // the iteration was skipped because the engine rejected the SQL), otherwise
 // a diagnostic. `trace` always receives the executed case.
 std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
-                                   ExprOracleTrace* trace = nullptr);
+                                   ExprOracleTrace* trace = nullptr,
+                                   const ExprGenConfig& config = {});
 
 // Regenerates the expression from `trace.seed` and re-runs both oracles.
 // Returns "" when the recorded failure no longer reproduces (fixed) or when
@@ -112,7 +115,8 @@ struct RowExprOracleTrace {
 //       - Engine SQL execution: `SELECT id FROM t_fuzz WHERE <predicate_sql>
 //       ORDER BY id;` Must all return the identical set of row IDs.
 std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
-                                      RowExprOracleTrace* trace = nullptr);
+                                      RowExprOracleTrace* trace = nullptr,
+                                      const ExprGenConfig& config = {});
 
 std::string ReplayRowExprOracleTrace(const RowExprOracleTrace& trace,
                                      bool verbose = false);

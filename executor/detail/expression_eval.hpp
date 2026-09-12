@@ -141,6 +141,7 @@ struct AggregateAccumulator {
   // BIT_AND/OR/XOR fold state.
   mutable int64_t bit_acc_{0};
   mutable bool bit_saw_value_{false};
+  mutable bool bit_is_uint64_{false};
   // ARRAY_AGG DISTINCT: a repeated NULL collapses to one element.
   mutable bool array_saw_null_{false};
   // ARRAY_CONCAT_AGG declared element type (captured even for empty arrays).
@@ -174,6 +175,7 @@ struct AggregateAccumulator {
   struct SumWeight {
     Value value;
     long double sum = 0;
+    int64_t int_sum = 0;
     int64_t weights = 0;  // non-null weight count (0 => NULL sum)
     bool is_double = false;
   };

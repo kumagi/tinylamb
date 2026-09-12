@@ -40,6 +40,7 @@ enum class UnaryOperation : uint8_t {
   kIsNotFalse,
   kNot,
   kMinus,
+  kBitwiseNot,
 };
 
 enum class AggregationType : uint8_t {

@@ -87,6 +87,18 @@ Database::Database(std::string_view /*dbname*/,
       functions_(kDefaultFunctionRoot),
       storage_(std::move(storage)) {}
 
+uint64_t Database::CacheHits() const noexcept {
+  return storage_ && storage_->pm_ ? storage_->pm_->CacheHits() : 0;
+}
+
+uint64_t Database::CacheMisses() const noexcept {
+  return storage_ && storage_->pm_ ? storage_->pm_->CacheMisses() : 0;
+}
+
+size_t Database::PinnedPageCount() const noexcept {
+  return storage_ && storage_->pm_ ? storage_->pm_->PinnedPageCount() : 0;
+}
+
 std::ostream& operator<<(std::ostream& o, const Database& db) {
   o << "Database(storage=" << *db.storage_
     << ", catalogs=<BPlusTree; use DebugDump(txn, o) for details>)";
@@ -547,6 +559,12 @@ Status Database::RefreshStatistics(TransactionContext& ctx,
 void Database::EmulateCrash() { storage_->DiscardAllUpdates(); }
 
 void Database::DeleteAll() {
+  // The fuzzer harnesses call DeleteAll() mid-session and again from the
+  // ScopedDb destructor, so the storage must stay usable afterwards (no
+  // storage_.reset() here) and a second call must be a no-op.
+  if (storage_ == nullptr) {
+    return;
+  }
   EmulateCrash();
   std::ignore = std::remove(storage_->DBName().c_str());
   std::ignore = std::remove(storage_->LogName().c_str());

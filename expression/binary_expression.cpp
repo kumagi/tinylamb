@@ -222,9 +222,40 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
   // them ahead of the ordinary comparison NULL propagation below.
   if (op == BinaryOperation::kIsDistinctFrom ||
       op == BinaryOperation::kIsNotDistinctFrom) {
-    const bool equal = left.IsNull() || right.IsNull()
-                           ? left.IsNull() && right.IsNull()
-                           : left == right;
+    if (left.IsNull() || right.IsNull()) {
+      const bool equal = left.IsNull() && right.IsNull();
+      return Value(op == BinaryOperation::kIsNotDistinctFrom ? equal : !equal);
+    }
+    const auto is_nan = [](const Value& v) {
+      return v.type == ValueType::kDouble && std::isnan(v.value.double_value);
+    };
+    if (is_nan(left) || is_nan(right)) {
+      const bool equal = is_nan(left) && is_nan(right);
+      return Value(op == BinaryOperation::kIsNotDistinctFrom ? equal : !equal);
+    }
+    if (left.type == ValueType::kVarChar &&
+        right.type == ValueType::kVarChar &&
+        IsStructJson(left.value.varchar_value) &&
+        IsStructJson(right.value.varchar_value)) {
+      auto v1 = ExtractStructValues(left.value.varchar_value);
+      auto v2 = ExtractStructValues(right.value.varchar_value);
+      bool equal = false;
+      if (v1.empty() && v2.empty()) {
+        equal = true;
+      } else if (v1.size() == v2.size()) {
+        equal = true;
+        for (size_t i = 0; i < v1.size(); ++i) {
+          if (v1[i] != v2[i]) {
+            equal = false;
+            break;
+          }
+        }
+      }
+      return Value(op == BinaryOperation::kIsNotDistinctFrom ? equal : !equal);
+    }
+    ASSIGN_OR_RETURN(Value, eq_val,
+                     TryEvaluateBinary(BinaryOperation::kEquals, left, right));
+    const bool equal = !eq_val.IsNull() && eq_val.Truthy();
     return Value(op == BinaryOperation::kIsNotDistinctFrom ? equal : !equal);
   }
   if (op == BinaryOperation::kAnd) {
@@ -422,18 +453,20 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       return StatusError(StatusCode::kInvalidArgument,
                          "bitwise shift requires integer operands");
     }
+    const bool is_u = left.IsUnsigned() || right.IsUnsigned();
+    auto with_u = [&](Value v) { return is_u ? v.WithUnsigned() : v; };
     const int64_t amount = right.value.int_value;
     if (amount < 0) {
       return StatusError(StatusCode::kInvalidArgument,
                          "Bitwise shift by negative offset.");
     }
     if (amount >= 64) {
-      return Value(static_cast<int64_t>(0));
+      return with_u(Value(static_cast<int64_t>(0)));
     }
     const auto bits = static_cast<uint64_t>(left.value.int_value);
     const uint64_t shifted =
         op == BinaryOperation::kShiftLeft ? bits << amount : bits >> amount;
-    return Value(static_cast<int64_t>(shifted));
+    return with_u(Value(static_cast<int64_t>(shifted)));
   }
   // Collation-aware normalization: when either operand carries a
   // case-insensitive collator, both sides fold to lowercase.  GoogleSQL
@@ -518,11 +551,11 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         break;
     }
     if (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract ||
-        op == BinaryOperation::kMultiply) {
-      // NOTE: division/modulo are excluded from this unsigned fast path —
+        op == BinaryOperation::kMultiply || op == BinaryOperation::kModulo) {
+      // NOTE: division is excluded from this unsigned fast path —
       // every type contract (BinaryResultType) declares kDivide to produce a
       // DOUBLE, and returning a kInt64 value under a declared-kDouble result
-      // makes typed column appends abort.  They fall through to the double
+      // makes typed column appends abort.  It falls through to the double
       // path below.
       const auto lhs = static_cast<uint64_t>(left.value.int_value);
       const auto rhs = static_cast<uint64_t>(right.value.int_value);
@@ -556,6 +589,13 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
               signed_result = static_cast<int64_t>(lhs) * right.value.int_value;
             }
             break;
+          case BinaryOperation::kModulo:
+            if (right.value.int_value == 0) {
+              return StatusError(StatusCode::kIsInfinity, "modulo by zero");
+            }
+            fits_signed = true;
+            signed_result = static_cast<int64_t>(lhs) % right.value.int_value;
+            break;
           default:
             break;
         }
@@ -574,6 +614,12 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         case BinaryOperation::kMultiply:
           unsigned_result = lhs * rhs;
           break;
+        case BinaryOperation::kModulo:
+          if (rhs == 0) {
+            return StatusError(StatusCode::kIsInfinity, "modulo by zero");
+          }
+          unsigned_result = lhs % rhs;
+          break;
         default:
           break;
       }
@@ -581,12 +627,18 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
     }
   }
   if (op == BinaryOperation::kDivide && numeric) {
-    const double lhs = left.type == ValueType::kDouble
-                           ? left.value.double_value
-                           : static_cast<double>(left.value.int_value);
-    const double rhs = right.type == ValueType::kDouble
-                           ? right.value.double_value
-                           : static_cast<double>(right.value.int_value);
+    const double lhs =
+        left.type == ValueType::kDouble
+            ? left.value.double_value
+            : (left.IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                       left.value.int_value))
+                                 : static_cast<double>(left.value.int_value));
+    const double rhs =
+        right.type == ValueType::kDouble
+            ? right.value.double_value
+            : (right.IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                        right.value.int_value))
+                                  : static_cast<double>(right.value.int_value));
     if (rhs == 0.0) {
       return StatusError(StatusCode::kIsInfinity, "division by zero");
     }
@@ -597,12 +649,18 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
     return Value(result);
   }
   if (numeric && left.type != right.type) {
-    const double lhs = left.type == ValueType::kDouble
-                           ? left.value.double_value
-                           : static_cast<double>(left.value.int_value);
-    const double rhs = right.type == ValueType::kDouble
-                           ? right.value.double_value
-                           : static_cast<double>(right.value.int_value);
+    const double lhs =
+        left.type == ValueType::kDouble
+            ? left.value.double_value
+            : (left.IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                       left.value.int_value))
+                                 : static_cast<double>(left.value.int_value));
+    const double rhs =
+        right.type == ValueType::kDouble
+            ? right.value.double_value
+            : (right.IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
+                                        right.value.int_value))
+                                  : static_cast<double>(right.value.int_value));
     // IEEE unordered comparisons: any ordered comparison against NaN is
     // FALSE (never NULL), even NaN vs NaN (GoogleSQL BETWEEN semantics).
     const auto is_nan = [](const Value& v) {
@@ -824,14 +882,22 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         return Value(!equal.Truthy());
       }
       return Value(folded_left != folded_right);
-    case BinaryOperation::kLessThan:
-      return Value(folded_left < folded_right);
-    case BinaryOperation::kLessThanEquals:
-      return Value(folded_left <= folded_right);
-    case BinaryOperation::kGreaterThan:
-      return Value(folded_left > folded_right);
-    case BinaryOperation::kGreaterThanEquals:
-      return Value(folded_left >= folded_right);
+    case BinaryOperation::kLessThan: {
+      ASSIGN_OR_RETURN(bool, result, folded_left.TryLess(folded_right));
+      return Value(result);
+    }
+    case BinaryOperation::kLessThanEquals: {
+      ASSIGN_OR_RETURN(bool, result, folded_left.TryLess(folded_right));
+      return Value(result || folded_left == folded_right);
+    }
+    case BinaryOperation::kGreaterThan: {
+      ASSIGN_OR_RETURN(bool, result, folded_left.TryGreater(folded_right));
+      return Value(result);
+    }
+    case BinaryOperation::kGreaterThanEquals: {
+      ASSIGN_OR_RETURN(bool, result, folded_left.TryGreater(folded_right));
+      return Value(result || folded_left == folded_right);
+    }
     case BinaryOperation::kAnd:
     case BinaryOperation::kOr:
     case BinaryOperation::kXor:

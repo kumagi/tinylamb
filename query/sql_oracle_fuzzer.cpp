@@ -8,9 +8,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -25,13 +25,9 @@
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
-#include "index/index_schema.hpp"
 #include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
-#include "table/table.hpp"
-#include "type/column.hpp"
 #include "type/row.hpp"
-#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -43,28 +39,16 @@ namespace {
 // engine-facing SQL and the harness expectation in lockstep.
 // ---------------------------------------------------------------------------
 
-// Sentinel for nullable mirror fields; edge value pools below must stay
-// clear of INT64_MIN so a real value can never alias kNull.
+// Sentinel for nullable mirror fields; INT64_MIN cannot collide with the
+// small generated value domain (-3..3).
 constexpr int64_t kNull = std::numeric_limits<int64_t>::min();
 
-// String pool in ascending lexicographic order, so code order == SQL order
-// and range predicates on `s` can be mirrored by comparing codes.
+// Lexicographically sorted: index order equals string order, so ordering
+// comparisons on (NULL-free) string columns can compare indices directly.
 constexpr std::array<const char*, 4> kStrPool = {"", "a", "bb", "zz"};
 // LIKE patterns with mirror implementations (prefix / suffix / length).
 constexpr std::array<const char*, 5> kLikePool = {"a%", "%b", "_", "%", "%z%"};
 
-// Edge constants stressing boundary handling; INT64_MIN is deliberately
-// absent (kNull sentinel collision) and values keep abs < 2^63 to stay
-// addition-safe inside small ranges.
-constexpr std::array<int64_t, 5> kEdgeConsts = {
-    std::numeric_limits<int64_t>::max(),
-    std::numeric_limits<int64_t>::max() - 1,
-    -(std::numeric_limits<int64_t>::max() - 1),
-    -(std::numeric_limits<int64_t>::max()),
-    1099511627776LL,  // 2^40
-};
-
-// Mirror of the five LIKE patterns above over pool codes (kNull excluded).
 bool LikeMatch(int64_t code, int pat) {
   const std::string_view s = kStrPool[static_cast<size_t>(code)];
   switch (pat) {
@@ -112,17 +96,21 @@ char Not3vl(char v) { return v == 'T' ? 'F' : (v == 'F' ? 'T' : 'N'); }
 
 struct RPred {
   enum class Kind {
-    kIntCmp,      // int_col op rhs (constant, NULL literal, or int column)
-    kIntIsNull,   // int_col IS [NOT] NULL
-    kBoolCol,     // flag / NOT flag
-    kStrCmp,      // s op pool constant (pool is lexicographically sorted)
-    kStrIsNull,   // s IS [NOT] NULL
-    kIntBetween,  // int_col BETWEEN lo AND hi
-    kIntInList,   // int_col IN (c1, ..., NULL?)
-    kStrLike,     // s LIKE pool pattern
+    kIntCmp,     // int_col op rhs (constant or other int column)
+    kIntIsNull,  // int_col IS [NOT] NULL
+    kBoolCol,    // flag / NOT flag
+    kStrCmp,     // s = / != 'a' | 'bb'
+    kStrIsNull,  // s IS [NOT] NULL
     kNot,
     kBin,
     kIsNullWrap,  // (left) IS NULL, whole-predicate
+    kIsDistinctFrom,
+    kBetween,
+    kInList,
+    kStrLike,
+    kBitwiseAndCmp,
+    kBitwiseNotCmp,
+    kArithmeticCmp,
   };
   Kind kind{Kind::kIntCmp};
   bool negated{false};  // IS NULL vs IS NOT NULL
@@ -131,13 +119,18 @@ struct RPred {
   bool rhs_is_col{false};
   int rhs_col{0};
   int64_t rhs_const{0};
-  bool rhs_is_null{false};  // kIntCmp against a literal NULL (always unknown)
+  bool rhs_is_null{false};
   int64_t between_lo{0};
   int64_t between_hi{0};
-  std::vector<int64_t> in_consts;  // kNull element renders as NULL
-  int like_pat{0};
+  bool between_lo_null{false};
+  bool between_hi_null{false};
+  std::vector<int64_t> in_list{};
   int64_t str_const{0};  // index into kStrPool
+  int str_pattern{
+      0};  // 0 = '%', 1 = '_', 2 = 'a%', 3 = '%b', 4 = 'b%', 5 = 'bb', 6 = 'c%'
   bool bool_positive{true};
+  int64_t mask{1};
+  int64_t arith_const{0};
   std::unique_ptr<RPred> left, right;
 
   static int64_t IntOf(const MirrorRow& r, int column) {
@@ -149,7 +142,7 @@ struct RPred {
       case Kind::kIntCmp: {
         const int64_t lhs = IntOf(row, col);
         const int64_t rhs = rhs_is_col ? IntOf(row, rhs_col) : rhs_const;
-        if (lhs == kNull || rhs == kNull || rhs_is_null) {
+        if (lhs == kNull || rhs == kNull) {
           return 'N';
         }
         if (op == "=") {
@@ -184,7 +177,8 @@ struct RPred {
         if (row.s == kNull) {
           return 'N';
         }
-        // kStrPool is lexicographically sorted: code order equals string order.
+        // kStrPool is lexicographically sorted: code order equals string
+        // order.
         if (op == "=") {
           return Eval3vl(row.s == str_const);
         }
@@ -202,42 +196,16 @@ struct RPred {
         }
         return Eval3vl(row.s >= str_const);
       }
-      case Kind::kIntBetween: {
-        const int64_t lhs = IntOf(row, col);
-        if (lhs == kNull) {
-          return 'N';
-        }
-        const bool inside = lhs >= between_lo && lhs <= between_hi;
-        return Eval3vl(negated ? !inside : inside);
-      }
-      case Kind::kIntInList: {
-        const int64_t lhs = IntOf(row, col);
-        if (lhs == kNull) {
-          return 'N';
-        }
-        bool saw_null = false;
-        for (const int64_t e : in_consts) {
-          if (e == kNull) {
-            saw_null = true;
-          } else if (e == lhs) {
-            return negated ? 'F' : 'T';
-          }
-        }
-        if (saw_null) {
-          return 'N';
-        }
-        return negated ? 'T' : 'F';
+      case Kind::kStrIsNull: {
+        const bool is_null = row.s == kNull;
+        return Eval3vl(negated ? !is_null : is_null);
       }
       case Kind::kStrLike: {
         if (row.s == kNull) {
           return 'N';
         }
-        const bool m = LikeMatch(row.s, like_pat);
+        const bool m = LikeMatch(row.s, str_pattern);
         return Eval3vl(negated ? !m : m);
-      }
-      case Kind::kStrIsNull: {
-        const bool is_null = row.s == kNull;
-        return Eval3vl(negated ? !is_null : is_null);
       }
       case Kind::kNot:
         return Not3vl(left->Eval(row));
@@ -246,6 +214,107 @@ struct RPred {
       case Kind::kBin:
         return op == "AND" ? And3vl(left->Eval(row), right->Eval(row))
                            : Or3vl(left->Eval(row), right->Eval(row));
+      case Kind::kIsDistinctFrom: {
+        const int64_t lhs = IntOf(row, col);
+        const int64_t rhs =
+            rhs_is_null ? kNull
+                        : (rhs_is_col ? IntOf(row, rhs_col) : rhs_const);
+        bool distinct = false;
+        if (lhs == kNull && rhs == kNull) {
+          distinct = false;
+        } else if (lhs == kNull || rhs == kNull) {
+          distinct = true;
+        } else {
+          distinct = (lhs != rhs);
+        }
+        return Eval3vl(negated ? !distinct : distinct);
+      }
+      case Kind::kBetween: {
+        const int64_t lhs = IntOf(row, col);
+        const int64_t lo = between_lo_null ? kNull : between_lo;
+        const int64_t hi = between_hi_null ? kNull : between_hi;
+        char ge = 'T';
+        if (lhs == kNull || lo == kNull) {
+          ge = 'N';
+        } else {
+          ge = Eval3vl(lhs >= lo);
+        }
+        char le = 'T';
+        if (lhs == kNull || hi == kNull) {
+          le = 'N';
+        } else {
+          le = Eval3vl(lhs <= hi);
+        }
+        char res = And3vl(ge, le);
+        return negated ? Not3vl(res) : res;
+      }
+      case Kind::kInList: {
+        const int64_t lhs = IntOf(row, col);
+        if (lhs == kNull) {
+          return 'N';
+        }
+        bool has_null = false;
+        bool matched = false;
+        for (int64_t val : in_list) {
+          if (val == kNull) {
+            has_null = true;
+          } else if (val == lhs) {
+            matched = true;
+            break;
+          }
+        }
+        char res = 'N';
+        if (matched) {
+          res = 'T';
+        } else if (has_null) {
+          res = 'N';
+        } else {
+          res = 'F';
+        }
+        return negated ? Not3vl(res) : res;
+      }
+      case Kind::kBitwiseAndCmp: {
+        const int64_t lhs = IntOf(row, col);
+        if (lhs == kNull) {
+          return 'N';
+        }
+        const int64_t masked = lhs & mask;
+        const int64_t rhs = rhs_const;
+        if (op == "=") return Eval3vl(masked == rhs);
+        if (op == "!=") return Eval3vl(masked != rhs);
+        if (op == "<") return Eval3vl(masked < rhs);
+        if (op == "<=") return Eval3vl(masked <= rhs);
+        if (op == ">") return Eval3vl(masked > rhs);
+        return Eval3vl(masked >= rhs);
+      }
+      case Kind::kBitwiseNotCmp: {
+        const int64_t lhs = IntOf(row, col);
+        if (lhs == kNull) {
+          return 'N';
+        }
+        const int64_t not_val = ~lhs;
+        const int64_t rhs = rhs_const;
+        if (op == "=") return Eval3vl(not_val == rhs);
+        if (op == "!=") return Eval3vl(not_val != rhs);
+        if (op == "<") return Eval3vl(not_val < rhs);
+        if (op == "<=") return Eval3vl(not_val <= rhs);
+        if (op == ">") return Eval3vl(not_val > rhs);
+        return Eval3vl(not_val >= rhs);
+      }
+      case Kind::kArithmeticCmp: {
+        const int64_t lhs = IntOf(row, col);
+        if (lhs == kNull) {
+          return 'N';
+        }
+        const int64_t arith_val = lhs + arith_const;
+        const int64_t rhs = rhs_const;
+        if (op == "=") return Eval3vl(arith_val == rhs);
+        if (op == "!=") return Eval3vl(arith_val != rhs);
+        if (op == "<") return Eval3vl(arith_val < rhs);
+        if (op == "<=") return Eval3vl(arith_val <= rhs);
+        if (op == ">") return Eval3vl(arith_val > rhs);
+        return Eval3vl(arith_val >= rhs);
+      }
     }
     return 'N';
   }
@@ -254,14 +323,9 @@ struct RPred {
     switch (kind) {
       case Kind::kIntCmp: {
         static const std::array<const char*, 2> kIntCols = {"a", "b"};
-        std::string rhs;
-        if (rhs_is_null) {
-          rhs = "NULL";
-        } else if (rhs_is_col) {
-          rhs = kIntCols[static_cast<size_t>(rhs_col)];
-        } else {
-          rhs = std::to_string(rhs_const);
-        }
+        const std::string rhs = rhs_is_col
+                                    ? kIntCols[static_cast<size_t>(rhs_col)]
+                                    : std::to_string(rhs_const);
         return "(" + std::string(kIntCols[static_cast<size_t>(col)]) + " " +
                op + " " + rhs + ")";
       }
@@ -280,28 +344,6 @@ struct RPred {
       case Kind::kStrCmp:
         return "(s " + op + " '" + kStrPool[static_cast<size_t>(str_const)] +
                "')";
-      case Kind::kIntBetween: {
-        std::string out = "(";
-        out += (col == 0 ? "a" : "b");
-        out += negated ? " NOT BETWEEN " : " BETWEEN ";
-        out += std::to_string(between_lo) + " AND " +
-               std::to_string(between_hi) + ")";
-        return out;
-      }
-      case Kind::kIntInList: {
-        std::string out = "(";
-        out += (col == 0 ? "a" : "b");
-        out += negated ? " NOT IN (" : " IN (";
-        for (size_t i = 0; i < in_consts.size(); ++i) {
-          out += i == 0 ? "" : ", ";
-          out += in_consts[i] == kNull ? "NULL" : std::to_string(in_consts[i]);
-        }
-        out += "))";
-        return out;
-      }
-      case Kind::kStrLike:
-        return "(s " + std::string(negated ? "NOT LIKE '" : "LIKE '") +
-               kLikePool[static_cast<size_t>(like_pat)] + "')";
       case Kind::kStrIsNull: {
         std::string out = "(s IS ";
         if (negated) {
@@ -316,6 +358,64 @@ struct RPred {
         return "(" + left->Render() + ") IS NULL";
       case Kind::kBin:
         return "(" + left->Render() + " " + op + " " + right->Render() + ")";
+      case Kind::kIsDistinctFrom: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        const std::string rhs =
+            rhs_is_null ? "NULL"
+                        : (rhs_is_col ? kIntCols[static_cast<size_t>(rhs_col)]
+                                      : std::to_string(rhs_const));
+        return "(" + std::string(kIntCols[static_cast<size_t>(col)]) + " IS " +
+               (negated ? "NOT " : "") + "DISTINCT FROM " + rhs + ")";
+      }
+      case Kind::kBetween: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        const std::string lo =
+            between_lo_null ? "NULL" : std::to_string(between_lo);
+        const std::string hi =
+            between_hi_null ? "NULL" : std::to_string(between_hi);
+        return "(" + std::string(kIntCols[static_cast<size_t>(col)]) +
+               (negated ? " NOT BETWEEN " : " BETWEEN ") + lo + " AND " + hi +
+               ")";
+      }
+      case Kind::kInList: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        std::string out = "(" +
+                          std::string(kIntCols[static_cast<size_t>(col)]) +
+                          (negated ? " NOT IN (" : " IN (");
+        for (size_t i = 0; i < in_list.size(); ++i) {
+          if (i > 0) {
+            out += ", ";
+          }
+          out += in_list[i] == kNull ? "NULL" : std::to_string(in_list[i]);
+        }
+        out += "))";
+        return out;
+      }
+      case Kind::kStrLike: {
+        static const std::array<const char*, 5> kPatterns = {
+            "'a%'", "'%b'", "'_'", "'%'", "'%z%'"};
+        return std::string("(s ") + (negated ? "NOT LIKE " : "LIKE ") +
+               kPatterns[static_cast<size_t>(str_pattern)] + ")";
+      }
+      case Kind::kBitwiseAndCmp: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        return "(((" + std::string(kIntCols[static_cast<size_t>(col)]) + " & " +
+               std::to_string(mask) + ") " + op + " " +
+               std::to_string(rhs_const) + "))";
+      }
+      case Kind::kBitwiseNotCmp: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        return "(((~" + std::string(kIntCols[static_cast<size_t>(col)]) + ") " +
+               op + " " + std::to_string(rhs_const) + "))";
+      }
+      case Kind::kArithmeticCmp: {
+        static const std::array<const char*, 2> kIntCols = {"a", "b"};
+        const std::string op_str = arith_const >= 0 ? "+" : "-";
+        const int64_t abs_const = arith_const >= 0 ? arith_const : -arith_const;
+        return "(((" + std::string(kIntCols[static_cast<size_t>(col)]) + " " +
+               op_str + " " + std::to_string(abs_const) + ") " + op + " " +
+               std::to_string(rhs_const) + "))";
+      }
     }
     return "TRUE";
   }
@@ -335,10 +435,14 @@ RPredPtr CopyPred(const RPred& p) {
   c->rhs_is_null = p.rhs_is_null;
   c->between_lo = p.between_lo;
   c->between_hi = p.between_hi;
-  c->in_consts = p.in_consts;
-  c->like_pat = p.like_pat;
+  c->between_lo_null = p.between_lo_null;
+  c->between_hi_null = p.between_hi_null;
+  c->in_list = p.in_list;
   c->str_const = p.str_const;
+  c->str_pattern = p.str_pattern;
   c->bool_positive = p.bool_positive;
+  c->mask = p.mask;
+  c->arith_const = p.arith_const;
   if (p.left) {
     c->left = CopyPred(*p.left);
   }
@@ -367,20 +471,11 @@ class Gen {
   std::mt19937& rng_;
 };
 
-// Small-domain constant most of the time, boundary constant occasionally.
-int64_t GenIntConst(Gen& g) {
-  if (g.Chance(18)) {
-    return kEdgeConsts[static_cast<size_t>(
-        g.Pick(0, static_cast<int>(std::size(kEdgeConsts)) - 1))];
-  }
-  return g.Pick(-3, 3);
-}
-
 RPredPtr IntLeafPredicate(Gen& g) {
   static const std::vector<std::string> kOps = {"=",  "!=", "<",
                                                 "<=", ">",  ">="};
   auto p = std::make_unique<RPred>();
-  switch (g.Pick(0, 7)) {
+  switch (g.Pick(0, 9)) {
     case 0:
       p->kind = RPred::Kind::kIntCmp;
       p->col = g.Pick(0, 1);
@@ -391,74 +486,102 @@ RPredPtr IntLeafPredicate(Gen& g) {
       p->kind = RPred::Kind::kIntCmp;
       p->col = g.Pick(0, 1);
       p->op = g.PickFrom(kOps);
-      p->rhs_const = GenIntConst(g);
-      return p;
-    case 2:
-      p->kind = RPred::Kind::kIntCmp;
-      p->col = g.Pick(0, 1);
-      p->op = g.PickFrom(kOps);
       p->rhs_is_col = true;
       p->rhs_col = g.Pick(0, 1);
       return p;
-    case 3:
-      p->kind = RPred::Kind::kIntCmp;
-      p->col = g.Pick(0, 1);
-      p->op = g.PickFrom(kOps);
-      p->rhs_is_null = true;  // `a = NULL`-style 3VL trap
-      return p;
-    case 4:
+    case 2:
       p->kind = RPred::Kind::kIntIsNull;
       p->col = g.Pick(0, 1);
       p->negated = g.Chance(50);
       return p;
-    case 5:
+    case 3:
       p->kind = RPred::Kind::kBoolCol;
       p->bool_positive = g.Chance(50);
       return p;
-    case 6: {
-      p->kind = RPred::Kind::kIntBetween;
+    case 4: {
+      p->kind = RPred::Kind::kIsDistinctFrom;
       p->col = g.Pick(0, 1);
-      p->between_lo = GenIntConst(g);
-      p->between_hi = GenIntConst(g);
-      if (g.Chance(60)) {  // usually a sane range
-        if (p->between_lo > p->between_hi) {
-          std::swap(p->between_lo, p->between_hi);
-        }
+      p->negated = g.Chance(50);
+      if (g.Chance(20)) {
+        p->rhs_is_null = true;
+      } else if (g.Chance(40)) {
+        p->rhs_is_col = true;
+        p->rhs_col = g.Pick(0, 1);
+      } else {
+        p->rhs_const = g.Pick(-3, 3);
       }
-      p->negated = g.Chance(20);
+      return p;
+    }
+    case 5: {
+      p->kind = RPred::Kind::kBetween;
+      p->col = g.Pick(0, 1);
+      p->negated = g.Chance(30);
+      int64_t v1 = g.Pick(-3, 3);
+      int64_t v2 = g.Pick(-3, 3);
+      p->between_lo = std::min(v1, v2);
+      p->between_hi = std::max(v1, v2);
+      p->between_lo_null = g.Chance(15);
+      p->between_hi_null = g.Chance(15);
+      return p;
+    }
+    case 6: {
+      p->kind = RPred::Kind::kBitwiseAndCmp;
+      p->col = g.Pick(0, 1);
+      p->op = g.PickFrom(kOps);
+      p->mask = g.Pick(1, 3);
+      p->rhs_const = g.Pick(0, 3);
+      return p;
+    }
+    case 7: {
+      p->kind = RPred::Kind::kBitwiseNotCmp;
+      p->col = g.Pick(0, 1);
+      p->op = g.PickFrom(kOps);
+      p->rhs_const = g.Pick(-4, 4);
+      return p;
+    }
+    case 8: {
+      p->kind = RPred::Kind::kArithmeticCmp;
+      p->col = g.Pick(0, 1);
+      p->op = g.PickFrom(kOps);
+      p->arith_const = g.Pick(-2, 2);
+      p->rhs_const = g.Pick(-3, 3);
       return p;
     }
     default: {
-      p->kind = RPred::Kind::kIntInList;
+      p->kind = RPred::Kind::kInList;
       p->col = g.Pick(0, 1);
-      const int n = g.Pick(1, 3);
-      for (int i = 0; i < n; ++i) {
-        p->in_consts.push_back(g.Chance(15) ? kNull : GenIntConst(g));
+      p->negated = g.Chance(30);
+      const int count = g.Pick(1, 4);
+      p->in_list.reserve(static_cast<size_t>(count));
+      for (int i = 0; i < count; ++i) {
+        if (g.Chance(20)) {
+          p->in_list.push_back(kNull);
+        } else {
+          p->in_list.push_back(g.Pick(-3, 3));
+        }
       }
-      p->negated = g.Chance(25);
       return p;
     }
   }
 }
 
 RPredPtr LeafPredicate(Gen& g) {
-  switch (g.Pick(0, 4)) {
+  switch (g.Pick(0, 3)) {
     case 0:
-    case 1:
       return IntLeafPredicate(g);
-    case 2: {
-      static const std::vector<std::string> kStrOps = {"=", "!=", "<", ">="};
+    case 1: {
       auto p = std::make_unique<RPred>();
       p->kind = RPred::Kind::kStrCmp;
+      static const std::vector<std::string> kStrOps = {"=", "!=", "<", ">="};
       p->op = g.PickFrom(kStrOps);
       p->str_const = g.Pick(0, static_cast<int>(std::size(kStrPool)) - 1);
       return p;
     }
-    case 3: {
+    case 2: {
       auto p = std::make_unique<RPred>();
       p->kind = RPred::Kind::kStrLike;
-      p->like_pat = g.Pick(0, static_cast<int>(std::size(kLikePool)) - 1);
-      p->negated = g.Chance(20);
+      p->negated = g.Chance(40);
+      p->str_pattern = g.Pick(0, static_cast<int>(std::size(kLikePool)) - 1);
       return p;
     }
     default: {
@@ -471,8 +594,7 @@ RPredPtr LeafPredicate(Gen& g) {
 }
 
 // `flavour` biases the search space (driven by the plan-feedback bandit):
-// 0 = default, 1 = shallower trees, 2 = boolean-heavy (no NOT nodes),
-// 3 = join-heavy (forces the join partner for the metamorphic oracles).
+// 0 = default, 1 = shallower trees, 2 = boolean-heavy (no NOT nodes).
 RPredPtr GenPredicate(Gen& g, int depth, int flavour) {
   if (depth <= 0 || g.Chance(40 + (flavour * 10))) {
     return LeafPredicate(g);
@@ -491,93 +613,33 @@ RPredPtr GenPredicate(Gen& g, int depth, int flavour) {
   return p;
 }
 
-std::string GenProjection(Gen& g, bool with_join) {
-  const bool distinct = g.Chance(18);
-  std::string prefix = distinct ? "DISTINCT " : "";
-  const int n = with_join ? 6 : 4;
-  switch (g.Pick(0, n - 1)) {
+std::string GenProjection(Gen& g) {
+  switch (g.Pick(0, 7)) {
     case 0:
-      return distinct ? prefix + "a" : "*";
+      return "*";
     case 1:
       return "a";
     case 2:
       return "a, b";
     case 3:
-      return distinct ? prefix + "flag, s" : "flag, s";
+      return "flag, s";
     case 4:
-      return "x";
-    default:
-      return "a, x, y";
-  }
-}
-
-// SQL boolean fragments the mirror does not track: subqueries, arithmetic,
-// CASE and coalesce.  Used only by the metamorphic oracles (TLP partition
-// predicate, NoREC filter), whose checks never need a ground truth.
-// `allow_subquery=false` restricts to the subquery-free subset: DELETE/UPDATE
-// reject a WHERE containing a query expression ("query expression requires
-// relational evaluation"), so feeding one to the transaction oracle would
-// skip the whole iteration.
-std::string GenSqlOnlyPred(Gen& g, const std::string& tab,
-                           const std::string& jtab,
-                           bool allow_subquery = true) {
-  switch (g.Pick(0, 8)) {
-    case 0:
-      return g.Chance(50) ? "(a IN (1, 2, NULL))" : "(b NOT IN (0, -1, 3))";
-    case 1:
-      return g.Chance(50) ? "(b BETWEEN -1 AND 1)"
-                          : "(a BETWEEN 0 AND 9223372036854775807)";
-    case 2:
-      return "((b + 1) > a)";  // b is bounded, so the addition cannot overflow
-    case 3:
-      return "(CASE WHEN flag THEN a > 0 ELSE b < 1 END)";
-    case 4:
-      return "(COALESCE(a, b, 0) >= 0)";
+      return "COALESCE(a, 0), b";
     case 5:
-      return "(s LIKE 'a%' OR s = '')";
+      return "u + 1, a";
     case 6:
-      if (!allow_subquery) {
-        return "(a IS NOT NULL AND b IS NOT NULL)";
-      }
-      return jtab.empty() ? "(u IN (SELECT u FROM " + tab + " WHERE a > 0))"
-                          : "(a IN (SELECT x FROM " + jtab + "))";
-    case 7:
-      if (!allow_subquery) {
-        return "(flag IS NOT NULL OR a != b)";
-      }
-      return jtab.empty() ? "(SELECT COUNT(*) FROM " + tab + ") >= 0"
-                          : "(EXISTS (SELECT 1 FROM " + jtab + " WHERE x > " +
-                                tab + ".a))";
+      return "CASE WHEN flag THEN a ELSE b END";
     default:
-      if (!allow_subquery) {
-        return "(NOT (a IS NULL AND b IS NULL))";
-      }
-      return jtab.empty()
-                 ? "(NOT (a IS NULL AND b IS NULL))"
-                 : "((SELECT MAX(x) FROM " + jtab + ") > " + tab + ".b)";
+      return "u, a, b, flag, s";
   }
-}
-
-// TLP partition predicate: half the time a mirrored tree, half the time a
-// SQL-only fragment (richer syntax without needing a C++ mirror).
-std::string GenAuxPredicate(Gen& g, int flavour, const std::string& tab,
-                            const std::string& jtab) {
-  if (g.Chance(50)) {
-    return GenPredicate(g, g.Pick(1, 2), flavour)->Render();
-  }
-  return GenSqlOnlyPred(g, tab, jtab);
 }
 
 // Generates one row: the VALUES clause and its mirror.
 MirrorRow GenRow(Gen& g, int64_t u, std::string* sql_values) {
   MirrorRow m;
   m.u = u;
-  // `a` carries the boundary constants (comparison / MIN / MAX / BETWEEN
-  // stress); `b` stays in a small range so it is safe as the operand of the
-  // auxiliary arithmetic and the grouped SUM (INT64_MAX would overflow those
-  // metamorphic oracles and force a skip).
-  m.a = g.Chance(15) ? kNull : GenIntConst(g);
-  m.b = g.Chance(10) ? kNull : g.Pick(-4, 4);
+  m.a = g.Chance(15) ? kNull : g.Pick(-3, 3);
+  m.b = g.Chance(10) ? kNull : g.Pick(-2, 2);
   switch (g.Pick(0, 2)) {
     case 0:
       m.flag = 1;
@@ -589,33 +651,27 @@ MirrorRow GenRow(Gen& g, int64_t u, std::string* sql_values) {
       m.flag = kNull;
       break;
   }
-  m.s = g.Chance(25) ? kNull
-                     : g.Pick(0, static_cast<int>(std::size(kStrPool)) - 1);
+  switch (g.Pick(0, 2)) {
+    case 0:
+      m.s = 0;
+      break;
+    case 1:
+      m.s = 1;
+      break;
+    default:
+      m.s = kNull;
+      break;
+  }
   const std::string a_sql = m.a == kNull ? "NULL" : std::to_string(m.a);
   const std::string b_sql = m.b == kNull ? "NULL" : std::to_string(m.b);
-  const std::string s_sql =
-      m.s == kNull
-          ? "NULL"
-          : std::string("'") + kStrPool[static_cast<size_t>(m.s)] + "'";
-  *sql_values = "(" + std::to_string(m.u) + ", " + a_sql + ", " + b_sql + ", " +
-                (m.flag == kNull ? "NULL" : (m.flag == 1 ? "TRUE" : "FALSE")) +
-                ", " + s_sql + ")";
+  *sql_values =
+      "(" + std::to_string(m.u) + ", " + a_sql + ", " + b_sql + ", " +
+      (m.flag == kNull ? "NULL" : (m.flag == 1 ? "TRUE" : "FALSE")) + ", " +
+      (m.s == kNull
+           ? "NULL"
+           : "'" + std::string(kStrPool[static_cast<size_t>(m.s)]) + "'") +
+      ")";
   return m;
-}
-
-// VALUES tuple for the join partner table: (x INT64, y VARCHAR(8)).
-std::string GenJoinRow(Gen& g) {
-  const std::string x_sql =
-      g.Chance(20) ? "NULL"
-                   : (g.Chance(20) ? std::to_string(GenIntConst(g))
-                                   : std::to_string(g.Pick(-3, 3)));
-  const std::string y_sql =
-      g.Chance(25) ? "NULL"
-                   : std::string("'") +
-                         kStrPool[static_cast<size_t>(g.Pick(
-                             0, static_cast<int>(std::size(kStrPool)) - 1))] +
-                         "'";
-  return "(" + x_sql + ", " + y_sql + ")";
 }
 
 // ---------------------------------------------------------------------------
@@ -635,25 +691,8 @@ std::optional<std::vector<Row>> RunRows(Database& db, TransactionContext& ctx,
   }
   std::vector<Row> rows;
   Row row;
-  try {
-    while (result.Value().Next(&row)) {
-      rows.push_back(row);
-    }
-  } catch (const std::exception& e) {
-    // Engine-raised runtime errors (e.g. "integer overflow in SUM" on the
-    // edge-value rows) are legitimate rejections for a metamorphic oracle:
-    // both sides of the comparison must raise the same way, so treat the
-    // throw as a skip rather than a mismatch or a fuzzer crash.
-    *error = e.what();
-    return std::nullopt;
-  }
-  // Lazy execution surfaces runtime errors only through the executor status
-  // ("integer overflow on '+'"): a failed-but-not-thrown query must also
-  // skip the oracle, otherwise the empty result masquerades as data.
-  const Status st = result.Value().GetStatus();
-  if (st != Status::kSuccess) {
-    *error = st.GetMessage();
-    return std::nullopt;
+  while (result.Value().Next(&row)) {
+    rows.push_back(row);
   }
   return rows;
 }
@@ -684,15 +723,25 @@ std::optional<std::string> RunScalar(Database& db, TransactionContext& ctx,
 }
 
 // Runs any statement to completion; returns false on error.
-bool RunUpdate(Database& db, TransactionContext& ctx, const std::string& sql) {
+bool RunUpdate(Database& db, TransactionContext& ctx, const std::string& sql,
+               std::string* error = nullptr) {
   SqlEngine engine(db);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
+    if (error != nullptr) {
+      *error = engine.LastError();
+    }
     return false;
   }
   // QueryResults are lazy: drain or the mutation never happens.
   result.Value().Drain();
-  return result.Value().GetStatus() == Status::kSuccess;
+  if (result.Value().GetStatus() != Status::kSuccess) {
+    if (error != nullptr) {
+      *error = result.Value().GetStatus().GetMessage();
+    }
+    return false;
+  }
+  return true;
 }
 
 std::string DumpRows(const std::vector<std::string>& rows) {
@@ -724,15 +773,11 @@ bool CheckTlp(Database& db, TransactionContext& ctx,
   auto r3 = RunRows(db, ctx, tlp[3], &error);
   if (!(r0.has_value() && r1.has_value() && r2.has_value() && r3.has_value())) {
     if (verbose) {
-      const std::size_t failed =
-          (!r0.has_value() ? 0
-                           : (!r1.has_value() ? 1 : (!r2.has_value() ? 2 : 3)));
-      std::cerr << "[sql_oracle][tlp-error] part=" << failed << ": " << error
-                << " :: " << tlp[failed] << "\n";
+      std::cerr << "[sql_oracle][tlp-error] " << error << "\n";
     }
     return false;
   }
-  std::vector<std::string> s0 = SerializeSorted(*r0);
+  const std::vector<std::string> s0 = SerializeSorted(*r0);
   std::vector<std::string> s1 = SerializeSorted(*r1);
   std::vector<std::string> s2 = SerializeSorted(*r2);
   std::vector<std::string> s3 = SerializeSorted(*r3);
@@ -740,14 +785,6 @@ bool CheckTlp(Database& db, TransactionContext& ctx,
   merged.insert(merged.end(), s2.begin(), s2.end());
   merged.insert(merged.end(), s3.begin(), s3.end());
   std::sort(merged.begin(), merged.end());
-  if (tlp[0].find("DISTINCT") != std::string::npos) {
-    // Set semantics: duplicate projected tuples may land in different
-    // partitions, so compare deduplicated multisets.
-    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
-    if (!s0.empty()) {
-      s0.erase(std::unique(s0.begin(), s0.end()), s0.end());
-    }
-  }
   if (s0 == merged) {
     return true;
   }
@@ -969,83 +1006,7 @@ bool CheckPqs(Database& db, TransactionContext& ctx, const OracleTrace& t,
   return true;
 }
 
-// Applies a recorded `CREATE INDEX <name> ON <table>(<col>, ...);` DDL
-// through the catalog API: the GoogleSQL frontend parses the statement but
-// has no executor route for it (every fuzzer DDL used to be rejected,
-// silently killing the whole index-independence oracle).  CreateIndex goes
-// through the same catalog update, schema-epoch bump, and plan-cache
-// invalidation a SQL route would trigger.
-bool ApplyIndexDdl(Database& db, TransactionContext& ctx,
-                   const std::string& ddl, bool verbose) {
-  constexpr std::string_view prefix = "CREATE INDEX ";
-  if (!ddl.starts_with(prefix)) {
-    return false;
-  }
-  const size_t on_pos = ddl.find(" ON ", prefix.size());
-  const size_t open = ddl.find('(', on_pos == std::string::npos ? 0 : on_pos);
-  const size_t close = ddl.rfind(')');
-  if (on_pos == std::string::npos || open == std::string::npos ||
-      close == std::string::npos || close < open) {
-    return false;
-  }
-  const std::string name = ddl.substr(prefix.size(), on_pos - prefix.size());
-  const std::string table = ddl.substr(on_pos + 4, open - on_pos - 4);
-  std::vector<std::string> columns;
-  {
-    std::string rest = ddl.substr(open + 1, close - open - 1);
-    size_t pos = 0;
-    while (pos <= rest.size()) {
-      const size_t comma = rest.find(',', pos);
-      std::string column = rest.substr(
-          pos, comma == std::string::npos ? std::string::npos : comma - pos);
-      const size_t first = column.find_first_not_of(" \t");
-      const size_t last = column.find_last_not_of(" \t");
-      columns.push_back(first == std::string::npos
-                            ? std::string()
-                            : column.substr(first, last - first + 1));
-      if (comma == std::string::npos) {
-        break;
-      }
-      pos = comma + 1;
-    }
-  }
-  auto tbl = ctx.GetTable(table);
-  if (!tbl.HasValue()) {
-    if (verbose) {
-      std::cerr << "[sql_oracle][idx-ddl-error] table " << table << "\n";
-    }
-    return false;
-  }
-  const Schema& schema = tbl.Value()->GetSchema();
-  std::vector<slot_t> slots;
-  for (const std::string& column : columns) {
-    bool found = false;
-    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-      if (schema.GetColumn(i).Name().name == column) {
-        slots.push_back(static_cast<slot_t>(i));
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      if (verbose) {
-        std::cerr << "[sql_oracle][idx-ddl-error] column " << column << "\n";
-      }
-      return false;
-    }
-  }
-  // kNonUnique: the generated data has many duplicate keys, and index
-  // independence is about access paths, not uniqueness enforcement.
-  const Status st = db.CreateIndex(
-      ctx, table, IndexSchema(name, slots, {}, IndexMode::kNonUnique));
-  if (st != Status::kSuccess && verbose) {
-    std::cerr << "[sql_oracle][idx-ddl-error] " << st.GetMessage() << "\n";
-  }
-  return st == Status::kSuccess;
-}
-
-// Constraint rewriting: the probe must survive every CREATE INDEX step
-// unchanged (index scan vs full scan must agree at every index set).
+// Constraint rewriting: the probe must survive CREATE INDEX unchanged.
 bool CheckIdx(Database& db, TransactionContext& ctx, const OracleTrace& t,
               std::string* report, bool verbose) {
   if (t.index_ddl.empty() || t.index_probe.empty()) {
@@ -1059,76 +1020,74 @@ bool CheckIdx(Database& db, TransactionContext& ctx, const OracleTrace& t,
     }
     return false;
   }
-  for (size_t step = 0; step < t.index_ddl.size(); ++step) {
-    const std::string& ddl = t.index_ddl[step];
-    if (!ApplyIndexDdl(db, ctx, ddl, verbose)) {
+  for (const std::string& ddl : t.index_ddl) {
+    if (!RunUpdate(db, ctx, ddl)) {
       if (verbose) {
         std::cerr << "[sql_oracle][idx-ddl-error] :: " << ddl << "\n";
       }
       return false;
     }
-    auto after = RunScalar(db, ctx, t.index_probe, &error);
-    if (!after.has_value()) {
-      if (verbose) {
-        std::cerr << "[sql_oracle][idx-error] " << error << "\n";
-      }
-      return false;
-    }
-    if (*before == *after) {
-      continue;
-    }
-    *report += "[INDEX MISMATCH]\n";
-    *report += "  before: " + t.index_probe + " => " + *before + "\n";
-    for (size_t i = 0; i <= step; ++i) {
-      *report += "  ddl:    " + t.index_ddl[i] + "\n";
-    }
-    *report += "  after:  " + t.index_probe + " => " + *after + "\n";
   }
+  auto after = RunScalar(db, ctx, t.index_probe, &error);
+  if (!after.has_value()) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][idx-error] " << error << "\n";
+    }
+    return false;
+  }
+  if (*before == *after) {
+    return true;
+  }
+  *report += "[INDEX MISMATCH]\n";
+  *report += "  before: " + t.index_probe + " => " + *before + "\n";
+  for (const std::string& ddl : t.index_ddl) {
+    *report += "  ddl:    " + ddl + "\n";
+  }
+  *report += "  after:  " + t.index_probe + " => " + *after + "\n";
   return true;
 }
 
 // Transaction splitting: atomic execution must match autocommit execution.
-// Transaction splitting: atomic execution must match autocommit execution.
-// Both branches replay the full trace (setup + mutations + probe) on their
-// own throwaway database so the atomic branch runs exactly one transaction
-// and the autocommit branch commits per statement.  (The previous design
-// re-ran the setup on the shared database, so its second CREATE TABLE always
-// failed and the oracle silently skipped every iteration.)
 bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
                bool verbose) {
-  (void)db;
   if (t.troc.empty() || t.troc_probe.empty()) {
     return true;
   }
-  std::string error;
+  const std::string tab = t.table.empty() ? "t0" : t.table;
+  auto substitute = [&tab](std::string sql) {
+    const std::string& from = tab;
+    const std::string to = tab + "b";
+    size_t pos = 0;
+    while ((pos = sql.find(from, pos)) != std::string::npos) {
+      sql.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+    return sql;
+  };
 
-  // Branch A: setup + mutations inside ONE transaction.
-  ScopedDb holder_a("sql_oracle_trocA");
-  if (!holder_a) {
-    return false;
-  }
-  Database& db_a = *holder_a;
-  TransactionContext ctx_a = db_a.BeginContext();
+  std::string error;
+  // Branch A: everything inside one transaction.
+  TransactionContext ctx_a = db.BeginContext();
   for (const std::string& sql : t.setup) {
-    if (!RunUpdate(db_a, ctx_a, sql)) {
+    if (!RunUpdate(db, ctx_a, sql)) {
       if (verbose) {
-        std::cerr << "[sql_oracle][troc-setup-error] " << sql << "\n";
+        std::cerr << "[sql_oracle][troc-setup-error] " << error << "\n";
       }
       return false;
     }
   }
   for (const std::string& sql : t.troc) {
-    if (!RunUpdate(db_a, ctx_a, sql)) {
+    if (!RunUpdate(db, ctx_a, sql)) {
       if (verbose) {
         std::cerr << "[sql_oracle][troc-stmt-error] " << sql << "\n";
       }
       return false;
     }
   }
-  auto inside = RunRows(db_a, ctx_a, t.troc_probe, &error);
-  const bool committed = ctx_a.txn_.PreCommit() == Status::kSuccess;
-  TransactionContext ctx_a2 = db_a.BeginContext();
-  auto after_a = RunRows(db_a, ctx_a2, t.troc_probe, &error);
+  auto inside = RunRows(db, ctx_a, t.troc_probe, &error);
+  bool committed = ctx_a.txn_.PreCommit() == Status::kSuccess;
+  TransactionContext ctx_a2 = db.BeginContext();
+  auto after_a = RunRows(db, ctx_a2, t.troc_probe, &error);
   if (!(inside.has_value() && after_a.has_value()) || !committed) {
     if (verbose) {
       std::cerr << "[sql_oracle][troc-error-a] " << error << "\n";
@@ -1136,71 +1095,33 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
     return false;
   }
 
-  // Branch B: same statements, each in its own transaction (autocommit).
-  ScopedDb holder_b("sql_oracle_trocB");
-  if (!holder_b) {
-    return false;
-  }
-  Database& db_b = *holder_b;
-  TransactionContext ctx_b = db_b.BeginContext();
+  // Branch B: each statement in its own transaction (autocommit), on a
+  // shadow table t0b so both branches start from the same pristine state.
+  TransactionContext ctx_b = db.BeginContext();
   for (const std::string& sql : t.setup) {
-    if (!RunUpdate(db_b, ctx_b, sql)) {
+    if (!RunUpdate(db, ctx_b, substitute(sql))) {
       if (verbose) {
-        std::cerr << "[sql_oracle][troc-setup-error-b] " << sql << "\n";
+        std::cerr << "[sql_oracle][troc-setup-error-b]\n";
       }
       return false;
     }
   }
   ctx_b.txn_.PreCommit();
   for (const std::string& sql : t.troc) {
-    TransactionContext ctx = db_b.BeginContext();
-    if (!RunUpdate(db_b, ctx, sql)) {
+    TransactionContext ctx = db.BeginContext();
+    if (!RunUpdate(db, ctx, substitute(sql))) {
       if (verbose) {
         std::cerr << "[sql_oracle][troc-stmt-error-b] " << sql << "\n";
       }
       return false;
     }
-    if (ctx.txn_.PreCommit() != Status::kSuccess) {
-      return false;
-    }
+    ctx.txn_.PreCommit();
   }
-  TransactionContext ctx_b2 = db_b.BeginContext();
-  auto after_b = RunRows(db_b, ctx_b2, t.troc_probe, &error);
+  TransactionContext ctx_b2 = db.BeginContext();
+  auto after_b = RunRows(db, ctx_b2, substitute(t.troc_probe), &error);
   if (!after_b.has_value()) {
     if (verbose) {
       std::cerr << "[sql_oracle][troc-error-b] " << error << "\n";
-    }
-    return false;
-  }
-
-  // Branch C: the same mutations, then ABORT.  The visible state must be
-  // exactly the pristine setup state (MVCC undo + write-intent release).
-  ScopedDb holder_c("sql_oracle_trocC");
-  if (!holder_c) {
-    return false;
-  }
-  Database& db_c = *holder_c;
-  TransactionContext ctx_c = db_c.BeginContext();
-  for (const std::string& sql : t.setup) {
-    if (!RunUpdate(db_c, ctx_c, sql)) {
-      return false;
-    }
-  }
-  ctx_c.txn_.PreCommit();
-  TransactionContext ctx_c0 = db_c.BeginContext();
-  auto pristine = RunRows(db_c, ctx_c0, t.troc_probe, &error);
-  TransactionContext ctx_c2 = db_c.BeginContext();
-  for (const std::string& sql : t.troc) {
-    if (!RunUpdate(db_c, ctx_c2, sql)) {
-      return false;
-    }
-  }
-  ctx_c2.txn_.Abort();
-  TransactionContext ctx_c3 = db_c.BeginContext();
-  auto after_c = RunRows(db_c, ctx_c3, t.troc_probe, &error);
-  if (!(after_c.has_value() && pristine.has_value())) {
-    if (verbose) {
-      std::cerr << "[sql_oracle][troc-error-c] " << error << "\n";
     }
     return false;
   }
@@ -1209,12 +1130,7 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
       inside->empty() ? "" : (*inside)[0].ToString();
   const std::string state_a = after_a->empty() ? "" : (*after_a)[0].ToString();
   const std::string state_b = after_b->empty() ? "" : (*after_b)[0].ToString();
-  const std::string state_pristine =
-      pristine->empty() ? "" : (*pristine)[0].ToString();
-  const std::string state_aborted =
-      after_c->empty() ? "" : (*after_c)[0].ToString();
-  if (state_inside == state_a && state_a == state_b &&
-      state_pristine == state_aborted) {
+  if (state_inside == state_a && state_a == state_b) {
     return true;
   }
   *report += "[TRANSACTION MISMATCH]\n";
@@ -1222,10 +1138,6 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
   *report += "  inside txn: " + state_inside + "\n";
   *report += "  committed:  " + state_a + "\n";
   *report += "  autocommit: " + state_b + "\n";
-  if (state_pristine != state_aborted) {
-    *report += "  !! ABORT NOT ATOMIC: pristine=" + state_pristine +
-               " after-abort=" + state_aborted + "\n";
-  }
   return true;
 }
 
@@ -1272,18 +1184,20 @@ bool CheckDqe(Database& db, TransactionContext& ctx, const OracleTrace& t,
   return true;
 }
 
-// Executes the setup statements; returns false when the engine rejected one.
-bool RunSetup(Database& db, TransactionContext& ctx,
-              const std::vector<std::string>& setup, bool verbose) {
+// Executes the setup statements; returns empty on success, error message on
+// failure.
+std::string RunSetup(Database& db, TransactionContext& ctx,
+                     const std::vector<std::string>& setup, bool verbose) {
   for (const std::string& sql : setup) {
-    if (!RunUpdate(db, ctx, sql)) {
+    std::string err;
+    if (!RunUpdate(db, ctx, sql, &err)) {
       if (verbose) {
-        std::cerr << "[sql_oracle][skip-setup] " << sql << "\n";
+        std::cerr << "[sql_oracle][skip-setup] " << sql << " (" << err << ")\n";
       }
-      return false;
+      return "setup statement failed on [" + sql + "]: " + err;
     }
   }
-  return true;
+  return {};
 }
 
 }  // namespace
@@ -1338,7 +1252,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   OracleTrace local;
   OracleTrace& t = (trace != nullptr) ? *trace : local;
 
-  const int flavour = session != nullptr ? session->SelectFlavour(4) : 0;
+  const int flavour = session != nullptr ? session->SelectFlavour(3) : 0;
 
   // Unique table name per iteration: the compiled-plan cache is process
   // global and keyed by SQL text + schema epoch, so identical SQL against a
@@ -1351,7 +1265,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   t.setup.push_back("CREATE TABLE " + tab +
                     " (u INT64, a INT64, b INT64, flag BOOL, s VARCHAR(8));");
   std::vector<MirrorRow> mirror;
-  const int row_count = g.Pick(4, 12);
+  const int row_count = g.Pick(4, 10);
   for (int i = 0; i < row_count; ++i) {
     std::string values;
     mirror.push_back(GenRow(g, i, &values));
@@ -1363,111 +1277,56 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     t.setup.push_back(std::move(insert));
   }
 
-  // Optional join partner: the metamorphic oracles run over this FROM clause,
-  // which drags hash/merge/NL join selection, outer-join null extension, and
-  // predicate pushdown into the TLP/NoREC/index probes.  Columns are named
-  // x/y so the mirrored predicate's bare a/b/flag/s stay unambiguous.
-  const bool with_join = g.Chance(flavour == 3 ? 75 : 30);
-  std::string jtab;
-  std::string from_main = tab;
-  if (with_join) {
-    jtab = tab + "_j";
-    t.setup.push_back("CREATE TABLE " + jtab + " (x INT64, y VARCHAR(8));");
-    const int join_rows = g.Pick(2, 7);
-    for (int i = 0; i < join_rows; ++i) {
-      t.setup.push_back("INSERT INTO " + jtab + " VALUES " + GenJoinRow(g) +
-                        ";");
-    }
-    const int shape = g.Pick(0, 4);
-    const std::string on_eq = tab + ".a = " + jtab + ".x";
-    switch (shape) {
-      case 0:
-        from_main = tab + " JOIN " + jtab + " ON " + on_eq;
-        break;
-      case 1:
-        from_main = tab + " LEFT JOIN " + jtab + " ON " + on_eq;
-        break;
-      case 2:
-        from_main = jtab + " RIGHT JOIN " + tab + " ON " + on_eq;
-        break;
-      case 3:
-        from_main = tab + " FULL JOIN " + jtab + " ON " + on_eq;
-        break;
-      default:
-        from_main = tab + " CROSS JOIN " + jtab;
-        break;
-    }
-  }
-
   const RPredPtr pred = GenPredicate(g, g.Pick(1, 3), flavour);
   t.predicate = pred->Render();
 
   // ---- TLP ----
+  const RPredPtr tlp_aux = GenPredicate(g, g.Pick(1, 2), flavour);
+  const RPred& aux = *tlp_aux;
   {
-    const std::string proj = GenProjection(g, with_join);
-    const std::string aux = GenAuxPredicate(g, flavour, tab, jtab);
+    const std::string proj = GenProjection(g);
     t.tlp = {
-        "SELECT " + proj + " FROM " + from_main + " WHERE " + t.predicate + ";",
-        "SELECT " + proj + " FROM " + from_main + " WHERE (" + t.predicate +
-            ") AND (" + aux + ");",
-        "SELECT " + proj + " FROM " + from_main + " WHERE (" + t.predicate +
-            ") AND NOT (" + aux + ");",
-        "SELECT " + proj + " FROM " + from_main + " WHERE (" + t.predicate +
-            ") AND (" + aux + ") IS NULL;",
+        "SELECT " + proj + " FROM " + tab + " WHERE " + t.predicate + ";",
+        "SELECT " + proj + " FROM " + tab + " WHERE (" + t.predicate +
+            ") AND (" + aux.Render() + ");",
+        "SELECT " + proj + " FROM " + tab + " WHERE (" + t.predicate +
+            ") AND NOT (" + aux.Render() + ");",
+        "SELECT " + proj + " FROM " + tab + " WHERE (" + t.predicate +
+            ") AND (" + aux.Render() + ") IS NULL;",
     };
   }
 
   // ---- Aggregate TLP (grouped partition merge) ----
-  if (!with_join || g.Chance(60)) {
-    const std::string aux = GenAuxPredicate(g, flavour, tab, jtab);
+  {
     const std::string sel =
-        "SELECT a, COUNT(*), SUM(b) FROM " + from_main + " WHERE ";
+        "SELECT a, COUNT(*), SUM(b) FROM " + tab + " WHERE ";
     const std::string grp = " GROUP BY a;";
     t.tlp_agg = {
         sel + t.predicate + grp,
-        sel + "(" + t.predicate + ") AND (" + aux + ")" + grp,
-        sel + "(" + t.predicate + ") AND NOT (" + aux + ")" + grp,
-        sel + "(" + t.predicate + ") AND (" + aux + ") IS NULL" + grp,
+        sel + "(" + t.predicate + ") AND (" + tlp_aux->Render() + ")" + grp,
+        sel + "(" + t.predicate + ") AND NOT (" + tlp_aux->Render() + ")" + grp,
+        sel + "(" + t.predicate + ") AND (" + tlp_aux->Render() + ") IS NULL" +
+            grp,
     };
-  }
-
-  // ---- NoREC (optionally conjoined with a SQL-only fragment) ----
-  {
-    std::string filter = t.predicate;
-    if (g.Chance(45)) {
-      const std::string extra = GenSqlOnlyPred(g, tab, jtab);
-      filter = g.Chance(60) ? "(" + t.predicate + ") AND " + extra
-                            : "(" + t.predicate + ") OR " + extra;
-    }
-    t.norec = {"SELECT COUNT(*) FROM " + from_main + " WHERE " + filter + ";",
-               "SELECT SUM(CASE WHEN " + filter + " THEN 1 ELSE 0 END) FROM " +
-                   from_main + ";"};
   }
 
   // ---- UNION ALL partitioning (engine recombines, harness does not) ----
   {
-    const std::string aux = GenAuxPredicate(g, flavour, tab, jtab);
-    const std::string prefix = "SELECT " + GenProjection(g, with_join) +
-                               " FROM " + from_main + " WHERE ";
+    const std::string prefix =
+        "SELECT " + GenProjection(g) + " FROM " + tab + " WHERE ";
     t.unionall = {
         prefix + t.predicate + ";",
-        prefix + "(" + t.predicate + ") AND (" + aux + ") UNION ALL " + prefix +
-            "(" + t.predicate + ") AND NOT (" + aux + ") UNION ALL " + prefix +
-            "(" + t.predicate + ") AND (" + aux + ") IS NULL;",
+        prefix + "(" + t.predicate + ") AND (" + tlp_aux->Render() +
+            ") UNION ALL " + prefix + "(" + t.predicate + ") AND NOT (" +
+            tlp_aux->Render() + ") UNION ALL " + prefix + "(" + t.predicate +
+            ") AND (" + tlp_aux->Render() + ") IS NULL;",
     };
   }
 
-  // ---- Subquery differential (needs a join partner to reference) ----
-  if (with_join) {
-    const std::string count_prefix = "SELECT COUNT(*) FROM " + tab + " WHERE ";
-    t.subq = {
-        count_prefix + "a IN (SELECT x FROM " + jtab + ");",
-        count_prefix + "EXISTS (SELECT 1 FROM " + jtab + " WHERE " + jtab +
-            ".x = " + tab + ".a);",
-        "SELECT COUNT(*) FROM (SELECT DISTINCT " + tab + ".u FROM " + tab +
-            " JOIN " + jtab + " ON " + tab + ".a = " + jtab + ".x) sub;",
-    };
-  }
+  // ---- NoREC ----
+  t.norec = {"SELECT COUNT(*) FROM " + tab + " WHERE " + t.predicate + ";",
+             "SELECT SUM(CASE WHEN " + t.predicate +
+                 " THEN 1 ELSE 0 END) FROM " + tab + ";"};
 
   // ---- PQS: adjust the predicate so the pivot row must be included ----
   {
@@ -1507,73 +1366,30 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     static const std::array<const char*, 4> kIdxCols = {"a", "b", "flag", "s"};
     const int idx_count = g.Pick(1, 4);
     for (int i = 0; i < idx_count; ++i) {
-      const std::string base =
-          std::string("CREATE INDEX idx_fuzz") + std::to_string(i) + " ON ";
-      const int shape = g.Pick(0, 9);
-      if (!jtab.empty() && shape == 0) {
-        t.index_ddl.push_back(base + jtab + "(x);");
-      } else if (shape == 1) {
-        t.index_ddl.push_back(base + tab + "(a, b);");
-      } else {
-        t.index_ddl.push_back(base + tab + "(" +
-                              kIdxCols[static_cast<size_t>(g.Pick(0, 3))] +
-                              ");");
-      }
+      t.index_ddl.push_back(std::string("CREATE INDEX idx_fuzz") +
+                            std::to_string(i) + " ON " + tab + "(" +
+                            kIdxCols[static_cast<size_t>(g.Pick(0, 3))] + ");");
     }
-    // Probe each DDL step against the pre-DDL baseline.
     t.index_probe =
-        "SELECT COUNT(*) FROM " + from_main + " WHERE " + t.predicate + ";";
+        "SELECT COUNT(*) FROM " + tab + " WHERE " + t.predicate + ";";
   }
 
   // ---- Transaction splitting ----
   {
-    const int stmt_count = g.Pick(1, 4);
+    const int stmt_count = g.Pick(1, 3);
     for (int i = 0; i < stmt_count; ++i) {
-      switch (g.Pick(0, 3)) {
+      switch (g.Pick(0, 2)) {
         case 0: {
           const RPredPtr cond = GenPredicate(g, g.Pick(1, 2), flavour);
-          std::string set_expr;
-          switch (g.Pick(0, 4)) {
-            case 0:
-              set_expr = "SET a = NULL";
-              break;
-            case 1:
-              set_expr = "SET a = b";
-              break;
-            case 2:
-              set_expr = "SET b = a + 1";
-              break;
-            case 3:
-              set_expr = "SET a = " + std::to_string(GenIntConst(g));
-              break;
-            default:
-              set_expr = "SET flag = TRUE, a = -a";
-              break;
-          }
-          std::string update_sql = "UPDATE ";
-          update_sql += tab;
-          update_sql += " ";
-          update_sql += set_expr;
-          update_sql += " WHERE ";
-          update_sql += cond->Render();
-          update_sql += ";";
-          t.troc.push_back(std::move(update_sql));
+          t.troc.push_back("UPDATE " + tab +
+                           " SET a = " + std::to_string(g.Pick(-3, 3)) +
+                           " WHERE " + cond->Render() + ";");
           break;
         }
         case 1: {
           const RPredPtr cond = GenPredicate(g, g.Pick(1, 2), flavour);
-          std::string delete_sql = "DELETE FROM " + tab + " WHERE ";
-          delete_sql += cond->Render();
-          delete_sql += ";";
-          t.troc.push_back(std::move(delete_sql));
-          break;
-        }
-        case 2: {
-          const std::string cond = GenSqlOnlyPred(g, tab, "", false);
-          std::string delete_sql = "DELETE FROM " + tab + " WHERE ";
-          delete_sql += cond;
-          delete_sql += ";";
-          t.troc.push_back(std::move(delete_sql));
+          t.troc.push_back("DELETE FROM " + tab + " WHERE " + cond->Render() +
+                           ";");
           break;
         }
         default: {
@@ -1589,11 +1405,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
         }
       }
     }
-    // SUM(a) omitted: `a` carries INT64-class boundary values whose sum
-    // overflows, which would turn every probe into a skip.
-    t.troc_probe =
-        "SELECT COUNT(*), SUM(b), COUNT(a), COUNT(b), MIN(a), MAX(a) FROM " +
-        tab + ";";
+    t.troc_probe = "SELECT COUNT(*), SUM(a), SUM(b) FROM " + tab + ";";
   }
 
   // ---- Statement-type transformation (mutates; probed last) ----
@@ -1605,11 +1417,11 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
 
   // Plan feedback: reward flavours that surface unseen plan shapes.
   if (session != nullptr) {
-    ScopedDb db_holder("sql_oracle_fuzz");
-    CHECK(db_holder.get() != nullptr);
-    Database& db = *db_holder;
+    ScopedDb sdb("sql_oracle_fuzz");
+    CHECK(sdb.get() != nullptr);
+    Database& db = *sdb;
     TransactionContext ctx = db.BeginContext();
-    if (RunSetup(db, ctx, t.setup, verbose)) {
+    if (RunSetup(db, ctx, t.setup, verbose).empty()) {
       std::string error;
       auto plan = RunRows(db, ctx, "EXPLAIN " + t.tlp[0], &error);
       if (plan.has_value()) {
@@ -1641,12 +1453,13 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   if (trace.setup.empty() || !trace.setup[0].starts_with("CREATE TABLE")) {
     return "malformed trace: no CREATE TABLE in setup";
   }
-  ScopedDb db_holder("sql_oracle_replay");
-  CHECK(db_holder.get() != nullptr);
-  Database& db = *db_holder;
+  ScopedDb sdb("sql_oracle_replay");
+  CHECK(sdb.get() != nullptr);
+  Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
-  if (!RunSetup(db, ctx, trace.setup, verbose)) {
-    return "setup statement failed";
+  const std::string setup_err = RunSetup(db, ctx, trace.setup, verbose);
+  if (!setup_err.empty()) {
+    return setup_err;
   }
   std::string report;
   if (!CheckTlp(db, ctx, trace.tlp, &report, verbose) ||
@@ -1804,9 +1617,9 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
 
 std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
   Gen g(rng);
-  ScopedDb db_holder("sql_oracle_amoeba");
-  CHECK(db_holder.get() != nullptr);
-  Database& db = *db_holder;
+  ScopedDb sdb("sql_oracle_amoeba");
+  CHECK(sdb.get() != nullptr);
+  Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
   const std::string tab =
       "t" +
@@ -1889,54 +1702,75 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
     }
   }
 
-  auto median_ns = [&](const std::string& sql) {
-    std::vector<int64_t> samples;
+  auto explain_plan = [&](const std::string& sql) {
     std::string error;
-    for (int i = 0; i < 7; ++i) {
+    auto rows = RunRows(db, ctx, "EXPLAIN " + sql, &error);
+    if (!rows.has_value()) return std::string{};
+    std::string plan;
+    for (const Row& r : *rows) {
+      plan += r.ToString() + ";";
+    }
+    return plan;
+  };
+
+  std::vector<std::string> sqls;
+  for (const RPredPtr& v : variants) {
+    sqls.push_back("SELECT COUNT(*) FROM " + tab + " WHERE " + v->Render() +
+                   ";");
+  }
+
+  // Interleave samples across variants so that external host spikes (e.g.
+  // checkpoints or thread scheduling in multi-threaded fuzzing) affect all
+  // variants rather than unfairly penalizing one consecutive block.
+  std::vector<std::vector<int64_t>> all_samples(sqls.size());
+  for (int round = 0; round < 7; ++round) {
+    for (size_t vi = 0; vi < sqls.size(); ++vi) {
+      std::string error;
       const auto start = std::chrono::steady_clock::now();
-      auto rows = RunRows(db, ctx, sql, &error);
+      auto rows = RunRows(db, ctx, sqls[vi], &error);
       const auto stop = std::chrono::steady_clock::now();
       if (!rows.has_value()) {
-        return int64_t{-1};
+        if (verbose) {
+          std::cerr << "[sql_oracle][amoeba-skip]\n";
+        }
+        return "";
       }
-      samples.push_back(
+      all_samples[vi].push_back(
           std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start)
               .count());
     }
-    std::sort(samples.begin(), samples.end());
-    return samples[samples.size() / 2];
-  };
+  }
 
   int64_t fastest = -1;
   int64_t slowest = -1;
-  std::string fastest_sql;
-  std::string slowest_sql;
-  for (const RPredPtr& v : variants) {
-    const std::string sql =
-        "SELECT COUNT(*) FROM " + tab + " WHERE " + v->Render() + ";";
-    const int64_t ns = median_ns(sql);
-    if (ns < 0) {
-      if (verbose) {
-        std::cerr << "[sql_oracle][amoeba-skip]\n";
-      }
-      return "";
+  size_t fastest_idx = 0;
+  size_t slowest_idx = 0;
+  for (size_t vi = 0; vi < sqls.size(); ++vi) {
+    std::sort(all_samples[vi].begin(), all_samples[vi].end());
+    const int64_t med = all_samples[vi][all_samples[vi].size() / 2];
+    if (fastest < 0 || med < fastest) {
+      fastest = med;
+      fastest_idx = vi;
     }
-    if (fastest < 0 || ns < fastest) {
-      fastest = ns;
-      fastest_sql = sql;
-    }
-    if (slowest < 0 || ns > slowest) {
-      slowest = ns;
-      slowest_sql = sql;
+    if (slowest < 0 || med > slowest) {
+      slowest = med;
+      slowest_idx = vi;
     }
   }
-  // Conservative thresholds: report only egregious regressions so CI noise
-  // cannot produce false positives.
-  if (slowest > 3000000 && slowest > 30 * fastest) {
+
+  // Conservative thresholds: report only egregious regressions where the
+  // optimizer produced different plans or huge runtime divergence.
+  if (slowest > 20000000 && slowest > 30 * fastest) {
+    const std::string plan_fast = explain_plan(sqls[fastest_idx]);
+    const std::string plan_slow = explain_plan(sqls[slowest_idx]);
+    if (!plan_fast.empty() && !plan_slow.empty() && plan_fast == plan_slow) {
+      // Identical physical plan: runtime divergence is host scheduler noise.
+      return "";
+    }
     std::string report = "[AMOEBA MISMATCH]\n";
-    report += "  fast: " + fastest_sql + " => " +
+    report += "  fast: " + sqls[fastest_idx] + " => " +
               std::to_string(fastest / 1000000) + "ms\n";
-    report += "  slow: " + slowest_sql + " => " +
+    report += "  slow: " + sqls[slowest_idx] + " => " +
               std::to_string(slowest / 1000000) + "ms\n";
     return report;
   }

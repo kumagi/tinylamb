@@ -53,9 +53,13 @@ class TransactionTest : public ::testing::Test {
     lm_.reset();
     pm_.reset();
     l_.reset();
+    if (!log_name_.empty()) {
+      std::ignore = std::remove(log_name_.c_str());
+      log_name_.clear();
+    }
     // Unique log file per run: parallel test suites must not share a WAL.
-    l_ = Logger::Create("transaction_test-" + RandomString() + ".log")
-             .MoveValue();
+    log_name_ = "transaction_test-" + RandomString() + ".log";
+    l_ = Logger::Create(log_name_).MoveValue();
     lm_ = std::make_unique<LockManager>();
     // Fixture premise: pm_/recovery_ stay null on purpose.  The tests below
     // only exercise lock/version bookkeeping; any page-accessing method would
@@ -63,7 +67,19 @@ class TransactionTest : public ::testing::Test {
     tm_ = std::make_unique<TransactionManager>(pm_.get(), l_.get(), nullptr);
   }
 
+  void TearDown() override {
+    tm_.reset();
+    lm_.reset();
+    pm_.reset();
+    l_.reset();
+    if (!log_name_.empty()) {
+      std::ignore = std::remove(log_name_.c_str());
+      log_name_.clear();
+    }
+  }
+
  protected:
+  std::string log_name_;
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> pm_;
   std::unique_ptr<Logger> l_;

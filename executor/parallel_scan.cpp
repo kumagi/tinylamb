@@ -37,7 +37,7 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
 ParallelScan::~ParallelScan() {
   {
     std::scoped_lock lock(mutex_);
-    cancelled_ = true;
+    cancelled_.store(true, std::memory_order_release);
   }
   ready_cv_.notify_all();
   space_cv_.notify_all();
@@ -86,7 +86,7 @@ void ParallelScan::RunWorker(size_t batch_size) {
         projection_types.push_back(table_->GetSchema().GetColumn(slot).Type());
       }
     }
-    while (true) {
+    while (!cancelled_.load(std::memory_order_relaxed)) {
       const size_t morsel_index = next_morsel_.fetch_add(1);
       if (morsel_index >= morsels_.size()) {
         break;
@@ -105,6 +105,10 @@ void ParallelScan::RunWorker(size_t batch_size) {
         chunk.Initialize(table_->GetSchema(), batch_size);
       }
       while (iterator.IsValid()) {
+        if (cancelled_.load(std::memory_order_relaxed)) {
+          iterator.DropPageLatch();
+          return;
+        }
         chunk.Append(*iterator, iterator.Position());
         ++iterator;
         if (chunk.Size() == batch_size) {
@@ -140,7 +144,7 @@ void ParallelScan::RunWorker(size_t batch_size) {
     if (!worker_error_) {
       worker_error_ = std::current_exception();
     }
-    cancelled_ = true;
+    cancelled_.store(true, std::memory_order_release);
   }
   {
     std::scoped_lock lock(mutex_);
@@ -152,9 +156,11 @@ void ParallelScan::RunWorker(size_t batch_size) {
 
 bool ParallelScan::Enqueue(DataChunk chunk) {
   std::unique_lock lock(mutex_);
-  space_cv_.wait(
-      lock, [this] { return cancelled_ || ready_.size() < max_ready_chunks_; });
-  if (cancelled_) {
+  space_cv_.wait(lock, [this] {
+    return cancelled_.load(std::memory_order_relaxed) ||
+           ready_.size() < max_ready_chunks_;
+  });
+  if (cancelled_.load(std::memory_order_relaxed)) {
     return false;
   }
   ready_.push_back(std::move(chunk));

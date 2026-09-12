@@ -425,12 +425,12 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
       1 + static_cast<int>(rng() % static_cast<uint32_t>(
                                        std::max(1, config.max_operator_depth)));
   std::vector<int> op_choices;
-  op_choices.reserve(static_cast<size_t>(depth));
+  op_choices.reserve(depth);
   for (int d = 0; d < depth; ++d) {
-    op_choices.push_back(static_cast<int>(rng() % 7));
+    op_choices.push_back(static_cast<int>(rng() % 10));
   }
   const bool use_outer_join_root = (relation_count >= 2 && rng() % 3 == 0);
-  const auto outer_join_type = static_cast<uint8_t>(rng() % 3);
+  const uint8_t outer_join_type = static_cast<uint8_t>(rng() % 3);
 
   std::ostringstream desc;
   desc << "relations{" << gen.relations.size() << "} ops[";
@@ -560,7 +560,7 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
           current = limit_group;
           break;
         }
-        default: {  // Window
+        case 6: {  // Window
           const cascades::GroupId win_group =
               memo.EnsureDerivedGroup(relations, tag + "window");
           memo.AddExpression(
@@ -569,6 +569,42 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
                              .children = {current},
                              .partition_by = {ColumnValueExp(rel0 + ".c0")}});
           current = win_group;
+          break;
+        }
+        case 7: {  // TopN
+          const cascades::GroupId topn_group =
+              memo.EnsureDerivedGroup(relations, tag + "topn");
+          memo.AddExpression(topn_group,
+                             cascades::LogicalExpression{
+                                 .operation = cascades::LogicalOperator::kTopN,
+                                 .children = {current},
+                                 .target_list = {NamedExpression(rel0 + ".c0")},
+                                 .sort_ascending = {true},
+                                 .sort_nulls_first = {std::nullopt},
+                                 .limit_count = 5,
+                                 .limit_offset = 0});
+          current = topn_group;
+          break;
+        }
+        case 8: {  // Max1Row
+          const cascades::GroupId max1_group =
+              memo.EnsureDerivedGroup(relations, tag + "max1row");
+          memo.AddExpression(
+              max1_group, cascades::LogicalExpression{
+                              .operation = cascades::LogicalOperator::kMax1Row,
+                              .children = {current}});
+          current = max1_group;
+          break;
+        }
+        default: {  // Unnest
+          const cascades::GroupId unnest_group =
+              memo.EnsureDerivedGroup(relations, tag + "unnest");
+          memo.AddExpression(
+              unnest_group, cascades::LogicalExpression{
+                                .operation = cascades::LogicalOperator::kUnnest,
+                                .children = {current},
+                                .unnest_alias = "elem"});
+          current = unnest_group;
           break;
         }
       }

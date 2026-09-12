@@ -46,7 +46,8 @@ constexpr size_t kParallelSortMinRows = 4096;
 
 uint64_t BSwap64(uint64_t v) { return __builtin_bswap64(v); }
 
-void AppendMemComparableValue(const Value& v, std::string* out) {
+void AppendMemComparableValue(const Value& v, std::string* out,
+                              bool is_unsigned = false) {
   switch (v.type) {
     case ValueType::kInt64:
     case ValueType::kDate: {
@@ -54,7 +55,9 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
       const uint64_t be = BSwap64(static_cast<uint64_t>(v.value.int_value));
       std::array<char, 8> buf{};
       std::memcpy(buf.data(), &be, buf.size());
-      buf[0] ^= static_cast<char>(0x80);
+      if (!is_unsigned && !v.IsUnsigned()) {
+        buf[0] ^= static_cast<char>(0x80);
+      }
       out->append(buf.data(), buf.size());
       break;
     }
@@ -149,10 +152,11 @@ class SortKeyEncoder {
         const int offset =
             schema.Offset(key.expression->AsColumnValue().GetColumnName());
         if (offset >= 0) {
-          const ValueType type =
-              schema.GetColumn(static_cast<size_t>(offset)).Type();
+          const auto& col = schema.GetColumn(static_cast<size_t>(offset));
+          const ValueType type = col.Type();
           if (type == ValueType::kInt64 || type == ValueType::kDate) {
             spec.column = offset;
+            spec.is_unsigned = col.IsUnsigned();
           }
         }
       }
@@ -174,11 +178,9 @@ class SortKeyEncoder {
     }
     *is_null = false;
     const auto bits = static_cast<uint64_t>(v.value.int_value);
-    // Order-preserving map: sign flip for ASC. DESC must invert that map
-    // (~(bits ^ sign)), not the raw two's-complement bits: ~bits keeps
-    // negative keys below positive ones, so mixed-sign DESC came out wrong.
-    const uint64_t flipped = bits ^ (uint64_t{1} << 63);
-    return specs_[0].ascending ? flipped : ~flipped;
+    const bool is_unsigned = specs_[0].is_unsigned || v.IsUnsigned();
+    const uint64_t mapped = is_unsigned ? bits : (bits ^ (uint64_t{1} << 63));
+    return specs_[0].ascending ? mapped : ~mapped;
   }
 
   void AppendEncoded(const Row& row, std::string* out,
@@ -211,7 +213,7 @@ class SortKeyEncoder {
           continue;
         }
         out->push_back('\x01');
-        AppendMemComparableValue(*v, out);
+        AppendMemComparableValue(*v, out, spec.is_unsigned);
       } else {
         if (v->IsNull()) {
           out->push_back(nulls_first ? '\x00' : '\xff');
@@ -219,7 +221,7 @@ class SortKeyEncoder {
         }
         out->push_back('\x01');
         const size_t begin = out->size();
-        AppendMemComparableValue(*v, out);
+        AppendMemComparableValue(*v, out, spec.is_unsigned);
         for (size_t i = begin; i < out->size(); ++i) {
           (*out)[i] = static_cast<char>(~(*out)[i]);
         }
@@ -233,6 +235,7 @@ class SortKeyEncoder {
     bool ascending{true};
     bool nulls_first{true};
     int column{-1};
+    bool is_unsigned{false};
   };
   const Schema* schema_;
   std::vector<Spec> specs_;

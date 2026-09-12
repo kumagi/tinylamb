@@ -51,6 +51,15 @@ class CheckpointTest : public RowPageTest {
   }
 
   void TearDown() override {
+    cm_.reset();
+    tm_.reset();
+    lm_.reset();
+    r_.reset();
+    l_.reset();
+    if (p_) {
+      p_->GetPool()->DropAllPages();
+    }
+    p_.reset();
     // Best-effort cleanup; a missing file must not fail the test.
     (void)std::remove(db_name_.c_str());
     (void)std::remove(log_name_.c_str());

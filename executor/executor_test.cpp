@@ -42,6 +42,7 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/bitmap_scan.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
 #include "executor/data_chunk.hpp"
@@ -281,6 +282,128 @@ TEST_F(ExecutorTest, IndexOnlyFullScan) {
 
   // Assert -- cursor exhausted after all projected rows consumed
   ASSERT_FALSE(fs.Next(&got, &pos));
+}
+
+TEST_F(ExecutorTest, IndexOnlyScanAndBitmapScanMvccSnapshotVisibility) {
+  Schema mvcc_schema(
+      "MvccTable",
+      {Column("id", ValueType::kInt64), Column("name", ValueType::kVarChar),
+       Column("val", ValueType::kDouble)});
+  TransactionContext init_ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(init_ctx, mvcc_schema));
+  ASSERT_SUCCESS(
+      tbl.Insert(init_ctx.txn_, Row({Value(1), Value("one"), Value(1.1)}))
+          .GetStatus());
+  ASSERT_SUCCESS(
+      tbl.Insert(init_ctx.txn_, Row({Value(2), Value("two"), Value(2.2)}))
+          .GetStatus());
+  ASSERT_SUCCESS(
+      tbl.Insert(init_ctx.txn_, Row({Value(3), Value("three"), Value(3.3)}))
+          .GetStatus());
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      init_ctx, "MvccTable",
+      IndexSchema("IdxMvcc", {0}, {1, 2}, IndexMode::kVersionedUnique)));
+  ASSERT_SUCCESS(init_ctx.txn_.PreCommit());
+
+  TransactionContext reader_ctx = rs_->BeginReadOnlyContext();
+
+  TransactionContext writer_ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, w_tbl, rs_->GetTable(writer_ctx, "MvccTable"));
+  IndexScan find_row(writer_ctx.txn_, w_tbl, w_tbl.GetIndex(0), Value(1),
+                     Value(1), true, Expression(), mvcc_schema);
+  Row found_row;
+  RowPosition pos1;
+  ASSERT_TRUE(find_row.Next(&found_row, &pos1));
+  ASSERT_SUCCESS(
+      w_tbl.Update(writer_ctx.txn_, pos1,
+                   Row({Value(1), Value("one_updated"), Value(99.9)}))
+          .GetStatus());
+
+  IndexScan find_row2(writer_ctx.txn_, w_tbl, w_tbl.GetIndex(0), Value(2),
+                      Value(2), true, Expression(), mvcc_schema);
+  RowPosition pos2;
+  ASSERT_TRUE(find_row2.Next(&found_row, &pos2));
+  ASSERT_SUCCESS(w_tbl.Delete(writer_ctx.txn_, pos2));
+
+  ASSERT_SUCCESS(
+      w_tbl.Insert(writer_ctx.txn_, Row({Value(4), Value("four"), Value(4.4)}))
+          .GetStatus());
+  ASSERT_SUCCESS(writer_ctx.txn_.PreCommit());
+
+  ASSIGN_OR_ASSERT_FAIL(Table, r_tbl, rs_->GetTable(reader_ctx, "MvccTable"));
+  IndexOnlyScan ios(reader_ctx.txn_, r_tbl, r_tbl.GetIndex(0), Value(), Value(),
+                    true, Expression(), mvcc_schema);
+  std::vector<Row> ios_rows;
+  Row r;
+  while (ios.Next(&r, nullptr)) {
+    ios_rows.push_back(r);
+  }
+  ASSERT_EQ(ios_rows.size(), 3U);
+  EXPECT_EQ(ios_rows[0][0], Value(1));
+  EXPECT_EQ(ios_rows[0][1], Value("one"));
+  EXPECT_EQ(ios_rows[0][2], Value(1.1));
+  EXPECT_EQ(ios_rows[1][0], Value(2));
+  EXPECT_EQ(ios_rows[1][1], Value("two"));
+  EXPECT_EQ(ios_rows[2][0], Value(3));
+  EXPECT_EQ(ios_rows[2][1], Value("three"));
+
+  BitmapIndexScan bis(reader_ctx.txn_, r_tbl, r_tbl.GetIndex(0), Value(),
+                      Value());
+  std::vector<RowPosition> positions = bis.ScanPositions();
+  BitmapHeapScan bhs(reader_ctx.txn_, r_tbl, std::move(positions), Expression(),
+                     mvcc_schema);
+  std::vector<Row> bhs_rows;
+  while (bhs.Next(&r, nullptr)) {
+    bhs_rows.push_back(r);
+  }
+  ASSERT_EQ(bhs_rows.size(), 3U);
+  std::ranges::sort(bhs_rows, [](const Row& a, const Row& b) {
+    return a[0].value.int_value < b[0].value.int_value;
+  });
+  EXPECT_EQ(bhs_rows[0][0], Value(1));
+  EXPECT_EQ(bhs_rows[0][1], Value("one"));
+  EXPECT_EQ(bhs_rows[0][2], Value(1.1));
+  EXPECT_EQ(bhs_rows[1][0], Value(2));
+  EXPECT_EQ(bhs_rows[1][1], Value("two"));
+  EXPECT_EQ(bhs_rows[2][0], Value(3));
+  EXPECT_EQ(bhs_rows[2][1], Value("three"));
+
+  ASSERT_SUCCESS(reader_ctx.txn_.PreCommit());
+
+  TransactionContext fresh_ctx = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, f_tbl, rs_->GetTable(fresh_ctx, "MvccTable"));
+  IndexOnlyScan fresh_ios(fresh_ctx.txn_, f_tbl, f_tbl.GetIndex(0), Value(),
+                         Value(), true, Expression(), mvcc_schema);
+  std::vector<Row> fresh_ios_rows;
+  while (fresh_ios.Next(&r, nullptr)) {
+    fresh_ios_rows.push_back(r);
+  }
+  ASSERT_EQ(fresh_ios_rows.size(), 3U);
+  EXPECT_EQ(fresh_ios_rows[0][0], Value(1));
+  EXPECT_EQ(fresh_ios_rows[0][1], Value("one_updated"));
+  EXPECT_EQ(fresh_ios_rows[0][2], Value(99.9));
+  EXPECT_EQ(fresh_ios_rows[1][0], Value(3));
+  EXPECT_EQ(fresh_ios_rows[2][0], Value(4));
+
+  BitmapIndexScan fresh_bis(fresh_ctx.txn_, f_tbl, f_tbl.GetIndex(0), Value(),
+                            Value());
+  std::vector<RowPosition> fresh_positions = fresh_bis.ScanPositions();
+  BitmapHeapScan fresh_bhs(fresh_ctx.txn_, f_tbl, std::move(fresh_positions),
+                           Expression(), mvcc_schema);
+  std::vector<Row> fresh_bhs_rows;
+  while (fresh_bhs.Next(&r, nullptr)) {
+    fresh_bhs_rows.push_back(r);
+  }
+  ASSERT_EQ(fresh_bhs_rows.size(), 3U);
+  std::ranges::sort(fresh_bhs_rows, [](const Row& a, const Row& b) {
+    return a[0].value.int_value < b[0].value.int_value;
+  });
+  EXPECT_EQ(fresh_bhs_rows[0][0], Value(1));
+  EXPECT_EQ(fresh_bhs_rows[0][1], Value("one_updated"));
+  EXPECT_EQ(fresh_bhs_rows[0][2], Value(99.9));
+  EXPECT_EQ(fresh_bhs_rows[1][0], Value(3));
+  EXPECT_EQ(fresh_bhs_rows[2][0], Value(4));
+  ASSERT_SUCCESS(fresh_ctx.txn_.PreCommit());
 }
 
 TEST_F(ExecutorTest, Projection) {
@@ -3906,6 +4029,45 @@ TEST_F(ExecutorTest, AggregationTypedConstantFastPath) {
   EXPECT_EQ(result[1], Value(int64_t{100}));
   EXPECT_EQ(result[2], Value(int64_t{5}));
   EXPECT_EQ(result[3], Value(int64_t{5}));
+}
+
+TEST_F(ExecutorTest, AggregationUnsignedInt64) {
+  std::vector<Row> rows = {
+      Row({Value(int64_t{10}).WithUnsigned()}),
+      Row({Value(static_cast<int64_t>(18446744073709551600ULL))
+               .WithUnsigned()}),
+      Row({Value(int64_t{5}).WithUnsigned()})};
+  Column col("u", ValueType::kInt64);
+  col.SetUnsigned(true);
+  const Schema schema("s", {col});
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("min_u", AggregateExpressionExp(AggregationType::kMin,
+                                                      ColumnValueExp("u"))),
+      NamedExpression("max_u", AggregateExpressionExp(AggregationType::kMax,
+                                                      ColumnValueExp("u"))),
+      NamedExpression("sum_u", AggregateExpressionExp(AggregationType::kSum,
+                                                      ColumnValueExp("u"))),
+      NamedExpression("bit_and_u",
+                      AggregateExpressionExp(AggregationType::kBitAnd,
+                                             ColumnValueExp("u"))),
+      NamedExpression("bit_or_u",
+                      AggregateExpressionExp(AggregationType::kBitOr,
+                                             ColumnValueExp("u")))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates), 64);
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_TRUE(result[0].IsUnsigned());
+  EXPECT_EQ(result[0].AsString(), "5");
+  EXPECT_TRUE(result[1].IsUnsigned());
+  EXPECT_EQ(result[1].AsString(), "18446744073709551600");
+  EXPECT_TRUE(result[2].IsUnsigned());
+  EXPECT_EQ(result[2].AsString(), "18446744073709551615");
+  EXPECT_TRUE(result[3].IsUnsigned());
+  EXPECT_EQ(result[3].AsString(), "0");
+  EXPECT_TRUE(result[4].IsUnsigned());
+  EXPECT_EQ(result[4].AsString(), "18446744073709551615");
 }
 
 TEST_F(ExecutorTest, ParallelAggregationLogicalAndOr) {

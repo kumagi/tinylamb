@@ -48,8 +48,9 @@ RelationRenamePlan::RelationRenamePlan(Plan src, std::string relation,
   const Schema& source = src_->GetSchema();
   columns.reserve(source.ColumnCount());
   for (size_t i = 0; i < source.ColumnCount(); ++i) {
-    const ColumnName& column = source.GetColumn(i).Name();
-    columns.emplace_back(ColumnName(relation_, column.name));
+    Column col = source.GetColumn(i);
+    col.Name() = ColumnName(relation_, col.Name().name);
+    columns.push_back(std::move(col));
   }
   renamed_schema_ = Schema("", std::move(columns));
 }

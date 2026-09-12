@@ -27,6 +27,9 @@ class ValuesPlan final : public PlanBase {
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
   [[nodiscard]] const std::vector<Row>& Rows() const { return rows_; }
+  [[nodiscard]] bool EnforcesDistinct() const override {
+    return rows_.size() <= 1;
+  }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -53,6 +56,7 @@ class DummyScanPlan final : public PlanBase {
       const std::vector<bool>& /*ascending*/) const override {
     return true;
   }
+  [[nodiscard]] bool EnforcesDistinct() const override { return true; }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

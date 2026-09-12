@@ -711,7 +711,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           return;
         }
         if (!MatchScanFilter(row, source.schema, local_filter, nullptr, context,
-                             ctes)) {
+                             ctes, &group_error)) {
           return;
         }
         GroupAggs* group = nullptr;

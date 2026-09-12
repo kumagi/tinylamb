@@ -1757,8 +1757,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   }
   for (size_t idx : load_order) {
     if (!base_sources[idx]) {
-      FilterRelation(context, &relations[idx], local_predicates[idx], outer,
-                     ctes);
+      RETURN_IF_FAIL(FilterRelation(context, &relations[idx],
+                                    local_predicates[idx], outer, ctes));
       loaded[idx] = true;
       continue;
     }
@@ -2029,7 +2029,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // Subquery-bearing or constant-only ON conjuncts never made it into a
     // scan filter or join key; evaluate them over the joined rows now so the
     // inner-join semantics stay intact.
-    FilterRelation(context, &result, join_residual, outer, ctes);
+    RETURN_IF_FAIL(FilterRelation(context, &result, join_residual, outer, ctes));
   }
   return result;
 }

@@ -54,6 +54,7 @@ IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
       key_schema_(KeySchema(index, sc)),
       value_schema_(ValueSchema(index, sc)),
       output_schema_(OutputSchema(index, sc)),
+      include_offsets_(index.sc_.include_),
       ascending_(ascending) {}
 
 Schema IndexOnlyScan::KeySchema(const Index& idx, const Schema& input_schema) {
@@ -95,11 +96,21 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
   while (iter_.IsValid()) {
     // Heap visibility: uncommitted or snapshot-invisible index entries must
     // not leak through INCLUDE columns that are not versioned.
-    if (!(*iter_).IsValid()) {
+    const Row& heap_row = *iter_;
+    if (!heap_row.IsValid()) {
       ++iter_;
       continue;
     }
-    *dst = iter_.GetKey() + iter_.Include();
+    if (include_offsets_.empty()) {
+      *dst = iter_.GetKey();
+    } else {
+      Row inc;
+      inc.values_.reserve(include_offsets_.size());
+      for (slot_t offset : include_offsets_) {
+        inc.values_.push_back(heap_row[offset]);
+      }
+      *dst = iter_.GetKey() + std::move(inc);
+    }
     ++iter_;
     if (!dst->IsValid()) {
       continue;

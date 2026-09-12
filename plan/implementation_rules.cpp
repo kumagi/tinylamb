@@ -1340,8 +1340,9 @@ std::vector<PlanAlternative> JoinAlternatives(
           std::vector<Column> renamed_columns;
           renamed_columns.reserve(physical_schema.ColumnCount());
           for (size_t i = 0; i < physical_schema.ColumnCount(); ++i) {
-            renamed_columns.emplace_back(ColumnName(
-                right_relation, physical_schema.GetColumn(i).Name().name));
+            Column col = physical_schema.GetColumn(i);
+            col.Name() = ColumnName(right_relation, col.Name().name);
+            renamed_columns.push_back(std::move(col));
           }
           const Schema declared_output =
               left.plan->GetSchema() + Schema("", std::move(renamed_columns));
@@ -1455,7 +1456,7 @@ std::vector<PlanAlternative> MergeJoinAlternative(
   const bool right_ordered = right.plan->IsOrderedBy(ordering_right, ascending);
 
   const auto sort_cost = [](double rows) {
-    return rows <= 1 ? rows : rows * std::log2(rows);
+    return rows * std::log2(std::max(2.0, rows));
   };
   Plan left_plan = left.plan;
   Plan right_plan = right.plan;
@@ -2038,7 +2039,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           // remains selectable by rule disabling/hints and is costed as a
           // materializing sort plus the accumulator pass.
           const double sort_cost =
-              rows <= 1.0 ? rows : (rows * std::log2(rows)) + rows;
+              (rows * std::log2(std::max(2.0, rows))) + rows;
           std::vector<PlanAlternative> agg_alternatives{
               PlanAlternative{.plan = std::move(hash),
                               .local_cost = rows,
@@ -2092,7 +2093,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           Plan sort =
               std::make_shared<SortPlan>(children[0].plan, std::move(keys));
           const double rows = children[0].estimated_rows;
-          const double cost = rows <= 1 ? rows : rows * std::log2(rows);
+          const double cost = rows * std::log2(std::max(2.0, rows));
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(sort),
                               .local_cost = cost,
@@ -2126,7 +2127,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           const double rows = children[0].estimated_rows;
           return std::vector<PlanAlternative>{PlanAlternative{
               .plan = std::move(topn),
-              .local_cost = rows <= 1 ? rows : rows * std::log2(rows),
+              .local_cost = rows * std::log2(std::max(2.0, rows)),
               .estimated_rows = LimitOutputRows(rows, logical.limit_count,
                                                 logical.limit_offset)}};
         },
@@ -2184,7 +2185,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           const std::vector<bool> ascending(ordering.size(), true);
           if (!input->IsOrderedBy(ordering, ascending)) {
             const double rows = children[0].estimated_rows;
-            cost += rows <= 1 ? rows : rows * std::log2(rows);
+            cost += rows * std::log2(std::max(2.0, rows));
             input =
                 std::make_shared<SortPlan>(std::move(input), std::move(keys));
           }

@@ -109,6 +109,9 @@ StatusOr<size_t> Row::TryDeserialize(const char* src, const Schema& sc) {
       ASSIGN_OR_RETURN(size_t, consumed,
                        v.TryDeserialize(src, sc.GetColumn(i).Type()));
       src += consumed;
+      if (sc.GetColumn(i).IsUnsigned() && v.type == ValueType::kInt64) {
+        v = v.WithUnsigned();
+      }
     }
     values_.push_back(v);
   }
@@ -153,6 +156,9 @@ StatusOr<size_t> Row::TryDeserializeProjected(
       Value value;
       ASSIGN_OR_RETURN(size_t, consumed, value.TryDeserialize(src, type));
       src += consumed;
+      if (sc.GetColumn(i).IsUnsigned() && value.type == ValueType::kInt64) {
+        value = value.WithUnsigned();
+      }
       values_.push_back(std::move(value));
       ++projection;
     } else {

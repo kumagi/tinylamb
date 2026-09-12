@@ -98,7 +98,8 @@ bool RejectsNulls(const Expression& expression, const std::string& qualifier) {
           // padded row alive (`NOT (padded.a > 5 AND other.x > 100)`).
           return NeverFalse(unary.Child(), qualifier);
         case UnaryOperation::kMinus:
-          // Arithmetic negation keeps NULL; a non-NULL child may stay TRUE
+        case UnaryOperation::kBitwiseNot:
+          // Arithmetic/bitwise negation keeps NULL; a non-NULL child may stay TRUE
           // (e.g. IS TRUE wrappers), so require the child to reject.
           return RejectsNulls(unary.Child(), qualifier);
         case UnaryOperation::kIsNull:
@@ -195,6 +196,7 @@ bool NeverFalse(const Expression& expression, const std::string& qualifier) {
           // is precisely RejectsNulls(e).
           return RejectsNulls(unary.Child(), qualifier);
         case UnaryOperation::kMinus:
+        case UnaryOperation::kBitwiseNot:
           return NeverFalse(unary.Child(), qualifier);
         default:
           // IS-family predicates return concrete FALSE for many padded-row

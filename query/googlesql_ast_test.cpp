@@ -368,6 +368,27 @@ TEST(GoogleSqlAstTest, CreateTableColumnTypes) {
   EXPECT_EQ(create.Columns()[9].Type(), ValueType::kInt64);
 }
 
+TEST(GoogleSqlAstTest, CreateTableExtendedColumnTypes) {
+  auto statement = VisitSql(
+      "CREATE TABLE t (u UINT64, u32 UINT32, i32 INT32, f32 FLOAT32, "
+      "b BYTES, js JSON, bn BIGNUMERIC);");
+  ASSERT_TRUE(statement);
+  ASSERT_EQ(statement->Type(), StatementType::kCreateTable);
+  const auto& create = dynamic_cast<const CreateTableStatement&>(*statement);
+  EXPECT_EQ(create.TableName(), "t");
+  ASSERT_EQ(create.Columns().size(), 7);
+  EXPECT_EQ(create.Columns()[0].Type(), ValueType::kInt64);
+  EXPECT_TRUE(create.Columns()[0].IsUnsigned());
+  EXPECT_EQ(create.Columns()[1].Type(), ValueType::kInt64);
+  EXPECT_TRUE(create.Columns()[1].IsUnsigned());
+  EXPECT_EQ(create.Columns()[2].Type(), ValueType::kInt64);
+  EXPECT_FALSE(create.Columns()[2].IsUnsigned());
+  EXPECT_EQ(create.Columns()[3].Type(), ValueType::kDouble);
+  EXPECT_EQ(create.Columns()[4].Type(), ValueType::kVarChar);
+  EXPECT_EQ(create.Columns()[5].Type(), ValueType::kVarChar);
+  EXPECT_EQ(create.Columns()[6].Type(), ValueType::kDouble);
+}
+
 TEST(GoogleSqlAstTest, InsertWithAndWithoutColumnList) {
   auto with_columns = VisitSql("INSERT INTO t (a, b) VALUES (1, 2);");
   ASSERT_TRUE(with_columns);

@@ -66,7 +66,7 @@ class ParallelScan final : public ExecutorBase {
   std::deque<DataChunk> ready_;
   size_t active_workers_{0};
   bool started_{false};
-  bool cancelled_{false};
+  std::atomic<bool> cancelled_{false};
   std::exception_ptr worker_error_;
 
   std::optional<DataChunk> pending_;

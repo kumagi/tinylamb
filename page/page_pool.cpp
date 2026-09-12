@@ -162,6 +162,7 @@ StatusOr<PageRef> PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit,
           }
         }
       }
+      cache_hits_.fetch_add(1, std::memory_order_relaxed);
       return PageRef(this, hit_page, hit_page_latch, shared, hit_pin_count);
     }
 
@@ -179,6 +180,7 @@ StatusOr<PageRef> PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit,
       if (cache_hit != nullptr) {
         *cache_hit = true;
       }
+      cache_hits_.fetch_add(1, std::memory_order_relaxed);
       latch.unlock();
       return PageRef(this, page, page_latch, shared, pin_count);
     }
@@ -275,6 +277,7 @@ StatusOr<PageRef> PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit,
       Page* const page = refreshed->page.get();
       std::shared_mutex* const page_latch = refreshed->page_latch.get();
       std::atomic<uint32_t>* const pin_count = &refreshed->pin_count;
+      cache_hits_.fetch_add(1, std::memory_order_relaxed);
       latch.unlock();
       return PageRef(this, page, page_latch, shared, pin_count);
     }
@@ -358,6 +361,7 @@ StatusOr<PageRef> PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit,
     latch.unlock();
     // Page content was loaded without holding page_latch, so the caller may
     // take a shared page latch when requested.
+    cache_misses_.fetch_add(1, std::memory_order_relaxed);
     return PageRef(this, raw_page, raw_latch, shared, installed_pin_count);
   }
 }
@@ -488,6 +492,22 @@ void PagePool::Touch(LruType::iterator it) {
   // them the Entry addresses published in the stripe maps) stay stable.
   pool_lru_.splice(pool_lru_.end(), pool_lru_, it);
   pool_[it->page->PageID()] = it;
+}
+
+size_t PagePool::PinnedPageCount() const noexcept {
+  std::shared_lock latch(pool_latch);
+  size_t count = 0;
+  for (const auto& entry : pool_lru_) {
+    if (entry.pin_count.load(std::memory_order_relaxed) > 0) {
+      ++count;
+    }
+  }
+  for (const auto& entry : retired_) {
+    if (entry.pin_count.load(std::memory_order_relaxed) > 0) {
+      ++count;
+    }
+  }
+  return count;
 }
 
 PagePool::~PagePool() {

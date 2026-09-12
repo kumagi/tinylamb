@@ -188,7 +188,10 @@ Status ParallelAggregationExecutor::AccumulateValue(PartialState* state,
       state->values[index].value.double_value +=
           value.type == ValueType::kDouble
               ? value.value.double_value
-              : static_cast<double>(value.value.int_value);
+              : (value.IsUnsigned()
+                     ? static_cast<double>(
+                           static_cast<uint64_t>(value.value.int_value))
+                     : static_cast<double>(value.value.int_value));
       ++state->counts[index];
       break;
     case AggregationType::kMin:
@@ -425,6 +428,34 @@ Status ParallelAggregationExecutor::AccumulateInt64Column(
       break;
     }
     case AggregationType::kSum: {
+      if (column.IsUnsigned()) {
+        uint64_t sum = 0;
+        bool any = false;
+        bool overflow = false;
+        for (size_t row = 0; row < column.Size(); ++row) {
+          if (column.IsNull(row)) {
+            continue;
+          }
+          if (__builtin_add_overflow(sum, static_cast<uint64_t>(data[row]),
+                                     &sum)) {
+            overflow = true;
+          }
+          any = true;
+        }
+        if (!any) {
+          break;
+        }
+        Value& total = state->values[aggregate_index];
+        if (overflow ||
+            (!total.IsNull() &&
+             __builtin_add_overflow(
+                 static_cast<uint64_t>(total.value.int_value), sum, &sum))) {
+          return StatusError(StatusCode::kIsInfinity,
+                             "uint64 overflow in SUM");
+        }
+        total = Value(static_cast<int64_t>(sum)).WithUnsigned();
+        break;
+      }
       // The serial executor raises "integer overflow on '+'"; the parallel
       // path must not silently wrap (UB) instead.
       int64_t sum = 0;
@@ -458,7 +489,9 @@ Status ParallelAggregationExecutor::AccumulateInt64Column(
         if (column.IsNull(row)) {
           continue;
         }
-        total += static_cast<double>(data[row]);
+        total += column.IsUnsigned()
+                     ? static_cast<double>(static_cast<uint64_t>(data[row]))
+                     : static_cast<double>(data[row]);
         ++count;
       }
       break;
@@ -469,8 +502,16 @@ Status ParallelAggregationExecutor::AccumulateInt64Column(
         if (column.IsNull(row)) {
           continue;
         }
-        if (best.IsNull() || data[row] < best.value.int_value) {
-          best = Value(data[row]);
+        if (column.IsUnsigned()) {
+          if (best.IsNull() ||
+              static_cast<uint64_t>(data[row]) <
+                  static_cast<uint64_t>(best.value.int_value)) {
+            best = Value(data[row]).WithUnsigned();
+          }
+        } else {
+          if (best.IsNull() || data[row] < best.value.int_value) {
+            best = Value(data[row]);
+          }
         }
       }
       break;
@@ -481,8 +522,16 @@ Status ParallelAggregationExecutor::AccumulateInt64Column(
         if (column.IsNull(row)) {
           continue;
         }
-        if (best.IsNull() || best.value.int_value < data[row]) {
-          best = Value(data[row]);
+        if (column.IsUnsigned()) {
+          if (best.IsNull() ||
+              static_cast<uint64_t>(best.value.int_value) <
+                  static_cast<uint64_t>(data[row])) {
+            best = Value(data[row]).WithUnsigned();
+          }
+        } else {
+          if (best.IsNull() || best.value.int_value < data[row]) {
+            best = Value(data[row]);
+          }
         }
       }
       break;

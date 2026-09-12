@@ -161,7 +161,7 @@ TEST(ExprSimplifyOracle, GroundTruthExecutesNullifGreatestLeastIfnull) {
                 "greatest", {ConstantValueExp(Value(int64_t{1})),
                              ConstantValueExp(Value(2.5)),
                              ConstantValueExp(Value(int64_t{3}))})),
-            Value(int64_t{3}));
+            Value(3.0));
   EXPECT_TRUE(
       EvaluateGroundTruth(
           FunctionCallExp("least", {ConstantValueExp(Value()),
@@ -204,6 +204,91 @@ TEST(ExprSimplifyOracle, DoubleNegationKeepsMinOverflowError) {
       ExpressionRewriter(ExpressionRuleSet::Default())
           .Rewrite(UnaryExpressionExp(neg_min, UnaryOperation::kMinus));
   EXPECT_THROW(rewritten->Evaluate(Row(), Schema()), std::runtime_error);
+}
+
+TEST(ExprSimplifyOracle, DoubleNegationNonNumericPreservesError) {
+  Expression neg_str = UnaryExpressionExp(
+      ConstantValueExp(Value("foo")), UnaryOperation::kMinus);
+  ASSERT_THROW(EvaluateGroundTruth(neg_str), std::runtime_error);
+  Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default())
+          .Rewrite(UnaryExpressionExp(neg_str, UnaryOperation::kMinus));
+  EXPECT_THROW(rewritten->Evaluate(Row(), Schema()), std::runtime_error);
+}
+
+TEST(ExprSimplifyOracle, BooleanConnectivesPreserveTypeAndValueOnNonBooleans) {
+  const ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  const Row empty_row;
+  const Schema empty_schema;
+
+  // 1. String: "foo" AND "foo" evaluates to 1 (kInt64), NOT "foo" (kVarChar).
+  Expression str_expr = ConstantValueExp(Value("foo"));
+  Expression and_str = BinaryExpressionExp(str_expr, BinaryOperation::kAnd, str_expr);
+  Value original_and_str = and_str->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(original_and_str.type, ValueType::kInt64);
+  EXPECT_EQ(original_and_str.value.int_value, 1);
+  Expression rewritten_and_str = rewriter.Rewrite(and_str);
+  Value rewritten_val_str = rewritten_and_str->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(rewritten_val_str.type, ValueType::kInt64);
+  EXPECT_EQ(rewritten_val_str.value.int_value, 1);
+
+  // 2. Double: 2.5 AND 2.5 evaluates to 1 (kInt64), NOT 2.5 (kDouble).
+  Expression dbl_expr = ConstantValueExp(Value(2.5));
+  Expression and_dbl = BinaryExpressionExp(dbl_expr, BinaryOperation::kAnd, dbl_expr);
+  Value original_and_dbl = and_dbl->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(original_and_dbl.type, ValueType::kInt64);
+  EXPECT_EQ(original_and_dbl.value.int_value, 1);
+  Expression rewritten_and_dbl = rewriter.Rewrite(and_dbl);
+  Value rewritten_val_dbl = rewritten_and_dbl->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(rewritten_val_dbl.type, ValueType::kInt64);
+  EXPECT_EQ(rewritten_val_dbl.value.int_value, 1);
+
+  // 3. Double negation: NOT NOT 2.5 evaluates to 1 (kInt64), NOT 2.5 (kDouble).
+  Expression not_not_dbl = UnaryExpressionExp(
+      UnaryExpressionExp(dbl_expr, UnaryOperation::kNot), UnaryOperation::kNot);
+  Value original_not_not_dbl = not_not_dbl->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(original_not_not_dbl.type, ValueType::kInt64);
+  EXPECT_EQ(original_not_not_dbl.value.int_value, 1);
+  Expression rewritten_not_not_dbl = rewriter.Rewrite(not_not_dbl);
+  Value rewritten_val_not_not_dbl = rewritten_not_not_dbl->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(rewritten_val_not_not_dbl.type, ValueType::kInt64);
+  EXPECT_EQ(rewritten_val_not_not_dbl.value.int_value, 1);
+
+  // 4. Non-boolean Integer: 2 AND 2 evaluates to 1 (kInt64), NOT 2 (kInt64).
+  Expression two_expr = ConstantValueExp(Value(int64_t{2}));
+  Expression and_two = BinaryExpressionExp(two_expr, BinaryOperation::kAnd, two_expr);
+  Value original_and_two = and_two->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(original_and_two.value.int_value, 1);
+  Expression rewritten_and_two = rewriter.Rewrite(and_two);
+  Value rewritten_val_two = rewritten_and_two->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(rewritten_val_two.value.int_value, 1);
+
+  // 5. Absorption: 2 AND (2 OR 3) evaluates to 1 (kInt64), NOT 2.
+  Expression three_expr = ConstantValueExp(Value(int64_t{3}));
+  Expression absorb = BinaryExpressionExp(
+      two_expr, BinaryOperation::kAnd,
+      BinaryExpressionExp(two_expr, BinaryOperation::kOr, three_expr));
+  Value original_absorb = absorb->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(original_absorb.value.int_value, 1);
+  Expression rewritten_absorb = rewriter.Rewrite(absorb);
+  Value rewritten_val_absorb = rewritten_absorb->Evaluate(empty_row, empty_schema);
+  EXPECT_EQ(rewritten_val_absorb.value.int_value, 1);
+}
+
+TEST(ExprSimplifyOracle, ExtendedOpsSeededIterationsPreserveSemantics) {
+  constexpr int kIterations = 10000;
+  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+    std::mt19937 rng(seed);
+    ExprGenConfig config;
+    config.extended_ops = true;
+    config.max_depth = 2 + static_cast<int>(seed % 5);
+    config.null_percent = static_cast<int>(seed % 40);
+    GeneratedExpr generated = GenerateSimplifyExpr(rng, config);
+    ASSERT_TRUE(generated.expr);
+    std::string report = CheckSimplifyEquivalence(generated.expr);
+    ASSERT_EQ(report, "") << "seed=" << seed << "\n"
+                          << report << "\nSQL: " << generated.sql;
+  }
 }
 
 }  // namespace

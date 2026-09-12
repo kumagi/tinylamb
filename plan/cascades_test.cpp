@@ -4326,10 +4326,10 @@ TEST(CascadesTest, RankRowNumberToTopNSkipsNonWindowColumn) {
 }
 
 TEST(CascadesTest, RankRowNumberToTopNEqualsUsesOffsetForKthRow) {
-  // `WHERE rn = 3` over row_number() must become TopN(limit=3, offset=2):
-  // the k-th ranked row is the 3rd row with the first 2 dropped.  The old
-  // rule emitted limit=1/offset=0, returning the FIRST row instead of the
-  // 3rd.
+  // `WHERE rn = 3` over row_number() must become TopN(limit=1, offset=2):
+  // exactly the 3rd ranked row, skipping the first 2.  (An earlier form
+  // emitted limit=3/offset=2 -- correct but wider -- and the original bug
+  // emitted limit=1/offset=0, returning the FIRST row instead of the 3rd.)
   Memo memo;
   const GroupId scan = memo.Build({"t"});
   const GroupId win = memo.EnsureDerivedGroup({"t"}, "win");
@@ -4355,7 +4355,7 @@ TEST(CascadesTest, RankRowNumberToTopNEqualsUsesOffsetForKthRow) {
         return expr.operation == LogicalOperator::kTopN;
       });
   ASSERT_TRUE(it != search.GetMemo().Get(sel).expressions.end()) << true;
-  EXPECT_EQ(it->limit_count, 3U);
+  EXPECT_EQ(it->limit_count, 1U);
   EXPECT_EQ(it->limit_offset, 2U);
 }
 
@@ -5418,12 +5418,19 @@ TEST(CascadesTest, EagerAggregationOverJoinOnUniqueKey) {
 
   bool found_eager_agg = false;
   for (const auto& expr : search.GetMemo().Get(agg_group).expressions) {
-    if (expr.operation == LogicalOperator::kJoin && expr.children.size() == 2) {
-      const Group& left_child = search.GetMemo().Get(expr.children[0]);
-      for (const auto& cexpr : left_child.expressions) {
-        if (cexpr.operation == LogicalOperator::kAggregation) {
-          found_eager_agg = true;
-          break;
+    if (expr.operation == LogicalOperator::kAggregation &&
+        expr.children.size() == 1 && expr.children[0] != join_group) {
+      const Group& join_child = search.GetMemo().Get(expr.children[0]);
+      for (const auto& jexpr : join_child.expressions) {
+        if (jexpr.operation == LogicalOperator::kJoin &&
+            jexpr.children.size() == 2) {
+          const Group& left_child = search.GetMemo().Get(jexpr.children[0]);
+          for (const auto& cexpr : left_child.expressions) {
+            if (cexpr.operation == LogicalOperator::kAggregation) {
+              found_eager_agg = true;
+              break;
+            }
+          }
         }
       }
     }
@@ -5545,7 +5552,8 @@ TEST(CascadesTest, ForeignKeyOuterJoinElimination) {
   const Schema t1_schema(
       "t1",
       {Column("id", ValueType::kInt64, Constraint(Constraint::kPrimaryKey)),
-       Column("t2_id", ValueType::kInt64, Constraint(Constraint::kNotNull))});
+       Column("t2_id", ValueType::kInt64,
+              Constraint(Constraint::kForeign, Value(std::string("t2"))))});
   const Schema t2_schema("t2", {Column("id", ValueType::kInt64,
                                        Constraint(Constraint::kPrimaryKey)),
                                 Column("val", ValueType::kInt64)});
@@ -5553,7 +5561,15 @@ TEST(CascadesTest, ForeignKeyOuterJoinElimination) {
   (void)memo.Build({"t1", "t2"});
 
   const GroupId left = memo.EnsureGroup({"t1"});
+  memo.AddExpression(left,
+                     LogicalExpression{.operation = LogicalOperator::kScan,
+                                       .table = "t1",
+                                       .output_schema = t1_schema});
   const GroupId right = memo.EnsureGroup({"t2"});
+  memo.AddExpression(right,
+                     LogicalExpression{.operation = LogicalOperator::kScan,
+                                       .table = "t2",
+                                       .output_schema = t2_schema});
 
   const GroupId ojoin_group = memo.EnsureDerivedGroup({"t1", "t2"}, "ojoin");
   memo.AddExpression(
@@ -6662,6 +6678,145 @@ TEST(CascadesTest, ExploreTwiceReachesSameFixpoint) {
   search.Explore(root);
   EXPECT_EQ(search.GetMemo().GroupCount(), groups_once);
   EXPECT_EQ(search.GetMemo().ExpressionCount(root), root_exprs_once);
+}
+
+TEST(CascadesTest, CostMonotonicityApproximateVerification) {
+  PhysicalProperties delivered;
+  PhysicalProperties required;
+
+  // 1. Operator cost monotonicity across fine-grained row counts.
+  const std::vector<double> row_counts = {
+      0.0,   0.1,   0.5,    0.9,    1.0,     1.05,    1.1,
+      1.5,   2.0,   5.0,    10.0,   20.0,    50.0,    100.0,
+      250.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0};
+
+  const std::vector<OperatorCostKind> all_operators = {
+      OperatorCostKind::kHashJoin,       OperatorCostKind::kMergeJoin,
+      OperatorCostKind::kNestedLoopJoin, OperatorCostKind::kIndexScan,
+      OperatorCostKind::kBitmapScan,     OperatorCostKind::kSort};
+
+  for (OperatorCostKind kind : all_operators) {
+    // Monotonicity in left input rows.
+    for (size_t i = 1; i < row_counts.size(); ++i) {
+      double cost_prev = CalibrateOperatorCost(kind, row_counts[i - 1], 100.0,
+                                               delivered, required);
+      double cost_curr = CalibrateOperatorCost(kind, row_counts[i], 100.0,
+                                               delivered, required);
+      EXPECT_LE(cost_prev, cost_curr + 1e-9)
+          << "Operator cost not monotonic in left rows for kind "
+          << static_cast<int>(kind) << " between " << row_counts[i - 1]
+          << " and " << row_counts[i];
+    }
+    // Monotonicity in right input rows.
+    for (size_t i = 1; i < row_counts.size(); ++i) {
+      double cost_prev = CalibrateOperatorCost(kind, 100.0, row_counts[i - 1],
+                                               delivered, required);
+      double cost_curr = CalibrateOperatorCost(kind, 100.0, row_counts[i],
+                                               delivered, required);
+      EXPECT_LE(cost_prev, cost_curr + 1e-9)
+          << "Operator cost not monotonic in right rows for kind "
+          << static_cast<int>(kind) << " between " << row_counts[i - 1]
+          << " and " << row_counts[i];
+    }
+  }
+
+  // 2. Ordering mismatch penalty monotonicity.
+  PhysicalProperties required_ordered;
+  required_ordered.ordering = {ColumnName("t1", "id")};
+  for (double rows : row_counts) {
+    double match_cost = CalibrateOperatorCost(OperatorCostKind::kHashJoin, rows,
+                                              100.0, delivered, required);
+    double mismatch_cost = CalibrateOperatorCost(
+        OperatorCostKind::kHashJoin, rows, 100.0, delivered, required_ordered);
+    EXPECT_GE(mismatch_cost, match_cost)
+        << "Mismatch penalty must not decrease total cost at rows " << rows;
+  }
+
+  // 3. Memory spill cost monotonicity.
+  MemoryBudget budget{.max_memory_bytes = 64.0 * 1024.0,
+                      .row_size_bytes = 64.0,
+                      .io_spill_cost_multiplier = 3.5};
+  for (OperatorCostKind kind :
+       {OperatorCostKind::kSort, OperatorCostKind::kHashJoin}) {
+    for (size_t i = 1; i < row_counts.size(); ++i) {
+      double spill_prev =
+          EstimateMemorySpillCost(kind, row_counts[i - 1], budget);
+      double spill_curr = EstimateMemorySpillCost(kind, row_counts[i], budget);
+      EXPECT_LE(spill_prev, spill_curr + 1e-9)
+          << "Spill cost not monotonic for kind " << static_cast<int>(kind)
+          << " between " << row_counts[i - 1] << " and " << row_counts[i];
+    }
+  }
+
+  // 4. Star join cost monotonicity.
+  const std::vector<double> dim_rows = {10.0, 50.0, 100.0};
+  const std::vector<double> selectivities = {0.1, 0.5, 0.8};
+  for (size_t i = 1; i < row_counts.size(); ++i) {
+    double star_prev =
+        EstimateStarJoinCost(row_counts[i - 1], dim_rows, selectivities);
+    double star_curr =
+        EstimateStarJoinCost(row_counts[i], dim_rows, selectivities);
+    EXPECT_LE(star_prev, star_curr + 1e-9);
+  }
+  for (size_t i = 1; i < row_counts.size(); ++i) {
+    double star_prev =
+        EstimateStarJoinCost(1000.0, {row_counts[i - 1], 50.0}, {0.5, 0.5});
+    double star_curr =
+        EstimateStarJoinCost(1000.0, {row_counts[i], 50.0}, {0.5, 0.5});
+    EXPECT_LE(star_prev, star_curr + 1e-9);
+  }
+
+  // 5. Multi-column selectivity monotonicity under conjunction.
+  std::vector<double> sels = {0.8};
+  double prev_sel = EstimateMultiColumnSelectivity(sels, 0.2);
+  for (double additional_sel : {0.7, 0.5, 0.3, 0.1}) {
+    sels.push_back(additional_sel);
+    double curr_sel = EstimateMultiColumnSelectivity(sels, 0.2);
+    EXPECT_LE(curr_sel, prev_sel + 1e-9)
+        << "Adding selective predicate increased total selectivity";
+    prev_sel = curr_sel;
+  }
+
+  // 6. Pattern selectivity monotonicity with prefix length.
+  EXPECT_LE(EstimatePatternSelectivity(PatternMatchingKind::kLike, "abcd%"),
+            EstimatePatternSelectivity(PatternMatchingKind::kLike, "abc%"));
+  EXPECT_LE(EstimatePatternSelectivity(PatternMatchingKind::kLike, "abc%"),
+            EstimatePatternSelectivity(PatternMatchingKind::kLike, "ab%"));
+  EXPECT_LE(EstimatePatternSelectivity(PatternMatchingKind::kLike, "ab%"),
+            EstimatePatternSelectivity(PatternMatchingKind::kLike, "a%"));
+  EXPECT_LE(EstimatePatternSelectivity(PatternMatchingKind::kLike, "a%"),
+            EstimatePatternSelectivity(PatternMatchingKind::kLike, "%"));
+
+  // 7. Join cardinality monotonicity.
+  for (size_t i = 1; i < row_counts.size(); ++i) {
+    auto c_prev =
+        EstimateJoinCardinality(row_counts[i - 1], 100.0, false, false, 0.1);
+    auto c_curr =
+        EstimateJoinCardinality(row_counts[i], 100.0, false, false, 0.1);
+    EXPECT_LE(c_prev.rows, c_curr.rows + 1e-9);
+  }
+
+  // 8. Histogram join cardinality monotonicity with scaling.
+  std::vector<HistogramBucket> left_buckets = {
+      HistogramBucket{
+          .lower = 0.0, .upper = 50.0, .count = 100.0, .distinct_count = 50.0},
+      HistogramBucket{.lower = 50.0,
+                      .upper = 100.0,
+                      .count = 200.0,
+                      .distinct_count = 50.0}};
+  std::vector<HistogramBucket> right_buckets = {HistogramBucket{
+      .lower = 25.0, .upper = 75.0, .count = 150.0, .distinct_count = 50.0}};
+
+  double base_hist_join =
+      EstimateHistogramJoinCardinality(left_buckets, right_buckets);
+  EXPECT_GT(base_hist_join, 0.0);
+
+  std::vector<HistogramBucket> scaled_left = left_buckets;
+  scaled_left[0].count *= 2.0;
+  scaled_left[1].count *= 2.0;
+  double scaled_hist_join =
+      EstimateHistogramJoinCardinality(scaled_left, right_buckets);
+  EXPECT_GE(scaled_hist_join, base_hist_join);
 }
 
 }  // namespace tinylamb::cascades

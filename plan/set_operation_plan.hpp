@@ -40,6 +40,11 @@ class SetOperationPlan final : public PlanBase {
   [[nodiscard]] std::string ToString() const override;
   [[nodiscard]] const std::vector<Plan>& Children() const { return children_; }
   [[nodiscard]] SetOperationKind Operation() const { return operation_; }
+  [[nodiscard]] bool EnforcesDistinct() const override {
+    return operation_ == SetOperationKind::kUnion ||
+           operation_ == SetOperationKind::kIntersect ||
+           operation_ == SetOperationKind::kExcept;
+  }
   [[nodiscard]] const std::vector<SortKey>& OrderKeys() const {
     return order_keys_;
   }
