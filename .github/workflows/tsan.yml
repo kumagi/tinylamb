@@ -16,8 +16,10 @@ jobs:
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
           cmake --build build -j"$(nproc)"
           # CamelCase gtest suite names; the old lowercase regex matched zero
-          # tests, so the job vacuously passed.
+          # tests, so the job vacuously passed. Anchored to the suite start:
+          # unanchored "Transaction" also pulled in PostgresServerTest
+          # TCP-protocol tests, which are not part of the concurrency subset.
           ctest --test-dir build \
-            -R 'LockManager|LockWaitProgress|CacheConcurrent|PagePool|RowPageConcurrent|BPlusTreeConcurrent|Transaction' \
+            -R '^(LockManager|LockWaitProgress|CacheConcurrent|PagePool|RowPageConcurrent|BPlusTreeConcurrent|Transaction)' \
             -j"$(nproc)" --output-on-failure
           python3 scripts/clean_root_artifacts.py

@@ -23,6 +23,7 @@
 #ifdef TINYLAMB_HAS_LLVM
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcpp"
+#include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/BasicBlock.h>
@@ -34,6 +35,19 @@
 #include <llvm/Support/Error.h>
 #include <llvm/Support/TargetSelect.h>
 #pragma GCC diagnostic pop
+
+namespace {
+// LLVM 21 deprecated Intrinsic::getDeclaration in favor of
+// getOrInsertDeclaration; the runners' distro LLVM (18) only has the former.
+llvm::Function* IntrinsicDecl(llvm::Module* module, llvm::Intrinsic::ID id,
+                              llvm::ArrayRef<llvm::Type*> tys) {
+#if LLVM_VERSION_MAJOR >= 21
+  return llvm::Intrinsic::getOrInsertDeclaration(module, id, tys);
+#else
+  return llvm::Intrinsic::getDeclaration(module, id, tys);
+#endif
+}
+}  // namespace
 #endif
 
 // LLVM's PHINode uses hung-off-operands: memory preceding the User object is
@@ -384,10 +398,10 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileProjectionChecked() {
   llvm::Value* addend = argument++;
   llvm::Value* mul_overflow_out = argument++;
   llvm::Value* add_overflow_out = argument++;
-  llvm::Function* smul = llvm::Intrinsic::getOrInsertDeclaration(
-      module.get(), llvm::Intrinsic::smul_with_overflow, {i64});
-  llvm::Function* sadd = llvm::Intrinsic::getOrInsertDeclaration(
-      module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
+  llvm::Function* smul =
+      IntrinsicDecl(module.get(), llvm::Intrinsic::smul_with_overflow, {i64});
+  llvm::Function* sadd =
+      IntrinsicDecl(module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
   auto* entry = llvm::BasicBlock::Create(*context, "entry", function);
   auto* loop = llvm::BasicBlock::Create(*context, "loop", function);
   auto* body = llvm::BasicBlock::Create(*context, "body", function);
@@ -470,8 +484,8 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileSumChecked() {
   llvm::Value* input = argument++;
   llvm::Value* count = argument++;
   llvm::Value* overflow_out = argument++;
-  llvm::Function* sadd = llvm::Intrinsic::getOrInsertDeclaration(
-      module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
+  llvm::Function* sadd =
+      IntrinsicDecl(module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
   auto* entry = llvm::BasicBlock::Create(*context, "entry", function);
   auto* loop = llvm::BasicBlock::Create(*context, "loop", function);
   auto* body = llvm::BasicBlock::Create(*context, "body", function);

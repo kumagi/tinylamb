@@ -2,15 +2,26 @@ name: clang-format
 on: [ push, pull_request ]
 jobs:
   validate:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Install clang-format
+      # The tree is formatted with clang-format 22 (matching the dev
+      # toolchain). Distro clang-format (< 19) disagrees on requires-clause
+      # indentation, which made this job fail even on empty patches.
+      - name: Install clang-format 22
         run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
+            sudo gpg --dearmor --yes -o /usr/share/keyrings/llvm-snapshot.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | \
+            sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y clang-format
+          sudo apt-get install -y --no-install-recommends clang-format-22
+
       - name: Check diff
         run: |
-          git ls-files *.{c,h,hpp,cpp,cc} | xargs clang-format -style=file -i
+          # Quote the pathspecs: an unquoted *.{...} glob expands against the
+          # repo root only, so nested files silently dropped out of the check.
+          git ls-files '*.c' '*.h' '*.cc' '*.cpp' '*.hpp' | \
+            xargs clang-format-22 -style=file -i
           git diff --exit-code

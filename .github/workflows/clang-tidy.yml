@@ -9,12 +9,15 @@ jobs:
           fetch-depth: 0
 
       - name: install deps
-        run: sudo apt-get update && sudo apt-get install -y cmake clang clang-tidy
+        run: sudo apt-get update && sudo apt-get install -y cmake clang clang-tidy clang-tools
 
       - name: configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DTINYLAMB_ENABLE_GOOGLESQL=OFF
 
       - name: clang-tidy diff
         run: |
+          # Ubuntu 24.04 ships the diff helper under a versioned name
+          # (clang-tidy-diff-18.py); pick whichever is present.
+          TIDY_DIFF=$(command -v clang-tidy-diff.py || ls /usr/bin/clang-tidy-diff*.py | head -1)
           git diff -U0 origin/master...HEAD -- '*.cpp' '*.hpp' | \
-            clang-tidy-diff.py -path build -checks='bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' -quiet
+            "$TIDY_DIFF" -path build -checks='bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' -quiet

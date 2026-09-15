@@ -1546,8 +1546,13 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     // Wait until the server has begun writing the large reply: the client's
     // tiny receive window then stalls the write part-way through the response.
     {
-      struct pollfd ready{.fd = client, .events = POLLIN, .revents = 0};
-      for (int attempt = 0; attempt < 100; ++attempt) {
+      // Sanitizer builds on loaded CI runners can spend over a minute
+      // computing the projection before the first reply byte moves; a fixed
+      // window here gave up (and pipelined the COUNT below) far too early.
+      const auto first_byte_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      while (std::chrono::steady_clock::now() < first_byte_deadline) {
+        struct pollfd ready{.fd = client, .events = POLLIN, .revents = 0};
         if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) {
           break;
         }
@@ -1558,15 +1563,18 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
 
     auto ReadUntil = [](int fd, const std::string& needle) {
       std::string result;
-      while (result.find(needle) == std::string::npos) {
+      // Sanitizer builds serialize the 18 MB projection slowly enough to
+      // open minute-long no-data windows on loaded CI runners; a fixed 30 s
+      // gap there aborted the read before the queued replies arrived even
+      // though the server was still flushing. A generous overall deadline
+      // keeps the queueing assertions, not the machine speed, under test.
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(180);
+      while (result.find(needle) == std::string::npos &&
+             std::chrono::steady_clock::now() < deadline) {
         pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
-        // Sanitizer builds serialize the 18 MB projection slowly enough to
-        // open multi-second no-data windows; a 5 s gap there aborted the
-        // read before the queued replies arrived even though the server was
-        // still flushing. 30 s keeps the queueing assertions, not the
-        // machine speed, under test.
         if (poll(&descriptor, 1, 30000) <= 0) {
-          break;
+          continue;
         }
         std::array<char, 4096> buffer{};
         const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
