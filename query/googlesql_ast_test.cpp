@@ -837,7 +837,7 @@ TEST(GoogleSqlAstTest, UnitlessIntervalLiteralsReturnStatusNotThrow) {
   // A hand-built dump cannot express every malformed shape; also feed the
   // original crash input verbatim (opaque bytes are valid here because the
   // AST parser is a line-oriented text reader that must reject garbage).
-  static const char kCrashInput[] =
+  static const std::string_view kCrashInput =
       "DeleteStatement\n  CastExpression\n    IntervalExpr\n      esl\n";
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast2 =
       GoogleSqlAstParser::Parse(kCrashInput);

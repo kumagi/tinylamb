@@ -1020,6 +1020,8 @@ Expression FactorCommonAndImpl(const Expression& expression) {
 }
 }  // namespace
 
+namespace {
+
 // Schema published by ExpressionRewriter::TryRewrite for rules that want to
 // resolve column types (see set_schema). Null outside a rewrite.
 thread_local const Schema* g_active_rewrite_schema = nullptr;
@@ -1034,6 +1036,8 @@ class ScopedActiveRewriteSchema {
   ScopedActiveRewriteSchema(const ScopedActiveRewriteSchema&) = delete;
   ScopedActiveRewriteSchema& operator=(const ScopedActiveRewriteSchema&) =
       delete;
+  ScopedActiveRewriteSchema(ScopedActiveRewriteSchema&&) = delete;
+  ScopedActiveRewriteSchema& operator=(ScopedActiveRewriteSchema&&) = delete;
 
  private:
   const Schema* saved_;
@@ -1065,6 +1069,7 @@ bool SideCanBeDouble(const Expression& side, const Schema& schema) {
     return false;
   }
 }
+}  // namespace
 
 const ExpressionRuleSet& ExpressionRuleSet::Default() {
   static const ExpressionRuleSet rules = [] {

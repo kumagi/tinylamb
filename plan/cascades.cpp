@@ -6602,17 +6602,15 @@ const RuleSet& RuleSet::Default() {
             }
             auto side_survives = [&](const ExpressionBase& side) {
               if (side.Type() != TypeTag::kColumnValue) {
-                for (const auto& col : side.TouchedColumns()) {
-                  if (std::ranges::find(left_rels, col.schema) ==
-                      left_rels.end()) {
-                    continue;  // not a left-side column
-                  }
-                  if (!surviving_cols.contains(col.ToString()) &&
-                      !surviving_cols.contains(col.name)) {
-                    return false;
-                  }
-                }
-                return true;
+                return std::ranges::all_of(
+                    side.TouchedColumns(), [&](const auto& col) {
+                      if (std::ranges::find(left_rels, col.schema) ==
+                          left_rels.end()) {
+                        return true;  // not a left-side column
+                      }
+                      return surviving_cols.contains(col.ToString()) ||
+                             surviving_cols.contains(col.name);
+                    });
               }
               const auto& c = side.AsColumnValue().GetColumnName();
               if (std::ranges::find(left_rels, c.schema) == left_rels.end()) {
@@ -6625,18 +6623,17 @@ const RuleSet& RuleSet::Default() {
               if (!join_expr.predicate || !*join_expr.predicate) {
                 return true;
               }
-              for (const auto& conjunct :
-                   SplitConjuncts(*join_expr.predicate)) {
-                if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
-                  continue;
-                }
-                const auto& bin = conjunct->AsBinaryExpression();
-                if (!side_survives(*bin.Left()) ||
-                    !side_survives(*bin.Right())) {
-                  return false;
-                }
-              }
-              return true;
+              const std::vector<Expression> conjuncts =
+                  SplitConjuncts(*join_expr.predicate);
+              return std::ranges::all_of(
+                  conjuncts, [&](const Expression& conjunct) {
+                    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+                      return true;
+                    }
+                    const auto& bin = conjunct->AsBinaryExpression();
+                    return side_survives(*bin.Left()) &&
+                           side_survives(*bin.Right());
+                  });
             };
             if (!predicate_fully_survives()) {
               continue;
@@ -8399,17 +8396,15 @@ const RuleSet& RuleSet::Default() {
             }
             auto side_survives = [&](const ExpressionBase& side) {
               if (side.Type() != TypeTag::kColumnValue) {
-                for (const auto& col : side.TouchedColumns()) {
-                  if (std::ranges::find(left_rels, col.schema) ==
-                      left_rels.end()) {
-                    continue;  // not a left-side column
-                  }
-                  if (!surviving_cols.contains(col.ToString()) &&
-                      !surviving_cols.contains(col.name)) {
-                    return false;
-                  }
-                }
-                return true;
+                return std::ranges::all_of(
+                    side.TouchedColumns(), [&](const auto& col) {
+                      if (std::ranges::find(left_rels, col.schema) ==
+                          left_rels.end()) {
+                        return true;  // not a left-side column
+                      }
+                      return surviving_cols.contains(col.ToString()) ||
+                             surviving_cols.contains(col.name);
+                    });
               }
               const auto& c = side.AsColumnValue().GetColumnName();
               if (std::ranges::find(left_rels, c.schema) == left_rels.end()) {
@@ -8422,18 +8417,17 @@ const RuleSet& RuleSet::Default() {
               if (!join_expr.predicate || !*join_expr.predicate) {
                 return true;
               }
-              for (const auto& conjunct :
-                   SplitConjuncts(*join_expr.predicate)) {
-                if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
-                  continue;
-                }
-                const auto& bin = conjunct->AsBinaryExpression();
-                if (!side_survives(*bin.Left()) ||
-                    !side_survives(*bin.Right())) {
-                  return false;
-                }
-              }
-              return true;
+              const std::vector<Expression> conjuncts =
+                  SplitConjuncts(*join_expr.predicate);
+              return std::ranges::all_of(
+                  conjuncts, [&](const Expression& conjunct) {
+                    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+                      return true;
+                    }
+                    const auto& bin = conjunct->AsBinaryExpression();
+                    return side_survives(*bin.Left()) &&
+                           side_survives(*bin.Right());
+                  });
             };
             if (!predicate_fully_survives()) {
               continue;

@@ -40,9 +40,9 @@ class TestDatabaseCleanup : public ::testing::Environment {
 // AddGlobalTestEnvironment must run before RUN_ALL_TESTS; a static
 // initializer in a TU compiled into every test binary guarantees that.
 // gtest takes ownership of the released pointer; the catch-all keeps the
-// dynamic initialization from escaping (cert-err58-cpp).
-// NOLINTNEXTLINE(cert-err58-cpp): the lambda body is fully wrapped in
-// try/catch, so the initializer cannot escape an exception.
+// dynamic initialization from escaping (cert-err58-cpp): the lambda body is
+// fully wrapped in try/catch, so no exception can leave the initializer.
+// NOLINTNEXTLINE(cert-err58-cpp)
 const bool kCleanupEnvironmentRegistered = [] {
   try {
     std::unique_ptr<::testing::Environment> env(new TestDatabaseCleanup);
