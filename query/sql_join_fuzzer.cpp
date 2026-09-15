@@ -3,6 +3,7 @@
 #include "query/sql_join_fuzzer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -181,8 +182,13 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   std::string report;
   for (int q = 0; q < query_count; ++q) {
     const bool fact_left = g.Chance(60);
-    const bool left_join = g.Chance(40);
-    const std::string join_kw = left_join ? "LEFT JOIN" : "JOIN";
+    // 0 = INNER, 1 = LEFT, 2 = RIGHT, 3 = FULL, 4 = CROSS.
+    const int join_kind = g.Pick(0, 4);
+    const std::string join_kw = join_kind == 0   ? "JOIN"
+                                : join_kind == 1 ? "LEFT JOIN"
+                                : join_kind == 2 ? "RIGHT JOIN"
+                                : join_kind == 3 ? "FULL JOIN"
+                                                 : "CROSS JOIN";
     // Projection: u and/or a from fact, tag and/or k from dim.
     std::vector<ProjCol> proj;
     std::string proj_sql;
@@ -202,8 +208,41 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     }
     const std::string fl = fact_left ? "fact f" : "dim d";
     const std::string fr = fact_left ? "dim d" : "fact f";
+    // ON condition: equi-join on the keys, a non-equi comparison between
+    // f.a and d.k, or f.k <cmp> d.k; optionally AND a residual predicate.
+    std::string on_sql;
+    int on_kind = 0;  // 0 = f.k = d.k, 1 = f.k <cmp> d.k,
+                      // 2 = f.a <cmp> d.k
+    std::string on_op = "=";
+    int residual = 0;  // 0 = none, 1 = f.a <cmp> const, 2 = d.tag = 'x'
+    std::string res_op;
+    int64_t res_const = 0;
+    if (join_kind != 4) {
+      on_kind = g.Pick(0, 9) < 6 ? 0 : g.Pick(1, 2);
+      if (on_kind == 0) {
+        on_sql = "f.k = d.k";
+      } else {
+        static constexpr std::array<std::string_view, 6> kJoinOps = {
+            "=", "<>", "<", "<=", ">", ">="};
+        on_op = std::string(kJoinOps[g.Pick(0, 5)]);
+        on_sql =
+            on_kind == 1 ? "f.k " + on_op + " d.k" : "f.a " + on_op + " d.k";
+      }
+      if (g.Chance(30)) {
+        residual = g.Pick(1, 2);
+        if (residual == 1) {
+          static constexpr std::array<std::string_view, 6> kJoinOps2 = {
+              "=", "<>", "<", "<=", ">", ">="};
+          res_op = std::string(kJoinOps2[g.Pick(0, 5)]);
+          res_const = g.Pick(-3, 3);
+          on_sql += " AND f.a " + res_op + " " + std::to_string(res_const);
+        } else {
+          on_sql += " AND d.tag = 'x'";
+        }
+      }
+    }
     std::string sql;
-    sql.reserve(proj_sql.size() + fl.size() + join_kw.size() + fr.size() + 32);
+    sql.reserve(proj_sql.size() + fl.size() + join_kw.size() + fr.size() + 64);
     sql += "SELECT ";
     sql += proj_sql;
     sql += " FROM ";
@@ -212,33 +251,81 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     sql += join_kw;
     sql += " ";
     sql += fr;
-    sql += " ON f.k = d.k";
-    // Optional post-join filter over projected-safe columns.
-    int filter = g.Pick(0, 2);
+    if (join_kind != 4) {
+      sql += " ON " + on_sql;
+    }
+    // Optional post-join filter over fact or dim columns.
+    int filter = g.Pick(0, 3);
     if (filter == 1) {
       sql += " WHERE f.a IS NOT NULL";
     } else if (filter == 2) {
       sql += " WHERE f.k = 1";
+    } else if (filter == 3) {
+      sql += " WHERE d.tag = 'x'";
     }
     sql += ";";
 
-    // Mirror: nested-loop equi-join with SQL NULL semantics.  The left
-    // operand of LEFT JOIN is the preserved side, in either direction.
+    // Mirror: nested-loop join with SQL NULL semantics.  Preserved sides
+    // are the left operand for LEFT, right for RIGHT, both for FULL.
     std::vector<std::string> expected;
-    auto match = [](int64_t lk, int64_t rk) {
-      return lk != kNullRepr && rk != kNullRepr && lk == rk;
+    auto num_cmp = [](int64_t l, const std::string& o, int64_t r) {
+      if (l == kNullRepr || r == kNullRepr) {
+        return false;  // UNKNOWN never produces a join match
+      }
+      if (o == "=") {
+        return l == r;
+      }
+      if (o == "<>") {
+        return l != r;
+      }
+      if (o == "<") {
+        return l < r;
+      }
+      if (o == "<=") {
+        return l <= r;
+      }
+      if (o == ">") {
+        return l > r;
+      }
+      return l >= r;
     };
-    auto passes_filter = [&](const FactRow* f) {
+    auto match = [&](const FactRow& f, const DimRow& d) {
+      if (join_kind == 4) {
+        return true;  // CROSS JOIN
+      }
+      bool ok = false;
+      if (on_kind == 0) {
+        ok = num_cmp(f.k, "=", d.k);
+      } else if (on_kind == 1) {
+        ok = num_cmp(f.k, on_op, d.k);
+      } else {
+        ok = num_cmp(f.a, on_op, d.k);
+      }
+      if (!ok) {
+        return false;
+      }
+      if (residual == 1) {
+        return num_cmp(f.a, res_op, res_const);
+      }
+      if (residual == 2) {
+        return d.tag == 0;
+      }
+      return true;
+    };
+    auto passes_filter = [&](const FactRow* f, const DimRow* d) {
       if (filter == 1) {
         return f != nullptr && f->a != kNullRepr;
       }
       if (filter == 2) {
         return f != nullptr && f->k == 1;
       }
+      if (filter == 3) {
+        return d != nullptr && d->tag == 0;
+      }
       return true;
     };
     auto emit = [&](const FactRow* f, const DimRow* d) {
-      if (!passes_filter(f)) {
+      if (!passes_filter(f, d)) {
         return;
       }
       std::string row;
@@ -247,33 +334,28 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       }
       expected.push_back(row);
     };
-    if (fact_left) {
-      for (const FactRow& f : facts) {
-        bool matched = false;
-        for (const DimRow& d : dims) {
-          if (!match(f.k, d.k)) {
-            continue;
-          }
-          matched = true;
-          emit(&f, &d);
+    const bool preserve_left = (join_kind == 1 || join_kind == 3);
+    const bool preserve_right = (join_kind == 2 || join_kind == 3);
+    std::vector<bool> fact_matched(facts.size(), false);
+    std::vector<bool> dim_matched(dims.size(), false);
+    for (size_t i = 0; i < facts.size(); ++i) {
+      for (size_t j = 0; j < dims.size(); ++j) {
+        if (!match(facts[i], dims[j])) {
+          continue;
         }
-        if (left_join && !matched) {
-          emit(&f, nullptr);
-        }
+        fact_matched[i] = true;
+        dim_matched[j] = true;
+        emit(&facts[i], &dims[j]);
       }
-    } else {
-      for (const DimRow& d : dims) {
-        bool matched = false;
-        for (const FactRow& f : facts) {
-          if (!match(f.k, d.k)) {
-            continue;
-          }
-          matched = true;
-          emit(&f, &d);
-        }
-        if (left_join && !matched) {
-          emit(nullptr, &d);
-        }
+    }
+    for (size_t i = 0; i < facts.size(); ++i) {
+      if (!fact_matched[i] && (fact_left ? preserve_left : preserve_right)) {
+        emit(&facts[i], nullptr);
+      }
+    }
+    for (size_t j = 0; j < dims.size(); ++j) {
+      if (!dim_matched[j] && (fact_left ? preserve_right : preserve_left)) {
+        emit(nullptr, &dims[j]);
       }
     }
     std::sort(expected.begin(), expected.end());
@@ -289,7 +371,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     }
     if (stats != nullptr) {
       ++stats->queries;
-      stats->left_joins += left_join ? 1 : 0;
+      stats->left_joins += (join_kind == 1 || join_kind == 3) ? 1 : 0;
       for (const FactRow& f : facts) {
         stats->null_key_rows += f.k == kNullRepr ? 1 : 0;
       }

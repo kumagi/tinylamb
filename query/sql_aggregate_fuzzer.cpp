@@ -27,6 +27,8 @@ namespace {
 
 constexpr const char* kTestHeader = "-- tinylamb-aggregate-test v1";
 constexpr int64_t kNullRepr = INT64_MIN;
+constexpr std::array<std::string_view, 6> kCmpOps = {"=",  "!=", "<",
+                                                     "<=", ">",  ">="};
 
 class Gen {
  public:
@@ -218,9 +220,7 @@ WPredPtr GenWhere(Gen& g, int depth) {
       return p;
     }
     p->kind = WPred::Kind::kCmp;
-    static constexpr std::array<std::string_view, 6> kOps = {"=",  "!=", "<",
-                                                             "<=", ">",  ">="};
-    p->op = std::string(kOps[static_cast<size_t>(g.Pick(0, 5))]);
+    p->op = std::string(kCmpOps[static_cast<size_t>(g.Pick(0, 5))]);
     p->const_val = IsStrCol(p->col) ? g.Pick(0, 1) : g.Pick(-2, 2);
     return p;
   }
@@ -240,8 +240,58 @@ WPredPtr GenWhere(Gen& g, int depth) {
 struct AggSpec {
   std::string sql;  // "COUNT(*)", "SUM(a)", ...
   int col{0};       // argument column (-1 for COUNT(*))
-  enum Kind { kCountStar, kCount, kSum, kMin, kMax } kind{kCountStar};
+  enum Kind {
+    kCountStar,
+    kCount,
+    kSum,
+    kMin,
+    kMax,
+    kCountDistinct,
+    kSumDistinct
+  } kind{kCountStar};
 };
+
+// Numeric value of an aggregate over a group, when it is one (COUNT/SUM);
+// used by the HAVING mirror.
+std::optional<int64_t> AggNum(const AggSpec& spec,
+                              const std::vector<MRow>& rows) {
+  switch (spec.kind) {
+    case AggSpec::Kind::kCountStar:
+      return static_cast<int64_t>(rows.size());
+    case AggSpec::Kind::kCount: {
+      int64_t n = 0;
+      for (const MRow& r : rows) {
+        if (CellOf(r, spec.col) != kNullRepr) {
+          ++n;
+        }
+      }
+      return n;
+    }
+    case AggSpec::Kind::kSum:
+    case AggSpec::Kind::kSumDistinct: {
+      bool any = false;
+      int64_t sum = 0;
+      std::vector<int64_t> seen;
+      for (const MRow& r : rows) {
+        const int64_t v = CellOf(r, spec.col);
+        if (v == kNullRepr ||
+            (spec.kind == AggSpec::Kind::kSumDistinct &&
+             std::find(seen.begin(), seen.end(), v) != seen.end())) {
+          continue;
+        }
+        seen.push_back(v);
+        any = true;
+        sum += v;
+      }
+      if (!any) {
+        return std::nullopt;
+      }
+      return sum;
+    }
+    default:
+      return std::nullopt;
+  }
+}
 
 std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& rows) {
   switch (spec.kind) {
@@ -256,17 +306,21 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& rows) {
       }
       return FmtInt(n);
     }
-    case AggSpec::Kind::kSum: {
-      bool any = false;
-      int64_t sum = 0;
+    case AggSpec::Kind::kSum:
+    case AggSpec::Kind::kSumDistinct: {
+      const std::optional<int64_t> sum = AggNum(spec, rows);
+      return sum.has_value() ? FmtInt(*sum) : std::string("NULL");
+    }
+    case AggSpec::Kind::kCountDistinct: {
+      std::vector<int64_t> seen;
       for (const MRow& r : rows) {
         const int64_t v = CellOf(r, spec.col);
-        if (v != kNullRepr) {
-          any = true;
-          sum += v;
+        if (v != kNullRepr &&
+            std::find(seen.begin(), seen.end(), v) == seen.end()) {
+          seen.push_back(v);
         }
       }
-      return any ? FmtInt(sum) : std::string("NULL");
+      return FmtInt(static_cast<int64_t>(seen.size()));
     }
     case AggSpec::Kind::kMin:
     case AggSpec::Kind::kMax: {
@@ -339,50 +393,159 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     std::vector<std::string> expected;
 
     if (!window) {
-      // GROUP BY query.
-      const int gcol = g.Pick(0, 2);
+      // GROUP BY query over 1-2 key columns (nullable), optionally with
+      // DISTINCT aggregates and a HAVING over numeric aggregates.
+      std::vector<int> gcols{g.Pick(0, 2)};
+      if (g.Chance(35)) {
+        const int second = g.Pick(0, 2);
+        if (second != gcols[0]) {
+          gcols.push_back(second);
+        }
+      }
       std::vector<AggSpec> aggs;
       aggs.push_back({"COUNT(*)", -1, AggSpec::Kind::kCountStar});
+      const int gcol0 = gcols[0];
       if (g.Chance(70)) {
-        aggs.push_back({IsStrCol(gcol) ? "COUNT(s)" : "COUNT(a)",
-                        IsStrCol(gcol) ? 2 : 0, AggSpec::Kind::kCount});
+        aggs.push_back({IsStrCol(gcol0) ? "COUNT(s)" : "COUNT(a)",
+                        IsStrCol(gcol0) ? 2 : 0, AggSpec::Kind::kCount});
       }
       if (g.Chance(60)) {
         aggs.push_back({"SUM(a)", 0, AggSpec::Kind::kSum});
       }
       if (g.Chance(40)) {
         aggs.push_back(
-            {"MIN(" + ColName(gcol) + ")", gcol, AggSpec::Kind::kMin});
+            {"MIN(" + ColName(gcol0) + ")", gcol0, AggSpec::Kind::kMin});
       }
       if (g.Chance(40)) {
         aggs.push_back(
-            {"MAX(" + ColName(gcol) + ")", gcol, AggSpec::Kind::kMax});
+            {"MAX(" + ColName(gcol0) + ")", gcol0, AggSpec::Kind::kMax});
+      }
+      if (g.Chance(35)) {
+        const int dcol = g.Pick(0, 2);
+        aggs.push_back({"COUNT(DISTINCT " + ColName(dcol) + ")", dcol,
+                        AggSpec::Kind::kCountDistinct});
+      }
+      if (g.Chance(25)) {
+        aggs.push_back({"SUM(DISTINCT a)", 0, AggSpec::Kind::kSumDistinct});
+      }
+      // HAVING: 1-2 conditions over numeric aggregates (COUNT(*)/SUM(a),
+      // incl. IS [NOT] NULL for SUM over all-NULL groups), AND/OR joined.
+      struct HavingCond {
+        AggSpec spec;
+        std::string op;  // "=", "<", ... or "IS NULL"/"IS NOT NULL"
+        int64_t rhs{0};
+      };
+      std::vector<HavingCond> having;
+      std::string having_join;
+      if (g.Chance(40)) {
+        const int ncond = g.Chance(40) ? 2 : 1;
+        for (int i = 0; i < ncond; ++i) {
+          HavingCond c;
+          if (g.Chance(30)) {
+            c.spec = {"SUM(a)", 0, AggSpec::Kind::kSum};
+            c.op = g.Chance(50) ? "IS NULL" : "IS NOT NULL";
+          } else if (g.Chance(50)) {
+            c.spec = {"COUNT(*)", -1, AggSpec::Kind::kCountStar};
+            c.op = std::string(kCmpOps[g.Pick(0, 5)]);
+            c.rhs = g.Pick(0, 4);
+          } else {
+            c.spec = {"SUM(a)", 0, AggSpec::Kind::kSum};
+            c.op = std::string(kCmpOps[g.Pick(0, 5)]);
+            c.rhs = g.Pick(-4, 4);
+          }
+          having.push_back(std::move(c));
+        }
+        having_join = g.Chance(65) ? "AND" : "OR";
       }
       std::string agg_sql;
       for (size_t i = 0; i < aggs.size(); ++i) {
         agg_sql += (i == 0 ? "" : ", ") + aggs[i].sql;
       }
-      sql = "SELECT " + ColName(gcol) + ", " + agg_sql + " FROM t";
+      sql = "SELECT ";
+      std::string group_sql;
+      for (size_t i = 0; i < gcols.size(); ++i) {
+        sql += ColName(gcols[i]) + ", ";
+        group_sql += (i == 0 ? "" : ", ") + ColName(gcols[i]);
+      }
+      sql += agg_sql + " FROM t";
       WPredPtr where;
       if (g.Chance(50)) {
         where = GenWhere(g, g.Pick(1, 2));
         sql += " WHERE " + where->Render();
       }
-      sql += " GROUP BY " + ColName(gcol) + ";";
+      sql += " GROUP BY " + group_sql;
+      if (!having.empty()) {
+        sql += " HAVING ";
+        for (size_t i = 0; i < having.size(); ++i) {
+          if (i != 0) {
+            sql += " " + having_join + " ";
+          }
+          const HavingCond& c = having[i];
+          if (c.op.starts_with("IS")) {
+            sql += "(" + c.spec.sql + " " + c.op + ")";
+          } else {
+            sql += "(" + c.spec.sql + " " + c.op + " " + std::to_string(c.rhs) +
+                   ")";
+          }
+        }
+      }
+      sql += ";";
 
-      // Mirror: group the surviving rows.  The map key is internal; the
-      // rendered group label follows the column's value formatting.
+      // Mirror: group the surviving rows on the composite key, apply HAVING.
       std::map<std::string, std::vector<MRow>> groups;
       for (const MRow& r : mirror) {
         if (where != nullptr && where->Eval(r) != 'T') {
           continue;
         }
-        groups[GroupKey(gcol, r)].push_back(r);
+        std::string key;
+        for (const int c : gcols) {
+          key += GroupKey(c, r) + "#";
+        }
+        groups[key].push_back(r);
       }
+      auto having_holds = [&](const std::vector<MRow>& rows) {
+        std::vector<bool> flags;
+        for (const HavingCond& c : having) {
+          const std::optional<int64_t> v = AggNum(c.spec, rows);
+          if (c.op == "IS NULL") {
+            flags.push_back(!v.has_value());
+          } else if (c.op == "IS NOT NULL") {
+            flags.push_back(v.has_value());
+          } else if (!v.has_value()) {
+            flags.push_back(false);  // HAVING comparison with NULL is false
+          } else {
+            const int64_t l = *v;
+            if (c.op == "=") {
+              flags.push_back(l == c.rhs);
+            } else if (c.op == "!=") {
+              flags.push_back(l != c.rhs);
+            } else if (c.op == "<") {
+              flags.push_back(l < c.rhs);
+            } else if (c.op == "<=") {
+              flags.push_back(l <= c.rhs);
+            } else if (c.op == ">") {
+              flags.push_back(l > c.rhs);
+            } else {
+              flags.push_back(l >= c.rhs);
+            }
+          }
+        }
+        bool acc = flags.empty() ? true : flags[0];
+        for (size_t i = 1; i < flags.size(); ++i) {
+          acc = (having_join == "AND") ? (acc && flags[i]) : (acc || flags[i]);
+        }
+        return acc;
+      };
       for (auto& [key, rows] : groups) {
-        const std::string label =
-            IsStrCol(gcol) ? FmtStr(rows[0].s) : FmtInt(CellOf(rows[0], gcol));
-        std::string row = label + ",";
+        if (!having_holds(rows)) {
+          continue;
+        }
+        std::string row;
+        for (const int c : gcols) {
+          row += (IsStrCol(c) ? FmtStr(CellOf(rows[0], c))
+                              : FmtInt(CellOf(rows[0], c))) +
+                 ",";
+        }
         for (const AggSpec& spec : aggs) {
           row += ComputeAgg(spec, rows) + ",";
         }
@@ -394,8 +557,8 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       }
     } else {
       // Window query; ORDER BY u is unique so ties are impossible except for
-      // RANK over a, which the mirror handles with peers.
-      const int mode = g.Pick(0, 3);
+      // rank functions over a, which the mirror handles with peers.
+      const int mode = g.Pick(0, 9);
       const int pcol = g.Pick(0, 1);  // partition by a or b (nullable)
       WPredPtr where;
       std::string where_sql;
@@ -403,6 +566,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         where = GenWhere(g, 1);
         where_sql = " WHERE " + where->Render();
       }
+      // ROWS BETWEEN frame params for mode 8; NTILE bucket count for mode 5;
+      // direction flag for mode 6 (1 = LAG, -1 = LEAD).
+      int frame_lo = 0, frame_hi = 0, ntile_n = 0, lag_lead = 0;
       switch (mode) {
         case 0:
           sql = "SELECT u, ROW_NUMBER() OVER (PARTITION BY " + ColName(pcol) +
@@ -415,9 +581,47 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           sql = "SELECT u, COUNT(*) OVER (PARTITION BY " + ColName(pcol) +
                 ") FROM t" + where_sql + ";";
           break;
-        default:
+        case 3:
           sql = "SELECT u, SUM(a) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY u) FROM t" + where_sql + ";";
+          break;
+        case 4:
+          sql = "SELECT u, DENSE_RANK() OVER (ORDER BY a) FROM t" + where_sql +
+                ";";
+          break;
+        case 5: {
+          const int buckets = g.Pick(2, 3);
+          ntile_n = buckets;
+          sql = "SELECT u, NTILE(" + std::to_string(buckets) +
+                ") OVER (PARTITION BY " + ColName(pcol) +
+                " ORDER BY u) FROM t" + where_sql + ";";
+          break;
+        }
+        case 6:
+          lag_lead = g.Chance(50) ? 1 : -1;  // 1 = LAG, -1 = LEAD
+          sql = "SELECT u, " + std::string(lag_lead == 1 ? "LAG" : "LEAD") +
+                "(a, 1) OVER (PARTITION BY " + ColName(pcol) +
+                " ORDER BY u) FROM t" + where_sql + ";";
+          break;
+        case 7:
+          sql = "SELECT u, FIRST_VALUE(a) OVER (PARTITION BY " + ColName(pcol) +
+                " ORDER BY u) FROM t" + where_sql + ";";
+          break;
+        case 8: {
+          frame_lo = g.Pick(0, 2);
+          frame_hi = g.Pick(0, 2);
+          sql = "SELECT u, SUM(b) OVER (PARTITION BY " + ColName(pcol) +
+                " ORDER BY u ROWS BETWEEN " + std::to_string(frame_lo) +
+                " PRECEDING AND " + std::to_string(frame_hi) +
+                " FOLLOWING) FROM t" + where_sql + ";";
+          break;
+        }
+        default:
+          sql = "SELECT u, NTH_VALUE(b, 2) OVER (PARTITION BY " +
+                ColName(pcol) +
+                " ORDER BY u ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED "
+                "FOLLOWING) FROM t" +
+                where_sql + ";";
           break;
       }
 
@@ -458,7 +662,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             }
           }
           row += FmtInt(n) + ",";
-        } else {
+        } else if (mode == 3) {
           int64_t sum = 0;
           bool any = false;
           for (const MRow* o : selected) {
@@ -469,6 +673,113 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             }
           }
           row += (any ? FmtInt(sum) : std::string("NULL")) + ",";
+        } else if (mode == 4) {
+          // DENSE_RANK over a: 1 + distinct non-peer values below r->a;
+          // NULL sorts first, so every non-NULL outranks it.
+          std::vector<int64_t> below;
+          for (const MRow* o : selected) {
+            const int64_t va = o->a, vb = r->a;
+            const bool o_less = va == kNullRepr
+                                    ? vb != kNullRepr
+                                    : (vb == kNullRepr ? false : va < vb);
+            if (o_less &&
+                std::find(below.begin(), below.end(), va) == below.end()) {
+              below.push_back(va);
+            }
+          }
+          row += FmtInt(static_cast<int64_t>(below.size()) + 1) + ",";
+        } else if (mode == 5) {
+          // NTILE(n) within partition ordered by u: first (m % n) buckets
+          // hold one extra row.
+          int64_t pos = 0, m = 0;
+          for (const MRow* o : selected) {
+            if (CellOf(*o, pcol) != CellOf(*r, pcol)) {
+              continue;
+            }
+            if (o->u < r->u) {
+              ++pos;
+            }
+            ++m;
+          }
+          const int64_t base = m / ntile_n, rem = m % ntile_n;
+          const int64_t bucket =
+              pos < rem * (base + 1)
+                  ? pos / (base + 1) + 1
+                  : rem + (pos - rem * (base + 1)) / base + 1;
+          row += FmtInt(bucket) + ",";
+        } else if (mode == 6) {
+          // LAG(a,1)/LEAD(a,1) within partition ordered by u.
+          const MRow* prev = nullptr;
+          const MRow* next = nullptr;
+          for (const MRow* o : selected) {
+            if (CellOf(*o, pcol) != CellOf(*r, pcol)) {
+              continue;
+            }
+            if (o->u < r->u && (prev == nullptr || o->u > prev->u)) {
+              prev = o;
+            }
+            if (o->u > r->u && (next == nullptr || o->u < next->u)) {
+              next = o;
+            }
+          }
+          const MRow* src = lag_lead == 1 ? prev : next;
+          row += (src == nullptr ? std::string("NULL") : FmtInt(src->a)) + ",";
+        } else if (mode == 7) {
+          // FIRST_VALUE(a): a of the partition's first row by u.
+          const MRow* first = nullptr;
+          for (const MRow* o : selected) {
+            if (CellOf(*o, pcol) == CellOf(*r, pcol) &&
+                (first == nullptr || o->u < first->u)) {
+              first = o;
+            }
+          }
+          row +=
+              (first == nullptr ? std::string("NULL") : FmtInt(first->a)) + ",";
+        } else if (mode == 8) {
+          // SUM(b) over ROWS BETWEEN frame: positional within partition
+          // ordered by u.
+          int64_t pos = 0;
+          std::vector<const MRow*> part;
+          for (const MRow* o : selected) {
+            if (CellOf(*o, pcol) == CellOf(*r, pcol)) {
+              part.push_back(o);
+            }
+          }
+          for (const MRow* o : part) {
+            if (o->u < r->u) {
+              ++pos;
+            }
+          }
+          int64_t sum = 0;
+          bool any = false;
+          for (size_t i = 0; i < part.size(); ++i) {
+            const auto idx = static_cast<int64_t>(i);
+            if (idx < pos - frame_lo || idx > pos + frame_hi ||
+                part[i]->b == kNullRepr) {
+              continue;
+            }
+            sum += part[i]->b;
+            any = true;
+          }
+          row += (any ? FmtInt(sum) : std::string("NULL")) + ",";
+        } else {
+          // NTH_VALUE(b, 2) with UNBOUNDED frame: b of the partition's
+          // second row by u.
+          const MRow* first = nullptr;
+          const MRow* second = nullptr;
+          for (const MRow* o : selected) {
+            if (CellOf(*o, pcol) != CellOf(*r, pcol)) {
+              continue;
+            }
+            if (first == nullptr || o->u < first->u) {
+              second = first;
+              first = o;
+            } else if (second == nullptr || o->u < second->u) {
+              second = o;
+            }
+          }
+          row += (second == nullptr ? std::string("NULL") : FmtInt(second->b)) +
+                 ",";
         }
         expected.push_back(row);
       }

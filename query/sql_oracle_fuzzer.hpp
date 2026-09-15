@@ -29,6 +29,18 @@ namespace tinylamb {
 // - Subquery differential: COUNT over t matching j spelled three ways
 //   (IN subquery / correlated EXISTS / JOIN+DISTINCT semi-join) must agree;
 //   exercises decorrelation, apply and hash-join against each other.
+// - Set-operation mirror: UNION/INTERSECT/EXCEPT in ALL/DISTINCT forms over
+//   two generated tables must equal the C++ mirror's multiset semantics
+//   (NULL treated as equal to NULL, per SQL set-op rules).
+// - Ordered oracle: ORDER BY (ASC/DESC, explicit NULLS FIRST/LAST) with
+//   LIMIT/OFFSET must produce the mirror-sorted sequence sliced the same
+//   way — the only oracle that verifies row order, sort and TopN.
+// - HAVING oracle: grouped COUNT/SUM/MIN/MAX filtered by a mirrored HAVING
+//   clause must match the groups surviving in the mirror.
+// - CTE oracle: a WITH query filtered inside and outside must equal the
+//   equivalent flat query; WITH RECURSIVE counters must match arithmetic.
+// - UNNEST oracle: array-literal/GENERATE_ARRAY unnesting (with and without
+//   WITH OFFSET, and as a cross join) must match the mirror's element list.
 // - NoREC (Non-Optimizing Reference Engine): COUNT(*) WHERE p ==
 //   SUM(CASE WHEN p THEN 1 ELSE 0 END).
 // - Constraint-solving / PQS-flavoured oracle: the harness mirrors every
@@ -80,6 +92,21 @@ struct OracleTrace {
   // Transaction splitting: statements run inside one txn vs autocommit.
   std::vector<std::string> troc;  // mutating statements
   std::string troc_probe;         // state probe, run in both branches
+  // Mirror-checked feature oracles: each stores the query (size 1) plus the
+  // expected rows in Row::ToString() form ("[v, v]").  `ordered` sections
+  // compare the sequence verbatim; the rest compare sorted multisets.
+  std::vector<std::string> setop;           // set-operation query
+  std::vector<std::string> setop_expect;    // sorted multiset
+  std::vector<std::string> orderby;         // ORDER BY/LIMIT/OFFSET query
+  std::vector<std::string> orderby_expect;  // ordered sequence
+  std::vector<std::string> having;          // GROUP BY ... HAVING query
+  std::vector<std::string> having_expect;   // sorted multiset
+  std::vector<std::string> cte;             // {WITH form, inline form}
+  std::string recursive;                    // WITH RECURSIVE query
+  std::string recursive_expect;             // expected single row
+  std::vector<std::string> unnest;          // UNNEST query
+  std::vector<std::string> unnest_expect;   // ordered or multiset
+  bool unnest_ordered{false};               // WITH OFFSET: compare verbatim
 
   bool operator==(const OracleTrace&) const = default;
 };
@@ -94,6 +121,12 @@ struct OracleIterationStats {
   bool idx_ran{false};
   bool dqe_ran{false};
   bool troc_ran{false};
+  bool setop_ran{false};
+  bool orderby_ran{false};
+  bool having_ran{false};
+  bool cte_ran{false};
+  bool recursive_ran{false};
+  bool unnest_ran{false};
 };
 
 // QPG-flavoured plan feedback: remembers EXPLAIN fingerprints and rewards

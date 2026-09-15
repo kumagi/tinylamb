@@ -1,0 +1,20 @@
+# https://docs.devin.ai/onboard-devin/environment-yaml
+# Commands run from the repo root.
+initialize: |
+  sudo apt-get update
+  sudo apt-get install -y cmake ninja-build wget software-properties-common libzstd-dev libcurl4-openssl-dev clang-format
+  wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh && chmod +x /tmp/llvm.sh && sudo /tmp/llvm.sh 20
+knowledge:
+  - name: build
+    contents: |
+      cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++-20 -DCMAKE_C_COMPILER=clang-20 -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+      cmake --build build -j$(nproc)
+      # fuzzer targets: add -DTINYLAMB_ENABLE_FUZZ=ON. LLVM >=16 required by expression/jit.cpp.
+  - name: test
+    contents: |
+      ctest --test-dir build --output-on-failure -j$(nproc)
+      # single test: ./build/<name>_test; fuzzer seeded tests honor TINYLAMB_FUZZ_ITERS=<n>
+  - name: lint
+    contents: |
+      python3 scripts/check_layering.py   # include-lint, must exit 0
+      clang-format -i <touched .hpp/.cpp>   # CI uses Ubuntu's clang-format-14

@@ -35,13 +35,11 @@
 #include <llvm/Support/Error.h>
 #include <llvm/Support/TargetSelect.h>
 #pragma GCC diagnostic pop
-
 namespace {
-// LLVM 21 deprecated Intrinsic::getDeclaration in favor of
-// getOrInsertDeclaration; the runners' distro LLVM (18) only has the former.
+// getOrInsertDeclaration replaced getDeclaration in LLVM 20.
 llvm::Function* IntrinsicDecl(llvm::Module* module, llvm::Intrinsic::ID id,
                               llvm::ArrayRef<llvm::Type*> tys) {
-#if LLVM_VERSION_MAJOR >= 21
+#if LLVM_VERSION_MAJOR >= 20
   return llvm::Intrinsic::getOrInsertDeclaration(module, id, tys);
 #else
   return llvm::Intrinsic::getDeclaration(module, id, tys);
