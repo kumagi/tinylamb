@@ -3,6 +3,7 @@
 #include "query/sql_aggregate_fuzzer.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <string>
 
@@ -13,8 +14,9 @@ namespace tinylamb {
 TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
   int group_queries = 0;
   int window_queries = 0;
-  constexpr int kIterations = 48;
-  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 48;
+  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
     std::mt19937 rng(seed);
     AggStats stats;
     std::string report = RunAggregateIteration(rng, false, &stats);

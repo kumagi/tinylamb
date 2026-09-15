@@ -782,6 +782,126 @@ std::string DumpRows(const std::vector<std::string>& rows) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Mirror-expected oracles: expected rows are rendered in Row::ToString()
+// form ("[v1, v2]") so engine output compares textually.
+// ---------------------------------------------------------------------------
+
+// One nullable INT64 cell exactly as Value::AsString() prints it.
+std::string MirrorCell(int64_t v) {
+  return v == kNull ? std::string("NULL") : std::to_string(v);
+}
+
+std::string ExpectRow(std::initializer_list<int64_t> cells) {
+  std::string out = "[";
+  bool first = true;
+  for (const int64_t v : cells) {
+    if (!first) {
+      out += ", ";
+    }
+    first = false;
+    out += MirrorCell(v);
+  }
+  out += "]";
+  return out;
+}
+
+// Runs the single recorded query and compares against the expected rows
+// (verbatim when `ordered`, otherwise as sorted multisets).  Returns false
+// when the engine rejected the query (oracle skipped).
+bool CheckExpected(Database& db, TransactionContext& ctx,
+                   const std::vector<std::string>& queries,
+                   const std::vector<std::string>& expected, bool ordered,
+                   const char* tag, std::string* report, bool verbose) {
+  if (queries.size() != 1) {
+    return true;
+  }
+  std::string error;
+  auto rows = RunRows(db, ctx, queries[0], &error);
+  if (!rows.has_value()) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][" << tag << "-error] " << error << "\n";
+    }
+    return false;
+  }
+  std::vector<std::string> actual;
+  actual.reserve(rows->size());
+  for (const Row& r : *rows) {
+    actual.push_back(r.ToString());
+  }
+  std::vector<std::string> expect = expected;
+  if (!ordered) {
+    std::sort(actual.begin(), actual.end());
+    std::sort(expect.begin(), expect.end());
+  }
+  if (actual == expect) {
+    return true;
+  }
+  *report += std::string("[") + tag + " MISMATCH]\n";
+  *report += "  query: " + queries[0] + "\n";
+  *report += "  expected (" + std::to_string(expect.size()) + "):\n" +
+             DumpRows(expect);
+  *report +=
+      "  actual (" + std::to_string(actual.size()) + "):\n" + DumpRows(actual);
+  return true;
+}
+
+// CTE inlining: the WITH form must equal the flattened equivalent.
+bool CheckCte(Database& db, TransactionContext& ctx,
+              const std::vector<std::string>& cte, std::string* report,
+              bool verbose) {
+  if (cte.size() != 2) {
+    return true;
+  }
+  std::string error;
+  auto with = RunRows(db, ctx, cte[0], &error);
+  auto flat = RunRows(db, ctx, cte[1], &error);
+  if (!(with.has_value() && flat.has_value())) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][cte-error] " << error << "\n";
+    }
+    return false;
+  }
+  std::vector<std::string> s0 = SerializeSorted(*with);
+  std::vector<std::string> s1 = SerializeSorted(*flat);
+  if (s0 == s1) {
+    return true;
+  }
+  *report += "[CTE MISMATCH]\n";
+  *report += "  with: " + cte[0] + " (" + std::to_string(s0.size()) +
+             " rows)\n" + DumpRows(s0);
+  *report += "  flat: " + cte[1] + " (" + std::to_string(s1.size()) +
+             " rows)\n" + DumpRows(s1);
+  return true;
+}
+
+// WITH RECURSIVE counters: the single aggregate row must match arithmetic.
+bool CheckRecursive(Database& db, TransactionContext& ctx, const OracleTrace& t,
+                    std::string* report, bool verbose) {
+  if (t.recursive.empty()) {
+    return true;
+  }
+  std::string error;
+  auto rows = RunRows(db, ctx, t.recursive, &error);
+  if (!rows.has_value()) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][recursive-error] " << error << "\n";
+    }
+    return false;
+  }
+  if (rows->size() == 1 && (*rows)[0].ToString() == t.recursive_expect) {
+    return true;
+  }
+  *report += "[RECURSIVE MISMATCH]\n";
+  *report += "  " + t.recursive + "\n";
+  *report += "  expected: " + t.recursive_expect + "\n  actual:";
+  for (const Row& r : *rows) {
+    *report += " " + r.ToString();
+  }
+  *report += "\n";
+  return true;
+}
+
 constexpr const char* kTestHeader = "-- tinylamb-oracle-test v1";
 
 // ---------------------------------------------------------------------------
@@ -1357,6 +1477,459 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     };
   }
 
+  // ---- Auxiliary tables for the subquery / set-operation oracles ----
+  // jtab feeds the three semi-join spellings; stab is a same-schema sibling
+  // whose rows the set-operation mirror tracks.
+  std::string jtab;
+  if (g.Chance(50)) {
+    jtab = tab + "_j";
+    t.setup.push_back("CREATE TABLE " + jtab + " (x INT64, y VARCHAR(8));");
+    const int join_rows = g.Pick(2, 6);
+    for (int i = 0; i < join_rows; ++i) {
+      const std::string x =
+          g.Chance(20) ? "NULL" : std::to_string(g.Pick(-3, 3));
+      const std::string y =
+          g.Chance(25)
+              ? "NULL"
+              : "'" +
+                    std::string(kStrPool[static_cast<size_t>(g.Pick(
+                        0, static_cast<int>(std::size(kStrPool)) - 1))]) +
+                    "'";
+      t.setup.push_back("INSERT INTO " + jtab + " VALUES (" + x + ", " + y +
+                        ");");
+    }
+  }
+  std::string stab;
+  std::vector<MirrorRow> mirror2;
+  RPredPtr pred2;
+  if (g.Chance(55)) {
+    stab = tab + "_s";
+    t.setup.push_back("CREATE TABLE " + stab +
+                      " (u INT64, a INT64, b INT64, flag BOOL, s VARCHAR(8));");
+    const int n = g.Pick(3, 8);
+    for (int i = 0; i < n; ++i) {
+      std::string values;
+      mirror2.push_back(GenRow(g, 500 + i, &values));
+      t.setup.push_back("INSERT INTO " + stab + " VALUES " + values + ";");
+    }
+    pred2 = GenPredicate(g, g.Pick(1, 2), flavour);
+  }
+
+  // ---- Subquery differential: IN vs correlated EXISTS vs JOIN+DISTINCT ----
+  // Positive forms only: NOT IN and NOT EXISTS diverge under 3VL by design.
+  if (!jtab.empty()) {
+    t.subq = {
+        "SELECT COUNT(*) FROM " + tab + " WHERE a IN (SELECT x FROM " + jtab +
+            ");",
+        "SELECT COUNT(*) FROM " + tab + " WHERE EXISTS (SELECT 1 FROM " + jtab +
+            " WHERE " + jtab + ".x = " + tab + ".a);",
+        "SELECT COUNT(*) FROM (SELECT DISTINCT u FROM " + tab + " JOIN " +
+            jtab + " ON " + tab + ".a = " + jtab + ".x) semi;",
+    };
+  }
+
+  // ---- Set operations vs the mirror multiset ----
+  if (!stab.empty()) {
+    static const std::array<const char*, 6> kSetOps = {
+        "UNION ALL",          "UNION DISTINCT", "INTERSECT ALL",
+        "INTERSECT DISTINCT", "EXCEPT ALL",     "EXCEPT DISTINCT"};
+    const int op = g.Pick(0, static_cast<int>(kSetOps.size()) - 1);
+    t.setop = {"SELECT a FROM " + tab + " WHERE " + t.predicate + " " +
+               kSetOps[static_cast<size_t>(op)] + " SELECT a FROM " + stab +
+               " WHERE " + pred2->Render() + ";"};
+
+    auto filtered_a = [](const std::vector<MirrorRow>& rows, const RPred& p) {
+      std::vector<int64_t> out;
+      for (const MirrorRow& m : rows) {
+        if (p.Eval(m) == 'T') {
+          out.push_back(m.a);
+        }
+      }
+      return out;
+    };
+    const std::vector<int64_t> la = filtered_a(mirror, *pred);
+    const std::vector<int64_t> lb = filtered_a(mirror2, *pred2);
+    auto dedup = [](std::vector<int64_t> v) {
+      std::sort(v.begin(), v.end());
+      v.erase(std::unique(v.begin(), v.end()), v.end());
+      return v;
+    };
+    auto count_of = [](const std::vector<int64_t>& v, int64_t e) {
+      return static_cast<int64_t>(std::count(v.begin(), v.end(), e));
+    };
+    auto contains = [](const std::vector<int64_t>& v, int64_t e) {
+      return std::find(v.begin(), v.end(), e) != v.end();
+    };
+    // SQL set-op NULL semantics: NULL equals NULL here, so the kNull
+    // sentinel compares like any other value.
+    std::vector<int64_t> result;
+    switch (op) {
+      case 0:  // UNION ALL
+        result = la;
+        result.insert(result.end(), lb.begin(), lb.end());
+        break;
+      case 1: {  // UNION DISTINCT
+        result = la;
+        result.insert(result.end(), lb.begin(), lb.end());
+        result = dedup(std::move(result));
+        break;
+      }
+      case 2:  // INTERSECT ALL: min multiplicity
+        for (const int64_t e : dedup(la)) {
+          for (int64_t i = 0; i < std::min(count_of(la, e), count_of(lb, e));
+               ++i) {
+            result.push_back(e);
+          }
+        }
+        break;
+      case 3:  // INTERSECT DISTINCT
+        for (const int64_t e : dedup(la)) {
+          if (contains(lb, e)) {
+            result.push_back(e);
+          }
+        }
+        break;
+      case 4:  // EXCEPT ALL: subtract multiplicities
+        for (const int64_t e : dedup(la)) {
+          for (int64_t i = 0; i < count_of(la, e) - count_of(lb, e); ++i) {
+            result.push_back(e);
+          }
+        }
+        break;
+      default:  // EXCEPT DISTINCT
+        for (const int64_t e : dedup(la)) {
+          if (!contains(lb, e)) {
+            result.push_back(e);
+          }
+        }
+        break;
+    }
+    for (const int64_t v : result) {
+      t.setop_expect.push_back(ExpectRow({v}));
+    }
+  }
+
+  // ---- ORDER BY + LIMIT/OFFSET: the ordered oracle ----
+  // Sort keys always end at the unique `u` so the expected sequence is
+  // deterministic; engine default is NULLS FIRST for ASC, LAST for DESC.
+  {
+    struct SortKey {
+      int col;  // 0 = u, 1 = a
+      bool desc;
+      bool nulls_first;  // effective (default = !desc)
+    };
+    std::vector<SortKey> keys;
+    std::string spec;
+    auto push_key = [&](int col, bool desc, int explicit_nf) {
+      // explicit_nf: -1 = omitted, 0 = NULLS LAST, 1 = NULLS FIRST.
+      keys.push_back({col, desc, explicit_nf < 0 ? !desc : explicit_nf == 1});
+      spec += spec.empty() ? "" : ", ";
+      spec += col == 0 ? "u" : "a";
+      if (desc) {
+        spec += " DESC";
+      }
+      if (explicit_nf >= 0) {
+        spec += explicit_nf == 1 ? " NULLS FIRST" : " NULLS LAST";
+      }
+    };
+    switch (g.Pick(0, 4)) {
+      case 0:
+        push_key(0, false, -1);
+        break;
+      case 1:
+        push_key(0, true, -1);
+        break;
+      case 2:
+        push_key(1, g.Chance(50), -1);
+        push_key(0, g.Chance(50), -1);
+        break;
+      case 3:
+        push_key(1, true, g.Chance(40) ? 0 : -1);
+        push_key(0, g.Chance(50), -1);
+        break;
+      default:
+        push_key(1, false, g.Chance(50) ? 1 : 0);
+        push_key(0, true, g.Chance(30) ? 1 : -1);
+        break;
+    }
+    std::vector<const MirrorRow*> rows;
+    for (const MirrorRow& m : mirror) {
+      if (pred->Eval(m) == 'T') {
+        rows.push_back(&m);
+      }
+    }
+    std::stable_sort(rows.begin(), rows.end(),
+                     [&](const MirrorRow* l, const MirrorRow* r) {
+                       for (const SortKey& k : keys) {
+                         const int64_t lv = k.col == 0 ? l->u : l->a;
+                         const int64_t rv = k.col == 0 ? r->u : r->a;
+                         const bool lnull = lv == kNull;
+                         const bool rnull = rv == kNull;
+                         if (lnull != rnull) {
+                           return k.nulls_first ? lnull : rnull;
+                         }
+                         if (lnull || lv == rv) {
+                           continue;
+                         }
+                         return k.desc ? lv > rv : lv < rv;
+                       }
+                       return false;
+                     });
+    const int64_t total = static_cast<int64_t>(rows.size());
+    int64_t offset = 0;
+    int64_t limit = -1;
+    std::string sql = "SELECT u, a FROM " + tab + " WHERE " + t.predicate +
+                      " ORDER BY " + spec;
+    if (g.Chance(65)) {
+      limit = g.Pick(0, static_cast<int>(total) + 2);
+      sql += " LIMIT " + std::to_string(limit);
+      if (g.Chance(40)) {
+        offset = g.Pick(0, static_cast<int>(total));
+        sql += " OFFSET " + std::to_string(offset);
+      }
+    }
+    t.orderby = {sql + ";"};
+    const int64_t end = std::min(total, offset + (limit < 0 ? total : limit));
+    for (int64_t i = offset; i < end; ++i) {
+      t.orderby_expect.push_back(ExpectRow(
+          {rows[static_cast<size_t>(i)]->u, rows[static_cast<size_t>(i)]->a}));
+    }
+  }
+
+  // ---- HAVING over grouped aggregates ----
+  // Aggregates stay in INT64 so the mirror formats identically; NULL-valued
+  // aggregates (empty SUM, all-NULL MIN/MAX) make the HAVING condition
+  // evaluate to UNKNOWN and drop the group.
+  {
+    static const std::array<const char*, 5> kAggSql = {
+        "COUNT(*)", "SUM(b)", "MIN(a)", "MAX(a)", "COUNT(b)"};
+    struct AggVals {
+      int64_t cnt{0};
+      int64_t sum_b{kNull};  // kNull when empty
+      int64_t min_a{kNull};
+      int64_t max_a{kNull};
+      int64_t cnt_b{0};
+    };
+    // 0 = COUNT(*), 1 = SUM(b), 2 = MIN(a), 3 = MAX(a), 4 = COUNT(b).
+    auto agg_value = [](const AggVals& v, int agg) {
+      switch (agg) {
+        case 0:
+          return v.cnt;
+        case 1:
+          return v.sum_b;
+        case 2:
+          return v.min_a;
+        case 3:
+          return v.max_a;
+        default:
+          return v.cnt_b;
+      }
+    };
+    struct HCond {
+      int agg;
+      std::string op;  // "=", "!=", "<", "<=", ">", ">=", "IS NULL",
+                       // "IS NOT NULL"
+      int64_t k{0};
+    };
+    const bool use_where = g.Chance(70);
+    const int cond_count = g.Pick(1, 2);
+    const bool conj_or = g.Chance(25);  // join two conds with OR
+    std::vector<HCond> conds;
+    std::string having_sql;
+    static const std::vector<std::string> kCmpOps = {"=",  "!=", "<",
+                                                     "<=", ">",  ">="};
+    for (int i = 0; i < cond_count; ++i) {
+      HCond c;
+      c.agg = g.Pick(0, static_cast<int>(kAggSql.size()) - 1);
+      if (c.agg != 0 && g.Chance(20)) {
+        c.op = g.Chance(50) ? "IS NULL" : "IS NOT NULL";
+      } else {
+        c.op = g.PickFrom(kCmpOps);
+        c.k = g.Pick(-2, 4);
+      }
+      conds.push_back(c);
+      having_sql += having_sql.empty() ? "" : (conj_or ? " OR " : " AND ");
+      having_sql += std::string(kAggSql[static_cast<size_t>(c.agg)]) + " " +
+                    c.op +
+                    (c.op == "IS NULL" || c.op == "IS NOT NULL"
+                         ? ""
+                         : " " + std::to_string(c.k));
+    }
+    std::string sql = "SELECT a, COUNT(*), SUM(b) FROM " + tab;
+    if (use_where) {
+      sql += " WHERE " + t.predicate;
+    }
+    sql += " GROUP BY a HAVING " + having_sql + ";";
+    t.having = {sql};
+
+    std::map<int64_t, AggVals> groups;
+    for (const MirrorRow& m : mirror) {
+      if (use_where && pred->Eval(m) != 'T') {
+        continue;
+      }
+      AggVals& v = groups[m.a];
+      ++v.cnt;
+      if (m.b != kNull) {
+        v.sum_b = v.sum_b == kNull ? m.b : v.sum_b + m.b;
+        ++v.cnt_b;
+      }
+      if (m.a != kNull) {  // never true for the group key kNull, kept general
+        v.min_a = v.min_a == kNull ? m.a : std::min(v.min_a, m.a);
+        v.max_a = v.max_a == kNull ? m.a : std::max(v.max_a, m.a);
+      }
+    }
+    for (const auto& [key, v] : groups) {
+      bool keep = conj_or ? false : true;
+      for (const HCond& c : conds) {
+        const int64_t val = agg_value(v, c.agg);
+        char r = 'F';
+        if (c.op == "IS NULL") {
+          r = val == kNull ? 'T' : 'F';
+        } else if (c.op == "IS NOT NULL") {
+          r = val == kNull ? 'F' : 'T';
+        } else if (val != kNull) {
+          if (c.op == "=") {
+            r = val == c.k ? 'T' : 'F';
+          } else if (c.op == "!=") {
+            r = val != c.k ? 'T' : 'F';
+          } else if (c.op == "<") {
+            r = val < c.k ? 'T' : 'F';
+          } else if (c.op == "<=") {
+            r = val <= c.k ? 'T' : 'F';
+          } else if (c.op == ">") {
+            r = val > c.k ? 'T' : 'F';
+          } else {
+            r = val >= c.k ? 'T' : 'F';
+          }
+        } else {
+          r = 'N';
+        }
+        if (conj_or) {
+          keep = keep || r == 'T';
+        } else {
+          keep = keep && r == 'T';
+        }
+      }
+      if (keep) {
+        t.having_expect.push_back(ExpectRow({key, v.cnt, v.sum_b}));
+      }
+    }
+  }
+
+  // ---- CTE inlining + WITH RECURSIVE counters ----
+  if (g.Chance(60)) {
+    const RPredPtr inner = GenPredicate(g, g.Pick(1, 2), flavour);
+    const RPredPtr outer = GenPredicate(g, g.Pick(1, 2), flavour);
+    t.cte = {"WITH w AS (SELECT u, a, b FROM " + tab + " WHERE " +
+                 inner->Render() + ") SELECT u, a, b FROM w WHERE " +
+                 outer->Render() + ";",
+             "SELECT u, a, b FROM " + tab + " WHERE (" + inner->Render() +
+                 ") AND (" + outer->Render() + ");"};
+  }
+  if (g.Chance(45)) {
+    const int64_t start = g.Pick(-3, 4);
+    const int64_t bound = g.Pick(-3, 8);
+    const bool up = g.Chance(70);
+    const int64_t step = up ? 1 : -1;
+    const char* cmp = up ? "<" : ">";
+    // Occasionally route the dedup path (values never repeat anyway).
+    const std::string union_kw = g.Chance(20) ? "UNION DISTINCT" : "UNION ALL";
+    std::vector<int64_t> seq;
+    int64_t v = start;
+    seq.push_back(v);
+    while (up ? v < bound : v > bound) {
+      v += step;
+      seq.push_back(v);
+    }
+    int64_t sum = 0;
+    for (const int64_t n : seq) {
+      sum += n;
+    }
+    t.recursive = "WITH RECURSIVE r AS (SELECT " + std::to_string(start) +
+                  " AS n " + union_kw + " SELECT n + " + std::to_string(step) +
+                  " FROM r WHERE n " + cmp + " " + std::to_string(bound) +
+                  ") SELECT COUNT(*), SUM(n), MIN(n), MAX(n) FROM r;";
+    t.recursive_expect = ExpectRow(
+        {static_cast<int64_t>(seq.size()), sum, seq.front(), seq.back()});
+  }
+
+  // ---- UNNEST over literal/generated arrays ----
+  if (g.Chance(55)) {
+    const int variant = g.Pick(0, 3);
+    std::vector<int64_t> elems;
+    if (variant <= 1) {
+      const int n = g.Pick(0, 6);
+      for (int i = 0; i < n; ++i) {
+        elems.push_back(g.Chance(15) ? kNull : g.Pick(-3, 3));
+      }
+    } else if (variant == 2) {
+      const int64_t lo = g.Pick(-3, 3);
+      const int64_t hi = g.Pick(-3, 8);
+      const int64_t step = g.Pick(0, 1) == 0 ? g.Pick(1, 3) : -g.Pick(1, 3);
+      for (int64_t v2 = lo; step > 0 ? v2 <= hi : v2 >= hi; v2 += step) {
+        elems.push_back(v2);
+      }
+      t.unnest = {"SELECT x FROM UNNEST(GENERATE_ARRAY(" + std::to_string(lo) +
+                  ", " + std::to_string(hi) + ", " + std::to_string(step) +
+                  ")) x;"};
+    }
+    if (variant == 0) {
+      std::string arr = "[";
+      for (size_t i = 0; i < elems.size(); ++i) {
+        arr += i == 0 ? "" : ", ";
+        arr += elems[i] == kNull ? "NULL" : std::to_string(elems[i]);
+      }
+      arr += "]";
+      t.unnest = {"SELECT x FROM UNNEST(" + arr + ") x;"};
+      for (const int64_t e : elems) {
+        t.unnest_expect.push_back(ExpectRow({e}));
+      }
+      t.unnest_ordered = false;
+    } else if (variant == 1) {
+      std::string arr = "[";
+      for (size_t i = 0; i < elems.size(); ++i) {
+        arr += i == 0 ? "" : ", ";
+        arr += elems[i] == kNull ? "NULL" : std::to_string(elems[i]);
+      }
+      arr += "]";
+      t.unnest = {"SELECT x, p FROM UNNEST(" + arr + ") x WITH OFFSET p;"};
+      for (size_t i = 0; i < elems.size(); ++i) {
+        t.unnest_expect.push_back(
+            ExpectRow({elems[i], static_cast<int64_t>(i)}));
+      }
+      t.unnest_ordered = true;
+    } else if (variant == 2) {
+      for (const int64_t e : elems) {
+        t.unnest_expect.push_back(ExpectRow({e}));
+      }
+      t.unnest_ordered = false;
+    } else {
+      // Cross join with the generated table: passing rows multiply by the
+      // element count (NULL elements still count as rows).
+      const int n = g.Pick(1, 4);
+      for (int i = 0; i < n; ++i) {
+        elems.push_back(g.Chance(15) ? kNull : g.Pick(-3, 3));
+      }
+      std::string arr = "[";
+      for (size_t i = 0; i < elems.size(); ++i) {
+        arr += i == 0 ? "" : ", ";
+        arr += elems[i] == kNull ? "NULL" : std::to_string(elems[i]);
+      }
+      arr += "]";
+      int64_t pass = 0;
+      for (const MirrorRow& m : mirror) {
+        if (pred->Eval(m) == 'T') {
+          ++pass;
+        }
+      }
+      t.unnest = {"SELECT COUNT(*) FROM " + tab + ", UNNEST(" + arr +
+                  ") x WHERE " + t.predicate + ";"};
+      t.unnest_expect = {
+          ExpectRow({pass * static_cast<int64_t>(elems.size())})};
+      t.unnest_ordered = false;
+    }
+  }
+
   // ---- NoREC ----
   t.norec = {"SELECT COUNT(*) FROM " + tab + " WHERE " + t.predicate + ";",
              "SELECT SUM(CASE WHEN " + t.predicate +
@@ -1479,6 +2052,12 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->idx_ran = !t.index_ddl.empty() && !t.index_probe.empty();
     stats->dqe_ran = t.dqe.size() == 3;
     stats->troc_ran = !t.troc.empty();
+    stats->setop_ran = t.setop.size() == 1;
+    stats->orderby_ran = t.orderby.size() == 1;
+    stats->having_ran = t.having.size() == 1;
+    stats->cte_ran = t.cte.size() == 2;
+    stats->recursive_ran = !t.recursive.empty();
+    stats->unnest_ran = t.unnest.size() == 1;
   }
   return report;
 }
@@ -1504,7 +2083,17 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
       !CheckPqs(db, ctx, trace, &report, verbose) ||
       !CheckIdx(db, ctx, trace, &report, verbose) ||
       !CheckTroc(db, trace, &report, verbose) ||
-      !CheckDqe(db, ctx, trace, &report, verbose)) {
+      !CheckDqe(db, ctx, trace, &report, verbose) ||
+      !CheckExpected(db, ctx, trace.setop, trace.setop_expect,
+                     /*ordered=*/false, "SETOP", &report, verbose) ||
+      !CheckExpected(db, ctx, trace.orderby, trace.orderby_expect,
+                     /*ordered=*/true, "ORDERBY", &report, verbose) ||
+      !CheckExpected(db, ctx, trace.having, trace.having_expect,
+                     /*ordered=*/false, "HAVING", &report, verbose) ||
+      !CheckCte(db, ctx, trace.cte, &report, verbose) ||
+      !CheckRecursive(db, ctx, trace, &report, verbose) ||
+      !CheckExpected(db, ctx, trace.unnest, trace.unnest_expect,
+                     trace.unnest_ordered, "UNNEST", &report, verbose)) {
     // A statement failed to execute: the oracle could not run, which is a
     // skip, not a mismatch.
   }
@@ -1562,6 +2151,40 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   if (!trace.troc_probe.empty()) {
     out += "-- trocprobe: " + trace.troc_probe + "\n";
+  }
+  for (const std::string& sql : trace.setop) {
+    out += "-- setop: " + sql + "\n";
+  }
+  for (const std::string& row : trace.setop_expect) {
+    out += "-- setopexpect: " + row + "\n";
+  }
+  for (const std::string& sql : trace.orderby) {
+    out += "-- orderby: " + sql + "\n";
+  }
+  for (const std::string& row : trace.orderby_expect) {
+    out += "-- orderbyexpect: " + row + "\n";
+  }
+  for (const std::string& sql : trace.having) {
+    out += "-- having: " + sql + "\n";
+  }
+  for (const std::string& row : trace.having_expect) {
+    out += "-- havingexpect: " + row + "\n";
+  }
+  for (const std::string& sql : trace.cte) {
+    out += "-- cte: " + sql + "\n";
+  }
+  if (!trace.recursive.empty()) {
+    out += "-- recursive: " + trace.recursive + "\n";
+    out += "-- recursiveexpect: " + trace.recursive_expect + "\n";
+  }
+  for (const std::string& sql : trace.unnest) {
+    out += "-- unnest: " + sql + "\n";
+  }
+  for (const std::string& row : trace.unnest_expect) {
+    out += "-- unnestexpect: " + row + "\n";
+  }
+  if (trace.unnest_ordered) {
+    out += "-- unnestordered: 1\n";
   }
   if (!failure_summary.empty()) {
     out += "-- failure: " + failure_summary + "\n";
@@ -1636,6 +2259,30 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->troc.push_back(value);
     } else if (consume("-- trocprobe: ", &value)) {
       trace->troc_probe = value;
+    } else if (consume("-- setop: ", &value)) {
+      trace->setop.push_back(value);
+    } else if (consume("-- setopexpect: ", &value)) {
+      trace->setop_expect.push_back(value);
+    } else if (consume("-- orderby: ", &value)) {
+      trace->orderby.push_back(value);
+    } else if (consume("-- orderbyexpect: ", &value)) {
+      trace->orderby_expect.push_back(value);
+    } else if (consume("-- having: ", &value)) {
+      trace->having.push_back(value);
+    } else if (consume("-- havingexpect: ", &value)) {
+      trace->having_expect.push_back(value);
+    } else if (consume("-- cte: ", &value)) {
+      trace->cte.push_back(value);
+    } else if (consume("-- recursive: ", &value)) {
+      trace->recursive = value;
+    } else if (consume("-- recursiveexpect: ", &value)) {
+      trace->recursive_expect = value;
+    } else if (consume("-- unnest: ", &value)) {
+      trace->unnest.push_back(value);
+    } else if (consume("-- unnestexpect: ", &value)) {
+      trace->unnest_expect.push_back(value);
+    } else if (consume("-- unnestordered: ", &value)) {
+      trace->unnest_ordered = value == "1";
     } else if (consume("-- failure: ", &value)) {
       *failure_summary = value;
     } else {

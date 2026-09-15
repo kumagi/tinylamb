@@ -63,6 +63,10 @@ struct LSMValue {
 };
 
 class SortedRun {
+ public:
+  // Entry's stream operator calls HeadString; being a friend of the nested
+  // class does not grant access to enclosing-class privates (GCC enforces
+  // this, Clang accepts it), so it lives in the public section.
   static std::string HeadString(uint32_t in) {
     std::string out(4, '\0');
     const uint32_t raw = be32toh(in);
@@ -70,7 +74,6 @@ class SortedRun {
     return out;
   }
 
- public:
   struct Entry {
     constexpr static size_t kIndirectThreshold = 12;
     Entry() = default;
