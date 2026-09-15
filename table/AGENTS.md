@@ -15,7 +15,9 @@ ops to accelerate consecutive ops inside one UPDATE.
   (`IndexScanIterator : IteratorBase`, see `index/AGENTS.md`).
 - `full_scan_iterator` visibility goes through `Transaction::ReadVersion`,
   with a fast path: pages with `PageLSN <= snapshot` are read physically
-  without version resolution. Returned rows are owned copies — valid after
+  without version resolution (boundary caveat: mutations stamped before the
+  snapshot began but still uncommitted can be served physically — see
+  `PhysicalReadEligible`). Returned rows are owned copies — valid after
   the latch is released.
 - `table_statistics.{hpp,cpp}`, `hyper_log_log.{hpp,cpp}` — persistent stats:
   row count + per-column NULL/non-NULL/distinct counts, 16 equi-depth

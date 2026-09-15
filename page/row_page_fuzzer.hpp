@@ -69,6 +69,13 @@ class RowPageEnvironment {
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     lm_ = std::make_unique<LockManager>();
     tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
+    // Run the real ARIES pass (same entry point as page_storage's open);
+    // without it the "Crash" case discarded committed effects instead of
+    // replaying them, so redo/undo was never actually exercised.
+    const Status recovery_status = r_->RecoverFrom(0, tm_.get());
+    if (recovery_status != Status::kSuccess) {
+      LOG(FATAL) << "RecoverFrom failed: " << recovery_status;
+    }
   }
 
   ~RowPageEnvironment() {

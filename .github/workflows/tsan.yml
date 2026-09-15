@@ -15,5 +15,9 @@ jobs:
             -DTINYLAMB_ENABLE_TSAN=ON \
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
           cmake --build build -j"$(nproc)"
-          ctest --test-dir build -R 'lock_manager|cache_concurrent|page_pool' \
+          # CamelCase gtest suite names; the old lowercase regex matched zero
+          # tests, so the job vacuously passed.
+          ctest --test-dir build \
+            -R 'LockManager|LockWaitProgress|CacheConcurrent|PagePool|RowPageConcurrent|BPlusTreeConcurrent|Transaction' \
             -j"$(nproc)" --output-on-failure
+          python3 scripts/clean_root_artifacts.py

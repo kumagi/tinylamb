@@ -302,6 +302,43 @@ TEST_F(TableTest, Insert_DuplicateUniqueKey_LeavesNoOrphanRow) {
   ASSERT_EQ(count, 1U);
 }
 
+TEST_F(TableTest, Insert_NullUniqueKey_AllowsMultipleNullsAndDeletes) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(ctx, kTableName, IndexSchema("col1_unique", {0})));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  // SQL unique semantics: NULL != NULL, so any number of rows may carry a
+  // NULL in a UNIQUE column; the second NULL key must not be rejected as a
+  // duplicate of the first.
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, rp1,
+      tbl->Insert(ctx.txn_, Row({Value(), Value("first"), Value(3.3)})));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, rp2,
+      tbl->Insert(ctx.txn_, Row({Value(), Value("second"), Value(4.4)})));
+  ASSERT_NE(rp1, rp2);
+
+  size_t count = 0;
+  Iterator it = tbl->BeginFullScan(ctx.txn_);
+  while (it.IsValid()) {
+    ++count;
+    ++it;
+  }
+  ASSERT_EQ(count, 2U);
+
+  // Deleting one NULL-keyed row must remove only that row's index entry;
+  // the sibling NULL key must remain reachable.
+  ASSERT_SUCCESS(tbl->Delete(ctx.txn_, rp1));
+  count = 0;
+  it = tbl->BeginFullScan(ctx.txn_);
+  while (it.IsValid()) {
+    ++count;
+    ++it;
+  }
+  ASSERT_EQ(count, 1U);
+}
+
 TEST_F(TableTest, IndexScan_VersionedUniqueIndex_ServesOldAndNewSnapshots) {
   {
     TransactionContext setup = rs_->BeginContext();

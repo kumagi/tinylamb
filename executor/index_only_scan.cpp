@@ -109,7 +109,7 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
       for (slot_t offset : include_offsets_) {
         inc.values_.push_back(heap_row[offset]);
       }
-      *dst = iter_.GetKey() + std::move(inc);
+      *dst = iter_.GetKey() + inc;
     }
     ++iter_;
     if (!dst->IsValid()) {

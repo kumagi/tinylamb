@@ -49,9 +49,6 @@ class Page {
   void SetRecLSN(lsn_t lsn) { recovery_lsn = std::min(lsn, recovery_lsn); }
 
   // Meta page manipulations.
-  StatusOr<PageRef> AllocateNewPage(Transaction& txn, PagePool& pool,
-                                    PageType new_page_type);
-
   Status DestroyPage(Transaction& txn, Page* target);
 
   size_t RowCount(Transaction& txn) const;

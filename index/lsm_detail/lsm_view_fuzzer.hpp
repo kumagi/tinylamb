@@ -43,6 +43,10 @@ namespace tinylamb {
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::filesystem::path base = "lsm_view_fuzzer-" + RandomString(20, false);
+  // A previous aborted iteration (crash/abort before the tail remove_all) can
+  // leave a stale directory behind; clearing first keeps SortedRun::Construct
+  // from tripping over leftover index/blob files under a reused name.
+  std::filesystem::remove_all(base);
   std::filesystem::create_directory(base);
   std::string blob_path = base / "blob.db";
   auto blob =

@@ -222,7 +222,15 @@ class ExpressionDepthGuard {
     ++depth;
   }
   [[nodiscard]] bool failed() const { return failed_; }
-  ~ExpressionDepthGuard() { --ExpressionDepthCounter(); }
+  // A failed guard never incremented the counter: decrementing anyway would
+  // underflow the size_t to SIZE_MAX and make EVERY later parse on this
+  // thread "exceed" the depth limit (observed as unrelated tests aborting
+  // when several ran inside one process).
+  ~ExpressionDepthGuard() {
+    if (!failed_) {
+      --ExpressionDepthCounter();
+    }
+  }
   ExpressionDepthGuard(const ExpressionDepthGuard&) = delete;
   ExpressionDepthGuard& operator=(const ExpressionDepthGuard&) = delete;
   ExpressionDepthGuard(ExpressionDepthGuard&&) = delete;
@@ -411,7 +419,13 @@ class UdfExpansionDepthGuard {
     }
     ++tls_udf_expansion_depth;
   }
-  ~UdfExpansionDepthGuard() { --tls_udf_expansion_depth; }
+  // Symmetric with the constructor: a failed guard never incremented the
+  // depth, so it must not decrement either (see ExpressionDepthGuard).
+  ~UdfExpansionDepthGuard() {
+    if (!failed_) {
+      --tls_udf_expansion_depth;
+    }
+  }
   UdfExpansionDepthGuard(const UdfExpansionDepthGuard&) = delete;
   UdfExpansionDepthGuard& operator=(const UdfExpansionDepthGuard&) = delete;
   UdfExpansionDepthGuard(UdfExpansionDepthGuard&&) = delete;
@@ -965,12 +979,14 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
 StatusOr<Expression> ExpandUdfCall(const std::string& name,
                                    std::vector<Expression> arguments);
 
+}  // namespace
+
 bool NeedsRelationalEvaluation(
     const Expression&
         expression,  // NOLINT(misc-no-recursion) // AST traversal recursion is
                      // intentional; expression depth bounded by
                      // ExpressionDepthGuard (kMaxExpressionDepth).
-    bool top_level = true) {
+    bool top_level) {
   if (!expression) {
     return false;
   }
@@ -1049,6 +1065,8 @@ bool NeedsRelationalEvaluation(
       return false;
   }
 }
+
+namespace {
 
 StatusOr<Expression> FoldBoolean(
     const GoogleSqlAstNode& node,
@@ -3756,6 +3774,16 @@ StatusOr<Expression> VisitExpression(
         } catch (const std::exception& error) {
           (void)error;
         }
+        // The IntervalExpression constructor parses eagerly and its EXC-SHIM
+        // wrapper THROWS on unparseable text (fuzz-found: INTERVAL '<empty>'
+        // with no unit aborted the process).  Reject through Status instead.
+        if (!IntervalValue::TryParse(
+                 str_val.empty() ? std::to_string(amount) : str_val, unit)
+                 .HasValue()) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "unsupported INTERVAL literal: '" + str_val + "' " + unit);
+        }
         return IntervalExpressionExp(amount, std::move(unit),
                                      std::move(str_val));
       }
@@ -3764,6 +3792,12 @@ StatusOr<Expression> VisitExpression(
       if (expr->Type() == TypeTag::kConstantValue) {
         const Value& v = expr->AsConstantValue().GetValue();
         if (v.type == ValueType::kInt64) {
+          if (!IntervalValue::TryParse(std::to_string(v.value.int_value), unit)
+                   .HasValue()) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "unsupported INTERVAL literal: interval constant");
+          }
           return IntervalExpressionExp(v.value.int_value, std::move(unit));
         }
         if (v.type == ValueType::kVarChar) {
@@ -3774,6 +3808,13 @@ StatusOr<Expression> VisitExpression(
           } catch (const std::exception& error) {
             (void)error;
           }
+          if (!IntervalValue::TryParse(
+                   (str_val.empty() ? std::to_string(amount) : str_val), unit)
+                   .HasValue()) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "unsupported INTERVAL literal: interval string constant");
+          }
           return IntervalExpressionExp(amount, std::move(unit),
                                        std::move(str_val));
         }
@@ -3782,6 +3823,13 @@ StatusOr<Expression> VisitExpression(
         std::string col_name = expr->AsColumnValue().GetColumnName().name;
         if (HasSessionConstant(col_name)) {
           std::string str_val = GetSessionConstant(col_name);
+          if (!IntervalValue::TryParse(
+                   (str_val.empty() ? std::string("0") : str_val), unit)
+                   .HasValue()) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "unsupported INTERVAL literal: session-constant interval");
+          }
           return IntervalExpressionExp(0, std::move(unit), std::move(str_val));
         }
         return FunctionCallExp(
@@ -3793,6 +3841,12 @@ StatusOr<Expression> VisitExpression(
       if (StatusOr<Value> v = expr->TryEvaluate(dummy_row, dummy_schema);
           v.HasValue()) {
         if (v.Value().type == ValueType::kInt64) {
+          if (!IntervalValue::TryParse(
+                   std::to_string(v.Value().value.int_value), unit)
+                   .HasValue()) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "unsupported INTERVAL literal: folded interval");
+          }
           return IntervalExpressionExp(v.Value().value.int_value,
                                        std::move(unit));
         }
@@ -3803,6 +3857,13 @@ StatusOr<Expression> VisitExpression(
             amount = std::stoll(str_val);
           } catch (const std::exception& error) {
             (void)error;
+          }
+          if (!IntervalValue::TryParse(
+                   (str_val.empty() ? std::to_string(amount) : str_val), unit)
+                   .HasValue()) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "unsupported INTERVAL literal: folded interval string");
           }
           return IntervalExpressionExp(amount, std::move(unit),
                                        std::move(str_val));
@@ -5131,6 +5192,15 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         // off the wrapper.  Preserve them here so execution sees the same
         // scope and applies bounds after concatenating the branches.
         if (const GoogleSqlAstNode* limit_offset = query.Child("LimitOffset")) {
+          // `... WITH TIES` hangs off the same wrapper; the plain-SELECT
+          // path reads it, so the set-op path must too or the modifier is
+          // silently dropped (the frontend pre-rewrite already erased the
+          // "with ties" text from the SQL).
+          if (limit_offset->Child("WithTies") != nullptr ||
+              limit_offset->detail.find("with_ties") != std::string::npos ||
+              limit_offset->detail.find("WITH TIES") != std::string::npos) {
+            first_stmt->SetWithTies(true);
+          }
           if (const GoogleSqlAstNode* limit_node =
                   limit_offset->Child("Limit")) {
             for (const auto& child : limit_node->children) {
@@ -5921,8 +5991,22 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
   // or without table aliases) stay on the cost-based optimizer path; the
   // engine folds INNER ON conditions into the WHERE conjunction. Only
   // features the optimizer cannot represent yet force the relational
-  // executor: FROM-subqueries and outer joins.
+  // executor: FROM-subqueries and outer joins. M6 admits plain LEFT joins
+  // (base-table sources, ON condition, no USING/nesting): the optimizer
+  // carries their ON conditions as outer-join predicates, and any shape
+  // beyond its slice returns kNotImplemented so the engine falls back to
+  // the relational path. Single RIGHT/FULL edges are admitted by the
+  // M6+1 post-rewrite gate in sql_engine.cpp; RIGHT/FULL chains, USING and
+  // nested shapes stay relational.
   for (const SelectSource& source : statement->Sources()) {
+    const bool plain_left_join =
+        source.join_type == JoinType::kLeft && !source.query &&
+        !source.from_nested_join && !source.unnest &&
+        source.using_columns.empty() && source.join_condition &&
+        !NeedsRelationalEvaluation(source.join_condition);
+    if (plain_left_join) {
+      continue;
+    }
     if (source.query || source.join_type == JoinType::kLeft ||
         source.join_type == JoinType::kRight ||
         source.join_type == JoinType::kFull || source.from_nested_join ||
@@ -5969,7 +6053,7 @@ StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
   const GoogleSqlAstNode* schema = definition.Child("SimpleColumnSchema");
   if (schema == nullptr) {
     if (definition.Child("ArrayColumnSchema") != nullptr) {
-      return ColumnTypeInfo{ValueType::kArray, false};
+      return ColumnTypeInfo{.type = ValueType::kArray, .is_unsigned = false};
     }
   }
   const GoogleSqlAstNode* path =
@@ -5990,35 +6074,36 @@ StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
   }
   const std::string lower = Lower(cleaned);
   if (lower.starts_with("proto<") || lower.find('.') != std::string::npos) {
-    return ColumnTypeInfo{ValueType::kVarChar, false};
+    return ColumnTypeInfo{.type = ValueType::kVarChar, .is_unsigned = false};
   }
   const std::string& type = lower;
   if (type == "int" || type == "int64" || type == "integer" ||
       type == "bigint" || type == "bool" || type == "boolean" ||
       type == "int32" || type == "int16" || type == "int8") {
-    return ColumnTypeInfo{ValueType::kInt64, false};
+    return ColumnTypeInfo{.type = ValueType::kInt64, .is_unsigned = false};
   }
   if (type == "uint" || type == "uint64" || type == "uint32" ||
       type == "uint16" || type == "uint8") {
-    return ColumnTypeInfo{ValueType::kInt64, true};
+    return ColumnTypeInfo{.type = ValueType::kInt64, .is_unsigned = true};
   }
   if (type == "numeric" || type == "decimal" || type == "double" ||
       type == "float" || type == "float64" || type == "float32" ||
       type == "bignumeric") {
-    return ColumnTypeInfo{ValueType::kDouble, false};
+    return ColumnTypeInfo{.type = ValueType::kDouble, .is_unsigned = false};
   }
   if (type == "date") {
-    return ColumnTypeInfo{ValueType::kDate, false};
+    return ColumnTypeInfo{.type = ValueType::kDate, .is_unsigned = false};
   }
   if (type == "string" || type == "varchar" || type == "char" ||
       type == "timestamp" || type == "datetime" || type == "time" ||
       type == "interval" || type == "bytes" || type == "json") {
-    return ColumnTypeInfo{ValueType::kVarChar, false};
+    return ColumnTypeInfo{.type = ValueType::kVarChar, .is_unsigned = false};
   }
   if (type == "array" || type.starts_with("array<")) {
-    return ColumnTypeInfo{ValueType::kArray, false};
+    return ColumnTypeInfo{.type = ValueType::kArray, .is_unsigned = false};
   }
-  return AstError<ColumnTypeInfo>("GoogleSQL AST: unsupported column type " + type);
+  return AstError<ColumnTypeInfo>("GoogleSQL AST: unsupported column type " +
+                                  type);
 }
 
 StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {

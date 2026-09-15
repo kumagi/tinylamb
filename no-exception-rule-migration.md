@@ -99,11 +99,21 @@ Google C++ Style Guide に沿い、DB ロジック（ライブラリ層）から
        ErrorResponse は Status.message を使用）
 
 ### Phase 8: 最終検証
-- [ ] ctest 全件
-- [ ] `python3 scripts/check_layering.py`
-- [ ] フォーマット（clang-format）
-- [ ] 残存 throw の棚卸し（スコープ外ファイルのみであることの確認）
+- [x] ctest 全件（2026-09-15: 2404/2404 green、gcc/clang -Wconversion クリーン）
+- [x] `python3 scripts/check_layering.py`
+- [x] フォーマット（clang-format、2026-09-15: リポジトリ全体で未適用 0 件）
+- [x] 残存 throw の棚卸し: ライブラリ層の実 throw は `common/exc_shim.hpp`
+      の shim 機構のみ。`recovery/log_record_oracle.cpp` は PBT サポート
+      （oracle 内 catch で完結、スコープ外扱い）。テスト/fuzzer/benchmark/
+      main.cpp はスコープ外。
 - [ ] ドキュメント更新（common/AGENTS.md の "never throws" 記述の実態化）
+
+### Phase 8 メモ（2026-09-15 健全化パス）
+- boundary catch（sql_engine / postgres_server）は残置 = Phase 7 未完のまま。
+  ExcShimUnwrap 呼び出し（type/expression/plan + executor/detail の
+  const-fold 経路）が依然例外を投げるため、shim 全廃までの正常系。
+  完了条件は exc_shim.hpp 冒頭コメントの grep 監査を参照。
+- `Transaction::CommitWait` は write バリア（fsync ではない）とヘッダに明記。
 
 ## 進捗メモ
 
@@ -328,6 +338,12 @@ Google C++ Style Guide に沿い、DB ロジック（ライブラリ層）から
   3. `std::stoll` 等の C++ ランタイム例外由来 catch（`cast_expression.cpp`,
      `type/interval.cpp`）と raw thread 境界の安全網 catch は許容。
      `*_oracle.cpp` はテストハーネスとして除外扱い。
+- **2026-09-13: ユーザーデータ起因の無防護 `std::sto*` を解消（(b) 分類）**:
+  `type/interval.cpp` の INTERVAL 数値成分、`expression_eval.cpp` の
+  DATETIME/TIME コンストラクタ・ADD_MONTHS・小数秒 INTERVAL を
+  `std::from_chars` ベースの strict パース（`ParseI64Strict` /
+  `ParseDoubleStrict`）へ置換し、`StatusError(kInvalidArgument)` で伝播する
+  ようにした。scan accepted 入力（`"."`、桁過多）でも例外は上がらない。
 - **Phase 8 検証手順**: `cmake --build build -j32` → 
   `ctest --test-dir build -j16 --timeout 120`（2218/2218）→
   `python3 scripts/check_layering.py`（exit 0, allowlisted=63）→

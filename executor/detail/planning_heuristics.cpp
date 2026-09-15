@@ -61,19 +61,27 @@ bool IsVirtualValueTableField(const Schema& schema, const ColumnName& name) {
   }
   // A value table's implementation column is commonly named after the
   // table (for CREATE TABLE AS SELECT AS PROTO), not necessarily `$expr0`.
-  // Any non-physical field reference against a one-column relation therefore
+  // A dotted field reference against a one-column relation therefore
   // needs the sole payload column retained for dotted-field evaluation.
   if (name.name == only.name &&
       (name.schema.empty() || name.schema == only.schema)) {
     return false;
   }
-  return name.schema.empty() ||
-         (only.schema.size() == name.schema.size() &&
-          std::equal(only.schema.begin(), only.schema.end(),
-                     name.schema.begin(), [](char left, char right) {
-                       return std::tolower(static_cast<unsigned char>(left)) ==
-                              std::tolower(static_cast<unsigned char>(right));
-                     }));
+  // A bare simple name never addresses a virtual payload field: dotted
+  // access always spells a qualifier (alias or dotted path). Claiming bare
+  // names here makes every bare predicate column "ambiguous" against any
+  // single-column relation (single-column derived tables, single-column
+  // base tables), which silently degrades their joins to cross products
+  // (TPC-H Q20 at SF1: 800K x derived rows instead of a hash join).
+  if (name.schema.empty()) {
+    return false;
+  }
+  return only.schema.size() == name.schema.size() &&
+         std::equal(only.schema.begin(), only.schema.end(), name.schema.begin(),
+                    [](char left, char right) {
+                      return std::tolower(static_cast<unsigned char>(left)) ==
+                             std::tolower(static_cast<unsigned char>(right));
+                    });
 }
 
 }  // namespace
@@ -2029,7 +2037,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // Subquery-bearing or constant-only ON conjuncts never made it into a
     // scan filter or join key; evaluate them over the joined rows now so the
     // inner-join semantics stay intact.
-    RETURN_IF_FAIL(FilterRelation(context, &result, join_residual, outer, ctes));
+    RETURN_IF_FAIL(
+        FilterRelation(context, &result, join_residual, outer, ctes));
   }
   return result;
 }

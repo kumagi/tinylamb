@@ -55,8 +55,7 @@ The built-in logical rules include (see `RuleSet::Default` in
   `semijoin_to_inner_plus_distinct`, `mark_join_to_filter`,
   `outer_to_anti_join`, `union_all_push_limit`, `eliminate_double_sort`,
   `join_identity_dummy`, `count_star_rewrite_on_not_null`,
-  `group_by_functional_dependency_reduction`, `topn_push_through_inner_join`,
-  `split_window`, `values_fold_into_union`, `cast_pushdown_on_comparison`,
+  `group_by_functional_dependency_reduction`, `split_window`, `values_fold_into_union`, `cast_pushdown_on_comparison`,
   `extract_year_sargable`, `comparison_self_predicates`,
   `any_value_elimination`, `order_by_redundant_column_removal`, and
   subquery/aggregate lowering rules
@@ -73,7 +72,7 @@ The built-in physical rules include (see `plan/implementation_rules.cpp`):
 - `outer_nested_loop` (LEFT non-equi; RIGHT normalizes to LEFT)
 - `index_join`
 - `nested_loop_join`
-- `stream_agg` (scalar third alternative beside hash/sort)
+- `aggregation` (its third `PlanAlternative` is the scalar stream aggregate beside hash/sort)
 - `materialize` / `eager_spool` / `lazy_spool`
 - `exchange_noop` / `gather_noop` / `broadcast_noop` / `redistribute_noop`
 
@@ -181,8 +180,11 @@ Tests for rule isolation and memo enumeration are in
 - `PhysicalProperties` contains `require_row_position`, `ordering`,
   `limit_hint`, `access_method`, and the reserved `distribution`. Selection,
   projection, and limit forward requirements; joins and aggregation drop them.
-- Logical exploration has no pass cap by default: an append-only worklist and expression
-  fingerprints drive it to completion. `OptimizerOptions::search_step_budget` optionally
+- Logical exploration drives an append-only worklist to completion, bounded by
+  the built-in `kMaxExploreSteps` (20000 rule applications; exploration stops
+  silently at the cap and keeps the best plan so far — visible only via
+  `dump_memo`). `OptimizerOptions::search_step_budget` additionally caps rule
+  applications explicitly, degrading gracefully to the best plan found so far. `OptimizerOptions::search_step_budget` optionally
   caps rule applications, degrading gracefully to the best plan found so far
   (`SearchEngine::BudgetExhausted`, reported in `dump_memo`). Costing prunes
   branch-and-bound style: expressions whose children alone reach the incumbent
@@ -215,7 +217,17 @@ disabled and its basis recorded here. Counterexample tests live in
 | `in_list_to_semi_join` | every OR branch is a col=const equality on one column (no branch dropped); group tag fingerprints all constants | Gated | `InListToSemiJoinRejectsMixedColumnOr`, `InListToSemiJoinRejectsUncollectableBranch` |
 | `eliminate_double_sort` | key expressions, direction and NULLS order all equal (collation is not modelled in the logical expression, so it cannot diverge) | Gated | `EliminateDoubleSortRequiresSameKeyExpressions`, `EliminateDoubleSortRequiresSameNullsFirst` |
 | `rank_row_number_to_topn` | window has no PARTITION BY and the Selection filters the window's own output column | Gated | `RankRowNumberToTopNSkipsPartitionedWindow`, `RankRowNumberToTopNSkipsNonWindowColumn` |
+| `no_op_window_elimination` bypasses | kWindow targets contain no window calls (branch 1); outer targets reference no `$win` outputs of the bypassed node and contain no raw calls (branch 2) | Gated: the comment promised "when outer expressions do not reference results" but the code never checked — bypassing a live `$win` silently dropped its computation (`compatible_windows_share_single_sort` regressed to `column $win0 not found` with ANALYZE) | `NoOpWindowElimination` (plain-target bypass preserved), `SqlEngineWindowRankingPlansThroughCascades` |
+| opaque recursive-CTE leaf (`LiftRecursiveCtes`) | single top-level FROM site; body references no mapped CTE except itself (worktable); unique output names; single-use counting excludes the body's own self-references | Gated: multiple sites would re-run the fixpoint per site instead of sharing it; sibling-scoped references keep map-scoped execution; a renamed alias with surviving CTE-qualified refs would orphan them | `SqlEngineRecursiveCtePlansOuterThroughCascades`, `SqlEngineMultiUseAndRecursiveCteStayCorrect` |
+| `unused_left_join_elimination` (statement-level, `TryEliminateUnusedOuterJoin`) | single LEFT/RIGHT edge (FULL excluded) with a single col=col equi-ON whose null-supplying-side column is declared UNIQUE/PK (each preserved row matches ≤1, so the join is the identity); nothing above the join (SELECT/ORDER/WHERE/QUALIFY, window partition/order keys included) names the dropped side | Gated: without the uniqueness proof duplicate matches would collapse (`OuterJoinSliceKeepsJoinWithoutUniquenessProof` pins 3 rows vs 2); an orphaned right reference has no sound placement so it blocks elimination | `OuterJoinSliceEliminatesUnusedUniqueRightSide`, `OuterJoinSliceEliminatesUnusedUniqueLeftSideForRight`, `OuterJoinSliceKeepsJoinWithoutUniquenessProof` |
 | derived group creation | tag must fingerprint the expression *meaning*, never a bare count | `TargetListFingerprint` used by all projection/aggregate/values derived groups | `DerivedGroupFingerprintSeparatesDifferentInLists` |
+| `setop_empty_simplification` | INTERSECT empties on ANY empty branch; EXCEPT only when its LEFT branch is empty (an earlier gate accepted any empty branch, collapsing non-empty `A EXCEPT empty-B` to `Empty`) | Gated (2026-09) | `CascadesTest.SetopEmptySimplification*` family |
+| `intersect_to_semijoin` / `except_to_antijoin` / `intersect_except_cost_based_lowering` | INTERSECT/EXCEPT are DISTINCT set operations: the semi/anti join keeps left-side multiplicity, so the join alternative is published through a logical Distinct wrapper | Gated: Distinct-wrapped (2026-09; bare joins dropped the dedup contract) | `IntersectToSemiJoinRewrite`, `ExceptToAntiJoinRewrite`, `IntersectExceptCostBasedLowering` |
+| `filter_aggregate_pushdown` | scalar aggregation only (with GROUP BY, groups whose every row fails the predicate would survive as COUNT=0 phantoms); a FILTER already present on an aggregate is conjoined, never overwritten | Gated (2026-09) | `FilterAggregatePushdown`, `FilterAggregatePushdownRefusedForGroupedAggregation` |
+| `grouping_sets_expansion` (aggregation branch) | exactly two grouping sets — the UNION-ALL decomposition covers only the first two; larger sets must not be rewritten | Gated (2026-09) | — |
+| `eager_aggregation_over_join` / `aggregate_join_transpose` (surviving-column gate) | every left-side column referenced by the join predicate must survive the pushed aggregate (grouping key or plain passthrough target); otherwise the re-join binds a column the aggregate no longer produces | Gated (2026-09) | `EagerAggregationOverJoinOnUniqueKey` |
+| `count_star_without_group_rewrite` | input group is a base-table scan (empty tag, kScan present): derived selection groups would lose their predicate to the ConstantTable COUNT | Gated (2026-09) | — |
+| `push_limit_through_left_join` | LIMIT without ORDER BY (any subset of the join output is acceptable); re-introduces the limit-through-join family ONLY under unordered semantics — must not be enabled once a required ordering can attach to a kLimit expression | Gated (recorded 2026-09) | — |
 | `Memo::AddExpression` | schema/arity/child-group/relation-set contract | Violations are `CHECK` aborts (fast-fail, no exceptions); rule bodies must probe with `Memo::ContainsRelation` / uniqueness checks instead of relying on throws. `ExploreGroup` skips a rule whose alternative is declined, and keeps a legacy `std::invalid_argument` containment for the remaining planning-path throws | memo contract tests in `cascades_test.cpp` |
 
 Re-adding a disabled rule requires re-establishing its precondition gate and a

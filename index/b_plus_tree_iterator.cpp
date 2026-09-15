@@ -189,7 +189,10 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
       ref.PageUnlock();
       // Empty foster-tail leaves are reachable after deletions (the deleter
       // only refeeds its own chain).  Skip past them instead of ending the
-      // scan early, mirroring the operator-- handling.
+      // scan early, mirroring the operator-- handling.  An empty leaf with
+      // no foster of its own still carries a finite high fence mid-tree:
+      // walk it like the post-fence path below, or keys beyond it silently
+      // disappear from range scans.
       while (next_ref->body.leaf_page.row_count_ == 0) {
         if (auto nested = next_ref->GetFoster(*txn_)) {
           pid_ = nested.Value().child_pid;
@@ -205,8 +208,22 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
           next_ref = std::move(following);
           continue;
         }
-        valid_ = false;
-        return *this;
+        const IndexKey nested_fence = next_ref->GetHighFence(*txn_);
+        if (nested_fence.IsPlusInfinity()) {
+          valid_ = false;
+          return *this;
+        }
+        const std::string nested_seek(nested_fence.GetKey().Value());
+        next_ref.PageUnlock();
+        StatusOr<PageRef> nested_so =
+            tree_->FindLeafReadOnly(*txn_, nested_seek, false);
+        if (!nested_so.HasValue()) {
+          status_ = nested_so.GetStatus();
+          valid_ = false;
+          return *this;
+        }
+        next_ref = nested_so.MoveValue();
+        pid_ = next_ref->PageID();
       }
       idx_ = 0;
       if (!end_.empty() && end_ < next_ref->body.leaf_page.GetKey(idx_)) {
@@ -296,7 +313,10 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
   LeafPage* const lp = &ref->body.leaf_page;
   if (0 == idx_) {
     if (pid_ == 0) {
+      // The first leaf sits at pid 0; before-begin is already invalid, like
+      // the operator++ guard.
       valid_ = false;
+      return *this;
     }
     IndexKey low_fence = ref->GetLowFence(*txn_);
     if (low_fence.IsMinusInfinity()) {

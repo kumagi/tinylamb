@@ -138,22 +138,42 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
     ただし集合演算は `plan_contains` が relational 形式の
     `optimizer_subquery_setop_high_expectations` 等を結果契約のみに緩和済み。
   - **残存する relational 経路（M4〜M8）と各移管要件**:
-    1. **CTE / 再帰 CTE**（M4）: Cascades コアが CTE 名を解決できない。
-       memo に materialized-scan 葉（派生スキャン）オペレータが必要。
-       再帰は `ExecuteRecursiveCte` 相当の物理演算子接続。
-    2. **FROM サブクエリ / LATERAL**（M5）: 派生スキャン葉に同じく依存。
-       LATERAL は相関パラメータの per-row 再実行が必要（subquery_runtime 相当）。
-    3. **OUTER JOIN**（M6）: `GroupByPlan` コアは外部結合条件の WHERE 平坦化が
-       意味論を壊すため除外済み。memo `kOuterJoin` に join-type 付き lowering
-       （`Memo::Build` の join 木構築拡張）が必要。
-       ※ SELECT COUNT(*) FROM a LEFT JOIN b は外部結合ガードで relational 保棄。
-    4. **UNNEST / TVF**（M7）: `kUnnest` 論理 op は enum に存在、実装規則未接続。
+1. **CTE / 再帰 CTE**（M4）: 単一参照・単一表の非再帰 CTE はインライン化で
+   移管済み（`InlineSingleUseCtes`＋M5 flatten）。複数参照の小規模 CTE は
+   共有 eager セルへ持ち上げ済み（`MaterializeCtes`：fresh engine で1回だけ
+   計画・実行し kValues 葉で共有。1024行超は mapped 維持）。単一参照の再帰
+   CTE は不透明 memo 葉へ lowering 済み（`LiftRecursiveCtes`：
+   fixpoint 自体は `ExecuteRecursiveCte` 維持、外側の結合・フィルタ・順序は
+   Cascades）。残件: 複数参照再帰の worktable 共有、再帰本体の decorrelation
+   （magic sets 等、研究枠）、CTE 残存時の M5 待機緩和の一部
+   （派生-over-CTE は relational 維持）。
+2. **FROM サブクエリ / LATERAL**（M5）: 単一表・非相関・行保存の派生表は
+   statement-level flatten で解消済み（`FlattenDerivedSources`:
+   内部 WHERE は INNER 側へ併合／外部結合の null-supplying 側は ON へ併合、
+   star・集約・CTE・相関は対象外で relational 維持）。
+   残件: CTE 実体化リーフ（M4）、LATERAL の相関実行、集約・複数表・star 付き
+   派生表の memo 葉化（`cte_inlining` / `decorrelate_lateral` は葉待ち）。
+   LATERAL は相関パラメータの per-row 再実行が必要（subquery_runtime 相当）。
+3. **OUTER JOIN**（M6）: 単一 LEFT（2表・明示ON）は Cascades 移管済み
+   （`QueryData::outer_joins_`＋`Memo::NewOuterJoin`＋`TryEliminateUnusedOuterJoin`。
+   ON-vs-WHERE 分離・右側 WHERE 上残し・unique 右側の除去まで接続）。
+   M6+1 で単一 RIGHT／FULL も移管済み（`PostRewriteNeedsRelational` の
+   単一辺スライス＋辺 kind 1/2 構築＋ preserved/null-supplying 側で一般化した
+   ON-vs-WHERE 契約＋RIGHT の unique 左側除去ミラー。FULL 除去なし。
+   非等価 FULL は `batch_nested_loop_outer` で実行）。
+   残件: outer chain・GROUP BY 付き outer の memo 移管、
+   memo レベルの unused-outer 除去（現状 statement-level のみ）。
+   ※ SELECT COUNT(*) FROM a LEFT JOIN b は外部結合ガードで relational 保棄
+   （slice が集約を拒否しフォールバック）。
+    4. **UNNEST / TVF**（M7）: `kUnnest` 論理 op は memo 接続済み
+       （`sql_engine.cpp` が kUnnest を構築、`implementation_rules.cpp` が
+       `unnest` 実装規則を登録）。残件は汎用 TVF（`WITH OFFSET` 等の周辺）。
     5. **相関サブクエリ残部**（M8）: `GroupedSelect` は式内 QueryExp で
        フォールバック済み（`grouped_expressions_correlate` ガード）。
        デコリレーション不能形状は subquery_runtime 依存を維持。
   - **M9（planner 削除）の前提**: 上記 1〜5 の全移管後、
-    `executor/relational.cpp`（2,562 行）+ `executor/detail/planning_heuristics.cpp`
-    （1,853 行）+ `sql_engine.cpp` の `emit_relational` 3 箇所 +
+    `executor/relational.cpp`（2,965 行）+ `executor/detail/planning_heuristics.cpp`
+    （2,038 行）+ `sql_engine.cpp` の `emit_relational` 3 箇所 +
     `Optimizer::OptimizeRelational` / `kRelational` を削除する。
     実行ヘルパ（expression_eval / window_eval / scan_filter / subquery_runtime の
     評価器部分）は残す。`OptimizerAndRelationalPathsAgree` 監査テストは役目終了。
@@ -352,8 +372,11 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       block NL として実装）
 - [x] `lookup_join` / `index_nested_loop` の一般化（複合キー、範囲。
       `index_join` が複合キー対応。範囲 INL はコストモデル待ちの将来枠）
-- [ ] `batch_nested_loop`（IN リスト化して内側を一括。`BatchNestedLoopJoin`
-      実行器はあるが Cascades 配線はコストモデル待ち）
+- [x] `batch_nested_loop`（`batch_nested_loop`＋`_semi`＋`_anti`＋`_outer`
+      実装規則。非 equi のみ発火：inner は tuple `nested_loop_join` と完全同
+      形・同コストでタイは登録順により tuple が勝つため既存プラン不変、
+      semi/anti/full/right は tuple 実装がなく新規能力。`ProductPlan` の
+      batch フラグで factory が `BatchNestedLoopJoin` に lowering）
 - [x] `dynamic_filter_join`（実行時ブルームを内側スキャンへ。
       `dynamic_filter_pushdown_join`）
 - [ ] `late_materialization_join`（行 ID で join してから列を取る。
@@ -477,9 +500,12 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       非等式は保守的に一般経路へ）
 - [x] `push_correlated_predicate_into_subquery`（相関等式の local 側を index
       build、local-only predicate を build 時 filter。NULL key は push しない）
-- [x] `flatten_nested_subqueries`（単一表の identity projection と、行数を変えない
-      immutable projection の nested derived table。WHERE / ORDER BY の列参照を
-      内側式へ再束縛し、GROUP/LIMIT/WINDOW/volatile 式は境界を保持）
+- [x] `flatten_nested_subqueries`（`FlattenDerivedSources` として実装:
+      単一表・非相関・行保存の nested derived table を statement レベルで
+      インライン化。WHERE / ORDER BY / GROUP BY / ON の列参照を内側式へ
+      再束縛し、内部 WHERE は INNER 側へ併合・null-supplying 側は ON へ併合。
+      GROUP/LIMIT/WINDOW/volatile 式・star・CTE・相関は境界を保持し
+      relational 維持）
 - [x] `merge_identical_subqueries`（非相関 QueryExpression を構造 fingerprint と
       継承 CTE の実体識別子で共有。scalar 結果と IN membership の構築を
       statement 内で一度にし、`uncorrelated_cache_hits` へ反映）
@@ -489,9 +515,13 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       再利用し、`correlated_result_cache_hits` を記録。単一表 equality probe の
       専用 index に加え、derived/opaque source も外側スコープのパラメータ化
       結果を共有し、volatile 関数はキャッシュしない）
-- [ ] `cte_inlining`（参照 1 回、または安価。派生スキャン葉（M4）待ち）
-- [ ] `cte_materialization`（参照複数、または再帰。物理側は `materialize`
-      実装規則まで接続済み。Cascades 側の CTE 葉は M4 待ち）
+- [x] `cte_inlining`（`InlineSingleUseCtes` として実装：単一参照・非再帰・
+      単一表行保存ボディを参照箇所へインライン化し派生表へ。M5 と連動して
+      Cascades 到達。複数表・集約ボディ、複数参照は対象外）
+- [x] `cte_materialization`（`MaterializeCtes` として実装：CTE-free・
+      1024行以下の非再帰 CTE を fresh engine で1回だけ計画・実行し、
+      参照サイト間で kValues 葉として共有。over-budget・再帰・CTE依存は
+      mapped 維持。`multi_use_cte_is_materialized_once` が共有を回帰）
 - [ ] `cte_filter_pushdown`
 - [ ] `cte_predicate_propagation`
       （いずれも派生スキャン葉（M4）待ち。relational 維持）
@@ -532,8 +562,11 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `except_empty_right` → left（DISTINCT は重複排除を保持）
 - [x] `setop_type_coercion_pushdown`（`SetOperationPlan` が出力スキーマへ数値共通型を
       反映し、枝側の型合わせは `setop_push_projection` との合成で等価）
-- [ ] `merge_union_compatible_scans`（同一表の OR を 1 スキャンに。OR 述語は
-      relational 経路に残るため、そちら側の将来枠）
+- [x] `merge_union_compatible_scans`（`MergeCompatibleUnionBranches`
+      として実装：同一表・同一別名の UNION ALL（互いに素な等価述語で証明）
+      ／ UNION DISTINCT 分岐を単一 OR スキャンへ。OR 述語自体は `or_to_in`／
+      bitmap 経路で被覆済み。INTERSECT/EXCEPT・集約分岐・star 以外の表面は
+      対象外）
 - [ ] `partition_wise_union`（パーティションカタログがないため将来枠）
 
 ---
@@ -552,8 +585,8 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `window_to_aggregate`（適用不能として確定。全フレーム集計への置換は行複製
       を伴わないと非等価（Window N 行 vs 集約 1 行）のため、単純置換の余地なし。
       一時集約＋cross 結合の形は将来の decorrelation 枠）
-- [x] `rank_filter_to_topn`（`RANK() = 1` 等）
-- [x] `row_number_filter_to_topn`
+- [x] `rank_filter_to_topn`（`RANK() = 1` 等。`rank_row_number_to_topn` として実装済み）
+- [x] `row_number_filter_to_topn`（`rank_row_number_to_topn` として実装済み）
 - [x] `eliminate_noop_window`
 - [x] `window_prefix_sort_share`（`window_frame_sort_sharing` として実装済み）
 - [x] `unnest_with_ordinality`（`WITH OFFSET` を列へ射影し、配列/相関 UNNEST の回帰あり）
@@ -727,10 +760,18 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       （`sort`・`merge_join`・`aggregation`（Hash/Sort/Stream の3代替）で分離済み）
 - [x] `stream_agg` 実装規則（`aggregation` 規則の第三代替 `StreamAggregatePlan`）
 - [x] `hash_distinct` / `sort_distinct`
-- [ ] `window_sort` / `window_hash_partition`（window 実行器がなく relational
-      `window_eval` のため将来枠。window migration とセット）
-- [ ] `set_union_hash` / `set_union_sort`（`SetOperationPlan` 単一実装のため
-      将来枠。現状 MergeAppend 選択はある）
+- [x] `window` 実装規則（`WindowPlan`＋`WindowExecutor`。正準 evaluator へ
+      委譲するため frame/NULL 配置は AST/relational と一致。partition 毎の
+      sort/hash 分岐は単一戦略のため将来枠）
+- [ ] `window_sort` / `window_hash_partition`（明示の物理分岐。単一戦略の
+      `window` 実装規則で被覆済みのため優先度低）
+- [x] `set_union_hash` / `set_union_sort`（単一実装で確定：
+      set-op は memo に入らず枝ごとに独立計画→executor レベルで fold
+      するため（`ExecuteSetOperation`＋`NeedsRelational` の set-op 経路）、
+      Cascades 側の hash/sort 分岐は到達不能。hash 側は現行の
+      `SetOperationExecutor`（hash＋spill 済み）が担い、sort 側は
+      set-op の Cascades 移管（memo 葉化）待ちの将来枠。
+      現状 MergeAppend 選択あり）
 - [x] `materialize` 実装規則（`materialize`＋`MaterializePlan` まで接続）
 - [x] `spool` 実装規則（`eager_spool` / `lazy_spool`。同上実装を共有し
       ヒント用に分離）
@@ -798,10 +839,12 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       のしきい値駆動で実行器が選択。Cascades の明示分岐は不要のため確定）
 - [x] `topn_heap`（TopN implementation rule emits `TopNPlan` and preserves
       required NULL placement）
-- [ ] `window_agg`（window 実行器がなく relational `window_eval` のため将来枠。
-      window migration とセット）
-- [ ] `setop_hash` / `setop_sort`（`SetOperationPlan` 単一実装（MergeAppend 選択
-      あり）のため将来枠）
+- [x] `window_agg`（`window` 実装規則が全 window 関数形を被覆。`kWindow`
+      論理ノード＋`split_window` 等の既存論理規則と接続）
+- [x] `setop_hash` / `setop_sort`（単一実装で確定：同上、
+      memo に set-op が到達しないため実装規則の追加は dead code になる。
+      INTERSECT/EXCEPT の merge 系は executor 自体がなく、そちらが先。
+      `SetOperationPlan` 単一実装＋MergeAppend 選択を維持）
 - [x] `unnest_exec`（現行の relational fallback で `Unnest` / OFFSET を実行。
       Cascades 側 `unnest` 実装規則あり）
 - [x] `recursive_union`（`recursive_cte` 実装規則＋`ExecuteRecursiveCte` で被覆。
@@ -809,8 +852,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [ ] `insert` / `update` / `delete` / `upsert` の DML 計画（DML 論理ノード自体が
       なく relational 実行。`INSERT SELECT` の投影写像のみ接続済み。DML ノード
       導入時に追加）
-- [ ] `on_conflict` / `returning`（parser 表面がなく到達不能。構文追加時に DML 計画とセット）
-- [ ] `lock_rows`（SELECT FOR UPDATE）計画（同上、表面なし）
+- [x] `on_conflict` / `returning`（確定：parser 表面がなく到達不能のため
+      規則追加は dead code。構文追加時に DML 計画とセットで再開）
+- [x] `lock_rows`（SELECT FOR UPDATE）計画（確定：同上、表面なし）
 
 ---
 
@@ -847,8 +891,8 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       オプティマイザ側の追加規則は不要のため確定）
 - [ ] `MATCH_RECOGNIZE`（将来。行パターン実行器がなく将来枠）
 - [ ] `TABLESAMPLE`（構文がなく SQL 表面なし。`kSample` enum 予約のみ）
-- [ ] `QUALIFY`（window filter。relational で実行。window の Cascades migration
-      後に Selection-over-Window として移管する将来枠）
+- [x] `QUALIFY`（window 付きは Selection-over-Window として Cascades 移管済み。
+      window なし・集約あり等は relational 維持）
 - [x] `GROUP BY ALL` / `GROUP BY DISTINCT`（ALL は parse 時に明示キーへ展開、
       DISTINCT は重複除去意味が GROUP BY と一致するためそのまま実行。
       `GroupByAllAndDistinctExecution` で回帰。専用規則の余地なし）
@@ -910,6 +954,129 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       fixpoint 冪等回帰＋規則追加時の回帰で被覆）
 - [x] EXPLAIN に適用された規則名を出す（`SearchEngine::AppliedRuleNames`＋
       `dump_memo` 記録で被覆）
+
+---
+
+## 監査 — 解説書執筆で判明したコメント/実装の乖離(2026-09-13)
+
+`docs/opt/`(Cascades 解説書)の全 Rule 執筆(基準リビジョン `3880673` +
+作業ツリー差分)で確認された現状。詳細な根拠・コード引用は
+`docs/opt/part2-rules/` 配下の各 Rule 章と `docs/opt/00-index.md` の
+「実装の現状メモ」を参照。**各項は「文書を直す」か「実装を直す」かの判断が
+必要な未解決項目。** 正しさへの影響が疑われる順。
+
+### A. 正しさの調査が必要(guard 追加または意図の明記)
+
+- [ ] `intersect_to_semijoin` / `except_to_antijoin` /
+      `intersect_except_cost_based_lowering`: INTERSECT/EXCEPT(DISTINCT) は
+      重複を圧縮するが semi/anti join は左行ごとに出力するため、左入力に
+      重複があると多光度が一致しない。多光度の guard 未実装。D5 監査表に
+      項目なし → guard(左側一意性の証明 or 明示 dedup)追加 + 反例テスト +
+      D5 記載(`docs/opt/part2-rules/logical/intersect_to_semijoin.md` 等)
+- [ ] `filter_aggregate_pushdown`: 述語を通す行に一度も現れない GROUP BY
+      キーのグループが、変換後は「空集約値の行」として新規に出力され得る
+      (グループ集合の変化を排除する guard なし)。実行時は
+      `executor/partial_aggregate.cpp` がグループ生成を FILTER 評価に先行
+      させることで現状一致しているが、構造的保証ではない → guard 追加または
+      意図の明記(`docs/opt/part2-rules/logical/filter_aggregate_pushdown.md`)
+- [ ] `rank_row_number_to_topn`: 複数連言の述語で最初の一致項のみ TopN 化し
+      残差連言を引き継がない → 残差評価の欠落の疑い。反例テストの追加
+- [ ] `decorrelate_aggregate_apply`: Apply の `join_type`(0=Inner /
+      1=LeftOuter / 2=Semi / 3=Anti)を `kOuterJoin` の join_type
+      (0=LEFT / 1=RIGHT / 2=FULL)へ無変換で写すため、値 1 が RIGHT に
+      解釈され得る(テストは 0 のみ)。`apply_to_join` 側は写像し直している。
+      Apply の join_type は 2 種の符号化が混在しており統一が必要
+- [ ] `mark_join_to_filter`: NULL マーカー行の扱いが semi/anti と厳密一致
+      することをコードで確認できていない(`TryEvaluateUnary` の
+      IS NOT FALSE / IS NOT TRUE は NULL 入力で TRUE、`hash_join.cpp` の
+      `MaterializeMarkJoin` は NULL marker を生成しうる)。D5 監査表に項目なし
+- [x] `window_frame_sort_sharing`: `merge_adjacent_windows` が持つ「内側の
+      ウィンドウ出力列を参照しない」guard を追加済み（名前衝突時の意味破壊を
+      解消。`docs/opt/part2-rules/logical/window_frame_sort_sharing.md` 参照）
+- [ ] `eager_aggregation_over_join`: 登録コメントは「join keys ⊆ grouping
+      keys」を主張するが、実装の guard は「GROUP BY キーが全て左側リレーション
+      の列参照」まで。containment 検査の追加またはコメント修正。D5 反例
+      テスト 3 本(`EagerAggregationOverJoin*`)は guard と一致
+- [ ] `xor_boolean_identity`(式): TRUE 側(`x XOR TRUE → NOT x`)のみ
+      `StaticallyNonBoolean` チェックが無い非対称。理由を確認し guard か
+      コメントか決める
+- [ ] `distribute_or_over_and_budgeted`(式): 分配で `other` 側が n 回
+      複製されるが、volatile / サブクエリ評価回数の guard が現状ない
+
+### B. コメントと実装の不一致(コメント修正または実装追加)
+
+- [ ] `eliminate_sort_under_unordered_consumer`: コメントは「aggregation が
+      順序依存の要求を持たないとき」と述べるが、順序依存性を検査する guard
+      は実装されていない(A 項と重なる正しさの懸念)。また `grouping_sets` /
+      `output_schema` を写さず `target_list` のみ引き継ぐ
+- [ ] `recursive_termination_predicate_pushdown`: 登録コメントは monotonic
+      termination を謳うが、単調性解析は未実装(guard は循環防止の構造的
+      ものみ)。再帰 CTE の終端正しさに関わるため要確認
+- [ ] `cross_to_inner_with_predicate`: コメントは「p が左右両方を参照するとき」
+      と述べるが、両側参照の検査は未実装(意味保存には支援不要:
+      σp(L×R)≡L⋈pR は常に成立。コメントを直すか検査を足す)
+- [ ] `push_filter_through_sort`: コメントは「述語が子の列のみを参照」と
+      述べるが明示検査なし(ソートはスキーマを変えないため不要の判断。
+      コメントに明記)
+- [ ] `check_constraint_predicate_intake`: 未修飾名・`IsSameTable` を許容する
+      緩い照合。厳格派の `OutputMatchesColumn` と方針の統一を検討
+- [ ] 式書き換えの no-op 3 本(`nondeterministic_barrier` /
+      `safe_divide_rewrite` / `function_volatility_classification`):
+      ラムダが常に不発火の宣言的 Rule で、実際の抑止は `fold_function` の
+      volatility guard が担う。`nondeterministic_barrier` のインライン
+      コメントは実際の制御フローと不一致 → 位置づけの明記または廃止
+- [ ] `identity_divide_one`(式)と `StaticallyDouble` ヘルパーのコメント:
+      ヘルパー側は「生存側が double のときのみ発火すべき」と述べるが実際の
+      guard は `StaticallyNonNumeric`(int 列でも発火。AST グラウンド
+      トゥルースからの意図的逸脱の系列)→ コメントと guard の整合
+- [ ] `like_equality` / `not_like_equality`(式): 列名 `key` / `id` / `score` /
+      `val` を発火除外する guard の理由がコード・文書のどこにもない → 意図の記録
+- [ ] `count_star_without_group_rewrite`: コメントは COUNT(*) だが guard は
+      子式つき COUNT(col) も許す(等価性は `constant_table` 実装側が実表を
+      読み直して集約し直すことで担保)。前提をコメントに明記
+- [ ] `setop_empty_identity`: 全分岐空の UNION を `Empty` に潰さない
+      (`survivors.empty()` で早期 return)。意図ならコメント、漏れなら実装
+
+### C. デッド / プレースホルダの配線判断
+
+- [ ] `scan_zone_map_filter_integration`: `zonemap_pruned` 派生グループを
+      作るが、元のグループからこの派生グループを参照する式を追加しない
+      (接続変更なし)。テストもタグ付きグループの存在のみ → 配線するか撤去
+- [ ] `single_hash_join` / `mark_hash_join`: `kSingleJoin` / `kMarkJoin`
+      論理式の生成元が製品コードにない(テストのみ)。`mark_hash_join` は
+      `marker_column` を読まない(semi 種別に実装)
+- [ ] `max1_row`: `kMax1Row` をメモへ載せる製品経路が現状ない(テストからのみ)
+- [ ] `generate_series`: `kGenerateSeries` のフロントエンド生成元なし
+      (実装規則のみ存在)
+- [ ] `merge_projections` と `merge_adjacent_projections`: ほぼ同一の二重
+      登録(output_schema 引き継ぎと最初の成功で return するかの差のみ) →
+      統合を検討
+- [ ] `union_all_push_limit` と `push_limit_through_union_all`: 同一目的の
+      並存 Rule(循環 guard の切り口がタグ接頭辞 vs 枝の Limit 有無で違う)。
+      既存テストはどちらの形状も許す → 統合または役割分担の明記
+
+### D. 監査表・文書の追記
+
+- [ ] `docs/cascades_optimizer.md` の D5 監査表に未記載の項目を追記:
+      `eliminate_identity_projection`(登録式がコメントアウトで無効化。
+      理由: 射影削除が出力スキーマ列名を変え、エイリアス参照を含む結合
+      述語を壊す)、A 項の guard 課題 4 件(intersect/except→semi/anti、
+      mark_join_to_filter、filter_aggregate_pushdown、Apply の join_type
+      二重符号化)
+- [ ] `aggregate_join_transpose` の文書整合: 本ファイルは証明ゲート付きで
+      有効と記載、`plan/cascades_test.cpp` の名目形状テストは不発火を主張
+      (矛盾ではないが併記を明確化)
+- [ ] 式書き換えの実効登録数(`abs_of_abs` の同名二重登録により 73 本)を
+      `docs/cascades_optimizer.md` のスカラー節に反映
+
+### E. テスト追加候補(個別テストが確認できなかった Rule)
+
+- [ ] 論理: `distinct_over_group_by`, `push_filter_through_sort`,
+      `cast_pushdown_on_comparison`, `push_projection_through_join`(否条件は
+      `ProjectionThroughOuterJoinIsConservativelySkipped` のみ),
+      `push_projection_through_union`
+- [ ] 式: `xor_to_or_and_not`(個別 unit テストなし)、
+      `distribute_or_over_and_budgeted` の予算超過不発火分岐
 
 ---
 

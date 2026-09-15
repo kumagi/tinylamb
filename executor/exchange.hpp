@@ -82,6 +82,9 @@ class ExchangeExecutor : public ExecutorBase,
   std::vector<Value> range_bounds_;
 
   std::vector<std::vector<std::pair<Row, RowPosition>>> partitions_;
+  // Gather cursor: single-consumer by contract. Next() mutates it without a
+  // lock; several concurrent gatherers would need their own synchronization
+  // (partition readers are the multi-consumer story, not this cursor).
   size_t current_gather_part_{0};
   size_t current_gather_offset_{0};
   // PartitionScanExecutors handed to several workers all funnel their

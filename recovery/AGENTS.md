@@ -23,9 +23,12 @@ Write-ahead log, group commit, checkpoints, crash recovery. Normative docs:
   `UndoLoserChains`. `UndoneRecorder` prevents double-undo under parallel
   per-page replay; CRC mismatch at tail = torn tail (`ValidLogEnd`);
   truncation only with `--force` (`SetTornTailTruncationAllowed`).
-- `checkpoint_manager.{hpp,cpp}` — 5 s worker: ATT snapshot →
-  CHECKPOINT_BEGIN → dirty flush → END with `ActiveTransactionEntry{txn_id,
-  status, last_lsn}`; txn status snapshotted via relaxed atomics, lock-free.
+- `checkpoint_manager.{hpp,cpp}` — 5 s worker: fuzzy checkpoint — pin
+  resident entries → per-page `RecoveryLSN` into the DPT → ATT snapshot →
+  CHECKPOINT_BEGIN/END (DPT + `ActiveTransactionEntry{txn_id, status,
+  last_lsn}`) → fsync → master record. **No dirty-page flush, no TM pause**;
+  redo starts from the DPT's per-page `RecoveryLSN`. Txn status snapshotted
+  via relaxed atomics, lock-free.
 
 ## Before reading code here
 

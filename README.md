@@ -26,8 +26,10 @@ catalog, so create your tables with DDL before querying.
 
 CMake downloads the pinned GoogleSQL `execute_query` release and verifies its
 SHA-256 checksum. Bazel is not required. GoogleSQL AST mode is required by the
-SQL executable; configuring with `-DTINYLAMB_ENABLE_GOOGLESQL=OFF` leaves only
-the lower-level tinylamb libraries available.
+SQL executable; configuring with `-DTINYLAMB_ENABLE_GOOGLESQL=OFF` still
+builds every library, executable and test binary, but the SQL frontend
+becomes unavailable at runtime (statements fail to parse and frontend-driven
+tests skip themselves).
 
 The SQL execution path supports the TPC-C transaction query shapes (excluding
 stored procedures) and all 22 TPC-H queries. This includes inner and left

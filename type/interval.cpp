@@ -22,6 +22,15 @@
 namespace tinylamb {
 
 namespace {
+// Smallest/hargest doubles that still convert to int64_t without undefined
+// behaviour.  The old ±9.3e18 guards let values in (INT64_MAX, 9.3e18] reach
+// the cast (UBSan: "9.24222e+18 is outside the range of representable values
+// of type 'long'", found by INTERVAL fuzzing).
+constexpr double kInt64MinAsDouble = -9223372036854775808.0;  // -2^63 exact
+constexpr double kInt64MaxExclusive = 9223372036854775808.0;  // 2^63
+}  // namespace
+
+namespace {
 
 thread_local std::unordered_map<std::string, std::string> tls_session_constants;
 
@@ -289,10 +298,28 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       }
       char desig =
           static_cast<char>(std::toupper(static_cast<unsigned char>(s[pos++])));
-      double val = std::stod(num_str) * static_cast<double>(sign);
+      // std::stod raises std::invalid_argument ("." alone) / std::out_of_range
+      // (400-digit runs) on scanner-accepted input; reject through fail
+      // instead of unwinding.
+      double parsed = 0;
+      const char* num_begin = num_str.data();
+      const char* num_end = num_begin + num_str.size();
+      const auto [parse_end, parse_ec] =
+          std::from_chars(num_begin, num_end, parsed);
+      if (parse_ec != std::errc() || parse_end != num_end) {
+        std::string message = "'" + s;
+        message += "': invalid numeric component '";
+        message += num_str;
+        message += "'";
+        return fail(message);
+      }
+      double val = parsed * static_cast<double>(sign);
       // C++20 makes an out-of-range double-to-integral cast undefined; a
-      // literal like P9e300Y must be rejected, not cast to garbage.
-      if (val < -9.3e18 || val > 9.3e18) {
+      // literal like P9e300Y must be rejected, not cast to garbage.  from_
+      // chars also happily parses "nan"/"inf" spellings, which slip past
+      // plain range comparisons.
+      if (!std::isfinite(val) || val <= kInt64MinAsDouble ||
+          val >= kInt64MaxExclusive) {
         return fail_range();
       }
       sign = 1;
@@ -329,7 +356,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         checked_add(checked_mul(parsed_h, 3600), checked_mul(parsed_min, 60)),
         1000000000LL);
     const double sec_nanos = std::round(parsed_sec * 1000000000.0);
-    if (sec_nanos < -9.2e18 || sec_nanos > 9.2e18) {
+    if (sec_nanos <= kInt64MinAsDouble || sec_nanos >= kInt64MaxExclusive) {
       return fail_range();
     }
     int64_t tot_nanos =
@@ -369,7 +396,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       }
       const auto to_int64 = [&](double v) -> int64_t {
         const double rounded = std::round(v);
-        if (rounded >= 9223372036854775808.0 ||
+        if (!std::isfinite(rounded) || rounded >= 9223372036854775808.0 ||
             rounded < -9223372036854775808.0) {
           overflowed = true;
           return 0;
@@ -526,6 +553,13 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
             ok = false;
             break;
           }
+          // The nanoseconds product must stay representable: "nan"/"inf"
+          // spellings and huge magnitudes would turn the cast below into
+          // undefined behavior (UBSan-found via INTERVAL fuzzing).
+          if (!std::isfinite(ts) || ts > 9.2e9 || ts < -9.2e9) {
+            ok = false;
+            break;
+          }
           iv.nanos += static_cast<int64_t>(std::round(
               (static_cast<double>((th * 3600) + (tm * 60)) + ts) * 1e9));
           continue;
@@ -613,6 +647,13 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       // accepted parse result for malformed composite parts here.
       sscanf(  // NOLINT(cert-err33-c,cert-err34-c)
           time_part.c_str(), "%ld:%ld:%lf", &th, &tm, &ts);
+      // sscanf happily yields inf/1e300 for e.g. "0:0:1e999"; converting a
+      // value outside int64 range (or NaN) is UB, not a wrap (fuzz-found via
+      // UBSan: "inf is outside the range of representable values of long").
+      if (!std::isfinite(ts) || ts <= kInt64MinAsDouble ||
+          ts >= kInt64MaxExclusive) {
+        return fail_range();
+      }
       auto s_int = static_cast<int64_t>(ts);
       double s_frac = ts - static_cast<double>(s_int);
       auto sub_ns = static_cast<int64_t>(std::round(s_frac * 1e9));

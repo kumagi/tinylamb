@@ -365,8 +365,8 @@ TEST_F(QueryTest, SqlEngineDistinctDoesNotStackDuplicateDistinctExecutor) {
     return count;
   };
 
-  EXPECT_EQ(count_distinct_in_explain("EXPLAIN SELECT DISTINCT a FROM t_nodup;"),
-            1);
+  EXPECT_EQ(
+      count_distinct_in_explain("EXPLAIN SELECT DISTINCT a FROM t_nodup;"), 1);
   EXPECT_EQ(count_distinct_in_explain(
                 "EXPLAIN SELECT DISTINCT a FROM t_nodup ORDER BY a;"),
             1);
@@ -820,6 +820,154 @@ TEST_F(QueryTest, SqlEngineUnionAllConcatenatesMultipleBranches) {
       RunSql(ctx, *db_, "SELECT v FROM u UNION ALL SELECT v FROM u LIMIT 3;");
   EXPECT_EQ(limited_union, (std::vector<Row>{Row({Value(1)}), Row({Value(2)}),
                                              Row({Value(1)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, RightJoinRoutesThroughCascadesOuterLowering) {
+  // M6+1: a single plain RIGHT JOIN lowers through the Cascades outer
+  // slice (EXPLAIN shows the memo Product node); rows prove the
+  // null-supplying (left) side pads while unmatched left rows drop.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE rj_l (a INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE rj_r (b INT64);");
+  RunSql(ctx, *db_, "INSERT INTO rj_l VALUES (1), (2), (3);");
+  RunSql(ctx, *db_, "INSERT INTO rj_r VALUES (2), (3), (4);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explained =
+      engine.Prepare(ctx,
+                     "EXPLAIN SELECT a, b FROM rj_l RIGHT JOIN rj_r "
+                     "ON a = b;");
+  ASSERT_TRUE(explained.HasValue()) << engine.LastError();
+  std::string plan_text;
+  Row plan_row;
+  while (explained.Value()->Next(&plan_row, nullptr)) {
+    plan_text += plan_row[0].AsString();
+  }
+  // Cascades-lowered hash join, not the relational interpreter.
+  EXPECT_NE(plan_text.find("RightHashJoin"), std::string::npos) << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalExecutor"), std::string::npos)
+      << plan_text;
+
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT a, b FROM rj_l RIGHT JOIN rj_r ON a = b;");
+  ASSERT_EQ(rows.size(), 3U);
+  size_t matched = 0;
+  size_t padded = 0;
+  for (const Row& row : rows) {
+    ASSERT_EQ(row.values_.size(), 2U);
+    if (row[0].IsNull()) {
+      ++padded;
+      EXPECT_EQ(row[1], Value(4));
+    } else {
+      ++matched;
+      EXPECT_EQ(row[0], row[1]);
+    }
+  }
+  EXPECT_EQ(matched, 2U);
+  EXPECT_EQ(padded, 1U);
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, FullJoinRoutesThroughCascadesOuterLowering) {
+  // M6+1: single FULL JOIN lowers the same way; both sides pad (a = 1 has
+  // no partner on the right, b = 4 has none on the left).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE fj_l (a INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE fj_r (b INT64);");
+  RunSql(ctx, *db_, "INSERT INTO fj_l VALUES (1), (2), (3);");
+  RunSql(ctx, *db_, "INSERT INTO fj_r VALUES (2), (3), (4);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explained =
+      engine.Prepare(ctx,
+                     "EXPLAIN SELECT a, b FROM fj_l FULL JOIN fj_r "
+                     "ON a = b;");
+  ASSERT_TRUE(explained.HasValue()) << engine.LastError();
+  std::string plan_text;
+  Row plan_row;
+  while (explained.Value()->Next(&plan_row, nullptr)) {
+    plan_text += plan_row[0].AsString();
+  }
+  // Cascades-lowered hash join, not the relational interpreter.
+  EXPECT_NE(plan_text.find("FullHashJoin"), std::string::npos) << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalExecutor"), std::string::npos)
+      << plan_text;
+
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT a, b FROM fj_l FULL JOIN fj_r ON a = b;");
+  ASSERT_EQ(rows.size(), 4U);
+  size_t matched = 0;
+  size_t left_padded = 0;
+  size_t right_padded = 0;
+  for (const Row& row : rows) {
+    ASSERT_EQ(row.values_.size(), 2U);
+    if (row[0].IsNull()) {
+      ++left_padded;
+      EXPECT_EQ(row[1], Value(4));
+    } else if (row[1].IsNull()) {
+      ++right_padded;
+      EXPECT_EQ(row[0], Value(1));
+    } else {
+      ++matched;
+      EXPECT_EQ(row[0], row[1]);
+    }
+  }
+  EXPECT_EQ(matched, 2U);
+  EXPECT_EQ(left_padded, 1U);
+  EXPECT_EQ(right_padded, 1U);
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, OuterJoinChainStaysRelationalAndCorrect) {
+  // Chains are beyond the single-edge slice and keep the relational path;
+  // row correctness guards the routing boundary.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE oc_a (a INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE oc_b (b INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE oc_c (c INT64);");
+  RunSql(ctx, *db_, "INSERT INTO oc_a VALUES (1), (2);");
+  RunSql(ctx, *db_, "INSERT INTO oc_b VALUES (2), (3);");
+  RunSql(ctx, *db_, "INSERT INTO oc_c VALUES (3), (4);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explained =
+      engine.Prepare(ctx,
+                     "EXPLAIN SELECT a, b, c FROM oc_a LEFT JOIN oc_b "
+                     "ON a = b LEFT JOIN oc_c ON b = c;");
+  ASSERT_TRUE(explained.HasValue()) << engine.LastError();
+  std::string plan_text;
+  Row plan_row;
+  while (explained.Value()->Next(&plan_row, nullptr)) {
+    plan_text += plan_row[0].AsString();
+  }
+  EXPECT_NE(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT a, b, c FROM oc_a LEFT JOIN oc_b ON a = b "
+             "LEFT JOIN oc_c ON b = c;");
+  // (1,NULL): a=1 matches nothing, pads through both joins.
+  // (2,2,NULL): a=2 matches b=2, which matches no c.
+  ASSERT_EQ(rows.size(), 2U);
+  size_t both_padded = 0;
+  size_t right_padded = 0;
+  for (const Row& row : rows) {
+    ASSERT_EQ(row.values_.size(), 3U);
+    if (row[1].IsNull()) {
+      ++both_padded;
+      EXPECT_EQ(row[0], Value(1));
+      EXPECT_TRUE(row[2].IsNull());
+    } else {
+      ++right_padded;
+      EXPECT_EQ(row[0], Value(2));
+      EXPECT_EQ(row[1], Value(2));
+      EXPECT_TRUE(row[2].IsNull());
+    }
+  }
+  EXPECT_EQ(both_padded, 1U);
+  EXPECT_EQ(right_padded, 1U);
   ctx.txn_.Abort();
 }
 
@@ -1494,6 +1642,870 @@ TEST_F(QueryTest, SqlEngineLeftJoinPushesLeftSideFilter) {
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(10));
   EXPECT_EQ(rows[1][0], Value(20));
+
+  ctx.txn_.Abort();
+}
+
+// M6: a plain LEFT JOIN plans through the Cascades memo (outer hash/merge
+// alternatives) instead of the relational fallback, preserving NULL padding.
+TEST_F(QueryTest, SqlEngineLeftJoinCascadesPlansOuterJoin) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO l VALUES (1, 10), (2, 20);");
+  RunSql(ctx, *db_, "INSERT INTO r VALUES (2, 200);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain =
+      engine.Prepare(ctx,
+                     "EXPLAIN SELECT a.v, b.w FROM l AS a LEFT JOIN r AS b "
+                     "ON a.k = b.k ORDER BY a.v;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  // Fully-relational plans render as "Relational Physical Plan"; a
+  // Cascades-native plan never contains that marker (nor the opaque
+  // kRelational fallback node).
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT a.v, b.w FROM l AS a LEFT JOIN r AS b ON a.k = b.k "
+             "ORDER BY a.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(10), Value()}));
+  EXPECT_EQ(rows[1], Row({Value(20), Value(200)}));
+
+  ctx.txn_.Abort();
+}
+
+// M6 ON-vs-WHERE contract: ON decides the match (before padding), WHERE
+// filters the joined rows (after padding). A left-only ON keeps every left
+// row; the same predicate in WHERE drops rows. A right-only ON filters the
+// build side before matching; WHERE over the null-supplying side observes
+// padded NULLs.
+TEST_F(QueryTest, SqlEngineLeftJoinOnVsWhereSemantics) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO l VALUES (1, 10), (2, 20), (3, 30);");
+  RunSql(ctx, *db_, "INSERT INTO r VALUES (2, 200), (3, 5);");
+
+  // Left-only ON: the v = 30 row fails its ON (30 < 25 is false) yet
+  // survives padded; the same predicate in WHERE would drop the row.
+  std::vector<Row> on_left = RunSql(
+      ctx, *db_,
+      "SELECT a.v, b.w FROM l AS a LEFT JOIN r AS b ON a.k = b.k AND a.v < 25 "
+      "ORDER BY a.v;");
+  ASSERT_EQ(on_left.size(), 3U);
+  EXPECT_EQ(on_left[0], Row({Value(10), Value()}));
+  EXPECT_EQ(on_left[1], Row({Value(20), Value(200)}));
+  EXPECT_EQ(on_left[2], Row({Value(30), Value()}));
+
+  // Same predicate in WHERE: only rows with v > 15 survive.
+  std::vector<Row> where_left =
+      RunSql(ctx, *db_,
+             "SELECT a.v, b.w FROM l AS a LEFT JOIN r AS b ON a.k = b.k "
+             "WHERE a.v > 15 ORDER BY a.v;");
+  ASSERT_EQ(where_left.size(), 2U);
+  EXPECT_EQ(where_left[0], Row({Value(20), Value(200)}));
+  EXPECT_EQ(where_left[1], Row({Value(30), Value(5)}));
+
+  // Right-only ON: build rows with w <= 100 never match; their left rows pad.
+  std::vector<Row> on_right = RunSql(
+      ctx, *db_,
+      "SELECT a.v, b.w FROM l AS a LEFT JOIN r AS b ON a.k = b.k AND b.w > 100 "
+      "ORDER BY a.v;");
+  ASSERT_EQ(on_right.size(), 3U);
+  EXPECT_EQ(on_right[0], Row({Value(10), Value()}));
+  EXPECT_EQ(on_right[1], Row({Value(20), Value(200)}));
+  EXPECT_EQ(on_right[2], Row({Value(30), Value()}));
+
+  // WHERE over the null-supplying side observes padded NULLs.
+  std::vector<Row> where_null =
+      RunSql(ctx, *db_,
+             "SELECT a.v FROM l AS a LEFT JOIN r AS b ON a.k = b.k "
+             "WHERE b.w IS NULL ORDER BY a.v;");
+  ASSERT_EQ(where_null.size(), 1U);
+  EXPECT_EQ(where_null[0][0], Value(10));
+
+  ctx.txn_.Abort();
+}
+
+// M6: an empty build side pads every preserved row (no match is still a row).
+TEST_F(QueryTest, SqlEngineLeftJoinEmptyInnerSidePadsAll) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO l VALUES (1, 10), (2, 20);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT a.v, b.w FROM l AS a LEFT JOIN r AS b ON a.k = b.k "
+             "ORDER BY a.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(10), Value()}));
+  EXPECT_EQ(rows[1], Row({Value(20), Value()}));
+
+  ctx.txn_.Abort();
+}
+
+// M6: ORDER BY + LIMIT compose above the outer join through the engine's
+// Sort/Limit safety net.
+TEST_F(QueryTest, SqlEngineLeftJoinWithOrderAndLimit) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO l VALUES (1, 10), (2, 20), (3, 30);");
+  RunSql(ctx, *db_, "INSERT INTO r VALUES (2, 200);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT a.v, b.w FROM l AS a LEFT JOIN r AS b ON a.k = b.k "
+             "ORDER BY a.v DESC LIMIT 2;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(30), Value()}));
+  EXPECT_EQ(rows[1], Row({Value(20), Value(200)}));
+
+  ctx.txn_.Abort();
+}
+
+// M-union: UNION ALL branches over one table with disjoint equality
+// predicates merge into a single OR-filtered scan (bag-identical).
+TEST_F(QueryTest, SqlEngineUnionAllDisjointMergesToSingleScan) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN SELECT k FROM t WHERE k = 1 UNION ALL SELECT k FROM t "
+      "WHERE k = 2 ORDER BY k;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+  EXPECT_NE(plan_text.find("IN (1, 2)"), std::string::npos) << plan_text;
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT k FROM t WHERE k = 1 UNION ALL SELECT k FROM t WHERE k = 2 "
+      "ORDER BY k;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(2));
+
+  ctx.txn_.Abort();
+}
+
+// M-union: UNION DISTINCT merges regardless of overlap (dedup absorbs it).
+TEST_F(QueryTest, SqlEngineUnionDistinctMergesToSingleScan) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT k FROM t WHERE k >= 2 UNION DISTINCT SELECT k FROM t WHERE "
+      "k <= 2 ORDER BY k;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[2][0], Value(3));
+
+  ctx.txn_.Abort();
+}
+
+// M-union negative shapes keep the branch-wise path: overlapping UNION ALL
+// branches must preserve duplicates, and grouped branches keep grouping.
+TEST_F(QueryTest, SqlEngineUnionOverlappingAndGroupedStayCorrect) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  // Overlapping predicates: k = 2 appears twice (bag semantics).
+  std::vector<Row> overlap = RunSql(
+      ctx, *db_,
+      "SELECT k FROM t WHERE k >= 2 UNION ALL SELECT k FROM t WHERE k <= 2 "
+      "ORDER BY k;");
+  ASSERT_EQ(overlap.size(), 4U);
+  EXPECT_EQ(overlap[0][0], Value(1));
+  EXPECT_EQ(overlap[1][0], Value(2));
+  EXPECT_EQ(overlap[2][0], Value(2));
+  EXPECT_EQ(overlap[3][0], Value(3));
+
+  // Grouped branch: aggregation boundary preserved.
+  std::vector<Row> grouped = RunSql(
+      ctx, *db_,
+      "SELECT k, SUM(v) AS s FROM t GROUP BY k UNION ALL SELECT k, v FROM t "
+      "ORDER BY k;");
+  ASSERT_EQ(grouped.size(), 6U);
+
+  ctx.txn_.Abort();
+}
+
+// M5: a single-table uncorrelated FROM-subquery flattens into the outer
+// query and plans through Cascades (join ordering, access paths apply).
+TEST_F(QueryTest, SqlEngineDerivedTableFlattensToCascades) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE u (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+  RunSql(ctx, *db_, "INSERT INTO u VALUES (2, 200), (3, 300);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN SELECT s.v, u.w FROM (SELECT k, v FROM t WHERE v >= 20) AS s "
+      "JOIN u ON s.k = u.k ORDER BY s.v;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  // Fully-relational plans render as "Relational Physical Plan"; a
+  // Cascades-native plan never contains that marker (nor the opaque
+  // kRelational fallback node).
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT s.v, u.w FROM (SELECT k, v FROM t WHERE v >= 20) AS s "
+             "JOIN u ON s.k = u.k ORDER BY s.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(20), Value(200)}));
+  EXPECT_EQ(rows[1], Row({Value(30), Value(300)}));
+
+  ctx.txn_.Abort();
+}
+
+// M5: computed (immutable) derived outputs rebind wherever the outer query
+// names them, including the WHERE clause and ORDER BY.
+TEST_F(QueryTest, SqlEngineDerivedTableComputedOutputs) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT s.y FROM (SELECT k, v + 1 AS y FROM t WHERE v >= 20) AS s "
+             "WHERE s.y >= 21 ORDER BY s.y;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(21));
+  EXPECT_EQ(rows[1][0], Value(31));
+
+  ctx.txn_.Abort();
+}
+
+// M5: an inner `*` expands over the base schema before flattening. (A star
+// in the OUTER select list keeps the dedicated expansion paths, including
+// the lone-star value-table wrapper, so it is out of scope for this slice.)
+TEST_F(QueryTest, SqlEngineDerivedTableInnerStarExpansion) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT s.k, s.kk FROM (SELECT *, k AS kk FROM t WHERE v >= 20) AS s "
+      "ORDER BY s.k;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0], Row({Value(2), Value(2)}));
+
+  ctx.txn_.Abort();
+}
+
+// M5: an inner WHERE under a LEFT JOIN rides the ON condition, so rows the
+// derived table filters out still NULL-pad instead of vanishing.
+TEST_F(QueryTest, SqlEngineDerivedTableUnderLeftJoinKeepsPadding) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO l VALUES (1, 10), (2, 20);");
+  RunSql(ctx, *db_, "INSERT INTO r VALUES (1, 100), (2, 5);");
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT a.v, s.w FROM l AS a LEFT JOIN (SELECT k, w FROM r WHERE w > 50) "
+      "AS s ON a.k = s.k ORDER BY a.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(10), Value(100)}));
+  EXPECT_EQ(rows[1], Row({Value(20), Value()}));
+
+  ctx.txn_.Abort();
+}
+
+// M5 negative shapes stay correct on the relational path: aggregation
+// inside the derived table, and a correlated reference to the outer query.
+TEST_F(QueryTest, SqlEngineDerivedTableFallbackShapesStayCorrect) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 30);");
+
+  std::vector<Row> grouped = RunSql(
+      ctx, *db_,
+      "SELECT s.k, s.total FROM (SELECT k, SUM(v) AS total FROM t GROUP BY k) "
+      "AS s ORDER BY s.k;");
+  ASSERT_EQ(grouped.size(), 2U);
+  EXPECT_EQ(grouped[0], Row({Value(1), Value(30)}));
+  EXPECT_EQ(grouped[1], Row({Value(2), Value(30)}));
+
+  std::vector<Row> correlated =
+      RunSql(ctx, *db_,
+             "SELECT a.v FROM t AS a WHERE a.v IN (SELECT v FROM t AS b "
+             "WHERE b.k = a.k) ORDER BY a.v;");
+  ASSERT_EQ(correlated.size(), 3U);
+  EXPECT_EQ(correlated[0][0], Value(10));
+
+  ctx.txn_.Abort();
+}
+
+// M4: a singly-referenced non-recursive CTE inlines into a derived source
+// (and flattens further through M5), reaching Cascades with the same rows.
+TEST_F(QueryTest, SqlEngineSingleUseCteInlinesToCascades) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE u (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+  RunSql(ctx, *db_, "INSERT INTO u VALUES (2, 200), (3, 300);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN WITH c AS (SELECT k, v FROM t WHERE v >= 20) "
+      "SELECT c.v, u.w FROM c JOIN u ON c.k = u.k ORDER BY c.v;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  // Fully-relational plans render as "Relational Physical Plan"; a
+  // Cascades-native plan never contains that marker (nor the opaque
+  // kRelational fallback node).
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH c AS (SELECT k, v FROM t WHERE v >= 20) "
+             "SELECT c.v, u.w FROM c JOIN u ON c.k = u.k ORDER BY c.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(20), Value(200)}));
+  EXPECT_EQ(rows[1], Row({Value(30), Value(300)}));
+
+  ctx.txn_.Abort();
+}
+
+// M4: chained CTEs inline inside-out (c1 into c2, then c2 into the outer
+// query) when each has a single reference.
+TEST_F(QueryTest, SqlEngineChainedCteInlinesInsideOut) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH a AS (SELECT k, v FROM t WHERE v >= 20), "
+             "b AS (SELECT k, v FROM a WHERE k >= 3) "
+             "SELECT b.v FROM b ORDER BY b.v;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(30));
+
+  ctx.txn_.Abort();
+}
+
+// M4/M5: a derived output used as a nested-field scope (`st.y` where `st`
+// is an output, not a relation) must not flatten: substituting the alias
+// away would orphan the qualifier. The query keeps the existing
+// (relational) path with identical rows.
+TEST_F(QueryTest, SqlEngineDerivedOutputAsScopeStaysCorrect) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN WITH c AS (SELECT STRUCT(v AS y) AS st FROM t WHERE k = 2) "
+      "SELECT st.y FROM c;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_NE(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH c AS (SELECT STRUCT(v AS y) AS st FROM t WHERE k = 2) "
+             "SELECT st.y FROM c;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(20));
+
+  ctx.txn_.Abort();
+}
+
+// M4 negative shapes keep the materialized path with identical rows: a
+// multiply-referenced CTE (shared rescan, not re-evaluation per inline)
+// and a recursive CTE.
+TEST_F(QueryTest, SqlEngineMultiUseAndRecursiveCteStayCorrect) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+  std::vector<Row> shared = RunSql(
+      ctx, *db_,
+      "WITH c AS (SELECT k, v FROM t) "
+      "SELECT x.v, y.v FROM c AS x JOIN c AS y ON x.k = y.k ORDER BY x.v;");
+  ASSERT_EQ(shared.size(), 2U);
+  EXPECT_EQ(shared[0], Row({Value(10), Value(10)}));
+  EXPECT_EQ(shared[1], Row({Value(20), Value(20)}));
+
+  std::vector<Row> rec =
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r "
+             "WHERE n < 3) SELECT n FROM r ORDER BY n;");
+  ASSERT_EQ(rec.size(), 3U);
+  EXPECT_EQ(rec[0][0], Value(1));
+  EXPECT_EQ(rec[2][0], Value(3));
+
+  ctx.txn_.Abort();
+}
+
+// M4 materialization: a multiply-referenced small CTE lifts into one shared
+// eager cell scanned from every site (kValues leaves, no CTE rescan nodes).
+TEST_F(QueryTest, SqlEngineMultiUseCteMaterializesOnceToCascades) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN WITH c AS (SELECT k, v FROM t WHERE v >= 10) "
+      "SELECT x.v, y.v FROM c AS x JOIN c AS y ON x.k = y.k ORDER BY x.v;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+  EXPECT_EQ(plan_text.find("CteOrMissingScan"), std::string::npos) << plan_text;
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "WITH c AS (SELECT k, v FROM t WHERE v >= 10) "
+      "SELECT x.v, y.v FROM c AS x JOIN c AS y ON x.k = y.k ORDER BY x.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(10), Value(10)}));
+  EXPECT_EQ(rows[1], Row({Value(20), Value(20)}));
+
+  ctx.txn_.Abort();
+}
+
+// M4 materialization boundary: an over-budget CTE keeps the map-scoped
+// rescan path (CteScan) with identical rows.
+TEST_F(QueryTest, SqlEngineOverBudgetCteKeepsRescanPath) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t1 (k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE t2 (k INT64);");
+  std::string insert1 = "INSERT INTO t1 VALUES ";
+  std::string insert2 = "INSERT INTO t2 VALUES ";
+  for (int i = 0; i < 40; ++i) {
+    insert1 += (i == 0 ? "(" : ",(") + std::to_string(i) + ")";
+    if (i < 30) {
+      insert2 += (i == 0 ? "(" : ",(") + std::to_string(i) + ")";
+    }
+  }
+  insert1 += ";";
+  insert2 += ";";
+  RunSql(ctx, *db_, insert1);
+  RunSql(ctx, *db_, insert2);
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain =
+      engine.Prepare(ctx,
+                     "EXPLAIN WITH c AS (SELECT t1.k FROM t1 CROSS JOIN t2) "
+                     "SELECT COUNT(*) FROM c;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  // 40 x 30 = 1200 rows exceeds the eager cell budget: the CTE stays mapped.
+  EXPECT_NE(plan_text.find("CteOrMissingScan"), std::string::npos) << plan_text;
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "WITH c AS (SELECT t1.k FROM t1 CROSS JOIN t2) SELECT COUNT(*) FROM c;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1200));
+
+  ctx.txn_.Abort();
+}
+
+// M4 recursive leaf: a singly-referenced recursive CTE plans its outer
+// query through Cascades around an opaque worktable leaf (same fixpoint,
+// same rows), instead of running the whole statement relationally.
+TEST_F(QueryTest, SqlEngineRecursiveCtePlansOuterThroughCascades) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 "
+      "FROM r WHERE n < 3) SELECT n, n + 100 AS m FROM r WHERE n >= 2 "
+      "ORDER BY n;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+  EXPECT_NE(plan_text.find("RecursiveCte"), std::string::npos) << plan_text;
+
+  // Same fixpoint rows as the relational path: 2, 3 filtered and projected.
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 "
+             "FROM r WHERE n < 3) SELECT n, n + 100 AS m FROM r WHERE n >= 2 "
+             "ORDER BY n;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(2), Value(102)}));
+  EXPECT_EQ(rows[1], Row({Value(3), Value(103)}));
+
+  ctx.txn_.Abort();
+}
+
+// ORDER BY over an unnamed computed projection sorts by the projected
+// output column (previously the source form evaluated against output rows
+// that no longer expose the source columns, yielding no rows).
+TEST_F(QueryTest, SqlEngineOrderByUnnamedComputedSortsOutput) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE u (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20);");
+  RunSql(ctx, *db_, "INSERT INTO u VALUES (1, 100), (2, 200), (3, 300);");
+
+  std::vector<Row> single =
+      RunSql(ctx, *db_, "SELECT v + 1 FROM t ORDER BY v + 1;");
+  ASSERT_EQ(single.size(), 3U);
+  EXPECT_EQ(single[0][0], Value(11));
+  EXPECT_EQ(single[2][0], Value(31));
+
+  std::vector<Row> dup =
+      RunSql(ctx, *db_, "SELECT v + 1, v + 1 FROM t ORDER BY v + 1, v + 1;");
+  ASSERT_EQ(dup.size(), 3U);
+  EXPECT_EQ(dup[0], Row({Value(11), Value(11)}));
+
+  std::vector<Row> joined =
+      RunSql(ctx, *db_,
+             "SELECT a.v + 1, b.w FROM t AS a JOIN u AS b ON a.k = b.k "
+             "ORDER BY a.v + 1;");
+  ASSERT_EQ(joined.size(), 3U);
+  EXPECT_EQ(joined[0], Row({Value(11), Value(200)}));
+  EXPECT_EQ(joined[2], Row({Value(31), Value(100)}));
+
+  ctx.txn_.Abort();
+}
+
+// M-window: ranking functions plan through the Cascades memo (kWindow +
+// WindowExecutor delegating to the canonical evaluator) instead of the
+// relational pre-computation, with identical row multisets.
+TEST_F(QueryTest, SqlEngineWindowRankingPlansThroughCascades) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (2, 25), (3, 30);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN SELECT k, RANK() OVER (PARTITION BY k ORDER BY v) AS rnk "
+      "FROM t ORDER BY k, rnk;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
+  EXPECT_NE(plan_text.find("Window"), std::string::npos) << plan_text;
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT k, RANK() OVER (PARTITION BY k ORDER BY v) AS rnk "
+             "FROM t ORDER BY k, rnk;");
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(1)}));
+  EXPECT_EQ(rows[1], Row({Value(2), Value(1)}));
+  EXPECT_EQ(rows[2], Row({Value(2), Value(2)}));
+  EXPECT_EQ(rows[3], Row({Value(3), Value(1)}));
+
+  ctx.txn_.Abort();
+}
+
+// M-window: frame aggregation (cumulative SUM) and multi-spec chaining
+// (two partition specs lower two kWindow nodes).
+TEST_F(QueryTest, SqlEngineWindowFramesAndChainedSpecs) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 30);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT k, SUM(v) OVER (PARTITION BY k ORDER BY v ROWS BETWEEN "
+             "UNBOUNDED PRECEDING AND CURRENT ROW) AS running, "
+             "ROW_NUMBER() OVER () AS rn FROM t ORDER BY k, v;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(10), Value(1)}));
+  EXPECT_EQ(rows[1], Row({Value(1), Value(30), Value(2)}));
+  EXPECT_EQ(rows[2], Row({Value(2), Value(30), Value(3)}));
+
+  ctx.txn_.Abort();
+}
+
+// M-window: QUALIFY filters windowed rows above the kWindow nodes.
+TEST_F(QueryTest, SqlEngineWindowQualifyFiltersWindowedRows) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 30);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT k, RANK() OVER (PARTITION BY k ORDER BY v) AS rnk "
+             "FROM t QUALIFY rnk = 1 ORDER BY k;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(1)}));
+  EXPECT_EQ(rows[1], Row({Value(2), Value(1)}));
+
+  ctx.txn_.Abort();
+}
+
+// RANGE `1 FOLLOWING .. 2 FOLLOWING` under DESC ordering must open the frame
+// on the lower values (the regression made the start bound `>= key - off`,
+// which matched the largest keys and collapsed the frame to the partition
+// head).
+TEST_F(QueryTest, SqlEngineRangeDescendingFollowingStartBound) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, id INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (10,1),(9,2),(8,3),(7,4),(6,5);");
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT id, MIN(id) OVER (ORDER BY k DESC "
+      "RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS e FROM t ORDER BY id;");
+  ASSERT_EQ(rows.size(), 5U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(2)}));
+  EXPECT_EQ(rows[1], Row({Value(2), Value(3)}));
+  EXPECT_EQ(rows[2], Row({Value(3), Value(4)}));
+  EXPECT_EQ(rows[3], Row({Value(4), Value(5)}));
+  EXPECT_EQ(rows[4], Row({Value(5), Value()}));
+
+  ctx.txn_.Abort();
+}
+
+// RANGE `0 PRECEDING` is defined as CURRENT ROW, so the end bound is the last
+// row of the peer group, not the current row.
+TEST_F(QueryTest, SqlEngineRangeZeroPrecedingEndsAtPeer) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (5),(5);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT SUM(k) OVER (ORDER BY k "
+             "RANGE BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING), "
+             "SUM(k) OVER (ORDER BY k "
+             "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(10), Value(10)}));
+  EXPECT_EQ(rows[1], Row({Value(10), Value(10)}));
+
+  ctx.txn_.Abort();
+}
+
+// MERGE of UNION ALL branches must not fold window calls into one shared scan:
+// each branch's window is evaluated over its own rows.
+TEST_F(QueryTest, SqlEngineUnionMergeKeepsWindowPartitions) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1,30),(2,10),(3,20);");
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT k, RANK() OVER (ORDER BY v) AS r FROM t WHERE k=1 "
+      "UNION ALL "
+      "SELECT k, RANK() OVER (ORDER BY v) AS r FROM t WHERE k=2 ORDER BY k;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(1)}));
+  EXPECT_EQ(rows[1], Row({Value(2), Value(1)}));
+
+  ctx.txn_.Abort();
+}
+
+// A merged UNION ALL still honors an integer ORDER BY ordinal.
+TEST_F(QueryTest, SqlEngineUnionMergeKeepsOrderByOrdinal) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1),(2);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT k FROM t WHERE k=1 UNION ALL SELECT k FROM t WHERE k=2 "
+             "ORDER BY 1 DESC LIMIT 1;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0], Row({Value(2)}));
+
+  ctx.txn_.Abort();
+}
+
+// A derived table on the right of an inner join must have its own ON
+// condition rebound through the derived outputs before the alias disappears.
+TEST_F(QueryTest, SqlEngineDerivedJoinOnRebindsOutputs) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, x INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE u (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1,11),(2,22),(3,33);");
+  RunSql(ctx, *db_, "INSERT INTO u VALUES (1,100),(2,200),(3,300);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT d.x, u.w FROM u JOIN (SELECT k AS x FROM t) d "
+             "ON d.x = u.k ORDER BY u.w;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(100)}));
+  EXPECT_EQ(rows[1], Row({Value(2), Value(200)}));
+  EXPECT_EQ(rows[2], Row({Value(3), Value(300)}));
+
+  ctx.txn_.Abort();
+}
+
+// An inner WHERE of a derived table placed on the NULL-supplying left of a
+// RIGHT join must ride the join's ON, so padded right rows survive.
+TEST_F(QueryTest, SqlEngineDerivedLeftOfRightJoinKeepsPaddedRows) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE u (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1,5),(2,22),(3,33);");
+  RunSql(ctx, *db_, "INSERT INTO u VALUES (1,100),(2,200),(3,300);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT d.x, u.w FROM (SELECT k AS x, v FROM t WHERE v > 10) d "
+             "RIGHT JOIN u ON d.x = u.k ORDER BY u.w;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0], Row({Value(), Value(100)}));
+  EXPECT_EQ(rows[1], Row({Value(2), Value(200)}));
+  EXPECT_EQ(rows[2], Row({Value(3), Value(300)}));
+
+  ctx.txn_.Abort();
+}
+
+// Two window calls differing only in the aggregate WHERE filter are distinct
+// outputs and must not be deduplicated onto one hidden column.
+TEST_F(QueryTest, SqlEngineWindowWhereFilterNotDeduplicated) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t2 (a INT64, x INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t2 VALUES (1,10),(-1,20),(2,30),(-2,40);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT SUM(x WHERE a > 0) OVER () AS s_pos, "
+             "SUM(x WHERE a < 0) OVER () AS s_neg FROM t2 ORDER BY s_pos;");
+  ASSERT_EQ(rows.size(), 4U);
+  for (const Row& row : rows) {
+    EXPECT_EQ(row, Row({Value(40), Value(60)}));
+  }
+
+  ctx.txn_.Abort();
+}
+
+// A filter on the NULL-supplying side of a RIGHT/FULL join must not leak into
+// the preserved side's scan (it would drop the padded rows the join keeps).
+TEST_F(QueryTest, SqlEngineNullSupplyingFilterNotPushed) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE a (x INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE b (y INT64);");
+  RunSql(ctx, *db_, "INSERT INTO a VALUES (1),(2),(3);");
+  RunSql(ctx, *db_, "INSERT INTO b VALUES (2),(4);");
+
+  std::vector<Row> right =
+      RunSql(ctx, *db_,
+             "SELECT a.x, b.y FROM a RIGHT JOIN b ON a.x = b.y "
+             "WHERE a.x IS NULL ORDER BY b.y;");
+  ASSERT_EQ(right.size(), 1U);
+  EXPECT_EQ(right[0], Row({Value(), Value(4)}));
+
+  std::vector<Row> full =
+      RunSql(ctx, *db_,
+             "SELECT a.x, b.y FROM a FULL JOIN b ON a.x > b.y "
+             "WHERE a.x IS NULL ORDER BY b.y;");
+  ASSERT_EQ(full.size(), 1U);
+  EXPECT_EQ(full[0], Row({Value(), Value(4)}));
+
+  ctx.txn_.Abort();
+}
+
+// A unique index on a nullable column stores NULL-bearing keys in the
+// multi-value encoding, so it may hold many NULL rows; DISTINCT must not be
+// dropped on the strength of that index.
+TEST_F(QueryTest, DistinctKeepsNullableUniqueKey) {
+  TransactionContext ctx = db_->BeginContext();
+  Schema schema("nullable_unique", {Column("id", ValueType::kInt64,
+                                           Constraint(Constraint::kUnique)),
+                                    Column("name", ValueType::kVarChar)});
+  ASSERT_TRUE(db_->CreateTable(ctx, schema).HasValue());
+  RunSql(ctx, *db_,
+         "INSERT INTO nullable_unique VALUES (NULL, 'a'), (NULL, 'b');");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT DISTINCT id FROM nullable_unique;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_TRUE(rows[0][0].IsNull());
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineWindowOverLeftJoinWithAliasOrder) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO l VALUES (1, 10), (2, 20), (3, 30);");
+  RunSql(ctx, *db_, "INSERT INTO r VALUES (2, 200);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT a.v, ROW_NUMBER() OVER (ORDER BY a.v) AS rn "
+             "FROM l AS a LEFT JOIN r AS b ON a.k = b.k ORDER BY rn;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0], Row({Value(10), Value(1)}));
+  EXPECT_EQ(rows[2], Row({Value(30), Value(3)}));
 
   ctx.txn_.Abort();
 }
@@ -2411,6 +3423,11 @@ TEST_F(QueryTest, SqlEngineNonEqualityJoinCascades) {
   while (explain.Value()->Next(&exp_row, nullptr)) {
     plan_text += exp_row[0].AsString() + "\n";
   }
+  // Fully-relational plans render as "Relational Physical Plan"; a
+  // Cascades-native plan never contains that marker (nor the opaque
+  // kRelational fallback node).
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
   EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
 
   const std::vector<Row> rows =
@@ -2439,6 +3456,11 @@ TEST_F(QueryTest, SqlEngineJoinOnlySourceCascades) {
   while (explain.Value()->Next(&exp_row, nullptr)) {
     plan_text += exp_row[0].AsString() + "\n";
   }
+  // Fully-relational plans render as "Relational Physical Plan"; a
+  // Cascades-native plan never contains that marker (nor the opaque
+  // kRelational fallback node).
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
   EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
 
   const std::vector<Row> rows = RunSql(
@@ -2467,6 +3489,11 @@ TEST_F(QueryTest, SqlEngineCompoundJoinPredicateCascades) {
   while (explain.Value()->Next(&exp_row, nullptr)) {
     plan_text += exp_row[0].AsString() + "\n";
   }
+  // Fully-relational plans render as "Relational Physical Plan"; a
+  // Cascades-native plan never contains that marker (nor the opaque
+  // kRelational fallback node).
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
   EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
 
   const std::vector<Row> rows = RunSql(
@@ -2492,6 +3519,11 @@ TEST_F(QueryTest, SqlEngineRecursiveCteCascadesPlan) {
     plan_text += exp_row[0].AsString() + "\n";
   }
   EXPECT_NE(plan_text.find("RecursiveCtePlan"), std::string::npos) << plan_text;
+  // Fully-relational plans render as "Relational Physical Plan"; a
+  // Cascades-native plan never contains that marker (nor the opaque
+  // kRelational fallback node).
+  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+      << plan_text;
   EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
 
   std::vector<Row> total =
@@ -2638,9 +3670,9 @@ TEST_F(QueryTest, UnsignedInt64_AggregationSemantics) {
   EXPECT_EQ(bit_rows[0][1].AsString(), "18446744073709551615");
 
   // GROUP BY aggregations on unsigned int64
-  std::vector<Row> group_rows = RunSql(
-      ctx, *db_,
-      "SELECT g, MIN(u), MAX(u) FROM u_agg_tbl GROUP BY g ORDER BY g;");
+  std::vector<Row> group_rows =
+      RunSql(ctx, *db_,
+             "SELECT g, MIN(u), MAX(u) FROM u_agg_tbl GROUP BY g ORDER BY g;");
   ASSERT_EQ(group_rows.size(), 2U);
   EXPECT_EQ(group_rows[0][0].value.int_value, 1LL);
   EXPECT_EQ(group_rows[0][1].AsString(), "5");
@@ -2711,10 +3743,10 @@ TEST_F(QueryTest, OuterJoinNullPadGolden) {
   // ON a.id = b.id AND a.val < b.score
   // For Bob (id=2), a.val=20, b.score=5 -> 20 < 5 is FALSE!
   // So Bob must NOT match and should be NULL-padded!
-  std::vector<Row> res_pred = RunSql(
-      ctx, *db_,
-      "SELECT a.id, a.name, b.score FROM oj_a a LEFT JOIN oj_b b "
-      "ON a.id = b.id AND a.val < b.score ORDER BY a.id;");
+  std::vector<Row> res_pred =
+      RunSql(ctx, *db_,
+             "SELECT a.id, a.name, b.score FROM oj_a a LEFT JOIN oj_b b "
+             "ON a.id = b.id AND a.val < b.score ORDER BY a.id;");
   ASSERT_EQ(res_pred.size(), 3U);
   EXPECT_EQ(res_pred[0][0], Value(1));
   EXPECT_EQ(res_pred[0][2], Value(100));
@@ -2736,10 +3768,10 @@ TEST_F(QueryTest, OuterJoinNullPadGolden) {
 
   // 4. FULL OUTER JOIN:
   // Both Charlie (id=3 in a) and David (id=4 in b) must be present.
-  std::vector<Row> full_res = RunSql(
-      ctx, *db_,
-      "SELECT a.id, b.id FROM oj_a a FULL JOIN oj_b b ON a.id = b.id "
-      "ORDER BY COALESCE(a.id, b.id);");
+  std::vector<Row> full_res =
+      RunSql(ctx, *db_,
+             "SELECT a.id, b.id FROM oj_a a FULL JOIN oj_b b ON a.id = b.id "
+             "ORDER BY COALESCE(a.id, b.id);");
   ASSERT_EQ(full_res.size(), 4U);
   EXPECT_EQ(full_res[0][0], Value(1));
   EXPECT_EQ(full_res[0][1], Value(1));
@@ -2770,12 +3802,12 @@ TEST_F(QueryTest, OuterJoinNullPadGolden) {
   // 6. Multi-table chained LEFT JOIN:
   // a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id
   // Charlie (id=3): b is null, so b.id = c.id fails -> c is also null!
-  std::vector<Row> chain_res = RunSql(
-      ctx, *db_,
-      "SELECT a.id, b.b_name, c.extra FROM oj_a a "
-      "LEFT JOIN oj_b b ON a.id = b.id "
-      "LEFT JOIN oj_c c ON b.id = c.id "
-      "ORDER BY a.id;");
+  std::vector<Row> chain_res =
+      RunSql(ctx, *db_,
+             "SELECT a.id, b.b_name, c.extra FROM oj_a a "
+             "LEFT JOIN oj_b b ON a.id = b.id "
+             "LEFT JOIN oj_c c ON b.id = c.id "
+             "ORDER BY a.id;");
   ASSERT_EQ(chain_res.size(), 3U);
   EXPECT_EQ(chain_res[0][0], Value(1));
   EXPECT_EQ(chain_res[0][1], Value("B-Alice"));
@@ -2797,7 +3829,8 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
   for (int i = 0; i < 300; ++i) {
     std::string sql = "INSERT INTO cancel_t VALUES (" + std::to_string(i) +
                       ", " + std::to_string(300 - i) + ", '" +
-                      std::string(80, 'A' + (i % 26)) + "');";
+                      std::string(80, static_cast<char>('A' + (i % 26))) +
+                      "');";
     RunSql(ctx, *db_, sql);
   }
 
@@ -2830,12 +3863,22 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
     EXPECT_EQ(db_->PinnedPageCount(), 0U);
   }
 
-  // Part 2: QueryMemoryBudget and SpillFile cleanup on Sort mid-execution destruction.
+  // Part 2: QueryMemoryBudget and SpillFile cleanup on Sort mid-execution
+  // destruction. The leak check counts spill files in SpillFile's temp
+  // directory, which defaults to a system-wide folder shared by every
+  // concurrently running test binary; point TINYLAMB_TEMP at a fresh
+  // per-process directory so external spills cannot land between the
+  // baseline and post-cancellation counts.
+  const std::filesystem::path spill_isolation_dir =
+      std::filesystem::temp_directory_path() /
+      ("tinylamb-spill-test-" + RandomString());
+  std::filesystem::create_directories(spill_isolation_dir);
+  setenv("TINYLAMB_TEMP", spill_isolation_dir.c_str(), 1);
   auto count_spill_files = []() -> size_t {
     size_t count = 0;
     std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(
-             SpillFile::TempDirectory(), ec)) {
+    for (const auto& entry :
+         std::filesystem::directory_iterator(SpillFile::TempDirectory(), ec)) {
       if (entry.path().filename().string().starts_with("tinylamb-spill-") &&
           entry.path().extension() == ".bin") {
         ++count;
@@ -2867,12 +3910,14 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
     EXPECT_EQ(db_->PinnedPageCount(), 0U);
   }
 
-  // Part 3: QueryMemoryBudget and SpillFile cleanup on HashJoin mid-execution destruction.
-  RunSql(ctx, *db_, "CREATE TABLE cancel_t2 (id INT64, val INT64, info STRING);");
+  // Part 3: QueryMemoryBudget and SpillFile cleanup on HashJoin mid-execution
+  // destruction.
+  RunSql(ctx, *db_,
+         "CREATE TABLE cancel_t2 (id INT64, val INT64, info STRING);");
   for (int i = 0; i < 200; ++i) {
     std::string sql = "INSERT INTO cancel_t2 VALUES (" + std::to_string(i) +
-                      ", " + std::to_string(i) + ", '" +
-                      std::string(80, 'x') + "');";
+                      ", " + std::to_string(i) + ", '" + std::string(80, 'x') +
+                      "');";
     RunSql(ctx, *db_, sql);
   }
 
@@ -2902,6 +3947,10 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
   EXPECT_EQ(count_spill_files(), baseline_spills);
   EXPECT_EQ(db_->PinnedPageCount(), 0U);
 
+  unsetenv("TINYLAMB_TEMP");
+  std::error_code cleanup_ec;
+  std::filesystem::remove_all(spill_isolation_dir, cleanup_ec);
+
   ctx.txn_.Abort();
 }
 
@@ -2926,7 +3975,7 @@ TEST_F(QueryTest, DifferentialTestCascadesVsRelationalFallback) {
 
   for (int i = 1; i <= 50; ++i) {
     std::string sql2 = "INSERT INTO diff_t2 VALUES (" + std::to_string(i) +
-                       ", " + std::to_string((i * 2) % 60 + 1) + ", 'note_" +
+                       ", " + std::to_string(((i * 2) % 60) + 1) + ", 'note_" +
                        std::to_string(i % 5) + "', " + std::to_string(i * 2.0) +
                        ");";
     RunSql(ctx, *db_, sql2);
@@ -3021,14 +4070,17 @@ TEST_F(QueryTest, DifferentialTestCascadesVsRelationalFallback) {
   run_differential(
       "SELECT val, COUNT(*) FROM diff_t1 GROUP BY val HAVING COUNT(*) > 5 "
       "ORDER BY val;");
-  run_differential("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM diff_t1;");
+  run_differential(
+      "SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM diff_t1;");
 
   // 6. Joins:
   run_differential(
-      "SELECT a.id, b.id, a.val, b.note FROM diff_t1 a JOIN diff_t2 b ON a.id = "
+      "SELECT a.id, b.id, a.val, b.note FROM diff_t1 a JOIN diff_t2 b ON a.id "
+      "= "
       "b.t1_id ORDER BY a.id, b.id;");
   run_differential(
-      "SELECT a.id, b.id, a.name, b.note FROM diff_t1 a JOIN diff_t2 b ON a.id = "
+      "SELECT a.id, b.id, a.name, b.note FROM diff_t1 a JOIN diff_t2 b ON a.id "
+      "= "
       "b.t1_id WHERE a.val > 5 AND b.bonus > 10 ORDER BY a.id, b.id;");
   run_differential(
       "SELECT a.id, b.bonus + a.val FROM diff_t1 a JOIN diff_t2 b ON a.id = "
@@ -3048,8 +4100,4 @@ TEST_F(QueryTest, DifferentialTestCascadesVsRelationalFallback) {
 
   ctx.txn_.Abort();
 }
-
 }  // namespace tinylamb
-
-
-

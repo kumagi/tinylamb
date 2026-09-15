@@ -527,8 +527,7 @@ TEST(ValueTest, ToString_UnaryAndAggregationEnums_FormatsExpectedStrings) {
 
   unary << UnaryOperation::kIsNull << "|" << UnaryOperation::kIsNotNull << "|"
         << UnaryOperation::kNot << "|" << UnaryOperation::kMinus << "|"
-        << UnaryOperation::kBitwiseNot << "|"
-        << invalid_unary;
+        << UnaryOperation::kBitwiseNot << "|" << invalid_unary;
   agg << AggregationType::kCount << "|" << AggregationType::kSum << "|"
       << AggregationType::kAvg << "|" << AggregationType::kMin << "|"
       << AggregationType::kMax << "|" << invalid_agg;
@@ -749,7 +748,13 @@ TEST(ValueTest, Truthy_VariousTypes_ReturnsExpectedBoolean) {
   EXPECT_TRUE(int_one.Truthy());
   EXPECT_TRUE(int_neg.Truthy());
   EXPECT_TRUE(empty_str.Truthy());
-  EXPECT_TRUE(double_zero.Truthy());
+  // Zero is false whatever its representation: DOUBLE 0.0 must agree with
+  // INT64 0 (fuzz-found: `(0.0 OR x)` short-circuited to TRUE while
+  // `(0 OR x)` was FALSE, and identity folds of the 0.0 made the AST and
+  // the bytecode fast path diverge).
+  EXPECT_FALSE(double_zero.Truthy());
+  EXPECT_FALSE(Value(-0.0).Truthy());
+  EXPECT_TRUE(Value(std::numeric_limits<double>::infinity()).Truthy());
 }
 
 TEST(ValueTest,
@@ -1327,8 +1332,7 @@ TEST(ValueTest,
 TEST(ValueTest, UnsignedInt64_ComparisonAndOrdering) {
   const Value u0 = Value(0ULL).WithUnsigned();
   const Value u10 = Value(10ULL).WithUnsigned();
-  const Value umax =
-      Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
+  const Value umax = Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
 
   const Value s_neg = Value(-1);
   const Value s_0 = Value(0);

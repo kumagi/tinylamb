@@ -408,14 +408,22 @@ Status TransactionManager::Abort(Transaction& txn) {
   }
   AbortVersions(txn);
   txn.SetStatus(TransactionStatus::kAborted);
-  LogRecord abort_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
-  StatusOr<lsn_t> appended = logger_->AddLog(abort_log.Serialize());
-  // Same contract as PreCommit: release locks and leave an aborted state
-  // rather than a half-finished transaction blocking everyone.
-  if (appended.HasValue()) {
-    txn.prev_lsn_ = appended.MoveValue();
-  } else if (undo_status == Status::kSuccess) {
-    undo_status = appended.GetStatus();
+  // The terminator is the record recovery classifies commits by, so append
+  // it only after the undo walk compensated the whole chain.  A partially
+  // compensated chain stays un-terminated and is finished by the restart
+  // loser-undo (idempotent through the page_lsn guard in UndoLoserChains);
+  // appending the terminator unconditionally would resurrect the
+  // uncompensated tail as committed data.
+  if (undo_status == Status::kSuccess) {
+    LogRecord abort_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
+    StatusOr<lsn_t> appended = logger_->AddLog(abort_log.Serialize());
+    // Same contract as PreCommit: release locks and leave an aborted state
+    // rather than a half-finished transaction blocking everyone.
+    if (appended.HasValue()) {
+      txn.prev_lsn_ = appended.MoveValue();
+    } else {
+      undo_status = appended.GetStatus();
+    }
   }
   ForgetTransaction(txn);
   return undo_status;
@@ -429,6 +437,10 @@ bool TransactionManager::AcquireWriteIntent(
   const auto wait_start = measure ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
   const DeadlockPolicy policy = GetDeadlockPolicy();
+  // Escalation deadline for the wait loops below: a holder may be deadlocked
+  // on this waiter's page latch, so waiting must stay bounded.
+  const auto intent_wait_deadline =
+      std::chrono::steady_clock::now() + GetWriteIntentWaitLimit();
   std::unique_lock lock(shard.mutex);
   if (measure) {
     write_intent_attempts_.fetch_add(1, std::memory_order_relaxed);
@@ -508,10 +520,10 @@ bool TransactionManager::AcquireWriteIntent(
       break;
     }
     case DeadlockPolicy::kWaitDie: {
-      // If the holder is younger than us, the policy says we must die.  We
-      // never wound a younger holder; we just refuse to wait and let the
-      // caller abort us. This bounds wait-queue length to a single older
-      // waiter per row and is deadlock-free by construction.
+      // If we (the waiter) are younger than the holder, wait-die says we
+      // must die.  We never wound a younger holder; we just refuse to wait
+      // and let the caller abort us. This bounds wait-queue length to a
+      // single older waiter per row and is deadlock-free by construction.
       const txn_id_t current_holder = holder_id();
       if (current_holder != 0 && current_holder != txn.ID() &&
           txn.ID() > current_holder) {
@@ -537,6 +549,16 @@ bool TransactionManager::AcquireWriteIntent(
       // Bounded wait: see kWriteIntentPollInterval for why a plain,
       // unbounded wait() could sleep through a cross-shard wound forever.
       while (!available()) {
+        if (std::chrono::steady_clock::now() >= intent_wait_deadline) {
+          // Latch-cycle escape hatch: the holder may be a transaction whose
+          // abort walk needs the page latch THIS waiter holds (page ops run
+          // exclusively latched). Giving up unwinds us, releases the latch,
+          // and lets the holder's AbortVersions make progress.
+          if (measure) {
+            write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
+          }
+          return false;
+        }
         shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
       }
       if (txn.IsWounded()) {
@@ -585,6 +607,13 @@ bool TransactionManager::AcquireWriteIntent(
       // Bounded wait: see kWriteIntentPollInterval for why a plain,
       // unbounded wait() could sleep through a cross-shard wound forever.
       while (!available()) {
+        if (std::chrono::steady_clock::now() >= intent_wait_deadline) {
+          // Latch-cycle escape hatch: see the kWaitDie branch.
+          if (measure) {
+            write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
+          }
+          return false;
+        }
         shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
       }
       if (txn.IsWounded()) {
@@ -619,6 +648,15 @@ bool TransactionManager::AcquireWriteIntent(
       // Bounded wait: see kWriteIntentPollInterval for why a plain,
       // unbounded wait() could sleep through a cross-shard wound forever.
       while (!available()) {
+        if (std::chrono::steady_clock::now() >= intent_wait_deadline) {
+          // Latch-cycle escape hatch: see the kWaitDie branch. The wait-for
+          // edge is moot once we give up.
+          RemoveWaitForEdge(txn.ID());
+          if (measure) {
+            write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
+          }
+          return false;
+        }
         shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
       }
       // Whether we got the lock or were wounded, our wait-for edge is moot.
@@ -631,7 +669,17 @@ bool TransactionManager::AcquireWriteIntent(
   }
   VersionChain& chain = shard.versions[rp];
   if (chain.pending) {
-    return chain.pending->owner == txn.ID();
+    const bool ours = chain.pending->owner == txn.ID();
+    // The write set may have pre-reserved this intent without a
+    // before-image (TryAddWriteSet); the actual update now supplies one.
+    // Install it so concurrent snapshots keep reading the pre-update value
+    // instead of falling back to the (soon overwritten) heap image.
+    if (ours && before && chain.committed.empty()) {
+      chain.committed.push_back(
+          {0, std::numeric_limits<uint64_t>::max(),
+           std::optional<std::string>(std::string(*before))});
+    }
+    return ours;
   }
   // Strict write locking: a conflicting writer waits, then evaluates against
   // the latest physical row after reserving its own unstaged intent. This is
@@ -681,6 +729,24 @@ StatusOr<std::string> TransactionManager::ReadVersion(
       return Status::kNotExists;
     }
     return *chain.pending->value;
+  }
+  // An empty committed list means the chain carries no snapshot-relevant
+  // version: either GC collected a chain made redundant by the heap image
+  // (leaving at most an unstaged intent shell), or the intent was acquired
+  // without a before-image on a row whose chain no longer exists. In both
+  // cases the physical image is authoritative for every snapshot that could
+  // reach this branch -- any newer value is still uncommitted and any older
+  // value was already proven equal to the physical image when GC dropped
+  // the chain. Without this fallback the row reads back as kNotExists and
+  // silently disappears from scans after a commit+GC+re-intent cycle.
+  // (A bare INSERT intent also produces an empty committed list; updates
+  // keep their before-image in `committed` via AcquireWriteIntent so this
+  // fallback is never what serves a stale post-update heap image.)
+  if (chain.committed.empty()) {
+    if (!physical) {
+      return Status::kNotExists;
+    }
+    return std::string(*physical);
   }
   // A writer that waited for a predecessor implements strict write locking,
   // not first-updater-wins snapshot isolation: its SET expression must see
@@ -929,6 +995,10 @@ void TransactionManager::UnregisterActiveTransaction(Transaction* txn) {
   auto it = active_transactions_.find(txn->txn_id_);
   if (it != active_transactions_.end() && it->second == txn) {
     active_transactions_.erase(it);
+    // The move-assignment adopts a new identity next; a snapshot entry left
+    // under the old one would pin GarbageCollectVersions forever (the
+    // destructor only releases the entry keyed by the adopted id).
+    active_snapshots_.erase(txn->txn_id_);
   }
 }
 

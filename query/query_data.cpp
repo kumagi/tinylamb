@@ -36,12 +36,14 @@
 #include "type/value.hpp"
 
 namespace {
+
 std::string ToLowerCopy(std::string value) {
   for (char& c : value) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   }
   return value;
 }
+
 }  // namespace
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
@@ -223,6 +225,45 @@ Expression BindFieldPaths(
     }
   }
   return changed ? WithExpressionChildren(exp, std::move(children)) : nullptr;
+}
+
+// Inlines SELECT-list aliases inside QUALIFY (any depth): a bare identifier
+// that names no base column but names a select alias becomes the aliased
+// expression. Single-level (mirrors the relational InlineAliases); base
+// columns win over aliases.  // NOLINT(misc-no-recursion)
+Expression InlineSelectAliases(
+    const Expression& expression,
+    const std::unordered_map<std::string, Expression>& aliases,
+    const std::unordered_map<std::string, std::string>& col_table_map) {
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& name = expression->AsColumnValue().GetColumnName();
+    if (!name.schema.empty() || name.name == "*" ||
+        col_table_map.contains(ToLowerCopy(name.name))) {
+      return expression;
+    }
+    const auto found = aliases.find(ToLowerCopy(name.name));
+    return found != aliases.end() ? found->second : expression;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    return expression;
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  bool changed = false;
+  for (Expression& child : children) {
+    if (!child) {
+      continue;
+    }
+    Expression mapped = InlineSelectAliases(child, aliases, col_table_map);
+    if (mapped != child) {
+      changed = true;
+      child = std::move(mapped);
+    }
+  }
+  return changed ? WithExpressionChildren(expression, std::move(children))
+                 : expression;
 }
 
 Status
@@ -520,6 +561,36 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   std::unordered_map<std::string, size_t> relation_column_counts;
 
   for (const auto& relation : from_) {
+    // Lifted CTEs (M4) resolve from their leaf schemas, not the catalog:
+    // same map entries, ambiguity handling, and qualifier validation as base
+    // tables so downstream resolution cannot tell them apart. (Cells carry
+    // inferred types; opaque recursive leaves are Null-typed.)
+    const Schema* leaf_schema = nullptr;
+    const auto materialized = lifted_ctes_.cells.find(relation);
+    if (materialized != lifted_ctes_.cells.end() &&
+        materialized->second != nullptr) {
+      leaf_schema = &materialized->second->schema;
+    } else {
+      const auto recursive = lifted_ctes_.recursive.find(relation);
+      if (recursive != lifted_ctes_.recursive.end()) {
+        leaf_schema = &recursive->second.output_schema;
+      }
+    }
+    if (leaf_schema != nullptr) {
+      const Schema& sc = *leaf_schema;
+      relation_column_counts[relation] = sc.ColumnCount();
+      for (size_t i = 0; i < sc.ColumnCount(); ++i) {
+        const ColumnName& col_name = sc.GetColumn(i).Name();
+        all_cols.emplace_back(relation, col_name.name);
+        const std::string lower_name = ToLowerCopy(col_name.name);
+        if (!col_table_map.contains(lower_name)) {
+          col_table_map.emplace(lower_name, relation);
+        } else {
+          ambiguous_colum_name.emplace(lower_name);
+        }
+      }
+      continue;
+    }
     const auto aliased = aliases_.find(relation);
     const std::string& physical =
         aliased == aliases_.end() ? relation : aliased->second;
@@ -554,6 +625,13 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
       where_ = std::move(mapped);
     }
   }
+  for (OuterJoinEdge& edge : outer_joins_) {
+    Expression mapped =
+        BindFieldPaths(edge.on_condition, col_table_map, relations);
+    if (mapped) {
+      edge.on_condition = std::move(mapped);
+    }
+  }
 
   // Rewrite SELECT clause.
   for (auto& named : select_) {
@@ -566,6 +644,17 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
                ? BindColumnQualifiedFieldReads(where_, col_table_map, relations,
                                                relation_column_counts)
                : where_;
+  qualify_ =
+      qualify_ ? BindColumnQualifiedFieldReads(
+                     qualify_, col_table_map, relations, relation_column_counts)
+               : qualify_;
+  for (OuterJoinEdge& edge : outer_joins_) {
+    edge.on_condition =
+        edge.on_condition
+            ? BindColumnQualifiedFieldReads(edge.on_condition, col_table_map,
+                                            relations, relation_column_counts)
+            : edge.on_condition;
+  }
 
   // Proto value tables (compliance harness) expose a single message column
   // whose fields are addressed by name; only those relations may absorb an
@@ -625,6 +714,35 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
                         all_cols, expand_proto_value_table, &ambiguous_column_);
   if (where_status != Status::kSuccess) {
     return RecordAmbiguousColumn(where_status, ambiguous_colum_name);
+  }
+  // Rewrite QUALIFY clause. Like ORDER BY it runs after projection, so bare
+  // identifiers may name SELECT-list aliases; inline them (any depth) with
+  // base columns taking precedence, matching the ORDER BY rule above and the
+  // relational InlineAliases.
+  if (qualify_) {
+    std::unordered_map<std::string, Expression> aliases;
+    for (const NamedExpression& selected : select_) {
+      if (!selected.name.empty() && selected.expression) {
+        aliases.emplace(ToLowerCopy(selected.name), selected.expression);
+      }
+    }
+    qualify_ = InlineSelectAliases(qualify_, aliases, col_table_map);
+  }
+  Status qualify_status = ResolveExpression(
+      qualify_, col_table_map, ambiguous_colum_name, relations, all_cols,
+      expand_proto_value_table, &ambiguous_column_);
+  if (qualify_status != Status::kSuccess) {
+    return RecordAmbiguousColumn(qualify_status, ambiguous_colum_name);
+  }
+  // Rewrite each outer-join ON condition in the same scope: bare names in ON
+  // resolve against the combined FROM clause, exactly like WHERE.
+  for (OuterJoinEdge& edge : outer_joins_) {
+    Status on_status = ResolveExpression(
+        edge.on_condition, col_table_map, ambiguous_colum_name, relations,
+        all_cols, expand_proto_value_table, &ambiguous_column_);
+    if (on_status != Status::kSuccess) {
+      return RecordAmbiguousColumn(on_status, ambiguous_colum_name);
+    }
   }
   return where_status;
 }

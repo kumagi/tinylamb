@@ -509,11 +509,12 @@ TEST(ExpressionRewriteTest, DeeplyNestedExpressionThrowsInsteadOfCrashing) {
 TEST(ExpressionRewriteTest, NestedExpressionWithinDepthLimitStillRewrites) {
   Expression expression = ColumnValueExp("v");
   for (int i = 0; i < 400; ++i) {
-    expression = UnaryExpressionExp(expression, UnaryOperation::kMinus);
+    expression = BinaryExpressionExp(expression, BinaryOperation::kMultiply,
+                                     ConstantValueExp(Value(1)));
   }
   Expression rewritten =
       ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
-  // An even number of negations collapses back to the bare column.
+  // The nested identities collapse back to the bare column.
   EXPECT_EQ(rewritten->Type(), TypeTag::kColumnValue);
 }
 
@@ -777,9 +778,17 @@ TEST(ExpressionRewriteTest, ArithmeticIdentitiesAndDoubleNegation) {
                 ->Type(),
             TypeTag::kColumnValue);
 
+  // A dynamic INT64 child may hold INT64_MIN, where `-(-x)` throws while the
+  // folded `x` would not: the collapse must stay.
   Expression double_minus = UnaryExpressionExp(
       UnaryExpressionExp(x, UnaryOperation::kMinus), UnaryOperation::kMinus);
-  EXPECT_EQ(rewrite(double_minus)->Type(), TypeTag::kColumnValue);
+  EXPECT_EQ(rewrite(double_minus)->Type(), TypeTag::kUnaryExp);
+
+  // Double negation on exact doubles folds away.
+  Expression double_minus_d = UnaryExpressionExp(
+      UnaryExpressionExp(ConstantValueExp(Value(2.5)), UnaryOperation::kMinus),
+      UnaryOperation::kMinus);
+  EXPECT_EQ(rewrite(double_minus_d)->Type(), TypeTag::kConstantValue);
 
   // Non-identity operands stay untouched.
   Expression kept =
@@ -802,15 +811,17 @@ TEST(ExpressionRewriteTest, ArithmeticIdentitiesRefuseNonNumeric) {
   Expression double_minus_s = UnaryExpressionExp(
       UnaryExpressionExp(s, UnaryOperation::kMinus), UnaryOperation::kMinus);
   EXPECT_EQ(rewrite(double_minus_s)->Type(), TypeTag::kUnaryExp);
-  EXPECT_THROW(rewrite(double_minus_s)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(double_minus_s)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   // -(-date) must NOT simplify to date.
   Expression double_minus_d = UnaryExpressionExp(
       UnaryExpressionExp(d, UnaryOperation::kMinus), UnaryOperation::kMinus);
   EXPECT_EQ(rewrite(double_minus_d)->Type(), TypeTag::kUnaryExp);
-  EXPECT_THROW(rewrite(double_minus_d)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(double_minus_d)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   // -(-5_u64) must NOT simplify to 5_u64 (unary minus on uint64 > 0 throws
   // overflow).
@@ -819,8 +830,9 @@ TEST(ExpressionRewriteTest, ArithmeticIdentitiesRefuseNonNumeric) {
   Expression double_minus_u5 = UnaryExpressionExp(
       UnaryExpressionExp(u5, UnaryOperation::kMinus), UnaryOperation::kMinus);
   EXPECT_EQ(rewrite(double_minus_u5)->Type(), TypeTag::kUnaryExp);
-  EXPECT_THROW(rewrite(double_minus_u5)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(double_minus_u5)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   // -(-0_u64) CAN simplify to 0_u64.
   const Expression u0 =
@@ -838,43 +850,49 @@ TEST(ExpressionRewriteTest, ArithmeticIdentitiesRefuseNonNumeric) {
       UnaryExpressionExp(UnaryExpressionExp(min_int, UnaryOperation::kMinus),
                          UnaryOperation::kMinus);
   EXPECT_EQ(rewrite(double_minus_min)->Type(), TypeTag::kUnaryExp);
-  EXPECT_THROW(rewrite(double_minus_min)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(double_minus_min)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   // "foo" + 0, 0 + "foo", "foo" - 0 must NOT simplify to "foo" (type mismatch).
   Expression add_zero_s1 = BinaryExpressionExp(s, BinaryOperation::kAdd, zero);
   EXPECT_EQ(rewrite(add_zero_s1)->Type(), TypeTag::kBinaryExp);
-  EXPECT_THROW(rewrite(add_zero_s1)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(add_zero_s1)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   Expression add_zero_s2 = BinaryExpressionExp(zero, BinaryOperation::kAdd, s);
   EXPECT_EQ(rewrite(add_zero_s2)->Type(), TypeTag::kBinaryExp);
-  EXPECT_THROW(rewrite(add_zero_s2)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(add_zero_s2)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   Expression sub_zero_s =
       BinaryExpressionExp(s, BinaryOperation::kSubtract, zero);
   EXPECT_EQ(rewrite(sub_zero_s)->Type(), TypeTag::kBinaryExp);
-  EXPECT_THROW(rewrite(sub_zero_s)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(sub_zero_s)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   // "foo" * 1, 1 * "foo" must NOT simplify to "foo" (type mismatch).
   Expression mul_one_s1 =
       BinaryExpressionExp(s, BinaryOperation::kMultiply, one);
   EXPECT_EQ(rewrite(mul_one_s1)->Type(), TypeTag::kBinaryExp);
-  EXPECT_THROW(rewrite(mul_one_s1)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(mul_one_s1)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   Expression mul_one_s2 =
       BinaryExpressionExp(one, BinaryOperation::kMultiply, s);
   EXPECT_EQ(rewrite(mul_one_s2)->Type(), TypeTag::kBinaryExp);
-  EXPECT_THROW(rewrite(mul_one_s2)->Evaluate(Row(), Schema()),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(rewrite(mul_one_s2)->Evaluate(Row(), Schema())),
+      std::runtime_error);
 
   // "foo" / 1 must NOT simplify to "foo" (type mismatch).
   Expression div_one_s = BinaryExpressionExp(s, BinaryOperation::kDivide, one);
   EXPECT_EQ(rewrite(div_one_s)->Type(), TypeTag::kBinaryExp);
-  EXPECT_THROW(rewrite(div_one_s)->Evaluate(Row(), Schema()),
+  EXPECT_THROW(static_cast<void>(rewrite(div_one_s)->Evaluate(Row(), Schema())),
                std::runtime_error);
 
   // "foo" + (-5) must NOT canonicalize to "foo" - 5.
@@ -915,12 +933,22 @@ TEST(ExpressionRewriteTest, CanonicalizesSimpleArithmeticShapes) {
   ASSERT_EQ(negative_one->Type(), TypeTag::kUnaryExp);
   EXPECT_EQ(negative_one->AsUnaryExpression().Op(), UnaryOperation::kMinus);
 
+  // A DYNAMIC INT64 addend must stay: `x + x` wraps into UINT64 at the
+  // overflow boundary while `x * 2` raises, so the collapse is unsound
+  // (INT64_MIN). Exact doubles still fold.
   Expression repeated = rewriter.Rewrite(
       BinaryExpressionExp(integer, BinaryOperation::kAdd, integer));
   ASSERT_EQ(repeated->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(repeated->AsBinaryExpression().Op(), BinaryOperation::kMultiply);
+  EXPECT_EQ(repeated->AsBinaryExpression().Op(), BinaryOperation::kAdd);
+
+  const Expression dbl = FunctionCallExp("sqrt", {ColumnValueExp("x")});
+  Expression repeated_dbl =
+      rewriter.Rewrite(BinaryExpressionExp(dbl, BinaryOperation::kAdd, dbl));
+  ASSERT_EQ(repeated_dbl->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(repeated_dbl->AsBinaryExpression().Op(),
+            BinaryOperation::kMultiply);
   EXPECT_EQ(
-      repeated->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      repeated_dbl->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
       Value(2));
 }
 
@@ -1468,11 +1496,13 @@ TEST(ExpressionRewriteTest, FactorCommonAndShortCircuitThrow) {
       "t", {Column("x", ValueType::kInt64), Column("y", ValueType::kInt64)});
   Row row({Value(int64_t{0}), Value(int64_t{2})});
 
-  EXPECT_THROW((void)expr->Evaluate(row, schema), std::runtime_error);
+  EXPECT_THROW(static_cast<void>((void)expr->Evaluate(row, schema)),
+               std::runtime_error);
 
   Expression rewritten = rewriter.Rewrite(expr);
   // Rewritten MUST also throw on row x = 0, y = 2!
-  EXPECT_THROW((void)rewritten->Evaluate(row, schema), std::runtime_error);
+  EXPECT_THROW(static_cast<void>((void)rewritten->Evaluate(row, schema)),
+               std::runtime_error);
 
   // Common conjunct with volatile call (rand()) must NOT be factored out.
   Expression rand_call = FunctionCallExp("rand", {});
@@ -1687,11 +1717,13 @@ TEST(ExpressionRewriteTest, OrOfRangesInterveningThrow) {
 
   // Original throws because x = 1 is false, so it evaluates the second disjunct
   // which raises.
-  EXPECT_THROW((void)expr->Evaluate(row, schema), std::runtime_error);
+  EXPECT_THROW(static_cast<void>((void)expr->Evaluate(row, schema)),
+               std::runtime_error);
 
   Expression rewritten = rewriter.Rewrite(expr);
   // Rewritten MUST also throw on row x = 2!
-  EXPECT_THROW((void)rewritten->Evaluate(row, schema), std::runtime_error);
+  EXPECT_THROW(static_cast<void>((void)rewritten->Evaluate(row, schema)),
+               std::runtime_error);
 }
 
 TEST(ExpressionRewriteTest, IntervalNormalize) {
@@ -2484,8 +2516,9 @@ TEST(ExpressionRewriteTest, DivisionByZeroConstantStaysRuntimeError) {
       ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(div_zero);
   const Row row({});
   const Schema schema;
-  EXPECT_THROW(std::ignore = rewritten->Evaluate(row, schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(std::ignore = rewritten->Evaluate(row, schema)),
+      std::runtime_error);
 }
 
 TEST(ExpressionRewriteTest, BooleanPredicateEqualityInvertsExactComplement) {

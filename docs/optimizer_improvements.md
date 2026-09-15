@@ -168,11 +168,33 @@ Completed 2026-08 unless noted. Routing contract after this phase:
 - **Optimizer path (cost-based)**: single-relation queries; multi-relation
   queries whose sources carry table aliases — including self-joins of one
   physical table; plain INNER/CROSS `JOIN ... ON` (the engine folds the ON
-  conjunction into WHERE before planning).
-- **Relational path (heuristic)**: unaliased multi-table joins, LEFT JOIN,
-  FROM-subqueries, CTEs/WITH, GROUP BY/HAVING, OR/subquery expressions
-  (`NeedsRelationalEvaluation`), and unqualified column references across
-  several relations (precise ambiguity diagnostics live there).
+  conjunction into WHERE before planning); plain single LEFT JOIN over two
+  base tables with an explicit ON (M6 slice: ON rides the `kOuterJoin`
+  predicate via `Memo::NewOuterJoin`, WHERE over the null-supplying side
+  stays above the join; anything beyond the slice returns
+  `kNotImplemented` and falls back to the relational path); single-table
+  uncorrelated FROM-subqueries without stars/grouping (M5 slice: flattened
+  by `FlattenDerivedSources` before routing, inner WHERE merged into WHERE
+  or — for a null-supplying outer side — into ON); singly-referenced
+  non-recursive single-table CTEs (M4 slice: inlined by
+  `InlineSingleUseCtes` into derived sources, then flattened by M5);
+  multiply-referenced small CTEs (M4 slice: lifted by `MaterializeCtes`
+  into one shared eager cell scanned through kValues leaves); singly-
+  referenced recursive CTEs (M4 slice: opaque kRecursiveCte memo leaves in
+  `LiftRecursiveCtes`, fixpoint still on the worktable driver); window
+  functions over flat queries without grouping (M-window slice: hoisted by
+  `ExtractWindowCalls` into kWindow nodes with a `WindowExecutor`
+  delegating to the canonical evaluator; QUALIFY lowers to a Selection
+  above the nodes).
+- **Relational path (heuristic)**: unaliased multi-table joins, RIGHT/FULL
+  JOIN chains (single RIGHT/FULL edges route through Cascades since M6+1),
+  LEFT JOIN chains / mixed outer+inner graphs / USING / nested joins /
+  outer joins with grouping, FROM-subqueries with aggregation, stars,
+  correlation or multiple tables, multiply-referenced or recursive CTEs that
+  miss the M4 gates (over-budget, CTE-dependent, nested placements),
+  GROUP BY/HAVING, OR/subquery expressions (`NeedsRelationalEvaluation`),
+  and unqualified column references across several relations (precise
+  ambiguity diagnostics live there).
 
 Implemented in this phase:
 
@@ -201,8 +223,15 @@ Deliberately not migrated to cost-based planning (functional via the
 relational executor; each needs its own design note):
 
 - Outer-join predicate pushdown inside the memo: `kOuterJoin` and the
-  LEFT/RIGHT/FULL hash implementations now exist, but null-rejection analysis
-  must still gate every pushdown rule and commutativity restriction.
+  LEFT/RIGHT/FULL hash implementations now exist, and the M6 slice lowers
+  single LEFT joins end-to-end (`QueryData::outer_joins_` +
+  `Memo::NewOuterJoin` + `TryEliminateUnusedOuterJoin`; left-side pushdown
+  and null-rejecting outer→inner reduction apply through the existing
+  rules). M6+1 added single RIGHT/FULL lowering (join-type payloads, kinds
+  1/2). Still outstanding: RIGHT/FULL chains, grouped
+  outer joins, and a memo-level (vs statement-level) unused-outer-side
+  elimination; null-rejection analysis must still gate every remaining
+  pushdown rule and commutativity restriction.
 - Subquery decorrelation into SemiJoin/AntiJoin: IN/EXISTS evaluate via
   `subquery_runtime` today; decorrelation changes cardinality estimation and
   needs new implementation rules.
@@ -210,8 +239,9 @@ relational executor; each needs its own design note):
   etc.): the global touched-set approximation remains sound for the shapes
   that reach the optimizer now that disjunctive/subquery shapes route to the
   relational engine; revisit if those shapes ever move over.
-- RIGHT/FULL OUTER joins: parsed and executed on the syntactic relational path;
-  cost-based migration still requires null-rejection-aware rewrites.
+- RIGHT/FULL OUTER joins: single edges lower through the M6+1 slice; chains,
+  USING and grouped shapes stay on the syntactic relational path and need
+  null-rejection-aware rewrites.
 
 ## Phase 9 — Hardening
 

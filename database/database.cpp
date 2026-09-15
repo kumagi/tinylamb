@@ -32,6 +32,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -59,10 +60,23 @@ constexpr page_id_t kDefaultTableRoot = 1;
 constexpr page_id_t kDefaultStatisticsRoot = 2;
 constexpr page_id_t kDefaultFunctionRoot = 3;
 
+namespace {
+
+// Base names of every database this process opened through Create().
+// Guards RemoveCreatedDatabaseFiles(); see the header comment.
+std::mutex created_databases_mutex;
+std::unordered_set<std::string> created_databases;
+
+}  // namespace
+
 StatusOr<std::unique_ptr<Database>> Database::Create(std::string_view dbname,
                                                      size_t wal_sync_ms) {
   ASSIGN_OR_RETURN(std::unique_ptr<PageStorage>, storage,
                    PageStorage::Create(dbname, wal_sync_ms));
+  {
+    const std::scoped_lock lock(created_databases_mutex);
+    created_databases.insert(std::string(dbname));
+  }
   // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
   auto database = std::unique_ptr<Database>(
       new Database(dbname, std::move(storage)));  // NOLINT
@@ -241,7 +255,20 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
   // A failure after the allocation must not leak the fresh table page or
   // any already-built index tree: unwind them the way DropTable would.  No
   // rows were inserted, so the row-page chain is the single initial page.
+  bool catalog_inserted = false;
   const auto unwind_allocation = [&](Status failure) -> Status {
+    // After the catalog row landed, DropTable-equivalent unwinding must also
+    // remove the catalog entry and any statistics rows that were written,
+    // otherwise the catalog keeps serving a table whose storage is back on
+    // the free list.
+    if (catalog_inserted) {
+      std::ignore = catalog_.Delete(ctx.txn_, schema.Name());
+      for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
+        std::ignore = statistics_.Delete(
+            ctx.txn_, StatisticsColumnKey(schema.Name(), column));
+      }
+      std::ignore = statistics_.Delete(ctx.txn_, schema.Name());
+    }
     for (size_t i = 0; i < new_table.IndexCount(); ++i) {
       for (const page_id_t idx_pid :
            BPlusTree::CollectPageIds(ctx.txn_, new_table.GetIndex(i).Root())) {
@@ -284,6 +311,7 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
     if (insert_status != Status::kSuccess) {
       return unwind_allocation(insert_status);
     }
+    catalog_inserted = true;
   }
   {
     const Status stats_status =
@@ -539,8 +567,13 @@ StatusOr<TableStatistics> Database::GetStatistics(
 Status Database::UpdateStatistics(TransactionContext& ctx,
                                   std::string_view schema_name,
                                   const TableStatistics& ts) {
+  // Statistics keys follow the canonical (declared) table name, exactly like
+  // the readers (GetStatistics) and DropTable; writing under the caller's
+  // raw spelling left the refresh invisible for differently-cased references.
+  ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
+  const std::string canonical(tbl.GetSchema().Name());
   const Status updated =
-      WriteSplitStatistics(statistics_, ctx.txn_, schema_name, ts);
+      WriteSplitStatistics(statistics_, ctx.txn_, canonical, ts);
   if (updated == Status::kSuccess) {
     // ANALYZE (and any other refresh) changes cost inputs for compiled plans.
     BumpSchemaEpoch();
@@ -557,6 +590,23 @@ Status Database::RefreshStatistics(TransactionContext& ctx,
 }
 
 void Database::EmulateCrash() { storage_->DiscardAllUpdates(); }
+
+void Database::RemoveCreatedDatabaseFiles() {
+  std::unordered_set<std::string> names;
+  {
+    const std::scoped_lock lock(created_databases_mutex);
+    names = created_databases;
+  }
+  for (const std::string& name : names) {
+    // Same file set as DeleteAll(): the page file, WAL, checkpoint marker
+    // and its stranded temp sibling. Missing entries are the norm (not
+    // every database reaches every stage) and simply ignored.
+    std::ignore = std::remove((name + ".db").c_str());
+    std::ignore = std::remove((name + ".log").c_str());
+    std::ignore = std::remove((name + ".last_checkpoint").c_str());
+    std::ignore = std::remove((name + ".last_checkpoint.tmp").c_str());
+  }
+}
 
 void Database::DeleteAll() {
   // The fuzzer harnesses call DeleteAll() mid-session and again from the

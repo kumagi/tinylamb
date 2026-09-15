@@ -78,8 +78,8 @@ StatusOr<Value> TryEvaluateUnary(UnaryOperation operation, const Value& child) {
         return Value();
       }
       if (child.type == ValueType::kInt64) {
-        Value res(
-            static_cast<int64_t>(~static_cast<uint64_t>(child.value.int_value)));
+        Value res(static_cast<int64_t>(
+            ~static_cast<uint64_t>(child.value.int_value)));
         return child.IsUnsigned() ? res.WithUnsigned() : res;
       }
       return StatusError(StatusCode::kInvalidArgument,

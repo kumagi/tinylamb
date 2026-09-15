@@ -876,17 +876,21 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     collectors.emplace_back(schema.GetColumn(i).Type());
   }
 
-  // Collect into locals first: if a row trips a type-mismatch throw, the
-  // previous statistics stay intact instead of being half-cleared.
+  // Collect into locals first: a row that trips the type-mismatch CHECK
+  // aborts the process anyway, but any other error keeps the previous
+  // statistics intact instead of half-clearing them.
   size_t scanned_rows = 0;
-  for (Iterator iterator = target.BeginFullScan(txn); iterator.IsValid();
-       ++iterator) {
+  Iterator iterator = target.BeginFullScan(txn);
+  for (; iterator.IsValid(); ++iterator) {
     const Row& row = *iterator;
     ++scanned_rows;
     for (size_t i = 0; i < collectors.size(); ++i) {
       collectors[i].Add(row[i]);
     }
   }
+  // A scan that stopped on an error would otherwise persist partial counts
+  // as if they were complete.
+  RETURN_IF_FAIL(iterator.GetStatus());
 
   std::vector<ColumnStats> rebuilt;
   rebuilt.reserve(collectors.size());

@@ -190,12 +190,32 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
 }  // namespace
 
 std::optional<BytecodeProgram> BytecodeCompiler::Compile(
-    const Expression& expression, const Schema& schema) {
+    const Expression& expression, const Schema& schema, Context context) {
   try {
-    const ExpressionRewriter rewriter(
+    // Mirror the optimizer's split: the not-inference rule turns NULL into
+    // FALSE, so it is only sound in filter contexts (see plan/optimizer.cpp).
+    ExpressionRuleSet rules =
         ContainsNotOfOrderedDoubleComparison(expression, schema)
             ? NotComparisonFreeRules()
-            : ExpressionRuleSet::Default());
+            : ExpressionRuleSet::Default();
+    if (context == Context::kValue) {
+      rules.Remove("inner_join_not_null_inference");
+      // Truthiness-preserving collapses (x AND TRUE -> x, x OR x -> x,
+      // NOT NOT x -> x, ...) are only sound where the result is consumed as
+      // a predicate.  As a *value* the AST always normalizes these to
+      // BOOLEAN (or NULL), while the collapsed operand may carry -1, "abc",
+      // etc. (oracle-found: `(-1 OR -1)` -> AST TRUE, VM -1).
+      for (const char* name :
+           {"boolean_identity", "double_negation", "xor_boolean_identity",
+            "and_idempotent", "or_idempotent", "absorption_and",
+            "absorption_and_reversed", "absorption_or",
+            "absorption_or_reversed", "factor_or_common_and",
+            "boolean_filter_pullup"}) {
+        rules.Remove(name);
+      }
+    }
+    ExpressionRewriter rewriter(rules);
+    rewriter.set_schema(&schema);
     StatusOr<Expression> folded_or = rewriter.TryRewrite(expression);
     if (!folded_or.HasValue()) {
       return std::nullopt;
@@ -244,6 +264,10 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
                                    ? (!top.IsNull() && !top.Truthy())
                                    : (!top.IsNull() && top.Truthy());
           if (decides) {
+            // The AST normalizes a short-circuit result to BOOLEAN
+            // (Value(op == kOr)); replace the raw truthy operand so e.g.
+            // `(-1 OR x)` yields TRUE, not -1.
+            stack.back() = Value(instruction.opcode == BytecodeOp::kJumpIfTrue);
             pc += static_cast<size_t>(instruction.jump_target);
             --pc;  // the for-loop ++pc lands on the target.
           }
@@ -316,6 +340,9 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
                                  ? (!top.IsNull() && !top.Truthy())
                                  : (!top.IsNull() && top.Truthy());
         if (decides) {
+          // Match the AST: a short-circuit AND/OR evaluates to a normalized
+          // BOOLEAN, never the raw truthy operand value.
+          stack.back() = Value(instruction.opcode == BytecodeOp::kJumpIfTrue);
           pc += static_cast<size_t>(instruction.jump_target);
           --pc;
         }

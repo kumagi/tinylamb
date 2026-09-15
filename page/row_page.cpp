@@ -97,7 +97,16 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
   }
   txn.RegisterVersionWrite(RowPosition(page_id, inserted.Value()), std::nullopt,
                            record);
-  RETURN_IF_FAIL(txn.InsertLog(page_id, inserted.Value(), record).GetStatus());
+  Status append = txn.InsertLog(page_id, inserted.Value(), record).GetStatus();
+  if (append != Status::kSuccess) {
+    // The WAL append failed: no CLR will ever compensate this insert, and
+    // once AbortVersions clears the unstaged pending, the physical image
+    // would serve phantom rows through ReadVersion's fallback.  Roll the
+    // slot back to a hole now (DeleteRow keeps the high-water mark, which is
+    // harmless; the space stays reusable through the hole).
+    DeleteRow(inserted.Value());
+    return append;
+  }
   return inserted.Value();
 }
 
@@ -184,7 +193,19 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
   // not leave a log record describing an update that never reached the page.
   RETURN_IF_FAIL(UpdateRow(pos.slot, record));
   txn.RegisterVersionWrite(pos, prev_row, record);
-  RETURN_IF_FAIL(txn.UpdateLog(page_id, slot, record, prev_row).GetStatus());
+  Status append = txn.UpdateLog(page_id, slot, record, prev_row).GetStatus();
+  if (append != Status::kSuccess) {
+    // WAL append failed: restore the previous image so the page never keeps
+    // an update no log record backs.  The committed base installed by
+    // AddWriteSet shields MVCC readers, but the physical fallback would not.
+    // The restore cannot fail here: its image is never larger than what the
+    // page already held before the applied update.
+    if (UpdateRow(pos.slot, prev_row) != Status::kSuccess) {
+      LOG(ERROR) << "Update rollback failed; unlogged image at " << page_id
+                 << "/" << pos.slot;
+    }
+    return append;
+  }
   return Status::kSuccess;
 }
 

@@ -629,7 +629,7 @@ TEST_F(BranchPageTest, FosterChild) {
     ASSERT_EQ(result.child_pid, i);
     ASSERT_SUCCESS(page->SetFoster(txn, FosterPair()));
     if (auto f = page->GetFoster(txn)) {
-      ASSERT_TRUE(!"never reach here");
+      FAIL() << "never reach here";
     }
   }
 

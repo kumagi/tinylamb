@@ -49,8 +49,9 @@ size_t SerializeU64(char* pos, uint64_t value) {
 }
 
 size_t DeserializeU16(const char* pos, uint16_t* out) {
-  *out = (static_cast<uint16_t>(static_cast<unsigned char>(pos[0])) << 8U) |
-         static_cast<uint16_t>(static_cast<unsigned char>(pos[1]));
+  *out = static_cast<uint16_t>(
+      (static_cast<uint16_t>(static_cast<unsigned char>(pos[0])) << 8U) |
+      static_cast<uint16_t>(static_cast<unsigned char>(pos[1])));
   return sizeof(*out);
 }
 

@@ -280,11 +280,21 @@ struct RPred {
         }
         const int64_t masked = lhs & mask;
         const int64_t rhs = rhs_const;
-        if (op == "=") return Eval3vl(masked == rhs);
-        if (op == "!=") return Eval3vl(masked != rhs);
-        if (op == "<") return Eval3vl(masked < rhs);
-        if (op == "<=") return Eval3vl(masked <= rhs);
-        if (op == ">") return Eval3vl(masked > rhs);
+        if (op == "=") {
+          return Eval3vl(masked == rhs);
+        }
+        if (op == "!=") {
+          return Eval3vl(masked != rhs);
+        }
+        if (op == "<") {
+          return Eval3vl(masked < rhs);
+        }
+        if (op == "<=") {
+          return Eval3vl(masked <= rhs);
+        }
+        if (op == ">") {
+          return Eval3vl(masked > rhs);
+        }
         return Eval3vl(masked >= rhs);
       }
       case Kind::kBitwiseNotCmp: {
@@ -294,11 +304,21 @@ struct RPred {
         }
         const int64_t not_val = ~lhs;
         const int64_t rhs = rhs_const;
-        if (op == "=") return Eval3vl(not_val == rhs);
-        if (op == "!=") return Eval3vl(not_val != rhs);
-        if (op == "<") return Eval3vl(not_val < rhs);
-        if (op == "<=") return Eval3vl(not_val <= rhs);
-        if (op == ">") return Eval3vl(not_val > rhs);
+        if (op == "=") {
+          return Eval3vl(not_val == rhs);
+        }
+        if (op == "!=") {
+          return Eval3vl(not_val != rhs);
+        }
+        if (op == "<") {
+          return Eval3vl(not_val < rhs);
+        }
+        if (op == "<=") {
+          return Eval3vl(not_val <= rhs);
+        }
+        if (op == ">") {
+          return Eval3vl(not_val > rhs);
+        }
         return Eval3vl(not_val >= rhs);
       }
       case Kind::kArithmeticCmp: {
@@ -308,11 +328,21 @@ struct RPred {
         }
         const int64_t arith_val = lhs + arith_const;
         const int64_t rhs = rhs_const;
-        if (op == "=") return Eval3vl(arith_val == rhs);
-        if (op == "!=") return Eval3vl(arith_val != rhs);
-        if (op == "<") return Eval3vl(arith_val < rhs);
-        if (op == "<=") return Eval3vl(arith_val <= rhs);
-        if (op == ">") return Eval3vl(arith_val > rhs);
+        if (op == "=") {
+          return Eval3vl(arith_val == rhs);
+        }
+        if (op == "!=") {
+          return Eval3vl(arith_val != rhs);
+        }
+        if (op == "<") {
+          return Eval3vl(arith_val < rhs);
+        }
+        if (op == "<=") {
+          return Eval3vl(arith_val <= rhs);
+        }
+        if (op == ">") {
+          return Eval3vl(arith_val > rhs);
+        }
         return Eval3vl(arith_val >= rhs);
       }
     }
@@ -1194,7 +1224,11 @@ std::string RunSetup(Database& db, TransactionContext& ctx,
       if (verbose) {
         std::cerr << "[sql_oracle][skip-setup] " << sql << " (" << err << ")\n";
       }
-      return "setup statement failed on [" + sql + "]: " + err;
+      std::string failure = "setup statement failed on [";
+      failure += sql;
+      failure += "]: ";
+      failure += err;
+      return failure;
     }
   }
   return {};
@@ -1457,7 +1491,7 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   CHECK(sdb.get() != nullptr);
   Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
-  const std::string setup_err = RunSetup(db, ctx, trace.setup, verbose);
+  std::string setup_err = RunSetup(db, ctx, trace.setup, verbose);
   if (!setup_err.empty()) {
     return setup_err;
   }
@@ -1687,13 +1721,8 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
       not_of(bin(not_of(CopyPred(*l1)), "OR", not_of(CopyPred(*l2)))));
   variants.push_back(bin(CopyPred(*l2), "AND", CopyPred(*l1)));
 
-  // Sanity: the mirror says all variants are semantically identical.
-  int64_t expected = 0;
-  for (const MirrorRow& m : mirror) {
-    if (variants[0]->Eval(m) == 'T') {
-      ++expected;
-    }
-  }
+  // Sanity: the mirror says all variants are semantically identical
+  // (row-wise equality trivially implies equal true-counts).
   for (const RPredPtr& v : variants) {
     for (const MirrorRow& m : mirror) {
       if (v->Eval(m) != variants[0]->Eval(m)) {
@@ -1705,7 +1734,9 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
   auto explain_plan = [&](const std::string& sql) {
     std::string error;
     auto rows = RunRows(db, ctx, "EXPLAIN " + sql, &error);
-    if (!rows.has_value()) return std::string{};
+    if (!rows.has_value()) {
+      return std::string{};
+    }
     std::string plan;
     for (const Row& r : *rows) {
       plan += r.ToString() + ";";
@@ -1714,6 +1745,7 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
   };
 
   std::vector<std::string> sqls;
+  sqls.reserve(variants.size());
   for (const RPredPtr& v : variants) {
     sqls.push_back("SELECT COUNT(*) FROM " + tab + " WHERE " + v->Render() +
                    ";");

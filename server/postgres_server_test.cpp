@@ -346,6 +346,101 @@ TEST(PostgresServerTest, TransactionsOverTcpProtocol) {
   database.DeleteAll();
 }
 
+TEST(PostgresServerTest, SingleMessageImplicitBlockRollsBackWithControl) {
+  const std::string path =
+      "postgres_server_implicit_txn_test-" + RandomString();
+  {
+    PostgresServerOptions options;
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string listen_error;
+    ASSERT_TRUE(server.Listen(&listen_error)) << listen_error;
+    std::string run_error;
+    int run_result = -1;
+    std::jthread server_thread([&] { run_result = server.Run(&run_error); });
+    StopGuard stop_guard{&server};
+
+    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ASSERT_GE(client, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(server.BoundPort());
+    ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+    ASSERT_EQ(
+        connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+        0);
+    ASSERT_TRUE(SendAll(client, StartupMessage()));
+    ASSERT_FALSE(ReadUntilReady(client).empty());
+
+    ASSERT_TRUE(SendAll(
+        client, QueryMessage(
+                    "CREATE TABLE implicit_txn (id INT64, body STRING(32));")));
+    EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
+
+    // Act -- UPDATE followed by ROLLBACK in ONE Query message: PostgreSQL
+    // runs the statement inside an implicit block that the ROLLBACK undoes
+    // (the legacy per-statement commit made this a silent no-op).
+    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO implicit_txn VALUES "
+                                             "(1, 'keep');"
+                                             "UPDATE implicit_txn SET body = "
+                                             "'lost' WHERE id = 1;"
+                                             "ROLLBACK;")));
+    const std::string rollback_reply = ReadUntilReady(client);
+    EXPECT_NE(rollback_reply.find("INSERT 0 1"), std::string::npos);
+    EXPECT_NE(rollback_reply.find("UPDATE 1"), std::string::npos);
+    EXPECT_NE(rollback_reply.find("ROLLBACK"), std::string::npos);
+
+    // Assert -- the WHOLE implicit block is undone (PostgreSQL treats the
+    // single Query message as one implicit transaction), so neither the
+    // INSERT nor the UPDATE survived.
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT id, body FROM implicit_txn;")));
+    const std::string after_rollback = ReadUntilReady(client);
+    EXPECT_NE(after_rollback.find("SELECT 0"), std::string::npos);
+    EXPECT_EQ(after_rollback.find("keep"), std::string::npos);
+    EXPECT_EQ(after_rollback.find("lost"), std::string::npos);
+
+    // Act -- INSERT followed by COMMIT in one message persists the row
+    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO implicit_txn VALUES "
+                                             "(2, 'kept');"
+                                             "COMMIT;")));
+    const std::string commit_reply = ReadUntilReady(client);
+    EXPECT_NE(commit_reply.find("INSERT 0 1"), std::string::npos);
+    EXPECT_NE(commit_reply.find("COMMIT"), std::string::npos);
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT id, body FROM implicit_txn;")));
+    const std::string after_commit = ReadUntilReady(client);
+    EXPECT_NE(after_commit.find("kept"), std::string::npos);
+
+    // Act -- BEGIN adopts the implicit block: statements before BEGIN and
+    // after it share one transaction that ROLLBACK undoes.
+    ASSERT_TRUE(SendAll(client, QueryMessage("UPDATE implicit_txn SET body = "
+                                             "'gone' WHERE id = 1;"
+                                             "BEGIN;"
+                                             "UPDATE implicit_txn SET body = "
+                                             "'also-gone' WHERE id = 2;"
+                                             "ROLLBACK;")));
+    const std::string begin_rollback = ReadUntilReady(client);
+    EXPECT_NE(begin_rollback.find("BEGIN"), std::string::npos);
+    EXPECT_NE(begin_rollback.find("ROLLBACK"), std::string::npos);
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT id, body FROM implicit_txn;")));
+    const std::string after_begin_rollback = ReadUntilReady(client);
+    EXPECT_NE(after_begin_rollback.find("kept"), std::string::npos);
+    EXPECT_EQ(after_begin_rollback.find("gone"), std::string::npos);
+
+    ASSERT_TRUE(SendAll(client, std::string("X\0\0\0\4", 5)));
+    close(client);
+    server.RequestStop();
+    server_thread.join();
+    EXPECT_EQ(run_result, 0) << run_error;
+  }
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
+  database.DeleteAll();
+}
+
 TEST(PostgresServerTest, ServerProtocolErrorResponses) {
   const std::string path = "postgres_server_errors_test-" + RandomString();
   {
@@ -1465,7 +1560,12 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
       std::string result;
       while (result.find(needle) == std::string::npos) {
         pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
-        if (poll(&descriptor, 1, 5000) <= 0) {
+        // Sanitizer builds serialize the 18 MB projection slowly enough to
+        // open multi-second no-data windows; a 5 s gap there aborted the
+        // read before the queued replies arrived even though the server was
+        // still flushing. 30 s keeps the queueing assertions, not the
+        // machine speed, under test.
+        if (poll(&descriptor, 1, 30000) <= 0) {
           break;
         }
         std::array<char, 4096> buffer{};

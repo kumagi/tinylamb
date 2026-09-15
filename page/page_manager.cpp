@@ -27,6 +27,7 @@
 #include "page/page_ref.hpp"
 #include "page_type.hpp"
 #include "recovery/recovery_manager.hpp"
+#include "transaction/transaction.hpp"
 
 namespace tinylamb {
 
@@ -87,8 +88,34 @@ void PageManager::PopFreePageHead(page_id_t pid, page_id_t next) {
 
 StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& system_txn,
                                                PageType new_page_type) {
-  ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
-  return meta->AllocateNewPage(system_txn, *pool_, new_page_type);
+  // Two-phase allocation: pick the candidate under the meta latch, but
+  // release that latch before blocking on the candidate page's latch.  The
+  // runtime undo of an aborted destroy latches the candidate page first and
+  // takes the meta latch second (LogUndoWithPage -> PopFreePageHead), so
+  // holding meta across GetPage here would give the two paths opposite
+  // orders and let an allocator deadlock against an aborting destructor.
+  // Re-validation under the re-taken latch keeps the pop correct when
+  // another allocator moved the head in between; the loser just retries.
+  for (;;) {
+    page_id_t candidate = 0;
+    {
+      ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
+      candidate = meta->body.meta_page.PeekAllocationCandidate();
+    }
+    ASSIGN_OR_RETURN(PageRef, page, pool_->GetPage(candidate, nullptr));
+    ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
+    if (!meta->body.meta_page.AllocateCandidate(candidate, page.get())) {
+      // The candidate moved while the meta latch was released; the pinned
+      // page was never mutated, so dropping it and recomputing is safe.
+      continue;
+    }
+    RETURN_IF_FAIL(
+        system_txn.AllocatePageLog(candidate, new_page_type).GetStatus());
+    meta->SetPageLSN(system_txn.PrevRecordEndLSN());
+    meta->SetRecLSN(system_txn.PrevRecordEndLSN());
+    page->PageInit(candidate, new_page_type);
+    return page;
+  }
 }
 
 StatusOr<PageRef> PageManager::GetMetaPage() {

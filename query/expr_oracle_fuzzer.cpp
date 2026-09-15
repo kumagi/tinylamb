@@ -376,7 +376,7 @@ std::pair<Schema, std::vector<Row>> BuildRowFuzzDataset(std::mt19937& rng) {
       vals.emplace_back();
     }
     if (s_val.has_value()) {
-      vals.push_back(Value(std::string(*s_val)));
+      vals.emplace_back(std::string(*s_val));
     } else {
       vals.emplace_back();
     }
@@ -448,249 +448,252 @@ RowGenPred GenRowPred(std::mt19937& rng, int depth = 0,
     switch (pick(0, max_case)) {
       case 0: {
         int64_t c = pick(-3, 3);
-        return {
-            BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kEquals,
-                                ConstantValueExp(Value(c))),
-            "(i = " + std::to_string(c) + ")"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("i"),
+                                            BinaryOperation::kEquals,
+                                            ConstantValueExp(Value(c))),
+                .sql = "(i = " + std::to_string(c) + ")"};
       }
       case 1: {
         int64_t c = pick(-3, 3);
-        return {BinaryExpressionExp(ColumnValueExp("i"),
-                                    BinaryOperation::kGreaterThan,
-                                    ConstantValueExp(Value(c))),
-                "(i > " + std::to_string(c) + ")"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("i"),
+                                            BinaryOperation::kGreaterThan,
+                                            ConstantValueExp(Value(c))),
+                .sql = "(i > " + std::to_string(c) + ")"};
       }
       case 2: {
         int64_t c = pick(-3, 3);
-        return {BinaryExpressionExp(ColumnValueExp("i"),
-                                    BinaryOperation::kLessThanEquals,
-                                    ConstantValueExp(Value(c))),
-                "(i <= " + std::to_string(c) + ")"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("i"),
+                                            BinaryOperation::kLessThanEquals,
+                                            ConstantValueExp(Value(c))),
+                .sql = "(i <= " + std::to_string(c) + ")"};
       }
       case 3: {
         double f = pick(-20, 20) / 10.0;
-        return {BinaryExpressionExp(ColumnValueExp("f"),
-                                    BinaryOperation::kGreaterThan,
-                                    ConstantValueExp(Value(f))),
-                "(f > " + std::to_string(f) + ")"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("f"),
+                                            BinaryOperation::kGreaterThan,
+                                            ConstantValueExp(Value(f))),
+                .sql = "(f > " + std::to_string(f) + ")"};
       }
       case 4:
-        return {
-            BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kEquals,
-                                ConstantValueExp(Value("foo"))),
-            "(s = 'foo')"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("s"),
+                                            BinaryOperation::kEquals,
+                                            ConstantValueExp(Value("foo"))),
+                .sql = "(s = 'foo')"};
       case 5:
-        return {BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kLike,
-                                    ConstantValueExp(Value("a%"))),
-                "(s LIKE 'a%')"};
+        return {.expr = BinaryExpressionExp(ColumnValueExp("s"),
+                                            BinaryOperation::kLike,
+                                            ConstantValueExp(Value("a%"))),
+                .sql = "(s LIKE 'a%')"};
       case 6:
-        return {
-            UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kIsNull),
-            "(i IS NULL)"};
+        return {.expr = UnaryExpressionExp(ColumnValueExp("i"),
+                                           UnaryOperation::kIsNull),
+                .sql = "(i IS NULL)"};
       case 7:
-        return {
-            UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kIsNotNull),
-            "(i IS NOT NULL)"};
+        return {.expr = UnaryExpressionExp(ColumnValueExp("i"),
+                                           UnaryOperation::kIsNotNull),
+                .sql = "(i IS NOT NULL)"};
       case 8:
-        return {
-            UnaryExpressionExp(ColumnValueExp("f"), UnaryOperation::kIsNull),
-            "(f IS NULL)"};
+        return {.expr = UnaryExpressionExp(ColumnValueExp("f"),
+                                           UnaryOperation::kIsNull),
+                .sql = "(f IS NULL)"};
       case 9:
-        return {
-            UnaryExpressionExp(ColumnValueExp("s"), UnaryOperation::kIsNotNull),
-            "(s IS NOT NULL)"};
+        return {.expr = UnaryExpressionExp(ColumnValueExp("s"),
+                                           UnaryOperation::kIsNotNull),
+                .sql = "(s IS NOT NULL)"};
       case 10:
         return {
-            BinaryExpressionExp(
+            .expr = BinaryExpressionExp(
                 FunctionCallExp(
                     "coalesce",
                     {ColumnValueExp("i"), ConstantValueExp(Value(int64_t{0}))}),
                 BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0}))),
-            "(COALESCE(i, 0) = 0)"};
+            .sql = "(COALESCE(i, 0) = 0)"};
       case 11:
         return {
-            BinaryExpressionExp(
+            .expr = BinaryExpressionExp(
                 FunctionCallExp("coalesce", {ColumnValueExp("s"),
                                              ConstantValueExp(Value("bar"))}),
                 BinaryOperation::kEquals, ConstantValueExp(Value("bar"))),
-            "(COALESCE(s, 'bar') = 'bar')"};
+            .sql = "(COALESCE(s, 'bar') = 'bar')"};
       case 12: {
         int64_t v1 = pick(-1, 1);
         int64_t v2 = pick(2, 5);
-        return {
-            InExpressionExp(ColumnValueExp("i"), {ConstantValueExp(Value(v1)),
-                                                  ConstantValueExp(Value(v2))}),
-            "(i IN (" + std::to_string(v1) + ", " + std::to_string(v2) + "))"};
+        return {.expr = InExpressionExp(
+                    ColumnValueExp("i"),
+                    {ConstantValueExp(Value(v1)), ConstantValueExp(Value(v2))}),
+                .sql = "(i IN (" + std::to_string(v1) + ", " +
+                       std::to_string(v2) + "))"};
       }
       case 13:
-        return {
-            BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kEquals,
-                                ConstantValueExp(Value(int64_t{1}))),
-            "(b = TRUE)"};
+        return {.expr = BinaryExpressionExp(
+                    ColumnValueExp("b"), BinaryOperation::kEquals,
+                    ConstantValueExp(Value(int64_t{1}))),
+                .sql = "(b = TRUE)"};
       case 14: {
         int64_t c = pick(-3, 3);
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     FunctionCallExp("greatest", {ColumnValueExp("i"),
                                                  ConstantValueExp(Value(c))}),
                     BinaryOperation::kGreaterThan,
                     ConstantValueExp(Value(int64_t{0}))),
-                "(GREATEST(i, " + std::to_string(c) + ") > 0)"};
+                .sql = "(GREATEST(i, " + std::to_string(c) + ") > 0)"};
       }
       case 15: {
         int64_t c = pick(-3, 3);
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     FunctionCallExp("least", {ColumnValueExp("i"),
                                               ConstantValueExp(Value(c))}),
                     BinaryOperation::kLessThan,
                     ConstantValueExp(Value(int64_t{0}))),
-                "(LEAST(i, " + std::to_string(c) + ") < 0)"};
+                .sql = "(LEAST(i, " + std::to_string(c) + ") < 0)"};
       }
       case 16: {
         int64_t c = pick(0, 3);
         return {
-            BinaryExpressionExp(FunctionCallExp("abs", {ColumnValueExp("i")}),
-                                BinaryOperation::kLessThanEquals,
-                                ConstantValueExp(Value(c))),
-            "(ABS(i) <= " + std::to_string(c) + ")"};
+            .expr = BinaryExpressionExp(
+                FunctionCallExp("abs", {ColumnValueExp("i")}),
+                BinaryOperation::kLessThanEquals, ConstantValueExp(Value(c))),
+            .sql = "(ABS(i) <= " + std::to_string(c) + ")"};
       }
       case 17: {
         return {
-            BinaryExpressionExp(FunctionCallExp("sign", {ColumnValueExp("i")}),
-                                BinaryOperation::kEquals,
-                                ConstantValueExp(Value(int64_t{1}))),
-            "(SIGN(i) = 1)"};
+            .expr = BinaryExpressionExp(
+                FunctionCallExp("sign", {ColumnValueExp("i")}),
+                BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{1}))),
+            .sql = "(SIGN(i) = 1)"};
       }
       case 18: {
         int64_t c = pick(-2, 2);
         return {
-            BinaryExpressionExp(
+            .expr = BinaryExpressionExp(
                 FunctionCallExp("safe_add", {ColumnValueExp("i"),
                                              ConstantValueExp(Value(c))}),
                 BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0}))),
-            "(SAFE_ADD(i, " + std::to_string(c) + ") = 0)"};
+            .sql = "(SAFE_ADD(i, " + std::to_string(c) + ") = 0)"};
       }
       case 19: {
         int64_t c = pick(-2, 2);
         return {
-            BinaryExpressionExp(
+            .expr = BinaryExpressionExp(
                 FunctionCallExp("safe_subtract", {ColumnValueExp("i"),
                                                   ConstantValueExp(Value(c))}),
                 BinaryOperation::kGreaterThan,
                 ConstantValueExp(Value(int64_t{0}))),
-            "(SAFE_SUBTRACT(i, " + std::to_string(c) + ") > 0)"};
+            .sql = "(SAFE_SUBTRACT(i, " + std::to_string(c) + ") > 0)"};
       }
       case 20: {
         int64_t c = pick(-2, 2);
         return {
-            BinaryExpressionExp(
+            .expr = BinaryExpressionExp(
                 FunctionCallExp("safe_multiply", {ColumnValueExp("i"),
                                                   ConstantValueExp(Value(c))}),
                 BinaryOperation::kLessThan,
                 ConstantValueExp(Value(int64_t{0}))),
-            "(SAFE_MULTIPLY(i, " + std::to_string(c) + ") < 0)"};
+            .sql = "(SAFE_MULTIPLY(i, " + std::to_string(c) + ") < 0)"};
       }
       case 21: {
         int64_t c = pick(-2, 2);
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     FunctionCallExp("safe_negate", {ColumnValueExp("i")}),
                     BinaryOperation::kEquals, ConstantValueExp(Value(c))),
-                "(SAFE_NEGATE(i) = " + std::to_string(c) + ")"};
+                .sql = "(SAFE_NEGATE(i) = " + std::to_string(c) + ")"};
       }
       case 22: {
         int64_t c = pick(-1, 1);
-        return {UnaryExpressionExp(
+        return {.expr = UnaryExpressionExp(
                     FunctionCallExp("nullif", {ColumnValueExp("i"),
                                                ConstantValueExp(Value(c))}),
                     UnaryOperation::kIsNull),
-                "(NULLIF(i, " + std::to_string(c) + ") IS NULL)"};
+                .sql = "(NULLIF(i, " + std::to_string(c) + ") IS NULL)"};
       }
       case 23: {
         int64_t c = pick(-2, 2);
         return {
-            BinaryExpressionExp(
+            .expr = BinaryExpressionExp(
                 FunctionCallExp("ifnull", {ColumnValueExp("i"),
                                            ConstantValueExp(Value(c))}),
                 BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0}))),
-            "(IFNULL(i, " + std::to_string(c) + ") = 0)"};
+            .sql = "(IFNULL(i, " + std::to_string(c) + ") = 0)"};
       }
       case 24: {
         double c = pick(-10, 10) / 10.0;
-        return {
-            BinaryExpressionExp(FunctionCallExp("round", {ColumnValueExp("f")}),
-                                BinaryOperation::kGreaterThanEquals,
-                                ConstantValueExp(Value(c))),
-            "(ROUND(f) >= " + std::to_string(c) + ")"};
+        return {.expr = BinaryExpressionExp(
+                    FunctionCallExp("round", {ColumnValueExp("f")}),
+                    BinaryOperation::kGreaterThanEquals,
+                    ConstantValueExp(Value(c))),
+                .sql = "(ROUND(f) >= " + std::to_string(c) + ")"};
       }
       case 25: {
         double c = pick(-10, 10) / 10.0;
-        return {
-            BinaryExpressionExp(FunctionCallExp("ceil", {ColumnValueExp("f")}),
-                                BinaryOperation::kGreaterThanEquals,
-                                ConstantValueExp(Value(c))),
-            "(CEIL(f) >= " + std::to_string(c) + ")"};
+        return {.expr = BinaryExpressionExp(
+                    FunctionCallExp("ceil", {ColumnValueExp("f")}),
+                    BinaryOperation::kGreaterThanEquals,
+                    ConstantValueExp(Value(c))),
+                .sql = "(CEIL(f) >= " + std::to_string(c) + ")"};
       }
       case 26: {
         double c = pick(-10, 10) / 10.0;
         return {
-            BinaryExpressionExp(FunctionCallExp("floor", {ColumnValueExp("f")}),
-                                BinaryOperation::kLessThanEquals,
-                                ConstantValueExp(Value(c))),
-            "(FLOOR(f) <= " + std::to_string(c) + ")"};
+            .expr = BinaryExpressionExp(
+                FunctionCallExp("floor", {ColumnValueExp("f")}),
+                BinaryOperation::kLessThanEquals, ConstantValueExp(Value(c))),
+            .sql = "(FLOOR(f) <= " + std::to_string(c) + ")"};
       }
       case 27: {
         int64_t mask = pick(1, 3);
         int64_t c = pick(0, 3);
         return {
-            BinaryExpressionExp(
+            .expr = BinaryExpressionExp(
                 FunctionCallExp("__bit_and", {ColumnValueExp("i"),
                                               ConstantValueExp(Value(mask))}),
                 BinaryOperation::kEquals, ConstantValueExp(Value(c))),
-            "((i & " + std::to_string(mask) + ") = " + std::to_string(c) + ")"};
+            .sql = "((i & " + std::to_string(mask) +
+                   ") = " + std::to_string(c) + ")"};
       }
       case 28: {
         int64_t c = pick(-4, 4);
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     UnaryExpressionExp(ColumnValueExp("i"),
                                        UnaryOperation::kBitwiseNot),
                     BinaryOperation::kLessThan, ConstantValueExp(Value(c))),
-                "((~i) < " + std::to_string(c) + ")"};
+                .sql = "((~i) < " + std::to_string(c) + ")"};
       }
       case 29: {
         int64_t c = pick(1, 4);
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     FunctionCallExp("length", {ColumnValueExp("s")}),
                     BinaryOperation::kGreaterThan, ConstantValueExp(Value(c))),
-                "(LENGTH(s) > " + std::to_string(c) + ")"};
+                .sql = "(LENGTH(s) > " + std::to_string(c) + ")"};
       }
       case 30: {
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     FunctionCallExp("upper", {ColumnValueExp("s")}),
                     BinaryOperation::kEquals, ConstantValueExp(Value("ABC"))),
-                "(UPPER(s) = 'ABC')"};
+                .sql = "(UPPER(s) = 'ABC')"};
       }
       case 31: {
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     FunctionCallExp("substr",
                                     {ColumnValueExp("s"),
                                      ConstantValueExp(Value(int64_t{1})),
                                      ConstantValueExp(Value(int64_t{2}))}),
                     BinaryOperation::kEquals, ConstantValueExp(Value("ab"))),
-                "(SUBSTR(s, 1, 2) = 'ab')"};
+                .sql = "(SUBSTR(s, 1, 2) = 'ab')"};
       }
       case 32: {
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     FunctionCallExp("trim", {ColumnValueExp("s")}),
                     BinaryOperation::kEquals, ConstantValueExp(Value("abc"))),
-                "(TRIM(s) = 'abc')"};
+                .sql = "(TRIM(s) = 'abc')"};
       }
       default: {
         int64_t c = pick(0, 10);
-        return {BinaryExpressionExp(
+        return {.expr = BinaryExpressionExp(
                     FunctionCallExp("__shift_left",
                                     {ColumnValueExp("i"),
                                      ConstantValueExp(Value(int64_t{1}))}),
                     BinaryOperation::kGreaterThan, ConstantValueExp(Value(c))),
-                "((i << 1) > " + std::to_string(c) + ")"};
+                .sql = "((i << 1) > " + std::to_string(c) + ")"};
       }
     }
   }
@@ -699,19 +702,20 @@ RowGenPred GenRowPred(std::mt19937& rng, int depth = 0,
     case 0: {
       auto l = GenRowPred(rng, depth + 1, config);
       auto r = GenRowPred(rng, depth + 1, config);
-      return {BinaryExpressionExp(l.expr, BinaryOperation::kAnd, r.expr),
-              "(" + l.sql + " AND " + r.sql + ")"};
+      return {
+          .expr = BinaryExpressionExp(l.expr, BinaryOperation::kAnd, r.expr),
+          .sql = "(" + l.sql + " AND " + r.sql + ")"};
     }
     case 1: {
       auto l = GenRowPred(rng, depth + 1, config);
       auto r = GenRowPred(rng, depth + 1, config);
-      return {BinaryExpressionExp(l.expr, BinaryOperation::kOr, r.expr),
-              "(" + l.sql + " OR " + r.sql + ")"};
+      return {.expr = BinaryExpressionExp(l.expr, BinaryOperation::kOr, r.expr),
+              .sql = "(" + l.sql + " OR " + r.sql + ")"};
     }
     default: {
       auto inner = GenRowPred(rng, depth + 1, config);
-      return {UnaryExpressionExp(inner.expr, UnaryOperation::kNot),
-              "(NOT " + inner.sql + ")"};
+      return {.expr = UnaryExpressionExp(inner.expr, UnaryOperation::kNot),
+              .sql = "(NOT " + inner.sql + ")"};
     }
   }
 }
@@ -739,26 +743,22 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
     if (cascades::ExpressionRejectsNullsOnColumn(pred.expr, col_name)) {
       t.null_reject_claimed = true;
       t.null_reject_col = col_name;
-      for (size_t r_idx = 0; r_idx < rows.size(); ++r_idx) {
-        if (rows[r_idx][col_idx].IsNull()) {
-          StatusOr<Value> v = pred.expr->TryEvaluate(rows[r_idx], schema);
+      for (const auto& r_idx : rows) {
+        if (r_idx[col_idx].IsNull()) {
+          StatusOr<Value> v = pred.expr->TryEvaluate(r_idx, schema);
           if (v.HasValue() && !v.Value().IsNull() && v.Value().Truthy()) {
-            report +=
-                "[NULL-REJECT SOUNDNESS VIOLATION]\n"
-                "  Predicate claims to reject NULL on column '" +
-                col_name +
-                "':\n"
-                "  Expression SQL: " +
-                pred.sql +
-                "\n"
-                "  Expression AST: " +
-                pred.expr->ToString() +
-                "\n"
-                "  Evaluated to TRUE on row where " +
-                col_name +
-                " is NULL:\n"
-                "  Row:            " +
-                rows[r_idx].ToString() + "\n";
+            report += "[NULL-REJECT SOUNDNESS VIOLATION]\n";
+            report += "  Predicate claims to reject NULL on column '";
+            report += col_name;
+            report += "':\n  Expression SQL: ";
+            report += pred.sql;
+            report += "\n  Expression AST: ";
+            report += pred.expr->ToString();
+            report += "\n  Evaluated to TRUE on row where ";
+            report += col_name;
+            report += " is NULL:\n  Row:            ";
+            report += r_idx.ToString();
+            report += "\n";
             t.failure = "null-reject soundness violation on column " + col_name;
             return report;
           }
@@ -772,9 +772,9 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
   Expression rewritten =
       ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(pred.expr);
   rewritten = RewriteTypedArithmetic(rewritten, schema);
-  for (size_t r_idx = 0; r_idx < rows.size(); ++r_idx) {
-    StatusOr<Value> orig_v = pred.expr->TryEvaluate(rows[r_idx], schema);
-    StatusOr<Value> rew_v = rewritten->TryEvaluate(rows[r_idx], schema);
+  for (const auto& r_idx : rows) {
+    StatusOr<Value> orig_v = pred.expr->TryEvaluate(r_idx, schema);
+    StatusOr<Value> rew_v = rewritten->TryEvaluate(r_idx, schema);
     if (!orig_v.HasValue() || !rew_v.HasValue()) {
       if (orig_v.HasValue() != rew_v.HasValue()) {
         report +=
@@ -791,7 +791,7 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
             (rew_v.HasValue() ? rew_v.Value().AsString() : "THROW") +
             "\n"
             "  On Row:         " +
-            rows[r_idx].ToString() + "\n";
+            r_idx.ToString() + "\n";
         t.failure = "rewrite throw mismatch";
         return report;
       }
@@ -812,7 +812,7 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
           rewritten->ToString() + " => " + (rew_pass ? "PASS" : "REJECT") +
           "\n"
           "  On Row:         " +
-          rows[r_idx].ToString() + "\n";
+          r_idx.ToString() + "\n";
       t.failure = "rewrite truthiness mismatch";
       return report;
     }
@@ -952,7 +952,9 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
     auto fmt = [](const std::vector<int64_t>& ids) {
       std::string out = "[";
       for (size_t i = 0; i < ids.size(); ++i) {
-        if (i > 0) out += ", ";
+        if (i > 0) {
+          out += ", ";
+        }
         out += std::to_string(ids[i]);
       }
       out += "]";

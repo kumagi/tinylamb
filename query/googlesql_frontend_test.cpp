@@ -460,6 +460,10 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << true;
   }
+  // The 2 MB input parses far slower under sanitizer builds on a loaded
+  // machine; this test targets EINTR retry, not the parse-round-trip budget,
+  // so lift the production timeout for the process under test.
+  (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "300", 1);
   // Arm a SIGALRM while Parse() is blocked reading a slow-to-parse query.
   // Without SA_RESTART the blocking read/write returns EINTR and must retry.
   struct sigaction saved = {};

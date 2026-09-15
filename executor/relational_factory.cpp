@@ -23,6 +23,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/apply.hpp"
+#include "executor/batch_nested_loop_join.hpp"
 #include "executor/bitmap_scan.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
@@ -53,6 +54,7 @@
 #include "executor/topn.hpp"
 #include "executor/unnest.hpp"
 #include "executor/values.hpp"
+#include "executor/window.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "index/index.hpp"
@@ -88,6 +90,7 @@
 #include "plan/topn_plan.hpp"
 #include "plan/unnest_plan.hpp"
 #include "plan/values_plan.hpp"
+#include "plan/window_plan.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -128,6 +131,14 @@ Executor ApplyPlan::EmitExecutor(TransactionContext& ctx) const {
 Executor RecursiveCtePlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<RecursiveCteExecutor>(ctx, cte_name_, body_,
                                                 depth_spec_, schema_);
+}
+
+Executor WindowPlan::EmitExecutor(TransactionContext& ctx) const {
+  Executor child_exec =
+      child_ ? child_->EmitExecutor(ctx)
+             : std::make_shared<ValuesExecutor>(std::vector<Row>{Row({})});
+  return std::make_shared<WindowExecutor>(ctx, std::move(child_exec),
+                                          GetSchema(), WindowOutputs());
 }
 
 // Streaming pass-through that surfaces a relation rename in EXPLAIN/Dump
@@ -465,14 +476,49 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
     // optimizer and FULL has hash/merge implementations.
     if (residual_note_ && !IsSemiJoinKind(kind_) && !IsAntiJoinKind(kind_)) {
       if (kind_ != JoinKind::kInner && !IsLeftOuterJoinKind(kind_)) {
+        // Full/right-outer residuals have no tuple nested-loop
+        // implementation; the blocked executor null-pads unmatched rows on
+        // either side. Only the batch_nested_loop rule constructs this
+        // shape, so any other kind here is still a planner bug.
+        if (IsFullOuterJoinKind(kind_) || IsRightOuterJoinKind(kind_)) {
+          return std::make_shared<BatchNestedLoopJoin>(
+              left_src_->EmitExecutor(ctx), left_src_->GetSchema(),
+              right_src_->EmitExecutor(ctx), right_src_->GetSchema(),
+              residual_note_, kind_);
+        }
         // Falling through to CrossJoin would silently DROP the residual and
         // emit an unfiltered product; no current rule constructs this shape,
         // so a residual with an unsupported kind is a planner bug. Fail
         // loudly (programmer-error category) instead of returning wrong rows.
-        CHECK_MSG(false, "ProductPlan: residual predicate on unsupported "
-                         "join kind (expected INNER/LEFT OUTER)");
+        CHECK_MSG(false,
+                  "ProductPlan: residual predicate on unsupported "
+                  "join kind (expected INNER/LEFT OUTER)");
+      }
+      // The batch_nested_loop rule marks inner joins whose predicate has no
+      // equi pair for the blocked executor; the tuple executor stays the
+      // default so existing plans are unchanged.
+      if (batch_nested_loop_) {
+        return std::make_shared<BatchNestedLoopJoin>(
+            left_src_->EmitExecutor(ctx), left_src_->GetSchema(),
+            right_src_->EmitExecutor(ctx), right_src_->GetSchema(),
+            residual_note_, kind_);
       }
       return std::make_shared<NestedLoopJoin>(
+          left_src_->EmitExecutor(ctx), left_src_->GetSchema(),
+          right_src_->EmitExecutor(ctx), right_src_->GetSchema(),
+          residual_note_, kind_);
+    }
+    // Semi/anti residuals have no tuple nested-loop implementation either:
+    // falling through to CrossJoin would drop the predicate and emit an
+    // unfiltered product. The blocked executor evaluates the predicate per
+    // pair with match tracking. Null-aware anti carries three-valued
+    // short-circuit semantics the blocked executor does not implement; no
+    // rule constructs that shape (the batch rule only fires without an
+    // equi pair, and null-aware arises from single-key equi NOT IN).
+    if (residual_note_ && (IsSemiJoinKind(kind_) || IsAntiJoinKind(kind_))) {
+      CHECK_MSG(!IsNullAwareAntiJoinKind(kind_),
+                "ProductPlan: residual predicate on null-aware anti join");
+      return std::make_shared<BatchNestedLoopJoin>(
           left_src_->EmitExecutor(ctx), left_src_->GetSchema(),
           right_src_->EmitExecutor(ctx), right_src_->GetSchema(),
           residual_note_, kind_);

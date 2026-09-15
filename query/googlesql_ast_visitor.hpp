@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "common/status_or.hpp"
+#include "expression/expression.hpp"
 
 namespace tinylamb {
 
@@ -37,6 +38,14 @@ class GoogleSqlAstVisitor {
   static StatusOr<std::unique_ptr<Statement>> Visit(
       const GoogleSqlAstNode& root, std::string_view source = {});
 };
+
+// True when an expression needs the relational interpreter's evaluation
+// scope (subqueries, window functions, general function calls, nested-field
+// paths, ...). Shared by the visitor's Phase 8 routing marks and the
+// engine's post-rewrite routing re-check, which must apply the identical
+// rule to the rewritten statement.
+bool NeedsRelationalEvaluation(const Expression& expression,
+                               bool top_level = true);
 
 }  // namespace tinylamb
 

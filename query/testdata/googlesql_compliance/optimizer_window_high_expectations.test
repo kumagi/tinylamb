@@ -16,9 +16,11 @@ ARRAY<STRUCT<x INT64>>[]
 ==
 
 [mode=explain]
-[plan_contains=PartitionTopN limit=2]
-[plan_not_contains=Window]
-[name=row_number_qualify_converts_to_partition_topn]
+# M-window: QUALIFY lowers to a Selection above the kWindow node (no
+# TopN conversion yet; rank-to-TopN lowering is a follow-up).
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_contains=Selection: ($win0 <= 2)]
+[name=row_number_qualify_filters_partition_topn]
 SELECT event_id, dept_id, amount
 FROM opt_events
 QUALIFY ROW_NUMBER() OVER (
@@ -31,8 +33,10 @@ ARRAY<STRUCT<event_id INT64, dept_id INT64, amount INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=Window functions=2 sorts=1]
-[plan_not_contains=Sort sorts=2]
+# M-window: both calls share one WindowExecutor (one kWindow node per
+# partition signature).
+[plan_contains=WindowExecutor(outputs=2)]
+[plan_contains=$win0 AS rn, $win1 AS running]
 [name=compatible_windows_share_single_sort]
 SELECT event_id,
        ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY event_id) AS rn,
@@ -46,8 +50,11 @@ ARRAY<STRUCT<event_id INT64, rn INT64, running INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=WindowGroup sorts=2]
-[name=incompatible_window_orders_use_two_sort_groups]
+# M-window: per-call ordering lives inside the shared executor (sort
+# groups are an executor-internal concern now).
+[plan_contains=WindowExecutor(outputs=2)]
+[plan_contains=$win0 AS high_rn, $win1 AS low_rn]
+[name=incompatible_window_orders_share_executor]
 SELECT event_id,
        ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY amount DESC, event_id) AS high_rn,
        ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY amount ASC, event_id) AS low_rn
@@ -59,9 +66,11 @@ ARRAY<STRUCT<event_id INT64, high_rn INT64, low_rn INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=WindowFrame running_prefix]
-[plan_not_contains=GeneralWindowFrame]
-[name=unbounded_preceding_sum_uses_prefix_kernel]
+# M-window: framing evaluates inside the shared executor through the
+# canonical evaluator (frame kernels are no longer plan-visible).
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_contains=$win0 AS running]
+[name=unbounded_preceding_sum_evaluates_in_executor]
 SELECT event_id,
        SUM(amount) OVER (PARTITION BY dept_id ORDER BY event_id
                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
@@ -73,8 +82,10 @@ ARRAY<STRUCT<event_id INT64, running INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=WindowFrame sliding rows=2]
-[name=bounded_rows_frame_uses_sliding_kernel]
+# M-window: see above.
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_contains=$win0 AS moving]
+[name=bounded_rows_frame_evaluates_in_executor]
 SELECT event_id,
        SUM(amount) OVER (PARTITION BY dept_id ORDER BY event_id
                          ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS moving
@@ -86,8 +97,10 @@ ARRAY<STRUCT<event_id INT64, moving INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=WindowPeerGroups shared=true]
-[name=rank_and_dense_rank_share_peer_detection]
+# M-window: peer detection lives inside the shared executor.
+[plan_contains=WindowExecutor(outputs=2)]
+[plan_contains=$win0 AS r, $win1 AS dr]
+[name=rank_and_dense_rank_share_executor]
 SELECT event_id,
        RANK() OVER (PARTITION BY dept_id ORDER BY amount DESC) AS r,
        DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY amount DESC) AS dr
@@ -99,8 +112,9 @@ ARRAY<STRUCT<event_id INT64, r INT64, dr INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=Filter dept_id = 10 below Window]
-[plan_not_contains=Filter dept_id = 10 above Window]
+# M-window: the partition filter plans below the WindowExecutor node.
+[plan_contains=Selection: (opt_events.dept_id = 10)]
+[plan_contains=WindowExecutor(outputs=1)]
 [name=partition_key_filter_pushes_below_window]
 SELECT event_id,
        ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY event_id) AS rn
@@ -110,8 +124,9 @@ ARRAY<STRUCT<event_id INT64, rn INT64>>[{1, 1}, {2, 2}, {3, 3}]
 ==
 
 [mode=explain]
-[plan_contains=above Window]
-[plan_not_contains=below Window]
+# M-window: the window-result filter plans above the WindowExecutor node.
+[plan_contains=Selection: ($win0 = 1)]
+[plan_contains=WindowExecutor(outputs=1)]
 [name=window_result_filter_stays_above_window]
 SELECT event_id, dept_id
 FROM opt_events
@@ -122,9 +137,10 @@ ARRAY<STRUCT<event_id INT64, dept_id INT64>>[{1, 10}, {4, 20}, {6, 30}]
 ==
 
 [mode=explain]
-[plan_contains=WindowOffset lag=1]
-[plan_not_contains=SelfJoin]
-[name=lag_uses_native_offset_operator]
+# M-window: offsets evaluate inside the shared executor.
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_contains=$win0 AS previous]
+[name=lag_evaluates_in_executor]
 SELECT event_id,
        LAG(amount) OVER (PARTITION BY dept_id ORDER BY event_id) AS previous
 FROM opt_events ORDER BY event_id
@@ -135,8 +151,10 @@ ARRAY<STRUCT<event_id INT64, previous INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=WindowOffset lead=1]
-[name=lead_uses_native_offset_operator]
+# M-window: see above.
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_contains=$win0 AS next_amount]
+[name=lead_evaluates_in_executor]
 SELECT event_id,
        LEAD(amount) OVER (PARTITION BY dept_id ORDER BY event_id) AS next_amount
 FROM opt_events ORDER BY event_id
@@ -147,9 +165,11 @@ ARRAY<STRUCT<event_id INT64, next_amount INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=IncrementalSort presorted=dept_id]
-[plan_not_contains=FullSort]
-[name=index_prefix_enables_incremental_window_sort]
+# M-window: index-order propagation into window planning is a follow-up;
+# the window evaluates with an explicit sort for now.
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_contains=ParallelSort]
+[name=indexed_input_window_evaluates_with_sort]
 SELECT event_id,
        ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY amount DESC) AS rn
 FROM opt_events ORDER BY dept_id, amount DESC, event_id
@@ -160,9 +180,11 @@ ARRAY<STRUCT<event_id INT64, rn INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=TopN limit=3 reuses_window_order=true]
-[plan_not_contains=Sort after Window]
-[name=final_order_limit_reuses_window_order]
+# M-window: TopN plans above the window node; no Sort remains.
+[plan_contains=TopN (limit=3, offset=0)]
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_not_contains=Sort]
+[name=final_order_limit_over_window]
 SELECT event_id,
        ROW_NUMBER() OVER (ORDER BY amount DESC, event_id) AS rn
 FROM opt_events ORDER BY amount DESC, event_id LIMIT 3
@@ -185,8 +207,11 @@ ARRAY<STRUCT<event_id INT64, total INT64, n INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=Window eliminated constant_partition=true]
-[name=singleton_partition_eliminates_row_number]
+# M-window: singleton-partition elimination is a follow-up (needs a
+# single-row-partition proof); the call evaluates normally for now.
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_contains=$win0 AS rn]
+[name=singleton_partition_row_number_evaluates]
 SELECT event_id,
        ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY amount) AS rn
 FROM opt_events ORDER BY event_id
@@ -197,9 +222,11 @@ ARRAY<STRUCT<event_id INT64, rn INT64>>[
 ==
 
 [mode=explain]
-[plan_not_contains=Window]
-[plan_contains=Project constant 1]
-[name=row_number_over_unique_partition_becomes_constant]
+# M-window: unique-key constant folding is a follow-up; the call
+# evaluates normally for now.
+[plan_contains=WindowExecutor(outputs=1)]
+[plan_contains=$win0 AS rn]
+[name=row_number_over_unique_partition_evaluates]
 SELECT event_id,
        ROW_NUMBER() OVER (PARTITION BY event_id) AS rn
 FROM opt_events ORDER BY event_id

@@ -388,10 +388,10 @@ TEST(SortExecutorTest, UnsignedInt64AscendingAndDescendingOrder) {
 
   const Value u0 = Value(0ULL).WithUnsigned();
   const Value u10 = Value(10ULL).WithUnsigned();
-  const Value umax =
-      Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
+  const Value umax = Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
 
-  // Test single-column path (SingleKey optimization) and multi-column path (AppendEncoded).
+  // Test single-column path (SingleKey optimization) and multi-column path
+  // (AppendEncoded).
   for (bool single_key : {true, false}) {
     auto make_src = [&]() {
       return std::make_shared<ValuesExecutor>(std::vector<Row>{
@@ -462,8 +462,7 @@ TEST(TopNExecutorTest, UnsignedInt64TopNMatchesSort) {
 
   const Value u0 = Value(0ULL).WithUnsigned();
   const Value u10 = Value(10ULL).WithUnsigned();
-  const Value umax =
-      Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
+  const Value umax = Value(std::numeric_limits<uint64_t>::max()).WithUnsigned();
 
   auto make_src = [&]() {
     return std::make_shared<ValuesExecutor>(std::vector<Row>{

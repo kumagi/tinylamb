@@ -31,7 +31,9 @@
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <sstream>
 #include <stdexcept>
@@ -68,6 +70,40 @@ bool RecoveryTraceEnabled() {
 
 // Garbage bytes must fail parsing (and trigger tail truncation) instead of
 // decoding into an undefined LogType that Release builds silently accept.
+// A kCompensateX record proves that an earlier recovery pass already undid
+// an operation of type X (never X itself, and only at a LOWER LSN). Maps a
+// compensating record back to the operation type it closes.
+std::optional<LogType> CompensatedOpType(LogType type) {
+  switch (type) {
+    case LogType::kCompensateInsertRow:
+      return LogType::kInsertRow;
+    case LogType::kCompensateInsertLeaf:
+      return LogType::kInsertLeaf;
+    case LogType::kCompensateInsertBranch:
+      return LogType::kInsertBranch;
+    case LogType::kCompensateUpdateRow:
+      return LogType::kUpdateRow;
+    case LogType::kCompensateUpdateLeaf:
+      return LogType::kUpdateLeaf;
+    case LogType::kCompensateUpdateBranch:
+      return LogType::kUpdateBranch;
+    case LogType::kCompensateDeleteRow:
+      return LogType::kDeleteRow;
+    case LogType::kCompensateDeleteLeaf:
+      return LogType::kDeleteLeaf;
+    case LogType::kCompensateDeleteBranch:
+      return LogType::kDeleteBranch;
+    case LogType::kCompensateSetLowFence:
+      return LogType::kSetLowFence;
+    case LogType::kCompensateSetHighFence:
+      return LogType::kSetHighFence;
+    case LogType::kCompensateSetFoster:
+      return LogType::kSetFoster;
+    default:
+      return std::nullopt;
+  }
+}
+
 bool IsKnownLogType(LogType type) {
   switch (type) {
     case LogType::kUnknown:
@@ -441,11 +477,40 @@ Status PageReplay(PageRef&& target,
   }
 
   // Undo phase.
+  // A kCompensate* record in the redo window proves that the ORIGINAL
+  // operation was already undone by an earlier recovery pass. Undoing it a
+  // second time is only idempotent while the page state has not moved on;
+  // when a LATER committed transaction legitimately wrote the same key/slot
+  // again, replaying the stale undo deletes the fresh value (fuzz-found: a
+  // re-inserted key vanished after the second crash). Scan backwards and
+  // remember exactly which (txn, slot/key) operations were compensated.
+  std::map<std::pair<txn_id_t, std::string>, int> compensated_ops;
   for (const auto& log : std::ranges::reverse_view(logs)) {
     const LogRecord& undo_log = log.second;
     const auto it = committed_txn.find(undo_log.txn_id);
     assert(undo_log.pid == target->PageID());
+    const std::optional<LogType> closes = CompensatedOpType(undo_log.type);
+    const LogType match_type = closes.value_or(undo_log.type);
+    const std::string op_id = undo_log.HasSlot()
+                                  ? "s" + std::to_string(undo_log.slot)
+                                  : "k" + undo_log.key;
+    const std::pair<txn_id_t, std::string> op_key{
+        undo_log.txn_id, std::to_string(static_cast<int>(match_type)) + op_id};
+    if (closes.has_value()) {
+      // A compensating record closes the most recent still-open matching
+      // operation of this transaction on this page (it can only refer to a
+      // LOWER LSN, which the backward scan has not visited yet).
+      ++compensated_ops[op_key];
+      continue;
+    }
     if (it == committed_txn.end()) {
+      auto done_it = compensated_ops.find(op_key);
+      if (done_it != compensated_ops.end() && done_it->second > 0) {
+        // Already undone by a previous recovery pass (matching CLR found at
+        // a newer LSN); skipping is also what makes redo/undo safe to re-run.
+        --done_it->second;
+        continue;
+      }
       if (RecoveryTraceEnabled()) {
         LOG(INFO) << "undo: " << undo_log;
       }
@@ -649,7 +714,7 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
                  << " unparsable bytes). Restart with --force to truncate "
                  << "the damaged tail and recover its intact prefix.";
     }
-    if (read_fd_ < 0) {
+    if (ReadFdSnapshot() < 0 && !OpenReadFd()) {
       LOG(ERROR) << "Log file unreadable, skipping recovery";
       return Status::kSuccess;
     }
@@ -694,6 +759,10 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
   // while per-page records survive; without re-deriving it here the allocator
   // would re-issue live page ids and a later AllocateNewPage would wipe one.
   page_id_t max_seen_pid = 0;
+  // Highest txn id the WAL ever used.  The TransactionManager counter is
+  // not WAL'd, so without re-deriving it a restart would re-issue ids that
+  // old kCommit records already vouch for, hiding new losers from undo.
+  txn_id_t max_seen_txn = 0;
   {
     lsn_t offset = checkpoint_lsn;
     LogRecord log;
@@ -710,6 +779,7 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
       if (log.type != LogType::kEndCheckpoint &&
           log.type != LogType::kBeginCheckpoint) {
         txn_last_lsn[log.txn_id] = offset;
+        max_seen_txn = std::max(max_seen_txn, log.txn_id);
       }
       if (IsPageManipulation(log.type)) {
         // Collect the oldest LSN to dirty_page_table.
@@ -728,6 +798,7 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
           max_seen_pid = std::max(max_seen_pid, dpt.first);
         }
         for (const auto& at : log.active_transaction_table) {
+          max_seen_txn = std::max(max_seen_txn, at.txn_id);
           if (at.status == TransactionStatus::kCommitted) {
             committed_txn.insert(at.txn_id);
           } else if (at.status == TransactionStatus::kRunning &&
@@ -743,6 +814,12 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     for (const auto& d : dirty_page_table) {
       redo_start_point = std::min(redo_start_point, d.second);
     }
+  }
+
+  // Resume the id counter above every id the WAL still remembers; see
+  // TransactionManager::SeedNextTransactionId.
+  if (tm != nullptr && max_seen_txn != std::numeric_limits<txn_id_t>::max()) {
+    tm->SeedNextTransactionId(max_seen_txn + 1);
   }
 
   // Loser chain heads: newest LSN of every transaction without a commit
@@ -896,7 +973,10 @@ int RecoveryManager::ReadFdSnapshot() const {
 
 bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
   dst->Clear();
-  if (read_fd_ < 0 && !OpenReadFd()) {
+  // read_fd_ must be read under read_fd_mutex_ (see OpenReadFd): ReadLog runs
+  // concurrently with other Abort() walks, and this unlocked check raced the
+  // fd assignment inside OpenReadFd.
+  if (ReadFdSnapshot() < 0 && !OpenReadFd()) {
     return false;
   }
   // Take a local snapshot of the descriptor: ReadLog runs concurrently with

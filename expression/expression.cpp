@@ -35,8 +35,10 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/lambda_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "type/column_name.hpp"
 #include "type/value.hpp"
 
@@ -92,6 +94,15 @@ const ArrayExpression& ExpressionBase::AsArrayExpression() const {
 
 const CastExpression& ExpressionBase::AsCastExpression() const {
   return dynamic_cast<const CastExpression&>(*this);
+}
+
+const WindowFunctionCallExpression&
+ExpressionBase::AsWindowFunctionCallExpression() const {
+  return dynamic_cast<const WindowFunctionCallExpression&>(*this);
+}
+
+const LambdaExpression& ExpressionBase::AsLambdaExpression() const {
+  return dynamic_cast<const LambdaExpression&>(*this);
 }
 
 std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {

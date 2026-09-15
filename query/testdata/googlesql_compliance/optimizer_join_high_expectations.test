@@ -105,9 +105,13 @@ ARRAY<STRUCT<customer_id INT64, region_id INT64>>[
 ]
 ==
 
+# M6: the null-rejecting WHERE still collapses the LEFT join to an inner
+# join (statement-level reduction), but the reduced query now plans through
+# Cascades (PartitionedHashJoin) instead of the relational fallback.
 [mode=explain]
-[plan_contains=HashJoin type=inner]
+[plan_contains=HashJoin]
 [plan_not_contains=type=left]
+[plan_not_contains=LeftHashJoin]
 [name=null_rejecting_where_reduces_left_join_to_inner]
 SELECT c.customer_id, o.order_id
 FROM opt_customers c LEFT JOIN opt_orders o
@@ -120,9 +124,12 @@ ARRAY<STRUCT<customer_id INT64, order_id INT64>>[
 ]
 ==
 
+# M6: the null-accepting WHERE keeps the LEFT join, planned as a Cascades
+# LeftHashJoin (relational vocabulary "type=left" no longer appears).
 [mode=explain]
-[plan_contains=type=left]
+[plan_contains=LeftHashJoin]
 [plan_not_contains=type=inner]
+[plan_not_contains=PartitionedHashJoin]
 [name=null_accepting_where_preserves_left_join]
 SELECT c.customer_id, o.order_id
 FROM opt_customers c LEFT JOIN opt_orders o

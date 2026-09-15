@@ -33,4 +33,4 @@ When a higher-level component needs to access a page, it goes through the follow
    - If it is, the page is pinned, and a `PageRef` is returned.
    - If not, the `PagePool` finds a free frame in the cache (evicting a page if necessary), reads the page from disk into the frame, pins it, and then returns a `PageRef`.
 4. The client then uses the `PageRef` to safely access and modify the page's content.
-5. When the `PageRef` is destroyed, the page is automatically unpinned in the `PagePool`, and if it was modified (marked as "dirty"), it will be scheduled to be written back to disk.
+5. When the `PageRef` is destroyed, the page is automatically unpinned and unlatched in the `PagePool`. Unpinning itself does **not** write the page back: dirty pages reach disk when they are evicted (write-back through the WAL durability gate) or when the pool shuts down. There is no per-page dirty flag — at read time a stored checksum distinguishes a clean page image from one that needs a write-back.

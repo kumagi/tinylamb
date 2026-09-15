@@ -232,6 +232,9 @@ class Transaction final {
 
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.
+  // Note this waits only until the transaction's records are WRITTEN to the
+  // WAL (CommittedLSN), not fsynced — it is a visibility barrier, not a
+  // durability barrier; use Logger::WaitForDurable for the latter.
   void CommitWait() const;
 
   PageManager* GetPageManager() {

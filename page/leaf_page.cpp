@@ -78,7 +78,14 @@ Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
   }
 
   InsertImpl(key, value);
-  RETURN_IF_FAIL(txn.InsertLeafLog(page_id, key, value).GetStatus());
+  Status append = txn.InsertLeafLog(page_id, key, value).GetStatus();
+  if (append != Status::kSuccess) {
+    // WAL append failed: no CLR will compensate this insert, so remove the
+    // key again (DeleteImpl is an idempotent no-op-safe delete) instead of
+    // serving a phantom index entry after the abort.
+    DeleteImpl(key);
+    return append;
+  }
   return Status::kSuccess;
 }
 
@@ -87,9 +94,10 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   // guards, so a wrapped bin_size_t sum would drive the writes below past the
   // page body.
   const size_t physical_size = SerializeSize(key) + SerializeSize(value);
-  assert(physical_size + sizeof(RowPointer) <= free_size_);
-  assert(physical_size <= std::numeric_limits<bin_size_t>::max());
-  if (physical_size > std::numeric_limits<bin_size_t>::max()) {
+  if (physical_size > std::numeric_limits<bin_size_t>::max() ||
+      physical_size + sizeof(RowPointer) > free_size_) {
+    // The Insert() admission checks make this unreachable; redo with a
+    // corrupt image must refuse instead of underflowing the counters.
     LOG(ERROR) << "InsertImpl: oversized payload (" << physical_size
                << " bytes) rejected";
     return;
@@ -110,7 +118,13 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   if (free_ptr_ <= (sizeof(RowPointer) * (row_count_ + 1)) + physical_size) {
     DeFragment();
   }
-  assert((sizeof(RowPointer) * (row_count_ + 1)) + physical_size <= free_ptr_);
+  if ((sizeof(RowPointer) * (row_count_ + 1)) + physical_size > free_ptr_) {
+    // Same corruption backstop as above: even a full compaction could not
+    // make room, so refuse instead of writing past the slot array.
+    LOG(ERROR) << "InsertImpl: insufficient space for payload ("
+               << physical_size << " bytes) rejected";
+    return;
+  }
   free_size_ -= static_cast<bin_size_t>(physical_size + sizeof(RowPointer));
   free_ptr_ -= static_cast<bin_size_t>(physical_size);
 
@@ -561,7 +575,7 @@ Status LeafPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
     std::string next_foster_key(right.GetKey(1));
     COERCE(right.Delete(txn, move_key));
     COERCE(
-        this_page->SetFoster(txn, FosterPair(next_foster_key, right.PageID())))
+        this_page->SetFoster(txn, FosterPair(next_foster_key, right.PageID())));
     COERCE(right.SetLowFence(txn, IndexKey(move_key)));
     return Status::kSuccess;
   }

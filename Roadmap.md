@@ -141,16 +141,16 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 
 
 #### 1.7 Date & Time Functions
-- [ ] `CURRENT_DATE([timezone])`
-- [ ] `CURRENT_TIMESTAMP()`
-- [ ] `DATE(year, month, day)` constructor
-- [ ] `DATE_ADD(date, INTERVAL n unit)`
-- [ ] `DATE_SUB(date, INTERVAL n unit)`
-- [ ] `DATE_DIFF(date1, date2, unit)`
-- [ ] `DATE_TRUNC(date, unit)`
-- [ ] `EXTRACT(part FROM date_or_timestamp)` for `YEAR`, `MONTH`, `DAY`, `DAYOFWEEK`, `DAYOFYEAR`, `QUARTER`, `HOUR`, `MINUTE`, `SECOND`
-- [ ] `FORMAT_DATE(format_string, date)`
-- [ ] `PARSE_DATE(format_string, date_string)`
+- [x] `CURRENT_DATE([timezone])`
+- [x] `CURRENT_TIMESTAMP()`
+- [x] `DATE(year, month, day)` constructor
+- [x] `DATE_ADD(date, INTERVAL n unit)`
+- [x] `DATE_SUB(date, INTERVAL n unit)`
+- [x] `DATE_DIFF(date1, date2, unit)`
+- [x] `DATE_TRUNC(date, unit)`
+- [x] `EXTRACT(part FROM date_or_timestamp)` for `YEAR`, `MONTH`, `DAY`, `DAYOFWEEK`, `DAYOFYEAR`, `QUARTER`, `HOUR`, `MINUTE`, `SECOND`
+- [x] `FORMAT_DATE(format_string, date)`
+- [x] `PARSE_DATE(format_string, date_string)`
 
 ---
 
@@ -215,8 +215,8 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 
 #### 3.5 UNNEST Operator & Relational Flattening
 - [ ] AST translation for `FROM UNNEST(array_expr) [AS alias]`
-- [ ] `UnnestPlan` relational plan node in `plan/`
-- [ ] `UnnestExecutor` physical iterator in `executor/`
+- [x] `UnnestPlan` relational plan node in `plan/`
+- [x] `UnnestExecutor` physical iterator in `executor/`
 - [ ] `WITH OFFSET [AS offset_alias]` support in `UNNEST`
 - [ ] Lateral/Correlated join with `UNNEST`: `FROM table t, UNNEST(t.array_col) a`
 - [ ] `LEFT JOIN UNNEST(...) ON ...` outer unnesting semantics
@@ -231,14 +231,14 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 ### [ ] Phase 4: Set Operations, Advanced Subqueries & Query Scoping
 
 #### 4.1 Set Operations
-- [ ] `UNION ALL` with type coercion across multiple branches
-- [ ] `UNION DISTINCT` with duplicate elimination
-- [ ] `INTERSECT DISTINCT` relational operator and executor
-- [ ] `INTERSECT ALL` relational operator and executor
-- [ ] `EXCEPT DISTINCT` relational operator and executor
-- [ ] `EXCEPT ALL` relational operator and executor
-- [ ] `CORRESPONDING` column-name matching for set operations
-- [ ] Parenthesized set operation subtrees: `(SELECT ...) UNION ALL (SELECT ...)`
+- [x] `UNION ALL` with type coercion across multiple branches
+- [x] `UNION DISTINCT` with duplicate elimination
+- [x] `INTERSECT DISTINCT` relational operator and executor
+- [x] `INTERSECT ALL` relational operator and executor
+- [x] `EXCEPT DISTINCT` relational operator and executor
+- [x] `EXCEPT ALL` relational operator and executor
+- [x] `CORRESPONDING` column-name matching for set operations
+- [x] Parenthesized set operation subtrees: `(SELECT ...) UNION ALL (SELECT ...)`
 
 #### 4.2 Advanced CTE (`WITH`) Scoping & Recursion
 - [ ] Multi-statement CTE resolution (`WITH q1 AS (...), q2 AS (...) SELECT ...`)
@@ -261,35 +261,35 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 ### [ ] Phase 5: Analytic & Window Functions
 
 #### 5.1 Window Execution Infrastructure
-- [ ] Window specification AST node (`PARTITION BY`, `ORDER BY`, frame clauses)
-- [ ] `WindowPlan` logical plan node in `plan/`
-- [ ] `WindowExecutor` streaming/partition-buffered physical operator in `executor/`
-- [ ] Frame specification parser: `ROWS BETWEEN ... AND ...`
-- [ ] Frame specification parser: `RANGE BETWEEN ... AND ...`
-- [ ] Frame bounds: `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING`
+- [x] Window specification AST node (`PARTITION BY`, `ORDER BY`, frame clauses)
+- [x] `WindowPlan` logical plan node in `plan/`
+- [x] `WindowExecutor` streaming/partition-buffered physical operator in `executor/`
+- [x] Frame specification parser: `ROWS BETWEEN ... AND ...`
+- [x] Frame specification parser: `RANGE BETWEEN ... AND ...`
+- [x] Frame bounds: `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING`
 
 #### 5.2 Ranking & Distribution Functions
-- [ ] `ROW_NUMBER() OVER (...)`
-- [ ] `RANK() OVER (...)`
-- [ ] `DENSE_RANK() OVER (...)`
-- [ ] `PERCENT_RANK() OVER (...)`
-- [ ] `CUME_DIST() OVER (...)`
-- [ ] `NTILE(num_buckets) OVER (...)`
+- [x] `ROW_NUMBER() OVER (...)`
+- [x] `RANK() OVER (...)`
+- [x] `DENSE_RANK() OVER (...)`
+- [x] `PERCENT_RANK() OVER (...)`
+- [x] `CUME_DIST() OVER (...)`
+- [x] `NTILE(num_buckets) OVER (...)`
 
 #### 5.3 Value & Navigation Window Functions
-- [ ] `LEAD(expr[, offset[, default_expr]]) OVER (...)`
-- [ ] `LAG(expr[, offset[, default_expr]]) OVER (...)`
-- [ ] `FIRST_VALUE(expr) OVER (...)`
-- [ ] `LAST_VALUE(expr) OVER (...)`
-- [ ] `NTH_VALUE(expr, n) OVER (...)`
-- [ ] `NULLS FIRST` / `NULLS LAST` ordering modifier in window definitions
+- [x] `LEAD(expr[, offset[, default_expr]]) OVER (...)`
+- [x] `LAG(expr[, offset[, default_expr]]) OVER (...)`
+- [x] `FIRST_VALUE(expr) OVER (...)`
+- [x] `LAST_VALUE(expr) OVER (...)`
+- [x] `NTH_VALUE(expr, n) OVER (...)`
+- [x] `NULLS FIRST` / `NULLS LAST` ordering modifier in window definitions
 
 #### 5.4 Windowed Aggregates
-- [ ] `SUM(expr) OVER (...)` sliding / expanding frame evaluation
-- [ ] `COUNT(*) OVER (...)` and `COUNT(expr) OVER (...)`
-- [ ] `AVG(expr) OVER (...)`
-- [ ] `MIN(expr) OVER (...)`
-- [ ] `MAX(expr) OVER (...)`
+- [x] `SUM(expr) OVER (...)` sliding / expanding frame evaluation
+- [x] `COUNT(*) OVER (...)` and `COUNT(expr) OVER (...)`
+- [x] `AVG(expr) OVER (...)`
+- [x] `MIN(expr) OVER (...)`
+- [x] `MAX(expr) OVER (...)`
 
 ---
 

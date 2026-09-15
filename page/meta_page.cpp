@@ -33,29 +33,28 @@
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
-StatusOr<PageRef> MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
-                                            PageType new_page_type) {
-  page_id_t new_page_id = 0;
-  ASSIGN_OR_RETURN(PageRef, ret, [&]() -> StatusOr<PageRef> {
-    if (first_free_page == 0) {
-      // Reserve nothing before the load succeeds: a failing GetPage must not
-      // permanently advance max_page_count (that would strand a page-id
-      // hole).
-      const page_id_t candidate = max_page_count + 1;
-      ASSIGN_OR_RETURN(PageRef, page, pool.GetPage(candidate, nullptr));
-      new_page_id = candidate;
-      max_page_count = candidate;
-      return page;
-    }
-    new_page_id = first_free_page;
-    ASSIGN_OR_RETURN(PageRef, page, pool.GetPage(new_page_id, nullptr));
-    first_free_page = page.GetFreePage().next_free_page;
-    return page;
-  }());
-  RETURN_IF_FAIL(txn.AllocatePageLog(new_page_id, new_page_type).GetStatus());
-  ret->PageInit(new_page_id, new_page_type);
+page_id_t MetaPage::PeekAllocationCandidate() const {
+  return first_free_page == 0 ? max_page_count + 1 : first_free_page;
+}
 
-  return ret;
+bool MetaPage::AllocateCandidate(page_id_t candidate, Page* candidate_page) {
+  // Revalidates the choice made by PeekAllocationCandidate: another
+  // allocator may have moved the head or advanced max_page_count while the
+  // meta latch was released between the two phases (see
+  // PageManager::AllocateNewPage for why the latch must not span the
+  // candidate GetPage).
+  if (first_free_page == 0) {
+    if (max_page_count + 1 != candidate) {
+      return false;
+    }
+    max_page_count = candidate;
+    return true;
+  }
+  if (first_free_page != candidate) {
+    return false;
+  }
+  first_free_page = candidate_page->body.free_page.next_free_page;
+  return true;
 }
 
 // Precondition: latch of page is taken by txn.
@@ -92,14 +91,32 @@ Status MetaPage::DestroyPage(Transaction& txn, Page* target) {
     old_body.assign(reinterpret_cast<const char*>(&target->body),
                     kPageBodySize);
   }
+  const lsn_t old_page_lsn = target->PageLSN();
+  const lsn_t old_rec_lsn = target->RecoveryLSN();
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageID() == free_page_id);
   FreePage& free_page = target->body.free_page;
   // Add the free page to the free page chain.
+  const page_id_t old_first_free_page = first_free_page;
   free_page.next_free_page = first_free_page;
   first_free_page = free_page_id;
-  RETURN_IF_FAIL(txn.DestroyPageLog(free_page_id, old_type, std::move(old_body))
-                     .GetStatus());
+  Status append =
+      txn.DestroyPageLog(free_page_id, old_type, old_body).GetStatus();
+  if (append != Status::kSuccess) {
+    // WAL append failed: no CLR will compensate, so undo the in-memory
+    // destroy (free-list head, body image, stamps) instead of leaving an
+    // unlogged free page the allocator could re-issue after the abort.
+    first_free_page = old_first_free_page;
+    target->PageInit(free_page_id, old_type);
+    if (has_content) {
+      std::memcpy(
+          &target->body, old_body.data(),
+          std::min(old_body.size(), static_cast<size_t>(kPageBodySize)));
+    }
+    target->SetPageLSN(old_page_lsn);
+    target->recovery_lsn = old_rec_lsn;
+    return append;
+  }
   // Stamp the freed image with the destroy record's end LSN.  Without this
   // the PageInit'd page keeps page_lsn == 0, the write-back durability gate
   // (WaitForDurable(0)) is a no-op, and the free-page image can reach disk

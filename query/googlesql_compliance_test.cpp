@@ -518,6 +518,14 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
     std::unique_ptr<SqlEngine>& engine;
     std::unique_ptr<TransactionContext>& context;
     std::unique_ptr<Database>& database;
+    DatabaseCleaner(std::unique_ptr<SqlEngine>& engine_in,
+                    std::unique_ptr<TransactionContext>& context_in,
+                    std::unique_ptr<Database>& database_in)
+        : engine(engine_in), context(context_in), database(database_in) {}
+    DatabaseCleaner(const DatabaseCleaner&) = delete;
+    DatabaseCleaner& operator=(const DatabaseCleaner&) = delete;
+    DatabaseCleaner(DatabaseCleaner&&) = delete;
+    DatabaseCleaner& operator=(DatabaseCleaner&&) = delete;
     ~DatabaseCleaner() {
       engine.reset();
       context.reset();

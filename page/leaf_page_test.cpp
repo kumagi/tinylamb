@@ -693,7 +693,7 @@ TEST_F(LeafPageTest, FosterChild) {
       ASSERT_SUCCESS(page->SetFoster(txn, {}));
       ASSERT_SUCCESS(page->SetFoster(txn, FosterPair()));
       if (auto f = page->GetFoster(txn)) {
-        ASSERT_TRUE(!"never reach here");
+        FAIL() << "never reach here";
       }
       ASSERT_EQ(result.child_pid, i);
     }

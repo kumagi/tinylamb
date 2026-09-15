@@ -695,7 +695,8 @@ TEST(ExpressionTest,
   Expression scalar = QueryExpressionExp(std::shared_ptr<SelectStatement>(),
                                          ColumnValueExp("x"));
 
-  EXPECT_THROW(scalar->Evaluate(row, schema), std::runtime_error);
+  EXPECT_THROW(static_cast<void>(scalar->Evaluate(row, schema)),
+               std::runtime_error);
 
   std::ostringstream oss;
   scalar->Dump(oss);
@@ -727,7 +728,8 @@ TEST(ExpressionTest, AggregateExpression_EvaluateDirectly_ThrowsRuntimeError) {
 
   // The no-exception migration keeps the direct-evaluation misuse observable
   // as a runtime_error through the deprecated Evaluate shim.
-  EXPECT_THROW(count->Evaluate(row, schema), std::runtime_error);
+  EXPECT_THROW(static_cast<void>(count->Evaluate(row, schema)),
+               std::runtime_error);
   EXPECT_EQ(count->ToString(), "COUNT(amount)");
   EXPECT_EQ(AggregateExpressionExp(AggregationType::kCount,
                                    ColumnValueExp("amount"), true)
@@ -1050,9 +1052,10 @@ TEST(ExpressionTest, FunctionCall_CoalesceAndConcat_EvaluatesCorrectly) {
   EXPECT_TRUE(all_null->Evaluate(row, schema).IsNull());
   EXPECT_EQ(concat->Evaluate(row, schema), Value("abc"));
   EXPECT_TRUE(concat_null->Evaluate(row, schema).IsNull());
-  EXPECT_THROW(FunctionCallExp("concat", {ConstantValueExp(Value(1)),
-                                          ConstantValueExp(Value("a"))})
-                   ->Evaluate(row, schema),
+  EXPECT_THROW(static_cast<void>(
+                   FunctionCallExp("concat", {ConstantValueExp(Value(1)),
+                                              ConstantValueExp(Value("a"))})
+                       ->Evaluate(row, schema)),
                std::runtime_error);
 }
 
@@ -1078,18 +1081,20 @@ TEST(ExpressionTest, FunctionCall_Substr_EvaluatesCorrectly) {
   EXPECT_EQ(substr_start_one->Evaluate(row, schema), Value("he"));
   EXPECT_EQ(substr_out_of_range->Evaluate(row, schema), Value(std::string()));
   EXPECT_TRUE(substr_null->Evaluate(row, schema).IsNull());
-  EXPECT_THROW(FunctionCallExp("substr", {ConstantValueExp(Value("hello"))})
-                   ->Evaluate(row, schema),
+  EXPECT_THROW(static_cast<void>(
+                   FunctionCallExp("substr", {ConstantValueExp(Value("hello"))})
+                       ->Evaluate(row, schema)),
                std::runtime_error);
-  EXPECT_THROW(FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
-                                          ConstantValueExp(Value("x"))})
-                   ->Evaluate(row, schema),
+  EXPECT_THROW(static_cast<void>(
+                   FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
+                                              ConstantValueExp(Value("x"))})
+                       ->Evaluate(row, schema)),
                std::runtime_error);
 
   Expression substr_negative_length = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(1)),
                  ConstantValueExp(Value(-1))});
-  EXPECT_THROW(substr_negative_length->Evaluate(row, schema),
+  EXPECT_THROW(static_cast<void>(substr_negative_length->Evaluate(row, schema)),
                std::runtime_error);
   Expression substr_zero_length = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(2)),
@@ -1132,11 +1137,14 @@ TEST(ExpressionTest, FunctionCall_Extract_EvaluatesCorrectly) {
   EXPECT_EQ(month->Evaluate(row, schema), Value(7));
   EXPECT_EQ(day->Evaluate(row, schema), Value(15));
   EXPECT_TRUE(null_extract->Evaluate(row, schema).IsNull());
-  EXPECT_THROW(FunctionCallExp("extract_year", {})->Evaluate(row, schema),
+  EXPECT_THROW(static_cast<void>(
+                   FunctionCallExp("extract_year", {})->Evaluate(row, schema)),
                std::runtime_error);
-  EXPECT_THROW(FunctionCallExp("extract_year", {ConstantValueExp(Value("bad"))})
-                   ->Evaluate(row, schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(
+          FunctionCallExp("extract_year", {ConstantValueExp(Value("bad"))})
+              ->Evaluate(row, schema)),
+      std::runtime_error);
 }
 
 TEST(ExpressionTest,
@@ -1147,11 +1155,12 @@ TEST(ExpressionTest,
   EXPECT_EQ(
       FunctionCallExp("current_timestamp", {})->Evaluate(row, schema).type,
       ValueType::kVarChar);
-  EXPECT_THROW(
-      FunctionCallExp("current_timestamp", {ConstantValueExp(Value(1))})
-          ->Evaluate(row, schema),
-      std::runtime_error);
-  EXPECT_THROW(FunctionCallExp("unknown_func", {})->Evaluate(row, schema),
+  EXPECT_THROW(static_cast<void>(FunctionCallExp("current_timestamp",
+                                                 {ConstantValueExp(Value(1))})
+                                     ->Evaluate(row, schema)),
+               std::runtime_error);
+  EXPECT_THROW(static_cast<void>(
+                   FunctionCallExp("unknown_func", {})->Evaluate(row, schema)),
                std::runtime_error);
   EXPECT_EQ(FunctionCallExp("unknown_func", {})->ToString(), "unknown_func()");
   EXPECT_EQ(FunctionCallExp("COALESCE", {ConstantValueExp(Value(1)),
@@ -1202,13 +1211,15 @@ TEST(ExpressionTest, FunctionCall_DateAddSub_EvaluatesCorrectly) {
             Value("1995-01-01"));
   EXPECT_TRUE(date_add_null->Evaluate(row, schema).IsNull());
   EXPECT_THROW(
-      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
-          ->Evaluate(row, schema),
+      static_cast<void>(
+          FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
+              ->Evaluate(row, schema)),
       std::runtime_error);
   EXPECT_THROW(
-      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
-                                   ConstantValueExp(Value(1))})
-          ->Evaluate(row, schema),
+      static_cast<void>(
+          FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
+                                       ConstantValueExp(Value(1))})
+              ->Evaluate(row, schema)),
       std::runtime_error);
 }
 
@@ -1221,7 +1232,7 @@ TEST(ExpressionTest, ColumnValue_CaseInsensitiveLookup_ResolvesColumn) {
   EXPECT_EQ(ColumnValueExp("name")->Evaluate(row, sc), Value("foo"));
   EXPECT_EQ(ColumnValueExp("SCORE")->Evaluate(row, sc), Value(12));
   EXPECT_EQ(ColumnValueExp("sc.NAME")->Evaluate(row, sc), Value("foo"));
-  EXPECT_THROW(ColumnValueExp("missing")->Evaluate(row, sc),
+  EXPECT_THROW(static_cast<void>(ColumnValueExp("missing")->Evaluate(row, sc)),
                std::runtime_error);
 }
 
@@ -1237,7 +1248,8 @@ TEST(ExpressionTest, ColumnValue_ResultType_InfersCorrectType) {
   EXPECT_EQ(ColumnValueExp("s")->ResultType(sc).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(ColumnValueExp("dt")->ResultType(sc).GetType(), TypeTag::kDate);
   EXPECT_EQ(ColumnValueExp("n")->ResultType(sc).GetType(), TypeTag::kInvalid);
-  EXPECT_THROW(ColumnValueExp("zzz")->ResultType(sc), std::runtime_error);
+  EXPECT_THROW(static_cast<void>(ColumnValueExp("zzz")->ResultType(sc)),
+               std::runtime_error);
 }
 
 TEST(ExpressionTest, ColumnValue_EvaluateWithTwoSchemas_ResolvesCorrectSchema) {
@@ -1252,8 +1264,8 @@ TEST(ExpressionTest, ColumnValue_EvaluateWithTwoSchemas_ResolvesCorrectSchema) {
   EXPECT_EQ(ColumnValueExp("b")->Evaluate(&left_row, left_schema, &right_row,
                                           right_schema),
             Value("two"));
-  EXPECT_THROW(ColumnValueExp("zzz")->Evaluate(&left_row, left_schema,
-                                               &right_row, right_schema),
+  EXPECT_THROW(static_cast<void>(ColumnValueExp("zzz")->Evaluate(
+                   &left_row, left_schema, &right_row, right_schema)),
                std::runtime_error);
   EXPECT_EQ(
       ColumnValueExp("b")->ResultType(left_schema, right_schema).GetType(),
@@ -1261,7 +1273,8 @@ TEST(ExpressionTest, ColumnValue_EvaluateWithTwoSchemas_ResolvesCorrectSchema) {
   EXPECT_EQ(
       ColumnValueExp("a")->ResultType(left_schema, right_schema).GetType(),
       TypeTag::kBigInt);
-  EXPECT_THROW(ColumnValueExp("zzz")->ResultType(left_schema, right_schema),
+  EXPECT_THROW(static_cast<void>(ColumnValueExp("zzz")->ResultType(
+                   left_schema, right_schema)),
                std::runtime_error);
 }
 
@@ -1292,26 +1305,32 @@ TEST(ExpressionTest,
           ->Evaluate(row, schema)
           .IsNull());
   EXPECT_THROW(
-      UnaryExpressionExp(ConstantValueExp(Value("x")), UnaryOperation::kMinus)
-          ->Evaluate(row, schema),
+      static_cast<void>(UnaryExpressionExp(ConstantValueExp(Value("x")),
+                                           UnaryOperation::kMinus)
+                            ->Evaluate(row, schema)),
       std::runtime_error);
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kMinus, Value(5)), Value(-5));
   EXPECT_DOUBLE_EQ(
       EvaluateUnary(UnaryOperation::kMinus, Value(2.5)).value.double_value,
       -2.5);
   EXPECT_TRUE(EvaluateUnary(UnaryOperation::kMinus, Value()).IsNull());
-  EXPECT_EQ(EvaluateUnary(UnaryOperation::kMinus, Value(static_cast<uint64_t>(0)).WithUnsigned()),
+  EXPECT_EQ(EvaluateUnary(UnaryOperation::kMinus,
+                          Value(static_cast<uint64_t>(0)).WithUnsigned()),
             Value(static_cast<uint64_t>(0)).WithUnsigned());
-  EXPECT_TRUE(EvaluateUnary(UnaryOperation::kMinus, Value(static_cast<uint64_t>(0)).WithUnsigned()).IsUnsigned());
+  EXPECT_TRUE(EvaluateUnary(UnaryOperation::kMinus,
+                            Value(static_cast<uint64_t>(0)).WithUnsigned())
+                  .IsUnsigned());
   EXPECT_THROW(
-      (void)EvaluateUnary(UnaryOperation::kMinus, Value(static_cast<uint64_t>(5)).WithUnsigned()),
+      (void)EvaluateUnary(UnaryOperation::kMinus,
+                          Value(static_cast<uint64_t>(5)).WithUnsigned()),
       std::runtime_error);
-  EXPECT_THROW(
-      (void)EvaluateUnary(UnaryOperation::kMinus, Value(std::numeric_limits<uint64_t>::max()).WithUnsigned()),
-      std::runtime_error);
-  EXPECT_THROW(
-      (void)EvaluateUnary(UnaryOperation::kMinus, Value(std::numeric_limits<int64_t>::min())),
-      std::runtime_error);
+  EXPECT_THROW((void)EvaluateUnary(
+                   UnaryOperation::kMinus,
+                   Value(std::numeric_limits<uint64_t>::max()).WithUnsigned()),
+               std::runtime_error);
+  EXPECT_THROW((void)EvaluateUnary(UnaryOperation::kMinus,
+                                   Value(std::numeric_limits<int64_t>::min())),
+               std::runtime_error);
   EXPECT_TRUE(EvaluateUnary(UnaryOperation::kNot, Value()).IsNull());
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kIsNull, Value(1)), Value(false));
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kIsNotNull, Value()), Value(false));
@@ -1320,20 +1339,16 @@ TEST(ExpressionTest,
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kBitwiseNot, Value(1)), Value(-2));
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kBitwiseNot, Value(-1)), Value(0));
   EXPECT_TRUE(EvaluateUnary(UnaryOperation::kBitwiseNot, Value()).IsNull());
-  EXPECT_EQ(
-      EvaluateUnary(UnaryOperation::kBitwiseNot,
-                    Value(static_cast<uint64_t>(0)).WithUnsigned()),
-      Value(std::numeric_limits<uint64_t>::max()).WithUnsigned());
-  EXPECT_TRUE(
-      EvaluateUnary(UnaryOperation::kBitwiseNot,
-                    Value(static_cast<uint64_t>(0)).WithUnsigned())
-          .IsUnsigned());
-  EXPECT_THROW(
-      (void)EvaluateUnary(UnaryOperation::kBitwiseNot, Value("str")),
-      std::runtime_error);
-  EXPECT_THROW(
-      (void)EvaluateUnary(UnaryOperation::kBitwiseNot, Value(1.5)),
-      std::runtime_error);
+  EXPECT_EQ(EvaluateUnary(UnaryOperation::kBitwiseNot,
+                          Value(static_cast<uint64_t>(0)).WithUnsigned()),
+            Value(std::numeric_limits<uint64_t>::max()).WithUnsigned());
+  EXPECT_TRUE(EvaluateUnary(UnaryOperation::kBitwiseNot,
+                            Value(static_cast<uint64_t>(0)).WithUnsigned())
+                  .IsUnsigned());
+  EXPECT_THROW((void)EvaluateUnary(UnaryOperation::kBitwiseNot, Value("str")),
+               std::runtime_error);
+  EXPECT_THROW((void)EvaluateUnary(UnaryOperation::kBitwiseNot, Value(1.5)),
+               std::runtime_error);
 
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kShiftLeft, Value(1), Value(64)),
             Value(0));
@@ -1463,10 +1478,13 @@ TEST(ExpressionTest, ExpressionBase_DefaultImplementations_ThrowRuntimeError) {
   Row row;
   Schema schema;
 
-  EXPECT_THROW((void)bare.Evaluate(&row, schema, &row, schema),
+  EXPECT_THROW(
+      static_cast<void>((void)bare.Evaluate(&row, schema, &row, schema)),
+      std::runtime_error);
+  EXPECT_THROW(static_cast<void>((void)bare.ResultType(schema)),
                std::runtime_error);
-  EXPECT_THROW((void)bare.ResultType(schema), std::runtime_error);
-  EXPECT_THROW((void)bare.ResultType(schema, schema), std::runtime_error);
+  EXPECT_THROW(static_cast<void>((void)bare.ResultType(schema, schema)),
+               std::runtime_error);
   EXPECT_EQ(bare.TouchedColumns().size(), 0);
 }
 
@@ -1588,18 +1606,21 @@ TEST(ExpressionTest,
   Schema schema;
 
   EXPECT_THROW(
-      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
-                                   ConstantValueExp(Value(1))})
-          ->Evaluate(&row, schema, &row, schema),
+      static_cast<void>(
+          FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
+                                       ConstantValueExp(Value(1))})
+              ->Evaluate(&row, schema, &row, schema)),
       std::runtime_error);
   EXPECT_THROW(
-      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
-          ->Evaluate(&row, schema, &row, schema),
+      static_cast<void>(
+          FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
+              ->Evaluate(&row, schema, &row, schema)),
       std::runtime_error);
   EXPECT_THROW(
-      FunctionCallExp("date_sub", {ConstantValueExp(Value("1998-12-01")),
-                                   ConstantValueExp(Value(1))})
-          ->Evaluate(&row, schema, &row, schema),
+      static_cast<void>(
+          FunctionCallExp("date_sub", {ConstantValueExp(Value("1998-12-01")),
+                                       ConstantValueExp(Value(1))})
+              ->Evaluate(&row, schema, &row, schema)),
       std::runtime_error);
 }
 
@@ -1795,7 +1816,7 @@ TEST(ExpressionTest, BinaryExpression_SpecialOperations_EvaluatesCorrectly) {
   Expression div_nan =
       BinaryExpressionExp(ConstantValueExp(Value(0.0)),
                           BinaryOperation::kDivide, ConstantValueExp(Value(0)));
-  EXPECT_THROW((void)div_nan->Evaluate(dummy, dummy_schema),
+  EXPECT_THROW(static_cast<void>((void)div_nan->Evaluate(dummy, dummy_schema)),
                std::runtime_error);
 
   Expression div_mixed =
@@ -1818,13 +1839,15 @@ TEST(ExpressionTest, BinaryExpression_SpecialOperations_EvaluatesCorrectly) {
   Expression div_zero_double = BinaryExpressionExp(
       ConstantValueExp(Value(1.0)), BinaryOperation::kDivide,
       ConstantValueExp(Value(0.0)));
-  EXPECT_THROW((void)div_zero_double->Evaluate(dummy, dummy_schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>((void)div_zero_double->Evaluate(dummy, dummy_schema)),
+      std::runtime_error);
 
   Expression div_overflow_double = BinaryExpressionExp(
       ConstantValueExp(Value(std::numeric_limits<double>::max())),
       BinaryOperation::kDivide, ConstantValueExp(Value(1e-300)));
-  EXPECT_THROW((void)div_overflow_double->Evaluate(dummy, dummy_schema),
+  EXPECT_THROW(static_cast<void>(
+                   (void)div_overflow_double->Evaluate(dummy, dummy_schema)),
                std::runtime_error);
 
   Expression and_short =
@@ -1909,7 +1932,8 @@ TEST(ExpressionTest,
 
   Row dummy({});
   Schema dummy_schema;
-  EXPECT_THROW((void)node->Evaluate(dummy, dummy_schema), std::runtime_error);
+  EXPECT_THROW(static_cast<void>((void)node->Evaluate(dummy, dummy_schema)),
+               std::runtime_error);
   EXPECT_EQ(node->TouchedColumns().size(), 4U);
   std::string s = node->ToString();
   EXPECT_NE(s.find("ORDER BY"), std::string::npos);
@@ -2190,17 +2214,17 @@ TEST(ExpressionTest, IsDistinctFromSemantics) {
   EXPECT_EQ(eval(Value::Date("2023-01-01"), BinaryOperation::kIsDistinctFrom,
                  Value("2023-01-01")),
             Value(false));
-  EXPECT_EQ(eval(Value::Date("2023-01-01"),
-                 BinaryOperation::kIsNotDistinctFrom, Value("2023-01-01")),
+  EXPECT_EQ(eval(Value::Date("2023-01-01"), BinaryOperation::kIsNotDistinctFrom,
+                 Value("2023-01-01")),
             Value(true));
   EXPECT_EQ(eval(Value::Date("2023-01-01"), BinaryOperation::kIsDistinctFrom,
                  Value("2023-01-02")),
             Value(true));
 
   // 6. Incompatible types raise error
-  EXPECT_THROW(
-      eval(Value("hello"), BinaryOperation::kIsDistinctFrom, Value(int64_t{123})),
-      std::runtime_error);
+  EXPECT_THROW(eval(Value("hello"), BinaryOperation::kIsDistinctFrom,
+                    Value(int64_t{123})),
+               std::runtime_error);
 }
 
 TEST(ExpressionTest, UnsignedInt64_BinaryOperations) {
@@ -2212,9 +2236,8 @@ TEST(ExpressionTest, UnsignedInt64_BinaryOperations) {
   const Value u10 = Value(int64_t{10}).WithUnsigned();
 
   // Modulo on UINT64
-  auto mod_expr =
-      BinaryExpressionExp(ConstantValueExp(umax), BinaryOperation::kModulo,
-                          ConstantValueExp(u10));
+  auto mod_expr = BinaryExpressionExp(
+      ConstantValueExp(umax), BinaryOperation::kModulo, ConstantValueExp(u10));
   auto mod_res = mod_expr->Evaluate(dummy_row, dummy_schema);
   EXPECT_TRUE(mod_res.IsUnsigned());
   EXPECT_EQ(static_cast<uint64_t>(mod_res.value.int_value), 5ULL);
@@ -2234,8 +2257,8 @@ TEST(ExpressionTest, UnsignedInt64_BinaryOperations) {
   EXPECT_EQ(cmp_gt->Evaluate(dummy_row, dummy_schema), Value(true));
 
   auto cmp_lt =
-      BinaryExpressionExp(ConstantValueExp(Value(0.0)), BinaryOperation::kLessThan,
-                          ConstantValueExp(umax));
+      BinaryExpressionExp(ConstantValueExp(Value(0.0)),
+                          BinaryOperation::kLessThan, ConstantValueExp(umax));
   EXPECT_EQ(cmp_lt->Evaluate(dummy_row, dummy_schema), Value(true));
 
   auto cmp_neg =
@@ -2253,8 +2276,10 @@ TEST(ExpressionTest, CastExpression_UnsignedInt64) {
   const Value u10 = Value(int64_t{10}).WithUnsigned();
 
   // 1. UINT64 -> INT64: umax exceeds INT64_MAX -> throws out of range
-  auto cast_umax_int64 = CastExpressionExp(ConstantValueExp(umax), "INT64", false);
-  EXPECT_THROW((void)cast_umax_int64->Evaluate(dummy_row, dummy_schema),
+  auto cast_umax_int64 =
+      CastExpressionExp(ConstantValueExp(umax), "INT64", false);
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_umax_int64->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
 
   // 2. SAFE_CAST UINT64 -> INT64: umax returns NULL
@@ -2263,20 +2288,24 @@ TEST(ExpressionTest, CastExpression_UnsignedInt64) {
   EXPECT_TRUE(safe_cast_umax_int64->Evaluate(dummy_row, dummy_schema).IsNull());
 
   // 3. UINT64 -> INT64: in-range value converts to signed INT64
-  auto cast_u10_int64 = CastExpressionExp(ConstantValueExp(u10), "INT64", false);
+  auto cast_u10_int64 =
+      CastExpressionExp(ConstantValueExp(u10), "INT64", false);
   Value res_u10_int64 = cast_u10_int64->Evaluate(dummy_row, dummy_schema);
   EXPECT_FALSE(res_u10_int64.IsUnsigned());
   EXPECT_EQ(res_u10_int64.value.int_value, 10LL);
 
   // 4. UINT64 -> INT32: umax throws out of range
-  auto cast_umax_int32 = CastExpressionExp(ConstantValueExp(umax), "INT32", false);
-  EXPECT_THROW((void)cast_umax_int32->Evaluate(dummy_row, dummy_schema),
+  auto cast_umax_int32 =
+      CastExpressionExp(ConstantValueExp(umax), "INT32", false);
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_umax_int32->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
 
   // 5. UINT64 -> UINT32: umax throws out of range
   auto cast_umax_uint32 =
       CastExpressionExp(ConstantValueExp(umax), "UINT32", false);
-  EXPECT_THROW((void)cast_umax_uint32->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_umax_uint32->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
 
   // 6. UINT64 -> DOUBLE: umax converts to positive float >= 1.8e19
@@ -2291,8 +2320,7 @@ TEST(ExpressionTest, CastExpression_UnsignedInt64) {
       CastExpressionExp(ConstantValueExp(umax), "STRING", false);
   Value res_str = cast_umax_str->Evaluate(dummy_row, dummy_schema);
   EXPECT_EQ(res_str.type, ValueType::kVarChar);
-  EXPECT_EQ(std::string(res_str.value.varchar_value),
-            "18446744073709551615");
+  EXPECT_EQ(std::string(res_str.value.varchar_value), "18446744073709551615");
 
   // 8. STRING -> UINT64: dec string >= 2^63 parses accurately into UINT64
   auto cast_str_umax = CastExpressionExp(
@@ -2305,7 +2333,8 @@ TEST(ExpressionTest, CastExpression_UnsignedInt64) {
   // 9. STRING -> UINT64: negative decimal string throws
   auto cast_neg_str_u64 =
       CastExpressionExp(ConstantValueExp(Value("-1")), "UINT64", false);
-  EXPECT_THROW((void)cast_neg_str_u64->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_neg_str_u64->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
 
   // 10. FLOAT -> UINT64: 1e19 (between 2^63 and 2^64-1) converts accurately
@@ -2319,13 +2348,15 @@ TEST(ExpressionTest, CastExpression_UnsignedInt64) {
   // 11. INT64 -> INT8: 300 is out of range
   auto cast_300_int8 =
       CastExpressionExp(ConstantValueExp(Value(int64_t{300})), "INT8", false);
-  EXPECT_THROW((void)cast_300_int8->Evaluate(dummy_row, dummy_schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>((void)cast_300_int8->Evaluate(dummy_row, dummy_schema)),
+      std::runtime_error);
 
   // 12. INT64 -> UINT32: -1 is out of range
   auto cast_neg_uint32 =
       CastExpressionExp(ConstantValueExp(Value(int64_t{-1})), "UINT32", false);
-  EXPECT_THROW((void)cast_neg_uint32->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_neg_uint32->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
 }
 
@@ -2336,15 +2367,17 @@ TEST(ExpressionTest, CastExpression_ValidationAndSafeCast) {
   // 1. Invalid DATETIME strings
   auto cast_bad_dt =
       CastExpressionExp(ConstantValueExp(Value("abc")), "DATETIME", false);
-  EXPECT_THROW((void)cast_bad_dt->Evaluate(dummy_row, dummy_schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>((void)cast_bad_dt->Evaluate(dummy_row, dummy_schema)),
+      std::runtime_error);
   auto safe_cast_bad_dt =
       CastExpressionExp(ConstantValueExp(Value("abc")), "DATETIME", true);
   EXPECT_TRUE(safe_cast_bad_dt->Evaluate(dummy_row, dummy_schema).IsNull());
 
   auto cast_invalid_dt_month = CastExpressionExp(
       ConstantValueExp(Value("2024-13-45 00:00:00")), "DATETIME", false);
-  EXPECT_THROW((void)cast_invalid_dt_month->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>((void)cast_invalid_dt_month->Evaluate(
+                   dummy_row, dummy_schema)),
                std::runtime_error);
   auto safe_cast_invalid_dt_month = CastExpressionExp(
       ConstantValueExp(Value("2024-13-45 00:00:00")), "DATETIME", true);
@@ -2353,7 +2386,8 @@ TEST(ExpressionTest, CastExpression_ValidationAndSafeCast) {
 
   auto cast_invalid_feb30 = CastExpressionExp(
       ConstantValueExp(Value("2024-02-30 00:00:00")), "DATETIME", false);
-  EXPECT_THROW((void)cast_invalid_feb30->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_invalid_feb30->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
 
   auto cast_valid_dt = CastExpressionExp(
@@ -2364,29 +2398,33 @@ TEST(ExpressionTest, CastExpression_ValidationAndSafeCast) {
   // 2. Invalid TIMESTAMP strings
   auto cast_bad_ts =
       CastExpressionExp(ConstantValueExp(Value("abc")), "TIMESTAMP", false);
-  EXPECT_THROW((void)cast_bad_ts->Evaluate(dummy_row, dummy_schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>((void)cast_bad_ts->Evaluate(dummy_row, dummy_schema)),
+      std::runtime_error);
   auto safe_cast_bad_ts =
       CastExpressionExp(ConstantValueExp(Value("abc")), "TIMESTAMP", true);
   EXPECT_TRUE(safe_cast_bad_ts->Evaluate(dummy_row, dummy_schema).IsNull());
 
   auto cast_invalid_ts = CastExpressionExp(
       ConstantValueExp(Value("2024-13-45 00:00:00 UTC")), "TIMESTAMP", false);
-  EXPECT_THROW((void)cast_invalid_ts->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_invalid_ts->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
 
   // 3. Invalid TIME strings
   auto cast_bad_tm =
       CastExpressionExp(ConstantValueExp(Value("abc")), "TIME", false);
-  EXPECT_THROW((void)cast_bad_tm->Evaluate(dummy_row, dummy_schema),
-               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>((void)cast_bad_tm->Evaluate(dummy_row, dummy_schema)),
+      std::runtime_error);
   auto safe_cast_bad_tm =
       CastExpressionExp(ConstantValueExp(Value("abc")), "TIME", true);
   EXPECT_TRUE(safe_cast_bad_tm->Evaluate(dummy_row, dummy_schema).IsNull());
 
   auto cast_invalid_tm_hour =
       CastExpressionExp(ConstantValueExp(Value("25:00:00")), "TIME", false);
-  EXPECT_THROW((void)cast_invalid_tm_hour->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>((void)cast_invalid_tm_hour->Evaluate(
+                   dummy_row, dummy_schema)),
                std::runtime_error);
   auto safe_cast_invalid_tm_hour =
       CastExpressionExp(ConstantValueExp(Value("25:00:00")), "TIME", true);
@@ -2401,7 +2439,8 @@ TEST(ExpressionTest, CastExpression_ValidationAndSafeCast) {
   // 4. Out-of-range INT64 -> DATE
   auto cast_huge_days = CastExpressionExp(
       ConstantValueExp(Value(int64_t{20000000})), "DATE", false);
-  EXPECT_THROW((void)cast_huge_days->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_huge_days->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
   auto safe_cast_huge_days = CastExpressionExp(
       ConstantValueExp(Value(int64_t{20000000})), "DATE", true);
@@ -2416,7 +2455,8 @@ TEST(ExpressionTest, CastExpression_ValidationAndSafeCast) {
   // 5. Overflowing FLOAT32
   auto cast_overflow_f32 =
       CastExpressionExp(ConstantValueExp(Value(1e100)), "FLOAT32", false);
-  EXPECT_THROW((void)cast_overflow_f32->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>(
+                   (void)cast_overflow_f32->Evaluate(dummy_row, dummy_schema)),
                std::runtime_error);
   auto safe_cast_overflow_f32 =
       CastExpressionExp(ConstantValueExp(Value(1e100)), "FLOAT32", true);
@@ -2425,7 +2465,8 @@ TEST(ExpressionTest, CastExpression_ValidationAndSafeCast) {
 
   auto cast_overflow_str_f32 =
       CastExpressionExp(ConstantValueExp(Value("1e100")), "FLOAT32", false);
-  EXPECT_THROW((void)cast_overflow_str_f32->Evaluate(dummy_row, dummy_schema),
+  EXPECT_THROW(static_cast<void>((void)cast_overflow_str_f32->Evaluate(
+                   dummy_row, dummy_schema)),
                std::runtime_error);
   auto safe_cast_overflow_str_f32 =
       CastExpressionExp(ConstantValueExp(Value("1e100")), "FLOAT32", true);

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -52,6 +53,7 @@
 #include "executor/set_operation.hpp"
 #include "executor/skip_scan_distinct.hpp"
 #include "executor/sort.hpp"
+#include "executor/topn.hpp"
 #include "executor/update.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/cast_expression.hpp"
@@ -62,6 +64,7 @@
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/sql_udf.hpp"
+#include "expression/window_function_expression.hpp"
 #include "plan/cascades.hpp"
 #include "plan/group_by_plan.hpp"
 #include "plan/implementation_rules.hpp"
@@ -388,6 +391,241 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
   return found_correlated;
 }
 
+// Post-rewrite routing predicate (M4/M5/M6): whether the CURRENT statement
+// still needs the relational interpreter. The parse-time complex_ flag only
+// ever reflects pre-rewrite shapes (statement rewrites remove derived
+// sources and CTE entries, never add complexity), so this re-examines the
+// statement feature by feature instead of trusting the stale flag:
+// - a statement the flag accepts is accepted here too (rewrites add no
+//   complexity features, so acceptance is preserved);
+// - a flagged statement whose derived/CTE complexity the rewrites eliminated
+//   reaches Cascades only when no other complex feature remains.
+// Anything unrecognized keeps the relational path: the optimizer's
+// kNotImplemented fallback is a safety net, not a routing strategy.
+// NOTE: keep in sync with the visitor's marking rules in
+// googlesql_ast_visitor.cpp (Phase 8 routing) and the pre-gate inside
+// MaterializeCtes — a new mark without a mirror entry here would misroute
+// to Cascades, and a gate there without one here would waste eager
+// execution on a relational fallback.
+namespace {
+
+// True when the expression tree carries a window-function call (never
+// descending into subquery boundaries, whose windows belong to another
+// scope). Local mirror of the optimizer-side check.
+bool ExpressionContainsWindow(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  std::vector<Expression> stack{expression};
+  while (!stack.empty()) {
+    Expression current = std::move(stack.back());
+    stack.pop_back();
+    if (!current) {
+      continue;
+    }
+    if (current->Type() == TypeTag::kWindowFunctionExp) {
+      return true;
+    }
+    if (current->Type() == TypeTag::kQueryExp) {
+      continue;
+    }
+    for (const Expression& child : ExpressionChildren(current)) {
+      if (child) {
+        stack.push_back(child);
+      }
+    }
+  }
+  return false;
+}
+
+// Every component of one window call (arguments, partition/order keys,
+// filters, frame offsets) must evaluate without interpreter scope.
+bool WindowCallComponentsClean(const Expression& call) {
+  if (!call || call->Type() != TypeTag::kWindowFunctionExp) {
+    return false;
+  }
+  const auto& window = call->AsWindowFunctionCallExpression();
+  const auto clean = [](const Expression& component) {
+    return !component || !NeedsRelationalEvaluation(component);
+  };
+  for (const Expression& argument : window.args) {
+    if (!clean(argument)) {
+      return false;
+    }
+  }
+  if (!clean(window.where_filter)) {
+    return false;
+  }
+  for (const Expression& key : window.partition_by) {
+    if (!clean(key)) {
+      return false;
+    }
+  }
+  for (const auto& term : window.order_by) {
+    if (!clean(term.expression)) {
+      return false;
+    }
+  }
+  for (const auto& term : window.inner_order_by) {
+    if (!clean(term.expression)) {
+      return false;
+    }
+  }
+  return (!window.frame_start.offset || clean(window.frame_start.offset)) &&
+         (!window.frame_end.offset || clean(window.frame_end.offset));
+}
+
+// True when `expression` carries window calls that the memo lowering can
+// take: at least one call, every call scope-clean, and no other relational
+// trigger in the non-window residue. Aggregates are checked at statement
+// level (grouped semantics stay out entirely).
+bool WindowItemRoutable(const Expression& expression) {
+  if (!expression || !ExpressionContainsWindow(expression)) {
+    return false;
+  }
+  size_t counter = 0;
+  std::unordered_map<std::string, size_t> dedup;
+  std::optional<std::pair<Expression, std::vector<ExtractedWindow>>> extracted =
+      ExtractWindowCalls(expression, &counter, &dedup);
+  if (!extracted.has_value()) {
+    return false;
+  }
+  if (NeedsRelationalEvaluation(extracted->first)) {
+    return false;
+  }
+  return std::ranges::all_of(extracted->second,
+                             [](const ExtractedWindow& spec) {
+                               return WindowCallComponentsClean(spec.call);
+                             });
+}
+
+// Statement-level window routing: every window occurrence (SELECT list,
+// ORDER BY, QUALIFY) must be routable, and no aggregates may appear in
+// those clauses (grouped evaluation stays on the existing paths).
+bool StatementWindowRoutable(const SelectStatement& select) {
+  bool found = false;
+  const auto check = [&](const Expression& expression) {
+    if (!expression) {
+      return true;
+    }
+    if (relational_detail::ContainsAggregate(expression)) {
+      return false;
+    }
+    if (ExpressionContainsWindow(expression)) {
+      found = true;
+      return WindowItemRoutable(expression);
+    }
+    return true;
+  };
+  for (const NamedExpression& item : select.SelectList()) {
+    if (!check(item.expression)) {
+      return false;
+    }
+  }
+  for (const auto& term : select.OrderBy()) {
+    if (!check(term.expression)) {
+      return false;
+    }
+  }
+  if (!check(select.Qualify())) {
+    return false;
+  }
+  return found;
+}
+
+}  // namespace
+
+bool PostRewriteNeedsRelational(const SelectStatement& select,
+                                const LiftedCtes* lifted = nullptr) {
+  // M6+1: a single RIGHT/FULL edge over two plain sources lowers like LEFT;
+  // chains and any other single-source oddity stay relational.
+  bool single_right_full_slice = false;
+  if (select.Sources().size() == 2) {
+    const SelectSource& first = select.Sources()[0];
+    const SelectSource& second = select.Sources()[1];
+    const bool first_plain = first.query == nullptr && !first.unnest &&
+                             !first.is_lateral && first.using_columns.empty() &&
+                             !first.from_nested_join &&
+                             (first.join_type == JoinType::kCross ||
+                              first.join_type == JoinType::kInner) &&
+                             !NeedsRelationalEvaluation(first.join_condition);
+    const bool second_outer =
+        (second.join_type == JoinType::kRight ||
+         second.join_type == JoinType::kFull) &&
+        second.query == nullptr && !second.unnest && !second.is_lateral &&
+        second.using_columns.empty() && !second.from_nested_join &&
+        second.join_condition != nullptr &&
+        !NeedsRelationalEvaluation(second.join_condition);
+    single_right_full_slice = first_plain && second_outer;
+  }
+  for (const SelectSource& source : select.Sources()) {
+    // Plain LEFT joins are M6 territory (lowered with join-type payloads);
+    // single RIGHT/FULL edges are M6+1 territory (same payloads, kinds 1/2);
+    // every other join-level complexity stays relational.
+    if (source.query != nullptr || source.unnest || source.is_lateral ||
+        !source.using_columns.empty() || source.from_nested_join ||
+        ((source.join_type == JoinType::kRight ||
+          source.join_type == JoinType::kFull) &&
+         !single_right_full_slice) ||
+        NeedsRelationalEvaluation(source.join_condition)) {
+      return true;
+    }
+  }
+  if (!select.WithQueries().empty() &&
+      (lifted == nullptr || !lifted->fully_covered)) {
+    // A covered layer (every mapped CTE lifted into cells or opaque
+    // recursive leaves) is vestigial for routing; relational fallbacks
+    // still execute through the intact map.
+    return true;
+  }
+  // Window routing (M-window): statements whose every window occurrence is
+  // plannable flow to the memo lowering below; the per-clause checks then
+  // admit exactly the window-carrying shapes.
+  const bool window_routed = StatementWindowRoutable(select);
+  const auto window_item_routed = [&](const Expression& expression) {
+    return window_routed && expression &&
+           ExpressionContainsWindow(expression) &&
+           WindowItemRoutable(expression);
+  };
+  bool qualify_routed = false;
+  if (window_routed && select.Qualify() &&
+      !ContainsQueryExpression(select.Qualify())) {
+    qualify_routed = !ExpressionContainsWindow(select.Qualify()) ||
+                     WindowItemRoutable(select.Qualify());
+  }
+  for (const NamedExpression& item : select.SelectList()) {
+    if (NeedsRelationalEvaluation(item.expression) &&
+        !window_item_routed(item.expression)) {
+      return true;
+    }
+    // Value-table operands need the relational interpreter's proto-field
+    // resolution (mirrors has_value_table_operand below).
+    if (item.expression &&
+        item.expression->Type() == TypeTag::kFunctionCallExp &&
+        (item.expression->AsFunctionCallExpression().FuncName() ==
+             "__value_table_value" ||
+         item.expression->AsFunctionCallExpression().FuncName() ==
+             "__proto_new")) {
+      return true;
+    }
+  }
+  if (NeedsRelationalEvaluation(select.WhereClause()) ||
+      NeedsRelationalEvaluation(select.Having())) {
+    return true;
+  }
+  for (const auto& term : select.OrderBy()) {
+    if (NeedsRelationalEvaluation(term.expression) &&
+        !window_item_routed(term.expression)) {
+      return true;
+    }
+  }
+  return (relational_detail::HasWindowFunctions(select) && !window_routed) ||
+         (select.Qualify() && !qualify_routed) || !select.GroupBy().empty() ||
+         select.Having() || !select.UnionAll().empty() ||
+         select.GetSetOperationTree() != nullptr || select.HasDistinctOn() ||
+         select.WithTies();
+}
+
 // DISTINCT is redundant when the visible projection contains every column of
 // a unique index. Keep this SQL-layer check in addition to the optimizer's
 // DistinctPlan elimination because this facade normally adds the executable
@@ -414,8 +652,21 @@ bool ProjectionContainsUniqueKey(const Plan& plan,
   }
   for (size_t i = 0; i < table->IndexCount(); ++i) {
     const Index& index = table->GetIndex(i);
-    if (index.IsUnique() &&
+    if (!index.IsUnique()) {
+      continue;
+    }
+    // A uniqueness proof holds only for non-NULL key values: NULL-bearing
+    // keys are stored in the multi-value encoding (two rows may share the
+    // physical NULL key), so a nullable unique key no longer guarantees a
+    // single row per projected key and DISTINCT must not be dropped.
+    const bool all_not_null =
         std::ranges::all_of(index.sc_.key_, [&](slot_t key) {
+          const Constraint::ConstraintType ctype =
+              table->GetSchema().GetColumn(key).GetConstraint().ctype;
+          return ctype == Constraint::kNotNull ||
+                 ctype == Constraint::kPrimaryKey;
+        });
+    if (all_not_null && std::ranges::all_of(index.sc_.key_, [&](slot_t key) {
           return projected.contains(key);
         })) {
       return true;
@@ -439,10 +690,7 @@ bool NarrowIntegerFits(const ColumnName& column, const Value& value) {
   });
   const int64_t number = value.value.int_value;
   if (name.find("uint64") != std::string::npos) {
-    if (!value.IsUnsigned() && number < 0) {
-      return false;
-    }
-    return true;
+    return value.IsUnsigned() || number >= 0;
   }
   if (name.find("uint32") != std::string::npos) {
     if (!value.IsUnsigned() && number < 0) {
@@ -1206,6 +1454,12 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
       if (source.join_type == JoinType::kLeft ||
           source.join_type == JoinType::kRight ||
           source.join_type == JoinType::kFull) {
+        continue;
+      }
+      // CTE names never resolve to catalog tables (materialized CTEs scan
+      // shared row cells instead); listing them would fake join-elimination
+      // annotations below, so only physical tables participate.
+      if (!ctx.GetTable(source.table).HasValue()) {
         continue;
       }
       if (source.join_type == JoinType::kInner) {
@@ -2142,10 +2396,51 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
     std::vector<SortExecutor::Key> keys;
     keys.reserve(select.OrderBy().size());
     for (const auto& term : select.OrderBy()) {
-      keys.push_back({term.expression, term.ascending, term.nulls_first});
+      Expression key = term.expression;
+      // GoogleSQL: an unsigned integer ORDER BY item sorts by the
+      // SELECT-list ordinal, not by the constant itself.  The combined
+      // schema carries the first branch's output names, so bind the key to
+      // that output column (a bare constant would encode identically for
+      // every row and the sort would silently do nothing).
+      if (key && key->Type() == TypeTag::kConstantValue) {
+        const Value& ordinal_value = key->AsConstantValue().GetValue();
+        if (ordinal_value.type == ValueType::kInt64 &&
+            !ordinal_value.IsNull() && ordinal_value.value.int_value >= 0) {
+          const auto ordinal =
+              static_cast<size_t>(ordinal_value.value.int_value);
+          if (ordinal < 1 || ordinal > output_names.size()) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "ORDER BY ordinal out of range");
+          }
+          key = ColumnValueExp(ColumnName(output_names[ordinal - 1]));
+        }
+      }
+      keys.push_back({std::move(key), term.ascending, term.nulls_first});
+    }
+    if (select.WithTies()) {
+      // WITH TIES must keep every row tied with the cutoff row; a plain
+      // Limit after the sort would silently truncate them.  Without an
+      // explicit LIMIT the cutoff is "the whole result", so TopN with the
+      // recorded (possibly zero) limit would wrongly drop rows.
+      const size_t ties_limit = select.HasLimit()
+                                    ? select.Limit()
+                                    : std::numeric_limits<size_t>::max();
+      std::vector<TopNExecutor::Key> topn_keys;
+      topn_keys.reserve(keys.size());
+      for (SortExecutor::Key& key : keys) {
+        topn_keys.push_back(
+            {std::move(key.expression), key.ascending, key.nulls_first});
+      }
+      executor = std::make_shared<TopNExecutor>(
+          std::move(executor), combined_schema, std::move(topn_keys),
+          ties_limit, select.Offset(), /*with_ties=*/true);
+      return executor;
     }
     executor = std::make_shared<SortExecutor>(std::move(executor),
                                               combined_schema, std::move(keys));
+  } else if (select.WithTies()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "FETCH/LIMIT WITH TIES requires an ORDER BY clause");
   }
   if (select.HasLimit() || select.Offset() != 0) {
     executor = std::make_shared<LimitExecutor>(std::move(executor),
@@ -2154,13 +2449,1758 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
   return executor;
 }
 
+// M4 CTE inlining (first slice): replace a singly-referenced non-recursive
+// CTE by its defining query at the single reference site. The reference
+// becomes an ordinary derived source, so the M5 flattener (run right after)
+// can inline single-table bodies further, and outer predicates push through
+// the normal rules. Multi-referenced CTEs keep the materialized relational
+// path (shared rescan would re-evaluate an inlined body per reference).
+//
+// Soundness gates (anything else keeps the map entry for the existing
+// materialized path):
+// - non-recursive, exactly one reference in the whole statement (FROM
+//   sources at any depth, expression subqueries, set-op branches, sibling
+//   bodies), none of them inside its own body (cyclic shapes keep the
+//   existing error path);
+// - the defining body carries no nested WITH of its own (nested-map scope
+//   is a follow-up);
+// - the single site is a FROM source; the inlined source keeps the CTE name
+//   as its alias (or the reference alias when the reference already renames
+//   it and nothing still qualifies the CTE name).
+// Bodies are top-level queries, so they cannot see the consumer's row scope:
+// the inlined source is uncorrelated by construction (a stale lateral flag
+// is recomputed with the visitor's own locality rule).
+namespace {
+void CountCteReferencesInExpression(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const std::unordered_set<std::string>& names,
+    std::unordered_map<std::string, size_t>* counts);
+
+void CountCteReferencesInStatement(  // NOLINT(misc-no-recursion)
+    const SelectStatement& statement,
+    const std::unordered_set<std::string>& names,
+    std::unordered_map<std::string, size_t>* counts) {
+  for (const SelectSource& source : statement.Sources()) {
+    if (!source.table.empty() && names.contains(source.table)) {
+      (*counts)[source.table]++;
+    }
+    if (source.query != nullptr) {
+      CountCteReferencesInStatement(*source.query, names, counts);
+    }
+    CountCteReferencesInExpression(source.join_condition, names, counts);
+    CountCteReferencesInExpression(source.unnest, names, counts);
+  }
+  CountCteReferencesInExpression(statement.WhereClause(), names, counts);
+  for (const NamedExpression& item : statement.SelectList()) {
+    CountCteReferencesInExpression(item.expression, names, counts);
+  }
+  for (const Expression& expression : statement.GroupBy()) {
+    CountCteReferencesInExpression(expression, names, counts);
+  }
+  CountCteReferencesInExpression(statement.Having(), names, counts);
+  CountCteReferencesInExpression(statement.Qualify(), names, counts);
+  for (const auto& term : statement.OrderBy()) {
+    CountCteReferencesInExpression(term.expression, names, counts);
+  }
+  for (const auto& branch : statement.UnionAll()) {
+    if (branch != nullptr) {
+      CountCteReferencesInStatement(*branch, names, counts);
+    }
+  }
+  if (const auto& tree = statement.GetSetOperationTree(); tree != nullptr) {
+    if (tree->first != nullptr) {
+      CountCteReferencesInStatement(*tree->first, names, counts);
+    }
+    for (const auto& branch : tree->branches) {
+      if (branch != nullptr) {
+        CountCteReferencesInStatement(*branch, names, counts);
+      }
+    }
+  }
+  for (const auto& [name, body] : statement.WithQueries()) {
+    (void)name;
+    if (body != nullptr) {
+      CountCteReferencesInStatement(*body, names, counts);
+    }
+  }
+}
+
+void CountCteReferencesInExpression(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const std::unordered_set<std::string>& names,
+    std::unordered_map<std::string, size_t>* counts) {
+  if (!expression) {
+    return;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    const QueryExpression& query = expression->AsQueryExpression();
+    if (query.Query() != nullptr) {
+      CountCteReferencesInStatement(*query.Query(), names, counts);
+    }
+    CountCteReferencesInExpression(query.Test(), names, counts);
+    return;
+  }
+  for (const Expression& child : ExpressionChildren(expression)) {
+    CountCteReferencesInExpression(child, names, counts);
+  }
+}
+
+// Finds the single FROM source naming `name`. Sources inside sibling CTE
+// bodies are reported through `in_map_body`: inlining there only churns the
+// materialized path (the body stays mapped), so the slice leaves them alone
+// and lets chained CTEs resolve inside-out as outer sites open up.
+struct CteReferenceSite {
+  SelectSource* source = nullptr;
+  bool in_map_body = false;
+};
+
+CteReferenceSite FindSingleCteReference(  // NOLINT(misc-no-recursion)
+    SelectStatement* statement, const std::string& name) {
+  CteReferenceSite result;
+  int matches = 0;
+  // Whether the visit is currently inside a map-owned CTE body (as opposed
+  // to the main statement tree or an already-inlined derived source).
+  const std::function<void(SelectStatement*, bool)> visit =
+      [&](SelectStatement* current, bool in_map) {
+        if (current == nullptr) {
+          return;
+        }
+        for (SelectSource& source :
+             const_cast<std::vector<SelectSource>&>(current->Sources())) {
+          if (source.table == name) {
+            result.source = &source;
+            result.in_map_body = in_map;
+            ++matches;
+          }
+          if (source.query != nullptr) {
+            visit(source.query.get(), in_map);
+          }
+        }
+        const auto visit_expression = [&](const Expression& expression) {
+          std::vector<Expression> stack;
+          if (expression) {
+            stack.push_back(expression);
+          }
+          while (!stack.empty()) {
+            Expression current_expr = std::move(stack.back());
+            stack.pop_back();
+            if (!current_expr) {
+              continue;
+            }
+            if (current_expr->Type() == TypeTag::kQueryExp) {
+              const QueryExpression& query = current_expr->AsQueryExpression();
+              if (query.Query() != nullptr) {
+                visit(const_cast<SelectStatement*>(query.Query().get()),
+                      in_map);
+              }
+            }
+            for (const Expression& child : ExpressionChildren(current_expr)) {
+              if (child) {
+                stack.push_back(child);
+              }
+            }
+          }
+        };
+        visit_expression(current->WhereClause());
+        for (const NamedExpression& item : current->SelectList()) {
+          visit_expression(item.expression);
+        }
+        for (const Expression& expression : current->GroupBy()) {
+          visit_expression(expression);
+        }
+        visit_expression(current->Having());
+        visit_expression(current->Qualify());
+        for (const auto& term : current->OrderBy()) {
+          visit_expression(term.expression);
+        }
+        for (const auto& branch : current->UnionAll()) {
+          visit(branch.get(), in_map);
+        }
+        if (const auto& tree = current->GetSetOperationTree();
+            tree != nullptr) {
+          visit(tree->first.get(), in_map);
+          for (const auto& branch : tree->branches) {
+            visit(branch.get(), in_map);
+          }
+        }
+        for (const auto& [entry, body] : current->WithQueries()) {
+          (void)entry;
+          // Bodies owned by a WITH map (at any depth) count as map bodies;
+          // the top-level statement itself does not.
+          visit(body.get(), true);
+        }
+      };
+  visit(statement, false);
+  if (matches != 1) {
+    return CteReferenceSite{};
+  }
+  return result;
+}
+
+// True when every qualified reference in `expression` outside the lateral
+// locality check below is irrelevant: mirrors the visitor's own rule that a
+// FROM-subquery whose WHERE touches only its local tables is not lateral.
+bool DerivedSourceIsLocal(const SelectSource& source) {
+  if (source.query == nullptr || !source.query->WhereClause()) {
+    return true;
+  }
+  std::unordered_set<std::string> local;
+  for (const SelectSource& inner : source.query->Sources()) {
+    if (!inner.alias.empty()) {
+      local.insert(inner.alias);
+    }
+    if (!inner.table.empty()) {
+      local.insert(inner.table);
+    }
+  }
+  return std::ranges::all_of(source.query->WhereClause()->TouchedColumns(),
+                             [&local](const ColumnName& column) {
+                               return column.schema.empty() ||
+                                      local.contains(column.schema);
+                             });
+}
+
+// True when any expression in the statement (any depth, including sibling
+// CTE bodies and set-op branches) qualifies a column with `name`.
+bool StatementQualifiesName(  // NOLINT(misc-no-recursion)
+    const SelectStatement& statement, const std::string& name) {
+  bool found = false;
+  const auto scan_expression = [&](const Expression& expression) {
+    std::vector<Expression> stack;
+    if (expression) {
+      stack.push_back(expression);
+    }
+    while (!stack.empty() && !found) {
+      Expression current = std::move(stack.back());
+      stack.pop_back();
+      if (!current) {
+        continue;
+      }
+      for (const ColumnName& column : current->TouchedColumns()) {
+        if (!column.schema.empty() && column.schema == name) {
+          found = true;
+          return;
+        }
+      }
+      for (const Expression& child : ExpressionChildren(current)) {
+        if (child) {
+          stack.push_back(child);
+        }
+      }
+    }
+  };
+  const std::function<void(const SelectStatement&)> visit =
+      [&](const SelectStatement& current) {
+        if (found) {
+          return;
+        }
+        for (const SelectSource& source : current.Sources()) {
+          scan_expression(source.join_condition);
+          scan_expression(source.unnest);
+          if (source.query != nullptr) {
+            visit(*source.query);
+          }
+          if (found) {
+            return;
+          }
+        }
+        scan_expression(current.WhereClause());
+        for (const NamedExpression& item : current.SelectList()) {
+          scan_expression(item.expression);
+        }
+        for (const Expression& expression : current.GroupBy()) {
+          scan_expression(expression);
+        }
+        scan_expression(current.Having());
+        scan_expression(current.Qualify());
+        for (const auto& term : current.OrderBy()) {
+          scan_expression(term.expression);
+        }
+        for (const auto& branch : current.UnionAll()) {
+          if (branch != nullptr) {
+            visit(*branch);
+          }
+        }
+        if (const auto& tree = current.GetSetOperationTree(); tree != nullptr) {
+          if (tree->first != nullptr) {
+            visit(*tree->first);
+          }
+          for (const auto& branch : tree->branches) {
+            if (branch != nullptr) {
+              visit(*branch);
+            }
+          }
+        }
+        for (const auto& [entry, body] : current.WithQueries()) {
+          (void)entry;
+          if (body != nullptr) {
+            visit(*body);
+          }
+        }
+      };
+  visit(statement);
+  return found;
+}
+
+bool InlineSingleUseCtes(SelectStatement* outer) {
+  if (outer == nullptr || outer->WithQueries().empty()) {
+    return false;
+  }
+  bool changed = false;
+  // One inline per pass; each pass removes a map entry, so the loop ends
+  // after at most map-size passes (chained CTEs resolve inside-out).
+  for (size_t pass = 0; pass <= outer->WithQueries().size(); ++pass) {
+    std::unordered_set<std::string> names;
+    for (const auto& [name, body] : outer->WithQueries()) {
+      (void)body;
+      if (!outer->IsRecursiveWith(name)) {
+        names.insert(name);
+      }
+    }
+    if (names.empty()) {
+      break;
+    }
+    std::unordered_map<std::string, size_t> counts;
+    CountCteReferencesInStatement(*outer, names, &counts);
+    bool inlined = false;
+    for (const std::string& name : names) {
+      const auto body_it = outer->WithQueries().find(name);
+      if (body_it == outer->WithQueries().end() || body_it->second == nullptr ||
+          !body_it->second->WithQueries().empty()) {
+        continue;
+      }
+      if (counts[name] != 1) {
+        continue;
+      }
+      // A self reference keeps the existing cyclic-error path.
+      std::unordered_map<std::string, size_t> self_counts;
+      CountCteReferencesInStatement(*body_it->second, {name}, &self_counts);
+      if (self_counts[name] != 0) {
+        continue;
+      }
+      CteReferenceSite site = FindSingleCteReference(outer, name);
+      if (site.source == nullptr || site.source->query != nullptr ||
+          site.in_map_body) {
+        continue;
+      }
+      // Slice boundary: inline only single-table row-preserving bodies —
+      // exactly what the M5 flattener can consume next. Anything richer
+      // (multi-table, grouping, ...) stays mapped for the existing
+      // materialized path instead of churning its EXPLAIN shape.
+      const SelectStatement& body = *body_it->second;
+      if (body.Sources().size() != 1 || !body.GroupBy().empty() ||
+          body.Having() || body.Distinct() || !body.DistinctOn().empty() ||
+          body.HasLimit() || body.Offset() != 0 || body.Qualify() ||
+          !body.UnionAll().empty() || body.GetSetOperationTree() != nullptr ||
+          relational_detail::HasWindowFunctions(body)) {
+        continue;
+      }
+      const SelectSource& body_source = body.Sources().front();
+      if (body_source.query != nullptr || body_source.unnest ||
+          body_source.is_lateral || body_source.table.empty() ||
+          !body_source.using_columns.empty() || body_source.from_nested_join ||
+          body_source.join_condition) {
+        continue;
+      }
+      bool body_has_aggregate = false;
+      for (const NamedExpression& item : body.SelectList()) {
+        if (relational_detail::ContainsAggregate(item.expression) ||
+            ContainsQueryExpression(item.expression)) {
+          body_has_aggregate = true;
+          break;
+        }
+      }
+      if (body_has_aggregate) {
+        continue;
+      }
+      // A reference that already renames the CTE keeps its alias, but only
+      // when nothing still qualifies the CTE name itself (such references
+      // would lose their scope after inlining).
+      std::string alias =
+          site.source->alias.empty() ? name : site.source->alias;
+      if (alias != name && StatementQualifiesName(*outer, name)) {
+        continue;
+      }
+      site.source->query = body_it->second;
+      site.source->table.clear();
+      site.source->alias = std::move(alias);
+      site.source->is_lateral = !DerivedSourceIsLocal(*site.source);
+      outer->RemoveWithQuery(name);
+      inlined = true;
+      changed = true;
+      break;
+    }
+    if (!inlined) {
+      break;
+    }
+  }
+  return changed;
+}
+}  // namespace
+
+// M5 derived-table flattening (first slice): inline a FROM-subquery over a
+// single base table when the rewrite provably preserves the row multiset.
+// The derived source `s` over `SELECT <outputs> FROM t [WHERE w]` becomes the
+// base table under alias `s`, output references `s.name` substitute the
+// (immutable) inner expression, and the inner WHERE merges into the outer
+// WHERE — or into the ON condition when the flattened source is the
+// null-supplying side of an outer join (filtering it after padding would
+// drop padded rows instead of merely failing the match).
+//
+// Soundness gates (anything else keeps the relational path):
+// - single plain-table inner source; no CTEs (inner or outer), grouping,
+//   aggregates, DISTINCT, LIMIT/OFFSET, QUALIFY, window functions, set-ops,
+//   subqueries, or stars the catalog cannot expand;
+// - non-correlated: every inner column reference binds inside the inner
+//   table (qualified with the inner alias/table, or bare and present there);
+// - substituted outputs are immutable per row (a volatile output referenced
+//   twice must evaluate once, as in the materialized derived table);
+// - no observability shift for outer scopes: qualified `s.name` must name a
+//   derived output, and no bare outer reference may collide with a base
+//   column hidden by the derived table.
+namespace {
+bool DerivedExpressionIsImmutable(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) {
+    return true;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kQueryExp:
+    case TypeTag::kAggregateExp:
+    case TypeTag::kWindowFunctionExp:
+      return false;
+    case TypeTag::kFunctionCallExp:
+      if (GetFunctionVolatility(
+              expression->AsFunctionCallExpression().FuncName()) !=
+          Volatility::kImmutable) {
+        return false;
+      }
+      break;
+    default:
+      break;
+  }
+  return std::ranges::all_of(ExpressionChildren(expression),
+                             [](const Expression& child) {
+                               return DerivedExpressionIsImmutable(child);
+                             });
+}
+
+struct DerivedScope {
+  std::string derived_alias;
+  std::string inner_alias;
+  std::string base_table;
+  Schema base_schema;
+  // Lowered output name -> rebound inner expression (qualifiers already name
+  // the derived alias).
+  std::unordered_map<std::string, Expression> outputs;
+  // Lowered base column names hidden by the derived table (for the bare-name
+  // collision gate).
+  std::unordered_set<std::string> hidden_columns;
+};
+
+// Rebinds an inner-scope expression to the derived alias: qualifiers naming
+// the inner alias/table become the derived alias, bare names must exist in
+// the base schema. Nullopt on any outer reference or unknown column.
+std::optional<Expression> RebindInnerExpression(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const DerivedScope& scope) {
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    if (column.name == "*") {
+      return std::nullopt;
+    }
+    if (!column.schema.empty()) {
+      if (!IdentifierEquals(column.schema, scope.inner_alias) &&
+          !IdentifierEquals(column.schema, scope.base_table)) {
+        return std::nullopt;
+      }
+      return ColumnValueExp(ColumnName(scope.derived_alias, column.name));
+    }
+    if (scope.base_schema.Offset(ColumnName("", column.name)) < 0) {
+      return std::nullopt;
+    }
+    return ColumnValueExp(ColumnName(scope.derived_alias, column.name));
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  std::vector<Expression> rebound;
+  rebound.reserve(children.size());
+  for (const Expression& child : children) {
+    std::optional<Expression> mapped = RebindInnerExpression(child, scope);
+    if (!mapped.has_value()) {
+      return std::nullopt;
+    }
+    rebound.push_back(std::move(*mapped));
+  }
+  return WithExpressionChildren(expression, std::move(rebound));
+}
+
+// Substitutes derived-output references in an outer-scope expression with
+// the rebound inner expression. Qualified `alias.name` must name a derived
+// output; bare names matching an output substitute only when they cannot
+// name a base column (otherwise the reference is left for normal scope
+// resolution, which errors on ambiguity exactly as before).
+std::optional<Expression>
+SubstituteDerivedOutputs(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const DerivedScope& scope,
+    const std::unordered_set<std::string>& base_column_names) {
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    if (column.name == "*") {
+      return expression;
+    }
+    if (!column.schema.empty()) {
+      if (!IdentifierEquals(column.schema, scope.derived_alias)) {
+        return expression;
+      }
+      std::string lowered = column.name;
+      for (char& c : lowered) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      const auto found = scope.outputs.find(lowered);
+      if (found == scope.outputs.end()) {
+        return std::nullopt;
+      }
+      return found->second;
+    }
+    std::string lowered = column.name;
+    for (char& c : lowered) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (!scope.outputs.contains(lowered)) {
+      return expression;
+    }
+    if (base_column_names.contains(lowered)) {
+      return std::nullopt;
+    }
+    return scope.outputs.at(lowered);
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  std::vector<Expression> substituted;
+  substituted.reserve(children.size());
+  for (const Expression& child : children) {
+    std::optional<Expression> mapped =
+        SubstituteDerivedOutputs(child, scope, base_column_names);
+    if (!mapped.has_value()) {
+      return std::nullopt;
+    }
+    substituted.push_back(std::move(*mapped));
+  }
+  return WithExpressionChildren(expression, std::move(substituted));
+}
+
+bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
+                             TransactionContext& ctx);
+
+// True when the expression carries a `*` column reference at any depth,
+// including the lone-star value-table wrapper (`__value_table_value(*)`,
+// which selects the row as a value rather than expanding columns). Star
+// expansion over derived tables keeps its dedicated (relational) path in
+// this slice.
+bool ContainsStarReference(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  std::vector<Expression> stack{expression};
+  while (!stack.empty()) {
+    Expression current = std::move(stack.back());
+    stack.pop_back();
+    if (!current) {
+      continue;
+    }
+    if (current->Type() == TypeTag::kColumnValue &&
+        current->AsColumnValue().GetColumnName().name == "*") {
+      return true;
+    }
+    for (const Expression& child : ExpressionChildren(current)) {
+      if (child) {
+        stack.push_back(child);
+      }
+    }
+  }
+  return false;
+}
+
+// M-union: merge UNION ALL / UNION DISTINCT branches over one shared table
+// into a single scan. UNION ALL with pairwise-disjoint branch predicates is
+// bag-identical to one OR-filtered scan; UNION DISTINCT additionally survives
+// dedup either way. Anything else keeps the branch-wise set-operation path.
+//
+// Soundness gates (all must hold; the statement is untouched otherwise):
+// - flat UNION ALL list, every pair kind ALL (bag merge) or every pair kind
+//   DISTINCT (dedup merge); no INTERSECT/EXCEPT mixing, no grouped
+//   SetOperationTree, default positional column matching only;
+// - every part (head + branches) is a single plain-table source over the
+//   SAME table and alias (so no qualifier rebinding is needed), with no
+//   branch-level CTE map, grouping, aggregates, DISTINCT, LIMIT/OFFSET,
+//   ORDER BY, QUALIFY, join condition, or USING clause. Head-level ORDER
+//   BY/LIMIT/OFFSET are result-level modifiers and stay put; plain window
+//   calls ride along (the merged shape routes through the normal window
+//   lowering or relational fallback);
+// - equal-width select lists with pairwise identical expressions (the head
+//   part's output names win, matching set-operation semantics); `*`
+//   expands over the shared table first;
+// - UNION ALL additionally proves pairwise disjointness through one shared
+//   column pinned to pairwise-different same-type constants (IS NULL counts
+//   as its own constant; anything else stays relational).
+bool UnionBranchShapeOk(const SelectStatement& part, bool is_head) {
+  if (part.Sources().size() != 1 || !part.WithQueries().empty() ||
+      !part.GroupBy().empty() || part.Having() || part.Distinct() ||
+      !part.DistinctOn().empty() || part.Qualify()) {
+    return false;
+  }
+  // Parenthesized (grouped) set operations change meaning when flattened;
+  // the top-level gate already confined this merge to ungrouped trees, and
+  // branches must not nest set operations at all.
+  const auto& tree = part.GetSetOperationTree();
+  if (tree != nullptr && (tree->grouped || !is_head)) {
+    return false;
+  }
+  // The head's own UNION ALL list is what is being merged (not a nested set
+  // operation); its ORDER BY / LIMIT / OFFSET are result-level modifiers
+  // that stay put. Branches must be bare.
+  if (!is_head && (!part.UnionAll().empty() || part.HasLimit() ||
+                   part.Offset() != 0 || !part.OrderBy().empty())) {
+    return false;
+  }
+  const SelectSource& source = part.Sources().front();
+  if (source.query != nullptr || source.unnest || source.is_lateral ||
+      source.table.empty() || !source.using_columns.empty() ||
+      source.from_nested_join || source.join_condition ||
+      (source.join_type != JoinType::kCross &&
+       source.join_type != JoinType::kInner)) {
+    return false;
+  }
+  // A window call is evaluated over the whole query block, so merging the
+  // branch into one shared scan would recompute it over the union of every
+  // branch's rows (wrong frames/ranks). Keep window-bearing branches on the
+  // set-operation path.
+  if (relational_detail::HasWindowFunctions(part)) {
+    return false;
+  }
+  return std::ranges::all_of(
+      part.SelectList(), [](const NamedExpression& item) {
+        return item.expression &&
+               !relational_detail::ContainsAggregate(item.expression);
+      });
+}
+
+// Expands `*` select items of a single-table part over the catalog. False
+// when unexpandable (unknown table stays relational).
+bool ExpandUnionBranchStars(SelectStatement* part, TransactionContext& ctx) {
+  if (part == nullptr || part->Sources().size() != 1) {
+    return false;
+  }
+  bool has_star = false;
+  for (const NamedExpression& item : part->SelectList()) {
+    if (item.expression && item.expression->Type() == TypeTag::kColumnValue &&
+        item.expression->AsColumnValue().GetColumnName().name == "*") {
+      has_star = true;
+      break;
+    }
+  }
+  if (!has_star) {
+    return true;
+  }
+  const SelectSource& source = part->Sources().front();
+  StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(source.table);
+  if (!found.HasValue()) {
+    return false;
+  }
+  const std::string relation =
+      source.alias.empty() ? source.table : source.alias;
+  std::vector<NamedExpression> expanded;
+  for (const NamedExpression& item : part->SelectList()) {
+    if (item.expression && item.expression->Type() == TypeTag::kColumnValue &&
+        item.expression->AsColumnValue().GetColumnName().name == "*") {
+      const ColumnName& star = item.expression->AsColumnValue().GetColumnName();
+      if (!star.schema.empty() && !IdentifierEquals(star.schema, relation) &&
+          !IdentifierEquals(star.schema, source.table)) {
+        return false;
+      }
+      for (size_t i = 0; i < found.Value()->GetSchema().ColumnCount(); ++i) {
+        const std::string& col =
+            found.Value()->GetSchema().GetColumn(i).Name().name;
+        expanded.emplace_back(col, ColumnValueExp(ColumnName(relation, col)));
+      }
+      continue;
+    }
+    expanded.push_back(item);
+  }
+  part->SetSelectList(std::move(expanded));
+  return true;
+}
+
+// Collects single-column equality-to-constant (or IS NULL) conjuncts for the
+// disjointness proof: lowered column name -> constant, or nullopt for
+// IS NULL (equal only to itself, so two IS NULL branches correctly fail the
+// all-different proof while IS NULL vs a constant passes it).
+void CollectEqualityConsts(
+    const Expression& where,
+    std::unordered_map<std::string, std::optional<Value>>* out) {
+  if (!where || out == nullptr) {
+    return;
+  }
+  for (const Expression& conjunct : SplitConjuncts(where)) {
+    if (!conjunct) {
+      continue;
+    }
+    if (conjunct->Type() == TypeTag::kBinaryExp &&
+        conjunct->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+      const auto& binary = conjunct->AsBinaryExpression();
+      const Expression* column_side = nullptr;
+      const Expression* const_side = nullptr;
+      if (binary.Left()->Type() == TypeTag::kColumnValue &&
+          binary.Right()->Type() == TypeTag::kConstantValue) {
+        column_side = &binary.Left();
+        const_side = &binary.Right();
+      } else if (binary.Right()->Type() == TypeTag::kColumnValue &&
+                 binary.Left()->Type() == TypeTag::kConstantValue) {
+        column_side = &binary.Right();
+        const_side = &binary.Left();
+      }
+      if (column_side != nullptr && const_side != nullptr) {
+        const ColumnName& column =
+            (*column_side)->AsColumnValue().GetColumnName();
+        std::string lowered = column.name;
+        for (char& c : lowered) {
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        const Value& constant = (*const_side)->AsConstantValue().GetValue();
+        if (!constant.IsNull()) {
+          out->emplace(lowered, constant);
+        }
+      }
+      continue;
+    }
+    if (conjunct->Type() == TypeTag::kUnaryExp &&
+        conjunct->AsUnaryExpression().Op() == UnaryOperation::kIsNull &&
+        conjunct->AsUnaryExpression().Child()->Type() ==
+            TypeTag::kColumnValue) {
+      const ColumnName& column = conjunct->AsUnaryExpression()
+                                     .Child()
+                                     ->AsColumnValue()
+                                     .GetColumnName();
+      std::string lowered = column.name;
+      for (char& c : lowered) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      out->emplace(lowered, std::nullopt);
+    }
+  }
+}
+
+bool UnionBranchesDisjoint(const std::vector<const SelectStatement*>& parts) {
+  // One shared column pinned to pairwise-different same-type constants.
+  // Extra conjuncts only narrow further, preserving disjointness.
+  std::unordered_map<std::string, std::vector<std::optional<Value>>> by_column;
+  for (const SelectStatement* part : parts) {
+    std::unordered_map<std::string, std::optional<Value>> consts;
+    CollectEqualityConsts(part->WhereClause(), &consts);
+    for (const auto& [column, value] : consts) {
+      by_column[column].push_back(value);
+    }
+  }
+  for (const auto& [column, values] : by_column) {
+    (void)column;
+    if (values.size() != parts.size()) {
+      continue;
+    }
+    bool pairwise_different = true;
+    for (size_t i = 0; i < values.size() && pairwise_different; ++i) {
+      for (size_t j = i + 1; j < values.size(); ++j) {
+        const std::optional<Value>& left = values[i];
+        const std::optional<Value>& right = values[j];
+        if (!left.has_value() || !right.has_value()) {
+          pairwise_different = left.has_value() != right.has_value();
+        } else if (left->type != right->type || *left == *right) {
+          pairwise_different = false;
+        }
+        if (!pairwise_different) {
+          break;
+        }
+      }
+    }
+    if (pairwise_different) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool MergeCompatibleUnionBranches(SelectStatement* outer,
+                                  TransactionContext& ctx) {
+  if (outer == nullptr || outer->UnionAll().empty()) {
+    return false;
+  }
+  if (outer->GetSetOperationTree() != nullptr &&
+      outer->GetSetOperationTree()->grouped) {
+    return false;
+  }
+  if (outer->UnionByName()) {
+    return false;
+  }
+  for (const SetOperationMatch& match : outer->Matches()) {
+    if (match.corresponding || match.by_name || !match.columns.empty()) {
+      return false;
+    }
+  }
+  bool all_all = true;
+  bool all_distinct = true;
+  for (size_t i = 0; i < outer->UnionAll().size(); ++i) {
+    const SetOperationKind kind = i < outer->SetOperationKinds().size()
+                                      ? outer->SetOperationKinds()[i]
+                                      : SetOperationKind::kUnionAll;
+    all_all = all_all && kind == SetOperationKind::kUnionAll;
+    all_distinct = all_distinct && kind == SetOperationKind::kUnion;
+  }
+  if (!all_all && !all_distinct) {
+    return false;
+  }
+  // Parts: the head (this statement's own clauses; its ORDER BY / LIMIT /
+  // OFFSET are result-level and stay put) plus every branch.
+  std::vector<SelectStatement*> parts{outer};
+  for (const auto& branch : outer->UnionAll()) {
+    if (branch == nullptr) {
+      return false;
+    }
+    parts.push_back(branch.get());
+  }
+  if (!UnionBranchShapeOk(*parts[0], /*is_head=*/true)) {
+    return false;
+  }
+  for (size_t i = 1; i < parts.size(); ++i) {
+    if (!UnionBranchShapeOk(*parts[i], /*is_head=*/false)) {
+      return false;
+    }
+  }
+  const SelectSource& head_source = parts[0]->Sources().front();
+  for (size_t i = 1; i < parts.size(); ++i) {
+    const SelectSource& source = parts[i]->Sources().front();
+    if (!IdentifierEquals(source.table, head_source.table) ||
+        !IdentifierEquals(source.alias.empty() ? source.table : source.alias,
+                          head_source.alias.empty() ? head_source.table
+                                                    : head_source.alias)) {
+      return false;
+    }
+  }
+  for (SelectStatement* part : parts) {
+    if (!ExpandUnionBranchStars(part, ctx)) {
+      return false;
+    }
+  }
+  const std::vector<NamedExpression>& head_list = parts[0]->SelectList();
+  if (head_list.empty()) {
+    return false;
+  }
+  for (size_t i = 1; i < parts.size(); ++i) {
+    const std::vector<NamedExpression>& branch_list = parts[i]->SelectList();
+    if (branch_list.size() != head_list.size()) {
+      return false;
+    }
+    for (size_t c = 0; c < head_list.size(); ++c) {
+      if (!head_list[c].expression || !branch_list[c].expression ||
+          head_list[c].expression->ToString() !=
+              branch_list[c].expression->ToString()) {
+        return false;
+      }
+    }
+  }
+  if (all_all) {
+    std::vector<const SelectStatement*> const_parts(parts.begin(), parts.end());
+    if (!UnionBranchesDisjoint(const_parts)) {
+      return false;
+    }
+  }
+  Expression merged;
+  for (SelectStatement* part : parts) {
+    Expression branch_where = part->WhereClause()
+                                  ? part->WhereClause()
+                                  : ConstantValueExp(Value(true));
+    merged =
+        merged ? BinaryExpressionExp(merged, BinaryOperation::kOr, branch_where)
+               : branch_where;
+  }
+  if (!merged) {
+    return false;
+  }
+  // An integer ORDER BY item is a SELECT-list ordinal. The set-operation
+  // path translates it, but this merge collapses to a plain SELECT whose
+  // ordinary path would treat the constant as a no-op sort key (silently
+  // ignoring the ordering and any LIMIT). Bind the ordinal to the head
+  // projection here, after every bail-out so a rejected merge leaves the
+  // statement untouched.
+  if (!outer->OrderBy().empty()) {
+    std::vector<SelectStatement::OrderByTerm> rebound_order;
+    rebound_order.reserve(outer->OrderBy().size());
+    for (const SelectStatement::OrderByTerm& term : outer->OrderBy()) {
+      if (term.expression &&
+          term.expression->Type() == TypeTag::kConstantValue) {
+        const Value& value = term.expression->AsConstantValue().GetValue();
+        if (value.type == ValueType::kInt64 && !value.IsNull()) {
+          const int64_t ordinal = value.value.int_value;
+          if (ordinal < 1 || static_cast<size_t>(ordinal) > head_list.size()) {
+            return false;
+          }
+          const NamedExpression& target =
+              head_list[static_cast<size_t>(ordinal) - 1];
+          if (!target.expression) {
+            return false;
+          }
+          rebound_order.push_back(
+              {target.expression, term.ascending, term.nulls_first});
+          continue;
+        }
+      }
+      rebound_order.push_back(term);
+    }
+    outer->SetOrderBy(std::move(rebound_order));
+  }
+  outer->SetWhereClause(std::move(merged));
+  outer->ClearUnionAll();
+  // Drop the (now stale) set-operation tree alongside the flat list: any
+  // downstream reader, including relational fallbacks, must see the merged
+  // single-query shape only.
+  outer->SetSetOperationTree(nullptr);
+  if (all_distinct) {
+    outer->SetDistinct(true);
+  }
+  return true;
+}
+bool FlattenDerivedSources(SelectStatement* outer, TransactionContext& ctx,
+                           const LiftedCtes* lifted = nullptr) {
+  // A covered layer (LiftedCtes::fully_covered) leaves only vestigial map
+  // entries, which no longer block flattening. Call adjacency guarantees
+  // this: nothing mutates the map between lifting and this call.
+  if (outer == nullptr || (!outer->WithQueries().empty() &&
+                           (lifted == nullptr || !lifted->fully_covered))) {
+    return false;
+  }
+  bool changed = false;
+  // Depth-first: an inner derived table flattens before its consumer, so a
+  // nested derived source is already a base table when the outer level runs.
+  for (const SelectSource& source : outer->Sources()) {
+    if (source.query != nullptr &&
+        FlattenDerivedSources(source.query.get(), ctx, lifted)) {
+      changed = true;
+    }
+  }
+  for (size_t i = 0; i < outer->Sources().size(); ++i) {
+    if (outer->Sources()[i].query != nullptr &&
+        FlattenOneDerivedSource(outer, i, ctx)) {
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
+                             TransactionContext& ctx) {
+  std::vector<SelectSource> sources = outer->Sources();
+  if (index >= sources.size()) {
+    return false;
+  }
+  const SelectSource& derived = sources[index];
+  const auto& inner = derived.query;
+  if (inner == nullptr || derived.alias.empty() || derived.is_lateral ||
+      derived.unnest || !derived.using_columns.empty() ||
+      derived.from_nested_join || derived.join_type == JoinType::kFull) {
+    return false;
+  }
+  // Grouped constructs route to the grouped bridge / relational finish paths
+  // whose scope contracts assume unflattened shapes (in particular, the
+  // single-source grouped path cannot resolve qualified references). Window
+  // evaluation likewise owns its pre-computed scope. Keep those queries on
+  // the existing path in this slice.
+  if (!outer->GroupBy().empty() || outer->Having() ||
+      relational_detail::HasWindowFunctions(*outer) ||
+      std::ranges::any_of(outer->SelectList(), [](const NamedExpression& item) {
+        return relational_detail::ContainsAggregate(item.expression);
+      })) {
+    return false;
+  }
+  // Stars (including the lone-star value-table wrapper) keep the dedicated
+  // expansion paths: expanding them here would diverge from the row-value
+  // semantics the visitor marked.
+  for (const NamedExpression& item : outer->SelectList()) {
+    if (ContainsStarReference(item.expression)) {
+      return false;
+    }
+  }
+  // The immediate join decides where the inner WHERE may go: into the outer
+  // WHERE everywhere except the null-supplying side of an outer join, where
+  // it must ride the ON condition (see the header comment). Chains beyond
+  // two relations only qualify when every join is inner.
+  const bool two_sources = outer->Sources().size() == 2;
+  bool inner_where_to_on = false;
+  if (index > 0) {
+    if (derived.join_type == JoinType::kLeft) {
+      if (!two_sources) {
+        return false;
+      }
+      inner_where_to_on = true;
+    } else if (derived.join_type == JoinType::kRight) {
+      if (!two_sources) {
+        return false;
+      }
+      inner_where_to_on = false;
+    } else if (derived.join_type != JoinType::kCross &&
+               derived.join_type != JoinType::kInner) {
+      return false;
+    }
+  } else if (outer->Sources().size() > 1) {
+    const JoinType next = outer->Sources()[1].join_type;
+    if (next == JoinType::kRight) {
+      if (!two_sources) {
+        return false;
+      }
+      inner_where_to_on = true;
+    } else if (next != JoinType::kCross && next != JoinType::kInner &&
+               next != JoinType::kLeft) {
+      return false;
+    }
+    if (!two_sources &&
+        std::ranges::any_of(outer->Sources(), [](const SelectSource& source) {
+          return source.join_type == JoinType::kLeft ||
+                 source.join_type == JoinType::kRight ||
+                 source.join_type == JoinType::kFull;
+        })) {
+      return false;
+    }
+  }
+  // Inner shape: one plain base table, row-preserving, uncorrelated.
+  if (inner->Sources().size() != 1 || !inner->WithQueries().empty() ||
+      !inner->GroupBy().empty() || inner->Having() || inner->Distinct() ||
+      !inner->DistinctOn().empty() || inner->HasLimit() ||
+      inner->Offset() != 0 || inner->Qualify() || !inner->UnionAll().empty() ||
+      inner->GetSetOperationTree() != nullptr ||
+      relational_detail::HasWindowFunctions(*inner) ||
+      inner->SelectList().empty()) {
+    return false;
+  }
+  const SelectSource& base = inner->Sources()[0];
+  if (base.query != nullptr || base.unnest || base.is_lateral ||
+      base.table.empty() || !base.using_columns.empty() ||
+      base.from_nested_join || base.join_condition) {
+    return false;
+  }
+  if (outer->IsRecursiveWith(base.table)) {
+    return false;
+  }
+  StatusOr<std::shared_ptr<Table>> base_table = ctx.GetTable(base.table);
+  if (!base_table.HasValue()) {
+    return false;
+  }
+  const Schema& base_schema = base_table.Value()->GetSchema();
+  const std::string inner_alias = base.alias.empty() ? base.table : base.alias;
+  const std::string derived_alias = derived.alias;
+
+  // Expand an inner `*` over the base schema; anything else unexpandable
+  // keeps the relational path.
+  std::vector<NamedExpression> inner_items;
+  for (const NamedExpression& item : inner->SelectList()) {
+    if (item.expression && item.expression->Type() == TypeTag::kColumnValue &&
+        item.expression->AsColumnValue().GetColumnName().name == "*") {
+      const ColumnName& star = item.expression->AsColumnValue().GetColumnName();
+      if (!star.schema.empty() && !IdentifierEquals(star.schema, inner_alias) &&
+          !IdentifierEquals(star.schema, base.table)) {
+        return false;
+      }
+      for (size_t i = 0; i < base_schema.ColumnCount(); ++i) {
+        const std::string& col = base_schema.GetColumn(i).Name().name;
+        inner_items.emplace_back(col, ColumnValueExp(ColumnName(col)));
+      }
+      continue;
+    }
+    inner_items.push_back(item);
+  }
+  DerivedScope scope;
+  scope.derived_alias = derived_alias;
+  scope.inner_alias = inner_alias;
+  scope.base_table = base.table;
+  scope.base_schema = base_schema;
+  for (size_t i = 0; i < base_schema.ColumnCount(); ++i) {
+    std::string lowered = base_schema.GetColumn(i).Name().name;
+    for (char& c : lowered) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    scope.hidden_columns.insert(std::move(lowered));
+  }
+  for (const NamedExpression& item : inner_items) {
+    if (item.name.empty() || !item.expression ||
+        relational_detail::ContainsAggregate(item.expression) ||
+        ContainsQueryExpression(item.expression) ||
+        !DerivedExpressionIsImmutable(item.expression)) {
+      return false;
+    }
+    std::optional<Expression> rebound =
+        RebindInnerExpression(item.expression, scope);
+    if (!rebound.has_value()) {
+      return false;
+    }
+    std::string lowered = item.name;
+    for (char& c : lowered) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (!scope.outputs.try_emplace(lowered, std::move(*rebound)).second) {
+      return false;
+    }
+    scope.hidden_columns.erase(lowered);
+  }
+  std::optional<Expression> rebound_where =
+      RebindInnerExpression(inner->WhereClause(), scope);
+  if (!rebound_where.has_value()) {
+    return false;
+  }
+  // Base column names visible in the outer scope (other sources plus the
+  // flattened base itself): a bare outer reference colliding with one never
+  // substitutes a derived output.
+  std::unordered_set<std::string> base_column_names;
+  for (size_t i = 0; i < sources.size(); ++i) {
+    if (i == index) {
+      continue;
+    }
+    const SelectSource& sibling = sources[i];
+    if (sibling.query != nullptr) {
+      for (const NamedExpression& item : sibling.query->SelectList()) {
+        if (item.name.empty()) {
+          continue;
+        }
+        std::string lowered = item.name;
+        for (char& c : lowered) {
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        base_column_names.insert(std::move(lowered));
+      }
+      continue;
+    }
+    if (sibling.table.empty()) {
+      continue;
+    }
+    StatusOr<std::shared_ptr<Table>> sibling_table =
+        ctx.GetTable(sibling.table);
+    if (!sibling_table.HasValue()) {
+      continue;
+    }
+    for (size_t c = 0; c < sibling_table.Value()->GetSchema().ColumnCount();
+         ++c) {
+      std::string lowered =
+          sibling_table.Value()->GetSchema().GetColumn(c).Name().name;
+      for (char& ch : lowered) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      }
+      base_column_names.insert(std::move(lowered));
+    }
+  }
+  // No bare outer reference may name a base column hidden by the derived
+  // table: it errored (or bound elsewhere) before flattening and must not
+  // silently start resolving to the base table.
+  const auto outer_bare_names = [&](const Expression& expression) {
+    std::unordered_set<std::string> names;
+    if (!expression) {
+      return names;
+    }
+    std::vector<Expression> stack{expression};
+    while (!stack.empty()) {
+      Expression current = std::move(stack.back());
+      stack.pop_back();
+      if (!current) {
+        continue;
+      }
+      if (current->Type() == TypeTag::kColumnValue) {
+        const ColumnName& column = current->AsColumnValue().GetColumnName();
+        if (column.schema.empty() && column.name != "*") {
+          std::string lowered = column.name;
+          for (char& c : lowered) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          }
+          names.insert(std::move(lowered));
+        }
+        continue;
+      }
+      for (const Expression& child : ExpressionChildren(current)) {
+        if (child) {
+          stack.push_back(child);
+        }
+      }
+    }
+    return names;
+  };
+  std::vector<Expression> outer_exprs;
+  if (outer->WhereClause()) {
+    outer_exprs.push_back(outer->WhereClause());
+  }
+  for (const NamedExpression& item : outer->SelectList()) {
+    if (item.expression) {
+      outer_exprs.push_back(item.expression);
+    }
+  }
+  for (const auto& term : outer->OrderBy()) {
+    if (term.expression) {
+      outer_exprs.push_back(term.expression);
+    }
+  }
+  for (const Expression& expression : outer->GroupBy()) {
+    outer_exprs.push_back(expression);
+  }
+  if (outer->Having()) {
+    outer_exprs.push_back(outer->Having());
+  }
+  for (const SelectSource& source : sources) {
+    if (source.join_condition) {
+      outer_exprs.push_back(source.join_condition);
+    }
+  }
+  for (const Expression& expression : outer_exprs) {
+    for (const std::string& name : outer_bare_names(expression)) {
+      if (scope.hidden_columns.contains(name)) {
+        return false;
+      }
+    }
+    // A derived output used as a qualifier (`pb.field` where `pb` is an
+    // output, not a relation) addresses the row value through the derived
+    // scope; substituting the alias away would orphan it. The derived alias
+    // itself is fine (handled by substitution below).
+    std::vector<Expression> stack;
+    if (expression) {
+      stack.push_back(expression);
+    }
+    while (!stack.empty()) {
+      Expression current = std::move(stack.back());
+      stack.pop_back();
+      if (!current) {
+        continue;
+      }
+      if (current->Type() == TypeTag::kColumnValue) {
+        const ColumnName& column = current->AsColumnValue().GetColumnName();
+        if (!column.schema.empty() &&
+            !IdentifierEquals(column.schema, derived_alias)) {
+          std::string lowered = column.schema;
+          for (char& c : lowered) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          }
+          if (scope.outputs.contains(lowered)) {
+            return false;
+          }
+        }
+        continue;
+      }
+      for (const Expression& child : ExpressionChildren(current)) {
+        if (child) {
+          stack.push_back(child);
+        }
+      }
+    }
+  }
+  if (outer->Qualify()) {
+    for (const std::string& name : outer_bare_names(outer->Qualify())) {
+      if (scope.hidden_columns.contains(name) || scope.outputs.contains(name)) {
+        return false;
+      }
+    }
+    for (const ColumnName& column : outer->Qualify()->TouchedColumns()) {
+      if (!column.schema.empty() &&
+          IdentifierEquals(column.schema, derived_alias)) {
+        return false;
+      }
+    }
+  }
+  // Substitute derived references across the outer statement. (Stars were
+  // rejected above and need no handling here.)
+  std::vector<NamedExpression> new_select;
+  for (const NamedExpression& item : outer->SelectList()) {
+    std::optional<Expression> mapped =
+        SubstituteDerivedOutputs(item.expression, scope, base_column_names);
+    if (!mapped.has_value()) {
+      return false;
+    }
+    new_select.emplace_back(item.name, std::move(*mapped));
+  }
+  const auto substitute_field = [&](const Expression& expression) {
+    return SubstituteDerivedOutputs(expression, scope, base_column_names);
+  };
+  std::optional<Expression> new_where = substitute_field(outer->WhereClause());
+  std::vector<SelectStatement::OrderByTerm> new_order = outer->OrderBy();
+  for (auto& term : new_order) {
+    std::optional<Expression> mapped = substitute_field(term.expression);
+    if (!mapped.has_value()) {
+      return false;
+    }
+    term.expression = std::move(*mapped);
+  }
+  std::vector<Expression> new_group;
+  for (const Expression& expression : outer->GroupBy()) {
+    std::optional<Expression> mapped = substitute_field(expression);
+    if (!mapped.has_value()) {
+      return false;
+    }
+    new_group.push_back(std::move(*mapped));
+  }
+  std::optional<Expression> new_having = substitute_field(outer->Having());
+  if (!new_where.has_value() || !new_having.has_value()) {
+    return false;
+  }
+  // Merge the inner WHERE into the outer WHERE — or into the ON condition
+  // when the flattened source is null-supplying for its immediate outer
+  // join (a post-padding residual would drop padded rows outright).
+  Expression merged_where = std::move(*new_where);
+  // The join carrying the ON lives on the later source of each pair. When
+  // the derived table is the right operand (index > 0) that is its own slot;
+  // when it is the left operand of `d RIGHT JOIN next`, the ON sits on the
+  // next source.  Every source's ON must be rebound through the derived
+  // scope first: the derived alias disappears after flattening, so an
+  // unrebound `d.col` would silently bind to the base table or fail.
+  const size_t on_index =
+      index > 0 ? index : (sources.size() > 1 ? size_t{1} : index);
+  for (auto& source : sources) {
+    if (!source.join_condition) {
+      continue;
+    }
+    std::optional<Expression> mapped = substitute_field(source.join_condition);
+    if (!mapped.has_value()) {
+      return false;
+    }
+    source.join_condition = std::move(*mapped);
+  }
+  if (inner_where_to_on) {
+    Expression on = sources[on_index].join_condition;
+    if (*rebound_where) {
+      on = on ? BinaryExpressionExp(on, BinaryOperation::kAnd, *rebound_where)
+              : *rebound_where;
+    }
+    sources[on_index].join_condition = std::move(on);
+  } else if (*rebound_where) {
+    merged_where =
+        merged_where ? BinaryExpressionExp(merged_where, BinaryOperation::kAnd,
+                                           *rebound_where)
+                     : *rebound_where;
+  }
+  // Publish the base table under the derived alias and drop the subquery.
+  sources[index].table = base.table;
+  sources[index].query = nullptr;
+  outer->SetSources(std::move(sources));
+  outer->SetWhereClause(std::move(merged_where));
+  outer->SetSelectList(std::move(new_select));
+  outer->SetOrderBy(std::move(new_order));
+  outer->SetGroupBy(std::move(new_group));
+  outer->SetHaving(std::move(*new_having));
+  return true;
+}
+
+// Budget for eager CTE cells (M4): planning-time memory plus memo
+// fingerprint cost stay trivial; anything bigger keeps the materialized
+// relational path.
+constexpr size_t kMaxMaterializedCteRows = 1024;
+
+}  // namespace
+
+void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
+                                LiftedCtes* lifted) {
+  if (outer == nullptr || lifted == nullptr || outer->WithQueries().empty() ||
+      force_relational_fallback_) {
+    return;
+  }
+  // Grouped outer queries never reach the cell-reading paths (grouping
+  // routes relational), so lifting would only waste eager execution.
+  if (!outer->GroupBy().empty() || outer->Having()) {
+    return;
+  }
+  bool outer_has_aggregate = false;
+  for (const NamedExpression& item : outer->SelectList()) {
+    if (relational_detail::ContainsAggregate(item.expression)) {
+      outer_has_aggregate = true;
+      break;
+    }
+  }
+  if (outer_has_aggregate) {
+    return;
+  }
+  // Relational-only features never compose with cells either (same set as
+  // PostRewriteNeedsRelational minus the CTE/derived clauses this lifting
+  // resolves; keep in sync). Lifting there would execute eagerly only to
+  // discard the rows on the relational fallback.
+  for (const SelectSource& source : outer->Sources()) {
+    if (source.unnest || source.is_lateral || !source.using_columns.empty() ||
+        source.from_nested_join || source.join_type == JoinType::kRight ||
+        source.join_type == JoinType::kFull ||
+        NeedsRelationalEvaluation(source.join_condition)) {
+      return;
+    }
+  }
+  for (const NamedExpression& item : outer->SelectList()) {
+    if (NeedsRelationalEvaluation(item.expression)) {
+      return;
+    }
+    if (item.expression &&
+        item.expression->Type() == TypeTag::kFunctionCallExp &&
+        (item.expression->AsFunctionCallExpression().FuncName() ==
+             "__value_table_value" ||
+         item.expression->AsFunctionCallExpression().FuncName() ==
+             "__proto_new")) {
+      return;
+    }
+  }
+  if (NeedsRelationalEvaluation(outer->WhereClause()) ||
+      relational_detail::HasWindowFunctions(*outer) || outer->Qualify() ||
+      !outer->UnionAll().empty() || outer->GetSetOperationTree() != nullptr ||
+      outer->HasDistinctOn() || outer->WithTies()) {
+    return;
+  }
+  for (const auto& term : outer->OrderBy()) {
+    if (NeedsRelationalEvaluation(term.expression)) {
+      return;
+    }
+  }
+  // Deterministic declaration order for reproducible plans.
+  std::vector<std::string> names;
+  for (const std::string& name : outer->WithQueryOrder()) {
+    if (outer->WithQueries().contains(name)) {
+      names.push_back(name);
+    }
+  }
+  for (const auto& [name, body] : outer->WithQueries()) {
+    (void)body;
+    if (!outer->IsRecursiveWith(name) &&
+        std::ranges::find(names, name) == names.end()) {
+      names.push_back(name);
+    }
+  }
+  // Plain (non-recursive) names lift here; recursive ones belong to
+  // LiftRecursiveCtes below and stay mapped meanwhile. Reference counting
+  // still spans every name so a plain CTE referenced from a recursive body
+  // (or anywhere off the top level) keeps the layer mapped.
+  std::vector<std::string> plain_names;
+  for (const std::string& name : names) {
+    if (!outer->IsRecursiveWith(name)) {
+      plain_names.push_back(name);
+    }
+  }
+  if (plain_names.empty()) {
+    return;
+  }
+  std::unordered_set<std::string> name_set(names.begin(), names.end());
+  std::unordered_map<std::string, size_t> total_refs;
+  CountCteReferencesInStatement(*outer, name_set, &total_refs);
+  // Every reference must be a top-level FROM source: nested placements
+  // (expression subqueries, set-op branches, sibling bodies) keep the
+  // map-scoped execution they rely on.
+  std::unordered_map<std::string, std::vector<size_t>> top_sites;
+  for (size_t i = 0; i < outer->Sources().size(); ++i) {
+    const std::string& table = outer->Sources()[i].table;
+    if (name_set.contains(table)) {
+      top_sites[table].push_back(i);
+    }
+  }
+  size_t top_total = 0;
+  for (const auto& [name, sites] : top_sites) {
+    (void)name;
+    top_total += sites.size();
+  }
+  size_t grand_total = 0;
+  for (const auto& [name, count] : total_refs) {
+    (void)name;
+    grand_total += count;
+  }
+  if (top_total != grand_total) {
+    return;
+  }
+  // Every mapped CTE participates (no dead entries left behind to block
+  // routing, no unmapped stragglers): each needs at least one top-level
+  // site, distinct normalized aliases per CTE, and a CTE-free body with
+  // unique output names.
+  for (const std::string& name : plain_names) {
+    const auto sites_it = top_sites.find(name);
+    if (sites_it == top_sites.end() || sites_it->second.empty()) {
+      return;
+    }
+    std::unordered_set<std::string> aliases;
+    for (size_t index : sites_it->second) {
+      const std::string& alias = outer->Sources()[index].alias;
+      if (!aliases.insert(alias.empty() ? name : alias).second) {
+        return;
+      }
+    }
+    const auto body_it = outer->WithQueries().find(name);
+    if (body_it == outer->WithQueries().end() || body_it->second == nullptr) {
+      return;
+    }
+    std::unordered_map<std::string, size_t> body_refs;
+    CountCteReferencesInStatement(*body_it->second, name_set, &body_refs);
+    for (const auto& [ref, count] : body_refs) {
+      (void)ref;
+      if (count > 0) {
+        return;
+      }
+    }
+    std::unordered_set<std::string> output_names;
+    for (const NamedExpression& item : body_it->second->SelectList()) {
+      if (item.name.empty()) {
+        return;
+      }
+      std::string lowered = item.name;
+      for (char& c : lowered) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (!output_names.insert(std::move(lowered)).second) {
+        return;
+      }
+    }
+    if (output_names.empty()) {
+      return;
+    }
+  }
+  // All gates passed: plan + execute each body through a fresh engine (same
+  // transaction snapshot as the outer query; isolated facade state so the
+  // outer preparation is undisturbed). Bodies are loaned out of the map and
+  // moved straight back afterwards, so the map is complete on every return
+  // path and the abort path is identical to never having tried (bodies may
+  // come back statement-rewritten by the inner preparation, which preserves
+  // their row multisets).
+  SqlEngine body_engine(*database_);
+  struct LiftedRows {
+    std::string name;
+    std::vector<std::string> labels;
+    std::vector<Row> rows;
+  };
+  std::vector<LiftedRows> lifted_rows;
+  for (const std::string& name : plain_names) {
+    const auto body_it = outer->WithQueries().find(name);
+    if (body_it == outer->WithQueries().end() || body_it->second == nullptr) {
+      return;
+    }
+    // Shared ownership: the inner preparation may statement-rewrite the
+    // (shared) body, which preserves its row multiset by construction; the
+    // map entry itself is never disturbed, so every return path below keeps
+    // a complete map and the abort path is identical to never having tried.
+    StatusOr<Executor> planned = body_engine.PrepareStatement(
+        ctx, std::make_unique<SelectStatement>(*body_it->second));
+    if (!planned.HasValue()) {
+      return;
+    }
+    // The facade contract serves rows in ResultColumnNames order.
+    const std::vector<std::string>& labels = body_engine.ResultColumnNames();
+    if (labels.empty()) {
+      return;
+    }
+    LiftedRows lifted_body;
+    lifted_body.name = name;
+    lifted_body.labels = labels;
+    Row row;
+    size_t drained = 0;
+    while (planned.Value()->Next(&row, nullptr)) {
+      if (row.values_.size() != labels.size()) {
+        return;
+      }
+      if (++drained > kMaxMaterializedCteRows) {
+        return;
+      }
+      lifted_body.rows.push_back(std::move(row));
+    }
+    if (planned.Value()->GetStatus() != Status::kSuccess) {
+      return;
+    }
+    lifted_rows.push_back(std::move(lifted_body));
+  }
+  // Commit: normalize site aliases (FROM identities for the memo groups) and
+  // record one alias-qualified cell per reference site sharing the rows.
+  std::unordered_map<std::string, std::shared_ptr<MaterializedCte>> cells;
+  std::vector<SelectSource> sources = outer->Sources();
+  for (LiftedRows& lifted_body : lifted_rows) {
+    // First-non-null type inference per column; all-null stays Null (typed
+    // rewrites treat it conservatively, row semantics stay dynamic).
+    std::vector<ValueType> column_types(lifted_body.labels.size(),
+                                        ValueType::kNull);
+    for (const Row& row : lifted_body.rows) {
+      for (size_t i = 0; i < row.values_.size() && i < column_types.size();
+           ++i) {
+        if (!row.values_[i].IsNull() && column_types[i] == ValueType::kNull) {
+          column_types[i] = row.values_[i].type;
+        }
+      }
+    }
+    for (SelectSource& source : sources) {
+      if (source.table != lifted_body.name) {
+        continue;
+      }
+      const std::string alias =
+          source.alias.empty() ? lifted_body.name : source.alias;
+      source.alias = alias;
+      std::vector<Column> columns;
+      columns.reserve(lifted_body.labels.size());
+      for (size_t c = 0; c < lifted_body.labels.size(); ++c) {
+        columns.emplace_back(ColumnName(alias, lifted_body.labels[c]),
+                             column_types[c]);
+      }
+      auto cell = std::make_shared<MaterializedCte>();
+      cell->schema = Schema(alias, std::move(columns));
+      cell->rows = lifted_body.rows;
+      cells.emplace(alias, std::move(cell));
+    }
+  }
+  outer->SetSources(std::move(sources));
+  lifted->cells = std::move(cells);
+  // Every remaining non-recursive entry lifted (atomic gates above), so all
+  // of them are covered from here on.
+  for (const auto& [name, body] : outer->WithQueries()) {
+    (void)body;
+    if (!outer->IsRecursiveWith(name)) {
+      lifted->covered.insert(name);
+    }
+  }
+  if (!lifted->cells.empty()) {
+    plan_cache_fingerprint_.clear();
+    plan_cache_parameters_.clear();
+  }
+}
+
+// A recursive CTE lifts to an opaque memo leaf when exactly one top-level
+// FROM site references it and its body references no mapped CTE except
+// itself (the worktable). Sibling-scoped references keep the map-scoped
+// execution they rely on; multiple sites would re-run the fixpoint per
+// site instead of sharing it.
+namespace {
+
+bool RecursiveCteLiftable(const SelectStatement& outer,
+                          const std::string& name) {
+  int top_sites = 0;
+  for (const SelectSource& source : outer.Sources()) {
+    if (source.table == name) {
+      ++top_sites;
+    }
+  }
+  if (top_sites != 1) {
+    return false;
+  }
+  const auto body_it = outer.WithQueries().find(name);
+  if (body_it == outer.WithQueries().end() || body_it->second == nullptr) {
+    return false;
+  }
+  const SelectStatement& body = *body_it->second;
+  std::unordered_set<std::string> names;
+  for (const auto& [entry, entry_body] : outer.WithQueries()) {
+    (void)entry_body;
+    names.insert(entry);
+  }
+  std::unordered_map<std::string, size_t> total_refs;
+  CountCteReferencesInStatement(outer, names, &total_refs);
+  std::unordered_map<std::string, size_t> body_refs;
+  CountCteReferencesInStatement(body, names, &body_refs);
+  // Exactly one EXTERNAL reference, living at the top level: the body's own
+  // worktable self-references do not count (they resolve inside the
+  // fixpoint, not through the map).
+  size_t self_refs = 0;
+  const auto self_it = body_refs.find(name);
+  if (self_it != body_refs.end()) {
+    self_refs = self_it->second;
+  }
+  const auto total_it = total_refs.find(name);
+  const size_t total = total_it == total_refs.end() ? 0 : total_it->second;
+  if (top_sites != 1 || total != 1 + self_refs) {
+    return false;
+  }
+  for (const auto& [ref, count] : body_refs) {
+    if (ref != name && count > 0) {
+      return false;
+    }
+  }
+  // Unique output names for the leaf schema (mirrors the cell gate: the
+  // downstream name maps cannot tell duplicates apart).
+  std::unordered_set<std::string> output_names;
+  for (const NamedExpression& item : body.SelectList()) {
+    if (item.name.empty()) {
+      return false;
+    }
+    std::string lowered = item.name;
+    for (char& c : lowered) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (!output_names.insert(std::move(lowered)).second) {
+      return false;
+    }
+  }
+  return !output_names.empty();
+}
+}  // namespace
+
+void SqlEngine::LiftRecursiveCtes(SelectStatement* outer, LiftedCtes* lifted) {
+  auto seal_coverage = [&] {
+    if (lifted == nullptr) {
+      return;
+    }
+    lifted->fully_covered = true;
+    if (outer != nullptr) {
+      for (const auto& [name, body] : outer->WithQueries()) {
+        (void)body;
+        if (!lifted->covered.contains(name)) {
+          lifted->fully_covered = false;
+          break;
+        }
+      }
+    }
+  };
+  if (outer == nullptr || lifted == nullptr || outer->WithQueries().empty() ||
+      force_relational_fallback_) {
+    seal_coverage();
+    return;
+  }
+  for (const auto& [name, body] : outer->WithQueries()) {
+    if (!outer->IsRecursiveWith(name) || body == nullptr) {
+      continue;
+    }
+    if (!RecursiveCteLiftable(*outer, name)) {
+      continue;
+    }
+    // Normalize the single site's alias (FROM identity for the memo group).
+    for (SelectSource& source :
+         const_cast<std::vector<SelectSource>&>(outer->Sources())) {
+      if (source.table == name && source.alias.empty()) {
+        source.alias = name;
+      }
+    }
+    std::string alias;
+    for (const SelectSource& source : outer->Sources()) {
+      if (source.table == name) {
+        alias = source.alias.empty() ? name : source.alias;
+        break;
+      }
+    }
+    if (alias.empty()) {
+      continue;
+    }
+    // A reference that already renames the CTE keeps its alias, but only
+    // when nothing still qualifies the CTE name itself.
+    if (alias != name && StatementQualifiesName(*outer, name)) {
+      continue;
+    }
+    std::vector<Column> columns;
+    for (const NamedExpression& item : body->SelectList()) {
+      columns.emplace_back(ColumnName(alias, item.name), ValueType::kNull);
+    }
+    RecursiveCteRef ref;
+    ref.body = body;
+    ref.output_schema = Schema(alias, std::move(columns));
+    if (const RecursiveDepthSpec* depth = outer->RecursiveDepthOf(name)) {
+      ref.depth_spec = *depth;
+    }
+    lifted->recursive.emplace(alias, std::move(ref));
+    lifted->covered.insert(name);
+  }
+  seal_coverage();
+}
+
 StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
-    const SelectStatement& select, TransactionContext& ctx) {
+    const SelectStatement& select, TransactionContext& ctx,
+    const LiftedCtes* lifted) {
   // Core: FROM + WHERE (+ join conditions) optimized by Cascades.  The
   // projection carries every base column the grouping pipeline needs
   // (select list, GROUP BY, HAVING, ORDER BY); Project re-resolves the real
   // select list against this core output.
   QueryData core;
+  if (lifted != nullptr) {
+    core.lifted_ctes_ = *lifted;
+  }
   Expression where = select.WhereClause();
   std::unordered_set<std::string> seen_relations;
   for (const SelectSource& source : select.Sources()) {
@@ -2974,7 +5014,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
               cell = Value(static_cast<double>(cell.value.int_value));
             }
           }
-          ASSIGN_OR_RETURN(RowPosition, pos, table.Insert(ctx.txn_, row));
+          RETURN_IF_FAIL(table.Insert(ctx.txn_, row).GetStatus());
         }
         return Executor(std::make_shared<ConstantExecutor>(
             Row({Value("CREATE TABLE"),
@@ -3095,11 +5135,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           if (col.IsUnsigned()) {
             if (!row[i].IsNull()) {
               if (row[i].type != ValueType::kInt64) {
-                last_error_ = "INSERT type mismatch for column " + col.Name().name;
+                last_error_ =
+                    "INSERT type mismatch for column " + col.Name().name;
                 return Status::kUnknown;
               }
               if (!row[i].IsUnsigned() && row[i].value.int_value < 0) {
-                last_error_ = "assignment out of range for column " + col.Name().name;
+                last_error_ =
+                    "assignment out of range for column " + col.Name().name;
                 return Status::kUnknown;
               }
               row[i] = row[i].WithUnsigned();
@@ -3119,8 +5161,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             row[i] = Value::Date(row[i].value.varchar_value);
             continue;
           }
-          last_error_ = "INSERT type mismatch for column " +
-                        col.Name().name;
+          last_error_ = "INSERT type mismatch for column " + col.Name().name;
           return Status::kUnknown;
         }
       }
@@ -3208,6 +5249,17 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       auto select = std::shared_ptr<SelectStatement>(
           dynamic_cast<SelectStatement*>(statement.release()));
+      // M4: inline singly-referenced non-recursive CTEs into derived
+      // sources, then lift the remaining layer (shared eager cells plus
+      // opaque recursive leaves) when atomic; M5 flattens the single-table
+      // derived sources last. All rewrites preserve the row multiset;
+      // anything they reject keeps the existing materialized/relational
+      // path untouched.
+      (void)InlineSingleUseCtes(select.get());
+      LiftedCtes lifted;
+      MaterializeCtes(select.get(), ctx, &lifted);
+      LiftRecursiveCtes(select.get(), &lifted);
+      (void)FlattenDerivedSources(select.get(), ctx, &lifted);
       // A WHERE conjunct that rejects the NULL padding of a LEFT JOIN makes
       // the outer join's padded rows unreachable; planning it as an inner
       // join is exact and unlocks hash-join fast paths (§7.5).
@@ -3376,6 +5428,17 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                         return source.query == nullptr && !source.unnest &&
                                !source.is_lateral && !source.table.empty();
                       });
+      // M6: the grouped bridge folds every ON condition into WHERE, which is
+      // exact only for inner joins. Outer joins keep their ON predicates on
+      // the join itself and stay out of the bridge until the memo models
+      // grouped outer joins.
+      const bool has_outer_join =
+          std::any_of(select->Sources().begin(), select->Sources().end(),
+                      [](const SelectSource& source) {
+                        return source.join_type == JoinType::kLeft ||
+                               source.join_type == JoinType::kRight ||
+                               source.join_type == JoinType::kFull;
+                      });
       // Set operations fold independently planned operands, so a FROM-side
       // UNNEST is fine: each operand routes through its own statement
       // planning.  Subquery sources and LATERAL stay on the other paths.
@@ -3384,6 +5447,10 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                       [](const SelectSource& source) {
                         return source.query == nullptr && !source.is_lateral;
                       });
+      // M-union: merge same-table UNION ALL / UNION DISTINCT branches into
+      // one scan before operand planning (the merged shape routes through
+      // the normal single-query paths below).
+      (void)MergeCompatibleUnionBranches(select.get(), ctx);
       if (!select->UnionAll().empty() && !has_value_table_operand &&
           select->WithQueries().empty() && sources_setop_safe) {
         return ExecuteSetOperation(*select, ctx);
@@ -3423,15 +5490,17 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // The bridge executes multi-relation and single-relation grouped
         // queries through the Cascades core (join ordering, access paths,
         // filter pushdown), feeding the grouping finish pipeline (GroupByPlan).
+        // Routing reads the post-rewrite shape: flattened/inlined inputs are
+        // plain by now, while genuinely complex shapes stay relational.
         if (!force_relational_fallback_ && select->Sources().size() > 1 &&
             has_grouping && !simple_count_star && !select->Qualify() &&
             !relational_detail::HasWindowFunctions(*select) &&
-            select->WithQueries().empty() && sources_plain &&
-            (!select->RequiresRelationalEvaluation() ||
+            select->WithQueries().empty() && sources_plain && !has_outer_join &&
+            (!PostRewriteNeedsRelational(*select, &lifted) ||
              can_decorrelate_subqueries) &&
             !touches_query_expression(select->WhereClause()) &&
             !grouped_expressions_correlate) {
-          return ExecuteGroupedSelect(*select, ctx);
+          return ExecuteGroupedSelect(*select, ctx, &lifted);
         }
       }
       const auto touches_query_expression =
@@ -3496,8 +5565,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           return unnest_exec;
         }
       }
+      // Routing reads the post-rewrite shape (see PostRewriteNeedsRelational):
+      // statements whose derived/CTE complexity the rewrites eliminated flow
+      // to the cost-based planner; the optimizer's kNotImplemented fallback
+      // still catches anything beyond its slices.
       if (force_relational_fallback_ ||
-          (select->RequiresRelationalEvaluation() &&
+          (PostRewriteNeedsRelational(*select, &lifted) &&
            !can_decorrelate_subqueries) ||
           select->Sources().empty() || has_unnest || has_lateral ||
           touches_array_subquery ||
@@ -3511,7 +5584,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           return emit_relational();
         }
       }
-      if (select->RequiresRelationalEvaluation() && !simple_count_star &&
+      if (PostRewriteNeedsRelational(*select, &lifted) && !simple_count_star &&
           !can_decorrelate_subqueries) {
         return emit_relational();
       }
@@ -3534,7 +5607,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       QueryData query;
       Expression where = select->WhereClause();
       std::unordered_set<std::string> seen_relations;
-      for (const SelectSource& source : select->Sources()) {
+      for (size_t i = 0; i < select->Sources().size(); ++i) {
+        const SelectSource& source = select->Sources()[i];
         if (!seen_relations.insert(source.alias).second) {
           last_error_ = "duplicate FROM relation; use distinct aliases";
           return Status::kUnknown;
@@ -3544,12 +5618,34 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           query.aliases_.emplace(source.alias, source.table);
         }
         if (source.join_condition) {
-          where = where ? BinaryExpressionExp(where, BinaryOperation::kAnd,
-                                              source.join_condition)
-                        : source.join_condition;
+          // M6+1: a LEFT/RIGHT/FULL ON condition rides the outer-join
+          // predicate, never WHERE (ON filters before NULL padding, WHERE
+          // after). Anything beyond the optimizer's outer slice was already
+          // routed to the relational path; reaching it here is a programming
+          // error, so fall back rather than folding it unsoundly.
+          if (source.join_type == JoinType::kLeft ||
+              source.join_type == JoinType::kRight ||
+              source.join_type == JoinType::kFull) {
+            if (i == 0) {
+              return emit_relational();
+            }
+            QueryData::OuterJoinEdge edge;
+            edge.right_index = query.from_.size() - 1;
+            edge.join_kind = source.join_type == JoinType::kLeft    ? 0
+                             : source.join_type == JoinType::kRight ? 1
+                                                                    : 2;
+            edge.on_condition = source.join_condition;
+            query.outer_joins_.push_back(std::move(edge));
+          } else {
+            where = where ? BinaryExpressionExp(where, BinaryOperation::kAnd,
+                                                source.join_condition)
+                          : source.join_condition;
+          }
         }
       }
       query.where_ = where ? where : ConstantValueExp(Value(true));
+      query.lifted_ctes_ = lifted;
+      query.qualify_ = select->Qualify();
       query.select_.reserve(select->SelectList().size());
       for (const NamedExpression& item : select->SelectList()) {
         NamedExpression copied = item;
@@ -3590,6 +5686,27 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                                                   : aliased->second;
                 if (!column.schema.empty() && column.schema != relation &&
                     column.schema != physical) {
+                  continue;
+                }
+                // Lifted CTE leaves (M4) expand from their leaf schemas,
+                // exactly like a base table's columns under this relation.
+                const Schema* leaf_schema = nullptr;
+                const auto cell = lifted.cells.find(relation);
+                if (cell != lifted.cells.end() && cell->second != nullptr) {
+                  leaf_schema = &cell->second->schema;
+                } else {
+                  const auto rec = lifted.recursive.find(relation);
+                  if (rec != lifted.recursive.end()) {
+                    leaf_schema = &rec->second.output_schema;
+                  }
+                }
+                if (leaf_schema != nullptr) {
+                  matched_relation = true;
+                  const Schema& source_schema = *leaf_schema;
+                  for (size_t i = 0; i < source_schema.ColumnCount(); ++i) {
+                    expanded.emplace_back(ColumnName(
+                        relation, source_schema.GetColumn(i).Name().name));
+                  }
                   continue;
                 }
                 StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
@@ -3696,6 +5813,21 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             // expression here makes the post-plan IsOrderedBy comparison
             // fail and stack a second sort above one the plan already
             // declared.
+            order_needs_projection_binding = true;
+          } else if (selected->expression &&
+                     selected->expression->Type() != TypeTag::kColumnValue) {
+            // An unnamed computed projection has no output name to bind: the
+            // source form would evaluate against output rows that no longer
+            // expose the source columns. Name the projection output
+            // deterministically (client labels were captured before this
+            // runs, and the trim below is positional) so every layer keys on
+            // the output column instead; the plan side resolves it through
+            // the same name.
+            const std::string sort_name =
+                "$sort" +
+                std::to_string(std::distance(query.select_.begin(), selected));
+            selected->name = sort_name;
+            sort_expressions.push_back(ColumnValueExp(ColumnName(sort_name)));
             order_needs_projection_binding = true;
           } else {
             sort_expressions.push_back(order.expression);

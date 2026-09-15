@@ -752,3 +752,94 @@ routing work and the relational-planner bytecode filter work integrated):
   agent's builds were saturating the machine; treat 6,384 as the
   representative quiet-tree figure.
 
+
+## 2026-09-13 — TPC-H SF=1 (partial: Q1–Q19 + Q22; Q20/Q21 abort) — appendix, not a gate baseline
+
+(This section is appended at the end deliberately so `bench_gate.py`, which
+treats the FIRST section as baseline, never picks up these partial numbers.
+Q1–Q22 sum is unavailable: Q20/Q21 produced no result.)
+
+- **Build:** `build/`, `CMAKE_BUILD_TYPE=RelWithDebInfo`, working tree at
+  `3880673` plus uncommitted WIP (optimizer rule batch: 119 logical / 79 scalar /
+  47 physical rules, outer NL, stream agg, materialize/spool, exchange no-ops;
+  plus unrelated in-flight work from a second agent sharing the checkout,
+  including its fuzzer farm running during the measurement window).
+- **Host:** 32 cores, 121 GiB RAM, /tmp on tmpfs. NOT quiet: concurrent builds
+  and libFuzzer sweeps ran throughout; single-query numbers carry scheduler
+  noise (e.g. Q6 487 ms vs 1041 ms across the two runs).
+- **Commands:**
+  `./build/tinylamb_tpch_benchmark /tmp/opencode/tpch/sf1 --scale-factor 1 --force`
+  (fresh fixture: dbgen 6.7 s, load 21.6 s total, ANALYZE included), repeated
+  into `/tmp/opencode/tpch/sf1b`. Q20/Q21/Q22 also attempted individually with
+  `--reuse-database --query N` (reuse path re-runs ANALYZE, 8 tables, ~8 s).
+- **Fixture:** SF=1 official (`official_sf=true`): region 5, nation 25,
+  supplier 10K, customer 150K, part 200K, partsupp 800K, orders 1.5M,
+  lineitem 6,001,215 rows.
+
+### SF=1 results, Q1–Q19 (two runs, all `RelationalExecutor`)
+
+| Query | Run1 (ms) | Run2 (ms) | Rows |
+| --- | ---: | ---: | ---: |
+| Q1 | 5403.5 | 5949.2 | 4 |
+| Q2 | 750.5 | 752.5 | 100 |
+| Q3 | 1053.9 | 1043.4 | 10 |
+| Q4 | 4525.5 | 4497.4 | 5 |
+| Q5 | 1295.8 | 1301.7 | 5 |
+| Q6 | 487.5 | 1041.2 | 1 |
+| Q7 | 1688.0 | 1708.7 | 4 |
+| Q8 | 1669.5 | 1613.2 | 5 |
+| Q9 | 8666.6 | 8901.4 | 175 |
+| Q10 | 1301.4 | 1307.9 | 20 |
+| Q11 | 449.1 | 463.0 | 741 |
+| Q12 | 651.0 | 698.8 | 2 |
+| Q13 | 2202.5 | 2229.4 | 42 |
+| Q14 | 326.8 | 333.7 | 1 |
+| Q15 | 571.7 | 583.1 | 1 |
+| Q16 | 449.3 | 469.4 | 18331 |
+| Q17 | 4047.6 | 3259.7 | 1 |
+| Q18 | 3001.1 | 2863.5 | 100 |
+| Q19 | 5006.5 | 4986.2 | 1 |
+
+- **Query sum (Q1–Q19):** **43.55 s** (run1) / **44.00 s** (run2). Reference:
+  2026-08 opt16c SF1 baseline **45.34 s** for Q1–Q22 — consistent within noise
+  and build-type difference, but NOT directly comparable (different query
+  coverage, RelWithDebInfo vs. that run's build, noisy machine).
+- Profile shape: scan-bound (Q1 5.35 s scan of 5.94M lineitem rows, Q9 join
+  2.48 s, Q17 filter 3.33 s). All 19 ran on `RelationalExecutor` (unaliased
+  multi-table shapes stay on the heuristic path per the M4–M8 routing map).
+
+### Q20 — no result (correlated cross-product grind + process death)
+
+- Isolated `--query 20` grinds at 100% of one core (~38 MB RSS, no I/O):
+  a gdb sample caught it inside the relational fallback's in-memory
+  nested-loop `InnerJoin` (`executor/detail/planning_heuristics.cpp:884`,
+  `predicates` empty) under `ExecuteCachedUncorrelated` — i.e. the EXISTS
+  uncorrelated-cache path materializes a predicate-less cross product, which
+  at SF1 (800K partsupp × 6M lineitem scale) does not finish in practicable
+  time (killed after 400 s still inside the join; an earlier attempt ground
+  30+ min the same way). SF=0.01 completes it in ~80 ms, confirming the
+  superlinear blowup.
+- Separately, both full runs' processes vanished ~50 s into Q20 with a WAL
+  `Logger::SetFailed` as the last word and torn fixtures (broken pages +
+  WAL corruption at reopen) left behind. Correlated in time with heavy
+  concurrent machine load (second benchmark process + fuzzer farm), so the
+  logger failure is not proven to be Q20's fault; the grind above is the
+  confirmed Q20 finding.
+
+### Q21 — no result (silent death; consistent with known spill failure)
+
+- `--query 21` analyzed (8 tables, 7.8 s) then the process vanished with no
+  profile and no error line. Consistent with the pre-existing
+  `spill write failed` Q21 failure recorded at SF=0.01, now fatal at SF1.
+
+### Q22 — 116,483 ms, rows=7 (with stats)
+
+- Breakdown: filter 116,224 ms of 116,483 ms total (`correlated_hash_probes`
+  19,040, `correlated_cache_hits` 61,128, join 0 ms): the customer anti-join
+  subquery evaluates per-outer-row without effective decorrelation — same
+  correlated-execution family as Q20, ~9400× the SF=0.01 cold figure (394 ms)
+  for 100× rows. Row count 7 matches the SF=0.01 result.
+
+### Correctness
+
+- `sql_engine_tpch_test.ExecutesAllTwentyTwoQueries` PASS (from the same tree).

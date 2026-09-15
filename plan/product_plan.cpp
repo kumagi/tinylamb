@@ -40,8 +40,8 @@ namespace {
 
 // JoinKind values (executor/join_kind.hpp). The plan layer sees only the
 // opaque enum, so comparisons go through the fixed underlying values; the
-// executor header owns the names and any future additions.
-constexpr uint8_t kJoinKindInner = 0;
+// executor header owns the names and any future additions. Inner (0) needs
+// no constant: it is the complement of the semi/anti/outer predicates.
 constexpr uint8_t kJoinKindSemi = 1;
 constexpr uint8_t kJoinKindAnti = 2;
 constexpr uint8_t kJoinKindNullAwareAnti = 3;
@@ -341,6 +341,9 @@ bool ProductPlan::IsOrderedBy(const std::vector<Expression>& expressions,
 
 void ProductPlan::Dump(std::ostream& o, int indent) const {
   o << "Product: ";
+  if (batch_nested_loop_) {
+    o << "Batch ";
+  }
   if (static_cast<uint8_t>(kind_) == kJoinKindSemi) {
     o << "Semi Join ";
   } else if (static_cast<uint8_t>(kind_) == kJoinKindAnti) {
@@ -394,6 +397,9 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
 
 std::string ProductPlan::ToString() const {
   std::string s = "Product: ";
+  if (batch_nested_loop_) {
+    s += "Batch ";
+  }
   if (static_cast<uint8_t>(kind_) == kJoinKindSemi) {
     s += "Semi Join ";
   } else if (static_cast<uint8_t>(kind_) == kJoinKindAnti) {

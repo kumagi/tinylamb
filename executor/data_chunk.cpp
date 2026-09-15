@@ -65,7 +65,9 @@ void ColumnVector::Append(const Value& value) {
     unsigned_ = value.IsUnsigned();
     MaterializeInferredStorage();
   } else if (!is_null && type_ != value.type) {
-    CHECK_MSG(false, "column vector type mismatch");
+    CHECK_MSG(false, "column vector type mismatch: column=" +
+                         std::string(ValueTypeToString(type_)) + " value=" +
+                         std::string(ValueTypeToString(value.type)));
   }
   EnsureNullBit(size_, is_null);
   if (is_null) {

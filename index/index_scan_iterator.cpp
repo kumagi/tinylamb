@@ -62,7 +62,19 @@ Value FirstOrNull(const std::vector<Value>& parts) {
   return parts.empty() ? Value() : parts.front();
 }
 
+// The decoded key image holds exactly the index key columns in key order;
+// any NULL part means the entry was stored through the multi-value list
+// encoding (see Table::IndexInsert), even on a kUnique index.
+bool KeyImageHasNull(const Row& key_image) {
+  return std::ranges::any_of(key_image.values_,
+                             [](const Value& value) { return value.IsNull(); });
+}
+
 }  // namespace
+
+bool IndexScanIterator::StoredAsSingleValue() const {
+  return is_unique_ && !KeyImageHasNull(keys_);
+}
 
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
                                      Transaction& txn, const Value& begin,
@@ -92,7 +104,7 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
     return;
   }
   keys_.DecodeMemcomparableFormat(iter_.Key());
-  if (is_unique_) {
+  if (StoredAsSingleValue()) {
     StatusOr<Table::IndexValueType> val =
         Decode<Table::IndexValueType>(iter_.Value());
     if (!val.HasValue()) {
@@ -152,7 +164,7 @@ void IndexScanIterator::UpdateIteratorState() {
     return;
   }
   keys_.DecodeMemcomparableFormat(iter_.Key());
-  if (is_unique_) {
+  if (StoredAsSingleValue()) {
     StatusOr<Table::IndexValueType> rp =
         Decode<Table::IndexValueType>(GetValue());
     if (!rp.HasValue()) {
@@ -186,10 +198,16 @@ void IndexScanIterator::ResolveRow() const {
   StatusOr<PageRef> ref = txn_.GetPageManager()->GetPage(pos_.page_id, true);
   if (!ref.HasValue()) {
     // const method: record the failure through the mutable sticky status.
+    // Clear the cached row as well: operator* must not re-emit the previous
+    // row once resolution failed.
     const_cast<IndexScanIterator*>(this)->status_ = ref.GetStatus();
+    current_row_.Clear();
+    current_row_resolved_ = true;
     return;
   }
   if (!ref.Value().IsValid()) {
+    current_row_.Clear();
+    current_row_resolved_ = true;
     return;
   }
   StatusOr<std::string_view> row = ref.Value()->Read(txn_, pos_.slot);
@@ -223,7 +241,7 @@ IteratorBase& IndexScanIterator::operator++() {
     return *this;
   }
   if (!ascending_) {
-    if (is_unique_) {
+    if (StoredAsSingleValue()) {
       --iter_;
     } else if (0 < value_offset_) {
       --value_offset_;
@@ -243,7 +261,7 @@ IteratorBase& IndexScanIterator::operator++() {
     UpdateIteratorState();
     return *this;
   }
-  if (is_unique_) {
+  if (StoredAsSingleValue()) {
     ++iter_;
   } else {
     StatusOr<std::vector<Table::IndexValueType> > val =
@@ -268,7 +286,7 @@ IteratorBase& IndexScanIterator::operator--() {
   if (!IsValid()) {
     return *this;
   }
-  if (is_unique_) {
+  if (StoredAsSingleValue()) {
     --iter_;
   } else {
     if (0 < value_offset_) {

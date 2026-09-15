@@ -70,6 +70,10 @@ class PushdownDb {
   PushdownDb(std::string name, std::unique_ptr<Database> db)
       : name_(std::move(name)), db_(std::move(db)) {}
 
+  PushdownDb(const PushdownDb&) = delete;
+  PushdownDb& operator=(const PushdownDb&) = delete;
+  PushdownDb(PushdownDb&&) = delete;
+  PushdownDb& operator=(PushdownDb&&) = delete;
   ~PushdownDb() {
     db_.reset();
     std::error_code ec;
@@ -129,7 +133,7 @@ class PushdownDb {
 
     // Create indexes on tables for index scan / index join rules.
     auto add_idx = [&](std::string_view tbl, std::string_view idx_name,
-                       std::vector<slot_t> cols,
+                       const std::vector<slot_t>& cols,
                        IndexMode mode = IndexMode::kUnique) {
       Status s =
           db_->CreateIndex(ctx, tbl, IndexSchema(idx_name, cols, {}, mode));
@@ -154,7 +158,9 @@ std::optional<int64_t> RunScalarCount(Database& db, TransactionContext& ctx,
   SqlEngine engine(db);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
-    if (error) *error = engine.LastError();
+    if (error != nullptr) {
+      *error = engine.LastError();
+    }
     return std::nullopt;
   }
   std::vector<Row> rows;
@@ -163,7 +169,9 @@ std::optional<int64_t> RunScalarCount(Database& db, TransactionContext& ctx,
     rows.push_back(row);
   }
   if (rows.size() != 1 || rows[0].Size() == 0) {
-    if (error) *error = "expected 1 row, got " + std::to_string(rows.size());
+    if (error != nullptr) {
+      *error = "expected 1 row, got " + std::to_string(rows.size());
+    }
     return std::nullopt;
   }
   const Value& val = rows[0][0];
@@ -264,10 +272,14 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
           "t2.t1_id;";
       std::string err;
       auto opt_cnt = RunScalarCount(db, ctx, opt_sql, &err);
-      if (!opt_cnt) return true;
+      if (!opt_cnt) {
+        return true;
+      }
       SqlEngine engine(db);
       StatusOr<QueryResult> ref_res = engine.Execute(ctx, ref_sql);
-      if (!ref_res.HasValue()) return true;
+      if (!ref_res.HasValue()) {
+        return true;
+      }
       int64_t actual_rows = 0;
       Row r;
       while (ref_res.Value().Next(&r) && actual_rows < 3) {
@@ -317,8 +329,8 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
                                                        "t2.val", "t2.flag"};
       static const std::array<const char*, 4> kOps = {"=", "!=", ">", "<"};
       static const std::array<const char*, 4> kConsts = {"0", "1", "10", "20"};
-      const int col_idx1 = static_cast<int>(rng() % kCols.size());
-      const int col_idx2 = static_cast<int>(rng() % kCols.size());
+      const size_t col_idx1 = rng() % kCols.size();
+      const size_t col_idx2 = rng() % kCols.size();
       std::string part1 = std::string(kCols[col_idx1]) + " " +
                           kOps[rng() % kOps.size()] + " " +
                           kConsts[rng() % kConsts.size()];
@@ -590,7 +602,7 @@ void Worker(int thread_id, uint64_t base_seed,
             std::atomic<bool>& stop_requested,
             std::chrono::steady_clock::time_point deadline, Stats& stats) {
   std::mt19937_64 rng(base_seed +
-                      static_cast<uint64_t>(thread_id) * 1000003ULL);
+                      (static_cast<uint64_t>(thread_id) * uint64_t{1000003}));
 
   auto db_holder = PushdownDb::Create(thread_id);
   if (!db_holder) {
@@ -604,7 +616,7 @@ void Worker(int thread_id, uint64_t base_seed,
 
   while (!stop_requested.load(std::memory_order_relaxed) &&
          std::chrono::steady_clock::now() < deadline) {
-    const uint32_t pass = rng() % 9;
+    const auto pass = static_cast<uint32_t>(rng() % 9);
     if (pass == 0) {
       // Pass 0: Semantic Pushdown & NoREC Differential Execution Oracle
       std::string mismatch;
@@ -793,35 +805,43 @@ void Worker(int thread_id, uint64_t base_seed,
 }  // namespace tinylamb
 
 int main(int argc, char** argv) {
+  // atoi neither reports conversion errors nor accepts non-NUL-terminated
+  // string_view tails; parse through an owned, NUL-terminated copy instead.
+  const auto parse_int = [](std::string_view text) {
+    const std::string owned(text);
+    return static_cast<int>(std::strtol(owned.c_str(), nullptr, 10));
+  };
   int duration_sec = 1800;  // Default 30 minutes
   int num_threads = static_cast<int>(std::thread::hardware_concurrency());
-  if (num_threads <= 0) num_threads = 4;
+  if (num_threads <= 0) {
+    num_threads = 4;
+  }
 
   int positional_idx = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg.starts_with("--duration_sec=")) {
-      duration_sec = std::atoi(arg.substr(15).data());
+      duration_sec = parse_int(arg.substr(15));
     } else if (arg.starts_with("--duration=")) {
-      duration_sec = std::atoi(arg.substr(11).data());
+      duration_sec = parse_int(arg.substr(11));
     } else if (arg.starts_with("--threads=")) {
-      num_threads = std::atoi(arg.substr(10).data());
+      num_threads = parse_int(arg.substr(10));
     } else if (!arg.starts_with("-")) {
       if (positional_idx == 0) {
-        duration_sec = std::atoi(arg.data());
+        duration_sec = parse_int(arg);
         positional_idx++;
       } else if (positional_idx == 1) {
-        num_threads = std::atoi(arg.data());
+        num_threads = parse_int(arg);
         positional_idx++;
       }
     }
   }
 
   if (const char* env_dur = std::getenv("FUZZ_DURATION_SEC")) {
-    duration_sec = std::atoi(env_dur);
+    duration_sec = parse_int(env_dur);
   }
   if (const char* env_threads = std::getenv("FUZZ_THREADS")) {
-    num_threads = std::atoi(env_threads);
+    num_threads = parse_int(env_threads);
   }
 
   std::cout
@@ -853,7 +873,7 @@ int main(int argc, char** argv) {
   std::atomic<bool> stop_requested{false};
 
   std::vector<std::thread> workers;
-  workers.reserve(num_threads);
+  workers.reserve(static_cast<size_t>(num_threads));
   for (int t = 0; t < num_threads; ++t) {
     workers.emplace_back(tinylamb::Worker, t, base_seed,
                          std::ref(stop_requested), deadline, std::ref(stats));
@@ -865,7 +885,9 @@ int main(int argc, char** argv) {
   while (!stop_requested.load()) {
     std::this_thread::sleep_for(std::chrono::seconds(5));
     const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) break;
+    if (now >= deadline) {
+      break;
+    }
 
     const auto elapsed_sec =
         std::chrono::duration_cast<std::chrono::seconds>(now - start_time)
@@ -876,7 +898,8 @@ int main(int argc, char** argv) {
             .count();
     const uint64_t cur_total =
         stats.total_iterations.load(std::memory_order_relaxed);
-    const double cur_rate = (cur_total - prev_total) / step_sec;
+    const double cur_rate =
+        static_cast<double>(cur_total - prev_total) / step_sec;
     prev_total = cur_total;
     prev_time = now;
 

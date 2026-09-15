@@ -45,6 +45,17 @@ if(TINYLAMB_ENABLE_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
+# libFuzzer targets need MORE than their own TU instrumented: the SQL/plan/
+# executor fuzzers call straight into tinylamb::sql, so without layer-wide
+# coverage the whole engine is one black box (cov stays at 1, the corpus
+# cannot guide mutations). fuzzer-no-link adds the PC table everywhere; the
+# actual libFuzzer runtime is linked only by add_fuzzer_test.  GCC has no
+# fuzzer-no-link, so this applies to clang fuzz builds only.
+if(TINYLAMB_ENABLE_FUZZ AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-fsanitize=fuzzer-no-link,undefined,bounds)
+    add_link_options(-fsanitize=fuzzer-no-link,undefined,bounds)
+endif()
+
 set(TINYLAMB_GOOGLESQL_VERSION "2026.7.2" CACHE STRING
     "Pinned GoogleSQL release used by the SQL frontend")
 
@@ -355,6 +366,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/unnest.cpp
         executor/apply.cpp
         executor/recursive_cte.cpp
+        executor/window.cpp
         executor/returning.cpp
         executor/relational.cpp
         executor/relational_factory.cpp
@@ -426,6 +438,7 @@ tinylamb_add_layer(tinylamb_executor
         plan/unnest_plan.cpp
         plan/apply_plan.cpp
         plan/recursive_cte_plan.cpp
+        plan/window_plan.cpp
         plan/plan_memo_oracle.cpp
         plan/plan.cpp
         plan/index_scan_plan.cpp
@@ -457,6 +470,10 @@ add_library(tinylamb_sql
         query/sql_engine.cpp
         query/join_reduction.cpp
         query/sql_oracle_fuzzer.cpp
+        query/sql_join_fuzzer.cpp
+        query/sql_aggregate_fuzzer.cpp
+        query/sql_plancache_fuzzer.cpp
+        query/sql_session_fuzzer.cpp
         query/expr_oracle_fuzzer.cpp
         query/griffin_fuzzer.cpp
 )
@@ -639,7 +656,13 @@ if(BUILD_TESTING)
     function(add_simple_test file_path)
         get_filename_component(filename ${file_path} NAME)
         get_filename_component(target_name ${filename} NAME_WE)
-        add_executable(${target_name} ${file_path})
+        # The workspace-cleanup environment (database/test_workspace_cleanup_env
+        # .cpp) removes .db/.log files the tests left in the working directory;
+        # it is compiled directly into every test binary (gtest environments
+        # only fire if the TU is linked). TINYLAMB_KEEP_TEST_DATABASES=1 keeps
+        # them for post-mortem inspection.
+        add_executable(${target_name} ${file_path}
+                "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
         tinylamb_apply_options(${target_name})
         target_link_libraries(${target_name}
                 PRIVATE
@@ -665,6 +688,8 @@ if(BUILD_TESTING)
         # .md / AGENTS.md fuzzing workflow).
         list(APPEND _test_env
              "TINYLAMB_ORACLE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/oracle_regressions")
+        list(APPEND _test_env
+             "TINYLAMB_SESSION_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/session_regressions")
         gtest_discover_tests(${target_name} PROPERTIES ENVIRONMENT
                                                        "${_test_env}")
     endfunction()
@@ -739,6 +764,10 @@ add_simple_test(query/sql_engine_tpcc_test.cpp)
 add_simple_test(query/sql_engine_tpch_test.cpp)
 add_simple_test(query/googlesql_compliance_test.cpp)
 add_simple_test(query/sql_oracle_fuzzer_test.cpp)
+add_simple_test(query/sql_join_fuzzer_test.cpp)
+add_simple_test(query/sql_aggregate_fuzzer_test.cpp)
+add_simple_test(query/sql_plancache_fuzzer_test.cpp)
+add_simple_test(query/sql_session_fuzzer_test.cpp)
 add_simple_test(query/expr_oracle_fuzzer_test.cpp)
 add_simple_test(query/griffin_fuzzer_test.cpp)
 add_simple_test(expression/expr_simplify_oracle_test.cpp)
@@ -827,17 +856,26 @@ endfunction()
 add_fuzzer_test(recovery/logger_fuzzer.cpp)
 add_fuzzer_test(recovery/log_record_fuzzer.cpp)
 add_fuzzer_test(type/value_fuzzer.cpp)
+add_fuzzer_test(type/date_interval_fuzzer.cpp)
 add_fuzzer_test(page/row_page_fuzzer.cpp)
 add_fuzzer_test(page/leaf_page_fuzzer.cpp)
+add_fuzzer_test(page/pax_page_fuzzer.cpp)
 add_fuzzer_test(index/lsm_detail/lsm_view_fuzzer.cpp)
 add_fuzzer_test(index/lsm_detail/cache_fuzzer.cpp)
 add_fuzzer_test(index/lsm_tree_fuzzer.cpp)
 add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
 add_fuzzer_test(table/table_fuzzer.cpp)
 add_fuzzer_test(expression/expression_fuzzer.cpp)
+add_fuzzer_test(expression/cast_fuzzer.cpp)
+add_fuzzer_test(expression/function_fuzzer.cpp)
 add_fuzzer_test(server/postgres_protocol_fuzzer.cpp tinylamb::postgres_server)
+add_fuzzer_test(executor/data_chunk_fuzzer.cpp)
 add_fuzzer_test(query/googlesql_ast_fuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/sql_join_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/sql_aggregate_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/sql_plancache_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/sql_session_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/expr_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/griffin_fuzzer_libfuzzer.cpp tinylamb::sql)
 endif()
@@ -863,6 +901,7 @@ add_replay_test(recovery/logger_fuzzer_replay.cpp)
 add_replay_test(recovery/log_record_fuzzer_replay.cpp)
 add_replay_test(page/row_page_fuzzer_replay.cpp)
 add_replay_test(page/leaf_page_fuzzer_replay.cpp)
+add_replay_test(page/pax_page_fuzzer_replay.cpp)
 add_replay_test(index/lsm_detail/lsm_view_fuzzer_replay.cpp)
 add_replay_test(index/lsm_detail/cache_fuzzer_replay.cpp)
 add_replay_test(index/lsm_tree_fuzzer_replay.cpp)

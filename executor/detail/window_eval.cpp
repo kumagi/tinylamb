@@ -283,6 +283,38 @@ bool DistanceWithin(const Value& key, const Value& candidate, double off,
   const double dc = NumericOf(candidate);
   return inclusive_le ? dk - dc <= off + 1e-9 : dk - dc >= off - 1e-9;
 }
+
+// Exact candidate <= key + off / candidate >= key - off.  DESC orderings
+// mirror RANGE boundaries around the current key, which needs the flipped
+// comparisons DistanceWithin does not express; INT64 limits stay in long
+// double so key +/- off cannot wrap.
+bool CandidateAtMostKeyPlusOffset(const Value& candidate, const Value& key,
+                                  double off) {
+  const bool key_int = key.type == ValueType::kInt64;
+  const long double limit =
+      key_int ? static_cast<long double>(key.value.int_value) +
+                    static_cast<long double>(off)
+              : static_cast<long double>(NumericOf(key) + off);
+  const long double cand =
+      candidate.type == ValueType::kInt64
+          ? static_cast<long double>(candidate.value.int_value)
+          : static_cast<long double>(NumericOf(candidate));
+  return cand <= limit;
+}
+
+bool CandidateAtLeastKeyMinusOffset(const Value& candidate, const Value& key,
+                                    double off) {
+  const bool key_int = key.type == ValueType::kInt64;
+  const long double limit =
+      key_int ? static_cast<long double>(key.value.int_value) -
+                    static_cast<long double>(off)
+              : static_cast<long double>(NumericOf(key) - off);
+  const long double cand =
+      candidate.type == ValueType::kInt64
+          ? static_cast<long double>(candidate.value.int_value)
+          : static_cast<long double>(NumericOf(candidate));
+  return cand >= limit;
+}
 struct WindowRuntime {
   TransactionContext& context;
   const Scope* outer{nullptr};
@@ -336,9 +368,9 @@ struct WindowRuntime {
         }
         const int64_t off = val.value.int_value;
         if (off < 0) {
-          frame_error = StatusError(
-              StatusCode::kInvalidArgument,
-              "Window frame offset for PRECEDING or FOLLOWING must be non-negative");
+          frame_error = StatusError(StatusCode::kInvalidArgument,
+                                    "Window frame offset for PRECEDING or "
+                                    "FOLLOWING must be non-negative");
           return 0;
         }
         return off;
@@ -452,9 +484,9 @@ struct WindowRuntime {
           return 0;
         }
         if (value < 0) {
-          frame_error = StatusError(
-              StatusCode::kInvalidArgument,
-              "Window frame offset for PRECEDING or FOLLOWING must be non-negative");
+          frame_error = StatusError(StatusCode::kInvalidArgument,
+                                    "Window frame offset for PRECEDING or "
+                                    "FOLLOWING must be non-negative");
           return 0;
         }
         return static_cast<size_t>(value);
@@ -551,9 +583,9 @@ struct WindowRuntime {
         return std::nullopt;
       }
       if (off < 0) {
-        frame_error = StatusError(
-            StatusCode::kInvalidArgument,
-            "Window frame offset for PRECEDING or FOLLOWING must be non-negative");
+        frame_error = StatusError(StatusCode::kInvalidArgument,
+                                  "Window frame offset for PRECEDING or "
+                                  "FOLLOWING must be non-negative");
         return std::nullopt;
       }
       return off;
@@ -575,12 +607,17 @@ struct WindowRuntime {
           if (key.IsNull()) {
             return position;
           }
+          // ASC: first row with candidate >= key - off.  DESC mirrors the
+          // band around the current key: first row with candidate <=
+          // key + off.
+          const bool asc = window.order_by[0].ascending;
           for (size_t j = 0; j <= position; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
               continue;
             }
-            if (DistanceWithin(key, candidate, off, true)) {
+            if (asc ? DistanceWithin(key, candidate, off, true)
+                    : CandidateAtMostKeyPlusOffset(candidate, key, off)) {
               return j;
             }
           }
@@ -588,7 +625,7 @@ struct WindowRuntime {
         }
         case WindowFrameBoundType::kOffsetFollowing: {
           // Start bound `N FOLLOWING`: the FIRST row whose key is >=
-          // `key + off`.
+          // `key + off` (ASC) / <= `key - off` (DESC).
           const auto opt_off = range_offset(bound);
           if (!opt_off.has_value()) {
             return std::nullopt;
@@ -598,20 +635,20 @@ struct WindowRuntime {
           if (key.IsNull()) {
             return position;
           }
+          const bool asc = window.order_by[0].ascending;
           for (size_t j = 0; j < m; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
               continue;
             }
-            // DistanceWithin(candidate_value, key, off, false) checks
-            // candidate_value - key >= off, i.e. value >= key + off.
-            if (DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
-                    candidate, key, off,
-                    false)) {  // (scanned, current) order is intentional.
+            if (asc ? DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
+                          candidate, key, off,
+                          false)  // (scanned, current) order is intentional.
+                    : CandidateAtMostKeyPlusOffset(candidate, key, -off)) {
               return j;
             }
           }
-          // No row satisfies key + off: the frame is empty.
+          // No row satisfies the bound: the frame is empty.
           return std::nullopt;
         }
         case WindowFrameBoundType::kUnboundedFollowing:
@@ -635,15 +672,19 @@ struct WindowRuntime {
           if (key.IsNull()) {
             return peer_end[position];
           }
+          // ASC: last row with candidate <= key + off.  DESC: last row with
+          // candidate >= key - off.
+          const bool asc = window.order_by[0].ascending;
           std::optional<size_t> reached;
           for (size_t j = 0; j < m; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
               continue;
             }
-            if (DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
-                    candidate, key, off,
-                    true)) {  // (scanned, current) order is intentional.
+            if (asc ? DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
+                          candidate, key, off,
+                          true)  // (scanned, current) order is intentional.
+                    : CandidateAtLeastKeyMinusOffset(candidate, key, off)) {
               reached = j;
             }
           }
@@ -657,19 +698,32 @@ struct WindowRuntime {
             return std::nullopt;
           }
           const double off = *opt_off;
+          // RANGE `0 PRECEDING` is defined as CURRENT ROW, i.e. the bound is
+          // the last row of the current row's peer group. The value scan below
+          // is capped at `position`, which would truncate a peer group to its
+          // first row.
+          if (off == 0.0) {
+            return peer_end[position];
+          }
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
             return peer_end[position];
           }
-          // End bound "off PRECEDING": candidates <= key - off, computed
-          // exactly (key - off may underflow int64).  NULL keys sort lowest
-          // and stay inside an unbounded-start frame.
+          // End bound "off PRECEDING": ASC keeps candidates <= key - off,
+          // DESC keeps candidates >= key + off, computed exactly (key -/+ off
+          // may underflow int64).  NULL keys sort lowest and stay inside an
+          // unbounded-start frame.
+          const bool asc = window.order_by[0].ascending;
           std::optional<size_t> reached;
           const bool key_int = key.type == ValueType::kInt64;
-          const long double limit =
+          const long double asc_limit =
               key_int ? static_cast<long double>(key.value.int_value) -
                             static_cast<long double>(off)
                       : static_cast<long double>(NumericOf(key) - off);
+          const long double desc_limit =
+              key_int ? static_cast<long double>(key.value.int_value) +
+                            static_cast<long double>(off)
+                      : static_cast<long double>(NumericOf(key) + off);
           for (size_t j = 0; j <= position; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
@@ -680,7 +734,7 @@ struct WindowRuntime {
                 candidate.type == ValueType::kInt64
                     ? static_cast<long double>(candidate.value.int_value)
                     : static_cast<long double>(NumericOf(candidate));
-            if (cand <= limit) {
+            if (asc ? cand <= asc_limit : cand >= desc_limit) {
               reached = j;
             }
           }
@@ -701,26 +755,17 @@ struct WindowRuntime {
     return std::pair<size_t, size_t>{*lo, *hi};
   }
 
-  [[nodiscard]] StatusOr<Value> AggregateOverFrame(
+  // Frame rows (positions within [lo, hi] of the ordered partition) that
+  // survive the frame EXCLUDE clause and the aggregate WHERE filter, in
+  // frame order.  Shared by the single-argument aggregate path, the
+  // two-argument COVAR/CORR collector, and APPROX_TOP_* so all of them
+  // honor identical frame semantics.
+  [[nodiscard]] StatusOr<std::vector<size_t>> FrameSurvivors(
       const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
       const std::vector<size_t>& ordered,
       const std::vector<std::vector<Value>>& order_values, size_t current,
       size_t lo, size_t hi) const {
-    const std::string& fn = window.function;
-    if (hi < lo || ordered.empty() || hi >= ordered.size()) {
-      if (fn == "COUNT") {
-        return Value(static_cast<int64_t>(0));
-      }
-      return Value();
-    }
-    // The window expression carries an optional row-level WHERE filter.
-    int64_t row_count = 0;
-    bool count_star =
-        fn == "COUNT" && window.args.size() == 1 &&
-        window.args[0]->Type() == TypeTag::kColumnValue &&
-        window.args[0]->AsColumnValue().GetColumnName().name == "*";
-    std::vector<Value> values;
-    Value delimiter;
+    std::vector<size_t> survivors;
     for (size_t p = lo; p <= hi; ++p) {
       bool excluded = false;
       switch (window.exclusion) {
@@ -775,6 +820,37 @@ struct WindowRuntime {
           continue;
         }
       }
+      survivors.push_back(p);
+    }
+    return survivors;
+  }
+
+  [[nodiscard]] StatusOr<Value> AggregateOverFrame(
+      const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
+      const std::vector<size_t>& ordered,
+      const std::vector<std::vector<Value>>& order_values, size_t current,
+      size_t lo, size_t hi) const {
+    const std::string& fn = window.function;
+    if (hi < lo || ordered.empty() || hi >= ordered.size()) {
+      if (fn == "COUNT") {
+        return Value(static_cast<int64_t>(0));
+      }
+      return Value();
+    }
+    // The window expression carries an optional row-level WHERE filter.
+    int64_t row_count = 0;
+    bool count_star =
+        fn == "COUNT" && window.args.size() == 1 &&
+        window.args[0]->Type() == TypeTag::kColumnValue &&
+        window.args[0]->AsColumnValue().GetColumnName().name == "*";
+    std::vector<Value> values;
+    Value delimiter;
+    ASSIGN_OR_RETURN(
+        std::vector<size_t>, frame_survivors,
+        (FrameSurvivors(window, rows, ordered, order_values, current, lo, hi)));
+    for (const size_t p : frame_survivors) {
+      const Row& row = rows[ordered[p]];
+      Scope scope{.row = &row, .schema = schema, .outer = outer};
       ++row_count;
       if (count_star) {
         continue;
@@ -915,7 +991,10 @@ struct WindowRuntime {
         }
       }
       std::vector<std::pair<Value, double>> stats;
-      for (size_t r = lo; r <= hi; ++r) {
+      ASSIGN_OR_RETURN(std::vector<size_t>, approx_survivors,
+                       (FrameSurvivors(window, rows, ordered, order_values,
+                                       current, lo, hi)));
+      for (const size_t r : approx_survivors) {
         const size_t row = ordered[r];
         const Scope scope{.row = &rows[row], .schema = schema, .outer = outer};
         ASSIGN_OR_RETURN(
@@ -1144,9 +1223,16 @@ struct WindowRuntime {
     auto frame_pairs =
         [&]() -> std::optional<std::tuple<double, double, double, size_t>> {
       // Evaluates both arguments per aligned row (NULL on either side skips
-      // the pair).  Returns {covar_pop, var_x, var_y, n}.
+      // the pair), over the frame rows that survive EXCLUDE and the WHERE
+      // filter.  Returns {covar_pop, var_x, var_y, n}.
       std::vector<std::pair<double, double>> pairs;
-      for (size_t r = lo; r <= hi; ++r) {
+      StatusOr<std::vector<size_t>> survivors_or =
+          FrameSurvivors(window, rows, ordered, order_values, current, lo, hi);
+      if (!survivors_or.HasValue()) {
+        pairs_error = survivors_or.GetStatus();
+        return std::nullopt;
+      }
+      for (const size_t r : survivors_or.Value()) {
         const size_t row = ordered[r];
         const Scope pair_scope{
             .row = &rows[row], .schema = schema, .outer = outer};
@@ -1551,12 +1637,12 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
   return layout;
 }
 
-Status ComputeOneWindow(TransactionContext& context,
-                        const WindowFunctionCallExpression& window,
-                        std::vector<Row>& rows, const Schema& schema,
-                        const Scope* outer, const CteMap& ctes,
-                        std::vector<Value>* out,
-                        const WindowOrderLayout* cached_layout = nullptr) {
+Status ComputeOneWindowImpl(TransactionContext& context,
+                            const WindowFunctionCallExpression& window,
+                            std::vector<Row>& rows, const Schema& schema,
+                            const Scope* outer, const CteMap& ctes,
+                            std::vector<Value>* out,
+                            const WindowOrderLayout* cached_layout = nullptr) {
   const size_t n = rows.size();
   out->assign(n, Value());
   if (n == 0) {
@@ -1624,9 +1710,9 @@ Status ComputeOneWindow(TransactionContext& context,
       ASSIGN_OR_RETURN(Value, buckets_value,
                        (runtime.EvalAt(window.args[0], rows, ordered[0])));
       if (buckets_value.IsNull()) {
-        return StatusError(
-            StatusCode::kInvalidArgument,
-            "The N value (number of buckets) for the NTILE function must not be NULL");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "The N value (number of buckets) for the NTILE "
+                           "function must not be NULL");
       }
       if (buckets_value.type != ValueType::kInt64) {
         return StatusError(StatusCode::kInvalidArgument,
@@ -1634,9 +1720,9 @@ Status ComputeOneWindow(TransactionContext& context,
       }
       const int64_t buckets = buckets_value.value.int_value;
       if (buckets <= 0) {
-        return StatusError(
-            StatusCode::kInvalidArgument,
-            "The N value (number of buckets) for the NTILE function must be positive");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "The N value (number of buckets) for the NTILE "
+                           "function must be positive");
       }
       const int64_t base = static_cast<int64_t>(m) / buckets;
       const int64_t extra = static_cast<int64_t>(m) % buckets;
@@ -1896,6 +1982,18 @@ Expression InlineAliases(
 
 }  // namespace
 
+// Single-window entry point for the Cascades WindowExecutor, which plans
+// each call through the memo instead of the statement-level ApplyWindows
+// above. Layout caching stays internal (pass-through null).
+Status ComputeOneWindow(TransactionContext& context,
+                        const WindowFunctionCallExpression& window,
+                        std::vector<Row>& rows, const Schema& schema,
+                        const Scope* outer, const CteMap& ctes,
+                        std::vector<Value>* out) {
+  return ComputeOneWindowImpl(context, window, rows, schema, outer, ctes, out,
+                              nullptr);
+}
+
 StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
                                      const SelectStatement& statement,
                                      Relation&& input, const Scope* outer,
@@ -1992,9 +2090,9 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
       layout_it->second = std::move(built_layout);
     }
     computed.emplace_back();
-    RETURN_IF_FAIL(ComputeOneWindow(context, *window_node, rows, base_schema,
-                                    outer, ctes, &computed.back(),
-                                    &layout_it->second));
+    RETURN_IF_FAIL(ComputeOneWindowImpl(context, *window_node, rows,
+                                        base_schema, outer, ctes,
+                                        &computed.back(), &layout_it->second));
   }
   for (size_t r = 0; r < rows.size(); ++r) {
     for (size_t w = 0; w < windows.size(); ++w) {

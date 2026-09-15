@@ -68,6 +68,10 @@ struct IntegerPeekCompare {
 // stamps PageLSN on every completed mutation, so such pages carry no
 // modification newer than the snapshot and their physical rows are served
 // directly.  Pages stamped above the threshold fall back to ReadVersion.
+// Boundary caveat: an uncommitted writer whose mutations were stamped
+// BEFORE this snapshot began can still be served physically (the op-LSN
+// threshold is pushed past it by later unrelated commits); see the
+// PhysicalReadEligible comment for the writer-side fix that would close it.
 //
 // Lifetime contract: table_ and txn_ must outlive the iterator.  If
 // key_filter_ / peek_compares_ are supplied, those objects must also outlive

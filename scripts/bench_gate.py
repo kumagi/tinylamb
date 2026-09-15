@@ -6,8 +6,10 @@ section of BenchmarkHistory.md and exits 1 when any shared metric regresses
 beyond --threshold-pct percent.
 
 Baseline extraction (BenchmarkHistory.md):
-  - Sections start with "## "; the FIRST section is treated as the newest
-    (the file is maintained newest-first).
+  - Sections start with "## "; the file is maintained newest-first.  Each
+    metric key is taken from the NEWEST section that contains it, so a
+    section documenting a different workload (e.g. TPC-C) does not blind the
+    gate to metrics that still have current baselines in older sections.
   - Metrics are harvested from two shapes:
       table rows:   | `tps` | 821.1 |
       bold bullets: - **Query sum (Q1-Q22):** **81.30 s**
@@ -56,27 +58,29 @@ def extract_baseline(history_path: Path) -> dict:
             sections.append(current)
         elif current is not None:
             current.append(line)
-    if not sections:
-        return {}
-    body = "\n".join(sections[0])  # newest-first document
-
     metrics = {}
-    # "| `tps` | 821.1 |" style rows (first cell label, second cell number)
-    for match in re.finditer(r"^\s*\|\s*`?([^|`]+)`?\s*\|\s*([0-9][0-9,.]*)\s*(?:\||$)",
-                             body, re.MULTILINE):
-        value = parse_number(match.group(2))
-        if value is not None:
-            metrics.setdefault(normalize_key(match.group(1)), value)
+    # newest-first document: iterate oldest -> newest and let newer sections
+    # overwrite, so each key resolves to its newest recorded baseline.
+    for section in reversed(sections):
+        body = "\n".join(section)
+        # "| `tps` | 821.1 |" style rows (first cell label, second cell number)
+        for match in re.finditer(
+                r"^\s*\|\s*`?([^|`]+)`?\s*\|\s*([0-9][0-9,.]*)\s*(?:\||$)",
+                body, re.MULTILINE):
+            value = parse_number(match.group(2))
+            if value is not None:
+                metrics[normalize_key(match.group(1))] = value
 
-    # "- **Label:** **81.30 s**" / "- **Label:** 126.39 s total" bullets
-    for match in re.finditer(r"\*\*([^*:]+):\*\*\s*(?:\*\*)?~?([0-9][0-9,.]*)\s*(ms|s)\b",
-                             body):
-        value = parse_number(match.group(2))
-        if value is None:
-            continue
-        if match.group(3) == "ms":
-            value /= 1000.0
-        metrics.setdefault(normalize_key(match.group(1)), value)
+        # "- **Label:** **81.30 s**" / "- **Label:** 126.39 s total" bullets
+        for match in re.finditer(
+                r"\*\*([^*:]+):\*\*\s*(?:\*\*)?~?([0-9][0-9,.]*)\s*(ms|s)\b",
+                body):
+            value = parse_number(match.group(2))
+            if value is None:
+                continue
+            if match.group(3) == "ms":
+                value /= 1000.0
+            metrics[normalize_key(match.group(1))] = value
     return metrics
 
 

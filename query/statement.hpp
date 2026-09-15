@@ -242,6 +242,7 @@ class SelectStatement : public Statement {
   void SetOffset(size_t offset) { offset_ = offset; }
   size_t Offset() const { return offset_; }
   bool Distinct() const { return distinct_; }
+  void SetDistinct(bool distinct) { distinct_ = distinct; }
   bool HasDistinctOn() const { return !distinct_on_.empty(); }
   const std::vector<Expression>& DistinctOn() const { return distinct_on_; }
   void SetDistinctOn(std::vector<Expression> distinct_on) {
@@ -293,6 +294,12 @@ class SelectStatement : public Statement {
                              std::shared_ptr<SelectStatement> query) {
     recursive_with_queries_.insert(name);
     AddWithQuery(std::move(name), std::move(query));
+  }
+  // Erases a CTE definition after its single use was inlined (M4). Recursive
+  // entries are never inlined and therefore never removed here.
+  void RemoveWithQuery(const std::string& name) {
+    with_queries_.erase(name);
+    std::erase(with_query_order_, name);
   }
   [[nodiscard]] bool IsRecursiveWith(const std::string& name) const {
     return recursive_with_queries_.contains(name);

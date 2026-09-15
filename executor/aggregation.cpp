@@ -387,9 +387,9 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
               return FailWith(StatusError(StatusCode::kIsInfinity,
                                           "uint64 overflow in SUM"));
             }
-            total = Value(
-                static_cast<int64_t>(static_cast<uint64_t>(prior + batch_sum)))
-                .WithUnsigned();
+            total = Value(static_cast<int64_t>(
+                              static_cast<uint64_t>(prior + batch_sum)))
+                        .WithUnsigned();
             break;
           }
           int64_t batch_sum = 0;
@@ -456,12 +456,11 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
           if (column.IsNull(row)) {
             continue;
           }
-          total += is_int
-                       ? (column.IsUnsigned()
-                              ? static_cast<double>(
-                                    static_cast<uint64_t>(integers[row]))
-                              : static_cast<double>(integers[row]))
-                       : doubles[row];
+          total += is_int ? (column.IsUnsigned()
+                                 ? static_cast<double>(
+                                       static_cast<uint64_t>(integers[row]))
+                                 : static_cast<double>(integers[row]))
+                          : doubles[row];
           ++(*counts)[i];
         }
         break;
@@ -510,9 +509,8 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
           if (is_int) {
             const int64_t candidate = integers[row];
             if (column.IsUnsigned()) {
-              if (best.IsNull() ||
-                  static_cast<uint64_t>(best.value.int_value) <
-                      static_cast<uint64_t>(candidate)) {
+              if (best.IsNull() || static_cast<uint64_t>(best.value.int_value) <
+                                       static_cast<uint64_t>(candidate)) {
                 best = Value(candidate).WithUnsigned();
               }
             } else {

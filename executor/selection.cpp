@@ -110,8 +110,10 @@ Selection::Selection(Expression exp, Schema schema, Executor src,
       jit_threshold_rows_(jit_threshold_rows) {
   // The JIT kernel below is derived from the compiled program, so disabling
   // bytecode also disables the filter JIT (differential-testing hook).
-  bytecode_ = BytecodeEnabled() ? BytecodeCompiler::Compile(exp_, schema_)
-                                : std::nullopt;
+  bytecode_ = BytecodeEnabled()
+                  ? BytecodeCompiler::Compile(
+                        exp_, schema_, BytecodeCompiler::Context::kFilter)
+                  : std::nullopt;
 }
 
 bool Selection::Next(Row* dst, RowPosition* rp) {

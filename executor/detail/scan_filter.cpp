@@ -273,10 +273,11 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
   // BytecodeCompiler::Compile); a pre-filter built from that would silently
   // drop rows, so use the same suppression when doubles can reach a negated
   // ordered comparison.
-  const ExpressionRewriter rewriter(
+  ExpressionRewriter rewriter(
       ContainsNotOfOrderedDoubleComparison(predicate, schema)
           ? NotComparisonFreeRules()
           : ExpressionRuleSet::Default());
+  rewriter.set_schema(&schema);
   StatusOr<Expression> folded_or = rewriter.TryRewrite(predicate);
   if (!folded_or.HasValue()) {
     return std::nullopt;
@@ -446,7 +447,8 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
         combined = BinaryExpressionExp(combined, BinaryOperation::kAnd,
                                        compiled.residual[i]);
       }
-      if (auto bytecode = BytecodeCompiler::Compile(combined, schema)) {
+      if (auto bytecode = BytecodeCompiler::Compile(
+              combined, schema, BytecodeCompiler::Context::kFilter)) {
         compiled.residual_bytecode = std::move(*bytecode);
       }
     }
@@ -621,8 +623,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                           bool filter_during_scan,
                           const CompiledScanFilter* scan_filter,
                           const Schema& result_schema, const Scope* outer,
-                          const CteMap& ctes, Relation* result,
-                          Status* error) {
+                          const CteMap& ctes, Relation* result, Status* error) {
   std::vector<Table::ScanMorsel> morsels =
       table.BuildScanMorsels(context.txn_, 8);
   const size_t workers =
@@ -1038,6 +1039,16 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
     ASSIGN_OR_RETURN(Relation, sub,
                      (ExecuteQuery(context, *source.query, outer, ctes)));
     result = std::move(sub);
+    // Derived outputs carry bare (or inner-qualified) column names, while
+    // outer predicates reference them through this source's alias
+    // (QualifyExpression). Without alias qualification, LocalColumnOffset
+    // cannot bind `alias.col`, join equalities go unresolved, and the join
+    // degrades to a cross product plus filter (TPC-H Q20 at SF1: 800K x
+    // derived rows instead of a hash join). Mirror the estimate path
+    // (MakeScanNode), which already qualifies derived schemas.
+    if (!source.alias.empty()) {
+      result.schema = QualifySchema(result.schema, source.alias);
+    }
   } else if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
     const Relation& cte_relation = *cte->second;
     result.schema = cte_relation.schema;

@@ -51,6 +51,16 @@ class Database final : public CatalogReader {
   // system relations. Startup failures surface as Status.
   static StatusOr<std::unique_ptr<Database>> Create(std::string_view dbname,
                                                     size_t wal_sync_ms = 1);
+
+  // Filesystem bookkeeping: every Create() records the database's base name
+  // for this process; RemoveCreatedDatabaseFiles() unlinks the
+  // <name>.db/.log/.last_checkpoint/.db.tmp artifacts of every recorded
+  // name (missing files are ignored). The test-workspace cleanup environment
+  // calls it at binary exit so throwaway databases never outlive the run;
+  // benchmarks and servers keep files unless they call it themselves.
+  // Names are never unregistered: a reopen cycle (EmulateCrash + Create)
+  // keeps the same base name and stays covered.
+  static void RemoveCreatedDatabaseFiles();
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;
   Database(Database&&) = delete;

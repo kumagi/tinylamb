@@ -36,7 +36,9 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
 
 Remaining allowlisted edges: `plan/* -> query/query_data.hpp` (same CMake
 target), `plan/{product_plan,implementation_rules}.cpp ->
-executor/hash_join_mode.hpp` (cost-estimation helper location debt, V4).
+executor/hash_join_mode.hpp` (cost-estimation helper location debt, V4),
+`plan/implementation_rules.cpp -> executor/detail/scan_filter.hpp`
+(CompiledScanFilter helpers used by implementation rules; same V4 debt).
 `JoinKind` itself lives in `common/join_kind.hpp`; `executor/join_kind.hpp`
 is a compat include.
 

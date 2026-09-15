@@ -124,16 +124,6 @@ Status Page::DecodeDisk(const char* source) {
 }
 
 // Meta page functions.
-StatusOr<PageRef> Page::AllocateNewPage(Transaction& txn, PagePool& pool,
-                                        PageType new_page_type) {
-  ASSERT_PAGE_TYPE(PageType::kMetaPage);
-  ASSIGN_OR_RETURN(PageRef, ret,
-                   body.meta_page.AllocateNewPage(txn, pool, new_page_type));
-  SetPageLSN(txn.PrevRecordEndLSN());
-  SetRecLSN(txn.PrevRecordEndLSN());
-  return ret;
-}
-
 Status Page::DestroyPage(Transaction& txn, Page* target) {
   ASSERT_PAGE_TYPE(PageType::kMetaPage);
   RETURN_IF_FAIL(body.meta_page.DestroyPage(txn, target));
@@ -348,8 +338,24 @@ void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
 }
 
 Status Page::PageTypeChange(Transaction& txn, PageType new_type) {
+  const PageType old_type = Type();
+  std::string old_body(reinterpret_cast<const char*>(&body), kPageBodySize);
+  const lsn_t old_page_lsn = PageLSN();
+  const lsn_t old_rec_lsn = RecoveryLSN();
   PageTypeChangeImpl(new_type);
-  RETURN_IF_FAIL(txn.AllocatePageLog(page_id, new_type).GetStatus());
+  Status append = txn.AllocatePageLog(page_id, new_type).GetStatus();
+  if (append != Status::kSuccess) {
+    // WAL append failed: no CLR will compensate the type change, so restore
+    // the previous image instead of leaving an unlogged conversion behind
+    // the abort (an in-memory type diverging from the last logged image
+    // would corrupt the next write-back).
+    PageTypeChangeImpl(old_type);
+    std::memcpy(&body, old_body.data(),
+                std::min(old_body.size(), static_cast<size_t>(kPageBodySize)));
+    SetPageLSN(old_page_lsn);
+    recovery_lsn = old_rec_lsn;
+    return append;
+  }
   SetPageLSN(txn.PrevRecordEndLSN());
   SetRecLSN(txn.PrevRecordEndLSN());
   return Status::kSuccess;

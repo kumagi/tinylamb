@@ -12,9 +12,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake clang clang-tidy
 
       - name: configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DTINYLAMB_ENABLE_GOOGLESQL=OFF
 
       - name: clang-tidy diff
         run: |
-          git diff -U0 origin/main...HEAD -- '*.cpp' '*.hpp' | \
-            clang-tidy-diff.py -p build -checks='bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' -quiet || true
+          git diff -U0 origin/master...HEAD -- '*.cpp' '*.hpp' | \
+            clang-tidy-diff.py -path build -checks='bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' -quiet

@@ -13,13 +13,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake clang
-          cmake -S . -B build-fuzz \
+          # libFuzzer needs clang: GCC 15 dropped -fsanitize=fuzzer, and the
+          # runner's default c++ is GCC.
+          CC=clang CXX=clang++ cmake -S . -B build-fuzz \
             -DCMAKE_BUILD_TYPE=Debug \
             -DTINYLAMB_ENABLE_FUZZ=ON \
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
-          cmake --build build-fuzz -j"$(nproc)" --target table_fuzzer value_fuzzer
+          cmake --build build-fuzz -j"$(nproc)" --target \
+            table_fuzzer value_fuzzer date_interval_fuzzer cast_fuzzer \
+            function_fuzzer data_chunk_fuzzer pax_page_fuzzer \
+            expression_fuzzer row_page_fuzzer leaf_page_fuzzer \
+            b_plus_tree_fuzzer lsm_tree_fuzzer
 
       - name: short fuzz run
         run: |
-          ./build-fuzz/table_fuzzer -runs=1000 -max_total_time=60 || true
-          ./build-fuzz/value_fuzzer -runs=1000 -max_total_time=60 || true
+          for f in table_fuzzer value_fuzzer date_interval_fuzzer \
+                   cast_fuzzer function_fuzzer data_chunk_fuzzer \
+                   pax_page_fuzzer expression_fuzzer row_page_fuzzer \
+                   leaf_page_fuzzer b_plus_tree_fuzzer lsm_tree_fuzzer; do
+            ./build-fuzz/$f -runs=1000 -max_total_time=60 || true
+          done
+
+      - name: sweep fuzz database artifacts
+        if: always()
+        run: python3 scripts/clean_root_artifacts.py

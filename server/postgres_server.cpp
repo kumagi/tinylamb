@@ -818,10 +818,12 @@ class PostgresServer::Impl {
     // PostgreSQL semantics: all statements of one Query message run in a
     // single implicit transaction unless the message itself manages
     // transactions. The implicit transaction commits only after every
-    // statement succeeded.
+    // statement succeeded.  The block opens even when the message carries
+    // transaction control: BEGIN adopts it as the explicit transaction and
+    // COMMIT/ROLLBACK finalize it, so `UPDATE ...; ROLLBACK` in one message
+    // really undoes the UPDATE.
     std::unique_ptr<TransactionContext> implicit;
-    if (!ContainsTransactionControl(statements) &&
-        client.transaction == nullptr && client.transaction_status != 'E') {
+    if (client.transaction == nullptr && client.transaction_status != 'E') {
       implicit =
           std::make_unique<TransactionContext>(database_->BeginContext());
     }
@@ -878,8 +880,15 @@ class PostgresServer::Impl {
         return false;
       }
       if (!client.transaction) {
-        client.transaction =
-            std::make_unique<TransactionContext>(database_->BeginContext());
+        if (implicit) {
+          // Adopt this message's implicit block as the explicit
+          // transaction: statements that already ran in it (and everything
+          // after BEGIN) commit or roll back together.
+          client.transaction = std::move(implicit);
+        } else {
+          client.transaction =
+              std::make_unique<TransactionContext>(database_->BeginContext());
+        }
       }
       client.transaction_status = 'T';
       Queue(client, pgwire::CommandComplete("BEGIN"));
@@ -887,6 +896,14 @@ class PostgresServer::Impl {
     }
     if (command == "ROLLBACK" || command == "ABORT") {
       AbortOpenTransaction(client);
+      if (implicit) {
+        // Statements earlier in this Query message ran in the implicit
+        // block; PostgreSQL rolls those back with the ROLLBACK.
+        if (!implicit->IsFinished()) {
+          implicit->Abort();
+        }
+        implicit.reset();
+      }
       client.transaction_status = 'I';
       Queue(client, pgwire::CommandComplete("ROLLBACK"));
       return true;
@@ -901,6 +918,21 @@ class PostgresServer::Impl {
         const Status status = client.transaction->PreCommit();
         client.transaction.reset();
         if (status != Status::kSuccess) {
+          client.transaction_status = 'I';
+          Queue(client, pgwire::ErrorResponse("transaction commit failed: " +
+                                                  StatusMessage(status),
+                                              "40001"));
+          return false;
+        }
+      }
+      if (implicit) {
+        // Finalize the implicit block opened by earlier statements of this
+        // message (no BEGIN ran, or it would have adopted the block).
+        const bool finished = implicit->IsFinished();
+        const Status status =
+            finished ? Status::kSuccess : implicit->PreCommit();
+        implicit.reset();
+        if (!finished && status != Status::kSuccess) {
           client.transaction_status = 'I';
           Queue(client, pgwire::ErrorResponse("transaction commit failed: " +
                                                   StatusMessage(status),

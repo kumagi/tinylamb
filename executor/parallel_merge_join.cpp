@@ -348,7 +348,18 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
       w.join();
     }
     if (worker_failure) {
-      std::rethrow_exception(worker_failure);
+      // Never let an exception cross the executor boundary: latch it as a
+      // sticky Status so consumers observe a failed materialization instead
+      // of an unwinding Next() (mirrors parallel_hash_join).
+      try {
+        std::rethrow_exception(worker_failure);
+      } catch (const std::exception& error) {
+        FailWith(StatusError(StatusCode::kRuntimeError, error.what()));
+      } catch (...) {
+        FailWith(StatusError(StatusCode::kRuntimeError,
+                             "parallel merge worker failed"));
+      }
+      return;
     }
   }
 
@@ -393,8 +404,12 @@ void ParallelMergeJoin::EnsureMaterialized() {
   if (left_width_ == 0 && !left_rows_.empty()) {
     left_width_ = left_rows_.front().first.values_.size();
   }
-  FailWithChildOf(*left_);
-  FailWithChildOf(*right_);
+  // A failed child must stop materialization here: continuing would run the
+  // merge over truncated input and serve the partial join as success
+  // (mirrors SharedBuildParallelHashJoin).
+  if (FailWithChildOf(*left_) || FailWithChildOf(*right_)) {
+    return;
+  }
 
   // Latch only after the work completes so a failed materialization can be
   // retried instead of silently yielding an empty output.

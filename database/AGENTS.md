@@ -23,7 +23,8 @@ Facade over everything below: DDL/catalog, statistics persistence, and the
   `shared_ptr<Table/Stats>` per txn; move-assign drops the cache.
 - `catalog_reader.hpp` — minimal capability interface
   (`CatalogEpoch/GetTable/GetStatistics/GetOrAddFunction`) so executor state
-  cannot reach DDL/crash/filesystem. `EvaluationContext` is forward-declared
-  only — **no include edge to `expression/`** (allowlist V1 depends on this).
+  cannot reach DDL/crash/filesystem. `transaction_context.hpp` forward-declares
+  `EvaluationContext` only — **no include edge to `expression/`** (the
+  database→expression direction stays closed).
 
 Test: `./build/catalog_test`, `database_extra_test`.

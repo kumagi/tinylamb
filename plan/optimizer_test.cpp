@@ -1758,6 +1758,551 @@ TEST_F(OptimizerTest, OuterJoinRuleAddsMergeJoinAlternative) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, OuterJoinSliceLowersLeftJoinThroughMemo) {
+  // M6: QueryData with a single LEFT edge optimizes to a LeftOuter physical
+  // join. Sc2.d4 is constant 16, so left row c1 = 16 matches all 200 right
+  // rows; the other 99 left rows must survive as NULL-padded rows.
+  QueryData query{{"Sc1", "Sc2"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("c1"), NamedExpression("d1")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 0;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp("c1"), BinaryOperation::kEquals, ColumnValueExp("d4"));
+  query.outer_joins_.push_back(std::move(edge));
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_NE(dump.str().find("Left Outer Join"), std::string::npos)
+      << dump.str();
+
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  size_t rows = 0;
+  size_t padded = 0;
+  size_t matched = 0;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+    ASSERT_EQ(row.values_.size(), 2U);
+    if (row[1].IsNull()) {
+      ++padded;
+      EXPECT_NE(row[0], Value(16));
+    } else {
+      ++matched;
+      EXPECT_EQ(row[0], Value(16));
+    }
+  }
+  EXPECT_EQ(rows, 299U);
+  EXPECT_EQ(matched, 200U);
+  EXPECT_EQ(padded, 99U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceKeepsRightSideFilterAboveJoin) {
+  // M6 ON-vs-WHERE contract: a WHERE conjunct over the null-supplying side
+  // filters AFTER padding. Sc1.c1 = Sc2.d1 matches c1 in 0..99 fully, so
+  // WHERE d1 IS NULL must yield zero rows (no padded rows exist). Pushing
+  // the predicate into the right scan would empty the build side and pad
+  // every left row instead.
+  QueryData query{
+      {"Sc1", "Sc2"},
+      UnaryExpressionExp(ColumnValueExp("d1"), UnaryOperation::kIsNull),
+      {NamedExpression("c1"), NamedExpression("d1")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 0;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp("c1"), BinaryOperation::kEquals, ColumnValueExp("d1"));
+  query.outer_joins_.push_back(std::move(edge));
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  Row row;
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceLowersRightJoinThroughMemo) {
+  // M6+1: QueryData with a single RIGHT edge optimizes to a RightOuter
+  // physical join (possibly normalized to LEFT inside the memo; rows
+  // decide). Sc1.c1 = Sc2.d1 matches c1 in 0..99; the 100 unmatched right
+  // rows (d1 = 100..199) survive as left-padded rows.
+  QueryData query{{"Sc1", "Sc2"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("c1"), NamedExpression("d1")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 1;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp("c1"), BinaryOperation::kEquals, ColumnValueExp("d1"));
+  query.outer_joins_.push_back(std::move(edge));
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  size_t rows = 0;
+  size_t padded = 0;
+  size_t matched = 0;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+    ASSERT_EQ(row.values_.size(), 2U);
+    if (row[0].IsNull()) {
+      ++padded;
+      EXPECT_EQ(row[1].value.int_value >= 100, true);
+    } else {
+      ++matched;
+      EXPECT_EQ(row[0], row[1]);
+    }
+  }
+  EXPECT_EQ(rows, 200U);
+  EXPECT_EQ(matched, 100U);
+  EXPECT_EQ(padded, 100U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceKeepsLeftSideFilterAboveJoin) {
+  // M6+1 ON-vs-WHERE mirror: a WHERE conjunct over the null-supplying
+  // (left) side of a RIGHT join filters AFTER padding. ON c1 = d1 matches
+  // c1 in 0..99, so WHERE c1 IS NULL must yield exactly the 100 padded
+  // rows. Pushing it into the left scan would match nothing pre-join.
+  QueryData query{
+      {"Sc1", "Sc2"},
+      UnaryExpressionExp(ColumnValueExp("c1"), UnaryOperation::kIsNull),
+      {NamedExpression("c1"), NamedExpression("d1")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 1;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp("c1"), BinaryOperation::kEquals, ColumnValueExp("d1"));
+  query.outer_joins_.push_back(std::move(edge));
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  Row row;
+  size_t count = 0;
+  while (executor->Next(&row, nullptr)) {
+    EXPECT_TRUE(row[0].IsNull());
+    ++count;
+  }
+  EXPECT_EQ(count, 100U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceLowersFullJoinThroughMemo) {
+  // M6+1: single FULL edge with an equi ON lowers to a FullOuter hash join.
+  // c1 = d1 matches 100 pairs; every left row matches, so only the 100
+  // unmatched right rows (d1 = 100..199) pad. The equi pair keeps the
+  // batch nested loop out (its gate refuses equi shapes).
+  QueryData query{{"Sc1", "Sc2"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("c1"), NamedExpression("d1")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 2;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp("c1"), BinaryOperation::kEquals, ColumnValueExp("d1"));
+  query.outer_joins_.push_back(std::move(edge));
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_NE(dump.str().find("Full Outer Join"), std::string::npos)
+      << dump.str();
+  EXPECT_EQ(dump.str().find("Batch"), std::string::npos) << dump.str();
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  size_t rows = 0;
+  size_t left_padded = 0;
+  size_t right_padded = 0;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+    ASSERT_EQ(row.values_.size(), 2U);
+    if (row[0].IsNull()) {
+      ++left_padded;
+    } else if (row[1].IsNull()) {
+      ++right_padded;
+    } else {
+      EXPECT_EQ(row[0], row[1]);
+    }
+  }
+  EXPECT_EQ(rows, 200U);
+  EXPECT_EQ(left_padded, 100U);
+  EXPECT_EQ(right_padded, 0U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceFullNonEquiJoinUsesBatchNestedLoop) {
+  // M6+1 meets batch_nested_loop: a non-equi FULL ON has no equi pair, so
+  // hash/merge offer nothing and the blocked executor wins through the
+  // real lowering. c1 > d1 matches 4950 pairs; c1 = 0 pads right (1 row)
+  // and d1 = 99..199 pad left (101 rows).
+  QueryData query{{"Sc1", "Sc2"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("c1"), NamedExpression("d1")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 2;
+  edge.on_condition =
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kGreaterThan,
+                          ColumnValueExp("d1"));
+  query.outer_joins_.push_back(std::move(edge));
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("BatchNestedLoopJoin"), std::string::npos)
+      << dump.str();
+  size_t rows = 0;
+  size_t left_padded = 0;
+  size_t right_padded = 0;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+    ASSERT_EQ(row.values_.size(), 2U);
+    if (row[0].IsNull()) {
+      ++left_padded;
+    } else if (row[1].IsNull()) {
+      ++right_padded;
+    }
+  }
+  EXPECT_EQ(rows, 5052U);
+  EXPECT_EQ(left_padded, 101U);
+  EXPECT_EQ(right_padded, 1U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceKeepsFullWhereAboveJoin) {
+  // M6+1: FULL preserves neither side, so every WHERE stays above the
+  // join. ON c1 = d1 leaves d1 = 100..199 padded; WHERE c1 IS NULL must
+  // yield exactly those 100 left-padded rows. Pushing it into the left
+  // scan would empty that input and pad every right row instead (200 rows
+  // reaching down to d1 = 0).
+  QueryData query{
+      {"Sc1", "Sc2"},
+      UnaryExpressionExp(ColumnValueExp("c1"), UnaryOperation::kIsNull),
+      {NamedExpression("c1"), NamedExpression("d1")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 2;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp("c1"), BinaryOperation::kEquals, ColumnValueExp("d1"));
+  query.outer_joins_.push_back(std::move(edge));
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  Row row;
+  size_t count = 0;
+  while (executor->Next(&row, nullptr)) {
+    EXPECT_TRUE(row[0].IsNull());
+    ASSERT_FALSE(row[1].IsNull());
+    EXPECT_LE(100, row[1].value.int_value);
+    ++count;
+  }
+  EXPECT_EQ(count, 100U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceRejectsChainsAndAggregates) {
+  // Chains (two edges) stay on the relational path for every kind, as do
+  // single outer joins under aggregation: the optimizer reports
+  // kNotImplemented instead of planning them unsoundly.
+  for (uint8_t kind : {uint8_t{0}, uint8_t{1}, uint8_t{2}}) {
+    QueryData query{{"Sc1", "Sc2", "Sc3"},
+                    ConstantValueExp(Value(true)),
+                    {NamedExpression("c1")}};
+    for (size_t right : {size_t{1}, size_t{2}}) {
+      QueryData::OuterJoinEdge edge;
+      edge.right_index = right;
+      edge.join_kind = kind;
+      edge.on_condition = BinaryExpressionExp(
+          ColumnValueExp("c1"), BinaryOperation::kEquals, ColumnValueExp("d1"));
+      query.outer_joins_.push_back(std::move(edge));
+    }
+    TransactionContext context = rs_->BeginContext();
+    ASSERT_SUCCESS(query.Rewrite(context));
+    EXPECT_EQ(Optimizer::Optimize(query, context).GetStatus(),
+              Status::kNotImplemented);
+  }
+  for (uint8_t kind : {uint8_t{0}, uint8_t{1}, uint8_t{2}}) {
+    QueryData query{
+        {"Sc1", "Sc2"},
+        ConstantValueExp(Value(true)),
+        {NamedExpression("n", AggregateExpressionExp(AggregationType::kCount,
+                                                     ColumnValueExp("c1")))}};
+    QueryData::OuterJoinEdge edge;
+    edge.right_index = 1;
+    edge.join_kind = kind;
+    edge.on_condition = BinaryExpressionExp(
+        ColumnValueExp("c1"), BinaryOperation::kEquals, ColumnValueExp("d1"));
+    query.outer_joins_.push_back(std::move(edge));
+    TransactionContext context = rs_->BeginContext();
+    ASSERT_SUCCESS(query.Rewrite(context));
+    EXPECT_EQ(Optimizer::Optimize(query, context).GetStatus(),
+              Status::kNotImplemented);
+  }
+  ASSERT_SUCCESS(rs_->BeginContext().PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceEliminatesUnusedUniqueRightSide) {
+  // M6: nothing above the join names the right side and the equi-key is
+  // UNIQUE there, so each preserved row matches at most once and the LEFT
+  // join is the identity over the preserved side.
+  TransactionContext context = rs_->BeginContext();
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, parent,
+        rs_->CreateTable(
+            context,
+            Schema("OjParent", {Column("id", ValueType::kInt64,
+                                       Constraint(Constraint::kPrimaryKey)),
+                                Column("v", ValueType::kInt64)})));
+    for (int i = 1; i <= 3; ++i) {
+      ASSERT_SUCCESS(parent.Insert(context.txn_, Row({Value(i), Value(i * 10)}))
+                         .GetStatus());
+    }
+  }
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, child,
+        rs_->CreateTable(
+            context,
+            Schema("OjChild", {Column("id", ValueType::kInt64,
+                                      Constraint(Constraint::kPrimaryKey)),
+                               Column("w", ValueType::kInt64)})));
+    ASSERT_SUCCESS(
+        child.Insert(context.txn_, Row({Value(2), Value(200)})).GetStatus());
+  }
+  QueryData query{{"OjParent", "OjChild"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("v")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 0;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("OjParent", "id")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("OjChild", "id")));
+  query.outer_joins_.push_back(std::move(edge));
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_EQ(dump.str().find("Join"), std::string::npos) << dump.str();
+
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  std::vector<int64_t> values;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ASSERT_EQ(row.values_.size(), 1U);
+    values.push_back(row[0].value.int_value);
+  }
+  EXPECT_EQ(values, (std::vector<int64_t>{10, 20, 30}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceKeepsJoinWithoutUniquenessProof) {
+  // Same shape but the equi-key carries no uniqueness proof: dropping the
+  // join could collapse duplicate matches, so the outer join stays.
+  TransactionContext context = rs_->BeginContext();
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, parent,
+        rs_->CreateTable(
+            context,
+            Schema("OjParentNu", {Column("id", ValueType::kInt64,
+                                         Constraint(Constraint::kPrimaryKey)),
+                                  Column("v", ValueType::kInt64)})));
+    for (int i = 1; i <= 2; ++i) {
+      ASSERT_SUCCESS(parent.Insert(context.txn_, Row({Value(i), Value(i * 10)}))
+                         .GetStatus());
+    }
+  }
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, child,
+        rs_->CreateTable(
+            context, Schema("OjChildNu", {Column("id", ValueType::kInt64),
+                                          Column("w", ValueType::kInt64)})));
+    ASSERT_SUCCESS(
+        child.Insert(context.txn_, Row({Value(1), Value(100)})).GetStatus());
+    ASSERT_SUCCESS(
+        child.Insert(context.txn_, Row({Value(1), Value(101)})).GetStatus());
+  }
+  QueryData query{{"OjParentNu", "OjChildNu"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("v")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 0;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("OjParentNu", "id")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("OjChildNu", "id")));
+  query.outer_joins_.push_back(std::move(edge));
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_NE(dump.str().find("Left Outer Join"), std::string::npos)
+      << dump.str();
+
+  // v = 10 matches twice (multiplied), v = 20 pads: elimination would have
+  // reported 2 rows instead of 3.
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  size_t rows = 0;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+  }
+  EXPECT_EQ(rows, 3U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceEliminatesUnusedUniqueLeftSideForRight) {
+  // M6+1 mirror: nothing above the join names the left side of a RIGHT join
+  // and the equi-key is UNIQUE there, so the RIGHT join is the identity
+  // over the preserved (right) side.
+  TransactionContext context = rs_->BeginContext();
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, parent,
+        rs_->CreateTable(
+            context,
+            Schema("RjParent", {Column("id", ValueType::kInt64,
+                                       Constraint(Constraint::kPrimaryKey)),
+                                Column("v", ValueType::kInt64)})));
+    for (int i = 1; i <= 3; ++i) {
+      ASSERT_SUCCESS(parent.Insert(context.txn_, Row({Value(i), Value(i * 10)}))
+                         .GetStatus());
+    }
+  }
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, child,
+        rs_->CreateTable(
+            context,
+            Schema("RjChild", {Column("id", ValueType::kInt64,
+                                      Constraint(Constraint::kPrimaryKey)),
+                               Column("w", ValueType::kInt64)})));
+    ASSERT_SUCCESS(
+        child.Insert(context.txn_, Row({Value(2), Value(200)})).GetStatus());
+  }
+  QueryData query{{"RjChild", "RjParent"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("v")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 1;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("RjChild", "id")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("RjParent", "id")));
+  query.outer_joins_.push_back(std::move(edge));
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_EQ(dump.str().find("Join"), std::string::npos) << dump.str();
+
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  std::vector<int64_t> values;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ASSERT_EQ(row.values_.size(), 1U);
+    values.push_back(row[0].value.int_value);
+  }
+  EXPECT_EQ(values, (std::vector<int64_t>{10, 20, 30}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterJoinSliceKeepsFullJoinWithoutElimination) {
+  // M6+1: FULL preserves both sides, so even a unique unreferenced side
+  // cannot be eliminated. RjChild {2} FULL JOIN RjParent {1,2,3} yields the
+  // id = 2 match plus the two unmatched parent rows.
+  TransactionContext context = rs_->BeginContext();
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, parent,
+        rs_->CreateTable(
+            context,
+            Schema("FjParent", {Column("id", ValueType::kInt64,
+                                       Constraint(Constraint::kPrimaryKey)),
+                                Column("v", ValueType::kInt64)})));
+    for (int i = 1; i <= 3; ++i) {
+      ASSERT_SUCCESS(parent.Insert(context.txn_, Row({Value(i), Value(i * 10)}))
+                         .GetStatus());
+    }
+  }
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, child,
+        rs_->CreateTable(
+            context,
+            Schema("FjChild", {Column("id", ValueType::kInt64,
+                                      Constraint(Constraint::kPrimaryKey)),
+                               Column("w", ValueType::kInt64)})));
+    ASSERT_SUCCESS(
+        child.Insert(context.txn_, Row({Value(2), Value(200)})).GetStatus());
+  }
+  QueryData query{{"FjChild", "FjParent"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("v")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 2;
+  edge.on_condition = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("FjChild", "id")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("FjParent", "id")));
+  query.outer_joins_.push_back(std::move(edge));
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_NE(dump.str().find("Full Outer Join"), std::string::npos)
+      << dump.str();
+
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  std::vector<int64_t> values;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ASSERT_EQ(row.values_.size(), 1U);
+    ASSERT_FALSE(row[0].IsNull());
+    values.push_back(row[0].value.int_value);
+  }
+  std::sort(values.begin(), values.end());
+  EXPECT_EQ(values, (std::vector<int64_t>{10, 20, 30}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, MergeSemiJoinRuleBuildsSortedProbeOnlyPlan) {
   TransactionContext context = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, left_table,
@@ -1966,6 +2511,198 @@ TEST_F(OptimizerTest, CrossTableResidualPredicateIsAppliedByTheJoin) {
     ++count;
   }
   EXPECT_EQ(count, 55U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, BatchNestedLoopExecutesNonEquiInnerJoin) {
+  // Arrange: a pure non-equi join predicate (no equi pair, so hash/merge
+  // offer nothing) with selective single-table filters. c1 = 99 can only
+  // pair with d1 = 100, so exactly one row survives.
+  auto query = [&] {
+    return QueryData{
+        {"Sc1", "Sc2"},
+        BinaryExpressionExp(
+            BinaryExpressionExp(ColumnValueExp("c1"),
+                                BinaryOperation::kLessThan,
+                                ColumnValueExp("d1")),
+            BinaryOperation::kAnd,
+            BinaryExpressionExp(
+                BinaryExpressionExp(ColumnValueExp("c1"),
+                                    BinaryOperation::kGreaterThanEquals,
+                                    ConstantValueExp(Value(99))),
+                BinaryOperation::kAnd,
+                BinaryExpressionExp(ColumnValueExp("d1"),
+                                    BinaryOperation::kLessThanEquals,
+                                    ConstantValueExp(Value(100))))),
+        {NamedExpression("c1"), NamedExpression("d1")}};
+  };
+  {
+    // Act: disable the tuple nested loop so the blocked executor must win.
+    QueryData q = query();
+    TransactionContext context = rs_->BeginContext();
+    ASSERT_SUCCESS(q.Rewrite(context));
+    OptimizerOptions options = OptimizerOptions::Default();
+    options.disabled_implementation_rules.insert("nested_loop_join");
+    const auto plan_or = Optimizer::Optimize(q, context, options);
+    ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    Executor executor = plan_or.Value()->EmitExecutor(context);
+    std::ostringstream dump;
+    executor->Dump(dump, 0);
+    EXPECT_NE(dump.str().find("BatchNestedLoopJoin"), std::string::npos)
+        << dump.str();
+
+    // Assert: exactly (99, 100).
+    Row row;
+    ASSERT_TRUE(executor->Next(&row, nullptr));
+    EXPECT_EQ(row[0].value.int_value, 99);
+    EXPECT_EQ(row[1].value.int_value, 100);
+    EXPECT_FALSE(executor->Next(&row, nullptr));
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  {
+    // Act: with the full rule set the tuple nested loop still wins the
+    // exact tie (it is registered first), so existing plans are unchanged.
+    QueryData q = query();
+    TransactionContext context = rs_->BeginContext();
+    ASSERT_SUCCESS(q.Rewrite(context));
+    const auto plan_or = Optimizer::Optimize(q, context);
+    ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    std::ostringstream plan_dump;
+    plan_dump << plan_or.Value();
+    EXPECT_EQ(plan_dump.str().find("Batch"), std::string::npos)
+        << plan_dump.str();
+    Executor executor = plan_or.Value()->EmitExecutor(context);
+    std::ostringstream dump;
+    executor->Dump(dump, 0);
+    EXPECT_EQ(dump.str().find("BatchNestedLoopJoin"), std::string::npos)
+        << dump.str();
+
+    // Assert: same single row.
+    Row row;
+    ASSERT_TRUE(executor->Next(&row, nullptr));
+    EXPECT_EQ(row[0].value.int_value, 99);
+    EXPECT_EQ(row[1].value.int_value, 100);
+    EXPECT_FALSE(executor->Next(&row, nullptr));
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+}
+
+TEST_F(OptimizerTest, BatchNestedLoopGateKeepsEquiJoins) {
+  // Arrange: with hash/merge/index/tuple-loop all disabled, an equi join
+  // must fail to plan (the batch gate refuses equi pairs) while a non-equi
+  // join still plans through the blocked executor.
+  OptimizerOptions options = OptimizerOptions::Default();
+  options.disabled_implementation_rules.insert("hash_join");
+  options.disabled_implementation_rules.insert("merge_join");
+  options.disabled_implementation_rules.insert("index_join");
+  options.disabled_implementation_rules.insert("nested_loop_join");
+  {
+    QueryData query{
+        {"Sc1", "Sc2"},
+        BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                            ColumnValueExp("d1")),
+        {NamedExpression("c1"), NamedExpression("d1")}};
+    TransactionContext context = rs_->BeginContext();
+    ASSERT_SUCCESS(query.Rewrite(context));
+    EXPECT_EQ(Optimizer::Optimize(query, context, options).GetStatus(),
+              Status::kNotImplemented);
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  {
+    QueryData query{
+        {"Sc1", "Sc2"},
+        BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kLessThan,
+                            ColumnValueExp("d1")),
+        {NamedExpression("c1"), NamedExpression("d1")}};
+    TransactionContext context = rs_->BeginContext();
+    ASSERT_SUCCESS(query.Rewrite(context));
+    const auto plan_or = Optimizer::Optimize(query, context, options);
+    ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    std::ostringstream dump;
+    plan_or.Value()->EmitExecutor(context)->Dump(dump, 0);
+    EXPECT_NE(dump.str().find("BatchNestedLoopJoin"), std::string::npos)
+        << dump.str();
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+}
+
+TEST_F(OptimizerTest, BatchNestedLoopCoversNonEquiSemiAntiAndFullJoin) {
+  // Arrange: memo-level non-equi semi/anti/full joins (c1 > d1). Semi keeps
+  // c1 = 1..99 (99 rows), anti keeps only c1 = 0, and the full join emits
+  // 4950 matches plus every unmatched row padded (c1 = 0 on the left,
+  // d1 = 99..199 on the right).
+  TransactionContext context = rs_->BeginContext();
+  cascades::RuleContext rule_context;
+  rule_context.transaction = &context;
+  for (const char* relation : {"Sc1", "Sc2"}) {
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable(relation));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, statistics,
+                          context.GetStats(relation));
+    rule_context.tables.emplace(relation, std::move(table));
+    rule_context.statistics.emplace(relation, std::move(statistics));
+  }
+  const Expression predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("Sc1", "c1")), BinaryOperation::kGreaterThan,
+      ColumnValueExp(ColumnName("Sc2", "d1")));
+  struct Case {
+    cascades::LogicalOperator operation;
+    uint8_t join_type;
+    JoinKind kind;
+    size_t expected_rows;
+    size_t expected_left_nulls;
+  };
+  const std::vector<Case> cases = {
+      {cascades::LogicalOperator::kSemiJoin, 0, SemiJoinKind(), 99U, 0U},
+      {cascades::LogicalOperator::kAntiJoin, 0, AntiJoinKind(), 1U, 0U},
+      {cascades::LogicalOperator::kOuterJoin, 2, FullOuterJoinKind(), 5052U,
+       101U},
+  };
+  for (const Case& test_case : cases) {
+    cascades::Memo memo;
+    // Register the relations in the memo join graph (outer-join planning
+    // probes it; the derived group below carries the join itself).
+    (void)memo.Build({"Sc1", "Sc2"});
+    const cascades::GroupId left = memo.EnsureGroup({"Sc1"});
+    const cascades::GroupId right = memo.EnsureGroup({"Sc2"});
+    const cascades::GroupId derived =
+        memo.EnsureDerivedGroup({"Sc1", "Sc2"}, "kinded-join");
+    ASSERT_TRUE(memo.AddExpression(
+        derived,
+        cascades::LogicalExpression{.operation = test_case.operation,
+                                    .children = {left, right},
+                                    .predicate = predicate,
+                                    .join_type = test_case.join_type}));
+    const cascades::RuleSet no_rules;
+    cascades::SearchEngine search(std::move(memo), no_rules);
+    const auto best =
+        search.Optimize(derived, cascades::PhysicalProperties{},
+                        DefaultImplementationRules(), rule_context);
+    ASSERT_TRUE(best.has_value());
+    if (!best.has_value()) {
+      continue;
+    }
+    const auto product = std::dynamic_pointer_cast<ProductPlan>(best->plan);
+    ASSERT_NE(product, nullptr);
+    EXPECT_EQ(product->Kind(), test_case.kind);
+    EXPECT_TRUE(product->PrefersBatchNestedLoop());
+    Executor executor = best->plan->EmitExecutor(context);
+    std::ostringstream dump;
+    executor->Dump(dump, 0);
+    EXPECT_NE(dump.str().find("BatchNestedLoopJoin"), std::string::npos)
+        << dump.str();
+    Row row;
+    size_t count = 0;
+    size_t left_nulls = 0;
+    while (executor->Next(&row, nullptr)) {
+      if (row[0].IsNull()) {
+        ++left_nulls;
+      }
+      ++count;
+    }
+    EXPECT_EQ(count, test_case.expected_rows);
+    EXPECT_EQ(left_nulls, test_case.expected_left_nulls);
+  }
   ASSERT_SUCCESS(context.PreCommit());
 }
 

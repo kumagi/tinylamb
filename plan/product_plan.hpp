@@ -61,8 +61,9 @@ class ProductPlan final : public PlanBase {
   ProductPlan(Plan left_src, Plan right_src);
   // Cross / nested-loop shape with an explicit join kind. Inner lowers to a
   // cross product (or NestedLoopJoin when a residual note is attached);
-  // LeftOuter lowers to a null-padding NestedLoopJoin. Other kinds are
-  // rejected by the factory.
+  // LeftOuter lowers to a null-padding NestedLoopJoin. Semi/anti/full/right
+  // residuals lower to the blocked BatchNestedLoopJoin (the tuple nested
+  // loop only implements inner/left-outer).
   ProductPlan(Plan left_src, Plan right_src, JoinKind kind);
   ProductPlan(const ProductPlan&) = delete;
   ProductPlan(ProductPlan&&) = delete;
@@ -98,6 +99,15 @@ class ProductPlan final : public PlanBase {
   [[nodiscard]] const Expression& ResidualNote() const {
     return residual_note_;
   }
+  // Block-nested-loop strategy marker. The cross/nested-loop shape (empty
+  // key columns + residual note) lowers to the tuple NestedLoopJoin by
+  // default; the batch_nested_loop implementation rule sets this to select
+  // the blocked BatchNestedLoopJoin executor instead (same logical info,
+  // different physical strategy — like HashJoinMode kInMemory/kHybrid).
+  void PreferBatchNestedLoop() { batch_nested_loop_ = true; }
+  [[nodiscard]] bool PrefersBatchNestedLoop() const {
+    return batch_nested_loop_;
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -113,6 +123,7 @@ class ProductPlan final : public PlanBase {
   JoinKind kind_{};
   std::vector<bool> key_null_safe_;
   Expression residual_note_;
+  bool batch_nested_loop_{false};
   Schema output_schema_;
   TableStatistics stats_;
 };

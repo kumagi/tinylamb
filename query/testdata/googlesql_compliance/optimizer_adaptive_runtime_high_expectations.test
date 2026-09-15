@@ -61,11 +61,26 @@ ARRAY<STRUCT<id INT64, other_id INT64>>[
 ==
 
 [mode=explain_analyze]
-[plan_contains=EmptyBuildShortCircuit probe_opened=false]
+# M5: a constant-FALSE derived table flattens into a constant-false filter
+# before planning, which folds all the way to an empty plan (no join, no
+# scan, no probe work at all).
+[plan_contains=EmptyResult]
 [plan_contains=Actual Rows: 0]
 [name=empty_inner_hash_build_skips_probe_scan]
 SELECT p.id FROM opt_probe p
 JOIN (SELECT k FROM opt_build WHERE false) b ON p.k = b.k
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain_analyze]
+# The executor-level empty-build short circuit, preserved through a
+# non-flattenable (grouped) empty build side.
+[plan_contains=EmptyBuildShortCircuit probe_opened=false]
+[plan_contains=Actual Rows: 0]
+[name=empty_grouped_build_skips_probe_scan]
+SELECT p.id FROM opt_probe p
+JOIN (SELECT k FROM opt_build GROUP BY k HAVING false) b ON p.k = b.k
 --
 ARRAY<STRUCT<id INT64>>[]
 ==

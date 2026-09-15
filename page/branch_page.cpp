@@ -51,7 +51,13 @@ Status BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
                                   page_id_t value) {
   page_id_t old_lowest_value = lowest_page_;
   SetLowestValueImpl(value);
-  RETURN_IF_FAIL(txn.SetLowestLog(pid, value, old_lowest_value).GetStatus());
+  Status append = txn.SetLowestLog(pid, value, old_lowest_value).GetStatus();
+  if (append != Status::kSuccess) {
+    // WAL append failed: no CLR will compensate, so restore the previous
+    // fence instead of keeping an unlogged lowest value.
+    SetLowestValueImpl(old_lowest_value);
+    return append;
+  }
   return Status::kSuccess;
 }
 
@@ -77,7 +83,14 @@ Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
     return Status::kDuplicates;
   }
   InsertImpl(key, value);
-  RETURN_IF_FAIL(txn.InsertBranchLog(pid, key, value).GetStatus());
+  Status append = txn.InsertBranchLog(pid, key, value).GetStatus();
+  if (append != Status::kSuccess) {
+    // WAL append failed: no CLR will compensate this insert, so remove the
+    // separator again (DeleteImpl is a no-op-safe delete) instead of leaving
+    // an unlogged branch entry behind the abort.
+    DeleteImpl(key);
+    return append;
+  }
   return Status::kSuccess;
 }
 
@@ -105,8 +118,17 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
     DeFragment();
   }
   const int pos = SearchToInsert(key);
+  if (static_cast<size_t>(physical_size) > free_ptr_) {
+    // Corruption backstop: the Insert() admission checks make this
+    // unreachable, and redo reaching here without them must refuse instead
+    // of underflowing free_ptr_ into the slot array.  Undo the charge so
+    // the counters stay consistent with the untouched layout.
+    LOG(ERROR) << "InsertImpl: insufficient space for payload ("
+               << physical_size << " bytes) rejected";
+    free_size_ += static_cast<bin_size_t>(physical_size + sizeof(RowPointer));
+    return;
+  }
   ++row_count_;
-  assert(physical_size <= free_ptr_);
   free_ptr_ -= static_cast<bin_size_t>(physical_size);
   SerializePID(Payload() + free_ptr_, pid);
   SerializeStringView(Payload() + free_ptr_ + sizeof(page_id_t), key);
@@ -210,12 +232,19 @@ Status BranchPage::Delete(page_id_t pid, Transaction& txn,
 }
 
 void BranchPage::DeleteImpl(std::string_view key) {
-  assert(0 < row_count_);
+  // Runtime callers reach here after Delete() resolved the separator, and
+  // redo/undo replay after the page_lsn filter; the floor landing is the
+  // contract (a Search miss below the lowest separator designates entry 0
+  // itself).  The row_count_ guard replaces a debug-only assert: a release
+  // build deleting from an empty branch would Search its way into
+  // GetValue(0) and read past the slot array.
+  if (row_count_ == 0) {
+    return;
+  }
   int pos = Search(key, false);
-  assert(std::cmp_less(pos, row_count_));
   if (pos < 0) {
     lowest_page_ = GetValue(0);
-    ++pos;
+    pos = 0;
   }
   // Refund exactly what InsertImpl charged: key + page id + the RowPointer
   // slot.  Missing the pointer here permanently inflated free_size_, and the

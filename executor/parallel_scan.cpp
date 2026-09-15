@@ -192,7 +192,17 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
     return !ready_.empty() || active_workers_ == 0 || worker_error_;
   });
   if (worker_error_) {
-    std::rethrow_exception(worker_error_);
+    // Surface the worker failure as a sticky Status instead of unwinding
+    // through NextBatch (no-exception executor contract).
+    try {
+      std::rethrow_exception(worker_error_);
+    } catch (const std::exception& error) {
+      FailWith(StatusError(StatusCode::kRuntimeError, error.what()));
+    } catch (...) {
+      FailWith(StatusError(StatusCode::kRuntimeError,
+                           "parallel scan worker failed"));
+    }
+    return 0;
   }
   if (ready_.empty()) {
     return 0;

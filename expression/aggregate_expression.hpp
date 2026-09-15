@@ -91,6 +91,7 @@ class AggregateExpression : public ExpressionBase {
   // Row-level pre-filter: `AGG(x WHERE cond)` skips rows where cond is not
   // true; streaming-safe, unlike the HAVING MAX/MIN modifier.
   [[nodiscard]] const Expression& WhereFilter() const { return where_filter_; }
+  [[nodiscard]] bool HasWhereFilter() const { return where_filter_ != nullptr; }
   void SetWhereFilter(Expression filter) { where_filter_ = std::move(filter); }
   // Static SQL type of ARRAY_AGG's element (BOOL, INT32, ...), inferred from
   // the argument AST.  Empty means infer from the aggregated values.

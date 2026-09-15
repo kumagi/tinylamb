@@ -32,8 +32,10 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/lambda_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "type/column_name.hpp"
 #include "type/interval.hpp"
 #include "type/row.hpp"
@@ -603,6 +605,20 @@ BinaryOperation NegateComparison(BinaryOperation operation) {
   }
 }
 
+// True when the subtree contains a DOUBLE-valued constant: its comparisons
+// can be IEEE-unordered (NaN) regardless of the static schema type.
+bool SubtreeHasDoubleLiteral(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kConstantValue &&
+      expression->AsConstantValue().GetValue().type == ValueType::kDouble) {
+    return true;
+  }
+  return std::ranges::any_of(ExpressionChildren(expression),
+                             SubtreeHasDoubleLiteral);
+}
+
 bool IsZero(const Expression& expression) {
   if (!IsConstant(expression)) {
     return false;
@@ -694,6 +710,10 @@ bool StaticallyNonNumeric(const Expression& expression) {
     return type != TypeTag::kBigInt && type != TypeTag::kDouble &&
            type != TypeTag::kInvalid;
   } catch (const std::exception&) {
+    // Unknown type (rewrite-time probe schema is empty): assume the
+    // expression may be numeric.  Identity rules firing on bare columns is
+    // pinned by ArithmeticIdentitiesAndDoubleNegation; the catch keeps the
+    // boolean heuristics permissive for the same reason.
     return false;
   }
 }
@@ -908,6 +928,7 @@ bool ExpressionRuleSet::Contains(std::string_view name) const {
       rules_, [&](const ExpressionRule& rule) { return rule.Name() == name; });
 }
 
+namespace {
 Expression FactorCommonAndImpl(const Expression& expression) {
   if (!expression || expression->Type() != TypeTag::kBinaryExp) {
     return Expression{};
@@ -996,6 +1017,53 @@ Expression FactorCommonAndImpl(const Expression& expression) {
       CombineConjuncts(common), BinaryOperation::kAnd,
       BinaryExpressionExp(CombineConjuncts(left_rest), BinaryOperation::kOr,
                           CombineConjuncts(right_rest)));
+}
+}  // namespace
+
+// Schema published by ExpressionRewriter::TryRewrite for rules that want to
+// resolve column types (see set_schema). Null outside a rewrite.
+thread_local const Schema* g_active_rewrite_schema = nullptr;
+
+class ScopedActiveRewriteSchema {
+ public:
+  explicit ScopedActiveRewriteSchema(const Schema* schema)
+      : saved_(g_active_rewrite_schema) {
+    g_active_rewrite_schema = schema;
+  }
+  ~ScopedActiveRewriteSchema() { g_active_rewrite_schema = saved_; }
+  ScopedActiveRewriteSchema(const ScopedActiveRewriteSchema&) = delete;
+  ScopedActiveRewriteSchema& operator=(const ScopedActiveRewriteSchema&) =
+      delete;
+
+ private:
+  const Schema* saved_;
+};
+
+const Schema* ActiveRewriteSchema() { return g_active_rewrite_schema; }
+
+bool SideCanBeDouble(const Expression& side, const Schema& schema);
+
+bool SideCanBeDouble(const Expression& side, const Schema& schema) {
+  if (!side) {
+    return false;
+  }
+  // A DOUBLE literal anywhere in the subtree makes the expression's runtime
+  // value potentially NaN even when the schema-typed ResultType cannot be
+  // resolved (unknown columns throw).  Check this BEFORE the schema lookup.
+  if (side->Type() == TypeTag::kConstantValue &&
+      side->AsConstantValue().GetValue().type == ValueType::kDouble) {
+    return true;
+  }
+  for (const Expression& child : ExpressionChildren(side)) {
+    if (SideCanBeDouble(child, schema)) {
+      return true;
+    }
+  }
+  try {
+    return side->ResultType(schema).GetType() == TypeTag::kDouble;
+  } catch (const std::exception&) {
+    return false;
+  }
 }
 
 const ExpressionRuleSet& ExpressionRuleSet::Default() {
@@ -1225,12 +1293,26 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             case BinaryOperation::kEquals:
             case BinaryOperation::kNotEquals:
               break;
-            default:
+            default: {
+              // StaticallyDouble() cannot see DOUBLE literals buried under a
+              // column-typed expression (unknown columns throw out of
+              // ResultType), so probe the operand subtrees for anything that
+              // can evaluate to a double / NaN (oracle-found: NOT(NaN > 0)
+              // became NaN <= 0, flipping TRUE to FALSE).
+              const Expression& bin = bindings.at("binary");
+              const Expression& left = bin->AsBinaryExpression().Left();
+              const Expression& right = bin->AsBinaryExpression().Right();
               if (StaticallyDouble(bindings.at("left")) ||
-                  StaticallyDouble(bindings.at("right"))) {
+                  StaticallyDouble(bindings.at("right")) ||
+                  SubtreeHasDoubleLiteral(left) ||
+                  SubtreeHasDoubleLiteral(right) ||
+                  (ActiveRewriteSchema() != nullptr &&
+                   (SideCanBeDouble(left, *ActiveRewriteSchema()) ||
+                    SideCanBeDouble(right, *ActiveRewriteSchema())))) {
                 return Expression{};
               }
               break;
+            }
           }
           return BinaryExpressionExp(bindings.at("left"),
                                      NegateComparison(operation),
@@ -1505,6 +1587,14 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               !SafeToReduceEvaluationCount(left)) {
             return Expression{};
           }
+          // INT64 `x + x` and `x * 2` disagree at the overflow boundary in
+          // this engine (addition crosses into UINT64 wraparound, while
+          // multiplication raises), so collapsing a DYNAMIC integer addition
+          // can turn a value into a throw (oracle-found: col_i = INT64_MIN)
+          // or erase one. Exact doubles have no such boundary.
+          if (!StaticallyDouble(left) && !IsInt64Constant(left)) {
+            return Expression{};
+          }
           return BinaryExpressionExp(left, BinaryOperation::kMultiply,
                                      ConstantValueExp(Value(2)));
         }));
@@ -1534,6 +1624,14 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                        std::numeric_limits<int64_t>::min()) {
               return Expression{};
             }
+          }
+          // The constant check above only sees literals.  A DYNAMIC INT64
+          // child can hold INT64_MIN at runtime, so dropping the negations
+          // would erase a throwing evaluation (oracle-found: `-(-col_i)`
+          // with col_i = INT64_MIN throws in the AST but not folded).
+          // Double negation is exact and total, so it stays foldable.
+          if (!StaticallyDouble(child)) {
+            return Expression{};
           }
           return child;
         }));
@@ -3386,6 +3484,25 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (and_side->size() > 4) {
             return Expression{};
           }
+          // Distribution duplicates `other` into one disjunct per conjunct:
+          // a volatile (RAND()) or potentially-raising (1/0) operand would
+          // then evaluate (or raise) several times where the original
+          // short-circuits after the first TRUE disjunct. Sibling rules
+          // gate on the same two predicates.
+          if (!ExpressionCannotThrow(*other) ||
+              !SafeToReduceEvaluationCount(*other)) {
+            return Expression{};
+          }
+          // The conjuncts move from a position the original expression may
+          // SKIP (AND short-circuits on a FALSE sibling) into one that the
+          // distributed form always evaluates: a raising conjunct would
+          // gain a spurious error (oracle-found: `(FALSE AND (ci + ci)) OR
+          // ci` at INT64_MAX raised only after the rewrite).
+          for (const Expression& conjunct : *and_side) {
+            if (!ExpressionCannotThrow(conjunct)) {
+              return Expression{};
+            }
+          }
           std::vector<Expression> distributed;
           distributed.reserve(and_side->size());
           for (const Expression& conjunct : *and_side) {
@@ -3429,6 +3546,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
 StatusOr<Expression> ExpressionRewriter::TryRewrite(
     const Expression& expression) const {
+  const ScopedActiveRewriteSchema schema_scope(schema_);
+
   Expression current = expression;
   // D6 (docs/design.md): the pass cap is a safety net, not a rejection
   // mechanism.  When a rule set oscillates past the cap, returning the last
@@ -3537,6 +3656,32 @@ std::vector<Expression> ExpressionChildren(const Expression& expression) {
       const auto& test = expression->AsQueryExpression().Test();
       return test ? std::vector<Expression>{test} : std::vector<Expression>{};
     }
+    case TypeTag::kWindowFunctionExp: {
+      const auto& window = expression->AsWindowFunctionCallExpression();
+      std::vector<Expression> children = window.args;
+      if (window.where_filter) {
+        children.push_back(window.where_filter);
+      }
+      for (const auto& term : window.inner_order_by) {
+        children.push_back(term.expression);
+      }
+      children.insert(children.end(), window.partition_by.begin(),
+                      window.partition_by.end());
+      for (const auto& term : window.order_by) {
+        children.push_back(term.expression);
+      }
+      if (window.frame_start.offset) {
+        children.push_back(window.frame_start.offset);
+      }
+      if (window.frame_end.offset) {
+        children.push_back(window.frame_end.offset);
+      }
+      return children;
+    }
+    // kLambdaExp stays opaque here (see lambda_expression.hpp): generic
+    // walkers that rebuild through WithExpressionChildren have no lambda
+    // case, and exposing children would turn every traversal into a
+    // "leaf has children" CHECK failure.
     default:
       return {};
   }
@@ -3657,9 +3802,81 @@ Expression WithExpressionChildren(const Expression& expression,
 
         return nullptr;
       }
-      return QueryExpressionExp(query.Query(),
-                                children.empty() ? nullptr : children.front(),
-                                query.Exists(), query.Negated());
+      // Preserve every discriminator of the quantified/ARRAY form: dropping
+      // op_/mode_ would silently turn "x > ANY(...)" into "x IN (...)", and
+      // the ARRAY(SELECT ...) markers change evaluation outright.
+      auto rebuilt = std::make_shared<QueryExpression>(
+          query.Query(), children.empty() ? nullptr : children.front(),
+          query.Exists(), query.Negated(), query.Op(), query.Mode());
+      rebuilt->SetArrayResult(query.ArrayResult());
+      rebuilt->SetArrayElementSqlType(query.ArrayElementSqlType());
+      return rebuilt;
+    }
+    case TypeTag::kWindowFunctionExp: {
+      // Mirror ExpressionChildren's enumeration exactly: args, where_filter,
+      // inner_order_by, partition_by, order_by, then both frame offsets.
+      // Every other field (frame unit/bounds, exclusion, NULL modifiers,
+      // inner limit, distinct) copies verbatim so a child rewrite cannot
+      // silently change the window specification.
+      const auto& window = expression->AsWindowFunctionCallExpression();
+      size_t expected = window.args.size() + window.inner_order_by.size() +
+                        window.partition_by.size() + window.order_by.size() +
+                        (window.where_filter ? 1U : 0U) +
+                        (window.frame_start.offset ? 1U : 0U) +
+                        (window.frame_end.offset ? 1U : 0U);
+      if (children.size() != expected) {
+        CHECK_MSG(false, "window arity");
+
+        return nullptr;
+      }
+      // ExpressionBase deletes copy/move, so clone field by field (the
+      // class is a plain aggregate of specification fields).
+      auto rebuilt = std::make_shared<WindowFunctionCallExpression>();
+      rebuilt->function = window.function;
+      rebuilt->args = window.args;
+      rebuilt->where_filter = window.where_filter;
+      rebuilt->distinct = window.distinct;
+      rebuilt->inner_order_by = window.inner_order_by;
+      rebuilt->inner_limit = window.inner_limit;
+      rebuilt->partition_by = window.partition_by;
+      rebuilt->order_by = window.order_by;
+      rebuilt->frame_unit = window.frame_unit;
+      rebuilt->frame_start = window.frame_start;
+      rebuilt->frame_end = window.frame_end;
+      rebuilt->has_frame = window.has_frame;
+      rebuilt->exclusion = window.exclusion;
+      rebuilt->respect_nulls = window.respect_nulls;
+      rebuilt->ignore_nulls = window.ignore_nulls;
+      size_t next = 0;
+      for (Expression& arg : rebuilt->args) {
+        arg = std::move(children[next]);
+        ++next;
+      }
+      if (rebuilt->where_filter) {
+        rebuilt->where_filter = std::move(children[next]);
+        ++next;
+      }
+      for (WindowOrderTerm& term : rebuilt->inner_order_by) {
+        term.expression = std::move(children[next]);
+        ++next;
+      }
+      for (Expression& partition : rebuilt->partition_by) {
+        partition = std::move(children[next]);
+        ++next;
+      }
+      for (WindowOrderTerm& term : rebuilt->order_by) {
+        term.expression = std::move(children[next]);
+        ++next;
+      }
+      if (rebuilt->frame_start.offset) {
+        rebuilt->frame_start.offset = std::move(children[next]);
+        ++next;
+      }
+      if (rebuilt->frame_end.offset) {
+        rebuilt->frame_end.offset = std::move(children[next]);
+        ++next;
+      }
+      return rebuilt;
     }
     default:
       if (!children.empty()) {
@@ -3835,10 +4052,12 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
 
     // (x * c1) * c2 -> x * (c1 * c2) for non-negative integer constants.
     // Checked combines skip the rewrite instead of folding into an
-    // overflow the original tree would not have evaluated.
+    // overflow the original tree would not have evaluated.  c2 == 0 also
+    // refuses: the original still evaluates x * c1 (which may raise), while
+    // the folded x * 0 would silently return 0.
     int64_t inner_constant = 0;
     if (IsInt64Constant(binary.Right(), &inner_constant) &&
-        inner_constant >= 0 && binary.Left()->Type() == TypeTag::kBinaryExp &&
+        inner_constant > 0 && binary.Left()->Type() == TypeTag::kBinaryExp &&
         binary.Left()->AsBinaryExpression().Op() ==
             BinaryOperation::kMultiply) {
       const auto& inner = binary.Left()->AsBinaryExpression();
@@ -4007,17 +4226,6 @@ bool IsOrderedComparison(BinaryOperation operation) {
   }
 }
 
-bool SideCanBeDouble(const Expression& side, const Schema& schema) {
-  if (!side) {
-    return false;
-  }
-  try {
-    return side->ResultType(schema).GetType() == TypeTag::kDouble;
-  } catch (const std::exception&) {
-    return false;
-  }
-}
-
 }  // namespace
 
 bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
@@ -4041,6 +4249,23 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kBinaryExp: {
       const auto& binary = expression->AsBinaryExpression();
+      // XOR expands into `(a OR b) AND (NOT a OR NOT b)` during rewriting,
+      // so an ordered DOUBLE comparison under a XOR becomes a
+      // NOT(ordered-comparison) that not_comparison would then negate
+      // unsoundly for IEEE NaN (oracle-found: `(NaN >= -3) XOR col_i`
+      // evaluated TRUE pre-fold and FALSE post-fold).
+      if (binary.Op() == BinaryOperation::kXor) {
+        const auto negatable = [](const Expression& e, const Schema& sch) {
+          return e && e->Type() == TypeTag::kBinaryExp &&
+                 IsOrderedComparison(e->AsBinaryExpression().Op()) &&
+                 (SideCanBeDouble(e->AsBinaryExpression().Left(), sch) ||
+                  SideCanBeDouble(e->AsBinaryExpression().Right(), sch));
+        };
+        if (negatable(binary.Left(), schema) ||
+            negatable(binary.Right(), schema)) {
+          return true;
+        }
+      }
       return ContainsNotOfOrderedDoubleComparison(binary.Left(), schema) ||
              ContainsNotOfOrderedDoubleComparison(binary.Right(), schema);
     }
@@ -4094,6 +4319,86 @@ const ExpressionRuleSet& NotComparisonFreeRules() {
     return copy;
   }();
   return rules;
+}
+
+namespace {
+// Recursive worker for ExtractWindowCalls; see the header for the contract.
+std::optional<Expression> ExtractWindowCallsIn(
+    const Expression& expression, size_t* counter,
+    std::unordered_map<std::string, size_t>* dedup,
+    std::vector<ExtractedWindow>* specs) {
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kWindowFunctionExp) {
+    // Nested window calls are invalid SQL; refuse instead of miscompiling.
+    for (const Expression& child : ExpressionChildren(expression)) {
+      if (child && child->Type() == TypeTag::kWindowFunctionExp) {
+        return std::nullopt;
+      }
+    }
+    // ToString() omits the aggregate WHERE filter and the NULL-treatment
+    // modifiers, so two calls that differ only in those would collapse onto
+    // one hidden column and silently share a result. Extend the key with
+    // every field the evaluator distinguishes.
+    const auto& window = expression->AsWindowFunctionCallExpression();
+    std::string key = expression->ToString();
+    if (window.where_filter) {
+      key += " WHERE ";
+      key += window.where_filter->ToString();
+    }
+    if (window.respect_nulls) {
+      key += " RESPECT NULLS";
+    }
+    if (window.ignore_nulls) {
+      key += " IGNORE NULLS";
+    }
+    const auto found = dedup->find(key);
+    size_t index = 0;
+    if (found != dedup->end()) {
+      index = found->second;
+    } else {
+      index = (*counter)++;
+      dedup->emplace(key, index);
+      ColumnName output("", "$win" + std::to_string(index));
+      specs->push_back({expression, output});
+    }
+    // The output name derives from the global index, never from the
+    // per-invocation specs vector (the dedup map is shared across items
+    // while each call returns only its own new specs).
+    return ColumnValueExp(ColumnName("", "$win" + std::to_string(index)));
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  std::vector<Expression> rewritten;
+  rewritten.reserve(children.size());
+  for (const Expression& child : children) {
+    std::optional<Expression> mapped =
+        ExtractWindowCallsIn(child, counter, dedup, specs);
+    if (!mapped.has_value()) {
+      return std::nullopt;
+    }
+    rewritten.push_back(std::move(*mapped));
+  }
+  return WithExpressionChildren(expression, std::move(rewritten));
+}
+}  // namespace
+
+std::optional<std::pair<Expression, std::vector<ExtractedWindow>>>
+ExtractWindowCalls(const Expression& expression, size_t* counter,
+                   std::unordered_map<std::string, size_t>* dedup) {
+  if (counter == nullptr || dedup == nullptr) {
+    return std::nullopt;
+  }
+  std::vector<ExtractedWindow> specs;
+  std::optional<Expression> rewritten =
+      ExtractWindowCallsIn(expression, counter, dedup, &specs);
+  if (!rewritten.has_value()) {
+    return std::nullopt;
+  }
+  return std::make_pair(std::move(*rewritten), std::move(specs));
 }
 
 }  // namespace tinylamb

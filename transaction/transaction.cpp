@@ -156,7 +156,10 @@ bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
     return false;
   }
   if (write_set_.contains(rp)) {
-    return true;
+    // The write set may have pre-reserved this row without a before-image
+    // (TryAddWriteSet); re-acquire so the image is recorded and concurrent
+    // snapshots keep seeing the pre-update value.
+    return transaction_manager_->AcquireWriteIntent(*this, rp, true, before);
   }
   if (!transaction_manager_->AcquireWriteIntent(*this, rp, true, before)) {
     return false;

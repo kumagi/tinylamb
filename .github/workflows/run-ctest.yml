@@ -10,12 +10,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake clang
+          # The SQL tests assume the GoogleSQL frontend (GoogleSqlFrontend::
+          # Available() is baked in at configure time); OFF would fail 300+
+          # of them, so keep the default ON here.
           cmake -S . -B build \
             -DCMAKE_CXX_FLAGS="-fsanitize=undefined,bounds,address" \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+            -DCMAKE_BUILD_TYPE=Debug
           cmake --build build -j"$(nproc)"
           ctest --test-dir build -j"$(nproc)" --output-on-failure
+          python3 scripts/clean_root_artifacts.py
 
   googlesql-compliance:
     runs-on: ubuntu-24.04
@@ -31,4 +34,5 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DTINYLAMB_ENABLE_GOOGLESQL=ON
           cmake --build build -j"$(nproc)" --target googlesql_compliance_test
-          ctest --test-dir build -R googlesql_compliance --output-on-failure
+          ctest --test-dir build -R GoogleSqlCompliance --output-on-failure
+          python3 scripts/clean_root_artifacts.py

@@ -24,7 +24,7 @@ jobs:
           cmake -S . -B build-rel \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=clang++ \
-            -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+            -DTINYLAMB_ENABLE_GOOGLESQL=ON
           cmake --build build-rel --target tinylamb_tpch_benchmark -j"$(nproc)"
 
       - name: Run TPC-H SF=1 (load + Q1-Q22)

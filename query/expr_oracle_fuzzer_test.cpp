@@ -24,6 +24,10 @@ struct ScopedDb {
   std::unique_ptr<Database> db;
   ScopedDb(std::string n, std::unique_ptr<Database> d)
       : name(std::move(n)), db(std::move(d)) {}
+  ScopedDb(const ScopedDb&) = delete;
+  ScopedDb& operator=(const ScopedDb&) = delete;
+  ScopedDb(ScopedDb&&) = delete;
+  ScopedDb& operator=(ScopedDb&&) = delete;
   ~ScopedDb() {
     db.reset();
     std::error_code ec;
@@ -441,6 +445,8 @@ TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
     ++ran;
   }
   EXPECT_EQ(ran, kIterations);
+  EXPECT_GT(engine_ran, kIterations / 2)
+      << "extended-op sweep must execute the engine oracle";
 }
 
 // Failure->file->replay pipeline: serialize/parse round-trips, replay of a
@@ -538,6 +544,9 @@ TEST(ExprOracleFuzzer, RowAwareExtendedOpsEquivalence) {
   }
 
   EXPECT_EQ(engine_ran_count, kIterations);
+  EXPECT_GT(null_reject_verified_count, 0)
+      << "Expected null rejection verification to trigger on generated "
+         "extended-op predicates";
 }
 
 }  // namespace tinylamb

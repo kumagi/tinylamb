@@ -175,10 +175,9 @@ TEST_F(RelationalRegressionTest, WherePredicateError_PropagatesFailure) {
   SqlEngine engine(*rs_);
   ASSIGN_OR_ASSERT_FAIL(
       Table, t,
-      rs_->CreateTable(
-          context,
-          Schema("ErrTable", {Column("id", ValueType::kInt64),
-                              Column("val", ValueType::kInt64)})));
+      rs_->CreateTable(context,
+                       Schema("ErrTable", {Column("id", ValueType::kInt64),
+                                           Column("val", ValueType::kInt64)})));
   ASSERT_SUCCESS(
       t.Insert(context.txn_,
                Row({Value(1), Value(std::numeric_limits<int64_t>::min())}))
@@ -196,16 +195,16 @@ TEST_F(RelationalRegressionTest, WherePredicateError_PropagatesFailure) {
   run_ctx.Abort();
 }
 
-TEST_F(RelationalRegressionTest, ConjunctEvaluationToleratesErrorOnRejectedRow) {
+TEST_F(RelationalRegressionTest,
+       ConjunctEvaluationToleratesErrorOnRejectedRow) {
   TransactionContext context = rs_->BeginContext();
   SqlEngine engine(*rs_);
   ASSIGN_OR_ASSERT_FAIL(
       Table, t,
-      rs_->CreateTable(
-          context,
-          Schema("ErrTable2", {Column("id", ValueType::kInt64),
-                               Column("i", ValueType::kInt64),
-                               Column("f", ValueType::kDouble)})));
+      rs_->CreateTable(context,
+                       Schema("ErrTable2", {Column("id", ValueType::kInt64),
+                                            Column("i", ValueType::kInt64),
+                                            Column("f", ValueType::kDouble)})));
   ASSERT_SUCCESS(
       t.Insert(context.txn_,
                Row({Value(1), Value(std::numeric_limits<int64_t>::min()),
@@ -229,21 +228,23 @@ TEST_F(RelationalRegressionTest, ConjunctEvaluationToleratesErrorOnRejectedRow) 
     EXPECT_EQ(r2[0][0], Value(2));
   }
 
-  // Residual compare rejects row 1 (SAFE_ADD(i, -1) = 0 is false/null for row 1):
-  // Both orders of conjuncts must succeed and return empty.
+  // Residual compare rejects row 1 (SAFE_ADD(i, -1) = 0 is false/null for row
+  // 1): Both orders of conjuncts must succeed and return empty.
   {
-    std::vector<Row> r1 = RelationalRun(
-        *rs_,
-        "SELECT id FROM ErrTable2 WHERE (SAFE_ADD(i, -1) = 0) AND ABS(i) <= 3;");
+    std::vector<Row> r1 =
+        RelationalRun(*rs_,
+                      "SELECT id FROM ErrTable2 WHERE (SAFE_ADD(i, -1) = 0) "
+                      "AND ABS(i) <= 3;");
     EXPECT_TRUE(r1.empty());
 
-    std::vector<Row> r2 = RelationalRun(
-        *rs_,
-        "SELECT id FROM ErrTable2 WHERE ABS(i) <= 3 AND (SAFE_ADD(i, -1) = 0);");
+    std::vector<Row> r2 = RelationalRun(*rs_,
+                                        "SELECT id FROM ErrTable2 WHERE ABS(i) "
+                                        "<= 3 AND (SAFE_ADD(i, -1) = 0);");
     EXPECT_TRUE(r2.empty());
   }
 
-  // When no conjunct rejects row 1 (f < 0 is true for row 1), ABS(i) must throw.
+  // When no conjunct rejects row 1 (f < 0 is true for row 1), ABS(i) must
+  // throw.
   {
     TransactionContext run_ctx = rs_->BeginContext();
     StatusOr<Executor> prepared = engine.Prepare(
@@ -290,7 +291,8 @@ TEST_F(RelationalRegressionTest, WindowFunctions_ArgumentAndFrameValidation) {
         *rs_, "SELECT LAG(k, k) OVER (ORDER BY k) FROM KeyTable;");
     ASSERT_EQ(rows.size(), 10U);
     for (size_t i = 0; i < 10; ++i) {
-      // Offset is k, so target is i - i = 0 for each row; always yields row 0 (Value(0)).
+      // Offset is k, so target is i - i = 0 for each row; always yields row 0
+      // (Value(0)).
       EXPECT_EQ(rows[i][0], Value(0));
     }
   }
@@ -305,7 +307,7 @@ TEST_F(RelationalRegressionTest, WindowFunctions_ArgumentAndFrameValidation) {
       "SELECT SUM(k) OVER (ORDER BY k ROWS BETWEEN -1 PRECEDING AND CURRENT "
       "ROW) FROM KeyTable;");
   check_fails(
-      "SELECT SUM(k) OVER (ORDER BY k ROWS BETWEEN NULL PRECEDING AND CURRENT "
+      "SELECT SUM(k) OVER (ORDER BY k RANGE BETWEEN NULL PRECEDING AND CURRENT "
       "ROW) FROM KeyTable;");
   check_fails(
       "SELECT SUM(k) OVER (ORDER BY k RANGE BETWEEN -1 PRECEDING AND CURRENT "
@@ -313,6 +315,71 @@ TEST_F(RelationalRegressionTest, WindowFunctions_ArgumentAndFrameValidation) {
   check_fails(
       "SELECT SUM(k) OVER (ORDER BY k RANGE BETWEEN NULL PRECEDING AND CURRENT "
       "ROW) FROM KeyTable;");
+}
+
+// Collects EXPLAIN ANALYZE output lines for a statement.
+std::string ExplainAnalyze(Database& database, std::string_view sql) {
+  TransactionContext context = database.BeginContext();
+  SqlEngine engine(database);
+  StatusOr<Executor> prepared = engine.Prepare(
+      context, std::string("EXPLAIN ANALYZE ") + std::string(sql));
+  std::string profile;
+  if (!prepared.HasValue()) {
+    ADD_FAILURE() << sql << "\n" << engine.LastError();
+    context.Abort();
+    return profile;
+  }
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    profile += std::string(row[0].value.varchar_value) + "\n";
+  }
+  EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+  return profile;
+}
+
+TEST_F(RelationalRegressionTest, DerivedSingleColumnEquiJoinUsesHashJoin) {
+  // TPC-H Q20 at SF1: joining a base table against a single-column derived
+  // table on `AggTable.k = s.k` must resolve the key into a hash join.
+  // Previously the derived output schema stayed bare while outer predicates
+  // reference it through the source alias, so the equality went unresolved
+  // and execution fell back to cross product + filter (800K x derived rows
+  // at SF1). LoadSource now alias-qualifies derived schemas, mirroring the
+  // estimate path.
+  const std::string profile = ExplainAnalyze(
+      *rs_,
+      "SELECT COUNT(*) FROM AggTable, (SELECT k FROM SmallKeys) s "
+      "WHERE AggTable.k = s.k;");
+  EXPECT_NE(profile.find("nested_loop_joins=0"), std::string::npos) << profile;
+
+  // Results are unchanged by the join shape (20 matches per key 1..4).
+  const std::vector<Row> rows = RelationalRun(
+      *rs_,
+      "SELECT COUNT(*) FROM AggTable, (SELECT k FROM SmallKeys) s "
+      "WHERE AggTable.k = s.k;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{80}));
+}
+
+TEST_F(RelationalRegressionTest, DerivedSingleColumnBareEqualityUsesHashJoin) {
+  // Same join with bare, disjoint column names (`v = kk`, the TPC-H Q20
+  // `ps_partkey = p_partkey` shape). Previously IsVirtualValueTableField
+  // claimed every bare predicate column against the single-column derived
+  // schema, marking the equality ambiguous and forcing the same cross
+  // product fallback.
+  const std::string profile = ExplainAnalyze(
+      *rs_,
+      "SELECT COUNT(*) FROM AggTable, (SELECT k AS kk FROM SmallKeys) s "
+      "WHERE v = kk;");
+  EXPECT_NE(profile.find("nested_loop_joins=0"), std::string::npos) << profile;
+
+  // v is constantly 1 while derived kk ranges over {1,2,3,4}: every one
+  // of the 200 AggTable rows matches exactly the kk = 1 row.
+  const std::vector<Row> rows = RelationalRun(
+      *rs_,
+      "SELECT COUNT(*) FROM AggTable, (SELECT k AS kk FROM SmallKeys) s "
+      "WHERE v = kk;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{200}));
 }
 
 }  // namespace

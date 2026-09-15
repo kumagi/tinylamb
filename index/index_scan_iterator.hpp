@@ -68,6 +68,11 @@ class IndexScanIterator : public IteratorBase {
   friend class IndexScan;
   void UpdateIteratorState();
   void ResolveRow() const;
+  // kUnique entries normally hold a single position per key, but a key
+  // carrying a NULL is stored (and must be decoded/navigated) as a
+  // multi-value list: SQL says NULL != NULL, so several rows can share one
+  // NULL key (see Table::IndexInsert).
+  [[nodiscard]] bool StoredAsSingleValue() const;
 
   const Table& table_;
   const Index& index_;

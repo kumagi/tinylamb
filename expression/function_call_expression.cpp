@@ -149,8 +149,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   if (matched) {
     if (ct->year < 1 || ct->year > 9999 || ct->month < 1 || ct->month > 12 ||
         ct->day < 1 || ct->day > 31 || ct->hour < 0 || ct->hour > 23 ||
-        ct->minute < 0 || ct->minute > 59 || ct->second < 0 || ct->second > 60 ||
-        ct->subsecond_nanos < 0 || ct->subsecond_nanos > 999999999) {
+        ct->minute < 0 || ct->minute > 59 || ct->second < 0 ||
+        ct->second > 60 || ct->subsecond_nanos < 0 ||
+        ct->subsecond_nanos > 999999999) {
       return false;
     }
     const std::chrono::year_month_day ymd{
@@ -741,11 +742,10 @@ StatusOr<Value> FormatFunction(const std::string& name,
         } else if (arg.type == ValueType::kDouble) {
           formatted_item = std::to_string(arg.value.double_value);
         } else if (arg.type == ValueType::kInt64) {
-          const double d =
-              arg.IsUnsigned()
-                  ? static_cast<double>(
-                        static_cast<uint64_t>(arg.value.int_value))
-                  : static_cast<double>(arg.value.int_value);
+          const double d = arg.IsUnsigned()
+                               ? static_cast<double>(
+                                     static_cast<uint64_t>(arg.value.int_value))
+                               : static_cast<double>(arg.value.int_value);
           formatted_item = std::to_string(d);
         } else {
           return StatusError(
@@ -819,9 +819,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     for (size_t i = 0; i < s.size();) {
       offsets.push_back(i);
       const auto c = static_cast<unsigned char>(s[i]);
-      if ((c & 0x80) == 0) {
-        i += 1;
-      } else if ((c & 0xE0) == 0xC0) {
+      if ((c & 0xE0) == 0xC0) {
         i += static_cast<size_t>((i + 1 < s.size()) ? 2 : 1);
       } else if ((c & 0xF0) == 0xE0) {
         i += static_cast<size_t>(
@@ -832,6 +830,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
                 ? 4
                 : (i + 2 < s.size() ? 3 : (i + 1 < s.size() ? 2 : 1)));
       } else {
+        // ASCII byte or invalid lead byte: advance by one.
         i += 1;
       }
     }
@@ -1106,7 +1105,8 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       }
     }
     for (const auto& val : values) {
-      if (val.type == ValueType::kDouble && std::isnan(val.value.double_value)) {
+      if (val.type == ValueType::kDouble &&
+          std::isnan(val.value.double_value)) {
         return Value(std::numeric_limits<double>::quiet_NaN());
       }
     }
@@ -1124,7 +1124,8 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return static_cast<double>(val.value.int_value);
     };
     for (size_t i = 1; i < values.size(); ++i) {
-      if (best.type == ValueType::kInt64 && values[i].type == ValueType::kInt64) {
+      if (best.type == ValueType::kInt64 &&
+          values[i].type == ValueType::kInt64) {
         const bool takes =
             name == "greatest" ? values[i] > best : values[i] < best;
         if (takes) {
@@ -1305,7 +1306,8 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
         }
         uint64_t result = 0;
         if (__builtin_mul_overflow(q, scale, &result)) {
-          return StatusError(StatusCode::kIsInfinity, "integer overflow in ROUND");
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in ROUND");
         }
         return Value(static_cast<int64_t>(result)).WithUnsigned();
       }
@@ -1314,7 +1316,13 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
         return Value(v);
       }
       int64_t scale = 1;
-      for (int64_t i = 0; i < -digits; ++i) {
+      // `-digits` is itself INT64_MIN for digits == INT64_MIN and cannot be
+      // negated in signed arithmetic (UBSan, found by FUNCTION fuzzing).
+      const uint64_t trunc_digits =
+          digits == std::numeric_limits<int64_t>::min()
+              ? static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+              : static_cast<uint64_t>(-digits);
+      for (uint64_t i = 0; i < trunc_digits; ++i) {
         if (scale > std::numeric_limits<int64_t>::max() / 10) {
           return Value(int64_t{0});
         }
@@ -1329,7 +1337,8 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       }
       int64_t result = 0;
       if (__builtin_mul_overflow(q, scale, &result)) {
-        return StatusError(StatusCode::kIsInfinity, "integer overflow in ROUND");
+        return StatusError(StatusCode::kIsInfinity,
+                           "integer overflow in ROUND");
       }
       return Value(result);
     }
@@ -1380,7 +1389,12 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
         return Value(v);
       }
       int64_t scale = 1;
-      for (int64_t i = 0; i < -digits; ++i) {
+      // See trunc: INT64_MIN negation guard (FUNCTION fuzz).
+      const uint64_t trunc_digits =
+          digits == std::numeric_limits<int64_t>::min()
+              ? static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+              : static_cast<uint64_t>(-digits);
+      for (uint64_t i = 0; i < trunc_digits; ++i) {
         if (scale > std::numeric_limits<int64_t>::max() / 10) {
           return Value(int64_t{0});
         }
@@ -1446,7 +1460,8 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       if (values[0].IsUnsigned() || values[1].IsUnsigned()) {
         const auto r = static_cast<uint64_t>(values[1].value.int_value);
         if (r == 0) {
-          return StatusError(StatusCode::kIsInfinity, "division by zero in MOD");
+          return StatusError(StatusCode::kIsInfinity,
+                             "division by zero in MOD");
         }
         const auto l = static_cast<uint64_t>(values[0].value.int_value);
         return Value(static_cast<int64_t>(l % r)).WithUnsigned();
@@ -1475,19 +1490,17 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
                          "unsupported argument type for MOD");
     }
     const double l =
-        left_double
-            ? values[0].value.double_value
-            : (values[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
-                                          values[0].value.int_value))
-                                      : static_cast<double>(
-                                            values[0].value.int_value));
+        left_double ? values[0].value.double_value
+                    : (values[0].IsUnsigned()
+                           ? static_cast<double>(static_cast<uint64_t>(
+                                 values[0].value.int_value))
+                           : static_cast<double>(values[0].value.int_value));
     const double r =
-        right_double
-            ? values[1].value.double_value
-            : (values[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
-                                          values[1].value.int_value))
-                                      : static_cast<double>(
-                                            values[1].value.int_value));
+        right_double ? values[1].value.double_value
+                     : (values[1].IsUnsigned()
+                            ? static_cast<double>(static_cast<uint64_t>(
+                                  values[1].value.int_value))
+                            : static_cast<double>(values[1].value.int_value));
     if (r == 0.0) {
       return StatusError(StatusCode::kIsInfinity, "division by zero");
     }
@@ -1509,25 +1522,24 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     }
     const double l =
         values[0].type == ValueType::kInt64
-            ? (values[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
-                                          values[0].value.int_value))
-                                      : static_cast<double>(
-                                            values[0].value.int_value))
+            ? (values[0].IsUnsigned()
+                   ? static_cast<double>(
+                         static_cast<uint64_t>(values[0].value.int_value))
+                   : static_cast<double>(values[0].value.int_value))
             : values[0].value.double_value;
     const double r =
         values[1].type == ValueType::kInt64
-            ? (values[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
-                                          values[1].value.int_value))
-                                      : static_cast<double>(
-                                            values[1].value.int_value))
+            ? (values[1].IsUnsigned()
+                   ? static_cast<double>(
+                         static_cast<uint64_t>(values[1].value.int_value))
+                   : static_cast<double>(values[1].value.int_value))
             : values[1].value.double_value;
     if (l < 0.0 && !std::isinf(l) && !std::isnan(r) && std::floor(r) != r) {
       return StatusError(StatusCode::kInvalidArgument,
                          "Floating point error in function: POW");
     }
     if (l == 0.0 && r < 0.0 && !std::isinf(r)) {
-      return StatusError(StatusCode::kIsInfinity,
-                         "division by zero in POW");
+      return StatusError(StatusCode::kIsInfinity, "division by zero in POW");
     }
     const double res = std::pow(l, r);
     if (std::isinf(res) && !std::isinf(l) && !std::isinf(r)) {
@@ -1781,7 +1793,8 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       if (values[0].IsUnsigned() || values[1].IsUnsigned()) {
         const auto r = static_cast<uint64_t>(values[1].value.int_value);
         if (r == 0) {
-          return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
+          return StatusError(StatusCode::kIsInfinity,
+                             "division by zero in DIV");
         }
         const auto l = static_cast<uint64_t>(values[0].value.int_value);
         return Value(static_cast<int64_t>(l / r)).WithUnsigned();
@@ -1870,10 +1883,10 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return Value(std::string());
     }
 
-    const size_t length =
-        values.size() == 3
-            ? static_cast<size_t>(std::max(int64_t{0}, values[2].value.int_value))
-            : total_cps;
+    const size_t length = values.size() == 3
+                              ? static_cast<size_t>(std::max(
+                                    int64_t{0}, values[2].value.int_value))
+                              : total_cps;
     return Value(utf8_substr(input, static_cast<size_t>(actual_start), length));
   }
 
@@ -2017,8 +2030,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "TRIM requires 1 or 2 arguments");
     }
-    if (values[0].IsNull() ||
-        (values.size() == 2 && values[1].IsNull())) {
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
       return Value();
     }
     std::string s = raw_str(values[0]);
@@ -2036,8 +2048,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "LTRIM requires 1 or 2 arguments");
     }
-    if (values[0].IsNull() ||
-        (values.size() == 2 && values[1].IsNull())) {
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
       return Value();
     }
     std::string s = raw_str(values[0]);
@@ -2054,8 +2065,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "RTRIM requires 1 or 2 arguments");
     }
-    if (values[0].IsNull() ||
-        (values.size() == 2 && values[1].IsNull())) {
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
       return Value();
     }
     std::string s = raw_str(values[0]);
@@ -2158,16 +2168,23 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
           StatusCode::kInvalidArgument,
           "Second argument (repeat count) for REPEAT cannot be negative");
     }
-    if (n == 0) {
+    if (n == 0 || s.empty()) {
+      // REPEAT('', k) is '' for every k; without this the loop below runs k
+      // times appending nothing (fuzz-found 30s+ timeout for '' x 2^63).
       return Value(std::string());
     }
-    if (static_cast<uint64_t>(s.size()) * static_cast<uint64_t>(n) > 1000000) {
+    // The old uint64 multiply WRAPPED for e.g. ("abcdefgh", 2^61), slipping
+    // past the 1MB cap into an unbounded append loop until OOM (fuzz-found).
+    uint64_t total_bytes = 0;
+    if (__builtin_mul_overflow(s.size(), static_cast<uint64_t>(n),
+                               &total_bytes) ||
+        total_bytes > 1000000) {
       return StatusError(
           StatusCode::kInvalidArgument,
           "Output of REPEAT exceeds max allowed output size of 1MB");
     }
     std::string res;
-    res.reserve(s.size() * static_cast<size_t>(n));
+    res.reserve(static_cast<size_t>(total_bytes));
     for (int64_t i = 0; i < n; ++i) {
       res += s;
     }
@@ -2263,17 +2280,20 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     if (first_len == 1) {
       code = static_cast<unsigned char>(s[0]);
     } else if (first_len == 2) {
-      code = ((static_cast<unsigned char>(s[0]) & 0x1F) << 6) |
-             (static_cast<unsigned char>(s[1]) & 0x3F);
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[0]) & 0x1F) << 6) |
+          (static_cast<unsigned char>(s[1]) & 0x3F));
     } else if (first_len == 3) {
-      code = ((static_cast<unsigned char>(s[0]) & 0x0F) << 12) |
-             ((static_cast<unsigned char>(s[1]) & 0x3F) << 6) |
-             (static_cast<unsigned char>(s[2]) & 0x3F);
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[0]) & 0x0F) << 12) |
+          ((static_cast<unsigned char>(s[1]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[2]) & 0x3F));
     } else if (first_len == 4) {
-      code = ((static_cast<unsigned char>(s[0]) & 0x07) << 18) |
-             ((static_cast<unsigned char>(s[1]) & 0x3F) << 12) |
-             ((static_cast<unsigned char>(s[2]) & 0x3F) << 6) |
-             (static_cast<unsigned char>(s[3]) & 0x3F);
+      code = static_cast<uint32_t>(
+          ((static_cast<unsigned char>(s[0]) & 0x07) << 18) |
+          ((static_cast<unsigned char>(s[1]) & 0x3F) << 12) |
+          ((static_cast<unsigned char>(s[2]) & 0x3F) << 6) |
+          (static_cast<unsigned char>(s[3]) & 0x3F));
     }
     return Value(static_cast<int64_t>(code));
   }
@@ -2862,7 +2882,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     const int64_t lhs = values[0].value.int_value;
     const int64_t rhs = values[1].value.int_value;
     const bool is_u = values[0].IsUnsigned() || values[1].IsUnsigned();
-    auto with_u = [&](Value v) { return is_u ? v.WithUnsigned() : v; };
+    auto with_u = [&](const Value& v) { return is_u ? v.WithUnsigned() : v; };
     if (name == "__bit_and") {
       return with_u(Value(lhs & rhs));
     }
@@ -2880,8 +2900,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return with_u(Value(static_cast<int64_t>(0)));
     }
     const auto ulhs = static_cast<uint64_t>(lhs);
-    const uint64_t shifted =
-        name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
+    const uint64_t shifted = name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
     return with_u(Value(static_cast<int64_t>(shifted)));
   }
   if (name == "safe_add" || name == "safe_subtract" ||
@@ -2951,17 +2970,17 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     }
     const double l =
         values[0].type == ValueType::kInt64
-            ? (values[0].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
-                                          values[0].value.int_value))
-                                      : static_cast<double>(
-                                            values[0].value.int_value))
+            ? (values[0].IsUnsigned()
+                   ? static_cast<double>(
+                         static_cast<uint64_t>(values[0].value.int_value))
+                   : static_cast<double>(values[0].value.int_value))
             : values[0].value.double_value;
     const double r =
         values[1].type == ValueType::kInt64
-            ? (values[1].IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
-                                          values[1].value.int_value))
-                                      : static_cast<double>(
-                                            values[1].value.int_value))
+            ? (values[1].IsUnsigned()
+                   ? static_cast<double>(
+                         static_cast<uint64_t>(values[1].value.int_value))
+                   : static_cast<double>(values[1].value.int_value))
             : values[1].value.double_value;
     const double checked =
         name == "safe_add" ? l + r : (name == "safe_subtract" ? l - r : l * r);
@@ -3525,8 +3544,13 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     }
     const std::string val_str = raw_str(values[0]);
     const std::string unit_str = raw_str(values[1]);
-    const IntervalValue iv = IntervalValue::Parse(val_str, unit_str);
-    return Value(iv.ToString());
+    // TryEvaluate must not let an EXC-SHIM throw escape its Status contract
+    // (fuzz-found: an ARRAY<INT64>[] garbage literal made Parse throw
+    // out_of_range straight through Visit and killed the process).
+    ASSIGN_OR_RETURN(IntervalValue, iv,
+                     (IntervalValue::TryParse(val_str, unit_str)));
+    ASSIGN_OR_RETURN(std::string, iv_text, (iv.TryToString()));
+    return Value(std::move(iv_text));
   }
 
   if (name == "generate_array") {
@@ -3553,9 +3577,9 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     };
     ASSIGN_OR_RETURN(double, start, (numeric(values[0])));
     ASSIGN_OR_RETURN(double, end, (numeric(values[1])));
-    ASSIGN_OR_RETURN(double, step,
-                     (values.size() == 3 ? numeric(values[2])
-                                         : StatusOr<double>(0.0)));
+    ASSIGN_OR_RETURN(
+        double, step,
+        (values.size() == 3 ? numeric(values[2]) : StatusOr<double>(0.0)));
     if (step == 0.0) {
       if (values.size() == 3) {
         return StatusError(StatusCode::kIsInfinity,
@@ -3586,8 +3610,10 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
 
     std::vector<Value> elements;
     constexpr size_t kMaxGeneratedElements = 1'000'000;
+    // Repeated addition (not start + i*step) is the observable contract:
+    // an integer-bound rewrite changes accumulated FP results element-wise.
     for (double value = start; (step > 0 ? value <= end : value >= end);
-         value += step) {
+         value += step) {  // NOLINT(cert-flp30-c)
       if (elements.size() == kMaxGeneratedElements) {
         return StatusError(StatusCode::kInvalidArgument,
                            "GENERATE_ARRAY generated too many elements");
@@ -3643,7 +3669,8 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     const int64_t end_days = end_days_or.Value();
     if (start_days < -11000000 || start_days > 11000000 ||
         end_days < -11000000 || end_days > 11000000) {
-      return StatusError(StatusCode::kInvalidArgument, "DATE value out of range");
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DATE value out of range");
     }
     int64_t step_days = 1;
     if (values.size() == 3) {
@@ -3652,8 +3679,9 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
         step_days = step.value.int_value;
       } else {
         const std::string text = raw_str(step);
-        const IntervalValue parsed =
-            text.empty() ? IntervalValue{} : IntervalValue::Parse(text);
+        ASSIGN_OR_RETURN(IntervalValue, parsed,
+                         text.empty() ? StatusOr<IntervalValue>{IntervalValue{}}
+                                      : IntervalValue::TryParse(text));
         if (parsed.months != 0 || parsed.nanos != 0) {
           return StatusError(StatusCode::kInvalidArgument,
                              "unsupported GENERATE_DATE_ARRAY step unit");
@@ -3670,15 +3698,15 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     }
     std::vector<Value> elements;
     constexpr size_t kMaxGeneratedDates = 1'000'000;
-    for (int64_t d = start_days;
-         step_days > 0 ? d <= end_days : d >= end_days;
+    for (int64_t d = start_days; step_days > 0 ? d <= end_days : d >= end_days;
          d += step_days) {
       if (elements.size() == kMaxGeneratedDates) {
         return StatusError(StatusCode::kInvalidArgument,
                            "GENERATE_DATE_ARRAY generated too many elements");
       }
       if (d < -11000000 || d > 11000000) {
-        return StatusError(StatusCode::kInvalidArgument, "DATE value out of range");
+        return StatusError(StatusCode::kInvalidArgument,
+                           "DATE value out of range");
       }
       elements.push_back(Value::DateFromDays(d));
       int64_t next = 0;
@@ -3894,7 +3922,12 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
     }
     constexpr std::string_view kDateMarker = "__tinylamb_date__:";
     if (unescaped.starts_with(kDateMarker)) {
-      *parsed = Value::Date(unescaped.substr(kDateMarker.size()));
+      // A malformed marked DATE must not throw through this bool-returning
+      // helper; fall back to the plain string value.
+      StatusOr<Value> date_value =
+          Value::TryDate(unescaped.substr(kDateMarker.size()));
+      *parsed = date_value.HasValue() ? date_value.MoveValue()
+                                      : Value(std::move(unescaped));
     } else {
       *parsed = Value(std::move(unescaped));
     }
@@ -3949,7 +3982,14 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
                      item.size() >= 2) {
             elements.emplace_back(item.substr(1, item.size() - 2));
           } else if (element_type == "DATE") {
-            elements.emplace_back(Value::Date(item));
+            StatusOr<Value> date_element = Value::TryDate(item);
+            if (date_element.HasValue()) {
+              elements.push_back(date_element.MoveValue());
+            } else {
+              // Unparseable DATE element: mirror the sibling fallback that
+              // keeps the raw text instead of throwing through a bool API.
+              elements.emplace_back(std::string(item));
+            }
           } else {
             try {
               size_t consumed = 0;
@@ -4595,10 +4635,9 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
       func_name_ == "ascii" || func_name_ == "unicode" ||
       func_name_ == "regexp_contains" || func_name_ == "regexp_match" ||
       func_name_ == "regexp_instr" || func_name_ == "div" ||
-      func_name_.starts_with("extract_") ||
-      func_name_ == "__bit_and" || func_name_ == "__bit_or" ||
-      func_name_ == "__bit_xor" || func_name_ == "__shift_left" ||
-      func_name_ == "__shift_right") {
+      func_name_.starts_with("extract_") || func_name_ == "__bit_and" ||
+      func_name_ == "__bit_or" || func_name_ == "__bit_xor" ||
+      func_name_ == "__shift_left" || func_name_ == "__shift_right") {
     return {TypeTag::kBigInt};
   }
 
@@ -4721,10 +4760,9 @@ Type FunctionCallExpression::ResultType(const Schema& left,
       func_name_ == "ascii" || func_name_ == "unicode" ||
       func_name_ == "regexp_contains" || func_name_ == "regexp_match" ||
       func_name_ == "regexp_instr" || func_name_ == "div" ||
-      func_name_.starts_with("extract_") ||
-      func_name_ == "__bit_and" || func_name_ == "__bit_or" ||
-      func_name_ == "__bit_xor" || func_name_ == "__shift_left" ||
-      func_name_ == "__shift_right") {
+      func_name_.starts_with("extract_") || func_name_ == "__bit_and" ||
+      func_name_ == "__bit_or" || func_name_ == "__bit_xor" ||
+      func_name_ == "__shift_left" || func_name_ == "__shift_right") {
     return {TypeTag::kBigInt};
   }
 

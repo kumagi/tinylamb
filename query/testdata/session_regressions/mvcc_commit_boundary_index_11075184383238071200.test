@@ -1,0 +1,67 @@
+-- tinylamb-session-test v1
+-- seed: 11075184383238071200
+-- stmt: CREATE TABLE tbl0 (u INT64, c1 INT64, c2 INT64);
+-- stmt: CREATE TABLE tbl1 (u INT64, c1 VARCHAR(8), c2 INT64, c3 INT64);
+-- stmt: INSERT INTO tbl0 VALUES (0, -1, 0);
+-- stmt: INSERT INTO tbl1 VALUES (0, 'bb', NULL, 0);
+-- stmt: UPDATE tbl1 SET c1 = 'bb' WHERE ((c2 >= 1) OR (c3 > -3));
+-- ddl: CREATE INDEX idx0 ON tbl0 KEY(0)
+-- stmt: INSERT INTO tbl0 VALUES (1, -1, -3);
+-- check: tbl0
+-- expect: [0, -1, 0]
+-- expect: [1, -1, -3]
+-- stmt: INSERT INTO tbl1 VALUES (1, 'bb', -3, -2);
+-- stmt: DELETE FROM tbl1 WHERE (c1 != 'bb');
+-- commit
+-- stmt: INSERT INTO tbl0 VALUES (2, 1, 0);
+-- check: tbl0
+-- expect: [0, -1, 0]
+-- expect: [1, -1, -3]
+-- expect: [2, 1, 0]
+-- stmt: UPDATE tbl1 SET c2 = -1 WHERE ((c1 = 'a') OR (c3 >= u));
+-- stmt: UPDATE tbl1 SET c2 = 3 WHERE ((u > 1) OR (c1 = 'bb'));
+-- stmt: INSERT INTO tbl0 VALUES (3, 2, 2);
+-- stmt: UPDATE tbl0 SET c1 = NULL WHERE ((u >= -2) AND (c2 > 1));
+-- stmt: INSERT INTO tbl0 VALUES (4, 0, 2);
+-- stmt: INSERT INTO tbl0 VALUES (5, 3, 1);
+-- commit
+-- check: tbl0
+-- expect: [0, -1, 0]
+-- expect: [1, -1, -3]
+-- expect: [2, 1, 0]
+-- expect: [3, NULL, 2]
+-- expect: [4, 0, 2]
+-- expect: [5, 3, 1]
+-- stmt: UPDATE tbl1 SET c2 = -3 WHERE (NOT (c1 IS NULL));
+-- stmt: UPDATE tbl0 SET c1 = 0 WHERE (((c1 IS NOT NULL) AND (c1 IS NULL)) OR (c1 = -3));
+-- stmt: INSERT INTO tbl1 VALUES (2, NULL, -3, -1);
+-- stmt: UPDATE tbl1 SET c3 = NULL WHERE (c1 = 'a');
+-- stmt: UPDATE tbl1 SET c3 = NULL WHERE (((c3 = c3) AND (c2 = u)) OR ((u IS NOT NULL) AND (c1 IS NULL)));
+-- stmt: INSERT INTO tbl0 VALUES (6, 0, 3);
+-- stmt: UPDATE tbl1 SET c1 = 'a' WHERE (c2 IS NOT NULL);
+-- commit
+-- stmt: INSERT INTO tbl0 VALUES (7, NULL, 1);
+-- stmt: INSERT INTO tbl0 VALUES (8, NULL, NULL);
+-- stmt: INSERT INTO tbl1 VALUES (3, 'bb', NULL, 3);
+-- stmt: INSERT INTO tbl1 VALUES (4, 'bb', 2, -3);
+-- stmt: INSERT INTO tbl1 VALUES (5, 'a', 2, 2);
+-- stmt: UPDATE tbl1 SET c2 = 2 WHERE (c2 < c2);
+-- stmt: DELETE FROM tbl1 WHERE (c2 >= 2);
+-- stmt: INSERT INTO tbl1 VALUES (6, 'a', 0, -2);
+-- check: tbl0
+-- expect: [0, -1, 0]
+-- expect: [1, -1, -3]
+-- expect: [2, 1, 0]
+-- expect: [3, NULL, 2]
+-- expect: [4, 0, 2]
+-- expect: [5, 3, 1]
+-- expect: [6, 0, 3]
+-- expect: [7, NULL, 1]
+-- expect: [8, NULL, NULL]
+-- check: tbl1
+-- expect: [0, "a", -3, 0]
+-- expect: [1, "a", -3, -2]
+-- expect: [2, "a", -3, NULL]
+-- expect: [3, "bb", NULL, 3]
+-- expect: [6, "a", 0, -2]
+-- failure: recorded session: commit-boundary + index + update MVCC visibility

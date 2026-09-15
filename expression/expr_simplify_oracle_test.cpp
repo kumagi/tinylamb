@@ -203,17 +203,19 @@ TEST(ExprSimplifyOracle, DoubleNegationKeepsMinOverflowError) {
   Expression rewritten =
       ExpressionRewriter(ExpressionRuleSet::Default())
           .Rewrite(UnaryExpressionExp(neg_min, UnaryOperation::kMinus));
-  EXPECT_THROW(rewritten->Evaluate(Row(), Schema()), std::runtime_error);
+  EXPECT_THROW(static_cast<void>(rewritten->Evaluate(Row(), Schema())),
+               std::runtime_error);
 }
 
 TEST(ExprSimplifyOracle, DoubleNegationNonNumericPreservesError) {
-  Expression neg_str = UnaryExpressionExp(
-      ConstantValueExp(Value("foo")), UnaryOperation::kMinus);
+  Expression neg_str = UnaryExpressionExp(ConstantValueExp(Value("foo")),
+                                          UnaryOperation::kMinus);
   ASSERT_THROW(EvaluateGroundTruth(neg_str), std::runtime_error);
   Expression rewritten =
       ExpressionRewriter(ExpressionRuleSet::Default())
           .Rewrite(UnaryExpressionExp(neg_str, UnaryOperation::kMinus));
-  EXPECT_THROW(rewritten->Evaluate(Row(), Schema()), std::runtime_error);
+  EXPECT_THROW(static_cast<void>(rewritten->Evaluate(Row(), Schema())),
+               std::runtime_error);
 }
 
 TEST(ExprSimplifyOracle, BooleanConnectivesPreserveTypeAndValueOnNonBooleans) {
@@ -223,23 +225,27 @@ TEST(ExprSimplifyOracle, BooleanConnectivesPreserveTypeAndValueOnNonBooleans) {
 
   // 1. String: "foo" AND "foo" evaluates to 1 (kInt64), NOT "foo" (kVarChar).
   Expression str_expr = ConstantValueExp(Value("foo"));
-  Expression and_str = BinaryExpressionExp(str_expr, BinaryOperation::kAnd, str_expr);
+  Expression and_str =
+      BinaryExpressionExp(str_expr, BinaryOperation::kAnd, str_expr);
   Value original_and_str = and_str->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(original_and_str.type, ValueType::kInt64);
   EXPECT_EQ(original_and_str.value.int_value, 1);
   Expression rewritten_and_str = rewriter.Rewrite(and_str);
-  Value rewritten_val_str = rewritten_and_str->Evaluate(empty_row, empty_schema);
+  Value rewritten_val_str =
+      rewritten_and_str->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(rewritten_val_str.type, ValueType::kInt64);
   EXPECT_EQ(rewritten_val_str.value.int_value, 1);
 
   // 2. Double: 2.5 AND 2.5 evaluates to 1 (kInt64), NOT 2.5 (kDouble).
   Expression dbl_expr = ConstantValueExp(Value(2.5));
-  Expression and_dbl = BinaryExpressionExp(dbl_expr, BinaryOperation::kAnd, dbl_expr);
+  Expression and_dbl =
+      BinaryExpressionExp(dbl_expr, BinaryOperation::kAnd, dbl_expr);
   Value original_and_dbl = and_dbl->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(original_and_dbl.type, ValueType::kInt64);
   EXPECT_EQ(original_and_dbl.value.int_value, 1);
   Expression rewritten_and_dbl = rewriter.Rewrite(and_dbl);
-  Value rewritten_val_dbl = rewritten_and_dbl->Evaluate(empty_row, empty_schema);
+  Value rewritten_val_dbl =
+      rewritten_and_dbl->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(rewritten_val_dbl.type, ValueType::kInt64);
   EXPECT_EQ(rewritten_val_dbl.value.int_value, 1);
 
@@ -250,17 +256,20 @@ TEST(ExprSimplifyOracle, BooleanConnectivesPreserveTypeAndValueOnNonBooleans) {
   EXPECT_EQ(original_not_not_dbl.type, ValueType::kInt64);
   EXPECT_EQ(original_not_not_dbl.value.int_value, 1);
   Expression rewritten_not_not_dbl = rewriter.Rewrite(not_not_dbl);
-  Value rewritten_val_not_not_dbl = rewritten_not_not_dbl->Evaluate(empty_row, empty_schema);
+  Value rewritten_val_not_not_dbl =
+      rewritten_not_not_dbl->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(rewritten_val_not_not_dbl.type, ValueType::kInt64);
   EXPECT_EQ(rewritten_val_not_not_dbl.value.int_value, 1);
 
   // 4. Non-boolean Integer: 2 AND 2 evaluates to 1 (kInt64), NOT 2 (kInt64).
   Expression two_expr = ConstantValueExp(Value(int64_t{2}));
-  Expression and_two = BinaryExpressionExp(two_expr, BinaryOperation::kAnd, two_expr);
+  Expression and_two =
+      BinaryExpressionExp(two_expr, BinaryOperation::kAnd, two_expr);
   Value original_and_two = and_two->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(original_and_two.value.int_value, 1);
   Expression rewritten_and_two = rewriter.Rewrite(and_two);
-  Value rewritten_val_two = rewritten_and_two->Evaluate(empty_row, empty_schema);
+  Value rewritten_val_two =
+      rewritten_and_two->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(rewritten_val_two.value.int_value, 1);
 
   // 5. Absorption: 2 AND (2 OR 3) evaluates to 1 (kInt64), NOT 2.
@@ -271,7 +280,8 @@ TEST(ExprSimplifyOracle, BooleanConnectivesPreserveTypeAndValueOnNonBooleans) {
   Value original_absorb = absorb->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(original_absorb.value.int_value, 1);
   Expression rewritten_absorb = rewriter.Rewrite(absorb);
-  Value rewritten_val_absorb = rewritten_absorb->Evaluate(empty_row, empty_schema);
+  Value rewritten_val_absorb =
+      rewritten_absorb->Evaluate(empty_row, empty_schema);
   EXPECT_EQ(rewritten_val_absorb.value.int_value, 1);
 }
 

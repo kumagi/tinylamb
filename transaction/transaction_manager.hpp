@@ -74,6 +74,20 @@ class TransactionManager {
 
   Transaction Begin(bool read_only = false);
 
+  // Recovery seeding: transaction ids must never be reused across a crash.
+  // Recovery classifies losers by "no kCommit with this txn_id in the WAL",
+  // so a fresh counter starting at 1 after restart lets an OLD commit record
+  // vouch for a NEW uncommitted transaction, whose writes then skip undo
+  // (fuzz-found: an uncommitted leaf DELETE survived recovery because a
+  // previous lifetime's txn 1 had committed). Call with max_seen_id + 1.
+  void SeedNextTransactionId(txn_id_t next_id) {
+    txn_id_t current = next_txn_id_.load(std::memory_order_relaxed);
+    while (current < next_id &&
+           !next_txn_id_.compare_exchange_weak(current, next_id,
+                                               std::memory_order_relaxed)) {
+    }
+  }
+
   Status PreCommit(Transaction& txn);
 
   // When true (default), PreCommit waits until the commit LSN is fsynced.
@@ -124,6 +138,20 @@ class TransactionManager {
   [[nodiscard]] DeadlockPolicy GetDeadlockPolicy() const {
     return static_cast<DeadlockPolicy>(
         deadlock_policy_.load(std::memory_order_acquire));
+  }
+  // Safety valve for write-intent waits: a waiter that exceeds this limit
+  // gives up with kConflicts instead of sleeping forever.  The holder may be
+  // deadlocked on the WAITER's page latch (RowPage ops run exclusively
+  // latched; Abort's undo walk re-acquires that latch before AbortVersions
+  // can release the intents), a cycle no detector can see.  Generous enough
+  // that legitimate contention never hits it; test-tunable.
+  void SetWriteIntentWaitLimit(std::chrono::milliseconds limit) {
+    write_intent_wait_limit_ms_.store(static_cast<int64_t>(limit.count()),
+                                      std::memory_order_release);
+  }
+  [[nodiscard]] std::chrono::milliseconds GetWriteIntentWaitLimit() const {
+    return std::chrono::milliseconds(
+        write_intent_wait_limit_ms_.load(std::memory_order_acquire));
   }
   [[nodiscard]] TransactionRuntimeStats RuntimeStats() const;
 
@@ -324,6 +352,8 @@ class TransactionManager {
   // ---- deadlock policy & wait-for graph ----
   std::atomic<uint8_t> deadlock_policy_{
       static_cast<uint8_t>(DeadlockPolicy::kLegacy)};
+  // Write-intent wait escalation limit; see SetWriteIntentWaitLimit.
+  std::atomic<int64_t> write_intent_wait_limit_ms_{5'000};
   // Active deadlock detector thread (kDeadlockDetect only).
   std::atomic<bool> deadlock_detector_stop_{false};
   std::thread deadlock_detector_;

@@ -50,7 +50,9 @@ class PartitionScanExecutor : public ExecutorBase {
     }
     const auto& rows = exchange_->GetPartitionRows(partition_idx_);
     if (offset_ >= rows.size()) {
-      return false;
+      // EOF and failure both stop here: forward the exchange's sticky
+      // status so a mid-scan child error is not read as a clean EOF.
+      return FailWithChildOf(*exchange_);
     }
     *dst = rows[offset_].first;
     if (rp != nullptr) {
@@ -165,6 +167,12 @@ void ExchangeExecutor::DistributeRows() {
       partitions_[target].emplace_back(std::move(row), rp);
     }
   }
+  // The child stops on EOF and on failure alike; a mid-scan error must
+  // surface through the sticky status instead of latching truncated
+  // partitions as a clean end-of-stream.
+  if (child_) {
+    FailWithChildOf(*child_);
+  }
 
   charge_.Add(total_bytes);
 }
@@ -220,7 +228,8 @@ bool ExchangeExecutor::Next(Row* dst, RowPosition* rp) {
     ++current_gather_part_;
     current_gather_offset_ = 0;
   }
-  return false;
+  // EOF and failure both stop here: surface the child's sticky error.
+  return child_ ? FailWithChildOf(*child_) : false;
 }
 
 size_t ExchangeExecutor::NextBatch(DataChunk* destination, size_t max_rows) {

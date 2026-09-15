@@ -821,4 +821,29 @@ TEST(GoogleSqlAstTest, PivotAndUnpivotAstVisitor) {
   EXPECT_NE(select_u->Sources()[0].query, nullptr);
 }
 
+TEST(GoogleSqlAstTest, UnitlessIntervalLiteralsReturnStatusNotThrow) {
+  // Fuzz regression: an IntervalExpr whose literal/unit resolve to the
+  // unparseable pair ("" amount, "" unit) made the eager
+  // IntervalExpression constructor throw out_of_range straight through
+  // Visit(), killing the process instead of surfacing an error.
+  const std::string dump =
+      "QueryStatement\n  IntervalExpr\n    StringLiteral ''\"''\"\n";
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(dump);
+  ASSERT_TRUE(ast.HasValue()) << ToString(ast.GetStatus());
+  // Any outcome is fine as long as it is a Status, never an exception.
+  EXPECT_NO_THROW((void)GoogleSqlAstVisitor::Visit(*ast.Value()));
+
+  // A hand-built dump cannot express every malformed shape; also feed the
+  // original crash input verbatim (opaque bytes are valid here because the
+  // AST parser is a line-oriented text reader that must reject garbage).
+  static const char kCrashInput[] =
+      "DeleteStatement\n  CastExpression\n    IntervalExpr\n      esl\n";
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast2 =
+      GoogleSqlAstParser::Parse(kCrashInput);
+  if (ast2.HasValue()) {
+    EXPECT_NO_THROW((void)GoogleSqlAstVisitor::Visit(*ast2.Value()));
+  }
+}
+
 }  // namespace tinylamb

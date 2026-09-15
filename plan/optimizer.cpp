@@ -47,6 +47,7 @@
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "plan/cascades.hpp"
 #include "plan/distinct_plan.hpp"
 #include "plan/empty_plan.hpp"
@@ -110,8 +111,10 @@ StatusOr<std::vector<NamedExpression>> ExpandSelect(
       }
       const StatusOr<std::shared_ptr<Table>> found = context.GetTable(physical);
       if (UNLIKELY(!found.HasValue())) {
-        // Matches ASSIGN_OR_CRASH semantics; LOG(FATAL) aborts the process.
-        LOG(FATAL) << "Crashed: " << found.GetStatus();
+        // A table dropped between parsing and star expansion is a user-level
+        // error, not a broken invariant: report it instead of aborting.
+        return StatusError(found.GetStatus().GetCode(),
+                           found.GetStatus().GetMessage());
       }
       matched_relation = true;
       const std::shared_ptr<Table>& table = found.Value();
@@ -465,6 +468,149 @@ std::optional<QueryData> TryEliminateUnusedJoins(
   }
   rewritten.where_ = kept_conjuncts.empty() ? ConstantValueExp(Value(true))
                                             : CombineConjuncts(kept_conjuncts);
+  rewritten.select_ = expanded_select;
+  return rewritten;
+}
+
+// M6: drop the null-supplying side of a LEFT join when nothing above it can
+// observe the difference. A LEFT join emits exactly one row per preserved
+// row; it multiplies left rows only through repeated matches, so when the
+// equi-key is UNIQUE on the right side each left row matches at most once
+// and the join is the identity over the preserved side. Unlike the inner
+// case no containment proof is needed (an outer join never filters its
+// preserved side), but the gate is correspondingly strict elsewhere:
+// single LEFT edge, single equi-ON, and no SELECT/ORDER/WHERE reference to
+// the dropped side (an orphaned reference has no sound placement).
+// Returns the single-table rewrite, or nullopt when the proof fails.
+std::optional<QueryData> TryEliminateUnusedOuterJoin(
+    const QueryData& query, const std::vector<NamedExpression>& expanded_select,
+    TransactionContext& ctx) {
+  if (query.outer_joins_.size() != 1 || query.from_.size() != 2 ||
+      query.require_row_position_) {
+    return std::nullopt;
+  }
+  const QueryData::OuterJoinEdge& edge = query.outer_joins_.front();
+  // M6+1: LEFT drops the right side, RIGHT drops the left side (mirror).
+  // FULL preserves both sides, so nothing can be eliminated.
+  if (edge.join_kind > 1 || edge.right_index != 1 || !edge.on_condition) {
+    return std::nullopt;
+  }
+  const std::vector<Expression> on_conjuncts =
+      SplitConjuncts(edge.on_condition);
+  if (on_conjuncts.size() != 1 || !on_conjuncts[0] ||
+      on_conjuncts[0]->Type() != TypeTag::kBinaryExp ||
+      on_conjuncts[0]->AsBinaryExpression().Op() != BinaryOperation::kEquals ||
+      on_conjuncts[0]->AsBinaryExpression().Left()->Type() !=
+          TypeTag::kColumnValue ||
+      on_conjuncts[0]->AsBinaryExpression().Right()->Type() !=
+          TypeTag::kColumnValue) {
+    return std::nullopt;
+  }
+  const std::string& left_rel = query.from_[0];
+  const std::string& right_rel = query.from_[1];
+  // Preserved side survives; the other side drops when its unique equi-key
+  // proves at most one match per preserved row while nothing above names
+  // it. (LEFT: drop right; RIGHT: drop left, mirrored.)
+  const bool is_right_join = edge.join_kind == 1;
+  const std::string& preserved_rel = is_right_join ? right_rel : left_rel;
+  const std::string& dropped_rel = is_right_join ? left_rel : right_rel;
+
+  std::unordered_map<std::string, std::shared_ptr<Table>> tables;
+  for (const std::string& relation : query.from_) {
+    const auto aliased = query.aliases_.find(relation);
+    const std::string& physical =
+        aliased == query.aliases_.end() ? relation : aliased->second;
+    StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+    if (!found.HasValue()) {
+      return std::nullopt;
+    }
+    tables.emplace(relation, found.Value());
+  }
+
+  const ColumnName& first = on_conjuncts[0]
+                                ->AsBinaryExpression()
+                                .Left()
+                                ->AsColumnValue()
+                                .GetColumnName();
+  const ColumnName& second = on_conjuncts[0]
+                                 ->AsBinaryExpression()
+                                 .Right()
+                                 ->AsColumnValue()
+                                 .GetColumnName();
+  const std::unordered_set<std::string> first_rels =
+      ColumnRelations(first, tables);
+  const std::unordered_set<std::string> second_rels =
+      ColumnRelations(second, tables);
+  if (first_rels.size() != 1 || second_rels.size() != 1) {
+    return std::nullopt;
+  }
+  const bool first_is_dropped = *first_rels.begin() == dropped_rel;
+  const bool second_is_dropped = *second_rels.begin() == dropped_rel;
+  if (first_is_dropped == second_is_dropped ||
+      (*first_rels.begin() != preserved_rel && !first_is_dropped) ||
+      (*second_rels.begin() != preserved_rel && !second_is_dropped)) {
+    return std::nullopt;
+  }
+  const ColumnName& dropped_col = first_is_dropped ? first : second;
+  const auto dropped_table = tables.find(dropped_rel);
+  const int dropped_offset = dropped_table->second->GetSchema().Offset(
+      ColumnName("", dropped_col.name));
+  if (dropped_offset < 0) {
+    return std::nullopt;
+  }
+  const Constraint& dropped_constraint =
+      dropped_table->second->GetSchema()
+          .GetColumn(static_cast<size_t>(dropped_offset))
+          .GetConstraint();
+  if (dropped_constraint.ctype != Constraint::kPrimaryKey &&
+      !dropped_constraint.IsUnique()) {
+    return std::nullopt;
+  }
+
+  // Nothing above the join may name the dropped side.
+  const auto touches_dropped = [&](const Expression& expression) -> bool {
+    if (!expression) {
+      return false;
+    }
+    const RelationRef ref = TouchedRelations(expression, tables);
+    if (!ref.ok) {
+      return true;
+    }
+    return ref.relations.contains(dropped_rel);
+  };
+  for (const NamedExpression& item : expanded_select) {
+    if (touches_dropped(item.expression)) {
+      return std::nullopt;
+    }
+  }
+  // M-window extraction replaced window calls in the SELECT list with
+  // $winN references; the original expressions still carry the calls with
+  // their partition/order keys, which may name the dropped side.
+  for (const NamedExpression& item : query.select_) {
+    if (touches_dropped(item.expression)) {
+      return std::nullopt;
+    }
+  }
+  for (const Expression& order : query.order_expressions_) {
+    if (touches_dropped(order)) {
+      return std::nullopt;
+    }
+  }
+  for (const Expression& conjunct : SplitConjuncts(query.where_)) {
+    if (touches_dropped(conjunct)) {
+      return std::nullopt;
+    }
+  }
+  // QUALIFY survives the rewrite verbatim; a predicate naming the dropped
+  // side (legal after M-window routing) would turn the query unresolvable.
+  if (touches_dropped(query.qualify_)) {
+    return std::nullopt;
+  }
+
+  QueryData rewritten = query;
+  rewritten.from_ = {preserved_rel};
+  rewritten.outer_joins_.clear();
+  rewritten.aliases_.erase(dropped_rel);
   rewritten.select_ = expanded_select;
   return rewritten;
 }
@@ -1073,20 +1219,26 @@ Expression SimplifyFilterPredicate(const Expression& predicate,
 // (alias when given, else table name); unqualified names map to every FROM
 // relation whose physical schema owns such a column (ambiguous names
 // therefore stay above the join that combines their tables, preserving the
-// executor's first-match resolution semantics). Returns false when the
+// executor's first-match resolution semantics). Opaque CTE aliases
+// (M4 materialized cells and recursive leaves) resolve like relations for
+// classification, but callers must never push their conjuncts into scan
+// filters: neither implementation reads group filters, so only the residual
+// above evaluates them. Returns false when the
 // conjunct references something outside the FROM clause; such conjuncts stay
 // in the root Selection fallback.
 bool ConjunctRelations(
     const Expression& conjunct,
     const std::unordered_map<std::string, std::shared_ptr<Table>>& tables,
+    const std::unordered_set<std::string>& materialized,
     std::unordered_set<std::string>* relations) {
   for (const ColumnName& column : conjunct->TouchedColumns()) {
     if (!column.schema.empty()) {
-      if (!tables.contains(column.schema)) {
-        return false;
+      if (tables.contains(column.schema) ||
+          materialized.contains(column.schema)) {
+        relations->insert(column.schema);
+        continue;
       }
-      relations->insert(column.schema);
-      continue;
+      return false;
     }
     size_t matches = 0;
     for (const auto& [relation, table] : tables) {
@@ -1100,6 +1252,115 @@ bool ConjunctRelations(
     }
   }
   return true;
+}
+
+bool ConjunctRelations(
+    const Expression& conjunct,
+    const std::unordered_map<std::string, std::shared_ptr<Table>>& tables,
+    std::unordered_set<std::string>* relations) {
+  const std::unordered_set<std::string> empty;
+  return ConjunctRelations(conjunct, tables, empty, relations);
+}
+
+// True when the expression tree carries a subquery node at any depth. The
+// M6 outer slice keeps every such shape on the relational interpreter, whose
+// scope chain evaluates correlated and SELECT-list subqueries; the vectorized
+// projection path has no subquery evaluation context.
+bool ContainsQueryExpression(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  std::vector<Expression> stack{expression};
+  while (!stack.empty()) {
+    Expression current = std::move(stack.back());
+    stack.pop_back();
+    if (!current) {
+      continue;
+    }
+    if (current->Type() == TypeTag::kQueryExp) {
+      return true;
+    }
+    for (const Expression& child : ExpressionChildren(current)) {
+      if (child) {
+        stack.push_back(child);
+      }
+    }
+  }
+  return false;
+}
+
+// True when the expression tree carries a window-function call at any depth
+// (never descending into subquery boundaries, whose windows belong to
+// another scope).
+bool ContainsWindowExpression(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  std::vector<Expression> stack{expression};
+  while (!stack.empty()) {
+    Expression current = std::move(stack.back());
+    stack.pop_back();
+    if (!current) {
+      continue;
+    }
+    if (current->Type() == TypeTag::kWindowFunctionExp) {
+      return true;
+    }
+    if (current->Type() == TypeTag::kQueryExp) {
+      continue;
+    }
+    for (const Expression& child : ExpressionChildren(current)) {
+      if (child) {
+        stack.push_back(child);
+      }
+    }
+  }
+  return false;
+}
+
+// M6 minimal slice gate: one LEFT join over exactly two base relations with
+// an explicit ON condition, no aggregation, no subqueries, no row-identity
+// requirement. Anything else returns false so the caller falls back to the
+// relational executor, which keeps the exact legacy semantics. RIGHT/FULL,
+// join chains, and mixed inner/outer graphs are deliberate follow-ups, not
+// silent generalizations: each widens the ON-vs-WHERE contract (matched
+// below) in ways this slice does not prove.
+bool SupportsOuterJoinSlice(const QueryData& query, bool has_aggregate,
+                            const Expression& predicate,
+                            const Expression& outer_on,
+                            const std::vector<NamedExpression>& select) {
+  if (query.outer_joins_.size() != 1 || query.from_.size() != 2) {
+    return false;
+  }
+  const QueryData::OuterJoinEdge& edge = query.outer_joins_.front();
+  // M6+1: single LEFT, RIGHT or FULL edge (2 tables, explicit ON). Chains,
+  // USING, aggregates and row-positional (DML) cores stay relational.
+  if (edge.join_kind > 2 || edge.right_index != 1) {
+    return false;
+  }
+  if (!edge.on_condition || !outer_on) {
+    return false;
+  }
+  if (has_aggregate || query.require_row_position_) {
+    return false;
+  }
+  if (ContainsQueryExpression(predicate) || ContainsQueryExpression(outer_on)) {
+    return false;
+  }
+  // Window calls in ON/WHERE belong to other scopes (or illegal SQL): the
+  // outer lowering never evaluates them.
+  if (ContainsWindowExpression(predicate) ||
+      ContainsWindowExpression(outer_on)) {
+    return false;
+  }
+  for (const NamedExpression& item : select) {
+    if (ContainsQueryExpression(item.expression)) {
+      return false;
+    }
+  }
+  return std::ranges::all_of(
+      query.order_expressions_,
+      [](const Expression& order) { return !ContainsQueryExpression(order); });
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,11 +1817,12 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // it is stripped for these rewrites (WHERE keeps the full rule set).
   ExpressionRuleSet value_context_rules = options.expression_rules;
   value_context_rules.Remove("inner_join_not_null_inference");
-  const ExpressionRewriter value_rewriter(value_context_rules);
+  ExpressionRewriter value_rewriter(value_context_rules);
   bool order_rewritten = false;
   QueryData scalar_normalized = query;
   for (size_t i = 0; i < query.order_expressions_.size(); ++i) {
-    if (!query.order_expressions_[i]) {
+    if (!query.order_expressions_[i] ||
+        ContainsWindowExpression(query.order_expressions_[i])) {
       continue;
     }
     ASSIGN_OR_RETURN(Expression, rewritten,
@@ -1601,19 +1863,120 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   ASSIGN_OR_RETURN(std::vector<NamedExpression>, expanded_select,
                    (ExpandSelect(query, ctx)));
   for (NamedExpression& selected : expanded_select) {
-    if (selected.expression) {
+    // Window calls bypass scalar rewriting: the rewriter rebuilds nodes
+    // positionally and has no window case (its WithExpressionChildren would
+    // abort), while extraction below needs pristine call text for
+    // cross-clause dedup. Unrewritten calls evaluate identically in both
+    // engines (the relational path never folds them either).
+    if (selected.expression && !ContainsWindowExpression(selected.expression)) {
       ASSIGN_OR_RETURN(Expression, rewritten,
                        (value_rewriter.TryRewrite(selected.expression)));
       selected.expression = std::move(rewritten);
     }
   }
 
+  // Window extraction (M-window): hoist window calls out of the SELECT
+  // list, ORDER BY, and QUALIFY into shared `$winN` references; the kWindow
+  // nodes are built after the join core below. Pure syntax (no catalog):
+  // validation waits for rule_context. A nullopt means nested window calls
+  // (invalid SQL); the whole query keeps the existing relational path via
+  // kNotImplemented. SELECT, ORDER BY, and QUALIFY share one namespace, so
+  // identical calls reuse outputs across clauses.
+  std::vector<ExtractedWindow> window_specs;
+  std::unordered_map<std::string, size_t> window_dedup;
+  size_t window_counter = 0;
+  Expression window_qualify;
+  std::vector<Expression> effective_order = query.order_expressions_;
+  {
+    std::vector<NamedExpression> rewritten_select;
+    rewritten_select.reserve(expanded_select.size());
+    bool extraction_failed = false;
+    const auto extract_into =
+        [&](const Expression& source,
+            std::optional<Expression>* rewritten_out) -> bool {
+      if (!source) {
+        if (rewritten_out != nullptr) {
+          *rewritten_out = source;
+        }
+        return true;
+      }
+      std::optional<std::pair<Expression, std::vector<ExtractedWindow>>>
+          extracted =
+              ExtractWindowCalls(source, &window_counter, &window_dedup);
+      if (!extracted.has_value()) {
+        return false;
+      }
+      if (rewritten_out != nullptr) {
+        *rewritten_out = std::move(extracted->first);
+      }
+      window_specs.insert(window_specs.end(),
+                          std::make_move_iterator(extracted->second.begin()),
+                          std::make_move_iterator(extracted->second.end()));
+      return true;
+    };
+    for (NamedExpression& selected : expanded_select) {
+      if (!selected.expression) {
+        rewritten_select.push_back(selected);
+        continue;
+      }
+      std::optional<Expression> rewritten;
+      if (!extract_into(selected.expression, &rewritten)) {
+        extraction_failed = true;
+        break;
+      }
+      rewritten_select.emplace_back(selected.name, std::move(*rewritten));
+    }
+    for (Expression& order : effective_order) {
+      if (!order) {
+        continue;
+      }
+      std::optional<Expression> rewritten;
+      if (!extract_into(order, &rewritten)) {
+        extraction_failed = true;
+        break;
+      }
+      order = std::move(*rewritten);
+    }
+    if (!extraction_failed && query.qualify_) {
+      std::optional<Expression> rewritten;
+      if (!extract_into(query.qualify_, &rewritten)) {
+        extraction_failed = true;
+      } else {
+        window_qualify = std::move(*rewritten);
+      }
+    }
+    if (extraction_failed) {
+      return Status::kNotImplemented;
+    }
+    expanded_select = std::move(rewritten_select);
+  }
+  const bool has_window = !window_specs.empty();
+
   // Provable unused inner-join elimination: drop a dimension table whose
   // unique-keyed equality join provably neither filters nor multiplies the
   // kept rows (verified against the current snapshot for small tables).
-  if (query.from_.size() > 1) {
+  // Inner-only: outer joins carry padding semantics the proof does not model
+  // (dedicated outer-elimination rules live in the memo instead).
+  // Window extraction above moved every call into `window_specs` and left
+  // `$winN` references. The elimination proofs below re-run Optimize on a
+  // QueryData whose select list already carries those references, so the
+  // recursive extraction would see no calls and build no kWindow node; the
+  // surviving `$winN` columns would then be unresolvable. Skip elimination
+  // while windows are live (a window call's partition/order keys can also
+  // name a side the proof would drop).
+  if (!has_window && query.from_.size() > 1 && query.outer_joins_.empty()) {
     if (std::optional<QueryData> eliminated =
             TryEliminateUnusedJoins(query, expanded_select, ctx)) {
+      return Optimize(*eliminated, ctx, options);
+    }
+  }
+  // M6: drop the null-supplying side of a LEFT join whose unique equi-key
+  // proves at most one match per preserved row while nothing above names
+  // it. An outer join never filters its preserved side, so no containment
+  // proof is needed.
+  if (!has_window && !query.outer_joins_.empty()) {
+    if (std::optional<QueryData> eliminated =
+            TryEliminateUnusedOuterJoin(query, expanded_select, ctx)) {
       return Optimize(*eliminated, ctx, options);
     }
   }
@@ -1624,13 +1987,16 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   }
 
   if (query.from_.empty()) {
-    if (has_aggregate || expanded_select.empty()) {
+    if (has_aggregate || expanded_select.empty() || has_window) {
       return Status::kNotImplemented;
     }
     Plan source = std::make_shared<DummyScanPlan>();
     Expression predicate =
         query.where_ ? Expression{} : ConstantValueExp(Value(true));
     if (query.where_) {
+      // No schema is plumbed here: the projection schema is computed
+      // downstream, and not_comparison falls back to its previous
+      // (constant-literal-only) NaN guard without one.
       ASSIGN_OR_RETURN(Expression, rewritten,
                        (ExpressionRewriter(options.expression_rules)
                             .TryRewrite(query.where_)));
@@ -1658,17 +2024,20 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
 
   const Expression source_predicate =
       query.where_ ? query.where_ : ConstantValueExp(Value(true));
-  ASSIGN_OR_RETURN(Expression, predicate,
-                   (ExpressionRewriter(options.expression_rules)
-                        .TryRewrite(source_predicate)));
-
   cascades::RuleContext rule_context;
   rule_context.transaction = &ctx;
   rule_context.query = &query;
   // Catalog objects are keyed by relation identity (alias when given, else
   // table name); scans rename their output schemas to this identity so
   // self-joins of one physical table stay distinguishable end-to-end.
+  // Lifted CTEs (M4 cells and opaque recursive leaves) have no catalog
+  // objects: cells scan shared rows and recursive leaves run the worktable
+  // driver, both wired below, so they skip this population.
   for (const std::string& relation : query.from_) {
+    if (query.lifted_ctes_.cells.contains(relation) ||
+        query.lifted_ctes_.recursive.contains(relation)) {
+      continue;
+    }
     const auto aliased = query.aliases_.find(relation);
     const std::string& physical =
         aliased == query.aliases_.end() ? relation : aliased->second;
@@ -1679,13 +2048,111 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     rule_context.statistics.emplace(relation, std::move(table_statistics));
   }
 
-  const Schema input_schema = BuildInputSchema(query, rule_context.tables);
+  Schema input_schema = BuildInputSchema(query, rule_context.tables);
+  // Lifted CTE schemas resolve references to non-catalog relations: cells
+  // carry inferred types, opaque recursive leaves are Null-typed (typed
+  // rewrites treat them conservatively). Without these entries the typed
+  // rewrites below would throw on unknown columns.
+  for (const std::string& relation : query.from_) {
+    const auto cell = query.lifted_ctes_.cells.find(relation);
+    if (cell != query.lifted_ctes_.cells.end() && cell->second != nullptr) {
+      input_schema = input_schema + cell->second->schema;
+      continue;
+    }
+    const auto rec = query.lifted_ctes_.recursive.find(relation);
+    if (rec != query.lifted_ctes_.recursive.end()) {
+      input_schema = input_schema + rec->second.output_schema;
+    }
+  }
+  // Window calls bypass scalar rewriting (same rationale as the SELECT-list
+  // skip above); a window-bearing predicate keeps the relational path
+  // downstream, where it fails loudly like today instead of tripping the
+  // rewriter's positional rewrite.
+  // The rule choice mirrors BytecodeCompiler::Compile: NOT() over an ordered
+  // double comparison is NaN-unsound, so the predicate keeps the
+  // comparison-free rule set instead of Default().
+  Expression predicate;
+  if (ContainsWindowExpression(source_predicate)) {
+    predicate = source_predicate;
+  } else {
+    const ExpressionRuleSet& predicate_rules =
+        ContainsNotOfOrderedDoubleComparison(source_predicate, input_schema)
+            ? NotComparisonFreeRules()
+            : options.expression_rules;
+    ExpressionRewriter predicate_rewriter(predicate_rules);
+    predicate_rewriter.set_schema(&input_schema);
+    ASSIGN_OR_RETURN(Expression, rewritten,
+                     (predicate_rewriter.TryRewrite(source_predicate)));
+    predicate = std::move(rewritten);
+  }
   for (NamedExpression& selected : expanded_select) {
     selected.expression =
         RewriteTypedArithmetic(selected.expression, input_schema);
   }
-  predicate = SimplifyFilterPredicate(
-      RewriteTypedArithmetic(predicate, input_schema), input_schema);
+  if (ContainsWindowExpression(predicate)) {
+    // Window-bearing predicates keep the relational path downstream; leave
+    // the predicate pristine (see the SELECT-list skip above).
+  } else {
+    predicate = SimplifyFilterPredicate(
+        RewriteTypedArithmetic(predicate, input_schema), input_schema);
+  }
+
+  // M6 outer slice: rewrite the ON condition through the same scalar pipeline
+  // as WHERE, then gate the whole query. A rejection returns kNotImplemented
+  // so every caller falls back to the relational executor.
+  const bool is_outer = !query.outer_joins_.empty();
+  Expression outer_on;
+  if (is_outer) {
+    const QueryData::OuterJoinEdge& edge = query.outer_joins_.front();
+    if (edge.on_condition) {
+      if (ContainsWindowExpression(edge.on_condition)) {
+        outer_on = edge.on_condition;
+      } else {
+        // Same NaN-unsoundness gate as the WHERE rewrite above: an ON
+        // clause decides match/no-match, so NOT() over an ordered double
+        // comparison must not flip to its (NaN-divergent) negation.
+        const ExpressionRuleSet& on_rules =
+            ContainsNotOfOrderedDoubleComparison(edge.on_condition,
+                                                 input_schema)
+                ? NotComparisonFreeRules()
+                : options.expression_rules;
+        ExpressionRewriter on_rewriter(on_rules);
+        on_rewriter.set_schema(&input_schema);
+        ASSIGN_OR_RETURN(Expression, rewritten,
+                         (on_rewriter.TryRewrite(edge.on_condition)));
+        outer_on = SimplifyFilterPredicate(
+            RewriteTypedArithmetic(rewritten, input_schema), input_schema);
+      }
+    }
+    if (!SupportsOuterJoinSlice(query, has_aggregate, predicate, outer_on,
+                                expanded_select)) {
+      return Status::kNotImplemented;
+    }
+  }
+
+  // M-window slice gates (catalog scope available from here on). SELECT,
+  // ORDER BY, and QUALIFY were already extracted into one `$winN` namespace
+  // above; this validates scope. A rejection returns kNotImplemented so
+  // every caller falls back to the relational executor, which keeps the
+  // window behavior callers already observe.
+  if (has_window) {
+    if (has_aggregate || query.require_row_position_) {
+      return Status::kNotImplemented;
+    }
+    if (ContainsQueryExpression(predicate)) {
+      // Decorrelated semi/anti wraps above a windowed core are a follow-up;
+      // keep those shapes on the runtime that scopes subqueries today.
+      return Status::kNotImplemented;
+    }
+    // Every call must resolve against the input relations (bare names were
+    // attributed by Rewrite; anything outside stays relational).
+    for (const ExtractedWindow& spec : window_specs) {
+      std::unordered_set<std::string> relations;
+      if (!ConjunctRelations(spec.call, rule_context.tables, &relations)) {
+        return Status::kNotImplemented;
+      }
+    }
+  }
 
   // Subquery decorrelation (tpch Phase2-4 / P1-5): canonical IN / EXISTS /
   // NOT EXISTS conjuncts become semi/anti hash joins wrapped around the
@@ -1700,7 +2167,11 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   bool hidden_semi_keys_added = false;
   const Expression effective_predicate = [&] {
     std::vector<Expression> kept;
-    if (query.limit_count_ == 0 && query.limit_offset_ == 0 &&
+    // No decorrelation above an outer join in this slice: semi/anti wraps
+    // would need the same scope proof as the join itself. Subquery conjuncts
+    // were already rejected by SupportsOuterJoinSlice, so every conjunct is
+    // kept and classified below.
+    if (!is_outer && query.limit_count_ == 0 && query.limit_offset_ == 0 &&
         tls_decorrelation_depth < kMaxDecorrelationDepth &&
         predicate->Type() != TypeTag::kConstantValue) {
       ++tls_decorrelation_depth;
@@ -1767,6 +2238,27 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   for (const NamedExpression& selected : projection_items) {
     touched.merge(selected.expression->TouchedColumns());
   }
+  // ON key columns must survive scan projection even when neither WHERE nor
+  // the SELECT list names them (e.g. SELECT a.v ... ON a.k = b.k).
+  if (is_outer && outer_on) {
+    touched.merge(outer_on->TouchedColumns());
+  }
+  // Window input columns (arguments, partition/order keys, filters) must
+  // likewise survive: the rewritten projection only names the `$winN`
+  // outputs, so the underlying columns would otherwise be pruned away.
+  if (has_window) {
+    for (const ExtractedWindow& spec : window_specs) {
+      touched.merge(spec.call->TouchedColumns());
+    }
+    for (const Expression& order : effective_order) {
+      if (order) {
+        touched.merge(order->TouchedColumns());
+      }
+    }
+    if (window_qualify) {
+      touched.merge(window_qualify->TouchedColumns());
+    }
+  }
 
   // Required-column computation (Phase 3): every touched column is needed on
   // each root-to-leaf path of a conjunctive query, so the per-relation
@@ -1806,31 +2298,128 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // conditions at their deepest covering join.
   std::vector<cascades::ConjunctInfo> conjuncts;
   bool needs_root_selection = false;
-  for (const Expression& conjunct : SplitConjuncts(effective_predicate)) {
-    // The neutral predicate is already represented by the scan group. It has
-    // no relation identity and must not force the general memo route; doing
-    // so would make a simple single-table query lose the direct access-path
-    // costing (notably COUNT(*)'s covering IndexOnlyScan).
-    if (conjunct && conjunct->Type() == TypeTag::kConstantValue &&
-        conjunct->AsConstantValue().GetValue().Truthy()) {
-      continue;
+  // Opaque relations (M4): materialized cells and recursive leaves both
+  // ignore group scan filters (neither implementation reads them), so
+  // conjuncts touching them stay above as residuals.
+  std::unordered_set<std::string> opaque_relations;
+  for (const auto& [alias, cell] : query.lifted_ctes_.cells) {
+    if (cell != nullptr) {
+      opaque_relations.insert(alias);
     }
-    std::unordered_set<std::string> relations;
-    if (!ConjunctRelations(conjunct, rule_context.tables, &relations) ||
-        relations.empty()) {
+  }
+  for (const auto& [alias, ref] : query.lifted_ctes_.recursive) {
+    (void)ref;
+    opaque_relations.insert(alias);
+  }
+  const auto touches_opaque =
+      [&](const std::unordered_set<std::string>& relations) {
+        return std::ranges::any_of(relations, [&](const std::string& relation) {
+          return opaque_relations.contains(relation);
+        });
+      };
+  const auto is_neutral_true = [](const Expression& conjunct) {
+    return conjunct && conjunct->Type() == TypeTag::kConstantValue &&
+           conjunct->AsConstantValue().GetValue().Truthy();
+  };
+  if (!is_outer) {
+    for (const Expression& conjunct : SplitConjuncts(effective_predicate)) {
+      // The neutral predicate is already represented by the scan group. It has
+      // no relation identity and must not force the general memo route; doing
+      // so would make a simple single-table query lose the direct access-path
+      // costing (notably COUNT(*)'s covering IndexOnlyScan).
+      if (is_neutral_true(conjunct)) {
+        continue;
+      }
+      std::unordered_set<std::string> relations;
+      if (!ConjunctRelations(conjunct, rule_context.tables, opaque_relations,
+                             &relations) ||
+          relations.empty()) {
+        needs_root_selection = true;
+        continue;
+      }
+      if (touches_opaque(relations)) {
+        needs_root_selection = true;
+        continue;
+      }
+      // Keep a final residual guard for single-relation predicates in a
+      // multi-relation query.  Scan-group filters are still used for costing
+      // and pushdown, but some join alternatives (notably the partitioned hash
+      // path) can reorder or project away the filtered side before the group
+      // predicate is attached.  Rechecking the original conjunct at the root
+      // is cheap compared with returning rows that did not satisfy WHERE.
+      if (relations.size() == 1 && query.from_.size() > 1) {
+        needs_root_selection = true;
+      }
+      conjuncts.push_back({conjunct, {relations.begin(), relations.end()}});
+    }
+  } else {
+    // M6+1 ON-vs-WHERE contract (slice: from_ = {L, R}, single edge).
+    // Preserved vs null-supplying sides by kind: LEFT preserves L, RIGHT
+    // preserves R, FULL preserves neither (both sides pad).
+    // - WHERE over a preserved side may filter before the join (scan
+    //   filter, kept as a root residual like the inner path).
+    // - WHERE touching a null-supplying side, or spanning both sides,
+    //   filters AFTER null padding and stays above the join only. Pushing
+    //   it into that side's scan would drop padded rows it must observe.
+    //   (FULL therefore keeps every WHERE above the join.)
+    // - ON over the single null-supplying side may filter before the join
+    //   (non-matching probe rows simply NULL-pad; the full ON rides as the
+    //   join predicate residual).
+    // - ON over a preserved side, or spanning, decides the match itself
+    //   and lives only in the join predicate: pushing a preserved-side ON
+    //   into its scan would drop rows that must survive as padded rows.
+    //   (FULL keeps every ON in the join predicate only.)
+    const std::string& left_rel = query.from_[0];
+    const std::string& right_rel = query.from_[1];
+    const uint8_t outer_kind = query.outer_joins_.front().join_kind;
+    const bool is_full_outer = outer_kind == 2;
+    // Preserved side whose single-relation WHERE may become a scan filter;
+    // empty for FULL (no side is preserved).
+    const std::string& preserved_rel = outer_kind == 1 ? right_rel : left_rel;
+    // Null-supplying side whose single-relation ON may become a scan
+    // filter; only meaningful when exactly one side pads (LEFT/RIGHT).
+    const std::string& null_supplying_rel =
+        outer_kind == 1 ? left_rel : right_rel;
+    for (const Expression& conjunct : SplitConjuncts(effective_predicate)) {
+      if (is_neutral_true(conjunct)) {
+        continue;
+      }
+      std::unordered_set<std::string> relations;
+      if (!ConjunctRelations(conjunct, rule_context.tables, opaque_relations,
+                             &relations) ||
+          relations.empty()) {
+        needs_root_selection = true;
+        continue;
+      }
       needs_root_selection = true;
-      continue;
+      if (touches_opaque(relations)) {
+        continue;
+      }
+      if (!is_full_outer && relations.size() == 1 &&
+          *relations.begin() == preserved_rel) {
+        conjuncts.push_back({conjunct, {relations.begin(), relations.end()}});
+      }
     }
-    // Keep a final residual guard for single-relation predicates in a
-    // multi-relation query.  Scan-group filters are still used for costing
-    // and pushdown, but some join alternatives (notably the partitioned hash
-    // path) can reorder or project away the filtered side before the group
-    // predicate is attached.  Rechecking the original conjunct at the root
-    // is cheap compared with returning rows that did not satisfy WHERE.
-    if (relations.size() == 1 && query.from_.size() > 1) {
-      needs_root_selection = true;
+    for (const Expression& conjunct : SplitConjuncts(outer_on)) {
+      if (is_neutral_true(conjunct)) {
+        continue;
+      }
+      std::unordered_set<std::string> relations;
+      if (!ConjunctRelations(conjunct, rule_context.tables, opaque_relations,
+                             &relations) ||
+          relations.empty()) {
+        // Every ON conjunct must be attributable to the join graph; an
+        // unattributable ON has no sound placement in this slice.
+        return Status::kNotImplemented;
+      }
+      if (touches_opaque(relations)) {
+        continue;
+      }
+      if (!is_full_outer && relations.size() == 1 &&
+          *relations.begin() == null_supplying_rel) {
+        conjuncts.push_back({conjunct, {relations.begin(), relations.end()}});
+      }
     }
-    conjuncts.push_back({conjunct, {relations.begin(), relations.end()}});
   }
   // Custom relational rules may add join expressions without condition
   // payloads; the root Selection keeps the old guarantee that no residual
@@ -1841,7 +2430,63 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   }
 
   cascades::Memo memo;
-  cascades::GroupId search_root = memo.Build(query.from_, conjuncts);
+  cascades::GroupId search_root = cascades::kInvalidGroup;
+  if (!is_outer) {
+    search_root = memo.Build(query.from_, conjuncts);
+  } else {
+    // The plain two-relation group built here carries an inner join that is
+    // unreachable from the outer root below; singleton scan filters (from
+    // `conjuncts`) are the only part reused. The outer join itself lives in
+    // a tag-distinguished derived group so inner and outer alternatives can
+    // never share a group (D1: one group, one meaning).
+    ASSIGN_OR_RETURN(cascades::GroupId, unused_inner,
+                     memo.TryBuild(query.from_, conjuncts));
+    (void)unused_inner;
+    const cascades::GroupId left = memo.EnsureGroup({query.from_[0]});
+    const cascades::GroupId right = memo.EnsureGroup({query.from_[1]});
+    const cascades::GroupId outer =
+        memo.EnsureDerivedGroup(query.from_, "outer_join");
+    memo.AddExpression(outer, cascades::Memo::NewOuterJoin(
+                                  left, right, outer_on,
+                                  query.outer_joins_.front().join_kind));
+    search_root = outer;
+  }
+  // Materialized CTE leaves (M4): one kValues alternative per materialized
+  // singleton, sharing the cell rows across every reference site through the
+  // memo group (no per-site copies). The stray kScan that EnsureGroup adds
+  // yields no implementation (no catalog objects), so it never wins costing.
+  // EnsureGroup CHECK-aborts on an alias outside the join graph, so probe
+  // first: the lifting contract only admits top-level FROM sites today, and
+  // if that ever drifts the memo must degrade (skip the leaf), not kill the
+  // process.
+  for (const auto& [alias, cell] : query.lifted_ctes_.cells) {
+    if (cell == nullptr || !memo.ContainsRelation({alias})) {
+      continue;
+    }
+    const cascades::GroupId singleton = memo.EnsureGroup({alias});
+    memo.AddExpression(singleton,
+                       cascades::LogicalExpression{
+                           .operation = cascades::LogicalOperator::kValues,
+                           .values = cell->rows,
+                           .output_schema = cell->schema});
+  }
+  // Opaque recursive leaves (M4): one childless kRecursiveCte alternative
+  // per lifted recursive singleton. The fixpoint executes through the proven
+  // worktable driver inside the executor; the memo only costs and composes
+  // the leaf (same stray-kScan story as above).
+  for (const auto& [alias, ref] : query.lifted_ctes_.recursive) {
+    if (ref.body == nullptr || !memo.ContainsRelation({alias})) {
+      continue;
+    }
+    const cascades::GroupId singleton = memo.EnsureGroup({alias});
+    memo.AddExpression(
+        singleton, cascades::LogicalExpression{
+                       .operation = cascades::LogicalOperator::kRecursiveCte,
+                       .relational_statement = ref.body,
+                       .output_schema = ref.output_schema,
+                       .cte_name = alias,
+                       .depth_spec = ref.depth_spec});
+  }
   // Publish table schemas (including unique constraints) so join-elimination
   // rules can prove key uniqueness instead of trusting column names.
   {
@@ -1867,6 +2512,58 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                            .children = {search_root},
                            .predicate = effective_predicate});
     search_root = selection;
+  }
+  // Window layers (M-window): one kWindow node per distinct partition
+  // signature, chained bottom-up above the filtered core (SQL evaluates
+  // WHERE before window functions). QUALIFY filters the windowed rows above
+  // the chain, still below the final projection.
+  if (has_window) {
+    std::vector<std::string> partition_order;
+    std::unordered_map<std::string, std::vector<NamedExpression>>
+        grouped_targets;
+    std::unordered_map<std::string, std::vector<Expression>> grouped_keys;
+    for (const ExtractedWindow& spec : window_specs) {
+      if (spec.call->Type() != TypeTag::kWindowFunctionExp) {
+        return Status::kNotImplemented;
+      }
+      const auto& call = spec.call->AsWindowFunctionCallExpression();
+      std::string signature;
+      // Length-prefixed elements: raw '|' concatenation collides when a key
+      // text itself contains the separator ("a|b" as one key vs "a","b").
+      signature += std::to_string(call.partition_by.size()) + ":";
+      for (const Expression& key : call.partition_by) {
+        const std::string text = key ? key->ToString() : std::string("<null>");
+        signature += std::to_string(text.size()) + "/" + text;
+      }
+      if (!grouped_targets.contains(signature)) {
+        partition_order.push_back(signature);
+        grouped_keys.emplace(signature, call.partition_by);
+      }
+      grouped_targets[signature].emplace_back(spec.output.name, spec.call);
+    }
+    for (const std::string& signature : partition_order) {
+      // Tag by partition signature (like split_window): distinct specs live
+      // in distinct groups so alternatives never mix meanings (D1).
+      const cascades::GroupId window =
+          memo.EnsureDerivedGroup(query.from_, "window|" + signature);
+      memo.AddExpression(
+          window, cascades::LogicalExpression{
+                      .operation = cascades::LogicalOperator::kWindow,
+                      .children = {search_root},
+                      .target_list = std::move(grouped_targets[signature]),
+                      .partition_by = std::move(grouped_keys[signature])});
+      search_root = window;
+    }
+    if (window_qualify) {
+      const cascades::GroupId qualify =
+          memo.EnsureDerivedGroup(query.from_, "qualify");
+      memo.AddExpression(qualify,
+                         cascades::LogicalExpression{
+                             .operation = cascades::LogicalOperator::kSelection,
+                             .children = {search_root},
+                             .predicate = window_qualify});
+      search_root = qualify;
+    }
   }
   if (has_aggregate) {
     const cascades::GroupId aggregation =
@@ -1904,7 +2601,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       query.order_expressions_.size() == query.order_ascending_.size() &&
       query.limit_count_ != 0) {
     const std::vector<Expression> sort_expressions =
-        NormalizeOrderingForOutput(query.order_expressions_, projection_items);
+        NormalizeOrderingForOutput(effective_order, projection_items);
     const cascades::GroupId topn = memo.EnsureDerivedGroup(query.from_, "topn");
     std::vector<NamedExpression> topn_keys;
     topn_keys.reserve(sort_expressions.size());
@@ -1923,7 +2620,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   } else if (!query.order_expressions_.empty() &&
              query.order_expressions_.size() == query.order_ascending_.size()) {
     const std::vector<Expression> sort_expressions =
-        NormalizeOrderingForOutput(query.order_expressions_, projection_items);
+        NormalizeOrderingForOutput(effective_order, projection_items);
     const cascades::GroupId sort = memo.EnsureDerivedGroup(query.from_, "sort");
     std::vector<NamedExpression> sort_keys;
     sort_keys.reserve(sort_expressions.size());
@@ -1983,12 +2680,19 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // cost the exact same scan alternatives directly and build the root layers
   // without memo worklists, rule matching, or best-property hash tables.
   // Keep the general search for custom rule sets and decorrelated subqueries.
+  // A single materialized CTE (M4) also takes the fast path: its Values
+  // alternative carries an explicit residual there, which subsumes the root
+  // Selection the general search would add.
   const bool default_rules = options.relational_rules.Names() ==
                                  cascades::RuleSet::Default().Names() &&
                              options.disabled_implementation_rules.empty() &&
                              options.extra_implementation_rules.empty();
+  const bool single_materialized =
+      query.from_.size() == 1 &&
+      query.lifted_ctes_.cells.contains(query.from_.front());
   if (query.from_.size() == 1 && default_rules && decorrelations.empty() &&
-      !needs_root_selection) {
+      (single_materialized || query.lifted_ctes_.cells.empty()) &&
+      (single_materialized || !needs_root_selection) && !has_window) {
     return OptimizeSingleRelation(query, effective_predicate, projection_items,
                                   has_aggregate, query.distinct_, properties,
                                   rule_context);

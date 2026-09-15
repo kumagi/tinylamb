@@ -692,12 +692,10 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       }
       continue;
     }
-    const bool is_triple_single =
-        (c == '\'' && i + 2 < sql.size() && sql[i + 1] == '\'' &&
-         sql[i + 2] == '\'');
-    const bool is_triple_double =
-        (c == '"' && i + 2 < sql.size() && sql[i + 1] == '"' &&
-         sql[i + 2] == '"');
+    const bool is_triple_single = (c == '\'' && i + 2 < sql.size() &&
+                                   sql[i + 1] == '\'' && sql[i + 2] == '\'');
+    const bool is_triple_double = (c == '"' && i + 2 < sql.size() &&
+                                   sql[i + 1] == '"' && sql[i + 2] == '"');
     if (c == '\'' || is_triple_double) {
       const bool is_triple = is_triple_single || is_triple_double;
       const char quote = is_triple_double ? '"' : '\'';
@@ -773,10 +771,9 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         }
       }
       std::string literal =
-          is_raw_prefix
-              ? raw_literal
-              : DecodeStringEscapes(raw_literal, is_bytes_prefix, is_triple,
-                                    quote);
+          is_raw_prefix ? raw_literal
+                        : DecodeStringEscapes(raw_literal, is_bytes_prefix,
+                                              is_triple, quote);
       // PRODUCTION FIX (Q3): a TIMESTAMP '...' literal is UTC-normalized by
       // the visitor on the first parse, but the template/plan caches replayed
       // the RAW string parameter on later runs, so the same SQL returned a

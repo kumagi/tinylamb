@@ -42,7 +42,11 @@
 // for this LLVM-integration TU only.
 #ifdef __clang__
 #pragma clang diagnostic push
+// Older analyzers expose the check under a name clang 21 no longer accepts
+// as a compiler warning group; __has_warning keeps the pragma portable.
+#if __has_warning("-Wanalyzer-security.ArrayBound")
 #pragma clang diagnostic ignored "-Wanalyzer-security.ArrayBound"
+#endif
 #endif
 
 namespace tinylamb {
@@ -380,9 +384,9 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileProjectionChecked() {
   llvm::Value* addend = argument++;
   llvm::Value* mul_overflow_out = argument++;
   llvm::Value* add_overflow_out = argument++;
-  llvm::Function* smul = llvm::Intrinsic::getDeclaration(
+  llvm::Function* smul = llvm::Intrinsic::getOrInsertDeclaration(
       module.get(), llvm::Intrinsic::smul_with_overflow, {i64});
-  llvm::Function* sadd = llvm::Intrinsic::getDeclaration(
+  llvm::Function* sadd = llvm::Intrinsic::getOrInsertDeclaration(
       module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
   auto* entry = llvm::BasicBlock::Create(*context, "entry", function);
   auto* loop = llvm::BasicBlock::Create(*context, "loop", function);
@@ -466,7 +470,7 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileSumChecked() {
   llvm::Value* input = argument++;
   llvm::Value* count = argument++;
   llvm::Value* overflow_out = argument++;
-  llvm::Function* sadd = llvm::Intrinsic::getDeclaration(
+  llvm::Function* sadd = llvm::Intrinsic::getOrInsertDeclaration(
       module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
   auto* entry = llvm::BasicBlock::Create(*context, "entry", function);
   auto* loop = llvm::BasicBlock::Create(*context, "loop", function);

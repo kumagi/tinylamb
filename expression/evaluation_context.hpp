@@ -12,7 +12,7 @@
 namespace tinylamb {
 
 class AggregateExpression;
-class Row;
+struct Row;
 class SelectStatement;
 
 // Prepared aggregation results keyed by the aggregate expression node that

@@ -40,6 +40,9 @@ class LockManager {
   // Returns false when this owner does not hold a shared lock (double
   // release or foreign release).
   bool ReleaseSharedLock(const RowPosition& row, txn_id_t owner);
+  // Not reentrant: acquiring a row this |owner| already holds exclusively
+  // blocks like any other conflict and times out to false.  Track the lock
+  // on the caller side instead of acquiring twice.
   bool GetExclusiveLock(const RowPosition& row, txn_id_t owner,
                         bool wait = true);
   bool GetExclusiveLock(const RowPosition& row, txn_id_t owner,

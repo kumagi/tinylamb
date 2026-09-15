@@ -11,14 +11,10 @@ This directory is responsible for managing transactions, which are the fundament
 - **`TransactionManager`**: The central component that manages the lifecycle of all transactions in the system.
   - **Transaction Creation**: It is responsible for creating new `Transaction` objects via its `Begin()` method, assigning them a unique `txn_id`.
   - **Active Transaction Table**: It maintains a table of all currently active transactions, which is crucial for recovery and for managing concurrent operations.
-  - **Commit and Abort**: It orchestrates the commit and abort processes. When a transaction is committed, it writes a `COMMIT` record to the log. When a transaction is aborted, it uses the chain of log records to undo all the changes made by that transaction.
+  - **Commit and Abort**: It orchestrates the commit and abort processes. When a transaction is committed, it writes a `COMMIT` record to the log. When a transaction is aborted, it walks the same chain to compensate every change with a CLR and then appends a `COMMIT`-typed terminator (there is no `ABORT` record type) so restart recovery classifies the transaction as finished.
   - **Compensation Log Records (CLRs)**: During an abort, for each change that is undone, the `TransactionManager` writes a Compensation Log Record (CLR) to the log. CLRs describe the undo operation and are essential for ensuring that the rollback process itself is idempotent and can survive a crash.
 
-- **`LockManager`**: Implements the concurrency control mechanism, which is responsible for ensuring that concurrent transactions do not interfere with each other, thus providing isolation.
-  - **Locking Protocol**: It uses a locking protocol (likely Strict Two-Phase Locking, or Strict 2PL) to manage access to data. Before a transaction can read or write to a row, it must first acquire the appropriate lock.
-    - **Shared Locks (S-locks)**: Multiple transactions can hold a shared lock on the same data item simultaneously, allowing for concurrent reads.
-    - **Exclusive Locks (X-locks)**: Only one transaction can hold an exclusive lock on a data item at a time. An exclusive lock is required for write operations.
-  - **Deadlock Detection/Prevention**: While not explicitly detailed in the headers, a complete `LockManager` would also be responsible for handling deadlocks, which can occur when two or more transactions are waiting for each other to release locks.
+- **`LockManager`**: An auxiliary row-lock table (Strict 2PL semantics: shared and exclusive locks per `RowPosition`). It is **not** the primary isolation mechanism — conflict control between writers is handled by the MVCC version store and per-row write intents in the `TransactionManager` (see `transaction/AGENTS.md` and `docs/lock_order.md`). The `LockManager` exists for test-facing locking semantics and for callers that need explicit row locks; the `TransactionManager` itself never takes or releases `LockManager` locks (unlocking is the caller's job).
 
 ## Workflow
 
@@ -27,11 +23,11 @@ The typical lifecycle of a transaction is as follows:
 1.  A client requests a new transaction from the `TransactionManager` by calling `Begin()`.
 2.  The `TransactionManager` creates a new `Transaction` object and adds it to the active transaction table.
 3.  The client then performs a series of read and write operations. For each operation:
-    -   The transaction requests the appropriate lock (shared or exclusive) from the `LockManager`.
-    -   If the lock is granted, the operation proceeds.
+    -   Reads go through the MVCC version store, which selects the version visible to the transaction's snapshot.
+    -   Writes first acquire a per-row write intent (`AddWriteSet`); conflicts are resolved by the configured deadlock policy (wait-die, wound-wait, detection) and the executor unwinds the transaction on a lost race.
     -   The transaction generates a log record for the operation and appends it to the log.
 4.  When the client is finished, it calls either `PreCommit()` or `Abort()` on the `Transaction` object.
-    -   **Commit**: The `TransactionManager` writes a `COMMIT` record to the log and then releases all the locks held by the transaction.
-    -   **Abort**: The `TransactionManager` uses the log to undo all the changes made by the transaction and then releases all its locks.
+    -   **Commit**: The `TransactionManager` writes a `COMMIT` record to the log, publishes the staged versions, and releases the write intents. `LockManager` locks, if any were taken, are released by the caller.
+    -   **Abort**: The `TransactionManager` walks the log chain, writes a CLR for each change, releases the write intents, marks the transaction aborted, and appends a `COMMIT`-typed terminator.
 
 This combination of locking for concurrency control and logging for durability and atomicity ensures that the database operates reliably and maintains data consistency even in the presence of concurrent access and system failures.

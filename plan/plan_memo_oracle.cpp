@@ -425,12 +425,12 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
       1 + static_cast<int>(rng() % static_cast<uint32_t>(
                                        std::max(1, config.max_operator_depth)));
   std::vector<int> op_choices;
-  op_choices.reserve(depth);
+  op_choices.reserve(static_cast<size_t>(depth));
   for (int d = 0; d < depth; ++d) {
     op_choices.push_back(static_cast<int>(rng() % 10));
   }
   const bool use_outer_join_root = (relation_count >= 2 && rng() % 3 == 0);
-  const uint8_t outer_join_type = static_cast<uint8_t>(rng() % 3);
+  const auto outer_join_type = static_cast<uint8_t>(rng() % 3);
 
   std::ostringstream desc;
   desc << "relations{" << gen.relations.size() << "} ops[";

@@ -93,8 +93,14 @@ class BytecodeProgram {
 
 class BytecodeCompiler {
  public:
+  // kValue: select items / sort keys — a rewrite that turns a NULL result
+  // into FALSE (inner_join_not_null_inference) must not apply there.
+  // kFilter: WHERE/ON and other truthiness-only contexts, where the same
+  // rewrite is sound and kept enabled.
+  enum class Context { kValue, kFilter };
   [[nodiscard]] static std::optional<BytecodeProgram> Compile(
-      const Expression& expression, const Schema& schema);
+      const Expression& expression, const Schema& schema,
+      Context context = Context::kValue);
 };
 
 // Differential-testing hook: false when TINYLAMB_DISABLE_BYTECODE is set in

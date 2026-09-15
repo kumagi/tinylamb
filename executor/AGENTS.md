@@ -1,4 +1,4 @@
-# `executor/` — Layer 10 physical operators
+# `executor/` — Layer 10 (with `plan/`) physical operators
 
 Volcano `Next(Row*, RowPosition*)` + batched `NextBatch(DataChunk*,
 max_rows = kDefaultVectorSize = 1024)` (`executor_base.hpp`;
@@ -23,6 +23,8 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   `spill_file`, `aggregation`, `parallel_aggregation`, `partial_aggregate`,
   `grouping_sets`, `two_phase_distinct_agg`, `distributed_agg_finalize`,
   `dictionary_batch_aggregation`, `distinct`, `skip_scan_distinct`.
+- Window: `window` (physical operator wired from `WindowPlan::EmitExecutor`)
+  over `detail/window_eval` partition/frame evaluation.
 - DML/other: `insert`, `update`, `delete`, `truncate`, `merge`, `returning`,
   `values`, `generate_series`, `unnest`, `recursive_cte`, `set_operation`,
   `merge_append`, `limit`, `max1_row`, `minmax_index`, `materialize`,

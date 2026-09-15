@@ -45,6 +45,8 @@ class QueryExpression;
 class IntervalExpression;
 class ArrayExpression;
 class CastExpression;
+class WindowFunctionCallExpression;
+class LambdaExpression;
 class SelectStatement;
 class EvaluationContext;
 
@@ -78,6 +80,9 @@ class ExpressionBase {
   [[nodiscard]] const IntervalExpression& AsIntervalExpression() const;
   [[nodiscard]] const ArrayExpression& AsArrayExpression() const;
   [[nodiscard]] const CastExpression& AsCastExpression() const;
+  [[nodiscard]] const WindowFunctionCallExpression&
+  AsWindowFunctionCallExpression() const;
+  [[nodiscard]] const LambdaExpression& AsLambdaExpression() const;
 
   [[nodiscard]] virtual std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,

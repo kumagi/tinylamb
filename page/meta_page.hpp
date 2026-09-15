@@ -54,6 +54,12 @@ class MetaPage {
   // its free-page body BEFORE the image was restored.  A non-matching head
   // (page flushed and chain extended meanwhile) leaves the link stale; the
   // recovery rebuild is the authority for that case.
+  // Allocation is two-phase (see PageManager::AllocateNewPage): peek the
+  // candidate under one meta latch acquisition, then revalidate and pop it
+  // under a second one taken after the candidate page is latched.
+  [[nodiscard]] page_id_t PeekAllocationCandidate() const;
+  [[nodiscard]] bool AllocateCandidate(page_id_t candidate,
+                                       Page* candidate_page);
   void PopFreePageHead(page_id_t pid, page_id_t next) {
     if (first_free_page == pid) {
       first_free_page = next;
@@ -66,8 +72,6 @@ class MetaPage {
     first_free_page = 0;
   }
 
-  StatusOr<PageRef> AllocateNewPage(Transaction& txn, PagePool& pool,
-                                    PageType new_page_type);
   Status DestroyPage(Transaction& txn, Page* target);
 
   // Note that all member of this class is private.

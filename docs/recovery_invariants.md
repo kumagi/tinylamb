@@ -4,6 +4,13 @@ After crash or `Database::EmulateCrash()` + reopen:
 
 1. **Committed transactions** are visible; **aborted** or **in-flight** work is
    rolled back.
+   Abort chains carry the same terminator record recovery classifies commits
+   by (`LogType::kCommit`), so `TransactionManager::Abort` appends it only
+   after the undo walk compensated the whole chain. A partially compensated
+   chain stays un-terminated and is finished by the restart loser-undo
+   (idempotent through the `page_lsn` guard in `UndoLoserChains`); appending
+   the terminator unconditionally would resurrect the uncompensated tail as
+   committed data.
 2. **Page LSN** on disk ≤ **CommittedLSN** for durable commits.
 3. **Checksum** validates every page read from disk; corrupt pages fail closed.
 4. **Checkpoint** (`*.last_checkpoint`) points at a recoverable LSN; replay starts

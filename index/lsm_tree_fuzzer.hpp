@@ -61,7 +61,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   constexpr size_t kMaxOps = 200;
   for (size_t i = 0; i < kMaxOps && stream.Remaining(); ++i) {
     std::string key(stream.Bytes(stream.Pick(64)));
-    switch (stream.Pick(3)) {
+    switch (stream.Pick(4)) {
       case 0: {  // Write
         std::string value(stream.Bytes(stream.Pick(64)));
         if (verbose) {
@@ -80,7 +80,19 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         expected.erase(key);
         break;
       }
-      default: {  // Verify the model against the tree.
+      case 2: {  // Verify the model against the tree.
+        Scan();
+        break;
+      }
+      default: {  // Sync, then reopen the tree from disk.
+        // Sync is the durability barrier: after it returns every earlier
+        // write must be in a persisted run, so a restart may not lose any.
+        if (verbose) {
+          LOG(TRACE) << "Sync+Reopen";
+        }
+        assert(tree->Sync() == Status::kSuccess);
+        tree.reset();
+        tree = LSMTree::Create(base_path).MoveValue();
         Scan();
         break;
       }
@@ -122,6 +134,11 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     LOG(ERROR) << expected_it->first << " not finished";
     exit(1);
   }
+  // Stop the flush/merge workers BEFORE sweeping the directory: a
+  // background merge deletes superseded run files concurrently, and racing
+  // that teardown made the throwing remove_all overload raise
+  // filesystem_error (ENOENT) sporadically.
+  tree.reset();
   std::filesystem::remove_all(base_path);
   if (verbose) {
     LOG(INFO) << "Successfully finished.";

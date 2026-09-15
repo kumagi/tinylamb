@@ -16,7 +16,8 @@
 #
 """include-lint: enforce the declaration-layer DAG of tinylamb.
 
-Scans every tracked C++ source for quoted #include directives and rejects
+Scans every *.hpp/*.cpp under the repository root (outside build*/, scripts/
+and docs/) for quoted #include directives and rejects
 edges that point to a higher layer.  Layers (left = low, right = high;
 a layer may only include equal or lower layers):
 

@@ -70,6 +70,7 @@
 #include "type/value_type.hpp"
 #include "unnest_plan.hpp"
 #include "values_plan.hpp"
+#include "window_plan.hpp"
 
 namespace tinylamb {
 namespace {
@@ -541,8 +542,17 @@ std::vector<PlanAlternative> ScanAlternatives(
     const cascades::LogicalExpression& logical,
     const PhysicalProperties& required, const cascades::RuleContext& context,
     bool include_indexes, bool include_full_scan) {
-  const Table& table = *context.tables.at(logical.table);
-  const TableStatistics& statistics = *context.statistics.at(logical.table);
+  // Materialized CTE singletons (M4) carry a stray kScan alongside their
+  // kValues leaf; with no catalog objects the scan offers no alternative
+  // (the kValues implementation wins by default).
+  const auto table_it = context.tables.find(logical.table);
+  const auto statistics_it = context.statistics.find(logical.table);
+  if (table_it == context.tables.end() ||
+      statistics_it == context.statistics.end()) {
+    return {};
+  }
+  const Table& table = *table_it->second;
+  const TableStatistics& statistics = *statistics_it->second;
   const Schema& schema = table.GetSchema();
   const std::string relation = logical.table;
   const std::string physical = std::string(schema.Name());
@@ -1528,6 +1538,93 @@ std::vector<PlanAlternative> MergeJoinAlternative(
                           .estimated_rows = estimated_rows}};
 }
 
+// True when the predicate holds at least one equi column-pair spanning the
+// two children (mirrors the equi detection in JoinAlternatives, including
+// IS NOT DISTINCT FROM). Hash/merge implementations own those shapes; the
+// blocked nested loop only competes where no equi pair exists.
+bool HasEquiColumnPair(const Expression& predicate, const Plan& left,
+                       const Plan& right) {
+  return std::ranges::any_of(
+      SplitConjuncts(predicate), [&left, &right](const Expression& conjunct) {
+        if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+          return false;
+        }
+        const auto& binary = conjunct->AsBinaryExpression();
+        const bool null_safe =
+            binary.Op() == BinaryOperation::kIsNotDistinctFrom;
+        if ((binary.Op() != BinaryOperation::kEquals && !null_safe) ||
+            binary.Left()->Type() != TypeTag::kColumnValue ||
+            binary.Right()->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
+        const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+        const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+        return (left->GetSchema().Offset(lhs) >= 0 &&
+                right->GetSchema().Offset(rhs) >= 0) ||
+               (left->GetSchema().Offset(rhs) >= 0 &&
+                right->GetSchema().Offset(lhs) >= 0);
+      });
+}
+
+// Shared builder for the batch_nested_loop family: a cross-shaped
+// ProductPlan carrying the full predicate, marked for the blocked executor.
+// The gate (usable predicate, no equi pair) keeps hash/merge shapes — and
+// single-key equi NOT IN, the only source of null-aware anti joins — out of
+// reach, so the rule only fires where hash/merge offer nothing:
+// - inner: ties the tuple nested_loop_join exactly (same shape, cost and
+//   estimate); the tuple rule is registered first and wins ties, so
+//   existing plans are unchanged and the blocked form is a tested fallback.
+// - semi/anti/full/right-outer: no tuple implementation exists, so the
+//   blocked form is new capability (previously relational fallback).
+// Semi/anti/outer carry no Selection wrapper: the executor null-pads
+// unmatched rows (outer) and reduces to the probe side (semi/anti) while
+// pairing, and a Selection above would filter those rows back out.
+std::vector<PlanAlternative> BatchNestedLoopFor(
+    const std::optional<Expression>& condition, const BestPlan& left,
+    const BestPlan& right, const std::optional<JoinKind>& kind,
+    bool wrap_selection) {
+  if (!condition.has_value() || !*condition) {
+    return {};
+  }
+  const Expression& predicate = *condition;
+  if (!wrap_selection && predicate->Type() == TypeTag::kConstantValue) {
+    // ON FALSE/NULL over an outer/semi/anti shape is short-circuited by the
+    // logical layer; like outer_nested_loop, leave those shapes out. (ON
+    // TRUE stays: the blocked executor pads correctly around it.)
+    const Value constant = predicate->AsConstantValue().GetValue();
+    if (constant.IsNull() || !constant.Truthy()) {
+      return {};
+    }
+  }
+  if (HasEquiColumnPair(predicate, left.plan, right.plan)) {
+    return {};
+  }
+  Plan join;
+  if (!kind.has_value()) {
+    join = std::make_shared<ProductPlan>(left.plan, right.plan);
+  } else if (IsSemiJoinKind(*kind) || IsAntiJoinKind(*kind)) {
+    join = std::make_shared<ProductPlan>(left.plan, std::vector<ColumnName>{},
+                                         right.plan, std::vector<ColumnName>{},
+                                         HashJoinMode::kInMemory, *kind);
+  } else {
+    join = std::make_shared<ProductPlan>(left.plan, right.plan, *kind);
+  }
+  std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes({}, predicate);
+  std::static_pointer_cast<ProductPlan>(join)->PreferBatchNestedLoop();
+  const double l_rows = left.estimated_rows;
+  const double r_rows = right.estimated_rows;
+  auto estimated_rows = static_cast<double>(join->EmitRowCount());
+  if (wrap_selection) {
+    // Same shape/cost/estimate as the tuple nested_loop_join cross path, so
+    // the two tie and registration order keeps the tuple winner.
+    join = std::make_shared<SelectionPlan>(join, predicate, join->GetStats());
+    estimated_rows = l_rows * r_rows;
+  }
+  return {PlanAlternative{.plan = std::move(join),
+                          .local_cost = (l_rows * r_rows) + l_rows + r_rows,
+                          .estimated_rows = estimated_rows}};
+}
+
 }  // namespace
 
 StatusOr<Plan> OptimizeSingleRelation(
@@ -1550,9 +1647,35 @@ StatusOr<Plan> OptimizeSingleRelation(
     return Status::kNotImplemented;
   }
 
-  std::vector<PlanAlternative> alternatives = ScanAlternatives(
-      memo, group, scan_group.expressions.front(), required, context,
-      /*include_indexes=*/true, /*include_full_scan=*/true);
+  std::vector<PlanAlternative> alternatives;
+  const auto materialized = query.lifted_ctes_.cells.find(relation);
+  const bool is_materialized = materialized != query.lifted_ctes_.cells.end() &&
+                               materialized->second != nullptr;
+  if (is_materialized) {
+    // A materialized CTE scans shared rows with no catalog objects: offer a
+    // single Values alternative and apply the whole predicate above it (a
+    // scan-group filter would be ignored by the Values implementation, so
+    // the fast path carries its own residual like the general search does).
+    // Row positions are unavailable from row cells.
+    if (required.require_row_position) {
+      return Status::kNotImplemented;
+    }
+    Plan values = std::make_shared<ValuesPlan>(materialized->second->schema,
+                                               materialized->second->rows);
+    const auto rows = static_cast<double>(materialized->second->rows.size());
+    if (predicate && (predicate->Type() != TypeTag::kConstantValue ||
+                      !predicate->AsConstantValue().GetValue().Truthy())) {
+      values = std::make_shared<SelectionPlan>(values, predicate,
+                                               values->GetStats());
+    }
+    alternatives.push_back(PlanAlternative{
+        .plan = std::move(values), .local_cost = rows, .estimated_rows = rows});
+  } else {
+    alternatives = ScanAlternatives(memo, group, scan_group.expressions.front(),
+                                    required, context,
+                                    /*include_indexes=*/true,
+                                    /*include_full_scan=*/true);
+  }
   if (alternatives.empty()) {
     return Status::kNotImplemented;
   }
@@ -1562,9 +1685,10 @@ StatusOr<Plan> OptimizeSingleRelation(
   // precise than scanning the relation and feeding every row to an
   // aggregate.  Restrict the rewrite to a NOT NULL/PRIMARY KEY column: a
   // general nullable index needs a separate null-position contract and must
-  // retain the ordinary aggregate path.
-  if (has_aggregate && !distinct && query.from_.size() == 1 &&
-      projection_items.size() == 1 &&
+  // retain the ordinary aggregate path. Materialized CTEs have no indexes;
+  // their MIN/MAX flows through the ordinary aggregate below.
+  if (!is_materialized && has_aggregate && !distinct &&
+      query.from_.size() == 1 && projection_items.size() == 1 &&
       (!predicate || (predicate->Type() == TypeTag::kConstantValue &&
                       predicate->AsConstantValue().GetValue().Truthy()))) {
     const NamedExpression& output = projection_items.front();
@@ -2100,6 +2224,37 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                               .estimated_rows = rows}};
         },
         c::LogicalOperator::kSort));
+    // window: one WindowPlan per kWindow node. Window evaluation preserves
+    // the row count; the local cost prices the internal partition ordering
+    // like a sort (the executor delegates to the canonical evaluator, so
+    // framing and NULL placement agree with the relational path by
+    // construction).
+    built.Add(c::ImplementationRule(
+        "window", cascades::dsl::Window(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 1 || required.require_row_position ||
+              logical.target_list.empty()) {
+            return std::vector<PlanAlternative>{};
+          }
+          for (const NamedExpression& item : logical.target_list) {
+            if (!item.expression ||
+                item.expression->Type() != TypeTag::kWindowFunctionExp) {
+              return std::vector<PlanAlternative>{};
+            }
+          }
+          Plan window = std::make_shared<WindowPlan>(children[0].plan,
+                                                     logical.target_list);
+          const double rows = children[0].estimated_rows;
+          const double cost = rows * std::log2(std::max(2.0, rows));
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(window),
+                              .local_cost = cost,
+                              .estimated_rows = rows}};
+        },
+        c::LogicalOperator::kWindow));
     built.Add(c::ImplementationRule(
         "topn", cascades::dsl::TopN(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
@@ -2617,7 +2772,11 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         "constant_table", c::dsl::ConstantTable(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
            const c::LogicalExpression& logical, const std::vector<BestPlan>&,
-           const PhysicalProperties&, const c::RuleContext& context) {
+           const PhysicalProperties& required, const c::RuleContext& context) {
+          // Row cells (M4 materialized CTEs included) carry no row positions.
+          if (required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
           if (logical.values.empty() && !logical.table.empty()) {
             // COUNT(*) is rewritten to this leaf for optimizer purposes, but
             // its result must still be computed from the transaction-visible
@@ -2713,6 +2872,75 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               PlanAlternative{.plan = std::move(join),
                               .local_cost = local_cost,
                               .estimated_rows = estimate}};
+        },
+        c::LogicalOperator::kOuterJoin));
+    // batch_nested_loop family: non-equi joins for the blocked executor.
+    // The gate (no equi column-pair) means hash/merge offer nothing here, so
+    // these alternatives only compete with the tuple nested loop (inner,
+    // exact tie broken by registration order) or fill shapes with no tuple
+    // implementation at all (semi/anti/full/right-outer, previously
+    // relational fallback). LEFT stays with outer_nested_loop to avoid a
+    // second tie; null-aware anti never reaches the gate (single-key equi
+    // NOT IN always carries an equi pair).
+    built.Add(c::ImplementationRule(
+        "batch_nested_loop", Join(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          return BatchNestedLoopFor(logical.predicate, children[0], children[1],
+                                    std::nullopt,
+                                    /*wrap_selection=*/true);
+        },
+        c::LogicalOperator::kJoin));
+    built.Add(c::ImplementationRule(
+        "batch_nested_loop_semi", c::dsl::SemiJoin(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          return BatchNestedLoopFor(logical.predicate, children[0], children[1],
+                                    SemiJoinKind(),
+                                    /*wrap_selection=*/false);
+        },
+        c::LogicalOperator::kSemiJoin));
+    built.Add(c::ImplementationRule(
+        "batch_nested_loop_anti", c::dsl::AntiJoin(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          return BatchNestedLoopFor(logical.predicate, children[0], children[1],
+                                    AntiJoinKind(),
+                                    /*wrap_selection=*/false);
+        },
+        c::LogicalOperator::kAntiJoin));
+    built.Add(c::ImplementationRule(
+        "batch_nested_loop_outer", OuterJoin(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position ||
+              logical.operation != c::LogicalOperator::kOuterJoin ||
+              (logical.join_type != 1 && logical.join_type != 2) ||
+              !logical.predicate || !*logical.predicate) {
+            return std::vector<PlanAlternative>{};
+          }
+          const JoinKind kind = logical.join_type == 1 ? RightOuterJoinKind()
+                                                       : FullOuterJoinKind();
+          return BatchNestedLoopFor(logical.predicate, children[0], children[1],
+                                    kind,
+                                    /*wrap_selection=*/false);
         },
         c::LogicalOperator::kOuterJoin));
     // exchange_noop: single-node distribution enforcement. kExchange /

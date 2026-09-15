@@ -99,8 +99,8 @@ bool RejectsNulls(const Expression& expression, const std::string& qualifier) {
           return NeverFalse(unary.Child(), qualifier);
         case UnaryOperation::kMinus:
         case UnaryOperation::kBitwiseNot:
-          // Arithmetic/bitwise negation keeps NULL; a non-NULL child may stay TRUE
-          // (e.g. IS TRUE wrappers), so require the child to reject.
+          // Arithmetic/bitwise negation keeps NULL; a non-NULL child may stay
+          // TRUE (e.g. IS TRUE wrappers), so require the child to reject.
           return RejectsNulls(unary.Child(), qualifier);
         case UnaryOperation::kIsNull:
         case UnaryOperation::kIsNotNull:

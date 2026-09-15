@@ -13,10 +13,12 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "common/status_or.hpp"
 #include "executor/executor_base.hpp"
+#include "query/query_data.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -108,6 +110,23 @@ class SqlEngine {
   StatusOr<Executor> PrepareStatement(TransactionContext& ctx,
                                       std::unique_ptr<Statement> statement);
 
+  // M4: lifts every remaining non-recursive CTE into a shared eager cell
+  // (planned + executed once via a fresh engine, scanned from every
+  // reference site through kValues memo leaves). Atomic: any un-liftable CTE
+  // keeps the whole layer mapped for the existing materialized path (the map
+  // below is never disturbed, so the abort path is identical to never having
+  // tried). Records covered CTE names in `lifted`. Clears the plan cache
+  // fingerprint when cells are built (embedded rows are data, never
+  // cacheable).
+  void MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
+                       LiftedCtes* lifted);
+
+  // M4: references singly-used recursive CTEs as opaque memo leaves (the
+  // fixpoint still executes through the proven worktable driver). Records
+  // coverage in `lifted` and seals `fully_covered` last: routing treats a
+  // covered map as vestigial.
+  void LiftRecursiveCtes(SelectStatement* outer, LiftedCtes* lifted);
+
   // Cascades-route set operations: each operand runs through normal statement
   // routing (recursively) and the operands combine at the executor level with
   // INTERSECT binding tighter than UNION/EXCEPT.
@@ -116,8 +135,11 @@ class SqlEngine {
 
   // GROUP BY / HAVING / aggregate routing: optimizes the FROM + WHERE core
   // through Cascades and wraps it in a GroupByPlan finish node.
+  // `lifted` carries the lifted CTE layer (M4) into the core QueryData;
+  // null selects the legacy behavior.
   StatusOr<Executor> ExecuteGroupedSelect(const SelectStatement& select,
-                                          TransactionContext& ctx);
+                                          TransactionContext& ctx,
+                                          const LiftedCtes* lifted = nullptr);
 
   // Cascades routing for UNNEST queries: lowers UNNEST and lateral sources
   // into LogicalOperator::kUnnest over DummyScan/input plans.

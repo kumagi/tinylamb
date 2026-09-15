@@ -68,8 +68,7 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       return false;
     }
     const std::chrono::year_month_day ymd{
-        std::chrono::year{Y},
-        std::chrono::month{static_cast<unsigned>(M)},
+        std::chrono::year{Y}, std::chrono::month{static_cast<unsigned>(M)},
         std::chrono::day{static_cast<unsigned>(D)}};
     if (!ymd.ok()) {
       return false;
@@ -144,14 +143,14 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   if (matched) {
     if (ct->year < 1 || ct->year > 9999 || ct->month < 1 || ct->month > 12 ||
         ct->day < 1 || ct->day > 31 || ct->hour < 0 || ct->hour > 23 ||
-        ct->minute < 0 || ct->minute > 59 || ct->second < 0 || ct->second > 60 ||
-        ct->subsecond_nanos < 0 || ct->subsecond_nanos > 999999999) {
+        ct->minute < 0 || ct->minute > 59 || ct->second < 0 ||
+        ct->second > 60 || ct->subsecond_nanos < 0 ||
+        ct->subsecond_nanos > 999999999) {
       return false;
     }
-    const std::chrono::year_month_day ymd{
-        std::chrono::year{ct->year},
-        std::chrono::month{static_cast<unsigned>(ct->month)},
-        std::chrono::day{static_cast<unsigned>(ct->day)}};
+    const std::chrono::year_month_day ymd{std::chrono::year{ct->year},
+                                          std::chrono::month{ct->month},
+                                          std::chrono::day{ct->day}};
     if (!ymd.ok()) {
       return false;
     }
@@ -392,8 +391,11 @@ void AppendProtoMessageField(std::string* out, uint32_t field_number,
   out->append(payload);
 }
 
-std::string EncodeProtoWireMessage(std::string_view type_name,
-                                   std::string_view payload) {
+// StatusOr because a NullableDate field runs user text through
+// TryParseDateDays; an unparseable date must surface as a Status from the
+// CAST path, not as an EXC-SHIM throw escaping TryEvaluate (fuzz-found).
+StatusOr<std::string> EncodeProtoWireMessage(std::string_view type_name,
+                                             std::string_view payload) {
   std::vector<ProtoTextEntry> entries;
   std::string body(payload);
   if (body.starts_with("#")) {
@@ -405,7 +407,7 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
     body = body.substr(1, body.size() - 2);
   }
   if (!ParseProtoTextEntries(body, &entries)) {
-    return {};
+    return std::string{};
   }
   const std::string lower = ToLower(std::string(type_name));
   std::string out;
@@ -429,7 +431,8 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
         uint64_t value = ProtoInteger(entry.text);
         if (lower.ends_with("nullabledate") &&
             entry.text.find('-') != std::string::npos) {
-          value = static_cast<uint64_t>(ParseDateDays(entry.text));
+          ASSIGN_OR_RETURN(int64_t, date_days, TryParseDateDays(entry.text));
+          value = static_cast<uint64_t>(date_days);
         }
         AppendProtoField(&out, 1, value);
       }
@@ -441,16 +444,18 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
       } else if (field == "int64_key_2") {
         AppendProtoField(&out, 2, ProtoInteger(entry.text));
       } else if (field == "nested_value") {
-        AppendProtoMessageField(
-            &out, 22,
-            EncodeProtoWireMessage("googlesql_test.KitchenSinkPB.Nested",
-                                   entry.text));
+        ASSIGN_OR_RETURN(
+            std::string, nested_msg,
+            (EncodeProtoWireMessage("googlesql_test.KitchenSinkPB.Nested",
+                                    entry.text)));
+        AppendProtoMessageField(&out, 22, nested_msg);
       } else if (field == "optionalgroup" || field == "optional_group" ||
                  field == "optional_group_field") {
-        AppendProtoMessageField(
-            &out, 27,
-            EncodeProtoWireMessage("googlesql_test.KitchenSinkPB.OptionalGroup",
-                                   entry.text));
+        ASSIGN_OR_RETURN(
+            std::string, optional_group_msg,
+            (EncodeProtoWireMessage(
+                "googlesql_test.KitchenSinkPB.OptionalGroup", entry.text)));
+        AppendProtoMessageField(&out, 27, optional_group_msg);
       }
     } else if (lower.ends_with("kitchensinkenumpb")) {
       // Unknown proto2 enum values are rendered using their numeric field
@@ -487,11 +492,12 @@ std::string EncodeProtoWireMessage(std::string_view type_name,
       AppendProtoMessageField(&out, 2, text);
     } else if (lower.ends_with("optionalgroup") &&
                field == "optionalgroupnested") {
-      AppendProtoMessageField(
-          &out, 3,
-          EncodeProtoWireMessage(
+      ASSIGN_OR_RETURN(
+          std::string, optional_group_nested_msg,
+          (EncodeProtoWireMessage(
               "googlesql_test.KitchenSinkPB.OptionalGroup.OptionalGroupNested",
-              entry.text));
+              entry.text)));
+      AppendProtoMessageField(&out, 3, optional_group_nested_msg);
     } else if (lower.ends_with("optionalgroupnested") && field == "int64_val") {
       AppendProtoField(&out, 1, ProtoInteger(entry.text));
     }
@@ -850,8 +856,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
       }
     }
     if (!marker.empty()) {
-      std::string encoded = EncodeProtoWireMessage(
-          marker, std::string_view(val.value.varchar_value));
+      ASSIGN_OR_RETURN(std::string, encoded,
+                       (EncodeProtoWireMessage(
+                           marker, std::string_view(val.value.varchar_value))));
       return Value(std::move(encoded));
     }
   }
@@ -1437,7 +1444,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                              "invalid DATETIME string: " + raw);
         }
         if (upper == "TIMESTAMP") {
-          std::string raw = s;
+          const std::string& raw = s;
           // Explicit zone detection: a ±HH[:MM] offset after the date part,
           // a Z/z suffix, or a trailing UTC/GMT zone word.  An explicit zone
           // fixes the instant regardless of the session default.
@@ -1501,8 +1508,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                              "invalid TIMESTAMP string: " + s);
         }
         if (upper == "INTERVAL") {
-          IntervalValue iv = IntervalValue::Parse(s);
-          return Value(iv.ToString());
+          ASSIGN_OR_RETURN(IntervalValue, iv, IntervalValue::TryParse(s));
+          ASSIGN_OR_RETURN(std::string, iv_text, iv.TryToString());
+          return Value(std::move(iv_text));
         }
         if (upper == "STRING") {
           return Value(std::move(s));

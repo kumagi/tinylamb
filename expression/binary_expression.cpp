@@ -233,8 +233,7 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       const bool equal = is_nan(left) && is_nan(right);
       return Value(op == BinaryOperation::kIsNotDistinctFrom ? equal : !equal);
     }
-    if (left.type == ValueType::kVarChar &&
-        right.type == ValueType::kVarChar &&
+    if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
         IsStructJson(left.value.varchar_value) &&
         IsStructJson(right.value.varchar_value)) {
       auto v1 = ExtractStructValues(left.value.varchar_value);
@@ -454,7 +453,7 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
                          "bitwise shift requires integer operands");
     }
     const bool is_u = left.IsUnsigned() || right.IsUnsigned();
-    auto with_u = [&](Value v) { return is_u ? v.WithUnsigned() : v; };
+    auto with_u = [&](const Value& v) { return is_u ? v.WithUnsigned() : v; };
     const int64_t amount = right.value.int_value;
     if (amount < 0) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -988,7 +987,9 @@ Type BinaryResultType(BinaryOperation operation, const Type& left,
   if (IsComparison(operation) || operation == BinaryOperation::kAnd ||
       operation == BinaryOperation::kOr || operation == BinaryOperation::kXor ||
       operation == BinaryOperation::kLike ||
-      operation == BinaryOperation::kNotLike) {
+      operation == BinaryOperation::kNotLike ||
+      operation == BinaryOperation::kIsDistinctFrom ||
+      operation == BinaryOperation::kIsNotDistinctFrom) {
     return {TypeTag::kBigInt};
   }
   if (operation == BinaryOperation::kDivide) {

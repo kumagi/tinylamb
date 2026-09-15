@@ -204,7 +204,6 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   bool adaptive_stayed_nested_loop_{false};
   size_t memory_peak_bytes_{0};
   size_t spill_partition_count_{0};
-  bool reopt_recorded_{false};
   // The hybrid path keeps its fully materialized output (frozen spill spec).
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};

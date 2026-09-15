@@ -639,7 +639,11 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
   if (hint_leaf != nullptr) {
     cursor = *hint_leaf;
   }
-  if (idx.StoresSingleValue()) {
+  // NULL-bearing keys use the multi-value list encoding even for a UNIQUE
+  // index: SQL says NULL != NULL, so two rows with a NULL key must both be
+  // insertable, while the single-value encoding would collide on the shared
+  // NULL key image and reject the second row with kDuplicates.
+  if (idx.StoresSingleValue() && !KeyHasNull(idx, new_row)) {
     // BTree value is encoded pair<RowPosition, vector<Value>>.
     IndexValueType val;
     val.pos = pos;
@@ -713,7 +717,10 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
     }
     return Status::kSuccess;
   }
-  if (idx.StoresSingleValue()) {
+  // Rows whose key bears a NULL were inserted through the multi-value list
+  // encoding (see IndexInsert); deleting them must read that list, not the
+  // single-value image, or the stale entry keeps blocking scans.
+  if (idx.StoresSingleValue() && !KeyHasNull(idx, original_row)) {
     RETURN_IF_FAIL(bpt.Delete(txn, key));
   } else {
     ASSIGN_OR_RETURN(std::string_view, existing_data,

@@ -11,8 +11,8 @@ lives here but compiles into `tinylamb_table` (see `table/AGENTS.md`).
   the chain, only writers absorb it. `hint_leaf` skips the root-to-leaf walk
   when the previous landing leaf still routes the key (verified against root
   + fences). Reclaim via `ReclaimIfOrphaned` (row-less + foster-less only).
-- `b_plus_tree_iterator.{hpp,cpp}` — range scan cursor (asc/desc,
-  `PositionAtOrAbove`/`PositionBelow`).
+- `b_plus_tree_iterator.{hpp,cpp}` — range scan cursor (asc/desc) built on
+  `BPlusTree::PositionAtOrAbove`/`BPlusTree::PositionBelow`.
 - `index_schema.{hpp,cpp}` (`IndexMode{kNonUnique/kUnique/kVersionedUnique}`),
   `index.{hpp,cpp}` (`Index{schema, root pid}` only — no row data).
   `IndexValueType{RowPosition | Row include}` lives here; `Table::IndexValueType`

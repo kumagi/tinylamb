@@ -450,8 +450,7 @@ Status ParallelAggregationExecutor::AccumulateInt64Column(
             (!total.IsNull() &&
              __builtin_add_overflow(
                  static_cast<uint64_t>(total.value.int_value), sum, &sum))) {
-          return StatusError(StatusCode::kIsInfinity,
-                             "uint64 overflow in SUM");
+          return StatusError(StatusCode::kIsInfinity, "uint64 overflow in SUM");
         }
         total = Value(static_cast<int64_t>(sum)).WithUnsigned();
         break;
@@ -523,9 +522,8 @@ Status ParallelAggregationExecutor::AccumulateInt64Column(
           continue;
         }
         if (column.IsUnsigned()) {
-          if (best.IsNull() ||
-              static_cast<uint64_t>(best.value.int_value) <
-                  static_cast<uint64_t>(data[row])) {
+          if (best.IsNull() || static_cast<uint64_t>(best.value.int_value) <
+                                   static_cast<uint64_t>(data[row])) {
             best = Value(data[row]).WithUnsigned();
           }
         } else {

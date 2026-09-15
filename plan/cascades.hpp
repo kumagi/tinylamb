@@ -202,6 +202,16 @@ class Memo {
   // joins through this helper; it guarantees each conjunct is applied exactly
   // once on every root-to-leaf path.
   [[nodiscard]] LogicalExpression NewJoin(GroupId left, GroupId right) const;
+  // Constructs an outer-join expression with an explicit ON predicate and
+  // join-type payload (0 = LEFT, 1 = RIGHT, 2 = FULL). Unlike NewJoin the ON
+  // condition is supplied by the caller: WHERE conjuncts must never be folded
+  // into it (for a LEFT join they filter after NULL padding, while ON filters
+  // before it). All outer-join lowering must go through this helper so the
+  // preserved/null-supplying orientation stays explicit at every call site.
+  [[nodiscard]] static LogicalExpression NewOuterJoin(GroupId left,
+                                                      GroupId right,
+                                                      Expression on_condition,
+                                                      uint8_t join_type);
   // Merges `predicate` into a single-relation group's scan filter (used by
   // pushdown rules); idempotent through conjunct canonicalization.
   void MergeScanFilter(GroupId group, const Expression& predicate);

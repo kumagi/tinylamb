@@ -106,7 +106,7 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
 - `--allowlist FILE`: 追加許容エッジ (`src -> include` 行, `#` コメント, fnmatch)
 - 判定ルール: 上位→下位のみ OK。同一バンド (page/recovery/transaction) 内は自由
 - 対象外: `build*`, テスト/ファズ/ベンチ
-  (`*_test*`, `*_fuzzer*`, `_benchmark.`), `main.cpp`
+  (ファイル名に `_test.`, `_fuzzer`, `_benchmark.` を含むもの), `main.cpp`
 - **運用**: 既知の負債エッジはスクリプト内 `DEFAULT_ALLOWLIST` にコメント付きで
   許容している。修正が完了したらその行を削る (潰すごとにリストが減る)。
   新規に赤くなったら、allowlist 追加ではなく層の配置を見直すのが原則

@@ -285,10 +285,9 @@ TEST_F(ExecutorTest, IndexOnlyFullScan) {
 }
 
 TEST_F(ExecutorTest, IndexOnlyScanAndBitmapScanMvccSnapshotVisibility) {
-  Schema mvcc_schema(
-      "MvccTable",
-      {Column("id", ValueType::kInt64), Column("name", ValueType::kVarChar),
-       Column("val", ValueType::kDouble)});
+  Schema mvcc_schema("MvccTable", {Column("id", ValueType::kInt64),
+                                   Column("name", ValueType::kVarChar),
+                                   Column("val", ValueType::kDouble)});
   TransactionContext init_ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(init_ctx, mvcc_schema));
   ASSERT_SUCCESS(
@@ -314,10 +313,10 @@ TEST_F(ExecutorTest, IndexOnlyScanAndBitmapScanMvccSnapshotVisibility) {
   Row found_row;
   RowPosition pos1;
   ASSERT_TRUE(find_row.Next(&found_row, &pos1));
-  ASSERT_SUCCESS(
-      w_tbl.Update(writer_ctx.txn_, pos1,
-                   Row({Value(1), Value("one_updated"), Value(99.9)}))
-          .GetStatus());
+  ASSERT_SUCCESS(w_tbl
+                     .Update(writer_ctx.txn_, pos1,
+                             Row({Value(1), Value("one_updated"), Value(99.9)}))
+                     .GetStatus());
 
   IndexScan find_row2(writer_ctx.txn_, w_tbl, w_tbl.GetIndex(0), Value(2),
                       Value(2), true, Expression(), mvcc_schema);
@@ -373,7 +372,7 @@ TEST_F(ExecutorTest, IndexOnlyScanAndBitmapScanMvccSnapshotVisibility) {
   TransactionContext fresh_ctx = rs_->BeginReadOnlyContext();
   ASSIGN_OR_ASSERT_FAIL(Table, f_tbl, rs_->GetTable(fresh_ctx, "MvccTable"));
   IndexOnlyScan fresh_ios(fresh_ctx.txn_, f_tbl, f_tbl.GetIndex(0), Value(),
-                         Value(), true, Expression(), mvcc_schema);
+                          Value(), true, Expression(), mvcc_schema);
   std::vector<Row> fresh_ios_rows;
   while (fresh_ios.Next(&r, nullptr)) {
     fresh_ios_rows.push_back(r);
@@ -2454,8 +2453,11 @@ TEST_F(ExecutorTest, RelationalExplainPlans) {
       "SELECT a.key FROM SampleTable AS a LEFT JOIN SampleTable AS b ON "
       "a.key = b.key;");
   // LEFT JOIN with unused right side may be eliminated.
-  // If present, it should carry type=left.
-  if (left.find("type=left") == std::string::npos) {
+  // If present, it should carry type=left (relational) or a LeftHashJoin /
+  // Left Outer Join node (M6 Cascades route).
+  if (left.find("type=left") == std::string::npos &&
+      left.find("LeftHashJoin") == std::string::npos &&
+      left.find("Left Outer Join") == std::string::npos) {
     EXPECT_NE(left.find("SeqScan SampleTable AS a"), std::string::npos) << left;
   }
 
@@ -2844,16 +2846,20 @@ TEST_F(ExecutorTest, RelationalHybridHashLeftJoinSpillsUnderBudget) {
   ScopedQueryMemory memory(65536);
   // No right row matches b.key = 999, so every left row is null-extended; the
   // hybrid hash join must emit unmatched rows from both the resident bucket
-  // and the replayed spilled partitions.
+  // and the replayed spilled partitions. The EXISTS marker forces the
+  // relational engine (M6 routes plain LEFT joins to the cost-based
+  // optimizer); it is semantically neutral.
   const auto rows = RelationalRun(
       *rs_,
       "SELECT a.key FROM WideLeft AS a LEFT JOIN WideLeft AS b ON "
-      "a.key = b.key AND b.key = 999;");
+      "a.key = b.key AND b.key = 999 WHERE EXISTS (SELECT 1 FROM WideLeft);");
   ASSERT_EQ(rows.size(), 200U);
   const std::string plan = RelationalExplain(*rs_,
                                              "SELECT a.key FROM WideLeft AS a "
                                              "LEFT JOIN WideLeft AS b ON "
-                                             "a.key = b.key AND b.key = 999;",
+                                             "a.key = b.key AND b.key = 999 "
+                                             "WHERE EXISTS (SELECT 1 FROM "
+                                             "WideLeft);",
                                              /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
@@ -3170,9 +3176,16 @@ TEST_F(ExecutorTest, RelationalExplainResultOnlyAndDerivedAlias) {
 }
 
 TEST_F(ExecutorTest, RelationalExplainWithClauseCteScan) {
-  const std::string plan =
-      RelationalExplain(*rs_, "WITH w AS (SELECT 1 AS x) SELECT * FROM w;");
-  EXPECT_NE(plan.find("CteOrMissingScan w"), std::string::npos) << plan;
+  // A tiny multiply-referenced CTE lifts into shared eager cells (M4): both
+  // sites scan the same rows with no CTE-scan node. The map-scoped rescan
+  // path stays covered by over-budget shapes (see
+  // QueryTest.SqlEngineOverBudgetCteKeepsRescanPath).
+  const std::string plan = RelationalExplain(
+      *rs_,
+      "WITH w AS (SELECT 1 AS x) SELECT * FROM w AS a JOIN w AS b ON "
+      "a.x = b.x;");
+  EXPECT_EQ(plan.find("CteOrMissingScan"), std::string::npos) << plan;
+  EXPECT_NE(plan.find("ValuesExecutor"), std::string::npos) << plan;
 }
 
 TEST_F(ExecutorTest, RelationalExplainNestedLoopUnknownRows) {
@@ -3270,17 +3283,21 @@ TEST_F(ExecutorTest, RelationalStringKeyHybridHashJoinSpillsUnderBudget) {
 TEST_F(ExecutorTest, RelationalStringKeyHybridLeftJoinSpillsUnderBudget) {
   // String-key LEFT JOIN: no right row matches b.key = 999, so the hybrid join
   // emits null-extended rows from both the resident and replayed partitions.
+  // The EXISTS marker forces the relational engine (M6 routes plain LEFT
+  // joins to the cost-based optimizer); it is semantically neutral.
   CreateWideTable(*rs_, "WideStrLeft", 400);
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
       *rs_,
       "SELECT a.key FROM WideStrLeft AS a LEFT JOIN WideStrLeft AS b ON "
-      "a.name = b.name AND b.key = 999;");
+      "a.name = b.name AND b.key = 999 WHERE EXISTS (SELECT 1 FROM "
+      "WideStrLeft);");
   ASSERT_EQ(rows.size(), 400U);
   const std::string plan = RelationalExplain(
       *rs_,
       "SELECT a.key FROM WideStrLeft AS a LEFT JOIN WideStrLeft AS b ON "
-      "a.name = b.name AND b.key = 999;",
+      "a.name = b.name AND b.key = 999 WHERE EXISTS (SELECT 1 FROM "
+      "WideStrLeft);",
       /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);

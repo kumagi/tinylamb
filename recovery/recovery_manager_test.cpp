@@ -1232,8 +1232,9 @@ TEST_F(RecoveryManagerTest, CorruptTailAbortsByDefault) {
       std::filesystem::read_symlink("/proc/self/exe").string();
   const std::string filter =
       "--gtest_filter=RecoveryManagerTest.CorruptTailAbortsByDefault";
-  const std::string cmd = "TINYLAMB_CORRUPT_TAIL_PROBE='" + probe_prefix + "' '" + self + "' " +
-                          filter + " --gtest_brief=1 >/dev/null 2>&1";
+  const std::string cmd = "TINYLAMB_CORRUPT_TAIL_PROBE='" + probe_prefix +
+                          "' '" + self + "' " + filter +
+                          " --gtest_brief=1 >/dev/null 2>&1";
   // Non-zero exit = the fresh process aborted on corruption, as required.
   const int rc = std::system(cmd.c_str());  // NOLINT(cert-env33-c)
   std::error_code ec;

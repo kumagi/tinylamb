@@ -48,6 +48,21 @@ constexpr std::chrono::seconds kNegativeCacheTtl{1};
 // Hard bound for one parse round trip; a stuck or flooded child is killed
 // instead of blocking the worker forever (§7.2).
 constexpr std::chrono::seconds kParseTimeout{5};
+
+// Tests that exercise EINTR retry on multi-MB inputs under sanitizer
+// slowdown need a larger round-trip budget than the production default.
+std::chrono::seconds ParseTimeoutSeconds() {
+  if (const char* env = std::getenv("TINYLAMB_PARSE_TIMEOUT_SEC")) {
+    const std::string owned(env);
+    char* end = nullptr;
+    const long value = std::strtol(owned.c_str(), &end, 10);
+    if (value > 0 && end != nullptr && *end == '\0') {
+      return std::chrono::seconds(value);
+    }
+  }
+  return kParseTimeout;
+}
+
 constexpr size_t kMaxChildOutputBytes = 64U << 20;
 
 struct ParseShard {
@@ -131,7 +146,8 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   close(input_pipe[0]);
   close(output_pipe[1]);
 
-  const auto deadline = std::chrono::steady_clock::now() + kParseTimeout;
+  const auto deadline =
+      std::chrono::steady_clock::now() + ParseTimeoutSeconds();
   BlockedSigPipe blocked_sigpipe;
   bool input_open = true;
   bool output_open = true;

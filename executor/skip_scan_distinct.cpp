@@ -48,6 +48,13 @@ std::string EncodeEndParts(const Index& index,
   return encoded;
 }
 
+// A kUnique key carrying a NULL is stored as a multi-value list (SQL says
+// NULL != NULL, see Table::IndexInsert), so it must decode as one.
+bool KeyImageHasNull(const Row& key_image) {
+  return std::ranges::any_of(key_image.values_,
+                             [](const Value& value) { return value.IsNull(); });
+}
+
 }  // namespace
 
 SkipScanDistinct::SkipScanDistinct(Transaction& txn, const Table& table,
@@ -181,7 +188,7 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
     current_index_key_.Clear();
     current_index_key_.DecodeMemcomparableFormat(iter_.Key());
 
-    if (is_unique_) {
+    if (is_unique_ && !KeyImageHasNull(current_index_key_)) {
       StatusOr<Table::IndexValueType> val =
           Decode<Table::IndexValueType>(iter_.Value());
       if (!val.HasValue()) {

@@ -47,8 +47,8 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int tlp_ran = 0;
   int tlp_agg_ran = 0;
-  int unionall_ran = 0;
-  int subq_ran = 0;
+  [[maybe_unused]] int unionall_ran = 0;
+  [[maybe_unused]] int subq_ran = 0;
   int norec_ran = 0;
   int pqs_ran = 0;
   int idx_ran = 0;

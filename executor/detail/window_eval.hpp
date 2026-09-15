@@ -3,10 +3,15 @@
 #define TINYLAMB_WINDOW_EVAL_HPP
 
 #include <cstddef>
+#include <vector>
 
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "expression/window_function_expression.hpp"
 #include "query/statement.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb::relational_detail {
 
@@ -29,7 +34,14 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
                                      Relation&& input, const Scope* outer,
                                      const CteMap& ctes);
 
-// Drops the trailing $winN columns produced by ApplyWindows.
+// Single-window entry point for the Cascades WindowExecutor (same evaluator,
+// one call at a time; window clauses without subquery scope pass null/empty
+// outer and CTE maps).
+Status ComputeOneWindow(TransactionContext& context,
+                        const WindowFunctionCallExpression& window,
+                        std::vector<Row>& rows, const Schema& schema,
+                        const Scope* outer, const CteMap& ctes,
+                        std::vector<Value>* out);
 
 }  // namespace tinylamb::relational_detail
 

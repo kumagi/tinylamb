@@ -16,7 +16,7 @@ project-wide invariants, layering, and workflows.
 Upper layers may include lower layers, never the reverse. Enforced by
 `scripts/check_layering.py` (include-lint). The DAG is **not strict**:
 accepted debt lives in `DEFAULT_ALLOWLIST` inside that script
-(V1/V3'/V4 markers). shrinking that list is how layering debt gets paid
+(V3'/V4 markers). shrinking that list is how layering debt gets paid
 off — do not add new allowlist entries without rethinking placement.
 
 ```
@@ -81,6 +81,18 @@ ctest --test-dir build --output-on-failure -j$(nproc)
 python3 scripts/check_layering.py   # must exit 0
 ```
 
+- Throwaway `.db`/`.log` files: every test binary links
+  `database/test_workspace_cleanup_env.cpp`, a gtest environment that
+  removes database artifacts newly created in the working directory at
+  exit (pre-existing files are untouched; `TINYLAMB_KEEP_TEST_DATABASES=1`
+  keeps the run's files for post-mortem). Benchmarks, fuzzers and servers
+  outlive or outspawn that hook: sweep with
+  `python3 scripts/clean_root_artifacts.py [--dry-run]` (CI runs it after
+  ctest/tsan/fuzz jobs). Fuzz harnesses must open databases through
+  `query/fuzz_scoped_db.hpp` (`ScopedDb`), which deletes its files per
+  iteration — the disk-quota guard that keeps long sweeps from turning
+  `Database::Create` failures into bogus crashes.
+
 - Single test: `./build/<name>_test` (e.g. `differential_test`,
   `sql_engine_tpch_test`). Tests link `tinylamb::sql` + `tinylamb::test_util`.
 - Format: `clang-format -i` on touched `*.hpp`/`*.cpp`.
@@ -93,7 +105,10 @@ python3 scripts/check_layering.py   # must exit 0
   (TLP/NoREC/PQS/DQE/index-independence/txn-splitting oracles over the whole
   engine), `expr_oracle_fuzzer_libfuzzer` (scalar rewrite + engine + Python
   cross-check), `griffin_fuzzer_libfuzzer` (catalog-guided SQL sessions,
-  AST-vs-bytecode/JIT differential). Build with
+  AST-vs-bytecode/JIT differential), `sql_session_fuzzer_libfuzzer`
+  (state-tracking sessions: a C++ row-level mirror is compared against a
+  full-table dump after every statement, across PreCommit boundaries).
+  Build with
   `cmake -S . -B build-fuzz -DTINYLAMB_ENABLE_FUZZ=ON` and run e.g.
   `./build-fuzz/sql_oracle_fuzzer_libfuzzer -max_total_time=3600` in a scratch
   dir. On a mismatch each writes a self-contained
@@ -101,7 +116,10 @@ python3 scripts/check_layering.py   # must exit 0
   `abort()`. Keep the file as a regression guard:
   `SqlOracleFuzzer.ReplayCommittedRegressionFiles` replays every `.test` in
   `TINYLAMB_ORACLE_REGRESSION_DIR` (expr/griffin traces replay through
-  `ReplayExprOracleTrace` / `ReplayGriffinTrace` in their `*_fuzzer_test`).
+  `ReplayExprOracleTrace` / `ReplayGriffinTrace` in their `*_fuzzer_test`;
+  session traces through `SqlSessionFuzzer.ReplayCommittedRegressionFiles`
+  over `TINYLAMB_SESSION_REGRESSION_DIR`, wired in CMake to
+  `query/testdata/session_regressions/`).
   Logic bugs (wrong results), not just crashes, fail the run; run them long
   after touching optimizer/executor/expression code.
 

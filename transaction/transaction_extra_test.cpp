@@ -260,6 +260,43 @@ TEST(LockWaitProgressTest, WaiterExtendsWhileSystemShowsReleaseProgress) {
 }
 
 // ---------------------------------------------------------------------------
+// Write-intent wait escalation: the intent holder may be deadlocked on the
+// WAITER's page latch (RowPage ops run exclusively latched; the holder's
+// Abort undo walk re-acquires that latch before AbortVersions releases the
+// intents) -- a cycle no wait-for detector can see.  The waiter must give up
+// with kConflicts after the wait limit instead of sleeping forever.
+// ---------------------------------------------------------------------------
+
+TEST(WriteIntentWaitTest, WaiterGivesUpAfterWaitLimit) {
+  const std::string log_name = "intent_wait-test-" + RandomString() + ".log";
+  auto logger_holder = Logger::Create(log_name).MoveValue();
+  CHECK(logger_holder != nullptr);
+  Logger& logger = *logger_holder;
+  TransactionManager tm(nullptr, &logger, nullptr);
+  tm.SetDeadlockPolicy(TransactionManager::DeadlockPolicy::kWoundWait);
+  tm.SetWriteIntentWaitLimit(std::chrono::milliseconds(80));
+
+  const RowPosition contested(71, 3);
+  Transaction holder = tm.Begin();
+  ASSERT_TRUE(holder.AddWriteSet(contested));
+
+  std::thread waiter([&] {
+    Transaction t2 = tm.Begin();
+    // The waiter is younger than the holder, so kWaitDie/kWoundWait both
+    // make it wait; the holder never releases, and only the wait limit can
+    // end the wait.
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(t2.AddWriteSet(contested));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(60));
+    EXPECT_LT(elapsed, std::chrono::milliseconds(2000));
+    EXPECT_EQ(tm.Abort(t2), Status::kSuccess);
+  });
+  waiter.join();
+  EXPECT_EQ(tm.Abort(holder), Status::kSuccess);
+}
+
+// ---------------------------------------------------------------------------
 // Delivery DELETE visibility contract (Phase 0-1).
 //
 // Contract under test: Table::Delete deletes exactly the rows the caller
@@ -646,6 +683,61 @@ TEST(DurabilityBarrierTest, ChainedWriterDependsOnEarlierCommit) {
   }
 
   ASSERT_EQ(std::remove(log_name.c_str()), 0);
+}
+
+// Regression (sql_session_fuzzer seed 11075184383238071200): after a commit
+// makes the heap image authoritative, GC erases the version chain; a later
+// transaction that reserves a write intent on the row (UPDATE/DELETE row
+// locking touches every scanned row) and commits without staging that intent
+// used to leave an empty chain shell behind.  ReadVersion served the shell
+// instead of the physical image and the committed row disappeared from every
+// later snapshot.
+TEST_F(QueueTableTest, CommittedRowSurvivesGcThenUnstagedIntent) {
+  TransactionContext inserter = database_->BeginContext();
+  StatusOr<std::shared_ptr<Table>> table = inserter.GetTable("new_order_t");
+  ASSERT_TRUE(table.HasValue());
+  std::vector<RowPosition> inserted;
+  for (int64_t line = 1; line <= 4; ++line) {
+    Row row({Value(static_cast<int64_t>(1)), Value(static_cast<int64_t>(1)),
+             Value(static_cast<int64_t>(100)), Value(line)});
+    StatusOr<RowPosition> pos = table.Value()->Insert(inserter.txn_, row);
+    ASSERT_TRUE(pos.HasValue());
+    inserted.push_back(pos.MoveValue());
+  }
+  ASSERT_EQ(inserter.PreCommit(), Status::kSuccess);
+
+  // Cross the GC commit threshold so the background collector runs, then
+  // give the worker time to take its pass.
+  for (int i = 0; i < 10; ++i) {
+    TransactionContext idle = database_->BeginContext();
+    ASSERT_EQ(idle.PreCommit(), Status::kSuccess);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Intent without a staged write: exactly the row-lock shape an UPDATE
+  // takes on scanned-but-unmatched rows.
+  TransactionContext locker = database_->BeginContext();
+  for (const RowPosition& pos : inserted) {
+    ASSERT_TRUE(locker.txn_.AddWriteSet(pos));
+  }
+  ASSERT_EQ(locker.PreCommit(), Status::kSuccess);
+
+  // A fresh snapshot must still see every committed row (physical image or
+  // surviving version).
+  TransactionContext reader = database_->BeginContext();
+  StatusOr<std::shared_ptr<Table>> rtable = reader.GetTable("new_order_t");
+  ASSERT_TRUE(rtable.HasValue());
+  size_t visible = 0;
+  for (Iterator it = rtable.Value()->BeginFullScan(reader.txn_); it.IsValid();
+       ++it) {
+    ++visible;
+  }
+  EXPECT_EQ(visible, inserted.size());
+  for (const RowPosition& pos : inserted) {
+    auto row = rtable.Value()->Read(reader.txn_, pos);
+    EXPECT_TRUE(row.HasValue()) << "row vanished after commit+GC+intent";
+  }
+  ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
 }
 
 }  // namespace

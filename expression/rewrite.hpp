@@ -143,6 +143,12 @@ class ExpressionRewriter {
   // paying 32 full passes; 0 restores the default.
   void set_pass_limit(size_t passes) { pass_limit_ = passes; }
 
+  // Optional schema context. While a rewrite runs, type-blind rules that
+  // carry documented soundness assumptions (not_comparison's IEEE-NaN gap)
+  // resolve column types against this schema and refuse the rewrite when it
+  // would be unsound. Without a schema the rules behave exactly as before.
+  void set_schema(const Schema* schema) { schema_ = schema; }
+
   // Core rewriting with StatusOr propagation
   // (no-exception-rule-migration Phase 5); Rewrite/RewriteOnce are the
   // deprecated EXC-SHIM wrappers.
@@ -157,6 +163,7 @@ class ExpressionRewriter {
                                        size_t depth) const;
   const ExpressionRuleSet* rules_;
   size_t pass_limit_ = 0;
+  const Schema* schema_ = nullptr;
 };
 
 [[nodiscard]] std::vector<Expression> ExpressionChildren(
@@ -175,6 +182,26 @@ class ExpressionRewriter {
 [[nodiscard]] bool ReferencesOnly(
     const Expression& expression,
     const std::unordered_set<std::string>& relation_names);
+
+// A window-function call extracted from a projection, with its assigned
+// hidden output column. Window calls need whole-partition context, so
+// planning hoists each call into a kWindow node emitting this column and
+// rewrites the original site to reference it.
+struct ExtractedWindow {
+  Expression call;
+  ColumnName output;
+};
+// Replaces every WindowFunctionCallExpression in `expression` with a
+// reference to a fresh `$winN` output column (counter threaded by the
+// caller across items so names stay unique), appending one ExtractedWindow
+// per call in encounter order. Calls shared by structure (identical
+// ToString) map to the same output through `dedup`. Subquery boundaries
+// are never crossed: kQueryExp subtrees are left intact (their windows
+// belong to another scope). Returns nullopt on nested window calls, which
+// no valid query produces.
+[[nodiscard]] std::optional<std::pair<Expression, std::vector<ExtractedWindow>>>
+ExtractWindowCalls(const Expression& expression, size_t* counter,
+                   std::unordered_map<std::string, size_t>* dedup);
 
 enum class Volatility : uint8_t {
   kImmutable,

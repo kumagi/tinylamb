@@ -179,7 +179,10 @@ class SortedRun {
       assert(rhs.offset_ < rhs.parent_->Size());
       ASSIGN_OR_RETURN(Entry, entry, GetEntry());
       ASSIGN_OR_RETURN(Entry, rhs_entry, rhs.GetEntry());
-      return entry.Compare(rhs_entry, *blob_).Value();
+      // Propagate blob-IO failures: .Value() here would abort the whole
+      // process on an unreadable blob during a merge even though every
+      // caller handles the error through ASSIGN_OR_RETURN.
+      return entry.Compare(rhs_entry, *blob_);
     }
     [[nodiscard]] StatusOr<Entry> GetEntry() const {
       return parent_->GetEntry(offset_);

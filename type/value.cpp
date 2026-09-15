@@ -338,6 +338,13 @@ bool Value::Truthy() const {
   if (type == ValueType::kInt64) {
     return value.int_value != 0;
   }
+  if (type == ValueType::kDouble) {
+    // Zero (either sign) is false; NaN is true by IEEE semantics (it is
+    // "non-zero").  Before this, DOUBLE fell into the blanket `return true`
+    // below, so `(0.0 OR x)` short-circuited to TRUE in the AST while the
+    // same expression on INT64 operands was FALSE (fuzz-found divergence).
+    return value.double_value != 0.0;
+  }
   return true;
 }
 
@@ -856,7 +863,7 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
     return StatusError(StatusCode::kCorrupt,
                        "corrupt memcomparable value: empty buffer");
   }
-  const uint8_t prefix = static_cast<uint8_t>(*cursor++);
+  const auto prefix = static_cast<uint8_t>(*cursor++);
   switch (prefix) {
     case static_cast<uint8_t>(ValueType::kNull):
       // Mirror of the 1-byte NULL encoding above: an index key carrying a
@@ -963,6 +970,8 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       array_->elements = std::move(elements);
       return static_cast<size_t>(p - cursor) + 1;
     }
+    default:
+      break;
   }
   return StatusError(StatusCode::kCorrupt, "broken data");
 }
@@ -1161,11 +1170,11 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       }
       if (type == ValueType::kInt64) {
         if (IsUnsigned() || rhs.IsUnsigned()) {
-          uint64_t u_rhs = static_cast<uint64_t>(rhs.value.int_value);
+          const auto u_rhs = static_cast<uint64_t>(rhs.value.int_value);
           if (u_rhs == 0) {
             return StatusError(StatusCode::kIsInfinity, "division by zero");
           }
-          uint64_t u_lhs = static_cast<uint64_t>(value.int_value);
+          const auto u_lhs = static_cast<uint64_t>(value.int_value);
           return Value(static_cast<int64_t>(u_lhs / u_rhs)).WithUnsigned();
         }
         if (rhs.value.int_value == 0) {
@@ -1188,11 +1197,11 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       }
       if (type == ValueType::kInt64) {
         if (IsUnsigned() || rhs.IsUnsigned()) {
-          uint64_t u_rhs = static_cast<uint64_t>(rhs.value.int_value);
+          const auto u_rhs = static_cast<uint64_t>(rhs.value.int_value);
           if (u_rhs == 0) {
             return StatusError(StatusCode::kIsInfinity, "modulo by zero");
           }
-          uint64_t u_lhs = static_cast<uint64_t>(value.int_value);
+          const auto u_lhs = static_cast<uint64_t>(value.int_value);
           return Value(static_cast<int64_t>(u_lhs % u_rhs)).WithUnsigned();
         }
         if (rhs.value.int_value == 0) {
@@ -1256,8 +1265,9 @@ int CompareForOrderBy(const Value& a, const Value& b) {
   auto rank_of = [](const Value& v) {
     return v.type == ValueType::kNull
                ? 0
-               : (static_cast<int>(v.type) < 6 ? kRank[static_cast<int>(v.type)]
-                                               : 9);
+               : (static_cast<int>(v.type) < 6
+                      ? kRank[static_cast<size_t>(v.type)]
+                      : 9);
   };
   if (a.IsNull() || b.IsNull()) {
     // NULLs compare equal here; NULLS FIRST/LAST is the caller's decision.
