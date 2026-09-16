@@ -249,12 +249,32 @@ struct AggSpec {
     kCountDistinct,
     kSumDistinct
   } kind{kCountStar};
+  // Optional FILTER (WHERE ...) predicate; only rows evaluating TRUE
+  // feed the aggregate.
+  std::shared_ptr<const WPred> filter;
 };
+
+// Rows of `input` satisfying the spec's FILTER clause (all of them when
+// unset).
+std::vector<MRow> FilteredRows(const AggSpec& spec,
+                               const std::vector<MRow>& input) {
+  if (!spec.filter) {
+    return input;
+  }
+  std::vector<MRow> out;
+  for (const MRow& r : input) {
+    if (spec.filter->Eval(r) == 'T') {
+      out.push_back(r);
+    }
+  }
+  return out;
+}
 
 // Numeric value of an aggregate over a group, when it is one (COUNT/SUM);
 // used by the HAVING mirror.
 std::optional<int64_t> AggNum(const AggSpec& spec,
-                              const std::vector<MRow>& rows) {
+                              const std::vector<MRow>& input) {
+  const std::vector<MRow> rows = FilteredRows(spec, input);
   switch (spec.kind) {
     case AggSpec::Kind::kCountStar:
       return static_cast<int64_t>(rows.size());
@@ -293,7 +313,8 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
   }
 }
 
-std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& rows) {
+std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
+  const std::vector<MRow> rows = FilteredRows(spec, input);
   switch (spec.kind) {
     case AggSpec::Kind::kCountStar:
       return FmtInt(static_cast<int64_t>(rows.size()));
@@ -433,6 +454,14 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       if (g.Chance(25)) {
         aggs.push_back({"SUM(DISTINCT a)", 0, AggSpec::Kind::kSumDistinct});
       }
+      // FILTER (WHERE ...) on some specs.
+      for (AggSpec& spec : aggs) {
+        if (g.Chance(25)) {
+          WPredPtr f = GenWhere(g, 1);
+          spec.sql += " FILTER (WHERE " + f->Render() + ")";
+          spec.filter = std::shared_ptr<const WPred>(std::move(f));
+        }
+      }
       // HAVING: 1-2 conditions over numeric aggregates (COUNT(*)/SUM(a),
       // incl. IS [NOT] NULL for SUM over all-NULL groups), AND/OR joined.
       struct HavingCond {
@@ -457,6 +486,11 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             c.spec = {"SUM(a)", 0, AggSpec::Kind::kSum};
             c.op = std::string(kCmpOps[g.Pick(0, 5)]);
             c.rhs = g.Pick(-4, 4);
+          }
+          if (!c.op.starts_with("IS") && g.Chance(20)) {
+            WPredPtr f = GenWhere(g, 1);
+            c.spec.sql += " FILTER (WHERE " + f->Render() + ")";
+            c.spec.filter = std::shared_ptr<const WPred>(std::move(f));
           }
           having.push_back(std::move(c));
         }
