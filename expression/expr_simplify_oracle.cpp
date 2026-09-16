@@ -1567,7 +1567,11 @@ std::string SerializeSExpr(const Expression& expr, GenType type) {
     case TypeTag::kFunctionCallExp: {
       const auto& call = expr->AsFunctionCallExpression();
       const std::string& fname = call.FuncName();
-      std::string out = "(" + fname;
+      // Function DIV/MOD collide with the binary / and % operators in the
+      // S-expression vocabulary (both emit "div"/"mod"); give the function
+      // spellings distinct tokens so an evaluator can tell them apart.
+      std::string out =
+          "(" + ((fname == "div" || fname == "mod") ? "f" + fname : fname);
       if (fname == "__bit_and" || fname == "__bit_or" || fname == "__bit_xor" ||
           fname == "__shift_left" || fname == "__shift_right") {
         for (const Expression& arg : call.Args()) {

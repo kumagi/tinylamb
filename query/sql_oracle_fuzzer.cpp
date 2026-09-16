@@ -850,10 +850,10 @@ bool CheckExpected(Database& db, TransactionContext& ctx,
   return true;
 }
 
-// CTE inlining: the WITH form must equal the flattened equivalent.
-bool CheckCte(Database& db, TransactionContext& ctx,
-              const std::vector<std::string>& cte, std::string* report,
-              bool verbose) {
+// Two-query equivalence: both forms must return the same row multiset.
+bool CheckPair(Database& db, TransactionContext& ctx,
+               const std::vector<std::string>& cte, const char* tag,
+               std::string* report, bool verbose) {
   if (cte.size() != 2) {
     return true;
   }
@@ -862,7 +862,7 @@ bool CheckCte(Database& db, TransactionContext& ctx,
   auto flat = RunRows(db, ctx, cte[1], &error);
   if (!(with.has_value() && flat.has_value())) {
     if (verbose) {
-      std::cerr << "[sql_oracle][cte-error] " << error << "\n";
+      std::cerr << "[sql_oracle][" << tag << "-error] " << error << "\n";
     }
     return false;
   }
@@ -871,10 +871,10 @@ bool CheckCte(Database& db, TransactionContext& ctx,
   if (s0 == s1) {
     return true;
   }
-  *report += "[CTE MISMATCH]\n";
-  *report += "  with: " + cte[0] + " (" + std::to_string(s0.size()) +
+  *report += std::string("[") + tag + " MISMATCH]\n";
+  *report += "  lhs: " + cte[0] + " (" + std::to_string(s0.size()) +
              " rows)\n" + DumpRows(s0);
-  *report += "  flat: " + cte[1] + " (" + std::to_string(s1.size()) +
+  *report += "  rhs: " + cte[1] + " (" + std::to_string(s1.size()) +
              " rows)\n" + DumpRows(s1);
   return true;
 }
@@ -1485,13 +1485,15 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   // jtab feeds the three semi-join spellings; stab is a same-schema sibling
   // whose rows the set-operation mirror tracks.
   std::string jtab;
+  std::vector<int64_t> jxs;  // j.x values feeding the subquery oracles
   if (g.Chance(50)) {
     jtab = tab + "_j";
     t.setup.push_back("CREATE TABLE " + jtab + " (x INT64, y VARCHAR(8));");
     const int join_rows = g.Pick(2, 6);
     for (int i = 0; i < join_rows; ++i) {
-      const std::string x =
-          g.Chance(20) ? "NULL" : std::to_string(g.Pick(-3, 3));
+      const int64_t xv = g.Chance(20) ? kNull : g.Pick(-3, 3);
+      jxs.push_back(xv);
+      const std::string x = xv == kNull ? "NULL" : std::to_string(xv);
       const std::string y =
           g.Chance(25)
               ? "NULL"
@@ -1522,14 +1524,157 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   // ---- Subquery differential: IN vs correlated EXISTS vs JOIN+DISTINCT ----
   // Positive forms only: NOT IN and NOT EXISTS diverge under 3VL by design.
   if (!jtab.empty()) {
-    t.subq = {
-        "SELECT COUNT(*) FROM " + tab + " WHERE a IN (SELECT x FROM " + jtab +
-            ");",
-        "SELECT COUNT(*) FROM " + tab + " WHERE EXISTS (SELECT 1 FROM " + jtab +
-            " WHERE " + jtab + ".x = " + tab + ".a);",
-        "SELECT COUNT(*) FROM (SELECT DISTINCT u FROM " + tab + " JOIN " +
-            jtab + " ON " + tab + ".a = " + jtab + ".x) semi;",
+    if (g.Chance(60)) {
+      t.subq = {
+          "SELECT COUNT(*) FROM " + tab + " WHERE a IN (SELECT x FROM " + jtab +
+              ");",
+          "SELECT COUNT(*) FROM " + tab + " WHERE EXISTS (SELECT 1 FROM " +
+              jtab + " WHERE " + jtab + ".x = " + tab + ".a);",
+          "SELECT COUNT(*) FROM (SELECT DISTINCT u FROM " + tab + " JOIN " +
+              jtab + " ON " + tab + ".a = " + jtab + ".x) semi;",
+      };
+    } else {
+      // Correlated variant: the subquery's own WHERE references the outer
+      // row, exercising the apply/correlated-cache path.
+      const std::string corr = g.Chance(50) ? (jtab + ".x = " + tab + ".b")
+                                            : (jtab + ".y = " + tab + ".s");
+      t.subq = {
+          "SELECT COUNT(*) FROM " + tab + " WHERE a IN (SELECT x FROM " + jtab +
+              " WHERE " + corr + ");",
+          "SELECT COUNT(*) FROM " + tab + " WHERE EXISTS (SELECT 1 FROM " +
+              jtab + " WHERE " + corr + " AND " + jtab + ".x = " + tab + ".a);",
+          "SELECT COUNT(*) FROM (SELECT DISTINCT u FROM " + tab + " JOIN " +
+              jtab + " ON " + tab + ".a = " + jtab + ".x AND " + corr +
+              ") semi;",
+      };
+    }
+    // Scalar subquery vs LEFT JOIN: a correlated scalar COUNT over the
+    // join must equal the decorrelated GROUP BY spelling row for row.
+    if (g.Chance(40)) {
+      const std::string corr2 = g.Chance(50) ? (jtab + ".x = " + tab + ".a")
+                                             : (jtab + ".y = " + tab + ".s");
+      t.ssub = {
+          "SELECT u, (SELECT COUNT(x) FROM " + jtab + " WHERE " + corr2 +
+              ") AS c FROM " + tab + ";",
+          "SELECT " + tab + ".u, COUNT(" + jtab + ".x) AS c FROM " + tab +
+              " LEFT JOIN " + jtab + " ON " + corr2 + " GROUP BY " + tab +
+              ".u;",
+      };
+    }
+    // NOT IN anti-join: the result is empty whenever the subquery column
+    // contains any NULL (every comparison then goes UNKNOWN), and a NULL
+    // outer `a` is likewise never TRUE. The mirror encodes those three-
+    // valued semantics directly.
+    if (g.Chance(35)) {
+      t.notin = {"SELECT u FROM " + tab + " WHERE a NOT IN (SELECT x FROM " +
+                 jtab + ");"};
+      const bool j_has_null =
+          std::find(jxs.begin(), jxs.end(), kNull) != jxs.end();
+      for (const MirrorRow& m : mirror) {
+        if (j_has_null || m.a == kNull) {
+          continue;
+        }
+        if (std::find(jxs.begin(), jxs.end(), m.a) == jxs.end()) {
+          t.notin_expect.push_back(ExpectRow({m.u}));
+        }
+      }
+    }
+  }
+
+  // ---- CASE vs UNION ALL partition ----
+  // The ELSE arm must fire exactly on FALSE-or-NULL: `IS NOT TRUE` (not
+  // `NOT (p IS TRUE)`) is the correct complement under three-valued logic.
+  if (g.Chance(35)) {
+    const std::string then_col = std::string(g.Chance(50) ? "a" : "b");
+    const std::string else_col = std::string(g.Chance(50) ? "u" : "b");
+    t.cqp = {
+        "SELECT CASE WHEN " + t.predicate + " THEN " + then_col + " ELSE " +
+            else_col + " END AS v FROM " + tab + ";",
+        "SELECT " + then_col + " AS v FROM " + tab + " WHERE (" + t.predicate +
+            ") IS TRUE UNION ALL SELECT " + else_col + " AS v FROM " + tab +
+            " WHERE (" + t.predicate + ") IS NOT TRUE;",
     };
+  }
+
+  // ---- DISTINCT vs GROUP BY dedup ----
+  // SELECT DISTINCT must agree with the GROUP BY spelling on the same
+  // column list, including NULL grouping (NULLs dedupe together in both).
+  if (g.Chance(35)) {
+    static const std::array<const char*, 3> kDdgCols = {"a", "b", "s"};
+    const int dcol0 = g.Pick(0, 2);
+    std::string cols = kDdgCols[static_cast<size_t>(dcol0)];
+    if (g.Chance(40)) {
+      int dcol1 = g.Pick(0, 2);
+      while (dcol1 == dcol0) {
+        dcol1 = g.Pick(0, 2);
+      }
+      cols += ", ";
+      cols += kDdgCols[static_cast<size_t>(dcol1)];
+    }
+    t.ddg = {"SELECT DISTINCT " + cols + " FROM " + tab + ";",
+             "SELECT " + cols + " FROM " + tab + " GROUP BY " + cols + ";"};
+  }
+
+  // ---- LIMIT/OFFSET vs ROW_NUMBER window ----
+  // ORDER BY a,u with a LIMIT window must equal filtering the window
+  // function over the same ordering (both use engine default NULLS FIRST).
+  if (g.Chance(30)) {
+    const int k = g.Pick(1, 3);
+    const int m = g.Pick(0, 2);
+    t.lwn = {"SELECT u FROM " + tab + " ORDER BY a, u LIMIT " +
+                 std::to_string(k) + " OFFSET " + std::to_string(m) + ";",
+             "SELECT u FROM (SELECT u, ROW_NUMBER() OVER (ORDER BY a, u) AS "
+             "rn FROM " +
+                 tab + ") w WHERE rn > " + std::to_string(m) +
+                 " AND rn <= " + std::to_string(m + k) + ";"};
+  }
+
+  // ---- PIVOT vs CASE-pivot ----
+  // An unkeyed single-aggregate PIVOT must equal the manual
+  // SUM(CASE WHEN ...) spelling column for column.
+  if (g.Chance(30)) {
+    const int k0 = g.Pick(0, 2);
+    int k1 = g.Pick(0, 2);
+    while (k1 == k0) {
+      k1 = g.Pick(0, 2);
+    }
+    const std::string c0 =
+        "SUM(CASE WHEN u = " + std::to_string(k0) + " THEN a END)";
+    const std::string c1 =
+        "SUM(CASE WHEN u = " + std::to_string(k1) + " THEN a END)";
+    t.piv = {"SELECT * FROM " + tab + " PIVOT(SUM(a) FOR u IN (" +
+                 std::to_string(k0) + ", " + std::to_string(k1) + "));",
+             "SELECT " + c0 + ", " + c1 + " FROM " + tab + ";"};
+  }
+
+  // ---- Set-op precedence: INTERSECT binds tighter than UNION ALL ----
+  if (!stab.empty() && g.Chance(30)) {
+    const std::string lhs = "SELECT a FROM " + tab;
+    const std::string mid = "SELECT a FROM " + stab;
+    const std::string rhs =
+        "SELECT a FROM " + tab + " WHERE " + pred2->Render();
+    t.usp = {lhs + " UNION ALL " + mid + " INTERSECT DISTINCT " + rhs + ";",
+             lhs + " UNION ALL (" + mid + " INTERSECT DISTINCT " + rhs + ");"};
+  }
+
+  // ---- NOT IN literal list vs NOT(OR of equals) ----
+  // Under three-valued logic both spellings must agree row-for-row:
+  // NULL a makes each comparison UNKNOWN and both sides filter out.
+  if (g.Chance(30)) {
+    const int n = g.Pick(1, 3);
+    std::string list;
+    std::string ors;
+    for (int i = 0; i < n; ++i) {
+      const std::string lit = std::to_string(g.Pick(-2, 5));
+      if (i > 0) {
+        list += ", ";
+        ors += " OR ";
+      }
+      list += lit;
+      ors += "a = " + lit;
+    }
+    t.niv = {"SELECT u FROM " + tab + " WHERE a NOT IN (" + list + ");",
+             "SELECT u FROM " + tab + " WHERE NOT (" + ors + ");"};
   }
 
   // ---- Set operations vs the mirror multiset ----
@@ -2100,6 +2245,14 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->tlp_agg_ran = t.tlp_agg.size() == 4;
     stats->unionall_ran = t.unionall.size() == 2;
     stats->subq_ran = t.subq.size() == 3;
+    stats->ssub_ran = t.ssub.size() == 2;
+    stats->cqp_ran = t.cqp.size() == 2;
+    stats->ddg_ran = t.ddg.size() == 2;
+    stats->piv_ran = t.piv.size() == 2;
+    stats->lwn_ran = t.lwn.size() == 2;
+    stats->niv_ran = t.niv.size() == 2;
+    stats->usp_ran = t.usp.size() == 2;
+    stats->notin_ran = t.notin.size() == 1;
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
     stats->idx_ran = !t.index_ddl.empty() && !t.index_probe.empty();
@@ -2146,7 +2299,16 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
                      /*ordered=*/false, "TIES", &report, verbose) ||
       !CheckExpected(db, ctx, trace.having, trace.having_expect,
                      /*ordered=*/false, "HAVING", &report, verbose) ||
-      !CheckCte(db, ctx, trace.cte, &report, verbose) ||
+      !CheckPair(db, ctx, trace.cte, "CTE", &report, verbose) ||
+      !CheckPair(db, ctx, trace.ssub, "SSUB", &report, verbose) ||
+      !CheckPair(db, ctx, trace.cqp, "CASE", &report, verbose) ||
+      !CheckPair(db, ctx, trace.ddg, "DDG", &report, verbose) ||
+      !CheckPair(db, ctx, trace.piv, "PIV", &report, verbose) ||
+      !CheckPair(db, ctx, trace.lwn, "LWN", &report, verbose) ||
+      !CheckPair(db, ctx, trace.niv, "NIV", &report, verbose) ||
+      !CheckPair(db, ctx, trace.usp, "USP", &report, verbose) ||
+      !CheckExpected(db, ctx, trace.notin, trace.notin_expect,
+                     /*ordered=*/false, "NOTIN", &report, verbose) ||
       !CheckRecursive(db, ctx, trace, &report, verbose) ||
       !CheckExpected(db, ctx, trace.unnest, trace.unnest_expect,
                      trace.unnest_ordered, "UNNEST", &report, verbose)) {
@@ -2180,6 +2342,33 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.unionall) {
     out += "-- unionall: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.ssub) {
+    out += "-- ssub: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.cqp) {
+    out += "-- cqp: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.ddg) {
+    out += "-- ddg: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.piv) {
+    out += "-- piv: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.lwn) {
+    out += "-- lwn: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.niv) {
+    out += "-- niv: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.usp) {
+    out += "-- usp: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.notin) {
+    out += "-- notin: " + sql + "\n";
+  }
+  for (const std::string& row : trace.notin_expect) {
+    out += "-- notinexpect: " + row + "\n";
   }
   for (const std::string& sql : trace.subq) {
     out += "-- subq: " + sql + "\n";
@@ -2299,6 +2488,24 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->tlp_agg.push_back(value);
     } else if (consume("-- unionall: ", &value)) {
       trace->unionall.push_back(value);
+    } else if (consume("-- ssub: ", &value)) {
+      trace->ssub.push_back(value);
+    } else if (consume("-- cqp: ", &value)) {
+      trace->cqp.push_back(value);
+    } else if (consume("-- ddg: ", &value)) {
+      trace->ddg.push_back(value);
+    } else if (consume("-- piv: ", &value)) {
+      trace->piv.push_back(value);
+    } else if (consume("-- lwn: ", &value)) {
+      trace->lwn.push_back(value);
+    } else if (consume("-- niv: ", &value)) {
+      trace->niv.push_back(value);
+    } else if (consume("-- usp: ", &value)) {
+      trace->usp.push_back(value);
+    } else if (consume("-- notin: ", &value)) {
+      trace->notin.push_back(value);
+    } else if (consume("-- notinexpect: ", &value)) {
+      trace->notin_expect.push_back(value);
     } else if (consume("-- subq: ", &value)) {
       trace->subq.push_back(value);
     } else if (consume("-- norec: ", &value)) {

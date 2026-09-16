@@ -84,6 +84,27 @@ struct OracleTrace {
   // Subquery differential: three spellings of "t rows matching j" (IN
   // subquery / correlated EXISTS / semi-join via JOIN+DISTINCT) must agree.
   std::vector<std::string> subq;  // exactly 3 when active
+  // Scalar-subquery vs LEFT JOIN + COUNT: correlated scalar aggregates must
+  // equal the decorrelated join spelling (apply executor boundary).
+  std::vector<std::string> ssub;  // exactly 2 when active
+  // CASE WHEN vs UNION ALL partition: the ELSE arm must fire exactly on
+  // FALSE-or-NULL, i.e. `<p> IS NOT TRUE` (NOT `<p> IS TRUE` would drop NULL).
+  std::vector<std::string> cqp;  // exactly 2 when active
+
+  // DISTINCT vs GROUP BY dedup differential: exactly 2 when active
+  std::vector<std::string> ddg;
+  // PIVOT vs manual CASE-pivot differential: exactly 2 when active
+  std::vector<std::string> piv;
+  // LIMIT/OFFSET vs ROW_NUMBER window differential: exactly 2 when active
+  std::vector<std::string> lwn;
+  // NOT IN literal list vs NOT(OR-equals) 3VL differential: 2 when active
+  std::vector<std::string> niv;
+  // UNION/INTERSECT precedence differential: exactly 2 when active
+  std::vector<std::string> usp;
+  // NOT IN anti-join with NULL-sensitivity: expected rows carry the
+  // three-valued result (empty whenever the subquery holds any NULL).
+  std::vector<std::string> notin;  // exactly 1 when active
+  std::vector<std::string> notin_expect;
   // Constraint rewriting: probe before/after the DDL must agree.
   std::vector<std::string> index_ddl;
   std::string index_probe;
@@ -118,6 +139,14 @@ struct OracleIterationStats {
   bool tlp_agg_ran{false};
   bool unionall_ran{false};
   bool subq_ran{false};
+  bool ssub_ran{false};
+  bool cqp_ran{false};
+  bool notin_ran{false};
+  bool ddg_ran{false};
+  bool piv_ran{false};
+  bool lwn_ran{false};
+  bool niv_ran{false};
+  bool usp_ran{false};
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};

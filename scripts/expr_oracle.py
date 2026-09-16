@@ -41,6 +41,7 @@ Semantic mapping ([PY-DIFF] = differs from raw Python):
 - Booleans are 1/0; TRUE/FALSE render as TRUE/FALSE, like the engine.
 """
 
+import math
 import re
 import sys
 
@@ -400,6 +401,419 @@ def eval_node(node):
         return Null("int")
     if op == "nullif":
         return eval_nullif(eval_node(node[1]), eval_node(node[2]))
+    if op == "ifnull":
+        a = eval_node(node[1])
+        return eval_node(node[2]) if is_null(a) else a
+    if op == "sign":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("int")
+        if isinstance(a, int) and not isinstance(a, bool):
+            return 1 if a > 0 else (-1 if a < 0 else 0)
+        if isinstance(a, float):
+            if math.isnan(a):
+                return a
+            return 1.0 if a > 0.0 else (-1.0 if a < 0.0 else 0.0)
+        raise OracleError("SIGN requires numeric argument")
+    if op in ("safe_add", "safe_subtract", "safe_multiply"):
+        l = eval_node(node[1])
+        r = eval_node(node[2])
+        if is_null(l) or is_null(r):
+            return Null("int")
+        if (not isinstance(l, (int, float)) or isinstance(l, bool)
+                or not isinstance(r, (int, float)) or isinstance(r, bool)):
+            raise OracleError(op + " requires numeric arguments")
+        if isinstance(l, int) and isinstance(r, int):
+            res = (l + r if op == "safe_add" else l - r
+                   if op == "safe_subtract" else l * r)
+            # SAFE_* returns NULL on overflow instead of raising.
+            return Null("int") if res > INT64_MAX or res < INT64_MIN else res
+        lf, rf = to_float(l), to_float(r)
+        res = (lf + rf if op == "safe_add" else lf - rf
+               if op == "safe_subtract" else lf * rf)
+        return Null("float") if math.isinf(res) or math.isnan(res) else res
+    if op == "safe_negate":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("int")
+        if isinstance(a, int) and not isinstance(a, bool):
+            return Null("int") if a == INT64_MIN else -a
+        if isinstance(a, float):
+            return -a
+        raise OracleError("SAFE_NEGATE requires numeric argument")
+    if op in ("ceil", "ceiling", "floor"):
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("float")
+        if isinstance(a, int) and not isinstance(a, bool):
+            return a
+        if isinstance(a, float):
+            return float(math.ceil(a) if op != "floor" else math.floor(a))
+        raise OracleError(op + " requires numeric argument")
+    if op in ("round", "trunc", "truncate"):
+        a = eval_node(node[1])
+        digits = eval_node(node[2]) if len(node) > 2 else 0
+        if is_null(a) or is_null(digits):
+            return Null("float")
+        if not isinstance(digits, int) or isinstance(digits, bool):
+            raise OracleError(op + " digits must be an integer")
+        if isinstance(a, int) and not isinstance(a, bool):
+            if digits >= 0:
+                return a
+            # [PY-DIFF] integer rounding is half away from zero at the
+            # 10^|digits| scale; |digits| beyond int64 saturates the scale.
+            trunc_digits = (INT64_MAX if digits == INT64_MIN else -digits)
+            scale = 1
+            for _ in range(trunc_digits):
+                if scale > INT64_MAX // 10:
+                    return 0
+                scale *= 10
+            q = abs(a) // scale
+            rem = abs(a) % scale
+            if op == "round" and rem >= scale // 2:
+                q += 1
+            res = q * scale
+            if res > INT64_MAX:
+                raise OracleError("integer overflow in " + op.upper())
+            return -res if a < 0 else res
+        if isinstance(a, float):
+            if math.isnan(a):
+                return a
+            factor = 10.0**digits
+            x = a * factor
+            if op == "round":
+                # std::round: half away from zero.
+                res = math.copysign(math.floor(abs(x) + 0.5), x)
+            else:
+                res = math.trunc(x)
+            return res / factor
+        raise OracleError(op + " requires numeric argument")
+    if op in ("fdiv", "fmod"):
+        # Function-call DIV/MOD (see f-prefixed tokens in SerializeSExpr):
+        # int/int is truncated C division/remainder, NOT the floating
+        # division of binary "div".  Mixed numeric coerces to double:
+        # fdiv truncates toward zero, fmod is fmod.
+        l = eval_node(node[1])
+        r = eval_node(node[2])
+        if is_null(l) or is_null(r):
+            return Null("int" if op == "fdiv" else "float")
+        li = isinstance(l, int) and not isinstance(l, bool)
+        ri = isinstance(r, int) and not isinstance(r, bool)
+        if li and ri:
+            if r == 0:
+                raise OracleError("division by zero in " +
+                                  ("DIV" if op == "fdiv" else "MOD"))
+            if l == INT64_MIN and r == -1:
+                raise OracleError("integer overflow in " +
+                                  ("DIV" if op == "fdiv" else "'%'"))
+            q = abs(l) // abs(r)
+            if (l < 0) != (r < 0):
+                q = -q
+            return q if op == "fdiv" else l - q * r
+        if op == "fmod" and isinstance(l, float) and isinstance(r, float):
+            raise OracleError("unsupported binary operation")
+        lf, rf = to_float(l), to_float(r)
+        if rf == 0.0:
+            raise OracleError("division by zero" +
+                              (" in DIV" if op == "fdiv" else ""))
+        if op == "fmod":
+            return math.fmod(lf, rf)
+        q = math.trunc(lf / rf)
+        if (math.isnan(q) or math.isinf(q) or q < INT64_MIN
+                or q > INT64_MAX):
+            raise OracleError("DIV result out of range for INT64")
+        return int(q)
+    if op in ("ieee_divide", "safe_divide"):
+        l = eval_node(node[1])
+        r = eval_node(node[2])
+        if is_null(l) or is_null(r):
+            return Null("float")
+        lf, rf = to_float(l), to_float(r)
+        if rf == 0.0:
+            if op == "safe_divide":
+                return Null("float")
+            if lf == 0.0:
+                return float("nan")
+            return math.copysign(float("inf"), lf)
+        res = lf / rf
+        if op == "safe_divide" and (math.isinf(res) or math.isnan(res)):
+            return Null("float")
+        return res
+    if op == "sqrt":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("float")
+        v = to_float(a)
+        if v < 0.0:
+            raise OracleError("SQRT of negative number")
+        return math.sqrt(v)
+    if op == "cbrt":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("float")
+        # math.cbrt needs Python >= 3.11; fall back to libm via ctypes.
+        try:
+            return math.cbrt(to_float(a))
+        except AttributeError:
+            import ctypes
+            libm = ctypes.CDLL("libm.so.6")
+            libm.cbrt.restype = ctypes.c_double
+            libm.cbrt.argtypes = [ctypes.c_double]
+            return libm.cbrt(to_float(a))
+    if op in ("ln", "log", "log10"):
+        # [PY-DIFF] out-of-range inputs return -inf/NaN like libm, not
+        # Python's ValueError.  log takes an optional base.
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("float")
+        v = to_float(a)
+        if len(node) > 2:
+            bv = eval_node(node[2])
+            if is_null(bv):
+                return Null("float")
+            base = to_float(bv)
+        else:
+            base = None
+        if op == "log10":
+            res = math.log10(v) if v > 0 else (
+                float("nan") if v < 0 else float("-inf"))
+            return res
+        logv = math.log(v) if v > 0 else (
+            float("nan") if v < 0 else float("-inf"))
+        if base is None:
+            return logv
+        if v == 1.0 and math.isinf(base):
+            return float("nan")
+        logb = math.log(base) if base > 0 else (
+            float("nan") if base < 0 else float("-inf"))
+        return logv / logb
+    if op == "exp":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("float")
+        v = to_float(a)
+        try:
+            res = math.exp(v)
+        except OverflowError:
+            res = float("inf")
+        if math.isinf(res) and not math.isinf(v):
+            raise OracleError("Floating point overflow in function: EXP")
+        return res
+    if op in ("cos", "sin", "tan", "acos", "asin", "atan", "cosh", "sinh",
+              "tanh"):
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("float")
+        v = to_float(a)
+        try:
+            res = getattr(math, op)(v)
+        except (ValueError, OverflowError):
+            res = float("nan") if op != "atanh" else float("nan")
+        return res
+    if op in ("pow", "power"):
+        l = eval_node(node[1])
+        r = eval_node(node[2])
+        if is_null(l) or is_null(r):
+            return Null("float")
+        lf, rf = to_float(l), to_float(r)
+        if (lf < 0.0 and not math.isinf(lf) and not math.isnan(rf)
+                and math.floor(rf) != rf):
+            raise OracleError("Floating point error in function: POW")
+        if lf == 0.0 and rf < 0.0 and not math.isinf(rf):
+            raise OracleError("division by zero in POW")
+        try:
+            res = math.pow(lf, rf)
+        except (ValueError, OverflowError):
+            res = float("nan") if lf < 0 else float("inf")
+        if math.isinf(res) and not math.isinf(lf) and not math.isinf(rf):
+            raise OracleError("Floating point overflow in function: POW")
+        return res
+    if op in ("length", "octet_length", "byte_length", "char_length",
+              "character_length"):
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("int")
+        if not isinstance(a, str):
+            raise OracleError(op + " requires string argument")
+        # length/byte_length count bytes; char_length counts code points.
+        return len(a) if op in ("char_length",
+                                "character_length") else len(a.encode())
+    if op == "ascii":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("int")
+        return a.encode()[0] if a else 0
+    if op == "unicode":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("int")
+        return ord(a[0]) if a else 0
+    if op == "chr":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("string")
+        if not isinstance(a, int) or isinstance(a, bool):
+            raise OracleError("CHR requires an integer argument")
+        if a < 0 or a > 0x10FFFF or 0xD800 <= a <= 0xDFFF:
+            raise OracleError("CHR argument out of range")
+        return chr(a)
+    if op in ("substr", "substring"):
+        s = eval_node(node[1])
+        start = eval_node(node[2])
+        length = eval_node(node[3]) if len(node) > 3 else None
+        if is_null(s) or is_null(start) or is_null(length):
+            return Null("string")
+        if not isinstance(s, str):
+            raise OracleError("SUBSTR argument type mismatch")
+        if length is not None:
+            if length < 0:
+                raise OracleError("SUBSTR length cannot be negative")
+            if length == 0:
+                return ""
+        if start > 0:
+            idx = start - 1
+        elif start < 0:
+            idx = len(s) + start
+        else:
+            idx = 0
+        idx = max(idx, 0)
+        if idx >= len(s):
+            return ""
+        return s[idx:] if length is None else s[idx:idx + length]
+    if op in ("upper", "lower"):
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("string")
+        # Engine applies C toupper/tolower per byte (ASCII-only).
+        if op == "upper":
+            return "".join(
+                chr(ord(c) - 32) if "a" <= c <= "z" else c for c in a)
+        return "".join(
+            chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in a)
+    if op in ("trim", "ltrim", "rtrim"):
+        s = eval_node(node[1])
+        cutset = eval_node(node[2]) if len(node) > 2 else " \t\n\r\x0b\x0c"
+        if is_null(s) or is_null(cutset):
+            return Null("string")
+        if op == "trim":
+            return s.strip(cutset)
+        return s.lstrip(cutset) if op == "ltrim" else s.rstrip(cutset)
+    if op == "replace":
+        s, frm, to = (eval_node(n) for n in node[1:4])
+        if is_null(s) or is_null(frm) or is_null(to):
+            return Null("string")
+        return s if frm == "" else s.replace(frm, to)
+    if op == "concat":
+        vals = [eval_node(n) for n in node[1:]]
+        if any(is_null(v) for v in vals):
+            return Null("string")
+        if not all(isinstance(v, str) for v in vals):
+            raise OracleError("CONCAT currently requires string arguments")
+        return "".join(vals)
+    if op in ("starts_with", "ends_with"):
+        s = eval_node(node[1])
+        p = eval_node(node[2])
+        if is_null(s) or is_null(p):
+            return Null("bool")
+        return s.startswith(p) if op == "starts_with" else s.endswith(p)
+    if op in ("strpos", "instr"):
+        hay = eval_node(node[1])
+        needle = eval_node(node[2])
+        if is_null(hay) or is_null(needle):
+            return Null("int")
+        # Engine searches bytes; encode both for multi-byte parity.
+        pos = hay.encode().find(needle.encode())
+        return 0 if pos < 0 else pos + 1
+    if op in ("lpad", "rpad"):
+        s = eval_node(node[1])
+        target = eval_node(node[2])
+        pad = eval_node(node[3]) if len(node) > 3 else " "
+        if is_null(s) or is_null(target) or is_null(pad):
+            return Null("string")
+        if target < 0:
+            raise OracleError(
+                "Second argument (output size) for LPAD/RPAD cannot be "
+                "negative")
+        if target > 1000000:
+            raise OracleError(
+                "Output of LPAD/RPAD exceeds max allowed output size of 1MB")
+        if target == 0:
+            return ""
+        if pad == "":
+            raise OracleError("Pattern in LPAD/RPAD cannot be empty")
+        if target <= len(s):
+            return s[:target]
+        needed = target - len(s)
+        pad_str = pad * (needed // len(pad)) + pad[:needed % len(pad)]
+        return pad_str + s if op == "lpad" else s + pad_str
+    if op == "reverse":
+        a = eval_node(node[1])
+        if is_null(a):
+            return Null("string")
+        return a[::-1]
+    if op == "repeat":
+        s = eval_node(node[1])
+        n = eval_node(node[2])
+        if is_null(s) or is_null(n):
+            return Null("string")
+        if n < 0:
+            raise OracleError(
+                "Second argument (repeat count) for REPEAT cannot be "
+                "negative")
+        if n == 0 or s == "":
+            return ""
+        if len(s.encode()) * n > 1000000:
+            raise OracleError(
+                "Output of REPEAT exceeds max allowed output size of 1MB")
+        return s * n
+    if op in ("left", "right", "byte_left", "byte_right"):
+        s = eval_node(node[1])
+        n = eval_node(node[2])
+        if is_null(s) or is_null(n):
+            return Null("string")
+        if n < 0:
+            raise OracleError("Second argument (length) for " +
+                              op.upper() + " cannot be negative")
+        if n == 0:
+            return ""
+        return s[:n] if op.endswith("left") else s[max(0, len(s) - n):]
+    if op in ("__bit_and", "__bit_or", "__bit_xor"):
+        l = eval_node(node[1])
+        r = eval_node(node[2])
+        if is_null(l) or is_null(r):
+            return Null("int")
+        res = (l & r if op == "__bit_and" else l | r
+               if op == "__bit_or" else l ^ r)
+        # Wrap into signed int64 range.
+        res &= (1 << 64) - 1
+        return res - (1 << 64) if res > INT64_MAX else res
+    if op in ("__shift_left", "__shift_right"):
+        l = eval_node(node[1])
+        r = eval_node(node[2])
+        if is_null(l) or is_null(r):
+            return Null("int")
+        if r < 0:
+            raise OracleError("Bitwise shift by negative offset.")
+        if r >= 64:
+            return 0
+        ul = l & ((1 << 64) - 1)
+        res = (ul << r) & ((1 << 64) - 1) if op == "__shift_left" else ul >> r
+        return res - (1 << 64) if res > INT64_MAX else res
+    if op in ("shl", "shr", "bitnot"):
+        a = eval_node(node[1])
+        b = eval_node(node[2]) if len(node) > 2 else None
+        if is_null(a) or is_null(b):
+            return Null("int")
+        if op == "bitnot":
+            return check_int_range(~a)
+        # Binary << / >> mirror the __shift_* functions.
+        if b < 0:
+            raise OracleError("Bitwise shift by negative offset.")
+        if b >= 64:
+            return 0
+        ua = a & ((1 << 64) - 1)
+        res = (ua << b) & ((1 << 64) - 1) if op == "shl" else ua >> b
+        return res - (1 << 64) if res > INT64_MAX else res
     if op.startswith("cast-"):
         return eval_cast(op, eval_node(node[1]))
     raise OracleError("unknown op: " + op)
