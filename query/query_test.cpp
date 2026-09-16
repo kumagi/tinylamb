@@ -140,6 +140,40 @@ TEST_F(QueryTest, QualifiedStarWithUnknownRelationFails) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
+TEST_F(QueryTest, NaturalJoinIsRejectedNotCrossProduct) {
+  // A NATURAL join's key is the shared column set, which the AST visitor
+  // cannot resolve; previously the join silently ran as a cross product.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (u INT64, a INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE j (u INT64, x INT64);");
+  SqlEngine engine(*db_);
+  bool rejected = false;
+  StatusOr<QueryResult> executed =
+      engine.Execute(ctx, "SELECT * FROM t NATURAL JOIN j;");
+  if (!executed.HasValue()) {
+    rejected = true;
+  } else {
+    Row row;
+    while (executed.Value().Next(&row)) {
+    }
+    rejected = executed.Value().GetStatus() != Status::kSuccess;
+  }
+  EXPECT_TRUE(rejected);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(QueryTest, GroupByEmptyParensFormsSingleGroup) {
+  // `GROUP BY ()` keys on a synthesized constant so every row lands in one
+  // group; previously the empty key list degenerated into "no GROUP BY".
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (u INT64, a INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1,10),(2,20),(3,NULL);");
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT 1 FROM t GROUP BY ();").size(), 1U);
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT COUNT(*) FROM t GROUP BY ();"),
+            std::vector<Row>{Row({Value(3)})});
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
 TEST_F(QueryTest, SelectWithProjection) {
   // Arrange
   TransactionContext ctx = db_->BeginContext();

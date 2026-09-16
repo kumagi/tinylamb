@@ -5020,6 +5020,12 @@ Status AppendSources(
   if (operands.size() != 2) {
     return AstStatus("GoogleSQL AST: join arity");
   }
+  if (node.detail.starts_with("NATURAL")) {
+    // A NATURAL join key is the shared column names, which are not known at
+    // AST time. Treating it as a condition-less join silently returns the
+    // cross product, so reject until the shared columns can be resolved.
+    return AstStatus("GoogleSQL AST: unsupported NATURAL join");
+  }
   AppendSources(*operands[0], incoming, std::move(condition), sources);
   JoinType type = JoinType::kInner;
   if (node.detail == "COMMA") {
@@ -5907,6 +5913,12 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         }
         ASSIGN_OR_RETURN(Expression, hv207291_0, (VisitExpression(term)));
         expressions.push_back(std::move(hv207291_0));
+      }
+      if (expressions.empty()) {
+        // `GROUP BY ()` groups every row into a single group. An empty key
+        // list is indistinguishable from no GROUP BY downstream, so key on
+        // a constant: one group, and non-aggregate references still error.
+        expressions.push_back(ConstantValueExp(Value(int64_t{0})));
       }
       statement->SetGroupBy(std::move(expressions));
     }
