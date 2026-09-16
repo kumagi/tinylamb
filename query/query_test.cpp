@@ -140,6 +140,28 @@ TEST_F(QueryTest, QualifiedStarWithUnknownRelationFails) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
+TEST_F(QueryTest, NaturalJoinIsRejectedNotCrossProduct) {
+  // A NATURAL join's key is the shared column set, which the AST visitor
+  // cannot resolve; previously the join silently ran as a cross product.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (u INT64, a INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE j (u INT64, x INT64);");
+  SqlEngine engine(*db_);
+  bool rejected = false;
+  StatusOr<QueryResult> executed =
+      engine.Execute(ctx, "SELECT * FROM t NATURAL JOIN j;");
+  if (!executed.HasValue()) {
+    rejected = true;
+  } else {
+    Row row;
+    while (executed.Value().Next(&row)) {
+    }
+    rejected = executed.Value().GetStatus() != Status::kSuccess;
+  }
+  EXPECT_TRUE(rejected);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
 TEST_F(QueryTest, SelectWithProjection) {
   // Arrange
   TransactionContext ctx = db_->BeginContext();
