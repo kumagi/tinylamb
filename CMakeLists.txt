@@ -690,6 +690,8 @@ if(BUILD_TESTING)
              "TINYLAMB_ORACLE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/oracle_regressions")
         list(APPEND _test_env
              "TINYLAMB_SESSION_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/session_regressions")
+        list(APPEND _test_env
+             "TINYLAMB_AGGREGATE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/aggregate_regressions")
         gtest_discover_tests(${target_name} PROPERTIES ENVIRONMENT
                                                        "${_test_env}")
     endfunction()
@@ -885,7 +887,12 @@ endif()
 ########################################
 if(TINYLAMB_ENABLE_FUZZ)
 function(add_replay_test file_path)
-    set(fuzzer_option "-fsanitize-trap=undefined,bounds")
+    # Link the UBSan runtime: tinylamb::core objects are compiled with
+    # -fsanitize=undefined (see the TINYLAMB_ENABLE_FUZZ block above), which
+    # requires the runtime at link time.  -fsanitize-trap=undefined only
+    # affects how the replay TU's own checks are lowered and would leave
+    # __ubsan_* references in the libraries undefined.
+    set(fuzzer_option "-fsanitize=undefined,bounds")
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})

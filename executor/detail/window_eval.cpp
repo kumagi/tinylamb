@@ -605,7 +605,9 @@ struct WindowRuntime {
           const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
-            return position;
+            // NULLs are peers of each other: the offset bound collapses to
+            // the peer group, so the frame opens at the group head.
+            return first_peer(position);
           }
           // ASC: first row with candidate >= key - off.  DESC mirrors the
           // band around the current key: first row with candidate <=
@@ -633,7 +635,9 @@ struct WindowRuntime {
           const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
-            return position;
+            // NULLs are peers of each other: the offset bound collapses to
+            // the peer group, so the frame opens at the group head.
+            return first_peer(position);
           }
           const bool asc = window.order_by[0].ascending;
           for (size_t j = 0; j < m; ++j) {
@@ -727,7 +731,6 @@ struct WindowRuntime {
           for (size_t j = 0; j <= position; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
-              reached = j;
               continue;
             }
             const long double cand =

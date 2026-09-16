@@ -724,6 +724,10 @@ std::optional<std::vector<Row>> RunRows(Database& db, TransactionContext& ctx,
   while (result.Value().Next(&row)) {
     rows.push_back(row);
   }
+  if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
+    *error = st.GetMessage().empty() ? ToString(st.GetCode()) : st.GetMessage();
+    return std::nullopt;
+  }
   return rows;
 }
 
@@ -1694,6 +1698,55 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
       t.orderby_expect.push_back(ExpectRow(
           {rows[static_cast<size_t>(i)]->u, rows[static_cast<size_t>(i)]->a}));
     }
+
+    // FETCH FIRST n ROWS WITH TIES over a single non-unique key: the
+    // cutoff row's peers all come along. Compared as a multiset because
+    // order inside a tied group is unspecified.
+    if (g.Chance(30)) {
+      const bool desc = g.Chance(40);
+      const int explicit_nf = g.Chance(40) ? (g.Chance(50) ? 1 : 0) : -1;
+      const bool nf = explicit_nf < 0 ? !desc : explicit_nf == 1;
+      std::vector<const MirrorRow*> keyed = rows;
+      std::stable_sort(keyed.begin(), keyed.end(),
+                       [&](const MirrorRow* l, const MirrorRow* r) {
+                         const bool lnull = l->a == kNull;
+                         const bool rnull = r->a == kNull;
+                         if (lnull != rnull) {
+                           return nf ? lnull : rnull;
+                         }
+                         if (lnull || l->a == r->a) {
+                           return false;
+                         }
+                         return desc ? l->a > r->a : l->a < r->a;
+                       });
+      const int64_t n = g.Pick(0, total + 1);
+      std::string tsql =
+          "SELECT u, a FROM " + tab + " WHERE " + t.predicate + " ORDER BY a";
+      if (desc) {
+        tsql += " DESC";
+      }
+      if (explicit_nf == 1) {
+        tsql += " NULLS FIRST";
+      } else if (explicit_nf == 0) {
+        tsql += " NULLS LAST";
+      }
+      tsql += " FETCH FIRST " + std::to_string(n) + " ROWS WITH TIES;";
+      t.ties = {tsql};
+      for (int64_t i = 0; i < std::min(n, total); ++i) {
+        t.ties_expect.push_back(ExpectRow({keyed[static_cast<size_t>(i)]->u,
+                                           keyed[static_cast<size_t>(i)]->a}));
+      }
+      if (n > 0 && n < total) {
+        const int64_t cutoff = keyed[static_cast<size_t>(n - 1)]->a;
+        for (int64_t i = n; i < total; ++i) {
+          if (keyed[static_cast<size_t>(i)]->a == cutoff) {
+            t.ties_expect.push_back(
+                ExpectRow({keyed[static_cast<size_t>(i)]->u,
+                           keyed[static_cast<size_t>(i)]->a}));
+          }
+        }
+      }
+    }
   }
 
   // ---- HAVING over grouped aggregates ----
@@ -2054,6 +2107,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->troc_ran = !t.troc.empty();
     stats->setop_ran = t.setop.size() == 1;
     stats->orderby_ran = t.orderby.size() == 1;
+    stats->ties_ran = t.ties.size() == 1;
     stats->having_ran = t.having.size() == 1;
     stats->cte_ran = t.cte.size() == 2;
     stats->recursive_ran = !t.recursive.empty();
@@ -2088,6 +2142,8 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
                      /*ordered=*/false, "SETOP", &report, verbose) ||
       !CheckExpected(db, ctx, trace.orderby, trace.orderby_expect,
                      /*ordered=*/true, "ORDERBY", &report, verbose) ||
+      !CheckExpected(db, ctx, trace.ties, trace.ties_expect,
+                     /*ordered=*/false, "TIES", &report, verbose) ||
       !CheckExpected(db, ctx, trace.having, trace.having_expect,
                      /*ordered=*/false, "HAVING", &report, verbose) ||
       !CheckCte(db, ctx, trace.cte, &report, verbose) ||
@@ -2163,6 +2219,12 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& row : trace.orderby_expect) {
     out += "-- orderbyexpect: " + row + "\n";
+  }
+  for (const std::string& sql : trace.ties) {
+    out += "-- ties: " + sql + "\n";
+  }
+  for (const std::string& row : trace.ties_expect) {
+    out += "-- tiesexpect: " + row + "\n";
   }
   for (const std::string& sql : trace.having) {
     out += "-- having: " + sql + "\n";
@@ -2267,6 +2329,10 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->orderby.push_back(value);
     } else if (consume("-- orderbyexpect: ", &value)) {
       trace->orderby_expect.push_back(value);
+    } else if (consume("-- ties: ", &value)) {
+      trace->ties.push_back(value);
+    } else if (consume("-- tiesexpect: ", &value)) {
+      trace->ties_expect.push_back(value);
     } else if (consume("-- having: ", &value)) {
       trace->having.push_back(value);
     } else if (consume("-- havingexpect: ", &value)) {

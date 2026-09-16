@@ -1,0 +1,28 @@
+-- tinylamb-aggregate-test v1
+-- seed: 70
+-- setup: CREATE TABLE t (u INT64, a INT64, b INT64, s VARCHAR(8));
+-- setup: INSERT INTO t VALUES (0, 3, NULL, 'x');
+-- setup: INSERT INTO t VALUES (1, -2, 2, NULL);
+-- setup: INSERT INTO t VALUES (2, NULL, -1, 'x');
+-- setup: INSERT INTO t VALUES (3, -3, -1, 'x');
+-- setup: INSERT INTO t VALUES (4, -3, 0, 'x');
+-- setup: INSERT INTO t VALUES (5, NULL, 1, 'x');
+-- setup: INSERT INTO t VALUES (6, -2, 1, 'x');
+-- setup: INSERT INTO t VALUES (7, -1, NULL, 'x');
+-- setup: INSERT INTO t VALUES (8, -2, 2, NULL);
+-- setup: INSERT INTO t VALUES (9, NULL, NULL, NULL);
+-- setup: INSERT INTO t VALUES (10, 0, 2, 'yy');
+-- setup: INSERT INTO t VALUES (11, 1, -2, 'x');
+-- query: SELECT u, SUM(b) OVER (PARTITION BY a ORDER BY a RANGE BETWEEN 1 PRECEDING AND 0 FOLLOWING) FROM t;
+-- expect: |0|,NULL,
+-- expect: |10|,|2|,
+-- expect: |11|,|-2|,
+-- expect: |1|,|5|,
+-- expect: |2|,|0|,
+-- expect: |3|,|-1|,
+-- expect: |4|,|-1|,
+-- expect: |5|,|0|,
+-- expect: |6|,|5|,
+-- expect: |7|,NULL,
+-- expect: |8|,|5|,
+-- expect: |9|,|0|,

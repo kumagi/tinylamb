@@ -2538,13 +2538,12 @@ bool AggregateAccumulator::IsDone() const {
          !extreme.IsNull();
 }
 
-void AggregateAccumulator::Add(AggregateInput input) {
+Status AggregateAccumulator::Add(AggregateInput input) {
   if (IsDone()) {
-    return;
+    return Status::kSuccess;
   }
   if (!buffer_) {
-    ApplyCore(input.value, input.trailing_values, input.order_keys);
-    return;
+    return TryApplyCore(input.value, input.trailing_values, input.order_keys);
   }
   buffer_->push_back(
       BufferedRow{.value = std::move(input.value),
@@ -2552,11 +2551,12 @@ void AggregateAccumulator::Add(AggregateInput input) {
                   .condition = std::move(input.condition),
                   .auxiliary = std::move(input.auxiliary),
                   .trailing_values = std::move(input.trailing_values)});
+  return Status::kSuccess;
 }
 
-void AggregateAccumulator::Add(const Value& value) {
+Status AggregateAccumulator::Add(const Value& value) {
   if (IsDone()) {
-    return;
+    return Status::kSuccess;
   }
   if (buffer_) {
     buffer_->push_back(BufferedRow{.value = value,
@@ -2564,9 +2564,9 @@ void AggregateAccumulator::Add(const Value& value) {
                                    .condition = Value(),
                                    .auxiliary = Value(),
                                    .trailing_values = {}});
-    return;
+    return Status::kSuccess;
   }
-  ApplyCore(value);
+  return TryApplyCore(value);
 }
 
 StatusOr<Value> AggregateAccumulator::TryFinish() const {

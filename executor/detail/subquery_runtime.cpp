@@ -756,7 +756,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             }
           }
           if (IsCountStar(aggregate)) {
-            group->accumulators[i].Add(Value(1));
+            if (Status st = group->accumulators[i].Add(Value(1));
+                st != Status::kSuccess) {
+              group_error = st;
+              return;
+            }
             continue;
           }
           AggregateInput input;
@@ -799,7 +803,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
               input.trailing_values.push_back(std::move(*trail));
             }
           }
-          group->accumulators[i].Add(std::move(input));
+          if (Status st = group->accumulators[i].Add(std::move(input));
+              st != Status::kSuccess) {
+            group_error = st;
+            return;
+          }
         }
       });
       if (group_error != Status::kSuccess) {
@@ -809,8 +817,13 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         AggregateResultMap aggregate_results;
         aggregate_results.reserve(group.accumulators.size());
         for (const AggregateAccumulator& accumulator : group.accumulators) {
+          StatusOr<Value> finished = accumulator.TryFinish();
+          if (!finished.HasValue()) {
+            group_error = finished.GetStatus();
+            return;
+          }
           aggregate_results.emplace(accumulator.expression,
-                                    accumulator.Finish());
+                                    finished.MoveValue());
         }
         Row representative;
         Scope scope{

@@ -2,14 +2,39 @@
 
 #include "query/sql_aggregate_fuzzer.hpp"
 
+#include <dirent.h>
+
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
+#include <vector>
 
 #include "gtest/gtest.h"
 
 namespace tinylamb {
+
+namespace {
+
+std::vector<std::string> ListTestFiles(const std::string& dir) {
+  std::vector<std::string> files;
+  DIR* handle = opendir(dir.c_str());
+  if (handle == nullptr) {
+    return files;
+  }
+  while (const dirent* entry = readdir(handle)) {
+    const std::string name = entry->d_name;
+    if (name.size() > 5 && name.substr(name.size() - 5) == ".test") {
+      files.push_back(dir + "/" + name);
+    }
+  }
+  closedir(handle);
+  return files;
+}
+
+}  // namespace
 
 TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
   int group_queries = 0;
@@ -19,8 +44,20 @@ TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
   for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
     std::mt19937 rng(seed);
     AggStats stats;
-    std::string report = RunAggregateIteration(rng, false, &stats);
-    ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
+    AggTrace trace;
+    std::string report;
+    try {
+      report = RunAggregateIteration(rng, false, &stats, &trace);
+    } catch (const std::exception& ex) {
+      report = std::string(
+                   "[AGGREGATE MISMATCH] exception escaped "
+                   "RunAggregateIteration: ") +
+               ex.what();
+    }
+    ASSERT_EQ(report, "") << "failing seed=" << seed << "\n"
+                          << SerializeAggregateTest(seed, trace, "seeded run")
+                          << "\n"
+                          << report;
     group_queries += stats.group_queries;
     window_queries += stats.window_queries;
   }
@@ -60,6 +97,31 @@ TEST(SqlAggregateFuzzer, TestFileRoundTripDetectsMismatch) {
   ASSERT_TRUE(ParseAggregateTest(broken_text, &seed2, &parsed2, &summary2));
   EXPECT_NE(ReplayAggregateTrace(parsed2), "")
       << "tampered trace replayed clean";
+}
+
+// Any committed sql_aggregate_fuzz-*.test file replays as a permanent
+// regression guard: the recorded expectations must hold now.  Point
+// TINYLAMB_AGGREGATE_REGRESSION_DIR at a directory to enable; with no
+// directory the test passes trivially.
+TEST(SqlAggregateFuzzer, ReplayCommittedRegressionFiles) {
+  const char* dir = std::getenv("TINYLAMB_AGGREGATE_REGRESSION_DIR");
+  if (dir == nullptr) {
+    GTEST_SKIP() << true;
+  }
+  for (const std::string& path : ListTestFiles(dir)) {
+    std::ifstream file(path);
+    std::string text((std::istreambuf_iterator<char>(file)),
+                     std::istreambuf_iterator<char>());
+    ASSERT_TRUE(file.good()) << path;
+    uint64_t seed = 0;
+    AggTrace trace;
+    std::string summary;
+    ASSERT_TRUE(ParseAggregateTest(text, &seed, &trace, &summary))
+        << "malformed regression file: " << path;
+    EXPECT_EQ(ReplayAggregateTrace(trace), "")
+        << "regression " << path << " still reproduces:\n"
+        << summary;
+  }
 }
 
 }  // namespace tinylamb

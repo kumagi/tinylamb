@@ -763,7 +763,10 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
               input.trailing_values.push_back(std::move(*trail));
             }
           }
-          accumulators[i]->Add(std::move(input));
+          if (Status st = accumulators[i]->Add(std::move(input));
+              st != Status::kSuccess) {
+            return FailWith(st);
+          }
           continue;
         }
         if (agg.WhereFilter()) {

@@ -92,6 +92,15 @@ int main(int argc, char** argv) {
         line << row << '\n';
         buffer += line.str();
       });
+      // Executors latch drain-time failures on their status channel
+      // (Next()==false reads as EOF): an unchecked overflow would print
+      // as a successful empty result and exit 0.
+      if (const tinylamb::Status drain_status = executed.Value().GetStatus();
+          drain_status != tinylamb::Status::kSuccess) {
+        std::cerr << "SQL error: " << drain_status << '\n';
+        context.Abort();
+        return 1;
+      }
       pending_output.push_back(std::move(buffer));
     } catch (const std::exception& error) {
       std::cerr << "error executing statement: " << error.what() << '\n';
