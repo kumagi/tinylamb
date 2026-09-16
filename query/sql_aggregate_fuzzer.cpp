@@ -43,12 +43,14 @@ class Gen {
   std::mt19937& rng_;
 };
 
-// Mirror row of t(u, a, b, s).
+// Mirror row of t(u, a, b, s, f).
 struct MRow {
   int64_t u{0};
   int64_t a{kNullRepr};
   int64_t b{kNullRepr};
   int64_t s{kNullRepr};  // 0 = 'x', 1 = 'yy'
+  double f{0.0};
+  bool f_null{true};
 };
 
 std::string FmtInt(int64_t v) {
@@ -96,7 +98,7 @@ std::optional<std::vector<std::vector<Value>>> RunQuery(Database& db,
 }
 
 constexpr const char* kDdl =
-    "CREATE TABLE t (u INT64, a INT64, b INT64, s VARCHAR(8));";
+    "CREATE TABLE t (u INT64, a INT64, b INT64, s VARCHAR(8), f DOUBLE);";
 
 std::vector<std::string> FormatRows(
     const std::vector<std::vector<Value>>& rows) {
@@ -129,6 +131,11 @@ std::string CellSql(int col, int64_t v) {
   return IsStrCol(col) ? (v == 0 ? "'x'" : "'yy'") : std::to_string(v);
 }
 std::string GroupKey(int col, const MRow& r) { return FmtInt(CellOf(r, col)); }
+
+// Column 3 is the DOUBLE column `f` (aggregates only; never a group key or
+// a WPred target).
+bool IsDblCol(int col) { return col == 3; }
+std::string FmtDbl(double v) { return "|" + FormatDoubleShortest(v) + "|"; }
 
 // Simple WHERE: comparisons / IS NULL over a, b, s, AND/OR/NOT depth 2.
 struct WPred {
@@ -288,7 +295,7 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
     case AggSpec::Kind::kCount: {
       int64_t n = 0;
       for (const MRow& r : rows) {
-        if (CellOf(r, spec.col) != kNullRepr) {
+        if (IsDblCol(spec.col) ? !r.f_null : CellOf(r, spec.col) != kNullRepr) {
           ++n;
         }
       }
@@ -296,6 +303,9 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
     }
     case AggSpec::Kind::kSum:
     case AggSpec::Kind::kSumDistinct: {
+      if (IsDblCol(spec.col)) {
+        return std::nullopt;  // double sums never feed HAVING comparisons
+      }
       bool any = false;
       __int128 sum = 0;  // extremes must not UB the mirror
       std::vector<int64_t> seen;
@@ -333,7 +343,7 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
     case AggSpec::Kind::kCount: {
       int64_t n = 0;
       for (const MRow& r : rows) {
-        if (CellOf(r, spec.col) != kNullRepr) {
+        if (IsDblCol(spec.col) ? !r.f_null : CellOf(r, spec.col) != kNullRepr) {
           ++n;
         }
       }
@@ -341,6 +351,23 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
     }
     case AggSpec::Kind::kSum:
     case AggSpec::Kind::kSumDistinct: {
+      if (IsDblCol(spec.col)) {
+        bool any = false;
+        double sum = 0.0;
+        std::vector<double> seen;
+        for (const MRow& r : rows) {
+          const double v = r.f;
+          if (r.f_null ||
+              (spec.kind == AggSpec::Kind::kSumDistinct &&
+               std::find(seen.begin(), seen.end(), v) != seen.end())) {
+            continue;
+          }
+          seen.push_back(v);
+          any = true;
+          sum += v;
+        }
+        return any ? FmtDbl(sum) : std::string("NULL");
+      }
       const std::optional<int64_t> sum = AggNum(spec, rows);
       // INT64_MIN is a legitimate sum but collides with the kNullRepr
       // sentinel inside FmtInt; format past the sentinel here.
@@ -360,6 +387,23 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
     }
     case AggSpec::Kind::kMin:
     case AggSpec::Kind::kMax: {
+      if (IsDblCol(spec.col)) {
+        bool any = false;
+        double best = 0.0;
+        for (const MRow& r : rows) {
+          if (r.f_null) {
+            continue;
+          }
+          const double v = r.f;
+          if (!any) {
+            best = v;
+            any = true;
+          } else if (spec.kind == AggSpec::Kind::kMin ? v < best : v > best) {
+            best = v;
+          }
+        }
+        return any ? FmtDbl(best) : std::string("NULL");
+      }
       bool any = false;
       int64_t best = 0;
       for (const MRow& r : rows) {
@@ -384,7 +428,20 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
       double sum = 0;
       int64_t cnt = 0;
       std::vector<int64_t> seen;
+      std::vector<double> fseen;
       for (const MRow& r : rows) {
+        if (IsDblCol(spec.col)) {
+          const double v = r.f;
+          if (r.f_null ||
+              (spec.kind == AggSpec::Kind::kAvgDistinct &&
+               std::find(fseen.begin(), fseen.end(), v) != fseen.end())) {
+            continue;
+          }
+          fseen.push_back(v);
+          sum += v;
+          ++cnt;
+          continue;
+        }
         const int64_t v = CellOf(r, spec.col);
         if (v == kNullRepr ||
             (spec.kind == AggSpec::Kind::kAvgDistinct &&
@@ -428,10 +485,19 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       r.b = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
     }
     r.s = g.Chance(15) ? kNullRepr : g.Pick(0, 1);
+    r.f_null = g.Chance(25);
+    if (!r.f_null) {
+      static constexpr std::array<double, 10> kFPool = {
+          0.5, -1.5, 2.25, -3.0, 100.5, 1e-300, 1e17, 3.7, -0.25, 7.0};
+      r.f = g.Chance(8) ? (g.Chance(50) ? 1e300 : -1e300)
+                        : kFPool[static_cast<size_t>(g.Pick(0, 9))];
+    }
     mirror.push_back(r);
-    t.setup.push_back("INSERT INTO t VALUES (" + std::to_string(r.u) + ", " +
-                      CellSql(0, r.a) + ", " + CellSql(1, r.b) + ", " +
-                      CellSql(2, r.s) + ");");
+    t.setup.push_back(
+        "INSERT INTO t VALUES (" + std::to_string(r.u) + ", " +
+        CellSql(0, r.a) + ", " + CellSql(1, r.b) + ", " + CellSql(2, r.s) +
+        ", " + (r.f_null ? std::string("NULL") : FormatDoubleShortest(r.f)) +
+        ");");
   }
 
   // ScopedDb deletes the throwaway .db/.log pair when the iteration ends.
@@ -504,6 +570,28 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       }
       if (g.Chance(20)) {
         aggs.push_back({"AVG(DISTINCT a)", 0, AggSpec::Kind::kAvgDistinct});
+      }
+      // DOUBLE-column aggregates: float SUM/AVG/MIN/MAX exercise the double
+      // accumulator path incl. extreme magnitudes (1e300) and NULLs.
+      if (g.Chance(35)) {
+        aggs.push_back({"SUM(f)", 3, AggSpec::Kind::kSum});
+      }
+      if (g.Chance(35)) {
+        aggs.push_back({"AVG(f)", 3, AggSpec::Kind::kAvg});
+      }
+      if (g.Chance(25)) {
+        const bool is_min = g.Chance(50);
+        aggs.push_back({is_min ? "MIN(f)" : "MAX(f)", 3,
+                        is_min ? AggSpec::Kind::kMin : AggSpec::Kind::kMax});
+      }
+      if (g.Chance(30)) {
+        aggs.push_back({"COUNT(f)", 3, AggSpec::Kind::kCount});
+      }
+      if (g.Chance(15)) {
+        aggs.push_back({"AVG(DISTINCT f)", 3, AggSpec::Kind::kAvgDistinct});
+      }
+      if (g.Chance(15)) {
+        aggs.push_back({"SUM(DISTINCT f)", 3, AggSpec::Kind::kSumDistinct});
       }
       // FILTER (WHERE ...) on some specs.
       for (AggSpec& spec : aggs) {
