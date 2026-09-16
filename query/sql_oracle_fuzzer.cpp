@@ -850,10 +850,10 @@ bool CheckExpected(Database& db, TransactionContext& ctx,
   return true;
 }
 
-// CTE inlining: the WITH form must equal the flattened equivalent.
-bool CheckCte(Database& db, TransactionContext& ctx,
-              const std::vector<std::string>& cte, std::string* report,
-              bool verbose) {
+// Two-query equivalence: both forms must return the same row multiset.
+bool CheckPair(Database& db, TransactionContext& ctx,
+               const std::vector<std::string>& cte, const char* tag,
+               std::string* report, bool verbose) {
   if (cte.size() != 2) {
     return true;
   }
@@ -862,7 +862,7 @@ bool CheckCte(Database& db, TransactionContext& ctx,
   auto flat = RunRows(db, ctx, cte[1], &error);
   if (!(with.has_value() && flat.has_value())) {
     if (verbose) {
-      std::cerr << "[sql_oracle][cte-error] " << error << "\n";
+      std::cerr << "[sql_oracle][" << tag << "-error] " << error << "\n";
     }
     return false;
   }
@@ -871,10 +871,10 @@ bool CheckCte(Database& db, TransactionContext& ctx,
   if (s0 == s1) {
     return true;
   }
-  *report += "[CTE MISMATCH]\n";
-  *report += "  with: " + cte[0] + " (" + std::to_string(s0.size()) +
+  *report += std::string("[") + tag + " MISMATCH]\n";
+  *report += "  lhs: " + cte[0] + " (" + std::to_string(s0.size()) +
              " rows)\n" + DumpRows(s0);
-  *report += "  flat: " + cte[1] + " (" + std::to_string(s1.size()) +
+  *report += "  rhs: " + cte[1] + " (" + std::to_string(s1.size()) +
              " rows)\n" + DumpRows(s1);
   return true;
 }
@@ -1546,6 +1546,19 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
               ") semi;",
       };
     }
+    // Scalar subquery vs LEFT JOIN: a correlated scalar COUNT over the
+    // join must equal the decorrelated GROUP BY spelling row for row.
+    if (g.Chance(40)) {
+      const std::string corr2 = g.Chance(50) ? (jtab + ".x = " + tab + ".a")
+                                             : (jtab + ".y = " + tab + ".s");
+      t.ssub = {
+          "SELECT u, (SELECT COUNT(x) FROM " + jtab + " WHERE " + corr2 +
+              ") AS c FROM " + tab + ";",
+          "SELECT " + tab + ".u, COUNT(" + jtab + ".x) AS c FROM " + tab +
+              " LEFT JOIN " + jtab + " ON " + corr2 + " GROUP BY " + tab +
+              ".u;",
+      };
+    }
   }
 
   // ---- Set operations vs the mirror multiset ----
@@ -2116,6 +2129,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->tlp_agg_ran = t.tlp_agg.size() == 4;
     stats->unionall_ran = t.unionall.size() == 2;
     stats->subq_ran = t.subq.size() == 3;
+    stats->ssub_ran = t.ssub.size() == 2;
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
     stats->idx_ran = !t.index_ddl.empty() && !t.index_probe.empty();
@@ -2162,7 +2176,8 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
                      /*ordered=*/false, "TIES", &report, verbose) ||
       !CheckExpected(db, ctx, trace.having, trace.having_expect,
                      /*ordered=*/false, "HAVING", &report, verbose) ||
-      !CheckCte(db, ctx, trace.cte, &report, verbose) ||
+      !CheckPair(db, ctx, trace.cte, "CTE", &report, verbose) ||
+      !CheckPair(db, ctx, trace.ssub, "SSUB", &report, verbose) ||
       !CheckRecursive(db, ctx, trace, &report, verbose) ||
       !CheckExpected(db, ctx, trace.unnest, trace.unnest_expect,
                      trace.unnest_ordered, "UNNEST", &report, verbose)) {
@@ -2196,6 +2211,9 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.unionall) {
     out += "-- unionall: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.ssub) {
+    out += "-- ssub: " + sql + "\n";
   }
   for (const std::string& sql : trace.subq) {
     out += "-- subq: " + sql + "\n";
@@ -2315,6 +2333,8 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->tlp_agg.push_back(value);
     } else if (consume("-- unionall: ", &value)) {
       trace->unionall.push_back(value);
+    } else if (consume("-- ssub: ", &value)) {
+      trace->ssub.push_back(value);
     } else if (consume("-- subq: ", &value)) {
       trace->subq.push_back(value);
     } else if (consume("-- norec: ", &value)) {

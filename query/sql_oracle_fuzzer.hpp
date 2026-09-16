@@ -84,6 +84,9 @@ struct OracleTrace {
   // Subquery differential: three spellings of "t rows matching j" (IN
   // subquery / correlated EXISTS / semi-join via JOIN+DISTINCT) must agree.
   std::vector<std::string> subq;  // exactly 3 when active
+  // Scalar-subquery vs LEFT JOIN + COUNT: correlated scalar aggregates must
+  // equal the decorrelated join spelling (apply executor boundary).
+  std::vector<std::string> ssub;  // exactly 2 when active
   // Constraint rewriting: probe before/after the DDL must agree.
   std::vector<std::string> index_ddl;
   std::string index_probe;
@@ -118,6 +121,7 @@ struct OracleIterationStats {
   bool tlp_agg_ran{false};
   bool unionall_ran{false};
   bool subq_ran{false};
+  bool ssub_ran{false};
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};
