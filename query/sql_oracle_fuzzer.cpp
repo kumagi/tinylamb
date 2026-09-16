@@ -724,6 +724,10 @@ std::optional<std::vector<Row>> RunRows(Database& db, TransactionContext& ctx,
   while (result.Value().Next(&row)) {
     rows.push_back(row);
   }
+  if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
+    *error = st.GetMessage().empty() ? ToString(st.GetCode()) : st.GetMessage();
+    return std::nullopt;
+  }
   return rows;
 }
 

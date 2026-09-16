@@ -279,7 +279,7 @@ StatusOr<Relation> Project(TransactionContext& context,
           (*local_states)[group.accumulator_offset + i];
       const AggregateExpression& aggregate = *accumulator.expression;
       if (IsCountStar(aggregate)) {
-        accumulator.Add(Value(1));
+        RETURN_IF_FAIL(accumulator.Add(Value(1)));
         continue;
       }
       if (aggregate.WhereFilter()) {
@@ -326,7 +326,7 @@ StatusOr<Relation> Project(TransactionContext& context,
           aggregate_input.trailing_values.push_back(std::move(hv11885_0));
         }
       }
-      accumulator.Add(std::move(aggregate_input));
+      RETURN_IF_FAIL(accumulator.Add(std::move(aggregate_input)));
       if (context.execution_runtime() != nullptr) {
         ++context.execution_runtime()->aggregate_updates;
       }
@@ -719,7 +719,10 @@ StatusOr<Relation> Project(TransactionContext& context,
       for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
         const AggregateAccumulator& accumulator =
             aggregate_states[group.accumulator_offset + i];
-        aggregate_results.emplace(accumulator.expression, accumulator.Finish());
+        ASSIGN_OR_RETURN(
+            Value, finished,
+            aggregate_states[group.accumulator_offset + i].TryFinish());
+        aggregate_results.emplace(accumulator.expression, std::move(finished));
       }
       RETURN_IF_FAIL(emit(group.representative, &aggregate_results));
     }
@@ -2207,11 +2210,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
           continue;
         }
         if (is_count_star[i]) {
-          accumulator.Add(Value(1));
+          RETURN_IF_FAIL(accumulator.Add(Value(1)));
         } else if (aggregate_child_offsets[i] &&
                    !aggregate.NeedsGroupContext() &&
                    aggregate.Having() == AggregateHavingModifier::kNone) {
-          accumulator.Add(row[*aggregate_child_offsets[i]]);
+          RETURN_IF_FAIL(accumulator.Add(row[*aggregate_child_offsets[i]]));
         } else {
           AggregateInput aggregate_input;
           aggregate_input.value =
@@ -2244,7 +2247,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
               aggregate_input.trailing_values.push_back(std::move(hv84223_0));
             }
           }
-          accumulator.Add(std::move(aggregate_input));
+          RETURN_IF_FAIL(accumulator.Add(std::move(aggregate_input)));
         }
         if (context.execution_runtime() != nullptr) {
           ++context.execution_runtime()->aggregate_updates;
@@ -2394,9 +2397,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       AggregateResultMap aggregate_results;
       aggregate_results.reserve(aggregate_expressions.size());
       for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
-        aggregate_results.emplace(
-            aggregate_expressions[i],
-            aggregate_states[group.accumulator_offset + i].Finish());
+        ASSIGN_OR_RETURN(
+            Value, finished,
+            aggregate_states[group.accumulator_offset + i].TryFinish());
+        aggregate_results.emplace(aggregate_expressions[i],
+                                  std::move(finished));
       }
       Scope scope{.row = &group.representative,
                   .schema = &input.schema,

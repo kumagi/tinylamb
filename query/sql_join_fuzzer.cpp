@@ -98,6 +98,10 @@ std::optional<std::vector<EngineRow>> RunQuery(Database& db,
     }
     rows.push_back(std::move(er));
   }
+  if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
+    *error = st.GetMessage().empty() ? ToString(st.GetCode()) : st.GetMessage();
+    return std::nullopt;
+  }
   return rows;
 }
 

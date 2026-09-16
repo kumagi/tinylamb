@@ -389,6 +389,31 @@ TEST_F(WindowSqlTest, RangePeersAndOffsetFollowing) {
   EXPECT_EQ(following[3], Row({Value(40)}));
 }
 
+TEST_F(WindowSqlTest, AggregateOverflowSurfacesAsStatusNotException) {
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO w VALUES (3, 1, 9223372036854775807, 'x'), "
+         "(3, 2, 1, 'x');");
+  // An overflowing SUM fails the drain with a Status on the executor
+  // channel: it must not throw through QueryResult::Next (fuzzer-found:
+  // the accumulator's EXC-SHIM wrapper escaped the engine as a C++
+  // exception).
+  {
+    StatusOr<QueryResult> result =
+        engine_->Execute(*context_, "SELECT SUM(v) FROM w GROUP BY g;");
+    ASSERT_TRUE(result.HasValue());
+    EXPECT_EQ(result.Value().Drain(), 0U);
+    EXPECT_NE(result.Value().GetStatus(), Status::kSuccess);
+  }
+  // The same overflow through a window frame takes the same path.
+  {
+    StatusOr<QueryResult> result = engine_->Execute(
+        *context_, "SELECT SUM(v) OVER (PARTITION BY g) FROM w WHERE g = 3;");
+    ASSERT_TRUE(result.HasValue());
+    EXPECT_EQ(result.Value().Drain(), 0U);
+    EXPECT_NE(result.Value().GetStatus(), Status::kSuccess);
+  }
+}
+
 TEST_F(WindowSqlTest, CountFamilyOverPartition) {
   const auto rows = RunSql(
       engine_.get(), context_.get(),

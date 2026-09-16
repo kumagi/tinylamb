@@ -87,6 +87,10 @@ std::optional<std::vector<std::vector<Value>>> RunQuery(Database& db,
     }
     rows.push_back(std::move(cells));
   }
+  if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
+    *error = st.GetMessage().empty() ? ToString(st.GetCode()) : st.GetMessage();
+    return std::nullopt;
+  }
   return rows;
 }
 
@@ -290,7 +294,7 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
     case AggSpec::Kind::kSum:
     case AggSpec::Kind::kSumDistinct: {
       bool any = false;
-      int64_t sum = 0;
+      __int128 sum = 0;  // extremes must not UB the mirror
       std::vector<int64_t> seen;
       for (const MRow& r : rows) {
         const int64_t v = CellOf(r, spec.col);
@@ -306,7 +310,12 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
       if (!any) {
         return std::nullopt;
       }
-      return sum;
+      // Out-of-int64 results are modeled as NULL: an engine that errors
+      // skips the query anyway, and a wrapped result mismatches loudly.
+      if (sum > INT64_MAX || sum < INT64_MIN) {
+        return std::nullopt;
+      }
+      return static_cast<int64_t>(sum);
     }
     default:
       return std::nullopt;
@@ -382,6 +391,13 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     r.u = i;
     r.a = g.Chance(25) ? kNullRepr : g.Pick(-3, 3);
     r.b = g.Chance(25) ? kNullRepr : g.Pick(-2, 2);
+    // INT64 extremes stress SUM/running aggregates (never kNullRepr).
+    if (g.Chance(8)) {
+      r.a = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
+    }
+    if (g.Chance(8)) {
+      r.b = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
+    }
     r.s = g.Chance(15) ? kNullRepr : g.Pick(0, 1);
     mirror.push_back(r);
     t.setup.push_back("INSERT INTO t VALUES (" + std::to_string(r.u) + ", " +
@@ -892,8 +908,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
               ++pos;
             }
           }
-          int64_t sum = 0;
+          __int128 sum = 0;
           bool any = false;
+          bool overflow = false;
           for (size_t i = 0; i < part.size(); ++i) {
             const auto idx = static_cast<int64_t>(i);
             if (idx < pos - frame_lo || idx > pos + frame_hi ||
@@ -901,9 +918,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
               continue;
             }
             sum += part[i]->b;
+            overflow = overflow || sum > INT64_MAX || sum < INT64_MIN;
             any = true;
           }
-          row += (any ? FmtInt(sum) : std::string("NULL")) + ",";
+          row += (any && !overflow ? FmtInt(static_cast<int64_t>(sum))
+                                   : std::string("NULL")) +
+                 ",";
         } else if (mode == 9) {
           // NTH_VALUE(b, 2) with UNBOUNDED frame: b of the partition's
           // second row by u.
@@ -967,8 +987,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             }
             return false;
           };
-          int64_t sum = 0;
+          __int128 sum = 0;
           bool any = false;
+          bool overflow = false;
           for (size_t i = 0; i < part.size(); ++i) {
             bool in_frame = false;
             if (mode == 10) {
@@ -993,9 +1014,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
               continue;
             }
             sum += part[i]->b;
+            overflow = overflow || sum > INT64_MAX || sum < INT64_MIN;
             any = true;
           }
-          row += (any ? FmtInt(sum) : std::string("NULL")) + ",";
+          row += (any && !overflow ? FmtInt(static_cast<int64_t>(sum))
+                                   : std::string("NULL")) +
+                 ",";
         }
         expected.push_back(row);
       }

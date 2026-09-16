@@ -317,6 +317,10 @@ std::optional<std::vector<Row>> RunSelect(Database& db, TransactionContext& ctx,
   while (result.Value().Next(&row)) {
     rows.push_back(row);
   }
+  if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
+    *error = st.GetMessage().empty() ? ToString(st.GetCode()) : st.GetMessage();
+    return std::nullopt;
+  }
   return rows;
 }
 
@@ -328,7 +332,7 @@ bool RunSql(Database& db, TransactionContext& ctx, const std::string& sql) {
     return false;
   }
   static_cast<void>(result.Value().Drain());
-  return true;
+  return result.Value().GetStatus() == Status::kSuccess;
 }
 
 std::string DumpLines(const std::vector<std::string>& rows) {

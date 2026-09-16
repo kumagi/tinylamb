@@ -90,13 +90,11 @@ struct AggregateAccumulator {
   explicit AggregateAccumulator(const AggregateExpression* aggregate);
 
   // Row-at-a-time accumulation for streaming aggregates.
-  void Add(const Value& value);
+  Status Add(const Value& value);
   // Full-input accumulation: buffers rows for aggregates that need whole-group
   // context (HAVING modifier, inner ORDER BY/LIMIT, ARRAY_AGG, STRING_AGG).
-  void Add(AggregateInput input);
+  Status Add(AggregateInput input);
   StatusOr<Value> TryFinish() const;
-  // EXC-SHIM (see no-exception-rule-migration.md).
-  Value Finish() const { return ExcShimUnwrap(TryFinish(), "Finish"); }
   [[nodiscard]] bool IsDone() const;
 
   const AggregateExpression* expression;

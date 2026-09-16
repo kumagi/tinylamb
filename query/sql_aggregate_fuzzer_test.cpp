@@ -45,7 +45,15 @@ TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
     std::mt19937 rng(seed);
     AggStats stats;
     AggTrace trace;
-    std::string report = RunAggregateIteration(rng, false, &stats, &trace);
+    std::string report;
+    try {
+      report = RunAggregateIteration(rng, false, &stats, &trace);
+    } catch (const std::exception& ex) {
+      report = std::string(
+                   "[AGGREGATE MISMATCH] exception escaped "
+                   "RunAggregateIteration: ") +
+               ex.what();
+    }
     ASSERT_EQ(report, "") << "failing seed=" << seed << "\n"
                           << SerializeAggregateTest(seed, trace, "seeded run")
                           << "\n"
