@@ -3,6 +3,7 @@
 #include "query/expr_oracle_fuzzer.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <random>
 #include <stdexcept>
@@ -396,8 +397,9 @@ TEST(ExprOracleFuzzer, ReplayPinnedDeadBranchCastOrderRegression) {
 TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
-  constexpr int kIterations = 64;
-  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 64;
+  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
     const auto seed32 = seed;
     const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
     std::mt19937 rng(seed32);
@@ -424,10 +426,11 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
 TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
-  constexpr int kIterations = 200;
+  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 200;
   ExprGenConfig config;
   config.extended_ops = true;
-  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
     const auto seed32 = seed + 3000;
     const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
     std::mt19937 rng(seed32);
@@ -477,11 +480,12 @@ TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
 }
 
 TEST(ExprOracleFuzzer, RowAwareNullRejectAndDifferentialEquivalence) {
-  constexpr int kIterations = 64;
+  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 64;
   int null_reject_verified_count = 0;
   int engine_ran_count = 0;
 
-  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
     const auto seed32 = seed;
     const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
     std::mt19937 rng(seed32);
@@ -529,7 +533,7 @@ TEST(ExprOracleFuzzer, RowAwareExtendedOpsEquivalence) {
   int null_reject_verified_count = 0;
   int engine_ran_count = 0;
 
-  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
     std::mt19937 rng(seed + 1000);
     RowExprOracleTrace trace;
     trace.seed = (static_cast<uint64_t>(seed + 1000) << 32) | (seed + 1000);

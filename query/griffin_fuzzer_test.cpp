@@ -3,6 +3,7 @@
 #include "query/griffin_fuzzer.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <string>
 
@@ -15,9 +16,10 @@ namespace {
 // every executed SELECT. A non-empty report is a logic bug in the bytecode
 // compiler, the JIT kernels, or the executor.
 TEST(GriffinFuzzer, SeededIterationsHoldOracles) {
-  constexpr int kIterations = 64;
+  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 64;
   int ran_select = 0;
-  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
     const uint64_t packed = (static_cast<uint64_t>(seed) << 32) | seed;
     std::mt19937 rng(seed);
     GriffinTrace trace;
