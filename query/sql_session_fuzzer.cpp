@@ -563,8 +563,41 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           tuple += ", " + lit;
         }
         tuple += ")";
-        const std::string sql =
-            "INSERT INTO " + target->name + " VALUES " + tuple + ";";
+        std::string sql;
+        if (g.Chance(25)) {
+          // Column-list insert with a shuffled order: the engine must map
+          // values positionally onto the listed columns, not ordinal ones.
+          std::vector<int> order;
+          for (size_t i = 0; i < target->columns.size(); ++i) {
+            order.push_back(static_cast<int>(i));
+          }
+          for (size_t i = order.size() - 1; i > 0; --i) {
+            std::swap(order[i], order[static_cast<size_t>(g.Pick(0, i))]);
+          }
+          std::string col_list = "(u";
+          std::string lit_list = "(" + std::to_string(target->next_u - 1);
+          for (const int i : order) {
+            if (i == 0) {
+              continue;
+            }
+            col_list += ", c" + std::to_string(i);
+            // values[j] holds the literal for column j + 1 (column 0 is u).
+            const int64_t repr = values[static_cast<size_t>(i - 1)].first;
+            lit_list +=
+                ", " +
+                (repr == kNullRepr
+                     ? "NULL"
+                     : (values[static_cast<size_t>(i - 1)].second == ColType::kInt
+                            ? std::to_string(repr)
+                            : (repr == kStrA ? "'a'" : "'bb'")));
+          }
+          col_list += ")";
+          lit_list += ")";
+          sql = "INSERT INTO " + target->name + " " + col_list + " VALUES " +
+                lit_list + ";";
+        } else {
+          sql = "INSERT INTO " + target->name + " VALUES " + tuple + ";";
+        }
         if (!RunSql(db, ctx, sql)) {
           return "INSERT rejected: " + sql + " :: " + engine.LastError() + "\n";
         }
@@ -613,16 +646,18 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         break;
       }
       case Op::kDelete: {
-        const SPredPtr pred = GenPred(g, *target, g.Pick(1, 2));
-        const std::string sql =
-            "DELETE FROM " + target->name + " WHERE " + pred->Render() + ";";
+        const SPredPtr pred =
+            g.Chance(15) ? nullptr : GenPred(g, *target, g.Pick(1, 2));
+        const std::string sql = pred ? "DELETE FROM " + target->name +
+                                           " WHERE " + pred->Render() + ";"
+                                     : "DELETE FROM " + target->name + ";";
         if (!RunSql(db, ctx, sql)) {
           return "DELETE rejected: " + sql + " :: " + engine.LastError() + "\n";
         }
         t.steps.push_back({.sql = sql});
         std::vector<Row> kept;
         for (Row& row : target->rows) {
-          if (pred->Eval(row) != 'T') {
+          if (pred && pred->Eval(row) != 'T') {
             kept.push_back(std::move(row));
           }
         }
