@@ -1017,10 +1017,10 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             }
           }
           // Peer-group id per position: groups of equal a (NULL == NULL).
-          std::vector<int> gid(part.size());
-          for (size_t i = 0; i < part.size(); ++i) {
-            gid[i] = (i == 0 || part[i]->a != part[i - 1]->a) ? gid[i - 1] + 1
-                                                              : gid[i - 1];
+          std::vector<int> gid(part.size(), 0);
+          for (size_t i = 1; i < part.size(); ++i) {
+            gid[i] =
+                part[i]->a != part[i - 1]->a ? gid[i - 1] + 1 : gid[i - 1];
           }
           auto excluded_at = [&](size_t i) {
             if (exclude == 1) {
