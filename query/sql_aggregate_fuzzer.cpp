@@ -690,6 +690,10 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       // ROWS BETWEEN frame params for mode 8; NTILE bucket count for mode 5;
       // direction flag for mode 6 (1 = LAG, -1 = LEAD).
       int frame_lo = 0, frame_hi = 0, ntile_n = 0, lag_lead = 0;
+      // Frame-mode aggregate: 0=SUM, 1=COUNT, 2=MIN, 3=MAX over b.
+      int wagg = 0;
+      static constexpr std::array<const char*, 4> kWagg = {"SUM", "COUNT",
+                                                           "MIN", "MAX"};
       // EXCLUDE clause for GROUPS/ROWS-frame modes:
       // 0 = NO OTHERS, 1 = CURRENT ROW, 2 = GROUP, 3 = TIES.
       int exclude = 0;
@@ -734,7 +738,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         case 8: {
           frame_lo = g.Pick(0, 2);
           frame_hi = g.Pick(0, 2);
-          sql = "SELECT u, SUM(b) OVER (PARTITION BY " + ColName(pcol) +
+          wagg = g.Pick(0, 3);
+          sql = "SELECT u, " + std::string(kWagg[wagg]) +
+                "(b) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY u ROWS BETWEEN " + std::to_string(frame_lo) +
                 " PRECEDING AND " + std::to_string(frame_hi) +
                 " FOLLOWING) FROM t" + where_sql + ";";
@@ -753,9 +759,11 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           frame_lo = g.Pick(0, 2);
           frame_hi = g.Pick(0, 2);
           exclude = g.Pick(0, 3);
+          wagg = g.Pick(0, 3);
           static constexpr std::array<const char*, 4> kExclude = {
               "", " EXCLUDE CURRENT ROW", " EXCLUDE GROUP", " EXCLUDE TIES"};
-          sql = "SELECT u, SUM(b) OVER (PARTITION BY " + ColName(pcol) +
+          sql = "SELECT u, " + std::string(kWagg[wagg]) +
+                "(b) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY a GROUPS BETWEEN " + std::to_string(frame_lo) +
                 " PRECEDING AND " + std::to_string(frame_hi) + " FOLLOWING" +
                 kExclude[exclude] + ") FROM t" + where_sql + ";";
@@ -765,7 +773,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           // RANGE frame over ORDER BY a with a numeric offset.
           frame_lo = g.Pick(0, 2);
           frame_hi = g.Pick(0, 2);
-          sql = "SELECT u, SUM(b) OVER (PARTITION BY " + ColName(pcol) +
+          wagg = g.Pick(0, 3);
+          sql = "SELECT u, " + std::string(kWagg[wagg]) +
+                "(b) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY a RANGE BETWEEN " + std::to_string(frame_lo) +
                 " PRECEDING AND " + std::to_string(frame_hi) +
                 " FOLLOWING) FROM t" + where_sql + ";";
@@ -776,9 +786,11 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           frame_lo = g.Pick(0, 2);
           frame_hi = g.Pick(0, 2);
           exclude = g.Pick(1, 3);
+          wagg = g.Pick(0, 3);
           static constexpr std::array<const char*, 4> kExclude = {
               "", " EXCLUDE CURRENT ROW", " EXCLUDE GROUP", " EXCLUDE TIES"};
-          sql = "SELECT u, SUM(b) OVER (PARTITION BY " + ColName(pcol) +
+          sql = "SELECT u, " + std::string(kWagg[wagg]) +
+                "(b) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY a ROWS BETWEEN " + std::to_string(frame_lo) +
                 " PRECEDING AND " + std::to_string(frame_hi) + " FOLLOWING" +
                 kExclude[exclude] + ") FROM t" + where_sql + ";";
@@ -792,6 +804,39 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           selected.push_back(&r);
         }
       }
+      // Frame-aggregate mirror for the SUM(b)-family modes (8, 10-12):
+      // render the aggregate over a frame's non-NULL b values.
+      auto frame_agg = [&](const std::vector<int64_t>& vals) -> std::string {
+        if (vals.empty()) {
+          // COUNT over an empty/NULL-only frame is 0, not NULL.
+          return wagg == 1 ? "|0|" : "NULL";
+        }
+        switch (wagg) {
+          case 1:
+            return "|" + std::to_string(static_cast<int64_t>(vals.size())) +
+                   "|";
+          case 2:
+            return "|" +
+                   std::to_string(*std::min_element(vals.begin(), vals.end())) +
+                   "|";
+          case 3:
+            return "|" +
+                   std::to_string(*std::max_element(vals.begin(), vals.end())) +
+                   "|";
+          default: {
+            __int128 sum = 0;
+            for (const int64_t v : vals) {
+              sum += v;
+            }
+            // An overflowing SUM errors the whole query in the engine; the
+            // run skips it, so NULL here is only a "don't care" marker.
+            if (sum > INT64_MAX || sum < INT64_MIN) {
+              return "NULL";
+            }
+            return "|" + std::to_string(static_cast<int64_t>(sum)) + "|";
+          }
+        }
+      };
       for (const MRow* r : selected) {
         std::string row = FmtInt(r->u) + ",";
         if (mode == 0) {
@@ -916,23 +961,16 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
               ++pos;
             }
           }
-          __int128 sum = 0;
-          bool any = false;
-          bool overflow = false;
+          std::vector<int64_t> vals;
           for (size_t i = 0; i < part.size(); ++i) {
             const auto idx = static_cast<int64_t>(i);
             if (idx < pos - frame_lo || idx > pos + frame_hi ||
                 part[i]->b == kNullRepr) {
               continue;
             }
-            sum += part[i]->b;
-            overflow = overflow || sum > INT64_MAX || sum < INT64_MIN;
-            any = true;
+            vals.push_back(part[i]->b);
           }
-          row += (any && !overflow
-                      ? "|" + std::to_string(static_cast<int64_t>(sum)) + "|"
-                      : std::string("NULL")) +
-                 ",";
+          row += frame_agg(vals) + ",";
         } else if (mode == 9) {
           // NTH_VALUE(b, 2) with UNBOUNDED frame: b of the partition's
           // second row by u.
@@ -996,9 +1034,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             }
             return false;
           };
-          __int128 sum = 0;
-          bool any = false;
-          bool overflow = false;
+          std::vector<int64_t> vals;
           for (size_t i = 0; i < part.size(); ++i) {
             bool in_frame = false;
             if (mode == 10) {
@@ -1024,14 +1060,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             if (!in_frame || excluded_at(i) || part[i]->b == kNullRepr) {
               continue;
             }
-            sum += part[i]->b;
-            overflow = overflow || sum > INT64_MAX || sum < INT64_MIN;
-            any = true;
+            vals.push_back(part[i]->b);
           }
-          row += (any && !overflow
-                      ? "|" + std::to_string(static_cast<int64_t>(sum)) + "|"
-                      : std::string("NULL")) +
-                 ",";
+          row += frame_agg(vals) + ",";
         }
         expected.push_back(row);
       }
