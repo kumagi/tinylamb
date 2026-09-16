@@ -584,12 +584,12 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             // values[j] holds the literal for column j + 1 (column 0 is u).
             const int64_t repr = values[static_cast<size_t>(i - 1)].first;
             lit_list +=
-                ", " +
-                (repr == kNullRepr
-                     ? "NULL"
-                     : (values[static_cast<size_t>(i - 1)].second == ColType::kInt
-                            ? std::to_string(repr)
-                            : (repr == kStrA ? "'a'" : "'bb'")));
+                ", " + (repr == kNullRepr
+                            ? "NULL"
+                            : (values[static_cast<size_t>(i - 1)].second ==
+                                       ColType::kInt
+                                   ? std::to_string(repr)
+                                   : (repr == kStrA ? "'a'" : "'bb'")));
           }
           col_list += ")";
           lit_list += ")";
@@ -609,6 +609,44 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         const SPredPtr pred = GenPred(g, *target, g.Pick(1, 2));
         const int set_col =
             g.Pick(1, static_cast<int>(target->columns.size()) - 1);
+        // Column-expression SET: `cX = cY + k` exercises per-row expression
+        // evaluation (incl. NULL propagation) on the update path.
+        std::vector<int> int_cols;
+        for (size_t i = 1; i < target->columns.size(); ++i) {
+          if (target->columns[i].type == ColType::kInt) {
+            int_cols.push_back(static_cast<int>(i));
+          }
+        }
+        if (!int_cols.empty() &&
+            target->columns[static_cast<size_t>(set_col)].type ==
+                ColType::kInt &&
+            g.Chance(25)) {
+          const int src_col = int_cols[static_cast<size_t>(
+              g.Pick(0, static_cast<int>(int_cols.size()) - 1))];
+          const int64_t k = g.Pick(-2, 2);
+          const std::string sql =
+              "UPDATE " + target->name + " SET c" + std::to_string(set_col) +
+              " = c" + std::to_string(src_col) + " + " + std::to_string(k) +
+              " WHERE " + pred->Render() + ";";
+          if (!RunSql(db, ctx, sql)) {
+            return "UPDATE rejected: " + sql + " :: " + engine.LastError() +
+                   "\n";
+          }
+          t.steps.push_back({.sql = sql});
+          for (Row& row : target->rows) {
+            if (pred->Eval(row) != 'T') {
+              continue;
+            }
+            const Value& src = row[static_cast<size_t>(src_col)];
+            if (src.IsNull()) {
+              row[static_cast<size_t>(set_col)] = Value();
+            } else {
+              row[static_cast<size_t>(set_col)] =
+                  Value(src.value.int_value + k);
+            }
+          }
+          break;
+        }
         const bool set_null = g.Chance(25);
         std::string set_lit;
         set_lit.reserve(24);
