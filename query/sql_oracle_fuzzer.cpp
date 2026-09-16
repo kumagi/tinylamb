@@ -1561,6 +1561,21 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     }
   }
 
+  // ---- CASE vs UNION ALL partition ----
+  // The ELSE arm must fire exactly on FALSE-or-NULL: `IS NOT TRUE` (not
+  // `NOT (p IS TRUE)`) is the correct complement under three-valued logic.
+  if (g.Chance(35)) {
+    const std::string then_col = std::string(g.Chance(50) ? "a" : "b");
+    const std::string else_col = std::string(g.Chance(50) ? "u" : "b");
+    t.cqp = {
+        "SELECT CASE WHEN " + t.predicate + " THEN " + then_col + " ELSE " +
+            else_col + " END AS v FROM " + tab + ";",
+        "SELECT " + then_col + " AS v FROM " + tab + " WHERE (" + t.predicate +
+            ") IS TRUE UNION ALL SELECT " + else_col + " AS v FROM " + tab +
+            " WHERE (" + t.predicate + ") IS NOT TRUE;",
+    };
+  }
+
   // ---- Set operations vs the mirror multiset ----
   if (!stab.empty()) {
     static const std::array<const char*, 6> kSetOps = {
@@ -2130,6 +2145,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->unionall_ran = t.unionall.size() == 2;
     stats->subq_ran = t.subq.size() == 3;
     stats->ssub_ran = t.ssub.size() == 2;
+    stats->cqp_ran = t.cqp.size() == 2;
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
     stats->idx_ran = !t.index_ddl.empty() && !t.index_probe.empty();
@@ -2178,6 +2194,7 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
                      /*ordered=*/false, "HAVING", &report, verbose) ||
       !CheckPair(db, ctx, trace.cte, "CTE", &report, verbose) ||
       !CheckPair(db, ctx, trace.ssub, "SSUB", &report, verbose) ||
+      !CheckPair(db, ctx, trace.cqp, "CASE", &report, verbose) ||
       !CheckRecursive(db, ctx, trace, &report, verbose) ||
       !CheckExpected(db, ctx, trace.unnest, trace.unnest_expect,
                      trace.unnest_ordered, "UNNEST", &report, verbose)) {
@@ -2214,6 +2231,9 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.ssub) {
     out += "-- ssub: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.cqp) {
+    out += "-- cqp: " + sql + "\n";
   }
   for (const std::string& sql : trace.subq) {
     out += "-- subq: " + sql + "\n";
@@ -2335,6 +2355,8 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->unionall.push_back(value);
     } else if (consume("-- ssub: ", &value)) {
       trace->ssub.push_back(value);
+    } else if (consume("-- cqp: ", &value)) {
+      trace->cqp.push_back(value);
     } else if (consume("-- subq: ", &value)) {
       trace->subq.push_back(value);
     } else if (consume("-- norec: ", &value)) {

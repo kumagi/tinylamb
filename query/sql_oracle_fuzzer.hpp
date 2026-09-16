@@ -87,6 +87,9 @@ struct OracleTrace {
   // Scalar-subquery vs LEFT JOIN + COUNT: correlated scalar aggregates must
   // equal the decorrelated join spelling (apply executor boundary).
   std::vector<std::string> ssub;  // exactly 2 when active
+  // CASE WHEN vs UNION ALL partition: the ELSE arm must fire exactly on
+  // FALSE-or-NULL, i.e. `<p> IS NOT TRUE` (NOT `<p> IS TRUE` would drop NULL).
+  std::vector<std::string> cqp;  // exactly 2 when active
   // Constraint rewriting: probe before/after the DDL must agree.
   std::vector<std::string> index_ddl;
   std::string index_probe;
@@ -122,6 +125,7 @@ struct OracleIterationStats {
   bool unionall_ran{false};
   bool subq_ran{false};
   bool ssub_ran{false};
+  bool cqp_ran{false};
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};
