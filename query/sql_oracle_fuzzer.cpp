@@ -1615,6 +1615,24 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
              "SELECT " + cols + " FROM " + tab + " GROUP BY " + cols + ";"};
   }
 
+  // ---- PIVOT vs CASE-pivot ----
+  // An unkeyed single-aggregate PIVOT must equal the manual
+  // SUM(CASE WHEN ...) spelling column for column.
+  if (g.Chance(30)) {
+    const int k0 = g.Pick(0, 2);
+    int k1 = g.Pick(0, 2);
+    while (k1 == k0) {
+      k1 = g.Pick(0, 2);
+    }
+    const std::string c0 =
+        "SUM(CASE WHEN u = " + std::to_string(k0) + " THEN a END)";
+    const std::string c1 =
+        "SUM(CASE WHEN u = " + std::to_string(k1) + " THEN a END)";
+    t.piv = {"SELECT * FROM " + tab + " PIVOT(SUM(a) FOR u IN (" +
+                 std::to_string(k0) + ", " + std::to_string(k1) + "));",
+             "SELECT " + c0 + ", " + c1 + " FROM " + tab + ";"};
+  }
+
   // ---- Set operations vs the mirror multiset ----
   if (!stab.empty()) {
     static const std::array<const char*, 6> kSetOps = {
@@ -2186,6 +2204,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->ssub_ran = t.ssub.size() == 2;
     stats->cqp_ran = t.cqp.size() == 2;
     stats->ddg_ran = t.ddg.size() == 2;
+    stats->piv_ran = t.piv.size() == 2;
     stats->notin_ran = t.notin.size() == 1;
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
@@ -2237,6 +2256,7 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
       !CheckPair(db, ctx, trace.ssub, "SSUB", &report, verbose) ||
       !CheckPair(db, ctx, trace.cqp, "CASE", &report, verbose) ||
       !CheckPair(db, ctx, trace.ddg, "DDG", &report, verbose) ||
+      !CheckPair(db, ctx, trace.piv, "PIV", &report, verbose) ||
       !CheckExpected(db, ctx, trace.notin, trace.notin_expect,
                      /*ordered=*/false, "NOTIN", &report, verbose) ||
       !CheckRecursive(db, ctx, trace, &report, verbose) ||
@@ -2281,6 +2301,9 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.ddg) {
     out += "-- ddg: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.piv) {
+    out += "-- piv: " + sql + "\n";
   }
   for (const std::string& sql : trace.notin) {
     out += "-- notin: " + sql + "\n";
@@ -2412,6 +2435,8 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->cqp.push_back(value);
     } else if (consume("-- ddg: ", &value)) {
       trace->ddg.push_back(value);
+    } else if (consume("-- piv: ", &value)) {
+      trace->piv.push_back(value);
     } else if (consume("-- notin: ", &value)) {
       trace->notin.push_back(value);
     } else if (consume("-- notinexpect: ", &value)) {

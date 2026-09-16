@@ -93,6 +93,8 @@ struct OracleTrace {
 
   // DISTINCT vs GROUP BY dedup differential: exactly 2 when active
   std::vector<std::string> ddg;
+  // PIVOT vs manual CASE-pivot differential: exactly 2 when active
+  std::vector<std::string> piv;
   // NOT IN anti-join with NULL-sensitivity: expected rows carry the
   // three-valued result (empty whenever the subquery holds any NULL).
   std::vector<std::string> notin;  // exactly 1 when active
@@ -135,6 +137,7 @@ struct OracleIterationStats {
   bool cqp_ran{false};
   bool notin_ran{false};
   bool ddg_ran{false};
+  bool piv_ran{false};
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};
