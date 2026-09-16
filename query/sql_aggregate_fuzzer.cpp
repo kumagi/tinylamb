@@ -21,6 +21,7 @@
 #include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 namespace {
@@ -251,7 +252,9 @@ struct AggSpec {
     kMin,
     kMax,
     kCountDistinct,
-    kSumDistinct
+    kSumDistinct,
+    kAvg,
+    kAvgDistinct
   } kind{kCountStar};
   // Optional FILTER (WHERE ...) predicate; only rows evaluating TRUE
   // feed the aggregate.
@@ -374,6 +377,29 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
       return any ? (IsStrCol(spec.col) ? FmtStr(best) : FmtInt(best))
                  : std::string("NULL");
     }
+    case AggSpec::Kind::kAvg:
+    case AggSpec::Kind::kAvgDistinct: {
+      // AVG yields DOUBLE: the engine accumulates in double, so huge sums
+      // round rather than overflow-error like SUM(int64) does.
+      double sum = 0;
+      int64_t cnt = 0;
+      std::vector<int64_t> seen;
+      for (const MRow& r : rows) {
+        const int64_t v = CellOf(r, spec.col);
+        if (v == kNullRepr ||
+            (spec.kind == AggSpec::Kind::kAvgDistinct &&
+             std::find(seen.begin(), seen.end(), v) != seen.end())) {
+          continue;
+        }
+        seen.push_back(v);
+        sum += static_cast<double>(v);
+        ++cnt;
+      }
+      if (cnt == 0) {
+        return std::string("NULL");
+      }
+      return "|" + FormatDoubleShortest(sum / static_cast<double>(cnt)) + "|";
+    }
   }
   return "NULL";
 }
@@ -472,6 +498,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       }
       if (g.Chance(25)) {
         aggs.push_back({"SUM(DISTINCT a)", 0, AggSpec::Kind::kSumDistinct});
+      }
+      if (g.Chance(40)) {
+        aggs.push_back({"AVG(a)", 0, AggSpec::Kind::kAvg});
+      }
+      if (g.Chance(20)) {
+        aggs.push_back({"AVG(DISTINCT a)", 0, AggSpec::Kind::kAvgDistinct});
       }
       // FILTER (WHERE ...) on some specs.
       for (AggSpec& spec : aggs) {
