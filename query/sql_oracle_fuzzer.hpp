@@ -99,6 +99,8 @@ struct OracleTrace {
   std::vector<std::string> setop_expect;    // sorted multiset
   std::vector<std::string> orderby;         // ORDER BY/LIMIT/OFFSET query
   std::vector<std::string> orderby_expect;  // ordered sequence
+  std::vector<std::string> ties;            // FETCH FIRST n ROWS WITH TIES
+  std::vector<std::string> ties_expect;     // sorted multiset
   std::vector<std::string> having;          // GROUP BY ... HAVING query
   std::vector<std::string> having_expect;   // sorted multiset
   std::vector<std::string> cte;             // {WITH form, inline form}
@@ -123,6 +125,7 @@ struct OracleIterationStats {
   bool troc_ran{false};
   bool setop_ran{false};
   bool orderby_ran{false};
+  bool ties_ran{false};
   bool having_ran{false};
   bool cte_ran{false};
   bool recursive_ran{false};
