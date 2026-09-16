@@ -339,7 +339,10 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
     case AggSpec::Kind::kSum:
     case AggSpec::Kind::kSumDistinct: {
       const std::optional<int64_t> sum = AggNum(spec, rows);
-      return sum.has_value() ? FmtInt(*sum) : std::string("NULL");
+      // INT64_MIN is a legitimate sum but collides with the kNullRepr
+      // sentinel inside FmtInt; format past the sentinel here.
+      return sum.has_value() ? "|" + std::to_string(*sum) + "|"
+                             : std::string("NULL");
     }
     case AggSpec::Kind::kCountDistinct: {
       std::vector<int64_t> seen;
@@ -821,16 +824,21 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           }
           row += FmtInt(n) + ",";
         } else if (mode == 3) {
-          int64_t sum = 0;
+          __int128 sum = 0;
           bool any = false;
+          bool overflow = false;
           for (const MRow* o : selected) {
             if (o->u <= r->u && CellOf(*o, pcol) == CellOf(*r, pcol) &&
                 o->a != kNullRepr) {
               sum += o->a;
+              overflow = overflow || sum > INT64_MAX || sum < INT64_MIN;
               any = true;
             }
           }
-          row += (any ? FmtInt(sum) : std::string("NULL")) + ",";
+          row += (any && !overflow
+                      ? "|" + std::to_string(static_cast<int64_t>(sum)) + "|"
+                      : std::string("NULL")) +
+                 ",";
         } else if (mode == 4) {
           // DENSE_RANK over a: 1 + distinct non-peer values below r->a;
           // NULL sorts first, so every non-NULL outranks it.
@@ -921,8 +929,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             overflow = overflow || sum > INT64_MAX || sum < INT64_MIN;
             any = true;
           }
-          row += (any && !overflow ? FmtInt(static_cast<int64_t>(sum))
-                                   : std::string("NULL")) +
+          row += (any && !overflow
+                      ? "|" + std::to_string(static_cast<int64_t>(sum)) + "|"
+                      : std::string("NULL")) +
                  ",";
         } else if (mode == 9) {
           // NTH_VALUE(b, 2) with UNBOUNDED frame: b of the partition's
@@ -1002,8 +1011,10 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
                 in_frame = part[i]->a == kNullRepr;
               } else {
                 in_frame = part[i]->a != kNullRepr &&
-                           part[i]->a >= r->a - frame_lo &&
-                           part[i]->a <= r->a + frame_hi;
+                           static_cast<__int128>(part[i]->a) >=
+                               static_cast<__int128>(r->a) - frame_lo &&
+                           static_cast<__int128>(part[i]->a) <=
+                               static_cast<__int128>(r->a) + frame_hi;
               }
             } else {
               in_frame =
@@ -1017,8 +1028,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             overflow = overflow || sum > INT64_MAX || sum < INT64_MIN;
             any = true;
           }
-          row += (any && !overflow ? FmtInt(static_cast<int64_t>(sum))
-                                   : std::string("NULL")) +
+          row += (any && !overflow
+                      ? "|" + std::to_string(static_cast<int64_t>(sum)) + "|"
+                      : std::string("NULL")) +
                  ",";
         }
         expected.push_back(row);
