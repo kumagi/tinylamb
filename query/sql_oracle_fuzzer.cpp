@@ -1647,6 +1647,16 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
              "SELECT " + c0 + ", " + c1 + " FROM " + tab + ";"};
   }
 
+  // ---- Set-op precedence: INTERSECT binds tighter than UNION ALL ----
+  if (!stab.empty() && g.Chance(30)) {
+    const std::string lhs = "SELECT a FROM " + tab;
+    const std::string mid = "SELECT a FROM " + stab;
+    const std::string rhs =
+        "SELECT a FROM " + tab + " WHERE " + pred2->Render();
+    t.usp = {lhs + " UNION ALL " + mid + " INTERSECT DISTINCT " + rhs + ";",
+             lhs + " UNION ALL (" + mid + " INTERSECT DISTINCT " + rhs + ");"};
+  }
+
   // ---- NOT IN literal list vs NOT(OR of equals) ----
   // Under three-valued logic both spellings must agree row-for-row:
   // NULL a makes each comparison UNKNOWN and both sides filter out.
@@ -2241,6 +2251,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->piv_ran = t.piv.size() == 2;
     stats->lwn_ran = t.lwn.size() == 2;
     stats->niv_ran = t.niv.size() == 2;
+    stats->usp_ran = t.usp.size() == 2;
     stats->notin_ran = t.notin.size() == 1;
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
@@ -2295,6 +2306,7 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
       !CheckPair(db, ctx, trace.piv, "PIV", &report, verbose) ||
       !CheckPair(db, ctx, trace.lwn, "LWN", &report, verbose) ||
       !CheckPair(db, ctx, trace.niv, "NIV", &report, verbose) ||
+      !CheckPair(db, ctx, trace.usp, "USP", &report, verbose) ||
       !CheckExpected(db, ctx, trace.notin, trace.notin_expect,
                      /*ordered=*/false, "NOTIN", &report, verbose) ||
       !CheckRecursive(db, ctx, trace, &report, verbose) ||
@@ -2348,6 +2360,9 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.niv) {
     out += "-- niv: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.usp) {
+    out += "-- usp: " + sql + "\n";
   }
   for (const std::string& sql : trace.notin) {
     out += "-- notin: " + sql + "\n";
@@ -2485,6 +2500,8 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->lwn.push_back(value);
     } else if (consume("-- niv: ", &value)) {
       trace->niv.push_back(value);
+    } else if (consume("-- usp: ", &value)) {
+      trace->usp.push_back(value);
     } else if (consume("-- notin: ", &value)) {
       trace->notin.push_back(value);
     } else if (consume("-- notinexpect: ", &value)) {
