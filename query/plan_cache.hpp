@@ -66,6 +66,7 @@
 namespace tinylamb {
 
 class Table;
+class TableStatistics;
 class Database;
 
 // ---------------------------------------------------------------------------
@@ -524,6 +525,12 @@ struct CompiledPlan {
   // Planning resolves every relation through TransactionContext::GetTable, so
   // the snapshot taken after Optimize is a superset of what the plan touches.
   std::vector<std::shared_ptr<Table>> retained_tables;
+  // Same story for TableStatistics: scan plans embed `const TableStatistics&`
+  // (e.g. FullScanPlan::stats_), whose shared_ptr lives only in the fill-time
+  // ctx.stats_ cache. ANALYZE/DROP erase that cache, so a replay without
+  // retention reads freed memory (ASan: heap-use-after-free in
+  // TableStatistics::Rows).
+  std::vector<std::shared_ptr<TableStatistics>> retained_stats;
 
   // kSelect: everything the executor-construction tail needs, captured from
   // the fill-time bound statement so hits replay it without re-binding.

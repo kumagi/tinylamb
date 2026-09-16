@@ -1319,7 +1319,8 @@ void RememberSpecializedPlan(const std::string& fingerprint, uint64_t epoch,
                              std::vector<Value> parameters,
                              CompiledPlan::Kind kind, Plan plan,
                              std::shared_ptr<Table> table,
-                             const Database* database) {
+                             const Database* database,
+                             const TransactionContext& ctx) {
   if (fingerprint.empty() || IsVolatileSpecializedPlan(fingerprint)) {
     return;
   }
@@ -1330,6 +1331,13 @@ void RememberSpecializedPlan(const std::string& fingerprint, uint64_t epoch,
   compiled->parameters = std::move(parameters);
   compiled->plan = std::move(plan);
   compiled->table = std::move(table);
+  // The plan tree borrows fill-time TableStatistics whose shared_ptr lives
+  // only in ctx.stats_; pin them so ANALYZE/DROP invalidation cannot leave
+  // replayed scans reading freed memory.
+  compiled->retained_stats.reserve(ctx.stats_.size());
+  for (const auto& entry : ctx.stats_) {
+    compiled->retained_stats.push_back(entry.second);
+  }
   StoreThreadCompiledPlan(fingerprint, std::move(compiled));
 }
 
@@ -6032,6 +6040,10 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         for (const auto& entry : ctx.tables_) {
           compiled->retained_tables.push_back(entry.second);
         }
+        compiled->retained_stats.reserve(ctx.stats_.size());
+        for (const auto& entry : ctx.stats_) {
+          compiled->retained_stats.push_back(entry.second);
+        }
         compiled->select_shape = std::move(shape);
         StoreThreadCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
       }
@@ -6307,7 +6319,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         RememberSpecializedPlan(
             plan_cache_fingerprint_, database_->SchemaEpoch(),
             plan_cache_parameters_, CompiledPlan::Kind::kUpdate, plan, table,
-            database_);
+            database_, ctx);
       }
       // Compliance primary-key mode: UPDATEs assigning the first column must
       // keep the emulated key unique and duplicate-free.
@@ -6420,7 +6432,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         RememberSpecializedPlan(
             plan_cache_fingerprint_, database_->SchemaEpoch(),
             plan_cache_parameters_, CompiledPlan::Kind::kDelete, plan, table,
-            database_);
+            database_, ctx);
       }
       return Executor(std::make_shared<DeleteExecutor>(
           ctx.txn_, *table, plan->EmitExecutor(ctx),

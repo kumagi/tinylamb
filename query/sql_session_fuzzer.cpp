@@ -521,7 +521,9 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       kCheck,
       kIndex,
       kDropTable,
-      kCreateTable
+      kCreateTable,
+      kInsertSelect,
+      kAnalyze
     };
     Op op = Op::kCheck;
     const int roll = g.Pick(1, 100);
@@ -537,10 +539,14 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       op = Op::kUpdate;
     } else if (roll <= 65) {
       op = Op::kDelete;
-    } else if (roll <= 75 && target->columns.size() >= 2) {
+    } else if (roll <= 72) {
+      op = Op::kInsertSelect;
+    } else if (roll <= 80 && target->columns.size() >= 2) {
       op = Op::kIndex;
-    } else if (roll <= 82 && static_cast<int>(tables.size()) < 3) {
+    } else if (roll <= 86 && static_cast<int>(tables.size()) < 3) {
       op = Op::kCreateTable;
+    } else if (roll <= 90) {
+      op = Op::kAnalyze;
     } else {
       op = Op::kCheck;
     }
@@ -557,8 +563,41 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           tuple += ", " + lit;
         }
         tuple += ")";
-        const std::string sql =
-            "INSERT INTO " + target->name + " VALUES " + tuple + ";";
+        std::string sql;
+        if (g.Chance(25)) {
+          // Column-list insert with a shuffled order: the engine must map
+          // values positionally onto the listed columns, not ordinal ones.
+          std::vector<int> order;
+          for (size_t i = 0; i < target->columns.size(); ++i) {
+            order.push_back(static_cast<int>(i));
+          }
+          for (size_t i = order.size() - 1; i > 0; --i) {
+            std::swap(order[i], order[static_cast<size_t>(g.Pick(0, i))]);
+          }
+          std::string col_list = "(u";
+          std::string lit_list = "(" + std::to_string(target->next_u - 1);
+          for (const int i : order) {
+            if (i == 0) {
+              continue;
+            }
+            col_list += ", c" + std::to_string(i);
+            // values[j] holds the literal for column j + 1 (column 0 is u).
+            const int64_t repr = values[static_cast<size_t>(i - 1)].first;
+            lit_list +=
+                ", " + (repr == kNullRepr
+                            ? "NULL"
+                            : (values[static_cast<size_t>(i - 1)].second ==
+                                       ColType::kInt
+                                   ? std::to_string(repr)
+                                   : (repr == kStrA ? "'a'" : "'bb'")));
+          }
+          col_list += ")";
+          lit_list += ")";
+          sql = "INSERT INTO " + target->name + " " + col_list + " VALUES " +
+                lit_list + ";";
+        } else {
+          sql = "INSERT INTO " + target->name + " VALUES " + tuple + ";";
+        }
         if (!RunSql(db, ctx, sql)) {
           return "INSERT rejected: " + sql + " :: " + engine.LastError() + "\n";
         }
@@ -570,6 +609,44 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         const SPredPtr pred = GenPred(g, *target, g.Pick(1, 2));
         const int set_col =
             g.Pick(1, static_cast<int>(target->columns.size()) - 1);
+        // Column-expression SET: `cX = cY + k` exercises per-row expression
+        // evaluation (incl. NULL propagation) on the update path.
+        std::vector<int> int_cols;
+        for (size_t i = 1; i < target->columns.size(); ++i) {
+          if (target->columns[i].type == ColType::kInt) {
+            int_cols.push_back(static_cast<int>(i));
+          }
+        }
+        if (!int_cols.empty() &&
+            target->columns[static_cast<size_t>(set_col)].type ==
+                ColType::kInt &&
+            g.Chance(25)) {
+          const int src_col = int_cols[static_cast<size_t>(
+              g.Pick(0, static_cast<int>(int_cols.size()) - 1))];
+          const int64_t k = g.Pick(-2, 2);
+          const std::string sql =
+              "UPDATE " + target->name + " SET c" + std::to_string(set_col) +
+              " = c" + std::to_string(src_col) + " + " + std::to_string(k) +
+              " WHERE " + pred->Render() + ";";
+          if (!RunSql(db, ctx, sql)) {
+            return "UPDATE rejected: " + sql + " :: " + engine.LastError() +
+                   "\n";
+          }
+          t.steps.push_back({.sql = sql});
+          for (Row& row : target->rows) {
+            if (pred->Eval(row) != 'T') {
+              continue;
+            }
+            const Value& src = row[static_cast<size_t>(src_col)];
+            if (src.IsNull()) {
+              row[static_cast<size_t>(set_col)] = Value();
+            } else {
+              row[static_cast<size_t>(set_col)] =
+                  Value(src.value.int_value + k);
+            }
+          }
+          break;
+        }
         const bool set_null = g.Chance(25);
         std::string set_lit;
         set_lit.reserve(24);
@@ -607,20 +684,73 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         break;
       }
       case Op::kDelete: {
-        const SPredPtr pred = GenPred(g, *target, g.Pick(1, 2));
-        const std::string sql =
-            "DELETE FROM " + target->name + " WHERE " + pred->Render() + ";";
+        const SPredPtr pred =
+            g.Chance(15) ? nullptr : GenPred(g, *target, g.Pick(1, 2));
+        const std::string sql = pred ? "DELETE FROM " + target->name +
+                                           " WHERE " + pred->Render() + ";"
+                                     : "DELETE FROM " + target->name + ";";
         if (!RunSql(db, ctx, sql)) {
           return "DELETE rejected: " + sql + " :: " + engine.LastError() + "\n";
         }
         t.steps.push_back({.sql = sql});
         std::vector<Row> kept;
         for (Row& row : target->rows) {
-          if (pred->Eval(row) != 'T') {
+          if (pred && pred->Eval(row) != 'T') {
             kept.push_back(std::move(row));
           }
         }
         target->rows = std::move(kept);
+        break;
+      }
+      case Op::kInsertSelect: {
+        // Self-select with a shifted primary key: `u + next_u` keeps every
+        // generated key above the current maximum, and `next_u` is advanced
+        // past the new maximum so later plain inserts cannot collide.
+        const SPredPtr pred = GenPred(g, *target, g.Pick(1, 2));
+        const int64_t offset = std::max<int64_t>(target->next_u, 1);
+        std::vector<bool> bump(target->columns.size(), false);
+        std::string sel = "u + " + std::to_string(offset);
+        for (size_t i = 1; i < target->columns.size(); ++i) {
+          bump[i] = target->columns[i].type == ColType::kInt && g.Chance(50);
+          sel += ", c" + std::to_string(i) + (bump[i] ? " + 1" : "");
+        }
+        const std::string sql = "INSERT INTO " + target->name + " SELECT " +
+                                sel + " FROM " + target->name + " WHERE " +
+                                pred->Render() + ";";
+        if (!RunSql(db, ctx, sql)) {
+          return "INSERT SELECT rejected: " + sql +
+                 " :: " + engine.LastError() + "\n";
+        }
+        t.steps.push_back({.sql = sql});
+        std::vector<Row> added;
+        int64_t max_u = offset;
+        for (const Row& row : target->rows) {
+          if (pred->Eval(row) != 'T') {
+            continue;
+          }
+          Row copy = row;
+          copy[0] = Value(row[0].value.int_value + offset);
+          for (size_t i = 1; i < target->columns.size(); ++i) {
+            if (bump[i] && !copy[i].IsNull()) {
+              copy[i] = Value(copy[i].value.int_value + 1);
+            }
+          }
+          max_u = std::max(max_u, row[0].value.int_value + offset);
+          added.push_back(std::move(copy));
+        }
+        target->rows.insert(target->rows.end(),
+                            std::make_move_iterator(added.begin()),
+                            std::make_move_iterator(added.end()));
+        target->next_u = max_u + 1;
+        break;
+      }
+      case Op::kAnalyze: {
+        const std::string sql = "ANALYZE " + target->name + ";";
+        if (!RunSql(db, ctx, sql)) {
+          return "ANALYZE rejected: " + sql + " :: " + engine.LastError() +
+                 "\n";
+        }
+        t.steps.push_back({.sql = sql});
         break;
       }
       case Op::kIndex: {
