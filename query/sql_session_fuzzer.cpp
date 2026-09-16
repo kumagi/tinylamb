@@ -521,7 +521,9 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       kCheck,
       kIndex,
       kDropTable,
-      kCreateTable
+      kCreateTable,
+      kInsertSelect,
+      kAnalyze
     };
     Op op = Op::kCheck;
     const int roll = g.Pick(1, 100);
@@ -537,10 +539,14 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       op = Op::kUpdate;
     } else if (roll <= 65) {
       op = Op::kDelete;
-    } else if (roll <= 75 && target->columns.size() >= 2) {
+    } else if (roll <= 72) {
+      op = Op::kInsertSelect;
+    } else if (roll <= 80 && target->columns.size() >= 2) {
       op = Op::kIndex;
-    } else if (roll <= 82 && static_cast<int>(tables.size()) < 3) {
+    } else if (roll <= 86 && static_cast<int>(tables.size()) < 3) {
       op = Op::kCreateTable;
+    } else if (roll <= 90) {
+      op = Op::kAnalyze;
     } else {
       op = Op::kCheck;
     }
@@ -621,6 +627,57 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           }
         }
         target->rows = std::move(kept);
+        break;
+      }
+      case Op::kInsertSelect: {
+        // Self-select with a shifted primary key: `u + next_u` keeps every
+        // generated key above the current maximum, and `next_u` is advanced
+        // past the new maximum so later plain inserts cannot collide.
+        const SPredPtr pred = GenPred(g, *target, g.Pick(1, 2));
+        const int64_t offset = std::max<int64_t>(target->next_u, 1);
+        std::vector<bool> bump(target->columns.size(), false);
+        std::string sel = "u + " + std::to_string(offset);
+        for (size_t i = 1; i < target->columns.size(); ++i) {
+          bump[i] = target->columns[i].type == ColType::kInt && g.Chance(50);
+          sel += ", c" + std::to_string(i) + (bump[i] ? " + 1" : "");
+        }
+        const std::string sql = "INSERT INTO " + target->name + " SELECT " +
+                                sel + " FROM " + target->name + " WHERE " +
+                                pred->Render() + ";";
+        if (!RunSql(db, ctx, sql)) {
+          return "INSERT SELECT rejected: " + sql +
+                 " :: " + engine.LastError() + "\n";
+        }
+        t.steps.push_back({.sql = sql});
+        std::vector<Row> added;
+        int64_t max_u = offset;
+        for (const Row& row : target->rows) {
+          if (pred->Eval(row) != 'T') {
+            continue;
+          }
+          Row copy = row;
+          copy[0] = Value(row[0].value.int_value + offset);
+          for (size_t i = 1; i < target->columns.size(); ++i) {
+            if (bump[i] && !copy[i].IsNull()) {
+              copy[i] = Value(copy[i].value.int_value + 1);
+            }
+          }
+          max_u = std::max(max_u, row[0].value.int_value + offset);
+          added.push_back(std::move(copy));
+        }
+        target->rows.insert(target->rows.end(),
+                            std::make_move_iterator(added.begin()),
+                            std::make_move_iterator(added.end()));
+        target->next_u = max_u + 1;
+        break;
+      }
+      case Op::kAnalyze: {
+        const std::string sql = "ANALYZE " + target->name + ";";
+        if (!RunSql(db, ctx, sql)) {
+          return "ANALYZE rejected: " + sql + " :: " + engine.LastError() +
+                 "\n";
+        }
+        t.steps.push_back({.sql = sql});
         break;
       }
       case Op::kIndex: {
