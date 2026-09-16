@@ -1485,13 +1485,15 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   // jtab feeds the three semi-join spellings; stab is a same-schema sibling
   // whose rows the set-operation mirror tracks.
   std::string jtab;
+  std::vector<int64_t> jxs;  // j.x values feeding the subquery oracles
   if (g.Chance(50)) {
     jtab = tab + "_j";
     t.setup.push_back("CREATE TABLE " + jtab + " (x INT64, y VARCHAR(8));");
     const int join_rows = g.Pick(2, 6);
     for (int i = 0; i < join_rows; ++i) {
-      const std::string x =
-          g.Chance(20) ? "NULL" : std::to_string(g.Pick(-3, 3));
+      const int64_t xv = g.Chance(20) ? kNull : g.Pick(-3, 3);
+      jxs.push_back(xv);
+      const std::string x = xv == kNull ? "NULL" : std::to_string(xv);
       const std::string y =
           g.Chance(25)
               ? "NULL"
@@ -1558,6 +1560,24 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
               " LEFT JOIN " + jtab + " ON " + corr2 + " GROUP BY " + tab +
               ".u;",
       };
+    }
+    // NOT IN anti-join: the result is empty whenever the subquery column
+    // contains any NULL (every comparison then goes UNKNOWN), and a NULL
+    // outer `a` is likewise never TRUE. The mirror encodes those three-
+    // valued semantics directly.
+    if (g.Chance(35)) {
+      t.notin = {"SELECT u FROM " + tab + " WHERE a NOT IN (SELECT x FROM " +
+                 jtab + ");"};
+      const bool j_has_null =
+          std::find(jxs.begin(), jxs.end(), kNull) != jxs.end();
+      for (const MirrorRow& m : mirror) {
+        if (j_has_null || m.a == kNull) {
+          continue;
+        }
+        if (std::find(jxs.begin(), jxs.end(), m.a) == jxs.end()) {
+          t.notin_expect.push_back(ExpectRow({m.u}));
+        }
+      }
     }
   }
 
@@ -2146,6 +2166,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->subq_ran = t.subq.size() == 3;
     stats->ssub_ran = t.ssub.size() == 2;
     stats->cqp_ran = t.cqp.size() == 2;
+    stats->notin_ran = t.notin.size() == 1;
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
     stats->idx_ran = !t.index_ddl.empty() && !t.index_probe.empty();
@@ -2195,6 +2216,8 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
       !CheckPair(db, ctx, trace.cte, "CTE", &report, verbose) ||
       !CheckPair(db, ctx, trace.ssub, "SSUB", &report, verbose) ||
       !CheckPair(db, ctx, trace.cqp, "CASE", &report, verbose) ||
+      !CheckExpected(db, ctx, trace.notin, trace.notin_expect,
+                     /*ordered=*/false, "NOTIN", &report, verbose) ||
       !CheckRecursive(db, ctx, trace, &report, verbose) ||
       !CheckExpected(db, ctx, trace.unnest, trace.unnest_expect,
                      trace.unnest_ordered, "UNNEST", &report, verbose)) {
@@ -2234,6 +2257,12 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.cqp) {
     out += "-- cqp: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.notin) {
+    out += "-- notin: " + sql + "\n";
+  }
+  for (const std::string& row : trace.notin_expect) {
+    out += "-- notinexpect: " + row + "\n";
   }
   for (const std::string& sql : trace.subq) {
     out += "-- subq: " + sql + "\n";
@@ -2357,6 +2386,10 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->ssub.push_back(value);
     } else if (consume("-- cqp: ", &value)) {
       trace->cqp.push_back(value);
+    } else if (consume("-- notin: ", &value)) {
+      trace->notin.push_back(value);
+    } else if (consume("-- notinexpect: ", &value)) {
+      trace->notin_expect.push_back(value);
     } else if (consume("-- subq: ", &value)) {
       trace->subq.push_back(value);
     } else if (consume("-- norec: ", &value)) {
