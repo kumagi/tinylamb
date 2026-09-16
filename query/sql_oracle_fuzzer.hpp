@@ -97,6 +97,8 @@ struct OracleTrace {
   std::vector<std::string> piv;
   // LIMIT/OFFSET vs ROW_NUMBER window differential: exactly 2 when active
   std::vector<std::string> lwn;
+  // NOT IN literal list vs NOT(OR-equals) 3VL differential: 2 when active
+  std::vector<std::string> niv;
   // NOT IN anti-join with NULL-sensitivity: expected rows carry the
   // three-valued result (empty whenever the subquery holds any NULL).
   std::vector<std::string> notin;  // exactly 1 when active
@@ -141,6 +143,7 @@ struct OracleIterationStats {
   bool ddg_ran{false};
   bool piv_ran{false};
   bool lwn_ran{false};
+  bool niv_ran{false};
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};
