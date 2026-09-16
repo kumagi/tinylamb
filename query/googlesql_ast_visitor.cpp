@@ -5914,6 +5914,12 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         ASSIGN_OR_RETURN(Expression, hv207291_0, (VisitExpression(term)));
         expressions.push_back(std::move(hv207291_0));
       }
+      if (expressions.empty()) {
+        // `GROUP BY ()` groups every row into a single group. An empty key
+        // list is indistinguishable from no GROUP BY downstream, so key on
+        // a constant: one group, and non-aggregate references still error.
+        expressions.push_back(ConstantValueExp(Value(int64_t{0})));
+      }
       statement->SetGroupBy(std::move(expressions));
     }
   }
