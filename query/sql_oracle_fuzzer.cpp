@@ -1522,14 +1522,30 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   // ---- Subquery differential: IN vs correlated EXISTS vs JOIN+DISTINCT ----
   // Positive forms only: NOT IN and NOT EXISTS diverge under 3VL by design.
   if (!jtab.empty()) {
-    t.subq = {
-        "SELECT COUNT(*) FROM " + tab + " WHERE a IN (SELECT x FROM " + jtab +
-            ");",
-        "SELECT COUNT(*) FROM " + tab + " WHERE EXISTS (SELECT 1 FROM " + jtab +
-            " WHERE " + jtab + ".x = " + tab + ".a);",
-        "SELECT COUNT(*) FROM (SELECT DISTINCT u FROM " + tab + " JOIN " +
-            jtab + " ON " + tab + ".a = " + jtab + ".x) semi;",
-    };
+    if (g.Chance(60)) {
+      t.subq = {
+          "SELECT COUNT(*) FROM " + tab + " WHERE a IN (SELECT x FROM " + jtab +
+              ");",
+          "SELECT COUNT(*) FROM " + tab + " WHERE EXISTS (SELECT 1 FROM " +
+              jtab + " WHERE " + jtab + ".x = " + tab + ".a);",
+          "SELECT COUNT(*) FROM (SELECT DISTINCT u FROM " + tab + " JOIN " +
+              jtab + " ON " + tab + ".a = " + jtab + ".x) semi;",
+      };
+    } else {
+      // Correlated variant: the subquery's own WHERE references the outer
+      // row, exercising the apply/correlated-cache path.
+      const std::string corr = g.Chance(50) ? (jtab + ".x = " + tab + ".b")
+                                            : (jtab + ".y = " + tab + ".s");
+      t.subq = {
+          "SELECT COUNT(*) FROM " + tab + " WHERE a IN (SELECT x FROM " + jtab +
+              " WHERE " + corr + ");",
+          "SELECT COUNT(*) FROM " + tab + " WHERE EXISTS (SELECT 1 FROM " +
+              jtab + " WHERE " + corr + " AND " + jtab + ".x = " + tab + ".a);",
+          "SELECT COUNT(*) FROM (SELECT DISTINCT u FROM " + tab + " JOIN " +
+              jtab + " ON " + tab + ".a = " + jtab + ".x AND " + corr +
+              ") semi;",
+      };
+    }
   }
 
   // ---- Set operations vs the mirror multiset ----
