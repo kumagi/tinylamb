@@ -38,12 +38,12 @@
 namespace tinylamb {
 
 StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn,
-                                         slot_t slot) const {
+                                         slot_t slot, bool resolve_head) const {
   const RowPosition position(page_id, slot);
   if (row_max_ <= slot || rows_[slot].offset == 0) {
-    return txn.ReadVersion(position, std::nullopt);
+    return txn.ReadVersion(position, std::nullopt, resolve_head);
   }
-  return txn.ReadVersion(position, GetRow(slot));
+  return txn.ReadVersion(position, GetRow(slot), resolve_head);
 }
 
 /*
@@ -81,11 +81,21 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
   // Reuse the first hole whose MVCC intent is available. A concurrent delete
   // can leave an earlier physical hole reserved until commit; repeatedly
   // choosing only that hole would starve every inserter on the page.
+  // A hole whose committed chain still serves the deleted row under THIS
+  // transaction's snapshot is also unusable: staging the insert there would
+  // mask the snapshot-visible version behind our own pending value
+  // (ReadVersion consults pending first), silently dropping the old row from
+  // the inserter's view.  Acquire, re-check, and release on disqualification —
+  // once we hold the intent no other writer can publish a version covering
+  // our snapshot at this position.
   slot_t slot = 0;
   for (; slot < row_max_; ++slot) {
-    if (rows_[slot].offset == 0 &&
-        txn.AddWriteSet(RowPosition(page_id, slot))) {
-      break;
+    const RowPosition hole(page_id, slot);
+    if (rows_[slot].offset == 0 && txn.AddWriteSet(hole)) {
+      if (!txn.SnapshotSeesRow(hole)) {
+        break;
+      }
+      txn.ReleaseWriteIntent(hole);
     }
   }
   if (slot == row_max_ && !txn.AddWriteSet(RowPosition(page_id, slot))) {

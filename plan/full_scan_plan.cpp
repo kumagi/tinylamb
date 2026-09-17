@@ -32,13 +32,21 @@
 namespace tinylamb {
 
 FullScanPlan::FullScanPlan(const Table& table, const TableStatistics& stats,
-                           size_t max_rows)
-    : table_(table), stats_(stats), max_rows_(max_rows) {}
+                           size_t max_rows, bool lock_rows,
+                           bool wait_for_write_intent)
+    : lock_rows_(lock_rows),
+      wait_for_write_intent_(wait_for_write_intent),
+      table_(table),
+      stats_(stats),
+      max_rows_(max_rows) {}
 
 FullScanPlan::FullScanPlan(const Table& table, const TableStatistics& stats,
                            std::vector<IntegerPeekCompare> peek_compares,
-                           size_t max_rows)
-    : table_(table),
+                           size_t max_rows, bool lock_rows,
+                           bool wait_for_write_intent)
+    : lock_rows_(lock_rows),
+      wait_for_write_intent_(wait_for_write_intent),
+      table_(table),
       stats_(stats),
       max_rows_(max_rows),
       peek_compares_(std::move(peek_compares)) {}

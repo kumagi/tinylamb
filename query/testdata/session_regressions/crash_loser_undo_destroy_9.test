@@ -1,0 +1,34 @@
+-- tinylamb-session-test v1
+-- seed: 9
+-- stmt: CREATE TABLE tbl0 (u INT64, c1 INT64, c2 INT64);
+-- stmt: CREATE TABLE tbl1 (u INT64, c1 INT64, c2 INT64);
+-- stmt: INSERT INTO tbl0 VALUES (0, 3, -3);
+-- stmt: UPDATE tbl0 SET c2 = COALESCE(3, c1) WHERE ((c2 IS NULL) AND (u IS NULL));
+-- ddl: CREATE INDEX idx0 ON tbl1 KEY(1)
+-- stmt: UPDATE tbl1 SET c2 = -2 WHERE (NOT (u <= -3));
+-- check: tbl1
+-- stmt: DELETE FROM tbl0 WHERE (NOT (c2 != u));
+-- stmt: UPDATE tbl1 SET c2 = c1, c1 = c2 WHERE ((c1 IS NULL) AND (u IS NOT NULL));
+-- stmt: CREATE TABLE tbl2 (u INT64, c1 INT64, c2 INT64);
+-- commit
+-- stmt: DROP TABLE tbl0;
+-- check: tbl1
+-- stmt: INSERT INTO tbl2 VALUES (0, 3, -3);
+-- abort
+-- check: tbl0
+-- expect: [0, 3, -3]
+-- check: tbl1
+-- check: tbl2
+-- check: tbl1
+-- stmt: DROP TABLE tbl1;
+-- ddl: CREATE INDEX idx1 ON tbl0 KEY(1,0) INCLUDE(1)
+-- crash
+-- check: tbl0
+-- expect: [0, 3, -3]
+-- failure: post-crash state mismatch on tbl0 after step 15
+table tbl0: mirror has 1 rows, engine has 0
+  expected:
+    [0, 3, -3]
+  actual:
+  first diff at 0: expected [0, 3, -3] vs actual <missing>
+

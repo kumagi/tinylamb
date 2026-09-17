@@ -13,10 +13,12 @@
 #include "common/join_kind.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/join_kind.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -33,6 +35,7 @@ BatchNestedLoopJoin::BatchNestedLoopJoin(Executor left, Schema left_schema,
       right_(std::move(right)),
       right_schema_(std::move(right_schema)),
       predicate_(std::move(predicate)),
+      predicate_conjuncts_(SplitConjuncts(predicate_)),
       kind_(kind),
       block_size_(std::max<size_t>(16, block_size)),
       combined_schema_(left_schema_ + right_schema_) {}
@@ -47,6 +50,22 @@ bool BatchNestedLoopJoin::EvaluatePredicate(const Row& left,
   // emit the outer row instead of erroring).  The error is recorded in the
   // sticky predicate_error_ and re-surfaced by Next().
   Row combined = left + right;
+  if (kind_ == JoinKind::kInner) {
+    // An inner-join predicate is a WHERE-level filter: conjuncts may have
+    // been reordered by canonicalization, so a sibling that cleanly rejects
+    // the pair suppresses errors from the rest (commutative semantics).
+    StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+        predicate_conjuncts_, [&](const Expression& conjunct) {
+          return conjunct->TryEvaluate(combined, combined_schema_);
+        });
+    if (!pass.HasValue()) {
+      if (predicate_error_.ok()) {
+        predicate_error_ = pass.GetStatus();
+      }
+      return false;
+    }
+    return pass.Value();
+  }
   StatusOr<Value> res = predicate_->TryEvaluate(combined, combined_schema_);
   if (!res.HasValue()) {
     if (predicate_error_.ok()) {

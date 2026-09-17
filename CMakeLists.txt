@@ -807,6 +807,14 @@ add_simple_test(executor/executor_extra_test.cpp)
 add_simple_test(recovery/recovery_extra_test.cpp)
 add_simple_test(database/database_extra_test.cpp)
 add_simple_test(transaction/transaction_extra_test.cpp)
+add_simple_test(query/sql_function_coverage_test.cpp)
+add_simple_test(query/sql_window_agg_coverage_test.cpp)
+add_simple_test(query/sql_engine_coverage_test.cpp)
+add_simple_test(executor/executor_feature_test.cpp)
+add_simple_test(plan/cascades_rules_coverage_test.cpp)
+add_simple_test(type/interval_test.cpp)
+add_simple_test(transaction/transaction_coverage_test.cpp)
+add_simple_test(index/bptree_coverage_test.cpp)
 add_simple_test(page/page_extra_test.cpp)
 add_simple_test(expression/expr_extra_test.cpp)
 add_simple_test(cli_main_test.cpp)
@@ -833,6 +841,18 @@ endif()
 ## Fuzzing
 ########################################
 if(TINYLAMB_ENABLE_FUZZ)
+    # -fsanitize=fuzzer is the clang libFuzzer driver; GCC has no fuzzer
+    # sanitizer nor the runtime, and no PC-guard coverage instrumentation to
+    # feed it. Fuzz targets are clang-only by design (see fuzzer-nightly.yml
+    # which pins CC=clang); fail at configure time with this explanation
+    # instead of 25 cryptic compile errors.
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+                "TINYLAMB_ENABLE_FUZZ requires clang (libFuzzer is clang-only); "
+                "reconfigure with -DCMAKE_CXX_COMPILER=clang++ or turn the "
+                "option off. The deterministic *_fuzzer_test replay suites "
+                "still build and run under GCC.")
+    endif()
 function(add_fuzzer_test file_path)
     set(fuzzer_option "-fsanitize=fuzzer,undefined,bounds")
     # When the global sanitizer interface lib is active the linked static

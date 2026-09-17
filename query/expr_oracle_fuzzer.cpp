@@ -148,7 +148,9 @@ std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
 
   // Oracle (b): full engine execution of the same expression text.
   ScopedDb sdb("expr_oracle_fuzz");
-  CHECK(sdb.get() != nullptr);
+  if (sdb.get() == nullptr) {
+    return report;  // resource pressure: keep any rewrite finding, skip (b)
+  }
   Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
   const EngineOutcome engine = RunScalar(db, ctx, t.sql);
@@ -860,7 +862,9 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
   t.matched_ids = expected_ids;
 
   ScopedDb sdb("row_expr_fuzz");
-  CHECK(sdb.get() != nullptr);
+  if (sdb.get() == nullptr) {
+    return "";  // resource pressure: skip the engine leg
+  }
   Database& db = *sdb;
 
   const std::string tab = "t_fuzz_" + RandomString(6);

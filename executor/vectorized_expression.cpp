@@ -92,6 +92,72 @@ StatusOr<ColumnVector> VectorizedExpression::Evaluate(
     }
     case TypeTag::kBinaryExp: {
       const auto& binary = expr->AsBinaryExpression();
+      // AND/OR short-circuit like the AST (EvaluateMaybeShortCircuited):
+      // the right child must not be evaluated on rows where the left operand
+      // already decides the result, so a rhs error (e.g. division by zero)
+      // is suppressed on exactly those rows.  An eager evaluation of both
+      // sides would raise where AST/bytecode return FALSE/TRUE.
+      if (binary.Op() == BinaryOperation::kAnd ||
+          binary.Op() == BinaryOperation::kOr) {
+        ASSIGN_OR_RETURN(ColumnVector, left_vec,
+                         (Evaluate(binary.Left(), schema, chunk, sel)));
+        // AND decides FALSE when lhs is FALSE; OR decides TRUE when lhs is
+        // TRUE.  NULL never decides (falls through to rhs evaluation).
+        const bool is_and = binary.Op() == BinaryOperation::kAnd;
+        std::vector<char> decided(active_count, 0);
+        std::vector<uint32_t> pending_rows;
+        pending_rows.reserve(active_count);
+        for (size_t i = 0; i < active_count; ++i) {
+          const bool l_null = left_vec.IsNull(i);
+          const bool lv = !l_null && left_vec.ValueAt(i).Truthy();
+          if (!l_null && lv != is_and) {
+            decided[i] = 1;
+          } else {
+            pending_rows.push_back(
+                static_cast<uint32_t>(sel != nullptr ? (*sel)[i] : i));
+          }
+        }
+        // Evaluate rhs only on undecided rows: rows the AST suppresses rhs
+        // errors on never reach the rhs evaluator.
+        ColumnVector right_vec(ValueType::kNull, 0);
+        if (!pending_rows.empty()) {
+          SelectionVector pending_sel(std::move(pending_rows));
+          ASSIGN_OR_RETURN(
+              ColumnVector, evaluated,
+              (Evaluate(binary.Right(), schema, chunk, &pending_sel)));
+          right_vec = std::move(evaluated);
+        }
+        ColumnVector result(ValueType::kInt64, active_count);
+        for (size_t i = 0, p = 0; i < active_count; ++i) {
+          const bool l_null = left_vec.IsNull(i);
+          const bool lv = !l_null && left_vec.ValueAt(i).Truthy();
+          if (decided[i] != 0) {
+            result.Append(Value(is_and ? int64_t{0} : int64_t{1}));
+            continue;
+          }
+          const bool r_null = right_vec.IsNull(p);
+          const bool rv = !r_null && right_vec.ValueAt(p).Truthy();
+          ++p;
+          if (is_and) {
+            if ((!l_null && !lv) || (!r_null && !rv)) {
+              result.Append(Value(int64_t{0}));
+            } else if (l_null || r_null) {
+              result.Append(Value());
+            } else {
+              result.Append(Value(int64_t{1}));
+            }
+          } else {
+            if ((!l_null && lv) || (!r_null && rv)) {
+              result.Append(Value(int64_t{1}));
+            } else if (l_null || r_null) {
+              result.Append(Value());
+            } else {
+              result.Append(Value(int64_t{0}));
+            }
+          }
+        }
+        return result;
+      }
       ASSIGN_OR_RETURN(ColumnVector, left_vec,
                        (Evaluate(binary.Left(), schema, chunk, sel)));
       ASSIGN_OR_RETURN(ColumnVector, right_vec,

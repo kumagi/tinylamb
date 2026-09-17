@@ -30,10 +30,13 @@ namespace tinylamb {
 class FullScanPlan : public PlanBase {
  public:
   explicit FullScanPlan(const Table& table, const TableStatistics& ts,
-                        size_t max_rows = std::numeric_limits<size_t>::max());
+                        size_t max_rows = std::numeric_limits<size_t>::max(),
+                        bool lock_rows = false,
+                        bool wait_for_write_intent = true);
   FullScanPlan(const Table& table, const TableStatistics& ts,
                std::vector<IntegerPeekCompare> peek_compares,
-               size_t max_rows = std::numeric_limits<size_t>::max());
+               size_t max_rows = std::numeric_limits<size_t>::max(),
+               bool lock_rows = false, bool wait_for_write_intent = true);
   FullScanPlan(const FullScanPlan&) = delete;
   FullScanPlan(FullScanPlan&&) = delete;
   FullScanPlan& operator=(const FullScanPlan&) = delete;
@@ -58,6 +61,12 @@ class FullScanPlan : public PlanBase {
   [[nodiscard]] std::string ToString() const override;
 
  private:
+  // lock_rows_ marks a DML source scan (UPDATE/DELETE): the executor takes a
+  // write intent on every occupied slot before resolving its row, so the
+  // yielded image is the head version rather than this transaction's
+  // snapshot version -- the full-scan twin of IndexScanPlan::lock_rows_.
+  bool lock_rows_{false};
+  bool wait_for_write_intent_{true};
   const Table& table_;
   const TableStatistics& stats_;
   size_t max_rows_;

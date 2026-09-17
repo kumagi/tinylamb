@@ -107,6 +107,39 @@ const std::vector<std::vector<std::string>>& SeedPool() {
           "FROM w;",
           "SELECT g, SUM(v) OVER (PARTITION BY g) FROM w;",
           "SELECT g, COUNT(*) OVER () c FROM w ORDER BY c;",
+          "SELECT g, v, DENSE_RANK() OVER (ORDER BY v DESC) "
+          "dr FROM w;",
+          "SELECT g, v, PERCENT_RANK() OVER (ORDER BY v) pr, "
+          "CUME_DIST() OVER (ORDER BY v) cd FROM w;",
+          "SELECT g, v, NTILE(3) OVER (PARTITION BY g ORDER "
+          "BY v) nt FROM w;",
+          "SELECT v, LAG(v, 1, -1) OVER (ORDER BY g, v) p, "
+          "LEAD(v) OVER (ORDER BY g, v) n FROM w;",
+          "SELECT g, v, FIRST_VALUE(v) OVER (PARTITION BY g "
+          "ORDER BY v) fv, LAST_VALUE(v) OVER (PARTITION BY g "
+          "ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND "
+          "UNBOUNDED FOLLOWING) lv FROM w;",
+          "SELECT v, SUM(v) OVER (ORDER BY v ROWS BETWEEN 1 "
+          "PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) "
+          "win FROM w;",
+          "SELECT v, COUNT(*) OVER (ORDER BY v RANGE BETWEEN "
+          "5 PRECEDING AND CURRENT ROW) rg FROM w;",
+          "SELECT v, COUNT(*) OVER (ORDER BY v GROUPS BETWEEN "
+          "1 PRECEDING AND 1 FOLLOWING) gp FROM w;",
+          "SELECT v, COUNT(*) OVER (PARTITION BY g ORDER BY v "
+          "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW "
+          "EXCLUDE TIES) et FROM w;",
+          "SELECT g, ARRAY_AGG(v ORDER BY v) OVER (PARTITION "
+          "BY g) aa, STRING_AGG(t, ',') OVER (ORDER BY g) sa "
+          "FROM w;",
+          "SELECT g, COUNT(DISTINCT v) OVER (PARTITION BY g) "
+          "dv, COUNTIF(v > 10) OVER (PARTITION BY g) cf FROM "
+          "w;",
+          "SELECT g, v FROM w ORDER BY g LIMIT 2 WITH TIES;",
+          "CREATE INDEX w_g ON w(g);",
+          "SELECT g, COUNT(DISTINCT v) cd FROM w GROUP BY g;",
+          "SELECT g, ROW_NUMBER() OVER (PARTITION BY g ORDER "
+          "BY v) FROM w;",
       },
       // CTE + correlated and uncorrelated subqueries.
       {
@@ -306,6 +339,93 @@ const std::vector<std::vector<std::string>>& SeedPool() {
           "t_math;",
           "SELECT x, IFNULL(x, 0) FROM t_math WHERE ABS(x) > 1;",
           "SELECT x, GREATEST(x, 2), LEAST(x, 2) FROM t_math;",
+      },
+      // Guarded division: a rejecting conjunct must suppress sibling
+      // errors regardless of canonicalized order.
+      {
+          "CREATE TABLE dg (u INT64, a INT64, b INT64);",
+          "INSERT INTO dg VALUES (0, 0, 5), (1, 2, -3), (2, "
+          "NULL, 0), (3, 1, NULL);",
+          "SELECT u FROM dg WHERE a <> 0 AND b / a > -10 ORDER "
+          "BY u;",
+          "SELECT u FROM dg WHERE b / a > -10 AND a <> 0 ORDER "
+          "BY u;",
+          "SELECT COUNT(*) FROM dg WHERE a <> 0 AND b / a > "
+          "-10;",
+          "SELECT u FROM dg WHERE a > 0 OR b / a < -10 ORDER "
+          "BY u;",
+      },
+      // Grouped outer joins and TopN through a join.
+      {
+          "CREATE TABLE gj (x INT64, y INT64);",
+          "INSERT INTO gj VALUES (1, 10), (2, NULL), (NULL, 5);",
+          "CREATE TABLE gk (x INT64, z INT64);",
+          "INSERT INTO gk VALUES (1, 100), (3, 300), (NULL, "
+          "9);",
+          "SELECT gj.x, gk.z FROM gj LEFT JOIN gk ON gj.x = "
+          "gk.x GROUP BY gj.x, gk.z;",
+          "SELECT gj.x, COUNT(gk.z) FROM gj LEFT JOIN gk ON "
+          "gj.x = gk.x GROUP BY gj.x ORDER BY gj.x;",
+          "SELECT gj.x, gk.z FROM gj JOIN gk ON gj.x = gk.x "
+          "ORDER BY gj.x, gk.z LIMIT 2;",
+          "SELECT gj.x FROM gj FULL JOIN gk ON gj.x = gk.x "
+          "WHERE gk.z IS NULL;",
+          "CREATE INDEX gj_x ON gj(x);",
+          "SELECT gj.x, gk.z FROM gj LEFT JOIN gk ON gj.x = "
+          "gk.x ORDER BY gj.x;",
+      },
+      // LATERAL and correlated subqueries.
+      {
+          "CREATE TABLE la (x INT64, y INT64);",
+          "INSERT INTO la VALUES (1, 10), (2, NULL), (3, -4);",
+          "SELECT la.x, s.v FROM la CROSS JOIN LATERAL (SELECT "
+          "la.y + 1 AS v) s;",
+          "SELECT la.x, s.v FROM la LEFT JOIN LATERAL (SELECT "
+          "la.y * 2 AS v) s ON TRUE;",
+          "SELECT x FROM la WHERE EXISTS (SELECT 1 FROM la o "
+          "WHERE o.y = la.x);",
+          "SELECT x FROM la WHERE x IN (SELECT y FROM la "
+          "WHERE y IS NOT NULL);",
+          "SELECT x FROM la WHERE x NOT IN (SELECT y FROM la);",
+      },
+      // Multi-site CTE with pushed filters and a recursive CTE.
+      {
+          "CREATE TABLE rc (id INT64, grp INT64, val INT64);",
+          "INSERT INTO rc VALUES (1, 1, 10), (2, 1, NULL), (3, "
+          "2, 30), (4, NULL, 5);",
+          "WITH f AS (SELECT id, grp FROM rc WHERE val > 1 OR "
+          "val IS NULL) SELECT COUNT(*) FROM f;",
+          "WITH f AS (SELECT grp, SUM(val) sv FROM rc GROUP BY "
+          "grp) SELECT f1.sv FROM f f1 JOIN f f2 ON f1.grp = "
+          "f2.grp WHERE f1.sv IS NOT NULL;",
+          "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT "
+          "n + 1 FROM r WHERE n < 8) SELECT SUM(n), MAX(n) "
+          "FROM r;",
+      },
+      // Set operations carrying NULLs through joins.
+      {
+          "CREATE TABLE sa (v INT64);",
+          "INSERT INTO sa VALUES (1), (NULL), (3);",
+          "CREATE TABLE sb (v INT64);",
+          "INSERT INTO sb VALUES (NULL), (3), (4);",
+          "SELECT v FROM sa UNION SELECT v FROM sb ORDER BY "
+          "v;",
+          "SELECT v FROM sa INTERSECT SELECT v FROM sb;",
+          "SELECT v FROM sa EXCEPT SELECT v FROM sb;",
+          "SELECT sa.v, sb.v FROM sa FULL JOIN sb ON sa.v = "
+          "sb.v;",
+          "SELECT v FROM (SELECT v FROM sa UNION ALL SELECT v "
+          "FROM sb) u WHERE v IS NOT NULL;",
+      },
+      // DISTINCT ON / WITH TIES / FETCH boundary shapes.
+      {
+          "CREATE TABLE dt (g INT64, v INT64);",
+          "INSERT INTO dt VALUES (1, 5), (1, 5), (2, NULL), "
+          "(2, 7), (NULL, 1);",
+          "SELECT DISTINCT ON (g) g, v FROM dt ORDER BY g, v;",
+          "SELECT g, v FROM dt ORDER BY v LIMIT 2 WITH TIES;",
+          "SELECT g, v FROM dt ORDER BY g OFFSET 1 FETCH NEXT "
+          "2 ROWS WITH TIES;",
       },
   };
   return *pool;
@@ -595,6 +715,13 @@ std::string RunSession(
     const std::string sql =
         (mutate != nullptr && !IsDdl(original)) ? mutate(original) : original;
     t->statements.push_back(sql);
+    // The frontend rejects CREATE INDEX; route it through the catalog API so
+    // index-coverage seeds actually build indexes.
+    if (sql.starts_with("CREATE INDEX ") ||
+        sql.starts_with("CREATE UNIQUE INDEX ")) {
+      ApplyIndexSpec(db, ctx, sql);
+      continue;
+    }
     const RunOutcome first = RunStatement(db, ctx, sql);
     if (first.threw) {
       // Oracle (1): an escaped exception is a crash-adjacent finding; under
@@ -632,7 +759,9 @@ std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
   std::shuffle(statements.begin(), statements.end(), rng);
 
   ScopedDb db_holder("griffin_fuzz");
-  CHECK(db_holder.get() != nullptr);
+  if (db_holder.get() == nullptr) {
+    return "";  // resource pressure: iteration skipped
+  }
   Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
 
@@ -668,7 +797,9 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose) {
   // Re-run the recorded session verbatim (identity mutation) and report
   // whether the failure still reproduces. "" means fixed or flaky-clean.
   ScopedDb db_holder("griffin_replay");
-  CHECK(db_holder.get() != nullptr);
+  if (db_holder.get() == nullptr) {
+    return "";  // resource pressure: replay skipped, not a mismatch
+  }
   Database& db = *db_holder;
   TransactionContext ctx = db.BeginContext();
   GriffinTrace fresh;

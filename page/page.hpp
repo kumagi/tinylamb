@@ -54,7 +54,10 @@ class Page {
   size_t RowCount(Transaction& txn) const;
 
   // Row page manipulations.
-  StatusOr<std::string_view> Read(Transaction& txn, slot_t slot) const;
+  // resolve_head applies to row pages only: false is a pure snapshot read
+  // (see RowPage::Read / Transaction::ReadVersion).
+  StatusOr<std::string_view> Read(Transaction& txn, slot_t slot,
+                                  bool resolve_head = true) const;
 
   StatusOr<slot_t> Insert(Transaction& txn, std::string_view record);
 

@@ -367,14 +367,23 @@ TEST_F(PagePoolTest, MetaPageAllocateDestroyReuse) {
   // Release p2's exclusive latch before the pool is asked to relatch it.
   p2.PageUnlock();
 
-  // Act 3 -- the next allocation must reuse the freed page ID
-  PageRef p3 = pm.AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+  // Act 3 -- while the destroying transaction is still active the freed id
+  // is withheld (its destroy can still be undone, and reissue would let the
+  // abort restore a stale image over the new owner), so this allocation
+  // grows past the high-water mark instead.
+  PageRef p3_early = pm.AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+  ASSERT_NE(p3_early->PageID(), p2->PageID());
+  ASSERT_SUCCESS(txn.PreCommit());
+
+  // Act 4 -- once the destroyer has settled the freed id is reissued (LIFO).
+  Transaction txn2 = tm.Begin();
+  PageRef p3 = pm.AllocateNewPage(txn2, PageType::kBranchPage).MoveValue();
   ASSERT_EQ(p3->PageID(), p2->PageID());
 
   // Assert -- the meta page tracks the allocated max page count
   PageRef meta = pm.GetPool()->GetPage(0, nullptr).MoveValue();
-  ASSERT_GE(meta->body.meta_page.MaxPageCountForTest(), p3->PageID());
-  ASSERT_SUCCESS(txn.PreCommit());
+  ASSERT_GE(meta->body.meta_page.MaxPageCountForTest(), p3_early->PageID());
+  ASSERT_SUCCESS(txn2.PreCommit());
 }
 
 TEST_F(PagePoolTest, EvictionResumesAfterPoolGrewPastCapacity) {

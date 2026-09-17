@@ -59,8 +59,11 @@ class RowPage {
     // memset(data_, 0, kBodySize);
   }
 
+  // resolve_head is forwarded to Transaction::ReadVersion: false gives a
+  // pure snapshot read that ignores the head-upgrade effect of an own
+  // unstaged write intent.
   StatusOr<std::string_view> Read(page_id_t page_id, Transaction& txn,
-                                  slot_t slot) const;
+                                  slot_t slot, bool resolve_head = true) const;
 
   StatusOr<slot_t> Insert(page_id_t page_id, Transaction& txn,
                           std::string_view record);

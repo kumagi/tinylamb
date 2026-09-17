@@ -33,12 +33,18 @@ class Transaction;
 
 class IndexScanIterator : public IteratorBase {
  public:
+  // resolve_head marks a DML source scan: ResolveRow then serves the
+  // position's newest committed version when the transaction holds an
+  // unstaged write intent on it.  Plain scans keep the default (pure
+  // snapshot read) so an intent left by an earlier DML statement cannot
+  // leak a post-snapshot commit into a SELECT.
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
                     const Value& begin = Value(), const Value& end = Value(),
-                    bool ascending = true);
+                    bool ascending = true, bool resolve_head = false);
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
                     const std::vector<Value>& begin_key,
-                    const std::vector<Value>& end_key, bool ascending = true);
+                    const std::vector<Value>& end_key, bool ascending = true,
+                    bool resolve_head = false);
   IndexScanIterator(const IndexScanIterator&) = delete;
   IndexScanIterator(IndexScanIterator&&) = delete;
   IndexScanIterator& operator=(const IndexScanIterator&) = delete;
@@ -80,6 +86,7 @@ class IndexScanIterator : public IteratorBase {
   Value begin_;
   Value end_;
   bool ascending_;
+  bool resolve_head_;
   bool is_unique_;
   // Set by Clear(): once cleared the iterator must never report valid again
   // even though the underlying BPlusTreeIterator may still iterate.

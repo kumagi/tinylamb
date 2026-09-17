@@ -66,6 +66,27 @@ Volatility GetFunctionVolatility(std::string_view func_name) {
   return Volatility::kImmutable;
 }
 
+// Reducing x + x to x * 2 must not change the number of evaluations of a
+// volatile expression or a subquery. Immutable scalar trees are safe.
+bool SafeToReduceEvaluationCount(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kQueryExp ||
+      expression->Type() == TypeTag::kAggregateExp) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp &&
+      GetFunctionVolatility(
+          expression->AsFunctionCallExpression().FuncName()) !=
+          Volatility::kImmutable) {
+    return false;
+  }
+  return std::ranges::all_of(ExpressionChildren(expression),
+                             SafeToReduceEvaluationCount);
+}
+
 namespace {
 
 // Mirrors the timestamp-shape detection in EvaluateBinary: `=` on two
@@ -796,27 +817,6 @@ bool StaticallyNonBoolean(const Expression& expression) {
     }
   }
   return false;
-}
-
-// Reducing x + x to x * 2 must not change the number of evaluations of a
-// volatile expression or a subquery. Immutable scalar trees are safe.
-bool SafeToReduceEvaluationCount(  // NOLINT(misc-no-recursion)
-    const Expression& expression) {
-  if (!expression) {
-    return false;
-  }
-  if (expression->Type() == TypeTag::kQueryExp ||
-      expression->Type() == TypeTag::kAggregateExp) {
-    return false;
-  }
-  if (expression->Type() == TypeTag::kFunctionCallExp &&
-      GetFunctionVolatility(
-          expression->AsFunctionCallExpression().FuncName()) !=
-          Volatility::kImmutable) {
-    return false;
-  }
-  return std::ranges::all_of(ExpressionChildren(expression),
-                             SafeToReduceEvaluationCount);
 }
 
 }  // namespace

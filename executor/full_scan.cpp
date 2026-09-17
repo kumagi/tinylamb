@@ -28,8 +28,16 @@
 #include "table/table.hpp"
 
 namespace tinylamb {
-FullScan::FullScan(Transaction& txn, const Table& table, size_t max_rows)
-    : table_(&table), iter_(table_->BeginFullScan(txn)), max_rows_(max_rows) {}
+FullScan::FullScan(Transaction& txn, const Table& table, size_t max_rows,
+                   bool lock_rows, bool wait_for_write_intent)
+    : table_(&table),
+      iter_([&]() {
+        TableScanOptions options;
+        options.lock_rows = lock_rows;
+        options.wait_for_write_intent = wait_for_write_intent;
+        return table_->BeginFullScan(txn, options);
+      }()),
+      max_rows_(max_rows) {}
 
 bool FullScan::Next(Row* dst, RowPosition* rp) {
   if (emitted_ >= max_rows_) {

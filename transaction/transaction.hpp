@@ -156,8 +156,24 @@ class Transaction final {
   // staged (prevents a phantom kNotExists during the intent window).
   bool AddWriteSet(const RowPosition& rp, std::string_view before);
   bool TryAddWriteSet(const RowPosition& rp);
+  // True when the position's committed chain still serves a live row under
+  // this transaction's snapshot.  RowPage::Insert consults this before
+  // reusing a deleted slot: an insert staged at a position whose old row is
+  // still visible to the inserter's own snapshot would mask that row behind
+  // the pending staged value (ReadVersion serves pending first), silently
+  // dropping it from every scan the snapshot is entitled to.
+  [[nodiscard]] bool SnapshotSeesRow(const RowPosition& rp) const;
+  // Drops a previously acquired, still-unstaged write intent (used when
+  // Insert picked a hole that SnapshotSeesRow disqualifies).  Staged or
+  // foreign intents are left untouched.
+  void ReleaseWriteIntent(const RowPosition& rp);
+  // resolve_head=false is a pure snapshot read: an unstaged write intent
+  // this transaction happens to hold on the position does NOT upgrade the
+  // result to the newest committed version.  Write-path resolution keeps
+  // the default (head under an own intent).
   StatusOr<std::string_view> ReadVersion(
-      const RowPosition& rp, std::optional<std::string_view> physical);
+      const RowPosition& rp, std::optional<std::string_view> physical,
+      bool resolve_head = true);
   void RegisterVersionWrite(const RowPosition& rp,
                             std::optional<std::string_view> before,
                             std::optional<std::string_view> after);
@@ -239,6 +255,31 @@ class Transaction final {
 
   PageManager* GetPageManager() {
     return transaction_manager_->GetPageManager();
+  }
+
+  // Drops MVCC version chains left by a previous incarnation of |pid|.
+  // Invoked by PageManager::AllocateNewPage when it recycles a page id off
+  // the free list; see TransactionManager::InvalidatePageVersions.
+  void InvalidatePageVersions(page_id_t pid) {
+    if (transaction_manager_ != nullptr) {
+      transaction_manager_->InvalidatePageVersions(pid, this);
+    }
+  }
+
+  // Diagnostic dump of every version chain on |pid|; empty string when no
+  // transaction manager is attached.  Session-fuzzer mismatch reports only.
+  [[nodiscard]] std::string DebugDumpVersionChains(page_id_t pid) const {
+    return transaction_manager_ != nullptr
+               ? transaction_manager_->DebugDumpVersionChains(pid)
+               : "";
+  }
+
+  // Whether |id| still names a live transaction.  Used by the page
+  // allocator to keep a page id whose destroy is still undoable out of the
+  // allocation path.
+  [[nodiscard]] bool IsTransactionActive(txn_id_t id) const {
+    return transaction_manager_ != nullptr &&
+           transaction_manager_->IsActive(id);
   }
   friend std::ostream& operator<<(std::ostream& o, const Transaction& t) {
     o << "Transaction(id=" << t.txn_id_ << ", status=" << t.status_

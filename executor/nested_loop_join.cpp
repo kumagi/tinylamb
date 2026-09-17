@@ -10,8 +10,10 @@
 
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -28,6 +30,7 @@ NestedLoopJoin::NestedLoopJoin(Executor left, Schema left_schema,
       right_(std::move(right)),
       right_schema_(std::move(right_schema)),
       predicate_(std::move(predicate)),
+      predicate_conjuncts_(SplitConjuncts(predicate_)),
       kind_(kind),
       block_size_(block_size == 0 ? 1024 : block_size),
       assert_unique_(assert_unique),
@@ -38,9 +41,18 @@ StatusOr<bool> NestedLoopJoin::EvaluatePredicate(const Row& left,
   if (!predicate_) {
     return true;
   }
+  Row combined = left + right;
+  if (kind_ == JoinKind::kInner) {
+    // An inner-join predicate is a WHERE-level filter: conjuncts may have
+    // been reordered by canonicalization, so a sibling that cleanly rejects
+    // the pair suppresses errors from the rest (commutative semantics).
+    return relational_detail::EvaluateConjunctsTolerant(
+        predicate_conjuncts_, [&](const Expression& conjunct) {
+          return conjunct->TryEvaluate(combined, combined_schema_);
+        });
+  }
   // Predicate errors must propagate (see BatchNestedLoopJoin): swallowing
   // them as FALSE corrupts Anti-join output.
-  Row combined = left + right;
   ASSIGN_OR_RETURN(Value, res,
                    (predicate_->TryEvaluate(combined, combined_schema_)));
   return !res.IsNull() && res.Truthy();

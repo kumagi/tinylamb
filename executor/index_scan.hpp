@@ -78,6 +78,10 @@ class IndexScan : public ExecutorBase {
   size_t pending_offset_{0};
   Iterator iter_;
   Expression cond_;
+  // Top-level conjuncts of `cond_`; the filter follows commutative WHERE
+  // semantics (executor/detail/scan_filter.hpp) so conjunct order is not
+  // observable.
+  std::vector<Expression> cond_conjuncts_;
   // Held by value (not reference): callers often pass a temporary Schema.
   Schema schema_;
 };
@@ -102,6 +106,7 @@ class IndexSkipScanExecutor final : public ExecutorBase {
   }
   void Dump(std::ostream& o, int indent) const override;
   void Explain(std::ostream& o, int indent) const override { Dump(o, indent); }
+  Status GetStatus() const override { return inner_->GetStatus(); }
 
  private:
   Executor inner_;

@@ -52,6 +52,9 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int norec_ran = 0;
   int pqs_ran = 0;
   int idx_ran = 0;
+  int skip_ran = 0;
+  int window_ran = 0;
+  int topties_ran = 0;
   int dqe_ran = 0;
   int troc_ran = 0;
   constexpr int kIterations = 64;
@@ -67,6 +70,9 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
     norec_ran += stats.norec_ran ? 1 : 0;
     pqs_ran += stats.pqs_ran ? 1 : 0;
     idx_ran += stats.idx_ran ? 1 : 0;
+    skip_ran += stats.skip_ran ? 1 : 0;
+    window_ran += stats.window_ran ? 1 : 0;
+    topties_ran += stats.topties_ran ? 1 : 0;
     dqe_ran += stats.dqe_ran ? 1 : 0;
     troc_ran += stats.troc_ran ? 1 : 0;
   }
@@ -75,6 +81,9 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   EXPECT_GT(norec_ran, kIterations / 2) << true;
   EXPECT_GT(pqs_ran, kIterations / 2) << true;
   EXPECT_GT(idx_ran, kIterations / 2) << true;
+  EXPECT_GT(skip_ran, kIterations / 2) << true;
+  EXPECT_GT(window_ran, kIterations / 2) << true;
+  EXPECT_GT(topties_ran, kIterations / 2) << true;
   EXPECT_GT(dqe_ran, kIterations / 2) << true;
   EXPECT_GT(troc_ran, kIterations / 2) << true;
 }
@@ -143,6 +152,43 @@ TEST(SqlOracleFuzzer, TestFileRoundTripDetectsMismatch) {
   std::string summary2;
   ASSERT_TRUE(ParseOracleTest(consistent_text, &seed2, &parsed2, &summary2));
   EXPECT_EQ(ReplayOracleTrace(parsed2), "") << true;
+}
+
+// The window/ties oracles must catch a wrong model: a clean trace replays
+// empty, and perturbing one frame offset flips the model comparison into a
+// report (proves probes run, values are compared, and the new .test tags
+// survive serialization).
+TEST(SqlOracleFuzzer, WindowOracleDetectsWrongModel) {
+  OracleTrace trace;
+  trace.table = "t9";
+  trace.setup = {
+      "CREATE TABLE t9 (u INT64, a INT64, b INT64, flag BOOL, s VARCHAR(8));",
+      "INSERT INTO t9 VALUES (0, 1, NULL, TRUE, 'a');",
+      "INSERT INTO t9 VALUES (1, 1, 2, FALSE, '');",
+      "INSERT INTO t9 VALUES (2, NULL, -3, NULL, 'zz');",
+      "INSERT INTO t9 VALUES (3, 4, 4, TRUE, 'bb');",
+  };
+  trace.predicate = "a > 0";
+  trace.window_probes = {
+      "0|0|0|2|-1|0|0|SELECT u, ROW_NUMBER() OVER (ORDER BY u) FROM t9 "
+      "ORDER BY u;",
+      "10|1|0|0|0|0|0|SELECT u, SUM(b) OVER (PARTITION BY a ORDER BY u ROWS "
+      "BETWEEN 1 PRECEDING AND 0 FOLLOWING) FROM t9 ORDER BY u;",
+  };
+  trace.topties_limit = 2;
+  trace.topties = "SELECT u, a FROM t9 ORDER BY a LIMIT 2 WITH TIES;";
+  trace.skip_probes = {"SELECT COUNT(DISTINCT a) FROM t9;",
+                       "SELECT DISTINCT a FROM t9 ORDER BY a;"};
+  EXPECT_EQ(ReplayOracleTrace(trace, true), "") << true;
+
+  OracleTrace wrong = trace;
+  // Frame becomes 2 PRECEDING: row u=1's expected SUM changes 2 -> 2 (NULL+2
+  // stays), u=0 keeps NULL; use the ROW_NUMBER probe instead, where shifting
+  // p1 flips nothing... use frame probe with EXCLUDE CURRENT ROW flag.
+  wrong.window_probes[1] =
+      "10|1|0|0|0|1|0|SELECT u, SUM(b) OVER (PARTITION BY a ORDER BY u ROWS "
+      "BETWEEN 1 PRECEDING AND 0 FOLLOWING) FROM t9 ORDER BY u;";
+  EXPECT_NE(ReplayOracleTrace(wrong, false), "") << true;
 }
 
 // Any committed sql_oracle_fuzz-*.test file replays as a permanent

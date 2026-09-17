@@ -308,7 +308,16 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
         jit.kernel = JitInt64Kernels::CompileProjection();
       }
     }
-    if (jit.kernel && expression_input->ZoneMapAt(jit.column).Initialized() &&
+    // The JIT kernel reads raw signed-int64 storage.  Fire only when the
+    // runtime batch really has that layout (signed INT64, no NULLs);
+    // otherwise fall through to the bytecode/AST paths below.  This mirrors
+    // the aggregation SUM guard.  The kernel is only compiled when CSE is
+    // empty, so the batch layout here matches input_schema_ (not the
+    // CSE-augmented schema).
+    if (jit.kernel && expression_input->HasLayout(input_schema_) &&
+        expression_input->ColumnAt(jit.column).Type() == ValueType::kInt64 &&
+        !expression_input->ColumnAt(jit.column).IsUnsigned() &&
+        expression_input->ZoneMapAt(jit.column).Initialized() &&
         expression_input->ZoneMapAt(jit.column).NullCount() == 0) {
       std::vector<int64_t> output(expression_input->Size());
       bool mul_overflow = false;

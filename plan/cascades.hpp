@@ -224,6 +224,21 @@ class Memo {
   // True when no conjunct connects any pair of relations.
   [[nodiscard]] bool JoinGraphDisconnected() const;
 
+  // Snapshot-proven 1:1 joins (TODO.md item 1d). The optimizer records a
+  // directed pair (outer, inner) when every non-NULL outer join key is
+  // observed, in the planning snapshot, to be present in the inner UNIQUE
+  // key: each outer row then matches exactly one inner row. Logical rules
+  // may only *read* this set (the snapshot I/O lives in optimizer.cpp);
+  // a declared FOREIGN KEY is the scan-free equivalent checked by the rule
+  // itself. Keys are relation identities (alias when given).
+  void MarkProvenOneToOne(const std::string& outer, const std::string& inner) {
+    proven_one_to_one_.insert(outer + '\0' + inner);
+  }
+  [[nodiscard]] bool IsProvenOneToOne(const std::string& outer,
+                                      const std::string& inner) const {
+    return proven_one_to_one_.contains(outer + '\0' + inner);
+  }
+
   // Bitset of `relations` over the memo-wide relation index.
   [[nodiscard]] uint64_t RelationMask(
       const std::vector<std::string>& relations) const;
@@ -276,6 +291,7 @@ class Memo {
   std::vector<uint64_t> conjunct_masks_;
   std::vector<GroupId> touched_groups_;
   std::unordered_map<std::string, Schema> table_schemas_;
+  std::unordered_set<std::string> proven_one_to_one_;
   const size_t expression_cap_;
   bool degraded_{false};
 };

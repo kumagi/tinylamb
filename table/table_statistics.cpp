@@ -89,6 +89,9 @@ struct CollectedColumn {
   std::vector<ValueFrequency> lowest;
   std::vector<ValueFrequency> highest;
   std::vector<ValueFrequency> most_common;
+  // Fraction of adjacent non-NULL pairs in scan (physical) order that are
+  // non-decreasing. 1.0 for sorted input, ~0.5 for random input.
+  double correlation{1.0};
 };
 
 bool SameValue(const Value& left, const Value& right) {
@@ -118,6 +121,7 @@ class ColumnCollector {
     CHECK_MSG(value.type == type_, "column statistics type mismatch");
     ++non_null_count_;
     const Value compacted = CompactValue(value);
+    TrackOrder(compacted);
     TrackLowest(compacted);
     TrackHighest(compacted);
     Sample(compacted);
@@ -127,6 +131,11 @@ class ColumnCollector {
     CollectedColumn result;
     result.null_count = null_count_;
     result.non_null_count = non_null_count_;
+    if (total_pairs_ > 0) {
+      result.correlation = std::clamp(static_cast<double>(ordered_pairs_) /
+                                          static_cast<double>(total_pairs_),
+                                      0.0, 1.0);
+    }
 
     // Aggregate the reservoir into sorted per-value runs.  When every value
     // fit into the sample the runs are the exact frequency table; otherwise
@@ -229,6 +238,17 @@ class ColumnCollector {
     return static_cast<size_t>(std::llround(capped));
   }
 
+  void TrackOrder(const Value& value) {
+    if (has_prev_) {
+      ++total_pairs_;
+      if (!(value < prev_)) {
+        ++ordered_pairs_;
+      }
+    }
+    prev_ = value;
+    has_prev_ = true;
+  }
+
   void TrackLowest(const Value& value) {
     for (size_t i = 0; i < lowest_.size(); ++i) {
       if (SameValue(lowest_[i].value, value)) {
@@ -292,6 +312,13 @@ class ColumnCollector {
   std::vector<Value> sample_;
   std::vector<ValueFrequency> lowest_;
   std::vector<ValueFrequency> highest_;
+  // Physical-order adjacency tracking for the clustering correlation
+  // (TODO.md item 1a). NULLs neither start nor break a run: they are skipped
+  // so the fraction still reflects the order of stored values.
+  Value prev_;
+  bool has_prev_{false};
+  size_t ordered_pairs_{0};
+  size_t total_pairs_{0};
   // Deterministic on purpose: reproducible samples keep query plans and
   // statistics tests stable across runs. Not used for any security purpose.
   std::mt19937_64 rng_{// NOLINT(cert-msc32-c,cert-msc51-cpp)
@@ -904,6 +931,7 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     stats.lowest_values_ = std::move(collected.lowest);
     stats.highest_values_ = std::move(collected.highest);
     stats.most_common_values_ = std::move(collected.most_common);
+    stats.correlation_ = collected.correlation;
     rebuilt.push_back(std::move(stats));
   }
   row_count_ = scanned_rows;
@@ -943,7 +971,10 @@ double TableStatistics::EstimateCount(int column_index, const Value& from,
     return 0;
   }
   if (*upper < *lower) {
-    std::swap(lower, upper);
+    // An inverted range (e.g. BETWEEN 9 AND 3) is legitimately empty: report
+    // zero instead of swapping, matching ColumnStats::EstimateRange and the
+    // scan iterators (which yield no rows for such bounds).
+    return 0;
   }
   return column_stats.EstimateRange(lower, true, upper, true);
 }
@@ -1040,7 +1071,7 @@ Encoder& operator<<(Encoder& encoder, const ColumnStats& stats) {
           << static_cast<uint64_t>(stats.null_count_)
           << static_cast<uint64_t>(stats.distinct_count_) << stats.histogram_
           << stats.lowest_values_ << stats.highest_values_
-          << stats.most_common_values_;
+          << stats.most_common_values_ << stats.correlation_;
   return encoder;
 }
 
@@ -1054,6 +1085,16 @@ Decoder& operator>>(Decoder& decoder, ColumnStats& stats) {
   stats.non_null_count_ = non_null;
   stats.null_count_ = nulls;
   stats.distinct_count_ = distinct;
+  // Payloads written before the correlation field carry no trailing bytes;
+  // keep them readable with the neutral (fully clustered) default.
+  stats.correlation_ = 1.0;
+  if (!decoder.AtEnd()) {
+    double correlation = 1.0;
+    decoder >> correlation;
+    if (!decoder.Failed()) {
+      stats.correlation_ = std::clamp(correlation, 0.0, 1.0);
+    }
+  }
   return decoder;
 }
 

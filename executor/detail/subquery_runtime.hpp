@@ -78,9 +78,15 @@ struct ExecutionRuntime {
   // one execution (CSE across a SELECT list).
   std::unordered_map<std::string, RelationPtr>
       uncorrelated_results_by_fingerprint;
-  std::unordered_map<const SelectStatement*, std::unordered_set<Value>>
-      uncorrelated_membership;
-  std::unordered_map<std::string, std::unordered_set<Value>>
+  // Hashed membership for uncorrelated `x IN (SELECT ...)` probes.  The
+  // NULL flag is recorded once while the hash is built; per-probe NULL
+  // ambiguity must never rescan the build relation (Q22-sized builds make a
+  // per-row rescan quadratic).
+  struct UncorrelatedMembership {
+    std::unordered_set<Value> values;
+    bool contains_null{false};
+  };
+  std::unordered_map<std::string, UncorrelatedMembership>
       uncorrelated_membership_by_fingerprint;
   // Results for correlated subqueries which cannot use the specialized
   // single-table equality index.

@@ -328,4 +328,86 @@ TEST_F(PageManagerTest, TableTailHintAdvancesWithoutRegressing) {
   EXPECT_EQ(p_->GetTableTail(first, 41), 43);
 }
 
+TEST_F(PageManagerTest, UndoDestroyBelowNewerDestroyRelinksFreeList) {
+  // Undoing a destroy whose free-list entry no longer heads the chain (a
+  // newer uncommitted destroy sits above it) must unlink the middle entry:
+  // the restored page A stays live and the allocator never re-issues it.
+  // Before the chain walk, the entry stayed linked and every subsequent
+  // AllocateNewPage spun forever re-peeking the dead head.
+  page_id_t a_id = 0;
+  page_id_t b_id = 0;
+  {
+    Transaction txn = tm_->Begin();
+    PageRef a = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
+    PageRef b = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
+    a_id = a->PageID();
+    b_id = b->PageID();
+    EXPECT_EQ(txn.PreCommit(), Status::kSuccess);
+  }
+  Transaction older = tm_->Begin();
+  {
+    PageRef a = p_->GetPage(a_id).MoveValue();
+    EXPECT_EQ(p_->DestroyPage(older, a.get()), Status::kSuccess);
+  }
+  Transaction newer = tm_->Begin();
+  {
+    PageRef b = p_->GetPage(b_id).MoveValue();
+    EXPECT_EQ(p_->DestroyPage(newer, b.get()), Status::kSuccess);
+  }
+  EXPECT_EQ(newer.PreCommit(), Status::kSuccess);
+  // B heads the chain now; undoing the older destroy takes the mid-chain
+  // path (relink B.next instead of the meta head).
+  EXPECT_EQ(older.Abort(), Status::kSuccess);
+
+  {
+    PageRef a = p_->GetPage(a_id).MoveValue();
+    EXPECT_EQ(a->Type(), PageType::kRowPage);
+  }
+  Transaction txn = tm_->Begin();
+  PageRef recycled = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
+  EXPECT_EQ(recycled->PageID(), b_id);
+  txn.PreCommit();
+}
+
+TEST_F(PageManagerTest, StaleFreeListHeadDoesNotStallAllocation) {
+  // When the head names a page that is live again and no undo can relink it,
+  // the allocator must abandon the chain (ids return at the startup rebuild)
+  // instead of spinning on the dead head.
+  page_id_t a_id = 0;
+  page_id_t b_id = 0;
+  {
+    Transaction txn = tm_->Begin();
+    PageRef a = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
+    PageRef b = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
+    a_id = a->PageID();
+    b_id = b->PageID();
+    EXPECT_EQ(txn.PreCommit(), Status::kSuccess);
+  }
+  Transaction newer = tm_->Begin();
+  {
+    PageRef b = p_->GetPage(b_id).MoveValue();
+    EXPECT_EQ(p_->DestroyPage(newer, b.get()), Status::kSuccess);
+  }
+  EXPECT_EQ(newer.PreCommit(), Status::kSuccess);
+  Transaction older = tm_->Begin();
+  {
+    PageRef a = p_->GetPage(a_id).MoveValue();
+    EXPECT_EQ(p_->DestroyPage(older, a.get()), Status::kSuccess);
+  }
+  EXPECT_EQ(older.PreCommit(), Status::kSuccess);
+  // Resurrect A behind the allocator's back (the state a lost undo leaves):
+  // the chain head now names a live page.
+  {
+    PageRef a = p_->GetPage(a_id).MoveValue();
+    a->PageInit(a_id, PageType::kRowPage);
+  }
+
+  Transaction txn = tm_->Begin();
+  PageRef fresh = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
+  EXPECT_NE(fresh->PageID(), a_id);
+  EXPECT_NE(fresh->PageID(), b_id);
+  EXPECT_EQ(fresh->Type(), PageType::kRowPage);
+  txn.PreCommit();
+}
+
 }  // namespace tinylamb

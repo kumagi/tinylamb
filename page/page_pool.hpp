@@ -124,7 +124,11 @@ class PagePool {
   // Flush all page buffer without write back.
   void DropAllPages();
 
-  void FlushPageForTest(page_id_t page_id);
+  // Test-only synchronous write-back of one resident page.  Errors are
+  // reported to the caller: silently dropping a durability-gate or I/O
+  // failure here would let tests pass while persistence is broken.  Callers
+  // that cannot fail (fixture Flush() helpers) may discard the result.
+  Status FlushPageForTest(page_id_t page_id);
 
   // Installs a WAL durability hook: before a dirty page image is pwritten,
   // the pool invokes gate(page->PageLSN()) so the caller can guarantee every

@@ -48,13 +48,13 @@ std::string Describe(const LogRecord& record) {
   return out.str();
 }
 
-LogRecord Decode(const std::string& bytes) {
+StatusOr<LogRecord> Decode(const std::string& bytes) {
   std::istringstream stream(bytes, std::istringstream::binary);
   Decoder decoder(stream);
   LogRecord record;
   decoder >> record;
   if (stream.fail()) {
-    throw std::runtime_error("decoder stream failed");
+    return StatusError(StatusCode::kCorrupt, "decoder stream failed");
   }
   return record;
 }
@@ -226,12 +226,12 @@ std::string CheckLogRecordEquivalence(const GeneratedLogRecord& generated) {
            " serialized=" + std::to_string(serialized.size());
   }
   // Property 1: semantic roundtrip.
-  LogRecord decoded;
-  try {
-    decoded = Decode(serialized);
-  } catch (const std::exception& e) {
-    return "decode of serialized bytes threw for " + where + ": " + e.what();
+  StatusOr<LogRecord> decoded_or = Decode(serialized);
+  if (!decoded_or.HasValue()) {
+    return "decode of serialized bytes failed for " + where + ": " +
+           ToString(decoded_or.GetStatus());
   }
+  const LogRecord decoded = decoded_or.MoveValue();
   if (!(decoded == generated.record)) {
     return "roundtrip mismatch for " + where + " got " + Describe(decoded);
   }
@@ -245,14 +245,12 @@ std::string CheckLogRecordEquivalence(const GeneratedLogRecord& generated) {
   if (reserialized != serialized) {
     return "byte instability for " + where;
   }
-  // Property 4: every strict prefix decodes cleanly-or-throws, never crashes.
+  // Property 4: every strict prefix decodes cleanly-or-fails, never crashes.
   // Payloads are bounded by the generator, so the full prefix walk is cheap.
+  // A failed decode (short input) is the expected outcome; only a crash
+  // would be a bug, and a crash cannot be caught here by construction.
   for (size_t length = 0; length < serialized.size(); ++length) {
-    try {
-      static_cast<void>(Decode(serialized.substr(0, length)));
-    } catch (const std::exception&) {
-      continue;
-    }
+    static_cast<void>(Decode(serialized.substr(0, length)));
   }
   return "";
 }

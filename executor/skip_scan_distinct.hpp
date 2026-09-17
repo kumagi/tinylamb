@@ -47,7 +47,7 @@ class SkipScanDistinct : public ExecutorBase {
   bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
-  [[nodiscard]] Status GetStatus() const { return status_; }
+  [[nodiscard]] Status GetStatus() const override { return status_; }
   void Dump(std::ostream& o, int indent) const override;
   void Explain(std::ostream& o, int indent) const override;
 

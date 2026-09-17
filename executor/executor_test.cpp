@@ -68,7 +68,11 @@
 #include "gtest/gtest.h"
 #include "index/index_schema.hpp"
 #include "index_only_scan.hpp"
+#include "plan/merge_join_plan.hpp"
+#include "plan/product_plan.hpp"
+#include "plan/values_plan.hpp"
 #include "transaction/transaction.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -1740,6 +1744,29 @@ class FailingBatchExecutor final : public ExecutorBase {
 };
 }  // namespace
 
+// Regression (Bug 33): transparent executor decorators used to swallow the
+// wrapped executor's sticky error because ExecutorBase::GetStatus() read the
+// decorator's own (always-success) status_.  A failed inner cursor must
+// surface through IndexSkipScanExecutor::GetStatus(); the same forwarding
+// exists on the plan-cache RetainedExecutor (query/sql_engine.cpp).
+TEST_F(ExecutorTest, DecoratorForwardsInnerFailure) {
+  class FailsImmediately final : public ExecutorBase {
+   public:
+    bool Next(Row* /*dst*/, RowPosition* /*rp*/) override {
+      return FailWith(
+          StatusError(StatusCode::kConflicts, "synthetic inner failure"));
+    }
+    void Dump(std::ostream& out, int /*indent*/) const override {
+      out << "FailsImmediately";
+    }
+  };
+  IndexSkipScanExecutor decorator(std::make_shared<FailsImmediately>());
+  Row row;
+  EXPECT_FALSE(decorator.Next(&row, nullptr));
+  EXPECT_EQ(decorator.GetStatus(), Status::kConflicts);
+  EXPECT_FALSE(decorator.ok());
+}
+
 TEST_F(ExecutorTest, ParallelAggregationRethrowsOnRetry) {
   // Regression (§6.4): after a worker failure the executor used to answer a
   // later Next() with a well-formed empty aggregate (COUNT=0 / SUM=NULL).
@@ -2073,6 +2100,154 @@ TEST_F(ExecutorTest, LimitDump) {
   EXPECT_NE(ss.str().find("Limit: 3 offset 1"), std::string::npos);
   EXPECT_NE(ss.str().find("SyntheticBatchExecutor"), std::string::npos);
 }
+
+namespace {
+
+// Values-backed equi-join inputs for the parallel-threshold tests (TODO.md
+// item 5d): 8000 + 200 = 8200 estimated rows clear kParallelHashJoinMinRows /
+// kParallelMergeJoinMinRows (8192); 100 + 100 stay sequential.
+constexpr int64_t kParallelJoinBigLeft = 8000;
+constexpr int64_t kParallelJoinBigRight = 200;
+
+std::vector<Row> ShuffledJoinLeft() {
+  std::vector<Row> rows;
+  rows.reserve(static_cast<size_t>(kParallelJoinBigLeft));
+  for (int64_t i = 0; i < kParallelJoinBigLeft; ++i) {
+    rows.emplace_back(Row({Value(i % 100), Value(i)}));
+  }
+  return rows;
+}
+
+std::vector<Row> SortedJoinLeft() {
+  std::vector<Row> rows;
+  rows.reserve(static_cast<size_t>(kParallelJoinBigLeft));
+  for (int64_t i = 0; i < kParallelJoinBigLeft; ++i) {
+    rows.emplace_back(Row({Value(i / 80), Value(i)}));
+  }
+  return rows;
+}
+
+std::vector<Row> SortedJoinRight() {
+  std::vector<Row> rows;
+  rows.reserve(static_cast<size_t>(kParallelJoinBigRight));
+  for (int64_t i = 0; i < kParallelJoinBigRight; ++i) {
+    rows.emplace_back(Row({Value(i / 2), Value(i)}));
+  }
+  return rows;
+}
+
+const Schema& JoinLeftSchema() {
+  static const Schema schema(
+      "l", {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});
+  return schema;
+}
+
+const Schema& JoinRightSchema() {
+  static const Schema schema(
+      "r", {Column("k", ValueType::kInt64), Column("w", ValueType::kInt64)});
+  return schema;
+}
+
+}  // namespace
+
+TEST_F(ExecutorTest, ParallelHashJoinEmittedForLargeInputs) {
+  Plan left =
+      std::make_shared<ValuesPlan>(JoinLeftSchema(), ShuffledJoinLeft());
+  Plan right =
+      std::make_shared<ValuesPlan>(JoinRightSchema(), SortedJoinRight());
+  ProductPlan join(left, {ColumnName("l", "k")}, right, {ColumnName("r", "k")});
+  TransactionContext ctx = rs_->BeginContext();
+  Executor executor = join.EmitExecutor(ctx);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("SharedBuildParallelHashJoin"), std::string::npos)
+      << dump.str();
+  // 80 left rows per key x 2 right rows per key x 100 keys.
+  Row row;
+  size_t rows = 0;
+  while (executor->Next(&row, nullptr)) {
+    ASSERT_EQ(row.values_.size(), 4U);
+    EXPECT_EQ(row[0], row[2]);
+    ++rows;
+  }
+  EXPECT_EQ(rows, 16000U);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(ExecutorTest, SequentialHashJoinEmittedForSmallInputs) {
+  std::vector<Row> left_rows;
+  std::vector<Row> right_rows;
+  for (int64_t i = 0; i < 100; ++i) {
+    left_rows.emplace_back(Row({Value(i), Value(i)}));
+    right_rows.emplace_back(Row({Value(i), Value(i * 2)}));
+  }
+  Plan left = std::make_shared<ValuesPlan>(JoinLeftSchema(), left_rows);
+  Plan right = std::make_shared<ValuesPlan>(JoinRightSchema(), right_rows);
+  ProductPlan join(left, {ColumnName("l", "k")}, right, {ColumnName("r", "k")});
+  TransactionContext ctx = rs_->BeginContext();
+  Executor executor = join.EmitExecutor(ctx);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_EQ(dump.str().find("SharedBuildParallelHashJoin"), std::string::npos)
+      << dump.str();
+  Row row;
+  size_t rows = 0;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+  }
+  EXPECT_EQ(rows, 100U);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(ExecutorTest, ParallelMergeJoinEmittedForLargeSortedInputs) {
+  Plan left = std::make_shared<ValuesPlan>(JoinLeftSchema(), SortedJoinLeft());
+  Plan right =
+      std::make_shared<ValuesPlan>(JoinRightSchema(), SortedJoinRight());
+  MergeJoinPlan join(left, {ColumnName("l", "k")}, right,
+                     {ColumnName("r", "k")});
+  TransactionContext ctx = rs_->BeginContext();
+  Executor executor = join.EmitExecutor(ctx);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("ParallelMergeJoin"), std::string::npos)
+      << dump.str();
+  Row row;
+  size_t rows = 0;
+  while (executor->Next(&row, nullptr)) {
+    ASSERT_EQ(row.values_.size(), 4U);
+    EXPECT_EQ(row[0], row[2]);
+    ++rows;
+  }
+  EXPECT_EQ(rows, 16000U);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(ExecutorTest, SequentialMergeJoinEmittedForSmallInputs) {
+  std::vector<Row> left_rows;
+  std::vector<Row> right_rows;
+  for (int64_t i = 0; i < 100; ++i) {
+    left_rows.emplace_back(Row({Value(i), Value(i)}));
+    right_rows.emplace_back(Row({Value(i), Value(i * 2)}));
+  }
+  Plan left = std::make_shared<ValuesPlan>(JoinLeftSchema(), left_rows);
+  Plan right = std::make_shared<ValuesPlan>(JoinRightSchema(), right_rows);
+  MergeJoinPlan join(left, {ColumnName("l", "k")}, right,
+                     {ColumnName("r", "k")});
+  TransactionContext ctx = rs_->BeginContext();
+  Executor executor = join.EmitExecutor(ctx);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_EQ(dump.str().find("ParallelMergeJoin"), std::string::npos)
+      << dump.str();
+  Row row;
+  size_t rows = 0;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+  }
+  EXPECT_EQ(rows, 100U);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
 }  // namespace tinylamb
 
 // ===== RelationalExecutor (complex SELECT plans) coverage =====
@@ -3089,6 +3264,40 @@ TEST_F(ExecutorTest, RelationalInSubqueryKeepsSpilledRows) {
   const auto rows = RelationalRun(
       *rs_, "SELECT key FROM WideIn WHERE key IN (SELECT key FROM WideIn);");
   EXPECT_EQ(rows.size(), 200U);
+}
+
+TEST_F(ExecutorTest, RelationalNotInSubqueryNullBuildKeyFiltersEverything) {
+  // Regression guard: an uncorrelated NOT IN whose subquery emits a NULL key
+  // turns every miss into UNKNOWN, so no outer row survives.  The NULL flag
+  // is recorded once while the membership hash is built; per-probe NULL
+  // ambiguity must never rescan the build relation (Q22-sized builds make a
+  // per-row rescan quadratic).
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    Schema schema{"NullBuild", {Column("key", ValueType::kInt64)}};
+    StatusOr<Table> created = rs_->CreateTable(ctx, schema);
+    ASSERT_SUCCESS(created.GetStatus());
+    ASSERT_SUCCESS(created.Value()
+                       .Insert(ctx.txn_, Row(std::vector{Value(int64_t{1})}))
+                       .GetStatus());
+    ASSERT_SUCCESS(created.Value()
+                       .Insert(ctx.txn_, Row(std::vector{Value()}))
+                       .GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  CreateWideTable(*rs_, "WideNotInNull", 3);
+  ScopedQueryMemory memory(65536);
+  const auto rows = RelationalRun(
+      *rs_,
+      "SELECT key FROM WideNotInNull WHERE key NOT IN (SELECT key FROM "
+      "NullBuild);");
+  EXPECT_TRUE(rows.empty());
+  // The NULL-free build keeps the complement: only non-members survive.
+  const auto clean = RelationalRun(
+      *rs_,
+      "SELECT key FROM WideNotInNull WHERE key NOT IN (SELECT key FROM "
+      "WideNotInNull WHERE key > 1);");
+  ASSERT_EQ(clean.size(), 2U);
 }
 
 TEST_F(ExecutorTest, RelationalWindowFunctionKeepsSpilledRows) {

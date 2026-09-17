@@ -69,6 +69,10 @@ class BatchNestedLoopJoin : public ExecutorBase, public PipelineBreaker {
   Executor right_;
   Schema right_schema_;
   Expression predicate_;
+  // Top-level conjuncts of `predicate_`, populated for INNER joins whose
+  // predicate is an optimizer-canonicalized conjunct list evaluated under
+  // commutative WHERE semantics (executor/detail/scan_filter.hpp).
+  std::vector<Expression> predicate_conjuncts_;
   JoinKind kind_{JoinKind::kInner};
   size_t block_size_{1024};
   Schema combined_schema_;

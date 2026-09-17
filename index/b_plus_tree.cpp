@@ -955,10 +955,12 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) const {
         // Make this foster child of left sibling.  PRODUCTION GUARD:
         // next_idx == 0 made GetValue(-1) read the foster slot as a child
         // pid (garbage page id), so require a real left sibling and skip
-        // the rebalance otherwise.
+        // the rebalance otherwise.  Keep descending: the singleton child
+        // may itself be a branch when the height is above two, and breaking
+        // out here would run the leaf-only tail below on a branch page.
         if (next_idx == 0) {
           curr = std::move(next_page);  // Releases parent lock here.
-          break;
+          continue;
         }
         ASSIGN_OR_RETURN(
             PageRef, new_foster_parent,

@@ -108,6 +108,21 @@ struct OracleTrace {
   // Constraint rewriting: probe before/after the DDL must agree.
   std::vector<std::string> index_ddl;
   std::string index_probe;
+  // Skip-scan distinct: COUNT(DISTINCT c) / SELECT DISTINCT c must return the
+  // same result with and without an index on c (the indexed plan may use the
+  // skip-scan-distinct executor).
+  std::vector<std::string> skip_probes;
+  // Window functions (added 2026-09): "KIND|P1|P2|ARG|PART|FLAGS|DEF|SQL"
+  // specs.  Model kinds are recomputed harness-side from the INSERTs in
+  // `setup`; every kind additionally runs under physical-row-order
+  // permutation and with/without indexes (results must be identical because
+  // each probe orders by the unique key).
+  std::vector<std::string> window_probes;
+  // TOP-n WITH TIES: ORDER BY a LIMIT n WITH TIES must yield exactly the
+  // rows whose key is not past the n-th boundary (null-safe, ASC NULLS
+  // FIRST).  Compared as a set of u values.
+  std::string topties;
+  int64_t topties_limit{0};
   // Statement-type transformation: COUNT WHERE p, COUNT all, DELETE WHERE p.
   std::vector<std::string> dqe;  // exactly 3 when active
   // Transaction splitting: statements run inside one txn vs autocommit.
@@ -130,6 +145,15 @@ struct OracleTrace {
   std::vector<std::string> unnest;          // UNNEST query
   std::vector<std::string> unnest_expect;   // ordered or multiset
   bool unnest_ordered{false};               // WITH OFFSET: compare verbatim
+  // Guarded-division conjunct oracle: WHERE clauses pairing a possibly
+  // erroring conjunct ((b / a) <op> c) with a sibling that may reject the
+  // row first.  Every permutation must agree; when no conjunct cleanly
+  // rejects a row the error must surface.  `guard_error` = the mirror
+  // expects the engine to fail, otherwise `guard_expected` is the rendered
+  // sorted u multiset.
+  std::vector<std::string> guard_probes;
+  std::string guard_expected;
+  bool guard_error{false};
 
   bool operator==(const OracleTrace&) const = default;
 };
@@ -150,6 +174,9 @@ struct OracleIterationStats {
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};
+  bool skip_ran{false};
+  bool window_ran{false};
+  bool topties_ran{false};
   bool dqe_ran{false};
   bool troc_ran{false};
   bool setop_ran{false};
@@ -159,6 +186,7 @@ struct OracleIterationStats {
   bool cte_ran{false};
   bool recursive_ran{false};
   bool unnest_ran{false};
+  bool guard_ran{false};
 };
 
 // QPG-flavoured plan feedback: remembers EXPLAIN fingerprints and rewards

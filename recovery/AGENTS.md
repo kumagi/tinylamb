@@ -6,7 +6,7 @@ Write-ahead log, group commit, checkpoints, crash recovery. Normative docs:
 ## Key files
 
 - `logger.{hpp,cpp}` — group commit: 8 MiB buffer + 1 ms worker thread
-  (`pwrite`+`fdatasync`). Three-LSN split is the core idea:
+  (`write` on an `O_APPEND` fd + `fdatasync`). Three-LSN split is the core idea:
   BufferedLSN / CommittedLSN (written) / DurableLSN (fsynced).
   **`AddLog`'s return LSN alone guarantees nothing — callers must
   `WaitForDurable`.** `kMaxRecordSize` (16 MiB−64 KiB) enforced;

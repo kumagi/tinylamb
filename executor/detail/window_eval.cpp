@@ -36,6 +36,7 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/statement.hpp"
@@ -695,7 +696,9 @@ struct WindowRuntime {
           return reached.value_or(peer_end[position]);
         }
         case WindowFrameBoundType::kUnboundedPreceding:
-          return peer_end[position];
+          // As a frame END bound this is the first row of the partition,
+          // so any CURRENT/FOLLOWING start bound produces an empty frame.
+          return size_t{0};
         case WindowFrameBoundType::kOffsetPreceding: {
           const auto opt_off = range_offset(bound);
           if (!opt_off.has_value()) {
@@ -1421,7 +1424,18 @@ struct WindowRuntime {
       const auto lo_idx = static_cast<size_t>(std::floor(rank));
       const auto hi_idx = static_cast<size_t>(std::ceil(rank));
       if (lo_idx == hi_idx) {
-        return sorted[lo_idx];
+        const Value& hit = sorted[lo_idx];
+        if (hit.IsNull()) {
+          return Value();
+        }
+        // PERCENTILE_CONT interpolates in double space, so numeric input
+        // always yields FLOAT64 even when the rank lands exactly on an
+        // element.  Non-numeric elements (e.g. numeric strings) keep their
+        // own type.
+        if (hit.type == ValueType::kInt64 || hit.type == ValueType::kDouble) {
+          return Value(NumericOf(hit));
+        }
+        return hit;
       }
       // Interpolation across a NULL endpoint yields NULL.
       if (sorted[lo_idx].IsNull() || sorted[hi_idx].IsNull()) {
@@ -1893,10 +1907,19 @@ Status ComputeOneWindowImpl(TransactionContext& context,
     }
 
     // Everything else is treated as an aggregate over the frame.
+    // PERCENTILE_CONT/DISC are analytic functions: they ignore the window
+    // frame and always see the whole partition.
+    const bool frame_ignoring =
+        fn == "PERCENTILE_CONT" || fn == "PERCENTILE_DISC";
     for (size_t k = 0; k < m; ++k) {
-      ASSIGN_OR_RETURN(FrameBounds, frame_bounds,
-                       (WindowRuntime::ResolveFrame(
-                           window, rows, ordered, order_values, k, peer_end)));
+      FrameBounds frame_bounds{0, m - 1};
+      if (!frame_ignoring) {
+        ASSIGN_OR_RETURN(
+            FrameBounds, resolved,
+            (WindowRuntime::ResolveFrame(window, rows, ordered, order_values, k,
+                                         peer_end)));
+        frame_bounds = resolved;
+      }
       ASSIGN_OR_RETURN(Value, agg_value,
                        (runtime.AggregateOverFrame(
                            window, rows, ordered, order_values, k,
@@ -1978,8 +2001,28 @@ Expression InlineAliases(
             }
             return out;
           }());
-    default:
+    case TypeTag::kQueryExp:
+      // A subquery has its own scope; outer SELECT aliases do not apply.
       return expression;
+    default: {
+      // Every other composite node (IN lists, casts, array literals, ...)
+      // is rebuilt through the shared children helper so aliases inside
+      // them inline as well.
+      std::vector<Expression> children = ExpressionChildren(expression);
+      bool changed = false;
+      for (Expression& child : children) {
+        if (!child) {
+          continue;
+        }
+        Expression mapped = InlineAliases(child, aliases, schema);
+        if (mapped != child) {
+          changed = true;
+          child = std::move(mapped);
+        }
+      }
+      return changed ? WithExpressionChildren(expression, std::move(children))
+                     : expression;
+    }
   }
 }
 

@@ -86,6 +86,10 @@ class BitmapHeapScan : public ExecutorBase {
   std::vector<RowPosition> positions_;
   size_t offset_{0};
   Expression where_;
+  // Top-level conjuncts of `where_`; the recheck follows commutative WHERE
+  // semantics (executor/detail/scan_filter.hpp) so conjunct order is not
+  // observable.
+  std::vector<Expression> where_conjuncts_;
   Schema schema_;
   std::string bitmap_operation_;
 };

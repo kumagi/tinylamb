@@ -14,38 +14,20 @@
 #include "database/database.hpp"
 #include "executor/executor_base.hpp"
 #include "gtest/gtest.h"
+#include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb {
 namespace {
 
-struct ScopedDb {
-  std::string name;
-  std::unique_ptr<Database> db;
-  ScopedDb(std::string n, std::unique_ptr<Database> d)
-      : name(std::move(n)), db(std::move(d)) {}
-  ScopedDb(const ScopedDb&) = delete;
-  ScopedDb& operator=(const ScopedDb&) = delete;
-  ScopedDb(ScopedDb&&) = delete;
-  ScopedDb& operator=(ScopedDb&&) = delete;
-  ~ScopedDb() {
-    db.reset();
-    std::error_code ec;
-    std::filesystem::remove(name + ".log", ec);
-    std::filesystem::remove(name + ".db", ec);
-    std::filesystem::remove(name + ".last_checkpoint", ec);
-  }
-};
-
 std::string RunSingleCellSql(const std::string& sql) {
-  const std::string db_name = (std::filesystem::temp_directory_path() /
-                               ("expr_oracle_pin-" + RandomString(8)))
-                                  .string();
-  auto db_holder = Database::Create(db_name).MoveValue();
-  CHECK(db_holder != nullptr);
-  ScopedDb sdb(db_name, std::move(db_holder));
-  Database& db = *sdb.db;
+  ScopedDb sdb("expr_oracle_pin");
+  if (!sdb) {
+    ADD_FAILURE() << "failed to create scratch database";
+    return "";
+  }
+  Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
   // Probe: does table presence change scalar-select row widths?

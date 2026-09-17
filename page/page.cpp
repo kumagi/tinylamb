@@ -116,6 +116,13 @@ Status Page::DecodeDisk(const char* source) {
   offset += DeserializeU64(source + offset, &recovery_lsn);
   uint64_t raw_type = 0;
   offset += DeserializeU64(source + offset, &raw_type);
+  // A bit-rotted type discriminant would otherwise CHECK-abort (whole
+  // process) in RowCount/GetKey/etc; report kCorrupt like the magic/version
+  // checks above so callers handle it as a Status.
+  if (raw_type > static_cast<uint64_t>(PageType::kPaxPage)) {
+    return StatusError(StatusCode::kCorrupt,
+                       "invalid page type: " + std::to_string(raw_type));
+  }
   type = static_cast<PageType>(raw_type);
   offset += DeserializeU64(source + offset, &checksum);
   CHECK(offset == kPageHeaderSize);
@@ -146,9 +153,10 @@ size_t Page::RowCount(Transaction& /*txn*/) const {
   return 0;
 }
 
-StatusOr<std::string_view> Page::Read(Transaction& txn, slot_t slot) const {
+StatusOr<std::string_view> Page::Read(Transaction& txn, slot_t slot,
+                                      bool resolve_head) const {
   if (type == PageType::kRowPage) {
-    return body.row_page.Read(PageID(), txn, slot);
+    return body.row_page.Read(PageID(), txn, slot, resolve_head);
   }
   if (type == PageType::kLeafPage) {
     return body.leaf_page.Read(PageID(), txn, slot);

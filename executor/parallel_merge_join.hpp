@@ -79,7 +79,10 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
   void ComputeSteeringPartitions();
   void ExecuteParallelMerge();
 
-  [[nodiscard]] int CompareKeys(const Row& left, const Row& right) const;
+  [[nodiscard]] static int CompareKeys(const Row& left,
+                                       const std::vector<slot_t>& left_cols,
+                                       const Row& right,
+                                       const std::vector<slot_t>& right_cols);
   [[nodiscard]] static bool KeyIsNull(const Row& row,
                                       const std::vector<slot_t>& cols);
   // Residual (non-equi) predicate over the concatenated pair; always true
@@ -99,6 +102,10 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
   size_t worker_count_{1};
   JoinKind kind_{JoinKind::kInner};
   Expression residual_;
+  // Top-level conjuncts of `residual_`, used for INNER joins where the
+  // residual is a WHERE-level filter evaluated under commutative semantics
+  // (executor/detail/scan_filter.hpp).
+  std::vector<Expression> residual_conjuncts_;
   Schema residual_schema_;
   // Full right row width used for left-outer NULL padding; inferred from the
   // first right row when the right side is non-empty.

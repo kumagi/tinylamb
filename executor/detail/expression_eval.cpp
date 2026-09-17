@@ -10513,19 +10513,6 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
         return Value(value.Negated() ? !exists : exists);
       }
       if (value.Test()) {
-        if (value.Negated() && value.Mode() == QuantifierMode::kIn &&
-            context.execution_runtime() != nullptr) {
-          bool has_null_build_key = false;
-          row_source.ForEachRow([&](const Row& row) {
-            has_null_build_key =
-                has_null_build_key ||
-                (!row.values_.empty() && row.values_[0].IsNull());
-          });
-          context.execution_runtime()->null_aware_anti_build_contains_null =
-              context.execution_runtime()
-                  ->null_aware_anti_build_contains_null ||
-              has_null_build_key;
-        }
         ASSIGN_OR_RETURN(
             Value, test,
             (TryEvaluate(value.Test(), scope, aggregates, context, ctes)));
@@ -10566,7 +10553,7 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
                   ->uncorrelated_membership_by_fingerprint.try_emplace(
                       structural_key);
           if (inserted) {
-            cached->second.reserve(relation->TotalRows());
+            cached->second.values.reserve(relation->TotalRows());
             Status collation_error = Status::kSuccess;
             row_source.ForEachRow([&](const Row& row) {
               if (collation_error != Status::kSuccess) {
@@ -10581,28 +10568,27 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
                                 "operands");
                 return;
               }
-              if (!projected.IsNull()) {
-                cached->second.insert(projected);
+              if (projected.IsNull()) {
+                cached->second.contains_null = true;
+              } else {
+                cached->second.values.insert(projected);
               }
             });
             if (collation_error != Status::kSuccess) {
               return collation_error;
             }
+            if (cached->second.contains_null && value.Negated()) {
+              context.execution_runtime()->null_aware_anti_build_contains_null =
+                  true;
+            }
             ++context.execution_runtime()->uncorrelated_hash_builds;
           }
           ++context.execution_runtime()->uncorrelated_hash_probes;
-          found = !test.IsNull() && cached->second.contains(test);
-          if (!found && !test.IsNull() &&
-              cached->second.size() < relation->TotalRows()) {
-            // The hash set excludes NULL keys; a size shortfall means the
-            // relation may contain NULLs that turn the miss into UNKNOWN.
-            row_source.ForEachRow([&](const Row& row) {
-              if (!row.values_.empty() &&
-                  ProjectSubqueryRow(row, as_struct, &subquery_schema)
-                      .IsNull()) {
-                saw_null = true;
-              }
-            });
+          found = !test.IsNull() && cached->second.values.contains(test);
+          if (!found && !test.IsNull()) {
+            // The hash build recorded NULL keys once; a miss over a
+            // null-containing build is UNKNOWN without a rescan.
+            saw_null = cached->second.contains_null;
           }
         } else {
           Status collation_error = Status::kSuccess;

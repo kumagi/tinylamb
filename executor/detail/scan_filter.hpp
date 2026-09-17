@@ -3,6 +3,7 @@
 #define TINYLAMB_EXECUTOR_DETAIL_SCAN_FILTER_HPP
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -67,6 +68,27 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
                      const CompiledScanFilter& filter, const Scope* outer,
                      TransactionContext& context, const CteMap& ctes,
                      Status* error = nullptr);
+
+// Evaluates a conjunctive filter predicate under the engine's commutative
+// WHERE semantics: each conjunct is evaluated independently and a conjunct
+// that cleanly rejects the row (FALSE or NULL) suppresses errors raised by
+// sibling conjuncts; the first error surfaces only when no conjunct rejects
+// the row. This is the same combination rule MatchScanFilter applies to its
+// residual predicates. The optimizer canonicalizes conjunct order
+// (plan/cascades.cpp CanonicalizeConjuncts) and pushes conjuncts to
+// different evaluation sites, so every executor that applies a
+// WHERE-derived conjunctive predicate must use this -- strict
+// left-to-right evaluation of a reordered conjunction would let the plan
+// shape decide whether an error surfaces.
+//
+// `eval` evaluates one conjunct against a row; callers without a
+// TransactionContext pass `[&](const Expression& e) { return
+// e->TryEvaluate(row, schema); }`. Join executors must only use this for
+// INNER joins: outer/semi/anti predicates decide match-ness and keep
+// strict error propagation (PredicateErrorPropagatesForAntiJoin).
+StatusOr<bool> EvaluateConjunctsTolerant(
+    const std::vector<Expression>& conjuncts,
+    const std::function<StatusOr<Value>(const Expression&)>& eval);
 
 std::vector<IntegerPeekCompare> BuildIntegerPeeks(
     const CompiledScanFilter& filter, const std::vector<slot_t>* projection,

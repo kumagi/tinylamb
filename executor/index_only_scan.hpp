@@ -61,6 +61,10 @@ class IndexOnlyScan : public ExecutorBase {
 
   IndexScanIterator iter_;
   Expression cond_;
+  // Top-level conjuncts of `cond_`; the filter follows commutative WHERE
+  // semantics (executor/detail/scan_filter.hpp) so conjunct order is not
+  // observable.
+  std::vector<Expression> cond_conjuncts_;
   Schema key_schema_;
   Schema value_schema_;
   Schema output_schema_;

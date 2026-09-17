@@ -59,6 +59,10 @@ class MergeJoin final : public ExecutorBase {
   size_t left_width_{0};
   size_t right_width_{0};
   Expression residual_{};
+  // Top-level conjuncts of `residual_`, used for INNER joins where the
+  // residual is a WHERE-level filter evaluated under commutative semantics
+  // (executor/detail/scan_filter.hpp).
+  std::vector<Expression> residual_conjuncts_{};
   Schema residual_schema_{};
   size_t output_index_{0};
   bool materialized_{false};

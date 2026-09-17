@@ -536,7 +536,8 @@ bool StatementWindowRoutable(const SelectStatement& select) {
 }  // namespace
 
 bool PostRewriteNeedsRelational(const SelectStatement& select,
-                                const LiftedCtes* lifted = nullptr) {
+                                const LiftedCtes* lifted = nullptr,
+                                bool include_grouping = true) {
   // M6+1: a single RIGHT/FULL edge over two plain sources lowers like LEFT;
   // chains and any other single-source oddity stay relational.
   bool single_right_full_slice = false;
@@ -619,9 +620,17 @@ bool PostRewriteNeedsRelational(const SelectStatement& select,
       return true;
     }
   }
+  // Grouped consumers (the ExecuteGroupedSelect bridge) call with
+  // include_grouping=false: the presence of GROUP BY / HAVING / plain
+  // aggregates is what the bridge exists to serve, so it must not count as
+  // a relational blocker there. What still blocks the bridge is any other
+  // relational-only shape (unguarded windows, QUALIFY, set operations,
+  // DISTINCT ON, WITH TIES) and extended aggregates whose evaluation the
+  // grouping finish cannot reproduce.
   return (relational_detail::HasWindowFunctions(select) && !window_routed) ||
-         (select.Qualify() && !qualify_routed) || !select.GroupBy().empty() ||
-         select.Having() || !select.UnionAll().empty() ||
+         (select.Qualify() && !qualify_routed) ||
+         (include_grouping && (!select.GroupBy().empty() || select.Having())) ||
+         !select.UnionAll().empty() ||
          select.GetSetOperationTree() != nullptr || select.HasDistinctOn() ||
          select.WithTies();
 }
@@ -951,6 +960,7 @@ class RetainedExecutor final : public ExecutorBase {
   void Explain(std::ostream& output, int indent) const override {
     inner_->Explain(output, indent);
   }
+  Status GetStatus() const override { return inner_->GetStatus(); }
 
  private:
   // Members are destroyed in reverse declaration order: tear down the
@@ -3001,7 +3011,6 @@ SubstituteDerivedOutputs(  // NOLINT(misc-no-recursion)
 
 bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
                              TransactionContext& ctx);
-
 // True when the expression carries a `*` column reference at any depth,
 // including the lone-star value-table wrapper (`__value_table_value(*)`,
 // which selects the row as a value rather than expanding columns). Star
@@ -3377,6 +3386,264 @@ bool MergeCompatibleUnionBranches(SelectStatement* outer,
   }
   return true;
 }
+// LATERAL decorrelation, minimal slice (TODO.md item 3a): a LATERAL site
+// whose subquery is a single plain base table, row-preserving, with all
+// outer references confined to column-to-column equality correlations in its
+// WHERE, is convertible to a decorrelated join. The correlation conjuncts
+// move to the site's ON condition (rebound to the derived alias, extending
+// the inner projection with the key columns when they are not outputs),
+// the lateral flag clears, and the proven M5 flattener consumes the now
+// uncorrelated site when its own gates pass. Per-row lateral evaluation and
+// the decorrelated join produce the same row multiset: each outer row pairs
+// with exactly the inner rows satisfying the local predicates plus the
+// equalities (inner join), or null-pads when none match (LEFT kept as-is).
+// Volatile inner expressions would observe different evaluation counts
+// across the two shapes, so they block the rewrite.
+bool DecorrelateOneLateralSource(SelectStatement* outer, size_t index,
+                                 TransactionContext& ctx) {
+  std::vector<SelectSource> sources = outer->Sources();
+  if (index >= sources.size()) {
+    return false;
+  }
+  SelectSource site = sources[index];
+  if (site.query == nullptr || !site.is_lateral || site.unnest ||
+      site.alias.empty() || !site.using_columns.empty() ||
+      site.from_nested_join) {
+    return false;
+  }
+  if (site.join_type != JoinType::kCross &&
+      site.join_type != JoinType::kInner && site.join_type != JoinType::kLeft) {
+    return false;
+  }
+  const std::shared_ptr<SelectStatement>& inner = site.query;
+  if (inner->Sources().size() != 1 || !inner->WithQueries().empty() ||
+      !inner->GroupBy().empty() || inner->Having() || inner->Distinct() ||
+      !inner->DistinctOn().empty() || inner->HasLimit() ||
+      inner->Offset() != 0 || inner->Qualify() || !inner->UnionAll().empty() ||
+      inner->GetSetOperationTree() != nullptr ||
+      relational_detail::HasWindowFunctions(*inner) ||
+      inner->SelectList().empty()) {
+    return false;
+  }
+  const SelectSource& base = inner->Sources()[0];
+  if (base.query != nullptr || base.unnest || base.is_lateral ||
+      base.table.empty() || !base.using_columns.empty() ||
+      base.from_nested_join || base.join_condition) {
+    return false;
+  }
+  if (outer->IsRecursiveWith(base.table)) {
+    return false;
+  }
+  StatusOr<std::shared_ptr<Table>> base_table = ctx.GetTable(base.table);
+  if (!base_table.HasValue()) {
+    return false;
+  }
+  const Schema& base_schema = base_table.Value()->GetSchema();
+  const std::string inner_alias = base.alias.empty() ? base.table : base.alias;
+  // Inner SELECT: named, immutable, subquery-free, star-free (a star would
+  // hide whether a correlation key is projected).
+  for (const NamedExpression& item : inner->SelectList()) {
+    if (item.name.empty() || !item.expression ||
+        relational_detail::ContainsAggregate(item.expression) ||
+        ContainsQueryExpression(item.expression) ||
+        !DerivedExpressionIsImmutable(item.expression) ||
+        ContainsStarReference(item.expression)) {
+      return false;
+    }
+  }
+  // Outer scope identities: preceding sources only (later sources cannot be
+  // referenced, and the site itself is the derived alias, not the base).
+  std::unordered_set<std::string> outer_identities;
+  for (size_t j = 0; j < index; ++j) {
+    if (!sources[j].alias.empty()) {
+      outer_identities.insert(sources[j].alias);
+    }
+    if (!sources[j].table.empty()) {
+      outer_identities.insert(sources[j].table);
+    }
+  }
+  auto is_inner = [&](const ColumnName& column) {
+    if (column.schema.empty()) {
+      return base_schema.Offset(ColumnName("", column.name)) >= 0;
+    }
+    return IdentifierEquals(column.schema, inner_alias) ||
+           IdentifierEquals(column.schema, base.table);
+  };
+  auto is_outer = [&](const ColumnName& column) {
+    if (column.schema.empty()) {
+      return false;
+    }
+    return std::ranges::any_of(
+        outer_identities, [&](const std::string& identity) {
+          return IdentifierEquals(column.schema, identity);
+        });
+  };
+  // Partition the inner WHERE into correlation equalities and the local
+  // remainder. Every other outer reference anywhere in the inner statement
+  // aborts the rewrite.
+  struct Correlation {
+    Expression outer_column;
+    std::string inner_name;
+  };
+  std::vector<Correlation> correlations;
+  std::vector<Expression> remainder;
+  for (const Expression& conjunct : SplitConjuncts(inner->WhereClause())) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp ||
+        conjunct->AsBinaryExpression().Op() != BinaryOperation::kEquals ||
+        conjunct->AsBinaryExpression().Left()->Type() !=
+            TypeTag::kColumnValue ||
+        conjunct->AsBinaryExpression().Right()->Type() !=
+            TypeTag::kColumnValue) {
+      if (conjunct && !DerivedExpressionIsImmutable(conjunct)) {
+        return false;
+      }
+      if (conjunct) {
+        for (const ColumnName& column : conjunct->TouchedColumns()) {
+          if (!is_inner(column)) {
+            return false;
+          }
+        }
+        remainder.push_back(conjunct);
+      }
+      continue;
+    }
+    const ColumnName& left =
+        conjunct->AsBinaryExpression().Left()->AsColumnValue().GetColumnName();
+    const ColumnName& right =
+        conjunct->AsBinaryExpression().Right()->AsColumnValue().GetColumnName();
+    const ColumnName* inner_col = nullptr;
+    const Expression* outer_expr = nullptr;
+    if (is_inner(left) && is_outer(right)) {
+      inner_col = &left;
+      outer_expr = &conjunct->AsBinaryExpression().Right();
+    } else if (is_inner(right) && is_outer(left)) {
+      inner_col = &right;
+      outer_expr = &conjunct->AsBinaryExpression().Left();
+    } else {
+      // Both sides inner (a local predicate), or unresolvable: the latter
+      // may still name the outer scope, so only provably-local stays.
+      if (!is_inner(left) || !is_inner(right)) {
+        return false;
+      }
+      remainder.push_back(conjunct);
+      continue;
+    }
+    correlations.push_back(Correlation{.outer_column = *outer_expr,
+                                       .inner_name = inner_col->name});
+  }
+  if (correlations.empty()) {
+    return false;
+  }
+  auto touches_outer = [&](const Expression& expression) {
+    if (!expression) {
+      return false;
+    }
+    return std::ranges::any_of(expression->TouchedColumns(),
+                               [&](const ColumnName& column) {
+                                 return column.name != "*" && !is_inner(column);
+                               });
+  };
+  for (const NamedExpression& item : inner->SelectList()) {
+    if (touches_outer(item.expression)) {
+      return false;
+    }
+  }
+  for (const auto& term : inner->OrderBy()) {
+    if (touches_outer(term.expression)) {
+      return false;
+    }
+  }
+  // Extend the inner projection with correlation keys that are not outputs
+  // (the ON condition below addresses them through the derived alias).
+  // A clashing output name with different meaning aborts the rewrite.
+  std::shared_ptr<SelectStatement> new_inner =
+      std::make_shared<SelectStatement>(*inner);
+  for (const Correlation& correlation : correlations) {
+    std::string lowered = correlation.inner_name;
+    for (char& c : lowered) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    bool projected = false;
+    for (const NamedExpression& item : new_inner->SelectList()) {
+      std::string item_lowered = item.name;
+      for (char& c : item_lowered) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (item_lowered != lowered) {
+        continue;
+      }
+      if (!item.expression ||
+          item.expression->Type() != TypeTag::kColumnValue) {
+        return false;
+      }
+      const ColumnName& projected_col =
+          item.expression->AsColumnValue().GetColumnName();
+      const bool same_base =
+          (projected_col.schema.empty() &&
+           base_schema.Offset(ColumnName("", projected_col.name)) >= 0 &&
+           IdentifierEquals(projected_col.name, correlation.inner_name)) ||
+          ((IdentifierEquals(projected_col.schema, inner_alias) ||
+            IdentifierEquals(projected_col.schema, base.table)) &&
+           IdentifierEquals(projected_col.name, correlation.inner_name));
+      if (!same_base) {
+        return false;
+      }
+      projected = true;
+      break;
+    }
+    if (!projected) {
+      std::vector<NamedExpression> extended = new_inner->SelectList();
+      extended.emplace_back(
+          correlation.inner_name,
+          ColumnValueExp(ColumnName(inner_alias, correlation.inner_name)));
+      new_inner->SetSelectList(std::move(extended));
+    }
+  }
+  new_inner->SetWhereClause(remainder.empty() ? Expression{}
+                                              : CombineConjuncts(remainder));
+  // Publish the rewrite on the site: uncorrelated, explicitly joined, with
+  // the correlations as the ON condition addressed through the derived
+  // alias (the flattener rebinds them when it consumes the site).
+  Expression on;
+  for (const Correlation& correlation : correlations) {
+    Expression term = BinaryExpressionExp(
+        correlation.outer_column, BinaryOperation::kEquals,
+        ColumnValueExp(ColumnName(site.alias, correlation.inner_name)));
+    on = on ? BinaryExpressionExp(on, BinaryOperation::kAnd, term) : term;
+  }
+  if (site.join_condition) {
+    on = BinaryExpressionExp(site.join_condition, BinaryOperation::kAnd, on);
+  }
+  site.query = std::move(new_inner);
+  site.is_lateral = false;
+  if (site.join_type == JoinType::kCross) {
+    site.join_type = JoinType::kInner;
+  }
+  site.join_condition = std::move(on);
+  sources[index] = std::move(site);
+  outer->SetSources(std::move(sources));
+  // The proven M5 flattener consumes the uncorrelated site when its gates
+  // pass; otherwise the site stays a single-evaluation uncorrelated derived
+  // table, still cheaper than per-row lateral re-execution.
+  (void)FlattenOneDerivedSource(outer, index, ctx);
+  return true;
+}
+
+bool DecorrelateSingleTableLaterals(SelectStatement* outer,
+                                    TransactionContext& ctx) {
+  if (outer == nullptr) {
+    return false;
+  }
+  bool changed = false;
+  for (size_t i = 0; i < outer->Sources().size(); ++i) {
+    if (outer->Sources()[i].query != nullptr &&
+        DecorrelateOneLateralSource(outer, i, ctx)) {
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 bool FlattenDerivedSources(SelectStatement* outer, TransactionContext& ctx,
                            const LiftedCtes* lifted = nullptr) {
   // A covered layer (LiftedCtes::fully_covered) leaves only vestigial map
@@ -3802,6 +4069,312 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
 // relational path.
 constexpr size_t kMaxMaterializedCteRows = 1024;
 
+// CTE predicate pushdown (TODO.md item 2a): before a lifted CTE body is
+// executed into a shared cell, narrow it with outer WHERE conjuncts. The
+// cell serves every reference site, so an injected predicate must be a
+// logical consequence of *each* site's filters (a weakening): per output
+// column it keeps the minimum lower bound, the maximum upper bound, and a
+// unanimous equality across all live sites. Single-site CTEs fall out as
+// the special case (their own bounds). The outer filters are kept
+// everywhere, so the injection only ever narrows the prefetched cell; it
+// must still be exact (an over-narrowing injection would drop rows a site
+// keeps), hence the passthrough-only mapping and the sargable-operator
+// gate. A site whose own conjuncts contradict each other needs nothing and
+// is excluded from the combination.
+// Returns true when at least one conjunct was injected.
+bool TryNarrowCteBody(SelectStatement* body, const SelectStatement& outer,
+                      const std::vector<std::string>& site_aliases) {
+  if (body == nullptr || site_aliases.empty() || body->Sources().size() != 1) {
+    return false;
+  }
+  const SelectSource& base = body->Sources().front();
+  if (base.table.empty() || base.query != nullptr || base.unnest ||
+      base.is_lateral || base.from_nested_join || !base.using_columns.empty() ||
+      base.join_condition || base.join_type != JoinType::kCross) {
+    return false;
+  }
+  // Row-preserving bodies only (same shape the M5 flattener consumes, plus
+  // no post-window/row-count operators whose input the filter would change).
+  if (!body->GroupBy().empty() || body->Having() || body->Distinct() ||
+      body->HasDistinctOn() || body->HasLimit() || body->Offset() != 0 ||
+      !body->UnionAll().empty() || body->GetSetOperationTree() != nullptr ||
+      body->Qualify() || body->WithTies() ||
+      relational_detail::HasWindowFunctions(*body) ||
+      !body->WithQueries().empty()) {
+    return false;
+  }
+  for (const NamedExpression& item : body->SelectList()) {
+    if (ContainsStarReference(item.expression)) {
+      return false;
+    }
+  }
+  // Lowered output-name -> base column for bare passthrough targets only.
+  // Expression outputs have no mapping (conservative: no injection).
+  auto lower = [](std::string text) {
+    for (char& c : text) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return text;
+  };
+  std::unordered_map<std::string, ColumnName> output_to_base;
+  for (const NamedExpression& item : body->SelectList()) {
+    if (item.name.empty() || !item.expression ||
+        item.expression->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    output_to_base.emplace(lower(item.name),
+                           item.expression->AsColumnValue().GetColumnName());
+  }
+  if (output_to_base.empty()) {
+    return false;
+  }
+  struct SiteBounds {
+    bool dead{false};
+    struct ColumnBounds {
+      bool usable{true};
+      bool has_lower{false};
+      bool has_upper{false};
+      bool has_eq{false};
+      Value lower_value;
+      Value upper_value;
+      Value eq_value;
+      bool lower_inclusive{true};
+      bool upper_inclusive{true};
+    };
+    std::unordered_map<std::string, ColumnBounds> columns;
+  };
+  std::unordered_map<std::string, size_t> site_index;
+  for (size_t i = 0; i < site_aliases.size(); ++i) {
+    site_index.emplace(lower(site_aliases[i]), i);
+  }
+  std::vector<SiteBounds> sites(site_aliases.size());
+  for (const Expression& conjunct : SplitConjuncts(outer.WhereClause())) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const auto& binary = conjunct->AsBinaryExpression();
+    BinaryOperation normalized_op = binary.Op();
+    const Expression* column_side = nullptr;
+    const Expression* const_side = nullptr;
+    if (binary.Left()->Type() == TypeTag::kColumnValue &&
+        binary.Right()->Type() == TypeTag::kConstantValue) {
+      column_side = &binary.Left();
+      const_side = &binary.Right();
+    } else if (binary.Left()->Type() == TypeTag::kConstantValue &&
+               binary.Right()->Type() == TypeTag::kColumnValue) {
+      column_side = &binary.Right();
+      const_side = &binary.Left();
+      switch (binary.Op()) {
+        case BinaryOperation::kEquals:
+          normalized_op = BinaryOperation::kEquals;
+          break;
+        case BinaryOperation::kLessThan:
+          normalized_op = BinaryOperation::kGreaterThan;
+          break;
+        case BinaryOperation::kLessThanEquals:
+          normalized_op = BinaryOperation::kGreaterThanEquals;
+          break;
+        case BinaryOperation::kGreaterThan:
+          normalized_op = BinaryOperation::kLessThan;
+          break;
+        case BinaryOperation::kGreaterThanEquals:
+          normalized_op = BinaryOperation::kLessThanEquals;
+          break;
+        default:
+          continue;
+      }
+    } else {
+      continue;
+    }
+    if (normalized_op != BinaryOperation::kEquals &&
+        normalized_op != BinaryOperation::kLessThan &&
+        normalized_op != BinaryOperation::kLessThanEquals &&
+        normalized_op != BinaryOperation::kGreaterThan &&
+        normalized_op != BinaryOperation::kGreaterThanEquals) {
+      continue;
+    }
+    const Value& constant = (*const_side)->AsConstantValue().GetValue();
+    if (constant.IsNull()) {
+      continue;
+    }
+    const ColumnName& outer_col =
+        (*column_side)->AsColumnValue().GetColumnName();
+    const auto site_it = site_index.find(lower(outer_col.schema));
+    if (site_it == site_index.end()) {
+      continue;
+    }
+    SiteBounds& site = sites[site_it->second];
+    if (site.dead) {
+      continue;
+    }
+    const std::string key = lower(outer_col.name);
+    if (!output_to_base.contains(key)) {
+      continue;
+    }
+    SiteBounds::ColumnBounds& bounds = site.columns[key];
+    if (!bounds.usable) {
+      continue;
+    }
+    if (normalized_op == BinaryOperation::kEquals) {
+      if (bounds.has_eq) {
+        if (bounds.eq_value.type != constant.type) {
+          // Mixed-type equalities may still agree under numeric coercion;
+          // the column simply becomes unrepresentable for this site (the
+          // column is then skipped globally, never mis-narrowed).
+          bounds.usable = false;
+          bounds.has_lower = bounds.has_upper = bounds.has_eq = false;
+          continue;
+        }
+        if (!(bounds.eq_value == constant)) {
+          // Contradictory equalities: this site needs nothing.
+          site.dead = true;
+          site.columns.clear();
+          continue;
+        }
+      } else {
+        bounds.has_eq = true;
+        bounds.eq_value = constant;
+      }
+      continue;
+    }
+    // Range bound: mixed-type comparisons on one column are skipped.
+    bool* has = nullptr;
+    Value* stored = nullptr;
+    bool* inclusive = nullptr;
+    const bool is_lower = normalized_op == BinaryOperation::kGreaterThan ||
+                          normalized_op == BinaryOperation::kGreaterThanEquals;
+    if (is_lower) {
+      has = &bounds.has_lower;
+      stored = &bounds.lower_value;
+      inclusive = &bounds.lower_inclusive;
+    } else {
+      has = &bounds.has_upper;
+      stored = &bounds.upper_value;
+      inclusive = &bounds.upper_inclusive;
+    }
+    if (*has && stored->type != constant.type) {
+      bounds.usable = false;
+      bounds.has_lower = bounds.has_upper = bounds.has_eq = false;
+      continue;
+    }
+    const bool edge_inclusive =
+        normalized_op == BinaryOperation::kGreaterThanEquals ||
+        normalized_op == BinaryOperation::kLessThanEquals;
+    if (!*has) {
+      *has = true;
+      *stored = constant;
+      *inclusive = edge_inclusive;
+    } else if (is_lower) {
+      if (constant.type == stored->type && *stored < constant) {
+        *stored = constant;
+        *inclusive = edge_inclusive;
+      } else if (!(constant.type == stored->type) || constant == *stored) {
+        *inclusive = *inclusive && edge_inclusive;
+      }
+    } else {
+      if (constant.type == stored->type && constant < *stored) {
+        *stored = constant;
+        *inclusive = edge_inclusive;
+      } else if (!(constant.type == stored->type) || constant == *stored) {
+        *inclusive = *inclusive && edge_inclusive;
+      }
+    }
+  }
+  // Combine across live sites: the minimum lower bound, the maximum upper
+  // bound, and a unanimous equality. The inclusive edge is always sound for
+  // the weakening (a strict site bound implies its inclusive form).
+  std::vector<Expression> injected;
+  for (const auto& [output, base_column] : output_to_base) {
+    bool all_lower = true;
+    bool all_upper = true;
+    bool all_eq = true;
+    bool all_usable = true;
+    bool any_live = false;
+    Value lower_value;
+    Value upper_value;
+    Value eq_value;
+    bool lower_set = false;
+    bool upper_set = false;
+    bool eq_set = false;
+    for (const SiteBounds& site : sites) {
+      if (site.dead) {
+        continue;
+      }
+      any_live = true;
+      const auto found = site.columns.find(output);
+      if (found == site.columns.end() || !found->second.usable) {
+        all_lower = all_upper = all_eq = false;
+        if (found != site.columns.end()) {
+          all_usable = false;
+        }
+        continue;
+      }
+      const SiteBounds::ColumnBounds& bounds = found->second;
+      if (bounds.has_lower) {
+        if (!lower_set) {
+          lower_value = bounds.lower_value;
+          lower_set = true;
+        } else if (lower_value.type != bounds.lower_value.type) {
+          all_lower = false;
+        } else if (bounds.lower_value < lower_value) {
+          lower_value = bounds.lower_value;
+        }
+      } else {
+        all_lower = false;
+      }
+      if (bounds.has_upper) {
+        if (!upper_set) {
+          upper_value = bounds.upper_value;
+          upper_set = true;
+        } else if (upper_value.type != bounds.upper_value.type) {
+          all_upper = false;
+        } else if (bounds.upper_value < upper_value) {
+          upper_value = bounds.upper_value;
+        }
+      } else {
+        all_upper = false;
+      }
+      if (bounds.has_eq) {
+        if (!eq_set) {
+          eq_value = bounds.eq_value;
+          eq_set = true;
+        } else if (eq_value.type != bounds.eq_value.type ||
+                   !(eq_value == bounds.eq_value)) {
+          all_eq = false;
+        }
+      } else {
+        all_eq = false;
+      }
+    }
+    if (!any_live || !all_usable) {
+      continue;
+    }
+    if (all_eq && eq_set) {
+      injected.push_back(BinaryExpressionExp(ColumnValueExp(base_column),
+                                             BinaryOperation::kEquals,
+                                             ConstantValueExp(eq_value)));
+      continue;
+    }
+    if (all_lower && lower_set) {
+      injected.push_back(BinaryExpressionExp(
+          ColumnValueExp(base_column), BinaryOperation::kGreaterThanEquals,
+          ConstantValueExp(lower_value)));
+    }
+    if (all_upper && upper_set) {
+      injected.push_back(BinaryExpressionExp(ColumnValueExp(base_column),
+                                             BinaryOperation::kLessThanEquals,
+                                             ConstantValueExp(upper_value)));
+    }
+  }
+  if (injected.empty()) {
+    return false;
+  }
+  std::vector<Expression> body_conjuncts = SplitConjuncts(body->WhereClause());
+  body_conjuncts.insert(body_conjuncts.end(), injected.begin(), injected.end());
+  body->SetWhereClause(CombineConjuncts(body_conjuncts));
+  return true;
+}
+
 }  // namespace
 
 void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
@@ -3982,8 +4555,23 @@ void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
     // (shared) body, which preserves its row multiset by construction; the
     // map entry itself is never disturbed, so every return path below keeps
     // a complete map and the abort path is identical to never having tried.
-    StatusOr<Executor> planned = body_engine.PrepareStatement(
-        ctx, std::make_unique<SelectStatement>(*body_it->second));
+    // Single-use bodies additionally get outer filters pushed in (TODO.md
+    // item 2a): the copy is narrowed, never the mapped body, and the outer
+    // filter stays as the residual.
+    auto body_copy = std::make_unique<SelectStatement>(*body_it->second);
+    {
+      // Every top-level reference site shares the cell, so the narrowing
+      // must be a weakening over all of them (TODO.md item 2a).
+      std::vector<std::string> site_aliases;
+      for (const SelectSource& source : outer->Sources()) {
+        if (source.table == name) {
+          site_aliases.push_back(source.alias.empty() ? name : source.alias);
+        }
+      }
+      TryNarrowCteBody(body_copy.get(), *outer, site_aliases);
+    }
+    StatusOr<Executor> planned =
+        body_engine.PrepareStatement(ctx, std::move(body_copy));
     if (!planned.HasValue()) {
       return;
     }
@@ -4223,9 +4811,26 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
       core.aliases_.emplace(source.alias, source.table);
     }
     if (source.join_condition) {
-      where = where ? BinaryExpressionExp(where, BinaryOperation::kAnd,
-                                          source.join_condition)
-                    : source.join_condition;
+      // M6-bridge: outer joins keep their ON predicate on the join itself
+      // (folding it into WHERE would move null-supplying-side filtering past
+      // the NULL padding and silently drop preserved rows). The routing gate
+      // (outer_bridge_slice) admits only memo-representable edges; inner and
+      // cross conditions fold into WHERE exactly as before.
+      if (source.join_type == JoinType::kLeft ||
+          source.join_type == JoinType::kRight ||
+          source.join_type == JoinType::kFull) {
+        QueryData::OuterJoinEdge edge;
+        edge.right_index = core.from_.size() - 1;
+        edge.join_kind = source.join_type == JoinType::kLeft    ? 0
+                         : source.join_type == JoinType::kRight ? 1
+                                                                : 2;
+        edge.on_condition = source.join_condition;
+        core.outer_joins_.push_back(std::move(edge));
+      } else {
+        where = where ? BinaryExpressionExp(where, BinaryOperation::kAnd,
+                                            source.join_condition)
+                      : source.join_condition;
+      }
     }
   }
   core.where_ = where ? where : ConstantValueExp(Value(true));
@@ -5268,6 +5873,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       MaterializeCtes(select.get(), ctx, &lifted);
       LiftRecursiveCtes(select.get(), &lifted);
       (void)FlattenDerivedSources(select.get(), ctx, &lifted);
+      // M5+: single-table equality LATERALs become decorrelated joins (the
+      // proven flattener above consumes them once uncorrelated).
+      (void)DecorrelateSingleTableLaterals(select.get(), ctx);
       // A WHERE conjunct that rejects the NULL padding of a LEFT JOIN makes
       // the outer join's padded rows unreachable; planning it as an inner
       // join is exact and unlocks hash-join fast paths (§7.5).
@@ -5436,17 +6044,45 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                         return source.query == nullptr && !source.unnest &&
                                !source.is_lateral && !source.table.empty();
                       });
-      // M6: the grouped bridge folds every ON condition into WHERE, which is
-      // exact only for inner joins. Outer joins keep their ON predicates on
-      // the join itself and stay out of the bridge until the memo models
-      // grouped outer joins.
-      const bool has_outer_join =
-          std::any_of(select->Sources().begin(), select->Sources().end(),
-                      [](const SelectSource& source) {
-                        return source.join_type == JoinType::kLeft ||
-                               source.join_type == JoinType::kRight ||
-                               source.join_type == JoinType::kFull;
-                      });
+      // M6: the grouped bridge folds every inner ON condition into WHERE,
+      // which is exact only for inner joins. Outer joins keep their ON
+      // predicates on the join itself as QueryData::OuterJoinEdge payloads
+      // (see outer_bridge_slice below); anything beyond that slice stays
+      // relational until the memo models the remaining grouped shapes.
+      // M6-bridge slice: LEFT edges are admitted from source 1 onward;
+      // RIGHT/FULL only in the M6+1 two-source shape (plain inner/cross
+      // first source); every outer ON condition must be memo-representable
+      // and no USING / nested-join sugar may remain on any source.
+      const bool outer_bridge_slice = [&] {
+        for (size_t i = 0; i < select->Sources().size(); ++i) {
+          const SelectSource& source = select->Sources()[i];
+          if (!source.using_columns.empty() || source.from_nested_join) {
+            return false;
+          }
+          const bool outer_type = source.join_type == JoinType::kLeft ||
+                                  source.join_type == JoinType::kRight ||
+                                  source.join_type == JoinType::kFull;
+          if (!source.join_condition || !outer_type) {
+            continue;
+          }
+          if (i == 0) {
+            return false;
+          }
+          // M6+1 admits only the single RIGHT/FULL edge over a plain
+          // inner/cross first source.
+          const bool m61_shape =
+              select->Sources().size() == 2 && i == 1 &&
+              (select->Sources()[0].join_type == JoinType::kCross ||
+               select->Sources()[0].join_type == JoinType::kInner);
+          if (source.join_type != JoinType::kLeft && !m61_shape) {
+            return false;
+          }
+          if (NeedsRelationalEvaluation(source.join_condition)) {
+            return false;
+          }
+        }
+        return true;
+      }();
       // Set operations fold independently planned operands, so a FROM-side
       // UNNEST is fine: each operand routes through its own statement
       // planning.  Subquery sources and LATERAL stay on the other paths.
@@ -5503,8 +6139,10 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         if (!force_relational_fallback_ && select->Sources().size() > 1 &&
             has_grouping && !simple_count_star && !select->Qualify() &&
             !relational_detail::HasWindowFunctions(*select) &&
-            select->WithQueries().empty() && sources_plain && !has_outer_join &&
-            (!PostRewriteNeedsRelational(*select, &lifted) ||
+            select->WithQueries().empty() && sources_plain &&
+            outer_bridge_slice &&
+            (!PostRewriteNeedsRelational(*select, &lifted,
+                                         /*include_grouping=*/false) ||
              can_decorrelate_subqueries) &&
             !touches_query_expression(select->WhereClause()) &&
             !grouped_expressions_correlate) {

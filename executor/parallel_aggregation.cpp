@@ -57,6 +57,20 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
       input_schema_(std::move(input_schema)),
       aggregates_(std::move(aggregates)),
       worker_count_(std::max<size_t>(1, worker_count)) {
+  // Two-input DISTINCT statistics (CORR/COVAR with DISTINCT) de-duplicate
+  // leading/trailing pairs per row; worker-local dedup sets cannot be merged
+  // without the pairs, so force single-worker execution for exactness.  The
+  // serial AggregateAccumulator stays the reference for these shapes.
+  for (const NamedExpression& named : aggregates_) {
+    const auto& aggregate = named.expression->AsAggregateExpression();
+    const AggregationType type = aggregate.GetType();
+    if (aggregate.Distinct() && (type == AggregationType::kCovarSamp ||
+                                 type == AggregationType::kCovarPop ||
+                                 type == AggregationType::kCorr)) {
+      worker_count_ = 1;
+      break;
+    }
+  }
   inputs_.reserve(aggregates_.size());
   for (size_t index = 0; index < aggregates_.size(); ++index) {
     const auto& aggregate =
@@ -733,11 +747,20 @@ Status ParallelAggregationExecutor::Merge(PartialState* destination,
     if (aggregate.Distinct()) {
       // Replay each worker's deduped set through the destination's OWN
       // distinct_values: a value present in several workers' sets must be
-      // counted once globally, and statistical aggregates need the pair
-      // semantics of AccumulateValue's dedup path (an empty trailing_values
-      // would throw "requires two arguments" for CORR/COVAR with DISTINCT).
-      for (const Value& value : source.distinct_values[index]) {
-        RETURN_IF_FAIL(AccumulateValue(destination, index, value, true));
+      // counted once globally.  Single-input statistical aggregates keep
+      // long-double partial sums, so they replay through AccumulateStatValue
+      // with the same (empty-trailing) shape the per-row path uses.
+      // Two-input DISTINCT statistics (CORR/COVAR) never reach this executor
+      // (AggregationPlan routes them to the serial path: their pairs cannot
+      // be reconstructed from deduped leading values alone).
+      if (IsStatisticalAggregate(aggregate.GetType())) {
+        for (const Value& value : source.distinct_values[index]) {
+          RETURN_IF_FAIL(AccumulateStatValue(destination, index, value, {}));
+        }
+      } else {
+        for (const Value& value : source.distinct_values[index]) {
+          RETURN_IF_FAIL(AccumulateValue(destination, index, value, true));
+        }
       }
       continue;
     }

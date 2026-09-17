@@ -13,11 +13,17 @@
 namespace tinylamb {
 
 // Aggregation / GROUP BY / window-function oracle.  Mirrors a single table
-// in C++, then runs random GROUP BY queries (COUNT/COUNT(x)/SUM/MIN/MAX over
-// nullable columns, optional WHERE) and window queries (ROW_NUMBER / RANK /
-// COUNT(*) / running SUM over PARTITION BY with a unique ORDER BY) and
-// compares whole result multisets against the mirror's SQL-semantics
-// computation (NULL groups, NULL-skipping aggregates, NULLS-FIRST ranking).
+// in C++, then runs random aggregate queries — GROUP BY over 1-2 key
+// columns, optional WHERE and HAVING (3VL on the aggregate result), global
+// aggregates over possibly-empty input (COUNT(*)=0 / SUM=NULL contract),
+// COUNTIF and DISTINCT aggregates (COUNT(DISTINCT)/SUM(DISTINCT)) — and
+// window queries (ROW_NUMBER / RANK / COUNT(*) / running SUM plus
+// ROWS BETWEEN k PRECEDING AND CURRENT ROW frames for SUM/COUNT(b)) over
+// PARTITION BY with a unique ORDER BY.  ~12% of iterations use ~8.4k rows
+// (multi-row VALUES batches) to cross the morsel/parallel-aggregation
+// threshold.  Whole result multisets are compared against the mirror's
+// SQL-semantics computation (NULL groups, NULL-skipping aggregates,
+// NULLS-FIRST ranking).
 
 struct AggQueryExpect {
   std::string sql;

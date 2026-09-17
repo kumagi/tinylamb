@@ -130,6 +130,9 @@ class Table {
 
   [[nodiscard]] const Schema& GetSchema() const { return schema_; }
   [[nodiscard]] size_t IndexCount() const { return indexes_.size(); }
+  // Diagnostics: the row-page chain head/tail (for corruption reports).
+  [[nodiscard]] page_id_t FirstPageId() const { return first_pid_; }
+  [[nodiscard]] page_id_t LastPageId() const { return last_pid_; }
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);

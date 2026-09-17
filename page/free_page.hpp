@@ -27,7 +27,10 @@ class FreePage {
   // page 0 is reserved for the meta page.
   static constexpr page_id_t kEndOfFreeList = 0;
 
-  void Initialize() { next_free_page = kEndOfFreeList; }
+  void Initialize() {
+    next_free_page = kEndOfFreeList;
+    destroyer_ = 0;
+  }
 
  public:
   char* FreeBody() { return reinterpret_cast<char*>(this) + sizeof(FreePage); }
@@ -41,14 +44,28 @@ class FreePage {
   [[nodiscard]] page_id_t NextFreePage() const { return next_free_page; }
   void SetNextFreePage(page_id_t next) { next_free_page = next; }
 
+  // The transaction whose kSystemDestroyPage pushed this page onto the free
+  // list, or 0 for entries recovered by the startup rebuild (their destroy
+  // was already committed, or the loser undo already ran).  While that
+  // transaction is still active the destroy can be undone, so the page id
+  // must not be reissued to *any* transaction — the allocating one included:
+  // the abort would restore the old page image over the interim owner's
+  // content and resurrect the dropped catalog entry, while the reuse-time
+  // version-chain invalidation would have destroyed the history the
+  // restored rows need to stay visible.
+  [[nodiscard]] txn_id_t Destroyer() const { return destroyer_; }
+  void SetDestroyer(txn_id_t txn) { destroyer_ = txn; }
+
  private:
   friend class Page;
   friend class MetaPage;
   friend std::hash<tinylamb::FreePage>;
 
   uint64_t next_free_page;
+  txn_id_t destroyer_;
   void Dump(std::ostream& o, int /*unused*/) const {
-    o << "[NextFreePage: " << next_free_page << "]";
+    o << "[NextFreePage: " << next_free_page << " Destroyer: " << destroyer_
+      << "]";
   }
   friend std::ostream& operator<<(std::ostream& o, const FreePage& f) {
     f.Dump(o, 0);
@@ -65,7 +82,8 @@ template <>
 class hash<tinylamb::FreePage> {
  public:
   uint64_t operator()(const tinylamb::FreePage& p) {
-    return 0xf1ee1a4e0000 + std::hash<uint64_t>()(p.next_free_page);
+    return 0xf1ee1a4e0000 + std::hash<uint64_t>()(p.next_free_page) +
+           std::hash<uint64_t>()(p.destroyer_) * 31;
   }
 };
 

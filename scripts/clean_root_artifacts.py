@@ -27,6 +27,7 @@ PATTERNS = (
     "*.db.tmp",
     "*.log",
     "*.last_checkpoint",
+    "*.last_checkpoint.tmp",
     "*.wal",
 )
 

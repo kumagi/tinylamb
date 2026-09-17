@@ -53,6 +53,13 @@ bool MetaPage::AllocateCandidate(page_id_t candidate, Page* candidate_page) {
   if (first_free_page != candidate) {
     return false;
   }
+  // A stale/corrupt free-list head could point at a live row/branch page;
+  // re-issuing it would hand out an in-use id and poison the head with
+  // non-free bytes.  Refuse and let the allocator retry/rebuild.
+  if (candidate_page == nullptr ||
+      candidate_page->Type() != PageType::kFreePage) {
+    return false;
+  }
   first_free_page = candidate_page->body.free_page.next_free_page;
   return true;
 }
@@ -96,6 +103,11 @@ Status MetaPage::DestroyPage(Transaction& txn, Page* target) {
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageID() == free_page_id);
   FreePage& free_page = target->body.free_page;
+  // Record the destroying transaction on the free page itself: while it is
+  // still active the destroy can be undone, so AllocateNewPage must not
+  // reissue the id to a different transaction (the abort would resurrect
+  // the page image and catalog entry over the new owner's content).
+  free_page.SetDestroyer(txn.ID());
   // Add the free page to the free page chain.
   const page_id_t old_first_free_page = first_free_page;
   free_page.next_free_page = first_free_page;

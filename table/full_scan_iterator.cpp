@@ -80,14 +80,17 @@ FullScanIterator::FullScanIterator(
     std::optional<std::vector<slot_t>> projection,
     const std::unordered_set<int64_t>* key_filter,
     std::optional<slot_t> key_column,
-    const std::vector<IntegerPeekCompare>* peek_compares)
+    const std::vector<IntegerPeekCompare>* peek_compares, bool lock_rows,
+    bool wait_for_write_intent)
     : table_(table),
       txn_(txn),
       pos_(table_->first_pid_, 0),
       projection_(std::move(projection)),
       key_filter_(key_filter),
       key_column_(key_column),
-      peek_compares_(peek_compares) {
+      peek_compares_(peek_compares),
+      lock_rows_(lock_rows),
+      wait_for_write_intent_(wait_for_write_intent) {
   // Scans only read: always take a shared page latch, even for writable
   // transactions, so concurrent scan workers never convoy on exclusive
   // latches.  Row-level unpinning below keeps same-thread mutations safe.
@@ -168,7 +171,43 @@ void FullScanIterator::SeekVisibleRow() {
     const bool physical_read = PhysicalReadEligible(*txn_, **page_);
     while (pos_.slot < (*page_)->body.row_page.RowMax()) {
       std::optional<std::string_view> row;
-      if (physical_read) {
+      if (lock_rows_) {
+        // DML source scan: pin the position's head version with a write
+        // intent BEFORE resolving the row, so the image handed to the
+        // predicate is the newest committed version -- the same contract
+        // IndexScan's Position/AddWriteSet/ResolveRow sequence provides.
+        // Vacant slots cannot carry a live head row, so they are skipped
+        // without spending an intent.
+        const RowPage& body = (*page_)->body.row_page;
+        if (body.rows_[pos_.slot].offset == 0) {
+          ++pos_.slot;
+          continue;
+        }
+        const bool locked = wait_for_write_intent_ ? txn_->AddWriteSet(pos_)
+                                                   : txn_->TryAddWriteSet(pos_);
+        if (!locked) {
+          // Undo the intents this scan acquired so a failed statement
+          // leaves no residual locks behind for other transactions.
+          for (const RowPosition& held : scan_locked_) {
+            txn_->ReleaseWriteIntent(held);
+          }
+          scan_locked_.clear();
+          status_ = Status::kConflicts;
+          pos_.page_id = ~0ULL;
+          current_row_.Clear();
+          return;
+        }
+        StatusOr<std::string_view> version = (*page_)->Read(*txn_, pos_.slot);
+        if (!version.HasValue()) {
+          // The head at this position is deleted; nothing here can match a
+          // predicate, so the just-acquired intent is released again.
+          txn_->ReleaseWriteIntent(pos_);
+          ++pos_.slot;
+          continue;
+        }
+        row = version.Value();
+        scan_locked_.push_back(pos_);
+      } else if (physical_read) {
         // Fast path: vacant slots (offset == 0, i.e. deleted or never
         // filled) are invisible to every snapshot that qualifies above --
         // any historical deletion would have stamped PageLSN above the
@@ -179,7 +218,12 @@ void FullScanIterator::SeekVisibleRow() {
           row = body.GetRow(pos_.slot);
         }
       } else {
-        StatusOr<std::string_view> version = (*page_)->Read(*txn_, pos_.slot);
+        // Pure snapshot read (resolve_head=false): an unstaged write intent
+        // this transaction happens to hold on the position -- e.g. left over
+        // from an earlier DML source scan -- must not upgrade this read to
+        // the newest committed version.
+        StatusOr<std::string_view> version =
+            (*page_)->Read(*txn_, pos_.slot, /*resolve_head=*/false);
         if (version.HasValue()) {
           row = version.Value();
         }
@@ -190,11 +234,19 @@ void FullScanIterator::SeekVisibleRow() {
               row->data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
               table_->GetSchema(), *key_column_);
           if (!key || !key_filter_->contains(*key)) {
+            if (lock_rows_) {
+              txn_->ReleaseWriteIntent(pos_);
+              scan_locked_.pop_back();
+            }
             ++pos_.slot;
             continue;
           }
         }
         if (!PassesPeekFilters(*row)) {
+          if (lock_rows_) {
+            txn_->ReleaseWriteIntent(pos_);
+            scan_locked_.pop_back();
+          }
           ++pos_.slot;
           continue;
         }

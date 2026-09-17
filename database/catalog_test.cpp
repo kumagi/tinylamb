@@ -412,11 +412,17 @@ TEST_F(CatalogTest, PageStoragePageSlotsAllocateReuse) {
     pm->DestroyPage(txn, first.get());
   }
 
+  // The freed id is withheld while its destroyer is still active (an abort
+  // could still restore the page), so commit before expecting reuse.
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  TransactionContext ctx2 = rs_->BeginContext();
+
   // Assert -- the next allocation reuses the freed page id
-  PageRef second = pm->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
+  PageRef second =
+      pm->AllocateNewPage(ctx2.txn_, PageType::kRowPage).MoveValue();
   EXPECT_EQ(second->PageID(), first_pid);
 
-  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ASSERT_SUCCESS(ctx2.txn_.PreCommit());
 }
 
 TEST_F(CatalogTest, PageStorageAllocatesGrowingPageIds) {

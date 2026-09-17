@@ -96,9 +96,21 @@ bool PageOffset(page_id_t pid, off_t* out) {
 StatusOr<std::unique_ptr<PagePool>> PagePool::Create(std::string_view file_name,
                                                      size_t capacity) {
   ASSIGN_OR_RETURN(int, fd, OpenPageFile(file_name));
-  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
-  return std::unique_ptr<PagePool>(
-      new PagePool(file_name, capacity, fd));  // NOLINT
+  // The fd is owned by this frame until the pool takes it: a throwing `new`
+  // (bad_alloc) must close it here or the descriptor leaks (same pattern as
+  // Logger::Create).
+  std::unique_ptr<PagePool> pool;
+  try {
+    // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+    pool = std::unique_ptr<PagePool>(
+        new PagePool(file_name, capacity, fd));  // NOLINT
+  } catch (const std::bad_alloc&) {
+    ::close(fd);
+    return StatusError(
+        StatusCode::kIOError,
+        "failed to allocate page pool for " + std::string(file_name));
+  }
+  return pool;
 }
 
 PagePool::PagePool(std::string_view file_name, size_t capacity, int fd)
@@ -380,7 +392,7 @@ void PagePool::DropAllPages() {
   }
 }
 
-void PagePool::FlushPageForTest(page_id_t page_id) {
+Status PagePool::FlushPageForTest(page_id_t page_id) {
   // Hold the Entry address (not a map iterator): list-node addresses stay
   // stable across Touch splices and DropAllPages retires, and a pinned entry
   // can never be detached, so this pointer outlives every path below.  The
@@ -394,7 +406,7 @@ void PagePool::FlushPageForTest(page_id_t page_id) {
     std::unique_lock latch(pool_latch);
     const auto it = pool_.find(page_id);
     if (it == pool_.end()) {
-      return;  // Already evicted.
+      return Status::kSuccess;  // Already evicted.
     }
     // Pin the entry so a concurrent eviction cannot detach and destroy the
     // Page between unlocking pool_latch and WriteBack (the raw pointer would
@@ -424,10 +436,9 @@ void PagePool::FlushPageForTest(page_id_t page_id) {
   // self-deadlock.
   if (exclusive_pin) {
     std::unique_lock page_latch(*pinned->page_latch);
-    WriteBack(pinned->page.get());
-  } else {
-    WriteBack(pinned->page.get());
+    return WriteBack(pinned->page.get());
   }
+  return WriteBack(pinned->page.get());
 }
 
 // Precondition: no latch requirement; operates on the entry atomically.

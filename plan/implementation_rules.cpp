@@ -400,6 +400,23 @@ void ApplyLimitHint(const Plan& plan, const PhysicalProperties& required,
   *estimated_rows = std::min(*estimated_rows, rows);
 }
 
+// Clustering penalty for range index scans (TODO.md item 1b). A range scan
+// over a physically clustered column reads heap rows mostly sequentially,
+// while the same range over randomly ordered rows pays a seek per row.
+// Point lookups (full equality prefix) are excluded by the caller: they
+// fetch scattered rows either way, so correlation carries no signal there.
+// The penalty is multiplicative on the heap-fetch portion and bounded at
+// 1+k for a fully uncorrelated column.
+inline constexpr double kIndexRangeClusteringPenalty = 2.0;
+
+double RangeClusteringPenalty(const TableStatistics& statistics, slot_t slot) {
+  double correlation = 1.0;
+  if (slot < statistics.Columns()) {
+    correlation = std::clamp(statistics.Column(slot).Correlation(), 0.0, 1.0);
+  }
+  return 1.0 + (kIndexRangeClusteringPenalty * (1.0 - correlation));
+}
+
 // Independent-column statistics are sufficient to distinguish two common
 // composite-index choices even without multi-column histograms.  In
 // particular, (warehouse,district,customer,order) is far narrower for three
@@ -768,7 +785,12 @@ std::vector<PlanAlternative> ScanAlternatives(
         }
         return &*found;
       };
-      if (filter && leading_key_range(index) != nullptr) {
+      // Bitmap heap scans fetch rows by position through the snapshot read
+      // path with no write-intent acquisition, so they cannot serve a DML
+      // source that must lock and re-resolve each row's committed head
+      // (same restriction as index-only scans).
+      if (!required.require_row_position && filter &&
+          leading_key_range(index) != nullptr) {
         // AND: every independent indexed predicate contributes one bitmap.
         std::vector<BitmapIndexRange> and_ranges;
         std::unordered_set<slot_t> seen_leading_slots;
@@ -808,7 +830,8 @@ std::vector<PlanAlternative> ScanAlternatives(
       // OR: build one bitmap range per disjunct on this index.  Only
       // comparison ranges are admitted; residual rechecking handles strict
       // versus inclusive boundaries and any additional conjuncts.
-      if (filter && index.sc_.key_.size() == 1) {
+      if (!required.require_row_position && filter &&
+          index.sc_.key_.size() == 1) {
         const std::vector<Expression> disjuncts =
             relational_detail::SplitDisjuncts(filter);
         if (disjuncts.size() >= 2) {
@@ -1058,6 +1081,27 @@ std::vector<PlanAlternative> ScanAlternatives(
         local_cost = std::min(
             local_cost,
             EqualityPrefixRows(statistics, index, equality_prefix_values));
+        // Random heap I/O for range scans (TODO.md item 1b): a range over a
+        // clustered column reads mostly sequentially, while the same range
+        // over randomly ordered rows seeks per matching row and can cost
+        // more than a full sequential scan. Model it as
+        // matched-rows x clustering penalty. Equality-pinned slots are
+        // exact point lookups with no clustering signal, so a pure point
+        // scan keeps the base cost above. Statistics-free tables keep the
+        // old cost exactly (no datapoint to penalize with).
+        bool has_range_slot = false;
+        double range_penalty = 1.0;
+        for (const slot_t slot : consumed) {
+          if (!equality_slots.contains(slot)) {
+            has_range_slot = true;
+            range_penalty *= RangeClusteringPenalty(statistics, slot);
+          }
+        }
+        if (has_range_slot && statistics.Rows() > 0) {
+          const double matched_rows = std::max(
+              1.0, static_cast<double>(statistics.Rows()) * filter_selectivity);
+          local_cost = matched_rows * range_penalty;
+        }
         // Residual (non-range) conjuncts narrow the output further.
         double estimated_rows =
             static_cast<double>(candidate->EmitRowCount()) * filter_selectivity;
@@ -1096,10 +1140,13 @@ std::vector<PlanAlternative> ScanAlternatives(
     }
     Plan full_scan =
         scan_peeks.empty()
-            ? static_cast<Plan>(
-                  std::make_shared<FullScanPlan>(table, statistics, scan_limit))
+            ? static_cast<Plan>(std::make_shared<FullScanPlan>(
+                  table, statistics, scan_limit, required.require_row_position,
+                  required.wait_for_write_intent))
             : static_cast<Plan>(std::make_shared<FullScanPlan>(
-                  table, statistics, std::move(scan_peeks), scan_limit));
+                  table, statistics, std::move(scan_peeks), scan_limit,
+                  required.require_row_position,
+                  required.wait_for_write_intent));
     if (filter) {
       full_scan =
           std::make_shared<SelectionPlan>(full_scan, filter, statistics);

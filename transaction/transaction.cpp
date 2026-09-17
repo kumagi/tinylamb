@@ -72,7 +72,10 @@ Transaction::~Transaction() {
 Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm,
                          bool read_only)
     : txn_id_(txn_id),
-      snapshot_ts_(tm->CurrentCommitTimestamp()),
+      // Begin() immediately overwrites this with StableTimestamp() under the
+      // registry lock; the value here is a placeholder only (the stable
+      // timestamp cannot be read safely before registration).
+      snapshot_ts_(0),
       shard_epoch_(NextShardEpoch()),
       status_(TransactionStatus::kRunning),
       read_only_(read_only),
@@ -111,6 +114,14 @@ Transaction::Transaction(Transaction&& o) noexcept
 
 Status Transaction::PreCommit() {
   Status result = transaction_manager_->PreCommit(*this);
+  // Adopt the manager-assigned status: the pre-publish AddLog-failure path
+  // reports kAborted, while the post-publish durability-failure path keeps
+  // kCommitted (published versions cannot be retracted).  Overwriting a
+  // failed-but-committed outcome with kAborted here would let a later Abort()
+  // roll back data other transactions may already have read.
+  if (IsFinished()) {
+    return result;
+  }
   if (result == Status::kSuccess) {
     status_ = TransactionStatus::kCommitted;
   } else {
@@ -183,6 +194,20 @@ bool Transaction::TryAddWriteSet(const RowPosition& rp) {
   return true;
 }
 
+bool Transaction::SnapshotSeesRow(const RowPosition& rp) const {
+  return transaction_manager_->SnapshotSeesRow(*this, rp);
+}
+
+void Transaction::ReleaseWriteIntent(const RowPosition& rp) {
+  if (!transaction_manager_->ReleaseWriteIntent(*this, rp)) {
+    return;
+  }
+  // The reservation is gone from the chain; keeping rp in the write set
+  // would let a later write on the same slot skip AcquireWriteIntent and
+  // reach RegisterVersionWrite with no pending intent.
+  write_set_.erase(rp);
+}
+
 Transaction::VersionCacheShard& Transaction::ThreadShard() {
   // Thread-local shortcut so the shard-map lock is taken once per thread
   // instead of once per row.  The process-wide epoch guards against stale
@@ -209,7 +234,8 @@ uint64_t Transaction::NextShardEpoch() {
 }
 
 StatusOr<std::string_view> Transaction::ReadVersion(
-    const RowPosition& rp, std::optional<std::string_view> physical) {
+    const RowPosition& rp, std::optional<std::string_view> physical,
+    bool resolve_head) {
   assert(!IsFinished());
   // Fast path: a row without a version chain has exactly one version -- the
   // physical image inside the caller's pinned page -- which every snapshot
@@ -245,7 +271,7 @@ StatusOr<std::string_view> Transaction::ReadVersion(
     }
   }
   StatusOr<std::string> visible =
-      transaction_manager_->ReadVersion(*this, rp, physical);
+      transaction_manager_->ReadVersion(*this, rp, physical, resolve_head);
   if (!visible.HasValue()) {
     return visible.GetStatus();
   }

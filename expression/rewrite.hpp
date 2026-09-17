@@ -211,6 +211,12 @@ enum class Volatility : uint8_t {
 
 [[nodiscard]] Volatility GetFunctionVolatility(std::string_view func_name);
 
+// True when the expression can be evaluated more times without changing
+// results: immutable scalar tree, no volatile functions, and no subquery
+// or aggregate subtrees. Rewrites that duplicate an expression (x + x ->
+// x * 2, predicate fan-out into several FILTER clauses) must gate on this.
+[[nodiscard]] bool SafeToReduceEvaluationCount(const Expression& expression);
+
 // Executes the JSON_EXTRACT / JSON_QUERY / JSON_VALUE / JSON_EXTRACT_SCALAR /
 // JSON_EXTRACT_ARRAY / JSON_QUERY_ARRAY / JSON_VALUE_ARRAY /
 // JSON_EXTRACT_STRING_ARRAY family on raw JSON text.  Shared by the

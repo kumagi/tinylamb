@@ -89,6 +89,10 @@ enum class LogType : uint16_t {  // NOLINT(performance-enum-size)
   kSystemAllocPage,
   kSystemDestroyPage,
   kLowestValue,
+  // CLR for kSystemDestroyPage: the undo of a destroy restores the page
+  // image in the pool but must also be logged, or a later crash replays
+  // the destroy and leaves the catalog pointing at a free page.
+  kCompensateDestroyPage,
 };
 inline std::istream& operator>>(std::istream& in, LogType& val) {
   uint16_t raw = 0;
@@ -208,6 +212,13 @@ struct LogRecord {
       lsn_t prev_lsn, txn_id_t txn, page_id_t pid,
       PageType old_page_type = PageType::kUnknown,
       std::string old_page_body = {});
+
+  // Compensation record for a destroy undo: carries the restored type and
+  // body image exactly as the undo applied them, so a later REDO replays
+  // the restore instead of leaving the destroyed (free) image in place.
+  static LogRecord CompensateDestroyPageLogRecord(txn_id_t txn, page_id_t pid,
+                                                  PageType restored_type,
+                                                  std::string restored_body);
 
   static LogRecord BeginCheckpointLogRecord();
 

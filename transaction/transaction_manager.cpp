@@ -320,9 +320,15 @@ Status TransactionManager::PreCommit(Transaction& txn) {
       }
     }
     if (durable != Status::kSuccess) {
+      // The versions are already published (CommitVersions above) and other
+      // transactions may have read them and recorded D4 dependencies, so the
+      // commit cannot be retracted: a failed fsync must not retroactively
+      // un-commit visible data.  Keep kCommitted, release the registry slot,
+      // and report the durability failure so the caller knows the commit may
+      // not survive a crash.  Only the pre-publish AddLog-failure path above
+      // may report aborted.
       RemoveWaitForEdgesOf(txn.ID());
       ForgetTransaction(txn);
-      txn.SetStatus(TransactionStatus::kAborted);
       return durable;
     }
   } else {
@@ -695,6 +701,83 @@ bool TransactionManager::AcquireWriteIntent(
   return true;
 }
 
+bool TransactionManager::SnapshotSeesRow(const Transaction& txn,
+                                         const RowPosition& rp) const {
+  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::scoped_lock lock(shard.mutex);
+  const auto found = shard.versions.find(rp);
+  if (found == shard.versions.end()) {
+    return false;
+  }
+  const VersionChain& chain = found->second;
+  // An own staged write already supersedes whatever the snapshot would
+  // see at this position (e.g. a delete staged by this transaction makes
+  // reusing the slot an in-place replace, not a masked version).  An
+  // unstaged pending is the intent RowPage::Insert just reserved while
+  // probing the hole; it must not suppress the committed-history check.
+  if (chain.pending && chain.pending->owner == txn.ID() &&
+      chain.pending->staged) {
+    return false;
+  }
+  for (const auto& version : std::ranges::reverse_view(chain.committed)) {
+    if (version.begin_ts <= txn.SnapshotTimestamp() &&
+        txn.SnapshotTimestamp() < version.end_ts) {
+      return version.value.has_value();
+    }
+  }
+  return false;
+}
+
+bool TransactionManager::ReleaseWriteIntent(Transaction& txn,
+                                            const RowPosition& rp) {
+  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::scoped_lock lock(shard.mutex);
+  const auto found = shard.versions.find(rp);
+  if (found == shard.versions.end()) {
+    return true;
+  }
+  VersionChain& chain = found->second;
+  if (!chain.pending || chain.pending->owner != txn.ID() ||
+      chain.pending->staged) {
+    return false;
+  }
+  chain.pending.reset();
+  shard.write_intent_released.notify_all();
+  if (chain.committed.empty()) {
+    shard.versions.erase(found);
+  }
+  return true;
+}
+
+std::string TransactionManager::DebugDumpVersionChains(page_id_t pid) const {
+  std::string out;
+  for (const VersionShard& shard : version_shards_) {
+    std::scoped_lock lock(shard.mutex);
+    for (const auto& [rp, chain] : shard.versions) {
+      if (rp.page_id != pid) {
+        continue;
+      }
+      out += "    chain {" + std::to_string(rp.page_id) + "," +
+             std::to_string(rp.slot) + "} committed=[";
+      for (const CommittedVersion& v : chain.committed) {
+        out += "{" + std::to_string(v.begin_ts) + "," +
+               std::to_string(v.end_ts) + "," +
+               (v.value ? "row:" + std::to_string(v.value->size()) + "B"
+                        : "null") +
+               "}";
+      }
+      out += "]";
+      if (chain.pending) {
+        out += " pending=txn" + std::to_string(chain.pending->owner) +
+               (chain.pending->staged ? "/staged" : "/unstaged") +
+               (chain.pending->value ? "/row" : "/null");
+      }
+      out += "\n";
+    }
+  }
+  return out;
+}
+
 TransactionRuntimeStats TransactionManager::RuntimeStats() const {
   return {
       .wal_wait_count = wal_wait_count_.load(std::memory_order_relaxed),
@@ -712,7 +795,7 @@ TransactionRuntimeStats TransactionManager::RuntimeStats() const {
 
 StatusOr<std::string> TransactionManager::ReadVersion(
     const Transaction& txn, const RowPosition& rp,
-    std::optional<std::string_view> physical) const {
+    std::optional<std::string_view> physical, bool resolve_head) const {
   VersionShard& shard = version_shards_[VersionShardIndex(rp)];
   std::scoped_lock lock(shard.mutex);
   const auto found = shard.versions.find(rp);
@@ -754,7 +837,7 @@ StatusOr<std::string> TransactionManager::ReadVersion(
   // while this unstaged intent exists.  When GC removed a redundant chain
   // before the intent was acquired, the heap is the authoritative latest
   // image and the physical fallback below is equivalent.
-  if (chain.pending && chain.pending->owner == txn.ID()) {
+  if (resolve_head && chain.pending && chain.pending->owner == txn.ID()) {
     if (!chain.committed.empty()) {
       const CommittedVersion& latest = chain.committed.back();
       // D4 (docs/design.md): a writer reading a predecessor's committed
@@ -793,6 +876,36 @@ bool TransactionManager::HasVersionChain(const RowPosition& rp) const {
   const VersionShard& shard = version_shards_[VersionShardIndex(rp)];
   std::scoped_lock lock(shard.mutex);
   return shard.versions.contains(rp);
+}
+
+void TransactionManager::InvalidatePageVersions(page_id_t pid,
+                                                Transaction* reclaimer) {
+  for (VersionShard& shard : version_shards_) {
+    std::scoped_lock lock(shard.mutex);
+    const bool erased = std::erase_if(shard.versions, [pid](const auto& entry) {
+                          return entry.first.page_id == pid;
+                        }) != 0;
+    // A waiter parked on a recycled page's write intent must re-evaluate:
+    // its chain is gone, so acquisition now succeeds.
+    if (erased) {
+      shard.write_intent_released.notify_all();
+    }
+  }
+  if (reclaimer != nullptr) {
+    // The reclaimer may hold write intents acquired against the dead
+    // incarnation (e.g. INSERT ... DROP ... CREATE in one transaction).
+    // Erasing the chains above removed the reservations these entries
+    // describe; leaving them in the write set would let a later write on
+    // the new incarnation skip AcquireWriteIntent and reach
+    // RegisterVersionWrite with no pending intent.
+    std::erase_if(reclaimer->write_set_,
+                  [pid](const RowPosition& rp) { return rp.page_id == pid; });
+  }
+}
+
+bool TransactionManager::IsActive(txn_id_t id) const {
+  std::scoped_lock lk(transaction_table_lock);
+  return active_transactions_.contains(id);
 }
 
 void TransactionManager::RegisterVersionWrite(
@@ -1180,6 +1293,15 @@ StatusOr<lsn_t> TransactionManager::CompensateSetFosterLog(
     txn_id_t txn_id, page_id_t pid, const FosterPair& foster) {
   const LogRecord lr =
       LogRecord::CompensateSetFosterLogRecord(0, txn_id, pid, foster);
+  ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
+  return start + lr.Size();
+}
+
+StatusOr<lsn_t> TransactionManager::CompensateDestroyPageLog(
+    txn_id_t txn_id, page_id_t pid, PageType restored_type,
+    std::string_view restored_body) {
+  const LogRecord lr = LogRecord::CompensateDestroyPageLogRecord(
+      txn_id, pid, restored_type, std::string(restored_body));
   ASSIGN_OR_RETURN(lsn_t, start, AddLog(lr));
   return start + lr.Size();
 }

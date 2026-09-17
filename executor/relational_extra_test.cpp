@@ -85,6 +85,41 @@ TEST(ParallelMergeJoinExtraTest, ResidualFiltersMatchedPairs) {
                           Value(int64_t{2}), Value(int64_t{200})}));
 }
 
+TEST(ParallelMergeJoinExtraTest, DuplicateKeysAtDifferentOffsets) {
+  for (const size_t workers : {size_t{1}, size_t{4}}) {
+    SCOPED_TRACE(workers);
+    std::vector<Row> left_rows;
+    std::vector<Row> right_rows;
+    std::vector<Row> expected;
+    for (int64_t key = 0; key < 25; ++key) {
+      for (int64_t duplicate = 0; duplicate < 3; ++duplicate) {
+        left_rows.emplace_back(Row({Value(key), Value(100 + duplicate)}));
+      }
+      for (int64_t duplicate = 0; duplicate < 2; ++duplicate) {
+        right_rows.emplace_back(Row({Value(200 + duplicate), Value(key)}));
+      }
+      for (int64_t left_duplicate = 0; left_duplicate < 3; ++left_duplicate) {
+        for (int64_t right_duplicate = 0; right_duplicate < 2;
+             ++right_duplicate) {
+          expected.emplace_back(Row({Value(key), Value(100 + left_duplicate),
+                                     Value(200 + right_duplicate), Value(key)}));
+        }
+      }
+    }
+    ParallelMergeJoin join(
+        std::make_shared<ConstantExecutor>(left_rows), {0},
+        std::make_shared<ConstantExecutor>(right_rows), {1}, workers);
+    std::vector<Row> actual;
+    Row row;
+    while (join.Next(&row, nullptr)) {
+      actual.push_back(row);
+    }
+    EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+    EXPECT_EQ(actual, expected);
+    EXPECT_EQ(join.Partitions().size(), workers);
+  }
+}
+
 }  // namespace
 
 }  // namespace tinylamb

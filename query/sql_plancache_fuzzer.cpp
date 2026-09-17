@@ -77,6 +77,12 @@ std::optional<std::vector<std::vector<Value>>> RunQuery(Database& db,
     }
     rows.push_back(std::move(cells));
   }
+  // Lazy result: a mid-stream error would silently truncate the rows that
+  // the four-way plan-cache differential compares — surface it.
+  if (result.Value().GetStatus() != Status::kSuccess) {
+    *error = "stream-error: " + result.Value().GetStatus().GetMessage();
+    return std::nullopt;
+  }
   return rows;
 }
 
@@ -88,7 +94,7 @@ bool RunSql(Database& db, TransactionContext& ctx, const std::string& sql) {
   }
   // QueryResults are lazy: drain or the DML never lands.
   result.Value().Drain();
-  return true;
+  return result.Value().GetStatus() == Status::kSuccess;
 }
 
 std::vector<std::string> FormatRows(

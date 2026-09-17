@@ -29,7 +29,9 @@
 #include <vector>
 
 #include "common/status_or.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "page/row_position.hpp"
@@ -62,8 +64,9 @@ IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
       lock_rows_(lock_rows),
       wait_for_write_intent_(wait_for_write_intent),
       iter_(new IndexScanIterator(table, index, txn, begin_key, end_key,
-                                  ascending)),
+                                  ascending, lock_rows)),
       cond_(std::move(where)),
+      cond_conjuncts_(SplitConjuncts(cond_)),
       schema_(std::move(sc)) {}
 
 IndexScan::IndexScan(
@@ -83,8 +86,9 @@ IndexScan::IndexScan(
           table, index, txn,
           ranges.empty() ? std::vector<Value>{} : ranges.front().first,
           ranges.empty() ? std::vector<Value>{} : ranges.front().second,
-          ascending)),
+          ascending, lock_rows)),
       cond_(std::move(where)),
+      cond_conjuncts_(SplitConjuncts(cond_)),
       schema_(std::move(sc)) {
   range_count_ = ranges.size();
   if (!ranges.empty()) {
@@ -96,7 +100,7 @@ IndexScan::IndexScan(
 void IndexScan::OpenRange(const std::vector<Value>& begin_key,
                           const std::vector<Value>& end_key) {
   iter_ = Iterator(new IndexScanIterator(table_, index_, txn_, begin_key,
-                                         end_key, ascending_));
+                                         end_key, ascending_, lock_rows_));
 }
 
 bool IndexScan::Next(Row* dst, RowPosition* rp) {
@@ -133,11 +137,14 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
       *rp = pointed_row;
     }
     if (cond_) {
-      StatusOr<Value> res = cond_->TryEvaluate(*dst, schema_);
-      if (!res.HasValue()) {
-        return FailWith(res.GetStatus());
+      StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+          cond_conjuncts_, [&](const Expression& conjunct) {
+            return conjunct->TryEvaluate(*dst, schema_);
+          });
+      if (!pass.HasValue()) {
+        return FailWith(pass.GetStatus());
       }
-      if (!res.Value().Truthy()) {
+      if (!pass.Value()) {
         continue;
       }
     }

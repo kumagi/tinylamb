@@ -472,6 +472,222 @@ std::optional<QueryData> TryEliminateUnusedJoins(
   return rewritten;
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot referential-integrity proofs for TopN pushdown (TODO.md item 1d).
+//
+// `topn_push_through_proven_one_to_one_join` (plan/cascades.cpp) pushes a
+// TopN below an inner join only with a 1:1 proof the memo cannot derive
+// itself: every outer join key must match exactly one inner row. This helper
+// records directed (outer, inner) pairs on the memo when either a declared
+// FOREIGN KEY says so (no I/O) or the current snapshot proves it:
+// the inner key is UNIQUE + NOT NULL (at most one match) and every outer
+// key value is non-NULL and present on the inner side (at least one match).
+// The proof is limited to the TopN shape (ordered + finite LIMIT) over
+// exactly two relations with a single col=col edge, and to small tables so
+// planning never scans a large fact table just to push a TopN.
+// ---------------------------------------------------------------------------
+
+std::string ForeignKeyTarget(const Constraint& constraint) {
+  if (constraint.ctype != Constraint::kForeign) {
+    return "";
+  }
+  std::string ref_table =
+      (constraint.value.type == ValueType::kVarChar)
+          ? std::string(constraint.value.value.varchar_value)
+          : constraint.value.AsString();
+  if (ref_table.starts_with('"') && ref_table.ends_with('"') &&
+      ref_table.size() >= 2) {
+    ref_table = ref_table.substr(1, ref_table.size() - 2);
+  }
+  return ref_table;
+}
+
+bool SnapshotContainsKeys(const Table& outer_table, int outer_offset,
+                          const Table& inner_table, int inner_offset,
+                          Transaction& txn) {
+  JoinKeySet inner_values;
+  {
+    auto iterator = inner_table.BeginFullScan(
+        txn, TableScanOptions{.projection = std::vector<slot_t>{
+                                  static_cast<slot_t>(inner_offset)}});
+    size_t scanned = 0;
+    for (; iterator.IsValid(); ++iterator) {
+      if (++scanned > kMaxJoinEliminationProofRows) {
+        return false;
+      }
+      const Value& cell = (*iterator)[0];
+      if (!cell.IsNull()) {
+        inner_values.insert(cell);
+      }
+    }
+  }
+  {
+    auto iterator = outer_table.BeginFullScan(
+        txn, TableScanOptions{.projection = std::vector<slot_t>{
+                                  static_cast<slot_t>(outer_offset)}});
+    size_t scanned = 0;
+    for (; iterator.IsValid(); ++iterator) {
+      if (++scanned > kMaxJoinEliminationProofRows) {
+        return false;
+      }
+      const Value& cell = (*iterator)[0];
+      if (cell.IsNull() || !inner_values.contains(cell)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void MarkProvenOneToOneJoins(const QueryData& query, TransactionContext& ctx,
+                             cascades::Memo& memo) {
+  // Mirrors the memo kTopN construction: ordered + finite LIMIT only.
+  if (query.order_expressions_.empty() || query.limit_count_ == 0 ||
+      query.from_.size() != 2) {
+    return;
+  }
+  std::unordered_map<std::string, std::shared_ptr<Table>> tables;
+  std::unordered_map<std::string, std::string> physical_of;
+  for (const std::string& relation : query.from_) {
+    const auto aliased = query.aliases_.find(relation);
+    const std::string& physical =
+        aliased == query.aliases_.end() ? relation : aliased->second;
+    StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+    if (!found.HasValue()) {
+      return;
+    }
+    tables.emplace(relation, found.Value());
+    physical_of.emplace(relation, physical);
+  }
+  struct Edge {
+    std::string left_relation;
+    ColumnName left_column;
+    std::string right_relation;
+    ColumnName right_column;
+  };
+  std::vector<Edge> edges;
+  for (const Expression& conjunct : SplitConjuncts(query.where_)) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp ||
+        conjunct->AsBinaryExpression().Op() != BinaryOperation::kEquals ||
+        conjunct->AsBinaryExpression().Left()->Type() !=
+            TypeTag::kColumnValue ||
+        conjunct->AsBinaryExpression().Right()->Type() !=
+            TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& left =
+        conjunct->AsBinaryExpression().Left()->AsColumnValue().GetColumnName();
+    const ColumnName& right =
+        conjunct->AsBinaryExpression().Right()->AsColumnValue().GetColumnName();
+    const std::unordered_set<std::string> left_rels =
+        ColumnRelations(left, tables);
+    const std::unordered_set<std::string> right_rels =
+        ColumnRelations(right, tables);
+    if (left_rels.size() != 1 || right_rels.size() != 1 ||
+        *left_rels.begin() == *right_rels.begin()) {
+      continue;
+    }
+    edges.push_back(Edge{.left_relation = *left_rels.begin(),
+                         .left_column = left,
+                         .right_relation = *right_rels.begin(),
+                         .right_column = right});
+  }
+  // v1: a single equality edge. Multiple edges need a per-edge uniqueness +
+  // containment proof folded into one pair, which is future work.
+  if (edges.size() != 1) {
+    return;
+  }
+  const Edge& edge = edges.front();
+  for (int direction = 0; direction < 2; ++direction) {
+    const std::string& outer_rel =
+        direction == 0 ? edge.left_relation : edge.right_relation;
+    const ColumnName& outer_col =
+        direction == 0 ? edge.left_column : edge.right_column;
+    const std::string& inner_rel =
+        direction == 0 ? edge.right_relation : edge.left_relation;
+    const ColumnName& inner_col =
+        direction == 0 ? edge.right_column : edge.left_column;
+    const Table& outer_table = *tables[outer_rel];
+    const Table& inner_table = *tables[inner_rel];
+    const int outer_offset =
+        outer_table.GetSchema().Offset(ColumnName("", outer_col.name));
+    const int inner_offset =
+        inner_table.GetSchema().Offset(ColumnName("", inner_col.name));
+    if (outer_offset < 0 || inner_offset < 0) {
+      continue;
+    }
+    const Constraint& inner_constraint =
+        inner_table.GetSchema()
+            .GetColumn(static_cast<size_t>(inner_offset))
+            .GetConstraint();
+    // At most one match: UNIQUE (+NOT NULL; a nullable UNIQUE admits
+    // duplicate NULLs, and NULL keys never match under equi semantics).
+    const bool inner_unique =
+        inner_constraint.ctype == Constraint::kPrimaryKey ||
+        inner_constraint.IsUnique();
+    const bool inner_not_null =
+        inner_constraint.ctype == Constraint::kPrimaryKey ||
+        inner_constraint.ctype == Constraint::kNotNull;
+    if (!inner_unique || !inner_not_null) {
+      continue;
+    }
+    // Declared FOREIGN KEY: scan-free proof. The reference names the
+    // physical table; accept the relation identity too.  The certificate
+    // covers only non-NULL values -- a NULL outer key matches nothing, and
+    // an unmatched row inside the top-(limit+offset) prefix is exactly the
+    // counterexample that keeps push_down_limit_through_join disabled -- so
+    // the FK alone proves at-least-one-match only when the outer key is
+    // also provably NOT NULL (constraint or an IS NOT NULL conjunct).
+    // Otherwise fall through to the snapshot scan, which verifies the
+    // non-NULL containment on the data.
+    const Constraint& outer_constraint =
+        outer_table.GetSchema()
+            .GetColumn(static_cast<size_t>(outer_offset))
+            .GetConstraint();
+    const std::string ref_table = ForeignKeyTarget(outer_constraint);
+    if (!ref_table.empty() &&
+        (ref_table == inner_rel || ref_table == physical_of[inner_rel] ||
+         ref_table == inner_table.GetSchema().Name())) {
+      bool outer_proves_not_null =
+          outer_constraint.ctype == Constraint::kNotNull ||
+          outer_constraint.ctype == Constraint::kPrimaryKey;
+      for (const Expression& conjunct : SplitConjuncts(query.where_)) {
+        if (!conjunct || conjunct->Type() != TypeTag::kUnaryExp ||
+            conjunct->AsUnaryExpression().Op() != UnaryOperation::kIsNotNull) {
+          continue;
+        }
+        const Expression& child = conjunct->AsUnaryExpression().Child();
+        if (child->Type() != TypeTag::kColumnValue) {
+          continue;
+        }
+        const ColumnName& tested = child->AsColumnValue().GetColumnName();
+        if (tested.name == outer_col.name &&
+            (tested.schema.empty() || tested.schema == outer_rel)) {
+          outer_proves_not_null = true;
+          break;
+        }
+      }
+      if (outer_proves_not_null) {
+        memo.MarkProvenOneToOne(outer_rel, inner_rel);
+        continue;
+      }
+    }
+    // Size gate: the proof scans both sides inside this snapshot.
+    const auto rows_of = [&ctx](const std::string& physical) -> size_t {
+      const auto stats = ctx.GetStats(physical);
+      return stats.HasValue() ? stats.Value()->Rows() : 0;
+    };
+    if (rows_of(physical_of[outer_rel]) + rows_of(physical_of[inner_rel]) >
+        kMaxJoinEliminationProofRows) {
+      continue;
+    }
+    if (SnapshotContainsKeys(outer_table, outer_offset, inner_table,
+                             inner_offset, ctx.txn_)) {
+      memo.MarkProvenOneToOne(outer_rel, inner_rel);
+    }
+  }
+}
+
 // M6: drop the null-supplying side of a LEFT join when nothing above it can
 // observe the difference. A LEFT join emits exactly one row per preserved
 // row; it multiplies left rows only through repeated matches, so when the
@@ -2205,10 +2421,19 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
         bool covered = true;
         for (const Expression& outer_key : candidate.first.outer_keys) {
           const ColumnName& key = outer_key->AsColumnValue().GetColumnName();
+          // Coverage is about the projection's OUTPUT schema, not just the
+          // expression: ProductPlan resolves `key` by qualified name against
+          // the left child's emitted columns.  A renamed passthrough
+          // ("u" output for ColumnValue(t.u)) drops the qualifier, so the
+          // key is only covered when the item emits it under the same name.
           const bool key_covered = std::ranges::any_of(
               expanded_select, [&](const NamedExpression& item) {
-                return item.expression->Type() == TypeTag::kColumnValue &&
-                       item.expression->AsColumnValue().GetColumnName() == key;
+                if (!item.expression ||
+                    item.expression->Type() != TypeTag::kColumnValue ||
+                    item.expression->AsColumnValue().GetColumnName() != key) {
+                  return false;
+                }
+                return item.name.empty() || ColumnName(item.name) == key;
               });
           if (!key_covered && !has_aggregate) {
             // ProductPlan resolves its key against the left output schema.
@@ -2503,6 +2728,12 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     }
     memo.SetTableSchemas(table_schemas);
   }
+  // Snapshot 1:1 proofs for TopN pushdown (TODO.md item 1d). Inner joins
+  // only: outer-join memos carry kOuterJoin (never matched by the TopN push
+  // rule), so marking there would be dead data.
+  if (!is_outer) {
+    MarkProvenOneToOneJoins(query, ctx, memo);
+  }
   if (needs_root_selection) {
     const cascades::GroupId selection =
         memo.EnsureDerivedGroup(query.from_, "selection");
@@ -2777,7 +3008,20 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // columns.  Restore the caller-visible projection after all joins so a
   // decorrelated predicate never leaks hidden key columns into the result.
   if (!has_aggregate && !decorrelations.empty()) {
-    best->plan = std::make_shared<ProjectionPlan>(best->plan, expanded_select);
+    // Trim POSITIONALLY, not by re-evaluating expanded_select: the core's top
+    // projection already evaluated each select item, and hidden key columns
+    // are appended after them.  Re-evaluating expressions here would apply
+    // UPDATE SET expressions a second time (a+1 -> a+2) and fail to resolve
+    // keys the core projection renamed ("u AS x" drops t.u).
+    const Schema& core_schema = best->plan->GetSchema();
+    std::vector<NamedExpression> trim;
+    trim.reserve(expanded_select.size());
+    for (size_t i = 0;
+         i < expanded_select.size() && i < core_schema.ColumnCount(); ++i) {
+      trim.emplace_back(expanded_select[i].name,
+                        ColumnValueExp(core_schema.GetColumn(i).Name()));
+    }
+    best->plan = std::make_shared<ProjectionPlan>(best->plan, trim);
     // With hidden semi-join keys in the core output, an in-search DISTINCT
     // would dedupe over the implementation columns and leak duplicates that
     // differ only in a key; dedupe above the trim instead.

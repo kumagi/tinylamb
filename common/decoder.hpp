@@ -70,6 +70,12 @@ class Decoder {
   // it has already been read (unknown discriminants, torn payloads).
   void Fail() { is_->setstate(std::ios::failbit); }
   [[nodiscard]] bool Failed() const { return is_->fail(); }
+  // True when no more bytes remain. Lets decoders read optional trailing
+  // fields written by newer encoders without tripping failbit on old
+  // payloads (e.g. ColumnStats::correlation_).
+  [[nodiscard]] bool AtEnd() {
+    return is_->peek() == std::char_traits<char>::eof();
+  }
 
  private:
   std::istream* is_;

@@ -747,9 +747,9 @@ Iterator Table::BeginFullScan(Transaction& txn,
   // FullScanIterator's ctors are private with Table as friend, so make_unique
   // is unavailable; the unique_ptr is built from new inside this member and
   // Iterator's explicit adopting ctor never throws.
-  auto owned = std::unique_ptr<FullScanIterator>(
-      new FullScanIterator(this, &txn, options.projection, options.key_filter,
-                           options.key_column, options.peek_compares));
+  auto owned = std::unique_ptr<FullScanIterator>(new FullScanIterator(
+      this, &txn, options.projection, options.key_filter, options.key_column,
+      options.peek_compares, options.lock_rows, options.wait_for_write_intent));
   return Iterator(owned.release());
 }
 

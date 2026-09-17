@@ -47,6 +47,36 @@
 
 namespace tinylamb::relational_detail {
 
+StatusOr<bool> EvaluateConjunctsTolerant(
+    const std::vector<Expression>& conjuncts,
+    const std::function<StatusOr<Value>(const Expression&)>& eval) {
+  Status first_error{Status::kSuccess};
+  for (const Expression& conjunct : conjuncts) {
+    if (!conjunct) {
+      continue;
+    }
+    StatusOr<Value> res = eval(conjunct);
+    if (!res.HasValue()) {
+      if (first_error.ok()) {
+        first_error = res.GetStatus();
+      }
+      continue;
+    }
+    const Value& value = res.Value();
+    if (value.IsNull() || !value.Truthy()) {
+      // In SQL, conjunction is commutative: if any conjunct cleanly
+      // evaluates to FALSE or NULL, the row is discarded by the WHERE
+      // filter. Any error in another conjunct on this row must not abort
+      // the query.
+      return false;
+    }
+  }
+  if (!first_error.ok()) {
+    return first_error;
+  }
+  return true;
+}
+
 namespace {
 
 BinaryOperation FlipCompare(BinaryOperation operation) {
@@ -539,20 +569,21 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
   }
   // Use bytecode evaluator when available: avoids recursive expression tree
   // traversal and virtual dispatch, which is the dominant cost for complex
-  // residual predicates like TPC-H Q20's 3-way OR filter.
+  // residual predicates like TPC-H Q20's 3-way OR filter.  The compiled
+  // program is one left-to-right AND tree, so a raise inside it aborts the
+  // whole batch eval; a batch-level error does not decide the row because a
+  // sibling conjunct may still cleanly reject it (commutative WHERE
+  // semantics), so on error fall through to the per-conjunct evaluation.
+  Status residual_error{Status::kSuccess};
   if (filter.residual_bytecode) {
     StatusOr<Value> result =
         filter.residual_bytecode->TryEvaluateRow(*match_row);
-    if (!result.HasValue()) {
-      if (error != nullptr && error->ok()) {
-        *error = result.GetStatus();
-      }
-      return false;
+    if (result.HasValue()) {
+      return !result.Value().IsNull() && result.Value().Truthy();
     }
-    return !result.Value().IsNull() && result.Value().Truthy();
+    residual_error = result.GetStatus();
   }
   Scope scope{.row = match_row, .schema = &schema, .outer = outer};
-  Status residual_error{Status::kSuccess};
   for (const Expression& predicate : filter.residual) {
     StatusOr<Value> res = TryEvaluate(predicate, scope, nullptr, context, ctes);
     if (!res.HasValue()) {
@@ -562,9 +593,6 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
       continue;
     }
     if (!Truthy(res.Value())) {
-      // In SQL, conjunction is commutative: if any conjunct cleanly evaluates
-      // to FALSE or NULL, the row is discarded by the WHERE filter. Any error
-      // in another conjunct on this row must not abort the query.
       return false;
     }
   }

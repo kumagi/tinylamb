@@ -68,8 +68,11 @@ class PageManager {
 
   // D3 (docs/design.md): undo of a page destroy restores the page image and
   // pops it from the allocator free stack (see MetaPage::PopFreePageHead).
-  // Defined in the .cpp because it needs the full Page definition.
-  void PopFreePageHead(page_id_t pid, page_id_t next);
+  // Returns an error instead of aborting when the meta page is unreadable:
+  // callers run on the recovery/abort path, exactly when the meta page is
+  // most likely to be distressed.  Defined in the .cpp because it needs the
+  // full Page definition.
+  Status PopFreePageHead(page_id_t pid, page_id_t next);
 
   // Logically delete the page.
   Status DestroyPage(Transaction& txn, Page* target);

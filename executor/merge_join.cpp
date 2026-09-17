@@ -10,8 +10,10 @@
 
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -31,6 +33,7 @@ MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
       left_width_(left_width),
       right_width_(right_width),
       residual_(std::move(residual)),
+      residual_conjuncts_(SplitConjuncts(residual_)),
       residual_schema_(std::move(residual_schema)) {
   const bool keys_valid =
       !left_columns_.empty() && left_columns_.size() == right_columns_.size();
@@ -63,6 +66,20 @@ bool MergeJoin::PairPasses(size_t i, size_t j) const {
     return true;
   }
   const Row combined = Concatenate(i, j);
+  if (kind_ == JoinKind::kInner) {
+    // An inner-join residual is a WHERE-level filter: conjuncts may have
+    // been reordered by canonicalization, so a sibling that cleanly rejects
+    // the pair suppresses errors from the rest (commutative semantics).
+    StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+        residual_conjuncts_, [&](const Expression& conjunct) {
+          return conjunct->TryEvaluate(combined, residual_schema_);
+        });
+    if (!pass.HasValue()) {
+      residual_error_ = pass.GetStatus();
+      return false;
+    }
+    return pass.Value();
+  }
   StatusOr<Value> res = residual_->TryEvaluate(combined, residual_schema_);
   if (!res.HasValue()) {
     residual_error_ = res.GetStatus();

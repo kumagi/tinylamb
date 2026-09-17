@@ -9,7 +9,9 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -58,6 +60,7 @@ BitmapHeapScan::BitmapHeapScan(Transaction& txn, const Table& table,
       table_(&table),
       positions_(std::move(positions)),
       where_(std::move(where)),
+      where_conjuncts_(SplitConjuncts(where_)),
       schema_(std::move(schema)),
       bitmap_operation_(std::move(bitmap_operation)) {
   std::sort(positions_.begin(), positions_.end(), RowPositionComparator{});
@@ -73,11 +76,14 @@ bool BitmapHeapScan::Next(Row* dst, RowPosition* rp) {
       continue;
     }
     if (where_) {
-      StatusOr<Value> res = where_->TryEvaluate(row_or.Value(), schema_);
-      if (!res.HasValue()) {
-        return FailWith(res.GetStatus());
+      StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+          where_conjuncts_, [&](const Expression& conjunct) {
+            return conjunct->TryEvaluate(row_or.Value(), schema_);
+          });
+      if (!pass.HasValue()) {
+        return FailWith(pass.GetStatus());
       }
-      if (res.Value().IsNull() || !res.Value().Truthy()) {
+      if (!pass.Value()) {
         continue;
       }
     }

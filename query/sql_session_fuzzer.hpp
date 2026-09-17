@@ -31,6 +31,9 @@ struct SessionCheck {
   std::string table;                  // dump this table...
   size_t after_step{0};               // ...after steps[after_step]
   std::vector<std::string> expected;  // sorted Row::ToString dump
+  // Dual-transaction sessions: which context issues the check (0 or 1).
+  // Each context's snapshot isolates it from the other's uncommitted work.
+  int txn{0};
 
   bool operator==(const SessionCheck&) const = default;
 };
@@ -43,7 +46,26 @@ struct SessionCheck {
 struct SessionStep {
   bool is_ddl{false};
   bool is_commit{false};
-  std::string sql;
+  bool is_abort{false};
+  // Crash boundary: discard the buffer pool, reopen the same database, and
+  // let ARIES recovery reconstruct the committed state (any in-flight
+  // transaction is loser-undone — mirror-wise a crash is an abort).
+  bool is_crash{false};
+  // Fuzzy checkpoint: writes BEGIN/END checkpoint records + the master
+  // record so a later crash recovers from the DPT instead of LSN 0.  No
+  // visible-state change — the in-flight transaction stays open.
+  bool is_checkpoint{false};
+  // Dual-transaction sessions: "-- begin2" opens context 1's first
+  // transaction (context 0 begins implicitly at session start; commit/abort
+  // re-begin their own context, crash re-begins both).
+  bool is_begin{false};
+  // Dual-transaction sessions: which context the step runs under (0 or 1).
+  int txn{0};
+  // The statement was observed to fail at generation time (write-intent
+  // conflict or insert slot race).  Replay must fail the same way — a
+  // flipped outcome means nondeterministic conflict handling.
+  bool must_fail{false};
+  std::string sql{};
 
   bool operator==(const SessionStep&) const = default;
 };
@@ -61,6 +83,10 @@ struct SessionStats {
   int indexes_created{0};
   int tables_dropped{0};
   int commits{0};
+  int aborts{0};
+  int crashes{0};
+  int checkpoints{0};
+  int conflicts{0};
 };
 
 // Runs one seeded session.  Returns "" when every check held, otherwise a

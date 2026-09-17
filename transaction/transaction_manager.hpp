@@ -32,6 +32,7 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#include "page/page_type.hpp"
 #include "page/row_position.hpp"
 
 namespace tinylamb {
@@ -191,6 +192,12 @@ class TransactionManager {
                                             const IndexKey& redo);
   StatusOr<lsn_t> CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
                                          const FosterPair& foster);
+  // CLR for a destroy undo: the record carries the restored page type and
+  // body image, so a later REDO replays the restore rather than leaving the
+  // destroyed (free) image that the original destroy record would recreate.
+  StatusOr<lsn_t> CompensateDestroyPageLog(txn_id_t txn_id, page_id_t pid,
+                                           PageType restored_type,
+                                           std::string_view restored_body);
   // Non-waiting first-updater-wins reservation stored in the same shard as
   // the row's MVCC chain. A stale snapshot or another pending writer loses.
   // When `before` is supplied (update/delete of an existing row), the chain's
@@ -210,16 +217,55 @@ class TransactionManager {
   [[nodiscard]] uint64_t StableTimestamp() const {
     return stable_timestamp_.load(std::memory_order_acquire);
   }
-  StatusOr<std::string> ReadVersion(
-      const Transaction& txn, const RowPosition& rp,
-      std::optional<std::string_view> physical) const;
+  // resolve_head=false keeps a caller-owned UNSTAGED write intent from
+  // upgrading the read to the newest committed version: snapshot reads
+  // (SELECT scans) use it so a scan-side intent taken by an earlier DML
+  // statement cannot leak a post-snapshot commit into plain reads.  Write
+  // paths keep the default so a writer that waited on an intent resolves
+  // the predecessor's newest committed image.
+  StatusOr<std::string> ReadVersion(const Transaction& txn,
+                                    const RowPosition& rp,
+                                    std::optional<std::string_view> physical,
+                                    bool resolve_head = true) const;
   // True when any version chain entry exists for the row.  Without one, the
   // physical row image is the only version and is visible to every snapshot,
   // letting readers skip the copy/cache slow path in Transaction::ReadVersion.
   [[nodiscard]] bool HasVersionChain(const RowPosition& rp) const;
+  // Drops every version chain keyed to |pid|.  RowPosition namespaces chain
+  // keys by {page_id, slot} only, so a page id recycled off the free list
+  // would otherwise serve the previous incarnation's committed rows to scans
+  // of the new page (they surface for physically vacant slots, and to
+  // snapshots predating the new rows for occupied ones).  Called by
+  // PageManager::AllocateNewPage when a destroyed page id is reused; an
+  // aborted destroy restores its page in place and never recycles the id,
+  // so the destroyed incarnation's history survives for old snapshots.
+  // |reclaimer| (the allocating transaction) also drops the dead
+  // incarnation's slots from its own write set, so a later write re-acquires
+  // a fresh write intent under the new incarnation instead of skipping the
+  // reservation on a stale write-set entry.
+  void InvalidatePageVersions(page_id_t pid, Transaction* reclaimer);
+  // True while |id| is registered in the active-transaction table (between
+  // Begin's registration and the ForgetTransaction at the end of
+  // commit/abort).
+  [[nodiscard]] bool IsActive(txn_id_t id) const;
   void RegisterVersionWrite(Transaction& txn, const RowPosition& rp,
                             std::optional<std::string_view> before,
                             std::optional<std::string_view> after);
+  // True when the committed chain at |rp| still serves a live row under
+  // |txn|'s snapshot.  Insert slot-reuse consults this: reusing a position
+  // whose pre-delete image is still snapshot-visible would mask that row
+  // behind the inserter's staged value.
+  [[nodiscard]] bool SnapshotSeesRow(const Transaction& txn,
+                                     const RowPosition& rp) const;
+  // Drops |txn|'s unstaged pending intent on |rp| and wakes waiters; used
+  // when an acquired insert slot turns out to be snapshot-occupied.
+  // Returns false when nothing was released (foreign or already-staged
+  // intent).
+  bool ReleaseWriteIntent(Transaction& txn, const RowPosition& rp);
+  // Diagnostic: render every version chain keyed on |pid| as text
+  // ("{p,s} committed:[{b,e,row|null}] pending:owner/staged").  Used by
+  // session-fuzzer mismatch reports; not on any hot path.
+  [[nodiscard]] std::string DebugDumpVersionChains(page_id_t pid) const;
   [[nodiscard]] bool RequiresHistoricalRead(const Transaction& txn) const;
   [[nodiscard]] bool IndexKeysMayBeStale(const Transaction& txn) const;
   [[nodiscard]] bool IndexKeysMayBeStale(const Transaction& txn,

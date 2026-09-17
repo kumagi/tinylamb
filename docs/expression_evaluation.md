@@ -45,6 +45,37 @@ and `bytecode_test.cpp` (`D7_*`).
 **Bytecode is the authoritative description of what a batch kernel may assume**
 about an expression (column slots, constants, operators, result type).
 
+## Predicate-context semantics (WHERE / JOIN ON)
+
+The strict left-to-right contract above applies to a **single expression**.
+At the predicate layer the engine uses two different contracts:
+
+- **WHERE / filter conjuncts are commutative.** `MatchScanFilter`
+  (`executor/detail/scan_filter.cpp`) declares this: when any conjunct
+  evaluates to a clean `FALSE`/`NULL` on a row, an error raised by a
+  *sibling* conjunct on that row is suppressed, because conjuncts are
+  logically interchangeable and the optimizer freely reorders, splits, and
+  pushes them (`CanonicalizeConjuncts`, predicate pushdown, index sargable
+  extraction). Every filter evaluation site — `Selection`, index/index-only/
+  bitmap scan residual conditions, `CompiledScanFilter` fallback, and
+  **inner-kind** join residuals (a filter by definition) — evaluates
+  top-level conjuncts with this tolerant semantics. If no conjunct cleanly
+  rejects the row, the error surfaces normally.
+- **JOIN ON for outer/semi/anti joins propagates errors.** Swallowing a
+  sibling-conjunct error into "row rejected" would corrupt unmatched-row
+  padding (LEFT/RIGHT/FULL) and especially semi/anti results, so those join
+  kinds evaluate their predicate strictly and propagate errors.
+
+A single conjunct that is itself `guard AND risky` still follows the
+strict AST short-circuit order — tolerance applies *between* top-level
+conjuncts, not inside one.
+
+Regression pins: `query_test.cpp` `WhereConjunctReorderSuppressesSiblingError`
+(sibling FALSE suppresses div-by-zero across both textual orders), the
+division-by-zero propagation case (no rejecting sibling → error), and the
+fuzzer-side `CheckGuard` oracle in `sql_oracle_fuzzer.cpp` which permutes
+guarded conjuncts and compares against a commutative 3VL mirror.
+
 ## JIT as a bytecode compiler
 
 LLVM kernels (`JitInt64Kernels`) are **not a third semantic definition**. They

@@ -27,6 +27,7 @@
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor_base.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/bytecode.hpp"
@@ -34,6 +35,7 @@
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/jit.hpp"
+#include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -105,6 +107,7 @@ bool BatchMayMatch(  // NOLINT(misc-no-recursion)
 Selection::Selection(Expression exp, Schema schema, Executor src,
                      size_t jit_threshold_rows)
     : exp_(std::move(exp)),
+      conjuncts_(SplitConjuncts(exp_)),
       schema_(std::move(schema)),
       src_(std::move(src)),
       jit_threshold_rows_(jit_threshold_rows) {
@@ -159,25 +162,27 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
           input_batch_.Size() >= kDefaultVectorSize))) {
       jit_attempted_ = true;
       const auto& instructions = bytecode_->Instructions();
-      // The JIT kernel compares with signed integer semantics. Any unsigned
-      // involvement (UINT64 column or constant) must stay on the
-      // unsigned-aware bytecode path (cf. the aggregation SUM guard).
-      const size_t const_index =
-          instructions.size() == 3 ? instructions[1].operand : 0;
-      const bool constant_unsigned =
+      // The operand fields are only meaningful once the opcodes match;
+      // reading them before validation would index the constant pool with
+      // a garbage uint16_t.
+      const bool simple_int_cmp =
           instructions.size() == 3 &&
-          bytecode_->Constants()[const_index].IsUnsigned();
-      const bool column_unsigned =
-          instructions.size() == 3 &&
-          instructions[0].operand < schema_.ColumnCount() &&
-          schema_.GetColumn(instructions[0].operand).IsUnsigned();
-      if (instructions.size() == 3 &&
           instructions[0].opcode == BytecodeOp::kLoadColumn &&
           instructions[1].opcode == BytecodeOp::kLoadConstant &&
           instructions[2].opcode == BytecodeOp::kBinaryInt64 &&
+          instructions[1].operand < bytecode_->Constants().size() &&
           bytecode_->Constants()[instructions[1].operand].type ==
-              ValueType::kInt64 &&
-          !constant_unsigned && !column_unsigned) {
+              ValueType::kInt64;
+      // The JIT kernel compares with signed integer semantics. Any unsigned
+      // involvement (UINT64 column or constant) must stay on the
+      // unsigned-aware bytecode path (cf. the aggregation SUM guard).
+      const bool constant_unsigned =
+          simple_int_cmp &&
+          bytecode_->Constants()[instructions[1].operand].IsUnsigned();
+      const bool column_unsigned =
+          simple_int_cmp && instructions[0].operand < schema_.ColumnCount() &&
+          schema_.GetColumn(instructions[0].operand).IsUnsigned();
+      if (simple_int_cmp && !constant_unsigned && !column_unsigned) {
         jit_column_ = instructions[0].operand;
         jit_constant_ =
             bytecode_->Constants()[instructions[1].operand].value.int_value;
@@ -185,8 +190,14 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
         jit_filter_ = JitInt64Kernels::CompileFilter(jit_operation_);
       }
     }
+    // The JIT kernel compares with signed integer semantics over raw int64
+    // storage.  Only fire when the runtime batch really carries a signed
+    // INT64 layout: an unsigned column under a signed schema would compare
+    // UINT64 > INT64_MAX keys wrong with ICmpSLT/SGT.
     if (jit_filter_ &&
         input_batch_.ColumnAt(jit_column_).Type() == ValueType::kInt64 &&
+        !input_batch_.ColumnAt(jit_column_).IsUnsigned() &&
+        input_batch_.HasLayout(schema_) &&
         input_batch_.ZoneMapAt(jit_column_).Initialized() &&
         input_batch_.ZoneMapAt(jit_column_).NullCount() == 0) {
       std::vector<uint8_t> result(input_batch_.Size());
@@ -200,11 +211,14 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
       ++jit_batches_;
     } else if (bytecode_) {
       StatusOr<ColumnVector> batch = bytecode_->TryEvaluateBatch(input_batch_);
-      if (!batch.HasValue()) {
-        FailWith(batch.GetStatus());
-        return 0;
+      if (batch.HasValue()) {
+        predicates.emplace(batch.MoveValue());
       }
-      predicates.emplace(batch.MoveValue());
+      // A batch-level error does not decide any single row: the compiled
+      // program is one left-to-right AND tree, but WHERE semantics are
+      // commutative (a conjunct that cleanly rejects the row suppresses
+      // sibling errors), so on failure the row loop below must evaluate
+      // conjunct-wise instead of propagating the error.
     }
     selection_vector_.clear();
     if (predicates && predicates->Type() == ValueType::kInt64) {
@@ -218,14 +232,22 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
       }
     } else {
       for (size_t i = 0; i < input_batch_.Size(); ++i) {
-        StatusOr<Value> predicate =
-            predicates ? StatusOr<Value>(predicates->ValueAt(i))
-                       : (exp_->TryEvaluate(input_batch_.RowAt(i), schema_));
-        if (!predicate.HasValue()) {
-          FailWith(predicate.GetStatus());
+        if (predicates) {
+          const Value predicate = predicates->ValueAt(i);
+          if (!predicate.IsNull() && predicate.Truthy()) {
+            selection_vector_.push_back(static_cast<uint32_t>(i));
+          }
+          continue;
+        }
+        StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+            conjuncts_, [&](const Expression& conjunct) {
+              return conjunct->TryEvaluate(input_batch_.RowAt(i), schema_);
+            });
+        if (!pass.HasValue()) {
+          FailWith(pass.GetStatus());
           return 0;
         }
-        if (!predicate.Value().IsNull() && predicate.Value().Truthy()) {
+        if (pass.Value()) {
           selection_vector_.push_back(static_cast<uint32_t>(i));
         }
       }

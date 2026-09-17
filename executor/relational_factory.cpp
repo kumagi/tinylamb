@@ -43,6 +43,8 @@
 #include "executor/minmax_index.hpp"
 #include "executor/nested_loop_join.hpp"
 #include "executor/parallel_aggregation.hpp"
+#include "executor/parallel_hash_join.hpp"
+#include "executor/parallel_merge_join.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/projection.hpp"
 #include "executor/recursive_cte.hpp"
@@ -181,13 +183,17 @@ void RelationRenameExecutor::Dump(std::ostream& o, int indent) const {
 }
 
 Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
-  if (MaxRows() == std::numeric_limits<size_t>::max() &&
+  // DML source scans (lock_rows_) must resolve rows under a write intent;
+  // the morsel-based ParallelScan has no such hook, so they stay on the
+  // single-threaded FullScan.
+  if (!lock_rows_ && MaxRows() == std::numeric_limits<size_t>::max() &&
       stats_.Rows() >= kParallelScanMinRows) {
     return std::make_shared<ParallelScan>(txn.txn_, table_,
                                           std::thread::hardware_concurrency(),
                                           8, std::nullopt, peek_compares_);
   }
-  return std::make_shared<FullScan>(txn.txn_, table_, MaxRows());
+  return std::make_shared<FullScan>(txn.txn_, table_, MaxRows(), lock_rows_,
+                                    wait_for_write_intent_);
 }
 
 Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -338,8 +344,12 @@ Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
 Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
   if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
     // Fallback route scans the table directly; Selection requires a real
-    // predicate, so pass the plain scan through when there is none.
-    Executor scan = std::make_shared<FullScan>(txn.txn_, table_);
+    // predicate, so pass the plain scan through when there is none.  The
+    // lock flags survive the fallback: a DML source scan still needs its
+    // head-version resolution when the index cannot serve it.
+    Executor scan = std::make_shared<FullScan>(
+        txn.txn_, table_, std::numeric_limits<size_t>::max(), lock_rows_,
+        wait_for_write_intent_);
     if (!where_) {
       return scan;
     }
@@ -460,6 +470,20 @@ Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
   // (semi/anti).
   Schema residual_schema =
       Residual() ? Left()->GetSchema() + Right()->GetSchema() : Schema();
+  // Inner equi merge joins without residuals go parallel past the
+  // threshold (TODO.md item 5b): the steering partitioner needs enough rows
+  // to amortize thread startup. Outer/semi/anti and residual shapes keep
+  // the proven sequential executor.
+  if (Kind() == JoinKind::kInner && !Residual() &&
+      Left()->EmitRowCount() + Right()->EmitRowCount() >=
+          kParallelMergeJoinMinRows) {
+    const size_t workers =
+        std::min<size_t>(16, std::thread::hardware_concurrency());
+    return std::make_shared<ParallelMergeJoin>(
+        Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),
+        std::move(right), workers, Kind(), Expression(), Schema(),
+        Right()->GetSchema().ColumnCount());
+  }
   return std::make_shared<MergeJoin>(
       Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),
       std::move(right), Kind(), Left()->GetSchema().ColumnCount(),
@@ -548,6 +572,24 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
         right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount());
     join->SetJoinAnnotations(key_null_safe_, residual_note_);
     return join;
+  }
+  // Inner equi hash joins go parallel past the threshold (TODO.md item
+  // 5b): workers share one concurrent build table, then probe concurrently.
+  // The threshold mirrors the scan/aggregation ones (thread startup only
+  // pays past ~8k rows). Semi/anti/outer shapes return above and keep their
+  // sequential executors. Null-safe keys (IS NOT DISTINCT FROM) stay
+  // sequential too: the parallel executor has no null-safe key encoding.
+  const bool any_null_safe =
+      std::ranges::any_of(key_null_safe_, [](bool safe) { return safe; });
+  if (!any_null_safe &&
+      left_src_->EmitRowCount() + right_src_->EmitRowCount() >=
+          kParallelHashJoinMinRows) {
+    const size_t workers =
+        std::min<size_t>(16, std::thread::hardware_concurrency());
+    return std::make_shared<SharedBuildParallelHashJoin>(
+        left_src_->EmitExecutor(ctx), left, right_src_->EmitExecutor(ctx),
+        right, workers, JoinKind::kInner,
+        right_src_->GetSchema().ColumnCount());
   }
   auto join = std::make_shared<HashJoin>(left_src_->EmitExecutor(ctx), left,
                                          right_src_->EmitExecutor(ctx), right,

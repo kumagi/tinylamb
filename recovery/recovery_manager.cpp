@@ -99,6 +99,8 @@ std::optional<LogType> CompensatedOpType(LogType type) {
       return LogType::kSetHighFence;
     case LogType::kCompensateSetFoster:
       return LogType::kSetFoster;
+    case LogType::kCompensateDestroyPage:
+      return LogType::kSystemDestroyPage;
     default:
       return std::nullopt;
   }
@@ -138,6 +140,7 @@ bool IsKnownLogType(LogType type) {
     case LogType::kEndCheckpoint:
     case LogType::kSystemAllocPage:
     case LogType::kSystemDestroyPage:
+    case LogType::kCompensateDestroyPage:
     case LogType::kLowestValue:
       return true;
   }
@@ -235,6 +238,19 @@ Status LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       // this idempotent initialization.
       target->PageInit(log.pid, PageType::kFreePage);
       break;
+    case LogType::kCompensateDestroyPage:
+      // REDO of a destroy undo: restore the page's type and full body
+      // image exactly as the undo applied them (the CLR carries both).
+      // Without this record a crash after an aborted DROP would replay
+      // only the destroy and leave the resurrected catalog entry pointing
+      // at a free page.
+      target->PageInit(log.pid, log.allocated_page_type);
+      if (!log.undo_data.empty()) {
+        std::memcpy(
+            &target->body, log.undo_data.data(),
+            std::min(log.undo_data.size(), static_cast<size_t>(kPageBodySize)));
+      }
+      break;
     case LogType::kSetLowFence:
     case LogType::kCompensateSetLowFence: {
       ASSIGN_OR_RETURN(IndexKey, ik, Decode<IndexKey>(log.redo_data));
@@ -303,6 +319,22 @@ StatusOr<lsn_t> LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       // keeps its rows).  A legacy v1 record (or an all-zero body) falls
       // back to type-only reinitialization; the free-list rebuild at the
       // end of recovery then treats any remaining orphan conservatively.
+      //
+      // WAL-before-data: log the CLR *before* mutating the page.  An
+      // unlogged restore would vanish on the next crash — REDO would
+      // replay the destroy and leave the page free while the catalog
+      // entry (restored through a logged compensate-delete) points at
+      // it.  The CLR also marks the original op compensated so a
+      // crash-mid-undo never restores the image twice.  A null tm means
+      // there is no logger to compensate through (single-page recovery
+      // consults the log directly); the page-level fix-up still runs.
+      if (tm != nullptr) {
+        ASSIGN_OR_RETURN(lsn_t, clr_destroy,
+                         tm->CompensateDestroyPageLog(log.txn_id, log.pid,
+                                                      log.allocated_page_type,
+                                                      log.undo_data));
+        clr_end = clr_destroy;
+      }
       const page_id_t popped_next = target->Type() == PageType::kFreePage
                                         ? target->body.free_page.NextFreePage()
                                         : 0;
@@ -313,10 +345,12 @@ StatusOr<lsn_t> LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
             std::min(log.undo_data.size(), static_cast<size_t>(kPageBodySize)));
       }
       // The restore made the page live again; drop it from the allocator's
-      // free stack so the next AllocateNewPage cannot re-issue it.
+      // free stack so the next AllocateNewPage cannot re-issue it.  A
+      // distressed meta page must fail the undo, not abort the process.
       if (log.allocated_page_type != PageType::kFreePage && tm != nullptr &&
           tm->GetPageManager() != nullptr) {
-        tm->GetPageManager()->PopFreePageHead(log.pid, popped_next);
+        RETURN_IF_FAIL(
+            tm->GetPageManager()->PopFreePageHead(log.pid, popped_next));
       }
       break;
     }
@@ -427,6 +461,7 @@ StatusOr<lsn_t> LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kCompensateSetLowFence:
     case LogType::kCompensateSetHighFence:
     case LogType::kCompensateSetFoster:
+    case LogType::kCompensateDestroyPage:
       // Compensating log cannot undo.
       break;
   }
@@ -942,6 +977,15 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
   for (page_id_t pid = high_water; 1 <= pid; --pid) {
     ASSIGN_OR_RETURN(PageRef, p, pool_->GetPageForRecovery(pid, nullptr));
     if (p->Type() != PageType::kFreePage) {
+      continue;
+    }
+    // A torn image can decode with its type discriminant reading kFreePage
+    // while the body fails its checksum; linking it would let the allocator
+    // hand out bytes that are still a half-written live page.  Freshly
+    // materialized pages (sparse file tail) carry checksum 0 by design, so
+    // only the checksum-mismatch placeholder is refused here.
+    if (!p->IsValid() && p->checksum != 0) {
+      LOG(WARN) << "free-list rebuild skips corrupt page " << pid;
       continue;
     }
     p.GetFreePage().SetNextFreePage(free_head);

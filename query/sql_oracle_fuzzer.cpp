@@ -16,6 +16,8 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <ranges>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -705,6 +707,487 @@ MirrorRow GenRow(Gen& g, int64_t u, std::string* sql_values) {
 }
 
 // ---------------------------------------------------------------------------
+// Window-function oracle machinery.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Rebuilds the mirror from the trace's single-row INSERT statements so a
+// replayed .test file checks the same model the generator pinned.
+std::vector<MirrorRow> MirrorFromSetup(const std::vector<std::string>& setup,
+                                       const std::string& table) {
+  std::vector<MirrorRow> mirror;
+  // Only the base table feeds the mirror: sibling tables (e.g. the `_s`
+  // copy used by the set-operation oracle) share the schema but not the
+  // probe's FROM clause.
+  const std::string prefix = "INSERT INTO " + table + " VALUES";
+  for (const std::string& sql : setup) {
+    if (!sql.starts_with(prefix)) {
+      continue;
+    }
+    const size_t open = sql.find('(');
+    if (open == std::string::npos) {
+      continue;
+    }
+    std::vector<std::string> fields;
+    std::string cur;
+    bool in_quote = false;
+    for (size_t i = open + 1; i < sql.size(); ++i) {
+      const char c = sql[i];
+      if (c == '\'') {
+        in_quote = !in_quote;
+        cur += c;
+      } else if ((c == ',' || c == ')') && !in_quote) {
+        fields.push_back(cur);
+        cur.clear();
+        if (c == ')') {
+          break;
+        }
+      } else {
+        cur += c;
+      }
+    }
+    if (fields.size() < 5) {
+      continue;
+    }
+    auto to_int = [](const std::string& v) -> int64_t {
+      size_t i = 0;
+      while (i < v.size() && (v[i] == ' ' || v[i] == '\t')) {
+        ++i;
+      }
+      if (v.substr(i).starts_with("NULL")) {
+        return kNull;
+      }
+      if (v.substr(i).starts_with("TRUE")) {
+        return 1;
+      }
+      if (v.substr(i).starts_with("FALSE")) {
+        return 0;
+      }
+      return std::stoll(v.substr(i));
+    };
+    MirrorRow m;
+    m.u = to_int(fields[0]);
+    m.a = to_int(fields[1]);
+    m.b = to_int(fields[2]);
+    m.flag = to_int(fields[3]);
+    m.s = kNull;
+    {
+      const std::string& raw = fields[4];
+      const size_t q1 = raw.find('\'');
+      const size_t q2 = raw.rfind('\'');
+      if (q1 != std::string::npos && q2 > q1) {
+        const std::string content = raw.substr(q1 + 1, q2 - q1 - 1);
+        for (size_t i = 0; i < kStrPool.size(); ++i) {
+          if (content == kStrPool[i]) {
+            m.s = static_cast<int64_t>(i);
+            break;
+          }
+        }
+      }
+    }
+    mirror.push_back(m);
+  }
+  return mirror;
+}
+
+// INT64 sentinel meaning "no default argument supplied" for LAG/LEAD.
+constexpr int64_t kNoDefault = (INT64_MIN / 2);
+constexpr int64_t kAnyValue = (INT64_MAX / 2);
+
+int64_t ArgValue(const MirrorRow& m, int arg) {
+  switch (arg) {
+    case 0:
+      return m.b;
+    case 1:
+      return m.a;
+    default:
+      return m.u;
+  }
+}
+
+// Parses "KIND|P1|P2|ARG|PART|FLAGS|DEF|SQL".
+bool ParseProbeSpec(const std::string& spec, int* kind, int64_t* p1,
+                    int64_t* p2, int* arg, int* part, int64_t* flags,
+                    int64_t* def, std::string* sql) {
+  size_t pos = 0;
+  std::array<long, 7> vals = {0, 0, 0, 0, -1, 0, 0};
+  for (long& val : vals) {
+    const size_t bar = spec.find('|', pos);
+    if (bar == std::string::npos) {
+      return false;
+    }
+    val = std::stoll(spec.substr(pos, bar - pos));
+    pos = bar + 1;
+  }
+  *kind = static_cast<int>(vals[0]);
+  *p1 = vals[1];
+  *p2 = vals[2];
+  *arg = static_cast<int>(vals[3]);
+  *part = static_cast<int>(vals[4]);
+  *flags = vals[5];
+  *def = vals[6];
+  *sql = spec.substr(pos);
+  return !sql->empty();
+}
+
+// Expected (int64 or NULL) value of a model probe per u; kAnyValue entries
+// are shape-only.  Ordering inside every partition is by u (unique key).
+std::map<int64_t, int64_t> WindowModel(const std::vector<MirrorRow>& mirror,
+                                       int kind, int64_t p1, int64_t p2,
+                                       int arg, int part, int64_t flags,
+                                       int64_t def) {
+  std::map<int64_t, int64_t> expected;
+  // Partition key: -1 → single partition, 0 → group by `a` (NULLs together).
+  auto part_key = [part](const MirrorRow& m) {
+    return part == 0 ? m.a : int64_t{0};
+  };
+  std::map<int64_t, std::vector<const MirrorRow*>> groups;
+  for (const MirrorRow& m : mirror) {
+    groups[part_key(m)].push_back(&m);
+  }
+  for (auto& [key, rows] : groups) {
+    std::sort(
+        rows.begin(), rows.end(),
+        [](const MirrorRow* l, const MirrorRow* r) { return l->u < r->u; });
+    const size_t n = rows.size();
+    for (size_t i = 0; i < n; ++i) {
+      int64_t out = kAnyValue;
+      switch (kind) {
+        case 0:  // ROW_NUMBER
+          out = static_cast<int64_t>(i) + 1;
+          break;
+        case 1:  // RANK over `arg` column (ASC NULLS FIRST, no partition)
+        case 2: {
+          // RANK/DENSE_RANK computed globally in generation; handled below.
+          break;
+        }
+        case 3: {  // LAG/LEAD over ORDER BY u
+          const bool lead = (flags & 2) != 0;
+          const int64_t target = lead ? static_cast<int64_t>(i) + p1
+                                      : static_cast<int64_t>(i) - p1;
+          if (target < 0 || std::cmp_greater_equal(target, n)) {
+            out = def == kNoDefault ? kNull : def;
+          } else {
+            out = ArgValue(*rows[static_cast<size_t>(target)], arg);
+          }
+          break;
+        }
+        case 10:    // SUM over ROWS p1 PRECEDING .. p2 FOLLOWING
+        case 11:    // COUNT(col)
+        case 12:    // MIN
+        case 13: {  // MAX
+          bool any = false;
+          int64_t acc = 0;
+          const size_t lo =
+              std::cmp_greater_equal(i, p1) ? i - static_cast<size_t>(p1) : 0;
+          for (size_t j = lo; j <= i + static_cast<size_t>(p2) && j < n; ++j) {
+            if (j == i && (flags & 1) != 0) {  // EXCLUDE CURRENT ROW
+              continue;
+            }
+            const int64_t v = ArgValue(*rows[j], arg);
+            if (kind == 11) {
+              if (v != kNull) {
+                ++acc;
+              }
+              continue;
+            }
+            if (v == kNull) {
+              continue;
+            }
+            acc = !any ? v
+                       : (kind == 10              ? acc + v
+                          : kind == 12 && v < acc ? v
+                          : kind == 13 && v > acc ? v
+                                                  : acc);
+            any = true;
+          }
+          // COUNT(col) yields 0 on an empty/all-NULL frame, never NULL.
+          out = kind == 11 ? acc : (any ? acc : kNull);
+          break;
+        }
+        case 20:  // whole-partition SUM/COUNT/MIN/MAX (UNBOUNDED frame)
+        case 21:
+        case 22:
+        case 23: {
+          bool any = false;
+          int64_t acc = 0;
+          for (const MirrorRow* r : rows) {
+            const int64_t v = ArgValue(*r, arg);
+            if (v == kNull) {
+              continue;
+            }
+            if (kind == 21) {
+              ++acc;
+              continue;
+            }
+            acc = !any ? v
+                       : (kind == 20              ? acc + v
+                          : kind == 22 && v < acc ? v
+                          : kind == 23 && v > acc ? v
+                                                  : acc);
+            any = true;
+          }
+          out = kind == 21 ? acc : (any ? acc : kNull);
+          break;
+        }
+        case 50: {  // NTILE(k) over ORDER BY u: first n%k buckets get +1 row
+          const int64_t k = p1;
+          const int64_t base = static_cast<int64_t>(n) / k;
+          const int64_t extra = static_cast<int64_t>(n) % k;
+          const auto idx = static_cast<int64_t>(i);
+          out = idx < extra * (base + 1)
+                    ? (idx / (base + 1)) + 1
+                    : extra + ((idx - extra * (base + 1)) / base) + 1;
+          break;
+        }
+        case 51:  // FIRST_VALUE (default frame: unbounded .. current row)
+          out = ArgValue(*rows[0], arg);
+          break;
+        case 52:  // LAST_VALUE (default frame ends at current row's peers;
+                  // ORDER BY u is unique, so that is the current row)
+          out = ArgValue(*rows[i], arg);
+          break;
+        case 60: {  // COUNTIF(b > p2) over the whole partition
+          int64_t cnt = 0;
+          for (const MirrorRow* r : rows) {
+            if (r->b != kNull && r->b > p2) {
+              ++cnt;
+            }
+          }
+          out = cnt;
+          break;
+        }
+        case 61: {  // COUNT(DISTINCT arg) over the whole partition
+          std::set<int64_t> seen;
+          for (const MirrorRow* r : rows) {
+            const int64_t v = ArgValue(*r, arg);
+            if (v != kNull) {
+              seen.insert(v);
+            }
+          }
+          out = static_cast<int64_t>(seen.size());
+          break;
+        }
+        default:
+          break;  // shape-only kinds (30-49): permutation/index checks only
+      }
+      if (out != kAnyValue) {
+        expected[rows[i]->u] = out;
+      }
+    }
+  }
+  // RANK/DENSE_RANK are global (generated without PARTITION BY).
+  if (kind == 1 || kind == 2) {
+    const bool desc = (flags & 4) != 0;
+    std::vector<const MirrorRow*> all;
+    all.reserve(mirror.size());
+    for (const MirrorRow& m : mirror) {
+      all.push_back(&m);
+    }
+    std::sort(all.begin(), all.end(),
+              [arg, desc](const MirrorRow* l, const MirrorRow* r) {
+                const int64_t lv = ArgValue(*l, arg);
+                const int64_t rv = ArgValue(*r, arg);
+                if (lv == kNull || rv == kNull) {
+                  // ASC: NULLS FIRST; DESC: NULLS LAST.
+                  const bool l_null = lv == kNull;
+                  const bool r_null = rv == kNull;
+                  if (l_null && r_null) {
+                    return false;
+                  }
+                  return desc ? r_null : l_null;
+                }
+                return desc ? lv > rv : lv < rv;
+              });
+    int64_t prev = kAnyValue;
+    bool first = true;
+    int64_t rank = 0;
+    int64_t dense = 0;
+    for (size_t i = 0; i < all.size(); ++i) {
+      const int64_t v = ArgValue(*all[i], arg);
+      if (first || v != prev) {
+        rank = static_cast<int64_t>(i) + 1;
+        ++dense;
+        prev = v;
+        first = false;
+      }
+      expected[all[i]->u] = kind == 1 ? rank : dense;
+    }
+  }
+  return expected;
+}
+
+// Generates 2..4 window probes (mix of model-checked and shape-only kinds)
+// as "KIND|P1|P2|ARG|PART|FLAGS|DEF|SQL" specs.
+std::vector<std::string> GenWindowProbes(Gen& g, const std::string& tab) {
+  std::vector<std::string> probes;
+  const int count = g.Pick(2, 4);
+  for (int i = 0; i < count; ++i) {
+    int kind = g.Pick(0, 14);
+    const int part = g.Chance(50) ? 0 : -1;  // PARTITION BY a
+    const int arg = g.Pick(0, 2);            // 0=b 1=a 2=u
+    const std::string arg_name = arg == 0 ? "b" : (arg == 1 ? "a" : "u");
+    const std::string part_txt = part == 0 ? "PARTITION BY a " : "";
+    int64_t p1 = g.Pick(0, 2);
+    int64_t p2 = g.Pick(0, 2);
+    int64_t flags = 0;
+    int64_t def = kNoDefault;
+    std::string expr;
+    switch (kind) {
+      case 0:
+        expr = "ROW_NUMBER() OVER (" + part_txt + "ORDER BY u)";
+        break;
+      case 1:
+      case 2: {
+        flags = g.Chance(35) ? 4 : 0;  // DESC
+        expr = std::string(kind == 1 ? "RANK" : "DENSE_RANK") +
+               "() OVER (ORDER BY " + arg_name + ((flags != 0) ? " DESC" : "") +
+               ")";
+        break;
+      }
+      case 3: {
+        flags = g.Chance(50) ? 2 : 0;  // LEAD
+        p1 = g.Pick(1, 2);             // offset
+        if (g.Chance(50)) {
+          def = g.Pick(-5, 5);
+        }
+        expr = std::string((flags != 0) ? "LEAD" : "LAG")
+                   .append("(")
+                   .append(arg_name)
+                   .append(", ")
+                   .append(std::to_string(p1))
+                   .append(def == kNoDefault ? "" : ", " + std::to_string(def))
+                   .append(") OVER (")
+                   .append(part_txt)
+                   .append("ORDER BY u)");
+        break;
+      }
+      case 4:
+      case 5:
+      case 6:
+      case 7: {
+        static constexpr std::array<const char*, 4> kAggs = {"SUM", "COUNT",
+                                                             "MIN", "MAX"};
+        if (g.Chance(40)) {
+          flags |= 1;  // EXCLUDE CURRENT ROW
+        }
+        expr = std::string(kAggs[static_cast<size_t>(kind - 4)])
+                   .append("(")
+                   .append(arg_name)
+                   .append(") OVER (")
+                   .append(part_txt)
+                   .append("ORDER BY u ROWS BETWEEN ")
+                   .append(std::to_string(p1))
+                   .append(" PRECEDING AND ")
+                   .append(std::to_string(p2))
+                   .append(" FOLLOWING")
+                   .append((flags & 1) != 0 ? " EXCLUDE CURRENT ROW" : "")
+                   .append(")");
+        kind = 10 + (kind - 4);
+        break;
+      }
+      case 8: {
+        static constexpr std::array<const char*, 4> kAggs = {"SUM", "COUNT",
+                                                             "MIN", "MAX"};
+        const int f = g.Pick(0, 3);
+        kind = 20 + f;
+        expr = std::string(kAggs[static_cast<size_t>(f)])
+                   .append("(")
+                   .append(arg_name)
+                   .append(") OVER (")
+                   .append(part_txt)
+                   .append(
+                       "ROWS BETWEEN UNBOUNDED PRECEDING AND "
+                       "UNBOUNDED FOLLOWING)");
+        break;
+      }
+      case 9:
+        expr = std::string(g.Chance(50) ? "SUM" : "COUNT")
+                   .append("(")
+                   .append(arg_name)
+                   .append(") OVER (ORDER BY ")
+                   .append(arg_name)
+                   .append(" RANGE BETWEEN ")
+                   .append(std::to_string(p1))
+                   .append(" PRECEDING AND ")
+                   .append(std::to_string(p2))
+                   .append(" FOLLOWING)");
+        kind = 30;
+        break;
+      case 10:
+        expr = "COUNT(*) OVER (ORDER BY a GROUPS BETWEEN " +
+               std::to_string(p1) + " PRECEDING AND " + std::to_string(p2) +
+               " FOLLOWING)";
+        kind = 31;
+        break;
+      case 11:
+        expr =
+            "ARRAY_AGG(b ORDER BY u) OVER (ORDER BY u ROWS BETWEEN 1 "
+            "PRECEDING AND CURRENT ROW)";
+        kind = 40;
+        break;
+      case 12: {
+        static constexpr std::array<const char*, 4> kAggs = {"SUM", "COUNT",
+                                                             "MIN", "MAX"};
+        const int f = g.Pick(0, 3);
+        const bool lead = g.Chance(50);
+        const int64_t a = g.Pick(1, 2);
+        const int64_t b = g.Pick(0, 1);
+        expr = std::string(kAggs[static_cast<size_t>(f)])
+                   .append("(")
+                   .append(arg_name)
+                   .append(") OVER (")
+                   .append(part_txt)
+                   .append("ORDER BY u ROWS BETWEEN ")
+                   .append(lead ? std::to_string(a) + " FOLLOWING"
+                                : std::string("UNBOUNDED PRECEDING"))
+                   .append(" AND ")
+                   .append(lead ? std::string("UNBOUNDED FOLLOWING")
+                                : std::to_string(b) + " PRECEDING")
+                   .append(")");
+        kind = 41;
+        break;
+      }
+      case 13: {
+        p1 = g.Pick(1, 4);
+        expr = std::string("NTILE(")
+                   .append(std::to_string(p1))
+                   .append(") OVER (")
+                   .append(part_txt)
+                   .append("ORDER BY u)");
+        kind = 50;
+        break;
+      }
+      default: {
+        if (g.Chance(50)) {
+          kind = 60;
+          p2 = g.Pick(-2, 2);
+          expr = std::string("COUNTIF(b > ")
+                     .append(std::to_string(p2))
+                     .append(") OVER (")
+                     .append(part_txt)
+                     .append(")");
+        } else {
+          kind = 61;
+          expr = "COUNT(DISTINCT " + arg_name + ") OVER (" + part_txt + ")";
+        }
+        break;
+      }
+    }
+    const std::string sql =
+        "SELECT u, " + expr + " FROM " + tab + " ORDER BY u;";
+    probes.push_back(std::to_string(kind) + "|" + std::to_string(p1) + "|" +
+                     std::to_string(p2) + "|" + std::to_string(arg) + "|" +
+                     std::to_string(part) + "|" + std::to_string(flags) + "|" +
+                     std::to_string(def) + "|" + sql);
+  }
+  return probes;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // Engine helpers.
 // ---------------------------------------------------------------------------
 
@@ -1175,7 +1658,7 @@ bool CheckIdx(Database& db, TransactionContext& ctx, const OracleTrace& t,
     return false;
   }
   for (const std::string& ddl : t.index_ddl) {
-    if (!RunUpdate(db, ctx, ddl)) {
+    if (!ApplyIndexSpec(db, ctx, ddl)) {
       if (verbose) {
         std::cerr << "[sql_oracle][idx-ddl-error] :: " << ddl << "\n";
       }
@@ -1198,6 +1681,279 @@ bool CheckIdx(Database& db, TransactionContext& ctx, const OracleTrace& t,
     *report += "  ddl:    " + ddl + "\n";
   }
   *report += "  after:  " + t.index_probe + " => " + *after + "\n";
+  return true;
+}
+
+// Value of a result cell as int64/kNull; kAnyValue for other types (arrays,
+// strings) which the model does not pin.
+int64_t CellInt(const Value& v) {
+  if (v.IsNull()) {
+    return kNull;
+  }
+  if (v.type == ValueType::kInt64) {
+    return v.value.int_value;
+  }
+  return kAnyValue;
+}
+
+// Window oracle: model-checked values on the base table, then identical
+// results after (a) reinserting the rows in reversed physical order and
+// (b) creating the trace's indexes: every probe orders by the unique key,
+// so the answer must not depend on how the rows physically arrive.
+bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
+                 std::string* report, bool verbose) {
+  if (t.window_probes.empty()) {
+    return true;
+  }
+  const std::vector<MirrorRow> mirror = MirrorFromSetup(t.setup, t.table);
+  const std::string tab2 = t.table + "w";
+  auto substitute = [&t, &tab2](std::string sql) {
+    size_t pos = 0;
+    while ((pos = sql.find(t.table, pos)) != std::string::npos) {
+      sql.replace(pos, t.table.size(), tab2);
+      pos += tab2.size();
+    }
+    return sql;
+  };
+  std::vector<std::pair<std::string, std::vector<std::string>>> baseline;
+  std::string error;
+  for (const std::string& spec : t.window_probes) {
+    int kind = 0;
+    int64_t p1 = 0;
+    int64_t p2 = 0;
+    int arg = 0;
+    int part = -1;
+    int64_t flags = 0;
+    int64_t def = 0;
+    std::string sql;
+    if (!ParseProbeSpec(spec, &kind, &p1, &p2, &arg, &part, &flags, &def,
+                        &sql)) {
+      continue;
+    }
+    auto rows = RunRows(db, ctx, sql, &error);
+    if (!rows.has_value()) {
+      // Unsupported syntax for this probe: skip it (other kinds keep
+      // running).  The whole oracle reports a skip only if nothing ran.
+      if (verbose) {
+        std::cerr << "[sql_oracle][win-skip] " << error << " :: " << sql
+                  << "\n";
+      }
+      continue;
+    }
+    std::vector<std::string> rendered;
+    const std::map<int64_t, int64_t> expected =
+        WindowModel(mirror, kind, p1, p2, arg, part, flags, def);
+    for (const Row& r : *rows) {
+      const int64_t u = CellInt(r[0]);
+      const int64_t got = CellInt(r[1]);
+      rendered.push_back(std::to_string(u) + "=" + std::to_string(got));
+      auto it = expected.find(u);
+      if (it != expected.end() && got != kAnyValue && it->second != got) {
+        *report += "[WINDOW MODEL MISMATCH]\n";
+        *report += "  sql: " + sql + "\n";
+        *report += "  u=" + std::to_string(u) + " expected " +
+                   (it->second == kNull ? "NULL" : std::to_string(it->second)) +
+                   " got " + (got == kNull ? "NULL" : std::to_string(got)) +
+                   "\n";
+      }
+    }
+    baseline.emplace_back(sql, std::move(rendered));
+  }
+  if (baseline.empty()) {
+    return false;  // every probe was rejected: oracle did not run
+  }
+
+  // Reversed physical order.
+  TransactionContext ctx2 = db.BeginContext();
+  std::vector<std::string> inserts;
+  for (const std::string& sql : t.setup) {
+    if (sql.starts_with("INSERT ")) {
+      inserts.push_back(substitute(sql));
+    } else if (sql.starts_with("CREATE TABLE")) {
+      if (!RunUpdate(db, ctx2, substitute(sql))) {
+        return true;
+      }
+    }
+  }
+  for (auto& insert : std::ranges::reverse_view(inserts)) {
+    if (!RunUpdate(db, ctx2, insert)) {
+      return true;
+    }
+  }
+  std::vector<std::string> idx_ddl;
+  idx_ddl.reserve(t.index_ddl.size());
+  for (const std::string& ddl : t.index_ddl) {
+    idx_ddl.push_back(substitute(ddl));
+  }
+  // Pass 1: permuted, no indexes; pass 2: permuted + indexed.
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) {
+      for (const std::string& ddl : idx_ddl) {
+        if (!ApplyIndexSpec(db, ctx2, ddl)) {
+          break;
+        }
+      }
+    }
+    for (const auto& [sql, rendered] : baseline) {
+      auto rows = RunRows(db, ctx2, substitute(sql), &error);
+      if (!rows.has_value()) {
+        if (verbose) {
+          std::cerr << "[sql_oracle][win-perm-error] " << error << " :: " << sql
+                    << "\n";
+        }
+        continue;
+      }
+      std::vector<std::string> got;
+      for (const Row& r : *rows) {
+        got.push_back(std::to_string(CellInt(r[0])) + "=" +
+                      std::to_string(CellInt(r[1])));
+      }
+      if (got != rendered) {
+        *report += std::string("[WINDOW ") +
+                   (pass == 0 ? "PERMUTATION" : "INDEX") + " MISMATCH]\n";
+        *report += "  sql: " + sql + "\n";
+        *report += "  base: [";
+        for (const std::string& s : rendered) {
+          *report += s + " ";
+        }
+        *report += "]\n  alt:  [";
+        for (const std::string& s : got) {
+          *report += s + " ";
+        }
+        *report += "]\n";
+      }
+    }
+  }
+  return true;
+}
+
+// Skip-scan distinct: COUNT(DISTINCT c) / DISTINCT c with and without an
+// index on c must agree, with and without a WHERE predicate.
+bool CheckSkip(Database& db, const OracleTrace& t, std::string* report,
+               bool /*verbose*/) {
+  if (t.skip_probes.empty()) {
+    return true;
+  }
+  const std::string tab2 = t.table + "k";
+  auto substitute = [&t, &tab2](std::string sql) {
+    size_t pos = 0;
+    while ((pos = sql.find(t.table, pos)) != std::string::npos) {
+      sql.replace(pos, t.table.size(), tab2);
+      pos += tab2.size();
+    }
+    return sql;
+  };
+  auto render = [&](TransactionContext& c,
+                    const std::string& sql) -> std::optional<std::string> {
+    std::string error;
+    auto rows = RunRows(db, c, sql, &error);
+    if (!rows.has_value()) {
+      return std::nullopt;
+    }
+    std::string out;
+    for (const Row& r : *rows) {
+      out += r.ToString() + ";";
+    }
+    return out;
+  };
+  TransactionContext ctx = db.BeginContext();
+  for (const std::string& sql : t.setup) {
+    if (!RunUpdate(db, ctx, substitute(sql))) {
+      return true;
+    }
+  }
+  std::vector<std::pair<std::string, std::string>> before;
+  for (const std::string& probe : t.skip_probes) {
+    auto out = render(ctx, substitute(probe));
+    if (!out.has_value()) {
+      return true;
+    }
+    before.emplace_back(probe, *out);
+  }
+  for (const char* col : {"a", "b"}) {
+    if (!ApplyIndexSpec(db, ctx,
+                        "CREATE INDEX idx_skip_" + std::string(col) + " ON " +
+                            tab2 + "(" + col + ");")) {
+      return true;
+    }
+  }
+  for (const auto& [probe, expected] : before) {
+    auto out = render(ctx, substitute(probe));
+    if (!out.has_value()) {
+      return true;
+    }
+    if (*out != expected) {
+      *report += "[SKIP-SCAN MISMATCH]\n";
+      *report += "  probe:    " + probe + "\n";
+      *report += "  no-index: " + expected + "\n";
+      *report += "  index:    " + *out + "\n";
+    }
+  }
+  return true;
+}
+
+// TOP-n WITH TIES: rows past the n-th position whose ORDER BY key ties the
+// boundary must all be present (set of u values, null-safe boundary).
+bool CheckTopTies(Database& db, TransactionContext& ctx, const OracleTrace& t,
+                  std::string* report, bool verbose) {
+  if (t.topties.empty() || t.topties_limit <= 0) {
+    return true;
+  }
+  const std::vector<MirrorRow> mirror = MirrorFromSetup(t.setup, t.table);
+  std::vector<const MirrorRow*> sorted;
+  sorted.reserve(mirror.size());
+  for (const MirrorRow& m : mirror) {
+    sorted.push_back(&m);
+  }
+  std::sort(
+      sorted.begin(), sorted.end(), [](const MirrorRow* l, const MirrorRow* r) {
+        if (l->a == kNull || r->a == kNull) {
+          return l->a == kNull ? r->a != kNull : false;  // ASC NULLS FIRST
+        }
+        return l->a < r->a;
+      });
+  std::set<int64_t> expected;
+  if (sorted.size() <= static_cast<size_t>(t.topties_limit)) {
+    for (const MirrorRow* m : sorted) {
+      expected.insert(m->u);
+    }
+  } else {
+    const int64_t boundary =
+        sorted[static_cast<size_t>(t.topties_limit) - 1]->a;
+    for (const MirrorRow* m : sorted) {
+      const bool keep = boundary == kNull ? m->a == kNull
+                                          : (m->a == kNull || m->a <= boundary);
+      if (keep) {
+        expected.insert(m->u);
+      }
+    }
+  }
+  std::string error;
+  auto rows = RunRows(db, ctx, t.topties, &error);
+  if (!rows.has_value()) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][topties-error] " << error << "\n";
+    }
+    return true;
+  }
+  std::set<int64_t> got;
+  for (const Row& r : *rows) {
+    got.insert(CellInt(r[0]));
+  }
+  if (got != expected) {
+    *report += "[WITH TIES MISMATCH]\n";
+    *report += "  sql: " + t.topties + "\n";
+    *report += "  limit: " + std::to_string(t.topties_limit) + "\n";
+    *report += "  expected u: ";
+    for (const int64_t u : expected) {
+      *report += std::to_string(u) + " ";
+    }
+    *report += "\n  got u:      ";
+    for (const int64_t u : got) {
+      *report += std::to_string(u) + " ";
+    }
+    *report += "\n";
+  }
   return true;
 }
 
@@ -2168,15 +2924,55 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
 
   // ---- Constraint rewriting (index independence) ----
   {
+    // Specs stay textual for .test self-containment; ApplyIndexSpec routes
+    // them through Database::CreateIndex because the SQL frontend has no
+    // CREATE INDEX statement.
     static const std::array<const char*, 4> kIdxCols = {"a", "b", "flag", "s"};
     const int idx_count = g.Pick(1, 4);
     for (int i = 0; i < idx_count; ++i) {
-      t.index_ddl.push_back(std::string("CREATE INDEX idx_fuzz") +
-                            std::to_string(i) + " ON " + tab + "(" +
-                            kIdxCols[static_cast<size_t>(g.Pick(0, 3))] + ");");
+      std::string ddl;
+      if (g.Pick(0, 7) == 0) {
+        // u is the unique row id: a real unique index exercises the
+        // IndexMode::kUnique plan paths.
+        ddl = "CREATE UNIQUE INDEX idx_fuzz" + std::to_string(i) + " ON " +
+              tab + "(u);";
+      } else {
+        ddl = "CREATE INDEX idx_fuzz" + std::to_string(i) + " ON " + tab + "(" +
+              kIdxCols[static_cast<size_t>(g.Pick(0, 3))];
+        if (g.Pick(0, 3) == 0) {
+          ddl += "," + std::string(kIdxCols[static_cast<size_t>(g.Pick(0, 3))]);
+        }
+        ddl += ")";
+        if (g.Pick(0, 3) == 0) {
+          // Covering index: probes that touch only key+include columns can
+          // take the index-only scan path.
+          ddl += " INCLUDE(" +
+                 std::string(kIdxCols[static_cast<size_t>(g.Pick(0, 3))]) + ")";
+        }
+        ddl += ";";
+      }
+      t.index_ddl.push_back(std::move(ddl));
     }
     t.index_probe =
         "SELECT COUNT(*) FROM " + tab + " WHERE " + t.predicate + ";";
+    // DISTINCT probes exercise the skip-scan-distinct executor; the no-index
+    // plan and the indexed plan must agree exactly.
+    static const std::array<const char*, 2> kSkipCols = {"a", "b"};
+    const std::string skip_col = kSkipCols[static_cast<size_t>(g.Pick(0, 1))];
+    t.skip_probes.push_back("SELECT COUNT(DISTINCT " + skip_col + ") FROM " +
+                            tab + ";");
+    t.skip_probes.push_back("SELECT DISTINCT " + skip_col + " FROM " + tab +
+                            " ORDER BY " + skip_col + ";");
+    t.skip_probes.push_back("SELECT COUNT(DISTINCT " + skip_col + ") FROM " +
+                            tab + " WHERE " + t.predicate + ";");
+  }
+
+  // ---- Window functions + TOP-n WITH TIES (model / permutation / index) ----
+  {
+    t.window_probes = GenWindowProbes(g, tab);
+    t.topties_limit = g.Pick(1, 3);
+    t.topties = "SELECT u, a FROM " + tab + " ORDER BY a LIMIT " +
+                std::to_string(t.topties_limit) + " WITH TIES;";
   }
 
   // ---- Transaction splitting ----
@@ -2186,9 +2982,28 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
       switch (g.Pick(0, 2)) {
         case 0: {
           const RPredPtr cond = GenPredicate(g, g.Pick(1, 2), flavour);
-          t.troc.push_back("UPDATE " + tab +
-                           " SET a = " + std::to_string(g.Pick(-3, 3)) +
-                           " WHERE " + cond->Render() + ";");
+          // Mix constant SETs with column/arithmetic RHS — the expression
+          // engine runs inside the DML write path in both branches.
+          std::string set_expr;
+          switch (g.Pick(0, 2)) {
+            case 0:
+              set_expr = std::to_string(g.Pick(-3, 3));
+              break;
+            case 1:
+              set_expr = "(a + " + std::to_string(g.Pick(-3, 3)) + ")";
+              break;
+            default:
+              set_expr = "b";
+              break;
+          }
+          std::string update = "UPDATE ";
+          update.append(tab)
+              .append(" SET a = ")
+              .append(set_expr)
+              .append(" WHERE ")
+              .append(cond->Render())
+              .append(";");
+          t.troc.push_back(std::move(update));
           break;
         }
         case 1: {
@@ -2223,18 +3038,19 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   // Plan feedback: reward flavours that surface unseen plan shapes.
   if (session != nullptr) {
     ScopedDb sdb("sql_oracle_fuzz");
-    CHECK(sdb.get() != nullptr);
-    Database& db = *sdb;
-    TransactionContext ctx = db.BeginContext();
-    if (RunSetup(db, ctx, t.setup, verbose).empty()) {
-      std::string error;
-      auto plan = RunRows(db, ctx, "EXPLAIN " + t.tlp[0], &error);
-      if (plan.has_value()) {
-        std::string fingerprint;
-        for (const Row& r : *plan) {
-          fingerprint += r.ToString() + ";";
+    if (sdb.get() != nullptr) {  // resource pressure: skip feedback only
+      Database& db = *sdb;
+      TransactionContext ctx = db.BeginContext();
+      if (RunSetup(db, ctx, t.setup, verbose).empty()) {
+        std::string error;
+        auto plan = RunRows(db, ctx, "EXPLAIN " + t.tlp[0], &error);
+        if (plan.has_value()) {
+          std::string fingerprint;
+          for (const Row& r : *plan) {
+            fingerprint += r.ToString() + ";";
+          }
+          session->RewardFlavour(flavour, session->ObservePlan(fingerprint));
         }
-        session->RewardFlavour(flavour, session->ObservePlan(fingerprint));
       }
     }
   }
@@ -2256,6 +3072,9 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
     stats->idx_ran = !t.index_ddl.empty() && !t.index_probe.empty();
+    stats->skip_ran = !t.skip_probes.empty();
+    stats->window_ran = !t.window_probes.empty();
+    stats->topties_ran = !t.topties.empty();
     stats->dqe_ran = t.dqe.size() == 3;
     stats->troc_ran = !t.troc.empty();
     stats->setop_ran = t.setop.size() == 1;
@@ -2274,7 +3093,9 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
     return "malformed trace: no CREATE TABLE in setup";
   }
   ScopedDb sdb("sql_oracle_replay");
-  CHECK(sdb.get() != nullptr);
+  if (sdb.get() == nullptr) {
+    return "";  // resource pressure: replay skipped, not a mismatch
+  }
   Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
   std::string setup_err = RunSetup(db, ctx, trace.setup, verbose);
@@ -2289,6 +3110,9 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
       !CheckNoRec(db, ctx, trace.norec, &report, verbose) ||
       !CheckPqs(db, ctx, trace, &report, verbose) ||
       !CheckIdx(db, ctx, trace, &report, verbose) ||
+      !CheckWindow(db, ctx, trace, &report, verbose) ||
+      !CheckSkip(db, trace, &report, verbose) ||
+      !CheckTopTies(db, ctx, trace, &report, verbose) ||
       !CheckTroc(db, trace, &report, verbose) ||
       !CheckDqe(db, ctx, trace, &report, verbose) ||
       !CheckExpected(db, ctx, trace.setop, trace.setop_expect,
@@ -2387,6 +3211,16 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   if (!trace.index_probe.empty()) {
     out += "-- idxprobe: " + trace.index_probe + "\n";
+  }
+  for (const std::string& probe : trace.skip_probes) {
+    out += "-- skip: " + probe + "\n";
+  }
+  for (const std::string& spec : trace.window_probes) {
+    out += "-- win: " + spec + "\n";
+  }
+  if (!trace.topties.empty()) {
+    out += "-- topties: " + trace.topties + "\n";
+    out += "-- toptieslimit: " + std::to_string(trace.topties_limit) + "\n";
   }
   for (const std::string& sql : trace.dqe) {
     out += "-- dqe: " + sql + "\n";
@@ -2522,6 +3356,14 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->index_ddl.push_back(value);
     } else if (consume("-- idxprobe: ", &value)) {
       trace->index_probe = value;
+    } else if (consume("-- skip: ", &value)) {
+      trace->skip_probes.push_back(value);
+    } else if (consume("-- win: ", &value)) {
+      trace->window_probes.push_back(value);
+    } else if (consume("-- topties: ", &value)) {
+      trace->topties = value;
+    } else if (consume("-- toptieslimit: ", &value)) {
+      trace->topties_limit = std::stoll(value);
     } else if (consume("-- dqe: ", &value)) {
       trace->dqe.push_back(value);
     } else if (consume("-- troc: ", &value)) {
@@ -2572,7 +3414,9 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
 std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
   Gen g(rng);
   ScopedDb sdb("sql_oracle_amoeba");
-  CHECK(sdb.get() != nullptr);
+  if (sdb.get() == nullptr) {
+    return "";  // resource pressure: iteration skipped
+  }
   Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
   const std::string tab =

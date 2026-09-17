@@ -137,6 +137,14 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
     コアを最適化し、グルーピング仕上げは `FinishQuery` 経由）。
     ただし集合演算は `plan_contains` が relational 形式の
     `optimizer_subquery_setop_high_expectations` 等を結果契約のみに緩和済み。
+    **訂正 (2026-09-16)**: ブリッジ gate が `PostRewriteNeedsRelational` の
+    GROUP BY/HAVING 存在条件と自己矛盾し、実は到達不能（デッドコード）で
+    あった。`include_grouping=false` を bridge gate が渡すようにして初めて
+    実活性化。同時に M6-bridge slice（outer join の ON を WHERE 折り畳みで
+    なく `QueryData::OuterJoinEdge` に載せる）を追加し、**GROUP BY 付き
+    LEFT JOIN / LEFT 連鎖 / スカラ集約 over outer join** が Cascades コア
+    経由になった。テスト `SqlEngineGroupedLeftJoinRoutesThroughCascadesBridge`
+    ほか3本。
   - **残存する relational 経路（M4〜M8）と各移管要件**:
 1. **CTE / 再帰 CTE**（M4）: 単一参照・単一表の非再帰 CTE はインライン化で
    移管済み（`InlineSingleUseCtes`＋M5 flatten）。複数参照の小規模 CTE は
@@ -161,10 +169,14 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
    単一辺スライス＋辺 kind 1/2 構築＋ preserved/null-supplying 側で一般化した
    ON-vs-WHERE 契約＋RIGHT の unique 左側除去ミラー。FULL 除去なし。
    非等価 FULL は `batch_nested_loop_outer` で実行）。
-   残件: outer chain・GROUP BY 付き outer の memo 移管、
+   残件: 非グループ化 outer chain（2 辺以上の LEFT 連鎖）の memo 移管、
+   GROUP BY 付き RIGHT/FULL（M6+1 の 2 表形状を除く）、
    memo レベルの unused-outer 除去（現状 statement-level のみ）。
-   ※ SELECT COUNT(*) FROM a LEFT JOIN b は外部結合ガードで relational 保棄
-   （slice が集約を拒否しフォールバック）。
+   ※ 2026-09-16: GROUP BY 付き LEFT JOIN・LEFT 連鎖・スカラ集約 over
+   outer join は M6-bridge（`ExecuteGroupedSelect` が ON を
+   `QueryData::OuterJoinEdge` に載せ、gate が `include_grouping=false` を
+   渡す）で Cascades コア経由になった。旧記載「COUNT(*) FROM a LEFT JOIN b
+   は relational 保棄」は解消。
     4. **UNNEST / TVF**（M7）: `kUnnest` 論理 op は memo 接続済み
        （`sql_engine.cpp` が kUnnest を構築、`implementation_rules.cpp` が
        `unnest` 実装規則を登録）。残件は汎用 TVF（`WITH OFFSET` 等の周辺）。
@@ -967,25 +979,28 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 
 ### A. 正しさの調査が必要(guard 追加または意図の明記)
 
-- [ ] `intersect_to_semijoin` / `except_to_antijoin` /
-      `intersect_except_cost_based_lowering`: INTERSECT/EXCEPT(DISTINCT) は
-      重複を圧縮するが semi/anti join は左行ごとに出力するため、左入力に
-      重複があると多光度が一致しない。多光度の guard 未実装。D5 監査表に
-      項目なし → guard(左側一意性の証明 or 明示 dedup)追加 + 反例テスト +
-      D5 記載(`docs/opt/part2-rules/logical/intersect_to_semijoin.md` 等)
-- [ ] `filter_aggregate_pushdown`: 述語を通す行に一度も現れない GROUP BY
-      キーのグループが、変換後は「空集約値の行」として新規に出力され得る
-      (グループ集合の変化を排除する guard なし)。実行時は
-      `executor/partial_aggregate.cpp` がグループ生成を FILTER 評価に先行
-      させることで現状一致しているが、構造的保証ではない → guard 追加または
-      意図の明記(`docs/opt/part2-rules/logical/filter_aggregate_pushdown.md`)
-- [ ] `rank_row_number_to_topn`: 複数連言の述語で最初の一致項のみ TopN 化し
-      残差連言を引き継がない → 残差評価の欠落の疑い。反例テストの追加
-- [ ] `decorrelate_aggregate_apply`: Apply の `join_type`(0=Inner /
-      1=LeftOuter / 2=Semi / 3=Anti)を `kOuterJoin` の join_type
-      (0=LEFT / 1=RIGHT / 2=FULL)へ無変換で写すため、値 1 が RIGHT に
-      解釈され得る(テストは 0 のみ)。`apply_to_join` 側は写像し直している。
-      Apply の join_type は 2 種の符号化が混在しており統一が必要
+- [x] `intersect_to_semijoin` / `except_to_antijoin` /
+      `intersect_except_cost_based_lowering`: 多光度は解消済み — 3 ルールとも
+      join を論理 `Distinct` で包んで発行する(監査基準時点で既存、監査が
+      取りこぼし)。実残だったのは NULL 意味論で、`BuildEqualityOnAllColumns`
+      が null 拒否の `=` を使うため NULL 行が INTERSECT で欠落/EXCEPT で残存
+      していた → 2026-09-16 に `IS NOT DISTINCT FROM` 行等価へ修正
+      (物理は null-safe ハッシュキー経路へ接続)。
+      反例テスト `IntersectExceptLoweringUsesNullSafeRowEquality`
+- [x] `filter_aggregate_pushdown`: guard は実装済み — scalar aggregation のみ
+      発火(`grouping_sets.empty()` 検査+`FilterAggregatePushdownRefusedFor
+      GroupedAggregation`)。追加で 2026-09-16 に volatile/サブクエリ述語の
+      FILTER 複製 guard(`SafeToReduceEvaluationCount`、評価回数変化の排除)
+      を実装。反例テスト
+      `FilterAggregatePushdownRefusedForVolatilePredicate`
+- [x] `rank_row_number_to_topn`: 現行実装は複数連言を発火前に拒否する
+      (`conjuncts.size() != 1` で continue、コメント明記)。監査指摘は
+      古い形状に対するもの。反例テスト
+      `RankRowNumberToTopNSkipsResidualConjuncts` で挙動を固定
+- [x] `decorrelate_aggregate_apply`: 2026-09-16 に `apply_to_join` と同じ
+      写像へ修正(0→kJoin、1→kOuterJoin(join_type=0=LEFT)、2/3=Semi/Anti は
+      不発火で一般経路維持)。生値コピーは LeftOuter を RIGHT に解釈していた。
+      回帰テスト `DecorrelateAggregateApplyRemapsLeftOuterJoinType`
 - [ ] `mark_join_to_filter`: NULL マーカー行の扱いが semi/anti と厳密一致
       することをコードで確認できていない(`TryEvaluateUnary` の
       IS NOT FALSE / IS NOT TRUE は NULL 入力で TRUE、`hash_join.cpp` の
@@ -1005,10 +1020,15 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 
 ### B. コメントと実装の不一致(コメント修正または実装追加)
 
-- [ ] `eliminate_sort_under_unordered_consumer`: コメントは「aggregation が
-      順序依存の要求を持たないとき」と述べるが、順序依存性を検査する guard
-      は実装されていない(A 項と重なる正しさの懸念)。また `grouping_sets` /
-      `output_schema` を写さず `target_list` のみ引き継ぐ
+- [x] `eliminate_sort_under_unordered_consumer`: 2026-09-16 に修正。
+      (1) 順序依存 guard — WITHIN GROUP 付き集約・string_agg/array_agg/
+      ANY_VALUE/percentile/sketch 系を不許可の許可リスト方式
+      (count/sum/avg/min/max/統計系/bit 系/approx_count_distinct のみ許可)。
+      (2) ペイロード完全引き継ぎ — 旧実装は `grouping_sets`/`partition_by`/
+      `output_schema` を写さず GROUP BY 付き集約が scalar 化されていた
+      (正しさの懸念)。テスト
+      `EliminateSortUnderAggregationKeepsGroupingSets` /
+      `EliminateSortSkipsOrderSensitiveAggregate`
 - [ ] `recursive_termination_predicate_pushdown`: 登録コメントは monotonic
       termination を謳うが、単調性解析は未実装(guard は循環防止の構造的
       ものみ)。再帰 CTE の終端正しさに関わるため要確認

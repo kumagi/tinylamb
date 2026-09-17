@@ -50,8 +50,11 @@ class ExecutorBase {
   // and on failure; callers must inspect GetStatus() after exhaustion to
   // tell the two apart. The first recorded error wins (ARIES-style
   // fail-fast cursor semantics).
-  [[nodiscard]] Status GetStatus() const { return status_; }
-  [[nodiscard]] bool ok() const { return status_ == Status::kSuccess; }
+  // Virtual: transparent decorators (RetainedExecutor, IndexSkipScanExecutor)
+  // forward to the wrapped executor so a child's error is not reported as a
+  // successful exhaustion by the outermost cursor.
+  [[nodiscard]] virtual Status GetStatus() const { return status_; }
+  [[nodiscard]] bool ok() const { return GetStatus() == Status::kSuccess; }
 
  protected:
   // Records the first error; returns false so callers can write

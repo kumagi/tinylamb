@@ -14,9 +14,11 @@
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -35,6 +37,7 @@ ParallelMergeJoin::ParallelMergeJoin(
       worker_count_(std::max<size_t>(1, worker_count)),
       kind_(kind),
       residual_(std::move(residual)),
+      residual_conjuncts_(SplitConjuncts(residual_)),
       residual_schema_(std::move(residual_schema)),
       right_width_(right_width) {}
 
@@ -50,6 +53,20 @@ bool ParallelMergeJoin::PairPasses(const Row& left, const Row& right) const {
     return true;
   }
   const Row combined = left + right;
+  if (kind_ == JoinKind::kInner) {
+    // An inner-join residual is a WHERE-level filter: conjuncts may have
+    // been reordered by canonicalization, so a sibling that cleanly rejects
+    // the pair suppresses errors from the rest (commutative semantics).
+    StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+        residual_conjuncts_, [&](const Expression& conjunct) {
+          return conjunct->TryEvaluate(combined, residual_schema_);
+        });
+    if (!pass.HasValue()) {
+      RecordResidualError(pass.GetStatus());
+      return false;
+    }
+    return pass.Value();
+  }
   StatusOr<Value> res = residual_->TryEvaluate(combined, residual_schema_);
   if (!res.HasValue()) {
     RecordResidualError(res.GetStatus());
@@ -67,11 +84,14 @@ void ParallelMergeJoin::RecordResidualError(const Status& status) const {
   }
 }
 
-int ParallelMergeJoin::CompareKeys(const Row& left, const Row& right) const {
-  const size_t n = std::min(left_cols_.size(), right_cols_.size());
+int ParallelMergeJoin::CompareKeys(const Row& left,
+                                   const std::vector<slot_t>& left_cols,
+                                   const Row& right,
+                                   const std::vector<slot_t>& right_cols) {
+  const size_t n = std::min(left_cols.size(), right_cols.size());
   for (size_t i = 0; i < n; ++i) {
-    const Value& lv = left[left_cols_[i]];
-    const Value& rv = right[right_cols_[i]];
+    const Value& lv = left[left_cols[i]];
+    const Value& rv = right[right_cols[i]];
     if (lv < rv) {
       return -1;
     }
@@ -113,8 +133,8 @@ void ParallelMergeJoin::ComputeSteeringPartitions() {
     size_t target_l = (left_n * p) / num_partitions;
     // Advance target_l past equal-key cluster boundary
     while (target_l < left_n &&
-           CompareKeys(left_rows_[target_l].first,
-                       left_rows_[target_l - 1].first) == 0) {
+           CompareKeys(left_rows_[target_l].first, left_cols_,
+                       left_rows_[target_l - 1].first, left_cols_) == 0) {
       ++target_l;
     }
     if (target_l >= left_n) {
@@ -127,7 +147,8 @@ void ParallelMergeJoin::ComputeSteeringPartitions() {
     size_t high = right_n;
     while (low < high) {
       size_t mid = low + ((high - low) / 2);
-      if (CompareKeys(bound_row, right_rows_[mid].first) > 0) {
+      if (CompareKeys(bound_row, left_cols_, right_rows_[mid].first,
+                      right_cols_) > 0) {
         low = mid + 1;
       } else {
         high = mid;
@@ -208,7 +229,8 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
         continue;
       }
 
-      int cmp = CompareKeys(left_rows_[l].first, right_rows_[r].first);
+      int cmp = CompareKeys(left_rows_[l].first, left_cols_,
+                            right_rows_[r].first, right_cols_);
       if (cmp < 0) {
         if (kind_ == JoinKind::kAnti) {
           out.emplace_back(left_rows_[l].first, left_rows_[l].second);
@@ -227,13 +249,14 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
         // semantics (mirrors the serial MergeJoin).
         size_t l_end = l + 1;
         while (l_end < range.left_end &&
-               CompareKeys(left_rows_[l].first, left_rows_[l_end].first) == 0) {
+               CompareKeys(left_rows_[l].first, left_cols_,
+                           left_rows_[l_end].first, left_cols_) == 0) {
           ++l_end;
         }
         size_t r_end = r + 1;
         while (r_end < range.right_end &&
-               CompareKeys(right_rows_[r].first, right_rows_[r_end].first) ==
-                   0) {
+               CompareKeys(right_rows_[r].first, right_cols_,
+                           right_rows_[r_end].first, right_cols_) == 0) {
           ++r_end;
         }
 
@@ -326,9 +349,9 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
   if (partitions_.size() <= 1) {
     worker_func(0);
   } else {
-    std::vector<std::jthread> workers;
     std::exception_ptr worker_failure;
     std::mutex failure_mutex;
+    std::vector<std::jthread> workers;
     workers.reserve(partitions_.size());
     for (size_t p = 0; p < partitions_.size(); ++p) {
       workers.emplace_back([&, p]() {

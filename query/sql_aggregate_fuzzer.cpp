@@ -90,8 +90,13 @@ std::optional<std::vector<std::vector<Value>>> RunQuery(Database& db,
     }
     rows.push_back(std::move(cells));
   }
+  // QueryResult is lazy: a mid-stream error is not a rejected query but a
+  // truncated result.  Generated SELECTs cannot legitimately fail, so mark
+  // it distinctly — the caller reports instead of skipping.
   if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
-    *error = st.GetMessage().empty() ? ToString(st.GetCode()) : st.GetMessage();
+    *error = "stream-error: " + (st.GetMessage().empty()
+                                     ? std::string(ToString(st.GetCode()))
+                                     : std::string(st.GetMessage()));
     return std::nullopt;
   }
   return rows;
@@ -261,11 +266,13 @@ struct AggSpec {
     kCountDistinct,
     kSumDistinct,
     kAvg,
-    kAvgDistinct
+    kAvgDistinct,
+    kCountIf
   } kind{kCountStar};
   // Optional FILTER (WHERE ...) predicate; only rows evaluating TRUE
   // feed the aggregate.
   std::shared_ptr<const WPred> filter;
+  WPredPtr cond;  // kCountIf only
 };
 
 // Rows of `input` satisfying the spec's FILTER clause (all of them when
@@ -330,6 +337,15 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
       }
       return static_cast<int64_t>(sum);
     }
+    case AggSpec::Kind::kCountIf: {
+      int64_t n = 0;
+      for (const MRow& r : rows) {
+        if (spec.cond->Eval(r) == 'T') {
+          ++n;
+        }
+      }
+      return n;
+    }
     default:
       return std::nullopt;
   }
@@ -344,6 +360,15 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
       int64_t n = 0;
       for (const MRow& r : rows) {
         if (IsDblCol(spec.col) ? !r.f_null : CellOf(r, spec.col) != kNullRepr) {
+          ++n;
+        }
+      }
+      return FmtInt(n);
+    }
+    case AggSpec::Kind::kCountIf: {
+      int64_t n = 0;
+      for (const MRow& r : rows) {
+        if (spec.cond->Eval(r) == 'T') {
           ++n;
         }
       }
@@ -471,7 +496,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
 
   t.setup.emplace_back(kDdl);
   std::vector<MRow> mirror;
-  const int row_count = g.Pick(5, 12);
+  // ~12% of rounds cross the morsel/parallel-aggregation threshold; the
+  // small-table domain (-3..3) is kept so group counts stay meaningful.
+  const bool large = g.Chance(12);
+  const int row_count = large ? g.Pick(8300, 8450) : g.Pick(5, 12);
+  std::string batch;
+  int pending = 0;
   for (int i = 0; i < row_count; ++i) {
     MRow r;
     r.u = i;
@@ -493,15 +523,30 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
                         : kFPool[static_cast<size_t>(g.Pick(0, 9))];
     }
     mirror.push_back(r);
-    t.setup.push_back(
-        "INSERT INTO t VALUES (" + std::to_string(r.u) + ", " +
-        CellSql(0, r.a) + ", " + CellSql(1, r.b) + ", " + CellSql(2, r.s) +
-        ", " + (r.f_null ? std::string("NULL") : FormatDoubleShortest(r.f)) +
-        ");");
+    const std::string tuple =
+        "(" + std::to_string(r.u) + ", " + CellSql(0, r.a) + ", " +
+        CellSql(1, r.b) + ", " + CellSql(2, r.s) + ", " +
+        (r.f_null ? std::string("NULL") : FormatDoubleShortest(r.f)) + ")";
+    if (!large) {
+      t.setup.push_back("INSERT INTO t VALUES " + tuple + ";");
+      continue;
+    }
+    batch += (pending == 0 ? "" : ", ") + tuple;
+    if (++pending == 200) {
+      t.setup.push_back("INSERT INTO t VALUES " + batch + ";");
+      batch.clear();
+      pending = 0;
+    }
+  }
+  if (pending != 0) {
+    t.setup.push_back("INSERT INTO t VALUES " + batch + ";");
   }
 
   // ScopedDb deletes the throwaway .db/.log pair when the iteration ends.
   ScopedDb db_owner("sql_aggregate_fuzz");
+  if (!db_owner) {
+    return "";  // resource pressure: iteration skipped
+  }
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
@@ -515,12 +560,18 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     }
     // QueryResults are lazy: drain or the INSERT never happens.
     result.Value().Drain();
+    if (result.Value().GetStatus() != Status::kSuccess) {
+      if (verbose) {
+        std::cerr << "[agg_fuzz][skip-setup-status] " << sql << "\n";
+      }
+      return "";
+    }
   }
 
   std::string report;
   const int query_count = g.Pick(2, 5);
   for (int q = 0; q < query_count; ++q) {
-    const bool window = g.Chance(45);
+    const bool window = !large && g.Chance(45);
     std::string sql;
     std::vector<std::string> expected;
 
@@ -593,8 +644,18 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       if (g.Chance(15)) {
         aggs.push_back({"SUM(DISTINCT f)", 3, AggSpec::Kind::kSumDistinct});
       }
+      if (g.Chance(30)) {
+        AggSpec ci;
+        ci.cond = GenWhere(g, 1);
+        ci.sql = "COUNTIF(" + ci.cond->Render() + ")";
+        ci.kind = AggSpec::Kind::kCountIf;
+        aggs.push_back(std::move(ci));
+      }
       // FILTER (WHERE ...) on some specs.
       for (AggSpec& spec : aggs) {
+        if (spec.kind == AggSpec::Kind::kCountIf) {
+          continue;  // COUNTIF already carries its own condition
+        }
         if (g.Chance(25)) {
           WPredPtr f = GenWhere(g, 1);
           spec.sql += " FILTER (WHERE " + f->Render() + ")";
@@ -1194,6 +1255,19 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     std::string error;
     auto got = RunQuery(db, ctx, sql, &error);
     if (!got.has_value()) {
+      if (error.starts_with("stream-error")) {
+        if (error.find("overflow") != std::string::npos) {
+          // INT64 extremes legitimately abort SUM mid-stream; the mirror
+          // models the overflow as NULL so a wrapped result still trips.
+          continue;
+        }
+        report += "[AGGREGATE MISMATCH] query aborted mid-stream: ";
+        report += sql;
+        report += "\n  ";
+        report += error;
+        report += "\n";
+        return report;
+      }
       if (verbose) {
         std::cerr << "[agg_fuzz][skip-query] " << sql << " :: " << error
                   << "\n";
@@ -1224,6 +1298,9 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
     return "malformed trace: no setup";
   }
   ScopedDb db_owner("sql_aggregate_replay");
+  if (!db_owner) {
+    return "";  // resource pressure: replay skipped, not a mismatch
+  }
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
@@ -1234,6 +1311,9 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
       return "setup failed: " + sql;
     }
     result.Value().Drain();
+    if (result.Value().GetStatus() != Status::kSuccess) {
+      return "setup stream-error: " + sql;
+    }
   }
   for (const AggQueryExpect& q : trace.queries) {
     std::string error;

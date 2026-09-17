@@ -273,7 +273,8 @@ TEST_F(LogRecordTest, LogTypeStreamOperator) {
                                    LogType::kEndCheckpoint,
                                    LogType::kSystemAllocPage,
                                    LogType::kSystemDestroyPage,
-                                   LogType::kLowestValue};
+                                   LogType::kLowestValue,
+                                   LogType::kCompensateDestroyPage};
 
   // Act -- stream each type
   // Assert -- the common types print their canonical names

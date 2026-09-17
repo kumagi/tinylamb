@@ -45,6 +45,7 @@
 #include "executor/executor_base.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
+#include "recovery/recovery_manager.hpp"
 #include "server/postgres_protocol.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -149,6 +150,13 @@ class PostgresServer::Impl {
  public:
   Impl(const std::string& database_path, PostgresServerOptions options)
       : options_(std::move(options)) {
+    // Honor force_recovery here as well as in postgres_server_main: an
+    // embedder constructing PostgresServer directly with the flag set gets
+    // the same torn-tail truncation behavior without touching the global
+    // beforehand.
+    if (options_.force_recovery) {
+      RecoveryManager::SetTornTailTruncationAllowed(true);
+    }
     // Opening (and recovering) the database is fallible; keep the failure
     // for Listen() instead of throwing out of the constructor.
     StatusOr<std::unique_ptr<Database>> created =
@@ -852,17 +860,6 @@ class PostgresServer::Impl {
       }
     }
     Queue(client, pgwire::ReadyForQuery(client.transaction_status));
-  }
-
-  static bool ContainsTransactionControl(
-      const std::vector<std::string>& statements) {
-    return std::ranges::any_of(statements, [](const std::string& statement) {
-      const std::string command = UppercaseCommand(statement);
-      return command == "BEGIN" || command == "START" || command == "COMMIT" ||
-             command == "END" || command == "ROLLBACK" ||
-             // PostgreSQL alias for ROLLBACK.
-             command == "ABORT";
-    });
   }
 
   bool ExecuteStatement(Client& client, const std::string& sql,

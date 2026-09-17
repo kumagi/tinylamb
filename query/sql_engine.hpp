@@ -47,7 +47,9 @@ class QueryResult {
         column_names_(std::move(column_names)) {}
 
   bool Next(Row* row);
-  [[nodiscard]] Status GetStatus() const { return executor_->GetStatus(); }
+  [[nodiscard]] Status GetStatus() const {
+    return executor_ ? executor_->GetStatus() : Status::kSuccess;
+  }
   size_t ForEach(const std::function<void(const Row&)>& sink);
   size_t Drain();
   std::vector<Row> Collect();

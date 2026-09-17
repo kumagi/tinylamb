@@ -46,6 +46,8 @@ TEST(SqlSessionFuzzer, SeededSessionsHoldState) {
   int indexes_created = 0;
   int tables_dropped = 0;
   int commits = 0;
+  int crashes = 0;
+  int checkpoints = 0;
   constexpr int kIterations = 24;
   for (uint32_t seed = 0; seed < kIterations; ++seed) {
     std::mt19937 rng(seed);
@@ -56,11 +58,130 @@ TEST(SqlSessionFuzzer, SeededSessionsHoldState) {
     indexes_created += stats.indexes_created;
     tables_dropped += stats.tables_dropped;
     commits += stats.commits;
+    crashes += stats.crashes;
+    checkpoints += stats.checkpoints;
   }
   EXPECT_GT(total_checks, 0) << "no state checks ran; harness is broken";
   EXPECT_GT(indexes_created, 0) << "index DDL never ran; harness is broken";
   EXPECT_GT(tables_dropped, 0) << "DROP TABLE never ran; harness is broken";
   EXPECT_GT(commits, 0) << "no commit boundaries; harness is broken";
+  EXPECT_GT(crashes, 0) << "no crash boundaries; harness is broken";
+  EXPECT_GT(checkpoints, 0) << "no checkpoints ran; harness is broken";
+}
+
+// Minimal probe for the abort-undo phantom-row bug: a committed empty table,
+// then a transaction that inserts rows and builds an index, aborted — a scan
+// afterwards must see an empty table.
+TEST(SqlSessionFuzzer, AbortWithIndexLeavesNoPhantomRows) {
+  SessionTrace trace;
+  trace.steps = {
+      {.sql =
+           "CREATE TABLE t (u INT64, c1 VARCHAR(8), c2 INT64, c3 VARCHAR(8));"},
+      {.is_commit = true},
+      {.sql = "INSERT INTO t VALUES (0, 'a', -2, 'x');"},
+      {.sql = "INSERT INTO t VALUES (1, 'bb', 1, 'y');"},
+      {.is_ddl = true, .sql = "CREATE INDEX idx ON t KEY(3)"},
+      {.is_abort = true},
+  };
+  SessionCheck check;
+  check.table = "t";
+  check.after_step = trace.steps.size() - 1;
+  check.expected = {};
+  trace.checks.push_back(check);
+  EXPECT_EQ(ReplaySessionTrace(trace, true), "");
+}
+
+// Regression (Bug 33): txn B holds an uncommitted UPDATE on a row; txn A's
+// UPDATE of the same row must lose the write-intent race.  The replayed
+// statement reuses B's identical compiled plan, so it executes through the
+// plan-cache RetainedExecutor — which used to swallow the inner Update
+// executor's kConflicts status and report success.
+TEST(SqlSessionFuzzer, ConcurrentUpdateSameRowLosesIntentRace) {
+  SessionTrace trace;
+  trace.steps = {
+      {.sql = "CREATE TABLE t (u INT64, c1 INT64, c2 INT64);"},
+      {.sql = "INSERT INTO t VALUES (0, 3, 0);"},
+      {.is_commit = true},
+      {.is_begin = true, .txn = 1},
+      {.txn = 1,
+       .sql = "UPDATE t SET c2 = (CASE WHEN (c1 IS NOT NULL) THEN u ELSE c2 "
+              "END) WHERE t.u = 0;"},
+      {.txn = 1, .sql = "UPDATE t SET c1 = c1 WHERE t.u = 0;"},
+      {.txn = 0,
+       .must_fail = true,
+       .sql = "UPDATE t SET c1 = c1 WHERE t.u = 0;"},
+  };
+  // What does txn 0 see before its update?  u=0 must still be visible
+  // under A's snapshot despite B's two uncommitted writes.
+  SessionCheck see;
+  see.table = "t";
+  see.after_step = 5;
+  see.expected = {"[0, 3, 0]"};
+  trace.checks.push_back(see);
+  EXPECT_EQ(ReplaySessionTrace(trace, true), "");
+}
+
+// Minimal probe for the post-commit snapshot regression: txn B begins while
+// txn A's DELETE is uncommitted; after A commits, B's snapshot must still
+// see the deleted row.
+TEST(SqlSessionFuzzer, SnapshotOutlivesConcurrentDeleteCommit) {
+  SessionTrace trace;
+  trace.steps = {
+      {.sql = "CREATE TABLE t (u INT64, c1 INT64);"},
+      {.sql = "INSERT INTO t VALUES (0, 0);"},
+      {.sql = "INSERT INTO t VALUES (4, 4);"},
+      {.is_commit = true},
+      {.is_begin = true, .txn = 1},
+      {.txn = 0, .sql = "DELETE FROM t WHERE t.u = 4;"},
+      {.is_commit = true, .txn = 0},
+      // B inserts into the same table: the slot freed by A's committed
+      // delete is still visible under B's older snapshot and must not be
+      // reused — reuse would mask the old row behind B's staged insert.
+      {.txn = 1, .sql = "INSERT INTO t VALUES (5, 5);"},
+  };
+  SessionCheck before;
+  before.table = "t";
+  before.txn = 1;
+  before.after_step = 5;  // pre-commit: B must see the row A staged away
+  before.expected = {"[0, 0]", "[4, 4]"};
+  trace.checks.push_back(before);
+  SessionCheck see;
+  see.table = "t";
+  see.txn = 1;
+  see.after_step = trace.steps.size() - 1;
+  see.expected = {"[0, 0]", "[4, 4]", "[5, 5]"};
+  trace.checks.push_back(see);
+  EXPECT_EQ(ReplaySessionTrace(trace, true), "");
+}
+
+// Stress one seed repeatedly: nondeterministic engine bugs (e.g. abort undo
+// leaving a half-visible row) may only fire under specific timing, so a
+// single iteration is not enough.  Opt-in via env vars.
+TEST(SqlSessionFuzzer, RepeatSeedForNondeterministicBugs) {
+  const char* seed_env = std::getenv("TINYLAMB_SESSION_SEED");
+  const char* count_env = std::getenv("TINYLAMB_SESSION_REPEAT");
+  if (seed_env == nullptr || count_env == nullptr) {
+    GTEST_SKIP() << "set TINYLAMB_SESSION_SEED + TINYLAMB_SESSION_REPEAT";
+  }
+  const uint64_t seed = std::strtoull(seed_env, nullptr, 10);
+  const int repeat = std::atoi(count_env);
+  for (int i = 0; i < repeat; ++i) {
+    // Same fold as SessionFuzzTry so a .test file's -- seed: value can be
+    // passed verbatim.
+    std::mt19937 rng(static_cast<uint32_t>(seed ^ (seed >> 32)));
+    SessionStats stats;
+    SessionTrace trace;
+    std::string report = RunSessionIteration(rng, false, &stats, &trace);
+    if (!report.empty()) {
+      const std::string path =
+          "sql_session_fuzz-repro-" + std::to_string(seed) + ".test";
+      std::ofstream out(path);
+      out << SerializeSessionTest(seed, trace, report);
+      std::cerr << "wrote " << path << "\n";
+    }
+    ASSERT_EQ(report, "") << "seed=" << seed << " iteration=" << i << "\n"
+                          << report;
+  }
 }
 
 // Round trip: a trace with a tampered expected dump must serialize, parse and

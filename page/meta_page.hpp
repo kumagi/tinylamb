@@ -60,11 +60,37 @@ class MetaPage {
   [[nodiscard]] page_id_t PeekAllocationCandidate() const;
   [[nodiscard]] bool AllocateCandidate(page_id_t candidate,
                                        Page* candidate_page);
+  // Allocates a brand-new id past the high-water mark, leaving the free
+  // list untouched.  PageManager::AllocateNewPage falls back to this when
+  // the free-list head's destroy is still uncommitted and cannot be safely
+  // reissued.  Returns false when |candidate| is stale (another allocator
+  // already consumed it).
+  [[nodiscard]] bool AllocateFreshId(page_id_t candidate) {
+    if (max_page_count + 1 != candidate) {
+      return false;
+    }
+    max_page_count = candidate;
+    return true;
+  }
+  // Restores the allocator to the snapshot taken before AllocateCandidate:
+  // called when the allocation's WAL append fails, so the id is not leaked
+  // (max-path ids would be skipped forever, free-path ids orphaned).
+  void RollbackAllocation(page_id_t saved_first_free_page,
+                          page_id_t saved_max_page_count) {
+    first_free_page = saved_first_free_page;
+    max_page_count = saved_max_page_count;
+  }
   void PopFreePageHead(page_id_t pid, page_id_t next) {
     if (first_free_page == pid) {
       first_free_page = next;
     }
   }
+  // Liveness escape hatch for PageManager::AllocateNewPage: when the head
+  // names a page that is no longer free (a stale link the undo path could
+  // not relink), drop the whole chain instead of re-peeking the same dead
+  // head forever.  Allocation falls back to the max+1 path; the abandoned
+  // ids return at the next startup free-list rebuild.
+  void ResetFreeList() { first_free_page = 0; }
 
  private:
   void Initialize() {

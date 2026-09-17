@@ -843,3 +843,102 @@ Q1–Q22 sum is unavailable: Q20/Q21 produced no result.)
 ### Correctness
 
 - `sql_engine_tpch_test.ExecutesAllTwentyTwoQueries` PASS (from the same tree).
+
+## 2026-09-17 — TPC-H SF=1: uncorrelated `NOT IN` membership NULL-rescan removed (Q1–Q22 sum 192.4 s → 67.6 s, −64.9%)
+
+- **Change (one targeted fix):** `x NOT IN (SELECT ...)` re-scanned the whole
+  cached membership relation on every probe. Two full-relation rescans were
+  hidden in the per-row path of the uncorrelated membership evaluation
+  (`executor/detail/expression_eval.cpp`): (1) every negated-IN probe swept
+  the build relation once to detect NULL build keys, and (2) every hash-set
+  miss whose set was smaller than the relation (i.e. any duplicate-containing
+  build such as `orders.o_custkey`: 1.5 M rows, 150 K distinct) swept the
+  build relation again looking for NULLs. At SF=1 that is
+  ~19 K probes × 1.5 M rows ≈ 2.9 × 10¹⁰ row visits and dominated Q22
+  (filter_ms 110,084 of 110,181 ms total).
+- The NULL flag is now recorded once while the membership hash is built
+  (`UncorrelatedMembership{values, contains_null}` in
+  `executor/detail/subquery_runtime.hpp`); probes read the flag instead of
+  rescanning. `null_aware_anti_build_contains_null` (EXPLAIN ANALYZE
+  diagnostics) is set from the build-time flag. Nothing else changed.
+- **Why A/B is trustworthy:** another agent was actively sharing the
+  checkout, so both sides were measured from isolated rsync snapshots of the
+  same working tree (WIP as of 2026-09-17 ~04:26 JST, which already fixed the
+  2026-09-13 Q20 grind and Q21 spill failure: Q20 2.5–2.9 s rows=164, Q21
+  9.7–10.5 s rows=100). The snapshots differ only by this fix (the base
+  snapshot carries the pre-fix membership code verbatim). 22 of 22 queries
+  completed in one process per side (`--reuse-database`, no `--query`),
+  identical row counts everywhere, ~3 GiB fixture copy per side.
+- **Host:** 32 cores / 121 GiB RAM, NVMe; machine NOT quiet (concurrent
+  builds during parts of the window, load 3–22); per-query noise ±5% except
+  where noted.
+
+### Results (SF=1, ms, in-process all-query runs)
+
+| Query | Fixed (ms) | Baseline (ms) | Rows |
+| --- | ---: | ---: | ---: |
+| Q1 | 5494.2 | 5470.6 | 4 |
+| Q2 | 882.4 | 894.3 | 100 |
+| Q3 | 5260.7 | 5373.9 | 10 |
+| Q4 | 4913.9 | 4947.4 | 5 |
+| Q5 | 1529.0 | 1531.0 | 5 |
+| Q6 | 542.1 | 533.5 | 1 |
+| Q7 | 1988.5 | 2038.0 | 4 |
+| Q8 | 1924.8 | 1881.8 | 5 |
+| Q9 | 10522.9 | 10835.7 | 175 |
+| Q10 | 1531.2 | 1570.0 | 20 |
+| Q11 | 578.2 | 501.4 | 741 |
+| Q12 | 825.6 | 759.1 | 2 |
+| Q13 | 2416.4 | 2485.5 | 42 |
+| Q14 | 443.4 | 419.3 | 1 |
+| Q15 | 690.4 | 643.0 | 1 |
+| Q16 | 617.3 | 560.7 | 18331 |
+| Q17 | 3807.7 | 3830.5 | 1 |
+| Q18 | 3201.4 | 3222.1 | 100 |
+| Q19 | 7248.9 | 7231.2 | 1 |
+| Q20 | 2519.8 | 2583.2 | 164 |
+| Q21 | 9727.2 | 10530.4 | 100 |
+| Q22 | **926.6** | **124594.0** | 7 |
+
+- Baseline snapshot sum (Q1–Q22, pre-fix A/B side): 192.44 s. Fixed A/B-side
+  sum (Q1–Q22): 68.40 s — −64.5% under identical conditions.
+- **Query sum (Q1–Q22):** **67.59 s** — confirmation run on a quieter
+  machine (table above); **−64.9% vs the pre-fix snapshot (2.85×)**.
+- Q22 alone: 124.59 s → 0.93 s (**134×**); profile counters identical on both
+  sides (`uncorrelated_hash_builds=1`, `uncorrelated_hash_probes=19040`,
+  rows=7), only the rescans disappeared (filter_ms 110,084 → ~800 ms).
+- All 21 other queries are within run-to-run noise; the fix only touches the
+  uncorrelated IN/NOT IN membership path (exercised at this scale by Q22).
+- This is the first fully measurable Q1–Q22 sum at SF=1 (2026-09-13 lost
+  Q20/Q21/Q22); not comparable to the partial Q1–Q19 sums in earlier entries,
+  nor to the 2026-08-24 58.40 s figure whose Q20/Q21/Q22 coverage differed.
+
+### Correctness
+
+- `executor_test` 169/169 PASS, including the new
+  `RelationalNotInSubqueryNullBuildKeyFiltersEverything` regression guard
+  (NULL build key turns every NOT IN miss into UNKNOWN; NULL-free build
+  keeps the complement).
+- `sql_engine_tpch_test` 6/6 PASS (`ExecutesAllTwentyTwoQueries`).
+- `query_test` 141/141, `optimizer_test` 100/100,
+  `expression/differential_test` 15/15 PASS.
+- `scripts/check_layering.py` exit 0. The landed tree (shared checkout,
+  including the concurrent agent's newer in-flight edits) rebuilds and
+  reproduces Q22 at 817 ms rows=7.
+
+### Where the remaining time is (next targets, in expected-value order)
+
+1. Q9 10.5 s and Q21 9.7 s: join-order/hash-join work (Q21 aggregates
+   9.8 M input rows over 2.9 M groups; a semi-join shape would avoid the
+   double lineitem pass).
+2. Q19 7.2 s, Q1 5.5 s, Q3 5.3 s, Q4 4.9 s: lineitem scan/decode throughput
+   and correlated-EXISTS probes (Q4's per-orders probe costs a 6 M-row
+   correlated-index build; decorrelation into a hash semi-join keyed on
+   `l_orderkey` would make it one filtered scan).
+3. Q17 3.8 s: the correlated `avg(l_quantity)` index materializes all of
+   `lineitem` for ~1.6 K outer part keys; a key-filtered build would shrink
+   it ~100×.
+4. TPC-C is untouched by this change (SELECT-path only); the 2026-09-04
+   figures (6,384 TPS sync) remain the latest recorded. The known TPC-C
+   backlog from history still stands: deferred Delivery/RTE queue,
+   parameterized index-bound plans to cut prepare/collect CPU.

@@ -114,7 +114,8 @@ class FullScanIterator : public IteratorBase {
       std::optional<std::vector<slot_t>> projection = std::nullopt,
       const std::unordered_set<int64_t>* key_filter = nullptr,
       std::optional<slot_t> key_column = std::nullopt,
-      const std::vector<IntegerPeekCompare>* peek_compares = nullptr);
+      const std::vector<IntegerPeekCompare>* peek_compares = nullptr,
+      bool lock_rows = false, bool wait_for_write_intent = true);
   FullScanIterator(
       const Table* table, Transaction* txn, std::vector<page_id_t> pages,
       std::optional<std::vector<slot_t>> projection,
@@ -141,6 +142,11 @@ class FullScanIterator : public IteratorBase {
   const std::unordered_set<int64_t>* key_filter_{nullptr};
   std::optional<slot_t> key_column_;
   const std::vector<IntegerPeekCompare>* peek_compares_{nullptr};
+  bool lock_rows_{false};
+  bool wait_for_write_intent_{true};
+  // Positions whose write intent this scan acquired and still holds; used to
+  // undo scan-side locking when a later intent acquisition fails mid-scan.
+  std::vector<RowPosition> scan_locked_;
   Status status_{Status::kSuccess};
 };
 

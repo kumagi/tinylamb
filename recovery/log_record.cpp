@@ -50,7 +50,10 @@ enum KeyTypes : uint8_t {
 
 [[maybe_unused]] std::string OmittedString(std::string_view original,
                                            size_t length) {
-  if (length < original.length()) {
+  // Mirrors common/debug.cpp: abbreviate only when the 8-byte head and tail
+  // stay disjoint, so the elided-byte arithmetic cannot underflow for
+  // mid-sized keys (it printed a huge garbage count for those before).
+  if (length + 16 <= original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
         "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
@@ -144,6 +147,9 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kCompensateSetHighFence:
       o << "COMPENSATE SET HIGH FENCE\t";
       break;
+    case LogType::kCompensateSetFoster:
+      o << "COMPENSATE SET FOSTER\t";
+      break;
     case LogType::kLowestValue:
       o << "SET LOWEST VALUE\t";
       break;
@@ -158,6 +164,9 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
       break;
     case LogType::kSystemDestroyPage:
       o << "DESTROY\t";
+      break;
+    case LogType::kCompensateDestroyPage:
+      o << "COMPENSATE DESTROY\t";
       break;
     default:
       o << "(undefined: " << static_cast<uint16_t>(type) << ")";
@@ -239,6 +248,7 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
     case LogType::kCommit:
     case LogType::kSystemAllocPage:
     case LogType::kSystemDestroyPage:
+    case LogType::kCompensateDestroyPage:
       break;
   }
   o << "\tprev_lsn: " << l.prev_lsn << "\ttxn_id: " << l.txn_id;
@@ -606,6 +616,18 @@ LogRecord LogRecord::DestroyPageLogRecord(lsn_t prev_lsn, txn_id_t txn,
   return l;
 }
 
+LogRecord LogRecord::CompensateDestroyPageLogRecord(txn_id_t txn, page_id_t pid,
+                                                    PageType restored_type,
+                                                    std::string restored_body) {
+  LogRecord l;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kCompensateDestroyPage;
+  l.allocated_page_type = restored_type;
+  l.undo_data = std::move(restored_body);
+  return l;
+}
+
 LogRecord LogRecord::BeginCheckpointLogRecord() {
   LogRecord l;
   l.type = LogType::kBeginCheckpoint;
@@ -712,6 +734,11 @@ size_t LogRecord::Size() const {
         size += SerializeSize(undo_data);
       }
       break;
+    case LogType::kCompensateDestroyPage:
+      // Only ever written at the current version: restored type + body.
+      size += sizeof(uint64_t);
+      size += SerializeSize(undo_data);
+      break;
     case LogType::kBegin:
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertBranch:
@@ -795,6 +822,10 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
       // page, so undo of an aborted destroy restores it exactly.
       e << static_cast<uint64_t>(l.allocated_page_type) << l.undo_data;
       break;
+    case LogType::kCompensateDestroyPage:
+      // Same payload shape as the destroy record: restored type + body.
+      e << static_cast<uint64_t>(l.allocated_page_type) << l.undo_data;
+      break;
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertRow:
     case LogType::kCompensateInsertLeaf:
@@ -863,6 +894,10 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
         d >> l.allocated_page_type;
         d >> l.undo_data;
       }
+      break;
+    case LogType::kCompensateDestroyPage:
+      d >> l.allocated_page_type;
+      d >> l.undo_data;
       break;
     case LogType::kInsertRow:
     case LogType::kInsertLeaf:

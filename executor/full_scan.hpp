@@ -37,8 +37,12 @@ class FullScan : public ExecutorBase {
   FullScan& operator=(const FullScan&) = delete;
   FullScan(FullScan&&) = delete;
   FullScan& operator=(FullScan&&) = delete;
+  // lock_rows marks a DML source scan: the iterator write-intent-locks every
+  // occupied slot before resolving it, so yielded rows carry the head
+  // (newest committed) image rather than the transaction's snapshot image.
   FullScan(Transaction& txn, const Table& table,
-           size_t max_rows = std::numeric_limits<size_t>::max());
+           size_t max_rows = std::numeric_limits<size_t>::max(),
+           bool lock_rows = false, bool wait_for_write_intent = true);
   ~FullScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,

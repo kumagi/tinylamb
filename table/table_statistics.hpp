@@ -81,6 +81,13 @@ class ColumnStats {
   [[nodiscard]] const std::vector<ValueFrequency>& MostCommonValues() const {
     return most_common_values_;
   }
+  // Physical-order correlation in [0,1]: the fraction of adjacent non-NULL
+  // pairs observed in scan order that are non-decreasing. 1.0 means the
+  // column is stored in sorted order (range scans over an index on this
+  // column are mostly sequential heap reads); ~0.5 means random order.
+  // Used by the optimizer to penalize range index scans over unclustered
+  // columns (TODO.md item 1). Never affects correctness.
+  [[nodiscard]] double Correlation() const { return correlation_; }
 
   [[nodiscard]] double EstimateEqual(const Value& value) const;
   [[nodiscard]] double EstimateRange(const std::optional<Value>& lower,
@@ -111,6 +118,7 @@ class ColumnStats {
   std::vector<ValueFrequency> lowest_values_;
   std::vector<ValueFrequency> highest_values_;
   std::vector<ValueFrequency> most_common_values_;
+  double correlation_{1.0};
 };
 
 class TableStatistics {

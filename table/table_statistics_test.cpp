@@ -29,6 +29,8 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -306,6 +308,46 @@ TEST_F(TableStatisticsTest, Serialize_ColumnStats_FitsInOneLeafEntry) {
   encoder << statistics.Column(1);
   constexpr size_t kMaxLeafEntry = kPageBodySize / 6;
   EXPECT_LT(stream.str().size() + 8, kMaxLeafEntry);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, Correlation_SortedAndReverseInput_ReportsExtremes) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, sc1,
+                              db_->GetStatistics(context, "Sc1"));
+  // Sc1.c1 is inserted 0..99 in order: fully clustered.
+  EXPECT_DOUBLE_EQ(sc1.Column(0).Correlation(), 1.0);
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, sc3,
+                              db_->GetStatistics(context, "Sc3"));
+  // Sc3.e1 is inserted 10..1 in reverse: every adjacency decreases.
+  EXPECT_DOUBLE_EQ(sc3.Column(0).Correlation(), 0.0);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, Correlation_RoundTrip_PreservesValue) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, sc3,
+                              db_->GetStatistics(context, "Sc3"));
+  const ColumnStats& column = sc3.Column(0);
+  ASSERT_DOUBLE_EQ(column.Correlation(), 0.0);
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << column;
+  const std::string payload = stream.str();
+
+  // New payloads round-trip the correlation.
+  ASSIGN_OR_ASSERT_FAIL(ColumnStats, decoded, Decode<ColumnStats>(payload));
+  EXPECT_DOUBLE_EQ(decoded.Correlation(), 0.0);
+  EXPECT_EQ(decoded, column);
+
+  // Payloads written before the correlation field (trailing 8-byte double
+  // missing) still decode with the neutral fully-clustered default.
+  ASSIGN_OR_ASSERT_FAIL(
+      ColumnStats, legacy,
+      Decode<ColumnStats>(payload.substr(0, payload.size() - sizeof(double))));
+  EXPECT_DOUBLE_EQ(legacy.Correlation(), 1.0);
+  EXPECT_EQ(legacy.NonNullCount(), column.NonNullCount());
+  EXPECT_EQ(legacy.Distinct(), column.Distinct());
   ASSERT_SUCCESS(context.PreCommit());
 }
 

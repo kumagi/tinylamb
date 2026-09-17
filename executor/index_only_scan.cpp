@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "common/status_or.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "index/index_schema.hpp"
@@ -51,6 +53,7 @@ IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
                              Expression where, const Schema& sc)
     : iter_(table, index, txn, begin_key, end_key, ascending),
       cond_(std::move(where)),
+      cond_conjuncts_(SplitConjuncts(cond_)),
       key_schema_(KeySchema(index, sc)),
       value_schema_(ValueSchema(index, sc)),
       output_schema_(OutputSchema(index, sc)),
@@ -116,11 +119,14 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
       continue;
     }
     if (cond_) {
-      StatusOr<Value> res = cond_->TryEvaluate(*dst, output_schema_);
-      if (!res.HasValue()) {
-        return FailWith(res.GetStatus());
+      StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+          cond_conjuncts_, [&](const Expression& conjunct) {
+            return conjunct->TryEvaluate(*dst, output_schema_);
+          });
+      if (!pass.HasValue()) {
+        return FailWith(pass.GetStatus());
       }
-      if (!res.Value().Truthy()) {
+      if (!pass.Value()) {
         continue;
       }
     }

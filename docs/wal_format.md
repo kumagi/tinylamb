@@ -51,6 +51,11 @@ See `LogType` in `recovery/log_record.hpp` for the full list.
   truncates or replays from the last completed checkpoint (see
   `docs/recovery_invariants.md`).
 - **kSystemAllocPage / kSystemDestroyPage** — page allocation/destruction.
+- **kCompensateDestroyPage** — CLR for a destroy undo. Carries the same
+  payload shape as `kSystemDestroyPage` (restored page type + full body
+  image); its REDO re-installs that image.  Without it a crash after an
+  aborted `DROP TABLE` would replay only the destroy and leave the
+  resurrected catalog entry pointing at a free page.
 
 ## Durability
 

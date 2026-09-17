@@ -591,6 +591,10 @@ Status Database::RefreshStatistics(TransactionContext& ctx,
 
 void Database::EmulateCrash() { storage_->DiscardAllUpdates(); }
 
+StatusOr<lsn_t> Database::WriteCheckpoint() {
+  return storage_->cm_->WriteCheckpoint();
+}
+
 void Database::RemoveCreatedDatabaseFiles() {
   std::unordered_set<std::string> names;
   {

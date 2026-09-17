@@ -3273,11 +3273,16 @@ TEST_F(OptimizerTest, UpdateOverParallelScanStaysCorrect) {
   ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
   const Plan& plan = plan_or.Value();
 
-  // Act: emit the mutation source and check it is a ParallelScan.
+  // Act: emit the mutation source. A DML source must acquire a write
+  // intent and re-resolve each row's committed head; the morsel-based
+  // ParallelScan has no such hook, so the plan stays on the single-threaded
+  // FullScan even for an analyzed big table.
   Executor source = plan->EmitExecutor(context);
   std::ostringstream physical;
   source->Dump(physical, 0);
-  EXPECT_NE(physical.str().find("ParallelScan"), std::string::npos)
+  EXPECT_NE(physical.str().find("FullScan"), std::string::npos)
+      << physical.str();
+  EXPECT_EQ(physical.str().find("ParallelScan"), std::string::npos)
       << physical.str();
   const auto table_or = (context.GetTable(kTable));
   ASSERT_EQ(table_or.GetStatus(), Status::kSuccess);
@@ -3636,6 +3641,194 @@ TEST(HashJoinKindTest, NullAwareAntiJoinDropsNullProbeButKeepsUnmatchedValue) {
   ASSERT_TRUE(join.Next(&row, nullptr));
   EXPECT_EQ(row[0], Value(1));
   EXPECT_FALSE(join.Next(&row, nullptr));
+}
+
+namespace {
+
+// TODO.md item 1d end-to-end: TopnDim(id PRIMARY KEY, val) and
+// TopnFact(id, dim_id, payload) with every fact.dim_id present in dim.id.
+// Returns the fact ids of ORDER BY TopnFact.id LIMIT 5 over the inner join.
+std::vector<int64_t> RunTopNOneToOneJoin(Database* db, bool disable_rule,
+                                         std::string* plan_dump) {
+  QueryData query{
+      {"TopnFact", "TopnDim"},
+      BinaryExpressionExp(ColumnValueExp(ColumnName("TopnFact", "dim_id")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("TopnDim", "id"))),
+      {NamedExpression("id", ColumnValueExp(ColumnName("TopnFact", "id")))}};
+  query.order_expressions_.push_back(
+      ColumnValueExp(ColumnName("TopnFact", "id")));
+  query.order_ascending_.push_back(true);
+  query.limit_count_ = 5;
+  TransactionContext context = db->BeginContext();
+  const Status rewrite_status = query.Rewrite(context);
+  EXPECT_EQ(rewrite_status, Status::kSuccess);
+  if (rewrite_status != Status::kSuccess) {
+    return {};
+  }
+  OptimizerOptions options = OptimizerOptions::Default();
+  if (disable_rule) {
+    EXPECT_TRUE(options.relational_rules.Remove(
+        "topn_push_through_proven_one_to_one_join"));
+  }
+  auto plan_or = Optimizer::Optimize(query, context, options);
+  EXPECT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  if (plan_or.GetStatus() != Status::kSuccess) {
+    return {};
+  }
+  if (plan_dump != nullptr) {
+    std::ostringstream dump;
+    plan_or.Value()->Dump(dump, 0);
+    *plan_dump = dump.str();
+  }
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  std::vector<int64_t> ids;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ids.push_back(row[0].value.int_value);
+  }
+  EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+  return ids;
+}
+
+void BuildTopNOneToOneTables(Database* db) {
+  TransactionContext writer = db->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, dim,
+      db->CreateTable(
+          writer,
+          Schema("TopnDim", {Column("id", ValueType::kInt64,
+                                    Constraint(Constraint::kPrimaryKey)),
+                             Column("val", ValueType::kInt64)})));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, fact,
+      db->CreateTable(
+          writer, Schema("TopnFact", {Column("id", ValueType::kInt64),
+                                      Column("dim_id", ValueType::kInt64),
+                                      Column("payload", ValueType::kInt64)})));
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_SUCCESS(
+        dim.Insert(writer.txn_, Row({Value(i), Value(i * 100)})).GetStatus());
+  }
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_SUCCESS(
+        fact.Insert(writer.txn_, Row({Value(i), Value(i % 10), Value(i * 3)}))
+            .GetStatus());
+  }
+  ASSERT_SUCCESS(writer.PreCommit());
+}
+
+}  // namespace
+
+TEST_F(OptimizerTest, TopNPushThroughSnapshotProvenOneToOneJoin) {
+  BuildTopNOneToOneTables(rs_.get());
+  const std::vector<int64_t> expected{0, 1, 2, 3, 4};
+  std::string plan_dump;
+  EXPECT_EQ(RunTopNOneToOneJoin(rs_.get(), /*disable_rule=*/false, &plan_dump),
+            expected);
+  EXPECT_NE(plan_dump.find("TopN"), std::string::npos) << plan_dump;
+  // The same rows come back with the rule disabled: the push is a pure
+  // performance alternative, never a semantic change.
+  EXPECT_EQ(RunTopNOneToOneJoin(rs_.get(), /*disable_rule=*/true, nullptr),
+            expected);
+}
+
+TEST_F(OptimizerTest, TopNPushSkippedWhenReferentialIntegrityFails) {
+  BuildTopNOneToOneTables(rs_.get());
+  // An unmatched key and a NULL key sort first, so an unsound push of
+  // TopN(5) below the join would surface them (or truncate the output to
+  // 3-4 rows). The snapshot proof must fail and the join must drop them.
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
+                          writer.GetTable("TopnFact"));
+    ASSERT_SUCCESS(
+        fact->Insert(writer.txn_, Row({Value(-1), Value(999), Value(7)}))
+            .GetStatus());
+    ASSERT_SUCCESS(
+        fact->Insert(writer.txn_, Row({Value(-2), Value(), Value(8)}))
+            .GetStatus());
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  const std::vector<int64_t> expected{0, 1, 2, 3, 4};
+  EXPECT_EQ(RunTopNOneToOneJoin(rs_.get(), /*disable_rule=*/false, nullptr),
+            expected);
+  EXPECT_EQ(RunTopNOneToOneJoin(rs_.get(), /*disable_rule=*/true, nullptr),
+            expected);
+}
+
+TEST_F(OptimizerTest, ClusteringPenaltySteersWideRangeScanChoice) {
+  // TODO.md item 1b: two 2000-row tables with an index on key, one inserted
+  // in order (correlation 1.0) and one fully reversed (correlation 0.0).
+  // A 60% range costs 1200 heap rows clustered (index wins over the 2000-row
+  // full scan) but 1200 x 3.0 = 3600 unclustered (full scan wins).
+  constexpr int64_t kRows = 2000;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, clust,
+        rs_->CreateTable(
+            writer,
+            Schema("ClustKeys", {Column("key", ValueType::kInt64),
+                                 Column("payload", ValueType::kInt64)})));
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, unclust,
+        rs_->CreateTable(
+            writer,
+            Schema("UnclustKeys", {Column("key", ValueType::kInt64),
+                                   Column("payload", ValueType::kInt64)})));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_SUCCESS(
+          clust.Insert(writer.txn_, Row({Value(i), Value(i)})).GetStatus());
+      ASSERT_SUCCESS(
+          unclust.Insert(writer.txn_, Row({Value(kRows - 1 - i), Value(i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(writer, "ClustKeys", IndexSchema("ClustIdx", {0})));
+    ASSERT_SUCCESS(rs_->CreateIndex(writer, "UnclustKeys",
+                                    IndexSchema("UnclustIdx", {0})));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  {
+    TransactionContext stats_ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, "ClustKeys"));
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, "UnclustKeys"));
+    ASSERT_SUCCESS(stats_ctx.PreCommit());
+  }
+  auto plan_for = [&](std::string_view table) {
+    QueryData query{
+        {std::string(table)},
+        BinaryExpressionExp(
+            BinaryExpressionExp(ColumnValueExp("key"),
+                                BinaryOperation::kGreaterThanEquals,
+                                ConstantValueExp(Value(int64_t{200}))),
+            BinaryOperation::kAnd,
+            BinaryExpressionExp(ColumnValueExp("key"),
+                                BinaryOperation::kLessThan,
+                                ConstantValueExp(Value(int64_t{1400})))),
+        {NamedExpression("key"), NamedExpression("payload")}};
+    TransactionContext context = rs_->BeginContext();
+    EXPECT_EQ(query.Rewrite(context), Status::kSuccess);
+    auto plan_or = Optimizer::Optimize(query, context);
+    EXPECT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    std::ostringstream dump;
+    dump << plan_or.Value();
+    size_t rows = 0;
+    Executor executor = plan_or.Value()->EmitExecutor(context);
+    Row row;
+    while (executor->Next(&row, nullptr)) {
+      ++rows;
+    }
+    EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+    return std::make_pair(dump.str(), rows);
+  };
+  const auto [clust_dump, clust_rows] = plan_for("ClustKeys");
+  EXPECT_NE(clust_dump.find("IndexScan"), std::string::npos) << clust_dump;
+  EXPECT_EQ(clust_rows, 1200U);
+  const auto [unclust_dump, unclust_rows] = plan_for("UnclustKeys");
+  EXPECT_NE(unclust_dump.find("FullScan"), std::string::npos) << unclust_dump;
+  EXPECT_EQ(unclust_rows, 1200U);
 }
 
 }  // namespace tinylamb

@@ -78,24 +78,26 @@ bool IndexScanIterator::StoredAsSingleValue() const {
 
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
                                      Transaction& txn, const Value& begin,
-                                     const Value& end, bool ascending)
+                                     const Value& end, bool ascending,
+                                     bool resolve_head)
     : IndexScanIterator(
           table, index, txn,
           begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
           end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
-          ascending) {}
+          ascending, resolve_head) {}
 
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
                                      Transaction& txn,
                                      const std::vector<Value>& begin_key,
                                      const std::vector<Value>& end_key,
-                                     bool ascending)
+                                     bool ascending, bool resolve_head)
     : table_(table),
       index_(index),
       txn_(txn),
       begin_(FirstOrNull(begin_key)),
       end_(FirstOrNull(end_key)),
       ascending_(ascending),
+      resolve_head_(resolve_head),
       is_unique_(index.StoresSingleValue()),
       bpt_(index.Root()),
       iter_(&bpt_, &txn, EncodeParts(begin_key), EncodeEndParts(index, end_key),
@@ -210,7 +212,8 @@ void IndexScanIterator::ResolveRow() const {
     current_row_resolved_ = true;
     return;
   }
-  StatusOr<std::string_view> row = ref.Value()->Read(txn_, pos_.slot);
+  StatusOr<std::string_view> row =
+      ref.Value()->Read(txn_, pos_.slot, resolve_head_);
   if (!row.HasValue()) {
     current_row_.Clear();
     current_row_resolved_ = true;
@@ -286,6 +289,14 @@ IteratorBase& IndexScanIterator::operator--() {
   if (!IsValid()) {
     return *this;
   }
+  // NOTE: despite the name, operator-- on a descending scan steps toward
+  // SMALLER keys, the same direction as operator++ (see ScanDescending /
+  // NonUniqueDescending tests, which walk a DESC scan with --it from the
+  // upper bound down to the lower bound).  The two operators are not
+  // inverses here: ++ advances the scan in its iteration order and --
+  // retreats one step in scan order, and for a DESC scan both move toward
+  // smaller keys.  Do not "fix" this into a mirror of operator++ without
+  // updating those tests and every caller that relies on it.
   if (StoredAsSingleValue()) {
     --iter_;
   } else {

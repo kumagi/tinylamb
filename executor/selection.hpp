@@ -52,6 +52,10 @@ class Selection : public ExecutorBase {
 
  private:
   Expression exp_;
+  // Top-level conjuncts of `exp_`, kept so the row-wise fallback can apply
+  // commutative WHERE semantics (executor/detail/scan_filter.hpp) when the
+  // whole-predicate evaluators cannot run or raise mid-batch.
+  std::vector<Expression> conjuncts_;
   Schema schema_;
   Executor src_;
   DataChunk input_batch_;
