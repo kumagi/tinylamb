@@ -1,0 +1,4 @@
+{
+  "name": "tinylamb",
+  "install": "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential cmake ninja-build clang clang-format libstdc++-14-dev postgresql-client curl git ca-certificates"
+}
