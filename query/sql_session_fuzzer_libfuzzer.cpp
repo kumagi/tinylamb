@@ -2,11 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "query/sql_session_fuzzer.hpp"
 
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
-  tinylamb::SessionFuzzTry(data, size, false);
+  tinylamb::SessionFuzzTry(data, size,
+                           std::getenv("TINYLAMB_SESSION_VERBOSE") != nullptr);
   return 0;
 }

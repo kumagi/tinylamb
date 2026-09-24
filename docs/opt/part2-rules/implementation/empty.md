@@ -5,7 +5,7 @@
 
 ## 概要
 
-論理式 `kEmpty`（0 行確定のリレーション演算子）を、子プランの出力スキーマを保持したまま何も出力しない物理プラン `EmptyPlan`（文字列表現 `EmptyResult`）として具現化する Rule です。
+論理式 `kEmpty`（0 行確定のリレーション演算子）を、子プランの出力スキーマを保持したまま何も出力しない物理プラン `EmptyPlan`（文字列表現 `EmptyResult`）として変換する Rule です。
 
 論理最適化において結果が常に 0 行になると確定した部分木に対し、実行コスト 0 かつ推定行数 0 の物理ノードを割り当てることで、下位のテーブルスキャンや結合処理を完全に消去します。
 
@@ -83,17 +83,17 @@ return std::vector<PlanAlternative>{PlanAlternative{
 
 0 行確定の部分木について、ストレージ読み込みや演算子処理のコストを完全に排除します。
 
-さらに、推定行数 `0` は親演算子（結合や集合演算など）のコスト計算にも直ちに波及し、結合の相手側リレーションの読み込み無駄を抑制するなどの強力な枝刈り効果をもたらします。
+さらに、推定行数 `0` は親演算子（結合や集合演算など）のコスト計算にも伝わります。これにより、結合相手のリレーションを不要に読み込む候補を枝刈りできます。
 
 ## 関連 Rule との相互作用
 
 - `join_on_false_to_empty`: ON 句が定数 FALSE / NULL である結合を `kEmpty` に変換する論理 Rule です。
 - `join_empty_simplification`: 空のリレーションを含む結合を空に簡約する論理 Rule です。
 - `setop_empty_simplification`: 空の入力を含む集合演算を簡約する論理 Rule です。
-- `selection`: 定数 FALSE / NULL の選択述語を直接 `EmptyPlan` に具現化するショートカット経路を保持しています。
+- `selection`: 定数 FALSE / NULL の選択述語を直接 `EmptyPlan` に変換するショートカット経路を保持しています。
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp` の `OptimizerTest.ConstantFalseSelectionBecomesEmptyPlan`: 定数 FALSE の選択述語が `EmptyPlan` に具現化され、下位の `FullScanPlan` が除去されることを検証。
+- `plan/optimizer_test.cpp` の `OptimizerTest.ConstantFalseSelectionBecomesEmptyPlan`: 定数 FALSE の選択述語が `EmptyPlan` に変換され、下位の `FullScanPlan` が除去されることを検証。
 - `plan/optimizer_test.cpp` の `OptimizerTest.ContradictoryConjunctsBecomeEmptyResult`: 矛盾する AND 条件が `EmptyResult` として計画されることを検証。
 - `plan/cascades_test.cpp` の `CascadesTest.JoinEmptySimplification`: 空リレーションを含む結合の論理簡約を検証。

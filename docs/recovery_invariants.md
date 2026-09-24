@@ -6,7 +6,9 @@ After crash or `Database::EmulateCrash()` + reopen:
    rolled back.
    Abort chains carry the same terminator record recovery classifies commits
    by (`LogType::kCommit`), so `TransactionManager::Abort` appends it only
-   after the undo walk compensated the whole chain. A partially compensated
+   after the undo walk compensated the whole chain. Every CLR records the
+   original record's `prev_lsn` as its undo-next pointer, so a crash during a
+   multi-step abort resumes at the first uncompensated predecessor. A partially compensated
    chain stays un-terminated and is finished by the restart loser-undo
    (idempotent through the `page_lsn` guard in `UndoLoserChains`); appending
    the terminator unconditionally would resurrect the uncompensated tail as
@@ -17,6 +19,14 @@ After crash or `Database::EmulateCrash()` + reopen:
    from the minimum `rec_lsn` among active pages or the checkpoint, whichever is
    earlier.
 5. **Catalog** table/index metadata matches row pages after redo completes.
+6. **Recycled WAL never holds a needed record**: after a durable checkpoint
+   the log is truncated by whole segments (see `docs/wal_format.md`), and
+   every consumer -- redo from the DPT, loser-chain undo, torn-tail
+   truncation, runtime abort walks -- stays at or above the retained start
+   because the recycle floor is the minimum over (checkpoint begin LSN,
+   oldest DPT recLSN, oldest active transaction's first LSN, oldest
+   unsynced full-page image). A torn data-file page rebuilds from its
+   retained `kFullPageImage` record plus the deltas above it.
 
 ## Idempotent redo/undo (D2, `docs/design.md`)
 
@@ -72,6 +82,21 @@ Startup → read checkpoint LSN
 ## Testing
 
 - Unit: `recovery_manager_test`, `checkpoint_manager_test`, `logger_test`.
+- Segmented WAL / recycling / FPW: `recovery_extra_test`
+  (`WalRollsAcrossSegmentsAndReadsBack`, `LegacySingleFileLogMigratesToSegments`,
+  `CheckpointRecyclesOldSegmentsAndRestarts`,
+  `TornPageRebuildsFromFullPageImageAfterRecycle`,
+  `TornWalTailAcrossSegmentsTruncatesWithForce`,
+  `WholeWalReplaysWhenNoCheckpointExisted`).
+- Torn-tail auto-truncation (safe classes) and `--force`:
+  `HalfWrittenRecordAutoTruncatesWithoutForce`,
+  `ZeroFilledTailAutoTruncatesWithoutForce`,
+  `CorruptTailAbortsByDefault`, `ForceRecoversFromCorruptTail`.
+- Commit visibility under concurrent checkpoints (ATT-classification race
+  regression): `DatabaseExtraTest.CommittedRowsSurviveCrashDuringCheckpointStorm`.
+- Checkpoint worker lifecycle (`Start()` gating, interval 0 disabled):
+  `CheckpointTest.WorkerStaysParkedUntilStart`,
+  `CheckpointTest.ZeroIntervalDisablesPeriodicCheckpointing`.
 - Idempotence / destroy (D2/D3): `LoserUndoSurvivesRepeatedRecoveryPasses`,
   `DestroyPageRedoInitializesFreePageAndRebuildsList`,
   `DestroyPageRedoTwiceOnSamePageIsIdempotent`,

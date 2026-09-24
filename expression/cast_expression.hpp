@@ -32,6 +32,10 @@ class CastExpression : public ExpressionBase {
   [[nodiscard]] StatusOr<Value> TryEvaluate(
       const Row& row, const Schema& schema,
       EvaluationContext& context) const override;
+  // Applies the cast step to an already-evaluated child value — the
+  // vectorized path evaluates the child once per batch and needs the cast
+  // without re-resolving the child expression against a synthetic schema.
+  [[nodiscard]] StatusOr<Value> TryCast(const Value& value) const;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;

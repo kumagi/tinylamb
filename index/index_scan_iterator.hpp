@@ -20,9 +20,11 @@
 #include <cstdint>
 #include <vector>
 
+#include "common/incarnation.hpp"
 #include "index/b_plus_tree.hpp"
 #include "index/b_plus_tree_iterator.hpp"
 #include "table/iterator_base.hpp"
+#include "transaction/transaction_manager.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -38,13 +40,16 @@ class IndexScanIterator : public IteratorBase {
   // unstaged write intent on it.  Plain scans keep the default (pure
   // snapshot read) so an intent left by an earlier DML statement cannot
   // leak a post-snapshot commit into a SELECT.
-  IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
-                    const Value& begin = Value(), const Value& end = Value(),
-                    bool ascending = true, bool resolve_head = false);
-  IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
-                    const std::vector<Value>& begin_key,
-                    const std::vector<Value>& end_key, bool ascending = true,
-                    bool resolve_head = false);
+  IndexScanIterator(
+      const Table& table, const Index& index, Transaction& txn,
+      const Value& begin = Value(), const Value& end = Value(),
+      bool ascending = true, bool resolve_head = false,
+      TransactionManager::IndexReadGuard* index_read_guard = nullptr);
+  IndexScanIterator(
+      const Table& table, const Index& index, Transaction& txn,
+      const std::vector<Value>& begin_key, const std::vector<Value>& end_key,
+      bool ascending = true, bool resolve_head = false,
+      TransactionManager::IndexReadGuard* index_read_guard = nullptr);
   IndexScanIterator(const IndexScanIterator&) = delete;
   IndexScanIterator(IndexScanIterator&&) = delete;
   IndexScanIterator& operator=(const IndexScanIterator&) = delete;
@@ -95,6 +100,8 @@ class IndexScanIterator : public IteratorBase {
   // -1 means "not positioned"; otherwise an index into the non-unique
   // value list of the current key. Signed so the sentinel cannot wrap.
   int64_t value_offset_{-1};
+  TableLease table_lease_;
+  TransactionManager::IndexReadGuard index_read_lock_;
   BPlusTree bpt_;
   BPlusTreeIterator iter_;
   RowPosition pos_;

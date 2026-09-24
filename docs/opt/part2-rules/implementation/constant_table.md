@@ -5,9 +5,9 @@
 
 ## 概要
 
-論理式 `kConstantTable`（定数テーブル葉）を物理プランとして具現化する Rule です。
+論理式 `kConstantTable`（定数テーブル葉）を物理プランとして変換する Rule です。
 
-行リテラル群を保持する一般的な定数テーブルを `ValuesPlan` に変換するパスと、`count_star_without_group_rewrite` によって生成された `COUNT(*)` 特化の定数テーブルを「実テーブルのフルスキャン + ハッシュ集約」に具現化するパスの 2 つを持ちます。`COUNT(*)` 形式においてカタログ統計から静的に値を確定させるのではなく、トランザクション可視の実テーブルを走査して正しく行数を計数する点が意味論的保証の核心です。
+行リテラル群を保持する一般的な定数テーブルを `ValuesPlan` に変換するパスと、`count_star_without_group_rewrite` によって生成された `COUNT(*)` 特化の定数テーブルを「実テーブルのフルスキャン + ハッシュ集約」に変換するパスの 2 つを持ちます。`COUNT(*)` 形式においてカタログ統計から静的に値を確定させるのではなく、トランザクション可視の実テーブルを走査して正しく行数を計数する点が意味論的保証の核心です。
 
 ## 変換前後の関係
 
@@ -49,7 +49,7 @@ if (logical.values.empty() && !logical.table.empty()) {
 
 本 Rule の設計において最も重要な論点は、A のパスにおける「カタログ統計の即値マテリアライズ禁止」という規律です。
 
-論理最適化層の `count_star_without_group_rewrite` は、`SELECT COUNT(*) FROM t` のような単純集約を Memo 上で扱いやすくするために `kConstantTable` 葉ノードへと変換します。このとき、オプティマイザが「カタログ統計の `statistics->Rows()` をそのまま 1 行の定数値として返却する」物理プランを作ってしまうと、直近のトランザクションによる未コミットの INSERT / DELETE や、統計更新前の変更が反映されず、トランザクション分離レベルおよび ACID 特性を根本から破壊します。
+論理最適化層の `count_star_without_group_rewrite` は、`SELECT COUNT(*) FROM t` のような単純集約を Memo で扱いやすくするため、`kConstantTable` 葉ノードへ変換します。ただし、カタログ統計の `statistics->Rows()` を 1 行の定数として返す物理プランを作ってはいけません。その値には、直近のトランザクションによる未コミットの INSERT / DELETE や、統計更新後の変更が反映されず、トランザクション分離の要件を満たせないためです。
 
 ```cpp
 // COUNT(*) is rewritten to this leaf for optimizer purposes, but
@@ -58,7 +58,7 @@ if (logical.values.empty() && !logical.table.empty()) {
 // INSERT/DELETE, so materializing the count from them is wrong.
 ```
 
-したがって、物理具現化においては必ず実テーブルに対する `FullScanPlan` を構築し、実行器（エグゼキュータ）が現在のトランザクションから可視であるタプルを 1 パス走査して計数するプランを強制します。
+したがって、物理化においては必ず実テーブルに対する `FullScanPlan` を構築し、実行器（エグゼキュータ）が現在のトランザクションから可視であるタプルを 1 パス走査して計数するプランを強制します。
 
 B のパス（行リテラル）に関しては、メモリ上に保持された定数値タプルをそのまま出力するため、行位置要求を持たないこと（定数セルには物理ページ内の行位置が存在しない）のみが整合性の条件となります。
 
@@ -109,7 +109,7 @@ return std::vector<PlanAlternative>{
 
 - `count_star_without_group_rewrite`: `COUNT(*)` 集約を `kConstantTable` へ書き換える論理 Rule であり、本 Rule の A のパスへの入力を供給します。
 - `aggregation`: 通常の集約を担当する物理実装 Rule です。インデックスが存在する場合は、`index_scan` によるインデックスオンリースキャンを経由した集約が本 Rule のフルスキャンよりも低コストと評価されて採用されることがあります。
-- `values`: `kValues` 論理演算子を `ValuesPlan` に具現化する兄弟実装 Rule です。
+- `values`: `kValues` 論理演算子を `ValuesPlan` に変換する兄弟実装 Rule です。
 
 ## 検証テスト
 

@@ -19,6 +19,7 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/in_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "type/schema.hpp"
@@ -42,6 +43,45 @@ ValueType ValueTypeFor(const Type& type) {
     default:
       return ValueType::kNull;
   }
+}
+
+ExpressionRuleSet MakeValueRules(const ExpressionRuleSet& base_rules) {
+  ExpressionRuleSet rules = base_rules;
+  rules.Remove("inner_join_not_null_inference");
+  // Truthiness-preserving collapses (x AND TRUE -> x, x OR x -> x,
+  // NOT NOT x -> x, ...) are only sound where the result is consumed as a
+  // predicate.  As a *value* the AST always normalizes these to
+  // BOOLEAN (or NULL), while the collapsed operand may carry -1, "abc",
+  // etc. (oracle-found: `(-1 OR -1)` -> AST TRUE, VM -1).
+  for (const char* name :
+       {"boolean_identity", "double_negation", "xor_boolean_identity",
+        "and_idempotent", "or_idempotent", "absorption_and", "absorption_or",
+        "absorption_and_reversed", "absorption_or_reversed",
+        "factor_or_common_and", "boolean_filter_pullup",
+        // Neutral-constant identities drop the 0/1.0 operand, which
+        // erases the INT64<->DOUBLE promotion the AST applies for
+        // mixed-type arithmetic (`CASE..THEN 1.0..END * i` stays IEEE
+        // double in the reference but becomes a checked INT64 kernel
+        // after the fold).  Where both sides are statically INT64 the
+        // kernel is identical anyway, so dropping the fold only gives
+        // up work the VM can do at full speed.
+        "identity_add_zero", "identity_subtract_zero", "identity_multiply_one",
+        "identity_divide_one"}) {
+    rules.Remove(name);
+  }
+  return rules;
+}
+
+const ExpressionRuleSet& DefaultValueRules() {
+  static const ExpressionRuleSet rules =
+      MakeValueRules(ExpressionRuleSet::Default());
+  return rules;
+}
+
+const ExpressionRuleSet& NotComparisonValueRules() {
+  static const ExpressionRuleSet rules =
+      MakeValueRules(NotComparisonFreeRules());
+  return rules;
 }
 
 std::optional<BytecodeOp> BinaryOpcode(ValueType type) {
@@ -155,6 +195,15 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
                          right_type == ValueType::kVarChar)) {
         return false;
       }
+      // A kNull static type means BOOLEAN (or genuinely untyped NULL) on
+      // one side.  The AST treats numeric-with-bool arithmetic as a mixed
+      // numeric promotion and evaluates it in IEEE DOUBLE (never raising
+      // integer overflow), while a typed kernel here would add in the
+      // operand's own domain and raise at a different boundary.
+      if (arithmetic &&
+          (left_type == ValueType::kNull || right_type == ValueType::kNull)) {
+        return false;
+      }
       const std::optional<BytecodeOp> opcode = BinaryOpcode(operand_type);
       if (!opcode.has_value()) {
         return false;
@@ -162,6 +211,27 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       program->AddInstruction(
           {.opcode = *opcode, .operand = 0, .binary = binary.Op()});
       return true;
+    }
+    case TypeTag::kInExp: {
+      // `x IN (a, b, ...)` compiles to the equivalent OR-of-equalities
+      // chain.  The VM's binary instruction dispatches through the same
+      // canonical evaluator the AST uses, so NULL and NaN semantics are
+      // identical; any operand the compiler cannot lower (subqueries,
+      // unsupported functions) fails compilation and the caller falls back
+      // to the AST evaluator.
+      const InExpression& in = expression->AsInExpression();
+      if (in.list_.empty()) {
+        return false;
+      }
+      Expression expanded = BinaryExpressionExp(
+          in.child_, BinaryOperation::kEquals, in.list_.back());
+      for (size_t i = in.list_.size() - 1; i-- > 0;) {
+        expanded = BinaryExpressionExp(
+            BinaryExpressionExp(in.child_, BinaryOperation::kEquals,
+                                in.list_[i]),
+            BinaryOperation::kOr, expanded);
+      }
+      return CompileNode(expanded, schema, program);
     }
     case TypeTag::kUnaryExp: {
       const UnaryExpression& unary = expression->AsUnaryExpression();
@@ -194,27 +264,18 @@ std::optional<BytecodeProgram> BytecodeCompiler::Compile(
   try {
     // Mirror the optimizer's split: the not-inference rule turns NULL into
     // FALSE, so it is only sound in filter contexts (see plan/optimizer.cpp).
-    ExpressionRuleSet rules =
+    const ExpressionRuleSet& base_rules =
         ContainsNotOfOrderedDoubleComparison(expression, schema)
             ? NotComparisonFreeRules()
             : ExpressionRuleSet::Default();
+    const ExpressionRuleSet* rules = &base_rules;
     if (context == Context::kValue) {
-      rules.Remove("inner_join_not_null_inference");
-      // Truthiness-preserving collapses (x AND TRUE -> x, x OR x -> x,
-      // NOT NOT x -> x, ...) are only sound where the result is consumed as
-      // a predicate.  As a *value* the AST always normalizes these to
-      // BOOLEAN (or NULL), while the collapsed operand may carry -1, "abc",
-      // etc. (oracle-found: `(-1 OR -1)` -> AST TRUE, VM -1).
-      for (const char* name :
-           {"boolean_identity", "double_negation", "xor_boolean_identity",
-            "and_idempotent", "or_idempotent", "absorption_and",
-            "absorption_and_reversed", "absorption_or",
-            "absorption_or_reversed", "factor_or_common_and",
-            "boolean_filter_pullup"}) {
-        rules.Remove(name);
-      }
+      rules = (&base_rules) == &ExpressionRuleSet::Default()
+                  ? &DefaultValueRules()
+                  : &NotComparisonValueRules();
     }
-    ExpressionRewriter rewriter(rules);
+    ExpressionRewriter rewriter(*rules);
+
     rewriter.set_schema(&schema);
     StatusOr<Expression> folded_or = rewriter.TryRewrite(expression);
     if (!folded_or.HasValue()) {
@@ -321,7 +382,11 @@ ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
 }
 
 StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
-  std::vector<Value> stack;
+  // The interpreter has no call instruction, so evaluation cannot re-enter
+  // this function; reusing one stack per thread removes a heap allocation
+  // per row on the hot aggregation/filter paths.
+  thread_local std::vector<Value> stack;
+  stack.clear();
   stack.reserve(instructions_.size());
   for (size_t pc = 0; pc < instructions_.size(); ++pc) {
     const BytecodeInstruction& instruction = instructions_[pc];

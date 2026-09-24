@@ -18,6 +18,7 @@
 #define TINYLAMB_BINARY_EXPRESSION_HPP
 
 #include <memory>
+#include <string_view>
 #include <utility>
 
 #include "expression/expression.hpp"
@@ -34,6 +35,14 @@ class EvaluationContext;
                                                 const Value& right);
 [[nodiscard]] Value EvaluateBinary(BinaryOperation operation, const Value& left,
                                    const Value& right);
+
+// True when the string carries none of the shape markers that trigger the
+// semantic comparison fallbacks — interval text and timestamp strings always
+// contain a space (or a 'T'-separator at offset 10 for the compact form), and
+// structured JSON is '{'...'}'.  For such strings the SQL comparison reduces
+// to byte comparison.  Shared by the TryEvaluateBinary fast path and the
+// scan-filter simple-predicate compiler.
+[[nodiscard]] bool PlainStringComparable(std::string_view s);
 
 // Lowercases ASCII letters; the fold applied by case-insensitive collation
 // comparisons ('und:ci').

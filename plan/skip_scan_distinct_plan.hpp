@@ -45,6 +45,10 @@ class SkipScanDistinctPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   [[nodiscard]] bool EnforcesDistinct() const override { return true; }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;

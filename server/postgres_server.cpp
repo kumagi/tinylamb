@@ -163,14 +163,22 @@ class PostgresServer::Impl {
         Database::Create(database_path);
     if (created.HasValue()) {
       database_ = created.MoveValue();
+      // Production default: wait-die. The manager's kLegacy policy aborts a
+      // conflicting writer after a 5 ms bounded wait, which under concurrent
+      // OLTP load turns transient row contention into abort storms; wait-die
+      // is deadlock-free by construction and only dies the younger waiter.
+      // The kLegacy default stays for the deterministic fuzz/test harnesses.
+      database_->SetDeadlockPolicy(Database::DeadlockPolicy::kWaitDie);
     } else {
       startup_error_ = "failed to open database " + database_path + ": " +
                        ToString(created.GetStatus());
     }
     read_worker_count_ = options_.read_worker_threads;
     if (read_worker_count_ == 0) {
+      constexpr size_t kMaxReadWorkers = 16;
       read_worker_count_ =
-          std::max<size_t>(1, std::thread::hardware_concurrency());
+          std::min(kMaxReadWorkers,
+                   std::max<size_t>(1, std::thread::hardware_concurrency()));
     }
   }
 
@@ -978,25 +986,36 @@ class PostgresServer::Impl {
         FailStatement(client, automatic, implicit, error, "42601");
         return false;
       }
-      QueryResult result = std::move(executed.Value());
-      if (!result.Statement()) {
+      // `result` keeps the statement executor alive, and that executor
+      // points back at `context`.  FailStatement() frees the context (it
+      // resets client.transaction), so the result must die BEFORE any
+      // failure path runs or the executor destructor reads freed memory
+      // (ASan: use-after-free in RelationalExecutor::~RelationalExecutor).
+      std::optional<QueryResult> result;
+      result.emplace(std::move(executed.Value()));
+      if (!result->Statement()) {
+        result.reset();
         FailStatement(client, automatic, implicit,
                       "SQL statement type is unavailable", "XX000");
         return false;
       }
-      const StatementType type = *result.Statement();
+      const StatementType type = *result->Statement();
       if (type == StatementType::kSelect) {
-        StatusOr<std::string> wire = StreamSelectResult(result);
+        StatusOr<std::string> wire = StreamSelectResult(*result);
         if (!wire.HasValue()) {
+          result.reset();
           FailStatement(client, automatic, implicit,
                         wire.GetStatus().GetMessage(), "XX000");
           return false;
         }
         Queue(client, wire.MoveValue());
       } else {
-        Queue(client,
-              pgwire::CommandComplete(CommandTag(type, result.AffectedRows())));
+        Queue(client, pgwire::CommandComplete(
+                          CommandTag(type, result->AffectedRows())));
       }
+      // Tear the executor (and its pins/read-set) down before committing so
+      // FailStatement/PreCommit below can never outlive their context.
+      result.reset();
       if (automatic) {
         // Standalone statement in a transaction-control message: legacy
         // commit-per-statement behavior.
@@ -1133,6 +1152,23 @@ class PostgresServer::Impl {
                          const std::vector<std::string>& statements) {
     client.read_query_in_flight = true;
     client.read_started_at = std::chrono::steady_clock::now();
+    if (read_workers_.empty()) {
+      std::string response;
+      try {
+        response = ExecuteReadTask(statements);
+      } catch (const std::exception& exception) {
+        response = pgwire::ErrorResponse(
+            std::string("read worker failed: ") + exception.what(), "XX000");
+        response += pgwire::ReadyForQuery('I');
+      } catch (...) {
+        response =
+            pgwire::ErrorResponse("read worker failed: unknown error", "XX000");
+        response += pgwire::ReadyForQuery('I');
+      }
+      client.read_query_in_flight = false;
+      Queue(client, response);
+      return;
+    }
     {
       std::scoped_lock lock(read_task_mutex_);
       read_tasks_.push_back({client.fd, client.id, statements});
@@ -1146,7 +1182,12 @@ class PostgresServer::Impl {
     }
     read_workers_.reserve(read_worker_count_);
     for (size_t i = 0; i < read_worker_count_; ++i) {
-      read_workers_.emplace_back([this] { ReadWorkerLoop(); });
+      try {
+        read_workers_.emplace_back([this] { ReadWorkerLoop(); });
+      } catch (...) {
+        read_worker_count_ = read_workers_.size();
+        break;
+      }
     }
   }
 

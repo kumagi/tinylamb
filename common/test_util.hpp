@@ -17,7 +17,14 @@
 #ifndef TINYLAMB_TEST_UTIL_HPP
 #define TINYLAMB_TEST_UTIL_HPP
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <ranges>
 #include <sstream>
+#include <string>
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
@@ -27,6 +34,38 @@
 
 namespace tinylamb {
 class Transaction;  // forward declaration for DumpLogTxn helper
+
+// Removes the WAL file `log_path` plus every segment file the segmented
+// logger may have created next to it (`<log_path>.<20-digit index>`).
+// Tests that open a Logger directly (bypassing Database, whose cleanup env
+// sweeps automatically) must call this from their TearDown or segment files
+// leak into the working directory.
+inline void RemoveLogAndSegments(const std::string& log_path) {
+  std::ignore = std::remove(log_path.c_str());
+  std::ignore = std::remove((log_path + ".meta").c_str());
+  std::ignore = std::remove((log_path + ".meta.tmp").c_str());
+  const std::filesystem::path base(log_path);
+  const std::filesystem::path directory =
+      base.has_parent_path() ? base.parent_path() : std::filesystem::path(".");
+  const std::string prefix = base.filename().string() + ".";
+  std::error_code ec;
+  std::filesystem::directory_iterator it(directory, ec);
+  if (ec) {
+    return;
+  }
+  for (const std::filesystem::directory_entry& entry : it) {
+    const std::string name = entry.path().filename().string();
+    if (!name.starts_with(prefix)) {
+      continue;
+    }
+    const std::string suffix = name.substr(prefix.size());
+    if (!suffix.empty() && std::ranges::all_of(suffix, [](char c) {
+          return c >= '0' && c <= '9';
+        })) {
+      std::filesystem::remove(entry.path(), ec);
+    }
+  }
+}
 }  // namespace tinylamb
 
 #define ASSERT_SUCCESS(x) ASSERT_EQ(Status::kSuccess, x)

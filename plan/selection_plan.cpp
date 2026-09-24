@@ -22,6 +22,7 @@
 
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "plan.hpp"
 #include "table/table_statistics.hpp"
 
@@ -32,21 +33,32 @@ namespace tinylamb {
 
 const Schema& SelectionPlan::GetSchema() const { return src_->GetSchema(); }
 
-size_t SelectionPlan::AccessRowCount() const { return src_->EmitRowCount(); }
+size_t SelectionPlan::AccessRowCount() const { return src_->AccessRowCount(); }
 
 size_t SelectionPlan::EmitRowCount() const { return stats_.Rows(); }
 
 void SelectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Select: [";
   exp_->Dump(o);
-  o << "] (estimated cost: " << AccessRowCount() << ")\n"
+  o << "] (estimated rows: " << EmitRowCount() << ")\n"
     << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 
 std::string SelectionPlan::ToString() const {
   return "Select: [" + exp_->ToString() +
-         "] (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+         "] (estimated rows: " + std::to_string(EmitRowCount()) + ")";
+}
+
+bool SelectionPlan::ContainsParameterSlots() const {
+  return ContainsParameterSlot(exp_) || src_->ContainsParameterSlots();
+}
+
+bool SelectionPlan::InstallParameterSlots(const std::vector<Value>& parameters,
+                                          size_t* cursor,
+                                          std::vector<Expression>* slots) {
+  return SlotizeInPlace(&exp_, parameters, cursor, slots) &&
+         src_->InstallParameterSlots(parameters, cursor, slots);
 }
 
 }  // namespace tinylamb

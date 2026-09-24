@@ -726,7 +726,7 @@ TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
                  std::string::npos) {
         saw_id_lookup = true;
       } else {
-        ADD_FAILURE() << true << result.error;
+        ADD_FAILURE() << result.error;
       }
     }
     EXPECT_TRUE(saw_name_lookup);
@@ -810,7 +810,7 @@ TEST(TpccWorkloadFailPathTest, OrderStatusAbortsWhenSupportingRowsMissing) {
                  std::string::npos) {
         saw_id_lookup = true;
       } else {
-        ADD_FAILURE() << true << result.error;
+        ADD_FAILURE() << result.error;
       }
     }
     EXPECT_TRUE(saw_name_lookup);

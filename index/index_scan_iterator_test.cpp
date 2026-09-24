@@ -492,6 +492,38 @@ TEST_F(IndexScanIteratorTest, UniqueDescendingIncrement) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
+TEST_F(IndexScanIteratorTest, UniqueDescendingAcrossNullKey) {
+  TransactionContext setup = db_->BeginContext();
+  ASSERT_SUCCESS(db_->CreateIndex(
+      setup, kTableName,
+      IndexSchema("NullableUnique", {1, 2}, {}, IndexMode::kUnique)));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              setup.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      table->Insert(setup.txn_, Row({Value(0), Value("0"), Value(9.0)}))
+          .GetStatus());
+  ASSERT_SUCCESS(table->Insert(setup.txn_, Row({Value(1), Value("1"), Value()}))
+                     .GetStatus());
+  ASSERT_SUCCESS(
+      table->Insert(setup.txn_, Row({Value(2), Value("1"), Value(2.0)}))
+          .GetStatus());
+
+  const Index& index = table->GetIndex(table->IndexCount() - 1);
+  Iterator scan =
+      table->BeginIndexScan(setup.txn_, index, Value(), Value(), false);
+  ASSERT_TRUE(scan.IsValid());
+  EXPECT_EQ((*scan)[0], Value(2));
+  ++scan;
+  ASSERT_TRUE(scan.IsValid());
+  EXPECT_EQ((*scan)[0], Value(1));
+  ++scan;
+  ASSERT_TRUE(scan.IsValid());
+  EXPECT_EQ((*scan)[0], Value(0));
+  ++scan;
+  EXPECT_FALSE(scan.IsValid());
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+}
+
 TEST_F(IndexScanIteratorTest, CompositePrefixRangeScan) {
   // Arrange -- insert rows, then scan the two-part KeyScore index with a
   // single-part bound so the end key is widened with a 0xff terminator

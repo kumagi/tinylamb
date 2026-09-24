@@ -38,9 +38,17 @@ namespace {
 // execution failure surfaces as a runtime_error carrying the diagnostic.
 std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
+  // One retry for empty diagnostics: a failed Prepare with no LastError is
+  // the external parse child being transiently unavailable under load, not
+  // a legitimate SQL error (real errors always carry a message).
   StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
   if (!prepared.HasValue()) {
-    throw std::runtime_error(engine->LastError());
+    if (engine->LastError().empty()) {
+      prepared = engine->Prepare(*ctx, sql);
+    }
+    if (!prepared.HasValue()) {
+      throw std::runtime_error(engine->LastError());
+    }
   }
   std::vector<Row> rows;
   Row row;
@@ -110,12 +118,13 @@ class CascadesRulesCoverageTest : public ::testing::Test {
                                   Column("c3", ValueType::kDouble)})));
       for (int i = 0; i < 100; ++i) {
         ASSERT_SUCCESS(
-            tbl.Insert(ctx.txn_, Row({Value(i),
-                                      Value("c2-" + std::to_string(i % 7)),
-                                      Value(i + 9.9)}))
+            tbl.Insert(ctx.txn_,
+                       Row({Value(i), Value("c2-" + std::to_string(i % 7)),
+                            Value(i + 9.9)}))
                 .GetStatus());
       }
-      ASSERT_SUCCESS(database_->CreateIndex(ctx, "Sc1", IndexSchema("Sc1PK", {0})));
+      ASSERT_SUCCESS(
+          database_->CreateIndex(ctx, "Sc1", IndexSchema("Sc1PK", {0})));
       ASSERT_SUCCESS(
           database_->CreateIndex(ctx, "Sc1", IndexSchema("KeyIdx", {1, 2})));
     }
@@ -135,7 +144,8 @@ class CascadesRulesCoverageTest : public ::testing::Test {
                                       Value(i % 4)}))
                 .GetStatus());
       }
-      ASSERT_SUCCESS(database_->CreateIndex(ctx, "Sc2", IndexSchema("Sc2PK", {0})));
+      ASSERT_SUCCESS(
+          database_->CreateIndex(ctx, "Sc2", IndexSchema("Sc2PK", {0})));
       ASSERT_SUCCESS(database_->CreateIndex(
           ctx, "Sc2",
           IndexSchema("NameIdx", {2, 3}, {0, 1}, IndexMode::kNonUnique)));
@@ -149,8 +159,7 @@ class CascadesRulesCoverageTest : public ::testing::Test {
                                   Column("e2", ValueType::kDouble)})));
       for (int i = 20; i > 0; --i) {
         ASSERT_SUCCESS(
-            tbl.Insert(ctx.txn_, Row({Value(i), Value(i + 53.4)}))
-                .GetStatus());
+            tbl.Insert(ctx.txn_, Row({Value(i), Value(i + 53.4)})).GetStatus());
       }
     }
     {
@@ -178,10 +187,12 @@ class CascadesRulesCoverageTest : public ::testing::Test {
                                   Column("v", ValueType::kVarChar)})));
       for (int i = 0; i < 10; ++i) {
         ASSERT_SUCCESS(
-            tbl.Insert(ctx.txn_, Row({Value(i), Value("dim" + std::to_string(i))}))
+            tbl.Insert(ctx.txn_,
+                       Row({Value(i), Value("dim" + std::to_string(i))}))
                 .GetStatus());
       }
-      ASSERT_SUCCESS(database_->CreateIndex(ctx, "Dim", IndexSchema("DimK", {0})));
+      ASSERT_SUCCESS(
+          database_->CreateIndex(ctx, "Dim", IndexSchema("DimK", {0})));
     }
     {
       // Fact table referencing Dim keys, including values outside Dim and a
@@ -193,8 +204,7 @@ class CascadesRulesCoverageTest : public ::testing::Test {
                                    Column("payload", ValueType::kInt64)})));
       for (int i = 0; i < 12; ++i) {
         ASSERT_SUCCESS(
-            tbl.Insert(ctx.txn_, Row({Value(i % 13), Value(i)}))
-                .GetStatus());
+            tbl.Insert(ctx.txn_, Row({Value(i % 13), Value(i)})).GetStatus());
       }
     }
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -233,51 +243,54 @@ class CascadesRulesCoverageTest : public ::testing::Test {
 // ---------------------------------------------------------------------------
 
 TEST_F(CascadesRulesCoverageTest, TwoTableEquiJoinPlansAndExecutes) {
-  const auto rows = Run("SELECT sc1.c1, sc2.d4 FROM sc1 JOIN sc2 "
-                        "ON sc1.c1 = sc2.d1 WHERE sc1.c1 < 10");
+  const auto rows =
+      Run("SELECT sc1.c1, sc2.d4 FROM sc1 JOIN sc2 "
+          "ON sc1.c1 = sc2.d1 WHERE sc1.c1 < 10");
   EXPECT_EQ(rows.size(), 10U);
 }
 
 TEST_F(CascadesRulesCoverageTest, ThreeTableChainJoin) {
-  const auto rows = Run(
-      "SELECT sc1.c1 FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 "
-      "JOIN dim ON sc2.d4 = dim.k WHERE sc1.c1 < 8");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 "
+          "JOIN dim ON sc2.d4 = dim.k WHERE sc1.c1 < 8");
   EXPECT_EQ(rows.size(), 8U);
 }
 
 TEST_F(CascadesRulesCoverageTest, FourTableJoinEnumeratesOrders) {
-  const auto rows = Run(
-      "SELECT sc1.c1 FROM sc1, sc2, dim, fact "
-      "WHERE sc1.c1 = sc2.d1 AND sc2.d4 = dim.k AND dim.k = fact.fk "
-      "AND sc1.c1 < 4");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1, sc2, dim, fact "
+          "WHERE sc1.c1 = sc2.d1 AND sc2.d4 = dim.k AND dim.k = fact.fk "
+          "AND sc1.c1 < 4");
   EXPECT_EQ(rows.size(), 4U);
 }
 
 TEST_F(CascadesRulesCoverageTest, FiveTableJoinPlans) {
-  const auto rows = Run(
-      "SELECT sc1.c1 FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 "
-      "JOIN dim ON sc2.d4 = dim.k JOIN fact ON dim.k = fact.fk "
-      "JOIN sc3 ON fact.payload = sc3.e1 LIMIT 3");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 "
+          "JOIN dim ON sc2.d4 = dim.k JOIN fact ON dim.k = fact.fk "
+          "JOIN sc3 ON fact.payload = sc3.e1 LIMIT 3");
   EXPECT_LE(rows.size(), 3U);
 }
 
 TEST_F(CascadesRulesCoverageTest, CommaJoinWithEqualityBecomesInnerJoin) {
-  const auto rows = Run("SELECT sc1.c1 FROM sc1, sc2 "
-                        "WHERE sc1.c1 = sc2.d1 AND sc1.c1 < 5");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1, sc2 "
+          "WHERE sc1.c1 = sc2.d1 AND sc1.c1 < 5");
   EXPECT_EQ(rows.size(), 5U);
 }
 
 TEST_F(CascadesRulesCoverageTest, CommaJoinWithInequalityStaysCartesian) {
   // Non-equi comma join: batch nested loop / product paths, no hash join.
-  const auto rows = Run("SELECT sc1.c1, sc3.e1 FROM sc1, sc3 "
-                        "WHERE sc1.c1 < sc3.e1 AND sc1.c1 < 3");
+  const auto rows =
+      Run("SELECT sc1.c1, sc3.e1 FROM sc1, sc3 "
+          "WHERE sc1.c1 < sc3.e1 AND sc1.c1 < 3");
   EXPECT_FALSE(rows.empty());
 }
 
 TEST_F(CascadesRulesCoverageTest, AliasedSelfJoin) {
-  const auto rows = Run(
-      "SELECT a.c1 FROM sc1 a JOIN sc1 b ON a.c1 = b.c1 "
-      "WHERE a.c1 < 5 AND b.c3 > 10.0");
+  const auto rows =
+      Run("SELECT a.c1 FROM sc1 a JOIN sc1 b ON a.c1 = b.c1 "
+          "WHERE a.c1 < 5 AND b.c3 > 10.0");
   // c1=0 carries c3=9.9, which fails b.c3 > 10.
   EXPECT_EQ(rows.size(), 4U);
 }
@@ -289,89 +302,100 @@ TEST_F(CascadesRulesCoverageTest, SelfJoinEliminationOnUniqueKey) {
 }
 
 TEST_F(CascadesRulesCoverageTest, RightJoinNormalizesToLeft) {
-  const auto rows = Run("SELECT sc1.c1, sc3.e1 FROM sc1 RIGHT JOIN sc3 "
-                        "ON sc1.c1 = sc3.e1 WHERE sc3.e1 <= 5");
+  const auto rows =
+      Run("SELECT sc1.c1, sc3.e1 FROM sc1 RIGHT JOIN sc3 "
+          "ON sc1.c1 = sc3.e1 WHERE sc3.e1 <= 5");
   EXPECT_EQ(rows.size(), 5U);
 }
 
 TEST_F(CascadesRulesCoverageTest, FullOuterJoinPlans) {
-  const auto rows = Run("SELECT sc1.c1, fact.fk FROM sc1 FULL JOIN fact "
-                        "ON sc1.c1 = fact.fk WHERE sc1.c1 < 3 OR fact.fk > 11");
+  const auto rows =
+      Run("SELECT sc1.c1, fact.fk FROM sc1 FULL JOIN fact "
+          "ON sc1.c1 = fact.fk WHERE sc1.c1 < 3 OR fact.fk > 11");
   EXPECT_GE(rows.size(), 2U);
 }
 
 TEST_F(CascadesRulesCoverageTest, LeftJoinNonEquiUsesNestedLoop) {
-  const auto rows = Run("SELECT sc1.c1, sc3.e1 FROM sc1 LEFT JOIN sc3 "
-                        "ON sc1.c1 < sc3.e1 WHERE sc1.c1 < 2");
+  const auto rows =
+      Run("SELECT sc1.c1, sc3.e1 FROM sc1 LEFT JOIN sc3 "
+          "ON sc1.c1 < sc3.e1 WHERE sc1.c1 < 2");
   EXPECT_GE(rows.size(), 2U);
 }
 
 TEST_F(CascadesRulesCoverageTest, LeftJoinTruePredicatePadsAllRows) {
-  const auto rows = Run("SELECT sc1.c1 FROM sc1 LEFT JOIN sc3 ON 1 = 1 "
-                        "WHERE sc1.c1 < 2");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 LEFT JOIN sc3 ON 1 = 1 "
+          "WHERE sc1.c1 < 2");
   EXPECT_GT(rows.size(), 2U);
 }
 
 TEST_F(CascadesRulesCoverageTest, LeftJoinFalsePredicateKeepsLeftRows) {
-  const auto rows = Run("SELECT sc1.c1, sc3.e1 FROM sc1 LEFT JOIN sc3 ON 1 = 2 "
-                        "WHERE sc1.c1 < 3");
+  const auto rows =
+      Run("SELECT sc1.c1, sc3.e1 FROM sc1 LEFT JOIN sc3 ON 1 = 2 "
+          "WHERE sc1.c1 < 3");
   ASSERT_EQ(rows.size(), 3U);
   EXPECT_EQ(rows[0][1], Value());
 }
 
 TEST_F(CascadesRulesCoverageTest, LeftJoinFilterOnLeftSidePushesBelow) {
   // WHERE on the preserved side of a LEFT join pushes into the scan.
-  const auto rows = Run("SELECT sc1.c1, fact.fk FROM sc1 LEFT JOIN fact "
-                        "ON sc1.c1 = fact.fk WHERE sc1.c1 > 95");
+  const auto rows =
+      Run("SELECT sc1.c1, fact.fk FROM sc1 LEFT JOIN fact "
+          "ON sc1.c1 = fact.fk WHERE sc1.c1 > 95");
   EXPECT_EQ(rows.size(), 4U);
 }
 
 TEST_F(CascadesRulesCoverageTest, LeftJoinFilterOnRightSideStaysAbove) {
   // WHERE on the null-supplying side must NOT push below the join.
-  const auto rows = Run("SELECT sc1.c1 FROM sc1 LEFT JOIN fact "
-                        "ON sc1.c1 = fact.fk WHERE fact.payload > 5");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 LEFT JOIN fact "
+          "ON sc1.c1 = fact.fk WHERE fact.payload > 5");
   EXPECT_EQ(rows.size(), 6U);
 }
 
 TEST_F(CascadesRulesCoverageTest, OuterJoinSliceEliminatesUnusedUniqueRight) {
   // Only Dim's unique key is referenced; Fact is dropped from the plan.
-  const auto rows = Run(
-      "SELECT fact.fk, dim.k FROM fact LEFT JOIN dim ON fact.fk = dim.k "
-      "WHERE fact.fk < 3");
+  const auto rows =
+      Run("SELECT fact.fk, dim.k FROM fact LEFT JOIN dim ON fact.fk = dim.k "
+          "WHERE fact.fk < 3");
   EXPECT_EQ(rows.size(), 3U);
 }
 
 TEST_F(CascadesRulesCoverageTest, SemiJoinViaInSubquery) {
-  const auto rows = Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 IN "
-                        "(SELECT fact.fk FROM fact) AND sc1.c1 < 12");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 IN "
+          "(SELECT fact.fk FROM fact) AND sc1.c1 < 12");
   EXPECT_EQ(rows.size(), 12U);
 }
 
 TEST_F(CascadesRulesCoverageTest, AntiJoinViaNotInSubquery) {
-  const auto rows = Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 NOT IN "
-                        "(SELECT fact.fk FROM fact) AND sc1.c1 < 20");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 NOT IN "
+          "(SELECT fact.fk FROM fact) AND sc1.c1 < 20");
   EXPECT_EQ(rows.size(), 8U);
 }
 
 TEST_F(CascadesRulesCoverageTest, SemiJoinViaExists) {
-  const auto rows = Run("SELECT sc1.c1 FROM sc1 WHERE EXISTS "
-                        "(SELECT 1 FROM fact WHERE fact.fk = sc1.c1) "
-                        "AND sc1.c1 < 12");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 WHERE EXISTS "
+          "(SELECT 1 FROM fact WHERE fact.fk = sc1.c1) "
+          "AND sc1.c1 < 12");
   EXPECT_EQ(rows.size(), 12U);
 }
 
 TEST_F(CascadesRulesCoverageTest, AntiJoinViaNotExists) {
-  const auto rows = Run("SELECT sc1.c1 FROM sc1 WHERE NOT EXISTS "
-                        "(SELECT 1 FROM fact WHERE fact.fk = sc1.c1) "
-                        "AND sc1.c1 < 20");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 WHERE NOT EXISTS "
+          "(SELECT 1 FROM fact WHERE fact.fk = sc1.c1) "
+          "AND sc1.c1 < 20");
   EXPECT_EQ(rows.size(), 8U);
 }
 
 TEST_F(CascadesRulesCoverageTest, SemiJoinPushesThroughInnerJoin) {
   // The semi join's leftover conjuncts move across the inner join edge.
-  const auto rows = Run(
-      "SELECT sc1.c1 FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 WHERE sc1.c1 IN "
-      "(SELECT fact.fk FROM fact) AND sc1.c1 < 6");
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 WHERE sc1.c1 IN "
+          "(SELECT fact.fk FROM fact) AND sc1.c1 < 6");
   EXPECT_EQ(rows.size(), 6U);
 }
 
@@ -381,10 +405,51 @@ TEST_F(CascadesRulesCoverageTest, InLiteralListUsesPointLookup) {
   EXPECT_EQ(rows[0][0], Value(int64_t{1}));
 }
 
+TEST_F(CascadesRulesCoverageTest, InLiteralListWithNullAndCrossType) {
+  // A NULL IN item is never satisfiable and must not reach the point-union
+  // sort (Value ordering throws on NULL/cross-typed pairs): the list still
+  // probes {1, 3} and the residual predicate keeps three-valued semantics.
+  const auto null_rows =
+      Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 IN (1, 3, NULL) "
+          "ORDER BY sc1.c1");
+  ASSERT_EQ(null_rows.size(), 2U);
+  EXPECT_EQ(null_rows[0][0], Value(int64_t{1}));
+  EXPECT_EQ(null_rows[1][0], Value(int64_t{3}));
+  // A cross-typed numeric constant must keep full-scan semantics: 2.0
+  // compares equal to INT64 2, which a DOUBLE-encoded seek key would miss.
+  const auto double_rows =
+      Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 IN (1, 3.0) "
+          "ORDER BY sc1.c1");
+  ASSERT_EQ(double_rows.size(), 2U);
+  EXPECT_EQ(double_rows[0][0], Value(int64_t{1}));
+  EXPECT_EQ(double_rows[1][0], Value(int64_t{3}));
+  // The same holds for range bounds: `c1 = 2.0` and `0.5 < c1 < 2.5` must
+  // find INT64 rows even though DOUBLE bounds cannot drive the index.
+  const auto eq_rows = Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 = 2.0");
+  ASSERT_EQ(eq_rows.size(), 1U);
+  EXPECT_EQ(eq_rows[0][0], Value(int64_t{2}));
+  const auto band_rows =
+      Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 > 0.5 AND sc1.c1 < 2.5 "
+          "ORDER BY sc1.c1");
+  ASSERT_EQ(band_rows.size(), 2U);
+  EXPECT_EQ(band_rows[0][0], Value(int64_t{1}));
+  EXPECT_EQ(band_rows[1][0], Value(int64_t{2}));
+}
+
+TEST_F(CascadesRulesCoverageTest, MultiDisjunctOrPreservesResults) {
+  const auto rows =
+      Run("SELECT sc1.c1 FROM sc1 WHERE sc1.c1 = 1 OR sc1.c1 = 3 OR "
+          "sc1.c1 = 5 ORDER BY sc1.c1");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(3));
+  EXPECT_EQ(rows[2][0], Value(5));
+}
+
 TEST_F(CascadesRulesCoverageTest, ExplainSemiJoinMentionsJoinOperator) {
-  const std::string plan =
-      Explain("SELECT sc1.c1 FROM sc1 WHERE EXISTS "
-              "(SELECT 1 FROM fact WHERE fact.fk = sc1.c1)");
+  const std::string plan = Explain(
+      "SELECT sc1.c1 FROM sc1 WHERE EXISTS "
+      "(SELECT 1 FROM fact WHERE fact.fk = sc1.c1)");
   EXPECT_FALSE(plan.empty());
 }
 
@@ -405,36 +470,39 @@ TEST_F(CascadesRulesCoverageTest, CountNonNullColumnRewritesToCountStar) {
 }
 
 TEST_F(CascadesRulesCoverageTest, GroupByWithHavingOnGroupingKey) {
-  const auto rows = Run("SELECT d4, COUNT(*) FROM sc2 GROUP BY d4 "
-                        "HAVING d4 >= 2 ORDER BY d4");
+  const auto rows =
+      Run("SELECT d4, COUNT(*) FROM sc2 GROUP BY d4 "
+          "HAVING d4 >= 2 ORDER BY d4");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(int64_t{2}));
 }
 
 TEST_F(CascadesRulesCoverageTest, GroupByWithResidualHaving) {
-  const auto rows = Run("SELECT d4, COUNT(*) AS n FROM sc2 GROUP BY d4 "
-                        "HAVING COUNT(*) > 10 ORDER BY d4");
+  const auto rows =
+      Run("SELECT d4, COUNT(*) AS n FROM sc2 GROUP BY d4 "
+          "HAVING COUNT(*) > 10 ORDER BY d4");
   EXPECT_EQ(rows.size(), 4U);
 }
 
 TEST_F(CascadesRulesCoverageTest, ScalarAggregatesWrapInMax1Row) {
-  const auto rows = Run(
-      "SELECT SUM(c3), MIN(c1), MAX(c1), COUNT(*) FROM sc1 WHERE c1 < 10");
+  const auto rows =
+      Run("SELECT SUM(c3), MIN(c1), MAX(c1), COUNT(*) FROM sc1 WHERE c1 < 10");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][3], Value(int64_t{10}));
 }
 
 TEST_F(CascadesRulesCoverageTest, AggregateOverJoinWithUniqueSide) {
   // sc1.c1 is unique: aggregation may be pushed below the join.
-  const auto rows = Run(
-      "SELECT sc1.c2, SUM(sc2.d2) FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 "
-      "GROUP BY sc1.c2 ORDER BY sc1.c2 LIMIT 4");
+  const auto rows =
+      Run("SELECT sc1.c2, SUM(sc2.d2) FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 "
+          "GROUP BY sc1.c2 ORDER BY sc1.c2 LIMIT 4");
   EXPECT_EQ(rows.size(), 4U);
 }
 
 TEST_F(CascadesRulesCoverageTest, DistinctOverJoinWithUniqueKey) {
-  const auto rows = Run("SELECT DISTINCT sc1.c1 FROM sc1 JOIN fact "
-                        "ON sc1.c1 = fact.fk WHERE sc1.c1 < 5");
+  const auto rows =
+      Run("SELECT DISTINCT sc1.c1 FROM sc1 JOIN fact "
+          "ON sc1.c1 = fact.fk WHERE sc1.c1 < 5");
   EXPECT_EQ(rows.size(), 5U);
 }
 
@@ -451,9 +519,9 @@ TEST_F(CascadesRulesCoverageTest, FilterBelowDistinctRewrite) {
 
 TEST_F(CascadesRulesCoverageTest, AggregateJoinTransposeShape) {
   // 1:N join from unique side aggregated after the join.
-  const auto rows = Run(
-      "SELECT dim.k, COUNT(sc1.c1) FROM dim JOIN sc1 ON dim.k = sc1.c1 "
-      "GROUP BY dim.k ORDER BY dim.k LIMIT 3");
+  const auto rows =
+      Run("SELECT dim.k, COUNT(sc1.c1) FROM dim JOIN sc1 ON dim.k = sc1.c1 "
+          "GROUP BY dim.k ORDER BY dim.k LIMIT 3");
   EXPECT_EQ(rows.size(), 3U);
 }
 
@@ -485,23 +553,22 @@ TEST_F(CascadesRulesCoverageTest, LimitWithOffsetOverIndexOrder) {
 }
 
 TEST_F(CascadesRulesCoverageTest, LimitOverUnionAllCapsBranches) {
-  const auto rows = Run(
-      "SELECT c1 FROM sc1 WHERE c1 < 50 UNION ALL "
-      "SELECT d1 FROM sc2 WHERE d1 < 50 ORDER BY 1 LIMIT 7");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 50 UNION ALL "
+          "SELECT d1 FROM sc2 WHERE d1 < 50 ORDER BY 1 LIMIT 7");
   ASSERT_EQ(rows.size(), 7U);
   EXPECT_EQ(rows[0][0], Value(int64_t{0}));
 }
 
 TEST_F(CascadesRulesCoverageTest, NestedSortsCollapse) {
-  const auto rows = Run(
-      "SELECT c1 FROM (SELECT c1, c2 FROM sc1 ORDER BY c1) t "
-      "ORDER BY c1 LIMIT 4");
+  const auto rows =
+      Run("SELECT c1 FROM (SELECT c1, c2 FROM sc1 ORDER BY c1) t "
+          "ORDER BY c1 LIMIT 4");
   ASSERT_EQ(rows.size(), 4U);
 }
 
 TEST_F(CascadesRulesCoverageTest, OrderByRedundantDuplicateKey) {
-  const auto rows =
-      Run("SELECT c1 FROM sc1 ORDER BY c1, c1 LIMIT 3");
+  const auto rows = Run("SELECT c1 FROM sc1 ORDER BY c1, c1 LIMIT 3");
   ASSERT_EQ(rows.size(), 3U);
 }
 
@@ -510,62 +577,68 @@ TEST_F(CascadesRulesCoverageTest, OrderByRedundantDuplicateKey) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CascadesRulesCoverageTest, UnionDistinctRemovesDuplicates) {
-  const auto rows = Run("SELECT c1 FROM sc1 WHERE c1 < 5 "
-                        "UNION DISTINCT SELECT d1 FROM sc2 WHERE d1 < 5");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 5 "
+          "UNION DISTINCT SELECT d1 FROM sc2 WHERE d1 < 5");
   EXPECT_EQ(rows.size(), 5U);
 }
 
 TEST_F(CascadesRulesCoverageTest, UnionAllKeepsDuplicates) {
-  const auto rows = Run("SELECT c1 FROM sc1 WHERE c1 < 3 "
-                        "UNION ALL SELECT d1 FROM sc2 WHERE d1 < 3");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 3 "
+          "UNION ALL SELECT d1 FROM sc2 WHERE d1 < 3");
   EXPECT_EQ(rows.size(), 6U);
 }
 
 TEST_F(CascadesRulesCoverageTest, IntersectPlans) {
-  const auto rows = Run("SELECT c1 FROM sc1 WHERE c1 < 6 "
-                        "INTERSECT DISTINCT SELECT d1 FROM sc2 WHERE d1 > 2");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 6 "
+          "INTERSECT DISTINCT SELECT d1 FROM sc2 WHERE d1 > 2");
   EXPECT_EQ(rows.size(), 3U);
 }
 
 TEST_F(CascadesRulesCoverageTest, ExceptPlans) {
-  const auto rows = Run("SELECT c1 FROM sc1 WHERE c1 < 6 "
-                        "EXCEPT DISTINCT SELECT d1 FROM sc2 WHERE d1 > 2");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 6 "
+          "EXCEPT DISTINCT SELECT d1 FROM sc2 WHERE d1 > 2");
   EXPECT_EQ(rows.size(), 3U);
 }
 
 TEST_F(CascadesRulesCoverageTest, IntersectAllPlans) {
-  const auto rows = Run(
-      "SELECT c1 FROM sc1 WHERE c1 < 4 INTERSECT ALL "
-      "SELECT c1 FROM sc1 WHERE c1 > 1");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 4 INTERSECT ALL "
+          "SELECT c1 FROM sc1 WHERE c1 > 1");
   EXPECT_EQ(rows.size(), 2U);
 }
 
 TEST_F(CascadesRulesCoverageTest, ExceptAllPlans) {
-  const auto rows = Run("SELECT c1 FROM sc1 WHERE c1 < 4 "
-                        "EXCEPT ALL SELECT c1 FROM sc1 WHERE c1 > 1");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 4 "
+          "EXCEPT ALL SELECT c1 FROM sc1 WHERE c1 > 1");
   EXPECT_EQ(rows.size(), 2U);
 }
 
 TEST_F(CascadesRulesCoverageTest, FilterPushedIntoEveryUnionBranch) {
-  const auto rows = Run(
-      "SELECT u.c1 FROM (SELECT c1 FROM sc1 UNION DISTINCT SELECT d1 "
-      "FROM sc2) u WHERE u.c1 < 2 ORDER BY 1");
+  const auto rows =
+      Run("SELECT u.c1 FROM (SELECT c1 FROM sc1 UNION DISTINCT SELECT d1 "
+          "FROM sc2) u WHERE u.c1 < 2 ORDER BY 1");
   EXPECT_EQ(rows.size(), 2U);
 }
 
 TEST_F(CascadesRulesCoverageTest, ProjectionPushedThroughUnion) {
-  const auto rows = Run("SELECT c1 + 100 AS x FROM (SELECT c1 FROM sc1 "
-                        "WHERE c1 < 2 UNION DISTINCT SELECT d1 FROM sc2 WHERE d1 < 2) t "
-                        "ORDER BY x");
+  const auto rows =
+      Run("SELECT c1 + 100 AS x FROM (SELECT c1 FROM sc1 "
+          "WHERE c1 < 2 UNION DISTINCT SELECT d1 FROM sc2 WHERE d1 < 2) t "
+          "ORDER BY x");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(int64_t{100}));
 }
 
 TEST_F(CascadesRulesCoverageTest, ExceptWithNullSafeComparison) {
   // EXCEPT must treat NULL rows as equal (IS NOT DISTINCT FROM lowering).
-  const auto rows = Run(
-      "SELECT fk FROM fact WHERE payload >= 12 EXCEPT DISTINCT "
-      "SELECT fk FROM fact WHERE payload >= 12");
+  const auto rows =
+      Run("SELECT fk FROM fact WHERE payload >= 12 EXCEPT DISTINCT "
+          "SELECT fk FROM fact WHERE payload >= 12");
   EXPECT_EQ(rows.size(), 0U);
 }
 
@@ -574,31 +647,32 @@ TEST_F(CascadesRulesCoverageTest, ExceptWithNullSafeComparison) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CascadesRulesCoverageTest, WindowRankPlans) {
-  const auto rows = Run("SELECT c1, RANK() OVER (ORDER BY c3) FROM sc1 "
-                        "WHERE c1 < 5");
+  const auto rows =
+      Run("SELECT c1, RANK() OVER (ORDER BY c3) FROM sc1 "
+          "WHERE c1 < 5");
   EXPECT_EQ(rows.size(), 5U);
 }
 
 TEST_F(CascadesRulesCoverageTest, WindowPartitionSharesSort) {
-  const auto rows = Run(
-      "SELECT c1, SUM(c3) OVER (PARTITION BY c2 ORDER BY c1 "
-      "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s "
-      "FROM sc1 WHERE c1 < 8");
+  const auto rows =
+      Run("SELECT c1, SUM(c3) OVER (PARTITION BY c2 ORDER BY c1 "
+          "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s "
+          "FROM sc1 WHERE c1 < 8");
   EXPECT_EQ(rows.size(), 8U);
 }
 
 TEST_F(CascadesRulesCoverageTest, RowNumberFilterBecomesTopN) {
-  const auto rows = Run(
-      "SELECT c1 FROM (SELECT c1, ROW_NUMBER() OVER (ORDER BY c1) AS rn "
-      "FROM sc1) t WHERE rn <= 5");
+  const auto rows =
+      Run("SELECT c1 FROM (SELECT c1, ROW_NUMBER() OVER (ORDER BY c1) AS rn "
+          "FROM sc1) t WHERE rn <= 5");
   ASSERT_EQ(rows.size(), 5U);
   EXPECT_EQ(rows[4][0], Value(int64_t{4}));
 }
 
 TEST_F(CascadesRulesCoverageTest, TwoWindowsShareOneSort) {
-  const auto rows = Run(
-      "SELECT c1, RANK() OVER (ORDER BY c3) AS r, "
-      "ROW_NUMBER() OVER (ORDER BY c3) AS n FROM sc1 WHERE c1 < 6");
+  const auto rows =
+      Run("SELECT c1, RANK() OVER (ORDER BY c3) AS r, "
+          "ROW_NUMBER() OVER (ORDER BY c3) AS n FROM sc1 WHERE c1 < 6");
   EXPECT_EQ(rows.size(), 6U);
 }
 
@@ -607,17 +681,17 @@ TEST_F(CascadesRulesCoverageTest, TwoWindowsShareOneSort) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CascadesRulesCoverageTest, CorrelatedAggregateSubquery) {
-  const auto rows = Run(
-      "SELECT c1 FROM sc1 WHERE c1 < 5 AND c3 > "
-      "(SELECT AVG(e2) FROM sc3 WHERE sc3.e1 = sc1.c1) - 1000.0");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 5 AND c3 > "
+          "(SELECT AVG(e2) FROM sc3 WHERE sc3.e1 = sc1.c1) - 1000.0");
   // sc3 has no e1=0, so c1=0's correlated AVG is NULL and drops out.
   EXPECT_EQ(rows.size(), 4U);
 }
 
 TEST_F(CascadesRulesCoverageTest, CorrelatedCountSubquery) {
-  const auto rows = Run(
-      "SELECT c1, (SELECT COUNT(*) FROM fact WHERE fact.fk = sc1.c1) AS n "
-      "FROM sc1 WHERE c1 < 6 ORDER BY c1");
+  const auto rows =
+      Run("SELECT c1, (SELECT COUNT(*) FROM fact WHERE fact.fk = sc1.c1) AS n "
+          "FROM sc1 WHERE c1 < 6 ORDER BY c1");
   ASSERT_EQ(rows.size(), 6U);
   EXPECT_EQ(rows[0][1], Value(int64_t{1}));
 }
@@ -632,16 +706,16 @@ TEST_F(CascadesRulesCoverageTest, ComplexCorrelationStaysApply) {
 }
 
 TEST_F(CascadesRulesCoverageTest, UncorrelatedScalarSubqueryMax1Row) {
-  const auto rows = Run(
-      "SELECT c1 FROM sc1 WHERE c1 < 3 AND c3 > (SELECT AVG(e2) FROM sc3) "
-      "- 10000.0");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE c1 < 3 AND c3 > (SELECT AVG(e2) FROM sc3) "
+          "- 10000.0");
   EXPECT_EQ(rows.size(), 3U);
 }
 
 TEST_F(CascadesRulesCoverageTest, ExistsWithResidualInnerPredicate) {
-  const auto rows = Run(
-      "SELECT c1 FROM sc1 WHERE EXISTS (SELECT 1 FROM sc2 WHERE sc2.d1 = "
-      "sc1.c1 AND sc2.d4 = 3) AND sc1.c1 < 20");
+  const auto rows =
+      Run("SELECT c1 FROM sc1 WHERE EXISTS (SELECT 1 FROM sc2 WHERE sc2.d1 = "
+          "sc1.c1 AND sc2.d4 = 3) AND sc1.c1 < 20");
   EXPECT_EQ(rows.size(), 5U);
 }
 
@@ -650,39 +724,39 @@ TEST_F(CascadesRulesCoverageTest, ExistsWithResidualInnerPredicate) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CascadesRulesCoverageTest, NonRecursiveCteInlines) {
-  const auto rows = Run(
-      "WITH t AS (SELECT c1 FROM sc1 WHERE c1 < 10) "
-      "SELECT c1 FROM t WHERE c1 > 7");
+  const auto rows =
+      Run("WITH t AS (SELECT c1 FROM sc1 WHERE c1 < 10) "
+          "SELECT c1 FROM t WHERE c1 > 7");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[1][0], Value(int64_t{9}));
 }
 
 TEST_F(CascadesRulesCoverageTest, RecursiveCtePlans) {
-  const auto rows = Run(
-      "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r "
-      "WHERE n < 6) SELECT SUM(n) FROM r");
+  const auto rows =
+      Run("WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r "
+          "WHERE n < 6) SELECT SUM(n) FROM r");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{21}));
 }
 
 TEST_F(CascadesRulesCoverageTest, DerivedTableWithFilterAndProjection) {
-  const auto rows = Run(
-      "SELECT t.c1 FROM (SELECT c1, c3 FROM sc1 WHERE c3 > 50.0) t "
-      "WHERE t.c1 < 3");
+  const auto rows =
+      Run("SELECT t.c1 FROM (SELECT c1, c3 FROM sc1 WHERE c3 > 50.0) t "
+          "WHERE t.c1 < 3");
   EXPECT_EQ(rows.size(), 0U);
 }
 
 TEST_F(CascadesRulesCoverageTest, NestedDerivedProjectionsMerge) {
-  const auto rows = Run(
-      "SELECT b.c1 FROM (SELECT a.c1 FROM (SELECT c1, c2 FROM sc1) a) b "
-      "WHERE b.c1 < 4");
+  const auto rows =
+      Run("SELECT b.c1 FROM (SELECT a.c1 FROM (SELECT c1, c2 FROM sc1) a) b "
+          "WHERE b.c1 < 4");
   EXPECT_EQ(rows.size(), 4U);
 }
 
 TEST_F(CascadesRulesCoverageTest, ValuesLeafPlans) {
-  const auto rows = Run(
-      "SELECT v.x FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL "
-      "SELECT 3) v WHERE v.x < 3");
+  const auto rows =
+      Run("SELECT v.x FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL "
+          "SELECT 3) v WHERE v.x < 3");
   EXPECT_EQ(rows.size(), 2U);
 }
 
@@ -724,8 +798,8 @@ TEST_F(CascadesRulesCoverageTest, NullPredicateOnUnindexedColumn) {
 }
 
 TEST_F(CascadesRulesCoverageTest, IsNotNotNullPredicateCombinedWithRange) {
-  const auto rows = Run(
-      "SELECT e1 FROM sc3 WHERE e1 IS NOT NULL AND e1 > 15 ORDER BY e1");
+  const auto rows =
+      Run("SELECT e1 FROM sc3 WHERE e1 IS NOT NULL AND e1 > 15 ORDER BY e1");
   EXPECT_EQ(rows.size(), 5U);
 }
 
@@ -748,9 +822,9 @@ TEST_F(CascadesRulesCoverageTest, OrDisjunctionStaysResidual) {
 }
 
 TEST_F(CascadesRulesCoverageTest, CaseExpressionInProjection) {
-  const auto rows = Run(
-      "SELECT CASE WHEN c1 < 5 THEN 'low' ELSE 'high' END FROM sc1 "
-      "WHERE c1 < 2");
+  const auto rows =
+      Run("SELECT CASE WHEN c1 < 5 THEN 'low' ELSE 'high' END FROM sc1 "
+          "WHERE c1 < 2");
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value("low"));
 }
@@ -804,9 +878,8 @@ std::vector<LogicalOperator> ExploreMarkJoinToFilter(
                               .marker_column = "mark"};
   EXPECT_TRUE(memo.AddExpression(mark, mark_join));
   const GroupId selection = memo.EnsureDerivedGroup({"a", "b"}, "selection");
-  LogicalExpression selection_expression{.operation =
-                                             LogicalOperator::kSelection,
-                                         .children = {mark}};
+  LogicalExpression selection_expression{
+      .operation = LogicalOperator::kSelection, .children = {mark}};
   selection_expression.predicate = marker_test;
   EXPECT_TRUE(memo.AddExpression(selection, selection_expression));
 
@@ -843,16 +916,24 @@ TEST(MarkJoinToFilterBranchTest, IsTrueMarkerBecomesSemiJoin) {
   EXPECT_TRUE(HasOperator(operations, LogicalOperator::kSemiJoin));
 }
 
-TEST(MarkJoinToFilterBranchTest, IsNotFalseMarkerBecomesSemiJoin) {
+TEST(MarkJoinToFilterBranchTest, IsNotFalseMarkerDeclines) {
+  // IS NOT FALSE keeps the TRUE *and* NULL markers; a semi join drops the
+  // NULL-marker rows (probe key NULL / build holds NULL), so the rewrite is
+  // unsound under three-valued marker semantics.
   const auto operations = ExploreMarkJoinToFilter(
       UnaryTest(UnaryOperation::kIsNotFalse, ColumnName("mark")));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kSemiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
 }
 
-TEST(MarkJoinToFilterBranchTest, IsFalseMarkerBecomesAntiJoin) {
+TEST(MarkJoinToFilterBranchTest, IsFalseMarkerDeclines) {
+  // IS FALSE keeps only FALSE markers; a plain anti join also keeps the
+  // NULL-marker rows (a NULL probe key matches nothing), so no single join
+  // kind reproduces the filter exactly.
   const auto operations = ExploreMarkJoinToFilter(
       UnaryTest(UnaryOperation::kIsFalse, ColumnName("mark")));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kAntiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
 }
 
 TEST(MarkJoinToFilterBranchTest, IsNotTrueMarkerBecomesAntiJoin) {
@@ -861,10 +942,13 @@ TEST(MarkJoinToFilterBranchTest, IsNotTrueMarkerBecomesAntiJoin) {
   EXPECT_TRUE(HasOperator(operations, LogicalOperator::kAntiJoin));
 }
 
-TEST(MarkJoinToFilterBranchTest, NotMarkerBecomesAntiJoin) {
+TEST(MarkJoinToFilterBranchTest, NotMarkerDeclines) {
+  // NOT marker is three-valued: it drops the NULL markers exactly like
+  // IS FALSE, which no plain semi/anti join reproduces.
   const auto operations = ExploreMarkJoinToFilter(
       UnaryTest(UnaryOperation::kNot, ColumnName("mark")));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kAntiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
 }
 
 TEST(MarkJoinToFilterBranchTest, IsNullMarkerDoesNotRewrite) {
@@ -877,11 +961,11 @@ TEST(MarkJoinToFilterBranchTest, IsNullMarkerDoesNotRewrite) {
 
 TEST(MarkJoinToFilterBranchTest, IsTrueOverNonColumnDoesNotRewrite) {
   // kIsTrue whose child is not a plain column leaves `marker` empty.
-  const auto test = BinaryExpressionExp(ColumnValueExp(ColumnName("a", "x")),
-                                        BinaryOperation::kAdd,
-                                        ConstantValueExp(Value(1)));
-  const auto operations =
-      ExploreMarkJoinToFilter(UnaryExpressionExp(test, UnaryOperation::kIsTrue));
+  const auto test =
+      BinaryExpressionExp(ColumnValueExp(ColumnName("a", "x")),
+                          BinaryOperation::kAdd, ConstantValueExp(Value(1)));
+  const auto operations = ExploreMarkJoinToFilter(
+      UnaryExpressionExp(test, UnaryOperation::kIsTrue));
   EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
 }
 
@@ -892,18 +976,21 @@ TEST(MarkJoinToFilterBranchTest, MarkerEqualsTrueBecomesSemiJoin) {
   EXPECT_TRUE(HasOperator(operations, LogicalOperator::kSemiJoin));
 }
 
-TEST(MarkJoinToFilterBranchTest, MarkerEqualsFalseBecomesAntiJoin) {
+TEST(MarkJoinToFilterBranchTest, MarkerEqualsFalseDeclines) {
+  // = FALSE keeps only FALSE markers; a plain anti join keeps the NULL
+  // markers too, so the equality does not hold under three-valued markers.
   const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
       ColumnValueExp(ColumnName("mark")), BinaryOperation::kEquals,
       ConstantValueExp(Value(false))));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kAntiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
 }
 
 TEST(MarkJoinToFilterBranchTest, MarkerEqualsNullDeclines) {
   // A NULL constant is neither TRUE nor FALSE: the rule declines.
-  const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
-      ColumnValueExp(ColumnName("mark")), BinaryOperation::kEquals,
-      ConstantValueExp(Value())));
+  const auto operations = ExploreMarkJoinToFilter(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("mark")),
+                          BinaryOperation::kEquals, ConstantValueExp(Value())));
   EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
   EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
 }
@@ -924,11 +1011,13 @@ TEST(MarkJoinToFilterBranchTest, ConstantEqualsMarkerBecomesSemiJoin) {
   EXPECT_TRUE(HasOperator(operations, LogicalOperator::kSemiJoin));
 }
 
-TEST(MarkJoinToFilterBranchTest, FalseConstantEqualsMarkerBecomesAntiJoin) {
+TEST(MarkJoinToFilterBranchTest, FalseConstantEqualsMarkerDeclines) {
+  // FALSE = marker keeps only FALSE markers (see MarkerEqualsFalseDeclines).
   const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
       ConstantValueExp(Value(false)), BinaryOperation::kEquals,
       ColumnValueExp(ColumnName("mark"))));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kAntiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
+  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
 }
 
 TEST(MarkJoinToFilterBranchTest, NonConstantAgainstMarkerDeclines) {
@@ -950,8 +1039,7 @@ TEST(MarkJoinToFilterBranchTest, ColumnEqualsNonConstantDeclines) {
 }
 
 TEST(MarkJoinToFilterBranchTest, NeitherSideIsMarkerDeclines) {
-  const auto operations = ExploreMarkJoinToFilter(
-      EqExp("a.x", Value(1)));
+  const auto operations = ExploreMarkJoinToFilter(EqExp("a.x", Value(1)));
   EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
   EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
 }

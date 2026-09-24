@@ -1,0 +1,102 @@
+-- tinylamb-session-test v1
+-- seed: 5
+-- stmt: CREATE TABLE tbl0 (u INT64, c1 VARCHAR(8), c2 INT64, c3 INT64);
+-- stmt: INSERT INTO tbl0 VALUES (0, 'a', NULL, -1);
+-- stmt: INSERT INTO tbl0 VALUES (1, 'a', 0, 3);
+-- stmt: INSERT INTO tbl0 VALUES (2, NULL, -3, 2);
+-- stmt: INSERT INTO tbl0 VALUES (3, 'a', -2, 3);
+-- stmt: INSERT INTO tbl0 VALUES (4, NULL, -2, -3);
+-- commit
+-- begin2
+-- stmt2: DELETE FROM tbl0 WHERE tbl0.u = 2;
+-- stmt: INSERT INTO tbl0 VALUES (5, NULL, 2, 2);
+-- abort2
+-- check2: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- crash
+-- check: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- check2: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- stmt2: UPDATE tbl0 SET c3 = u WHERE tbl0.u = 0;
+-- stmt2: UPDATE tbl0 SET c2 = NULL WHERE tbl0.u = 3;
+-- stmt2: DELETE FROM tbl0 WHERE tbl0.u = 4;
+-- commit
+-- check: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- stmt2: DELETE FROM tbl0 WHERE tbl0.u = 0;
+-- stmt: INSERT INTO tbl0 VALUES (6, 'bb', NULL, -2);
+-- fail: UPDATE tbl0 SET c2 = -3 WHERE tbl0.u = 4;
+-- stmt: INSERT INTO tbl0 VALUES (7, NULL, -2, -2);
+-- stmt2: INSERT INTO tbl0 VALUES (8, 'a', -1, -2);
+-- fail: DELETE FROM tbl0 WHERE tbl0.u = 1;
+-- fail: UPDATE tbl0 SET c3 = -2 WHERE tbl0.u = 3;
+-- check: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- expect: [6, "bb", NULL, -2]
+-- expect: [7, NULL, -2, -2]
+-- abort2
+-- check2: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- crash
+-- check: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- check2: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- stmt: UPDATE tbl0 SET c2 = COALESCE(c3, u) WHERE tbl0.u = 2;
+-- abort2
+-- check2: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, -3, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- stmt2: INSERT INTO tbl0 VALUES (9, NULL, -1, 0);
+-- commit
+-- check: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, 2, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- commit2
+-- check2: tbl0
+-- expect: [0, "a", NULL, -1]
+-- expect: [1, "a", 0, 3]
+-- expect: [2, NULL, 2, 2]
+-- expect: [3, "a", -2, 3]
+-- expect: [4, NULL, -2, -3]
+-- expect: [9, NULL, -1, 0]
+-- failure: final state mismatch on tbl0 (txn 1) after step 29

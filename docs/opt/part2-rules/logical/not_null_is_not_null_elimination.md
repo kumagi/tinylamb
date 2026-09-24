@@ -5,7 +5,7 @@
 
 ## 概要
 
-`not_null_is_not_null_elimination` は、選択演算の述語に含まれる `col IS NOT NULL` 連言項について、対象列 `col` がスキーマ上で NOT NULL 制約または PRIMARY KEY 制約を持つことが静的に証明できる場合に、その連言項を述語から除去する論理変換Ruleです。
+`not_null_is_not_null_elimination` は、選択演算の述語に含まれる `col IS NOT NULL` 連言項について、対象列 `col` がスキーマ上で NOT NULL 制約または PRIMARY KEY 制約を持つことが静的に証明できる場合に、その連言項を述語から除去する論理変換 Rule です。
 
 常に TRUE と評価される冗長な NULL チェック条件をコンパイル時に排除し、実行時の式評価コストを低減させるとともに、後続の述語プッシュダウンやインデックス選択の適合性を高めます。
 
@@ -31,8 +31,8 @@ graph TD
 
 以下のガード条件をすべて満たす必要があります。
 
-1. **選択ノードの完全性**: 式が `kSelection` であり、子ノードを1つ持ち、述語が存在すること。
-2. **非循環性の担保**: 子グループが親グループ自身でないこと（`input_id != group`）。
+1. **選択ノードの完全性**: 式が `kSelection` であり、子ノードを1 つ持ち、述語が存在すること。
+2. **非循環性の保証**: 子グループが親グループ自身でないこと（`input_id != group`）。
 3. **NOT NULL 制約の静的証明**: 子グループ内のいずれかの代替式の `output_schema` において、`Constraint::kNotNull` または `Constraint::kPrimaryKey` が明示宣言されている列が存在すること（UNIQUE 制約単独は不可）。
 4. **対象項の合致**: 述語の連言中に「素の列参照に対する `kIsNotNull` 単項式」が存在し、かつその修飾名がステップ3で収集された証明済み列集合に含まれていること。
 
@@ -84,7 +84,7 @@ SQL の三値論理において、値 $v$ に対する `v IS NOT NULL` は、$v 
           }
 ```
 
-- **全項除去時のフォールバック**: 証明によりすべての項が除去された場合（`kept.empty()`）、本Ruleは Selection 自体を消去せず、明示的に `ConstantValueExp(Value(true))` を述語とする Selection ノードを生成します。
+- **全項除去時のフォールバック**: 証明によりすべての項が除去された場合（`kept.empty()`）、本 Rule は Selection 自体を消去せず、明示的に `ConstantValueExp(Value(true))` を述語とする Selection ノードを生成します。
 
   ```cpp
             if (kept.empty()) {
@@ -102,16 +102,16 @@ SQL の三値論理において、値 $v$ に対する `v IS NOT NULL` は、$v 
 
 ## 最適化効果
 
-本Ruleの適用により、以下のメリットが得られます。
+本 Rule の適用により、以下のメリットが得られます。
 
 - **冗長評価の排除**: 毎行評価されていたブール判定が消去されます。
 - **SARG 探索の単純化**: 複合述語から不要な条件が取り除かれることで、オプティマイザが真にインデックス探索引数として利用すべき述語に集中でき、より効率的なアクセスパスを選択できます。
 
 ## 関連 Rule との相互作用
 
-- `eliminate_true_selection`: すべての述語が除去されて `Selection(TRUE)` となった式を検知し、Selection 演算子そのものを除去して下位スキャンを直接露出させます。
-- `outer_to_inner_join_on_null_rejecting_filter`: NULL 排除性を利用して外部結合を内部結合へ昇格させる関連Ruleです。
-- 式書き換え層（`expression/rewrite.cpp`）: 式レベルの恒真変形（`NOT (x IS NULL)` 等）を事前に本Ruleが受容可能な形式へと整えます。
+- `eliminate_true_selection`: すべての述語が除去されて `Selection(TRUE)` となった式を検知し、Selection 演算子を除いて下位スキャンを直接参照できる形にします。
+- `outer_to_inner_join_on_null_rejecting_filter`: NULL 排除性を利用して外部結合を内部結合へ昇格させる関連 Rule です。
+- 式書き換え層（`expression/rewrite.cpp`）: 式レベルの恒真変形（`NOT (x IS NULL)` 等）を事前に本 Rule が受容可能な形式へと整えます。
 
 ## 検証テスト
 

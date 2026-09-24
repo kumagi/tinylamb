@@ -45,6 +45,20 @@ class PlanBase {
 
   virtual Executor EmitExecutor(TransactionContext& txn) const = 0;
 
+  // True when this node or a descendant still holds a ParameterSlot, so a
+  // compiled-plan replay can rebind literals. The default is false: a wrapper
+  // that forgets to forward simply disables parametric reuse, which recompiles
+  // instead of executing sniffed constants against a different literal.
+  [[nodiscard]] virtual bool ContainsParameterSlots() const { return false; }
+
+  // Collects ParameterSlots already stamped in SQL-text order. Parent
+  // expressions are visited before children. The default has no literals.
+  virtual bool InstallParameterSlots(const std::vector<Value>& /*parameters*/,
+                                     size_t* /*cursor*/,
+                                     std::vector<Expression>* /*slots*/) {
+    return true;
+  }
+
   [[nodiscard]] virtual const Table* ScanSource() const = 0;
   [[nodiscard]] virtual const TableStatistics& GetStats() const = 0;
   [[nodiscard]] virtual const Schema& GetSchema() const = 0;
@@ -55,15 +69,13 @@ class PlanBase {
       const std::vector<bool>& /*ascending*/) const {
     return false;
   }
-  // Null-placement-aware variant. `nulls_first[i]` parallels `expressions[i]`
-  // (absent/short entries mean the engine default, i.e. NULLS FIRST for ASC
-  // and NULLS LAST for DESC). Plans that cannot verify null placement
-  // inherit this default, which delegates to the legacy two-argument check.
   [[nodiscard]] virtual bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending,
       const std::vector<std::optional<bool>>& /*nulls_first*/) const {
-    return IsOrderedBy(expressions, ascending);
+    static_cast<void>(expressions);
+    static_cast<void>(ascending);
+    return false;
   }
   // True when the plan already caps its output to `limit_count` rows after
   // skipping `limit_offset`, so callers must not apply the same LIMIT/OFFSET

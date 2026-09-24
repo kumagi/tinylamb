@@ -11,6 +11,7 @@
 
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 
 namespace tinylamb {
 
@@ -90,6 +91,29 @@ std::string TopNPlan::ToString() const {
   }
   output << "]";
   return output.str();
+}
+
+bool TopNPlan::ContainsParameterSlots() const {
+  if (child_->ContainsParameterSlots()) {
+    return true;
+  }
+  return std::ranges::any_of(keys_, [](const TopNKey& key) {
+    return ContainsParameterSlot(key.expression);
+  });
+}
+
+bool TopNPlan::InstallParameterSlots(const std::vector<Value>& parameters,
+                                     size_t* cursor,
+                                     std::vector<Expression>* slots) {
+  if (!child_->InstallParameterSlots(parameters, cursor, slots)) {
+    return false;
+  }
+  for (TopNKey& key : keys_) {
+    if (!SlotizeInPlace(&key.expression, parameters, cursor, slots)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace tinylamb

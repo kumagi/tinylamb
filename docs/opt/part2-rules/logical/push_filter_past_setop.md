@@ -68,11 +68,11 @@ guard の列挙は次のとおりです。
 
 この Rule の意味保存の核心は 2 つあります。
 
-1. **行ごとのフィルタは重複排除と可換**。UNION(DISTINCT) や
-   INTERSECT / EXCEPT は行の重複を潰しますが、フィルタが行の値だけに
-   依存するなら「潰してから絞る」は「絞ってから潰す」と同じ行集合に
+1. **行ごとのフィルタは重複排除と可換**。UNION（DISTINCT）や
+   INTERSECT / EXCEPT は行の重複を除きますが、フィルタが行の値だけに
+   依存するなら「重複を除いてから絞る」場合も「絞ってから重複を除く」場合も同じ行集合に
    なります。登録コメントの「Row-wise filtering commutes with duplicate
-   elimination」がこの根拠で、ALL 変種(重複を潰さない)では自明に可換です。
+   elimination」がこの根拠で、ALL 変種（重複を保持する）では自明に可換です。
 2. **集合演算の出力は位置揃えの契約**。しかし述語が分岐の誰かが持って
    いない列に触れるとき、押し込んだ先でその列は解決できません。
    修飾付き `t1.a > 0` を `t1` を持たない分岐へ押し込むのは誤りであり、
@@ -143,7 +143,7 @@ D5 反例テストがこの 2 面を固定します。
 
 ## 最適化効果
 
-適用後の Group には「上の Selection」と「分岐ごとの Selection」の 2 代替が
+適用後の Group には「上の Selection 」と「分岐ごとの Selection 」の 2 代替が
 並びます。分岐側が選ばれると、集合演算の入力が先に間引かれ、
 DISTINCT の処理対象行・集合演算の中間バッファが縮みます。分岐の 1 つが
 スキャンであれば、押し込まれた Selection はさらに
@@ -155,7 +155,7 @@ DISTINCT の処理対象行・集合演算の中間バッファが縮みます�
 - `push_filter_through_distinct` / `push_filter_through_sort`:
   「フィルタと行単位の演算の可換性」を使う同じ族の Rule です。
 - `push_selection_through_aggregation` / `push_selection_through_projection`:
-  押し込んだ先の分岐が集約・射影のときに続けて効きます。
+  押し込み先の分岐が集約や射影である場合に、続けて適用できます。
 - `union_to_union_all_plus_distinct` / `union_all_merge`:
   分岐集合演算そのものの形を整える Rule で、本 Rule と独立に発火します。
 

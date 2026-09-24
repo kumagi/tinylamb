@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -12,6 +13,7 @@
 #include "common/constants.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
 #include "type/column_name.hpp"
@@ -21,47 +23,45 @@ namespace tinylamb {
 
 MergeJoinPlan::MergeJoinPlan(Plan left, std::vector<ColumnName> left_keys,
                              Plan right, std::vector<ColumnName> right_keys,
-                             JoinKind kind, Expression residual)
+                             JoinKind kind, Expression residual,
+                             std::optional<size_t> estimated_rows)
     : left_(std::move(left)),
       right_(std::move(right)),
       left_keys_(std::move(left_keys)),
       right_keys_(std::move(right_keys)),
       kind_(kind),
       residual_(std::move(residual)),
-      schema_(IsSemiJoinKind(kind_) || IsAntiJoinKind(kind_)
+      schema_(IsSemiJoinKind(kind_) || IsAntiJoinKind(kind_) ||
+                      IsNullAwareAntiJoinKind(kind_)
                   ? left_->GetSchema()
                   : left_->GetSchema() + right_->GetSchema()),
-      stats_(left_->GetStats().ScaleToRows(
-          std::min(left_->GetStats().Rows(), right_->GetStats().Rows()))) {
+      stats_(left_->GetStats().ScaleCardinality(
+          EstimatedJoinRowCount(kind_, left_->GetStats().Rows(),
+                                right_->GetStats().Rows(), estimated_rows))) {
   const bool keys_valid =
       !left_keys_.empty() && left_keys_.size() == right_keys_.size();
   CHECK_MSG(keys_valid, "MergeJoinPlan requires equally-sized non-empty keys");
-  stats_.Concat(right_->GetStats().ScaleToRows(stats_.Rows()));
+  if (!IsSemiJoinKind(kind_) && !IsAntiJoinKind(kind_) &&
+      !IsNullAwareAntiJoinKind(kind_)) {
+    stats_.Concat(right_->GetStats().ScaleCardinality(stats_.Rows()));
+  }
 }
 
 size_t MergeJoinPlan::AccessRowCount() const {
   return left_->AccessRowCount() + right_->AccessRowCount();
 }
 
-size_t MergeJoinPlan::EmitRowCount() const {
-  if (IsSemiJoinKind(kind_)) {
-    return std::min(left_->EmitRowCount(), right_->EmitRowCount());
-  }
-  if (IsAntiJoinKind(kind_)) {
-    return left_->EmitRowCount();
-  }
-  if (IsLeftOuterJoinKind(kind_) || IsRightOuterJoinKind(kind_) ||
-      IsFullOuterJoinKind(kind_)) {
-    return std::max(left_->EmitRowCount(), right_->EmitRowCount());
-  }
-  return std::min(left_->EmitRowCount(), right_->EmitRowCount());
-}
+size_t MergeJoinPlan::EmitRowCount() const { return stats_.Rows(); }
 
 bool MergeJoinPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                 const std::vector<bool>& ascending) const {
-  // Right/full outer output appends unmatched right rows after the merge and
-  // therefore cannot claim the left-key order. Left outer preserves the left
-  // traversal order because unmatched right rows are never emitted.
+  return IsOrderedBy(expressions, ascending, {});
+}
+
+bool MergeJoinPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
   if (IsRightOuterJoinKind(kind_) || IsFullOuterJoinKind(kind_)) {
     return false;
   }
@@ -79,7 +79,7 @@ bool MergeJoinPlan::IsOrderedBy(const std::vector<Expression>& expressions,
     }
     left_order.push_back(expressions[i]);
   }
-  return left_->IsOrderedBy(left_order, ascending);
+  return left_->IsOrderedBy(left_order, ascending, nulls_first);
 }
 
 void MergeJoinPlan::Dump(std::ostream& o, int indent) const {
@@ -100,6 +100,19 @@ std::string MergeJoinPlan::ToString() const {
   }
   s += ")";
   return s;
+}
+
+bool MergeJoinPlan::ContainsParameterSlots() const {
+  return left_->ContainsParameterSlots() || right_->ContainsParameterSlots() ||
+         ContainsParameterSlot(residual_);
+}
+
+bool MergeJoinPlan::InstallParameterSlots(const std::vector<Value>& parameters,
+                                          size_t* cursor,
+                                          std::vector<Expression>* slots) {
+  return left_->InstallParameterSlots(parameters, cursor, slots) &&
+         right_->InstallParameterSlots(parameters, cursor, slots) &&
+         SlotizeInPlace(&residual_, parameters, cursor, slots);
 }
 
 }  // namespace tinylamb

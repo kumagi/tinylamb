@@ -115,7 +115,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       （`IsOrderedBy` でエンジン安全網との二重適用を防止）
 - [x] `ExternalMergeSort` のプラン接続（`SortPlan` が既存
       `SortExecutor` を駆動。単一キー radix / 複合キー安定ソートも既存実装）
-- [ ] `InMemoryQuickSort` / `pdqsort` 経路
+- [x] `InMemoryQuickSort` / `pdqsort` 経路
 - [x] `TopNPlan` / `TopNExecutor`（ヒープで `OFFSET + LIMIT` 件だけ保持）
 - [x] `TopNPlusOffset`（TopNの容量と出力位置で対応）
 - [x] `WITH TIES` Top-N（TopNExecutor の ties 境界拡張）
@@ -164,7 +164,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 - [x] `BitmapIndexScan` + `BitmapHeapScan`（単一キーの複数インデックス OR/AND を optimizer に接続）
 - [x] `BitmapAnd` / `BitmapOr` オペレータ
-- [ ] `TidScan` / `RowIdLookup` / `CTID` 相当
+- [x] `TidScan` / `RowIdLookup` / `CTID` 相当
 - [ ] `IndexSkipScan`（先頭列が等式でない複合インデックス）
 - [ ] `IndexOnlyScan` の visibility map 相当（MVCC で heap fetch 省略を広げる）
 - [ ] `CoveringIndex` 選択のコスト精度
@@ -178,7 +178,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `DummyScan` / `OneRow`（`DummyScanPlan` + `ValuesExecutor`。SELECT 1 を
       Optimizer 経路で実行）
 - [x] `ValuesScan`（多行 VALUES の `ValuesPlan` / `ValuesExecutor`）
-- [x] `FunctionScan` / TVF（関数由来の配列を `LoadSource` が行源化）
+- [ ] `FunctionScan` / TVF（関数由来の配列を `LoadSource` が行源化）
 - [x] `UnnestScan`（配列、STRUCT/PROTO、WITH OFFSET、相関 lateral 経路）
 - [x] `WorkTableScan`（再帰 CTE。反復ごとに CteMap の CTE 名を差分 Relation に
       束縛する形で実装。専用インデックスアクセスは `WorkTableIndex` が未実装）
@@ -298,13 +298,13 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       DML 論理ノード導入時に置換する）
 - [x] `BatchInsert`（`Insert` が複数行 source を最後まで消費して一括挿入。
       `Insert_FromSourceTable_InsertsAllRows` と上記 INSERT SELECT 回帰で確認）
-- [ ] `Upsert` / `ON CONFLICT`
+- [x] `Upsert` / `ON CONFLICT`
 - [x] `MergeExecutor`（MATCHED / NOT MATCHED）
 - [ ] `UpdateFrom` / `DeleteUsing`（結合更新）
-- [ ] `ReturningExecutor`
+- [x] `ReturningExecutor`
 - [ ] `LockRows` / `SELECT FOR UPDATE`
 - [ ] `SkipLocked` / `NOWAIT`
-- [ ] `Truncate` 実行器（カタログ操作との境界）
+- [x] `Truncate` 実行器（カタログ操作との境界）
 - [ ] トリガ相当の before/after 行フック（将来）
 
 ---
@@ -317,11 +317,11 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `PipelineBreaker` 明示（Hash build、Sort、Materialize）
 - [ ] morsel-driven 並列の Cascades DOP 接続（`QueryScheduler` 既存）
 - [ ] `Exchange` / `Gather` / `Redistribute` 実行器（単一ノードはスレッド間）
-- [ ] `ParallelHashJoin`（共有ビルド表）
-- [ ] `ParallelMergeJoin`
+- [x] `ParallelHashJoin`（共有ビルド表）
+- [x] `ParallelMergeJoin`
 - [ ] `ScanPartition` ステアリング
-- [ ] NUMA 意識のアリーナ
-- [ ] SIMD 比較カーネル（INT64 は JIT と役割分担）
+- [x] NUMA 意識のアリーナ
+- [x] SIMD 比較カーネル（INT64 は JIT と役割分担）
 - [ ] バッチ集約の辞書エンコード
 - [ ] 圧縮カラムの直接スキャン（PAX）
 - [ ] ゼロコピー投影（列参照のみ）
@@ -366,8 +366,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 - [x] `AnalyzeScan`（ヒストグラム構築用）
 - [x] `ReservoirSample`
-- [x] `BlockSample`
-- [x] `HyperLogLogScan`
+- [ ] `BlockSample`
+- [x] HyperLogLogによる統計収集（`AnalyzeScan` 内部で使用）
 - [x] 実行時フィードバック用 `CardinalityProbe`（デバッグ）
 
 ---

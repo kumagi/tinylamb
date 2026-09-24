@@ -70,27 +70,41 @@ bool KeyImageHasNull(const Row& key_image) {
                              [](const Value& value) { return value.IsNull(); });
 }
 
+TableLease AcquireTableLease(const Table& table, Transaction& txn) {
+  StatusOr<TableLease> lease = table.AcquireLease(txn.ID());
+  return lease.HasValue() ? lease.MoveValue() : TableLease();
+}
+
+TransactionManager::IndexReadGuard AcquireIteratorIndexReadGuard(
+    Transaction& txn, const Index& index, bool resolve_head,
+    TransactionManager::IndexReadGuard* external_guard) {
+  if (external_guard != nullptr || resolve_head) {
+    return {};
+  }
+  return txn.AcquireIndexReadGuard(index.Root());
+}
+
 }  // namespace
 
 bool IndexScanIterator::StoredAsSingleValue() const {
   return is_unique_ && !KeyImageHasNull(keys_);
 }
 
-IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
-                                     Transaction& txn, const Value& begin,
-                                     const Value& end, bool ascending,
-                                     bool resolve_head)
+IndexScanIterator::IndexScanIterator(
+    const Table& table, const Index& index, Transaction& txn,
+    const Value& begin, const Value& end, bool ascending, bool resolve_head,
+    TransactionManager::IndexReadGuard* index_read_guard)
     : IndexScanIterator(
           table, index, txn,
           begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
           end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
-          ascending, resolve_head) {}
+          ascending, resolve_head, index_read_guard) {}
 
-IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
-                                     Transaction& txn,
-                                     const std::vector<Value>& begin_key,
-                                     const std::vector<Value>& end_key,
-                                     bool ascending, bool resolve_head)
+IndexScanIterator::IndexScanIterator(
+    const Table& table, const Index& index, Transaction& txn,
+    const std::vector<Value>& begin_key, const std::vector<Value>& end_key,
+    bool ascending, bool resolve_head,
+    TransactionManager::IndexReadGuard* index_read_guard)
     : table_(table),
       index_(index),
       txn_(txn),
@@ -99,10 +113,19 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
       ascending_(ascending),
       resolve_head_(resolve_head),
       is_unique_(index.StoresSingleValue()),
+      table_lease_(AcquireTableLease(table, txn)),
+      index_read_lock_(AcquireIteratorIndexReadGuard(txn, index, resolve_head,
+                                                     index_read_guard)),
       bpt_(index.Root()),
-      iter_(&bpt_, &txn, EncodeParts(begin_key), EncodeEndParts(index, end_key),
-            ascending) {
+      iter_() {
+  if (!table_lease_.Valid()) {
+    status_ = Status::kConflicts;
+    return;
+  }
+  iter_ = BPlusTreeIterator(&bpt_, &txn, EncodeParts(begin_key),
+                            EncodeEndParts(index, end_key), ascending);
   if (!iter_.IsValid()) {
+    status_ = iter_.GetStatus();
     return;
   }
   keys_.DecodeMemcomparableFormat(iter_.Key());
@@ -174,6 +197,12 @@ void IndexScanIterator::UpdateIteratorState() {
       Clear();
       return;
     }
+    // Single-value entries never index into a list; the sentinel also
+    // marks "next multi-value entry is entered fresh" for the branch
+    // below (a kUnique scan alternates between the two encodings at NULL
+    // keys, and the step operators do not touch the offset on single
+    // entries).
+    value_offset_ = -1;
     pos_ = rp.Value().pos;
     include_ = rp.Value().include;
   } else {
@@ -183,6 +212,12 @@ void IndexScanIterator::UpdateIteratorState() {
       status_ = val.GetStatus();
       Clear();
       return;
+    }
+    if (value_offset_ < 0) {
+      // Entering this list at its first (ascending) or last (descending)
+      // element; see the sentinel reset in the single-value branch.
+      value_offset_ =
+          ascending_ ? 0 : static_cast<int64_t>(val.Value().size()) - 1;
     }
     if (val.Value().empty() || value_offset_ < 0 ||
         static_cast<size_t>(value_offset_) >= val.Value().size()) {
@@ -250,16 +285,7 @@ IteratorBase& IndexScanIterator::operator++() {
       --value_offset_;
     } else {
       --iter_;
-      if (iter_.IsValid()) {
-        StatusOr<std::vector<Table::IndexValueType> > val =
-            Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-        if (!val.HasValue()) {
-          status_ = val.GetStatus();
-          Clear();
-          return *this;
-        }
-        value_offset_ = static_cast<int64_t>(val.Value().size()) - 1;
-      }
+      value_offset_ = -1;
     }
     UpdateIteratorState();
     return *this;
@@ -304,16 +330,7 @@ IteratorBase& IndexScanIterator::operator--() {
       --value_offset_;
     } else {
       --iter_;
-      if (iter_.IsValid()) {
-        StatusOr<std::vector<Table::IndexValueType> > val =
-            Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-        if (!val.HasValue()) {
-          status_ = val.GetStatus();
-          Clear();
-          return *this;
-        }
-        value_offset_ = static_cast<int64_t>(val.Value().size()) - 1;
-      }
+      value_offset_ = -1;
     }
   }
   UpdateIteratorState();

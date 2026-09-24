@@ -11,6 +11,7 @@
 
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "index/index.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
@@ -23,11 +24,11 @@ BitmapScanPlan::BitmapScanPlan(const Table& table, TableStatistics statistics,
                                BitmapCombine combine, Expression where,
                                size_t estimated_rows, size_t access_rows)
     : table_(table),
-      statistics_(std::move(statistics)),
+      statistics_(statistics.ScaleCardinality(estimated_rows)),
       ranges_(std::move(ranges)),
       combine_(combine),
       where_(std::move(where)),
-      estimated_rows_(std::max<size_t>(1, estimated_rows)),
+      estimated_rows_(estimated_rows),
       access_rows_(std::max<size_t>(1, access_rows)) {}
 
 const Schema& BitmapScanPlan::GetSchema() const { return table_.GetSchema(); }
@@ -63,6 +64,16 @@ std::string BitmapScanPlan::ToString() const {
   std::ostringstream output;
   Dump(output, 0);
   return output.str();
+}
+
+bool BitmapScanPlan::ContainsParameterSlots() const {
+  return ContainsParameterSlot(where_);
+}
+
+bool BitmapScanPlan::InstallParameterSlots(const std::vector<Value>& parameters,
+                                           size_t* cursor,
+                                           std::vector<Expression>* slots) {
+  return SlotizeInPlace(&where_, parameters, cursor, slots);
 }
 
 }  // namespace tinylamb

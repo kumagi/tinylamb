@@ -7,7 +7,7 @@
 
 `push_aggregation_through_union_all` は、`Aggregation(UnionAll(B1, B2, ...))` という論理構造に対し、分配可能な集約関数（`MIN`, `MAX`, `SUM`）を `UnionAll` の各枝へと押し込み、その上で再集約を行う等価論理式を Memo に登録する変換ルールです。
 
-部分集約（Partial Aggregation）をユニオンの各枝で事前に評価することにより、`UnionAll` ノードおよび最終段の集約ノードが処理すべき入力行数を各枝のグループ数まで劇的に圧縮します。
+部分集約（Partial Aggregation）をユニオンの各枝で事前に評価することにより、`UnionAll` ノードおよび最終段の集約ノードが処理すべき入力行数を各枝のグループ数まで削減します。
 
 ## 変換前後の関係
 

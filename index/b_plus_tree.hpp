@@ -50,8 +50,12 @@ class BPlusTree {
   Status Update(Transaction& txn, std::string_view key, std::string_view value,
                 page_id_t* hint_leaf = nullptr);
   Status Delete(Transaction& txn, std::string_view key) const;
-  StatusOr<std::string_view> Read(Transaction& txn, std::string_view key,
-                                  page_id_t* hint_leaf = nullptr) const;
+  // Returns an owned copy: the value lives in a leaf page whose shared latch
+  // is released the moment this returns, so handing back a view into the
+  // page body would race concurrent writers decoding it (IndexInsert /
+  // IndexDelete decode after the pin is gone).
+  StatusOr<std::string> Read(Transaction& txn, std::string_view key,
+                             page_id_t* hint_leaf = nullptr) const;
   void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
   [[nodiscard]] page_id_t Root() const { return root_; }
   BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",

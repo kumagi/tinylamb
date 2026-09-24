@@ -121,6 +121,7 @@ struct ProjCol {
     kFactU,
     kFactA,
     kFactK,
+    kMergedK,
     kDimK,
     kDimTag,
     kDim2K,
@@ -139,6 +140,11 @@ std::string FormatJoined(const ProjCol& col, const FactRow* f, const DimRow* d,
       return f == nullptr ? std::string("NULL") : Fmt(f->a);
     case ProjCol::kFactK:
       return f == nullptr ? std::string("NULL") : Fmt(f->k);
+    case ProjCol::kMergedK:
+      // The USING column is COALESCE(f.k, d.k): it survives on either
+      // null-extended side, unlike the raw f.k/d.k projections.
+      return f != nullptr ? Fmt(f->k)
+                          : (d != nullptr ? Fmt(d->k) : std::string("NULL"));
     case ProjCol::kDimK:
       return d == nullptr ? std::string("NULL") : Fmt(d->k);
     case ProjCol::kDimTag:
@@ -254,13 +260,15 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       const int on1_kind = g.Chance(60) ? 0 : g.Pick(1, 2);
       static constexpr std::array<std::string_view, 6> kOps = {
           "=", "<>", "<", "<=", ">", ">="};
-      const std::string on1_op = std::string(kOps[g.Pick(0, 5)]);
+      const std::string on1_op =
+          std::string(kOps[static_cast<size_t>(g.Pick(0, 5))]);
       std::string on1 = on1_kind == 0   ? "f.k = d.k"
                         : on1_kind == 1 ? "f.k " + on1_op + " d.k"
                                         : "f.a " + on1_op + " d.k";
       const int on2_kind = g.Pick(0, 3);  // 0 f.k=d2.k, 1 d.k=d2.k,
                                           // 2 f.a<cmp>d2.k, 3 d.k<cmp>d2.k
-      const std::string on2_op = std::string(kOps[g.Pick(0, 5)]);
+      const std::string on2_op =
+          std::string(kOps[static_cast<size_t>(g.Pick(0, 5))]);
       std::string on2 = on2_kind == 0   ? "f.k = d2.k"
                         : on2_kind == 1 ? "d.k = d2.k"
                         : on2_kind == 2 ? "f.a " + on2_op + " d2.k"
@@ -272,7 +280,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       if (res2 == 1) {
         on2 += " AND d2.tag = 'x'";
       } else if (res2 == 2) {
-        res2_op = std::string(kOps[g.Pick(0, 5)]);
+        res2_op = std::string(kOps[static_cast<size_t>(g.Pick(0, 5))]);
         res2_const = g.Pick(-3, 3);
         on2 += " AND f.a " + res2_op + " " + std::to_string(res2_const);
       }
@@ -294,9 +302,17 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         proj.push_back({ProjCol::kDim2K});
         proj_sql += ", d2.k";
       }
-      std::string sql = "SELECT " + proj_sql + " FROM fact f " + kw(j1) +
-                        " dim d ON " + on1 + " " + kw(j2) + " dim d2 ON " +
-                        on2 + ";";
+      std::string sql = "SELECT ";
+      sql += proj_sql;
+      sql += " FROM fact f ";
+      sql += kw(j1);
+      sql += " dim d ON ";
+      sql += on1;
+      sql += " ";
+      sql += kw(j2);
+      sql += " dim d2 ON ";
+      sql += on2;
+      sql += ";";
 
       auto num_cmp = [](int64_t l, const std::string& o, int64_t r) {
         if (l == kNullRepr || r == kNullRepr) {
@@ -330,7 +346,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         const DimRow* d;
       };
       auto match2 = [&](const StageRow& r, const DimRow& d2) {
-        bool ok;
+        bool ok = false;
         switch (on2_kind) {
           case 0:
             ok = r.f != nullptr && num_cmp(r.f->k, "=", d2.k);
@@ -410,7 +426,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       }
       for (size_t j = 0; j < dims.size(); ++j) {
         if (!d2_hit[j] && pr2) {
-          emit({nullptr, nullptr}, &dims[j]);
+          emit({.f = nullptr, .d = nullptr}, &dims[j]);
         }
       }
       std::sort(expected.begin(), expected.end());
@@ -586,10 +602,15 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         }
       }
     }
+    // Plain equi-joins (on_kind <= 5 render as `f.k = d.k`) can equally be
+    // spelled `USING (k)`: same join semantics, but the merged key column
+    // coalesces and the key deduplicates out of `SELECT *`.  The raw
+    // f.k/d.k projections stay valid either way.
+    const bool use_using = join_kind != 4 && on_kind <= 5 && g.Chance(35);
     const std::string join_sql =
-        join_kind == 4
-            ? "fact f CROSS JOIN dim d"
-            : "fact f " + std::string(join_kw) + " dim d ON " + on_sql;
+        join_kind == 4 ? "fact f CROSS JOIN dim d"
+        : use_using ? "fact f " + std::string(join_kw) + " dim d USING (k)"
+                    : "fact f " + std::string(join_kw) + " dim d ON " + on_sql;
 
     // ---- query shape ----------------------------------------------------
     // Large rounds stay on count-shaped probes to keep .test repros small.
@@ -611,6 +632,11 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         if (g.Chance(30)) {
           proj.push_back({ProjCol::kDimK});
           proj_sql += ", d.k";
+        }
+        if (use_using && g.Chance(50)) {
+          // Bare `k` resolves to the merged (coalesced) USING column.
+          proj.push_back({ProjCol::kMergedK});
+          proj_sql += ", k";
         }
         const int filter = g.Pick(0, 2);
         sql = "SELECT ";
@@ -828,7 +854,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         for (const DimRow& d : dims) {
           right.insert(d.k);
         }
-        if (op[0] == 'U' && op[6] == 'A') {  // UNION ALL
+        if (std::string_view(op) == "UNION ALL") {  // UNION ALL
           out = left;
           out.insert(right.begin(), right.end());
         } else {

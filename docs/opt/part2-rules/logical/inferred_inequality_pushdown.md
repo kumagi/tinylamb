@@ -5,9 +5,9 @@
 
 ## 概要
 
-`inferred_inequality_pushdown` は、内側結合の結合条件に含まれる等式 `t1.x = t2.y` と、一方のスキャングループ（例: 表 `t1`）の scan filter に存在する不等号条件（例: `t1.x > 10`）から、他方の表に対する不等号条件 `t2.y > 10` を演繹し、そのスキャングループ（表 `t2`）の scan filter へ追加する述語推論Ruleです。
+`inferred_inequality_pushdown` は、等値結合の一方にある不等号条件を他方へ伝える述語推論 Rule です。たとえば、結合条件 `t1.x = t2.y` と表 `t1` の scan filter `t1.x > 10` から `t2.y > 10` を導き、表 `t2` の scan filter へ追加します。
 
-等式推論Rule（`infer_join_predicates`）の不等号拡張であり、結合の対向側に対して範囲走査（RangeScan）の適用機会を創出します。
+等式推論 Rule（`infer_join_predicates`）の不等号拡張であり、結合の対向側に対して範囲走査（RangeScan）の適用機会を創出します。
 
 ## 変換前後の関係
 
@@ -53,7 +53,7 @@ graph TD
 
 内側結合の出力行は結合述語 `t1.x = t2.y` を必ず満たします。三値論理において、どちらかが NULL の場合、比較結果は UNKNOWN となり内側結合の出力から除外されます。また、`t1` 側スキャンを通過する行は `t1.x > 10` を満たす必要があります（NULL の場合は除外済み）。したがって、結合出力行において `t2.y = t1.x > 10` が成立するため、`t2.y > 10` を `t2` 側のスキャンフィルタに追加しても、元々出力されるはずだった行が不当に除外されることはなく、代数的一致性が保たれます。
 
-本Ruleにおいて等号式をスキップする理由は、等式からの定数推論は `infer_join_predicates` が専任で担っており、最適化Rule間の責務分担を明確にするためです。
+本 Rule において等号式をスキップする理由は、等式からの定数推論は `infer_join_predicates` が専任で担っており、最適化 Rule 間の責務分担を明確にするためです。
 
 外部結合に対する適用禁止（`kJoin` 限定）の理由は、外部結合における NULL 補完行の存在に起因します。`t1 LEFT JOIN t2 ON t1.x = t2.y` において、`t2` 側にマッチする行が存在しない場合、`t2.y` は NULL として保持される必要があります。推論された不等号を `t2` のスキャンへ適用すると、本来 NULL 補完行として残るべき結合候補が消失し、結果が壊れます。
 
@@ -105,9 +105,9 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `infer_join_predicates`: 等式条件を対象とする推論Ruleです。同一のアーキテクチャを共有します。
-- `join_predicate_transitivity`: 結合述語の等式鎖を拡張するRuleです。等式ペアが増加することで、本Ruleの推論路が拡張されます。
-- `extract_year_sargable` / `cast_pushdown_on_comparison`: スキャンフィルタに登録された不等号述語を、SARG可能な形式へ変形する後続の式書き換えRuleです。
+- `infer_join_predicates`: 等式条件を対象とする推論 Rule です。同一のアーキテクチャを共有します。
+- `join_predicate_transitivity`: 結合述語の等式鎖を拡張する Rule です。等式ペアが増加することで、本 Rule の推論路が拡張されます。
+- `extract_year_sargable` / `cast_pushdown_on_comparison`: スキャンフィルタに登録された不等号述語を、SARG可能な形式へ変形する後続の式書き換え Rule です。
 
 ## 検証テスト
 

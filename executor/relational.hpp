@@ -68,10 +68,16 @@ class RelationalExecutor : public ExecutorBase {
   double join_ms_{0};
   double project_ms_{0};
   double sort_ms_{0};
+  size_t topn_finish_uses_{0};
+  size_t topn_finish_capacity_{0};
+  size_t topn_finish_input_rows_{0};
+  double planning_ms_{0};
+  double join_estimate_ms_{0};
   size_t base_scan_cache_hits_{0};
   size_t aggregate_input_rows_{0};
   size_t aggregate_groups_{0};
   size_t aggregate_updates_{0};
+  double aggregate_ms_{0};
   size_t scan_rows_{0};
   size_t scan_output_rows_{0};
   size_t scan_values_decoded_{0};

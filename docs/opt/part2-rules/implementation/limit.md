@@ -45,7 +45,7 @@ if (children.size() != 1) {
 // SortExecutor remains responsible (D6).
 ```
 
-クエリが `ORDER BY` を要求しているにもかかわらず、子プランがインデックス順序を提供しておらず明示的な `SortPlan` も物理化されていない段階で `LimitPlan` を子ノード直上に配置すると、整序前の任意の N 行で打ち切る誤ったプランが形成されます。整序が確定する前の打ち切りは真の Top-N 結果を不可逆的に破壊するため、この局面では `LimitPlan` の生成を抑止し、子プランをゼロコストでそのまま透過させます。最終的な行制限は、実行エンジン側で `SortExecutor` の上流に配置される `LimitExecutor` のセーフティネットに委ねられます（D6 規律）。
+クエリが `ORDER BY` を要求しているのに、子プランがインデックス順序を提供せず、明示的な `SortPlan` もない段階で `LimitPlan` を配置すると、整列前の任意の N 行で処理を打ち切ります。これでは正しい Top-N を返せません。そのため、この段階では `LimitPlan` を生成せず、子プランをゼロコストでそのまま通します。最終的な行数制限は、実行エンジン側で `SortExecutor` の上流に置く `LimitExecutor` が担当します（D6 規律）。
 
 ## 実装の詳細
 
@@ -116,7 +116,7 @@ return std::vector<PlanAlternative>{
 
 ## 最適化効果
 
-`LimitPlan` の先読み打ち止め効果（Early-out）により、下流のスキャンや結合の読み取り走査行数を $\text{OFFSET} + \text{LIMIT}$ に抑え込み、クエリ実行コストを劇的に削減します。また、子ノードが `SortPlan` である場合は優先度付きヒープを用いた `TopNPlan` へ融合され、全件ソートに必要な $O(N \log N)$ の計算量とメモリ消費を $O(N \log K)$ に圧縮します。
+`LimitPlan` の先読み打ち止め（Early-out）により、下流のスキャンや結合が読み取る行数を $\text{OFFSET} + \text{LIMIT}$ に抑えます。また、子ノードが `SortPlan` である場合は、優先度付きヒープを用いた `TopNPlan` へ統合し、全件ソートの計算量とメモリ消費を $O(N \log N)$ から $O(N \log K)$ へ減らします。
 
 ## 関連 Rule との相互作用
 
@@ -134,4 +134,3 @@ return std::vector<PlanAlternative>{
   - `OptimizerTest.PhysicalRuleSubsetsPreserveOrderedLimitResults`: 物理規則の適用サブセットを変調させた環境下でも順序付き LIMIT の結果整合性が保たれることを検証します。
 - `executor/executor_test.cpp`:
   - `ExecutorTest.LimitOffsetSkipsLeadingRows`: 実行時における OFFSET スキップと行制限の正確性を検証します。
-

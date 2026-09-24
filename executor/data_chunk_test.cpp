@@ -77,7 +77,7 @@ TEST(DataChunkTest, ZoneMap_AfterAppendsAndReset_MaintainsStatistics) {
   chunk.Append(Row({Value(7)}));
   const ZoneMap& zone = chunk.ZoneMapAt(0);
   if (!zone.Minimum() || !zone.Maximum()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   EXPECT_EQ(*zone.Minimum(), Value(2));
@@ -89,6 +89,30 @@ TEST(DataChunkTest, ZoneMap_AfterAppendsAndReset_MaintainsStatistics) {
   chunk.Reset();
   EXPECT_FALSE(chunk.ZoneMapAt(0).Minimum());
   EXPECT_EQ(chunk.ZoneMapAt(0).ValueCount(), 0U);
+}
+
+TEST(DataChunkTest, Append_MovedRowPreservesValuesAndZoneMaps) {
+  DataChunk chunk(
+      std::vector<ValueType>{ValueType::kInt64, ValueType::kVarChar});
+  chunk.Append(Row({Value(7), Value("moved")}), RowPosition(3, 4));
+  chunk.Append(Row({Value(3), Value("kept")}), RowPosition(3, 5));
+  chunk.Append(Row({Value(), Value()}), RowPosition(3, 6));
+
+  ASSERT_EQ(chunk.Size(), 3U);
+  EXPECT_EQ(chunk.RowAt(0), Row({Value(7), Value("moved")}));
+  EXPECT_EQ(chunk.PositionAt(2), RowPosition(3, 6));
+  const ZoneMap& integers = chunk.ZoneMapAt(0);
+  const ZoneMap& strings = chunk.ZoneMapAt(1);
+  ASSERT_TRUE(integers.Minimum().has_value());
+  ASSERT_TRUE(integers.Maximum().has_value());
+  ASSERT_TRUE(strings.Minimum().has_value());
+  ASSERT_TRUE(strings.Maximum().has_value());
+  EXPECT_EQ(*integers.Minimum(), Value(3));
+  EXPECT_EQ(*integers.Maximum(), Value(7));
+  EXPECT_EQ(integers.NullCount(), 1U);
+  EXPECT_EQ(*strings.Minimum(), Value("kept"));
+  EXPECT_EQ(*strings.Maximum(), Value("moved"));
+  EXPECT_EQ(strings.NullCount(), 1U);
 }
 
 TEST(DataChunkTest, ZoneMap_ArrayValuesCountedOnColumnAppendPath) {
@@ -285,7 +309,7 @@ TEST(DataChunkTest,
   EXPECT_EQ(projected.PositionAt(1), RowPosition(2, 2));
   const ZoneMap& names = projected.ZoneMapAt(0);
   if (!names.Minimum() || !names.Maximum()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   EXPECT_EQ(*names.Minimum(), Value("one"));
@@ -337,7 +361,7 @@ TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
   // Zone maps must survive the unboxed copy, including the date type.
   const std::optional<Value> date_minimum = output.ZoneMapAt(2).Minimum();
   if (!date_minimum) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   EXPECT_EQ(*date_minimum, Value::DateFromDays(9));
@@ -640,7 +664,7 @@ TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
     const Value expected =
         EvaluateBinary(BinaryOperation::kAnd, chunk.ColumnAt(0).ValueAt(i),
                        chunk.ColumnAt(1).ValueAt(i));
-    EXPECT_EQ(and_res.ValueAt(i), expected) << true << (i != 0U);
+    EXPECT_EQ(and_res.ValueAt(i), expected) << i;
   }
 
   const Expression or_expr = BinaryExpressionExp(
@@ -657,7 +681,7 @@ TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
     const Value expected =
         EvaluateBinary(BinaryOperation::kOr, chunk.ColumnAt(0).ValueAt(i),
                        chunk.ColumnAt(1).ValueAt(i));
-    EXPECT_EQ(or_res.ValueAt(i), expected) << true << (i != 0U);
+    EXPECT_EQ(or_res.ValueAt(i), expected) << i;
   }
 }
 

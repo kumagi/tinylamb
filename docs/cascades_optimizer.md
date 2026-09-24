@@ -90,8 +90,8 @@ checks; XOR boolean identities; idempotence (`x AND x`) and absorption
 constant reassociation (`(x + 1) + 2` to `x + 3`); duplicate elimination in
 `IN` lists; and uniform-result `CASE` flattening. Wildcard-free `LIKE`
 constants become equality comparisons, stacked null checks collapse to
-constants, `(x - c1) + c2` style mixed reassociation merges the constants,
-and `x AND (NOT x OR y)` shrinks to `x AND y`. Nested identical `CAST`s
+constants, `(x - c1) + c2` style mixed reassociation merges the constants.
+Nested identical `CAST`s
 collapse, and a common conjunct factored from both sides of `OR` becomes
 `x AND (y OR z)`. Rewriting is bottom-up and continues to a fixed point.
 
@@ -114,6 +114,14 @@ auto plan = plan_or.Value();
 
 `Add` replaces a rule with the same name, which makes a local override
 explicit and avoids ordering two implementations with the same identity.
+
+A `Rule` may declare one target operator, a set of them, or none. The target
+set is an applicability prefilter for the append-only worklist: a rule whose
+body gates on several root operators (INTERSECT/EXCEPT shapes, the
+window/projection pair of `no_op_window_elimination`, …) must declare all of
+them, so scan/join expressions skip the rule without running its pattern.
+Setting `TINYLAMB_RULE_STATS=1` logs per-rule attempt counts during `Explore`
+(planning-cost attribution; zero cost when unset).
 
 ## Adding a scalar rule with the C++ DSL
 
@@ -175,8 +183,12 @@ Tests for rule isolation and memo enumeration are in
   can produce the root.
 - Total cost is child cost plus each rule's `local_cost`. Scan rules use
   statistics/selectivity and Top-K hints; joins use cardinality estimates and
-  spill penalties. A plan that misses required ordering also pays an estimated
-  `N log N` engine-side sort cost.
+  spill penalties. A single equijoin key still estimates `|L|*|R|/max(NDV)`.
+  Additional keys combine those per-key selectivities with exponential
+  backoff (`EstimateEquijoinSelectivity`): the catalog has no cross-column
+  NDV, so the estimate sits between max-NDV and full independence. A plan
+  that misses required ordering also pays an estimated `N log N` engine-side
+  sort cost.
 - `PhysicalProperties` contains `require_row_position`, `ordering`,
   `limit_hint`, `access_method`, and the reserved `distribution`. Selection,
   projection, and limit forward requirements; joins and aggregation drop them.
@@ -189,9 +201,19 @@ Tests for rule isolation and memo enumeration are in
   (`SearchEngine::BudgetExhausted`, reported in `dump_memo`). Costing prunes
   branch-and-bound style: expressions whose children alone reach the incumbent
   are skipped. Groups have an expression cap and set
-  `Memo::Degraded()` when alternatives are dropped. Join enumeration skips
-  exponential bipartitions above 16 relations and keeps the initial order.
-  Scalar rewriting treats the pass cap as a safety net: when a rule set oscillates it returns the last stable (still semantics-preserving) form instead of rejecting the query (D6).
+  `Memo::Degraded()` when alternatives are dropped. Join enumeration partitions
+  each group once. A connected group emits only csg-cmp pairs (both sides
+  induced-connected and the cut crossed by a conjunct); a disconnected group
+  keeps exhaustive bipartitions. Enumeration stops above 16 relations and keeps
+  the initial order. Left-deep LEFT chains, including an inner prefix, lower
+  to nested `kOuterJoin` nodes so the outer hash and nested-loop executors
+  run; WHERE is rechecked above the chain, and only preserved-prefix conjuncts
+  become scan filters. GROUPING SETS / ROLLUP / CUBE branches are UNION ALL
+  of one FROM+WHERE core; `SqlEngine` keeps that Cascades plan for the
+  statement and reuses it for a later branch whose required columns are
+  already in the plan schema. Scalar rewriting treats the pass cap as a safety net:
+  when a rule set oscillates it returns the last stable (still
+  semantics-preserving) form instead of rejecting the query (D6).
 - Logical and implementation rules all get a chance to apply in registration
   order. `Add` replaces an existing rule of the same name. Scalar rewriting is
   first-success per node and also supports literal function-call folding.

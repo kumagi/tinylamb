@@ -74,10 +74,17 @@ WindowPlan::WindowPlan(Plan child, std::vector<NamedExpression> window_outputs)
 
 bool WindowPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                              const std::vector<bool>& ascending) const {
+  return IsOrderedBy(expressions, ascending, {});
+}
+
+bool WindowPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
   if (child_ == nullptr) {
-    return expressions.empty();
+    return expressions.empty() && ascending.empty();
   }
-  return child_->IsOrderedBy(expressions, ascending);
+  return child_->IsOrderedBy(expressions, ascending, nulls_first);
 }
 
 void WindowPlan::Dump(std::ostream& output, int indent) const {

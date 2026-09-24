@@ -17,12 +17,14 @@
 #ifndef TINYLAMB_QUERY_STATEMENT_HPP
 #define TINYLAMB_QUERY_STATEMENT_HPP
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -30,6 +32,8 @@
 #include "common/set_operation.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/query_expression.hpp"
+#include "expression/table_sample_spec.hpp"
 #include "type/column.hpp"
 
 namespace tinylamb {
@@ -86,6 +90,7 @@ struct SelectSource {
   // physically duplicated in the joined schema, but bare references and
   // star expansion coalesce them (see Lookup / relational projection).
   std::vector<std::string> using_columns;
+  std::optional<TableSampleSpec> sample;
 };
 
 enum class StatementType : uint8_t {
@@ -136,12 +141,32 @@ class Statement {
   StatementType type_;
 };
 
+// Table-level FOREIGN KEY definition: child_columns[i] references
+// parent_table.parent_columns[i].  Only NO ACTION referential actions are
+// supported; anything else is rejected at parse time.
+struct ForeignKeyDef {
+  enum class Action : uint8_t { kNoAction = 0 };
+
+  std::vector<std::string> child_columns;
+  std::string parent_table;
+  std::vector<std::string> parent_columns;
+  Action on_delete{Action::kNoAction};
+  Action on_update{Action::kNoAction};
+};
+
 class CreateTableStatement : public Statement {
  public:
   CreateTableStatement(std::string table_name, std::vector<Column> columns)
       : Statement(StatementType::kCreateTable),
         table_name_(std::move(table_name)),
         columns_(std::move(columns)) {}
+
+  CreateTableStatement(std::string table_name, std::vector<Column> columns,
+                       std::vector<ForeignKeyDef> foreign_keys)
+      : Statement(StatementType::kCreateTable),
+        table_name_(std::move(table_name)),
+        columns_(std::move(columns)),
+        foreign_keys_(std::move(foreign_keys)) {}
 
   CreateTableStatement(std::string table_name,
                        std::shared_ptr<SelectStatement> as_query)
@@ -151,6 +176,9 @@ class CreateTableStatement : public Statement {
 
   [[nodiscard]] const std::string& TableName() const { return table_name_; }
   [[nodiscard]] const std::vector<Column>& Columns() const { return columns_; }
+  [[nodiscard]] const std::vector<ForeignKeyDef>& ForeignKeys() const {
+    return foreign_keys_;
+  }
   [[nodiscard]] const std::shared_ptr<SelectStatement>& AsQuery() const {
     return as_query_;
   }
@@ -169,12 +197,30 @@ class CreateTableStatement : public Statement {
         o << columns_[i];
       }
       o << "]";
+      for (const ForeignKeyDef& fk : foreign_keys_) {
+        o << " FOREIGN KEY (";
+        for (size_t i = 0; i < fk.child_columns.size(); i++) {
+          if (i != 0U) {
+            o << ", ";
+          }
+          o << fk.child_columns[i];
+        }
+        o << ") REFERENCES " << fk.parent_table << "(";
+        for (size_t i = 0; i < fk.parent_columns.size(); i++) {
+          if (i != 0U) {
+            o << ", ";
+          }
+          o << fk.parent_columns[i];
+        }
+        o << ")";
+      }
     }
   }
 
  private:
   std::string table_name_;
   std::vector<Column> columns_;
+  std::vector<ForeignKeyDef> foreign_keys_;
   std::shared_ptr<SelectStatement> as_query_;
 };
 
@@ -281,6 +327,13 @@ class SelectStatement : public Statement {
     group_by_ = std::move(group_by);
     complex_ = true;
   }
+  // True when the statement carries the syntactically empty grouping set
+  // (`GROUP BY ()`, or the () set of GROUPING SETS / ROLLUP). The grouping
+  // key list holds a placeholder constant then, but the standard semantics
+  // is exactly one group over all input rows -- emitted even when the input
+  // is empty (COUNT(*) = 0, other aggregates NULL).
+  void SetGroupAll(bool group_all) { group_all_ = group_all; }
+  bool IsGroupAll() const { return group_all_; }
   void SetHaving(Expression having) {
     having_ = std::move(having);
     complex_ = true;
@@ -363,16 +416,145 @@ class SelectStatement : public Statement {
     set_operation_matches_.clear();
   }
   void MarkComplex() { complex_ = true; }
-  // Structural fingerprint (Dump text), memoized per statement object.  The
-  // execution runtime keys caches by statement address; because freed
-  // statements are recycled by the allocator, a probe must confirm the
-  // cached fingerprint still describes THIS statement before reusing data.
   const std::string& Fingerprint() const {
-    if (cached_fingerprint_.empty()) {
-      std::ostringstream stream;
-      Dump(stream);
-      cached_fingerprint_ = stream.str();
+    std::ostringstream stream;
+    auto append_string = [&](std::string_view text) {
+      stream << text.size() << ':' << text << ';';
+    };
+    auto append_expression = [&](const Expression& expression) {
+      if (!expression) {
+        stream << "<null>;";
+        return;
+      }
+      stream << "e" << static_cast<int>(expression->Type()) << ':';
+      if (expression->Type() == TypeTag::kQueryExp) {
+        const auto& query = expression->AsQueryExpression();
+        stream << "q=";
+        if (query.Query()) {
+          stream << query.Query()->Fingerprint();
+        } else {
+          stream << "<null>";
+        }
+        stream << ':' << query.Exists() << ':' << query.Negated() << ':'
+               << static_cast<int>(query.Op()) << ':'
+               << static_cast<int>(query.Mode()) << ':' << query.ArrayResult()
+               << ':';
+        append_string(query.ArrayElementSqlType());
+        if (query.Test()) {
+          stream << static_cast<int>(query.Test()->Type()) << ':'
+                 << query.Test()->ToString() << ';';
+        } else {
+          stream << "<null>;";
+        }
+      } else if (expression->Type() == TypeTag::kAggregateExp ||
+                 expression->Type() == TypeTag::kWindowFunctionExp) {
+        stream << static_cast<const void*>(expression.get());
+      } else {
+        stream << expression->ToString();
+      }
+      stream << ';';
+    };
+    stream << "select;";
+    for (const NamedExpression& item : select_list_) {
+      append_string(item.name);
+      append_expression(item.expression);
     }
+    stream << "from;";
+    for (const std::string& table : from_clause_) {
+      append_string(table);
+    }
+    for (const SelectSource& source : sources_) {
+      append_string(source.table);
+      append_string(source.alias);
+      stream << "q=";
+      if (source.query) {
+        stream << source.query->Fingerprint();
+      } else {
+        stream << "<null>";
+      }
+      stream << ";j=" << static_cast<int>(source.join_type) << ';';
+      append_expression(source.join_condition);
+      append_expression(source.unnest);
+      append_string(source.offset_alias);
+      stream << source.is_lateral << source.from_nested_join << ';';
+      for (const std::string& column : source.using_columns) {
+        append_string(column);
+      }
+      if (source.sample) {
+        source.sample->Dump(stream);
+      }
+      stream << ';';
+    }
+    stream << "where;";
+    append_expression(where_clause_);
+    stream << "order;";
+    for (const OrderByTerm& term : order_by_) {
+      append_expression(term.expression);
+      stream << term.ascending << ':' << term.nulls_first.value_or(false)
+             << ';';
+    }
+    stream << "limit;" << has_limit_ << ':' << limit_ << ':' << offset_
+           << ";distinct;" << distinct_ << ';';
+    for (const Expression& expression : distinct_on_) {
+      append_expression(expression);
+    }
+    stream << "ties;" << with_ties_ << ";aliases;";
+    std::vector<std::pair<std::string, std::string>> aliases(aliases_.begin(),
+                                                             aliases_.end());
+    std::sort(aliases.begin(), aliases.end());
+    for (const auto& [alias, table] : aliases) {
+      append_string(alias);
+      append_string(table);
+    }
+    stream << "group;" << group_all_ << ';';
+    for (const Expression& expression : group_by_) {
+      append_expression(expression);
+    }
+    stream << "having;";
+    append_expression(having_);
+    stream << "qualify;";
+    append_expression(qualify_);
+    stream << "with;";
+    for (const std::string& name : with_query_order_) {
+      append_string(name);
+      stream << "recursive=" << IsRecursiveWith(name) << ';';
+      const auto found = with_queries_.find(name);
+      if (found != with_queries_.end() && found->second) {
+        stream << found->second->Fingerprint();
+      } else {
+        stream << "<null>";
+      }
+      const auto depth = recursive_depth_specs_.find(name);
+      if (depth != recursive_depth_specs_.end()) {
+        stream << ':' << depth->second.column << ':' << depth->second.lower
+               << ':' << depth->second.upper;
+      }
+      stream << ';';
+    }
+    stream << "union;";
+    for (size_t i = 0; i < union_all_.size(); ++i) {
+      stream << (i < set_operation_kinds_.size()
+                     ? static_cast<int>(set_operation_kinds_[i])
+                     : static_cast<int>(SetOperationKind::kUnionAll))
+             << ';';
+      if (i < set_operation_matches_.size()) {
+        const SetOperationMatch& match = set_operation_matches_[i];
+        stream << match.corresponding << match.by_name << ':';
+        for (const std::string& column : match.columns) {
+          append_string(column);
+        }
+      }
+      if (i < union_all_.size() && union_all_[i]) {
+        stream << union_all_[i]->Fingerprint();
+      } else {
+        stream << "<null>";
+      }
+      stream << ';';
+    }
+    stream << "union_flags;" << union_distinct_ << ':' << union_by_name_
+           << ";struct;" << as_struct_ << ";complex;" << complex_ << ";tree;"
+           << static_cast<const void*>(set_operation_tree_.get()) << ';';
+    cached_fingerprint_ = stream.str();
     return cached_fingerprint_;
   }
   void Dump(std::ostream& o) const override {
@@ -396,6 +578,13 @@ class SelectStatement : public Statement {
     } else {
       o << "(null)";
     }
+    for (const SelectSource& source : sources_) {
+      if (!source.sample) {
+        continue;
+      }
+      o << " sample=";
+      source.sample->Dump(o);
+    }
   }
 
  private:
@@ -412,6 +601,7 @@ class SelectStatement : public Statement {
   std::unordered_map<std::string, std::string> aliases_;
   std::vector<SelectSource> sources_;
   std::vector<Expression> group_by_;
+  bool group_all_{false};
   Expression having_;
   Expression qualify_;
   std::unordered_map<std::string, std::shared_ptr<SelectStatement>>
@@ -454,6 +644,7 @@ class InsertStatement : public Statement {
         columns_(std::move(columns)) {}
 
   [[nodiscard]] const std::string& TableName() const { return table_name_; }
+  std::vector<std::vector<Expression>>& MutableValues() { return values_; }
   [[nodiscard]] const std::vector<std::vector<Expression>>& Values() const {
     return values_;
   }
@@ -543,6 +734,10 @@ class UpdateStatement : public Statement {
   void SetAlias(std::string alias) { alias_ = std::move(alias); }
   [[nodiscard]] const std::vector<std::pair<ColumnName, Expression>>&
   SetClause() const {
+    return set_clause_;
+  }
+  // Prepare-time subquery folding rewrites the SET value expressions.
+  std::vector<std::pair<ColumnName, Expression>>& MutableSetClause() {
     return set_clause_;
   }
   [[nodiscard]] const Expression& WhereClause() const { return where_clause_; }

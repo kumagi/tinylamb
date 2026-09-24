@@ -145,7 +145,11 @@ StatusOr<Value> QueryExpression::TryEvaluate(const Row& row,
         ASSIGN_OR_RETURN(
             Value, equal,
             TryEvaluateBinary(BinaryOperation::kEquals, test_value, candidate));
-        found = equal.Truthy();
+        if (equal.IsNull()) {
+          saw_null = true;
+        } else if (equal.Truthy()) {
+          found = true;
+        }
       }
     }
     Value membership =

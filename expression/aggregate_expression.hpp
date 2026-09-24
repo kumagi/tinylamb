@@ -48,6 +48,8 @@ class AggregateExpression : public ExpressionBase {
   [[nodiscard]] AggregationType GetType() const { return type_; }
   [[nodiscard]] const Expression& Child() const { return child_; }
   [[nodiscard]] bool Distinct() const { return distinct_; }
+  [[nodiscard]] bool IgnoreNulls() const { return ignore_nulls_; }
+  void SetIgnoreNulls(bool ignore_nulls) { ignore_nulls_ = ignore_nulls; }
   [[nodiscard]] AggregateHavingModifier Having() const { return having_; }
   [[nodiscard]] const Expression& HavingCondition() const {
     return having_cond_;
@@ -131,6 +133,7 @@ class AggregateExpression : public ExpressionBase {
   AggregationType type_;
   Expression child_;
   bool distinct_{false};
+  bool ignore_nulls_{false};
   AggregateHavingModifier having_{AggregateHavingModifier::kNone};
   Expression having_cond_;
   std::vector<WindowOrderTerm> inner_order_by_;

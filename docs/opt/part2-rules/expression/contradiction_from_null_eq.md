@@ -8,7 +8,7 @@
 
 NULL 定数との等値・不等値比較（`x = NULL` および `x != NULL`）を、三値論理における `UNKNOWN` を表すスカラー NULL 定数へ直接畳み込む式書き換え Rule です。
 
-SQL の三値論理において、任意の式 $x$ と NULL の比較結果は常に `UNKNOWN`（真理値としての NULL）となります。この比較式を `FALSE` や `x IS NULL` へ置き換えることは意味論を破壊します。本 Rule は、確定真理値 `UNKNOWN` への忠実な縮退を行うとともに、左辺式 $x$ の評価脱落に伴う実行時例外の消去（error erasure）を `ExpressionCannotThrow` により厳格に抑止します。
+SQL の三値論理では、任意の式 $x$ と NULL の比較結果は常に `UNKNOWN`（真理値としての NULL）です。この比較式を `FALSE` や `x IS NULL` へ置き換えると、真理値が変わります。本 Rule は `UNKNOWN` へ畳み込むとともに、左辺式 $x$ を評価しなくなることで実行時例外が消える事態（error erasure）を `ExpressionCannotThrow` で防ぎます。
 
 ## 変換前後の関係
 

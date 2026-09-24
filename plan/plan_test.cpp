@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "aggregation_plan.hpp"
+#include "bitmap_scan_plan.hpp"
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
@@ -46,6 +47,7 @@
 #include "gtest/gtest.h"
 #include "index/index.hpp"
 #include "index_only_scan_plan.hpp"
+#include "index_scan_plan.hpp"
 #include "merge_join_plan.hpp"
 #include "page/page_manager.hpp"
 #include "product_plan.hpp"
@@ -240,6 +242,29 @@ TEST_F(PlanTest, ProjectPlan) {
   DumpAll(pp);
 
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+}
+
+TEST_F(PlanTest, ProjectionRebuildsStatisticsInOutputOrder) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc1"));
+  Plan source = std::make_shared<FullScanPlan>(*table, *stats);
+  Plan projection = std::make_shared<ProjectionPlan>(
+      source, std::vector<NamedExpression>{
+                  NamedExpression("", ColumnValueExp(ColumnName("Sc1.c3"))),
+                  NamedExpression("", ColumnValueExp(ColumnName("Sc1.c1")))});
+
+  ASSERT_EQ(projection->GetStats().Rows(), source->GetStats().Rows());
+  ASSERT_EQ(projection->GetStats().Columns(), 2U);
+  const int c3 = table->GetSchema().Offset(ColumnName("Sc1.c3"));
+  const int c1 = table->GetSchema().Offset(ColumnName("Sc1.c1"));
+  ASSERT_GE(c3, 0);
+  ASSERT_GE(c1, 0);
+  EXPECT_EQ(projection->GetStats().Column(0).Distinct(),
+            stats->Column(static_cast<size_t>(c3)).Distinct());
+  EXPECT_EQ(projection->GetStats().Column(1).Distinct(),
+            stats->Column(static_cast<size_t>(c1)).Distinct());
 }
 
 TEST_F(PlanTest, SelectionPlan) {
@@ -527,7 +552,11 @@ TEST_F(PlanTest, AggregationAccessors) {
   EXPECT_EQ(ap->AccessRowCount(), child->AccessRowCount());
   EXPECT_EQ(ap->EmitRowCount(), 1);
   EXPECT_EQ(ap->ScanSource(), child->ScanSource());
-  EXPECT_EQ(ap->GetStats().Rows(), child->GetStats().Rows());
+  EXPECT_EQ(ap->GetStats().Rows(), 1U);
+  EXPECT_EQ(ap->GetStats().Columns(), sc.ColumnCount());
+  for (size_t i = 0; i < sc.ColumnCount(); ++i) {
+    EXPECT_EQ(ap->GetStats().Column(i).Type(), sc.GetColumn(i).Type());
+  }
   EXPECT_NE(ap->ToString().find("HashAggregate {"), std::string::npos);
   std::ostringstream oss;
   ap->Dump(oss, 0);
@@ -716,6 +745,31 @@ TEST_F(PlanTest, ProductHashJoinAccessors) {
   EXPECT_NE(oss.str().find("right:{Sc2.d1}"), std::string::npos);
 }
 
+TEST_F(PlanTest, JoinPlansPreserveExplicitManyToManyCardinality) {
+  const Schema left_schema("l", {Column("id", ValueType::kInt64)});
+  const Schema right_schema("r", {Column("id", ValueType::kInt64)});
+  std::vector<Row> left_rows;
+  std::vector<Row> right_rows;
+  for (int64_t i = 0; i < 10; ++i) {
+    left_rows.push_back(Row({Value(i % 2)}));
+    right_rows.push_back(Row({Value(i % 2)}));
+  }
+  Plan left = std::make_shared<ValuesPlan>(left_schema, left_rows);
+  Plan right = std::make_shared<ValuesPlan>(right_schema, right_rows);
+
+  Plan hash(new ProductPlan(left, {ColumnName("l.id")}, right,
+                            {ColumnName("r.id")}, HashJoinMode::kInMemory,
+                            static_cast<size_t>(100)));
+  EXPECT_EQ(hash->EmitRowCount(), 100U);
+  EXPECT_EQ(hash->GetStats().Rows(), 100U);
+
+  Plan merge(new MergeJoinPlan(left, {ColumnName("l.id")}, right,
+                               {ColumnName("r.id")}, JoinKind{}, Expression(),
+                               static_cast<size_t>(100)));
+  EXPECT_EQ(merge->EmitRowCount(), 100U);
+  EXPECT_EQ(merge->GetStats().Rows(), 100U);
+}
+
 TEST_F(PlanTest, MergeJoinPlanCarriesSortedKeyContractAndOutputSchema) {
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
@@ -812,12 +866,15 @@ TEST_F(PlanTest, ProductOuterJoinPreservesBothSchemasAndOuterCardinalityBound) {
   Plan full_outer(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
                                   {ColumnName("Sc2.d1")}, FullOuterJoinKind()));
 
+  const size_t left_rows = left->EmitRowCount();
+  const size_t right_rows = right->EmitRowCount();
+  const size_t cross_rows = left_rows * right_rows;
   for (const Plan& plan : {left_outer, right_outer, full_outer}) {
     EXPECT_EQ(
         plan->GetSchema().ColumnCount(),
         left->GetSchema().ColumnCount() + right->GetSchema().ColumnCount());
-    EXPECT_EQ(plan->EmitRowCount(),
-              std::max(left->EmitRowCount(), right->EmitRowCount()));
+    EXPECT_GE(plan->EmitRowCount(), std::max(left_rows, right_rows));
+    EXPECT_GE(plan->EmitRowCount(), cross_rows);
   }
   EXPECT_NE(left_outer->ToString().find("Left Outer Join"), std::string::npos);
   EXPECT_NE(right_outer->ToString().find("Right Outer Join"),
@@ -903,6 +960,8 @@ TEST_F(PlanTest, IndexOnlyScanPlanBasic) {
   EXPECT_NE(plan->ToString().find("Sc2PK"), std::string::npos);
   EXPECT_EQ(plan->EmitRowCount(), ts->Rows());
   EXPECT_EQ(plan->AccessRowCount(), ts->Rows());
+  ASSERT_EQ(plan->GetStats().Columns(), 1U);
+  EXPECT_EQ(plan->GetStats().Column(0).Distinct(), ts->Column(0).Distinct());
   std::ostringstream oss;
   plan->Dump(oss, 0);
   EXPECT_NE(oss.str().find("IndexOnlyScan: Sc2"), std::string::npos);
@@ -924,6 +983,7 @@ TEST_F(PlanTest, IndexOnlyScanPlanUniqueLookup) {
 
   // Assert -- a unique full-key lookup emits exactly one row
   EXPECT_EQ(plan->EmitRowCount(), 1);
+  EXPECT_EQ(plan->GetStats().Rows(), 1U);
   EXPECT_EQ(plan->AccessRowCount(), 1);
 }
 
@@ -1235,6 +1295,113 @@ TEST_F(PlanTest, IndexOnlyScanPlanStaleFallbackProjectsIncludedColumns) {
   // Assert -- only the 6 snapshot-visible rows are returned
   ASSERT_EQ(count, 6);
   reader.txn_.Abort();
+}
+
+TEST_F(PlanTest, IndexScanPlanPendingOrdinaryKeyReplacementPreservesSnapshot) {
+  const std::string table_name = "PendingIndexReplacement";
+  RowPosition row_position;
+  {
+    TransactionContext setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        rs_->CreateTable(
+            setup,
+            Schema(table_name, {Column("id", ValueType::kInt64),
+                                Column("search_key", ValueType::kInt64)})));
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted,
+                          table.Insert(setup.txn_, Row({Value(1), Value(10)})));
+    row_position = inserted;
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        setup, table_name,
+        IndexSchema("by_search_key", {1}, {}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(setup.txn_.PreCommit());
+  }
+
+  page_id_t index_root = 0;
+  TransactionContext writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, writer_table,
+                        writer.GetTable(table_name));
+  index_root = writer_table->GetIndex(0).Root();
+  ASSERT_SUCCESS(
+      writer_table
+          ->Update(writer.txn_, row_position, Row({Value(1), Value(20)}))
+          .GetStatus());
+  EXPECT_TRUE(writer.txn_.IndexKeysMayBeStale(index_root));
+
+  TransactionContext reader = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, reader_table,
+                        reader.GetTable(table_name));
+  const auto stats_or = reader.GetStats(table_name);
+  ASSERT_EQ(stats_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& stats = stats_or.Value();
+  EXPECT_TRUE(reader.txn_.IndexKeysMayBeStale(index_root));
+  Expression where = BinaryExpressionExp(ColumnValueExp("search_key"),
+                                         BinaryOperation::kEquals,
+                                         ConstantValueExp(Value(10)));
+  IndexScanPlan plan(*reader_table, reader_table->GetIndex(0), *stats,
+                     {Value(10)}, {Value(10)}, true, where);
+  Executor executor = plan.EmitExecutor(reader);
+  Row result;
+  ASSERT_TRUE(executor->Next(&result, nullptr));
+  EXPECT_EQ(result, Row({Value(1), Value(10)}));
+  EXPECT_FALSE(executor->Next(&result, nullptr));
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+
+  IndexOnlyScanPlan only_plan(*reader_table, reader_table->GetIndex(0), *stats,
+                              {Value(10)}, {Value(10)}, true, where);
+  Executor only_executor = only_plan.EmitExecutor(reader);
+  ASSERT_TRUE(only_executor->Next(&result, nullptr));
+  EXPECT_EQ(result, Row({Value(10)}));
+  EXPECT_FALSE(only_executor->Next(&result, nullptr));
+  EXPECT_EQ(only_executor->GetStatus(), Status::kSuccess);
+
+  BitmapScanPlan bitmap_plan(
+      *reader_table, *stats,
+      std::vector<BitmapIndexRange>{
+          {&reader_table->GetIndex(0), {Value(10)}, {Value(10)}}},
+      BitmapCombine::kOr, where, 1, 1);
+  Executor bitmap_executor = bitmap_plan.EmitExecutor(reader);
+  Row bitmap_result;
+  ASSERT_TRUE(bitmap_executor->Next(&bitmap_result, nullptr));
+  EXPECT_EQ(bitmap_result, Row({Value(1), Value(10)}));
+  EXPECT_FALSE(bitmap_executor->Next(&bitmap_result, nullptr));
+  EXPECT_EQ(bitmap_executor->GetStatus(), Status::kSuccess);
+
+  Schema left_schema("left", {Column("search_key", ValueType::kInt64)});
+  Plan left = std::make_shared<ValuesPlan>(left_schema,
+                                           std::vector<Row>{Row({Value(10)})});
+  ProductPlan index_join_plan(std::move(left), {ColumnName("left.search_key")},
+                              *reader_table, reader_table->GetIndex(0),
+                              {reader_table->GetSchema().GetColumn(1).Name()},
+                              *stats);
+  Executor index_join_executor = index_join_plan.EmitExecutor(reader);
+  Row index_join_result;
+  ASSERT_TRUE(index_join_executor->Next(&index_join_result, nullptr));
+  EXPECT_EQ(index_join_result, Row({Value(10), Value(1), Value(10)}));
+  EXPECT_FALSE(index_join_executor->Next(&index_join_result, nullptr));
+  EXPECT_EQ(index_join_executor->GetStatus(), Status::kSuccess);
+
+  ASSERT_SUCCESS(writer.txn_.Abort());
+  EXPECT_FALSE(reader.txn_.IndexKeysMayBeStale(index_root));
+  ASSERT_SUCCESS(reader.txn_.Abort());
+
+  TransactionContext after_abort = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, current_table,
+                        after_abort.GetTable(table_name));
+  const auto current_stats_or = after_abort.GetStats(table_name);
+  ASSERT_EQ(current_stats_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& current_stats =
+      current_stats_or.Value();
+  EXPECT_FALSE(after_abort.txn_.IndexKeysMayBeStale(index_root));
+  IndexScanPlan current_plan(*current_table, current_table->GetIndex(0),
+                             *current_stats, {Value(10)}, {Value(10)}, true,
+                             where);
+  Executor current_executor = current_plan.EmitExecutor(after_abort);
+  ASSERT_TRUE(current_executor->Next(&result, nullptr));
+  EXPECT_EQ(result, Row({Value(1), Value(10)}));
+  EXPECT_FALSE(current_executor->Next(&result, nullptr));
+  EXPECT_EQ(current_executor->GetStatus(), Status::kSuccess);
+  ASSERT_SUCCESS(after_abort.txn_.Abort());
 }
 
 // ProjectionPlan(Plan, vector<ColumnName>) used to dereference a moved-from

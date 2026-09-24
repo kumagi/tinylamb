@@ -209,8 +209,6 @@ bool ValueLess(const Value& a, const Value& b, bool ascending,
   if (b.IsNull()) {
     return !nulls_first_value;
   }
-  // GoogleSQL orders NaN above every other number (including +inf) and all
-  // NaNs as one peer group; raw double comparison cannot express that.
   const bool a_nan =
       a.type == ValueType::kDouble && std::isnan(a.value.double_value);
   const bool b_nan =
@@ -219,8 +217,7 @@ bool ValueLess(const Value& a, const Value& b, bool ascending,
     return false;
   }
   if (a_nan || b_nan) {
-    // NaN is the largest value regardless of direction.
-    return a_nan ? !ascending : ascending;
+    return ascending ? a_nan : b_nan;
   }
   try {
     return ascending ? a < b : b < a;
@@ -897,7 +894,7 @@ struct WindowRuntime {
     std::vector<Value> non_null;
     non_null.reserve(values.size());
     for (Value& value : values) {
-      if (!value.IsNull()) {
+      if ((fn != "ARRAY_AGG" || window.ignore_nulls) && !value.IsNull()) {
         non_null.push_back(std::move(value));
       }
     }
@@ -1107,7 +1104,7 @@ struct WindowRuntime {
       }
       return Value(trues);
     }
-    if (non_null.empty()) {
+    if (non_null.empty() && fn != "ARRAY_AGG") {
       return Value();
     }
 
@@ -1123,6 +1120,9 @@ struct WindowRuntime {
         double total = 0.0;
         for (const Value& value : non_null) {
           total += NumericOf(value);
+        }
+        if (fn == "AVG") {
+          return Value(total / static_cast<double>(non_null.size()));
         }
         return Value(total);
       }
@@ -1143,6 +1143,12 @@ struct WindowRuntime {
       return Value(total);
     }
     if (fn == "MIN" || fn == "MAX") {
+      for (const Value& value : non_null) {
+        if (value.type == ValueType::kDouble &&
+            std::isnan(value.value.double_value)) {
+          return value;
+        }
+      }
       const Value* best = non_null.data();
       for (const Value& value : non_null) {
         if (fn == "MIN" ? ValueLess(value, *best, true)
@@ -1153,10 +1159,15 @@ struct WindowRuntime {
       return *best;
     }
     if (fn == "ARRAY_AGG" || fn == "STRING_AGG") {
-      std::vector<Value> final_values = std::move(non_null);
+      std::vector<Value> final_values =
+          fn == "ARRAY_AGG" && !window.ignore_nulls ? std::move(values)
+                                                    : std::move(non_null);
       if (window.inner_limit.has_value() &&
           final_values.size() > *window.inner_limit) {
         final_values.resize(*window.inner_limit);
+      }
+      if (fn == "ARRAY_AGG" && final_values.empty()) {
+        return Value();
       }
       if (fn == "STRING_AGG") {
         // Raw text for VARCHAR parts: AsString would wrap them in display
@@ -1844,17 +1855,51 @@ Status ComputeOneWindowImpl(TransactionContext& context,
                      : peer && candidate != k;
         };
         size_t target = lo;
+        bool found = false;
+        Value selected;
         if (fn == "FIRST_VALUE") {
-          while (target <= hi && excluded(target)) {
-            ++target;
+          for (size_t candidate = lo; candidate <= hi; ++candidate) {
+            if (excluded(candidate)) {
+              continue;
+            }
+            if (window.ignore_nulls) {
+              ASSIGN_OR_RETURN(
+                  Value, candidate_value,
+                  (runtime.EvalAt(window.args[0], rows, ordered[candidate])));
+              if (candidate_value.IsNull()) {
+                continue;
+              }
+              selected = std::move(candidate_value);
+            }
+            target = candidate;
+            found = true;
+            break;
           }
         } else if (fn == "LAST_VALUE") {
-          target = hi;
-          while (target >= lo && excluded(target)) {
-            if (target == 0) {
+          size_t candidate = hi;
+          for (;;) {
+            if (!excluded(candidate)) {
+              if (window.ignore_nulls) {
+                ASSIGN_OR_RETURN(
+                    Value, candidate_value,
+                    (runtime.EvalAt(window.args[0], rows, ordered[candidate])));
+                if (candidate_value.IsNull()) {
+                  if (candidate == lo) {
+                    break;
+                  }
+                  --candidate;
+                  continue;
+                }
+                selected = std::move(candidate_value);
+              }
+              target = candidate;
+              found = true;
               break;
             }
-            --target;
+            if (candidate == lo) {
+              break;
+            }
+            --candidate;
           }
         } else {
           if (window.args.size() < 2) {
@@ -1879,29 +1924,38 @@ Status ComputeOneWindowImpl(TransactionContext& context,
                 StatusCode::kInvalidArgument,
                 "The N value for the NthValue function must be positive");
           }
-          size_t frame_size = 0;
+          size_t seen = 0;
           for (size_t candidate = lo; candidate <= hi; ++candidate) {
-            if (!excluded(candidate)) {
-              ++frame_size;
+            if (excluded(candidate)) {
+              continue;
             }
-          }
-          if (std::cmp_greater(nth, frame_size)) {
-            continue;
-          }
-          for (size_t candidate = lo; candidate <= hi; ++candidate) {
-            if (!excluded(candidate) && --nth == 0) {
+            if (window.ignore_nulls) {
+              ASSIGN_OR_RETURN(
+                  Value, candidate_value,
+                  (runtime.EvalAt(window.args[0], rows, ordered[candidate])));
+              if (candidate_value.IsNull()) {
+                continue;
+              }
+              selected = std::move(candidate_value);
+            }
+            ++seen;
+            if (seen == static_cast<size_t>(nth)) {
               target = candidate;
+              found = true;
               break;
             }
           }
         }
-        if (target < lo || target > hi || excluded(target)) {
+        if (!found) {
           continue;
         }
-        ASSIGN_OR_RETURN(
-            Value, edge_value,
-            (runtime.EvalAt(window.args[0], rows, ordered[target])));
-        (*out)[ordered[k]] = std::move(edge_value);
+        if (!window.ignore_nulls) {
+          ASSIGN_OR_RETURN(
+              Value, selected_value,
+              (runtime.EvalAt(window.args[0], rows, ordered[target])));
+          selected = std::move(selected_value);
+        }
+        (*out)[ordered[k]] = std::move(selected);
       }
       continue;
     }

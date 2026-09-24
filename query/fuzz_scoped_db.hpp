@@ -63,6 +63,7 @@ class ScopedDb {
   [[nodiscard]] Database& operator*() const { return *db_; }
   [[nodiscard]] Database* get() const { return db_.get(); }
   [[nodiscard]] explicit operator bool() const { return db_ != nullptr; }
+  [[nodiscard]] const std::string& name() const { return name_; }
 
  private:
   std::string name_;

@@ -19,7 +19,7 @@ class TopNExecutor final : public ExecutorBase {
   struct Key {
     Expression expression;
     bool ascending{true};
-    std::optional<bool> nulls_first;
+    std::optional<bool> nulls_first{std::nullopt};
   };
 
   TopNExecutor(Executor source, Schema schema, std::vector<Key> keys,

@@ -81,6 +81,7 @@ struct OracleTrace {
   // UNION ALL partitioning: Q[p] as a bag must equal the three partitions
   // combined through the set-operation executor (not a harness-side merge).
   std::vector<std::string> unionall;  // original, 3-way UNION ALL
+  std::vector<std::string> or_partition;
   // Subquery differential: three spellings of "t rows matching j" (IN
   // subquery / correlated EXISTS / semi-join via JOIN+DISTINCT) must agree.
   std::vector<std::string> subq;  // exactly 3 when active
@@ -101,6 +102,15 @@ struct OracleTrace {
   std::vector<std::string> niv;
   // UNION/INTERSECT precedence differential: exactly 2 when active
   std::vector<std::string> usp;
+  // QUALIFY vs derived-table WHERE differential: a window predicate above
+  // the projection must equal the explicit derived spelling (alias or
+  // inline window expression in QUALIFY): exactly 2 when active.
+  std::vector<std::string> qualify;
+  // Set-op derived table + outer WHERE: pushing the filter into every
+  // branch is an identity for all six set operations, so the
+  // derived+outer-WHERE and per-branch-WHERE spellings must agree
+  // (Bug-36 class: head-only injection silently unfilters UNION tails).
+  std::vector<std::string> dso;  // exactly 2 when active
   // NOT IN anti-join with NULL-sensitivity: expected rows carry the
   // three-valued result (empty whenever the subquery holds any NULL).
   std::vector<std::string> notin;  // exactly 1 when active
@@ -162,6 +172,7 @@ struct OracleIterationStats {
   bool tlp_ran{false};
   bool tlp_agg_ran{false};
   bool unionall_ran{false};
+  bool or_partition_ran{false};
   bool subq_ran{false};
   bool ssub_ran{false};
   bool cqp_ran{false};
@@ -171,6 +182,8 @@ struct OracleIterationStats {
   bool lwn_ran{false};
   bool niv_ran{false};
   bool usp_ran{false};
+  bool qualify_ran{false};
+  bool dso_ran{false};
   bool norec_ran{false};
   bool pqs_ran{false};
   bool idx_ran{false};

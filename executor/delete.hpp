@@ -3,6 +3,7 @@
 #define TINYLAMB_DELETE_EXECUTOR_HPP
 
 #include "executor/executor_base.hpp"
+#include "foreign_key.hpp"
 
 namespace tinylamb {
 class Table;
@@ -13,11 +14,13 @@ class DeleteExecutor : public ExecutorBase {
   DeleteExecutor(Transaction& txn, Table& target, Executor source)
       : txn_(&txn), target_(&target), source_(std::move(source)) {}
   DeleteExecutor(Transaction& txn, Table& target, Executor source,
-                 int64_t assert_rows_modified)
+                 int64_t assert_rows_modified,
+                 std::vector<ReferencedByCheck> ref_checks = {})
       : txn_(&txn),
         target_(&target),
         source_(std::move(source)),
-        assert_rows_modified_(assert_rows_modified) {}
+        assert_rows_modified_(assert_rows_modified),
+        ref_checks_(std::move(ref_checks)) {}
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& output, int indent) const override;
 
@@ -26,6 +29,7 @@ class DeleteExecutor : public ExecutorBase {
   Table* target_;
   Executor source_;
   int64_t assert_rows_modified_{-1};
+  std::vector<ReferencedByCheck> ref_checks_;
   bool finished_{false};
 };
 }  // namespace tinylamb

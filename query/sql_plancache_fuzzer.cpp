@@ -234,8 +234,53 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
 
   // Mutations drift the data after the cache is warm.
   const int mut_count = g.Pick(1, 4);
+  int subq_mutations = 0;
   for (int i = 0; i < mut_count; ++i) {
-    switch (g.Pick(0, 2)) {
+    switch (g.Pick(subq_mutations == 0 ? -2 : 0, 2)) {
+      case -1: {
+        // `SET a = a + (SELECT MIN(k) ...)` folded at prepare time on the
+        // warm cache: a later replay must not reuse the old fold (Bug 57).
+        const int pick = g.Pick(0, 3);
+        std::optional<int64_t> scalar;
+        for (const MRow& r : mirror) {
+          if (r.k == pick) {
+            scalar = r.k;
+          }
+        }
+        for (MRow& r : mirror) {
+          if (!scalar.has_value() || r.a == kNullRepr) {
+            r.a = kNullRepr;
+          } else {
+            r.a += *scalar;
+          }
+        }
+        t.mutations.push_back(
+            "UPDATE t SET a = a + (SELECT MIN(k) FROM t "
+            "WHERE k = " +
+            std::to_string(pick) + ");");
+        ++subq_mutations;
+        break;
+      }
+      case -2: {
+        // `WHERE k = ANY (SELECT u-100 FROM t WHERE u >= 100)` folds to a
+        // constant membership set over the mutation-inserted rows.
+        std::unordered_set<int64_t> hit;
+        for (const MRow& r : mirror) {
+          if (r.u >= 100) {
+            hit.insert(r.u - 100);
+          }
+        }
+        for (MRow& r : mirror) {
+          if (hit.contains(r.u)) {
+            r.a = kNullRepr;
+          }
+        }
+        t.mutations.emplace_back(
+            "UPDATE t SET a = NULL WHERE t.u = ANY (SELECT u - 100 FROM t "
+            "WHERE u >= 100);");
+        ++subq_mutations;
+        break;
+      }
       case 0: {
         MRow r;
         r.u = 100 + i;

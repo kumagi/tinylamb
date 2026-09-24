@@ -739,55 +739,6 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     }
   }
 
-  if (statement.Distinct() && statement.Sources().size() == 1 &&
-      !statement.Sources()[0].query && !statement.Sources()[0].unnest) {
-    StatusOr<std::shared_ptr<Table>> table =
-        context.GetTable(statement.Sources()[0].table);
-    if (table.HasValue() && table.Value()->IndexCount() > 0 &&
-        table.Value()->GetIndex(0).sc_.key_.size() == 1 &&
-        !statement.SelectList().empty() &&
-        statement.SelectList()[0].expression &&
-        statement.SelectList()[0].expression->Type() == TypeTag::kColumnValue) {
-      const size_t key = table.Value()->GetIndex(0).sc_.key_[0];
-      const std::string key_name =
-          table.Value()->GetSchema().GetColumn(key).Name().name;
-      if (statement.SelectList()[0]
-              .expression->AsColumnValue()
-              .GetColumnName()
-              .name == key_name) {
-        output << pad << "UniqueKey " << key_name << '\n';
-      }
-    }
-  }
-
-  if (statement.HasLimit() && statement.Limit() > 0 &&
-      !statement.OrderBy().empty() && statement.Sources().size() == 1 &&
-      !statement.Sources()[0].query && !statement.Sources()[0].unnest) {
-    const SelectSource& source = statement.Sources()[0];
-    StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
-    if (table.HasValue()) {
-      std::unordered_set<std::string> ordered;
-      for (const auto& term : statement.OrderBy()) {
-        for (const ColumnName& column : term.expression->TouchedColumns()) {
-          ordered.insert(column.name);
-        }
-      }
-      for (const NamedExpression& item : statement.SelectList()) {
-        if (!item.expression ||
-            item.expression->Type() != TypeTag::kColumnValue) {
-          continue;
-        }
-        const std::string name =
-            item.expression->AsColumnValue().GetColumnName().name;
-        if (!ordered.contains(name) &&
-            table.Value()->GetSchema().Offset(ColumnName("", name)) >= 0) {
-          output << pad << "LateMaterialize " << name << " after Limit\n";
-          break;
-        }
-      }
-    }
-  }
-
   const bool index_ordered = CanStreamOrderFromIndex(context, statement);
   if (index_ordered) {
     output << pad << "IndexScan: " << statement.Sources()[0].table << '\n';
@@ -1370,10 +1321,10 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       any_join_remaining = !remaining.empty() || nodes.size() > 1;
     }
     if (any_join_remaining) {
-      output << pad << "JoinOrder="
+      output << pad << "HeuristicJoinOrder="
              << (has_ordered_join
                      ? "syntactic (outer/using joins present)"
-                     : "greedy_filtered_cardinality "
+                     : "greedy_table_rows "
                        "(equality=hash|hybrid, fallback=nested_loop)")
              << '\n';
     }

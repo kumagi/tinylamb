@@ -27,6 +27,7 @@
 #include "executor/bitmap_scan.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
+#include "executor/detail/relation.hpp"
 #include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
@@ -53,12 +54,14 @@
 #include "executor/set_operation.hpp"
 #include "executor/skip_scan_distinct.hpp"
 #include "executor/sort.hpp"
+#include "executor/table_sample.hpp"
 #include "executor/topn.hpp"
 #include "executor/unnest.hpp"
 #include "executor/values.hpp"
 #include "executor/window.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "index/index.hpp"
 #include "page/row_position.hpp"
 #include "plan/aggregation_plan.hpp"
@@ -84,6 +87,7 @@
 #include "plan/recursive_cte_plan.hpp"
 #include "plan/relation_rename_plan.hpp"
 #include "plan/relational_plan.hpp"
+#include "plan/sample_plan.hpp"
 #include "plan/selection_plan.hpp"
 #include "plan/set_operation_plan.hpp"
 #include "plan/skip_scan_distinct_plan.hpp"
@@ -188,9 +192,12 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
   // single-threaded FullScan.
   if (!lock_rows_ && MaxRows() == std::numeric_limits<size_t>::max() &&
       stats_.Rows() >= kParallelScanMinRows) {
-    return std::make_shared<ParallelScan>(txn.txn_, table_,
-                                          std::thread::hardware_concurrency(),
-                                          8, std::nullopt, peek_compares_);
+    constexpr size_t kMaxParallelScanWorkers = 16;
+    const size_t workers =
+        std::min(kMaxParallelScanWorkers,
+                 std::max<size_t>(1, std::thread::hardware_concurrency()));
+    return std::make_shared<ParallelScan>(txn.txn_, table_, workers, 8,
+                                          std::nullopt, peek_compares_);
   }
   return std::make_shared<FullScan>(txn.txn_, table_, MaxRows(), lock_rows_,
                                     wait_for_write_intent_);
@@ -209,6 +216,11 @@ Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
 Executor LimitPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<LimitExecutor>(src_->EmitExecutor(ctx), limit_count_,
                                          limit_offset_);
+}
+
+Executor SamplePlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<TableSampleExecutor>(ctx, child_->EmitExecutor(ctx),
+                                               child_->GetSchema(), spec_);
 }
 
 Executor SortPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -326,7 +338,38 @@ Executor SetOperationPlan::EmitExecutor(TransactionContext& ctx) const {
 }
 
 Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
-  if (child_->EmitRowCount() >= kParallelAggregationMinRows) {
+  // ParallelAggregationExecutor keeps only streaming scalar state
+  // (PartialState has no per-aggregate row buffer), so aggregates that need
+  // whole-group context — HAVING MIN/MAX, inner ORDER BY/LIMIT, a secondary
+  // argument — or kinds with no parallel kernel (ARRAY_AGG, STRING_AGG,
+  // ANY_VALUE, BIT_*, COUNTIF, approx sketches) must stay on the serial
+  // AggregationExecutor, where AggregateAccumulator buffers and replays.
+  const bool parallel_safe =
+      std::ranges::all_of(aggregates_, [](const NamedExpression& named) {
+        if (!named.expression ||
+            named.expression->Type() != TypeTag::kAggregateExp) {
+          return false;
+        }
+        const auto& agg = named.expression->AsAggregateExpression();
+        if (agg.Having() != AggregateHavingModifier::kNone ||
+            !agg.InnerOrderBy().empty() || agg.InnerLimit().has_value() ||
+            agg.SecondaryArg() || agg.HasInnerGroupBy()) {
+          return false;
+        }
+        switch (agg.GetType()) {
+          case AggregationType::kCount:
+          case AggregationType::kSum:
+          case AggregationType::kAvg:
+          case AggregationType::kMin:
+          case AggregationType::kMax:
+          case AggregationType::kLogicalAnd:
+          case AggregationType::kLogicalOr:
+            return agg.TrailingArgs().empty();
+          default:
+            return IsStatisticalAggregate(agg.GetType());
+        }
+      });
+  if (parallel_safe && child_->EmitRowCount() >= kParallelAggregationMinRows) {
     // Cap workers like the parallel table scan path; unbounded
     // hardware_concurrency() oversubscribes under nested or concurrent
     // aggregations.
@@ -342,7 +385,29 @@ Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
 }
 
 Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
-  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
+  std::vector<Value> begin_key = begin_key_;
+  std::vector<Value> end_key = end_key_;
+  auto point_ranges = point_ranges_;
+  if (ContainsParameterSlot(where_)) {
+    // Seek keys were sniffed at fill time. Rebuild them from the predicate
+    // after Bind() so a different literal still lands on the right rows.
+    // An empty rebuild scans without a seek; the residual predicate remains
+    // authoritative.
+    const ReboundIndexKeys rebound = ReboundIndexKeysFromPredicate(
+        where_, table_.GetSchema(), index_, !point_ranges_.empty());
+    if (!point_ranges_.empty()) {
+      point_ranges = rebound.point_ranges;
+      if (point_ranges.empty()) {
+        begin_key.clear();
+        end_key.clear();
+      }
+    } else {
+      begin_key = rebound.begin_key;
+      end_key = rebound.end_key;
+      point_ranges.clear();
+    }
+  }
+  auto stale_fallback = [&]() -> Executor {
     // Fallback route scans the table directly; Selection requires a real
     // predicate, so pass the plain scan through when there is none.  The
     // lock flags survive the fallback: a DML source scan still needs its
@@ -355,32 +420,57 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
     }
     return std::make_shared<Selection>(where_, table_.GetSchema(),
                                        std::move(scan));
+  };
+  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
+    return stale_fallback();
   }
-  if (!point_ranges_.empty()) {
-    return std::make_shared<IndexScan>(txn.txn_, table_, index_, point_ranges_,
-                                       ascending_, where_, GetSchema(),
-                                       lock_rows_, wait_for_write_intent_);
+  auto index_read_guard = txn.txn_.AcquireIndexReadGuard(index_.Root());
+  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
+    return stale_fallback();
   }
-  return std::make_shared<IndexScan>(txn.txn_, table_, index_, begin_key_,
-                                     end_key_, ascending_, where_, GetSchema(),
-                                     lock_rows_, wait_for_write_intent_);
+  if (!point_ranges.empty()) {
+    return std::make_shared<IndexScan>(
+        txn.txn_, table_, index_, point_ranges, ascending_, where_, GetSchema(),
+        lock_rows_, wait_for_write_intent_, std::move(index_read_guard));
+  }
+  return std::make_shared<IndexScan>(txn.txn_, table_, index_, begin_key,
+                                     end_key, ascending_, where_, GetSchema(),
+                                     lock_rows_, wait_for_write_intent_,
+                                     std::move(index_read_guard));
 }
 
 Executor BitmapScanPlan::EmitExecutor(TransactionContext& context) const {
-  for (const BitmapIndexRange& range : ranges_) {
-    if (context.txn_.IndexKeysMayBeStale(range.index->Root())) {
-      Executor scan = std::make_shared<FullScan>(context.txn_, table_);
-      return where_ ? std::make_shared<Selection>(where_, table_.GetSchema(),
-                                                  std::move(scan))
-                    : scan;
-    }
+  if (ContainsParameterSlot(where_)) {
+    // Bitmap ranges are sniffed constants. A full scan plus the residual
+    // predicate stays correct for every later binding.
+    Executor scan = std::make_shared<FullScan>(context.txn_, table_);
+    return where_ ? std::make_shared<Selection>(where_, table_.GetSchema(),
+                                                std::move(scan))
+                  : scan;
   }
+  auto stale_fallback = [&]() -> Executor {
+    Executor scan = std::make_shared<FullScan>(context.txn_, table_);
+    return where_ ? std::make_shared<Selection>(where_, table_.GetSchema(),
+                                                std::move(scan))
+                  : scan;
+  };
+  std::vector<TransactionManager::IndexReadGuard> index_read_guards;
+  index_read_guards.reserve(ranges_.size());
   std::vector<RowPosition> positions;
   bool first = true;
   for (const BitmapIndexRange& range : ranges_) {
+    if (context.txn_.IndexKeysMayBeStale(range.index->Root())) {
+      return stale_fallback();
+    }
+    auto index_read_guard =
+        context.txn_.AcquireIndexReadGuard(range.index->Root());
+    if (context.txn_.IndexKeysMayBeStale(range.index->Root())) {
+      return stale_fallback();
+    }
+    index_read_guards.emplace_back(std::move(index_read_guard));
     std::vector<RowPosition> next =
         BitmapIndexScan(context.txn_, table_, *range.index, range.begin_key,
-                        range.end_key)
+                        range.end_key, &index_read_guards.back())
             .ScanPositions();
     if (first) {
       positions = std::move(next);
@@ -397,9 +487,15 @@ Executor BitmapScanPlan::EmitExecutor(TransactionContext& context) const {
 }
 
 Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& txn) const {
-  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
-    // Fallback route reads the table directly; Selection requires a real
-    // predicate, so skip it when there is none.
+  std::vector<Value> begin_key = begin_key_;
+  std::vector<Value> end_key = end_key_;
+  if (ContainsParameterSlot(where_)) {
+    const ReboundIndexKeys rebound = ReboundIndexKeysFromPredicate(
+        where_, table_.GetSchema(), index_, /*want_points=*/false);
+    begin_key = rebound.begin_key;
+    end_key = rebound.end_key;
+  }
+  auto stale_fallback = [&] {
     Executor executor = std::make_shared<FullScan>(txn.txn_, table_);
     if (where_) {
       executor = std::make_shared<Selection>(where_, table_.GetSchema(),
@@ -415,10 +511,17 @@ Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& txn) const {
     }
     return std::make_shared<Projection>(std::move(columns), table_.GetSchema(),
                                         std::move(executor));
+  };
+  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
+    return stale_fallback();
   }
-  return std::make_shared<IndexOnlyScan>(txn.txn_, table_, index_, begin_key_,
-                                         end_key_, ascending_, where_,
-                                         table_.GetSchema());
+  auto index_read_guard = txn.txn_.AcquireIndexReadGuard(index_.Root());
+  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
+    return stale_fallback();
+  }
+  return std::make_shared<IndexOnlyScan>(
+      txn.txn_, table_, index_, begin_key, end_key, ascending_, where_,
+      table_.GetSchema(), std::move(index_read_guard));
 }
 
 Executor RelationRenamePlan::EmitExecutor(TransactionContext& ctx) const {
@@ -477,8 +580,8 @@ Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
   if (Kind() == JoinKind::kInner && !Residual() &&
       Left()->EmitRowCount() + Right()->EmitRowCount() >=
           kParallelMergeJoinMinRows) {
-    const size_t workers =
-        std::min<size_t>(16, std::thread::hardware_concurrency());
+    const size_t workers = std::min<size_t>(
+        16, std::max<size_t>(1, std::thread::hardware_concurrency()));
     return std::make_shared<ParallelMergeJoin>(
         Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),
         std::move(right), workers, Kind(), Expression(), Schema(),
@@ -558,9 +661,22 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
       right_tbl_ != nullptr ? right_tbl_->GetSchema() : right_src_->GetSchema();
   BuildKeyOffsets(right_schema, right_cols_, &right);
   if (right_tbl_ != nullptr) {
-    // IndexJoin.
-    return std::make_shared<IndexJoin>(ctx.txn_, left_src_->EmitExecutor(ctx),
-                                       left, *right_tbl_, *right_idx_, right);
+    Executor left_executor = left_src_->EmitExecutor(ctx);
+    auto index_read_guard = ctx.txn_.AcquireIndexReadGuard(right_idx_->Root());
+    if (ctx.txn_.IndexKeysMayBeStale(right_idx_->Root())) {
+      auto join = std::make_shared<HashJoin>(
+          std::move(left_executor), left,
+          std::make_shared<FullScan>(ctx.txn_, *right_tbl_), right, hash_mode_,
+          kind_,
+          std::min<size_t>(
+              16, std::max<size_t>(1, std::thread::hardware_concurrency())),
+          right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount());
+      join->SetJoinAnnotations(key_null_safe_, residual_note_);
+      return join;
+    }
+    return std::make_shared<IndexJoin>(ctx.txn_, std::move(left_executor), left,
+                                       *right_tbl_, *right_idx_, right,
+                                       std::move(index_read_guard));
   }
   if (kind_ != JoinKind::kInner) {
     // Semi/anti and outer hash joins retain the logical join kind.  Widths
@@ -568,7 +684,9 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
     // cannot infer the number of NULL padding columns from a row.
     auto join = std::make_shared<HashJoin>(
         left_src_->EmitExecutor(ctx), left, right_src_->EmitExecutor(ctx),
-        right, hash_mode_, kind_, std::thread::hardware_concurrency(),
+        right, hash_mode_, kind_,
+        std::min<size_t>(
+            16, std::max<size_t>(1, std::thread::hardware_concurrency())),
         right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount());
     join->SetJoinAnnotations(key_null_safe_, residual_note_);
     return join;
@@ -584,8 +702,8 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   if (!any_null_safe &&
       left_src_->EmitRowCount() + right_src_->EmitRowCount() >=
           kParallelHashJoinMinRows) {
-    const size_t workers =
-        std::min<size_t>(16, std::thread::hardware_concurrency());
+    const size_t workers = std::min<size_t>(
+        16, std::max<size_t>(1, std::thread::hardware_concurrency()));
     return std::make_shared<SharedBuildParallelHashJoin>(
         left_src_->EmitExecutor(ctx), left, right_src_->EmitExecutor(ctx),
         right, workers, JoinKind::kInner,
@@ -597,5 +715,39 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   join->SetJoinAnnotations(key_null_safe_, residual_note_);
   return join;
 }
+
+namespace relational_detail {
+
+StatusOr<Relation> ApplyTableSample(TransactionContext& context,
+                                    const SelectSource& source,
+                                    Relation input) {
+  if (!source.sample) {
+    return input;
+  }
+  input.FinishSpill();
+  std::vector<Row> rows;
+  RETURN_IF_FAIL(
+      input.ForEachRow([&](const Row& row) { rows.push_back(row); }));
+  auto executor = std::make_shared<TableSampleExecutor>(
+      context, std::make_shared<ConstantExecutor>(std::move(rows)),
+      input.schema, *source.sample);
+  Relation output(context.execution_runtime());
+  output.schema = executor->OutputSchema();
+  Row row;
+  RowPosition position;
+  while (executor->Next(&row, &position)) {
+    output.AddRow(std::move(row));
+  }
+  if (executor->GetStatus() != Status::kSuccess) {
+    return executor->GetStatus();
+  }
+  CopyExecutionStats(&output, input);
+  output.FinishSpill();
+  output.peak_intermediate_rows =
+      std::max(output.peak_intermediate_rows, output.TotalRows());
+  return output;
+}
+
+}  // namespace relational_detail
 
 }  // namespace tinylamb

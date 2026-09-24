@@ -7,7 +7,7 @@
 ## 概要
 
 `Limit(Projection(X))` を `Projection(Limit(X))` に反転させる Rule です
-(ProjectLimitTranspose / LimitProjectTranspose)。射影は行数を変えない 1:1 変形
+（ProjectLimitTranspose / LimitProjectTranspose）。射影は行数を変えない 1:1 変形
 なので Limit と交換でき、先に Limit をかけることで下のスキャンや結合が
 作る行を減らせます。登録直前のコメントが意図を述べています。
 
@@ -72,10 +72,10 @@ graph TD
 - `Projection(X)` の先頭 5 行 ≡ `X` の先頭 5 行を射影したもの
 - 逆に `X` の先頭 5 行を射影すれば、全体の射影結果の先頭 5 行と一致
 
-が成り立ちます。ここを崩すのが危険なのは行数を変える演算子です。フィルタ
-(Selection)や集約、DISTINCT は行数を変えるため、同じ転置はできません
-(フィルタは `push_filter_through_sort` 系が、集約は `push_selection_through_aggregation`
-が別の条件で扱います)。
+が成り立ちます。同じ転置を行数が変わる演算子へ適用すると、結果も変わります。
+そのため、フィルタ（Selection）や集約、DISTINCT は対象外です。フィルタは
+`push_filter_through_sort` 系が、集約は `push_selection_through_aggregation` が
+別の条件で扱います。
 
 もう 1 つの要点は「射影を上に残す」ことです。射影の `target_list`
 (出力列の定義)はそのままに、子を Limit 済みグループへ付け替えるだけで、
@@ -121,9 +121,9 @@ graph TD
 ```
 
 - 射影の計算量が「全入力行 × 1 行あたり計算」から「Limit 後の行 × 同」に
-  減ります(特に計算式の重い射影で効きます)。
+  減ります（特に計算量の多い射影で効果があります）。
 - 物理化の際、Limit の下のスキャンが `limit_hint` を受け取り、行数上限を
-  見込んだコスト見積りと早期打ち切りが効きます(第 1 部 50 章)。
+  上限件数を考慮したコスト見積もりと早期打ち切りを適用できます（第 1 部 50 章）。
 - UNION ALL や結合の下にさらに押し込む可能性が生まれます。
 
 ## 関連 Rule との相互作用

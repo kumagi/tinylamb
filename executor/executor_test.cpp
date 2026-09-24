@@ -229,6 +229,37 @@ TEST_F(ExecutorTest, IndexScan) {
   ASSERT_FALSE(fs.Next(&got, &pos));
 }
 
+TEST_F(ExecutorTest, IndexScanRejectedPredicateReleasesWriteIntent) {
+  TransactionContext scan_context = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, scan_table,
+                              scan_context.GetTable(kTableName));
+  Row row;
+  {
+    IndexScan scan(scan_context.txn_, *scan_table, scan_table->GetIndex(0),
+                   Value(), Value(), true,
+                   BinaryExpressionExp(ColumnValueExp("score"),
+                                       BinaryOperation::kGreaterThan,
+                                       ConstantValueExp(Value(100.0))),
+                   scan_table->GetSchema(), true);
+    while (scan.Next(&row, nullptr)) {
+    }
+    ASSERT_EQ(scan.GetStatus(), Status::kSuccess);
+  }
+
+  TransactionContext find_context = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, find_table,
+                              find_context.GetTable(kTableName));
+  RowPosition candidate;
+  FullScan find(find_context.txn_, *find_table);
+  ASSERT_TRUE(find.Next(&row, &candidate));
+
+  TransactionContext contender = rs_->BeginContext();
+  EXPECT_TRUE(contender.txn_.TryAddWriteSet(candidate));
+  contender.Abort();
+  find_context.Abort();
+  scan_context.Abort();
+}
+
 TEST_F(ExecutorTest, IndexOnlyScan) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
@@ -312,20 +343,24 @@ TEST_F(ExecutorTest, IndexOnlyScanAndBitmapScanMvccSnapshotVisibility) {
 
   TransactionContext writer_ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, w_tbl, rs_->GetTable(writer_ctx, "MvccTable"));
-  IndexScan find_row(writer_ctx.txn_, w_tbl, w_tbl.GetIndex(0), Value(1),
-                     Value(1), true, Expression(), mvcc_schema);
   Row found_row;
   RowPosition pos1;
-  ASSERT_TRUE(find_row.Next(&found_row, &pos1));
+  {
+    IndexScan find_row(writer_ctx.txn_, w_tbl, w_tbl.GetIndex(0), Value(1),
+                       Value(1), true, Expression(), mvcc_schema);
+    ASSERT_TRUE(find_row.Next(&found_row, &pos1));
+  }
   ASSERT_SUCCESS(w_tbl
                      .Update(writer_ctx.txn_, pos1,
                              Row({Value(1), Value("one_updated"), Value(99.9)}))
                      .GetStatus());
 
-  IndexScan find_row2(writer_ctx.txn_, w_tbl, w_tbl.GetIndex(0), Value(2),
-                      Value(2), true, Expression(), mvcc_schema);
   RowPosition pos2;
-  ASSERT_TRUE(find_row2.Next(&found_row, &pos2));
+  {
+    IndexScan find_row2(writer_ctx.txn_, w_tbl, w_tbl.GetIndex(0), Value(2),
+                        Value(2), true, Expression(), mvcc_schema);
+    ASSERT_TRUE(find_row2.Next(&found_row, &pos2));
+  }
   ASSERT_SUCCESS(w_tbl.Delete(writer_ctx.txn_, pos2));
 
   ASSERT_SUCCESS(
@@ -723,6 +758,42 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
   // Assert -- cursor exhausted and all matched pairs consumed
   ASSERT_FALSE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.empty());
+}
+
+TEST_F(ExecutorTest, IndexJoinRejectsNullAndNaNKeys) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_table,
+      rs_->CreateTable(ctx, Schema{"IndexedDouble",
+                                   {Column("key", ValueType::kDouble),
+                                    Column("value", ValueType::kInt64)}}));
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  ASSERT_SUCCESS(
+      right_table.Insert(ctx.txn_, Row({Value(nan), Value(7)})).GetStatus());
+  ASSERT_SUCCESS(
+      right_table.Insert(ctx.txn_, Row({Value(1.0), Value(8)})).GetStatus());
+  ASSERT_SUCCESS(
+      right_table.Insert(ctx.txn_, Row({Value(2.0), Value(9)})).GetStatus());
+  ASSERT_EQ(rs_->CreateIndex(ctx, "IndexedDouble",
+                             IndexSchema("IndexedDoubleKey", {0}, {},
+                                         IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const StatusOr<std::shared_ptr<Table>> reloaded_status =
+      ctx.GetTable("IndexedDouble");
+  ASSERT_EQ(reloaded_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& reloaded = reloaded_status.Value();
+  auto left = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(nan)}), Row({Value(1.0)}), Row({Value()})});
+  IndexJoin join(ctx.txn_, left, {0}, *reloaded, reloaded->GetIndex(0), {0});
+  std::vector<Row> rows;
+  Row row;
+  while (join.Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1.0));
+  EXPECT_EQ(rows[0][1], Value(1.0));
+  EXPECT_EQ(rows[0][2], Value(8));
 }
 
 TEST_F(ExecutorTest, Insert) {
@@ -1330,7 +1401,7 @@ TEST_F(ExecutorTest, ZoneMapTracksStats) {
   const std::optional<Value> minimum = map.Minimum();
   const std::optional<Value> maximum = map.Maximum();
   if (!minimum || !maximum) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   EXPECT_EQ(*minimum, Value(3));
@@ -1843,7 +1914,7 @@ TEST_F(ExecutorTest, ParallelAggregationInt64FastPathMatchesSequential) {
     if (column == 3) {
       continue;
     }
-    EXPECT_EQ(actual[column], expected[column]) << true << (column != 0U);
+    EXPECT_EQ(actual[column], expected[column]) << (column != 0U);
   }
   EXPECT_DOUBLE_EQ(actual[3].value.double_value,
                    expected[3].value.double_value);
@@ -2535,11 +2606,14 @@ TEST_F(ExecutorTest, RelationalInSubqueriesAndScalarFallback) {
                     "SampleTable ORDER BY key);");
   EXPECT_EQ(uncorrelated.size(), 4U);
 
-  const auto derived_star = RelationalRun(
-      *rs_,
-      "SELECT key FROM SampleTable WHERE key IN (SELECT * FROM (SELECT * "
-      "FROM SampleTable));");
-  EXPECT_EQ(derived_star.size(), 4U);
+  // A multi-column IN subquery is rejected by both routes with the same
+  // pinned message (sql_subquery_shapes_coverage_test pins the default
+  // route); the relational interpreter must not silently return 0 rows.
+  ExpectMessageContains(
+      RelationalThrow(*rs_,
+                      "SELECT key FROM SampleTable WHERE key IN "
+                      "(SELECT * FROM (SELECT * FROM SampleTable));"),
+      "Subquery of type IN must have only one output column");
 
   // Scalar subquery that is neither correlated-indexable nor cacheable must
   // fall back to a full ExecuteQuery.  LIMIT 1 keeps the scalar subquery
@@ -2988,6 +3062,118 @@ TEST_F(ExecutorTest, RelationalCorrelatedDerivedSubqueryUsesApplyCache) {
   EXPECT_GT(StatsValue(plan, "correlated_result_cache_hits="), 0) << plan;
 }
 
+TEST_F(ExecutorTest, RelationalCorrelatedAggregatePreservesTypedKeys) {
+  RelationalRun(*rs_, "CREATE TABLE TypedDateKeys(d DATE)");
+  RelationalRun(*rs_,
+                "INSERT INTO TypedDateKeys VALUES (DATE '2026-01-01'), "
+                "(DATE '2026-01-01'), (DATE '2026-01-02')");
+  const std::string date_query =
+      "SELECT o.d, (SELECT COUNT(*) FROM TypedDateKeys i WHERE i.d = o.d) "
+      "FROM TypedDateKeys o ORDER BY o.d";
+  const auto date_rows = RelationalRun(*rs_, date_query);
+  ASSERT_EQ(date_rows.size(), 3U);
+  EXPECT_EQ(date_rows[0][1], Value(int64_t{2}));
+  EXPECT_EQ(date_rows[1][1], Value(int64_t{2}));
+  EXPECT_EQ(date_rows[2][1], Value(int64_t{1}));
+  const std::string date_plan = RelationalExplain(*rs_, date_query, true);
+  EXPECT_GT(StatsValue(date_plan, "correlated_result_cache_hits="), 0)
+      << date_plan;
+
+  RelationalRun(*rs_, "CREATE TABLE TypedUnsignedKeys(k UINT64)");
+  RelationalRun(*rs_, "INSERT INTO TypedUnsignedKeys VALUES (1), (1), (2)");
+  const std::string unsigned_query =
+      "SELECT o.k, (SELECT COUNT(*) FROM TypedUnsignedKeys i WHERE i.k = o.k) "
+      "FROM TypedUnsignedKeys o ORDER BY o.k";
+  const auto unsigned_rows = RelationalRun(*rs_, unsigned_query);
+  ASSERT_EQ(unsigned_rows.size(), 3U);
+  EXPECT_EQ(unsigned_rows[0][1], Value(int64_t{2}));
+  EXPECT_EQ(unsigned_rows[1][1], Value(int64_t{2}));
+  EXPECT_EQ(unsigned_rows[2][1], Value(int64_t{1}));
+  const std::string unsigned_plan =
+      RelationalExplain(*rs_, unsigned_query, true);
+  EXPECT_GT(StatsValue(unsigned_plan, "correlated_result_cache_hits="), 0)
+      << unsigned_plan;
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedSetOperationFallsBack) {
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedSetOuter(k INT64)");
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedSetEmpty(k INT64, v INT64)");
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedSetFilled(k INT64, v INT64)");
+  RelationalRun(*rs_, "INSERT INTO CorrelatedSetOuter VALUES (1)");
+  RelationalRun(*rs_, "INSERT INTO CorrelatedSetFilled VALUES (1, 99)");
+  const auto rows = RelationalRun(
+      *rs_,
+      "SELECT o.k, (SELECT d.v FROM CorrelatedSetEmpty d "
+      "WHERE d.k = o.k UNION ALL SELECT n.v FROM CorrelatedSetFilled n "
+      "WHERE n.k = o.k LIMIT 1) FROM CorrelatedSetOuter o");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][1], Value(int64_t{99}));
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedWindowFallsBack) {
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedWindowOuter(k INT64)");
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedWindowLocal(k INT64, v INT64)");
+  RelationalRun(*rs_, "INSERT INTO CorrelatedWindowOuter VALUES (1)");
+  RelationalRun(*rs_,
+                "INSERT INTO CorrelatedWindowLocal VALUES (1, 10), (1, 20)");
+  const auto rows = RelationalRun(
+      *rs_,
+      "SELECT o.k, (SELECT d.v FROM CorrelatedWindowLocal d "
+      "WHERE d.k = o.k QUALIFY ROW_NUMBER() OVER (ORDER BY d.v) = 3 LIMIT 1) "
+      "FROM CorrelatedWindowOuter o");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_TRUE(rows[0][1].IsNull());
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedMixedKeyFallsBack) {
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedMixedLocal(k INT64)");
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedMixedOuter(k FLOAT64, id INT64)");
+  RelationalRun(*rs_, "INSERT INTO CorrelatedMixedLocal VALUES (1)");
+  RelationalRun(*rs_, "INSERT INTO CorrelatedMixedOuter VALUES (1.0, 1)");
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT o.id, (SELECT COUNT(*) FROM CorrelatedMixedLocal d "
+                    "WHERE d.k = o.k) FROM CorrelatedMixedOuter o");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][1], Value(int64_t{1}));
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedOrderByCacheIncludesOuterDependency) {
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedOrderLocal(k INT64, v INT64)");
+  RelationalRun(
+      *rs_, "CREATE TABLE CorrelatedOrderOuter(k INT64, s INT64, id INT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO CorrelatedOrderLocal VALUES (1, 10), (1, 20)");
+  RelationalRun(
+      *rs_, "INSERT INTO CorrelatedOrderOuter VALUES (1, 1, 1), (1, -1, 2)");
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT o.id, (SELECT d.v FROM CorrelatedOrderLocal d "
+                    "WHERE d.k = o.k ORDER BY d.v * o.s LIMIT 1) "
+                    "FROM CorrelatedOrderOuter o ORDER BY o.id");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][1], Value(int64_t{10}));
+  EXPECT_EQ(rows[1][1], Value(int64_t{20}));
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedNestedQueryCacheIncludesDependencies) {
+  RelationalRun(*rs_, "CREATE TABLE CorrelatedNestedLocal(k INT64, v INT64)");
+  RelationalRun(
+      *rs_, "CREATE TABLE CorrelatedNestedOuter(k INT64, s INT64, id INT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO CorrelatedNestedLocal VALUES (1, 10), (1, 20)");
+  RelationalRun(
+      *rs_, "INSERT INTO CorrelatedNestedOuter VALUES (1, 1, 1), (1, -1, 2)");
+  const auto rows = RelationalRun(
+      *rs_,
+      "SELECT o.id, (SELECT (SELECT d.v FROM CorrelatedNestedLocal d "
+      "WHERE d.k = o.k ORDER BY d.v * o.s LIMIT 1)) "
+      "FROM CorrelatedNestedOuter o ORDER BY o.id");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][1], Value(int64_t{10}));
+  EXPECT_EQ(rows[1][1], Value(int64_t{20}));
+}
+
 TEST_F(ExecutorTest, RelationalHybridHashJoinSpillsUnderBudget) {
   CreateWideTable(*rs_, "WideJoin", 200);
   ScopedQueryMemory memory(65536);  // 200 x ~236B rows cannot all stay resident
@@ -3298,6 +3484,51 @@ TEST_F(ExecutorTest, RelationalNotInSubqueryNullBuildKeyFiltersEverything) {
       "SELECT key FROM WideNotInNull WHERE key NOT IN (SELECT key FROM "
       "WideNotInNull WHERE key > 1);");
   ASSERT_EQ(clean.size(), 2U);
+}
+
+TEST_F(ExecutorTest, RelationalInSubqueryMixedDomainAndDecisiveHashMiss) {
+  // Two invariants of the uncorrelated IN/NOT IN membership path:
+  // 1. A hash miss over a NULL-free same-domain build is decisive; the
+  //    canonical rescan must not run (a per-miss rescan is quadratic over
+  //    Q22-sized builds).
+  // 2. A mixed numeric domain (INT64 probe over a DOUBLE build and the
+  //    reverse) must not answer from the type-strict hash: `=` promotion
+  //    decides, so `1 IN (SELECT 1.0)` is TRUE.
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    Schema schema{"MixedDom", {Column("val", ValueType::kDouble)}};
+    StatusOr<Table> created = rs_->CreateTable(ctx, schema);
+    ASSERT_SUCCESS(created.GetStatus());
+    for (const double v : {1.0, 2.0}) {
+      ASSERT_SUCCESS(created.Value()
+                         .Insert(ctx.txn_, Row(std::vector{Value(v)}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  CreateWideTable(*rs_, "WideMixedIn", 3);
+  ScopedQueryMemory memory(65536);
+  // INT64 probe over a DOUBLE build: promotion decides both directions.
+  const auto int_over_double = RelationalRun(
+      *rs_,
+      "SELECT key FROM WideMixedIn WHERE key IN (SELECT val FROM MixedDom);");
+  ASSERT_EQ(int_over_double.size(), 2U);
+  const auto int_not_in_double = RelationalRun(
+      *rs_,
+      "SELECT key FROM WideMixedIn WHERE key NOT IN (SELECT val FROM "
+      "MixedDom);");
+  ASSERT_EQ(int_not_in_double.size(), 1U);
+  // DOUBLE probe over an INT64 build.
+  const auto double_over_int = RelationalRun(
+      *rs_,
+      "SELECT val FROM MixedDom WHERE val IN (SELECT key FROM WideMixedIn);");
+  ASSERT_EQ(double_over_int.size(), 2U);
+  // Same-domain miss over a NULL-free build stays decisive TRUE for NOT IN.
+  const auto same_domain = RelationalRun(
+      *rs_,
+      "SELECT val FROM MixedDom WHERE val NOT IN (SELECT val FROM MixedDom "
+      "WHERE val > 1.5);");
+  ASSERT_EQ(same_domain.size(), 1U);
 }
 
 TEST_F(ExecutorTest, RelationalWindowFunctionKeepsSpilledRows) {
@@ -3679,6 +3910,63 @@ TEST_F(ExecutorTest, HashJoinNullJoinKeysDoNotMatch) {
     }
     EXPECT_EQ(count, 2U);
   }
+}
+
+TEST_F(ExecutorTest, HashJoinNaNKeysDoNotMatch) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  auto left = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(nan)}), Row({Value(1.0)})});
+  auto right = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(nan)}), Row({Value(1.0)})});
+  HashJoin join(left, {0}, right, {0}, HashJoinMode::kInMemory, 2);
+  std::vector<Row> rows;
+  Row row;
+  while (join.Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1.0));
+  EXPECT_EQ(rows[0][1], Value(1.0));
+}
+
+TEST_F(ExecutorTest, HashJoinNullSafeNaNKeysMatch) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  auto left = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(nan)}), Row({Value(1.0)})});
+  auto right = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(nan)}), Row({Value(1.0)})});
+  HashJoin join(left, {0}, right, {0}, HashJoinMode::kInMemory,
+                JoinKind::kInner, 2);
+  join.SetJoinAnnotations({true}, Expression());
+  std::vector<Row> rows;
+  Row row;
+  while (join.Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_TRUE(std::ranges::any_of(rows, [](const Row& item) {
+    return item[0].type == ValueType::kDouble &&
+           std::isnan(item[0].value.double_value);
+  }));
+}
+
+TEST_F(ExecutorTest, HashJoinUnsignedBoundaryDoesNotCollide) {
+  const Value signed_minus_one(static_cast<int64_t>(-1));
+  const Value unsigned_minus_one =
+      Value(std::numeric_limits<int64_t>::min()).WithUnsigned();
+  auto left = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({signed_minus_one}), Row({Value(5)})});
+  auto right = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({unsigned_minus_one}), Row({Value(5).WithUnsigned()})});
+  HashJoin join(left, {0}, right, {0}, HashJoinMode::kInMemory, 2);
+  std::vector<Row> rows;
+  Row row;
+  while (join.Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(5));
+  EXPECT_EQ(rows[0][1], Value(5).WithUnsigned());
 }
 
 TEST_F(ExecutorTest, HashJoinNextBatchSplitsOutput) {

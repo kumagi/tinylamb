@@ -5,9 +5,9 @@
 
 ## 概要
 
-`intersect_to_semijoin` は、集合演算 `Intersect(L, R)` を、全属性の等値を結合述語とする半結合 `SemiJoin(L, R, equality_on_all_columns)` へ書き換える論理変換Ruleです。
+`intersect_to_semijoin` は、集合演算 `Intersect(L, R)` を、全属性の等値を結合述語とする半結合 `SemiJoin(L, R, equality_on_all_columns)` へ書き換える論理変換 Rule です。
 
-INTERSECT 演算を「左入力の各行について、右入力に対応する行が少なくとも1つ存在するものを残す」という半結合の意味論へ還元することで、結合アルゴリズム（SemiHashJoin、インデックス半結合等）および結合順序最適化の適用を可能にします。
+INTERSECT 演算を「左入力の各行について、右入力に対応する行が少なくとも1 つ存在するものを残す」という半結合の意味論へ還元することで、結合アルゴリズム（SemiHashJoin、インデックス半結合等）および結合順序最適化の適用を可能にします。
 
 ## 変換前後の関係
 
@@ -36,9 +36,9 @@ graph TD
     // equality_on_all_columns)
 ```
 
-変換ラムダ内で以下の3つのガード条件を検証します。
+変換ラムダ内で以下の3 つのガード条件を検証します。
 
-1. **子ノード数**: 子ノードの要素数が正確に2つであること。
+1. **子ノード数**: 子ノードの要素数が正確に2 つであること。
 2. **関係集合の排他性と網羅性**:
    左右の子グループの関係集合が互いに素（排他）であり、かつそれらの和集合が親グループの関係集合と完全に一致すること。
 
@@ -76,7 +76,7 @@ INTERSECT 演算は、集合論的に両入力の共通部分を抽出します�
   }
 ```
 
-なお、多重度保存に関する留意事項として、SQL の `INTERSECT`（DISTINCT 集合演算）は左入力内の重複行を1行に集約しますが、`SemiJoin` はマッチした左行をそのまま通過させるため、左入力に重複行が含まれる場合は多重度が一致しません。tinylamb の現行実装では `kIntersect` のみを対象とし、bag 演算である `kIntersectAll` は除外されています。
+なお、多重度保存に関する留意事項として、SQL の `INTERSECT`（DISTINCT 集合演算）は左入力内の重複行を1 行に集約しますが、`SemiJoin` はマッチした左行をそのまま通過させるため、左入力に重複行が含まれる場合は多重度が一致しません。tinylamb の現行実装では `kIntersect` のみを対象とし、bag 演算である `kIntersectAll` は除外されています。
 
 ## 実装の詳細
 
@@ -97,16 +97,16 @@ INTERSECT 演算は、集合論的に両入力の共通部分を抽出します�
 
 ## 最適化効果
 
-本Ruleの適用により、以下の最適化機会が得られます。
+本 Rule の適用により、以下の最適化機会が得られます。
 
 - **物理実装の多様化**: 集合演算の専用実装（`intersect`）は右入力の完全なマテリアライズを要求しますが、`SemiJoin` へ降格させることで、ビルド側のインデックスを用いた走査やパイプライン処理が可能なハッシュ半結合（`semi_hash_join`）を選択可能になります。
 - **結合順序最適化の適用**: 集合演算の境界を越えて、結合リオーダリングなどの大域的な探索空間を拡張します。
 
 ## 関連 Rule との相互作用
 
-- `except_to_antijoin`: EXCEPT 演算を AntiJoin へ変換する対照的なRuleです。同一の判定基盤および述語構築ロジックを共有します。
-- `intersect_except_cost_based_lowering`: `Pattern::Any()` を用いて INTERSECT と EXCEPT の双方を一括処理するRuleです。本Ruleと同一の論理代替を導出しますが、`Memo::AddExpression` により重複は排除されます。
-- `semi_hash_join` / `semi_merge_join`（実装Rule）: 本Ruleが生成した `kSemiJoin` 式を物理プランへ具体化します。
+- `except_to_antijoin`: EXCEPT 演算を AntiJoin へ変換する対照的な Rule です。同一の判定基盤および述語構築ロジックを共有します。
+- `intersect_except_cost_based_lowering`: `Pattern::Any()` を用いて INTERSECT と EXCEPT の双方を一括処理する Rule です。本 Rule と同一の論理代替を導出しますが、`Memo::AddExpression` により重複は排除されます。
+- `semi_hash_join` / `semi_merge_join`（実装 Rule）: 本 Rule が生成した `kSemiJoin` 式を物理プランへ具体化します。
 
 ## 検証テスト
 

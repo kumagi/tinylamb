@@ -21,6 +21,7 @@
 #include <cctype>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,13 @@
 namespace tinylamb {
 
 class EvaluationContext;
+
+std::string UnicodeUpper(std::string_view value);
+std::string UnicodeLower(std::string_view value);
+std::string UnicodeInitcap(std::string_view value, std::string_view delimiters,
+                           bool has_delimiters);
+std::string FormatFloatingForPrintf(double value, char specifier,
+                                    int precision);
 
 // Splits a JSON object body into top-level key / raw-value-text pairs.
 std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(

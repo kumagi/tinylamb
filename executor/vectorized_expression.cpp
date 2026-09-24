@@ -224,10 +224,7 @@ StatusOr<ColumnVector> VectorizedExpression::Evaluate(
         if (child_val.IsNull()) {
           result.Append(Value());
         } else {
-          Row tmp_row({child_val});
-          Schema tmp_schema("tmp", {Column("c", child_val.type)});
-          ASSIGN_OR_RETURN(Value, casted,
-                           (cast.TryEvaluate(tmp_row, tmp_schema)));
+          ASSIGN_OR_RETURN(Value, casted, cast.TryCast(child_val));
           result.Append(casted);
         }
       }

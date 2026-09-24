@@ -41,7 +41,7 @@ TEST(ParallelMergeJoinExtraTest, LeftOuterPadsFullRightWidth) {
   RowPosition pos;
   std::vector<Row> rows;
   while (join.Next(&row, &pos)) {
-    ASSERT_EQ(row.values_.size(), 5U) << true;
+    ASSERT_EQ(row.values_.size(), 5U);
     rows.push_back(row);
   }
   ASSERT_EQ(rows.size(), 2U);
@@ -101,14 +101,15 @@ TEST(ParallelMergeJoinExtraTest, DuplicateKeysAtDifferentOffsets) {
       for (int64_t left_duplicate = 0; left_duplicate < 3; ++left_duplicate) {
         for (int64_t right_duplicate = 0; right_duplicate < 2;
              ++right_duplicate) {
-          expected.emplace_back(Row({Value(key), Value(100 + left_duplicate),
-                                     Value(200 + right_duplicate), Value(key)}));
+          expected.emplace_back(
+              Row({Value(key), Value(100 + left_duplicate),
+                   Value(200 + right_duplicate), Value(key)}));
         }
       }
     }
-    ParallelMergeJoin join(
-        std::make_shared<ConstantExecutor>(left_rows), {0},
-        std::make_shared<ConstantExecutor>(right_rows), {1}, workers);
+    ParallelMergeJoin join(std::make_shared<ConstantExecutor>(left_rows), {0},
+                           std::make_shared<ConstantExecutor>(right_rows), {1},
+                           workers);
     std::vector<Row> actual;
     Row row;
     while (join.Next(&row, nullptr)) {

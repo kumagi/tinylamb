@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <ostream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -29,10 +30,19 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
       table_(&table),
       projection_(std::move(projection)),
       peek_compares_(std::move(peek_compares)),
-      morsels_(table.BuildScanMorsels(txn, pages_per_morsel)),
-      worker_count_(std::min(std::max<size_t>(1, worker_count),
-                             std::max<size_t>(1, morsels_.size()))),
-      max_ready_chunks_(std::max<size_t>(2, worker_count_ * 2)) {}
+      worker_count_(1),
+      max_ready_chunks_(2) {
+  StatusOr<TableLease> lease = table_->AcquireLease(txn_->ID());
+  if (!lease.HasValue()) {
+    worker_status_ = lease.GetStatus();
+    return;
+  }
+  table_lease_ = lease.MoveValue();
+  morsels_ = table_->BuildScanMorsels(*txn_, pages_per_morsel);
+  worker_count_ = std::min(std::max<size_t>(1, worker_count),
+                           std::max<size_t>(1, morsels_.size()));
+  max_ready_chunks_ = std::max<size_t>(2, worker_count_ * 2);
+}
 
 ParallelScan::~ParallelScan() {
   {
@@ -109,7 +119,8 @@ void ParallelScan::RunWorker(size_t batch_size) {
           iterator.DropPageLatch();
           return;
         }
-        chunk.Append(*iterator, iterator.Position());
+        const RowPosition position = iterator.Position();
+        chunk.Append(std::move(*iterator), position);
         ++iterator;
         if (chunk.Size() == batch_size) {
           // Never block on a full output queue while holding a page latch:
@@ -129,8 +140,18 @@ void ParallelScan::RunWorker(size_t batch_size) {
           }
         }
       }
+      bool scan_failed = false;
+      if (iterator.GetStatus() != Status::kSuccess) {
+        std::scoped_lock lock(mutex_);
+        if (worker_status_ == Status::kSuccess) {
+          worker_status_ = iterator.GetStatus();
+        }
+        cancelled_.store(true, std::memory_order_release);
+        scan_failed = true;
+      }
       iterator.DropPageLatch();
-      if (!chunk.Empty()) {
+
+      if (!scan_failed && !chunk.Empty()) {
         if (!Enqueue(std::move(chunk))) {
           return;
         }
@@ -189,7 +210,8 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
   Start(kDefaultVectorSize);
   std::unique_lock lock(mutex_);
   ready_cv_.wait(lock, [this] {
-    return !ready_.empty() || active_workers_ == 0 || worker_error_;
+    return !ready_.empty() || active_workers_ == 0 || worker_error_ ||
+           worker_status_ != Status::kSuccess;
   });
   if (worker_error_) {
     // Surface the worker failure as a sticky Status instead of unwinding
@@ -202,6 +224,10 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
       FailWith(StatusError(StatusCode::kRuntimeError,
                            "parallel scan worker failed"));
     }
+    return 0;
+  }
+  if (worker_status_ != Status::kSuccess) {
+    FailWith(worker_status_);
     return 0;
   }
   if (ready_.empty()) {

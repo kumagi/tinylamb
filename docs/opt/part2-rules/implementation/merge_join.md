@@ -5,7 +5,7 @@
 
 ## 概要
 
-`merge_join` は、論理結合演算 `kJoin` を、両オペランドのタプルを等値結合キーの昇順に走査・照合する物理計画 `MergeJoinPlan`（ソートマージ結合）へと変換する実装Ruleです。入力子ノードがすでに要求キー順でソートされている場合はその順序を無償で活用し、ソートされていない子ノードに対しては局所的な `SortPlan` を挿入して物理整合性を担保します。
+`merge_join` は、論理結合演算 `kJoin` を、両オペランドのタプルを等値結合キーの昇順に走査・照合する物理計画 `MergeJoinPlan`（ソートマージ結合）へと変換する実装 Rule です。入力子ノードがすでに要求キー順でソートされている場合はその順序を無償で活用し、ソートされていない子ノードに対しては局所的な `SortPlan` を挿入して物理整合性を保証します。
 
 ## 変換前後の関係
 
@@ -28,7 +28,7 @@ graph TD
 
 ## 適用条件
 
-パターンは `Join()`（2つの子ノードを持つ `kJoin`）です。適用条件は以下のとおりです（`plan/implementation_rules.cpp`）。
+パターンは `Join()`（2 つの子ノードを持つ `kJoin`）です。適用条件は以下のとおりです（`plan/implementation_rules.cpp`）。
 
 ```cpp
           if (children.size() != 2 || required.require_row_position) {
@@ -47,7 +47,7 @@ graph TD
     }
 ```
 
-等値キーが存在しない場合、本Ruleは空の候補リストを返却して適用を中断します。
+等値キーが存在しない場合、本 Rule は空の候補リストを返却して適用を中断します。
 
 ## 意味論的根拠と順序の健全性
 
@@ -61,7 +61,7 @@ graph TD
 // can still win the Cascades search.
 ```
 
-入力の順序が崩れている場合、マッチングすべきタプルを見落とし、結果行の欠落（意味論の破壊）を招きます。そのため、本Ruleは各子計画に対して `IsOrderedBy` を呼び出し、順序要件を満たしていない側にのみ明示的な `SortPlan` を挿入して安全性を保証します。
+入力が必要な順序に並んでいないと、照合すべきタプルを見落として結果行が欠落します。そのため、本 Rule は各子計画に対して `IsOrderedBy` を呼び出し、順序要件を満たさない側にだけ `SortPlan` を挿入します。
 
 ```cpp
   const std::vector<bool> ascending(left_columns.size(), true);
@@ -107,11 +107,11 @@ graph TD
 
 インデックススキャンや先行するソート処理によって両入力がすでにソートされている場合、追加のソートやハッシュテーブル構築が不要となり、メモリ消費を最小限に抑えた高速な1パス結合が実現します。一方、双方の入力にソートを要する場合はソートコストが加算されるため、コストベース探索器は通常ハッシュ結合を優先します。
 
-## 関連Ruleとの相互作用
+## 関連 Rule との相互作用
 
-- `hash_join` / `index_join` / `nested_loop_join`: 競合する結合実装Rule群。
-- `sort_merge_of_compatible_orders`: ソート順序の互換性を整え、ソートマージ結合が採用されやすい環境を整備する論理Rule。
-- `outer_hash_join` / `semi_merge_join` / `anti_merge_join`: 同一の `MergeJoinAlternative` ヘルパーを共有し、異なる結合種別を実装するRule群。
+- `hash_join` / `index_join` / `nested_loop_join`: 競合する結合実装 Rule 群。
+- `sort_merge_of_compatible_orders`: ソート順序の互換性を整え、ソートマージ結合が採用されやすい環境を整備する論理 Rule。
+- `outer_hash_join` / `semi_merge_join` / `anti_merge_join`: 同一の `MergeJoinAlternative` ヘルパーを共有し、異なる結合種別を実装する Rule 群。
 - 物理プロパティの提供: `MergeJoinPlan::IsOrderedBy` により、マージ結合の出力は左結合キーの順序を保持していると宣言されます。これにより、後続の集約やORDER BYにおいてソート処理を省略可能です。
 
 ## 検証テスト

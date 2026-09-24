@@ -37,7 +37,7 @@ class ScalarFunctionSqlTest : public ::testing::Test {
   void TearDown() override {
     db_.reset();
     std::filesystem::remove(db_name_ + ".db");
-    std::filesystem::remove(db_name_ + ".log");
+    tinylamb::RemoveLogAndSegments(db_name_ + ".log");
     std::filesystem::remove(db_name_ + ".last_checkpoint");
   }
 
@@ -204,6 +204,35 @@ TEST_F(ScalarFunctionSqlTest, RegexpFunctions) {
   EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('hello', 'ell')"), Value(true));
   EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('hello', 'xyz')"), Value(false));
   EXPECT_EQ(Scalar("SELECT REGEXP_REPLACE('hello', 'l', 'L')"), Value("heLLo"));
+}
+
+TEST_F(ScalarFunctionSqlTest, RegexpNestedRepetitionRejected) {
+  // Bug 70: std::regex's backtracking executor takes exponential time on
+  // patterns that apply an unbounded quantifier to an already-repetitious
+  // sub-expression (".++", "(a+)+", "a+{2,}*"); a fuzz probe hung >20min on
+  // a 75-byte subject. Such patterns are rejected up front.
+  EXPECT_TRUE(SqlFails("SELECT REGEXP_REPLACE('aaaaaaaaaa', '.++', 'x')"));
+  EXPECT_TRUE(SqlFails("SELECT REGEXP_CONTAINS('aaaaaaaaaa', '(a+)+')"));
+  EXPECT_TRUE(SqlFails("SELECT REGEXP_CONTAINS('aaaab', '(a+b?)+')"));
+  EXPECT_TRUE(SqlFails("SELECT REGEXP_REPLACE('aaaaaaaaaa', 'a+{2,}*', 'x')"));
+  EXPECT_TRUE(SqlFails("SELECT REGEXP_CONTAINS('aaaaaaaaaa', '((a+)b)+')"));
+
+  // AST/constant-folding path rejects them as well.
+  Row dummy_row;
+  Schema dummy_schema;
+  EXPECT_EQ(
+      FunctionCallExp("regexp_replace", {ConstantValueExp(Value("aaaaaaaaaa")),
+                                         ConstantValueExp(Value(".++")),
+                                         ConstantValueExp(Value("x"))})
+          ->TryEvaluate(dummy_row, dummy_schema)
+          .GetStatus(),
+      StatusCode::kInvalidArgument);
+
+  // Bounded, non-nested, and lazily-modified quantifiers still work.
+  EXPECT_EQ(Scalar("SELECT REGEXP_REPLACE('hello', 'l+', 'L')"), Value("heLo"));
+  EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('abab', '(ab)+')"), Value(true));
+  EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('aab', 'a{2,}b')"), Value(true));
+  EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('aab', 'a+?b')"), Value(true));
 }
 
 TEST(FunctionCallAstTest, MathFunctionsAstParity) {
@@ -955,6 +984,118 @@ TEST_F(ScalarFunctionSqlTest, BitwiseAndShiftOperatorsConformance) {
   Value u_xor = Scalar("SELECT CAST(1 AS UINT64) ^ 3");
   EXPECT_TRUE(u_xor.IsUnsigned());
   EXPECT_EQ(u_xor.value.int_value, 2);
+}
+
+// Regression for the fuzz-found AddOrSubInterval union-member read:
+// DATE_ADD/DATE_SUB with a non-DATE non-VARCHAR operand must return a
+// Status, not dereference `value.varchar_value` of an INT64/DOUBLE union
+// member (a garbage string_view -> SEGV inside TryParseDateDays).
+TEST_F(ScalarFunctionSqlTest, ArrayToString_JoinsWithDelimiterAndNullHandling) {
+  EXPECT_EQ(Scalar("SELECT ARRAY_TO_STRING([1, 2, 3], '-')"),
+            Value(std::string("1-2-3")));
+  EXPECT_EQ(Scalar("SELECT ARRAY_TO_STRING(['a', 'b'], ', ')"),
+            Value(std::string("a, b")));
+  // NULL elements are skipped without a null_text and substituted with one.
+  EXPECT_EQ(Scalar("SELECT ARRAY_TO_STRING(['a', NULL, 'b'], ',')"),
+            Value(std::string("a,b")));
+  EXPECT_EQ(Scalar("SELECT ARRAY_TO_STRING(['a', NULL, 'b'], ',', '*')"),
+            Value(std::string("a,*,b")));
+  EXPECT_EQ(Scalar("SELECT ARRAY_TO_STRING([], ',')"), Value(std::string()));
+  EXPECT_EQ(Scalar("SELECT ARRAY_TO_STRING([1.5, 2.25], '|')"),
+            Value(std::string("1.5|2.25")));
+  EXPECT_EQ(Scalar("SELECT ARRAY_TO_STRING([DATE '2020-01-02'], ',')"),
+            Value(std::string("2020-01-02")));
+  EXPECT_TRUE(Scalar("SELECT ARRAY_TO_STRING(NULL, ',')").IsNull());
+  // Nested arrays have no text form; arity violations are errors.
+  EXPECT_TRUE(SqlFails("SELECT ARRAY_TO_STRING([[1], [2]], ',')"));
+  EXPECT_TRUE(SqlFails("SELECT ARRAY_TO_STRING([1, 2])"));
+  EXPECT_TRUE(SqlFails("SELECT ARRAY_TO_STRING([1, 2], ',', '*', 4)"));
+}
+
+TEST(FunctionCallTest, DateAddRejectsNonDateOperand) {
+  Row dummy_row;
+  Schema dummy_schema;
+  const Expression interval = IntervalExpressionExp(1, "day");
+
+  for (const Value& bad :
+       {Value(int64_t{5}), Value(1.5), Value::Array({}, "INT64")}) {
+    const Expression call =
+        FunctionCallExp("date_add", {ConstantValueExp(bad), interval});
+    const StatusOr<Value> res = call->TryEvaluate(dummy_row, dummy_schema);
+    ASSERT_FALSE(res.HasValue())
+        << "date_add accepted a non-DATE/VARCHAR operand";
+  }
+
+  // VARCHAR operands still parse; DATE operands still shift.
+  const Expression ok_varchar = FunctionCallExp(
+      "date_add", {ConstantValueExp(Value(std::string("2024-01-15"))),
+                   IntervalExpressionExp(2, "day")});
+  const StatusOr<Value> res_v =
+      ok_varchar->TryEvaluate(dummy_row, dummy_schema);
+  ASSERT_TRUE(res_v.HasValue());
+  EXPECT_EQ(res_v.Value().AsString(), "\"2024-01-17\"");
+
+  const Expression ok_date = FunctionCallExp(
+      "date_sub",
+      {ConstantValueExp(Value::DateFromDays(19737 /* 2024-01-15 */)),
+       IntervalExpressionExp(1, "month")});
+  const StatusOr<Value> res_d = ok_date->TryEvaluate(dummy_row, dummy_schema);
+  ASSERT_TRUE(res_d.HasValue());
+  EXPECT_EQ(res_d.Value().AsString(), "2023-12-15");
+}
+
+// Regression for the fuzz-found ParseJsonSimple non-progress loop:
+// a '[' array whose first token is unrecognized consumed no input, so the
+// element loop pushed JVals forever -> OOM. Malformed JSON must terminate.
+TEST(FunctionCallTest, JsonExtractMalformedArrayTerminates) {
+  Row dummy_row;
+  Schema dummy_schema;
+  for (const char* bad : {"[x", "[ $$", "[[[[x", "[,", "[", "[ "}) {
+    const Expression call = FunctionCallExp(
+        "json_extract", {ConstantValueExp(Value(std::string(bad))),
+                         ConstantValueExp(Value(std::string("$")))});
+    const StatusOr<Value> res = call->TryEvaluate(dummy_row, dummy_schema);
+    // Any result is acceptable (NULL or error) — the contract is that this
+    // returns at all instead of hanging in the element loop.
+    (void)res;
+  }
+  // Sanity: well-formed input still extracts.
+  const Expression ok = FunctionCallExp(
+      "json_extract", {ConstantValueExp(Value(std::string("[10,20,30]"))),
+                       ConstantValueExp(Value(std::string("$[1]")))});
+  const StatusOr<Value> res = ok->TryEvaluate(dummy_row, dummy_schema);
+  ASSERT_TRUE(res.HasValue());
+  EXPECT_EQ(res.Value().AsString(), "\"20\"");
+}
+
+// Bug 67: GREATEST/LEAST on arrays reached Value::TryLess/TryGreater, whose
+// kArray branch delegated to std::vector<Value>::operator< -- that calls the
+// throwing Value::operator< (ExcShimUnwrap), so an incomparable element (a
+// NULL member, or a cross-type member) escaped TryEvaluate as a raw C++
+// exception instead of a Status error.
+TEST(FunctionCallTest, GreatestLeastOnArraysWithIncomparableElements) {
+  Row dummy_row;
+  Schema dummy_schema;
+  const Value with_null = Value::Array({Value(), Value(int64_t{81})}, "INT64");
+  const Value plain =
+      Value::Array({Value(int64_t{190}), Value(int64_t{190})}, "INT64");
+  for (const char* name : {"least", "greatest"}) {
+    const Expression call =
+        FunctionCallExp(name, {ConstantValueExp(plain), ConstantValueExp(plain),
+                               ConstantValueExp(with_null)});
+    StatusOr<Value> res = Value();
+    EXPECT_NO_THROW(res = call->TryEvaluate(dummy_row, dummy_schema));
+    EXPECT_FALSE(res.HasValue());
+  }
+  // Comparable arrays still order correctly.
+  const Value small = Value::Array({Value(int64_t{1})}, "INT64");
+  const Value large = Value::Array({Value(int64_t{2})}, "INT64");
+  const Expression least_call = FunctionCallExp(
+      "least", {ConstantValueExp(large), ConstantValueExp(small)});
+  const StatusOr<Value> least_res =
+      least_call->TryEvaluate(dummy_row, dummy_schema);
+  ASSERT_TRUE(least_res.HasValue());
+  EXPECT_EQ(least_res.Value(), small);
 }
 
 }  // namespace

@@ -63,6 +63,8 @@ AggregationExecutor::AggregationExecutor(
   if (aggregates_.size() == 1) {
     const auto& aggregate = aggregates_[0].expression->AsAggregateExpression();
     if (aggregate.GetType() == AggregationType::kSum && !aggregate.Distinct() &&
+        !aggregate.HasWhereFilter() && !aggregate.NeedsGroupContext() &&
+        aggregate.Child() &&
         aggregate.Child()->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
@@ -89,7 +91,7 @@ AggregationExecutor::AggregationExecutor(
     AggregateInput input;
     const auto& agg = named.expression->AsAggregateExpression();
     if (IsTypedAggregate(agg.GetType()) && !agg.Distinct() &&
-        !agg.WhereFilter() && agg.InnerOrderBy().empty()) {
+        !agg.WhereFilter() && !agg.NeedsGroupContext()) {
       if (IsCountStar(agg)) {
         input.kind = AggregateInputKind::kCountStar;
       } else if (agg.Child()->Type() == TypeTag::kColumnValue) {
@@ -652,7 +654,7 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       continue;
     }
     accumulators[i] = std::make_unique<relational_detail::AggregateAccumulator>(
-        &aggregates_[i].expression->AsAggregateExpression());
+        &aggregates_[i].expression->AsAggregateExpression(), &input_schema_);
   }
   for (size_t i = 0; i < aggregates_.size(); ++i) {
     const auto& agg = aggregates_[i].expression->AsAggregateExpression();
@@ -736,6 +738,15 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             input.value = std::move(*value);
           } else {
             input.value = Value(1);
+          }
+          if (agg.Having() != AggregateHavingModifier::kNone &&
+              agg.HavingCondition()) {
+            std::optional<Value> cond =
+                eval_input(agg.HavingCondition(), materialize());
+            if (!cond.has_value()) {
+              return FailWith(agg_error);
+            }
+            input.condition = std::move(*cond);
           }
           for (const auto& term : agg.InnerOrderBy()) {
             std::optional<Value> key =

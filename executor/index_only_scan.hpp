@@ -40,11 +40,13 @@ class IndexOnlyScan : public ExecutorBase {
  public:
   IndexOnlyScan(Transaction& txn, const Table& table, const Index& index,
                 const Value& begin, const Value& end, bool ascending,
-                Expression where, const Schema& sc);
+                Expression where, const Schema& sc,
+                TransactionManager::IndexReadGuard index_read_guard = {});
   IndexOnlyScan(Transaction& txn, const Table& table, const Index& index,
                 const std::vector<Value>& begin_key,
                 const std::vector<Value>& end_key, bool ascending,
-                Expression where, const Schema& sc);
+                Expression where, const Schema& sc,
+                TransactionManager::IndexReadGuard index_read_guard = {});
   IndexOnlyScan(const IndexOnlyScan&) = delete;
   IndexOnlyScan(IndexOnlyScan&&) = delete;
   IndexOnlyScan& operator=(const IndexOnlyScan&) = delete;
@@ -59,6 +61,7 @@ class IndexOnlyScan : public ExecutorBase {
   static Schema ValueSchema(const Index& idx, const Schema& input_schema);
   static Schema OutputSchema(const Index& idx, const Schema& input_schema);
 
+  TransactionManager::IndexReadGuard index_read_guard_;
   IndexScanIterator iter_;
   Expression cond_;
   // Top-level conjuncts of `cond_`; the filter follows commutative WHERE

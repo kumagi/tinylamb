@@ -45,6 +45,15 @@ class WindowPlan final : public PlanBase {
   ~WindowPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override {
+    return child_ != nullptr && child_->ContainsParameterSlots();
+  }
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override {
+    return child_ == nullptr ||
+           child_->InstallParameterSlots(parameters, cursor, slots);
+  }
 
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
   [[nodiscard]] const TableStatistics& GetStats() const override {
@@ -61,6 +70,10 @@ class WindowPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   [[nodiscard]] const Plan& GetSource() const { return child_; }
   [[nodiscard]] const std::vector<NamedExpression>& WindowOutputs() const {
     return window_outputs_;

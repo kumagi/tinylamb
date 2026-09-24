@@ -2,6 +2,8 @@
 #ifndef TINYLAMB_MERGE_JOIN_PLAN_HPP
 #define TINYLAMB_MERGE_JOIN_PLAN_HPP
 
+#include <optional>
+
 #include "expression/expression.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
@@ -14,9 +16,14 @@ class MergeJoinPlan final : public PlanBase {
  public:
   MergeJoinPlan(Plan left, std::vector<ColumnName> left_keys, Plan right,
                 std::vector<ColumnName> right_keys, JoinKind kind = JoinKind{},
-                Expression residual = Expression());
+                Expression residual = Expression(),
+                std::optional<size_t> estimated_rows = std::nullopt);
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override;
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override;
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
   [[nodiscard]] const Schema& GetSchema() const override { return schema_; }
   [[nodiscard]] const TableStatistics& GetStats() const override {
@@ -27,6 +34,10 @@ class MergeJoinPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

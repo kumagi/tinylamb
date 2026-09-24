@@ -117,6 +117,26 @@ Selection::Selection(Expression exp, Schema schema, Executor src,
                   ? BytecodeCompiler::Compile(
                         exp_, schema_, BytecodeCompiler::Context::kFilter)
                   : std::nullopt;
+  // When the whole predicate cannot compile (a single IS NOT NULL / IN over
+  // a function / LIKE conjunct is enough), compile the conjuncts that CAN be
+  // lowered so NextBatch evaluates them batch-wise and pays the per-row AST
+  // walk only for the conjuncts that need it and the rows that survive.
+  if (!bytecode_ && BytecodeEnabled() && conjuncts_.size() >= 2) {
+    conjunct_plans_.reserve(conjuncts_.size());
+    bool any_compiled = false;
+    for (const Expression& conjunct : conjuncts_) {
+      ConjunctPlan plan;
+      if (conjunct) {
+        plan.program = BytecodeCompiler::Compile(
+            conjunct, schema_, BytecodeCompiler::Context::kFilter);
+        any_compiled = any_compiled || plan.program.has_value();
+      }
+      conjunct_plans_.push_back(std::move(plan));
+    }
+    if (!any_compiled) {
+      conjunct_plans_.clear();
+    }
+  }
 }
 
 bool Selection::Next(Row* dst, RowPosition* rp) {
@@ -221,6 +241,81 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
       // conjunct-wise instead of propagating the error.
     }
     selection_vector_.clear();
+    if (!predicates && !conjunct_plans_.empty()) {
+      // Two-tier conjunct evaluation: tier 1 batch-evaluates every compiled
+      // conjunct and drops rows where any of them is FALSE or NULL (a clean
+      // reject also suppresses sibling errors, matching the tolerant WHERE
+      // semantics below); tier 2 runs the remaining conjuncts per row and
+      // only on the survivors.  Conjuncts whose batch evaluation failed this
+      // batch rejoin the per-row set, mirroring the whole-predicate fallback.
+      selection_vector_.reserve(input_batch_.Size());
+      for (uint32_t i = 0; i < input_batch_.Size(); ++i) {
+        selection_vector_.push_back(i);
+      }
+      std::vector<size_t> per_row;
+      for (size_t c = 0; c < conjunct_plans_.size(); ++c) {
+        if (selection_vector_.empty()) {
+          break;
+        }
+        const std::optional<BytecodeProgram>& program =
+            conjunct_plans_[c].program;
+        if (!program) {
+          per_row.push_back(c);
+          continue;
+        }
+        StatusOr<ColumnVector> batch = program->TryEvaluateBatch(input_batch_);
+        if (!batch.HasValue()) {
+          per_row.push_back(c);
+          continue;
+        }
+        const ColumnVector& column = batch.Value();
+        scratch_indices_.clear();
+        if (column.Type() == ValueType::kInt64) {
+          const std::vector<int64_t>& bits = column.IntegerData();
+          for (uint32_t idx : selection_vector_) {
+            if (!column.IsNull(idx) && bits[idx] != 0) {
+              scratch_indices_.push_back(idx);
+            }
+          }
+        } else {
+          for (uint32_t idx : selection_vector_) {
+            const Value predicate_value = column.ValueAt(idx);
+            if (!predicate_value.IsNull() && predicate_value.Truthy()) {
+              scratch_indices_.push_back(idx);
+            }
+          }
+        }
+        selection_vector_.swap(scratch_indices_);
+      }
+      if (!per_row.empty() && !selection_vector_.empty()) {
+        std::vector<Expression> per_row_exprs;
+        per_row_exprs.reserve(per_row.size());
+        for (size_t c : per_row) {
+          per_row_exprs.push_back(conjuncts_[c]);
+        }
+        scratch_indices_.clear();
+        for (uint32_t idx : selection_vector_) {
+          StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+              per_row_exprs, [&](const Expression& conjunct) {
+                return conjunct->TryEvaluate(input_batch_.RowAt(idx), schema_);
+              });
+          if (!pass.HasValue()) {
+            FailWith(pass.GetStatus());
+            return 0;
+          }
+          if (pass.Value()) {
+            scratch_indices_.push_back(idx);
+          }
+        }
+        selection_vector_.swap(scratch_indices_);
+      }
+      if (!selection_vector_.empty()) {
+        rows_selected_ += selection_vector_.size();
+        destination->AppendGather(input_batch_, selection_vector_.data(),
+                                  selection_vector_.size());
+      }
+      continue;
+    }
     if (predicates && predicates->Type() == ValueType::kInt64) {
       // Batch-evaluated predicates: read the boolean column straight from
       // typed storage instead of boxing one Value per row.
@@ -278,15 +373,9 @@ void Selection::Dump(std::ostream& o, int indent) const {
   // anything.  Runtime-only counters must not turn a logical plan's
   // `Filter` text into a false profile or break plan-shape assertions.
   if (rows_seen_ > 0) {
-    o << "CardinalityFeedback node=Filter estimated=" << (rows_seen_ / 2)
-      << " actual=" << rows_selected_ << "\n"
-      << "feedback_recorded=true\n"
-      << "ZoneMap blocks_skipped=" << skipped_batches_
-      << "\nrows_after_zone_map=" << rows_selected_ << "\n";
-    if (schema_.Offset(ColumnName("", "payload")) >= 0) {
-      o << "LateMaterialize requested_rows=" << rows_selected_
-        << " decoded_payloads=" << rows_selected_ << "\n";
-    }
+    o << "SelectionStats rows_evaluated=" << rows_seen_
+      << " rows_selected=" << rows_selected_ << "\n"
+      << "ZoneMap blocks_skipped=" << skipped_batches_ << "\n";
   }
   o << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);

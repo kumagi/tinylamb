@@ -6,7 +6,7 @@
 
 ## 概要
 
-`INTERVAL` 型リテラル同士の加減算（例: `INTERVAL '1' DAY + INTERVAL '2' DAY` → `INTERVAL '3' DAY`）、整数定数との乗算（例: `INTERVAL '2' DAY * 3` → `INTERVAL '6' DAY`）、単項マイナスによる符号反転、および `JUSTIFY_HOURS` / `JUSTIFY_DAYS` / `JUSTIFY_INTERVAL` 関数の定数適用を、コンパイル時に計算して正規化された単一の `INTERVAL` リテラルへ畳み込む Rule です。
+`interval_normalize` は、`INTERVAL` 型リテラルに対する定数演算をコンパイル時に評価する Rule です。対象は、リテラル同士の加減算、整数定数との乗算、単項マイナスによる符号反転、`JUSTIFY_HOURS` / `JUSTIFY_DAYS` / `JUSTIFY_INTERVAL` の適用です。たとえば `INTERVAL '1' DAY + INTERVAL '2' DAY` を `INTERVAL '3' DAY` へ畳み込みます。
 
 算術オーバーフローが生じる場合には、実行時エンジンが送出すべき例外を消去しないよう、畳み込みを即座に中止して元の構文木のまま保持します。
 

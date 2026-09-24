@@ -41,30 +41,50 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+namespace {
+
+TransactionManager::IndexReadGuard AcquireScanIndexReadGuard(
+    Transaction& txn, const Index& index, bool lock_rows,
+    TransactionManager::IndexReadGuard index_read_guard) {
+  if (index_read_guard.HoldsLock()) {
+    return index_read_guard;
+  }
+  if (lock_rows) {
+    return {};
+  }
+  return txn.AcquireIndexReadGuard(index.Root());
+}
+
+}
 
 IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const Value& begin, const Value& end, bool ascending,
                      Expression where, const Schema& sc, bool lock_rows,
-                     bool wait_for_write_intent)
+                     bool wait_for_write_intent,
+                     TransactionManager::IndexReadGuard index_read_guard)
     : IndexScan(
           txn, table, index,
           begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
           end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
-          ascending, std::move(where), sc, lock_rows, wait_for_write_intent) {}
+          ascending, std::move(where), sc, lock_rows, wait_for_write_intent,
+          std::move(index_read_guard)) {}
 
 IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const std::vector<Value>& begin_key,
                      const std::vector<Value>& end_key, bool ascending,
                      Expression where, Schema sc, bool lock_rows,
-                     bool wait_for_write_intent)
+                     bool wait_for_write_intent,
+                     TransactionManager::IndexReadGuard index_read_guard)
     : txn_(txn),
       table_(table),
       index_(index),
       ascending_(ascending),
       lock_rows_(lock_rows),
       wait_for_write_intent_(wait_for_write_intent),
+      index_read_guard_(AcquireScanIndexReadGuard(txn, index, lock_rows,
+                                                  std::move(index_read_guard))),
       iter_(new IndexScanIterator(table, index, txn, begin_key, end_key,
-                                  ascending, lock_rows)),
+                                  ascending, lock_rows, &index_read_guard_)),
       cond_(std::move(where)),
       cond_conjuncts_(SplitConjuncts(cond_)),
       schema_(std::move(sc)) {}
@@ -73,20 +93,23 @@ IndexScan::IndexScan(
     Transaction& txn, const Table& table, const Index& index,
     std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
     bool ascending, Expression where, Schema sc, bool lock_rows,
-    bool wait_for_write_intent)
+    bool wait_for_write_intent,
+    TransactionManager::IndexReadGuard index_read_guard)
     : txn_(txn),
       table_(table),
       index_(index),
       ascending_(ascending),
       lock_rows_(lock_rows),
       wait_for_write_intent_(wait_for_write_intent),
+      index_read_guard_(AcquireScanIndexReadGuard(txn, index, lock_rows,
+                                                  std::move(index_read_guard))),
       // Contract: at least one range. Callers build one entry per distinct
       // IN value.
       iter_(new IndexScanIterator(
           table, index, txn,
           ranges.empty() ? std::vector<Value>{} : ranges.front().first,
           ranges.empty() ? std::vector<Value>{} : ranges.front().second,
-          ascending, lock_rows)),
+          ascending, lock_rows, &index_read_guard_)),
       cond_(std::move(where)),
       cond_conjuncts_(SplitConjuncts(cond_)),
       schema_(std::move(sc)) {
@@ -100,7 +123,12 @@ IndexScan::IndexScan(
 void IndexScan::OpenRange(const std::vector<Value>& begin_key,
                           const std::vector<Value>& end_key) {
   iter_ = Iterator(new IndexScanIterator(table_, index_, txn_, begin_key,
-                                         end_key, ascending_, lock_rows_));
+                                         end_key, ascending_, lock_rows_,
+                                         &index_read_guard_));
+}
+
+void IndexScan::ReleaseIndexReadGuard() {
+  index_read_guard_ = TransactionManager::IndexReadGuard();
 }
 
 bool IndexScan::Next(Row* dst, RowPosition* rp) {
@@ -111,15 +139,18 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
       // would silently truncate the result set (table/iterator_base.hpp).
       const Status status = iter_.GetStatus();
       if (status != Status::kSuccess) {
+        ReleaseIndexReadGuard();
         return FailWith(status);
       }
       if (pending_offset_ == pending_.size()) {
+        ReleaseIndexReadGuard();
         return false;
       }
       auto range = std::move(pending_[pending_offset_++]);
       OpenRange(range.first, range.second);
     }
     const RowPosition pointed_row = iter_.Position();
+    const bool already_reserved = lock_rows_ && txn_.HasWriteSet(pointed_row);
     const bool locked = !lock_rows_ || (wait_for_write_intent_
                                             ? txn_.AddWriteSet(pointed_row)
                                             : txn_.TryAddWriteSet(pointed_row));
@@ -128,9 +159,16 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
                                   "write intent wait timed out on table " +
                                       std::string(table_.GetSchema().Name())));
     }
-    *dst = *iter_;
+    if (cond_ || lock_rows_) {
+      *dst = *iter_;
+    } else {
+      *dst = std::move(*iter_);
+    }
     ++iter_;
     if (!dst->IsValid()) {
+      if (lock_rows_ && !already_reserved) {
+        txn_.ReleaseWriteIntent(pointed_row);
+      }
       continue;
     }
     if (rp != nullptr) {
@@ -142,9 +180,15 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
             return conjunct->TryEvaluate(*dst, schema_);
           });
       if (!pass.HasValue()) {
+        if (lock_rows_ && !already_reserved) {
+          txn_.ReleaseWriteIntent(pointed_row);
+        }
         return FailWith(pass.GetStatus());
       }
       if (!pass.Value()) {
+        if (lock_rows_ && !already_reserved) {
+          txn_.ReleaseWriteIntent(pointed_row);
+        }
         continue;
       }
     }

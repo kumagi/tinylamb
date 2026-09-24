@@ -30,15 +30,15 @@ graph TD
 パターンは `Projection(Aggregation(Any(), "agg"))` です。guard は次のとおり
 です。
 
-1. 外側の target list が空でない。
+1. 外側の target list が空でないこと。
 2. 外側の target list の**すべての出力が素の列参照**
-   (`Type() == TypeTag::kColumnValue`)である。式 1 つでも混ざれば発火しない。
-3. 集約グループが自分自身でない(`agg_id != group`)。
-4. 集約グループ内の `kAggregation` 式が子を持ち、その子が集約グループや
-   `group` 自身でない(循環防止)。
+   （`Type() == TypeTag::kColumnValue`）であること。式が一つでも混ざれば発火しません。
+3. 集約 Group が自分自身でないこと（`agg_id != group`）。
+4. 集約 Group 内の `kAggregation` 式が子を持ち、その子が集約 Group や
+   `group` 自身でないこと（循環防止）。
 5. 作る派生グループ `proj_below` / `new_agg` が特定の既存グループと
-   一致しない(`proj_below != agg_child && proj_below != group &&
-   new_agg != agg_id && new_agg != group`)。
+   一致しないこと（`proj_below != agg_child && proj_below != group &&
+   new_agg != agg_id && new_agg != group`）。
 
 なおループ末尾に `return` があるため、集約グループ内の最初の
 `kAggregation` 代替だけが対象です。複数の集約代替がある場合も 1 形だけ
@@ -115,7 +115,7 @@ graph TD
 ## 最適化効果
 
 適用後は上図のとおり、集約に入る前に必要列だけの行幅になります。集約の
-ハッシュ表・グループ化バッファは 1 行あたりの幅がそのままメモリに効くため、
+ハッシュ表とグループ化バッファのメモリ使用量は 1 行あたりの幅に比例するため、
 幅の広いテーブルの GROUP BY で効果が大きい Rule です。行数は集約後も
 変わりません(射影は行ごとの関数で、グルーピングキーと集約引数を落とさない
 ため集約結果も不変です)。

@@ -660,7 +660,7 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
 }
 
-TEST_F(SqlEngineTpchTest, TpchQ8Q9JoinOrderGolden) {
+TEST_F(SqlEngineTpchTest, TpchQ8Q9HeuristicPlanGolden) {
   TransactionContext context = database_->BeginContext();
   CreateSchema(*database_, context);
   Seed(*database_, context);
@@ -721,7 +721,7 @@ TEST_F(SqlEngineTpchTest, TpchQ8Q9JoinOrderGolden) {
       << q8_plan;
 
   const std::string q8_inner_plan = explain_plan("EXPLAIN ", kQ8InnerSql);
-  EXPECT_NE(q8_inner_plan.find("JoinOrder=greedy_filtered_cardinality"),
+  EXPECT_NE(q8_inner_plan.find("HeuristicJoinOrder=greedy_table_rows"),
             std::string::npos)
       << q8_inner_plan;
   // All 8 relation scans present.
@@ -756,7 +756,7 @@ TEST_F(SqlEngineTpchTest, TpchQ8Q9JoinOrderGolden) {
       << q9_plan;
 
   const std::string q9_inner_plan = explain_plan("EXPLAIN ", kQ9InnerSql);
-  EXPECT_NE(q9_inner_plan.find("JoinOrder=greedy_filtered_cardinality"),
+  EXPECT_NE(q9_inner_plan.find("HeuristicJoinOrder=greedy_table_rows"),
             std::string::npos)
       << q9_inner_plan;
   // All 6 relation scans present.

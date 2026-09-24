@@ -70,6 +70,10 @@ class IndexScanPlan final : public PlanBase {
       const std::vector<std::optional<bool>>& nulls_first) const override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override;
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override;
 
  private:
   const Table& table_;
@@ -84,6 +88,20 @@ class IndexScanPlan final : public PlanBase {
   Expression where_;
   std::vector<ColumnName> provided_order_;
 };
+
+// Seek keys rebuilt from a predicate after ParameterSlot::Bind. `want_points`
+// asks for the IN-list / disjunction shape the original plan used; otherwise
+// a single begin/end range is built. Empty keys mean the caller should scan
+// without a seek and let the residual predicate filter.
+struct ReboundIndexKeys {
+  std::vector<Value> begin_key;
+  std::vector<Value> end_key;
+  std::vector<std::pair<std::vector<Value>, std::vector<Value>>> point_ranges;
+};
+
+[[nodiscard]] ReboundIndexKeys ReboundIndexKeysFromPredicate(
+    const Expression& predicate, const Schema& schema, const Index& index,
+    bool want_points);
 
 }  // namespace tinylamb
 

@@ -12,12 +12,15 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/statement.hpp"
@@ -43,7 +46,7 @@ std::unique_ptr<Statement> VisitSql(std::string_view sql) {
   if (!ast.HasValue()) {
     return nullptr;
   }
-  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
   return visited.HasValue() ? visited.MoveValue() : nullptr;
 }
 
@@ -56,7 +59,7 @@ std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
   if (!ast.HasValue()) {
     return nullptr;
   }
-  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
   if (!visited.HasValue()) {
     throw std::runtime_error(visited.GetStatus().GetMessage());
   }
@@ -564,7 +567,7 @@ TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
   // nesting beyond the depth cap with an exception instead of overflowing
   // the C++ stack (a stack overflow is unrecoverable).
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   std::string sql = "SELECT 1";
   for (int i = 0; i < 600; ++i) {
@@ -685,12 +688,36 @@ TEST(GoogleSqlAstTest, ParsesLateralTableSubquery) {
       GoogleSqlAstParser::Parse(parsed.ast);
   ASSERT_TRUE(ast.HasValue());
   std::unique_ptr<Statement> stmt =
-      GoogleSqlAstVisitor::Visit(*ast.Value()).MoveValue();
+      GoogleSqlAstVisitor::Visit(*ast.Value(), sql).MoveValue();
   ASSERT_NE(stmt, nullptr);
   auto* select = dynamic_cast<SelectStatement*>(stmt.get());
   ASSERT_NE(select, nullptr);
   ASSERT_EQ(select->Sources().size(), 2U);
   EXPECT_TRUE(select->Sources()[1].is_lateral);
+}
+
+TEST(GoogleSqlAstTest, DistinguishesLateralFromMultilineDerivedTable) {
+  struct Case {
+    std::string sql;
+    bool is_lateral;
+  };
+  const std::vector<Case> cases{
+      {"SELECT x FROM (       SELECT 1 AS x) x", false},
+      {"SELECT x FROM (/* LATERAL */ SELECT 1 AS x) x", false},
+      {"SELECT x FROM (SELECT 'LATERAL' AS value) x", false},
+      {"SELECT x FROM (SELECT 1 AS lateral_value) x", false},
+      {"SELECT x FROM LATERAL (SELECT 1 AS x) x", true},
+      {"select x from lateral(select 1 as x) x", true},
+      {"SELECT x FROM LATERAL /* comment */ (SELECT 1 AS x) x", true},
+  };
+  for (const Case& test : cases) {
+    std::unique_ptr<Statement> statement = VisitSql(test.sql);
+    ASSERT_NE(statement, nullptr) << test.sql;
+    const auto* select = dynamic_cast<const SelectStatement*>(statement.get());
+    ASSERT_NE(select, nullptr) << test.sql;
+    ASSERT_EQ(select->Sources().size(), 1U) << test.sql;
+    EXPECT_EQ(select->Sources()[0].is_lateral, test.is_lateral) << test.sql;
+  }
 }
 
 TEST(GoogleSqlAstTest, DistinctOnAstVisitor) {
@@ -769,6 +796,48 @@ TEST(GoogleSqlAstTest, GroupByAllAndDistinctAstVisitor) {
   auto* select_dist = dynamic_cast<SelectStatement*>(stmt_dist.get());
   ASSERT_NE(select_dist, nullptr);
   EXPECT_EQ(select_dist->GroupBy().size(), 1U);
+}
+
+TEST(GoogleSqlAstTest, RecoversAnalyticNullTreatmentModifiers) {
+  auto statement = VisitSql(
+      "SELECT ARRAY_AGG('RESPECT NULLS' IGNORE NULLS ORDER BY v LIMIT 2) "
+      "OVER (), "
+      "FIRST_VALUE(v IGNORE NULLS) OVER (), "
+      "LAST_VALUE(v RESPECT NULLS) OVER (), "
+      "NTH_VALUE(v, 2 IGNORE NULLS) OVER () FROM t");
+  ASSERT_NE(statement, nullptr);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 4U);
+  for (const NamedExpression& item : select.SelectList()) {
+    ASSERT_EQ(item.expression->Type(), TypeTag::kWindowFunctionExp);
+  }
+
+  const auto& array_agg =
+      select.SelectList()[0].expression->AsWindowFunctionCallExpression();
+  EXPECT_TRUE(array_agg.ignore_nulls);
+  EXPECT_FALSE(array_agg.respect_nulls);
+  const auto& first_value =
+      select.SelectList()[1].expression->AsWindowFunctionCallExpression();
+  EXPECT_TRUE(first_value.ignore_nulls);
+  EXPECT_FALSE(first_value.respect_nulls);
+  const auto& last_value =
+      select.SelectList()[2].expression->AsWindowFunctionCallExpression();
+  EXPECT_FALSE(last_value.ignore_nulls);
+  EXPECT_TRUE(last_value.respect_nulls);
+  const auto& nth_value =
+      select.SelectList()[3].expression->AsWindowFunctionCallExpression();
+  EXPECT_TRUE(nth_value.ignore_nulls);
+  EXPECT_FALSE(nth_value.respect_nulls);
+}
+
+TEST(GoogleSqlAstTest, RecoversAggregateNullTreatmentModifiers) {
+  auto statement = VisitSql("SELECT ARRAY_AGG(v IGNORE NULLS) FROM t");
+  ASSERT_NE(statement, nullptr);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 1U);
+  const auto& aggregate =
+      select.SelectList()[0].expression->AsAggregateExpression();
+  EXPECT_TRUE(aggregate.IgnoreNulls());
 }
 
 TEST(GoogleSqlAstTest, QualifyAstVisitor) {

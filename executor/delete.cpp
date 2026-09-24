@@ -27,6 +27,35 @@ bool DeleteExecutor::Next(Row* dst, RowPosition* rp) {
   if (source_->GetStatus() != Status::kSuccess) {
     return FailWith(source_->GetStatus());
   }
+  // NO ACTION enforcement: a parent row still referenced by a child row
+  // the statement does not itself delete rejects the statement.  Rows in
+  // `pending` are invisible to the check, matching statement-end semantics.
+  if (!ref_checks_.empty()) {
+    for (const RowPosition& row_position : pending) {
+      StatusOr<Row> old = target_->Read(*txn_, row_position);
+      if (!old.HasValue()) {
+        return FailWith(old.GetStatus());
+      }
+      const Row& old_row = old.Value();
+      for (const ReferencedByCheck& check : ref_checks_) {
+        if (check.parent_offset >= old_row.values_.size()) {
+          continue;
+        }
+        const Value& parent_key = old_row[check.parent_offset];
+        if (parent_key.IsNull()) {
+          continue;
+        }
+        if (IsParentKeyReferenced(*check.child, *txn_, check.child_offset,
+                                  parent_key, pending)) {
+          return FailWith(StatusError(
+              StatusCode::kConflicts,
+              "delete on table " + std::string(target_->GetSchema().Name()) +
+                  " violates foreign key constraint (referenced by " +
+                  std::string(check.child->GetSchema().Name()) + ")"));
+        }
+      }
+    }
+  }
   int64_t count = 0;
   for (const RowPosition& row_position : pending) {
     if (target_->Delete(*txn_, row_position) != Status::kSuccess) {

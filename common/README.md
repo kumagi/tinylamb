@@ -4,7 +4,7 @@ This directory provides a suite of foundational utilities and data structures th
 
 ## Key Components
 
-- **`constants.hpp`**: Defines a wide range of global constants, status codes, and enumerations that are critical for the consistent operation of the system. This includes page sizes, status enums (e.g., `kSuccess`, `kNotFound`), and binary operation types for query processing.
+- **`constants.hpp`**: Defines a wide range of global constants, status codes, and enumerations that are critical for the consistent operation of the system. This includes page sizes, status enums (e.g., `kSuccess`, `kNotExists`), and binary operation types for query processing.
 
 - **Serialization/Deserialization (`serdes`, `Encoder`, `Decoder`)**: A robust set of tools for converting data structures into a format suitable for storage or network transmission, and for reconstructing them back into their original form.
   - **`serdes.hpp` / `serdes.cpp`**: Contains low-level functions for serializing and deserializing primitive C++ types and fundamental database types like `page_id_t` and `slot_t`. These functions are optimized for performance and space efficiency.

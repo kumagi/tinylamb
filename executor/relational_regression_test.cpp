@@ -31,11 +31,13 @@
 //                                               900 + 200 = 1100
 //   SmallKeys: k in {1, 2, 3, 4}
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -44,9 +46,16 @@
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/planning_heuristics.hpp"
+#include "executor/detail/relation.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "executor/executor_base.hpp"
+#include "expression/aggregate_expression.hpp"
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
 #include "query/sql_engine.hpp"
+#include "query/statement.hpp"
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -113,6 +122,114 @@ class RelationalRegressionTest : public ::testing::Test {
   std::string prefix_;
   std::unique_ptr<Database> rs_;
 };
+
+TEST_F(RelationalRegressionTest,
+       ParallelGroupedFinishMergesMinMaxAcrossWorkers) {
+  constexpr size_t kRowCount = 262144;
+  TransactionContext context = rs_->BeginContext();
+  relational_detail::Relation input;
+  input.schema = Schema("parallel_group", {Column("g", ValueType::kInt64),
+                                           Column("v", ValueType::kInt64)});
+  input.rows.reserve(kRowCount);
+  for (size_t i = 0; i < kRowCount; ++i) {
+    int64_t value = 1;
+    if (i == 0) {
+      value = -100;
+    } else if (i + 1 == kRowCount) {
+      value = 100;
+    }
+    input.AddRow(Row({Value(int64_t{1}), Value(value)}));
+  }
+
+  const auto make_aggregate = [](AggregationType type, bool distinct) {
+    return std::make_shared<AggregateExpression>(type, ColumnValueExp("v"),
+                                                 distinct);
+  };
+  SelectStatement statement(
+      {NamedExpression("g", ColumnValueExp("g")),
+       NamedExpression("min_v", make_aggregate(AggregationType::kMin, false)),
+       NamedExpression("max_v", make_aggregate(AggregationType::kMax, false)),
+       NamedExpression("distinct_v",
+                       make_aggregate(AggregationType::kCount, true))},
+      {}, nullptr);
+  statement.SetGroupBy({ColumnValueExp("g")});
+
+  StatusOr<relational_detail::Relation> finished =
+      relational_detail::FinishQuery(context, statement, std::move(input),
+                                     nullptr, {}, false);
+  ASSERT_TRUE(finished.HasValue()) << finished.GetStatus();
+  relational_detail::Relation output = finished.MoveValue();
+  ASSERT_EQ(output.rows.size(), 1U);
+  EXPECT_EQ(output.rows[0][0], Value(int64_t{1}));
+  EXPECT_EQ(output.rows[0][1], Value(int64_t{-100}));
+  EXPECT_EQ(output.rows[0][2], Value(int64_t{100}));
+  EXPECT_EQ(output.rows[0][3], Value(int64_t{3}));
+  context.Abort();
+}
+
+TEST_F(RelationalRegressionTest, ParallelProbePadsNullAndNaNLeftKeys) {
+  constexpr size_t kRowCount = 65536;
+  TransactionContext context = rs_->BeginContext();
+  relational_detail::Relation left;
+  left.schema = Schema("parallel_left", {Column("lk", ValueType::kDouble)});
+  for (size_t i = 0; i < kRowCount; ++i) {
+    Value key(1.0);
+    if (i == 0) {
+      key = Value(std::numeric_limits<double>::quiet_NaN());
+    } else if (i == 1) {
+      key = Value();
+    }
+    left.AddRow(Row({std::move(key)}));
+  }
+  relational_detail::Relation right;
+  right.schema = Schema("parallel_right", {Column("rk", ValueType::kDouble)});
+  right.AddRow(Row({Value(1.0)}));
+
+  SelectSource source;
+  source.join_type = JoinType::kLeft;
+  source.join_condition = BinaryExpressionExp(
+      ColumnValueExp("lk"), BinaryOperation::kEquals, ColumnValueExp("rk"));
+  StatusOr<relational_detail::Relation> joined = relational_detail::Join(
+      context, std::move(left), std::move(right), source, nullptr, {});
+  ASSERT_TRUE(joined.HasValue()) << joined.GetStatus();
+  ASSERT_EQ(joined.Value().rows.size(), kRowCount);
+  size_t padded = 0;
+  for (const Row& row : joined.Value().rows) {
+    if (row[1].IsNull()) {
+      ++padded;
+    }
+  }
+  EXPECT_EQ(padded, 2U);
+  context.Abort();
+}
+
+TEST_F(RelationalRegressionTest,
+       ParallelFilteredCountStarUsesSerialAccumulation) {
+  constexpr size_t kRowCount = 262144;
+  TransactionContext context = rs_->BeginContext();
+  relational_detail::Relation input;
+  input.schema =
+      Schema("parallel_filtered_count", {Column("v", ValueType::kInt64)});
+  input.rows.reserve(kRowCount);
+  for (size_t i = 0; i < kRowCount; ++i) {
+    input.AddRow(Row({Value(static_cast<int64_t>(i + 1))}));
+  }
+  auto count = std::make_shared<AggregateExpression>(AggregationType::kCount,
+                                                     ColumnValueExp("*"));
+  count->SetWhereFilter(
+      BinaryExpressionExp(ColumnValueExp("v"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{kRowCount / 2}))));
+  SelectStatement statement({NamedExpression("count", count)}, {}, nullptr);
+
+  StatusOr<relational_detail::Relation> finished =
+      relational_detail::FinishQuery(context, statement, std::move(input),
+                                     nullptr, {}, false);
+  ASSERT_TRUE(finished.HasValue()) << finished.GetStatus();
+  relational_detail::Relation output = finished.MoveValue();
+  ASSERT_EQ(output.rows.size(), 1U);
+  EXPECT_EQ(output.rows[0][0], Value(int64_t{kRowCount / 2}));
+  context.Abort();
+}
 
 // A single statement that first narrows AggTable through an uncorrelated IN
 // list pushdown (BuildInput stores table_key_filters["AggTable"]) and then
@@ -380,6 +497,49 @@ TEST_F(RelationalRegressionTest, DerivedSingleColumnBareEqualityUsesHashJoin) {
       "WHERE v = kk;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{200}));
+}
+
+TEST_F(RelationalRegressionTest, FilteredAggregateOverJoinUsesPredicate) {
+  TransactionContext setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, left,
+      rs_->CreateTable(
+          setup, Schema("FilteredLeft", {Column("k", ValueType::kInt64),
+                                         Column("v", ValueType::kInt64)})));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right,
+      rs_->CreateTable(
+          setup, Schema("FilteredRight", {Column("k", ValueType::kInt64)})));
+  for (const Row& row : {Row({Value(int64_t{1}), Value(int64_t{10})}),
+                         Row({Value(int64_t{1}), Value(int64_t{30})}),
+                         Row({Value(int64_t{2}), Value(int64_t{40})})}) {
+    ASSERT_SUCCESS(left.Insert(setup.txn_, row).GetStatus());
+  }
+  for (const int64_t key : {int64_t{1}, int64_t{2}}) {
+    ASSERT_SUCCESS(right.Insert(setup.txn_, Row({Value(key)})).GetStatus());
+  }
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  const auto countif =
+      RelationalRun(*rs_,
+                    "SELECT COUNTIF(t.v > 20) FROM FilteredLeft t "
+                    "JOIN FilteredRight u ON t.k = u.k;");
+  ASSERT_EQ(countif.size(), 1U);
+  EXPECT_EQ(countif[0][0], Value(int64_t{2}));
+
+  const auto countif_one =
+      RelationalRun(*rs_,
+                    "SELECT COUNTIF(t.v > 30) FROM FilteredLeft t "
+                    "JOIN FilteredRight u ON t.k = u.k;");
+  ASSERT_EQ(countif_one.size(), 1U);
+  EXPECT_EQ(countif_one[0][0], Value(int64_t{1}));
+
+  const auto filtered_count =
+      RelationalRun(*rs_,
+                    "SELECT COUNT(* WHERE t.v > 30) FROM FilteredLeft t "
+                    "JOIN FilteredRight u ON t.k = u.k;");
+  ASSERT_EQ(filtered_count.size(), 1U);
+  EXPECT_EQ(filtered_count[0][0], Value(int64_t{1}));
 }
 
 }  // namespace

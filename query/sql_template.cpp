@@ -193,10 +193,81 @@ StatusOr<Expression> BindExpression(
     }
     case TypeTag::kAggregateExp: {
       const auto& aggregate = expression->AsAggregateExpression();
-      ASSIGN_OR_RETURN(Expression, h_agg,
-                       (BindExpression(aggregate.Child(), parameters, index)));
-      return AggregateExpressionExp(aggregate.GetType(), std::move(h_agg),
-                                    aggregate.Distinct());
+      // Rebuild every expression-bearing attribute in SQL text order:
+      // argument list -> WHERE -> HAVING modifier -> inner ORDER BY.
+      // Rebuilding only type/child/distinct silently dropped
+      // `AGG(arg WHERE cond)` filters (plus inner ordering, limits and
+      // extra arguments) on every template-cache hit.
+      Expression child;
+      if (aggregate.Child()) {
+        ASSIGN_OR_RETURN(
+            Expression, h_agg,
+            (BindExpression(aggregate.Child(), parameters, index)));
+        child = std::move(h_agg);
+      }
+      auto bound = std::make_shared<AggregateExpression>(
+          aggregate.GetType(), std::move(child), aggregate.Distinct());
+      bound->SetIgnoreNulls(aggregate.IgnoreNulls());
+      if (aggregate.SecondaryArg()) {
+        ASSIGN_OR_RETURN(
+            Expression, h_sec,
+            (BindExpression(aggregate.SecondaryArg(), parameters, index)));
+        bound->SetSecondaryArg(std::move(h_sec));
+      }
+      if (!aggregate.TrailingArgs().empty()) {
+        std::vector<Expression> trailing;
+        trailing.reserve(aggregate.TrailingArgs().size());
+        for (const Expression& extra : aggregate.TrailingArgs()) {
+          if (!extra) {
+            trailing.emplace_back();
+            continue;
+          }
+          ASSIGN_OR_RETURN(Expression, h_tr,
+                           (BindExpression(extra, parameters, index)));
+          trailing.push_back(std::move(h_tr));
+        }
+        bound->SetTrailingArgs(std::move(trailing));
+      }
+      if (aggregate.HasWhereFilter()) {
+        ASSIGN_OR_RETURN(
+            Expression, h_wf,
+            (BindExpression(aggregate.WhereFilter(), parameters, index)));
+        bound->SetWhereFilter(std::move(h_wf));
+      }
+      if (aggregate.Having() != AggregateHavingModifier::kNone) {
+        ASSIGN_OR_RETURN(
+            Expression, h_hc,
+            (BindExpression(aggregate.HavingCondition(), parameters, index)));
+        bound->SetHaving(aggregate.Having(), std::move(h_hc));
+      }
+      if (!aggregate.InnerOrderBy().empty()) {
+        std::vector<WindowOrderTerm> order;
+        order.reserve(aggregate.InnerOrderBy().size());
+        for (const WindowOrderTerm& term : aggregate.InnerOrderBy()) {
+          ASSIGN_OR_RETURN(
+              Expression, h_ob,
+              (BindExpression(term.expression, parameters, index)));
+          WindowOrderTerm bound_term = term;
+          bound_term.expression = std::move(h_ob);
+          order.push_back(std::move(bound_term));
+        }
+        bound->SetInnerOrderBy(std::move(order));
+      }
+      if (aggregate.InnerLimit().has_value()) {
+        bound->SetInnerLimit(aggregate.InnerLimit());
+      }
+      if (aggregate.HasInnerGroupBy()) {
+        std::vector<Expression> group_by;
+        group_by.reserve(aggregate.InnerGroupBy().size());
+        for (const Expression& key : aggregate.InnerGroupBy()) {
+          ASSIGN_OR_RETURN(Expression, h_gb,
+                           (BindExpression(key, parameters, index)));
+          group_by.push_back(std::move(h_gb));
+        }
+        bound->SetInnerGroupBy(std::move(group_by));
+      }
+      bound->SetArrayElementSqlType(aggregate.ArrayElementSqlType());
+      return Expression{std::move(bound)};
     }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
@@ -264,11 +335,18 @@ StatusOr<Expression> BindExpression(
                        (BindExpression(query.Test(), parameters, index)));
       ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, subquery,
                        (BindSelect(*query.Query(), parameters, index)));
+      // Carry the quantifier op/mode across template rebinding (Bug 60):
+      // the 4-arg constructor silently downgraded
+      // `x op ANY/ALL (sub)` to plain IN membership.
       auto bound = std::make_shared<QueryExpression>(
-          std::move(subquery), std::move(test), query.Exists(),
-          query.Negated());
-      // Preserve ARRAY(SELECT ...) semantics across template rebinding.
+          std::move(subquery), std::move(test), query.Exists(), query.Negated(),
+          query.Op(), query.Mode());
+      // Preserve ARRAY(SELECT ...) semantics across template rebinding,
+      // including the static element-type annotation: dropping it makes the
+      // second execution of the same SQL re-infer the element type from the
+      // produced values, diverging from the first (cached-tree) run.
       bound->SetArrayResult(query.ArrayResult());
+      bound->SetArrayElementSqlType(query.ArrayElementSqlType());
       return Expression{bound};
     }
     case TypeTag::kIntervalExp: {
@@ -333,10 +411,21 @@ bool SelectHasBindableConstant(
     }
   }
   for (const SelectSource& source : select.Sources()) {
-    if (ContainsBindableConstant(source.join_condition)) {
+    if (source.query && SelectHasBindableConstant(*source.query)) {
       return true;
     }
-    if (source.query && SelectHasBindableConstant(*source.query)) {
+    if (source.sample) {
+      if (ContainsBindableConstant(source.sample->size) ||
+          (source.sample->repeatable_seed &&
+           ContainsBindableConstant(*source.sample->repeatable_seed))) {
+        return true;
+      }
+      if (std::ranges::any_of(source.sample->partition_by,
+                              ContainsBindableConstant)) {
+        return true;
+      }
+    }
+    if (ContainsBindableConstant(source.join_condition)) {
       return true;
     }
   }
@@ -486,6 +575,24 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
       ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv16794_0,
                        (BindSelect(*source.query, parameters, index)));
       copied.query = std::move(hv16794_0);
+    }
+    if (source.sample) {
+      TableSampleSpec sample = *source.sample;
+      ASSIGN_OR_RETURN(Expression, size,
+                       (BindExpression(sample.size, parameters, index)));
+      sample.size = std::move(size);
+      for (Expression& partition : sample.partition_by) {
+        ASSIGN_OR_RETURN(Expression, bound_partition,
+                         (BindExpression(partition, parameters, index)));
+        partition = std::move(bound_partition);
+      }
+      if (sample.repeatable_seed) {
+        ASSIGN_OR_RETURN(
+            Expression, seed,
+            (BindExpression(*sample.repeatable_seed, parameters, index)));
+        sample.repeatable_seed = std::move(seed);
+      }
+      copied.sample = std::move(sample);
     }
     ASSIGN_OR_RETURN(
         Expression, hv16867_0,
@@ -832,8 +939,10 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         continue;
       }
     }
-    if (KeywordAt(sql, i, "LIMIT") || KeywordAt(sql, i, "OFFSET") ||
-        KeywordAt(sql, i, "INTERVAL")) {
+    const int upper_c = std::toupper(c);
+    if ((upper_c == 'L' || upper_c == 'O' || upper_c == 'I') &&
+        (KeywordAt(sql, i, "LIMIT") || KeywordAt(sql, i, "OFFSET") ||
+         KeywordAt(sql, i, "INTERVAL"))) {
       size_t keyword_size = 5;
       if (KeywordAt(sql, i, "INTERVAL")) {
         keyword_size = 8;
@@ -855,7 +964,7 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       }
       continue;
     }
-    if (KeywordAt(sql, i, "ASSERT_ROWS_MODIFIED")) {
+    if (upper_c == 'A' && KeywordAt(sql, i, "ASSERT_ROWS_MODIFIED")) {
       // The row-count assert is statement metadata carried outside the
       // expression tree; parameterizing its literal would let two asserts
       // that differ only in the count collide on one fingerprint (and one
@@ -875,7 +984,8 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       }
       continue;
     }
-    if (KeywordAt(sql, i, "CREATE") || KeywordAt(sql, i, "DROP")) {
+    if ((upper_c == 'C' || upper_c == 'D') &&
+        (KeywordAt(sql, i, "CREATE") || KeywordAt(sql, i, "DROP"))) {
       result.templatable = false;
     }
     const bool number_start =

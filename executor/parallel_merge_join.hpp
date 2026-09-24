@@ -85,6 +85,8 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
                                        const std::vector<slot_t>& right_cols);
   [[nodiscard]] static bool KeyIsNull(const Row& row,
                                       const std::vector<slot_t>& cols);
+  [[nodiscard]] static bool KeyCannotMatch(const Row& row,
+                                           const std::vector<slot_t>& cols);
   // Residual (non-equi) predicate over the concatenated pair; always true
   // when no residual was given.
   [[nodiscard]] bool PairPasses(const Row& left, const Row& right) const;

@@ -82,7 +82,7 @@ Expression FactorCommonAndImpl(const Expression& expression) {
 ### 1. 短絡順序の変更に伴う例外消去の防止
 AST 参照評価器は二項演算を左から右へ短絡評価します。$(E_{\text{throw}} \land x = 1) \lor (y = 2 \land x = 1)$ という式において、$x = 0, y = 2$ の行を評価する場合を考えます。
 元の式では、左被演算子の先頭に位置する $E_{\text{throw}}$ が評価され、直ちに実行時例外を送出します。
-もし共通項 $x = 1$ を無条件に外側へ括り出し、$(x = 1) \land (E_{\text{throw}} \lor y = 2)$ へ書き換えたとすると、先頭の $x = 1$ が `FALSE` を返し、連言全体の短絡により右側の被演算子 $(E_{\text{throw}} \lor y = 2)$ の評価がスキップされます。その結果、本来発生すべき例外が消滅し、クエリが正常終了して不正な結果集合を返す重大な意味論破壊が発生します。
+共通項 $x = 1$ を無条件に外へ出し、$(x = 1) \land (E_{\text{throw}} \lor y = 2)$ へ書き換えたとします。先頭の $x = 1$ が `FALSE` を返すと、連言の短絡評価により右辺 $(E_{\text{throw}} \lor y = 2)$ は評価されません。その結果、本来発生する例外が消え、クエリが正常終了して誤った結果集合を返します。
 したがって、共通因子の前方に 1 つでも例外を送出し得る式が存在する場合、括り出しは禁止されなければなりません。
 
 ### 2. 揮発性関数の評価回数保存
@@ -152,5 +152,5 @@ $(x \land y) \lor x$ を $x$ へ縮退させる場合、部分式 $y$ の評価�
 `expression/rewrite_test.cpp` において以下のテストケースにより動作が検証されています。
 
 - `ExpressionRewriteTest.FactorCommonAndFromOr`: $(x \land y) \lor (x \land z)$ が AND を頂点とする木へ正しく変換されること。
-- `ExpressionRewriteTest.FactorCommonAndShortCircuitThrow`: 先行する投げる式によって括り出しが抑絶され、元の AST と同一の例外が維持されること、ならびに `RAND()` を含む共通因子が不発火となること。
+- `ExpressionRewriteTest.FactorCommonAndShortCircuitThrow`: 先行する例外を送出する式によって括り出しが抑止され、元の AST と同一の例外が維持されること、ならびに `RAND()` を含む共通因子が不発火となること。
 - `ExpressionRewriteTest.IdempotenceAndAbsorptionRefuseNonBooleanAndVolatile`: 非ブール型式に対する不適切な縮退の拒絶。

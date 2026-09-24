@@ -19,7 +19,7 @@ EmptyPlan::EmptyPlan(Plan child)
 
 void EmptyPlan::Dump(std::ostream& o, int indent) const {
   o << Indent(static_cast<size_t>(indent))
-    << "EmptyResult (estimated cost: 0)\n";
+    << "EmptyResult (estimated rows: 0)\n";
 }
 
 std::string EmptyPlan::ToString() const { return "EmptyResult"; }

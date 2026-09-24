@@ -2,6 +2,7 @@
 #include "executor/detail/subquery_runtime.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -9,11 +10,13 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ratio>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -27,6 +30,7 @@
 #include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
+#include "executor/detail/window_eval.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -461,6 +465,10 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       std::ranges::any_of(
           statement.Sources(),
           [](const SelectSource& source) { return source.query != nullptr; }) ||
+      !statement.UnionAll().empty() ||
+      statement.GetSetOperationTree() != nullptr || statement.Qualify() ||
+      HasWindowFunctions(statement) ||
+      StatementContainsVolatileFunction(statement) ||
       context.execution_runtime()->unindexable_queries.contains(&statement)) {
     return std::nullopt;
   }
@@ -613,6 +621,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     if (statement.Having()) {
       correlated_expressions.push_back(statement.Having());
     }
+    for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+      correlated_expressions.push_back(term.expression);
+    }
     for (const Expression& expression : correlated_expressions) {
       for (const ColumnName& column : expression->TouchedColumns()) {
         if (column.name == "*") {
@@ -684,6 +695,16 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     Status group_error{Status::kSuccess};
     const bool integer_key =
         SingleIntegerJoinKey(source.schema, created->local_columns);
+    const auto integer_key_value = [&](int64_t key) {
+      const Column& column =
+          source.schema.GetColumn(created->local_columns.front());
+      Value value = column.Type() == ValueType::kDate ? Value::DateFromDays(key)
+                                                      : Value(key);
+      if (column.IsUnsigned()) {
+        value = value.WithUnsigned();
+      }
+      return value;
+    };
     if (aggregate_only) {
       // One-pass hash aggregate into finished scalar results. Storing only
       // aggregates (not every lineitem row) keeps Q17-style subqueries small.
@@ -706,7 +727,50 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       std::unordered_map<std::string, GroupAggs> str_groups;
       const CompiledScanFilter local_filter =
           CompileScanFilter(local_predicates, source.schema);
-      source.ForEachRow([&](const Row& row) {
+      // Child column fast path: an aggregate whose input is a plain column
+      // (the Q17 avg(l_quantity) shape) skips per-row AST evaluation, which
+      // would otherwise resolve the column by name for every build row.
+      std::vector<std::optional<slot_t>> aggregate_child_columns(
+          aggregate_expressions.size(), std::nullopt);
+      for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
+        const AggregateExpression& aggregate = *aggregate_expressions[i];
+        if (!IsCountStar(aggregate) && aggregate.Child() &&
+            aggregate.Child()->Type() == TypeTag::kColumnValue) {
+          aggregate_child_columns[i] = LocalColumnOffset(
+              source.schema,
+              aggregate.Child()->AsColumnValue().GetColumnName());
+        }
+      }
+      // Worker-safe aggregation check: plain-column inputs (or count(*))
+      // for streaming SUM/AVG/COUNT/MIN/MAX let the build run as a parallel
+      // row-slice reduction; anything else (per-row filters, DISTINCT,
+      // buffered aggregates) falls back to the serial pass.
+      bool build_parallel =
+          integer_key && !source.HasSpill() && source.TotalRows() >= 65536;
+      std::vector<bool> worker_safe(aggregate_expressions.size(), false);
+      for (size_t i = 0; build_parallel && i < aggregate_expressions.size();
+           ++i) {
+        const AggregateExpression& aggregate = *aggregate_expressions[i];
+        const bool safe =
+            (IsCountStar(aggregate) ||
+             (aggregate_child_columns[i].has_value() &&
+              !aggregate.WhereFilter() &&
+              aggregate.Having() == AggregateHavingModifier::kNone &&
+              aggregate.InnerOrderBy().empty() && !aggregate.SecondaryArg() &&
+              !aggregate.Distinct() && aggregate.TrailingArgs().empty())) &&
+            (IsCountStar(aggregate) ||
+             LocalColumnOffset(
+                 source.schema,
+                 aggregate.Child()->AsColumnValue().GetColumnName())
+                 .has_value());
+        worker_safe[i] = safe;
+        build_parallel = build_parallel && safe;
+      }
+      struct BuildWorker {
+        std::unordered_map<int64_t, GroupAggs> int_groups;
+        std::vector<Row> deferred;
+      };
+      auto accumulate_one = [&](const Row& row) -> void {
         if (HasNullKey(row, created->local_columns)) {
           return;
         }
@@ -727,7 +791,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         if (group->accumulators.empty()) {
           group->accumulators.reserve(aggregate_expressions.size());
           for (const AggregateExpression* aggregate : aggregate_expressions) {
-            group->accumulators.emplace_back(aggregate);
+            group->accumulators.emplace_back(aggregate, &source.schema);
           }
         }
         Scope scope{.row = &row, .schema = &source.schema, .outer = nullptr};
@@ -764,7 +828,12 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             continue;
           }
           AggregateInput input;
-          std::optional<Value> value = eval_group_value(aggregate.Child());
+          std::optional<Value> value;
+          if (aggregate_child_columns[i].has_value()) {
+            value = row[*aggregate_child_columns[i]];
+          } else {
+            value = eval_group_value(aggregate.Child());
+          }
           if (!value.has_value()) {
             return;
           }
@@ -809,7 +878,173 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             return;
           }
         }
-      });
+      };
+      if (build_parallel) {
+        // Parallel reduction: workers slice the materialized rows, keep
+        // per-key accumulator maps, and the main thread merges the scalar
+        // streaming states (AggregateAccumulator::Merge).  Worker filters
+        // use the worker-safe subset (simple compares + compiled residual
+        // bytecode); rows they cannot decide are deferred to the serial
+        // pass below.
+        const auto build_rows = source.TotalRows();
+        const auto workers =
+            std::min<size_t>({std::thread::hardware_concurrency(), 16UL,
+                              std::max<size_t>(1, build_rows / 32768)});
+        if (workers > 1) {
+          std::vector<BuildWorker> build_workers(workers);
+          std::vector<Status> build_errors(workers, Status::kSuccess);
+          std::atomic<size_t> next_chunk{0};
+          const size_t chunk_rows = 8192;
+          const size_t chunk_count = (build_rows + chunk_rows - 1) / chunk_rows;
+          std::mutex build_error_mu;
+          std::exception_ptr build_error_ex;
+          const std::vector<Row>& build_vector = source.rows;
+          const CompiledScanFilter& shared_filter = local_filter;
+          {
+            std::vector<std::jthread> threads;
+            threads.reserve(workers);
+            for (size_t w = 0; w < workers; ++w) {
+              try {
+                threads.emplace_back([&, w] {
+                  BuildWorker& local = build_workers[w];
+                  try {
+                    while (true) {
+                      const size_t ci = next_chunk.fetch_add(1);
+                      if (ci >= chunk_count) {
+                        break;
+                      }
+                      const size_t begin = ci * chunk_rows;
+                      const size_t end =
+                          std::min(build_rows, begin + chunk_rows);
+                      for (size_t ri = begin; ri < end; ++ri) {
+                        const Row& row = build_vector[ri];
+                        if (HasNullKey(row, created->local_columns)) {
+                          continue;
+                        }
+                        bool matches = true;
+                        for (const SimpleComparePredicate& pred :
+                             shared_filter.simple) {
+                          if (!MatchSimpleCompare(row, pred)) {
+                            matches = false;
+                            break;
+                          }
+                        }
+                        bool decided = matches;
+                        if (matches && shared_filter.residual_bytecode) {
+                          StatusOr<Value> result =
+                              shared_filter.residual_bytecode->TryEvaluateRow(
+                                  row);
+                          if (result.HasValue()) {
+                            matches = !result.Value().IsNull() &&
+                                      result.Value().Truthy();
+                          } else {
+                            decided = false;
+                          }
+                        } else if (matches && !shared_filter.residual.empty()) {
+                          decided = false;
+                        }
+                        if (matches && !decided) {
+                          local.deferred.push_back(row);
+                        } else if (matches) {
+                          int64_t key =
+                              IntegerJoinKey(row, created->local_columns[0]);
+                          auto [iter, inserted] =
+                              local.int_groups.try_emplace(key);
+                          if (inserted) {
+                            iter->second.accumulators.reserve(
+                                aggregate_expressions.size());
+                            for (const AggregateExpression* aggregate :
+                                 aggregate_expressions) {
+                              iter->second.accumulators.emplace_back(
+                                  aggregate, &source.schema);
+                            }
+                          }
+                          for (size_t i = 0; i < aggregate_expressions.size();
+                               ++i) {
+                            if (!worker_safe[i]) {
+                              continue;
+                            }
+                            if (IsCountStar(*aggregate_expressions[i])) {
+                              if (Status st = iter->second.accumulators[i].Add(
+                                      Value(1));
+                                  st != Status::kSuccess) {
+                                build_errors[w] = st;
+                                return;
+                              }
+                              continue;
+                            }
+                            if (Status st = iter->second.accumulators[i].Add(
+                                    row[*aggregate_child_columns[i]]);
+                                st != Status::kSuccess) {
+                              build_errors[w] = st;
+                              return;
+                            }
+                          }
+                        }
+                      }
+                    }
+                  } catch (...) {
+                    std::scoped_lock lock(build_error_mu);
+                    if (!build_error_ex) {
+                      build_error_ex = std::current_exception();
+                    }
+                  }
+                });
+              } catch (...) {
+                std::scoped_lock lock(build_error_mu);
+                if (!build_error_ex) {
+                  build_error_ex = std::current_exception();
+                }
+                break;
+              }
+            }
+          }
+          if (build_error_ex) {
+            std::rethrow_exception(build_error_ex);
+          }
+          for (const Status& st : build_errors) {
+            if (st != Status::kSuccess) {
+              return std::nullopt;
+            }
+          }
+          for (BuildWorker& local : build_workers) {
+            for (auto& [key, group] : local.int_groups) {
+              GroupAggs& dst = int_groups[key];
+              if (dst.accumulators.empty()) {
+                dst.accumulators = std::move(group.accumulators);
+                continue;
+              }
+              for (size_t i = 0; i < dst.accumulators.size(); ++i) {
+                if (group.accumulators[i].count == 0) {
+                  continue;
+                }
+                if (Status st =
+                        dst.accumulators[i].Merge(group.accumulators[i]);
+                    st != Status::kSuccess) {
+                  return std::nullopt;
+                }
+              }
+            }
+          }
+          for (BuildWorker& local : build_workers) {
+            for (const Row& row : local.deferred) {
+              accumulate_one(row);
+              if (group_error != Status::kSuccess) {
+                break;
+              }
+            }
+          }
+          if (group_error != Status::kSuccess) {
+            return std::nullopt;
+          }
+          build_parallel = true;
+        } else {
+          build_parallel = false;
+        }
+      }
+      if (!build_parallel) {
+        source.ForEachRow(accumulate_one);
+      }
       if (group_error != Status::kSuccess) {
         return std::nullopt;  // Fall back to the generic (diagnostic) path.
       }
@@ -878,13 +1113,49 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       };
       if (integer_key) {
         for (auto& [key, group] : int_groups) {
-          emit_group(Row({Value(key)}).EncodeMemcomparableFormat(), group);
+          emit_group(integer_key_value(key).EncodeMemcomparableFormat(), group);
         }
       } else {
         for (auto& [key, group] : str_groups) {
           emit_group(key, group);
         }
       }
+    } else if (exists_only &&
+               std::ranges::all_of(
+                   created->cache_outer_columns,
+                   [&](const ColumnName& column) {
+                     // Outer references beyond the correlation equalities
+                     // themselves would make existence depend on outer
+                     // values the key set cannot see.
+                     return std::ranges::find(created->outer_columns, column) !=
+                            created->outer_columns.end();
+                   }) &&
+               statement.GroupBy().empty() && statement.Having() == nullptr &&
+               !statement.Distinct() && !statement.HasLimit() &&
+               statement.Offset() == 0 &&
+               SingleIntegerJoinKey(source.schema, created->local_columns)) {
+      // EXISTS key-set build: row existence keyed by the local correlation
+      // column is the entire observable result, so the matching rows never
+      // need to be retained (the generic branch below copies every one of
+      // them into the multimap).
+      const CompiledScanFilter local_filter =
+          CompileScanFilter(local_predicates, source.schema);
+      source.ForEachRow([&](const Row& row) {
+        if (group_error != Status::kSuccess ||
+            HasNullKey(row, created->local_columns)) {
+          return;
+        }
+        if (!MatchScanFilter(row, source.schema, local_filter, nullptr, context,
+                             ctes, &group_error)) {
+          return;
+        }
+        created->exists_keys.insert(
+            IntegerJoinKey(row, created->local_columns[0]));
+      });
+      if (group_error != Status::kSuccess) {
+        return std::nullopt;  // Fall back to the generic (diagnostic) path.
+      }
+      created->exists_key_set = true;
     } else {
       source.ForEachRow([&](const Row& row) {
         if (HasNullKey(row, created->local_columns)) {
@@ -928,6 +1199,32 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
 
   ++context.execution_runtime()->correlated_index_probes;
 
+  if (index->local_columns.size() != index->outer_columns.size()) {
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < index->outer_columns.size(); ++i) {
+    StatusOr<Value> indexed_outer_value =
+        TryLookup(index->outer_columns[i], outer);
+    if (!indexed_outer_value.HasValue()) {
+      return std::nullopt;
+    }
+    const Value& outer_value = indexed_outer_value.Value();
+    if (outer_value.IsNull()) {
+      continue;
+    }
+    const Column& local_column =
+        index->schema.GetColumn(index->local_columns[i]);
+    const bool same_domain =
+        (local_column.Type() == ValueType::kDate &&
+         outer_value.type == ValueType::kDate) ||
+        (local_column.Type() == ValueType::kInt64 &&
+         outer_value.type == ValueType::kInt64 &&
+         local_column.IsUnsigned() == outer_value.IsUnsigned());
+    if (!same_domain) {
+      return std::nullopt;
+    }
+  }
+
   std::vector<Value> cache_values;
   cache_values.reserve(index->cache_outer_columns.size());
   for (const ColumnName& column : index->cache_outer_columns) {
@@ -961,6 +1258,36 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     // NULL equality parameters do not participate in the result cache, but
     // they are still one distinct parameter tuple for profiling purposes.
     index->parameter_keys_seen.insert("\xfftinylamb-null-parameter");
+  }
+
+  if (index->exists_key_set) {
+    // Key-set probes answer directly from the build; neither the per-key
+    // result cache nor FinishQuery runs.  A NULL correlation key matches
+    // nothing under `=` (empty relation), mirroring the generic NULL guard.
+    StatusOr<Value> outer_value = TryLookup(index->outer_columns[0], outer);
+    if (!outer_value.HasValue()) {
+      return std::nullopt;  // Fall back to the generic (diagnostic) path.
+    }
+    const Value& probe = outer_value.Value();
+    if (probe.IsNull()) {
+      Relation empty;
+      empty.schema = index->schema;
+      return empty;
+    }
+    if (probe.type != ValueType::kInt64 && probe.type != ValueType::kDate) {
+      // Type-promoted equality is the generic path's decision, not the
+      // bit-equality key set's.
+      return std::nullopt;
+    }
+    if (!index->exists_keys.contains(probe.value.int_value)) {
+      Relation empty;
+      empty.schema = index->schema;
+      return empty;
+    }
+    Relation one;
+    one.schema = index->schema;
+    one.AddRow(Row(std::vector<Value>(index->schema.ColumnCount())));
+    return one;
   }
 
   if (index->preaggregated) {
@@ -1184,6 +1511,45 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
       if (query.Query() && StatementContainsVolatileFunction(*query.Query())) {
         return true;
       }
+      return self(query.Test(), self);
+    }
+    if (expression->Type() == TypeTag::kAggregateExp) {
+      const auto& aggregate = expression->AsAggregateExpression();
+      return self(aggregate.Child(), self) ||
+             self(aggregate.HavingCondition(), self) ||
+             self(aggregate.SecondaryArg(), self) ||
+             self(aggregate.WhereFilter(), self) ||
+             std::ranges::any_of(aggregate.TrailingArgs(), [&](const auto& arg) {
+               return self(arg, self);
+             }) ||
+             std::ranges::any_of(
+                 aggregate.InnerOrderBy(), [&](const auto& term) {
+                   return self(term.expression, self);
+                 }) ||
+             std::ranges::any_of(
+                 aggregate.InnerGroupBy(), [&](const auto& key) {
+                   return self(key, self);
+                 });
+    }
+    if (expression->Type() == TypeTag::kWindowFunctionExp) {
+      const auto& window = expression->AsWindowFunctionCallExpression();
+      return std::ranges::any_of(window.args, [&](const auto& arg) {
+               return self(arg, self);
+             }) ||
+             self(window.where_filter, self) ||
+             std::ranges::any_of(
+                 window.partition_by, [&](const auto& key) {
+                   return self(key, self);
+                 }) ||
+             std::ranges::any_of(window.order_by, [&](const auto& term) {
+               return self(term.expression, self);
+             }) ||
+             std::ranges::any_of(
+                 window.inner_order_by, [&](const auto& term) {
+                   return self(term.expression, self);
+                 }) ||
+             self(window.frame_start.offset, self) ||
+             self(window.frame_end.offset, self);
     }
     return std::ranges::any_of(
         ExpressionChildren(expression),
@@ -1278,6 +1644,14 @@ std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
     if (!expression) {
       return;
     }
+    if (expression->Type() == TypeTag::kQueryExp) {
+      const QueryExpression& query = expression->AsQueryExpression();
+      collect_expression(query.Test());
+      if (query.Query()) {
+        collect_statement(*query.Query());
+      }
+      return;
+    }
     for (const ColumnName& column : expression->TouchedColumns()) {
       referenced_columns.insert(column);
     }
@@ -1309,6 +1683,26 @@ std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
        current = current->outer, ++depth) {
     key += std::to_string(depth);
     key.push_back(':');
+    if (current->aggregates != nullptr && !current->aggregates->empty()) {
+      std::vector<std::pair<const AggregateExpression*, std::string>>
+          aggregate_values;
+      aggregate_values.reserve(current->aggregates->size());
+      for (const auto& [expression, value] : *current->aggregates) {
+        aggregate_values.emplace_back(expression,
+                                      value.EncodeMemcomparableFormat());
+      }
+      std::ranges::sort(aggregate_values, [](const auto& left,
+                                             const auto& right) {
+        return std::less<const AggregateExpression*>()(left.first, right.first);
+      });
+      key += "|aggregates=";
+      for (const auto& [expression, value] : aggregate_values) {
+        key += std::to_string(reinterpret_cast<uintptr_t>(expression));
+        key.push_back(':');
+        key += value;
+        key.push_back(';');
+      }
+    }
     if (current->row == nullptr) {
       key += "<null-row>;";
       continue;
@@ -1358,7 +1752,8 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           const CteMap& ctes,
                                           bool exists_only) {
   if (context.execution_runtime() == nullptr ||
-      context.execution_runtime()->noncacheable_queries.contains(&statement)) {
+      context.execution_runtime()->noncacheable_queries.contains(&statement) ||
+      StatementContainsVolatileFunction(statement)) {
     return nullptr;
   }
   // Separate AST nodes can describe the same uncorrelated subquery (for
@@ -1493,6 +1888,13 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     return nullptr;
   }
   Relation result = executed.MoveValue();
+  if (std::getenv("TINYLAMB_TRACE_UNCORRELATED") !=
+      nullptr) {  // NOLINT(cert-err33-c)
+    (void)fprintf(stderr, "[UNCORR] rows=%zu schema_cols=%zu exists=%d\n",
+            result.TotalRows(),
+            static_cast<size_t>(result.schema.ColumnCount()),
+            static_cast<int>(exists_only));
+  }
   auto [iter, inserted] =
       context.execution_runtime()->uncorrelated_results.emplace(
           &statement, std::make_shared<Relation>(std::move(result)));

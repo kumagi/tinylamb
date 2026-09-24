@@ -66,7 +66,7 @@ size_t FullScanPlan::EmitRowCount() const {
 
 void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_.GetSchema().Name()
-    << "(estimated cost: " << AccessRowCount();
+    << "(estimated rows: " << AccessRowCount();
   if (max_rows_ != std::numeric_limits<size_t>::max()) {
     o << ", max rows: " << max_rows_;
   }
@@ -75,7 +75,7 @@ void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
 
 std::string FullScanPlan::ToString() const {
   std::string result = "FullScan: " + std::string(table_.GetSchema().Name()) +
-                       "(estimated cost: " + std::to_string(AccessRowCount());
+                       "(estimated rows: " + std::to_string(AccessRowCount());
   if (max_rows_ != std::numeric_limits<size_t>::max()) {
     result += ", max rows: " + std::to_string(max_rows_);
   }

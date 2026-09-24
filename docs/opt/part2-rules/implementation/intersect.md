@@ -41,7 +41,7 @@ if (children.size() < 2) {
 
 `SetOperationPlan::EnforcesDistinct()` は `kIntersect` に対して真を返します（`plan/set_operation_plan.hpp`）。物理実行器 `SetOperationExecutor::AppendIntersection`（`executor/set_operation.cpp`）は、入力行の頻度マップを構築して全入力に共通する要素を抽出し、フラグ `all = false` に基づいて重複行を削ぎ落とします。
 
-もし入力が左 `{2, 2}`、右 `{2, 2}` である場合、多重度を保持する `INTERSECT ALL` は `{2, 2}` を出力しますが、`INTERSECT` は重複を排除して `{2}` を出力します。このように演算種別により出力行数および多重度が根本的に異なるため、ALL の有無による物理演算種別の峻別が必須となります。
+入力が左 `{2, 2}`、右 `{2, 2}` の場合、多重度を保持する `INTERSECT ALL` は `{2, 2}` を出力しますが、`INTERSECT` は重複を排除して `{2}` を出力します。ALL の有無で出力行数と多重度が変わるため、別の物理演算として扱う必要があります。
 
 また、論理規則 `intersect_to_semijoin` が適用された論理式は `kSemiJoin` へ書き換えられるため、半結合（SemiJoin）の物理実装と本集合演算実装がコスト基準で競合します。
 
@@ -84,4 +84,3 @@ return std::vector<PlanAlternative>{
   - `CascadesTest.IntersectWithEmptyBranchBecomesEmpty`: 入力の一方が空である場合の論理簡約を検証します。
   - `CascadesTest.IntersectToSemiJoinRewrite`: INTERSECT から SemiJoin への論理変換を検証します。
   - `CascadesTest.IntersectExceptCostBasedLowering`: コストに基づく実装形態の選択を検証します。
-

@@ -34,7 +34,12 @@ class EmptyPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& /*expressions*/,
       const std::vector<bool>& /*ascending*/) const override {
-    // An empty relation satisfies every ordering requirement.
+    return true;
+  }
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& /*expressions*/,
+      const std::vector<bool>& /*ascending*/,
+      const std::vector<std::optional<bool>>& /*nulls_first*/) const override {
     return true;
   }
   [[nodiscard]] bool EnforcesLimit(size_t /*limit_count*/,

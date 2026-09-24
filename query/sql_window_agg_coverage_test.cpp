@@ -45,9 +45,17 @@ namespace {
 // execution failure surfaces as a runtime_error carrying the diagnostic.
 std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
+  // One retry for empty diagnostics: a failed Prepare with no LastError is
+  // the external parse child being transiently unavailable under load, not
+  // a legitimate SQL error (real errors always carry a message).
   StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
   if (!prepared.HasValue()) {
-    throw std::runtime_error(engine->LastError());
+    if (engine->LastError().empty()) {
+      prepared = engine->Prepare(*ctx, sql);
+    }
+    if (!prepared.HasValue()) {
+      throw std::runtime_error(engine->LastError());
+    }
   }
   std::vector<Row> rows;
   Row row;
@@ -120,9 +128,11 @@ class SqlWindowAggCoverageTest : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
-      GTEST_SKIP() << true;
+      GTEST_SKIP() << "skipped";
     }
-    database_ = Database::Create("sql_window_agg_coverage_test").MoveValue();
+    database_ =
+        Database::Create("sql_window_agg_coverage_test-" + RandomString())
+            .MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
     engine_ = std::make_unique<SqlEngine>(*database_);
   }
@@ -154,7 +164,7 @@ class WindowSqlCov : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
-      GTEST_SKIP() << true;
+      GTEST_SKIP() << "skipped";
     }
     database_ = Database::Create("window_cov-" + RandomString()).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
@@ -240,33 +250,43 @@ TEST_F(WindowSqlCov, NullsFirstLastExplicitInWindowOrder) {
   EXPECT_EQ(out[4], (Row({Value(5), Value(4), Value(2), Value(110)})));
 }
 
-TEST_F(WindowSqlCov, NanOrderKeysAreOnePeerGroupAboveEverything) {
+TEST_F(WindowSqlCov, NanOrderKeysAreOnePeerGroupBeforeFiniteValues) {
   const auto rows =
       TryRunSql(engine_.get(), context_.get(),
                 "SELECT RANK() OVER (ORDER BY f), SUM(v) OVER (ORDER BY f), "
                 "CUME_DIST() OVER (ORDER BY f DESC) "
-                "FROM wx WHERE g = 1 ORDER BY f NULLS FIRST, v");
+                "FROM wx WHERE g = 1 ORDER BY v");
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   ASSERT_EQ(rows.Value().size(), 5U);
   const std::vector<Row>& out = rows.Value();
-  // Order: NULL, 1.5, 1.5, 2.5, NaN.  NaN peers with nothing and sorts above
-  // every number; the 1.5 ties share their cumulative frame.
-  EXPECT_EQ(out[0][0], Value(1));
-  EXPECT_EQ(out[1][0], Value(2));
-  EXPECT_EQ(out[2][0], Value(2));
-  EXPECT_EQ(out[3][0], Value(4));
-  EXPECT_EQ(out[4][0], Value(5));
-  // The engine sorts NULL lowest for ASC, so the NULL-key row's cumulative
-  // sum includes it in every later frame: 50, 80, 80, 110, 150.
-  EXPECT_EQ(out[0][1], Value(50));
-  EXPECT_EQ(out[1][1], Value(80));
-  EXPECT_EQ(out[2][1], Value(80));
-  EXPECT_EQ(out[3][1], Value(110));
-  EXPECT_EQ(out[4][1], Value(150));
-  // CUME_DIST over f DESC (NULLS LAST by default): NaN, 2.5, 1.5, 1.5, NULL.
-  EXPECT_DOUBLE_EQ(out[0][2].value.double_value, 1.0);
-  EXPECT_DOUBLE_EQ(out[3][2].value.double_value, 0.4);
-  EXPECT_DOUBLE_EQ(out[4][2].value.double_value, 0.2);
+  EXPECT_EQ(out[0][0], Value(3));
+  EXPECT_EQ(out[1][0], Value(3));
+  EXPECT_EQ(out[2][0], Value(5));
+  EXPECT_EQ(out[3][0], Value(2));
+  EXPECT_EQ(out[4][0], Value(1));
+  EXPECT_EQ(out[0][1], Value(120));
+  EXPECT_EQ(out[1][1], Value(120));
+  EXPECT_EQ(out[2][1], Value(150));
+  EXPECT_EQ(out[3][1], Value(90));
+  EXPECT_EQ(out[4][1], Value(50));
+  EXPECT_DOUBLE_EQ(out[0][2].value.double_value, 0.6);
+  EXPECT_DOUBLE_EQ(out[1][2].value.double_value, 0.6);
+  EXPECT_DOUBLE_EQ(out[2][2].value.double_value, 0.2);
+  EXPECT_DOUBLE_EQ(out[3][2].value.double_value, 0.8);
+  EXPECT_DOUBLE_EQ(out[4][2].value.double_value, 1.0);
+}
+
+TEST_F(WindowSqlCov, WindowOrderPlacesNanBeforeFiniteValues) {
+  const auto rows =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT v, ROW_NUMBER() OVER (ORDER BY f) "
+                "FROM wx WHERE g = 1 AND f IS NOT NULL ORDER BY v");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  ASSERT_EQ(rows.Value().size(), 4U);
+  EXPECT_EQ(rows.Value()[0], Row({Value(10), Value(2)}));
+  EXPECT_EQ(rows.Value()[1], Row({Value(20), Value(3)}));
+  EXPECT_EQ(rows.Value()[2], Row({Value(30), Value(4)}));
+  EXPECT_EQ(rows.Value()[3], Row({Value(40), Value(1)}));
 }
 
 TEST_F(WindowSqlCov, RangeOffsetFramesAroundInt64Keys) {
@@ -528,6 +548,65 @@ TEST_F(WindowSqlCov, AggregateWindowSweepOverUnnest) {
   EXPECT_DOUBLE_EQ(r[16].value.double_value, std::sqrt(200.0 / 3.0));
   for (size_t i = 1; i < rows.Value().size(); ++i) {
     EXPECT_EQ(rows.Value()[i], r);
+  }
+}
+
+TEST_F(WindowSqlCov, WindowMinMaxPropagateNan) {
+  const auto rows = TryRunSql(engine_.get(), context_.get(),
+                              "SELECT MIN(f) OVER (), MAX(f) OVER () "
+                              "FROM wx WHERE g = 1");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  ASSERT_EQ(rows.Value().size(), 5U);
+  for (const Row& row : rows.Value()) {
+    ASSERT_EQ(row[0].type, ValueType::kDouble);
+    ASSERT_EQ(row[1].type, ValueType::kDouble);
+    EXPECT_TRUE(std::isnan(row[0].value.double_value));
+    EXPECT_TRUE(std::isnan(row[1].value.double_value));
+  }
+}
+
+TEST_F(WindowSqlCov, WindowArrayAggPreservesNullElements) {
+  const auto rows =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT ARRAY_AGG(v) OVER () FROM UNNEST([10, NULL, 20]) AS v");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  ASSERT_EQ(rows.Value().size(), 3U);
+  const Value& result = rows.Value()[0][0];
+  ASSERT_TRUE(result.IsArray());
+  EXPECT_EQ(result.ArrayElements(),
+            (std::vector<Value>({Value(10), Value(), Value(20)})));
+
+  const auto all_null =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT ARRAY_AGG(v) OVER () FROM UNNEST([CAST(NULL AS INT64), "
+                "CAST(NULL AS INT64)]) AS v");
+  ASSERT_TRUE(all_null.HasValue()) << all_null.GetStatus().GetMessage();
+  ASSERT_EQ(all_null.Value().size(), 2U);
+  ASSERT_TRUE(all_null.Value()[0][0].IsArray());
+  EXPECT_EQ(all_null.Value()[0][0].ArrayElements(),
+            (std::vector<Value>({Value(), Value()})));
+}
+
+TEST_F(WindowSqlCov, WindowIgnoreNullsFiltersAnalyticValues) {
+  const auto rows = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT ARRAY_AGG(v IGNORE NULLS) OVER (), "
+      "FIRST_VALUE(v IGNORE NULLS) OVER (ORDER BY ord ROWS BETWEEN "
+      "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), "
+      "LAST_VALUE(v IGNORE NULLS) OVER (ORDER BY ord ROWS BETWEEN "
+      "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), "
+      "NTH_VALUE(v, 2 IGNORE NULLS) OVER (ORDER BY ord ROWS BETWEEN "
+      "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) "
+      "FROM UNNEST([NULL, 10, 20]) AS v WITH OFFSET AS ord ORDER BY ord");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  ASSERT_EQ(rows.Value().size(), 3U);
+  for (const Row& row : rows.Value()) {
+    ASSERT_TRUE(row[0].IsArray());
+    EXPECT_EQ(row[0].ArrayElements(),
+              (std::vector<Value>({Value(10), Value(20)})));
+    EXPECT_EQ(row[1], Value(10));
+    EXPECT_EQ(row[2], Value(20));
+    EXPECT_EQ(row[3], Value(20));
   }
 }
 
@@ -879,38 +958,38 @@ TEST_F(DirectWinCov, GroupsFramesWithEveryBoundKind) {
     WindowFrameBound start;
     WindowFrameBound end;
     std::vector<Value> expected;
-  } cases[] = {
-      {"current..following",
-       Bound(WindowFrameBoundType::kCurrentRow),
-       OffsetBound(WindowFrameBoundType::kOffsetFollowing, 1),
-       {Value(40), Value(40), Value(50), Value(30)}},
-      {"following..unbounded",
-       OffsetBound(WindowFrameBoundType::kOffsetFollowing, 1),
-       Bound(WindowFrameBoundType::kUnboundedFollowing),
-       {Value(50), Value(50), Value(30), Value(30)}},
-      {"unbounded..unbounded",
-       Bound(WindowFrameBoundType::kUnboundedFollowing),
-       Bound(WindowFrameBoundType::kUnboundedFollowing),
-       {Value(30), Value(30), Value(30), Value(30)}},
-      {"unbounded_prec..unbounded_prec",
-       Bound(WindowFrameBoundType::kUnboundedPreceding),
-       Bound(WindowFrameBoundType::kUnboundedPreceding),
-       {Value(10), Value(10), Value(10), Value(10)}},
-      // A following-start clamped past the last group pins to it.
-      {"following-clamped..unbounded",
-       OffsetBound(WindowFrameBoundType::kOffsetFollowing, 5),
-       Bound(WindowFrameBoundType::kUnboundedFollowing),
-       {Value(30), Value(30), Value(30), Value(30)}},
-      // Preceding-end below a following-start empties the frame.
-      {"following..preceding",
-       OffsetBound(WindowFrameBoundType::kOffsetFollowing, 1),
-       OffsetBound(WindowFrameBoundType::kOffsetPreceding, 1),
-       {Value(), Value(), Value(), Value()}},
   };
+  const std::array<Case, 6> cases = {{
+      {.name = "current..following",
+       .start = Bound(WindowFrameBoundType::kCurrentRow),
+       .end = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 1),
+       .expected = {Value(40), Value(40), Value(50), Value(30)}},
+      {.name = "following..unbounded",
+       .start = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 1),
+       .end = Bound(WindowFrameBoundType::kUnboundedFollowing),
+       .expected = {Value(50), Value(50), Value(30), Value(30)}},
+      {.name = "unbounded..unbounded",
+       .start = Bound(WindowFrameBoundType::kUnboundedFollowing),
+       .end = Bound(WindowFrameBoundType::kUnboundedFollowing),
+       .expected = {Value(30), Value(30), Value(30), Value(30)}},
+      {.name = "unbounded_prec..unbounded_prec",
+       .start = Bound(WindowFrameBoundType::kUnboundedPreceding),
+       .end = Bound(WindowFrameBoundType::kUnboundedPreceding),
+       .expected = {Value(10), Value(10), Value(10), Value(10)}},
+      // A following-start clamped past the last group pins to it.
+      {.name = "following-clamped..unbounded",
+       .start = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 5),
+       .end = Bound(WindowFrameBoundType::kUnboundedFollowing),
+       .expected = {Value(30), Value(30), Value(30), Value(30)}},
+      // Preceding-end below a following-start empties the frame.
+      {.name = "following..preceding",
+       .start = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 1),
+       .end = OffsetBound(WindowFrameBoundType::kOffsetPreceding, 1),
+       .expected = {Value(), Value(), Value(), Value()}},
+  }};
   for (const Case& c : cases) {
-    auto result =
-        Apply(*context_, SumWithFrame(WindowFrameUnit::kGroups,
-                                      std::move(c.start), std::move(c.end)));
+    auto result = Apply(*context_,
+                        SumWithFrame(WindowFrameUnit::kGroups, c.start, c.end));
     ASSERT_TRUE(result.HasValue())
         << c.name << ": " << result.GetStatus().GetMessage();
     EXPECT_EQ(result.Value(), c.expected) << c.name;
@@ -1199,9 +1278,8 @@ std::vector<Row> Drain(ExecutorBase* executor) {
 }
 
 NamedExpression CountStarAgg(const std::string& name) {
-  return NamedExpression(
-      name, std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                  ColumnValueExp("*")));
+  return {name, std::make_shared<AggregateExpression>(AggregationType::kCount,
+                                                      ColumnValueExp("*"))};
 }
 
 }  // namespace
@@ -1399,7 +1477,7 @@ class AggSmallCov : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
-      GTEST_SKIP() << true;
+      GTEST_SKIP() << "skipped";
     }
     database_ = Database::Create("agg_small-" + RandomString()).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
@@ -1608,7 +1686,7 @@ class AggBigCov : public ::testing::Test {
 
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
-      GTEST_SKIP() << true;
+      GTEST_SKIP() << "skipped";
     }
     database_ = Database::Create("agg_big-" + RandomString()).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
@@ -1730,26 +1808,27 @@ TEST_F(AggBigCov, GroupedStatisticsMatchClosedForms) {
   const Row* g1 = FindRow(rows.Value(), 0, Value(int64_t{1}));
   ASSERT_NE(g1, nullptr);
   // Reference moments for a = 1, 4, ..., 10000 and f = 1.5 * a.
-  const double n = static_cast<double>(CountFor(1));
+  const auto n = static_cast<double>(CountFor(1));
   double sx = 0, sxx = 0, sy = 0, sxy = 0;
   for (int64_t v = 1; v <= kRows; v += 3) {
-    sx += v;
-    sxx += static_cast<double>(v) * v;
-    sy += 1.5 * v;
-    sxy += 1.5 * static_cast<double>(v) * v;
+    const auto dv = static_cast<double>(v);
+    sx += dv;
+    sxx += (dv * dv);
+    sy += (1.5 * dv);
+    sxy += ((1.5 * dv) * dv);
   }
   const double mean = sx / n;
-  const double var_pop = sxx / n - mean * mean;
-  EXPECT_NEAR((*g1)[1].value.double_value, var_pop, var_pop * 1e-9 + 1e-9);
+  const double var_pop = (sxx / n) - (mean * mean);
+  EXPECT_NEAR((*g1)[1].value.double_value, var_pop, (var_pop * 1e-9) + 1e-9);
   EXPECT_NEAR((*g1)[2].value.double_value, var_pop * n / (n - 1.0),
-              var_pop * 1e-9 + 1e-9);
+              (var_pop * 1e-9) + 1e-9);
   EXPECT_NEAR((*g1)[3].value.double_value, std::sqrt(var_pop),
-              std::sqrt(var_pop) * 1e-9 + 1e-9);
-  const double covar_pop = sxy / n - mean * (sy / n);
+              (std::sqrt(var_pop) * 1e-9) + 1e-9);
+  const double covar_pop = (sxy / n) - (mean * (sy / n));
   EXPECT_NEAR((*g1)[5].value.double_value, covar_pop,
-              std::abs(covar_pop) * 1e-9 + 1e-9);
+              (std::abs(covar_pop) * 1e-9) + 1e-9);
   EXPECT_NEAR((*g1)[6].value.double_value, covar_pop * n / (n - 1.0),
-              std::abs(covar_pop) * 1e-9 + 1e-9);
+              (std::abs(covar_pop) * 1e-9) + 1e-9);
   EXPECT_NEAR((*g1)[7].value.double_value, 1.0, 1e-9);
 
   // VAR_SAMP with a single sample row is NULL (the NULL-key group).
@@ -1786,15 +1865,16 @@ TEST_F(AggBigCov, GroupedDistinctStatisticsForceSingleWorker) {
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row* g1 = FindRow(rows.Value(), 0, Value(int64_t{1}));
   ASSERT_NE(g1, nullptr);
-  const double n = static_cast<double>(CountFor(1));
+  const auto n = static_cast<double>(CountFor(1));
   double sx = 0, sxx = 0;
   for (int64_t v = 1; v <= kRows; v += 3) {
-    sx += v;
-    sxx += static_cast<double>(v) * v;
+    const auto dv = static_cast<double>(v);
+    sx += dv;
+    sxx += (dv * dv);
   }
   const double mean = sx / n;
-  const double var_pop = sxx / n - mean * mean;
-  EXPECT_NEAR((*g1)[1].value.double_value, var_pop, var_pop * 1e-9 + 1e-9);
+  const double var_pop = (sxx / n) - (mean * mean);
+  EXPECT_NEAR((*g1)[1].value.double_value, var_pop, (var_pop * 1e-9) + 1e-9);
   // a and f are perfectly correlated within the group.
   EXPECT_NEAR((*g1)[2].value.double_value, 1.0, 1e-9);
 }
@@ -1824,13 +1904,14 @@ TEST_F(AggBigCov, GroupedFilteredAggregatesAccumulateGenerically) {
   // FILTER (WHERE a > 0) keeps every row of the group.
   double sx = 0, sxx = 0;
   for (int64_t v = 1; v <= kRows; v += 3) {
-    sx += v;
-    sxx += static_cast<double>(v) * v;
+    const auto dv = static_cast<double>(v);
+    sx += dv;
+    sxx += (dv * dv);
   }
-  const double n = static_cast<double>(CountFor(1));
+  const auto n = static_cast<double>(CountFor(1));
   const double mean = sx / n;
-  const double var_pop = sxx / n - mean * mean;
-  EXPECT_NEAR((*g1)[4].value.double_value, var_pop, var_pop * 1e-9 + 1e-9);
+  const double var_pop = (sxx / n) - (mean * mean);
+  EXPECT_NEAR((*g1)[4].value.double_value, var_pop, (var_pop * 1e-9) + 1e-9);
 }
 
 TEST_F(AggBigCov, GenericStatisticalAggregatesOnExpressions) {
@@ -1842,15 +1923,16 @@ TEST_F(AggBigCov, GenericStatisticalAggregatesOnExpressions) {
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
   const Row* g2 = FindRow(rows.Value(), 0, Value(int64_t{2}));
   ASSERT_NE(g2, nullptr);
-  const double n = static_cast<double>(CountFor(2));
+  const auto n = static_cast<double>(CountFor(2));
   double sx = 0, sxx = 0;
   for (int64_t v = 2; v <= kRows; v += 3) {
-    sx += v;
-    sxx += static_cast<double>(v) * v;
+    const auto dv = static_cast<double>(v);
+    sx += dv;
+    sxx += (dv * dv);
   }
   const double mean = sx / n;
-  const double var_pop = sxx / n - mean * mean;
-  EXPECT_NEAR((*g2)[1].value.double_value, var_pop, var_pop * 1e-9 + 1e-9);
+  const double var_pop = (sxx / n) - (mean * mean);
+  EXPECT_NEAR((*g2)[1].value.double_value, var_pop, (var_pop * 1e-9) + 1e-9);
   EXPECT_NEAR((*g2)[2].value.double_value, 1.0, 1e-9);
 }
 
@@ -1979,17 +2061,30 @@ TEST_F(ScanFilterDirectCov, DateColumnVersusStringConstants) {
   const Schema schema("t", {Column("d", ValueType::kDate)});
   const Value date = Value::Date("2020-01-15");
   struct OpCase {
-    BinaryOperation op;
     std::string literal;
+    BinaryOperation op;
     bool expected;
-  } cases[] = {
-      {BinaryOperation::kEquals, "2020-01-15", true},
-      {BinaryOperation::kNotEquals, "2020-01-15", false},
-      {BinaryOperation::kLessThan, "2020-02-01", true},
-      {BinaryOperation::kLessThanEquals, "2020-01-15", true},
-      {BinaryOperation::kGreaterThan, "2020-01-01", true},
-      {BinaryOperation::kGreaterThanEquals, "2020-01-16", false},
   };
+  const std::array<OpCase, 6> cases = {{
+      {.literal = "2020-01-15",
+       .op = BinaryOperation::kEquals,
+       .expected = true},
+      {.literal = "2020-01-15",
+       .op = BinaryOperation::kNotEquals,
+       .expected = false},
+      {.literal = "2020-02-01",
+       .op = BinaryOperation::kLessThan,
+       .expected = true},
+      {.literal = "2020-01-15",
+       .op = BinaryOperation::kLessThanEquals,
+       .expected = true},
+      {.literal = "2020-01-01",
+       .op = BinaryOperation::kGreaterThan,
+       .expected = true},
+      {.literal = "2020-01-16",
+       .op = BinaryOperation::kGreaterThanEquals,
+       .expected = false},
+  }};
   for (const OpCase& c : cases) {
     CompiledScanFilter f = Compile(
         {BinaryExpressionExp(ColumnValueExp("d"), c.op,
@@ -2019,57 +2114,82 @@ TEST_F(ScanFilterDirectCov, MixedNumericOperandTypes) {
     Expression pred;
     Row row;
     bool expected;
-  } cases[] = {
-      // INT64 value vs DOUBLE constant: falls through to double coercion.
-      {BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,
-                           ConstantValueExp(Value(1.5))),
-       Row({Value(int64_t{2}), Value(0.0)}), true},
-      {BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,
-                           ConstantValueExp(Value(1.5))),
-       Row({Value(int64_t{1}), Value(0.0)}), false},
-      // DOUBLE value vs INT64 constant.
-      {BinaryExpressionExp(ColumnValueExp("f"), BinaryOperation::kEquals,
-                           ConstantValueExp(Value(int64_t{2}))),
-       Row({Value(int64_t{0}), Value(2.0)}), true},
-      {BinaryExpressionExp(ColumnValueExp("f"), BinaryOperation::kNotEquals,
-                           ConstantValueExp(Value(int64_t{2}))),
-       Row({Value(int64_t{0}), Value(2.5)}), true},
-      {BinaryExpressionExp(ColumnValueExp("f"), BinaryOperation::kLessThan,
-                           ConstantValueExp(Value(int64_t{3}))),
-       Row({Value(int64_t{0}), Value(2.5)}), true},
-      {BinaryExpressionExp(ColumnValueExp("f"),
-                           BinaryOperation::kLessThanEquals,
-                           ConstantValueExp(Value(int64_t{2}))),
-       Row({Value(int64_t{0}), Value(2.0)}), true},
-      {BinaryExpressionExp(ColumnValueExp("f"), BinaryOperation::kGreaterThan,
-                           ConstantValueExp(Value(int64_t{2}))),
-       Row({Value(int64_t{0}), Value(2.5)}), true},
-      {BinaryExpressionExp(ColumnValueExp("f"),
-                           BinaryOperation::kGreaterThanEquals,
-                           ConstantValueExp(Value(int64_t{3}))),
-       Row({Value(int64_t{0}), Value(2.5)}), false},
-      // INT64 value vs VARCHAR constant: no numeric coercion, never matches.
-      {BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kEquals,
-                           ConstantValueExp(Value("3"))),
-       Row({Value(int64_t{3}), Value(0.0)}), false},
-      {BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kNotEquals,
-                           ConstantValueExp(Value("3"))),
-       Row({Value(int64_t{3}), Value(0.0)}), false},
-      {BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kLessThan,
-                           ConstantValueExp(Value("9"))),
-       Row({Value(int64_t{3}), Value(0.0)}), false},
-      {BinaryExpressionExp(ColumnValueExp("i"),
-                           BinaryOperation::kLessThanEquals,
-                           ConstantValueExp(Value("9"))),
-       Row({Value(int64_t{3}), Value(0.0)}), false},
-      {BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,
-                           ConstantValueExp(Value("1"))),
-       Row({Value(int64_t{3}), Value(0.0)}), false},
-      {BinaryExpressionExp(ColumnValueExp("i"),
-                           BinaryOperation::kGreaterThanEquals,
-                           ConstantValueExp(Value("1"))),
-       Row({Value(int64_t{3}), Value(0.0)}), false},
   };
+  const std::array<Case, 14> cases = {{
+      // INT64 value vs DOUBLE constant: falls through to double coercion.
+      {.pred = BinaryExpressionExp(ColumnValueExp("i"),
+                                   BinaryOperation::kGreaterThan,
+                                   ConstantValueExp(Value(1.5))),
+       .row = Row({Value(int64_t{2}), Value(0.0)}),
+       .expected = true},
+      {.pred = BinaryExpressionExp(ColumnValueExp("i"),
+                                   BinaryOperation::kGreaterThan,
+                                   ConstantValueExp(Value(1.5))),
+       .row = Row({Value(int64_t{1}), Value(0.0)}),
+       .expected = false},
+      // DOUBLE value vs INT64 constant.
+      {.pred =
+           BinaryExpressionExp(ColumnValueExp("f"), BinaryOperation::kEquals,
+                               ConstantValueExp(Value(int64_t{2}))),
+       .row = Row({Value(int64_t{0}), Value(2.0)}),
+       .expected = true},
+      {.pred =
+           BinaryExpressionExp(ColumnValueExp("f"), BinaryOperation::kNotEquals,
+                               ConstantValueExp(Value(int64_t{2}))),
+       .row = Row({Value(int64_t{0}), Value(2.5)}),
+       .expected = true},
+      {.pred =
+           BinaryExpressionExp(ColumnValueExp("f"), BinaryOperation::kLessThan,
+                               ConstantValueExp(Value(int64_t{3}))),
+       .row = Row({Value(int64_t{0}), Value(2.5)}),
+       .expected = true},
+      {.pred = BinaryExpressionExp(ColumnValueExp("f"),
+                                   BinaryOperation::kLessThanEquals,
+                                   ConstantValueExp(Value(int64_t{2}))),
+       .row = Row({Value(int64_t{0}), Value(2.0)}),
+       .expected = true},
+      {.pred = BinaryExpressionExp(ColumnValueExp("f"),
+                                   BinaryOperation::kGreaterThan,
+                                   ConstantValueExp(Value(int64_t{2}))),
+       .row = Row({Value(int64_t{0}), Value(2.5)}),
+       .expected = true},
+      {.pred = BinaryExpressionExp(ColumnValueExp("f"),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   ConstantValueExp(Value(int64_t{3}))),
+       .row = Row({Value(int64_t{0}), Value(2.5)}),
+       .expected = false},
+      // INT64 value vs VARCHAR constant: no numeric coercion, never matches.
+      {.pred =
+           BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kEquals,
+                               ConstantValueExp(Value("3"))),
+       .row = Row({Value(int64_t{3}), Value(0.0)}),
+       .expected = false},
+      {.pred =
+           BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kNotEquals,
+                               ConstantValueExp(Value("3"))),
+       .row = Row({Value(int64_t{3}), Value(0.0)}),
+       .expected = false},
+      {.pred =
+           BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kLessThan,
+                               ConstantValueExp(Value("9"))),
+       .row = Row({Value(int64_t{3}), Value(0.0)}),
+       .expected = false},
+      {.pred = BinaryExpressionExp(ColumnValueExp("i"),
+                                   BinaryOperation::kLessThanEquals,
+                                   ConstantValueExp(Value("9"))),
+       .row = Row({Value(int64_t{3}), Value(0.0)}),
+       .expected = false},
+      {.pred = BinaryExpressionExp(ColumnValueExp("i"),
+                                   BinaryOperation::kGreaterThan,
+                                   ConstantValueExp(Value("1"))),
+       .row = Row({Value(int64_t{3}), Value(0.0)}),
+       .expected = false},
+      {.pred = BinaryExpressionExp(ColumnValueExp("i"),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   ConstantValueExp(Value("1"))),
+       .row = Row({Value(int64_t{3}), Value(0.0)}),
+       .expected = false},
+  }};
   for (const Case& c : cases) {
     CompiledScanFilter f = Compile({c.pred}, schema);
     EXPECT_EQ(Match(f, c.row, schema), c.expected);

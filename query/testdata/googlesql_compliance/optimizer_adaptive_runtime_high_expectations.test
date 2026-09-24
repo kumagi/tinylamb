@@ -139,18 +139,19 @@ ARRAY<STRUCT<id INT64, peers INT64>>[
 ==
 
 [mode=explain_analyze]
-[plan_contains=CardinalityFeedback node=Filter estimated=4 actual=2]
-[plan_contains=feedback_recorded=true]
-[name=selectivity_miss_records_cardinality_feedback]
+[plan_contains=SelectionStats rows_evaluated=8 rows_selected=2]
+[plan_not_contains=CardinalityFeedback]
+[plan_not_contains=feedback_recorded=true]
+[name=selection_reports_observed_counts_not_feedback]
 SELECT id FROM opt_probe WHERE k = 10 ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{1}, {2}]
 ==
 
 [mode=explain_analyze]
-[plan_contains=LateMaterialize requested_rows=2 decoded_payloads=2]
-[plan_not_contains=decoded_payloads=8]
-[name=late_materialization_profile_counts_only_survivors]
+[plan_contains=SelectionStats rows_evaluated=8 rows_selected=2]
+[plan_not_contains=LateMaterialize]
+[name=selection_profile_counts_only_survivors]
 SELECT id, payload FROM opt_probe WHERE k = 10 ORDER BY id
 --
 ARRAY<STRUCT<id INT64, payload INT64>>[{1, 100}, {2, 200}]
@@ -158,7 +159,7 @@ ARRAY<STRUCT<id INT64, payload INT64>>[{1, 100}, {2, 200}]
 
 [mode=explain_analyze]
 [plan_contains=ZoneMap blocks_skipped]
-[plan_contains=rows_after_zone_map=2]
+[plan_contains=SelectionStats rows_evaluated=8 rows_selected=2]
 [name=zone_map_profile_exposes_skipped_work]
 SELECT id FROM opt_probe WHERE payload >= 700 ORDER BY id
 --
@@ -184,9 +185,10 @@ ARRAY<STRUCT<id INT64>>[]
 ==
 
 [mode=explain_analyze]
-[plan_contains=Reoptimization considered=true retained_original=true]
-[plan_contains=reason=remaining_work_below_threshold]
-[name=adaptive_reoptimization_records_noop_decision]
+[plan_contains=HashJoin]
+[plan_not_contains=Reoptimization]
+[plan_not_contains=reason=remaining_work_below_threshold]
+[name=runtime_join_profile_makes_no_reoptimization_claim]
 SELECT p.id FROM opt_probe p JOIN opt_build b ON p.k = b.k
 WHERE p.payload >= 500 ORDER BY p.id
 --

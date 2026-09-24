@@ -5,9 +5,9 @@
 
 ## 概要
 
-論理式 `kEagerSpool`（子の出力ストリームを先行して一時退避・キャッシュするスプール演算）を、物理プラン `MaterializePlan` として具現化する Rule です。
+論理式 `kEagerSpool`（子の出力ストリームを先行して一時退避・キャッシュするスプール演算）を、物理プラン `MaterializePlan` として変換する Rule です。
 
-`materialize` および `lazy_spool` と同一の実装ラムダ `materialize_child` を共有し、同一の物理ノードを生成します。論理演算子と実装 Rule を個別に分離して登録することにより、将来的な実行ヒントや先行評価（eager）と遅延評価（lazy）の挙動分岐に向けた個別アドレス性を担保しています。
+`materialize` および `lazy_spool` と同一の実装ラムダ `materialize_child` を共有し、同一の物理ノードを生成します。論理演算子と実装 Rule を個別に分離して登録することにより、将来的な実行ヒントや先行評価（eager）と遅延評価（lazy）の挙動分岐に向けた個別アドレス性を保証しています。
 
 ## 変換前後の関係
 
@@ -43,7 +43,7 @@ if (children.size() != 1 || required.require_row_position) {
 
 第一に、行位置要求（`require_row_position`）の拒否です。マテリアライズおよびスプール処理は、入力タプルを一度メモリ上のバッファへ書き出し、走査要求に応じて挿入順に再生します。この過程でストレージ層固有の物理ページ内タプル位置（TID / RID）は完全に失われます。したがって、上位演算子がタプル位置の同一性に依存した更新・削除などの操作を要求している場合、本 Rule を適用すると誤ったタプル操作を引き起こすため、探索段階で明示的に排除します。
 
-第二に、順序性の保存とコスト計上です。エグゼキュータである `MaterializeExecutor` は、タプルを挿入された順序のまま忠実に再生します。そのため、子プランが保証していた順序プロパティ（`ordering`）はマテリアライズ後も破壊されずに維持されます。
+第二に、順序の保存とコスト計上です。`MaterializeExecutor` は、タプルを挿入順に再生します。そのため、子プランが保証する順序プロパティ（`ordering`）はマテリアライズ後も変わりません。
 
 ```cpp
 // materialize / spool: cache the child for multi-pass consumers (CTE
@@ -85,5 +85,5 @@ return std::vector<PlanAlternative>{
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.MaterializeAndSpoolHaveImplementationRules`: `kEagerSpool` を含む 3 種類の演算子がそれぞれ `MaterializePlan` へ具現化されることを検証。
+- `plan/cascades_test.cpp` の `CascadesTest.MaterializeAndSpoolHaveImplementationRules`: `kEagerSpool` を含む 3 種類の演算子がそれぞれ `MaterializePlan` へ変換されることを検証。
 - `plan/cascades_test.cpp` の `CascadesTest.WindowAndSpoolAreUnaryLogicalOperators`: `kEagerSpool` が単項演算子として整合性を保っていることを検証。

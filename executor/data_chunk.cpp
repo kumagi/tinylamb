@@ -94,6 +94,46 @@ void ColumnVector::Append(const Value& value) {
   ++size_;
 }
 
+void ColumnVector::Append(Value&& value) {
+  const bool is_null = value.IsNull();
+  if (!is_null && type_ == ValueType::kNull) {
+    type_ = value.type;
+    unsigned_ = value.IsUnsigned();
+    MaterializeInferredStorage();
+  } else if (!is_null && type_ != value.type) {
+    CHECK_MSG(false, "column vector type mismatch: column=" +
+                         std::string(ValueTypeToString(type_)) + " value=" +
+                         std::string(ValueTypeToString(value.type)));
+  }
+  EnsureNullBit(size_, is_null);
+  if (is_null) {
+    AppendDefault();
+  } else {
+    switch (type_) {
+      case ValueType::kInt64:
+      case ValueType::kDate:
+        integers_.push_back(value.value.int_value);
+        break;
+      case ValueType::kDouble:
+        doubles_.push_back(value.value.double_value);
+        break;
+      case ValueType::kVarChar:
+        if (value.owned_data.empty()) {
+          strings_.emplace_back(value.value.varchar_value);
+        } else {
+          strings_.emplace_back(std::move(value.owned_data));
+        }
+        break;
+      case ValueType::kArray:
+        nested_.emplace_back(std::move(value));
+        break;
+      case ValueType::kNull:
+        break;
+    }
+  }
+  ++size_;
+}
+
 void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
   const bool is_null = source.IsNull(index);
   if (!is_null && type_ == ValueType::kNull) {
@@ -348,12 +388,9 @@ void DataChunk::Append(const Row& row, RowPosition position) {
 
 void DataChunk::Append(Row&& row, RowPosition position) {
   EnsureLayout(row);
-  // Match the lvalue overload: append into columns first so a type mismatch
-  // cannot leave zone maps holding a value of the wrong type.
   for (size_t i = 0; i < columns_.size(); ++i) {
-    Value value = std::move(row[i]);
-    columns_[i].Append(value);
-    zone_maps_[i].Add(value);
+    zone_maps_[i].Add(row[i]);
+    columns_[i].Append(std::move(row[i]));
   }
   positions_.push_back(position);
   ++size_;

@@ -120,8 +120,18 @@ struct Relation {
   }
 
  private:
+  // Apply the per-relation pending charge to the global budget.  AddRow
+  // charges in bounded batches (never concurrently: parallel operators merge
+  // separately built Relations) so the shared atomic stops being the
+  // serialization point of every parallel scan/join row append.
+  void FlushPendingCharge();
+  [[nodiscard]] static size_t ChargeFlushGranularity();
+
   ExecutionRuntime* runtime_{nullptr};
   Status spill_error_{Status::kSuccess};
+  // charged_bytes_ = total estimate owned by this Relation; pending_charge_
+  // is the not-yet-applied suffix of it.
+  size_t pending_charge_{0};
 };
 
 using RelationPtr = std::shared_ptr<Relation>;

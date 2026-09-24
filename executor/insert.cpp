@@ -81,6 +81,74 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
       existing_positions.emplace(std::move(key), it.Position());
     }
   }
+  // FOREIGN KEY child-side state: the parent key multiset is seeded once
+  // from the statement snapshot; rows this statement inserts extend it so
+  // self-referencing keys stay precise.
+  std::vector<ForeignKeyCounts> fk_counts;
+  if (!fk_checks_.empty()) {
+    fk_counts.reserve(fk_checks_.size());
+    for (const ForeignKeyCheck& check : fk_checks_) {
+      StatusOr<ForeignKeyCounts> counts =
+          BuildForeignKeyCounts(*check.parent, *txn_, check.parent_offset);
+      if (!counts.HasValue()) {
+        return FailWith(counts.GetStatus());
+      }
+      fk_counts.push_back(counts.MoveValue());
+    }
+  }
+  const auto check_child_row = [&](const Row& row) -> Status {
+    for (size_t c = 0; c < fk_checks_.size(); ++c) {
+      const ForeignKeyCheck& check = fk_checks_[c];
+      if (check.child_offset >= row.values_.size()) {
+        continue;
+      }
+      if (IsForeignKeyViolation(fk_counts[c], row[check.child_offset])) {
+        return StatusError(
+            StatusCode::kConflicts,
+            "insert on table " + std::string(target_->GetSchema().Name()) +
+                " violates foreign key constraint (references " +
+                std::string(check.parent->GetSchema().Name()) + ")");
+      }
+    }
+    return Status::kSuccess;
+  };
+  // Table handles resolved through the txn cache may be distinct objects
+  // for the same table (case-variant lookups), so self-references compare
+  // by canonical schema name, not pointer.
+  const std::string target_name = std::string(target_->GetSchema().Name());
+  const auto is_self_reference = [&](const Table* other) {
+    return std::string(other->GetSchema().Name()) == target_name;
+  };
+  const auto note_inserted_row = [&](const Row& row) {
+    for (size_t c = 0; c < fk_checks_.size(); ++c) {
+      const ForeignKeyCheck& check = fk_checks_[c];
+      if (!is_self_reference(check.parent) ||
+          check.parent_offset >= row.values_.size()) {
+        continue;
+      }
+      const Value& key = row[check.parent_offset];
+      if (!key.IsNull()) {
+        ++fk_counts[c][ForeignKeyString(key)];
+      }
+    }
+  };
+  // Upsert/replace rewrite an existing row whose old key is unknown here;
+  // re-seed the self-referencing multisets instead of guessing.
+  const auto reseed_self_counts = [&]() -> Status {
+    for (size_t c = 0; c < fk_checks_.size(); ++c) {
+      const ForeignKeyCheck& check = fk_checks_[c];
+      if (!is_self_reference(check.parent)) {
+        continue;
+      }
+      StatusOr<ForeignKeyCounts> counts =
+          BuildForeignKeyCounts(*check.parent, *txn_, check.parent_offset);
+      if (!counts.HasValue()) {
+        return counts.GetStatus();
+      }
+      fk_counts[c] = counts.MoveValue();
+    }
+    return Status::kSuccess;
+  };
   while (src_->Next(&new_row, nullptr)) {
     const bool has_key = enforce_primary_key_ && !new_row.values_.empty();
     const std::string key = has_key ? KeyString(new_row[0]) : std::string();
@@ -104,6 +172,10 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
           } else {
             updated = new_row;
           }
+          if (const Status fk_status = check_child_row(updated);
+              fk_status != Status::kSuccess) {
+            return FailWith(fk_status);
+          }
           if (target_->Update(*txn_, pos, updated).GetStatus() !=
               Status::kSuccess) {
             return FailWith(
@@ -112,6 +184,10 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
                             "insert failed on table " +
                                 std::string(target_->GetSchema().Name())));
           }
+          if (const Status reseed_status = reseed_self_counts();
+              reseed_status != Status::kSuccess) {
+            return FailWith(reseed_status);
+          }
           if (!in_batch) {
             ++insertion_count;
           }
@@ -119,6 +195,10 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
         }
         case InsertExecutionMode::kReplace: {
           const RowPosition& pos = existing_positions[key];
+          if (const Status fk_status = check_child_row(new_row);
+              fk_status != Status::kSuccess) {
+            return FailWith(fk_status);
+          }
           if (target_->Update(*txn_, pos, new_row).GetStatus() !=
               Status::kSuccess) {
             return FailWith(
@@ -126,6 +206,10 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
 
                             "insert failed on table " +
                                 std::string(target_->GetSchema().Name())));
+          }
+          if (const Status reseed_status = reseed_self_counts();
+              reseed_status != Status::kSuccess) {
+            return FailWith(reseed_status);
           }
           if (!in_batch) {
             ++insertion_count;
@@ -139,6 +223,10 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
                           "Failed to insert row with primary key (" + key +
                               ") due to previously existing row"));
       }
+    }
+    if (const Status fk_status = check_child_row(new_row);
+        fk_status != Status::kSuccess) {
+      return FailWith(fk_status);
     }
     StatusOr<RowPosition> inserted = target_->Insert(*txn_, new_row);
     if (inserted.GetStatus() != Status::kSuccess) {
@@ -155,6 +243,7 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
       batch_keys.insert(key);
       existing_positions.insert_or_assign(key, inserted.Value());
     }
+    note_inserted_row(new_row);
     insertion_count++;
   }
   if (src_->GetStatus() != Status::kSuccess) {

@@ -63,7 +63,7 @@ graph TD
 なお、登録コメントは「Subquery only correlates with L」と述べていますが、
 実装が検査しているのは Apply 自身の条件述語(`expression.predicate`)が
 `R` に触れないことだけです。サブクエリ内部の相関が実際に `L` だけに
-閉じているかはここでは検査しません(現状こうなっています)。
+閉じているかは、この Rule では検査しません。
 
 ```cpp
             bool only_touches_jl = true;
@@ -101,9 +101,8 @@ Apply を実行すると、同じ L の行が R とのマッチ数だけ繰り�
   列が存在しない)。
 - 列の判定は `col.schema` が `jr_rels` に含まれるかという修飾名ベースです。
   非修飾名の列は `jr_rels` に見つからないため「R を触らない」と扱われます。
-  `push_selection_through_apply`(左側のみを厳格に要求)とは方向が逆で、
-  こちらは「R を含んでいたら拒否」という否定形のガードです(現状こうなって
-  います)。
+  `push_selection_through_apply`(左側のみを厳格に要求)とは方向が逆です。
+  この Rule は、参照列に R が含まれる場合だけ適用を拒否します。
 - 移動後の Apply は `L ⋈ Sub` の関係集合を持ち、元の結合条件
   (`join_expr.predicate`)は新しい `kJoin` が引き継ぎます。 Apply の適用が
   L 行ごとに 1 回であることを除けば行の組は保たれるため、意味は保存されます。
@@ -149,7 +148,7 @@ Apply を実行すると、同じ L の行が R とのマッチ数だけ繰り�
 - Apply の実行回数が「`L ⋈ R` の行数」から「L の行数」に減ります
   (R が増殖する結合ほど効果が大きい)。
 - Apply が結合の片枝になるため、外側の結合順序の入替(`join_commutativity`
-  など)や、`apply_to_join` による Apply の結合化が後段で効きます。
+  など）や、`apply_to_join` による Apply の結合化を後段で適用できます。
 
 ## 関連 Rule との相互作用
 

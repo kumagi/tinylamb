@@ -5,9 +5,9 @@
 
 ## 概要
 
-`outer_join_associativity` は、左外部結合の連鎖 `(A LEFT JOIN B ON p1) LEFT JOIN C ON p2` を `A LEFT JOIN (B LEFT JOIN C ON p2) ON p1` へと再結合（結合順序の結合則変換）する論理変換Ruleです。
+`outer_join_associativity` は、左外部結合の連鎖 `(A LEFT JOIN B ON p1) LEFT JOIN C ON p2` を `A LEFT JOIN (B LEFT JOIN C ON p2) ON p1` へと再結合（結合順序の結合則変換）する論理変換 Rule です。
 
-外部結合は内部結合と異なり無条件の結合則が成立しません。本Ruleは、外側結合述語 `p2` が結合対象関係 `B` の属性に対して NULL 排除的（null-rejecting）である場合に限り発火し、代数的一致性を保証しながら外部結合ツリーの再順序付け探索を可能にします。
+外部結合は内部結合と異なり無条件の結合則が成立しません。本 Rule は、外側結合述語 `p2` が結合対象関係 `B` の属性に対して NULL 排除的（null-rejecting）である場合に限り発火し、代数的一致性を保証しながら外部結合ツリーの再順序付け探索を可能にします。
 
 ## 変換前後の関係
 
@@ -37,7 +37,7 @@ graph TD
 
 変換ラムダ内において、以下のガード条件をすべて満たす必要があります。
 
-1. **左外部結合の特定**: 外側式が `kOuterJoin` であり、正確に2つの子ノードを持ち、`join_type == 0`（LEFT OUTER JOIN）かつ有効な述語 `p2` を持つこと。
+1. **左外部結合の特定**: 外側式が `kOuterJoin` であり、正確に2 つの子ノードを持ち、`join_type == 0`（LEFT OUTER JOIN）かつ有効な述語 `p2` を持つこと。
 2. **内側左外部結合の特定**: 第0子グループ内に、`kOuterJoin`、2子ノード、`join_type == 0` である式 `(A LOJ B ON p1)` が存在すること。
 3. **参照関係のスコープ限定**: 外側述語 `p2` が触れる全列が、関係 `B` または関係 `C` の属性のみで構成されていること（関係 `A` の列を参照していないこと）。
 
@@ -105,16 +105,16 @@ graph TD
 
 ## 最適化効果
 
-本Ruleの適用により、外部結合を含むクエリにおいて以下の結合順序最適化が可能となります。
+本 Rule の適用により、外部結合を含むクエリにおいて以下の結合順序最適化が可能となります。
 
-- **小規模テーブルの先行結合**: `(A LOJ B) LOJ C` では `C` は必ず最後に評価されますが、`B` と `C` が共に小さく索引化されている場合、先に `B LOJ C` を計算して中間サイズを抑制した上で `A` と結合する方がコスト的に極めて有利となります。
+- **小規模テーブルの先行結合**: `(A LOJ B) LOJ C` では `C` は必ず最後に評価されます。`B` と `C` が共に小さく索引化されている場合は、先に `B LOJ C` を計算して中間結果を小さくすると、後続の `A` との結合コストを減らせます。
 - **探索空間の拡張**: 外部結合の結合則の適用により、結合順序列挙の幅が広がり、最適なハッシュ結合順序が選択可能になります。
 
 ## 関連 Rule との相互作用
 
-- `join_associativity_left` / `join_associativity_right`: 内部結合（`kJoin`）専用の結合則Ruleです。外部結合は本Ruleが専任で担当します。
-- `right_to_left_outer_join`: RIGHT OUTER JOIN を LEFT OUTER JOIN へ標準化するRuleであり、本Ruleの適用対象を増大させます。
-- `push_filter_through_left_join_left_side`: 外部結合の左側入力へフィルタを押し下げるRuleであり、同一の NULL 排除性判定機構を利用します。
+- `join_associativity_left` / `join_associativity_right`: 内部結合（`kJoin`）専用の結合則 Rule です。外部結合は本 Rule が専任で担当します。
+- `right_to_left_outer_join`: RIGHT OUTER JOIN を LEFT OUTER JOIN へ標準化する Rule であり、本 Rule の適用対象を増大させます。
+- `push_filter_through_left_join_left_side`: 外部結合の左側入力へフィルタを押し下げる Rule であり、同一の NULL 排除性判定機構を利用します。
 
 ## 検証テスト
 

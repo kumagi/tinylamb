@@ -150,8 +150,7 @@ TEST(PostgresProtocolTest, EncodesDoubleAndDateValues) {
   // emitted (PostgreSQL behavior); max_digits10 printed 17 digits and turned
   // 0.1 into "0.10000000000000001".
   const std::string short_row = DataRow(Row({Value(0.1), Value(1e20)}));
-  EXPECT_NE(short_row.find("0.1\x00", 0), std::string::npos)
-      << true << short_row;
+  EXPECT_NE(short_row.find("0.1\x00", 0), std::string::npos) << short_row;
   EXPECT_EQ(short_row.find("0.10000000000000001"), std::string::npos);
 
   // float8 OID 701 then date OID 1082 in the row description

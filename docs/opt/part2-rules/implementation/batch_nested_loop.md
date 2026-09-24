@@ -6,7 +6,7 @@
 
 ## 概要
 
-論理式 `kJoin`（内部結合）のうち等値結合キー対を持たない非等値結合を対象とし、結合述語全体を保持する直積形式の `ProductPlan` にブロック化実行標識 `PreferBatchNestedLoop()` を付与して具現化する Rule です。
+論理式 `kJoin`（内部結合）のうち等値結合キー対を持たない非等値結合を対象とし、結合述語全体を保持する直積形式の `ProductPlan` にブロック化実行標識 `PreferBatchNestedLoop()` を付与して変換する Rule です。
 
 タプル単位の入れ子ループ結合（`nested_loop_join`）と同一のプラン形状・同一コスト・同一の推定行数を返却するためコスト比較では同点となりますが、ルール登録順序により通常はタプル版が選ばれる検証済みフォールバックとして位置付けられています。
 
@@ -92,9 +92,9 @@ return {PlanAlternative{.plan = std::move(join),
                         .estimated_rows = estimated_rows}};
 ```
 
-物理エグゼキュータへの具現化時（`ProductPlan::EmitExecutor`）において、`batch_nested_loop_` フラグが有効であれば、タプル単位のループではなく `BatchNestedLoopJoin` エグゼキュータがインスタンス化されます。
+物理エグゼキュータの生成時（`ProductPlan::EmitExecutor`）において、`batch_nested_loop_` フラグが有効であれば、タプル単位のループではなく `BatchNestedLoopJoin` エグゼキュータがインスタンス化されます。
 
-`BatchNestedLoopJoin` は、外側のリレーションをメモリブロックにバッファリングし、内側リレーションをバッチ走査することで内側の再読み込み回数を劇的に低減します。
+`BatchNestedLoopJoin` は、外側のリレーションをメモリブロックにバッファリングし、内側リレーションをバッチ走査することで内側の再読み込み回数を低減します。
 
 ## 最適化効果
 

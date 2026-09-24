@@ -23,9 +23,11 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "gtest/gtest.h"
+#include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -155,6 +157,20 @@ TEST(ExpressionRewriteTest, PatternCaptureConflictRejects) {
   EXPECT_TRUE(pattern.Match(same, &bindings));
   bindings.clear();
   EXPECT_FALSE(pattern.Match(different, &bindings));
+}
+
+TEST(ExpressionRewriteTest, LeafPatternCaptureMaintainsBindings) {
+  using namespace expression_dsl;
+  const Expression first = ColumnValueExp("a");
+  const Expression second = ColumnValueExp("b");
+  ExpressionBindings bindings;
+  const ExpressionPattern pattern = Is(TypeTag::kColumnValue, "column");
+
+  ASSERT_TRUE(pattern.Match(first, &bindings));
+  ASSERT_EQ(bindings.size(), 1U);
+  EXPECT_EQ(bindings.at("column").get(), first.get());
+  EXPECT_FALSE(pattern.Match(second, &bindings));
+  EXPECT_EQ(bindings.at("column").get(), first.get());
 }
 
 TEST(ExpressionRewriteTest, RuleApplyWithoutMatchReturnsNull) {
@@ -536,8 +552,12 @@ TEST(ExpressionRewriteTest, RewriteAppliesSingleRule) {
 }
 
 TEST(ExpressionRewriteTest, NotPushdownRewritesComparisons) {
-  auto rewrite = [](const Expression& expression) {
-    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  const Schema schema(
+      "t", {Column("x", ValueType::kInt64), Column("y", ValueType::kInt64)});
+  auto rewrite = [&schema](const Expression& expression) {
+    ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+    rewriter.set_schema(&schema);
+    return rewriter.Rewrite(expression);
   };
   Expression x = ColumnValueExp("x");
   Expression y = ColumnValueExp("y");
@@ -563,6 +583,32 @@ TEST(ExpressionRewriteTest, NotPushdownRewritesComparisons) {
   rewritten = rewrite(not_and);
   ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
   EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kOr);
+}
+
+TEST(ExpressionRewriteTest,
+     NotPushdownPreservesOrderedComparisonWithoutSchema) {
+  Expression expression = UnaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kLessThan,
+                          ColumnValueExp("y")),
+      UnaryOperation::kNot);
+  Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kNot);
+}
+
+TEST(ExpressionRewriteTest, NotPushdownRefusesTypedDoubleComparison) {
+  const Schema schema(
+      "t", {Column("x", ValueType::kDouble), Column("y", ValueType::kInt64)});
+  Expression expression = UnaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kLessThan,
+                          ColumnValueExp("y")),
+      UnaryOperation::kNot);
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  rewriter.set_schema(&schema);
+  Expression rewritten = rewriter.Rewrite(expression);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kNot);
 }
 
 TEST(ExpressionRewriteTest, NotPushdownRewritesLikeAndNullChecks) {
@@ -622,6 +668,33 @@ TEST(ExpressionRewriteTest, XorBooleanIdentity) {
   Expression xor_columns =
       BinaryExpressionExp(x, BinaryOperation::kXor, ColumnValueExp("y"));
   EXPECT_EQ(rewrite(xor_columns)->Type(), TypeTag::kBinaryExp);
+}
+
+TEST(ExpressionRewriteTest, XorBooleanIdentityRefusesNonBooleanSurvivor) {
+  // `(x + y) XOR FALSE` must not collapse to `x + y`: the survivor is
+  // statically non-boolean, so the raw value (e.g. 7) would replace the
+  // truthy result (1).  Constant operands never reach the guard — a
+  // constant-only XOR is folded first — so use a non-constant arithmetic
+  // expression (StaticallyNonBoolean via its operator) on both sides.
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression x = ColumnValueExp("x");
+  Expression y = ColumnValueExp("y");
+  Expression sum = BinaryExpressionExp(x, BinaryOperation::kAdd, y);
+
+  Expression non_bool_xor_false = BinaryExpressionExp(
+      sum, BinaryOperation::kXor, ConstantValueExp(Value(false)));
+  Expression rewritten = rewrite(non_bool_xor_false);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kXor);
+
+  Expression false_xor_non_bool =
+      BinaryExpressionExp(ConstantValueExp(Value(false)), BinaryOperation::kXor,
+                          BinaryExpressionExp(x, BinaryOperation::kAdd, y));
+  rewritten = rewrite(false_xor_non_bool);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kXor);
 }
 
 TEST(ExpressionRewriteTest, IdempotenceAndAbsorption) {
@@ -967,6 +1040,51 @@ TEST(ExpressionRewriteTest, DoesNotCombineVolatileOrUntypedRepeatedAddends) {
   rewritten = rewriter.Rewrite(string_add);
   ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
   EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAdd);
+}
+
+TEST(ExpressionRewriteTest, ParameterSlotsSurviveDefaultRewrite) {
+  const auto first = std::make_shared<ParameterSlot>(0, Value(int64_t{1}));
+  const auto second = std::make_shared<ParameterSlot>(1, Value(int64_t{2}));
+  const Expression expression = BinaryExpressionExp(
+      BinaryExpressionExp(first, BinaryOperation::kAdd,
+                          ConstantValueExp(Value(int64_t{3}))),
+      BinaryOperation::kAdd,
+      BinaryExpressionExp(second, BinaryOperation::kAdd,
+                          ConstantValueExp(Value(int64_t{4}))));
+
+  const Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  std::vector<Expression> slots;
+  AppendParameterSlots(rewritten, &slots);
+
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  ASSERT_EQ(slots.size(), 2U);
+  EXPECT_EQ(dynamic_cast<const ParameterSlot*>(slots[0].get())->Index(), 0U);
+  EXPECT_EQ(dynamic_cast<const ParameterSlot*>(slots[1].get())->Index(), 1U);
+}
+
+TEST(ExpressionRewriteTest, ParameterSlotsSurviveTypedArithmetic) {
+  const Schema schema("stock", {Column("s", ValueType::kInt64)});
+  const Expression stock = ColumnValueExp(ColumnName("stock", "s"));
+  const auto received = std::make_shared<ParameterSlot>(0, Value(int64_t{91}));
+  const auto shipped = std::make_shared<ParameterSlot>(1, Value(int64_t{10}));
+  const Expression expression = BinaryExpressionExp(
+      BinaryExpressionExp(
+          BinaryExpressionExp(stock, BinaryOperation::kAdd, received),
+          BinaryOperation::kAdd, ConstantValueExp(Value(int64_t{1}))),
+      BinaryOperation::kAdd,
+      BinaryExpressionExp(
+          BinaryExpressionExp(stock, BinaryOperation::kSubtract, shipped),
+          BinaryOperation::kSubtract, ConstantValueExp(Value(int64_t{2}))));
+
+  const Expression rewritten = RewriteTypedArithmetic(expression, schema);
+  std::vector<Expression> slots;
+  AppendParameterSlots(rewritten, &slots);
+
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  ASSERT_EQ(slots.size(), 2U);
+  EXPECT_EQ(dynamic_cast<const ParameterSlot*>(slots[0].get())->Index(), 0U);
+  EXPECT_EQ(dynamic_cast<const ParameterSlot*>(slots[1].get())->Index(), 1U);
 }
 
 TEST(ExpressionRewriteTest, TypedIntegerMultiplyZeroPreservesNullsAndType) {
@@ -1391,7 +1509,7 @@ TEST(ExpressionRewriteTest, AbsorptionPreservesRaisingOperand) {
   Expression rewritten = rewrite(t);
   // Must still contain the raising CAST (not collapsed to a NULL constant).
   EXPECT_NE(rewritten->ToString().find("CAST"), std::string::npos)
-      << true << rewritten->ToString();
+      << rewritten->ToString();
 }
 
 // Oracle-found: `(x IS NULL) IS NOT NULL -> TRUE` (and the IS NULL twin)
@@ -1407,7 +1525,7 @@ TEST(ExpressionRewriteTest, NullCheckOfNullCheckPreservesRaise) {
                          UnaryOperation::kIsNotNull);
   Expression rewritten = rewrite(t);
   EXPECT_NE(rewritten->ToString().find("CAST"), std::string::npos)
-      << true << rewritten->ToString();
+      << rewritten->ToString();
 }
 
 TEST(ExpressionRewriteTest, ComplementaryAbsorptionDisabled) {
@@ -1923,6 +2041,24 @@ TEST(ExpressionRewriteTest, InnerJoinNotNullInference) {
   EXPECT_TRUE(has_eq);
   EXPECT_TRUE(has_x_not_null);
   EXPECT_TRUE(has_y_not_null);
+}
+
+TEST(ExpressionRewriteTest, InnerJoinNotNullInferenceRefusesVolatileOperands) {
+  Expression volatile_left = FunctionCallExp("rand", {});
+  Expression volatile_right = FunctionCallExp("rand", {});
+  Expression expression = BinaryExpressionExp(
+      BinaryExpressionExp(volatile_left, BinaryOperation::kEquals,
+                          volatile_right),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{10}))));
+  Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  for (const Expression& conjunct : SplitConjuncts(rewritten)) {
+    EXPECT_FALSE(conjunct->Type() == TypeTag::kUnaryExp &&
+                 conjunct->AsUnaryExpression().Op() ==
+                     UnaryOperation::kIsNotNull);
+  }
 }
 
 TEST(ExpressionRewriteTest, NotNullInferenceIdempotentAndRootScoped) {
@@ -2590,8 +2726,7 @@ TEST(ExpressionRewriteTest, LikeEqualityRefusesTimestampShapedPattern) {
                           ConstantValueExp(Value("2020-01-01T12:00:00")));
   Expression rewritten_ts = rewrite(like_timestamp);
   ASSERT_EQ(rewritten_ts->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(rewritten_ts->AsBinaryExpression().Op(), BinaryOperation::kLike)
-      << true;
+  EXPECT_EQ(rewritten_ts->AsBinaryExpression().Op(), BinaryOperation::kLike);
 }
 
 TEST(ExpressionRewriteTest, ChildRewritePreservesAggregateMetadata) {
@@ -2607,6 +2742,7 @@ TEST(ExpressionRewriteTest, ChildRewritePreservesAggregateMetadata) {
                                           ConstantValueExp(Value(1))));
   agg->SetInnerLimit(7);
   agg->SetSecondaryArg(ConstantValueExp(Value("delim")));
+  agg->SetIgnoreNulls(true);
   Expression aggregate(agg);
 
   std::vector<Expression> children = ExpressionChildren(aggregate);
@@ -2616,12 +2752,13 @@ TEST(ExpressionRewriteTest, ChildRewritePreservesAggregateMetadata) {
   ASSERT_EQ(rebuilt->Type(), TypeTag::kAggregateExp);
   const auto& rebuilt_agg = rebuilt->AsAggregateExpression();
   EXPECT_EQ(rebuilt_agg.GetType(), AggregationType::kSum);
-  EXPECT_TRUE(rebuilt_agg.WhereFilter()) << true;
+  EXPECT_TRUE(rebuilt_agg.WhereFilter());
   EXPECT_EQ(rebuilt_agg.WhereFilter()->ToString(),
             agg->WhereFilter()->ToString());
   EXPECT_TRUE(rebuilt_agg.InnerLimit().has_value());
   EXPECT_EQ(rebuilt_agg.InnerLimit().value_or(size_t{0}), 7U);
   EXPECT_TRUE(rebuilt_agg.SecondaryArg());
+  EXPECT_TRUE(rebuilt_agg.IgnoreNulls());
 }
 
 TEST(ExpressionRewriteTest, CanonicalizeBooleanKeepsBooleanExpression) {

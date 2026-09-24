@@ -29,8 +29,10 @@ Relation::Relation(Relation&& other) noexcept
       peak_intermediate_rows(other.peak_intermediate_rows),
       spilled_rows_(other.spilled_rows_),
       runtime_(other.runtime_),
-      spill_error_(std::move(other.spill_error_)) {
+      spill_error_(std::move(other.spill_error_)),
+      pending_charge_(other.pending_charge_) {
   other.charged_bytes_ = 0;
+  other.pending_charge_ = 0;
   other.hash_joins = 0;
   other.hybrid_hash_joins = 0;
   other.in_memory_hash_joins = 0;
@@ -49,7 +51,9 @@ Relation& Relation::operator=(Relation&& other) noexcept {
     spill_tail_ = std::move(other.spill_tail_);
     using_columns = std::move(other.using_columns);
     charged_bytes_ = other.charged_bytes_;
+    pending_charge_ = other.pending_charge_;
     other.charged_bytes_ = 0;
+    other.pending_charge_ = 0;
     hash_joins = other.hash_joins;
     hybrid_hash_joins = other.hybrid_hash_joins;
     in_memory_hash_joins = other.in_memory_hash_joins;
@@ -72,7 +76,30 @@ Relation& Relation::operator=(Relation&& other) noexcept {
 
 Relation::~Relation() { ReleaseCharge(); }
 
+size_t Relation::ChargeFlushGranularity() {
+  // Scale the batching window to the budget so tiny test budgets keep
+  // near-exact accounting (overshoot <= 1/64 of the limit, min 4 KiB) while
+  // production-size budgets amortize the shared atomic over megabytes.
+  const size_t limit = QueryMemoryBudget::Global().Limit();
+  if (QueryMemoryBudget::Global().Unlimited()) {
+    return size_t{4} << 20;
+  }
+  return std::clamp(limit / 64, size_t{4096}, size_t{262144});
+}
+
+void Relation::FlushPendingCharge() {
+  if (pending_charge_ != 0) {
+    QueryMemoryBudget::Global().ReserveForced(pending_charge_);
+    pending_charge_ = 0;
+  }
+}
+
 void Relation::ReleaseCharge() {
+  // Charges never applied to the global counter simply evaporate.
+  if (pending_charge_ != 0) {
+    charged_bytes_ -= pending_charge_;
+    pending_charge_ = 0;
+  }
   if (charged_bytes_ != 0) {
     QueryMemoryBudget::Global().Release(charged_bytes_);
     charged_bytes_ = 0;
@@ -106,7 +133,11 @@ void Relation::EnsureSpill() {
 
 void Relation::AddRow(Row row) {
   const size_t bytes = EstimateRowBytes(row);
-  if (spill_tail_ || !QueryMemoryBudget::Global().CanReserve(bytes)) {
+  // The pending (not yet applied) charge joins the soft-limit check so spill
+  // decisions see the same total usage the immediate-charge version tracked.
+  if (spill_tail_ ||
+      !QueryMemoryBudget::Global().CanReserve(bytes + pending_charge_)) {
+    FlushPendingCharge();
     if (!spill_tail_) {
       EnsureSpill();
     }
@@ -117,8 +148,9 @@ void Relation::AddRow(Row row) {
                                    "relation spill failed; keeping rows in "
                                    "memory");
       }
-      QueryMemoryBudget::Global().ReserveForced(bytes);
       charged_bytes_ += bytes;
+      pending_charge_ += bytes;
+      FlushPendingCharge();
       rows.push_back(std::move(row));
       peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
       return;
@@ -139,8 +171,11 @@ void Relation::AddRow(Row row) {
     ++spilled_rows_;
     return;
   }
-  QueryMemoryBudget::Global().ReserveForced(bytes);
   charged_bytes_ += bytes;
+  pending_charge_ += bytes;
+  if (pending_charge_ >= ChargeFlushGranularity()) {
+    FlushPendingCharge();
+  }
   rows.push_back(std::move(row));
   peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
 }
@@ -170,6 +205,7 @@ void NoteRelationSpill(ExecutionRuntime* runtime) {
 StatusOr<Relation> MaterializeRelation(const Relation& source) {
   Relation out(source.runtime());
   out.schema = source.schema;
+  out.using_columns = source.using_columns;
   Status copied = source.ForEachRow([&](const Row& row) { out.AddRow(row); });
   if (copied == Status::kSuccess) {
     // A source that already degraded (dropped/kept-in-memory rows on spill

@@ -17,6 +17,14 @@ class IncrementalSortPlan final : public PlanBase {
                       std::vector<SortKey> suffix_keys);
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override {
+    return child_->ContainsParameterSlots();
+  }
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override {
+    return child_->InstallParameterSlots(parameters, cursor, slots);
+  }
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();
   }

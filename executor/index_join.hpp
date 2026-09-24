@@ -35,7 +35,8 @@ class Transaction;
 class IndexJoin : public ExecutorBase {
  public:
   IndexJoin(Transaction& txn, Executor left, std::vector<slot_t> left_cols,
-            const Table& tbl, const Index& idx, std::vector<slot_t> right_cols);
+            const Table& tbl, const Index& idx, std::vector<slot_t> right_cols,
+            TransactionManager::IndexReadGuard index_read_guard = {});
   IndexJoin(const IndexJoin&) = delete;
   IndexJoin(IndexJoin&&) = delete;
   IndexJoin& operator=(const IndexJoin&) = delete;
@@ -54,6 +55,7 @@ class IndexJoin : public ExecutorBase {
   const Table& right_;
   const Index& right_idx_;
   Row hold_left_;
+  TransactionManager::IndexReadGuard index_read_guard_;
   std::unique_ptr<IndexScanIterator> right_it_;
   std::vector<slot_t> right_cols_;
 };

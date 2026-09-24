@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "executor/executor_base.hpp"
+#include "executor/foreign_key.hpp"
 
 namespace tinylamb {
 class Table;
@@ -55,14 +56,16 @@ class Insert : public ExecutorBase {
 
   Insert(Transaction& txn, Table* target, Executor src,
          InsertExecutionMode mode, bool enforce_primary_key,
-         std::vector<size_t> upsert_offsets, int64_t assert_rows_modified)
+         std::vector<size_t> upsert_offsets, int64_t assert_rows_modified,
+         std::vector<ForeignKeyCheck> fk_checks = {})
       : txn_(&txn),
         target_(target),
         src_(std::move(src)),
         mode_(mode),
         enforce_primary_key_(enforce_primary_key),
         upsert_offsets_(std::move(upsert_offsets)),
-        assert_rows_modified_(assert_rows_modified) {}
+        assert_rows_modified_(assert_rows_modified),
+        fk_checks_(std::move(fk_checks)) {}
   ~Insert() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
@@ -77,6 +80,7 @@ class Insert : public ExecutorBase {
   // overwrite only those columns of the conflicting row.
   std::vector<size_t> upsert_offsets_;
   int64_t assert_rows_modified_{-1};
+  std::vector<ForeignKeyCheck> fk_checks_;
   bool finished_{false};
 };
 

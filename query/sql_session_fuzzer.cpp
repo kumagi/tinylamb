@@ -41,7 +41,17 @@ constexpr int64_t kStrB = 1;  // 'bb'
 // Schema-driven predicate with mirror evaluation.
 // ---------------------------------------------------------------------------
 
-enum class ColType { kInt, kStr };
+enum class ColType { kInt, kStr, kDbl };
+
+// DOUBLE columns keep values in a fixed half-step domain: the mirror stores
+// repr (value * 2) as int64 and renders `repr * 0.5` so every literal is
+// exact and always carries a decimal point (parses as DOUBLE, not INT64).
+std::string DblLit(int64_t repr) {
+  if (repr % 2 == 0) {
+    return std::to_string(repr / 2) + ".0";
+  }
+  return (repr < 0 ? "-" : "") + std::to_string(std::abs(repr) / 2) + ".5";
+}
 
 struct MirrorColumn {
   std::string name;
@@ -53,6 +63,13 @@ struct MirrorTable {
   std::vector<MirrorColumn> columns;  // slot 0 is always "u" (INT64)
   std::vector<Row> rows;              // ordered by ascending u
   int64_t next_u{0};
+  // Key slot lists of the live UNIQUE indexes on this table.  DML that
+  // would put two rows on the same non-NULL key image must be rejected by
+  // the engine (NULL keys are exempt: SQL says NULL != NULL).
+  std::vector<std::vector<int>> unique_keys;
+  // Key slot lists of the live plain (non-unique) indexes, for the
+  // index-independence read probes.
+  std::vector<std::vector<int>> plain_keys;
 
   [[nodiscard]] static size_t Slot(size_t col_index) {
     return col_index;
@@ -86,7 +103,10 @@ struct SPred {
     kIntIsNull,   // int col IS [NOT] NULL
     kStrCmp,      // str col = / != const
     kStrIsNull,   // str col IS [NOT] NULL
+    kDblCmp,      // dbl col op (const | other dbl col)
     kInSubquery,  // int col [NOT] IN (SELECT int_col FROM tbl)
+    kQuantSub,    // int col op ANY|ALL (SELECT int_col FROM tbl)
+    kExistsSub,   // [NOT] EXISTS (SELECT 1 FROM tbl s WHERE s.c = outer.c)
     kNot,
     kBin,
   };
@@ -103,6 +123,12 @@ struct SPred {
   // semi/anti join sees too).
   std::vector<Value> sub_vals;
   std::string sub_render;  // e.g. "tbl1.c2" parts pre-rendered below
+  // kQuantSub: true for ALL, false for ANY (negated is the NOT wrapper).
+  bool sub_is_all{false};
+  // kExistsSub: inner relation and its qualified join column.
+  std::string sub_table, sub_qual;
+  // kQuantSub: kIntCmp-style operator against every snapshot value.
+  // kExistsSub: the OUTER row's own column index (correlated equality).
   // kInSubquery: qualified LHS ("tbl0.u").  An unqualified name that also
   // exists in the subquery's table makes the engine treat the predicate as
   // correlated and reject it (next-actions D-8); qualifying keeps it
@@ -165,6 +191,10 @@ struct SPred {
                                              : Value(std::string("bb"));
         return cmp(row[static_cast<size_t>(col)], op, rhs);
       }
+      case Kind::kDblCmp:
+        return cmp(row[static_cast<size_t>(col)], op,
+                   rhs_is_col ? row[static_cast<size_t>(rhs_col)]
+                              : Value(static_cast<double>(const_val) * 0.5));
       case Kind::kStrIsNull: {
         const bool is_null = row[static_cast<size_t>(col)].IsNull();
         return (negated ? !is_null : is_null) ? 'T' : 'F';
@@ -192,6 +222,40 @@ struct SPred {
         const char res = matched ? 'T' : (saw_null ? 'N' : 'F');
         return negated ? Not(res) : res;
       }
+      case Kind::kQuantSub: {
+        // op ANY folds to an OR-chain, op ALL to an AND-chain over the
+        // snapshot (empty: ANY=FALSE, ALL=TRUE), matching both the
+        // prepare-time fold and TryEvaluateQuantifiedComparison.
+        if (std::getenv("TINYLAMB_SESSION_PRED_DEBUG") != nullptr) {
+          std::cerr << "[pred-debug] quant col=" << col << " op=" << op
+                    << (sub_is_all ? " ALL" : " ANY") << " neg=" << negated
+                    << " subn=" << sub_vals.size() << " render=" << Render()
+                    << "\n";
+        }
+        auto cmp2 = [&cmp](const Value& l, const std::string& o,
+                           const Value& r) { return cmp(l, o, r); };
+        const Value& v = row[static_cast<size_t>(col)];
+        char acc_all = 'T', acc_any = 'F';
+        for (const Value& sv : sub_vals) {
+          const char c = cmp2(v, op, sv);
+          acc_all = And(acc_all, c);
+          acc_any = Or(acc_any, c);
+        }
+        const char res = sub_is_all ? acc_all : acc_any;
+        return negated ? Not(res) : res;
+      }
+      case Kind::kExistsSub: {
+        const Value& v = row[static_cast<size_t>(col)];
+        bool found = false;
+        if (!v.IsNull()) {
+          for (const Value& sv : sub_vals) {
+            if (!sv.IsNull() && v == sv) {
+              found = true;
+            }
+          }
+        }
+        return (found != negated) ? 'T' : 'F';
+      }
       case Kind::kNot:
         return Not(left->Eval(row));
       case Kind::kBin:
@@ -214,9 +278,20 @@ struct SPred {
         return "(" + ColName(col) + " IS " + (negated ? "NOT " : "") + "NULL)";
       case Kind::kStrCmp:
         return "(" + ColName(col) + " " + op + " " + sql_const() + ")";
+      case Kind::kDblCmp: {
+        const std::string rhs =
+            rhs_is_col ? ColName(rhs_col) : DblLit(const_val);
+        return "(" + ColName(col) + " " + op + " " + rhs + ")";
+      }
       case Kind::kInSubquery:
         return "(" + lhs_qual + (negated ? " NOT" : "") + " IN " + sub_render +
                ")";
+      case Kind::kQuantSub:
+        return std::string(negated ? "(NOT " : "(") + lhs_qual + " " + op +
+               " " + (sub_is_all ? "ALL" : "ANY") + " " + sub_render + ")";
+      case Kind::kExistsSub:
+        return std::string(negated ? "(NOT " : "(") + "EXISTS (SELECT 1 FROM " +
+               sub_table + " WHERE " + sub_qual + " = " + lhs_qual + "))";
       case Kind::kNot:
         return "(NOT " + left->Render() + ")";
       case Kind::kBin:
@@ -239,6 +314,8 @@ const std::vector<MirrorTable> kNoTables;
 // kAnywhere additionally permits OR-nested positions, which only the
 // relational SELECT path (e.g. INSERT ... SELECT) evaluates correctly.
 enum class SubqMode { kNone, kConjunct, kAnywhere };
+
+int PickTypedCol(Gen& g, const MirrorTable& t, ColType type);
 
 SPredPtr GenPred(Gen& g, const MirrorTable& t,
                  const std::vector<MirrorTable>& all, int depth,
@@ -275,7 +352,6 @@ SPredPtr GenPred(Gen& g, const MirrorTable& t,
         if (!int_cols.empty()) {
           const int sub_col = int_cols[static_cast<size_t>(
               g.Pick(0, static_cast<int>(int_cols.size()) - 1))];
-          p->kind = SPred::Kind::kInSubquery;
           p->col = col;
           p->lhs_qual = t.name + "." + ColName(col);
           p->negated = g.Chance(35);
@@ -285,6 +361,35 @@ SPredPtr GenPred(Gen& g, const MirrorTable& t,
           }
           p->sub_render =
               "(SELECT " + ColName(sub_col) + " FROM " + sub_t.name + ")";
+          const int flavor = g.Pick(0, 4);
+          if (flavor == 0 || flavor == 1) {
+            p->kind = SPred::Kind::kInSubquery;
+            return p;
+          }
+          if (flavor == 2 || flavor == 3) {
+            // `x op ANY/ALL (SELECT ...)`: the prepare-time fold rewrites it
+            // to the AND/OR chain the mirror evaluates below.
+            static constexpr std::array<const char*, 4> kQOps = {"=", "!=", "<",
+                                                                 ">"};
+            p->kind = SPred::Kind::kQuantSub;
+            p->op = kQOps[static_cast<size_t>(g.Pick(0, 3))];
+            p->sub_is_all = g.Chance(50);
+            return p;
+          }
+          // Correlated EXISTS (per-row engine route; the mirror scans the
+          // snapshot for the join-key equality).  A SELF-table subquery is
+          // forbidden: the inner FROM shadows the outer qualifier, so
+          // `EXISTS (SELECT 1 FROM t WHERE t.a = t.b)` reads fully
+          // uncorrelated (a constant membership test) even though the
+          // generator reads its own column as the outer key.  Fold back to
+          // the IN flavor instead (Bug 58: mirror-vs-engine false positive).
+          if (sub_t.name == t.name) {
+            p->kind = SPred::Kind::kInSubquery;
+            return p;
+          }
+          p->kind = SPred::Kind::kExistsSub;
+          p->sub_table = sub_t.name;
+          p->sub_qual = sub_t.name + "." + ColName(sub_col);
           return p;
         }
       }
@@ -321,6 +426,27 @@ SPredPtr GenPred(Gen& g, const MirrorTable& t,
           p->negated = g.Chance(50);
           return p;
       }
+    }
+    if (t.columns[static_cast<size_t>(col)].type == ColType::kDbl) {
+      if (g.Chance(70)) {
+        static constexpr std::array<const char*, 6> kOps = {"=",  "!=", "<",
+                                                            "<=", ">",  ">="};
+        p->kind = SPred::Kind::kDblCmp;
+        p->col = col;
+        p->op = kOps[static_cast<size_t>(g.Pick(0, 5))];
+        const int other = PickTypedCol(g, t, ColType::kDbl);
+        if (other >= 0 && g.Chance(40)) {
+          p->rhs_is_col = true;
+          p->rhs_col = other;
+        } else {
+          p->const_val = g.Pick(-6, 6);
+        }
+      } else {
+        p->kind = SPred::Kind::kIntIsNull;
+        p->col = col;
+        p->negated = g.Chance(50);
+      }
+      return p;
     }
     if (g.Chance(60)) {
       p->kind = SPred::Kind::kStrCmp;
@@ -367,6 +493,7 @@ struct SExpr {
   enum class Kind { kConst, kCol, kArith, kCoalesce, kConcat, kCase };
   Kind kind{Kind::kConst};
   bool is_str{false};
+  bool is_dbl{false};
   bool const_null{false};
   int64_t const_val{0};  // INT literal, or kStrA/kStrB for strings
   int col{-1};
@@ -379,17 +506,18 @@ struct SExpr {
     switch (kind) {
       case Kind::kConst:
         if (const_null) {
-          return Value();
+          return {};
         }
-        return is_str ? Value(std::string(const_val == kStrA ? "a" : "bb"))
-                      : Value(const_val);
+        return is_str   ? Value(std::string(const_val == kStrA ? "a" : "bb"))
+               : is_dbl ? Value(static_cast<double>(const_val) * 0.5)
+                        : Value(const_val);
       case Kind::kCol:
         return row[static_cast<size_t>(col)];
       case Kind::kArith: {
         const Value l = lhs->Eval(row);
         const Value r = rhs->Eval(row);
         if (l.IsNull() || r.IsNull()) {
-          return Value();
+          return {};
         }
         const int64_t lv = l.value.int_value;
         const int64_t rv = r.value.int_value;
@@ -408,14 +536,14 @@ struct SExpr {
       case Kind::kConcat: {
         const Value l = lhs->Eval(row);
         if (l.IsNull()) {
-          return Value();
+          return {};
         }
         return Value(std::string(l.value.varchar_value) + "!");
       }
       case Kind::kCase:
         return (cond->Eval(row) == 'T' ? then_e : else_e)->Eval(row);
     }
-    return Value();
+    return {};
   }
 
   [[nodiscard]] std::string Render() const {
@@ -424,8 +552,9 @@ struct SExpr {
         if (const_null) {
           return "NULL";
         }
-        return is_str ? (const_val == kStrA ? "'a'" : "'bb'")
-                      : std::to_string(const_val);
+        return is_str   ? (const_val == kStrA ? "'a'" : "'bb'")
+               : is_dbl ? DblLit(const_val)
+                        : std::to_string(const_val);
       case Kind::kCol:
         return ColName(col);
       case Kind::kArith:
@@ -462,12 +591,15 @@ SExprPtr GenLeafExpr(Gen& g, const MirrorTable& t, ColType type,
                      bool allow_null = true) {
   auto e = std::make_unique<SExpr>();
   e->is_str = type == ColType::kStr;
+  e->is_dbl = type == ColType::kDbl;
   if (g.Chance(40)) {
     e->kind = SExpr::Kind::kConst;
     if (allow_null && g.Chance(15)) {
       e->const_null = true;
     } else {
-      e->const_val = type == ColType::kInt ? g.Pick(-3, 3) : g.Pick(0, 1);
+      e->const_val = type == ColType::kInt   ? g.Pick(-3, 3)
+                     : type == ColType::kDbl ? g.Pick(-6, 6)
+                                             : g.Pick(0, 1);
     }
     return e;
   }
@@ -487,6 +619,25 @@ SExprPtr GenSetExpr(Gen& g, const MirrorTable& t, ColType type, int depth) {
   }
   auto e = std::make_unique<SExpr>();
   e->is_str = type == ColType::kStr;
+  e->is_dbl = type == ColType::kDbl;
+  if (type == ColType::kDbl) {
+    // No kArith: the mirror's arithmetic is INT64-only.  Leaves, COALESCE
+    // and CASE still exercise the DOUBLE write path.
+    if (roll < 80) {
+      return GenLeafExpr(g, t, type);
+    }
+    if (roll < 90) {
+      e->kind = SExpr::Kind::kCoalesce;
+      e->lhs = GenLeafExpr(g, t, ColType::kDbl);
+      e->rhs = GenLeafExpr(g, t, ColType::kDbl);
+      return e;
+    }
+    e->kind = SExpr::Kind::kCase;
+    e->cond = GenPred(g, t, kNoTables, 1, SubqMode::kNone);
+    e->then_e = GenLeafExpr(g, t, type);
+    e->else_e = GenLeafExpr(g, t, type);
+    return e;
+  }
   if (type == ColType::kInt) {
     if (roll < 80) {
       // The frontend rejects arithmetic on a literal NULL operand, so
@@ -552,6 +703,26 @@ std::pair<int64_t, std::string> GenStrValue(Gen& g) {
   return {kStrB, "'bb'"};
 }
 
+std::pair<int64_t, std::string> GenDblValue(Gen& g) {
+  if (g.Chance(20)) {
+    return {kNullRepr, "NULL"};
+  }
+  const int64_t repr = g.Pick(-6, 6);
+  return {repr, DblLit(repr)};
+}
+
+// {repr, literal} for any column type.
+std::pair<int64_t, std::string> GenValue(Gen& g, ColType type) {
+  switch (type) {
+    case ColType::kInt:
+      return GenIntValue(g);
+    case ColType::kDbl:
+      return GenDblValue(g);
+    default:
+      return GenStrValue(g);
+  }
+}
+
 // Builds the mirror Row slot vector: u plus per-column values.
 Row BuildRow(int64_t u,
              const std::vector<std::pair<int64_t, ColType>>& values) {
@@ -562,11 +733,59 @@ Row BuildRow(int64_t u,
       cells.emplace_back();
     } else if (type == ColType::kInt) {
       cells.emplace_back(repr);
+    } else if (type == ColType::kDbl) {
+      cells.emplace_back(static_cast<double>(repr) * 0.5);
     } else {
       cells.emplace_back(repr == kStrA ? std::string("a") : std::string("bb"));
     }
   }
   return Row(cells);
+}
+
+bool KeyHasNull(const Row& row, const std::vector<int>& key) {
+  return std::ranges::any_of(key, [&](const int slot) {
+    return row[static_cast<size_t>(slot)] == Value();
+  });
+}
+
+bool SameKey(const Row& a, const Row& b, const std::vector<int>& key) {
+  return std::ranges::all_of(key, [&](const int slot) {
+    return a[static_cast<size_t>(slot)] == b[static_cast<size_t>(slot)];
+  });
+}
+
+// `rows` contains `candidate` at index `skip` (exempt: its own old entry);
+// true if any other row owns the same non-NULL key image.
+bool KeyCollides(const std::vector<Row>& rows, const Row& candidate,
+                 const std::vector<int>& key, size_t skip) {
+  if (KeyHasNull(candidate, key)) {
+    return false;
+  }
+  for (size_t i = 0; i < rows.size(); ++i) {
+    if (i == skip || KeyHasNull(rows[i], key)) {
+      continue;
+    }
+    if (SameKey(rows[i], candidate, key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// True if two distinct rows share the same non-NULL key image.
+bool HasDuplicateKey(const std::vector<Row>& rows,
+                     const std::vector<int>& key) {
+  for (size_t i = 0; i < rows.size(); ++i) {
+    if (KeyHasNull(rows[i], key)) {
+      continue;
+    }
+    for (size_t j = i + 1; j < rows.size(); ++j) {
+      if (!KeyHasNull(rows[j], key) && SameKey(rows[i], rows[j], key)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 std::vector<std::string> SortedDump(const std::vector<Row>& rows) {
@@ -582,6 +801,19 @@ std::vector<std::string> SortedDump(const std::vector<Row>& rows) {
 // ---------------------------------------------------------------------------
 // Engine helpers.
 // ---------------------------------------------------------------------------
+
+// Route differential: every third recorded statement runs through the
+// relational interpreter instead of the optimizer, so the row mirror
+// doubles as a plan-vs-interpreter oracle. The decision is keyed on the
+// trace length (t.steps.size()), which replay rebuilds identically, so
+// a flip trace stays route-aligned across .test replay. Gated by env so
+// the long sweeps opt in explicitly.
+bool RouteFlipFor(size_t ordinal) {
+  static const bool enabled =
+      std::getenv("TINYLAMB_SESSION_ROUTE_FLIP") != nullptr &&
+      std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") == nullptr;
+  return enabled && (ordinal % 3U) == 2U;
+}
 
 std::optional<std::vector<Row>> RunSelect(Database& db, TransactionContext& ctx,
                                           const std::string& sql,
@@ -606,27 +838,38 @@ std::optional<std::vector<Row>> RunSelect(Database& db, TransactionContext& ctx,
   return rows;
 }
 
-bool RunSql(Database& db, TransactionContext& ctx, const std::string& sql) {
+bool RunSql(Database& db, TransactionContext& ctx, const std::string& sql,
+            bool force_relational = false) {
   SqlEngine engine(db);
+  engine.SetForceRelationalFallback(force_relational);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   // QueryResults are lazy: drain or the mutation never happens.
   if (!result.HasValue()) {
     return false;
   }
   static_cast<void>(result.Value().Drain());
+  return result.Value().GetStatus() == Status::kSuccess;
+}
+
+// Same, but reports why the statement failed (prepare status vs the drain
+// stream status) so an unexplained rejection names itself instead of
+// surfacing as an empty LastError.
+bool RunSqlWhy(Database& db, TransactionContext& ctx, const std::string& sql,
+               bool force_relational, std::string* why) {
+  SqlEngine engine(db);
+  engine.SetForceRelationalFallback(force_relational);
+  StatusOr<QueryResult> result = engine.Execute(ctx, sql);
+  if (!result.HasValue()) {
+    *why = "prepare: " + tinylamb::ToString(result.GetStatus()) + " " +
+           engine.LastError();
+    return false;
+  }
+  static_cast<void>(result.Value().Drain());
   if (result.Value().GetStatus() != Status::kSuccess) {
+    *why = "stream: " + tinylamb::ToString(result.Value().GetStatus());
     return false;
   }
   return true;
-}
-
-std::string DumpLines(const std::vector<std::string>& rows) {
-  std::string out;
-  out.reserve(64);
-  for (const std::string& r : rows) {
-    out += "    " + r + "\n";
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -635,8 +878,8 @@ std::string DumpLines(const std::vector<std::string>& rows) {
 
 // Executes one DDL pseudo-statement through the C++ index API.
 bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
-              std::string* error) {
-  // "CREATE INDEX <name> ON <table> KEY(i,j) INCLUDE(k,l)"
+              std::string* error, bool* rejected_as_duplicate = nullptr) {
+  // "CREATE [UNIQUE] INDEX <name> ON <table> KEY(i,j) INCLUDE(k,l)"
   auto parse_slots = [](const std::string& text) {
     std::vector<slot_t> slots;
     size_t pos = 0;
@@ -652,15 +895,17 @@ bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
     }
     return slots;
   };
-  const auto name_pos = ddl.find("CREATE INDEX ");
+  const bool is_unique = ddl.starts_with("CREATE UNIQUE INDEX ");
+  const std::string prefix =
+      is_unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ";
+  const auto name_pos = ddl.find(prefix);
   if (name_pos == std::string::npos) {
     *error = "unknown ddl: " + ddl;
     return false;
   }
   const size_t name_end = ddl.find(" ON ", name_pos);
   const std::string name =
-      ddl.substr(name_pos + strlen("CREATE INDEX "),
-                 name_end - name_pos - strlen("CREATE INDEX "));
+      ddl.substr(name_pos + prefix.size(), name_end - name_pos - prefix.size());
   const size_t key_pos = ddl.find(" KEY(", name_end);
   const size_t key_end = ddl.find(')', key_pos);
   const size_t inc_pos = ddl.find(" INCLUDE(", key_end);
@@ -677,9 +922,14 @@ bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
     include = parse_slots(ddl.substr(inc_pos + strlen(" INCLUDE("),
                                      inc_end - inc_pos - strlen(" INCLUDE(")));
   }
-  const IndexSchema schema(name, key, include, IndexMode::kNonUnique);
+  const IndexSchema schema(
+      name, key, include,
+      is_unique ? IndexMode::kUnique : IndexMode::kNonUnique);
   const Status status = db.CreateIndex(ctx, table, schema);
   if (status != Status::kSuccess) {
+    if (rejected_as_duplicate != nullptr) {
+      *rejected_as_duplicate = status == Status::kDuplicates;
+    }
     *error = "CreateIndex failed: " + ddl;
     return false;
   }
@@ -745,6 +995,16 @@ std::string DebugDumpTableChain(TransactionContext& ctx,
   return report;
 }
 
+// Renders `rows` with a 4-space indent for mismatch reports.
+std::string DumpLines(const std::vector<std::string>& rows) {
+  std::string out;
+  out.reserve(64);
+  for (const std::string& r : rows) {
+    out += "    " + r + "\n";
+  }
+  return out;
+}
+
 std::string CheckTable(Database& db, TransactionContext& ctx,
                        const MirrorTable& t, std::string* error) {
   const std::string sql = "SELECT * FROM " + t.name + " ORDER BY u;";
@@ -780,6 +1040,108 @@ std::string CheckTable(Database& db, TransactionContext& ctx,
       break;
     }
   }
+  return report;
+}
+
+// Index-independence probe: filter the first index key column by an
+// equality or range predicate, compare the engine's answer (which may
+// legitimately take the index, covering or skip-scan path) with the
+// mirror's own 3-valued filter.  Returns "" on agreement.
+std::string CheckIndexProbe(Database& db, TransactionContext& ctx, Gen& g,
+                            const MirrorTable& t, const std::vector<int>& key,
+                            std::string* sql,
+                            std::vector<std::string>* expected,
+                            std::string* error) {
+  const int slot = key[0];
+  const MirrorColumn& col = t.columns[static_cast<size_t>(slot)];
+  const bool equality = g.Chance(60);
+  // Half the probes key off an existing row (guaranteed hits), the rest
+  // use arbitrary constants (mostly misses).
+  Value probe;
+  if (!t.rows.empty() && g.Chance(50)) {
+    probe = t.rows[static_cast<size_t>(g.Pick(
+        0, static_cast<int>(t.rows.size()) - 1))][static_cast<size_t>(slot)];
+  } else if (col.type == ColType::kInt) {
+    if (g.Chance(15)) {
+      probe = Value();
+    } else {
+      probe = Value(static_cast<int64_t>(g.Pick(-4, 4)));
+    }
+  } else if (col.type == ColType::kStr) {
+    if (g.Chance(15)) {
+      probe = Value();
+    } else {
+      probe = Value(std::string(g.Chance(55) ? "a" : "bb"));
+    }
+  } else {
+    if (g.Chance(15)) {
+      probe = Value();
+    } else {
+      probe = Value(static_cast<double>(g.Pick(-6, 6)) * 0.5);
+    }
+  }
+  const auto lit = [](const Value& v) {
+    if (v.IsNull()) {
+      return std::string("NULL");
+    }
+    if (v.type == ValueType::kVarChar) {
+      return std::string("'") + std::string(v.value.varchar_value) + "'";
+    }
+    if (v.type == ValueType::kDouble) {
+      return FormatDoubleShortest(v.value.double_value);
+    }
+    return std::to_string(v.value.int_value);
+  };
+  const char* op = "=";
+  if (!equality) {
+    static constexpr std::array<const char*, 4> kOps = {"<", "<=", ">", ">="};
+    op = kOps[static_cast<size_t>(g.Pick(0, 3))];
+  }
+  *sql = "SELECT * FROM " + t.name + " WHERE " + ColName(slot) + " " + op +
+         " " + lit(probe) + ";";
+  auto got = RunSelect(db, ctx, *sql, error);
+  if (!got.has_value()) {
+    return "index probe engine error: " + *sql + " :: " + *error + "\n";
+  }
+  std::vector<Row> want;
+  for (const Row& r : t.rows) {
+    const Value& v = r[static_cast<size_t>(slot)];
+    if (v.IsNull() || probe.IsNull()) {
+      continue;  // three-valued: any comparison with NULL is unknown
+    }
+    bool hit = false;
+    switch (op[0]) {
+      case '=':
+        hit = (v == probe);
+        break;
+      case '<':
+        hit = (op[1] == '=' ? v <= probe : v < probe);
+        break;
+      case '>':
+        hit = (op[1] == '=' ? probe <= v : probe < v);
+        break;
+      default:
+        hit = false;
+    }
+    if (hit) {
+      want.push_back(r);
+    }
+  }
+  *expected = SortedDump(want);
+  std::vector<std::string> actual;
+  for (const Row& r : *got) {
+    actual.push_back(r.ToString());
+  }
+  std::sort(actual.begin(), actual.end());
+  if (*expected == actual) {
+    return "";
+  }
+  std::string report = "index probe mismatch on " + t.name + " :: " + *sql +
+                       "\n  mirror says " + std::to_string(expected->size()) +
+                       " rows, engine says " + std::to_string(actual.size()) +
+                       "\n";
+  report += "  expected:\n" + DumpLines(*expected);
+  report += "  actual:\n" + DumpLines(actual);
   return report;
 }
 
@@ -894,6 +1256,9 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
   Database* db = sdb.get();
   std::optional<SqlEngine> engine;
   engine.emplace(*db);
+  if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
+    engine->SetForceRelationalFallback(true);
+  }
 
   // ---- setup phase: schema + seed rows under one committed txn ----
   TransactionContext setup_ctx = db->BeginContext();
@@ -908,12 +1273,16 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     const int col_count = g.Pick(2, 3);
     for (int c = 0; c < col_count; ++c) {
       const std::string cname = "c" + std::to_string(m.columns.size());
-      if (g.Chance(60)) {
+      const int roll = g.Pick(0, 99);
+      if (roll < 50) {
         cols += ", " + cname + " INT64";
         m.columns.push_back({cname, ColType::kInt});
-      } else {
+      } else if (roll < 80) {
         cols += ", " + cname + " VARCHAR(8)";
         m.columns.push_back({cname, ColType::kStr});
+      } else {
+        cols += ", " + cname + " DOUBLE";
+        m.columns.push_back({cname, ColType::kDbl});
       }
     }
     const std::string sql = "CREATE TABLE " + m.name + " (" + cols + ");";
@@ -928,9 +1297,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       std::vector<std::pair<int64_t, ColType>> values;
       std::string tuple = "(" + std::to_string(next_u[m.name]++);
       for (size_t c = 1; c < m.columns.size(); ++c) {
-        const auto [repr, lit] = m.columns[c].type == ColType::kInt
-                                     ? GenIntValue(g)
-                                     : GenStrValue(g);
+        const auto [repr, lit] = GenValue(g, m.columns[c].type);
         values.emplace_back(repr, m.columns[c].type);
         tuple += ", " + lit;
       }
@@ -955,18 +1322,19 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
   }
 
   // ---- dual phase ----
-  // ctxs[0] re-begins via the commit above's semantics; begin both contexts.
-  TransactionContext ctxs[2] = {db->BeginContext(), db->BeginContext()};
+  // ctxs[static_cast<size_t>(0)] re-begins via the commit above's semantics; begin both contexts.
+  std::array<TransactionContext, 2> ctxs = {db->BeginContext(),
+                                            db->BeginContext()};
   t.steps.push_back({.is_begin = true, .txn = 1});
-  std::vector<MirrorTable> base[2] = {committed, committed};
-  std::vector<MirrorTable> view[2] = {committed, committed};
+  std::array<std::vector<MirrorTable>, 2> base = {committed, committed};
+  std::array<std::vector<MirrorTable>, 2> view = {committed, committed};
   // owner[(table,u)] = holder of an uncommitted write/intent on that row.
   std::map<std::pair<std::string, int64_t>, OwnerInfo> owner;
 
   auto check_txn = [&](int x) -> std::string {
-    for (const MirrorTable& tab : view[x]) {
+    for (const MirrorTable& tab : view[static_cast<size_t>(x)]) {
       std::string error;
-      const std::string mismatch = CheckTable(*db, ctxs[x], tab, &error);
+      const std::string mismatch = CheckTable(*db, ctxs[static_cast<size_t>(x)], tab, &error);
       if (verbose) {
         std::cerr << "[session][dual-check] txn" << x << " " << tab.name
                   << " rows=" << tab.rows.size()
@@ -996,18 +1364,18 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     if (roll <= 9) {
       // Commit txn x: merge its delta into committed, re-begin fresh.
       const int x = g.Pick(0, 1);
-      if (ctxs[x].txn_.PreCommit() != Status::kSuccess) {
+      if (ctxs[static_cast<size_t>(x)].txn_.PreCommit() != Status::kSuccess) {
         return "dual commit failed for txn " + std::to_string(x) + " at step " +
                std::to_string(step) + "\n";
       }
       const auto written = WrittenKeys(owner, x);
-      ApplyDelta(committed, view[x], written);
+      ApplyDelta(committed, view[static_cast<size_t>(x)], written);
       for (auto it = owner.begin(); it != owner.end();) {
         it = it->second.txn == x ? owner.erase(it) : std::next(it);
       }
-      ctxs[x] = db->BeginContext();
-      base[x] = committed;
-      view[x] = committed;
+      ctxs[static_cast<size_t>(x)] = db->BeginContext();
+      base[static_cast<size_t>(x)] = committed;
+      view[static_cast<size_t>(x)] = committed;
       t.steps.push_back({.is_commit = true, .txn = x});
       if (stats != nullptr) {
         ++stats->commits;
@@ -1019,16 +1387,16 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     }
     if (roll <= 15) {
       const int x = g.Pick(0, 1);
-      if (ctxs[x].txn_.Abort() != Status::kSuccess) {
+      if (ctxs[static_cast<size_t>(x)].txn_.Abort() != Status::kSuccess) {
         return "dual abort failed for txn " + std::to_string(x) + " at step " +
                std::to_string(step) + "\n";
       }
       for (auto it = owner.begin(); it != owner.end();) {
         it = it->second.txn == x ? owner.erase(it) : std::next(it);
       }
-      ctxs[x] = db->BeginContext();
-      base[x] = committed;
-      view[x] = committed;
+      ctxs[static_cast<size_t>(x)] = db->BeginContext();
+      base[static_cast<size_t>(x)] = committed;
+      view[static_cast<size_t>(x)] = committed;
       t.steps.push_back({.is_abort = true, .txn = x});
       if (stats != nullptr) {
         ++stats->aborts;
@@ -1047,11 +1415,14 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       }
       db = sdb.get();
       engine.emplace(*db);
-      ctxs[0] = db->BeginContext();
-      ctxs[1] = db->BeginContext();
+      if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
+        engine->SetForceRelationalFallback(true);
+      }
+      ctxs[static_cast<size_t>(0)] = db->BeginContext();
+      ctxs[static_cast<size_t>(1)] = db->BeginContext();
       owner.clear();
-      base[0] = view[0] = committed;
-      base[1] = view[1] = committed;
+      base[static_cast<size_t>(0)] = view[static_cast<size_t>(0)] = committed;
+      base[static_cast<size_t>(1)] = view[static_cast<size_t>(1)] = committed;
       t.steps.push_back({.is_crash = true});
       if (stats != nullptr) {
         ++stats->crashes;
@@ -1077,13 +1448,13 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
 
     // Statement on a randomly chosen context.
     const int x = g.Pick(0, 1);
-    MirrorTable* target = &view[x][static_cast<size_t>(
-        g.Pick(0, static_cast<int>(view[x].size()) - 1))];
+    MirrorTable* target = &view[static_cast<size_t>(x)][static_cast<size_t>(
+        g.Pick(0, static_cast<int>(view[static_cast<size_t>(x)].size()) - 1))];
     const int oproll = g.Pick(1, 100);
     if (oproll <= 25) {
       // Check this txn's view of one table.
       std::string error;
-      const std::string mismatch = CheckTable(*db, ctxs[x], *target, &error);
+      const std::string mismatch = CheckTable(*db, ctxs[static_cast<size_t>(x)], *target, &error);
       SessionCheck check;
       check.table = target->name;
       check.after_step = t.steps.size() - 1;
@@ -1107,19 +1478,19 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       std::vector<std::pair<int64_t, ColType>> values;
       std::string tuple = "(" + std::to_string(u);
       for (size_t c = 1; c < target->columns.size(); ++c) {
-        const auto [repr, lit] = target->columns[c].type == ColType::kInt
-                                     ? GenIntValue(g)
-                                     : GenStrValue(g);
+        const auto [repr, lit] = GenValue(g, target->columns[c].type);
         values.emplace_back(repr, target->columns[c].type);
         tuple += ", " + lit;
       }
       tuple += ")";
       const std::string sql =
           "INSERT INTO " + target->name + " VALUES " + tuple + ";";
-      if (RunSql(*db, ctxs[x], sql)) {
+      const bool flip = RouteFlipFor(t.steps.size());
+      if (RunSql(*db, ctxs[static_cast<size_t>(x)], sql, flip)) {
         t.steps.push_back({.txn = x, .sql = sql});
         target->rows.push_back(BuildRow(u, values));
-        owner[{target->name, u}] = OwnerInfo{x, false, true};
+        owner[{target->name, u}] =
+            OwnerInfo{.txn = x, .vacant = false, .written = true};
       } else {
         t.steps.push_back({.txn = x, .must_fail = true, .sql = sql});
         if (stats != nullptr) {
@@ -1137,7 +1508,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     //  - the predicate is evaluated on the committed head image, not this
     //    txn's snapshot — a row whose head moved is written at its NEW
     //    image, and a row whose head is gone is a vacuous no-op.
-    const size_t row_idx = static_cast<size_t>(
+    const auto row_idx = static_cast<size_t>(
         g.Pick(0, static_cast<int>(target->rows.size()) - 1));
     const Row old_row = target->rows[row_idx];
     const int64_t u = RowU(old_row);
@@ -1169,7 +1540,11 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
                                 owner_it->second.vacant;
     const Row* head_row = nullptr;
     if (!foreign_vacant) {
-      head_row = (owner_it != owner.end() && owner_it->second.txn == x)
+      // An own *written* intent means our staged image is the row's head;
+      // a scan-only intent still resolves the committed head — the engine
+      // re-reads through ReadVersion after taking the intent.
+      head_row = (owner_it != owner.end() && owner_it->second.txn == x &&
+                  owner_it->second.written)
                      ? &old_row
                      : committed_row;
     }
@@ -1190,7 +1565,8 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       sql = "DELETE FROM " + target->name + " WHERE " + target->name +
             ".u = " + std::to_string(u) + ";";
     }
-    const bool ok = RunSql(*db, ctxs[x], sql);
+    const bool flip = RouteFlipFor(t.steps.size());
+    const bool ok = RunSql(*db, ctxs[static_cast<size_t>(x)], sql, flip);
     if (predicted_conflict && ok) {
       return "concurrent write-intent violated: " + sql + " succeeded while" +
              " txn " +
@@ -1206,13 +1582,9 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       continue;
     }
     t.steps.push_back({.txn = x, .sql = sql});
-    // The successful scan intent-locked every occupied slot of the table;
-    // record that so a later DML by the other txn predicts the conflict.
-    if (committed_tbl != nullptr) {
-      for (const Row& r : committed_tbl->rows) {
-        owner.try_emplace({target->name, RowU(r)}, OwnerInfo{x, false, false});
-      }
-    }
+    // The scan's peek filter (`u = const`) releases the intent on every
+    // slot it skips, and a vacuous scan releases all of them, so the only
+    // intent the engine retains is the row actually written below.
     if (head_row == nullptr) {
       // Vacuous success: the predicate sees a dead/vacant position at head,
       // so nothing is written and our snapshot keeps showing the row.
@@ -1222,6 +1594,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       // The written image is the head row with SET applied — columns the
       // statement does not touch take their head values, not the snapshot's.
       std::vector<std::pair<int, Value>> results;
+      results.reserve(sets.size());
       for (const auto& [col, expr] : sets) {
         results.emplace_back(col, expr->Eval(*head_row));
       }
@@ -1229,23 +1602,25 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       for (const auto& [col, v] : results) {
         target->rows[row_idx][static_cast<size_t>(col)] = v;
       }
-      owner[{target->name, u}] = OwnerInfo{x, false, true};
+      owner[{target->name, u}] =
+          OwnerInfo{.txn = x, .vacant = false, .written = true};
     } else {
       target->rows.erase(target->rows.begin() + static_cast<long>(row_idx));
-      owner[{target->name, u}] = OwnerInfo{x, true, true};
+      owner[{target->name, u}] =
+          OwnerInfo{.txn = x, .vacant = true, .written = true};
     }
   }
 
   // ---- teardown: commit both, then check both views ----
   for (int x = 0; x < 2; ++x) {
-    if (ctxs[x].txn_.PreCommit() != Status::kSuccess) {
+    if (ctxs[static_cast<size_t>(x)].txn_.PreCommit() != Status::kSuccess) {
       return "dual teardown commit failed for txn " + std::to_string(x) + "\n";
     }
     const auto written = WrittenKeys(owner, x);
-    ApplyDelta(committed, view[x], written);
-    ctxs[x] = db->BeginContext();
-    base[x] = committed;
-    view[x] = committed;
+    ApplyDelta(committed, view[static_cast<size_t>(x)], written);
+    ctxs[static_cast<size_t>(x)] = db->BeginContext();
+    base[static_cast<size_t>(x)] = committed;
+    view[static_cast<size_t>(x)] = committed;
     t.steps.push_back({.is_commit = true, .txn = x});
     if (stats != nullptr) {
       ++stats->commits;
@@ -1281,6 +1656,9 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
   TransactionContext ctx = db->BeginContext();
   std::optional<SqlEngine> engine;
   engine.emplace(*db);
+  if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
+    engine->SetForceRelationalFallback(true);
+  }
 
   std::vector<MirrorTable> tables;
   // Committed mirror snapshot: an abort rolls the engine AND the mirror back
@@ -1300,16 +1678,23 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
     const int col_count = g.Pick(2, 3);
     for (int i = 0; i < col_count; ++i) {
       const std::string cname = "c" + std::to_string(m.columns.size());
-      if (g.Chance(60)) {
+      const int roll = g.Pick(0, 99);
+      if (roll < 50) {
         cols += ", " + cname + " INT64";
         m.columns.push_back({cname, ColType::kInt});
-      } else {
+      } else if (roll < 80) {
         cols += ", " + cname + " VARCHAR(8)";
         m.columns.push_back({cname, ColType::kStr});
+      } else {
+        cols += ", " + cname + " DOUBLE";
+        m.columns.push_back({cname, ColType::kDbl});
       }
     }
     const std::string sql = "CREATE TABLE " + name + " (" + cols + ");";
-    if (!RunSql(*db, ctx, sql)) {
+    if (verbose) {
+      std::cerr << "[session][stmt] " << sql << "\n";
+    }
+    if (!RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()))) {
       report =
           "CREATE TABLE rejected: " + sql + " :: " + engine->LastError() + "\n";
       return false;
@@ -1344,11 +1729,34 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         return "state mismatch on " + tab.name + " after step " +
                std::to_string(t.steps.size() - 1) + "\n" + mismatch;
       }
+      if (!tab.plain_keys.empty()) {
+        // Re-validate the index access path itself: after a crash this
+        // exercises REDOne index pages; after a checkpoint, dirty-flushed
+        // ones.
+        const std::vector<int>& key = tab.plain_keys[0];
+        std::string probe_sql;
+        std::vector<std::string> probe_expected;
+        std::string probe_error;
+        const std::string probe_report = CheckIndexProbe(
+            *db, ctx, g, tab, key, &probe_sql, &probe_expected, &probe_error);
+        SessionCheck probe;
+        probe.table = tab.name;
+        probe.after_step = t.steps.size() - 1;
+        probe.sql_override = probe_sql;
+        probe.expected = probe_expected;
+        t.checks.push_back(std::move(probe));
+        if (stats != nullptr) {
+          ++stats->index_probes;
+        }
+        if (!probe_report.empty()) {
+          return probe_report;
+        }
+      }
     }
     return "";
   };
 
-  const int total_steps = g.Pick(20, 45);
+  const int total_steps = g.Pick(25, 60);
   for (int step = 0; step < total_steps; ++step) {
     // Commit boundary: periodic PreCommit exercises WAL + cross-txn reads.
     if (step > 0 && step % 8 == 0) {
@@ -1357,6 +1765,9 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       }
       ctx = db->BeginContext();
       committed_tables = tables;
+      if (verbose) {
+        std::cerr << "[session][stmt] --COMMIT--\n";
+      }
       t.steps.push_back({.is_ddl = false, .is_commit = true, .sql = {}});
       if (stats != nullptr) {
         ++stats->commits;
@@ -1369,6 +1780,9 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       }
       ctx = db->BeginContext();
       tables = committed_tables;
+      if (verbose) {
+        std::cerr << "[session][stmt] --ABORT--\n";
+      }
       t.steps.push_back(
           {.is_ddl = false, .is_commit = false, .is_abort = true, .sql = {}});
       if (stats != nullptr) {
@@ -1389,6 +1803,9 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       }
       db = sdb.get();
       engine.emplace(*db);
+      if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
+        engine->SetForceRelationalFallback(true);
+      }
       ctx = db->BeginContext();
       tables = committed_tables;
       t.steps.push_back({.is_ddl = false,
@@ -1410,11 +1827,30 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       if (db->WriteCheckpoint().GetStatus() != Status::kSuccess) {
         return "checkpoint failed at step " + std::to_string(step) + "\n";
       }
+      if (verbose) {
+        std::cerr << "[session][stmt] --CHECKPOINT--\n";
+      }
       t.steps.push_back({.is_checkpoint = true});
       if (stats != nullptr) {
         ++stats->checkpoints;
       }
+      if (verbose) {
+        std::cerr << "[session][stmt] --CHECKPOINT--\n";
+      }
       if (std::string mismatch = check_all_tables(); !mismatch.empty()) {
+        for (size_t si = 0; si < t.steps.size(); ++si) {
+          std::cerr << "[session][trace] step" << si << " "
+                    << (t.steps[si].is_commit
+                            ? "--COMMIT--"
+                            : (t.steps[si].is_abort
+                                   ? "--ABORT--"
+                                   : (t.steps[si].is_checkpoint
+                                          ? "--CHECKPOINT--"
+                                          : (t.steps[si].is_crash
+                                                 ? "--CRASH--"
+                                                 : t.steps[si].sql))))
+                    << "\n";
+        }
         return "post-checkpoint " + mismatch;
       }
     }
@@ -1442,7 +1878,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       op = Op::kCreateTable;
     } else if (static_cast<int>(tables.size()) >= 3 && roll <= 8) {
       op = Op::kDropTable;
-    } else if (roll <= 35 && target->rows.size() < 20) {
+    } else if (roll <= 35 && target->rows.size() < 45) {
       op = Op::kInsert;
     } else if (roll <= 55) {
       op = Op::kUpdate;
@@ -1490,11 +1926,6 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             sql += (i == 0 ? "" : ", ") + exprs[i]->Render();
           }
           sql += " FROM " + target->name + " WHERE " + pred->Render() + ";";
-          if (!RunSql(*db, ctx, sql)) {
-            return "INSERT SELECT rejected: " + sql +
-                   " :: " + engine->LastError() + "\n";
-          }
-          t.steps.push_back({.sql = sql});
           const int64_t next_u = target->next_u;
           const size_t existing = target->rows.size();
           std::vector<Row> added;
@@ -1508,21 +1939,60 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             for (const SExprPtr& e : exprs) {
               cells.push_back(e->Eval(row));
             }
-            added.push_back(Row(std::move(cells)));
+            added.emplace_back(std::move(cells));
           }
+          bool has_active_key = false;
+          for (const std::vector<int>& key : target->unique_keys) {
+            if (std::find(key.begin(), key.end(), 0) == key.end()) {
+              has_active_key = true;
+            }
+          }
+          if (has_active_key && added.size() != 1) {
+            // Multi-row (or vacuous) projections against an active unique
+            // index have order-dependent intermediate states; only a
+            // single-row insert has a deterministic verdict, and a
+            // vacuous one can collide mid-batch anyway.  Skip the step.
+            break;
+          }
+          bool expect_dup = false;
+          if (added.size() == 1) {
+            for (const std::vector<int>& key : target->unique_keys) {
+              if (KeyCollides(target->rows, added[0], key,
+                              target->rows.size())) {
+                expect_dup = true;
+                break;
+              }
+            }
+          }
+          if (verbose) {
+            std::cerr << "[session][stmt] " << sql << "\n";
+          }
+          const bool ok = RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()));
+          if (expect_dup) {
+            if (ok) {
+              return "unique-violating INSERT SELECT unexpectedly accepted "
+                     "at step " +
+                     std::to_string(step) + ": " + sql + "\n";
+            }
+            t.steps.push_back({.must_fail = true, .sql = sql});
+            break;
+          }
+          if (!ok) {
+            return "INSERT SELECT rejected: " + sql +
+                   " :: " + engine->LastError() + "\n";
+          }
+          t.steps.push_back({.sql = sql});
           for (Row& r : added) {
             target->rows.push_back(std::move(r));
           }
           // New u values are old_u + next_u; keep next_u above every key.
-          target->next_u = next_u * 2 + 1;
+          target->next_u = (next_u * 2) + 1;
           break;
         }
         std::vector<std::pair<int64_t, ColType>> values;
         std::string tuple = "(" + std::to_string(target->next_u++);
         for (size_t i = 1; i < target->columns.size(); ++i) {
-          const auto [repr, lit] = target->columns[i].type == ColType::kInt
-                                       ? GenIntValue(g)
-                                       : GenStrValue(g);
+          const auto [repr, lit] = GenValue(g, target->columns[i].type);
           values.emplace_back(repr, target->columns[i].type);
           tuple += ", " + lit;
         }
@@ -1532,11 +2002,14 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           // Column-list insert with a shuffled order: the engine must map
           // values positionally onto the listed columns, not ordinal ones.
           std::vector<int> order;
+          order.reserve(target->columns.size());
           for (size_t i = 0; i < target->columns.size(); ++i) {
             order.push_back(static_cast<int>(i));
           }
           for (size_t i = order.size() - 1; i > 0; --i) {
-            std::swap(order[i], order[static_cast<size_t>(g.Pick(0, i))]);
+            std::swap(
+                order[i],
+                order[static_cast<size_t>(g.Pick(0, static_cast<int>(i)))]);
           }
           std::string col_list = "(u";
           std::string lit_list = "(" + std::to_string(target->next_u - 1);
@@ -1547,30 +2020,69 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             col_list += ", c" + std::to_string(i);
             // values[j] holds the literal for column j + 1 (column 0 is u).
             const int64_t repr = values[static_cast<size_t>(i - 1)].first;
-            lit_list +=
-                ", " + (repr == kNullRepr
-                            ? "NULL"
-                            : (values[static_cast<size_t>(i - 1)].second ==
-                                       ColType::kInt
-                                   ? std::to_string(repr)
-                                   : (repr == kStrA ? "'a'" : "'bb'")));
+            const ColType ct = values[static_cast<size_t>(i - 1)].second;
+            lit_list += ", " + (repr == kNullRepr     ? "NULL"
+                                : ct == ColType::kInt ? std::to_string(repr)
+                                : ct == ColType::kDbl
+                                    ? DblLit(repr)
+                                    : (repr == kStrA ? "'a'" : "'bb'"));
           }
           col_list += ")";
           lit_list += ")";
-          sql = "INSERT INTO " + target->name + " " + col_list + " VALUES " +
-                lit_list + ";";
+          sql = "INSERT INTO " + target->name;
+          sql += " ";
+          sql += col_list;
+          sql += " VALUES ";
+          sql += lit_list;
+          sql += ";";
         } else {
-          sql = "INSERT INTO " + target->name + " VALUES " + tuple + ";";
+          sql = "INSERT INTO " + target->name;
+          sql += " VALUES ";
+          sql += tuple;
+          sql += ";";
         }
-        if (!RunSql(*db, ctx, sql)) {
-          return "INSERT rejected: " + sql + " :: " + engine->LastError() +
-                 "\n";
+        // Unique-key prediction: u is fresh by construction, so a collision
+        // can only come from a unique index over the other columns.
+        const Row candidate = BuildRow(target->next_u - 1, values);
+        bool expect_dup = false;
+        for (const std::vector<int>& key : target->unique_keys) {
+          if (KeyCollides(target->rows, candidate, key, target->rows.size())) {
+            expect_dup = true;
+            break;
+          }
+        }
+        if (verbose) {
+          std::cerr << "[session][stmt] " << sql << "\n";
+        }
+        std::string why;
+        const bool ok =
+            RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why);
+        if (expect_dup) {
+          if (ok) {
+            return "unique-violating INSERT unexpectedly accepted at step " +
+                   std::to_string(step) + ": " + sql + "\n";
+          }
+          t.steps.push_back({.must_fail = true, .sql = sql});
+          break;
+        }
+        if (!ok) {
+          std::string message;
+          message += "INSERT rejected: ";
+          message += sql;
+          message += " :: ";
+          message += why;
+          message += '\n';
+          return message;
         }
         t.steps.push_back({.sql = sql});
-        target->rows.push_back(BuildRow(target->next_u - 1, values));
+        target->rows.push_back(candidate);
         break;
       }
       case Op::kUpdate: {
+        // Debug aid: quantified/EXISTS predicates expose snapshot drift
+        // instantly; check right after applying them (env-gated).
+        const bool dbg_pred =
+            std::getenv("TINYLAMB_SESSION_CHECK_QUANT") != nullptr;
         const SPredPtr pred =
             GenPred(g, *target, tables, g.Pick(1, 2), SubqMode::kConjunct);
         const int set_col =
@@ -1612,10 +2124,14 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           auto lit = std::make_unique<SExpr>();
           lit->is_str = target->columns[static_cast<size_t>(set_col)].type ==
                         ColType::kStr;
+          lit->is_dbl = target->columns[static_cast<size_t>(set_col)].type ==
+                        ColType::kDbl;
           if (g.Chance(25)) {
             lit->const_null = true;
           } else {
-            lit->const_val = lit->is_str ? g.Pick(0, 1) : g.Pick(-3, 3);
+            lit->const_val = lit->is_str   ? g.Pick(0, 1)
+                             : lit->is_dbl ? g.Pick(-6, 6)
+                                           : g.Pick(-3, 3);
           }
           sets.emplace_back(set_col, std::move(lit));
         }
@@ -1625,7 +2141,101 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
                  sets[i].second->Render();
         }
         sql += " WHERE " + pred->Render() + ";";
-        if (!RunSql(*db, ctx, sql)) {
+        // Unique-key oracle.  A SET that touches a column covered by a
+        // UNIQUE index must not put two live rows on the same non-NULL key
+        // image.  Multi-row statements that touch covered columns can
+        // collide transiently depending on the engine's scan order, so
+        // those degrade to a column no unique index covers.
+        std::vector<size_t> match_idx;
+        for (size_t i = 0; i < target->rows.size(); ++i) {
+          if (pred->Eval(target->rows[i]) == 'T') {
+            match_idx.push_back(i);
+          }
+        }
+        auto key_covered = [&](int col) {
+          return std::ranges::any_of(target->unique_keys,
+                                     [&](const std::vector<int>& key) {
+                                       return std::find(key.begin(),
+                                                        key.end(), 0) ==
+                                                  key.end() &&
+                                              std::find(key.begin(), key.end(),
+                                                        col) != key.end();
+                                     });
+        };
+        bool touches_key = false;
+        for (const auto& [col, expr] : sets) {
+          if (key_covered(col)) {
+            touches_key = true;
+          }
+        }
+        if (touches_key && match_idx.size() > 1) {
+          int free_col = -1;
+          for (int c = 1; std::cmp_less(c, target->columns.size()); ++c) {
+            if (!key_covered(c)) {
+              free_col = c;
+              break;
+            }
+          }
+          if (free_col < 0) {
+            continue;  // every column is key-covered: skip the step
+          }
+          sets.clear();
+          auto lit = std::make_unique<SExpr>();
+          lit->kind = SExpr::Kind::kConst;
+          lit->is_str = target->columns[static_cast<size_t>(free_col)].type ==
+                        ColType::kStr;
+          lit->is_dbl = target->columns[static_cast<size_t>(free_col)].type ==
+                        ColType::kDbl;
+          if (g.Chance(25)) {
+            lit->const_null = true;
+          } else {
+            lit->const_val = lit->is_str   ? g.Pick(0, 1)
+                             : lit->is_dbl ? g.Pick(-6, 6)
+                                           : g.Pick(-3, 3);
+          }
+          sets.emplace_back(free_col, std::move(lit));
+          sql = "UPDATE " + target->name + " SET " + ColName(free_col) + " = " +
+                sets[0].second->Render() + " WHERE " + pred->Render() + ";";
+          touches_key = false;
+        }
+        bool expect_dup = false;
+        if (touches_key) {  // exactly one matching row here
+          std::vector<Row> post = target->rows;
+          for (size_t mi : match_idx) {
+            Row row = post[mi];
+            std::vector<std::pair<int, Value>> results;
+            results.reserve(sets.size());
+            for (const auto& [col, expr] : sets) {
+              results.emplace_back(col, expr->Eval(row));
+            }
+            for (const auto& [col, v] : results) {
+              row[static_cast<size_t>(col)] = v;
+            }
+            post[mi] = row;
+            for (const std::vector<int>& key : target->unique_keys) {
+              if (KeyCollides(post, row, key, mi)) {
+                expect_dup = true;
+                break;
+              }
+            }
+            if (expect_dup) {
+              break;
+            }
+          }
+        }
+        if (verbose) {
+          std::cerr << "[session][stmt] " << sql << "\n";
+        }
+        const bool ok = RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()));
+        if (expect_dup) {
+          if (ok) {
+            return "unique-violating UPDATE unexpectedly accepted at step " +
+                   std::to_string(step) + ": " + sql + "\n";
+          }
+          t.steps.push_back({.must_fail = true, .sql = sql});
+          break;
+        }
+        if (!ok) {
           return "UPDATE rejected: " + sql + " :: " + engine->LastError() +
                  "\n";
         }
@@ -1645,6 +2255,16 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             row[static_cast<size_t>(col)] = v;
           }
         }
+        if (dbg_pred) {
+          if (std::string mismatch = check_all_tables(); !mismatch.empty()) {
+            std::string quant_report = "post-UPDATE(quant) ";
+            quant_report += mismatch;
+            quant_report += " stmt: ";
+            quant_report += sql;
+            quant_report += "\n";
+            return quant_report;
+          }
+        }
         break;
       }
       case Op::kDelete: {
@@ -1655,7 +2275,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         const std::string sql = pred ? "DELETE FROM " + target->name +
                                            " WHERE " + pred->Render() + ";"
                                      : "DELETE FROM " + target->name + ";";
-        if (!RunSql(*db, ctx, sql)) {
+        if (!RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()))) {
           return "DELETE rejected: " + sql + " :: " + engine->LastError() +
                  "\n";
         }
@@ -1671,24 +2291,75 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       }
       case Op::kIndex: {
         const std::string idx_name = "idx" + std::to_string(index_counter++);
-        std::string key_list = std::to_string(g.PickCol(*target));
-        if (g.Chance(40)) {
-          key_list += ",0";  // fold in the unique u column
+        const bool make_unique = g.Chance(35);
+        std::vector<int> key_slots;
+        std::string key_list;
+        if (make_unique && g.Chance(50)) {
+          // The u column is unique by construction: always creatable, and
+          // every later INSERT/UPDATE collides only through the OTHER
+          // unique specs or the engine-side bookkeeping.
+          key_slots = {0};
+          key_list = "0";
+        } else {
+          key_slots.push_back(g.PickCol(*target));
+          key_list = std::to_string(key_slots[0]);
+          if (g.Chance(30) && target->columns.size() >= 2) {
+            int second = g.PickCol(*target);
+            if (second != key_slots[0]) {
+              key_slots.push_back(second);
+              key_list += "," + std::to_string(second);
+            }
+          }
         }
-        std::string ddl = "CREATE INDEX ";
+        std::string ddl =
+            make_unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ";
         ddl += idx_name;
         ddl += " ON ";
         ddl += target->name;
         ddl += " KEY(";
         ddl += key_list;
         ddl += ")";
-        if (g.Chance(40)) {
+        if (!make_unique && g.Chance(40)) {
           ddl += " INCLUDE(" + std::to_string(g.PickCol(*target));
           ddl += ")";
         }
+        // NULL-exempt duplicate detection decides the engine's verdict
+        // before we ask it.  Accepting a duplicating build or rejecting a
+        // clean one is a uniqueness bug.
+        bool dup = false;
+        if (make_unique) {
+          dup = HasDuplicateKey(target->rows, key_slots);
+        }
         std::string error;
         error.reserve(64);
-        if (!ApplyDdl(*db, ctx, ddl, &error)) {
+        bool rejected_dup = false;
+        const bool ok = ApplyDdl(*db, ctx, ddl, &error, &rejected_dup);
+        if (make_unique && dup) {
+          if (ok) {
+            std::string dup_report =
+                "unique index on duplicate key unexpectedly created at step ";
+            dup_report += std::to_string(step);
+            dup_report += ": ";
+            dup_report += ddl;
+            dup_report += "\n";
+            return dup_report;
+          }
+          if (!rejected_dup) {
+            std::string message =
+                "unique index creation failed for a non-duplicate reason "
+                "at step ";
+            message += std::to_string(step);
+            message += ": ";
+            message += ddl;
+            message += " :: ";
+            message += error;
+            message += '\n';
+            return message;
+          }
+          t.steps.push_back({.is_ddl = true, .must_fail = true, .sql = ddl});
+          break;
+        }
+        if (!ok) {
           std::string msg = "index DDL failed at step ";
           msg += std::to_string(step);
           msg += ": ";
@@ -1698,6 +2369,11 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           msg += "\n";
           return msg;
         }
+        if (make_unique) {
+          target->unique_keys.push_back(key_slots);
+        } else {
+          target->plain_keys.push_back(key_slots);
+        }
         t.steps.push_back({.is_ddl = true, .sql = ddl});
         if (stats != nullptr) {
           ++stats->indexes_created;
@@ -1706,7 +2382,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       }
       case Op::kDropTable: {
         const std::string sql = "DROP TABLE " + target->name + ";";
-        if (!RunSql(*db, ctx, sql)) {
+        if (!RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()))) {
           return "DROP TABLE rejected: " + sql + " :: " + engine->LastError() +
                  "\n";
         }
@@ -1729,7 +2405,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       }
       case Op::kAnalyze: {
         const std::string sql = "ANALYZE " + target->name + ";";
-        if (!RunSql(*db, ctx, sql)) {
+        if (!RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()))) {
           return "ANALYZE rejected: " + sql + " :: " + engine->LastError() +
                  "\n";
         }
@@ -1758,6 +2434,34 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
                  std::to_string(t.steps.size() - 1) + " (" +
                  t.steps.back().sql + ")\n" + mismatch;
         }
+        if (!target->plain_keys.empty() && g.Chance(70)) {
+          // Index-independence probe: same predicate through the engine's
+          // index/covering/skip-scan paths must equal the mirror filter.
+          const std::vector<int>& key = target->plain_keys[static_cast<size_t>(
+              g.Pick(0, static_cast<int>(target->plain_keys.size()) - 1))];
+          std::string probe_sql;
+          std::vector<std::string> probe_expected;
+          std::string probe_error;
+          const std::string probe_report =
+              CheckIndexProbe(*db, ctx, g, *target, key, &probe_sql,
+                              &probe_expected, &probe_error);
+          SessionCheck probe;
+          probe.table = target->name;
+          probe.after_step = t.steps.size() - 1;
+          probe.sql_override = probe_sql;
+          probe.expected = probe_expected;
+          t.checks.push_back(std::move(probe));
+          if (stats != nullptr) {
+            ++stats->index_probes;
+          }
+          if (verbose) {
+            std::cerr << "[session][probe] " << probe_sql
+                      << (probe_report.empty() ? " ok" : " MISMATCH") << "\n";
+          }
+          if (!probe_report.empty()) {
+            return probe_report;
+          }
+        }
         break;
       }
     }
@@ -1785,10 +2489,13 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
   Database* db = sdb.get();
   // Context 0 begins implicitly; context 1 begins at "-- begin2" so its
   // snapshot timestamp matches generation exactly.
-  std::optional<TransactionContext> ctxs[2];
-  ctxs[0].emplace(db->BeginContext());
+  std::array<std::optional<TransactionContext>, 2> ctxs;
+  ctxs[static_cast<size_t>(0)].emplace(db->BeginContext());
   std::optional<SqlEngine> engine;
   engine.emplace(*db);
+  if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
+    engine->SetForceRelationalFallback(true);
+  }
   // Rebuild the mirror from the executed statements (CREATE TABLE shapes the
   // columns; INSERT/UPDATE/DELETE effects are re-derived by re-execution).
   // The expected dumps in the trace carry the ground truth, so the replay
@@ -1800,35 +2507,39 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
     std::string error;
     error.reserve(64);
     if (!step.is_crash && !step.is_checkpoint && !step.is_begin &&
-        !ctxs[step.txn].has_value()) {
+        !ctxs[static_cast<size_t>(step.txn)].has_value()) {
       return "malformed trace: step " + std::to_string(i) +
              " uses a context that was never begun\n";
     }
     if (step.is_begin) {
-      ctxs[step.txn].emplace(db->BeginContext());
+      ctxs[static_cast<size_t>(step.txn)].emplace(db->BeginContext());
     } else if (step.is_commit) {
       // Reproduce the original transaction boundary: everything committed so
       // far must become visible to a fresh context, exactly as during
       // generation.
-      if (ctxs[step.txn]->txn_.PreCommit() != Status::kSuccess) {
+      if (ctxs[static_cast<size_t>(step.txn)]->txn_.PreCommit() != Status::kSuccess) {
         return "replay commit failed at step " + std::to_string(i) + "\n";
       }
-      ctxs[step.txn].emplace(db->BeginContext());
+      ctxs[static_cast<size_t>(step.txn)].emplace(db->BeginContext());
     } else if (step.is_abort) {
-      if (ctxs[step.txn]->txn_.Abort() != Status::kSuccess) {
+      if (ctxs[static_cast<size_t>(step.txn)]->txn_.Abort() != Status::kSuccess) {
         return "replay abort failed at step " + std::to_string(i) + "\n";
       }
-      ctxs[step.txn].emplace(db->BeginContext());
+      ctxs[static_cast<size_t>(step.txn)].emplace(db->BeginContext());
     } else if (step.is_crash) {
       sdb.CrashAndReopen();
       if (!sdb) {
-        return "replay crash reopen failed at step " + std::to_string(i) + "\n";
+        return "replay cra != nullptrsh reopen failed at step " +
+               std::to_string(i) + "\n";
       }
       db = sdb.get();
       engine.emplace(*db);
-      ctxs[0].emplace(db->BeginContext());
-      if (ctxs[1].has_value()) {
-        ctxs[1].emplace(db->BeginContext());
+      if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
+        engine->SetForceRelationalFallback(true);
+      }
+      ctxs[static_cast<size_t>(0)].emplace(db->BeginContext());
+      if (ctxs[static_cast<size_t>(1)].has_value()) {
+        ctxs[static_cast<size_t>(1)].emplace(db->BeginContext());
       }
     } else if (step.is_checkpoint) {
       // Same fuzzy checkpoint as generation: no transaction boundary, no
@@ -1837,12 +2548,21 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
         return "replay checkpoint failed at step " + std::to_string(i) + "\n";
       }
     } else if (step.is_ddl) {
-      if (!ApplyDdl(*db, *ctxs[step.txn], step.sql, &error)) {
+      bool rejected_dup = false;
+      const bool ddl_ok =
+          ApplyDdl(*db, *ctxs[static_cast<size_t>(step.txn)], step.sql, &error, &rejected_dup);
+      if (step.must_fail) {
+        if (ddl_ok || !rejected_dup) {
+          return "replay unique-index DDL did not reproduce the duplicate "
+                 "rejection at step " +
+                 std::to_string(i) + ": " + step.sql + "\n";
+        }
+      } else if (!ddl_ok) {
         return "replay ddl failed at step " + std::to_string(i) + ": " +
                step.sql + " :: " + error + "\n";
       }
     } else {
-      const bool ok = RunSql(*db, *ctxs[step.txn], step.sql);
+      const bool ok = RunSql(*db, *ctxs[static_cast<size_t>(step.txn)], step.sql, RouteFlipFor(i));
       if (step.must_fail) {
         if (ok) {
           return "replay statement unexpectedly succeeded at step " +
@@ -1857,12 +2577,14 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
     while (check_index < trace.checks.size() &&
            trace.checks[check_index].after_step == i) {
       const SessionCheck& check = trace.checks[check_index];
-      if (!ctxs[check.txn].has_value()) {
+      if (!ctxs[static_cast<size_t>(check.txn)].has_value()) {
         return "malformed trace: check on unbegun context\n";
       }
-      auto got =
-          RunSelect(*db, *ctxs[check.txn],
-                    "SELECT * FROM " + check.table + " ORDER BY u;", &error);
+      const std::string check_sql =
+          check.sql_override.empty()
+              ? "SELECT * FROM " + check.table + " ORDER BY u;"
+              : check.sql_override;
+      auto got = RunSelect(*db, *ctxs[static_cast<size_t>(check.txn)], check_sql, &error);
       if (!got.has_value()) {
         return "replay check failed on " + check.table + " :: " + error + "\n";
       }
@@ -1878,7 +2600,7 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
                                " after step " + std::to_string(i) + "\n";
         mismatch += "  expected:\n" + DumpLines(expected);
         mismatch += "  actual:\n" + DumpLines(actual);
-        mismatch += DebugDumpTableChain(*ctxs[check.txn], check.table);
+        mismatch += DebugDumpTableChain(*ctxs[static_cast<size_t>(check.txn)], check.table);
         return mismatch;
       }
       if (verbose) {
@@ -1910,6 +2632,8 @@ std::string SerializeSessionTest(uint64_t seed, const SessionTrace& trace,
       out += "-- crash\n";
     } else if (step.is_checkpoint) {
       out += "-- checkpoint\n";
+    } else if (step.must_fail && step.is_ddl) {
+      out += "-- ddlfail" + sfx + ": " + step.sql + "\n";
     } else if (step.must_fail) {
       out += "-- fail" + sfx + ": " + step.sql + "\n";
     } else {
@@ -1921,6 +2645,11 @@ std::string SerializeSessionTest(uint64_t seed, const SessionTrace& trace,
       out +=
           (trace.checks[check_index].txn == 1 ? "-- check2: " : "-- check: ") +
           trace.checks[check_index].table + "\n";
+      if (!trace.checks[check_index].sql_override.empty()) {
+        out += (trace.checks[check_index].txn == 1 ? "-- checksql2: "
+                                                   : "-- checksql: ") +
+               trace.checks[check_index].sql_override + "\n";
+      }
       for (const std::string& row : trace.checks[check_index].expected) {
         out += "-- expect: " + row + "\n";
       }
@@ -1930,6 +2659,11 @@ std::string SerializeSessionTest(uint64_t seed, const SessionTrace& trace,
   while (check_index < trace.checks.size()) {
     out += (trace.checks[check_index].txn == 1 ? "-- check2: " : "-- check: ") +
            trace.checks[check_index].table + "\n";
+    if (!trace.checks[check_index].sql_override.empty()) {
+      out += (trace.checks[check_index].txn == 1 ? "-- checksql2: "
+                                                 : "-- checksql: ") +
+             trace.checks[check_index].sql_override + "\n";
+    }
     for (const std::string& row : trace.checks[check_index].expected) {
       out += "-- expect: " + row + "\n";
     }
@@ -2000,6 +2734,11 @@ bool ParseSessionTest(std::string_view text, uint64_t* seed,
       trace->steps.push_back({.is_ddl = true, .sql = value});
     } else if (consume("-- ddl2: ", &value)) {
       trace->steps.push_back({.is_ddl = true, .txn = 1, .sql = value});
+    } else if (consume("-- ddlfail: ", &value)) {
+      trace->steps.push_back({.is_ddl = true, .must_fail = true, .sql = value});
+    } else if (consume("-- ddlfail2: ", &value)) {
+      trace->steps.push_back(
+          {.is_ddl = true, .txn = 1, .must_fail = true, .sql = value});
     } else if (consume("-- fail: ", &value)) {
       trace->steps.push_back({.must_fail = true, .sql = value});
     } else if (consume("-- fail2: ", &value)) {
@@ -2011,6 +2750,12 @@ bool ParseSessionTest(std::string_view text, uint64_t* seed,
       check.txn = line.starts_with("-- check2:") ? 1 : 0;
       check.after_step = trace->steps.empty() ? 0 : trace->steps.size() - 1;
       trace->checks.push_back(std::move(check));
+    } else if (consume("-- checksql: ", &value) ||
+               consume("-- checksql2: ", &value)) {
+      if (trace->checks.empty()) {
+        return false;
+      }
+      trace->checks.back().sql_override = value;
     } else if (consume("-- expect: ", &value)) {
       if (trace->checks.empty()) {
         return false;

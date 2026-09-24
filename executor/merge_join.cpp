@@ -2,6 +2,7 @@
 #include "executor/merge_join.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <ostream>
 #include <stdexcept>
@@ -12,6 +13,7 @@
 #include "common/join_kind.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
+#include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
@@ -20,6 +22,23 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+namespace {
+
+bool JoinValueEqual(const Value& left, const Value& right) {
+  if (left.IsNull() || right.IsNull()) {
+    return false;
+  }
+  const auto result = TryEvaluateBinary(BinaryOperation::kEquals, left, right);
+  return result.HasValue() && !result.Value().IsNull() &&
+         result.Value().Truthy();
+}
+
+bool JoinValueUnmatchable(const Value& value) {
+  return value.type == ValueType::kDouble &&
+         std::isnan(value.value.double_value);
+}
+
+}  // namespace
 
 MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
                      Executor right, std::vector<slot_t> right_columns,
@@ -45,14 +64,21 @@ bool MergeJoin::KeyIsNull(const Row& row, const std::vector<slot_t>& columns) {
       columns, [&](slot_t column) { return row[column].IsNull(); });
 }
 
+bool MergeJoin::KeyCannotMatch(const Row& row,
+                               const std::vector<slot_t>& columns) {
+  return std::ranges::any_of(columns, [&](slot_t column) {
+    return row[column].IsNull() || JoinValueUnmatchable(row[column]);
+  });
+}
+
 int MergeJoin::CompareKeys(const Row& left, const Row& right) const {
   for (size_t i = 0; i < left_columns_.size(); ++i) {
     const Value& lhs = left[left_columns_[i]];
     const Value& rhs = right[right_columns_[i]];
-    if (lhs == rhs) {
+    if (JoinValueEqual(lhs, rhs)) {
       continue;
     }
-    return lhs < rhs ? -1 : 1;
+    return CompareForOrderBy(lhs, rhs) < 0 ? -1 : 1;
   }
   return 0;
 }
@@ -123,14 +149,14 @@ void MergeJoin::Materialize() {
     size_t left_index = 0;
     size_t right_index = 0;
     while (left_index < left_rows_.size() && right_index < right_rows_.size()) {
-      if (KeyIsNull(left_rows_[left_index], left_columns_)) {
+      if (KeyCannotMatch(left_rows_[left_index], left_columns_)) {
         if (anti) {
           emit_left(left_index);
         }
         ++left_index;
         continue;
       }
-      if (KeyIsNull(right_rows_[right_index], right_columns_)) {
+      if (KeyCannotMatch(right_rows_[right_index], right_columns_)) {
         ++right_index;
         continue;
       }
@@ -152,13 +178,13 @@ void MergeJoin::Materialize() {
       const size_t run_left_begin = left_index;
       size_t left_end = left_index;
       while (left_end < left_rows_.size() &&
-             !KeyIsNull(left_rows_[left_end], left_columns_) &&
+             !KeyCannotMatch(left_rows_[left_end], left_columns_) &&
              CompareKeys(left_rows_[left_end], right_rows_[right_index]) == 0) {
         ++left_end;
       }
       size_t right_end = right_index;
       while (right_end < right_rows_.size() &&
-             !KeyIsNull(right_rows_[right_end], right_columns_) &&
+             !KeyCannotMatch(right_rows_[right_end], right_columns_) &&
              CompareKeys(left_rows_[run_left_begin], right_rows_[right_end]) ==
                  0) {
         ++right_end;
@@ -205,14 +231,14 @@ void MergeJoin::Materialize() {
   size_t left_index = 0;
   size_t right_index = 0;
   while (left_index < left_rows_.size() && right_index < right_rows_.size()) {
-    if (KeyIsNull(left_rows_[left_index], left_columns_)) {
+    if (KeyCannotMatch(left_rows_[left_index], left_columns_)) {
       if (left_outer) {
         emit_padded_left(left_index);
       }
       ++left_index;
       continue;
     }
-    if (KeyIsNull(right_rows_[right_index], right_columns_)) {
+    if (KeyCannotMatch(right_rows_[right_index], right_columns_)) {
       if (right_outer) {
         emit_padded_right(right_rows_[right_index]);
       }
@@ -240,13 +266,13 @@ void MergeJoin::Materialize() {
     // single surviving pair are unmatched and get NULL-padded.
     size_t left_end = left_index;
     while (left_end < left_rows_.size() &&
-           !KeyIsNull(left_rows_[left_end], left_columns_) &&
+           !KeyCannotMatch(left_rows_[left_end], left_columns_) &&
            CompareKeys(left_rows_[left_end], right_rows_[right_index]) == 0) {
       ++left_end;
     }
     size_t right_end = right_index;
     while (right_end < right_rows_.size() &&
-           !KeyIsNull(right_rows_[right_end], right_columns_) &&
+           !KeyCannotMatch(right_rows_[right_end], right_columns_) &&
            CompareKeys(left_rows_[left_index], right_rows_[right_end]) == 0) {
       ++right_end;
     }

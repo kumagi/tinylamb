@@ -40,7 +40,7 @@ graph TD
 
 ## 意味論的根拠と三値論理・例外保護
 
-ゼロ除算式 `x / 0` を NULL へ畳み込む最適化は、SQL の意味論を二重の意味で破壊します。
+ゼロ除算式 `x / 0` を NULL へ畳み込むと、次の 2 点で元の式と動作が変わります。
 
 ```cpp
 // x / 0 keeps the runtime "division by zero" error (removed: folding it

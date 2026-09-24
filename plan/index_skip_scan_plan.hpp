@@ -24,6 +24,14 @@ class IndexSkipScanPlan final : public PlanBase {
   ~IndexSkipScanPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& txn) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override {
+    return inner_->ContainsParameterSlots();
+  }
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override {
+    return inner_->InstallParameterSlots(parameters, cursor, slots);
+  }
   [[nodiscard]] const Table* ScanSource() const override {
     return inner_->ScanSource();
   }

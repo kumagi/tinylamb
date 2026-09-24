@@ -16,4 +16,4 @@ PAXページは、同じページ内で行のMVCC可視性と列ごとの連続�
 5. 列値領域: INT64/DOUBLEは8 byte配列。VARCHARは`uint32_t[row_count + 1]`のoffset配列とbyte payload。
 6. 補助領域: dictionary、bit packing metadata、zone mapを後方互換に追加できる。
 
-すべてのoffsetは`Page::body`先頭からの`uint32_t`相対値とする。各 directory の値/NULL 領域はページ境界内に収まること、NULL bitmap が全行を覆うこと、encoding が `kPlain` であること、型が既知の `ValueType` であることを `Load` が検証し、違反は破損として拒否する。ヘッダの version が未知の場合も読み込みを拒否する。領域同士の重複検査と visibility 内容の解釈は未実装 (予約領域としてゼロ固定)。可視性を列データから独立させることで、MVCC判定後に必要列だけを連続走査できる。
+すべてのoffsetは`Page::body`先頭からの`uint32_t`相対値とする。各 directory の値/NULL 領域はページ境界内に収まること、NULL bitmap が全行を覆うこと、encoding が `kPlain` であること、型が既知の `ValueType` であることを `Load` が検証し、違反は破損として拒否する。ヘッダの version が未知の場合も読み込みを拒否する。領域同士の重複検査は `Load` が実装済みで、領域の重複は破損 (`kCorrupt`) として拒否する。visibility 内容の解釈のみ未実装 (予約領域としてゼロ固定)。可視性を列データから独立させることで、MVCC判定後に必要列だけを連続走査できる。

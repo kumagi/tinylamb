@@ -10,10 +10,14 @@
 //
 // Key:    SQL fingerprint + database schema/statistics epoch.
 // Value:  a CompiledPlan, one of
-//           (a) kSelect/kUpdate/kDelete: the specialized Plan compiled at fill
-//               time, replayed only while incoming parameters equal the
-//               fill-time values (identical parameters guarantee an identical
-//               bound statement, so baked index ranges stay correct);
+//           (a) kSelect/kUpdate/kDelete: a plan whose bindable literals are
+//               ParameterSlots. Replay binds the incoming values into those
+//               slots and rebuilds index seek keys from the predicate, so a
+//               repeated shape hits regardless of its literals. A SELECT whose
+//               later execution is both slower than 50ms and at least 8x its
+//               first replay is dropped and planned again (parameter sniffing).
+//               Shapes that cannot keep the slots fall back to an
+//               identical-parameter replay and are never permanently retired.
 //           (b) kInsert: a parametric artifact whose bindable literals were
 //               replaced by ParameterSlot placeholders; runtime values are
 //               injected per execution ("prepared" style), so every repeated
@@ -57,6 +61,7 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/unary_expression.hpp"
 #include "plan/plan.hpp"
 #include "query/statement.hpp"
@@ -90,162 +95,6 @@ struct PlanCacheCounters {
 inline PlanCacheCounters& PlanCacheStats() {
   static PlanCacheCounters counters;
   return counters;
-}
-
-// ---------------------------------------------------------------------------
-// PreparedValues: one instance per execution, holding that execution's bound
-// parameter values. ParameterSlot nodes read through a shared_ptr to it, so
-// concurrent executions of one cached artifact never share mutable state.
-// ---------------------------------------------------------------------------
-class PreparedValues {
- public:
-  explicit PreparedValues(std::vector<Value> values)
-      : values_(std::move(values)) {}
-  [[nodiscard]] const Value& at(size_t index) const { return values_[index]; }
-
- private:
-  std::vector<Value> values_;
-};
-
-// A placeholder standing in for one bindable literal inside a cached INSERT
-// artifact. Evaluate() returns this execution's value for the slot.
-//
-// Type() masquerades as kConstantValue so existing expression walkers treat
-// the node as a leaf. INVARIANT: these nodes must remain confined to plan-cache
-// artifacts; nothing may call AsConstantValue() on them (it would downcast a
-// ParameterSlot to ConstantValue -- undefined behavior). The artifact is only
-// ever consumed by Evaluate() in the insert fast path and by ToString/Dump.
-class ParameterSlot final : public ExpressionBase {
- public:
-  ParameterSlot(size_t slot_index, ValueType expected,
-                std::shared_ptr<const PreparedValues> values)
-      : slot_index_(slot_index),
-        expected_(expected),
-        values_(std::move(values)) {}
-
-  [[nodiscard]] size_t Index() const { return slot_index_; }
-
-  // Rebinds this slot (inside a cloned subtree) to another execution's values.
-  [[nodiscard]] Expression Rebind(
-      const std::shared_ptr<const PreparedValues>& values) const {
-    return std::make_shared<ParameterSlot>(slot_index_, expected_, values);
-  }
-
-  [[nodiscard]] TypeTag Type() const override {
-    return TypeTag::kConstantValue;
-  }
-  [[nodiscard]] Value Evaluate(const Row& /*row*/,
-                               const Schema& /*schema*/) const override {
-    return values_->at(slot_index_);
-  }
-  [[nodiscard]] Value Evaluate(const Row* /*left*/,
-                               const Schema& /*left_schema*/,
-                               const Row* /*right*/,
-                               const Schema& /*right_schema*/) const override {
-    return values_->at(slot_index_);
-  }
-  [[nodiscard]] tinylamb::Type ResultType(
-      const Schema& /*unused*/) const override {
-    return TypeFor(expected_);
-  }
-  [[nodiscard]] tinylamb::Type ResultType(
-      const Schema& /*unused*/, const Schema& /*unused*/) const override {
-    return TypeFor(expected_);
-  }
-  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override {
-    return {};
-  }
-  [[nodiscard]] std::string ToString() const override {
-    return "<?" + std::to_string(slot_index_) + ">";
-  }
-  void Dump(std::ostream& o) const override { o << ToString(); }
-
- private:
-  static tinylamb::Type TypeFor(ValueType value_type) {
-    switch (value_type) {
-      case ValueType::kInt64:
-        return {TypeTag::kBigInt};
-      case ValueType::kDouble:
-        return {TypeTag::kDouble};
-      case ValueType::kVarChar:
-        return {TypeTag::kVarChar};
-      case ValueType::kDate:
-        return {TypeTag::kDate};
-      case ValueType::kArray:
-        return {TypeTag::kArray};
-      default:
-        return {TypeTag::kInvalid};
-    }
-  }
-
-  size_t slot_index_;
-  ValueType expected_;
-  std::shared_ptr<const PreparedValues> values_;
-};
-
-// True when any bindable literal (the kinds ExtractSqlTemplate turns into
-// parameters) sits under `expression`.
-inline bool IsBindableLiteral(const Value& value) {
-  return !value.IsNull() &&
-         (value.type == ValueType::kInt64 || value.type == ValueType::kDouble ||
-          value.type == ValueType::kVarChar || value.type == ValueType::kDate);
-}
-
-inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)
-    const Expression& expression) {
-  if (!expression) {
-    return false;
-  }
-  switch (expression->Type()) {
-    case TypeTag::kConstantValue:
-      return dynamic_cast<const ParameterSlot*>(expression.get()) != nullptr;
-    case TypeTag::kBinaryExp: {
-      const auto& binary = expression->AsBinaryExpression();
-      return ContainsParameterSlot(binary.Left()) ||
-             ContainsParameterSlot(binary.Right());
-    }
-    case TypeTag::kUnaryExp:
-      return ContainsParameterSlot(expression->AsUnaryExpression().Child());
-    case TypeTag::kAggregateExp:
-      return ContainsParameterSlot(expression->AsAggregateExpression().Child());
-    case TypeTag::kCaseExp: {
-      const auto& searched = expression->AsCaseExpression();
-      for (const auto& clause : searched.when_clauses_) {
-        if (ContainsParameterSlot(clause.first) ||
-            ContainsParameterSlot(clause.second)) {
-          return true;
-        }
-      }
-      return ContainsParameterSlot(searched.else_clause_);
-    }
-    case TypeTag::kInExp: {
-      const auto& in = expression->AsInExpression();
-      if (ContainsParameterSlot(in.child_)) {
-        return true;
-      }
-      return std::ranges::any_of(in.list_, [](const Expression& item) {
-        return ContainsParameterSlot(item);
-      });
-    }
-    case TypeTag::kFunctionCallExp:
-      for (const Expression& arg :
-           expression->AsFunctionCallExpression().Args()) {
-        if (ContainsParameterSlot(arg)) {
-          return true;
-        }
-      }
-      return false;
-    case TypeTag::kArrayExp:
-      for (const Expression& element :
-           expression->AsArrayExpression().Elements()) {
-        if (ContainsParameterSlot(element)) {
-          return true;
-        }
-      }
-      return false;
-    default:
-      return false;
-  }
 }
 
 // Rebuilds `expression` so every ParameterSlot reads from `values`. Slot-free
@@ -389,106 +238,6 @@ inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
   }
 }
 
-// Replaces bindable literals with ParameterSlot placeholders (fill time).
-// `ok` is cleared on unsupported shapes (subqueries): callers then skip
-// caching and the statement keeps using the legacy path forever.
-inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
-    const Expression& expression, size_t* slot_cursor, bool* ok) {
-  if (!expression) {
-    return expression;
-  }
-  switch (expression->Type()) {
-    case TypeTag::kConstantValue: {
-      const Value current = expression->AsConstantValue().GetValue();
-      if (!IsBindableLiteral(current)) {
-        return expression;
-      }
-      return std::make_shared<ParameterSlot>(
-          (*slot_cursor)++, current.type,
-          std::make_shared<PreparedValues>(std::vector<Value>{}));
-    }
-    case TypeTag::kColumnValue:
-      return expression;
-    case TypeTag::kBinaryExp: {
-      const auto& binary = expression->AsBinaryExpression();
-      return BinaryExpressionExp(
-          SlotizeLiterals(binary.Left(), slot_cursor, ok), binary.Op(),
-          SlotizeLiterals(binary.Right(), slot_cursor, ok));
-    }
-    case TypeTag::kUnaryExp: {
-      const auto& unary = expression->AsUnaryExpression();
-      return UnaryExpressionExp(SlotizeLiterals(unary.Child(), slot_cursor, ok),
-                                unary.Op());
-    }
-    case TypeTag::kAggregateExp: {
-      const auto& aggregate = expression->AsAggregateExpression();
-      return AggregateExpressionExp(
-          aggregate.GetType(),
-          SlotizeLiterals(aggregate.Child(), slot_cursor, ok),
-          aggregate.Distinct());
-    }
-    case TypeTag::kCaseExp: {
-      const auto& searched = expression->AsCaseExpression();
-      std::vector<std::pair<Expression, Expression>> clauses;
-      clauses.reserve(searched.when_clauses_.size());
-      for (const auto& clause : searched.when_clauses_) {
-        clauses.emplace_back(SlotizeLiterals(clause.first, slot_cursor, ok),
-                             SlotizeLiterals(clause.second, slot_cursor, ok));
-        if (!*ok) {
-          return expression;
-        }
-      }
-      return CaseExpressionExp(
-          std::move(clauses),
-          SlotizeLiterals(searched.else_clause_, slot_cursor, ok));
-    }
-    case TypeTag::kInExp: {
-      const auto& in = expression->AsInExpression();
-      std::vector<Expression> list;
-      list.reserve(in.list_.size());
-      for (const Expression& item : in.list_) {
-        list.push_back(SlotizeLiterals(item, slot_cursor, ok));
-        if (!*ok) {
-          return expression;
-        }
-      }
-      return InExpressionExp(SlotizeLiterals(in.child_, slot_cursor, ok),
-                             std::move(list));
-    }
-    case TypeTag::kFunctionCallExp: {
-      const auto& call = expression->AsFunctionCallExpression();
-      std::vector<Expression> args;
-      args.reserve(call.Args().size());
-      for (const Expression& arg : call.Args()) {
-        args.push_back(SlotizeLiterals(arg, slot_cursor, ok));
-        if (!*ok) {
-          return expression;
-        }
-      }
-      return FunctionCallExp(call.FuncName(), std::move(args));
-    }
-    case TypeTag::kArrayExp: {
-      const auto& array = expression->AsArrayExpression();
-      std::vector<Expression> elements;
-      elements.reserve(array.Elements().size());
-      for (const Expression& element : array.Elements()) {
-        elements.push_back(SlotizeLiterals(element, slot_cursor, ok));
-        if (!*ok) {
-          return expression;
-        }
-      }
-      return ArrayExpressionExp(std::move(elements), array.ElementSqlType());
-    }
-    case TypeTag::kIntervalExp: {
-      const auto& interval = expression->AsIntervalExpression();
-      return IntervalExpressionExp(interval.Amount(), interval.Unit());
-    }
-    default:
-      *ok = false;  // e.g. kQueryExp: not expressible as a flat slot template.
-      return expression;
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Cached artifact.
 // ---------------------------------------------------------------------------
@@ -503,11 +252,17 @@ struct CompiledPlan {
   // plan compiled for another database instance from being replayed here.
   const Database* database{nullptr};
   uint64_t epoch{0};
-  // Fill-time parameter values for the specialized tiers (kSelect/kUpdate/
-  // kDelete). A hit requires exact equality: identical parameters produce an
-  // identical bound statement, so the specialized plan's baked constants and
-  // index ranges remain correct.
+  // Fill-time parameter values. When `parameter_slots` is non-empty the plan
+  // is parametric and these values are only the sniffed bindings from the
+  // fill. When it is empty, a non-INSERT hit still requires exact equality.
   std::vector<Value> parameters;
+  // Optimizer-resident slots shared with the plan tree, in parameter order.
+  // Empty when the shape could not be slotized; replay then requires equal
+  // parameters and a miss recompiles without retiring the fingerprint.
+  std::vector<Expression> parameter_slots;
+  // First successful SELECT replay's elapsed time. Later replays that are
+  // both above the floor and several times this baseline drop the entry.
+  mutable std::atomic<uint64_t> reuse_baseline_ns{0};
 
   // Specialized tiers: the compiled physical plan.
   std::shared_ptr<PlanBase> plan;
@@ -565,29 +320,45 @@ struct CompiledPlan {
 
 using CompiledPlanPtr = std::shared_ptr<const CompiledPlan>;
 
-// Constant-specialized SELECT/UPDATE/DELETE plans bake their literal bounds
-// into the plan and therefore almost never match another OLTP request. Keep
-// those artifacts local to the worker that compiled them; after repeated
-// literal churn, stop replacing the artifact for that fingerprint.
+// SELECT/UPDATE/DELETE plans are thread-local: Bind() mutates the slots in
+// the cached tree, so two workers must not share one artifact. INSERT stays
+// in the process-global cache because each execution clones its slots.
 inline thread_local std::unordered_map<std::string, CompiledPlanPtr>
     thread_compiled_plans;
-inline thread_local std::unordered_map<std::string, uint8_t>
-    thread_specialized_mismatches;
 inline thread_local std::unordered_set<std::string>
     thread_volatile_specialized_plans;
 inline constexpr size_t kThreadCompiledPlanCapacity = 256;
+
+// A reused SELECT is planned again when a later execution is slower than
+// 50ms and at least 8x the first replay. Point lookups stay cached. A plan
+// that becomes pathologically slow for a new literal is dropped.
+inline constexpr uint64_t kSelectReuseLatencyFloorNs = 50'000'000ULL;
+inline constexpr uint64_t kSelectReuseLatencyFactor = 8;
+
+inline bool SelectReuseExceededThreshold(uint64_t elapsed_ns,
+                                         uint64_t baseline_ns) {
+  if (baseline_ns == 0 || elapsed_ns <= kSelectReuseLatencyFloorNs) {
+    return false;
+  }
+  return elapsed_ns > baseline_ns * kSelectReuseLatencyFactor;
+}
 
 inline bool IsVolatileSpecializedPlan(const std::string& fingerprint) {
   return thread_volatile_specialized_plans.contains(fingerprint);
 }
 
-inline void NoteSpecializedParameterMismatch(const std::string& fingerprint) {
-  uint8_t& mismatches = thread_specialized_mismatches[fingerprint];
-  if (++mismatches < 4) {
-    return;
+// Prepends a fingerprint to the volatile set for the duration of one
+// statement compile (used by the DML subquery fold path), returning true
+// when the entry was freshly added so the caller can demote it later.
+inline bool MarkFingerprintVolatile(const std::string& fingerprint) {
+  return thread_volatile_specialized_plans.insert(fingerprint).second;
+}
+
+inline void DemoteVolatileFingerprint(const std::string& fingerprint,
+                                      bool was_fresh) {
+  if (was_fresh) {
+    thread_volatile_specialized_plans.erase(fingerprint);
   }
-  thread_volatile_specialized_plans.insert(fingerprint);
-  thread_compiled_plans.erase(fingerprint);
 }
 
 inline CompiledPlanPtr FindThreadCompiledPlan(const std::string& fingerprint,
@@ -620,6 +391,10 @@ inline void StoreThreadCompiledPlan(const std::string& fingerprint,
                                     CompiledPlanPtr plan) {
   RememberThreadCompiledPlan(fingerprint, std::move(plan));
   PlanCacheStats().fills.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void ForgetThreadCompiledPlan(const std::string& fingerprint) {
+  thread_compiled_plans.erase(fingerprint);
 }
 
 // ---------------------------------------------------------------------------

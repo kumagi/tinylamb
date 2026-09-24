@@ -25,6 +25,7 @@
 #include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "plan/plan.hpp"
 #include "type/column.hpp"
 #include "type/schema.hpp"
@@ -40,7 +41,8 @@ AggregationPlan::AggregationPlan(Plan child,
     : child_(std::move(child)),
       aggregates_(std::move(aggregates)),
       strategy_(strategy),
-      schema_(GenerateSchema()) {}
+      schema_(GenerateSchema()),
+      output_stats_(GenerateOutputStats()) {}
 
 const Schema& AggregationPlan::GetSchema() const { return schema_; }
 
@@ -52,14 +54,25 @@ const Table* AggregationPlan::ScanSource() const {
 }
 
 const TableStatistics& AggregationPlan::GetStats() const {
-  return child_->GetStats();
+  return output_stats_;
 }
 
 size_t AggregationPlan::AccessRowCount() const {
   return child_->AccessRowCount();
 }
 
-size_t AggregationPlan::EmitRowCount() const { return 1; }
+size_t AggregationPlan::EmitRowCount() const { return output_stats_.Rows(); }
+
+TableStatistics AggregationPlan::GenerateOutputStats() const {
+  std::vector<ColumnStats> columns;
+  columns.reserve(schema_.ColumnCount());
+  for (size_t i = 0; i < schema_.ColumnCount(); ++i) {
+    columns.emplace_back(schema_.GetColumn(i).Type());
+  }
+  TableStatistics stats(schema_);
+  stats.Assign(1, std::move(columns));
+  return stats;
+}
 
 std::string AggregationPlan::ToString() const {
   const char* name = "HashAggregate";
@@ -114,7 +127,8 @@ Schema AggregationPlan::GenerateSchema() const {
     ValueType type = ValueType::kInt64;
     if (expression.GetType() == AggregationType::kAvg) {
       type = ValueType::kDouble;
-    } else if (expression.GetType() != AggregationType::kCount) {
+    } else if (expression.GetType() != AggregationType::kCount &&
+               expression.Child()) {
       // SUM/MIN/MAX inherit their argument's evaluated type so that
       // arithmetic arguments (e.g. TPC-H Q1
       // sum(l_extendedprice*(1-l_discount))) do not silently claim Int64.
@@ -138,6 +152,29 @@ Schema AggregationPlan::GenerateSchema() const {
     columns.emplace_back(agg.name, type);
   }
   return {"", columns};
+}
+
+bool AggregationPlan::ContainsParameterSlots() const {
+  if (child_->ContainsParameterSlots()) {
+    return true;
+  }
+  return std::ranges::any_of(aggregates_, [](const NamedExpression& aggregate) {
+    return ContainsParameterSlot(aggregate.expression);
+  });
+}
+
+bool AggregationPlan::InstallParameterSlots(
+    const std::vector<Value>& parameters, size_t* cursor,
+    std::vector<Expression>* slots) {
+  if (!child_->InstallParameterSlots(parameters, cursor, slots)) {
+    return false;
+  }
+  for (NamedExpression& aggregate : aggregates_) {
+    if (!SlotizeInPlace(&aggregate.expression, parameters, cursor, slots)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace tinylamb

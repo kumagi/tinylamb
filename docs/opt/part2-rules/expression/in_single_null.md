@@ -59,7 +59,7 @@ SQL 標準における述語 $x \in \{y_1, y_2, \dots, y_n\}$ の意味論は、
 ### 2. 式の脱落に伴う例外消去の防止
 式書き換えによって被演算子 $x$ を消去しスカラー定数へ置き換える操作は、$x$ の評価を完全に破棄することを意味します。tinylamb の AST 参照評価器（`expression/in_expression.cpp`）では、演算子の左辺ノードを右辺リストの照合に先立って先行評価します。
 
-もし $x$ に例外を発生させる式（例: `(INT64_MIN / 0)` や無効な文字列からのキャスト）が含まれていた場合、元のクエリは行の評価時に実行時エラーを送出しなければなりません。ここで無条件に式を NULL 定数へ畳み込むと、本来発生すべきエラーが握りつぶされ、クエリ結果が空行（WHERE 節による除外）としてサイレントに処理される意味論破壊が生じます。
+$x$ に例外を送出する式（例: `(INT64_MIN / 0)` や無効な文字列からのキャスト）が含まれる場合、元のクエリは行の評価時に実行時エラーを返す必要があります。式を無条件に NULL 定数へ畳み込むと、このエラーが発生せず、WHERE 節が行を除外してクエリが正常終了します。これは元のクエリと異なる動作です。
 
 ```cpp
     // x IN (NULL) -> NULL, but only when x cannot raise: evaluating the
@@ -93,4 +93,4 @@ SQL 標準における述語 $x \in \{y_1, y_2, \dots, y_n\}$ の意味論は、
 - `query/expr_oracle_fuzzer_test.cpp` の `ExprOracleFuzzer.ReplayPinnedInNullDivisionThrowRegression`:
   ファザーが発見した反例 `((-9223372036854775807 - 1) / 0.0) IN (CAST(NULL AS FLOAT64))`（シード `0x16b1e8b4`）において、0 除算例外が畳み込みによって消去されず正しく送出されることをピン留め検証します。
 - `expression/rewrite_test.cpp` の `ExpressionRewriteTest.NotInNullSemantics`:
-  兄弟 Rule となる NOT IN 系の書き換えを通じ、単一 NULL リストに対する畳み込みの意味論的一貫性を間接的に担保します。
+  兄弟 Rule となる NOT IN 系の書き換えを通じ、単一 NULL リストに対する畳み込みの意味論的一貫性を間接的に保証します。

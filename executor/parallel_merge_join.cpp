@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <exception>
 #include <iostream>
@@ -17,6 +18,7 @@
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
+#include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
@@ -25,6 +27,23 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+namespace {
+
+bool JoinValueEqual(const Value& left, const Value& right) {
+  if (left.IsNull() || right.IsNull()) {
+    return false;
+  }
+  const auto result = TryEvaluateBinary(BinaryOperation::kEquals, left, right);
+  return result.HasValue() && !result.Value().IsNull() &&
+         result.Value().Truthy();
+}
+
+bool JoinValueUnmatchable(const Value& value) {
+  return value.type == ValueType::kDouble &&
+         std::isnan(value.value.double_value);
+}
+
+}  // namespace
 
 ParallelMergeJoin::ParallelMergeJoin(
     Executor left, std::vector<slot_t> left_cols, Executor right,
@@ -45,6 +64,14 @@ bool ParallelMergeJoin::KeyIsNull(const Row& row,
                                   const std::vector<slot_t>& cols) {
   return std::ranges::any_of(cols, [&row](slot_t col) {
     return col < row.Size() && row[col].IsNull();
+  });
+}
+
+bool ParallelMergeJoin::KeyCannotMatch(const Row& row,
+                                       const std::vector<slot_t>& cols) {
+  return std::ranges::any_of(cols, [&](slot_t col) {
+    return col >= row.Size() || row[col].IsNull() ||
+           JoinValueUnmatchable(row[col]);
   });
 }
 
@@ -92,12 +119,10 @@ int ParallelMergeJoin::CompareKeys(const Row& left,
   for (size_t i = 0; i < n; ++i) {
     const Value& lv = left[left_cols[i]];
     const Value& rv = right[right_cols[i]];
-    if (lv < rv) {
-      return -1;
+    if (JoinValueEqual(lv, rv)) {
+      continue;
     }
-    if (rv < lv) {
-      return 1;
-    }
+    return CompareForOrderBy(lv, rv) < 0 ? -1 : 1;
   }
   return 0;
 }
@@ -211,7 +236,7 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
     size_t r = range.right_start;
 
     while (l < range.left_end && r < range.right_end) {
-      if (KeyIsNull(left_rows_[l].first, left_cols_)) {
+      if (KeyCannotMatch(left_rows_[l].first, left_cols_)) {
         if (kind_ == JoinKind::kAnti) {
           out.emplace_back(left_rows_[l].first, left_rows_[l].second);
         } else if (pads_left) {
@@ -220,7 +245,7 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
         ++l;
         continue;
       }
-      if (KeyIsNull(right_rows_[r].first, right_cols_)) {
+      if (KeyCannotMatch(right_rows_[r].first, right_cols_)) {
         // NULL keys never match; RIGHT/FULL outer still keep the row.
         if (pads_right) {
           emit_padded_right(r);
@@ -354,18 +379,26 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
     std::vector<std::jthread> workers;
     workers.reserve(partitions_.size());
     for (size_t p = 0; p < partitions_.size(); ++p) {
-      workers.emplace_back([&, p]() {
-        try {
-          worker_func(p);
-        } catch (...) {
-          // An exception escaping a raw std::thread terminates the process;
-          // latch the first failure and rethrow on the joining thread.
-          std::scoped_lock guard(failure_mutex);
-          if (!worker_failure) {
-            worker_failure = std::current_exception();
+      try {
+        workers.emplace_back([&, p]() {
+          try {
+            worker_func(p);
+          } catch (...) {
+            // An exception escaping a raw std::thread terminates the process;
+            // latch the first failure and rethrow on the joining thread.
+            std::scoped_lock guard(failure_mutex);
+            if (!worker_failure) {
+              worker_failure = std::current_exception();
+            }
           }
+        });
+      } catch (...) {
+        std::scoped_lock guard(failure_mutex);
+        if (!worker_failure) {
+          worker_failure = std::current_exception();
         }
-      });
+        break;
+      }
     }
     for (auto& w : workers) {
       w.join();

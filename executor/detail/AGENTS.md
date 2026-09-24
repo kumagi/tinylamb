@@ -8,8 +8,8 @@ Namespace `relational_detail`. Promotion to a real layer is an open A5 item.
 ## Key files
 
 - `relation.{hpp,cpp}` — `Relation{schema, rows, spill, using_columns,
-  charged_bytes, join stats}` + `Materialize/CopyStats/NoteSpill`:
-  materialization, spilling, memory accounting.
+  charged_bytes, join stats}` + `MaterializeRelation/CopyExecutionStats/
+  NoteRelationSpill`: materialization, spilling, memory accounting.
 - `expression_eval.{hpp,cpp}` — row-at-a-time fallback evaluation
   (`Evaluate/Lookup/Binary/Like/Truthy`) + aggregation accumulators
   (SUM/MIN/MAX, stats, HLL/KLL, APPROX_TOP…). Former three-valued-logic and

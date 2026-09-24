@@ -1,25 +1,47 @@
 # 第70章 式書き換え — フレームワークと自明な Rule の一括解説
 
 - 状態: draft / 執筆基準リビジョン: `3880673` (2026-09-12)
-- 位置づけ: 3層のRuleセット（第1章 1-4節）のうち最下層に位置する式書き換え（`ExpressionRuleSet`）のフレームワークを解説し、自明な35本のRuleを一括して整理します。非自明な残り38本は第2部 `part2-rules/expression/` の個別章で扱います（70-5節）。パターンの構文は第30章の `cascades::dsl` と対比しながら確認します。
 
-## 70-1. 3層Ruleの最下層 — 最適化の入口
+`ExpressionRuleSet` は、スカラー式を直接書き換える最下層の Rule セットです。
+この章ではフレームワークと基本的な 35 本を説明し、適用条件の複雑な 38 本は
+第 2 部の個別章へ分けます。
 
-式書き換えRuleは、論理同値Ruleと異なりメモ構造を介さずに動作します。論理同値Ruleがメモに同値な関係代数式を追加するのに対し、式書き換えRuleはスカラー式（ASTの `Expression`）を入力として受け取り、等価なスカラー式を返します。したがって、メモ、同値グループ、コスト計算のいずれにも依存しません。定義は `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` に置かれています。基準リビジョンでは74回の `built.Add` を呼び出しますが、`abs_of_abs` が同名で2回登録されているため（`Add` は同名登録を上書きする仕様、70-2節）、実効的な登録数は73本です。このうち本章で35本、第2部で38本を扱い、合計73本が `00-index.md` の一覧と整合しています。
+## 70-1. スカラー式を直接変換する Rule
 
-式書き換えが実行される契機は、オプティマイザの初期処理に留まりません。実行経路は以下の3箇所に存在します。
+式書き換え Rule は、論理同値 Rule と異なり、メモ構造を介さずに動作します。
+論理同値 Rule がメモに同値な関係代数式を追加するのに対し、式書き換え Rule は
+スカラー式（AST の `Expression`）を受け取り、等価なスカラー式を返します。
+したがって、メモ、同値 Group、コスト計算のいずれにも依存しません。
 
-1. `plan/optimizer.cpp` の `Optimizer::Optimize` 冒頭（第1章 1-5節 (1)）: ORDER BYキー、SELECT式、WHERE述語、外部結合のON条件の正規化。
+定義は `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` にあります。
+基準リビジョンでは `built.Add` を 74 回呼び出しますが、`abs_of_abs` が同名で
+2 回登録されています。`Add` は同名登録を上書きするため（70-2 節）、実効的な
+登録数は 73 本です。本章で 35 本、第 2 部で 38 本を扱い、合計 73 本が
+`00-index.md` の一覧と一致します。
+
+式書き換えは、オプティマイザの初期処理以外でも実行されます。実行経路は次の
+3 箇所です。
+
+1. `plan/optimizer.cpp` の `Optimizer::Optimize` 冒頭（第 1 章 1-5 節（1））: ORDER BY キー、SELECT 式、WHERE 述語、外部結合の ON 条件の正規化。
 2. `expression/bytecode.cpp` の `BytecodeCompiler::Compile`: バイトコード生成直前の簡約。
 3. `executor/detail/scan_filter.cpp` の `TryCompileSimpleCompare`: スキャン事前フィルタの構築。
 
-SELECT句とORDER BYキーに対しては、`inner_join_not_null_inference` を除外した `value_context_rules` を適用します（第1章 1-5節 (1)）。さらにWHERE述語、ON条件、バイトコード生成、スキャン事前フィルタでは、`ContainsNotOfOrderedDoubleComparison` が真となる木に限り、`not_comparison` を除外した `NotComparisonFreeRules()` を適用します（70-3(b)節）。
+SELECT 句と ORDER BY キーには、`inner_join_not_null_inference` を除外した
+`value_context_rules` を適用します（第 1 章 1-5 節（1））。WHERE 述語、
+ON 条件、バイトコード生成、スキャン事前フィルタでは、
+`ContainsNotOfOrderedDoubleComparison` が真となる木に限り、`not_comparison` を
+除外した `NotComparisonFreeRules()` を適用します（70-3（b）節）。
 
-この最下層での正規化は、上位の論理最適化を補助する役割を果たします。たとえば `canonicalize_comparison` によって定数を右辺に集めたり、`or_of_ranges_to_in` によって等値ORをINリストにまとめたりすることで、上位の論理Ruleやインデックスアクセスのパターン照合が成立しやすくなります。
+この最下層での正規化は、上位の論理最適化を補助します。例えば、
+`canonicalize_comparison` は定数を右辺に集め、`or_of_ranges_to_in` は等値 OR を
+IN リストにまとめます。その結果、上位の論理 Rule やインデックスアクセスの
+パターンに照合しやすくなります。
 
 ## 70-2. フレームワーク — Pattern、Rule、RuleSet、Rewriter
 
-式書き換えのフレームワークは、`expression/rewrite.hpp` に定義された4つの部品（`ExpressionPattern`、`ExpressionRule`、`ExpressionRuleSet`、`ExpressionRewriter`）で構成されます。
+式書き換えのフレームワークは、`expression/rewrite.hpp` に定義された 4 つの
+部品（`ExpressionPattern`、`ExpressionRule`、`ExpressionRuleSet`、
+`ExpressionRewriter`）で構成されます。
 
 まず照合パターンを表現する `ExpressionPattern` を確認します。
 
@@ -41,15 +63,36 @@ class ExpressionPattern {
 };
 ```
 
-関係演算子を対象とする第30章の `Pattern` と比較すると、2つの違いがあります。第1に、照合対象がスカラー式であるため、キャプチャされる値も部分式（`ExpressionBindings` は名前から `Expression` への写像）となります。第2に、演算子指定が `std::optional` となっており、任意の演算子に一致させる条件を `nullopt` で表現します。
+関係演算子を対象とする第 30 章の `Pattern` と比べると、2 つの違いがあります。
+1 点目は、照合対象がスカラー式であり、キャプチャする値も部分式であることです。
+`ExpressionBindings` は、名前から `Expression` への写像です。2 点目は、
+演算子指定が `std::optional` であり、任意の演算子に一致する条件を `nullopt` で
+表すことです。
 
-構築用DSLである `expression_dsl` には、`Any`、`Is`（型指定）、`Binary`、`AnyBinary`、`Unary`、`AnyUnary` の6関数が用意されています。これらはファクトリメソッドへの直接の委譲です。`ExpressionPattern::Match` の照合処理では、同一のキャプチャ名が複数回現れた場合に `Same`（ノード種別と `ToString()` の完全一致）を要求します。一致しない場合は照合失敗となります。この仕組みにより、`and_idempotent` のような「左右に同一の部分式が現れる」規則は、`Any("x")` を左右に指定するだけで記述できます。
+構築用 DSL である `expression_dsl` には、`Any`、`Is`（型指定）、`Binary`、
+`AnyBinary`、`Unary`、`AnyUnary` の 6 関数があります。いずれもファクトリ
+メソッドへ直接委譲します。`ExpressionPattern::Match` は、同じキャプチャ名が
+複数回現れた場合に `Same`（ノード種別と `ToString()` の完全一致）を要求します。
+一致しなければ照合に失敗します。この仕組みにより、`and_idempotent` のような
+「左右に同じ部分式が現れる」規則は、`Any("x")` を左右に指定するだけで
+記述できます。
 
-個々の規則を保持する `ExpressionRule` は、規則名、照合パターン、書き換え関数の3点に加え、`root_only` フラグを保持します。設計方針（D6、`docs/design.md`）では「述語を追加する規則はルートの論理積集合にのみ適用する」と定めています。述語を追加する書き換えをANDの内側で無制限に適用すると、推論された述語が新たなANDを生成し続け、不動点探索が停止しなくなるためです。
+個々の規則を保持する `ExpressionRule` は、規則名、照合パターン、書き換え関数の
+3 点に加え、`root_only` フラグを保持します。設計方針 D6
+（`docs/design.md`）では、「述語を追加する規則はルートの論理積集合にのみ
+適用する」と定めています。述語を追加する書き換えを AND の内側で無制限に
+適用すると、推論した述語が新たな AND を生成し続け、不動点探索が停止しない
+ためです。
 
-複数の規則を束ねる `ExpressionRuleSet` は、内部に `std::vector<ExpressionRule>` を保持する値型です。`Add` を呼び出すと、内部で `Remove(rule.Name())` を実行してから新しい規則を追加します。したがって、同名規則の再登録は上書きとして機能します。`abs_of_abs` が2回登録されている実装は、この上書き動作に依存しています。
+複数の規則を束ねる `ExpressionRuleSet` は、内部に
+`std::vector<ExpressionRule>` を保持する値型です。`Add` は内部で
+`Remove(rule.Name())` を実行してから、新しい規則を追加します。したがって、
+同名規則の再登録は上書きとして機能します。`abs_of_abs` の 2 回の登録は、
+この動作に依存しています。
 
-これらの規則を実行エンジンとして駆動するのが `ExpressionRewriter` です。`ExpressionRewriter` はRuleSetへの参照と探索パス上限 `pass_limit_` を保持します。書き換え処理の中核である `TryRewrite` の実装は以下のとおりです（`expression/rewrite.cpp`）。
+これらの規則を実行するのが `ExpressionRewriter` です。`ExpressionRewriter` は
+RuleSet への参照とパス数の上限 `pass_limit_` を保持します。書き換え処理の
+中核である `TryRewrite` の実装は次のとおりです（`expression/rewrite.cpp`）。
 
 ```cpp
 StatusOr<Expression> ExpressionRewriter::TryRewrite(
@@ -74,17 +117,28 @@ StatusOr<Expression> ExpressionRewriter::TryRewrite(
 }
 ```
 
-書き換えは、1パス（`TryRewriteOnce` の1回実行）ごとに式全体を走査し、`Same` による不動点判定が成立するまで繰り返されます。規定のパス上限（32回）は無限ループを防ぐ安全弁であり、上限を超過してもクエリ処理をエラーで中断しません。適用される各書き換えは意味論を保存しているため、不動点に達しなかった場合でも直前の安定形（`current`）をそのまま返すことで、安全に実行を継続できます。
+書き換えは、1 パス（`TryRewriteOnce` の 1 回の実行）ごとに式全体を走査し、
+`Same` による不動点判定が成立するまで繰り返します。パス数の上限は 32 回で、
+無限ループを防ぐ安全弁として機能します。上限に達してもクエリ処理は中断せず、
+直前の式（`current`）を返します。適用済みの各書き換えは意味を保存するため、
+この式も実行できます。
 
-1パスを担う `TryRewriteOnce` はボトムアップで進行します。まずすべての子ノードを再帰的に書き換えた後、親ノードに対して登録順にRuleを評価します。最初に変換式を返したRuleが採用され、即座に次の処理へ移ります。この際、`rule.root_only() && depth != 0` の条件を満たすRuleは評価をスキップします。
+1 パスを担う `TryRewriteOnce` はボトムアップで進みます。まず、すべての子ノードを
+再帰的に書き換え、その後で親ノードの Rule を登録順に評価します。変換式を
+最初に返した Rule を採用し、次の処理へ移ります。
+`rule.root_only() && depth != 0` を満たす Rule は評価しません。
 
-## 70-3. 型と安全性の境界 — 2つの分割
+## 70-3. 型と安全性の境界 — 2 つの分割
 
-式書き換えRuleは、入力スキーマの情報を持たずに実行されます（空のスキーマ `TryEvaluate(Row(), Schema())` を渡して定数判定を行う設計）。スキーマ非依存の設計は任意の場面で呼び出せる利点を持つ反面、式の静的型が未確定であるために生じる安全上の境界が存在します。tinylambでは、この問題を2通りの手法で切り分けています。
+式書き換え Rule は、入力スキーマの情報を持たずに実行されます。定数判定では、
+空のスキーマを `TryEvaluate(Row(), Schema())` に渡します。この設計により任意の
+場所から呼び出せますが、式の静的型が未確定であることに注意が必要です。
+tinylamb では、この問題を 2 通りの方法で扱います。
 
 ### (a) 型確定が必要な算術書き換えの分離 — `RewriteTypedArithmetic`
 
-型情報が確定しなければ安全性を保証できない算術変形は、汎用RuleSetから切り離し、専用の関数として実装されています（`expression/rewrite.hpp`）。
+型情報がなければ安全性を保証できない算術変形は、汎用 RuleSet から切り離し、
+専用の関数として実装しています（`expression/rewrite.hpp`）。
 
 ```cpp
 // Applies arithmetic rewrites that require resolved input-column types.
@@ -94,7 +148,10 @@ StatusOr<Expression> ExpressionRewriter::TryRewrite(
                                                 const Schema& input_schema);
 ```
 
-`RewriteTypedArithmetic` は、`TryRewrite` が完了した後に、入力スキーマが確定したオプティマイザの文脈（SELECT句、WHERE句、外部結合ON条件）から個別に呼び出されます。対象となる変形は、`-1 * x` の単項マイナス化、`x + x` から `x * 2` への変換、加減算の定数再結合、そして `x * 0` の畳み込みです。
+`RewriteTypedArithmetic` は `TryRewrite` の完了後、入力スキーマが確定した
+オプティマイザの文脈（SELECT 句、WHERE 句、外部結合の ON 条件）から個別に
+呼び出します。対象は、`-1 * x` の単項マイナス化、`x + x` から `x * 2` への
+変換、加減算の定数再結合、`x * 0` の畳み込みです。
 
 とくに `x * 0` の畳み込みには型による制限が課されています（`expression/rewrite.cpp`）。
 
@@ -108,13 +165,19 @@ StatusOr<Expression> ExpressionRewriter::TryRewrite(
     }
 ```
 
-浮動小数点数における `x * 0.0` は、NaNや無限大の入力に対して `0.0` にならないため、無条件のゼロへの変形は意味論を破壊します。そのため、この変形はオペランドが静的に `INT64` であると確定している場合に限定されます。さらに、列 `x` が NULL の場合に式全体が NULL を返さなければならないSQLの3値論理を維持するため、単純な `0` ではなく `CASE WHEN x IS NULL THEN CAST(NULL AS INT64) ELSE CAST(0 AS INT64) END` へと展開されます。
+浮動小数点数の `x * 0.0` は、`x` が NaN や無限大の場合に `0.0` を返しません。この式を無条件にゼロへ変換すると結果が変わるため、オペランドが静的に `INT64` だと分かる場合に限定します。また、列 `x` が NULL なら式全体も NULL になるという SQL の三値論理を保つため、単純な `0` ではなく `CASE WHEN x IS NULL THEN CAST(NULL AS INT64) ELSE CAST(0 AS INT64) END` へ展開します。
 
 ### (b) NaN と NOT — 型ブラインドな Rule の境界
 
-スキーマを持たないRuleSetでは、浮動小数点数特有の意味論を見落とす危険が生じます。顕著な例が `not_comparison` です。二値論理においては `NOT(x < y)` を `x >= y` へ変形することは自明ですが、IEEE 754の浮動小数点演算においては成り立ちません。順序比較はオペランドのいずれかがNaNである場合に常にFALSEを返すため、`x` がNaNのとき `NOT(NaN < y)` はTRUEとなる一方、変形後の `NaN >= y` はFALSEに評価されます。
+スキーマを持たない RuleSet では、浮動小数点数に固有の意味を見落とす可能性が
+あります。`not_comparison` がその例です。二値論理では `NOT(x < y)` を
+`x >= y` へ変形できますが、IEEE 754 の浮動小数点演算では成り立ちません。
+順序比較は、オペランドのいずれかが NaN なら常に FALSE を返します。そのため、
+`x` が NaN のとき、`NOT(NaN < y)` は TRUE ですが、変形後の
+`NaN >= y` は FALSE です。
 
-tinylambはこの安全性の境界を明示的な判定関数と代替RuleSetによって制御しています（`expression/rewrite.hpp`）。
+tinylamb は、この境界を明示的な判定関数と代替 RuleSet で処理します
+（`expression/rewrite.hpp`）。
 
 ```cpp
 // True when the tree contains NOT(ordered-comparison) whose schema-typed
@@ -129,13 +192,18 @@ bool ContainsNotOfOrderedDoubleComparison(const Expression& expression,
 const ExpressionRuleSet& NotComparisonFreeRules();
 ```
 
-呼び出し側（バイトコードコンパイラやスキャン事前フィルタ）はスキーマ情報を保持しているため、対象の式木に「DOUBLE型となり得るオペランドを含む順序比較のNOT」が存在するかを判定します。該当する構造が検出された場合、`Default()` から `not_comparison` を除外した `NotComparisonFreeRules()` を選択して書き換えを実行します。
+呼び出し側（バイトコードコンパイラやスキャン事前フィルタ）はスキーマ情報を
+持つため、対象の式木に「DOUBLE 型となり得るオペランドを含む順序比較の NOT」が
+あるかを判定できます。該当する構造があれば、`Default()` から
+`not_comparison` を除外した `NotComparisonFreeRules()` で書き換えます。
 
 ## 70-4. 自明な Rule 35 本の一括解説
 
-`Default()` に含まれる自明な35本のRuleを、意味論に基づく6つのグループに分類して整理します。表中の「guard」列は、変換関数が適用を拒絶して `Expression{}`（空の式）を返す条件を示します。
+`Default()` に含まれる基本的な 35 本の Rule を、意味に基づいて 6 つの
+グループに分類します。表の「guard」列は、変換関数が適用を拒否して
+`Expression{}`（空の式）を返す条件です。
 
-### 定数畳み込み（4本）
+### 定数畳み込み（4 本）
 
 二項演算の定数畳み込みを担う `fold_binary` の実装は以下のとおりです（`expression/rewrite.cpp`）。
 
@@ -153,18 +221,22 @@ const ExpressionRuleSet& NotComparisonFreeRules();
         }));
 ```
 
-`fold_binary` は左右両辺が定数ノードである式を捕捉し、式全体の `TryEvaluate` を試みます。評価に成功した場合にのみ、得られた値を定数ノードとして返します。ゼロ除算（`1 / 0`）のように評価時にエラーを発生させる式は、`TryEvaluate` が失敗するため書き換えを行わず、実行時の例外処理を温存します。
+`fold_binary` は左右の辺がどちらも定数ノードである式を捉え、式全体の
+`TryEvaluate` を試みます。評価に成功した場合だけ、得られた値を定数ノードとして
+返します。ゼロ除算（`1 / 0`）のように実行時エラーとなる式は、`TryEvaluate` が
+失敗するため書き換えず、実行時に同じエラーを発生させます。
 
 | Rule | パターン → 書き換え | guard（適用除外条件） |
 |---|---|---|
 | `fold_binary` | 両辺が定数の二項演算 → `TryEvaluate` で評価した定数 | 評価失敗（ゼロ除算など） |
 | `fold_unary` | 子ノードが定数の単項演算 → `TryEvaluate` で評価した定数 | 評価失敗 |
-| `fold_in` | すべてのオペランドが定数の `IN` 式 → 評価した定数 | 非定数のオペランドが1つでも存在する場合 |
-| `fold_function` | 引数がすべてリテラル（定数またはINTERVAL）の関数呼出し → 評価した定数 | 関数の揮発性分類（`GetFunctionVolatility`）が `kImmutable` 以外（`RAND` や `NOW` など） |
+| `fold_in` | すべてのオペランドが定数の `IN` 式 → 評価した定数 | 非定数のオペランドが 1 つでも存在する場合 |
+| `fold_function` | 引数がすべてリテラル（定数または INTERVAL）の関数呼出し → 評価した定数 | 関数の揮発性分類（`GetFunctionVolatility`）が `kImmutable` 以外（`RAND` や `NOW` など） |
 
-### IN と CASE の正規化（6本）
+### IN と CASE の正規化（6 本）
 
-単一要素の `IN` 式を等値比較に変換する `singleton_in` では、NULL定数の扱いに注意が必要です（`expression/rewrite.cpp`）。
+単一要素の `IN` 式を等値比較に変換する `singleton_in` では、NULL 定数の扱いに
+注意が必要です（`expression/rewrite.cpp`）。
 
 ```cpp
           if (IsConstant(in.list_.front()) &&
@@ -173,18 +245,20 @@ const ExpressionRuleSet& NotComparisonFreeRules();
           }
 ```
 
-`x IN (NULL)` を単純に `x = NULL` に変換することは、三値論理の意味論上正しくありません（このケースは第2部の `in_single_null` が個別に引き受けます）。そのため、`singleton_in` はリスト要素がNULL定数の場合には適用を拒否します。
+`x IN (NULL)` を単純に `x = NULL` へ変換することは、三値論理では正しく
+ありません。このケースは、第 2 部の `in_single_null` が扱います。そのため、
+`singleton_in` はリスト要素が NULL 定数の場合に適用を拒否します。
 
 | Rule | パターン → 書き換え | guard（適用除外条件） |
 |---|---|---|
-| `singleton_in` | 要素が1つの `IN` 式（`x IN (c)`）→ 等値比較 `x = c` | リスト要素がNULL定数 |
+| `singleton_in` | 要素が 1 つの `IN` 式（`x IN (c)`）→ 等値比較 `x = c` | リスト要素が NULL 定数 |
 | `dedupe_in_list` | `IN` 式のリスト要素から重複を除去（順序維持） | 重複が存在しない場合 |
-| `empty_in_list` | リストが空の `IN` 式 → FALSE定数 | 左辺の子式が非NULLの静的定数でない場合（左辺がNULLのときは三値論理によりNULLを返さなければならないため） |
-| `simplify_case` | CASE式から定数WHEN条件を整理（定数TRUEに達した時点でELSEに繰り上げ、後続を枝刈り） | 定数のWHEN条件が1つも存在しない場合 |
-| `uniform_case_result` | すべてのWHEN分岐およびELSEの結果が同一値のCASE式 → その共通結果 | 各WHEN条件が `ExpressionCannotThrow`（評価時に例外を発生させない安全判定）かつ `SafeToReduceEvaluationCount`（副作用を含まない）を満たさない場合 |
-| `if_to_case` | 3引数の `IF(c, t, e)` → `CASE WHEN c THEN t ELSE e END` | なし（構文の正規化） |
+| `empty_in_list` | リストが空の `IN` 式 → FALSE 定数 | 左辺の子式が非 NULL の静的定数でない場合（左辺が NULL のときは三値論理により NULL を返す必要があるため） |
+| `simplify_case` | CASE 式から定数 WHEN 条件を整理（定数 TRUE に達した時点で ELSE に繰り上げ、後続を枝刈り） | 定数の WHEN 条件が 1 つも存在しない場合 |
+| `uniform_case_result` | すべての WHEN 分岐および ELSE の結果が同一値の CASE 式 → その共通結果 | 各 WHEN 条件が `ExpressionCannotThrow`（評価時に例外を発生させない安全判定）かつ `SafeToReduceEvaluationCount`（副作用を含まない）を満たさない場合 |
+| `if_to_case` | 3 引数の `IF(c, t, e)` → `CASE WHEN c THEN t ELSE e END` | なし（構文の正規化） |
 
-### 比較とブール論理の正規化（6本）
+### 比較とブール論理の正規化（6 本）
 
 論理演算の恒等式を処理する `boolean_identity` では、短絡評価と例外発生の順序が制約となります（`expression/rewrite.cpp`）。
 
@@ -201,12 +275,12 @@ const ExpressionRuleSet& NotComparisonFreeRules();
 | Rule | パターン → 書き換え | guard（適用除外条件） |
 |---|---|---|
 | `canonicalize_comparison` | 左辺が定数、右辺が非定数の二項比較 → 演算子を反転して定数を右辺に移動（`5 > x` → `x < 5`） | 左辺が非定数、または右辺も定数 |
-| `boolean_identity` | 真偽定数を含むAND/ORの簡約（`TRUE AND x` → `x` など） | 残存式が非ブール型、または消去される左辺式が例外を送出する可能性がある場合 |
+| `boolean_identity` | 真偽定数を含む AND / OR の簡約（`TRUE AND x` → `x` など） | 残存式が非ブール型、または消去される左辺式が例外を送出する可能性がある場合 |
 | `double_negation` | `NOT(NOT(x))` → `x` | `x` が静的に非ブール型 |
 | `and_idempotent` / `or_idempotent` | 同一式の論理積・論理和（`x AND x` / `x OR x`）→ `x` | `x` が静的に非ブール型、または `SafeToReduceEvaluationCount` が偽（評価回数を減らせない副次的作用を含む） |
-| `canonicalize_boolean` | ブール評価式と0/1定数との比較（`expr = 1` など）→ 式そのものまたは `NOT expr` | 定数がNULLまたは0/1以外の整数 |
+| `canonicalize_boolean` | ブール評価式と 0 / 1 との比較（`expr = 1` など）→ 式そのものまたは `NOT expr` | 定数が NULL または 0 / 1 以外の整数 |
 
-### 算術恒等式（10本）
+### 算術恒等式（10 本）
 
 加算の恒等式 `identity_add_zero` には、最適化の品質と厳密な型付けの兼ね合いが存在します（`expression/rewrite.cpp`）。
 
@@ -218,22 +292,24 @@ const ExpressionRuleSet& NotComparisonFreeRules();
           // -0.0 survivor is normalized to +0.0.
 ```
 
-ASTの厳密な評価基準では `a + 0.0` はDOUBLE型へと昇格しますが、このRuleはオプティマイザのインデックス照合効率を維持するため、整数型列に対しても適用されます。この挙動はコンプライアンステストによって固定された既知の仕様逸脱です。
+AST の厳密な評価基準では、`a + 0.0` は DOUBLE 型へ昇格します。一方、この
+Rule はインデックス照合を維持するため、整数型の列にも適用されます。この挙動は
+コンプライアンステストで固定された既知の仕様差です。
 
 | Rule | パターン → 書き換え | guard（適用除外条件） |
 |---|---|---|
 | `identity_add_zero` | `x + 0` または `0 + x` → `x` | 残存側が静的に非数値型 |
 | `identity_subtract_zero` | `x - 0` → `x` | 右辺がゼロ定数でない、または左辺が静的に非数値型 |
 | `identity_multiply_one` | `x * 1` または `1 * x` → `x` | 残存側が静的に非数値型 |
-| `identity_divide_one` | `x / 1` → `x` | 右辺が1定数でない、または左辺が静的に非数値型 |
+| `identity_divide_one` | `x / 1` → `x` | 右辺が定数 1 でない、または左辺が静的に非数値型 |
 | `canonicalize_add_negative_constant` | `x + (-c)`（右辺が負の整数定数）→ `x - c` | 左辺が静的に非数値型、または定数が `INT64_MIN`（反転時にオーバーフローするため） |
 | `canonicalize_subtract_negative_constant` | `x - (-c)` → `x + c` | 同上 |
 | `multiply_by_negative_one` | `x * (-1)` または `(-1) * x` → `-x` | 定数が `-1` 以外、または残存側が静的に非数値型 |
 | `combine_repeated_addend` | `x + x` → `x * 2` | 静的に非数値型、または評価回数の削減が不安全 |
 | `double_negation_arithmetic` | `-(-x)` → `x` | 子ノードが静的に非数値型、または子ノードが `INT64_MIN` 定数 |
-| `double_bitwise_negation` | `~(~x)` → `x` | 静的に非数値型、DOUBLE型、または型未確定 |
+| `double_bitwise_negation` | `~(~x)` → `x` | 静的に非数値型、DOUBLE 型、または型未確定 |
 
-### 定数の再結合（4本）
+### 定数の再結合（4 本）
 
 `(x + 1) + 2` を `x + 3` へ変形する再結合は、中間結果におけるオーバーフローの発生有無を変化させる可能性があります。
 
@@ -243,7 +319,7 @@ ASTの厳密な評価基準では `a + 0.0` はDOUBLE型へと昇格しますが
 // x + a overflow, changing throw-vs-value.
 ```
 
-したがって、再結合Rule群では定数の符号が一致していることを条件とし、中間オーバーフローの消失によって計算結果やエラー挙動が変わらないことを保証しています。
+したがって、再結合 Rule 群では定数の符号が一致していることを条件とし、中間オーバーフローの消失によって計算結果やエラー挙動が変わらないことを保証しています。
 
 | Rule | パターン → 書き換え | guard（適用除外条件） |
 |---|---|---|
@@ -252,35 +328,29 @@ ASTの厳密な評価基準では `a + 0.0` はDOUBLE型へと昇格しますが
 | `reassociate_subtract_add_constants` | `(x - a) + b` → `x + (b - a)` | `(a <= 0) == (b >= 0)` が不成立、または定数計算がオーバーフローする場合 |
 | `reassociate_add_subtract_constants` | `(x + a) - b` → `x + (a - b)` | `(a >= 0) == (b <= 0)` が不成立、または定数計算がオーバーフローする場合 |
 
-### 関数と配列の平坦化（5本）
+### 関数と配列の平坦化（5 本）
 
 多重にネストした同名関数呼び出しを展開し、引数リストを平坦化します。
 
 | Rule | パターン → 書き換え | guard（適用除外条件） |
 |---|---|---|
 | `abs_of_abs` | `ABS(ABS(x))` → `ABS(x)` | 引数の構造が合致しない場合 |
-| `concat_flatten` | `CONCAT(CONCAT(a, b), c)` → `CONCAT(a, b, c)` | 変化がない、または結果の引数が2個未満 |
+| `concat_flatten` | `CONCAT(CONCAT(a, b), c)` → `CONCAT(a, b, c)` | 変化がない、または結果の引数が 2 個未満 |
 | `array_flatten_optimization` | ネストした `ARRAY_CONCAT` の展開および空配列リテラルの除去 | 引数の構造が合致しない場合 |
-| `pow_identities` | `POW(x, 1)` → `CAST(x AS FLOAT64)` | 指数が1定数でない場合（戻り値の型をFLOAT64に固定するためのCASTを付与） |
-| `greatest_least_fold` | `GREATEST(GREATEST(a, b), c)` → `GREATEST(a, b, c)` | 引数が空、または結果の引数が2個未満 |
+| `pow_identities` | `POW(x, 1)` → `CAST(x AS FLOAT64)` | 指数が定数 1 でない場合（戻り値を FLOAT64 型に固定するため CAST を付与） |
+| `greatest_least_fold` | `GREATEST(GREATEST(a, b), c)` → `GREATEST(a, b, c)` | 引数が空、または結果の引数が 2 個未満 |
 
-これら35本の自明なRuleに共通する原則は、「式を消去または変形する際、その式が本来発生させるはずだった実行時例外や副作用を消失させてはならない」という点です。`ExpressionCannotThrow` や `SafeToReduceEvaluationCount` による事後条件判定は、この意味論的整合性を担保するために設けられています。
+これら 35 本の自明な Rule に共通する原則は、「式を消去または変形する際、その式が本来発生させるはずだった実行時例外や副作用を消失させてはならない」という点です。`ExpressionCannotThrow` や `SafeToReduceEvaluationCount` による事後条件判定は、この意味論的整合性を保証するために設けられています。
 
-## 70-5. 第2部の個別章への橋渡し（38本）
+## 70-5. 個別に解説する 38 本の Rule
 
-残る38本のRule（ド・モルガンの法則、吸収則、共通積因子の抽出など）は、複雑な適用条件や詳細な意味論的検証を要するため、第2部 `part2-rules/expression/` の個別章で詳細に解説します。
+残る 38 本の Rule（ド・モルガンの法則、吸収則、共通積因子の抽出など）は、
+適用条件や意味の検証を個別に説明する必要があります。各 Rule は、第 2 部の
+`part2-rules/expression/` で解説します。
 
-- NOTの展開（6本）: `de_morgan.md`, `not_comparison.md`, `not_like.md`, `not_not_like.md`, `not_is_null.md`, `not_is_not_null.md`
-- ブール論理の簡約（9本）: `xor_boolean_identity.md`, `xor_to_or_and_not.md`, `absorption_and.md`, `absorption_and_reversed.md`, `absorption_or.md`, `absorption_or_reversed.md`, `boolean_filter_pullup.md`, `distribute_or_over_and_budgeted.md`, `boolean_eq_true_false_three_valued.md`
-- 文字列照合と正規表現（3本）: `like_equality.md`, `not_like_equality.md`, `regexp_prefix_extraction.md`
-- NULLと三値論理（5本）: `is_null_of_null_check.md`, `is_not_null_of_null_check.md`, `contradiction_from_null_eq.md`, `in_single_null.md`, `not_in_null_semantics.md`
-- 型変換と関数特性（10本）: `collapse_nested_identical_cast.md`, `nullif_to_case.md`, `coalesce_and_nullif_simplification.md`, `deterministic_function_cse.md`, `function_volatility_classification.md`, `nondeterministic_barrier.md`, `safe_divide_rewrite.md`, `datetime_and_string_fold_extent.md`, `json_path_constant_fold.md`, `numeric_widening_cast.md`
-- 述語推論と因子展開（5本）: `factor_or_common_and.md`, `or_of_ranges_to_in.md`, `interval_normalize.md`, `predicate_pushdown_case.md`, `inner_join_not_null_inference.md`
-
-## 70-6. まとめ
-
-- 式書き換えは最下層に位置し、関係代数メモを介さずスカラー式を直接変形する。オプティマイザ、バイトコードコンパイラ、スキャン事前フィルタで共有され、正規化によって上位Ruleの照合を支援する。
-- フレームワークは `ExpressionPattern`、`ExpressionRule`、`ExpressionRuleSet`、`ExpressionRewriter` の4要素で構成される。ボトムアップ走査によって不動点に達するまで適用され、反復上限超過時は直前の安定形を返却することで実行可能性を担保する（D6）。
-- 静的型が必要な算術最適化は `RewriteTypedArithmetic` に分離され、浮動小数点のNaN不整合を避けるため `ContainsNotOfOrderedDoubleComparison` による動的なRuleSet切り替え（`NotComparisonFreeRules`）を行う。
-- 自明な35本のRule群では、評価短絡や式の消去に伴う例外消失・副作用消失を防ぐため、`ExpressionCannotThrow` や `SafeToReduceEvaluationCount` を用いた網羅的なガードが設定されている。
-
+- NOT の展開（6 本）: `de_morgan.md`, `not_comparison.md`, `not_like.md`, `not_not_like.md`, `not_is_null.md`, `not_is_not_null.md`
+- ブール論理の簡約（9 本）: `xor_boolean_identity.md`, `xor_to_or_and_not.md`, `absorption_and.md`, `absorption_and_reversed.md`, `absorption_or.md`, `absorption_or_reversed.md`, `boolean_filter_pullup.md`, `distribute_or_over_and_budgeted.md`, `boolean_eq_true_false_three_valued.md`
+- 文字列照合と正規表現（3 本）: `like_equality.md`, `not_like_equality.md`, `regexp_prefix_extraction.md`
+- NULL と三値論理（5 本）: `is_null_of_null_check.md`, `is_not_null_of_null_check.md`, `contradiction_from_null_eq.md`, `in_single_null.md`, `not_in_null_semantics.md`
+- 型変換と関数特性（10 本）: `collapse_nested_identical_cast.md`, `nullif_to_case.md`, `coalesce_and_nullif_simplification.md`, `deterministic_function_cse.md`, `function_volatility_classification.md`, `nondeterministic_barrier.md`, `safe_divide_rewrite.md`, `datetime_and_string_fold_extent.md`, `json_path_constant_fold.md`, `numeric_widening_cast.md`
+- 述語推論と因子展開（5 本）: `factor_or_common_and.md`, `or_of_ranges_to_in.md`, `interval_normalize.md`, `predicate_pushdown_case.md`, `inner_join_not_null_inference.md`

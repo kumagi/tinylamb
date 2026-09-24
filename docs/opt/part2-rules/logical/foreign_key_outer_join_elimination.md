@@ -5,7 +5,7 @@
 
 ## 概要
 
-`foreign_key_outer_join_elimination` は、左外部結合を包含する射影 `Projection(LeftOuterJoin(L, R))` において、射影が右側リレーション $R$ の列を参照せず、かつ外部キー制約（参照整合性）と一意性制約により $R$ のタプルが $L$ のタプルを増幅・フィルタしないことが証明できる場合に、LEFT OUTER JOIN をセミ結合 `SemiJoin(L, R)` へと書き換える論理 Rule です。
+`foreign_key_outer_join_elimination` は、`Projection(LeftOuterJoin(L, R))` の LEFT OUTER JOIN を `SemiJoin(L, R)` へ書き換える論理 Rule です。射影が右側リレーション $R$ の列を参照せず、外部キー制約と一意性制約から、$R$ が $L$ の行を増やしたり除いたりしないと証明できる場合に適用します。
 
 外部結合に伴う NULL 補完タプルの生成処理や追跡オーバーヘッドを排除し、早期マッチ判定が可能なセミ結合アルゴリズムへの切り替えを可能にします。
 

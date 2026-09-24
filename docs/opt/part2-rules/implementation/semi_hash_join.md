@@ -88,7 +88,7 @@ graph TD
 
 右側の一致件数がいかに多くとも左側の入力行数 $|L|$ を超えることはないため、`std::min(l_rows, equi_estimate)` によって出力行数に上限をかけます。
 
-物理特性の伝播において、`ProductPlan::IsOrderedBy` は semi/anti 結合の場合にプローブ側（左子）の順序プロパティをそのまま継承します（`plan/product_plan.cpp` の `IsSemiOrAnti` 分岐）。右側の結合処理によって左側の順序が破壊されないため、上流のソート要求を満たすための追加コストを抑制できます。
+物理特性の伝播では、`ProductPlan::IsOrderedBy` が semi/anti 結合のプローブ側（左子）の順序をそのまま継承します（`plan/product_plan.cpp` の `IsSemiOrAnti` 分岐）。右側との照合後も左側の順序が変わらないため、上流のソート要求を満たす追加処理を省けます。
 
 ## 最適化効果
 

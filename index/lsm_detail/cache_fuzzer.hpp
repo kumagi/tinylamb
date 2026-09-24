@@ -35,8 +35,7 @@ static constexpr size_t kMaxReads = 512;
 // cache page boundaries directly instead of hoping a PRNG lands near one.
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
-  std::filesystem::path blob_path =
-      "cache_fuzzer-" + RandomString(20, false) + ".db";
+  std::filesystem::path blob_path = "cache_fuzzer-" + RandomString(20) + ".db";
   const size_t kMemoryPages = stream.Pick(1024) + 8;
   auto blob =
       BlobFile::Create(blob_path, kMemoryPages * kCachePageSize, kFileSize)

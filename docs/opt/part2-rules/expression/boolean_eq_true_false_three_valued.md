@@ -73,7 +73,7 @@ graph TD
       return Value(child.IsNull() || !child.Truthy());
 ```
 
-`kIsTrue` およびその関連述語は、子ノードの評価結果が NULL であるか否かを内部で吸収し、常に真偽値（`Value(true)` または `Value(false)`）を出力します。出力集合が $\{0, 1\}$ に限定され `UNKNOWN` を返さないため、$(\text{pred}) = 0$ という等値比較の結果は $\text{NOT}(\text{pred})$ と完全に一致します。この性質が担保されない一般のブール列 $b$ に対して $b = 0$ を単純置換することは許されず、対象を IS 述語族へ限定する必然性がここにあります。
+`kIsTrue` およびその関連述語は、子ノードの評価結果が NULL であるか否かを内部で吸収し、常に真偽値（`Value(true)` または `Value(false)`）を出力します。出力集合が $\{0, 1\}$ に限定され `UNKNOWN` を返さないため、$(\text{pred}) = 0$ という等値比較の結果は $\text{NOT}(\text{pred})$ と完全に一致します。この性質が保証されない一般のブール列 $b$ に対して $b = 0$ を単純置換することは許されず、対象を IS 述語族へ限定する必然性がここにあります。
 
 ### 2. 補数マッピングの正確性と意味論の保存
 $(\text{pred}) = 0$ を反転する際、左辺の述語に応じた正確な補数を割り当てる必要があります。
@@ -85,7 +85,7 @@ $(\text{pred}) = 0$ を反転する際、左辺の述語に応じた正確な補
 | `x IS FALSE` | $x \text{ is not null } \land x = 0$ | `x IS NOT FALSE` | `x IS NOT TRUE`（誤り） |
 | `x IS NOT FALSE` | $x \text{ is null } \lor x \ne 0$ | `x IS FALSE` | — |
 
-`(i IS FALSE) = 0` の補数として一律に `i IS NOT TRUE` を返すと、`i = 0` の行において元の式は $(0 \text{ IS FALSE}) = 0 \implies 1 = 0 \implies \text{FALSE}$ であるのに対し、誤変換後は $0 \text{ IS NOT TRUE} \implies \text{FALSE}$ となる一方、`i = 1` の行では元の式 $(1 \text{ IS FALSE}) = 0 \implies 0 = 0 \implies \text{TRUE}$ に対し、誤変換後は $1 \text{ IS NOT TRUE} \implies \text{FALSE}$ となり真理値の不整合が発生します。したがって、`kIsFalse` の正確な補数は $x \text{ IS NOT FALSE}$（NULL または真）でなければなりません。
+`(i IS FALSE) = 0` の補数として、一律に `i IS NOT TRUE` を返す場合を考えます。`i = 0` では、元の式は $(0 \text{ IS FALSE}) = 0 \implies 1 = 0 \implies \text{FALSE}$ であり、変換後も $0 \text{ IS NOT TRUE} \implies \text{FALSE}$ です。しかし `i = 1` では、元の式は $(1 \text{ IS FALSE}) = 0 \implies 0 = 0 \implies \text{TRUE}$ ですが、変換後は $1 \text{ IS NOT TRUE} \implies \text{FALSE}$ となります。このため、一律の変換では真理値を保てません。`kIsFalse` の正しい補数は $x \text{ IS NOT FALSE}$（NULL または真）です。
 
 ## 実装の詳細
 

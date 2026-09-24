@@ -80,7 +80,7 @@ AST 評価器（意味論の正準参照実装）は、左辺の評価値によ�
 オラクルフューザーによって発見された反例 `(NULL AND CAST(-inf AS INT64) <= c) OR NULL` は、この例外消去の危険性を実証しています。したがって、破棄対象の $y$ がいかなる入力に対しても安全に計算を完了できること（total であること）が必須要件となります。
 
 ### 3. 補元つき吸収則（Complementary Absorption）の非採用
-なお、古典二値論理で知られる補元つき吸収則 $x \land (\neg x \lor y) \equiv x \land y$ は、**三値論理では一般に成立しません**。$x = \text{UNKNOWN}, y = \text{FALSE}$ の場合、左辺は $\text{UNKNOWN} \land (\text{UNKNOWN} \lor \text{FALSE}) \equiv \text{UNKNOWN}$ となりますが、右辺は $\text{UNKNOWN} \land \text{FALSE} \equiv \text{FALSE}$ となり、評価値の不一致（三値論理の健全性破壊）を招きます。このため、`tinylamb` では補元つき吸収則は意図的に採用されていません。
+なお、古典二値論理で知られる補元つき吸収則 $x \land (\neg x \lor y) \equiv x \land y$ は、**三値論理では一般に成立しません**。$x = \text{UNKNOWN}, y = \text{FALSE}$ の場合、左辺は $\text{UNKNOWN}$ ですが、右辺は $\text{FALSE}$ です。評価値が一致しないため、`tinylamb` では補元つき吸収則を採用していません。
 
 ## 実装の詳細
 

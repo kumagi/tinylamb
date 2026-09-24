@@ -465,24 +465,6 @@ void Projection::Dump(std::ostream& o, int indent) const {
   }
   std::ostringstream child_dump;
   src_->Dump(child_dump, indent + 2);
-  if (child_dump.str().find("TopN") != std::string::npos) {
-    for (const NamedExpression& expression : expressions_) {
-      if (expression.expression &&
-          expression.expression->Type() == TypeTag::kColumnValue &&
-          expression.expression->AsColumnValue().GetColumnName().name ==
-              "payload") {
-        o << "LateMaterialize payload after Limit\n";
-        break;
-      }
-    }
-  }
-  if (!expressions_.empty() && expressions_[0].expression &&
-      expressions_[0].expression->Type() == TypeTag::kColumnValue &&
-      expressions_[0].expression->AsColumnValue().GetColumnName().name ==
-          "id" &&
-      child_dump.str().find("IndexScan") != std::string::npos) {
-    o << "UniqueKey id\n";
-  }
   o << "Projection: [";
   for (size_t i = 0; i < expressions_.size(); ++i) {
     if (0 < i) {

@@ -113,6 +113,11 @@ Status LSMTree::RestoreRuns() {
     if (name == "blob.db") {
       continue;
     }
+    if (name.ends_with(".meta")) {
+      // WAL segment geometry sidecar of blob.db (Logger::SegmentMetadataPath):
+      // it lives next to the runs but is not one of them.
+      continue;
+    }
     if (name.ends_with(".pending")) {
       // A flush/merge that died before its blob payloads were durable.  The
       // bytes it references may be gone; drop it (the mem-tree side of the

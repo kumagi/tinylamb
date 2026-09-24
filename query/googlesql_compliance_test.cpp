@@ -396,7 +396,7 @@ ARRAY<STRUCT<id INT64, category INT64, score INT64>>[]
 TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
   const std::string directory = TINYLAMB_GOOGLESQL_COMPLIANCE_DIR;
   if (directory.empty() || !std::filesystem::exists(directory)) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   const std::vector<std::string> files =
       ListGoogleSqlComplianceFiles(directory);
@@ -424,7 +424,7 @@ TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
       EXPECT_FALSE(test_case.sql.empty()) << name << " / " << test_case.name;
     }
   }
-  EXPECT_GE(files.size(), 200U) << true;
+  EXPECT_GE(files.size(), 200U);
   EXPECT_GE(case_count, 1000U);
   EXPECT_GT(error_count, 0U);
   EXPECT_GT(prepare_count, 0U);
@@ -490,10 +490,10 @@ class GoogleSqlComplianceFileTest
 TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   const std::string directory = TINYLAMB_GOOGLESQL_COMPLIANCE_DIR;
   if (directory.empty() || !std::filesystem::exists(directory)) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
 
   const std::filesystem::path path =

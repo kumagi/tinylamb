@@ -1,0 +1,6 @@
+-- tinylamb-session-test v1
+-- seed: 1
+-- stmt: CREATE TABLE tbl1 (u INT64, c1 INT64, c2 VARCHAR(8));
+-- stmt: INSERT INTO tbl1 VALUES (0,-1,'a'),(1,-1,'a'),(2,NULL,NULL),(3,-1,'a'),(4,-3,'bb');
+-- ddl: CREATE INDEX i ON tbl1 KEY(0)
+-- stmt: UPDATE tbl1 SET c2 = c2 WHERE (u IN (0, 2, NULL));

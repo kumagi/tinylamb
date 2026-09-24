@@ -65,7 +65,7 @@ SQL 標準において、`WHERE` 句等の選択述語は真（TRUE）と評価�
 述語が定数 TRUE の場合、すべての行が通過するため `EmptyPlan` へ短絡してはなりません。また、`SelectionPlan` 自体の除去（削除）は論理書き換え Rule である `eliminate_true_selection` の責務です。実装層である本 Rule は、定数 TRUE であっても `SelectionPlan` を忠実に生成し、オプティマイザの責任分担を明確に保ちます。
 
 ### 3. タプル順序プロパティの透過伝播
-選択演算はタプルの並び順序を変更しません。`SelectionPlan::IsOrderedBy` は `src_->IsOrderedBy(...)` を呼び出して子ノードの順序判定へ委譲するため、上位オペレータから要求されたソート順序プロパティ（`ordering`）を破壊することなく維持します。
+選択演算はタプルの並び順を変更しません。`SelectionPlan::IsOrderedBy` は `src_->IsOrderedBy(...)` を呼び出して子ノードの順序判定へ委譲するため、上位演算子が要求する順序プロパティ（`ordering`）をそのまま維持します。
 
 ## 実装の詳細
 
@@ -113,4 +113,3 @@ SQL 標準において、`WHERE` 句等の選択述語は真（TRUE）と評価�
 - `plan/optimizer_test.cpp`:
   - `OptimizerTest.ConstantFalseSelectionBecomesEmptyPlan`: 定数 0 の述語が `EmptyPlan`（実行時 `EmptyResult`）となり、テーブル走査が実行されないことを検証。
   - `OptimizerTest.ContradictoryConjunctsBecomeEmptyResult`: `c1 = 10 AND c1 = 11` などの矛盾連言が 0 行短絡されることを確認。
-

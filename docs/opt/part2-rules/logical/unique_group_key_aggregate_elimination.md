@@ -5,9 +5,9 @@
 
 ## 概要
 
-`unique_group_key_aggregate_elimination` は、GROUP BY のグルーピングキーが入力タプルの一意キー（PRIMARY KEY または UNIQUE 制約）であると証明できる場合に、集約演算子（Aggregation）を行ごとの射影演算子（Projection）へと置き換える Rule である。
+`unique_group_key_aggregate_elimination` は、GROUP BY のグルーピングキーが入力タプルの一意キー（PRIMARY KEY または UNIQUE 制約）であると証明できる場合に、集約演算子（Aggregation）を行ごとの射影演算子（Projection）へと置き換える Rule です。
 
-キーが一意であれば各グループには高々 1 行しか存在しないため、グループ内の `MIN(x)`, `MAX(x)`, `ANY_VALUE(x)` の評価値は常に対象行の `x` そのものと一致する。この性質を利用して集約処理そのものを消去する。
+キーが一意であれば各グループには高々 1 行しか存在しないため、グループ内の `MIN(x)`, `MAX(x)`, `ANY_VALUE(x)` の評価値は常に対象行の `x` そのものと一致します。この性質を利用して集約処理そのものを消去します。
 
 ## 変換前後の関係
 
@@ -23,7 +23,7 @@ graph TD
 
 ## 適用条件
 
-パターンは `Aggregation(Any("input"))` であり、対象演算子は `LogicalOperator::kAggregation` である。変換ラムダ内で以下のガード条件を検証する。
+パターンは `Aggregation(Any("input"))` であり、対象演算子は `LogicalOperator::kAggregation` です。変換ラムダ内で以下のガード条件を検証します。
 
 ```cpp
           // Uniqueness must be PROVEN by a UNIQUE/PRIMARY KEY constraint on
@@ -34,25 +34,25 @@ graph TD
           // bare Projection).
 ```
 
-発火条件および非発火条件は以下の通りである。
+発火条件および非発火条件は以下の通りです。
 
 1. 子ノード数が 1 であり、`grouping_sets` および `target_list` が空でないこと。入力グループが自グループと一致しないこと。
 2. 入力グループのスキーマから PRIMARY KEY または UNIQUE 制約を持つ列（`unique_cols`）を収集し、`grouping_sets` の**すべての**キーが列参照かつ `unique_cols` に含まれていること（完全な一意性の証明）。
-3. `target_list` 内の集約関数が、DISTINCT、FILTER、HAVING を持たず、種類が `kMin`, `kMax`, `kAnyValue` のいずれかのみであること。それ以外の集約関数（`COUNT`, `SUM`, `AVG` 等）が 1 つでも含まれる場合は発火しない。
-4. 集約を含まないターゲット（キー列等）はそのまま射影ターゲットとして維持される。
+3. `target_list` 内の集約関数が、DISTINCT、FILTER、HAVING を持たず、種類が `kMin`, `kMax`, `kAnyValue` のいずれかのみであること。それ以外の集約関数（`COUNT`, `SUM`, `AVG` 等）が 1 つでも含まれる場合は発火しません。
+4. 集約を含まないターゲット（キー列等）はそのまま射影ターゲットとして維持されます。
 
 ## 意味論的根拠と多重度保存
 
-集約の削除は、タプル多重度の一致が数学的に証明される場合にのみ許容される。
+集約の削除は、タプル多重度の一致が数学的に証明される場合にのみ許容されます。
 
-- **一意性証明の厳密性**: GROUP BY キーが一意でない場合、入力行数が複数であっても集約によって 1 行に縮約される。この状況で集約を射影に置き換えると、同一キーを持つ複数行がすべて出力されてしまい、タプル多重度が破壊される（過去の「id/pk という名前の列なら一意とみなす」ヒューリスティクスが引き起こしたバグの反省に基づく）。修飾子を含めた完全なカタログ制約による証明が必須である。
-- **1 行グループにおける集約等価性**: 濃度 1 の集合 $\{v\}$ に対し、$\min(\{v\}) = \max(\{v\}) = \text{any\_value}(\{v\}) = v$ が厳密に成立する。したがって、集約計算を単なる列の参照へと縮退させても値は一切変化しない。
-- **対象関数の限定理由**: `COUNT(v)` は $v$ が NULL でない場合 1、NULL の場合 0 となり、型の相違や NULL 検査が必要となる。また `SUM(v)` も同様の型プロモーションを伴う。本 Rule は型変換の不整合を防ぐため、値が完全に一致する 3 種類に限定して適用する。
-- **修飾子の排除**: `FILTER` 句や `HAVING` 句を伴う集約は、1 行グループであっても行の除外が発生し得るため、無条件の射影置換を禁止する。
+- **一意性証明の厳密性**: GROUP BY キーが一意でない場合、同じキーを持つ複数の入力行は、集約によって 1 行になります。この集約を射影へ置き換えると複数行がそのまま出力され、行の多重度が変わります。過去には「列名が id/pk なら一意とみなす」ヒューリスティクスによって、この誤変換が発生しました。そのため、修飾子を含むカタログ制約から一意性を証明できることを必須とします。
+- **1 行グループにおける集約等価性**: 濃度 1 の集合 $\{v\}$ に対し、$\min(\{v\}) = \max(\{v\}) = \text{any\_value}(\{v\}) = v$ が厳密に成立します。したがって、集約計算を単なる列の参照へと縮退させても値は一切変化しません。
+- **対象関数の限定理由**: `COUNT(v)` は $v$ が NULL でない場合 1、NULL の場合 0 となり、型の相違や NULL 検査が必要となります。また `SUM(v)` も同様の型プロモーションを伴います。本 Rule は型変換の不整合を防ぐため、値が完全に一致する 3 種類に限定して適用します。
+- **修飾子の排除**: `FILTER` 句や `HAVING` 句を伴う集約は、1 行グループであっても行の除外が発生し得るため、無条件の射影置換を禁止します。
 
 ## 実装の詳細
 
-`plan/cascades.cpp` における変換処理は、ターゲットリストの走査と置換によって行われる。
+`plan/cascades.cpp` の変換処理では、ターゲットリストを走査して対象式を置き換えます。
 
 ```cpp
               if (agg.GetType() == AggregationType::kMin ||
@@ -64,7 +64,7 @@ graph TD
               }
 ```
 
-置換完了後、入力グループを直接の子とする `LogicalOperator::kProjection` 式を構築し、ルートグループへ登録する。
+置換完了後、入力グループを直接の子とする `LogicalOperator::kProjection` 式を構築し、ルートグループへ登録します。
 
 ```cpp
           memo.AddExpression(
@@ -75,20 +75,20 @@ graph TD
                                 .output_schema = expression.output_schema});
 ```
 
-元の集約式も Memo 内に残るため、万一コスト評価で集約が有利と判定された場合でも安全である。
+元の集約式も Memo 内に残るため、万一コスト評価で集約が有利と判定された場合でも安全です。
 
 ## 最適化効果
 
-ハッシュテーブル構築、バッファリング、ソートなどを伴う高コストな集約オペレータが完全に消去される。
+ハッシュテーブル構築、バッファリング、ソートなどを伴う高コストな集約オペレータが完全に消去されます。
 
-行ごとの単純な射影評価のみに縮退するため、CPU サイクルおよび作業メモリの消費量が大幅に削減される。
+行ごとの単純な射影評価のみに縮退するため、CPU サイクルおよび作業メモリの消費量が大幅に削減されます。
 
 ## 関連 Rule との相互作用
 
 - `group_by_functional_dependency_reduction`: 関数従属性に基づいて不要な GROUP BY キーを削減し、残ったキーによる一意性証明を助ける。
 - `pk_unique_distinct_elimination`: 一意キーに対する DISTINCT を射影へ縮退させる類似の Rule。
-- `any_value_elimination`: 式レベルで冗長な `ANY_VALUE` を簡約する。
+- `any_value_elimination`: 式レベルで冗長な `ANY_VALUE` を簡約します。
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.UniqueGroupKeyAggregateElimination`: 主キー `t1.id` で GROUP BY を行う集約式（`MIN(val)`, `ANY_VALUE(v2)` を含む）から、3 つの列参照を持つ `Projection` 式が生成されることを検証する。
+- `plan/cascades_test.cpp` の `CascadesTest.UniqueGroupKeyAggregateElimination`: 主キー `t1.id` で GROUP BY を行う集約式（`MIN(val)`, `ANY_VALUE(v2)` を含む）から、3 つの列参照を持つ `Projection` 式が生成されることを検証します。

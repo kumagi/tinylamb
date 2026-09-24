@@ -35,6 +35,12 @@ ChunkedScan::ChunkedScan(Transaction& txn, Table& table, Schema schema,
       filter_(std::move(filter)),
       pages_per_morsel_(pages_per_morsel),
       is_index_scan_(false) {
+  StatusOr<TableLease> lease = table_.AcquireLease(txn_.ID());
+  if (!lease.HasValue()) {
+    FailWith(lease.GetStatus());
+    return;
+  }
+  table_lease_ = lease.MoveValue();
   InitializeTableMorsels();
 }
 
@@ -52,6 +58,12 @@ ChunkedScan::ChunkedScan(Transaction& txn, Table& table, const Index& index,
       index_end_(std::move(end)),
       ascending_(ascending),
       is_index_scan_(true) {
+  StatusOr<TableLease> lease = table_.AcquireLease(txn_.ID());
+  if (!lease.HasValue()) {
+    FailWith(lease.GetStatus());
+    return;
+  }
+  table_lease_ = lease.MoveValue();
   index_iter_ = table_.BeginIndexScan(txn_, *index_, index_begin_, index_end_,
                                       ascending_);
 }

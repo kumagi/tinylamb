@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <limits>
 #include <ostream>
+#include <utility>
 
 #include "executor/data_chunk.hpp"
 #include "table/table.hpp"
@@ -68,7 +69,8 @@ size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset(table_->GetSchema(), batch_limit);
   while (iter_.IsValid() && emitted_ < max_rows_ &&
          destination->Size() < batch_limit) {
-    destination->Append(*iter_, iter_.Position());
+    const RowPosition position = iter_.Position();
+    destination->Append(std::move(*iter_), position);
     ++iter_;
     ++emitted_;
   }

@@ -22,6 +22,7 @@
 #define TINYLAMB_UPDATE_HPP
 
 #include "executor_base.hpp"
+#include "foreign_key.hpp"
 
 namespace tinylamb {
 class Transaction;
@@ -42,12 +43,16 @@ class Update : public ExecutorBase {
   // Compliance primary-key emulation: when enabled, an UPDATE that assigns
   // the first column must keep keys non-duplicated across the table.
   Update(Transaction& txn, Table* target, Executor src,
-         int64_t assert_rows_modified, bool enforce_primary_key)
+         int64_t assert_rows_modified, bool enforce_primary_key,
+         std::vector<ForeignKeyCheck> fk_checks = {},
+         std::vector<ReferencedByCheck> ref_checks = {})
       : txn_(&txn),
         target_(target),
         src_(std::move(src)),
         assert_rows_modified_(assert_rows_modified),
-        enforce_primary_key_(enforce_primary_key) {}
+        enforce_primary_key_(enforce_primary_key),
+        fk_checks_(std::move(fk_checks)),
+        ref_checks_(std::move(ref_checks)) {}
 
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
@@ -58,6 +63,8 @@ class Update : public ExecutorBase {
   Executor src_;
   int64_t assert_rows_modified_{-1};
   bool enforce_primary_key_{false};
+  std::vector<ForeignKeyCheck> fk_checks_;
+  std::vector<ReferencedByCheck> ref_checks_;
   bool finished_{false};
 };
 }  // namespace tinylamb

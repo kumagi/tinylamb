@@ -42,7 +42,7 @@ namespace tinylamb {
 // toward merge and delete-resolution bugs instead of sampling a PRNG.
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
-  std::filesystem::path base = "lsm_view_fuzzer-" + RandomString(20, false);
+  std::filesystem::path base = "lsm_view_fuzzer-" + RandomString(20);
   // A previous aborted iteration (crash/abort before the tail remove_all) can
   // leave a stale directory behind; clearing first keeps SortedRun::Construct
   // from tripping over leftover index/blob files under a reused name.

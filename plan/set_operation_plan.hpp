@@ -26,6 +26,24 @@ class SetOperationPlan final : public PlanBase {
         schema_(GenerateSchema()) {}
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override {
+    for (const Plan& child : children_) {
+      if (child->ContainsParameterSlots()) {
+        return true;
+      }
+    }
+    return false;
+  }
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override {
+    for (const Plan& child : children_) {
+      if (!child->InstallParameterSlots(parameters, cursor, slots)) {
+        return false;
+      }
+    }
+    return true;
+  }
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return children_.front()->GetStats();
@@ -36,6 +54,10 @@ class SetOperationPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
   [[nodiscard]] const std::vector<Plan>& Children() const { return children_; }

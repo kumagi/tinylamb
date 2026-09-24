@@ -23,6 +23,7 @@
 
 #include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
+#include "table/table_statistics.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -39,6 +40,10 @@ class AggregationPlan : public PlanBase {
                   AggregationStrategy strategy = AggregationStrategy::kHash);
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override;
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override;
   [[nodiscard]] const Table* ScanSource() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override;
   [[nodiscard]] size_t AccessRowCount() const override;
@@ -49,12 +54,14 @@ class AggregationPlan : public PlanBase {
 
  private:
   [[nodiscard]] Schema GenerateSchema() const;
+  [[nodiscard]] TableStatistics GenerateOutputStats() const;
   Plan child_;
   std::vector<NamedExpression> aggregates_;
   AggregationStrategy strategy_;
   // Declaration order matters: schema_ is initialized from child_ and
   // aggregates_ in the constructor's initializer list.
   Schema schema_;
+  TableStatistics output_stats_;
 };
 
 // Physical names are kept as distinct plan types so EXPLAIN and rule tests can

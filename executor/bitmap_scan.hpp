@@ -49,11 +49,14 @@ inline std::vector<RowPosition> BitmapOr(const std::vector<RowPosition>& a,
 
 class BitmapIndexScan {
  public:
-  BitmapIndexScan(Transaction& txn, const Table& table, const Index& index,
-                  const Value& begin, const Value& end);
-  BitmapIndexScan(Transaction& txn, const Table& table, const Index& index,
-                  const std::vector<Value>& begin_key,
-                  const std::vector<Value>& end_key);
+  BitmapIndexScan(
+      Transaction& txn, const Table& table, const Index& index,
+      const Value& begin, const Value& end,
+      TransactionManager::IndexReadGuard* index_read_guard = nullptr);
+  BitmapIndexScan(
+      Transaction& txn, const Table& table, const Index& index,
+      const std::vector<Value>& begin_key, const std::vector<Value>& end_key,
+      TransactionManager::IndexReadGuard* index_read_guard = nullptr);
 
   [[nodiscard]] std::vector<RowPosition> ScanPositions() const;
 
@@ -63,6 +66,7 @@ class BitmapIndexScan {
   const Index* index_;
   std::vector<Value> begin_key_;
   std::vector<Value> end_key_;
+  TransactionManager::IndexReadGuard* index_read_guard_;
 };
 
 class BitmapHeapScan : public ExecutorBase {

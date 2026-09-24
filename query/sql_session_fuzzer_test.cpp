@@ -48,11 +48,22 @@ TEST(SqlSessionFuzzer, SeededSessionsHoldState) {
   int commits = 0;
   int crashes = 0;
   int checkpoints = 0;
-  constexpr int kIterations = 24;
-  for (uint32_t seed = 0; seed < kIterations; ++seed) {
-    std::mt19937 rng(seed);
+  constexpr int kIterations = 64;
+  const char* only = std::getenv("TINYLAMB_SESSION_ONLY_SEED");
+  // A seed asked for via TINYLAMB_SESSION_ONLY_SEED runs even when it
+  // lies outside the sweep range (libFuzzer seeds are full-width; the
+  // old uint32 stoul + 64-iteration loop turned such asks into "run
+  // nothing", tripping the sanity floor below and hiding the repro).
+  const uint64_t only_seed =
+      only != nullptr ? std::strtoull(only, nullptr, 10) : 0;
+  const uint64_t first = only != nullptr ? only_seed : 0;
+  const uint64_t last =
+      only != nullptr ? only_seed + 1 : static_cast<uint64_t>(kIterations);
+  for (uint64_t seed = first; seed < last; ++seed) {
+    std::mt19937 rng(static_cast<uint32_t>(seed));
     SessionStats stats;
-    std::string report = RunSessionIteration(rng, false, &stats);
+    std::string report = RunSessionIteration(
+        rng, std::getenv("TINYLAMB_SESSION_VERBOSE") != nullptr, &stats);
     ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
     total_checks += stats.checks;
     indexes_created += stats.indexes_created;
@@ -61,12 +72,17 @@ TEST(SqlSessionFuzzer, SeededSessionsHoldState) {
     crashes += stats.crashes;
     checkpoints += stats.checkpoints;
   }
-  EXPECT_GT(total_checks, 0) << "no state checks ran; harness is broken";
-  EXPECT_GT(indexes_created, 0) << "index DDL never ran; harness is broken";
-  EXPECT_GT(tables_dropped, 0) << "DROP TABLE never ran; harness is broken";
-  EXPECT_GT(commits, 0) << "no commit boundaries; harness is broken";
-  EXPECT_GT(crashes, 0) << "no crash boundaries; harness is broken";
-  EXPECT_GT(checkpoints, 0) << "no checkpoints ran; harness is broken";
+  // The coverage floor guards the FULL sweep; a single-seed repro run
+  // (TINYLAMB_SESSION_ONLY_SEED) legitimately exercises a fraction of
+  // the boundary types.
+  if (only == nullptr) {
+    EXPECT_GT(total_checks, 0) << "no state checks ran; harness is broken";
+    EXPECT_GT(indexes_created, 0) << "index DDL never ran; harness is broken";
+    EXPECT_GT(tables_dropped, 0) << "DROP TABLE never ran; harness is broken";
+    EXPECT_GT(commits, 0) << "no commit boundaries; harness is broken";
+    EXPECT_GT(crashes, 0) << "no crash boundaries; harness is broken";
+    EXPECT_GT(checkpoints, 0) << "no checkpoints ran; harness is broken";
+  }
 }
 
 // Minimal probe for the abort-undo phantom-row bug: a committed empty table,
@@ -164,7 +180,7 @@ TEST(SqlSessionFuzzer, RepeatSeedForNondeterministicBugs) {
     GTEST_SKIP() << "set TINYLAMB_SESSION_SEED + TINYLAMB_SESSION_REPEAT";
   }
   const uint64_t seed = std::strtoull(seed_env, nullptr, 10);
-  const int repeat = std::atoi(count_env);
+  const int repeat = static_cast<int>(std::strtol(count_env, nullptr, 10));
   for (int i = 0; i < repeat; ++i) {
     // Same fold as SessionFuzzTry so a .test file's -- seed: value can be
     // passed verbatim.

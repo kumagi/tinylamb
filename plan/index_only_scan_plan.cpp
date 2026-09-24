@@ -15,6 +15,7 @@
 #include "database/transaction_context.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "index/index.hpp"
 #include "index/index_schema.hpp"
 #include "table/table.hpp"
@@ -61,6 +62,29 @@ Value FirstOrNull(const std::vector<Value>& keys) {
   return keys.empty() ? Value() : keys.front();
 }
 
+TableStatistics IndexOnlyStats(const TableStatistics& source,
+                               const Schema& table_schema, const Index& index) {
+  std::vector<ColumnStats> columns;
+  columns.reserve(index.sc_.key_.size() + index.sc_.include_.size());
+  for (const slot_t slot : index.sc_.key_) {
+    if (slot < table_schema.ColumnCount() && slot < source.Columns()) {
+      columns.push_back(source.Column(slot));
+    } else {
+      columns.emplace_back(table_schema.GetColumn(slot).Type());
+    }
+  }
+  for (const slot_t slot : index.sc_.include_) {
+    if (slot < table_schema.ColumnCount() && slot < source.Columns()) {
+      columns.push_back(source.Column(slot));
+    } else {
+      columns.emplace_back(table_schema.GetColumn(slot).Type());
+    }
+  }
+  TableStatistics result(Schema("", {}));
+  result.Assign(source.Rows(), std::move(columns));
+  return result;
+}
+
 }  // namespace
 
 IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
@@ -71,16 +95,23 @@ IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
                                      std::vector<ColumnName> provided_order)
     : table_(table),
       index_(index),
-      stats_(begin_key.empty() && end_key.empty()
-                 ? ts
-                 : ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
-                                  FirstOrNull(end_key))),
+      stats_(IndexOnlyStats(
+          begin_key.empty() && end_key.empty()
+              ? ts
+              : ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
+                               FirstOrNull(end_key)),
+          table.GetSchema(), index)),
       begin_key_(std::move(begin_key)),
       end_key_(std::move(end_key)),
       ascending_(ascending),
       where_(std::move(where)),
       output_schema_(OutputSchema()),
-      provided_order_(std::move(provided_order)) {}
+      provided_order_(std::move(provided_order)) {
+  if (index_.IsUnique() && !begin_key_.empty() && begin_key_ == end_key_ &&
+      begin_key_.size() == index_.sc_.key_.size()) {
+    stats_ = stats_.ScaleCardinality(1);
+  }
+}
 
 Schema IndexOnlyScanPlan::OutputSchema() const {
   std::vector<Column> cols;
@@ -122,13 +153,33 @@ bool IndexOnlyScanPlan::IsOrderedBy(
 
 void IndexOnlyScanPlan::Dump(std::ostream& o, int /*indent*/) const {
   o << "IndexOnlyScan: " << table_.GetSchema().Name() << " with " << index_
-    << " (estimated cost: " << AccessRowCount() << ")";
+    << " (estimated rows: " << AccessRowCount() << ")";
 }
 
 std::string IndexOnlyScanPlan::ToString() const {
   return "IndexOnlyScan: " + std::string(table_.GetSchema().Name()) + " with " +
          index_.sc_.name_ +
-         " (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+         " (estimated rows: " + std::to_string(AccessRowCount()) + ")";
+}
+
+bool IndexOnlyScanPlan::ContainsParameterSlots() const {
+  if (ContainsParameterSlot(where_)) {
+    return true;
+  }
+  return std::ranges::any_of(select_, [](const NamedExpression& column) {
+    return ContainsParameterSlot(column.expression);
+  });
+}
+
+bool IndexOnlyScanPlan::InstallParameterSlots(
+    const std::vector<Value>& parameters, size_t* cursor,
+    std::vector<Expression>* slots) {
+  for (NamedExpression& column : select_) {
+    if (!SlotizeInPlace(&column.expression, parameters, cursor, slots)) {
+      return false;
+    }
+  }
+  return SlotizeInPlace(&where_, parameters, cursor, slots);
 }
 
 }  // namespace tinylamb

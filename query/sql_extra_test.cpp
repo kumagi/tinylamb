@@ -16,6 +16,7 @@
 #include "executor/detail/relation.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/executor_base.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/window_function_expression.hpp"
@@ -56,9 +57,9 @@ class SqlUdfTest : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
-      GTEST_SKIP() << true;
+      GTEST_SKIP() << "skipped";
     }
-    database_ = Database::Create("sql_udf_test").MoveValue();
+    database_ = Database::Create("sql_udf_test-" + RandomString()).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
     engine_ = std::make_unique<SqlEngine>(*database_);
   }
@@ -272,7 +273,7 @@ class WindowSqlTest : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
-      GTEST_SKIP() << true;
+      GTEST_SKIP() << "skipped";
     }
     database_ = Database::Create("window_sql-" + RandomString()).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
@@ -319,6 +320,64 @@ TEST_F(WindowSqlTest, RankingFamilyMatchesPeerGroups) {
   // Single-row partition: percent_rank denominator collapses to 1.
   EXPECT_EQ(rows[4],
             (Row({Value(1), Value(1), Value(1), Value(0.0), Value(1.0)})));
+}
+
+// Regression: the window accumulator's DOUBLE path returned the bare total
+// for AVG (TPC-DS q89 exposed it), so AVG(v) OVER (...) answered SUM(v).
+TEST_F(WindowSqlTest, AvgOverPartitionDividesByCount) {
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT g, v, AVG(v) OVER (PARTITION BY g) "
+                           "FROM w ORDER BY g, k, v;");
+  ASSERT_EQ(rows.size(), 5U);
+  EXPECT_EQ(rows[0], (Row({Value(1), Value(10), Value(25.0)})));
+  EXPECT_EQ(rows[4], (Row({Value(2), Value(50), Value(50.0)})));
+}
+
+TEST_F(WindowSqlTest, AggregateOfAggregateOverPartition) {
+  // Window over the grouped rows: avg(sum(v)) per g partition, with k left
+  // out of the select list but present in GROUP BY.
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT g, SUM(v) sv, "
+                           "AVG(SUM(v)) OVER (PARTITION BY g) a, "
+                           "MAX(SUM(v)) OVER (PARTITION BY g) mx "
+                           "FROM w GROUP BY g, k ORDER BY g, sv;");
+  ASSERT_EQ(rows.size(), 4U);
+  // g=1 groups: {30, 30, 40}; g=2: {50}.
+  EXPECT_EQ(rows[0],
+            (Row({Value(1), Value(30), Value(100.0 / 3.0), Value(40)})));
+  EXPECT_EQ(rows[1],
+            (Row({Value(1), Value(30), Value(100.0 / 3.0), Value(40)})));
+  EXPECT_EQ(rows[2],
+            (Row({Value(1), Value(40), Value(100.0 / 3.0), Value(40)})));
+  EXPECT_EQ(rows[3], (Row({Value(2), Value(50), Value(50.0), Value(50)})));
+}
+
+TEST_F(WindowSqlTest, MixedAggregateAndWindowItem) {
+  // sum(v) * 100 / sum(sum(v)) OVER () — the select item mixes a plain
+  // aggregate with a window over aggregates.
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT g, SUM(v) * 100.0 / SUM(SUM(v)) OVER () pct "
+                           "FROM w GROUP BY g ORDER BY g;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_DOUBLE_EQ(rows[0][1].value.double_value, 10000.0 / 150.0);
+  EXPECT_DOUBLE_EQ(rows[1][1].value.double_value, 5000.0 / 150.0);
+}
+
+TEST_F(WindowSqlTest, WindowOverAggregateOrderByAliasExpression) {
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT g, k, SUM(v) sv, "
+                           "AVG(SUM(v)) OVER (PARTITION BY g) a "
+                           "FROM w GROUP BY g, k "
+                           "ORDER BY sv - a, g, k;");
+  ASSERT_EQ(rows.size(), 4U);
+  // g=1 partition average is 100/3; sv-a values: -3.33, -3.33 (g=1),
+  // 0 (g=2's 50-50), 6.67 (g=1's 40-33.33).
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(1));
+  EXPECT_EQ(rows[2][0], Value(2));
+  EXPECT_EQ(rows[2][2], Value(50));
+  EXPECT_EQ(rows[3][0], Value(1));
+  EXPECT_EQ(rows[3][2], Value(40));
 }
 
 TEST_F(WindowSqlTest, NtileLagLeadAcrossPartitions) {
@@ -472,7 +531,7 @@ TEST_F(WindowSqlTest, VarianceCovarianceAndPercentilesOverFrame) {
   for (size_t i = 0; i < rows.size(); ++i) {
     EXPECT_DOUBLE_EQ(rows[i][0].value.double_value,
                      rows[i][2].value.double_value)
-        << true << (i != 0U);
+        << i;
   }
   // VAR_SAMP is undefined for a single-row frame.
   EXPECT_TRUE(rows[0][1].IsNull());
@@ -689,6 +748,102 @@ TEST_F(WindowEvalDirectTest, NonWindowStatementPassesThroughUntouched) {
   for (const Row& row : rows) {
     EXPECT_EQ(row[1], Value(4));
   }
+}
+
+// Bug 64: `AGG(x HAVING MIN c)` was mis-parsed as `HAVING MAX` (the pinned
+// parser leaves HavingModifier.detail empty), the scalar executor never
+// populated AggregateInput.condition, and the typed/JIT/parallel fast paths
+// silently dropped the modifier.
+class AggregateHavingTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    if (!GoogleSqlFrontend::Available()) {
+      GTEST_SKIP() << "skipped";
+    }
+    database_ =
+        Database::Create("aggregate_having_test-" + RandomString()).MoveValue();
+    context_ = std::make_unique<TransactionContext>(database_->BeginContext());
+    engine_ = std::make_unique<SqlEngine>(*database_);
+    RunSql(engine_.get(), context_.get(),
+           "CREATE TABLE t (g INT64, v INT64, s STRING)");
+    RunSql(engine_.get(), context_.get(),
+           "INSERT INTO t VALUES (1, 10, 'a'), (1, 30, 'c'), (1, 20, 'b'),"
+           " (2, 5, 'x'), (2, 7, 'y')");
+  }
+  void TearDown() override {
+    engine_.reset();
+    context_.reset();
+    if (database_ != nullptr) {
+      database_->DeleteAll();
+    }
+    database_.reset();
+  }
+  std::unique_ptr<Database> database_;
+  std::unique_ptr<TransactionContext> context_;
+  std::unique_ptr<SqlEngine> engine_;
+};
+
+TEST_F(AggregateHavingTest, MinModifierGatesToMinRowsGrouped) {
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT g, ANY_VALUE(s HAVING MIN v) FROM t GROUP BY g ORDER BY g");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][1], Value("a"));
+  EXPECT_EQ(rows[1][1], Value("x"));
+}
+
+TEST_F(AggregateHavingTest, MinModifierGatesToMinRowsScalar) {
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT ANY_VALUE(s HAVING MIN v) FROM t");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value("x"));
+}
+
+TEST_F(AggregateHavingTest, MaxModifierGatesToMaxRowsScalar) {
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT ANY_VALUE(s HAVING MAX v) FROM t");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value("c"));
+}
+
+TEST_F(AggregateHavingTest, SumWithHavingModifierAppliesGate) {
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT SUM(v HAVING MIN v), SUM(v HAVING MAX v)"
+                           " FROM t");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{5}));
+  EXPECT_EQ(rows[0][1], Value(int64_t{30}));
+}
+
+TEST(SelectStatementFingerprintTest, IncludesModifiersAndTracksMutation) {
+  SelectStatement first({NamedExpression("x")}, {"t"}, nullptr);
+  const std::string original = first.Fingerprint();
+  SelectStatement limited = first;
+  limited.SetLimit(1);
+  EXPECT_NE(limited.Fingerprint(), original);
+
+  SelectStatement grouped = first;
+  grouped.SetGroupBy({ColumnValueExp("x")});
+  EXPECT_NE(grouped.Fingerprint(), original);
+
+  first.SetWhereClause(
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{1}))));
+  EXPECT_NE(first.Fingerprint(), original);
+  EXPECT_EQ(first.Fingerprint(), first.Fingerprint());
+}
+
+TEST(SelectStatementFingerprintTest, IncludesAggregateFilter) {
+  const auto plain =
+      AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("x"));
+  auto filtered = std::make_shared<AggregateExpression>(AggregationType::kSum,
+                                                        ColumnValueExp("x"));
+  filtered->SetWhereFilter(ConstantValueExp(Value(true)));
+  SelectStatement first({NamedExpression("v", plain)}, {"t"}, nullptr);
+  SelectStatement second(
+      {NamedExpression("v", std::static_pointer_cast<ExpressionBase>(filtered))},
+      {"t"}, nullptr);
+  EXPECT_NE(first.Fingerprint(), second.Fingerprint());
 }
 
 }  // namespace tinylamb

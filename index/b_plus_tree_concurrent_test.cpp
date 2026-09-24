@@ -85,7 +85,7 @@ class BPlusTreeConcurrentTest : public ::testing::Test {
     l_.reset();
     p_.reset();
     std::ignore = std::remove(db_name_.c_str());
-    std::ignore = std::remove(log_name_.c_str());
+    tinylamb::RemoveLogAndSegments(log_name_);
     std::ignore = std::remove(master_record_name_.c_str());
   }
 
@@ -140,8 +140,7 @@ TEST_F(BPlusTreeConcurrentTest, InsertInsert) {
     auto txn = tm_->Begin();
     for (const auto& rows_per_thread : rows) {
       for (const auto& row : rows_per_thread) {
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, value,
-                              bpt_->Read(txn, row.first));
+        ASSIGN_OR_ASSERT_FAIL(std::string, value, bpt_->Read(txn, row.first));
         // Assert -- read-back value matches what thread inserted
         ASSERT_EQ(value, row.second);
       }

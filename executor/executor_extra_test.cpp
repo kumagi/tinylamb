@@ -370,7 +370,7 @@ TEST(ScanFilterTest, UnsignedComparisonsMatchGroundTruth) {
   pred.constant = Value(int64_t{0});
   pred.int_payload = true;
   pred.int_constant = 0;
-  EXPECT_FALSE(relational_detail::MatchSimpleCompare(row, pred)) << true;
+  EXPECT_FALSE(relational_detail::MatchSimpleCompare(row, pred));
   EXPECT_FALSE(
       EvaluateBinary(BinaryOperation::kLessThan, max_uint, Value(int64_t{0}))
           .Truthy());
@@ -521,7 +521,7 @@ TEST(ExchangeTest, NextBatchResetsReusedDestination) {
   EXPECT_EQ(first, 2U);
   size_t second = part->NextBatch(&chunk, 2);
   EXPECT_EQ(second, 1U);
-  EXPECT_EQ(chunk.Size(), 1U) << true;
+  EXPECT_EQ(chunk.Size(), 1U);
 }
 
 TEST(BatchNestedLoopJoinTest, PredicateErrorPropagatesForAntiJoin) {
@@ -601,13 +601,12 @@ void ExpectStatValue(const Row& row, size_t index, double expected) {
 }
 
 void ExpectStatNull(const Row& row, size_t index) {
-  EXPECT_TRUE(row[index].IsNull()) << true << (index != 0U);
+  EXPECT_TRUE(row[index].IsNull()) << index;
 }
 
 void ExpectStatNaN(const Row& row, size_t index) {
   ASSERT_FALSE(row[index].IsNull());
-  EXPECT_TRUE(std::isnan(row[index].value.double_value))
-      << true << (index != 0U);
+  EXPECT_TRUE(std::isnan(row[index].value.double_value)) << index;
 }
 
 }  // namespace

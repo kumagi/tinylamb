@@ -7,7 +7,7 @@
 
 二重否定を伴うパターン照合 `NOT(x NOT LIKE p)` を、単一の二項演算子 `x LIKE p` へ復元する式書き換え Rule です。
 
-`not_like` の逆変換に相当し、三値論理において恒等的に相殺される二重の論理反転を解消します。式木から余剰な否定ノードを取り除くことで、LIKE 述語とその定数パターンを露出させ、インデックス走査やプレフィックス抽出といった後続最適化への伝播を可能にします。
+`not_like` の逆変換に相当し、三値論理において相殺される二重の論理反転を除きます。否定ノードを取り除くと、後続 Rule が LIKE 述語と定数パターンを直接扱えるため、インデックス走査やプレフィックス抽出へつなげられます。
 
 ## 変換前後の関係
 
@@ -69,7 +69,7 @@ $x$ または $p$ が NULL のとき、$x \text{ NOT LIKE } p$ は `UNKNOWN`（N
 
 ## 検証テスト
 
-本 Rule は以下のテストケースにより動作が担保されています。
+本 Rule は以下のテストケースにより動作が保証されています。
 
 - `expression/rewrite_test.cpp` の `ExpressionRewriteTest.NotPushdownRewritesLikeAndNullChecks`:
   `NOT(name NOT LIKE 'a%')` が `kLike` 二項式ノードへと正規化されることを確認します。

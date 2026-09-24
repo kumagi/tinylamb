@@ -5,9 +5,9 @@
 
 ## 概要
 
-`mark_join_to_filter` は、マーク結合の直上に位置する選択演算 `Selection(MarkJoin(L, R, marker), marker_test)` を、マーカー列に対するテスト条件の内容に応じて半結合 `SemiJoin` または反結合 `AntiJoin` へと書き換える論理変換Ruleです。
+`mark_join_to_filter` は、マーク結合の直上に位置する選択演算 `Selection(MarkJoin(L, R, marker), marker_test)` を、マーカー列に対するテスト条件の内容に応じて半結合 `SemiJoin` または反結合 `AntiJoin` へと書き換える論理変換 Rule です。
 
-マーク結合（MarkJoin）は外側（左）行に対して右入力とのマッチ成否を示すブール値マーカー列（TRUE / FALSE / NULL）を付与します。したがって、TRUE を要求するフィルタは半結合に、FALSE（明確な非マッチ）を要求するフィルタは反結合に代数的に一致します。本Ruleにより、マーカー列の生成とフィルタ評価のオーバーヘッドを解消し、専用の結合アルゴリズムへの誘導を図ります。
+マーク結合（MarkJoin）は外側（左）行に対して右入力とのマッチ成否を示すブール値マーカー列（TRUE / FALSE / NULL）を付与します。したがって、TRUE を要求するフィルタは半結合に、FALSE（明確な非マッチ）を要求するフィルタは反結合に代数的に一致します。本 Rule により、マーカー列の生成とフィルタ評価のオーバーヘッドを解消し、専用の結合アルゴリズムへの誘導を図ります。
 
 ## 変換前後の関係
 
@@ -43,13 +43,13 @@ graph TD
 
 以下のガード条件をすべて満たす必要があります。
 
-1. **選択ノードの制約**: 子ノードが1つであり、有効な述語を持つこと。
-2. **単一連言の制約**: `SplitConjuncts` による連言分解結果が**厳密に1つ**であること（他の述語との複合連言は不発）。
+1. **選択ノードの制約**: 子ノードが1 つであり、有効な述語を持つこと。
+2. **単一連言の制約**: `SplitConjuncts` による連言分解結果が**厳密に1 つ**であること（他の述語との複合連言は不発）。
 3. **マーカーテストの分類成立**: 述語が以下のいずれかの形式に該当し、マーカー列に対する semi または anti の判定が確定すること。
    - 単項式: `kIsTrue` / `kIsNotFalse`（semi 判定）、`kIsFalse` / `kIsNotTrue` / `kNot`（anti 判定）。
    - 二項等号式: `kEquals` であり、一方の辺がマーカー列、他方の辺が定数の TRUE または FALSE（非 NULL かつブール値）であること。
 4. **対象列名の一致**: 判定式が参照する列名が空でなく、下位 MarkJoin の `marker_column` と一致すること（未修飾名・修飾名の双方を照合）。
-5. **MarkJoin ノードの完全性**: マッチした `kMarkJoin` 式が正確に2つの子ノードを持ち、非空の `marker_column` を定義していること。
+5. **MarkJoin ノードの完全性**: マッチした `kMarkJoin` 式が正確に2 つの子ノードを持ち、非空の `marker_column` を定義していること。
 
 ```cpp
           // Classify the marker test as semi (keep matches) or anti (keep
@@ -67,7 +67,7 @@ graph TD
 - マッチする行が存在しないことが確定している場合: `FALSE`
 - NULL キーの存在等によりマッチの成否が確定できない場合: `NULL`
 
-したがって、マーカー列が真であることを要求するフィルタ条件は「マッチが1件以上存在する行を残す」半結合（SemiJoin）と完全に等価です。一方、偽であることを要求する条件は「マッチが確実に存在しない行を残す」反結合（AntiJoin）と一致します。
+したがって、マーカー列が真であることを要求するフィルタ条件は「マッチが1 件以上存在する行を残す」半結合（SemiJoin）と完全に等価です。一方、偽であることを要求する条件は「マッチが確実に存在しない行を残す」反結合（AntiJoin）と一致します。
 
 ガード条件の根拠は以下の通りです。
 
@@ -106,20 +106,20 @@ graph TD
 
 ## 最適化効果
 
-本Ruleの適用により、以下の性能向上が得られます。
+本 Rule の適用により、以下の性能向上が得られます。
 
-- **実行パスの削減**: MarkJoin は一度全行にマーカーを付与してタプルを生成し、その直後に Selection でフィルタリングするという2段階の処理を要します。SemiJoin / AntiJoin への変換により、結合アルゴリズム内部でマッチ検出時に即座にタプルを出力または破棄する単一パス実行が可能となります。
+- **実行パスの削減**: MarkJoin は一度全行にマーカーを付与してタプルを生成し、その直後に Selection でフィルタリングするという2 段階の処理を要します。SemiJoin / AntiJoin への変換により、結合アルゴリズム内部でマッチ検出時に即座にタプルを出力または破棄する単一パス実行が可能となります。
 - **物理結合アルゴリズムの選択肢拡大**: `semi_hash_join`、`anti_hash_join` 等の高度に最適化された物理オペレータの利用が可能となります。
 
 ## 関連 Rule との相互作用
 
-- `outer_to_anti_join`: 外部結合から反結合を導出する同様の目的を持つRuleです。
-- `unique_semi_to_inner` / `push_semi_join_through_inner_join`: 本Ruleによって生成された `SemiJoin` 式をさらに内部結合へ変換したり、結合順序を再配置したりする後続Ruleです。
-- 式書き換え層（`expression/rewrite.cpp`）: マーカーに対するブール式が事前に正規化されている場合、本Ruleの照合がより容易になります。
+- `outer_to_anti_join`: 外部結合から反結合を導出する同様の目的を持つ Rule です。
+- `unique_semi_to_inner` / `push_semi_join_through_inner_join`: 本 Rule によって生成された `SemiJoin` 式をさらに内部結合へ変換したり、結合順序を再配置したりする後続 Rule です。
+- 式書き換え層（`expression/rewrite.cpp`）: マーカーに対するブール式が事前に正規化されている場合、本 Rule の照合がより容易になります。
 
 ## 検証テスト
 
 - `plan/cascades_test.cpp`:
   - `CascadesTest.MarkJoinToFilterProducesSemiJoin`: `m IS TRUE` のフィルタを持つ Selection(MarkJoin) から `SemiJoin` 式が生成されることを検証。
   - `CascadesTest.MarkJoinToFilterProducesAntiJoin`: `m = FALSE` のフィルタから `AntiJoin` 式が生成されることを検証。
-  - `CascadesTest.MarkJoinToFilterRejectsUnrelatedColumn`: マーカー列以外の列に対するフィルタでは本Ruleが発火しないことを検証。
+  - `CascadesTest.MarkJoinToFilterRejectsUnrelatedColumn`: マーカー列以外の列に対するフィルタでは本 Rule が発火しないことを検証。

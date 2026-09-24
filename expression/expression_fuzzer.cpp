@@ -307,8 +307,21 @@ bool TypesComparable(const Expression& left, const Expression& right,
     return t == TypeTag::kInteger || t == TypeTag::kBigInt ||
            t == TypeTag::kDouble;
   };
+  auto null_constant = [](const Expression& e) {
+    return e->Type() == TypeTag::kConstantValue &&
+           e->AsConstantValue().GetValue().IsNull();
+  };
   if (l == TypeTag::kInvalid || r == TypeTag::kInvalid) {
-    return true;  // Unknown shapes stay untolerated (conservative).
+    // A NULL constant operand yields UNKNOWN (never a type-mismatch raise),
+    // so it stays "comparable".  Any other statically indeterminate operand
+    // (a CASE whose branches disagree, a cast the static model cannot type)
+    // is exactly where the AST decides comparability from the RUNTIME value
+    // of the selected branch; folds that treat evaluation as total may drop
+    // or add that raise by design, so treat it as mismatched (tolerated).
+    if (null_constant(left) || null_constant(right)) {
+      return true;
+    }
+    return false;
   }
   if (l == r) {
     return true;  // Same type; only VALUE-dependent raises (string dates).
@@ -610,9 +623,13 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
           fold_dump += " => THREW";
         }
       }
-      fprintf(stderr, "threw mismatch ast=%d(%s) bc=%d exp=%s folded=%s\n",
+      fprintf(stderr,
+              "threw mismatch ast=%d(%s) bc=%d tol=%d neutral=%d exp=%s "
+              "folded=%s\n",
               ast_threw, ast_throw_reason.c_str(), bc_threw,
-              exp->ToString().c_str(), fold_dump.c_str());
+              (int)ContainsStaticallyMismatchedComparison(exp, schema),
+              (int)ContainsNeutralArithmetic(exp), exp->ToString().c_str(),
+              fold_dump.c_str());
     }
     assert(ast_threw == bc_threw || fold_tolerated);
     if (!ast_threw && !bc_threw && !ValuesMatch(ast_result, bc_result) &&

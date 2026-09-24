@@ -37,7 +37,7 @@ TEST(
 
   auto program = BytecodeCompiler::Compile(predicate, schema);
   if (!program.has_value()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   const BytecodeProgram& compiled = *program;
@@ -62,7 +62,7 @@ TEST(BytecodeTest, Compile_WithConstantExpressions_FoldsToOneLoadInstruction) {
 
   auto program = BytecodeCompiler::Compile(constants, schema);
   if (!program.has_value()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   const BytecodeProgram& folded = *program;
@@ -81,7 +81,7 @@ TEST(BytecodeTest, Compile_WithDateComparison_UsesTypedDateOpcode) {
 
   auto program = BytecodeCompiler::Compile(predicate, schema);
   if (!program.has_value()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   const BytecodeProgram& date_program = *program;
@@ -169,7 +169,7 @@ TEST(BytecodeTest, D7_CompilesAndOrToShortCircuitJumps) {
   Expression conj = BinaryExpressionExp(lhs, BinaryOperation::kAnd, rhs);
   auto program = BytecodeCompiler::Compile(conj, schema);
   if (!program.has_value()) {
-    FAIL() << true;
+    FAIL();
     return;
   }
   EXPECT_TRUE(std::ranges::any_of(
@@ -180,7 +180,7 @@ TEST(BytecodeTest, D7_CompilesAndOrToShortCircuitJumps) {
   Expression disj = BinaryExpressionExp(lhs, BinaryOperation::kOr, rhs);
   auto or_program = BytecodeCompiler::Compile(disj, schema);
   if (!or_program.has_value()) {
-    FAIL() << true;
+    FAIL();
     return;
   }
   EXPECT_TRUE(std::ranges::any_of(
@@ -221,7 +221,7 @@ TEST(BytecodeTest, D7_RightHandSideErrorsAreSuppressedByShortCircuit) {
                           ConstantValueExp(Value(1))));
   auto program = BytecodeCompiler::Compile(conj, schema);
   if (!program.has_value()) {
-    FAIL() << true;
+    FAIL();
     return;
   }
 
@@ -238,6 +238,99 @@ TEST(BytecodeTest, D7_RightHandSideErrorsAreSuppressedByShortCircuit) {
     EXPECT_THROW(static_cast<void>(program->EvaluateBatch(throwing_rows)),
                  std::exception);
   }
+}
+
+// sql_session/expression fuzz regressions (campaign R18, bugs 45-47):
+// folds that erased the INT64<->DOUBLE promotion boundary let the
+// bytecode VM raise integer overflow where the AST reference evaluated
+// in IEEE double (or vice versa).
+namespace {
+void ExpectAstMatchesBytecode(const Expression& expression, const Row& row,
+                              const Schema& schema) {
+  std::optional<std::string> ast_error;
+  std::optional<Value> ast_value;
+  try {
+    ast_value = expression->Evaluate(row, schema);
+  } catch (const std::exception& error) {
+    ast_error = error.what();
+  }
+  const std::optional<BytecodeProgram> program =
+      BytecodeCompiler::Compile(expression, schema);
+  if (!program.has_value()) {
+    return;  // unsupported shape falls back to the AST evaluator
+  }
+  DataChunk chunk(schema);
+  chunk.Append(row);
+  if (ast_error.has_value()) {
+    EXPECT_THROW(static_cast<void>(program->EvaluateBatch(chunk)),
+                 std::exception);
+    return;
+  }
+  const ColumnVector out = program->EvaluateBatch(chunk);
+  EXPECT_EQ(out.ValueAt(0), *ast_value) << expression->ToString();
+}
+}  // namespace
+
+TEST(BytecodeTest, MixedTypePromotion_FoldsMustNotEraseDoubleDomain) {
+  const Schema schema("fuzz_schema", {Column("col_i", ValueType::kInt64),
+                                      Column("col_d", ValueType::kDouble),
+                                      Column("col_s", ValueType::kVarChar),
+                                      Column("col_n", ValueType::kInt64)});
+  const Expression one_d = ConstantValueExp(Value(1.0));
+  const Expression one_i = ConstantValueExp(Value(int64_t{1}));
+  const Expression null_c = ConstantValueExp(Value());
+  const Expression ci = ColumnValueExp("col_i");
+  // CASE takes the DOUBLE branch at runtime; the arithmetic chain is IEEE,
+  // never a checked INT64 kernel (was: identity folds dropped the 1.0).
+  Expression case_expr = CaseExpressionExp(
+      {{ci, one_d}, {one_i, one_i}, {one_i, null_c}}, nullptr);
+  Expression chain = BinaryExpressionExp(
+      BinaryExpressionExp(
+          BinaryExpressionExp(case_expr, BinaryOperation::kMultiply, ci),
+          BinaryOperation::kAdd, ci),
+      BinaryOperation::kAdd, ci);
+  ExpectAstMatchesBytecode(chain,
+                           Row({Value(std::numeric_limits<int64_t>::min()),
+                                Value(0.0), Value(std::string("a")), Value()}),
+                           schema);
+}
+
+TEST(BytecodeTest, UniformCaseResult_FoldKeepsBranchValueType) {
+  const Schema schema("fuzz_schema", {Column("col_i", ValueType::kInt64),
+                                      Column("col_d", ValueType::kDouble),
+                                      Column("col_s", ValueType::kVarChar),
+                                      Column("col_n", ValueType::kInt64)});
+  const Expression ci = ColumnValueExp("col_i");
+  // THEN 1.0 / ELSE 1 agree textually but not in type: the fold must not
+  // substitute the ELSE's INT64 for the taken DOUBLE branch.
+  Expression case_expr = CaseExpressionExp({{ci, ConstantValueExp(Value(1.0))}},
+                                           ConstantValueExp(Value(int64_t{1})));
+  Expression sum = BinaryExpressionExp(
+      BinaryExpressionExp(
+          BinaryExpressionExp(case_expr, BinaryOperation::kAdd,
+                              UnaryExpressionExp(ci, UnaryOperation::kIsTrue)),
+          BinaryOperation::kAdd, ci),
+      BinaryOperation::kAdd, ci);
+  ExpectAstMatchesBytecode(
+      sum,
+      Row({Value(std::numeric_limits<int64_t>::max()),
+           Value(std::numeric_limits<double>::quiet_NaN()), Value(), Value()}),
+      schema);
+}
+
+TEST(BytecodeTest, Int64PlusBool_UsesAstDoublePromotionNotIntKernel) {
+  const Schema schema("fuzz_schema", {Column("col_i", ValueType::kInt64),
+                                      Column("col_d", ValueType::kDouble),
+                                      Column("col_s", ValueType::kVarChar),
+                                      Column("col_n", ValueType::kInt64)});
+  const Expression ci = ColumnValueExp("col_i");
+  Expression sum = BinaryExpressionExp(
+      ConstantValueExp(Value(int64_t{1})), BinaryOperation::kAdd,
+      UnaryExpressionExp(ci, UnaryOperation::kIsTrue));
+  ExpectAstMatchesBytecode(sum,
+                           Row({Value(std::numeric_limits<int64_t>::max()),
+                                Value(0.0), Value(), Value()}),
+                           schema);
 }
 
 }  // namespace tinylamb

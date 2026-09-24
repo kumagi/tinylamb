@@ -32,14 +32,8 @@
 namespace tinylamb {
 
 namespace {
-// Membership must use the same comparison as `=` (TryEvaluateBinary), which
-// promotes INT64/DOUBLE and honors unsigned/collation tags. The previous
-// `child == candidate` used Value::operator==, which returns false across
-// types, so `1 IN (1.0)` folded to FALSE while `1 = 1.0` was TRUE.
-StatusOr<bool> TryMatches(const Value& child, const Value& candidate) {
-  ASSIGN_OR_RETURN(
-      Value, eq, TryEvaluateBinary(BinaryOperation::kEquals, child, candidate));
-  return !eq.IsNull() && eq.Truthy();
+StatusOr<Value> TryMatches(const Value& child, const Value& candidate) {
+  return TryEvaluateBinary(BinaryOperation::kEquals, child, candidate);
 }
 
 template <typename... Args>
@@ -52,8 +46,10 @@ StatusOr<Value> TryMembership(const ExpressionBase& child,
     ASSIGN_OR_RETURN(Value, candidate, item->TryEvaluate(args...));
     saw_null |= candidate.IsNull();
     if (!child_value.IsNull() && !candidate.IsNull()) {
-      ASSIGN_OR_RETURN(bool, matched, TryMatches(child_value, candidate));
-      if (matched) {
+      ASSIGN_OR_RETURN(Value, match, TryMatches(child_value, candidate));
+      if (match.IsNull()) {
+        saw_null = true;
+      } else if (match.Truthy()) {
         return Value(true);
       }
     }

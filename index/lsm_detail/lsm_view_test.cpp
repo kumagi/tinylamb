@@ -270,7 +270,8 @@ TEST_F(LSMViewTest, Recover) {
   blob_ = BlobFile::Create(path_ / "blob.db").MoveValue();
   std::vector<SortedRun> idx;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
-    if (entry.path() != path_ / "blob.db") {
+    if (entry.path() != path_ / "blob.db" &&
+        !entry.path().string().ends_with(".meta")) {
       idx.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
@@ -325,7 +326,8 @@ TEST_F(LSMViewTest, OverwriteAndScan) {
   // overwrite run)
   std::vector<SortedRun> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
-    if (!entry.path().string().ends_with(".db")) {
+    if (!entry.path().string().ends_with(".db") &&
+        !entry.path().string().ends_with(".meta")) {
       index_files.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
@@ -358,7 +360,8 @@ TEST_F(LSMViewTest, DeleteAndScan) {
   // delete run)
   std::vector<SortedRun> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
-    if (!entry.path().string().ends_with(".db")) {
+    if (!entry.path().string().ends_with(".db") &&
+        !entry.path().string().ends_with(".meta")) {
       index_files.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
@@ -384,7 +387,8 @@ TEST_F(LSMViewTest, DeleteMultiAndScan) {
   // delete run)
   std::vector<SortedRun> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
-    if (!entry.path().string().ends_with(".db")) {
+    if (!entry.path().string().ends_with(".db") &&
+        !entry.path().string().ends_with(".meta")) {
       index_files.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }
@@ -425,7 +429,8 @@ TEST_F(LSMViewTest, DeleteOverWriteScan) {
   // overwrites + original 10 runs)
   std::vector<SortedRun> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
-    if (!entry.path().string().ends_with(".db")) {
+    if (!entry.path().string().ends_with(".db") &&
+        !entry.path().string().ends_with(".meta")) {
       index_files.push_back(SortedRun::Restore(entry.path()).MoveValue());
     }
   }

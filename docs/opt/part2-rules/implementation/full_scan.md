@@ -51,7 +51,7 @@ graph TD
   Expression filter = QualifyDown(memo.Get(group).filter, relation, physical);
 ```
 
-ルートノードの `SelectionPlan` はプッシュダウン完了後に消去されるため、物理スキャン演算子側でこの `filter` を漏れなく適用しなければ行漏洩（不正なタプル増加）を招きます。`QualifyDown` により、クエリ論理名（別名）から物理テーブルスキーマの列オフセットへのマッピング変換が行われます。
+ルートノードの `SelectionPlan` はプッシュダウン完了後に消去されます。そのため、物理スキャン演算子側でこの `filter` を必ず適用しなければ、不正なタプルが結果に混入します。`QualifyDown` は、クエリ上の論理名（別名）を物理テーブルスキーマの列オフセットへ対応付けます。
 
 ### 2. LIMIT 条件の安全な押し込み判定
 順序保証を伴わない単純な LIMIT は、スキャンの反復上限（`scan_limit`）として下位へ沈めることが可能です。ただし、以下のケースではスキャン上限を設定すると誤った結果を生じるため、`CanPushLimitIntoFullScan` により厳格に排除されます。

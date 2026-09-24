@@ -75,6 +75,16 @@ class Selection : public ExecutorBase {
   // Surviving row indices of the current input batch; reused across batches
   // so the hot path stays allocation-free.
   std::vector<uint32_t> selection_vector_;
+  // Per-conjunct compiled programs, populated only when the whole predicate
+  // failed to compile (any non-lowerable conjunct: IN over functions, IS NOT
+  // NULL, LIKE, ...).  Compiled conjuncts then evaluate batch-wise while the
+  // rest fall back to the per-row AST path (see NextBatch).
+  struct ConjunctPlan {
+    std::optional<BytecodeProgram> program;
+  };
+  std::vector<ConjunctPlan> conjunct_plans_;
+  // Second scratch buffer for the tiered selection-vector filtering.
+  std::vector<uint32_t> scratch_indices_;
 };
 }  // namespace tinylamb
 

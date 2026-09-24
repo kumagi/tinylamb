@@ -73,6 +73,7 @@ class ChunkedScan : public ExecutorBase {
   size_t pages_per_morsel_{8};
 
   // Table scan state
+  TableLease table_lease_;
   std::vector<Table::ScanMorsel> morsels_;
   size_t current_morsel_idx_{0};
   std::optional<Iterator> current_iter_;

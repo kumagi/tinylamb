@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_PRODUCT_PLAN_HPP
 #define TINYLAMB_PRODUCT_PLAN_HPP
 
+#include <optional>
+
 #include "expression/expression.hpp"
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
@@ -37,34 +39,40 @@ class ProductPlan final : public PlanBase {
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
               std::vector<ColumnName> right_cols);
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
-              std::vector<ColumnName> right_cols, HashJoinMode hash_mode);
+              std::vector<ColumnName> right_cols, HashJoinMode hash_mode,
+              std::optional<size_t> estimated_rows = std::nullopt);
   // Explicit hash join kind. Semi/anti kinds emit only the left child's
   // columns; outer kinds retain both schemas and add NULL padding.
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
               std::vector<ColumnName> right_cols, HashJoinMode hash_mode,
-              JoinKind kind);
+              JoinKind kind,
+              std::optional<size_t> estimated_rows = std::nullopt);
   // Same, always executing in memory (the decorrelation rewrite in the
   // optimizer emits this shape).
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
-              std::vector<ColumnName> right_cols, JoinKind kind);
+              std::vector<ColumnName> right_cols, JoinKind kind,
+              std::optional<size_t> estimated_rows = std::nullopt);
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
               const Table& right_tbl, const Index& idx,
               std::vector<ColumnName> right_cols,
-              const TableStatistics& right_ts);
+              const TableStatistics& right_ts,
+              std::optional<size_t> estimated_rows = std::nullopt);
   // Index Join whose right side is exposed under a relation-renamed schema:
   // `right_cols` resolve against the physical table while `declared_output`
   // names the emitted columns (Phase 8 self-joins).
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
               const Table& right_tbl, const Index& idx,
               std::vector<ColumnName> right_cols,
-              const TableStatistics& right_ts, Schema declared_output);
+              const TableStatistics& right_ts, Schema declared_output,
+              std::optional<size_t> estimated_rows = std::nullopt);
   ProductPlan(Plan left_src, Plan right_src);
   // Cross / nested-loop shape with an explicit join kind. Inner lowers to a
   // cross product (or NestedLoopJoin when a residual note is attached);
   // LeftOuter lowers to a null-padding NestedLoopJoin. Semi/anti/full/right
   // residuals lower to the blocked BatchNestedLoopJoin (the tuple nested
   // loop only implements inner/left-outer).
-  ProductPlan(Plan left_src, Plan right_src, JoinKind kind);
+  ProductPlan(Plan left_src, Plan right_src, JoinKind kind,
+              std::optional<size_t> estimated_rows = std::nullopt);
   ProductPlan(const ProductPlan&) = delete;
   ProductPlan(ProductPlan&&) = delete;
   ProductPlan& operator=(const ProductPlan&) = delete;
@@ -72,6 +80,10 @@ class ProductPlan final : public PlanBase {
   ~ProductPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override;
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override;
 
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
   [[nodiscard]] const Schema& GetSchema() const override;
@@ -84,8 +96,20 @@ class ProductPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override;
   [[nodiscard]] HashJoinMode GetHashJoinMode() const { return hash_mode_; }
   [[nodiscard]] JoinKind Kind() const { return kind_; }
+  [[nodiscard]] const Plan& Left() const { return left_src_; }
+  [[nodiscard]] const Plan& Right() const { return right_src_; }
+  [[nodiscard]] const std::vector<ColumnName>& LeftKeys() const {
+    return left_cols_;
+  }
+  [[nodiscard]] const std::vector<ColumnName>& RightKeys() const {
+    return right_cols_;
+  }
   // Per-key null-safety (IS NOT DISTINCT FROM equijoins) and the residual
   // predicate the implementation rule wraps in a Selection above this join.
   // Both ride down to the executor purely so EXPLAIN can annotate the node.
@@ -127,6 +151,10 @@ class ProductPlan final : public PlanBase {
   Schema output_schema_;
   TableStatistics stats_;
 };
+
+[[nodiscard]] size_t EstimatedJoinRowCount(
+    JoinKind kind, size_t left_rows, size_t right_rows,
+    std::optional<size_t> match_rows = std::nullopt);
 
 // Opaque accessors for the executor-layer enum values: the plan layer sees
 // only the forward-declared JoinKind, so callers pick a side by name instead

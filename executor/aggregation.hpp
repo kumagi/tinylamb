@@ -33,12 +33,15 @@
 
 namespace tinylamb {
 
-// COUNT(*) is spelled as a kCount aggregate whose child is the column "*".
-// This predicate is the single authority for that shape.
+// COUNT(*) has two spellings: a kCount aggregate whose child is the column
+// "*", and a kCount aggregate with no child at all (the form the Cascades
+// count_not_null_to_count_star rewrite produces). This predicate is the
+// single authority for both shapes.
 [[nodiscard]] inline bool IsCountStar(const AggregateExpression& aggregate) {
   return aggregate.GetType() == AggregationType::kCount &&
-         aggregate.Child()->Type() == TypeTag::kColumnValue &&
-         aggregate.Child()->AsColumnValue().GetColumnName().name == "*";
+         (!aggregate.Child() ||
+          (aggregate.Child()->Type() == TypeTag::kColumnValue &&
+           aggregate.Child()->AsColumnValue().GetColumnName().name == "*"));
 }
 
 class AggregationExecutor : public ExecutorBase {

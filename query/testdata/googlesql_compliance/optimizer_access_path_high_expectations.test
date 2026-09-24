@@ -162,9 +162,9 @@ ARRAY<STRUCT<present INT64>>[{1}]
 ==
 
 [mode=explain]
-[plan_contains=LateMaterialize payload]
+[plan_not_contains=LateMaterialize]
 [plan_contains=TopN]
-[name=wide_payload_materialized_after_topn]
+[name=topn_plan_does_not_claim_fake_late_materialization]
 SELECT id, payload FROM access_input ORDER BY score DESC LIMIT 2
 --
 ARRAY<STRUCT<id INT64, payload STRING>>[{1, "one"}, {2, "two"}]

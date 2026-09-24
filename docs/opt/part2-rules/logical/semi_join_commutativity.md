@@ -48,7 +48,7 @@ graph TD
 ### 1. 半結合の代数特性
 関係代数において、半結合 $X \ltimes_p Y$ の定義は $\Pi_{\text{schema}(X)}(X \Join_p Y)$ であり、出力スキーマおよび出力タプルの重複度は完全に $X$ に支配されます。
 
-連続する半結合 $(R \ltimes_{p_1} S) \ltimes_{p_2} T$ において、述語 $p_2$ が $S$ の属性に依存しない（$\text{attrs}(p_2) \subseteq \text{schema}(R) \cup \text{schema}(T)$）ならば、各タプル $r \in R$ に対する $p_2$ の充足性は $S$ との結合状態に左右されません。したがって、以下の代数同値性が厳密に成立します。
+連続する半結合 $(R \ltimes_{p_1} S) \ltimes_{p_2} T$ を考えます。述語 $p_2$ が $S$ の属性に依存しない（$\text{attrs}(p_2) \subseteq \text{schema}(R) \cup \text{schema}(T)$）なら、各タプル $r \in R$ が $p_2$ を満たすかどうかは、$S$ との結合状態に左右されません。したがって、次の代数同値性が成立します。
 
 $$(R \ltimes_{p_1} S) \ltimes_{p_2} T \equiv (R \ltimes_{p_2} T) \ltimes_{p_1} S$$
 

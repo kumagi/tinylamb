@@ -5,11 +5,11 @@
 
 ## 概要
 
-`join_enumeration` は、Groupに属する関係集合のすべての二分割（bipartition）を生成し、`Join(左集合, 右集合)` を列挙する論理変換Ruleです。3表以上の結合において探索空間の大半を供給します。分割面（cut）を結合述語（連接詞）が跨がない純粋な直積分割は `CutConnected` により枝刈りし、16表を超える大規模結合では組合せ爆発を防ぐために列挙を停止します。
+`join_enumeration` は、Group に属する関係集合の二分割（bipartition）を生成し、`Join(左集合, 右集合)` を列挙する論理変換 Rule です。3 表以上の結合で、探索候補の大半を生成します。分割面（cut）を結合述語（連接詞）がまたがない直積分割は `CutConnected` で除外し、関係数が 16 を超える場合は候補数の急増を避けるため列挙を停止します。
 
 ## 変換前後の関係
 
-例として、3表 `{a, b, c}` を含むGroupに対し、連接詞 `a.x = b.y`（関係 `{a, b}` を参照）のみが存在する場合を取り上げます。このとき、分割面を連接詞が跨ぐ分割のみが等価式として追加されます。
+例として、3 表 `{a, b, c}` を含む Group に対し、連接詞 `a.x = b.y`（関係 `{a, b}` を参照）のみが存在する場合を取り上げます。このとき、分割面を連接詞が跨ぐ分割のみが等価式として追加されます。
 
 ```mermaid
 graph TD
@@ -43,13 +43,13 @@ graph TD
 
 適用条件は以下の3点です。
 
-1. **関係数が3以上**: 関係集合のサイズが2以下の場合は適用されません。2表の左右入替は `join_commutativity` が担当します。
-2. **関係数が上限以下**: 関係数が `kMaxJoinEnumerationRelations`（定数値16）以下である必要があります。$2^{16}$ 通りのマスク走査と再帰的なグループ生成による探索空間の爆発を防ぎます。
+1. **関係数が3以上**: 関係集合のサイズが2以下の場合は適用されません。2 表の左右入替は `join_commutativity` が担当します。
+2. **関係数が上限以下**: 関係数が `kMaxJoinEnumerationRelations`（定数値 16）以下である必要があります。これは、$2^{16}$ 通りを超えるマスク走査と、再帰的な Group 生成を避けるためです。
 3. **有効な二分割マスク**: 分割ループ内で、最下位ビットが立っていないマスク、片側が空集合となるマスク、および非連結なマスクはスキップされます。
 
 ## 意味論的根拠と刈り込み方針
 
-16表上限は探索効率とメモリ消費を両立させる境界です。関係数 $N$ に対して二分割の組合せは $2^{N-1}$ 通り存在し、各分割で `EnsureGroup` が部分Groupを生成するため、16表を超える結合では列挙を行わず、貪欲法を用いる `greedy_join_order_fallback` に処理を委ねます。
+16 表上限は探索効率とメモリ消費を両立させる境界です。関係数 $N$ に対して二分割の組合せは $2^{N-1}$ 通り存在し、各分割で `EnsureGroup` が部分 Group を生成するため、16 表を超える結合では列挙を行わず、貪欲法を用いる `greedy_join_order_fallback` に処理を委ねます。
 
 最下位ビットが0のマスクをスキップする処理（`(mask & 1U) == 0`）は、二分割の対称性を利用した冗長性排除です。マスクとその補集合は左右を入れ替えた同一の二分割を表すため、最下位ビット（最初の関係）を常に左側に固定することで、`{a}|{b,c}` と `{b,c}|{a}` の一方のみを生成します。左右を反転させた形状は `join_commutativity` によって網羅されます。
 
@@ -80,9 +80,9 @@ graph TD
             }
 ```
 
-`mask` の各ビットは、対応する関係を左側の子Groupに含めるかどうかを示します。0（左側が空）および全ビット点灯（右側が空）を除く範囲を走査します。
+`mask` の各ビットは、対応する関係を左側の子 Group に含めるかどうかを示します。0（左側が空）および全ビット点灯（右側が空）を除く範囲を走査します。
 
-`Memo::CutConnected` は、登録済みの連接詞マスク集合（`conjunct_masks_`）のうち、左側と右側の双方にまたがる述語が1つ以上存在するかを検査します。
+`Memo::CutConnected` は、登録済みの連接詞マスク集合（`conjunct_masks_`）のうち、左側と右側の双方にまたがる述語が1 つ以上存在するかを検査します。
 
 ```cpp
 bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
@@ -97,7 +97,7 @@ bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
 }
 ```
 
-枝刈りを通過したマスクに対しては、左右の関係リストを構築してGroupを確保します。
+枝刈りを通過したマスクに対しては、左右の関係リストを構築して Group を確保します。
 
 ```cpp
             std::vector<std::string> left;
@@ -113,17 +113,17 @@ bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
             memo.AddExpression(group, memo.NewJoin(left_group, right_group));
 ```
 
-`EnsureGroup` は関係の集合を一意キーとしてGroupを検索または生成するため、異なるマスクから同一の部分関係集合が得られた場合でも単一のGroupに統合されます。また `NewJoin` は、左右のGroup間にまたがる連接詞を `JoinConditionFor` により自動的に結合条件として付与します（第20章 20-6節）。
+`EnsureGroup` は関係の集合を一意キーとして Group を検索または生成するため、異なるマスクから同一の部分関係集合が得られた場合でも単一の Group に統合されます。また `NewJoin` は、左右の Group 間にまたがる連接詞を `JoinConditionFor` により自動的に結合条件として付与します（第20章 20-6節）。
 
 ## 最適化効果
 
-`join_enumeration` を適用することで、親Groupには分割面を跨ぐ連接詞を持つすべての二分割結合式が登録されます。左深木だけでなく右深木やブッシー木（bushy tree）の形状が1回の適用で網羅されるため、結合結合則（associativity）の多段適用を待つことなく多様なトポロジが即座に探索候補に入ります。これにより、コストベース探索において有望な計画への早期収束が可能になります。
+`join_enumeration` を適用すると、分割面をまたぐ連言を持つすべての二分割結合式が親 Group に登録されます。1 回の適用で、左深木だけでなく右深木やブッシー木（bushy tree）も探索候補になります。そのため、結合則（associativity）を何段階も適用して同じ形を導出する必要がありません。
 
-## 関連Ruleとの相互作用
+## 関連 Rule との相互作用
 
 - `join_commutativity`: 左右反転の鏡像ペアを生成。メモへの登録時に指紋照合（`Expression::Fingerprint`）によって重複が排除されます。
-- `join_associativity_left` / `join_associativity_right`: 部分Groupの内部で局所的な結合順序を組み替えます。`join_enumeration` が無効化された場合でも、結合則と交換則の組合せによって全順序を探索可能な冗長設計となっています。
-- `greedy_join_order_fallback`: 16表を超える結合において、貪欲法により初期結合順序を補正します。
+- `join_associativity_left` / `join_associativity_right`: 部分 Group の内部で局所的な結合順序を組み替えます。`join_enumeration` が無効化された場合でも、結合則と交換則の組合せによって全順序を探索可能な冗長設計となっています。
+- `greedy_join_order_fallback`: 16 表を超える結合において、貪欲法により初期結合順序を補正します。
 - `join_to_cross_if_no_predicate`: 連接詞を持たない結合に対し、物理実装のためのCrossJoin代替式を供給します。
 
 ## 検証テスト
@@ -133,5 +133,4 @@ bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
   - `AssociativityRulesEnumerateJoinOrdersWithoutEnumeration`: `join_enumeration` を除外した状態でも結合則により全結合順序が導出可能であることを検証。
   - `ExploreConvergesOnWideJoinGraphsWithoutPassCap`, `ExpressionCapDegradesGracefully`: 多表結合における探索収束性と式上限による縮退動作を検証。
 - `plan/optimizer_test.cpp`:
-  - `JoinChainMatchesGoldenResultUnderRuleSubsets`: 結合順序系Ruleの一部を無効化しても最終的な出力結果が一致することを検証。
-
+  - `JoinChainMatchesGoldenResultUnderRuleSubsets`: 結合順序系 Rule の一部を無効化しても最終的な出力結果が一致することを検証。

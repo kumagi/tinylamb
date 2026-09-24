@@ -2,20 +2,27 @@
 #include "executor/detail/planning_heuristics.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -82,6 +89,59 @@ bool IsVirtualValueTableField(const Schema& schema, const ColumnName& name) {
                       return std::tolower(static_cast<unsigned char>(left)) ==
                              std::tolower(static_cast<unsigned char>(right));
                     });
+}
+
+bool IdentifierEqualsLocal(const std::string& lhs, const std::string& rhs) {
+  return lhs.size() == rhs.size() &&
+         std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+                    [](char left, char right) {
+                      return std::tolower(static_cast<unsigned char>(left)) ==
+                             std::tolower(static_cast<unsigned char>(right));
+                    });
+}
+
+std::string LowerIdentifierLocal(std::string value) {
+  for (char& c : value) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return value;
+}
+
+bool ContainsIdentifierLocal(const std::vector<std::string>& names,
+                             const std::string& name) {
+  return std::ranges::any_of(names, [&](const std::string& candidate) {
+    return IdentifierEqualsLocal(candidate, name);
+  });
+}
+
+std::vector<size_t> MatchingColumnOffsets(const Schema& schema,
+                                          const std::string& name) {
+  std::vector<size_t> offsets;
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    if (IdentifierEqualsLocal(schema.GetColumn(i).Name().name, name)) {
+      offsets.push_back(i);
+    }
+  }
+  return offsets;
+}
+
+bool IsDeclaredUsingEquality(const Expression& expression,
+                             const std::vector<std::string>& using_columns) {
+  if (!expression || expression->Type() != TypeTag::kBinaryExp ||
+      using_columns.empty()) {
+    return false;
+  }
+  const auto& binary = expression->AsBinaryExpression();
+  if (binary.Op() != BinaryOperation::kEquals ||
+      binary.Left()->Type() != TypeTag::kColumnValue ||
+      binary.Right()->Type() != TypeTag::kColumnValue) {
+    return false;
+  }
+  const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+  const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+  return lhs.schema.empty() && rhs.schema.empty() &&
+         IdentifierEqualsLocal(lhs.name, rhs.name) &&
+         ContainsIdentifierLocal(using_columns, lhs.name);
 }
 
 }  // namespace
@@ -166,22 +226,6 @@ std::vector<Expression> ResidualJoinPredicates(
   std::vector<Expression> residual;
   residual.reserve(predicates.size());
   for (const Expression& predicate : predicates) {
-    if (IsColumnEqualityPredicate(predicate) &&
-        predicate->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
-      const auto& binary = predicate->AsBinaryExpression();
-      const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
-      const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
-      if (lhs.schema.empty() && rhs.schema.empty() && lhs.name == rhs.name) {
-        // A USING equality is represented as the same bare name on both
-        // sides.  It is enforced positionally by the join and must not be
-        // evaluated against the combined schema, where it is ambiguous.
-        continue;
-      }
-    }
-    // Keep key equalities as a residual predicate as well.  Hash keys are an
-    // indexing aid, not a complete SQL comparison: UINT64 and INT64 share
-    // the same physical int64 representation, so a bucket collision must be
-    // checked with the original typed expression.
     residual.push_back(predicate);
   }
   return residual;
@@ -235,6 +279,61 @@ int64_t IntegerJoinKey(const Row& row, slot_t column) {
   return row[column].value.int_value;
 }
 
+// Fixed-width composite key over INT64 join columns.  Membership is raw
+// int64 bit equality (mirrors IntegerJoinKey), so no memcomparable string
+// is materialized per build/probe row -- a 6M-row composite-key build used
+// to spend ~3 heap allocations per row inside EncodeJoinKey.  Key tuples
+// wider than kMaxParts keep the string path.
+struct CompositeIntKey {
+  static constexpr size_t kMaxParts = 4;
+  std::array<int64_t, kMaxParts> parts{};
+  uint8_t count{0};
+  bool operator==(const CompositeIntKey& rhs) const = default;
+};
+
+struct CompositeIntKeyHash {
+  size_t operator()(const CompositeIntKey& key) const {
+    size_t hash = key.count;
+    for (uint8_t i = 0; i < key.count; ++i) {
+      hash ^= std::hash<int64_t>{}(key.parts[i]) + 0x9e3779b97f4a7c15ULL +
+              (hash << 6) + (hash >> 2);
+    }
+    return hash;
+  }
+};
+
+// The composite fast path applies when both sides carry the same number of
+// join columns (at least two: the single-column case is IntegerJoinKey's),
+// all typed INT64 on both sides.  Pairwise type equality keeps the decision
+// identical to the memcomparable encoding it replaces.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace)
+static bool CompositeIntJoinKey(const Schema& left_schema,
+                                const std::vector<slot_t>& left_columns,
+                                const Schema& right_schema,
+                                const std::vector<slot_t>& right_columns) {
+  if (left_columns.size() != right_columns.size() || left_columns.size() < 2 ||
+      left_columns.size() > CompositeIntKey::kMaxParts) {
+    return false;
+  }
+  for (size_t i = 0; i < left_columns.size(); ++i) {
+    if (left_schema.GetColumn(left_columns[i]).Type() != ValueType::kInt64 ||
+        right_schema.GetColumn(right_columns[i]).Type() != ValueType::kInt64) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// NOLINTNEXTLINE(misc-use-anonymous-namespace)
+static CompositeIntKey EncodeCompositeIntKey(
+    const Row& row, const std::vector<slot_t>& columns) {
+  CompositeIntKey key;
+  for (const slot_t column : columns) {
+    key.parts[key.count++] = row[column].value.int_value;
+  }
+  return key;
+}
+
 std::string EncodeJoinKey(const Row& row, const std::vector<slot_t>& columns) {
   // Join keys canonicalize doubles the way SQL equality demands: -0 folds to
   // +0 so both zeros share a bucket, while NaN bit patterns stay distinct
@@ -274,6 +373,138 @@ std::string EncodeNullSafeJoinKey(const Row& row,
   return key;
 }
 
+// Build-side frequency tables for join-cardinality estimation.  Split out of
+// EstimateJoinRows so the greedy join-order sweep can reuse a candidate's map
+// across levels: the candidate relation is fixed while only the accumulated
+// probe side grows, so rebuilding the map per candidate per level repeats
+// identical full-relation sweeps (seconds at TPC-H SF=1).
+struct JoinKeyFrequencyMaps {
+  bool composite_int{false};
+  std::vector<slot_t> right_columns;
+  // Stride used when the build side itself was sampled (1 = exact map).
+  size_t build_stride{1};
+  std::unordered_map<std::string, size_t> frequencies;
+  std::unordered_map<CompositeIntKey, size_t, CompositeIntKeyHash>
+      int_frequencies;
+};
+
+void BuildJoinKeyFrequencyMaps(const Relation& right,
+                               const std::vector<slot_t>& right_columns,
+                               bool composite_int, JoinKeyFrequencyMaps* maps) {
+  maps->composite_int = composite_int;
+  maps->right_columns = right_columns;
+  if (composite_int) {
+    maps->int_frequencies.reserve(right.TotalRows());
+  } else {
+    maps->frequencies.reserve(right.TotalRows());
+  }
+  // Multi-million-row build sides cost seconds of hash inserts per candidate
+  // (TPC-H Q9 builds a 6M-row lineitem map).  Above the same threshold as the
+  // probe side, insert a deterministic stride sample; ProbeJoinEstimate
+  // rescales by build_stride alongside its own probe stride.
+  static const size_t kBuildSampleTarget = [] {
+    // A/B hatch: TINYLAMB_LEGACY_ESTIMATE=1 restores the 2M-row sampling
+    // targets (finer estimates, slower planning sweeps).
+    const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
+    return legacy != nullptr ? size_t{2'000'000} : size_t{512'000};
+  }();
+  static const bool build_sampling_disabled =
+      std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
+  const size_t total = right.TotalRows();
+  maps->build_stride =
+      build_sampling_disabled || total <= kBuildSampleTarget
+          ? 1
+          : (total + kBuildSampleTarget - 1) / kBuildSampleTarget;
+  size_t index = 0;
+  right.ForEachRow([&](const Row& row) {
+    const size_t current = index++;
+    if (maps->build_stride > 1 && current % maps->build_stride != 0) {
+      return;
+    }
+    if (HasNullKey(row, right_columns)) {
+      return;
+    }
+    if (composite_int) {
+      ++maps->int_frequencies[EncodeCompositeIntKey(row, right_columns)];
+    } else {
+      ++maps->frequencies[row.Extract(right_columns)
+                              .EncodeMemcomparableFormat()];
+    }
+  });
+}
+
+size_t ProbeJoinEstimate(const Relation& left,
+                         const std::vector<slot_t>& left_columns,
+                         const JoinKeyFrequencyMaps& maps) {
+  size_t estimate = 0;
+  // Planning-only cardinality estimation on multi-million-row probe sides
+  // costs seconds per join level (TPC-H Q9 sweeps a 6M-row lineitem once per
+  // candidate).  Above a threshold, probe a deterministic stride sample and
+  // scale the matched-key sum back up; near-tie estimates may flip ranking,
+  // which is acceptable for a heuristic planner.
+  static const size_t kEstimateSampleTarget = [] {
+    const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
+    return legacy != nullptr ? size_t{2'000'000} : size_t{512'000};
+  }();
+  static const bool probe_sampling_disabled =
+      std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
+  const size_t left_rows = left.TotalRows();
+  const size_t stride =
+      probe_sampling_disabled || left_rows <= kEstimateSampleTarget
+          ? 1
+          : (left_rows + kEstimateSampleTarget - 1) / kEstimateSampleTarget;
+  size_t index = 0;
+  left.ForEachRow([&](const Row& row) {
+    const size_t current = index++;
+    if (stride > 1 && current % stride != 0) {
+      return;
+    }
+    if (HasNullKey(row, left_columns)) {
+      return;
+    }
+    if (maps.composite_int) {
+      const auto found =
+          maps.int_frequencies.find(EncodeCompositeIntKey(row, left_columns));
+      if (found != maps.int_frequencies.end()) {
+        estimate += found->second * maps.build_stride;
+      }
+    } else {
+      const auto found = maps.frequencies.find(
+          row.Extract(left_columns).EncodeMemcomparableFormat());
+      if (found != maps.frequencies.end()) {
+        estimate += found->second * maps.build_stride;
+      }
+    }
+  });
+  return stride > 1 ? estimate * stride : estimate;
+}
+
+// Deterministic key order for estimation: the estimate is a sum over key
+// tuples, so any consistent pairwise reorder yields the same value while
+// letting the per-candidate cache match across levels whose predicate order
+// differs.  Both column lists come from one sort so the i-th left column
+// stays paired with the i-th right column; ordering by the right offset
+// (stable across levels, whose left schema keeps growing) maximizes cache
+// reuse for the candidate-side frequency maps.
+std::pair<std::vector<slot_t>, std::vector<slot_t>> AlignedEstimateKeys(
+    const std::vector<EqualityKey>& keys) {
+  std::vector<std::pair<slot_t, slot_t>> pairs;
+  pairs.reserve(keys.size());
+  for (const EqualityKey& key : keys) {
+    pairs.emplace_back(key.right, key.left);
+  }
+  std::sort(pairs.begin(), pairs.end());
+  std::vector<slot_t> left_columns;
+  std::vector<slot_t> right_columns;
+  left_columns.reserve(pairs.size());
+  right_columns.reserve(pairs.size());
+  for (const auto& pair : pairs) {
+    right_columns.push_back(pair.first);
+    left_columns.push_back(pair.second);
+  }
+  return {left_columns, right_columns};
+}
+
 }  // namespace
 
 size_t EstimateJoinRows(const Relation& left, const Relation& right,
@@ -290,31 +521,47 @@ size_t EstimateJoinRows(const Relation& left, const Relation& right,
     }
     return left.TotalRows() * right.TotalRows();
   }
-  std::vector<slot_t> left_columns;
-  std::vector<slot_t> right_columns;
-  for (const EqualityKey& key : keys) {
-    left_columns.push_back(static_cast<slot_t>(key.left));
-    right_columns.push_back(static_cast<slot_t>(key.right));
+  const auto [left_columns, right_columns] = AlignedEstimateKeys(keys);
+  JoinKeyFrequencyMaps maps;
+  BuildJoinKeyFrequencyMaps(right, right_columns,
+                            CompositeIntJoinKey(left.schema, left_columns,
+                                                right.schema, right_columns),
+                            &maps);
+  return ProbeJoinEstimate(left, left_columns, maps);
+}
+
+// Greedy-loop variant that reuses each candidate's frequency map across
+// levels: only the probe side (the accumulated join result) changes between
+// calls, so a per-candidate cache turns repeated full-relation builds into
+// one build per (candidate, join-column) pair.  Estimates stay identical to
+// EstimateJoinRows.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace)
+static size_t EstimateJoinRowsCached(
+    const Relation& left, const Relation& candidate,
+    const std::vector<Expression>& predicates,
+    std::unordered_map<const Relation*, JoinKeyFrequencyMaps>* cache) {
+  const std::vector<EqualityKey> keys =
+      EqualityKeys(left.schema, candidate.schema, predicates);
+  if (keys.empty()) {
+    if (left.TotalRows() == 0 || candidate.TotalRows() == 0) {
+      return 0;
+    }
+    if (left.TotalRows() >
+        std::numeric_limits<size_t>::max() / candidate.TotalRows()) {
+      return std::numeric_limits<size_t>::max();
+    }
+    return left.TotalRows() * candidate.TotalRows();
   }
-  std::unordered_map<std::string, size_t> frequencies;
-  frequencies.reserve(right.rows.size());
-  right.ForEachRow([&](const Row& row) {
-    if (!HasNullKey(row, right_columns)) {
-      ++frequencies[row.Extract(right_columns).EncodeMemcomparableFormat()];
-    }
-  });
-  size_t estimate = 0;
-  left.ForEachRow([&](const Row& row) {
-    if (HasNullKey(row, left_columns)) {
-      return;
-    }
-    const auto found =
-        frequencies.find(row.Extract(left_columns).EncodeMemcomparableFormat());
-    if (found != frequencies.end()) {
-      estimate += found->second;
-    }
-  });
-  return estimate;
+  const auto [left_columns, right_columns] = AlignedEstimateKeys(keys);
+  const bool composite_int = CompositeIntJoinKey(
+      left.schema, left_columns, candidate.schema, right_columns);
+  auto [iter, inserted] = cache->try_emplace(&candidate);
+  JoinKeyFrequencyMaps& maps = iter->second;
+  if (inserted || maps.composite_int != composite_int ||
+      maps.right_columns != right_columns) {
+    BuildJoinKeyFrequencyMaps(candidate, right_columns, composite_int, &maps);
+  }
+  return ProbeJoinEstimate(left, left_columns, maps);
 }
 
 size_t SpillPartitionOf(const std::string& key, size_t partitions) {
@@ -621,6 +868,127 @@ bool ShouldHybridJoin(const Relation& left, const Relation& right) {
   return PreferHybridHashJoin(estimate);
 }
 
+// Chunked parallel probe for big in-memory hash joins.  The serial probe
+// iterates the left relation on one core while the other workers sit idle;
+// at SF=1 the lineitem-side joins spend seconds there.  Callers gate this
+// on: neither side spills (guaranteed by ShouldHybridJoin), no residual
+// predicate re-entering evaluation, no null-safe keys, no RIGHT/FULL
+// outer emission (it needs shared matched flags), and enough left rows to
+// amortize thread startup.  Workers claim contiguous chunks of left.rows,
+// join into a per-chunk buffer, and flush the buffers through result->AddRow
+// one chunk at a time in strict chunk order, so output row order matches
+// the serial loop exactly.  Left-outer unmatched emission happens inside the
+// worker's chunk buffer, preserving order as well.  At most one buffer per
+// worker is ever in flight, so the query memory budget (and the spill
+// behavior inside AddRow) stays in force.  The build-side buckets are
+// read-only during the probe.
+constexpr size_t kParallelProbeMinLeftRows = 65536;
+constexpr size_t kParallelProbeChunk = 8192;
+constexpr size_t kParallelProbeMaxWorkers = 16;
+
+template <typename Buckets, typename KeyOfRow>
+static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
+    Buckets& buckets, const Relation& left,
+    const std::vector<slot_t>& left_columns, KeyOfRow key_of_row,
+    bool left_outer_emit, size_t right_width, size_t worker_count,
+    Relation* result, size_t* join_comparisons) {
+  const size_t total = left.rows.size();
+  const size_t num_chunks =
+      (total + kParallelProbeChunk - 1) / kParallelProbeChunk;
+  worker_count = std::min({worker_count, num_chunks, total});
+  std::atomic<size_t> next_chunk{0};
+  std::vector<std::vector<Row>> buffers(num_chunks);
+  std::mutex flush_mutex;
+  std::condition_variable flush_cv;
+  size_t flush_cursor = 0;
+  std::vector<size_t> comparisons(worker_count, 0);
+  std::mutex error_mutex;
+  Status first_error{Status::kSuccess};
+
+  // Every claimed chunk advances the cursor exactly once, even on the error
+  // path, so waiters never block on a chunk whose owner already returned.
+  auto flush_one = [&](size_t chunk) {
+    std::unique_lock lock(flush_mutex);
+    while (flush_cursor != chunk) {  // NOLINT(bugprone-infinite-loop)
+      // flush_cursor only advances in OTHER waiters' iterations below; the
+      // analyzer cannot model the cv handshake, so this wait looks infinite.
+      flush_cv.wait(lock);
+    }
+    for (Row& row : buffers[chunk]) {
+      result->AddRow(std::move(row));
+    }
+    buffers[chunk].clear();
+    buffers[chunk].shrink_to_fit();
+    ++flush_cursor;
+    lock.unlock();
+    flush_cv.notify_all();
+  };
+
+  auto run_worker = [&](size_t worker_id) {
+    for (;;) {
+      const size_t chunk = next_chunk.fetch_add(1);
+      if (chunk >= num_chunks) {
+        return;
+      }
+      try {
+        const size_t begin = chunk * kParallelProbeChunk;
+        const size_t end = std::min(total, begin + kParallelProbeChunk);
+        std::vector<Row>& local = buffers[chunk];
+        local.reserve(end - begin);
+        for (size_t i = begin; i < end; ++i) {
+          const Row& left_row = left.rows[i];
+          if (HasNullKey(left_row, left_columns)) {
+            if (left_outer_emit) {
+              std::vector<Value> nulls(right_width);
+              local.push_back(left_row + Row(std::move(nulls)));
+            }
+            continue;
+          }
+          bool matched = false;
+          const auto [eq_begin, eq_end] =
+              buckets.equal_range(key_of_row(left_row));
+          for (auto iter = eq_begin; iter != eq_end; ++iter) {
+            ++comparisons[worker_id];
+            Row combined = left_row + *iter->second;
+            local.push_back(std::move(combined));
+            matched = true;
+          }
+          if (!matched && left_outer_emit) {
+            std::vector<Value> nulls(right_width);
+            local.push_back(left_row + Row(std::move(nulls)));
+          }
+        }
+      } catch (const std::exception& error) {
+        std::scoped_lock error_lock(error_mutex);
+        if (first_error.ok()) {
+          first_error = StatusError(StatusCode::kRuntimeError, error.what());
+        }
+      } catch (...) {
+        std::scoped_lock error_lock(error_mutex);
+        if (first_error.ok()) {
+          first_error =
+              StatusError(StatusCode::kRuntimeError, "parallel probe failed");
+        }
+      }
+      flush_one(chunk);
+    }
+  };
+
+  if (worker_count <= 1) {
+    run_worker(0);
+  } else {
+    std::vector<std::jthread> workers;
+    workers.reserve(worker_count);
+    for (size_t i = 0; i < worker_count; ++i) {
+      workers.emplace_back([&, i] { run_worker(i); });
+    }
+  }
+  for (const size_t count : comparisons) {
+    *join_comparisons += count;
+  }
+  return first_error;
+}  // namespace
+
 StatusOr<Relation> Join(TransactionContext& context, Relation left,
                         Relation right, const SelectSource& source,
                         const Scope* outer, const CteMap& ctes) {
@@ -635,21 +1003,37 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
   result.join_comparisons = left.join_comparisons + right.join_comparisons;
   result.peak_intermediate_rows =
       std::max(left.peak_intermediate_rows, right.peak_intermediate_rows);
-  // USING joins expose one merged column per declared name: bare references
-  // and star expansion coalesce the physical duplicates (see Lookup and the
-  // relational projection).  Qualified references keep binding per side.
-  if (!source.using_columns.empty()) {
-    std::vector<std::string> lowered;
-    lowered.reserve(source.using_columns.size());
-    for (const std::string& name : source.using_columns) {
-      std::string lower(name);
-      for (char& c : lower) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  std::vector<std::string> merged_using;
+  auto append_using = [&](const std::vector<std::string>& names) {
+    for (const std::string& name : names) {
+      const std::string lowered = LowerIdentifierLocal(name);
+      if (!ContainsIdentifierLocal(merged_using, lowered)) {
+        merged_using.push_back(lowered);
       }
-      lowered.push_back(std::move(lower));
     }
-    result.using_columns =
-        std::make_shared<const std::vector<std::string>>(std::move(lowered));
+  };
+  if (left.using_columns != nullptr) {
+    append_using(*left.using_columns);
+  }
+  if (right.using_columns != nullptr) {
+    append_using(*right.using_columns);
+  }
+  append_using(source.using_columns);
+  std::vector<std::string> retained_using;
+  retained_using.reserve(merged_using.size());
+  for (const std::string& name : merged_using) {
+    const bool declared_now =
+        ContainsIdentifierLocal(source.using_columns, name);
+    const bool right_collision =
+        !MatchingColumnOffsets(right.schema, name).empty();
+    if (!declared_now && right_collision) {
+      continue;
+    }
+    retained_using.push_back(name);
+  }
+  if (!retained_using.empty()) {
+    result.using_columns = std::make_shared<const std::vector<std::string>>(
+        std::move(retained_using));
   }
   const bool want_left_nulls = source.join_type == JoinType::kLeft ||
                                source.join_type == JoinType::kFull;
@@ -676,16 +1060,93 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
   };
   const std::vector<Expression> predicates =
       SplitConjuncts(source.join_condition);
-  const std::vector<EqualityKey> equality_keys =
-      EqualityKeys(left.schema, right.schema, predicates);
+  std::vector<Expression> ordinary_predicates;
+  ordinary_predicates.reserve(predicates.size());
+  for (const Expression& predicate : predicates) {
+    if (!IsDeclaredUsingEquality(predicate, source.using_columns)) {
+      ordinary_predicates.push_back(predicate);
+    }
+  }
+  std::vector<EqualityKey> equality_keys =
+      EqualityKeys(left.schema, right.schema, ordinary_predicates);
+  struct UsingJoinKey {
+    std::vector<size_t> left_columns;
+    std::vector<size_t> right_columns;
+  };
+  std::vector<UsingJoinKey> using_residuals;
+  for (const std::string& name : source.using_columns) {
+    std::vector<size_t> left_columns = MatchingColumnOffsets(left.schema, name);
+    std::vector<size_t> right_columns =
+        MatchingColumnOffsets(right.schema, name);
+    if (left_columns.empty() || right_columns.empty()) {
+      continue;
+    }
+    if (left_columns.size() > 1 &&
+        (left.using_columns == nullptr ||
+         !ContainsIdentifierLocal(*left.using_columns, name))) {
+      return StatusError(StatusCode::kAmbiguousQuery,
+                         "ambiguous USING column: " + name);
+    }
+    if (right_columns.size() > 1 &&
+        (right.using_columns == nullptr ||
+         !ContainsIdentifierLocal(*right.using_columns, name))) {
+      return StatusError(StatusCode::kAmbiguousQuery,
+                         "ambiguous USING column: " + name);
+    }
+    const bool same_single_type =
+        left_columns.size() == 1 && right_columns.size() == 1 &&
+        left.schema.GetColumn(left_columns.front()).Type() ==
+            right.schema.GetColumn(right_columns.front()).Type();
+    if (same_single_type) {
+      equality_keys.push_back(
+          {left_columns.front(), right_columns.front(), false});
+    } else {
+      using_residuals.push_back(
+          {std::move(left_columns), std::move(right_columns)});
+    }
+  }
   const std::vector<Expression> residual =
-      ResidualJoinPredicates(left.schema, right.schema, predicates);
+      ResidualJoinPredicates(left.schema, right.schema, ordinary_predicates);
   Status residual_error{Status::kSuccess};
   auto matches = [&](const Row& combined) {
+    const auto merged_value = [&](const std::vector<size_t>& columns,
+                                  const size_t offset) -> const Value* {
+      for (const size_t column : columns) {
+        const Value& value = combined[column + offset];
+        if (!value.IsNull()) {
+          return &value;
+        }
+      }
+      return nullptr;
+    };
+    for (const UsingJoinKey& key : using_residuals) {
+      const Value* left_value = merged_value(key.left_columns, 0);
+      const Value* right_value =
+          merged_value(key.right_columns, left.schema.ColumnCount());
+      if (left_value == nullptr || right_value == nullptr) {
+        return false;
+      }
+      if ((left_value->type == ValueType::kDouble &&
+           std::isnan(left_value->value.double_value)) ||
+          (right_value->type == ValueType::kDouble &&
+           std::isnan(right_value->value.double_value))) {
+        return false;
+      }
+      StatusOr<Value> equal =
+          TryBinary(BinaryOperation::kEquals, *left_value, *right_value);
+      if (!equal.HasValue()) {
+        residual_error = equal.GetStatus();
+        return false;
+      }
+      if (!Truthy(equal.Value())) {
+        return false;
+      }
+    }
     if (residual.empty()) {
       return true;
     }
     Scope scope{.row = &combined, .schema = &result.schema, .outer = outer};
+    scope.using_columns = result.using_columns.get();
     return std::ranges::all_of(residual, [&](const Expression& predicate) {
       if (residual_error != Status::kSuccess) {
         return false;
@@ -759,6 +1220,19 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
       return joined;
     }
     ++result.in_memory_hash_joins;
+    // Parallel chunked probe (see ParallelHashProbe): needs a pure row
+    // decision (no residual re-entering TryEvaluate), no shared right-side
+    // matched flags, and a probe side big enough to amortize the threads.
+    static const bool probe_disabled =
+        std::getenv("TINYLAMB_DISABLE_PARALLEL_PROBE") != nullptr;
+    const bool can_parallelize = !probe_disabled && residual.empty() &&
+                                 using_residuals.empty() &&
+                                 !has_null_safe_key && !want_right_nulls &&
+                                 left.rows.size() >= kParallelProbeMinLeftRows;
+    const size_t probe_workers =
+        can_parallelize ? std::min<size_t>(kParallelProbeMaxWorkers,
+                                           std::thread::hardware_concurrency())
+                        : 1;
     const bool integer_key = !has_null_safe_key &&
                              SingleIntegerJoinKey(left.schema, left_columns) &&
                              SingleIntegerJoinKey(right.schema, right_columns);
@@ -770,23 +1244,77 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
           buckets.emplace(IntegerJoinKey(row, right_columns[0]), &row);
         }
       }
-      for (const Row& left_row : left.rows) {
-        bool matched = false;
-        if (has_null_safe_key || !HasNullKey(left_row, left_columns)) {
-          const int64_t key = IntegerJoinKey(left_row, left_columns[0]);
-          const auto [begin, end] = buckets.equal_range(key);
-          for (auto iter = begin; iter != end; ++iter) {
-            ++result.join_comparisons;
-            Row combined = left_row + *iter->second;
-            if (matches(combined)) {
-              mark_right_match(*iter->second);
-              result.AddRow(std::move(combined));
-              matched = true;
+      if (can_parallelize) {
+        RETURN_IF_FAIL(ParallelHashProbe(
+            buckets, left, left_columns,
+            [&](const Row& row) {
+              return IntegerJoinKey(row, left_columns[0]);
+            },
+            want_left_nulls, right.schema.ColumnCount(), probe_workers, &result,
+            &result.join_comparisons));
+        RETURN_IF_FAIL(residual_error);
+      } else {
+        for (const Row& left_row : left.rows) {
+          bool matched = false;
+          if (has_null_safe_key || !HasNullKey(left_row, left_columns)) {
+            const int64_t key = IntegerJoinKey(left_row, left_columns[0]);
+            const auto [begin, end] = buckets.equal_range(key);
+            for (auto iter = begin; iter != end; ++iter) {
+              ++result.join_comparisons;
+              Row combined = left_row + *iter->second;
+              if (matches(combined)) {
+                mark_right_match(*iter->second);
+                result.AddRow(std::move(combined));
+                matched = true;
+              }
             }
           }
+          if (!matched) {
+            emit_unmatched(left_row);
+          }
         }
-        if (!matched) {
-          emit_unmatched(left_row);
+      }
+    } else if (!has_null_safe_key &&
+               CompositeIntJoinKey(left.schema, left_columns, right.schema,
+                                   right_columns)) {
+      std::unordered_multimap<CompositeIntKey, const Row*, CompositeIntKeyHash>
+          buckets;
+      buckets.reserve(right.rows.size());
+      for (const Row& row : right.rows) {
+        if (HasNullKey(row, right_columns)) {
+          continue;
+        }
+        buckets.emplace(EncodeCompositeIntKey(row, right_columns), &row);
+      }
+      if (can_parallelize) {
+        RETURN_IF_FAIL(ParallelHashProbe(
+            buckets, left, left_columns,
+            [&](const Row& row) {
+              return EncodeCompositeIntKey(row, left_columns);
+            },
+            want_left_nulls, right.schema.ColumnCount(), probe_workers, &result,
+            &result.join_comparisons));
+        RETURN_IF_FAIL(residual_error);
+      } else {
+        for (const Row& left_row : left.rows) {
+          bool matched = false;
+          if (!HasNullKey(left_row, left_columns)) {
+            const CompositeIntKey key =
+                EncodeCompositeIntKey(left_row, left_columns);
+            const auto [begin, end] = buckets.equal_range(key);
+            for (auto iter = begin; iter != end; ++iter) {
+              ++result.join_comparisons;
+              Row combined = left_row + *iter->second;
+              if (matches(combined)) {
+                mark_right_match(*iter->second);
+                result.AddRow(std::move(combined));
+                matched = true;
+              }
+            }
+          }
+          if (!matched) {
+            emit_unmatched(left_row);
+          }
         }
       }
     } else {
@@ -800,25 +1328,35 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
                           &row);
         }
       }
-      for (const Row& left_row : left.rows) {
-        bool matched = false;
-        if (has_null_safe_key || !HasNullKey(left_row, left_columns)) {
-          const std::string key =
-              has_null_safe_key ? EncodeNullSafeJoinKey(left_row, left_columns)
-                                : EncodeJoinKey(left_row, left_columns);
-          const auto [begin, end] = buckets.equal_range(key);
-          for (auto iter = begin; iter != end; ++iter) {
-            ++result.join_comparisons;
-            Row combined = left_row + *iter->second;
-            if (matches(combined)) {
-              mark_right_match(*iter->second);
-              result.AddRow(std::move(combined));
-              matched = true;
+      if (can_parallelize) {
+        RETURN_IF_FAIL(ParallelHashProbe(
+            buckets, left, left_columns,
+            [&](const Row& row) { return EncodeJoinKey(row, left_columns); },
+            want_left_nulls, right.schema.ColumnCount(), probe_workers, &result,
+            &result.join_comparisons));
+        RETURN_IF_FAIL(residual_error);
+      } else {
+        for (const Row& left_row : left.rows) {
+          bool matched = false;
+          if (has_null_safe_key || !HasNullKey(left_row, left_columns)) {
+            const std::string key =
+                has_null_safe_key
+                    ? EncodeNullSafeJoinKey(left_row, left_columns)
+                    : EncodeJoinKey(left_row, left_columns);
+            const auto [begin, end] = buckets.equal_range(key);
+            for (auto iter = begin; iter != end; ++iter) {
+              ++result.join_comparisons;
+              Row combined = left_row + *iter->second;
+              if (matches(combined)) {
+                mark_right_match(*iter->second);
+                result.AddRow(std::move(combined));
+                matched = true;
+              }
             }
           }
-        }
-        if (!matched) {
-          emit_unmatched(left_row);
+          if (!matched) {
+            emit_unmatched(left_row);
+          }
         }
       }
     }
@@ -930,6 +1468,12 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
       return joined;
     }
     ++result.in_memory_hash_joins;
+    const bool can_parallelize = residual.empty() && !has_null_safe_key &&
+                                 left.rows.size() >= kParallelProbeMinLeftRows;
+    const size_t probe_workers =
+        can_parallelize ? std::min<size_t>(kParallelProbeMaxWorkers,
+                                           std::thread::hardware_concurrency())
+                        : 1;
     const bool integer_key = !has_null_safe_key &&
                              SingleIntegerJoinKey(left.schema, left_columns) &&
                              SingleIntegerJoinKey(right.schema, right_columns);
@@ -942,17 +1486,66 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
         }
         buckets.emplace(IntegerJoinKey(row, right_columns[0]), &row);
       }
-      for (const Row& left_row : left.rows) {
-        if (!has_null_safe_key && HasNullKey(left_row, left_columns)) {
+      if (can_parallelize) {
+        RETURN_IF_FAIL(ParallelHashProbe(
+            buckets, left, left_columns,
+            [&](const Row& row) {
+              return IntegerJoinKey(row, left_columns[0]);
+            },
+            false, right.schema.ColumnCount(), probe_workers, &result,
+            &result.join_comparisons));
+        RETURN_IF_FAIL(residual_error);
+      } else {
+        for (const Row& left_row : left.rows) {
+          if (!has_null_safe_key && HasNullKey(left_row, left_columns)) {
+            continue;
+          }
+          const int64_t key = IntegerJoinKey(left_row, left_columns[0]);
+          const auto [begin, end] = buckets.equal_range(key);
+          for (auto iter = begin; iter != end; ++iter) {
+            ++result.join_comparisons;
+            Row combined = left_row + *iter->second;
+            if (matches(combined)) {
+              result.AddRow(std::move(combined));
+            }
+          }
+        }
+      }
+    } else if (!has_null_safe_key &&
+               CompositeIntJoinKey(left.schema, left_columns, right.schema,
+                                   right_columns)) {
+      std::unordered_multimap<CompositeIntKey, const Row*, CompositeIntKeyHash>
+          buckets;
+      buckets.reserve(right.rows.size());
+      for (const Row& row : right.rows) {
+        if (HasNullKey(row, right_columns)) {
           continue;
         }
-        const int64_t key = IntegerJoinKey(left_row, left_columns[0]);
-        const auto [begin, end] = buckets.equal_range(key);
-        for (auto iter = begin; iter != end; ++iter) {
-          ++result.join_comparisons;
-          Row combined = left_row + *iter->second;
-          if (matches(combined)) {
-            result.AddRow(std::move(combined));
+        buckets.emplace(EncodeCompositeIntKey(row, right_columns), &row);
+      }
+      if (can_parallelize) {
+        RETURN_IF_FAIL(ParallelHashProbe(
+            buckets, left, left_columns,
+            [&](const Row& row) {
+              return EncodeCompositeIntKey(row, left_columns);
+            },
+            false, right.schema.ColumnCount(), probe_workers, &result,
+            &result.join_comparisons));
+        RETURN_IF_FAIL(residual_error);
+      } else {
+        for (const Row& left_row : left.rows) {
+          if (HasNullKey(left_row, left_columns)) {
+            continue;
+          }
+          const CompositeIntKey key =
+              EncodeCompositeIntKey(left_row, left_columns);
+          const auto [begin, end] = buckets.equal_range(key);
+          for (auto iter = begin; iter != end; ++iter) {
+            ++result.join_comparisons;
+            Row combined = left_row + *iter->second;
+            if (matches(combined)) {
+              result.AddRow(std::move(combined));
+            }
           }
         }
       }
@@ -968,19 +1561,28 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
                             : EncodeJoinKey(row, right_columns),
                         &row);
       }
-      for (const Row& left_row : left.rows) {
-        if (!has_null_safe_key && HasNullKey(left_row, left_columns)) {
-          continue;
-        }
-        const std::string key =
-            has_null_safe_key ? EncodeNullSafeJoinKey(left_row, left_columns)
-                              : EncodeJoinKey(left_row, left_columns);
-        const auto [begin, end] = buckets.equal_range(key);
-        for (auto iter = begin; iter != end; ++iter) {
-          ++result.join_comparisons;
-          Row combined = left_row + *iter->second;
-          if (matches(combined)) {
-            result.AddRow(std::move(combined));
+      if (can_parallelize) {
+        RETURN_IF_FAIL(ParallelHashProbe(
+            buckets, left, left_columns,
+            [&](const Row& row) { return EncodeJoinKey(row, left_columns); },
+            false, right.schema.ColumnCount(), probe_workers, &result,
+            &result.join_comparisons));
+        RETURN_IF_FAIL(residual_error);
+      } else {
+        for (const Row& left_row : left.rows) {
+          if (!has_null_safe_key && HasNullKey(left_row, left_columns)) {
+            continue;
+          }
+          const std::string key =
+              has_null_safe_key ? EncodeNullSafeJoinKey(left_row, left_columns)
+                                : EncodeJoinKey(left_row, left_columns);
+          const auto [begin, end] = buckets.equal_range(key);
+          for (auto iter = begin; iter != end; ++iter) {
+            ++result.join_comparisons;
+            Row combined = left_row + *iter->second;
+            if (matches(combined)) {
+              result.AddRow(std::move(combined));
+            }
           }
         }
       }
@@ -1502,20 +2104,100 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 statement.Sources()[nested_begin], outer, ctes);
   }
   if (has_ordered_join) {
+    // The ordered path keeps the syntactic join shape, but WHERE conjuncts
+    // are still placed as early as they become referenceable, mirroring the
+    // inner-join optimizer below: (a) single-source conjuncts filter the
+    // owning scan, and (b) conjuncts whose last referenced table is a comma
+    // (cross) source become that join's condition, turning what would be an
+    // unbounded cross product into an equi/residual join.  Placement only
+    // moves a conjunct to the first step where every source it references is
+    // already joined -- never below the outer join that supplies one of its
+    // columns -- and the full WHERE still runs above the joined output, so
+    // outer-join semantics are unchanged.  Volatile or query-bearing
+    // conjuncts are left for the top-level filter, since applying them twice
+    // must not change how often they evaluate.
+    std::vector<PredicateInfo> ordered_predicates =
+        AnalyzePredicates(statement.WhereClause(), relations);
+    std::vector<bool> predicate_placed(ordered_predicates.size(), false);
+    const auto placeable = [&](const PredicateInfo& predicate) {
+      return predicate.resolved && !predicate.contains_query &&
+             SafeToReduceEvaluationCount(predicate.expression);
+    };
+    // Single-source conjuncts may only pre-filter a PRESERVED side.
+    // Pre-filtering a null-supplying side converts some matched rows into
+    // NULL-padded rows, which changes the outcome of WHERE terms that
+    // distinguish padded rows -- `WHERE b.id IS NULL` over
+    // `a LEFT JOIN b` (outer_to_anti) would otherwise resurrect the rows
+    // whose match was filtered away.  A source is null-supplying when it is
+    // the right side of a LEFT/FULL join; a RIGHT/FULL join additionally
+    // makes every earlier source null-supplying.
+    std::vector<char> filter_safe(relations.size(), 1);
+    for (size_t i = 1; i < statement.Sources().size(); ++i) {
+      const JoinType type = statement.Sources()[i].join_type;
+      if (type == JoinType::kLeft || type == JoinType::kFull) {
+        filter_safe[i] = 0;
+      }
+      if (type == JoinType::kRight || type == JoinType::kFull) {
+        for (size_t j = 0; j < i; ++j) {
+          filter_safe[j] = 0;
+        }
+      }
+    }
+    std::vector<std::vector<Expression>> ordered_local(relations.size());
+    for (size_t p = 0; p < ordered_predicates.size(); ++p) {
+      const PredicateInfo& predicate = ordered_predicates[p];
+      if (!placeable(predicate) || predicate.sources.size() != 1) {
+        continue;
+      }
+      const size_t owner = *predicate.sources.begin();
+      if (!static_cast<bool>(filter_safe[owner])) {
+        continue;
+      }
+      ordered_local[owner].push_back(predicate.expression);
+      predicate_placed[p] = true;
+    }
     for (size_t i = 0; i < relations.size(); ++i) {
       if (base_sources[i]) {
-        ASSIGN_OR_RETURN(Relation, loaded_rel,
-                         (LoadSource(context, statement.Sources()[i], outer,
-                                     ctes, &projections[i])));
+        ASSIGN_OR_RETURN(
+            Relation, loaded_rel,
+            (LoadSource(
+                context, statement.Sources()[i], outer, ctes, &projections[i],
+                ordered_local[i].empty() ? nullptr : &ordered_local[i])));
         relations[i] = std::move(loaded_rel);
+      } else if (!ordered_local[i].empty()) {
+        RETURN_IF_FAIL(FilterRelation(context, &relations[i], ordered_local[i],
+                                      outer, ctes));
       }
     }
     Relation result = std::move(relations.front());
+    std::unordered_set<size_t> available{0};
     for (size_t i = 1; i < relations.size(); ++i) {
-      ASSIGN_OR_RETURN(
-          Relation, result_r,
-          (Join(context, std::move(result), std::move(relations[i]),
-                statement.Sources()[i], outer, ctes)));
+      available.insert(i);
+      SelectSource source = statement.Sources()[i];
+      // Outer-join ON conditions keep their syntactic predicate: folding a
+      // WHERE conjunct into them would change matching into null padding.
+      if (source.join_type == JoinType::kCross) {
+        std::vector<Expression> applicable;
+        for (size_t p = 0; p < ordered_predicates.size(); ++p) {
+          const PredicateInfo& predicate = ordered_predicates[p];
+          if (predicate_placed[p] || !placeable(predicate) ||
+              predicate.sources.size() < 2 || !predicate.sources.contains(i) ||
+              !IsSubset(predicate.sources, available)) {
+            continue;
+          }
+          applicable.push_back(predicate.expression);
+          predicate_placed[p] = true;
+        }
+        if (!applicable.empty()) {
+          if (source.join_condition) {
+            applicable.push_back(source.join_condition);
+          }
+          source.join_condition = CombineConjuncts(applicable);
+        }
+      }
+      ASSIGN_OR_RETURN(Relation, result_r,
+                       (Join(context, std::move(result),
+                             std::move(relations[i]), source, outer, ctes)));
       result = std::move(result_r);
     }
     return result;
@@ -1558,6 +2240,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       all_predicates.push_back(condition);
     }
   }
+  const auto planning_begin = std::chrono::steady_clock::now();
+  double join_estimate_ms = 0;
   // Join-condition conjuncts that the pipeline below cannot push down
   // (subquery predicates, constant-only conjuncts such as NOT EXISTS(SELECT 1))
   // must still gate the joined output; dropping them silently changes the
@@ -1652,6 +2336,16 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       const QueryExpression& query = expression->AsQueryExpression();
       if (query.Exists() || query.Negated() || !query.Test() ||
           query.Test()->Type() != TypeTag::kColumnValue) {
+        continue;
+      }
+      // The stashed set is the MEMBERSHIP set: it may only prune rows that
+      // fail `test IN (rows)`.  `x > ANY (S)` / `x = ALL (S)` match on
+      // operators other than equality (or over multiple rows), where S is
+      // not a pruning superset: `j > ANY (SELECT 5,6)` would drop j=9.
+      // Only the equality-IN shape (`kIn`, or `= ANY`) may stash.
+      if (query.Mode() != QuantifierMode::kIn &&
+          (query.Mode() != QuantifierMode::kAny ||
+           query.Op() != BinaryOperation::kEquals)) {
         continue;
       }
       if (context.execution_runtime() != nullptr) {
@@ -1977,6 +2671,11 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     }
   }
 
+  // TINYLAMB_LEGACY_PLANNER=1 restores the per-call estimation behavior
+  // (fresh maps, exact full-relation sweeps) for A/B comparisons.
+  static const bool legacy_planner =
+      std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
+  std::unordered_map<const Relation*, JoinKeyFrequencyMaps> frequency_cache;
   while (!remaining.empty()) {
     size_t next = *remaining.begin();
     size_t next_estimate = std::numeric_limits<size_t>::max();
@@ -1998,8 +2697,13 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         // from join_residual for unselected candidates, corrupting
         // the residual filter.  We only mark after the winner is known.
       }
+      const auto estimate_begin = std::chrono::steady_clock::now();
       const size_t estimate =
-          EstimateJoinRows(result, relations[candidate], applicable);
+          legacy_planner
+              ? EstimateJoinRows(result, relations[candidate], applicable)
+              : EstimateJoinRowsCached(result, relations[candidate], applicable,
+                                       &frequency_cache);
+      join_estimate_ms += ElapsedMs(estimate_begin);
       const bool connected = !applicable.empty();
       const bool cheaper =
           estimate < next_estimate ||
@@ -2039,6 +2743,11 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // inner-join semantics stay intact.
     RETURN_IF_FAIL(
         FilterRelation(context, &result, join_residual, outer, ctes));
+  }
+  if (context.execution_runtime() != nullptr) {
+    context.execution_runtime()->join_estimate_ms += join_estimate_ms;
+    context.execution_runtime()->planning_ms +=
+        ElapsedMs(planning_begin) - join_estimate_ms;
   }
   return result;
 }

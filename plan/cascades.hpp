@@ -117,8 +117,12 @@ struct LogicalExpression {
   std::string unnest_alias{};
   std::string offset_alias{};
   std::string cte_name{};
-  double sample_rate{1.0};
-  bool is_bernoulli{false};
+  TableSampleMethod sample_method{TableSampleMethod::kBernoulli};
+  TableSampleUnit sample_unit{TableSampleUnit::kPercent};
+  Expression sample_size{};
+  std::optional<Expression> sample_seed{};
+  bool sample_with_weight{false};
+  std::string sample_weight_alias{};
   size_t depth_limit{0};
   std::optional<RecursiveDepthSpec> depth_spec{};
 
@@ -152,6 +156,7 @@ struct Group {
   // Non-empty for derived root-layer groups (Selection/Projection/
   // Aggregation/Limit chains); distinguishes groups that share a relation set.
   std::string tag{};
+  bool sample_barrier{false};
   LogicalProperties logical_properties{};
 };
 
@@ -220,9 +225,20 @@ class Memo {
   // `left_mask` and its complement within `within_mask`.
   [[nodiscard]] bool CutConnected(uint64_t left_mask,
                                   uint64_t within_mask) const;
+  // Nodes in `within` that share a conjunct with `subset` (hyperedges count
+  // as cliques). Used by join enumeration to test induced connectivity.
+  [[nodiscard]] uint64_t NeighborBits(uint64_t subset, uint64_t within) const;
+  // True when the conjuncts induced by `within` connect every relation in it.
+  [[nodiscard]] bool InducedSubgraphConnected(uint64_t within) const;
+  // Join enumeration partitions a group once. The first call wins.
+  bool ClaimJoinEnumeration(GroupId group);
+  [[nodiscard]] bool JoinEnumerationClaimed(GroupId group) const {
+    return group < join_enumerated_.size() && join_enumerated_[group] != 0;
+  }
   [[nodiscard]] bool HasConjuncts() const { return !conjuncts_.empty(); }
-  // True when no conjunct connects any pair of relations.
   [[nodiscard]] bool JoinGraphDisconnected() const;
+  [[nodiscard]] bool JoinGraphConnected() const;
+  [[nodiscard]] bool HasColumnEqualityConjunct() const;
 
   // Snapshot-proven 1:1 joins (TODO.md item 1d). The optimizer records a
   // directed pair (outer, inner) when every non-NULL outer join key is
@@ -292,6 +308,8 @@ class Memo {
   std::vector<GroupId> touched_groups_;
   std::unordered_map<std::string, Schema> table_schemas_;
   std::unordered_set<std::string> proven_one_to_one_;
+  // Parallel to groups_: 1 after join_enumeration has partitioned that group.
+  std::vector<uint8_t> join_enumerated_;
   const size_t expression_cap_;
   bool degraded_{false};
 };
@@ -573,12 +591,26 @@ class Rule {
        std::optional<LogicalOperator> target = std::nullopt)
       : name_(std::move(name)),
         pattern_(std::move(pattern)),
+        transform_(std::move(transform)) {
+    if (target) {
+      targets_.push_back(*target);
+    }
+  }
+
+  // Rules whose body acts on several root operator kinds (e.g. one
+  // INTERSECT/EXCEPT shape each) declare the full set so the worklist can
+  // prefilter every other expression without invoking the pattern.
+  Rule(std::string name, Pattern pattern, Transform transform,
+       std::initializer_list<LogicalOperator> targets)
+      : name_(std::move(name)),
+        pattern_(std::move(pattern)),
         transform_(std::move(transform)),
-        target_(target) {}
+        targets_(targets) {}
 
   [[nodiscard]] const std::string& Name() const { return name_; }
   [[nodiscard]] bool MayApply(LogicalOperator operation) const {
-    return !target_ || *target_ == operation;
+    return targets_.empty() ||
+           std::ranges::find(targets_, operation) != targets_.end();
   }
   [[nodiscard]] bool Apply(Memo& memo, GroupId group,
                            const LogicalExpression& expression) const;
@@ -587,7 +619,7 @@ class Rule {
   std::string name_;
   Pattern pattern_;
   Transform transform_;
-  std::optional<LogicalOperator> target_;
+  std::vector<LogicalOperator> targets_;
 };
 
 class RuleSet {
@@ -674,6 +706,13 @@ enum class OperatorCostKind : uint8_t {
 
 [[nodiscard]] double EstimateMultiColumnSelectivity(
     const std::vector<double>& selectivities, double correlation_factor = 0.0);
+
+// Per-equality-key selectivities (each 1/max(NDV)) combined when the catalog
+// has no cross-column NDV. A single key returns that selectivity. Further
+// keys use exponential backoff (most selective in full, then square root,
+// fourth root, ...), between the max-NDV model and full independence.
+[[nodiscard]] double EstimateEquijoinSelectivity(
+    const std::vector<double>& key_selectivities);
 
 enum class PatternMatchingKind : uint8_t { kLike, kRegexp };
 
@@ -786,6 +825,9 @@ class SearchEngine {
   // OptimizerOptions::search_step_budget.
   void SetStepBudget(size_t budget) { step_budget_ = budget; }
   [[nodiscard]] bool BudgetExhausted() const { return budget_exhausted_; }
+  [[nodiscard]] bool ExploreLimitReached() const {
+    return explore_limit_reached_;
+  }
   [[nodiscard]] std::optional<BestPlan> Optimize(
       GroupId root, const PhysicalProperties& properties,
       const Implement& implement, const RuleContext& context);
@@ -824,9 +866,14 @@ class SearchEngine {
   std::unordered_map<GroupId, size_t> next_expression_;
   std::unordered_map<std::string, std::optional<BestPlan>> best_;
   std::unordered_set<std::string> applied_rules_;
+  // Diagnostics: per-rule application counts, dumped from Explore() when
+  // TINYLAMB_RULE_STATS is set (planning-cost attribution only).
+  std::unordered_map<std::string, size_t> rule_attempt_counts_;
+  bool rule_stats_{false};
   size_t step_budget_{0};
   size_t steps_{0};
   bool budget_exhausted_{false};
+  bool explore_limit_reached_{false};
 };
 
 bool IsStrictOnRelations(const Expression& expr,

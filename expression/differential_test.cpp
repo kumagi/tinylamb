@@ -242,19 +242,18 @@ class DifferentialTally {
                              other.kind == Attempt::Kind::kThrow;
     if (both_values) {
       EXPECT_TRUE(SameValue(baseline.value, other.value))
-          << true << cell << " input[" << input
-          << "] baseline=" << Describe(baseline)
+          << cell << " input[" << input << "] baseline=" << Describe(baseline)
           << " other=" << Describe(other);
       return;
     }
     if (both_throws) {
       EXPECT_EQ(baseline.exception, other.exception)
-          << true << cell << " input[" << input << "] exception type differs";
-      EXPECT_EQ(baseline.note, other.note) << true << cell << " input[" << input
-                                           << "] exception message differs";
+          << cell << " input[" << input << "] exception type differs";
+      EXPECT_EQ(baseline.note, other.note)
+          << cell << " input[" << input << "] exception message differs";
       return;
     }
-    ADD_FAILURE() << true << cell << " input[" << input
+    ADD_FAILURE() << cell << " input[" << input
                   << "] one path threw, another returned: baseline="
                   << Describe(baseline) << " other=" << Describe(other);
   }
@@ -908,7 +907,7 @@ TEST(DifferentialTest,
      CompileProjection_LinearTransformation_MatchesAstAndBytecode) {
   const auto jit = JitInt64Kernels::CompileProjection();
   if (!jit.has_value()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   constexpr int64_t kMultiplier = 3;
   constexpr int64_t kAddend = 2;
@@ -920,7 +919,7 @@ TEST(DifferentialTest,
       BinaryOperation::kAdd, ConstantValueExp(Value(kAddend)));
   auto program = BytecodeCompiler::Compile(expr, projection_schema);
   if (!program.has_value()) {
-    FAIL() << true;
+    FAIL();
     return;
   }
   for (const int64_t sample :
@@ -952,7 +951,7 @@ TEST(DifferentialTest,
       EvaluateDetailPath(modulo_zero, zero_division, schema);
   EXPECT_EQ(ast_mod.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_mod.exception, ast_mod.exception);
-  EXPECT_EQ(detail_mod.note, ast_mod.note) << true;
+  EXPECT_EQ(detail_mod.note, ast_mod.note);
 
   const Row min_row({Value(kInt64Min), Value()});
   const Expression negated =
@@ -961,7 +960,7 @@ TEST(DifferentialTest,
   const Attempt detail_neg = EvaluateDetailPath(negated, min_row, schema);
   EXPECT_EQ(ast_neg.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_neg.exception, ast_neg.exception);
-  EXPECT_EQ(detail_neg.note, ast_neg.note) << true;
+  EXPECT_EQ(detail_neg.note, ast_neg.note);
 
   // CASE and date functions agree between the AST evaluator and the
   // relational_detail interpreter.
@@ -1058,7 +1057,7 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   EXPECT_EQ(detail_div.kind, Attempt::Kind::kValue);
   EXPECT_EQ(ast_div.kind, Attempt::Kind::kValue);
   EXPECT_EQ(detail_div.value.type, ValueType::kDouble);
-  EXPECT_TRUE(SameValue(detail_div.value, ast_div.value)) << true;
+  EXPECT_TRUE(SameValue(detail_div.value, ast_div.value));
 
   const Row max_one({Value(kInt64Max), Value(int64_t{1})});
   const Expression overflow_add = BinaryExpressionExp(
@@ -1068,7 +1067,7 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   EXPECT_EQ(detail_add.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(ast_add.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_add.exception, ast_add.exception);
-  EXPECT_EQ(detail_add.note, ast_add.note) << true;
+  EXPECT_EQ(detail_add.note, ast_add.note);
 
   const Row min_minus_one({Value(kInt64Min), Value(int64_t{-1})});
   const Expression extreme_modulo = BinaryExpressionExp(
@@ -1080,7 +1079,7 @@ TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   EXPECT_EQ(detail_extreme.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(ast_extreme.kind, Attempt::Kind::kThrow);
   EXPECT_EQ(detail_extreme.exception, ast_extreme.exception);
-  EXPECT_EQ(detail_extreme.note, ast_extreme.note) << true;
+  EXPECT_EQ(detail_extreme.note, ast_extreme.note);
 }
 
 TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
@@ -1088,7 +1087,7 @@ TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
   // throws. The checked kernels must report overflow on the same inputs.
   const auto sum = JitInt64Kernels::CompileSumChecked();
   if (!sum.has_value()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   {
     const std::array<int64_t, 2> inputs{std::numeric_limits<int64_t>::max(),
@@ -1105,7 +1104,7 @@ TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
   }
   const auto proj = JitInt64Kernels::CompileProjectionChecked();
   if (!proj.has_value()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   {
     const int64_t input = std::numeric_limits<int64_t>::max();

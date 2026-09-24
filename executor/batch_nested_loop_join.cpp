@@ -87,6 +87,10 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
   while (right_ && right_->Next(&r_row, &r_pos)) {
     right_rows.emplace_back(std::move(r_row), r_pos);
   }
+  if (right_->GetStatus() != Status::kSuccess) {
+    predicate_error_ = right_->GetStatus();
+    return;
+  }
 
   std::vector<std::pair<Row, RowPosition>> left_block;
   left_block.reserve(block_size_);
@@ -102,6 +106,10 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
     while (left_block.size() < block_size_ && left_ &&
            left_->Next(&l_row, &l_pos)) {
       left_block.emplace_back(std::move(l_row), l_pos);
+    }
+    if (left_->GetStatus() != Status::kSuccess) {
+      predicate_error_ = left_->GetStatus();
+      return;
     }
     if (left_block.empty()) {
       break;

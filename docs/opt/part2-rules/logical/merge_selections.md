@@ -5,11 +5,11 @@
 
 ## 概要
 
-`merge_selections` は、多段にネストした選択演算 `Selection(Selection(X, p1), p2)` を、述語の論理積を正規化した単一の選択演算 `Selection(..., p1 AND p2)` として外側Groupに追加する論理変換Ruleです。選択ノード数を集約し、連言の重複排除や矛盾検出（恒偽化）を可能にすることで、後続の最適化を支援します。
+`merge_selections` は、多段にネストした選択演算 `Selection(Selection(X, p1), p2)` を、述語の論理積を正規化した単一の選択演算 `Selection(..., p1 AND p2)` として外側 Group に追加する論理変換 Rule です。選択ノード数を集約し、連言の重複排除や矛盾検出（恒偽化）を可能にすることで、後続の最適化を支援します。
 
 ## 変換前後の関係
 
-外側Groupに、内側Groupを子として参照したまま述語を統合した等価式を追加します。
+外側 Group に、内側 Group を子として参照したまま述語を統合した等価式を追加します。
 
 ```mermaid
 graph TD
@@ -21,7 +21,7 @@ graph TD
   end
 ```
 
-本Ruleは外側Groupに新しい式を追加するのみであり、子ノードの参照先は内側Groupのままとなります。子ノードを直接 $X$ に繋ぎ替えて木をフラット化する変形は、相補的なRuleである `merge_adjacent_filters` が担当します。
+本 Rule は外側 Group に新しい式を追加するのみであり、子ノードの参照先は内側 Group のままとなります。子ノードを直接 $X$ に繋ぎ替えて木をフラット化する変形は、相補的な Rule である `merge_adjacent_filters` が担当します。
 
 ## 適用条件
 
@@ -46,14 +46,14 @@ graph TD
 
 適用条件は以下のとおりです。
 
-1. **内側ノードの演算子**: 内側Group（`inner`）に `LogicalOperator::kSelection` を持つ式が存在すること。
+1. **内側ノードの演算子**: 内側 Group（`inner`）に `LogicalOperator::kSelection` を持つ式が存在すること。
 2. **述語の存在**: 内側式および外側式の双方が有効な述語を保持していること（`*inner.predicate` および `*expression.predicate`）。
 
 ## 意味論的根拠と連言正規化
 
-2つの連続する選択述語を論理積で結合する変形 $Selection(p2, Selection(p1, X)) \equiv Selection(p1 \land p2, X)$ は、関係代数の定義上無条件に成立します。
+2 つの連続する選択述語を論理積で結合する変形 $Selection(p2, Selection(p1, X)) \equiv Selection(p1 \land p2, X)$ は、関係代数の定義上無条件に成立します。
 
-本Ruleにおける品質管理の中核は、結合された述語を必ず `CanonicalizeConjuncts` により正規化する点にあります（`plan/cascades.cpp`）。
+本 Rule における品質管理の中核は、結合された述語を必ず `CanonicalizeConjuncts` により正規化する点にあります（`plan/cascades.cpp`）。
 
 ```cpp
   // Provably-empty predicate: a contradictory conjunction, an always-false
@@ -68,22 +68,22 @@ graph TD
 
 ## 実装の詳細
 
-- **代替式の網羅**: 内側Groupに複数の `kSelection` 式が存在する場合、ループによりその各々と外側述語を合成した式を網羅的に生成します。
-- **外側Groupへの登録**: 生成された統合式は親Group（`group`）に登録されます。親Group内には二段構成の既存式と統合式が併存し、最終的なコスト評価（`SearchEngine`）によって最適な物理実行パスが選択されます。
+- **代替式の網羅**: 内側 Group に複数の `kSelection` 式が存在する場合、ループによりその各々と外側述語を合成した式を網羅的に生成します。
+- **外側 Group への登録**: 生成された統合式は親 Group（`group`）に登録されます。親 Group 内には二段構成の既存式と統合式が併存し、最終的なコスト評価（`SearchEngine`）によって最適な物理実行パスが選択されます。
 
 ## 最適化効果
 
 - **演算オーバーヘッドの削減**: 実行時におけるタプルごとのフィルタ評価段数が減少し、CPU命令実行数が削減されます。
-- **後続Ruleへの波及**: 述語が正規化されることで、定数畳み込み（`eliminate_true_selection`）や矛盾検知（`eliminate_false_selection` による空関係化）などの簡約Ruleが即座に適用可能になります。
+- **後続 Rule への波及**: 述語が正規化されることで、定数畳み込み（`eliminate_true_selection`）や矛盾検知（`eliminate_false_selection` による空関係化）などの簡約 Rule が即座に適用可能になります。
 
-## 関連Ruleとの相互作用
+## 関連 Rule との相互作用
 
-- `merge_adjacent_filters`: 本Ruleと同一のパターンにマッチしますが、子ノードの参照を内側Groupの子（`inner.children`）に直接繋ぎ替えるフラット化変形を行います。
+- `merge_adjacent_filters`: 本 Rule と同一のパターンにマッチしますが、子ノードの参照を内側 Group の子（`inner.children`）に直接繋ぎ替えるフラット化変形を行います。
 - `eliminate_false_selection`: 統合述語が矛盾により `false` 定数へ縮退した際、部分木全体を空集合ノード（`kEmpty`）へ置換します。
 - `push_selection_into_scan`: 内側ノードの下位がスキャンである場合、統合された述語をスキャンフィルタへと押し込みます。
 
 ## 検証テスト
 
 - `plan/cascades_test.cpp`:
-  - `CascadesTest.MergeSelectionsCollapsesSelectionChain`: 外側Groupに統合述語を持つSelection式が追加されることを検証。
+  - `CascadesTest.MergeSelectionsCollapsesSelectionChain`: 外側 Group に統合述語を持つ Selection 式が追加されることを検証。
 

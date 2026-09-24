@@ -2,6 +2,7 @@
 #include "set_operation_plan.hpp"
 
 #include <cstddef>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -85,13 +86,29 @@ size_t SetOperationPlan::EmitRowCount() const {
 
 bool SetOperationPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                    const std::vector<bool>& ascending) const {
+  return IsOrderedBy(expressions, ascending, {});
+}
+
+bool SetOperationPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
   if (expressions.size() > order_keys_.size() ||
       ascending.size() != expressions.size()) {
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (order_keys_[i].ascending != ascending[i] ||
+    if (!order_keys_[i].expression || !expressions[i] ||
+        order_keys_[i].ascending != ascending[i] ||
         order_keys_[i].expression->ToString() != expressions[i]->ToString()) {
+      return false;
+    }
+    const bool provided =
+        order_keys_[i].nulls_first.value_or(order_keys_[i].ascending);
+    const bool requested = i < nulls_first.size()
+                               ? nulls_first[i].value_or(ascending[i])
+                               : ascending[i];
+    if (provided != requested) {
       return false;
     }
   }

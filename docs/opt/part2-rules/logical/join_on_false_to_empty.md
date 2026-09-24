@@ -5,9 +5,9 @@
 
 ## 概要
 
-`join_on_false_to_empty` は、結合述語が定数 FALSE または NULL である内部結合 `Join(L, R, FALSE/NULL)` を空集合 `Empty` へと置き換える等価式をグループに追加する論理変換Ruleです。
+`join_on_false_to_empty` は、結合述語が定数 FALSE または NULL である内部結合 `Join(L, R, FALSE/NULL)` を空集合 `Empty` へと置き換える等価式をグループに追加する論理変換 Rule です。
 
-結合述語が恒偽である場合、結合結果の組が1行も生成されないことが証明されるため、左右双方の入力走査・結合評価を完全にバイパスできます。メモ内の関係集合（Relations）の整合性を維持するため、親グループと同一の関係集合を持つ基本グループ（base Group）を生成し、その直上に `Empty` を配置します。
+結合述語が恒偽である場合、結合結果の組が1 行も生成されないことが証明されるため、左右双方の入力走査・結合評価を完全にバイパスできます。メモ内の関係集合（Relations）の整合性を維持するため、親グループと同一の関係集合を持つ基本グループ（base Group）を生成し、その直上に `Empty` を配置します。
 
 ## 変換前後の関係
 
@@ -89,18 +89,18 @@ graph TD
 
 ## 最適化効果
 
-本Ruleの適用により、以下の最適化が行われます。
+本 Rule の適用により、以下の最適化が行われます。
 
 - **結合処理および全テーブルアクセスの省略**: 結合述語が恒偽である場合、左右双方のテーブル走査やインデックス探索、ハッシュ表構築などの処理がすべて不要となります。
-- **式書き換えとの協調**: `JOIN ON 1 = 2` のような明示的な偽条件だけでなく、式書き換え層（`expression/rewrite.cpp`）の定数畳み込みによって ON 句が `FALSE` に縮約されたクエリに対しても発火し、不要な計算を根本から排除します。
+- **式書き換えとの協調**: `JOIN ON 1 = 2` のような明示的な偽条件だけでなく、式書き換え層（`expression/rewrite.cpp`）の定数畳み込みによって ON 句が `FALSE` に縮約されたクエリに対しても発火し、不要な計算を排除します。
 
 ## 関連 Rule との相互作用
 
-- `eliminate_false_selection`: Selection 演算子において定数 FALSE/NULL を空集合へ簡約する対照的なRuleです。
-- `join_empty_simplification`: 本Ruleが導入した `kEmpty` 式を検知し、上位の結合ツリーへ空集合を連鎖伝播させる後続Ruleです。
-- `setop_empty_simplification`: 集合演算において空集合を処理するRuleであり、同一の `base` グループ生成設計を共有します。
+- `eliminate_false_selection`: Selection 演算子において定数 FALSE/NULL を空集合へ簡約する対照的な Rule です。
+- `join_empty_simplification`: 本 Rule が導入した `kEmpty` 式を検知し、上位の結合ツリーへ空集合を連鎖伝播させる後続 Rule です。
+- `setop_empty_simplification`: 集合演算において空集合を処理する Rule であり、同一の `base` グループ生成設計を共有します。
 
 ## 検証テスト
 
 - `plan/cascades_test.cpp`:
-  - `CascadesTest.JoinOnFalseToEmptyPreservesRelationSet`: 述語定数 `0`（偽）を持つ2表結合を探索した際、親グループに関係集合を保持した `kEmpty` 式が正しく追加されることを検証。
+  - `CascadesTest.JoinOnFalseToEmptyPreservesRelationSet`: 述語定数 `0`（偽）を持つ2 表結合を探索した際、親グループに関係集合を保持した `kEmpty` 式が正しく追加されることを検証。

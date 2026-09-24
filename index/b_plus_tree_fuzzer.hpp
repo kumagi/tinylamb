@@ -106,14 +106,14 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         if (!kvp.empty()) {
           auto iter = kvp.begin();
           std::advance(iter, stream.Pick(kvp.size()));
-          ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, iter->first));
+          ASSIGN_OR_CRASH(std::string, val, bpt.Read(txn, iter->first));
           assert(val == iter->second);
         }
         break;
       }
       case 3: {  // Verify the whole model against the tree.
         for (const auto& [key, value] : kvp) {
-          ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, key));
+          ASSIGN_OR_CRASH(std::string, val, bpt.Read(txn, key));
           assert(val == value);
         }
         // Full ascending scan must enumerate exactly the model in order.
@@ -161,7 +161,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         kvp = committed;
         assert(bpt.SanityCheckForTest(page_manager.get()));
         for (const auto& [key, value] : kvp) {
-          ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, key));
+          ASSIGN_OR_CRASH(std::string, val, bpt.Read(txn, key));
           assert(val == value);
         }
         break;

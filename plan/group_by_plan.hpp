@@ -3,9 +3,12 @@
 #define TINYLAMB_GROUP_BY_PLAN_HPP
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "plan/plan.hpp"
+#include "table/table_statistics.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -20,10 +23,23 @@ class SelectStatement;
 class GroupByPlan final : public PlanBase {
  public:
   GroupByPlan(Plan child, std::shared_ptr<const SelectStatement> statement,
-              Schema output_schema)
+              Schema output_schema, bool grouped = false,
+              std::optional<size_t> finite_limit = std::nullopt)
       : child_(std::move(child)),
         statement_(std::move(statement)),
-        output_schema_(std::move(output_schema)) {}
+        output_schema_(std::move(output_schema)),
+        grouped_(grouped),
+        stats_(output_schema_) {
+    std::vector<ColumnStats> columns;
+    columns.reserve(output_schema_.ColumnCount());
+    for (size_t i = 0; i < output_schema_.ColumnCount(); ++i) {
+      columns.emplace_back(output_schema_.GetColumn(i).Type());
+    }
+    const size_t base_rows = grouped_ ? child_->EmitRowCount() : 1;
+    const size_t estimated_rows =
+        finite_limit ? std::min(base_rows, *finite_limit) : base_rows;
+    stats_.Assign(estimated_rows, std::move(columns));
+  }
   GroupByPlan(const GroupByPlan&) = delete;
   GroupByPlan(GroupByPlan&&) = delete;
   GroupByPlan& operator=(const GroupByPlan&) = delete;
@@ -31,6 +47,14 @@ class GroupByPlan final : public PlanBase {
   ~GroupByPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& context) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override {
+    return child_->ContainsParameterSlots();
+  }
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override {
+    return child_->InstallParameterSlots(parameters, cursor, slots);
+  }
 
   [[nodiscard]] const Table* ScanSource() const override {
     return child_->ScanSource();
@@ -39,15 +63,12 @@ class GroupByPlan final : public PlanBase {
     return output_schema_;
   }
   [[nodiscard]] const TableStatistics& GetStats() const override {
-    return child_->GetStats();
+    return stats_;
   }
   [[nodiscard]] size_t AccessRowCount() const override {
     return child_->AccessRowCount();
   }
-  // Scalar aggregation yields one row; GROUP BY is capped by the input.
-  [[nodiscard]] size_t EmitRowCount() const override {
-    return std::min<size_t>(child_->EmitRowCount(), 1);
-  }
+  [[nodiscard]] size_t EmitRowCount() const override { return stats_.Rows(); }
   [[nodiscard]] Plan Child() const { return child_; }
   [[nodiscard]] const std::shared_ptr<const SelectStatement>& Statement()
       const {
@@ -62,6 +83,8 @@ class GroupByPlan final : public PlanBase {
   Plan child_;
   std::shared_ptr<const SelectStatement> statement_{};
   Schema output_schema_;
+  bool grouped_{false};
+  TableStatistics stats_;
 };
 
 }  // namespace tinylamb

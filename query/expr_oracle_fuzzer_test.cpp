@@ -8,6 +8,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -380,20 +381,22 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 64;
-  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
+  const int kIterations =
+      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
+                         : 64;
+  for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
     const auto seed32 = seed;
     const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
     std::mt19937 rng(seed32);
     ExprOracleTrace trace;
     trace.seed = packed;
     std::string report = RunExprOracleIteration(rng, false, &trace);
-    ASSERT_EQ(report, "") << true << (seed != 0U) << true << report;
+    ASSERT_EQ(report, "") << (seed != 0U) << report;
     EXPECT_EQ(trace.seed, packed);
     EXPECT_TRUE(trace.sql.rfind("SELECT ", 0) == 0)
-        << true << (seed != 0U) << true << trace.sql;
-    EXPECT_TRUE(trace.sexpr.front() == '(') << true << (seed != 0U);
-    EXPECT_TRUE(trace.reference.empty() == false) << true << (seed != 0U);
+        << (seed != 0U) << trace.sql;
+    EXPECT_TRUE(trace.sexpr.front() == '(');
+    EXPECT_TRUE(trace.reference.empty() == false);
     if (trace.engine_ran) {
       ++engine_ran;
     }
@@ -402,17 +405,19 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
   EXPECT_EQ(ran, kIterations);
   // The engine oracle must actually execute (not skip every iteration),
   // or the sweep is vacuous.
-  EXPECT_GT(engine_ran, kIterations / 2) << true;
+  EXPECT_GT(engine_ran, kIterations / 2);
 }
 
 TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 200;
+  const int kIterations =
+      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
+                         : 200;
   ExprGenConfig config;
   config.extended_ops = true;
-  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
+  for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
     const auto seed32 = seed + 3000;
     const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
     std::mt19937 rng(seed32);
@@ -448,12 +453,12 @@ TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
   ExprOracleTrace parsed;
   ASSERT_TRUE(ParseExprOracleTest(text, &parsed));
   EXPECT_EQ(parsed, trace);
-  EXPECT_EQ(ReplayExprOracleTrace(parsed, false), "") << true;
+  EXPECT_EQ(ReplayExprOracleTrace(parsed, false), "");
 
   // Tampered SQL must not replay clean.
   ExprOracleTrace tampered = parsed;
   tampered.sql = "SELECT 1 + 1;";
-  EXPECT_NE(ReplayExprOracleTrace(tampered, false), "") << true;
+  EXPECT_NE(ReplayExprOracleTrace(tampered, false), "");
 
   // Malformed input is refused, never half-replayed.
   ExprOracleTrace junk;
@@ -463,11 +468,13 @@ TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
 
 TEST(ExprOracleFuzzer, RowAwareNullRejectAndDifferentialEquivalence) {
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 64;
+  const int kIterations =
+      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
+                         : 64;
   int null_reject_verified_count = 0;
   int engine_ran_count = 0;
 
-  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
+  for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
     const auto seed32 = seed;
     const uint64_t packed = (static_cast<uint64_t>(seed32) << 32) | seed32;
     std::mt19937 rng(seed32);

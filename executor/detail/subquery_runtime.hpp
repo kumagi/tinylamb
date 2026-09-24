@@ -51,6 +51,14 @@ struct CorrelatedIndex {
   // actual distinct-key cardinality without pretending NULL is cacheable.
   std::unordered_set<std::string> parameter_keys_seen;
   bool preaggregated{false};
+  // EXISTS-only fast path: when the subquery result is consumed purely as
+  // row-existence (single INT64/DATE correlation key, no outer-referencing
+  // expressions, no HAVING/GROUP BY/LIMIT/OFFSET/DISTINCT), the build keeps
+  // just the set of surviving local key values instead of every matching
+  // row.  A Q4-sized build otherwise materializes millions of projected Rows
+  // plus one multimap entry (and one string key) per row.
+  std::unordered_set<int64_t> exists_keys;
+  bool exists_key_set{false};
 };
 
 // Integer semi-join keys stashed by BuildInput while planning one statement.
@@ -85,6 +93,14 @@ struct ExecutionRuntime {
   struct UncorrelatedMembership {
     std::unordered_set<Value> values;
     bool contains_null{false};
+    // Hash membership resolves equality through Value::operator==, which is
+    // exact only for pairs in the same comparison domain (type tag plus
+    // unsigned tag).  A mixed-domain probe (an INT64 test against a DOUBLE
+    // build) must fall back to the rescan path, whose canonical `=`
+    // promotion decides it; this sample records the build's domain.
+    bool uniform_domain{true};
+    bool has_domain{false};
+    Value domain_sample;
   };
   std::unordered_map<std::string, UncorrelatedMembership>
       uncorrelated_membership_by_fingerprint;
@@ -113,10 +129,18 @@ struct ExecutionRuntime {
   double join_ms{0};
   double project_ms{0};
   double sort_ms{0};
+  size_t topn_finish_uses{0};
+  size_t topn_finish_capacity{0};
+  size_t topn_finish_input_rows{0};
   size_t base_scan_cache_hits{0};
   size_t aggregate_input_rows{0};
   size_t aggregate_groups{0};
   size_t aggregate_updates{0};
+  double aggregate_ms{0};
+  double planning_ms{0};
+  double join_estimate_ms{0};
+  size_t typed_parallel_aggregations{0};
+  size_t typed_parallel_agg_fallbacks{0};
   size_t scan_rows{0};
   size_t scan_output_rows{0};
   size_t scan_values_decoded{0};

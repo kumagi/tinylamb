@@ -5,7 +5,7 @@
 
 ## 概要
 
-論理式 `kOuterJoin` のうち RIGHT 外部結合（`join_type = 1`）および FULL 外部結合（`join_type = 2`）の非等値結合を対象とし、結合述語全体を保持する `ProductPlan`（`RightOuterJoinKind` または `FullOuterJoinKind` およびブロック化標識 `PreferBatchNestedLoop()` を保持）として具現化する Rule です。
+`batch_nested_loop_outer` は、非等値条件を持つ RIGHT 外部結合（`join_type = 1`）と FULL 外部結合（`join_type = 2`）を物理化する Rule です。結合述語全体を保持する `ProductPlan` を生成し、結合種別を `RightOuterJoinKind` または `FullOuterJoinKind` に設定します。さらに `PreferBatchNestedLoop()` を設定して、ブロック単位の実行を選びます。
 
 LEFT 外部結合はタプル単位の `outer_nested_loop` が担当するため、本 Rule では対象から除外して重複登録によるコスト同点を回避しています。非等値の RIGHT / FULL 外部結合に対して、関係代数フォールバックに頼らないコストベースの物理実行パスを確立します。
 
@@ -124,5 +124,5 @@ return {PlanAlternative{.plan = std::move(join),
 ## 検証テスト
 
 - `plan/optimizer_test.cpp` の `OptimizerTest.OuterJoinSliceFullNonEquiJoinUsesBatchNestedLoop`: 非等値 FULL 外部結合が `BatchNestedLoopJoin` として計画され、一致行（4,950 行）および両側の未一致パディング行が正しく出力されることを検証。
-- `plan/optimizer_test.cpp` の `OptimizerTest.BatchNestedLoopCoversNonEquiSemiAntiAndFullJoin`: FULL 外部結合が `FullOuterJoinKind` かつ `PrefersBatchNestedLoop()` を持つ `ProductPlan` として具現化されることを検証。
+- `plan/optimizer_test.cpp` の `OptimizerTest.BatchNestedLoopCoversNonEquiSemiAntiAndFullJoin`: FULL 外部結合が `FullOuterJoinKind` かつ `PrefersBatchNestedLoop()` を持つ `ProductPlan` として変換されることを検証。
 - `executor/executor_extra_test.cpp` の `BatchNestedLoopJoinTest.RightOuterEmitsUnmatchedRightRows`: RIGHT 外部結合において未マッチの右側タプルが正しく NULL 拡張されて出力されることを検証。

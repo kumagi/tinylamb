@@ -105,6 +105,7 @@ if a matching bytecode pattern exists.
 
 ## Testing
 
-`bytecode_test.SemanticsMatchAstAndJitOnInt64Compares` checks AST, bytecode, and
-JIT filter kernels agree on simple INT64 column-vs-constant compares (non-NULL
-rows for JIT). Add similar tests when new bytecode→JIT mappings are introduced.
+`BytecodeTest.EvaluateBatch_WithInt64Comparisons_MatchesAstAndJitSemantics`
+checks AST, bytecode, and JIT filter kernels agree on simple INT64
+column-vs-constant compares (non-NULL rows for JIT). Add similar tests when
+new bytecode→JIT mappings are introduced.

@@ -31,15 +31,15 @@ graph TD
 パターンは `Projection(Join(Any("left"), Any("right"), "join"))` です。guard は
 次のとおりです。
 
-1. この式が `kProjection` で子と target list を持つ。
-2. 結合グループが自分自身でない(`join_id != group`)。
-3. マッチした `kJoin` 式が**結合条件(述語)を持つ**。述語なしの
+1. この式が `kProjection` で、子と target list を持つこと。
+2. 結合 Group が自分自身でないこと（`join_id != group`）。
+3. マッチした `kJoin` 式が**結合条件（述語）を持つ**こと。述語なしの
    `kJoin` では発火しません。
-4. 左右の子グループが `group` / `join_id` と一致しない(循環防止)。
-5. **両側にすでに射影がある場合は発火しない**(`left_has_proj &&
-   right_has_proj` なら `continue`)。片側だけなら発火します。
+4. 左右の子 Group が `group` / `join_id` と一致しないこと（循環防止）。
+5. **両側にすでに射影がある場合は発火しない**こと（`left_has_proj &&
+   right_has_proj` なら `continue`）。片側だけなら発火します。
 6. 結合条件と外側 target list が触れる列を左右に振り分けた結果、
-   どちらかの側が空(`left_cols.empty() || right_cols.empty()`)なら発火
+   どちらかの側が空（`left_cols.empty() || right_cols.empty()`）なら発火
    しません。
 
 登録部のコメントは次の 2 行です。
@@ -123,7 +123,7 @@ target list についても同じ振り分けを繰り返します。あとは�
 のハッシュ表・ネステッドループのコピー幅が減る点は
 `push_projection_through_join` と同じです。行幅は減るが行数は変わらない
 (射影は行ごとの関数で、結合のマッチングに影響しないため)ので、
-結合の選択率が悪く行数を削れない場合にも確実に効きます。
+結合の選択率が低くなく、行数を減らせない場合でも、1 行あたりの幅を減らせます。
 
 ## 関連 Rule との相互作用
 

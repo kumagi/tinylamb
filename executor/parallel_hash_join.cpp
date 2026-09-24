@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -150,6 +151,26 @@ bool SharedBuildParallelHashJoin::KeyHasNull(const Row& row,
   });
 }
 
+bool SharedBuildParallelHashJoin::KeyHasNaN(const Row& row,
+                                            const std::vector<slot_t>& cols) {
+  return std::ranges::any_of(cols, [&](slot_t col) {
+    if (col >= row.values_.size()) {
+      return false;
+    }
+    const Value& value = row[col];
+    if (value.type == ValueType::kDouble) {
+      return std::isnan(value.value.double_value);
+    }
+    if (value.type != ValueType::kArray) {
+      return false;
+    }
+    return std::ranges::any_of(value.ArrayElements(), [](const Value& item) {
+      return item.type == ValueType::kDouble &&
+             std::isnan(item.value.double_value);
+    });
+  });
+}
+
 uint64_t SharedBuildParallelHashJoin::HashKey(std::string_view key) {
   return Fnv1aHash(key);
 }
@@ -189,6 +210,9 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
         build_has_null_key_ = true;
         continue;
       }
+      if (KeyHasNaN(t.first, right_cols_)) {
+        continue;
+      }
       std::string key = MakeKey(t.first, right_cols_);
       const uint64_t hash = HashKey(key);
       shared_hash_table_.Insert(hash, std::move(key), t.first, t.second);
@@ -203,24 +227,36 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
     std::mutex error_mutex;
     Status build_error{Status::kSuccess};
     for (size_t i = 0; i < num_threads; ++i) {
-      workers.emplace_back([&, i] {
-        try {
-          build_worker(i);
-        } catch (const std::exception& error) {
-          // An exception escaping a raw thread terminates the process;
-          // capture it as a Status and surface it on the joining thread.
-          std::scoped_lock lock(error_mutex);
-          if (build_error.ok()) {
-            build_error = StatusError(StatusCode::kRuntimeError, error.what());
+      try {
+        workers.emplace_back([&, i] {
+          try {
+            build_worker(i);
+          } catch (const std::exception& error) {
+            // An exception escaping a raw thread terminates the process;
+            // capture it as a Status and surface it on the joining thread.
+            std::scoped_lock lock(error_mutex);
+            if (build_error.ok()) {
+              build_error =
+                  StatusError(StatusCode::kRuntimeError, error.what());
+            }
+          } catch (...) {
+            std::scoped_lock lock(error_mutex);
+            if (build_error.ok()) {
+              build_error = StatusError(StatusCode::kRuntimeError,
+                                        "parallel build worker failed");
+            }
           }
-        } catch (...) {
-          std::scoped_lock lock(error_mutex);
-          if (build_error.ok()) {
-            build_error = StatusError(StatusCode::kRuntimeError,
-                                      "parallel build worker failed");
-          }
-        }
-      });
+        });
+      } catch (const std::exception& error) {
+        std::scoped_lock lock(error_mutex);
+        build_error = StatusError(StatusCode::kRuntimeError, error.what());
+        break;
+      } catch (...) {
+        std::scoped_lock lock(error_mutex);
+        build_error = StatusError(StatusCode::kRuntimeError,
+                                  "failed to start parallel build worker");
+        break;
+      }
     }
     for (auto& w : workers) {
       w.join();
@@ -258,11 +294,13 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
       // SQL equality never matches on NULL: a NULL-keyed probe row takes the
       // no-match path for every kind (anti/outer emit it padded or raw).
       const bool probe_has_null = KeyHasNull(left_tuple.first, left_cols_);
-      const std::string key = probe_has_null
+      const bool probe_has_nan = KeyHasNaN(left_tuple.first, left_cols_);
+      const bool probe_unmatchable = probe_has_null || probe_has_nan;
+      const std::string key = probe_unmatchable
                                   ? std::string()
                                   : MakeKey(left_tuple.first, left_cols_);
       const uint64_t hash = HashKey(key);
-      const auto matches = probe_has_null
+      const auto matches = probe_unmatchable
                                ? std::vector<std::pair<Row, RowPosition>>{}
                                : shared_hash_table_.FindMatches(hash, key);
 
@@ -351,24 +389,36 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
     std::mutex error_mutex;
     Status probe_error{Status::kSuccess};
     for (size_t i = 0; i < num_threads; ++i) {
-      workers.emplace_back([&, i] {
-        try {
-          probe_worker(i);
-        } catch (const std::exception& error) {
-          // An exception escaping a raw thread terminates the process;
-          // capture it as a Status and surface it on the joining thread.
-          std::scoped_lock lock(error_mutex);
-          if (probe_error.ok()) {
-            probe_error = StatusError(StatusCode::kRuntimeError, error.what());
+      try {
+        workers.emplace_back([&, i] {
+          try {
+            probe_worker(i);
+          } catch (const std::exception& error) {
+            // An exception escaping a raw thread terminates the process;
+            // capture it as a Status and surface it on the joining thread.
+            std::scoped_lock lock(error_mutex);
+            if (probe_error.ok()) {
+              probe_error =
+                  StatusError(StatusCode::kRuntimeError, error.what());
+            }
+          } catch (...) {
+            std::scoped_lock lock(error_mutex);
+            if (probe_error.ok()) {
+              probe_error = StatusError(StatusCode::kRuntimeError,
+                                        "parallel probe worker failed");
+            }
           }
-        } catch (...) {
-          std::scoped_lock lock(error_mutex);
-          if (probe_error.ok()) {
-            probe_error = StatusError(StatusCode::kRuntimeError,
-                                      "parallel probe worker failed");
-          }
-        }
-      });
+        });
+      } catch (const std::exception& error) {
+        std::scoped_lock lock(error_mutex);
+        probe_error = StatusError(StatusCode::kRuntimeError, error.what());
+        break;
+      } catch (...) {
+        std::scoped_lock lock(error_mutex);
+        probe_error = StatusError(StatusCode::kRuntimeError,
+                                  "failed to start parallel probe worker");
+        break;
+      }
     }
     for (auto& w : workers) {
       w.join();

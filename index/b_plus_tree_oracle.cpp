@@ -83,7 +83,7 @@ std::filesystem::path WorkDir(const std::string& tag) {
 std::string VerifyModel(BPlusTree& tree, Transaction& txn,
                         const std::map<std::string, std::string>& model) {
   for (const auto& [key, value] : model) {
-    StatusOr<std::string_view> read = tree.Read(txn, key);
+    StatusOr<std::string> read = tree.Read(txn, key);
     if (!read) {
       std::ostringstream status;
       status << read.GetStatus();

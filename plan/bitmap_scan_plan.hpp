@@ -30,6 +30,10 @@ class BitmapScanPlan final : public PlanBase {
                  Expression where, size_t estimated_rows, size_t access_rows);
 
   Executor EmitExecutor(TransactionContext& context) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override;
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override;
   [[nodiscard]] const Table* ScanSource() const override { return &table_; }
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {

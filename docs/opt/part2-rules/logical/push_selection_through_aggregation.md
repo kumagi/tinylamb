@@ -40,9 +40,9 @@ graph TD
    - 書き換え結果に集約関数が含まれないこと(`!ContainsAggregate(*rewritten)`)。
    - この 2 つを満たす連言だけが `pushed` に入り、そうでないものは
      `residual` に残ります。
-3. `pushed` が空なら発火しない(押せるものが無い)。
+3. `pushed` が空なら発火しないこと（押し下げられる連言がないため）。
 4. 派生グループ(`sel-below-agg:`、`agg-after-sel-push:`)が自分自身・
-   既存の子と一致しないこと(循環防止)。
+   既存の子と一致しないこと（循環防止）。
 
 ```cpp
             for (const Expression& conjunct :
@@ -120,13 +120,13 @@ graph TD
 関する部分だけでも下に落とせるのがこの Rule の価値で、完全な
 HAVING(集約条件)は上に残ります。SQL フロントエンドが
 `WHERE` / `HAVING` をどう論理プランに載せるかにかかわらず、
-「集約の上の Selection」という形に正規化されていれば適用できる、
+「集約の上の Selection 」という形に正規化されていれば適用できる、
 メモ上の書き換えとして独立性が高い Rule です。
 
 ## 関連 Rule との相互作用
 
 - `having_to_filter_rewrite`: Aggregation が述語を自分の payload として
-  持つ形を「集約 + 上位 Selection」の形にする Rule。この Rule の
+  持つ形を「集約 + 上位 Selection 」の形にする Rule。この Rule の
   上流で発火すると、本 Rule が押し込める形になります。
 - `push_selection_through_projection`: 同じ `RewriteThroughOutputs` を
   使う出力名の張り替え。

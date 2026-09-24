@@ -40,7 +40,7 @@ std::unique_ptr<Statement> ParseSql(std::string_view sql) {
   if (!ast.HasValue()) {
     return nullptr;
   }
-  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
   return visited.HasValue() ? visited.MoveValue() : nullptr;
 }
 
@@ -67,9 +67,26 @@ TEST(SqlTemplateTest, LeavesLimitAndStringsTyped) {
   EXPECT_EQ(extracted.parameters[0], Value(std::string("Last#4")));
 }
 
+TEST(SqlTemplateTest, KeywordDetectionRemainsCaseInsensitive) {
+  const SqlTemplate upper =
+      ExtractSqlTemplate("SELECT a FROM t LIMIT 1 OFFSET 2 INTERVAL 3 DAY;");
+  const SqlTemplate lower =
+      ExtractSqlTemplate("select a from t limit 1 offset 2 interval 3 day;");
+  EXPECT_TRUE(upper.parameters.empty());
+  EXPECT_TRUE(lower.parameters.empty());
+  EXPECT_EQ(upper.fingerprint,
+            "SELECT a FROM t LIMIT 1 OFFSET 2 INTERVAL 3 DAY;");
+  EXPECT_EQ(lower.fingerprint,
+            "select a from t limit 1 offset 2 interval 3 day;");
+
+  const SqlTemplate identifier = ExtractSqlTemplate("SELECT limited FROM t;");
+  EXPECT_NE(identifier.fingerprint.find("limited"), std::string::npos);
+  EXPECT_FALSE(ExtractSqlTemplate("drop table t;").templatable);
+}
+
 TEST(SqlTemplateTest, BindsCachedSelectTree) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   auto original = ParseSql(
       "SELECT c_discount FROM customer WHERE c_w_id = 1 AND c_id = 4;");
@@ -90,7 +107,7 @@ TEST(SqlTemplateTest, BindsCachedSelectTree) {
 
 TEST(SqlTemplateTest, BindSelectPreservesLimitAndAttributes) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   // C1: BindSelect must re-apply has_limit_ (the constructor sets limit_ but
   // not has_limit_) and the QUALIFY/DISTINCT ON/WITH TIES/AS STRUCT clauses,
@@ -103,14 +120,14 @@ TEST(SqlTemplateTest, BindSelectPreservesLimitAndAttributes) {
   ASSERT_TRUE(bound_or.HasValue());
   auto bound = bound_or.MoveValue();
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
-  EXPECT_TRUE(select.HasLimit()) << true;
+  EXPECT_TRUE(select.HasLimit());
   EXPECT_EQ(select.Limit(), 3U);
   EXPECT_TRUE(select.Distinct());
 }
 
 TEST(SqlTemplateTest, BindsCompositeStockLookup) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   auto original = ParseSql(
       "SELECT s_quantity, s_data FROM stock WHERE s_w_id = 1 AND s_i_id = 2;");
@@ -127,7 +144,7 @@ TEST(SqlTemplateTest, BindsCompositeStockLookup) {
 
 TEST(SqlTemplateTest, BindsDateLiteralsPreservingTheDateType) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   auto original = ParseSql("SELECT d FROM t WHERE d <= date '1998-09-18';");
   ASSERT_TRUE(original);
@@ -156,7 +173,7 @@ TEST(SqlTemplateTest, ExtractsNegativeLiteralsWithoutTheSign) {
 
 TEST(SqlTemplateTest, BindsNegativeLiteralWithoutDoubleNegation) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   auto original = ParseSql("SELECT -5;");
   ASSERT_TRUE(original);
@@ -249,7 +266,7 @@ TEST(SqlTemplateTest, BindStatementLiteralsPreservesAliases) {
 
 TEST(SqlTemplateTest, BindStatementLiteralsRejectsDdl) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   auto create = ParseSql("CREATE TABLE t (a INT64);");
   ASSERT_TRUE(create);
@@ -258,7 +275,7 @@ TEST(SqlTemplateTest, BindStatementLiteralsRejectsDdl) {
 
 TEST(SqlTemplateTest, BindStatementLiteralsParameterCountMismatchThrows) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   auto statement = ParseSql("SELECT 1;");
   ASSERT_TRUE(statement);
@@ -395,7 +412,7 @@ TEST(SqlTemplateTest, BindsGroupingClausesBeforeOrderBy) {
 
 TEST(SqlTemplateTest, RebindsParsedTreeWithoutSwappingClauses) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   auto miss = ParseSql("SELECT a FROM t WHERE a = 1 ORDER BY b + 2;");
   ASSERT_TRUE(miss);
@@ -413,7 +430,7 @@ TEST(SqlTemplateTest, RebindsParsedTreeWithoutSwappingClauses) {
 
 TEST(SqlTemplateTest, BindsWithQueriesBeforeMainSelect) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   auto miss = ParseSql("WITH w AS (SELECT 1 AS x) SELECT x + 2 FROM w;");
   ASSERT_TRUE(miss);

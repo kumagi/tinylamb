@@ -6,6 +6,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -79,7 +81,11 @@ Status ExecuteSql(Database& database, TransactionContext& context,
     return result.GetStatus();
   }
   result.Value().Drain();
-  return Status::kSuccess;
+  const Status stream_status = result.Value().GetStatus();
+  if (stream_status != Status::kSuccess && error != nullptr && error->empty()) {
+    *error = "stream: " + std::string(ToString(stream_status));
+  }
+  return stream_status;
 }
 
 Status CreateIndex(Database& database, TransactionContext& context,
@@ -548,12 +554,22 @@ Status TpccWorkload::RunSql(TransactionContext& context, std::string_view sql,
     return query_result.GetStatus();
   }
   ++result->sql_statements;
+  if (getenv("TPCC_SQL_TRACE")) {
+    fprintf(stderr, "[tpcc-sql][%d] %s\n", static_cast<int>(result->type),
+            std::string(sql).c_str());
+  }
   try {
     *rows = query_result.Value().Collect();
   } catch (const std::exception& ex) {
     result->error = std::string(ToString(result->type)) + ": " + ex.what() +
                     " [" + std::string(sql) + "]";
     return Status::kConflicts;
+  }
+  const Status stream_status = query_result.Value().GetStatus();
+  if (stream_status != Status::kSuccess) {
+    result->error = std::string(ToString(result->type)) + ": " +
+                    ToString(stream_status) + " [" + std::string(sql) + "]";
+    return stream_status;
   }
   return Status::kSuccess;
 }
@@ -563,6 +579,9 @@ bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
                                TpccTransactionResult* result) {
   if (!rows.empty() && rows.front().IsValid()) {
     return true;
+  }
+  if (getenv("TPCC_SQL_TRACE")) {
+    fprintf(stderr, "[tpcc-empty] %s\n", std::string(operation).c_str());
   }
   result->error = std::string(operation) + " returned no rows";
   return false;

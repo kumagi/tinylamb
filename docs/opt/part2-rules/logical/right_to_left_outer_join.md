@@ -8,7 +8,7 @@
 
 `RightOuterJoin(L, R, p)` を、子を入れ替えた `LeftOuterJoin(R, L, p)` に
 正規化する Rule です。「RIGHT OUTER JOIN は左右を交換した LEFT OUTER
-JOIN と等価」という恒等式を Memo の中で 1 方向(L 形)に潰すことで、
+JOIN と等価」という恒等式を使い、Memo 内の表現を一方向（LEFT OUTER JOIN）に統一することで、
 outer join を扱う後続の Rule と実装が LEFT 形だけを考えればよいように
 します。
 
@@ -108,7 +108,7 @@ LEFT 形に揃えることで:
 - `push_filter_through_left_join_left_side` /
   `push_limit_through_left_join` / `outer_join_associativity` など:
   いずれも `join_type == 0`(LEFT)を前提とする Rule で、本 Rule が
-  RIGHT を先に LEFT に潰しておくことで間接的に効く範囲が広がります。
+  RIGHT を先に LEFT へ統一すると、LEFT を対象とする後続 Rule を適用できる範囲も広がります。
 - `full_outer_join_decomposition`: FULL OUTER JOIN は入れ替えでは
   正規化できないため、代わりに `LeftOuter + AntiJoin` への分解を行います。
 - `outer_to_inner_join_on_null_rejecting_filter`:

@@ -32,6 +32,7 @@
 #include <exception>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <optional>
 #include <ostream>
 #include <random>
@@ -46,6 +47,8 @@
 
 #include "common/constants.hpp"
 #include "common/digest.hpp"
+#include "common/math_utils.hpp"
+#include "common/regex_guard.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/evaluation_context.hpp"
@@ -357,6 +360,13 @@ StatusOr<Value> AddOrSubInterval(const std::string& func_name,
                                  const IntervalExpression& interval) {
   const int64_t amount =
       func_name == "date_sub" ? -interval.Amount() : interval.Amount();
+  // Only DATE and VARCHAR carry a parseable operand; for any other type
+  // `date.value.varchar_value` overlays the wrong union member and the
+  // string_view would hold a garbage pointer/length (fuzz-found SEGV).
+  if (date.type != ValueType::kDate && date.type != ValueType::kVarChar) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       func_name + " requires DATE or VARCHAR operand");
+  }
   ASSIGN_OR_RETURN(int64_t, days,
                    date.type == ValueType::kDate
                        ? StatusOr<int64_t>(date.DateDays())
@@ -545,6 +555,187 @@ StatusOr<bool> ProtoTextExtractFieldShim(std::string_view text,
     *out = Value::Array(std::move(matches), "INT64");
   }
   return true;
+}
+
+struct DecodedUtf8 {
+  uint32_t code_point;
+  size_t length;
+};
+
+std::optional<DecodedUtf8> DecodeUtf8(std::string_view value, size_t offset) {
+  if (offset >= value.size()) {
+    return std::nullopt;
+  }
+  const auto byte_at = [&](size_t index) {
+    return static_cast<unsigned char>(value[index]);
+  };
+  const unsigned char first = byte_at(offset);
+  if (first <= 0x7F) {
+    return DecodedUtf8{first, 1};
+  }
+  if (first >= 0xC2 && first <= 0xDF && offset + 1 < value.size() &&
+      (byte_at(offset + 1) & 0xC0) == 0x80) {
+    return DecodedUtf8{static_cast<uint32_t>(((first & 0x1F) << 6) |
+                                             (byte_at(offset + 1) & 0x3F)),
+                       2};
+  }
+  if (first >= 0xE0 && first <= 0xEF && offset + 2 < value.size() &&
+      (byte_at(offset + 1) & 0xC0) == 0x80 &&
+      (byte_at(offset + 2) & 0xC0) == 0x80) {
+    const uint32_t code_point = static_cast<uint32_t>(
+        ((first & 0x0F) << 12) | ((byte_at(offset + 1) & 0x3F) << 6) |
+        (byte_at(offset + 2) & 0x3F));
+    if (code_point < 0x800 || (code_point >= 0xD800 && code_point <= 0xDFFF)) {
+      return std::nullopt;
+    }
+    return DecodedUtf8{code_point, 3};
+  }
+  if (first >= 0xF0 && first <= 0xF4 && offset + 3 < value.size() &&
+      (byte_at(offset + 1) & 0xC0) == 0x80 &&
+      (byte_at(offset + 2) & 0xC0) == 0x80 &&
+      (byte_at(offset + 3) & 0xC0) == 0x80) {
+    const uint32_t code_point = static_cast<uint32_t>(
+        ((first & 0x07) << 18) | ((byte_at(offset + 1) & 0x3F) << 12) |
+        ((byte_at(offset + 2) & 0x3F) << 6) | (byte_at(offset + 3) & 0x3F));
+    if (code_point < 0x10000 || code_point > 0x10FFFF) {
+      return std::nullopt;
+    }
+    return DecodedUtf8{code_point, 4};
+  }
+  return std::nullopt;
+}
+
+void AppendUtf8(std::string* output, uint32_t code_point) {
+  if (code_point > 0x10FFFF || (code_point >= 0xD800 && code_point <= 0xDFFF)) {
+    code_point = 0xFFFD;
+  }
+  if (code_point <= 0x7F) {
+    output->push_back(static_cast<char>(code_point));
+  } else if (code_point <= 0x7FF) {
+    output->push_back(static_cast<char>(0xC0 | (code_point >> 6)));
+    output->push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+  } else if (code_point <= 0xFFFF) {
+    output->push_back(static_cast<char>(0xE0 | (code_point >> 12)));
+    output->push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+    output->push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+  } else {
+    output->push_back(static_cast<char>(0xF0 | (code_point >> 18)));
+    output->push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3F)));
+    output->push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+    output->push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+  }
+}
+
+const std::locale& UnicodeLocale() {
+  static const std::locale locale = [] {
+    for (const char* name : {"C.UTF-8", "C.utf8", "en_US.UTF-8"}) {
+      try {
+        return std::locale(name);
+      } catch (const std::exception&) {
+      }
+    }
+    return std::locale::classic();
+  }();
+  return locale;
+}
+
+uint32_t UnicodeCaseCodePoint(uint32_t code_point, bool upper) {
+  if constexpr (sizeof(wchar_t) < 4) {
+    if (code_point >
+        static_cast<uint32_t>(std::numeric_limits<wchar_t>::max())) {
+      return code_point;
+    }
+  }
+  const auto& facet = std::use_facet<std::ctype<wchar_t>>(UnicodeLocale());
+  const wchar_t converted =
+      upper ? facet.toupper(static_cast<wchar_t>(code_point))
+            : facet.tolower(static_cast<wchar_t>(code_point));
+  return static_cast<uint32_t>(converted);
+}
+
+bool UnicodeIsAlnum(uint32_t code_point) {
+  if constexpr (sizeof(wchar_t) < 4) {
+    if (code_point >
+        static_cast<uint32_t>(std::numeric_limits<wchar_t>::max())) {
+      return false;
+    }
+  }
+  const auto& facet = std::use_facet<std::ctype<wchar_t>>(UnicodeLocale());
+  return facet.is(std::ctype_base::alnum, static_cast<wchar_t>(code_point));
+}
+
+enum class UnicodeCaseMode { kUpper, kLower, kInitcap };
+
+std::string ConvertUnicodeCase(std::string_view value, UnicodeCaseMode mode,
+                               std::string_view delimiters,
+                               bool has_delimiters) {
+  std::vector<uint32_t> delimiter_code_points;
+  if (has_delimiters) {
+    for (size_t offset = 0; offset < delimiters.size();) {
+      const auto decoded = DecodeUtf8(delimiters, offset);
+      if (!decoded.has_value()) {
+        delimiter_code_points.push_back(
+            static_cast<unsigned char>(delimiters[offset++]));
+        continue;
+      }
+      delimiter_code_points.push_back(decoded->code_point);
+      offset += decoded->length;
+    }
+  }
+
+  std::string result;
+  result.reserve(value.size());
+  bool new_word = true;
+  for (size_t offset = 0; offset < value.size();) {
+    const auto decoded = DecodeUtf8(value, offset);
+    if (!decoded.has_value()) {
+      result.push_back(value[offset++]);
+      new_word = true;
+      continue;
+    }
+    const uint32_t code_point = decoded->code_point;
+    if (mode == UnicodeCaseMode::kInitcap) {
+      const bool delimiter =
+          has_delimiters ? std::find(delimiter_code_points.begin(),
+                                     delimiter_code_points.end(),
+                                     code_point) != delimiter_code_points.end()
+                         : !UnicodeIsAlnum(code_point);
+      if (delimiter) {
+        AppendUtf8(&result, code_point);
+        new_word = true;
+      } else {
+        AppendUtf8(&result, new_word ? UnicodeCaseCodePoint(code_point, true)
+                                     : UnicodeCaseCodePoint(code_point, false));
+        new_word = false;
+      }
+    } else {
+      AppendUtf8(&result, UnicodeCaseCodePoint(
+                              code_point, mode == UnicodeCaseMode::kUpper));
+    }
+    offset += decoded->length;
+  }
+  return result;
+}
+
+std::string FormatFloatingForPrintfImpl(double value, char specifier,
+                                        int precision) {
+  if (precision < 0) {
+    return std::to_string(value);
+  }
+  std::ostringstream output;
+  output.imbue(std::locale::classic());
+  if (specifier == 'f' || specifier == 'F') {
+    output << std::fixed << std::setprecision(precision);
+  } else if (specifier == 'e' || specifier == 'E') {
+    output << std::scientific << std::setprecision(precision);
+  } else {
+    output << std::defaultfloat << std::setprecision(std::max(precision, 1));
+  }
+  if (specifier == 'E' || specifier == 'G' || specifier == 'F') {
+    output << std::uppercase;
+  }
+  output << value;
+  return output.str();
 }
 
 // FORMAT(fmt, ...): GoogleSQL printf-style rendering.  Ported from the
@@ -740,13 +931,14 @@ StatusOr<Value> FormatFunction(const std::string& name,
         if (arg.IsNull()) {
           formatted_item = "NULL";
         } else if (arg.type == ValueType::kDouble) {
-          formatted_item = std::to_string(arg.value.double_value);
+          formatted_item =
+              FormatFloatingForPrintf(arg.value.double_value, spec, precision);
         } else if (arg.type == ValueType::kInt64) {
           const double d = arg.IsUnsigned()
                                ? static_cast<double>(
                                      static_cast<uint64_t>(arg.value.int_value))
                                : static_cast<double>(arg.value.int_value);
-          formatted_item = std::to_string(d);
+          formatted_item = FormatFloatingForPrintf(d, spec, precision);
         } else {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -1184,11 +1376,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    std::string s = raw_str(values[0]);
-    for (char& c : s) {
-      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-    return Value(std::move(s));
+    return Value(UnicodeUpper(raw_str(values[0])));
   }
   if (name == "lower") {
     if (values.size() != 1) {
@@ -1198,11 +1386,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    std::string s = raw_str(values[0]);
-    for (char& c : s) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return Value(std::move(s));
+    return Value(UnicodeLower(raw_str(values[0])));
   }
   auto to_numeric_double = [](const Value& val,
                               const std::string& fname) -> StatusOr<double> {
@@ -1572,7 +1756,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return Value();
     }
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "CBRT"));
-    return Value(std::cbrt(v));
+    return Value(AccurateCbrt(v));
   }
   if (name == "ln") {
     if (values.size() != 1) {
@@ -2153,6 +2337,87 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     return Value(std::move(s));
   }
 
+  if (name == "array_to_string") {
+    if (values.size() != 2 && values.size() != 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ARRAY_TO_STRING requires 2 or 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) {
+      return Value();
+    }
+    if (!values[0].IsArray()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ARRAY_TO_STRING requires an array");
+    }
+    const std::string delimiter = raw_str(values[1]);
+    const bool has_null_text = values.size() == 3 && !values[2].IsNull();
+    const std::string null_text =
+        has_null_text ? raw_str(values[2]) : std::string();
+    // Element rendering mirrors GoogleSQL CAST-to-STRING text: numbers in
+    // shortest round-trip form, dates as YYYY-MM-DD, strings unquoted;
+    // nested arrays have no text form and error.
+    const auto element_text =
+        [](const Value& element) -> StatusOr<std::string> {
+      switch (element.type) {
+        case ValueType::kInt64:
+          return element.IsUnsigned() ? std::to_string(static_cast<uint64_t>(
+                                            element.value.int_value))
+                                      : std::to_string(element.value.int_value);
+        case ValueType::kDouble: {
+          if (std::isnan(element.value.double_value)) {
+            return std::string("nan");
+          }
+          if (std::isinf(element.value.double_value)) {
+            return std::string(element.value.double_value > 0 ? "inf" : "-inf");
+          }
+          std::array<char, 64> buffer{};
+          const auto [ptr, ec] =
+              std::to_chars(buffer.data(), buffer.data() + buffer.size(),
+                            element.value.double_value);
+          if (ec != std::errc()) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "cannot format DOUBLE array element");
+          }
+          return std::string(buffer.data(),
+                             static_cast<size_t>(ptr - buffer.data()));
+        }
+        case ValueType::kVarChar:
+          return std::string(element.value.varchar_value);
+        case ValueType::kDate:
+          return FormatDateDays(element.value.int_value);
+        case ValueType::kArray:
+          return StatusError(StatusCode::kInvalidArgument,
+                             "ARRAY_TO_STRING cannot format nested arrays");
+        default:
+          break;
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "cannot format array element");
+    };
+    std::string out;
+    bool first = true;
+    for (const Value& element : values[0].ArrayElements()) {
+      if (element.IsNull()) {
+        if (!has_null_text) {
+          continue;
+        }
+        if (!first) {
+          out += delimiter;
+        }
+        out += null_text;
+        first = false;
+        continue;
+      }
+      ASSIGN_OR_RETURN(std::string, text, element_text(element));
+      if (!first) {
+        out += delimiter;
+      }
+      out += text;
+      first = false;
+    }
+    return Value(std::move(out));
+  }
+
   if (name == "repeat") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -2309,7 +2574,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     const int64_t code =
         values[0].type == ValueType::kInt64 ? values[0].value.int_value : 0;
     std::string res;
-    if (code < 0 || code > 0x10FFFF) {
+    if (code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
       return StatusError(StatusCode::kIsInfinity, "CHR argument out of range");
     }
     if (code <= 0x7F) {
@@ -2408,29 +2673,10 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
       return Value();
     }
-    std::string s = raw_str(values[0]);
     const bool has_delim = values.size() == 2;
+    const std::string s = raw_str(values[0]);
     const std::string delims = has_delim ? raw_str(values[1]) : "";
-    auto is_delim = [&](char c) {
-      if (has_delim) {
-        return delims.find(c) != std::string::npos;
-      }
-      return !std::isalnum(static_cast<unsigned char>(c));
-    };
-    bool new_word = true;
-    for (char& c : s) {
-      if (!is_delim(c)) {
-        if (new_word) {
-          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-          new_word = false;
-        } else {
-          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-      } else {
-        new_word = true;
-      }
-    }
-    return Value(std::move(s));
+    return Value(UnicodeInitcap(s, delims, has_delim));
   }
 
   if (name == "translate") {
@@ -2453,9 +2699,16 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
 
     std::vector<std::string> src_chars;
     src_chars.reserve(src_len);
+    std::unordered_set<std::string> source_seen;
+    source_seen.reserve(src_len);
     for (size_t i = 0; i < src_len; ++i) {
-      src_chars.push_back(
-          src.substr(src_offsets[i], src_offsets[i + 1] - src_offsets[i]));
+      std::string source_char =
+          src.substr(src_offsets[i], src_offsets[i + 1] - src_offsets[i]);
+      if (!source_seen.insert(source_char).second) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "TRANSLATE source contains duplicate characters");
+      }
+      src_chars.push_back(std::move(source_char));
     }
     std::vector<std::string> dst_chars;
     dst_chars.reserve(dst_len);
@@ -2676,7 +2929,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     const std::string s = raw_str(values[0]);
     const std::string pat = raw_str(values[1]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       return Value(std::regex_search(s, re));
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -2695,7 +2948,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     const std::string s = raw_str(values[0]);
     const std::string pat = raw_str(values[1]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       return Value(std::regex_match(s, re));
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -2737,7 +2990,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
                                   ? static_cast<size_t>(pos_arg - 1)
                                   : offsets[static_cast<size_t>(pos_arg - 1)];
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       std::string search_str = s.substr(byte_start);
       std::sregex_iterator it(search_str.begin(), search_str.end(), re);
       std::sregex_iterator end;
@@ -2794,7 +3047,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     const std::string s = raw_str(values[0]);
     const std::string pat = raw_str(values[1]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       std::vector<Value> results;
       std::sregex_iterator it(s.begin(), s.end(), re);
       std::sregex_iterator end;
@@ -2830,7 +3083,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     const std::string s = raw_str(values[0]);
     const std::string pat = raw_str(values[1]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       std::smatch match;
       if (std::regex_search(s, match, re)) {
         if (match.size() > 1) {
@@ -2857,7 +3110,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     const std::string pat = raw_str(values[1]);
     const std::string rep = raw_str(values[2]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       return Value(std::regex_replace(s, re, rep));
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -3730,6 +3983,25 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
 }
 
 }  // namespace
+
+std::string UnicodeUpper(std::string_view value) {
+  return ConvertUnicodeCase(value, UnicodeCaseMode::kUpper, {}, false);
+}
+
+std::string UnicodeLower(std::string_view value) {
+  return ConvertUnicodeCase(value, UnicodeCaseMode::kLower, {}, false);
+}
+
+std::string UnicodeInitcap(std::string_view value, std::string_view delimiters,
+                           bool has_delimiters) {
+  return ConvertUnicodeCase(value, UnicodeCaseMode::kInitcap, delimiters,
+                            has_delimiters);
+}
+
+std::string FormatFloatingForPrintf(double value, char specifier,
+                                    int precision) {
+  return FormatFloatingForPrintfImpl(value, specifier, precision);
+}
 
 // ---- Struct (JSON text) helpers shared by the evaluators and the DML
 // mapping. Struct values are stored as flat JSON objects:

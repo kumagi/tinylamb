@@ -18,6 +18,7 @@
 
 #include "common/status_or.hpp"
 #include "executor/executor_base.hpp"
+#include "plan/plan.hpp"
 #include "query/query_data.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -112,6 +113,20 @@ class SqlEngine {
   StatusOr<Executor> PrepareStatement(TransactionContext& ctx,
                                       std::unique_ptr<Statement> statement);
 
+  // Folds non-correlated `x IN (SELECT ...)` (and its negation) inside a
+  // DML WHERE into a constant IN list by running the subquery once now.
+  // The positional DML plans cannot evaluate a raw query expression: the
+  // scalar evaluator raises "requires relational evaluation" (masks as a
+  // runtime error) or the decorated semi-join drops row positions.
+  // Correlated or failing inner statements stay untouched (fallback
+  // behaviour), never a wrong answer produced from this helper itself.
+  StatusOr<Expression> DecorateDmlWhere(TransactionContext& ctx,
+                                        const Expression& expressionssion);
+
+  // `x op ANY/ALL (SELECT ...)` non-correlated fold; see the definition.
+  StatusOr<Expression> FoldQuantifiedComparison(TransactionContext& ctx,
+                                                const QueryExpression& query);
+
   // M4: lifts every remaining non-recursive CTE into a shared eager cell
   // (planned + executed once via a fresh engine, scanned from every
   // reference site through kValues memo leaves). Atomic: any un-liftable CTE
@@ -182,14 +197,28 @@ class SqlEngine {
     SqlEngine* engine_;
   };
 
+  // One Cascades plan of a grouped FROM+WHERE core, reused by later UNION
+  // ALL branches (GROUPING SETS / ROLLUP / CUBE) whose required columns are
+  // already in that plan. Cleared at each public Prepare.
+  struct SharedGroupingCore {
+    std::string fingerprint;
+    Plan plan;
+  };
+
   Database* database_;
   std::string last_error_;
   std::optional<StatementType> last_statement_type_;
   std::string last_dml_table_;
   std::vector<std::string> result_column_names_;
   std::string plan_cache_fingerprint_;
+
+  // True when this statement's WHERE/SET carried a subquery folded to
+  // constants at prepare time (Bug 57): the folded values are valid only
+  // for the data as of now, so the compiled plan must not be cached.
+  bool dml_fold_applied_{false};
   std::vector<Value> plan_cache_parameters_;
   bool force_relational_fallback_{false};
+  std::vector<SharedGroupingCore> shared_grouping_cores_;
 };
 
 }  // namespace tinylamb

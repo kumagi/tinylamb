@@ -34,6 +34,10 @@ struct SimpleComparePredicate {
   int64_t int_constant{0};
   bool double_payload{false};
   double double_constant{0.0};
+  // Set at compile time when the constant is a plain (non-interval,
+  // non-JSON, non-collated) string, letting MatchSimpleCompare compare
+  // bytes directly instead of routing through TryEvaluateBinary per row.
+  bool plain_string_payload{false};
 };
 
 struct CompiledScanFilter {
@@ -103,6 +107,45 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                           const Schema& result_schema, const Scope* outer,
                           const CteMap& ctes, Relation* result,
                           Status* error = nullptr);
+
+// Bytecode programs covering every non-simple component of a
+// CompiledScanFilter, so a scan worker can decide a row without touching the
+// TransactionContext.  `complete` is false when any needed program failed to
+// compile (or bytecode is disabled); callers then fall back to the
+// main-thread MatchScanFilter pass.
+struct WorkerScanFilterPrograms {
+  bool complete{false};
+  std::optional<BytecodeProgram> residual;
+  std::vector<std::optional<BytecodeProgram>> branch_residuals;
+};
+
+WorkerScanFilterPrograms CompileWorkerFilter(const CompiledScanFilter& filter,
+                                             const Schema& schema);
+
+// Worker-safe row decision: 0 = reject, 1 = accept, 2 = defer (a program
+// raised, so the row needs the contextful MatchScanFilter re-check).
+// Semantically mirrors MatchScanFilter for every decided row.
+int MatchScanFilterWorker(const Row& row, const Schema& schema,
+                          const CompiledScanFilter& filter,
+                          const WorkerScanFilterPrograms& programs);
+
+// Filters `source` into `result` with worker threads applying the full
+// filter (simple compares plus the compiled worker programs; rows whose
+// programs raise are re-checked on the main thread).  Rows are partitioned
+// into contiguous index ranges and emitted in worker order, so output order
+// matches a serial scan of `source`.  Returns false (touching nothing) when
+// the source is small, spilled, or the filter has no worker programs.
+bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
+                           const CompiledScanFilter& filter,
+                           const Schema& match_schema, const Scope* outer,
+                           const CteMap& ctes,
+                           const std::unordered_set<int64_t>* key_filter,
+                           std::optional<slot_t> key_column, Relation* result,
+                           Status* error);
+
+StatusOr<Relation> ApplyTableSample(TransactionContext& context,
+                                    const SelectSource& source,
+                                    Relation input);
 
 StatusOr<Relation> LoadSource(
     TransactionContext& context, const SelectSource& source, const Scope* outer,

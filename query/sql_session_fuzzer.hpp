@@ -31,6 +31,10 @@ struct SessionCheck {
   std::string table;                  // dump this table...
   size_t after_step{0};               // ...after steps[after_step]
   std::vector<std::string> expected;  // sorted Row::ToString dump
+  // Index-independence probes replay a custom SELECT instead of the plain
+  // full dump; the expected rows are the mirror's filter of the same
+  // predicate.  Empty = default "SELECT * FROM <table> ORDER BY u".
+  std::string sql_override;
   // Dual-transaction sessions: which context issues the check (0 or 1).
   // Each context's snapshot isolates it from the other's uncommitted work.
   int txn{0};
@@ -80,6 +84,8 @@ struct SessionTrace {
 struct SessionStats {
   int statements{0};
   int checks{0};
+  int index_probes{0};
+  int unique_rejects{0};
   int indexes_created{0};
   int tables_dropped{0};
   int commits{0};

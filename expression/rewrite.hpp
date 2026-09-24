@@ -216,6 +216,7 @@ enum class Volatility : uint8_t {
 // or aggregate subtrees. Rewrites that duplicate an expression (x + x ->
 // x * 2, predicate fan-out into several FILTER clauses) must gate on this.
 [[nodiscard]] bool SafeToReduceEvaluationCount(const Expression& expression);
+[[nodiscard]] bool ExpressionCannotThrowForPlanner(const Expression& expression);
 
 // Executes the JSON_EXTRACT / JSON_QUERY / JSON_VALUE / JSON_EXTRACT_SCALAR /
 // JSON_EXTRACT_ARRAY / JSON_QUERY_ARRAY / JSON_VALUE_ARRAY /

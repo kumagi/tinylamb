@@ -210,6 +210,88 @@ bool IdentifierEquals(std::string_view left, std::string_view right) {
                     });
 }
 
+// Resolves the child-side FOREIGN KEY checks for a DML target: every
+// well-formed single-column kForeign constraint becomes a (child offset,
+// parent table, parent offset) triple.  Malformed or dangling references
+// (possible only for hand-built schemas; CREATE TABLE validates) are
+// skipped so legacy tables keep working.
+StatusOr<std::vector<ForeignKeyCheck>> ResolveForeignKeyChecks(
+    TransactionContext& ctx, const Table& target) {
+  std::vector<ForeignKeyCheck> checks;
+  const Schema& schema = target.GetSchema();
+  for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
+    const Constraint& constraint = schema.GetColumn(i).GetConstraint();
+    if (constraint.ctype != Constraint::kForeign) {
+      continue;
+    }
+    std::string parent_table;
+    std::vector<std::string> parent_columns;
+    if (!ParseForeignKeyReference(constraint, &parent_table, &parent_columns) ||
+        parent_columns.size() != 1) {
+      continue;
+    }
+    auto* parent = const_cast<Table*>(&target);
+    if (!IdentifierEquals(parent_table, schema.Name())) {
+      ASSIGN_OR_RETURN(std::shared_ptr<Table>, h_parent,
+                       (ctx.GetTable(parent_table)));
+      // The txn context caches the handle for the statement's lifetime.
+      parent = h_parent.get();
+      // Keep the cache entry alive even if the caller drops its handle:
+      // re-fetching by canonical name returns the same object.
+      (void)ctx.GetTable(parent->GetSchema().Name());
+    }
+    const int parent_offset =
+        parent->GetSchema().Offset(ColumnName("", parent_columns[0]));
+    if (parent_offset < 0) {
+      continue;
+    }
+    checks.push_back(
+        ForeignKeyCheck{.child_offset = i,
+                        .parent = parent,
+                        .parent_offset = static_cast<size_t>(parent_offset)});
+  }
+  return checks;
+}
+
+// Resolves the NO ACTION reverse checks for a DML target: every other (or
+// the same) table whose kForeign constraint names this table contributes a
+// (child table, child offset, parent offset) triple.
+StatusOr<std::vector<ReferencedByCheck>> ResolveReferencedByChecks(
+    Database* database, TransactionContext& ctx, const Table& target) {
+  std::vector<ReferencedByCheck> checks;
+  const std::string target_name = std::string(target.GetSchema().Name());
+  for (const std::string& name : database->ListTables(ctx)) {
+    ASSIGN_OR_RETURN(std::shared_ptr<Table>, h_child, (ctx.GetTable(name)));
+    Table* child = h_child.get();
+    (void)ctx.GetTable(child->GetSchema().Name());
+    const Schema& schema = child->GetSchema();
+    for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
+      const Constraint& constraint = schema.GetColumn(i).GetConstraint();
+      if (constraint.ctype != Constraint::kForeign) {
+        continue;
+      }
+      std::string parent_table;
+      std::vector<std::string> parent_columns;
+      if (!ParseForeignKeyReference(constraint, &parent_table,
+                                    &parent_columns) ||
+          parent_columns.size() != 1 ||
+          !IdentifierEquals(parent_table, target_name)) {
+        continue;
+      }
+      const int parent_offset =
+          target.GetSchema().Offset(ColumnName("", parent_columns[0]));
+      if (parent_offset < 0) {
+        continue;
+      }
+      checks.push_back(ReferencedByCheck{
+          .child = child,
+          .child_offset = i,
+          .parent_offset = static_cast<size_t>(parent_offset)});
+    }
+  }
+  return checks;
+}
+
 bool ContainsQueryExpression(const Expression& expression) {
   if (!expression) {
     return false;
@@ -319,6 +401,14 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
       continue;
     }
     const QueryExpression& query = conjunct->AsQueryExpression();
+    // Non-equality quantifiers are not membership tests; the keyed
+    // semi/anti rewrite cannot express them (see TryDecorrelate), so the
+    // statement stays on the scope-aware relational evaluator.
+    if (query.Mode() != QuantifierMode::kIn &&
+        (query.Mode() != QuantifierMode::kAny ||
+         query.Op() != BinaryOperation::kEquals)) {
+      return false;
+    }
     if (query.Query() == nullptr ||
         (!query.Exists() && query.Test() == nullptr) ||
         query.Query()->Sources().size() != 1 ||
@@ -533,6 +623,34 @@ bool StatementWindowRoutable(const SelectStatement& select) {
   return found;
 }
 
+bool StatisticalAggregateOnlyRelational(const Expression& expression) {
+  if (!expression) {
+    return true;
+  }
+  if (expression->Type() == TypeTag::kAggregateExp) {
+    const auto& aggregate = expression->AsAggregateExpression();
+    if (IsExtendedAggregate(aggregate.GetType()) &&
+        !IsStatisticalAggregate(aggregate.GetType())) {
+      return false;
+    }
+  }
+  if (expression->Type() == TypeTag::kQueryExp ||
+      expression->Type() == TypeTag::kIntervalExp ||
+      expression->Type() == TypeTag::kFunctionCallExp ||
+      expression->Type() == TypeTag::kWindowFunctionExp) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    return column.name != "*" && column.schema.find('.') == std::string::npos &&
+           column.name.find('.') == std::string::npos;
+  }
+  return std::ranges::all_of(ExpressionChildren(expression),
+                             [](const Expression& child) {
+                               return StatisticalAggregateOnlyRelational(child);
+                             });
+}
+
 }  // namespace
 
 bool PostRewriteNeedsRelational(const SelectStatement& select,
@@ -595,28 +713,40 @@ bool PostRewriteNeedsRelational(const SelectStatement& select,
                      WindowItemRoutable(select.Qualify());
   }
   for (const NamedExpression& item : select.SelectList()) {
+    const bool statistical_finish =
+        !include_grouping &&
+        StatisticalAggregateOnlyRelational(item.expression);
     if (NeedsRelationalEvaluation(item.expression) &&
-        !window_item_routed(item.expression)) {
+        !window_item_routed(item.expression) && !statistical_finish) {
       return true;
     }
     // Value-table operands need the relational interpreter's proto-field
     // resolution (mirrors has_value_table_operand below).
     if (item.expression &&
-        item.expression->Type() == TypeTag::kFunctionCallExp &&
-        (item.expression->AsFunctionCallExpression().FuncName() ==
-             "__value_table_value" ||
-         item.expression->AsFunctionCallExpression().FuncName() ==
-             "__proto_new")) {
-      return true;
+        item.expression->Type() == TypeTag::kFunctionCallExp) {
+      const auto& call = item.expression->AsFunctionCallExpression();
+      const bool ordinary_star =
+          call.FuncName() == "__value_table_value" && call.Args().size() == 1 &&
+          call.Args()[0] && call.Args()[0]->Type() == TypeTag::kColumnValue &&
+          call.Args()[0]->AsColumnValue().GetColumnName().name == "*";
+      if (!ordinary_star && (call.FuncName() == "__value_table_value" ||
+                             call.FuncName() == "__proto_new")) {
+        return true;
+      }
     }
   }
   if (NeedsRelationalEvaluation(select.WhereClause()) ||
-      NeedsRelationalEvaluation(select.Having())) {
+      (NeedsRelationalEvaluation(select.Having()) &&
+       (include_grouping ||
+        !StatisticalAggregateOnlyRelational(select.Having())))) {
     return true;
   }
   for (const auto& term : select.OrderBy()) {
+    const bool statistical_finish =
+        !include_grouping &&
+        StatisticalAggregateOnlyRelational(term.expression);
     if (NeedsRelationalEvaluation(term.expression) &&
-        !window_item_routed(term.expression)) {
+        !window_item_routed(term.expression) && !statistical_finish) {
       return true;
     }
   }
@@ -973,6 +1103,74 @@ Executor RetainCompiledPlan(Executor executor, const CompiledPlanPtr& plan) {
   return std::make_shared<RetainedExecutor>(std::move(executor), plan);
 }
 
+// Times one SELECT replay. The first completion becomes the baseline. A later
+// completion that is both slower than 50ms and at least 8x that baseline
+// drops the thread-local plan so the next execution is planned again.
+class TimedSelectReuse final : public ExecutorBase {
+ public:
+  TimedSelectReuse(const TimedSelectReuse&) = delete;
+  TimedSelectReuse& operator=(const TimedSelectReuse&) = delete;
+  TimedSelectReuse(TimedSelectReuse&&) = delete;
+  TimedSelectReuse& operator=(TimedSelectReuse&&) = delete;
+
+  TimedSelectReuse(Executor inner, std::string fingerprint,
+                   CompiledPlanPtr plan)
+      : inner_(std::move(inner)),
+        fingerprint_(std::move(fingerprint)),
+        plan_(std::move(plan)),
+        started_(std::chrono::steady_clock::now()) {}
+  ~TimedSelectReuse() override { Finish(); }
+
+  bool Next(Row* row, RowPosition* position) override {
+    const bool more = inner_->Next(row, position);
+    if (!more) {
+      Finish();
+    }
+    return more;
+  }
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    const size_t rows = inner_->NextBatch(destination, max_rows);
+    if (rows == 0) {
+      Finish();
+    }
+    return rows;
+  }
+  void Dump(std::ostream& output, int indent) const override {
+    inner_->Dump(output, indent);
+  }
+  void Explain(std::ostream& output, int indent) const override {
+    inner_->Explain(output, indent);
+  }
+  Status GetStatus() const override { return inner_->GetStatus(); }
+
+ private:
+  void Finish() {
+    if (finished_) {
+      return;
+    }
+    finished_ = true;
+    const auto elapsed = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started_)
+            .count());
+    uint64_t baseline =
+        plan_->reuse_baseline_ns.load(std::memory_order_relaxed);
+    if (baseline == 0 && plan_->reuse_baseline_ns.compare_exchange_strong(
+                             baseline, elapsed, std::memory_order_relaxed)) {
+      return;
+    }
+    if (SelectReuseExceededThreshold(elapsed, baseline)) {
+      ForgetThreadCompiledPlan(fingerprint_);
+    }
+  }
+
+  Executor inner_;
+  std::string fingerprint_;
+  CompiledPlanPtr plan_;
+  std::chrono::steady_clock::time_point started_;
+  bool finished_{false};
+};
+
 struct ExplainRequest {
   bool analyze{false};
   std::string_view query;
@@ -1319,26 +1517,100 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
     }
     rows.emplace_back(std::move(evaluated));
   }
+  StatusOr<std::vector<ForeignKeyCheck>> fk_checks =
+      ResolveForeignKeyChecks(ctx, *shape.table);
+  if (!fk_checks.HasValue()) {
+    return std::nullopt;
+  }
   return Executor(std::make_shared<Insert>(
       ctx.txn_, shape.table.get(),
-      std::make_shared<ConstantExecutor>(std::move(rows))));
+      std::make_shared<ConstantExecutor>(std::move(rows)),
+      InsertExecutionMode::kDefault, /*enforce_primary_key=*/false,
+      /*upsert_offsets=*/std::vector<size_t>{},
+      /*assert_rows_modified=*/-1, fk_checks.MoveValue()));
 }
 
-// Fill-time helper shared by the specialized tiers.
+// Slotizes the finished plan. Parent expressions are visited before children,
+// so a SET/SELECT list is bound before the scan predicate. A mismatch returns
+// an empty vector; the statement still runs with the literals it was planned
+// with, and the cache keeps the identical-parameter fallback.
+// Numbers literals in SQL-text order before planning. The optimizer may
+// reorder conjuncts; the slot index stays with the literal.
+struct SqlLiteralSlots {
+  const std::vector<Value>* parameters = nullptr;
+  size_t cursor = 0;
+  bool ok = true;
+
+  Expression Apply(const Expression& expression) {
+    if (!ok || parameters == nullptr || !expression) {
+      return expression;
+    }
+    bool local_ok = true;
+    Expression slotted =
+        SlotizeLiterals(expression, &cursor, &local_ok, parameters, nullptr);
+    if (!local_ok) {
+      ok = false;
+      return expression;
+    }
+    return slotted;
+  }
+
+  [[nodiscard]] bool Complete() const {
+    return ok && parameters != nullptr && cursor == parameters->size();
+  }
+};
+
+// Collects slots stamped before planning. Every SQL parameter must still be
+// present. A missing index means the optimizer dropped that slot; refuse
+// parametric reuse instead of binding a different literal into the hole.
+std::vector<Expression> InstallPlanSlots(const Plan& plan,
+                                         const std::vector<Value>& parameters) {
+  if (!plan || parameters.empty()) {
+    return {};
+  }
+  std::vector<Expression> slots;
+  size_t cursor = 0;
+  if (!plan->InstallParameterSlots(parameters, &cursor, &slots)) {
+    return {};
+  }
+  std::vector<char> seen(parameters.size(), 0);
+  for (const Expression& expression : slots) {
+    const auto* slot = dynamic_cast<const ParameterSlot*>(expression.get());
+    if (slot == nullptr || slot->Index() >= parameters.size() ||
+        slot->GetValue() != parameters[slot->Index()]) {
+      return {};
+    }
+    seen[slot->Index()] = 1;
+  }
+  if (std::find(seen.begin(), seen.end(), 0) != seen.end()) {
+    return {};
+  }
+  return slots;
+}
+
+// Fill-time helper shared by the specialized tiers. The precautionary volatile
+// mark around PrepareStatement must not suppress the fill: Bug 57 is the
+// caller's `dml_fold_applied_` check. A volatile fingerprint is still not
+// served until that mark is demoted.
 void RememberSpecializedPlan(const std::string& fingerprint, uint64_t epoch,
                              std::vector<Value> parameters,
                              CompiledPlan::Kind kind, Plan plan,
                              std::shared_ptr<Table> table,
                              const Database* database,
-                             const TransactionContext& ctx) {
-  if (fingerprint.empty() || IsVolatileSpecializedPlan(fingerprint)) {
+                             const TransactionContext& ctx,
+                             std::vector<Expression> slots) {
+  if (fingerprint.empty()) {
     return;
+  }
+  if (!slots.empty() && (plan == nullptr || !plan->ContainsParameterSlots())) {
+    slots.clear();
   }
   auto compiled = std::make_shared<CompiledPlan>();
   compiled->kind = kind;
   compiled->database = database;
   compiled->epoch = epoch;
   compiled->parameters = std::move(parameters);
+  compiled->parameter_slots = std::move(slots);
   compiled->plan = std::move(plan);
   compiled->table = std::move(table);
   // The plan tree borrows fill-time TableStatistics whose shared_ptr lives
@@ -1358,6 +1630,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   last_error_.clear();
   last_statement_type_.reset();
   result_column_names_.clear();
+  shared_grouping_cores_.clear();
   const std::optional<ExplainRequest> explain = ParseExplain(sql);
   const std::string_view query_sql = explain ? explain->query : sql;
   if (explain && query_sql.empty()) {
@@ -1429,7 +1702,9 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(query_sql);
     if (!parsed.ok) {
       last_error_ = std::move(parsed.error);
-      return Status::kUnknown;
+      // Syntax rejections are client errors; kUnknown hid that from wire
+      // status mapping (pgwire reported them like internal faults).
+      return Status::kInvalidArgument;
     }
     try {
       ASSIGN_OR_RETURN(std::unique_ptr<GoogleSqlAstNode>, ast,
@@ -1455,14 +1730,8 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
       return Status::kNotImplemented;
     }
     last_statement_type_ = StatementType::kSelect;
-    // The Cascades optimizer reorders join inputs by filtered cardinality and
-    // eliminates provably redundant foreign-key joins. The relational explain
-    // path already surfaces those labels ("JoinOrder=", "JoinElimination"),
-    // but a plain physical-executor EXPLAIN dump does not; both are annotated
-    // below by comparing the FROM clause against the emitted plan.
     const auto* explain_select =
         static_cast<const SelectStatement*>(statement.get());
-    const size_t explain_source_count = explain_select->Sources().size();
     std::vector<std::string> explain_base_tables;
     bool explain_has_inner_join_source = false;
     for (const SelectSource& source : explain_select->Sources()) {
@@ -1514,12 +1783,6 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     std::ostringstream output;
     prepared.Value()->Explain(output, 0);
     const std::string body = output.str();
-    if (explain_source_count > 2 &&
-        body.find("JoinOrder=") == std::string::npos) {
-      // Cascades reordered the multi-way join inputs by filtered cardinality
-      // rather than preserving their written order.
-      output << "\nJoinOrder=greedy_filtered_cardinality";
-    }
     // An INNER-join FROM relation that vanished from a non-empty plan was
     // removed by provably-unused foreign-key join elimination. LEFT-join
     // elimination and full contradiction (EmptyResult) are left unannotated so
@@ -1591,6 +1854,13 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   }
   // Arm the compiled-plan fill sites inside PrepareStatement; the guard
   // disarms them on every exit (including EXPLAIN, which never sets one).
+  // A statement that folds subqueries into constants at prepare time must
+  // neither consume a cached plan (it may hold an older fold) nor publish
+  // one (Bug 57): mark its fingerprint volatile around the compile.
+  const std::string fold_fp = templated.fingerprint;
+  const bool fold_marked_fresh =
+      !fold_fp.empty() && MarkFingerprintVolatile(fold_fp);
+  dml_fold_applied_ = false;
   if (!force_relational_fallback_) {
     set_plan_cache_candidate(templated.fingerprint, templated.parameters);
   }
@@ -1599,8 +1869,13 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   // StatusOr contract: runtime errors surface as Status values, never as
   // escaping C++ exceptions.
   try {
-    return PrepareStatement(ctx, std::move(statement));
+    StatusOr<Executor> result = PrepareStatement(ctx, std::move(statement));
+    // The mark was precautionary: without an actual prepare-time fold the
+    // fingerprint stays cache-eligible.
+    DemoteVolatileFingerprint(fold_fp, fold_marked_fresh && !dml_fold_applied_);
+    return result;
   } catch (const std::exception& error) {
+    DemoteVolatileFingerprint(fold_fp, fold_marked_fresh);
     last_error_ = error.what();
     return Status::kUnknown;
   }
@@ -2360,6 +2635,13 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
     while (prepared.Value()->Next(&row, nullptr)) {
       rows.push_back(row);
     }
+    // A term that aborted mid-stream (e.g. an aggregate overflow) must fail
+    // the whole set operation; swallowing it here would silently truncate the
+    // concatenated result.
+    const Status term_status = prepared.Value()->GetStatus();
+    if (term_status != Status::kSuccess) {
+      return term_status;
+    }
     term_rows.push_back(std::move(rows));
   }
 
@@ -2436,10 +2718,6 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
       keys.push_back({std::move(key), term.ascending, term.nulls_first});
     }
     if (select.WithTies()) {
-      // WITH TIES must keep every row tied with the cutoff row; a plain
-      // Limit after the sort would silently truncate them.  Without an
-      // explicit LIMIT the cutoff is "the whole result", so TopN with the
-      // recorded (possibly zero) limit would wrongly drop rows.
       const size_t ties_limit = select.HasLimit()
                                     ? select.Limit()
                                     : std::numeric_limits<size_t>::max();
@@ -2451,8 +2729,19 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
       }
       executor = std::make_shared<TopNExecutor>(
           std::move(executor), combined_schema, std::move(topn_keys),
-          ties_limit, select.Offset(), /*with_ties=*/true);
+          ties_limit, select.Offset(), true);
       return executor;
+    }
+    if (select.HasLimit()) {
+      std::vector<TopNExecutor::Key> topn_keys;
+      topn_keys.reserve(keys.size());
+      for (SortExecutor::Key& key : keys) {
+        topn_keys.push_back(
+            {std::move(key.expression), key.ascending, key.nulls_first});
+      }
+      return std::make_shared<TopNExecutor>(
+          std::move(executor), combined_schema, std::move(topn_keys),
+          select.Limit(), select.Offset());
     }
     executor = std::make_shared<SortExecutor>(std::move(executor),
                                               combined_schema, std::move(keys));
@@ -3062,6 +3351,25 @@ bool ContainsStarReference(const Expression& expression) {
 // - UNION ALL additionally proves pairwise disjointness through one shared
 //   column pinned to pairwise-different same-type constants (IS NULL counts
 //   as its own constant; anything else stays relational).
+bool UnionProjectionExpressionSafe(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kQueryExp ||
+      expression->Type() == TypeTag::kAggregateExp ||
+      expression->Type() == TypeTag::kWindowFunctionExp) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp &&
+      GetFunctionVolatility(
+          expression->AsFunctionCallExpression().FuncName()) !=
+          Volatility::kImmutable) {
+    return false;
+  }
+  return std::ranges::all_of(ExpressionChildren(expression),
+                             UnionProjectionExpressionSafe);
+}
+
 bool UnionBranchShapeOk(const SelectStatement& part, bool is_head) {
   if (part.Sources().size() != 1 || !part.WithQueries().empty() ||
       !part.GroupBy().empty() || part.Having() || part.Distinct() ||
@@ -3084,7 +3392,7 @@ bool UnionBranchShapeOk(const SelectStatement& part, bool is_head) {
   }
   const SelectSource& source = part.Sources().front();
   if (source.query != nullptr || source.unnest || source.is_lateral ||
-      source.table.empty() || !source.using_columns.empty() ||
+      source.sample || source.table.empty() || !source.using_columns.empty() ||
       source.from_nested_join || source.join_condition ||
       (source.join_type != JoinType::kCross &&
        source.join_type != JoinType::kInner)) {
@@ -3100,7 +3408,8 @@ bool UnionBranchShapeOk(const SelectStatement& part, bool is_head) {
   return std::ranges::all_of(
       part.SelectList(), [](const NamedExpression& item) {
         return item.expression &&
-               !relational_detail::ContainsAggregate(item.expression);
+               !relational_detail::ContainsAggregate(item.expression) &&
+               UnionProjectionExpressionSafe(item.expression);
       });
 }
 
@@ -3756,6 +4065,9 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
     return false;
   }
   const SelectSource& base = inner->Sources()[0];
+  if (derived.sample && base.sample) {
+    return false;
+  }
   if (base.query != nullptr || base.unnest || base.is_lateral ||
       base.table.empty() || !base.using_columns.empty() ||
       base.from_nested_join || base.join_condition) {
@@ -4786,6 +5098,81 @@ void SqlEngine::LiftRecursiveCtes(SelectStatement* outer, LiftedCtes* lifted) {
   seal_coverage();
 }
 
+namespace {
+
+// Fingerprint of the grouped FROM+WHERE core, excluding the projection.
+// Empty means "do not share" (lifted CTE rows are data, not a plan key).
+std::string GroupingCoreFingerprint(const QueryData& core) {
+  if (!core.lifted_ctes_.cells.empty() ||
+      !core.lifted_ctes_.recursive.empty()) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "pos=" << core.require_row_position_ << '\n';
+  for (const std::string& relation : core.from_) {
+    out << relation << '\n';
+  }
+  std::vector<std::pair<std::string, std::string>> aliases(
+      core.aliases_.begin(), core.aliases_.end());
+  std::sort(aliases.begin(), aliases.end());
+  for (const auto& [alias, table] : aliases) {
+    out << alias << '=' << table << '\n';
+  }
+  out << (core.where_ ? core.where_->ToString() : "") << '\n';
+  if (core.qualify_) {
+    out << core.qualify_->ToString() << '\n';
+  }
+  for (const QueryData::OuterJoinEdge& edge : core.outer_joins_) {
+    out << edge.right_index << ',' << static_cast<int>(edge.join_kind) << ',';
+    if (edge.on_condition) {
+      out << edge.on_condition->ToString();
+    }
+    out << '\n';
+  }
+  return out.str();
+}
+
+bool SchemaHasColumn(const Schema& schema, const ColumnName& name) {
+  if (name.name.empty() || name.name == "*") {
+    return true;
+  }
+  int bare_matches = 0;
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    const ColumnName& candidate = schema.GetColumn(i).Name();
+    if (!name.schema.empty()) {
+      if (IdentifierEquals(candidate.schema, name.schema) &&
+          IdentifierEquals(candidate.name, name.name)) {
+        return true;
+      }
+    } else if (IdentifierEquals(candidate.name, name.name)) {
+      ++bare_matches;
+    }
+  }
+  return name.schema.empty() && bare_matches == 1;
+}
+
+// A cached core plan is reusable when every column this branch's grouping
+// finish reads is already in the plan output. Constant projections (the
+// COUNT(*) placeholder, NULL-padded keys) do not need a matching column.
+// Extra columns in the cached plan do not change the row set.
+bool GroupingCoreCovers(const Schema& schema,
+                        const std::vector<NamedExpression>& select) {
+  if (schema.ColumnCount() == 0 || select.empty()) {
+    return false;
+  }
+  return std::ranges::all_of(select, [&](const NamedExpression& item) {
+    if (!item.expression ||
+        item.expression->Type() == TypeTag::kConstantValue) {
+      return true;
+    }
+    return item.expression->Type() == TypeTag::kColumnValue &&
+           SchemaHasColumn(schema,
+                           item.expression->AsColumnValue().GetColumnName());
+  });
+}
+
+}  // namespace
+
 StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     const SelectStatement& select, TransactionContext& ctx,
     const LiftedCtes* lifted) {
@@ -4911,7 +5298,23 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
   for (const std::string& name : result_column_names_) {
     output_columns.emplace_back(name, ValueType::kNull);
   }
-  StatusOr<Plan> core_plan_or = Optimizer::Optimize(core, ctx);
+  // GROUPING SETS / ROLLUP / CUBE expands to UNION ALL of the same
+  // FROM+WHERE with a narrower projection on later branches. Plan that core
+  // once and reuse it when the cached schema still has every column this
+  // branch aggregates.
+  const std::string core_fingerprint = GroupingCoreFingerprint(core);
+  Plan shared_core;
+  if (!core_fingerprint.empty()) {
+    for (const SharedGroupingCore& cached : shared_grouping_cores_) {
+      if (cached.fingerprint == core_fingerprint &&
+          GroupingCoreCovers(cached.plan->GetSchema(), core.select_)) {
+        shared_core = cached.plan;
+        break;
+      }
+    }
+  }
+  StatusOr<Plan> core_plan_or = shared_core ? StatusOr<Plan>(shared_core)
+                                            : Optimizer::Optimize(core, ctx);
   if (!core_plan_or.HasValue()) {
     StatusOr<Plan> optimized = Optimizer::OptimizeRelational(
         statement, Schema("", std::move(output_columns)), ctx);
@@ -4924,8 +5327,20 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     return optimized.Value()->EmitExecutor(ctx);
   }
   Plan core_plan = std::move(core_plan_or.Value());
+  if (!shared_core && !core_fingerprint.empty() &&
+      shared_grouping_cores_.size() < 8 &&
+      GroupingCoreCovers(core_plan->GetSchema(), core.select_)) {
+    shared_grouping_cores_.push_back(
+        SharedGroupingCore{.fingerprint = core_fingerprint, .plan = core_plan});
+  }
+  std::optional<size_t> finite_limit;
+  if (select.HasLimit() && !select.WithTies() &&
+      select.Offset() <= std::numeric_limits<size_t>::max() - select.Limit()) {
+    finite_limit = select.Offset() + select.Limit();
+  }
   Plan finish = std::make_shared<GroupByPlan>(
-      core_plan, std::move(statement), Schema("", std::move(output_columns)));
+      core_plan, std::move(statement), Schema("", std::move(output_columns)),
+      !select.GroupBy().empty(), finite_limit);
   return finish->EmitExecutor(ctx);
 }
 
@@ -5216,8 +5631,15 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
     for (const std::string& name : result_column_names_) {
       output_columns.emplace_back(name, ValueType::kNull);
     }
+    std::optional<size_t> finite_limit;
+    if (select.HasLimit() && !select.WithTies() &&
+        select.Offset() <=
+            std::numeric_limits<size_t>::max() - select.Limit()) {
+      finite_limit = select.Offset() + select.Limit();
+    }
     Plan finish = std::make_shared<GroupByPlan>(
-        core_plan, std::move(statement), Schema("", std::move(output_columns)));
+        core_plan, std::move(statement), Schema("", std::move(output_columns)),
+        !select.GroupBy().empty(), finite_limit);
     return finish->EmitExecutor(ctx);
   }
 
@@ -5553,6 +5975,224 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
   return executor;
 }
 
+// `x op ANY/ALL (SELECT ...)` over a non-correlated subquery: run the inner
+// SELECT once at prepare time and fold the comparison into an AND/OR chain
+// over the constant candidate list.  Three-valued semantics coincide with
+// TryEvaluateQuantifiedComparison (ANY = OR-chain, ALL = AND-chain; empty
+// ANY = FALSE, empty ALL = TRUE; per-candidate UNKNOWN propagates exactly
+// like the row-loop implementation).  A correlated or unpreparable inner
+// statement keeps the legacy route.
+StatusOr<Expression> SqlEngine::FoldQuantifiedComparison(
+    TransactionContext& ctx, const QueryExpression& query) {
+  auto inner = std::make_unique<SelectStatement>(*query.Query());
+  std::string saved_fingerprint;
+  std::swap(saved_fingerprint, plan_cache_fingerprint_);
+  std::vector<Value> saved_parameters;
+  std::swap(saved_parameters, plan_cache_parameters_);
+  StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
+  std::swap(saved_fingerprint, plan_cache_fingerprint_);
+  std::swap(saved_parameters, plan_cache_parameters_);
+  if (!exec.HasValue()) {
+    return Expression(query.Test());  // keep legacy route
+  }
+  std::vector<Value> candidates;
+  bool failed = false;
+  Row row;
+  while (exec.Value()->Next(&row, nullptr)) {
+    if (row.values_.empty()) {
+      failed = true;
+      break;
+    }
+    candidates.push_back(row[0]);
+  }
+  if (exec.Value()->GetStatus() != Status::kSuccess) {
+    failed = true;
+  }
+  if (failed) {
+    return Expression(query.Test());
+  }
+  dml_fold_applied_ = true;
+  if (std::getenv("TINYLAMB_FOLD_TRACE") != nullptr) {  // NOLINT(cert-err33-c)
+    (void)fprintf(stderr, "[fold] quant cands=%zu neg=%d\n", candidates.size(),
+                  (int)query.Negated());
+  }
+  const bool is_all = query.Mode() == QuantifierMode::kAll;
+  if (candidates.empty()) {
+    // ANY -> FALSE, ALL -> TRUE, then the NOT wrapper (an empty
+    // `NOT (x = ALL ())` is FALSE, not TRUE).
+    const bool value = query.Negated() ? !is_all : is_all;
+    return ConstantValueExp(Value(value));
+  }
+  std::vector<Expression> terms;
+  terms.reserve(candidates.size());
+  for (const Value& candidate : candidates) {
+    terms.push_back(BinaryExpressionExp(query.Test(), query.Op(),
+                                        ConstantValueExp(candidate)));
+  }
+  Expression folded = is_all ? CombineConjuncts(terms)
+                             : relational_detail::CombineDisjuncts(terms);
+  if (query.Negated()) {
+    folded = UnaryExpressionExp(std::move(folded), UnaryOperation::kNot);
+  }
+  return folded;
+}
+
+StatusOr<Expression> SqlEngine::DecorateDmlWhere(TransactionContext& ctx,
+                                                 const Expression& expression) {
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    if (!relational_detail::ContainsOnlyUncorrelatedQueries(ctx, expression,
+                                                            {})) {
+      return expression;
+    }
+    const QueryExpression& query = expression->AsQueryExpression();
+
+    if (!query.ArrayResult() && query.Test() &&
+        (query.Mode() == QuantifierMode::kAny ||
+         query.Mode() == QuantifierMode::kAll)) {
+      if (!query.Query()->WithQueries().empty()) {
+        return expression;
+      }
+      return FoldQuantifiedComparison(ctx, query);
+    }
+    if (query.Exists()) {
+      // Non-correlated EXISTS: run once, fold to a constant.  A correlated
+      // inner cannot be prepared standalone and keeps the legacy route;
+      // WITH under a DML subquery stays unimplemented by contract
+      // (dml_delete.test / b/362158469), so those inners are not folded.
+      if (!query.Query()->WithQueries().empty()) {
+        return expression;
+      }
+      auto inner = std::make_unique<SelectStatement>(*query.Query());
+      std::string saved_fingerprint;
+      std::swap(saved_fingerprint, plan_cache_fingerprint_);
+      std::vector<Value> saved_parameters;
+      std::swap(saved_parameters, plan_cache_parameters_);
+      StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
+      std::swap(saved_fingerprint, plan_cache_fingerprint_);
+      std::swap(saved_parameters, plan_cache_parameters_);
+      if (exec.HasValue()) {
+        Row probe;
+        const bool any = exec.Value()->Next(&probe, nullptr) &&
+                         exec.Value()->GetStatus() == Status::kSuccess;
+        dml_fold_applied_ = true;
+        return ConstantValueExp(Value(query.Negated() ? !any : any));
+      }
+      return expression;
+    }
+    if (!query.Test() && !query.ArrayResult()) {
+      // Non-correlated scalar subquery: exactly one row folds to that
+      // constant; 0/>1 rows keep the legacy route (which raises the
+      // engine's own cardinality error).  WITH inners stay unimplemented
+      // by the same DML contract as EXISTS above.
+      if (!query.Query()->WithQueries().empty()) {
+        return expression;
+      }
+      auto inner = std::make_unique<SelectStatement>(*query.Query());
+      std::string saved_fingerprint;
+      std::swap(saved_fingerprint, plan_cache_fingerprint_);
+      std::vector<Value> saved_parameters;
+      std::swap(saved_parameters, plan_cache_parameters_);
+      StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
+      std::swap(saved_fingerprint, plan_cache_fingerprint_);
+      std::swap(saved_parameters, plan_cache_parameters_);
+      if (exec.HasValue()) {
+        std::vector<Value> picked;
+        bool failed = false;
+        Row row;
+        while (exec.Value()->Next(&row, nullptr)) {
+          if (row.values_.empty() || picked.size() >= 2) {
+            failed = true;
+            break;
+          }
+          picked.push_back(row[0]);
+        }
+        if (!failed && exec.Value()->GetStatus() == Status::kSuccess &&
+            picked.size() == 1) {
+          dml_fold_applied_ = true;
+          return ConstantValueExp(picked[0]);
+        }
+      }
+      return expression;
+    }
+    if (!query.Exists() && !query.ArrayResult() && query.Test() &&
+        query.Mode() == QuantifierMode::kIn &&
+        query.Op() == BinaryOperation::kEquals) {
+      // WITH under a DML subquery stays unimplemented by contract
+      // (dml_delete.test / b/362158469).
+      if (!query.Query()->WithQueries().empty()) {
+        return expression;
+      }
+      auto inner = std::make_unique<SelectStatement>(*query.Query());
+      // The nested prepare must not steal the OUTER statement's armed
+      // plan-cache candidate (the fill sites read the shared member), and
+      // the fold itself must never populate the cache.
+      std::string saved_fingerprint;
+      std::swap(saved_fingerprint, plan_cache_fingerprint_);
+      std::vector<Value> saved_parameters;
+      std::swap(saved_parameters, plan_cache_parameters_);
+      StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
+      std::swap(saved_fingerprint, plan_cache_fingerprint_);
+      std::swap(saved_parameters, plan_cache_parameters_);
+      if (exec.HasValue()) {
+        std::vector<Expression> values;
+        bool failed = false;
+        Row row;
+        while (exec.Value()->Next(&row, nullptr)) {
+          if (row.values_.empty()) {
+            failed = true;
+            break;
+          }
+          const bool as_struct = query.Query()->AsStruct();
+          if (!as_struct && row.values_.size() != 1) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "Subquery of type IN must have only one output column");
+          }
+          values.emplace_back(ConstantValueExp(
+              relational_detail::ProjectSubqueryRow(row, as_struct, nullptr)));
+        }
+        if (exec.Value()->GetStatus() != Status::kSuccess) {
+          failed = true;
+        }
+        if (!failed) {
+          dml_fold_applied_ = true;
+          if (values.empty()) {
+            // `x IN ()` is FALSE for every x (NULL included);
+            // `x NOT IN ()` is TRUE (GoogleSQL three-valued fold).
+            return ConstantValueExp(Value(query.Negated()));
+          }
+          Expression folded = InExpressionExp(query.Test(), std::move(values));
+          if (query.Negated()) {
+            folded =
+                UnaryExpressionExp(std::move(folded), UnaryOperation::kNot);
+          }
+          return folded;
+        }
+      }
+      // Correlated or unprepared inner: leave the node for the existing
+      // (legacy) route instead of guessing a semantics.
+      return expression;
+    }
+    return expression;
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  bool changed = false;
+  for (Expression& child : children) {
+    ASSIGN_OR_RETURN(Expression, rewritten, DecorateDmlWhere(ctx, child));
+    if (rewritten->ToString() != child->ToString()) {
+      child = std::move(rewritten);
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return expression;
+  }
+  return WithExpressionChildren(expression, std::move(children));
+}
+
 StatusOr<Executor> SqlEngine::PrepareStatement(
     TransactionContext& ctx, std::unique_ptr<Statement> statement) {
   last_statement_type_ = statement->Type();
@@ -5640,6 +6280,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           Row({Value("CREATE TABLE"), Value(0)})));
     }
     case StatementType::kInsert: {
+      // VALUES entries fold non-correlated subqueries like the WHERE/SET
+      // paths do.
+      for (auto& value_row :
+           dynamic_cast<InsertStatement&>(*statement).MutableValues()) {
+        for (Expression& value : value_row) {
+          ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
+          value = std::move(folded);
+        }
+      }
       const auto& insert = dynamic_cast<const InsertStatement&>(*statement);
       ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                        ctx.GetTable(insert.TableName()));
@@ -5829,7 +6478,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           compiled->epoch = database_->SchemaEpoch();
           compiled->parameters = plan_cache_parameters_;
           compiled->insert_shape = std::move(shape);
-          StoreCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
+          // Bug 57: VALUES rows folded to prepare-time constants must not
+          // be cached for reuse after the inner tables move on.
+          if (!dml_fold_applied_) {
+            StoreCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
+          }
         }
       }
       InsertExecutionMode exec_mode = InsertExecutionMode::kDefault;
@@ -5847,11 +6500,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           exec_mode = InsertExecutionMode::kReplace;
           break;
       }
+      ASSIGN_OR_RETURN(std::vector<ForeignKeyCheck>, fk_checks,
+                       (ResolveForeignKeyChecks(ctx, *table)));
       return Executor(std::make_shared<Insert>(
           ctx.txn_, table.get(),
           std::make_shared<ConstantExecutor>(std::move(rows)), exec_mode,
           CompliancePrimaryKeyMode(), upsert_offsets,
-          insert.AssertRowsModified()));
+          insert.AssertRowsModified(), std::move(fk_checks)));
     }
     case StatementType::kSelect: {
       // Verify the concrete kind before releasing: a Type()/type mismatch
@@ -5947,6 +6602,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         result_column_names_.push_back(
             item.name.empty() ? item.expression->ToString() : item.name);
       }
+      const bool has_table_sample = std::ranges::any_of(
+          select->Sources(),
+          [](const SelectSource& source) { return source.sample.has_value(); });
       const auto emit_relational = [&]() -> StatusOr<Executor> {
         std::vector<Column> columns;
         columns.reserve(result_column_names_.size());
@@ -5963,6 +6621,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         return optimized.Value()->EmitExecutor(ctx);
       };
+      const bool sampled_relational_source = std::ranges::any_of(
+          select->Sources(), [](const SelectSource& source) {
+            return source.sample.has_value() &&
+                   (source.query != nullptr || source.unnest ||
+                    source.table.empty());
+          });
+      if (sampled_relational_source) {
+        return emit_relational();
+      }
       // An explicit LIMIT 0 yields zero rows on every route (relational or
       // optimizer); neither LimitExecutor nor LimitedRows can express that
       // because they read limit==0 as "unbounded" (§6.3).
@@ -5992,6 +6659,17 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const bool has_lateral =
           std::any_of(select->Sources().begin(), select->Sources().end(),
                       [](const SelectSource& s) { return s.is_lateral; });
+      const bool lateral_join_needs_relational =
+          has_lateral &&
+          std::any_of(select->Sources().begin(), select->Sources().end(),
+                      [](const SelectSource& s) {
+                        return !s.using_columns.empty() ||
+                               s.join_type == JoinType::kLeft ||
+                               s.join_type == JoinType::kRight ||
+                               s.join_type == JoinType::kFull ||
+                               s.join_condition != nullptr ||
+                               s.from_nested_join;
+                      });
       const bool can_decorrelate_subqueries =
           CanUseDecorrelatedSubqueryOptimizer(*select);
       const bool simple_count_star =
@@ -6136,8 +6814,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // filter pushdown), feeding the grouping finish pipeline (GroupByPlan).
         // Routing reads the post-rewrite shape: flattened/inlined inputs are
         // plain by now, while genuinely complex shapes stay relational.
-        if (!force_relational_fallback_ && select->Sources().size() > 1 &&
-            has_grouping && !simple_count_star && !select->Qualify() &&
+        if (!force_relational_fallback_ && !has_table_sample &&
+            select->Sources().size() > 1 && has_grouping &&
+            !simple_count_star && !select->Qualify() &&
             !relational_detail::HasWindowFunctions(*select) &&
             select->WithQueries().empty() && sources_plain &&
             outer_bridge_slice &&
@@ -6203,8 +6882,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                               });
       if ((has_unnest || has_lateral ||
            (has_recursive_cte && !has_plain_cte && !touches_query)) &&
-          !unnest_join_needs_relational && !select_list_touches_query &&
-          !select->Qualify() &&
+          !unnest_join_needs_relational && !lateral_join_needs_relational &&
+          !select_list_touches_query && !select->Qualify() &&
           !relational_detail::HasWindowFunctions(*select)) {
         StatusOr<Executor> unnest_exec = ExecuteUnnestSelect(*select, ctx);
         if (unnest_exec.HasValue()) {
@@ -6243,7 +6922,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                 return relational_detail::ContainsAggregate(item.expression);
               }) ||
           relational_detail::ContainsAggregate(select->Having());
-      if (multi_relation && has_aggregate) {
+      if (multi_relation && has_aggregate && !has_table_sample) {
         return emit_relational();
       }
       // Post-projection ORDER BY scope: the adapter normalizes computed keys
@@ -6251,7 +6930,59 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // a post-plan SortExecutor covers plans that do not enforce ordering,
       // so computed ordering no longer forces the relational path.
       QueryData query;
-      Expression where = select->WhereClause();
+      // Stamp literals in SQL-text order before the optimizer sorts
+      // conjuncts. Identical values (warehouse 1 AND district 1) would
+      // otherwise be numbered by plan-tree position and bind swapped.
+      SqlLiteralSlots literal_slots;
+      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
+          !plan_cache_parameters_.empty() && select->WithQueries().empty() &&
+          !select->HasDistinctOn() && select->UnionAll().empty() &&
+          select->GetSetOperationTree() == nullptr) {
+        literal_slots.parameters = &plan_cache_parameters_;
+      }
+      std::vector<Expression> slotted_select;
+      slotted_select.reserve(select->SelectList().size());
+      for (const NamedExpression& item : select->SelectList()) {
+        slotted_select.push_back(literal_slots.Apply(item.expression));
+      }
+      std::vector<Expression> slotted_joins;
+      slotted_joins.reserve(select->Sources().size());
+      std::vector<std::optional<TableSampleSpec>> slotted_samples;
+      slotted_samples.reserve(select->Sources().size());
+      for (const SelectSource& source : select->Sources()) {
+        if (source.query != nullptr) {
+          literal_slots.ok = false;
+        }
+        if (source.sample) {
+          TableSampleSpec sample = *source.sample;
+          sample.size = literal_slots.Apply(sample.size);
+          for (Expression& partition : sample.partition_by) {
+            partition = literal_slots.Apply(partition);
+          }
+          if (sample.repeatable_seed) {
+            sample.repeatable_seed =
+                literal_slots.Apply(*sample.repeatable_seed);
+          }
+          slotted_samples.push_back(std::move(sample));
+        } else {
+          slotted_samples.push_back(std::nullopt);
+        }
+        slotted_joins.push_back(literal_slots.Apply(source.join_condition));
+      }
+      const Expression slotted_where =
+          literal_slots.Apply(select->WhereClause());
+      for (const Expression& key : select->GroupBy()) {
+        (void)literal_slots.Apply(key);
+      }
+      (void)literal_slots.Apply(select->Having());
+      const Expression slotted_qualify = literal_slots.Apply(select->Qualify());
+      std::vector<Expression> slotted_order;
+      slotted_order.reserve(select->OrderBy().size());
+      for (const auto& term : select->OrderBy()) {
+        slotted_order.push_back(literal_slots.Apply(term.expression));
+      }
+      const bool use_sql_slots = literal_slots.Complete();
+      Expression where = use_sql_slots ? slotted_where : select->WhereClause();
       std::unordered_set<std::string> seen_relations;
       for (size_t i = 0; i < select->Sources().size(); ++i) {
         const SelectSource& source = select->Sources()[i];
@@ -6263,7 +6994,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         if (!source.alias.empty() && source.alias != source.table) {
           query.aliases_.emplace(source.alias, source.table);
         }
-        if (source.join_condition) {
+        if (use_sql_slots && slotted_samples[i]) {
+          query.samples_.emplace(source.alias, std::move(*slotted_samples[i]));
+        } else if (source.sample) {
+          query.samples_.emplace(source.alias, *source.sample);
+        }
+        const Expression join_condition =
+            use_sql_slots ? slotted_joins[i] : source.join_condition;
+        if (join_condition) {
           // M6+1: a LEFT/RIGHT/FULL ON condition rides the outer-join
           // predicate, never WHERE (ON filters before NULL padding, WHERE
           // after). Anything beyond the optimizer's outer slice was already
@@ -6280,21 +7018,26 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             edge.join_kind = source.join_type == JoinType::kLeft    ? 0
                              : source.join_type == JoinType::kRight ? 1
                                                                     : 2;
-            edge.on_condition = source.join_condition;
+            edge.on_condition = join_condition;
             query.outer_joins_.push_back(std::move(edge));
           } else {
             where = where ? BinaryExpressionExp(where, BinaryOperation::kAnd,
-                                                source.join_condition)
-                          : source.join_condition;
+                                                join_condition)
+                          : join_condition;
           }
         }
       }
       query.where_ = where ? where : ConstantValueExp(Value(true));
       query.lifted_ctes_ = lifted;
-      query.qualify_ = select->Qualify();
+      query.qualify_ = use_sql_slots ? slotted_qualify : select->Qualify();
       query.select_.reserve(select->SelectList().size());
-      for (const NamedExpression& item : select->SelectList()) {
+      for (size_t item_index = 0; item_index < select->SelectList().size();
+           ++item_index) {
+        const NamedExpression& item = select->SelectList()[item_index];
         NamedExpression copied = item;
+        if (use_sql_slots) {
+          copied.expression = slotted_select[item_index];
+        }
         // The SQL visitor gives an unaliased `o.key` projection the display
         // name `key`.  QueryData's ProjectionPlan interprets a non-empty name
         // as a new unqualified schema column, which would hide `o.key` from
@@ -6319,9 +7062,19 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         bool has_star = false;
         std::string unknown_star_qualifier;
         for (const NamedExpression& item : query.select_) {
-          if (item.expression->Type() == TypeTag::kColumnValue) {
+          Expression star_expression = item.expression;
+          if (star_expression &&
+              star_expression->Type() == TypeTag::kFunctionCallExp) {
+            const auto& call = star_expression->AsFunctionCallExpression();
+            if (call.FuncName() == "__value_table_value" &&
+                call.Args().size() == 1) {
+              star_expression = call.Args()[0];
+            }
+          }
+          if (star_expression &&
+              star_expression->Type() == TypeTag::kColumnValue) {
             const ColumnName& column =
-                item.expression->AsColumnValue().GetColumnName();
+                star_expression->AsColumnValue().GetColumnName();
             if (column.name == "*") {
               has_star = true;
               bool matched_relation = false;
@@ -6330,6 +7083,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                 const std::string& physical = aliased == query.aliases_.end()
                                                   ? relation
                                                   : aliased->second;
+                const auto sample_source = std::ranges::find_if(
+                    select->Sources(), [&](const SelectSource& source) {
+                      return source.alias == relation;
+                    });
+                const TableSampleSpec* sample_spec =
+                    sample_source != select->Sources().end() &&
+                            sample_source->sample
+                        ? &*sample_source->sample
+                        : nullptr;
                 if (!column.schema.empty() && column.schema != relation &&
                     column.schema != physical) {
                   continue;
@@ -6353,6 +7115,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                     expanded.emplace_back(ColumnName(
                         relation, source_schema.GetColumn(i).Name().name));
                   }
+                  if (column.schema.empty() && sample_spec != nullptr &&
+                      sample_spec->with_weight) {
+                    expanded.emplace_back(
+                        sample_spec->weight_alias,
+                        ColumnValueExp(sample_spec->weight_alias));
+                  }
                   continue;
                 }
                 StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
@@ -6375,11 +7143,23 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                             {ColumnValueExp(base),
                              ConstantValueExp(Value(std::string(field)))}));
                   }
+                  if (column.schema.empty() && sample_spec != nullptr &&
+                      sample_spec->with_weight) {
+                    expanded.emplace_back(
+                        sample_spec->weight_alias,
+                        ColumnValueExp(sample_spec->weight_alias));
+                  }
                   continue;
                 }
                 for (size_t i = 0; i < source_schema.ColumnCount(); ++i) {
                   expanded.emplace_back(ColumnName(
                       relation, source_schema.GetColumn(i).Name().name));
+                }
+                if (column.schema.empty() && sample_spec != nullptr &&
+                    sample_spec->with_weight) {
+                  expanded.emplace_back(
+                      sample_spec->weight_alias,
+                      ColumnValueExp(sample_spec->weight_alias));
                 }
               }
               // A qualified star that matches no FROM relation would
@@ -6401,6 +7181,55 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         if (has_star && !expanded.empty()) {
           query.select_ = std::move(expanded);
+          if (has_table_sample) {
+            result_column_names_.clear();
+            result_column_names_.reserve(query.select_.size());
+            for (const NamedExpression& item : query.select_) {
+              result_column_names_.push_back(
+                  item.name.empty() ? item.expression->ToString() : item.name);
+            }
+          }
+        }
+      }
+      // GoogleSQL: a bare integer ORDER BY item is a SELECT-list ordinal.
+      // The AST visitor defers it when the select list still contained an
+      // unexpanded star; the list is expanded into query.select_ by now.
+      // Rewrite the statement's terms in place so every downstream consumer
+      // (required ordering, post-plan sort, safety-net sort) sees the
+      // resolved output column instead of a constant that sorts identically
+      // on every row.
+      if (!select->OrderBy().empty()) {
+        auto resolved_orders = select->OrderBy();
+        bool orders_changed = false;
+        for (SelectStatement::OrderByTerm& order : resolved_orders) {
+          const Expression& expression = order.expression;
+          if (!expression || expression->Type() != TypeTag::kConstantValue ||
+              dynamic_cast<const ParameterSlot*>(expression.get()) != nullptr) {
+            continue;
+          }
+          const Value& ordinal_value = expression->AsConstantValue().GetValue();
+          if (ordinal_value.type != ValueType::kInt64 ||
+              ordinal_value.IsNull() || ordinal_value.value.int_value < 1) {
+            continue;
+          }
+          const auto ordinal =
+              static_cast<size_t>(ordinal_value.value.int_value);
+          const Expression& target = ordinal <= query.select_.size()
+                                         ? query.select_[ordinal - 1].expression
+                                         : nullptr;
+          // A star cannot expand here (single-source shapes expand above;
+          // anything else stays unsupported), so leave the constant for the
+          // per-term check below to report.
+          if (!target ||
+              (target->Type() == TypeTag::kColumnValue &&
+               target->AsColumnValue().GetColumnName().name == "*")) {
+            continue;
+          }
+          order.expression = target;
+          orders_changed = true;
+        }
+        if (orders_changed) {
+          select->SetOrderBy(std::move(resolved_orders));
         }
       }
       const size_t visible_columns = query.select_.size();
@@ -6409,7 +7238,31 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       bool order_needs_projection_binding = false;
       sort_expressions.reserve(select->OrderBy().size());
       for (size_t i = 0; i < select->OrderBy().size(); ++i) {
-        const auto& order = select->OrderBy()[i];
+        auto order = select->OrderBy()[i];
+        if (use_sql_slots) {
+          order.expression = slotted_order[i];
+        }
+        // GoogleSQL: a bare integer ORDER BY item is a SELECT-list ordinal.
+        // The AST visitor defers it when the select list still contained an
+        // unexpanded star; the list is expanded here, so swap the constant
+        // for the ordinal's source expression and let the normal binding
+        // below handle aliases and output naming.
+        if (order.expression &&
+            order.expression->Type() == TypeTag::kConstantValue) {
+          const Value& ordinal_value =
+              order.expression->AsConstantValue().GetValue();
+          if (ordinal_value.type == ValueType::kInt64 &&
+              !ordinal_value.IsNull() && ordinal_value.value.int_value >= 1) {
+            const auto ordinal =
+                static_cast<size_t>(ordinal_value.value.int_value);
+            if (ordinal > query.select_.size() ||
+                !query.select_[ordinal - 1].expression) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "ORDER BY ordinal out of range");
+            }
+            order.expression = query.select_[ordinal - 1].expression;
+          }
+        }
         order_needs_projection_binding =
             order_needs_projection_binding ||
             order.expression->Type() != TypeTag::kColumnValue;
@@ -6648,7 +7501,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // Phase 2-1 fill: capture the compiled plan plus the executor-shape
       // metadata so identical-parameter repeats skip parse/bind/rewrite/
       // optimize entirely. Only optimizer-route statements reach this point.
-      if (!plan_cache_fingerprint_.empty()) {
+      if (!plan_cache_fingerprint_.empty() && !multi_relation) {
         auto shape = std::make_shared<CompiledPlan::SelectShape>();
         shape->column_names = result_column_names_;
         shape->order_expressions = query.order_expressions_;
@@ -6670,6 +7523,10 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         compiled->database = database_;
         compiled->epoch = database_->SchemaEpoch();
         compiled->parameters = plan_cache_parameters_;
+        if (!dml_fold_applied_) {
+          compiled->parameter_slots =
+              InstallPlanSlots(plan, plan_cache_parameters_);
+        }
         compiled->plan = plan;
         // The plan tree borrows fill-time Tables (and their indexes) that only
         // this transaction context owns; pin them so cache hits after this
@@ -6692,6 +7549,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                        ctx.GetTable(update.TableName()));
       last_dml_table_ = update.TableName();
+      if (!update.HasNestedDml()) {
+        // SET values share the WHERE clause's prepare-time subquery fold;
+        // a correlated or WITH-bearing inner keeps its legacy route.
+        for (auto& [target, value] :
+             dynamic_cast<UpdateStatement&>(*statement).MutableSetClause()) {
+          ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
+          value = std::move(folded);
+        }
+      }
       if (update.HasNestedDml()) {
         // Nested per-row array DML: rows are rewritten element-wise here
         // because array mutations are not expressible as plain projections.
@@ -6796,6 +7662,23 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                            : expr;
           };
           where_clause = bind_alias(where_clause);
+        }
+      }
+      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
+          !plan_cache_parameters_.empty() && !update.HasAssert()) {
+        SqlLiteralSlots literal_slots;
+        literal_slots.parameters = &plan_cache_parameters_;
+        std::vector<Expression> slotted_sets;
+        slotted_sets.reserve(set_clause.size());
+        for (const auto& clause : set_clause) {
+          slotted_sets.push_back(literal_slots.Apply(clause.second));
+        }
+        const Expression slotted_where = literal_slots.Apply(where_clause);
+        if (literal_slots.Complete()) {
+          for (size_t i = 0; i < set_clause.size(); ++i) {
+            set_clause[i].second = std::move(slotted_sets[i]);
+          }
+          where_clause = slotted_where;
         }
       }
       output.reserve(schema.ColumnCount());
@@ -6951,13 +7834,27 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           where_clause ? where_clause : ConstantValueExp(Value(true));
       query.select_ = std::move(output);
       query.require_row_position_ = true;
+      if (where_clause) {
+        ASSIGN_OR_RETURN(Expression, decorated_where,
+                         DecorateDmlWhere(ctx, where_clause));
+        query.where_ = decorated_where;
+      }
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-      if (!update.HasAssert()) {
+      std::vector<Expression> parameter_slots;
+      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
+          !update.HasAssert() && !CompliancePrimaryKeyMode()) {
+        parameter_slots = InstallPlanSlots(plan, plan_cache_parameters_);
+      }
+      if (!update.HasAssert() && !dml_fold_applied_ &&
+          !CompliancePrimaryKeyMode()) {
+        // Bug 57: a prepare-time subquery fold bakes the inner rows' values
+        // into the plan; re-preparing the same text after those rows change
+        // must not reuse the specialized plan.
         RememberSpecializedPlan(
             plan_cache_fingerprint_, database_->SchemaEpoch(),
             plan_cache_parameters_, CompiledPlan::Kind::kUpdate, plan, table,
-            database_, ctx);
+            database_, ctx, std::move(parameter_slots));
       }
       // Compliance primary-key mode: UPDATEs assigning the first column must
       // keep the emulated key unique and duplicate-free.
@@ -6970,9 +7867,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           }
         }
       }
+      ASSIGN_OR_RETURN(std::vector<ForeignKeyCheck>, fk_checks,
+                       (ResolveForeignKeyChecks(ctx, *table)));
+      ASSIGN_OR_RETURN(std::vector<ReferencedByCheck>, ref_checks,
+                       (ResolveReferencedByChecks(database_, ctx, *table)));
       return Executor(std::make_shared<Update>(
           ctx.txn_, table.get(), plan->EmitExecutor(ctx),
-          update.AssertRowsModified(), update_touches_primary_key));
+          update.AssertRowsModified(), update_touches_primary_key,
+          std::move(fk_checks), std::move(ref_checks)));
     }
     case StatementType::kDelete: {
       const auto& remove = dynamic_cast<const DeleteStatement&>(*statement);
@@ -7054,6 +7956,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         };
         where_clause = bind_proto_fields(where_clause);
       }
+      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
+          !plan_cache_parameters_.empty() && !remove.HasAssert()) {
+        SqlLiteralSlots literal_slots;
+        literal_slots.parameters = &plan_cache_parameters_;
+        const Expression slotted_where = literal_slots.Apply(where_clause);
+        if (literal_slots.Complete()) {
+          where_clause = slotted_where;
+        }
+      }
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         output.emplace_back(schema.GetColumn(i).Name());
       }
@@ -7064,17 +7975,29 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       query.select_ = std::move(output);
       query.require_row_position_ = true;
       query.wait_for_write_intent_ = false;
+      if (where_clause) {
+        ASSIGN_OR_RETURN(Expression, decorated_where,
+                         DecorateDmlWhere(ctx, where_clause));
+        query.where_ = decorated_where;
+      }
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-      if (!remove.HasAssert()) {
+      std::vector<Expression> parameter_slots;
+      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
+          !remove.HasAssert()) {
+        parameter_slots = InstallPlanSlots(plan, plan_cache_parameters_);
+      }
+      if (!remove.HasAssert() && !dml_fold_applied_) {
         RememberSpecializedPlan(
             plan_cache_fingerprint_, database_->SchemaEpoch(),
             plan_cache_parameters_, CompiledPlan::Kind::kDelete, plan, table,
-            database_, ctx);
+            database_, ctx, std::move(parameter_slots));
       }
+      ASSIGN_OR_RETURN(std::vector<ReferencedByCheck>, ref_checks,
+                       (ResolveReferencedByChecks(database_, ctx, *table)));
       return Executor(std::make_shared<DeleteExecutor>(
           ctx.txn_, *table, plan->EmitExecutor(ctx),
-          remove.AssertRowsModified()));
+          remove.AssertRowsModified(), std::move(ref_checks)));
     }
     case StatementType::kDropTable: {
       const auto& drop = dynamic_cast<const DropTableStatement&>(*statement);
@@ -7106,17 +8029,59 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
   if (!compiled) {
     return std::nullopt;
   }
+  if (CompliancePrimaryKeyMode() &&
+      (compiled->kind == CompiledPlan::Kind::kInsert ||
+       compiled->kind == CompiledPlan::Kind::kUpdate)) {
+    return std::nullopt;
+  }
+  const auto same_incarnation = [&](const Table& expected) {
+    if (ctx.GetCatalog() == nullptr) {
+      return false;
+    }
+    StatusOr<Table> current =
+        ctx.GetCatalog()->GetTable(ctx, expected.GetSchema().Name());
+    return current.HasValue() &&
+           current.Value().Incarnation() == expected.Incarnation();
+  };
+  bool valid = true;
+  for (const auto& table : compiled->retained_tables) {
+    if (table == nullptr || !same_incarnation(*table)) {
+      valid = false;
+      break;
+    }
+  }
+  if (compiled->table != nullptr && !same_incarnation(*compiled->table)) {
+    valid = false;
+  }
+  if (compiled->insert_shape != nullptr &&
+      compiled->insert_shape->table != nullptr &&
+      !same_incarnation(*compiled->insert_shape->table)) {
+    valid = false;
+  }
+  if (!valid) {
+    PlanCacheStats().epoch_invalidations.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    ForgetThreadCompiledPlan(fingerprint);
+    return std::nullopt;
+  }
   RememberThreadCompiledPlan(fingerprint, compiled);
-  // Specialized tiers replay only with identical parameters: identical
-  // parameters imply an identical bound statement, so the baked constants
-  // and index ranges of the fill-time plan remain correct. Differing
-  // literals fall back to a fresh compile, which then re-specializes the
-  // entry (adaptive refresh).
-  if (compiled->kind != CompiledPlan::Kind::kInsert &&
-      compiled->parameters != parameters) {
+  if (!compiled->parameter_slots.empty()) {
+    for (const Expression& expression : compiled->parameter_slots) {
+      auto* slot = dynamic_cast<ParameterSlot*>(expression.get());
+      if (slot == nullptr || slot->Index() >= parameters.size() ||
+          slot->ExpectedType() != parameters[slot->Index()].type) {
+        PlanCacheStats().parameter_mismatches.fetch_add(
+            1, std::memory_order_relaxed);
+        return std::nullopt;
+      }
+      slot->Bind(parameters[slot->Index()]);
+    }
+  } else if (compiled->kind != CompiledPlan::Kind::kInsert &&
+             compiled->parameters != parameters) {
+    // The shape could not keep its slots. Recompile and replace the entry;
+    // do not retire the fingerprint after a few mismatches.
     PlanCacheStats().parameter_mismatches.fetch_add(1,
                                                     std::memory_order_relaxed);
-    NoteSpecializedParameterMismatch(fingerprint);
     return std::nullopt;
   }
   try {
@@ -7129,7 +8094,9 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
         last_statement_type_ = StatementType::kSelect;
         result_column_names_ = compiled->select_shape->column_names;
         PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
-        return RetainCompiledPlan(std::move(*served), compiled);
+        Executor timed = std::make_shared<TimedSelectReuse>(
+            std::move(*served), fingerprint, compiled);
+        return RetainCompiledPlan(std::move(timed), compiled);
       }
       case CompiledPlan::Kind::kInsert: {
         std::optional<Executor> served =
@@ -7149,23 +8116,36 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
       case CompiledPlan::Kind::kUpdate: {
         last_statement_type_ = StatementType::kUpdate;
         last_dml_table_ = compiled->table->GetSchema().Name();
+        StatusOr<std::vector<ForeignKeyCheck>> fk_checks =
+            ResolveForeignKeyChecks(ctx, *compiled->table);
+        StatusOr<std::vector<ReferencedByCheck>> ref_checks =
+            ResolveReferencedByChecks(database_, ctx, *compiled->table);
+        if (!fk_checks.HasValue() || !ref_checks.HasValue()) {
+          break;
+        }
         Executor executor = std::make_shared<Update>(
-            ctx.txn_, compiled->table.get(), compiled->plan->EmitExecutor(ctx));
+            ctx.txn_, compiled->table.get(), compiled->plan->EmitExecutor(ctx),
+            /*assert_rows_modified=*/-1, /*enforce_primary_key=*/false,
+            fk_checks.MoveValue(), ref_checks.MoveValue());
         PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
         return RetainCompiledPlan(std::move(executor), compiled);
       }
       case CompiledPlan::Kind::kDelete: {
         last_statement_type_ = StatementType::kDelete;
         last_dml_table_ = compiled->table->GetSchema().Name();
+        StatusOr<std::vector<ReferencedByCheck>> ref_checks =
+            ResolveReferencedByChecks(database_, ctx, *compiled->table);
+        if (!ref_checks.HasValue()) {
+          break;
+        }
         Executor executor = std::make_shared<DeleteExecutor>(
-            ctx.txn_, *compiled->table, compiled->plan->EmitExecutor(ctx));
+            ctx.txn_, *compiled->table, compiled->plan->EmitExecutor(ctx),
+            /*assert_rows_modified=*/-1, ref_checks.MoveValue());
         PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
         return RetainCompiledPlan(std::move(executor), compiled);
       }
     }
-  } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) // Any
-                                     // fast-path doubt falls back to the
-                                     // authoritative legacy compile.
+  } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
   }
   return std::nullopt;
 }

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -30,6 +31,9 @@ constexpr const char* kTestHeader = "-- tinylamb-aggregate-test v1";
 constexpr int64_t kNullRepr = INT64_MIN;
 constexpr std::array<std::string_view, 6> kCmpOps = {"=",  "!=", "<",
                                                      "<=", ">",  ">="};
+// __int128 in a typedef position would trip -Wpedantic under the strict
+// warning tier; the extension marker silences it at the single definition.
+__extension__ typedef __int128 int128_t;
 
 class Gen {
  public:
@@ -117,6 +121,107 @@ std::vector<std::string> FormatRows(
   }
   std::sort(out.begin(), out.end());
   return out;
+}
+
+// DOUBLE sums differ in their last ulps depending on accumulation order
+// (mirror sums rows sequentially; the engine folds partial-aggregate
+// trees). A string-equal comparison would flag those as wrong results,
+// so mismatch candidates get a numeric second look: cells are split on
+// the "|...|," format, finite doubles compare with a relative epsilon,
+// and rows are matched as a multiset.
+bool CellAlmostEqual(const std::string& lhs, const std::string& rhs) {
+  if (lhs == rhs) {
+    return true;
+  }
+  const auto parse = [](const std::string& cell) -> std::optional<double> {
+    if (cell.size() < 3 || cell.front() != '|' || cell.back() != '|') {
+      return std::nullopt;
+    }
+    const std::string body = cell.substr(1, cell.size() - 2);
+    if (body.find_first_of("eE") == std::string::npos &&
+        body.find('.') == std::string::npos) {
+      return std::nullopt;
+    }
+    size_t pos = 0;
+    try {
+      const double v = std::stod(body, &pos);
+      if (pos != body.size() || !std::isfinite(v)) {
+        return std::nullopt;
+      }
+      return v;
+    } catch (...) {
+      return std::nullopt;
+    }
+  };
+  const std::optional<double> a = parse(lhs);
+  const std::optional<double> b = parse(rhs);
+  if (!a.has_value() || !b.has_value()) {
+    return false;
+  }
+  const double scale = std::max({1.0, std::abs(*a), std::abs(*b)});
+  return std::abs(*a - *b) <= 1e-9 * scale;
+}
+
+bool RowAlmostEqual(const std::string& lhs, const std::string& rhs) {
+  // A formatted row is a run of "NULL," or "|body|," cells.
+  const auto cells = [](const std::string& row) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < row.size()) {
+      if (row[i] == '|') {
+        const size_t j = row.find('|', i + 1);
+        if (j == std::string::npos) {
+          out.push_back(row.substr(i));
+          break;
+        }
+        out.push_back(row.substr(i, j - i + 1));
+        i = j + 1;
+      } else if (row.compare(i, 4, "NULL") == 0) {
+        out.emplace_back("NULL");
+        i += 4;
+      } else {
+        out.push_back(row.substr(i));
+        break;
+      }
+      if (i < row.size() && row[i] == ',') {
+        ++i;
+      }
+    }
+    return out;
+  };
+  const std::vector<std::string> a = cells(lhs);
+  const std::vector<std::string> b = cells(rhs);
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (!CellAlmostEqual(a[i], b[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RowsAlmostEqual(const std::vector<std::string>& actual,
+                     const std::vector<std::string>& expected) {
+  if (actual.size() != expected.size()) {
+    return false;
+  }
+  std::vector<bool> used(expected.size(), false);
+  for (const std::string& row : actual) {
+    bool matched = false;
+    for (size_t j = 0; j < expected.size(); ++j) {
+      if (!used[j] && RowAlmostEqual(row, expected[j])) {
+        used[j] = true;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,35 +372,89 @@ struct AggSpec {
     kSumDistinct,
     kAvg,
     kAvgDistinct,
-    kCountIf
+    kCountIf,
+    kBitAnd,
+    kBitOr,
+    kBitXor,
+    kLogicalAnd,
+    kLogicalOr,
+    kStringAgg,
+    kArrayAgg,
+    kVarPop,
+    kVarSamp,
+    kStddevPop,
+    kStddevSamp
   } kind{kCountStar};
-  // Optional FILTER (WHERE ...) predicate; only rows evaluating TRUE
-  // feed the aggregate.
-  std::shared_ptr<const WPred> filter;
-  WPredPtr cond;  // kCountIf only
+  // Optional inline-WHERE predicate (GoogleSQL `AGG(arg WHERE cond)`);
+  // only rows evaluating TRUE feed the aggregate.
+  std::shared_ptr<const WPred> filter{nullptr};
+  WPredPtr cond{nullptr};  // kCountIf / kLogicalAnd / kLogicalOr only
+  size_t where_pos{0};     // sql index where " WHERE cond" is inserted
+  bool distinct{false};    // kArrayAgg only
+  bool order_desc{false};  // inner ORDER BY u direction
+  int inner_limit{0};      // inner LIMIT (0 = none)
+  std::string delim{","};  // kStringAgg only
+  // Optional HAVING MIN/MAX modifier: gates the group to rows whose
+  // condition column equals the group's extremum (NULL conditions drop out).
+  int having_col{-1};  // -1 = no modifier; otherwise int column index
+  bool having_min{false};
 };
 
-// Rows of `input` satisfying the spec's FILTER clause (all of them when
-// unset).
+// Rows of `input` satisfying the spec's inline-WHERE clause (all of them
+// when unset), then gated by the HAVING MIN/MAX extremum when present.
 std::vector<MRow> FilteredRows(const AggSpec& spec,
                                const std::vector<MRow>& input) {
-  if (!spec.filter) {
-    return input;
-  }
   std::vector<MRow> out;
   for (const MRow& r : input) {
-    if (spec.filter->Eval(r) == 'T') {
+    if (!spec.filter || spec.filter->Eval(r) == 'T') {
       out.push_back(r);
     }
   }
+  if (spec.having_col >= 0) {
+    bool any = false;
+    int64_t extremum = 0;
+    for (const MRow& r : out) {
+      const int64_t c = CellOf(r, spec.having_col);
+      if (c == kNullRepr) {
+        continue;
+      }
+      if (!any || (spec.having_min ? c < extremum : extremum < c)) {
+        extremum = c;
+        any = true;
+      }
+    }
+    std::vector<MRow> gated;
+    for (const MRow& r : out) {
+      if (any && CellOf(r, spec.having_col) == extremum) {
+        gated.push_back(r);
+      }
+    }
+    out = std::move(gated);
+  }
   return out;
+}
+
+// FilteredRows plus the inner ORDER BY u [DESC] / LIMIT n modifiers.  Rows
+// arrive in ascending u order, so DESC is a reversal; LIMIT then counts
+// ordered rows (NULLs included) before aggregate-specific null handling.
+std::vector<MRow> PreparedRows(const AggSpec& spec,
+                               const std::vector<MRow>& input) {
+  std::vector<MRow> rows = FilteredRows(spec, input);
+  if (spec.order_desc) {
+    std::reverse(rows.begin(), rows.end());
+  }
+  if (spec.inner_limit > 0 &&
+      rows.size() > static_cast<size_t>(spec.inner_limit)) {
+    rows.resize(static_cast<size_t>(spec.inner_limit));
+  }
+  return rows;
 }
 
 // Numeric value of an aggregate over a group, when it is one (COUNT/SUM);
 // used by the HAVING mirror.
 std::optional<int64_t> AggNum(const AggSpec& spec,
                               const std::vector<MRow>& input) {
-  const std::vector<MRow> rows = FilteredRows(spec, input);
+  const std::vector<MRow> rows = PreparedRows(spec, input);
   switch (spec.kind) {
     case AggSpec::Kind::kCountStar:
       return static_cast<int64_t>(rows.size());
@@ -314,7 +473,7 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
         return std::nullopt;  // double sums never feed HAVING comparisons
       }
       bool any = false;
-      __int128 sum = 0;  // extremes must not UB the mirror
+      int128_t sum = 0;  // extremes must not UB the mirror
       std::vector<int64_t> seen;
       for (const MRow& r : rows) {
         const int64_t v = CellOf(r, spec.col);
@@ -352,7 +511,7 @@ std::optional<int64_t> AggNum(const AggSpec& spec,
 }
 
 std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
-  const std::vector<MRow> rows = FilteredRows(spec, input);
+  const std::vector<MRow> rows = PreparedRows(spec, input);
   switch (spec.kind) {
     case AggSpec::Kind::kCountStar:
       return FmtInt(static_cast<int64_t>(rows.size()));
@@ -478,9 +637,140 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
         ++cnt;
       }
       if (cnt == 0) {
-        return std::string("NULL");
+        return {"NULL"};
       }
-      return "|" + FormatDoubleShortest(sum / static_cast<double>(cnt)) + "|";
+      return {"|" + FormatDoubleShortest(sum / static_cast<double>(cnt)) +
+              "|"};
+    }
+    case AggSpec::Kind::kBitAnd:
+    case AggSpec::Kind::kBitOr:
+    case AggSpec::Kind::kBitXor: {
+      // NULLs are skipped; an all-NULL or empty group yields NULL.
+      bool any = false;
+      int64_t acc = 0;
+      for (const MRow& r : rows) {
+        const int64_t v = CellOf(r, spec.col);
+        if (v == kNullRepr) {
+          continue;
+        }
+        if (!any) {
+          acc = v;
+          any = true;
+        } else if (spec.kind == AggSpec::Kind::kBitAnd) {
+          acc &= v;
+        } else if (spec.kind == AggSpec::Kind::kBitOr) {
+          acc |= v;
+        } else {
+          acc ^= v;
+        }
+      }
+      // XOR can legitimately yield INT64_MIN (== kNullRepr); format past
+      // the sentinel like SUM does.
+      return any ? "|" + std::to_string(acc) + "|" : std::string("NULL");
+    }
+    case AggSpec::Kind::kLogicalAnd:
+    case AggSpec::Kind::kLogicalOr: {
+      // NULL operands are ignored; no non-NULL input yields NULL.
+      bool any = false;
+      bool acc = spec.kind == AggSpec::Kind::kLogicalAnd;
+      for (const MRow& r : rows) {
+        const char v = spec.cond->Eval(r);
+        if (v == 'N') {
+          continue;
+        }
+        const bool b = v == 'T';
+        if (!any) {
+          acc = b;
+          any = true;
+        } else {
+          acc =
+              spec.kind == AggSpec::Kind::kLogicalAnd ? (acc && b) : (acc || b);
+        }
+      }
+      return any ? FmtInt(acc ? 1 : 0) : std::string("NULL");
+    }
+    case AggSpec::Kind::kStringAgg: {
+      // PreparedRows applied ORDER BY u [DESC] then LIMIT (counting rows,
+      // NULLs included); NULL elements are skipped at emit time.  Empty
+      // input yields NULL.
+      int emitted = 0;
+      std::string out;
+      for (const MRow& r : rows) {
+        if (r.s == kNullRepr) {
+          continue;
+        }
+        if (emitted++ != 0) {
+          out += spec.delim;
+        }
+        out += (r.s == 0 ? "x" : "yy");
+      }
+      if (emitted == 0) {
+        return {"NULL"};
+      }
+      return {"|\"" + out + "\"|"};
+    }
+    case AggSpec::Kind::kArrayAgg: {
+      // NULL elements are kept; DISTINCT collapses them to one.
+      // PreparedRows applied ORDER BY u [DESC] then LIMIT (counting ordered
+      // rows before NULL/dedup handling).
+      int emitted = 0;
+      std::string out;
+      std::vector<int64_t> seen;
+      bool saw_null = false;
+      for (const MRow& r : rows) {
+        const int64_t v = CellOf(r, spec.col);
+        if (spec.distinct) {
+          if (v == kNullRepr) {
+            if (saw_null) {
+              continue;
+            }
+            saw_null = true;
+          } else if (std::find(seen.begin(), seen.end(), v) != seen.end()) {
+            continue;
+          } else {
+            seen.push_back(v);
+          }
+        }
+        out += (emitted++ == 0 ? "" : ", ");
+        out += (v == kNullRepr ? "NULL" : std::to_string(v));
+      }
+      if (emitted == 0) {
+        return {"NULL"};
+      }
+      return {"|ARRAY<INT64>[" + out + "]|"};
+    }
+    case AggSpec::Kind::kVarPop:
+    case AggSpec::Kind::kVarSamp:
+    case AggSpec::Kind::kStddevPop:
+    case AggSpec::Kind::kStddevSamp: {
+      // Bit-exact mirror of the engine accumulator: long double sx/sxx.
+      // Generation restricts the column to the small int domain so the
+      // sums are exact regardless of morsel ordering.
+      const bool samp = spec.kind == AggSpec::Kind::kVarSamp ||
+                        spec.kind == AggSpec::Kind::kStddevSamp;
+      long double sx = 0.0L, sxx = 0.0L;
+      int64_t n = 0;
+      for (const MRow& r : rows) {
+        const int64_t v = CellOf(r, spec.col);
+        if (v == kNullRepr) {
+          continue;
+        }
+        const auto x = static_cast<long double>(v);
+        sx += x;
+        sxx += x * x;
+        ++n;
+      }
+      if (n < (samp ? 2 : 1)) {
+        return {"NULL"};
+      }
+      const long double mean = sx / static_cast<long double>(n);
+      const long double ssd = sxx - (static_cast<long double>(n) * mean * mean);
+      long double res = ssd / static_cast<long double>(samp ? n - 1 : n);
+      if (spec.kind == AggSpec::Kind::kStddevPop ||
+          spec.kind == AggSpec::Kind::kStddevSamp) {
+        res = std::sqrt(res);
+      }
+      return FmtDbl(static_cast<double>(res));
     }
   }
   return "NULL";
@@ -502,6 +792,11 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   const int row_count = large ? g.Pick(8300, 8450) : g.Pick(5, 12);
   std::string batch;
   int pending = 0;
+  // Per-column flag for INT64 extremes: VAR_*/STDDEV_* accumulation order
+  // is only bit-exact when every term stays inside the long-double
+  // mantissa, so those aggregates are generated only for extreme-free
+  // columns.
+  std::array<bool, 2> col_extreme{false, false};
   for (int i = 0; i < row_count; ++i) {
     MRow r;
     r.u = i;
@@ -510,9 +805,11 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     // INT64 extremes stress SUM/running aggregates (never kNullRepr).
     if (g.Chance(8)) {
       r.a = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
+      col_extreme[0] = true;
     }
     if (g.Chance(8)) {
       r.b = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
+      col_extreme[1] = true;
     }
     r.s = g.Chance(15) ? kNullRepr : g.Pick(0, 1);
     r.f_null = g.Chance(25);
@@ -638,6 +935,14 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       if (g.Chance(30)) {
         aggs.push_back({"COUNT(f)", 3, AggSpec::Kind::kCount});
       }
+      if (g.Chance(30)) {
+        // ANY_VALUE normalizes to MIN in the frontend, so the mirror can
+        // reuse the kMin computation verbatim.  With a HAVING MIN/MAX
+        // modifier this is the argmin/argmax idiom.
+        const int acol = g.Pick(0, 2);
+        aggs.push_back(
+            {"ANY_VALUE(" + ColName(acol) + ")", acol, AggSpec::Kind::kMin});
+      }
       if (g.Chance(15)) {
         aggs.push_back({"AVG(DISTINCT f)", 3, AggSpec::Kind::kAvgDistinct});
       }
@@ -651,15 +956,138 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         ci.kind = AggSpec::Kind::kCountIf;
         aggs.push_back(std::move(ci));
       }
-      // FILTER (WHERE ...) on some specs.
-      for (AggSpec& spec : aggs) {
-        if (spec.kind == AggSpec::Kind::kCountIf) {
-          continue;  // COUNTIF already carries its own condition
+      if (g.Chance(30)) {
+        // Bitwise aggregates over a nullable int column; NULLs skipped.
+        const int bcol = g.Pick(0, 1);
+        static constexpr std::array<const char*, 3> kBitFn = {
+            "BIT_AND", "BIT_OR", "BIT_XOR"};
+        static constexpr std::array<AggSpec::Kind, 3> kBitKind = {
+            AggSpec::Kind::kBitAnd, AggSpec::Kind::kBitOr,
+            AggSpec::Kind::kBitXor};
+        const int pick = g.Pick(0, 2);
+        aggs.push_back({std::string(kBitFn[static_cast<size_t>(pick)]) + "(" +
+                            ColName(bcol) + ")",
+                        bcol, kBitKind[static_cast<size_t>(pick)]});
+      }
+      if (g.Chance(30)) {
+        // LOGICAL_AND/OR take a boolean expression; NULL operands are
+        // ignored and all-NULL groups yield NULL.
+        AggSpec la;
+        la.cond = GenWhere(g, 1);
+        la.kind = g.Chance(50) ? AggSpec::Kind::kLogicalAnd
+                               : AggSpec::Kind::kLogicalOr;
+        la.sql = (la.kind == AggSpec::Kind::kLogicalAnd ? "LOGICAL_AND("
+                                                        : "LOGICAL_OR(") +
+                 la.cond->Render() + ")";
+        la.where_pos = la.sql.size() - 1;
+        aggs.push_back(std::move(la));
+      }
+      if (g.Chance(30)) {
+        // STRING_AGG ordered by u for determinism, with optional explicit
+        // delimiter and inner LIMIT (which counts rows, NULLs included).
+        AggSpec sa;
+        sa.kind = AggSpec::Kind::kStringAgg;
+        sa.col = 2;
+        sa.order_desc = g.Chance(25);
+        sa.inner_limit = g.Chance(25) ? g.Pick(1, 3) : 0;
+        const bool with_delim = g.Chance(70);
+        sa.delim = with_delim && g.Chance(40) ? "-" : ",";
+        std::string base = "STRING_AGG(s";
+        if (with_delim) {
+          base += ", '" + sa.delim + "'";
         }
-        if (g.Chance(25)) {
+        sa.where_pos = base.size();
+        sa.sql =
+            base + (sa.order_desc ? " ORDER BY u DESC" : " ORDER BY u") +
+            (sa.inner_limit != 0 ? " LIMIT " + std::to_string(sa.inner_limit)
+                                 : "") +
+            ")";
+        aggs.push_back(std::move(sa));
+      }
+      if (g.Chance(30)) {
+        // ARRAY_AGG keeps NULL elements; DISTINCT collapses them to one.
+        AggSpec aa;
+        aa.kind = AggSpec::Kind::kArrayAgg;
+        aa.col = g.Pick(0, 1);
+        aa.distinct = g.Chance(35);
+        aa.order_desc = g.Chance(25);
+        aa.inner_limit = g.Chance(25) ? g.Pick(1, 3) : 0;
+        std::string base =
+            "ARRAY_AGG(" +
+            (aa.distinct ? std::string("DISTINCT ") : std::string()) +
+            ColName(aa.col);
+        aa.where_pos = base.size();
+        aa.sql =
+            base + (aa.order_desc ? " ORDER BY u DESC" : " ORDER BY u") +
+            (aa.inner_limit != 0 ? " LIMIT " + std::to_string(aa.inner_limit)
+                                 : "") +
+            ")";
+        aggs.push_back(std::move(aa));
+      }
+      if (g.Chance(30)) {
+        // VAR_*/STDDEV_* only over extreme-free int columns: the mirror
+        // reproduces the long-double sx/sxx accumulator bit-exactly only
+        // when every term stays inside its mantissa.
+        std::vector<int> ok_cols;
+        for (int c = 0; c < 2; ++c) {
+          if (!col_extreme[static_cast<size_t>(c)]) {
+            ok_cols.push_back(c);
+          }
+        }
+        if (!ok_cols.empty()) {
+          const int vcol = ok_cols[static_cast<size_t>(
+              g.Pick(0, static_cast<int>(ok_cols.size()) - 1))];
+          static constexpr std::array<const char*, 4> kVarFn = {
+              "VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP"};
+          static constexpr std::array<AggSpec::Kind, 4> kVarKind = {
+              AggSpec::Kind::kVarPop, AggSpec::Kind::kVarSamp,
+              AggSpec::Kind::kStddevPop, AggSpec::Kind::kStddevSamp};
+          const int pick = g.Pick(0, 3);
+          aggs.push_back({std::string(kVarFn[static_cast<size_t>(pick)]) + "(" +
+                              ColName(vcol) + ")",
+                          vcol, kVarKind[static_cast<size_t>(pick)]});
+        }
+      }
+      // Inline WHERE (GoogleSQL `AGG(arg WHERE cond)`), HAVING MIN/MAX,
+      // and inner ORDER BY u/LIMIT modifiers.  Grammar order is
+      // `AGG(arg [WHERE c] [HAVING {MIN|MAX} e] [ORDER BY ...] [LIMIT n])`,
+      // so all insert at the same anchor: before ORDER BY/LIMIT when
+      // `where_pos` marks one, else before the closing paren.
+      for (AggSpec& spec : aggs) {
+        size_t pos = spec.where_pos != 0 ? spec.where_pos : spec.sql.size() - 1;
+        if (spec.kind != AggSpec::Kind::kCountIf && g.Chance(25)) {
+          // COUNTIF already carries its own condition.
           WPredPtr f = GenWhere(g, 1);
-          spec.sql += " FILTER (WHERE " + f->Render() + ")";
+          const std::string text = " WHERE " + f->Render();
+          spec.sql.insert(pos, text);
+          pos += text.size();
           spec.filter = std::shared_ptr<const WPred>(std::move(f));
+        }
+        // COUNT(*) has no argument to gate on; COUNTIF and LOGICAL_AND/OR
+        // carry a predicate expression rather than a plain column argument.
+        if (spec.kind != AggSpec::Kind::kCountStar &&
+            spec.kind != AggSpec::Kind::kCountIf &&
+            spec.kind != AggSpec::Kind::kLogicalAnd &&
+            spec.kind != AggSpec::Kind::kLogicalOr && g.Chance(20)) {
+          spec.having_col = g.Pick(0, 2);
+          spec.having_min = g.Chance(50);
+          const std::string text = std::string(" HAVING ") +
+                                   (spec.having_min ? "MIN " : "MAX ") +
+                                   ColName(spec.having_col);
+          spec.sql.insert(pos, text);
+          pos += text.size();
+        }
+        // STRING_AGG/ARRAY_AGG already carry ORDER BY/LIMIT in `sql`.
+        if (spec.kind != AggSpec::Kind::kStringAgg &&
+            spec.kind != AggSpec::Kind::kArrayAgg && g.Chance(15)) {
+          spec.order_desc = g.Chance(30);
+          std::string text =
+              spec.order_desc ? " ORDER BY u DESC" : " ORDER BY u";
+          if (g.Chance(60)) {
+            spec.inner_limit = g.Pick(1, 3);
+            text += " LIMIT " + std::to_string(spec.inner_limit);
+          }
+          spec.sql.insert(pos, text);
         }
       }
       // HAVING: 1-2 conditions over numeric aggregates (COUNT(*)/SUM(a),
@@ -676,20 +1104,22 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         for (int i = 0; i < ncond; ++i) {
           HavingCond c;
           if (g.Chance(30)) {
-            c.spec = {"SUM(a)", 0, AggSpec::Kind::kSum};
+            c.spec = {.sql = "SUM(a)", .col = 0, .kind = AggSpec::Kind::kSum};
             c.op = g.Chance(50) ? "IS NULL" : "IS NOT NULL";
           } else if (g.Chance(50)) {
-            c.spec = {"COUNT(*)", -1, AggSpec::Kind::kCountStar};
-            c.op = std::string(kCmpOps[g.Pick(0, 5)]);
+            c.spec = {.sql = "COUNT(*)",
+                      .col = -1,
+                      .kind = AggSpec::Kind::kCountStar};
+            c.op = std::string(kCmpOps[static_cast<size_t>(g.Pick(0, 5))]);
             c.rhs = g.Pick(0, 4);
           } else {
-            c.spec = {"SUM(a)", 0, AggSpec::Kind::kSum};
-            c.op = std::string(kCmpOps[g.Pick(0, 5)]);
+            c.spec = {.sql = "SUM(a)", .col = 0, .kind = AggSpec::Kind::kSum};
+            c.op = std::string(kCmpOps[static_cast<size_t>(g.Pick(0, 5))]);
             c.rhs = g.Pick(-4, 4);
           }
           if (!c.op.starts_with("IS") && g.Chance(20)) {
             WPredPtr f = GenWhere(g, 1);
-            c.spec.sql += " FILTER (WHERE " + f->Render() + ")";
+            c.spec.sql.insert(c.spec.sql.size() - 1, " WHERE " + f->Render());
             c.spec.filter = std::shared_ptr<const WPred>(std::move(f));
           }
           having.push_back(std::move(c));
@@ -716,10 +1146,11 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         // Choose 2-3 distinct subsets of the output key columns (incl.
         // the grand-total set).
         std::vector<std::vector<int>> all_subsets;
+        all_subsets.reserve(gcols.size());
         for (int c : gcols) {
           all_subsets.push_back({c});
         }
-        all_subsets.push_back({});  // grand total
+        all_subsets.emplace_back();  // grand total
         if (gcols.size() == 2) {
           all_subsets.push_back(gcols);
         }
@@ -731,7 +1162,21 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             idx = g.Pick(0, static_cast<int>(all_subsets.size()) - 1);
           }
           picked.push_back(idx);
-          gsets.push_back(all_subsets[idx]);
+          gsets.push_back(all_subsets[static_cast<size_t>(idx)]);
+        }
+        // Every selected key column must appear in at least one grouping
+        // set: a column outside the union of sets has no defined value
+        // (the engine leniently reports an arbitrary group member, which
+        // is not deterministic across plans). Append its singleton set so
+        // the oracle stays decidable.
+        for (const int c : gcols) {
+          const bool covered =
+              std::ranges::any_of(gsets, [c](const std::vector<int>& gset) {
+                return std::find(gset.begin(), gset.end(), c) != gset.end();
+              });
+          if (!covered) {
+            gsets.push_back({c});
+          }
         }
         sql += " GROUP BY GROUPING SETS (";
         for (size_t i = 0; i < gsets.size(); ++i) {
@@ -920,7 +1365,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           frame_lo = g.Pick(0, 2);
           frame_hi = g.Pick(0, 2);
           wagg = g.Pick(0, 3);
-          sql = "SELECT u, " + std::string(kWagg[wagg]) +
+          sql = "SELECT u, " + std::string(kWagg[static_cast<size_t>(wagg)]) +
                 "(b) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY u ROWS BETWEEN " + std::to_string(frame_lo) +
                 " PRECEDING AND " + std::to_string(frame_hi) +
@@ -943,11 +1388,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           wagg = g.Pick(0, 3);
           static constexpr std::array<const char*, 4> kExclude = {
               "", " EXCLUDE CURRENT ROW", " EXCLUDE GROUP", " EXCLUDE TIES"};
-          sql = "SELECT u, " + std::string(kWagg[wagg]) +
+          sql = "SELECT u, " + std::string(kWagg[static_cast<size_t>(wagg)]) +
                 "(b) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY a GROUPS BETWEEN " + std::to_string(frame_lo) +
                 " PRECEDING AND " + std::to_string(frame_hi) + " FOLLOWING" +
-                kExclude[exclude] + ") FROM t" + where_sql + ";";
+                kExclude[static_cast<size_t>(exclude)] + ") FROM t" +
+                where_sql + ";";
           break;
         }
         case 11: {
@@ -955,7 +1401,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           frame_lo = g.Pick(0, 2);
           frame_hi = g.Pick(0, 2);
           wagg = g.Pick(0, 3);
-          sql = "SELECT u, " + std::string(kWagg[wagg]) +
+          sql = "SELECT u, " + std::string(kWagg[static_cast<size_t>(wagg)]) +
                 "(b) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY a RANGE BETWEEN " + std::to_string(frame_lo) +
                 " PRECEDING AND " + std::to_string(frame_hi) +
@@ -970,11 +1416,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           wagg = g.Pick(0, 3);
           static constexpr std::array<const char*, 4> kExclude = {
               "", " EXCLUDE CURRENT ROW", " EXCLUDE GROUP", " EXCLUDE TIES"};
-          sql = "SELECT u, " + std::string(kWagg[wagg]) +
+          sql = "SELECT u, " + std::string(kWagg[static_cast<size_t>(wagg)]) +
                 "(b) OVER (PARTITION BY " + ColName(pcol) +
                 " ORDER BY a ROWS BETWEEN " + std::to_string(frame_lo) +
                 " PRECEDING AND " + std::to_string(frame_hi) + " FOLLOWING" +
-                kExclude[exclude] + ") FROM t" + where_sql + ";";
+                kExclude[static_cast<size_t>(exclude)] + ") FROM t" +
+                where_sql + ";";
           break;
         }
       }
@@ -1005,7 +1452,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
                    std::to_string(*std::max_element(vals.begin(), vals.end())) +
                    "|";
           default: {
-            __int128 sum = 0;
+            int128_t sum = 0;
             for (const int64_t v : vals) {
               sum += v;
             }
@@ -1050,7 +1497,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           }
           row += FmtInt(n) + ",";
         } else if (mode == 3) {
-          __int128 sum = 0;
+          int128_t sum = 0;
           bool any = false;
           bool overflow = false;
           for (const MRow* o : selected) {
@@ -1083,7 +1530,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         } else if (mode == 5) {
           // NTILE(n) within partition ordered by u: first (m % n) buckets
           // hold one extra row.
-          int64_t pos = 0, m = 0;
+          int64_t pos = 0, seen = 0;
           for (const MRow* o : selected) {
             if (CellOf(*o, pcol) != CellOf(*r, pcol)) {
               continue;
@@ -1091,13 +1538,13 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
             if (o->u < r->u) {
               ++pos;
             }
-            ++m;
+            ++seen;
           }
-          const int64_t base = m / ntile_n, rem = m % ntile_n;
+          const int64_t base = seen / ntile_n, rem = seen % ntile_n;
           const int64_t bucket =
               pos < rem * (base + 1)
-                  ? pos / (base + 1) + 1
-                  : rem + (pos - rem * (base + 1)) / base + 1;
+                  ? (pos / (base + 1)) + 1
+                  : rem + ((pos - rem * (base + 1)) / base) + 1;
           row += FmtInt(bucket) + ",";
         } else if (mode == 6) {
           // LAG(a,1)/LEAD(a,1) within partition ordered by u.
@@ -1227,15 +1674,17 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
                 in_frame = part[i]->a == kNullRepr;
               } else {
                 in_frame = part[i]->a != kNullRepr &&
-                           static_cast<__int128>(part[i]->a) >=
-                               static_cast<__int128>(r->a) - frame_lo &&
-                           static_cast<__int128>(part[i]->a) <=
-                               static_cast<__int128>(r->a) + frame_hi;
+                           static_cast<int128_t>(part[i]->a) >=
+                               static_cast<int128_t>(r->a) - frame_lo &&
+                           static_cast<int128_t>(part[i]->a) <=
+                               static_cast<int128_t>(r->a) + frame_hi;
               }
             } else {
               in_frame =
-                  i >= pos - std::min<size_t>(pos, frame_lo) &&
-                  i <= pos + std::min<size_t>(part.size() - 1 - pos, frame_hi);
+                  i >= pos - std::min<size_t>(pos,
+                                              static_cast<size_t>(frame_lo)) &&
+                  i <= pos + std::min<size_t>(part.size() - 1 - pos,
+                                              static_cast<size_t>(frame_hi));
             }
             if (!in_frame || excluded_at(i) || part[i]->b == kNullRepr) {
               continue;
@@ -1276,7 +1725,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     }
     const std::vector<std::string> actual = FormatRows(*got);
     t.queries.push_back({sql, expected});
-    if (actual == expected) {
+    if (actual == expected || RowsAlmostEqual(actual, expected)) {
       continue;
     }
     report += "[AGGREGATE MISMATCH] " + sql + "\n";
@@ -1324,7 +1773,7 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
     std::vector<std::string> actual = FormatRows(*got);
     std::vector<std::string> expected = q.expected;
     std::sort(expected.begin(), expected.end());
-    if (actual != expected) {
+    if (actual != expected && !RowsAlmostEqual(actual, expected)) {
       std::string report = "[AGGREGATE REPLAY MISMATCH] " + q.sql + "\n";
       report += "  expected:\n";
       for (const std::string& r : expected) {

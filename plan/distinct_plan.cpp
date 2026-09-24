@@ -2,6 +2,7 @@
 #include "distinct_plan.hpp"
 
 #include <cstddef>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -60,13 +61,24 @@ size_t SkipScanDistinctPlan::EmitRowCount() const {
 bool SkipScanDistinctPlan::IsOrderedBy(
     const std::vector<Expression>& expressions,
     const std::vector<bool>& ascending) const {
-  // The skip scan walks the index in key order, so the output is ordered by
-  // the (single) distinct column when the scan is ascending.
-  if (!ascending_ || expressions.size() != select_items_.size()) {
+  return IsOrderedBy(expressions, ascending, {});
+}
+
+bool SkipScanDistinctPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
+  if (!ascending_ || expressions.size() != select_items_.size() ||
+      ascending.size() != expressions.size()) {
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (!ascending[i]) {
+    if (!ascending[i] || !expressions[i] || !select_items_[i].expression) {
+      return false;
+    }
+    const bool requested =
+        i < nulls_first.size() ? nulls_first[i].value_or(true) : true;
+    if (!requested) {
       return false;
     }
     if (expressions[i]->ToString() != select_items_[i].expression->ToString()) {

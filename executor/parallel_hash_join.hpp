@@ -111,6 +111,8 @@ class SharedBuildParallelHashJoin : public ExecutorBase,
                                            const std::vector<slot_t>& cols);
   [[nodiscard]] static bool KeyHasNull(const Row& row,
                                        const std::vector<slot_t>& cols);
+  [[nodiscard]] static bool KeyHasNaN(const Row& row,
+                                      const std::vector<slot_t>& cols);
   [[nodiscard]] static uint64_t HashKey(std::string_view key);
 
   Executor left_;

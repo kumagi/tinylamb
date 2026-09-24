@@ -31,8 +31,10 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/rewrite.hpp"
 #include "full_scan_plan.hpp"
 #include "incremental_sort_plan.hpp"
@@ -54,6 +56,7 @@
 #include "query/query_data.hpp"
 #include "query/statement.hpp"
 #include "recursive_cte_plan.hpp"
+#include "sample_plan.hpp"
 #include "selection_plan.hpp"
 #include "set_operation_plan.hpp"
 #include "skip_scan_distinct_plan.hpp"
@@ -93,6 +96,23 @@ bool ResidualContainsQuery(const Expression& expression) {
       ExpressionChildren(expression),
       [](const Expression& child) { return ResidualContainsQuery(child); });
 }
+
+// Pushdown safety: moving a conjunct below a join changes how often it
+// evaluates (once per child row instead of once per candidate pair), which
+// is only observable for volatile functions like RANDOM().
+bool DeterministicForPushdown(const Expression& expression) {
+  if (expression->Type() == TypeTag::kFunctionCallExp &&
+      GetFunctionVolatility(
+          expression->AsFunctionCallExpression().FuncName()) !=
+          Volatility::kImmutable) {
+    return false;
+  }
+  return std::ranges::all_of(
+      ExpressionChildren(expression),
+      [](const Expression& child) { return DeterministicForPushdown(child); });
+}
+
+size_t RowEstimate(double rows);
 
 struct Range {
   std::optional<Value> min;
@@ -439,15 +459,11 @@ double EqualityPrefixRows(const TableStatistics& statistics, const Index& index,
     double selectivity = 1.0;
     if (stats.NonNullCount() != 0) {
       const double frequency = stats.EstimateEqual(equality_values[key]);
-      if (frequency > 0) {
-        selectivity = frequency / static_cast<double>(stats.NonNullCount());
-      } else if (stats.Distinct() != 0) {
-        selectivity = 1.0 / static_cast<double>(stats.Distinct());
-      }
+      selectivity = frequency / static_cast<double>(stats.NonNullCount());
     }
     rows *= std::clamp(selectivity, 0.0, 1.0);
   }
-  return std::max(1.0, rows);
+  return rows;
 }
 
 std::optional<std::vector<std::vector<Value>>> DisjunctiveIndexPrefixes(
@@ -485,7 +501,13 @@ std::optional<std::vector<std::vector<Value>>> DisjunctiveIndexPrefixes(
         continue;
       }
       const int offset = schema.Offset(column->GetColumnName());
-      if (offset >= 0) {
+      // Only a same-typed, non-NULL constant may occupy a seek-key slot:
+      // NULL encodes as a truncated prefix (over-inclusive) and a
+      // cross-typed key can never reach the entries its numeric value
+      // would equal (e.g. `u = 2.0` vs INT64 2).
+      if (offset >= 0 && !constant->GetValue().IsNull() &&
+          constant->GetValue().type ==
+              schema.GetColumn(static_cast<size_t>(offset)).Type()) {
         equalities.insert_or_assign(static_cast<slot_t>(offset),
                                     constant->GetValue());
       }
@@ -548,6 +570,13 @@ std::unordered_map<slot_t, Range> ComparisonRanges(const Expression& predicate,
     if (offset < 0) {
       continue;
     }
+    // Same cross-type/NULL exclusion as the conjunct collector in
+    // ScanAlternatives: a bound that cannot encode into the index key
+    // domain must stay residual-only.
+    if (constant->GetValue().type !=
+        schema.GetColumn(static_cast<size_t>(offset)).Type()) {
+      continue;
+    }
     result[static_cast<slot_t>(offset)].Update(binary.Op(),
                                                constant->GetValue(), direction);
   }
@@ -559,6 +588,9 @@ std::vector<PlanAlternative> ScanAlternatives(
     const cascades::LogicalExpression& logical,
     const PhysicalProperties& required, const cascades::RuleContext& context,
     bool include_indexes, bool include_full_scan) {
+  if (memo.Get(group).sample_barrier) {
+    return {};
+  }
   // Materialized CTE singletons (M4) carry a stray kScan alongside their
   // kValues leaf; with no catalog objects the scan offers no alternative
   // (the kValues implementation wins by default).
@@ -658,9 +690,32 @@ std::vector<PlanAlternative> ScanAlternatives(
         if (offset < 0) {
           continue;
         }
+        const ValueType column_type =
+            schema.GetColumn(static_cast<size_t>(offset)).Type();
+        std::vector<Value> points;
+        bool indexable = true;
         for (const Expression& item : in.list_) {
-          point_sets[static_cast<slot_t>(offset)].push_back(
-              item->AsConstantValue().GetValue());
+          const Value& point = item->AsConstantValue().GetValue();
+          // A NULL point can never satisfy an equality seek; keeping it
+          // would also break the sort below (NULL is not ordered against
+          // typed values).
+          if (point.IsNull()) {
+            continue;
+          }
+          // Cross-typed constants cannot be probed through this index's
+          // key encoding: `u IN (0, 2.0)` must still match INT64 2 via
+          // numeric comparison, which a DOUBLE-encoded seek key would
+          // miss.  Leave the conjunct to the residual predicate instead.
+          if (point.type != column_type) {
+            indexable = false;
+            break;
+          }
+          points.push_back(point);
+        }
+        if (indexable && !points.empty()) {
+          auto& bucket = point_sets[static_cast<slot_t>(offset)];
+          bucket.insert(bucket.end(), std::make_move_iterator(points.begin()),
+                        std::make_move_iterator(points.end()));
         }
         continue;
       }
@@ -677,7 +732,13 @@ std::vector<PlanAlternative> ScanAlternatives(
                   LikePrefixBounds(pattern.value.varchar_value)) {
             const int offset =
                 schema.Offset(binary.Left()->AsColumnValue().GetColumnName());
-            if (offset >= 0) {
+            // LIKE bounds are VARCHAR-encoded; they can only probe a
+            // VARCHAR column's index.  On any other column the seek would
+            // silently return nothing where the residual predicate should
+            // have raised a type error.
+            if (offset >= 0 &&
+                schema.GetColumn(static_cast<size_t>(offset)).Type() ==
+                    ValueType::kVarChar) {
               Range& range = ranges[static_cast<slot_t>(offset)];
               const Value lower(std::string(bounds->first));
               const Value upper(std::string(bounds->second));
@@ -717,6 +778,16 @@ std::vector<PlanAlternative> ScanAlternatives(
       }
       const int offset = schema.Offset(column->GetColumnName());
       if (offset < 0) {
+        continue;
+      }
+      // A bound whose ValueType differs from the column's cannot probe the
+      // index: the memcomparable key encoding is type-tagged, so e.g. a
+      // DOUBLE seek misses the INT64 entry that `u = 2.0` must find, and
+      // narrowing mixed-type bounds throws inside Value::operator<.  The
+      // conjunct stays in the residual predicate, which is also what the
+      // no-index plan does.
+      if (constant->GetValue().type !=
+          schema.GetColumn(static_cast<size_t>(offset)).Type()) {
         continue;
       }
       ranges[static_cast<slot_t>(offset)].Update(
@@ -814,16 +885,23 @@ std::vector<PlanAlternative> ScanAlternatives(
         }
         if (and_ranges.size() >= 2 &&
             relational_detail::SplitDisjuncts(filter).size() == 1) {
+          const double bitmap_rows = std::max(
+              1.0, static_cast<double>(statistics.Rows()) * filter_selectivity);
+          const double index_access = std::max(
+              1.0, bitmap_rows * static_cast<double>(and_ranges.size()));
           Plan bitmap = std::make_shared<BitmapScanPlan>(
               table, statistics, std::move(and_ranges), BitmapCombine::kAnd,
-              scan_predicate, 1, 1);
+              scan_predicate, RowEstimate(bitmap_rows),
+              RowEstimate(index_access + bitmap_rows));
           if (fallback_select.size() != bitmap->GetSchema().ColumnCount()) {
             bitmap = std::make_shared<ProjectionPlan>(bitmap, fallback_select);
           }
           bitmap = finalize(bitmap);
-          candidates.push_back(PlanAlternative{.plan = std::move(bitmap),
-                                               .local_cost = 0.0,
-                                               .estimated_rows = 1.0});
+          candidates.push_back(PlanAlternative{
+              .plan = std::move(bitmap),
+              .local_cost =
+                  std::max(1.0, index_access * 0.25 + bitmap_rows * 0.25),
+              .estimated_rows = bitmap_rows});
         }
       }
 
@@ -855,9 +933,15 @@ std::vector<PlanAlternative> ScanAlternatives(
             or_ranges.push_back(std::move(range));
           }
           if (or_ranges.size() == disjuncts.size()) {
+            const double bitmap_rows =
+                std::max(1.0, filter_selectivity *
+                                  static_cast<double>(statistics.Rows()));
+            const double index_access =
+                std::max(1.0, static_cast<double>(statistics.Rows()));
             Plan bitmap = std::make_shared<BitmapScanPlan>(
                 table, statistics, std::move(or_ranges), BitmapCombine::kOr,
-                scan_predicate, statistics.Rows(), statistics.Rows());
+                scan_predicate, RowEstimate(bitmap_rows),
+                RowEstimate(index_access + bitmap_rows));
             if (fallback_select.size() != bitmap->GetSchema().ColumnCount()) {
               bitmap =
                   std::make_shared<ProjectionPlan>(bitmap, fallback_select);
@@ -865,9 +949,9 @@ std::vector<PlanAlternative> ScanAlternatives(
             bitmap = finalize(bitmap);
             candidates.push_back(PlanAlternative{
                 .plan = std::move(bitmap),
-                .local_cost = 0.0,
-                .estimated_rows = filter_selectivity *
-                                  static_cast<double>(statistics.Rows())});
+                .local_cost =
+                    std::max(1.0, index_access * 0.25 + bitmap_rows * 0.25),
+                .estimated_rows = bitmap_rows});
           }
         }
       }
@@ -894,10 +978,9 @@ std::vector<PlanAlternative> ScanAlternatives(
               std::make_shared<ProjectionPlan>(disjunctive, fallback_select);
         }
         disjunctive = finalize(disjunctive);
-        candidates.push_back(PlanAlternative{
-            .plan = std::move(disjunctive),
-            .local_cost = std::max(1.0, access_rows),
-            .estimated_rows = std::max(1.0, access_rows * filter_selectivity)});
+        candidates.push_back(PlanAlternative{.plan = std::move(disjunctive),
+                                             .local_cost = access_rows,
+                                             .estimated_rows = access_rows});
       }
 
       // Point-union alternative for a constant IN list after an equality
@@ -960,18 +1043,8 @@ std::vector<PlanAlternative> ScanAlternatives(
           point_candidate = finalize(point_candidate);
           auto point_cost =
               static_cast<double>(point_candidate->AccessRowCount());
-          // Per-point cardinality: rows / NDV of the leading key column.
-          double ndv = 1.0;
-          if (point_key_slot < statistics.Columns()) {
-            ndv = std::max<double>(
-                1.0, static_cast<double>(
-                         statistics.Column(point_key_slot).Distinct()));
-          }
-          double point_rows = std::min<double>(
-              static_cast<double>(statistics.Rows()),
-              static_cast<double>(values.size()) *
-                  std::max(1.0, static_cast<double>(statistics.Rows()) / ndv));
-          point_rows = std::max(point_rows, 1.0);
+          double point_rows =
+              static_cast<double>(point_candidate->EmitRowCount());
           ApplyLimitHint(point_candidate, required, context, filter_selectivity,
                          &point_cost, &point_rows);
           candidates.push_back(
@@ -1077,7 +1150,8 @@ std::vector<PlanAlternative> ScanAlternatives(
               std::make_shared<ProjectionPlan>(candidate, fallback_select);
         }
         candidate = finalize(candidate);
-        auto local_cost = static_cast<double>(candidate->AccessRowCount());
+        auto local_cost =
+            std::max(1.0, static_cast<double>(candidate->AccessRowCount()));
         local_cost = std::min(
             local_cost,
             EqualityPrefixRows(statistics, index, equality_prefix_values));
@@ -1097,15 +1171,12 @@ std::vector<PlanAlternative> ScanAlternatives(
             range_penalty *= RangeClusteringPenalty(statistics, slot);
           }
         }
-        if (has_range_slot && statistics.Rows() > 0) {
-          const double matched_rows = std::max(
-              1.0, static_cast<double>(statistics.Rows()) * filter_selectivity);
-          local_cost = matched_rows * range_penalty;
+        if (has_range_slot && candidate->AccessRowCount() > 0) {
+          local_cost =
+              static_cast<double>(candidate->AccessRowCount()) * range_penalty;
         }
-        // Residual (non-range) conjuncts narrow the output further.
         double estimated_rows =
-            static_cast<double>(candidate->EmitRowCount()) * filter_selectivity;
-        estimated_rows = std::max(estimated_rows, 1.0);
+            static_cast<double>(candidate->GetStats().Rows());
         ApplyLimitHint(candidate, required, context, filter_selectivity,
                        &local_cost, &estimated_rows);
         candidates.push_back(PlanAlternative{.plan = std::move(candidate),
@@ -1126,6 +1197,11 @@ std::vector<PlanAlternative> ScanAlternatives(
     if (filter) {
       const std::vector<Expression> conjuncts = SplitConjuncts(filter);
       for (const Expression& conjunct : conjuncts) {
+        // A ParameterSlot's peeked integer would stay sniffed after rebind
+        // and drop rows the residual predicate would have kept.
+        if (ContainsParameterSlot(conjunct)) {
+          continue;
+        }
         if (auto simple =
                 relational_detail::TryCompileSimpleCompare(conjunct, schema)) {
           if (simple->int_payload) {
@@ -1161,7 +1237,7 @@ std::vector<PlanAlternative> ScanAlternatives(
         table.IndexCount() > 0) {
       local_cost *= 2.0;
     }
-    auto estimated_rows = static_cast<double>(full_scan->EmitRowCount());
+    auto estimated_rows = static_cast<double>(full_scan->GetStats().Rows());
     ApplyLimitHint(full_scan, required, context, filter_selectivity,
                    &local_cost, &estimated_rows);
     candidates.push_back(PlanAlternative{.plan = std::move(full_scan),
@@ -1171,12 +1247,16 @@ std::vector<PlanAlternative> ScanAlternatives(
   return candidates;
 }
 
-// D3 join cardinality: |L|*|R| / max NDV of the equality keys, capped by the
-// cross-product size; falls back to the cross product when stats are missing.
+// D3 join cardinality: |L|*|R| times EstimateEquijoinSelectivity of the
+// per-key 1/max(NDV) values, capped by the cross product. A single equality
+// is the historical |L|*|R|/max(NDV) model. Missing stats fall back to the
+// cross product.
 double JoinCardinality(
     const BestPlan& left, const BestPlan& right,
-    const std::vector<std::pair<ColumnName, ColumnName>>& equalities) {
-  double max_ndv = 0;
+    const std::vector<std::pair<ColumnName, ColumnName>>& equalities,
+    const Expression& residual = nullptr) {
+  std::vector<double> key_selectivities;
+  key_selectivities.reserve(equalities.size());
   for (const auto& [left_column, right_column] : equalities) {
     const int lo = left.plan->GetSchema().Offset(left_column);
     const int ro = right.plan->GetSchema().Offset(right_column);
@@ -1193,13 +1273,68 @@ double JoinCardinality(
                                        .Column(static_cast<size_t>(ro))
                                        .Distinct()));
     }
-    max_ndv = std::max(max_ndv, ndv);
+    if (ndv >= 1.0) {
+      key_selectivities.push_back(1.0 / ndv);
+    }
   }
   const double cross = left.estimated_rows * right.estimated_rows;
-  if (max_ndv < 1) {
-    return cross;
+  double estimate = cross;
+  if (!key_selectivities.empty()) {
+    estimate = std::min(cross, cross * cascades::EstimateEquijoinSelectivity(
+                                           key_selectivities));
   }
-  return std::min(cross, cross / max_ndv);
+  if (!residual) {
+    return estimate;
+  }
+  double residual_factor = 1.0;
+  for (const Expression& conjunct : SplitConjuncts(residual)) {
+    if (!conjunct) {
+      return estimate;
+    }
+    bool touches_left = false;
+    bool touches_right = false;
+    for (const ColumnName& column : conjunct->TouchedColumns()) {
+      const int lo = left.plan->GetSchema().Offset(column);
+      const int ro = right.plan->GetSchema().Offset(column);
+      if (lo >= 0) {
+        touches_left = true;
+      } else if (ro >= 0) {
+        touches_right = true;
+      } else {
+        return estimate;
+      }
+    }
+    if (touches_left && touches_right) {
+      return estimate;
+    }
+    const BestPlan& side = touches_right ? right : left;
+    residual_factor *= std::clamp(side.plan->GetStats().EstimateSelectivity(
+                                      side.plan->GetSchema(), conjunct),
+                                  0.0, 1.0);
+  }
+  return estimate * residual_factor;
+}
+
+size_t RowEstimate(double rows) {
+  if (!std::isfinite(rows) ||
+      rows >= static_cast<double>(std::numeric_limits<size_t>::max())) {
+    return std::numeric_limits<size_t>::max();
+  }
+  if (rows <= 0.0) {
+    return 0;
+  }
+  return static_cast<size_t>(std::ceil(rows));
+}
+
+bool SamePhysicalJoinType(const Schema& left_schema, const ColumnName& left,
+                          const Schema& right_schema, const ColumnName& right) {
+  const int left_offset = left_schema.Offset(left);
+  const int right_offset = right_schema.Offset(right);
+  if (left_offset < 0 || right_offset < 0) {
+    return false;
+  }
+  return left_schema.GetColumn(static_cast<size_t>(left_offset)).Type() ==
+         right_schema.GetColumn(static_cast<size_t>(right_offset)).Type();
 }
 
 std::vector<PlanAlternative> JoinAlternatives(
@@ -1225,17 +1360,25 @@ std::vector<PlanAlternative> JoinAlternatives(
     }
     const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
     const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+    ColumnName left_column;
+    ColumnName right_column;
     if (left.plan->GetSchema().Offset(lhs) >= 0 &&
         right.plan->GetSchema().Offset(rhs) >= 0) {
-      equalities.emplace_back(lhs, rhs);
-      equality_null_safe.push_back(null_safe);
+      left_column = lhs;
+      right_column = rhs;
     } else if (left.plan->GetSchema().Offset(rhs) >= 0 &&
                right.plan->GetSchema().Offset(lhs) >= 0) {
-      equalities.emplace_back(rhs, lhs);
-      equality_null_safe.push_back(null_safe);
+      left_column = rhs;
+      right_column = lhs;
     } else {
       continue;
     }
+    if (!SamePhysicalJoinType(left.plan->GetSchema(), left_column,
+                              right.plan->GetSchema(), right_column)) {
+      continue;
+    }
+    equalities.emplace_back(left_column, right_column);
+    equality_null_safe.push_back(null_safe);
     equi_conjuncts.push_back(conjunct);
   }
   std::vector<Expression> residual_conjuncts;
@@ -1250,9 +1393,66 @@ std::vector<PlanAlternative> JoinAlternatives(
       }
     }
   }
-  const Expression residual = residual_conjuncts.empty()
+  // Inner joins allow moving a single-side residual conjunct below the join:
+  // it evaluates to the same value for every candidate pair, so filtering
+  // the child first is exactly equivalent while shrinking the join input
+  // (the join executor materializes its build side and every output pair,
+  // so dropped probe/build rows save real work).  Conjuncts referencing both
+  // sides, constants only, unresolved (outer) columns, subqueries, or
+  // non-immutable functions stay at the join.
+  std::vector<Expression> join_residual_conjuncts;
+  Plan left_child = left.plan;
+  Plan right_child = right.plan;
+  std::vector<Expression> left_pushed;
+  std::vector<Expression> right_pushed;
+  if (kind == JoinAlternativeKind::kInner) {
+    for (const Expression& conjunct : residual_conjuncts) {
+      bool left_only = false;
+      bool right_only = false;
+      bool keep_at_join = conjunct->TouchedColumns().empty();
+      if (!ResidualContainsQuery(conjunct) && !keep_at_join &&
+          DeterministicForPushdown(conjunct)) {
+        left_only = true;
+        right_only = true;
+        for (const ColumnName& column : conjunct->TouchedColumns()) {
+          const int lo = left.plan->GetSchema().Offset(column);
+          const int ro = right.plan->GetSchema().Offset(column);
+          if (lo >= 0 && ro < 0) {
+            right_only = false;
+          } else if (ro >= 0 && lo < 0) {
+            left_only = false;
+          } else {
+            left_only = false;
+            right_only = false;
+            break;
+          }
+        }
+      } else {
+        left_only = false;
+        right_only = false;
+      }
+      if (left_only) {
+        left_pushed.push_back(conjunct);
+      } else if (right_only) {
+        right_pushed.push_back(conjunct);
+      } else {
+        join_residual_conjuncts.push_back(conjunct);
+      }
+    }
+    if (!left_pushed.empty()) {
+      left_child = std::make_shared<SelectionPlan>(
+          left_child, CombineConjuncts(left_pushed), left_child->GetStats());
+    }
+    if (!right_pushed.empty()) {
+      right_child = std::make_shared<SelectionPlan>(
+          right_child, CombineConjuncts(right_pushed), right_child->GetStats());
+    }
+  } else {
+    join_residual_conjuncts = residual_conjuncts;
+  }
+  const Expression residual = join_residual_conjuncts.empty()
                                   ? nullptr
-                                  : CombineConjuncts(residual_conjuncts);
+                                  : CombineConjuncts(join_residual_conjuncts);
 
   // A semi/anti hash join emits only the probe side. A residual predicate
   // mentioning the build side cannot be evaluated after that reduction, so
@@ -1264,25 +1464,22 @@ std::vector<PlanAlternative> JoinAlternatives(
 
   const double l_rows = left.estimated_rows;
   const double r_rows = right.estimated_rows;
-  const double equi_estimate = JoinCardinality(left, right, equalities);
+  const double equi_estimate =
+      JoinCardinality(left, right, equalities, residual);
+  const std::optional<size_t> equi_rows = RowEstimate(equi_estimate);
 
-  // Wraps the plan in a Selection applying the residual conjuncts (Phase 4:
-  // the root SelectionPlan no longer re-applies them).
-  const auto with_residual = [&](Plan plan, double estimate) {
-    double est = estimate;
+  const auto with_residual = [&](Plan plan) {
     if (residual) {
       plan = std::make_shared<SelectionPlan>(plan, residual, plan->GetStats());
-      est = std::min(est, static_cast<double>(plan->EmitRowCount()));
     }
-    return std::pair<Plan, double>{std::move(plan), est};
+    const double rows = static_cast<double>(plan->EmitRowCount());
+    return std::pair<Plan, double>{std::move(plan), rows};
   };
 
   std::vector<PlanAlternative> candidates;
   if (cross) {
     auto product_plan = std::make_shared<ProductPlan>(left.plan, right.plan);
     Plan product = std::move(product_plan);
-    const double cross_estimate =
-        equi_conjuncts.empty() ? l_rows * r_rows : equi_estimate;
     // The cross-product executor does not consume join keys.  A nested-loop
     // implementation must therefore evaluate the complete join predicate,
     // including equality conjuncts; `with_residual` is only valid for hash
@@ -1297,9 +1494,10 @@ std::vector<PlanAlternative> JoinAlternatives(
                                                 product->GetStats());
     }
     const double local_cost = (l_rows * r_rows) + l_rows + r_rows;
+    const double product_rows = static_cast<double>(product->EmitRowCount());
     candidates.push_back(PlanAlternative{.plan = std::move(product),
                                          .local_cost = local_cost,
-                                         .estimated_rows = cross_estimate});
+                                         .estimated_rows = product_rows});
   }
   if (equi_conjuncts.empty()) {
     return candidates;
@@ -1319,8 +1517,9 @@ std::vector<PlanAlternative> JoinAlternatives(
          {HashJoinMode::kInMemory, HashJoinMode::kHybrid}) {
       Plan join;
       if (kind == JoinAlternativeKind::kInner) {
-        join = std::make_shared<ProductPlan>(left.plan, left_columns,
-                                             right.plan, right_columns, mode);
+        join =
+            std::make_shared<ProductPlan>(left_child, left_columns, right_child,
+                                          right_columns, mode, equi_rows);
       } else {
         JoinKind physical_kind = AntiJoinKind();
         if (kind == JoinAlternativeKind::kSemi) {
@@ -1332,35 +1531,38 @@ std::vector<PlanAlternative> JoinAlternatives(
         } else if (kind == JoinAlternativeKind::kFullOuter) {
           physical_kind = FullOuterJoinKind();
         }
-        join =
-            std::make_shared<ProductPlan>(left.plan, left_columns, right.plan,
-                                          right_columns, mode, physical_kind);
+        join = std::make_shared<ProductPlan>(left_child, left_columns,
+                                             right_child, right_columns, mode,
+                                             physical_kind, equi_rows);
       }
-      double local_cost = l_rows + r_rows;
+      // The shared-build hash join materializes its (right) build side and
+      // streams the (left) probe side, so the build orientation is not
+      // cost-symmetric.  Weigh build rows extra only when the build side
+      // dwarfs the probe side, where materializing the hash table dominates
+      // the join; this steers enumeration towards smaller build sides
+      // without reshaping plans over evenly sized inputs.
+      const double build_weight = r_rows > l_rows * 4.0 ? 2.0 : 1.0;
+      double local_cost = l_rows + (r_rows * build_weight);
+      if (kind == JoinAlternativeKind::kInner && r_rows > l_rows) {
+        local_cost += (r_rows - l_rows) * 0.5;
+      }
       const double build_bytes = r_rows * kHashJoinRowBytesEstimate;
       if (mode == HashJoinMode::kInMemory &&
           PreferHybridHashJoin(static_cast<size_t>(build_bytes))) {
         local_cost += r_rows * 3;
       }
-      const double estimate =
-          kind == JoinAlternativeKind::kAnti
-              ? l_rows
-              : (kind == JoinAlternativeKind::kLeftOuter ||
-                         kind == JoinAlternativeKind::kRightOuter ||
-                         kind == JoinAlternativeKind::kFullOuter
-                     ? std::max(l_rows, r_rows)
-                     : std::min(l_rows, equi_estimate));
       if (auto* pp = dynamic_cast<ProductPlan*>(join.get())) {
         pp->SetJoinNotes(equality_null_safe, residual);
       }
-      auto [plan, est] = with_residual(std::move(join), estimate);
+      auto [plan, est] = with_residual(std::move(join));
       candidates.push_back(PlanAlternative{.plan = std::move(plan),
                                            .local_cost = local_cost,
                                            .estimated_rows = est});
     }
   }
 
-  if (index) {
+  if (index && !std::ranges::any_of(equality_null_safe,
+                                    [](bool safe) { return safe; })) {
     const Table* right_table = right.plan->ScanSource();
     if (right_table != nullptr) {
       // The IndexJoin executor bypasses the right child plan entirely and
@@ -1414,12 +1616,16 @@ std::vector<PlanAlternative> JoinAlternatives(
                 for (const ColumnName& c : right_columns) {
                   right_physical.push_back(to_physical(c));
                 }
+                std::optional<size_t> index_rows = equi_rows;
+                if (index_handle.IsUnique() && index_rows.has_value()) {
+                  index_rows = std::min(*index_rows, RowEstimate(l_rows));
+                }
                 Plan join = std::make_shared<ProductPlan>(
-                    left.plan, left_columns, *right_table, index_handle,
-                    right_physical, *stats_it->second, declared_output);
+                    left_child, left_columns, *right_table, index_handle,
+                    right_physical, *stats_it->second, declared_output,
+                    index_rows);
                 const double local_cost = (l_rows * 2.0) + equi_estimate;
-                auto [plan, est] =
-                    with_residual(std::move(join), equi_estimate);
+                auto [plan, est] = with_residual(std::move(join));
                 candidates.push_back(PlanAlternative{.plan = std::move(plan),
                                                      .local_cost = local_cost,
                                                      .estimated_rows = est});
@@ -1459,17 +1665,25 @@ std::vector<PlanAlternative> MergeJoinAlternative(
     }
     const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
     const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+    ColumnName left_column;
+    ColumnName right_column;
     if (left.plan->GetSchema().Offset(lhs) >= 0 &&
         right.plan->GetSchema().Offset(rhs) >= 0) {
-      left_columns.push_back(lhs);
-      right_columns.push_back(rhs);
+      left_column = lhs;
+      right_column = rhs;
     } else if (left.plan->GetSchema().Offset(rhs) >= 0 &&
                right.plan->GetSchema().Offset(lhs) >= 0) {
-      left_columns.push_back(rhs);
-      right_columns.push_back(lhs);
+      left_column = rhs;
+      right_column = lhs;
     } else {
       continue;
     }
+    if (!SamePhysicalJoinType(left.plan->GetSchema(), left_column,
+                              right.plan->GetSchema(), right_column)) {
+      continue;
+    }
+    left_columns.push_back(left_column);
+    right_columns.push_back(right_column);
     equality_expressions.push_back(conjunct);
   }
   if (equality_expressions.empty()) {
@@ -1518,6 +1732,12 @@ std::vector<PlanAlternative> MergeJoinAlternative(
   Plan left_plan = left.plan;
   Plan right_plan = right.plan;
   double local_cost = left.estimated_rows + right.estimated_rows;
+  constexpr double kOrderedMergeJoinRowsThreshold = 1024.0;
+  if (left_ordered && right_ordered &&
+      std::max(left.estimated_rows, right.estimated_rows) >=
+          kOrderedMergeJoinRowsThreshold) {
+    local_cost *= 0.8;
+  }
   if (!left_ordered) {
     std::vector<SortKey> keys;
     keys.reserve(left_columns.size());
@@ -1554,29 +1774,27 @@ std::vector<PlanAlternative> MergeJoinAlternative(
   } else if (kind == JoinAlternativeKind::kFullOuter) {
     physical_kind = FullOuterJoinKind();
   }
+  std::vector<std::pair<ColumnName, ColumnName>> equality_pairs;
+  equality_pairs.reserve(left_columns.size());
+  for (size_t i = 0; i < left_columns.size(); ++i) {
+    equality_pairs.emplace_back(left_columns[i], right_columns[i]);
+  }
+  const Expression estimate_residual =
+      kind == JoinAlternativeKind::kInner
+          ? (residual_conjuncts.empty() ? nullptr
+                                        : CombineConjuncts(residual_conjuncts))
+          : merge_residual;
+  const double equi_estimate =
+      JoinCardinality(left, right, equality_pairs, estimate_residual);
   Plan merge = std::make_shared<MergeJoinPlan>(
       std::move(left_plan), left_columns, std::move(right_plan), right_columns,
-      physical_kind, std::move(merge_residual));
-  double estimated_rows = JoinCardinality(left, right, [&] {
-    std::vector<std::pair<ColumnName, ColumnName>> pairs;
-    pairs.reserve(left_columns.size());
-    for (size_t i = 0; i < left_columns.size(); ++i) {
-      pairs.emplace_back(left_columns[i], right_columns[i]);
-    }
-    return pairs;
-  }());
+      physical_kind, std::move(merge_residual), RowEstimate(equi_estimate));
   if (!residual_conjuncts.empty()) {
     const TableStatistics merge_stats = merge->GetStats();
     merge = std::make_shared<SelectionPlan>(
         std::move(merge), CombineConjuncts(residual_conjuncts), merge_stats);
-    estimated_rows =
-        std::min(estimated_rows, static_cast<double>(merge->EmitRowCount()));
   }
-  if (kind == JoinAlternativeKind::kAnti) {
-    estimated_rows = left.estimated_rows;
-  } else if (kind == JoinAlternativeKind::kSemi) {
-    estimated_rows = std::min(left.estimated_rows, estimated_rows);
-  }
+  const double estimated_rows = static_cast<double>(merge->EmitRowCount());
   (void)memo;
   (void)right_group;
   (void)context;
@@ -1613,6 +1831,43 @@ bool HasEquiColumnPair(const Expression& predicate, const Plan& left,
       });
 }
 
+bool HasCatalogTypeCompatibleEqui(const cascades::Memo& memo,
+                                  const Expression& predicate) {
+  const auto column_type =
+      [&](const ColumnName& column) -> std::optional<ValueType> {
+    if (column.schema.empty()) {
+      return std::nullopt;
+    }
+    const auto found = memo.GetTableSchemas().find(column.schema);
+    if (found == memo.GetTableSchemas().end()) {
+      return std::nullopt;
+    }
+    const int offset = found->second.Offset(ColumnName("", column.name));
+    if (offset < 0) {
+      return std::nullopt;
+    }
+    return found->second.GetColumn(static_cast<size_t>(offset)).Type();
+  };
+  return std::ranges::any_of(
+      SplitConjuncts(predicate), [&](const Expression& conjunct) {
+        if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+          return false;
+        }
+        const auto& binary = conjunct->AsBinaryExpression();
+        if ((binary.Op() != BinaryOperation::kEquals &&
+             binary.Op() != BinaryOperation::kIsNotDistinctFrom) ||
+            binary.Left()->Type() != TypeTag::kColumnValue ||
+            binary.Right()->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
+        const auto left =
+            column_type(binary.Left()->AsColumnValue().GetColumnName());
+        const auto right =
+            column_type(binary.Right()->AsColumnValue().GetColumnName());
+        return left && right && *left == *right;
+      });
+}
+
 // Shared builder for the batch_nested_loop family: a cross-shaped
 // ProductPlan carrying the full predicate, marked for the blocked executor.
 // The gate (usable predicate, no equi pair) keeps hash/merge shapes — and
@@ -1646,6 +1901,8 @@ std::vector<PlanAlternative> BatchNestedLoopFor(
   if (HasEquiColumnPair(predicate, left.plan, right.plan)) {
     return {};
   }
+  const double l_rows = left.estimated_rows;
+  const double r_rows = right.estimated_rows;
   Plan join;
   if (!kind.has_value()) {
     join = std::make_shared<ProductPlan>(left.plan, right.plan);
@@ -1654,19 +1911,15 @@ std::vector<PlanAlternative> BatchNestedLoopFor(
                                          right.plan, std::vector<ColumnName>{},
                                          HashJoinMode::kInMemory, *kind);
   } else {
-    join = std::make_shared<ProductPlan>(left.plan, right.plan, *kind);
+    join = std::make_shared<ProductPlan>(left.plan, right.plan, *kind,
+                                         RowEstimate(l_rows * r_rows));
   }
   std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes({}, predicate);
   std::static_pointer_cast<ProductPlan>(join)->PreferBatchNestedLoop();
-  const double l_rows = left.estimated_rows;
-  const double r_rows = right.estimated_rows;
-  auto estimated_rows = static_cast<double>(join->EmitRowCount());
   if (wrap_selection) {
-    // Same shape/cost/estimate as the tuple nested_loop_join cross path, so
-    // the two tie and registration order keeps the tuple winner.
     join = std::make_shared<SelectionPlan>(join, predicate, join->GetStats());
-    estimated_rows = l_rows * r_rows;
   }
+  const auto estimated_rows = static_cast<double>(join->EmitRowCount());
   return {PlanAlternative{.plan = std::move(join),
                           .local_cost = (l_rows * r_rows) + l_rows + r_rows,
                           .estimated_rows = estimated_rows}};
@@ -2161,6 +2414,32 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         },
         c::LogicalOperator::kSelection));
     built.Add(c::ImplementationRule(
+        "sample", cascades::dsl::Sample(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children, const PhysicalProperties&,
+           const c::RuleContext&) {
+          if (children.size() != 1 || !logical.sample_size) {
+            return std::vector<PlanAlternative>{};
+          }
+          TableSampleSpec spec;
+          spec.method = logical.sample_method;
+          spec.unit = logical.sample_unit;
+          spec.size = logical.sample_size;
+          spec.repeatable_seed = logical.sample_seed;
+          spec.partition_by = logical.partition_by;
+          spec.with_weight = logical.sample_with_weight;
+          spec.weight_alias = logical.sample_weight_alias;
+          Plan sample =
+              std::make_shared<SamplePlan>(children[0].plan, std::move(spec));
+          const double rows = static_cast<double>(sample->EmitRowCount());
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(sample),
+                              .local_cost = children[0].estimated_rows,
+                              .estimated_rows = rows}};
+        },
+        c::LogicalOperator::kSample));
+    built.Add(c::ImplementationRule(
         "projection", cascades::dsl::Projection(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
            const c::LogicalExpression& logical,
@@ -2327,9 +2606,15 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               children[0].plan, std::move(keys), logical.limit_count,
               logical.limit_offset, logical.with_ties);
           const double rows = children[0].estimated_rows;
+          const double capacity =
+              std::min(rows, static_cast<double>(logical.limit_count) +
+                                 static_cast<double>(logical.limit_offset));
+          const double cost = logical.with_ties
+                                  ? rows * std::log2(std::max(2.0, rows))
+                                  : rows * std::log2(std::max(2.0, capacity));
           return std::vector<PlanAlternative>{PlanAlternative{
               .plan = std::move(topn),
-              .local_cost = rows * std::log2(std::max(2.0, rows)),
+              .local_cost = cost,
               .estimated_rows = LimitOutputRows(rows, logical.limit_count,
                                                 logical.limit_offset)}};
         },
@@ -2691,8 +2976,10 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         [](c::GroupId, const c::Memo& memo, const c::Bindings&,
            const c::LogicalExpression& logical,
            const std::vector<BestPlan>& children,
-           const PhysicalProperties& required, const c::RuleContext& context) {
-          if (children.size() != 2 || required.require_row_position) {
+           const c::PhysicalProperties& required,
+           const c::RuleContext& context) {
+          if (children.size() != 2 || required.require_row_position ||
+              (memo.JoinGraphConnected() && memo.HasColumnEqualityConjunct())) {
             return std::vector<PlanAlternative>{};
           }
           return JoinAlternatives(memo, logical.children[1], std::nullopt,
@@ -2777,8 +3064,13 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         [](c::GroupId, const c::Memo& memo, const c::Bindings&,
            const c::LogicalExpression& logical,
            const std::vector<BestPlan>& children,
-           const PhysicalProperties& required, const c::RuleContext& context) {
-          if (children.size() != 2 || required.require_row_position) {
+           const c::PhysicalProperties& required,
+           const c::RuleContext& context) {
+          if (children.size() != 2 || required.require_row_position ||
+              (logical.predicate && *logical.predicate &&
+               HasEquiColumnPair(*logical.predicate, children[0].plan,
+                                 children[1].plan) &&
+               HasCatalogTypeCompatibleEqui(memo, *logical.predicate))) {
             return std::vector<PlanAlternative>{};
           }
           return JoinAlternatives(memo, logical.children[1], logical.predicate,
@@ -2903,7 +3195,9 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
             }
           }
           Plan join = std::make_shared<ProductPlan>(
-              children[0].plan, children[1].plan, LeftOuterJoinKind());
+              children[0].plan, children[1].plan, LeftOuterJoinKind(),
+              RowEstimate(children[0].estimated_rows *
+                          children[1].estimated_rows));
           // The executor evaluates the full predicate while pairing and
           // null-pads unmatched outer rows, so unlike the inner nested loop
           // no Selection wrapper may be added: it would filter the padded
@@ -2911,8 +3205,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           // for non-inner hash joins).
           std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes(
               {}, *logical.predicate);
-          const double estimate =
-              std::max(children[0].estimated_rows, children[1].estimated_rows);
+          const double estimate = static_cast<double>(join->EmitRowCount());
           const double local_cost =
               children[0].estimated_rows * children[1].estimated_rows;
           return std::vector<PlanAlternative>{

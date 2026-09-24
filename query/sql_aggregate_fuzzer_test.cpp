@@ -10,6 +10,7 @@
 #include <iterator>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -27,7 +28,10 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
   while (const dirent* entry = readdir(handle)) {
     const std::string name = entry->d_name;
     if (name.size() > 5 && name.substr(name.size() - 5) == ".test") {
-      files.push_back(dir + "/" + name);
+      std::string path = dir;
+      path += "/";
+      path += name;
+      files.push_back(path);
     }
   }
   closedir(handle);
@@ -40,8 +44,10 @@ TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
   int group_queries = 0;
   int window_queries = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations = (scale != nullptr) ? std::atoi(scale) : 48;
-  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
+  const int kIterations =
+      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
+                         : 48;
+  for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
     std::mt19937 rng(seed);
     AggStats stats;
     AggTrace trace;
@@ -106,7 +112,7 @@ TEST(SqlAggregateFuzzer, TestFileRoundTripDetectsMismatch) {
 TEST(SqlAggregateFuzzer, ReplayCommittedRegressionFiles) {
   const char* dir = std::getenv("TINYLAMB_AGGREGATE_REGRESSION_DIR");
   if (dir == nullptr) {
-    GTEST_SKIP() << true;
+    GTEST_SKIP() << "skipped";
   }
   for (const std::string& path : ListTestFiles(dir)) {
     std::ifstream file(path);

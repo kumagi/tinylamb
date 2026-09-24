@@ -91,7 +91,7 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     l_.reset();
     p_.reset();
     std::ignore = std::remove(db_name_.c_str());
-    std::ignore = std::remove(log_name_.c_str());
+    tinylamb::RemoveLogAndSegments(log_name_);
   }
 
   std::string db_name_;

@@ -377,21 +377,29 @@ class KeyOrdering {
       if (begin == end) {
         break;
       }
-      threads.emplace_back([&, begin, end] {
-        try {
-          if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
-            std::vector<size_t> tmp;
-            RadixSortIndices(base + begin, base + end, raw_keys_, &tmp);
-          } else {
-            std::stable_sort(base + begin, base + end, index_less);
+      try {
+        threads.emplace_back([&, begin, end] {
+          try {
+            if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
+              std::vector<size_t> tmp;
+              RadixSortIndices(base + begin, base + end, raw_keys_, &tmp);
+            } else {
+              std::stable_sort(base + begin, base + end, index_less);
+            }
+          } catch (...) {
+            std::scoped_lock lock(error_mutex);
+            if (!error) {
+              error = std::current_exception();
+            }
           }
-        } catch (...) {
-          std::scoped_lock lock(error_mutex);
-          if (!error) {
-            error = std::current_exception();
-          }
+        });
+      } catch (...) {
+        std::scoped_lock lock(error_mutex);
+        if (!error) {
+          error = std::current_exception();
         }
-      });
+        break;
+      }
     }
     threads.clear();
     if (error) {

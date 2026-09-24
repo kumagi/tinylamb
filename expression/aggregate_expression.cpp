@@ -32,7 +32,10 @@
 namespace tinylamb {
 
 std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
-  std::unordered_set<ColumnName> columns = child_->TouchedColumns();
+  // COUNT(*) carries no child at all; dereferencing it is a hard crash
+  // (rule_fuzzer: SEGV inside Cascades rule application).
+  std::unordered_set<ColumnName> columns =
+      child_ ? child_->TouchedColumns() : std::unordered_set<ColumnName>{};
   if (having_cond_) {
     columns.merge(having_cond_->TouchedColumns());
   }
@@ -42,9 +45,17 @@ std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
   for (const auto& term : inner_order_by_) {
     columns.merge(term.expression->TouchedColumns());
   }
+  if (secondary_arg_) {
+    columns.merge(secondary_arg_->TouchedColumns());
+  }
   for (const Expression& argument : trailing_args_) {
     if (argument) {
       columns.merge(argument->TouchedColumns());
+    }
+  }
+  for (const Expression& key : inner_group_by_) {
+    if (key) {
+      columns.merge(key->TouchedColumns());
     }
   }
   return columns;
@@ -109,6 +120,9 @@ std::string AggregateExpression::ToString() const {
     if (argument) {
       out += ", " + argument->ToString();
     }
+  }
+  if (ignore_nulls_) {
+    out += " IGNORE NULLS";
   }
   if (having_ != AggregateHavingModifier::kNone && having_cond_) {
     out += having_ == AggregateHavingModifier::kMax ? " HAVING MAX "

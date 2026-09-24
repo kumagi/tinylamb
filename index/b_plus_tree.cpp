@@ -1036,9 +1036,8 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) const {
   return Status::kSuccess;
 }
 
-StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
-                                           std::string_view key,
-                                           page_id_t* hint_leaf) const {
+StatusOr<std::string> BPlusTree::Read(Transaction& txn, std::string_view key,
+                                      page_id_t* hint_leaf) const {
   if (hint_leaf != nullptr && *hint_leaf != 0) {
     // Validate the remembered leaf against the live tree before trusting it:
     // the branch level that currently routes `key` must point at it. Read
@@ -1081,7 +1080,8 @@ StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
           break;
         }
         *hint_leaf = curr->PageID();
-        return curr->Read(txn, key);
+        ASSIGN_OR_RETURN(std::string_view, found, curr->Read(txn, key));
+        return std::string(found);
       }
       curr.PageUnlock();
     }
@@ -1119,7 +1119,8 @@ StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
   if (hint_leaf != nullptr) {
     *hint_leaf = curr->PageID();
   }
-  return curr->Read(txn, key);
+  ASSIGN_OR_RETURN(std::string_view, found, curr->Read(txn, key));
+  return std::string(found);
 }
 
 BPlusTreeIterator BPlusTree::Begin(Transaction& txn, std::string_view left,

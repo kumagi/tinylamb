@@ -5,7 +5,7 @@
 
 ## 概要
 
-`extract_year_sargable` は、`EXTRACT(YEAR FROM date_col) <op> year` 形式の非 SARGable（Search Argument Able でない）な述語を検出し、DATE 型列に対する半開区間 `[year-01-01, (year+1)-01-01)` を用いた範囲比較述語へと変換して対象テーブルの scan filter に追加する論理 Rule です。
+`extract_year_sargable` は、`EXTRACT(YEAR FROM date_col) <op> year` 形式の述語を、DATE 型列の範囲比較へ変換する論理 Rule です。元の述語は SARGable（Search Argument Able）ではありません。変換後は半開区間 `[year-01-01, (year+1)-01-01)` を使う述語となり、対象テーブルの scan filter へ追加されます。
 
 列値に関数を適用した比較はインデックス走査の探索キーとして利用できません。等価な日付リテラルの範囲条件を生成してベーステーブルの走査プロパティに注入することで、インデックス範囲走査（B+Tree Range Scan）やストレージ層のゾーンマップによるブロック枝刈りを可能にします。
 
@@ -85,13 +85,13 @@ graph TD
                                  CombineConjuncts(bounds));
 ```
 
-本 Rule は元の Selection 式そのものを除去・破壊するのではなく、scan filter を更新します。Memo 内部で正規化された連言が scan filter に蓄積され、スキャン演算子の物理化時にインデックス境界条件として抽出されます。
+本 Rule は元の Selection 式を除去せず、scan filter を更新します。Memo 内で正規化した連言を scan filter に蓄積し、スキャン演算子を物理化するときにインデックス境界条件として取り出します。
 
 ## 最適化効果
 
 テーブルフルスキャンと行ごとの関数評価（`extract_year` の CPU オーバーヘッド）を完全に排除し、B+Tree インデックスの範囲走査（$O(\log N + K)$）への切り替えを実現します。
 
-年間データや特定期間のトランザクションを抽出する分析系クエリにおいて、アクセス対象ページ数を数桁規模で削減する決定的な効果をもたらします。
+年間データや特定期間のトランザクションを抽出する分析系クエリでは、条件に合わない期間のページを読み飛ばせます。
 
 ## 関連 Rule との相互作用
 

@@ -1,0 +1,14 @@
+-- tinylamb-session-test v1
+-- seed: 1
+-- stmt: CREATE TABLE tbl3 (u INT64, c1 VARCHAR(8), c2 VARCHAR(8), c3 INT64);
+-- ddl: CREATE UNIQUE INDEX idx0 ON tbl3 KEY(0,3)
+-- stmt: INSERT INTO tbl3 VALUES (0, 'bb', 'bb', NULL);
+-- stmt: INSERT INTO tbl3 VALUES (1, 'a', NULL, 3);
+-- stmt: INSERT INTO tbl3 (u, c1, c3, c2) VALUES (2, 'a', NULL, 'bb');
+-- stmt: UPDATE tbl3 SET c3 = 2 WHERE (c1 = 'bb');
+-- stmt: INSERT INTO tbl3 SELECT (u + 3), 'bb', 'bb', u FROM tbl3 WHERE (c2 = 'bb');
+-- stmt: INSERT INTO tbl3 (u, c2, c3, c1) VALUES (7, 'bb', -3, NULL);
+-- stmt: DELETE FROM tbl3;
+-- stmt: INSERT INTO tbl3 (u, c2, c3, c1) VALUES (8, 'bb', 3, 'bb');
+-- check: tbl3
+-- expect: [8, "bb", "bb", 3]

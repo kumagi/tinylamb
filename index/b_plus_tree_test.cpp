@@ -98,7 +98,7 @@ class BPlusTreeTest : public ::testing::Test {
     l_.reset();
     p_.reset();
     std::ignore = std::remove(db_name_.c_str());
-    std::ignore = std::remove(log_name_.c_str());
+    tinylamb::RemoveLogAndSegments(log_name_);
     std::ignore = std::remove(master_record_name_.c_str());
   }
 
@@ -287,7 +287,7 @@ TEST_F(BPlusTreeTest, MergeBranch) {
     ASSERT_SUCCESS(bpt_->Delete(txn, key));
     for (size_t j = i + 1; j < kInserts; ++j) {
       ASSIGN_OR_ASSERT_FAIL(
-          std::string_view, val,
+          std::string, val,
           bpt_->Read(txn, KeyGen(static_cast<int>(j), kPayloadSize)));
       if (val != short_value) {
         LOG(FATAL) << OmittedString(val, 20) << " not found";
@@ -348,7 +348,7 @@ TEST_F(BPlusTreeTest, Search) {
   {
     auto txn = tm_->Begin();
     for (int i = 0; i < 100; ++i) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+      ASSIGN_OR_ASSERT_FAIL(std::string, val,
                             bpt_->Read(txn, KeyGen(i, kPayloadSize)));
 
       // Assert -- each read returns the expected 200-byte value
@@ -393,7 +393,7 @@ TEST_F(BPlusTreeTest, Update) {
     auto txn = tm_->Begin();
     for (size_t i = 0; i < kCount; ++i) {
       ASSIGN_OR_ASSERT_FAIL(
-          std::string_view, val,
+          std::string, val,
           bpt_->Read(txn, KeyGen(static_cast<int>(i), kPayloadSize)));
       if (i % 2 == 0) {
         ASSERT_EQ(val, KeyGen(static_cast<int>(i * 2), 200));
@@ -427,7 +427,7 @@ TEST_F(BPlusTreeTest, Delete) {
   {
     auto txn = tm_->Begin();
     for (const auto& kv : kvp) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+      ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kv.second, val);
     }
     txn.PreCommit();
@@ -442,7 +442,7 @@ TEST_F(BPlusTreeTest, Delete) {
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       kvp.erase(key);
       for (const auto& kv : kvp) {
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+        ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
         ASSERT_EQ(kv.second, val);
       }
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
@@ -458,7 +458,7 @@ TEST_F(BPlusTreeTest, Delete) {
       if (i % 2 == 0) {
         ASSERT_FAIL(bpt_->Read(txn, KeyGen(i, kKeyLength)).GetStatus());
       } else {
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+        ASSIGN_OR_ASSERT_FAIL(std::string, val,
                               bpt_->Read(txn, KeyGen(i, kKeyLength)));
         ASSERT_EQ(val, KeyGen(i * 1, 200));
       }
@@ -742,7 +742,7 @@ TEST_F(BPlusTreeTest, DeleteAll) {
   {
     auto txn = tm_->Begin();
     for (const auto& kv : kvp) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+      ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kv.second, val);
     }
     txn.PreCommit();
@@ -762,7 +762,7 @@ TEST_F(BPlusTreeTest, DeleteAll) {
                      << " from";
           DumpLogTxn(*bpt_, txn);
         }
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+        ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
         ASSERT_EQ(kv.second, val);
       }
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
@@ -796,7 +796,7 @@ TEST_F(BPlusTreeTest, DeleteAllReverse) {
   {
     auto txn = tm_->Begin();
     for (const auto& kv : kvp) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+      ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kv.second, val);
     }
   }
@@ -814,7 +814,7 @@ TEST_F(BPlusTreeTest, DeleteAllReverse) {
         if (!v) {
           LOG(FATAL) << "not found: " << kv.first;
         }
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+        ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
         ASSERT_EQ(kv.second, val);
       }
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
@@ -854,7 +854,7 @@ TEST_F(BPlusTreeTest, Crash) {
   {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+      ASSIGN_OR_ASSERT_FAIL(std::string, val,
                             bpt_->Read(txn, KeyGen(i, kKeyLength)));
       ASSERT_EQ(val, KeyGen(i * 10, 1000));
     }
@@ -897,8 +897,7 @@ TEST_F(BPlusTreeTest, NodeReclaimWALReplaysAfterCrash) {
 
   auto txn = tm_->Begin();
   for (const int i : survivors) {
-    ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
-                          bpt_->Read(txn, KeyGen(i, 300)));
+    ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, KeyGen(i, 300)));
     ASSERT_EQ(val, KeyGen(i * 10, 200));
   }
   for (int i = 0; i < kCount * 4 / 5; ++i) {
@@ -959,7 +958,7 @@ TEST_F(BPlusTreeTest, CheckPoint) {
   {
     auto txn = tm_->Begin();
     for (int i = 0; i < 30; ++i) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+      ASSIGN_OR_ASSERT_FAIL(std::string, val,
                             bpt_->Read(txn, KeyGen(i, kKeyLength)));
       ASSERT_EQ(val, KeyGen(i * 10, 1000));
     }
@@ -985,7 +984,7 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
     keys.push_back(key);
     kvp.emplace(key, value);
     for (const auto& kv : kvp) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+      ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kvp[kv.first], val);
     }
   }
@@ -999,14 +998,14 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
     ASSERT_SUCCESS(bpt_->Update(txn, key, value));
     kvp[key] = value;
     for (const auto& kv : kvp) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+      ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kvp[kv.first], val);
     }
   }
 
   // Assert -- final read-back of all keys matches the last known values
   for (const auto& kv : kvp) {
-    ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+    ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
   }
 }
@@ -1065,7 +1064,7 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
 
   // Act 2 -- read back all 100 keys to verify initial state
   for (const auto& kv : kvp) {
-    ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+    ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
   }
   LOG(INFO) << "initialized, insert and delete for " << (kCount * 40)
@@ -1093,7 +1092,7 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
   // Assert -- final read-back of all remaining keys matches the last known
   // values
   for (const auto& kv : kvp) {
-    ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
+    ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
   }
 }
@@ -1219,7 +1218,7 @@ TEST_F(BPlusTreeTest, InterleavedTransactions) {
     auto reader = tm_->Begin();
     auto writer = tm_->Begin();
     for (int i = 0; i < 20; ++i) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+      ASSIGN_OR_ASSERT_FAIL(std::string, val,
                             bpt_->Read(reader, KeyGen(i, 5000)));
       ASSERT_EQ(val, "v");
     }
@@ -1234,8 +1233,7 @@ TEST_F(BPlusTreeTest, InterleavedTransactions) {
   {
     auto txn = tm_->Begin();
     for (int i = 0; i < 20; ++i) {
-      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
-                            bpt_->Read(txn, KeyGen(i, 5000)));
+      ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, KeyGen(i, 5000)));
       ASSERT_EQ(val, i % 2 == 0 ? "u" : "v");
     }
   }
@@ -1479,7 +1477,7 @@ TEST_F(BPlusTreeTest, PrefixSeekCrossesSeparatorBoundary) {
           break;
         }
       }
-      EXPECT_EQ(seen, kCount / kGroups) << true << (group != 0);
+      EXPECT_EQ(seen, kCount / kGroups) << (group != 0);
       ++checked_groups;
     }
     EXPECT_EQ(checked_groups, kGroups);
@@ -1972,7 +1970,7 @@ TEST_F(BPlusTreeTest, RandomChurnTenThousandOpsKeepsStructure) {
       std::ranges::sort(scanned);
       std::vector<int> expected(live_set.begin(), live_set.end());
       std::ranges::sort(expected);
-      ASSERT_EQ(scanned, expected) << true << (op != 0);
+      ASSERT_EQ(scanned, expected) << (op != 0);
       check.PreCommit();
     }
   }
@@ -2121,7 +2119,7 @@ TEST_F(BPlusTreeTest, DeleteAlternatingSmallKeysAcrossLeaves) {
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       remaining.erase(key);
       for (const std::string& survivor : remaining) {
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, survivor));
+        ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, survivor));
         ASSERT_EQ(val.size(), 100U);
       }
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
@@ -2137,7 +2135,7 @@ TEST_F(BPlusTreeTest, DeleteAlternatingSmallKeysAcrossLeaves) {
       if (i % 2 == 0) {
         ASSERT_FAIL(bpt_->Read(txn, key).GetStatus());
       } else {
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, key));
+        ASSIGN_OR_ASSERT_FAIL(std::string, val, bpt_->Read(txn, key));
         ASSERT_EQ(val.size(), 100U);
       }
     }

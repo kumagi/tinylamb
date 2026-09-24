@@ -462,6 +462,18 @@ TEST(ExpressionTest, AggregateExpression_ToString_RendersSqlSyntax) {
   ASSERT_EQ(max_col->ToString(), "MAX(col)");
 }
 
+TEST(ExpressionTest, AggregateExpression_TouchedColumns_ChildlessIsEmpty) {
+  // COUNT(*) built without a child (the childless form used by Cascades
+  // rule construction) must not dereference null in TouchedColumns.
+  Expression count_star = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, nullptr, false);
+  EXPECT_TRUE(count_star->TouchedColumns().empty());
+
+  Expression count_star_distinct = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, nullptr, true);
+  EXPECT_TRUE(count_star_distinct->TouchedColumns().empty());
+}
+
 TEST(ExpressionTest, CaseExpression_Evaluate_EvaluatesMatchingBranchOrElse) {
   Row dummy({});
   Schema dummy_schema;
@@ -842,6 +854,21 @@ TEST(ExpressionTest, InExpression_WithNullValues_FollowsThreeValuedLogic) {
       InExpressionExp(ConstantValueExp(Value(1)), {ConstantValueExp(Value(1))})
           ->Evaluate(&row, schema, &row, schema),
       Value(true));
+
+  const Value struct_probe(std::string(R"json({"f1":1,"f2":null})json"));
+  const Expression struct_miss = InExpressionExp(
+      ConstantValueExp(struct_probe),
+      {ConstantValueExp(Value(std::string(R"json({"f1":1,"f2":1})json"))),
+       ConstantValueExp(Value(std::string(R"json({"f1":2,"f2":1})json")))});
+  const Expression struct_match = InExpressionExp(
+      ConstantValueExp(struct_probe),
+      {ConstantValueExp(Value(std::string(R"json({"f1":1,"f2":null})json")))});
+  EXPECT_TRUE(struct_miss->Evaluate(row, schema).IsNull());
+  EXPECT_TRUE(struct_match->Evaluate(row, schema).IsNull());
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kEquals,
+                           Value(std::string(R"json({"f1":1,"f2":20})json")),
+                           Value(std::string(R"json({"f1":1,"f2":10})json"))),
+            Value(false));
 }
 
 TEST(ExpressionTest, InExpression_Inspect_ReturnsStringAndResultType) {
@@ -1220,6 +1247,95 @@ TEST(ExpressionTest, FunctionCall_DateAddSub_EvaluatesCorrectly) {
           FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
                                        ConstantValueExp(Value(1))})
               ->Evaluate(row, schema)),
+      std::runtime_error);
+}
+
+TEST(ExpressionTest, DateBinaryArithmetic_InterAndUnaryShapes) {
+  Row row;
+  Schema schema;
+  const Value d = Value::Date("2020-01-01");
+  const Expression dt = ConstantValueExp(d);
+  const auto eval = [&](const Expression& e) {
+    return e->Evaluate(row, schema);
+  };
+
+  // DATE ± INTERVAL (both interval text shapes: canonical and amount+unit).
+  EXPECT_EQ(eval(BinaryExpressionExp(dt, BinaryOperation::kAdd,
+                                     IntervalExpressionExp(3, "day"))),
+            Value::Date("2020-01-04"));
+  EXPECT_EQ(eval(BinaryExpressionExp(dt, BinaryOperation::kSubtract,
+                                     IntervalExpressionExp(1, "month"))),
+            Value::Date("2019-12-01"));
+  EXPECT_EQ(eval(BinaryExpressionExp(dt, BinaryOperation::kAdd,
+                                     IntervalExpressionExp(2, "year"))),
+            Value::Date("2022-01-01"));
+  EXPECT_EQ(
+      eval(BinaryExpressionExp(dt, BinaryOperation::kSubtract,
+                               IntervalExpressionExp(0, "", "0-0 3 0:0:0"))),
+      Value::Date("2019-12-29"));
+  // Month-end clamping matches DATE_ADD: 2020-03-31 + 1 month → 2020-04-30.
+  EXPECT_EQ(eval(BinaryExpressionExp(
+                ConstantValueExp(Value::Date("2020-03-31")),
+                BinaryOperation::kAdd, IntervalExpressionExp(1, "month"))),
+            Value::Date("2020-04-30"));
+
+  // DATE ± INT64 (days) and INT64 + DATE.
+  EXPECT_EQ(eval(BinaryExpressionExp(dt, BinaryOperation::kAdd,
+                                     ConstantValueExp(Value(3)))),
+            Value::Date("2020-01-04"));
+  EXPECT_EQ(eval(BinaryExpressionExp(ConstantValueExp(Value(3)),
+                                     BinaryOperation::kAdd, dt)),
+            Value::Date("2020-01-04"));
+  EXPECT_EQ(eval(BinaryExpressionExp(dt, BinaryOperation::kSubtract,
+                                     ConstantValueExp(Value(1)))),
+            Value::Date("2019-12-31"));
+
+  // DATE - DATE → INT64 day difference, including the string-cell coercion.
+  EXPECT_EQ(
+      eval(BinaryExpressionExp(dt, BinaryOperation::kSubtract,
+                               ConstantValueExp(Value::Date("2019-12-25")))),
+      Value(7));
+  EXPECT_EQ(eval(BinaryExpressionExp(dt, BinaryOperation::kSubtract,
+                                     ConstantValueExp(Value("2019-12-25")))),
+            Value(7));
+
+  // NULL propagates through DATE arithmetic.
+  EXPECT_TRUE(eval(BinaryExpressionExp(dt, BinaryOperation::kAdd,
+                                       ConstantValueExp(Value())))
+                  .IsNull());
+
+  // Result types follow the runtime values.
+  const Schema date_schema(
+      "t", {Column("dt", ValueType::kDate), Column("n", ValueType::kInt64)});
+  EXPECT_EQ(BinaryExpressionExp(ColumnValueExp("dt"), BinaryOperation::kAdd,
+                                ColumnValueExp("n"))
+                ->ResultType(date_schema)
+                .GetType(),
+            TypeTag::kDate);
+  EXPECT_EQ(
+      BinaryExpressionExp(ColumnValueExp("dt"), BinaryOperation::kSubtract,
+                          ColumnValueExp("dt"))
+          ->ResultType(date_schema)
+          .GetType(),
+      TypeTag::kBigInt);
+
+  // Signatures that do not exist stay errors: DATE + DATE, INT64 - DATE,
+  // DATE * anything, DATE + unparseable text.
+  EXPECT_THROW(static_cast<void>(eval(BinaryExpressionExp(
+                   dt, BinaryOperation::kAdd,
+                   ConstantValueExp(Value::Date("2020-01-01"))))),
+               std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(eval(BinaryExpressionExp(
+          ConstantValueExp(Value(1)), BinaryOperation::kSubtract, dt))),
+      std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(eval(BinaryExpressionExp(dt, BinaryOperation::kMultiply,
+                                                 ConstantValueExp(Value(2))))),
+      std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(eval(BinaryExpressionExp(
+          dt, BinaryOperation::kAdd, ConstantValueExp(Value("not a date"))))),
       std::runtime_error);
 }
 
@@ -1725,6 +1841,15 @@ TEST(ExpressionTest, QueryExpression_EvaluateWithContext_ExecutesSubquery) {
   FakeEvaluationContext plain_miss_ctx(
       {{Value(int64_t{1})}, {Value(int64_t{1})}});
   EXPECT_EQ(miss_subquery->Evaluate(row, schema, plain_miss_ctx), Value(false));
+  const Expression struct_in_subquery = QueryExpressionExp(
+      statement,
+      ConstantValueExp(Value(std::string(R"json({"f1":1,"f2":null})json"))),
+      false, false);
+  FakeEvaluationContext struct_miss_ctx(
+      {{Value(std::string(R"json({"f1":1,"f2":1})json"))},
+       {Value(std::string(R"json({"f1":2,"f2":1})json"))}});
+  EXPECT_TRUE(
+      struct_in_subquery->Evaluate(row, schema, struct_miss_ctx).IsNull());
   const Expression null_test_subquery =
       QueryExpressionExp(statement, ConstantValueExp(Value()), false, false);
   FakeEvaluationContext fresh_ctx({{Value(int64_t{1})}});

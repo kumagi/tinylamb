@@ -37,6 +37,7 @@ class BPlusTreeIterator {
   // iterator becomes invalid and records the failure in GetStatus(). Loops
   // that must distinguish "scan exhausted" from "IO corrupt" check
   // GetStatus() after the loop.
+  BPlusTreeIterator() = default;
   BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
                     std::string_view begin = "", std::string_view end = "",
                     bool ascending = true);
@@ -59,13 +60,13 @@ class BPlusTreeIterator {
   }
 
  private:
-  BPlusTree* tree_;
-  Transaction* txn_;
-  page_id_t pid_;
-  size_t idx_;
+  BPlusTree* tree_{nullptr};
+  Transaction* txn_{nullptr};
+  page_id_t pid_{0};
+  size_t idx_{0};
   std::string begin_;
   std::string end_;
-  bool valid_;
+  bool valid_{false};
   mutable Status status_{Status::kSuccess};
 };
 

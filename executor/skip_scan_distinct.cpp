@@ -242,6 +242,9 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
     }
   }
   finished_ = true;
+  if (status_ != Status::kSuccess) {
+    return FailWith(status_);
+  }
   return false;
 }
 

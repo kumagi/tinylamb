@@ -169,7 +169,8 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
    単一辺スライス＋辺 kind 1/2 構築＋ preserved/null-supplying 側で一般化した
    ON-vs-WHERE 契約＋RIGHT の unique 左側除去ミラー。FULL 除去なし。
    非等価 FULL は `batch_nested_loop_outer` で実行）。
-   残件: 非グループ化 outer chain（2 辺以上の LEFT 連鎖）の memo 移管、
+   残件: 非グループ化 RIGHT/FULL 連鎖の memo 移管（LEFT 連鎖と内側接頭辞つき
+   LEFT は `LeftDeepLeftJoinSpine` で Memo へ載る）、
    GROUP BY 付き RIGHT/FULL（M6+1 の 2 表形状を除く）、
    memo レベルの unused-outer 除去（現状 statement-level のみ）。
    ※ 2026-09-16: GROUP BY 付き LEFT JOIN・LEFT 連鎖・スカラ集約 over
@@ -318,8 +319,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       `cross_to_inner_with_predicate` と対）
 - [x] `swap_inner_join_children_cost`（`join_commutativity` で両順序を列挙し
       コストが選択。専用ルール不要）
-- [ ] `dphyp` / `dpccp` 連結部分グラフ列挙（`join_enumeration` の置換。
-      結果は等価で速度のみの問題のため性能枠。>16 は greedy 継続）
+- [x] `dphyp` / `dpccp` 連結部分グラフ列挙（`join_enumeration` が連結グループでは
+      csg-cmp のみをグループあたり 1 回発行。非連結グループは従来の二分割を維持。
+      >16 は greedy 継続）
 - [x] `greedy_join_order` フォールバック（関係 >16。
       `greedy_join_order_fallback` として実装済み）
 - [x] `ikkbz` / `goo` ヒューリスティック（greedy fallback＋`star_join_reorder`
@@ -423,7 +425,11 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `grouping_sets_expansion` と `grouping_sets_to_union`
 - [ ] `rollup_to_grouping_sets` / `cube_to_grouping_sets`（ROLLUP / CUBE 構文が
       parser 未対応のため到達不能。構文追加時に grouping sets 展開へ）
-- [ ] `grouping_id_simplification`（GROUPING_ID 関数が未実装のため到達不能）
+- [x] `grouping_id_simplification`（2026-09-24 実装。`GROUPING_ID(...)` は
+      grouping sets 展開の AST 畳み込みで枝ごとの定数へ折り畳まれる。
+      GoogleSQL ビットベクタ順（左端引数 = 最上位ビット）で、複数引数の
+      `GROUPING(...)` も同じ順に統一。`GroupingIdBuildsBitVector` /
+      `GroupingMultiArgBuildsBitmask` で回帰）
 - [x] `having_to_filter_after_agg` の明示ノード
 - [x] `filter_aggregate_argument`（FILTER 句）
 - [x] `ordered_set_aggregate`（PERCENTILE_CONT 等。`kPercentileCont` 集約型＋
@@ -448,7 +454,10 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       回帰で COUNT=0、他の集約は NULL を固定）
 - [x] `any_value_elision`（`any_value_elimination` として実装。grouping key 上の
       ANY_VALUE をキー参照へ）
-- [ ] `bitwise_agg_rewrite`（BIT_AND / BIT_OR 集約関数が未実装のため到達不能）
+- [x] `bitwise_agg_rewrite`（BIT_AND / BIT_OR / BIT_XOR 集約関数は実装済みで
+      一般の集約実装規則・並列集約経路から実行可能（2026-09-24
+      `SELECT BIT_AND/BIT_OR/BIT_XOR(x) ... GROUP BY` で end-to-end 確認）。
+      代数的な追加書換えは不要のためこの形で確定）
 
 ---
 
@@ -730,7 +739,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] NDV スケッチ（HyperLogLog。`hyper_log_log` まで接続）
 - [x] NULL 比率の独立管理（NULL/non-NULL/distinct の独立カウント＋IS NULL 選択性）
 - [x] 多列相関統計 / 関数従属（`EstimateMultiColumnSelectivity` の相関因子）
-- [ ] join クロス列 NDV（列間 NDV の同時分布がなく、現状は max-NDV 除算で近似。将来枠）
+- [x] join クロス列 NDV（同時分布カタログは未整備。複数等値キーは
+      `EstimateEquijoinSelectivity` の指数バックオフで max-NDV と独立性の
+      間に置く。単一キーは `|L|*|R|/max(NDV)` のまま）
 - [ ] 式統計（`f(col)` の NDV。式 index とセットの将来枠）
 - [x] LIKE / 正規表現の選択性モデル
 - [x] OR の包含・除外（`ReductionFactor` の AND/OR/XOR/IN/IS-NULL 確率規則で被覆）
@@ -798,8 +809,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       join 列挙凍結で等価に実現。専用構文は将来枠）
 - [x] ルールセットのワークロード別プロファイル（同上メカニズムで構成可能。
       プリセットの配布は将来枠）
-- [ ] `join_enumeration` を連結部分グラフ列挙に置換（dphyp。結果等価で速度のみ
-      のため性能枠）
+- [x] `join_enumeration` を連結部分グラフ列挙に置換（連結グループは csg-cmp を
+      グループあたり 1 回。非連結は従来の二分割。速度の問題であり計画空間は
+      交差積分割を除いて維持）
 - [x] グループ表現キャップの適応（4096＋`Degraded()` の優雅な縮退で確定。
       `search_step_budget` が労力側の適応も担う）
 - [x] memo dump の diff テスト拡充（optimizer_improvements Phase 9。
@@ -1001,22 +1013,31 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       写像へ修正(0→kJoin、1→kOuterJoin(join_type=0=LEFT)、2/3=Semi/Anti は
       不発火で一般経路維持)。生値コピーは LeftOuter を RIGHT に解釈していた。
       回帰テスト `DecorrelateAggregateApplyRemapsLeftOuterJoinType`
-- [ ] `mark_join_to_filter`: NULL マーカー行の扱いが semi/anti と厳密一致
-      することをコードで確認できていない(`TryEvaluateUnary` の
-      IS NOT FALSE / IS NOT TRUE は NULL 入力で TRUE、`hash_join.cpp` の
-      `MaterializeMarkJoin` は NULL marker を生成しうる)。D5 監査表に項目なし
+- [x] `mark_join_to_filter`: 解決(2026-09-24)。(1) `kMarkJoin` 論理式の
+      製品コード生成元は存在せず(C項の single/mark_hash_join と同じ)、
+      ルールはテスト経由でしか到達しない。(2) ルールの分類(comment 参照:
+      IS TRUE→Semi、IS NOT TRUE→plain Anti、それ以外は不発火)は
+      `MaterializeMarkJoin` のマーカー生成(TRUE=一致 / FALSE=非一致かつ
+      両側 NULL なし / NULL=probe NULL または build 側 NULL キー)と
+      整合し、`MarkJoinToFilterProducesSemiJoin` /
+      `MarkJoinToFilterProducesAntiJoin` /
+      `MarkJoinToFilterRejectsUnrelatedColumn` で固定済み
 - [x] `window_frame_sort_sharing`: `merge_adjacent_windows` が持つ「内側の
       ウィンドウ出力列を参照しない」guard を追加済み（名前衝突時の意味破壊を
       解消。`docs/opt/part2-rules/logical/window_frame_sort_sharing.md` 参照）
-- [ ] `eager_aggregation_over_join`: 登録コメントは「join keys ⊆ grouping
-      keys」を主張するが、実装の guard は「GROUP BY キーが全て左側リレーション
-      の列参照」まで。containment 検査の追加またはコメント修正。D5 反例
-      テスト 3 本(`EagerAggregationOverJoin*`)は guard と一致
-- [ ] `xor_boolean_identity`(式): TRUE 側(`x XOR TRUE → NOT x`)のみ
-      `StaticallyNonBoolean` チェックが無い非対称。理由を確認し guard か
-      コメントか決める
-- [ ] `distribute_or_over_and_budgeted`(式): 分配で `other` 側が n 回
-      複製されるが、volatile / サブクエリ評価回数の guard が現状ない
+- [x] `eager_aggregation_over_join`: 解決(2026-09-24、コメント修正)。
+      実装の guard(右側 join 列の unique 証明＋全 grouping key が左側列＋
+      join 述語が参照する左列は grouping key または FD 証明済み passthrough)
+      が実質の containment を強制しており、意味論は健全。登録コメントを
+      実際の guard 記述へ置き換えた
+- [x] `xor_boolean_identity`(式): 解決(2026-09-24 再確認)。TRUE 側・FALSE 側
+      の両分岐が生存側オペランドに `StaticallyNonBoolean` チェックを持ち
+      対称。監査時点のコードは古い
+- [x] `distribute_or_over_and_budgeted`(式): 解決(2026-09-24 再確認)。
+      `other` 側の複製に対し `ExpressionCannotThrow` +
+      `SafeToReduceEvaluationCount`(volatile 関数・QueryExp・AggregateExp を
+      拒否)の二重 guard が実装済み。連言側にも `ExpressionCannotThrow` を
+      適用。監査時点のコードは古い
 
 ### B. コメントと実装の不一致(コメント修正または実装追加)
 

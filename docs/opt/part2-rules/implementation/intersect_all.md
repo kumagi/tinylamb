@@ -41,7 +41,7 @@ if (children.size() < 2) {
 
 `SetOperationPlan::EnforcesDistinct()` は `kIntersectAll` に対して偽を返します（`plan/set_operation_plan.hpp`）。`kUnion`, `kIntersect`, `kExcept` のみ重複排除フラグを真とし、ALL つき集合演算では重複排除を提供しないことを明示します。物理実行器 `SetOperationExecutor::AppendIntersection`（`executor/set_operation.cpp`）は、フラグ `all = true` に基づいて各行の出現頻度の最小値を算出し、その回数分だけタプルを反復出力します。
 
-仮に `kIntersectAll` に対して重複排除を行う `kIntersect` の物理実行器を割り当てた場合、多重度が削がれてしまい結果の行数が減少します（例えば左 `{2, 2}` と右 `{2, 2}` の積において `{2, 2}` ではなく `{2}` が返される誤謬が発生します）。多重度保存の契約を遵守するため、物理演算種別の完全な分離が必要です。
+`kIntersectAll` に重複排除を行う `kIntersect` の物理実行器を割り当てると、多重度が失われて結果の行数が減ります。例えば左 `{2, 2}` と右 `{2, 2}` の共通部分は `{2, 2}` ですが、`kIntersect` では `{2}` になります。そのため、多重度を保存する演算と重複を排除する演算には、別の実装 Rule を割り当てます。
 
 ## 実装の詳細
 
@@ -77,4 +77,3 @@ return std::vector<PlanAlternative>{
 
 - `plan/cascades_test.cpp`:
   - `CascadesTest.SetOperationValidatesArityRelationsAndDropsProperties`: 集合演算の子ノード数検証およびプロパティ伝播抑制を検証します。
-

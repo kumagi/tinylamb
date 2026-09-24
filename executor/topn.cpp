@@ -38,21 +38,11 @@ Status TopNExecutor::Materialize() {
         }
         continue;
       }
-      // GoogleSQL ordering treats every NaN as a single value above +inf;
-      // the plain operator< returns false in both directions, which used to
-      // leave NaN rows in arbitrary arrival order and made ORDER BY + LIMIT
-      // (TopN) disagree with an unbounded SortExecutor.
-      if (lhs.type == ValueType::kDouble && rhs.type == ValueType::kDouble) {
-        const int cmp = CompareForOrderBy(lhs, rhs);
-        if (cmp == 0) {
-          continue;
-        }
-        return cmp < 0 ? keys_[i].ascending : !keys_[i].ascending;
-      }
-      if (lhs == rhs) {
+      const int cmp = CompareForOrderBy(lhs, rhs);
+      if (cmp == 0) {
         continue;
       }
-      return keys_[i].ascending ? lhs < rhs : rhs < lhs;
+      return cmp < 0 ? keys_[i].ascending : !keys_[i].ascending;
     }
     return left.sequence < right.sequence;
   };

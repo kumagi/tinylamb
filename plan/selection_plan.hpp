@@ -39,6 +39,10 @@ class SelectionPlan final : public PlanBase {
   ~SelectionPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override;
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override;
 
   [[nodiscard]] const Table* ScanSource() const override {
     return src_->ScanSource();

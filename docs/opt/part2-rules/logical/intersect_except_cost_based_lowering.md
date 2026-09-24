@@ -5,7 +5,7 @@
 
 ## 概要
 
-`intersect_except_cost_based_lowering` は、集合演算 `Intersect(L, R)` を全列等値条件による半結合 `SemiJoin(L, R, equality_on_all_columns)` へ、`Except(L, R)` を全列等値条件による反結合 `AntiJoin(L, R, equality_on_all_columns)` へとそれぞれ降格（lowering）する論理変換Ruleです。
+`intersect_except_cost_based_lowering` は、INTERSECT と EXCEPT に結合による代替案を追加する論理変換 Rule です。`Intersect(L, R)` は全列を等値条件とする `SemiJoin(L, R, equality_on_all_columns)` へ、`Except(L, R)` は同じ条件を持つ `AntiJoin(L, R, equality_on_all_columns)` へ変換します。
 
 物理的な集合演算実装（ハッシュ集合演算やソート集合演算）と、結合系物理実装（SemiHashJoin、AntiHashJoin 等）を同一 Memo 内の等価な選択肢として共存させ、探索エンジンがコストベースで最適な実装を選択できるようにします。
 
@@ -41,7 +41,7 @@ graph TD
 
 発火には以下のガード条件をすべて満たす必要があります。
 
-1. **対象演算子と入力数**: 対象演算子が `LogicalOperator::kIntersect` または `LogicalOperator::kExcept` であり、正確に2つの子グループを持つこと（bag 意味論の `kIntersectAll` / `kExceptAll` は対象外）。
+1. **対象演算子と入力数**: 対象演算子が `LogicalOperator::kIntersect` または `LogicalOperator::kExcept` であり、正確に2 つの子グループを持つこと（bag 意味論の `kIntersectAll` / `kExceptAll` は対象外）。
 2. **非循環性**: 左右の子グループが自己グループ自身でないこと（`left == group || right == group` の除外）。
 3. **関係集合の排他性と網羅性**: 左右の子グループの関係集合が互いに素（排他）であり、かつ両者の和集合が親グループの関係集合と完全に一致すること。
 4. **全列等値条件の導出成功**: ヘルパー関数 `BuildEqualityOnAllColumns` により、全列に対する等値結合述語が正常に構築できること。
@@ -80,20 +80,20 @@ INTERSECT は「右入力に同一行が存在する左入力行」を抽出し�
 ```
 
 - **全列等値述語の構築**: `BuildEqualityOnAllColumns` は、まず元の集合演算式に明示的な述語が存在すればそれを採用します。存在しない場合は `output_schema` や左右の入力スキーマを走査し、対応する属性同士を `kEquals` で結んだ連言式を合成して `CanonicalizeConjuncts` により正規化します。
-- **ALL変種の除外**: `kIntersectAll` および `kExceptAll` は行の重複度に応じたカウントベースの bag 演算であり、二値の存在判定に基づく SemiJoin / AntiJoin では意味を保存できないため、本Ruleの対象外としています。
+- **ALL変種の除外**: `kIntersectAll` および `kExceptAll` は行の重複度に応じたカウントベースの bag 演算であり、二値の存在判定に基づく SemiJoin / AntiJoin では意味を保存できないため、本 Rule の対象外としています。
 
 ## 最適化効果
 
-本Ruleの適用により、以下のトレードオフをコストベースで最適化できます。
+本 Rule の適用により、以下のトレードオフをコストベースで最適化できます。
 
 - **アクセスパスの柔軟性**: 集合演算専用の物理オペレータ（`intersect` / `except`）は双方の入力をソートまたはマテリアライズする必要があります。一方、SemiJoin / AntiJoin への降格により、右入力が小さい場合のインデックスルックアップ結合やインメモリハッシュ結合が選択可能になります。
-- **結合順序の再配置**: 結合形式となることで、他の結合リオーダリングRule（`push_semi_join_through_inner_join` 等）の適用候補となり、大域的な最適化が可能になります。
+- **結合順序の再配置**: 結合形式となることで、他の結合リオーダリング Rule（`push_semi_join_through_inner_join` 等）の適用候補となり、大域的な最適化が可能になります。
 
 ## 関連 Rule との相互作用
 
-- `intersect_to_semijoin` / `except_to_antijoin`: それぞれの演算子に特化した専用Ruleです。本Ruleと同一の論理代替を生成しますが、`Memo::AddExpression` の指紋照合により同一式は単一に集約されます。
-- `push_filter_past_setop`: 集合演算の上位に存在する選択演算を押し込むRuleです。
-- `semi_hash_join` / `anti_hash_join`（実装Rule）: 本Ruleによって導入された SemiJoin / AntiJoin を物理実行プランへと具体化します。
+- `intersect_to_semijoin` / `except_to_antijoin`: それぞれの演算子に特化した専用 Rule です。本 Rule と同一の論理代替を生成しますが、`Memo::AddExpression` の指紋照合により同一式は単一に集約されます。
+- `push_filter_past_setop`: 集合演算の上位に存在する選択演算を押し込む Rule です。
+- `semi_hash_join` / `anti_hash_join`（実装 Rule）: 本 Rule によって導入された SemiJoin / AntiJoin を物理実行プランへと具体化します。
 
 ## 検証テスト
 

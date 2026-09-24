@@ -89,9 +89,9 @@ ARRAY<STRUCT<id INT64, doubled INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=LateMaterialize payload after Limit]
+[plan_not_contains=LateMaterialize]
 [plan_not_contains=ScanColumns id,a,b,payload]
-[name=wide_column_lifetime_starts_after_topn]
+[name=topn_plan_does_not_claim_fake_late_materialization]
 SELECT id, payload FROM opt_metrics ORDER BY a DESC LIMIT 2
 --
 ARRAY<STRUCT<id INT64, payload STRING>>[{3, "gamma"}, {2, "beta"}]
@@ -158,7 +158,7 @@ ARRAY<STRUCT<id INT64, product INT64>>[{3, 150}, {2, 80}]
 
 [mode=explain]
 [plan_not_contains=Distinct]
-[plan_contains=UniqueKey id]
+[plan_not_contains=UniqueKey id]
 [name=distinct_over_key_preserving_projection_removed]
 SELECT DISTINCT id, a * 2 AS doubled FROM opt_metrics ORDER BY id
 --

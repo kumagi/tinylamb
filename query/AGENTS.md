@@ -25,7 +25,10 @@ executors. Entry points for CLI, server, benchmarks:
   level string prefix for SELECT/WITH only** (`ParseExplain` in
   `sql_engine.cpp`), rejected otherwise without executing anything.
 - `plan_cache.hpp`, `sql_template.{hpp,cpp}` — fingerprint + literal-binding
-  compiled-plan cache. EXPLAIN and non-templatable SQL never participate.
+  compiled-plan cache. SELECT/UPDATE/DELETE keep parameter slots and rebind
+  them on replay; a SELECT replay slower than 50 ms and 8× its first replay
+  is planned again. INSERT stays a per-execution slot clone in the
+  process-global cache. EXPLAIN and non-templatable SQL never participate.
 - `query_data.{hpp,cpp}` — optimizer input (compiled into `tinylamb_executor`
   for the `plan/ → query_data` edge). `join_reduction.*` — join simplification.
 - `testdata/googlesql_compliance/` + `googlesql_compliance_{file,test}.*` —

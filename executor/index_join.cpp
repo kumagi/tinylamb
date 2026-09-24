@@ -20,6 +20,8 @@
 
 #include "executor/index_join.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <memory>
 #include <ostream>
@@ -29,33 +31,107 @@
 
 #include "common/constants.hpp"
 #include "executor/executor_base.hpp"
+#include "expression/binary_expression.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "table/table.hpp"
+#include "transaction/transaction.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
+namespace {
+
+bool JoinValueEqual(const Value& left, const Value& right) {
+  if (left.IsNull() || right.IsNull()) {
+    return false;
+  }
+  const auto result = TryEvaluateBinary(BinaryOperation::kEquals, left, right);
+  return result.HasValue() && !result.Value().IsNull() &&
+         result.Value().Truthy();
+}
+
+bool JoinKeyUnmatchable(const Row& key) {
+  return std::ranges::any_of(key.values_, [](const Value& value) {
+    return value.type == ValueType::kDouble &&
+           std::isnan(value.value.double_value);
+  });
+}
+
+bool JoinRowsEqual(const Row& left, const Row& right) {
+  if (left.values_.size() != right.values_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < left.values_.size(); ++i) {
+    if (!JoinValueEqual(left[i], right[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+TransactionManager::IndexReadGuard AcquireIndexJoinReadGuard(
+    Transaction& txn, const Index& index,
+    TransactionManager::IndexReadGuard index_read_guard) {
+  if (index_read_guard.HoldsLock()) {
+    return index_read_guard;
+  }
+  return txn.AcquireIndexReadGuard(index.Root());
+}
+
+}  // namespace
+
 IndexJoin::IndexJoin(Transaction& txn, Executor left,
                      std::vector<slot_t> left_cols, const Table& tbl,
-                     const Index& idx, std::vector<slot_t> right_cols)
+                     const Index& idx, std::vector<slot_t> right_cols,
+                     TransactionManager::IndexReadGuard index_read_guard)
     : txn_(txn),
       left_(std::move(left)),
       left_cols_(std::move(left_cols)),
       right_(tbl),
       right_idx_(idx),
+      index_read_guard_(
+          AcquireIndexJoinReadGuard(txn, idx, std::move(index_read_guard))),
       right_it_(nullptr),
-      right_cols_(std::move(right_cols)) {}
+      right_cols_(std::move(right_cols)) {
+  if (txn_.IndexKeysMayBeStale(right_idx_.Root())) {
+    FailWith(Status::kConflicts);
+  }
+}
 
 bool IndexJoin::Load() {
+  if (GetStatus() != Status::kSuccess) {
+    return false;
+  }
   for (;;) {
     if (!left_->Next(&hold_left_, nullptr)) {
+      hold_left_.Clear();
+      if (left_->GetStatus() != Status::kSuccess) {
+        FailWith(left_->GetStatus());
+      }
       return false;
     }
-    Value left_key = hold_left_.Extract(left_cols_)[0];
+    const Row left_key = hold_left_.Extract(left_cols_);
+    if (JoinKeyUnmatchable(left_key) ||
+        std::ranges::any_of(left_key.values_, [](const Value& value) {
+          return value.IsNull();
+        })) {
+      continue;
+    }
+    std::vector<Value> seek_key;
+    const size_t seek_columns =
+        std::min(left_key.values_.size(), right_idx_.sc_.key_.size());
+    seek_key.assign(
+        left_key.values_.begin(),
+        left_key.values_.begin() + static_cast<std::ptrdiff_t>(seek_columns));
     right_it_ = std::make_unique<IndexScanIterator>(right_, right_idx_, txn_,
-                                                    left_key, left_key);
+                                                    seek_key, seek_key, true,
+                                                    false, &index_read_guard_);
     if (right_it_->IsValid()) {
       return true;
+    }
+    if (right_it_->GetStatus() != Status::kSuccess) {
+      FailWith(right_it_->GetStatus());
+      return false;
     }
   }
 }
@@ -65,20 +141,26 @@ bool IndexJoin::Next(Row* dst, RowPosition* /* rp */) {
     return false;
   }
   for (;;) {
-    Row left_key = hold_left_.Extract(left_cols_);
+    const Row left_key = hold_left_.Extract(left_cols_);
     Row right_row = **right_it_;
-    Row right_key = right_row.Extract(right_cols_);
+    const Row right_key = right_row.Extract(right_cols_);
     ++*right_it_;
     *dst = hold_left_ + right_row;
-    if (!right_it_->IsValid() && !Load()) {
-      const bool matched = left_key == right_key;
-      // The last matching row still has to be returned, but the next call must
-      // not reuse the exhausted right iterator.  Clearing the held outer row
-      // makes the next call enter Load(), which will report end-of-input.
+    if (!right_it_->IsValid()) {
+      if (right_it_->GetStatus() != Status::kSuccess) {
+        return FailWith(right_it_->GetStatus());
+      }
+      const bool matched = JoinRowsEqual(left_key, right_key);
       hold_left_.Clear();
-      return matched;
+      if (matched) {
+        return true;
+      }
+      if (!Load()) {
+        return false;
+      }
+      continue;
     }
-    if (left_key == right_key) {
+    if (JoinRowsEqual(left_key, right_key)) {
       return true;
     }
   }

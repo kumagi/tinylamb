@@ -28,6 +28,9 @@ bool MinMaxIndexExecutor::Next(Row* destination, RowPosition* position) {
       return true;
     }
   }
+  if (source_->GetStatus() != Status::kSuccess) {
+    return FailWith(source_->GetStatus());
+  }
 
   // MIN/MAX over an empty or all-NULL input is one row containing NULL.
   *destination = Row({Value()});

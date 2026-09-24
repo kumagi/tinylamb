@@ -26,6 +26,13 @@ class ValuesPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending,
+      const std::vector<std::optional<bool>>& nulls_first) const override {
+    static_cast<void>(nulls_first);
+    return IsOrderedBy(expressions, ascending);
+  }
   [[nodiscard]] const std::vector<Row>& Rows() const { return rows_; }
   [[nodiscard]] bool EnforcesDistinct() const override {
     return rows_.size() <= 1;
@@ -54,6 +61,12 @@ class DummyScanPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& /*expressions*/,
       const std::vector<bool>& /*ascending*/) const override {
+    return true;
+  }
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& /*expressions*/,
+      const std::vector<bool>& /*ascending*/,
+      const std::vector<std::optional<bool>>& /*nulls_first*/) const override {
     return true;
   }
   [[nodiscard]] bool EnforcesDistinct() const override { return true; }

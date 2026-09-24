@@ -10,6 +10,7 @@
 
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 
 namespace tinylamb {
 
@@ -79,6 +80,29 @@ std::string SortPlan::ToString() const {
   }
   output << "]";
   return output.str();
+}
+
+bool SortPlan::ContainsParameterSlots() const {
+  if (child_->ContainsParameterSlots()) {
+    return true;
+  }
+  return std::ranges::any_of(keys_, [](const SortKey& key) {
+    return ContainsParameterSlot(key.expression);
+  });
+}
+
+bool SortPlan::InstallParameterSlots(const std::vector<Value>& parameters,
+                                     size_t* cursor,
+                                     std::vector<Expression>* slots) {
+  if (!child_->InstallParameterSlots(parameters, cursor, slots)) {
+    return false;
+  }
+  for (SortKey& key : keys_) {
+    if (!SlotizeInPlace(&key.expression, parameters, cursor, slots)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace tinylamb

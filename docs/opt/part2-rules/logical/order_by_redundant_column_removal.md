@@ -5,7 +5,7 @@
 
 ## 概要
 
-`order_by_redundant_column_removal` は、ソート演算 `Sort(k1, k2, ...)` において、キー列のプレフィックス（接頭辞部分列）が一意（UNIQUE / PRIMARY KEY）であると静的に証明できる場合に、そのプレフィックスより後続に位置する冗長なソートキーを切り落とす論理変換Ruleです。
+`order_by_redundant_column_removal` は、ソート演算 `Sort(k1, k2, ...)` において、キー列のプレフィックス（接頭辞部分列）が一意（UNIQUE / PRIMARY KEY）であると静的に証明できる場合に、そのプレフィックスより後続に位置する冗長なソートキーを切り落とす論理変換 Rule です。
 
 キーのプレフィックスだけで全タプルが一意に識別される場合、後続のキーがタイブレーク（同順位の解消）に使われる局面は一切生じません。したがって、行の順序付け結果を厳密に保ったまま比較キー長を切り詰め、ソート処理を高速化します。
 
@@ -39,10 +39,10 @@ graph TD
 以下のガード条件をすべて満たす必要があります。
 
 1. **ソートノードの基本制約**: 式が `kSort` であり、単一の子ノードを持ち、ターゲットリストの要素数が2以上であること（`target_list.size() >= 2`。単一キーは対象外）。
-2. **非循環性の担保**: 入力グループが親グループ自身でないこと。
+2. **非循環性の保証**: 入力グループが親グループ自身でないこと。
 3. **キー列の純粋性**: 試行するプレフィックス長 `keep`（1 から `target_list.size() - 1`）について、先頭 `keep` 個のキーがすべて素の列参照（`TypeTag::kColumnValue`）であること（複雑な式キーが混在する場合はスキップ）。
 4. **一意性の証明**: 先頭 `keep` 個のキー列集合について、`input_group.logical_properties.IsUniqueOn(prefix)` が成立すること。
-5. **最短一致による単一登録**: 一意性が証明された最小の `keep` で代替式を1つ登録し、直ちに処理を終了（`return`）すること。
+5. **最短一致による単一登録**: 一意性が証明された最小の `keep` で代替式を1 つ登録し、直ちに処理を終了（`return`）すること。
 
 ```cpp
             LogicalExpression trimmed = expression;
@@ -59,11 +59,11 @@ graph TD
 
 ## 意味論的根拠と物理実行の契約
 
-ソートの順序関係は、辞書式順序（Lexicographical Order）として定義されます。キー列のプレフィックス $K_{\text{prefix}}$ においてすべてのタプルが異なる値をとる（一意である）ならば、任意の2行 $r_1, r_2$ について $K_{\text{prefix}}(r_1) \neq K_{\text{prefix}}(r_2)$ が常に成立します。このため、後続のキー $K_{\text{suffix}}$ の比較ステップへ到達することは論理的にあり得ず、タプル間の順序比較結果はプレフィックスのみで確定します。
+ソートの順序関係は、辞書式順序（Lexicographical Order）として定義されます。キー列のプレフィックス $K_{\text{prefix}}$ においてすべてのタプルが異なる値をとる（一意である）ならば、任意の2 行 $r_1, r_2$ について $K_{\text{prefix}}(r_1) \neq K_{\text{prefix}}(r_2)$ が常に成立します。このため、後続のキー $K_{\text{suffix}}$ の比較ステップへ到達することは論理的にあり得ず、タプル間の順序比較結果はプレフィックスのみで確定します。
 
 証明とプロパティ維持の根拠は以下の通りです。
 
-- **一意性判定（`IsUniqueOn`）**: `LogicalProperties` において、入力が最大1行（`max_1_row`）であるか、またはカタログ由来の候補キー（Candidate Keys）のいずれかが指定列集合に内包されているかを厳密に判定します。
+- **一意性判定（`IsUniqueOn`）**: `LogicalProperties` において、入力が最大1 行（`max_1_row`）であるか、またはカタログ由来の候補キー（Candidate Keys）のいずれかが指定列集合に内包されているかを厳密に判定します。
 - **順序仕様の保存**: 残存する各キーの昇順／降順指定（`sort_ascending`）および NULLS FIRST / NULLS LAST 指定（`sort_nulls_first`）は完全に保存され、切り落とされる後続キーの要素分のみ配列サイズを縮小します。
 
 ## 実装の詳細
@@ -97,18 +97,18 @@ graph TD
 
 ## 最適化効果
 
-本Ruleの適用により、以下の性能向上が得られます。
+本 Rule の適用により、以下の性能向上が得られます。
 
 - **比較処理のオーバーヘッド削減**: ソート実行時におけるキー比較関数呼び出し回数および複数列比較の分岐が削減されます。
 - **順序プロパティ照合の容易化**: 短縮されたソートキーは、要求された物理プロパティ（`PhysicalProperties::ordering`）との一致判定を満たしやすくなり、不要な明示的ソートオペレータの挿入（SortEnforcer）を未然に防止します。
 
 ## 関連 Rule との相互作用
 
-- `eliminate_double_sort`: 同一の順序仕様を持つ多段ソートを1段に縮約するRuleです。
+- `eliminate_double_sort`: 同一の順序仕様を持つ多段ソートを1 段に縮約する Rule です。
 - `limit_push_through_sort` / `rank_row_number_to_topn`: ソートキーが最短化されることで、TopN アルゴリズムやインデックススキャンとの親和性が向上します。
-- `pk_unique_distinct_elimination`: 同一の `LogicalProperties::IsUniqueOn` 一意性証明基盤を利用するRuleです。
+- `pk_unique_distinct_elimination`: 同一の `LogicalProperties::IsUniqueOn` 一意性証明基盤を利用する Rule です。
 
 ## 検証テスト
 
 - `plan/cascades_test.cpp`:
-  - `CascadesTest.OrderByRedundantColumnRemoval`: PRIMARY KEY 列 `t.pk` と任意列 `x` を含む `Sort(pk, x)` から、キー1個の `Sort(pk)` 代替式が正しく生成されることを検証。
+  - `CascadesTest.OrderByRedundantColumnRemoval`: PRIMARY KEY 列 `t.pk` と任意列 `x` を含む `Sort(pk, x)` から、キー1 個の `Sort(pk)` 代替式が正しく生成されることを検証。

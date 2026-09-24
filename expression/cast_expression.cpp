@@ -712,12 +712,15 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
     return {ValueType::kInt64, TypeTag::kBigInt};
   }
   if (upper == "FLOAT64" || upper == "DOUBLE" || upper == "FLOAT" ||
-      upper == "FLOAT32") {
+      upper == "FLOAT32" || upper == "NUMERIC" || upper == "BIGNUMERIC" ||
+      upper == "DECIMAL") {
+    // NUMERIC/DECIMAL/BIGNUMERIC map onto the engine's DOUBLE numeric
+    // surface (the same mapping CREATE TABLE uses for numeric columns), so
+    // CAST(x AS DECIMAL(p,s)) yields a numeric value, not text.
     return {ValueType::kDouble, TypeTag::kDouble};
   }
   if (upper == "STRING" || upper == "VARCHAR" || upper == "TEXT" ||
-      upper == "BYTES" || upper == "JSON" || upper == "NUMERIC" ||
-      upper == "BIGNUMERIC" || upper == "DECIMAL" || upper == "DATETIME" ||
+      upper == "BYTES" || upper == "JSON" || upper == "DATETIME" ||
       upper == "TIMESTAMP" || upper == "TIME" || upper == "INTERVAL" ||
       upper.find("PB") != std::string::npos ||
       upper.find("PROTO") != std::string::npos) {
@@ -1824,6 +1827,11 @@ StatusOr<Value> CastExpression::TryEvaluate(const Row& row,
                                             EvaluationContext& context) const {
   ASSIGN_OR_RETURN(Value, val, child_->TryEvaluate(row, schema, context));
   return TryCastValue(val, target_type_name_, target_value_type_,
+                      return_null_on_error_);
+}
+
+StatusOr<Value> CastExpression::TryCast(const Value& value) const {
+  return TryCastValue(value, target_type_name_, target_value_type_,
                       return_null_on_error_);
 }
 

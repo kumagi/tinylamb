@@ -33,6 +33,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/lambda_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
@@ -178,7 +179,7 @@ struct JVal {
   }
 };
 
-JVal ParseJsonSimple(std::string_view& s);
+JVal ParseJsonSimple(std::string_view& s, size_t depth = 0);
 
 void SkipWs(std::string_view& s) {
   while (!s.empty() && (s.front() == ' ' || s.front() == '\t' ||
@@ -218,9 +219,15 @@ std::string ParseJsonStringToken(std::string_view& s) {
   return res;
 }
 
-JVal ParseJsonSimple(std::string_view& s) {
+JVal ParseJsonSimple(std::string_view& s, size_t depth) {
   SkipWs(s);
   JVal v;
+  // Bound recursion: a hostile nest of '[' or '{' would otherwise blow the
+  // stack (Bug 68, mirrored in expression_eval.cpp's parse_j).
+  constexpr size_t kMaxJsonDepth = 512;
+  if (depth > kMaxJsonDepth) {
+    return v;
+  }
   if (s.empty()) {
     return v;
   }
@@ -256,7 +263,13 @@ JVal ParseJsonSimple(std::string_view& s) {
     v.type = JVal::kArr;
     SkipWs(s);
     while (!s.empty() && s.front() != ']') {
-      v.arr.push_back(std::make_shared<JVal>(ParseJsonSimple(s)));
+      const size_t before = s.size();
+      v.arr.push_back(std::make_shared<JVal>(ParseJsonSimple(s, depth + 1)));
+      // An unrecognized token consumes nothing (empty JVal); without a
+      // progress check "[x" would loop forever and exhaust memory.
+      if (s.size() >= before) {
+        break;
+      }
       SkipWs(s);
       if (!s.empty() && s.front() == ',') {
         s.remove_prefix(1);
@@ -284,7 +297,7 @@ JVal ParseJsonSimple(std::string_view& s) {
         s.remove_prefix(1);
         SkipWs(s);
       }
-      JVal child = ParseJsonSimple(s);
+      JVal child = ParseJsonSimple(s, depth + 1);
       v.obj.emplace_back(std::move(key),
                          std::make_shared<JVal>(std::move(child)));
       SkipWs(s);
@@ -490,8 +503,7 @@ bool ExtractRegexPrefix(std::string_view pattern, std::string& prefix,
 }
 
 bool Same(const Expression& left, const Expression& right) {
-  return left == right || (left && right && left->Type() == right->Type() &&
-                           left->ToString() == right->ToString());
+  return SamePrintedExpression(left, right);
 }
 
 bool IsConstant(const Expression& expression) {
@@ -821,6 +833,10 @@ bool StaticallyNonBoolean(const Expression& expression) {
 
 }  // namespace
 
+bool ExpressionCannotThrowForPlanner(const Expression& expression) {
+  return ExpressionCannotThrow(expression);
+}
+
 Value EvaluateJsonFunctionCall(std::string_view func_name,
                                std::string_view json_str,
                                std::string_view path_str) {
@@ -881,8 +897,20 @@ bool ExpressionPattern::Match(  // NOLINT(misc-no-recursion)
       expression->AsUnaryExpression().Op() != *unary_operation_) {
     return false;
   }
+  if (children_.empty()) {
+    if (capture_.empty()) {
+      return true;
+    }
+    const auto found = bindings->find(capture_);
+    if (found == bindings->end()) {
+      bindings->emplace(capture_, expression);
+      return true;
+    }
+    return Same(found->second, expression);
+  }
+
   const std::vector<Expression> children = ExpressionChildren(expression);
-  if (!children_.empty() && children.size() != children_.size()) {
+  if (children.size() != children_.size()) {
     return false;
   }
 
@@ -1080,6 +1108,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         AnyBinary(Is(TypeTag::kConstantValue, "left"),
                   Is(TypeTag::kConstantValue, "right")),
         [](const Expression& expression, const ExpressionBindings&) {
+          // Parameter slots share Type() with constants. Folding them to a
+          // value would freeze the fill-time literal.
+          if (ContainsParameterSlot(expression)) {
+            return Expression{};
+          }
           if (StatusOr<Value> folded = expression->TryEvaluate(Row(), Schema());
 
               folded.HasValue()) {
@@ -1091,6 +1124,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     built.Add(ExpressionRule(
         "fold_unary", AnyUnary(Is(TypeTag::kConstantValue, "child")),
         [](const Expression& expression, const ExpressionBindings&) {
+          if (ContainsParameterSlot(expression)) {
+            return Expression{};
+          }
           if (StatusOr<Value> folded = expression->TryEvaluate(Row(), Schema());
 
               folded.HasValue()) {
@@ -1105,6 +1141,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           const std::vector<Expression> children =
               ExpressionChildren(expression);
           if (!std::ranges::all_of(children, IsConstant)) {
+            return Expression{};
+          }
+          if (ContainsParameterSlot(expression)) {
             return Expression{};
           }
           if (StatusOr<Value> folded = expression->TryEvaluate(Row(), Schema());
@@ -1128,6 +1167,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           };
           if (!std::ranges::all_of(ExpressionChildren(expression),
                                    is_literal)) {
+            return Expression{};
+          }
+          if (ContainsParameterSlot(expression)) {
             return Expression{};
           }
           if (StatusOr<Value> folded = expression->TryEvaluate(Row(), Schema());
@@ -1299,6 +1341,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             case BinaryOperation::kNotEquals:
               break;
             default: {
+              if (ActiveRewriteSchema() == nullptr) {
+                return Expression{};
+              }
               // StaticallyDouble() cannot see DOUBLE literals buried under a
               // column-typed expression (unknown columns throw out of
               // ResultType), so probe the operand subtrees for anything that
@@ -1366,22 +1411,25 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           const bool has_left = ConstantBool(bindings.at("left"), &left);
           const bool has_right = ConstantBool(bindings.at("right"), &right);
           if (has_right) {
+            // x XOR TRUE -> NOT x and x XOR FALSE -> x both presume the
+            // surviving side is boolean-valued; a statically non-boolean
+            // operand (e.g. an INT64 literal) keeps its XOR error semantics.
+            if (StaticallyNonBoolean(bindings.at("left"))) {
+              return Expression{};
+            }
             if (right) {
               return UnaryExpressionExp(bindings.at("left"),
                                         UnaryOperation::kNot);
             }
-            if (StaticallyNonBoolean(bindings.at("left"))) {
-              return Expression{};
-            }
             return bindings.at("left");
           }
           if (has_left) {
+            if (StaticallyNonBoolean(bindings.at("right"))) {
+              return Expression{};
+            }
             if (left) {
               return UnaryExpressionExp(bindings.at("right"),
                                         UnaryOperation::kNot);
-            }
-            if (StaticallyNonBoolean(bindings.at("right"))) {
-              return Expression{};
             }
             return bindings.at("right");
           }
@@ -1663,7 +1711,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         [](const Expression&, const ExpressionBindings& bindings) {
           if (!StaticallyInt64(bindings.at("inner")) ||
               !IsInt64Constant(bindings.at("first")) ||
-              !IsInt64Constant(bindings.at("second"))) {
+              !IsInt64Constant(bindings.at("second")) ||
+              ContainsParameterSlot(bindings.at("first")) ||
+              ContainsParameterSlot(bindings.at("second"))) {
             return Expression{};
           }
           // INT64 add/sub is not associative around overflow. Reassociating
@@ -1703,7 +1753,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         [](const Expression&, const ExpressionBindings& bindings) {
           if (!StaticallyInt64(bindings.at("inner")) ||
               !IsInt64Constant(bindings.at("first")) ||
-              !IsInt64Constant(bindings.at("second"))) {
+              !IsInt64Constant(bindings.at("second")) ||
+              ContainsParameterSlot(bindings.at("first")) ||
+              ContainsParameterSlot(bindings.at("second"))) {
             return Expression{};
           }
           // See reassociate_add_constants: `(x - a) - b -> x - (a + b)` is
@@ -1759,6 +1811,16 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           for (const auto& [condition, result] : source.when_clauses_) {
             if (!Same(result, source.else_clause_)) {
+              return Expression{};
+            }
+            // ToString equality alone would fold `THEN 1.0 ELSE 1` and
+            // hand back the ELSE's ValueType; the taken branch's runtime
+            // type drives numeric promotion upstream, so constants must
+            // agree in type as well as text.
+            if (result->Type() == TypeTag::kConstantValue &&
+                source.else_clause_->Type() == TypeTag::kConstantValue &&
+                result->AsConstantValue().GetValue().type !=
+                    source.else_clause_->AsConstantValue().GetValue().type) {
               return Expression{};
             }
             // Collapsing drops every condition evaluation; a throwing
@@ -1863,7 +1925,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         [](const Expression&, const ExpressionBindings& bindings) {
           if (!StaticallyInt64(bindings.at("inner")) ||
               !IsInt64Constant(bindings.at("first")) ||
-              !IsInt64Constant(bindings.at("second"))) {
+              !IsInt64Constant(bindings.at("second")) ||
+              ContainsParameterSlot(bindings.at("first")) ||
+              ContainsParameterSlot(bindings.at("second"))) {
             return Expression{};
           }
           // `(x - a) + b -> x + (b - a)`: the two addends applied to x are
@@ -1920,7 +1984,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         [](const Expression&, const ExpressionBindings& bindings) {
           if (!StaticallyInt64(bindings.at("inner")) ||
               !IsInt64Constant(bindings.at("first")) ||
-              !IsInt64Constant(bindings.at("second"))) {
+              !IsInt64Constant(bindings.at("second")) ||
+              ContainsParameterSlot(bindings.at("first")) ||
+              ContainsParameterSlot(bindings.at("second"))) {
             return Expression{};
           }
           // `(x + a) - b -> x + (a - b)`: addends +a and -b share a sign only
@@ -2300,6 +2366,12 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           // expression or a subquery would change meaning under the rewrite.
           if (!SafeToReduceEvaluationCount(a) ||
               !SafeToReduceEvaluationCount(b)) {
+            return Expression{};
+          }
+          // A statically non-boolean operand must keep the XOR's type-error
+          // semantics: the boolean OR/AND expansion (and downstream folds
+          // like `x OR TRUE -> TRUE`) would silently erase it.
+          if (StaticallyNonBoolean(a) || StaticallyNonBoolean(b)) {
             return Expression{};
           }
           return BinaryExpressionExp(
@@ -3153,7 +3225,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 c->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
               const Expression& l = c->AsBinaryExpression().Left();
               const Expression& r = c->AsBinaryExpression().Right();
-              if (l && r && !IsConstant(l) && !IsConstant(r)) {
+              if (l && r && !IsConstant(l) && !IsConstant(r) &&
+                  SafeToReduceEvaluationCount(l) &&
+                  SafeToReduceEvaluationCount(r)) {
                 Expression l_not_null =
                     UnaryExpressionExp(l, UnaryOperation::kIsNotNull);
                 Expression r_not_null =
@@ -3605,6 +3679,9 @@ StatusOr<Expression> ExpressionRewriter::TryRewriteOnce(
   Expression current =
       children_changed ? WithExpressionChildren(expression, std::move(children))
                        : expression;
+  if (ContainsParameterSlot(current)) {
+    return current;
+  }
   for (const ExpressionRule& rule : rules_->Rules()) {
     // D6 (docs/design.md): predicate-adding rules fire only at the root so
     // their inferred conjuncts cannot be re-appended inside nested ANDs and
@@ -3725,6 +3802,7 @@ Expression WithExpressionChildren(const Expression& expression,
       const auto& aggregate = expression->AsAggregateExpression();
       auto rebuilt = std::make_shared<AggregateExpression>(
           aggregate.GetType(), std::move(children[0]), aggregate.Distinct());
+      rebuilt->SetIgnoreNulls(aggregate.IgnoreNulls());
       if (aggregate.Having() != AggregateHavingModifier::kNone ||
           aggregate.HavingCondition()) {
         rebuilt->SetHaving(aggregate.Having(), aggregate.HavingCondition());
@@ -4033,6 +4111,9 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
   Expression current =
       children_changed ? WithExpressionChildren(expression, std::move(children))
                        : expression;
+  if (ContainsParameterSlot(current)) {
+    return current;
+  }
   if (current->Type() != TypeTag::kBinaryExp) {
     return current;
   }

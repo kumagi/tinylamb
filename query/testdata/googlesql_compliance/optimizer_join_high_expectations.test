@@ -61,10 +61,11 @@ ARRAY<STRUCT<order_id INT64, customer_name STRING>>[
 ==
 
 [mode=explain]
-[plan_contains=JoinOrder=greedy_filtered_cardinality]
+[plan_contains=HashJoin]
 [plan_contains=opt_regions]
 [plan_not_contains=CrossJoin]
-[name=three_way_join_starts_with_selective_relation]
+[plan_not_contains=HeuristicJoinOrder=]
+[name=three_way_join_uses_non_cross_connected_plan]
 SELECT o.order_id, r.region_name
 FROM opt_orders o
 JOIN opt_customers c ON o.customer_id = c.customer_id
@@ -315,9 +316,10 @@ ARRAY<STRUCT<left_id INT64, right_id INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=JoinOrder=greedy_filtered_cardinality]
-[plan_not_contains=JoinOrder=syntactic]
-[name=inner_join_reordering_ignores_written_order]
+[plan_contains=HashJoin]
+[plan_not_contains=CrossJoin]
+[plan_not_contains=HeuristicJoinOrder=]
+[name=four_way_join_uses_non_cross_connected_plan]
 SELECT l.line_id, r.region_name
 FROM opt_regions r
 JOIN opt_customers c ON r.region_id = c.region_id

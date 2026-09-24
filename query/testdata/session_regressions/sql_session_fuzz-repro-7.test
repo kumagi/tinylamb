@@ -1,0 +1,13 @@
+-- tinylamb-session-test v1
+-- seed: 7
+-- stmt: CREATE TABLE tbl0 (u INT64, c1 INT64, c2 INT64, c3 VARCHAR(8));
+-- stmt: INSERT INTO tbl0 VALUES (0, 3, 0, 'a');
+-- stmt: INSERT INTO tbl0 VALUES (1, NULL, NULL, 'a');
+-- stmt: INSERT INTO tbl0 VALUES (2, NULL, 0, 'bb');
+-- stmt: INSERT INTO tbl0 VALUES (3, -1, -1, NULL);
+-- commit
+-- begin2
+-- stmt2: UPDATE tbl0 SET c2 = (CASE WHEN ((c3 IS NOT NULL) AND (c3 IS NOT NULL)) THEN u ELSE c2 END) WHERE tbl0.u = 0;
+-- stmt2: UPDATE tbl0 SET c1 = c1 WHERE tbl0.u = 0;
+-- stmt: INSERT INTO tbl0 VALUES (4, -1, 2, 'bb');
+-- failure: concurrent write-intent violated: UPDATE tbl0 SET c1 = c1 WHERE tbl0.u = 0; succeeded while txn 1 holds the row

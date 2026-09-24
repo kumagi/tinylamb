@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -59,13 +60,31 @@ class QueryTest : public ::testing::Test {
  public:
   void SetUp() override {
     prefix_ = "query_test-" + RandomString();
+    prefixes_.push_back(prefix_);
     db_ = Database::Create(prefix_).MoveValue();
+    engines_.push_back(std::make_unique<SqlEngine>(*db_));
   }
 
-  void TearDown() override { db_->DeleteAll(); }
+  void TearDown() override {
+    engines_.clear();
+    db_.reset();
+    // Last resort: the files are uniquely prefixed, sweep them directly.
+    for (const auto& prefix : prefixes_) {
+      static_cast<void>(::remove((prefix + ".db").c_str()));
+      tinylamb::RemoveLogAndSegments((prefix + ".log"));
+    }
+  }
+
+  std::unique_ptr<Database> MakeDatabase() {
+    std::string p = "query_test-" + RandomString();
+    prefixes_.push_back(p);
+    return Database::Create(p).MoveValue();
+  }
 
   std::string prefix_;
   std::unique_ptr<Database> db_;
+  std::vector<std::unique_ptr<SqlEngine>> engines_;
+  std::vector<std::string> prefixes_;
 };
 
 namespace {
@@ -86,6 +105,451 @@ std::vector<Row> RunSql(TransactionContext& ctx, Database& db,
   return rows;
 }
 }  // namespace
+
+TEST_F(QueryTest, TableSampleExecutorSemantics) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE sample_t (id INT64, part INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO sample_t VALUES (1, 10), (2, 10), (3, 20), (4, 20), "
+         "(5, 30);");
+
+  SqlEngine engine(*db_);
+  const auto run = [&](std::string_view sql) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                      << engine.LastError();
+    std::vector<Row> rows;
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+
+  const std::vector<Row> sampled =
+      run("SELECT * FROM sample_t TABLESAMPLE RESERVOIR(2 ROWS) "
+          "WITH WEIGHT ORDER BY id;");
+  ASSERT_EQ(sampled.size(), 2U);
+  EXPECT_EQ(sampled[0].values_.size(), 3U);
+  EXPECT_DOUBLE_EQ(sampled[0][2].value.double_value, 2.5);
+  EXPECT_DOUBLE_EQ(sampled[1][2].value.double_value, 2.5);
+
+  const std::vector<Row> derived_count =
+      run("SELECT COUNT(*) FROM (SELECT id, part FROM sample_t) d "
+          "TABLESAMPLE RESERVOIR(0 ROWS);");
+  ASSERT_EQ(derived_count.size(), 1U);
+  EXPECT_EQ(derived_count[0][0].value.int_value, 0);
+
+  const std::vector<Row> partition_count =
+      run("SELECT part, COUNT(*) FROM (SELECT part FROM sample_t) d "
+          "TABLESAMPLE RESERVOIR(1 ROWS PARTITION BY part) "
+          "GROUP BY part ORDER BY part;");
+  ASSERT_EQ(partition_count.size(), 3U);
+  EXPECT_EQ(partition_count[0][0].value.int_value, 10);
+  EXPECT_EQ(partition_count[1][0].value.int_value, 20);
+  EXPECT_EQ(partition_count[2][0].value.int_value, 30);
+
+  const std::string repeatable =
+      "SELECT id FROM sample_t TABLESAMPLE RESERVOIR(2 ROWS) "
+      "REPEATABLE(7) ORDER BY id;";
+  const std::vector<Row> first_repeat = run(repeatable);
+  const std::vector<Row> second_repeat = run(repeatable);
+  ASSERT_EQ(first_repeat.size(), 2U);
+  EXPECT_EQ(second_repeat.size(), first_repeat.size());
+  for (size_t i = 0; i < first_repeat.size(); ++i) {
+    EXPECT_EQ(second_repeat[i][0].value.int_value,
+              first_repeat[i][0].value.int_value);
+  }
+}
+
+// Bug 48 regression: UPDATE/DELETE with a non-correlated `x IN (SELECT ...)`
+// must actually apply.  Before DecorateDmlWhere the predicate fell into the
+// scalar evaluator ("requires relational evaluation", masked as a sticky
+// executor error) or lost row positions to a semi-join wrap.
+// Bug 55 regression: ANY/ALL, non-correlated EXISTS and scalar subqueries
+// in a DML WHERE must fold (and apply) instead of falling into the scalar
+// evaluator's "requires relational evaluation" error; a WITH-bearing inner
+// keeps the engine's documented unimplemented rejection.
+// Bug 55 companion: the prepare-time subquery fold must reach the UPDATE
+// SET values and INSERT VALUES, not only the WHERE clause.
+TEST_F(QueryTest, DmlSetAndValuesFoldSubqueries) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE s (k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20);");
+  RunSql(ctx, *db_, "INSERT INTO s VALUES (7);");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+
+  RunSql(ctx, *db_, "UPDATE t SET v = (SELECT MIN(k) FROM s);");
+  const std::vector<Row> after_set =
+      RunSql(ctx, *db_, "SELECT k, v FROM t ORDER BY k;");
+  ASSERT_EQ(after_set.size(), 2U);
+  EXPECT_EQ(after_set[0][1].value.int_value, 7);
+  EXPECT_EQ(after_set[1][1].value.int_value, 7);
+
+  RunSql(ctx, *db_, "UPDATE t SET v = v + (SELECT MAX(k) FROM s) WHERE k = 1;");
+  const std::vector<Row> after_add =
+      RunSql(ctx, *db_, "SELECT k, v FROM t ORDER BY k;");
+  EXPECT_EQ(after_add[0][1].value.int_value, 14);
+
+  RunSql(ctx, *db_,
+         "UPDATE t SET v = CASE WHEN EXISTS (SELECT 1 FROM s) THEN 99 "
+         "ELSE 1 END;");
+  const std::vector<Row> after_case =
+      RunSql(ctx, *db_, "SELECT k, v FROM t ORDER BY k;");
+  EXPECT_EQ(after_case[0][1].value.int_value, 99);
+
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (3, (SELECT k FROM s));");
+  const std::vector<Row> after_insert =
+      RunSql(ctx, *db_, "SELECT k, v FROM t ORDER BY k;");
+  ASSERT_EQ(after_insert.size(), 3U);
+  EXPECT_EQ(after_insert[2][1].value.int_value, 7);
+}
+
+TEST_F(QueryTest, AggregateRewritesPreserveInnerLimitAndDistinctModifiers) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE agg_modifiers (v INT64, u INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO agg_modifiers VALUES (100, 1), (1, 2), (2, 3);");
+  const auto array_rows =
+      RunSql(ctx, *db_,
+             "SELECT ARRAY_AGG(v ORDER BY u LIMIT 1) FROM agg_modifiers "
+             "WHERE u > 0;");
+  ASSERT_EQ(array_rows.size(), 1U);
+  ASSERT_TRUE(array_rows[0][0].IsArray());
+  ASSERT_EQ(array_rows[0][0].ArrayElements().size(), 1U);
+  EXPECT_EQ(array_rows[0][0].ArrayElements()[0], Value(int64_t{100}));
+
+  const auto count_rows =
+      RunSql(ctx, *db_,
+             "SELECT COUNT(DISTINCT v ORDER BY u LIMIT 1) FROM agg_modifiers "
+             "WHERE u > 0;");
+  ASSERT_EQ(count_rows.size(), 1U);
+  EXPECT_EQ(count_rows[0][0], Value(int64_t{1}));
+}
+
+TEST_F(QueryTest, WindowFilterDoesNotConfuseQualifiedPartitionColumns) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE window_a (x INT64, v INT64, id INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE window_b (aid INT64, x INT64);");
+  RunSql(ctx, *db_, "INSERT INTO window_a VALUES (1, 10, 1), (1, 20, 2);");
+  RunSql(ctx, *db_, "INSERT INTO window_b VALUES (1, 1), (2, 2);");
+  const auto rows = RunSql(ctx, *db_,
+                           "SELECT a.x, SUM(a.v) OVER (PARTITION BY a.x) AS s "
+                           "FROM window_a a JOIN window_b b ON a.id = b.aid "
+                           "QUALIFY b.x = 1 ORDER BY a.x;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][1], Value(int64_t{30}));
+}
+
+// Bug 56 regression: non-equality quantified subqueries must keep their
+// operator/mode through planning (no equality-semijoin lowering), in SELECT
+// and DML alike, including the NOT-wrapped empty-subquery edge.
+// Differential for the prepare-time quantifier fold (Bugs 48/55/57):
+// the SAME DML must modify the same rows whether it goes through the
+// Cascades/vectorized route (folds apply) or the forced-relational route
+// (row-level quantified evaluator).  Crosses operators, ANY/ALL, NOT,
+// NULL and empty inner tables.
+// Bug 60 regression: the template cache must round-trip quantifier
+// op/mode. Running the same DML text twice through one SqlEngine hits
+// the template cache on the second Prepare; before the fix the
+// `NOT ... < ALL` predicate degraded to IN membership and updated 0
+// rows instead of 2.
+TEST_F(QueryTest, TemplateCacheKeepsQuantifierMode) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t0 (u INT64, c1 INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE t1 (u INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t1 VALUES (1), (2), (1);");
+  RunSql(ctx, *db_, "INSERT INTO t0 VALUES (1, 2), (2, 9);");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+  const std::string sql =
+      "UPDATE t0 SET c1 = -1 WHERE NOT u < ALL (SELECT u FROM t1);";
+  const std::vector<Row> first = RunSql(ctx, *db_, sql);
+  ASSERT_EQ(first.size(), 1U);
+  EXPECT_EQ(first[0][1].value.int_value, 2);
+  RunSql(ctx, *db_, "UPDATE t0 SET c1 = 5 WHERE u = 2;");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+  const std::vector<Row> second = RunSql(ctx, *db_, sql);
+  ASSERT_EQ(second.size(), 1U);
+  // t1 is unchanged ({1,2,1}): neither row satisfies u < ALL(t1), so the
+  // correct predicate is TRUE for both rows. The pre-fix template cache
+  // degraded it to IN membership and matched 0 rows here.
+  EXPECT_EQ(second[0][1].value.int_value, 2)
+      << "second pass lost the quantifier via the template cache";
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT u, c1 FROM t0 ORDER BY u;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][1].value.int_value, -1);
+  EXPECT_EQ(rows[1][1].value.int_value, -1);
+}
+
+// Bug 69 regression: template rebinding must round-trip the ARRAY(SELECT ...)
+// element-type annotation on QueryExpression.  Before the fix the second
+// execution of the same SQL text rebound the cached plan with
+// `array_element_sql_type_` dropped, so the runtime element-type inference
+// emitted ARRAY<STRING> where the first (cached-tree) run emitted
+// ARRAY<INT64>.  The lambda desugars to ARRAY(SELECT ... FROM UNNEST ...) and
+// the `1` literal makes the statement templatable.
+TEST_F(QueryTest, TemplateCacheKeepsArraySubqueryElementType) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, arr ARRAY<INT64>);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, [3, 1, 2]);");
+  const std::string sql = "SELECT ARRAY_TRANSFORM(arr, e -> e || 'a') FROM t;";
+  const std::vector<Row> first = RunSql(ctx, *db_, sql);
+  ASSERT_EQ(first.size(), 1U);
+  const std::vector<Row> second = RunSql(ctx, *db_, sql);
+  ASSERT_EQ(second.size(), 1U);
+  EXPECT_EQ(second[0].ToString(), first[0].ToString())
+      << "template-cache hit changed the declared array element type";
+  EXPECT_EQ(first[0][0].ArrayElementSqlType(), "INT64");
+}
+
+TEST_F(QueryTest, DmlQuantifiedFoldMatchesRelationalRoute) {
+  static constexpr std::array<const char*, 18> kPreds = {
+      "k = ANY (SELECT s FROM src)",
+      "k != ANY (SELECT s FROM src)",
+      "k > ANY (SELECT s FROM src)",
+      "k <= ANY (SELECT s FROM src)",
+      "k = ALL (SELECT s FROM src)",
+      "k != ALL (SELECT s FROM src)",
+      "k < ALL (SELECT s FROM src)",
+      "k >= ALL (SELECT s FROM src)",
+      "NOT (k = ANY (SELECT s FROM src))",
+      "NOT (k != ALL (SELECT s FROM src))",
+      "NOT (k > ALL (SELECT s FROM src))",
+      "(k IS NOT NULL) AND (k <> ALL (SELECT s FROM src))",
+      "(k IN (0, 2)) OR (k = ANY (SELECT s FROM src))",
+      "EXISTS (SELECT s FROM src)",
+      "NOT EXISTS (SELECT s FROM src)",
+      "EXISTS (SELECT 1 FROM src WHERE src.s = tgt.k)",
+      "k > (SELECT MIN(s) FROM src)",
+      "(k = ANY (SELECT s FROM src)) AND (k != ALL (SELECT s FROM src))",
+  };
+  static constexpr std::array<std::array<const char*, 3>, 3> kSrcSets = {{
+      {"CREATE TABLE src (s INT64);", "INSERT INTO src VALUES (0), (2);", ""},
+      {"CREATE TABLE src (s INT64);",
+       "INSERT INTO src VALUES (0), (NULL), (-2);", ""},
+      {"CREATE TABLE src (s INT64);", "", ""},
+  }};
+  // One engine per database, kept alive across the whole case so the
+  // force-relational flag actually applies to every Prepare.
+  auto drain = [](SqlEngine& engine, TransactionContext& ctx,
+                  const std::string& sql, std::string* out) -> std::string {
+    auto r = engine.Execute(ctx, sql);
+    if (!r.HasValue()) {
+      return "PERR:" + ToString(r.GetStatus());
+    }
+    std::string rows;
+    r.Value().ForEach([&](const Row& y) { rows += y.ToString() + ";"; });
+    const std::string st = ToString(r.Value().GetStatus());
+    *out = rows;
+    return st;
+  };
+  for (const char* kPred : kPreds) {
+    for (size_t variant = 0; variant < kSrcSets.size(); ++variant) {
+      SCOPED_TRACE(std::string(kPred) + " variant " + std::to_string(variant));
+      auto db1 = MakeDatabase();
+      SqlEngine engine1(*db1);
+      TransactionContext ctx = db1->BeginContext();
+      for (const char* ddl :
+           {"CREATE TABLE tgt (k INT64, v INT64);",
+            "INSERT INTO tgt VALUES (0, 0), (1, 10), (2, 20), (NULL, 30);",
+            kSrcSets[variant][0], kSrcSets[variant][1]}) {
+        if (ddl[0] != '\0') {
+          auto r = engine1.Execute(ctx, ddl);
+          EXPECT_TRUE(r.HasValue()) << ddl;
+        }
+      }
+      ASSERT_SUCCESS(ctx.txn_.PreCommit());
+      ctx = db1->BeginContext();
+      const std::string sql =
+          "UPDATE tgt SET v = v + 1 WHERE (" + std::string(kPred) + ");";
+      std::string rows1;
+      const std::string st1 = drain(engine1, ctx, sql, &rows1);
+      drain(engine1, ctx, "SELECT k, v FROM tgt ORDER BY k;", &rows1);
+      ASSERT_SUCCESS(ctx.txn_.PreCommit());
+      ctx = db1->BeginContext();
+      drain(engine1, ctx, "SELECT k, v FROM tgt ORDER BY k;", &rows1);
+
+      auto db2 = MakeDatabase();
+      SqlEngine engine2(*db2);
+      engine2.SetForceRelationalFallback(true);
+      TransactionContext ctx2 = db2->BeginContext();
+      for (const char* ddl :
+           {"CREATE TABLE tgt (k INT64, v INT64);",
+            "INSERT INTO tgt VALUES (0, 0), (1, 10), (2, 20), (NULL, 30);",
+            kSrcSets[variant][0], kSrcSets[variant][1]}) {
+        if (ddl[0] != '\0') {
+          auto r = engine2.Execute(ctx2, ddl);
+          EXPECT_TRUE(r.HasValue()) << ddl;
+        }
+      }
+      ASSERT_SUCCESS(ctx2.txn_.PreCommit());
+      ctx2 = db2->BeginContext();
+      std::string rows2;
+      const std::string st2 = drain(engine2, ctx2, sql, &rows2);
+      drain(engine2, ctx2, "SELECT k, v FROM tgt ORDER BY k;", &rows2);
+      ASSERT_SUCCESS(ctx2.txn_.PreCommit());
+      ctx2 = db2->BeginContext();
+      drain(engine2, ctx2, "SELECT k, v FROM tgt ORDER BY k;", &rows2);
+
+      EXPECT_EQ(st1, st2) << "prepare/drain status differs";
+      if (st1 == "Success") {
+        EXPECT_EQ(rows1, rows2) << "final table contents differ";
+      }
+    }
+  }
+}
+
+TEST_F(QueryTest, QuantifiedSubqueryKeepsOperatorAndNegation) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE s (k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE e (k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, j INT64);");
+  RunSql(ctx, *db_, "INSERT INTO s VALUES (5), (6);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (0, 5), (1, 9), (2, 7);");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+
+  const std::vector<Row> gt_any = RunSql(
+      ctx, *db_, "SELECT k FROM t WHERE j > ANY (SELECT k FROM s) ORDER BY k;");
+  ASSERT_EQ(gt_any.size(), 2U);
+  EXPECT_EQ(gt_any[0][0].value.int_value, 1);
+  EXPECT_EQ(gt_any[1][0].value.int_value, 2);
+
+  EXPECT_TRUE(
+      RunSql(ctx, *db_, "SELECT k FROM t WHERE j = ALL (SELECT k FROM s);")
+          .empty());
+
+  const std::vector<Row> gt_ne_all =
+      RunSql(ctx, *db_,
+             "SELECT k FROM t WHERE j <> ALL (SELECT k FROM s) ORDER BY k;");
+  ASSERT_EQ(gt_ne_all.size(), 2U);
+
+  // NOT over an empty ALL-subquery: NOT(TRUE) keeps nothing.
+  EXPECT_TRUE(RunSql(ctx, *db_,
+                     "SELECT k FROM t WHERE NOT (j = ALL (SELECT k FROM e));")
+                  .empty());
+
+  // The DML fold agrees with the SELECT reference.
+  const std::vector<Row> upd =
+      RunSql(ctx, *db_, "UPDATE t SET j = 0 WHERE j > ANY (SELECT k FROM s);");
+  ASSERT_EQ(upd.size(), 1U);
+  EXPECT_EQ(upd[0][1].value.int_value, 2);
+
+  const std::vector<Row> del =
+      RunSql(ctx, *db_, "DELETE FROM t WHERE NOT (j = ALL (SELECT k FROM e));");
+  ASSERT_EQ(del.size(), 1U);
+  EXPECT_EQ(del[0][1].value.int_value, 0);
+}
+
+TEST_F(QueryTest, DmlWhereQuantifiedAndExistsFold) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE s (k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (0, 0), (1, 10), (2, 20);");
+  RunSql(ctx, *db_, "INSERT INTO s VALUES (1), (NULL), (5);");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+
+  const std::vector<Row> updated =
+      RunSql(ctx, *db_, "UPDATE t SET v = -1 WHERE k = ANY (SELECT k FROM s);");
+  ASSERT_EQ(updated.size(), 1U);
+  EXPECT_EQ(updated[0][1].value.int_value, 1);
+
+  // `k <> ALL (s)` sees a NULL candidate: UNKNOWN for every row, so the
+  // three-valued fold must delete nothing (SELECT reference agrees).
+  const std::vector<Row> deleted =
+      RunSql(ctx, *db_, "DELETE FROM t WHERE k <> ALL (SELECT k FROM s);");
+  ASSERT_EQ(deleted.size(), 1U);
+  EXPECT_EQ(deleted[0][1].value.int_value, 0);
+
+  const std::vector<Row> scalar_upd =
+      RunSql(ctx, *db_, "UPDATE t SET v = 7 WHERE k > (SELECT MIN(k) FROM s);");
+  ASSERT_EQ(scalar_upd.size(), 1U);
+  EXPECT_EQ(scalar_upd[0][1].value.int_value, 1);
+
+  const std::vector<Row> exists_upd =
+      RunSql(ctx, *db_, "UPDATE t SET v = 8 WHERE EXISTS (SELECT 1 FROM s);");
+  ASSERT_EQ(exists_upd.size(), 1U);
+  EXPECT_EQ(exists_upd[0][1].value.int_value, 3);
+
+  // WITH + set operation under a DML subquery: documented unimplemented
+  // (dml_delete.test / b/362158469), not a crash.
+  SqlEngine engine(*db_);
+  const StatusOr<Executor> with_dml = engine.Prepare(
+      ctx,
+      "DELETE FROM t WHERE EXISTS (WITH c AS (SELECT 1 AS a) SELECT * FROM c "
+      "UNION ALL SELECT * FROM c);");
+  ASSERT_TRUE(with_dml.HasValue());
+  Row sink;
+  while (with_dml.Value()->Next(&sink, nullptr)) {
+  }
+  EXPECT_NE(with_dml.Value()->GetStatus(), Status::kSuccess);
+}
+
+TEST_F(QueryTest, DmlDoesNotFoldCorrelatedExists) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE dml_outer (u INT64, c1 STRING(MAX), c2 INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE dml_inner (u INT64);");
+  RunSql(ctx, *db_, "INSERT INTO dml_outer VALUES (1, 'a', 0);");
+  RunSql(ctx, *db_, "INSERT INTO dml_inner VALUES (0);");
+  const auto updated =
+      RunSql(ctx, *db_,
+             "UPDATE dml_outer SET c1 = 'bb' WHERE u > -3 AND NOT EXISTS "
+             "(SELECT 1 FROM dml_inner WHERE dml_inner.u = dml_outer.c2);");
+  EXPECT_EQ(updated.size(), 1U);
+  const auto rows = RunSql(ctx, *db_, "SELECT c1 FROM dml_outer;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value("a"));
+}
+
+TEST_F(QueryTest, DmlWhereInSubqueryAppliesRows) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE src (k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE tgt (k INT64, v VARCHAR(4));");
+  ASSERT_EQ(
+      RunSql(ctx, *db_, "INSERT INTO tgt VALUES (0, 'a'), (1, 'b'), (2, 'c');")
+          .size(),
+      1U);
+  RunSql(ctx, *db_, "INSERT INTO src VALUES (0), (2);");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+
+  std::vector<Row> updated = RunSql(
+      ctx, *db_, "UPDATE tgt SET v = 'z' WHERE k IN (SELECT k FROM src);");
+  ASSERT_EQ(updated.size(), 1U);
+  EXPECT_EQ(updated[0][1].value.int_value, 2);
+
+  std::vector<Row> deleted =
+      RunSql(ctx, *db_, "DELETE FROM tgt WHERE k NOT IN (SELECT k FROM src);");
+  ASSERT_EQ(deleted.size(), 1U);
+  EXPECT_EQ(deleted[0][1].value.int_value, 1);
+
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+  const std::vector<Row> left = RunSql(ctx, *db_, "SELECT k FROM tgt;");
+  ASSERT_EQ(left.size(), 2U);
+
+  // Empty subquery: IN () is FALSE, NOT IN () is TRUE (three-valued fold).
+  RunSql(ctx, *db_, "CREATE TABLE empty_src (k INT64);");
+  const std::vector<Row> upd0 =
+      RunSql(ctx, *db_,
+             "UPDATE tgt SET v = 'q' WHERE k IN (SELECT k FROM empty_src);");
+  ASSERT_EQ(upd0.size(), 1U);
+  EXPECT_EQ(upd0[0][1].value.int_value, 0);
+  const std::vector<Row> del_all = RunSql(
+      ctx, *db_, "DELETE FROM tgt WHERE k NOT IN (SELECT k FROM empty_src);");
+  ASSERT_EQ(del_all.size(), 1U);
+  EXPECT_EQ(del_all[0][1].value.int_value, 2);
+}
 
 TEST_F(QueryTest, SimpleSelect) {
   // Arrange
@@ -953,9 +1417,10 @@ TEST_F(QueryTest, FullJoinRoutesThroughCascadesOuterLowering) {
   ctx.txn_.Abort();
 }
 
-TEST_F(QueryTest, OuterJoinChainStaysRelationalAndCorrect) {
-  // Chains are beyond the single-edge slice and keep the relational path;
-  // row correctness guards the routing boundary.
+TEST_F(QueryTest, OuterJoinChainPlansThroughCascadesAndStaysCorrect) {
+  // A left-deep LEFT chain lowers through Cascades so the existing outer
+  // hash-join executor runs. WHERE on a null-supplying side stays above the
+  // join and still observes padded NULLs.
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE oc_a (a INT64);");
   RunSql(ctx, *db_, "CREATE TABLE oc_b (b INT64);");
@@ -975,7 +1440,8 @@ TEST_F(QueryTest, OuterJoinChainStaysRelationalAndCorrect) {
   while (explained.Value()->Next(&plan_row, nullptr)) {
     plan_text += plan_row[0].AsString();
   }
-  EXPECT_NE(plan_text.find("Relational Physical Plan"), std::string::npos)
+  EXPECT_NE(plan_text.find("LeftHashJoin"), std::string::npos) << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalExecutor"), std::string::npos)
       << plan_text;
 
   const std::vector<Row> rows =
@@ -1002,6 +1468,33 @@ TEST_F(QueryTest, OuterJoinChainStaysRelationalAndCorrect) {
   }
   EXPECT_EQ(both_padded, 1U);
   EXPECT_EQ(right_padded, 1U);
+
+  // b IS NULL sees the padded row; b = 2 rejects it. Pushing that predicate
+  // into the null-supplying scan would drop the pad before WHERE runs.
+  const std::vector<Row> only_pad =
+      RunSql(ctx, *db_,
+             "SELECT a, b, c FROM oc_a LEFT JOIN oc_b ON a = b "
+             "LEFT JOIN oc_c ON b = c WHERE b IS NULL;");
+  ASSERT_EQ(only_pad.size(), 1U);
+  EXPECT_EQ(only_pad[0][0], Value(1));
+  EXPECT_TRUE(only_pad[0][1].IsNull());
+  const std::vector<Row> matched_b =
+      RunSql(ctx, *db_,
+             "SELECT a, b, c FROM oc_a LEFT JOIN oc_b ON a = b "
+             "LEFT JOIN oc_c ON b = c WHERE b = 2;");
+  ASSERT_EQ(matched_b.size(), 1U);
+  EXPECT_EQ(matched_b[0][0], Value(2));
+  EXPECT_EQ(matched_b[0][1], Value(2));
+
+  // Inner prefix plus one LEFT: the inner match survives when the outer
+  // side misses.
+  const std::vector<Row> inner_left = RunSql(
+      ctx, *db_,
+      "SELECT a, b, c FROM oc_a JOIN oc_b ON a = b LEFT JOIN oc_c ON b = c;");
+  ASSERT_EQ(inner_left.size(), 1U);
+  EXPECT_EQ(inner_left[0][0], Value(2));
+  EXPECT_EQ(inner_left[0][1], Value(2));
+  EXPECT_TRUE(inner_left[0][2].IsNull());
   ctx.txn_.Abort();
 }
 
@@ -1147,6 +1640,14 @@ TEST_F(QueryTest, SqlEngineUnnestFlattenedStructFeedsProjectionAndAggregate) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, SqlEngineCastWrapsAggregateOverUnnest) {
+  TransactionContext ctx = db_->BeginContext();
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT CAST(SUM(x) AS STRING) FROM UNNEST([1,2]) AS x;"),
+            (std::vector<Row>{Row({Value(std::string("3"))})}));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, SqlEngineNullSafeJoinMatchesNulls) {
   // `IS NOT DISTINCT FROM` becomes a null-safe hash-join key: NULL must join
   // to NULL (plain `=` would drop the NULL=NULL pair).
@@ -1160,6 +1661,55 @@ TEST_F(QueryTest, SqlEngineNullSafeJoinMatchesNulls) {
              "SELECT l.id, r.id FROM ns_l l JOIN ns_r r "
              "ON l.k IS NOT DISTINCT FROM r.k ORDER BY l.id;"),
       (std::vector<Row>{Row({Value(1), Value(7)}), Row({Value(2), Value(8)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineChainedUsingEnforcesEveryKey) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE using_a (x INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE using_b (x INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE using_c_bad (x INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE using_c_good (x INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE using_c_plain (y INT64);");
+  RunSql(ctx, *db_, "INSERT INTO using_a VALUES (1);");
+  RunSql(ctx, *db_, "INSERT INTO using_b VALUES (1);");
+  RunSql(ctx, *db_, "INSERT INTO using_c_bad VALUES (2);");
+  RunSql(ctx, *db_, "INSERT INTO using_c_good VALUES (1);");
+  RunSql(ctx, *db_, "INSERT INTO using_c_plain VALUES (1);");
+  EXPECT_TRUE(RunSql(ctx, *db_,
+                     "SELECT * FROM using_a a JOIN using_b b USING (x) "
+                     "JOIN using_c_bad c USING (x);")
+                  .empty());
+  const auto matched =
+      RunSql(ctx, *db_,
+             "SELECT * FROM using_a a JOIN using_b b USING (x) "
+             "JOIN using_c_good c USING (x);");
+  ASSERT_EQ(matched.size(), 1U);
+  ASSERT_EQ(matched[0].values_.size(), 1U);
+  EXPECT_EQ(matched[0][0], Value(int64_t{1}));
+  const auto bare_after_using =
+      RunSql(ctx, *db_,
+             "SELECT x FROM using_a a JOIN using_b b USING (x) "
+             "JOIN using_c_plain c ON TRUE;");
+  ASSERT_EQ(bare_after_using.size(), 1U);
+  EXPECT_EQ(bare_after_using[0][0], Value(int64_t{1}));
+  SqlEngine engine(*db_);
+  StatusOr<Executor> ambiguous =
+      engine.Prepare(ctx,
+                     "SELECT x FROM using_a a JOIN using_b b USING (x) "
+                     "JOIN using_c_good c ON TRUE;");
+  if (!ambiguous.HasValue()) {
+    EXPECT_NE(engine.LastError().find("ambiguous"), std::string::npos)
+        << engine.LastError();
+  } else {
+    Row row;
+    while (ambiguous.Value()->Next(&row, nullptr)) {
+    }
+    const Status status = ambiguous.Value()->GetStatus();
+    EXPECT_NE(status, Status::kSuccess);
+    EXPECT_NE(status.GetMessage().find("ambiguous"), std::string::npos)
+        << status.GetMessage();
+  }
   ctx.txn_.Abort();
 }
 
@@ -2416,6 +2966,36 @@ TEST_F(QueryTest, SqlEngineOverBudgetCteKeepsRescanPath) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, SqlEngineSetOperationCteKeepsMapScopedPath) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t1 (k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE t2 (k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t1 VALUES (1);");
+  RunSql(ctx, *db_, "INSERT INTO t2 VALUES (2);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN WITH c AS (SELECT k FROM t1 UNION ALL SELECT k FROM t2) "
+      "SELECT a.k + b.k FROM c a, c b WHERE a.k = 1 AND b.k = 2;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row row;
+  std::string plan;
+  while (explain.Value()->Next(&row, nullptr)) {
+    plan += row[0].AsString() + "\n";
+  }
+  EXPECT_NE(plan.find("CteOrMissingScan"), std::string::npos) << plan;
+  EXPECT_EQ(plan.find("CteInline"), std::string::npos) << plan;
+
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH c AS (SELECT k FROM t1 UNION ALL SELECT k FROM t2) "
+             "SELECT a.k + b.k FROM c a, c b WHERE a.k = 1 AND b.k = 2;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(3));
+  ctx.txn_.Abort();
+}
+
 // M4 recursive leaf: a singly-referenced recursive CTE plans its outer
 // query through Cascades around an opaque worktable leaf (same fixpoint,
 // same rows), instead of running the whole statement relationally.
@@ -2909,7 +3489,7 @@ TEST_F(QueryTest, SqlEngineSelfJoinAmbiguousColumnRejected) {
       EXPECT_NE(std::string(error.what()).find("ambiguous"), std::string::npos)
           << (error.what() != nullptr);
     }
-    EXPECT_TRUE(rejected) << true;
+    EXPECT_TRUE(rejected);
   }
 
   ctx.txn_.Abort();
@@ -3174,6 +3754,23 @@ std::vector<Row> RunPrepared(SqlEngine* engine, TransactionContext* ctx,
 }
 }  // namespace
 
+TEST_F(QueryTest, OrToUnionPreservesBagMultiplicity) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE or_bag (a INT64, b INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO or_bag VALUES (1, 2), (1, 2), (1, NULL), "
+         "(NULL, 2), (NULL, 2), (3, NULL), (4, 0);");
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_, "SELECT a, b FROM or_bag WHERE a = 1 OR b = 2 ORDER BY a, b;");
+  EXPECT_EQ(rows,
+            (std::vector<Row>{Row({Value(), Value(int64_t{2})}),
+                              Row({Value(), Value(int64_t{2})}),
+                              Row({Value(int64_t{1}), Value()}),
+                              Row({Value(int64_t{1}), Value(int64_t{2})}),
+                              Row({Value(int64_t{1}), Value(int64_t{2})})}));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, SqlEnginePlanCacheHitsOnRepeatedStatement) {
   // Arrange -- a unique table so no other test shares this fingerprint.
   TransactionContext ctx = db_->BeginContext();
@@ -3195,6 +3792,91 @@ TEST_F(QueryTest, SqlEnginePlanCacheHitsOnRepeatedStatement) {
   EXPECT_EQ(second[0][0], Value(70));
   EXPECT_EQ(PlanCacheStats().hits.load(), hits_before + 1);
   ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest,
+       SqlEnginePlanCacheRevalidatesSnapshotDependentJoinElimination) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(
+      ctx, *db_,
+      "CREATE TABLE pcache_snap_parent (id INT64 PRIMARY KEY, label INT64);");
+  RunSql(ctx, *db_,
+         "CREATE TABLE pcache_snap_child (id INT64, pid INT64, value INT64);");
+  RunSql(ctx, *db_, "INSERT INTO pcache_snap_parent VALUES (1, 10);");
+  RunSql(ctx, *db_, "INSERT INTO pcache_snap_child VALUES (1, 1, 100);");
+  const std::string sql =
+      "SELECT c.value, 0 AS marker FROM pcache_snap_child c "
+      "JOIN pcache_snap_parent p ON c.pid = p.id WHERE c.value = 100;";
+  ASSERT_EQ(RunPrepared(&engine, &ctx, sql).size(), 1U);
+  const uint64_t hits_before = PlanCacheStats().hits.load();
+  ASSERT_EQ(RunPrepared(&engine, &ctx, sql).size(), 1U);
+  EXPECT_EQ(PlanCacheStats().hits.load(), hits_before);
+  RunSql(ctx, *db_, "UPDATE pcache_snap_child SET pid = 999 WHERE id = 1;");
+  EXPECT_TRUE(RunPrepared(&engine, &ctx, sql).empty());
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEnginePlanCacheRevalidatesSnapshotDependentTopNProof) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE pcache_topn_parent (id INT64 PRIMARY KEY);");
+  RunSql(ctx, *db_,
+         "CREATE TABLE pcache_topn_child (id INT64 PRIMARY KEY, pid INT64, "
+         "payload INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO pcache_topn_parent VALUES (1), (2), (3), (4), (5), "
+         "(6), (7), (8);");
+  RunSql(ctx, *db_,
+         "INSERT INTO pcache_topn_child VALUES (1, 1, 10), (2, 2, 20), "
+         "(3, 3, 30), (4, 4, 40), (5, 5, 50), (6, 6, 60), (7, 7, 70), "
+         "(8, 8, 80);");
+  const std::string sql =
+      "SELECT c.id, c.payload, p.id AS parent_id, 0 AS marker "
+      "FROM pcache_topn_child c JOIN pcache_topn_parent p ON c.pid = p.id "
+      "WHERE c.payload >= 0 ORDER BY c.id LIMIT 1;";
+  const std::vector<Row> warm = RunPrepared(&engine, &ctx, sql);
+  ASSERT_EQ(warm.size(), 1U);
+  const uint64_t hits_before = PlanCacheStats().hits.load();
+  ASSERT_EQ(RunPrepared(&engine, &ctx, sql).size(), 1U);
+  EXPECT_EQ(PlanCacheStats().hits.load(), hits_before);
+  RunSql(ctx, *db_, "INSERT INTO pcache_topn_child VALUES (-1, 999, 20);");
+  const std::vector<Row> after = RunPrepared(&engine, &ctx, sql);
+  ASSERT_EQ(after.size(), 1U);
+  EXPECT_EQ(after[0][0], Value(int64_t{1}));
+  EXPECT_EQ(after[0][1], Value(int64_t{10}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, CompliancePrimaryKeyModeNeverReplaysUncheckedDml) {
+  struct ModeReset {
+    ~ModeReset() { SqlEngine::SetCompliancePrimaryKeyMode(false); }
+  } mode_reset;
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE compliance_cache (id INT64, marker INT64);");
+  RunSql(ctx, *db_, "INSERT INTO compliance_cache VALUES (1, 1), (2, 2);");
+  SqlEngine::SetCompliancePrimaryKeyMode(false);
+  SqlEngine engine(*db_);
+  const std::string sql =
+      "UPDATE compliance_cache SET id = 3 WHERE marker = 1;";
+  const auto execute_update = [&](TransactionContext& transaction) {
+    StatusOr<Executor> prepared = engine.Prepare(transaction, sql);
+    if (!prepared.HasValue()) {
+      return prepared.GetStatus();
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    return prepared.Value()->GetStatus();
+  };
+  EXPECT_EQ(execute_update(ctx), Status::kSuccess);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "INSERT INTO compliance_cache VALUES (3, 3);");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+  SqlEngine::SetCompliancePrimaryKeyMode(true);
+  EXPECT_EQ(execute_update(ctx), Status::kDuplicates);
 }
 
 TEST_F(QueryTest, SqlEnginePlanCacheInvalidatedByDdlAndAnalyze) {
@@ -3236,6 +3918,38 @@ TEST_F(QueryTest, SqlEnginePlanCacheInvalidatedByDdlAndAnalyze) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, SqlEnginePlanCacheRejectsPreDdlSnapshotAtPostDdlEpoch) {
+  const std::string table_name =
+      "pcache_incarnation_" + std::string(RandomString());
+  TransactionContext setup = db_->BeginContext();
+  RunSql(setup, *db_, "CREATE TABLE " + table_name + " (k INT64, v INT64);");
+  RunSql(setup, *db_, "INSERT INTO " + table_name + " VALUES (5, 500);");
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  TransactionContext reader = db_->BeginContext();
+  SqlEngine engine(*db_);
+  ASSERT_TRUE(reader.GetTable(table_name).HasValue());
+  const std::string sql = "SELECT v FROM " + table_name + " WHERE k = 5;";
+
+  TransactionContext ddl = db_->BeginContext();
+  RunSql(ddl, *db_, "DROP TABLE " + table_name + ";");
+  RunSql(ddl, *db_, "CREATE TABLE " + table_name + " (k INT64, v INT64);");
+  RunSql(ddl, *db_, "INSERT INTO " + table_name + " VALUES (5, 900);");
+
+  RunPrepared(&engine, &reader, sql);
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+  ASSERT_SUCCESS(ddl.txn_.PreCommit());
+
+  const uint64_t invalidations_before =
+      PlanCacheStats().epoch_invalidations.load();
+  TransactionContext fresh = db_->BeginContext();
+  const std::vector<Row> recreated = RunPrepared(&engine, &fresh, sql);
+  ASSERT_EQ(recreated.size(), 1U);
+  EXPECT_EQ(recreated[0][0], Value(900));
+  EXPECT_GT(PlanCacheStats().epoch_invalidations.load(), invalidations_before);
+  ASSERT_SUCCESS(fresh.txn_.PreCommit());
+}
+
 TEST_F(QueryTest, SqlEnginePlanCacheParameterCorrectness) {
   // (1) SELECT with differing literals: a specialized entry is only served
   // for identical parameters, and differing parameters re-specialize it.
@@ -3247,9 +3961,13 @@ TEST_F(QueryTest, SqlEnginePlanCacheParameterCorrectness) {
   ASSERT_EQ(RunPrepared(&engine, &ctx,
                         "SELECT v FROM pcache_param WHERE k = 1;")[0][0],
             Value(10));  // fills the entry with k=1's plan
+  const uint64_t rebound_hits = PlanCacheStats().hits.load();
+  const uint64_t rebound_replays = PlanCacheStats().replays.load();
   ASSERT_EQ(RunPrepared(&engine, &ctx,
                         "SELECT v FROM pcache_param WHERE k = 2;")[0][0],
-            Value(20));  // parameter mismatch: legacy compile, refresh entry
+            Value(20));  // different literal rebinds the cached plan
+  EXPECT_EQ(PlanCacheStats().hits.load(), rebound_hits + 1);
+  EXPECT_EQ(PlanCacheStats().replays.load(), rebound_replays + 1);
   uint64_t hits_before = PlanCacheStats().hits.load();
   ASSERT_EQ(RunPrepared(&engine, &ctx,
                         "SELECT v FROM pcache_param WHERE k = 2;")[0][0],
@@ -3284,6 +4002,88 @@ TEST_F(QueryTest, SqlEnginePlanCacheParameterCorrectness) {
   EXPECT_EQ(contents[2][1], Value("z"));
   EXPECT_EQ(contents[3][0], Value(14));
   EXPECT_EQ(contents[3][1], Value("w"));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEnginePlanCacheRebindsUpdateAndDelete) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE pcache_upd (k INT64 PRIMARY KEY, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO pcache_upd VALUES (1, 10), (2, 20);");
+
+  RunSql(ctx, *db_, "UPDATE pcache_upd SET v = v + 1 WHERE k = 1;");
+  const uint64_t hits = PlanCacheStats().hits.load();
+  const uint64_t replays = PlanCacheStats().replays.load();
+  RunSql(ctx, *db_, "UPDATE pcache_upd SET v = v + 5 WHERE k = 2;");
+  EXPECT_EQ(PlanCacheStats().hits.load(), hits + 1);
+  EXPECT_EQ(PlanCacheStats().replays.load(), replays + 1);
+
+  std::vector<Row> updated =
+      RunPrepared(&engine, &ctx, "SELECT k, v FROM pcache_upd ORDER BY k;");
+  ASSERT_EQ(updated.size(), 2U);
+  EXPECT_EQ(updated[0][0], Value(1));
+  EXPECT_EQ(updated[0][1], Value(11));
+  EXPECT_EQ(updated[1][0], Value(2));
+  EXPECT_EQ(updated[1][1], Value(25));
+
+  RunSql(ctx, *db_, "DELETE FROM pcache_upd WHERE k = 1;");
+  const uint64_t delete_hits = PlanCacheStats().hits.load();
+  const uint64_t delete_replays = PlanCacheStats().replays.load();
+  RunSql(ctx, *db_, "DELETE FROM pcache_upd WHERE k = 2;");
+  EXPECT_EQ(PlanCacheStats().hits.load(), delete_hits + 1);
+  EXPECT_EQ(PlanCacheStats().replays.load(), delete_replays + 1);
+  EXPECT_TRUE(RunPrepared(&engine, &ctx, "SELECT k FROM pcache_upd;").empty());
+
+  ctx.txn_.Abort();
+}
+
+// The optimizer sorts conjuncts by text, so `d_id` precedes `d_w_id`. The
+// first execution's literals are all 1. A later district must still bind in
+// SQL order (warehouse, then district), not in that sorted order.
+TEST_F(QueryTest, SqlEnginePlanCacheRebindsDuplicateKeyLiterals) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_,
+         "CREATE TABLE pcache_district (d_w_id INT64 NOT NULL, d_id INT64 NOT "
+         "NULL, d_next_o_id INT64, PRIMARY KEY (d_w_id, d_id));");
+  RunSql(ctx, *db_,
+         "INSERT INTO pcache_district VALUES (1, 1, 10), (1, 2, 20);");
+
+  std::vector<Row> first = RunPrepared(
+      &engine, &ctx,
+      "SELECT d_next_o_id FROM pcache_district WHERE d_w_id = 1 AND d_id = 1;");
+  ASSERT_EQ(first.size(), 1U);
+  EXPECT_EQ(first[0][0], Value(10));
+  const uint64_t select_hits = PlanCacheStats().hits.load();
+  const uint64_t select_replays = PlanCacheStats().replays.load();
+  std::vector<Row> second = RunPrepared(
+      &engine, &ctx,
+      "SELECT d_next_o_id FROM pcache_district WHERE d_w_id = 1 AND d_id = 2;");
+  EXPECT_EQ(PlanCacheStats().hits.load(), select_hits + 1);
+  EXPECT_EQ(PlanCacheStats().replays.load(), select_replays + 1);
+  ASSERT_EQ(second.size(), 1U);
+  EXPECT_EQ(second[0][0], Value(20));
+
+  RunSql(ctx, *db_,
+         "UPDATE pcache_district SET d_next_o_id = d_next_o_id + 1 WHERE "
+         "d_w_id = 1 AND d_id = 1;");
+  const uint64_t update_hits = PlanCacheStats().hits.load();
+  const uint64_t update_replays = PlanCacheStats().replays.load();
+  RunSql(ctx, *db_,
+         "UPDATE pcache_district SET d_next_o_id = d_next_o_id + 1 WHERE "
+         "d_w_id = 1 AND d_id = 2;");
+  EXPECT_EQ(PlanCacheStats().hits.load(), update_hits + 1);
+  EXPECT_EQ(PlanCacheStats().replays.load(), update_replays + 1);
+
+  std::vector<Row> updated = RunPrepared(
+      &engine, &ctx,
+      "SELECT d_id, d_next_o_id FROM pcache_district ORDER BY d_id;");
+  ASSERT_EQ(updated.size(), 2U);
+  EXPECT_EQ(updated[0][0], Value(1));
+  EXPECT_EQ(updated[0][1], Value(11));
+  EXPECT_EQ(updated[1][0], Value(2));
+  EXPECT_EQ(updated[1][1], Value(21));
 
   ctx.txn_.Abort();
 }
@@ -3344,6 +4144,22 @@ TEST_F(QueryTest, LateralJoinExpansion) {
   EXPECT_EQ(left_result[3][0], Value("Charlie"));
   EXPECT_TRUE(left_result[3][1].IsNull());
 
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, LeftUsingBeforeLateralPreservesOuterRow) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE lat_empty (id INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE lat_seed (id INT64);");
+  RunSql(ctx, *db_, "INSERT INTO lat_seed VALUES (1);");
+
+  std::vector<Row> result = RunSql(
+      ctx, *db_,
+      "SELECT l.id, d.x FROM lat_seed l LEFT JOIN lat_empty r USING (id), "
+      "LATERAL (SELECT 42 AS x) d ORDER BY l.id");
+  ASSERT_EQ(result.size(), 1U);
+  EXPECT_EQ(result[0][0], Value(1));
+  EXPECT_EQ(result[0][1], Value(42));
   ctx.txn_.Abort();
 }
 
@@ -3577,6 +4393,25 @@ TEST_F(QueryTest, OrderByHonorsExplicitNullsFirstLast) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, DistinctIndexScanHonorsNullsLastBeforeLimit) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE nls_idx (x INT64);");
+  ASSERT_EQ(db_->CreateIndex(
+                ctx, "nls_idx",
+                IndexSchema("nls_idx_x", {0}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  RunSql(ctx, *db_, "INSERT INTO nls_idx VALUES (2), (NULL), (1), (2), (3);");
+
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT DISTINCT x FROM nls_idx ORDER BY x ASC NULLS LAST LIMIT 2;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(2));
+
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, DescendingIndexScanReturnsReversedRange) {
   // The optimizer must offer reverse index scans for a descending ORDER BY
   // over a range: the B+Tree iterator positions below `end` and walks left,
@@ -3637,7 +4472,7 @@ TEST_F(QueryTest, StructConstantFoldingEscapesQuotesAndBackslashes) {
   ASSERT_TRUE(rows[0][0].type == ValueType::kVarChar);
   const std::string json(rows[0][0].value.varchar_value);
   // The quote and backslash must be escaped inside the JSON string value.
-  EXPECT_NE(json.find(R"(a\"b\\c)"), std::string::npos) << true << json;
+  EXPECT_NE(json.find(R"(a\"b\\c)"), std::string::npos) << json;
   EXPECT_NE(json.find(R"("n":3)"), std::string::npos) << json;
   ctx.txn_.Abort();
 }
@@ -3870,10 +4705,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteCascadesPlan) {
     plan_text += exp_row[0].AsString() + "\n";
   }
   EXPECT_NE(plan_text.find("RecursiveCtePlan"), std::string::npos) << plan_text;
-  // Fully-relational plans render as "Relational Physical Plan"; a
-  // Cascades-native plan never contains that marker (nor the opaque
-  // kRelational fallback node).
-  EXPECT_EQ(plan_text.find("Relational Physical Plan"), std::string::npos)
+  EXPECT_NE(plan_text.find("Selected Cascades Core"), std::string::npos)
       << plan_text;
   EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
 
@@ -4615,6 +5447,31 @@ TEST_F(QueryTest, UpdateWithInSubqueryDecorrelatesOnce) {
   EXPECT_EQ(rows[0][0], Value(int64_t{2}));
   EXPECT_EQ(rows[0][1], Value(int64_t{40}));
 
+  ctx.txn_.Abort();
+}
+TEST_F(QueryTest, DmlDuplicateExistsConjunctDecorrelateOnce) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t0 (u INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE t1 (u INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t0 VALUES (9, 1);");
+  RunSql(ctx, *db_, "INSERT INTO t1 VALUES (9);");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  ctx = db_->BeginContext();
+
+  // The same correlated EXISTS conjunct twice: semi-joins are
+  // idempotent, so `E AND E` must match exactly like `E` alone.
+  // Pre-fix the duplicate wrapped a second semi-join over the key the
+  // first one reshaped, silently dropping every row (0 updates).
+  const std::vector<Row> upd = RunSql(
+      ctx, *db_,
+      "UPDATE t0 SET v = 2 WHERE (EXISTS (SELECT 1 FROM t1 WHERE "
+      "t1.u = t0.u)) AND (EXISTS (SELECT 1 FROM t1 WHERE t1.u = t0.u));");
+  ASSERT_EQ(upd.size(), 1U);
+  EXPECT_EQ(upd[0][1].value.int_value, 1);
+
+  const std::vector<Row> rows = RunSql(ctx, *db_, "SELECT u, v FROM t0;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][1].value.int_value, 2);
   ctx.txn_.Abort();
 }
 }  // namespace tinylamb

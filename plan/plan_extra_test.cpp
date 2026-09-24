@@ -179,6 +179,9 @@ TEST(SetOperationPlanExtraTest, RowCountsOrderingAndDump) {
                                 order);
   EXPECT_EQ(merge_append.ToString(), "MergeAppend");
   EXPECT_TRUE(merge_append.IsOrderedBy({ColumnValueExp("a")}, {true}));
+  EXPECT_TRUE(merge_append.IsOrderedBy({ColumnValueExp("a")}, {true}, {true}));
+  EXPECT_FALSE(
+      merge_append.IsOrderedBy({ColumnValueExp("a")}, {true}, {false}));
   EXPECT_FALSE(merge_append.IsOrderedBy({ColumnValueExp("a")}, {false}));
   EXPECT_FALSE(merge_append.IsOrderedBy({ColumnValueExp("b")}, {true}));
   EXPECT_FALSE(merge_append.IsOrderedBy(
@@ -245,8 +248,12 @@ TEST(GroupByPlanExtraTest, DumpAndCardinalityCaps) {
   GroupByPlan plan(child, nullptr,
                    Schema("out", {Column("c", ValueType::kInt64)}));
   EXPECT_EQ(plan.ToString(), "GroupByFinish");
-  EXPECT_EQ(plan.EmitRowCount(), 1U);  // scalar aggregation yields one row
+  EXPECT_EQ(plan.EmitRowCount(), 1U);
   EXPECT_EQ(plan.AccessRowCount(), 4U);
+  GroupByPlan grouped(child, nullptr,
+                      Schema("out", {Column("c", ValueType::kInt64)}), true);
+  EXPECT_EQ(grouped.EmitRowCount(), 4U);
+  EXPECT_EQ(grouped.GetStats().Rows(), 4U);
   EXPECT_EQ(plan.GetSchema().ColumnCount(), 1U);
   EXPECT_EQ(plan.Child().get(), child.get());
   EXPECT_EQ(plan.Statement(), nullptr);
@@ -317,6 +324,8 @@ TEST_F(SkipScanDistinctPlanExtraTest, StatsDrivenRowCountsAndOrdering) {
 
   // Asc skip scan only claims the ascending order of its distinct column.
   EXPECT_TRUE(plan.IsOrderedBy({ColumnValueExp("a")}, {true}));
+  EXPECT_TRUE(plan.IsOrderedBy({ColumnValueExp("a")}, {true}, {true}));
+  EXPECT_FALSE(plan.IsOrderedBy({ColumnValueExp("a")}, {true}, {false}));
   EXPECT_FALSE(plan.IsOrderedBy({ColumnValueExp("a")}, {false}));
   EXPECT_FALSE(plan.IsOrderedBy({ColumnValueExp("b")}, {true}));
   EXPECT_FALSE(plan.IsOrderedBy({}, {}));

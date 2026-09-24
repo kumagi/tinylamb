@@ -6,7 +6,7 @@ waiting on an outer one.
 ```
 1. Database / catalog latch (schema changes)
 2. PagePool shard latch → per-page latch
-3. B+ tree page latches (root → leaf, consistent with tree descent)
+3. Index mutation gate(s) → B+ tree page latches (root → leaf, consistent with tree descent)
 4. LockManager row locks (auxiliary, test-facing; primary conflict control is
    MVCC write-intent via `TransactionManager::AcquireWriteIntent`)
 5. LSM memtable / run mutex (single writer per tree)
@@ -18,11 +18,24 @@ waiting on an outer one.
 8. MVCC version shard mutex → wait-for graph mutex (AddWaitForEdge under the
    shard lock; the detector snapshots the graph under the graph mutex alone
    and re-locks the table only to wound).
+9. Transaction table lock → per-transaction `Transaction::chain_mu_` (the
+   checkpoint's active-transaction snapshot iterates the registry and takes
+   each transaction's chain mutex below it). WAL chain maintenance
+   (`AppendLog`, `PreCommit`'s commit record, `Abort`'s terminator) takes
+   ONLY the transaction's own chain mutex — never the table lock while
+   holding it (registry cleanup happens after the mutex is released). This
+   mutex also makes {record append, `prev_lsn_`, status flip} atomic with
+   respect to that snapshot: a snapshot that read `kRunning` while the
+   commit record sat below the checkpoint's begin LSN made restart recovery
+   roll back a durably committed transaction.
 ```
 
 ## Rules
 
 - **Page before row**: pin the page, then take row-level locks if needed.
+- **Index gate before tree pages**: DDL takes all affected index-gate shards
+  in sorted order before collecting or destroying B+Tree pages; readers hold a
+  shared gate for their cursor lifetime.
 - **Logger record atomicity (D1, `docs/design.md`)**: `AddLog` holds the
   enqueue latch until the whole record has landed in the ring buffer.  When
   the buffer is full the producer waits on the work condition variable **while
@@ -35,33 +48,23 @@ waiting on an outer one.
   toward the 60 s durability floor during WAL stalls); on expiry the wait
   gives up and the acquire returns `false` (see `docs/lock_timeout.md`).
 
-## Known TSAN static lock-order reports (not deadlocks)
+## Page allocation and the pool latch (two-phase by design)
 
-`page_pool_test` / `recovery_manager_test` under TSAN report
-"lock-order-inversion" cycles that pair the PagePool **pool latch (M0)** with a
-**per-page latch (M1)**:
-
-1. `MetaPage::AllocateNewPage` (`meta_page.cpp:36`) is invoked by
-   `PageManager::AllocateNewPage` while the CALLER holds the **meta page's own
-   per-page latch (M1)**; inside, `pool.GetPage(new_page_id)` installs a fresh
-   entry under the **pool latch (M0)** and constructs the new `PageRef`, whose
-   constructor takes the new entry's per-page latch while M0 is still held
-   (M1' under M0).
-2. Conversely, a plain `GetPage` hit path pins under the **shard mutex** and
-   then constructs `PageRef` (page latch) before any pool-latch acquisition.
-
-These are **false positives by construction**: `GetPageImpl` releases
-`pool_latch` (`latch.unlock()`) BEFORE constructing the returned `PageRef` on
-every install path, so M0 and M1 are never held simultaneously by one thread.
-TSAN observes the constructor stack inside the `GetPage` call frame and cannot
-see the unlock.  Do not "fix" this by reordering the unlock later; keep the
-invariant explicit:
-
-- **Invariant**: `GetPageImpl` must unlock `pool_latch` before constructing
-  the returned `PageRef` (or taking any per-page latch).  New install paths
-  must keep this ordering.
-- Pin counts use release/acquire (`ReleasePin` release fetch_sub, evictor
-  recheck acquire load) so Entry destruction cannot race a concurrent unpin.
+`PageManager::AllocateNewPage` (`page/page_manager.cpp`) never holds the meta
+latch across pool operations.  Allocation is two-phase via
+`MetaPage::PeekAllocationCandidate` / `AllocateCandidate` / `AllocateFreshId`
+(`page/meta_page.hpp:60-74`): the candidate is picked under one meta latch
+acquisition, the latch is released when the scoped `PageRef` ends, then the
+candidate page is latched with `pool_->GetPage`, and a second meta latch
+acquisition revalidates and pops the candidate.  Quoting the rationale
+comment in `page_manager.cpp`: "the runtime undo of an aborted destroy
+latches the candidate page first and takes the meta latch second
+(`LogUndoWithPage` -> `PopFreePageHead`), so holding meta across GetPage here
+would give the two paths opposite orders and let an allocator deadlock
+against an aborting destructor."  A loser of a race just retries after
+re-validation under the re-taken latch.  Because the meta latch is never held
+while acquiring a pool or per-page latch, no ordering violation exists on
+these paths.
 
 ## TSAN / deadlock tests
 

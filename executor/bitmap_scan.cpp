@@ -20,29 +20,32 @@
 
 namespace tinylamb {
 
-BitmapIndexScan::BitmapIndexScan(Transaction& txn, const Table& table,
-                                 const Index& index, const Value& begin,
-                                 const Value& end)
+BitmapIndexScan::BitmapIndexScan(
+    Transaction& txn, const Table& table, const Index& index,
+    const Value& begin, const Value& end,
+    TransactionManager::IndexReadGuard* index_read_guard)
     : txn_(&txn),
       table_(&table),
       index_(&index),
       begin_key_({begin}),
-      end_key_({end}) {}
+      end_key_({end}),
+      index_read_guard_(index_read_guard) {}
 
-BitmapIndexScan::BitmapIndexScan(Transaction& txn, const Table& table,
-                                 const Index& index,
-                                 const std::vector<Value>& begin_key,
-                                 const std::vector<Value>& end_key)
+BitmapIndexScan::BitmapIndexScan(
+    Transaction& txn, const Table& table, const Index& index,
+    const std::vector<Value>& begin_key, const std::vector<Value>& end_key,
+    TransactionManager::IndexReadGuard* index_read_guard)
     : txn_(&txn),
       table_(&table),
       index_(&index),
       begin_key_(begin_key),
-      end_key_(end_key) {}
+      end_key_(end_key),
+      index_read_guard_(index_read_guard) {}
 
 std::vector<RowPosition> BitmapIndexScan::ScanPositions() const {
   std::vector<RowPosition> positions;
-  for (IndexScanIterator it(*table_, *index_, *txn_, begin_key_, end_key_,
-                            true);
+  for (IndexScanIterator it(*table_, *index_, *txn_, begin_key_, end_key_, true,
+                            false, index_read_guard_);
        it.IsValid(); ++it) {
     positions.push_back(it.Position());
   }
@@ -73,7 +76,7 @@ bool BitmapHeapScan::Next(Row* dst, RowPosition* rp) {
     const RowPosition pos = positions_[offset_++];
     StatusOr<Row> row_or = table_->Read(*txn_, pos);
     if (row_or.GetStatus() != Status::kSuccess) {
-      continue;
+      return FailWith(row_or.GetStatus());
     }
     if (where_) {
       StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(

@@ -5,7 +5,7 @@
 
 ## 概要
 
-論理式 `kSemiJoin` のうち等値キー対を持たない非等値半結合を、probe 側スキーマに射影する `ProductPlan`（`SemiJoinKind` およびブロック化実行標識 `PreferBatchNestedLoop()` を保持）として具現化する Rule です。
+論理式 `kSemiJoin` のうち等値キー対を持たない非等値半結合を、probe 側スキーマに射影する `ProductPlan`（`SemiJoinKind` およびブロック化実行標識 `PreferBatchNestedLoop()` を保持）として変換する Rule です。
 
 半結合にはタプル単位の入れ子ループ結合実装が存在しないため、従来は関係代数フォールバックに依存していた非等値半結合に対して、コストベース探索に参加可能な第一級の物理実行代替を提供します。
 

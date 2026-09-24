@@ -168,8 +168,15 @@ const std::vector<std::vector<std::string>>& SeedPool() {
           "FROM c ORDER BY id;",
           "SELECT COUNT(*) FROM c WHERE val > (SELECT AVG(val) "
           "FROM c);",
+          "SELECT id FROM c WHERE val > ANY (SELECT val FROM "
+          "c) ORDER BY id;",
+          "SELECT id FROM c WHERE NOT (id < ALL (SELECT id "
+          "FROM c WHERE grp IS NOT NULL)) ORDER BY id;",
+          "SELECT id FROM c UNION SELECT 7 ORDER BY id;",
+          "SELECT grp, COUNT(*) FROM c GROUP BY grp UNION "
+          "DISTINCT SELECT NULL, 0 ORDER BY grp;",
       },
-      // GROUPING SETS / FILTER / DISTINCT aggregates.
+      // GROUPING SETS / inline-WHERE filtered / DISTINCT aggregates.
       {
           "CREATE TABLE gs (region STRING, product STRING, qty "
           "INT64);",
@@ -181,7 +188,9 @@ const std::vector<std::vector<std::string>>& SeedPool() {
           "SELECT region, COUNT(DISTINCT product) FROM gs "
           "GROUP BY "
           "region;",
-          "SELECT SUM(qty) FILTER (WHERE qty > 0) FROM gs;",
+          "SELECT SUM(qty WHERE qty > 0) FROM gs;",
+          "SELECT region, SUM(qty WHERE qty > 0) FROM gs GROUP "
+          "BY region;",
           "SELECT region, product, SUM(qty) FROM gs GROUP BY "
           "GROUPING "
           "SETS ((region), (region, product));",
@@ -427,6 +436,104 @@ const std::vector<std::vector<std::string>>& SeedPool() {
           "SELECT g, v FROM dt ORDER BY g OFFSET 1 FETCH NEXT "
           "2 ROWS WITH TIES;",
       },
+      // BIT_/LOGICAL_/STRING_AGG/ARRAY_AGG/VAR/STDDEV family.
+      {
+          "CREATE TABLE ag (g INT64, v INT64, s STRING, b "
+          "BOOL);",
+          "INSERT INTO ag VALUES (1, 6, 'x', TRUE), (1, 3, "
+          "'y', FALSE), (2, NULL, 'z', NULL), (2, 5, NULL, "
+          "TRUE);",
+          "SELECT g, BIT_AND(v), BIT_OR(v), BIT_XOR(v) FROM "
+          "ag GROUP BY g;",
+          "SELECT g, LOGICAL_AND(b), LOGICAL_OR(b) FROM ag "
+          "GROUP BY g;",
+          "SELECT g, STRING_AGG(s, ','), ARRAY_AGG(v ORDER "
+          "BY v) FROM ag GROUP BY g;",
+          "SELECT g, VAR_POP(v), VAR_SAMP(v), STDDEV_POP(v), "
+          "STDDEV_SAMP(v) FROM ag GROUP BY g;",
+          "SELECT g, COUNT(DISTINCT s), SUM(v WHERE v > 0) "
+          "FROM ag GROUP BY g;",
+      },
+      // Indexed column probed by IN-lists holding NULL and
+      // cross-type constants (Bug 50/51 regression shape).
+      {
+          "CREATE TABLE ix (u INT64, v INT64, s STRING);",
+          "INSERT INTO ix VALUES (0, 10, 'a'), (2, 20, 'b'), "
+          "(NULL, 30, 'c');",
+          "CREATE INDEX ix_u ON ix(u);",
+          "CREATE INDEX ix_v ON ix(v);",
+          "SELECT u FROM ix WHERE u IN (0, 2, NULL) ORDER BY "
+          "u;",
+          "SELECT u FROM ix WHERE u IN (0, 2.0) ORDER BY u;",
+          "SELECT u FROM ix WHERE u = 2.0;",
+          "SELECT u FROM ix WHERE u < 2.5 AND u > 0.5 ORDER "
+          "BY u;",
+          "UPDATE ix SET v = v + 1 WHERE u IN (0, 2, NULL);",
+          "SELECT u, v FROM ix ORDER BY u;",
+      },
+      // Aggregate HAVING MIN/MAX modifiers (Bug 64 surface): gating to the
+      // row of the group holding the condition extremum.
+      {
+          "CREATE TABLE am (g INT64, k INT64, v INT64, s STRING);",
+          "INSERT INTO am VALUES (1, 1, 10, 'a'), (1, 2, 30, "
+          "'c'), (2, 1, 5, 'x'), (2, 3, NULL, 'y'), (NULL, 4, "
+          "7, 'z');",
+          "SELECT g, SUM(v HAVING MIN k) FROM am GROUP BY g "
+          "ORDER BY g;",
+          "SELECT g, ANY_VALUE(s HAVING MAX k) FROM am "
+          "GROUP BY g ORDER BY g;",
+          "SELECT g, MIN(v HAVING MAX v), MAX(v HAVING MIN "
+          "v) FROM am GROUP BY g ORDER BY g;",
+          "SELECT SUM(v HAVING MIN k WHERE v > 0) FROM am;",
+          "SELECT g, STRING_AGG(s, ',' HAVING MIN k ORDER "
+          "BY k) FROM am GROUP BY g ORDER BY g;",
+          "SELECT g, ARRAY_AGG(v ORDER BY k LIMIT 2) FROM "
+          "am GROUP BY g ORDER BY g;",
+      },
+      // USING-clause joins: merged key coalesces and dedups.
+      {
+          "CREATE TABLE ua (k INT64, av INT64);",
+          "CREATE TABLE ub (k INT64, bv STRING);",
+          "INSERT INTO ua VALUES (1, 10), (2, 20), (NULL, "
+          "30);",
+          "INSERT INTO ub VALUES (1, 'p'), (3, 'q'), (NULL, "
+          "'r');",
+          "SELECT k, av, bv FROM ua JOIN ub USING (k) ORDER "
+          "BY k;",
+          "SELECT k, av, bv FROM ua LEFT JOIN ub USING (k) "
+          "ORDER BY k;",
+          "SELECT k, av, bv FROM ua FULL JOIN ub USING (k) "
+          "ORDER BY k;",
+          "SELECT ua.k, ub.k FROM ua FULL JOIN ub USING (k) "
+          "ORDER BY ua.k;",
+      },
+      // GROUPING SETS / ROLLUP / CUBE with GROUPING() marks.
+      {
+          "CREATE TABLE rs (r STRING, c STRING, n INT64);",
+          "INSERT INTO rs VALUES ('x', 'p', 1), ('x', 'q', "
+          "2), ('y', NULL, 3), (NULL, 'p', 4);",
+          "SELECT r, c, SUM(n) FROM rs GROUP BY GROUPING "
+          "SETS ((r), (r, c), ()) ORDER BY r, c;",
+          "SELECT r, c, SUM(n) FROM rs GROUP BY ROLLUP (r, "
+          "c) ORDER BY r, c;",
+          "SELECT r, GROUPING(r), GROUPING(c), COUNT(*) "
+          "FROM rs GROUP BY CUBE (r, c) ORDER BY r;",
+      },
+      // Higher-order lambdas and UNNEST over array columns.
+      {
+          "CREATE TABLE la (id INT64, arr ARRAY<INT64>);",
+          "INSERT INTO la VALUES (1, [3, 1, 2]), (2, []), "
+          "(3, NULL), (4, [NULL, 7]);",
+          "SELECT id, ARRAY_TRANSFORM(arr, x -> x * 2) FROM "
+          "la ORDER BY id;",
+          "SELECT id, ARRAY_FILTER(arr, x -> x > 1) FROM la "
+          "ORDER BY id;",
+          "SELECT id, e FROM la, UNNEST(la.arr) e ORDER BY "
+          "id, e;",
+          "SELECT id FROM la WHERE arr IS NULL ORDER BY id;",
+          "SELECT LEAST([5, 1], [2, 9]), GREATEST([0], "
+          "[NULL]);",
+      },
   };
   return *pool;
 }
@@ -629,8 +736,8 @@ RunOutcome RunStatement(Database& db, TransactionContext& ctx,
     for (const std::string_view known :
          {"not found", "no such", "ambiguous column", "numeric value",
           "overflow", "cannot access field", "cannot be compared",
-          "Different type", "Unknown type", "requires an integer",
-          "requires a number"}) {
+          "Different type", "type mismatch", "Unknown type",
+          "requires an integer", "requires a number"}) {
       if (what.find(known) != std::string::npos) {
         return outcome;  // rejected
       }
@@ -789,7 +896,13 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose) {
   GriffinTrace regenerated;
   std::mt19937 rng(seed32);
   RunGriffinIteration(rng, false, &regenerated);
-  if (regenerated.statements != trace.statements) {
+  // A live failure truncates the recorded session at the diverging
+  // statement; once the bug is fixed regeneration runs the full shuffled
+  // session, so the recorded statements only need to match the regenerated
+  // prefix.  A mismatch still means the file does not belong to the seed.
+  if (regenerated.statements.size() < trace.statements.size() ||
+      !std::equal(trace.statements.begin(), trace.statements.end(),
+                  regenerated.statements.begin())) {
     return "tampered trace: statements do not match seed " +
            std::to_string(trace.seed);
   }

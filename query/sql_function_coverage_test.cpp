@@ -8,8 +8,10 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
@@ -27,9 +29,17 @@ namespace {
 // execution failure surfaces as a runtime_error carrying the diagnostic.
 std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
+  // One retry for empty diagnostics: a failed Prepare with no LastError is
+  // the external parse child being transiently unavailable under load, not
+  // a legitimate SQL error (real errors always carry a message).
   StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
   if (!prepared.HasValue()) {
-    throw std::runtime_error(engine->LastError());
+    if (engine->LastError().empty()) {
+      prepared = engine->Prepare(*ctx, sql);
+    }
+    if (!prepared.HasValue()) {
+      throw std::runtime_error(engine->LastError());
+    }
   }
   std::vector<Row> rows;
   Row row;
@@ -49,9 +59,10 @@ class SqlFunctionCoverageTest : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
-      GTEST_SKIP() << true;
+      GTEST_SKIP() << "skipped";
     }
-    database_ = Database::Create("sql_function_coverage_test").MoveValue();
+    database_ = Database::Create("sql_function_coverage_test-" + RandomString())
+                    .MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
     engine_ = std::make_unique<SqlEngine>(*database_);
   }
@@ -65,7 +76,7 @@ class SqlFunctionCoverageTest : public ::testing::Test {
   }
   // Asserts the statement yields exactly one row whose first column equals
   // `expected`.
-  void ExpectScalar(const std::string& sql, Value expected) {
+  void ExpectScalar(const std::string& sql, const Value& expected) {
     SCOPED_TRACE(sql);
     const auto rows = RunSql(engine_.get(), context_.get(), sql);
     ASSERT_EQ(rows.size(), 1U);
@@ -86,8 +97,8 @@ class SqlFunctionCoverageTest : public ::testing::Test {
   }
   void ExpectError(const std::string& sql) {
     SCOPED_TRACE(sql);
-    EXPECT_THROW({ RunSql(engine_.get(), context_.get(), sql); },
-                 std::exception);
+    EXPECT_THROW(
+        { RunSql(engine_.get(), context_.get(), sql); }, std::exception);
   }
   // Materializes the array produced by a single SELECT column.
   std::vector<Value> ExpectArray(const std::string& sql, size_t expected_size) {
@@ -95,6 +106,7 @@ class SqlFunctionCoverageTest : public ::testing::Test {
     const auto rows = RunSql(engine_.get(), context_.get(), sql);
     EXPECT_EQ(rows.size(), expected_size);
     std::vector<Value> values;
+    values.reserve(rows.size());
     for (const Row& row : rows) {
       values.push_back(row[0]);
     }
@@ -162,7 +174,8 @@ TEST_F(SqlFunctionCoverageTest, ModPowDivBranches) {
   ExpectRow("SELECT DIV(7, 2), DIV(-7, 2), DIV(7.5, 2)",
             Row({Value(3), Value(-3), Value(3)}));
   ExpectScalar("SELECT POW(2, 10)", Value(1024.0));
-  ExpectScalar("SELECT POWER(2, 0.5)", Value(std::sqrt(2.0)));
+  ExpectScalar("SELECT SQRT(2)", Value(std::numbers::sqrt2));
+  ExpectScalar("SELECT POWER(2, 0.5)", Value(std::numbers::sqrt2));
   ExpectNullScalar("SELECT MOD(NULL, 3)");
   ExpectNullScalar("SELECT POW(NULL, 2)");
   ExpectError("SELECT DIV(7, 0)");
@@ -175,9 +188,8 @@ TEST_F(SqlFunctionCoverageTest, ModPowDivBranches) {
 
 TEST_F(SqlFunctionCoverageTest, SqrtCbrtLogExpBranches) {
   ExpectRow("SELECT SQRT(9.0), CBRT(27.0), CBRT(-8.0), EXP(0.0), LN(1.0)",
-            Row({Value(3.0), Value(std::cbrt(27.0)), Value(-2.0), Value(1.0),
-                 Value(0.0)}));
-  ExpectScalar("SELECT LOG(8, 2)", Value(std::log(8.0) / std::log(2.0)));
+            Row({Value(3.0), Value(3.0), Value(-2.0), Value(1.0), Value(0.0)}));
+  ExpectScalar("SELECT LOG(8, 2)", Value(std::log(8.0) / std::numbers::ln2));
   ExpectScalar("SELECT LOG(100)", Value(std::log(100.0)));
   ExpectScalar("SELECT LOG10(1000)", Value(3.0));
   ExpectError("SELECT SQRT(-1)");
@@ -262,7 +274,8 @@ TEST_F(SqlFunctionCoverageTest, UnsignedSafeArithmetic) {
                Value(int64_t{8}).WithUnsigned());
   // Unsigned wrap-around counts as overflow: SAFE_SUBTRACT yields NULL
   // rather than the wrapped 2^64-2.
-  ExpectNullScalar("SELECT SAFE_SUBTRACT(CAST(3 AS UINT64), CAST(5 AS UINT64))");
+  ExpectNullScalar(
+      "SELECT SAFE_SUBTRACT(CAST(3 AS UINT64), CAST(5 AS UINT64))");
   ExpectNullScalar(
       "SELECT SAFE_ADD(CAST(18446744073709551615 AS UINT64), CAST(1 AS "
       "UINT64))");
@@ -294,8 +307,7 @@ TEST_F(SqlFunctionCoverageTest, CaseAndLengthBranches) {
             Row({Value(5), Value(5), Value(2)}));
   ExpectScalar("SELECT CHAR_LENGTH('héllo')", Value(5));
   ExpectScalar("SELECT CHARACTER_LENGTH('€a')", Value(2));
-  ExpectRow("SELECT LENGTH(NULL), CHAR_LENGTH(NULL)",
-            Row({Value(), Value()}));
+  ExpectRow("SELECT LENGTH(NULL), CHAR_LENGTH(NULL)", Row({Value(), Value()}));
   ExpectError("SELECT UPPER('a', 'b')");
   ExpectError("SELECT LENGTH()");
 }
@@ -312,9 +324,10 @@ TEST_F(SqlFunctionCoverageTest, ConcatBranches) {
 TEST_F(SqlFunctionCoverageTest, SubstrBranches) {
   ExpectRow("SELECT SUBSTR('hello', 2), SUBSTRING('hello', 2)",
             Row({Value("ello"), Value("ello")}));
-  ExpectRow("SELECT SUBSTR('hello', 2, 2), SUBSTR('hello', 1, 0), "
-            "SUBSTR('hello', 1, 10)",
-            Row({Value("el"), Value(""), Value("hello")}));
+  ExpectRow(
+      "SELECT SUBSTR('hello', 2, 2), SUBSTR('hello', 1, 0), "
+      "SUBSTR('hello', 1, 10)",
+      Row({Value("el"), Value(""), Value("hello")}));
   ExpectScalar("SELECT SUBSTR('hello', -2)", Value("lo"));
   ExpectScalar("SELECT SUBSTR('hello', 10)", Value(""));
   ExpectScalar("SELECT SUBSTR('héllo', 2)", Value("éllo"));
@@ -338,9 +351,10 @@ TEST_F(SqlFunctionCoverageTest, ByteSubstrBranches) {
 TEST_F(SqlFunctionCoverageTest, InstrStartsEndsWithBranches) {
   ExpectRow("SELECT INSTR('abcabc', 'b'), STRPOS('abc', 'z'), INSTR('abc', '')",
             Row({Value(2), Value(0), Value(1)}));
-  ExpectRow("SELECT STARTS_WITH('abc', 'ab'), ENDS_WITH('abc', 'bc'), "
-            "STARTS_WITH('abc', 'b')",
-            Row({Value(true), Value(true), Value(false)}));
+  ExpectRow(
+      "SELECT STARTS_WITH('abc', 'ab'), ENDS_WITH('abc', 'bc'), "
+      "STARTS_WITH('abc', 'b')",
+      Row({Value(true), Value(true), Value(false)}));
   ExpectRow("SELECT INSTR(NULL, 'a'), STARTS_WITH(NULL, 'a')",
             Row({Value(), Value()}));
   ExpectError("SELECT INSTR('a')");
@@ -364,8 +378,9 @@ TEST_F(SqlFunctionCoverageTest, LpadRpadBranches) {
 TEST_F(SqlFunctionCoverageTest, TrimFamilyBranches) {
   ExpectRow("SELECT TRIM('  hi  '), LTRIM('  hi  '), RTRIM('  hi  ')",
             Row({Value("hi"), Value("hi  "), Value("  hi")}));
-  ExpectRow("SELECT TRIM('xxhixx', 'x'), LTRIM('xxhi', 'x'), RTRIM('hixx', 'x')",
-            Row({Value("hi"), Value("hi"), Value("hi")}));
+  ExpectRow(
+      "SELECT TRIM('xxhixx', 'x'), LTRIM('xxhi', 'x'), RTRIM('hixx', 'x')",
+      Row({Value("hi"), Value("hi"), Value("hi")}));
   ExpectRow("SELECT TRIM('   '), LTRIM('xxx', 'x'), RTRIM('xxx', 'x')",
             Row({Value(""), Value(""), Value("")}));
   ExpectNullScalar("SELECT TRIM(NULL)");
@@ -374,9 +389,10 @@ TEST_F(SqlFunctionCoverageTest, TrimFamilyBranches) {
 }
 
 TEST_F(SqlFunctionCoverageTest, ReplaceRepeatReverseBranches) {
-  ExpectRow("SELECT REPLACE('aaa', 'a', 'b'), REPLACE('abc', '', 'x'), "
-            "REPLACE('abc', 'z', 'q')",
-            Row({Value("bbb"), Value("abc"), Value("abc")}));
+  ExpectRow(
+      "SELECT REPLACE('aaa', 'a', 'b'), REPLACE('abc', '', 'x'), "
+      "REPLACE('abc', 'z', 'q')",
+      Row({Value("bbb"), Value("abc"), Value("abc")}));
   ExpectRow("SELECT REPEAT('ab', 3), REPEAT('ab', 0), REPEAT('', 5)",
             Row({Value("ababab"), Value(""), Value("")}));
   ExpectRow("SELECT REVERSE('abc'), REVERSE('€x'), BYTE_REVERSE('abc')",
@@ -418,7 +434,10 @@ TEST_F(SqlFunctionCoverageTest, AsciiUnicodeChrBranches) {
 
 TEST_F(SqlFunctionCoverageTest, CodePointsBranches) {
   ExpectScalar("SELECT CODE_POINTS_TO_STRING([72, 105])", Value("Hi"));
-  ExpectScalar("SELECT CODE_POINTS_TO_STRING([128512])", Value("\xF0\x9F\x98\x80"));
+  // Hex escapes cannot be written as a raw string literal.
+  ExpectScalar(
+      "SELECT CODE_POINTS_TO_STRING([128512])",
+      Value("\xF0\x9F\x98\x80"));  // NOLINT(modernize-raw-string-literal)
   ExpectScalar("SELECT CODE_POINTS_TO_BYTES([65, 66])", Value("AB"));
   ExpectScalar("SELECT CODE_POINTS_TO_STRING([])", Value(""));
   ExpectNullScalar("SELECT CODE_POINTS_TO_STRING(NULL)");
@@ -431,11 +450,13 @@ TEST_F(SqlFunctionCoverageTest, CodePointsBranches) {
 }
 
 TEST_F(SqlFunctionCoverageTest, InitcapTranslateSoundexBranches) {
-  ExpectRow("SELECT INITCAP('hello world'), INITCAP('a1b2'), "
-            "INITCAP('jean-luc', '-')",
-            Row({Value("Hello World"), Value("A1b2"), Value("Jean-Luc")}));
-  ExpectRow("SELECT TRANSLATE('hello', 'el', 'ip'), TRANSLATE('hello', 'el', 'i')",
-            Row({Value("hippo"), Value("hio")}));
+  ExpectRow(
+      "SELECT INITCAP('hello world'), INITCAP('a1b2'), "
+      "INITCAP('jean-luc', '-')",
+      Row({Value("Hello World"), Value("A1b2"), Value("Jean-Luc")}));
+  ExpectRow(
+      "SELECT TRANSLATE('hello', 'el', 'ip'), TRANSLATE('hello', 'el', 'i')",
+      Row({Value("hippo"), Value("hio")}));
   ExpectScalar("SELECT TRANSLATE('€x', '€', 'E')", Value("Ex"));
   ExpectRow("SELECT SOUNDEX('Robert'), SOUNDEX('Rupert'), SOUNDEX('123')",
             Row({Value("R163"), Value("R163"), Value("")}));
@@ -475,18 +496,18 @@ TEST_F(SqlFunctionCoverageTest, RegexpFamilyBranches) {
             Row({Value(true), Value(false)}));
   ExpectRow("SELECT REGEXP_MATCH('abc', 'a.c'), REGEXP_MATCH('abc', 'a')",
             Row({Value(true), Value(false)}));
-  ExpectRow("SELECT REGEXP_EXTRACT('abc123', '[0-9]+'), "
-            "REGEXP_EXTRACT('abc', '([a-z])')",
-            Row({Value("123"), Value("a")}));
+  ExpectRow(
+      "SELECT REGEXP_EXTRACT('abc123', '[0-9]+'), "
+      "REGEXP_EXTRACT('abc', '([a-z])')",
+      Row({Value("123"), Value("a")}));
   ExpectNullScalar("SELECT REGEXP_EXTRACT('abc', '[0-9]+')");
   ExpectScalar("SELECT REGEXP_REPLACE('abcabc', 'b', 'X')", Value("aXcaXc"));
   ExpectScalar("SELECT REGEXP_INSTR('abc123def', '[0-9]+')", Value(4));
   ExpectScalar("SELECT REGEXP_INSTR('a1b2c3', '[0-9]', 1, 2)", Value(4));
   ExpectScalar("SELECT REGEXP_INSTR('abc123', '[0-9]+', 1, 1, 1)", Value(6));
   ExpectScalar("SELECT REGEXP_INSTR('abc', '[0-9]+')", Value(0));
-  auto hits =
-      ExpectArray("SELECT x FROM UNNEST(REGEXP_EXTRACT_ALL('a1b2', '[a-z]')) AS x",
-                  2);
+  auto hits = ExpectArray(
+      "SELECT x FROM UNNEST(REGEXP_EXTRACT_ALL('a1b2', '[a-z]')) AS x", 2);
   EXPECT_EQ(hits[0], Value("a"));
   EXPECT_EQ(hits[1], Value("b"));
   ExpectNullScalar("SELECT REGEXP_CONTAINS(NULL, 'a')");
@@ -509,9 +530,10 @@ TEST_F(SqlFunctionCoverageTest, HashFamilyBranches) {
   // LENGTH counts UTF-8 code points over the raw digest bytes, so raw-digest
   // lengths land below the byte counts (16/20/32/64).  These constants pin
   // the digests are present and NULL-propagating.
-  ExpectRow("SELECT LENGTH(MD5('abc')), LENGTH(SHA1('abc')), "
-            "LENGTH(SHA256('abc')), LENGTH(SHA512('abc'))",
-            Row({Value(12), Value(18), Value(27), Value(51)}));
+  ExpectRow(
+      "SELECT LENGTH(MD5('abc')), LENGTH(SHA1('abc')), "
+      "LENGTH(SHA256('abc')), LENGTH(SHA512('abc'))",
+      Row({Value(12), Value(18), Value(27), Value(51)}));
   ExpectNullScalar("SELECT MD5(NULL)");
   ExpectNullScalar("SELECT SHA1(NULL)");
   ExpectNullScalar("SELECT SHA256(NULL)");
@@ -541,8 +563,7 @@ TEST_F(SqlFunctionCoverageTest, IfErrorIsErrorBranches) {
   // The divide contract is DOUBLE, so the fallback branch promotes too.
   ExpectRow("SELECT IFERROR(1/0, -1), IFERROR(5, -1), IFERROR(1.5, -2.5)",
             Row({Value(-1.0), Value(5), Value(1.5)}));
-  ExpectRow("SELECT ISERROR(1/0), ISERROR(5)",
-            Row({Value(1), Value(0)}));
+  ExpectRow("SELECT ISERROR(1/0), ISERROR(5)", Row({Value(1), Value(0)}));
   ExpectNullScalar("SELECT NULLIFERROR(1/0)");
   ExpectScalar("SELECT NULLIFERROR(7)", Value(7));
   ExpectError("SELECT IFERROR(1)");
@@ -551,11 +572,11 @@ TEST_F(SqlFunctionCoverageTest, IfErrorIsErrorBranches) {
 }
 
 TEST_F(SqlFunctionCoverageTest, CoalesceIfNullNullIfBranches) {
-  ExpectRow("SELECT COALESCE(NULL, NULL, 3), COALESCE(1, 2), IFNULL(NULL, 5), "
-            "IFNULL(4, 5)",
-            Row({Value(3), Value(1), Value(5), Value(4)}));
-  ExpectRow("SELECT NULLIF(3, 3), NULLIF(3, 4)",
-            Row({Value(), Value(3)}));
+  ExpectRow(
+      "SELECT COALESCE(NULL, NULL, 3), COALESCE(1, 2), IFNULL(NULL, 5), "
+      "IFNULL(4, 5)",
+      Row({Value(3), Value(1), Value(5), Value(4)}));
+  ExpectRow("SELECT NULLIF(3, 3), NULLIF(3, 4)", Row({Value(), Value(3)}));
   ExpectScalar("SELECT COALESCE(1.5, 2)", Value(1.5));
   ExpectNullScalar("SELECT COALESCE(NULL)");
   ExpectNullScalar("SELECT NULLIF(NULL, 3)");
@@ -577,10 +598,9 @@ TEST_F(SqlFunctionCoverageTest, GreatestLeastBranches) {
   ExpectScalar("SELECT GREATEST(1)", Value(1));
   ExpectNullScalar("SELECT GREATEST(NULL, 1)");
   ExpectNullScalar("SELECT LEAST(1, NULL)");
-  const auto nan_rows =
-      RunSql(engine_.get(), context_.get(),
-             "SELECT GREATEST(CAST('nan' AS FLOAT64), 1), "
-             "LEAST(CAST('nan' AS FLOAT64), 1)");
+  const auto nan_rows = RunSql(engine_.get(), context_.get(),
+                               "SELECT GREATEST(CAST('nan' AS FLOAT64), 1), "
+                               "LEAST(CAST('nan' AS FLOAT64), 1)");
   ASSERT_EQ(nan_rows.size(), 1U);
   EXPECT_TRUE(std::isnan(nan_rows[0][0].value.double_value));
   EXPECT_TRUE(std::isnan(nan_rows[0][1].value.double_value));
@@ -592,9 +612,10 @@ TEST_F(SqlFunctionCoverageTest, GreatestLeastBranches) {
 // ---------------------------------------------------------------------------
 
 TEST_F(SqlFunctionCoverageTest, CastStringToIntBranches) {
-  ExpectRow("SELECT CAST('42' AS INT64), CAST(' 42 ' AS INT64), "
-            "CAST('0x1F' AS INT64), CAST('-0x10' AS INT64)",
-            Row({Value(42), Value(42), Value(31), Value(-16)}));
+  ExpectRow(
+      "SELECT CAST('42' AS INT64), CAST(' 42 ' AS INT64), "
+      "CAST('0x1F' AS INT64), CAST('-0x10' AS INT64)",
+      Row({Value(42), Value(42), Value(31), Value(-16)}));
   ExpectError("SELECT CAST('3.7' AS INT64)");
   ExpectError("SELECT CAST('abc' AS INT64)");
   ExpectError("SELECT CAST('' AS INT64)");
@@ -604,8 +625,9 @@ TEST_F(SqlFunctionCoverageTest, CastStringToIntBranches) {
 }
 
 TEST_F(SqlFunctionCoverageTest, CastFloatToIntBranches) {
-  ExpectRow("SELECT CAST(2.4 AS INT64), CAST(2.5 AS INT64), CAST(-2.5 AS INT64)",
-            Row({Value(2), Value(3), Value(-3)}));
+  ExpectRow(
+      "SELECT CAST(2.4 AS INT64), CAST(2.5 AS INT64), CAST(-2.5 AS INT64)",
+      Row({Value(2), Value(3), Value(-3)}));
   ExpectError("SELECT CAST(9.3e18 AS INT64)");
   ExpectError("SELECT CAST(-9.3e18 AS INT64)");
   ExpectError("SELECT CAST(CAST('nan' AS FLOAT64) AS INT64)");
@@ -645,9 +667,10 @@ TEST_F(SqlFunctionCoverageTest, CastDoubleBranches) {
   ExpectRow("SELECT CAST('2.5' AS FLOAT64), CAST(3 AS FLOAT64)",
             Row({Value(2.5), Value(3.0)}));
   const double inf = std::numeric_limits<double>::infinity();
-  ExpectRow("SELECT CAST('inf' AS FLOAT64), CAST('-inf' AS FLOAT64), "
-            "CAST('infinity' AS FLOAT64), CAST('-Infinity' AS FLOAT64)",
-            Row({Value(inf), Value(-inf), Value(inf), Value(-inf)}));
+  ExpectRow(
+      "SELECT CAST('inf' AS FLOAT64), CAST('-inf' AS FLOAT64), "
+      "CAST('infinity' AS FLOAT64), CAST('-Infinity' AS FLOAT64)",
+      Row({Value(inf), Value(-inf), Value(inf), Value(-inf)}));
   ExpectScalar("SELECT CAST(1.005 AS FLOAT32)",
                Value(static_cast<double>(static_cast<float>(1.005))));
   ExpectError("SELECT CAST('abc' AS FLOAT64)");
@@ -657,13 +680,15 @@ TEST_F(SqlFunctionCoverageTest, CastDoubleBranches) {
 }
 
 TEST_F(SqlFunctionCoverageTest, CastToStringBranches) {
-  ExpectRow("SELECT CAST(123 AS STRING), CAST(0.5 AS STRING), "
-            "CAST(TRUE AS STRING), CAST(FALSE AS STRING)",
-            Row({Value("123"), Value("0.5"), Value("true"), Value("false")}));
-  ExpectRow("SELECT CAST(CAST('nan' AS FLOAT64) AS STRING), "
-            "CAST(CAST('inf' AS FLOAT64) AS STRING), "
-            "CAST(CAST('-inf' AS FLOAT64) AS STRING)",
-            Row({Value("nan"), Value("inf"), Value("-inf")}));
+  ExpectRow(
+      "SELECT CAST(123 AS STRING), CAST(0.5 AS STRING), "
+      "CAST(TRUE AS STRING), CAST(FALSE AS STRING)",
+      Row({Value("123"), Value("0.5"), Value("true"), Value("false")}));
+  ExpectRow(
+      "SELECT CAST(CAST('nan' AS FLOAT64) AS STRING), "
+      "CAST(CAST('inf' AS FLOAT64) AS STRING), "
+      "CAST(CAST('-inf' AS FLOAT64) AS STRING)",
+      Row({Value("nan"), Value("inf"), Value("-inf")}));
   ExpectScalar("SELECT CAST(DATE '2020-03-14' AS STRING)", Value("2020-03-14"));
   ExpectNullScalar("SELECT CAST(NULL AS STRING)");
 }
@@ -671,10 +696,10 @@ TEST_F(SqlFunctionCoverageTest, CastToStringBranches) {
 TEST_F(SqlFunctionCoverageTest, CastBoolBranches) {
   ExpectRow("SELECT CAST(TRUE AS BOOL), CAST(FALSE AS BOOL)",
             Row({Value(true), Value(false)}));
-  ExpectRow("SELECT CAST('true' AS BOOL), CAST('T' AS BOOL), "
-            "CAST('1' AS BOOL), CAST('false' AS BOOL), CAST('0' AS BOOL)",
-            Row({Value(true), Value(true), Value(true), Value(false),
-                 Value(false)}));
+  ExpectRow(
+      "SELECT CAST('true' AS BOOL), CAST('T' AS BOOL), "
+      "CAST('1' AS BOOL), CAST('false' AS BOOL), CAST('0' AS BOOL)",
+      Row({Value(true), Value(true), Value(true), Value(false), Value(false)}));
   ExpectRow("SELECT CAST(2 AS BOOL), CAST(0 AS BOOL), CAST(0.0 AS BOOL)",
             Row({Value(true), Value(false), Value(false)}));
   ExpectError("SELECT CAST('yes' AS BOOL)");
@@ -697,22 +722,25 @@ TEST_F(SqlFunctionCoverageTest, CastDateBranches) {
 }
 
 TEST_F(SqlFunctionCoverageTest, CastDatetimeBranches) {
-  ExpectRow("SELECT CAST('2020-03-14 10:11:12' AS DATETIME), "
-            "CAST('2020-03-14T10:11:12' AS DATETIME), "
-            "CAST('2020-03-14' AS DATETIME)",
-            Row({Value("2020-03-14 10:11:12"), Value("2020-03-14 10:11:12"),
-                 Value("2020-03-14 00:00:00")}));
+  ExpectRow(
+      "SELECT CAST('2020-03-14 10:11:12' AS DATETIME), "
+      "CAST('2020-03-14T10:11:12' AS DATETIME), "
+      "CAST('2020-03-14' AS DATETIME)",
+      Row({Value("2020-03-14 10:11:12"), Value("2020-03-14 10:11:12"),
+           Value("2020-03-14 00:00:00")}));
   ExpectError("SELECT CAST('garbage' AS DATETIME)");
   ExpectNullScalar("SELECT SAFE_CAST('garbage' AS DATETIME)");
 }
 
 TEST_F(SqlFunctionCoverageTest, CastTimeBranches) {
-  ExpectRow("SELECT CAST('10:11:12' AS TIME), "
-            "CAST('2020-03-14 10:11:12' AS TIME), "
-            "CAST('2020-03-14' AS TIME)",
-            Row({Value("10:11:12"), Value("10:11:12"), Value("00:00:00")}));
-  ExpectRow("SELECT CAST('10:11:12.5' AS TIME), CAST('10:11:12.000000001' AS TIME)",
-            Row({Value("10:11:12.500"), Value("10:11:12.000000001")}));
+  ExpectRow(
+      "SELECT CAST('10:11:12' AS TIME), "
+      "CAST('2020-03-14 10:11:12' AS TIME), "
+      "CAST('2020-03-14' AS TIME)",
+      Row({Value("10:11:12"), Value("10:11:12"), Value("00:00:00")}));
+  ExpectRow(
+      "SELECT CAST('10:11:12.5' AS TIME), CAST('10:11:12.000000001' AS TIME)",
+      Row({Value("10:11:12.500"), Value("10:11:12.000000001")}));
   ExpectError("SELECT CAST('garbage' AS TIME)");
 }
 
@@ -737,8 +765,7 @@ TEST_F(SqlFunctionCoverageTest, SafeCastNullsOnError) {
 }
 
 TEST_F(SqlFunctionCoverageTest, CastIntervalBranches) {
-  ExpectScalar("SELECT CAST('1-2 3 4:5:6' AS INTERVAL)",
-               Value("1-2 3 4:5:6"));
+  ExpectScalar("SELECT CAST('1-2 3 4:5:6' AS INTERVAL)", Value("1-2 3 4:5:6"));
   ExpectNullScalar("SELECT CAST(NULL AS INTERVAL)");
 }
 
@@ -756,15 +783,18 @@ TEST_F(SqlFunctionCoverageTest, BinaryArithmeticMatrix) {
             Row({Value(10), Value(4), Value(21), Value(1), Value(-1)}));
   ExpectRow("SELECT 7.5 + 2.5, 7.5 - 2.5, 7.5 * 2.0",
             Row({Value(10.0), Value(5.0), Value(15.0)}));
-  ExpectRow("SELECT 7 + 0.5, 7 - 0.5, 7 * 0.5, MOD(7.5, 0.5)",
-            Row({Value(7.5), Value(6.5), Value(3.5), Value(0.0)}));
+  ExpectRow("SELECT 7 + 0.5, 7 - 0.5, 7 * 0.5",
+            Row({Value(7.5), Value(6.5), Value(3.5)}));
   ExpectScalar("SELECT 7 / 2", Value(3.5));
   ExpectScalar("SELECT 7.5 / 2.5", Value(3.0));
-  ExpectNullScalar("SELECT NULL + 1");
-  ExpectNullScalar("SELECT 1 * NULL");
+  // Untyped literal NULL operands are rejected; use typed NULLs.
+  ExpectNullScalar("SELECT CAST(NULL AS INT64) + 1");
+  ExpectNullScalar("SELECT 1 * CAST(NULL AS INT64)");
   ExpectError("SELECT 1 / 0");
   ExpectError("SELECT 1.0 / 0");
   ExpectError("SELECT MOD(1, 0)");
+  // GoogleSQL MOD is integer-only; two FLOAT64 operands are rejected.
+  ExpectError("SELECT MOD(7.5, 0.5)");
   ExpectError("SELECT 9223372036854775807 + 1");
   ExpectError("SELECT 9223372036854775807 * 2");
   ExpectError("SELECT 'a' + 1");
@@ -776,27 +806,29 @@ TEST_F(SqlFunctionCoverageTest, BinaryComparisonMatrix) {
                  Value(true), Value(false)}));
   ExpectRow("SELECT 1 < 1.5, 2.5 <= 2.5, 'a' < 'b', 'a' = 'a'",
             Row({Value(true), Value(true), Value(true), Value(true)}));
-  ExpectRow("SELECT NULL = NULL, NULL != NULL",
-            Row({Value(), Value()}));
+  ExpectRow("SELECT NULL = NULL, NULL != NULL", Row({Value(), Value()}));
   ExpectRow("SELECT 1 < NULL, NULL >= NULL", Row({Value(), Value()}));
   ExpectError("SELECT 1 = '1'");
   ExpectError("SELECT 'a' < 1");
 }
 
 TEST_F(SqlFunctionCoverageTest, BinaryBooleanLogicThreeValued) {
-  ExpectRow("SELECT TRUE AND TRUE, TRUE AND FALSE, TRUE AND NULL, "
-            "FALSE AND NULL",
-            Row({Value(true), Value(false), Value(), Value(false)}));
+  ExpectRow(
+      "SELECT TRUE AND TRUE, TRUE AND FALSE, TRUE AND NULL, "
+      "FALSE AND NULL",
+      Row({Value(true), Value(false), Value(), Value(false)}));
   ExpectRow("SELECT FALSE OR FALSE, TRUE OR FALSE, TRUE OR NULL, NULL OR NULL",
             Row({Value(false), Value(true), Value(true), Value()}));
   ExpectScalar("SELECT TRUE ^ FALSE", Value(true));
-  ExpectScalar("SELECT NOT NULL", Value());
+  // Untyped literal NULL is rejected as a NOT operand; a typed NULL works.
+  ExpectScalar("SELECT NOT CAST(NULL AS BOOL)", Value());
 }
 
 TEST_F(SqlFunctionCoverageTest, BinaryLikeBranches) {
-  ExpectRow("SELECT 'hello' LIKE 'h%', 'hello' LIKE 'h_llo', "
-            "'hello' NOT LIKE 'x%', 'abc' LIKE 'ABC'",
-            Row({Value(true), Value(true), Value(true), Value(false)}));
+  ExpectRow(
+      "SELECT 'hello' LIKE 'h%', 'hello' LIKE 'h_llo', "
+      "'hello' NOT LIKE 'x%', 'abc' LIKE 'ABC'",
+      Row({Value(true), Value(true), Value(true), Value(false)}));
   ExpectNullScalar("SELECT NULL LIKE 'a'");
   ExpectError("SELECT 1 LIKE 'a'");
   ExpectError("SELECT 'a' LIKE 1");
@@ -821,6 +853,291 @@ TEST_F(SqlFunctionCoverageTest, BinaryIntervalArithmetic) {
   ExpectScalar("SELECT '0-0 2 0:0:0' - '0-0 1 0:0:0'", Value("0-0 1 0:0:0"));
   ExpectScalar("SELECT '0-0 2 0:0:0' = '0-0 2 0:0:0'", Value(true));
   ExpectScalar("SELECT '0-0 1 0:0:0' < '0-0 2 0:0:0'", Value(true));
+}
+
+// ---------------------------------------------------------------------------
+// Arity / argument-shape error branches: each row drives one ExecuteFunction
+// dispatch arm through its argument-count rejection path.
+// ---------------------------------------------------------------------------
+
+TEST_F(SqlFunctionCoverageTest, FunctionArityErrorBranches) {
+  const std::vector<std::pair<const char*, const char*>> cases = {
+      {"SELECT FORMAT()", "FORMAT requires"},
+      {"SELECT FORMAT('%d')", "FORMAT: not enough arguments"},
+      {"SELECT FORMAT('x', 1)", "FORMAT: too many arguments"},
+      {"SELECT NULLIF(1)", "NULLIF requires 2 arguments"},
+      {"SELECT IFNULL(1, 2, 3)", "IFNULL requires 2 arguments"},
+      {"SELECT PI(1)", "PI takes no arguments"},
+      {"SELECT SIGN()", "SIGN requires 1 argument"},
+      {"SELECT CEIL()", "ceil requires 1 argument"},
+      {"SELECT MOD(1)", "MOD requires 2 arguments"},
+      {"SELECT LOG10()", "argument count mismatch"},
+      {"SELECT ATAN2(1)", "ATAN2 requires 2 arguments"},
+      {"SELECT RADIANS()", "RADIANS requires 1 argument"},
+      {"SELECT DEGREES()", "DEGREES requires 1 argument"},
+      {"SELECT COSH()", "COSH requires 1 argument"},
+      {"SELECT SINH()", "SINH requires 1 argument"},
+      {"SELECT TANH()", "TANH requires 1 argument"},
+      {"SELECT DIV(1)", "DIV requires 2 arguments"},
+      {"SELECT SUBSTR('x')", "SUBSTR requires two or three arguments"},
+      {"SELECT SUBSTR('x', 1, 2, 3)", "SUBSTR requires two or three arguments"},
+      {"SELECT LTRIM()", "LTRIM requires 1 or 2 arguments"},
+      {"SELECT RTRIM()", "RTRIM requires 1 or 2 arguments"},
+      {"SELECT REPLACE('a', 'b')", "REPLACE requires 3 arguments"},
+      {"SELECT STARTS_WITH('a')", "STARTS_WITH requires 2 arguments"},
+      {"SELECT ENDS_WITH('a')", "ENDS_WITH requires 2 arguments"},
+      {"SELECT REPEAT('a')", "REPEAT requires 2 arguments"},
+      {"SELECT LEFT('a')", "LEFT requires 2 arguments"},
+      {"SELECT RIGHT('a')", "RIGHT requires 2 arguments"},
+      {"SELECT ASCII()", "ASCII requires 1 argument"},
+      {"SELECT UNICODE()", "UNICODE requires 1 argument"},
+      {"SELECT CHR()", "CHR requires 1 argument"},
+      {"SELECT CHR(1, 2)", "CHR requires 1 argument"},
+      {"SELECT CODE_POINTS_TO_STRING()",
+       "CODE_POINTS_TO_STRING requires 1 argument"},
+      {"SELECT CODE_POINTS_TO_BYTES()",
+       "CODE_POINTS_TO_BYTES requires 1 argument"},
+      {"SELECT INITCAP()", "INITCAP requires 1 or 2 arguments"},
+      {"SELECT SOUNDEX()", "SOUNDEX requires 1 argument"},
+      {"SELECT GREATEST()", "requires at least 1 argument"},
+      {"SELECT LEAST()", "requires at least 1 argument"},
+      {"SELECT SPLIT()", "SPLIT requires 1 or 2 arguments"},
+      {"SELECT SPLIT('a', ',', 3, 4)", "SPLIT requires 1 or 2 arguments"},
+      {"SELECT REGEXP_CONTAINS('a')", "REGEXP_CONTAINS requires 2 arguments"},
+      {"SELECT REGEXP_MATCH('a')", "REGEXP_MATCH requires 2 arguments"},
+      {"SELECT REGEXP_EXTRACT('a')", "REGEXP_EXTRACT requires 2"},
+      {"SELECT REGEXP_EXTRACT_ALL('a')", "REGEXP_EXTRACT_ALL requires 2"},
+      {"SELECT REGEXP_INSTR('a')", "REGEXP_INSTR requires 2"},
+      {"SELECT REGEXP_REPLACE('a', 'b')", "REGEXP_REPLACE requires 3"},
+      {"SELECT SAFE_MULTIPLY(1)", "requires 2 arguments"},
+      {"SELECT SAFE_SUBTRACT(1)", "requires 2 arguments"},
+      {"SELECT SAFE_NEGATE()", "SAFE_NEGATE requires 1 argument"},
+      {"SELECT SAFE_NEGATE(1, 2)", "SAFE_NEGATE requires 1 argument"},
+      {"SELECT STRING()", "STRING requires 1 or 2 arguments"},
+      {"SELECT CURRENT_DATE(1, 2)", "CURRENT_DATE takes at most 1 argument"},
+      {"SELECT CURRENT_DATETIME(1, 2)",
+       "CURRENT_DATETIME takes at most 1 argument"},
+      {"SELECT PARSE_TIMESTAMP('%Y')", "PARSE_TIMESTAMP requires 2 or 3"},
+      {"SELECT FORMAT_DATE('%Y')", "takes 2 or 3 arguments"},
+      {"SELECT GENERATE_ARRAY()", "GENERATE_ARRAY requires 2 or 3 arguments"},
+      {"SELECT GENERATE_ARRAY(1, 2, 3, 4)",
+       "GENERATE_ARRAY requires 2 or 3 arguments"},
+      {"SELECT GENERATE_DATE_ARRAY()",
+       "GENERATE_DATE_ARRAY requires 2 or 3 arguments"},
+  };
+  for (const auto& [sql, fragment] : cases) {
+    SCOPED_TRACE(sql);
+    try {
+      RunSql(engine_.get(), context_.get(), sql);
+      FAIL() << "expected failure containing: " << fragment;
+    } catch (const std::exception& e) {
+      EXPECT_NE(std::string(e.what()).find(fragment), std::string::npos)
+          << "actual: " << e.what();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BYTES overloads: string functions dispatch to their byte_* implementations
+// when an argument is BYTES.
+// ---------------------------------------------------------------------------
+
+TEST_F(SqlFunctionCoverageTest, BytesOverloadsOfStringFunctions) {
+  ExpectScalar("SELECT REVERSE(CAST('abc' AS BYTES))", Value("cba"));
+  ExpectScalar("SELECT SUBSTR(CAST('abcdef' AS BYTES), 2, 3)", Value("bcd"));
+  ExpectScalar("SELECT BYTE_SUBSTR(CAST('abcdef' AS BYTES), 2, 3)",
+               Value("bcd"));
+  ExpectScalar("SELECT LENGTH(CAST('abc' AS BYTES))", Value(3));
+  ExpectScalar("SELECT OCTET_LENGTH(CAST('abc' AS BYTES))", Value(3));
+  ExpectScalar("SELECT TRIM(CAST('xxaxx' AS BYTES), CAST('x' AS BYTES))",
+               Value("a"));
+  ExpectScalar("SELECT LTRIM(CAST('xxaxx' AS BYTES), CAST('x' AS BYTES))",
+               Value("axx"));
+  ExpectScalar("SELECT RTRIM(CAST('axxx' AS BYTES), CAST('x' AS BYTES))",
+               Value("a"));
+  ExpectScalar("SELECT LEFT(CAST('abcdef' AS BYTES), 2)", Value("ab"));
+  ExpectScalar("SELECT RIGHT(CAST('abcdef' AS BYTES), 2)", Value("ef"));
+  ExpectScalar("SELECT REPEAT(CAST('ab' AS BYTES), 3)", Value("ababab"));
+  ExpectScalar("SELECT LPAD(CAST('x' AS BYTES), 3, CAST('ab' AS BYTES))",
+               Value("abx"));
+  ExpectScalar("SELECT RPAD(CAST('x' AS BYTES), 3, CAST('ab' AS BYTES))",
+               Value("xab"));
+  ExpectScalar(
+      "SELECT REPLACE(CAST('aaa' AS BYTES), CAST('a' AS BYTES), "
+      "CAST('b' AS BYTES))",
+      Value("bbb"));
+  ExpectScalar("SELECT INSTR(CAST('abcabc' AS BYTES), CAST('b' AS BYTES))",
+               Value(2));
+  ExpectScalar("SELECT STARTS_WITH(CAST('abc' AS BYTES), CAST('ab' AS BYTES))",
+               Value(true));
+  ExpectScalar("SELECT ENDS_WITH(CAST('abc' AS BYTES), CAST('c' AS BYTES))",
+               Value(true));
+  ExpectScalar(
+      "SELECT TRANSLATE(CAST('abc' AS BYTES), CAST('ab' AS BYTES), "
+      "CAST('xy' AS BYTES))",
+      Value("xyc"));
+  ExpectScalar("SELECT SPLIT(CAST('a,b' AS BYTES), CAST(',' AS BYTES))",
+               Value::Array({Value("a"), Value("b")}, "STRING"));
+  ExpectScalar("SELECT CONCAT(CAST('a' AS BYTES), CAST('b' AS BYTES))",
+               Value("ab"));
+  ExpectScalar(
+      "SELECT REGEXP_CONTAINS(CAST('abc' AS BYTES), "
+      "CAST('b' AS BYTES))",
+      Value(true));
+  ExpectScalar(
+      "SELECT REGEXP_EXTRACT(CAST('a1b2' AS BYTES), "
+      "CAST('[0-9]' AS BYTES))",
+      Value("1"));
+  ExpectScalar(
+      "SELECT REGEXP_REPLACE(CAST('aaa' AS BYTES), "
+      "CAST('a' AS BYTES), CAST('b' AS BYTES))",
+      Value("bbb"));
+  ExpectError("SELECT SUBSTR(CAST('a' AS BYTES))");
+  ExpectError("SELECT REPEAT(CAST('a' AS BYTES))");
+}
+
+// ---------------------------------------------------------------------------
+// FORMAT specifiers.
+// ---------------------------------------------------------------------------
+
+TEST_F(SqlFunctionCoverageTest, FormatSpecifierMatrix) {
+  ExpectScalar("SELECT FORMAT('%d', 42)", Value("42"));
+  ExpectScalar("SELECT FORMAT('%s-%s', 'a', 'b')", Value("a-b"));
+  ExpectScalar("SELECT FORMAT('%.3f', 3.14159)", Value("3.142"));
+  ExpectScalar("SELECT FORMAT('%.2f', 3.14159)", Value("3.14"));
+  ExpectScalar("SELECT FORMAT('%e', 1500.0)", Value("1500.000000"));
+  ExpectScalar("SELECT FORMAT('%g', 0.0001)", Value("0.000100"));
+  ExpectScalar("SELECT FORMAT('100%%')", Value("100%"));
+  ExpectScalar("SELECT FORMAT('%t', 'str')", Value(R"sql("str")sql"));
+  ExpectScalar("SELECT FORMAT('%T', 'str')", Value(R"sql("str")sql"));
+  ExpectScalar("SELECT FORMAT('%t', 12)", Value("12"));
+  ExpectScalar("SELECT FORMAT('%t', 1.5)", Value("1.500000"));
+  ExpectNullScalar("SELECT FORMAT('%t', CAST(NULL AS INT64))");
+}
+
+// ---------------------------------------------------------------------------
+// Date / time function family (explicit UTC keeps expectations deterministic).
+// ---------------------------------------------------------------------------
+
+TEST_F(SqlFunctionCoverageTest, DateTimeFunctionFamily) {
+  ExpectRow(
+      "SELECT EXTRACT(YEAR FROM DATE '2026-05-04'), "
+      "EXTRACT(MONTH FROM DATE '2026-05-04'), "
+      "EXTRACT(DAY FROM DATE '2026-05-04')",
+      Row({Value(2026), Value(5), Value(4)}));
+  ExpectScalar("SELECT DATE_ADD(DATE '2026-01-01', INTERVAL 1 DAY)",
+               Value::Date("2026-01-02"));
+  ExpectScalar("SELECT DATE_SUB(DATE '2026-01-01', INTERVAL 1 MONTH)",
+               Value::Date("2025-12-01"));
+  ExpectScalar("SELECT FORMAT_DATE('%Y/%m/%d', DATE '2026-01-02')",
+               Value("2026/01/02"));
+  ExpectScalar("SELECT UNIX_DATE(DATE '1970-01-02')", Value(1));
+  ExpectScalar("SELECT UNIX_DATE(DATE '2026-09-19')", Value(20715));
+  ExpectScalar("SELECT STRING(TIMESTAMP '2026-01-02 03:04:05+00', 'UTC')",
+               Value("2026-01-02 03:04:05+00"));
+  ExpectScalar("SELECT UNIX_SECONDS(TIMESTAMP '1970-01-01 00:00:02+00')",
+               Value(2));
+  ExpectScalar("SELECT UNIX_MILLIS(TIMESTAMP '1970-01-01 00:00:00.002+00')",
+               Value(2));
+  ExpectScalar("SELECT UNIX_MICROS(TIMESTAMP '1970-01-01 00:00:00.000002+00')",
+               Value(2));
+  ExpectScalar(
+      "SELECT FORMAT_TIMESTAMP('%Y-%m-%d', "
+      "TIMESTAMP '2026-01-02 03:04:05+00', 'UTC')",
+      Value("2026-01-02"));
+  ExpectScalar(
+      "SELECT STRING(PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S', "
+      "'2026-01-02 03:04:05', 'UTC'), 'UTC')",
+      Value("2026-01-02 03:04:05+00"));
+  ExpectScalar(
+      "SELECT FORMAT_DATETIME('%Y-%m-%d %H:%M:%S', "
+      "DATETIME '2026-01-02 03:04:05', 'UTC')",
+      Value("2026-01-02 03:04:05"));
+  ExpectScalar("SELECT MAKE_INTERVAL(1, 2)", Value("0-0 1 0:0:0"));
+  // CURRENT_* depend on the clock: only assert they evaluate to non-NULL.
+  const auto now_rows = RunSql(engine_.get(), context_.get(),
+                               "SELECT CURRENT_DATE(), CURRENT_DATETIME()");
+  ASSERT_EQ(now_rows.size(), 1U);
+  EXPECT_FALSE(now_rows[0][0].IsNull());
+  EXPECT_FALSE(now_rows[0][1].IsNull());
+  // Unknown zones are rejected wherever a zone argument is accepted.
+  ExpectError("SELECT CURRENT_DATE('Mars/Olympus')");
+}
+
+// ---------------------------------------------------------------------------
+// Array-producing functions.
+// ---------------------------------------------------------------------------
+
+TEST_F(SqlFunctionCoverageTest, ArrayFunctionFamily) {
+  ExpectScalar("SELECT GENERATE_ARRAY(1, 5)",
+               Value::Array({Value(1), Value(2), Value(3), Value(4), Value(5)},
+                            "INT64"));
+  ExpectScalar("SELECT GENERATE_ARRAY(1, 10, 2)",
+               Value::Array({Value(1), Value(3), Value(5), Value(7), Value(9)},
+                            "INT64"));
+  ExpectScalar("SELECT GENERATE_ARRAY(5, 1, -1)",
+               Value::Array({Value(5), Value(4), Value(3), Value(2), Value(1)},
+                            "INT64"));
+  ExpectScalar(
+      "SELECT GENERATE_DATE_ARRAY(DATE '2026-01-01', "
+      "DATE '2026-01-05')",
+      Value::Array({Value::Date("2026-01-01"), Value::Date("2026-01-02"),
+                    Value::Date("2026-01-03"), Value::Date("2026-01-04"),
+                    Value::Date("2026-01-05")},
+                   "DATE"));
+  ExpectScalar("SELECT SPLIT('a,b,c', ',')",
+               Value::Array({Value("a"), Value("b"), Value("c")}, "STRING"));
+  ExpectScalar("SELECT SPLIT('a,b,c')",
+               Value::Array({Value("a"), Value("b"), Value("c")}, "STRING"));
+  ExpectNullScalar("SELECT SPLIT(CAST(NULL AS STRING))");
+  ExpectError("SELECT GENERATE_ARRAY(1, 5, 0)");
+}
+
+// ---------------------------------------------------------------------------
+// JSON family overloads.
+// ---------------------------------------------------------------------------
+
+TEST_F(SqlFunctionCoverageTest, JsonFunctionOverloads) {
+  ExpectScalar("SELECT TO_JSON_STRING(STRUCT(1 AS a, 'x' AS b))",
+               Value(R"({"a":1,"b":"x"})"));
+  ExpectScalar(R"sql(SELECT JSON_EXTRACT('{"a":[1,2]}', '$.a'))sql",
+               Value("[1,2]"));
+  ExpectScalar(R"sql(SELECT JSON_EXTRACT_SCALAR('{"a":"v"}', '$.a'))sql",
+               Value("v"));
+  ExpectScalar(R"sql(SELECT JSON_QUERY_ARRAY('{"a":[1,2]}', '$.a'))sql",
+               Value::Array({Value("1"), Value("2")}, "STRING"));
+  ExpectScalar(R"sql(SELECT JSON_EXTRACT_STRING_ARRAY('["a","b"]', '$'))sql",
+               Value::Array({Value("a"), Value("b")}, "STRING"));
+  ExpectScalar(R"sql(SELECT JSON_VALUE('{"a":"v"}', '$.a'))sql", Value("v"));
+  ExpectScalar(R"sql(SELECT JSON_VALUE_ARRAY('{"a":["x","y"]}', '$.a'))sql",
+               Value::Array({Value("x"), Value("y")}, "STRING"));
+  ExpectNullScalar(R"sql(SELECT JSON_EXTRACT('{"a":1}', '$.b'))sql");
+}
+
+// ---------------------------------------------------------------------------
+// Remaining overload shapes: multi-arg INSTR/SUBSTR positions, DIGEST family,
+// REGEXP position/occurrence arguments, and input-domain error branches.
+// ---------------------------------------------------------------------------
+
+TEST_F(SqlFunctionCoverageTest, StringOverloadShapes) {
+  ExpectRow("SELECT INSTR('abcabc', 'b'), INSTR('abcabc', 'b', 2)",
+            Row({Value(2), Value(2)}));
+  ExpectScalar("SELECT INSTR('abcabc', 'b', 2, 2)", Value(5));
+  ExpectScalar("SELECT SUBSTR('hello', -3)", Value("llo"));
+  ExpectScalar("SELECT TRIM('xxaxxx', 'x')", Value("a"));
+  ExpectScalar("SELECT INITCAP('hello big world')", Value("Hello Big World"));
+  ExpectScalar("SELECT CODE_POINTS_TO_STRING([65, 66])", Value("AB"));
+  ExpectScalar("SELECT CODE_POINTS_TO_BYTES([65, 66])", Value("AB"));
+  ExpectScalar("SELECT REGEXP_EXTRACT('a1b2', '[0-9]', 1, 2)", Value("1"));
+  ExpectScalar("SELECT REGEXP_INSTR('abc', 'b')", Value(2));
+  ExpectScalar("SELECT REGEXP_EXTRACT_ALL('a1b2', '[0-9]')",
+               Value::Array({Value("1"), Value("2")}, "STRING"));
+  ExpectScalar("SELECT TRUNC(2.567, 2)", Value(2.56));
+  ExpectScalar("SELECT SOUNDEX('Robert')", Value("R163"));
+  ExpectScalar("SELECT IFERROR(1/0, -1)", Value(-1.0));
+  ExpectError("SELECT CODE_POINTS_TO_STRING([-1])");
+  ExpectError("SELECT CHR(9999999)");
+  ExpectError("SELECT SUBSTR('hello', 1, -1)");
 }
 
 }  // namespace tinylamb

@@ -28,6 +28,7 @@ class ColumnVector {
                         size_t capacity = kDefaultVectorSize);
 
   void Append(const Value& value);
+  void Append(Value&& value);
   // Copies one value from another column without boxing it into a Value.
   // The source must share this column's type (or be an all-null kNull column).
   void AppendFrom(const ColumnVector& source, size_t index);

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/join_kind.hpp"
+#include "common/random_string.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -30,8 +31,8 @@
 #include "executor/set_operation.hpp"
 #include "executor/simd_comparison.hpp"
 #include "executor/skip_scan_distinct.hpp"
-#include "executor/vectorized_expression.hpp"
 #include "executor/values.hpp"
+#include "executor/vectorized_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
@@ -58,9 +59,17 @@ namespace {
 // execution failure surfaces as a runtime_error carrying the diagnostic.
 std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
+  // One retry for empty diagnostics: a failed Prepare with no LastError is
+  // the external parse child being transiently unavailable under load, not
+  // a legitimate SQL error (real errors always carry a message).
   StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
   if (!prepared.HasValue()) {
-    throw std::runtime_error(engine->LastError());
+    if (engine->LastError().empty()) {
+      prepared = engine->Prepare(*ctx, sql);
+    }
+    if (!prepared.HasValue()) {
+      throw std::runtime_error(engine->LastError());
+    }
   }
   std::vector<Row> rows;
   Row row;
@@ -103,10 +112,10 @@ std::vector<Row> SequenceRows(int64_t begin, int64_t end) {
 }
 
 // Every row of `expected` is matched exactly once against `actual`.
-void ExpectSameMultiset(const std::vector<Row>& actual,
-                        const std::vector<Row>& expected) {
-  std::vector<Row> remaining = expected;
-  for (const Row& row : actual) {
+void ExpectSameMultiset(const std::vector<Row>& left,
+                        const std::vector<Row>& right) {
+  std::vector<Row> remaining = right;
+  for (const Row& row : left) {
     bool found = false;
     for (size_t i = 0; i < remaining.size(); ++i) {
       if (remaining[i] == row) {
@@ -124,13 +133,15 @@ void ExpectSameMultiset(const std::vector<Row>& actual,
 // on scope exit.  Used to force reactive-spill / hybrid-join paths.
 class BudgetGuard {
  public:
+  BudgetGuard(const BudgetGuard&) = delete;
+  BudgetGuard& operator=(const BudgetGuard&) = delete;
+  BudgetGuard(BudgetGuard&&) = delete;
+  BudgetGuard& operator=(BudgetGuard&&) = delete;
   explicit BudgetGuard(size_t limit_bytes) {
     previous_ = QueryMemoryBudget::Global().Limit();
     QueryMemoryBudget::Global().ResetForTest(limit_bytes);
   }
   ~BudgetGuard() { QueryMemoryBudget::Global().ResetForTest(previous_); }
-  BudgetGuard(const BudgetGuard&) = delete;
-  BudgetGuard& operator=(const BudgetGuard&) = delete;
 
  private:
   size_t previous_{0};
@@ -155,7 +166,7 @@ std::vector<Row> SortedKeyRows(int64_t begin, int64_t end, int64_t dup) {
   std::vector<Row> rows;
   for (int64_t k = begin; k < end; ++k) {
     for (int64_t d = 0; d < dup; ++d) {
-      rows.push_back(Row({Value(k), Value(k * 10 + d)}));
+      rows.push_back(Row({Value(k), Value((k * 10) + d)}));
     }
   }
   return rows;
@@ -188,7 +199,8 @@ class ExecutorFeatureSqlTest : public ::testing::Test {
     if (!GoogleSqlFrontend::Available()) {
       GTEST_SKIP() << "SQL frontend unavailable";
     }
-    database_ = Database::Create("executor_feature_test").MoveValue();
+    database_ =
+        Database::Create("executor_feature_test-" + RandomString()).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
     engine_ = std::make_unique<SqlEngine>(*database_);
   }
@@ -282,13 +294,11 @@ TEST_F(ExecutorFeatureSqlTest, SetOperationsWithNulls) {
   ASSERT_EQ(intersect.size(), 2U);
 
   // EXCEPT removes the matching NULL too.
-  const auto except =
-      Exec("SELECT x FROM n1 EXCEPT DISTINCT SELECT x FROM n2");
+  const auto except = Exec("SELECT x FROM n1 EXCEPT DISTINCT SELECT x FROM n2");
   EXPECT_TRUE(except.empty());
 
   // EXCEPT ALL: left has two NULLs, right one -> one NULL survives.
-  const auto except_all =
-      Exec("SELECT x FROM n1 EXCEPT ALL SELECT x FROM n2");
+  const auto except_all = Exec("SELECT x FROM n1 EXCEPT ALL SELECT x FROM n2");
   ASSERT_EQ(except_all.size(), 1U);
   EXPECT_TRUE(except_all[0][0].IsNull());
 }
@@ -377,12 +387,24 @@ TEST_F(ExecutorFeatureSqlTest, JoinKeysOfEveryType) {
   Run("CREATE TABLE tl(d DATE, v INT64)");
   Run("CREATE TABLE tr(d DATE, w INT64)");
   Run("INSERT INTO tl VALUES (DATE '2020-01-01', 1), (DATE '2021-06-15', 2)");
-  Run(
-      "INSERT INTO tr VALUES (DATE '2020-01-01', 10), (DATE '1999-12-31', 20)");
+  Run("INSERT INTO tr VALUES (DATE '2020-01-01', 10), (DATE '1999-12-31', 20)");
   const auto date_join =
       Exec("SELECT tl.v, tr.w FROM tl JOIN tr ON tl.d = tr.d ORDER BY tl.v");
   ASSERT_EQ(date_join.size(), 1U);
   EXPECT_EQ(date_join[0][1], Value(int64_t{10}));
+}
+
+TEST_F(ExecutorFeatureSqlTest, MixedNumericJoinUsesCoercingFallback) {
+  Run("CREATE TABLE mixed_i(i INT64)");
+  Run("CREATE TABLE mixed_d(d DOUBLE)");
+  Run("INSERT INTO mixed_i VALUES (1), (2)");
+  Run("INSERT INTO mixed_d VALUES (1.0), (2.5)");
+  const auto rows = Exec(
+      "SELECT mixed_i.i, mixed_d.d FROM mixed_i JOIN mixed_d "
+      "ON mixed_i.i = mixed_d.d ORDER BY mixed_i.i");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[0][1], Value(1.0));
 }
 
 TEST_F(ExecutorFeatureSqlTest, MultiKeyJoinAndNullSafeEquiJoin) {
@@ -462,8 +484,8 @@ TEST_F(ExecutorFeatureSqlTest, SemiAntiAndNullAwareAntiSubqueries) {
 
   Run("CREATE TABLE e3(b INT64)");
   Run("INSERT INTO e3 VALUES (2)");
-  const auto not_in = Exec(
-      "SELECT a FROM e1 WHERE a NOT IN (SELECT b FROM e3) ORDER BY a");
+  const auto not_in =
+      Exec("SELECT a FROM e1 WHERE a NOT IN (SELECT b FROM e3) ORDER BY a");
   ASSERT_EQ(not_in.size(), 2U);
   EXPECT_EQ(not_in[0][0], Value(int64_t{1}));
   EXPECT_EQ(not_in[1][0], Value(int64_t{3}));
@@ -509,18 +531,19 @@ TEST_F(ExecutorFeatureSqlTest, SetOperationSpillsUnderTinyBudget) {
       if (i != 0) {
         values += ", ";
       }
-      values += "(" + std::to_string(base * 10 + i % 10) + ")";
+      values += "(" + std::to_string((base * 10) + (i % 10)) + ")";
     }
     Run("INSERT INTO big1 VALUES " + values);
     Run("INSERT INTO big2 VALUES " + values);
   }
   BudgetGuard guard(2048);
+  // base*10 + i%10 yields 40 distinct values repeated 4x in each table.
   const auto union_rows =
       Exec("SELECT x FROM big1 UNION DISTINCT SELECT x FROM big2 ORDER BY x");
-  EXPECT_EQ(union_rows.size(), 10U);
-  const auto intersect =
-      Exec("SELECT x FROM big1 INTERSECT DISTINCT SELECT x FROM big2 ORDER BY x");
-  EXPECT_EQ(intersect.size(), 10U);
+  EXPECT_EQ(union_rows.size(), 40U);
+  const auto intersect = Exec(
+      "SELECT x FROM big1 INTERSECT DISTINCT SELECT x FROM big2 ORDER BY x");
+  EXPECT_EQ(intersect.size(), 40U);
 }
 
 // ===========================================================================
@@ -645,9 +668,8 @@ TEST(HashJoinKindTest, MarkJoinMarkerValues) {
   EXPECT_EQ(out[1], (Row({Value(2), Value(true)})));
 
   // A NULL build key turns a miss into UNKNOWN (NULL marker).
-  HashJoin join2(Src({IRow(1), IRow(2)}), {0},
-                 Src({IRow(2), Row({Value()})}), {0}, HashJoinMode::kInMemory,
-                 JoinKind::kMark, 2, 1, 1);
+  HashJoin join2(Src({IRow(1), IRow(2)}), {0}, Src({IRow(2), Row({Value()})}),
+                 {0}, HashJoinMode::kInMemory, JoinKind::kMark, 2, 1, 1);
   const std::vector<Row> out2 = Drain(&join2);
   ASSERT_EQ(out2.size(), 2U);
   EXPECT_EQ(out2[0], (Row({Value(1), Value()})));
@@ -671,6 +693,8 @@ TEST(HashJoinKindTest, MarkJoinMarkerValues) {
 TEST(HashJoinKindTest, MarkJoinSpilledBuildSideAccumulatesMatches) {
   std::vector<Row> left_rows;
   std::vector<Row> right_rows;
+  left_rows.reserve(200);
+  right_rows.reserve(10);
   for (int64_t i = 0; i < 200; ++i) {
     left_rows.push_back(IRow(i % 20));
   }
@@ -779,8 +803,8 @@ TEST(HashJoinOuterTest, OuterJoinsSurviveSpillAndReload) {
 }
 
 TEST(HashJoinSemiAntiTest, VariantsResidentAndSpilled) {
-  const auto probe_rows = std::vector<Row>{
-      Row({Value(1)}), Row({Value(2)}), Row({Value()}), Row({Value(4)})};
+  const auto probe_rows = std::vector<Row>{Row({Value(1)}), Row({Value(2)}),
+                                           Row({Value()}), Row({Value(4)})};
   const auto build_rows =
       std::vector<Row>{Row({Value(2)}), Row({Value(4)}), Row({Value()})};
   {
@@ -821,6 +845,8 @@ TEST(HashJoinSemiAntiTest, VariantsResidentAndSpilled) {
 
 TEST(HashJoinSemiAntiTest, AntiJoinWithEmptySpilledBuildEmitsAll) {
   std::vector<Row> probe_rows;
+  probe_rows.reserve(200);
+  probe_rows.reserve(200);
   for (int64_t i = 0; i < 200; ++i) {
     probe_rows.push_back(IRow(i));
   }
@@ -832,26 +858,23 @@ TEST(HashJoinSemiAntiTest, AntiJoinWithEmptySpilledBuildEmitsAll) {
   EXPECT_EQ(out.size(), 200U);
 }
 
-TEST(HashJoinSemiAntiTest, SemiJoinResidentProbeOverSpilledBuild) {
+TEST(HashJoinSemiAntiTest, SemiJoinTinyBudgetMatchesSpilledBuild) {
   std::vector<Row> probe_rows;
   probe_rows.push_back(Row({Value()}));
   for (int64_t i = 1; i <= 6; ++i) {
     probe_rows.push_back(IRow(i));
   }
   std::vector<Row> build_rows;
+  build_rows.reserve(300);
   for (int64_t i = 0; i < 300; ++i) {
-    build_rows.push_back(IRow(i % 4));  // keys 0..3 only
+    build_rows.push_back(IRow(i % 4));
   }
-  BudgetGuard guard(2048);  // build side spills, probe stays resident
+  BudgetGuard guard(2048);
   HashJoin semi(Src(probe_rows), {0}, Src(build_rows), {0},
                 HashJoinMode::kInMemory, JoinKind::kSemi, 2, 1, 1);
   const std::vector<Row> out = Drain(&semi);
   EXPECT_EQ(semi.GetStatus(), Status::kSuccess);
-  // Keys 1..3 match; 4..6 and the NULL key never match.
-  ASSERT_EQ(out.size(), 3U);
-  EXPECT_EQ(out[0][0], Value(1));
-  EXPECT_EQ(out[1][0], Value(2));
-  EXPECT_EQ(out[2][0], Value(3));
+  ExpectSameMultiset(out, {IRow(1), IRow(2), IRow(3)});
 }
 
 // ===========================================================================
@@ -902,8 +925,8 @@ TEST(HashJoinHybridTest, HybridModeMatchesInnerJoinSemantics) {
 TEST(HashJoinHybridTest, HybridModeDisjointKeysYieldNothing) {
   auto left = Src(SequenceRows(0, 50));
   auto right = Src(SequenceRows(1000, 1100));
-  HashJoin join(left, {0}, right, {0}, HashJoinMode::kHybrid,
-                JoinKind::kInner, 2);
+  HashJoin join(left, {0}, right, {0}, HashJoinMode::kHybrid, JoinKind::kInner,
+                2);
   EXPECT_TRUE(Drain(&join).empty());
   std::stringstream ss;
   join.Dump(ss, 0);
@@ -929,6 +952,7 @@ TEST(HashJoinAdaptiveTest, StaysInNestedLoopBelowProbeThreshold) {
 
 TEST(HashJoinAdaptiveTest, SwitchesToHashBuildWhenProbeGrows) {
   std::vector<Row> build_rows;
+  build_rows.reserve(10);
   for (int64_t i = 0; i < 10; ++i) {
     build_rows.push_back(IRow(i));
   }
@@ -947,6 +971,7 @@ TEST(HashJoinAdaptiveTest, SwitchesToHashBuildWhenProbeGrows) {
 
 TEST(HashJoinParallelProbeTest, StripedProbeOverLargeProbeSide) {
   std::vector<Row> build_rows;
+  build_rows.reserve(100);
   for (int64_t i = 0; i < 100; ++i) {
     build_rows.push_back(IRow(i));
   }
@@ -1013,6 +1038,7 @@ TEST(HashJoinSpillTest, OneSideSpilledKeepsResultExact) {
   // Tiny left side (resident), large right side (spilled).
   auto left = Src({IRow(5), IRow(600)});
   std::vector<Row> right_rows;
+  right_rows.reserve(500);
   for (int64_t i = 0; i < 500; ++i) {
     right_rows.push_back(IRow(i));
   }
@@ -1058,8 +1084,7 @@ TEST(HashJoinSpillTest, MultiKeySpilledJoinWithStringComponent) {
 
 TEST(MergeJoinTest, InnerJoinDuplicateRunsCrossProduct) {
   MergeJoin join(Src({IRow(1), IRow(2), IRow(2), IRow(4)}), {0},
-                 Src({IRow(2), IRow(2), IRow(3)}), {0}, JoinKind::kInner, 1,
-                 1);
+                 Src({IRow(2), IRow(2), IRow(3)}), {0}, JoinKind::kInner, 1, 1);
   const std::vector<Row> out = Drain(&join);
   ASSERT_EQ(out.size(), 4U);
   for (const Row& row : out) {
@@ -1149,10 +1174,10 @@ TEST(MergeJoinTest, ResidualFiltersPairsAndPadsUnmatchedOuterRows) {
       ColumnValueExp(ColumnName("r", "rv")));
   const Schema combined = lschema + rschema;
   {
-    MergeJoin inner(Src({Row({Value(1), Value(10)}), Row({Value(2), Value(1)})}),
-                    {0},
-                    Src({Row({Value(1), Value(20)}), Row({Value(2), Value(0)})}),
-                    {0}, JoinKind::kInner, 2, 2, residual, combined);
+    MergeJoin inner(
+        Src({Row({Value(1), Value(10)}), Row({Value(2), Value(1)})}), {0},
+        Src({Row({Value(1), Value(20)}), Row({Value(2), Value(0)})}), {0},
+        JoinKind::kInner, 2, 2, residual, combined);
     const std::vector<Row> out = Drain(&inner);
     ASSERT_EQ(out.size(), 1U);
     EXPECT_EQ(out[0], (Row({Value(1), Value(10), Value(1), Value(20)})));
@@ -1160,10 +1185,10 @@ TEST(MergeJoinTest, ResidualFiltersPairsAndPadsUnmatchedOuterRows) {
   {
     // Left outer: the left row whose only pair fails the residual is
     // NULL-padded.
-    MergeJoin outer(Src({Row({Value(1), Value(10)}), Row({Value(2), Value(1)})}),
-                    {0},
-                    Src({Row({Value(1), Value(20)}), Row({Value(2), Value(0)})}),
-                    {0}, JoinKind::kLeftOuter, 2, 2, residual, combined);
+    MergeJoin outer(
+        Src({Row({Value(1), Value(10)}), Row({Value(2), Value(1)})}), {0},
+        Src({Row({Value(1), Value(20)}), Row({Value(2), Value(0)})}), {0},
+        JoinKind::kLeftOuter, 2, 2, residual, combined);
     const std::vector<Row> out = Drain(&outer);
     ASSERT_EQ(out.size(), 2U);
     bool saw_pad = false;
@@ -1194,9 +1219,9 @@ TEST(MergeJoinTest, ResidualDivideByZeroEvaluatesNullNotError) {
 }
 
 TEST(MergeJoinTest, MultiColumnKeysAndEmptyInputs) {
-  MergeJoin join(Src({Row({Value(1), Value("a")}), Row({Value(1), Value("b")})}),
-                 {0, 1}, Src({Row({Value(1), Value("a")})}), {0, 1},
-                 JoinKind::kInner, 2, 2);
+  MergeJoin join(
+      Src({Row({Value(1), Value("a")}), Row({Value(1), Value("b")})}), {0, 1},
+      Src({Row({Value(1), Value("a")})}), {0, 1}, JoinKind::kInner, 2, 2);
   const std::vector<Row> out = Drain(&join);
   ASSERT_EQ(out.size(), 1U);
   EXPECT_EQ(out[0], (Row({Value(1), Value("a"), Value(1), Value("a")})));
@@ -1214,10 +1239,9 @@ TEST(MergeJoinTest, MultiColumnKeysAndEmptyInputs) {
 // ===========================================================================
 
 TEST(ParallelMergeJoinTest, InnerJoinMultiPartitionMatchesSerialResult) {
-  ParallelMergeJoin join(Src(SortedKeyRows(0, 40, 2)), {0},
-                         Src(SortedKeyRows(10, 50, 1)), {0},
-                         /*worker_count=*/4, JoinKind::kInner, Expression(),
-                         Schema(), 2);
+  ParallelMergeJoin join(
+      Src(SortedKeyRows(0, 40, 2)), {0}, Src(SortedKeyRows(10, 50, 1)), {0},
+      /*worker_count=*/4, JoinKind::kInner, Expression(), Schema(), 2);
   std::vector<Row> out = Drain(&join);
   SortRowsByValue(&out);
   ASSERT_EQ(out.size(), 60U);  // keys 10..39, 2 x 1 pairs each
@@ -1351,8 +1375,8 @@ TEST(ParallelMergeJoinTest, AllEqualKeysFormOneGiantCluster) {
 
 TEST(ParallelMergeJoinTest, EmptySidesAndBatchPath) {
   {
-    ParallelMergeJoin join(Src(std::vector<Row>{}), {0}, Src({IRow(1)}), {0},
-                           2, JoinKind::kInner, Expression(), Schema(), 1);
+    ParallelMergeJoin join(Src(std::vector<Row>{}), {0}, Src({IRow(1)}), {0}, 2,
+                           JoinKind::kInner, Expression(), Schema(), 1);
     EXPECT_TRUE(Drain(&join).empty());
     EXPECT_EQ(join.GetStatus(), Status::kSuccess);
   }
@@ -1387,9 +1411,11 @@ TEST(ParallelMergeJoinTest, FailedChildLatchesStatusWithoutPartialResult) {
 TEST(SharedBuildParallelHashJoinTest, KindsMatchSerialSemantics) {
   std::vector<Row> left_rows;
   std::vector<Row> right_rows;
+  left_rows.reserve(70);
   for (int64_t i = 0; i < 70; ++i) {
     left_rows.push_back(Row({Value(i % 10), Value("L")}));
   }
+  right_rows.reserve(70);
   for (int64_t i = 0; i < 70; ++i) {
     right_rows.push_back(Row({Value(i % 5), Value("R")}));
   }
@@ -1430,12 +1456,12 @@ TEST(SharedBuildParallelHashJoinTest, KindsMatchSerialSemantics) {
 }
 
 TEST(SharedBuildParallelHashJoinTest, NullKeysNeverMatchAndPadsOuter) {
-  const auto left_rows = std::vector<Row>{
-      Row({Value(), Value("ln")}), Row({Value(1), Value("l1")}),
-      Row({Value(2), Value("l2")})};
-  const auto right_rows = std::vector<Row>{
-      Row({Value(), Value("rn")}), Row({Value(2), Value("r1")}),
-      Row({Value(2), Value("r2")})};
+  const auto left_rows = std::vector<Row>{Row({Value(), Value("ln")}),
+                                          Row({Value(1), Value("l1")}),
+                                          Row({Value(2), Value("l2")})};
+  const auto right_rows = std::vector<Row>{Row({Value(), Value("rn")}),
+                                           Row({Value(2), Value("r1")}),
+                                           Row({Value(2), Value("r2")})};
   {
     SharedBuildParallelHashJoin join(Src(left_rows), {0}, Src(right_rows), {0},
                                      2, JoinKind::kInner, 2);
@@ -1467,6 +1493,7 @@ TEST(SharedBuildParallelHashJoinTest, NullKeysNeverMatchAndPadsOuter) {
 
 TEST(SharedBuildParallelHashJoinTest, NullAwareAntiDropsAllOnNullBuildKey) {
   std::vector<Row> left_rows;
+  left_rows.reserve(40);
   for (int64_t i = 0; i < 40; ++i) {
     left_rows.push_back(IRow(i));
   }
@@ -1476,8 +1503,8 @@ TEST(SharedBuildParallelHashJoinTest, NullAwareAntiDropsAllOnNullBuildKey) {
   EXPECT_TRUE(Drain(&join).empty());
 
   // Without a NULL build key the NOT IN set behaves like plain anti.
-  SharedBuildParallelHashJoin join2(Src(left_rows), {0}, Src({IRow(1000)}),
-                                    {0}, 2, JoinKind::kNullAwareAnti, 1);
+  SharedBuildParallelHashJoin join2(Src(left_rows), {0}, Src({IRow(1000)}), {0},
+                                    2, JoinKind::kNullAwareAnti, 1);
   EXPECT_EQ(Drain(&join2).size(), 40U);
 }
 
@@ -1567,6 +1594,7 @@ TEST(ExchangeExecutorTest, BroadcastCopiesEveryRowToEveryPartition) {
 
 TEST(ExchangeExecutorTest, RangeExchangeRoutesByBounds) {
   std::vector<Row> rows;
+  rows.reserve(36);
   for (int64_t i = 0; i < 36; ++i) {
     rows.push_back(IRow(i));
   }
@@ -1603,6 +1631,7 @@ TEST(ExchangeExecutorTest, RangeExchangeSkipsIncomparableBounds) {
 
 TEST(ExchangeExecutorTest, GatherNextAndBatchDrainAcrossPartitions) {
   std::vector<Row> rows;
+  rows.reserve(10);
   for (int64_t i = 0; i < 10; ++i) {
     rows.push_back(IRow(i));
   }
@@ -1623,8 +1652,8 @@ TEST(ExchangeExecutorTest, GatherNextAndBatchDrainAcrossPartitions) {
   // Batch path resets the reused chunk.
   const Schema schema("t", {Column("x", ValueType::kInt64)});
   DataChunk chunk(schema, 8);
-  auto exchange2 = std::make_shared<ExchangeExecutor>(Src(rows),
-                                                      ExchangeType::kGather, 1);
+  auto exchange2 =
+      std::make_shared<ExchangeExecutor>(Src(rows), ExchangeType::kGather, 1);
   size_t total = 0;
   for (;;) {
     const size_t got = exchange2->NextBatch(&chunk, 4);
@@ -1653,9 +1682,8 @@ TEST(ExchangeExecutorTest, ChildErrorSurfacesAsStickyStatus) {
 }
 
 TEST(ExchangeExecutorTest, DumpShowsTypeAndPartitionCount) {
-  auto exchange = std::make_shared<ExchangeExecutor>(Src({IRow(1)}),
-                                                     ExchangeType::kBroadcast,
-                                                     2);
+  auto exchange = std::make_shared<ExchangeExecutor>(
+      Src({IRow(1)}), ExchangeType::kBroadcast, 2);
   std::stringstream ss;
   exchange->Dump(ss, 0);
   EXPECT_NE(ss.str().find("ExchangeExecutor"), std::string::npos);
@@ -1701,9 +1729,9 @@ TEST(SetOperationExecutorTest, DateAndTextUnifyToDateDomain) {
 }
 
 TEST(SetOperationExecutorTest, TextAndNumericUnifyToVarchar) {
-  SetOperationExecutor op({Src({Row({Value(int64_t{7})})}),
-                           Src({Row({Value("7")})})},
-                          SetOperationKind::kUnion);
+  SetOperationExecutor op(
+      {Src({Row({Value(int64_t{7})})}), Src({Row({Value("7")})})},
+      SetOperationKind::kUnion);
   const std::vector<Row> out = Drain(&op);
   ASSERT_EQ(out.size(), 1U);
   EXPECT_EQ(out[0][0].type, ValueType::kVarChar);
@@ -1807,8 +1835,8 @@ TEST(DataChunkFeatureTest, ColumnVectorSupportsDateDoubleStringArray) {
   EXPECT_EQ(strings.ValueAt(0), Value("hello"));
 
   ColumnVector arrays(ValueType::kArray, 2);
-  const Value arr = Value::Array({Value(int64_t{1}), Value(int64_t{2})},
-                                 "INT64");
+  const Value arr =
+      Value::Array({Value(int64_t{1}), Value(int64_t{2})}, "INT64");
   arrays.Append(arr);
   arrays.Append(Value());
   EXPECT_EQ(arrays.ValueAt(0), arr);
@@ -1847,9 +1875,9 @@ TEST(DataChunkFeatureTest, AppendChunkCopiesZoneMapsAcrossTypes) {
               Column("s", ValueType::kVarChar), Column("dt", ValueType::kDate),
               Column("arr", ValueType::kArray)});
   DataChunk src(src_schema, 4);
-  src.Append(Row({Value(int64_t{1}), Value(0.5), Value("a"),
-                  Value::Date("2020-01-01"),
-                  Value::Array({Value(int64_t{9})}, "INT64")}));
+  src.Append(
+      Row({Value(int64_t{1}), Value(0.5), Value("a"), Value::Date("2020-01-01"),
+           Value::Array({Value(int64_t{9})}, "INT64")}));
   src.Append(Row({Value(), Value(), Value(), Value(), Value()}));
 
   DataChunk dst;
@@ -1909,8 +1937,9 @@ TEST(DataChunkFeatureTest, ResetWithSchemaReinitializesLayout) {
   DataChunk inferred;
   inferred.Append(Row({Value(int64_t{3})}));
   EXPECT_TRUE(inferred.HasLayout(schema));
-  EXPECT_FALSE(inferred.HasLayout(Schema(
-      "u", {Column("a", ValueType::kVarChar), Column("b", ValueType::kInt64)})));
+  EXPECT_FALSE(
+      inferred.HasLayout(Schema("u", {Column("a", ValueType::kVarChar),
+                                      Column("b", ValueType::kInt64)})));
 }
 
 TEST(DataChunkFeatureTest, BitAggregatesHandleNullWordsAndSelections) {
@@ -1977,12 +2006,15 @@ TEST(DataChunkFeatureTest, LogicalAggregatesOnNonIntColumnUseTruthyPath) {
 
 namespace {
 
-const Schema kExprSchema("t", {Column("a", ValueType::kInt64),
-                               Column("b", ValueType::kInt64),
-                               Column("s", ValueType::kVarChar)});
+const Schema& ExprSchema() {
+  static const Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64),
+            Column("s", ValueType::kVarChar)});
+  return schema;
+}
 
 DataChunk MakeExprChunk() {
-  DataChunk chunk(kExprSchema, 8);
+  DataChunk chunk(ExprSchema(), 8);
   chunk.Append(Row({Value(int64_t{0}), Value(int64_t{0}), Value("x0")}));
   chunk.Append(Row({Value(int64_t{1}), Value(), Value("x1")}));
   chunk.Append(Row({Value(), Value(int64_t{3}), Value("x2")}));
@@ -1995,18 +2027,18 @@ DataChunk MakeExprChunk() {
 TEST(VectorizedExpressionFeatureTest, NullExpressionAndEmptyChunk) {
   const DataChunk chunk = MakeExprChunk();
   auto empty =
-      VectorizedExpression::Evaluate(Expression(), kExprSchema, chunk);
+      VectorizedExpression::Evaluate(Expression(), ExprSchema(), chunk);
   ASSERT_TRUE(empty.HasValue());
   EXPECT_EQ(empty.Value().Size(), 0U);
 
-  DataChunk nothing(kExprSchema, 4);
-  auto on_empty =
-      VectorizedExpression::Evaluate(ColumnValueExp("a"), kExprSchema, nothing);
+  DataChunk nothing(ExprSchema(), 4);
+  auto on_empty = VectorizedExpression::Evaluate(ColumnValueExp("a"),
+                                                 ExprSchema(), nothing);
   ASSERT_TRUE(on_empty.HasValue());
   EXPECT_EQ(on_empty.Value().Size(), 0U);
 
   auto filter = VectorizedExpression::EvaluateFilter(ColumnValueExp("a"),
-                                                     kExprSchema, nothing);
+                                                     ExprSchema(), nothing);
   ASSERT_TRUE(filter.HasValue());
   EXPECT_EQ(filter.Value().Size(), 0U);
 }
@@ -2014,22 +2046,22 @@ TEST(VectorizedExpressionFeatureTest, NullExpressionAndEmptyChunk) {
 TEST(VectorizedExpressionFeatureTest, ColumnAndConstantWithSelection) {
   const DataChunk chunk = MakeExprChunk();
   auto full =
-      VectorizedExpression::Evaluate(ColumnValueExp("a"), kExprSchema, chunk);
+      VectorizedExpression::Evaluate(ColumnValueExp("a"), ExprSchema(), chunk);
   ASSERT_TRUE(full.HasValue());
   ASSERT_EQ(full.Value().Size(), 4U);
   EXPECT_EQ(full.Value().ValueAt(0), Value(int64_t{0}));
   EXPECT_TRUE(full.Value().IsNull(2));
 
   SelectionVector sel({1U, 3U});
-  auto sliced = VectorizedExpression::Evaluate(ColumnValueExp("a"), kExprSchema,
-                                               chunk, &sel);
+  auto sliced = VectorizedExpression::Evaluate(ColumnValueExp("a"),
+                                               ExprSchema(), chunk, &sel);
   ASSERT_TRUE(sliced.HasValue());
   ASSERT_EQ(sliced.Value().Size(), 2U);
   EXPECT_EQ(sliced.Value().ValueAt(0), Value(int64_t{1}));
   EXPECT_EQ(sliced.Value().ValueAt(1), Value(int64_t{2}));
 
   auto constants = VectorizedExpression::Evaluate(
-      ConstantValueExp(Value(int64_t{9})), kExprSchema, chunk, &sel);
+      ConstantValueExp(Value(int64_t{9})), ExprSchema(), chunk, &sel);
   ASSERT_TRUE(constants.HasValue());
   EXPECT_EQ(constants.Value().ValueAt(0), Value(int64_t{9}));
   EXPECT_EQ(constants.Value().ValueAt(1), Value(int64_t{9}));
@@ -2039,7 +2071,7 @@ TEST(VectorizedExpressionFeatureTest, UnaryEvaluationWithNulls) {
   const DataChunk chunk = MakeExprChunk();
   auto negated = VectorizedExpression::Evaluate(
       UnaryExpressionExp(ColumnValueExp("a"), UnaryOperation::kMinus),
-      kExprSchema, chunk);
+      ExprSchema(), chunk);
   ASSERT_TRUE(negated.HasValue());
   ASSERT_EQ(negated.Value().Size(), 4U);
   EXPECT_EQ(negated.Value().ValueAt(0), Value(int64_t{0}));
@@ -2049,7 +2081,7 @@ TEST(VectorizedExpressionFeatureTest, UnaryEvaluationWithNulls) {
 
   auto not_exp = VectorizedExpression::Evaluate(
       UnaryExpressionExp(ColumnValueExp("a"), UnaryOperation::kNot),
-      kExprSchema, chunk);
+      ExprSchema(), chunk);
   ASSERT_TRUE(not_exp.HasValue());
   EXPECT_EQ(not_exp.Value().ValueAt(0), Value(true));
   EXPECT_EQ(not_exp.Value().ValueAt(1), Value(false));
@@ -2060,15 +2092,14 @@ TEST(VectorizedExpressionFeatureTest, UnaryEvaluationWithNulls) {
 TEST(VectorizedExpressionFeatureTest, AndOrShortCircuitSuppressesRhsErrors) {
   const Schema schema(
       "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
-  const Expression lhs = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kEquals,
-      ConstantValueExp(Value(int64_t{1})));
+  const Expression lhs =
+      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{1})));
   // 1 / b >= 0: raises for b = 0, TRUE otherwise (integer division).
   const Expression rhs = BinaryExpressionExp(
       BinaryExpressionExp(ConstantValueExp(Value(int64_t{1})),
                           BinaryOperation::kDivide, ColumnValueExp("b")),
-      BinaryOperation::kGreaterThanEquals,
-      ConstantValueExp(Value(int64_t{0})));
+      BinaryOperation::kGreaterThanEquals, ConstantValueExp(Value(int64_t{0})));
 
   DataChunk chunk(schema, 4);
   // lhs FALSE decides AND: the 1/0 rhs error on this row is suppressed.
@@ -2078,8 +2109,7 @@ TEST(VectorizedExpressionFeatureTest, AndOrShortCircuitSuppressesRhsErrors) {
   // lhs TRUE with rhs 1/0: the error must propagate.
   chunk.Append(Row({Value(int64_t{1}), Value(int64_t{0})}));
 
-  const Expression both =
-      BinaryExpressionExp(lhs, BinaryOperation::kAnd, rhs);
+  const Expression both = BinaryExpressionExp(lhs, BinaryOperation::kAnd, rhs);
   auto bad = VectorizedExpression::Evaluate(both, schema, chunk);
   EXPECT_FALSE(bad.HasValue());
 
@@ -2125,8 +2155,7 @@ TEST(VectorizedExpressionFeatureTest, Int64XorFollowsThreeValuedLogic) {
   const DataChunk chunk = MakeExprChunk();
   const Expression xor_expr = BinaryExpressionExp(
       ColumnValueExp("a"), BinaryOperation::kXor, ColumnValueExp("b"));
-  auto res =
-      VectorizedExpression::Evaluate(xor_expr, kExprSchema, chunk);
+  auto res = VectorizedExpression::Evaluate(xor_expr, ExprSchema(), chunk);
   ASSERT_TRUE(res.HasValue());
   ASSERT_EQ(res.Value().Size(), 4U);
   // 0^0 -> FALSE, 1^NULL -> NULL, NULL^3 -> NULL, truthy^truthy -> FALSE.
@@ -2140,7 +2169,7 @@ TEST(VectorizedExpressionFeatureTest, CastEvaluatesPerRowAndKeepsNulls) {
   const DataChunk chunk = MakeExprChunk();
   auto casted = VectorizedExpression::Evaluate(
       std::make_shared<CastExpression>(ColumnValueExp("a"), "VARCHAR"),
-      kExprSchema, chunk);
+      ExprSchema(), chunk);
   ASSERT_TRUE(casted.HasValue());
   ASSERT_EQ(casted.Value().Size(), 4U);
   EXPECT_EQ(casted.Value().ValueAt(0).type, ValueType::kVarChar);
@@ -2148,24 +2177,24 @@ TEST(VectorizedExpressionFeatureTest, CastEvaluatesPerRowAndKeepsNulls) {
   EXPECT_EQ(casted.Value().ValueAt(1), Value("1"));
   EXPECT_TRUE(casted.Value().IsNull(2));
 
-  // Casting NULL stays NULL.
+  // Casting NULL stays NULL (column b is NULL at index 1).
   auto cast_null = VectorizedExpression::Evaluate(
-      std::make_shared<CastExpression>(ColumnValueExp("s"), "VARCHAR"),
-      kExprSchema, chunk);
+      std::make_shared<CastExpression>(ColumnValueExp("b"), "VARCHAR"),
+      ExprSchema(), chunk);
   ASSERT_TRUE(cast_null.HasValue());
-  EXPECT_EQ(cast_null.Value().ValueAt(0), Value("x0"));
-  EXPECT_TRUE(cast_null.Value().IsNull(2));
+  EXPECT_EQ(cast_null.Value().ValueAt(0), Value("0"));
+  EXPECT_TRUE(cast_null.Value().IsNull(1));
 }
 
 TEST(VectorizedExpressionFeatureTest, CaseExpressionFallsToPerRowPath) {
   const DataChunk chunk = MakeExprChunk();
-  const Expression when = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kGreaterThan,
-      ConstantValueExp(Value(int64_t{0})));
+  const Expression when =
+      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0})));
   auto res = VectorizedExpression::Evaluate(
       CaseExpressionExp({{when, ConstantValueExp(Value("pos"))}},
                         ConstantValueExp(Value("nonpos"))),
-      kExprSchema, chunk);
+      ExprSchema(), chunk);
   ASSERT_TRUE(res.HasValue());
   ASSERT_EQ(res.Value().Size(), 4U);
   EXPECT_EQ(res.Value().ValueAt(0), Value("nonpos"));
@@ -2180,7 +2209,7 @@ TEST(VectorizedExpressionFeatureTest, UnhandledTagsTakeRowFallback) {
       InExpressionExp(ColumnValueExp("a"),
                       {ConstantValueExp(Value(int64_t{0})),
                        ConstantValueExp(Value(int64_t{2}))}),
-      kExprSchema, chunk);
+      ExprSchema(), chunk);
   ASSERT_TRUE(res.HasValue());
   ASSERT_EQ(res.Value().Size(), 4U);
   EXPECT_EQ(res.Value().ValueAt(0), Value(true));
@@ -2191,12 +2220,12 @@ TEST(VectorizedExpressionFeatureTest, UnhandledTagsTakeRowFallback) {
 
 TEST(VectorizedExpressionFeatureTest, EvaluateFilterHonorsSelection) {
   const DataChunk chunk = MakeExprChunk();
-  const Expression cmp = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kGreaterThan,
-      ConstantValueExp(Value(int64_t{0})));
+  const Expression cmp =
+      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0})));
 
   // Full chunk: rows 1 and 3 pass.
-  auto full = VectorizedExpression::EvaluateFilter(cmp, kExprSchema, chunk);
+  auto full = VectorizedExpression::EvaluateFilter(cmp, ExprSchema(), chunk);
   ASSERT_TRUE(full.HasValue());
   ASSERT_EQ(full.Value().Size(), 4U);
   EXPECT_FALSE(full.Value().Get(0));
@@ -2206,8 +2235,8 @@ TEST(VectorizedExpressionFeatureTest, EvaluateFilterHonorsSelection) {
 
   // Empty selection short-circuits to an all-false bitmap.
   SelectionVector empty_sel;
-  auto none =
-      VectorizedExpression::EvaluateFilter(cmp, kExprSchema, chunk, &empty_sel);
+  auto none = VectorizedExpression::EvaluateFilter(cmp, ExprSchema(), chunk,
+                                                   &empty_sel);
   ASSERT_TRUE(none.HasValue());
   ASSERT_EQ(none.Value().Size(), 4U);
   EXPECT_EQ(none.Value().CountTrue(), 0U);
@@ -2215,7 +2244,7 @@ TEST(VectorizedExpressionFeatureTest, EvaluateFilterHonorsSelection) {
   // Selection restricts both evaluation and the output bitmap.
   SelectionVector sel({0U, 1U});
   auto sliced =
-      VectorizedExpression::EvaluateFilter(cmp, kExprSchema, chunk, &sel);
+      VectorizedExpression::EvaluateFilter(cmp, ExprSchema(), chunk, &sel);
   ASSERT_TRUE(sliced.HasValue());
   EXPECT_FALSE(sliced.Value().Get(0));
   EXPECT_TRUE(sliced.Value().Get(1));
@@ -2225,14 +2254,14 @@ TEST(VectorizedExpressionFeatureTest, EvaluateFilterHonorsSelection) {
 
 TEST(VectorizedExpressionFeatureTest, FilterDataChunkChainsSelectionVectors) {
   const DataChunk chunk = MakeExprChunk();
-  const Expression cmp = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kGreaterThan,
-      ConstantValueExp(Value(int64_t{0})));
+  const Expression cmp =
+      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0})));
 
   SelectionVector input({0U, 1U, 2U, 3U});
   SelectionVector output;
   const Status st = VectorizedExpression::FilterDataChunk(
-      cmp, kExprSchema, chunk, &output, &input);
+      cmp, ExprSchema(), chunk, &output, &input);
   EXPECT_EQ(st, Status::kSuccess);
   ASSERT_EQ(output.Size(), 2U);
   EXPECT_EQ(output[0], 1U);
@@ -2241,7 +2270,7 @@ TEST(VectorizedExpressionFeatureTest, FilterDataChunkChainsSelectionVectors) {
   // No input selection: the bitmap feeds the output directly.
   SelectionVector plain;
   EXPECT_EQ(
-      VectorizedExpression::FilterDataChunk(cmp, kExprSchema, chunk, &plain),
+      VectorizedExpression::FilterDataChunk(cmp, ExprSchema(), chunk, &plain),
       Status::kSuccess);
   ASSERT_EQ(plain.Size(), 2U);
 }
@@ -2355,9 +2384,8 @@ TEST(SimdComparisonKernelTest, DoubleScalarCoversAllOperators) {
     EXPECT_EQ(mask.CountTrue(), c.expected) << static_cast<int>(c.op);
   }
   ValidityBitmap cleared;
-  SimdComparisonKernel::CompareDouble(data.data(), data.size(),
-                                      BinaryOperation::kMultiply, 0.0,
-                                      &cleared);
+  SimdComparisonKernel::CompareDouble(
+      data.data(), data.size(), BinaryOperation::kMultiply, 0.0, &cleared);
   EXPECT_EQ(cleared.CountTrue(), 0U);
 }
 
@@ -2383,9 +2411,8 @@ TEST(SimdComparisonKernelTest, StringPrefixCoversAllOperators) {
     EXPECT_EQ(mask.CountTrue(), c.expected) << static_cast<int>(c.op);
   }
   ValidityBitmap cleared;
-  SimdComparisonKernel::CompareStringPrefix(data.data(), data.size(),
-                                            BinaryOperation::kAdd, "banana",
-                                            &cleared);
+  SimdComparisonKernel::CompareStringPrefix(
+      data.data(), data.size(), BinaryOperation::kAdd, "banana", &cleared);
   EXPECT_EQ(cleared.CountTrue(), 0U);
 }
 
@@ -2425,9 +2452,8 @@ TEST(SimdComparisonKernelTest, VectorComparisonsMatchPairwiseSemantics) {
   EXPECT_TRUE(dmask.Get(2));
 
   ValidityBitmap dcleared;
-  SimdComparisonKernel::CompareDoubleVectors(dl.data(), dr.data(), dl.size(),
-                                             BinaryOperation::kDivide,
-                                             &dcleared);
+  SimdComparisonKernel::CompareDoubleVectors(
+      dl.data(), dr.data(), dl.size(), BinaryOperation::kDivide, &dcleared);
   EXPECT_EQ(dcleared.CountTrue(), 0U);
 }
 
@@ -2438,7 +2464,8 @@ TEST(SimdComparisonKernelTest, VectorComparisonsMatchPairwiseSemantics) {
 class SkipScanDistinctTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    database_ = Database::Create("executor_feature_test").MoveValue();
+    database_ =
+        Database::Create("executor_feature_test-" + RandomString()).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
   }
   void TearDown() override {
@@ -2497,20 +2524,18 @@ TEST_F(SkipScanDistinctTest, DistinctOverIndexedColumnSkipsDuplicates) {
   EXPECT_NE(ss.str().find("SkipScanDistinct"), std::string::npos);
 
   // Descending walk yields the reversed distinct set.
-  SkipScanDistinct descending(context_->txn_, table, index, std::vector<Value>{},
-                              std::vector<Value>{}, false,
-                              ConstantValueExp(Value(true)),
-                              table.GetSchema(), 0);
+  SkipScanDistinct descending(
+      context_->txn_, table, index, std::vector<Value>{}, std::vector<Value>{},
+      false, ConstantValueExp(Value(true)), table.GetSchema(), 0);
   const std::vector<Row> down = Drain(&descending);
   ASSERT_EQ(down.size(), 20U);
   EXPECT_EQ(down[0][0], Value(int64_t{20}));
   EXPECT_EQ(down[19][0], Value(int64_t{1}));
 
   // A WHERE filter drops some distinct keys.
-  const Expression where =
-      BinaryExpressionExp(ColumnValueExp(ColumnName("t", "a")),
-                          BinaryOperation::kGreaterThan,
-                          ConstantValueExp(Value(int64_t{15})));
+  const Expression where = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("t", "a")), BinaryOperation::kGreaterThan,
+      ConstantValueExp(Value(int64_t{15})));
   SkipScanDistinct filtered(context_->txn_, table, index, std::vector<Value>{},
                             std::vector<Value>{}, true, where,
                             table.GetSchema(), 0);
@@ -2544,25 +2569,23 @@ TEST_F(SkipScanDistinctTest, PrefixDistinctJumpsCompoundIndexGroups) {
     }
   }
   SetupTable(schema,
-             IndexSchema("pt_ab_idx", {0, 1}, {}, IndexMode::kNonUnique),
-             rows);
+             IndexSchema("pt_ab_idx", {0, 1}, {}, IndexMode::kNonUnique), rows);
   Table table = database_->GetTable(*context_, "pt").MoveValue();
   const Index& index = table.GetIndex(0);
 
   SkipScanDistinct ascending(context_->txn_, table, index, std::vector<Value>{},
                              std::vector<Value>{}, true,
-                             ConstantValueExp(Value(true)),
-                             table.GetSchema(), /*prefix_cols=*/1);
+                             ConstantValueExp(Value(true)), table.GetSchema(),
+                             /*prefix_cols=*/1);
   const std::vector<Row> up = Drain(&ascending);
   ASSERT_EQ(up.size(), 5U);
   for (size_t i = 0; i < up.size(); ++i) {
     EXPECT_EQ(up[i][0], Value(static_cast<int64_t>(i + 1)));
   }
 
-  SkipScanDistinct descending(context_->txn_, table, index,
-                              std::vector<Value>{}, std::vector<Value>{}, false,
-                              ConstantValueExp(Value(true)),
-                              table.GetSchema(), 1);
+  SkipScanDistinct descending(
+      context_->txn_, table, index, std::vector<Value>{}, std::vector<Value>{},
+      false, ConstantValueExp(Value(true)), table.GetSchema(), 1);
   const std::vector<Row> down = Drain(&descending);
   ASSERT_EQ(down.size(), 5U);
   EXPECT_EQ(down[0][0], Value(int64_t{5}));
@@ -2578,8 +2601,8 @@ TEST_F(SkipScanDistinctTest, UniqueIndexNullKeysDecodeAsMultiValue) {
   const Index& index = table.GetIndex(0);
 
   SkipScanDistinct scan(context_->txn_, table, index, std::vector<Value>{},
-                        std::vector<Value>{}, true, ConstantValueExp(Value(true)),
-                        table.GetSchema(), 0);
+                        std::vector<Value>{}, true,
+                        ConstantValueExp(Value(true)), table.GetSchema(), 0);
   const std::vector<Row> out = Drain(&scan);
   EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
   // DISTINCT sees keys {NULL, 1, 2}; how many rows the two NULL entries

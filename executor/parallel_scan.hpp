@@ -52,6 +52,7 @@ class ParallelScan final : public ExecutorBase {
 
   Transaction* txn_;
   const Table* table_;
+  TableLease table_lease_;
   std::optional<std::vector<slot_t>> projection_;
   std::vector<IntegerPeekCompare> peek_compares_;
   std::vector<Table::ScanMorsel> morsels_;
@@ -68,6 +69,7 @@ class ParallelScan final : public ExecutorBase {
   bool started_{false};
   std::atomic<bool> cancelled_{false};
   std::exception_ptr worker_error_;
+  Status worker_status_{Status::kSuccess};
 
   std::optional<DataChunk> pending_;
   size_t pending_offset_{0};

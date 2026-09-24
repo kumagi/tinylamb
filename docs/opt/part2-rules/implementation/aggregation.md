@@ -6,7 +6,7 @@
 
 ## 概要
 
-論理式 `kAggregation`（集約演算）を、3 種類の物理実行プラン候補 — `HashAggregatePlan`、`SortAggregatePlan`、`StreamAggregatePlan` — の代替候補（`PlanAlternative`）へと具現化する Rule です。
+論理式 `kAggregation`（集約演算）を、3 種類の物理実行プラン候補 — `HashAggregatePlan`、`SortAggregatePlan`、`StreamAggregatePlan` — の代替候補（`PlanAlternative`）へと変換する Rule です。
 
 単一の論理集約ノードに対して 3 つの物理代替プランを一括生成してメモ構造に登録し、コスト比較エンジン（`plan/cascades.cpp` の `SearchEngine::OptimizeGroup`）によるコスト最小化選択に委ねます。
 

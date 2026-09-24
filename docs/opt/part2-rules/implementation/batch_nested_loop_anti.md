@@ -5,7 +5,7 @@
 
 ## 概要
 
-論理式 `kAntiJoin` のうち等値キー対を持たない非等値反結合を、probe 側スキーマに射影する `ProductPlan`（`AntiJoinKind` およびブロック化実行標識 `PreferBatchNestedLoop()` を保持）として具現化する Rule です。
+論理式 `kAntiJoin` のうち等値キー対を持たない非等値反結合を、probe 側スキーマに射影する `ProductPlan`（`AntiJoinKind` およびブロック化実行標識 `PreferBatchNestedLoop()` を保持）として変換する Rule です。
 
 非等値反結合はハッシュ結合やマージ結合で代替できず、タプル単位の入れ子ループ結合実装も存在しないため、本 Rule が唯一のコストベース実行代替を提供します。単一キー等値の `NOT IN` 由来の null-aware anti 結合はゲート条件で確実に排除され、三値論理の不整合を未然に防ぎます。
 
@@ -76,7 +76,7 @@ SQL の `x NOT IN (SELECT y FROM ...)` は、右辺に 1 つでも NULL が存�
 // reach, so the rule only fires where hash/merge offer nothing:
 ```
 
-エグゼキュータ側の具現化処理（`executor/relational_factory.cpp`）でも、この前提がアサーションによって二重に防御されています。
+エグゼキュータ側の生成処理（`executor/relational_factory.cpp`）でも、この前提がアサーションによって二重に防御されています。
 
 ```cpp
 if (residual_note_ && (IsSemiJoinKind(kind_) || IsAntiJoinKind(kind_))) {
@@ -85,7 +85,7 @@ if (residual_note_ && (IsSemiJoinKind(kind_) || IsAntiJoinKind(kind_))) {
 }
 ```
 
-また、上位に `SelectionPlan` を配置しない理由は、反結合の射影契約にあります。`BatchNestedLoopJoin` エグゼキュータは行の照合と同時に「未マッチの左行のみを出力し、スキーマを probe 側に縮退させる」処理を行います。もしこの上に述語 $p$ を持つ `SelectionPlan` を重ねると、未マッチ行（述語 $p$ を満たすペアが存在しなかった行）が選択条件によってすべて除去されてしまい、意味論が破壊されます。
+上位に `SelectionPlan` を置かない理由は、反結合の出力スキーマにあります。`BatchNestedLoopJoin` は行を照合し、未マッチの左行だけを probe 側のスキーマで出力します。この上に述語 $p$ を持つ `SelectionPlan` を重ねると、未マッチ行がすべて除外され、反結合の結果と一致しません。
 
 定数述語に関しては、`ON FALSE` または `ON NULL` の場合は全 probe 行が出力対象となるか論理簡約で解決されるため、入れ子ループ探索からは除外されます。
 
@@ -113,7 +113,7 @@ return {PlanAlternative{.plan = std::move(join),
 
 `wrap_selection` が `false` であるため、推定行数は `join->EmitRowCount()`（probe 側の行数）がそのまま採用されます。
 
-物理エグゼキュータ具現化時、`ProductPlan` は `BatchNestedLoopJoin` を生成します。エグゼキュータは probe 側のバッチブロックをメモリに保持し、build 側の全タプルと総当たり比較を行い、一度も一致しなかった probe 行のみを後続へ放出します。
+物理エグゼキュータ生成時、`ProductPlan` は `BatchNestedLoopJoin` を生成します。エグゼキュータは probe 側のバッチブロックをメモリに保持し、build 側の全タプルと総当たり比較を行い、一度も一致しなかった probe 行のみを後続へ放出します。
 
 ## 最適化効果
 

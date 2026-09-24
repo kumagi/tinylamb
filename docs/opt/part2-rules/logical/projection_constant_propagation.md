@@ -100,7 +100,7 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `merge_projections` / `merge_adjacent_projections`: 同一の `Projection(Projection(X))` 構造を対象としますが、これらが射影の階層そのものを潰して 1 段に統合するのに対し、本ルールは子構造を維持したまま定数参照の伝搬のみを行います。Memo 内では異なる構造の等価表現として共存します。
+- `merge_projections` / `merge_adjacent_projections`: 同じ `Projection(Projection(X))` 構造を対象とします。これらの Rule が 2 段の射影を 1 段に統合するのに対し、本 Rule は子構造を維持したまま定数参照だけを伝搬します。Memo 内では、構造の異なる等価表現として共存します。
 - 式書き換えレイヤー（`expression/rewrite.cpp`）の定数畳み込み: 本ルールが展開した定数式（例: `1 = 1`）を評価し、`TRUE` や簡約値へと定数畳み込みを実行します。
 - `eliminate_true_selection` / `eliminate_false_selection`: 定数伝搬と畳み込みの結果生じた恒真・恒偽述語を検出し、不要なオペレータを除去します。
 
@@ -108,4 +108,3 @@ graph TD
 
 - `plan/cascades_test.cpp` の `ProjectionConstantPropagation`:
   - 2 段の射影において、内側の定数出力を参照する外側の式が定数リテラルに正しく置換されることを検証。
-

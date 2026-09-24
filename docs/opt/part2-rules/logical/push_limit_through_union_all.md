@@ -106,7 +106,7 @@ ALL のグループ(`union_all_limited`)が、自分自身・入力・枝その�
   再生成されます。なお判定は `cexpr.limit_count <= total_limit` の比較だけ
   で、`limit_count == 0`(上限なしの意味)の枝 Limit や枝 Limit のオフセット
   は考慮しません。現在の実装仕様です。
-- DISTINCT のある UNION には適用しません。重複排除は枝をまたいで効くため、
+- DISTINCT のある UNION には適用しません。重複排除は複数の枝をまとめて行うため、
   枝を切ると生存行が変わります。相手を `kUnionAll` に限定しているのはこの
   ためです。
 - なお `total_limit` の加算にオーバーフロー対策はありません(兄弟 Rule の

@@ -23,7 +23,7 @@ TEST(JitTest, JitInt64Kernels_WhenCompiled_MatchScalarResults) {
   auto projection = JitInt64Kernels::CompileProjection();
   auto sum = JitInt64Kernels::CompileSum();
   if (!filter.has_value() || !projection.has_value() || !sum.has_value()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   std::vector<uint8_t> selected(input.size());
@@ -88,7 +88,7 @@ TEST(JitTest, JitKernel_MoveAssignment_TransfersKernel) {
   auto filter = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   auto projection = JitInt64Kernels::CompileProjection();
   if (!filter.has_value() || !projection.has_value()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   std::vector<int64_t> input{1, 2, 3};
@@ -106,14 +106,14 @@ TEST(JitTest,
      CompileFilter_WhenCalledRepeatedly_ReusesCompiledKernelsProcessWide) {
   auto first = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   if (!first.has_value()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   const double first_ms = first->CompileMilliseconds();
 
   auto second = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   if (!second.has_value()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
 
@@ -131,7 +131,7 @@ TEST(JitTest, JitKernel_WhenInvokingWrongAccessor_ThrowsLogicError) {
   auto projection = JitInt64Kernels::CompileProjection();
   auto sum = JitInt64Kernels::CompileSum();
   if (!filter.has_value() || !projection.has_value() || !sum.has_value()) {
-    GTEST_FAIL() << true;
+    GTEST_FAIL() << "failed";
     return;
   }
   std::vector<int64_t> input{1, 2, 3};

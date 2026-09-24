@@ -5,7 +5,7 @@
 
 ## 概要
 
-`hash_join` は、論理結合演算 `kJoin` を、等値条件（`l.col = r.col` または NULL安全な等値 `IS NOT DISTINCT FROM`）に基づいてハッシュ表を構築する物理計画 `ProductPlan`（ハッシュ結合形態）へと変換する実装Ruleです。インメモリ実行（`kInMemory`）とハイブリッドスピル実行（`kHybrid`）の2つの物理戦略候補を生成し、メモリ予算に応じたコスト評価を行います。
+`hash_join` は、論理結合演算 `kJoin` を、等値条件（`l.col = r.col` または NULL安全な等値 `IS NOT DISTINCT FROM`）に基づいてハッシュ表を構築する物理計画 `ProductPlan`（ハッシュ結合形態）へと変換する実装 Rule です。インメモリ実行（`kInMemory`）とハイブリッドスピル実行（`kHybrid`）の2 つの物理戦略候補を生成し、メモリ予算に応じたコスト評価を行います。
 
 ## 変換前後の関係
 
@@ -47,7 +47,7 @@ graph TD
     }
 ```
 
-等値キー条件を満たさない非等値述語（例: `l.a > r.x`）は残差述語（residual）として分離され、ハッシュ結合ノードの上位に配置される `SelectionPlan` によって事後評価されます。等値キー対が1つも存在しない場合、本Ruleは候補計画を返却しません。
+等値キー条件を満たさない非等値述語（例: `l.a > r.x`）は残差述語（residual）として分離され、ハッシュ結合ノードの上位に配置される `SelectionPlan` によって事後評価されます。等値キー対が1 つも存在しない場合、本 Rule は候補計画を返却しません。
 
 ## 意味論的根拠とコストモデル
 
@@ -98,11 +98,11 @@ NULL安全等値比較（`IS NOT DISTINCT FROM`）への対応は、SQL標準に
 
 ハッシュ結合の計算量は $O(|L| + |R|)$ であり、ネステッドループ結合の $O(|L| \times |R|)$ と比較してデータ量増加に伴うコスト増大が大幅に抑えられます。探索器は右子ノード（ビルド側）が小さく、左子ノード（プローブ側）が大きい構成においてハッシュ結合を優先的に採択します。
 
-## 関連Ruleとの相互作用
+## 関連 Rule との相互作用
 
-- `nested_loop_join` / `cross_join`: 等値条件を持たない非等値結合を処理する代替実装Rule。
-- `merge_join` / `index_join`: 等値条件を共有する競合物理Rule。入力があらかじめソートされている場合はソートマージ結合、索引アクセスが可能な場合はインデックス結合が優位となります。
-- `infer_join_predicates` / `join_predicate_transitivity`: 論理層において等値述語を推論・補完し、本Ruleの適用機会を拡大します。
+- `nested_loop_join` / `cross_join`: 等値条件を持たない非等値結合を処理する代替実装 Rule。
+- `merge_join` / `index_join`: 等値条件を共有する競合物理 Rule。入力があらかじめソートされている場合はソートマージ結合、索引アクセスが可能な場合はインデックス結合が優位となります。
+- `infer_join_predicates` / `join_predicate_transitivity`: 論理層において等値述語を推論・補完し、本 Rule の適用機会を拡大します。
 - 物理コード生成: `ProductPlan::EmitExecutor`（`executor/relational_factory.cpp`）が、キーの幅および指定された `HashJoinMode` に応じたエグゼキュータを生成します。
 
 ## 検証テスト

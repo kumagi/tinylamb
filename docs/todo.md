@@ -142,7 +142,7 @@ Cascades rule / cost / statistics
 
 ### Scan / Access Path
 
-（以下は実装済み: FullScan/ParallelScan, IndexScan, IndexOnlyScan, BitmapIndexScan, BitmapHeapScan, BitmapAnd, BitmapOr, TidScan, FilteredScanPushdown, DummyScan, ValuesScan, FunctionScan, UnnestScan, WorkTableScan）
+（以下は実装済み: FullScan/ParallelScan, IndexScan, IndexOnlyScan, BitmapIndexScan, BitmapHeapScan, BitmapAnd, BitmapOr, TidScan, FilteredScanPushdown, DummyScan, ValuesScan, UnnestScan, WorkTableScan）
 
 - [x] BitmapIndexScan / BitmapHeapScanを実装する。
 - [x] BitmapAnd / BitmapOrを実装する。
@@ -153,11 +153,11 @@ Cascades rule / cost / statistics
 - [x] PAXScanをCascadesへ接続する。
 - [x] ZoneMapSkipScanをplan属性へ接続する。
 - [x] LateMaterializationScanを実装する。
-- [x] PrefetchingIndexScan、ParallelIndexScan、RangePartitionedScanを実装する。
+- [ ] PrefetchingIndexScan、ParallelIndexScan、RangePartitionedScanを実装する。
 - [x] BERNOULLI / SYSTEMのSampleScanを実装する。
 - [ ] 複数レンジIndexScanの順序回復を実装する。
 - [ ] LSM / WiscKeyのLsmScan implementation ruleを実装する。
-- [x] ForeignScanを実装する。
+- [ ] ForeignScanを実装する。
 - [ ] 複合インデックスの等式 + 不等式混在を実装する。
 - [ ] 複数インデックスを用いたcovering判定を実装する。
 - [x] NestedLoopIndexJoinのprefetchを実装する。
@@ -206,7 +206,7 @@ Cascades rule / cost / statistics
 - [ ] recursive JOIN USING、BY NAME、CORRESPONDINGをschema契約として実装する。
 - [ ] CTE依存順、前方参照、相互再帰エラーを実装する。
 - [ ] plan template / cache再構築時にrecursive metadataを保持する。
-- [x] WorkTableIndexを実装する。
+- [ ] WorkTableIndexを実装する。
 - [ ] CTE materialization / inlining / filter pushdownをコスト付きで選択する。
 - [x] CTE predicate propagationを実装する。
 - [x] recursive CTE union rewriteを実装する。
@@ -214,14 +214,14 @@ Cascades rule / cost / statistics
 
 ### DML / Lock
 
-（以下はリレーショナル経路で実装済み: Insert, Update, Delete, BatchInsert, Upsert/ON CONFLICT, LockRows, TableTriggers, UpdateFrom, DeleteUsing）
+（以下はリレーショナル経路で実装済み: Insert, Update, Delete, BatchInsert, Upsert/ON CONFLICT, TableTriggers）
 
 - [x] Upsert / ON CONFLICTを実装する。
 - [x] MATCHED / NOT MATCHEDのMergeExecutorを実装する。
-- [x] UPDATE FROM / DELETE USINGを実装する。
+- [ ] UPDATE FROM / DELETE USINGを実装する。
 - [x] ReturningExecutorを実装する。
-- [x] LockRows / SELECT FOR UPDATEを実装する。
-- [x] SkipLocked / NOWAITを実装する。
+- [ ] LockRows / SELECT FOR UPDATEを実装する。
+- [ ] SkipLocked / NOWAITを実装する。
 - [x] Truncate executorを実装する。
 - [x] before / after trigger hookを実装する。
 - [ ] DML logical / physical planを導入し、INSERT / UPDATE / DELETEをCascadesへ接続する。
@@ -229,8 +229,8 @@ Cascades rule / cost / statistics
 ### Sampling / 実行時統計
 
 - [x] AnalyzeScan（ヒストグラム構築用）を実装する。
-- [x] ReservoirSampleとBlockSampleを実装する。
-- [x] HyperLogLogScanを実装する。
+- [x] ReservoirSampleを実装する。
+- [x] HyperLogLogによる統計収集(AnalyzeScan)を実装する。
 - [x] 実行時feedback用CardinalityProbeを実装する。
 
 ---
@@ -314,7 +314,7 @@ Cascades rule / cost / statistics
 
 ### Scalar rewrite（ExpressionRuleSet）
 
-（以下はExpressionRuleSetに実装済み: fold_binary/unary/in/function, singleton_in, canonicalize_comparison, boolean_identity, double_negation, de_morgan, simplify_case, not_comparison/not_like/not_is_null/not_is_not_null, xor_boolean_identity, and/or_idempotent, absorption_and/or, identity_add/subtract_zero, identity_multiply/divide_one, double_negation_arithmetic, reassociate_add/subtract_constants, dedupe_in_list, uniform_case_result, like_equality, is_null/is_not_null_of_null_check, collapse_nested_identical_cast, factor_or_common_and, nullif_to_case, self_inequality, contradiction_from_null_eq, greatest_least_fold, in_single_null, concat_flatten, xor_to_or_and_not, is_distinct_from_rewrite, boolean_eq_true_false_three_valued, nondeterministic_barrier, safe_divide_rewrite, abs_of_abs, empty_in_list, coalesce_and_nullif_simplification, datetime_and_string_fold_extent, if_to_case, array_length_array_exp, json_path_constant_fold, numeric_widening_cast, or_of_ranges_to_in, interval_normalize, predicate_pushdown_case, inner_join_not_null_inference, regexp_prefix_extraction, cast_pushdown_comparison, deterministic_function_cse, function_volatility_classification, boolean_filter_pullup, not_in_null_semantics, array_flatten_optimization）
+（以下はExpressionRuleSetに実装済み: fold_binary/unary/in/function, singleton_in, canonicalize_comparison, boolean_identity, double_negation, de_morgan, simplify_case, not_comparison/not_like/not_is_null/not_is_not_null, xor_boolean_identity, and/or_idempotent, absorption_and/or, identity_add/subtract_zero, identity_multiply/divide_one, double_negation_arithmetic, reassociate_add/subtract_constants, dedupe_in_list, uniform_case_result, like_equality, is_null/is_not_null_of_null_check, collapse_nested_identical_cast, factor_or_common_and, nullif_to_case, self_inequality, contradiction_from_null_eq, greatest_least_fold, in_single_null, concat_flatten, xor_to_or_and_not, is_distinct_from_rewrite, boolean_eq_true_false_three_valued, abs_of_abs, empty_in_list, coalesce_and_nullif_simplification, datetime_and_string_fold_extent, if_to_case, json_path_constant_fold, numeric_widening_cast, or_of_ranges_to_in, interval_normalize, predicate_pushdown_case, inner_join_not_null_inference, regexp_prefix_extraction, cast_pushdown_comparison, deterministic_function_cse, function_volatility_classification, boolean_filter_pullup, not_in_null_semantics, array_flatten_optimization）
 
 - [x] numeric widening cast簡約とDATE/TIMESTAMP cast正規化を実装する。
 - [x] NOT IN with NULL listの警告・計画を実装する。
@@ -361,7 +361,8 @@ Cascades rule / cost / statistics
 - [x] skew補正、動的sampling、実行feedbackを実装する。
 - [x] I/O / CPU / memoryのコスト単位を監査する。
 - [x] memory許可量とspill確率、parallel speedupをモデル化する。
-- [ ] index clustering factorとpage cache hit率をモデル化する。
+- [x] index clustering factor(correlation)のモデル化は済。
+- [ ] page cache hit率のモデル化。
 - [x] PAX / zone map選択性をcostへ反映する。
 - [ ] Top-N limit hintを全implementation ruleへ伝播する。
 - [x] estimated rowsとactual rowsをEXPLAIN ANALYZEへ出す。
@@ -400,7 +401,7 @@ Cascades rule / cost / statistics
 - [x] distributed any / singleton / hash / broadcast / rangeを実装する。
 - [ ] enforce distribution、colocated join、broadcast vs shuffle costを実装する。
 - [x] partial agg/finalize、two-phase distinctを分散経路へ接続する。
-- [x] window partition再分散、distributed limit merge、scan range分割を実装する。
+- [x] window partition再分散、scan range分割を実装する。
 - [x] ExchangeHash / Broadcast / Gather / Rangeを実装する。
 - [x] RemoteScan、DistributedAggFinalizeを実装する。
 
@@ -419,7 +420,7 @@ Cascades rule / cost / statistics
 - [x] SELECT DISTINCT ONを実装する。
 - [x] FETCH FIRST WITH TIESを実装する。
 - [x] FOR UPDATE / SKIP LOCKEDのaccess path制約を実装する。
-- [x] MERGE、UPDATE FROM、DELETE USING、RETURNINGをSQLからplanへ接続する。
+- [x] MERGE、RETURNINGをSQLからplanへ接続する。
 - [ ] prepared statementのgeneric/custom経路を完成させる。
 - [ ] batch INSERTの値リスト結合を実装する。
 

@@ -39,6 +39,8 @@ class MergeJoin final : public ExecutorBase {
   void Materialize();
   [[nodiscard]] static bool KeyIsNull(const Row& row,
                                       const std::vector<slot_t>& columns);
+  [[nodiscard]] static bool KeyCannotMatch(const Row& row,
+                                           const std::vector<slot_t>& columns);
   [[nodiscard]] int CompareKeys(const Row& left, const Row& right) const;
   // Evaluates the optional residual over `left_rows_[i] + right_rows_[j]`;
   // always true when no residual was supplied.

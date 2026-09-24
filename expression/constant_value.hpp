@@ -59,6 +59,11 @@ class ConstantValue : public ExpressionBase {
   }
   void Dump(std::ostream& o) const override { o << val_; }
 
+ protected:
+  // ParameterSlot rebinds the sniffed literal in place. The stored value is
+  // what AsConstantValue().GetValue() and constant-folding observe.
+  void ResetValue(Value value) { val_ = std::move(value); }
+
  private:
   [[nodiscard]] tinylamb::Type TypeForValue() const {
     switch (val_.type) {

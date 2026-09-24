@@ -6,11 +6,11 @@
 
 ## 概要
 
-`Selection(pred, OuterJoin(L, R))` の述語 `pred` が **保存側である左入力の
-列だけ** を参照し、かつ結合が LEFT(join_type 0)であるとき、
-`Selection(pred, OuterJoin(Selection(pred, L), R))` へ書き換える Rule です
-(外側 Selection は冪等のために残す)。フィルタを LEFT JOIN の左入力の
-下に前倒しして、結合の入力行を減らします。
+`Selection(pred, OuterJoin(L, R))` の述語 `pred` が**保存側である左入力の
+列だけ**を参照し、かつ結合が LEFT（`join_type == 0`）であるとき、
+`Selection(pred, OuterJoin(Selection(pred, L), R))` へ書き換える Rule です。
+冪等性を保つため、外側の Selection は残します。フィルタを LEFT JOIN の
+左入力へ先に適用し、結合へ渡す行数を減らします。
 
 ## 変換前後の関係
 
@@ -146,11 +146,10 @@ while the join alternative below carries the push)")。押し込んだ述語は
 
 適用後は LEFT JOIN の左入力がフィルタ済みになり、(1) 結合の左入力行が
 減り、(2) 右側との照合試行も減ります。保存側の行集合は最終的に同一なので
-コストだけが下がります。outer join を越えるフィルタ押し込みは一般的には
-危険ですが、この Rule は「保存側かつ左側」という安全な 1 ケースに限定した
-ガードレール設計の見本です(null-rejection 解析の完全実装を待たず、
-安全な形だけ個別に実装する方針。`docs/opt/AGENTS.md` §4 の
-「ガードレール」の話題)。
+コストだけが下がります。outer join を越えるフィルタ押し込みは、一般には
+結果を変える可能性があります。この Rule は「保存側かつ左側」の 1 ケースに
+限定し、null-rejection 解析の対象外でも安全性を証明できる形だけを実装して
+います（`docs/opt/AGENTS.md` §4 の「ガードレール」）。
 
 ## 関連 Rule との相互作用
 

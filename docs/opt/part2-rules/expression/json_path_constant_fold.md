@@ -6,7 +6,7 @@
 
 ## 概要
 
-JSON アクセサ関数（`JSON_EXTRACT`, `JSON_QUERY`, `JSON_VALUE`, `JSON_EXTRACT_SCALAR`, `JSON_EXTRACT_ARRAY`, `JSON_QUERY_ARRAY`, `JSON_VALUE_ARRAY`, `JSON_EXTRACT_STRING_ARRAY` の計 8 種）において、対象の JSON 文字列および JSON パスがともにコンパイル時定数である場合に、パス抽出を実行して定数リテラルへ畳み込む Rule です。
+`json_path_constant_fold` は、JSON 文字列と JSON パスがともにコンパイル時定数なら、パス抽出を実行して結果を定数リテラルへ畳み込む Rule です。対象は `JSON_EXTRACT`, `JSON_QUERY`, `JSON_VALUE`, `JSON_EXTRACT_SCALAR`, `JSON_EXTRACT_ARRAY`, `JSON_QUERY_ARRAY`, `JSON_VALUE_ARRAY`, `JSON_EXTRACT_STRING_ARRAY` の 8 関数です。
 
 ## 変換前後の関係
 
@@ -72,7 +72,7 @@ return ConstantValueExp(res);
 
 定数 JSON に対するパス抽出演算がコンパイル時に解消されます。
 
-JSON のパースおよびツリー走査は計算負荷の高い処理であるため、タプルごとに繰り返される実行時の JSON パース処理を完全にゼロへと削減できる効果は、通常の算術定数畳み込みと比較しても極めて大きくなります。
+JSON のパースとツリー走査は計算量が多いため、実行時にタプルごとに行う JSON パースを省くことで、算術式の定数畳み込みより多くの処理を削減できます。
 
 ## 関連 Rule との相互作用
 

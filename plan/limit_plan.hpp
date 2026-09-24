@@ -26,6 +26,14 @@ class LimitPlan final : public PlanBase {
   ~LimitPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override {
+    return src_->ContainsParameterSlots();
+  }
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override {
+    return src_->InstallParameterSlots(parameters, cursor, slots);
+  }
 
   [[nodiscard]] const Table* ScanSource() const override {
     return src_->ScanSource();

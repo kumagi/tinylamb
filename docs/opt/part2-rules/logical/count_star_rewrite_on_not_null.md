@@ -82,7 +82,7 @@ changed = true;
 
 行ごとの列値取り出しおよび NULL 判定の CPU オーバーヘッドが完全に排除されます。
 
-さらに重要な効果として、`COUNT(*)` への正規化によって、後続の `count_star_without_group_rewrite` やストレージ層のメタデータ走査（B+Tree のリーフエントリ数やインデックスオンリースキャン）といった超高速な最適化パスが解禁（unlock）されます。
+`COUNT(*)` へ正規化すると、後続の `count_star_without_group_rewrite` やストレージ層のメタデータ走査（B+Tree のリーフエントリ数やインデックスオンリースキャン）を適用できるようになります。
 
 ## 関連 Rule との相互作用
 

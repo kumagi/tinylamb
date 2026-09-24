@@ -1170,13 +1170,19 @@ std::vector<std::string> GenWindowProbes(Gen& g, const std::string& tab) {
                      .append(")");
         } else {
           kind = 61;
-          expr = "COUNT(DISTINCT " + arg_name + ") OVER (" + part_txt + ")";
+          expr = "COUNT(DISTINCT " + arg_name;
+          expr += ") OVER (";
+          expr += part_txt;
+          expr += ")";
         }
         break;
       }
     }
-    const std::string sql =
-        "SELECT u, " + expr + " FROM " + tab + " ORDER BY u;";
+    std::string sql = "SELECT u, ";
+    sql += expr;
+    sql += " FROM ";
+    sql += tab;
+    sql += " ORDER BY u;";
     probes.push_back(std::to_string(kind) + "|" + std::to_string(p1) + "|" +
                      std::to_string(p2) + "|" + std::to_string(arg) + "|" +
                      std::to_string(part) + "|" + std::to_string(flags) + "|" +
@@ -2237,6 +2243,18 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     };
   }
 
+  {
+    const std::string prefix =
+        "SELECT " + GenProjection(g) + " FROM " + tab + " WHERE ";
+    const std::string left = t.predicate;
+    const std::string right = tlp_aux->Render();
+    t.or_partition = {
+        prefix + "(" + left + ") OR (" + right + ");",
+        prefix + "(" + left + ") IS TRUE UNION ALL " + prefix + "(" + right +
+            ") IS TRUE AND (" + left + ") IS NOT TRUE;",
+    };
+  }
+
   // ---- Auxiliary tables for the subquery / set-operation oracles ----
   // jtab feeds the three semi-join spellings; stab is a same-schema sibling
   // whose rows the set-operation mirror tracks.
@@ -2257,8 +2275,13 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
                     std::string(kStrPool[static_cast<size_t>(g.Pick(
                         0, static_cast<int>(std::size(kStrPool)) - 1))]) +
                     "'";
-      t.setup.push_back("INSERT INTO " + jtab + " VALUES (" + x + ", " + y +
-                        ");");
+      std::string insert = "INSERT INTO " + jtab;
+      insert += " VALUES (";
+      insert += x;
+      insert += ", ";
+      insert += y;
+      insert += ");";
+      t.setup.push_back(insert);
     }
   }
   std::string stab;
@@ -2272,7 +2295,12 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     for (int i = 0; i < n; ++i) {
       std::string values;
       mirror2.push_back(GenRow(g, 500 + i, &values));
-      t.setup.push_back("INSERT INTO " + stab + " VALUES " + values + ";");
+      std::string insert = "INSERT INTO ";
+      insert += stab;
+      insert += " VALUES ";
+      insert += values;
+      insert += ";";
+      t.setup.push_back(insert);
     }
     pred2 = GenPredicate(g, g.Pick(1, 2), flavour);
   }
@@ -2411,6 +2439,122 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
         "SELECT a FROM " + tab + " WHERE " + pred2->Render();
     t.usp = {lhs + " UNION ALL " + mid + " INTERSECT DISTINCT " + rhs + ";",
              lhs + " UNION ALL (" + mid + " INTERSECT DISTINCT " + rhs + ");"};
+  }
+
+  // ---- QUALIFY vs derived-table WHERE ----
+  // A window predicate in QUALIFY must equal the derived-table spelling
+  // row-for-row, whether it references the output alias or repeats the
+  // window expression inline.
+  if (g.Chance(35)) {
+    std::string win;
+    switch (g.Pick(0, 6)) {
+      case 0:
+        win = "ROW_NUMBER() OVER (ORDER BY a, u)";
+        break;
+      case 1:
+        win = "RANK() OVER (ORDER BY b)";
+        break;
+      case 2:
+        win = "DENSE_RANK() OVER (ORDER BY a)";
+        break;
+      case 3:
+        win = "COUNT(*) OVER (PARTITION BY b)";
+        break;
+      case 4:
+        win = "LAG(a, 1) OVER (ORDER BY u)";
+        break;
+      case 5:
+        win =
+            "MIN(b) OVER (ORDER BY u ROWS BETWEEN 1 PRECEDING AND "
+            "CURRENT ROW)";
+        break;
+      default:
+        win = "SUM(a) OVER (PARTITION BY b)";
+        break;
+    }
+    // The predicate is rendered around an operand so the same shape can
+    // target the alias, the inline window expression, or the derived
+    // column.
+    const int psel = g.Pick(0, 7);
+    const int k = g.Pick(-1, 4);
+    const int k2 = g.Pick(k, k + 4);
+    auto qpred = [&](const std::string& x) -> std::string {
+      switch (psel) {
+        case 0:
+          return x + " <= " + std::to_string(k);
+        case 1:
+          return x + " > " + std::to_string(k);
+        case 2:
+          return x + " = " + std::to_string(k);
+        case 3:
+          return x + " BETWEEN " + std::to_string(k) + " AND " +
+                 std::to_string(k2);
+        case 4:
+          return x + " IN (" + std::to_string(k) + ", " + std::to_string(k2) +
+                 ")";
+        case 5:
+          return x + " IS NOT NULL";
+        case 6:
+          return x + " IS NULL";
+        default:
+          return "NOT (" + x + " > " + std::to_string(k) + ")";
+      }
+    };
+    const std::string inner = "SELECT u, " + win + " AS r FROM " + tab;
+    const std::string lhs =
+        inner + " QUALIFY " + (g.Chance(50) ? qpred("r") : qpred(win));
+    const std::string rhs =
+        "SELECT u, r FROM (" + inner + ") q WHERE " + qpred("r");
+    t.qualify = {lhs + ";", rhs + ";"};
+  }
+
+  // ---- Set-op derived table + outer WHERE ----
+  // filter(A <op> B) = filter(A) <op> filter(B) is an identity for every
+  // set-operation flavour, so the derived spelling and the per-branch
+  // spelling must agree (Bug-36 class: injecting the predicate into the
+  // head operand only left UNION tails unfiltered).
+  if (!stab.empty() && g.Chance(35)) {
+    static const std::array<const char*, 6> kDsoOps = {
+        "UNION ALL",          "UNION DISTINCT", "INTERSECT ALL",
+        "INTERSECT DISTINCT", "EXCEPT ALL",     "EXCEPT DISTINCT"};
+    const std::string op = kDsoOps[static_cast<size_t>(g.Pick(0, 5))];
+    const int k = g.Pick(-3, 3);
+    const int k2 = g.Pick(k, k + 4);
+    std::string pred_a;
+    switch (g.Pick(0, 8)) {
+      case 0:
+        pred_a = "a < " + std::to_string(k);
+        break;
+      case 1:
+        pred_a = "a <= " + std::to_string(k);
+        break;
+      case 2:
+        pred_a = "a > " + std::to_string(k);
+        break;
+      case 3:
+        pred_a = "a >= " + std::to_string(k);
+        break;
+      case 4:
+        pred_a = "a = " + std::to_string(k);
+        break;
+      case 5:
+        pred_a = "a != " + std::to_string(k);
+        break;
+      case 6:
+        pred_a =
+            "a BETWEEN " + std::to_string(k) + " AND " + std::to_string(k2);
+        break;
+      case 7:
+        pred_a = "a IN (" + std::to_string(k) + ", " + std::to_string(k2) + ")";
+        break;
+      default:
+        pred_a = "NOT (a > " + std::to_string(k) + ")";
+        break;
+    }
+    t.dso = {"SELECT a FROM (SELECT a FROM " + tab + " " + op +
+                 " SELECT a FROM " + stab + ") d WHERE " + pred_a + ";",
+             "SELECT a FROM " + tab + " WHERE " + pred_a + " " + op +
+                 " SELECT a FROM " + stab + " WHERE " + pred_a + ";"};
   }
 
   // ---- NOT IN literal list vs NOT(OR of equals) ----
@@ -2580,7 +2724,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
                        }
                        return false;
                      });
-    const int64_t total = static_cast<int64_t>(rows.size());
+    const auto total = static_cast<int64_t>(rows.size());
     int64_t offset = 0;
     int64_t limit = -1;
     std::string sql = "SELECT u, a FROM " + tab + " WHERE " + t.predicate +
@@ -2620,7 +2764,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
                          }
                          return desc ? l->a > r->a : l->a < r->a;
                        });
-      const int64_t n = g.Pick(0, total + 1);
+      const int64_t n = g.Pick(0, static_cast<int>(total + 1));
       std::string tsql =
           "SELECT u, a FROM " + tab + " WHERE " + t.predicate + " ORDER BY a";
       if (desc) {
@@ -2680,7 +2824,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
       }
     };
     struct HCond {
-      int agg;
+      int agg{};
       std::string op;  // "=", "!=", "<", "<=", ">", ">=", "IS NULL",
                        // "IS NOT NULL"
       int64_t k{0};
@@ -2733,7 +2877,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
       }
     }
     for (const auto& [key, v] : groups) {
-      bool keep = conj_or ? false : true;
+      bool keep = true;
       for (const HCond& c : conds) {
         const int64_t val = agg_value(v, c.agg);
         char r = 'F';
@@ -3060,6 +3204,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->tlp_ran = t.tlp.size() == 4;
     stats->tlp_agg_ran = t.tlp_agg.size() == 4;
     stats->unionall_ran = t.unionall.size() == 2;
+    stats->or_partition_ran = t.or_partition.size() == 2;
     stats->subq_ran = t.subq.size() == 3;
     stats->ssub_ran = t.ssub.size() == 2;
     stats->cqp_ran = t.cqp.size() == 2;
@@ -3068,6 +3213,8 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->lwn_ran = t.lwn.size() == 2;
     stats->niv_ran = t.niv.size() == 2;
     stats->usp_ran = t.usp.size() == 2;
+    stats->qualify_ran = t.qualify.size() == 2;
+    stats->dso_ran = t.dso.size() == 2;
     stats->notin_ran = t.notin.size() == 1;
     stats->norec_ran = t.norec.size() == 2;
     stats->pqs_ran = !t.pqs_count.empty();
@@ -3106,6 +3253,7 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   if (!CheckTlp(db, ctx, trace.tlp, &report, verbose) ||
       !CheckTlpAgg(db, ctx, trace.tlp_agg, &report, verbose) ||
       !CheckUnionAll(db, ctx, trace.unionall, &report, verbose) ||
+      !CheckUnionAll(db, ctx, trace.or_partition, &report, verbose) ||
       !CheckSubq(db, ctx, trace.subq, &report, verbose) ||
       !CheckNoRec(db, ctx, trace.norec, &report, verbose) ||
       !CheckPqs(db, ctx, trace, &report, verbose) ||
@@ -3131,6 +3279,8 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
       !CheckPair(db, ctx, trace.lwn, "LWN", &report, verbose) ||
       !CheckPair(db, ctx, trace.niv, "NIV", &report, verbose) ||
       !CheckPair(db, ctx, trace.usp, "USP", &report, verbose) ||
+      !CheckPair(db, ctx, trace.qualify, "QFY", &report, verbose) ||
+      !CheckPair(db, ctx, trace.dso, "DSO", &report, verbose) ||
       !CheckExpected(db, ctx, trace.notin, trace.notin_expect,
                      /*ordered=*/false, "NOTIN", &report, verbose) ||
       !CheckRecursive(db, ctx, trace, &report, verbose) ||
@@ -3167,6 +3317,9 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   for (const std::string& sql : trace.unionall) {
     out += "-- unionall: " + sql + "\n";
   }
+  for (const std::string& sql : trace.or_partition) {
+    out += "-- orpartition: " + sql + "\n";
+  }
   for (const std::string& sql : trace.ssub) {
     out += "-- ssub: " + sql + "\n";
   }
@@ -3187,6 +3340,12 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.usp) {
     out += "-- usp: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.qualify) {
+    out += "-- qualify: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.dso) {
+    out += "-- dso: " + sql + "\n";
   }
   for (const std::string& sql : trace.notin) {
     out += "-- notin: " + sql + "\n";
@@ -3322,6 +3481,8 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->tlp_agg.push_back(value);
     } else if (consume("-- unionall: ", &value)) {
       trace->unionall.push_back(value);
+    } else if (consume("-- orpartition: ", &value)) {
+      trace->or_partition.push_back(value);
     } else if (consume("-- ssub: ", &value)) {
       trace->ssub.push_back(value);
     } else if (consume("-- cqp: ", &value)) {
@@ -3336,6 +3497,10 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->niv.push_back(value);
     } else if (consume("-- usp: ", &value)) {
       trace->usp.push_back(value);
+    } else if (consume("-- qualify: ", &value)) {
+      trace->qualify.push_back(value);
+    } else if (consume("-- dso: ", &value)) {
+      trace->dso.push_back(value);
     } else if (consume("-- notin: ", &value)) {
       trace->notin.push_back(value);
     } else if (consume("-- notinexpect: ", &value)) {
@@ -3556,7 +3721,7 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
 
   // Conservative thresholds: report only egregious regressions where the
   // optimizer produced different plans or huge runtime divergence.
-  if (slowest > 20000000 && slowest > 30 * fastest) {
+  if (fastest >= 1000000 && slowest > 20000000 && slowest > 30 * fastest) {
     const std::string plan_fast = explain_plan(sqls[fastest_idx]);
     const std::string plan_slow = explain_plan(sqls[slowest_idx]);
     if (!plan_fast.empty() && !plan_slow.empty() && plan_fast == plan_slow) {

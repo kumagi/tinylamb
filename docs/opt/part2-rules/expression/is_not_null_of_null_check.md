@@ -7,7 +7,7 @@
 
 NULL 判定述語の多重適用 `(x IS NULL) IS NOT NULL` および `(x IS NOT NULL) IS NOT NULL` を、スカラー定数 `TRUE` へ畳み込む式書き換え Rule です。
 
-`is_null_of_null_check` と対称関係にあり、二値閉包性を持つ NULL 判定述語の出力に対して外側から非 NULL 判定を行う構造を解消します。内側の述語出力は常に 0（FALSE）または 1（TRUE）であり NULL を返さないため、式全体は恒真に `TRUE` と確定します。ただし、部分式 $x$ の評価を省略することによる例外消去（error erasure）を抑止するため、`ExpressionCannotThrow` ガードによる安全性を厳密に担保します。
+`is_null_of_null_check` と対称関係にあり、二値閉包性を持つ NULL 判定述語の出力に対して外側から非 NULL 判定を行う構造を解消します。内側の述語出力は常に 0（FALSE）または 1（TRUE）であり NULL を返さないため、式全体は恒真に `TRUE` と確定します。ただし、部分式 $x$ の評価を省略することによる例外消去（error erasure）を抑止するため、`ExpressionCannotThrow` ガードによる安全性を厳密に保証します。
 
 ## 変換前後の関係
 

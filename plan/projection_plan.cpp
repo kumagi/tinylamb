@@ -28,6 +28,7 @@
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "plan.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
@@ -65,6 +66,32 @@ ValueType StaticResultValueType(const Expression& expression,
   }
 }
 
+TableStatistics ProjectedStats(const TableStatistics& source,
+                               const Schema& source_schema,
+                               const std::vector<NamedExpression>& targets,
+                               const Schema& output_schema) {
+  std::vector<ColumnStats> columns;
+  columns.reserve(targets.size());
+  for (size_t i = 0; i < targets.size(); ++i) {
+    const Expression& expression = targets[i].expression;
+    const int source_offset =
+        expression && expression->Type() == TypeTag::kColumnValue
+            ? source_schema.Offset(expression->AsColumnValue().GetColumnName())
+            : -1;
+    if (source_offset >= 0 &&
+        static_cast<size_t>(source_offset) < source.Columns()) {
+      columns.push_back(source.Column(static_cast<size_t>(source_offset)));
+    } else if (i < output_schema.ColumnCount()) {
+      columns.emplace_back(output_schema.GetColumn(i).Type());
+    } else {
+      columns.emplace_back();
+    }
+  }
+  TableStatistics result(output_schema);
+  result.Assign(source.Rows(), std::move(columns));
+  return result;
+}
+
 }  // namespace
 
 ProjectionPlan::ProjectionPlan(Plan src,
@@ -72,16 +99,19 @@ ProjectionPlan::ProjectionPlan(Plan src,
     : src_(std::move(src)),
       columns_(std::move(project_columns)),
       output_schema_(CalcSchema()),
-      stats_(src_->GetStats()) {}
+      stats_(ProjectedStats(src_->GetStats(), src_->GetSchema(), columns_,
+                            output_schema_)) {}
 
 ProjectionPlan::ProjectionPlan(Plan src,
                                const std::vector<ColumnName>& project_columns)
-    : src_(std::move(src)), stats_(src_->GetStats()) {
+    : src_(std::move(src)), output_schema_(), stats_(output_schema_) {
   columns_.reserve(project_columns.size());
   for (const auto& col : project_columns) {
     columns_.emplace_back(col);
   }
   output_schema_ = CalcSchema();
+  stats_ = ProjectedStats(src_->GetStats(), src_->GetSchema(), columns_,
+                          output_schema_);
 }
 
 Schema ProjectionPlan::CalcSchema() const {
@@ -210,7 +240,7 @@ void ProjectionPlan::Dump(std::ostream& o, int indent) const {
     }
     o << columns_[i];
   }
-  o << "} (estimated cost: " << AccessRowCount() << ")\n"
+  o << "} (estimated rows: " << EmitRowCount() << ")\n"
     << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
@@ -223,7 +253,27 @@ std::string ProjectionPlan::ToString() const {
     }
     s += columns_[i].name;
   }
-  s += "} (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+  s += "} (estimated rows: " + std::to_string(EmitRowCount()) + ")";
   return s;
+}
+
+bool ProjectionPlan::ContainsParameterSlots() const {
+  if (src_->ContainsParameterSlots()) {
+    return true;
+  }
+  return std::ranges::any_of(columns_, [](const NamedExpression& column) {
+    return ContainsParameterSlot(column.expression);
+  });
+}
+
+bool ProjectionPlan::InstallParameterSlots(const std::vector<Value>& parameters,
+                                           size_t* cursor,
+                                           std::vector<Expression>* slots) {
+  for (NamedExpression& column : columns_) {
+    if (!SlotizeInPlace(&column.expression, parameters, cursor, slots)) {
+      return false;
+    }
+  }
+  return src_->InstallParameterSlots(parameters, cursor, slots);
 }
 }  // namespace tinylamb

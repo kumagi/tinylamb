@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_EXECUTOR_DETAIL_EXPRESSION_EVAL_HPP
 #define TINYLAMB_EXECUTOR_DETAIL_EXPRESSION_EVAL_HPP
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -87,10 +88,29 @@ using DistinctValueSet =
 // The layout mirrors the per-stat switch structure for readability.
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct AggregateAccumulator {
-  explicit AggregateAccumulator(const AggregateExpression* aggregate);
+  explicit AggregateAccumulator(const AggregateExpression* aggregate,
+                                const Schema* input_schema = nullptr);
+  // Distinct-set handle: the hash set is allocated lazily.  COUNT/SUM
+  // (DISTINCT) over INT64/DATE values never touch it (they use the inline
+  // int array below), and materializing one per group cost a heap
+  // allocation per group on multi-million-group aggregations.
+  [[nodiscard]] bool DistinctMode() const { return distinct_mode_; }
+  DistinctValueSet& EnsureDistinctSet();
 
   // Row-at-a-time accumulation for streaming aggregates.
   Status Add(const Value& value);
+  // Parallel-build reduction: true when the accumulator keeps only streaming
+  // scalar state (no DISTINCT set, no buffered rows) and Merge is allowed.
+  [[nodiscard]] bool CanMerge() const;
+  // Merges `other`'s streaming state into this accumulator.  Both sides must
+  // satisfy CanMerge().  Double totals may associate differently than a
+  // serial pass (parallel aggregation semantics); integer overflow and SUM
+  // infinity still raise exactly like Add.
+  Status Merge(const AggregateAccumulator& other);
+  // Total distinct int64/date values tracked (inline array + overflow set).
+  [[nodiscard]] size_t DistinctIntCount() const;
+  // Inserts one int64/date distinct value; false when it was already present.
+  bool InsertDistinctInt(int64_t raw);
   // Full-input accumulation: buffers rows for aggregates that need whole-group
   // context (HAVING modifier, inner ORDER BY/LIMIT, ARRAY_AGG, STRING_AGG).
   Status Add(AggregateInput input);
@@ -123,7 +143,15 @@ struct AggregateAccumulator {
   // must raise; infinite inputs themselves are legal and stay inf.
   bool sum_saw_infinite_input_ = false;
   std::unique_ptr<DistinctValueSet> distinct;
+  // COUNT(DISTINCT int64/date) state.  Most groups hold only a handful of
+  // distinct values (TPC-H Q21: ~3.4 per l_orderkey group across 2.9M
+  // groups), so small cardinalities live in an inline array scanned linearly
+  // and only overflow promotes to a hash set; a per-group unordered_set would
+  // otherwise cost several heap allocations per group.
+  static constexpr size_t kInlineDistinctIntCapacity = 8;
   std::unique_ptr<std::unordered_set<int64_t>> distinct_ints;
+  size_t inline_distinct_int_count{0};
+  std::array<int64_t, kInlineDistinctIntCapacity> inline_distinct_ints{};
 
  private:
   struct BufferedRow {
@@ -133,6 +161,9 @@ struct AggregateAccumulator {
     Value auxiliary;
     std::vector<Value> trailing_values;
   };
+  // True when the aggregate carries DISTINCT; `distinct` materializes on
+  // first non-integer distinct insert.
+  bool distinct_mode_{false};
   mutable std::unique_ptr<std::vector<BufferedRow>> buffer_;
   mutable std::vector<Value> array_values_;
   mutable std::optional<std::string> delimiter_;
@@ -142,6 +173,10 @@ struct AggregateAccumulator {
   mutable bool bit_is_uint64_{false};
   // ARRAY_AGG DISTINCT: a repeated NULL collapses to one element.
   mutable bool array_saw_null_{false};
+  // ARRAY_AGG element type resolved against the input schema at
+  // construction: runtime values cannot recover the declared type when
+  // every element is NULL (an all-NULL INT64 column produced ARRAY<>).
+  mutable std::string resolved_element_type_;
   // ARRAY_CONCAT_AGG declared element type (captured even for empty arrays).
   mutable std::string concat_elem_type_;
   // ELEMENTWISE_SUM/AVG positional state.

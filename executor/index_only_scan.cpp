@@ -32,26 +32,43 @@
 #include "index/index_scan_iterator.hpp"
 #include "index/index_schema.hpp"
 #include "page/row_position.hpp"
+#include "transaction/transaction.hpp"
 #include "type/column.hpp"
 
 namespace tinylamb {
 
-IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
-                             const Index& index, const Value& begin,
-                             const Value& end, bool ascending, Expression where,
-                             const Schema& sc)
+namespace {
+
+TransactionManager::IndexReadGuard AcquireOnlyScanIndexReadGuard(
+    Transaction& txn, const Index& index,
+    TransactionManager::IndexReadGuard index_read_guard) {
+  if (index_read_guard.HoldsLock()) {
+    return index_read_guard;
+  }
+  return txn.AcquireIndexReadGuard(index.Root());
+}
+
+}  // namespace
+
+IndexOnlyScan::IndexOnlyScan(
+    Transaction& txn, const Table& table, const Index& index,
+    const Value& begin, const Value& end, bool ascending, Expression where,
+    const Schema& sc, TransactionManager::IndexReadGuard index_read_guard)
     : IndexOnlyScan(
           txn, table, index,
           begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
           end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
-          ascending, std::move(where), sc) {}
+          ascending, std::move(where), sc, std::move(index_read_guard)) {}
 
-IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
-                             const Index& index,
-                             const std::vector<Value>& begin_key,
-                             const std::vector<Value>& end_key, bool ascending,
-                             Expression where, const Schema& sc)
-    : iter_(table, index, txn, begin_key, end_key, ascending),
+IndexOnlyScan::IndexOnlyScan(
+    Transaction& txn, const Table& table, const Index& index,
+    const std::vector<Value>& begin_key, const std::vector<Value>& end_key,
+    bool ascending, Expression where, const Schema& sc,
+    TransactionManager::IndexReadGuard index_read_guard)
+    : index_read_guard_(AcquireOnlyScanIndexReadGuard(
+          txn, index, std::move(index_read_guard))),
+      iter_(table, index, txn, begin_key, end_key, ascending, false,
+            &index_read_guard_),
       cond_(std::move(where)),
       cond_conjuncts_(SplitConjuncts(cond_)),
       key_schema_(KeySchema(index, sc)),
@@ -131,6 +148,9 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
       }
     }
     return true;
+  }
+  if (iter_.GetStatus() != Status::kSuccess) {
+    return FailWith(iter_.GetStatus());
   }
   return false;
 }

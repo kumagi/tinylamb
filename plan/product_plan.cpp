@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -29,6 +30,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "index/index.hpp"
 #include "plan/plan.hpp"
 #include "table/table.hpp"
@@ -83,34 +85,14 @@ TableStatistics CrossJoinStats(const TableStatistics& left,
   return ans;
 }
 
-TableStatistics HashJoinStats(const TableStatistics& left,
-                              const std::vector<ColumnName>& /*left_cols*/,
-                              const TableStatistics& right,
-                              const std::vector<ColumnName>& /*right_cols*/) {
-  const size_t output_rows = std::min(left.Rows(), right.Rows());
-  TableStatistics ans = left.ScaleToRows(output_rows);
-  ans.Concat(right.ScaleToRows(output_rows));
-  return ans;
-}
-
-// Semi/anti joins emit only the left side's columns, with at most one output
-// row per left row.
-TableStatistics SemiAntiJoinStats(const TableStatistics& left,
-                                  const TableStatistics& right, JoinKind kind) {
-  if (IsAntiJoinKind(kind) || IsNullAwareAntiJoinKind(kind)) {
-    // Anti joins can retain every probe row; without a null-aware/selectivity
-    // estimate, the probe cardinality is the sound upper-bound estimate.
-    return left;
+TableStatistics JoinStats(const TableStatistics& left,
+                          const TableStatistics& right, JoinKind kind,
+                          size_t output_rows) {
+  if (IsSemiOrAnti(kind)) {
+    return left.ScaleCardinality(output_rows);
   }
-  const size_t output_rows = std::min(left.Rows(), right.Rows());
-  return left.ScaleToRows(output_rows);
-}
-
-TableStatistics OuterJoinStats(const TableStatistics& left,
-                               const TableStatistics& right) {
-  const size_t output_rows = std::max(left.Rows(), right.Rows());
-  TableStatistics ans = left.ScaleToRows(output_rows);
-  ans.Concat(right.ScaleToRows(output_rows));
+  TableStatistics ans = left.ScaleCardinality(output_rows);
+  ans.Concat(right.ScaleCardinality(output_rows));
   return ans;
 }
 
@@ -119,16 +101,39 @@ size_t EstimatedBuildBytes(const Plan& right_src) {
 }
 }  // namespace
 
+size_t EstimatedJoinRowCount(JoinKind kind, size_t left_rows, size_t right_rows,
+                             std::optional<size_t> match_rows) {
+  const size_t cross = SaturatingMul(left_rows, right_rows);
+  const size_t matches = match_rows.value_or(cross);
+  if (IsSemiJoinKind(kind)) {
+    return std::min(left_rows, matches);
+  }
+  if (IsAntiJoinKind(kind) || IsNullAwareAntiJoinKind(kind)) {
+    return left_rows;
+  }
+  if (IsLeftOuterJoinKind(kind)) {
+    return SaturatingAdd(left_rows, matches);
+  }
+  if (IsRightOuterJoinKind(kind)) {
+    return SaturatingAdd(right_rows, matches);
+  }
+  if (IsFullOuterJoinKind(kind)) {
+    return SaturatingAdd(SaturatingAdd(left_rows, right_rows), matches);
+  }
+  return matches;
+}
+
 // For Hash Join.
 ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          Plan right_src, std::vector<ColumnName> right_cols)
     : ProductPlan(std::move(left_src), std::move(left_cols),
                   std::move(right_src), std::move(right_cols),
-                  HashJoinMode::kInMemory) {}
+                  HashJoinMode::kInMemory, std::nullopt) {}
 
 ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          Plan right_src, std::vector<ColumnName> right_cols,
-                         HashJoinMode hash_mode)
+                         HashJoinMode hash_mode,
+                         std::optional<size_t> estimated_rows)
     : left_src_(std::move(left_src)),
       right_src_(std::move(right_src)),
       left_cols_(std::move(left_cols)),
@@ -138,13 +143,16 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
       right_ts_(nullptr),
       hash_mode_(hash_mode),
       output_schema_(left_src_->GetSchema() + right_src_->GetSchema()),
-      stats_(HashJoinStats(left_src_->GetStats(), left_cols_,
-                           right_src_->GetStats(), right_cols_)) {}
+      stats_(JoinStats(
+          left_src_->GetStats(), right_src_->GetStats(), kind_,
+          EstimatedJoinRowCount(kind_, left_src_->EmitRowCount(),
+                                right_src_->EmitRowCount(), estimated_rows))) {}
 
 // For Semi/Anti Hash Join: only the left side's schema and rows survive.
 ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          Plan right_src, std::vector<ColumnName> right_cols,
-                         HashJoinMode hash_mode, JoinKind kind)
+                         HashJoinMode hash_mode, JoinKind kind,
+                         std::optional<size_t> estimated_rows)
     : left_src_(std::move(left_src)),
       right_src_(std::move(right_src)),
       left_cols_(std::move(left_cols)),
@@ -157,18 +165,17 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
       output_schema_(IsSemiOrAnti(kind_)
                          ? left_src_->GetSchema()
                          : left_src_->GetSchema() + right_src_->GetSchema()),
-      stats_(IsSemiOrAnti(kind_)
-                 ? SemiAntiJoinStats(left_src_->GetStats(),
-                                     right_src_->GetStats(), kind)
-                 : OuterJoinStats(left_src_->GetStats(),
-                                  right_src_->GetStats())) {}
+      stats_(JoinStats(
+          left_src_->GetStats(), right_src_->GetStats(), kind_,
+          EstimatedJoinRowCount(kind_, left_src_->EmitRowCount(),
+                                right_src_->EmitRowCount(), estimated_rows))) {}
 
 ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          Plan right_src, std::vector<ColumnName> right_cols,
-                         JoinKind kind)
+                         JoinKind kind, std::optional<size_t> estimated_rows)
     : ProductPlan(std::move(left_src), std::move(left_cols),
                   std::move(right_src), std::move(right_cols),
-                  HashJoinMode::kInMemory, kind) {}
+                  HashJoinMode::kInMemory, kind, estimated_rows) {}
 
 bool IsSemiJoinKind(JoinKind kind) {
   return static_cast<uint8_t>(kind) == kJoinKindSemi;
@@ -218,7 +225,8 @@ JoinKind FullOuterJoinKind() {
 ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          const Table& right_tbl, const Index& idx,
                          std::vector<ColumnName> right_cols,
-                         const TableStatistics& right_ts)
+                         const TableStatistics& right_ts,
+                         std::optional<size_t> estimated_rows)
     : left_src_(std::move(left_src)),
       left_cols_(std::move(left_cols)),
       right_cols_(std::move(right_cols)),
@@ -227,8 +235,10 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
       right_ts_(&right_ts),
       hash_mode_(HashJoinMode::kInMemory),
       output_schema_(left_src_->GetSchema() + right_tbl_->GetSchema()),
-      stats_(HashJoinStats(left_src_->GetStats(), left_cols_, *right_ts_,
-                           right_cols_)) {}
+      stats_(JoinStats(
+          left_src_->GetStats(), *right_ts_, kind_,
+          EstimatedJoinRowCount(kind_, left_src_->EmitRowCount(),
+                                right_ts_->Rows(), estimated_rows))) {}
 
 // For Index Join over a relation-renamed right side: the emitted columns are
 // named by `declared_output` while key offsets still resolve physically.
@@ -236,7 +246,8 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          const Table& right_tbl, const Index& idx,
                          std::vector<ColumnName> right_cols,
                          const TableStatistics& right_ts,
-                         Schema declared_output)
+                         Schema declared_output,
+                         std::optional<size_t> estimated_rows)
     : left_src_(std::move(left_src)),
       left_cols_(std::move(left_cols)),
       right_cols_(std::move(right_cols)),
@@ -245,8 +256,10 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
       right_ts_(&right_ts),
       hash_mode_(HashJoinMode::kInMemory),
       output_schema_(std::move(declared_output)),
-      stats_(HashJoinStats(left_src_->GetStats(), left_cols_, *right_ts_,
-                           right_cols_)) {}
+      stats_(JoinStats(
+          left_src_->GetStats(), *right_ts_, kind_,
+          EstimatedJoinRowCount(kind_, left_src_->EmitRowCount(),
+                                right_ts_->Rows(), estimated_rows))) {}
 
 // For Cross Join.
 ProductPlan::ProductPlan(Plan left_src, Plan right_src)
@@ -259,7 +272,8 @@ ProductPlan::ProductPlan(Plan left_src, Plan right_src)
       output_schema_(left_src_->GetSchema() + right_src_->GetSchema()),
       stats_(CrossJoinStats(left_src_->GetStats(), right_src_->GetStats())) {}
 
-ProductPlan::ProductPlan(Plan left_src, Plan right_src, JoinKind kind)
+ProductPlan::ProductPlan(Plan left_src, Plan right_src, JoinKind kind,
+                         std::optional<size_t> estimated_rows)
     : left_src_(std::move(left_src)),
       right_src_(std::move(right_src)),
       right_tbl_(nullptr),
@@ -268,10 +282,14 @@ ProductPlan::ProductPlan(Plan left_src, Plan right_src, JoinKind kind)
       hash_mode_(HashJoinMode::kInMemory),
       kind_(kind),
       output_schema_(left_src_->GetSchema() + right_src_->GetSchema()),
-      stats_(IsOuter(kind)
-                 ? OuterJoinStats(left_src_->GetStats(), right_src_->GetStats())
-                 : CrossJoinStats(left_src_->GetStats(),
-                                  right_src_->GetStats())) {}
+      stats_(
+          IsOuter(kind)
+              ? JoinStats(left_src_->GetStats(), right_src_->GetStats(), kind_,
+                          EstimatedJoinRowCount(
+                              kind_, left_src_->EmitRowCount(),
+                              right_src_->EmitRowCount(), estimated_rows))
+              : CrossJoinStats(left_src_->GetStats(), right_src_->GetStats())) {
+}
 
 // EmitExecutor lives in the relational factory
 // (executor/relational_factory.cpp).
@@ -307,36 +325,21 @@ size_t ProductPlan::AccessRowCount() const {
   return base;
 }
 
-size_t ProductPlan::EmitRowCount() const {
-  if (IsSemiOrAnti(kind_)) {
-    // Semi: one output per matching left row; anti: any probe row may remain.
-    const size_t l = left_src_->EmitRowCount();
-    const size_t r = right_src_->EmitRowCount();
-    return IsSemiJoinKind(kind_) ? std::min(l, r) : l;
-  }
-  if (left_cols_.empty() && right_cols_.empty()) {
-    // CrossJoin.
-    return SaturatingMul(left_src_->EmitRowCount(), right_src_->EmitRowCount());
-  }
-  if (right_tbl_ != nullptr) {
-    // IndexJoin
-    return std::min(left_src_->EmitRowCount(), right_ts_->Rows());
-  }
-  if (IsOuter(kind_)) {
-    return std::max(left_src_->EmitRowCount(), right_src_->EmitRowCount());
-  }
-  return std::min(left_src_->EmitRowCount(), right_src_->EmitRowCount());
-}
+size_t ProductPlan::EmitRowCount() const { return stats_.Rows(); }
 
 bool ProductPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                               const std::vector<bool>& ascending) const {
-  // Semi/anti joins emit only probe rows while traversing the left child, so
-  // they preserve the left child's ordering property. Inner joins are not
-  // safe here because duplicate matches can interleave output rows.
+  return IsOrderedBy(expressions, ascending, {});
+}
+
+bool ProductPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending,
+    const std::vector<std::optional<bool>>& nulls_first) const {
   if (!IsSemiOrAnti(kind_)) {
     return false;
   }
-  return left_src_->IsOrderedBy(expressions, ascending);
+  return left_src_->IsOrderedBy(expressions, ascending, nulls_first);
 }
 
 void ProductPlan::Dump(std::ostream& o, int indent) const {
@@ -382,7 +385,7 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
     }
     o << "} ";
   }
-  o << " (estimated cost: " << EmitRowCount() << ")";
+  o << " (estimated rows: " << EmitRowCount() << ")";
   o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   left_src_->Dump(o, indent + 2);
   o << "\n" << Indent(static_cast<size_t>(indent) + 2);
@@ -438,7 +441,24 @@ std::string ProductPlan::ToString() const {
     }
     s += "} ";
   }
-  s += " (estimated cost: " + std::to_string(EmitRowCount()) + ")";
+  s += " (estimated rows: " + std::to_string(EmitRowCount()) + ")";
   return s;
+}
+
+bool ProductPlan::ContainsParameterSlots() const {
+  // Index-join shapes carry their right side as a raw Table (right_src_ null),
+  // so only the left subtree and the residual note can hold slots.
+  return left_src_->ContainsParameterSlots() ||
+         (right_src_ && right_src_->ContainsParameterSlots()) ||
+         ContainsParameterSlot(residual_note_);
+}
+
+bool ProductPlan::InstallParameterSlots(const std::vector<Value>& parameters,
+                                        size_t* cursor,
+                                        std::vector<Expression>* slots) {
+  return left_src_->InstallParameterSlots(parameters, cursor, slots) &&
+         (!right_src_ ||
+          right_src_->InstallParameterSlots(parameters, cursor, slots)) &&
+         SlotizeInPlace(&residual_note_, parameters, cursor, slots);
 }
 }  // namespace tinylamb

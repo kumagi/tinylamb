@@ -1,0 +1,15 @@
+-- tinylamb-griffin-test v1
+-- seed: 9473355082901233217
+-- stmt: SELECT id FROM la WHERE arr IS NULL ORDER BY id;
+-- stmt: SELECT id, e FROM la, UNNEST(la.arr) e ORDER BY id, e;
+-- stmt: CREATE TABLE la (x INT64, y INT64);
+-- stmt: SELECT x FROM la WHERE EXISTS (SELECT 1 FROM la o WHERE o.y = la.x);
+-- stmt: CREATE TABLE la (id INT64, arr ARRAY<INT64>);
+-- stmt: SELECT la.x, s.v FROM la CROSS JOIN LATERAL (SELECT la.y + 1 AS v) s;
+-- stmt: SELECT id, ARRAY_TRANSFORM(arr, x -> x * 2) FROM la ORDER BY id;
+-- stmt: SELECT x FROM la WHERE x NOT IN (SELECT y FROM la);
+-- stmt: SELECT la.x, s.v FROM la LEFT JOIN LATERAL (SELECT la.x * 2 AS v) s ON TRUE;
+-- stmt: INSERT INTO la VALUES (1, 10), (2, NULL), (3, -4);
+-- stmt: SELECT id, ARRAY_FILTER(arr, x -> y > 1) FROM la ORDER BY id;
+-- ran_select: true
+-- failure: evaluation-path mismatch

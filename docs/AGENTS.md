@@ -4,7 +4,7 @@ Read before designing, cite when changing behavior. Most binding first:
 
 - `lock_order.md` — normative lock ordering (storage + txn work must obey).
 - `recovery_invariants.md`, `wal_format.md` — ARIES invariants + on-disk WAL
-  layout (`kWalRecordVersion = 3`).
+  layout (`kWalRecordVersion = 4`).
 - `page_format.md`, `page_checksum.md`, `pax_page_format.md`,
   `value_storage.md` — on-disk formats.
 - `expression_evaluation.md` — AST/Bytecode/JIT equivalence contract.
@@ -16,6 +16,8 @@ Read before designing, cite when changing behavior. Most binding first:
   a standing ADR location.)
 - `next-actions.md` — improvement backlog. `todo.md`, `executor_todo.md`,
   `bug_audit_2026-08.md` — triage lists, check before claiming "known issue".
+  (`executor_todo.md` is partly superseded per `todo.md`'s header — cross-check
+  it against `todo.md` and the root `TODO.md` before acting.)
 - `jit_profile.md` — JIT measurements. `distributed*.md` (+
   `distributed.md` at root) — raft/membership/migration designs.
 - `design.md` — broad design notes (D3/D4/D9 cover storage/txn/WAL).

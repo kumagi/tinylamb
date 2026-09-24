@@ -978,39 +978,52 @@ bool ParallelAggregationExecutor::Next(Row* destination,
   std::vector<std::jthread> workers;
   workers.reserve(worker_count_);
   for (size_t worker = 0; worker < worker_count_; ++worker) {
-    workers.emplace_back([&, worker] {
-      // EXC-SHIM bridge: a child may still surface errors by throwing
-      // (Phase 7 removes the last throwing executors); translate them into
-      // the Status channel so no exception escapes this executor.
-      try {
-        DataChunk chunk;
-        while (!stopped.load(std::memory_order_relaxed)) {
-          size_t rows = 0;
-          {
-            std::scoped_lock input_guard(input_mutex);
-            rows = child_->NextBatch(&chunk);
-          }
-          if (rows == 0) {
-            break;
-          }
-          if (Status st = Accumulate(&partials[worker], chunk);
-              st != Status::kSuccess) {
-            stopped.store(true, std::memory_order_relaxed);
-            std::scoped_lock error_guard(error_mutex);
-            if (error == Status::kSuccess) {
-              error = st;
+    try {
+      workers.emplace_back([&, worker] {
+        // EXC-SHIM bridge: a child may still surface errors by throwing
+        // (Phase 7 removes the last throwing executors); translate them into
+        // the Status channel so no exception escapes this executor.
+        try {
+          DataChunk chunk;
+          while (!stopped.load(std::memory_order_relaxed)) {
+            size_t rows = 0;
+            {
+              std::scoped_lock input_guard(input_mutex);
+              rows = child_->NextBatch(&chunk);
             }
-            return;
+            if (rows == 0) {
+              break;
+            }
+            if (Status st = Accumulate(&partials[worker], chunk);
+                st != Status::kSuccess) {
+              stopped.store(true, std::memory_order_relaxed);
+              std::scoped_lock error_guard(error_mutex);
+              if (error == Status::kSuccess) {
+                error = st;
+              }
+              return;
+            }
+          }
+        } catch (const std::exception& ex) {
+          stopped.store(true, std::memory_order_relaxed);
+          std::scoped_lock error_guard(error_mutex);
+          if (error == Status::kSuccess) {
+            error = StatusError(StatusCode::kRuntimeError, ex.what());
           }
         }
-      } catch (const std::exception& ex) {
-        stopped.store(true, std::memory_order_relaxed);
-        std::scoped_lock error_guard(error_mutex);
-        if (error == Status::kSuccess) {
-          error = StatusError(StatusCode::kRuntimeError, ex.what());
-        }
-      }
-    });
+      });
+    } catch (const std::exception& ex) {
+      stopped.store(true, std::memory_order_relaxed);
+      std::scoped_lock error_guard(error_mutex);
+      error = StatusError(StatusCode::kRuntimeError, ex.what());
+      break;
+    } catch (...) {
+      stopped.store(true, std::memory_order_relaxed);
+      std::scoped_lock error_guard(error_mutex);
+      error = StatusError(StatusCode::kRuntimeError,
+                          "failed to start aggregation worker");
+      break;
+    }
   }
   workers.clear();
   if (error == Status::kSuccess && child_->GetStatus() != Status::kSuccess) {

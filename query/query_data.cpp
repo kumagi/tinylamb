@@ -559,6 +559,21 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   std::unordered_set<std::string> ambiguous_colum_name;
   std::vector<ColumnName> all_cols;
   std::unordered_map<std::string, size_t> relation_column_counts;
+  const auto add_sample_weight = [&](const std::string& relation) {
+    const auto sample = samples_.find(relation);
+    if (sample == samples_.end() || !sample->second.with_weight) {
+      return;
+    }
+    const std::string& name = sample->second.weight_alias;
+    all_cols.emplace_back(relation, name);
+    ++relation_column_counts[relation];
+    const std::string lower_name = ToLowerCopy(name);
+    if (!col_table_map.contains(lower_name)) {
+      col_table_map.emplace(lower_name, relation);
+    } else {
+      ambiguous_colum_name.emplace(lower_name);
+    }
+  };
 
   for (const auto& relation : from_) {
     // Lifted CTEs (M4) resolve from their leaf schemas, not the catalog:
@@ -589,6 +604,7 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
           ambiguous_colum_name.emplace(lower_name);
         }
       }
+      add_sample_weight(relation);
       continue;
     }
     const auto aliased = aliases_.find(relation);
@@ -608,6 +624,7 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
         ambiguous_colum_name.emplace(lower_name);
       }
     }
+    add_sample_weight(relation);
   }
 
   // STRUCT/PROTO field paths become explicit extraction calls before
@@ -630,6 +647,16 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
         BindFieldPaths(edge.on_condition, col_table_map, relations);
     if (mapped) {
       edge.on_condition = std::move(mapped);
+    }
+  }
+  for (auto& [relation, sample] : samples_) {
+    (void)relation;
+    for (Expression& partition : sample.partition_by) {
+      Expression mapped =
+          BindFieldPaths(partition, col_table_map, relations);
+      if (mapped) {
+        partition = std::move(mapped);
+      }
     }
   }
 
@@ -742,6 +769,17 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
         all_cols, expand_proto_value_table, &ambiguous_column_);
     if (on_status != Status::kSuccess) {
       return RecordAmbiguousColumn(on_status, ambiguous_colum_name);
+    }
+  }
+  for (auto& [relation, sample] : samples_) {
+    (void)relation;
+    for (Expression& partition : sample.partition_by) {
+      Status partition_status = ResolveExpression(
+          partition, col_table_map, ambiguous_colum_name, relations, all_cols,
+          expand_proto_value_table, &ambiguous_column_);
+      if (partition_status != Status::kSuccess) {
+        return RecordAmbiguousColumn(partition_status, ambiguous_colum_name);
+      }
     }
   }
   return where_status;

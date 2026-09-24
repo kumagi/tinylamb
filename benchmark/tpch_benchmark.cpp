@@ -688,6 +688,7 @@ bool LoadAllTables(tinylamb::Database& database, const Options& options,
 bool DatabaseFilesExist(const fs::path& base) {
   return fs::exists(base.string() + ".db") ||
          fs::exists(base.string() + ".log") ||
+         fs::exists(base.string() + ".log.meta") ||
          fs::exists(base.string() + ".last_checkpoint");
 }
 
@@ -695,6 +696,8 @@ void RemoveDatabaseFiles(const fs::path& base) {
   std::error_code ignored;
   fs::remove(base.string() + ".db", ignored);
   fs::remove(base.string() + ".log", ignored);
+  fs::remove(base.string() + ".log.meta", ignored);
+  fs::remove(base.string() + ".log.meta.tmp", ignored);
   fs::remove(base.string() + ".last_checkpoint", ignored);
 }
 

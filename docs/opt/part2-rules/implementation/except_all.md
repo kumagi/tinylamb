@@ -21,7 +21,7 @@ graph TD
   end
 ```
 
-上記例の出力は `{1, 2}` です（左入力の 1 は 2 行、右入力の 1 は 1 行存在するため、差引 1 行が出力されます。重複を潰す `except` の場合は `{2}` となります）。
+上記例の出力は `{1, 2}` です（左入力の 1 は 2 行、右入力の 1 は 1 行存在するため、差し引き 1 行が出力されます。重複を除く `except` の場合は `{2}` となります）。
 
 ## 適用条件
 
@@ -41,7 +41,7 @@ if (children.size() < 2) {
 
 `SetOperationPlan::EnforcesDistinct()` は `kExceptAll` に対して偽を返します。`plan/set_operation_plan.hpp` において重複排除フラグを偽と定義することにより、親演算子に対して重複排除保証を提供しないことが明示されます。物理実行器 `SetOperationExecutor::AppendExcept(rows, /*all=*/true)`（`executor/set_operation.cpp`）は、右入力の各行の出現頻度マップを構築し、左入力の行を走査しながら残余多重度分だけ出力行を蓄積します。
 
-仮に `kExceptAll` に対して重複排除を行う `kExcept` の物理実行器を割り当てた場合、左入力の重複行が削ぎ落とされ、クエリ結果の行数および多重度が変化します（例えば左 `{1, 1, 2}` と右 `{1}` の差において `{1, 2}` ではなく `{2}` が出力される誤謬が生じます）。したがって、多重度保存の有無に応じた規則の完全分離が意味論の厳密性に直結します。
+`kExceptAll` に重複排除を行う `kExcept` の物理実行器を割り当てると、左入力の重複行が失われ、結果の行数と多重度が変わります。例えば左 `{1, 1, 2}` と右 `{1}` の差は `{1, 2}` ですが、`kExcept` では `{2}` になります。そのため、多重度を保存する演算と重複を排除する演算には、別の実装 Rule を割り当てます。
 
 ## 実装の詳細
 
@@ -77,4 +77,4 @@ return std::vector<PlanAlternative>{
 
 - `plan/cascades_test.cpp`:
   - `CascadesTest.SetOperationValidatesArityRelationsAndDropsProperties`: 集合演算の子数バリデーションおよび上流プロパティの伝播抑制を検証します。
-  - `CascadesTest.ExceptToAntiJoinRewrite`: 反結合への書き換えが ALL なしの `kExcept` のみに限定され、`kExceptAll` が対象外であることを間接的に担保します。
+  - `CascadesTest.ExceptToAntiJoinRewrite`: 反結合への書き換えが ALL なしの `kExcept` のみに限定され、`kExceptAll` が対象外であることを間接的に保証します。

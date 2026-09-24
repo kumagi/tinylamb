@@ -45,6 +45,10 @@ class IndexOnlyScanPlan : public PlanBase {
   ~IndexOnlyScanPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& txn) const override;
+  [[nodiscard]] bool ContainsParameterSlots() const override;
+  bool InstallParameterSlots(const std::vector<Value>& parameters,
+                             size_t* cursor,
+                             std::vector<Expression>* slots) override;
 
   [[nodiscard]] const Table* ScanSource() const override { return &table_; }
   [[nodiscard]] const Index& GetIndex() const { return index_; }

@@ -5,7 +5,7 @@
 
 ## 概要
 
-論理式 `kDummyScan`（FROM 句を持たない SELECT クエリのための仮想 1 行リレーション）を、定数 1 行を出力する物理葉ノード `DummyScanPlan` として具現化する Rule です。
+論理式 `kDummyScan`（FROM 句を持たない SELECT クエリのための仮想 1 行リレーション）を、定数 1 行を出力する物理葉ノード `DummyScanPlan` として変換する Rule です。
 
 `SELECT 1 + 1` のような定数式評価クエリに対し、実テーブル走査やカタログアクセスを一切行わずに式評価エンジンへ単一タプルを供給する最小の物理実行単位を提供します。
 
@@ -82,10 +82,10 @@ return std::vector<PlanAlternative>{PlanAlternative{
 ## 関連 Rule との相互作用
 
 - `join_identity_dummy`: 結合の片辺が `DummyScan` である場合に結合演算そのものを消去する論理 Rule です。消去されずに残った単独の `DummyScan` を本 Rule が物理実装します。
-- `values`: 複数行または明示的な VALUES 句を持つ定数リレーションを具現化する兄弟 Rule です。
+- `values`: 複数行または明示的な VALUES 句を持つ定数リレーションを変換する兄弟 Rule です。
 - `constant_table`: 定数リレーションの別形態を担当する物理実装 Rule です。
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.DummyScanAndValuesHavePhysicalImplementationRules`: 手動で構築した `kDummyScan` 式が正しく `DummyScanPlan` に具現化され、表示名に "DummyScan" が現れることを検証。
+- `plan/cascades_test.cpp` の `CascadesTest.DummyScanAndValuesHavePhysicalImplementationRules`: 手動で構築した `kDummyScan` 式が正しく `DummyScanPlan` に変換され、表示名に "DummyScan" が現れることを検証。
 - `plan/optimizer_test.cpp` の `OptimizerTest.OptimizeWithoutFromUsesDummyScanForConstantProjection`: FROM 句のない定数射影クエリが `DummyScanPlan` を起点として計画されることを検証。

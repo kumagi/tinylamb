@@ -30,6 +30,8 @@
 
 #include "common/constants.hpp"
 #include "common/digest.hpp"
+#include "common/math_utils.hpp"
+#include "common/regex_guard.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
@@ -102,6 +104,10 @@ bool DistinctValueEqual::operator()(const Value& left,
 }
 
 Value CanonicalDistinctValue(const Value& value) {
+  if (value.type == ValueType::kVarChar && value.IsCaseInsensitive()) {
+    return Value(FoldCase(value.value.varchar_value))
+        .WithCollation(value.Collation());
+  }
   if (value.type == ValueType::kDouble) {
     const double d = value.value.double_value;
     if (std::isnan(d)) {
@@ -117,8 +123,16 @@ Value CanonicalDistinctValue(const Value& value) {
 namespace {
 
 bool IdentifierEquals(std::string_view left, std::string_view right) {
-  return left.size() == right.size() &&
-         std::equal(left.begin(), left.end(), right.begin(),
+  if (left.size() != right.size()) {
+    return false;
+  }
+  if (left == right) {
+    // Same-case match: skip per-character locale folding.  Column-name
+    // resolution runs per row in interpreted expression evaluation, and the
+    // tolower loop dominated Q9 profiles (~3% of all instructions).
+    return true;
+  }
+  return std::equal(left.begin(), left.end(), right.begin(),
                     [](char lhs, char rhs) {
                       return std::tolower(static_cast<unsigned char>(lhs)) ==
                              std::tolower(static_cast<unsigned char>(rhs));
@@ -876,9 +890,10 @@ int ThreeValuedEqualsImpl(const Value& left, const Value& right) {
     }
     return saw_unknown ? -1 : 1;
   }
-  if (left.type != right.type) {
-    return 0;
-  }
+  // Mixed types take the canonical `=` path: numeric promotion decides
+  // INT64-vs-DOUBLE (1 IN (SELECT 1.0) is TRUE, mirroring `1 = 1.0`), and
+  // genuinely incomparable operands error, which maps to UNKNOWN here —
+  // never to a decisive FALSE.
   {
     StatusOr<Value> eq = TryBinary(BinaryOperation::kEquals, left, right);
     if (!eq.HasValue()) {
@@ -902,44 +917,49 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
   // (`outer_table.a.repeated_field`) instead of splitting it into
   // qualifier/name components.  Resolve the longest physical column prefix
   // first so nested correlated proto/STRUCT fields bind to the right scope.
-  std::string full_name = name.schema;
-  if (!full_name.empty() && !name.name.empty()) {
-    full_name += ".";
-  }
-  full_name += name.name;
-  const std::vector<std::string> full_segments = SplitDottedName(full_name);
-  if (full_segments.size() >= 2) {
-    for (const Scope* current = &scope; current != nullptr;
-         current = current->outer) {
-      if (current->row == nullptr || current->schema == nullptr) {
-        continue;
-      }
-      for (size_t column_index = 0;
-           column_index < current->schema->ColumnCount(); ++column_index) {
-        const ColumnName& candidate =
-            current->schema->GetColumn(column_index).Name();
-        std::vector<std::string> base_segments;
-        if (!candidate.schema.empty()) {
-          base_segments = SplitDottedName(candidate.schema);
-        }
-        for (std::string part : SplitDottedName(candidate.name)) {
-          base_segments.push_back(std::move(part));
-        }
-        if (base_segments.empty() ||
-            full_segments.size() <= base_segments.size() ||
-            !std::equal(base_segments.begin(), base_segments.end(),
-                        full_segments.begin(),
-                        [](const std::string& left, const std::string& right) {
-                          return IdentifierEquals(left, right);
-                        })) {
+  const bool has_nested_path = name.schema.find('.') != std::string::npos ||
+                               name.name.find('.') != std::string::npos;
+  if (has_nested_path) {
+    std::string full_name = name.schema;
+    if (!full_name.empty() && !name.name.empty()) {
+      full_name += ".";
+    }
+    full_name += name.name;
+    const std::vector<std::string> full_segments = SplitDottedName(full_name);
+    if (full_segments.size() >= 2) {
+      for (const Scope* current = &scope; current != nullptr;
+           current = current->outer) {
+        if (current->row == nullptr || current->schema == nullptr) {
           continue;
         }
-        return TryResolveFieldPath(
-            (*current->row)[column_index],
-            std::vector<std::string>(
-                full_segments.begin() +
-                    static_cast<ptrdiff_t>(base_segments.size()),
-                full_segments.end()));
+        for (size_t column_index = 0;
+             column_index < current->schema->ColumnCount(); ++column_index) {
+          const ColumnName& candidate =
+              current->schema->GetColumn(column_index).Name();
+          std::vector<std::string> base_segments;
+          if (!candidate.schema.empty()) {
+            base_segments = SplitDottedName(candidate.schema);
+          }
+          for (std::string part : SplitDottedName(candidate.name)) {
+            base_segments.push_back(std::move(part));
+          }
+          if (base_segments.empty() ||
+              full_segments.size() <= base_segments.size() ||
+              !std::equal(
+                  base_segments.begin(), base_segments.end(),
+                  full_segments.begin(),
+                  [](const std::string& left, const std::string& right) {
+                    return IdentifierEquals(left, right);
+                  })) {
+            continue;
+          }
+          return TryResolveFieldPath(
+              (*current->row)[column_index],
+              std::vector<std::string>(
+                  full_segments.begin() +
+                      static_cast<ptrdiff_t>(base_segments.size()),
+                  full_segments.end()));
+        }
       }
     }
   }
@@ -1437,6 +1457,8 @@ bool ContainsAggregate(  // NOLINT(misc-no-recursion)
         }
       }
       return false;
+    case TypeTag::kCastExp:
+      return ContainsAggregate(expression->AsCastExpression().Child());
     case TypeTag::kArrayExp:
       return std::ranges::any_of(
           expression->AsArrayExpression().Elements(),
@@ -1481,22 +1503,62 @@ void CollectAggregates(  // NOLINT(misc-no-recursion)
   }
 }
 
-AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate)
-    : expression(aggregate),
-      distinct(aggregate->Distinct() ? std::make_unique<DistinctValueSet>()
-                                     : nullptr) {
+AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
+                                           const Schema* input_schema)
+    : expression(aggregate), distinct_mode_(aggregate->Distinct()) {
+  // The DISTINCT hash set is allocated lazily (EnsureDistinctSet): INT64/DATE
+  // distinct tracking never needs it, and per-group allocation dominated
+  // multi-million-group COUNT(DISTINCT) builds.
+  // ARRAY_AGG over a column whose declared type is known keeps that type
+  // even when every input element is NULL; InferAggregateArrayElementType
+  // only covers literal/CAST arguments, so plain column references arrive
+  // here without a static type.
+  resolved_element_type_ = aggregate->ArrayElementSqlType();
+  if (resolved_element_type_.empty() && input_schema != nullptr &&
+      aggregate->GetType() == AggregationType::kArrayAgg &&
+      aggregate->Child() != nullptr &&
+      aggregate->Child()->Type() == TypeTag::kColumnValue) {
+    const int offset = input_schema->Offset(
+        aggregate->Child()->AsColumnValue().GetColumnName());
+    if (offset >= 0) {
+      const Column& column =
+          input_schema->GetColumn(static_cast<size_t>(offset));
+      resolved_element_type_ = ElementSqlTypeName(column.Type());
+      if (column.Type() == ValueType::kInt64 && column.IsUnsigned()) {
+        resolved_element_type_ = "UINT64";
+      }
+    }
+  }
   if (aggregate->GetType() == AggregationType::kSum &&
       aggregate->Child()->Type() == TypeTag::kColumnValue) {
-    std::string name = aggregate->Child()->AsColumnValue().GetColumnName().name;
-    std::ranges::transform(name, name.begin(), [](unsigned char c) {
-      return static_cast<char>(std::tolower(c));
-    });
+    // Runs once per new group, so keep it allocation-free for ordinary
+    // column-name lengths: lowercase into a stack buffer instead of a
+    // heap std::string.
+    const std::string& original =
+        aggregate->Child()->AsColumnValue().GetColumnName().name;
+    std::array<char, 64> lowered{};
+    std::string heap_lowered;
+    std::string_view name;
+    if (original.size() < sizeof(lowered)) {
+      for (size_t i = 0; i < original.size(); ++i) {
+        lowered[i] = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(original[i])));
+      }
+      lowered[original.size()] = '\0';
+      name = std::string_view(lowered.data(), original.size());
+    } else {
+      heap_lowered.resize(original.size());
+      std::ranges::transform(
+          original, heap_lowered.begin(),
+          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      name = heap_lowered;
+    }
     // DISTINCT expressions are sometimes rebound through a UNION schema
     // whose declared unsigned type is unavailable here; their runtime
     // values are handled by the deferred UINT64_MAX detector below.  Keep
     // the name-based fast classification for ordinary table columns.
     sum_is_uint64 =
-        !aggregate->Distinct() && name.find("uint64") != std::string::npos;
+        !aggregate->Distinct() && name.find("uint64") != std::string_view::npos;
     // The compliance overflow UNION exposes its anonymous value as `x`.
     // Restrict this heuristic to that genuinely untyped shape so a signed
     // column such as int64_val containing -1 is never reinterpreted as an
@@ -1510,6 +1572,12 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate)
   }
 }
 
+DistinctValueSet& AggregateAccumulator::EnsureDistinctSet() {
+  if (distinct == nullptr) {
+    distinct = std::make_unique<DistinctValueSet>();
+  }
+  return *distinct;
+}
 namespace {
 
 // Forward declarations for helpers defined further below (sketch codec and
@@ -1589,10 +1657,9 @@ Status AggregateAccumulator::TryApplyCore(
     }
     return Status::kSuccess;
   }
-  // ARRAY_AGG keeps NULL elements (the compliance corpus requires them);
-  // DISTINCT collapses repeated NULLs into a single element.
-  if (core_type == AggregationType::kArrayAgg && value.IsNull()) {
-    if (!distinct || !array_saw_null_) {
+  if (core_type == AggregationType::kArrayAgg && value.IsNull() &&
+      !expression->IgnoreNulls()) {
+    if (!distinct_mode_ || !array_saw_null_) {
       array_saw_null_ = true;
       array_values_.push_back(value);
     }
@@ -1601,23 +1668,14 @@ Status AggregateAccumulator::TryApplyCore(
   if (value.IsNull()) {
     return Status::kSuccess;
   }
-  if (distinct) {
+  if (distinct_mode_) {
     if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
-      if (!distinct_ints) {
-        distinct_ints = std::make_unique<std::unordered_set<int64_t>>();
-        distinct_ints->reserve(distinct->size() + 8);
-        for (const Value& seen : *distinct) {
-          if (seen.type == ValueType::kInt64 || seen.type == ValueType::kDate) {
-            distinct_ints->insert(seen.value.int_value);
-          }
-        }
-        // Keep `distinct`: it still tracks non-integer values seen so far,
-        // so mixed-type COUNT(DISTINCT ...) cannot double count.
-      }
-      if (!distinct_ints->insert(value.value.int_value).second) {
+      if (!InsertDistinctInt(value.value.int_value)) {
         return Status::kSuccess;
       }
-    } else if (!distinct->insert(CanonicalDistinctValue(value)).second) {
+    } else if (!EnsureDistinctSet()
+                    .insert(CanonicalDistinctValue(value))
+                    .second) {
       return Status::kSuccess;
     }
   }
@@ -2554,6 +2612,113 @@ Status AggregateAccumulator::Add(AggregateInput input) {
   return Status::kSuccess;
 }
 
+size_t AggregateAccumulator::DistinctIntCount() const {
+  return distinct_ints != nullptr ? distinct_ints->size()
+                                  : inline_distinct_int_count;
+}
+
+bool AggregateAccumulator::InsertDistinctInt(int64_t raw) {
+  if (distinct_ints != nullptr) {
+    return distinct_ints->insert(raw).second;
+  }
+  for (size_t i = 0; i < inline_distinct_int_count; ++i) {
+    if (inline_distinct_ints[i] == raw) {
+      return false;
+    }
+  }
+  if (inline_distinct_int_count < kInlineDistinctIntCapacity) {
+    inline_distinct_ints[inline_distinct_int_count++] = raw;
+    return true;
+  }
+  distinct_ints = std::make_unique<std::unordered_set<int64_t>>();
+  distinct_ints->reserve(kInlineDistinctIntCapacity * 2);
+  distinct_ints->insert(inline_distinct_ints.begin(),
+                        inline_distinct_ints.end());
+  inline_distinct_int_count = 0;
+  return distinct_ints->insert(raw).second;
+}
+
+bool AggregateAccumulator::CanMerge() const {
+  return buffer_ == nullptr && !expression->NeedsGroupContext() &&
+         (expression->GetType() == AggregationType::kCount ||
+          expression->GetType() == AggregationType::kSum ||
+          expression->GetType() == AggregationType::kAvg ||
+          expression->GetType() == AggregationType::kMin ||
+          expression->GetType() == AggregationType::kMax) &&
+         // COUNT(DISTINCT) merges by set union below; every other DISTINCT
+         // aggregate has no exact partial merge.
+         (!expression->Distinct() ||
+          expression->GetType() == AggregationType::kCount);
+}
+
+Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
+  const AggregationType type = expression->GetType();
+  if (type == AggregationType::kCount) {
+    if (expression->Distinct()) {
+      // Set-union merge: COUNT(DISTINCT) partials overlap, so partial counts
+      // must never be added.  Int64/date values live in the int state and
+      // everything else in the canonical Value set; the merged count is the
+      // merged-set size, exactly like the serial Add path kept it.
+      if (other.distinct != nullptr) {
+        EnsureDistinctSet().insert(other.distinct->begin(),
+                                   other.distinct->end());
+      }
+      if (other.distinct_ints != nullptr) {
+        for (const int64_t raw : *other.distinct_ints) {
+          static_cast<void>(InsertDistinctInt(raw));
+        }
+      }
+      for (size_t i = 0; i < other.inline_distinct_int_count; ++i) {
+        static_cast<void>(InsertDistinctInt(other.inline_distinct_ints[i]));
+      }
+      count = static_cast<int64_t>(
+          DistinctIntCount() + (distinct != nullptr ? distinct->size() : 0));
+      return Status::kSuccess;
+    }
+    count += other.count;
+    return Status::kSuccess;
+  }
+  if (type == AggregationType::kSum) {
+    count += other.count;
+    if (sum_is_uint64 || other.sum_is_uint64) {
+      sum_is_uint64 = true;
+      if (uint_total >
+          std::numeric_limits<uint64_t>::max() - other.uint_total) {
+        return StatusError(StatusCode::kIsInfinity, "uint64 overflow in SUM");
+      }
+      uint_total += other.uint_total;
+    } else {
+      int64_t updated = 0;
+      if (__builtin_add_overflow(int_total, other.int_total, &updated)) {
+        return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+      }
+      int_total = updated;
+    }
+    total += other.total;
+    total_is_double = total_is_double || other.total_is_double;
+    sum_saw_infinite_input_ =
+        sum_saw_infinite_input_ || other.sum_saw_infinite_input_;
+    return Status::kSuccess;
+  }
+  if (type == AggregationType::kAvg) {
+    count += other.count;
+    total += other.total;
+    return Status::kSuccess;
+  }
+  saw_nan_ = saw_nan_ || other.saw_nan_;
+  if (extreme.IsNull()) {
+    extreme = other.extreme;
+  } else if (!other.extreme.IsNull()) {
+    const bool other_better = type == AggregationType::kMin
+                                  ? other.extreme < extreme
+                                  : extreme < other.extreme;
+    if (other_better) {
+      extreme = other.extreme;
+    }
+  }
+  return Status::kSuccess;
+}
+
 Status AggregateAccumulator::Add(const Value& value) {
   if (IsDone()) {
     return Status::kSuccess;
@@ -2713,8 +2878,25 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         return Value();
       }
       // Prefer the statically inferred element type (BOOL/INT32/... are
-      // indistinguishable from INT64 in runtime values).
-      std::string element_type = expression->ArrayElementSqlType();
+      // indistinguishable from INT64 in runtime values); the constructor
+      // resolved plain column references against the input schema.
+      // VARCHAR columns back both STRING and TIMESTAMP (the engine has no
+      // dedicated TIMESTAMP value type), so a schema-resolved STRING is
+      // still upgraded when the buffered values carry the canonical
+      // zoned-timestamp shape; without this the schema resolution turns
+      // every ARRAY_AGG over TIMESTAMP into ARRAY<STRING>.
+      std::string element_type = resolved_element_type_;
+      if (element_type == "STRING") {
+        for (const Value& value : array_values_) {
+          if (!value.IsNull()) {
+            if (value.type == ValueType::kVarChar &&
+                LooksLikeZonedTimestampText(value.value.varchar_value)) {
+              element_type = "TIMESTAMP";
+            }
+            break;
+          }
+        }
+      }
       if (element_type.empty()) {
         for (const Value& value : array_values_) {
           if (!value.IsNull()) {
@@ -6330,11 +6512,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    std::string s = raw_str(arguments[0]);
-    for (char& c : s) {
-      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-    return Value(std::move(s));
+    return Value(UnicodeUpper(raw_str(arguments[0])));
   }
   if (name == "lower") {
     if (arguments.size() != 1) {
@@ -6344,11 +6522,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    std::string s = raw_str(arguments[0]);
-    for (char& c : s) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return Value(std::move(s));
+    return Value(UnicodeLower(raw_str(arguments[0])));
   }
   if (name == "trim") {
     if (arguments.empty() || arguments.size() > 2) {
@@ -6950,7 +7124,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                              ? arguments[0].value.int_value
                              : 0;
     std::string res;
-    if (code < 0 || code > 0x10FFFF) {
+    if (code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
       return StatusError(StatusCode::kIsInfinity, "CHR argument out of range");
     }
     if (code <= 0x7F) {
@@ -7050,29 +7224,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return Value();
     }
-    std::string s = raw_str(arguments[0]);
     const bool has_delim = arguments.size() == 2;
+    const std::string s = raw_str(arguments[0]);
     const std::string delims = has_delim ? raw_str(arguments[1]) : "";
-    auto is_delim = [&](char c) {
-      if (has_delim) {
-        return delims.find(c) != std::string::npos;
-      }
-      return !std::isalnum(static_cast<unsigned char>(c));
-    };
-    bool new_word = true;
-    for (char& c : s) {
-      if (!is_delim(c)) {
-        if (new_word) {
-          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-          new_word = false;
-        } else {
-          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-      } else {
-        new_word = true;
-      }
-    }
-    return Value(std::move(s));
+    return Value(UnicodeInitcap(s, delims, has_delim));
   }
 
   if (name == "regexp_contains") {
@@ -7086,7 +7241,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string s = raw_str(arguments[0]);
     const std::string pat = raw_str(arguments[1]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       return Value(std::regex_search(s, re));
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -7105,7 +7260,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string s = raw_str(arguments[0]);
     const std::string pat = raw_str(arguments[1]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       return Value(std::regex_match(s, re));
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -7163,7 +7318,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                                   ? static_cast<size_t>(pos_arg - 1)
                                   : offsets[static_cast<size_t>(pos_arg - 1)];
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       std::string search_str = s.substr(byte_start);
       std::sregex_iterator it(search_str.begin(), search_str.end(), re);
       std::sregex_iterator end;
@@ -7222,7 +7377,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string s = raw_str(arguments[0]);
     const std::string pat = raw_str(arguments[1]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       std::vector<Value> results;
       std::sregex_iterator it(s.begin(), s.end(), re);
       std::sregex_iterator end;
@@ -7262,7 +7417,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string s = raw_str(arguments[0]);
     const std::string pat = raw_str(arguments[1]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       std::smatch match;
       if (std::regex_search(s, match, re)) {
         if (match.size() > 1) {
@@ -7290,7 +7445,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string pat = raw_str(arguments[1]);
     const std::string rep = raw_str(arguments[2]);
     try {
-      const std::regex re(pat);
+      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       return Value(std::regex_replace(s, re, rep));
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -7518,9 +7673,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
     std::vector<std::string> src_chars;
     src_chars.reserve(src_len);
+    std::unordered_set<std::string> source_seen;
+    source_seen.reserve(src_len);
     for (size_t i = 0; i < src_len; ++i) {
-      src_chars.push_back(
-          src.substr(src_offsets[i], src_offsets[i + 1] - src_offsets[i]));
+      std::string source_char =
+          src.substr(src_offsets[i], src_offsets[i + 1] - src_offsets[i]);
+      if (!source_seen.insert(source_char).second) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "TRANSLATE source contains duplicate characters");
+      }
+      src_chars.push_back(std::move(source_char));
     }
     std::vector<std::string> dst_chars;
     dst_chars.reserve(dst_len);
@@ -7722,8 +7884,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       return false;
     };
-    std::function<bool(std::string_view, size_t&, JVal&)> parse_j =
-        [&](std::string_view s, size_t& pos, JVal& out) -> bool {
+    std::function<bool(std::string_view, size_t&, JVal&, size_t)> parse_j =
+        [&](std::string_view s, size_t& pos, JVal& out, size_t depth) -> bool {
+      // Bound recursion: a deeply nested document would otherwise blow the
+      // stack (Bug 68; mirrored in rewrite.cpp's ParseJsonSimple).
+      constexpr size_t kMaxJsonDepth = 512;
+      if (depth > kMaxJsonDepth) {
+        return false;
+      }
       skip_ws(s, pos);
       if (pos >= s.size()) {
         return false;
@@ -7758,7 +7926,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           }
           ++pos;
           JVal v;
-          if (!parse_j(s, pos, v)) {
+          if (!parse_j(s, pos, v, depth + 1)) {
             return false;
           }
           out.obj.emplace_back(std::move(k),
@@ -7787,7 +7955,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         while (pos < s.size()) {
           JVal elem;
-          if (!parse_j(s, pos, elem)) {
+          if (!parse_j(s, pos, elem, depth + 1)) {
             return false;
           }
           out.arr.push_back(std::make_unique<JVal>(std::move(elem)));
@@ -7838,7 +8006,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
     size_t p = 0;
     JVal root;
-    if (!parse_j(json_str, p, root)) {
+    if (!parse_j(json_str, p, root, 0)) {
       return Value();
     }
     const JVal* cur = &root;
@@ -8339,7 +8507,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "CBRT"));
-    return Value(std::cbrt(v));
+    return Value(AccurateCbrt(v));
   }
   if (name == "greatest" || name == "least") {
     if (arguments.empty()) {
@@ -8961,10 +9129,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           if (arg.IsNull()) {
             formatted_item = "NULL";
           } else if (arg.type == ValueType::kDouble) {
-            formatted_item = std::to_string(arg.value.double_value);
+            formatted_item = FormatFloatingForPrintf(arg.value.double_value,
+                                                     spec, precision);
           } else if (arg.type == ValueType::kInt64) {
-            formatted_item =
-                std::to_string(static_cast<double>(arg.value.int_value));
+            formatted_item = FormatFloatingForPrintf(
+                static_cast<double>(arg.value.int_value), spec, precision);
           } else {
             return StatusError(
                 StatusCode::kInvalidArgument,
@@ -9105,6 +9274,86 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          "ARRAY_LENGTH requires an array");
     }
     return Value(static_cast<int64_t>(array.ArrayElements().size()));
+  }
+
+  if (name == "array_to_string") {
+    if (arguments.size() != 2 && arguments.size() != 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ARRAY_TO_STRING requires 2 or 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) {
+      return Value();
+    }
+    if (!arguments[0].IsArray()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ARRAY_TO_STRING requires an array");
+    }
+    const std::string delimiter = raw_str(arguments[1]);
+    const bool has_null_text = arguments.size() == 3 && !arguments[2].IsNull();
+    const std::string null_text =
+        has_null_text ? raw_str(arguments[2]) : std::string();
+    // Element text mirrors the AST evaluator: CAST-to-STRING rendering,
+    // strings unquoted; nested arrays have no text form and error.
+    const auto element_text =
+        [](const Value& element) -> StatusOr<std::string> {
+      switch (element.type) {
+        case ValueType::kInt64:
+          return element.IsUnsigned() ? std::to_string(static_cast<uint64_t>(
+                                            element.value.int_value))
+                                      : std::to_string(element.value.int_value);
+        case ValueType::kDouble: {
+          if (std::isnan(element.value.double_value)) {
+            return std::string("nan");
+          }
+          if (std::isinf(element.value.double_value)) {
+            return std::string(element.value.double_value > 0 ? "inf" : "-inf");
+          }
+          std::array<char, 64> buffer{};
+          const auto [ptr, ec] =
+              std::to_chars(buffer.data(), buffer.data() + buffer.size(),
+                            element.value.double_value);
+          if (ec != std::errc()) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "cannot format DOUBLE array element");
+          }
+          return std::string(buffer.data(),
+                             static_cast<size_t>(ptr - buffer.data()));
+        }
+        case ValueType::kVarChar:
+          return std::string(element.value.varchar_value);
+        case ValueType::kDate:
+          return FormatDateDays(element.value.int_value);
+        case ValueType::kArray:
+          return StatusError(StatusCode::kInvalidArgument,
+                             "ARRAY_TO_STRING cannot format nested arrays");
+        default:
+          break;
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         "cannot format array element");
+    };
+    std::string out;
+    bool first = true;
+    for (const Value& element : arguments[0].ArrayElements()) {
+      if (element.IsNull()) {
+        if (!has_null_text) {
+          continue;
+        }
+        if (!first) {
+          out += delimiter;
+        }
+        out += null_text;
+        first = false;
+        continue;
+      }
+      ASSIGN_OR_RETURN(std::string, text, element_text(element));
+      if (!first) {
+        out += delimiter;
+      }
+      out += text;
+      first = false;
+    }
+    return Value(std::move(out));
   }
 
   // OFFSET(n) / ORDINAL(n): index accessors; both yield their argument with
@@ -10366,7 +10615,9 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           ASSIGN_OR_RETURN(
               Value, eq,
               (TryBinary(BinaryOperation::kEquals, test, candidate)));
-          if (!eq.IsNull() && eq.Truthy()) {
+          if (eq.IsNull()) {
+            saw_null = true;
+          } else if (eq.Truthy()) {
             found = true;
           }
         }
@@ -10505,6 +10756,12 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       }
       auto& row_source = const_cast<Relation&>(*relation);
       const bool as_struct = value.Query()->AsStruct();
+      if (!as_struct && value.Test() && value.Mode() == QuantifierMode::kIn &&
+          relation->schema.ColumnCount() != 1) {
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "Subquery of type IN must have only one output column");
+      }
       // Declared select-list names feed struct field keys; without them
       // SELECT AS STRUCT rows would carry positional fN keys.
       const Schema& subquery_schema = relation->schema;
@@ -10536,8 +10793,18 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
         };
         bool found = false;
         bool saw_null = test.IsNull();
+        // True when the membership hash produced a final verdict (hit, or
+        // miss with the build-time NULL flag); blocks the per-miss rescan.
+        bool hash_decided = false;
         const bool structural_members =
             LooksLikeStructJson(test) || test.type == ValueType::kArray;
+        // Hash membership is exact only when the probe sits in the build's
+        // comparison domain (same type tag, same unsigned tag); a mixed
+        // domain must take the rescan path where `=` promotion decides.
+        auto same_domain = [](const Value& probe, const Value& stored) {
+          return probe.type == stored.type &&
+                 probe.IsUnsigned() == stored.IsUnsigned();
+        };
         if (relation->TotalRows() == 0) {
           // An empty candidate set is decisive: `x IN ()` is FALSE and
           // `x NOT IN ()` is TRUE even when x itself is NULL (no comparison
@@ -10571,6 +10838,13 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
               if (projected.IsNull()) {
                 cached->second.contains_null = true;
               } else {
+                if (!cached->second.has_domain) {
+                  cached->second.has_domain = true;
+                  cached->second.domain_sample = projected;
+                } else if (!same_domain(projected,
+                                        cached->second.domain_sample)) {
+                  cached->second.uniform_domain = false;
+                }
                 cached->second.values.insert(projected);
               }
             });
@@ -10583,14 +10857,36 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
             }
             ++context.execution_runtime()->uncorrelated_hash_builds;
           }
-          ++context.execution_runtime()->uncorrelated_hash_probes;
-          found = !test.IsNull() && cached->second.values.contains(test);
-          if (!found && !test.IsNull()) {
-            // The hash build recorded NULL keys once; a miss over a
-            // null-containing build is UNKNOWN without a rescan.
-            saw_null = cached->second.contains_null;
+          // Mixed numeric domains (INT64 test over a DOUBLE build and the
+          // reverse) are legal SQL whose equality promotes to DOUBLE; the
+          // type-strict hash would wrongly answer FALSE (or UNSIGNED-vs-
+          // SIGNED would answer from raw bit patterns).  A differing
+          // collation would likewise let `=` semantics (case folding)
+          // disagree with the type-strict hash.  Those probes defer to the
+          // canonical rescan path below.
+          // When the hash IS exact, its verdict is final: a miss over a
+          // null-containing build is UNKNOWN (contains_null was recorded at
+          // build time) and a miss over a NULL-free build is FALSE.  Neither
+          // may trigger the rescan -- Q22-sized builds make a per-miss rescan
+          // quadratic (filter_ms 0.8s -> 246s at SF=1).
+          const bool hash_is_exact =
+              cached->second.uniform_domain &&
+              (test.IsNull() ||
+               (cached->second.has_domain &&
+                same_domain(test, cached->second.domain_sample) &&
+                test.Collation() == cached->second.domain_sample.Collation()));
+          if (hash_is_exact) {
+            ++context.execution_runtime()->uncorrelated_hash_probes;
+            found = !test.IsNull() && cached->second.values.contains(test);
+            if (!found && !test.IsNull()) {
+              // The hash build recorded NULL keys once; a miss over a
+              // null-containing build is UNKNOWN without a rescan.
+              saw_null = cached->second.contains_null;
+            }
+            hash_decided = true;
           }
-        } else {
+        }
+        if (!hash_decided && relation->TotalRows() != 0) {
           Status collation_error = Status::kSuccess;
           row_source.ForEachRow([&](const Row& row) {
             if (found || row.values_.empty() ||
@@ -10694,7 +10990,9 @@ Schema QualifySchema(const Schema& schema, std::string_view qualifier) {
         (col_name.starts_with("$expr") && schema.ColumnCount() == 1)) {
       col_name = std::string(qualifier);
     }
-    columns.emplace_back(ColumnName(qualifier, col_name), column.Type());
+    Column qualified(ColumnName(qualifier, col_name), column.Type());
+    qualified.SetUnsigned(column.IsUnsigned());
+    columns.push_back(std::move(qualified));
   }
   return {"", std::move(columns)};
 }
@@ -10737,6 +11035,15 @@ void CollectStatementColumns(  // NOLINT(misc-no-recursion)
     // UNNEST arguments may reference sibling sources of the same FROM clause
     // or outer scopes; their columns must survive projection pruning.
     CollectExpressionColumns(source.unnest, columns);
+    if (source.sample) {
+      CollectExpressionColumns(source.sample->size, columns);
+      if (source.sample->repeatable_seed) {
+        CollectExpressionColumns(*source.sample->repeatable_seed, columns);
+      }
+      for (const Expression& expression : source.sample->partition_by) {
+        CollectExpressionColumns(expression, columns);
+      }
+    }
     if (source.query) {
       CollectStatementColumns(*source.query, columns);
     }

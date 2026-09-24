@@ -64,14 +64,14 @@ IEEE 754 規格および AST 参照実装において、NaN を含む順序比�
 - 変換前: $\neg(\text{NaN} < y) \to \neg(\text{FALSE}) \to \text{TRUE}$
 - 変換後: $\text{NaN} \ge y \to \text{FALSE}$
 
-このように、元の式ではタプルを通過（$\text{TRUE}$）させるべき行が、反転後の式では排除（$\text{FALSE}$）され、クエリ結果が破壊されます。
+この例では、元の式で通過する（$\text{TRUE}$ となる）行が、反転後の式では排除されます。そのため、変換前後でクエリ結果が一致しません。
 
 一方、等号および不等号（`=` / `!=`）においては、$\text{NaN} = y$ は `FALSE`、$\text{NaN} \ne y$ は `TRUE` となるため、$\neg(\text{NaN} = y) \equiv (\text{NaN} \ne y)$ の同値関係が維持されます。したがって、ガード条件は順序比較にのみ課されます。
 
 ### 3. スキーマ非依存リライタの残存課題と外部安全弁
 式書き換えエンジンはスキーマ情報を持たない純粋構文木上で動作するため、スキーマを参照しなければ型を決定できない列参照（例: `CAST` やリテラルを伴わない裸の列参照 `col_double`）は `StaticallyDouble` を通過してしまいます。
 
-この残存ギャップ（documented residual gap）を塞ぐため、スキーマ情報を保持する上位レイヤ（バイトコードコンパイラやスキャン述語最適化）向けに、式木内の順序比較ノードを検査する `ContainsNotOfOrderedDoubleComparison` および本 Rule を安全に除外したルールセット `NotComparisonFreeRules()` が提供されています。
+この制約だけでは、スキーマを見なければ DOUBLE 型だと分からない列参照を判定できません。そのため、スキーマ情報を持つ上位層では `ContainsNotOfOrderedDoubleComparison` で式木内の順序比較を検査します。また、本 Rule を除いた Rule セット `NotComparisonFreeRules()` も提供しています。
 
 ```cpp
 bool ContainsNotOfOrderedDoubleComparison(const Expression& expression,

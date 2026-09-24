@@ -626,8 +626,28 @@ TEST_F(LSMTreeTest, ReopenRejectsMalformedRunFile) {
   // The malformed file was quarantined IN THE RUN DIRECTORY (the rename
   // destination must be an absolute path; a bare "name.bad" would land in the
   // process CWD instead).
-  EXPECT_TRUE(std::filesystem::exists(junk.string() + ".bad")) << true;
+  EXPECT_TRUE(std::filesystem::exists(junk.string() + ".bad"));
   EXPECT_FALSE(std::filesystem::exists(junk));
+}
+
+TEST_F(LSMTreeTest, ReopenKeepsWalSegmentMetadataSidecar) {
+  // The segmented WAL writes a blob.db.meta geometry sidecar next to the
+  // runs (Logger::SegmentMetadataPath, created when BlobFile opens its WAL).
+  // RestoreRuns must leave it alone: quarantining it while the WAL is live
+  // would corrupt the segment geometry and fail the next Logger::Create.
+  t_->Write("keep", "me");
+  t_->Sync();
+  const std::filesystem::path meta =
+      std::filesystem::path(dir_path_) / "blob.db.meta";
+  ASSERT_TRUE(std::filesystem::exists(meta)) << "test premise: the WAL wrote "
+                                                "its geometry sidecar";
+  t_.reset();
+
+  ASSERT_NO_THROW(t_ = LSMTree::Create(dir_path_).MoveValue());
+  ASSERT_SUCCESS_AND_EQ(t_->Read("keep"), std::string("me"));
+  // The sidecar survived untouched: no quarantine rename, no deletion.
+  EXPECT_TRUE(std::filesystem::exists(meta));
+  EXPECT_FALSE(std::filesystem::exists(meta.string() + ".bad"));
 }
 
 TEST_F(LSMTreeTest, ReopenQuarantinesIncompleteRunFile) {
@@ -640,7 +660,8 @@ TEST_F(LSMTreeTest, ReopenQuarantinesIncompleteRunFile) {
   // Find the single run file and truncate it inside its entry area.
   std::filesystem::path run;
   for (const auto& e : std::filesystem::directory_iterator(dir_path_)) {
-    if (e.path().filename() == "blob.db") {
+    if (e.path().filename() == "blob.db" ||
+        e.path().string().ends_with(".meta")) {
       continue;
     }
     run = e.path();

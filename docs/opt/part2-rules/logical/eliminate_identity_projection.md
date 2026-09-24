@@ -7,7 +7,7 @@
 
 `eliminate_identity_projection` は、target list が入力スキーマの列参照をそのまま受け流すだけの恒等射影（Identity Projection）演算子 `Projection(X)` を除去することを企図した論理 Rule です。
 
-現行の tinylamb 実装では、射影の除去が出力スキーマの列名（エイリアス）を変更し、上位の結合述語やソート処理が参照する列名を破壊するリスクがあるため、本 Rule は無効化（DISABLED）されています。
+現行の tinylamb では、射影を除くと出力スキーマの列名（エイリアス）が変わり、上位の結合述語やソート処理が列を解決できなくなる場合があります。そのため、本 Rule は無効（DISABLED）です。
 
 ## 変換前後の関係
 
@@ -72,10 +72,10 @@ tinylamb では D5 規律に基づき、「前提条件を厳密に証明・保�
 
 ## 関連 Rule との相互作用
 
-- `merge_projections` / `merge_adjacent_projections`: 射影段数を削減する代替 Rule です。列名の整合性を破壊することなく安全に射影を合成します。
-- `push_projection_through_join`: 射影を結合下流へ押し下げる Rule です。出力スキーマを厳密に管理して列名破壊を回避します。
+- `merge_projections` / `merge_adjacent_projections`: 射影の段数を減らす代替 Rule です。列名を保ったまま射影を合成します。
+- `push_projection_through_join`: 射影を結合の下へ押し下げる Rule です。出力スキーマを明示的に管理して、列名の不一致を防ぎます。
 
 ## 検証テスト
 
 - 本 Rule は無効化されているため、直接的なユニットテストは存在しません。
-- 射影の健全性は `plan/cascades_test.cpp` における `MergeAdjacentProjections` 等の近縁 Rule テストによって間接的に担保されています。
+- 射影の健全性は `plan/cascades_test.cpp` における `MergeAdjacentProjections` 等の近縁 Rule テストによって間接的に保証されています。
