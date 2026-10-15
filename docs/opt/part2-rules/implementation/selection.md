@@ -103,7 +103,7 @@ SQL 標準において、`WHERE` 句等の選択述語は真（TRUE）と評価�
 
 ## 関連 Rule との相互作用
 
-- `merge_selections` / `merge_adjacent_filters`: 複数の選択条件を連言（AND）で合成し、物理層での多重 `SelectionPlan` 生成を防止します。
+- `merge_selections` / `merge_selections`: 複数の選択条件を連言（AND）で合成し、物理層での多重 `SelectionPlan` 生成を防止します。
 - `push_selection_into_scan`: 単一リレーションに対する述語を走査ノード（Scan）へ押し下げ、`SelectionPlan` 自体の生成を不要化します。
 - `eliminate_false_selection` / `eliminate_true_selection`: 定数述語を論理層で事前に除去・短絡する Rule 群です。本 Rule の `EmptyPlan` 枝は論理層を通過した定数式に対するフォールバックとして機能します。
 - `empty`: 論理空演算子 `kEmpty` に対し同一の `EmptyPlan` を生成する物理実装 Rule です。

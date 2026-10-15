@@ -76,6 +76,12 @@ int main(int argc, char** argv) {
     try {
       tinylamb::StatusOr<tinylamb::QueryResult> executed =
           engine.Execute(context, statement);
+      // An empty diagnostic means the external parse child was transiently
+      // unavailable (fork throttling under load, test runner in parallel).
+      // One retry keeps long scripts from dying on a scheduler hiccup.
+      if (!executed.HasValue() && engine.LastError().empty()) {
+        executed = engine.Execute(context, statement);
+      }
       if (!executed.HasValue()) {
         const std::string& last_error = engine.LastError();
         std::cerr << "SQL error: " << last_error;

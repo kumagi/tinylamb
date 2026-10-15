@@ -4,13 +4,15 @@ Read before designing, cite when changing behavior. Most binding first:
 
 - `lock_order.md` — normative lock ordering (storage + txn work must obey).
 - `recovery_invariants.md`, `wal_format.md` — ARIES invariants + on-disk WAL
-  layout (`kWalRecordVersion = 4`).
+  layout   (`kWalRecordVersion = 6`).
 - `page_format.md`, `page_checksum.md`, `pax_page_format.md`,
   `value_storage.md` — on-disk formats.
 - `expression_evaluation.md` — AST/Bytecode/JIT equivalence contract.
 - `cascades_optimizer.md` (+ `optimizer_todo.md`,
   `optimizer_improvements.md`) — optimizer design + open work.
 - `commit_durability.md`, `lock_timeout.md` — commit/wait semantics.
+- `environment_variables.md` — every `TINYLAMB_*` env var the code reads
+  (A/B hatches, budgets, fault-injection probes).
 - `adr-proposal.md` + `review/` (`*_review.md`) — decision records. (There is
   no `docs/adr/` directory; create `NNN-<topic>.md` there only if establishing
   a standing ADR location.)

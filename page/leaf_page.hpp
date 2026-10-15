@@ -72,7 +72,7 @@ class LeafPage final {
   Status Split(page_id_t pid, Transaction& txn, std::string_view key,
                std::string_view value, Page* right);
 
-  void InsertImpl(std::string_view key, std::string_view value);
+  Status InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view redo);
   void DeleteImpl(std::string_view key);
   void SetFence(RowPointer& fence_pos, const IndexKey& new_fence);
@@ -85,7 +85,10 @@ class LeafPage final {
 
   Status SetFoster(page_id_t pid, Transaction& txn,
                    const FosterPair& new_foster);
-  void SetFosterImpl(const FosterPair& foster);
+  Status SetFosterImpl(const FosterPair& foster);
+
+  // Test-only accounting probe (mirrors RowPage::FreeSizeForTest).
+  [[nodiscard]] bin_size_t FreeSizeForTest() const { return free_size_; }
 
   Status MoveRightToFoster(Transaction& txn, Page& right);
   Status MoveLeftFromFoster(Transaction& txn, Page& right);
@@ -93,7 +96,7 @@ class LeafPage final {
   [[nodiscard]] bool SanityCheckForTest() const;
 
  private:
-  void UpdateSlotImpl(RowPointer& pos, std::string_view payload);
+  Status UpdateSlotImpl(RowPointer& pos, std::string_view payload);
   void DeFragment();
   void Dump(std::ostream& o, int indent) const;
   [[nodiscard]] size_t Find(std::string_view key) const;

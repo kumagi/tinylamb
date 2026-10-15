@@ -48,7 +48,7 @@
     （`BuildIndexScan` 候補の `local_cost` 計算箇所。
     先頭キー equality-prefix のみの point lookup は対象外、
     range を含む候補のみ `local_cost *= (1 + k*(1-correlation))`。
-    `k` は `CalibrateOperatorCost`（`plan/cascades.cpp:10304`）側の較正係数と
+    `k` は `CalibrateOperatorCost`（`plan/cascades.cpp:10989`）側の較正係数と
     並べ、テストで full/index 選択が flip することを pin）
   - `optimizer_cardinality_costing_high_expectations.test` 系に期待値追加
 - [x] 1c. `topn_push_through_proven_one_to_one_join` 論理規則（kForeign ゲート版）
@@ -58,13 +58,13 @@
     発火条件：`TopN(Join(L,R))`（inner のみ）＋ 右結合キーが
     `IsUniqueOn` ＋ 左結合列の schema 制約が `Constraint::kForeign` で
     参照先が右 relation と一致（`foreign_key_outer_join_elimination`
-    `plan/cascades.cpp:5343` の参照先照合ロジックを再利用）＋
+    `plan/cascades.cpp:5402` の参照先照合ロジックを再利用）＋
     `!with_ties` ＋ 有限 limit。書換えは `Join(TopN(L'), R)` ではなく
     D5 表の反例を避けるため **1:1 証明が揃う場合のみ**
     左側へ `TopN(limit+offset)` を押す形（`push_limit_through_left_join`
-    `plan/cascades.cpp:5703` が前例。右キー uniqueness 証明付き左押込み）。
+    `plan/cascades.cpp:5758` が前例。右キー uniqueness 証明付き左押込み）。
   - 反例テスト：`TopNPushThroughInnerJoinOnForeignKey`（既存）と対になる
-    肯定テスト `TopNPushThroughInnerJoinWithForeignKeyFires` を
+    肯定テスト `TopNPushThroughProvenOneToOneJoinWithForeignKey` を
     `plan/cascades_test.cpp` に追加。D5 監査表へ行追加
 - [x] 1d. snapshot による参照整合性証明（DDL なしで今日速くする本体）
   - `plan/cascades.hpp` の `Memo` に `proven_one_to_one_`（relation-pair set）
@@ -81,13 +81,21 @@
   - `optimizer_test.cpp` に end-to-end（TPC-H Q3/Q10 型 ORDER BY+LIMIT が
     TopN push で計画されること）を追加
 
-残件（別タスク化可）：`FOREIGN KEY` DDL（parser `VisitCreate`
-`query/googlesql_ast_visitor.cpp:6109` が制約を捨てている。外部 pinned parser
-の AST dump に FK 情報があるか確認が先。なければ DDL は見送り）
+残件（実装済み 2026-09-19）：`FOREIGN KEY` DDL（pinned parser は
+`ForeignKey`／`ForeignKeyColumnAttribute` ノードを出すことを確認。
+`VisitCreate` で両形式を受理し、単一列 FK を `Constraint(kForeign,
+Value("parent(col)"))` 正準形で列スロットに格納＋`CreateTableStatement::
+ForeignKeys()` に定義保持。`Database::CreateTable` が親表・親列・型一致を
+検証（自己参照は作成中スキーマで解決）。`INSERT`/`UPDATE` 子側・
+`DELETE`/`UPDATE` 親側を NO ACTION 強制（`executor/foreign_key.*`＋
+`Insert`/`Update`/`DeleteExecutor` 配線、自己参照は文内書込を
+追跡）。`DropTable` は被参照表を拒否。CASCADE/SET NULL/SET DEFAULT・
+MATCH FULL/PARTIAL・複合 FK は明確に reject。回帰:
+`query/foreign_key_test.cpp` 14件）
 
 ## 2. CTE predicate pushdown（M4 の行削減）（実装済み 2026-09-16）
 
-狙い：`MaterializeCtes`（`query/sql_engine.cpp:3799`）の共有 eager cell が
+狙い：`MaterializeCtes`（`query/sql_engine.cpp:4380`）の共有 eager cell が
 外側 WHERE を被らず全行実体化している問題を解消。1024行予算
 （`kMaxMaterializedCteRows`）の浪費と cell scan の I/O を削減。
 
@@ -99,7 +107,7 @@
   - `MaterializeCtes` の body 実行直前（fresh `PrepareStatement` 前）に
     `TryPushCteFilterIntoBody(body, outer_where, cte_alias)` を挿入
   - ゲート：body が単一 plain base table・行保存
-    （`InlineSingleUseCtes` `query/sql_engine.cpp:2789` の body 判定を再利用）
+    （`InlineSingleUseCtes` `query/sql_engine.cpp:2761` の body 判定を再利用）
     ＋ CTE 参照サイトが単一（`CountCteReferencesInStatement == 1`。
     共有 cell への site-specific filter 混入を防止）＋ 外側 conjunct が
     `alias.out_col OP const`（`OP ∈ {=,<,<=,>,>=}`、const immutable、
@@ -122,6 +130,11 @@
 
 残件：複数サイト共通フィルタの intersection push、CTE推移的多段 push、
 `cte_predicate_propagation`（等価クラス経由の join 定数伝播。M4 葉待ち）
+—— このうち**複数サイト weakening は実装済み**（`TryNarrowCteBody` が全サイトの
+下限min・上限max・全会一致等価を注入）。2026-10-06 に上限方向の融合が
+最弱（最大値）でなく最強（最小値）を採る silent wrong result を修正
+（狭いサイトの上限が共有 cell を潰し、広いサイトが必要な行を失う。
+回帰 `SqlEngineMultiSiteCteUpperBoundStaysWeakest`）。
 
 ## 3. LATERAL decorrelation（per-row 再実行の排除）（実装済み 2026-09-16）
 
@@ -134,7 +147,7 @@
     `FlattenDerivedSources` 直後）。相関等値を ON へ移動（派生別名へ再束縛、
     非出力キーは射影拡張）＋ lateral clear ＋ kCross→kInner 昇格（LEFT 維持）＋
     M5 flatten へ委譲。volatile/集約/非等価/複数表 inner・RIGHT/FULL・star は対象外
-  - `FlattenDerivedSources`（`query/sql_engine.cpp:3372`）の直後に
+  - `FlattenDerivedSources`（`query/sql_engine.cpp:3647`）の直後に
     `DecorrelateSingleTableLateral(outer)` を挿入（routing 前。
     `InlineSingleUseCtes→MaterializeCtes→LiftRecursiveCtes→FlattenDerivedSources`
     の呼出順 `query/sql_engine.cpp:5258` を崩さない）
@@ -162,7 +175,7 @@
   - 否条件：複数相関・非等価相関・集約 inner・outer 参照残存は
     relational 維持（`PostRewriteNeedsRelational` が true のまま）
 
-残件：複数表 LATERAL、LATERAL + 集約の `decorrelate_aggregate_apply`
+残件：複数表 LATERAL、LATERAL + 集約のデコリレーション（旧 `decorrelate_aggregate_apply` は撤去、履歴は docs/optimizer_rule_audit.md）
 対応（memo 葉化 M5 待ち。一般形は `docs/optimizer_todo.md:491` のまま）
 
 ## 4. 論理規則3点（OR-to-UNION / 集約 duality / TopN-through-Union）（実装済み 2026-09-16）
@@ -179,10 +192,10 @@
     disjunct は conjunct 単位（AND 可、そのまま branch predicate 化）＋
     グループが単一 relation＋両 disjunct 非 volatile・subquery なし
     （`distribute_or_over_and_budgeted`
-    `expression/rewrite.cpp:3466` の `ExpressionCannotThrow` /
+    `expression/rewrite.cpp:3477` の `ExpressionCannotThrow` /
     `SafeToReduceEvaluationCount` 検査を再利用）＋派生タグ
     `or_union_branch:` での循環防止（`union_all_push_limit`
-    `plan/cascades.cpp:2988` の `union-limit-setop:` ガードが前例）
+    `plan/cascades.cpp:2997` の `union-limit-setop:` ガードが前例）
   - 書換え：`EnsureDerivedGroup(rels, "or_union_branch:0/1")` に
     `Selection(d_i)` を載せ、同一 group へ `kUnion`（DISTINCT。
     overlap があっても重複排除で等価。Selection は TRUE のみ保持するので
@@ -218,7 +231,7 @@
     `TopN(limit+offset)`＋親 TopN 維持。`!with_ties`・同形枝 cap 済み検査・枝 GroupId
     タグ（D1）。既存 limit 系2規則は不変。`TopNPushThroughUnionAll*` 2件
   - 既存 `union_all_push_limit` / `push_limit_through_union_all`
-    （`plan/cascades.cpp:2991/5155`、無順序 LIMIT の branch cap。重複登録の
+    （`plan/cascades.cpp:2997/5212`、無順序 LIMIT の branch cap。重複登録の
     統合は `docs/optimizer_todo.md:1054` の監査 C 項として別途）は触らず、
     `TopN(keys,limit,offset)` over `UnionAll` の新規則を追加
   - ゲート：`!with_ties`（ties 境界は行数保証が崩れる）＋有限 limit＋
@@ -270,12 +283,12 @@
     golden churn のみを生む。DOP 明示配分・Exchange 実装は分散枠に残す（従来通り）
   - `implementation_rules.cpp` の hash/merge join `local_cost` に
     閾値超過時の speedup divisor（`CalibrateOperatorCost`
-    `plan/cascades.cpp:10304` の hash `L*1.2+R*1.5` / merge `*1.1` と
+    `plan/cascades.cpp:10989` の hash `L*1.2+R*1.5` / merge `*1.1` と
     同オーダーで整合。並列効率は Amdahl 的に `1/min(workers, morsels)` の
     保守形）を適用し、逐次/並列の cost 順序が flip することを
     `optimizer_test.cpp` で pin（`ParallelScanEmittedForLargeAnalyzedTable`
-    `plan/optimizer_test.cpp:3147` が前例）
-  - spill 連携：`EstimateMemorySpillCost`（`plan/cascades.cpp:10288`）の
+    `plan/optimizer_test.cpp:3169` が前例）
+  - spill 連携：`EstimateMemorySpillCost`（`plan/cascades.cpp:10973`）の
     hybrid 罰則と二重割引にならないよう、spill 支配時は speedup を適用しない
 - [x] 5d. 回帰テスト
   - `executor_test.cpp` 4件：大入力で `SharedBuildParallelHashJoin` /

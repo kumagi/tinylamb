@@ -55,6 +55,17 @@ class LimitPlan final : public PlanBase {
       const std::vector<std::optional<bool>>& nulls_first) const override {
     return src_->IsOrderedBy(expressions, ascending, nulls_first);
   }
+  // A prefix of an ordered stream stays ordered, so the child's order
+  // provenance carries through the limit.
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return src_->OrderIsMeasured();
+  }
+  // Row-shaping wrappers preserve the child's order, so they also preserve the
+  // collation that order was produced under (a case-insensitive sort under a
+  // projection is still a case-insensitive order).
+  [[nodiscard]] Collation OrderCollation() const override {
+    return src_->OrderCollation();
+  }
   [[nodiscard]] bool EnforcesLimit(size_t limit_count,
                                    size_t limit_offset) const override {
     return limit_count == limit_count_ && limit_offset == limit_offset_;

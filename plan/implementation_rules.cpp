@@ -9,6 +9,9 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <ranges>
+#include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -18,9 +21,11 @@
 
 #include "aggregation_plan.hpp"
 #include "apply_plan.hpp"
+#include "band_join_plan.hpp"
 #include "bitmap_scan_plan.hpp"
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "common/log_message.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "distinct_plan.hpp"
@@ -28,6 +33,7 @@
 #include "executor/detail/scan_filter.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -36,15 +42,15 @@
 #include "expression/named_expression.hpp"
 #include "expression/parameter_slot.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/unary_expression.hpp"
 #include "full_scan_plan.hpp"
 #include "incremental_sort_plan.hpp"
 #include "index/index.hpp"
 #include "index_only_scan_plan.hpp"
 #include "index_scan_plan.hpp"
 #include "index_skip_scan_plan.hpp"
+#include "late_materialization_join_plan.hpp"
 #include "limit_plan.hpp"
-#include "materialize_plan.hpp"
-#include "max1_row_plan.hpp"
 #include "merge_join_plan.hpp"
 #include "minmax_index_plan.hpp"
 #include "plan/cascades.hpp"
@@ -74,9 +80,31 @@
 #include "unnest_plan.hpp"
 #include "values_plan.hpp"
 #include "window_plan.hpp"
+#include "zigzag_join_plan.hpp"
 
 namespace tinylamb {
 namespace {
+
+// Decode-floor hatch: narrow full scans to the required columns at the
+// iterator (TINYLAMB_SCAN_PROJECTION=1). Default OFF: narrowing only pays on
+// plans that execute through Cascades cores (the bridge route) -- the
+// default relational route prunes scan columns itself -- and under plan
+// feedback the narrowed shape flipped TPC-H Q19's cross-join-shaped plan to
+// a 10x slower alternative. Revisit after that interaction is root-caused.
+bool ScanProjectionEnabled() {
+  static const bool enabled =
+      std::getenv("TINYLAMB_SCAN_PROJECTION") != nullptr;
+  return enabled;
+}
+
+// Diagnostic gate for join-order quality investigations (zero cost when
+// unset): prints per-key selectivity inputs and hash-join orientation
+// candidates so a collapsed estimate or a wrong build side is visible.
+bool JoinCardinalityDebug() {
+  static const bool join_card_debug =
+      std::getenv("TINYLAMB_JOIN_CARD_DEBUG") != nullptr;
+  return join_card_debug;
+}
 
 using cascades::BestPlan;
 using cascades::PhysicalProperties;
@@ -221,6 +249,17 @@ bool ContainsAggregateExpression(const Expression& expression) {
                              ContainsAggregateExpression);
 }
 
+bool ContainsWindowFunctionExpression(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kWindowFunctionExp) {
+    return true;
+  }
+  return std::ranges::any_of(ExpressionChildren(expression),
+                             ContainsWindowFunctionExpression);
+}
+
 bool CanPushLimitIntoFullScan(const Expression& filter,
                               const PhysicalProperties& required,
                               const cascades::RuleContext& context) {
@@ -231,9 +270,18 @@ bool CanPushLimitIntoFullScan(const Expression& filter,
     return false;
   }
   // Aggregation must see every input row even when its result has a LIMIT.
-  return !std::ranges::any_of(context.query->select_, [](const auto& output) {
-    return ContainsAggregateExpression(output.expression);
-  });
+  // Window functions are equally input-holistic: the default frame is the
+  // whole partition, and any frame reaching past the current row
+  // (UNBOUNDED FOLLOWING, LEAD, NTILE, CUME_DIST, ...) reads rows the
+  // limit prefix would truncate away.
+  return !std::ranges::any_of(
+             context.query->select_,
+             [](const auto& output) {
+               return ContainsAggregateExpression(output.expression) ||
+                      ContainsWindowFunctionExpression(output.expression);
+             }) &&
+         !ContainsAggregateExpression(context.query->qualify_) &&
+         !ContainsWindowFunctionExpression(context.query->qualify_);
 }
 
 std::optional<std::pair<std::string, std::string>> LikePrefixBounds(
@@ -327,23 +375,29 @@ Plan RemoveIdentityProjection(Plan child,
              : std::move(projection);
 }
 
-std::vector<Expression> NormalizeOrderingForOutput(
-    const std::vector<Expression>& ordering,
-    const std::vector<NamedExpression>& outputs) {
-  std::vector<Expression> normalized;
-  normalized.reserve(ordering.size());
-  for (const Expression& expression : ordering) {
-    const auto found =
-        std::ranges::find_if(outputs, [&](const NamedExpression& output) {
-          return output.expression->ToString() == expression->ToString();
-        });
-    if (found != outputs.end() && !found->name.empty()) {
-      normalized.push_back(ColumnValueExp(found->name));
-    } else {
-      normalized.push_back(expression);
-    }
+double EstimateDistinctRows(const Plan& input,
+                            const std::vector<Expression>& columns) {
+  const auto rows = static_cast<double>(input->GetStats().Rows());
+  if (rows <= 0.0) {
+    return 0.0;
   }
-  return normalized;
+  if (columns.empty()) {
+    return rows;
+  }
+  const Schema& schema = input->GetSchema();
+  const TableStatistics& statistics = input->GetStats();
+  std::vector<size_t> offsets;
+  for (const Expression& column : columns) {
+    if (!column || column->Type() != TypeTag::kColumnValue) {
+      return rows;
+    }
+    const int offset = schema.Offset(column->AsColumnValue().GetColumnName());
+    if (offset < 0) {
+      return rows;
+    }
+    offsets.push_back(static_cast<size_t>(offset));
+  }
+  return statistics.EstimateDistinctRows(offsets);
 }
 
 double LimitOutputRows(double input, size_t limit, size_t offset) {
@@ -415,6 +469,13 @@ void ApplyLimitHint(const Plan& plan, const PhysicalProperties& required,
                          context.query->order_nulls_first_)) {
     return;
   }
+  // The discount models "stop the scan after the requested prefix". Only a
+  // structurally ordered scan can: a measured clustered order saves a sort, but
+  // the LIMIT stays above a scan that still walks the whole chain, so
+  // discounting it would price a full read as a prefix read.
+  if (plan->OrderIsMeasured()) {
+    return;
+  }
   const auto rows = static_cast<double>(required.limit_hint);
   *local_cost = std::min(*local_cost, rows / std::max(selectivity, 0.01));
   *estimated_rows = std::min(*estimated_rows, rows);
@@ -432,7 +493,7 @@ inline constexpr double kIndexRangeClusteringPenalty = 2.0;
 double RangeClusteringPenalty(const TableStatistics& statistics, slot_t slot) {
   double correlation = 1.0;
   if (slot < statistics.Columns()) {
-    correlation = std::clamp(statistics.Column(slot).Correlation(), 0.0, 1.0);
+    correlation = statistics.Column(slot).ClusteringStrength();
   }
   return 1.0 + (kIndexRangeClusteringPenalty * (1.0 - correlation));
 }
@@ -805,7 +866,7 @@ std::vector<PlanAlternative> ScanAlternatives(
       // stop after the requested prefix without touching the heap.  Do not
       // offer this fallback for filtered scans; without a selective bound it
       // would only create a tie that could displace the normal full scan.
-      if (no_filter && !required.distinct) {
+      if (no_filter) {
         std::vector<ColumnName> full_index_order;
         full_index_order.reserve(index.sc_.key_.size());
         for (const slot_t slot : index.sc_.key_) {
@@ -1043,7 +1104,7 @@ std::vector<PlanAlternative> ScanAlternatives(
           point_candidate = finalize(point_candidate);
           auto point_cost =
               static_cast<double>(point_candidate->AccessRowCount());
-          double point_rows =
+          auto point_rows =
               static_cast<double>(point_candidate->EmitRowCount());
           ApplyLimitHint(point_candidate, required, context, filter_selectivity,
                          &point_cost, &point_rows);
@@ -1175,8 +1236,7 @@ std::vector<PlanAlternative> ScanAlternatives(
           local_cost =
               static_cast<double>(candidate->AccessRowCount()) * range_penalty;
         }
-        double estimated_rows =
-            static_cast<double>(candidate->GetStats().Rows());
+        auto estimated_rows = static_cast<double>(candidate->GetStats().Rows());
         ApplyLimitHint(candidate, required, context, filter_selectivity,
                        &local_cost, &estimated_rows);
         candidates.push_back(PlanAlternative{.plan = std::move(candidate),
@@ -1214,18 +1274,59 @@ std::vector<PlanAlternative> ScanAlternatives(
         }
       }
     }
-    Plan full_scan =
-        scan_peeks.empty()
-            ? static_cast<Plan>(std::make_shared<FullScanPlan>(
-                  table, statistics, scan_limit, required.require_row_position,
-                  required.wait_for_write_intent))
-            : static_cast<Plan>(std::make_shared<FullScanPlan>(
-                  table, statistics, std::move(scan_peeks), scan_limit,
-                  required.require_row_position,
-                  required.wait_for_write_intent));
+    // Required-column narrowing (Phase 3, decode floor): when the required
+    // list is a strict subset of plain table columns, emit only those
+    // columns from the scan itself (the iterator skips the others before
+    // deserialize). A ProjectionPlan wrapper would decode every column of
+    // every row first, which dominates wide-table scans. The narrowed scan
+    // keeps table-column order so its statistics subset stays positionally
+    // aligned; DML sources (require_row_position maps to lock_rows) and
+    // peek-compare scans keep the previous shapes.
+    std::vector<slot_t> scan_slots;
+    // Decode-floor hatch (default OFF): narrowing only pays on plans that
+    // execute through Cascades cores (the bridge route); the default
+    // relational route prunes scan columns itself, and under plan feedback
+    // the narrowed shape flipped TPC-H Q19's cross-join-shaped plan to a
+    // 10x slower alternative. Revisit after the feedback interaction is
+    // root-caused.
+    bool narrow_scan = ScanProjectionEnabled() &&
+                       !required.require_row_position && scan_peeks.empty() &&
+                       fallback_select.size() < schema.ColumnCount();
+    if (narrow_scan) {
+      for (const auto& named : fallback_select) {
+        const int offset =
+            named.expression &&
+                    named.expression->Type() == TypeTag::kColumnValue
+                ? schema.Offset(
+                      named.expression->AsColumnValue().GetColumnName())
+                : -1;
+        if (offset < 0) {
+          narrow_scan = false;
+          break;
+        }
+        scan_slots.push_back(static_cast<slot_t>(offset));
+      }
+    }
+    Plan full_scan;
+    if (narrow_scan) {
+      const FullScanPlan base(table, statistics, scan_limit,
+                              required.require_row_position,
+                              required.wait_for_write_intent);
+      full_scan = std::make_shared<FullScanPlan>(base, std::move(scan_slots));
+    } else {
+      full_scan = scan_peeks.empty()
+                      ? static_cast<Plan>(std::make_shared<FullScanPlan>(
+                            table, statistics, scan_limit,
+                            required.require_row_position,
+                            required.wait_for_write_intent))
+                      : static_cast<Plan>(std::make_shared<FullScanPlan>(
+                            table, statistics, std::move(scan_peeks),
+                            scan_limit, required.require_row_position,
+                            required.wait_for_write_intent));
+    }
     if (filter) {
-      full_scan =
-          std::make_shared<SelectionPlan>(full_scan, filter, statistics);
+      full_scan = std::make_shared<SelectionPlan>(full_scan, filter,
+                                                  full_scan->GetStats());
     }
     if (fallback_select.size() != full_scan->GetSchema().ColumnCount()) {
       full_scan = std::make_shared<ProjectionPlan>(full_scan, fallback_select);
@@ -1254,34 +1355,89 @@ std::vector<PlanAlternative> ScanAlternatives(
 double JoinCardinality(
     const BestPlan& left, const BestPlan& right,
     const std::vector<std::pair<ColumnName, ColumnName>>& equalities,
-    const Expression& residual = nullptr) {
+    const Expression& residual = nullptr,
+    const std::vector<bool>* null_safe = nullptr) {
   std::vector<double> key_selectivities;
   key_selectivities.reserve(equalities.size());
-  for (const auto& [left_column, right_column] : equalities) {
+  for (size_t key = 0; key < equalities.size(); ++key) {
+    const auto& [left_column, right_column] = equalities[key];
+    const bool matches_null =
+        null_safe != nullptr && key < null_safe->size() && (*null_safe)[key];
     const int lo = left.plan->GetSchema().Offset(left_column);
     const int ro = right.plan->GetSchema().Offset(right_column);
-    double ndv = 0;
-    if (lo >= 0 && static_cast<size_t>(lo) < left.plan->GetStats().Columns()) {
-      ndv = std::max<double>(
-          ndv, static_cast<double>(left.plan->GetStats()
-                                       .Column(static_cast<size_t>(lo))
-                                       .Distinct()));
-    }
-    if (ro >= 0 && static_cast<size_t>(ro) < right.plan->GetStats().Columns()) {
-      ndv = std::max<double>(
-          ndv, static_cast<double>(right.plan->GetStats()
-                                       .Column(static_cast<size_t>(ro))
-                                       .Distinct()));
-    }
-    if (ndv >= 1.0) {
-      key_selectivities.push_back(1.0 / ndv);
+    const auto& left_stats = left.plan->GetStats();
+    const auto& right_stats = right.plan->GetStats();
+    if (lo >= 0 && ro >= 0 && static_cast<size_t>(lo) < left_stats.Columns() &&
+        static_cast<size_t>(ro) < right_stats.Columns()) {
+      const auto& l = left_stats.Column(static_cast<size_t>(lo));
+      const auto& r = right_stats.Column(static_cast<size_t>(ro));
+      const double population =
+          (static_cast<double>(l.NonNullCount() + l.NullCount())) *
+          (static_cast<double>(r.NonNullCount() + r.NullCount()));
+      if (population > 0.0) {
+        key_selectivities.push_back(std::clamp(
+            l.EstimateJoinMatches(r, matches_null) / population, 0.0, 1.0));
+      }
     }
   }
   const double cross = left.estimated_rows * right.estimated_rows;
   double estimate = cross;
   if (!key_selectivities.empty()) {
-    estimate = std::min(cross, cross * cascades::EstimateEquijoinSelectivity(
-                                           key_selectivities));
+    const double backoff =
+        cascades::EstimateEquijoinSelectivity(key_selectivities);
+    // Composite equality keys within one join conjunct are rarely
+    // independent: they are typically a composite foreign key meeting a
+    // unique key ((l_partkey, l_suppkey) = (ps_partkey, ps_suppkey)), so the
+    // per-key selectivities are strongly correlated. The independence
+    // backoff multiplies them into the ground (observed 100x under-estimates
+    // on TPC-H/TPC-DS FK joins), which poisons join order and build-side
+    // choices. Floor the combination at the most selective single key: under
+    // correlation the strongest key alone bounds the matching pairs from
+    // below, and the cross-product cap still applies. Single-key joins are
+    // unaffected (the floor equals the key itself).
+    const double min_key = *std::ranges::min_element(key_selectivities);
+    estimate = std::min(cross, cross * std::max(backoff, min_key));
+  }
+  // Diagnostic for join-order quality investigations (zero cost when unset):
+  // per-key selectivity inputs are the difference between a sound join order
+  // and a collapsed estimate, so print both sides of each key.
+  if (JoinCardinalityDebug()) {
+    std::string keys;
+    for (size_t key = 0; key < equalities.size(); ++key) {
+      const auto& [left_column, right_column] = equalities[key];
+      const auto& left_stats = left.plan->GetStats();
+      const auto& right_stats = right.plan->GetStats();
+      const int lo = left.plan->GetSchema().Offset(left_column);
+      const int ro = right.plan->GetSchema().Offset(right_column);
+      keys += " [";
+      keys += left_column.ToString();
+      if (lo >= 0 && static_cast<size_t>(lo) < left_stats.Columns()) {
+        const auto& l = left_stats.Column(static_cast<size_t>(lo));
+        keys += " nn=" + std::to_string(l.NonNullCount()) +
+                " ndv=" + std::to_string(l.Distinct()) +
+                (l.Unmeasured() ? " UNMEASURED" : "");
+      } else {
+        keys += " no-stats";
+      }
+      keys += "=";
+      keys += right_column.ToString();
+      if (ro >= 0 && static_cast<size_t>(ro) < right_stats.Columns()) {
+        const auto& r = right_stats.Column(static_cast<size_t>(ro));
+        keys += " nn=" + std::to_string(r.NonNullCount()) +
+                " ndv=" + std::to_string(r.Distinct()) +
+                (r.Unmeasured() ? " UNMEASURED" : "");
+      } else {
+        keys += " no-stats";
+      }
+      keys += " sel=";
+      keys += key < key_selectivities.size()
+                  ? std::to_string(key_selectivities[key])
+                  : std::string("dropped");
+      keys += "]";
+    }
+    LOG(INFO) << "join-card l_rows=" << left.estimated_rows
+              << " r_rows=" << right.estimated_rows << " est=" << estimate
+              << keys;
   }
   if (!residual) {
     return estimate;
@@ -1337,12 +1493,242 @@ bool SamePhysicalJoinType(const Schema& left_schema, const ColumnName& left,
          right_schema.GetColumn(static_cast<size_t>(right_offset)).Type();
 }
 
+bool HasNullSafeCrossJoinEquality(const Expression& predicate, const Plan& left,
+                                  const Plan& right) {
+  return std::ranges::any_of(
+      SplitConjuncts(predicate), [&](const Expression& conjunct) {
+        if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+          return false;
+        }
+        const auto& binary = conjunct->AsBinaryExpression();
+        if (binary.Op() != BinaryOperation::kIsNotDistinctFrom ||
+            !binary.Left() || !binary.Right() ||
+            binary.Left()->Type() != TypeTag::kColumnValue ||
+            binary.Right()->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
+        const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+        const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+        return (left->GetSchema().Offset(lhs) >= 0 &&
+                right->GetSchema().Offset(rhs) >= 0) ||
+               (left->GetSchema().Offset(rhs) >= 0 &&
+                right->GetSchema().Offset(lhs) >= 0);
+      });
+}
+
+bool SupportsLateMaterializationKeyType(ValueType type) {
+  return type == ValueType::kInt64 || type == ValueType::kDate;
+}
+
+// Dynamic ("shared information passing") join filter, Phase 2 "Dynamic
+// Filter Join / SIP / Bloom".
+//
+// The `dynamic_filter_pushdown_join` logical rule annotates a probe group with
+// the join keys a build side can publish a sound filter over. This is the
+// physical gate:
+//
+//   * the probe group must carry that annotation and it must name exactly the
+//     equi-join key -- an annotation over a different key set describes a
+//     different filter, and applying it would be a guess;
+//   * the key must be a single INT64/DATE column, the only domain the runtime
+//     filter is defined over (a composite or non-integer key keeps the plain
+//     hash join);
+//   * the join must be inner and free of null-safe keys, because a
+//     null-rejecting filter is not a membership test for `<=>`;
+//   * the build side must be materially smaller than the probe side, or
+//     building and testing the filter costs more than the rows it saves.
+[[nodiscard]] bool DynamicFilterIsProfitable(double build_rows,
+                                             double probe_rows) {
+  if (!(build_rows >= 1.0) || !(probe_rows > build_rows)) {
+    return false;
+  }
+  // Either a clearly smaller build side, or a small build side with a probe
+  // side big enough to amortize the filter's construction.
+  return build_rows * 4.0 <= probe_rows ||
+         (build_rows <= 1024.0 && probe_rows >= 8192.0);
+}
+
+[[nodiscard]] bool DynamicFilterAnnotated(
+    const cascades::Memo& memo, const BestPlan& probe,
+    const std::vector<ColumnName>& probe_keys) {
+  // A hand-built BestPlan (unit tests calling ImplementationRule::Apply
+  // directly) carries no group; only a searched plan can be annotated.
+  if (probe.group == cascades::kInvalidGroup) {
+    return false;
+  }
+  const std::vector<ColumnName>& annotated =
+      memo.Get(probe.group).dynamic_filter_keys;
+  if (annotated.empty() || annotated.size() != probe_keys.size()) {
+    return false;
+  }
+  return std::ranges::all_of(probe_keys, [&](const ColumnName& key) {
+    return std::ranges::find(annotated, key) != annotated.end();
+  });
+}
+
+// Hash semi reduction (Phase 2 "Hash Semi Reduction"): the physical gate.
+//
+// `SemiReductionIsProfitable` / `JoinKeyDomainEstimate` live in
+// plan/product_plan.cpp because the subquery-decorrelation path builds the same
+// ProductPlan shape and has to reach the same verdict.
+//
+//   * only a semi / anti kind qualifies. Outer joins null-pad build rows that
+//     the probe never matches, so the build cannot be cut to the probe domain;
+//     inner joins emit every matching build row;
+//   * a null-safe key (IS NOT DISTINCT FROM) is left to the plain pipeline: it
+//     is a legal shape, but the reduction is not worth a second code path over
+//     a key that is rare in practice;
+//   * the probe group must carry exactly the semi-reduction key annotation the
+//     `semi_reduction_pushdown_semi_join` / `..._anti_join` rules recorded, so
+//     the domain is built over the columns that actually carry the join key;
+//   * the build side must be large enough that cutting it pays.
+[[nodiscard]] bool SemiReductionAnnotated(const cascades::Memo& memo,
+                                          const BestPlan& probe,
+                                          const std::vector<ColumnName>& keys) {
+  if (probe.group == cascades::kInvalidGroup) {
+    return false;
+  }
+  const std::vector<ColumnName>& annotated =
+      memo.Get(probe.group).semi_reduction_probe_keys;
+  if (annotated.size() != keys.size()) {
+    return false;
+  }
+  return std::ranges::all_of(keys, [&](const ColumnName& key) {
+    return std::ranges::find(annotated, key) != annotated.end();
+  });
+}
+
+// Fraction of the probe side a sound filter over the build side's keys can
+// prune: a probe row survives only if its key is one of the build side's keys,
+// so the survival rate is min(1, build_rows / probe_rows).
+//
+// Two estimates are deliberately NOT used here. The join cardinality estimate
+// multiplies independent assumptions and routinely exceeds the probe row count
+// (a 5k x 40k equi-join on unique keys estimates ~49k matches over 40k probe
+// rows), which would make every dynamic filter look useless. The per-column
+// distinct estimate saturates at the ANALYZE sample size, so an NDV ratio
+// reports 1.0 for every wide column. The row-count ratio is the coarsest honest
+// proxy and stays monotone in the quantity the filter actually exploits: how
+// much smaller the build domain is than the probe domain.
+[[nodiscard]] double DynamicFilterPrunableRows(double build_rows,
+                                               double probe_rows) {
+  const double survival = std::min(1.0, build_rows / probe_rows);
+  return probe_rows * (1.0 - survival);
+}
+
+[[nodiscard]] bool DynamicFilterKeyTypeSupported(
+    const Schema& build_schema, const ColumnName& build_column,
+    const Schema& probe_schema, const ColumnName& probe_column) {
+  const int build_offset = build_schema.Offset(build_column);
+  const int probe_offset = probe_schema.Offset(probe_column);
+  if (build_offset < 0 || probe_offset < 0) {
+    return false;
+  }
+  const ValueType build_type =
+      build_schema.GetColumn(static_cast<size_t>(build_offset)).Type();
+  const ValueType probe_type =
+      probe_schema.GetColumn(static_cast<size_t>(probe_offset)).Type();
+  // Type equality is part of the filter's soundness: INT64 and DATE share the
+  // int64 bit domain but not the comparison domain.
+  return build_type == probe_type &&
+         SupportsLateMaterializationKeyType(build_type);
+}
+
+bool IsBandComparison(BinaryOperation operation) {
+  switch (operation) {
+    case BinaryOperation::kLessThan:
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThan:
+    case BinaryOperation::kGreaterThanEquals:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The index nested-loop probe always evaluates its range bound as
+// `right_index_column <op> left_bound_column`, so a predicate written the
+// other way round is mirrored here.
+BinaryOperation MirrorRangeOperation(BinaryOperation operation) {
+  switch (operation) {
+    case BinaryOperation::kLessThan:
+      return BinaryOperation::kGreaterThan;
+    case BinaryOperation::kLessThanEquals:
+      return BinaryOperation::kGreaterThanEquals;
+    case BinaryOperation::kGreaterThan:
+      return BinaryOperation::kLessThan;
+    case BinaryOperation::kGreaterThanEquals:
+      return BinaryOperation::kLessThanEquals;
+    default:
+      return operation;
+  }
+}
+
+struct LookupRangeCandidate {
+  ColumnName left_column;
+  // Relation-qualified, i.e. the name the residual predicate and the join's
+  // declared output schema use.
+  ColumnName right_column;
+  // Physical (table-qualified), i.e. the name the probe's right column list
+  // and the index key use.
+  ColumnName right_physical;
+  BinaryOperation operation = BinaryOperation::kEquals;
+  Expression conjunct;
+};
+
+// Picks the single range conjunct that can narrow a probe whose equality
+// prefix is already fixed. Only column-vs-column comparisons qualify: a
+// constant bound belongs to the right child's scan filter, and the index join
+// bypasses the right child plan entirely. `right_key_column` is the
+// relation-qualified name of the first index key column the prefix leaves
+// unpinned.
+std::optional<LookupRangeCandidate> FindLookupRange(
+    const std::vector<Expression>& conjuncts, const Schema& left_schema,
+    const Schema& right_schema, const ColumnName& right_key_column,
+    const ColumnName& right_key_physical) {
+  for (const Expression& conjunct : conjuncts) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (!IsBandComparison(binary.Op()) || !binary.Left() || !binary.Right()) {
+      continue;
+    }
+    if (binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+    LookupRangeCandidate candidate;
+    if (left_schema.Offset(lhs) >= 0 && right_schema.Offset(rhs) >= 0) {
+      candidate.left_column = lhs;
+      candidate.right_column = rhs;
+      candidate.operation = MirrorRangeOperation(binary.Op());
+    } else if (left_schema.Offset(rhs) >= 0 && right_schema.Offset(lhs) >= 0) {
+      candidate.left_column = rhs;
+      candidate.right_column = lhs;
+      candidate.operation = binary.Op();
+    } else {
+      continue;
+    }
+    if (candidate.right_column != right_key_column) {
+      continue;
+    }
+    candidate.right_physical = right_key_physical;
+    candidate.conjunct = conjunct;
+    return candidate;
+  }
+  return std::nullopt;
+}
+
 std::vector<PlanAlternative> JoinAlternatives(
     const cascades::Memo& memo, cascades::GroupId right_group,
     const std::optional<Expression>& condition, const BestPlan& left,
     const BestPlan& right, const cascades::RuleContext& context, bool hash,
     bool index, bool cross,
-    JoinAlternativeKind kind = JoinAlternativeKind::kInner) {
+    JoinAlternativeKind kind = JoinAlternativeKind::kInner,
+    bool allow_outer_residual = false) {
   const Expression predicate = condition ? *condition : nullptr;
   std::vector<std::pair<ColumnName, ColumnName>> equalities;
   std::vector<bool> equality_null_safe;
@@ -1455,24 +1841,29 @@ std::vector<PlanAlternative> JoinAlternatives(
                                   : CombineConjuncts(join_residual_conjuncts);
 
   // A semi/anti hash join emits only the probe side. A residual predicate
-  // mentioning the build side cannot be evaluated after that reduction, so
-  // leave such shapes for the existing relational fallback until a
-  // residual-aware mark join is available.
-  if (kind != JoinAlternativeKind::kInner && residual) {
+  // mentioning the build side cannot be evaluated after that reduction. Outer
+  // joins keep the residual in the join node so failed pairs still produce
+  // their preserved-side NULL padding.
+  if (kind != JoinAlternativeKind::kInner && residual &&
+      (!allow_outer_residual ||
+       (kind != JoinAlternativeKind::kLeftOuter &&
+        kind != JoinAlternativeKind::kRightOuter &&
+        kind != JoinAlternativeKind::kFullOuter) ||
+       ResidualContainsQuery(residual))) {
     return {};
   }
 
   const double l_rows = left.estimated_rows;
   const double r_rows = right.estimated_rows;
   const double equi_estimate =
-      JoinCardinality(left, right, equalities, residual);
+      JoinCardinality(left, right, equalities, residual, &equality_null_safe);
   const std::optional<size_t> equi_rows = RowEstimate(equi_estimate);
 
   const auto with_residual = [&](Plan plan) {
-    if (residual) {
+    if (residual && kind == JoinAlternativeKind::kInner) {
       plan = std::make_shared<SelectionPlan>(plan, residual, plan->GetStats());
     }
-    const double rows = static_cast<double>(plan->EmitRowCount());
+    const auto rows = static_cast<double>(plan->EmitRowCount());
     return std::pair<Plan, double>{std::move(plan), rows};
   };
 
@@ -1490,11 +1881,13 @@ std::vector<PlanAlternative> JoinAlternatives(
       // executor lowers to NestedLoopJoin.
       std::static_pointer_cast<ProductPlan>(product)->SetJoinNotes({},
                                                                    predicate);
-      product = std::make_shared<SelectionPlan>(product, predicate,
-                                                product->GetStats());
+      if (kind == JoinAlternativeKind::kInner) {
+        product = std::make_shared<SelectionPlan>(product, predicate,
+                                                  product->GetStats());
+      }
     }
     const double local_cost = (l_rows * r_rows) + l_rows + r_rows;
-    const double product_rows = static_cast<double>(product->EmitRowCount());
+    const auto product_rows = static_cast<double>(product->EmitRowCount());
     candidates.push_back(PlanAlternative{.plan = std::move(product),
                                          .local_cost = local_cost,
                                          .estimated_rows = product_rows});
@@ -1553,8 +1946,90 @@ std::vector<PlanAlternative> JoinAlternatives(
       }
       if (auto* pp = dynamic_cast<ProductPlan*>(join.get())) {
         pp->SetJoinNotes(equality_null_safe, residual);
+        if (kind == JoinAlternativeKind::kInner &&
+            mode == HashJoinMode::kInMemory && right_columns.size() == 1 &&
+            left_columns.size() == 1 &&
+            !std::ranges::any_of(equality_null_safe,
+                                 [](bool safe) { return safe; })) {
+          // The logical rule annotates children[1], so the annotated side is
+          // the probe and children[0] is the build. join_commutativity emits
+          // the mirrored expression, whose children[1] is the other side, so
+          // this single rule already offers both orientations and cost picks
+          // the one whose build side is the smaller estimate.
+          const double build_rows = l_rows;
+          const double probe_rows = r_rows;
+          if (DynamicFilterAnnotated(memo, right, right_columns) &&
+              DynamicFilterKeyTypeSupported(
+                  left.plan->GetSchema(), left_columns.front(),
+                  right.plan->GetSchema(), right_columns.front()) &&
+              DynamicFilterIsProfitable(build_rows, probe_rows)) {
+            pp->PreferDynamicFilter(/*build_left=*/true);
+            const double prunable =
+                DynamicFilterPrunableRows(build_rows, probe_rows);
+            // Cost model, on a SYMMETRIC base. The plain hash join's local cost
+            // presumes the right side builds, so it is orientation-asymmetric
+            // (l + r*weight + (r-l)/2); a dynamic filter makes the build side
+            // a free choice, because the executor publishes the filter from
+            // whichever side it drains first. `l + r` is a lower bound on the
+            // plain cost (weight >= 1 and (r-l)/2 >= 0), so the decision is
+            // made purely by the filter's own terms: build one filter row,
+            // one membership test per probe row, and one saved hash lookup plus
+            // output row per rejected probe row. A build domain that barely
+            // narrows the probe side loses to the plain hash join on cost, not
+            // on a flag.
+            constexpr double kBuildRowFilterCost = 0.5;
+            constexpr double kProbeMembershipCost = 0.25;
+            constexpr double kPrunedRowSaving = 0.75;
+            const double filtered_cost = (build_rows * kBuildRowFilterCost) +
+                                         (probe_rows * kProbeMembershipCost) -
+                                         (prunable * kPrunedRowSaving);
+            local_cost = l_rows + r_rows + filtered_cost;
+          }
+        }
+        // Hash semi reduction (Phase 2 "Hash Semi Reduction"). Only an
+        // existence-only kind qualifies: semi / anti emit the probe side only,
+        // so the build rows exist to answer "is this key present?" and can be
+        // cut to the probe side's key domain (and to one row per distinct key)
+        // without changing an output row. Outer / inner / mark / single kinds
+        // null-pad or emit build columns, so they are structurally excluded --
+        // and JoinAlternatives already refuses a semi/anti join that carries a
+        // residual, because a residual needs the build row it would discard.
+        if ((kind == JoinAlternativeKind::kSemi ||
+             kind == JoinAlternativeKind::kAnti) &&
+            !std::ranges::any_of(equality_null_safe,
+                                 [](bool safe) { return safe; }) &&
+            SemiReductionAnnotated(memo, left, left_columns) &&
+            SemiReductionProfitable(left.plan, left_columns, right.plan,
+                                    right_columns)) {
+          const double kept = SemiReductionKeptRows(
+              l_rows, r_rows, JoinKeyDomainEstimate(left.plan, left_columns),
+              JoinKeyDomainEstimate(right.plan, right_columns));
+          pp->PreferSemiReduction();
+          // Cost model. The plain semi/anti hash cost is `l + r*weight`; the
+          // reduction adds one domain insert per probe row and one membership
+          // test per build row, and saves the row handling (hash insert, chain
+          // walk, resident memory) of every build row the domain removes.
+          constexpr double kDomainInsertCost = 0.25;
+          constexpr double kBuildMembershipCost = 0.25;
+          constexpr double kPrunedRowSaving = 1.0;
+          const double reduced_cost = (l_rows * kDomainInsertCost) +
+                                      (r_rows * kBuildMembershipCost) -
+                                      ((r_rows - kept) * kPrunedRowSaving);
+          local_cost += reduced_cost;
+        }
       }
       auto [plan, est] = with_residual(std::move(join));
+      if (JoinCardinalityDebug()) {
+        std::ostringstream left_dump;
+        std::ostringstream right_dump;
+        left_child->Dump(left_dump, 0);
+        right_child->Dump(right_dump, 0);
+        LOG(INFO) << "join-alt kind=" << static_cast<int>(kind)
+                  << " mode=" << static_cast<int>(mode) << " l_rows=" << l_rows
+                  << " r_rows=" << r_rows << " local_cost=" << local_cost
+                  << " est=" << est << " left=[" << left_dump.str()
+                  << "] right=[" << right_dump.str() << "]";
+      }
       candidates.push_back(PlanAlternative{.plan = std::move(plan),
                                            .local_cost = local_cost,
                                            .estimated_rows = est});
@@ -1565,8 +2040,8 @@ std::vector<PlanAlternative> JoinAlternatives(
                                     [](bool safe) { return safe; })) {
     const Table* right_table = right.plan->ScanSource();
     if (right_table != nullptr) {
-      // The IndexJoin executor bypasses the right child plan entirely and
-      // probes the raw table through its index. A filter merged into the
+      // The index nested-loop executor bypasses the right child plan entirely
+      // and probes the raw table through its index. A filter merged into the
       // right scan group is implemented by that child plan, so offering an
       // index join here would silently drop it; hash/NL joins consume the
       // child executor and stay safe.
@@ -1605,38 +2080,581 @@ std::vector<PlanAlternative> JoinAlternatives(
           }
           const Schema declared_output =
               left.plan->GetSchema() + Schema("", std::move(renamed_columns));
+          std::vector<ColumnName> right_physical;
+          right_physical.reserve(right_columns.size());
+          for (const ColumnName& c : right_columns) {
+            right_physical.push_back(to_physical(c));
+          }
+          // Every conjunct of the join predicate. The probe decides only a
+          // prefix of them, so this is also the source of the residual that
+          // restores the rest.
+          const std::vector<Expression> all_conjuncts =
+              predicate ? SplitConjuncts(predicate) : std::vector<Expression>{};
+          // Single-side conjuncts were already moved below the join; keeping
+          // them in the residual would evaluate them twice.
+          std::unordered_set<std::string> pushed;
+          for (const std::vector<Expression>* side :
+               {&left_pushed, &right_pushed}) {
+            for (const Expression& conjunct : *side) {
+              pushed.insert(conjunct->ToString());
+            }
+          }
           for (size_t i = 0; i < right_table->IndexCount(); ++i) {
             const Index& index_handle = right_table->GetIndex(i);
-            for (const ColumnName& column : right_columns) {
-              if (to_physical(column) ==
-                  physical_schema.GetColumn(index_handle.sc_.key_.front())
-                      .Name()) {
-                std::vector<ColumnName> right_physical;
-                right_physical.reserve(right_columns.size());
-                for (const ColumnName& c : right_columns) {
-                  right_physical.push_back(to_physical(c));
-                }
-                std::optional<size_t> index_rows = equi_rows;
-                if (index_handle.IsUnique() && index_rows.has_value()) {
-                  index_rows = std::min(*index_rows, RowEstimate(l_rows));
-                }
-                Plan join = std::make_shared<ProductPlan>(
-                    left_child, left_columns, *right_table, index_handle,
-                    right_physical, *stats_it->second, declared_output,
-                    index_rows);
-                const double local_cost = (l_rows * 2.0) + equi_estimate;
-                auto [plan, est] = with_residual(std::move(join));
-                candidates.push_back(PlanAlternative{.plan = std::move(plan),
-                                                     .local_cost = local_cost,
-                                                     .estimated_rows = est});
+            // Equality prefix in the index's own key order. Deriving it (rather
+            // than reusing the equi-join's key order) is what makes a
+            // composite index usable when only some of its key columns are
+            // join keys: the seek key has to be a prefix of the stored key
+            // image, not an unrelated byte range.
+            std::optional<LookupSeek> probe = DeriveLookupSeek(
+                index_handle, physical_schema, right_physical, left_columns);
+            if (!probe) {
+              continue;
+            }
+            // Conjuncts this probe decides by itself: the pinned prefix
+            // equalities, plus the range bound below when it is admissible.
+            std::unordered_set<std::string> enforced;
+            for (const ColumnName& key_column : probe->right_columns) {
+              const auto equality = std::ranges::find_if(
+                  equalities,
+                  [&](const std::pair<ColumnName, ColumnName>& entry) {
+                    return to_physical(entry.second) == key_column;
+                  });
+              if (equality != equalities.end()) {
+                enforced.insert(
+                    equi_conjuncts[static_cast<size_t>(equality -
+                                                       equalities.begin())]
+                        ->ToString());
               }
             }
+            // One range bound on the first index key column the equality
+            // prefix leaves open. SetLookupRange rejects the shapes that
+            // cannot be probed safely (a later key column, mismatched operand
+            // types, a type outside the range whitelist) and the conjunct then
+            // simply stays in the residual predicate below: an explicit
+            // fallback, never a silently dropped one.
+            std::optional<LookupRangeCandidate> range;
+            auto range_key_slot = slot_t{0};
+            if (probe->right_columns.size() < index_handle.sc_.key_.size()) {
+              const slot_t next_key =
+                  index_handle.sc_.key_[probe->right_columns.size()];
+              if (next_key < physical_schema.ColumnCount()) {
+                const ColumnName& key_physical =
+                    physical_schema.GetColumn(next_key).Name();
+                range = FindLookupRange(
+                    all_conjuncts, left.plan->GetSchema(),
+                    right.plan->GetSchema(),
+                    ColumnName(right_relation, key_physical.name),
+                    key_physical);
+                range_key_slot = next_key;
+              }
+            }
+            const bool point_probe =
+                !range.has_value() &&
+                probe->right_columns.size() == index_handle.sc_.key_.size();
+            // A unique index caps the output at the left row count only for a
+            // point probe on the complete key; with a range bound (or a prefix
+            // shorter than the key) one left row can still match several right
+            // rows.
+            std::optional<size_t> index_rows = equi_rows;
+            if (point_probe && index_handle.IsUnique() &&
+                index_rows.has_value()) {
+              index_rows = std::min(*index_rows, RowEstimate(l_rows));
+            }
+            Plan join = std::make_shared<ProductPlan>(
+                left_child, left_columns, *right_table, index_handle,
+                right_physical, *stats_it->second, declared_output, index_rows);
+            const bool range_adopted =
+                range.has_value() &&
+                static_cast<ProductPlan&>(*join).SetLookupRange(
+                    probe->right_columns.size(), range->left_column,
+                    range->right_physical, range->operation);
+            if (range_adopted) {
+              enforced.insert(range->conjunct->ToString());
+            }
+            // Everything the probe does not decide, and that was not already
+            // pushed below the join, becomes the residual predicate. This is
+            // where a second range column, an equality on a non-key column and
+            // a range the whitelist rejected all end up: the probe over-fetches
+            // and the predicate decides the rows.
+            std::vector<Expression> lookup_residual;
+            for (const Expression& conjunct : all_conjuncts) {
+              const std::string printed = conjunct->ToString();
+              if (enforced.contains(printed) || pushed.contains(printed)) {
+                continue;
+              }
+              lookup_residual.push_back(conjunct);
+            }
+            Plan lookup_plan = std::move(join);
+            if (!lookup_residual.empty()) {
+              lookup_plan = std::make_shared<SelectionPlan>(
+                  lookup_plan, CombineConjuncts(lookup_residual),
+                  lookup_plan->GetStats());
+            }
+            // One B+Tree probe plus row assembly per left row, plus the rows
+            // the probe is expected to hand back. A range bound turns the
+            // point probe into a range walk over the heap, so it pays the same
+            // clustering penalty the range-sliced index scan applies
+            // (see RangeClusteringPenalty).
+            double local_cost = (l_rows * 2.0) + equi_estimate;
+            if (range_adopted) {
+              local_cost = std::max(
+                  1.0, local_cost * RangeClusteringPenalty(*stats_it->second,
+                                                           range_key_slot));
+            }
+            // Read the estimate before the move: designated initializers are
+            // evaluated in declaration order, so `.plan = std::move(...)` runs
+            // before a later member's initializer would touch the plan.
+            const auto lookup_rows =
+                static_cast<double>(lookup_plan->EmitRowCount());
+            candidates.push_back(
+                PlanAlternative{.plan = std::move(lookup_plan),
+                                .local_cost = local_cost,
+                                .estimated_rows = lookup_rows});
           }
         }
       }
     }
   }
   return candidates;
+}
+
+std::vector<PlanAlternative> LateMaterializationAlternative(
+    const cascades::Memo& memo, cascades::GroupId right_group,
+    const std::optional<Expression>& condition, const BestPlan& left,
+    const BestPlan& right, const cascades::PhysicalProperties& required,
+    const cascades::RuleContext& context) {
+  if (!condition || !*condition || required.require_row_position ||
+      memo.Get(right_group).filter) {
+    return {};
+  }
+  const Table* right_table = right.plan->ScanSource();
+  if (right_table == nullptr || left.plan == nullptr || right.plan == nullptr) {
+    return {};
+  }
+  const Schema& left_schema = left.plan->GetSchema();
+  const Schema& right_schema = right.plan->GetSchema();
+  const Schema& physical_schema = right_table->GetSchema();
+  const auto has_array = [](const Schema& schema) {
+    return std::ranges::any_of(
+        std::views::iota(size_t{0}, schema.ColumnCount()),
+        [&schema](size_t index) {
+          return schema.GetColumn(index).Type() == ValueType::kArray;
+        });
+  };
+  if (has_array(left_schema) || has_array(right_schema) ||
+      has_array(physical_schema)) {
+    return {};
+  }
+  std::vector<std::pair<ColumnName, ColumnName>> equalities;
+  for (const Expression& conjunct : SplitConjuncts(*condition)) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (binary.Op() == BinaryOperation::kIsNotDistinctFrom) {
+      return {};
+    }
+    if (binary.Op() != BinaryOperation::kEquals ||
+        binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+    ColumnName left_column;
+    ColumnName right_column;
+    if (left_schema.Offset(lhs) >= 0 && right_schema.Offset(rhs) >= 0) {
+      left_column = lhs;
+      right_column = rhs;
+    } else if (left_schema.Offset(rhs) >= 0 && right_schema.Offset(lhs) >= 0) {
+      left_column = rhs;
+      right_column = lhs;
+    } else {
+      continue;
+    }
+    if (!SamePhysicalJoinType(left_schema, left_column, right_schema,
+                              right_column)) {
+      return {};
+    }
+    equalities.emplace_back(std::move(left_column), std::move(right_column));
+  }
+  if (equalities.empty() || ResidualContainsQuery(*condition) ||
+      !DeterministicForPushdown(*condition)) {
+    return {};
+  }
+  for (const ColumnName& column : (*condition)->TouchedColumns()) {
+    if (left_schema.Offset(column) < 0 && right_schema.Offset(column) < 0) {
+      return {};
+    }
+  }
+  const double left_rows = left.estimated_rows;
+  const double right_rows = right.estimated_rows;
+  const bool small_build_side =
+      right_rows <= 0.0 || left_rows >= right_rows * 4.0;
+  if (!small_build_side && right_schema.ColumnCount() < 6) {
+    return {};
+  }
+  std::string right_relation;
+  for (const auto& [relation, table] : context.tables) {
+    if (table.get() == right_table) {
+      right_relation = relation;
+      break;
+    }
+  }
+  const auto statistics = context.statistics.find(right_relation);
+  if (statistics == context.statistics.end()) {
+    return {};
+  }
+  std::vector<ColumnName> left_columns;
+  std::vector<ColumnName> right_columns;
+  for (const auto& [left_column, right_column] : equalities) {
+    left_columns.push_back(left_column);
+    right_columns.push_back(right_column);
+  }
+  const auto to_physical = [&](const ColumnName& column) {
+    const int offset = physical_schema.Offset(ColumnName("", column.name));
+    return offset < 0
+               ? ColumnName("", column.name)
+               : physical_schema.GetColumn(static_cast<size_t>(offset)).Name();
+  };
+  std::vector<ColumnName> physical_right_columns;
+  physical_right_columns.reserve(right_columns.size());
+  for (const ColumnName& column : right_columns) {
+    physical_right_columns.push_back(to_physical(column));
+  }
+  for (size_t index_offset = 0; index_offset < right_table->IndexCount();
+       ++index_offset) {
+    const Index& index = right_table->GetIndex(index_offset);
+    if (index.RetainsDeletedEntries()) {
+      continue;
+    }
+    const std::optional<LookupSeek> probe = DeriveLookupSeek(
+        index, physical_schema, physical_right_columns, left_columns);
+    if (!probe || probe->right_columns.empty() ||
+        right_schema.ColumnCount() <= probe->right_columns.size()) {
+      continue;
+    }
+    bool supported = true;
+    for (size_t i = 0; i < probe->right_columns.size(); ++i) {
+      const int offset = physical_schema.Offset(probe->right_columns[i]);
+      const int left_offset = left_schema.Offset(probe->left_columns[i]);
+      if (offset < 0 || left_offset < 0 ||
+          !SupportsLateMaterializationKeyType(
+              physical_schema.GetColumn(static_cast<size_t>(offset)).Type()) ||
+          !SupportsLateMaterializationKeyType(
+              left_schema.GetColumn(static_cast<size_t>(left_offset)).Type()) ||
+          physical_schema.GetColumn(static_cast<size_t>(offset)).IsUnsigned() ||
+          left_schema.GetColumn(static_cast<size_t>(left_offset))
+              .IsUnsigned()) {
+        supported = false;
+        break;
+      }
+    }
+    if (!supported) {
+      continue;
+    }
+    std::vector<slot_t> right_projection;
+    right_projection.reserve(right_schema.ColumnCount());
+    for (size_t i = 0; i < right_schema.ColumnCount(); ++i) {
+      const int offset = physical_schema.Offset(
+          ColumnName("", right_schema.GetColumn(i).Name().name));
+      if (offset < 0) {
+        supported = false;
+        break;
+      }
+      right_projection.push_back(static_cast<slot_t>(offset));
+    }
+    if (!supported) {
+      continue;
+    }
+    double equi_estimate = JoinCardinality(left, right, equalities, *condition);
+    const size_t estimated_rows = RowEstimate(equi_estimate);
+    const bool unique_winner =
+        index.StoresSingleValue() &&
+        probe->right_columns.size() == index.sc_.key_.size();
+    const Schema declared_output = left_schema + right_schema;
+    Plan late = std::make_shared<LateMaterializationJoinPlan>(
+        left.plan, probe->left_columns, *right_table, index,
+        probe->right_columns, *statistics->second, *condition, declared_output,
+        std::move(right_projection), unique_winner, estimated_rows);
+    double local_cost = (left_rows * 0.5) + (equi_estimate * 0.5);
+    ApplyLimitHint(late, required, context, 1.0, &local_cost, &equi_estimate);
+    return {PlanAlternative{.plan = std::move(late),
+                            .local_cost = local_cost,
+                            .estimated_rows = equi_estimate}};
+  }
+  return {};
+}
+
+struct ZigZagJoinSpec {
+  ColumnName left;
+  ColumnName right;
+  BinaryOperation operation;
+  Expression comparison;
+};
+
+bool IsZigZagComparison(BinaryOperation operation) {
+  return operation == BinaryOperation::kEquals || IsBandComparison(operation);
+}
+
+bool IsZigZagKeyNotNull(const Expression& conjunct, const ColumnName& left,
+                        const ColumnName& right) {
+  if (!conjunct || conjunct->Type() != TypeTag::kUnaryExp) {
+    return false;
+  }
+  const auto& unary = conjunct->AsUnaryExpression();
+  if (unary.Op() != UnaryOperation::kIsNotNull || !unary.Child() ||
+      unary.Child()->Type() != TypeTag::kColumnValue) {
+    return false;
+  }
+  const ColumnName& column = unary.Child()->AsColumnValue().GetColumnName();
+  return column == left || column == right;
+}
+
+std::optional<ZigZagJoinSpec> TryZigZagJoinSpec(const Expression& predicate,
+                                                const Plan& left,
+                                                const Plan& right) {
+  const std::vector<Expression> conjuncts = SplitConjuncts(predicate);
+  std::optional<ZigZagJoinSpec> spec;
+  for (const Expression& conjunct : conjuncts) {
+    if (!conjunct) {
+      return std::nullopt;
+    }
+    if (conjunct->Type() == TypeTag::kUnaryExp) {
+      continue;
+    }
+    if (conjunct->Type() != TypeTag::kBinaryExp || spec) {
+      return std::nullopt;
+    }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (!IsZigZagComparison(binary.Op()) || !binary.Left() || !binary.Right() ||
+        binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      return std::nullopt;
+    }
+    const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+    const int left_lhs = left->GetSchema().Offset(lhs);
+    const int left_rhs = left->GetSchema().Offset(rhs);
+    const int right_lhs = right->GetSchema().Offset(lhs);
+    const int right_rhs = right->GetSchema().Offset(rhs);
+    if (left_lhs >= 0 && right_rhs >= 0 && left_rhs < 0 && right_lhs < 0) {
+      spec = ZigZagJoinSpec{.left = lhs,
+                            .right = rhs,
+                            .operation = binary.Op(),
+                            .comparison = conjunct};
+    } else if (left_rhs >= 0 && right_lhs >= 0 && left_lhs < 0 &&
+               right_rhs < 0) {
+      spec = ZigZagJoinSpec{.left = rhs,
+                            .right = lhs,
+                            .operation = MirrorRangeOperation(binary.Op()),
+                            .comparison = conjunct};
+    } else {
+      return std::nullopt;
+    }
+  }
+  if (!spec) {
+    return std::nullopt;
+  }
+  for (const Expression& conjunct : conjuncts) {
+    if (conjunct == spec->comparison ||
+        IsZigZagKeyNotNull(conjunct, spec->left, spec->right)) {
+      continue;
+    }
+    return std::nullopt;
+  }
+  const int left_offset = left->GetSchema().Offset(spec->left);
+  const int right_offset = right->GetSchema().Offset(spec->right);
+  if (left_offset < 0 || right_offset < 0) {
+    return std::nullopt;
+  }
+  const Column& left_column =
+      left->GetSchema().GetColumn(static_cast<size_t>(left_offset));
+  const Column& right_column =
+      right->GetSchema().GetColumn(static_cast<size_t>(right_offset));
+  if (left_column.Type() != ValueType::kInt64 ||
+      right_column.Type() != ValueType::kInt64 || left_column.IsUnsigned() ||
+      right_column.IsUnsigned()) {
+    return std::nullopt;
+  }
+  return spec;
+}
+
+bool IsOrderedIndexPlan(const Plan& plan, const ColumnName& key) {
+  const bool index_access =
+      dynamic_cast<const IndexScanPlan*>(plan.get()) != nullptr ||
+      dynamic_cast<const IndexOnlyScanPlan*>(plan.get()) != nullptr ||
+      dynamic_cast<const IndexSkipScanPlan*>(plan.get()) != nullptr;
+  return index_access && plan->IsOrderedBy({ColumnValueExp(key)}, {true});
+}
+
+std::vector<PlanAlternative> ZigZagJoinAlternative(
+    const std::optional<Expression>& condition, const BestPlan& left,
+    const BestPlan& right) {
+  if (!condition || !*condition) {
+    return {};
+  }
+  const auto spec = TryZigZagJoinSpec(*condition, left.plan, right.plan);
+  if (!spec || !IsOrderedIndexPlan(left.plan, spec->left) ||
+      !IsOrderedIndexPlan(right.plan, spec->right)) {
+    return {};
+  }
+
+  double estimated_rows = 0.0;
+  if (spec->operation == BinaryOperation::kEquals) {
+    estimated_rows =
+        JoinCardinality(left, right,
+                        std::vector<std::pair<ColumnName, ColumnName>>{
+                            {spec->left, spec->right}});
+  } else {
+    estimated_rows = left.estimated_rows * right.estimated_rows * 0.5;
+  }
+  const size_t output_rows = RowEstimate(estimated_rows);
+  Plan plan = std::make_shared<ZigZagJoinPlan>(
+      left.plan, spec->left, right.plan, spec->right, spec->operation,
+      *condition, output_rows);
+  const double local_cost = 0.8 * (left.estimated_rows + right.estimated_rows);
+  return {PlanAlternative{.plan = std::move(plan),
+                          .local_cost = local_cost,
+                          .estimated_rows = static_cast<double>(output_rows)}};
+}
+
+struct BandJoinSpec {
+  ColumnName left;
+  ColumnName right;
+  BinaryOperation comparison;
+};
+
+std::optional<BandJoinSpec> TryBandJoinSpec(const Expression& predicate,
+                                            const Plan& left,
+                                            const Plan& right) {
+  const std::vector<Expression> conjuncts = SplitConjuncts(predicate);
+  if (conjuncts.size() != 1 || !conjuncts.front() ||
+      conjuncts.front()->Type() != TypeTag::kBinaryExp) {
+    return std::nullopt;
+  }
+  const auto& binary = conjuncts.front()->AsBinaryExpression();
+  if (!IsBandComparison(binary.Op()) || !binary.Left() || !binary.Right() ||
+      binary.Left()->Type() != TypeTag::kColumnValue ||
+      binary.Right()->Type() != TypeTag::kColumnValue) {
+    return std::nullopt;
+  }
+  const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+  const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+  const int left_lhs = left->GetSchema().Offset(lhs);
+  const int left_rhs = left->GetSchema().Offset(rhs);
+  const int right_lhs = right->GetSchema().Offset(lhs);
+  const int right_rhs = right->GetSchema().Offset(rhs);
+
+  ColumnName left_column;
+  ColumnName right_column;
+  BinaryOperation comparison = binary.Op();
+  if (left_lhs >= 0 && right_rhs >= 0 && left_rhs < 0 && right_lhs < 0) {
+    left_column = lhs;
+    right_column = rhs;
+  } else if (left_rhs >= 0 && right_lhs >= 0 && left_lhs < 0 && right_rhs < 0) {
+    left_column = rhs;
+    right_column = lhs;
+    // The predicate reads `lhs <op> rhs` but this join's children are in the
+    // opposite order, so the spec must describe `left_column <comparison>
+    // right_column` -- the form the executor's candidate range is computed
+    // from. Keeping the written operator here would make the range enumerate
+    // the mirrored condition (e.g. treat `f.a <= d.k` as `d.k <= f.a` after
+    // join_commutativity swapped the children), so the range and the residual
+    // re-check would disagree and the join would silently drop rows.
+    comparison = MirrorRangeOperation(binary.Op());
+  } else {
+    return std::nullopt;
+  }
+
+  const int left_offset = left->GetSchema().Offset(left_column);
+  const int right_offset = right->GetSchema().Offset(right_column);
+  if (left_offset < 0 || right_offset < 0 ||
+      left->GetSchema().GetColumn(static_cast<size_t>(left_offset)).Type() !=
+          right->GetSchema()
+              .GetColumn(static_cast<size_t>(right_offset))
+              .Type()) {
+    return std::nullopt;
+  }
+  const ValueType type =
+      left->GetSchema().GetColumn(static_cast<size_t>(left_offset)).Type();
+  if ((type != ValueType::kInt64 && type != ValueType::kDate) ||
+      left->GetSchema()
+          .GetColumn(static_cast<size_t>(left_offset))
+          .IsUnsigned() ||
+      right->GetSchema()
+          .GetColumn(static_cast<size_t>(right_offset))
+          .IsUnsigned()) {
+    return std::nullopt;
+  }
+  return BandJoinSpec{.left = std::move(left_column),
+                      .right = std::move(right_column),
+                      .comparison = comparison};
+}
+
+std::vector<PlanAlternative> BandJoinAlternative(
+    const cascades::Memo& memo, cascades::GroupId right_group,
+    const std::optional<Expression>& condition, const BestPlan& left,
+    const BestPlan& right, JoinKind kind) {
+  if (!condition || !*condition) {
+    return {};
+  }
+  const auto spec = TryBandJoinSpec(*condition, left.plan, right.plan);
+  if (!spec) {
+    return {};
+  }
+
+  const Expression left_order = ColumnValueExp(spec->left);
+  const Expression right_order = ColumnValueExp(spec->right);
+  const std::vector<bool> ascending{true};
+  const bool left_ordered = left.plan->IsOrderedBy({left_order}, ascending);
+  const bool right_ordered = right.plan->IsOrderedBy({right_order}, ascending);
+  const auto sort_cost = [](double rows) {
+    return rows * std::log2(std::max(2.0, rows));
+  };
+
+  Plan left_plan = left.plan;
+  Plan right_plan = right.plan;
+  double local_cost = left.estimated_rows + right.estimated_rows;
+  if (!left_ordered) {
+    left_plan =
+        MakeSortPlan(std::move(left_plan),
+                     std::vector<SortKey>{SortKey{.expression = left_order,
+                                                  .ascending = true,
+                                                  .nulls_first = std::nullopt}},
+                     left.estimated_rows);
+    local_cost += sort_cost(left.estimated_rows);
+  }
+  if (!right_ordered) {
+    right_plan =
+        MakeSortPlan(std::move(right_plan),
+                     std::vector<SortKey>{SortKey{.expression = right_order,
+                                                  .ascending = true,
+                                                  .nulls_first = std::nullopt}},
+                     right.estimated_rows);
+    local_cost += sort_cost(right.estimated_rows);
+  }
+
+  const double match_estimate =
+      left.estimated_rows * right.estimated_rows * 0.5;
+  const size_t match_rows = RowEstimate(match_estimate);
+  const size_t output_rows = EstimatedJoinRowCount(
+      kind, static_cast<size_t>(left.estimated_rows),
+      static_cast<size_t>(right.estimated_rows), match_rows);
+  local_cost += static_cast<double>(output_rows);
+  if (left_ordered && right_ordered) {
+    local_cost *= 0.8;
+  }
+  Plan band = std::make_shared<BandJoinPlan>(
+      std::move(left_plan), std::vector<ColumnName>{spec->left},
+      std::move(right_plan), std::vector<ColumnName>{spec->right}, kind,
+      spec->comparison, *condition, output_rows);
+  (void)memo;
+  (void)right_group;
+  return {PlanAlternative{.plan = std::move(band),
+                          .local_cost = local_cost,
+                          .estimated_rows = static_cast<double>(output_rows)}};
 }
 
 // A merge join is only sound when both children deliver the equality keys in
@@ -1650,6 +2668,9 @@ std::vector<PlanAlternative> MergeJoinAlternative(
     const BestPlan& right, const cascades::RuleContext& context,
     JoinAlternativeKind kind = JoinAlternativeKind::kInner) {
   const Expression predicate = condition ? *condition : nullptr;
+  if (HasNullSafeCrossJoinEquality(predicate, left.plan, right.plan)) {
+    return {};
+  }
   std::vector<ColumnName> left_columns;
   std::vector<ColumnName> right_columns;
   std::vector<Expression> equality_expressions;
@@ -1746,8 +2767,8 @@ std::vector<PlanAlternative> MergeJoinAlternative(
                              .ascending = true,
                              .nulls_first = std::nullopt});
     }
-    left_plan =
-        std::make_shared<SortPlan>(std::move(left_plan), std::move(keys));
+    left_plan = MakeSortPlan(std::move(left_plan), std::move(keys),
+                             left.estimated_rows);
     local_cost += sort_cost(left.estimated_rows);
   }
   if (!right_ordered) {
@@ -1758,8 +2779,8 @@ std::vector<PlanAlternative> MergeJoinAlternative(
                              .ascending = true,
                              .nulls_first = std::nullopt});
     }
-    right_plan =
-        std::make_shared<SortPlan>(std::move(right_plan), std::move(keys));
+    right_plan = MakeSortPlan(std::move(right_plan), std::move(keys),
+                              right.estimated_rows);
     local_cost += sort_cost(right.estimated_rows);
   }
   auto physical_kind = JoinKind{};
@@ -1794,7 +2815,7 @@ std::vector<PlanAlternative> MergeJoinAlternative(
     merge = std::make_shared<SelectionPlan>(
         std::move(merge), CombineConjuncts(residual_conjuncts), merge_stats);
   }
-  const double estimated_rows = static_cast<double>(merge->EmitRowCount());
+  const auto estimated_rows = static_cast<double>(merge->EmitRowCount());
   (void)memo;
   (void)right_group;
   (void)context;
@@ -1873,9 +2894,8 @@ bool HasCatalogTypeCompatibleEqui(const cascades::Memo& memo,
 // The gate (usable predicate, no equi pair) keeps hash/merge shapes — and
 // single-key equi NOT IN, the only source of null-aware anti joins — out of
 // reach, so the rule only fires where hash/merge offer nothing:
-// - inner: ties the tuple nested_loop_join exactly (same shape, cost and
-//   estimate); the tuple rule is registered first and wins ties, so
-//   existing plans are unchanged and the blocked form is a tested fallback.
+// - inner: the blocked kernel has a lower per-pair cost than the tuple
+//   nested loop, so ordinary SQL can select it.
 // - semi/anti/full/right-outer: no tuple implementation exists, so the
 //   blocked form is new capability (previously relational fallback).
 // Semi/anti/outer carry no Selection wrapper: the executor null-pads
@@ -1920,297 +2940,224 @@ std::vector<PlanAlternative> BatchNestedLoopFor(
     join = std::make_shared<SelectionPlan>(join, predicate, join->GetStats());
   }
   const auto estimated_rows = static_cast<double>(join->EmitRowCount());
-  return {PlanAlternative{.plan = std::move(join),
-                          .local_cost = (l_rows * r_rows) + l_rows + r_rows,
-                          .estimated_rows = estimated_rows}};
+  return {
+      PlanAlternative{.plan = std::move(join),
+                      .local_cost = (l_rows * r_rows * 0.8) + l_rows + r_rows,
+                      .estimated_rows = estimated_rows}};
+}
+
+// What the two sort shapes agree on, so the rules that pick between them differ
+// only in the memory decision. The ORDER BY contract (keys, directions, NULL
+// placement, collation) and the elision check are shared verbatim: eliding a
+// sort is only sound when the child delivers the order under the collation the
+// parent asked for, because a case-insensitive ORDER BY is not a binary order.
+struct SortShapeInput {
+  Plan child;
+  std::vector<SortKey> keys;
+  double rows{0.0};
+  bool elided{false};
+};
+
+// Nullopt when the shape does not apply to this node at all.
+std::optional<SortShapeInput> PrepareSortShape(
+    const cascades::LogicalExpression& logical,
+    const PhysicalProperties& required, const std::vector<BestPlan>& children) {
+  if (children.size() != 1 ||
+      logical.target_list.size() != logical.sort_ascending.size()) {
+    return std::nullopt;
+  }
+  SortShapeInput input;
+  input.rows = children[0].estimated_rows;
+  input.keys.reserve(logical.target_list.size());
+  std::vector<Expression> expressions;
+  expressions.reserve(logical.target_list.size());
+  for (size_t i = 0; i < logical.target_list.size(); ++i) {
+    expressions.push_back(logical.target_list[i].expression);
+    input.keys.push_back(SortKey{
+        .expression = logical.target_list[i].expression,
+        .ascending = logical.sort_ascending[i],
+        .nulls_first = i < logical.sort_nulls_first.size()
+                           ? logical.sort_nulls_first[i]
+                           : std::nullopt,
+        .collation = CollationOfExpression(logical.target_list[i].expression)});
+  }
+  if (cascades::SatisfiesOrderingCollation(children[0].plan, required) &&
+      children[0].plan->IsOrderedBy(expressions, logical.sort_ascending,
+                                    logical.sort_nulls_first)) {
+    input.child = children[0].plan;
+    input.elided = true;
+    return input;
+  }
+  input.child = children[0].plan;
+  return input;
+}
+
+// In-memory comparison cost, shared by both shapes.
+double SortComparisonCost(double rows) {
+  return rows * std::log2(std::max(2.0, rows));
+}
+
+// The two shapes are the same ORDER BY, so the choice between them is a
+// memory one: the buffered sort while the estimated input fits the memory
+// budget, the external merge sort above it. Each rule owns one side of that
+// split, so exactly one of them applies to a node and the selection is a
+// deterministic function of the estimate (which the contract tests pin down).
+// Both keep the operator's own spill selection as the last resort, so a
+// mis-estimated shape still returns identical rows in identical order.
+std::vector<PlanAlternative> ImplementBufferedSort(
+    cascades::GroupId /*group*/, const cascades::Memo& /*memo*/,
+    const cascades::Bindings& /*bindings*/,
+    const cascades::LogicalExpression& logical,
+    const std::vector<BestPlan>& children, const PhysicalProperties& required,
+    const cascades::RuleContext& /*context*/) {
+  const std::optional<SortShapeInput> prepared =
+      PrepareSortShape(logical, required, children);
+  if (!prepared) {
+    return {};
+  }
+  if (prepared->elided) {
+    return {PlanAlternative{.plan = prepared->child,
+                            .local_cost = 0,
+                            .estimated_rows = prepared->rows}};
+  }
+  // Only the buffered side of the split: above the row capacity the estimate
+  // belongs to the external merge shape, which offers the alternative instead.
+  const SortMemoryPolicy memory;
+  if (SortStrategyForRows(prepared->rows, memory) != SortStrategy::kBuffered) {
+    return {};
+  }
+  Plan sort =
+      MakeSortPlan(prepared->child, prepared->keys, prepared->rows, memory);
+  return {PlanAlternative{.plan = std::move(sort),
+                          .local_cost = SortComparisonCost(prepared->rows),
+                          .estimated_rows = prepared->rows}};
+}
+
+std::vector<PlanAlternative> ImplementExternalMergeSort(
+    cascades::GroupId /*group*/, const cascades::Memo& /*memo*/,
+    const cascades::Bindings& /*bindings*/,
+    const cascades::LogicalExpression& logical,
+    const std::vector<BestPlan>& children, const PhysicalProperties& required,
+    const cascades::RuleContext& /*context*/) {
+  const std::optional<SortShapeInput> prepared =
+      PrepareSortShape(logical, required, children);
+  if (!prepared || prepared->elided) {
+    return {};
+  }
+  // Only the spill side of the split, and never a second copy of the elision
+  // the buffered rule already offered.
+  const SortMemoryPolicy memory;
+  if (SortStrategyForRows(prepared->rows, memory) !=
+      SortStrategy::kExternalMerge) {
+    return {};
+  }
+  Plan sort =
+      MakeSortPlan(prepared->child, prepared->keys, prepared->rows, memory);
+  // Writing and re-merging the runs is what the buffered shape avoids, so the
+  // shape is priced with the same n log n term plus the spill the estimate
+  // says is unavoidable (MemoryBudget in the same unit as the policy).
+  cascades::MemoryBudget budget;
+  budget.max_memory_bytes = static_cast<double>(memory.memory_budget_bytes);
+  budget.row_size_bytes = static_cast<double>(kSortEstimatedRowBytes);
+  const double cost =
+      SortComparisonCost(prepared->rows) +
+      cascades::EstimateMemorySpillCost(cascades::OperatorCostKind::kSort,
+                                        prepared->rows, budget);
+  return {PlanAlternative{.plan = std::move(sort),
+                          .local_cost = cost,
+                          .estimated_rows = prepared->rows}};
+}
+
+// The optimizer's memory model in the unit the aggregate policy counts in
+// (bytes over groups of the estimated row width), so the rule's spill decision
+// and the operator's accounting speak the same language.
+cascades::MemoryBudget AggregateMemoryBudget(
+    const AggregateMemoryPolicy& memory = AggregateMemoryPolicy{}) {
+  cascades::MemoryBudget budget;
+  budget.max_memory_bytes = static_cast<double>(memory.memory_budget_bytes);
+  budget.row_size_bytes = static_cast<double>(kAggregateEstimatedRowBytes);
+  return budget;
+}
+
+// Whether a child already delivers the group-key order the stream shape
+// requires: the keys ascending with NULLs first, which is the engine default
+// for an ascending key. Anything else (a different direction, a different key
+// list, a missing order) leaves the shape unusable, because folding an
+// unordered input would silently produce an order it never had.
+bool ChildDeliversGroupKeyOrder(const BestPlan& child,
+                                const std::vector<Expression>& keys) {
+  if (child.plan == nullptr || keys.empty()) {
+    return false;
+  }
+  std::vector<bool> ascending(keys.size(), true);
+  std::vector<std::optional<bool>> nulls_first(keys.size(), true);
+  return child.plan->IsOrderedBy(keys, ascending, nulls_first);
 }
 
 }  // namespace
 
-StatusOr<Plan> OptimizeSingleRelation(
+StatusOr<Plan> OptimizeMinMaxIndex(
     const QueryData& query, const Expression& predicate,
-    const std::vector<NamedExpression>& projection_items, bool has_aggregate,
-    bool distinct, const cascades::PhysicalProperties& required,
+    const std::vector<NamedExpression>& projection_items,
     const cascades::RuleContext& context) {
-  if (query.from_.size() != 1) {
+  if (query.from_.size() != 1 || projection_items.size() != 1 ||
+      query.distinct_ || query.require_row_position_ ||
+      (predicate && (predicate->Type() != TypeTag::kConstantValue ||
+                     !predicate->AsConstantValue().GetValue().Truthy()))) {
     return Status::kNotImplemented;
   }
-
   const std::string& relation = query.from_.front();
-  cascades::Memo memo;
-  const cascades::GroupId group = memo.Build(
-      query.from_, {{predicate, std::vector<std::string>{relation}}});
-  const cascades::Group& scan_group = memo.Get(group);
-  if (scan_group.expressions.size() != 1 ||
-      scan_group.expressions.front().operation !=
-          cascades::LogicalOperator::kScan) {
+  if (!context.tables.contains(relation) ||
+      !context.statistics.contains(relation)) {
     return Status::kNotImplemented;
   }
-
-  std::vector<PlanAlternative> alternatives;
-  const auto materialized = query.lifted_ctes_.cells.find(relation);
-  const bool is_materialized = materialized != query.lifted_ctes_.cells.end() &&
-                               materialized->second != nullptr;
-  if (is_materialized) {
-    // A materialized CTE scans shared rows with no catalog objects: offer a
-    // single Values alternative and apply the whole predicate above it (a
-    // scan-group filter would be ignored by the Values implementation, so
-    // the fast path carries its own residual like the general search does).
-    // Row positions are unavailable from row cells.
-    if (required.require_row_position) {
-      return Status::kNotImplemented;
-    }
-    Plan values = std::make_shared<ValuesPlan>(materialized->second->schema,
-                                               materialized->second->rows);
-    const auto rows = static_cast<double>(materialized->second->rows.size());
-    if (predicate && (predicate->Type() != TypeTag::kConstantValue ||
-                      !predicate->AsConstantValue().GetValue().Truthy())) {
-      values = std::make_shared<SelectionPlan>(values, predicate,
-                                               values->GetStats());
-    }
-    alternatives.push_back(PlanAlternative{
-        .plan = std::move(values), .local_cost = rows, .estimated_rows = rows});
-  } else {
-    alternatives = ScanAlternatives(memo, group, scan_group.expressions.front(),
-                                    required, context,
-                                    /*include_indexes=*/true,
-                                    /*include_full_scan=*/true);
-  }
-  if (alternatives.empty()) {
-    return Status::kNotImplemented;
-  }
-
-  // A scalar MIN/MAX of a non-null single-column key can be answered by the
-  // first entry of that key's ordered index.  This is both cheaper and more
-  // precise than scanning the relation and feeding every row to an
-  // aggregate.  Restrict the rewrite to a NOT NULL/PRIMARY KEY column: a
-  // general nullable index needs a separate null-position contract and must
-  // retain the ordinary aggregate path. Materialized CTEs have no indexes;
-  // their MIN/MAX flows through the ordinary aggregate below.
-  if (!is_materialized && has_aggregate && !distinct &&
-      query.from_.size() == 1 && projection_items.size() == 1 &&
-      (!predicate || (predicate->Type() == TypeTag::kConstantValue &&
-                      predicate->AsConstantValue().GetValue().Truthy()))) {
-    const NamedExpression& output = projection_items.front();
-    if (output.expression &&
-        output.expression->Type() == TypeTag::kAggregateExp) {
-      const auto& aggregate = output.expression->AsAggregateExpression();
-      const bool is_min = aggregate.GetType() == AggregationType::kMin;
-      const bool is_max = aggregate.GetType() == AggregationType::kMax;
-      const Expression& child = aggregate.Child();
-      if ((is_min || is_max) && !aggregate.Distinct() &&
-          !aggregate.NeedsGroupContext() && child &&
-          child->Type() == TypeTag::kColumnValue) {
-        const ColumnName target = child->AsColumnValue().GetColumnName();
-        const Table& table = *context.tables.at(relation);
-        const Schema& schema = table.GetSchema();
-        const int target_slot = schema.Offset(target);
-        if (target_slot >= 0 &&
-            schema.GetColumn(static_cast<size_t>(target_slot))
-                    .GetConstraint()
-                    .ctype != Constraint::kNothing) {
-          const auto& column_constraint =
-              schema.GetColumn(static_cast<size_t>(target_slot))
-                  .GetConstraint();
-          const bool non_null =
-              column_constraint.ctype == Constraint::kNotNull ||
-              column_constraint.ctype == Constraint::kPrimaryKey;
-          if (non_null) {
-            const TableStatistics& statistics =
-                *context.statistics.at(relation);
-            for (size_t index_offset = 0; index_offset < table.IndexCount();
-                 ++index_offset) {
-              const Index& index = table.GetIndex(index_offset);
-              if (index.sc_.key_.size() != 1 ||
-                  index.sc_.key_.front() != static_cast<slot_t>(target_slot) ||
-                  index.RetainsDeletedEntries()) {
-                continue;
-              }
-              const ColumnName provided =
-                  schema.GetColumn(static_cast<size_t>(target_slot)).Name();
-              Plan scan = std::make_shared<IndexOnlyScanPlan>(
-                  table, index, statistics, std::vector<Value>{},
-                  std::vector<Value>{}, is_min, ConstantValueExp(Value(true)),
-                  std::vector<ColumnName>{provided});
-              Plan minmax = std::make_shared<MinMaxIndexPlan>(
-                  std::move(scan), output, 0, is_max);
-              return minmax;
+  const NamedExpression& output = projection_items.front();
+  if (output.expression &&
+      output.expression->Type() == TypeTag::kAggregateExp) {
+    const auto& aggregate = output.expression->AsAggregateExpression();
+    const bool is_min = aggregate.GetType() == AggregationType::kMin;
+    const bool is_max = aggregate.GetType() == AggregationType::kMax;
+    const Expression& child = aggregate.Child();
+    if ((is_min || is_max) && !aggregate.Distinct() &&
+        !aggregate.NeedsGroupContext() && child &&
+        child->Type() == TypeTag::kColumnValue) {
+      const ColumnName target = child->AsColumnValue().GetColumnName();
+      const Table& table = *context.tables.at(relation);
+      const Schema& schema = table.GetSchema();
+      const int target_slot = schema.Offset(target);
+      if (target_slot >= 0 && schema.GetColumn(static_cast<size_t>(target_slot))
+                                      .GetConstraint()
+                                      .ctype != Constraint::kNothing) {
+        const auto& column_constraint =
+            schema.GetColumn(static_cast<size_t>(target_slot)).GetConstraint();
+        const bool non_null =
+            column_constraint.ctype == Constraint::kNotNull ||
+            column_constraint.ctype == Constraint::kPrimaryKey;
+        if (non_null) {
+          const TableStatistics& statistics = *context.statistics.at(relation);
+          for (size_t index_offset = 0; index_offset < table.IndexCount();
+               ++index_offset) {
+            const Index& index = table.GetIndex(index_offset);
+            if (index.sc_.key_.size() != 1 ||
+                index.sc_.key_.front() != static_cast<slot_t>(target_slot) ||
+                index.RetainsDeletedEntries()) {
+              continue;
             }
+            const ColumnName provided =
+                schema.GetColumn(static_cast<size_t>(target_slot)).Name();
+            Plan scan = std::make_shared<IndexOnlyScanPlan>(
+                table, index, statistics, std::vector<Value>{},
+                std::vector<Value>{}, is_min, ConstantValueExp(Value(true)),
+                std::vector<ColumnName>{provided});
+            Plan minmax = std::make_shared<MinMaxIndexPlan>(std::move(scan),
+                                                            output, 0, is_max);
+            return minmax;
           }
         }
       }
     }
   }
-  auto ordered = [&](const PlanAlternative& alternative) {
-    return query.order_expressions_.empty() ||
-           alternative.plan->IsOrderedBy(query.order_expressions_,
-                                         query.order_ascending_,
-                                         query.order_nulls_first_);
-  };
-  const bool ordered_candidate = std::ranges::any_of(alternatives, ordered);
-  const auto best = std::ranges::min_element(
-      alternatives, {}, [&](const PlanAlternative& alternative) {
-        // A physically ordered candidate avoids the engine-side sort.  The
-        // general Cascades search enforces this required property before
-        // comparing costs; mirror that behavior in the direct path.
-        return std::pair{ordered_candidate && !ordered(alternative),
-                         alternative.local_cost};
-      });
-  Plan plan = best->plan;
-  if (has_aggregate) {
-    if (required.require_row_position) {
-      return Status::kNotImplemented;
-    }
-    plan = std::make_shared<HashAggregatePlan>(plan, projection_items);
-  } else {
-    plan = RemoveIdentityProjection(std::move(plan), projection_items);
-  }
-
-  if (distinct) {
-    // DISTINCT over a single-column covering index skip-scans distinct keys
-    // instead of hashing every row (the index order also satisfies an
-    // ascending ORDER BY on that column).  Projections between the DISTINCT
-    // and the scan are transparent for a pure column passthrough.
-    Plan scan_plan = plan;
-    std::vector<NamedExpression> distinct_items = projection_items;
-    while (true) {
-      const auto* projection =
-          dynamic_cast<const ProjectionPlan*>(scan_plan.get());
-      if (projection == nullptr) {
-        break;
-      }
-      distinct_items = projection->Columns();
-      scan_plan = projection->GetSource();
-    }
-    const auto* index_only =
-        dynamic_cast<const IndexOnlyScanPlan*>(scan_plan.get());
-    bool skip_scan_built = false;
-    if (index_only != nullptr && !required.require_row_position &&
-        distinct_items.size() == 1 && distinct_items[0].expression &&
-        distinct_items[0].expression->Type() == TypeTag::kColumnValue) {
-      const Index& index = index_only->GetIndex();
-      const ColumnName distinct_column =
-          distinct_items[0].expression->AsColumnValue().GetColumnName();
-      const Table* table = index_only->ScanSource();
-      const int offset = table->GetSchema().Offset(distinct_column);
-      if (!index.RetainsDeletedEntries() && index.sc_.key_.size() == 1 &&
-          index_only->BeginKey().empty() && index_only->EndKey().empty() &&
-          offset >= 0 &&
-          index.sc_.key_.front() == static_cast<slot_t>(offset)) {
-        std::vector<NamedExpression> select_items = index_only->SelectItems();
-        if (select_items.empty()) {
-          select_items.emplace_back(distinct_column.name,
-                                    ColumnValueExp(distinct_column));
-        }
-        const Schema& scan_schema = index_only->GetSchema();
-        plan = std::make_shared<SkipScanDistinctPlan>(
-            *table, index, index_only->GetStats(), index_only->IsAscending(),
-            std::move(select_items), scan_schema);
-        skip_scan_built = true;
-      }
-    }
-    if (!skip_scan_built) {
-      plan = std::make_shared<DistinctPlan>(std::move(plan));
-    }
-  }
-
-  const std::vector<Expression> sort_expressions =
-      NormalizeOrderingForOutput(query.order_expressions_, projection_items);
-  // NormalizeOrderingForOutput preserves key positions, so null placement
-  // slices positionally alongside the normalized keys.
-  auto slice_nulls = [&](size_t count) {
-    std::vector<std::optional<bool>> sliced;
-    sliced.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-      sliced.push_back(i < query.order_nulls_first_.size()
-                           ? query.order_nulls_first_[i]
-                           : std::nullopt);
-    }
-    return sliced;
-  };
-  bool ordered_plan =
-      sort_expressions.empty() ||
-      plan->IsOrderedBy(sort_expressions, query.order_ascending_,
-                        slice_nulls(sort_expressions.size()));
-  if (!ordered_plan) {
-    // If the child already arrives in the leading ORDER BY prefix, sort only
-    // each contiguous prefix group. This preserves the requested global order
-    // while avoiding a relation-wide sort for clustered/covering indexes.
-    size_t prefix_length = 0;
-    for (size_t length = sort_expressions.size(); length > 1; --length) {
-      std::vector<Expression> prefix_expressions(
-          sort_expressions.begin(),
-          sort_expressions.begin() + static_cast<std::ptrdiff_t>(length - 1));
-      std::vector<bool> prefix_ascending(
-          query.order_ascending_.begin(),
-          query.order_ascending_.begin() +
-              static_cast<std::ptrdiff_t>(length - 1));
-      if (plan->IsOrderedBy(prefix_expressions, prefix_ascending,
-                            slice_nulls(length - 1))) {
-        prefix_length = length - 1;
-        break;
-      }
-    }
-    if (prefix_length != 0) {
-      std::vector<SortKey> prefix_keys;
-      std::vector<SortKey> suffix_keys;
-      prefix_keys.reserve(prefix_length);
-      suffix_keys.reserve(sort_expressions.size() - prefix_length);
-      for (size_t i = 0; i < sort_expressions.size(); ++i) {
-        SortKey key{.expression = sort_expressions[i],
-                    .ascending = query.order_ascending_[i],
-                    .nulls_first = i < query.order_nulls_first_.size()
-                                       ? query.order_nulls_first_[i]
-                                       : std::nullopt};
-        (i < prefix_length ? prefix_keys : suffix_keys)
-            .push_back(std::move(key));
-      }
-      plan = std::make_shared<IncrementalSortPlan>(
-          std::move(plan), std::move(prefix_keys), std::move(suffix_keys));
-      ordered_plan = true;
-    }
-  }
-  if (!ordered_plan) {
-    if (query.limit_count_ != 0 && !sort_expressions.empty()) {
-      std::vector<TopNKey> keys;
-      keys.reserve(sort_expressions.size());
-      for (size_t i = 0; i < sort_expressions.size(); ++i) {
-        keys.push_back(
-            TopNKey{.expression = sort_expressions[i],
-                    .ascending = query.order_ascending_[i],
-                    .nulls_first = i < query.order_nulls_first_.size()
-                                       ? query.order_nulls_first_[i]
-                                       : std::nullopt});
-      }
-      plan =
-          std::make_shared<TopNPlan>(std::move(plan), std::move(keys),
-                                     query.limit_count_, query.limit_offset_);
-    } else {
-      std::vector<SortKey> keys;
-      keys.reserve(sort_expressions.size());
-      for (size_t i = 0; i < sort_expressions.size(); ++i) {
-        keys.push_back(
-            SortKey{.expression = sort_expressions[i],
-                    .ascending = query.order_ascending_[i],
-                    .nulls_first = i < query.order_nulls_first_.size()
-                                       ? query.order_nulls_first_[i]
-                                       : std::nullopt});
-      }
-      plan = std::make_shared<SortPlan>(std::move(plan), std::move(keys));
-    }
-  }
-
-  if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
-    const bool needs_ordering = !sort_expressions.empty();
-    const bool topn = std::dynamic_pointer_cast<TopNPlan>(plan) != nullptr;
-    if (!topn && (!needs_ordering ||
-                  plan->IsOrderedBy(sort_expressions, query.order_ascending_,
-                                    slice_nulls(sort_expressions.size())))) {
-      plan = std::make_shared<LimitPlan>(std::move(plan), query.limit_count_,
-                                         query.limit_offset_);
-    }
-  }
-  return plan;
+  return Status::kNotImplemented;
 }
 
 const cascades::ImplementationRuleSet& DefaultImplementationRules() {
@@ -2432,7 +3379,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           spec.weight_alias = logical.sample_weight_alias;
           Plan sample =
               std::make_shared<SamplePlan>(children[0].plan, std::move(spec));
-          const double rows = static_cast<double>(sample->EmitRowCount());
+          const auto rows = static_cast<double>(sample->EmitRowCount());
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(sample),
                               .local_cost = children[0].estimated_rows,
@@ -2448,8 +3395,100 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           if (children.size() != 1) {
             return std::vector<PlanAlternative>{};
           }
+          for (const auto& target : logical.target_list) {
+            if (!target.expression) {
+              return std::vector<PlanAlternative>{};
+            }
+            for (const auto& column : target.expression->TouchedColumns()) {
+              if (children[0].plan->GetSchema().Offset(column) < 0) {
+                return std::vector<PlanAlternative>{};
+              }
+            }
+          }
+          // Scan projection: when the child chain is a stack of row-shaping
+          // wrappers (projections, filters) over a plain full scan, narrow
+          // the scan to the columns the chain actually reads. Full-row decode
+          // is the scan's dominant cost on wide tables and the relational
+          // route has always decoded only the required columns; this carries
+          // the same win into Cascades plans. Gates: no DML source
+          // (head-image reads need every column), no peek compares or
+          // max-rows (other scan shapes), no clustered-order claim (the
+          // claiming column may not be emitted), and the scan must not
+          // already be narrowed. The wrapper stack is rebuilt over the
+          // narrowed scan because each wrapper caches its child-schema
+          // derived output.
+          Plan scan_input = children[0].plan;
+          {
+            std::vector<const ProjectionPlan*> projections;
+            std::vector<const SelectionPlan*> filters;
+            const FullScanPlan* scan = nullptr;
+            std::set<slot_t> needed;
+            const Schema* scan_schema = nullptr;
+            const auto collect = [&](const Expression& expression) {
+              if (!expression || scan_schema == nullptr) {
+                return;
+              }
+              for (const ColumnName& column : expression->TouchedColumns()) {
+                const int offset = scan_schema->Offset(column);
+                if (offset >= 0) {
+                  needed.insert(static_cast<slot_t>(offset));
+                }
+              }
+            };
+            Plan holder = children[0].plan;
+            while (holder != nullptr) {
+              if (const auto* projection =
+                      dynamic_cast<const ProjectionPlan*>(holder.get())) {
+                for (const auto& named : projection->Columns()) {
+                  collect(named.expression);
+                }
+                projections.push_back(projection);
+                holder = projection->GetSource();
+              } else if (const auto* selection =
+                             dynamic_cast<const SelectionPlan*>(holder.get())) {
+                collect(selection->Predicate());
+                filters.push_back(selection);
+                holder = selection->Src();
+              } else {
+                scan = dynamic_cast<const FullScanPlan*>(holder.get());
+                break;
+              }
+            }
+            if (scan != nullptr && scan->CanNarrow() &&
+                ScanProjectionEnabled()) {
+              scan_schema = &scan->GetSchema();
+              needed.clear();
+              for (const auto* projection : projections) {
+                for (const auto& named : projection->Columns()) {
+                  collect(named.expression);
+                }
+              }
+              for (const auto* selection : filters) {
+                collect(selection->Predicate());
+              }
+              for (const auto& target : logical.target_list) {
+                collect(target.expression);
+              }
+              if (!needed.empty() &&
+                  needed.size() < scan->GetSchema().ColumnCount()) {
+                Plan rebuilt = std::make_shared<FullScanPlan>(
+                    *scan, std::vector<slot_t>(needed.begin(), needed.end()));
+                // Rebuild the wrapper stack bottom-up over the narrowed scan.
+                for (const auto& filter : std::ranges::reverse_view(filters)) {
+                  rebuilt = std::make_shared<SelectionPlan>(
+                      rebuilt, filter->Predicate(), rebuilt->GetStats());
+                }
+                for (const auto& projection :
+                     std::ranges::reverse_view(projections)) {
+                  rebuilt = std::make_shared<ProjectionPlan>(
+                      rebuilt, projection->Columns());
+                }
+                scan_input = std::move(rebuilt);
+              }
+            }
+          }
           Plan projection =
-              RemoveIdentityProjection(children[0].plan, logical.target_list);
+              RemoveIdentityProjection(scan_input, logical.target_list);
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(projection),
                               .local_cost = children[0].estimated_rows,
@@ -2466,90 +3505,191 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           if (children.size() != 1 || required.require_row_position) {
             return std::vector<PlanAlternative>{};
           }
-          // The aggregate executors assume every target-list item names an
-          // aggregate function; a target list of bare columns (the
-          // distinct_and_group_by_interchange representation of DISTINCT)
-          // would make them throw.  DISTINCT keeps its dedicated
-          // Distinct/SortDistinct implementations in that shape.
+          const double rows = children[0].estimated_rows;
+          const std::vector<Expression>& grouping_keys =
+              logical.grouping_sets.empty() ? logical.partition_by
+                                            : logical.grouping_sets;
           const bool has_aggregate =
               std::ranges::any_of(logical.target_list, [](const auto& item) {
                 return ContainsAggregateExpression(item.expression);
               });
           if (!has_aggregate) {
-            return std::vector<PlanAlternative>{};
+            // A grouping-only alternative is executable as projected DISTINCT
+            // when every grouping key survives, and every output is a key.
+            if (grouping_keys.empty() || logical.predicate) {
+              return std::vector<PlanAlternative>{};
+            }
+            const auto same = [](const Expression& l, const Expression& r) {
+              return l && r && l->ToString() == r->ToString();
+            };
+            if (!std::ranges::all_of(
+                    grouping_keys,
+                    [&](const auto& key) {
+                      return std::ranges::any_of(
+                          logical.target_list, [&](const auto& target) {
+                            return same(key, target.expression);
+                          });
+                    }) ||
+                !std::ranges::all_of(
+                    logical.target_list, [&](const auto& target) {
+                      return std::ranges::any_of(
+                          grouping_keys, [&](const auto& key) {
+                            return same(key, target.expression);
+                          });
+                    })) {
+              return std::vector<PlanAlternative>{};
+            }
+            Plan projection =
+                RemoveIdentityProjection(children[0].plan, logical.target_list);
+            Plan distinct = std::make_shared<DistinctPlan>(projection);
+            return std::vector<PlanAlternative>{PlanAlternative{
+                .plan = std::move(distinct),
+                .local_cost = rows * 2.0,
+                .estimated_rows =
+                    EstimateDistinctRows(children[0].plan, grouping_keys)}};
           }
-          const double rows = children[0].estimated_rows;
-          Plan hash = std::make_shared<HashAggregatePlan>(children[0].plan,
-                                                          logical.target_list);
-          Plan sort = std::make_shared<SortAggregatePlan>(children[0].plan,
-                                                          logical.target_list);
-          // Scalar aggregation has one group, but keep both physical
-          // alternatives in the memo so a future grouping-key payload can
-          // reuse the same cost boundary. Hash is the cheap default; SortAgg
-          // remains selectable by rule disabling/hints and is costed as a
-          // materializing sort plus the accumulator pass.
+          const double output_rows =
+              grouping_keys.empty()
+                  ? 1.0
+                  : EstimateDistinctRows(children[0].plan, grouping_keys);
+          // The GROUP BY payload every shape receives: the keys (named after
+          // the column they reference, so the projection above resolves them by
+          // the name it asked for), the aggregate target list, the estimated
+          // group count and the memory contract. Nothing here names an
+          // algorithm.
+          AggregatePayload payload;
+          payload.group_keys.reserve(grouping_keys.size());
+          for (size_t i = 0; i < grouping_keys.size(); ++i) {
+            const Expression& key = grouping_keys[i];
+            std::string name = "group_key_" + std::to_string(i);
+            if (key && key->Type() == TypeTag::kColumnValue) {
+              name = key->AsColumnValue().GetColumnName().name;
+            }
+            payload.group_keys.emplace_back(name, key);
+          }
+          payload.aggregates = logical.target_list;
+          // A HAVING on the aggregation node itself is a predicate over the
+          // group's output row (keys then aggregates), which is the scope every
+          // shape filters in. A HAVING that survived the rewrite as a
+          // kSelection above the node keeps that shape instead -- the two never
+          // overlap.
+          if (logical.predicate && *logical.predicate) {
+            payload.having = *logical.predicate;
+          }
+          payload.estimated_groups = output_rows;
+          payload.memory = AggregateMemoryPolicy{};
+
+          // COUNT(column) evaluates an argument and checks NULL per row;
+          // COUNT(*) only increments the accumulator. Without this work in
+          // all three shape costs, the not-null rewrite always ties its
+          // original and can never be selected by the memo.
+          double count_argument_cost = 0.0;
+          for (const auto& target : logical.target_list) {
+            if (target.expression &&
+                target.expression->Type() == TypeTag::kAggregateExp) {
+              const auto& aggregate =
+                  target.expression->AsAggregateExpression();
+              if (aggregate.GetType() == AggregationType::kCount &&
+                  aggregate.Child()) {
+                count_argument_cost += rows * 0.1;
+              }
+            }
+          }
+
+          // HashAgg: one hash table over the group keys, valid over any input
+          // order and the cheapest single pass. Above the group capacity the
+          // table partitions its input and re-groups it per partition, so the
+          // cost carries that spill exactly where the estimate says it happens.
+          Plan hash =
+              std::make_shared<HashAggregatePlan>(children[0].plan, payload);
+          const double hash_cost =
+              rows + cascades::EstimateMemorySpillCost(
+                         cascades::OperatorCostKind::kSort, output_rows,
+                         AggregateMemoryBudget());
+          // SortAgg: sorted runs over the group keys, then one pass over the
+          // equal runs. It materializes an ordering the hash shape does not, so
+          // it is priced as a sort plus the accumulator pass and stays
+          // selectable by rule disabling or a hint.
+          Plan sort =
+              std::make_shared<SortAggregatePlan>(children[0].plan, payload);
           const double sort_cost =
               (rows * std::log2(std::max(2.0, rows))) + rows;
           std::vector<PlanAlternative> agg_alternatives{
               PlanAlternative{.plan = std::move(hash),
-                              .local_cost = rows,
-                              .estimated_rows = 1.0},
+                              .local_cost = hash_cost + count_argument_cost,
+                              .estimated_rows = output_rows},
               PlanAlternative{.plan = std::move(sort),
-                              .local_cost = sort_cost,
-                              .estimated_rows = 1.0}};
-          // stream_aggregate_if_sorted: the streaming accumulator shares the
-          // scalar implementation and needs no hash table or sort, so it is
-          // offered as a third alternative at a single-pass cost. Scalar
-          // aggregation has exactly one group, which makes the stream shape
-          // valid over any input order.
-          Plan stream = std::make_shared<StreamAggregatePlan>(
-              children[0].plan, logical.target_list);
-          agg_alternatives.push_back(PlanAlternative{.plan = std::move(stream),
-                                                     .local_cost = rows,
-                                                     .estimated_rows = 1.0});
+                              .local_cost = sort_cost + count_argument_cost,
+                              .estimated_rows = output_rows}};
+          // stream_aggregate_if_sorted: the streaming shape needs no hash table
+          // and no sort, so it is offered at a single-pass cost — but ONLY when
+          // the input already arrives in group-key order, which is the order
+          // contract it promises. Without keys there is exactly one group,
+          // which makes the shape valid over any input order.
+          if (grouping_keys.empty() ||
+              ChildDeliversGroupKeyOrder(children[0], grouping_keys)) {
+            Plan stream = std::make_shared<StreamAggregatePlan>(
+                children[0].plan, payload);
+            agg_alternatives.push_back(PlanAlternative{
+                .plan = std::move(stream),
+                .local_cost = (rows * 0.8) + count_argument_cost,
+                .estimated_rows = output_rows});
+          }
           return agg_alternatives;
         },
         c::LogicalOperator::kAggregation));
+    // sort / sort_external_merge: the same logical ORDER BY, planned as one of
+    // two memory shapes (see PrepareSortShape). The rules are exclusive halves
+    // of one decision — buffered at or below the policy's row capacity, spill
+    // runs above it — so exactly one of them offers an alternative.
     built.Add(c::ImplementationRule(
-        "sort", cascades::dsl::Sort(),
+        "sort_incremental", cascades::dsl::Sort(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
            const c::LogicalExpression& logical,
-           const std::vector<BestPlan>& children, const PhysicalProperties&,
-           const c::RuleContext&) {
-          if (children.size() != 1 ||
-              logical.target_list.size() != logical.sort_ascending.size()) {
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          const auto prepared = PrepareSortShape(logical, required, children);
+          if (!prepared || prepared->elided || prepared->keys.size() < 2 ||
+              !c::SatisfiesOrderingCollation(prepared->child, required)) {
             return std::vector<PlanAlternative>{};
           }
-          std::vector<SortKey> keys;
-          std::vector<Expression> expressions;
-          keys.reserve(logical.target_list.size());
-          expressions.reserve(logical.target_list.size());
-          for (size_t i = 0; i < logical.target_list.size(); ++i) {
-            expressions.push_back(logical.target_list[i].expression);
-            keys.push_back(
-                SortKey{.expression = logical.target_list[i].expression,
-                        .ascending = logical.sort_ascending[i],
-                        .nulls_first = i < logical.sort_nulls_first.size()
-                                           ? logical.sort_nulls_first[i]
-                                           : std::nullopt});
+          for (size_t count = prepared->keys.size() - 1; count > 0; --count) {
+            std::vector<Expression> expressions;
+            std::vector<bool> directions;
+            std::vector<std::optional<bool>> nulls;
+            for (size_t i = 0; i < count; ++i) {
+              expressions.push_back(prepared->keys[i].expression);
+              directions.push_back(prepared->keys[i].ascending);
+              nulls.push_back(prepared->keys[i].nulls_first);
+            }
+            if (!prepared->child->IsOrderedBy(expressions, directions, nulls)) {
+              continue;
+            }
+            std::vector<SortKey> prefix(
+                prepared->keys.begin(),
+                prepared->keys.begin() + static_cast<std::ptrdiff_t>(count));
+            std::vector<SortKey> suffix(
+                prepared->keys.begin() + static_cast<std::ptrdiff_t>(count),
+                prepared->keys.end());
+            const double groups = std::max(
+                1.0, EstimateDistinctRows(prepared->child, expressions));
+            Plan plan = std::make_shared<IncrementalSortPlan>(
+                prepared->child, std::move(prefix), std::move(suffix));
+            return std::vector<PlanAlternative>{PlanAlternative{
+                .plan = std::move(plan),
+                .local_cost = prepared->rows *
+                              std::log2(std::max(2.0, prepared->rows / groups)),
+                .estimated_rows = prepared->rows}};
           }
-          if (children[0].plan->IsOrderedBy(expressions,
-                                            logical.sort_ascending)) {
-            return std::vector<PlanAlternative>{
-                PlanAlternative{.plan = children[0].plan,
-                                .local_cost = 0,
-                                .estimated_rows = children[0].estimated_rows}};
-          }
-          Plan sort =
-              std::make_shared<SortPlan>(children[0].plan, std::move(keys));
-          const double rows = children[0].estimated_rows;
-          const double cost = rows * std::log2(std::max(2.0, rows));
-          return std::vector<PlanAlternative>{
-              PlanAlternative{.plan = std::move(sort),
-                              .local_cost = cost,
-                              .estimated_rows = rows}};
+          return std::vector<PlanAlternative>{};
         },
         c::LogicalOperator::kSort));
+    built.Add(c::ImplementationRule("sort", cascades::dsl::Sort(),
+                                    ImplementBufferedSort,
+                                    c::LogicalOperator::kSort));
+    built.Add(c::ImplementationRule(
+        "sort_external_merge", cascades::dsl::Sort(),
+        ImplementExternalMergeSort, c::LogicalOperator::kSort));
     // window: one WindowPlan per kWindow node. Window evaluation preserves
     // the row count; the local cost prices the internal partition ordering
     // like a sort (the executor delegates to the canonical evaluator, so
@@ -2595,12 +3735,31 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           std::vector<TopNKey> keys;
           keys.reserve(logical.target_list.size());
           for (size_t i = 0; i < logical.target_list.size(); ++i) {
-            keys.push_back(
-                TopNKey{.expression = logical.target_list[i].expression,
-                        .ascending = logical.sort_ascending[i],
-                        .nulls_first = i < logical.sort_nulls_first.size()
-                                           ? logical.sort_nulls_first[i]
-                                           : std::nullopt});
+            keys.push_back(TopNKey{
+                .expression = logical.target_list[i].expression,
+                .ascending = logical.sort_ascending[i],
+                .nulls_first = i < logical.sort_nulls_first.size()
+                                   ? logical.sort_nulls_first[i]
+                                   : std::nullopt,
+                .collation =
+                    CollationOfExpression(logical.target_list[i].expression)});
+          }
+          std::vector<Expression> ordering;
+          ordering.reserve(logical.target_list.size());
+          for (const auto& key : logical.target_list) {
+            ordering.push_back(key.expression);
+          }
+          if (!logical.with_ties &&
+              children[0].plan->IsOrderedBy(ordering, logical.sort_ascending,
+                                            logical.sort_nulls_first)) {
+            Plan limit = std::make_shared<LimitPlan>(
+                children[0].plan, logical.limit_count, logical.limit_offset);
+            return std::vector<PlanAlternative>{PlanAlternative{
+                .plan = std::move(limit),
+                .local_cost = 0.0,
+                .estimated_rows = LimitOutputRows(children[0].estimated_rows,
+                                                  logical.limit_count,
+                                                  logical.limit_offset)}};
           }
           Plan topn = std::make_shared<TopNPlan>(
               children[0].plan, std::move(keys), logical.limit_count,
@@ -2635,23 +3794,43 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
     built.Add(c::ImplementationRule(
         "distinct", cascades::dsl::Distinct(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
-           const c::LogicalExpression&, const std::vector<BestPlan>& children,
-           const PhysicalProperties&, const c::RuleContext&) {
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children, const PhysicalProperties&,
+           const c::RuleContext&) {
           if (children.size() != 1) {
             return std::vector<PlanAlternative>{};
           }
+          std::vector<Expression> columns;
+          columns.reserve(logical.target_list.empty()
+                              ? children[0].plan->GetSchema().ColumnCount()
+                              : logical.target_list.size());
+          if (logical.target_list.empty()) {
+            for (size_t i = 0; i < children[0].plan->GetSchema().ColumnCount();
+                 ++i) {
+              columns.push_back(ColumnValueExp(
+                  children[0].plan->GetSchema().GetColumn(i).Name()));
+            }
+          } else {
+            for (const NamedExpression& item : logical.target_list) {
+              columns.push_back(item.expression);
+            }
+          }
+          const double output_rows =
+              EstimateDistinctRows(children[0].plan, columns);
           Plan distinct = std::make_shared<DistinctPlan>(children[0].plan);
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(distinct),
                               .local_cost = children[0].estimated_rows,
-                              .estimated_rows = children[0].estimated_rows}};
+                              .estimated_rows = output_rows}};
         },
         c::LogicalOperator::kDistinct));
     built.Add(c::ImplementationRule(
         "sort_distinct", cascades::dsl::Distinct(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
-           const c::LogicalExpression&, const std::vector<BestPlan>& children,
-           const PhysicalProperties&, const c::RuleContext&) {
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children, const PhysicalProperties&,
+           const c::RuleContext&) {
+          (void)logical;
           if (children.size() != 1) {
             return std::vector<PlanAlternative>{};
           }
@@ -2668,19 +3847,23 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                                    .nulls_first = std::nullopt});
           }
           Plan input = children[0].plan;
-          double cost = children[0].estimated_rows;
+          // Adjacent-row comparison avoids building a hash set. Include this
+          // advantage even when sorting is needed, so the ordered parent can
+          // compare sort+dedup against hash+sort without an artificial tie.
+          double cost = children[0].estimated_rows * 0.8;
           const std::vector<bool> ascending(ordering.size(), true);
           if (!input->IsOrderedBy(ordering, ascending)) {
             const double rows = children[0].estimated_rows;
             cost += rows * std::log2(std::max(2.0, rows));
-            input =
-                std::make_shared<SortPlan>(std::move(input), std::move(keys));
+            input = MakeSortPlan(std::move(input), std::move(keys), rows);
           }
+          const double output_rows =
+              EstimateDistinctRows(children[0].plan, ordering);
           Plan distinct = std::make_shared<SortDistinctPlan>(std::move(input));
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(distinct),
                               .local_cost = cost,
-                              .estimated_rows = children[0].estimated_rows}};
+                              .estimated_rows = output_rows}};
         },
         c::LogicalOperator::kDistinct));
     // DISTINCT over a single-column covering index becomes a skip scan: the
@@ -2733,30 +3916,16 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           Plan skip_scan = std::make_shared<SkipScanDistinctPlan>(
               *table, index, index_only->GetStats(), index_only->IsAscending(),
               std::move(select_items), scan_schema);
-          const double rows = std::max<double>(
-              1.0,
-              static_cast<double>(index_only->GetStats().Column(0).Distinct()));
+          // IndexOnlyScan statistics are already projected: the base-table
+          // slot is not a statistics offset. Include NULL as one distinct key.
+          const double rows = index_only->GetStats().EstimateDistinctRows({0});
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(skip_scan),
                               .local_cost = rows,
                               .estimated_rows = rows}};
         },
         c::LogicalOperator::kDistinct));
-    built.Add(c::ImplementationRule(
-        "max1_row", cascades::dsl::Max1Row(),
-        [](c::GroupId, const c::Memo&, const c::Bindings&,
-           const c::LogicalExpression&, const std::vector<BestPlan>& children,
-           const PhysicalProperties&, const c::RuleContext&) {
-          if (children.size() != 1) {
-            return std::vector<PlanAlternative>{};
-          }
-          Plan max1 = std::make_shared<Max1RowPlan>(children[0].plan);
-          return std::vector<PlanAlternative>{PlanAlternative{
-              .plan = std::move(max1),
-              .local_cost = children[0].estimated_rows,
-              .estimated_rows = std::min(1.0, children[0].estimated_rows)}};
-        },
-        c::LogicalOperator::kMax1Row));
+
     const auto implement_set_operation =
         [](c::GroupId, const c::Memo&, const c::Bindings&,
            const c::LogicalExpression& logical,
@@ -2820,8 +3989,8 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               for (const SortKey& key : order_keys) {
                 child_keys.push_back(key);
               }
-              plan = std::make_shared<SortPlan>(std::move(plan),
-                                                std::move(child_keys));
+              plan = MakeSortPlan(std::move(plan), std::move(child_keys),
+                                  child.estimated_rows);
             }
             plans.push_back(std::move(plan));
             input_rows += child.estimated_rows;
@@ -2945,6 +4114,33 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         },
         c::LogicalOperator::kJoin));
     built.Add(c::ImplementationRule(
+        "band_join", Join(),
+        [](c::GroupId, const c::Memo& memo, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<c::BestPlan>& children,
+           const c::PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          return BandJoinAlternative(memo, logical.children[1],
+                                     logical.predicate, children[0],
+                                     children[1], JoinKind::kInner);
+        },
+        c::LogicalOperator::kJoin));
+    built.Add(c::ImplementationRule(
+        "zigzag_join", Join(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<c::BestPlan>& children,
+           const c::PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          return ZigZagJoinAlternative(logical.predicate, children[0],
+                                       children[1]);
+        },
+        c::LogicalOperator::kJoin));
+    built.Add(c::ImplementationRule(
         "outer_hash_join", OuterJoin(),
         [](c::GroupId, const c::Memo& memo, const c::Bindings&,
            const c::LogicalExpression& logical,
@@ -2961,7 +4157,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           }
           std::vector<PlanAlternative> alternatives = JoinAlternatives(
               memo, logical.children[1], logical.predicate, children[0],
-              children[1], context, true, false, false, kind);
+              children[1], context, true, false, false, kind, true);
           std::vector<PlanAlternative> merge =
               MergeJoinAlternative(memo, logical.children[1], logical.predicate,
                                    children[0], children[1], context, kind);
@@ -3060,6 +4256,21 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         },
         c::LogicalOperator::kJoin));
     built.Add(c::ImplementationRule(
+        "late_materialization_join", Join(),
+        [](c::GroupId, const c::Memo& memo, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<c::BestPlan>& children,
+           const c::PhysicalProperties& required,
+           const c::RuleContext& context) {
+          if (children.size() != 2) {
+            return std::vector<PlanAlternative>{};
+          }
+          return LateMaterializationAlternative(memo, logical.children[1],
+                                                logical.predicate, children[0],
+                                                children[1], required, context);
+        },
+        c::LogicalOperator::kJoin));
+    built.Add(c::ImplementationRule(
         "nested_loop_join", Join(),
         [](c::GroupId, const c::Memo& memo, const c::Bindings&,
            const c::LogicalExpression& logical,
@@ -3078,87 +4289,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                                   false, true);
         },
         c::LogicalOperator::kJoin));
-    built.Add(c::ImplementationRule(
-        "single_hash_join", c::dsl::SingleJoin(),
-        [](c::GroupId, const c::Memo& memo, const c::Bindings&,
-           const c::LogicalExpression& logical,
-           const std::vector<BestPlan>& children,
-           const PhysicalProperties& required, const c::RuleContext& context) {
-          if (children.size() != 2 || required.require_row_position) {
-            return std::vector<PlanAlternative>{};
-          }
-          return JoinAlternatives(memo, logical.children[1], logical.predicate,
-                                  children[0], children[1], context, true,
-                                  false, false,
-                                  JoinAlternativeKind::kLeftOuter);
-        },
-        c::LogicalOperator::kSingleJoin));
-    built.Add(c::ImplementationRule(
-        "mark_hash_join", c::dsl::MarkJoin(),
-        [](c::GroupId, const c::Memo& memo, const c::Bindings&,
-           const c::LogicalExpression& logical,
-           const std::vector<BestPlan>& children,
-           const PhysicalProperties& required, const c::RuleContext& context) {
-          if (children.size() != 2 || required.require_row_position) {
-            return std::vector<PlanAlternative>{};
-          }
-          return JoinAlternatives(memo, logical.children[1], logical.predicate,
-                                  children[0], children[1], context, true,
-                                  false, false, JoinAlternativeKind::kSemi);
-        },
-        c::LogicalOperator::kMarkJoin));
-    built.Add(c::ImplementationRule(
-        "constant_table", c::dsl::ConstantTable(),
-        [](c::GroupId, const c::Memo&, const c::Bindings&,
-           const c::LogicalExpression& logical, const std::vector<BestPlan>&,
-           const PhysicalProperties& required, const c::RuleContext& context) {
-          // Row cells (M4 materialized CTEs included) carry no row positions.
-          if (required.require_row_position) {
-            return std::vector<PlanAlternative>{};
-          }
-          if (logical.values.empty() && !logical.table.empty()) {
-            // COUNT(*) is rewritten to this leaf for optimizer purposes, but
-            // its result must still be computed from the transaction-visible
-            // table.  Catalog statistics are estimates and become stale after
-            // INSERT/DELETE, so materializing the count from them is wrong.
-            const auto table = context.tables.find(logical.table);
-            const auto statistics = context.statistics.find(logical.table);
-            if (table == context.tables.end() ||
-                statistics == context.statistics.end()) {
-              return std::vector<PlanAlternative>{};
-            }
-            Plan scan = std::make_shared<FullScanPlan>(*table->second,
-                                                       *statistics->second);
-            Plan aggregate = std::make_shared<HashAggregatePlan>(
-                std::move(scan), logical.target_list);
-            return std::vector<PlanAlternative>{PlanAlternative{
-                .plan = std::move(aggregate),
-                .local_cost = static_cast<double>(statistics->second->Rows()),
-                .estimated_rows = 1.0}};
-          }
-          Plan values = std::make_shared<ValuesPlan>(logical.output_schema,
-                                                     logical.values);
-          const auto rows = static_cast<double>(logical.values.size());
-          return std::vector<PlanAlternative>{
-              PlanAlternative{.plan = std::move(values),
-                              .local_cost = rows,
-                              .estimated_rows = rows}};
-        },
-        c::LogicalOperator::kConstantTable));
-    built.Add(c::ImplementationRule(
-        "generate_series", c::dsl::GenerateSeries(),
-        [](c::GroupId, const c::Memo&, const c::Bindings&,
-           const c::LogicalExpression& logical, const std::vector<BestPlan>&,
-           const PhysicalProperties&, const c::RuleContext&) {
-          Plan values = std::make_shared<ValuesPlan>(logical.output_schema,
-                                                     logical.values);
-          const auto rows = static_cast<double>(logical.values.size());
-          return std::vector<PlanAlternative>{
-              PlanAlternative{.plan = std::move(values),
-                              .local_cost = rows,
-                              .estimated_rows = rows}};
-        },
-        c::LogicalOperator::kGenerateSeries));
+
     // outer_nested_loop: LEFT OUTER join via block nested loop. Hash/merge
     // cover equi-outer joins; this rule carries non-equi (and small) outer
     // joins into cost-based planning instead of the heuristic fallback. The
@@ -3205,7 +4336,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           // for non-inner hash joins).
           std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes(
               {}, *logical.predicate);
-          const double estimate = static_cast<double>(join->EmitRowCount());
+          const auto estimate = static_cast<double>(join->EmitRowCount());
           const double local_cost =
               children[0].estimated_rows * children[1].estimated_rows;
           return std::vector<PlanAlternative>{
@@ -3283,82 +4414,6 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                                     /*wrap_selection=*/false);
         },
         c::LogicalOperator::kOuterJoin));
-    // exchange_noop: single-node distribution enforcement. kExchange /
-    // kGather / kBroadcast / kRedistribute exist for the distributed
-    // property model (PhysicalProperties::distribution); with one node every
-    // distribution is already satisfied, so the rule passes the child plan
-    // through at zero cost and keeps exchange shapes plannable.
-    const auto exchange_passthrough =
-        [](c::GroupId, const c::Memo&, const c::Bindings&,
-           const c::LogicalExpression& logical,
-           const std::vector<BestPlan>& children, const PhysicalProperties&,
-           const c::RuleContext&) {
-          if (children.size() != 1) {
-            return std::vector<PlanAlternative>{};
-          }
-          switch (logical.operation) {
-            case c::LogicalOperator::kExchange:
-            case c::LogicalOperator::kGather:
-            case c::LogicalOperator::kBroadcast:
-            case c::LogicalOperator::kRedistribute:
-              break;
-            default:
-              return std::vector<PlanAlternative>{};
-          }
-          return std::vector<PlanAlternative>{
-              PlanAlternative{.plan = children[0].plan,
-                              .local_cost = 0.0,
-                              .estimated_rows = children[0].estimated_rows}};
-        };
-    built.Add(c::ImplementationRule("exchange_noop", c::dsl::Exchange(),
-                                    exchange_passthrough,
-                                    c::LogicalOperator::kExchange));
-    built.Add(c::ImplementationRule("gather_noop", c::dsl::Gather(),
-                                    exchange_passthrough,
-                                    c::LogicalOperator::kGather));
-    built.Add(c::ImplementationRule("broadcast_noop", c::dsl::Broadcast(),
-                                    exchange_passthrough,
-                                    c::LogicalOperator::kBroadcast));
-    built.Add(c::ImplementationRule("redistribute_noop", c::dsl::Redistribute(),
-                                    exchange_passthrough,
-                                    c::LogicalOperator::kRedistribute));
-    // materialize / spool: cache the child for multi-pass consumers (CTE
-    // references read twice, recurring work-table scans). The executor
-    // replays rows in insertion order, so ordering and row counts pass
-    // through; the local cost is the single caching pass. Eager and lazy
-    // spools share the implementation (the executor materializes on first
-    // read) and stay separately addressable for hints.
-    const auto materialize_child =
-        [](c::GroupId, const c::Memo&, const c::Bindings&,
-           const c::LogicalExpression& logical,
-           const std::vector<BestPlan>& children,
-           const PhysicalProperties& required, const c::RuleContext&) {
-          if (children.size() != 1 || required.require_row_position) {
-            return std::vector<PlanAlternative>{};
-          }
-          switch (logical.operation) {
-            case c::LogicalOperator::kMaterialize:
-            case c::LogicalOperator::kEagerSpool:
-            case c::LogicalOperator::kLazySpool:
-              break;
-            default:
-              return std::vector<PlanAlternative>{};
-          }
-          Plan plan = std::make_shared<MaterializePlan>(children[0].plan);
-          return std::vector<PlanAlternative>{
-              PlanAlternative{.plan = std::move(plan),
-                              .local_cost = children[0].estimated_rows,
-                              .estimated_rows = children[0].estimated_rows}};
-        };
-    built.Add(c::ImplementationRule("materialize", c::dsl::Materialize(),
-                                    materialize_child,
-                                    c::LogicalOperator::kMaterialize));
-    built.Add(c::ImplementationRule("eager_spool", c::dsl::EagerSpool(),
-                                    materialize_child,
-                                    c::LogicalOperator::kEagerSpool));
-    built.Add(c::ImplementationRule("lazy_spool", c::dsl::LazySpool(),
-                                    materialize_child,
-                                    c::LogicalOperator::kLazySpool));
     return built;
   }();
   return rules;

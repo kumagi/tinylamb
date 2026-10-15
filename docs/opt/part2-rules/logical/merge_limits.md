@@ -96,7 +96,7 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `push_limit_through_union_all` / `union_all_push_limit`: UNION ALL の各ブランチに Limit を押し込んだ後、ブランチ側で新設された Limit と上位 Limit が再び結合する局面で本 Rule が発火します。
+- `union_all_push_limit` / `union_all_push_limit`: UNION ALL の各ブランチに Limit を押し込んだ後、ブランチ側で新設された Limit と上位 Limit が再び結合する局面で本 Rule が発火します。
 - `limit_push_through_sort`: 1 段に集約された Limit は、ソートノードと組み合わされることで TopN オペレータへの変換を促進します。
 
 ## 検証テスト

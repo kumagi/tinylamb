@@ -304,6 +304,7 @@ TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
     Insert(txn, c, kSize, kSize);
   }
+  ASSERT_SUCCESS(txn.PreCommit());
 
   // Act -- begin a full scan iterator (forward) and walk through all 11 keys in
   // alphabetical order
@@ -329,6 +330,7 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
        {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
     Insert(txn, c, kSize, kSize);
   }
+  ASSERT_SUCCESS(txn.PreCommit());
 
   // Act -- begin a descending full scan iterator ["", ""] (both bounds open)
   // and walk backward
@@ -484,6 +486,7 @@ TEST_F(BPlusTreeIteratorTest, ReverseScanAfterDescendingInserts) {
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
     Insert(txn, c, kSize, kSize);
   }
+  ASSERT_SUCCESS(txn.PreCommit());
 
   // Act -- scan every key in reverse order
   BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);

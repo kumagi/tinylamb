@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "executor/dictionary_batch_aggregation.hpp"
 #include "executor/selection_vector.hpp"
 #include "executor/simd_comparison.hpp"
 #include "executor/vectorized_expression.hpp"
@@ -104,13 +103,23 @@ TEST(DataChunkTest, Append_MovedRowPreservesValuesAndZoneMaps) {
   const ZoneMap& integers = chunk.ZoneMapAt(0);
   const ZoneMap& strings = chunk.ZoneMapAt(1);
   ASSERT_TRUE(integers.Minimum().has_value());
+  ASSERT_TRUE(integers.Minimum().has_value());
   ASSERT_TRUE(integers.Maximum().has_value());
   ASSERT_TRUE(strings.Minimum().has_value());
   ASSERT_TRUE(strings.Maximum().has_value());
+  // Plain asserts so the optional-access checker sees the guard too.
+  assert(integers.Minimum().has_value());
+  assert(integers.Maximum().has_value());
+  assert(strings.Minimum().has_value());
+  assert(strings.Maximum().has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*integers.Minimum(), Value(3));
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*integers.Maximum(), Value(7));
   EXPECT_EQ(integers.NullCount(), 1U);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*strings.Minimum(), Value("kept"));
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*strings.Maximum(), Value("moved"));
   EXPECT_EQ(strings.NullCount(), 1U);
 }
@@ -373,6 +382,26 @@ TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
   EXPECT_EQ(output.ZoneMapAt(1).Minimum(), Value("a"));
 }
 
+TEST(DataChunkTest, AppendGather_IdentityPreservesColumnsAndZoneMaps) {
+  const Schema schema("g", {Column("id", ValueType::kInt64),
+                            Column("name", ValueType::kVarChar),
+                            Column("score", ValueType::kDouble)});
+  DataChunk source(schema, 4);
+  source.Append(Row({Value(4), Value("b"), Value(2.5)}), RowPosition(7, 2));
+  source.Append(Row({Value(), Value("a"), Value()}), RowPosition(7, 3));
+  DataChunk output;
+  const std::array<uint32_t, 2> selection = {0, 1};
+  output.AppendGather(source, selection.data(), selection.size());
+
+  ASSERT_EQ(output.Size(), 2U);
+  EXPECT_EQ(output.RowAt(0), source.RowAt(0));
+  EXPECT_EQ(output.RowAt(1), source.RowAt(1));
+  EXPECT_EQ(output.PositionAt(1), RowPosition(7, 3));
+  EXPECT_EQ(output.ZoneMapAt(0).NullCount(), 1U);
+  EXPECT_EQ(output.ZoneMapAt(1).Minimum(), Value("a"));
+  EXPECT_EQ(output.ZoneMapAt(2).Maximum(), Value(2.5));
+}
+
 TEST(DataChunkTest,
      Append_TypeMismatchFromSourceChunk_ThrowsWithoutPartialAppend) {
   DataChunk source(std::vector<ValueType>{ValueType::kDouble});
@@ -519,36 +548,50 @@ TEST(SimdComparisonKernelTest, IntegerDoubleStringComparison) {
   EXPECT_TRUE(str_mask.Get(1));
 }
 
-TEST(DictionaryBatchAggregationTest, GroupByCountSumAvg) {
-  const Schema schema("sales", {Column("category", ValueType::kVarChar),
-                                Column("amount", ValueType::kInt64)});
-  DataChunk chunk(schema, 6);
-  chunk.Append(Row({Value("Fruit"), Value(int64_t{100})}));
-  chunk.Append(Row({Value("Veg"), Value(int64_t{50})}));
-  chunk.Append(Row({Value("Fruit"), Value(int64_t{200})}));
-  chunk.Append(Row({Value("Veg"), Value(int64_t{150})}));
-  chunk.Append(Row({Value("Fruit"), Value(int64_t{300})}));
-
-  DictionaryBatchAggregation sum_agg(schema, 0, 1,
-                                     DictionaryBatchAggregation::AggOp::kSum);
-  sum_agg.AccumulateChunk(chunk);
-  EXPECT_EQ(sum_agg.GroupCount(), 2);
-
-  const Schema out_schema("res", {Column("category", ValueType::kVarChar),
-                                  Column("total", ValueType::kDouble)});
-  DataChunk out_chunk = sum_agg.EmitResult(out_schema);
-  ASSERT_EQ(out_chunk.Size(), 2);
-
-  // Group 0 ("Fruit"): sum = 600
-  EXPECT_EQ(out_chunk.ColumnAt(0).ValueAt(0), Value("Fruit"));
-  EXPECT_EQ(out_chunk.ColumnAt(1).ValueAt(0), Value(600.0));
-
-  // Group 1 ("Veg"): sum = 200
-  EXPECT_EQ(out_chunk.ColumnAt(0).ValueAt(1), Value("Veg"));
-  EXPECT_EQ(out_chunk.ColumnAt(1).ValueAt(1), Value(200.0));
+TEST(SimdComparisonKernelTest, AllIntegerOperationsCoverVectorTails) {
+  std::vector<int64_t> lhs(131);
+  std::vector<int64_t> rhs(131);
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    lhs[i] = static_cast<int64_t>(i) - 65;
+    rhs[i] = static_cast<int64_t>((i * 7) % 23) - 11;
+  }
+  const std::array<BinaryOperation, 6> operations = {
+      BinaryOperation::kEquals,      BinaryOperation::kNotEquals,
+      BinaryOperation::kLessThan,    BinaryOperation::kLessThanEquals,
+      BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals};
+  const auto matches = [](int64_t left, int64_t right, BinaryOperation op) {
+    switch (op) {
+      case BinaryOperation::kEquals:
+        return left == right;
+      case BinaryOperation::kNotEquals:
+        return left != right;
+      case BinaryOperation::kLessThan:
+        return left < right;
+      case BinaryOperation::kLessThanEquals:
+        return left <= right;
+      case BinaryOperation::kGreaterThan:
+        return left > right;
+      case BinaryOperation::kGreaterThanEquals:
+        return left >= right;
+      default:
+        return false;
+    }
+  };
+  for (const BinaryOperation op : operations) {
+    ValidityBitmap scalar_mask;
+    SimdComparisonKernel::CompareInt64(lhs.data(), lhs.size(), op, 0,
+                                       &scalar_mask);
+    ValidityBitmap vector_mask;
+    SimdComparisonKernel::CompareInt64Vectors(lhs.data(), rhs.data(),
+                                              lhs.size(), op, &vector_mask);
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      EXPECT_EQ(scalar_mask.Get(i), matches(lhs[i], 0, op));
+      EXPECT_EQ(vector_mask.Get(i), matches(lhs[i], rhs[i], op));
+    }
+  }
 }
 
-TEST(VectorizedBooleanAndBitwiseAggregationTest, BitwiseAggregates) {
+TEST(DataChunkBitwiseAggregateTest, BitAndOrXorSkipNullsAndHonorSelection) {
   const Schema schema("bits", {Column("v", ValueType::kInt64)});
   DataChunk chunk(schema, 8);
   chunk.Append(Row({Value(int64_t{0b1111})}));

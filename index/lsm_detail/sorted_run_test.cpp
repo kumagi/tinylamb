@@ -337,7 +337,6 @@ TEST_F(SortedRunTest, Delete) {
     }
     data_file = "sorted_run_build-test-" + RandomString() + ".db";
     index_file = "sorted_run_build-test-index-" + RandomString() + ".idx";
-    auto l = BlobFile::Create(data_file).MoveValue();
     blob_ = BlobFile::Create(data_file).MoveValue();
     SortedRun::Construct(index_file, input, *blob_, 1);
     sr_ =
@@ -390,7 +389,6 @@ TEST_F(SortedRunTest, DeleteScan) {
     }
     data_file = "sorted_run_build-test-" + RandomString() + ".db";
     index_file = "sorted_run_build-test-index-" + RandomString() + ".idx";
-    auto l = BlobFile::Create(data_file).MoveValue();
     blob_ = BlobFile::Create(data_file).MoveValue();
     SortedRun::Construct(index_file, input, *blob_, 1);
     sr_ =

@@ -98,8 +98,8 @@ graph TD
 
 - `semi_merge_join`: 同一の `kSemiJoin` 論理式に対する競合物理実装 Rule。入力がすでにキー順序を持つ場合や、非等値残余述語を含む場合に優位となります。
 - `anti_hash_join`: 否定存在判定（一致しない行を出力）を行う対称的な実装 Rule。
-- `in_list_to_semi_join` / `apply_to_join` / `intersect_to_semijoin`: サブクエリや IN 述語を論理 `kSemiJoin` へと引き上げる論理変換 Rule。本 Rule はこれらによって生成された論理ノードの受け皿となります。
-- `mark_join_to_filter`: マーク結合をセミ結合またはアンチ結合へと簡約化する論理 Rule。
+
+
 
 ## 検証テスト
 

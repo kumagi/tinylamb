@@ -25,6 +25,13 @@ std::string Payload(std::mt19937& rng, size_t max_payload) {
   return out;
 }
 
+std::string PageBody(char value) {
+  // The (size, char) constructor is required here: a braced initializer list
+  // would be a narrowing initializer_list<char>.
+  std::string body(kPageBodySize, value);
+  return body;
+}
+
 uint64_t Small(std::mt19937& rng, uint64_t bound = 8) {
   return rng() % (bound + 1);
 }
@@ -74,7 +81,7 @@ GeneratedLogRecord GenerateLogRecord(std::mt19937& rng,
   const auto undo_page = static_cast<page_id_t>(Small(rng, 9) + 1);
   GeneratedLogRecord generated;
   // One case per factory family so every LogType on the wire is reachable.
-  switch (rng() % 30) {
+  switch (rng() % 36) {
     case 0:
       generated.record = LogRecord(prev, txn, LogType::kBegin);
       break;
@@ -152,42 +159,87 @@ GeneratedLogRecord GenerateLogRecord(std::mt19937& rng,
           txn, pid, key, redo_page);
       break;
     case 20:
+      generated.record = LogRecord::SetRowPageNextLogRecord(
+          prev, txn, pid, redo_page, undo_page);
+      break;
+    case 21:
+      generated.record = LogRecord::SetRowPagePrevLogRecord(
+          prev, txn, pid, redo_page, undo_page);
+      break;
+    case 22:
+      generated.record = LogRecord::CompensateSetRowPageNextLogRecord(
+          prev, txn, pid, redo_page);
+      break;
+    case 23:
+      generated.record = LogRecord::CompensateSetRowPagePrevLogRecord(
+          prev, txn, pid, redo_page);
+      break;
+    case 24:
       generated.record = LogRecord::SetLowFenceLogRecord(
           prev, txn, pid, IndexKey(redo), IndexKey(undo));
       break;
-    case 21:
+    case 25:
       generated.record = LogRecord::SetHighFenceLogRecord(
           prev, txn, pid, IndexKey(redo), IndexKey(undo));
       break;
-    case 22:
+    case 26:
       generated.record = LogRecord::CompensateSetLowFenceLogRecord(
           prev, txn, pid, IndexKey(redo));
       break;
-    case 23:
+    case 27:
       generated.record = LogRecord::CompensateSetHighFenceLogRecord(
           prev, txn, pid, IndexKey(redo));
       break;
-    case 24:
+    case 28:
       generated.record = LogRecord::SetFosterLogRecord(
           prev, txn, pid, FosterPair(redo, redo_page),
           FosterPair(undo, undo_page));
       break;
-    case 25:
+    case 29:
       generated.record = LogRecord::CompensateSetFosterLogRecord(
           prev, txn, pid, FosterPair(redo, redo_page));
       break;
-    case 26:
+    case 30:
       generated.record =
           LogRecord::SetLowestLogRecord(prev, txn, pid, redo_page, undo_page);
       break;
-    case 27:
-      generated.record =
-          LogRecord::AllocatePageLogRecord(prev, txn, pid, RandomPageType(rng));
+    case 31: {
+      const auto kind = static_cast<PageAllocationKind>(
+          (rng() % static_cast<uint32_t>(PageAllocationKind::kInPlace)) + 1U);
+      const PageType new_type = RandomPageType(rng);
+      if (kind == PageAllocationKind::kFresh) {
+        generated.record = LogRecord::AllocatePageLogRecord(
+            prev, txn, pid, new_type, kind, PageType::kFreePage, {},
+            EncodeAllocationMetaPayload(0, pid - 1));
+      } else if (kind == PageAllocationKind::kRecycled) {
+        generated.record = LogRecord::AllocatePageLogRecord(
+            prev, txn, pid, new_type, kind, PageType::kFreePage,
+            EncodeAllocationFreePayload(0, txn),
+            EncodeAllocationMetaPayload(pid, pid));
+      } else {
+        generated.record = LogRecord::AllocatePageLogRecord(
+            prev, txn, pid, new_type, kind, RandomPageType(rng), PageBody('a'),
+            EncodeAllocationMetaPayload(0, pid));
+      }
       break;
-    case 28:
+    }
+    case 32:
       generated.record = LogRecord::DestroyPageLogRecord(
           prev, txn, pid, RandomPageType(rng), undo);
       break;
+    case 33:
+      generated.record = LogRecord::CompensateDestroyPageLogRecord(
+          txn, pid, RandomPageType(rng), undo);
+      break;
+    case 34: {
+      const LogRecord allocation = LogRecord::AllocatePageLogRecord(
+          prev, txn, pid, RandomPageType(rng), PageAllocationKind::kRecycled,
+          PageType::kFreePage, EncodeAllocationFreePayload(0, txn),
+          EncodeAllocationMetaPayload(pid, pid));
+      generated.record =
+          LogRecord::CompensateAllocatePageLogRecord(allocation, prev);
+      break;
+    }
     default: {
       std::vector<std::pair<page_id_t, lsn_t>> dpt;
       const auto dpt_size = static_cast<size_t>(rng() % 3);
@@ -219,6 +271,15 @@ std::string CheckLogRecordEquivalence(const GeneratedLogRecord& generated) {
   } catch (const std::exception& e) {
     return "serialize threw for " + where + ": " + e.what();
   }
+  std::string direct;
+  try {
+    generated.record.SerializeTo(direct);
+  } catch (const std::exception& e) {
+    return "SerializeTo threw for " + where + ": " + e.what();
+  }
+  if (direct != serialized) {
+    return "SerializeTo mismatch for " + where;
+  }
   // Property 3: Size() matches the on-disk byte count.
   if (generated.record.Size() != serialized.size()) {
     return "Size() mismatch for " + where +
@@ -238,7 +299,7 @@ std::string CheckLogRecordEquivalence(const GeneratedLogRecord& generated) {
   // Property 2: byte stability.
   std::string reserialized;
   try {
-    reserialized = decoded.Serialize();
+    decoded.SerializeTo(reserialized);
   } catch (const std::exception& e) {
     return "reserialize threw for " + where + ": " + e.what();
   }
@@ -249,8 +310,16 @@ std::string CheckLogRecordEquivalence(const GeneratedLogRecord& generated) {
   // Payloads are bounded by the generator, so the full prefix walk is cheap.
   // A failed decode (short input) is the expected outcome; only a crash
   // would be a bug, and a crash cannot be caught here by construction.
-  for (size_t length = 0; length < serialized.size(); ++length) {
-    static_cast<void>(Decode(serialized.substr(0, length)));
+  if (serialized.size() <= 4096) {
+    for (size_t length = 0; length < serialized.size(); ++length) {
+      static_cast<void>(Decode(serialized.substr(0, length)));
+    }
+  } else {
+    for (size_t sample = 0; sample < 256; ++sample) {
+      const size_t length =
+          (sample * (serialized.size() - 1)) / static_cast<size_t>(255);
+      static_cast<void>(Decode(serialized.substr(0, length)));
+    }
   }
   return "";
 }

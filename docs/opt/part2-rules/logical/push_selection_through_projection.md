@@ -145,7 +145,7 @@ std::optional<Expression> RewriteThroughOutputs(
 
 - `push_selection_into_scan`: 書き換え後の Selection がスキャン直下に
    来れば filter へ合流します。
-- `merge_projections` / `merge_adjacent_projections`: 本 Rule が作った
+- `merge_projections` / `merge_projections`: 本 Rule が作った
   Projection と既存 Projection が隣接した場合に統合します。
 - `push_selection_through_aggregation`: 同じ `RewriteThroughOutputs` を
   使う隣接ルール(集約の出力名から group key への書き換え)。

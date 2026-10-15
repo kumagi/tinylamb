@@ -630,23 +630,17 @@ TEST_F(LSMTreeTest, ReopenRejectsMalformedRunFile) {
   EXPECT_FALSE(std::filesystem::exists(junk));
 }
 
-TEST_F(LSMTreeTest, ReopenKeepsWalSegmentMetadataSidecar) {
-  // The segmented WAL writes a blob.db.meta geometry sidecar next to the
-  // runs (Logger::SegmentMetadataPath, created when BlobFile opens its WAL).
-  // RestoreRuns must leave it alone: quarantining it while the WAL is live
-  // would corrupt the segment geometry and fail the next Logger::Create.
+TEST_F(LSMTreeTest, ReopenDoesNotCreateBlobWalArtifacts) {
   t_->Write("keep", "me");
   t_->Sync();
   const std::filesystem::path meta =
       std::filesystem::path(dir_path_) / "blob.db.meta";
-  ASSERT_TRUE(std::filesystem::exists(meta)) << "test premise: the WAL wrote "
-                                                "its geometry sidecar";
+  EXPECT_FALSE(std::filesystem::exists(meta));
   t_.reset();
 
   ASSERT_NO_THROW(t_ = LSMTree::Create(dir_path_).MoveValue());
   ASSERT_SUCCESS_AND_EQ(t_->Read("keep"), std::string("me"));
-  // The sidecar survived untouched: no quarantine rename, no deletion.
-  EXPECT_TRUE(std::filesystem::exists(meta));
+  EXPECT_FALSE(std::filesystem::exists(meta));
   EXPECT_FALSE(std::filesystem::exists(meta.string() + ".bad"));
 }
 

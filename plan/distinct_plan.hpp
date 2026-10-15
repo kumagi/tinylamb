@@ -5,13 +5,15 @@
 #include <utility>
 
 #include "plan/plan.hpp"
+#include "table/table_statistics.hpp"
 
 namespace tinylamb {
 
+TableStatistics EstimateDistinctPlanStats(const Plan& child);
+
 class DistinctPlan final : public PlanBase {
  public:
-  explicit DistinctPlan(Plan child, std::vector<Expression> distinct_on = {})
-      : child_(std::move(child)), distinct_on_(std::move(distinct_on)) {}
+  explicit DistinctPlan(Plan child, std::vector<Expression> distinct_on = {});
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] bool ContainsParameterSlots() const override {
@@ -26,7 +28,7 @@ class DistinctPlan final : public PlanBase {
     return child_->ScanSource();
   }
   [[nodiscard]] const TableStatistics& GetStats() const override {
-    return child_->GetStats();
+    return stats_;
   }
   [[nodiscard]] const Schema& GetSchema() const override {
     return child_->GetSchema();
@@ -34,9 +36,7 @@ class DistinctPlan final : public PlanBase {
   [[nodiscard]] size_t AccessRowCount() const override {
     return child_->AccessRowCount();
   }
-  [[nodiscard]] size_t EmitRowCount() const override {
-    return child_->EmitRowCount();
-  }
+  [[nodiscard]] size_t EmitRowCount() const override { return stats_.Rows(); }
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override {
@@ -62,6 +62,7 @@ class DistinctPlan final : public PlanBase {
  private:
   Plan child_;
   std::vector<Expression> distinct_on_;
+  TableStatistics stats_;
 };
 
 }  // namespace tinylamb

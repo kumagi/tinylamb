@@ -253,8 +253,8 @@ StatusOr<DataChunk> PaxPage::Load() const {
     if (length == 0) {
       continue;
     }
-    if (offset < payload_begin || length > payload_end - offset ||
-        offset < cursor) {
+    if (offset < payload_begin || offset > payload_end ||
+        length > payload_end - offset || offset < cursor) {
       return Status::kCorrupt;
     }
     cursor = offset + length;

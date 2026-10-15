@@ -886,16 +886,20 @@ int main(int argc, char** argv) {
 
   // Always refresh statistics before measurement so EXPLAIN/costing and
   // Hybrid vs in-memory join choice see real cardinalities (including
-  // --reuse-database runs that skipped the load path).
-  const Clock::time_point analyze_begin = Clock::now();
-  if (!AnalyzeAllTables(database, &error)) {
-    std::cerr << "ANALYZE failed: " << error << '\n';
-    return 1;
+  // --reuse-database runs that skipped the load path).  TINYLAMB_SKIP_ANALYZE=1
+  // keeps persisted statistics when a profiling run must not fold the
+  // ANALYZE cost into the collected window.
+  if (std::getenv("TINYLAMB_SKIP_ANALYZE") == nullptr) {
+    const Clock::time_point analyze_begin = Clock::now();
+    if (!AnalyzeAllTables(database, &error)) {
+      std::cerr << "ANALYZE failed: " << error << '\n';
+      return 1;
+    }
+    std::cout
+        << "analyze_seconds="
+        << std::chrono::duration<double>(Clock::now() - analyze_begin).count()
+        << '\n';
   }
-  std::cout
-      << "analyze_seconds="
-      << std::chrono::duration<double>(Clock::now() - analyze_begin).count()
-      << '\n';
 
   std::vector<QueryProfile> profiles;
   const size_t first_query = options.query.value_or(1);

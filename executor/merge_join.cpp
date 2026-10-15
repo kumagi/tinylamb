@@ -329,8 +329,12 @@ bool MergeJoin::Next(Row* dst, RowPosition* rp) {
   return true;
 }
 
-void MergeJoin::Dump(std::ostream& o, int /*indent*/) const {
+void MergeJoin::Dump(std::ostream& o, int indent) const {
   o << "MergeJoin (sorted keys)";
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
+  left_->Dump(o, indent + 2);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
+  right_->Dump(o, indent + 2);
 }
 
 }  // namespace tinylamb

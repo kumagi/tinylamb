@@ -35,16 +35,10 @@ class MetaPage {
  public:
   [[nodiscard]] page_id_t MaxPageCountForTest() const { return max_page_count; }
   [[nodiscard]] page_id_t MaxPageCount() const { return max_page_count; }
-  // Recovery: re-derive the allocator high-water mark after a crash. The
-  // counter mutates outside the WAL, so RecoveryManager rebuilds it from
-  // every page id the log touches (see RecoverFrom).
   void RestoreMaxPageCount(page_id_t high_water) {
     max_page_count = std::max(max_page_count, high_water);
   }
 
-  // D3 (docs/design.md): the meta page mutates the free list outside the WAL,
-  // so a crash can leave a stale chain.  RecoveryManager re-derives the whole
-  // list by scanning the page range and installs the rebuilt head here.
   [[nodiscard]] page_id_t FirstFreePage() const { return first_free_page; }
   void RebuildFreeListHead(page_id_t head) { first_free_page = head; }
 

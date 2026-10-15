@@ -752,5 +752,59 @@ TEST(SqlTemplateTest, TripleQuotedStringsExtractedCorrectly) {
   EXPECT_EQ(raw.fingerprint, "SELECT r'?';");
 }
 
+// A cached MERGE statement re-binds every literal-bearing slot: the ON
+// condition, each clause's condition, SET values, and INSERT values. Dropping
+// any of them turned a plan-cache hit into a stale-conditioned merge.
+TEST(SqlTemplateTest, BindsCachedMergeTree) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "skipped";
+  }
+  auto original = ParseSql(
+      "MERGE INTO tgt USING src ON tgt.k = src.k AND tgt.v = 7 "
+      "WHEN MATCHED AND src.nv = 'hit' THEN UPDATE SET v = 8 "
+      "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (9, 'ins');");
+  ASSERT_TRUE(original);
+  ASSERT_EQ(original->Type(), StatementType::kMerge);
+  const SqlTemplate templated = ExtractSqlTemplate(
+      "MERGE INTO tgt USING src ON tgt.k = src.k AND tgt.v = 7 "
+      "WHEN MATCHED AND src.nv = 'hit' THEN UPDATE SET v = 8 "
+      "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (9, 'ins');");
+  ASSERT_EQ(templated.parameters.size(), 5U);
+  std::vector<Value> rebound;
+  for (const Value& v : templated.parameters) {
+    if (v.IsNull()) {
+      rebound.emplace_back(int64_t{0});
+    } else if (v.type == ValueType::kInt64) {
+      rebound.emplace_back(int64_t{v.value.int_value + 100});
+    } else {
+      // AsString() renders a quoted form; the raw varchar is the payload.
+      rebound.emplace_back("x" + std::string(v.value.varchar_value));
+    }
+  }
+  auto bound_or = BindStatementLiterals(*original, rebound);
+  ASSERT_TRUE(bound_or.HasValue()) << bound_or.GetStatus();
+  auto bound = bound_or.MoveValue();
+  ASSERT_EQ(bound->Type(), StatementType::kMerge);
+  const auto& merge = dynamic_cast<const MergeStatement&>(*bound);
+  // ON conjunct: the int literal moved 7 -> 107.
+  EXPECT_NE(merge.OnCondition()->ToString().find("107"), std::string::npos)
+      << merge.OnCondition()->ToString();
+  ASSERT_EQ(merge.Clauses().size(), 2U);
+  // WHEN MATCHED condition string literal 'hit' -> 'xhit'.
+  EXPECT_NE(merge.Clauses()[0].condition->ToString().find("xhit"),
+            std::string::npos);
+  // UPDATE SET value 8 -> 108.
+  ASSERT_EQ(merge.Clauses()[0].action.set_clause.size(), 1U);
+  EXPECT_NE(
+      merge.Clauses()[0].action.set_clause[0].second->ToString().find("108"),
+      std::string::npos);
+  // INSERT VALUES (9, 'ins') -> (109, 'xins').
+  ASSERT_EQ(merge.Clauses()[1].action.insert_values.size(), 2U);
+  EXPECT_NE(merge.Clauses()[1].action.insert_values[0]->ToString().find("109"),
+            std::string::npos);
+  EXPECT_NE(merge.Clauses()[1].action.insert_values[1]->ToString().find("xins"),
+            std::string::npos);
+}
+
 }  // namespace
 }  // namespace tinylamb

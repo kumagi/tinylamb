@@ -1,9 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/jit.hpp"
 
-#include <llvm/IR/DerivedTypes.h>
-#include <llvm/IR/Value.h>
-
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -21,6 +18,9 @@
 #include "common/log_message.hpp"
 
 #ifdef TINYLAMB_HAS_LLVM
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Value.h>
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcpp"
 #include <llvm/Config/llvm-config.h>

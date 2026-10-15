@@ -25,7 +25,8 @@
 #include "common/log_message.hpp"
 #include "page/row_page_fuzzer.hpp"
 
-static void TestCase(std::string_view input) {
+namespace {
+void TestCase(std::string_view input) {
   tinylamb::RowPageEnvironment env;
   tinylamb::Operation op(&env);
   while (!input.empty()) {
@@ -33,6 +34,7 @@ static void TestCase(std::string_view input) {
     input.remove_prefix(read_bytes);
   }
 }
+}  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {

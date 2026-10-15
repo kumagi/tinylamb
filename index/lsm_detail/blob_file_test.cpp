@@ -16,15 +16,19 @@
 
 #include "index/lsm_detail/blob_file.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "index/lsm_detail/cache.hpp"
 #include "recovery/logger.hpp"
@@ -51,20 +55,14 @@ class BlobFileTest : public ::testing::Test {
 };
 
 TEST_F(BlobFileTest, ReadAt) {
-  // Arrange -- build a tree of 2 key/value pairs and a Logger to write them
   std::map<std::string, std::string> tree;
   tree.emplace("foo", "barr");
   tree.emplace("value", "notice");
-  auto lg = Logger::Create(path_).MoveValue();
-
-  // Act -- write each key and value through the Logger, then destroy the logger
   for (const auto& it : tree) {
-    lg->AddLog(it.first);
-    lg->AddLog(it.second);
+    ASSERT_TRUE(blob_->Append(it.first).HasValue());
+    ASSERT_TRUE(blob_->Append(it.second).HasValue());
   }
-  lg.reset();
 
-  // Assert -- read back each entry at the expected offset via BlobFile::ReadAt
   ASSERT_EQ(blob_->ReadAt(0, 3).Value(), "foo");
   ASSERT_EQ(blob_->ReadAt(3, 4).Value(), "barr");
   ASSERT_EQ(blob_->ReadAt(7, 5).Value(), "value");
@@ -84,13 +82,9 @@ std::string EncodeRecord(std::string_view payload) {
 }  // namespace
 
 TEST_F(BlobFileTest, ReadAtWithLengthPrefix) {
-  // Arrange -- write two length-prefixed records through a Logger
-  auto lg = Logger::Create(path_).MoveValue();
-  lg->AddLog(EncodeRecord("hello"));
-  lg->AddLog(EncodeRecord("world of blob"));
-  lg.reset();
+  ASSERT_TRUE(blob_->Append(EncodeRecord("hello")).HasValue());
+  ASSERT_TRUE(blob_->Append(EncodeRecord("world of blob")).HasValue());
 
-  // Act -- read each record with the locked, length-prefix aware overload
   std::string_view out;
   {
     Cache::Locks locks = blob_->ReadAt(0, out).MoveValue();
@@ -139,4 +133,120 @@ TEST_F(BlobFileTest, StreamOperator) {
   ASSERT_NE(ss.str().find("BlobFile(written="), std::string::npos);
   ASSERT_NE(ss.str().find("cache="), std::string::npos);
 }
+
+TEST_F(BlobFileTest, LargeValueSurvivesReopen) {
+  const std::string value((size_t{16} << 20) + 123, 'v');
+  const lsn_t offset = blob_->Append(value).Value();
+  ASSERT_EQ(blob_->Written(), offset + value.size());
+  ASSERT_SUCCESS(blob_->Sync());
+  ASSERT_EQ(blob_->ReadAt(offset, value.size()).Value(), value);
+
+  blob_.reset();
+  auto reopened = BlobFile::Create(path_, size_t{32} << 20).MoveValue();
+  ASSERT_EQ(reopened->Written(), offset + value.size());
+  ASSERT_EQ(reopened->ReadAt(offset, value.size()).Value(), value);
+}
+
+TEST_F(BlobFileTest, MigratesLegacySegments) {
+  blob_.reset();
+  constexpr size_t kSegmentSize = 64;
+  std::vector<std::pair<lsn_t, std::string>> expected;
+  lsn_t expected_end = 0;
+  {
+    auto legacy = Logger::Create(path_, 64, 1, kSegmentSize).MoveValue();
+    for (int i = 0; i < 20; ++i) {
+      const std::string payload(static_cast<size_t>(3 + ((i * 7) % 23)),
+                                static_cast<char>('a' + i));
+      const lsn_t offset = legacy->AddLog(payload).Value();
+      expected.emplace_back(offset, payload);
+      expected_end = std::max(expected_end, offset + payload.size());
+    }
+    ASSERT_SUCCESS(legacy->Finish());
+  }
+
+  auto migrated = BlobFile::Create(path_).MoveValue();
+  ASSERT_EQ(migrated->Written(), expected_end);
+  for (const auto& [offset, payload] : expected) {
+    ASSERT_EQ(migrated->ReadAt(offset, payload.size()).Value(), payload);
+  }
+  bool any = false;
+  auto highest = Logger::FindHighestSegment(path_, &any);
+  ASSERT_TRUE(highest.HasValue());
+  EXPECT_TRUE(any);
+  EXPECT_EQ(highest.Value(), 0U);
+  EXPECT_FALSE(std::filesystem::exists(Logger::SegmentMetadataPath(path_)));
+  EXPECT_FALSE(std::filesystem::exists(path_ + ".migrating"));
+  EXPECT_FALSE(std::filesystem::exists(path_ + ".migrating.tmp"));
+}
+
+TEST_F(BlobFileTest, MissingLegacySegmentFailsClosed) {
+  blob_.reset();
+  constexpr size_t kSegmentSize = 64;
+  {
+    auto legacy = Logger::Create(path_, 64, 1, kSegmentSize).MoveValue();
+    for (int i = 0; i < 8; ++i) {
+      ASSERT_TRUE(legacy->AddLog(std::string(32, static_cast<char>('a' + i)))
+                      .HasValue());
+    }
+    ASSERT_SUCCESS(legacy->Finish());
+  }
+  ASSERT_TRUE(std::filesystem::remove(Logger::SegmentPath(path_, 1)));
+  EXPECT_FALSE(BlobFile::Create(path_).HasValue());
+  for (uint64_t index = 1; index < 8; ++index) {
+    std::filesystem::remove(Logger::SegmentPath(path_, index));
+  }
+  std::filesystem::remove(Logger::SegmentMetadataPath(path_));
+}
+
+// A segment that is shorter than its extent must fail the migration's
+// ValidateSeries pass instead of silently copying a truncated image.
+TEST_F(BlobFileTest, ShortLegacySegmentFailsClosed) {
+  blob_.reset();
+  constexpr size_t kSegmentSize = 64;
+  {
+    auto legacy = Logger::Create(path_, 64, 1, kSegmentSize).MoveValue();
+    for (int i = 0; i < 8; ++i) {
+      ASSERT_TRUE(legacy->AddLog(std::string(32, static_cast<char>('a' + i)))
+                      .HasValue());
+    }
+    ASSERT_SUCCESS(legacy->Finish());
+  }
+  // Segment 1 holds exactly kSegmentSize bytes; shaving one off must trip
+  // the extent check (a torn tail is not a valid legacy layout).
+  const auto segment_1 = Logger::SegmentPath(path_, 1);
+  ASSERT_TRUE(std::filesystem::exists(segment_1));
+  std::filesystem::resize_file(segment_1,
+                               std::filesystem::file_size(segment_1) - 1);
+  EXPECT_FALSE(BlobFile::Create(path_).HasValue());
+  for (uint64_t index = 1; index < 8; ++index) {
+    std::filesystem::remove(Logger::SegmentPath(path_, index));
+  }
+  std::filesystem::remove(Logger::SegmentMetadataPath(path_));
+}
+
+// Truncated geometry metadata (lost magic/version tail) must fail the open
+// as kCorrupt instead of guessing a segment size.
+TEST_F(BlobFileTest, TruncatedSegmentMetadataFailsClosed) {
+  blob_.reset();
+  constexpr size_t kSegmentSize = 64;
+  {
+    auto legacy = Logger::Create(path_, 64, 1, kSegmentSize).MoveValue();
+    for (int i = 0; i < 8; ++i) {
+      ASSERT_TRUE(legacy->AddLog(std::string(32, static_cast<char>('a' + i)))
+                      .HasValue());
+    }
+    ASSERT_SUCCESS(legacy->Finish());
+  }
+  const auto metadata = Logger::SegmentMetadataPath(path_);
+  ASSERT_TRUE(std::filesystem::exists(metadata));
+  std::filesystem::resize_file(metadata, 3U);
+  const StatusOr<std::unique_ptr<BlobFile>> opened = BlobFile::Create(path_);
+  EXPECT_FALSE(opened.HasValue());
+  EXPECT_EQ(opened.GetStatus().GetCode(), StatusCode::kCorrupt);
+  for (uint64_t index = 1; index < 8; ++index) {
+    std::filesystem::remove(Logger::SegmentPath(path_, index));
+  }
+  std::filesystem::remove(metadata);
+}
+
 }  // namespace tinylamb

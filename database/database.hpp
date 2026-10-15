@@ -23,6 +23,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -54,10 +55,11 @@ class Database final : public CatalogReader {
 
   // Filesystem bookkeeping: every Create() records the database's base name
   // for this process; RemoveCreatedDatabaseFiles() unlinks the
-  // <name>.db/.log/.last_checkpoint/.db.tmp artifacts of every recorded
-  // name (missing files are ignored). The test-workspace cleanup environment
-  // calls it at binary exit so throwaway databases never outlive the run;
-  // benchmarks and servers keep files unless they call it themselves.
+  // <name>.db/.log/.last_checkpoint/.last_checkpoint.tmp artifacts of every
+  // recorded name (missing files are ignored). The test-workspace cleanup
+  // environment calls it at binary exit so throwaway databases never outlive
+  // the run; benchmarks and servers keep files unless they call it
+  // themselves.
   // Names are never unregistered: a reopen cycle (EmulateCrash + Create)
   // keeps the same base name and stays covered.
   static void RemoveCreatedDatabaseFiles();
@@ -98,8 +100,51 @@ class Database final : public CatalogReader {
 
   Status DropTable(TransactionContext& ctx, std::string_view schema_name);
 
+  // Materialized-view definition records, persisted in the functions tree
+  // under a reserved key prefix.  The stored value is the defining SELECT
+  // text; `Put` overwrites (refresh/recreate), `Get` reports kNotExists for
+  // anything that is not a materialized view.
+  static constexpr std::string_view kMaterializedViewKeyPrefix =
+      "__matview\x1e";
+  Status PutMaterializedViewDefinition(TransactionContext& ctx,
+                                       std::string_view name,
+                                       std::string_view query_text);
+  StatusOr<std::string> GetMaterializedViewDefinition(TransactionContext& ctx,
+                                                      std::string_view name);
+  Status DeleteMaterializedViewDefinition(TransactionContext& ctx,
+                                          std::string_view name);
+
+  // (Non-materialized) view definition records, persisted like the
+  // materialized ones under their own reserved prefix, plus a newline-joined
+  // name index under `kViewIndexKey` so a reopen can re-register every view
+  // without a range-scan API.  Definitions store the defining SELECT text;
+  // expansion happens at FROM-reference time (session ViewRegistry).
+  static constexpr std::string_view kViewKeyPrefix = "__view\x1e";
+  static constexpr std::string_view kViewIndexKey = "__view\x1e\x01__index";
+  Status PutViewDefinition(TransactionContext& ctx, std::string_view name,
+                           std::string_view query_text);
+  StatusOr<std::string> GetViewDefinition(TransactionContext& ctx,
+                                          std::string_view name);
+  Status DeleteViewDefinition(TransactionContext& ctx, std::string_view name);
+  StatusOr<std::vector<std::string>> ListViewDefinitions(
+      TransactionContext& ctx);
+
   Status CreateIndex(TransactionContext& ctx, std::string_view schema_name,
                      const IndexSchema& idx);
+
+  // ALTER TABLE ... RENAME TO: a catalog-level operation (the Table value
+  // is re-serialized under the new canonical name; data and index pages are
+  // untouched).  Refuses when another table's FOREIGN KEY references the
+  // old name (the constraint stores the parent table name as a string) or
+  // when the target name already exists (case-insensitive).
+  Status RenameTable(TransactionContext& ctx, std::string_view from_name,
+                     std::string_view to_name);
+
+  // ALTER TABLE ... RENAME COLUMN: rewrites the column name inside the
+  // catalog-serialized schema.  Statistics entries are column-INDEX keyed
+  // and stay valid; cached plans are invalidated by the schema epoch bump.
+  Status RenameColumn(TransactionContext& ctx, std::string_view table_name,
+                      std::string_view old_column, std::string_view new_column);
 
   StatusOr<Function> GetOrAddFunction(TransactionContext& ctx,
                                       std::string_view function_name,
@@ -171,6 +216,10 @@ class Database final : public CatalogReader {
   // GetOrAddFunction). Held across page allocation so a concurrent duplicate
   // registration can no longer allocate pages it would never reclaim.
   std::mutex catalog_mu_;
+
+  std::mutex table_incarnations_mu_;
+  std::unordered_map<std::string, std::shared_ptr<TableIncarnation>>
+      table_incarnations_;
 
   // Compiled-plan invalidation epoch; see SchemaEpoch()/BumpSchemaEpoch().
   // Starts from a process-global counter so two Database instances never

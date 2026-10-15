@@ -20,13 +20,21 @@ After crash or `Database::EmulateCrash()` + reopen:
    earlier.
 5. **Catalog** table/index metadata matches row pages after redo completes.
 6. **Recycled WAL never holds a needed record**: after a durable checkpoint
-   the log is truncated by whole segments (see `docs/wal_format.md`), and
-   every consumer -- redo from the DPT, loser-chain undo, torn-tail
-   truncation, runtime abort walks -- stays at or above the retained start
-   because the recycle floor is the minimum over (checkpoint begin LSN,
-   oldest DPT recLSN, oldest active transaction's first LSN, oldest
-   unsynced full-page image). A torn data-file page rebuilds from its
-   retained `kFullPageImage` record plus the deltas above it.
+    the log is truncated by whole segments (see `docs/wal_format.md`), and
+    every consumer -- redo from the DPT, loser-chain undo, torn-tail
+    truncation, runtime abort walks -- stays at or above the retained start
+    because the recycle floor is the minimum over (checkpoint begin LSN,
+    oldest DPT recLSN, oldest active transaction's first LSN, oldest
+    unsynced full-page image). Each checkpoint also flushes stale dirty
+    pages (oldest recLSN first, time-budgeted) so the oldest-DPT-recLSN
+    component actually advances under sustained load. The allocator meta page
+    is synchronously flushed outside that budget before the master record is
+    published; a failed meta flush aborts the checkpoint without recycling.
+    `SyncDataFile` retires only images whose pwrite completed before the
+    sync began: emitting, in-flight, and failed writes remain pending, and a
+    later successful pwrite plus sync is required for retirement. A torn
+    data-file page rebuilds from its retained `kFullPageImage` record plus
+    the deltas above it.
 
 ## Idempotent redo/undo (D2, `docs/design.md`)
 
@@ -51,9 +59,20 @@ error:
   but it is never the sole correctness basis -- the page operations are
   self-guarding, so replay order changes (CLR, original record, restart)
   cannot corrupt the page.
-- Format/structure corruption is NOT hidden as a no-op: `ASSERT_PAGE_TYPE`
-  still throws and the page checksum still gates reads, so genuine damage
-  fails loudly while a merely-absent apply target succeeds quietly.
+- Format/structure corruption is NOT hidden as a no-op: ordinary page APIs
+  still reject invalid types, while recovery validates replay target types
+  and returns `kCorrupt` before advancing page LSN. The page checksum still
+  gates reads, so genuine damage fails loudly while a merely-absent apply
+  target succeeds quietly. Replay payload-size and page-capacity failures
+  likewise return an error before advancing the page LSN; a rejected
+  full-page image cannot be mistaken for an applied image.
+- The UNDO side has one deliberate exception to the hard type check: when the
+  target page's type no longer matches the record because the page was
+  destroyed or re-issued AFTER the record was written (a newer incarnation),
+  the operation's effects no longer exist, so `LogUndo` logs the CLR (the
+  loser chain must terminate on every future replay), skips the physical
+  mutation, and leaves the page's own stamps untouched. A mismatch on a page
+  whose current incarnation still predates the record remains `kCorrupt`.
 
 `kSystemDestroyPage` (D3): REDO re-initializes the target page as
 `kFreePage`; the free list is rebuilt by a `[1, max_page_count]` scan at the
@@ -64,6 +83,27 @@ rolled-back DROP TABLE) restores the page exactly and pops it from the
 allocator stack.  Re-applying the same destroy redo or re-running the whole
 recovery is idempotent.
 
+`kSystemAllocPage` v6 is transactional. Every record carries a fixed 16-byte
+big-endian allocator snapshot: pre-allocation `first_free_page` and
+`max_page_count`. Fresh allocation has no undo bytes, recycled allocation has
+a fixed 16-byte big-endian `next_free_page`/`destroyer` snapshot, and in-place
+page-type changes retain the complete 32 KiB old target body. No payload reads
+`MetaPage` or `FreePage` object representation. Runtime abort and loser recovery
+therefore restore the allocator without relying on a restart-time free-list
+scan. `kCompensateAllocPage` is appended before either page changes; recovery
+validates exact payload sizes and allocator/free-list invariants, then treats
+the CLR as the idempotent redo image. Fresh undo makes the target free and
+restores the old high-water mark. Recycled redo pops the captured link and
+repairs the high-water mark to `max(old_max_page_count, page_id)`. Recycled undo
+restores the exact old free state and allocator fields, including a free-list
+head ahead of a stale high-water mark; when later allocator activity forces a
+safe merge rather than an exact snapshot restore, the merged head and monotonic
+high-water mark are retained. Legacy v1-v5 allocation records have no undo
+payload and keep the legacy redo-only behavior.
+Recycled-page MVCC chains are cleaned only after the allocation commits; the
+cleanup preserves that transaction's pending versions on the new incarnation,
+while abort leaves the old incarnation's chains intact.
+
 `AddLog` and visibility (D4): a transaction's versions become visible only
 AFTER its commit record's `AddLog` returns; durability of the commit (own
 and observed dependencies) is a separate barrier before results reach the
@@ -73,11 +113,24 @@ user -- see `docs/commit_durability.md`.
 
 ```
 Startup → read checkpoint LSN
-       → scan WAL from checkpoint
-       → REDO page writes + row ops
+       → scan WAL from checkpoint (rate-limited progress lines per phase:
+         torn-tail scan / analysis / redo collection / torn-page sweep)
+       → REDO page writes + row ops (parallel per-page replay)
        → UNDO uncommitted transactions
-       → open for queries
+       → torn-page checksum sweep over the whole allocated range
+         (parallel classification; single-page recovery stays serial)
+       → END-OF-RECOVERY CHECKPOINT: publish a fresh master record so the
+         replayed state is durable immediately -- a crash right after a
+         long recovery re-pays only the post-checkpoint WAL, and the
+         recycled-prefix becomes reclaimable without waiting for the
+         periodic timer
+       → open for queries (one-line summary: WAL window, committed/loser
+         counts, pages rebuilt, elapsed)
 ```
+
+The end-of-recovery checkpoint is best-effort: a failure logs a warning and
+the periodic checkpoint retries; the recovered pages stay protected by the
+retained WAL either way.
 
 ## Testing
 
@@ -97,8 +150,15 @@ Startup → read checkpoint LSN
 - Checkpoint worker lifecycle (`Start()` gating, interval 0 disabled):
   `CheckpointTest.WorkerStaysParkedUntilStart`,
   `CheckpointTest.ZeroIntervalDisablesPeriodicCheckpointing`.
+- Allocation undo: `PageManagerTest.RuntimeFreshAllocationAbortReusesId`,
+  `PageManagerTest.RuntimeRecycledAllocationAbortRestoresFreeBodyAndReusesId`,
+  `RecoveryManagerTest.FreshLoserAllocationUndoRestoresIdForImmediateReuse`,
+  `RecoveryManagerTest.RecycledLoserAllocationUndoRestoresBodyForImmediateReuse`,
+  `RecoveryManagerTest.VersionSixCommittedAllocationSurvivesRecovery`.
 - Idempotence / destroy (D2/D3): `LoserUndoSurvivesRepeatedRecoveryPasses`,
   `DestroyPageRedoInitializesFreePageAndRebuildsList`,
+  `RowPageLinkRedoAndLoserUndo`,
+  `Update_CommittedRelocationSurvivesCrashReplay`,
   `DestroyPageRedoTwiceOnSamePageIsIdempotent`,
   `DestroyPageUndoRestoresRowContent`, `DeleteRowReappliedIsIdempotent`,
   `LeafPageTest.ImplOperationsAreIdempotent`,

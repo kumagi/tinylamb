@@ -17,11 +17,10 @@
 #ifndef TINYLAMB_ROW_PAGE_FUZZER_HPP
 #define TINYLAMB_ROW_PAGE_FUZZER_HPP
 
-#include <stdlib.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -47,8 +46,9 @@ class RowPageEnvironment {
     std::string prefix = "checkpoint_test-" + RandomString();
     db_name_ = prefix + ".db";
     log_name_ = prefix + ".log";
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
+    // Best-effort cleanup: ENOENT is expected on a fresh run.
+    (void)std::remove(db_name_.c_str());
+    (void)std::remove(log_name_.c_str());
     Recover();
     auto txn = tm_->Begin();
     PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage).MoveValue();
@@ -79,9 +79,14 @@ class RowPageEnvironment {
   }
 
   ~RowPageEnvironment() {
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
+    (void)std::remove(db_name_.c_str());
+    (void)std::remove(log_name_.c_str());
   }
+
+  RowPageEnvironment(const RowPageEnvironment&) = delete;
+  RowPageEnvironment& operator=(const RowPageEnvironment&) = delete;
+  RowPageEnvironment(RowPageEnvironment&&) = delete;
+  RowPageEnvironment& operator=(RowPageEnvironment&&) = delete;
 
   std::string db_name_;
   std::string log_name_;
@@ -109,7 +114,7 @@ class Operation {
     // never exercised the crash/recovery path at all.
     switch (operation % 7) {
       case 0: {  // Read
-        slot_t slot;
+        slot_t slot = 0;
         if (input.size() < sizeof(slot)) {
           return 1 + input.size();
         }
@@ -128,7 +133,7 @@ class Operation {
         memcpy(&size, input.data(), sizeof(size));
         input.remove_prefix(sizeof(size));
         size = std::min(size, (bin_size_t)input.size());
-        std::string_view str(input.data(), size);
+        std::string_view str = input.substr(0, size);
         if (verbose) {
           LOG(TRACE) << "InsertBranch: " << str;
         }
@@ -136,14 +141,14 @@ class Operation {
         return 1 + sizeof(size) + size;
       }
       case 2: {  // UpdateBranch
-        slot_t slot;
+        slot_t slot = 0;
         if (input.size() < sizeof(slot)) {
           return 1 + input.size();
         }
         memcpy(&slot, input.data(), sizeof(slot_t));
         input.remove_prefix(sizeof(slot));
 
-        bin_size_t size;
+        bin_size_t size = 0;
         if (input.size() < sizeof(size)) {
           return 1 + sizeof(size) + input.size();
         }
@@ -151,7 +156,7 @@ class Operation {
         input.remove_prefix(sizeof(size));
 
         size = std::min(size, (bin_size_t)input.size());
-        std::string_view str(input.data(), size);
+        std::string_view str = input.substr(0, size);
         if (verbose) {
           LOG(TRACE) << "UpdateBranch: " << str << " at " << slot;
         }
@@ -162,7 +167,7 @@ class Operation {
         return 1 + sizeof(slot) + sizeof(size) + size;
       }
       case 3: {  // Delete
-        slot_t slot;
+        slot_t slot = 0;
         if (input.size() < sizeof(slot)) {
           return 1 + input.size();
         }

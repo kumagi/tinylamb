@@ -116,15 +116,27 @@ TEST_F(TableSampleTest, BernoulliFullWeight) {
   }
 }
 
-TEST_F(TableSampleTest, SystemMethodIsRejected) {
+TEST_F(TableSampleTest, SystemMethodSamplesStorageBlocks) {
+  // SYSTEM now samples whole storage blocks (page-level include/exclude);
+  // 0% and 100% pin the boundary behavior.
   Seed();
-  StatusOr<Executor> prepared = engine_->Prepare(
-      *context_, "SELECT id FROM sample_t TABLESAMPLE SYSTEM(10 PERCENT)");
-  ASSERT_TRUE(prepared.HasValue()) << engine_->LastError();
-  Row row;
-  while (prepared.Value()->Next(&row, nullptr)) {
-  }
-  EXPECT_EQ(prepared.Value()->GetStatus(), Status::kNotImplemented);
+  const std::vector<Row> none =
+      RunSql(*engine_, *context_,
+             "SELECT id FROM sample_t TABLESAMPLE SYSTEM(0 PERCENT)");
+  EXPECT_TRUE(none.empty());
+  const std::vector<Row> all =
+      RunSql(*engine_, *context_,
+             "SELECT id FROM sample_t TABLESAMPLE SYSTEM(100 PERCENT)");
+  EXPECT_EQ(all.size(), 5U);
+  const std::vector<Row> repeatable = RunSql(
+      *engine_, *context_,
+      "SELECT id FROM sample_t TABLESAMPLE SYSTEM(50 PERCENT) REPEATABLE(7) "
+      "ORDER BY id");
+  const std::vector<Row> repeatable_again = RunSql(
+      *engine_, *context_,
+      "SELECT id FROM sample_t TABLESAMPLE SYSTEM(50 PERCENT) REPEATABLE(7) "
+      "ORDER BY id");
+  EXPECT_EQ(repeatable, repeatable_again);
 }
 
 TEST_F(TableSampleTest, DerivedRelationUsesRelationalSamplePath) {

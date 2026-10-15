@@ -63,23 +63,24 @@ graph TD
 
 ```cpp
           Plan input = children[0].plan;
-          double cost = children[0].estimated_rows;
+          double cost = children[0].estimated_rows * 0.8;
           const std::vector<bool> ascending(ordering.size(), true);
           if (!input->IsOrderedBy(ordering, ascending)) {
             const double rows = children[0].estimated_rows;
             cost += rows * std::log2(std::max(2.0, rows));
-            input =
-                std::make_shared<SortPlan>(std::move(input), std::move(keys));
+            input = MakeSortPlan(std::move(input), std::move(keys), rows);
           }
+          const double output_rows =
+              EstimateDistinctRows(children[0].plan, ordering);
           Plan distinct = std::make_shared<SortDistinctPlan>(std::move(input));
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(distinct),
                               .local_cost = cost,
-                              .estimated_rows = children[0].estimated_rows}};
+                              .estimated_rows = output_rows}};
 ```
 
-- **局所コスト（`local_cost`）**: ストリーミング重複排除自体の走査費用（`children[0].estimated_rows`）に、未ソート時の外部ソート費用 $N \log_2 N$ を加算。
-- **推定出力行数（`estimated_rows`）**: 統計からの正確な縮小率が未定であるため、保守的に入力行数 `children[0].estimated_rows` を維持。
+- **局所コスト（`local_cost`）**: ストリーミング重複排除自体の走査費用（`0.8 * children[0].estimated_rows`）に、未ソート時の外部ソート費用 $N \log_2 N$ を加算。
+- **推定出力行数（`estimated_rows`）**: 列の NDV と NULL 件数を使い、`EstimateDistinctRows` で推定。多列は指数バックオフによる近似です。
 
 `SortDistinctPlan`（`plan/sort_distinct_plan.hpp`）は `EnforcesDistinct() == true` を返し、出力順序特性としては子のソート順序をそのまま保持・公開します。
 
@@ -97,3 +98,8 @@ graph TD
 
 - `plan/optimizer_test.cpp`:
   - `OptimizerTest.SortDistinctRuleAddsSortForUnorderedInput`: 未ソート入力に対して `"sort_distinct"` を適用した際、`SortDistinctPlan` の直下に `SortPlan` が自動挿入されることを検証。
+
+2026-10-02 更新: 連続する行の比較は hash set 構築より軽いとして、局所コストを
+0.8 * rows とし、必要な場合だけ sort のコストを加えます。以前の rows 固定では
+hash distinct と同額になり、登録順で常に負けていました。
+`CascadesRulesCoverageTest.OrderedDistinctSelectsSortDistinct` が通常の選択を確認します。

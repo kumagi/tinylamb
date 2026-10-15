@@ -151,7 +151,7 @@ guard は次の 2 つだけです。
 
 ## 関連 Rule との相互作用
 
-- `merge_selections` / `merge_adjacent_filters`: 合成後の述語が
+- `merge_selections` / `merge_selections`: 合成後の述語が
   本 Rule の入力になります。
 - `push_selection_into_scan` / `push_selection_through_join`:
   正規形になった連言を下流へ押し込みます。

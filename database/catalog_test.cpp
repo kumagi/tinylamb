@@ -63,6 +63,7 @@ class CatalogTest : public ::testing::Test {
   void Recover() {
     if (rs_) {
       rs_->EmulateCrash();
+      rs_.reset();
     }
     rs_ = Database::Create(prefix_).MoveValue();
   }
@@ -508,6 +509,45 @@ TEST_F(CatalogTest, UniqueIndexRejectsDuplicateKeys) {
   }
 }
 
+TEST_F(CatalogTest, FailedQuiescentDropFailsPreCommitAndPreservesTable) {
+  Schema schema("drop_hook_failure", {Column("id", ValueType::kInt64)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->GetTable(ctx, schema.Name()));
+  auto lease = table.AcquireLease(ctx.txn_.ID());
+  ASSERT_TRUE(lease.HasValue());
+  ASSERT_TRUE(lease.Value().Valid());
+  EXPECT_EQ(rs_->DropTable(ctx, schema.Name()), Status::kConflicts);
+  lease.Value().Release();
+  EXPECT_TRUE(ctx.txn_.IsFailed());
+  EXPECT_NE(ctx.txn_.PreCommit(), Status::kSuccess);
+  ASSERT_SUCCESS(ctx.txn_.Abort());
+
+  {
+    TransactionContext check = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, live, rs_->GetTable(check, schema.Name()));
+    auto live_lease = live.AcquireLease(check.txn_.ID());
+    ASSERT_TRUE(live_lease.HasValue());
+    ASSERT_TRUE(live_lease.Value().Valid());
+    live_lease.Value().Release();
+    ASSERT_SUCCESS(check.txn_.PreCommit());
+  }
+
+  Recover();
+  TransactionContext restarted = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, live, rs_->GetTable(restarted, schema.Name()));
+  auto restarted_lease = live.AcquireLease(restarted.txn_.ID());
+  ASSERT_TRUE(restarted_lease.HasValue());
+  ASSERT_TRUE(restarted_lease.Value().Valid());
+  restarted_lease.Value().Release();
+  ASSERT_SUCCESS(restarted.txn_.PreCommit());
+}
+
 TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {
   // Arrange -- create and commit a table with two columns.
   Schema schema("drop_tbl", {Column("c", ValueType::kInt64),
@@ -525,6 +565,7 @@ TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {
                                 ctx.GetTable("drop_tbl"));
     EXPECT_EQ(schema, before->GetSchema());
     ASSERT_SUCCESS(rs_->DropTable(ctx, "drop_tbl"));
+    EXPECT_FALSE(ctx.txn_.IsFailed());
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -811,7 +852,7 @@ TEST_F(CatalogTest, DropTableCrashRecoveryReclaimsPages) {
   {
     PageRef meta = pm->GetPage(kMetaPageId).MoveValue();
     const page_id_t head = meta->body.meta_page.FirstFreePage();
-    EXPECT_NE(head, 0U) << true;
+    EXPECT_NE(head, 0U);
     PageRef freed = pm->GetPage(head).MoveValue();
     ASSERT_FALSE(freed.IsNull());
     EXPECT_EQ(freed->Type(), PageType::kFreePage);
@@ -963,7 +1004,7 @@ TEST_F(CatalogTest, ColumnStatisticsResolveForAnyCase) {
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, stats,
                         rs_->GetStatistics(ctx2, "casestats"));
   ASSERT_EQ(stats.Rows(), 5U);
-  EXPECT_GT(stats.Column(0).Count(), 0U) << true;
+  EXPECT_GT(stats.Column(0).Count(), 0U);
   ASSERT_SUCCESS(ctx2.txn_.PreCommit());
 }
 

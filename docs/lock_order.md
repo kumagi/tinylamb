@@ -5,7 +5,8 @@ waiting on an outer one.
 
 ```
 1. Database / catalog latch (schema changes)
-2. PagePool shard latch → per-page latch
+2. PagePool target-page content latch → IO latch → pool_latch (short, shared)
+   → shard mutex
 3. Index mutation gate(s) → B+ tree page latches (root → leaf, consistent with tree descent)
 4. LockManager row locks (auxiliary, test-facing; primary conflict control is
    MVCC write-intent via `TransactionManager::AcquireWriteIntent`)
@@ -15,6 +16,11 @@ waiting on an outer one.
    and the deadlock detector's victim wounding only). Never the reverse:
    no path may acquire a version shard mutex while holding the transaction
    table lock.
+7a. MVCC version shard mutex → page-chain shard mutex (leaf, see
+   `TransactionManager::page_chain_shards_`): chain create/erase updates the
+   per-page map under the storage shard's mutex. The page-chain shard mutex
+   is never held while acquiring any other lock; lookups
+   (`HasVersionChain`, `HasPageVersionChains`) take it alone.
 8. MVCC version shard mutex → wait-for graph mutex (AddWaitForEdge under the
    shard lock; the detector snapshots the graph under the graph mutex alone
    and re-locks the table only to wound).
@@ -44,6 +50,20 @@ waiting on an outer one.
   record's byte stream is never fragmented by another producer.
 - **No lock while blocking on I/O**: release page latches before `pread`/`pwrite`
   miss paths where possible (PagePool miss path loads outside shard lock).
+- **PagePool durability bookkeeping mutexes are below the IO latch**: the
+  write-back path takes page content latch → IO latch (`io_latches_[shard].mu`)
+  → `sync_state_mu_` (the `unsynced_pages_` / pwrite-serial map) and, nested
+  only under it, `snapshot_mu_` (the retained FPW LSN map). Both are released
+  before the durability gate or the WAL snapshot sink runs (they block on
+  fsync/logging); no path takes `pool_latch`, a page latch, or an IO latch
+  while holding either. `writeback_wait_mu_`/`writeback_cv_`
+  (`DropAllPages`/`~PagePool`) wait for the active writeback/eviction/load
+  counters with no other lock held.
+- **Table-tail ownership is a leaf lock**: `PageManager` may inspect or update
+  table-tail state while holding a page content latch, but it must release that
+  page latch before waiting on `table_tails_cv_`. Never hold `table_tails_mu_`
+  while taking a page, meta, transaction, index, or catalog latch. A pending
+  tail owner is resolved only after commit or complete runtime undo.
 - **LockManager timeout**: waits use `ExclusiveWaitTimeout()` (5 s, extended
   toward the 60 s durability floor during WAL stalls); on expiry the wait
   gives up and the acquire returns `false` (see `docs/lock_timeout.md`).
@@ -70,3 +90,25 @@ these paths.
 
 `lock_manager_test` and `page_pool` concurrency tests cover cross-thread
 ordering; extend them when adding a new global latch.
+
+### Recovery restart: phase-serialized latching (known TSAN graph cycle)
+
+Restart recovery mixes two latch disciplines across sequential phases inside
+`RecoveryManager::RecoverFrom`:
+
+1. The dirty-page batch (pin every DPT page, meta last) is latched, analyzed,
+   and released (`pages.clear()`) *before* parallel replay starts.
+2. `ReplayPagesInParallel` workers latch their target page first and the meta
+   page second (`PageManager::ReplayAllocation -> GetMetaPage`).
+3. The torn-page sweep and the free-list rebuild walk pages 1..high_water
+   transiently *after* the workers are joined.
+
+Because each phase releases everything before the next begins, no two of
+these orders can be active at once, so there is no runtime deadlock. TSAN's
+process-wide lock-order graph, however, combines the edges across phases and
+reports `lock-order-inversion` against `PageRef::PageRef`
+(`postgres_session_fuzzer_replay_test` under TSAN, exit code 66). Any change
+that lets two phases overlap — or keeps a PageRef alive across
+`pages.clear()` — turns the graph cycle into a real one; restructure toward a
+single global order (target -> meta everywhere) if recovery latching is ever
+revisited.

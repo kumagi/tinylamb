@@ -16,12 +16,17 @@
 
 #include "full_scan_iterator.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -34,8 +39,10 @@
 #include "gtest/gtest.h"
 #include "iterator.hpp"
 #include "page/page_manager.hpp"
+#include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "table/table.hpp"
+#include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/constraint.hpp"
 #include "type/row.hpp"
@@ -44,6 +51,19 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+namespace {
+
+void ForceScanWalFailure(Logger* logger) {
+  const int full_fd = ::open("/dev/full", O_WRONLY);
+  ASSERT_GE(full_fd, 0);
+  ASSERT_EQ(::dup2(full_fd, logger->Fd()), logger->Fd());
+  ASSERT_EQ(::close(full_fd), 0);
+  std::ignore = logger->AddLog("dead");
+  ASSERT_NE(logger->WaitForDurable(logger->BufferedLSN()), Status::kSuccess);
+  ASSERT_TRUE(logger->Failed());
+}
+
+}  // namespace
 
 class FullScanIteratorTest : public ::testing::Test {
  public:
@@ -62,6 +82,7 @@ class FullScanIteratorTest : public ::testing::Test {
   void Recover() {
     if (db_) {
       db_->EmulateCrash();
+      db_.reset();
     }
     db_ = Database::Create(prefix_).MoveValue();
   }
@@ -231,6 +252,42 @@ TEST_F(FullScanIteratorTest, OutputOperator_WhenCalled_PrintsScanName) {
   EXPECT_NE(output.str().find("FullScan"), std::string::npos);
   EXPECT_NE(output.str().find("SampleTable"), std::string::npos);
   ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, ReadVersionFailureTerminatesScanSticky) {
+  const std::string db_name = "full_scan_failure-" + RandomString() + ".db";
+  const std::string log_name = "full_scan_failure-" + RandomString() + ".log";
+  {
+    auto page_manager = PageManager::Create(db_name, 10).MoveValue();
+    auto logger = Logger::Create(log_name).MoveValue();
+    RecoveryManager recovery(log_name, page_manager->GetPool());
+    TransactionManager transactions(page_manager.get(), logger.get(),
+                                    &recovery);
+
+    Transaction pin = transactions.Begin(true);
+    Transaction seed = transactions.Begin();
+    PageRef allocated =
+        page_manager->AllocateNewPage(seed, PageType::kRowPage).MoveValue();
+    const page_id_t page_id = allocated->PageID();
+    allocated.PageUnlock();
+    Table table(Schema("failure_table", {Column("value", ValueType::kInt64)}),
+                page_id);
+    ASSERT_SUCCESS(table.Insert(seed, Row({Value(7)})).GetStatus());
+    ASSERT_SUCCESS(seed.PreCommit());
+
+    Transaction reader = transactions.Begin(true);
+    Transaction broken = transactions.Begin();
+    ASSERT_TRUE(broken.AddWriteSet(RowPosition(page_id + 1000, 0)));
+    ForceScanWalFailure(logger.get());
+    EXPECT_NE(broken.PreCommit(), Status::kSuccess);
+    ASSERT_TRUE(transactions.FailStopped());
+
+    Iterator scan = table.BeginFullScan(reader);
+    EXPECT_FALSE(scan.IsValid());
+    EXPECT_EQ(scan.GetStatus(), Status::kIOError);
+  }
+  std::ignore = std::remove(db_name.c_str());
+  tinylamb::RemoveLogAndSegments(log_name);
 }
 
 }  // namespace tinylamb

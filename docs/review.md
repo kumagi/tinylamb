@@ -400,8 +400,9 @@ query+server の各層を並行レビューし、発見した改善点を重要�
 - 提案: 1 行目スキーマ準拠で幅正規化、パース失敗は警告 or 明示エラー。
 
 ### [中] IndexJoin が複合キーの先頭列しか使わず過剰マッチ
-- 場所: `index_join.cpp:53-56`(残列の等価検証なし)
-- 提案: 残り列の等価チェック追加、または BuildKeyOffsets で複合を禁止して assert。
+- 場所: 旧 `executor/index_join.cpp`(残列の等価検証なし)
+- 対応: 解消。probe は `ProductPlan::DeriveLookupSeek` が索引キー順に導出し、
+  非キー列の等値は残差述語になる。`executor/lookup_join.cpp` が担う。
 
 ### [低] EstimateJoinRows が候補ごとに全行 memcomparable エンコードをやり直す
 - 場所: `planning_heuristics.cpp:179-215,1088-1089`

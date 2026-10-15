@@ -11,6 +11,12 @@
 
 namespace tinylamb {
 
+// sys_days counts days in a 32-bit representation and chrono::year saturates
+// at ±32767; keep every day count well inside both limits.  Shared with the
+// bytecode date kernels so they range-check exactly like the formatters.
+inline constexpr int64_t kDateMinDays = -11000000;
+inline constexpr int64_t kDateMaxDays = 11000000;
+
 [[nodiscard]] StatusOr<int64_t> TryParseDateDays(std::string_view date);
 [[nodiscard]] StatusOr<std::string> TryFormatDateDays(int64_t days);
 [[nodiscard]] StatusOr<int64_t> TryAddDateIntervalDays(int64_t days,

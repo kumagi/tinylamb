@@ -109,9 +109,8 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `merge_adjacent_projections`: 同一の `Projection(Projection(X))` を対象とする兄弟 Rule です。あちらは外側の `output_schema` を明示設定し最初に成功した代替で探索を抜けるのに対し、本 Rule はすべての内側代替を網羅的に試行します。
-- `eliminate_identity_projection`: 合成の結果、射影が入力列をそのまま通過させるだけの恒等射影（Identity Projection）となった場合、その射影自体を消去します。
-- `projection_constant_propagation`: 内側出力に含まれる定数値を外側の参照へ折り込む特殊化 Rule です。
+- `merge_projections`: 同一の `Projection(Projection(X))` を対象とする兄弟 Rule です。あちらは外側の `output_schema` を明示設定し最初に成功した代替で探索を抜けるのに対し、本 Rule はすべての内側代替を網羅的に試行します。
+- 恒等射影の除去は物理実装の `RemoveIdentityProjection` がスキーマを確認して行います。
 
 ## 検証テスト
 

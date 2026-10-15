@@ -229,9 +229,13 @@ size_t BatchNestedLoopJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   return count;
 }
 
-void BatchNestedLoopJoin::Dump(std::ostream& o, int /*indent*/) const {
+void BatchNestedLoopJoin::Dump(std::ostream& o, int indent) const {
   o << "BatchNestedLoopJoin(block_size=" << block_size_
     << ", kind=" << static_cast<int>(kind_) << ")";
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
+  left_->Dump(o, indent + 2);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
+  right_->Dump(o, indent + 2);
 }
 
 void BatchNestedLoopJoin::Explain(std::ostream& o, int indent) const {

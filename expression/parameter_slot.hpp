@@ -211,17 +211,15 @@ inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)
       if (ContainsParameterSlot(in.child_)) {
         return true;
       }
-      return std::ranges::any_of(
-          in.list_, [](const Expression& item) {
-            return ContainsParameterSlot(item);
-          });
+      return std::ranges::any_of(in.list_, [](const Expression& item) {
+        return ContainsParameterSlot(item);
+      });
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
-      return std::ranges::any_of(
-          call.Args(), [](const Expression& arg) {
-            return ContainsParameterSlot(arg);
-          });
+      return std::ranges::any_of(call.Args(), [](const Expression& arg) {
+        return ContainsParameterSlot(arg);
+      });
     }
     case TypeTag::kArrayExp:
       for (const Expression& element :

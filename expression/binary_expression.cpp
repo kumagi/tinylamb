@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
 #include <limits>
@@ -39,6 +40,7 @@
 
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
+#include "type/collation.hpp"
 #include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
@@ -299,19 +301,67 @@ StatusOr<Value> TryDateArithmetic(BinaryOperation op, const Value& left,
 }  // namespace
 
 std::string FoldCase(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    const auto uc = static_cast<unsigned char>(c);
-    out.push_back(uc >= 'A' && uc <= 'Z' ? static_cast<char>(uc - 'A' + 'a')
-                                         : c);
-  }
-  return out;
+  // The single fold rule for case-insensitive collation: ordering (type/
+  // collation.hpp) and grouping fold exactly the same way, so a predicate and
+  // an ORDER BY can never disagree about which rows are peers.
+  return FoldCaseForCollation(s);
 }
 
 namespace {
 
 bool Like(std::string_view value, std::string_view pattern) {
+  // Fast path: with no '_' in the pattern, '%' is a plain segment
+  // separator.  The match is then: optional value prefix, middle segments
+  // occurring in order (first occurrence is optimal — the earliest match
+  // leaves the most room for the remaining segments), optional value
+  // suffix.  Equivalent to the backtracking loop below but runs at
+  // memcmp/memchr speed, which matters on multi-million-row LIKE filters.
+  if (pattern.find('_') == std::string_view::npos) {
+    const size_t first_wild = pattern.find('%');
+    if (first_wild == std::string_view::npos) {
+      return value == pattern;
+    }
+    size_t pos = 0;  // matched prefix of `value`
+    if (first_wild > 0) {
+      if (value.size() < first_wild ||
+          std::memcmp(value.data(), pattern.data(), first_wild) != 0) {
+        return false;
+      }
+      pos = first_wild;
+    }
+    const size_t last_wild = pattern.rfind('%');
+    const size_t tail_len = pattern.size() - last_wild - 1;
+    size_t p = first_wild;
+    while (p < last_wild) {
+      size_t sep = pattern.find('%', p + 1);
+      if (sep == std::string_view::npos || sep > last_wild) {
+        sep = last_wild;
+      }
+      const size_t seg_len = sep - (p + 1);
+      if (seg_len > 0) {
+        const size_t avail =
+            value.size() >= pos + tail_len ? value.size() - tail_len - pos : 0;
+        if (seg_len > avail) {
+          return false;
+        }
+        const size_t found =
+            value.substr(pos, avail).find(pattern.substr(p + 1, seg_len));
+        if (found == std::string_view::npos) {
+          return false;
+        }
+        pos += found + seg_len;
+      }
+      p = sep;
+    }
+    if (tail_len > 0) {
+      if (value.size() < pos + tail_len ||
+          std::memcmp(value.data() + value.size() - tail_len,
+                      pattern.data() + last_wild + 1, tail_len) != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
   size_t value_pos = 0;
   size_t pattern_pos = 0;
   size_t wildcard = std::string_view::npos;

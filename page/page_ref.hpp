@@ -16,9 +16,8 @@
 
 #ifndef TINYLAMB_PAGE_REF_HPP
 #define TINYLAMB_PAGE_REF_HPP
-#include <assert.h>
-
 #include <atomic>
+#include <cassert>
 #include <mutex>
 #include <shared_mutex>
 

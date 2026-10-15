@@ -18,21 +18,21 @@
 #include "executor/aggregation.hpp"
 #include "executor/batch_nested_loop_join.hpp"
 #include "executor/cardinality_probe.hpp"
+#include "executor/cross_join.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
-#include "executor/exchange.hpp"
-#include "executor/generate_series.hpp"
 #include "executor/grouping_sets.hpp"
 #include "executor/max1_row.hpp"
 #include "executor/minmax_index.hpp"
 #include "executor/numa_arena.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_hash_join.hpp"
+#include "executor/partial_aggregate.hpp"
 #include "executor/partial_sort.hpp"
 #include "executor/pdqsort.hpp"
+#include "executor/returning.hpp"
 #include "executor/sort.hpp"
 #include "executor/topn.hpp"
-#include "executor/two_phase_distinct_agg.hpp"
 #include "executor/values.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -246,37 +246,6 @@ TEST(VectorizedAggregationExecutorTest, BitwiseAndLogicalAggregation) {
   EXPECT_EQ(result[2], Value(int64_t{0b1111}));
   EXPECT_EQ(result[3], Value(int64_t{0}));
   EXPECT_EQ(result[4], Value(int64_t{1}));
-}
-
-TEST(TwoPhaseDistinctAggTest, BasicDistinctAggregation) {
-  const Schema schema("data", {Column("dept", ValueType::kVarChar),
-                               Column("salary", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value("Eng"), Value(int64_t{100})}),
-      Row({Value("Eng"), Value(int64_t{100})}),
-      Row({Value("Eng"), Value(int64_t{200})}),
-      Row({Value("Sales"), Value(int64_t{50})}),
-  });
-
-  auto agg_count = std::make_shared<AggregateExpression>(
-      AggregationType::kCount, ColumnValueExp("salary"), true);
-
-  TwoPhaseDistinctAggExecutor distinct_agg(src, schema,
-                                           {ColumnValueExp("dept")},
-                                           {NamedExpression("cnt", agg_count)});
-
-  std::vector<Row> out_rows;
-  Row row;
-  RowPosition rp;
-  while (distinct_agg.Next(&row, &rp)) {
-    out_rows.push_back(std::move(row));
-  }
-
-  ASSERT_EQ(out_rows.size(), 2);
-  EXPECT_EQ(out_rows[0][0], Value("Eng"));
-  EXPECT_EQ(out_rows[0][1], Value(int64_t{2}));
-  EXPECT_EQ(out_rows[1][0], Value("Sales"));
-  EXPECT_EQ(out_rows[1][1], Value(int64_t{1}));
 }
 
 TEST(SharedBuildParallelHashJoinTest, BasicExecution) {
@@ -503,25 +472,6 @@ TEST(GroupingSetsTest, OutputSchemaMatchesAggregateResultTypes) {
   const Schema& out = gs.OutputSchema();
   ASSERT_EQ(out.ColumnCount(), 1U);
   EXPECT_EQ(out.GetColumn(0).Type(), ValueType::kInt64);
-}
-
-TEST(ExchangeTest, NextBatchResetsReusedDestination) {
-  // Fixed: Append-only NextBatch mixed the previous batch into a reused
-  // destination chunk.
-  Executor child = std::make_shared<ValuesExecutor>(
-      std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})}),
-                       Row({Value(int64_t{3})})});
-  auto exchange = std::make_shared<ExchangeExecutor>(std::move(child),
-                                                     ExchangeType::kGather, 1);
-  exchange->MaterializePipeline();
-  const Schema schema("t", {Column("x", ValueType::kInt64)});
-  DataChunk chunk(schema, 8);
-  Executor part = exchange->GetPartitionExecutor(0);
-  size_t first = part->NextBatch(&chunk, 2);
-  EXPECT_EQ(first, 2U);
-  size_t second = part->NextBatch(&chunk, 2);
-  EXPECT_EQ(second, 1U);
-  EXPECT_EQ(chunk.Size(), 1U);
 }
 
 TEST(BatchNestedLoopJoinTest, PredicateErrorPropagatesForAntiJoin) {
@@ -914,66 +864,10 @@ TEST(StatAggregateTest, ParallelPathLargeMixedInputMatchesSerial) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage for previously untested executor building blocks: a pure row
-// generator, the scalar-subquery guard, the in-memory sort kernel, the
+// Coverage for previously untested executor building blocks: the
+// scalar-subquery guard, the in-memory sort kernel, the
 // partitioned bump arena, and the cardinality probe wrapper.
 // ---------------------------------------------------------------------------
-
-TEST(GenerateSeriesExecutorTest, AscendingInclusiveBoundsAndStep) {
-  GenerateSeriesExecutor series(1, 5);
-  std::vector<int64_t> got;
-  Row row;
-  while (series.Next(&row, nullptr)) {
-    ASSERT_EQ(row.values_.size(), 1U);
-    got.push_back(row[0].value.int_value);
-  }
-  EXPECT_EQ(got, (std::vector<int64_t>{1, 2, 3, 4, 5}));
-
-  GenerateSeriesExecutor stepped(1, 7, 2);
-  got.clear();
-  while (stepped.Next(&row, nullptr)) {
-    got.push_back(row[0].value.int_value);
-  }
-  EXPECT_EQ(got, (std::vector<int64_t>{1, 3, 5, 7}));
-  // Exhausted series keeps returning false.
-  EXPECT_FALSE(stepped.Next(&row, nullptr));
-}
-
-TEST(GenerateSeriesExecutorTest, DescendingStepAndEmptyRange) {
-  GenerateSeriesExecutor down(5, 1, -1);
-  std::vector<int64_t> got;
-  Row row;
-  while (down.Next(&row, nullptr)) {
-    got.push_back(row[0].value.int_value);
-  }
-  EXPECT_EQ(got, (std::vector<int64_t>{5, 4, 3, 2, 1}));
-
-  // A positive step with start > stop yields nothing at all.
-  GenerateSeriesExecutor empty(3, 1);
-  EXPECT_FALSE(empty.Next(&row, nullptr));
-
-  // A negative step with start < stop yields nothing at all.
-  GenerateSeriesExecutor empty_down(1, 3, -1);
-  EXPECT_FALSE(empty_down.Next(&row, nullptr));
-}
-
-TEST(GenerateSeriesExecutorTest, ZeroStepThrowsAndOverflowStops) {
-  GenerateSeriesExecutor bad(1, 5, 0);
-  Row zero_step_row;
-  EXPECT_FALSE(bad.Next(&zero_step_row, nullptr));
-  EXPECT_NE(bad.GetStatus(), Status::kSuccess);
-
-  // The loop guard must catch the INT64_MAX + 1 overflow instead of
-  // wrapping into the negative range.
-  GenerateSeriesExecutor tail(std::numeric_limits<int64_t>::max() - 1,
-                              std::numeric_limits<int64_t>::max());
-  Row row;
-  ASSERT_TRUE(tail.Next(&row, nullptr));
-  EXPECT_EQ(row[0].value.int_value, std::numeric_limits<int64_t>::max() - 1);
-  ASSERT_TRUE(tail.Next(&row, nullptr));
-  EXPECT_EQ(row[0].value.int_value, std::numeric_limits<int64_t>::max());
-  EXPECT_FALSE(tail.Next(&row, nullptr));
-}
 
 TEST(Max1RowExecutorTest, PassThroughEmptyAndMultiRow) {
   Row row;
@@ -1343,155 +1237,133 @@ TEST(GroupingSetsExecutorTest, WhereFilterSkipsRowsAndBatchDumpWork) {
   EXPECT_NE(oss.str().find("GroupingSetsExecutor"), std::string::npos);
 }
 
-// ---------------------------------------------------------------------------
-// TwoPhaseDistinctAgg: grouped + scalar paths, NaN min/max, WHERE filters,
-// the Expression-vector constructor, and double-typed sum/avg emission.
-// ---------------------------------------------------------------------------
-
-TEST(TwoPhaseDistinctAggTest, GroupedDistinctSumAvgMinMax) {
-  const Schema schema("data", {Column("dept", ValueType::kVarChar),
-                               Column("salary", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value("Eng"), Value(int64_t{100})}),
-      Row({Value("Eng"), Value(int64_t{100})}),
-      Row({Value("Eng"), Value(int64_t{200})}),
-      Row({Value("Sales"), Value()}),
-  });
-
-  auto dsum = std::make_shared<AggregateExpression>(
-      AggregationType::kSum, ColumnValueExp("salary"), true);
-  auto davg = std::make_shared<AggregateExpression>(
-      AggregationType::kAvg, ColumnValueExp("salary"), true);
-  auto dmin = std::make_shared<AggregateExpression>(
-      AggregationType::kMin, ColumnValueExp("salary"), true);
-  auto dmax = std::make_shared<AggregateExpression>(
-      AggregationType::kMax, ColumnValueExp("salary"), true);
-
-  TwoPhaseDistinctAggExecutor agg(
-      src, schema, {ColumnValueExp("dept")},
-      {NamedExpression("s", dsum), NamedExpression("avg", davg),
-       NamedExpression("min", dmin), NamedExpression("max", dmax)});
-
-  std::vector<Row> out;
-  Row row;
-  while (agg.Next(&row, nullptr)) {
-    out.push_back(std::move(row));
+// A child executor that fails the drain after a bounded number of rows, so
+// drain-error propagation can be exercised without a real I/O fault.
+class DrainFailingRows final : public ExecutorBase {
+ public:
+  DrainFailingRows(std::vector<Row> rows, size_t fail_after)
+      : rows_(std::move(rows)), fail_after_(fail_after) {}
+  bool Next(Row* dst, RowPosition* rp) override {
+    if (emitted_ >= fail_after_) {
+      return FailWith(StatusError(StatusCode::kIOError, "source failed"));
+    }
+    *dst = rows_[emitted_];
+    if (rp != nullptr) {
+      *rp = RowPosition(0, static_cast<slot_t>(emitted_));
+    }
+    ++emitted_;
+    return true;
   }
-  ASSERT_EQ(out.size(), 2U);
-  // SUM/AVG are declared kDouble; int64 totals must be widened, not raw.
-  EXPECT_EQ(out[0][0], Value("Eng"));
-  EXPECT_EQ(out[0][1], Value(300.0));
-  EXPECT_EQ(out[0][2], Value(150.0));
-  EXPECT_EQ(out[0][3], Value(int64_t{100}));
-  EXPECT_EQ(out[0][4], Value(int64_t{200}));
-  // Sales has only NULLs -> empty distinct set -> NULLs.
-  EXPECT_TRUE(out[1][1].IsNull());
-  EXPECT_TRUE(out[1][2].IsNull());
-  EXPECT_TRUE(out[1][3].IsNull());
-  EXPECT_TRUE(out[1][4].IsNull());
+  void Dump(std::ostream& out, int /*indent*/) const override {
+    out << "DrainFailingRows";
+  }
 
-  // The declared schema widens SUM/AVG to DOUBLE and COUNT to INT64.
-  EXPECT_EQ(agg.OutputSchema().GetColumn(1).Type(), ValueType::kDouble);
-}
+ private:
+  std::vector<Row> rows_;
+  size_t fail_after_{0};
+  size_t emitted_{0};
+};
 
-TEST(TwoPhaseDistinctAggTest, ScalarPathMixesDistinctAndPlainAggregates) {
-  const Schema schema("v", {Column("x", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{1})}),
-      Row({Value(int64_t{1})}),
-      Row({Value(int64_t{2})}),
-      Row({Value()}),
-  });
-
-  auto cnt = std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                   ColumnValueExp("*"));
-  auto dcnt = std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                    ColumnValueExp("x"), true);
-  auto sum = std::make_shared<AggregateExpression>(AggregationType::kSum,
-                                                   ColumnValueExp("x"));
-  auto avg = std::make_shared<AggregateExpression>(AggregationType::kAvg,
-                                                   ColumnValueExp("x"));
-
-  TwoPhaseDistinctAggExecutor agg(
-      src, schema,
-      {NamedExpression("cnt", cnt), NamedExpression("dc", dcnt),
-       NamedExpression("s", sum), NamedExpression("avg", avg)});
+TEST(DrainErrorPropagationTest, AggregationJitSumForwardsChildError) {
+  // A JIT'ed SUM over a failing child must fail the whole drain
+  // as a sticky error, never as a partial sum emitted with success.
+  const Schema schema("t", {Column("v", ValueType::kInt64)});
+  AggregationExecutor agg(
+      std::make_shared<DrainFailingRows>(
+          std::vector<Row>{Row({Value(int64_t{10})}), Row({Value(int64_t{20})}),
+                           Row({Value(int64_t{30})})},
+          2),
+      schema,
+      {NamedExpression("total",
+                       std::make_shared<AggregateExpression>(
+                           AggregationType::kSum, ColumnValueExp("v")))});
 
   Row row;
-  ASSERT_TRUE(agg.Next(&row, nullptr));
-  EXPECT_EQ(row[0], Value(int64_t{4}));  // COUNT(*) counts the NULL row too
-  EXPECT_EQ(row[1], Value(int64_t{2}));  // COUNT(DISTINCT x)
-  EXPECT_EQ(row[2], Value(4.0));         // SUM widened to double
-  EXPECT_EQ(row[3], Value(4.0 / 3.0));   // AVG over non-NULL rows
   EXPECT_FALSE(agg.Next(&row, nullptr));
+  EXPECT_NE(agg.GetStatus(), Status::kSuccess);
 }
 
-TEST(TwoPhaseDistinctAggTest, NanDominatesPlainMinMax) {
-  const Schema schema("d", {Column("x", ValueType::kDouble)});
-  const double nan = std::numeric_limits<double>::quiet_NaN();
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(1.0)}),
-      Row({Value(nan)}),
-      Row({Value(2.0)}),
-  });
-  auto min_max = std::make_shared<AggregateExpression>(AggregationType::kMin,
-                                                       ColumnValueExp("x"));
-  auto max_agg = std::make_shared<AggregateExpression>(AggregationType::kMax,
-                                                       ColumnValueExp("x"));
+TEST(DrainErrorPropagationTest, GroupingSetsForwardsChildError) {
+  const Schema schema("t", {Column("k", ValueType::kInt64)});
+  GroupingSetsExecutor gs(
+      std::make_shared<DrainFailingRows>(
+          std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})},
+          1),
+      schema, {NamedExpression("k", ColumnValueExp("k"))}, {{0}},
+      {NamedExpression("total",
+                       std::make_shared<AggregateExpression>(
+                           AggregationType::kCount, ColumnValueExp("k")))});
 
-  TwoPhaseDistinctAggExecutor agg(
-      src, schema,
-      {NamedExpression("min", min_max), NamedExpression("max", max_agg)});
   Row row;
-  ASSERT_TRUE(agg.Next(&row, nullptr));
-  EXPECT_TRUE(std::isnan(row[0].value.double_value));
-  EXPECT_TRUE(std::isnan(row[1].value.double_value));
+  EXPECT_FALSE(gs.Next(&row, nullptr));
+  EXPECT_NE(gs.GetStatus(), Status::kSuccess);
 }
 
-TEST(TwoPhaseDistinctAggTest, WhereFilterAndExpressionKeyConstructor) {
-  const Schema schema(
-      "f", {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{1}), Value(int64_t{10})}),
-      Row({Value(int64_t{2}), Value(int64_t{20})}),
-      Row({Value(int64_t{2}), Value(int64_t{30})}),
-  });
+TEST(DrainErrorPropagationTest, PartialAggregateForwardsChildError) {
+  const Schema schema("t", {Column("v", ValueType::kInt64)});
+  PartialAggregate partial(
+      std::make_shared<DrainFailingRows>(
+          std::vector<Row>{Row({Value(int64_t{7})})}, 1),
+      schema,
+      {NamedExpression("total",
+                       std::make_shared<AggregateExpression>(
+                           AggregationType::kSum, ColumnValueExp("v")))});
 
-  // Only rows with k = 2 reach the distinct set / plain count.
-  auto dsum = std::make_shared<AggregateExpression>(AggregationType::kSum,
-                                                    ColumnValueExp("v"), true);
-  auto k_is_two =
-      BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kEquals,
-                          ConstantValueExp(Value(int64_t{2})));
-  dsum->SetWhereFilter(k_is_two);
-  auto cnt = std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                   ColumnValueExp("k"));
-  cnt->SetWhereFilter(k_is_two);
-
-  // Expression-vector constructor names keys group_key_0 automatically.
-  TwoPhaseDistinctAggExecutor agg(
-      src, schema, std::vector<Expression>{ColumnValueExp("k")},
-      {NamedExpression("s", dsum), NamedExpression("cnt", cnt)});
-  EXPECT_EQ(agg.OutputSchema().GetColumn(0).Name().name, "group_key_0");
-
-  std::vector<Row> out;
   Row row;
-  while (agg.Next(&row, nullptr)) {
-    out.push_back(std::move(row));
-  }
-  ASSERT_EQ(out.size(), 2U);
-  // k=1 group: every aggregate is WHERE-filtered away.
-  EXPECT_EQ(out[0][0], Value(int64_t{1}));
-  EXPECT_TRUE(out[0][1].IsNull());
-  EXPECT_EQ(out[0][2], Value(int64_t{0}));
-  // k=2 group: distinct SUM 20+30 and two surviving rows.
-  EXPECT_EQ(out[1][0], Value(int64_t{2}));
-  EXPECT_EQ(out[1][1], Value(50.0));
-  EXPECT_EQ(out[1][2], Value(int64_t{2}));
+  EXPECT_FALSE(partial.Next(&row, nullptr));
+  EXPECT_NE(partial.GetStatus(), Status::kSuccess);
+}
 
-  std::ostringstream oss;
-  agg.Dump(oss, 0);
-  EXPECT_NE(oss.str().find("TwoPhaseDistinctAgg"), std::string::npos);
+TEST(DrainErrorPropagationTest, FinalizeAggregateForwardsChildError) {
+  // FinalizeAggregate consumes partial states through the same void
+  // Materialize path; the child's sticky error must latch into the
+  // finalize executor's own status instead of reading as clean EOF.
+  const Schema partial_schema("p", {Column("sum_v", ValueType::kInt64)});
+  FinalizeAggregate finalize(
+      std::make_shared<DrainFailingRows>(
+          std::vector<Row>{Row({Value(int64_t{7})})}, 1),
+      partial_schema,
+      {NamedExpression("total",
+                       std::make_shared<AggregateExpression>(
+                           AggregationType::kSum, ColumnValueExp("sum_v")))});
+
+  Row row;
+  EXPECT_FALSE(finalize.Next(&row, nullptr));
+  EXPECT_NE(finalize.GetStatus(), Status::kSuccess);
+}
+
+TEST(DrainErrorPropagationTest, CrossJoinForwardsLeftError) {
+  const Schema left_schema("l", {Column("v", ValueType::kInt64)});
+  const Schema right_schema("r", {Column("w", ValueType::kInt64)});
+  CrossJoin join(
+      std::make_shared<DrainFailingRows>(
+          std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})},
+          1),
+      std::make_shared<ValuesExecutor>(
+          std::vector<Row>{Row({Value(int64_t{5})})}));
+
+  Row row;
+  ASSERT_TRUE(join.Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(int64_t{1}));
+  // The left side fails after its last row; the join must report that error
+  // instead of ending as a clean EOF with a truncated right pairing.
+  EXPECT_FALSE(join.Next(&row, nullptr));
+  EXPECT_NE(join.GetStatus(), Status::kSuccess);
+}
+
+TEST(DrainErrorPropagationTest, ReturningForwardsSourceError) {
+  const Schema schema("t", {Column("v", ValueType::kInt64)});
+  ReturningExecutor returning(
+      std::make_shared<DrainFailingRows>(
+          std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})},
+          1),
+      schema, {NamedExpression("v", ColumnValueExp("v"))});
+
+  Row row;
+  ASSERT_TRUE(returning.Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(int64_t{1}));
+  EXPECT_FALSE(returning.Next(&row, nullptr));
+  EXPECT_NE(returning.GetStatus(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

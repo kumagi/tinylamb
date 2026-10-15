@@ -69,6 +69,15 @@ class Optimizer {
   static StatusOr<Plan> Optimize(const QueryData& query,
                                  TransactionContext& ctx,
                                  const OptimizerOptions& options);
+  // Syntactic admission shared by SQL routing and the grouped memo bridge.
+  static bool SupportsGrouping(const std::vector<Expression>& keys,
+                               const std::vector<NamedExpression>& outputs);
+  // Plan simple grouped SQL with the scan and aggregation in one memo.
+  // The narrow column-key/scalar-aggregate contract declines richer SQL shapes.
+  static StatusOr<Plan> OptimizeGrouping(
+      const QueryData& core, const Plan& input,
+      const std::vector<Expression>& keys,
+      const std::vector<NamedExpression>& outputs, TransactionContext& ctx);
   static StatusOr<Plan> OptimizeRelational(
       std::shared_ptr<const SelectStatement> statement, Schema output_schema,
       TransactionContext& ctx);

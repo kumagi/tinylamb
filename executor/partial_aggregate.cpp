@@ -370,8 +370,8 @@ Status PartialAggregate::Materialize() {
 
 bool PartialAggregate::Next(Row* dst, RowPosition* rp) {
   if (!materialized_) {
-    if (Materialize() != Status::kSuccess) {
-      return false;
+    if (Status st = Materialize(); st != Status::kSuccess) {
+      return FailWith(st);
     }
   }
   if (cursor_ >= output_rows_.size()) {
@@ -605,11 +605,17 @@ void FinalizeAggregate::Materialize() {
       emit_group(&k, groups[k]);
     }
   }
+  if (child_->GetStatus() != Status::kSuccess) {
+    FailWith(child_->GetStatus());
+  }
 }
 
 bool FinalizeAggregate::Next(Row* dst, RowPosition* rp) {
   if (!materialized_) {
     Materialize();
+  }
+  if (GetStatus() != Status::kSuccess) {
+    return false;
   }
   if (cursor_ >= output_rows_.size()) {
     return false;

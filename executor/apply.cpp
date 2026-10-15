@@ -44,6 +44,7 @@ bool ApplyExecutor::Next(Row* dst, RowPosition* rp) {
   while (true) {
     if (!has_outer_row_) {
       if (!outer_exec_->Next(&current_outer_row_, &current_outer_rp_)) {
+        FailWithChildOf(*outer_exec_);
         return false;
       }
       has_outer_row_ = true;
@@ -69,13 +70,23 @@ bool ApplyExecutor::Next(Row* dst, RowPosition* rp) {
                   : relational_detail::QualifySchema(rel.schema, inner_alias_);
           combined_schema_ = outer_schema_ + inner_schema_;
         }
-        rel.ForEachRow([&](const Row& r) { inner_rows_.push_back(r); });
+        const Status copied =
+            rel.ForEachRow([&](const Row& r) { inner_rows_.push_back(r); });
+        if (copied != Status::kSuccess) {
+          return FailWith(copied);
+        }
+        if (rel.GetStatus() != Status::kSuccess) {
+          return FailWith(rel.GetStatus());
+        }
       } else if (inner_exec_ != nullptr) {
         if (!static_inner_cached_) {
           Row r;
           RowPosition p;
           while (inner_exec_->Next(&r, &p)) {
             static_inner_rows_.push_back(std::move(r));
+          }
+          if (inner_exec_->GetStatus() != Status::kSuccess) {
+            return FailWith(inner_exec_->GetStatus());
           }
           static_inner_cached_ = true;
         }

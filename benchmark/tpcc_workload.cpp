@@ -554,9 +554,10 @@ Status TpccWorkload::RunSql(TransactionContext& context, std::string_view sql,
     return query_result.GetStatus();
   }
   ++result->sql_statements;
-  if (getenv("TPCC_SQL_TRACE")) {
-    fprintf(stderr, "[tpcc-sql][%d] %s\n", static_cast<int>(result->type),
-            std::string(sql).c_str());
+  if (std::getenv("TPCC_SQL_TRACE") != nullptr) {
+    [[maybe_unused]] const int printed =
+        fprintf(stderr, "[tpcc-sql][%d] %s\n", static_cast<int>(result->type),
+                std::string(sql).c_str());
   }
   try {
     *rows = query_result.Value().Collect();
@@ -565,7 +566,7 @@ Status TpccWorkload::RunSql(TransactionContext& context, std::string_view sql,
                     " [" + std::string(sql) + "]";
     return Status::kConflicts;
   }
-  const Status stream_status = query_result.Value().GetStatus();
+  Status stream_status = query_result.Value().GetStatus();
   if (stream_status != Status::kSuccess) {
     result->error = std::string(ToString(result->type)) + ": " +
                     ToString(stream_status) + " [" + std::string(sql) + "]";
@@ -580,8 +581,9 @@ bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
   if (!rows.empty() && rows.front().IsValid()) {
     return true;
   }
-  if (getenv("TPCC_SQL_TRACE")) {
-    fprintf(stderr, "[tpcc-empty] %s\n", std::string(operation).c_str());
+  if (getenv("TPCC_ != nullptrSQL_TRACE") != nullptr) {
+    [[maybe_unused]] const int printed =
+        fprintf(stderr, "[tpcc-empty] %s\n", std::string(operation).c_str());
   }
   result->error = std::string(operation) + " returned no rows";
   return false;

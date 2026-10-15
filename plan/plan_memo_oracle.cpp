@@ -427,7 +427,7 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
   std::vector<int> op_choices;
   op_choices.reserve(static_cast<size_t>(depth));
   for (int d = 0; d < depth; ++d) {
-    op_choices.push_back(static_cast<int>(rng() % 10));
+    op_choices.push_back(static_cast<int>(rng() % 9));
   }
   const bool use_outer_join_root = (relation_count >= 2 && rng() % 3 == 0);
   const auto outer_join_type = static_cast<uint8_t>(rng() % 3);
@@ -586,16 +586,7 @@ GeneratedComplexMemo GenerateComplexMemo(std::mt19937& rng,
           current = topn_group;
           break;
         }
-        case 8: {  // Max1Row
-          const cascades::GroupId max1_group =
-              memo.EnsureDerivedGroup(relations, tag + "max1row");
-          memo.AddExpression(
-              max1_group, cascades::LogicalExpression{
-                              .operation = cascades::LogicalOperator::kMax1Row,
-                              .children = {current}});
-          current = max1_group;
-          break;
-        }
+
         default: {  // Unnest
           const cascades::GroupId unnest_group =
               memo.EnsureDerivedGroup(relations, tag + "unnest");

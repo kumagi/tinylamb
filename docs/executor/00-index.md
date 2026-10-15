@@ -75,14 +75,16 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 | `CrossJoin` | 直積を作る | [直積](50-join.md#2-crossjoin) |
 | `NestedLoopJoin` | 右入力を保持して全候補対を検査する | [入れ子ループ](50-join.md#3-nestedloopjoin) |
 | `BatchNestedLoopJoin` | 左入力をブロック化した入れ子ループを行う | [バッチ入れ子ループ](50-join.md#4-batchnestedloopjoin) |
-| `IndexJoin` | 左キーごとに右索引を探索する | [索引結合](50-join.md#5-indexjoin) |
+| `LookupJoin` | 左行ごとに、索引キー順の probe 列で右索引を探索する（等値 prefix ＋ 範囲 bound 1 個） | [索引結合](50-join.md#5-lookupjoin) |
+| `LateMaterializationJoin` | equi/unique winner または rowid の候補だけを先にjoinし、payloadを上位段で読む | [遅延実体化結合](50-join.md#14-latematerializationjoin) |
 | `HashJoin` | ハッシュ表と必要時の分割スピルで結合する | [ハッシュ結合](50-join.md#6-hashjoin) |
 | `SharedBuildParallelHashJoin` | 共有ハッシュ表を並列構築・探索する | [並列ハッシュ結合](50-join.md#7-sharedbuildparallelhashjoin) |
 | `MergeJoin` | 整列済みキー列を突き合わせる | [マージ結合](50-join.md#8-mergejoin) |
 | `ParallelMergeJoin` | キー範囲を分割して並列マージする | [並列マージ結合](50-join.md#9-parallelmergejoin) |
 | `ApplyExecutor` | 外側行ごとに相関内側計画を実行する | [Apply](50-join.md#10-applyexecutor) |
 | `AsOfJoin` | 時刻条件を満たす直近行を選ぶ | [AS OF 結合](50-join.md#11-asofjoin) |
-| `IntervalJoin` | 等値キーと時刻区間で候補を列挙する | [区間結合](50-join.md#12-intervaljoin) |
+| `BandJoin` | 単一キーの区間比較 (`<` `<=` `>` `>=`) を右キー二分探索で結合する | [区間結合](50-join.md#12-bandjoin) |
+| `ZigZagJoin` | 両側索引順の単一 INT64 キーで順序比較結合をする | [ZigZag結合](50-join.md#13-zigzagjoin) |
 
 ### 整列・重複除去・集合
 
@@ -103,6 +105,9 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 | 演算子 | 役割 | 詳細 |
 |---|---|---|
 | `AggregationExecutor` | グループなしの集約結果を 1 行作る | [単一集約](70-aggregation.md#3-aggregationexecutor) |
+| `HashAggregateExecutor` | グループ集約をハッシュ表と必要時の再分割スピルで行う | [三方式](70-aggregation.md#10-groupedaggregate-の三方式) |
+| `SortAggregateExecutor` | 入力をキー整列して連続一群ずつ畳み込む | [三方式](70-aggregation.md#10-groupedaggregate-の三方式) |
+| `StreamAggregateExecutor` | 既整列入力を整列なしで一群ずつ畳み込む | [三方式](70-aggregation.md#10-groupedaggregate-の三方式) |
 | `ParallelAggregationExecutor` | ワーカーの部分状態を番号順に併合する | [並列集約](70-aggregation.md#4-parallelaggregationexecutor) |
 | `PartialAggregate` | グループ別の可併合中間状態を作る | [二段集約](70-aggregation.md#5-partialaggregate-と-finalizeaggregate) |
 | `PartialAggregateExecutor` | `PartialAggregate` の公開別名 | [二段集約](70-aggregation.md#5-partialaggregate-と-finalizeaggregate) |

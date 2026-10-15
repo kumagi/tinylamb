@@ -41,6 +41,8 @@ class QueryMemoryBudget {
   static size_t LimitFromEnv();
 
   size_t limit_;
+  // 80% of limit_, precomputed: CanReserve runs once per buffered row.
+  size_t soft_;
   std::atomic<size_t> used_{0};
   static constexpr size_t kSoftFractionNum = 4;
   static constexpr size_t kSoftFractionDen = 5;  // spill at 80%

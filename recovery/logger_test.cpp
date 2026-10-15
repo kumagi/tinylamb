@@ -30,6 +30,7 @@
 #include <ios>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -37,6 +38,7 @@
 
 #include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "recovery/log_record.hpp"
 
@@ -52,7 +54,7 @@ class LoggerTest : public ::testing::Test {
   void TearDown() override {
     std::this_thread::sleep_for(std::chrono::microseconds(5));
     // Best-effort cleanup; a missing file must not fail the test.
-    (void)std::remove(log_name_.c_str());
+    tinylamb::RemoveLogAndSegments(log_name_);
   }
 
   void WaitForCommit(lsn_t target_lsn, size_t timeout_ms = 10000) {
@@ -90,6 +92,19 @@ TEST_F(LoggerTest, AppendOne) {
 
   // Assert -- file content equals the serialized LogRecord
   ASSERT_EQ(file_data, l.Serialize());
+}
+
+TEST_F(LoggerTest, AddLogCopiesStringViewBeforeReturning) {
+  std::string payload = "original";
+  const std::string expected = payload;
+  const lsn_t lsn = l_->AddLog(payload).Value();
+  payload.assign(payload.size(), 'x');
+  WaitForCommit(lsn + expected.size());
+
+  std::ifstream file(log_name_, std::ios::binary);
+  std::string actual;
+  file >> actual;
+  EXPECT_EQ(actual, expected);
 }
 
 TEST_F(LoggerTest, AppendTwo) {
@@ -134,8 +149,11 @@ TEST_F(LoggerTest, AppendMany) {
 
 TEST_F(LoggerTest, AppendExponential) {
   // Arrange -- reset Logger to a fresh instance; prepare 1000 exponential-size
-  // strings ('x' repeated)
-  l_ = Logger::Create(log_name_).MoveValue();
+  // strings ('x' repeated).  A single unlimited segment keeps the whole
+  // stream in the base file so the byte-count assertion below observes the
+  // append path directly instead of segment rotation.
+  l_ = Logger::Create(log_name_, size_t{1024} * 1024 * 8, 1, size_t{1} << 30)
+           .MoveValue();
   lsn_t lsn = 0;
   size_t size = 0;
 
@@ -184,6 +202,11 @@ TEST_F(LoggerTest, FinishDrainsWithoutSpin) {
   EXPECT_EQ(l_->CommittedLSN(), payload.size());
   EXPECT_GE(l_->DurableLSN(), payload.size());
   l_.reset();
+}
+
+TEST_F(LoggerTest, WaitForDurableAfterFinishReturnsError) {
+  ASSERT_SUCCESS(l_->Finish());
+  EXPECT_EQ(l_->WaitForDurable(l_->DurableLSN() + 1), Status::kRuntimeError);
 }
 
 TEST_F(LoggerTest, ReopenExistingWalKeepsContent) {
@@ -346,7 +369,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
   size_t records = 0;
   while (file.peek() != std::ifstream::traits_type::eof()) {
     const uint32_t magic = read32();
-    ASSERT_EQ(magic, kD1Magic) << true << (records != 0U) << true;
+    ASSERT_EQ(magic, kD1Magic) << (records != 0U);
     const uint32_t thread = read32();
     const uint32_t seq = read32();
     const uint32_t length = read32();
@@ -355,8 +378,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
     const int fill = static_cast<unsigned char>((thread * 31) + seq);
     for (uint32_t i = 0; i < length; ++i) {
       ASSERT_EQ(file.get(), fill)
-          << true << (records != 0U) << true << (thread != 0U) << true
-          << (seq != 0U) << true;
+          << (records != 0U) << (thread != 0U) << (seq != 0U);
     }
     ++records;
   }
@@ -372,5 +394,110 @@ TEST_F(LoggerTest, D1RejectsRecordOverMaxSize) {
   EXPECT_TRUE(
       logger->AddLog(std::string(Logger::kMaxRecordSize, 'x')).HasValue());
   EXPECT_EQ(logger->Finish(), Status::kSuccess);
+}
+
+// RecycleUpTo must keep LowestRetainedLSN exact across repeated calls: the
+// recycle cursor tracks the retained start so a long-running database pays
+// only for its live segment window on every checkpoint, never for the total
+// history it recycled away.
+TEST_F(LoggerTest, RecycleUpToTracksLowestRetainedAcrossCalls) {
+  constexpr size_t kSegmentSize = size_t{4} * 1024;
+  const std::string name = "logger_test-recycle-" + RandomString() + ".log";
+  auto logger = Logger::Create(name, 1024, 1, kSegmentSize).MoveValue();
+  const std::string payload(256, 'x');
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_TRUE(logger->AddLog(payload).HasValue());
+  }
+  ASSERT_SUCCESS(logger->WaitForDurable(logger->BufferedLSN()));
+  ASSERT_GT(logger->BufferedLSN(), static_cast<lsn_t>(2) * kSegmentSize);
+  EXPECT_EQ(logger->LowestRetainedLSN(), 0);
+
+  EXPECT_EQ(logger->RecycleUpTo(2 * kSegmentSize), 2 * lsn_t{kSegmentSize});
+  EXPECT_EQ(logger->LowestRetainedLSN(), 2 * lsn_t{kSegmentSize});
+  // Idempotent: a second pass at the same floor recycles nothing and keeps
+  // the retained start.
+  EXPECT_EQ(logger->RecycleUpTo(2 * kSegmentSize), 0);
+  EXPECT_EQ(logger->LowestRetainedLSN(), 2 * lsn_t{kSegmentSize});
+
+  EXPECT_EQ(logger->RecycleUpTo(3 * kSegmentSize), 3 * lsn_t{kSegmentSize});
+  EXPECT_EQ(logger->LowestRetainedLSN(), 3 * kSegmentSize);
+
+  logger.reset();
+  RemoveLogAndSegments(name);
+}
+
+// TryCopyBuffered serves exactly the bytes this process appended and that
+// the ring still holds: nothing below the open-time WAL end (the ring starts
+// zeroed on a reopen), nothing overwritten by the wrap, nothing past the
+// buffered end.
+TEST_F(LoggerTest, TryCopyBufferedServesResidentWindow) {
+  constexpr size_t kBufSize = 1024;
+  l_.reset();
+  auto logger = Logger::Create(log_name_, kBufSize, 60'000).MoveValue();
+  ASSERT_TRUE(logger != nullptr);
+  const std::string first = "first-payload-0123456789";
+  const std::string second = "second-payload-abcdefghijklmnop";
+  const lsn_t first_lsn = logger->AddLog(first).Value();
+  const lsn_t second_lsn = logger->AddLog(second).Value();
+  const lsn_t end = second_lsn + second.size();
+
+  auto read_back = [&](lsn_t at, size_t len) -> std::optional<std::string> {
+    std::string out(len, '\0');
+    if (!logger->TryCopyBuffered(at, out.data(), len)) {
+      return std::nullopt;
+    }
+    return out;
+  };
+
+  // Both payloads are resident and byte-identical.
+  EXPECT_EQ(read_back(first_lsn, first.size()), first);
+  EXPECT_EQ(read_back(second_lsn, second.size()), second);
+  // A read straddling the two payloads reads the contiguous stream.
+  EXPECT_EQ(read_back(first_lsn, first.size() + second.size()), first + second);
+  // Past the buffered end: not resident.
+  EXPECT_FALSE(read_back(end, 1).has_value());
+  EXPECT_FALSE(read_back(second_lsn, second.size() + 1).has_value());
+  // Zero length is trivially complete.
+  EXPECT_TRUE(logger->TryCopyBuffered(first_lsn, nullptr, 0));
+
+  // Fill past the ring capacity: the first payload is overwritten and must
+  // no longer be served, while the newest bytes stay exact.
+  const std::string filler(kBufSize * 2, 'f');
+  const lsn_t filler_lsn = logger->AddLog(filler).Value();
+  EXPECT_FALSE(read_back(first_lsn, first.size()).has_value());
+  const std::string tail = filler.substr(filler.size() - 32);
+  const lsn_t tail_lsn = filler_lsn + filler.size() - 32;
+  EXPECT_EQ(read_back(tail_lsn, 32), tail);
+
+  EXPECT_EQ(logger->Finish(), Status::kSuccess);
+}
+
+// A logger reopened over an existing WAL serves nothing from its zeroed
+// ring: every byte below the open-time end lives only in the segment files.
+TEST_F(LoggerTest, TryCopyBufferedNeverServesPreopenBytes) {
+  l_.reset();
+  {
+    auto first = Logger::Create(log_name_, 512, 60'000).MoveValue();
+    ASSERT_TRUE(first != nullptr);
+    first->AddLog("seeded bytes below the reopen point");
+    ASSERT_SUCCESS(first->WaitForDurable(first->BufferedLSN()));
+  }
+  auto reopened = Logger::Create(log_name_, 512, 60'000).MoveValue();
+  ASSERT_TRUE(reopened != nullptr);
+  const lsn_t seeded_end = reopened->BufferedLSN();
+  EXPECT_GT(seeded_end, lsn_t{0});
+  std::string out(8, '\0');
+  EXPECT_FALSE(reopened->TryCopyBuffered(0, out.data(), out.size()));
+  EXPECT_FALSE(
+      reopened->TryCopyBuffered(seeded_end - 8, out.data(), out.size()));
+  // New appends are served.
+  const std::string fresh = "fresh-append";
+  const lsn_t fresh_lsn = reopened->AddLog(fresh).Value();
+  EXPECT_EQ(fresh_lsn, seeded_end);
+  std::string served(fresh.size(), '\0');
+  EXPECT_TRUE(
+      reopened->TryCopyBuffered(fresh_lsn, served.data(), served.size()));
+  EXPECT_EQ(served, fresh);
+  EXPECT_EQ(reopened->Finish(), Status::kSuccess);
 }
 }  // namespace tinylamb

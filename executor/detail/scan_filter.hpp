@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/runtime_filter.hpp"
+#include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/bytecode.hpp"
@@ -38,10 +40,75 @@ struct SimpleComparePredicate {
   // non-JSON, non-collated) string, letting MatchSimpleCompare compare
   // bytes directly instead of routing through TryEvaluateBinary per row.
   bool plain_string_payload{false};
+  // Column-vs-column compare (`l_receiptdate > l_commitdate`): when set,
+  // MatchSimpleCompare reads both sides from the row positionally and
+  // `constant` is unused.  Compile time only accepts like-kind numeric or
+  // plain string pairs, so the positional compare cannot raise.
+  bool column_payload{false};
+  slot_t right_column{0};
+};
+
+// `substr(col, 1, k) IN (c1..cn)` compiled to a byte-prefix membership test.
+// Every prefix must be plain ASCII: a leading multi-byte UTF-8 code point can
+// then never match, and for an ASCII first byte one code point is one byte,
+// so the byte-prefix verdict equals the AST's code-point substr verdict.
+struct PrefixInPredicate {
+  slot_t column{0};
+  std::vector<std::string> prefixes;
+};
+
+// `col [NOT] IN (uncorrelated single-column subquery)` compiled to one
+// immutable value set built once at filter-compile time.  Only peeled for
+// INT64/DATE probes whose type tag and unsigned tag statically equal the
+// build domain, so the int-value set verdict equals the per-row runtime
+// membership build's exact verdict and the matcher is total: every input gets
+// the SQL three-valued answer, no row defers to the contextful path.
+struct PrebuiltMembershipPredicate {
+  slot_t column{0};
+  bool negated{false};
+  ValueType domain_type{ValueType::kNull};
+  // Distinct-member set over the build domain's int payloads (INT64 values /
+  // DATE day counts).  The peel-time domain pin (type tag plus unsigned tag)
+  // makes the int-set verdict the SQL equality here, and the flat table
+  // keeps multi-hundred-thousand-member builds allocation-free.
+  // NULL members are recorded in contains_null and never stored.
+  std::shared_ptr<const FlatIntSet> values;
+  bool contains_null{false};
+};
+
+// `col op (correlated scalar aggregate subquery)` with exactly one
+// INT64/DATE correlation equality, compiled to one key->value map built at
+// filter-compile time by executing the subquery rewritten as GROUP BY
+// correlation column.  min/max/count/sum/avg over the same per-key rows
+// produce the value the per-row correlated apply computes one probe at a
+// time; a missing key or a NULL group value reproduces the empty-group
+// scalar NULL (comparison UNKNOWN, row rejected).
+struct PrebuiltScalarComparePredicate {
+  // The comparison column (`ps_supplycost` above) and the correlation key
+  // column (the outer side, `p_partkey`), both positional in the filter
+  // schema.
+  slot_t column{0};
+  slot_t key_column{0};
+  BinaryOperation op{BinaryOperation::kEquals};
+  ValueType key_type{ValueType::kNull};
+  std::shared_ptr<const std::unordered_map<int64_t, Value>> values;
+};
+
+// Compile-time execution environment enabling query-bearing predicate
+// prebuilds (PrebuiltMembershipPredicate, PrebuiltScalarComparePredicate).
+// Null for callers without a TransactionContext: those keep every query on
+// the residual path.
+struct FilterCompileEnv {
+  TransactionContext* context{nullptr};
+  const Scope* outer{nullptr};
+  const CteMap* ctes{nullptr};
 };
 
 struct CompiledScanFilter {
   std::vector<SimpleComparePredicate> simple;
+  std::vector<PrefixInPredicate> prefix_in;
+  std::vector<PrebuiltMembershipPredicate> prebuilt_membership;
+  std::vector<PrebuiltScalarComparePredicate> prebuilt_scalar_compare;
   std::vector<Expression> residual;
   // Disjunctive branches: OR(AND(pred1, pred2, ...), AND(pred3, pred4, ...),
   // ...) Each inner vector is one AND branch.  MatchScanFilter returns true if
@@ -49,6 +116,7 @@ struct CompiledScanFilter {
   // only when the branch contains non-simple (residual) predicates.
   struct DisjunctiveBranch {
     std::vector<SimpleComparePredicate> simple;
+    std::vector<PrefixInPredicate> prefix_in;
     std::vector<Expression> residual;
   };
   std::vector<DisjunctiveBranch> disjunctive_branches;
@@ -62,16 +130,32 @@ struct CompiledScanFilter {
 
 bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred);
 
+// Exact SQL three-valued membership verdict for a prebuilt IN/NOT IN set.
+// Empty member set is decisive (`x IN ()` is FALSE, `x NOT IN ()` is TRUE,
+// even for a NULL x); a NULL probe or a NULL-containing set makes a miss
+// UNKNOWN (row rejected); a clean miss answers FALSE for IN, TRUE for
+// NOT IN.
+bool MatchPrebuiltMembership(const Row& row,
+                             const PrebuiltMembershipPredicate& pred);
+
+// Exact comparison verdict against the prebuilt scalar map.  A NULL probe,
+// a missing key, or a NULL group value means the original comparison is
+// UNKNOWN and the row is rejected.
+bool MatchPrebuiltScalarCompare(const Row& row,
+                                const PrebuiltScalarComparePredicate& pred);
+
 std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
     const Expression& predicate, const Schema& schema);
 
 CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
-                                     const Schema& schema);
+                                     const Schema& schema,
+                                     const FilterCompileEnv* env = nullptr);
 
 bool MatchScanFilter(const Row& row, const Schema& schema,
                      const CompiledScanFilter& filter, const Scope* outer,
                      TransactionContext& context, const CteMap& ctes,
-                     Status* error = nullptr);
+                     Status* error = nullptr,
+                     ColumnLookupCache* lookup_cache = nullptr);
 
 // Evaluates a conjunctive filter predicate under the engine's commutative
 // WHERE semantics: each conjunct is evaluated independently and a conjunct
@@ -98,9 +182,14 @@ std::vector<IntegerPeekCompare> BuildIntegerPeeks(
     const CompiledScanFilter& filter, const std::vector<slot_t>* projection,
     const Schema& full_schema);
 
+// `runtime_filter` is the dynamic join filter (common/runtime_filter.hpp) the
+// build side published for `key_column`; the scan rejects non-members before
+// row decode, both in the serial iterator and inside parallel workers (the
+// group is immutable once built, so sharing it across workers is safe).
 bool TryParallelTableScan(TransactionContext& context, Table& table,
                           const std::vector<slot_t>* projection,
-                          const std::unordered_set<int64_t>* key_filter,
+                          const RuntimeFilterGroup* runtime_filter,
+                          ValueType runtime_filter_type,
                           std::optional<slot_t> full_key_column,
                           bool filter_during_scan,
                           const CompiledScanFilter* scan_filter,
@@ -139,20 +228,17 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
                            const CompiledScanFilter& filter,
                            const Schema& match_schema, const Scope* outer,
                            const CteMap& ctes,
-                           const std::unordered_set<int64_t>* key_filter,
-                           std::optional<slot_t> key_column, Relation* result,
-                           Status* error);
+                           const ScanRuntimeFilter* runtime_filter,
+                           Relation* result, Status* error);
 
 StatusOr<Relation> ApplyTableSample(TransactionContext& context,
-                                    const SelectSource& source,
-                                    Relation input);
+                                    const SelectSource& source, Relation input);
 
 StatusOr<Relation> LoadSource(
     TransactionContext& context, const SelectSource& source, const Scope* outer,
     const CteMap& ctes, const std::vector<slot_t>* projection = nullptr,
     const std::vector<Expression>* scan_predicates = nullptr,
-    const std::unordered_set<int64_t>* int_key_filter = nullptr,
-    std::optional<slot_t> int_key_column = std::nullopt);
+    const ScanRuntimeFilter* runtime_filter = nullptr);
 
 // Materializes one UNNEST'd array value into a single-column relation named
 // after the source alias (struct elements expand into per-field columns,
@@ -161,6 +247,17 @@ Relation UnnestValueToRelation(const SelectSource& source,
                                const Value& array_val);
 
 bool ContainsQuery(const Expression& expression);
+
+// Returns `predicates` with every row-independent subquery replaced by the
+// constant value one probe returns (uncorrelated, volatile-free scalar and
+// EXISTS queries; see FoldRowIndependentSubqueriesIn).  Nodes that raise keep
+// their original form, so per-row error behavior is unchanged.  Callers pass
+// the result to CompileScanFilter: folded compares become typed SimpleCompare
+// predicates, and query-free predicates no longer force the contextful serial
+// filter or a cached-relation snapshot.
+std::vector<Expression> FoldRowIndependentSubqueries(
+    TransactionContext& context, const std::vector<Expression>& predicates,
+    const Scope* outer, const CteMap& ctes);
 
 std::optional<size_t> LocalColumnOffset(const Schema& schema,
                                         const ColumnName& name);

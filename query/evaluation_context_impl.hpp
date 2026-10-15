@@ -51,6 +51,7 @@ class RelationalEvaluationContext : public EvaluationContext {
   // the fallback.  Projects the first output column in row order.
   [[nodiscard]] StatusOr<std::vector<Value>> RunSubquery(
       const SelectStatement& statement, const Row* /*outer_row*/) override {
+    last_element_type_hint_.clear();
     std::optional<relational_detail::Relation> indexed;
     if (scope_ != nullptr) {
       indexed = relational_detail::ExecuteCorrelatedSingleSource(
@@ -80,7 +81,23 @@ class RelationalEvaluationContext : public EvaluationContext {
       projected.push_back(relational_detail::ProjectSubqueryRow(
           row, as_struct, &subquery_schema));
     });
+    last_element_type_hint_.clear();
+    if (subquery_schema.ColumnCount() > 0) {
+      last_element_type_hint_ =
+          std::string(ElementSqlTypeName(subquery_schema.GetColumn(0).Type()));
+    }
     return {std::move(projected)};
+  }
+
+  [[nodiscard]] StatusOr<SubqueryResult> RunSubqueryDetailed(
+      const SelectStatement& statement, const Row* outer_row) override {
+    StatusOr<std::vector<Value>> values = RunSubquery(statement, outer_row);
+    if (!values.HasValue()) {
+      return values.GetStatus();
+    }
+    return SubqueryResult{
+        .values = values.MoveValue(),
+        .element_type_hint = std::move(last_element_type_hint_)};
   }
 
   [[nodiscard]] const AggregateResultMap* CurrentAggregates() const override {
@@ -105,6 +122,7 @@ class RelationalEvaluationContext : public EvaluationContext {
   const relational_detail::Scope* scope_;
   const relational_detail::CteMap& ctes_;
   const AggregateResultMap* aggregates_;
+  std::string last_element_type_hint_;
 };
 
 }  // namespace tinylamb

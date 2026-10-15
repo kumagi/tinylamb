@@ -65,6 +65,7 @@ class IndexTest : public ::testing::Test {
   void Recover() {
     if (rs_) {
       rs_->EmulateCrash();
+      rs_.reset();
     }
     rs_ = Database::Create(prefix_).MoveValue();
   }

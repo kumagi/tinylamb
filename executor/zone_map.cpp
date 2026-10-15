@@ -100,6 +100,24 @@ void ZoneMap::AddOpaque() {
   ++value_count_;
 }
 
+void ZoneMap::Merge(const ZoneMap& other) {
+  if (!other.initialized_) {
+    return;
+  }
+  initialized_ = true;
+  null_count_ += other.null_count_;
+  value_count_ += other.value_count_;
+  has_nan_ = has_nan_ || other.has_nan_;
+  if (other.minimum_ &&
+      (!minimum_ || CompareForOrderBy(*other.minimum_, *minimum_) < 0)) {
+    minimum_ = other.minimum_;
+  }
+  if (other.maximum_ &&
+      (!maximum_ || CompareForOrderBy(*maximum_, *other.maximum_) < 0)) {
+    maximum_ = other.maximum_;
+  }
+}
+
 void ZoneMap::Reset() {
   minimum_.reset();
   maximum_.reset();

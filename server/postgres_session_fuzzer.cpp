@@ -200,6 +200,7 @@ struct ServerEnv {
     if (!db) {
       return;
     }
+    db.Reset();
     PostgresServerOptions options;
     options.port = 0;
     options.idle_timeout = std::chrono::seconds(30);
@@ -241,6 +242,7 @@ struct ServerEnv {
     if (runner.joinable()) {
       runner.join();
     }
+    db.Cleanup();
   }
 
   [[nodiscard]] bool SanityCheck() const {

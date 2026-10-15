@@ -316,8 +316,8 @@ TEST_F(SkipScanDistinctPlanExtraTest, StatsDrivenRowCountsAndOrdering) {
 
   EXPECT_EQ(plan.ToString(), "SkipScanDistinct");
   EXPECT_EQ(plan.AccessRowCount(), 123U);
-  // Zero recorded distinct values fall back to the one-row lower bound.
-  EXPECT_EQ(plan.EmitRowCount(), 1U);
+  // Unknown NDV conservatively retains the input cardinality.
+  EXPECT_EQ(plan.EmitRowCount(), 123U);
   EXPECT_EQ(plan.ScanSource(), table_.get());
   EXPECT_EQ(plan.GetStats().Rows(), 123U);
   EXPECT_EQ(plan.GetSchema().ColumnCount(), 1U);
@@ -338,12 +338,11 @@ TEST_F(SkipScanDistinctPlanExtraTest, StatsDrivenRowCountsAndOrdering) {
                             {NamedExpression("a", ColumnValueExp("a"))}, out);
   EXPECT_FALSE(desc.IsOrderedBy({ColumnValueExp("a")}, {true}));
 
-  // A schema-less stats object has no column-0 distinct either, and the
-  // one-row lower bound applies again.
+  // Empty input has no distinct rows.
   TableStatistics empty(Schema("none", {}));
   SkipScanDistinctPlan none(*table_, *index_, empty, true,
                             {NamedExpression("a", ColumnValueExp("a"))}, out);
-  EXPECT_EQ(none.EmitRowCount(), 1U);
+  EXPECT_EQ(none.EmitRowCount(), 0U);
   EXPECT_EQ(none.AccessRowCount(), 0U);
 }
 

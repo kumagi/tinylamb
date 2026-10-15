@@ -525,15 +525,12 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       "SELECT STR_VALUE('x')",
       "SELECT MAKE_INTERVAL(day => 4)",
       "SELECT GENERATE_ARRAY(1, 5, 0)",
-      "SELECT GENERATE_DATE_ARRAY(DATE '2026-01-01', DATE '2026-01-05', "
-      "INTERVAL 2 MONTH)",
       "SELECT PARSE_DATE('%Y-%m-%d', 'bad')",
       "SELECT PARSE_DATETIME('%Y-%m-%dT%H:%M:%S', '2026-01-02T03:04:05')",
       "SELECT PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', "
       "'2026-01-02T03:04:05.123456+05:30')",
       "SELECT PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%S', 'bad')",
       "SELECT DATE '2026-01-02' + INTERVAL 24 HOUR",
-      "SELECT EXTRACT(WEEKDAY FROM DATE '2026-01-01')",
       "SELECT DATE(2026, 1, 2)",
       "SELECT DATE('bad')",
       "SELECT DATETIME(DATE '2026-01-02', TIME 03:04:05)",

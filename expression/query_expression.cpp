@@ -109,17 +109,37 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema) const {
 StatusOr<Value> QueryExpression::TryEvaluate(const Row& row,
                                              const Schema& schema,
                                              EvaluationContext& context) const {
-  StatusOr<std::vector<Value>> rows = context.RunSubquery(*query_, &row);
+  StatusOr<EvaluationContext::SubqueryResult> rows =
+      context.RunSubqueryDetailed(*query_, &row);
   if (!rows.HasValue()) {
     return StatusError(rows.GetStatus().GetCode(),
                        "subquery execution failed: " +
                            std::string(tinylamb::ToString(rows.GetStatus())));
   }
-  const std::vector<Value> values = std::move(rows).MoveValue();
+  EvaluationContext::SubqueryResult subquery = std::move(rows).MoveValue();
+  const std::vector<Value> values = std::move(subquery.values);
   if (array_result_) {
-    return Value::Array(values, array_element_sql_type_.empty()
-                                    ? std::string("INT64")
-                                    : array_element_sql_type_);
+    // Keep parity with the relational evaluator: an empty declared tag is
+    // inferred from the produced elements first (a lambda-desugared
+    // ARRAY_TRANSFORM returning strings must not be declared
+    // ARRAY<INT64>), then the subquery's result schema, with INT64 as the
+    // last resort for empty/all-NULL results.
+    std::string element_type = array_element_sql_type_;
+    if (element_type.empty()) {
+      for (const Value& element : values) {
+        if (!element.IsNull()) {
+          element_type = std::string(ElementSqlTypeName(element.type));
+          break;
+        }
+      }
+      if (element_type.empty()) {
+        element_type = std::move(subquery.element_type_hint);
+      }
+      if (element_type.empty()) {
+        element_type = "INT64";
+      }
+    }
+    return Value::Array(values, element_type);
   }
   if (exists_) {
     const bool any = !values.empty();

@@ -18,12 +18,15 @@
 #define TINYLAMB_TABLE_HPP
 
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "common/incarnation.hpp"
 #include "common/status_or.hpp"
 #include "full_scan_iterator.hpp"
 #include "index/index.hpp"
@@ -36,6 +39,7 @@
 namespace tinylamb {
 
 class Transaction;
+class PageRef;
 class Decoder;
 class Encoder;
 struct Row;
@@ -50,9 +54,13 @@ class Table {
   // second definition and the disk encoding is unchanged.
   using IndexValueType = tinylamb::IndexValueType;
 
-  Table() = default;
-  Table(Schema sc, page_id_t pid)
-      : schema_(std::move(sc)), first_pid_(pid), last_pid_(pid) {}
+  Table() : incarnation_state_(std::make_shared<TableIncarnation>()) {}
+  Table(Schema sc, page_id_t pid, uint64_t incarnation = 0)
+      : schema_(std::move(sc)),
+        first_pid_(pid),
+        last_pid_(pid),
+        incarnation_(incarnation),
+        incarnation_state_(std::make_shared<TableIncarnation>()) {}
   Table(const Table&) = default;
   Table(Table&&) = default;
   Table& operator=(const Table&) = default;
@@ -69,6 +77,13 @@ class Table {
   Status Delete(Transaction& txn, RowPosition pos);
 
   StatusOr<Row> Read(Transaction& txn, RowPosition pos) const;
+
+  [[nodiscard]] StatusOr<TableLease> AcquireLease(txn_id_t owner) const {
+    if (incarnation_state_ == nullptr || !incarnation_state_->Acquire(owner)) {
+      return Status::kConflicts;
+    }
+    return TableLease(incarnation_state_, owner);
+  }
 
   Iterator BeginFullScan(Transaction& txn,
                          const TableScanOptions& options = {}) const;
@@ -114,7 +129,9 @@ class Table {
       std::optional<std::vector<slot_t>> projection = std::nullopt,
       const std::unordered_set<int64_t>* key_filter = nullptr,
       std::optional<slot_t> key_column = std::nullopt,
-      const std::vector<IntegerPeekCompare>* peek_compares = nullptr) const;
+      const std::vector<IntegerPeekCompare>* peek_compares = nullptr,
+      const RuntimeFilterGroup* runtime_filter = nullptr,
+      ValueType runtime_filter_type = ValueType::kNull) const;
   [[nodiscard]] std::vector<ScanMorsel> BuildScanMorsels(
       Transaction& txn, size_t pages_per_morsel = 8) const;
   Iterator BeginIndexScan(Transaction& txn, const Index& index,
@@ -133,11 +150,26 @@ class Table {
   // Diagnostics: the row-page chain head/tail (for corruption reports).
   [[nodiscard]] page_id_t FirstPageId() const { return first_pid_; }
   [[nodiscard]] page_id_t LastPageId() const { return last_pid_; }
+  [[nodiscard]] uint64_t Incarnation() const { return incarnation_; }
+
+  // Physical row-layout bookkeeping behind the clustered-order proof in
+  // table/table_statistics.hpp. Both read the shared TableIncarnation, so every
+  // copy of this Table observes the same values. A table without an
+  // incarnation state reports "unknown" (0 / false), which no proof matches.
+  [[nodiscard]] uint64_t LayoutGeneration() const {
+    return incarnation_state_ == nullptr
+               ? 0
+               : incarnation_state_->LayoutGeneration();
+  }
+  [[nodiscard]] bool RowsRewrittenInPlace() const {
+    return incarnation_state_ != nullptr &&
+           incarnation_state_->RowsRewrittenInPlace();
+  }
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
   friend std::ostream& operator<<(std::ostream& o, const Table& t);
-  bool operator==(const Table& rhs) const = default;
+  bool operator==(const Table& rhs) const;
   [[nodiscard]] const Index& GetIndex(size_t offset) const {
     return indexes_[offset];
   }
@@ -147,24 +179,79 @@ class Table {
   // operations on the same tree (e.g. the delete+insert pair of one UPDATE)
   // skip the root-to-leaf walk when the remembered leaf still covers the
   // key. nullptr keeps the plain always-descend behavior.
+  [[nodiscard]] Status CheckRowConstraints(const Row& row) const;
+  Status LinkReservedTableTail(Transaction& txn, PageRef& predecessor,
+                               PageRef& successor) const;
   Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
                      const RowPosition& pos,
                      page_id_t* hint_leaf = nullptr) const;
+  // Gate-held RMW bodies; see the escalation loops in IndexInsert/IndexDelete
+  // (table.cpp). Callers must hold the index write gate for idx.Root().
+  Status IndexInsertGuarded(Transaction& txn, const Index& idx,
+                            const Row& new_row, const RowPosition& pos,
+                            page_id_t* hint_leaf) const;
   Status IndexDelete(Transaction& txn, const Index& idx,
                      const RowPosition& pos) const;
   static Status IndexDelete(Transaction& txn, const Index& idx,
                             const RowPosition& pos, const Row& original_row,
                             page_id_t* hint_leaf = nullptr);
+  static Status IndexDeleteGuarded(Transaction& txn, const Index& idx,
+                                   const RowPosition& pos,
+                                   const Row& original_row,
+                                   page_id_t* hint_leaf);
 
   friend class Database;
   friend class FullScanIterator;
   friend class IndexScanIterator;
   friend class TableInterface;
 
+  void SetIncarnationState(std::shared_ptr<TableIncarnation> state) {
+    incarnation_state_ = std::move(state);
+  }
+
+  // Every row mutation brackets its work with these two calls, unconditionally
+  // (a failed or aborted mutation may still have moved rows, and a writer that
+  // is in flight while ANALYZE scans must not leave a usable proof behind).
+  // `rewrites_in_place` additionally latches the UPDATE/DELETE marker.
+  void NoteRowMutationStart(bool rewrites_in_place) const {
+    if (incarnation_state_ == nullptr) {
+      return;
+    }
+    incarnation_state_->BumpLayoutGeneration();
+    if (rewrites_in_place) {
+      incarnation_state_->LatchRowRewrite();
+    }
+  }
+  void NoteRowMutationEnd() const {
+    if (incarnation_state_ != nullptr) {
+      incarnation_state_->BumpLayoutGeneration();
+    }
+  }
+
+  // RAII bracket for one row mutation, so every early return (including the
+  // failure paths) still closes the generation window.
+  class RowMutationScope {
+   public:
+    RowMutationScope(const Table& table, bool rewrites_in_place)
+        : table_(&table) {
+      table_->NoteRowMutationStart(rewrites_in_place);
+    }
+    RowMutationScope(const RowMutationScope&) = delete;
+    RowMutationScope& operator=(const RowMutationScope&) = delete;
+    RowMutationScope(RowMutationScope&&) = delete;
+    RowMutationScope& operator=(RowMutationScope&&) = delete;
+    ~RowMutationScope() { table_->NoteRowMutationEnd(); }
+
+   private:
+    const Table* table_;
+  };
+
   Schema schema_;
   page_id_t first_pid_{};
   page_id_t last_pid_{};
+  uint64_t incarnation_{0};
   std::vector<Index> indexes_{};
+  std::shared_ptr<TableIncarnation> incarnation_state_;
 };
 
 }  // namespace tinylamb

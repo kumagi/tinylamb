@@ -127,9 +127,7 @@ Memo 上では、`filter-before-sort:` タグの派生グループに `Selection
 
 ## 関連 Rule との相互作用
 
-- `limit_push_through_sort` / `rank_row_number_to_topn`: ソートと行数制限の
-  組み合わせ(TopN)を扱う Rule。フィルタが下に来て行数が減ったほうが
-  TopN 化の効果も大きくなります。
+
 - `eliminate_double_sort` / `sort_merge_of_compatible_orders`: ソートの
   統廃合。本 Rule で新しく作った Sort が既存の Sort と隣接した場合に
   起きます(通常は消える側にならないが、キーが一致すれば統合候補になる)。

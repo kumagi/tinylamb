@@ -30,13 +30,57 @@
 
 namespace tinylamb {
 
+namespace {
+std::atomic<std::uint64_t> next_lookup_identity{1};
+}
+
+std::uint64_t Schema::NextLookupIdentity() {
+  return next_lookup_identity.fetch_add(1, std::memory_order_relaxed);
+}
+
+Schema::Schema() : identity_(NextLookupIdentity()) {}
+
+Schema::Schema(const Schema& other)
+    : name_(other.name_),
+      columns_(other.columns_),
+      identity_(NextLookupIdentity()) {}
+
+Schema::Schema(Schema&& other) noexcept
+    : name_(std::move(other.name_)),
+      columns_(std::move(other.columns_)),
+      identity_(NextLookupIdentity()) {}
+
+Schema& Schema::operator=(const Schema& other) {
+  if (this != &other) {
+    name_ = other.name_;
+    columns_ = other.columns_;
+    identity_ = NextLookupIdentity();
+  }
+  return *this;
+}
+
+Schema& Schema::operator=(Schema&& other) noexcept {
+  if (this != &other) {
+    name_ = std::move(other.name_);
+    columns_ = std::move(other.columns_);
+    identity_ = NextLookupIdentity();
+  }
+  return *this;
+}
+
 Schema::Schema(std::string_view schema_name, std::vector<Column> columns)
-    : name_(schema_name), columns_(std::move(columns)) {
+    : name_(schema_name),
+      columns_(std::move(columns)),
+      identity_(NextLookupIdentity()) {
   for (auto& c : columns_) {
     if (c.Name().schema.empty()) {
       c.Name().schema = Name();
     }
   }
+}
+
+bool Schema::operator==(const Schema& rhs) const {
+  return name_ == rhs.name_ && columns_ == rhs.columns_;
 }
 
 std::unordered_set<ColumnName> Schema::ColumnSet() const {
@@ -50,6 +94,26 @@ std::unordered_set<ColumnName> Schema::ColumnSet() const {
     }
   }
   return ret;
+}
+
+Schema Schema::WithName(std::string_view name) const {
+  Schema renamed;
+  renamed.name_ = std::string(name);
+  renamed.columns_ = columns_;
+  for (Column& column : renamed.columns_) {
+    column.Name() = ColumnName(std::string_view(name), column.Name().name);
+  }
+  return renamed;
+}
+
+Schema Schema::WithRenamedColumn(size_t offset, std::string_view name) const {
+  Schema renamed(*this);
+  if (offset >= renamed.columns_.size()) {
+    return renamed;
+  }
+  renamed.columns_[offset].Name() =
+      ColumnName(std::string_view(renamed.name_), name);
+  return renamed;
 }
 
 int Schema::Offset(const ColumnName& col_name) const {

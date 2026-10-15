@@ -108,7 +108,7 @@ std::vector<Expression> PushSingleRelationConjuncts(
 
 - `split_selection_over_join`: 左右両方の入力に対して連言を分解・押し込みを行う一般化 Rule。同一の `MergeScanFilter` ロジックを共有します。
 - `push_selection_into_scan`: スキャンノードの直上に位置する Selection をマージする Rule。本 Rule によって生成された中間状態を最終的なスキャン属性へと統合します。
-- `merge_selections` / `merge_adjacent_filters`: 述語の正規化と単一化を行い、連言分解の効率を向上させます。
+- `merge_selections` / `merge_selections`: 述語の正規化と単一化を行い、連言分解の効率を向上させます。
 
 ## 検証テスト
 

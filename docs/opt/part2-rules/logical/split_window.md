@@ -87,7 +87,7 @@ graph TD
 ## 関連 Rule との相互作用
 
 - `merge_adjacent_windows`: 同一のパーティション・ソート仕様を持つ隣接 Window ノードを 1 つに融合する逆方向の Rule です。
-- `window_frame_sort_sharing`: 縦積みされた Window ノード間で、ソート順が互換な場合にソート処理を共有・再利用します。
+- `merge_adjacent_windows`: 縦積みされた Window ノード間で、ソート順が互換な場合にソート処理を共有・再利用します。
 - `no_op_window_elimination`: 分割の結果、上位ノードから参照されない Window レベルが生じた場合にそれを削除します。
 
 ## 検証テスト

@@ -123,7 +123,7 @@ graph TD
 
 - `split_window` / `merge_adjacent_windows`: ウィンドウ演算の分解・融合を担う Rule です。それらの過程で不要化されたウィンドウ出力を本 Rule が最終的に刈り取ります。
 - `push_selection_through_window`: ウィンドウ演算を透過してフィルタを押し下げる Rule です。
-- `eliminate_identity_projection`: 本 Rule によって生成された射影が入力と完全に一致する場合、恒等射影として除去されます。
+- 恒等射影の除去は物理実装の `RemoveIdentityProjection` がスキーマを確認して行います。
 
 ## 検証テスト
 

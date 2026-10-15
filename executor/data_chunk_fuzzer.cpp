@@ -22,17 +22,17 @@ namespace tinylamb {
 namespace {
 
 struct Cursor {
-  const uint8_t* data;
-  size_t size;
+  const uint8_t* data{};
+  size_t size{};
   size_t pos{0};
   uint8_t Next() { return pos < size ? data[pos++] : 0; }
-  bool Done() const { return pos >= size; }
+  [[nodiscard]] bool Done() const { return pos >= size; }
 };
 
 Value MakeInt(Cursor& c) {
   switch (c.Next() % 6) {
     case 0:
-      return Value();
+      return {};  // NULL
     case 1:
       return Value(int64_t{0});
     case 2:
@@ -47,16 +47,20 @@ Value MakeInt(Cursor& c) {
 }
 
 Value MakeDouble(Cursor& c) {
-  if (c.Next() % 8 == 0) return Value();
+  if (c.Next() % 8 == 0) {
+    return {};  // NULL
+  }
   return Value(static_cast<double>(static_cast<int64_t>(c.Next()) - 128) / 4.0);
 }
 
 Value MakeString(Cursor& c) {
-  if (c.Next() % 8 == 0) return Value();
+  if (c.Next() % 8 == 0) {
+    return {};  // NULL
+  }
   const size_t len = c.Next() % 5;
   std::string s;
   for (size_t i = 0; i < len; ++i) {
-    s.push_back(static_cast<char>(1 + c.Next() % 60));
+    s.push_back(static_cast<char>(1 + (c.Next() % 60)));
   }
   return Value(std::move(s));
 }
@@ -75,15 +79,16 @@ void CheckChunkMatches(const DataChunk& a, const DataChunk& b,
 
 }  // namespace
 
+namespace {
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   if (size < 8) {
     return;
   }
-  Cursor c{data, size};
+  Cursor c{.data = data, .size = size};
   const Schema schema("chunk_fuzz", {Column("i", ValueType::kInt64),
                                      Column("d", ValueType::kDouble),
                                      Column("s", ValueType::kVarChar)});
-  const size_t rows = 1 + c.Next() % 24;
+  const size_t rows = 1 + (c.Next() % 24);
   DataChunk source(schema);
   std::vector<Row> model;
   for (size_t row = 0; row < rows && !c.Done(); ++row) {
@@ -111,10 +116,9 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
 
   // (3) AppendGather with a random selection vector.
   std::vector<uint32_t> selection;
-  const size_t gather = 1 + c.Next() % 32;
-  for (size_t i = 0; i < gather && !c.Done(); ++i) {
-    selection.push_back(c.Next() % static_cast<uint8_t>(source.Size() + 1) %
-                        static_cast<uint32_t>(source.Size()));
+  const size_t gather = 1 + (c.Next() % 32);
+  for (size_t i = 0; i < gather && !c.Done() && source.Size() > 0; ++i) {
+    selection.push_back(c.Next() % static_cast<uint32_t>(source.Size()));
   }
   DataChunk gathered(schema, 0);
   gathered.AppendGather(source, selection.data(), selection.size());
@@ -148,14 +152,14 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   for (size_t i = 0; i < source.Size(); ++i) {
     const Value v = source.ColumnAt(0).ValueAt(i);
     if (v.IsNull()) {
-      continue;  // SQL aggregates skip NULL inputs
+      continue;  // SQL aggregates skip NULL inputs.
     }
-    const uint64_t bits = static_cast<uint64_t>(v.value.int_value);
+    const auto bits = static_cast<uint64_t>(v.value.int_value);
     bit_and &= bits;
     bit_or |= bits;
     bit_xor ^= bits;
-    bool_and = (bool_and && v.Truthy()) ? 1 : 0;
-    bool_or = (bool_or || v.Truthy()) ? 1 : 0;
+    bool_and = ((bool_and != 0) && v.Truthy()) ? 1 : 0;
+    bool_or = ((bool_or != 0) || v.Truthy()) ? 1 : 0;
   }
   const bool any_int = bit_and != ~uint64_t{0} || bit_or != 0 || bit_xor != 0;
   if (source.Size() > 0 && any_int) {
@@ -177,6 +181,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   (void)verbose;
 }
 
+}  // namespace
 }  // namespace tinylamb
 
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,

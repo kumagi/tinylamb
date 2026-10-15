@@ -32,6 +32,7 @@
 #include "executor/constant_executor.hpp"
 #include "executor/detail/explain_format.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
@@ -45,12 +46,14 @@
 #include "expression/binary_expression.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
@@ -59,6 +62,7 @@
 #include "table/full_scan_iterator.hpp"
 #include "table/iterator.hpp"
 #include "table/table.hpp"
+#include "type/collation.hpp"
 #include "type/column.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -66,78 +70,10 @@
 
 namespace tinylamb::relational_detail {
 
-// SQL equality for group keys: NaN equals NaN and -0 equals +0, unlike raw
-// IEEE Value::operator== which never folds NaNs together.
-struct GroupKeyEqual {
-  bool operator()(const Row& a, const Row& b) const {
-    if (a.values_.size() != b.values_.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < a.values_.size(); ++i) {
-      const Value& x = a.values_[i];
-      const Value& y = b.values_[i];
-      if (x.type != y.type) {
-        return false;
-      }
-      if (x.type == ValueType::kDouble) {
-        const double p = x.value.double_value;
-        const double q = y.value.double_value;
-        if (std::isnan(p) && std::isnan(q)) {
-          continue;
-        }
-        if (!(p == q)) {
-          return false;
-        }
-        continue;
-      }
-      if (!(x == y)) {
-        return false;
-      }
-    }
-    return true;
-  }
-};
-
-// Transparent hash/equal pair: lets the grouped-aggregation index probe with
-// the scratch key vector directly, avoiding a Row construction per probe.
-// The vector overload reproduces std::hash<Row> bit-for-bit.
-struct GroupKeyTransparentHash {
-  using is_transparent = void;
-  size_t operator()(const Row& row) const { return std::hash<Row>{}(row); }
-  size_t operator()(const std::vector<Value>& values) const {
-    uint64_t ret = 0x9e3779b97f4a7c15ULL;
-    for (const auto& v : values) {
-      ret = (ret << 7) | (ret >> 57);
-      ret ^= std::hash<Value>()(v);
-      ret *= 0x100000001b3ULL;
-    }
-    return ret;
-  }
-};
-
-struct GroupKeyTransparentEqual {
-  using is_transparent = void;
-  bool operator()(const Row& a, const Row& b) const {
-    return GroupKeyEqual{}(a, b);
-  }
-  bool operator()(const std::vector<Value>& a, const Row& b) const {
-    if (a.size() != b.values_.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < a.size(); ++i) {
-      if (!(a[i] == b.values_[i])) {
-        return false;
-      }
-    }
-    return true;
-  }
-  bool operator()(const Row& a, const std::vector<Value>& b) const {
-    return (*this)(b, a);
-  }
-};
-
-using GroupKeyMap = std::unordered_map<Row, size_t, GroupKeyTransparentHash,
-                                       GroupKeyTransparentEqual>;
+// The grouped-aggregation key index (GroupKeyEqual / GroupKeyMap) lives in
+// executor/detail/expression_eval.hpp: it is the shared "same group" contract
+// between this path and the physical grouped aggregation shapes
+// (executor/grouped_aggregate.hpp).
 
 // Minimum grouped-input size before Project folds rows into parallel worker
 // slices; below this the serial loop's thread startup dominates.
@@ -426,9 +362,23 @@ StatusOr<Relation> Project(TransactionContext& context,
                     return ContainsAggregate(projection.expression);
                   }) ||
       ContainsAggregate(statement.Having());
-  const Expression having_expr =
-      grouped ? InlineHavingAliases(statement, input.schema)
-              : statement.Having();
+  Expression having_expr = grouped
+                               ? InlineHavingAliases(statement, input.schema)
+                               : statement.Having();
+  // Fold row-independent subqueries in HAVING to constants once, before the
+  // per-group emit (Q11: every group re-probed the same uncorrelated scalar
+  // through the cache).  Same contract as the scan-filter fold:
+  // uncorrelated volatile-free nodes are statement-invariant on this
+  // snapshot, and nodes whose evaluation raises keep their original form.
+  static const bool having_fold_disabled =
+      std::getenv("TINYLAMB_DISABLE_HAVING_FOLD") != nullptr;
+  if (grouped && having_expr && !having_fold_disabled) {
+    std::vector<Expression> folded_having =
+        FoldRowIndependentSubqueries(context, {having_expr}, outer, ctes);
+    if (!folded_having.empty()) {
+      having_expr = folded_having[0];
+    }
+  }
   // ORDER BY terms may reference select-list aliases or spell out an
   // aggregate ("ORDER BY sum(x) DESC", TPC-DS q42).  Alias references resolve
   // to the select item's expression; aggregate subtrees dedupe onto the
@@ -678,19 +628,43 @@ StatusOr<Relation> Project(TransactionContext& context,
       std::vector<std::optional<slot_t>> parallel_key_offsets;
       std::vector<std::optional<slot_t>> parallel_child_offsets;
       std::vector<bool> parallel_count_star;
+      // Deterministic computed keys and aggregate arguments ride the same
+      // worker-safe path as plain columns through the bytecode VM (the
+      // parallel scan filter already evaluates compiled programs on
+      // workers).  A program that fails to compile keeps the serial loop.
+      std::vector<BytecodeProgram> parallel_key_programs;
+      std::vector<BytecodeProgram> parallel_child_programs;
       const auto is_plain_column = [](const Expression& expression) {
         return expression && expression->Type() == TypeTag::kColumnValue;
+      };
+      static const bool parallel_expression_keys_disabled =
+          std::getenv("TINYLAMB_DISABLE_PARALLEL_EXPRESSION_KEYS") != nullptr;
+      const auto bind_parallel_value = [&](const Expression& expression,
+                                           std::optional<slot_t>* offset,
+                                           BytecodeProgram* program) {
+        if (is_plain_column(expression)) {
+          *offset = LocalColumnOffset(
+              input.schema, expression->AsColumnValue().GetColumnName());
+          return offset->has_value();
+        }
+        if (parallel_expression_keys_disabled || !BytecodeEnabled()) {
+          return false;
+        }
+        std::optional<BytecodeProgram> compiled = BytecodeCompiler::Compile(
+            expression, input.schema, BytecodeCompiler::Context::kValue);
+        if (!compiled.has_value()) {
+          return false;
+        }
+        *program = std::move(*compiled);
+        return true;
       };
       if (parallel_grouping) {
         parallel_key_offsets.reserve(statement.GroupBy().size());
         for (const Expression& key : statement.GroupBy()) {
-          if (!is_plain_column(key)) {
-            parallel_grouping = false;
-            break;
-          }
-          parallel_key_offsets.emplace_back(LocalColumnOffset(
-              input.schema, key->AsColumnValue().GetColumnName()));
-          if (!parallel_key_offsets.back().has_value()) {
+          parallel_key_offsets.emplace_back(std::nullopt);
+          parallel_key_programs.emplace_back();
+          if (!bind_parallel_value(key, &parallel_key_offsets.back(),
+                                   &parallel_key_programs.back())) {
             parallel_grouping = false;
             break;
           }
@@ -709,7 +683,7 @@ StatusOr<Relation> Project(TransactionContext& context,
           if (aggregate->WhereFilter() ||
               (!count_star &&
                !(  // NOLINT(readability-simplify-boolean-expr)
-                   is_plain_column(aggregate->Child()) &&
+                   aggregate->Child() &&
                    aggregate->Having() == AggregateHavingModifier::kNone &&
                    aggregate->InnerOrderBy().empty() &&
                    !aggregate->SecondaryArg() &&
@@ -721,16 +695,14 @@ StatusOr<Relation> Project(TransactionContext& context,
             break;
           }
           parallel_count_star.push_back(count_star);
-          if (count_star) {
-            parallel_child_offsets.emplace_back(std::nullopt);
-          } else {
-            parallel_child_offsets.emplace_back(LocalColumnOffset(
-                input.schema,
-                aggregate->Child()->AsColumnValue().GetColumnName()));
-            if (!parallel_child_offsets.back().has_value()) {
-              parallel_grouping = false;
-              break;
-            }
+          parallel_child_offsets.emplace_back(std::nullopt);
+          parallel_child_programs.emplace_back();
+          if (!count_star &&
+              !bind_parallel_value(aggregate->Child(),
+                                   &parallel_child_offsets.back(),
+                                   &parallel_child_programs.back())) {
+            parallel_grouping = false;
+            break;
           }
         }
       }
@@ -745,7 +717,6 @@ StatusOr<Relation> Project(TransactionContext& context,
           GroupKeyMap offsets;
           const size_t chunk_rows = 8192;
           const size_t chunk_count = (total_rows + chunk_rows - 1) / chunk_rows;
-          std::atomic<size_t> next_chunk{0};
           struct WorkerLocal {
             GroupKeyMap offsets;
             std::vector<GroupState> groups;
@@ -755,6 +726,14 @@ StatusOr<Relation> Project(TransactionContext& context,
             size_t aggregate_updates{0};
           };
           std::vector<WorkerLocal> locals(workers);
+          // Classification shared by every per-group accumulator construction
+          // in the workers below; identical for all groups of one aggregate.
+          std::vector<AggregateAccumulator::Shape> parallel_shapes;
+          parallel_shapes.reserve(aggregate_expressions.size());
+          for (const AggregateExpression* aggregate : aggregate_expressions) {
+            parallel_shapes.push_back(
+                AggregateAccumulator::AnalyzeShape(aggregate, nullptr));
+          }
           {
             std::vector<std::jthread> threads;
             threads.reserve(workers);
@@ -766,19 +745,35 @@ StatusOr<Relation> Project(TransactionContext& context,
                 // and evaluator state are single-threaded contracts).
                 std::vector<Value> key_values;
                 key_values.reserve(parallel_key_offsets.size());
-                while (true) {
-                  const size_t chunk = next_chunk.fetch_add(1);
-                  if (chunk >= chunk_count) {
-                    return;
-                  }
+                // Static rotation: worker w folds chunks w, w+W, w+2W, ... .
+                // The atomic counter this replaced handed chunks to whichever
+                // worker grabbed them, so the per-worker partial sums of a
+                // DOUBLE aggregate changed run to run and rank boundaries
+                // (TPC-DS q65/q67) flipped on the last ulp. Chunks are fixed
+                // 8192-row slices, so ownership by index is as balanced as
+                // the race was and the merge in worker order becomes a
+                // deterministic function of the input.
+                for (size_t chunk = w; chunk < chunk_count; chunk += workers) {
                   const size_t begin = chunk * chunk_rows;
                   const size_t end = std::min(total_rows, begin + chunk_rows);
                   for (size_t ri = begin; ri < end; ++ri) {
                     const Row& row = input.rows[ri];
                     key_values.clear();
-                    for (const std::optional<slot_t>& off :
-                         parallel_key_offsets) {
-                      key_values.push_back(CanonicalDistinctValue(row[*off]));
+                    for (size_t ki = 0; ki < parallel_key_offsets.size();
+                         ++ki) {
+                      if (parallel_key_offsets[ki].has_value()) {
+                        key_values.push_back(CanonicalDistinctValue(
+                            row[*parallel_key_offsets[ki]]));
+                        continue;
+                      }
+                      StatusOr<Value> computed =
+                          TryEvaluateRowAuto(parallel_key_programs[ki], row);
+                      if (!computed.HasValue()) {
+                        local.error = computed.GetStatus();
+                        return;
+                      }
+                      key_values.push_back(
+                          CanonicalDistinctValue(computed.Value()));
                     }
                     Row key(std::move(key_values));
                     key_values.clear();
@@ -787,9 +782,10 @@ StatusOr<Relation> Project(TransactionContext& context,
                     if (inserted) {
                       GroupState group;
                       group.accumulator_offset = local.states.size();
-                      for (const AggregateExpression* aggregate :
-                           aggregate_expressions) {
-                        local.states.emplace_back(aggregate);
+                      for (size_t i = 0; i < aggregate_expressions.size();
+                           ++i) {
+                        local.states.emplace_back(aggregate_expressions[i],
+                                                  parallel_shapes[i]);
                       }
                       group.representative = row;
                       local.groups.push_back(std::move(group));
@@ -798,10 +794,30 @@ StatusOr<Relation> Project(TransactionContext& context,
                     for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
                       AggregateAccumulator& accumulator =
                           local.states[group.accumulator_offset + i];
-                      Status st = parallel_count_star[i]
-                                      ? accumulator.Add(Value(1))
-                                      : accumulator.Add(
-                                            row[*parallel_child_offsets[i]]);
+                      if (parallel_count_star[i]) {
+                        Status st = accumulator.Add(Value(1));
+                        if (st != Status::kSuccess) {
+                          local.error = st;
+                          return;
+                        }
+                        continue;
+                      }
+                      if (parallel_child_offsets[i].has_value()) {
+                        Status st =
+                            accumulator.Add(row[*parallel_child_offsets[i]]);
+                        if (st != Status::kSuccess) {
+                          local.error = st;
+                          return;
+                        }
+                        continue;
+                      }
+                      StatusOr<Value> computed =
+                          TryEvaluateRowAuto(parallel_child_programs[i], row);
+                      if (!computed.HasValue()) {
+                        local.error = computed.GetStatus();
+                        return;
+                      }
+                      Status st = accumulator.Add(computed.Value());
                       if (st != Status::kSuccess) {
                         local.error = st;
                         return;
@@ -948,7 +964,50 @@ StatusOr<Relation> Project(TransactionContext& context,
       const ColumnName& requested =
           projection.expression->AsColumnValue().GetColumnName();
       const bool qualified = !requested.schema.empty();
+      if (projection.star_modifiers) {
+        // The index-group expansion below cannot splice a substitute
+        // expression mid-star; REPLACE needs the query-layer expansion.
+        if (!projection.star_modifiers->replace_items.empty()) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "SELECT * REPLACE over this query shape is not supported; "
+              "rewrite the star over a single relation");
+        }
+      }
+      std::unordered_set<std::string> except_names;
+      std::unordered_set<std::string> except_matched_names;
+      if (projection.star_modifiers) {
+        for (const std::string& entry :
+             projection.star_modifiers->except_columns) {
+          const size_t dot = entry.rfind('.');
+          except_names.insert(dot == std::string::npos ? entry
+                                                       : entry.substr(dot + 1));
+        }
+      }
+      const auto except_drops = [&](const ColumnName& candidate) {
+        if (except_names.empty()) {
+          return false;
+        }
+        const std::string& name = candidate.name;
+        for (const std::string& entry : except_names) {
+          if (entry.size() == name.size() &&
+              std::equal(entry.begin(), entry.end(), name.begin(),
+                         [](char a, char b) {
+                           return std::tolower(static_cast<unsigned char>(a)) ==
+                                  std::tolower(static_cast<unsigned char>(b));
+                         })) {
+            except_matched_names.insert(entry);
+            return true;
+          }
+        }
+        return false;
+      };
       if (proto_value_star && base_width == 1) {
+        if (projection.star_modifiers) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "SELECT * EXCEPT/REPLACE over this table is "
+                             "not supported");
+        }
         star_proto[i] = true;
         output_columns.emplace_back("int32_val1", ValueType::kInt64);
         output_columns.emplace_back("int32_val2", ValueType::kInt64);
@@ -988,7 +1047,8 @@ StatusOr<Relation> Project(TransactionContext& context,
             continue;
           }
           const Column& candidate = input.schema.GetColumn(column);
-          if (matches_star(requested, candidate.Name(), qualified)) {
+          if (matches_star(requested, candidate.Name(), qualified) &&
+              !except_drops(candidate.Name())) {
             star_groups[i].push_back({column});
             output_columns.emplace_back(candidate.Name().name,
                                         candidate.Type());
@@ -998,10 +1058,18 @@ StatusOr<Relation> Project(TransactionContext& context,
       }
       for (size_t column = 0; column < base_width; ++column) {
         const Column& candidate = input.schema.GetColumn(column);
-        if (matches_star(requested, candidate.Name(), qualified)) {
+        if (matches_star(requested, candidate.Name(), qualified) &&
+            !except_drops(candidate.Name())) {
           star_groups[i].push_back({column});
           output_columns.emplace_back(candidate.Name().name, candidate.Type());
         }
+      }
+      // An EXCEPT entry that dropped nothing resolves nowhere: fail loudly
+      // instead of silently keeping the column.
+      if (projection.star_modifiers &&
+          except_matched_names.size() < except_names.size()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "EXCEPT column not present in the star target");
       }
     } else {
       output_columns.emplace_back(ProjectionName(projection, i),
@@ -1040,24 +1108,23 @@ StatusOr<Relation> Project(TransactionContext& context,
   };
   std::vector<KeyedRow> sortable;
   const bool has_order_by = !order_by.empty();
+  // One ordering contract for the ORDER BY keys, the DISTINCT keys and the
+  // bounded (LIMIT) heap alike: NULL placement, direction and the collation
+  // the key resolves under all come from SortKeyOrder (type/collation.hpp),
+  // the same type the sort operators use. A COLLATE'd key therefore folds here
+  // exactly as it does in SortExecutor / TopNExecutor.
+  std::vector<SortKeyOrder> order_specs;
+  order_specs.reserve(order_by.size());
+  for (const SelectStatement::OrderByTerm& term : order_by) {
+    order_specs.emplace_back(term.ascending, term.nulls_first,
+                             CollationOfExpression(term.expression));
+  }
   const auto precedes = [&](const KeyedRow& left, const KeyedRow& right) {
     for (size_t i = 0; i < order_by.size(); ++i) {
-      const Value& a = left.keys[i];
-      const Value& b = right.keys[i];
-      const int c = CompareForOrderBy(a, b);
-      if (c == 0) {
-        continue;
+      const int cmp = order_specs[i].Compare(left.keys[i], right.keys[i]);
+      if (cmp != 0) {
+        return cmp < 0;
       }
-      const bool nulls_first =
-          order_by[i].nulls_first.value_or(order_by[i].ascending);
-      const bool a_less = c < 0;
-      if (a.IsNull()) {
-        return nulls_first;
-      }
-      if (b.IsNull()) {
-        return !nulls_first;
-      }
-      return order_by[i].ascending ? a_less : !a_less;
     }
     return left.sequence < right.sequence;
   };
@@ -1088,6 +1155,51 @@ StatusOr<Relation> Project(TransactionContext& context,
     }
   };
   Schema initial_output_schema("", output_columns);
+
+  for (auto& resolved_order_expression : resolved_order_expressions) {
+    const Expression& expression = resolved_order_expression;
+    // `ORDER BY 1 COLLATE 'und:ci'` arrives as COLLATE(<int>, 'spec'): the
+    // ordinal names a SELECT-list position and the clause collates it, so the
+    // two resolve together. Left as a constant, the key would encode
+    // identically for every row and the sort would silently do nothing.
+    if (const std::optional<CollatedOrdinal> collated =
+            AsCollatedOrdinal(expression);
+        collated.has_value() && collated->ordinal >= 1 &&
+        static_cast<size_t>(collated->ordinal) <= output_columns.size() &&
+        !output_columns[static_cast<size_t>(collated->ordinal) - 1]
+             .Name()
+             .name.empty()) {
+      resolved_order_expression = ApplyCollationSpec(
+          ColumnValueExp(ColumnName(
+              output_columns[static_cast<size_t>(collated->ordinal) - 1]
+                  .Name()
+                  .name)),
+          collated->spec);
+      continue;
+    }
+    if (!expression || expression->Type() != TypeTag::kConstantValue ||
+        dynamic_cast<const ParameterSlot*>(expression.get()) != nullptr) {
+      continue;
+    }
+    const Value& value = expression->AsConstantValue().GetValue();
+    if (value.type != ValueType::kInt64 || value.IsNull()) {
+      continue;
+    }
+    if (value.value.int_value < 1 ||
+        static_cast<size_t>(value.value.int_value) > output_columns.size()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ORDER BY ordinal out of range");
+    }
+    const std::string& name =
+        output_columns[static_cast<size_t>(value.value.int_value) - 1]
+            .Name()
+            .name;
+    if (name.empty() || name == "*") {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ORDER BY ordinal out of range");
+    }
+    resolved_order_expression = ColumnValueExp(ColumnName(name));
+  }
 
   auto emit = [&](const Row& representative,
                   const AggregateResultMap* aggregates) -> Status {
@@ -1153,9 +1265,21 @@ StatusOr<Relation> Project(TransactionContext& context,
     }
     Row output_row(std::move(values));
     if (has_order_by) {
+      // The grouped ORDER BY key may reference output columns, aliases,
+      // aggregates and group-key base columns -- never a relation alias
+      // denoting a whole row (the query is grouped by parts of that row),
+      // so the row-alias fallback is suppressed on both scopes.  The base
+      // wrapper keeps select-item evaluation (`COUNT(t)`) on the lenient
+      // scope above.
+      Scope order_base{.row = scope.row,
+                       .schema = scope.schema,
+                       .outer = scope.outer,
+                       .using_columns = scope.using_columns,
+                       .no_row_alias = true};
       Scope proj_scope{.row = &output_row,
                        .schema = &initial_output_schema,
-                       .outer = &scope};
+                       .outer = &order_base,
+                       .no_row_alias = true};
       std::vector<Value> keys;
       keys.reserve(order_by.size());
       for (const Expression& key : resolved_order_expressions) {
@@ -1264,8 +1388,17 @@ StatusOr<Relation> Project(TransactionContext& context,
   }
 
   if (grouped && fast_emit) {
+    // The per-group maps and buffers are hoisted: re-constructing an
+    // AggregateResultMap (bucket allocation) and a finished-values vector
+    // for every one of tens of thousands of groups dominated multi-group
+    // HAVING emits (TPC-H Q11: 31,587 groups).  The map keeps the same
+    // aggregate-node keys every iteration, so clearing + re-emplacing reuses
+    // the buckets and the per-group cost reduces to the TryFinish calls and
+    // the HAVING walk itself.
+    std::vector<Value> finished_values(aggregate_expressions.size());
+    AggregateResultMap aggregate_results;
+    aggregate_results.reserve(aggregate_expressions.size());
     for (const GroupState& group : groups) {
-      std::vector<Value> finished_values(aggregate_expressions.size());
       for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
         ASSIGN_OR_RETURN(
             Value, finished,
@@ -1273,11 +1406,9 @@ StatusOr<Relation> Project(TransactionContext& context,
         finished_values[i] = std::move(finished);
       }
       if (having_expr) {
-        AggregateResultMap aggregate_results;
-        aggregate_results.reserve(aggregate_expressions.size());
         for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
-          aggregate_results.emplace(aggregate_expressions[i],
-                                    finished_values[i]);
+          aggregate_results.insert_or_assign(aggregate_expressions[i],
+                                             finished_values[i]);
         }
         Scope scope{.row = &group.representative,
                     .schema = &input.schema,
@@ -1403,12 +1534,11 @@ namespace {
 // GoogleSQL DISTINCT treats every NaN as equal (they collapse to a single
 // group) and folds -0.0 into +0.0.  The default Value/Row equality returns
 // false for NaN != NaN, so DISTINCT needs this canonical-aware comparison
-// (mirroring CompareForOrderBy / CanonicalDistinctValue).
+// (mirroring CompareForOrderBy / CanonicalDistinctValue). The rule itself
+// lives in type/collation.hpp so DISTINCT, ORDER BY ties and Top-N boundaries
+// all agree on which rows are peers.
 bool CanonicalValuesEqual(const Value& x, const Value& y) {
-  if (x.type == ValueType::kDouble && y.type == ValueType::kDouble) {
-    return CompareForOrderBy(x, y) == 0;
-  }
-  return x == y;
+  return EqualUnderCollation(x, y);
 }
 
 struct CanonicalRowEqual {
@@ -1580,24 +1710,22 @@ Status ApplyOrderBy(TransactionContext& context,
   // Every row was copied into `sortable`; detach the finished spill files so
   // re-adding below cannot hit "Append after FinishWriting".
   output->ResetContents();
-  const auto precedes = [&](const KeyedRow& left, const KeyedRow& right) {
-    for (size_t i = 0; i < order_by.size(); ++i) {
-      const Value& a = left.keys[i];
-      const Value& b = right.keys[i];
-      const int c = CompareForOrderBy(a, b);
-      if (c == 0) {
-        continue;
+  // The same ordering contract the non-grouped and grouped relational paths
+  // use: NULL placement, direction and the key's collation from
+  // SortKeyOrder (type/collation.hpp).
+  std::vector<SortKeyOrder> order_specs;
+  order_specs.reserve(order_by.size());
+  for (const SelectStatement::OrderByTerm& term : order_by) {
+    order_specs.emplace_back(term.ascending, term.nulls_first,
+                             CollationOfExpression(term.expression));
+  }
+  const auto precedes = [&order_specs](const KeyedRow& left,
+                                       const KeyedRow& right) {
+    for (size_t i = 0; i < order_specs.size(); ++i) {
+      const int cmp = order_specs[i].Compare(left.keys[i], right.keys[i]);
+      if (cmp != 0) {
+        return cmp < 0;
       }
-      const bool nulls_first =
-          order_by[i].nulls_first.value_or(order_by[i].ascending);
-      const bool a_less = c < 0;
-      if (a.IsNull()) {
-        return nulls_first;
-      }
-      if (b.IsNull()) {
-        return !nulls_first;
-      }
-      return order_by[i].ascending ? a_less : !a_less;
     }
     return left.sequence < right.sequence;
   };
@@ -1700,7 +1828,10 @@ StatusOr<Relation> LimitedRows(const SelectStatement& statement,
                               *ctes)
                 : term.expression->TryEvaluate(all_rows[end_idx], input.schema);
         ASSIGN_OR_RETURN(Value, val_curr, (std::move(curr_or)));
-        if (!CanonicalValuesEqual(val_last, val_curr)) {
+        // Peers must collapse exactly the way the ORDER BY grouped them, so a
+        // case-insensitive key treats 'a' and 'A' as the same tie instead of
+        // cutting the tie group at the LIMIT boundary.
+        if (!EqualUnderCollation(val_last, val_curr)) {
           tied = false;
           break;
         }
@@ -1741,7 +1872,7 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
     Relation input, const Scope* outer, const CteMap& ctes, bool apply_where) {
   const std::string unsupported =
       "window functions combined with GROUP BY are not supported here";
-  if (statement.Qualify() || statement.HasDistinctOn()) {
+  if (statement.HasDistinctOn()) {
     return StatusError(StatusCode::kInvalidArgument, unsupported);
   }
   for (const NamedExpression& projection : statement.SelectList()) {
@@ -1758,6 +1889,10 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
     CollectWindowCalls(term.expression, &window_nodes);
   }
+  // QUALIFY is one more consumer of the same window/aggregate pool: its
+  // window calls join the pass-2 computation and its aggregates become
+  // hidden `$aggK` group-level columns.
+  CollectWindowCalls(statement.Qualify(), &window_nodes);
 
   auto grouped = std::make_shared<SelectStatement>(statement);
   std::vector<NamedExpression> grouped_select;
@@ -1792,6 +1927,8 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
   std::vector<NamedExpression> partition_items;
   std::unordered_map<std::string, std::string> partition_columns;
   std::unordered_map<std::string, std::string> aggregate_columns;
+  RegisterAggregatesForMaterialization(statement.Qualify(), &aggregate_columns,
+                                       &hidden_aggregates);
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
     if (!item_has_window[i] || statement.SelectList()[i].expression->Type() ==
                                    TypeTag::kWindowFunctionExp) {
@@ -1875,6 +2012,63 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
   for (const NamedExpression& item : partition_items) {
     grouped_select.emplace_back(item);
   }
+  // Pass 1 also materializes plain ORDER BY terms as hidden `$okJ` columns.
+  // The final pass evaluates its ordering over the grouped output, where an
+  // unselected GROUP BY key (q12 orders by i_item_id without selecting it)
+  // does not exist: without this column the ordering used to fall into the
+  // row-alias whole-row fallback and "sorted" by a STRUCT of the grouped row.
+  std::unordered_map<std::string, std::string> order_key_columns;
+  std::vector<Expression> rewritten_order_terms;
+  rewritten_order_terms.reserve(statement.OrderBy().size());
+  const auto materialize_order_key = [&](const Expression& term) -> Expression {
+    auto [it, inserted] = order_key_columns.emplace(
+        term->ToString(), "$ok" + std::to_string(order_key_columns.size()));
+    if (inserted) {
+      grouped_select.emplace_back(it->second, term);
+    }
+    return ColumnValueExp(ColumnName("", it->second));
+  };
+  const auto term_needs_materialization = [&](const Expression& term) {
+    if (!term) {
+      return false;
+    }
+    // Window calls and aggregates are materialized through aggregate_columns
+    // by the node-level rewrite below; a whole-term column would never
+    // resolve in the grouped pass.
+    if (ContainsWindowCall(term)) {
+      return false;
+    }
+    bool aliases_only = true;
+    std::function<void(const Expression&)> scan =
+        [&](const Expression& node) {  // NOLINT(misc-no-recursion)
+          if (!node) {
+            return;
+          }
+          if (node->Type() == TypeTag::kAggregateExp) {
+            aliases_only = false;
+            return;
+          }
+          if (node->Type() == TypeTag::kColumnValue) {
+            const ColumnName& referenced =
+                node->AsColumnValue().GetColumnName();
+            if (referenced.schema.empty() &&
+                alias_columns.contains(AsciiToLower(referenced.name))) {
+              aliases_only = false;
+              return;
+            }
+          }
+          for (const Expression& child : ExpressionChildren(node)) {
+            scan(child);
+          }
+        };
+    scan(term);
+    return aliases_only;
+  };
+  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+    rewritten_order_terms.push_back(term_needs_materialization(term.expression)
+                                        ? materialize_order_key(term.expression)
+                                        : term.expression);
+  }
   grouped->SetSelectList(std::move(grouped_select));
   grouped->SetOrderBy({});
   grouped->SetQualify(Expression{});
@@ -1919,6 +2113,44 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
         break;
       }
     }
+  }
+  // QUALIFY filters the grouped+$win rows (WHERE semantics: NULL and FALSE
+  // drop the row), after the window pass materialized its inputs.
+  if (statement.Qualify()) {
+    const auto point_qualify_at_materialized =
+        [&](const Expression& node) -> std::optional<Expression> {
+      if (node->Type() == TypeTag::kWindowFunctionExp ||
+          node->Type() == TypeTag::kAggregateExp) {
+        return ColumnValueExp(
+            ColumnName("", aggregate_columns.at(node->ToString())));
+      }
+      if (node->Type() == TypeTag::kColumnValue) {
+        const ColumnName& referenced = node->AsColumnValue().GetColumnName();
+        if (referenced.schema.empty()) {
+          if (auto it = alias_columns.find(AsciiToLower(referenced.name));
+              it != alias_columns.end()) {
+            return ColumnValueExp(ColumnName("", it->second));
+          }
+        }
+      }
+      return std::nullopt;
+    };
+    const Expression rewritten_qualify = ReplaceSubExpressions(
+        statement.Qualify(), point_qualify_at_materialized);
+    Schema extended_schema(grouped_output.schema.Name(), extended_columns);
+    std::vector<Row> filtered;
+    filtered.reserve(rows.size());
+    for (Row& row : rows) {
+      const Scope qualify_scope{
+          .row = &row, .schema = &extended_schema, .outer = outer};
+      ASSIGN_OR_RETURN(Value, decided,
+                       (TryEvaluate(rewritten_qualify, qualify_scope, nullptr,
+                                    context, ctes)));
+      if (Truthy(decided)) {
+        filtered.push_back(std::move(row));
+      }
+    }
+    rows = std::move(filtered);
   }
   Relation extended(context.execution_runtime());
   extended.schema =
@@ -1985,9 +2217,15 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
   };
   std::vector<SelectStatement::OrderByTerm> final_order;
   final_order.reserve(statement.OrderBy().size());
-  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+  for (size_t o = 0; o < statement.OrderBy().size(); ++o) {
+    const SelectStatement::OrderByTerm& term = statement.OrderBy()[o];
+    // A materialized `$okJ` column already names this term; anything else
+    // keeps the node-level rewrite (windows -> $win, aggregates/aliases ->
+    // select items).
     final_order.push_back(
-        {ReplaceSubExpressions(term.expression, point_at_materialized),
+        {rewritten_order_terms[o] == term.expression
+             ? ReplaceSubExpressions(term.expression, point_at_materialized)
+             : rewritten_order_terms[o],
          term.ascending, term.nulls_first});
   }
   final_statement->SetSelectList(std::move(final_select));
@@ -2040,17 +2278,45 @@ StatusOr<Relation> FinishQuery(TransactionContext& context,
       CopyExecutionStats(&filtered, input);
       input.FinishSpill();
       Status eval_error{Status::kSuccess};
-      RETURN_IF_FAIL(input.ForEachRow([&](const Row& row) {
-        if (!eval_error.ok()) {
-          return;
-        }
-        if (relational_detail::MatchScanFilter(row, input.schema, compiled,
-                                               outer, context, ctes,
-                                               &eval_error)) {
-          filtered.AddRow(row);
-        }
-      }));
-      RETURN_IF_FAIL(eval_error);
+      // A/B hatch: TINYLAMB_DISABLE_FINISH_PARALLEL_FILTER=1 keeps the serial
+      // per-row loop below.
+      static const bool finish_parallel_disabled =
+          std::getenv("TINYLAMB_DISABLE_FINISH_PARALLEL_FILTER") != nullptr;
+      bool filtered_in_parallel = false;
+      if (!finish_parallel_disabled) {
+        // Worker threads decide rows with the positional compares and the
+        // compiled bytecode programs; rows whose program raised are parked
+        // and re-checked on this thread through the same contextful
+        // MatchScanFilter call the serial loop uses, so error semantics are
+        // unchanged.  Filters that need the evaluator (query expressions the
+        // bytecode cannot compile) make the parallel attempt decline and
+        // fall through to the serial loop.
+        filtered_in_parallel = relational_detail::TryParallelFilterRows(
+            context, input, compiled, input.schema, outer, ctes, nullptr,
+            &filtered, &eval_error);
+      }
+      if (filtered_in_parallel) {
+        RETURN_IF_FAIL(eval_error);
+      } else {
+        RETURN_IF_FAIL((([&]() -> Status {
+          // Register the filtered relation so a correlated-subquery build
+          // triggered by one of the predicates can prune its build scan to
+          // this pipeline's outer key domain.
+          relational_detail::ScopedCorrelatedOuter correlated_outer(context,
+                                                                    input);
+          return input.ForEachRow([&](const Row& row) {
+            if (!eval_error.ok()) {
+              return;
+            }
+            if (relational_detail::MatchScanFilter(row, input.schema, compiled,
+                                                   outer, context, ctes,
+                                                   &eval_error)) {
+              filtered.AddRow(row);
+            }
+          });
+        })()));
+        RETURN_IF_FAIL(eval_error);
+      }
       filtered.FinishSpill();
       input = std::move(filtered);
     } else {
@@ -2201,12 +2467,30 @@ size_t FlattenableProjectionDepth(const SelectStatement& statement) {
 }
 
 bool IdentifierEquals(std::string_view left, std::string_view right) {
-  return left.size() == right.size() &&
-         std::equal(left.begin(), left.end(), right.begin(),
-                    [](char lhs, char rhs) {
-                      return std::tolower(static_cast<unsigned char>(lhs)) ==
-                             std::tolower(static_cast<unsigned char>(rhs));
-                    });
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < left.size(); ++i) {
+    const auto lhs = static_cast<unsigned char>(left[i]);
+    const auto rhs = static_cast<unsigned char>(right[i]);
+    if (lhs == rhs) {
+      continue;
+    }
+    if (lhs >= 0x80 || rhs >= 0x80) {
+      if (std::tolower(lhs) != std::tolower(rhs)) {
+        return false;
+      }
+      continue;
+    }
+    const unsigned char folded_left =
+        lhs >= 'A' && lhs <= 'Z' ? lhs + ('a' - 'A') : lhs;
+    const unsigned char folded_right =
+        rhs >= 'A' && rhs <= 'Z' ? rhs + ('a' - 'A') : rhs;
+    if (folded_left != folded_right) {
+      return false;
+    }
+  }
+  return true;
 }
 
 Expression SubstituteProjectionColumns(  // NOLINT(misc-no-recursion)
@@ -2420,6 +2704,162 @@ bool PredicateCanEnterDerived(const Expression& predicate,
          RebindDerivedPredicate(predicate, derived, derived_alias) != nullptr;
 }
 
+// Multi-source variant of IsFlattenableProjection: the derived side is a
+// plain inner-join projection.  Unlike the single-source boundary above, its
+// WHERE clause is allowed -- it composes into the merged statement's WHERE,
+// which is equivalent because the merged sources are exactly the derived's
+// own sources and every join inside them is inner.
+bool IsFlattenableJoinedProjection(const SelectStatement& statement) {
+  if (statement.Sources().empty() || statement.Having() ||
+      statement.Qualify() || !statement.GroupBy().empty() ||
+      !statement.UnionAll().empty() || statement.Distinct() ||
+      statement.HasLimit() || statement.Offset() != 0 ||
+      statement.SelectList().empty() || HasWindowFunctions(statement) ||
+      !statement.WithQueries().empty()) {
+    return false;
+  }
+  for (const SelectSource& source : statement.Sources()) {
+    if (source.unnest || (source.query && source.table.empty()) ||
+        (source.join_type != JoinType::kInner &&
+         source.join_type != JoinType::kCross) ||
+        source.sample) {
+      return false;
+    }
+  }
+  return std::ranges::all_of(
+      statement.SelectList(), [](const NamedExpression& item) {
+        return item.expression &&
+               (item.expression->Type() != TypeTag::kColumnValue ||
+                item.expression->AsColumnValue().GetColumnName().name != "*") &&
+               !ContainsQuery(item.expression) &&
+               !ContainsAggregate(item.expression) &&
+               IsDeterministicProjectionExpression(item.expression);
+      });
+}
+
+// Flattens a grouping boundary: a statement that GROUPs over a single derived
+// table absorbs the derived projection when the derived side is itself a
+// plain multi-source inner-join projection.  Group keys, select items and
+// ORDER BY terms re-resolve against the derived select list (aggregates
+// rebuild losslessly), so the grouping runs directly over the joined base
+// relations and the grouped-join fusion can fire at the join step instead of
+// materializing the multi-million-row join relation.
+std::shared_ptr<SelectStatement> FlattenGroupedDerivedBoundary(
+    const SelectStatement& statement, const SelectSource& source,
+    const SelectStatement& derived) {
+  if (statement.Sources().size() != 1 || statement.Having() ||
+      statement.Qualify() || !statement.UnionAll().empty() ||
+      HasWindowFunctions(statement) ||
+      StatementContainsVolatileFunction(statement) ||
+      !IsFlattenableJoinedProjection(derived)) {
+    return nullptr;
+  }
+  if (source.join_type != JoinType::kInner &&
+      source.join_type != JoinType::kCross) {
+    return nullptr;
+  }
+  if (source.sample || ContainsQuery(derived.WhereClause())) {
+    return nullptr;
+  }
+  // Duplicate derived output names make the substitution ambiguous.
+  for (auto a = derived.SelectList().begin(); a != derived.SelectList().end();
+       ++a) {
+    const std::string a_name =
+        !a->name.empty()
+            ? a->name
+            : (a->expression->Type() == TypeTag::kColumnValue
+                   ? a->expression->AsColumnValue().GetColumnName().name
+                   : std::string());
+    if (a_name.empty()) {
+      continue;
+    }
+    for (auto b = std::next(a); b != derived.SelectList().end(); ++b) {
+      const std::string b_name =
+          !b->name.empty()
+              ? b->name
+              : (b->expression->Type() == TypeTag::kColumnValue
+                     ? b->expression->AsColumnValue().GetColumnName().name
+                     : std::string());
+      if (!b_name.empty() && IdentifierEquals(a_name, b_name)) {
+        return nullptr;
+      }
+    }
+  }
+  const std::string derived_alias = source.alias.empty() ? "d" : source.alias;
+  auto rewrite = [&](const Expression& expression) -> Expression {
+    bool valid = true;
+    Expression result =
+        SubstituteProjectionColumns(expression, derived, derived_alias, &valid);
+    return valid ? result : Expression{};
+  };
+  std::vector<NamedExpression> select_list;
+  select_list.reserve(statement.SelectList().size());
+  for (const NamedExpression& item : statement.SelectList()) {
+    Expression expression = rewrite(item.expression);
+    if (!expression) {
+      return nullptr;
+    }
+    select_list.emplace_back(item.name, std::move(expression));
+  }
+  std::vector<Expression> group_by;
+  group_by.reserve(statement.GroupBy().size());
+  for (const Expression& key : statement.GroupBy()) {
+    Expression expression = rewrite(key);
+    if (!expression) {
+      return nullptr;
+    }
+    group_by.push_back(std::move(expression));
+  }
+  std::vector<SelectStatement::OrderByTerm> order_by;
+  order_by.reserve(statement.OrderBy().size());
+  for (const auto& term : statement.OrderBy()) {
+    // A term that names a select alias stays a plain column reference: the
+    // fused path orders the projected output through select aliases, and a
+    // substituted expression there would defeat that resolution.
+    const bool alias_ref =
+        term.expression && term.expression->Type() == TypeTag::kColumnValue &&
+        term.expression->AsColumnValue().GetColumnName().schema.empty() &&
+        std::any_of(
+            statement.SelectList().begin(), statement.SelectList().end(),
+            [&](const NamedExpression& item) {
+              return !item.name.empty() &&
+                     IdentifierEquals(
+                         item.name,
+                         term.expression->AsColumnValue().GetColumnName().name);
+            });
+    Expression expression =
+        alias_ref ? term.expression : rewrite(term.expression);
+    if (!expression) {
+      return nullptr;
+    }
+    order_by.push_back(
+        SelectStatement::OrderByTerm{.expression = std::move(expression),
+                                     .ascending = term.ascending,
+                                     .nulls_first = term.nulls_first});
+  }
+  // The derived's own conjuncts move up unchanged (same base sources); the
+  // parent's conjuncts are re-bound to the derived outputs first.
+  std::vector<Expression> where = SplitConjuncts(derived.WhereClause());
+  if (statement.WhereClause()) {
+    Expression rebound = rewrite(statement.WhereClause());
+    if (!rebound) {
+      return nullptr;
+    }
+    for (Expression& conjunct : SplitConjuncts(rebound)) {
+      where.push_back(std::move(conjunct));
+    }
+  }
+
+  auto rewritten = std::make_shared<SelectStatement>(statement);
+  rewritten->SetSelectList(std::move(select_list));
+  rewritten->SetGroupBy(std::move(group_by));
+  rewritten->SetWhereClause(where.empty() ? Expression{}
+                                          : CombineConjuncts(where));
+  rewritten->SetOrderBy(std::move(order_by));
+  rewritten->SetSources(derived.Sources());
+  return rewritten;
+}
+
 }  // namespace
 
 std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
@@ -2469,6 +2909,13 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
   // limit, window, or subquery expression.
   if (std::shared_ptr<SelectStatement> flattened =
           FlattenProjectionBoundary(statement, source, derived)) {
+    return flattened;
+  }
+
+  // A grouping parent over a plain joined projection absorbs the projection
+  // so the grouping (and the grouped-join fusion) runs over the base sources.
+  if (std::shared_ptr<SelectStatement> flattened =
+          FlattenGroupedDerivedBoundary(statement, source, derived)) {
     return flattened;
   }
 
@@ -2759,7 +3206,8 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
         next.AddRow(std::move(payload));
       }));
     }
-    next.FinishSpill();
+    RETURN_IF_FAIL(next.FinishSpill());
+    RETURN_IF_FAIL(next.GetStatus());
     if (next.TotalRows() == 0) {
       break;
     }
@@ -2772,7 +3220,8 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
       RETURN_IF_FAIL(
           next.ForEachRow([&](const Row& row) { result.AddRow(row); }));
     }
-    result.FinishSpill();
+    RETURN_IF_FAIL(result.FinishSpill());
+    RETURN_IF_FAIL(result.GetStatus());
     delta = std::move(next);
   }
   return result;
@@ -2791,6 +3240,28 @@ struct TypedAggregateInput {
   std::optional<BytecodeProgram> child;
 };
 
+// Slim per-group state classification for the typed stream aggregation.
+// Multi-million-group folds (TPC-H Q18/Q21 shapes) stream ~300 bytes of
+// AggregateAccumulator per group per aggregate even when the aggregate keeps
+// only a count and a scalar total; the slim SoA layout keeps those two scalars
+// instead, cutting group-state cache traffic by an order of magnitude.  The
+// kinds must mirror AggregateAccumulator::Add/Merge/TryFinish exactly for the
+// shapes they admit (NULL skip, INT64 overflow raise, SUM infinity raise,
+// AVG-through-double).
+enum class SlimAggKind : uint8_t {
+  kNone = 0,   // keep the generic AggregateAccumulator for this aggregate
+  kCount,      // COUNT(*) / COUNT(expr): NULL-skipping ++count
+  kSumInt64,   // SUM over signed INT64: overflow-checked int_total
+  kSumDouble,  // SUM over DOUBLE: double total + saw-infinite-input flag
+  kAvgDouble,  // AVG over INT64/DOUBLE: sums through a double intermediate
+  kCountDistinctInt64,  // COUNT(DISTINCT int64/date): inline slots + overflow
+};
+
+// Inline distinct-slot count for kCountDistinctInt64.  Mirrors
+// AggregateAccumulator::kInlineDistinctIntCapacity so overflow behavior is
+// bit-identical with the generic accumulator.
+constexpr size_t kSlimDistinctSlots = 8;
+
 // Select/ORDER BY output items resolved positionally: a group-key column or
 // a top-level aggregate.
 struct TypedEmitItem {
@@ -2798,11 +3269,149 @@ struct TypedEmitItem {
   size_t index{0};
 };
 
+// Same-type column-vs-column compare conjunct peeled out of the typed
+// aggregation's residual filter programs: evaluated positionally per row with
+// no bytecode dispatch (NULL rejects, exactly like the three-valued
+// conjunct).  INT64/DATE compare their raw integers; DOUBLE compares as
+// double (IEEE semantics, so a NaN input rejects every ordered comparison —
+// mirroring the AST evaluator).
+struct TypedFilterCompare {
+  slot_t left{0};
+  slot_t right{0};
+  BinaryOperation op{BinaryOperation::kEquals};
+  bool is_double{false};
+  // Col-vs-constant peel (`col op const`): `constant` was constant-folded at
+  // plan time and its ValueType equals the column's, so the per-row decision
+  // is a raw positional compare.  `op` is already mirrored so the column sits
+  // on the left.  NULL columns still reject the row exactly like the
+  // col-vs-col peel.
+  bool constant_payload{false};
+  int64_t int_constant{0};
+  double double_constant{0.0};
+  // Byte-exact VARCHAR equality/inequality against a plan-owned plain string
+  // (no collation on the constant; mirrors MatchSimpleCompare's
+  // plain_string_payload contract).
+  bool string_payload{false};
+  std::string string_constant{};
+};
+
+// Constant IN-list peel (`col IN (c1, c2, ...)`): keep the row iff any list
+// item equals the column cell.  Every item was a non-NULL same-type plain
+// constant at plan time, so a miss rejects the row exactly like the bytecode
+// IN (which yields UNKNOWN/FALSE for both the NULL-cell and no-match cases
+// in a WHERE context).
+struct TypedInListCompare {
+  slot_t column{0};
+  bool is_double{false};
+  bool is_string{false};
+  std::vector<int64_t> int_values;
+  std::vector<double> double_values;
+  std::vector<std::string> strings;
+};
+
+BinaryOperation FlipTypedCompare(BinaryOperation operation) {
+  switch (operation) {
+    case BinaryOperation::kLessThan:
+      return BinaryOperation::kGreaterThan;
+    case BinaryOperation::kLessThanEquals:
+      return BinaryOperation::kGreaterThanEquals;
+    case BinaryOperation::kGreaterThan:
+      return BinaryOperation::kLessThan;
+    case BinaryOperation::kGreaterThanEquals:
+      return BinaryOperation::kLessThanEquals;
+    default:
+      return operation;
+  }
+}
+
+inline bool DecideTypedFilterCompare(const Value& left, const Value& right,
+                                     const TypedFilterCompare& compare) {
+  if (compare.string_payload) {
+    const std::string_view a = left.value.varchar_value;
+    const bool equal = a == std::string_view(compare.string_constant);
+    return compare.op == BinaryOperation::kEquals ? equal : !equal;
+  }
+  if (compare.constant_payload) {
+    if (compare.is_double) {
+      const double a = left.value.double_value;
+      switch (compare.op) {
+        case BinaryOperation::kEquals:
+          return a == compare.double_constant;
+        case BinaryOperation::kNotEquals:
+          return a != compare.double_constant;
+        case BinaryOperation::kLessThan:
+          return a < compare.double_constant;
+        case BinaryOperation::kLessThanEquals:
+          return a <= compare.double_constant;
+        case BinaryOperation::kGreaterThan:
+          return a > compare.double_constant;
+        default:
+          return a >= compare.double_constant;
+      }
+    }
+    const int64_t a = left.value.int_value;
+    switch (compare.op) {
+      case BinaryOperation::kEquals:
+        return a == compare.int_constant;
+      case BinaryOperation::kNotEquals:
+        return a != compare.int_constant;
+      case BinaryOperation::kLessThan:
+        return a < compare.int_constant;
+      case BinaryOperation::kLessThanEquals:
+        return a <= compare.int_constant;
+      case BinaryOperation::kGreaterThan:
+        return a > compare.int_constant;
+      default:
+        return a >= compare.int_constant;
+    }
+  }
+  if (compare.is_double) {
+    const double a = left.value.double_value;
+    const double b = right.value.double_value;
+    switch (compare.op) {
+      case BinaryOperation::kEquals:
+        return a == b;
+      case BinaryOperation::kNotEquals:
+        return a != b;
+      case BinaryOperation::kLessThan:
+        return a < b;
+      case BinaryOperation::kLessThanEquals:
+        return a <= b;
+      case BinaryOperation::kGreaterThan:
+        return a > b;
+      default:
+        return a >= b;
+    }
+  }
+  const int64_t a = left.value.int_value;
+  const int64_t b = right.value.int_value;
+  switch (compare.op) {
+    case BinaryOperation::kEquals:
+      return a == b;
+    case BinaryOperation::kNotEquals:
+      return a != b;
+    case BinaryOperation::kLessThan:
+      return a < b;
+    case BinaryOperation::kLessThanEquals:
+      return a <= b;
+    case BinaryOperation::kGreaterThan:
+      return a > b;
+    default:
+      return a >= b;
+  }
+}
+
 struct TypedAggregationPlan {
   bool eligible{false};
   // Empty when the statement has no GROUP BY (global aggregate).
   std::vector<slot_t> key_offsets;
   std::vector<TypedAggregateInput> aggregates;
+  // Set when every aggregate admits a slim kind; plan.slim_kinds[i] then
+  // classifies aggregates[i] for the SoA group-state layout.
+  bool slim{false};
+  std::vector<SlimAggKind> slim_kinds;
+  // Select/ORDER BY output items resolved positionally: a group-key column or
+  // a top-level aggregate.
   std::vector<TypedEmitItem> emit_items;
   // Engaged only when the statement carries ORDER BY.
   std::vector<TypedEmitItem> order_items;
@@ -2810,6 +3419,12 @@ struct TypedAggregationPlan {
   std::vector<bool> order_nulls_first;
   // Whole-conjunct WHERE programs; every one must be truthy per row.
   std::vector<BytecodeProgram> filter_programs;
+  // Column-compare conjuncts peeled out of filter_programs (see
+  // TypedFilterCompare); evaluated before the programs.
+  std::vector<TypedFilterCompare> filter_compares;
+  // Constant IN-list conjuncts peeled out of filter_programs (see
+  // TypedInListCompare); evaluated with the compares, before the programs.
+  std::vector<TypedInListCompare> inlist_compares;
 };
 
 TypedAggregationPlan PlanTypedAggregation(
@@ -2844,6 +3459,17 @@ TypedAggregationPlan PlanTypedAggregation(
     plan.key_offsets.push_back(static_cast<slot_t>(*offset));
   }
   // WHERE: every conjunct must compile to context-free bytecode.
+  static const bool filter_peek_disabled =
+      std::getenv("TINYLAMB_DISABLE_AGG_FILTER_PEEK") != nullptr;
+  // A/B hatch: TINYLAMB_DISABLE_TYPED_CONST_PEEK=1 keeps col-vs-constant
+  // conjuncts in the bytecode programs (col-vs-col peeling stays on).
+  static const bool const_peek_disabled =
+      std::getenv("TINYLAMB_DISABLE_TYPED_CONST_PEEK") != nullptr;
+  // Only a PREFIX of the conjunct list may peel to positional compares: the
+  // typed path evaluates conjuncts in order and a raising program aborts the
+  // aggregate, so reordering a peel past a raising conjunct could silently
+  // swallow its error.
+  bool peel_allowed = !filter_peek_disabled;
   for (const Expression& predicate : scan_predicates) {
     if (!predicate) {
       continue;
@@ -2851,12 +3477,185 @@ TypedAggregationPlan PlanTypedAggregation(
     if (ContainsQuery(predicate)) {
       return plan;
     }
-    std::optional<BytecodeProgram> compiled = BytecodeCompiler::Compile(
-        predicate, scan_schema, BytecodeCompiler::Context::kFilter);
-    if (!compiled.has_value()) {
-      return plan;
+    bool peeled = false;
+    if (peel_allowed && !const_peek_disabled &&
+        predicate->Type() == TypeTag::kInExp) {
+      // Constant IN-list peel (`col IN ('RAIL', 'SHIP', ...)`): plain
+      // same-type constants only, so the per-row decision is a short linear
+      // scan with no dispatch.  NULL cells and no-match both reject the row,
+      // which is what the SQL semantics demand in a WHERE conjunct.
+      const InExpression& membership = predicate->AsInExpression();
+      if (!membership.list_.empty() && membership.list_.size() <= 64 &&
+          membership.child_->Type() == TypeTag::kColumnValue) {
+        const auto offset = LocalColumnOffset(
+            scan_schema, membership.child_->AsColumnValue().GetColumnName());
+        if (offset) {
+          const Column& column_object =
+              scan_schema.GetColumn(static_cast<slot_t>(*offset));
+          const ValueType column_type = column_object.Type();
+          TypedInListCompare compiled;
+          compiled.column = static_cast<slot_t>(*offset);
+          bool all_plain = !column_object.IsUnsigned();
+          if (column_type == ValueType::kVarChar) {
+            compiled.is_string = true;
+          } else if (column_type == ValueType::kDouble) {
+            compiled.is_double = true;
+          } else if (column_type != ValueType::kInt64 &&
+                     column_type != ValueType::kDate) {
+            all_plain = false;
+          }
+          for (const Expression& item : membership.list_) {
+            if (!all_plain || !item ||
+                item->Type() != TypeTag::kConstantValue) {
+              all_plain = false;
+              break;
+            }
+            const Value& item_value = item->AsConstantValue().GetValue();
+            if (item_value.IsNull() ||
+                (!compiled.is_string && item_value.type != column_type)) {
+              all_plain = false;
+              break;
+            }
+            if (compiled.is_string) {
+              if (item_value.type != ValueType::kVarChar ||
+                  item_value.IsCaseInsensitive() ||
+                  !PlainStringComparable(item_value.value.varchar_value)) {
+                all_plain = false;
+                break;
+              }
+              compiled.strings.emplace_back(item_value.value.varchar_value);
+            } else if (compiled.is_double) {
+              compiled.double_values.push_back(item_value.value.double_value);
+            } else {
+              compiled.int_values.push_back(item_value.value.int_value);
+            }
+          }
+          if (all_plain) {
+            plan.inlist_compares.push_back(std::move(compiled));
+            peeled = true;
+          }
+        }
+      }
     }
-    plan.filter_programs.push_back(std::move(*compiled));
+    if (peel_allowed && !peeled && predicate->Type() == TypeTag::kBinaryExp) {
+      // Column-vs-column compares of one numeric type evaluate positionally:
+      // a multi-million-row fold (Q21's l_receiptdate > l_commitdate) skips
+      // the per-row bytecode dispatch.  Such a compare can never raise, so
+      // the conjunct-order error semantics are unchanged.
+      const BinaryExpression& binary = predicate->AsBinaryExpression();
+      if (IsComparison(binary.Op()) &&
+          binary.Left()->Type() == TypeTag::kColumnValue &&
+          binary.Right()->Type() == TypeTag::kColumnValue) {
+        const auto left_offset = LocalColumnOffset(
+            scan_schema, binary.Left()->AsColumnValue().GetColumnName());
+        const auto right_offset = LocalColumnOffset(
+            scan_schema, binary.Right()->AsColumnValue().GetColumnName());
+        if (left_offset && right_offset) {
+          const Column& left_column =
+              scan_schema.GetColumn(static_cast<slot_t>(*left_offset));
+          const Column& right_column =
+              scan_schema.GetColumn(static_cast<slot_t>(*right_offset));
+          const ValueType left_type = left_column.Type();
+          if (!left_column.IsUnsigned() && !right_column.IsUnsigned() &&
+              left_type == right_column.Type() &&
+              (left_type == ValueType::kInt64 ||
+               left_type == ValueType::kDate ||
+               left_type == ValueType::kDouble)) {
+            plan.filter_compares.push_back(TypedFilterCompare{
+                .left = static_cast<slot_t>(*left_offset),
+                .right = static_cast<slot_t>(*right_offset),
+                .op = binary.Op(),
+                .is_double = left_type == ValueType::kDouble});
+            peeled = true;
+          }
+        }
+      } else if (IsComparison(binary.Op()) && !const_peek_disabled &&
+                 (binary.Left()->Type() == TypeTag::kColumnValue ||
+                  binary.Right()->Type() == TypeTag::kColumnValue)) {
+        // Column-vs-constant compares peel the same way after constant
+        // folding (Q1's `l_shipdate <= date_sub(date '1998-12-01',
+        // INTERVAL 74 day)` folds to a DATE constant).  Folding reuses the
+        // scan-filter path's rules, including the NOT-of-ordered-double
+        // suppression, so a peel never changes a NaN verdict.  A folding
+        // failure keeps the conjunct in bytecode exactly as before.
+        ExpressionRewriter rewriter(
+            ContainsNotOfOrderedDoubleComparison(predicate, scan_schema)
+                ? NotComparisonFreeRules()
+                : ExpressionRuleSet::Default());
+        rewriter.set_schema(&scan_schema);
+        StatusOr<Expression> folded_or = rewriter.TryRewrite(predicate);
+        if (folded_or.HasValue() && folded_or.Value() &&
+            folded_or.Value()->Type() == TypeTag::kBinaryExp) {
+          const BinaryExpression& folded =
+              folded_or.Value()->AsBinaryExpression();
+          if (IsComparison(folded.Op())) {
+            Expression column = folded.Left();
+            Expression constant = folded.Right();
+            BinaryOperation op = folded.Op();
+            if (column->Type() == TypeTag::kConstantValue &&
+                constant->Type() == TypeTag::kColumnValue) {
+              std::swap(column, constant);
+              op = FlipTypedCompare(op);
+            }
+            if (column->Type() == TypeTag::kColumnValue &&
+                constant->Type() == TypeTag::kConstantValue) {
+              const auto offset = LocalColumnOffset(
+                  scan_schema, column->AsColumnValue().GetColumnName());
+              const Value& constant_value =
+                  constant->AsConstantValue().GetValue();
+              if (offset && !constant_value.IsNull()) {
+                const Column& column_object =
+                    scan_schema.GetColumn(static_cast<slot_t>(*offset));
+                const ValueType column_type = column_object.Type();
+                TypedFilterCompare compiled{
+                    .left = static_cast<slot_t>(*offset),
+                    .op = op,
+                    .constant_payload = true};
+                bool supported = false;
+                if (!column_object.IsUnsigned() &&
+                    (column_type == ValueType::kInt64 ||
+                     column_type == ValueType::kDate) &&
+                    constant_value.type == column_type) {
+                  compiled.is_double = false;
+                  compiled.int_constant = constant_value.value.int_value;
+                  supported = true;
+                } else if (!column_object.IsUnsigned() &&
+                           column_type == ValueType::kDouble &&
+                           constant_value.type == ValueType::kDouble) {
+                  compiled.is_double = true;
+                  compiled.double_constant = constant_value.value.double_value;
+                  supported = true;
+                } else if (column_type == ValueType::kVarChar &&
+                           constant_value.type == ValueType::kVarChar &&
+                           !constant_value.IsCaseInsensitive() &&
+                           PlainStringComparable(
+                               constant_value.value.varchar_value) &&
+                           (op == BinaryOperation::kEquals ||
+                            op == BinaryOperation::kNotEquals)) {
+                  compiled.string_payload = true;
+                  compiled.string_constant =
+                      std::string(constant_value.value.varchar_value);
+                  supported = true;
+                }
+                if (supported) {
+                  plan.filter_compares.push_back(std::move(compiled));
+                  peeled = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!peeled) {
+      peel_allowed = false;
+      std::optional<BytecodeProgram> compiled = BytecodeCompiler::Compile(
+          predicate, scan_schema, BytecodeCompiler::Context::kFilter);
+      if (!compiled.has_value()) {
+        return plan;
+      }
+      plan.filter_programs.push_back(std::move(*compiled));
+    }
   }
   // Aggregates: exactly the accumulator kinds whose partial states merge.
   for (const AggregateExpression* aggregate : aggregate_expressions) {
@@ -2909,6 +3708,62 @@ TypedAggregationPlan PlanTypedAggregation(
     }
     plan.aggregates.push_back(std::move(input));
   }
+  // Slim-state classification: COUNT/SUM/AVG over signed INT64 or DOUBLE
+  // inputs keep a packed count+total pair per group instead of the generic
+  // ~300-byte accumulator.  One kNone anywhere keeps the whole plan on the
+  // chunked-accumulator layout (MIN/MAX need the extreme Value, DISTINCT
+  // needs the set, UINT64 needs the unsigned domain — none are slim).
+  static const bool slim_disabled =
+      std::getenv("TINYLAMB_DISABLE_SLIM_AGG") != nullptr;
+  plan.slim_kinds.reserve(plan.aggregates.size());
+  bool all_slim = !plan.aggregates.empty() && !slim_disabled;
+  for (const TypedAggregateInput& input : plan.aggregates) {
+    const AggregateExpression* aggregate = input.aggregate;
+    const AggregationType type = aggregate->GetType();
+    SlimAggKind kind = SlimAggKind::kNone;
+    const bool distinct_free = !aggregate->Distinct();
+    if (distinct_free && type == AggregationType::kCount) {
+      kind = SlimAggKind::kCount;
+    } else if (distinct_free && (type == AggregationType::kSum ||
+                                 type == AggregationType::kAvg)) {
+      ValueType input_type = ValueType::kNull;
+      if (input.column.has_value()) {
+        const Column& column =
+            scan_schema.GetColumn(static_cast<slot_t>(*input.column));
+        if (!column.IsUnsigned()) {
+          input_type = column.Type();
+        }
+      } else if (input.child.has_value()) {
+        input_type = input.child->ResultType();
+      }
+      if (type == AggregationType::kAvg) {
+        if (input_type == ValueType::kInt64 ||
+            input_type == ValueType::kDouble) {
+          kind = SlimAggKind::kAvgDouble;
+        }
+      } else if (input_type == ValueType::kInt64) {
+        kind = SlimAggKind::kSumInt64;
+      } else if (input_type == ValueType::kDouble) {
+        kind = SlimAggKind::kSumDouble;
+      }
+    } else if (!distinct_free && type == AggregationType::kCount) {
+      // COUNT(DISTINCT ...) over an INT64/DATE input keeps the inline-slot
+      // slim layout (same 8-slot threshold as the generic accumulator).
+      ValueType input_type = ValueType::kNull;
+      if (input.column.has_value()) {
+        input_type =
+            scan_schema.GetColumn(static_cast<slot_t>(*input.column)).Type();
+      } else if (input.child.has_value()) {
+        input_type = input.child->ResultType();
+      }
+      if (input_type == ValueType::kInt64 || input_type == ValueType::kDate) {
+        kind = SlimAggKind::kCountDistinctInt64;
+      }
+    }
+    plan.slim_kinds.push_back(kind);
+    all_slim = all_slim && kind != SlimAggKind::kNone;
+  }
+  plan.slim = all_slim;
   // Classifies one output expression as a group-key column or a top-level
   // aggregate; `alias` names the select item it came from for ORDER BY
   // alias resolution (empty for direct select items).
@@ -3018,15 +3873,289 @@ TypedAggregationPlan PlanTypedAggregation(
 // Group states local to one worker (or to the merged result on the main
 // thread).  Single INT64/DATE key statements index groups by the raw int
 // value; everything else keys a canonical Value row.
+// Chunked storage for the flat per-group accumulator states.  A plain
+// std::vector<AggregateAccumulator> reallocates on geometric growth, and the
+// realloc transient (old buffer + new buffer live together) peaks at ~3x the
+// final state size — with 16 workers each folding 1.4M groups x ~300 bytes
+// that was a ~20 GB transient spike whose page faults and cache thrash
+// dominated the very scans the flat layout was meant to speed up.  Fixed
+// chunks never move, and the chunk-pointer vector's growth moves 16-byte
+// handles.
+class AccumulatorChunks {
+ public:
+  static constexpr size_t kSlotsPerChunk = 512;
+
+  void Configure(size_t stride) { stride_ = stride; }
+
+  // Wholesale adoption when a merge target takes over a worker's whole state
+  // (same stride and chunk geometry, so slot positions carry over as-is).
+  void AdoptChunksFrom(AccumulatorChunks&& other) {
+    chunks_ = std::move(other.chunks_);
+    stride_ = other.stride_;
+  }
+
+  [[nodiscard]] AggregateAccumulator& State(size_t group, size_t i) {
+    const size_t slot = (group * stride_) + i;
+    return chunks_[slot / kSlotsPerChunk]->At(slot % kSlotsPerChunk);
+  }
+  [[nodiscard]] const AggregateAccumulator& State(size_t group,
+                                                  size_t i) const {
+    const size_t slot = (group * stride_) + i;
+    return chunks_[slot / kSlotsPerChunk]->At(slot % kSlotsPerChunk);
+  }
+
+  void AppendGroup(const std::vector<const AggregateExpression*>& aggregates,
+                   const std::vector<AggregateAccumulator::Shape>* shapes) {
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      if (chunks_.empty() || chunks_.back()->constructed() == kSlotsPerChunk) {
+        chunks_.push_back(std::make_unique<Chunk>(kSlotsPerChunk));
+      }
+      if (shapes != nullptr) {
+        chunks_.back()->ConstructAt((*aggregates[i]), (*shapes)[i]);
+      } else {
+        chunks_.back()->ConstructAt((*aggregates[i]));
+      }
+    }
+  }
+
+ private:
+  class Chunk {
+   public:
+    explicit Chunk(size_t capacity)
+        : storage_(new std::byte[capacity * sizeof(AggregateAccumulator)]) {}
+    Chunk(const Chunk&) = delete;
+    Chunk& operator=(const Chunk&) = delete;
+    Chunk(Chunk&&) = delete;
+    Chunk& operator=(Chunk&&) = delete;
+    ~Chunk() {
+      for (size_t i = 0; i < constructed_; ++i) {
+        At(i).~AggregateAccumulator();
+      }
+    }
+    AggregateAccumulator& At(size_t index) {
+      return *std::launder(reinterpret_cast<AggregateAccumulator*>(
+          storage_.get() + (index * sizeof(AggregateAccumulator))));
+    }
+    AggregateAccumulator& ConstructAt(const AggregateExpression& aggregate) {
+      auto* placed =  // NOLINT(cppcoreguidelines-owning-memory)
+          new (storage_.get() + (constructed_ * sizeof(AggregateAccumulator)))
+              AggregateAccumulator(&aggregate);
+      ++constructed_;
+      return *placed;
+    }
+    AggregateAccumulator& ConstructAt(
+        const AggregateExpression& aggregate,
+        const AggregateAccumulator::Shape& shape) {
+      auto* placed =  // NOLINT(cppcoreguidelines-owning-memory)
+          new (storage_.get() + (constructed_ * sizeof(AggregateAccumulator)))
+              AggregateAccumulator(&aggregate, shape);
+      ++constructed_;
+      return *placed;
+    }
+    [[nodiscard]] size_t constructed() const { return constructed_; }
+
+   private:
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
+    std::unique_ptr<std::byte[]> storage_;
+    size_t constructed_{0};
+  };
+
+  std::vector<std::unique_ptr<Chunk>> chunks_;
+  size_t stride_{1};
+};
+
 struct TypedWorkerGroups {
   bool int_key{false};
-  std::unordered_map<int64_t, size_t> int_index;
+  // Open-addressing: a fresh multi-million-group build (Q18/Q21 shapes) costs
+  // no per-group node allocation, unlike the node-based row_index below.
+  FlatIntKeyMap<size_t> int_index;
   std::unordered_map<Row, size_t, GroupKeyTransparentHash,
                      GroupKeyTransparentEqual>
       row_index;
+  // A/B hatch: TINYLAMB_DISABLE_FLAT_GROUP_FOLD=1 restores the per-group
+  // vector-of-vector layout.  The flat layout below strides two contiguous
+  // vectors instead: group g's canonical keys live at
+  // flat_group_keys[g * key_stride + k] and its accumulators at
+  // flat_group_states[g * agg_stride + i].  The previous layout cost one heap
+  // allocation per group per container — across Q21's two 1.4M-group builds
+  // and Q18's 1.5M-group build that is ~5.7M allocations the flat layout
+  // never makes, with the group states gaining contiguous locality in the
+  // bargain.
+  bool flat_layout{true};
+  // Slim SoA mode (plan.slim): no AggregateAccumulator storage at all —
+  // per (group, aggregate) slots live in three parallel vectors indexed by
+  // group * agg_stride + i.  Element width is 8 bytes, so geometric growth
+  // moves are cheap (the chunked layout above exists for the ~300-byte
+  // accumulators; these need no chunking).
+  bool slim{false};
+  const std::vector<SlimAggKind>* slim_kinds{nullptr};
+  std::vector<int64_t> slim_counts;
+  std::vector<int64_t> slim_int_totals;
+  std::vector<double> slim_double_totals;
+  std::vector<uint8_t> slim_flags;  // bit0: saw an infinite input (SUM double)
+  // kCountDistinctInt64 state: kSlimDistinctSlots inline int64 slots per
+  // (group, aggregate), the inline occupancy count, and a lazily materialized
+  // overflow set.  Slot stride is kSlimDistinctSlots * agg_stride.
+  std::vector<int64_t> slim_distinct;
+  std::vector<uint8_t> slim_distinct_n;
+  std::vector<std::unique_ptr<std::unordered_set<int64_t>>>
+      slim_distinct_overflow;
+  // Legacy layout (hatch only).
   std::vector<std::vector<Value>> group_keys;  // canonical key values
   std::vector<std::vector<AggregateAccumulator>> group_states;
+  // Flat layout: canonical keys in one contiguous vector, accumulators in
+  // fixed-size chunks (never moved, so no realloc transient).
+  std::vector<Value> flat_group_keys;
+  AccumulatorChunks chunked_states;
+  size_t key_stride{0};
+  size_t agg_stride{0};
+  size_t group_count{0};
+  // Per-aggregate classification shared by every FindOrInsert of this worker;
+  // null falls back to per-construction analysis.
+  const std::vector<AggregateAccumulator::Shape>* shapes{nullptr};
 
+  void Configure(bool flat, size_t keys_per_group,
+                 size_t aggregates_per_group) {
+    flat_layout = flat;
+    key_stride = keys_per_group;
+    agg_stride = aggregates_per_group;
+    chunked_states.Configure(std::max<size_t>(aggregates_per_group, 1));
+  }
+
+  void ConfigureSlim(const TypedAggregationPlan& plan) {
+    slim = plan.slim;
+    slim_kinds = &plan.slim_kinds;
+  }
+
+  // Slim state accessors for group g, aggregate i.
+  [[nodiscard]] int64_t& SlimCount(size_t g, size_t i) {
+    return slim_counts[(g * agg_stride) + i];
+  }
+  [[nodiscard]] int64_t& SlimIntTotal(size_t g, size_t i) {
+    return slim_int_totals[(g * agg_stride) + i];
+  }
+  [[nodiscard]] double& SlimDoubleTotal(size_t g, size_t i) {
+    return slim_double_totals[(g * agg_stride) + i];
+  }
+  [[nodiscard]] uint8_t& SlimFlags(size_t g, size_t i) {
+    return slim_flags[(g * agg_stride) + i];
+  }
+
+  // Inserts one int64/date distinct value for kCountDistinctInt64; false when
+  // it was already present.  Mirrors AggregateAccumulator::InsertDistinctInt.
+  bool SlimInsertDistinct(size_t g, size_t i, int64_t raw) {
+    const size_t state = (g * agg_stride) + i;
+    int64_t* slots = &slim_distinct[state * kSlimDistinctSlots];
+    const uint8_t n = slim_distinct_n[state];
+    for (size_t s = 0; s < n; ++s) {
+      if (slots[s] == raw) {
+        return false;
+      }
+    }
+    if (n < kSlimDistinctSlots) {
+      slots[n] = raw;
+      slim_distinct_n[state] = static_cast<uint8_t>(n + 1);
+      return true;
+    }
+    auto& overflow = slim_distinct_overflow[state];
+    if (!overflow) {
+      overflow = std::make_unique<std::unordered_set<int64_t>>();
+    }
+    return overflow->insert(raw).second;
+  }
+
+  // Distinct values seen so far for kCountDistinctInt64 (the value COUNT
+  // (DISTINCT) finishes to).
+  [[nodiscard]] size_t SlimDistinctTotal(size_t g, size_t i) const {
+    const size_t state = (g * agg_stride) + i;
+    size_t total = slim_distinct_n[state];
+    if (slim_distinct_overflow[state]) {
+      total += slim_distinct_overflow[state]->size();
+    }
+    return total;
+  }
+
+  [[nodiscard]] size_t GroupCount() const {
+    return flat_layout ? group_count : group_states.size();
+  }
+  [[nodiscard]] const Value& GroupKey(size_t group, size_t k) const {
+    if (flat_layout) {
+      return flat_group_keys[(group * key_stride) + k];
+    }
+    return group_keys[group][k];
+  }
+  [[nodiscard]] const AggregateAccumulator& State(size_t group,
+                                                  size_t i) const {
+    if (flat_layout) {
+      return chunked_states.State(group, i);
+    }
+    return group_states[group][i];
+  }
+  AggregateAccumulator& State(size_t group, size_t i) {
+    if (flat_layout) {
+      return chunked_states.State(group, i);
+    }
+    return group_states[group][i];
+  }
+
+ private:
+  // Slim group state grows in blocks of groups: one zeroing resize per block
+  // instead of one tail-insert per group.  Multi-million-group folds paid a
+  // vector::_M_fill_insert call (plus its capacity dance) per new group per
+  // array before, which callgrind put at ~7% of the fold.  Capacity is
+  // derived from the arrays themselves (not a separate counter), so the
+  // merge path's std::move adoption carries the padding along for free.
+  static constexpr size_t kSlimGroupBlock = 128;
+  void ReserveSlimBlock() {
+    const size_t stride = agg_stride;
+    const size_t have_groups = slim_counts.size() / stride;
+    if (group_count < have_groups) {
+      return;
+    }
+    const size_t groups = have_groups + kSlimGroupBlock;
+    const size_t cells = groups * stride;
+    slim_counts.resize(cells, 0);
+    slim_int_totals.resize(cells, 0);
+    slim_double_totals.resize(cells, 0.0);
+    slim_flags.resize(cells, 0);
+    if (std::ranges::any_of(*slim_kinds, [](SlimAggKind kind) {
+          return kind == SlimAggKind::kCountDistinctInt64;
+        })) {
+      slim_distinct.resize(cells * kSlimDistinctSlots, 0);
+      slim_distinct_n.resize(cells, 0);
+      slim_distinct_overflow.resize(cells);
+    }
+  }
+
+  void AppendGroup(const std::vector<Value>& canonical_keys,
+                   size_t aggregate_count,
+                   const std::vector<const AggregateExpression*>& aggregates) {
+    if (flat_layout) {
+      flat_group_keys.insert(flat_group_keys.end(), canonical_keys.begin(),
+                             canonical_keys.end());
+      if (!slim) {
+        chunked_states.AppendGroup(aggregates, shapes);
+      }
+    } else {
+      group_keys.push_back(canonical_keys);
+      group_states.emplace_back();
+      auto& states = group_states.back();
+      states.reserve(aggregate_count);
+      for (size_t i = 0; i < aggregate_count; ++i) {
+        if (shapes != nullptr) {
+          states.emplace_back(aggregates[i], (*shapes)[i]);
+        } else {
+          states.emplace_back(aggregates[i]);
+        }
+      }
+    }
+    if (slim) {
+      ReserveSlimBlock();
+    }
+    ++group_count;
+  }
+
+ public:
   size_t FindOrInsert(const std::vector<Value>& canonical_keys, int64_t raw_key,
                       size_t aggregate_count,
                       const std::vector<const AggregateExpression*>& aggregates,
@@ -3037,19 +4166,14 @@ struct TypedWorkerGroups {
     const bool use_int_key =
         int_key && !canonical_keys.empty() && !canonical_keys[0].IsNull();
     if (use_int_key) {
-      auto [iter, emplaced] =
-          int_index.try_emplace(raw_key, group_states.size());
+      bool emplaced = false;
+      size_t* slot = int_index.TryEmplace(raw_key, &emplaced);
       *inserted = emplaced;
       if (emplaced) {
-        group_keys.push_back(canonical_keys);
-        group_states.emplace_back();
-        auto& states = group_states.back();
-        states.reserve(aggregate_count);
-        for (const AggregateExpression* aggregate : aggregates) {
-          states.emplace_back(aggregate);
-        }
+        *slot = GroupCount();
+        AppendGroup(canonical_keys, aggregate_count, aggregates);
       }
-      return iter->second;
+      return *slot;
     }
     // Heterogeneous lookup: most rows land in an existing group, so probe
     // with the scratch key vector directly instead of paying a Row
@@ -3060,21 +4184,333 @@ struct TypedWorkerGroups {
       return found->second;
     }
     Row key(canonical_keys);
-    auto [iter, emplaced] =
-        row_index.try_emplace(std::move(key), group_states.size());
+    auto [iter, emplaced] = row_index.try_emplace(std::move(key), GroupCount());
     *inserted = emplaced;
     if (emplaced) {
-      group_keys.push_back(canonical_keys);
-      group_states.emplace_back();
-      auto& states = group_states.back();
-      states.reserve(aggregate_count);
-      for (const AggregateExpression* aggregate : aggregates) {
-        states.emplace_back(aggregate);
-      }
+      AppendGroup(canonical_keys, aggregate_count, aggregates);
     }
     return iter->second;
   }
+
+  // Raw-slot access for the arena fold fast path: the caller holds the raw
+  // int64 key, probes it directly, and builds canonical keys only on first
+  // insert.  Semantics identical to FindOrInsert's int-key branch (NULL keys
+  // never reach here; callers fall back to the Row path for those).
+  size_t* RawIntSlot(int64_t raw_key, bool* emplaced) {
+    return int_index.TryEmplace(raw_key, emplaced);
+  }
+  // Warms the group slot for a key that FindOrInsert/RawIntSlot will probe a
+  // few rows later; the intervening filter work hides the line fill.
+  void PrefetchGroupSlot(int64_t raw_key) const { int_index.Prefetch(raw_key); }
+  size_t ClaimSlotForNewGroup(
+      size_t* slot, const std::vector<Value>& canonical_keys,
+      size_t aggregate_count,
+      const std::vector<const AggregateExpression*>& aggregates) {
+    *slot = GroupCount();
+    AppendGroup(canonical_keys, aggregate_count, aggregates);
+    return *slot;
+  }
 };
+
+namespace {
+
+// Positional HAVING classification: `AGG op literal`, `literal op AGG`, or a
+// bare `AGG`, where AGG is one of the plan's aggregate nodes.  These shapes
+// cover the dominant HAVING forms (Q21's two `COUNT(DISTINCT ...) op n`
+// folds evaluate one per merged group); deciding them straight from the
+// finished values skips the per-group AggregateResultMap + Scope + expression
+// walk, which costs several allocations per group on multi-million-group
+// folds.  Anything else keeps the generic path.
+struct PositionalHaving {
+  size_t agg_index{0};
+  BinaryOperation op{BinaryOperation::kEquals};
+  Value constant;
+  bool has_constant{false};
+};
+
+BinaryOperation FlipHavingCompare(BinaryOperation operation) {
+  switch (operation) {
+    case BinaryOperation::kLessThan:
+      return BinaryOperation::kGreaterThan;
+    case BinaryOperation::kLessThanEquals:
+      return BinaryOperation::kGreaterThanEquals;
+    case BinaryOperation::kGreaterThan:
+      return BinaryOperation::kLessThan;
+    case BinaryOperation::kGreaterThanEquals:
+      return BinaryOperation::kLessThanEquals;
+    default:
+      return operation;
+  }
+}
+
+std::optional<PositionalHaving> TryCompilePositionalHaving(
+    const Expression& having,
+    const std::vector<TypedAggregateInput>& aggregates) {
+  if (!having) {
+    return std::nullopt;
+  }
+  const bool is_binary = having->Type() == TypeTag::kBinaryExp;
+  if (!is_binary) {
+    // Bare `HAVING AGG`: truthy test on the finished value.
+    if (having->Type() != TypeTag::kAggregateExp) {
+      return std::nullopt;
+    }
+    const AggregateExpression* aggregate = &having->AsAggregateExpression();
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      if (aggregates[i].aggregate == aggregate) {
+        PositionalHaving compiled;
+        compiled.agg_index = i;
+        compiled.has_constant = false;
+        return compiled;
+      }
+    }
+    return std::nullopt;
+  }
+  const BinaryExpression& binary = having->AsBinaryExpression();
+  if (!IsComparison(binary.Op())) {
+    return std::nullopt;
+  }
+  const Expression lhs = binary.Left();
+  const Expression rhs = binary.Right();
+  const AggregateExpression* aggregate = nullptr;
+  bool agg_on_right = false;
+  if (lhs && lhs->Type() == TypeTag::kAggregateExp) {
+    aggregate = &lhs->AsAggregateExpression();
+  } else if (rhs && rhs->Type() == TypeTag::kAggregateExp) {
+    aggregate = &rhs->AsAggregateExpression();
+    agg_on_right = true;
+  } else {
+    return std::nullopt;
+  }
+  const Expression& other = agg_on_right ? lhs : rhs;
+  if (!other || other->Type() != TypeTag::kConstantValue) {
+    return std::nullopt;
+  }
+  size_t index = aggregates.size();
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    if (aggregates[i].aggregate == aggregate) {
+      index = i;
+      break;
+    }
+  }
+  if (index == aggregates.size()) {
+    return std::nullopt;
+  }
+  PositionalHaving compiled;
+  compiled.agg_index = index;
+  compiled.op = agg_on_right ? FlipHavingCompare(binary.Op()) : binary.Op();
+  compiled.constant = other->AsConstantValue().GetValue();
+  compiled.has_constant = true;
+  return compiled;
+}
+
+}  // namespace
+
+// One (group, aggregate) slim-state update for an already-resolved input
+// value.  Shared by the Row-based accumulate loop and the cached-arena fold
+// fast path so the two can never drift; false (with *error set) on a raise.
+// A null `value` is the COUNT(*) sentinel and always counts.
+bool ApplySlimValue(TypedWorkerGroups* local, size_t group_index, size_t i,
+                    SlimAggKind kind, const Value* value, Status* error) {
+  if (kind == SlimAggKind::kCount) {
+    // COUNT(*): value == nullptr counts every surviving row; COUNT(expr)
+    // skips NULLs exactly like the streaming accumulator.
+    if (value == nullptr || !value->IsNull()) {
+      ++local->SlimCount(group_index, i);
+    }
+    return true;
+  }
+  if (value == nullptr || value->IsNull()) {
+    return true;
+  }
+  if (kind == SlimAggKind::kCountDistinctInt64) {
+    // NULL inputs never enter the set (mirrored by the skip above); the
+    // running count stays 0 because the finish derives the cardinality from
+    // the inline occupancy and the overflow set.
+    if (value->type == ValueType::kInt64 || value->type == ValueType::kDate) {
+      static_cast<void>(
+          local->SlimInsertDistinct(group_index, i, value->value.int_value));
+      return true;
+    }
+    *error = StatusError(StatusCode::kInvalidArgument,
+                         "slim COUNT(DISTINCT) input type mismatch");
+    return false;
+  }
+  switch (kind) {
+    case SlimAggKind::kSumInt64: {
+      if (value->type != ValueType::kInt64 || value->IsUnsigned()) {
+        *error = StatusError(StatusCode::kInvalidArgument,
+                             "slim SUM input type mismatch");
+        return false;
+      }
+      int64_t updated = 0;
+      if (__builtin_add_overflow(local->SlimIntTotal(group_index, i),
+                                 value->value.int_value, &updated)) {
+        *error =
+            StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+        return false;
+      }
+      local->SlimIntTotal(group_index, i) = updated;
+      ++local->SlimCount(group_index, i);
+      return true;
+    }
+    case SlimAggKind::kSumDouble: {
+      if (value->type != ValueType::kDouble) {
+        *error = StatusError(StatusCode::kInvalidArgument,
+                             "slim SUM input type mismatch");
+        return false;
+      }
+      if (std::isinf(value->value.double_value)) {
+        local->SlimFlags(group_index, i) |= 1;
+      }
+      local->SlimDoubleTotal(group_index, i) += value->value.double_value;
+      ++local->SlimCount(group_index, i);
+      return true;
+    }
+    case SlimAggKind::kAvgDouble: {
+      // AVG(INT64) sums through a double intermediate, so INT64
+      // overflow never applies here (mirrors TryApplyCore).
+      double addend = 0.0;
+      if (value->type == ValueType::kDouble) {
+        addend = value->value.double_value;
+      } else if (value->type == ValueType::kInt64) {
+        addend = value->IsUnsigned()
+                     ? static_cast<double>(
+                           static_cast<uint64_t>(value->value.int_value))
+                     : static_cast<double>(value->value.int_value);
+      } else {
+        *error = StatusError(StatusCode::kInvalidArgument,
+                             "slim AVG input type mismatch");
+        return false;
+      }
+      local->SlimDoubleTotal(group_index, i) += addend;
+      ++local->SlimCount(group_index, i);
+      return true;
+    }
+    default:
+      *error = StatusError(StatusCode::kInvalidArgument,
+                           "aggregate has no slim state");
+      return false;
+  }
+}
+
+// Per-morsel cache-fill buffer owned by a scan worker.  Rows land in the
+// worker's vector (published in morsel order later); fixed-width fills also
+// append row-major int64 cells + null bytes so the published cache gets its
+// int64 arena mirror without per-row work under the publish lock.  The typed
+// fill instead decodes straight into `mirror` (same arena layout, no Rows).
+struct MorselFillBuffer {
+  std::vector<Row> rows;
+  size_t arena_stride{0};  // 0 = no arena mirror for this morsel.
+  std::vector<int64_t> arena_cells;
+  std::vector<uint8_t> arena_nulls;
+  // Cells actually written (arena_cells/arena_nulls grow geometrically and
+  // are cut to this length at publish, keeping the rows*stride == cells.size
+  // invariant while skipping the per-row zeroing resize).
+  size_t arena_used{0};
+  // Typed-fill mirror (rows without Row objects); published through
+  // BaseRelationArena::AppendTyped.
+  BaseRelationArena mirror;
+};
+
+// Appends a decoded TypedCellBatch range (all columns, kept or filtered rows —
+// cache fills are unfiltered) into an arena run: null bytes fold into the
+// per-column bitmaps, cells copy verbatim, varchar bytes extend the run's
+// byte arenas with offset-adjusted end marks.
+void AppendBatchToArena(const TypedCellBatch& batch, size_t first_row,
+                        size_t run_rows, BaseRelationArena* arena) {
+  if (run_rows == 0) {
+    return;
+  }
+  const size_t stride = arena->stride;
+  const size_t first = arena->rows;
+  arena->cells.insert(
+      arena->cells.end(),
+      batch.cells.begin() + static_cast<std::ptrdiff_t>(first_row * stride),
+      batch.cells.begin() +
+          static_cast<std::ptrdiff_t>((first_row + run_rows) * stride));
+  for (size_t c = 0; c < stride; ++c) {
+    auto& bits = arena->null_bits[c];
+    bits.resize(((first + run_rows - 1) >> 6) + 1, 0);
+    for (size_t r = 0; r < run_rows; ++r) {
+      if (batch.nulls[((first_row + r) * stride) + c] != 0) {
+        const size_t row = first + r;
+        bits[row >> 6] |= uint64_t{1} << (row & 63);
+      }
+    }
+  }
+  size_t varchar_slot = 0;
+  for (size_t c = 0; c < stride; ++c) {
+    if (arena->slot_types[c] != ValueType::kVarChar) {
+      continue;
+    }
+    BaseRelationArena::VarcharRun& run = arena->varchars[varchar_slot];
+    const std::vector<uint32_t>& batch_ends = batch.varchar_ends[varchar_slot];
+    const auto run_bytes = static_cast<uint32_t>(run.bytes.size());
+    const uint32_t batch_prefix =
+        first_row == 0 ? 0U : batch_ends[first_row - 1];
+    run.bytes.insert(run.bytes.end(),
+                     batch.varchar_bytes[varchar_slot].begin() + batch_prefix,
+                     batch.varchar_bytes[varchar_slot].begin() +
+                         batch_ends[first_row + run_rows - 1]);
+    run.ends.reserve(run.ends.size() + run_rows);
+    for (size_t r = 0; r < run_rows; ++r) {
+      run.ends.push_back(run_bytes +
+                         (batch_ends[first_row + r] - batch_prefix));
+    }
+    ++varchar_slot;
+  }
+  arena->rows += run_rows;
+}
+
+// Typed cell value for the arena fold: the payload layout follows the slot
+// type (DOUBLE bit-casts through the int64 cell; VARCHAR slots never reach
+// this helper on the raw-cell paths because their folds need byte strings).
+inline Value ArenaCellValue(const BaseRelationArena& arena,
+                            const int64_t* cells, size_t column,
+                            const Schema& schema) {
+  Value value;
+  const ValueType type = arena.slot_types.size() == arena.stride
+                             ? arena.slot_types[column]
+                             : schema.GetColumn(column).Type();
+  value.type = type;
+  if (type == ValueType::kDouble) {
+    value.value.double_value = std::bit_cast<double>(cells[column]);
+  } else {
+    value.value.int_value = cells[column];
+  }
+  return value;
+}
+
+// MaterializeArenaRange and MaterializeCacheRowsIfNeeded live in
+// subquery_runtime.cpp next to the arena they serve.
+
+// Appends one decoded row to the morsel fill buffer (Row + optional arena
+// mirror).  `row` must not be touched afterwards when !fill_copy (the row
+// moves).
+template <typename RowLike>
+void AppendFillRow(RowLike&& row, MorselFillBuffer* fill, bool fill_copy) {
+  if (fill->arena_stride != 0) {
+    const size_t width = fill->arena_stride;
+    const size_t base = fill->arena_used;
+    if (base + width > fill->arena_cells.size()) {
+      const size_t grown = std::max(base + width, fill->arena_cells.size() * 2);
+      fill->arena_cells.resize(grown, 0);
+      fill->arena_nulls.resize(grown, 0);
+    }
+    for (size_t c = 0; c < width && c < row.values_.size(); ++c) {
+      const Value& value = row.values_[c];
+      fill->arena_cells[base + c] = value.value.int_value;
+      fill->arena_nulls[base + c] = value.IsNull() ? 1 : 0;
+    }
+    fill->arena_used = base + width;
+  }
+  if (fill_copy) {
+    fill->rows.emplace_back(row);
+  } else {
+    fill->rows.push_back(std::forward<RowLike>(row));
+  }
+}
 
 StatusOr<Relation> RunTypedParallelStreamAggregate(
     TransactionContext& context, const SelectStatement& stmt,
@@ -3095,6 +4531,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
            ValueType::kInt64 ||
        qualified_schema.GetColumn(plan.key_offsets[0]).Type() ==
            ValueType::kDate);
+  // Slot -> VARCHAR-ordinal map for the cell fold (SIZE_MAX = fixed-width
+  // slot); filled by the arena setup below.
+  std::vector<size_t> varchar_ordinal;
   // Peek compares pre-reject rows inside the scan; they must be disabled
   // while filling the shared cache, whose contract is unfiltered rows.
   const std::optional<std::vector<slot_t>> projection_opt =
@@ -3104,10 +4543,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // Shared base-relation cache: fill on miss (unfiltered rows, per the
   // BaseRelationCacheKey contract), aggregate from it on hit.
   std::shared_ptr<Relation> cached_relation;
+  std::shared_ptr<const BaseRelationArena> fold_arena;
+  std::string fold_cache_key;
   if (reusable && runtime != nullptr) {
-    const std::string cache_key = BaseRelationCacheKey(
+    fold_cache_key = BaseRelationCacheKey(
         table_name, projection.empty() ? nullptr : &projection);
-    auto found = runtime->base_relations.find(cache_key);
+    auto found = runtime->base_relations.find(fold_cache_key);
     if (found != runtime->base_relations.end()) {
       cached_relation = found->second;
       ++runtime->base_scan_cache_hits;
@@ -3119,20 +4560,99 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       cached_relation == nullptr && reusable && runtime != nullptr;
   const std::vector<IntegerPeekCompare>* peek_ptr =
       fill_cache || peek_compares.empty() ? nullptr : &peek_compares;
+  // A/B hatch: TINYLAMB_DISABLE_FILL_COPY=1 restores move-append into the
+  // cache-fill buffer.  Copying FIXED-WIDTH fills keeps the scan iterator's
+  // decode buffer alive (no per-row vector reallocation for 6M+ rows), the
+  // same trade ParallelScan makes for its chunk appends; VARCHAR/ARRAY cells
+  // keep the move so long text never deep-copies.
+  static const bool fill_copy_disabled =
+      std::getenv("TINYLAMB_DISABLE_FILL_COPY") != nullptr;
+  bool fill_copy = !fill_copy_disabled;
+  for (slot_t i = 0; i < qualified_schema.ColumnCount(); ++i) {
+    const ValueType type = qualified_schema.GetColumn(i).Type();
+    if (type == ValueType::kVarChar || type == ValueType::kArray) {
+      fill_copy = false;
+      break;
+    }
+  }
 
-  const auto accumulate_row =
-      [&](const Row& row, TypedWorkerGroups* local, Status* error,
-          size_t* rows_output, size_t* updates, std::vector<Row>* fill_buffer,
-          std::vector<Value>* scratch) -> void {
+  const auto accumulate_row = [&](auto&& row, TypedWorkerGroups* local,
+                                  Status* error, size_t* rows_output,
+                                  size_t* updates, MorselFillBuffer* fill,
+                                  std::vector<Value>* scratch) -> void {
     // Cache fills must capture UNFILTERED rows (BaseRelationCacheKey
     // contract): every consumer, including this statement, applies its own
-    // predicates while reading or aggregating.
-    if (fill_buffer != nullptr) {
-      fill_buffer->push_back(row);
+    // predicates while reading or aggregating.  The fill below MOVES the row
+    // instead of copying it (the copy dominated cache-fill time for the
+    // multi-million-row base relations behind Q18/Q21); every read of `row`
+    // therefore has to happen before the move.  A raise that skips the fill
+    // is unobservable: the cache is only published after a fully successful
+    // run.
+    // Warms the int-key group slot while the filter work below runs; the key
+    // cell was just decoded, so reading it here is free and the slot line is
+    // resident by the time FindOrInsert probes.
+    if (int_key && !plan.key_offsets.empty() && local != nullptr) {
+      const Value& key_cell = row[plan.key_offsets[0]];
+      if (!key_cell.IsNull()) {
+        local->PrefetchGroupSlot(key_cell.value.int_value);
+      }
     }
     bool keep = true;
+    for (const TypedFilterCompare& compare : plan.filter_compares) {
+      const Value& left = row[compare.left];
+      if (compare.constant_payload) {
+        if (left.IsNull() || !DecideTypedFilterCompare(left, left, compare)) {
+          keep = false;
+          break;
+        }
+        continue;
+      }
+      const Value& right = row[compare.right];
+      if (left.IsNull() || right.IsNull() ||
+          !DecideTypedFilterCompare(left, right, compare)) {
+        keep = false;
+        break;
+      }
+    }
+    if (keep) {
+      for (const TypedInListCompare& list : plan.inlist_compares) {
+        const Value& cell = row[list.column];
+        if (cell.IsNull()) {
+          keep = false;
+          break;
+        }
+        bool matched = false;
+        if (list.is_string) {
+          const std::string_view v = cell.value.varchar_value;
+          for (const std::string& item : list.strings) {
+            if (v == std::string_view(item)) {
+              matched = true;
+              break;
+            }
+          }
+        } else if (list.is_double) {
+          for (const double item : list.double_values) {
+            if (cell.value.double_value == item) {
+              matched = true;
+              break;
+            }
+          }
+        } else {
+          for (const int64_t item : list.int_values) {
+            if (cell.value.int_value == item) {
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (!matched) {
+          keep = false;
+          break;
+        }
+      }
+    }
     for (const BytecodeProgram& program : plan.filter_programs) {
-      StatusOr<Value> decided = program.TryEvaluateRow(row);
+      StatusOr<Value> decided = TryEvaluateRowAuto(program, row);
       if (!decided.HasValue()) {
         *error = decided.GetStatus();
         return;
@@ -3143,29 +4663,77 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       }
     }
     if (!keep) {
+      if (fill != nullptr) {
+        AppendFillRow(row, fill, fill_copy);
+      }
       return;
     }
     ++*rows_output;
-    scratch->clear();
-    int64_t raw_key = 0;
-    for (const slot_t offset : plan.key_offsets) {
-      scratch->push_back(CanonicalDistinctValue(row[offset]));
-      if (scratch->size() == 1 && int_key) {
-        raw_key = row[offset].value.int_value;
-      }
-    }
     bool inserted = false;
-    const size_t group_index =
-        local->FindOrInsert(*scratch, raw_key, plan.aggregates.size(),
-                            aggregate_expressions, &inserted);
-    auto& states = local->group_states[group_index];
+    size_t group_index = 0;
+    // Int-key fast path: probe the raw slot with the cell value directly and
+    // build canonical keys only when a new group actually opens.  The hit
+    // path (the overwhelmingly common case on multi-million-row folds) then
+    // constructs no Value at all for the group key.
+    if (int_key && !plan.key_offsets.empty() &&
+        !row[plan.key_offsets[0]].IsNull()) {
+      const Value& key_cell = row[plan.key_offsets[0]];
+      size_t* slot = local->RawIntSlot(key_cell.value.int_value, &inserted);
+      if (inserted) {
+        scratch->clear();
+        scratch->push_back(CanonicalDistinctValue(key_cell));
+        group_index = local->ClaimSlotForNewGroup(
+            slot, *scratch, plan.aggregates.size(), aggregate_expressions);
+      } else {
+        group_index = *slot;
+      }
+    } else {
+      scratch->clear();
+      int64_t raw_key = 0;
+      for (const slot_t offset : plan.key_offsets) {
+        scratch->push_back(CanonicalDistinctValue(row[offset]));
+        if (scratch->size() == 1 && int_key) {
+          raw_key = row[offset].value.int_value;
+        }
+      }
+      group_index =
+          local->FindOrInsert(*scratch, raw_key, plan.aggregates.size(),
+                              aggregate_expressions, &inserted);
+    }
     // Counted per worker and folded into the shared runtime stat after the
     // join: multiple workers racing on the plain counter is a data race.
     ++*updates;
+    if (local->slim) {
+      for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+        const TypedAggregateInput& input = plan.aggregates[i];
+        const Value* value = nullptr;
+        Value evaluated;
+        if (input.column.has_value()) {
+          value = &row[*input.column];
+        } else if (input.child.has_value()) {
+          StatusOr<Value> child_value = TryEvaluateRowAuto(*input.child, row);
+          if (!child_value.HasValue()) {
+            *error = child_value.GetStatus();
+            return;
+          }
+          evaluated = child_value.MoveValue();
+          value = &evaluated;
+        }
+        if (!ApplySlimValue(local, group_index, i, (*local->slim_kinds)[i],
+                            value, error)) {
+          return;
+        }
+      }
+      if (fill != nullptr) {
+        AppendFillRow(row, fill, fill_copy);
+      }
+      return;
+    }
     for (size_t i = 0; i < plan.aggregates.size(); ++i) {
       const TypedAggregateInput& input = plan.aggregates[i];
+      AggregateAccumulator& accumulator = local->State(group_index, i);
       if (input.column.has_value()) {
-        if (Status st = states[i].Add(row[*input.column]);
+        if (Status st = accumulator.Add(row[*input.column]);
             st != Status::kSuccess) {
           *error = st;
           return;
@@ -3174,18 +4742,280 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       }
       if (!input.child.has_value()) {
         // COUNT(*).
-        if (Status st = states[i].Add(Value(1)); st != Status::kSuccess) {
+        if (Status st = accumulator.Add(Value(1)); st != Status::kSuccess) {
           *error = st;
           return;
         }
         continue;
       }
-      StatusOr<Value> value = input.child->TryEvaluateRow(row);
+      StatusOr<Value> value = TryEvaluateRowAuto(*input.child, row);
       if (!value.HasValue()) {
         *error = value.GetStatus();
         return;
       }
-      if (Status st = states[i].Add(value.Value()); st != Status::kSuccess) {
+      if (Status st = accumulator.Add(value.Value()); st != Status::kSuccess) {
+        *error = st;
+        return;
+      }
+    }
+    if (fill != nullptr) {
+      AppendFillRow(row, fill, fill_copy);
+    }
+  };
+
+  // Typed-fill fold: one decoded cell row of a TypedCellBatch through the
+  // same filter/key/slim ladder as accumulate_row above, never constructing a
+  // Row.  `mirror` (per-morsel arena run) receives every row, filtered or
+  // not — cache fills capture UNFILTERED rows (BaseRelationCacheKey
+  // contract).  Declined shapes keep the Row loop above; the value contracts
+  // (canonical keys, NULL handling, slim kinds) are shared helpers, so the
+  // two paths cannot drift semantically.
+  const auto fold_cell_row = [&](const TypedCellBatch& batch, size_t r,
+                                 TypedWorkerGroups* local, Status* error,
+                                 size_t* rows_output, size_t* updates,
+                                 std::vector<Value>* scratch,
+                                 std::array<Value, 8>* row_values) -> void {
+    const size_t base = r * batch.stride;
+    const auto make_value = [&](slot_t c) {
+      Value value;
+      switch (batch.slot_types[c]) {
+        case ValueType::kDouble:
+          value.type = ValueType::kDouble;
+          value.value.double_value =
+              std::bit_cast<double>(batch.cells[base + c]);
+          break;
+        case ValueType::kVarChar:
+          // Probe-only view into the batch; copies become owned (Value copy
+          // ctor) the moment a key or accumulator retains one.
+          value.type = ValueType::kVarChar;
+          value.value.varchar_value = batch.Varchar(r, varchar_ordinal[c]);
+          break;
+        default:
+          value.type = batch.slot_types[c];
+          value.value.int_value = batch.cells[base + c];
+          break;
+      }
+      return value;
+    };
+    const auto is_null = [&](slot_t c) { return batch.nulls[base + c] != 0; };
+    bool keep = true;
+    for (const TypedFilterCompare& compare : plan.filter_compares) {
+      if (is_null(compare.left)) {
+        keep = false;
+        break;
+      }
+      Value left = make_value(compare.left);
+      if (compare.constant_payload) {
+        if (!DecideTypedFilterCompare(left, left, compare)) {
+          keep = false;
+          break;
+        }
+        continue;
+      }
+      if (is_null(compare.right)) {
+        keep = false;
+        break;
+      }
+      Value right = make_value(compare.right);
+      if (!DecideTypedFilterCompare(left, right, compare)) {
+        keep = false;
+        break;
+      }
+    }
+    if (keep) {
+      for (const TypedInListCompare& list : plan.inlist_compares) {
+        if (is_null(list.column)) {
+          keep = false;
+          break;
+        }
+        bool matched = false;
+        if (list.is_string) {
+          const std::string_view v =
+              make_value(list.column).value.varchar_value;
+          for (const std::string& item : list.strings) {
+            if (v == std::string_view(item)) {
+              matched = true;
+              break;
+            }
+          }
+        } else if (list.is_double) {
+          const double v = make_value(list.column).value.double_value;
+          for (const double item : list.double_values) {
+            if (v == item) {
+              matched = true;
+              break;
+            }
+          }
+        } else {
+          const int64_t v = batch.cells[base + list.column];
+          for (const int64_t item : list.int_values) {
+            if (v == item) {
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (!matched) {
+          keep = false;
+          break;
+        }
+      }
+    }
+    if (!keep) {
+      return;
+    }
+    ++*rows_output;
+    bool inserted = false;
+    size_t group_index = 0;
+    if (int_key && !plan.key_offsets.empty() && !is_null(plan.key_offsets[0])) {
+      const int64_t raw_key = batch.cells[base + plan.key_offsets[0]];
+      size_t* slot = local->RawIntSlot(raw_key, &inserted);
+      if (inserted) {
+        scratch->clear();
+        for (const slot_t offset : plan.key_offsets) {
+          scratch->push_back(CanonicalDistinctValue(make_value(offset)));
+        }
+        group_index = local->ClaimSlotForNewGroup(
+            slot, *scratch, plan.aggregates.size(), aggregate_expressions);
+      } else {
+        group_index = *slot;
+      }
+    } else {
+      scratch->clear();
+      int64_t raw_key = 0;
+      for (const slot_t offset : plan.key_offsets) {
+        if (is_null(offset)) {
+          scratch->emplace_back();
+        } else {
+          scratch->push_back(CanonicalDistinctValue(make_value(offset)));
+        }
+        if (scratch->size() == 1 && int_key) {
+          raw_key = scratch->back().value.int_value;
+        }
+      }
+      group_index =
+          local->FindOrInsert(*scratch, raw_key, plan.aggregates.size(),
+                              aggregate_expressions, &inserted);
+    }
+    ++*updates;
+    if (local->slim) {
+      // Raw-cell fast path: every slim kind reads at most one column cell,
+      // so the common payload kinds (COUNT / SUM / AVG / COUNT(DISTINCT)
+      // over fixed-width cells) fold straight from batch.cells without
+      // boxing a Value per input.  NULL inputs skip exactly like the generic
+      // path (ApplySlimValue returns early on IsNull for every kind); a kind
+      // or cell type the raw switch does not cover falls through to the
+      // generic boxed call, which raises the same type-mismatch errors.
+      const std::vector<SlimAggKind>& kinds = *local->slim_kinds;
+      std::array<Value, 8>& stack_values = *row_values;
+      for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+        const TypedAggregateInput& input = plan.aggregates[i];
+        const SlimAggKind kind = kinds[i];
+        if (!input.column.has_value()) {
+          // COUNT(*) (the only no-column slim input) counts unconditionally;
+          // any other shape keeps the generic nullptr sentinel path.
+          if (kind == SlimAggKind::kCount) {
+            ++local->SlimCount(group_index, i);
+            continue;
+          }
+          if (!ApplySlimValue(local, group_index, i, kind, nullptr, error)) {
+            return;
+          }
+          continue;
+        }
+        const slot_t column = *input.column;
+        if (is_null(column)) {
+          continue;
+        }
+        const ValueType cell_type = batch.slot_types[column];
+        const int64_t cell = batch.cells[base + column];
+        bool handled = true;
+        switch (kind) {
+          case SlimAggKind::kCount:
+            ++local->SlimCount(group_index, i);
+            break;
+          case SlimAggKind::kSumInt64:
+            if (cell_type == ValueType::kInt64 &&
+                !batch.slot_unsigned[column]) {
+              int64_t updated = 0;
+              if (__builtin_add_overflow(local->SlimIntTotal(group_index, i),
+                                         cell, &updated)) {
+                *error = StatusError(StatusCode::kIsInfinity,
+                                     "integer overflow in SUM");
+                return;
+              }
+              local->SlimIntTotal(group_index, i) = updated;
+              ++local->SlimCount(group_index, i);
+            } else {
+              handled = false;
+            }
+            break;
+          case SlimAggKind::kSumDouble:
+            if (cell_type == ValueType::kDouble) {
+              const auto addend = std::bit_cast<double>(cell);
+              if (std::isinf(addend)) {
+                local->SlimFlags(group_index, i) |= 1;
+              }
+              local->SlimDoubleTotal(group_index, i) += addend;
+              ++local->SlimCount(group_index, i);
+            } else {
+              handled = false;
+            }
+            break;
+          case SlimAggKind::kAvgDouble:
+            if (cell_type == ValueType::kDouble) {
+              local->SlimDoubleTotal(group_index, i) +=
+                  std::bit_cast<double>(cell);
+              ++local->SlimCount(group_index, i);
+            } else if (cell_type == ValueType::kInt64) {
+              local->SlimDoubleTotal(group_index, i) +=
+                  batch.slot_unsigned[column]
+                      ? static_cast<double>(static_cast<uint64_t>(cell))
+                      : static_cast<double>(cell);
+              ++local->SlimCount(group_index, i);
+            } else {
+              handled = false;
+            }
+            break;
+          case SlimAggKind::kCountDistinctInt64:
+            if (cell_type == ValueType::kInt64 ||
+                cell_type == ValueType::kDate) {
+              static_cast<void>(
+                  local->SlimInsertDistinct(group_index, i, cell));
+            } else {
+              handled = false;
+            }
+            break;
+          default:
+            handled = false;
+            break;
+        }
+        if (handled) {
+          continue;
+        }
+        stack_values[i] = make_value(column);
+        if (!ApplySlimValue(local, group_index, i, kind, &stack_values[i],
+                            error)) {
+          return;
+        }
+      }
+      return;
+    }
+    for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+      const TypedAggregateInput& input = plan.aggregates[i];
+      AggregateAccumulator& accumulator = local->State(group_index, i);
+      if (input.column.has_value()) {
+        const Value value =
+            is_null(*input.column) ? Value() : make_value(*input.column);
+        if (Status st = accumulator.Add(value); st != Status::kSuccess) {
+          *error = st;
+          return;
+        }
+        continue;
+      }
+      // COUNT(*): the typed fill declines expression aggregates, so a
+      // column-less input here is exactly COUNT(*).
+      if (Status st = accumulator.Add(Value(1)); st != Status::kSuccess) {
         *error = st;
         return;
       }
@@ -3198,7 +5028,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // per worker in flight (never the whole table twice).
   std::mutex publish_mutex;
   size_t next_to_publish = 0;
-  std::map<size_t, std::vector<Row>> pending_publish;
+  std::map<size_t, MorselFillBuffer> pending_publish;
+  // Rows landed in the published cache (Row-fill appends plus typed-fill
+  // mirrors) — the arena registration guard compares against this, because a
+  // typed fill publishes no Rows at all.
+  size_t published_rows = 0;
   // Owned unconditionally while filling so an error return frees the rows.
   std::shared_ptr<Relation> cache_owner(fill_cache ? new Relation(runtime)
                                                    : nullptr);
@@ -3206,17 +5040,110 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   if (cache_target != nullptr) {
     cache_target->schema = qualified_schema;
   }
-  const auto publish_morsel = [&](size_t morsel, std::vector<Row>* buffer) {
+  // A/B hatch: TINYLAMB_DISABLE_AGG_ARENA=1 keeps the cache Row-only.  The
+  // arena mirrors the rows with schema-typed cells (INT64/DATE/DOUBLE as
+  // 8-byte payloads, VARCHAR bytes in per-slot arenas) so the typed fold's
+  // cache-hit pass can stream cells without visiting per-Row heap blocks
+  // (Q18/Q21's multi-million-row folds).
+  static const bool arena_disabled =
+      std::getenv("TINYLAMB_DISABLE_AGG_ARENA") != nullptr;
+  std::shared_ptr<BaseRelationArena> fill_arena;
+  std::vector<int64_t> arena_cell_buffer;
+  std::vector<char> arena_null_buffer;
+  // Typed fill (TINYLAMB_TYPED_FILL=1): the scan decodes schema-typed cell
+  // batches instead of Rows, the fold consumes raw cells, and the cache is
+  // published with the arena only (rows are materialized from it on demand by
+  // consumers that cannot take the arena path).  Declined when the plan needs
+  // Row-shaped inputs: residual filter programs or expression aggregates.
+  static const bool typed_fill_enabled =
+      std::getenv("TINYLAMB_DISABLE_TYPED_FILL") == nullptr;
+  bool typed_fill = false;
+  if (fill_cache && !arena_disabled) {
+    bool all_typed = qualified_schema.ColumnCount() > 0;
+    for (slot_t i = 0; i < qualified_schema.ColumnCount(); ++i) {
+      const ValueType type = qualified_schema.GetColumn(i).Type();
+      if (type != ValueType::kInt64 && type != ValueType::kDate &&
+          type != ValueType::kDouble && type != ValueType::kVarChar) {
+        all_typed = false;
+        break;
+      }
+    }
+    if (all_typed) {
+      fill_arena = std::make_shared<BaseRelationArena>();
+      fill_arena->stride = qualified_schema.ColumnCount();
+      fill_arena->slot_types.reserve(fill_arena->stride);
+      size_t varchar_count = 0;
+      for (slot_t i = 0; i < qualified_schema.ColumnCount(); ++i) {
+        const ValueType type = qualified_schema.GetColumn(i).Type();
+        fill_arena->slot_types.push_back(type);
+        if (type == ValueType::kVarChar) {
+          ++varchar_count;
+        }
+      }
+      fill_arena->null_bits.resize(fill_arena->stride);
+      fill_arena->varchars.resize(varchar_count);
+      arena_cell_buffer.resize(fill_arena->stride);
+      arena_null_buffer.resize(fill_arena->stride);
+      varchar_ordinal.assign(fill_arena->stride, SIZE_MAX);
+      size_t varchar_ordinal_next = 0;
+      for (size_t i = 0; i < fill_arena->stride; ++i) {
+        if (fill_arena->slot_types[i] == ValueType::kVarChar) {
+          varchar_ordinal[i] = varchar_ordinal_next++;
+        }
+      }
+      typed_fill = typed_fill_enabled && plan.filter_programs.empty();
+      if (typed_fill) {
+        for (const TypedAggregateInput& input : plan.aggregates) {
+          if (input.child.has_value()) {
+            typed_fill = false;  // expression aggregates need Rows.
+            break;
+          }
+        }
+      }
+    }
+  }
+  const auto publish_morsel = [&](size_t morsel, MorselFillBuffer* buffer) {
     std::scoped_lock lock(publish_mutex);
+    // Cut the geometric arena buffers to the written length so the
+    // rows*stride == cells.size invariant below holds exactly.
+    buffer->arena_cells.resize(buffer->arena_used);
+    buffer->arena_nulls.resize(buffer->arena_used);
     pending_publish.emplace(morsel, std::move(*buffer));
-    buffer->clear();
-    buffer->shrink_to_fit();
+    buffer->rows.clear();
+    buffer->rows.shrink_to_fit();
+    buffer->arena_cells.clear();
+    buffer->arena_cells.shrink_to_fit();
+    buffer->arena_nulls.clear();
+    buffer->arena_nulls.shrink_to_fit();
     while (pending_publish.contains(next_to_publish)) {
       auto node = pending_publish.extract(next_to_publish);
       // Plain push_back: repeated exact reserves would move every existing
       // row per morsel (quadratic).  Geometric growth moves are cheap.
-      for (Row& row : node.mapped()) {
+      for (Row& row : node.mapped().rows) {
         cache_target->rows.push_back(std::move(row));
+      }
+      published_rows += node.mapped().rows.size();
+      // Splice the morsel's arena mirror (bulk memcpy, still row order); a
+      // layout mismatch drops the mirror — the registration guard keeps an
+      // unusable partial out of the runtime map.
+      if (fill_arena != nullptr) {
+        if (node.mapped().mirror.rows > 0) {
+          if (node.mapped().mirror.stride == fill_arena->stride &&
+              node.mapped().mirror.slot_types == fill_arena->slot_types) {
+            fill_arena->AppendTyped(node.mapped().mirror);
+            published_rows += node.mapped().mirror.rows;
+          } else {
+            fill_arena.reset();
+          }
+        } else if (node.mapped().arena_stride == fill_arena->stride &&
+                   node.mapped().rows.size() * fill_arena->stride ==
+                       node.mapped().arena_cells.size()) {
+          fill_arena->AppendRun(node.mapped().arena_cells.data(),
+                                node.mapped().arena_nulls.data(),
+                                node.mapped().rows.size());
+        } else if (node.mapped().arena_stride != 0) {
+          fill_arena.reset();
+        }
       }
       ++next_to_publish;
     }
@@ -3228,27 +5155,276 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   if (worker_count < 2) {
     worker_count = 1;
   }
+  // The per-aggregate classification (array element type, SUM column-name
+  // scan) is identical for every group of every worker; derive it once.
+  std::vector<AggregateAccumulator::Shape> aggregate_shapes;
+  aggregate_shapes.reserve(aggregate_expressions.size());
+  for (const AggregateExpression* aggregate : aggregate_expressions) {
+    aggregate_shapes.push_back(
+        AggregateAccumulator::AnalyzeShape(aggregate, nullptr));
+  }
+  // A/B hatch: TINYLAMB_DISABLE_FLAT_GROUP_FOLD=1 restores the per-group
+  // vector-of-vector group storage.
+  static const bool flat_fold_disabled =
+      std::getenv("TINYLAMB_DISABLE_FLAT_GROUP_FOLD") != nullptr;
   std::vector<TypedWorkerGroups> workers(worker_count);
   for (TypedWorkerGroups& local : workers) {
     local.int_key = int_key;
+    local.shapes = &aggregate_shapes;
+    local.Configure(!flat_fold_disabled, plan.key_offsets.size(),
+                    plan.aggregates.size());
+    local.ConfigureSlim(plan);
+  }
+  // A typed fill publishes the arena without Rows.  A hit whose fold shape
+  // CAN stream cells goes straight to the arena fold; anything else boxes the
+  // rows back here, before the workers spawn (MaterializeCacheRowsParallel
+  // latches rows_boxed, so the resized-but-unboxed state is never observable).
+  // Mirror of the worker's arena_ok gate: when the fold CANNOT stream cells,
+  // box the arena's rows back (parallel) before spawning workers.
+  if (cached_relation != nullptr && !arena_disabled && runtime != nullptr &&
+      !workers.empty()) {
+    // Same formula as the worker's arena_ok gate: when this fold cannot
+    // stream cells (non-slim shapes included), the arena-only cache must be
+    // boxed back into rows before the workers spawn.
+    bool fold_can_stream_arena = workers[0].slim && int_key &&
+                                 plan.filter_programs.empty() &&
+                                 plan.aggregates.size() <= 8;
+    if (fold_can_stream_arena) {
+      for (const TypedAggregateInput& input : plan.aggregates) {
+        const auto aggregate_index =
+            static_cast<size_t>(&input - plan.aggregates.data());
+        if (input.child.has_value() ||
+            (!input.column.has_value() &&
+             (*workers[0].slim_kinds)[aggregate_index] !=
+                 SlimAggKind::kCount)) {
+          fold_can_stream_arena = false;
+          break;
+        }
+      }
+    }
+    if (!fold_can_stream_arena && cached_relation->rows.empty()) {
+      MaterializeCacheRowsParallel(fold_cache_key, cached_relation.get(),
+                                   runtime);
+    }
   }
   std::vector<Status> worker_errors(worker_count, Status::kSuccess);
   std::vector<size_t> scanned(worker_count, 0);
   std::vector<size_t> emitted(worker_count, 0);
   std::vector<size_t> aggregate_updates(worker_count, 0);
   std::exception_ptr worker_exception;
-  std::atomic<size_t> next_morsel{0};
   const auto run_worker = [&](size_t worker) {
     try {
       std::vector<Value> scratch;
       scratch.reserve(plan.key_offsets.size());
       if (cached_relation != nullptr && !cached_relation->HasSpill()) {
-        // Cache hit: partition the resident rows into contiguous ranges.
+        // Cache hit: partition the resident rows into contiguous ranges.  A
+        // typed fill publishes the arena WITHOUT Rows (resized-but-unboxed
+        // once a presize ran); the arena lookup therefore cannot key on
+        // rows.empty().
         const std::vector<Row>& rows = cached_relation->rows;
-        const size_t total = rows.size();
+        std::shared_ptr<const BaseRelationArena> hit_arena;
+        if (runtime != nullptr) {
+          auto found_arena = runtime->base_relation_arenas.find(fold_cache_key);
+          if (found_arena != runtime->base_relation_arenas.end()) {
+            hit_arena = found_arena->second;
+          }
+        }
+        const size_t total =
+            !rows.empty() ? rows.size() : (hit_arena ? hit_arena->rows : 0);
         const size_t begin = total * worker / worker_count;
         const size_t end = total * (worker + 1) / worker_count;
+        // Scratch arrays for the arena fold below; every slot is written
+        // before it is read within a row, so they carry no cross-row state.
+        std::array<Value, 8> cache_hit_values{};
+        std::array<const Value*, 8> cache_hit_value_ptrs{};
+        // Arena fast path: an int64 mirror of the cache lets the fold stream
+        // raw cells instead of visiting per-Row heap blocks.  Requires a
+        // single int64/date group key, no bytecode filter residual, slim
+        // states, and column-only (or COUNT(*)) aggregate inputs; anything
+        // else keeps the Row loop below.  Row and arena are published
+        // together, so equal row counts mean the arena is complete.
+        std::shared_ptr<const BaseRelationArena> arena;
+        bool arena_ok = !arena_disabled && workers[worker].slim && int_key &&
+                        plan.filter_programs.empty() &&
+                        plan.aggregates.size() <= 8;
+        if (arena_ok) {
+          for (const TypedAggregateInput& input : plan.aggregates) {
+            const auto aggregate_index =
+                static_cast<size_t>(&input - plan.aggregates.data());
+            if (input.child.has_value() ||
+                (!input.column.has_value() &&
+                 (*workers[worker].slim_kinds)[aggregate_index] !=
+                     SlimAggKind::kCount)) {
+              arena_ok = false;
+              break;
+            }
+          }
+        }
+        if (arena_ok && hit_arena != nullptr && hit_arena->rows == total) {
+          arena = hit_arena;
+        }
+        if (arena != nullptr) {
+          const size_t stride = arena->stride;
+          std::vector<Value> fallback_row_values;
+          std::vector<int64_t> fallback_cells(stride);
+          constexpr size_t kArenaPrefetchDistance = 8;
+          for (size_t index = begin; index < end; ++index) {
+            if (worker_errors[worker] != Status::kSuccess) {
+              return;
+            }
+            ++scanned[worker];
+            const int64_t* cells = arena->cells.data() + (index * stride);
+            // The cells and null bitmap stream linearly (hardware prefetch
+            // covers them); the group-slot probe is the random access, so
+            // warm it one window ahead of the row that needs it.
+            if (index + kArenaPrefetchDistance < end) {
+              const int64_t* ahead = cells + (kArenaPrefetchDistance * stride);
+              __builtin_prefetch(ahead);
+              __builtin_prefetch(ahead + plan.key_offsets[0]);
+              if (!arena->IsNull(index + kArenaPrefetchDistance,
+                                 plan.key_offsets[0])) {
+                workers[worker].PrefetchGroupSlot(ahead[plan.key_offsets[0]]);
+              }
+            }
+            if (arena->IsNull(index, plan.key_offsets[0])) {
+              // NULL keys keep their own group through the canonical row
+              // path; materialize the row lazily for the rare case.
+              fallback_row_values.clear();
+              for (size_t c = 0; c < stride; ++c) {
+                if (arena->IsNull(index, c)) {
+                  fallback_row_values.emplace_back();
+                } else {
+                  fallback_row_values.push_back(
+                      ArenaCellValue(*arena, cells, c, qualified_schema));
+                }
+              }
+              Row fallback_row(std::move(fallback_row_values));
+              accumulate_row(fallback_row, &workers[worker],
+                             &worker_errors[worker], &emitted[worker],
+                             &aggregate_updates[worker], nullptr, &scratch);
+              fallback_row_values = std::move(fallback_row.values_);
+              continue;
+            }
+            bool keep = true;
+            for (const TypedFilterCompare& compare : plan.filter_compares) {
+              if (arena->IsNull(index, compare.left)) {
+                keep = false;
+                break;
+              }
+              if (compare.constant_payload) {
+                Value left_value = ArenaCellValue(*arena, cells, compare.left,
+                                                  qualified_schema);
+                if (!DecideTypedFilterCompare(left_value, left_value,
+                                              compare)) {
+                  keep = false;
+                  break;
+                }
+                continue;
+              }
+              if (arena->IsNull(index, compare.right)) {
+                keep = false;
+                break;
+              }
+              Value left_value =
+                  ArenaCellValue(*arena, cells, compare.left, qualified_schema);
+              Value right_value = ArenaCellValue(*arena, cells, compare.right,
+                                                 qualified_schema);
+              if (!DecideTypedFilterCompare(left_value, right_value, compare)) {
+                keep = false;
+                break;
+              }
+            }
+            if (keep) {
+              for (const TypedInListCompare& list : plan.inlist_compares) {
+                // String lists cannot reach the arena: it only mirrors
+                // tables whose every column is INT64/DATE.
+                if (arena->IsNull(index, list.column)) {
+                  keep = false;
+                  break;
+                }
+                const int64_t cell = cells[list.column];
+                bool matched = false;
+                if (list.is_double) {
+                  for (const double item : list.double_values) {
+                    if (static_cast<double>(cell) == item) {
+                      matched = true;
+                      break;
+                    }
+                  }
+                } else {
+                  for (const int64_t item : list.int_values) {
+                    if (cell == item) {
+                      matched = true;
+                      break;
+                    }
+                  }
+                }
+                if (!matched) {
+                  keep = false;
+                  break;
+                }
+              }
+            }
+            if (!keep) {
+              continue;
+            }
+            ++emitted[worker];
+            bool inserted = false;
+            const int64_t raw_key = cells[plan.key_offsets[0]];
+            size_t* slot = workers[worker].RawIntSlot(raw_key, &inserted);
+            size_t group_index = 0;
+            if (inserted) {
+              scratch.clear();
+              for (const slot_t offset : plan.key_offsets) {
+                Value key_value;
+                key_value.type = qualified_schema.GetColumn(offset).Type();
+                key_value.value.int_value = cells[offset];
+                scratch.push_back(CanonicalDistinctValue(key_value));
+              }
+              group_index = workers[worker].ClaimSlotForNewGroup(
+                  slot, scratch, plan.aggregates.size(), aggregate_expressions);
+            } else {
+              group_index = *slot;
+            }
+            ++aggregate_updates[worker];
+            std::array<Value, 8>& stack_values = cache_hit_values;
+            std::array<const Value*, 8>& value_ptrs = cache_hit_value_ptrs;
+            for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+              const TypedAggregateInput& input = plan.aggregates[i];
+              if (!input.column.has_value()) {
+                value_ptrs[i] = nullptr;  // COUNT(*) sentinel.
+                continue;
+              }
+              const slot_t column = *input.column;
+              if (arena->IsNull(index, column)) {
+                stack_values[i] = Value();
+              } else {
+                stack_values[i] =
+                    ArenaCellValue(*arena, cells, column, qualified_schema);
+              }
+              value_ptrs[i] = &stack_values[i];
+            }
+            for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+              if (!ApplySlimValue(&workers[worker], group_index, i,
+                                  (*workers[worker].slim_kinds)[i],
+                                  value_ptrs[i], &worker_errors[worker])) {
+                return;
+              }
+            }
+          }
+          return;
+        }
+        // Rows own their cells in a separate heap block, so stream the Value
+        // arrays into cache ahead of the consume point; the row headers
+        // alone prefetch well in hardware.
+        constexpr size_t kPrefetchDistance = 8;
         for (size_t index = begin; index < end; ++index) {
+          if (index + kPrefetchDistance < end) {
+            const Row& ahead = rows[index + kPrefetchDistance];
+            __builtin_prefetch(&ahead, /*write=*/0, /*locality=*/1);
+            __builtin_prefetch(ahead.values_.data(), /*write=*/0,
+                               /*locality=*/1);
+          }
           if (worker_errors[worker] != Status::kSuccess) {
             return;
           }
@@ -3281,17 +5457,80 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         aggregate_updates[worker] += updates;
         return;
       }
-      for (;;) {
-        const size_t morsel = next_morsel.fetch_add(1);
-        if (morsel >= morsels.size() ||
-            worker_errors[worker] != Status::kSuccess) {
+      // Static rotation, same contract as the grouped-chunk fold above:
+      // worker w scans morsels w, w+W, ... so the per-worker partial sums and
+      // the worker-order merge are deterministic (rank boundaries in the
+      // ROLLUP queries read these doubles).
+      // Per-worker scratch arrays for the fold; every slot is written before
+      // it is read within a row, so they carry no cross-row state.
+      std::array<Value, 8> fold_row_values{};
+      for (size_t morsel = worker; morsel < morsels.size();
+           morsel += worker_count) {
+        if (worker_errors[worker] != Status::kSuccess) {
           break;
         }
         Iterator iterator =
             table.BeginMorselScan(context.txn_, morsels[morsel], projection_opt,
                                   nullptr, std::nullopt, peek_ptr);
-        std::vector<Row> fill_buffer;
-        std::vector<Row>* fill_target = fill_cache ? &fill_buffer : nullptr;
+        if (typed_fill) {
+          // Typed fill: decode schema-typed cell batches (no per-cell Value),
+          // fold from raw cells, mirror every row into the morsel's arena run.
+          // The published cache then holds the arena WITHOUT Rows; consumers
+          // that cannot stream cells materialize rows from the arena on
+          // demand (see the cache-hit path above).
+          TypedCellBatch batch;
+          MorselFillBuffer fill_buffer;
+          fill_buffer.mirror.stride = fill_arena->stride;
+          fill_buffer.mirror.slot_types = fill_arena->slot_types;
+          fill_buffer.mirror.null_bits.resize(fill_arena->stride);
+          fill_buffer.mirror.varchars.resize(fill_arena->varchars.size());
+          for (;;) {
+            const size_t decoded = iterator.DecodeNextTypedBatch(&batch, 2048);
+            if (decoded == 0) {
+              break;
+            }
+            scanned[worker] += decoded;
+            AppendBatchToArena(batch, 0, decoded, &fill_buffer.mirror);
+            for (size_t r = 0; r < decoded; ++r) {
+              // Warm the int-key group slot a few rows ahead; the probe in
+              // fold_cell_row below is otherwise a cold cache miss on the
+              // first touch of each hot group's line.
+              constexpr size_t kKeyPrefetchDistance = 4;
+              if (int_key && r + kKeyPrefetchDistance < decoded &&
+                  batch.nulls[((r + kKeyPrefetchDistance) * batch.stride) +
+                              plan.key_offsets[0]] == 0) {
+                workers[worker].PrefetchGroupSlot(
+                    batch.cells[((r + kKeyPrefetchDistance) * batch.stride) +
+                                plan.key_offsets[0]]);
+              }
+              fold_cell_row(batch, r, &workers[worker], &worker_errors[worker],
+                            &emitted[worker], &aggregate_updates[worker],
+                            &scratch, &fold_row_values);
+              if (worker_errors[worker] != Status::kSuccess) {
+                break;
+              }
+            }
+            if (worker_errors[worker] != Status::kSuccess) {
+              break;
+            }
+          }
+          if (worker_errors[worker] == Status::kSuccess &&
+              iterator.GetStatus() != Status::kSuccess) {
+            worker_errors[worker] = iterator.GetStatus();
+          }
+          if (fill_cache) {
+            publish_morsel(morsel, &fill_buffer);
+          }
+          if (worker_errors[worker] != Status::kSuccess) {
+            break;
+          }
+          continue;
+        }
+        MorselFillBuffer fill_buffer;
+        if (fill_cache && fill_arena != nullptr) {
+          fill_buffer.arena_stride = fill_arena->stride;
+        }
+        MorselFillBuffer* fill_target = fill_cache ? &fill_buffer : nullptr;
         for (; iterator.IsValid(); ++iterator) {
           ++scanned[worker];
           accumulate_row(*iterator, &workers[worker], &worker_errors[worker],
@@ -3338,48 +5577,175 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     const std::string cache_key = BaseRelationCacheKey(
         table_name, projection.empty() ? nullptr : &projection);
     runtime->base_relations.emplace(cache_key, cache_owner);
+    if (fill_arena != nullptr && fill_arena->rows == published_rows) {
+      fill_arena->published_rowsless = typed_fill;
+      runtime->base_relation_arenas.emplace(cache_key, fill_arena);
+    }
   }
 
   // Merge worker states in worker order (deterministic group creation order).
   TypedWorkerGroups merged;
   merged.int_key = int_key;
+  merged.shapes = &aggregate_shapes;
+  merged.Configure(!flat_fold_disabled, plan.key_offsets.size(),
+                   plan.aggregates.size());
+  merged.ConfigureSlim(plan);
   size_t total_scan_rows = 0;
   size_t total_scan_output = 0;
   for (size_t worker = 0; worker < worker_count; ++worker) {
     total_scan_rows += scanned[worker];
     total_scan_output += emitted[worker];
     TypedWorkerGroups& local = workers[worker];
-    if (local.group_states.empty()) {
+    if (local.GroupCount() == 0) {
       continue;
     }
-    if (merged.group_states.empty()) {
+    if (merged.GroupCount() == 0) {
       merged.int_index = std::move(local.int_index);
       merged.row_index = std::move(local.row_index);
+      merged.flat_group_keys = std::move(local.flat_group_keys);
+      merged.chunked_states.AdoptChunksFrom(std::move(local.chunked_states));
       merged.group_keys = std::move(local.group_keys);
       merged.group_states = std::move(local.group_states);
+      merged.slim_counts = std::move(local.slim_counts);
+      merged.slim_int_totals = std::move(local.slim_int_totals);
+      merged.slim_double_totals = std::move(local.slim_double_totals);
+      merged.slim_flags = std::move(local.slim_flags);
+      merged.slim_distinct = std::move(local.slim_distinct);
+      merged.slim_distinct_n = std::move(local.slim_distinct_n);
+      merged.slim_distinct_overflow = std::move(local.slim_distinct_overflow);
+      merged.group_count = local.group_count;
+      local.group_count = 0;
       continue;
     }
-    for (size_t group = 0; group < local.group_states.size(); ++group) {
-      const std::vector<Value>& canonical_keys = local.group_keys[group];
+    std::vector<Value> canonical_keys;
+    canonical_keys.reserve(plan.key_offsets.size());
+    for (size_t group = 0; group < local.GroupCount(); ++group) {
       int64_t raw_key = 0;
-      if (merged.int_key) {
-        raw_key = canonical_keys[0].value.int_value;
-      }
       bool inserted = false;
-      const size_t target =
-          merged.FindOrInsert(canonical_keys, raw_key, plan.aggregates.size(),
-                              aggregate_expressions, &inserted);
+      size_t target = 0;
+      // Int-key merge fast path: probe the merged table with the raw key and
+      // build canonical keys only for groups that actually open here.  Every
+      // worker's hit (the overwhelmingly common case: the same orderkey
+      // appears in several workers' partials) then costs one map probe with
+      // no Value copies at all.
+      const Value& local_key0 = local.GroupKey(group, 0);
+      if (merged.int_key && !local_key0.IsNull()) {
+        size_t* slot = merged.RawIntSlot(local_key0.value.int_value, &inserted);
+        if (inserted) {
+          canonical_keys.clear();
+          for (size_t k = 0; k < plan.key_offsets.size(); ++k) {
+            canonical_keys.push_back(local.GroupKey(group, k));
+          }
+          target = merged.ClaimSlotForNewGroup(slot, canonical_keys,
+                                               plan.aggregates.size(),
+                                               aggregate_expressions);
+        } else {
+          target = *slot;
+        }
+      } else {
+        canonical_keys.clear();
+        for (size_t k = 0; k < plan.key_offsets.size(); ++k) {
+          canonical_keys.push_back(local.GroupKey(group, k));
+        }
+        if (merged.int_key) {
+          raw_key = canonical_keys[0].value.int_value;
+        }
+        target =
+            merged.FindOrInsert(canonical_keys, raw_key, plan.aggregates.size(),
+                                aggregate_expressions, &inserted);
+      }
       if (inserted) {
         // FindOrInsert created empty states; adopt this worker's partials.
-        merged.group_states[target] = std::move(local.group_states[group]);
+        for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+          if (merged.slim) {
+            merged.SlimCount(target, i) = local.SlimCount(group, i);
+            merged.SlimIntTotal(target, i) = local.SlimIntTotal(group, i);
+            merged.SlimDoubleTotal(target, i) = local.SlimDoubleTotal(group, i);
+            merged.SlimFlags(target, i) = local.SlimFlags(group, i);
+            if ((*merged.slim_kinds)[i] == SlimAggKind::kCountDistinctInt64) {
+              const size_t dst_state = (target * merged.agg_stride) + i;
+              const size_t src_state = (group * local.agg_stride) + i;
+              merged.slim_distinct_n[dst_state] =
+                  local.slim_distinct_n[src_state];
+              std::copy_n(
+                  &local.slim_distinct[src_state * kSlimDistinctSlots],
+                  kSlimDistinctSlots,
+                  &merged.slim_distinct[dst_state * kSlimDistinctSlots]);
+              merged.slim_distinct_overflow[dst_state] =
+                  std::move(local.slim_distinct_overflow[src_state]);
+            }
+            continue;
+          }
+          merged.State(target, i) = std::move(local.State(group, i));
+        }
         continue;
       }
-      auto& destination = merged.group_states[target];
-      for (size_t i = 0; i < destination.size(); ++i) {
-        if (local.group_states[group][i].count == 0) {
+      for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+        if (merged.slim) {
+          // Slim merge: mirror AggregateAccumulator::Merge for the kinds the
+          // slim layout admits (counts add; INT64 sums keep the overflow
+          // raise; DOUBLE totals add and OR the saw-infinite-input flag;
+          // COUNT(DISTINCT) unions sets).
+          const SlimAggKind kind = (*merged.slim_kinds)[i];
+          if (kind == SlimAggKind::kCountDistinctInt64) {
+            if (local.SlimDistinctTotal(group, i) == 0) {
+              continue;
+            }
+            const size_t src_state = (group * local.agg_stride) + i;
+            const uint8_t n = local.slim_distinct_n[src_state];
+            const int64_t* slots =
+                &local.slim_distinct[src_state * kSlimDistinctSlots];
+            for (size_t s = 0; s < n; ++s) {
+              static_cast<void>(merged.SlimInsertDistinct(target, i, slots[s]));
+            }
+            if (const auto& overflow =
+                    local.slim_distinct_overflow[src_state]) {
+              for (const int64_t raw : *overflow) {
+                static_cast<void>(merged.SlimInsertDistinct(target, i, raw));
+              }
+            }
+            continue;
+          }
+          if (local.SlimCount(group, i) == 0) {
+            continue;
+          }
+          switch (kind) {
+            case SlimAggKind::kCount:
+              merged.SlimCount(target, i) += local.SlimCount(group, i);
+              break;
+            case SlimAggKind::kSumInt64: {
+              int64_t updated = 0;
+              if (__builtin_add_overflow(merged.SlimIntTotal(target, i),
+                                         local.SlimIntTotal(group, i),
+                                         &updated)) {
+                return StatusError(StatusCode::kIsInfinity,
+                                   "integer overflow in SUM");
+              }
+              merged.SlimIntTotal(target, i) = updated;
+              merged.SlimCount(target, i) += local.SlimCount(group, i);
+              break;
+            }
+            case SlimAggKind::kSumDouble:
+              merged.SlimDoubleTotal(target, i) +=
+                  local.SlimDoubleTotal(group, i);
+              merged.SlimFlags(target, i) |= local.SlimFlags(group, i);
+              merged.SlimCount(target, i) += local.SlimCount(group, i);
+              break;
+            case SlimAggKind::kAvgDouble:
+              merged.SlimDoubleTotal(target, i) +=
+                  local.SlimDoubleTotal(group, i);
+              merged.SlimCount(target, i) += local.SlimCount(group, i);
+              break;
+            default:
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "aggregate has no slim state");
+          }
           continue;
         }
-        if (Status st = destination[i].Merge(local.group_states[group][i]);
+        if (local.State(group, i).count == 0) {
+          continue;
+        }
+        if (Status st = merged.State(target, i).Merge(local.State(group, i));
             st != Status::kSuccess) {
           return st;
         }
@@ -3396,7 +5762,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     runtime->scan_values_available +=
         total_scan_rows * table_schema.ColumnCount();
     runtime->typed_parallel_aggregations += 1;
-    runtime->aggregate_groups += merged.group_states.size();
+    runtime->aggregate_groups += merged.GroupCount();
     runtime->aggregate_input_rows += total_scan_output;
     for (const size_t worker_updates : aggregate_updates) {
       runtime->aggregate_updates += worker_updates;
@@ -3404,14 +5770,14 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   }
 
   // Global aggregate over an empty input produces one group of NULL/0.
-  if (merged.group_states.empty() && plan.key_offsets.empty()) {
-    merged.group_states.emplace_back();
-    auto& states = merged.group_states.back();
-    states.reserve(plan.aggregates.size());
-    for (const AggregateExpression* aggregate : aggregate_expressions) {
-      states.emplace_back(aggregate);
-    }
-    merged.group_keys.emplace_back();
+  if (merged.GroupCount() == 0 && plan.key_offsets.empty()) {
+    std::vector<Value> canonical_keys;
+    bool inserted = false;
+    const size_t target =
+        merged.FindOrInsert(canonical_keys, 0, plan.aggregates.size(),
+                            aggregate_expressions, &inserted);
+    (void)target;
+    (void)inserted;
   }
 
   const auto aggregate_begin = std::chrono::steady_clock::now();
@@ -3459,6 +5825,10 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     bounded = true;
     topn_capacity = stmt.Offset() + stmt.Limit();
   }
+  // The group count is final before emit; reserving up front keeps the rows
+  // vector from re-moving every emitted Row on geometric growth.
+  output.rows.reserve(bounded ? std::min(topn_capacity, merged.GroupCount())
+                              : merged.GroupCount());
   size_t next_sequence = 0;
   const auto retain = [&](KeyedRow keyed) {
     keyed.sequence = next_sequence++;
@@ -3478,28 +5848,101 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     }
   };
   std::vector<Value> finished_values;
-  for (size_t group = 0; group < merged.group_states.size(); ++group) {
+  // A/B hatch: TINYLAMB_DISABLE_HAVING_FAST=1 restores the per-group
+  // AggregateResultMap path for every HAVING shape.
+  static const bool having_fast_disabled =
+      std::getenv("TINYLAMB_DISABLE_HAVING_FAST") != nullptr;
+  std::optional<PositionalHaving> positional_having;
+  if (having_expr != nullptr && !having_fast_disabled) {
+    positional_having =
+        TryCompilePositionalHaving(having_expr, plan.aggregates);
+  }
+  const size_t merged_group_count = merged.GroupCount();
+  for (size_t group = 0; group < merged_group_count; ++group) {
     finished_values.clear();
     finished_values.reserve(plan.aggregates.size());
-    for (size_t i = 0; i < plan.aggregates.size(); ++i) {
-      ASSIGN_OR_RETURN(Value, finished,
-                       merged.group_states[group][i].TryFinish());
-      finished_values.push_back(std::move(finished));
+    if (merged.slim) {
+      for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+        const int64_t count = merged.SlimCount(group, i);
+        Value finished;
+        switch ((*merged.slim_kinds)[i]) {
+          case SlimAggKind::kCount:
+            finished = Value(count);
+            break;
+          case SlimAggKind::kSumInt64:
+            finished =
+                count == 0 ? Value() : Value(merged.SlimIntTotal(group, i));
+            break;
+          case SlimAggKind::kSumDouble: {
+            if (count == 0) {
+              break;
+            }
+            const double sum_result = merged.SlimDoubleTotal(group, i);
+            if ((merged.SlimFlags(group, i) & 1) == 0 &&
+                std::isinf(sum_result)) {
+              // Finite inputs whose sum leaves the double range overflow:
+              // GoogleSQL raises instead of returning inf.
+              return StatusError(StatusCode::kIsInfinity,
+                                 "SUM overflow: result is infinite");
+            }
+            finished = Value(sum_result);
+            break;
+          }
+          case SlimAggKind::kAvgDouble:
+            finished = count == 0 ? Value()
+                                  : Value(merged.SlimDoubleTotal(group, i) /
+                                          static_cast<double>(count));
+            break;
+          case SlimAggKind::kCountDistinctInt64:
+            finished =
+                Value(static_cast<int64_t>(merged.SlimDistinctTotal(group, i)));
+            break;
+          default:
+            return StatusError(StatusCode::kInvalidArgument,
+                               "aggregate has no slim state");
+        }
+        finished_values.push_back(std::move(finished));
+      }
+    } else {
+      for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+        ASSIGN_OR_RETURN(Value, finished, merged.State(group, i).TryFinish());
+        finished_values.push_back(std::move(finished));
+      }
     }
+    // Only HAVING reads the aggregate map; building an unordered_map per
+    // group cost one allocation per group on multi-million-group folds.
     AggregateResultMap aggregate_results;
-    aggregate_results.reserve(plan.aggregates.size());
-    for (size_t i = 0; i < plan.aggregates.size(); ++i) {
-      aggregate_results.emplace(plan.aggregates[i].aggregate,
-                                finished_values[i]);
-    }
-    if (having_expr) {
+    if (having_expr && positional_having) {
+      // `AGG op literal` / bare `AGG`: decide straight from the finished
+      // value.  A NULL aggregate result compares to UNKNOWN, so the group
+      // drops exactly as the generic path's TryEvaluate would decide.
+      const Value& left_value = finished_values[positional_having->agg_index];
+      Value having_value;
+      if (positional_having->has_constant) {
+        StatusOr<Value> compared = TryBinary(positional_having->op, left_value,
+                                             positional_having->constant);
+        if (!compared.HasValue()) {
+          return compared.GetStatus();
+        }
+        having_value = compared.MoveValue();
+      } else {
+        having_value = left_value;
+      }
+      if (!Truthy(having_value)) {
+        continue;
+      }
+    } else if (having_expr) {
+      aggregate_results.reserve(plan.aggregates.size());
+      for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+        aggregate_results.emplace(plan.aggregates[i].aggregate,
+                                  finished_values[i]);
+      }
       if (representative.values_.size() != qualified_schema.ColumnCount()) {
         representative =
             Row(std::vector<Value>(qualified_schema.ColumnCount(), Value()));
       }
       for (size_t k = 0; k < plan.key_offsets.size(); ++k) {
-        representative.values_[plan.key_offsets[k]] =
-            merged.group_keys[group][k];
+        representative.values_[plan.key_offsets[k]] = merged.GroupKey(group, k);
       }
       Scope scope{.row = &representative,
                   .schema = &qualified_schema,
@@ -3516,7 +5959,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     values.reserve(plan.emit_items.size());
     for (const TypedEmitItem& item : plan.emit_items) {
       if (item.is_key) {
-        values.push_back(merged.group_keys[group][item.index]);
+        values.push_back(merged.GroupKey(group, item.index));
       } else {
         values.push_back(finished_values[item.index]);
       }
@@ -3534,7 +5977,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       keys.reserve(plan.order_items.size());
       for (const TypedEmitItem& item : plan.order_items) {
         if (item.is_key) {
-          keys.push_back(merged.group_keys[group][item.index]);
+          keys.push_back(merged.GroupKey(group, item.index));
         } else {
           keys.push_back(finished_values[item.index]);
         }
@@ -3564,6 +6007,141 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   }
   output.schema = Schema("", std::move(output_columns));
   return output;
+}
+
+// Statement-level classification for fusing the final join with this
+// statement's grouping (see GroupedJoinFusionSpec).  Schema-dependent checks
+// (bytecode compilability against the joined schema) run at the join step in
+// BuildInput; this pass only decides whether the statement shape qualifies.
+GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
+    const SelectStatement& statement) {
+  GroupedJoinFusionSpec spec;
+  if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+    std::cerr << "[fusion] spec: sources=" << statement.Sources().size()
+              << " group_by=" << statement.GroupBy().size()
+              << " distinct=" << statement.Distinct()
+              << " having=" << (statement.Having() != nullptr)
+              << " order=" << statement.OrderBy().size() << "\n";
+  }
+  static const bool disabled =
+      std::getenv("TINYLAMB_DISABLE_GROUPED_JOIN_FUSION") != nullptr;
+  static const bool debug_fusion =
+      std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr;
+  const auto bail = [&spec](const char* reason) {
+    if (debug_fusion) {
+      std::cerr << "[fusion] spec bail: " << reason << "\n";
+    }
+    return spec;
+  };
+  if (disabled || statement.Sources().size() < 2 || statement.Distinct() ||
+      statement.Having() || HasWindowFunctions(statement) ||
+      StatementContainsVolatileFunction(statement)) {
+    return bail("shape head");
+  }
+  const bool grouped =
+      !statement.GroupBy().empty() ||
+      std::ranges::any_of(statement.SelectList(), [](const NamedExpression& e) {
+        return ContainsAggregate(e.expression);
+      });
+  if (!grouped) {
+    return bail("not grouped");
+  }
+  // GROUP BY must not lean on select-list alias resolution: the fused emit
+  // evaluates keys against the joined schema before any projection exists.
+  for (const Expression& key : statement.GroupBy()) {
+    if (!key || key->Type() != TypeTag::kColumnValue ||
+        ContainsAggregate(key)) {
+      continue;
+    }
+    const ColumnName& column = key->AsColumnValue().GetColumnName();
+    if (!column.schema.empty()) {
+      continue;
+    }
+    for (const NamedExpression& item : statement.SelectList()) {
+      // A select item whose expression IS this same column does not shadow
+      // it; only an alias for a different expression does.
+      if (!item.name.empty() && IdentifierEquals(item.name, column.name) &&
+          (!item.expression ||
+           item.expression->Type() != TypeTag::kColumnValue ||
+           !IdentifierEquals(
+               item.expression->AsColumnValue().GetColumnName().name,
+               column.name))) {
+        return bail("alias group by");  // keep the materializing path
+      }
+    }
+  }
+  std::vector<const AggregateExpression*> aggregates;
+  std::unordered_set<const AggregateExpression*> seen;
+  for (const NamedExpression& item : statement.SelectList()) {
+    CollectAggregates(item.expression, &aggregates, &seen);
+  }
+  for (const AggregateExpression* aggregate : aggregates) {
+    // Only mergeable streaming kinds fuse: the parallel build merges
+    // thread-local accumulator states.  COUNT(DISTINCT plain column) merges
+    // as an exact set union; DISTINCT on other kinds stays serial.  The
+    // child may be an arbitrary expression (Q9's SUM of arithmetic): the
+    // join-step gate compiles it against the joined schema and falls back to
+    // the materializing join when compilation fails.
+    const bool distinct_count = aggregate->Distinct() &&
+                                aggregate->GetType() == AggregationType::kCount;
+    const bool supported_kind =
+        aggregate->GetType() == AggregationType::kCount ||
+        aggregate->GetType() == AggregationType::kSum ||
+        aggregate->GetType() == AggregationType::kMin ||
+        aggregate->GetType() == AggregationType::kMax ||
+        aggregate->GetType() == AggregationType::kAvg;
+    if (!supported_kind || aggregate->WhereFilter() ||
+        (!IsCountStar(*aggregate) &&
+         (aggregate->Having() != AggregateHavingModifier::kNone ||
+          !aggregate->InnerOrderBy().empty() || aggregate->SecondaryArg() ||
+          !aggregate->ExtraArgs().empty() || aggregate->NeedsGroupContext() ||
+          !aggregate->TrailingArgs().empty() ||
+          (aggregate->Distinct() && !distinct_count)))) {
+      return bail("aggregate kind");
+    }
+  }
+  // Every ORDER BY term must resolve against the projected output (an
+  // ordinal or a select-item alias): the fused path orders after emission.
+  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+    if (!term.expression) {
+      return spec;
+    }
+    if (term.expression->Type() == TypeTag::kConstantValue) {
+      const Value& value = term.expression->AsConstantValue().GetValue();
+      if (value.type == ValueType::kInt64 && !value.IsNull() &&
+          value.value.int_value >= 1) {
+        continue;
+      }
+      return spec;
+    }
+    if (term.expression->Type() != TypeTag::kColumnValue ||
+        !term.expression->AsColumnValue().GetColumnName().schema.empty()) {
+      return spec;
+    }
+    const ColumnName& column = term.expression->AsColumnValue().GetColumnName();
+    const bool matches_alias = std::ranges::any_of(
+        statement.SelectList(), [&](const NamedExpression& item) {
+          return !item.name.empty() && IdentifierEquals(item.name, column.name);
+        });
+    if (!matches_alias) {
+      return spec;
+    }
+  }
+  spec.group_keys.assign(statement.GroupBy().begin(),
+                         statement.GroupBy().end());
+  spec.aggregates = std::move(aggregates);
+  spec.count_star.reserve(spec.aggregates.size());
+  for (const AggregateExpression* aggregate : spec.aggregates) {
+    spec.count_star.push_back(IsCountStar(*aggregate));
+  }
+  spec.select_items.reserve(statement.SelectList().size());
+  spec.select_names.reserve(statement.SelectList().size());
+  for (const NamedExpression& item : statement.SelectList()) {
+    spec.select_items.push_back(item.expression);
+    spec.select_names.push_back(item.name);
+  }
+  spec.eligible = true;
+  return spec;
 }
 
 }  // namespace
@@ -3646,8 +6224,12 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
                           SetOperationKind operation) -> StatusOr<Relation> {
       std::vector<Row> left_rows;
       std::vector<Row> right_rows;
+      RETURN_IF_FAIL(left.FinishSpill());
+      RETURN_IF_FAIL(left.GetStatus());
       RETURN_IF_FAIL(
           left.ForEachRow([&](const Row& row) { left_rows.push_back(row); }));
+      RETURN_IF_FAIL(right.FinishSpill());
+      RETURN_IF_FAIL(right.GetStatus());
       RETURN_IF_FAIL(
           right.ForEachRow([&](const Row& row) { right_rows.push_back(row); }));
       SetOperationExecutor set_operation(
@@ -3663,7 +6245,8 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       if (set_operation.GetStatus() != Status::kSuccess) {
         return set_operation.GetStatus();
       }
-      folded.FinishSpill();
+      RETURN_IF_FAIL(folded.FinishSpill());
+      RETURN_IF_FAIL(folded.GetStatus());
       return folded;
     };
 
@@ -3702,7 +6285,8 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
                                    low_ops[j - 1])));
       combined = std::move(folded_pair);
     }
-    combined.FinishSpill();
+    RETURN_IF_FAIL(combined.FinishSpill());
+    RETURN_IF_FAIL(combined.GetStatus());
     if (!statement.OrderBy().empty()) {
       RETURN_IF_FAIL(ApplyOrderBy(context, statement, &combined, outer, ctes));
     }
@@ -3715,6 +6299,9 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
     head.SetOrderBy({});
     head.SetLimit(std::nullopt);
     head.SetOffset(0);
+    // The WITH bodies already executed into `ctes` above; clearing the head's
+    // own copies keeps the fold from re-running every CTE body one extra time.
+    head.ClearWithQueries();
     ASSIGN_OR_RETURN(Relation, combined,
                      (ExecuteQuery(context, head, outer, ctes)));
     // PRODUCTION FIX: apply per-pair kinds with operator precedence
@@ -3725,8 +6312,12 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
                           SetOperationKind operation) -> StatusOr<Relation> {
       std::vector<Row> left_rows;
       std::vector<Row> right_rows;
+      RETURN_IF_FAIL(left.FinishSpill());
+      RETURN_IF_FAIL(left.GetStatus());
       RETURN_IF_FAIL(
           left.ForEachRow([&](const Row& row) { left_rows.push_back(row); }));
+      RETURN_IF_FAIL(right.FinishSpill());
+      RETURN_IF_FAIL(right.GetStatus());
       RETURN_IF_FAIL(
           right.ForEachRow([&](const Row& row) { right_rows.push_back(row); }));
       SetOperationExecutor set_operation(
@@ -3742,7 +6333,8 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       if (set_operation.GetStatus() != Status::kSuccess) {
         return set_operation.GetStatus();
       }
-      folded.FinishSpill();
+      RETURN_IF_FAIL(folded.FinishSpill());
+      RETURN_IF_FAIL(folded.GetStatus());
       if (folded.TotalRows() != 0) {
         folded.schema = left.schema;
       }
@@ -3778,7 +6370,8 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
                                    low_ops[j - 1])));
       combined = std::move(folded_pair);
     }
-    combined.FinishSpill();
+    RETURN_IF_FAIL(combined.FinishSpill());
+    RETURN_IF_FAIL(combined.GetStatus());
     if (!statement.OrderBy().empty()) {
       RETURN_IF_FAIL(ApplyOrderBy(context, statement, &combined, outer, ctes));
     }
@@ -3877,6 +6470,54 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
                         &seen_aggregates);
     }
     CollectAggregates(having_expr, &aggregate_expressions, &seen_aggregates);
+    // ORDER BY terms may reference select aliases or spell out an aggregate
+    // ("ORDER BY SUM(v) DESC").  The AggregateResultMap is keyed by node
+    // pointer, so aggregate subtrees dedupe onto the identical select-list
+    // node (mirroring the grouped path); without this the ORDER BY instance
+    // is never prepared and the sort fails with "aggregate was not prepared".
+    std::vector<Expression> resolved_order_keys;
+    resolved_order_keys.reserve(stmt.OrderBy().size());
+    for (const auto& term : stmt.OrderBy()) {
+      Expression expression = term.expression;
+      if (expression && expression->Type() == TypeTag::kColumnValue) {
+        const ColumnName& name = expression->AsColumnValue().GetColumnName();
+        if (name.schema.empty()) {
+          for (const NamedExpression& select_item : stmt.SelectList()) {
+            if (!select_item.name.empty() &&
+                select_item.name.size() == name.name.size() &&
+                std::equal(
+                    select_item.name.begin(), select_item.name.end(),
+                    name.name.begin(), [](char left, char right) {
+                      return std::tolower(static_cast<unsigned char>(left)) ==
+                             std::tolower(static_cast<unsigned char>(right));
+                    })) {
+              expression = select_item.expression;
+              break;
+            }
+          }
+        }
+      }
+      expression = ReplaceSubExpressions(
+          expression,
+          [&stmt](const Expression& node) -> std::optional<Expression> {
+            if (!node || node->Type() != TypeTag::kAggregateExp) {
+              return std::nullopt;
+            }
+            for (const NamedExpression& select_item : stmt.SelectList()) {
+              if (select_item.expression &&
+                  select_item.expression->Type() == TypeTag::kAggregateExp &&
+                  select_item.expression->ToString() == node->ToString()) {
+                return select_item.expression;
+              }
+            }
+            return std::nullopt;
+          });
+      resolved_order_keys.push_back(std::move(expression));
+    }
+    for (const Expression& order_expression : resolved_order_keys) {
+      CollectAggregates(order_expression, &aggregate_expressions,
+                        &seen_aggregates);
+    }
 
     struct GroupState {
       Row representative;
@@ -3889,7 +6530,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
     // probing an int map skips the per-row Value copies of the generic key
     // path.  NULL keys fall through to the row-keyed index (mirroring
     // TypedWorkerGroups), so NULL stays its own group.
-    std::unordered_map<int64_t, size_t> int_offsets;
+    // Flat open addressing (one cache line per probe) instead of a node-based
+    // unordered_map: the generic grouped loop's single-int-key path serves
+    // the multi-hundred-thousand-group shapes (Q3's l_orderkey), where the
+    // node chase per probe dominated the fold.
+    relational_detail::FlatIntKeyMap<size_t> int_offsets;
     bool single_int_key = false;
     slot_t int_key_column{0};
 
@@ -3958,9 +6603,14 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       if (single_int_key) {
         const Value& key_value = row[int_key_column];
         if (!key_value.IsNull()) {
-          const auto [iter, emplaced] =
-              int_offsets.try_emplace(key_value.value.int_value, groups.size());
-          group_index = iter->second;
+          bool emplaced = false;
+          size_t* slot =
+              int_offsets.TryEmplace(key_value.value.int_value, &emplaced);
+          if (emplaced) {
+            // Claim the index the new group below will occupy.
+            *slot = groups.size();
+          }
+          group_index = *slot;
           inserted = emplaced;
         } else {
           // NULL must stay its own group: the raw int64 slot cannot encode
@@ -4074,12 +6724,16 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
     // Typed parallel fast path (single-table GROUP BY): shapes whose group
     // keys, aggregates, and outputs resolve positionally run as parallel
     // morsel aggregation with context-free bytecode filtering.  Anything
-    // less regular keeps the generic loop below.  Statements that share the
-    // table through reusable_base_relations stay on the cache-filling stream
-    // loop: the parallel morsel path fills the shared base-relation cache
-    // from worker slices, and a subquery reading the entry mid-fill observes
-    // a partial relation (wrong aggregate results).
-    if (!reusable) {
+    // less regular keeps the generic loop below.  Shared base-relation
+    // statements are admitted too: the typed path fills the cache from
+    // worker slices with strict morsel-order publication and aggregates
+    // cache hits from parallel row ranges, so no reader can observe a
+    // partial entry.  A/B hatch: TINYLAMB_DISABLE_REUSABLE_TYPED_AGG=1
+    // restores the pre-change gate that kept shared-table statements on the
+    // generic stream loop.
+    static const bool reusable_typed_disabled =
+        std::getenv("TINYLAMB_DISABLE_REUSABLE_TYPED_AGG") != nullptr;
+    if (!reusable || !reusable_typed_disabled) {
       TypedAggregationPlan typed_plan =
           PlanTypedAggregation(stmt, having_expr, qualified_schema,
                                aggregate_expressions, scan_predicates);
@@ -4105,6 +6759,36 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       if (cached == context.execution_runtime()->base_relations.end()) {
         Relation cache_rel(context.execution_runtime());
         cache_rel.schema = scan_schema;
+        // Fixed-width cache fill also mirrors the rows into an int64 arena
+        // (same append order) so the typed fold's cache-hit pass can stream
+        // cells; eligibility mirrors the typed route's fill-side check.
+        std::shared_ptr<BaseRelationArena> generic_arena;
+        static const bool generic_arena_disabled =
+            std::getenv("TINYLAMB_DISABLE_AGG_ARENA") != nullptr;
+        if (!generic_arena_disabled && scan_schema.ColumnCount() > 0) {
+          bool all_fixed = true;
+          for (slot_t i = 0; i < scan_schema.ColumnCount(); ++i) {
+            const ValueType type = scan_schema.GetColumn(i).Type();
+            if (type != ValueType::kInt64 && type != ValueType::kDate) {
+              all_fixed = false;
+              break;
+            }
+          }
+          if (all_fixed) {
+            generic_arena = std::make_shared<BaseRelationArena>();
+            generic_arena->stride = scan_schema.ColumnCount();
+            generic_arena->null_bits.resize(generic_arena->stride);
+          }
+        }
+        std::array<int64_t, 16> generic_cells{};
+        std::array<uint8_t, 16> generic_nulls{};
+        std::vector<int64_t> generic_cell_buffer;
+        std::vector<uint8_t> generic_null_buffer;
+        if (generic_arena != nullptr &&
+            generic_arena->stride > static_cast<size_t>(16)) {
+          generic_cell_buffer.resize(generic_arena->stride);
+          generic_null_buffer.resize(generic_arena->stride);
+        }
         // Fill the shared cache with UNFILTERED rows: the cache key carries no
         // predicates (and no stashed key filters are applied here), so every
         // consumer applies its own filters while reading below.
@@ -4120,7 +6804,24 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
             context.execution_runtime()->scan_values_decoded +=
                 scan_schema.ColumnCount();
           }
-          cache_rel.AddRow(*iterator);
+          if (generic_arena != nullptr) {
+            if ((*iterator).values_.size() != generic_arena->stride) {
+              generic_arena.reset();
+            } else {
+              const size_t width = generic_arena->stride;
+              int64_t* cells = width <= 16 ? generic_cells.data()
+                                           : generic_cell_buffer.data();
+              uint8_t* nulls = width <= 16 ? generic_nulls.data()
+                                           : generic_null_buffer.data();
+              for (size_t c = 0; c < width; ++c) {
+                const Value& value = (*iterator).values_[c];
+                cells[c] = value.value.int_value;
+                nulls[c] = value.IsNull() ? 1 : 0;
+              }
+              generic_arena->AppendRun(cells, nulls, 1);
+            }
+          }
+          cache_rel.AddRow(std::move(*iterator));
           ++iterator;
         }
         cache_rel.FinishSpill();
@@ -4129,8 +6830,17 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
                      .emplace(cache_key,
                               std::make_shared<Relation>(std::move(cache_rel)))
                      .first;
+        if (generic_arena != nullptr &&
+            generic_arena->rows == cached->second->rows.size()) {
+          context.execution_runtime()->base_relation_arenas.emplace(
+              cache_key, std::move(generic_arena));
+        }
       } else {
         ++context.execution_runtime()->base_scan_cache_hits;
+        // A typed fill publishes the arena without Rows: box the rows back
+        // (once) before the generic consumer iterates them.
+        MaterializeCacheRowsIfNeeded(cache_key, cached->second.get(),
+                                     context.execution_runtime());
       }
       // Aggregation always reads through the shared cache so the first user
       // and later users see exactly the same rows.
@@ -4228,24 +6938,22 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       size_t sequence{0};
     };
     std::vector<KeyedRow> sortable;
-    const auto precedes = [&stmt](const KeyedRow& left, const KeyedRow& right) {
-      for (size_t i = 0; i < stmt.OrderBy().size(); ++i) {
-        const Value& a = left.keys[i];
-        const Value& b = right.keys[i];
-        const int c = CompareForOrderBy(a, b);
-        if (c == 0) {
-          continue;
+    // Same ordering contract as the non-grouped relational path above: NULL
+    // placement, direction and the key's collation all come from
+    // SortKeyOrder, so a grouped ORDER BY folds exactly like an ungrouped one.
+    std::vector<SortKeyOrder> order_specs;
+    order_specs.reserve(stmt.OrderBy().size());
+    for (const SelectStatement::OrderByTerm& term : stmt.OrderBy()) {
+      order_specs.emplace_back(term.ascending, term.nulls_first,
+                               CollationOfExpression(term.expression));
+    }
+    const auto precedes = [&order_specs](const KeyedRow& left,
+                                         const KeyedRow& right) {
+      for (size_t i = 0; i < order_specs.size(); ++i) {
+        const int cmp = order_specs[i].Compare(left.keys[i], right.keys[i]);
+        if (cmp != 0) {
+          return cmp < 0;
         }
-        const bool nulls_first =
-            stmt.OrderBy()[i].nulls_first.value_or(stmt.OrderBy()[i].ascending);
-        const bool a_less = c < 0;
-        if (a.IsNull()) {
-          return nulls_first;
-        }
-        if (b.IsNull()) {
-          return !nulls_first;
-        }
-        return stmt.OrderBy()[i].ascending ? a_less : !a_less;
       }
       return left.sequence < right.sequence;
     };
@@ -4307,18 +7015,24 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       // (`ORDER BY str_val` where str_val is a grouping key); chain the
       // projected row to the group's representative row so those resolve.
       if (!stmt.OrderBy().empty()) {
+        // The grouped ORDER BY key may reference output columns, aliases,
+        // aggregates and group-key base columns -- never a relation alias
+        // denoting a whole row (the query is grouped by parts of that row),
+        // so the row-alias fallback is suppressed on both scopes.
         Scope base_scope{.row = &group.representative,
                          .schema = &input.schema,
-                         .outer = outer};
+                         .outer = outer,
+                         .no_row_alias = true};
         Scope proj_scope{.row = &output_row,
                          .schema = &initial_output_schema,
-                         .outer = &base_scope};
+                         .outer = &base_scope,
+                         .no_row_alias = true};
         std::vector<Value> keys;
         keys.reserve(stmt.OrderBy().size());
-        for (const auto& key : stmt.OrderBy()) {
+        for (const Expression& key : resolved_order_keys) {
           ASSIGN_OR_RETURN(Value, hv91721_0,
-                           (TryEvaluate(key.expression, proj_scope,
-                                        &aggregate_results, context, ctes)));
+                           (TryEvaluate(key, proj_scope, &aggregate_results,
+                                        context, ctes)));
           keys.push_back(std::move(hv91721_0));
         }
         retain(KeyedRow{.keys = std::move(keys), .row = std::move(output_row)});
@@ -4372,9 +7086,24 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
   }
 
   bool where_fully_applied = false;
+  // Fuse the final join with this statement's grouping when the shape
+  // qualifies: the joined relation is never materialized (TPC-H Q13/Q18/Q21
+  // outer legs).
+  GroupedJoinFusionSpec fusion_spec = BuildGroupedJoinFusionSpec(statement);
   ASSIGN_OR_RETURN(
       Relation, input,
-      BuildInput(context, statement, outer, ctes, &where_fully_applied));
+      BuildInput(context, statement, outer, ctes, &where_fully_applied,
+                 fusion_spec.eligible ? &fusion_spec : nullptr));
+  if (fusion_spec.fired) {
+    // The fused probe emitted the grouped+projected rows already; only the
+    // ORDER BY / LIMIT tail remains, and eligibility guarantees every order
+    // term resolves against the projected output.
+    input.FinishSpill();
+    if (!statement.OrderBy().empty()) {
+      RETURN_IF_FAIL(ApplyOrderBy(context, statement, &input, outer, ctes));
+    }
+    return LimitedRows(statement, std::move(input), &context, outer, &ctes);
+  }
 
   size_t hidden_columns = 0;
   const SelectStatement* effective = &statement;
@@ -4465,7 +7194,9 @@ class GroupedFinishExecutor final : public ExecutorBase {
 
   void Dump(std::ostream& output, int indent) const override {
     output << std::string(static_cast<size_t>(indent), ' ')
-           << "GroupByFinish (rows=" << rows_.size() << ")\n";
+           << "GroupByFinish (rows=" << rows_.size()
+           << ", group_keys=" << (statement_ ? statement_->GroupBy().size() : 0)
+           << ")\n";
     if (statement_ && !statement_->OrderBy().empty() &&
         statement_->HasLimit() && !statement_->WithTies() &&
         !statement_->Distinct() &&
@@ -4515,7 +7246,8 @@ class GroupedFinishExecutor final : public ExecutorBase {
 
   void Explain(std::ostream& output, int indent) const override {
     output << std::string(static_cast<size_t>(indent), ' ')
-           << "GroupByFinish\n";
+           << "GroupByFinish (group_keys="
+           << (statement_ ? statement_->GroupBy().size() : 0) << ")\n";
     if (statement_ && !statement_->OrderBy().empty() &&
         statement_->HasLimit() && !statement_->WithTies() &&
         !statement_->Distinct() &&
@@ -4583,18 +7315,25 @@ class GroupedFinishExecutor final : public ExecutorBase {
 class ScopedExecutionRuntime {
  public:
   ScopedExecutionRuntime(TransactionContext& context, ExecutionRuntime& runtime)
-      : context_(context), previous_(context.execution_runtime()) {
+      : context_(context),
+        previous_(context.execution_runtime()),
+        previous_lookup_cache_(relational_detail::active_lookup_cache) {
     context_.set_execution_runtime(&runtime);
+    relational_detail::active_lookup_cache = &runtime.lookup_cache;
   }
   ScopedExecutionRuntime(const ScopedExecutionRuntime&) = delete;
   ScopedExecutionRuntime& operator=(const ScopedExecutionRuntime&) = delete;
   ScopedExecutionRuntime(ScopedExecutionRuntime&&) = delete;
   ScopedExecutionRuntime& operator=(ScopedExecutionRuntime&&) = delete;
-  ~ScopedExecutionRuntime() { context_.set_execution_runtime(previous_); }
+  ~ScopedExecutionRuntime() {
+    context_.set_execution_runtime(previous_);
+    relational_detail::active_lookup_cache = previous_lookup_cache_;
+  }
 
  private:
   TransactionContext& context_;
   ExecutionRuntime* previous_;
+  relational_detail::ColumnLookupCache* previous_lookup_cache_;
 };
 
 }  // namespace
@@ -4661,6 +7400,7 @@ Status RelationalExecutor::Initialize() {
   correlated_index_builds_ = runtime.correlated_index_builds;
   correlated_index_probes_ = runtime.correlated_index_probes;
   correlated_result_cache_hits_ = runtime.correlated_result_cache_hits;
+  shared_exists_build_reuses_ = runtime.shared_exists_build_reuses;
   correlated_distinct_keys_ = 0;
   for (const auto& [query, index] : runtime.correlated_indexes) {
     (void)query;
@@ -4669,9 +7409,11 @@ Status RelationalExecutor::Initialize() {
     }
   }
   uncorrelated_cache_hits_ = runtime.uncorrelated_cache_hits;
+  grouped_join_fusions_ = runtime.grouped_join_fusions;
   uncorrelated_hash_builds_ = runtime.uncorrelated_hash_builds;
   uncorrelated_hash_probes_ = runtime.uncorrelated_hash_probes;
   exists_short_circuit_queries_ = runtime.exists_short_circuit_queries;
+  correlated_domain_filter_builds_ = runtime.correlated_domain_filter_builds;
   scan_ms_ = runtime.scan_ms;
   filter_ms_ = runtime.filter_ms;
   join_ms_ = runtime.join_ms;
@@ -4695,6 +7437,9 @@ Status RelationalExecutor::Initialize() {
   key_filter_keys_ = runtime.key_filter_keys;
   key_filter_rejected_ = runtime.key_filter_rejected;
   key_filter_null_rejected_ = runtime.key_filter_null_rejected;
+  key_filter_minmax_ = runtime.key_filter_minmax;
+  key_filter_bloom_ = runtime.key_filter_bloom;
+  key_filter_bytes_ = runtime.key_filter_bytes;
   empty_build_short_circuit_ = runtime.empty_build_short_circuit;
   null_aware_anti_build_contains_null_ =
       runtime.null_aware_anti_build_contains_null;
@@ -4748,20 +7493,23 @@ void RelationalExecutor::Dump(std::ostream& output, int /*indent*/) const {
          << ", correlated_index_builds=" << correlated_index_builds_
          << ", correlated_index_probes=" << correlated_index_probes_
          << ", correlated_result_cache_hits=" << correlated_result_cache_hits_
+         << ", shared_exists_build_reuses=" << shared_exists_build_reuses_
          << ", correlated_distinct_keys=" << correlated_distinct_keys_
          << ", uncorrelated_cache_hits=" << uncorrelated_cache_hits_
          << ", uncorrelated_hash_builds=" << uncorrelated_hash_builds_
          << ", uncorrelated_hash_probes=" << uncorrelated_hash_probes_
          << ", exists_short_circuit_queries=" << exists_short_circuit_queries_
-         << ", scan_ms=" << scan_ms_ << ", filter_ms=" << filter_ms_
-         << ", join_ms=" << join_ms_ << ", project_ms=" << project_ms_
-         << ", sort_ms=" << sort_ms_
+         << ", correlated_domain_filter_builds="
+         << correlated_domain_filter_builds_ << ", scan_ms=" << scan_ms_
+         << ", filter_ms=" << filter_ms_ << ", join_ms=" << join_ms_
+         << ", project_ms=" << project_ms_ << ", sort_ms=" << sort_ms_
          << ", topn_finish_uses=" << topn_finish_uses_
          << ", topn_finish_capacity=" << topn_finish_capacity_
          << ", topn_finish_input_rows=" << topn_finish_input_rows_
          << ", planning_ms=" << planning_ms_
          << ", join_estimate_ms=" << join_estimate_ms_
          << ", aggregate_ms=" << aggregate_ms_
+         << ", grouped_join_fusions=" << grouped_join_fusions_
          << ", base_scan_cache_hits=" << base_scan_cache_hits_
          << ", aggregate_input_rows=" << aggregate_input_rows_
          << ", aggregate_groups=" << aggregate_groups_
@@ -4771,7 +7519,23 @@ void RelationalExecutor::Dump(std::ostream& output, int /*indent*/) const {
          << ", scan_values_decoded=" << scan_values_decoded_
          << ", scan_values_available=" << scan_values_available_ << ")";
   if (key_filter_keys_ != 0) {
-    output << "\nRuntimeFilter type=exact_set keys=" << key_filter_keys_
+    // Composition of the published dynamic filters (Phase 2 "Dynamic Filter
+    // Join / SIP / Bloom"): `exact_set` for the information-passing shape,
+    // plus `min_max` / `bloom` when the build domain outgrew the exact set.
+    output << "\nRuntimeFilter type=";
+    if (key_filter_minmax_ != 0) {
+      output << "min_max+";
+    }
+    if (key_filter_bloom_ != 0) {
+      output << "bloom";
+    }
+    if (key_filter_minmax_ == 0 && key_filter_bloom_ == 0) {
+      output << "exact_set";
+    } else if (key_filter_bloom_ == 0) {
+      output << "min_max";
+    }
+    output << " keys=" << key_filter_keys_ << " bytes=" << key_filter_bytes_
+           << " scans=" << key_filter_scans_
            << "\nprobe_rows_rejected=" << key_filter_rejected_
            << "\nprobe_rows_null_rejected=" << key_filter_null_rejected_;
   }

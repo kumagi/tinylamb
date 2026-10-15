@@ -79,6 +79,9 @@ Type AggregateExpression::ResultType(const Schema& schema) const {
   if (type_ == AggregationType::kCount) {
     return {TypeTag::kBigInt};
   }
+  if (type_ == AggregationType::kRegrCount) {
+    return {TypeTag::kBigInt};
+  }
   if (type_ == AggregationType::kAvg || IsStatisticalAggregate(type_) ||
       type_ == AggregationType::kHllMerge) {
     return {TypeTag::kDouble};
@@ -97,6 +100,9 @@ Type AggregateExpression::ResultType(const Schema& schema) const {
 Type AggregateExpression::ResultType(const Schema& left,
                                      const Schema& right) const {
   if (type_ == AggregationType::kCount) {
+    return {TypeTag::kBigInt};
+  }
+  if (type_ == AggregationType::kRegrCount) {
     return {TypeTag::kBigInt};
   }
   if (type_ == AggregationType::kAvg || IsStatisticalAggregate(type_) ||

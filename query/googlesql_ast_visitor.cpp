@@ -41,6 +41,7 @@
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -50,6 +51,7 @@
 #include "expression/proto_schema.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast.hpp"
@@ -1131,12 +1133,40 @@ bool NeedsRelationalEvaluation(
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
-      if (call.FuncName() == "__value_table_value" && call.Args().size() == 1 &&
-          call.Args()[0] && call.Args()[0]->Type() == TypeTag::kColumnValue &&
-          call.Args()[0]->AsColumnValue().GetColumnName().name == "*") {
-        return false;
+      // The star form of the value-table shim is transparent to every
+      // evaluator; the other proto plumbing forms still need the relational
+      // interpreter's proto-field resolution.
+      if (call.FuncName() == "__value_table_value") {
+        return call.Args().size() != 1 || !call.Args()[0] ||
+               call.Args()[0]->Type() != TypeTag::kColumnValue ||
+               call.Args()[0]->AsColumnValue().GetColumnName().name != "*";
       }
-      return true;
+      if (call.FuncName() == "__proto_new") {
+        return true;
+      }
+      std::string lower_name = call.FuncName();
+      std::ranges::transform(
+          lower_name, lower_name.begin(),
+          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      // A SQL scalar UDF's body evaluates through the interpreter's scope
+      // chain; it stays relational regardless of the hatch below.
+      if (FindSqlScalarFunction(lower_name).has_value()) {
+        return true;
+      }
+      // Ordinary scalar functions (EXTRACT, UPPER, SUBSTR, ...) evaluate the
+      // same through the plan/AST evaluators.  The 2026-10-03 hatch lets a
+      // GROUP BY key / SELECT item / WHERE term carrying them cross the
+      // Cascades bridge instead of dragging the whole statement onto the
+      // relational route.  Default off: flipping it needs the TPC-H Q9 A/B
+      // (the 2026-10-03 round-8 revert) plus the full TPC-DS/TPC-H suite;
+      // the estimate collapse that regressed Q9 then (vacuous stats on
+      // computed projection columns) was fixed the same day in
+      // ProjectionPlan/table_statistics.
+      static const bool scalar_functions_cascades = [] {
+        const char* hatch = std::getenv("TINYLAMB_SCALAR_FN_CASCADES");
+        return hatch != nullptr && std::string_view(hatch) == "1";
+      }();
+      return !scalar_functions_cascades;
     }
     case TypeTag::kWindowFunctionExp:
       // Window functions always evaluate through the relational engine's
@@ -1215,6 +1245,15 @@ bool IsBooleanAstNode(const GoogleSqlAstNode& node) {
   return false;
 }
 
+// Boolean-valued AST node kinds beyond IsBooleanAstNode's operator-level
+// checks: IN / LIKE / BETWEEN / quantified comparisons evaluate to BOOL but
+// arrive as their own node kinds rather than BinaryExpression.
+bool IsPredicateAstNode(const GoogleSqlAstNode& node) {
+  return IsBooleanAstNode(node) || node.kind == "InExpression" ||
+         node.kind == "LikeExpression" || node.kind == "BetweenExpression" ||
+         node.kind == "QuantifiedComparisonExpression";
+}
+
 // ---------------------------------------------------------------------------
 // SQL UDF / UDA support (CREATE TEMP FUNCTION / CREATE TEMP AGGREGATE
 // FUNCTION).  Definitions are kept in a session registry; call sites expand
@@ -1241,8 +1280,11 @@ std::unordered_map<std::string, SqlUdf>& UdfRegistry() {
   return registry;
 }
 
+}  // namespace
+
 // TEMP views created by CREATE VIEW statements: name -> cloned statement
-// AST. Views expand as macro subqueries at FROM-reference time.
+// AST. Views expand as macro subqueries at FROM-reference time; declared in
+// the header so SqlEngine can re-seed it from the persisted definitions.
 std::unordered_map<std::string, std::shared_ptr<GoogleSqlAstNode>>&
 ViewRegistry() {
   static thread_local std::unordered_map<std::string,
@@ -1250,6 +1292,8 @@ ViewRegistry() {
       registry;
   return registry;
 }
+
+namespace {
 
 size_t& ViewExpansionDepth() {
   static thread_local size_t depth = 0;
@@ -1269,6 +1313,16 @@ std::unique_ptr<GoogleSqlAstNode> CloneAstNode(
   }
   return clone;
 }
+
+}  // namespace
+
+void RegisterViewDefinition(std::string_view name,
+                            const GoogleSqlAstNode& query) {
+  std::shared_ptr<GoogleSqlAstNode> clone = CloneAstNode(query);
+  ViewRegistry()[Lower(std::string(name))] = std::move(clone);
+}
+
+namespace {
 
 struct UdfExpansionFrame {
   const SqlUdf* udf;
@@ -1642,11 +1696,34 @@ bool IsBytesAstNode(const GoogleSqlAstNode& node) {
   return false;
 }
 
+// Wraps `key` in the COLLATE(key, 'spec') call a `COLLATE` clause means.
+// GoogleSQL requires a plain string literal as the collator; anything else
+// (a column, a parameter) is left alone, which is also what the function-call
+// form of COLLATE validates at its own call site.
+StatusOr<Expression> MakeCollateCall(Expression key,
+                                     const GoogleSqlAstNode& collate) {
+  const GoogleSqlAstNode* spec = nullptr;
+  for (const auto& child : collate.children) {
+    if (child->kind == "StringLiteral") {
+      spec = child.get();
+      break;
+    }
+  }
+  if (spec == nullptr) {
+    return key;
+  }
+  ASSIGN_OR_RETURN(std::string, name, (DecodeString(*spec)));
+  return FunctionCallExp(
+      "collate", std::vector<Expression>{
+                     std::move(key), ConstantValueExp(Value(std::move(name)))});
+}
+
 StatusOr<WindowOrderTerm> ParseOrderingTerm(const GoogleSqlAstNode* term) {
   WindowOrderTerm parsed;
   if (term == nullptr || term->children.empty()) {
     return parsed;
   }
+  const GoogleSqlAstNode* collate = nullptr;
   for (const auto& child : term->children) {
     if (child->kind == "Location") {
       continue;
@@ -1659,6 +1736,14 @@ StatusOr<WindowOrderTerm> ParseOrderingTerm(const GoogleSqlAstNode* term) {
       parsed.nulls_first = null_order_text.find("FIRST") != std::string::npos;
       continue;
     }
+    // `ORDER BY x COLLATE 'spec'` arrives as a trailing Collate child. The
+    // key expression is the collation's *operand*, so the clause can only be
+    // applied after the loop: a child after the key expression is the clause,
+    // never another operand.
+    if (child->kind == "Collate") {
+      collate = child.get();
+      continue;
+    }
     if (!parsed.expression) {
       ASSIGN_OR_RETURN(Expression, hv54641_0, (VisitExpression(*child)));
       parsed.expression = std::move(hv54641_0);
@@ -1669,6 +1754,11 @@ StatusOr<WindowOrderTerm> ParseOrderingTerm(const GoogleSqlAstNode* term) {
     direction = UpperCopy(SliceSource(term));
   }
   parsed.ascending = direction.find("DESC") == std::string::npos;
+  if (collate != nullptr && parsed.expression) {
+    ASSIGN_OR_RETURN(Expression, collated,
+                     (MakeCollateCall(std::move(parsed.expression), *collate)));
+    parsed.expression = std::move(collated);
+  }
   return parsed;
 }
 
@@ -1787,12 +1877,27 @@ StatusOr<Expression> RewriteLambdaArrayFunction(
   auto query_expression = std::make_shared<QueryExpression>(
       std::move(inner), nullptr, false, false);
   query_expression->SetArrayResult(true);
-  ASSIGN_OR_RETURN(
-      std::string, h_elem_sql,
-      (InferArrayElementSqlType(lambda.children.back().get() == nullptr
-                                    ? lambda
-                                    : *lambda.children.back())));
-  query_expression->SetArrayElementSqlType(h_elem_sql);
+  // ARRAY_FILTER keeps the input's element type, so it is inferred from the
+  // array argument; ARRAY_TRANSFORM's element type comes from the lambda
+  // body. Unknown stays empty and the runtime infers it from the produced
+  // elements.
+  if (as_filter) {
+    ASSIGN_OR_RETURN(std::string, h_elem_sql,
+                     (InferArrayElementSqlType(array_node)));
+    if (h_elem_sql.starts_with("ARRAY<") && h_elem_sql.back() == '>') {
+      h_elem_sql = h_elem_sql.substr(6, h_elem_sql.size() - 7);
+    } else {
+      h_elem_sql.clear();
+    }
+    query_expression->SetArrayElementSqlType(std::move(h_elem_sql));
+  } else {
+    ASSIGN_OR_RETURN(
+        std::string, h_elem_sql,
+        (InferArrayElementSqlType(lambda.children.back().get() == nullptr
+                                      ? lambda
+                                      : *lambda.children.back())));
+    query_expression->SetArrayElementSqlType(std::move(h_elem_sql));
+  }
   Expression array_result(query_expression);
   return CaseExpressionExp({{UnaryExpressionExp(std::move(array_for_null_check),
                                                 UnaryOperation::kIsNull),
@@ -1849,6 +1954,13 @@ StatusOr<Expression> VisitFunction(
   }
   if (name == "lcase") {
     name = "lower";
+  }
+  // MEDIAN(x) [OVER (...)] ≡ PERCENTILE_CONT(x, 0.5): one alias here makes
+  // both the aggregate and window routes reuse the exact interpolation
+  // implementation instead of carrying a second median accumulator.
+  const bool median_alias = name == "median";
+  if (median_alias) {
+    name = "percentile_cont";
   }
   if (name == "array_transform" || name == "array_filter" ||
       name == "array_includes") {
@@ -1910,6 +2022,38 @@ StatusOr<Expression> VisitFunction(
       name = "byte_regexp_instr";
     } else if (name == "regexp_extract_all") {
       name = "byte_regexp_extract_all";
+    }
+  }
+  // BigQuery exposes the DATE parts as plain one-argument functions
+  // (DAY(x), DAYOFWEEK(x), WEEKDAY(x), ...) alongside EXTRACT(part FROM x).
+  // Lower them to the extract_* calls the EXTRACT path produces so both
+  // spellings share one evaluator implementation. The 2-argument WEEK(x,
+  // week_day) form changes the week start and is left to its own error.
+  static const std::unordered_map<std::string_view, std::string_view>
+      kDatePartFunctionAliases = {
+          {"day", "day"},
+          {"dayofweek", "dayofweek"},
+          {"dayofyear", "dayofyear"},
+          {"month", "month"},
+          {"quarter", "quarter"},
+          {"year", "year"},
+          {"isoyear", "isoyear"},
+          {"isoweek", "isoweek"},
+          {"week", "week"},
+          {"weekday", "weekday"},
+      };
+  {
+    const auto alias = kDatePartFunctionAliases.find(name);
+    if (alias != kDatePartFunctionAliases.end()) {
+      size_t argument_count = 0;
+      for (size_t i = 1; i < node.children.size(); ++i) {
+        if (node.children[i]->kind != "Location") {
+          ++argument_count;
+        }
+      }
+      if (argument_count == 1) {
+        name = std::string("extract_") + std::string(alias->second);
+      }
     }
   }
   std::vector<Expression> arguments;
@@ -1985,6 +2129,9 @@ StatusOr<Expression> VisitFunction(
       arg = WrapIfBoolean(std::move(arg), child);
     }
     arguments.push_back(std::move(arg));
+  }
+  if (median_alias) {
+    arguments.push_back(ConstantValueExp(Value(0.5)));
   }
 
   auto finish_aggregate = [&](AggregationType type) -> StatusOr<Expression> {
@@ -2065,7 +2212,7 @@ StatusOr<Expression> VisitFunction(
       name == "array_agg" || name == "string_agg" || name == "countif" ||
       name == "bit_and" || name == "bit_or" || name == "bit_xor" ||
       name == "array_concat_agg" || name == "elementwise_sum" ||
-      name == "elementwise_avg" || name == "any_value" ||
+      name == "elementwise_avg" || name == "any_value" || name == "mode" ||
       name == "approx_top_count" || name == "approx_top_sum") {
     const bool is_bit =
         name == "bit_and" || name == "bit_or" || name == "bit_xor";
@@ -2115,6 +2262,9 @@ StatusOr<Expression> VisitFunction(
     // that with deterministic streaming semantics.
     if (name == "any_value") {
       type = AggregationType::kMin;
+    }
+    if (name == "mode") {
+      type = AggregationType::kMode;
     }
     if (name == "bit_and") {
       type = AggregationType::kBitAnd;
@@ -2169,6 +2319,33 @@ StatusOr<Expression> VisitFunction(
       min_arity = max_arity = 2;
     } else if (name == "corr") {
       extended = AggregationType::kCorr;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_slope") {
+      extended = AggregationType::kRegrSlope;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_intercept") {
+      extended = AggregationType::kRegrIntercept;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_count") {
+      extended = AggregationType::kRegrCount;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_r2") {
+      extended = AggregationType::kRegrR2;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_avgx") {
+      extended = AggregationType::kRegrAvgX;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_avgy") {
+      extended = AggregationType::kRegrAvgY;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_sxx") {
+      extended = AggregationType::kRegrSxx;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_syy") {
+      extended = AggregationType::kRegrSyy;
+      min_arity = max_arity = 2;
+    } else if (name == "regr_sxy") {
+      extended = AggregationType::kRegrSxy;
       min_arity = max_arity = 2;
     } else if (name == "approx_quantiles") {
       extended = AggregationType::kApproxQuantiles;
@@ -2496,6 +2673,34 @@ StatusOr<std::string> InferArrayElementSqlType(
     return std::string{};
   }
 
+  // Predicate-shaped nodes produce BOOL, which the runtime cannot recover
+  // from stored values (BOOL folds into kInt64): they need the static tag.
+  if (IsPredicateAstNode(node)) {
+    return "BOOL";
+  }
+  if (node.kind == "ConcatExpr") {
+    // `a || b` is array concatenation when every operand is an array;
+    // otherwise the result is a string.
+    std::string array_type;
+    for (const auto& child : node.children) {
+      if (IsAstTrivia(child->kind)) {
+        continue;
+      }
+      ASSIGN_OR_RETURN(std::string, h_tmp_cat,
+                       (InferArrayElementSqlType(*child)));
+      if (h_tmp_cat.empty()) {
+        return std::string{};  // array-vs-string concat is undecidable
+      }
+      if (!h_tmp_cat.starts_with("ARRAY<")) {
+        return "STRING";
+      }
+      if (array_type.empty()) {
+        array_type = std::move(h_tmp_cat);
+      }
+    }
+    return array_type.empty() ? std::string("STRING") : array_type;
+  }
+
   if (node.kind == "ArrayConstructor") {
     std::string inner;
     for (const auto& child : node.children) {
@@ -2522,7 +2727,11 @@ StatusOr<std::string> InferArrayElementSqlType(
     }
     return "ARRAY<" + inner + ">";
   }
-  return "INT64";
+  // Anything else (identifiers, function calls, arithmetic) reports unknown
+  // so the runtime infers the element type from produced values — a wrong
+  // "INT64" guess would tag e.g. string-producing lambda results as
+  // ARRAY<INT64>.
+  return std::string{};
 }
 
 // Statically infers the SQL type of an ARRAY(SELECT ...) subquery's single
@@ -2567,6 +2776,11 @@ StatusOr<std::string> InferSubqueryArrayElementType(
     if (expr.kind == "CastExpression" && expr.children.size() >= 2) {
       return SqlTypeFromAst(*expr.children[1]);
     }
+    // Predicate projections produce BOOL, which runtime values cannot
+    // distinguish from INT64.
+    if (IsPredicateAstNode(expr)) {
+      return "BOOL";
+    }
     return std::string{};
   }
   return std::string{};
@@ -2604,6 +2818,11 @@ StatusOr<std::string> InferAggregateArrayElementType(
   }
   if (node.kind == "CastExpression" && node.children.size() >= 2) {
     return SqlTypeFromAst(*node.children[1]);
+  }
+  // Predicate-shaped arguments produce BOOL, which runtime values cannot
+  // distinguish from INT64 (both store as kInt64).
+  if (IsPredicateAstNode(node)) {
+    return "BOOL";
   }
   return std::string{};
 }
@@ -2844,10 +3063,14 @@ StatusOr<NamedWindowParts> ParseWindowSpecification(
   NamedWindowParts parts;
   if (const GoogleSqlAstNode* partition = spec.Child("PartitionBy")) {
     for (const auto& child : partition->children) {
-      if (child->kind == "PathExpression") {
-        ASSIGN_OR_RETURN(Expression, hv92026_0, (VisitExpression(*child)));
-        parts.partition_by.push_back(std::move(hv92026_0));
+      if (child->kind == "Location") {
+        continue;
       }
+      // Partition keys are arbitrary expressions (`PARTITION BY grouping(a)
+      // + grouping(b)`, `UPPER(x)`), not just column paths; dropping
+      // non-path children silently changed which rows share a partition.
+      ASSIGN_OR_RETURN(Expression, hv92026_0, (VisitExpression(*child)));
+      parts.partition_by.push_back(std::move(hv92026_0));
     }
   }
   if (const GoogleSqlAstNode* order = spec.Child("OrderBy")) {
@@ -2893,11 +3116,22 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
         "GoogleSQL AST: malformed analytic function call");
   }
   auto window = std::make_shared<WindowFunctionCallExpression>();
+  // Set when the call is the MEDIAN(x) OVER (...) alias; the synthesized
+  // PERCENTILE_CONT percentile argument is appended after the real ones.
+  bool median_window_alias = false;
 
   size_t arg_start = 0;
   if (call->children[0]->kind == "PathExpression") {
     ASSIGN_OR_RETURN(std::string, hv93668_0, (Path(*call->children[0])));
-    window->function = UpperCopy(std::move(hv93668_0));
+    std::string fn = UpperCopy(std::move(hv93668_0));
+    if (fn == "MEDIAN") {
+      // Same PERCENTILE_CONT(x, 0.5) alias as the aggregate route; the
+      // window evaluator dispatches on this exact name.
+      window->function = "PERCENTILE_CONT";
+      median_window_alias = true;
+    } else {
+      window->function = std::move(fn);
+    }
     arg_start = 1;
   } else {
     return AstError<Expression>("GoogleSQL AST: anonymous analytic function");
@@ -2941,6 +3175,9 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
     }
     ASSIGN_OR_RETURN(Expression, hv94904_0, (VisitExpression(child)));
     window->args.push_back(std::move(hv94904_0));
+  }
+  if (median_window_alias) {
+    window->args.push_back(ConstantValueExp(Value(0.5)));
   }
   window->inner_order_by = std::move(inner_order_by);
 
@@ -3359,10 +3596,12 @@ StatusOr<Expression> VisitExpression(
   if (node.kind == "NullLiteral") {
     return ConstantValueExp(Value());
   }
-  // INSERT ... VALUES (30, DEFAULT): tables built by this engine carry no
-  // column defaults, so DEFAULT resolves to NULL.
+  // INSERT ... VALUES (30, DEFAULT): the keyword rides a marker function
+  // call.  The visitor cannot see the target table, so the INSERT executor
+  // substitutes the target column's declared DEFAULT (and rejects the
+  // marker outside INSERT VALUES, where it has no meaning).
   if (node.kind == "DefaultLiteral") {
-    return ConstantValueExp(Value());
+    return FunctionCallExp("__column_default", {});
   }
   if (node.kind == "BooleanLiteral") {
     const std::string upper_literal = UpperCopy(node.detail);
@@ -4830,6 +5069,496 @@ StatusOr<Expression> RewriteGroupingSetBranch(
   return WithExpressionChildren(expression, std::move(children));
 }
 
+// Collects window calls from a select-entry expression.  Window
+// specifications own their scope: windows never nest inside aggregates,
+// subqueries or other window calls, so the walk stops at those boundaries.
+void CollectWindowCalls(const Expression& expression,
+                        std::vector<const WindowFunctionCallExpression*>* out) {
+  if (!expression) {
+    return;
+  }
+  if (expression->Type() == TypeTag::kWindowFunctionExp) {
+    out->push_back(&expression->AsWindowFunctionCallExpression());
+    return;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kAggregateExp:
+    case TypeTag::kQueryExp:
+      return;
+    default:
+      break;
+  }
+  for (const Expression& child : ExpressionChildren(expression)) {
+    CollectWindowCalls(child, out);
+  }
+}
+
+// True when the expression can be evaluated directly against the combined
+// grouping set output: only column references and constants downstream of
+// scalar operators.  Aggregates would degrade into scalar aggregations and
+// window calls cannot nest, so both fail the check.
+bool OnlyReferencesWrapperColumns(const Expression& expression,
+                                  const std::string& wrapper_alias) {
+  if (!expression) {
+    return true;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kAggregateExp:
+    case TypeTag::kWindowFunctionExp:
+    case TypeTag::kQueryExp:
+      return false;
+    case TypeTag::kColumnValue:
+      return expression->AsColumnValue().GetColumnName().schema ==
+             wrapper_alias;
+    default:
+      break;
+  }
+  return std::ranges::all_of(ExpressionChildren(expression),
+                             [&wrapper_alias](const Expression& child) {
+                               return OnlyReferencesWrapperColumns(
+                                   child, wrapper_alias);
+                             });
+}
+
+// Rewrites window calls into wrapper-level calls whose inputs reference the
+// hidden per-branch columns.  Frame specifications carry constants and are
+// copied verbatim; every other window input must have been materialized.
+StatusOr<Expression> RewireWindowInputs(
+    const Expression& expression, const std::string& wrapper_alias,
+    const std::unordered_map<std::string, std::string>& hidden_columns) {
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kWindowFunctionExp) {
+    const WindowFunctionCallExpression& window =
+        expression->AsWindowFunctionCallExpression();
+    auto rebuilt = std::make_shared<WindowFunctionCallExpression>();
+    rebuilt->function = window.function;
+    rebuilt->distinct = window.distinct;
+    rebuilt->respect_nulls = window.respect_nulls;
+    rebuilt->ignore_nulls = window.ignore_nulls;
+    rebuilt->inner_limit = window.inner_limit;
+    rebuilt->frame_unit = window.frame_unit;
+    rebuilt->frame_start = window.frame_start;
+    rebuilt->frame_end = window.frame_end;
+    rebuilt->has_frame = window.has_frame;
+    rebuilt->exclusion = window.exclusion;
+    const auto map_input =
+        [&](const Expression& input) -> StatusOr<Expression> {
+      const auto found = hidden_columns.find(input->ToString());
+      if (found == hidden_columns.end()) {
+        return AstError<Expression>(
+            "window function input over GROUPING SETS / ROLLUP / CUBE was "
+            "not materialized: " +
+            input->ToString());
+      }
+      return ColumnValueExp(ColumnName(wrapper_alias, found->second));
+    };
+    for (const Expression& arg : window.args) {
+      ASSIGN_OR_RETURN(Expression, mapped, (map_input(arg)));
+      rebuilt->args.push_back(std::move(mapped));
+    }
+    for (const Expression& partition : window.partition_by) {
+      ASSIGN_OR_RETURN(Expression, mapped, (map_input(partition)));
+      rebuilt->partition_by.push_back(std::move(mapped));
+    }
+    for (const WindowOrderTerm& term : window.order_by) {
+      ASSIGN_OR_RETURN(Expression, mapped, (map_input(term.expression)));
+      rebuilt->order_by.push_back(
+          {std::move(mapped), term.ascending, term.nulls_first});
+    }
+    for (const WindowOrderTerm& term : window.inner_order_by) {
+      ASSIGN_OR_RETURN(Expression, mapped, (map_input(term.expression)));
+      rebuilt->inner_order_by.push_back(
+          {std::move(mapped), term.ascending, term.nulls_first});
+    }
+    return rebuilt;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kAggregateExp:
+    case TypeTag::kQueryExp:
+      return expression;
+    default:
+      break;
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  bool changed = false;
+  for (Expression& child : children) {
+    ASSIGN_OR_RETURN(
+        Expression, rewritten,
+        (RewireWindowInputs(child, wrapper_alias, hidden_columns)));
+    if (rewritten->ToString() != child->ToString()) {
+      child = std::move(rewritten);
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return expression;
+  }
+  return WithExpressionChildren(expression, std::move(children));
+}
+
+// Expands GROUPING SETS / ROLLUP / CUBE for statements that also carry window
+// functions.  A window function sees the *combined* result of every grouping
+// set (rank() over a ROLLUP output must span detail and subtotal rows
+// together), so computing it per branch would restart each rank per branch.
+// The expansion therefore:
+//  1. rewrites every grouping set into a branch of a UNION ALL that keeps the
+//     aggregates, folds GROUPING() to constants, NULL-pads inactive keys,
+//     renames each entry to a synthetic column and appends one hidden column
+//     per expression the window calls (and unresolvable ORDER BY terms)
+//     consume;
+//  2. wraps the union as a derived table whose select list re-projects the
+//     original entries and evaluates the window calls over the hidden
+//     columns.  ORDER BY and LIMIT move to the wrapper: they belong to the
+//     ordered, post-window result.
+StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
+    // clang-tidy performance-unnecessary-value-param: kept by value on
+    // purpose (cheap shared_ptr incref; see the snapshot note below).
+    std::shared_ptr<SelectStatement>
+        statement,  // NOLINT(performance-unnecessary-value-param)
+    const std::vector<std::vector<Expression>>& pending_grouping_sets) {
+  const std::string wrapper_alias = "$grouping_sets_window";
+  const auto branch_column = [](size_t index) {
+    return "$gsc" + std::to_string(index);
+  };
+  const auto hidden_column = [](size_t index) {
+    return "$gsw" + std::to_string(index);
+  };
+
+  std::vector<const WindowFunctionCallExpression*> window_calls;
+  for (const NamedExpression& item : statement->SelectList()) {
+    CollectWindowCalls(item.expression, &window_calls);
+  }
+  for (const auto& term : statement->OrderBy()) {
+    std::vector<const WindowFunctionCallExpression*> term_windows;
+    CollectWindowCalls(term.expression, &term_windows);
+    if (!term_windows.empty()) {
+      return AstError<std::shared_ptr<SelectStatement>>(
+          "window functions in ORDER BY with GROUPING SETS / ROLLUP / CUBE "
+          "are not supported; reference the select-list alias instead");
+    }
+  }
+
+  // Every expression a window call consumes (arguments, PARTITION BY, ORDER
+  // BY, inner ORDER BY) is post-aggregation and must be materialized per
+  // branch.  AGG(x WHERE p) OVER (...) mixes a pre-aggregation row filter
+  // into that post-aggregation surface and stays unsupported here.
+  std::vector<Expression> window_inputs;
+  std::unordered_map<std::string, std::string> hidden_columns;
+  const auto add_window_input = [&](const Expression& input) -> Status {
+    if (!input) {
+      return Status::kSuccess;
+    }
+    std::vector<const WindowFunctionCallExpression*> nested;
+    CollectWindowCalls(input, &nested);
+    if (!nested.empty()) {
+      return AstStatus(
+          "nested window functions with GROUPING SETS / ROLLUP / "
+          "CUBE are not supported");
+    }
+    const std::string text = input->ToString();
+    if (hidden_columns.contains(text)) {
+      return Status::kSuccess;
+    }
+    hidden_columns.emplace(text, hidden_column(window_inputs.size()));
+    window_inputs.push_back(input);
+    return Status::kSuccess;
+  };
+  for (const WindowFunctionCallExpression* call : window_calls) {
+    if (call->where_filter) {
+      return AstError<std::shared_ptr<SelectStatement>>(
+          "AGG(x WHERE p) OVER (...) with GROUPING SETS / ROLLUP / CUBE is "
+          "not supported");
+    }
+    for (const Expression& arg : call->args) {
+      RETURN_IF_FAIL(add_window_input(arg));
+    }
+    for (const Expression& partition : call->partition_by) {
+      RETURN_IF_FAIL(add_window_input(partition));
+    }
+    for (const WindowOrderTerm& term : call->order_by) {
+      RETURN_IF_FAIL(add_window_input(term.expression));
+    }
+    for (const WindowOrderTerm& term : call->inner_order_by) {
+      RETURN_IF_FAIL(add_window_input(term.expression));
+    }
+  }
+
+  // ORDER BY belongs to the wrapper.  Bare names that identify a select entry
+  // (by alias, or by the entry's own bare column) rebind to that branch
+  // column; ordinal terms pass through; anything else is materialized per
+  // branch like a window input so it survives the union.  Window entries have
+  // no branch column (their branch cell is a placeholder), so terms naming a
+  // window alias stay unresolved and bind to the wrapper's own output.
+  std::unordered_map<std::string, size_t> entry_by_name;
+  std::unordered_map<std::string, size_t> entry_by_text;
+  std::unordered_set<std::string> window_entry_names;
+  const std::vector<NamedExpression>& base_list = statement->SelectList();
+  for (size_t j = 0; j < base_list.size(); ++j) {
+    const NamedExpression& item = base_list[j];
+    if (!item.name.empty()) {
+      entry_by_name.emplace(Lower(item.name), j);
+    } else if (item.expression &&
+               item.expression->Type() == TypeTag::kColumnValue &&
+               item.expression->AsColumnValue()
+                   .GetColumnName()
+                   .schema.empty()) {
+      entry_by_name.emplace(
+          Lower(item.expression->AsColumnValue().GetColumnName().name), j);
+    }
+    if (item.expression) {
+      entry_by_text.emplace(item.expression->ToString(), j);
+      std::vector<const WindowFunctionCallExpression*> windows;
+      CollectWindowCalls(item.expression, &windows);
+      if (!windows.empty() && !item.name.empty()) {
+        window_entry_names.insert(Lower(item.name));
+      }
+    }
+  }
+  // Rebinds bare column references that name a select entry to that entry's
+  // branch column.  Aggregate, window and subquery scopes are not descended.
+  const std::function<Expression(const Expression&)> rebind_output_names =
+      [&](const Expression& expression) -> Expression {
+    if (!expression) {
+      return expression;
+    }
+    if (expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName& column = expression->AsColumnValue().GetColumnName();
+      if (column.schema.empty()) {
+        const auto found = entry_by_name.find(Lower(column.name));
+        if (found != entry_by_name.end()) {
+          return ColumnValueExp(
+              ColumnName(wrapper_alias, branch_column(found->second)));
+        }
+      }
+      return expression;
+    }
+    switch (expression->Type()) {
+      case TypeTag::kAggregateExp:
+      case TypeTag::kWindowFunctionExp:
+      case TypeTag::kQueryExp:
+        return expression;
+      default:
+        break;
+    }
+    std::vector<Expression> children = ExpressionChildren(expression);
+    bool changed = false;
+    for (Expression& child : children) {
+      Expression rebound = rebind_output_names(child);
+      if (rebound->ToString() != child->ToString()) {
+        child = std::move(rebound);
+        changed = true;
+      }
+    }
+    if (!changed) {
+      return expression;
+    }
+    return WithExpressionChildren(expression, std::move(children));
+  };
+  std::vector<SelectStatement::OrderByTerm> wrapper_terms;
+  for (SelectStatement::OrderByTerm term : statement->OrderBy()) {
+    if (term.expression && term.expression->Type() == TypeTag::kConstantValue) {
+      // Ordinal terms resolve against the wrapper's select list, whose entry
+      // order matches the original.
+      wrapper_terms.push_back(std::move(term));
+      continue;
+    }
+    if (term.expression && term.expression->Type() == TypeTag::kColumnValue &&
+        term.expression->AsColumnValue().GetColumnName().schema.empty() &&
+        window_entry_names.contains(
+            Lower(term.expression->AsColumnValue().GetColumnName().name))) {
+      // A bare window alias sorts the wrapper's own computed window column;
+      // the engine's ORDER BY binding resolves it against the output.  The
+      // branch-side column is a NULL placeholder and must not be used.
+      wrapper_terms.push_back(std::move(term));
+      continue;
+    }
+    Expression rebound = rebind_output_names(term.expression);
+    const auto by_text = entry_by_text.find(rebound->ToString());
+    if (by_text != entry_by_text.end()) {
+      term.expression = ColumnValueExp(
+          ColumnName(wrapper_alias, branch_column(by_text->second)));
+    } else if (OnlyReferencesWrapperColumns(rebound, wrapper_alias)) {
+      term.expression = std::move(rebound);
+    } else {
+      RETURN_IF_FAIL(add_window_input(rebound));
+      term.expression = ColumnValueExp(
+          ColumnName(wrapper_alias, hidden_columns.at(rebound->ToString())));
+    }
+    wrapper_terms.push_back(std::move(term));
+  }
+
+  // Fingerprint of every key across all sets (deduplicated, insertion
+  // order); a branch NULL-pads references to keys outside its active set.
+  std::vector<std::string> all_key_texts;
+  for (const auto& set : pending_grouping_sets) {
+    for (const Expression& key : set) {
+      const std::string text = key->ToString();
+      if (std::ranges::find(all_key_texts, text) == all_key_texts.end()) {
+        all_key_texts.push_back(text);
+      }
+    }
+  }
+  const auto inactive_bare_key_aliases =
+      [&](const GroupingSetBranchContext& context) {
+        std::unordered_set<std::string> out;
+        for (const auto& set : pending_grouping_sets) {
+          for (const Expression& key : set) {
+            if (!key || key->Type() != TypeTag::kColumnValue) {
+              continue;
+            }
+            const std::string text = key->ToString();
+            if (context.active_key_texts.contains(text)) {
+              continue;
+            }
+            if (key->AsColumnValue().GetColumnName().schema.empty()) {
+              out.insert(Lower(text));
+            }
+          }
+        }
+        return out;
+      };
+
+  // A snapshot, not a reference: the rewrite below mutates *statement while
+  // still reading the original select list from `base`.
+  const SelectStatement
+      base =  // NOLINT(performance-unnecessary-copy-initialization)
+      *statement;
+  auto rewrite_window_branch =
+      [&](SelectStatement& branch,
+          const std::vector<Expression>& active) -> Status {
+    GroupingSetBranchContext context;
+    context.all_key_texts = all_key_texts;
+    for (const Expression& key : active) {
+      context.active_key_texts.insert(key->ToString());
+    }
+    const std::unordered_set<std::string> inactive_aliases =
+        inactive_bare_key_aliases(context);
+
+    std::vector<NamedExpression> rewritten_list;
+    rewritten_list.reserve(base.SelectList().size() + window_inputs.size());
+    std::vector<const WindowFunctionCallExpression*> windows_scratch;
+    for (const NamedExpression& item : base.SelectList()) {
+      const std::string entry_name = branch_column(rewritten_list.size());
+      if (!item.expression) {
+        rewritten_list.emplace_back(entry_name, item.expression);
+        continue;
+      }
+      windows_scratch.clear();
+      CollectWindowCalls(item.expression, &windows_scratch);
+      if (!windows_scratch.empty()) {
+        // The wrapper recomputes windows over the combined rows; the branch
+        // keeps a placeholder so every branch shares the union width.
+        rewritten_list.emplace_back(entry_name, ConstantValueExp(Value()));
+        continue;
+      }
+      // `SELECT a AS k ... GROUP BY ROLLUP(k)`: an entry named after an
+      // inactive bare-column key NULL-pads even though its expression (`a`)
+      // differs from the key text (`k`).
+      const std::string entry_text = item.expression->ToString();
+      const bool entry_is_active =
+          context.active_key_texts.contains(entry_text);
+      const bool entry_aliases_inactive_key =
+          !item.name.empty() && inactive_aliases.contains(Lower(item.name)) &&
+          !entry_is_active;
+      if (entry_aliases_inactive_key) {
+        rewritten_list.emplace_back(entry_name, ConstantValueExp(Value()));
+        continue;
+      }
+      ASSIGN_OR_RETURN(Expression, rewritten,
+                       (RewriteGroupingSetBranch(item.expression, context)));
+      rewritten_list.emplace_back(entry_name, std::move(rewritten));
+    }
+    for (const Expression& input : window_inputs) {
+      ASSIGN_OR_RETURN(Expression, rewritten,
+                       (RewriteGroupingSetBranch(input, context)));
+      rewritten_list.emplace_back(
+          hidden_column(rewritten_list.size() - base.SelectList().size()),
+          std::move(rewritten));
+    }
+    branch.SetSelectList(std::move(rewritten_list));
+    if (branch.Having()) {
+      ASSIGN_OR_RETURN(Expression, having,
+                       (RewriteGroupingSetBranch(branch.Having(), context)));
+      branch.SetHaving(std::move(having));
+    }
+    // The empty grouping set () aggregates the whole input into one row;
+    // the plain-item path keys it on a constant for that shape.
+    std::vector<Expression> group_keys = active;
+    if (group_keys.empty()) {
+      group_keys.push_back(ConstantValueExp(Value(int64_t{0})));
+      branch.SetGroupAll(true);
+    }
+    branch.SetGroupBy(std::move(group_keys));
+    branch.SetOrderBy({});
+    return Status::kSuccess;
+  };
+
+  for (size_t i = 0; i < pending_grouping_sets.size(); ++i) {
+    if (i == 0) {
+      RETURN_IF_FAIL(
+          rewrite_window_branch(*statement, pending_grouping_sets.front()));
+      continue;
+    }
+    auto branch = std::make_shared<SelectStatement>(base);
+    RETURN_IF_FAIL(rewrite_window_branch(*branch, pending_grouping_sets[i]));
+    // ORDER BY / LIMIT / WITH TIES belong to the wrapper only.
+    branch->SetOrderBy({});
+    branch->SetLimit(std::nullopt);
+    branch->SetOffset(0);
+    branch->SetWithTies(false);
+    // Same as the plain expansion: the owning statement keeps the WITH
+    // declarations so the CTE bodies execute once, not once per grouping set.
+    branch->ClearWithQueries();
+    statement->AddSetOperation(SetOperationKind::kUnionAll, std::move(branch));
+  }
+
+  // Wrapper select list: non-window entries re-project their branch column;
+  // window entries are rebuilt with every input rewired to a hidden column.
+  std::vector<NamedExpression> wrapper_list;
+  wrapper_list.reserve(base.SelectList().size());
+  for (size_t j = 0; j < base.SelectList().size(); ++j) {
+    const NamedExpression& item = base.SelectList()[j];
+    std::string name = item.name;
+    if (name.empty() && item.expression &&
+        item.expression->Type() == TypeTag::kColumnValue) {
+      // Unnamed bare-column entries keep their column as the output name.
+      name = item.expression->AsColumnValue().GetColumnName().name;
+    }
+    std::vector<const WindowFunctionCallExpression*> windows;
+    CollectWindowCalls(item.expression, &windows);
+    if (windows.empty()) {
+      wrapper_list.emplace_back(
+          std::move(name),
+          ColumnValueExp(ColumnName(wrapper_alias, branch_column(j))));
+      continue;
+    }
+    ASSIGN_OR_RETURN(
+        Expression, rewired,
+        (RewireWindowInputs(item.expression, wrapper_alias, hidden_columns)));
+    wrapper_list.emplace_back(std::move(name), std::move(rewired));
+  }
+
+  auto wrapper = std::make_shared<SelectStatement>();
+  SelectSource source;
+  source.query = statement;
+  source.alias = wrapper_alias;
+  source.join_type = JoinType::kCross;
+  wrapper->SetSources({std::move(source)});
+  wrapper->SetSelectList(std::move(wrapper_list));
+  wrapper->SetOrderBy(std::move(wrapper_terms));
+  wrapper->SetLimit(statement->HasLimit()
+                        ? std::optional<size_t>(statement->Limit())
+                        : std::nullopt);
+  wrapper->SetOffset(statement->Offset());
+  wrapper->SetWithTies(statement->WithTies());
+  statement->SetLimit(std::nullopt);
+  statement->SetOffset(0);
+  statement->SetWithTies(false);
+  return wrapper;
+}
+
 StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
                                          const GoogleSqlAstNode& pivot) {
   const GoogleSqlAstNode* expr_list = pivot.Child("PivotExpressionList");
@@ -5370,6 +6099,129 @@ StatusOr<SelectSource> VisitTableSource(
       }
       return view_source;
     }
+  } else if (node.kind == "TVF") {
+    // Table function invocation: expand the stored defining query with the
+    // call-site arguments.  Arguments must evaluate as constants at this
+    // statement boundary (correlated TVF references are not supported);
+    // trailing parameters pad from their DEFAULT expressions exactly like
+    // scalar UDF binding.
+    const GoogleSqlAstNode* path = node.Child("PathExpression");
+    if (path == nullptr) {
+      return AstError<SelectSource>(
+          "GoogleSQL AST: table function without name");
+    }
+    ASSIGN_OR_RETURN(std::string, hv244001_0, (Path(*path)));
+    const std::string function_name = std::move(hv244001_0);
+    const auto& udfs = UdfRegistry();
+    const auto found = udfs.find(Lower(function_name));
+    if (found == udfs.end()) {
+      return AstError<SelectSource>("unknown table function " + function_name);
+    }
+    const SqlUdf& tvf = found->second;
+    if (tvf.body == nullptr) {
+      return AstError<SelectSource>("table function " + function_name +
+                                    " has no body");
+    }
+    std::unordered_map<std::string, Expression> bindings;
+    size_t arg_index = 0;
+    for (const GoogleSqlAstNode* argument : node.Children("TVFArgument")) {
+      if (arg_index >= tvf.parameters.size()) {
+        return AstError<SelectSource>("too many arguments for table function " +
+                                      function_name);
+      }
+      const GoogleSqlAstNode* expression_node = nullptr;
+      for (const auto& child : argument->children) {
+        if (child->kind != "Location") {
+          expression_node = child.get();
+          break;
+        }
+      }
+      if (expression_node == nullptr) {
+        return AstError<SelectSource>("table function " + function_name +
+                                      " argument " + std::to_string(arg_index) +
+                                      " is empty");
+      }
+      ASSIGN_OR_RETURN(Expression, hv244002_0,
+                       (VisitExpression(*expression_node)));
+      // Volatile calls (RAND(), ...) would silently freeze one draw into
+      // every expansion of the body; require genuinely constant arguments.
+      const auto volatile_arg = [](const Expression& expression) {
+        if (expression->Type() == TypeTag::kFunctionCallExp &&
+            GetFunctionVolatility(
+                expression->AsFunctionCallExpression().FuncName()) !=
+                Volatility::kImmutable) {
+          return true;
+        }
+        for (const Expression& child : ExpressionChildren(expression)) {
+          std::vector<Expression> stack{child};
+          while (!stack.empty()) {
+            Expression current = stack.back();
+            stack.pop_back();
+            if (current->Type() == TypeTag::kFunctionCallExp &&
+                GetFunctionVolatility(
+                    current->AsFunctionCallExpression().FuncName()) !=
+                    Volatility::kImmutable) {
+              return true;
+            }
+            for (const Expression& next : ExpressionChildren(current)) {
+              stack.push_back(next);
+            }
+          }
+        }
+        return false;
+      };
+      if (volatile_arg(hv244002_0)) {
+        return AstError<SelectSource>(
+            "table function arguments must be constant: " + function_name);
+      }
+      Row dummy_row;
+      Schema dummy_schema;
+      StatusOr<Value> constant =
+          hv244002_0->TryEvaluate(dummy_row, dummy_schema);
+      if (!constant.HasValue()) {
+        return AstError<SelectSource>(
+            "table function arguments must be constant: " + function_name);
+      }
+      bindings[tvf.parameters[arg_index].first] =
+          ConstantValueExp(constant.MoveValue());
+      ++arg_index;
+    }
+    for (; arg_index < tvf.parameters.size(); ++arg_index) {
+      const std::shared_ptr<GoogleSqlAstNode>& default_expr =
+          tvf.default_values[arg_index];
+      if (default_expr == nullptr) {
+        return AstError<SelectSource>("missing argument " +
+                                      tvf.parameters[arg_index].first +
+                                      " for table function " + function_name);
+      }
+      ASSIGN_OR_RETURN(Expression, hv244003_0,
+                       (VisitExpression(*default_expr)));
+      Row dummy_row;
+      Schema dummy_schema;
+      StatusOr<Value> constant =
+          hv244003_0->TryEvaluate(dummy_row, dummy_schema);
+      if (!constant.HasValue()) {
+        return AstError<SelectSource>(
+            "table function DEFAULT arguments must be constant: " +
+            function_name);
+      }
+      bindings[tvf.parameters[arg_index].first] =
+          ConstantValueExp(constant.MoveValue());
+    }
+    ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv244004_0,
+                     (VisitQuery(*tvf.body)));
+    std::shared_ptr<SelectStatement> expanded =
+        SubstituteInSelect(*hv244004_0, bindings);
+    if (source.alias.empty()) {
+      source.alias = Lower(function_name);
+    }
+    source.query = std::move(expanded);
+    if (const GoogleSqlAstNode* sample = node.Child("SampleClause")) {
+      ASSIGN_OR_RETURN(TableSampleSpec, hv244005_0,
+                       (VisitTableSample(*sample)));
+      source.sample = std::move(hv244005_0);
+    }
+    return source;
   } else if (node.kind == "TableSubquery") {
     const GoogleSqlAstNode* query = node.Child("Query");
     if (query == nullptr) {
@@ -5529,6 +6381,447 @@ Status AppendSources(
     (*sources)[right_source_index].using_columns = std::move(using_columns);
   }
   return Status::kSuccess;
+}
+
+// Pipe syntax (`FROM t |> WHERE ...`) composes table-to-table operators.
+// Each fold wraps the previous statement as the single derived-table source
+// of a new one, so the engine's existing scoping, grouping, ordering and
+// limit machinery evaluates the pipe with identical semantics; the wrapper
+// shape also keeps the operator order (WHERE after AGGREGATE filters groups,
+// not rows) without new rules.
+std::shared_ptr<SelectStatement> WrapPipeInput(
+    std::shared_ptr<SelectStatement> input, std::string alias) {
+  auto wrapper = std::make_shared<SelectStatement>();
+  SelectSource source;
+  source.query = std::move(input);
+  source.alias = std::move(alias);
+  source.join_type = JoinType::kCross;
+  wrapper->SetSources({std::move(source)});
+  wrapper->SetSelectList({NamedExpression{"*", ColumnValueExp("*")}});
+  return wrapper;
+}
+
+// Visits a pipe SELECT/EXTEND/AGGREGATE list: standard SelectColumn items
+// with optional aliases.  Star items keep the "*" name the plain SELECT path
+// assigns, so `SELECT *` inside a pipe behaves like the non-pipe form.
+StatusOr<std::vector<NamedExpression>> VisitPipeSelectList(
+    const GoogleSqlAstNode& select_list) {
+  std::vector<NamedExpression> items;
+  for (const GoogleSqlAstNode* column : select_list.Children("SelectColumn")) {
+    const GoogleSqlAstNode* expression_node = nullptr;
+    for (const auto& child : column->children) {
+      if (child->kind != "Alias") {
+        expression_node = child.get();
+        break;
+      }
+    }
+    if (expression_node == nullptr) {
+      return AstError<std::vector<NamedExpression>>(
+          "GoogleSQL AST: empty pipe select item");
+    }
+    ASSIGN_OR_RETURN(Expression, hvpipe_0, (VisitExpression(*expression_node)));
+    Expression expression = std::move(hvpipe_0);
+    ASSIGN_OR_RETURN(std::string, hvpipe_1, (Alias(*column)));
+    std::string name = std::move(hvpipe_1);
+    if (name.empty() && expression->Type() == TypeTag::kColumnValue) {
+      name = expression->AsColumnValue().GetColumnName().name;
+    }
+    items.emplace_back(std::move(name), std::move(expression));
+  }
+  if (items.empty()) {
+    return AstError<std::vector<NamedExpression>>(
+        "GoogleSQL AST: empty pipe select list");
+  }
+  return items;
+}
+
+// The set-operation executor compares operand widths from the literal select
+// lists, so a wrapper whose list is a single star cannot join one.  This
+// rebuilds the pipe input's items as explicit references through the
+// wrapper's derived alias, reproducing the input columns by name.
+StatusOr<std::vector<NamedExpression>> ResolvePipeInputItems(
+    const std::shared_ptr<SelectStatement>& input,
+    const std::string& wrapper_alias, int depth) {
+  if (depth > 64 || !input || input->Sources().size() != 1) {
+    return AstError<std::vector<NamedExpression>>(
+        "pipe set operation over this input shape is not supported");
+  }
+  std::vector<NamedExpression> items;
+  for (const NamedExpression& item : input->SelectList()) {
+    if (item.expression && item.expression->Type() == TypeTag::kColumnValue &&
+        item.expression->AsColumnValue().GetColumnName().name == "*") {
+      // A star inherits the wrapped statement's columns through its alias.
+      const SelectSource& source = input->Sources().front();
+      if (!source.query || source.alias.empty()) {
+        return AstError<std::vector<NamedExpression>>(
+            "pipe set operation over this input shape is not supported");
+      }
+      ASSIGN_OR_RETURN(
+          std::vector<NamedExpression>, expanded,
+          (ResolvePipeInputItems(source.query, source.alias, depth + 1)));
+      for (NamedExpression& sub : expanded) {
+        items.push_back(std::move(sub));
+      }
+      continue;
+    }
+    std::string name = item.name;
+    if (name.empty() && item.expression &&
+        item.expression->Type() == TypeTag::kColumnValue) {
+      name = item.expression->AsColumnValue().GetColumnName().name;
+    }
+    if (name.empty()) {
+      return AstError<std::vector<NamedExpression>>(
+          "pipe set operation needs named input columns; alias the pipe "
+          "AGGREGATE / SELECT items first");
+    }
+    items.emplace_back(std::move(name),
+                       ColumnValueExp(ColumnName(wrapper_alias, name)));
+  }
+  if (items.empty()) {
+    return AstError<std::vector<NamedExpression>>(
+        "pipe set operation over an empty input");
+  }
+  return items;
+}
+
+// Folds the Pipe* children of `query` (siblings of the leading Select) into
+// `statement`.  Operators the engine cannot represent yet must fail loudly:
+// a silently dropped pipe changes results without any error.
+
+// Deep-copies `node`, rewriting the leading identifier of every path
+// expression whose qualifier equals `from` into `to`.  Used to rebind pipe
+// JOIN conditions that qualify input columns by the input's earlier name
+// (`FROM tv |> JOIN t2 ON tv.k = t2.c`) to the wrapper's derived alias.
+std::unique_ptr<GoogleSqlAstNode> CloneRebindingPipeQualifier(
+    const GoogleSqlAstNode& node, const std::string& from,
+    const std::string& to) {
+  auto clone = std::make_unique<GoogleSqlAstNode>();
+  clone->kind = node.kind;
+  clone->detail = node.detail;
+  clone->start = node.start;
+  clone->end = node.end;
+  bool suppressed = false;
+  if (node.kind == "PathExpression" && !node.children.empty() &&
+      node.children.front()->kind == "Identifier" &&
+      node.children.front()->detail == from) {
+    // A path rooted at the old input name resolves under the wrapper alias.
+    // Rebinding the root keeps the remaining path elements intact (deep
+    // struct field chains only ever hang off a resolved column).
+    clone->children.push_back(
+        CloneRebindingPipeQualifier(*node.children.front(), from, to));
+    clone->children.back()->detail = to;
+    for (size_t i = 1; i < node.children.size(); ++i) {
+      clone->children.push_back(
+          CloneRebindingPipeQualifier(*node.children[i], from, to));
+    }
+    suppressed = true;
+  }
+  if (!suppressed) {
+    for (const auto& child : node.children) {
+      clone->children.push_back(CloneRebindingPipeQualifier(*child, from, to));
+    }
+  }
+  return clone;
+}
+
+StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
+    const GoogleSqlAstNode& query, std::shared_ptr<SelectStatement> statement) {
+  size_t pipe_index = 0;
+  // The name the pipe input is currently visible under (its source alias or
+  // base table).  Pipe JOIN conditions may qualify input columns with it;
+  // every other fold renames the input to the wrapper's derived alias.
+  std::string input_name;
+  if (!statement->Sources().empty()) {
+    const SelectSource& first = statement->Sources().front();
+    input_name = first.alias.empty() ? first.table : first.alias;
+  }
+  // `|> AS name` renames the pipe input; it rides along until the next
+  // operator names its derived source.  A trailing AS names the output
+  // relation, which this engine never observes, so it is a no-op there.
+  std::string pending_alias;
+  auto wrapper_alias = [&]() {
+    if (!pending_alias.empty()) {
+      std::string alias = std::move(pending_alias);
+      pending_alias.clear();
+      return alias;
+    }
+    return "$pipe" + std::to_string(pipe_index);
+  };
+  auto adopt_wrapper = [&](std::shared_ptr<SelectStatement> wrapper) {
+    input_name = wrapper->Sources().front().alias;
+    statement = std::move(wrapper);
+  };
+  for (const auto& child : query.children) {
+    if (!child->kind.starts_with("Pipe")) {
+      continue;
+    }
+    const GoogleSqlAstNode& pipe = *child;
+    if (pipe.kind == "PipeAs") {
+      const GoogleSqlAstNode* identifier = nullptr;
+      if (const GoogleSqlAstNode* alias = pipe.Child("Alias")) {
+        identifier = alias->Child("Identifier");
+      }
+      if (identifier == nullptr) {
+        identifier = pipe.Child("Identifier");
+      }
+      if (identifier == nullptr) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: pipe AS without a name");
+      }
+      ASSIGN_OR_RETURN(std::string, hvpipe_as, (Identifier(*identifier)));
+      pending_alias = std::move(hvpipe_as);
+      ++pipe_index;
+      continue;
+    }
+    auto wrapper = WrapPipeInput(statement, wrapper_alias());
+    if (pipe.kind == "PipeWhere") {
+      const GoogleSqlAstNode* where = pipe.Child("WhereClause");
+      if (where == nullptr || where->children.empty()) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: pipe WHERE without a predicate");
+      }
+      ASSIGN_OR_RETURN(Expression, hvpipe_where,
+                       (VisitExpression(*where->children.front())));
+      wrapper->SetWhereClause(std::move(hvpipe_where));
+      adopt_wrapper(std::move(wrapper));
+    } else if (pipe.kind == "PipeSelect" || pipe.kind == "PipeAggregate") {
+      const GoogleSqlAstNode* select_node = pipe.Child("Select");
+      if (select_node == nullptr) {
+        select_node = &pipe;
+      }
+      const GoogleSqlAstNode* select_list = select_node->Child("SelectList");
+      if (select_list == nullptr) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: pipe select without a list");
+      }
+      ASSIGN_OR_RETURN(std::vector<NamedExpression>, hvpipe_items,
+                       (VisitPipeSelectList(*select_list)));
+      if (UpperCopy(select_node->detail).find("DISTINCT") !=
+          std::string::npos) {
+        wrapper->SetDistinct(true);
+      }
+      wrapper->SetSelectList(std::move(hvpipe_items));
+      if (pipe.kind == "PipeAggregate") {
+        const GoogleSqlAstNode* group = select_node->Child("GroupBy");
+        if (group != nullptr) {
+          std::vector<Expression> keys;
+          for (const GoogleSqlAstNode* item : group->Children("GroupingItem")) {
+            if (item->Child("GroupingSetList") != nullptr ||
+                item->Child("Rollup") != nullptr ||
+                item->Child("Cube") != nullptr) {
+              return AstError<std::shared_ptr<SelectStatement>>(
+                  "GROUPING SETS / ROLLUP / CUBE inside pipe AGGREGATE is "
+                  "not supported");
+            }
+            for (const auto& key_node : item->children) {
+              if (key_node->kind == "Location") {
+                continue;
+              }
+              ASSIGN_OR_RETURN(Expression, hvpipe_key,
+                               (VisitExpression(*key_node)));
+              keys.push_back(std::move(hvpipe_key));
+              break;
+            }
+          }
+          if (!keys.empty()) {
+            wrapper->SetGroupBy(std::move(keys));
+          }
+        }
+      }
+      adopt_wrapper(std::move(wrapper));
+    } else if (pipe.kind == "PipeOrderBy") {
+      const GoogleSqlAstNode* order = pipe.Child("OrderBy");
+      if (order == nullptr) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: pipe ORDER BY without keys");
+      }
+      std::vector<SelectStatement::OrderByTerm> terms;
+      for (const GoogleSqlAstNode* term :
+           order->Children("OrderingExpression")) {
+        ASSIGN_OR_RETURN(WindowOrderTerm, hvpipe_term,
+                         (ParseOrderingTerm(term)));
+        if (hvpipe_term.expression) {
+          terms.push_back({std::move(hvpipe_term.expression),
+                           hvpipe_term.ascending, hvpipe_term.nulls_first});
+        }
+      }
+      wrapper->SetOrderBy(std::move(terms));
+      adopt_wrapper(std::move(wrapper));
+    } else if (pipe.kind == "PipeLimitOffset") {
+      const GoogleSqlAstNode* limit_offset = pipe.Child("LimitOffset");
+      if (limit_offset == nullptr) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: pipe LIMIT without a clause");
+      }
+      std::optional<size_t> limit;
+      size_t offset = 0;
+      if (const GoogleSqlAstNode* limit_node = limit_offset->Child("Limit")) {
+        for (const auto& sub : limit_node->children) {
+          if (sub->kind == "Location" || sub->kind == "Hint") {
+            continue;
+          }
+          if (sub->kind == "IntLiteral") {
+            ASSIGN_OR_RETURN(uint64_t, hvpipe_limit,
+                             (ParseUnsignedLiteral(*sub)));
+            limit = static_cast<size_t>(hvpipe_limit);
+            break;
+          }
+          auto folded_or = VisitExpression(*sub);
+          if (folded_or.HasValue()) {
+            Expression folded = folded_or.MoveValue();
+            if (folded && folded->Type() == TypeTag::kConstantValue) {
+              const Value& constant = folded->AsConstantValue().GetValue();
+              if (constant.type == ValueType::kInt64 && !constant.IsNull() &&
+                  constant.value.int_value >= 0) {
+                limit = static_cast<size_t>(constant.value.int_value);
+                break;
+              }
+            }
+          }
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "pipe LIMIT requires an integer literal in this engine");
+        }
+      }
+      for (const auto& sub : limit_offset->children) {
+        if (sub->kind != "Offset") {
+          continue;
+        }
+        for (const auto& inner : sub->children) {
+          if (inner->kind == "IntLiteral") {
+            ASSIGN_OR_RETURN(uint64_t, hvpipe_offset,
+                             (ParseUnsignedLiteral(*inner)));
+            offset = hvpipe_offset;
+          }
+        }
+      }
+      if (limit.has_value()) {
+        wrapper->SetLimit(limit);
+      }
+      wrapper->SetOffset(offset);
+      adopt_wrapper(std::move(wrapper));
+    } else if (pipe.kind == "PipeJoin") {
+      const GoogleSqlAstNode* join = pipe.Child("Join");
+      if (join == nullptr) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: pipe JOIN without a join node");
+      }
+      if (join->detail.starts_with("NATURAL")) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: unsupported NATURAL pipe join");
+      }
+      JoinType type = JoinType::kInner;
+      if (join->detail == "COMMA") {
+        type = JoinType::kCross;
+      } else if (join->detail == "LEFT") {
+        type = JoinType::kLeft;
+      } else if (join->detail == "RIGHT") {
+        type = JoinType::kRight;
+      } else if (join->detail == "FULL") {
+        type = JoinType::kFull;
+      }
+      const GoogleSqlAstNode* rhs = nullptr;
+      const GoogleSqlAstNode* on = nullptr;
+      for (const auto& sub : join->children) {
+        if (sub->kind == "Location" || sub->kind == "PipeJoinLhsPlaceholder") {
+          continue;
+        }
+        if (sub->kind == "OnClause") {
+          on = sub.get();
+          continue;
+        }
+        if (rhs == nullptr) {
+          rhs = sub.get();
+        }
+      }
+      if (rhs == nullptr || rhs->kind != "TablePathExpression") {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "pipe JOIN supports plain table references only");
+      }
+      Expression condition;
+      if (on != nullptr && !on->children.empty()) {
+        // Inside the wrapper the pipe input is only visible under its derived
+        // alias: rebind ON qualifiers that name the input's earlier identity
+        // (`ON t2.c = tv.k` after `FROM tv`) onto that alias before visiting.
+        // Unqualified and already-renamed references need no rewrite.
+        const std::string input_alias = wrapper->Sources().front().alias;
+        auto rebound = CloneRebindingPipeQualifier(*on->children.front(),
+                                                   input_name, input_alias);
+        ASSIGN_OR_RETURN(Expression, hvpipe_on, (VisitExpression(*rebound)));
+        condition = std::move(hvpipe_on);
+      }
+      ASSIGN_OR_RETURN(SelectSource, hvpipe_rhs,
+                       (VisitTableSource(*rhs, type, std::move(condition))));
+      std::vector<SelectSource> wrapper_sources = wrapper->Sources();
+      wrapper_sources.push_back(std::move(hvpipe_rhs));
+      wrapper->SetSources(std::move(wrapper_sources));
+      adopt_wrapper(std::move(wrapper));
+    } else if (pipe.kind == "PipeSetOperation") {
+      // The parser attaches SetOperationMetadata + the right operand directly
+      // under PipeSetOperation (no SetOperation wrapper child).
+      std::vector<const GoogleSqlAstNode*> operands;
+      for (const auto& sub : pipe.children) {
+        if (sub->kind == "Query" || sub->kind == "Select" ||
+            sub->kind == "SetOperation") {
+          operands.push_back(sub.get());
+        }
+      }
+      if (operands.size() != 1) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "pipe set operations combine the pipe input with one operand");
+      }
+      SetOperationKind kind = SetOperationKind::kUnionAll;
+      if (const GoogleSqlAstNode* metadata =
+              pipe.Child("SetOperationMetadata")) {
+        const std::string type_text =
+            metadata->Child("SetOperationType") != nullptr
+                ? UpperCopy(SliceSource(metadata->Child("SetOperationType")))
+                : "";
+        const GoogleSqlAstNode* mode_node =
+            metadata->Child("SetOperationAllOrDistinct");
+        const std::string mode_text =
+            mode_node != nullptr ? UpperCopy(SliceSource(mode_node)) : "";
+        if (type_text.find("INTERSECT") != std::string::npos) {
+          kind = mode_text.find("ALL") != std::string::npos
+                     ? SetOperationKind::kIntersectAll
+                     : SetOperationKind::kIntersect;
+        } else if (type_text.find("EXCEPT") != std::string::npos) {
+          kind = mode_text.find("ALL") != std::string::npos
+                     ? SetOperationKind::kExceptAll
+                     : SetOperationKind::kExcept;
+        } else if (mode_text.find("DISTINCT") != std::string::npos ||
+                   mode_text.find("ALL") == std::string::npos) {
+          // A bare UNION (no ALL) is UNION DISTINCT.
+          kind = SetOperationKind::kUnion;
+        }
+      }
+      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hvpipe_branch,
+                       (VisitQuery(*operands[0])));
+      // The set-op width check reads literal select lists, so the wrapper
+      // must project the input columns explicitly instead of a star.
+      ASSIGN_OR_RETURN(std::vector<NamedExpression>, hvpipe_items,
+                       (ResolvePipeInputItems(
+                           statement, wrapper->Sources().front().alias, 0)));
+      wrapper->SetSelectList(std::move(hvpipe_items));
+      wrapper->AddSetOperation(kind, std::move(hvpipe_branch));
+      statement = std::move(wrapper);
+    } else if (pipe.kind == "PipeDrop" || pipe.kind == "PipeRename" ||
+               pipe.kind == "PipeSet" || pipe.kind == "PipeExtend" ||
+               pipe.kind == "PipeCall" || pipe.kind == "PipePivot" ||
+               pipe.kind == "PipeTablesample") {
+      // EXTEND/DROP/RENAME need the previous statement's output column names
+      // (or a payload the pinned parser does not attach to the node), and
+      // CALL/PIVOT/TABLESAMPLE need machinery the pipe input cannot carry.
+      // Reject loudly: dropping the operator would change results silently.
+      return AstError<std::shared_ptr<SelectStatement>>(
+          "pipe operator " + pipe.kind.substr(4) +
+          " is parsed but not supported yet");
+    } else {
+      return AstError<std::shared_ptr<SelectStatement>>(
+          "GoogleSQL AST: unsupported pipe operator " + pipe.kind);
+    }
+    ++pipe_index;
+  }
+  return statement;
 }
 
 StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
@@ -5810,6 +7103,33 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       }
       return nested;
     }
+    // `FROM t |> ...`: a pipe query may start from a bare FROM clause.  The
+    // base is the star projection over those sources; the pipe operators fold
+    // on top of it below.
+    if (const GoogleSqlAstNode* from_query = query.Child("FromQuery")) {
+      const GoogleSqlAstNode* from_clause = from_query->Child("FromClause");
+      if (from_clause != nullptr) {
+        std::vector<SelectSource> sources;
+        bool sources_ok = true;
+        for (const auto& child : from_clause->children) {
+          if (child->kind == "Location" || child->kind == "Hint") {
+            continue;
+          }
+          Status st_pipe_from =
+              AppendSources(*child, JoinType::kCross, Expression{}, &sources);
+          if (st_pipe_from != Status::kSuccess) {
+            sources_ok = false;
+            break;
+          }
+        }
+        if (sources_ok && !sources.empty()) {
+          auto base = std::make_shared<SelectStatement>();
+          base->SetSources(std::move(sources));
+          base->SetSelectList({NamedExpression{"*", ColumnValueExp("*")}});
+          return FoldPipeOperators(query, std::move(base));
+        }
+      }
+    }
     return AstError<std::shared_ptr<SelectStatement>>(
         "GoogleSQL AST: query without SELECT");
   }
@@ -5926,6 +7246,112 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
                        {base, ConstantValueExp(Value(std::string(field)))}));
         projection_nodes.push_back(expression_node);
       }
+      continue;
+    }
+    if (expression_node->kind == "StarWithModifiers" ||
+        expression_node->kind == "DotStarWithModifiers") {
+      // `* EXCEPT (...) / REPLACE (...)` and `rel.* EXCEPT (...)`: the star
+      // keeps its plain expression shape so existing star detection holds;
+      // the modifiers ride on the NamedExpression payload for the engine's
+      // star expansion to honor.
+      const GoogleSqlAstNode* star_path = nullptr;
+      const GoogleSqlAstNode* star_modifiers = nullptr;
+      if (expression_node->kind == "DotStarWithModifiers") {
+        star_path = expression_node->Child("PathExpression");
+        star_modifiers = expression_node->Child("StarModifiers");
+        if (star_path == nullptr) {
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "GoogleSQL AST: malformed DotStarWithModifiers");
+        }
+      } else {
+        star_modifiers = expression_node->Child("StarModifiers");
+      }
+      if (star_modifiers == nullptr) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: malformed " + expression_node->kind);
+      }
+      ASSIGN_OR_RETURN(std::string, hvstaralias_0, (Alias(*column)));
+      if (!hvstaralias_0.empty()) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: a star with EXCEPT/REPLACE cannot take an alias");
+      }
+      Expression star_expression;
+      if (star_path != nullptr) {
+        ASSIGN_OR_RETURN(std::string, hvstarp_0, (Path(*star_path)));
+        star_expression = ColumnValueExp(ColumnName(std::move(hvstarp_0), "*"));
+      } else {
+        star_expression = ColumnValueExp("*");
+      }
+      auto modifiers = std::make_shared<StarModifiers>();
+      std::unordered_set<std::string> seen_except;
+      std::unordered_set<std::string> seen_replace;
+      for (const GoogleSqlAstNode* except_list :
+           star_modifiers->Children("StarExceptList")) {
+        for (const GoogleSqlAstNode* list :
+             except_list->Children("ExpressionList")) {
+          for (const auto& entry_holder : list->children) {
+            const GoogleSqlAstNode* entry = entry_holder.get();
+            // The pinned parser only accepts bare identifiers here; accept a
+            // path spelling defensively and store the raw reference text.
+            std::string entry_name;
+            if (entry->kind == "Identifier") {
+              ASSIGN_OR_RETURN(std::string, hvstari_0, (Identifier(*entry)));
+              entry_name = std::move(hvstari_0);
+            } else if (entry->kind == "PathExpression") {
+              ASSIGN_OR_RETURN(std::string, hvstare_0, (Path(*entry)));
+              entry_name = std::move(hvstare_0);
+            } else {
+              return AstError<std::shared_ptr<SelectStatement>>(
+                  "GoogleSQL AST: EXCEPT entries must be column names");
+            }
+            std::string lowered = entry_name;
+            for (char& c : lowered) {
+              c = static_cast<char>(
+                  std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (!seen_except.insert(lowered).second) {
+              return AstError<std::shared_ptr<SelectStatement>>(
+                  "GoogleSQL AST: duplicate column in EXCEPT list: " +
+                  entry_name);
+            }
+            modifiers->except_columns.push_back(std::move(entry_name));
+          }
+        }
+      }
+      for (const GoogleSqlAstNode* replace :
+           star_modifiers->Children("StarReplaceItem")) {
+        if (replace->children.size() != 2) {
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "GoogleSQL AST: malformed REPLACE item");
+        }
+        const GoogleSqlAstNode* value_node = replace->children[0].get();
+        const GoogleSqlAstNode* name_node = replace->children[1].get();
+        if (name_node->kind != "Identifier") {
+          std::swap(value_node, name_node);
+        }
+        if (name_node->kind != "Identifier") {
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "GoogleSQL AST: malformed REPLACE item");
+        }
+        ASSIGN_OR_RETURN(Expression, hvstarr_0, (VisitExpression(*value_node)));
+        Expression replace_expression = std::move(hvstarr_0);
+        ASSIGN_OR_RETURN(std::string, hvstarr_1, (Identifier(*name_node)));
+        std::string lowered = hvstarr_1;
+        for (char& c : lowered) {
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (!seen_replace.insert(lowered).second) {
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "GoogleSQL AST: duplicate column in REPLACE list: " + hvstarr_1);
+        }
+        modifiers->replace_items.push_back(
+            StarReplaceItem{.column = std::move(hvstarr_1),
+                            .expression = std::move(replace_expression)});
+      }
+      NamedExpression star_item{"*", std::move(star_expression)};
+      star_item.star_modifiers = std::move(modifiers);
+      projections.push_back(std::move(star_item));
+      projection_nodes.push_back(expression_node);
       continue;
     }
     ASSIGN_OR_RETURN(Expression, hv190694_0,
@@ -6154,8 +7580,10 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           }
           if (ordinal >= 1 && ordinal <= projections.size() &&
               projections[ordinal - 1].expression) {
-            order_by.push_back({projections[ordinal - 1].expression,
-                                parsed.ascending, parsed.nulls_first});
+            order_by.push_back(
+                {ReapplyCollation(projections[ordinal - 1].expression,
+                                  parsed.expression),
+                 parsed.ascending, parsed.nulls_first});
             continue;
           }
           return AstError<std::shared_ptr<SelectStatement>>(
@@ -6389,57 +7817,67 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       std::vector<Expression> plain_expressions;
       std::vector<std::vector<std::vector<Expression>>> constructor_sets;
       constexpr size_t kMaxGroupingSetBranches = 64;
+      // Expands one `Rollup`/`Cube` AST node into its grouping-key sets:
+      // ROLLUP(a, b) => (a,b), (a), (); CUBE(a, b) => (a,b), (a), (b), ().
+      // Shared by the top-level GROUP BY item and set-list elements, where
+      // `GROUPING SETS ((k), ROLLUP(v))` unions the expansions into the list.
+      const auto expand_rollup_or_cube = [&](const GoogleSqlAstNode& term)
+          -> StatusOr<std::vector<std::vector<Expression>>> {
+        std::vector<Expression> keys;
+        for (const auto& key_node : term.children) {
+          ASSIGN_OR_RETURN(Expression, key, (resolve_grouping_term(*key_node)));
+          keys.push_back(std::move(key));
+        }
+        std::vector<std::vector<Expression>> sets;
+        if (term.kind == "Rollup") {
+          // ROLLUP(a, b, c) => (a,b,c), (a,b), (a), ().
+          for (size_t len = keys.size(); len > 0; --len) {
+            sets.emplace_back(keys.begin(),
+                              keys.begin() + static_cast<ptrdiff_t>(len));
+          }
+          sets.emplace_back();
+        } else {
+          // CUBE(a, b) => (a,b), (a), (b), () — widest sets first.
+          std::vector<std::pair<size_t, size_t>> mask_popcount;
+          const size_t total = size_t{1} << keys.size();
+          mask_popcount.reserve(total);
+          for (size_t mask = 0; mask < total; ++mask) {
+            mask_popcount.emplace_back(
+                mask, static_cast<size_t>(__builtin_popcountll(mask)));
+          }
+          std::stable_sort(mask_popcount.begin(), mask_popcount.end(),
+                           [](const auto& l, const auto& r) {
+                             if (l.second != r.second) {
+                               return l.second > r.second;
+                             }
+                             return l.first > r.first;
+                           });
+          for (const auto& [mask, _] : mask_popcount) {
+            std::vector<Expression> set;
+            for (size_t i = 0; i < keys.size(); ++i) {
+              if ((mask & (size_t{1} << i)) != 0) {
+                set.push_back(keys[i]);
+              }
+            }
+            sets.push_back(std::move(set));
+          }
+        }
+        return sets;
+      };
       for (const GoogleSqlAstNode* item : group->Children("GroupingItem")) {
         if (item->children.empty()) {
           continue;
         }
         const GoogleSqlAstNode& term = *item->children[0];
         if (term.kind == "Rollup" || term.kind == "Cube") {
-          std::vector<Expression> keys;
-          for (const auto& key_node : term.children) {
-            ASSIGN_OR_RETURN(Expression, key,
-                             (resolve_grouping_term(*key_node)));
-            keys.push_back(std::move(key));
-          }
           if (term.kind == "Cube" &&
-              keys.size() >= 8) {  // 2^8 branches would swamp statement prep.
+              term.children.size() >=
+                  8) {  // 2^8 branches would swamp statement prep.
             return AstError<std::shared_ptr<SelectStatement>>(
                 "GROUP BY CUBE supports at most 7 columns in this engine");
           }
-          std::vector<std::vector<Expression>> sets;
-          if (term.kind == "Rollup") {
-            // ROLLUP(a, b, c) => (a,b,c), (a,b), (a), ().
-            for (size_t len = keys.size(); len > 0; --len) {
-              sets.emplace_back(keys.begin(),
-                                keys.begin() + static_cast<ptrdiff_t>(len));
-            }
-            sets.emplace_back();
-          } else {
-            // CUBE(a, b) => (a,b), (a), (b), () — widest sets first.
-            std::vector<std::pair<size_t, size_t>> mask_popcount;
-            const size_t total = size_t{1} << keys.size();
-            mask_popcount.reserve(total);
-            for (size_t mask = 0; mask < total; ++mask) {
-              mask_popcount.emplace_back(
-                  mask, static_cast<size_t>(__builtin_popcountll(mask)));
-            }
-            std::stable_sort(mask_popcount.begin(), mask_popcount.end(),
-                             [](const auto& l, const auto& r) {
-                               if (l.second != r.second) {
-                                 return l.second > r.second;
-                               }
-                               return l.first > r.first;
-                             });
-            for (const auto& [mask, _] : mask_popcount) {
-              std::vector<Expression> set;
-              for (size_t i = 0; i < keys.size(); ++i) {
-                if ((mask & (size_t{1} << i)) != 0) {
-                  set.push_back(keys[i]);
-                }
-              }
-              sets.push_back(std::move(set));
-            }
-          }
+          ASSIGN_OR_RETURN(std::vector<std::vector<Expression>>, sets,
+                           (expand_rollup_or_cube(term)));
           constructor_sets.push_back(std::move(sets));
           continue;
         }
@@ -6447,6 +7885,24 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           std::vector<std::vector<Expression>> sets;
           for (const GoogleSqlAstNode* grouping_set :
                term.Children("GroupingSet")) {
+            // Elements may themselves be constructors: a ROLLUP/CUBE inside
+            // the list unions every set it spans
+            // (`GROUPING SETS ((k), ROLLUP(v))` == GROUPING SETS ((k), (v),
+            // ())). A nested GROUPING SETS as an element is a parser-level
+            // syntax error, so no other constructor shapes can appear here.
+            if (grouping_set->children.size() == 1 &&
+                (grouping_set->children[0]->kind == "Rollup" ||
+                 grouping_set->children[0]->kind == "Cube")) {
+              const GoogleSqlAstNode& nested = *grouping_set->children[0];
+              if (nested.kind == "Cube" && nested.children.size() >= 8) {
+                return AstError<std::shared_ptr<SelectStatement>>(
+                    "GROUP BY CUBE supports at most 7 columns in this engine");
+              }
+              ASSIGN_OR_RETURN(std::vector<std::vector<Expression>>, expanded,
+                               (expand_rollup_or_cube(nested)));
+              sets.insert(sets.end(), expanded.begin(), expanded.end());
+              continue;
+            }
             std::vector<Expression> set;
             for (const auto& element : grouping_set->children) {
               if (element->kind == "StructConstructorWithParens") {
@@ -6660,9 +8116,19 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           "QUALIFY with GROUPING SETS / ROLLUP / CUBE is not supported");
     }
     if (relational_detail::HasWindowFunctions(*statement)) {
-      return AstError<std::shared_ptr<SelectStatement>>(
-          "window functions with GROUPING SETS / ROLLUP / CUBE are not "
-          "supported");
+      // Window calls observe the combined result of every grouping set
+      // (rank() over a ROLLUP output spans detail and subtotal rows), so a
+      // per-branch window would restart each rank per branch.  The window
+      // expansion instead materializes every branch into a UNION ALL with
+      // hidden columns for the window inputs, and a wrapper statement
+      // evaluates the windows over the combined rows.
+      ASSIGN_OR_RETURN(
+          std::shared_ptr<SelectStatement>, expanded,
+          (ExpandGroupingSetsWithWindows(statement, pending_grouping_sets)));
+      if (query.kind != "Select") {
+        return FoldPipeOperators(query, std::move(expanded));
+      }
+      return expanded;
     }
 
     // Fingerprint of every key across all sets (deduplicated, insertion
@@ -6798,7 +8264,10 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       statement->SetOrderBy(std::move(wrapper_terms));
     }
 
-    const SelectStatement base = *statement;
+    // A snapshot, not a reference: the rewrite below mutates *statement while
+    // still reading the original select list from `base`.
+    const SelectStatement base =
+        *statement;  // NOLINT(performance-unnecessary-copy-initialization)
     for (size_t i = 0; i < pending_grouping_sets.size(); ++i) {
       if (i == 0) {
         RETURN_IF_FAIL(
@@ -6812,9 +8281,16 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       branch->SetLimit(std::nullopt);
       branch->SetOffset(0);
       branch->SetWithTies(false);
+      // The WITH declarations stay on the owning statement; a branch carrying
+      // its own copy would re-execute every CTE body once per grouping set
+      // (branch execution resolves CTE references through the inherited map).
+      branch->ClearWithQueries();
       statement->AddSetOperation(SetOperationKind::kUnionAll,
                                  std::move(branch));
     }
+  }
+  if (query.kind != "Select") {
+    return FoldPipeOperators(query, statement);
   }
   return statement;
 }
@@ -6967,6 +8443,47 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       }
       ASSIGN_OR_RETURN(ColumnTypeInfo, col_info, (ColumnType(*definition)));
       ASSIGN_OR_RETURN(std::string, col_name, (Identifier(*name)));
+      // Column DEFAULT clause: the pinned parser emits the default
+      // expression as a direct SimpleColumnSchema child next to the type
+      // path and the attribute list.  GoogleSQL requires constant literals
+      // here, so the expression must evaluate without a row.
+      std::optional<Value> column_default;
+      const GoogleSqlAstNode* column_schema =
+          definition->Child("SimpleColumnSchema");
+      if (column_schema != nullptr) {
+        for (const auto& child : column_schema->children) {
+          const std::string& kind = child->kind;
+          // The type path, its parameter list (VARCHAR(10)), and the
+          // attribute list are structural children; anything else is the
+          // DEFAULT expression.
+          if (kind == "PathExpression" || kind == "TypeParameterList" ||
+              kind == "ColumnAttributeList" || kind == "Collate") {
+            continue;
+          }
+          if (column_default.has_value()) {
+            return AstError<std::unique_ptr<Statement>>(
+                "GoogleSQL AST: column has more than one DEFAULT clause");
+          }
+          ASSIGN_OR_RETURN(Expression, default_expr, (VisitExpression(*child)));
+          // The clause freezes one value for every future INSERT, so
+          // volatile calls (RAND()) and subqueries must not reach it.
+          if (!SafeToReduceEvaluationCount(default_expr)) {
+            return AstError<std::unique_ptr<Statement>>(
+                "column DEFAULT must be a constant expression");
+          }
+          StatusOr<Value> evaluated =
+              default_expr->TryEvaluate(Row(), Schema());
+          if (!evaluated.HasValue()) {
+            return AstError<std::unique_ptr<Statement>>(
+                "column DEFAULT must be a constant expression");
+          }
+          if (evaluated.Value().IsNull()) {
+            return AstError<std::unique_ptr<Statement>>(
+                "column DEFAULT must not be NULL");
+          }
+          column_default = evaluated.MoveValue();
+        }
+      }
       Column col(std::move(col_name), col_info.type);
       if (col_info.is_unsigned) {
         col.SetUnsigned(true);
@@ -6976,6 +8493,12 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       const GoogleSqlAstNode* attrs =
           schema != nullptr ? schema->Child("ColumnAttributeList") : nullptr;
       if (attrs != nullptr) {
+        if (attrs->Child("PrimaryKeyColumnAttribute") != nullptr) {
+          const bool was_unsigned = columns.back().IsUnsigned();
+          columns.back() = Column(columns.back().Name().name, col_info.type,
+                                  Constraint(Constraint::kPrimaryKey));
+          columns.back().SetUnsigned(was_unsigned);
+        }
         for (const GoogleSqlAstNode* attr :
              attrs->Children("ForeignKeyColumnAttribute")) {
           const GoogleSqlAstNode* reference =
@@ -6989,6 +8512,23 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
                                *reference, {columns.back().Name().name})));
           foreign_keys.push_back(std::move(h_fk));
         }
+      }
+      // The DEFAULT rides the column's reserved constraint slot
+      // (Constraint::kDefault with the constant as the payload value), so
+      // catalog persistence needs no new schema plumbing.  A column that
+      // already carries PRIMARY KEY / FOREIGN KEY in the slot rejects the
+      // combination explicitly instead of silently losing one side.
+      if (column_default.has_value()) {
+        if (columns.back().GetConstraint().ctype != Constraint::kNothing) {
+          return AstError<std::unique_ptr<Statement>>(
+              "column " + columns.back().Name().name +
+              " cannot combine DEFAULT with its existing constraint");
+        }
+        const bool was_unsigned = columns.back().IsUnsigned();
+        columns.back() =
+            Column(columns.back().Name().name, columns.back().Type(),
+                   Constraint(Constraint::kDefault, *column_default));
+        columns.back().SetUnsigned(was_unsigned);
       }
     }
     for (const GoogleSqlAstNode* fk : elements->Children("ForeignKey")) {
@@ -7129,6 +8669,17 @@ StatusOr<std::unique_ptr<Statement>> VisitCreateFunction(
       UdfRegistry()[udf.name] = std::move(udf);
     }
   } else {
+    // Table function: keep the defining Query AST so FROM references can
+    // expand it with the call-site arguments (see the TVF table-source
+    // branch).  Body references whose names match a parameter substitute
+    // the argument value at expansion time.
+    const GoogleSqlAstNode* body = root.Child("Query");
+    if (body != nullptr) {
+      auto cloned = CloneAstNode(root);
+      udf.root = std::move(cloned);
+      udf.body = udf.root->Child("Query");
+      udf.parameter_counts.assign(udf.parameters.size(), 0);
+    }
     UdfRegistry()[udf.name] = std::move(udf);
   }
   std::vector<NamedExpression> projection;
@@ -7381,6 +8932,97 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
                      (VisitExpression(*where_candidates.front())));
     where = std::move(hv226442_0);
   }
+  // UPDATE ... FROM desugars to MERGE: `USING <from> ON (<where>) WHEN
+  // MATCHED THEN UPDATE SET ...`.  BigQuery UPDATE...FROM errors when one
+  // target row matches several source rows; MERGE's one-target-one-action
+  // contract enforces exactly that.  Reusing MERGE keeps FK enforcement,
+  // plan-cache rebinding, and the server command tag on one path.
+  if (const GoogleSqlAstNode* from_clause = root.Child("FromClause")) {
+    if (root.Child("Alias") != nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: UPDATE ... FROM with a target alias is not "
+          "supported; qualify target columns with the table name");
+    }
+    if (!nested_items.empty()) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: UPDATE ... FROM does not support nested DML");
+    }
+    if (root.Child("AssertRowsModified") != nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: UPDATE ... FROM does not support "
+          "ASSERT_ROWS_MODIFIED");
+    }
+    ASSIGN_OR_RETURN(std::string, update_from_target, (Path(*path)));
+    const GoogleSqlAstNode* source_table =
+        from_clause->Child("TablePathExpression");
+    const GoogleSqlAstNode* source_subquery =
+        from_clause->Child("TableSubquery");
+    if (source_table == nullptr && source_subquery == nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: bad UPDATE ... FROM source");
+    }
+    for (const auto& child : from_clause->children) {
+      if (child.get() == source_table || child.get() == source_subquery ||
+          child->kind == "Location" || child->kind == "Hint" ||
+          (source_table != nullptr && child->kind == "Alias")) {
+        continue;
+      }
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: UPDATE ... FROM supports a single from item");
+    }
+    std::shared_ptr<SelectStatement> source;
+    std::string source_alias;
+    if (source_table != nullptr) {
+      const GoogleSqlAstNode* source_path =
+          source_table->Child("PathExpression");
+      if (source_path == nullptr) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: bad UPDATE ... FROM source");
+      }
+      ASSIGN_OR_RETURN(std::string, source_name, Path(*source_path));
+      source_alias = source_name;
+      source = std::make_shared<SelectStatement>(
+          std::vector<NamedExpression>{
+              NamedExpression("", ColumnValueExp("*"))},
+          std::vector<std::string>{source_name}, Expression{});
+      if (const GoogleSqlAstNode* alias = source_table->Child("Alias")) {
+        if (const GoogleSqlAstNode* id = alias->Child("Identifier")) {
+          ASSIGN_OR_RETURN(std::string, hv226910_0, (Identifier(*id)));
+          source_alias = std::move(hv226910_0);
+        }
+      }
+    } else {
+      const GoogleSqlAstNode* query_node = source_subquery->Child("Query");
+      if (query_node == nullptr) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: bad UPDATE ... FROM source subquery");
+      }
+      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, update_from_tmp,
+                       (VisitQuery(*query_node)));
+      source = std::move(update_from_tmp);
+      ASSIGN_OR_RETURN(std::string, update_from_alias,
+                       (Alias(*source_subquery)));
+      source_alias = std::move(update_from_alias);
+      if (source_alias.empty()) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: UPDATE ... FROM subquery requires an alias");
+      }
+    }
+    Expression on_condition = where;
+    if (!on_condition) {
+      on_condition = ConstantValueExp(Value(true));
+    }
+    MergeWhenClause matched;
+    matched.match_type = MergeWhenClause::MatchType::kMatched;
+    matched.action.kind = MergeActionKind::kUpdate;
+    matched.action.set_clause = std::move(assignments);
+    auto merge = std::make_unique<MergeStatement>(
+        update_from_target, std::move(source), std::move(source_alias),
+        std::move(on_condition));
+    merge->SetDesugaredFromUpdate(true);
+    merge->SetClauses({std::move(matched)});
+    return merge;
+  }
   ASSIGN_OR_RETURN(std::string, hv226502_0, (Path(*path)));
   auto statement = std::make_unique<UpdateStatement>(
       std::move(hv226502_0), std::move(assignments), std::move(where));
@@ -7441,6 +9083,267 @@ StatusOr<std::unique_ptr<Statement>> VisitDelete(const GoogleSqlAstNode& root) {
     ASSIGN_OR_RETURN(int64_t, hv228315_0, (AssertRowsModifiedValue(*assert)));
     statement->SetAssertRowsModified(hv228315_0);
   }
+  return statement;
+}
+
+// ALTER TABLE.  Catalog-level actions (RENAME TO, RENAME COLUMN) map to
+// AlterTableStatement; row-layout actions (ADD/DROP COLUMN) stay explicit
+// errors until the rebuild path lands — the earlier behavior silently
+// rejected the whole statement as an unsupported node kind.
+StatusOr<std::unique_ptr<Statement>> VisitAlterTable(
+    const GoogleSqlAstNode& root) {
+  const GoogleSqlAstNode* path = root.Child("PathExpression");
+  const GoogleSqlAstNode* actions = root.Child("AlterActionList");
+  if (path == nullptr || actions == nullptr) {
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: bad ALTER TABLE");
+  }
+  ASSIGN_OR_RETURN(std::string, table_name, Path(*path));
+  size_t action_count = 0;
+  AlterTableAction parsed;
+  for (const auto& action_holder : actions->children) {
+    const GoogleSqlAstNode* action = action_holder.get();
+    if (action->kind == "Location" || action->kind == "Hint") {
+      continue;
+    }
+    if (++action_count > 1) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: exactly one ALTER action is supported per "
+          "statement");
+    }
+    if (action->kind == "RenameToClause") {
+      const GoogleSqlAstNode* new_path = action->Child("PathExpression");
+      if (new_path == nullptr) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: bad RENAME TO");
+      }
+      ASSIGN_OR_RETURN(std::string, new_name, Path(*new_path));
+      parsed.kind = AlterTableAction::Kind::kRenameTo;
+      parsed.new_name = std::move(new_name);
+      continue;
+    }
+    if (action->kind == "RenameColumnAction") {
+      const auto& identifiers = action->Children("Identifier");
+      if (identifiers.size() != 2) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: bad RENAME COLUMN");
+      }
+      ASSIGN_OR_RETURN(std::string, old_name, Identifier(*identifiers[0]));
+      ASSIGN_OR_RETURN(std::string, new_name, Identifier(*identifiers[1]));
+      parsed.kind = AlterTableAction::Kind::kRenameColumn;
+      parsed.old_column = std::move(old_name);
+      parsed.new_name = std::move(new_name);
+      continue;
+    }
+    if (action->kind == "AddColumnAction") {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: ALTER TABLE ADD COLUMN is not supported (a "
+          "table rebuild path is required; create a new table and "
+          "INSERT SELECT instead)");
+    }
+    if (action->kind == "DropColumnAction") {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: ALTER TABLE DROP COLUMN is not supported (a "
+          "table rebuild path is required; create a new table and "
+          "INSERT SELECT instead)");
+    }
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: unsupported ALTER TABLE action " + action->kind);
+  }
+  if (action_count == 0) {
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: ALTER TABLE requires an action");
+  }
+  return std::make_unique<AlterTableStatement>(std::move(table_name),
+                                               std::move(parsed));
+}
+
+StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
+  const GoogleSqlAstNode* target_path = root.Child("PathExpression");
+  if (target_path == nullptr) {
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: bad MERGE target");
+  }
+  ASSIGN_OR_RETURN(std::string, merge_target, Path(*target_path));
+  const GoogleSqlAstNode* source_table = root.Child("TablePathExpression");
+  const GoogleSqlAstNode* source_subquery = root.Child("TableSubquery");
+  if (source_table == nullptr && source_subquery == nullptr) {
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: bad MERGE source");
+  }
+  std::shared_ptr<SelectStatement> source;
+  std::string source_alias;
+  if (source_table != nullptr) {
+    const GoogleSqlAstNode* source_path = source_table->Child("PathExpression");
+    if (source_path == nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: bad MERGE source");
+    }
+    ASSIGN_OR_RETURN(std::string, source_name, Path(*source_path));
+    source_alias = source_name;
+    // A bare table source reads as SELECT * FROM <table>; the star expands
+    // during the prepare-time relation materialization in SqlEngine.
+    source = std::make_shared<SelectStatement>(
+        std::vector<NamedExpression>{NamedExpression("", ColumnValueExp("*"))},
+        std::vector<std::string>{source_name}, Expression{});
+  } else {
+    const GoogleSqlAstNode* query_node = source_subquery->Child("Query");
+    if (query_node == nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: bad MERGE source subquery");
+    }
+    ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, merge_source_tmp,
+                     (VisitQuery(*query_node)));
+    source = std::move(merge_source_tmp);
+    ASSIGN_OR_RETURN(std::string, merge_alias_tmp, (Alias(*source_subquery)));
+    source_alias = std::move(merge_alias_tmp);
+    if (source_alias.empty()) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: MERGE source subquery requires an alias");
+    }
+  }
+  const GoogleSqlAstNode* clause_list = root.Child("MergeWhenClauseList");
+  if (clause_list == nullptr) {
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: bad MERGE clause list");
+  }
+  // ON condition: the free-form expression child between the source and the
+  // clause list (its dump kind varies, so find it positionally).
+  const GoogleSqlAstNode* on_node = nullptr;
+  for (const auto& child : root.children) {
+    if (child.get() == target_path || child.get() == source_table ||
+        child.get() == source_subquery || child->kind == "Location" ||
+        child->kind == "Hint" || child->kind == "MergeWhenClauseList") {
+      continue;
+    }
+    on_node = child.get();
+    break;
+  }
+  if (on_node == nullptr) {
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: bad MERGE ON condition");
+  }
+  Expression on_condition;
+  ASSIGN_OR_RETURN(Expression, merge_on_tmp, (VisitExpression(*on_node)));
+  on_condition = std::move(merge_on_tmp);
+
+  std::vector<MergeWhenClause> clauses;
+  for (const GoogleSqlAstNode* clause_node :
+       clause_list->Children("MergeWhenClause")) {
+    MergeWhenClause parsed;
+    const std::string& match = clause_node->detail;
+    if (match == "match_type=NOT_MATCHED_BY_TARGET") {
+      parsed.match_type = MergeWhenClause::MatchType::kNotMatchedByTarget;
+    } else if (match == "match_type=NOT_MATCHED_BY_SOURCE") {
+      parsed.match_type = MergeWhenClause::MatchType::kNotMatchedBySource;
+    } else if (match == "match_type=MATCHED") {
+      parsed.match_type = MergeWhenClause::MatchType::kMatched;
+    } else {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: unknown MERGE match type " + match);
+    }
+    const GoogleSqlAstNode* action_node = clause_node->Child("MergeAction");
+    if (action_node == nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: bad MERGE action");
+    }
+    for (const auto& child : clause_node->children) {
+      if (child.get() == action_node || child->kind == "Location" ||
+          child->kind == "Hint") {
+        break;
+      }
+      // Search conditions precede the action; at most one condition node.
+      Expression condition;
+      ASSIGN_OR_RETURN(Expression, merge_cond_tmp, (VisitExpression(*child)));
+      condition = std::move(merge_cond_tmp);
+      parsed.condition = std::move(condition);
+      break;
+    }
+    const std::string& action_kind = action_node->detail;
+    if (action_kind == "UPDATE") {
+      if (parsed.match_type != MergeWhenClause::MatchType::kMatched &&
+          parsed.match_type !=
+              MergeWhenClause::MatchType::kNotMatchedBySource) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: MERGE WHEN [NOT] MATCHED [BY TARGET] cannot "
+            "UPDATE");
+      }
+      parsed.action.kind = MergeActionKind::kUpdate;
+      const GoogleSqlAstNode* items = action_node->Child("UpdateItemList");
+      if (items == nullptr) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: bad MERGE UPDATE SET");
+      }
+      for (const GoogleSqlAstNode* item : items->Children("UpdateItem")) {
+        const GoogleSqlAstNode* assignment = item->Child("UpdateSetValue");
+        if (assignment == nullptr || assignment->children.size() < 2) {
+          return AstError<std::unique_ptr<Statement>>(
+              "GoogleSQL AST: bad MERGE UPDATE SET item");
+        }
+        const GoogleSqlAstNode* target_column = assignment->children[0].get();
+        if (target_column->kind != "PathExpression") {
+          return AstError<std::unique_ptr<Statement>>(
+              "GoogleSQL AST: MERGE UPDATE SET target must be a column");
+        }
+        ASSIGN_OR_RETURN(std::string, merge_col_tmp, Path(*target_column));
+        std::string column_path = std::move(merge_col_tmp);
+        if (column_path.find('.') != std::string::npos) {
+          return AstError<std::unique_ptr<Statement>>(
+              "GoogleSQL AST: MERGE UPDATE SET does not support dotted "
+              "field targets");
+        }
+        Expression value;
+        ASSIGN_OR_RETURN(Expression, merge_val_tmp,
+                         (VisitExpression(*assignment->children[1].get())));
+        value = std::move(merge_val_tmp);
+        parsed.action.set_clause.emplace_back(ColumnName("", column_path),
+                                              std::move(value));
+      }
+    } else if (action_kind == "DELETE") {
+      if (parsed.match_type != MergeWhenClause::MatchType::kMatched &&
+          parsed.match_type !=
+              MergeWhenClause::MatchType::kNotMatchedBySource) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: MERGE WHEN [NOT] MATCHED [BY TARGET] cannot "
+            "DELETE");
+      }
+      parsed.action.kind = MergeActionKind::kDelete;
+    } else if (action_kind == "INSERT") {
+      if (parsed.match_type !=
+          MergeWhenClause::MatchType::kNotMatchedByTarget) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: MERGE WHEN MATCHED / BY SOURCE cannot INSERT");
+      }
+      parsed.action.kind = MergeActionKind::kInsert;
+      if (const GoogleSqlAstNode* columns = action_node->Child("ColumnList")) {
+        for (const GoogleSqlAstNode* identifier :
+             columns->Children("Identifier")) {
+          ASSIGN_OR_RETURN(std::string, merge_ident_tmp,
+                           (Identifier(*identifier)));
+          parsed.action.insert_columns.push_back(std::move(merge_ident_tmp));
+        }
+      }
+      const GoogleSqlAstNode* row = action_node->Child("InsertValuesRow");
+      if (row == nullptr) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: MERGE INSERT ... SELECT is not supported");
+      }
+      for (const auto& value : row->children) {
+        Expression expression;
+        ASSIGN_OR_RETURN(Expression, merge_expr_tmp, (VisitExpression(*value)));
+        expression = std::move(merge_expr_tmp);
+        parsed.action.insert_values.push_back(std::move(expression));
+      }
+    } else {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: unknown MERGE action " + action_kind);
+    }
+    clauses.push_back(std::move(parsed));
+  }
+  auto statement = std::make_unique<MergeStatement>(
+      std::move(merge_target), std::move(source), std::move(source_alias),
+      std::move(on_condition));
+  statement->SetClauses(std::move(clauses));
   return statement;
 }
 
@@ -7852,20 +9755,59 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
     return VisitCreateFunction(root);
   }
   if (root.kind == "CreateViewStatement") {
-    // TEMP views: register the defining query for FROM-reference expansion.
+    // Views register the defining query for FROM-reference expansion right
+    // away (same-transaction references resolve), and the IR statement
+    // persists the definition text for later sessions.
     const GoogleSqlAstNode* path = root.Child("PathExpression");
     const GoogleSqlAstNode* query = root.Child("Query");
     if (path == nullptr || query == nullptr) {
       return AstError<std::unique_ptr<Statement>>(
           "GoogleSQL AST: bad CREATE VIEW");
     }
-    std::shared_ptr<GoogleSqlAstNode> clone = CloneAstNode(*query);
     ASSIGN_OR_RETURN(std::string, hv242328_0, (Path(*path)));
-    ViewRegistry()[Lower(std::move(hv242328_0))] = std::move(clone);
-    std::vector<NamedExpression> projection;
-    projection.emplace_back("", ConstantValueExp(Value(int64_t{0})));
-    return std::make_unique<SelectStatement>(
-        std::move(projection), std::vector<std::string>{}, Expression{});
+    const std::string view_name = std::move(hv242328_0);
+    // Validate the definition by visiting it; an invalid body must fail the
+    // CREATE VIEW statement, not the first later reference.  Registration
+    // happens when the statement executes, so a failed or aborted CREATE
+    // leaves no session-registry entry behind.
+    ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv242329_1,
+                     (VisitQuery(*query)));
+    static_cast<void>(hv242329_1);
+    const bool or_replace =
+        root.detail.find("is_or_replace") != std::string::npos;
+    return std::make_unique<CreateViewStatement>(view_name, or_replace,
+                                                 SliceSource(query));
+  }
+  if (root.kind == "CreateMaterializedViewStatement") {
+    // Materialized views are catalog objects: materialize the query into a
+    // table and persist the defining text for explicit refresh.  The IF NOT
+    // EXISTS marker rides the node detail (the pinned parser emits
+    // CreateMaterializedViewStatement(is_if_not_exists) for it).
+    const GoogleSqlAstNode* path = root.Child("PathExpression");
+    const GoogleSqlAstNode* query = root.Child("Query");
+    if (path == nullptr || query == nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: bad CREATE MATERIALIZED VIEW");
+    }
+    ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv243001_0,
+                     (VisitQuery(*query)));
+    ASSIGN_OR_RETURN(std::string, hv243002_0, (Path(*path)));
+    const bool if_not_exists =
+        root.detail.find("is_if_not_exists") != std::string::npos;
+    std::string query_text = SliceSource(query);
+    return std::make_unique<CreateMaterializedViewStatement>(
+        std::move(hv243002_0), if_not_exists, std::move(hv243001_0),
+        std::move(query_text));
+  }
+  if (root.kind == "DropMaterializedViewStatement") {
+    const GoogleSqlAstNode* path = root.Child("PathExpression");
+    if (path == nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: bad DROP MATERIALIZED VIEW");
+    }
+    ASSIGN_OR_RETURN(std::string, hv243003_0, (Path(*path)));
+    return std::make_unique<DropMaterializedViewStatement>(
+        std::move(hv243003_0));
   }
   if (root.kind == "InsertStatement") {
     return VisitInsert(root);
@@ -7875,6 +9817,36 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
   }
   if (root.kind == "DeleteStatement") {
     return VisitDelete(root);
+  }
+  if (root.kind == "MergeStatement") {
+    return VisitMerge(root);
+  }
+  if (root.kind == "AlterTableStatement") {
+    return VisitAlterTable(root);
+  }
+  if (root.kind == "TruncateStatement") {
+    // TRUNCATE TABLE removes every row and keeps the table definition
+    // (schema, constraints, indexes).  It desugars to an unconditional
+    // DELETE so MVCC/WAL semantics stay uniform; a physical truncate
+    // shortcut (page-chain reset with a dedicated WAL record) remains a
+    // future transaction-layer optimization.
+    const GoogleSqlAstNode* path = root.Child("PathExpression");
+    if (path == nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: bad TRUNCATE");
+    }
+    ASSIGN_OR_RETURN(std::string, truncate_table, Path(*path));
+    return std::make_unique<DeleteStatement>(std::move(truncate_table),
+                                             ConstantValueExp(Value(true)));
+  }
+  if (root.kind == "DropStatement VIEW") {
+    const GoogleSqlAstNode* path = root.Child("PathExpression");
+    if (path == nullptr) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: bad DROP VIEW");
+    }
+    ASSIGN_OR_RETURN(std::string, hv245001_0, (Path(*path)));
+    return std::make_unique<DropViewStatement>(std::move(hv245001_0));
   }
   if (root.kind == "DropStatement" || root.kind == "DropStatement TABLE") {
     const GoogleSqlAstNode* path = root.Child("PathExpression");

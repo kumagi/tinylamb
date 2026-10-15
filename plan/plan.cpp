@@ -16,9 +16,30 @@
 
 #include "plan/plan.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <ostream>
 
 namespace tinylamb {
+
+void PlanBase::Explain(std::ostream& o, int indent) const {
+  Dump(o, indent);
+  const PlanExplainInfo& info = ExplainInfo();
+  if (info.rule_name.empty() && info.physical_operator.empty() &&
+      info.required_properties.empty() && info.provided_properties.empty() &&
+      info.applied_rules.empty()) {
+    return;
+  }
+  const std::string pad(static_cast<size_t>(std::max(indent, 0)), ' ');
+  o << "\n"
+    << pad << "Rule: " << info.rule_name << "\n"
+    << pad << "Physical operator: " << info.physical_operator << "\n"
+    << pad << "Required properties: " << info.required_properties << "\n"
+    << pad << "Provided properties: " << info.provided_properties;
+  if (!info.applied_rules.empty()) {
+    o << "\n" << pad << "Applied rules: " << info.applied_rules;
+  }
+}
 
 std::ostream& operator<<(std::ostream& o, const PlanBase& p) {
   p.Dump(o, 0);

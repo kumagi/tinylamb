@@ -639,8 +639,7 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
       if (cnt == 0) {
         return {"NULL"};
       }
-      return {"|" + FormatDoubleShortest(sum / static_cast<double>(cnt)) +
-              "|"};
+      return {"|" + FormatDoubleShortest(sum / static_cast<double>(cnt)) + "|"};
     }
     case AggSpec::Kind::kBitAnd:
     case AggSpec::Kind::kBitOr:
@@ -785,6 +784,11 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   AggTrace& t = (trace != nullptr) ? *trace : local;
 
   t.setup.emplace_back(kDdl);
+  t.setup.emplace_back(
+      "CREATE TABLE pk_group (id INT64 PRIMARY KEY, payload INT64);");
+  t.setup.emplace_back(
+      "INSERT INTO pk_group VALUES "
+      "(1, NULL), (2, -7), (3, 9);");
   std::vector<MRow> mirror;
   // ~12% of rounds cross the morsel/parallel-aggregation threshold; the
   // small-table domain (-3..3) is kept so group counts stay meaningful.
@@ -866,6 +870,36 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   }
 
   std::string report;
+  const std::string pk_group_sql =
+      "SELECT id, payload, COUNT(*) FROM pk_group GROUP BY id, payload;";
+  const std::vector<std::string> pk_group_expected = {
+      "|1|,NULL,|1|,", "|2|,|-7|,|1|,", "|3|,|9|,|1|,"};
+  t.queries.push_back({pk_group_sql, pk_group_expected});
+  std::string pk_group_error;
+  auto pk_group_actual = RunQuery(db, ctx, pk_group_sql, &pk_group_error);
+  if (!pk_group_actual.has_value()) {
+    report += "[AGGREGATE MISMATCH] primary-key GROUP BY failed: ";
+    report += pk_group_error;
+    report += "\n";
+    return report;
+  }
+  const std::vector<std::string> pk_group_rows = FormatRows(*pk_group_actual);
+  if (pk_group_rows != pk_group_expected) {
+    report += "[AGGREGATE MISMATCH] " + pk_group_sql + "\n";
+    report += "  expected:\n";
+    for (const std::string& row : pk_group_expected) {
+      report += "    " + row + "\n";
+    }
+    report += "  actual:\n";
+    for (const std::string& row : pk_group_rows) {
+      report += "    " + row + "\n";
+    }
+    return report;
+  }
+  if (stats != nullptr) {
+    ++stats->primary_key_group_queries;
+  }
+
   const int query_count = g.Pick(2, 5);
   for (int q = 0; q < query_count; ++q) {
     const bool window = !large && g.Chance(45);

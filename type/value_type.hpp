@@ -50,6 +50,25 @@ inline std::string_view ValueTypeToString(ValueType type) {
   return "unknown value type";
 }
 
+// SQL type name for a stored value's tag, used to infer an array's declared
+// element type from its runtime elements. BOOL folds into kInt64, so a
+// predicate-produced element still reports INT64 here — the frontend tags
+// those arrays statically. Returns "" for tags with no scalar SQL name.
+inline std::string_view ElementSqlTypeName(ValueType type) {
+  switch (type) {
+    case ValueType::kInt64:
+      return "INT64";
+    case ValueType::kDouble:
+      return "FLOAT64";
+    case ValueType::kVarChar:
+      return "STRING";
+    case ValueType::kDate:
+      return "DATE";
+    default:
+      return {};
+  }
+}
+
 }  // namespace tinylamb
 
 template <>

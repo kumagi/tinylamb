@@ -31,8 +31,8 @@ namespace tinylamb {
 namespace {
 
 struct Cursor {
-  const uint8_t* data;
-  size_t size;
+  const uint8_t* data{};
+  size_t size{};
   size_t pos{0};
   uint8_t Next() { return pos < size ? data[pos++] : 0; }
 };
@@ -40,7 +40,7 @@ struct Cursor {
 // Functions that must propagate NULL (each verified against the
 // `if (values[i].IsNull()) return Value();` guard in
 // function_call_expression.cpp).
-const char* const kStrictFunctions[] = {
+const auto kStrictFunctions = std::to_array<const char* const>({
     "lower",
     "upper",
     "trim",
@@ -162,12 +162,12 @@ const char* const kStrictFunctions[] = {
     "__bit_xor",
     "__shift_left",
     "__shift_right",
-};
+});
 
 // Deterministic, non-throwing builtins that intentionally do NOT propagate
 // NULL (null-handling and conditional-evaluation functions).  Only
 // invariants 1 (no escape) and 2 (determinism) are checked for these.
-const char* const kNonStrictFunctions[] = {
+const auto kNonStrictFunctions = std::to_array<const char* const>({
     // make_interval ignores arguments past the first two (lenient arity,
     // pinned by SqlIntervalCoverageTest), so NULLs there stay observable.
     "make_interval",
@@ -182,12 +182,12 @@ const char* const kNonStrictFunctions[] = {
     "if",
     "iferror",
     "nulliferror",
-};
+});
 
 Value MakeArg(Cursor& c) {
   switch (c.Next() % 8) {
     case 0:
-      return Value();  // NULL
+      return {};  // NULL
     case 1:
       return Value(static_cast<int64_t>(c.Next()) - 127);
     case 2:
@@ -215,19 +215,18 @@ Value MakeArg(Cursor& c) {
       for (size_t i = 0; i < n; ++i) {
         const uint8_t b = c.Next();
         if (b == 0) {
-          elems.push_back(Value());
+          elems.emplace_back();  // NULL element.
           continue;
         }
         switch (flavor) {
           case 0:
-            elems.push_back(Value(static_cast<int64_t>(b) - 64));
+            elems.emplace_back(static_cast<int64_t>(b) - 64);
             break;
           case 1:
-            elems.push_back(Value(std::string(1, static_cast<char>(b % 128))));
+            elems.emplace_back(std::string(1, static_cast<char>(b % 128)));
             break;
           case 2:
-            elems.push_back(
-                Value(static_cast<double>(static_cast<int8_t>(b)) / 7.0));
+            elems.emplace_back(static_cast<double>(b) / 7.0);
             break;
           default:
             elems.push_back(
@@ -235,9 +234,10 @@ Value MakeArg(Cursor& c) {
             break;
         }
       }
-      static const char* kElemTypes[] = {"INT64", "STRING", "DOUBLE",
-                                         "ARRAY<INT64>"};
-      return Value::Array(std::move(elems), kElemTypes[flavor]);
+      static constexpr auto k_elem_types = std::to_array<const char*>(
+          {"INT64", "STRING", "DOUBLE", "ARRAY<INT64>"});
+      return Value::Array(std::move(elems),
+                          k_elem_types[flavor % k_elem_types.size()]);
     }
     default:
       return Value(std::string("abc"));
@@ -246,15 +246,14 @@ Value MakeArg(Cursor& c) {
 
 }  // namespace
 
+namespace {
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   if (size < 2) {
     return;
   }
-  Cursor c{data, size};
-  constexpr size_t kStrictCount =
-      sizeof(kStrictFunctions) / sizeof(kStrictFunctions[0]);
-  constexpr size_t kNonStrictCount =
-      sizeof(kNonStrictFunctions) / sizeof(kNonStrictFunctions[0]);
+  Cursor c{.data = data, .size = size};
+  constexpr size_t kStrictCount = kStrictFunctions.size();
+  constexpr size_t kNonStrictCount = kNonStrictFunctions.size();
   const size_t pick = c.Next() % (kStrictCount + kNonStrictCount);
   const bool strict = pick < kStrictCount;
   const std::string name = strict ? kStrictFunctions[pick]
@@ -265,31 +264,31 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     // DATE_ADD/DATE_SUB require (date, INTERVAL) — the interval operand is
     // an IntervalExpression node, so it cannot be NULL itself; strictness
     // is judged on the date argument only.
-    static const char* const kUnits[] = {"year", "month",  "week",  "day",
-                                         "hour", "minute", "second"};
+    static constexpr auto kUnits = std::to_array<const char* const>(
+        {"year", "month", "week", "day", "hour", "minute", "second"});
     Value v = MakeArg(c);
     has_null |= v.IsNull();
-    args.push_back(ConstantValueExp(std::move(v)));
+    args.push_back(ConstantValueExp(v));
     args.push_back(IntervalExpressionExp(static_cast<int64_t>(c.Next()) - 127,
-                                         kUnits[c.Next() % 7]));
+                                         kUnits[c.Next() % kUnits.size()]));
   } else {
-    const size_t argc = 1 + c.Next() % 3;
+    const size_t argc = 1 + (c.Next() % 3);
     for (size_t i = 0; i < argc; ++i) {
       Value v = MakeArg(c);
       has_null |= v.IsNull();
-      args.push_back(ConstantValueExp(std::move(v)));
+      args.push_back(ConstantValueExp(v));
     }
   }
   const size_t argc = args.size();
-  if (getenv("TINYLAMB_FUNC_FUZZ_TRACE")) {
-    fprintf(stderr, "trace %s argc=%zu", name.c_str(), argc);
+  if (getenv("TINYLAMB_FUNC_FUZZ_TRACE") != nullptr) {
+    (void)fprintf(stderr, "trace %s argc=%zu", name.c_str(), argc);
     for (const auto& a : args) {
       if (a->Type() == TypeTag::kConstantValue) {
         std::string dbg = a->AsConstantValue().GetValue().AsString();
-        fprintf(stderr, " arg=%s", dbg.c_str());
+        (void)fprintf(stderr, " arg=%s", dbg.c_str());
       }
     }
-    fprintf(stderr, "\n");
+    (void)fprintf(stderr, "\n");
   }
   const Expression call = FunctionCallExp(name, std::move(args));
 
@@ -297,7 +296,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   try {
     first = call->TryEvaluate(Row(), Schema());
   } catch (...) {
-    fprintf(stderr, "function threw: %s(argc=%zu)\n", name.c_str(), argc);
+    (void)fprintf(stderr, "function threw: %s(argc=%zu)\n", name.c_str(), argc);
     abort();
   }
   const StatusOr<Value> second = call->TryEvaluate(Row(), Schema());
@@ -325,6 +324,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   (void)verbose;
 }
 
+}  // namespace
 }  // namespace tinylamb
 
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,

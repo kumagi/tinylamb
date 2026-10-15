@@ -177,6 +177,9 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
         }
       }
     }
+    if (FailWithChildOf(*child_)) {
+      return false;
+    }
     *dst = Row({any ? Value(total) : Value()});
     executed_ = true;
     return true;
@@ -956,7 +959,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       }
     }
   }
-  FailWithChildOf(*child_);
+  if (FailWithChildOf(*child_)) {
+    return false;
+  }
   for (size_t i = 0; i < aggregates_.size(); ++i) {
     const auto& agg = aggregates_[i].expression->AsAggregateExpression();
     switch (agg.GetType()) {

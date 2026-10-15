@@ -101,7 +101,7 @@ graph TD
 
 - `eliminate_false_selection` / `join_on_false_to_empty`: 空集合の起点となる式を生成する先行 Rule です。
 - `setop_empty_simplification`: 集合演算において空集合入力を簡約する兄弟 Rule です。
-- `one_row_cross_join_elimination`: 空集合ではなく「1 行関係」を単位元として結合を除去する Rule です。
+
 
 ## 検証テスト
 

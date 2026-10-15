@@ -634,7 +634,12 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
                      "HAVING SUM(l_quantity) > 0);");
   ASSERT_TRUE(reused_base.HasValue()) << engine.LastError();
   std::ostringstream reused_base_plan;
-  DrainForStats(reused_base.Value());
+  // The cache hit must still deliver every row: a typed-fill cache publishes
+  // an arena WITHOUT Rows, and a consumer that fails to box them reads a
+  // silently empty relation (the SF=1 Q18/Q21 zero-row regression).
+  const auto reused_base_rows = DrainForStats(reused_base.Value());
+  ASSERT_EQ(reused_base_rows.size(), 1U);
+  EXPECT_EQ(reused_base_rows[0][0], Value(static_cast<int64_t>(kRows)));
   reused_base.Value()->Dump(reused_base_plan, 0);
   EXPECT_NE(reused_base_plan.str().find("base_scan_cache_hits=1"),
             std::string::npos)
@@ -796,6 +801,93 @@ TEST_F(SqlEngineTpchTest, TpchQ8Q9HeuristicPlanGolden) {
   EXPECT_EQ(q9_rows[0][1], Value(1994));
   EXPECT_NEAR(q9_rows[0][2].value.double_value, 72.0, 1e-6);
 
+  EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+}
+
+// The SF=1 Q18/Q21 shapes regressed to silently-empty results once (0 rows
+// against data whose true answer is 100 rows); the tiny-fixture
+// ExecutesAllTwentyTwoQueries pins cannot see it because quantities and the
+// waiting-supplier shape never fire at that scale. These tests exercise the
+// same shapes -- aggregate HAVING under IN, EXISTS + NOT EXISTS over a shared
+// lineitem self-join, grouped TopN finish -- at a scale where the correct
+// answers are non-empty and hand-computed, with ANALYZE'd statistics.
+TEST_F(SqlEngineTpchTest, Q18LargeVolumeCustomerShapeKeepsQualifyingRows) {
+  TransactionContext context = database_->BeginContext();
+  Run(*database_, context, "CREATE TABLE qc (c_custkey INT64, c_name STRING);");
+  Run(*database_, context,
+      "CREATE TABLE qo (o_orderkey INT64, o_custkey INT64, o_orderdate DATE,"
+      " o_totalprice DOUBLE);");
+  Run(*database_, context,
+      "CREATE TABLE ql (l_orderkey INT64, l_quantity DOUBLE);");
+  Run(*database_, context, "INSERT INTO qc VALUES (1,'A'), (2,'B'), (3,'C');");
+  Run(*database_, context,
+      "INSERT INTO qo VALUES (100,1,'2026-01-01',10.0),"
+      " (200,2,'2026-01-02',20.0), (300,3,'2026-01-03',30.0);");
+  Run(*database_, context,
+      "INSERT INTO ql VALUES (100,10), (100,5), (200,60), (200,60),"
+      " (200,60), (300,1);");
+  Run(*database_, context, "ANALYZE;");
+  // Only order 200 aggregates past the threshold (180 > 15); orders 100
+  // (15, not >) and 300 (1) must stay out, and order 100's split rows must
+  // aggregate per order, not per row.
+  std::vector<Row> rows =
+      Run(*database_, context,
+          "SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice,"
+          " sum(l_quantity) FROM qc, qo, ql"
+          " WHERE c_custkey = o_custkey AND o_orderkey IN"
+          " (SELECT l_orderkey FROM ql GROUP BY l_orderkey"
+          "  HAVING sum(l_quantity) > 15)"
+          " AND o_orderkey = l_orderkey"
+          " GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice"
+          " ORDER BY o_totalprice DESC LIMIT 10;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value("B"));
+  EXPECT_EQ(rows[0][1], Value(static_cast<int64_t>(2)));
+  EXPECT_EQ(rows[0][2], Value(static_cast<int64_t>(200)));
+  EXPECT_NEAR(rows[0][5].value.double_value, 180.0, 1e-9);
+  EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+}
+
+TEST_F(SqlEngineTpchTest, Q21WaitingSupplierShapeCountsOnlyTrueWaiters) {
+  TransactionContext context = database_->BeginContext();
+  Run(*database_, context,
+      "CREATE TABLE ws (s_suppkey INT64, s_name STRING, s_nationkey INT64);");
+  Run(*database_, context,
+      "CREATE TABLE wn (n_nationkey INT64, n_name STRING);");
+  Run(*database_, context,
+      "CREATE TABLE wo (o_orderkey INT64, o_orderstatus STRING);");
+  Run(*database_, context,
+      "CREATE TABLE wl (l_orderkey INT64, l_suppkey INT64,"
+      " l_commitdate DATE, l_receiptdate DATE);");
+  Run(*database_, context,
+      "INSERT INTO ws VALUES (1,'Supplier#1',1), (2,'Supplier#2',1);");
+  Run(*database_, context, "INSERT INTO wn VALUES (1,'PERU');");
+  Run(*database_, context, "INSERT INTO wo VALUES (100,'F'), (200,'F');");
+  // Order 100: supplier 1's line is delayed (receipt > commit) and supplier
+  // 2's line is on time (receipt == commit) -- supplier 1 waits. Order 200:
+  // both lines are delayed -- no one waits (the NOT EXISTS arm fails).
+  Run(*database_, context,
+      "INSERT INTO wl VALUES (100,1,'2026-01-01','2026-01-10'),"
+      " (100,2,'2026-01-01','2026-01-01'),"
+      " (200,2,'2026-01-01','2026-01-10'),"
+      " (200,1,'2026-01-01','2026-01-11');");
+  Run(*database_, context, "ANALYZE;");
+  std::vector<Row> rows =
+      Run(*database_, context,
+          "SELECT s_name, count(*) AS numwait FROM ws, wl l1, wo, wn"
+          " WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey"
+          " AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate"
+          " AND EXISTS (SELECT * FROM wl l2 WHERE l2.l_orderkey = l1.l_orderkey"
+          "  AND l2.l_suppkey <> l1.l_suppkey)"
+          " AND NOT EXISTS (SELECT * FROM wl l3"
+          "  WHERE l3.l_orderkey = l1.l_orderkey"
+          "  AND l3.l_suppkey <> l1.l_suppkey"
+          "  AND l3.l_receiptdate > l3.l_commitdate)"
+          " AND s_nationkey = n_nationkey AND n_name = 'PERU'"
+          " GROUP BY s_name ORDER BY numwait DESC, s_name;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value("Supplier#1"));
+  EXPECT_EQ(rows[0][1], Value(static_cast<int64_t>(1)));
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
 }
 

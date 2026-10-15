@@ -124,8 +124,8 @@ TEST(CommitPublicationTest, ReaderNeverSeesLaterCommitWithoutEarlierOne) {
         // while seeing an older A would mean a snapshot ran ahead of the
         // stable watermark.
         // Values are std::to_string(round): conversion cannot fail here.
-        if (std::atoi(b.Value().c_str()) >   // NOLINT(cert-err34-c)
-            std::atoi(a.Value().c_str())) {  // NOLINT(cert-err34-c)
+        if (std::atoi(b.Value().value().c_str()) >   // NOLINT(cert-err34-c)
+            std::atoi(a.Value().value().c_str())) {  // NOLINT(cert-err34-c)
           ++violations;
           order_violations.fetch_add(1, std::memory_order_relaxed);
         }
@@ -158,9 +158,9 @@ TEST(CommitPublicationTest, ReaderNeverSeesLaterCommitWithoutEarlierOne) {
   // Once all rounds are published, a fresh snapshot is uniform.
   Transaction final_reader = tm.Begin(true);
   ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(final_reader, row_a, std::nullopt),
-                        std::to_string(kRounds));
+                        std::optional<std::string>(std::to_string(kRounds)));
   ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(final_reader, row_b, std::nullopt),
-                        std::to_string(kRounds));
+                        std::optional<std::string>(std::to_string(kRounds)));
   ASSERT_EQ(final_reader.PreCommit(), Status::kSuccess);
   version_pin.Abort();
   ASSERT_EQ(std::remove(log_name.c_str()), 0);
@@ -185,7 +185,7 @@ TEST(CommitPublicationTest, SnapshotIsRepeatableAcrossConcurrentCommits) {
 
   Transaction reader = tm.Begin(true);
   const auto first = tm.ReadVersion(reader, rp, std::nullopt);
-  ASSERT_SUCCESS_AND_EQ(first, "base");
+  ASSERT_SUCCESS_AND_EQ(first, std::optional<std::string>("base"));
 
   std::thread writer_thread([&] {
     for (int i = 0; i < 50; ++i) {
@@ -202,7 +202,7 @@ TEST(CommitPublicationTest, SnapshotIsRepeatableAcrossConcurrentCommits) {
   // cache involved) must stay on that snapshot even though the watermark
   // moved forward many times under it.
   const auto second = tm.ReadVersion(reader, rp, std::nullopt);
-  ASSERT_SUCCESS_AND_EQ(second, "base");
+  ASSERT_SUCCESS_AND_EQ(second, std::optional<std::string>("base"));
   ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
   ASSERT_EQ(std::remove(log_name.c_str()), 0);
 }
@@ -294,6 +294,163 @@ TEST(WriteIntentWaitTest, WaiterGivesUpAfterWaitLimit) {
   });
   waiter.join();
   EXPECT_EQ(tm.Abort(holder), Status::kSuccess);
+}
+
+// A stalled WAL durability barrier (a checkpoint's data-file sync stretching
+// group commit, a slow disk under a write-back gate) slows INTENT HOLDERS
+// without deadlocking them.  Timing such waiters out at the ordinary limit
+// manufactured abort cascades: TPC-C produced bursts of 5 s escapes exactly
+// while a checkpoint flushed, each one a full undo walk.  While a durability
+// barrier is in flight the escape hatch stretches toward
+// kDurabilityIntentWaitFloor; without a barrier the hatch still trips at the
+// ordinary limit (see WaiterGivesUpAfterWaitLimit).
+TEST(WriteIntentWaitTest, DurabilityBarrierExtendsTheEscapeHatch) {
+  const std::string log_name = "intent_wait-test-" + RandomString() + ".log";
+  auto logger_holder = Logger::Create(log_name).MoveValue();
+  CHECK(logger_holder != nullptr);
+  Logger& logger = *logger_holder;
+  TransactionManager tm(nullptr, &logger, nullptr);
+  tm.SetDeadlockPolicy(TransactionManager::DeadlockPolicy::kWoundWait);
+  tm.SetWriteIntentWaitLimit(std::chrono::milliseconds(80));
+
+  const RowPosition contested(73, 3);
+  Transaction holder = tm.Begin();
+  ASSERT_TRUE(holder.AddWriteSet(contested));
+
+  std::thread waiter([&] {
+    Transaction t2 = tm.Begin();
+    const auto start = std::chrono::steady_clock::now();
+    // Granted by the holder's release, never by the escape hatch: the wait
+    // outlives the 80 ms limit several times over while the barrier stalls.
+    EXPECT_TRUE(t2.AddWriteSet(contested));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(80));
+    EXPECT_EQ(t2.LastIntentWaitFailure(),
+              Transaction::IntentWaitFailure::kNone);
+    ASSERT_EQ(Status::kSuccess, t2.PreCommit());
+  });
+  {
+    TransactionManager::DurabilityBarrierGuard barrier(tm);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ASSERT_TRUE(tm.ReleaseWriteIntent(holder, contested));
+    waiter.join();
+  }
+  EXPECT_EQ(tm.Abort(holder), Status::kSuccess);
+}
+
+// A contended hot row legitimately queues waiters (TPC-C delivery: every
+// transaction in a district deletes the SAME oldest new_order row). Each
+// HANDOVER of the intent is progress, so the escape-hatch deadline restarts
+// from the handover: the waiter survives a chain of short-lived holders whose
+// TOTAL time exceeds the limit, while a single stuck holder still trips it.
+TEST(WriteIntentWaitTest, HandoverProgressResetsTheWaitDeadline) {
+  const std::string log_name = "intent_wait-test-" + RandomString() + ".log";
+  auto logger_holder = Logger::Create(log_name).MoveValue();
+  CHECK(logger_holder != nullptr);
+  Logger& logger = *logger_holder;
+  TransactionManager tm(nullptr, &logger, nullptr);
+  tm.SetDeadlockPolicy(TransactionManager::DeadlockPolicy::kWoundWait);
+  // Two holders at ~60 ms each outlive the 90 ms limit together but not
+  // singly: without the handover reset the waiter dies at 90 ms while the
+  // second holder still owns the row; with it, the wait is granted.
+  tm.SetWriteIntentWaitLimit(std::chrono::milliseconds(90));
+
+  const RowPosition contested(74, 3);
+  Transaction holder1 = tm.Begin();
+  ASSERT_TRUE(holder1.AddWriteSet(contested));
+
+  std::thread waiter([&] {
+    Transaction t2 = tm.Begin();
+    EXPECT_TRUE(t2.AddWriteSet(contested));
+    // The hatch must never have fired: the grant came from a release, not
+    // from giving up.
+    EXPECT_EQ(t2.LastIntentWaitFailure(),
+              Transaction::IntentWaitFailure::kNone);
+    ASSERT_EQ(Status::kSuccess, t2.PreCommit());
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  ASSERT_EQ(Status::kSuccess, holder1.PreCommit());
+  // Second holder: usually wins the wake-up race against the parked waiter
+  // (this thread acts inline); if the waiter is granted first, its wait was
+  // short and the handover chain never formed -- both outcomes prove the
+  // contract, so the second holder simply stands down.
+  Transaction holder2 = tm.Begin();
+  if (holder2.AddWriteSet(contested)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    ASSERT_EQ(Status::kSuccess, holder2.PreCommit());
+  } else {
+    ASSERT_EQ(Status::kSuccess, holder2.Abort());
+  }
+  waiter.join();
+  EXPECT_EQ(tm.Abort(holder1), Status::kSuccess);
+}
+
+// The latch cycle's fast lane: once the holder STARTS aborting, its undo
+// walk may need the very page latch the waiter holds, so the waiter (not
+// the holder) must move first. The abort flag makes that give-up definitive
+// -- one poll tick (~10ms) instead of the full wait limit.
+TEST(WriteIntentWaitTest, WaiterGivesUpWhenHolderStartsAbort) {
+  const std::string log_name = "intent_wait-test-" + RandomString() + ".log";
+  auto logger_holder = Logger::Create(log_name).MoveValue();
+  CHECK(logger_holder != nullptr);
+  Logger& logger = *logger_holder;
+  TransactionManager tm(nullptr, &logger, nullptr);
+  // Default kDeadlockDetect: unrestricted waiting, so only the abort flag
+  // (not the policy) can end this wait early.
+  tm.SetWriteIntentWaitLimit(std::chrono::seconds(10));
+
+  const RowPosition contested(72, 3);
+  Transaction holder = tm.Begin();
+  ASSERT_TRUE(holder.AddWriteSet(contested));
+  const uint64_t giveups_before =
+      tm.RuntimeStats().write_intent_holder_abort_giveups;
+  EXPECT_FALSE(holder.IsAbortStarted());
+
+  std::thread waiter([&] {
+    Transaction t2 = tm.Begin();
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(t2.AddWriteSet(contested));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    // Far below the 10s wait limit: the flag, not the deadline, ended it.
+    EXPECT_LT(elapsed, std::chrono::milliseconds(1000));
+    EXPECT_EQ(t2.LastIntentWaitFailure(),
+              Transaction::IntentWaitFailure::kHolderAborting);
+    EXPECT_EQ(tm.Abort(t2), Status::kSuccess);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  // The same store TransactionManager::Abort performs at the top of the
+  // undo walk; calling it directly keeps the test deterministic (the real
+  // Abort would also release the intent, which would mask which path ended
+  // the wait).
+  holder.MarkAbortStarted();
+  waiter.join();
+
+  EXPECT_EQ(tm.RuntimeStats().write_intent_holder_abort_giveups,
+            giveups_before + 1);
+  EXPECT_EQ(tm.Abort(holder), Status::kSuccess);
+  EXPECT_TRUE(holder.IsAbortStarted());
+}
+
+// Abort() itself arms the flag before the undo walk, on every non-read-only
+// path, so a waiter parked on the aborting holder's intent sees it no matter
+// which entry point started the rollback.
+TEST(WriteIntentWaitTest, AbortArmsHolderAbortFlag) {
+  const std::string log_name = "intent_wait-test-" + RandomString() + ".log";
+  auto logger_holder = Logger::Create(log_name).MoveValue();
+  CHECK(logger_holder != nullptr);
+  Logger& logger = *logger_holder;
+  TransactionManager tm(nullptr, &logger, nullptr);
+
+  Transaction holder = tm.Begin();
+  const RowPosition rp(73, 1);
+  ASSERT_TRUE(holder.AddWriteSet(rp));
+  EXPECT_FALSE(holder.IsAbortStarted());
+  EXPECT_EQ(tm.Abort(holder), Status::kSuccess);
+  EXPECT_TRUE(holder.IsAbortStarted());
+
+  Transaction read_only = tm.Begin(true);
+  EXPECT_EQ(tm.Abort(read_only), Status::kSuccess);
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +629,7 @@ TEST_F(QueueTableTest, PointRangeOnKeyPrefixResolvesHeapRows) {
 
   if (!mismatches.empty()) {
     GTEST_SKIP()
-        << true << true << true << true << true << true << mismatches.front()
+        << mismatches.front()
         << (mismatches.size() > 1
                 ? ", " + std::to_string(mismatches[1]) + ", ..."
                 : ", ...")
@@ -543,7 +700,7 @@ TEST_F(QueueTableTest, DeleteCompletesWhenPhysicalImageWasDisplaced) {
   ASSERT_TRUE(probe_table.HasValue());
   const RowPosition head = ten.front();
   auto still_visible = probe_table.Value()->Read(probe.txn_, head);
-  ASSERT_TRUE(still_visible.HasValue()) << true;
+  ASSERT_TRUE(still_visible.HasValue());
   ASSERT_EQ(probe.PreCommit(), Status::kSuccess);
 
   // The contract: a snapshot-visible row must be deletable even though its
@@ -612,7 +769,7 @@ TEST(DurabilityBarrierTest, ReadOnlyReaderWaitsForObservedCommitLSN) {
   {
     Transaction reader = tm.Begin(true);
     ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(reader, row, std::nullopt),
-                          std::string("committed"));
+                          std::optional<std::string>("committed"));
     // The observed version came from a real commit record, so the reader
     // must have recorded a non-zero dependency LSN.
     EXPECT_NE(reader.DurabilityDependence(), 0U);
@@ -673,7 +830,7 @@ TEST(DurabilityBarrierTest, ChainedWriterDependsOnEarlierCommit) {
     t2.RegisterVersionWrite(b, std::nullopt,
                             std::optional<std::string_view>("B"));
     ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(t2, a, std::nullopt),
-                          std::string("A"));
+                          std::optional<std::string>("A"));
     // T2 must carry a durability dependency from reading T1's version: the
     // end of T1's commit record, strictly above the record's start LSN.
     EXPECT_GT(t2.DurabilityDependence(), a_commit_lsn);

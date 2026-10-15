@@ -78,9 +78,9 @@ tinylamb の最適化は 3 層の独立した Rule セットで構成される
 
 | 層 | 定義場所 | 本数 | 役割 |
 |---|---|---|---|
-| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 約 74 | 定数畳み込み・比較の正規化・ブール恒等式などスカラー式の正規化 |
-| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 117 | Memo へ同値な論理式を追加(探索) |
-| 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 52 | 論理式を物理プランへ実装(コスト評価の対象) |
+| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 70 | 定数畳み込み・比較の正規化・ブール恒等式などスカラー式の正規化 |
+| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 83 | Memo へ同値な論理式を追加(探索) |
+| 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 46 | 論理式を物理プランへ実装(コスト評価の対象) |
 
 第1部で説明すべきインフラ要素:
 
@@ -122,8 +122,8 @@ docs/opt/
     60-rule-governance.md          Rule 追加・無効化・事前条件ゲート(D5)
     70-expression-rewrite.md       式書き換え: フレームワークと自明な Rule の一括解説
   part2-rules/                     第2部 Rule リファレンス(辞書向け)
-    logical/<rule-name>.md         論理 Rule 117 本(1 ルール 1 ファイル)
-    implementation/<rule-name>.md  実装 Rule 52 本(1 ルール 1 ファイル)
+    logical/<rule-name>.md         論理 Rule 83 本(1 ルール 1 ファイル)
+    implementation/<rule-name>.md  実装 Rule 46 本(1 ルール 1 ファイル)
     expression/<rule-name>.md      式書き換え Rule の非自明なもの(個別章)
 ```
 
@@ -197,7 +197,7 @@ docs/opt/
 - 日本語。本文はですます調(敬体)。コード・識別子・Rule 名は英語のまま。
 - 専門用語の初出は原語を併記する(例: メモ(Memo))。
 - Rule 名・識別子はバッククォートで囲む。
-- 数の主張(「117 本」等)は基準リビジョン時点の値であり、ずれたら §3 の運用
+- 数の主張(「83 本」等)は基準リビジョン時点の値であり、ずれたら §3 の運用
   で直す。
 
 ## 9. 複数ターン執筆ワークフロー
@@ -233,100 +233,15 @@ docs/opt/
 権威ある一覧はコード。執筆順はこの分類にこだわらず、第1部で必要になる概念から
 先に解説してよい。各 Rule の進捗は 00-index.md のトラッカーで管理する。
 
-### 論理 Rule(117 本)
+### 論理 Rule(83 本)
 
-- **A. 結合の順序・形状 (11)**: `join_commutativity` / `join_enumeration` /
-  `join_associativity_left` / `join_associativity_right` /
-  `join_to_cross_if_no_predicate` / `cross_to_inner_with_predicate` /
-  `outer_join_associativity` / `semi_join_commutativity` /
-  `semi_join_inner_join_reorder` / `greedy_join_order_fallback` /
-  `star_join_reorder`
-- **B. フィルタのマージとプッシュダウン (25)**: `merge_selections` /
-  `merge_adjacent_filters` / `push_selection_into_scan` /
-  `push_selection_through_join` / `split_selection_over_join` /
-  `push_filter_through_distinct` / `push_filter_through_sort` /
-  `push_filter_through_left_join_left_side` /
-  `push_selection_through_projection` / `push_selection_through_aggregation` /
-  `infer_join_predicates` / `infer_filter_from_equivalence_class` /
-  `join_predicate_transitivity` / `inferred_inequality_pushdown` /
-  `dynamic_filter_pushdown_join` / `having_to_filter_rewrite` /
-  `filter_pull_up_for_extreme_selectivity` /
-  `functional_dependency_filter_reduction` /
-  `scan_zone_map_filter_integration` / `check_constraint_predicate_intake` /
-  `unnest_filter_pushdown` / `recursive_termination_predicate_pushdown` /
-  `cast_pushdown_on_comparison` / `extract_year_sargable` /
-  `comparison_self_predicates`
-- **C. 削除・簡約 (20)**: `eliminate_false_selection` /
-  `eliminate_true_selection` / `join_on_false_to_empty` /
-  `join_empty_simplification` / `setop_empty_simplification` /
-  `setop_empty_identity` / `eliminate_identity_projection` /
-  `eliminate_double_sort` / `eliminate_sort_under_unordered_consumer` /
-  `no_op_window_elimination` / `one_row_cross_join_elimination` /
-  `self_join_elimination` / `unused_join_elimination` / `fk_join_elimination` /
-  `foreign_key_outer_join_elimination` / `redundant_join_predicate_elimination` /
-  `pk_unique_distinct_elimination` / `not_null_is_not_null_elimination` /
-  `any_value_elimination` / `join_identity_dummy`
-- **D. Projection (9)**: `merge_projections` / `merge_adjacent_projections` /
-  `push_projection_through_join` / `push_projection_through_union` /
-  `push_projection_through_aggregation` / `projection_cse_and_pruning` /
-  `projection_constant_propagation` /
-  `push_projection_below_join_width_control` / `aggregate_projection_merge`
-- **E. LIMIT / TOP-N / SORT (9)**: `merge_limits` /
-  `push_limit_through_projection` / `topn_push_through_projection` /
-  `union_all_push_limit` / `push_limit_through_union_all` /
-  `push_limit_through_left_join` / `limit_push_through_sort` /
-  `sort_merge_of_compatible_orders` / `rank_row_number_to_topn`
-- **F. 集約 (14)**: `distinct_over_group_by` / `distinct_over_distinct` /
-  `distinct_and_group_by_interchange` / `count_star_without_group_rewrite` /
-  `count_star_rewrite_on_not_null` /
-  `group_by_functional_dependency_reduction` /
-  `unique_group_key_aggregate_elimination` / `count_distinct_expansion` /
-  `grouping_sets_expansion` / `eager_aggregation_over_join` /
-  `aggregate_join_transpose` / `aggregate_union_transpose` /
-  `push_aggregation_through_union_all` / `filter_aggregate_pushdown`
-- **G. ウィンドウ関数 (5)**: `split_window` / `merge_adjacent_windows` /
-  `push_selection_through_window` / `window_frame_sort_sharing` /
-  `window_after_filter_partition_pushdown`
-- **H. 結合種別の変換 (11)**: `unique_semi_to_inner` / `outer_to_anti_join` /
-  `right_to_left_outer_join` / `full_outer_join_decomposition` /
-  `outer_to_inner_join_on_null_rejecting_filter` /
-  `semijoin_to_inner_plus_distinct` / `mark_join_to_filter` /
-  `in_list_to_semi_join` / `intersect_to_semijoin` / `except_to_antijoin` /
-  `push_semi_join_through_inner_join`
-- **I. 相関サブクエリ・Apply (5)**: `apply_to_join` /
-  `hoist_correlated_selection_to_apply` / `push_selection_through_apply` /
-  `push_apply_through_join` / `decorrelate_aggregate_apply`
-- **J. 集合演算 (6)**: `push_filter_past_setop` /
-  `union_to_union_all_plus_distinct` / `union_all_merge` /
-  `union_distinct_hash_sort_choice` / `intersect_except_cost_based_lowering` /
-  `values_fold_into_union`
-- **K. その他の式書き換え (2)**: `push_not_through_expression` /
-  `order_by_redundant_column_removal`
+`join_enumeration`, `join_commutativity`, `join_associativity_left`, `join_associativity_right`, `join_to_cross_if_no_predicate`, `eliminate_false_selection`, `merge_selections`, `push_selection_into_scan`, `push_selection_through_join`, `split_selection_over_join`, `push_filter_past_setop`, `push_filter_through_distinct`, `push_projection_through_union`, `push_projection_through_join`, `merge_projections`, `push_selection_through_projection`, `push_limit_through_projection`, `topn_push_through_projection`, `union_all_push_limit`, `push_selection_through_aggregation`, `infer_join_predicates`, `merge_limits`, `sort_merge_of_compatible_orders`, `eliminate_true_selection`, `setop_empty_simplification`, `setop_empty_identity`, `union_to_union_all_plus_distinct`, `union_all_merge`, `push_filter_through_left_join_left_side`, `join_on_false_to_empty`, `eliminate_double_sort`, `distinct_over_group_by`, `push_projection_through_aggregation`, `limit_push_through_sort`, `push_filter_through_sort`, `eliminate_sort_under_unordered_consumer`, `distinct_over_distinct`, `cross_to_inner_with_predicate`, `join_empty_simplification`, `intersect_to_semijoin`, `except_to_antijoin`, `distinct_and_group_by_interchange`, `self_join_elimination`, `unique_semi_to_inner`, `outer_to_anti_join`, `right_to_left_outer_join`, `full_outer_join_decomposition`, `outer_to_inner_join_on_null_rejecting_filter`, `outer_join_associativity`, `semi_join_inner_join_reorder`, `semi_join_commutativity`, `push_selection_through_window`, `infer_filter_from_equivalence_class`, `push_semi_join_through_inner_join`, `push_limit_through_left_join`, `merge_adjacent_windows`, `push_not_through_expression`, `no_op_window_elimination`, `dynamic_filter_pushdown_join`, `semi_reduction_pushdown_semi_join`, `semi_reduction_pushdown_anti_join`, `join_predicate_transitivity`, `inferred_inequality_pushdown`, `redundant_join_predicate_elimination`, `unnest_filter_pushdown`, `recursive_termination_predicate_pushdown`, `in_list_to_semi_join`, `functional_dependency_filter_reduction`, `filter_aggregate_pushdown`, `aggregate_union_transpose`, `pk_unique_distinct_elimination`, `not_null_is_not_null_elimination`, `join_identity_dummy`, `count_star_rewrite_on_not_null`, `topn_push_through_proven_one_to_one_join`, `or_to_union`, `distinct_eager_over_join`, `topn_push_through_union_all`, `split_window`, `values_fold_into_union`, `cast_pushdown_on_comparison`, `extract_year_sargable`, `comparison_self_predicates`
 
-### 実装 Rule(52 本)
+### 実装 Rule(46 本)
 
-- **スキャン (2)**: `full_scan` / `index_scan`(forward/reverse、IndexOnly /
-  Bitmap / MinMax への分岐を含む)
-- **リレーション供給 (6)**: `empty` / `dummy_scan` / `constant_table` /
-  `values` / `generate_series` / `relational_ir`
-- **選択・射影 (2)**: `selection` / `projection`
-- **結合 (17)**: `nested_loop_join` / `hash_join` / `single_hash_join` /
-  `merge_join` / `index_join` / `cross_join` / `outer_nested_loop` /
-  `outer_hash_join` / `semi_hash_join` / `semi_merge_join` / `anti_hash_join` /
-  `anti_merge_join` / `mark_hash_join` / `batch_nested_loop` /
-  `batch_nested_loop_semi` / `batch_nested_loop_anti` /
-  `batch_nested_loop_outer`
-- **集約・DISTINCT (4)**: `aggregation` / `distinct` / `sort_distinct` /
-  `skip_scan_distinct`
-- **ソート・行制限 (4)**: `sort` / `topn` / `limit` / `max1_row`
-- **集合演算 (6)**: `union` / `union_all` / `intersect` / `intersect_all` /
-  `except` / `except_all`
-- **その他 (7)**: `unnest` / `apply` / `recursive_cte` / `materialize` /
-  `eager_spool` / `lazy_spool` / `window`
-- **分散プレースホルダ (4)**: `exchange_noop` / `gather_noop` /
-  `broadcast_noop` / `redistribute_noop`
+`relational_ir`, `dummy_scan`, `values`, `unnest`, `apply`, `recursive_cte`, `index_scan`, `full_scan`, `selection`, `sample`, `projection`, `aggregation`, `sort_incremental`, `sort`, `sort_external_merge`, `window`, `topn`, `empty`, `distinct`, `sort_distinct`, `skip_scan_distinct`, `union`, `union_all`, `intersect`, `intersect_all`, `except`, `except_all`, `limit`, `hash_join`, `merge_join`, `band_join`, `zigzag_join`, `outer_hash_join`, `cross_join`, `semi_hash_join`, `anti_hash_join`, `semi_merge_join`, `anti_merge_join`, `index_join`, `late_materialization_join`, `nested_loop_join`, `outer_nested_loop`, `batch_nested_loop`, `batch_nested_loop_semi`, `batch_nested_loop_anti`, `batch_nested_loop_outer`
 
-### 式書き換え Rule(約 74 本)(決定: 2026-09-13 — 1 本も飛ばさない)
+### 式書き換え Rule(70 本)(決定: 2026-09-13 — 1 本も飛ばさない)
 
 `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` は全 Rule を解説
 する。定数畳み込み(`x + 0`、`x * 1` など)のように自明度の高いものは

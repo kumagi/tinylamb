@@ -83,7 +83,7 @@ return std::vector<PlanAlternative>{PlanAlternative{
 
 - `join_identity_dummy`: 結合の片辺が `DummyScan` である場合に結合演算そのものを消去する論理 Rule です。消去されずに残った単独の `DummyScan` を本 Rule が物理実装します。
 - `values`: 複数行または明示的な VALUES 句を持つ定数リレーションを変換する兄弟 Rule です。
-- `constant_table`: 定数リレーションの別形態を担当する物理実装 Rule です。
+
 
 ## 検証テスト
 

@@ -25,7 +25,9 @@
 
 namespace tinylamb {
 
-inline uint64_t Generate(size_t offset) { return offset * 19937 + 2147483647; }
+inline uint64_t Generate(size_t offset) {
+  return (offset * 19937) + 2147483647;
+}
 
 static constexpr size_t kFileSize = 8LLU * 1024 * 1024;
 static constexpr size_t kCachePageSize = 4096;
@@ -53,7 +55,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   for (size_t i = 0; i < kMaxReads && stream.Remaining(); ++i) {
     const size_t page = stream.Pick(kFileSize / kCachePageSize);
     const size_t offset = stream.Pick(kCachePageSize);
-    const size_t pos = page * kCachePageSize + offset;
+    const size_t pos = (page * kCachePageSize) + offset;
     size_t read_size = stream.Pick(kCachePageSize) + 1;
     if (kFileSize < read_size + pos) {
       read_size -= pos + read_size - kFileSize;

@@ -28,6 +28,7 @@
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
+#include "executor/simd_comparison.hpp"
 #include "executor_base.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/bytecode.hpp"
@@ -98,6 +99,12 @@ bool BatchMayMatch(  // NOLINT(misc-no-recursion)
   if (offset < 0) {
     return true;
   }
+  // Zone maps over stored INT64 payloads use signed bounds. UINT64 shares
+  // that storage, so pruning it here can discard values above INT64_MAX.
+  if (schema.GetColumn(static_cast<size_t>(offset)).IsUnsigned() ||
+      (*constant)->AsConstantValue().GetValue().IsUnsigned()) {
+    return true;
+  }
   return chunk.ZoneMapAt(static_cast<size_t>(offset))
       .MayMatch(operation, (*constant)->AsConstantValue().GetValue());
 }
@@ -111,6 +118,40 @@ Selection::Selection(Expression exp, Schema schema, Executor src,
       schema_(std::move(schema)),
       src_(std::move(src)),
       jit_threshold_rows_(jit_threshold_rows) {
+  if (BytecodeEnabled() && jit_threshold_rows_ >= kJitEarlyPromotionRows &&
+      exp_ && exp_->Type() == TypeTag::kBinaryExp) {
+    const BinaryExpression& binary = exp_->AsBinaryExpression();
+    if (IsComparison(binary.Op())) {
+      const Expression* column = &binary.Left();
+      const Expression* constant = &binary.Right();
+      BinaryOperation operation = binary.Op();
+      if ((*column)->Type() == TypeTag::kConstantValue &&
+          (*constant)->Type() == TypeTag::kColumnValue) {
+        std::swap(column, constant);
+        operation = Flip(operation);
+      }
+      if ((*column)->Type() == TypeTag::kColumnValue &&
+          (*constant)->Type() == TypeTag::kConstantValue) {
+        const int offset =
+            schema_.Offset((*column)->AsColumnValue().GetColumnName());
+        const Value& value = (*constant)->AsConstantValue().GetValue();
+        if (offset >= 0 &&
+            (schema_.GetColumn(static_cast<size_t>(offset)).Type() ==
+                 ValueType::kInt64 ||
+             schema_.GetColumn(static_cast<size_t>(offset)).Type() ==
+                 ValueType::kDate) &&
+            value.type ==
+                schema_.GetColumn(static_cast<size_t>(offset)).Type() &&
+            !value.IsUnsigned() &&
+            !schema_.GetColumn(static_cast<size_t>(offset)).IsUnsigned()) {
+          simd_filter_ = SimdIntFilter{.enabled = true,
+                                       .column = static_cast<size_t>(offset),
+                                       .operation = operation,
+                                       .constant = value.value.int_value};
+        }
+      }
+    }
+  }
   // The JIT kernel below is derived from the compiled program, so disabling
   // bytecode also disables the filter JIT (differential-testing hook).
   bytecode_ = BytecodeEnabled()
@@ -171,6 +212,27 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
     }
     std::optional<ColumnVector> predicates;
     rows_seen_ += input_batch_.Size();
+    if (simd_filter_.enabled) {
+      const ColumnVector& simd_column =
+          input_batch_.ColumnAt(simd_filter_.column);
+      const ZoneMap& simd_zone = input_batch_.ZoneMapAt(simd_filter_.column);
+      if (input_batch_.HasLayout(schema_) &&
+          simd_column.Type() == schema_.GetColumn(simd_filter_.column).Type() &&
+          !simd_column.IsUnsigned() && simd_zone.Initialized() &&
+          simd_zone.NullCount() == 0) {
+        ValidityBitmap mask;
+        SimdComparisonKernel::CompareInt64(
+            simd_column.IntegerData().data(), simd_column.Size(),
+            simd_filter_.operation, simd_filter_.constant, &mask);
+        mask.ToSelectionVector(&simd_selection_vector_);
+        if (!simd_selection_vector_.Empty()) {
+          rows_selected_ += simd_selection_vector_.Size();
+          destination->AppendGather(input_batch_, simd_selection_vector_.Data(),
+                                    simd_selection_vector_.Size());
+        }
+        continue;
+      }
+    }
     // Early promotion OR-condition: once the scan has streamed enough full
     // batches, its estimated row count dwarfs the JIT break-even point
     // (docs/jit_profile.md), so compiling now pays off long before the
@@ -225,9 +287,8 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
           input_batch_.ColumnAt(jit_column_).IntegerData().data(),
           result.data(), result.size(), jit_constant_);
       predicates.emplace(ValueType::kInt64, input_batch_.Size());
-      for (uint8_t value : result) {
-        predicates->Append(Value(value != 0));
-      }
+      // Bulk-append the 0/1 bytes as int64 payload: no per-row Value.
+      predicates->AppendBoolBatch(result.data(), result.size());
       ++jit_batches_;
     } else if (bytecode_) {
       StatusOr<ColumnVector> batch = bytecode_->TryEvaluateBatch(input_batch_);

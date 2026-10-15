@@ -1,118 +1,64 @@
 # push_selection_into_scan
 
-- 状態: draft / 執筆基準リビジョン: `3880673` (2026-09-12)
-- 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録名 `"push_selection_into_scan"`）
+- 状態: draft / 更新基準: `9ce7837` 上の作業ツリー (2026-10-02)
+- 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`
 
 ## 概要
 
-`push_selection_into_scan` は、単一表スキャンノードの直上に位置する選択演算 `Selection(Scan(t), p)` の述語 `p` を、スキャングループの `scan filter` にマージする論理変換 Rule です。メモ構造内のグループ属性（`Group.filter`）を更新することにより、物理実装段階で `index_scan` や範囲スキャン（RangeScan）などの効率的なアクセスパスを選択可能にします。
+Selection の述語を物理 scan の access-path 選択へ渡します。重要なのは、
+共有される入力 Group を変更せず、Selection の結果 Group に filtered scan を
+追加する点です。これにより外部結合や UNION の別枝を狭めません。
 
 ## 変換前後の関係
 
-論理プランのノードトポロジそのものを破棄するのではなく、スキャングループが保持するフィルタ述語を更新します。
-
 ```mermaid
 graph TD
-  subgraph before["変換前"]
-    S1["Selection p"] --> SC1["Scan t"]
-  end
-  subgraph after["変換後: Group t の scan filter に p が合併される"]
-    S2["Selection p（既存式は保持）"] --> SC2["Scan t (filter = ... AND p)"]
-  end
+  S["結果 Group: Selection p"] --> B["入力 Group: Scan t"]
+  S2["結果 Group の別候補: Scan t / filter p"]
+  O["別の利用者"] --> B
 ```
-
-変換後もメモ内には元の `Selection(Scan, p)` が維持されます。物理計画生成時にスキャン側で述語が完全に消費されたと証明できれば選択演算子は省略され、未消費の述語が残る場合は残差フィルタ（residual Selection）として評価されます。
 
 ## 適用条件
 
-パターン照合にはDSLヘルパー `SelectionWithin(0, Scan("scan"))` を用います（`plan/cascades.hpp`）。
+`SelectionWithin(0, Scan("scan"))` が述語の存在と参照関係の閉包を確認します。
+入力または結果 Group に `sample_barrier` がある場合は辞退します。
+サンプリングより前へ WHERE を移すと標本自体が変わるためです。
 
-```cpp
-// Matches a Selection whose predicate only touches the relations of child
-// group `predicate_within_child`.
-inline Pattern SelectionWithin(size_t predicate_within_child,
-                               Pattern child = Any(),
-                               std::string capture = {}) {
-  PayloadConstraint payload;
-  payload.requires_predicate = true;
-  payload.predicate_within_child = predicate_within_child;
-  return Pattern::Op(LogicalOperator::kSelection, {std::move(child)},
-                     std::move(capture), payload);
-}
-```
+## 意味論的根拠
 
-適用条件は以下の3点です。
-
-1. **述語の存在**: `requires_predicate = true` により、有効な述語を持つ `Selection` にのみマッチします。
-2. **参照関係のスコープ閉包**: `predicate_within_child = 0` により、述語内で参照される全列が修飾名ベースで0番目の子ノード（スキャングループ）の関係内に収まっている必要があります。未修飾の列名は帰属関係を静的に証明できないため、照合失敗として扱われます。
-3. **子ノードの演算子**: 子 Group に `LogicalOperator::kScan` を持つ式が存在すること。
-
-さらに変換ラムダ内で、外部結合由来のフィルタに関するガード条件を判定します（`plan/cascades.cpp`）。
-
-```cpp
-          // A derived filter that only limits one *input* of an outer join
-          // (push_filter_through_left_join_left_side) must stay a distinct
-          // Selection node: merging it into the shared scan group's filter
-          // would also constrain every other alternative that reuses that
-          // scan (e.g. the AntiJoin branch of a FULL decomposition), dropping
-          // rows the outer join must preserve.
-          if (memo.Get(group).tag.starts_with("left-join-filter:")) {
-            return;
-          }
-          memo.MergeScanFilter(bindings.at("scan"), *expression.predicate);
-```
-
-親 Group のタグが `left-join-filter:` で始まる場合、処理を中断します。これは、`push_filter_through_left_join_left_side` によって導出された外部結合の入力側限定フィルタを共有スキャングループにマージすると、同一スキャンを共有する他の代替ブランチ（完全外部結合の分解によるAntiJoin枝など）にも制約が波及し、外部結合で保持すべき行が脱落するためです。
-
-## 意味論的根拠とガードレール
-
-単一関係 Group においては、スキャンフィルタが実行時に評価される唯一の述語評価点となります。
-
-```cpp
-    // Selection(Scan(t), p): annotate the scan group's filter so
-    // implementation rules can choose IndexScan/RangeScan. Guard rail: never
-    // push through outer joins (null-rejection analysis does not exist yet).
-```
-
-単一表に対するスキャンフィルタの変更は、単なる最適化ではなく結果行の正しさに直結します。本 Rule が安全である理由は、`SelectionWithin(0)` によって「スキャン結果に対して適用しても結果集合が変わらない、当該表に閉じた述語」のみを対象としているためです。また、子ノード制約を `Scan` に限定することで、NULL補完行の破棄判定（null-rejection）が未確立な外部結合を誤って透過することを構造的に遮断しています。
+結果 Group は既に「入力のうち p を満たす行」という意味です。その Group に
+p を評価する scan を追加するのは同値です。入力 Group の意味は変更しません。
+以前のように共有入力を狭めると、FULL JOIN 分解の別枝などから行が失われます。
 
 ## 実装の詳細
 
-フィルタのマージ処理は `Memo::MergeScanFilter`（`plan/cascades.cpp`）が担当します。
+`RuleSet::Default()` からの抜粋です。
 
 ```cpp
-void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
-  Group& target = Get(group);
-  if (target.relations.size() != 1) {
-    CHECK_MSG(false, "scan filter requires a single-relation group");
-  }
-  const Expression next = CanonicalizeConjuncts(
-      target.filter
-          ? BinaryExpressionExp(target.filter, BinaryOperation::kAnd, predicate)
-          : predicate);
-  target.filter = next;
-}
+          if (memo.Get(input).filter)
+            memo.MergeScanFilter(group, memo.Get(input).filter);
+          memo.MergeScanFilter(group, *expression.predicate);
+          for (const auto& scan : memo.Get(input).expressions) {
+            if (scan.operation == LogicalOperator::kScan)
+              memo.AddExpression(group, scan);
+          }
 ```
 
-- 対象 Group が単一関係であることを表明（`CHECK_MSG`）します。
-- 既存のフィルタが存在する場合は論理積（AND）で結合し、`CanonicalizeConjuncts` により連言のソート、重複排除、矛盾検出に基づく恒偽化を行います。これにより、同一述語を複数回マージしてもフィルタ式が膨張しない冪等性が保証されます。
+`MergeScanFilter` は連言を正規化し、変更を touched 通知します。
+探索器は依存する親を再評価するので、新しい scan 候補と filter が物理選択へ届きます。
 
 ## 最適化効果
 
-スキャングループにフィルタ述語が統合されることで、以下の2点において実行コストが低減します。
-
-1. **インデックススキャンの誘発**: 物理実装 Rule（`index_scan`）が `Group.filter` を参照可能となり、SARG可能な述語（探索引数化可能な条件）が存在する場合にフルスキャンからインデックスシークへと物理計画を切り替えます。
-2. **早期のデータ削減**: スキャン段階でフィルタリングが行われるため、上位の結合演算や集約演算へ入力されるデータ行数が最小化されます。
+単一表の通常 SELECT も Memo に入り、この変換から index/full scan を比較できます。
+元の Selection も候補として残るので、可用な方式を減らしません。
 
 ## 関連 Rule との相互作用
 
-- `merge_selections` / `merge_adjacent_filters`: 多段の選択演算を1 段に集約し、述語を一括して `SelectionWithin` の検査対象とします。
-- `push_selection_through_join` / `split_selection_over_join`: 結合ノードの上位にある選択演算を分解し、各表のスキャングループへ述語を押し込みます。最終的には本 Rule と同様に `MergeScanFilter` を経由してスキャンに付与されます。
-- `extract_year_sargable` / `cast_pushdown_on_comparison`: スキャンフィルタに登録された述語をSARG可能な形式へと書き換えます。
+`merge_selections` が隣接 filter を一段にまとめます。
+`push_filter_past_setop` の枝は child ID を含むタグで区別します。
+範囲抽出は実際の scan filter を読みます。zone map は実行器で適用されます。
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
-  - `CascadesTest.PushSelectionIntoScanAnnotatesGroupFilter`: Selection ノード配下のスキャングループを探索した際、`Group.filter` が正しく更新されることを検証。
-  - `CascadesTest.SelectionWithinPatternMatchesOnlyCoveredPredicates`: 参照関係が子ノードに閉じていない述語に対し、パターン照合が正しく不成立となることを検証。
-
+`cascades_test` の scan-filter 契約と親再訪、`phase0_contract_test` の
+schema/order/estimate 契約、`optimizer_test` の FULL JOIN 分解を確認します。

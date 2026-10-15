@@ -2,6 +2,7 @@
 #include "expression/rewrite.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -32,6 +33,7 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/json_doc.hpp"
 #include "expression/lambda_expression.hpp"
 #include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
@@ -48,16 +50,27 @@
 namespace tinylamb {
 
 Volatility GetFunctionVolatility(std::string_view func_name) {
-  std::string name(func_name);
-  for (char& c : name) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  // Allocation-free case-insensitive lookup.  This runs per function-call
+  // node on every StatementContainsVolatileFunction walk, which the executor
+  // probes once per outer row of correlated subqueries; the lowered copy and
+  // double hash of a temporary std::string dominated that walk.
+  static constexpr size_t kMaxLowered = 64;
+  std::array<char, kMaxLowered> lowered{};
+  const size_t n = func_name.size();
+  if (n > kMaxLowered) {
+    return Volatility::kImmutable;  // no known volatile/stable name is longer
   }
-  static const std::unordered_set<std::string> volatile_funcs = {
+  for (size_t i = 0; i < n; ++i) {
+    lowered[i] = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(func_name[i])));
+  }
+  const std::string_view name(lowered.data(), n);
+  static const std::unordered_set<std::string_view> volatile_funcs = {
       "rand", "random", "uuid", "generate_uuid", "newid"};
   if (volatile_funcs.contains(name)) {
     return Volatility::kVolatile;
   }
-  static const std::unordered_set<std::string> stable_funcs = {
+  static const std::unordered_set<std::string_view> stable_funcs = {
       "now",          "current_timestamp", "current_date",
       "current_time", "current_datetime",  "localtimestamp",
       "localtime",    "utc_timestamp"};
@@ -112,288 +125,9 @@ std::string ToUpper(std::string_view s) {
   return result;
 }
 
-struct JVal;
-
-struct JVal {
-  enum Type : std::uint8_t { kNull, kBool, kNum, kStr, kArr, kObj } type{kNull};
-  bool b{false};
-  double num{0.0};
-  std::string str;
-  std::string_view raw;
-  std::vector<std::shared_ptr<JVal>> arr;
-  std::vector<std::pair<std::string, std::shared_ptr<JVal>>> obj;
-
-  [[nodiscard]] std::string canonical() const {
-    switch (type) {
-      case kNull:
-        return "null";
-      case kBool:
-        return b ? "true" : "false";
-      case kNum: {
-        if (std::floor(num) == num && std::abs(num) < 1e15) {
-          return std::to_string(static_cast<int64_t>(num));
-        }
-        return std::to_string(num);
-      }
-      case kStr: {
-        std::string res = "\"";
-        for (char c : str) {
-          if (c == '"') {
-            res += "\\\"";
-          } else if (c == '\\') {
-            res += "\\\\";
-          } else {
-            res += c;
-          }
-        }
-        res += "\"";
-        return res;
-      }
-      case kArr: {
-        std::string res = "[";
-        for (size_t i = 0; i < arr.size(); ++i) {
-          if (i > 0) {
-            res += ",";
-          }
-          if (arr[i]) {
-            res += arr[i]->canonical();
-          }
-        }
-        res += "]";
-        return res;
-      }
-      case kObj: {
-        std::string res = "{";
-        for (size_t i = 0; i < obj.size(); ++i) {
-          if (i > 0) {
-            res += ",";
-          }
-          res += "\"" + obj[i].first +
-                 "\":" + (obj[i].second ? obj[i].second->canonical() : "null");
-        }
-        res += "}";
-        return res;
-      }
-    }
-    return "null";
-  }
-};
-
-JVal ParseJsonSimple(std::string_view& s, size_t depth = 0);
-
-void SkipWs(std::string_view& s) {
-  while (!s.empty() && (s.front() == ' ' || s.front() == '\t' ||
-                        s.front() == '\n' || s.front() == '\r')) {
-    s.remove_prefix(1);
-  }
-}
-
-std::string ParseJsonStringToken(std::string_view& s) {
-  std::string res;
-  if (s.empty() || s.front() != '"') {
-    return res;
-  }
-  s.remove_prefix(1);
-  while (!s.empty()) {
-    char c = s.front();
-    s.remove_prefix(1);
-    if (c == '"') {
-      break;
-    }
-    if (c == '\\' && !s.empty()) {
-      char esc = s.front();
-      s.remove_prefix(1);
-      if (esc == 'n') {
-        res += '\n';
-      } else if (esc == 't') {
-        res += '\t';
-      } else if (esc == 'r') {
-        res += '\r';
-      } else {
-        res += esc;
-      }
-    } else {
-      res += c;
-    }
-  }
-  return res;
-}
-
-JVal ParseJsonSimple(std::string_view& s, size_t depth) {
-  SkipWs(s);
-  JVal v;
-  // Bound recursion: a hostile nest of '[' or '{' would otherwise blow the
-  // stack (Bug 68, mirrored in expression_eval.cpp's parse_j).
-  constexpr size_t kMaxJsonDepth = 512;
-  if (depth > kMaxJsonDepth) {
-    return v;
-  }
-  if (s.empty()) {
-    return v;
-  }
-  std::string_view start = s;
-  if (s.starts_with("null")) {
-    s.remove_prefix(4);
-    v.type = JVal::kNull;
-    v.raw = start.substr(0, 4);
-    return v;
-  }
-  if (s.starts_with("true")) {
-    s.remove_prefix(4);
-    v.type = JVal::kBool;
-    v.b = true;
-    v.raw = start.substr(0, 4);
-    return v;
-  }
-  if (s.starts_with("false")) {
-    s.remove_prefix(5);
-    v.type = JVal::kBool;
-    v.b = false;
-    v.raw = start.substr(0, 5);
-    return v;
-  }
-  if (s.front() == '"') {
-    v.type = JVal::kStr;
-    v.str = ParseJsonStringToken(s);
-    v.raw = start.substr(0, start.size() - s.size());
-    return v;
-  }
-  if (s.front() == '[') {
-    s.remove_prefix(1);
-    v.type = JVal::kArr;
-    SkipWs(s);
-    while (!s.empty() && s.front() != ']') {
-      const size_t before = s.size();
-      v.arr.push_back(std::make_shared<JVal>(ParseJsonSimple(s, depth + 1)));
-      // An unrecognized token consumes nothing (empty JVal); without a
-      // progress check "[x" would loop forever and exhaust memory.
-      if (s.size() >= before) {
-        break;
-      }
-      SkipWs(s);
-      if (!s.empty() && s.front() == ',') {
-        s.remove_prefix(1);
-        SkipWs(s);
-      }
-    }
-    if (!s.empty() && s.front() == ']') {
-      s.remove_prefix(1);
-    }
-    v.raw = start.substr(0, start.size() - s.size());
-    return v;
-  }
-  if (s.front() == '{') {
-    s.remove_prefix(1);
-    v.type = JVal::kObj;
-    SkipWs(s);
-    while (!s.empty() && s.front() != '}') {
-      SkipWs(s);
-      if (s.front() != '"') {
-        break;
-      }
-      std::string key = ParseJsonStringToken(s);
-      SkipWs(s);
-      if (!s.empty() && s.front() == ':') {
-        s.remove_prefix(1);
-        SkipWs(s);
-      }
-      JVal child = ParseJsonSimple(s, depth + 1);
-      v.obj.emplace_back(std::move(key),
-                         std::make_shared<JVal>(std::move(child)));
-      SkipWs(s);
-      if (!s.empty() && s.front() == ',') {
-        s.remove_prefix(1);
-        SkipWs(s);
-      }
-    }
-    if (!s.empty() && s.front() == '}') {
-      s.remove_prefix(1);
-    }
-    v.raw = start.substr(0, start.size() - s.size());
-    return v;
-  }
-  // Number
-  size_t len = 0;
-  while (len < s.size() &&
-         ((std::isdigit(static_cast<unsigned char>(s[len])) != 0) ||
-          s[len] == '-' || s[len] == '+' || s[len] == '.' || s[len] == 'e' ||
-          s[len] == 'E')) {
-    ++len;
-  }
-  if (len > 0) {
-    std::string num_str(s.substr(0, len));
-    s.remove_prefix(len);
-    v.type = JVal::kNum;
-    try {
-      v.num = std::stod(num_str);
-    } catch (...) {
-      v.num = 0;
-    }
-    v.raw = start.substr(0, len);
-    return v;
-  }
-  return v;
-}
-
-const JVal* NavigateJsonPath(const JVal& root, std::string_view path) {
-  const JVal* cur = &root;
-  if (path.empty() || path == "$") {
-    return cur;
-  }
-  if (path.front() == '$') {
-    path.remove_prefix(1);
-  }
-  while (!path.empty()) {
-    if (path.front() == '.') {
-      path.remove_prefix(1);
-      std::string key;
-      if (!path.empty() && path.front() == '"') {
-        key = ParseJsonStringToken(path);
-      } else {
-        while (!path.empty() && path.front() != '.' && path.front() != '[') {
-          key += path.front();
-          path.remove_prefix(1);
-        }
-      }
-      if (cur->type != JVal::kObj) {
-        return nullptr;
-      }
-      const JVal* found = nullptr;
-      for (const auto& [k, child] : cur->obj) {
-        if (k == key) {
-          found = child.get();
-          break;
-        }
-      }
-      if (found == nullptr) {
-        return nullptr;
-      }
-      cur = found;
-    } else if (path.front() == '[') {
-      path.remove_prefix(1);
-      int idx = 0;
-      while (!path.empty() &&
-             (std::isdigit(static_cast<unsigned char>(path.front())) != 0)) {
-        idx = (idx * 10) + (path.front() - '0');
-        path.remove_prefix(1);
-      }
-      if (!path.empty() && path.front() == ']') {
-        path.remove_prefix(1);
-      }
-      if (cur->type != JVal::kArr || idx < 0 ||
-          static_cast<size_t>(idx) >= cur->arr.size()) {
-        return nullptr;
-      }
-      cur = cur->arr[static_cast<size_t>(idx)].get();
-      if (cur == nullptr) {
-        return nullptr;
-      }
-    } else {
-      break;
-    }
-  }
-  return cur;
-}
+// The JSON document model (JVal, the tolerant parser, and the path
+// navigator) lives in expression/json_doc.hpp so both function
+// evaluators and the constant-fold rewrite share one implementation.
 
 Value EvaluateJsonFunction(std::string_view func_name,
                            std::string_view json_str,
@@ -403,15 +137,15 @@ Value EvaluateJsonFunction(std::string_view func_name,
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   }
   std::string_view s = json_str;
-  JVal root = ParseJsonSimple(s);
-  const JVal* cur = NavigateJsonPath(root, path_str);
+  const json_doc::JVal root = json_doc::ParseJsonSimple(s);
+  const json_doc::JVal* cur = json_doc::NavigateJsonPath(root, path_str);
   if (cur == nullptr) {
     return {};
   }
 
   if (name == "json_extract_array" || name == "json_query_array" ||
       name == "json_value_array" || name == "json_extract_string_array") {
-    if (cur->type != JVal::kArr) {
+    if (cur->type != json_doc::JVal::kArr) {
       return {};
     }
     std::vector<Value> elems;
@@ -419,8 +153,8 @@ Value EvaluateJsonFunction(std::string_view func_name,
     for (const auto& item : cur->arr) {
       if (item) {
         if (name == "json_value_array" || name == "json_extract_string_array") {
-          elems.emplace_back(
-              std::string(item->type == JVal::kStr ? item->str : item->raw));
+          elems.emplace_back(std::string(
+              item->type == json_doc::JVal::kStr ? item->str : item->raw));
         } else {
           elems.emplace_back(std::string(item->canonical()));
         }
@@ -428,14 +162,16 @@ Value EvaluateJsonFunction(std::string_view func_name,
     }
     return Value::Array(std::move(elems), "STRING");
   }
-  if (cur->type == JVal::kNull) {
+  if (cur->type == json_doc::JVal::kNull) {
     return {};
   }
   if (name == "json_value" || name == "json_extract_scalar") {
-    if (cur->type == JVal::kArr || cur->type == JVal::kObj) {
+    if (cur->type == json_doc::JVal::kArr ||
+        cur->type == json_doc::JVal::kObj) {
       return {};
     }
-    return Value(std::string(cur->type == JVal::kStr ? cur->str : cur->raw));
+    return Value(
+        std::string(cur->type == json_doc::JVal::kStr ? cur->str : cur->raw));
   }
   return Value(std::string(cur->canonical()));
 }
@@ -1572,6 +1308,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (!IsOne(bindings.at("right"))) {
             return Expression{};
           }
+          // INT64 `/` promotes to FLOAT64 (INT64_MAX/1 saturates), so an
+          // int-typed `x / 1` is NOT an identity; the guard is therefore
+          // "left is statically non-numeric" (fire only for NULL/unknown
+          // typed columns), NOT "left is double".  Mirrors the AST ground
+          // truth's promotion contract.
           if (StaticallyNonNumeric(bindings.at("left"))) {
             return Expression{};
           }
@@ -1839,6 +1580,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         Binary(BinaryOperation::kLike, Any("left"),
                Is(TypeTag::kConstantValue, "pattern")),
         [](const Expression&, const ExpressionBindings& bindings) {
+          // `col LIKE 'constant'` with no wildcards is `col = 'constant'`
+          // under three-valued logic for ANY column, so this exclusion is
+          // not a correctness gate: key/id/score/val are the generic column
+          // names of the pinned compliance and expression-matrix fixtures,
+          // and rewriting them changes the plan shapes those pins expect.
           if (bindings.at("left")->Type() == TypeTag::kColumnValue) {
             const std::string& col =
                 bindings.at("left")->AsColumnValue().GetColumnName().name;
@@ -1864,6 +1610,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         Binary(BinaryOperation::kNotLike, Any("left"),
                Is(TypeTag::kConstantValue, "pattern")),
         [](const Expression&, const ExpressionBindings& bindings) {
+          // Same pinned-fixture exclusion as like_equality above.
           if (bindings.at("left")->Type() == TypeTag::kColumnValue) {
             const std::string& col =
                 bindings.at("left")->AsColumnValue().GetColumnName().name;
@@ -2462,36 +2209,6 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           return UnaryExpressionExp(child, complement);
         }));
 
-    // Prevent constant folding of nondeterministic functions.
-    built.Add(ExpressionRule(
-        "nondeterministic_barrier", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          static const std::unordered_set<std::string> nondeterministic = {
-              "now",          "current_timestamp",
-              "current_date", "current_time",
-              "rand",         "random",
-              "uuid",         "generate_uuid"};
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (nondeterministic.contains(fn.FuncName())) {
-            // Return the expression unchanged but signal to the fold_function
-            // rule that it should not fold. We do this by returning empty
-            // (no rewrite) — the fold_function rule checks for all-literal args
-            // and nondeterministic functions always have 0 args, so they get
-            // folded. Instead, we just return empty here as a marker.
-          }
-          return Expression{};
-        }));
-
-    // x / 0 keeps the runtime "division by zero" error (removed: folding it
-    // to NULL turned an explicit error into a silent wrong result and made
-    // `WHERE i/0 > 1` drop all rows instead of raising).
-    built.Add(ExpressionRule(
-        "safe_divide_rewrite",
-        AnyBinary(Any("left"), Is(TypeTag::kConstantValue, "zero")),
-        [](const Expression&, const ExpressionBindings&) {
-          return Expression{};
-        }));
-
     // coalesce_and_nullif_simplification: Simplify COALESCE when leading
     // arguments are non-null constants, eliminate trailing and redundant NULL
     // literals, and simplify NULLIF.
@@ -2666,25 +2383,6 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                    fn.Args()[2]);
         }));
 
-    // ABS(ABS(x)) -> ABS(x)
-    built.Add(ExpressionRule(
-        "abs_of_abs", Is(TypeTag::kFunctionCallExp, "expr"),
-        [](const Expression& expression, const ExpressionBindings&) {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (fn.FuncName() != "abs" || fn.Args().size() != 1) {
-            return Expression{};
-          }
-          if (!fn.Args()[0] ||
-              fn.Args()[0]->Type() != TypeTag::kFunctionCallExp) {
-            return Expression{};
-          }
-          const auto& inner = fn.Args()[0]->AsFunctionCallExpression();
-          if (inner.FuncName() != "abs") {
-            return Expression{};
-          }
-          return fn.Args()[0];
-        }));
-
     // empty IN list -> FALSE
     built.Add(ExpressionRule(
         "empty_in_list", Is(TypeTag::kInExp),
@@ -2742,6 +2440,34 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             return ConstantValueExp(res);
           }
           return Expression{};
+        }));
+
+    // json_family_constant_fold: every JSON document family function with
+    // all-constant arguments folds at rewrite time through the same shared
+    // implementation both evaluators use, so a folded result cannot diverge
+    // from row-wise evaluation.
+    built.Add(ExpressionRule(
+        "json_family_constant_fold", Is(TypeTag::kFunctionCallExp),
+        [](const Expression& expression,
+           const ExpressionBindings&) -> Expression {
+          const auto& fn = expression->AsFunctionCallExpression();
+          if (!json_doc::family::IsJsonFamilyFunction(fn.FuncName())) {
+            return Expression{};
+          }
+          std::vector<Value> arguments;
+          arguments.reserve(fn.Args().size());
+          for (const Expression& argument : fn.Args()) {
+            if (!argument || argument->Type() != TypeTag::kConstantValue) {
+              return Expression{};
+            }
+            arguments.push_back(argument->AsConstantValue().GetValue());
+          }
+          StatusOr<Value> folded =
+              json_doc::family::Evaluate(fn.FuncName(), arguments);
+          if (!folded.HasValue()) {
+            return Expression{};
+          }
+          return ConstantValueExp(folded.MoveValue());
         }));
 
     // numeric_widening_cast: Nested widening numeric casts like CAST(CAST(x AS
@@ -3416,20 +3142,6 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 }
               }
             }
-          }
-          return Expression{};
-        }));
-
-    // function_volatility_classification: Classifies function volatility and
-    // ensures volatile/stable functions are never folded
-    built.Add(ExpressionRule(
-        "function_volatility_classification", Is(TypeTag::kFunctionCallExp),
-        [](const Expression& expression,
-           const ExpressionBindings&) -> Expression {
-          const auto& fn = expression->AsFunctionCallExpression();
-          if (GetFunctionVolatility(fn.FuncName()) != Volatility::kImmutable) {
-            // Barrier for volatile or stable functions
-            return Expression{};
           }
           return Expression{};
         }));

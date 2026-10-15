@@ -7,9 +7,6 @@
 //   - MaterializeExecutor: the full cache/replay lifecycle (Next, NextBatch,
 //     Rewind, MaterializePipeline, accounting, Dump/Explain) over empty and
 //     non-empty children.
-//   - TwoPhaseDistinctAgg: date/array value types in distinct sets and output
-//     schemas, non-int64/double finalize branches, NextBatch, and the
-//     evaluation-failure paths for group keys and aggregate children.
 
 #include <gtest/gtest.h>
 
@@ -27,7 +24,6 @@
 #include "executor/data_chunk.hpp"
 #include "executor/materialize.hpp"
 #include "executor/topn.hpp"
-#include "executor/two_phase_distinct_agg.hpp"
 #include "executor/values.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
@@ -321,131 +317,6 @@ TEST(MaterializeExecutorTest, DumpAndExplainRenderRowStats) {
   std::ostringstream explained;
   materialize.Explain(explained, 0);
   EXPECT_NE(explained.str().find("materialized=false"), std::string::npos);
-}
-
-// ---------------------------------------------------------------------------
-// TwoPhaseDistinctAgg
-// ---------------------------------------------------------------------------
-
-TEST(TwoPhaseDistinctAggCoverageTest, DateAndArrayDistinctSets) {
-  const Schema schema(
-      "d", {Column("dt", ValueType::kDate), Column("arr", ValueType::kArray)});
-  const Value d1 = Value::Date("2026-01-01");
-  const Value d2 = Value::Date("2026-02-01");
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({d1, Value::Array({Value(int64_t{1})}, "INT64")}),
-      Row({d1, Value::Array({Value(int64_t{1})}, "INT64")}),
-      Row({d2, Value::Array({Value(int64_t{2})}, "INT64")}),
-      Row({Value(), Value::Array({Value(int64_t{3})}, "INT64")}),
-  });
-
-  auto dcnt_date = std::make_shared<AggregateExpression>(
-      AggregationType::kCount, ColumnValueExp("dt"), true);
-  auto dcnt_arr = std::make_shared<AggregateExpression>(
-      AggregationType::kCount, ColumnValueExp("arr"), true);
-  auto dmin_date = std::make_shared<AggregateExpression>(
-      AggregationType::kMin, ColumnValueExp("dt"), true);
-  auto dmax_date = std::make_shared<AggregateExpression>(
-      AggregationType::kMax, ColumnValueExp("dt"), true);
-  auto davg_date = std::make_shared<AggregateExpression>(
-      AggregationType::kAvg, ColumnValueExp("dt"), true);
-
-  TwoPhaseDistinctAggExecutor agg(
-      src, schema,
-      {NamedExpression("dc_dt", dcnt_date), NamedExpression("dc_arr", dcnt_arr),
-       NamedExpression("min_dt", dmin_date),
-       NamedExpression("max_dt", dmax_date),
-       NamedExpression("avg_dt", davg_date)});
-
-  // The output schema maps DATE keys to kDate and falls back for arrays.
-  Row row;
-  ASSERT_TRUE(agg.Next(&row, nullptr));
-  EXPECT_EQ(row[0], Value(int64_t{2}));  // two distinct dates
-  EXPECT_EQ(row[1], Value(int64_t{3}));  // three distinct arrays
-  EXPECT_EQ(row[2], d1);
-  EXPECT_EQ(row[3], d2);
-  EXPECT_EQ(row[4], Value(0.0));  // AVG over dates has no numeric element
-
-  DataChunk chunk;
-  ASSERT_TRUE(agg.NextBatch(&chunk, 4) == 0);
-}
-
-TEST(TwoPhaseDistinctAggCoverageTest, DateGroupKeyTypesTheOutputColumn) {
-  const Schema schema(
-      "d", {Column("dt", ValueType::kDate), Column("v", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value::Date("2026-03-01"), Value(int64_t{5})}),
-      Row({Value::Date("2026-03-01"), Value(int64_t{7})}),
-  });
-  auto dsum = std::make_shared<AggregateExpression>(AggregationType::kSum,
-                                                    ColumnValueExp("v"), true);
-  TwoPhaseDistinctAggExecutor agg(src, schema,
-                                  {NamedExpression("dt", ColumnValueExp("dt"))},
-                                  {NamedExpression("s", dsum)});
-  EXPECT_EQ(agg.OutputSchema().GetColumn(0).Type(), ValueType::kDate);
-
-  Row row;
-  ASSERT_TRUE(agg.Next(&row, nullptr));
-  EXPECT_EQ(row[0], Value::Date("2026-03-01"));
-  EXPECT_EQ(row[1], Value(12.0));
-  EXPECT_FALSE(agg.Next(&row, nullptr));
-}
-
-TEST(TwoPhaseDistinctAggCoverageTest, NextBatchEmitsGroupedRowsInChunks) {
-  const Schema schema(
-      "d", {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{1}), Value(int64_t{1})}),
-      Row({Value(int64_t{1}), Value(int64_t{2})}),
-      Row({Value(int64_t{2}), Value(int64_t{4})}),
-  });
-  auto dcnt = std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                    ColumnValueExp("v"), true);
-  TwoPhaseDistinctAggExecutor agg(src, schema,
-                                  {NamedExpression("k", ColumnValueExp("k"))},
-                                  {NamedExpression("c", dcnt)});
-
-  DataChunk chunk;
-  ASSERT_EQ(agg.NextBatch(&chunk, /*max_rows=*/1), 1U);
-  EXPECT_EQ(chunk.Size(), 1U);
-  const size_t remaining = agg.NextBatch(&chunk, /*max_rows=*/8);
-  ASSERT_EQ(remaining, 1U);
-  EXPECT_EQ(agg.NextBatch(&chunk, /*max_rows=*/8), 0U);
-  EXPECT_EQ(agg.NextBatch(&chunk, /*max_rows=*/0), 0U);
-}
-
-TEST(TwoPhaseDistinctAggCoverageTest, EvaluationFailuresPropagates) {
-  const Schema schema("d", {Column("v", ValueType::kInt64)});
-  auto make_src = []() {
-    return std::make_shared<ValuesExecutor>(
-        std::vector<Row>{Row({Value(int64_t{1})})});
-  };
-
-  // Group key referencing a missing column fails during phase 1.
-  auto dcnt = std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                    ColumnValueExp("v"), true);
-  TwoPhaseDistinctAggExecutor bad_key(
-      make_src(), schema, {NamedExpression("k", ColumnValueExp("missing"))},
-      {NamedExpression("c", dcnt)});
-  Row row;
-  EXPECT_FALSE(bad_key.Next(&row, nullptr));
-  EXPECT_NE(bad_key.GetStatus(), Status::kSuccess);
-
-  // A distinct aggregate over a missing column fails while collecting.
-  auto bad_distinct = std::make_shared<AggregateExpression>(
-      AggregationType::kSum, ColumnValueExp("missing"), true);
-  TwoPhaseDistinctAggExecutor bad_agg(make_src(), schema,
-                                      {NamedExpression("s", bad_distinct)});
-  EXPECT_FALSE(bad_agg.Next(&row, nullptr));
-  EXPECT_NE(bad_agg.GetStatus(), Status::kSuccess);
-
-  // A plain aggregate over a missing column fails in the non-distinct path.
-  auto bad_plain = std::make_shared<AggregateExpression>(
-      AggregationType::kSum, ColumnValueExp("missing"));
-  TwoPhaseDistinctAggExecutor bad_plain_agg(make_src(), schema,
-                                            {NamedExpression("s", bad_plain)});
-  EXPECT_FALSE(bad_plain_agg.Next(&row, nullptr));
-  EXPECT_NE(bad_plain_agg.GetStatus(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

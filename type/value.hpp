@@ -17,7 +17,9 @@
 #ifndef TINYLAMB_VALUE_HPP
 #define TINYLAMB_VALUE_HPP
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -82,11 +84,53 @@ enum class AggregationType : uint8_t {
   kKllMergePartial,
   kPercentileCont,
   kApproxCountDistinct,
+  // MODE: most frequent non-NULL value (hash-count accumulation).
+  kMode,
+  // Linear regression aggregates over paired (y, x) inputs; all share the
+  // COVAR/CORR long-double partial sums, y as the child and x as the
+  // trailing argument.
+  kRegrSlope,
+  kRegrIntercept,
+  kRegrCount,
+  kRegrR2,
+  kRegrAvgX,
+  kRegrAvgY,
+  kRegrSxx,
+  kRegrSyy,
+  kRegrSxy,
 };
 
 bool IsStatisticalAggregate(AggregationType type);
 bool IsSketchAggregate(AggregationType type);
 bool IsExtendedAggregate(AggregationType type);
+// Two-input statistical aggregates (COVAR_*/CORR/REGR_*): the child is y,
+// the single trailing argument is x, and rows where either side is NULL are
+// skipped.
+bool IsTwoInputStatAggregate(AggregationType type);
+
+// SWAR space-presence scan for the string comparison fast paths below: they
+// run once per candidate-unequal string pair, where a memchr call per side
+// shows up in profiles; a 4-byte-at-a-time branchless byte-equality test
+// stays inline and short.
+inline bool ViewContainsSpace(std::string_view s) noexcept {
+  const char* p = s.data();
+  const size_t n = s.size();
+  size_t i = 0;
+  for (; i + 4 <= n; i += 4) {
+    uint32_t chunk = 0;
+    std::memcpy(&chunk, p + i, 4);
+    const uint32_t marked = chunk ^ 0x20202020U;
+    if (((marked - 0x01010101U) & ~marked & 0x80808080U) != 0U) {
+      return true;
+    }
+  }
+  for (; i < n; ++i) {
+    if (p[i] == ' ') {
+      return true;
+    }
+  }
+  return false;
+}
 
 std::string ToString(AggregationType type);
 inline std::ostream& operator<<(std::ostream& o, const AggregationType& at) {
@@ -119,8 +163,33 @@ class Value {
   [[nodiscard]] bool IsArray() const { return type == ValueType::kArray; }
   [[nodiscard]] const std::vector<Value>& ArrayElements() const;
   [[nodiscard]] const std::string& ArrayElementSqlType() const;
-  Value(const Value& o);
-  Value(Value&& o) noexcept;
+  // The copy/move quartet below keeps scalars (kNull/kInt64/kDouble/kDate) on
+  // a straight-line fast path: scalar payloads carry no heap state, so only
+  // value/type/collation move.  The heap paths (VarChar/Array) live in
+  // noinline cold functions in value.cpp -- hot scan/fold callers exhaust
+  // their inliner budget long before reaching these, and an out-of-line
+  // scalar assign showed up as a top profile entry on multi-million-row
+  // aggregate folds.  A scalar overwrite leaves any stale owned_data/array_
+  // payload in place: it stays unreachable behind the type tag (bounded to
+  // one old payload per slot) and the implicit destructor releases it.
+#define TINYLAMB_VALUE_SCALAR(t) \
+  ((t) != ValueType::kVarChar && (t) != ValueType::kArray)
+  [[gnu::always_inline]] Value(const Value& o) : value(o.value), type(o.type) {
+    if (TINYLAMB_VALUE_SCALAR(type)) [[likely]] {
+      collation_ = o.collation_;
+      return;
+    }
+    InitCopySlow(o);
+  }
+  [[gnu::always_inline]] Value(Value&& o) noexcept
+      : value(o.value), type(o.type) {
+    if (TINYLAMB_VALUE_SCALAR(type)) [[likely]] {
+      collation_ = o.collation_;
+      o.type = ValueType::kNull;
+      return;
+    }
+    InitMoveSlow(o);
+  }
 
   template <typename I>
   explicit Value(I val)
@@ -128,10 +197,49 @@ class Value {
       : type(ValueType::kInt64) {
     value.int_value = static_cast<int64_t>(val);
   }
-  Value& operator=(const Value& rhs);
-  Value& operator=(Value&& o) noexcept;
-  ~Value() = default;
+  [[gnu::always_inline]] Value& operator=(const Value& rhs) {
+    if (this == &rhs) [[unlikely]] {
+      return *this;
+    }
+    const ValueType copied = rhs.type;
+    if (TINYLAMB_VALUE_SCALAR(copied)) [[likely]] {
+      type = copied;
+      value = rhs.value;
+      collation_ = rhs.collation_;
+      return *this;
+    }
+    return CopyAssignSlow(rhs);
+  }
+  [[gnu::always_inline]] Value& operator=(Value&& o) noexcept {
+    if (this == &o) [[unlikely]] {
+      return *this;
+    }
+    const ValueType moved = o.type;
+    if (TINYLAMB_VALUE_SCALAR(moved)) [[likely]] {
+      type = moved;
+      value = o.value;
+      collation_ = o.collation_;
+      o.type = ValueType::kNull;
+      return *this;
+    }
+    return MoveAssignSlow(o);
+  }
+#undef TINYLAMB_VALUE_SCALAR
+  // ~Value stays the implicit member-wise destroy: scalar assigns above may
+  // leave a stale owned_data/array_ payload behind (unreachable behind the
+  // type tag, bounded to one old payload per slot), and the implicit dtor is
+  // what releases it.
 
+ private:
+  // Cold halves of the quartet (defined out-of-line in value.cpp): keeping
+  // the heap branches out of the always_inline header bodies is what makes
+  // every hot call site a straight-line scalar move.
+  void InitCopySlow(const Value& o);
+  void InitMoveSlow(Value& o) noexcept;
+  Value& CopyAssignSlow(const Value& rhs);
+  Value& MoveAssignSlow(Value& o) noexcept;
+
+ public:
   [[nodiscard]] bool Truthy() const;
 
   [[nodiscard]] size_t Size() const;
@@ -145,6 +253,12 @@ class Value {
   size_t Serialize(char* dst) const;
   [[nodiscard]] StatusOr<size_t> TryDeserialize(const char* src,
                                                 ValueType as_type);
+  // Hot path (row decode): fill this Value directly from `src` without the
+  // StatusOr/optional machinery on the success path.  Returns bytes consumed,
+  // or 0 with *out_status set on error (this Value is then partially filled;
+  // callers discard the row).  Identical stream semantics to TryDeserialize.
+  size_t DeserializeInto(const char* src, ValueType as_type,
+                         Status* out_status);
   // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
   size_t Deserialize(const char* src, ValueType as_type) {
     return ExcShimUnwrap(TryDeserialize(src, as_type), "Value::Deserialize");
@@ -152,6 +266,10 @@ class Value {
   // Advance past a serialized value without constructing it (projection skip).
   [[nodiscard]] static StatusOr<size_t> TrySkipSerialized(const char* src,
                                                           ValueType as_type);
+  // Hot path (row decode): TrySkipSerialized without StatusOr machinery.
+  // Returns bytes consumed, or 0 with *out_status set on error.
+  static size_t SkipSerializedInto(const char* src, ValueType as_type,
+                                   Status* out_status);
   // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
   [[nodiscard]] static size_t SkipSerialized(const char* src,
                                              ValueType as_type) {
@@ -175,14 +293,95 @@ class Value {
                          "Value::DecodeMemcomparableFormat");
   }
 
-  bool operator==(const Value& rhs) const;
+  // Hot path: the homogeneous scalar cases (the ones scan filters, join keys
+  // and group keys hammer) resolve inline; Null/VarChar/Array tail into
+  // EqualsSlow.
+  bool operator==(const Value& rhs) const {
+    if (type != rhs.type) [[unlikely]] {
+      return false;
+    }
+    switch (type) {
+      case ValueType::kInt64:
+        if (IsUnsigned() != rhs.IsUnsigned()) [[unlikely]] {
+          break;
+        }
+        return value.int_value == rhs.value.int_value;
+      case ValueType::kDate:
+        return value.int_value == rhs.value.int_value;
+      case ValueType::kDouble: {
+        const double l = value.double_value;
+        const double r = rhs.value.double_value;
+        if (l == r) {
+          return true;
+        }
+        // Exact equality canonicalized like std::hash<Value>: every NaN
+        // compares equal to every other NaN; -0.0 equals +0.0 via ==.
+        return std::isnan(l) && std::isnan(r);
+      }
+      case ValueType::kVarChar: {
+        // Byte-equal text is equal; byte-unequal text can still be
+        // interval-equivalent, but only when both sides carry
+        // interval-shaped text and every interval rendering embeds a
+        // space -- so a space-free side settles the comparison without
+        // the EqualsSlow call.
+        const std::string_view l = value.varchar_value;
+        const std::string_view r = rhs.value.varchar_value;
+        if (l == r) [[likely]] {
+          return true;
+        }
+        if (!ViewContainsSpace(l) || !ViewContainsSpace(r)) [[likely]] {
+          return false;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    return EqualsSlow(rhs);
+  }
+  [[nodiscard]] bool EqualsSlow(const Value& rhs) const;
   bool operator!=(const Value& rhs) const { return !operator==(rhs); }
   [[nodiscard]] StatusOr<bool> TryLess(const Value& rhs) const;
   [[nodiscard]] StatusOr<bool> TryGreater(const Value& rhs) const;
-  // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
+  // Hot path: homogeneous scalar ordering (statistics tracking, sort keys)
+  // resolves inline; mismatched types, NULLs, unsigned tags, collation,
+  // interval-shaped strings and arrays tail into LessSlow.
   bool operator<(const Value& rhs) const {
-    return ExcShimUnwrap(TryLess(rhs), "Value::operator<");
+    if (type == rhs.type) [[likely]] {
+      switch (type) {
+        case ValueType::kInt64:
+          if (IsUnsigned() || rhs.IsUnsigned()) [[unlikely]] {
+            break;
+          }
+          return value.int_value < rhs.value.int_value;
+        case ValueType::kDate:
+          return value.int_value < rhs.value.int_value;
+        case ValueType::kDouble:
+          return value.double_value < rhs.value.double_value;
+        case ValueType::kVarChar: {
+          // Byte order first; interval equivalence can only reorder
+          // interval-shaped texts and every interval rendering embeds a
+          // space, so a space-free side makes the byte order final
+          // without the LessSlow (StatusOr machinery) call.
+          const std::string_view l = value.varchar_value;
+          const std::string_view r = rhs.value.varchar_value;
+          const int cmp = l.compare(r);
+          if (cmp == 0) {
+            return false;
+          }
+          if (!ViewContainsSpace(l) || !ViewContainsSpace(r)) [[likely]] {
+            return cmp < 0;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    return LessSlow(rhs);
   }
+  [[nodiscard]] bool LessSlow(const Value& rhs) const;
+  // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
   bool operator>(const Value& rhs) const {
     return ExcShimUnwrap(TryGreater(rhs), "Value::operator>");
   }
@@ -263,6 +462,8 @@ class Value {
   // SQL signedness in the otherwise-unused collation tag.  This lets joins
   // and comparisons distinguish UINT64(2^64-1) from INT64(-1).
   [[nodiscard]] bool IsUnsigned() const { return collation_ == 3; }
+  // Hot path: tag in place (WithUnsigned copies the whole value).
+  void SetUnsigned() { collation_ = 3; }
   [[nodiscard]] Value WithUnsigned() const {
     Value copy = *this;
     copy.collation_ = 3;

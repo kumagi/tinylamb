@@ -12,6 +12,7 @@
 
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
 #include "query/statement.hpp"
 #include "type/schema.hpp"
@@ -33,6 +34,15 @@ struct EqualityKey {
   size_t left{};
   size_t right{};
   bool null_safe{false};
+  // Bias for `left.col = right.col +/- constant` join keys (week-over-week
+  // and year-over-year self joins): the LEFT value enters the key as
+  // (value + left_offset) and the RIGHT value as (value + right_offset), so
+  // both sides hash equal exactly when the SQL equality holds.  Zero for
+  // plain column=column keys.  Offset keys stay in the residual list too, so
+  // matched pairs are re-verified with the original predicate -- the bias
+  // only ever narrows the probe, never widens the result.
+  int64_t left_offset{0};
+  int64_t right_offset{0};
 };
 
 std::vector<PredicateInfo> AnalyzePredicates(
@@ -73,7 +83,8 @@ bool SingleIntegerJoinKey(const Schema& schema,
 
 int64_t IntegerJoinKey(const Row& row, slot_t column);
 
-std::string EncodeJoinKey(const Row& row, const std::vector<slot_t>& columns);
+std::string EncodeJoinKey(const Row& row, const std::vector<slot_t>& columns,
+                          const std::vector<int64_t>* offsets = nullptr);
 
 size_t EstimateJoinRows(const Relation& left, const Relation& right,
                         const std::vector<Expression>& predicates);
@@ -101,10 +112,37 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
 bool IsSubset(const std::unordered_set<size_t>& values,
               const std::unordered_set<size_t>& superset);
 
+// Statement-level description of a grouped aggregation that may be fused
+// into the statement's final join step: instead of materializing the joined
+// relation and grouping it afterwards, the probe loop feeds group keys and
+// aggregate inputs directly into accumulators and the join output never
+// exists.  Built by the statement layer (which owns alias/window/aggregation
+// classification); eligibility that needs the joined schema (bytecode
+// compilability) is re-checked at the join step.
+struct GroupedJoinFusionSpec {
+  // GROUP BY expressions, evaluated against the joined schema.
+  std::vector<Expression> group_keys;
+  // Aggregate call sites collected from the select list (order matters: it
+  // mirrors the AggregateAccumulator layout the emit finishes).
+  std::vector<const AggregateExpression*> aggregates;
+  // Per-aggregate flags parallel to `aggregates`.
+  std::vector<bool> count_star;
+  // Select-list expressions evaluated per group against the representative
+  // row plus the finished aggregate results.
+  std::vector<Expression> select_items;
+  std::vector<std::string> select_names;
+  // Statement-level eligibility decided by the caller (no HAVING/DISTINCT/
+  // windows, mergeable aggregate kinds, no alias-resolution dependencies).
+  bool eligible{false};
+  // Set by BuildInput when the final join step actually fused.
+  bool fired{false};
+};
+
 StatusOr<Relation> BuildInput(TransactionContext& context,
                               const SelectStatement& statement,
                               const Scope* outer, const CteMap& ctes,
-                              bool* where_fully_applied);
+                              bool* where_fully_applied,
+                              GroupedJoinFusionSpec* fusion = nullptr);
 
 size_t SpillPartitionOf(const std::string& key, size_t partitions);
 

@@ -86,7 +86,7 @@ graph TD
 ## 関連 Rule との相互作用
 
 - `intersect_to_semijoin`: 集合積（INTERSECT）をセミ結合（Semi-Join）へ変換する対称 Rule です。
-- `intersect_except_cost_based_lowering`: コストベースで集合演算の物理展開を指示する Rule です。
+- `intersect_to_semijoin / except_to_antijoin`: コストベースで集合演算の物理展開を指示する Rule です。
 - `outer_to_anti_join`: 外部結合と IS NULL 述語の組み合わせからアンチ結合を導出する Rule です。
 
 ## 検証テスト

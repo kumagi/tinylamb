@@ -151,11 +151,8 @@ ON 条件と join_type は元の式からそのまま写されるため、NULL �
   無効化されています(反例テスト `PushDownLimitThroughJoinSkipsNonUniqueJoin`,
   `TopNPushThroughInnerJoinOnForeignKey`)。本 Rule は LEFT JOIN 限定で
   同じ問題を回避します。
-- `merge_limits` / `push_limit_through_union_all`: 押し込んだ先での Limit
+- `merge_limits` / `union_all_push_limit`: 押し込んだ先での Limit
   の合成・枝への再押し込み。
-- `foreign_key_outer_join_elimination`: 同じ「右キー一意性 + 外部結合」の
-  文脈で外部結合そのものを除去する Rule(こちらは LEFT 側の NOT NULL も
-  要求します)。
 
 ## 検証テスト
 

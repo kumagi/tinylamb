@@ -130,6 +130,9 @@ DEFAULT_ALLOWLIST = (
     # 内の SelectStatement を解析する。sql 局のステートメント IR を読むだけ
     # で、実行は relational/subquery_runtime 側に留まる。
     "plan/optimizer.cpp -> query/statement.hpp",
+    # GroupByFinish の EXPLAIN が保持しているステートメントの GROUP BY キー数
+    # を報告するだけ (statement IR の読み取りのみ)。
+    "plan/group_by_plan.cpp -> query/statement.hpp",
 )
 
 

@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -231,6 +232,63 @@ TEST_F(RelationalRegressionTest,
   context.Abort();
 }
 
+// Computed GROUP BY keys and aggregate arguments join the parallel fold
+// through bytecode programs (workers cannot run the contextful evaluator;
+// a program that fails to compile keeps the serial loop).  The row count
+// keeps the fold above kParallelGroupMinRows; a machine below the worker
+// floor declines the parallel path and the serial loop must produce the
+// same groups.
+TEST_F(RelationalRegressionTest,
+       ParallelGroupedFinishEvaluatesExpressionKeysAndArgs) {
+  constexpr size_t kRowCount = 262144;
+  TransactionContext context = rs_->BeginContext();
+  relational_detail::Relation input;
+  input.schema = Schema("parallel_expr_keys", {Column("g", ValueType::kInt64),
+                                               Column("v", ValueType::kInt64)});
+  input.rows.reserve(kRowCount);
+  for (size_t i = 0; i < kRowCount; ++i) {
+    input.AddRow(Row(
+        {Value(static_cast<int64_t>(i)), Value(static_cast<int64_t>(i % 8))}));
+  }
+  const Expression key =
+      BinaryExpressionExp(ColumnValueExp("g"), BinaryOperation::kModulo,
+                          ConstantValueExp(Value(int64_t{4})));
+  auto count = std::make_shared<AggregateExpression>(AggregationType::kCount,
+                                                     ColumnValueExp("*"));
+  auto sum = std::make_shared<AggregateExpression>(
+      AggregationType::kSum,
+      BinaryExpressionExp(ColumnValueExp("v"), BinaryOperation::kMultiply,
+                          ConstantValueExp(Value(int64_t{2}))),
+      false);
+  SelectStatement statement(
+      {NamedExpression("k", key), NamedExpression("c", count),
+       NamedExpression("s", sum)},
+      {}, nullptr);
+  statement.SetGroupBy({key});
+
+  StatusOr<relational_detail::Relation> finished =
+      relational_detail::FinishQuery(context, statement, std::move(input),
+                                     nullptr, {}, false);
+  ASSERT_TRUE(finished.HasValue()) << finished.GetStatus();
+  relational_detail::Relation output = finished.MoveValue();
+  ASSERT_EQ(output.rows.size(), 4U);
+  std::map<int64_t, std::pair<int64_t, int64_t>> by_key;
+  for (const Row& row : output.rows) {
+    by_key.emplace(
+        row[0].value.int_value,
+        std::make_pair(row[1].value.int_value, row[2].value.int_value));
+  }
+  // Group q holds the 65536 rows with i ≡ q (mod 4); their v = i % 8 splits
+  // evenly between q and q + 4, so SUM(v * 2) = 65536 * (2q + 4).
+  for (const int64_t q : {int64_t{0}, int64_t{1}, int64_t{2}, int64_t{3}}) {
+    const auto iter = by_key.find(q);
+    ASSERT_TRUE(iter != by_key.end()) << "missing group " << q;
+    EXPECT_EQ(iter->second.first, 65536) << "group " << q;
+    EXPECT_EQ(iter->second.second, 65536 * (2 * q + 4)) << "group " << q;
+  }
+  context.Abort();
+}
+
 // A single statement that first narrows AggTable through an uncorrelated IN
 // list pushdown (BuildInput stores table_key_filters["AggTable"]) and then
 // aggregates the same table in an uncorrelated scalar subquery. The subquery's
@@ -285,6 +343,28 @@ TEST_F(RelationalRegressionTest,
     // k < 3 subset: no remaining row could satisfy k >= 8.
     EXPECT_EQ(row[1], Value(40));
   }
+}
+
+// MIN/MAX accumulators never incremented `count`, so the parallel merge's
+// empty-partial skip (`count == 0`) dropped every worker's MIN/MAX partial.
+// A second uncorrelated scalar subquery re-aggregates the shared
+// base-relation cache over row-sliced workers; before the fix it returned
+// the first worker slice's row value instead of the true aggregate.
+TEST_F(RelationalRegressionTest,
+       Execute_SharedBaseRelationCache_MinMaxMergesAcrossWorkers) {
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT (SELECT MAX(k) FROM SmallKeys) AS a, "
+                    "       (SELECT MAX(k) FROM SmallKeys) + 1 AS b, "
+                    "       (SELECT MIN(k) FROM SmallKeys) AS c, "
+                    "       (SELECT MIN(-k) FROM SmallKeys) - 10 AS d;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(4));
+  EXPECT_EQ(rows[0][1], Value(5));
+  EXPECT_EQ(rows[0][2], Value(1));
+  // MIN(-k) over {1,2,3,4} is -4; before the fix the cache-hit merge kept
+  // only the first worker slice (k = 1), producing -1 - 10 = -11.
+  EXPECT_EQ(rows[0][3], Value(-14));
 }
 
 TEST_F(RelationalRegressionTest, WherePredicateError_PropagatesFailure) {
@@ -499,6 +579,92 @@ TEST_F(RelationalRegressionTest, DerivedSingleColumnBareEqualityUsesHashJoin) {
   EXPECT_EQ(rows[0][0], Value(int64_t{200}));
 }
 
+// Grouped-join fusion: the final join of a grouped statement feeds the
+// aggregation directly and the joined relation never materializes.  These
+// pins guard the fused emit against the materializing path's semantics:
+// LEFT-join NULL padding feeds COUNT a NULL (not a skip), every outer row
+// joins multiplicatively, and ORDER BY/LIMIT still resolve over the
+// projected output.
+TEST_F(RelationalRegressionTest, GroupedJoinFusionKeepsGroupedJoinSemantics) {
+  TransactionContext setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, customer,
+      rs_->CreateTable(
+          setup, Schema("FusedCustomer", {Column("ck", ValueType::kInt64),
+                                          Column("cn", ValueType::kVarChar)})));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, orders,
+      rs_->CreateTable(
+          setup, Schema("FusedOrders", {Column("ok", ValueType::kInt64),
+                                        Column("oc", ValueType::kInt64),
+                                        Column("amt", ValueType::kInt64)})));
+  // Customers 1 (2 orders), 2 (1 order), 3 (no orders), 4 (2 orders, one
+  // filtered away only by a predicate that stays above the join).
+  struct OrderRow {
+    int64_t ok;
+    int64_t oc;
+    int64_t amt;
+  };
+  for (const OrderRow& order : {OrderRow{.ok = 10, .oc = 1, .amt = 100},
+                                OrderRow{.ok = 11, .oc = 1, .amt = 50},
+                                OrderRow{.ok = 12, .oc = 2, .amt = 70},
+                                OrderRow{.ok = 13, .oc = 4, .amt = 20},
+                                OrderRow{.ok = 14, .oc = 4, .amt = 80}}) {
+    ASSERT_SUCCESS(
+        orders
+            .Insert(setup.txn_,
+                    Row({Value(order.ok), Value(order.oc), Value(order.amt)}))
+            .GetStatus());
+  }
+  ASSERT_SUCCESS(
+      customer.Insert(setup.txn_, Row({Value(int64_t{1}), Value("a")}))
+          .GetStatus());
+  ASSERT_SUCCESS(
+      customer.Insert(setup.txn_, Row({Value(int64_t{2}), Value("b")}))
+          .GetStatus());
+  ASSERT_SUCCESS(
+      customer.Insert(setup.txn_, Row({Value(int64_t{3}), Value("c")}))
+          .GetStatus());
+  ASSERT_SUCCESS(
+      customer.Insert(setup.txn_, Row({Value(int64_t{4}), Value("d")}))
+          .GetStatus());
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  // Q13 shape: LEFT JOIN grouped on the left key; the empty customer 3 must
+  // survive with COUNT = 0 (COUNT(NULL) does not skip the group).
+  const auto counts =
+      RelationalRun(*rs_,
+                    "SELECT ck, COUNT(ok) AS cnt FROM FusedCustomer "
+                    "LEFT OUTER JOIN FusedOrders ON ck = oc GROUP BY ck "
+                    "ORDER BY cnt DESC, ck ASC;");
+  ASSERT_EQ(counts.size(), 4U);
+  EXPECT_EQ(counts[0], (Row({Value(int64_t{1}), Value(int64_t{2})})));
+  EXPECT_EQ(counts[1], (Row({Value(int64_t{4}), Value(int64_t{2})})));
+  EXPECT_EQ(counts[2], (Row({Value(int64_t{2}), Value(int64_t{1})})));
+  EXPECT_EQ(counts[3], (Row({Value(int64_t{3}), Value(int64_t{0})})));
+
+  // Inner join + SUM + HAVING-free ORDER BY over an alias, matching the Q21
+  // tail shape.
+  const auto sums =
+      RelationalRun(*rs_,
+                    "SELECT cn, SUM(amt) AS total FROM FusedCustomer "
+                    "JOIN FusedOrders ON ck = oc GROUP BY cn "
+                    "ORDER BY total DESC, cn ASC;");
+  ASSERT_EQ(sums.size(), 3U);
+  EXPECT_EQ(sums[0], (Row({Value("a"), Value(int64_t{150})})));
+  EXPECT_EQ(sums[1], (Row({Value("d"), Value(int64_t{100})})));
+  EXPECT_EQ(sums[2], (Row({Value("b"), Value(int64_t{70})})));
+
+  // LIMIT over the fused grouped output (TopN tail).
+  const auto top_one =
+      RelationalRun(*rs_,
+                    "SELECT cn, SUM(amt) AS total FROM FusedCustomer "
+                    "JOIN FusedOrders ON ck = oc GROUP BY cn "
+                    "ORDER BY total DESC, cn ASC LIMIT 1;");
+  ASSERT_EQ(top_one.size(), 1U);
+  EXPECT_EQ(top_one[0], (Row({Value("a"), Value(int64_t{150})})));
+}
+
 TEST_F(RelationalRegressionTest, FilteredAggregateOverJoinUsesPredicate) {
   TransactionContext setup = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(
@@ -540,6 +706,202 @@ TEST_F(RelationalRegressionTest, FilteredAggregateOverJoinUsesPredicate) {
                     "JOIN FilteredRight u ON t.k = u.k;");
   ASSERT_EQ(filtered_count.size(), 1U);
   EXPECT_EQ(filtered_count[0][0], Value(int64_t{1}));
+}
+
+// A correlated-subquery build whose scan was pruned by the outer
+// correlation-key domain (ScopedCorrelatedOuter registration) must answer
+// every outer key of THAT pipeline, and a later statement with a different
+// outer domain must rebuild rather than reuse the pruned build.  NULL
+// correlation keys on either side never match, so pruning them is
+// observationally identical.
+TEST_F(RelationalRegressionTest,
+       CorrelatedDomainFilteredBuildsStaySoundAcrossOuterDomains) {
+  TransactionContext setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, fact,
+      rs_->CreateTable(setup,
+                       Schema("DomFact", {Column("fkey", ValueType::kInt64),
+                                          Column("val", ValueType::kInt64)})));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, dim,
+      rs_->CreateTable(setup,
+                       Schema("DomDim", {Column("dkey", ValueType::kInt64),
+                                         Column("flag", ValueType::kInt64)})));
+  // Fact rows for keys 1..6 plus one NULL key; NULL never equals a probe.
+  for (int64_t key = 1; key <= 6; ++key) {
+    for (int64_t j = 0; j < 8; ++j) {
+      ASSERT_SUCCESS(
+          fact.Insert(setup.txn_, Row({Value(key), Value((key * 10) + j)}))
+              .GetStatus());
+    }
+  }
+  ASSERT_SUCCESS(
+      fact.Insert(setup.txn_, Row({Value(), Value(int64_t{99})})).GetStatus());
+  for (int64_t key = 1; key <= 6; ++key) {
+    ASSERT_SUCCESS(
+        dim.Insert(setup.txn_, Row({Value(key), Value(key % 2)})).GetStatus());
+  }
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  const auto avg_active =
+      RelationalRun(*rs_,
+                    "SELECT d.dkey, (SELECT AVG(f.val) FROM DomFact f "
+                    "WHERE f.fkey = d.dkey) FROM DomDim d "
+                    "WHERE d.flag = 1 ORDER BY 1;");
+  ASSERT_EQ(avg_active.size(), 3U);
+  EXPECT_EQ(avg_active[0][0], Value(int64_t{1}));
+  EXPECT_EQ(avg_active[0][1], Value(13.5));
+  EXPECT_EQ(avg_active[1][0], Value(int64_t{3}));
+  EXPECT_EQ(avg_active[1][1], Value(33.5));
+  EXPECT_EQ(avg_active[2][0], Value(int64_t{5}));
+  EXPECT_EQ(avg_active[2][1], Value(53.5));
+
+  // Same subquery shape, disjoint outer domain: keys 2/4/6.  A reused build
+  // pruned to the {1, 3, 5} domain above would answer NULL/NULL here.
+  const auto avg_inactive =
+      RelationalRun(*rs_,
+                    "SELECT d.dkey, (SELECT AVG(f.val) FROM DomFact f "
+                    "WHERE f.fkey = d.dkey) FROM DomDim d "
+                    "WHERE d.flag = 0 ORDER BY 1;");
+  ASSERT_EQ(avg_inactive.size(), 3U);
+  EXPECT_EQ(avg_inactive[0][0], Value(int64_t{2}));
+  EXPECT_EQ(avg_inactive[0][1], Value(23.5));
+  EXPECT_EQ(avg_inactive[1][0], Value(int64_t{4}));
+  EXPECT_EQ(avg_inactive[1][1], Value(43.5));
+  EXPECT_EQ(avg_inactive[2][0], Value(int64_t{6}));
+  EXPECT_EQ(avg_inactive[2][1], Value(63.5));
+
+  // Both domains in one pass over the same dim scan: the build (keyed once,
+  // under whichever outer context triggered it) must still answer every key.
+  const auto avg_all =
+      RelationalRun(*rs_,
+                    "SELECT d.dkey, (SELECT AVG(f.val) FROM DomFact f "
+                    "WHERE f.fkey = d.dkey) FROM DomDim d ORDER BY 1;");
+  ASSERT_EQ(avg_all.size(), 6U);
+  for (int64_t key = 1; key <= 6; ++key) {
+    EXPECT_EQ(avg_all[static_cast<size_t>(key) - 1][0], Value(key));
+    EXPECT_EQ(avg_all[static_cast<size_t>(key) - 1][1],
+              Value(static_cast<double>(key * 10) + 3.5));
+  }
+}
+
+TEST(RelationalPlanningTest, NullRejectingPredicateClassification) {
+  const Expression strict = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("r", "v")), BinaryOperation::kGreaterThan,
+      ConstantValueExp(Value(int64_t{0})));
+  const Expression not_null = UnaryExpressionExp(
+      ColumnValueExp(ColumnName("r", "v")), UnaryOperation::kIsNotNull);
+  const Expression null_test = UnaryExpressionExp(
+      ColumnValueExp(ColumnName("r", "v")), UnaryOperation::kIsNull);
+  const Expression coalesced = BinaryExpressionExp(
+      FunctionCallExp("coalesce", {ColumnValueExp(ColumnName("r", "v")),
+                                   ConstantValueExp(Value(int64_t{0}))}),
+      BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0})));
+  EXPECT_TRUE(relational_detail::IsNullRejectingPredicate(strict));
+  EXPECT_TRUE(relational_detail::IsNullRejectingPredicate(not_null));
+  EXPECT_TRUE(relational_detail::IsNullRejectingPredicate(
+      BinaryExpressionExp(strict, BinaryOperation::kAnd, null_test)));
+  EXPECT_FALSE(relational_detail::IsNullRejectingPredicate(null_test));
+  EXPECT_FALSE(relational_detail::IsNullRejectingPredicate(coalesced));
+}
+
+TEST(RelationalPlanningTest, JoinKeyEncodingMatchesValueEncoding) {
+  const std::vector<Value> values = {
+      Value(),
+      Value(std::numeric_limits<int64_t>::min()),
+      Value(std::numeric_limits<int64_t>::max()),
+      Value(std::numeric_limits<int64_t>::max()).WithUnsigned(),
+      Value::DateFromDays(42),
+      Value(""),
+      Value("a"),
+      Value("abcdefgh"),
+      Value("abcdefghi"),
+      Value("abcdefghijklmnop"),
+      Value(1.25),
+      Value(-1.25),
+      Value(0.0),
+      Value(std::numeric_limits<double>::quiet_NaN()),
+      Value::Array({Value(int64_t{1}), Value()}, "INT64")};
+  for (const Value& value : values) {
+    const Row input({value, Value("tail")});
+    const Row expected({value, Value("tail")});
+    EXPECT_EQ(relational_detail::EncodeJoinKey(input, {0, 1}),
+              expected.EncodeMemcomparableFormat());
+  }
+  const Row negative_zero({Value(-0.0), Value("tail")});
+  const Row positive_zero({Value(0.0), Value("tail")});
+  EXPECT_EQ(relational_detail::EncodeJoinKey(negative_zero, {0, 1}),
+            positive_zero.EncodeMemcomparableFormat());
+}
+
+TEST(RelationalPlanningTest, EstimateJoinRowsHandlesScalarKeyDomains) {
+  const std::vector<Expression> int_keys = {BinaryExpressionExp(
+      ColumnValueExp("key"), BinaryOperation::kEquals, ColumnValueExp("key"))};
+  relational_detail::Relation int_left;
+  int_left.schema = Schema("left", {Column("key", ValueType::kInt64)});
+  int_left.AddRow(Row({Value(int64_t{1})}));
+  int_left.AddRow(Row({Value(int64_t{2})}));
+  int_left.AddRow(Row({Value(int64_t{2})}));
+  int_left.AddRow(Row({Value()}));
+  relational_detail::Relation int_right;
+  int_right.schema = Schema("right", {Column("key", ValueType::kInt64)});
+  int_right.AddRow(Row({Value(int64_t{2})}));
+  int_right.AddRow(Row({Value(int64_t{2})}));
+  int_right.AddRow(Row({Value(int64_t{3})}));
+  int_right.AddRow(Row({Value()}));
+  EXPECT_EQ(relational_detail::EstimateJoinRows(int_left, int_right, int_keys),
+            4U);
+
+  const std::vector<Expression> string_keys = {BinaryExpressionExp(
+      ColumnValueExp("key"), BinaryOperation::kEquals, ColumnValueExp("key"))};
+  relational_detail::Relation string_left;
+  string_left.schema = Schema("left", {Column("key", ValueType::kVarChar)});
+  string_left.AddRow(Row({Value("a")}));
+  string_left.AddRow(Row({Value("b")}));
+  string_left.AddRow(Row({Value("b")}));
+  string_left.AddRow(Row({Value()}));
+  relational_detail::Relation string_right;
+  string_right.schema = Schema("right", {Column("key", ValueType::kVarChar)});
+  string_right.AddRow(Row({Value("b")}));
+  string_right.AddRow(Row({Value("b")}));
+  string_right.AddRow(Row({Value("c")}));
+  string_right.AddRow(Row({Value()}));
+  EXPECT_EQ(relational_detail::EstimateJoinRows(string_left, string_right,
+                                                string_keys),
+            4U);
+}
+
+TEST_F(RelationalRegressionTest,
+       FlatIntegerJoinHandlesCollisionsAndDuplicateOrder) {
+  TransactionContext context = rs_->BeginContext();
+  relational_detail::Relation left;
+  left.schema = Schema("left", {Column("left_key", ValueType::kInt64)});
+  left.AddRow(Row({Value(int64_t{1})}));
+  relational_detail::Relation right;
+  right.schema = Schema("right", {Column("right_key", ValueType::kInt64),
+                                  Column("tag", ValueType::kVarChar)});
+  right.AddRow(Row({Value(int64_t{1}), Value("first")}));
+  right.AddRow(Row({Value(int64_t{1}), Value("second")}));
+  right.AddRow(Row({Value(int64_t{9}), Value("collision")}));
+  ASSERT_EQ(left.rows.size(), 1U);
+  ASSERT_EQ(right.rows.size(), 3U);
+  ASSERT_FALSE(right.HasSpill());
+  const std::vector<Expression> predicates = {
+      BinaryExpressionExp(ColumnValueExp("left_key"), BinaryOperation::kEquals,
+                          ColumnValueExp("right_key"))};
+  const std::vector<relational_detail::EqualityKey> equality_keys =
+      relational_detail::EqualityKeys(left.schema, right.schema, predicates);
+  ASSERT_EQ(equality_keys.size(), 1U);
+  EXPECT_EQ(equality_keys[0].left, 0U);
+  EXPECT_EQ(equality_keys[0].right, 0U);
+  StatusOr<relational_detail::Relation> joined = relational_detail::InnerJoin(
+      context, std::move(left), std::move(right), predicates, nullptr, {});
+  ASSERT_TRUE(joined.HasValue()) << joined.GetStatus();
+  EXPECT_EQ(joined.Value().join_comparisons, 2U);
+  ASSERT_EQ(joined.Value().rows.size(), 2U);
+  EXPECT_EQ(joined.Value().rows[0][2], Value("second"));
+  EXPECT_EQ(joined.Value().rows[1][2], Value("first"));
+  context.Abort();
 }
 
 }  // namespace

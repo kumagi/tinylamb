@@ -22,6 +22,7 @@
 #include <optional>
 #include <vector>
 
+#include "executor/selection_vector.hpp"
 #include "executor_base.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/expression.hpp"
@@ -68,6 +69,13 @@ class Selection : public ExecutorBase {
   uint16_t jit_column_{0};
   int64_t jit_constant_{0};
   BinaryOperation jit_operation_{BinaryOperation::kEquals};
+  struct SimdIntFilter {
+    bool enabled{false};
+    size_t column{0};
+    BinaryOperation operation{BinaryOperation::kEquals};
+    int64_t constant{0};
+  };
+  SimdIntFilter simd_filter_;
   size_t jit_batches_{0};
   size_t jit_threshold_rows_;
   size_t rows_seen_{0};
@@ -75,6 +83,7 @@ class Selection : public ExecutorBase {
   // Surviving row indices of the current input batch; reused across batches
   // so the hot path stays allocation-free.
   std::vector<uint32_t> selection_vector_;
+  SelectionVector simd_selection_vector_;
   // Per-conjunct compiled programs, populated only when the whole predicate
   // failed to compile (any non-lowerable conjunct: IN over functions, IS NOT
   // NULL, LIKE, ...).  Compiled conjuncts then evaluate batch-wise while the

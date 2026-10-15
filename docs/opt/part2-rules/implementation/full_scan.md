@@ -90,6 +90,19 @@ graph TD
 - **ローカルコスト**: テーブル全ページを走査するアクセス行数（`AccessRowCount()`）。索引優先ヒント（`kPreferIndex`）が指定されている場合はペナルティ係数 $2.0$ を乗算します。
 - **Top-K ヒントの適用**: 要求順序をスキャンが偶然満たしているか無順序でよい場合、`ApplyLimitHint` によりコストと行数が `limit_hint` を上限として圧縮されます。
 
+### 3. 保存順（clustered index order）の報告
+本 Rule が作る `FullScanPlan` は、**ヒープの保存順が「SQL の昇順キー」であることを証明できる場合だけ**その順序を報告します。報告が成り立つにはカタログ・測定・鮮度の3条件がすべて揃う必要があり、どれか1つでも欠ければ無順序へ fallback します（`plan/full_scan_plan.hpp` の `ClusteredOrderColumn()`）。
+
+- **カタログ**: その列が UNIQUE 索引のキー全体であること（`CREATE TABLE` は PRIMARY KEY / UNIQUE 列ごとに索引を作る）、かつ列制約が NOT NULL であること。NOT NULL なら NULL が挟まらないので、報告する順序は NULLS FIRST でも NULLS LAST でも同じ列になります。
+- **測定**: ANALYZE がその列の相関を $1.0$ として記録していること（走査順で隣接する非 NULL 対がすべて非減少）。
+- **鮮度**: 統計が `TableStatistics::LayoutGeneration()` を持ち、それが表の `Table::LayoutGeneration()` と一致すること。行変異（INSERT/UPDATE/DELETE）はチェーンを動かし、UPDATE/DELETE はさらに「1プロセス内で in-place 書き換えが起きた」latch を立てる（古い snapshot は pre-image を解決しうるため、現在の画像の測定はその代理にならない）。ANALYZE は自分の走査の前後で世代が動いていれば証拠を捨てるので、走査中に commit された行は「測定済み」に数えられない。
+
+`IsOrderedBy` の応答は保守的です: 昇順・先頭キー1個・素の列参照にだけ一致します（降順には逆順チェーン走査がありません。2個目以降は prefix 扱いなので `IncrementalSort` 側の判定に委ねます）。一致したときだけ `ORDER BY` 用の `SortPlan` が生成されず、`EXPLAIN` には `FullScan: t (clustered order: id ASC)` が出ます。`FullScanPlan::EmitExecutor` は報告するプランでは `ParallelScan` を使わず、チェーン順を保つ single-threaded `FullScan` に固定します（モーセル並列は worker 完了順にチャンクを出すので保存順ではありません）。
+
+順序は**測定**であって保証ではないため、コスト計算とは切り離します。`PlanBase::OrderIsMeasured()` がその区別を表し、構造的な順序（索引・スート）と違い、全チェーンを読んだ代償が残ります。したがって direct path の「順序付き候補を優先」段も `ApplyLimitHint` の LIMIT 早期打ち切り割引も、測定された順序には適用しません。適用せずにいると `ORDER BY pk LIMIT 1` が全表読みを「1行読み」として評価し、索引アクセスを追い越してしまいます。
+
+さらに、この順序は次の行変異で失効しうるため、`sql_engine.cpp` はこの文脈で解決済みテーブルに順序主張がある間、その文の plan をコンパイル済み plan キャッシュへ入れません。キャッシュされた plan には「ソート助教 = 上限の折畳み / クラスタ prefix の IncrementalSort」のように順序依存の構造が焼き込まれており、別の snapshot で再生すると壊れるためです。
+
 ## 最適化効果
 
 - **シーケンシャル I/O の最大化**: ディスクまたはバッファプールからの連続ブロック先読み（Sequential Prefetching）を活用し、ランダムアクセス主体の索引探索よりも高速に大量データを処理します。
@@ -111,3 +124,10 @@ graph TD
   集約を含むクエリにおいて LIMIT がスキャンへ誤って押し込まれないことを確認します。
 - `OptimizerTest.PhysicalRulesCanBeRemovedIndependently`:
   `full_scan` および `index_scan` を個別にルールセットから着脱してもオプティマイザが正常動作することを確認します。
+- 保存順の報告ゲートは `plan/full_scan_plan_test.cpp` の
+  `FullScanClusteredOrderTest`（未 ANALYZE / 相関 1.0 の主キー / 逆順データ /
+  unique 無し / nullable unique / 挿入後の失効 / UPDATE・DELETE の latch /
+  並列閾値 / DML source scan / 空表）と、`query/sql_clustered_order_test.cpp`
+  の `SqlClusteredOrderTest`（EXPLAIN の `clustered order: id ASC` と Sort 不在、
+  順序付き結果、LIMIT・OFFSET・DISTINCT・NULL 順序・空表・失敗文、変異後の
+  Sort 復帰と順序維持）で検証しています。

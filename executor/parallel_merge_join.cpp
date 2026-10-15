@@ -63,14 +63,14 @@ ParallelMergeJoin::ParallelMergeJoin(
 bool ParallelMergeJoin::KeyIsNull(const Row& row,
                                   const std::vector<slot_t>& cols) {
   return std::ranges::any_of(cols, [&row](slot_t col) {
-    return col < row.Size() && row[col].IsNull();
+    return col < row.Count() && row[col].IsNull();
   });
 }
 
 bool ParallelMergeJoin::KeyCannotMatch(const Row& row,
                                        const std::vector<slot_t>& cols) {
   return std::ranges::any_of(cols, [&](slot_t col) {
-    return col >= row.Size() || row[col].IsNull() ||
+    return col >= row.Count() || row[col].IsNull() ||
            JoinValueUnmatchable(row[col]);
   });
 }

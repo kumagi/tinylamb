@@ -10,6 +10,7 @@
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -20,6 +21,11 @@ class TopNExecutor final : public ExecutorBase {
     Expression expression;
     bool ascending{true};
     std::optional<bool> nulls_first{std::nullopt};
+    // Collation the key's comparison runs under, resolved from the key
+    // expression by the planner (COLLATE(...)). The heap compares evaluated
+    // values through the same SortKeyOrder contract the sort operators use,
+    // so a case-insensitive ORDER BY keeps its LIMIT over the right rows.
+    Collation collation{Collation::kNone};
   };
 
   TopNExecutor(Executor source, Schema schema, std::vector<Key> keys,

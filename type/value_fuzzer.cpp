@@ -33,12 +33,12 @@ using tinylamb::ValueType;
 namespace {
 
 struct Stream {
-  const uint8_t* data;
-  size_t size;
+  const uint8_t* data{};
+  size_t size{};
   size_t offset{0};
 
   uint8_t Next() { return offset < size ? data[offset++] : 0; }
-  bool Done() const { return offset >= size; }
+  [[nodiscard]] bool Done() const { return offset >= size; }
 };
 
 int64_t NextI64(Stream& s) {
@@ -119,7 +119,7 @@ Value MakeValue(Stream& s, bool biased) {
   const uint8_t pick = s.Next() % (biased ? 5 : 7);
   switch (pick) {
     case 0:
-      return Value();  // NULL
+      return {};  // NULL
     case 1:
     case 2:
       return MakeInt(s, biased);
@@ -130,10 +130,11 @@ Value MakeValue(Stream& s, bool biased) {
     case 5:
       // DATE: Value::Date parses; invalid strings throw, so go through the
       // day-based constructor which is total.
-      return Value::DateFromDays(static_cast<int64_t>(s.Next()) * 7 - 700);
+      return Value::DateFromDays(((static_cast<int64_t>(s.Next()) * 7)) - 700);
     default: {
       const size_t n = s.Next() % 3;
       std::vector<Value> elems;
+      elems.reserve(n);
       for (size_t i = 0; i < n; ++i) {
         elems.push_back(MakeInt(s, biased));
       }
@@ -152,12 +153,16 @@ bool SameValue(const Value& a, const Value& b) {
       // so the round-trip oracle does not depend on SQL comparison rules.
       double x = a.value.double_value;
       double y = b.value.double_value;
-      int64_t rx, ry;
+      int64_t rx = 0, ry = 0;
       std::memcpy(&rx, &x, sizeof(rx));
       std::memcpy(&ry, &y, sizeof(ry));
       // Normalize only the NaN payload, keep +0/-0 distinct.
-      if (std::isnan(x)) rx = std::numeric_limits<int64_t>::min();
-      if (std::isnan(y)) ry = std::numeric_limits<int64_t>::min();
+      if (std::isnan(x)) {
+        rx = std::numeric_limits<int64_t>::min();
+      }
+      if (std::isnan(y)) {
+        ry = std::numeric_limits<int64_t>::min();
+      }
       return rx == ry;
     }
   }
@@ -171,7 +176,7 @@ void CheckSerializeRoundTrip(const Value& v) {
     return;
   }
   std::vector<char> buffer(v.Size());
-  const size_t written = v.Serialize(buffer.data());
+  [[maybe_unused]] const size_t written = v.Serialize(buffer.data());
   assert(written == buffer.size());
   Value decoded;
   const auto des = decoded.TryDeserialize(buffer.data(), v.type);
@@ -221,19 +226,17 @@ void CheckMemcomparableOrdering(const Value& a, const Value& b) {
     return;
   }
   const auto less = a.TryLess(b);
-  const auto eq = a == b;
-  const int enc_cmp =
+  [[maybe_unused]] const auto eq = a == b;
+  [[maybe_unused]] const int enc_cmp =
       ea.Value() < eb.Value() ? -1 : (eb.Value() < ea.Value() ? 1 : 0);
   if (less.HasValue()) {
     const auto greater = b.TryLess(a);
-    const int sql_cmp =
+    [[maybe_unused]] const int sql_cmp =
         less.Value() ? -1 : (greater.HasValue() && greater.Value() ? 1 : 0);
-    if (sql_cmp != 0) {
-      assert(sql_cmp == enc_cmp);
-    } else if (!eq) {
-      // Distinct SQL-equal values (none today) would still need equal keys.
-      assert(enc_cmp == 0);
-    }
+    // One assert (not an if/else): the branches are just asserts, and
+    // NDEBUG turns those into an empty if/else clone.  Distinct SQL-equal
+    // values (none today) would still need equal keys.
+    assert(sql_cmp != 0 ? sql_cmp == enc_cmp : (eq || enc_cmp == 0));
   }
 }
 
@@ -246,7 +249,7 @@ void CheckTrichotomy(const Value& a, const Value& b) {
   if (!lt.HasValue() || !gt.HasValue()) {
     return;  // Undefined orders (arrays) are allowed as errors.
   }
-  const bool eq = (a == b);
+  [[maybe_unused]] const bool eq = (a == b);
   if (a.type == ValueType::kDouble &&
       (std::isnan(a.value.double_value) || std::isnan(b.value.double_value))) {
     // NaN compares false against everything (SQL and IEEE).
@@ -263,11 +266,11 @@ void CheckTrichotomy(const Value& a, const Value& b) {
 
 void CheckOrderByTotal(const Value& a, const Value& b, const Value& c) {
   const int ab = CompareForOrderBy(a, b);
-  const int ba = CompareForOrderBy(b, a);
+  [[maybe_unused]] const int ba = CompareForOrderBy(b, a);
   assert((ab > 0) == (ba < 0));
   assert((ab == 0) == (ba == 0));
   const int bc = CompareForOrderBy(b, c);
-  const int ac = CompareForOrderBy(a, c);
+  [[maybe_unused]] const int ac = CompareForOrderBy(a, c);
   if (ab < 0 && bc < 0) {
     assert(ac < 0);
   }
@@ -307,8 +310,8 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
   }
 
   // Typed value invariants over three derived values (two "biased" toward
-  // boundary payloads, one fully random).
-  Stream stream{data, size};
+  // boundary payloads, one fully random)..data=
+  Stream stream{.data = data, .size = size};
   const Value a = MakeValue(stream, true);
   const Value b = MakeValue(stream, true);
   const Value c = MakeValue(stream, false);

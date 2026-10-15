@@ -104,6 +104,34 @@ TEST_F(SqlRelationalEvalCoverageTest, ExtractPartFamily) {
   ExpectScalar(
       "SELECT extract_nanosecond(TIMESTAMP '2026-09-18 05:06:07.123456789+00')",
       Value(int64_t{123456789}));
+  // WEEKDAY: Monday = 1 ... Sunday = 7 (distinct from DAYOFWEEK's
+  // Sunday = 1 ... Saturday = 7). 2026-01-01 is a Thursday.
+  ExpectScalar("SELECT extract_weekday(DATE '2026-01-01')", Value(int64_t{4}));
+  ExpectScalar("SELECT extract_weekday(DATE '2026-01-04')", Value(int64_t{7}));
+  ExpectScalar("SELECT extract_weekday(DATE '2026-01-05')", Value(int64_t{1}));
+  ExpectScalar("SELECT EXTRACT(WEEKDAY FROM DATE '2026-01-01')",
+               Value(int64_t{4}));
+}
+
+TEST_F(SqlRelationalEvalCoverageTest, DatePartPlainFunctionAliases) {
+  // The plain-function spellings lower to the extract_* family.
+  ExpectScalar("SELECT DAY(DATE '2026-01-01')", Value(int64_t{1}));
+  ExpectScalar("SELECT MONTH(DATE '2026-01-01')", Value(int64_t{1}));
+  ExpectScalar("SELECT YEAR(DATE '2026-01-01')", Value(int64_t{2026}));
+  ExpectScalar("SELECT QUARTER(DATE '2026-09-18')", Value(int64_t{3}));
+  ExpectScalar("SELECT DAYOFWEEK(DATE '2026-01-01')", Value(int64_t{5}));
+  ExpectScalar("SELECT DAYOFYEAR(DATE '2026-09-18')", Value(int64_t{261}));
+  ExpectScalar("SELECT WEEKDAY(DATE '2026-01-01')", Value(int64_t{4}));
+  ExpectScalar("SELECT WEEK(DATE '2026-01-01')", Value(int64_t{0}));
+  ExpectScalar("SELECT ISOWEEK(DATE '2026-01-01')", Value(int64_t{1}));
+  ExpectScalar("SELECT ISOYEAR(DATE '2026-01-01')", Value(int64_t{2026}));
+  // GROUP BY over the aliased spelling shares the extract path: Sunday (7)
+  // and Monday (1) each take one row.
+  ExpectScalar(
+      "SELECT COUNT(*) FROM (SELECT WEEKDAY(d), COUNT(*) FROM (SELECT"
+      " DATE '2026-01-04' d UNION ALL SELECT DATE '2026-01-05')"
+      " GROUP BY WEEKDAY(d) HAVING WEEKDAY(d) = 7)",
+      Value(int64_t{1}));
 }
 
 TEST_F(SqlRelationalEvalCoverageTest, DateTruncAndDateBucket) {

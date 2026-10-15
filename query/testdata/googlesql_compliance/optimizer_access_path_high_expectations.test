@@ -211,18 +211,39 @@ SELECT DISTINCT category FROM access_input ORDER BY category
 ARRAY<STRUCT<category INT64>>[{10}, {20}, {30}, {40}, {50}]
 ==
 
-# Range predicate on non-leading index key uses IndexSkipScan:
-# When filtering on a selective non-leading column (score >= 80) without a leading column
-# constraint, the optimizer should perform an index skip scan over the leading distinct keys
-# rather than falling back to a full table scan.
+# With an ORDER BY on the clustered primary key, the full scan avoids a
+# sort. Cost includes that advantage for this six-of-ten-row predicate.
+[mode=explain]
+[plan_contains=FullScan: access_input]
+[plan_not_contains=ParallelSort]
+[name=clustered_order_competes_with_secondary_range]
+SELECT id, score FROM access_input WHERE score >= 50 ORDER BY id
+--
+ARRAY<STRUCT<id INT64, score INT64>>[
+  {1, 100}, {2, 90}, {3, 80}, {4, 70}, {5, 60}, {6, 50}
+]
+==
+
+# Without that order requirement the selective secondary range wins.
 [mode=explain]
 [plan_contains=IndexSkipScan]
 [plan_not_contains=FullScan: access_input]
-[name=index_skip_scan_on_secondary_range]
+[name=secondary_range_without_order_requirement]
+SELECT id, score FROM access_input WHERE score >= 80
+--
+ARRAY<STRUCT<id INT64, score INT64>>[
+  {3, 80}, {2, 90}, {1, 100}
+]
+==
+
+# A narrow descending-clustered secondary range still wins after pricing sort.
+[mode=explain]
+[plan_contains=IndexSkipScan]
+[plan_not_contains=FullScan: access_input]
+[name=descending_clustered_range_has_sequential_locality]
 SELECT id, score FROM access_input WHERE score >= 80 ORDER BY id
 --
 ARRAY<STRUCT<id INT64, score INT64>>[
   {1, 100}, {2, 90}, {3, 80}
 ]
 ==
-

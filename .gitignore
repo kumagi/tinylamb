@@ -18,3 +18,11 @@ googlesql_compliance-*
 ironlamb-compliance-*
 *.db
 *.log
+# WAL segment metadata sidecars next to the ignored *.log files; aborted
+# fault-injection tests leave them behind (clean_root_artifacts.py sweeps CI).
+*.log.meta
+*.log.meta.tmp
+*.last_checkpoint
+*.last_checkpoint.tmp
+.fuzzscratch/
+__pycache__/

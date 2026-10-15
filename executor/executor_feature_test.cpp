@@ -20,7 +20,6 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/data_chunk.hpp"
-#include "executor/exchange.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/hash_join_mode.hpp"
@@ -435,6 +434,92 @@ TEST_F(ExecutorFeatureSqlTest, MultiKeyJoinAndNullSafeEquiJoin) {
   EXPECT_EQ(null_safe[1][0], Value(int64_t{2}));
 }
 
+TEST_F(ExecutorFeatureSqlTest, NullSafeOuterKindsKeepNullAndOuterSemantics) {
+  Run("CREATE TABLE nso_l(id INT64, k INT64)");
+  Run("CREATE TABLE nso_r(id INT64, k INT64)");
+  Run("INSERT INTO nso_l VALUES (1, NULL), (2, NULL), (3, 1), (4, NULL), "
+      "(5, 2)");
+  Run("INSERT INTO nso_r VALUES (10, NULL), (11, NULL), (12, 1), (13, 2), "
+      "(14, 3)");
+
+  EXPECT_EQ(Exec("SELECT l.id, r.id FROM nso_l l LEFT JOIN nso_r r "
+                 "ON l.k IS NOT DISTINCT FROM r.k ORDER BY l.id, r.id"),
+            (std::vector<Row>{
+                Row({Value(1), Value(10)}), Row({Value(1), Value(11)}),
+                Row({Value(2), Value(10)}), Row({Value(2), Value(11)}),
+                Row({Value(3), Value(12)}), Row({Value(4), Value(10)}),
+                Row({Value(4), Value(11)}), Row({Value(5), Value(13)})}));
+  EXPECT_EQ(
+      Exec("SELECT l.id, r.id FROM nso_l l RIGHT JOIN nso_r r "
+           "ON l.k IS NOT DISTINCT FROM r.k ORDER BY r.id, l.id"),
+      (std::vector<Row>{Row({Value(1), Value(10)}), Row({Value(2), Value(10)}),
+                        Row({Value(4), Value(10)}), Row({Value(1), Value(11)}),
+                        Row({Value(2), Value(11)}), Row({Value(4), Value(11)}),
+                        Row({Value(3), Value(12)}), Row({Value(5), Value(13)}),
+                        Row({Value(), Value(14)})}));
+  EXPECT_EQ(
+      Exec("SELECT l.id, r.id FROM nso_l l FULL JOIN nso_r r "
+           "ON l.k IS NOT DISTINCT FROM r.k ORDER BY r.id, l.id"),
+      (std::vector<Row>{Row({Value(1), Value(10)}), Row({Value(2), Value(10)}),
+                        Row({Value(4), Value(10)}), Row({Value(1), Value(11)}),
+                        Row({Value(2), Value(11)}), Row({Value(4), Value(11)}),
+                        Row({Value(3), Value(12)}), Row({Value(5), Value(13)}),
+                        Row({Value(), Value(14)})}));
+
+  EXPECT_EQ(
+      Exec("SELECT l.id, r.id FROM nso_l l LEFT JOIN nso_r r "
+           "ON l.k = r.k ORDER BY l.id, r.id"),
+      (std::vector<Row>{Row({Value(1), Value()}), Row({Value(2), Value()}),
+                        Row({Value(3), Value(12)}), Row({Value(4), Value()}),
+                        Row({Value(5), Value(13)})}));
+  const auto distinct_count = Exec(
+      "SELECT COUNT(*) FROM nso_l l JOIN nso_r r "
+      "ON l.k IS DISTINCT FROM r.k");
+  ASSERT_EQ(distinct_count.size(), 1U);
+  EXPECT_EQ(distinct_count[0][0], Value(int64_t{17}));
+  EXPECT_EQ(Exec("SELECT l.id, r.id FROM nso_l l LEFT JOIN nso_r r "
+                 "ON l.k IS DISTINCT FROM r.k WHERE l.id IN (1, 4) "
+                 "ORDER BY l.id, r.id"),
+            (std::vector<Row>{
+                Row({Value(1), Value(12)}), Row({Value(1), Value(13)}),
+                Row({Value(1), Value(14)}), Row({Value(4), Value(12)}),
+                Row({Value(4), Value(13)}), Row({Value(4), Value(14)})}));
+
+  std::string plan;
+  for (const Row& row :
+       Exec("EXPLAIN SELECT l.id, r.id FROM nso_l l LEFT JOIN nso_r r "
+            "ON l.k IS NOT DISTINCT FROM r.k")) {
+    plan += row[0].AsString();
+    plan.push_back('\n');
+  }
+  EXPECT_NE(plan.find("LeftHashJoin null_safe=true"), std::string::npos)
+      << plan;
+  EXPECT_EQ(plan.find("SemiHashJoin"), std::string::npos) << plan;
+  EXPECT_EQ(plan.find("AntiHashJoin"), std::string::npos) << plan;
+  EXPECT_EQ(plan.find("IndexJoin"), std::string::npos) << plan;
+  EXPECT_EQ(plan.find("MergeJoin"), std::string::npos) << plan;
+
+  Run("CREATE TABLE nso_empty(id INT64, k INT64)");
+  const auto empty_left = Exec(
+      "SELECT l.id, e.id FROM nso_l l LEFT JOIN nso_empty e "
+      "ON l.k IS NOT DISTINCT FROM e.k ORDER BY l.id");
+  ASSERT_EQ(empty_left.size(), 5U);
+  for (const Row& row : empty_left) {
+    EXPECT_TRUE(row[1].IsNull());
+  }
+  const auto empty_full = Exec(
+      "SELECT l.id, e.id FROM nso_l l FULL JOIN nso_empty e "
+      "ON l.k IS NOT DISTINCT FROM e.k ORDER BY l.id");
+  ASSERT_EQ(empty_full.size(), 5U);
+  for (const Row& row : empty_full) {
+    EXPECT_TRUE(row[1].IsNull());
+  }
+
+  EXPECT_THROW((void)Exec("SELECT l.id, r.id FROM nso_l l LEFT JOIN nso_r r "
+                          "ON l.k IS NOT DISTINCT FROM r.missing"),
+               std::runtime_error);
+}
+
 TEST_F(ExecutorFeatureSqlTest, ScalarSubquerySingleJoin) {
   Run("CREATE TABLE s1(a INT64)");
   Run("CREATE TABLE s2(b INT64)");
@@ -774,6 +859,247 @@ TEST(HashJoinOuterTest, LeftRightFullOuterWithNullKeys) {
     const std::vector<Row> out = Drain(&join);
     // 1 match + 2 unmatched left + 2 unmatched right.
     ASSERT_EQ(out.size(), 5U);
+  }
+}
+
+TEST(HashJoinOuterTest, NonRejectingResidualPadsEveryOuterKind) {
+  const Schema left_schema(
+      "l", {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});
+  const Schema right_schema(
+      "r", {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});
+  const Schema combined = left_schema + right_schema;
+  const std::vector<Row> left_rows{Row({Value(int64_t{1}), Value(int64_t{10})}),
+                                   Row({Value(int64_t{1}), Value(int64_t{11})}),
+                                   Row({Value(int64_t{2}), Value(int64_t{20})}),
+                                   Row({Value(int64_t{3}), Value(int64_t{30})}),
+                                   Row({Value(), Value(int64_t{40})})};
+  const std::vector<Row> right_rows{
+      Row({Value(int64_t{1}), Value(int64_t{100})}),
+      Row({Value(int64_t{1}), Value(int64_t{101})}),
+      Row({Value(int64_t{2}), Value(int64_t{0})}),
+      Row({Value(int64_t{3}), Value()}),
+      Row({Value(int64_t{4}), Value(int64_t{400})})};
+  const Expression residual = BinaryExpressionExp(
+      FunctionCallExp("coalesce", {ColumnValueExp(ColumnName("r", "v")),
+                                   ConstantValueExp(Value(int64_t{0}))}),
+      BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0})));
+  const auto run = [&](JoinKind kind) {
+    HashJoin join(Src(left_rows), {0}, Src(right_rows), {0},
+                  HashJoinMode::kInMemory, kind, 2, 2, 2);
+    join.SetJoinResidual(residual, combined);
+    return Drain(&join);
+  };
+
+  ExpectSameMultiset(
+      run(JoinKind::kLeftOuter),
+      {Row({Value(int64_t{1}), Value(int64_t{10}), Value(), Value()}),
+       Row({Value(int64_t{1}), Value(int64_t{11}), Value(), Value()}),
+       Row({Value(int64_t{2}), Value(int64_t{20}), Value(int64_t{2}),
+            Value(int64_t{0})}),
+       Row({Value(int64_t{3}), Value(int64_t{30}), Value(int64_t{3}), Value()}),
+       Row({Value(), Value(int64_t{40}), Value(), Value()})});
+  ExpectSameMultiset(
+      run(JoinKind::kRightOuter),
+      {Row({Value(), Value(), Value(int64_t{1}), Value(int64_t{100})}),
+       Row({Value(), Value(), Value(int64_t{1}), Value(int64_t{101})}),
+       Row({Value(int64_t{2}), Value(int64_t{20}), Value(int64_t{2}),
+            Value(int64_t{0})}),
+       Row({Value(int64_t{3}), Value(int64_t{30}), Value(int64_t{3}), Value()}),
+       Row({Value(), Value(), Value(int64_t{4}), Value(int64_t{400})})});
+  ExpectSameMultiset(
+      run(JoinKind::kFullOuter),
+      {Row({Value(int64_t{1}), Value(int64_t{10}), Value(), Value()}),
+       Row({Value(int64_t{1}), Value(int64_t{11}), Value(), Value()}),
+       Row({Value(int64_t{2}), Value(int64_t{20}), Value(int64_t{2}),
+            Value(int64_t{0})}),
+       Row({Value(int64_t{3}), Value(int64_t{30}), Value(int64_t{3}), Value()}),
+       Row({Value(), Value(int64_t{40}), Value(), Value()}),
+       Row({Value(), Value(), Value(int64_t{1}), Value(int64_t{100})}),
+       Row({Value(), Value(), Value(int64_t{1}), Value(int64_t{101})}),
+       Row({Value(), Value(), Value(int64_t{4}), Value(int64_t{400})})});
+
+  HashJoin empty(Src(std::vector<Row>{}), {0}, Src(std::vector<Row>{}), {0},
+                 HashJoinMode::kInMemory, JoinKind::kFullOuter, 2, 2, 2);
+  empty.SetJoinResidual(residual, combined);
+  EXPECT_TRUE(Drain(&empty).empty());
+
+  const Expression bad_residual =
+      CastExpressionExp(ConstantValueExp(Value("not-a-date")), "DATE");
+  HashJoin error(
+      Src(std::vector<Row>{Row({Value(int64_t{1}), Value(int64_t{10})})}), {0},
+      Src(std::vector<Row>{Row({Value(int64_t{1}), Value(int64_t{0})})}), {0},
+      HashJoinMode::kInMemory, JoinKind::kLeftOuter, 2, 2, 2);
+  error.SetJoinResidual(bad_residual, combined);
+  Row error_row;
+  EXPECT_FALSE(error.Next(&error_row, nullptr));
+  EXPECT_NE(error.GetStatus(), Status::kSuccess);
+}
+
+TEST(HashJoinOuterTest, NullSafeOuterKindsPreserveNullAndUnmatchedRows) {
+  const std::vector<Row> left_rows{
+      Row({Value(), Value("l-null-1")}), Row({Value(), Value("l-null-2")}),
+      Row({Value(1), Value("l-one")}), Row({Value(3), Value("l-three")})};
+  const std::vector<Row> right_rows{
+      Row({Value(), Value("r-null-1")}), Row({Value(), Value("r-null-2")}),
+      Row({Value(1), Value("r-one")}), Row({Value(2), Value("r-two")})};
+  const auto run = [&](JoinKind kind, bool null_safe) {
+    HashJoin join(Src(left_rows), {0}, Src(right_rows), {0},
+                  HashJoinMode::kInMemory, kind, 2, 2, 2);
+    if (null_safe) {
+      join.SetJoinAnnotations({true}, Expression());
+    }
+    const std::vector<Row> output = Drain(&join);
+    EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+    return output;
+  };
+
+  ExpectSameMultiset(
+      run(JoinKind::kLeftOuter, true),
+      {Row({Value(), Value("l-null-1"), Value(), Value("r-null-1")}),
+       Row({Value(), Value("l-null-1"), Value(), Value("r-null-2")}),
+       Row({Value(), Value("l-null-2"), Value(), Value("r-null-1")}),
+       Row({Value(), Value("l-null-2"), Value(), Value("r-null-2")}),
+       Row({Value(1), Value("l-one"), Value(1), Value("r-one")}),
+       Row({Value(3), Value("l-three"), Value(), Value()})});
+  ExpectSameMultiset(
+      run(JoinKind::kRightOuter, true),
+      {Row({Value(), Value("l-null-1"), Value(), Value("r-null-1")}),
+       Row({Value(), Value("l-null-1"), Value(), Value("r-null-2")}),
+       Row({Value(), Value("l-null-2"), Value(), Value("r-null-1")}),
+       Row({Value(), Value("l-null-2"), Value(), Value("r-null-2")}),
+       Row({Value(1), Value("l-one"), Value(1), Value("r-one")}),
+       Row({Value(), Value(), Value(2), Value("r-two")})});
+  ExpectSameMultiset(
+      run(JoinKind::kFullOuter, true),
+      {Row({Value(), Value("l-null-1"), Value(), Value("r-null-1")}),
+       Row({Value(), Value("l-null-1"), Value(), Value("r-null-2")}),
+       Row({Value(), Value("l-null-2"), Value(), Value("r-null-1")}),
+       Row({Value(), Value("l-null-2"), Value(), Value("r-null-2")}),
+       Row({Value(1), Value("l-one"), Value(1), Value("r-one")}),
+       Row({Value(3), Value("l-three"), Value(), Value()}),
+       Row({Value(), Value(), Value(2), Value("r-two")})});
+
+  ExpectSameMultiset(run(JoinKind::kLeftOuter, false),
+                     {Row({Value(1), Value("l-one"), Value(1), Value("r-one")}),
+                      Row({Value(3), Value("l-three"), Value(), Value()}),
+                      Row({Value(), Value("l-null-1"), Value(), Value()}),
+                      Row({Value(), Value("l-null-2"), Value(), Value()})});
+  ExpectSameMultiset(run(JoinKind::kRightOuter, false),
+                     {Row({Value(1), Value("l-one"), Value(1), Value("r-one")}),
+                      Row({Value(), Value(), Value(2), Value("r-two")}),
+                      Row({Value(), Value(), Value(), Value("r-null-1")}),
+                      Row({Value(), Value(), Value(), Value("r-null-2")})});
+  ExpectSameMultiset(run(JoinKind::kFullOuter, false),
+                     {Row({Value(1), Value("l-one"), Value(1), Value("r-one")}),
+                      Row({Value(3), Value("l-three"), Value(), Value()}),
+                      Row({Value(), Value("l-null-1"), Value(), Value()}),
+                      Row({Value(), Value("l-null-2"), Value(), Value()}),
+                      Row({Value(), Value(), Value(2), Value("r-two")}),
+                      Row({Value(), Value(), Value(), Value("r-null-1")}),
+                      Row({Value(), Value(), Value(), Value("r-null-2")})});
+
+  {
+    HashJoin join(Src(left_rows), {0}, Src(right_rows), {0},
+                  HashJoinMode::kInMemory, JoinKind::kSemi, 2, 2, 2);
+    join.SetJoinAnnotations({true}, Expression());
+    ExpectSameMultiset(Drain(&join), {Row({Value(), Value("l-null-1")}),
+                                      Row({Value(), Value("l-null-2")}),
+                                      Row({Value(1), Value("l-one")})});
+  }
+  {
+    HashJoin join(Src(left_rows), {0}, Src(right_rows), {0},
+                  HashJoinMode::kInMemory, JoinKind::kAnti, 2, 2, 2);
+    join.SetJoinAnnotations({true}, Expression());
+    ExpectSameMultiset(Drain(&join), {Row({Value(3), Value("l-three")})});
+  }
+
+  const std::vector<Row> composite_left{Row({Value(), Value(1), Value("l1")}),
+                                        Row({Value(), Value(), Value("ln")}),
+                                        Row({Value(1), Value(1), Value("l2")}),
+                                        Row({Value(2), Value(2), Value("l3")})};
+  const std::vector<Row> composite_right{Row({Value(), Value(1), Value("r1")}),
+                                         Row({Value(), Value(), Value("rn")}),
+                                         Row({Value(1), Value(1), Value("r2")}),
+                                         Row({Value(2), Value(), Value("r3")})};
+  {
+    HashJoin join(Src(composite_left), {0, 1}, Src(composite_right), {0, 1},
+                  HashJoinMode::kInMemory, JoinKind::kLeftOuter, 2, 3, 3);
+    join.SetJoinAnnotations({true, false}, Expression());
+    ExpectSameMultiset(
+        Drain(&join),
+        {Row({Value(), Value(1), Value("l1"), Value(), Value(1), Value("r1")}),
+         Row({Value(), Value(), Value("ln"), Value(), Value(), Value()}),
+         Row({Value(1), Value(1), Value("l2"), Value(1), Value(1),
+              Value("r2")}),
+         Row({Value(2), Value(2), Value("l3"), Value(), Value(), Value()})});
+  }
+  {
+    HashJoin join(Src(composite_left), {0, 1}, Src(composite_right), {0, 1},
+                  HashJoinMode::kInMemory, JoinKind::kFullOuter, 2, 3, 3);
+    join.SetJoinAnnotations({true, false}, Expression());
+    ExpectSameMultiset(
+        Drain(&join),
+        {Row({Value(), Value(1), Value("l1"), Value(), Value(1), Value("r1")}),
+         Row({Value(), Value(), Value("ln"), Value(), Value(), Value()}),
+         Row({Value(1), Value(1), Value("l2"), Value(1), Value(1),
+              Value("r2")}),
+         Row({Value(2), Value(2), Value("l3"), Value(), Value(), Value()}),
+         Row({Value(), Value(), Value(), Value(), Value(), Value("rn")}),
+         Row({Value(), Value(), Value(), Value(2), Value(), Value("r3")})});
+  }
+
+  const std::vector<Row> empty_left;
+  const std::vector<Row> empty_right;
+  const std::vector<Row> one_left{Row({Value(1), Value("left")})};
+  const std::vector<Row> one_right{Row({Value(1), Value("right")})};
+  {
+    HashJoin join(Src(empty_left), {0}, Src(one_right), {0},
+                  HashJoinMode::kInMemory, JoinKind::kLeftOuter, 1, 2, 2);
+    join.SetJoinAnnotations({true}, Expression());
+    EXPECT_TRUE(Drain(&join).empty());
+  }
+  {
+    HashJoin join(Src(empty_left), {0}, Src(one_right), {0},
+                  HashJoinMode::kInMemory, JoinKind::kFullOuter, 1, 2, 2);
+    join.SetJoinAnnotations({true}, Expression());
+    ExpectSameMultiset(Drain(&join),
+                       {Row({Value(), Value(), Value(1), Value("right")})});
+  }
+  {
+    HashJoin join(Src(one_left), {0}, Src(empty_right), {0},
+                  HashJoinMode::kInMemory, JoinKind::kFullOuter, 1, 2, 2);
+    join.SetJoinAnnotations({true}, Expression());
+    ExpectSameMultiset(Drain(&join),
+                       {Row({Value(1), Value("left"), Value(), Value()})});
+  }
+  {
+    HashJoin join(std::make_shared<FailingSource>(), {0}, Src(one_right), {0},
+                  HashJoinMode::kInMemory, JoinKind::kLeftOuter, 1, 2, 2);
+    join.SetJoinAnnotations({true}, Expression());
+    Row row;
+    EXPECT_FALSE(join.Next(&row, nullptr));
+    EXPECT_NE(join.GetStatus(), Status::kSuccess);
+  }
+
+  std::vector<Row> spill_left;
+  std::vector<Row> spill_right;
+  for (int64_t i = 0; i < 80; ++i) {
+    const std::string payload(96, 'x');
+    spill_left.push_back(Row({Value(i % 7), Value(std::string(payload))}));
+    spill_right.push_back(Row({Value(i % 7), Value(std::string(payload))}));
+  }
+  {
+    BudgetGuard guard(512);
+    HashJoin join(Src(std::move(spill_left)), {0}, Src(std::move(spill_right)),
+                  {0}, HashJoinMode::kInMemory, JoinKind::kFullOuter, 2, 2, 2);
+    join.SetJoinAnnotations({true}, Expression());
+    const std::vector<Row> output = Drain(&join);
+    EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+    ASSERT_EQ(output.size(), 916U);
+    for (const Row& row : output) {
+      EXPECT_EQ(row[0], row[2]);
+      EXPECT_EQ(row[1], row[3]);
+    }
   }
 }
 
@@ -1508,6 +1834,28 @@ TEST(SharedBuildParallelHashJoinTest, NullAwareAntiDropsAllOnNullBuildKey) {
   EXPECT_EQ(Drain(&join2).size(), 40U);
 }
 
+// A join key wider than the fixed-width int-key path must not be truncated:
+// clamping the width to four parts made (1,1,1,1,1) and (1,1,1,1,2) hash and
+// compare equal, so a five-column equi-join returned a false match.
+TEST(SharedBuildParallelHashJoinTest, WideKeyNeverTruncatesBelowFifthColumn) {
+  const Row left({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{1}),
+                  Value(int64_t{1}), Value(int64_t{1})});
+  const Row right({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{1}),
+                   Value(int64_t{1}), Value(int64_t{2})});
+  const std::vector<Row> left_rows{left};
+  const std::vector<Row> right_rows{right};
+  SharedBuildParallelHashJoin join(Src(left_rows), {0, 1, 2, 3, 4},
+                                   Src(right_rows), {0, 1, 2, 3, 4}, 2,
+                                   JoinKind::kInner, 1);
+  EXPECT_TRUE(Drain(&join).empty());
+
+  // The exact five-column match still has to be found on the byte-key path.
+  SharedBuildParallelHashJoin matching(Src(left_rows), {0, 1, 2, 3, 4},
+                                       Src(std::vector<Row>{left}),
+                                       {0, 1, 2, 3, 4}, 2, JoinKind::kInner, 1);
+  EXPECT_EQ(Drain(&matching).size(), 1U);
+}
+
 TEST(SharedBuildParallelHashJoinTest, BatchPathAndFailurePropagation) {
   {
     std::vector<Row> left_rows;
@@ -1522,6 +1870,11 @@ TEST(SharedBuildParallelHashJoinTest, BatchPathAndFailurePropagation) {
     size_t total = 0;
     for (;;) {
       const size_t got = join.NextBatch(&chunk, 7);
+      // The ExecutorBase contract is "fill the destination from scratch".
+      // A caller that reuses one DataChunk (Selection does) trusts
+      // chunk.Size(); appending to the previous batch would re-emit rows and
+      // blow past max_rows.
+      EXPECT_EQ(chunk.Size(), got);
       if (got == 0) {
         break;
       }
@@ -1553,149 +1906,6 @@ TEST(SharedBuildParallelHashJoinTest, BatchPathAndFailurePropagation) {
     EXPECT_NE(join.GetStatus(), Status::kSuccess);
   }
 }
-
-// ===========================================================================
-// ExchangeExecutor: routing, gather, lazy materialization, errors.
-// ===========================================================================
-
-TEST(ExchangeExecutorTest, HashExchangeRoutesNullSafeAndGathersBack) {
-  std::vector<Row> rows;
-  rows.push_back(Row({Value()}));
-  for (int64_t i = 0; i < 20; ++i) {
-    rows.push_back(IRow(i));
-  }
-  auto exchange = std::make_shared<ExchangeExecutor>(
-      Src(rows), ExchangeType::kHash, 4, std::vector<slot_t>{0});
-  EXPECT_FALSE(exchange->IsMaterialized());
-  std::vector<Row> collected;
-  for (size_t p = 0; p < exchange->PartitionCount(); ++p) {
-    Executor part = exchange->GetPartitionExecutor(p);
-    for (const Row& row : Drain(part.get())) {
-      collected.push_back(row);
-    }
-  }
-  EXPECT_TRUE(exchange->IsMaterialized());
-  ASSERT_EQ(collected.size(), rows.size());
-  EXPECT_EQ(exchange->MaterializedRowCount(), rows.size());
-  // Every input row came back exactly once (order may differ).
-  ExpectSameMultiset(collected, rows);
-}
-
-TEST(ExchangeExecutorTest, BroadcastCopiesEveryRowToEveryPartition) {
-  auto exchange = std::make_shared<ExchangeExecutor>(
-      Src({IRow(1), IRow(2), IRow(3)}), ExchangeType::kBroadcast, 3);
-  exchange->MaterializePipeline();
-  for (size_t p = 0; p < 3; ++p) {
-    EXPECT_EQ(exchange->GetPartitionRows(p).size(), 3U);
-  }
-  EXPECT_EQ(exchange->MaterializedRowCount(), 9U);
-  EXPECT_GT(exchange->MaterializedBytes(), 0U);
-}
-
-TEST(ExchangeExecutorTest, RangeExchangeRoutesByBounds) {
-  std::vector<Row> rows;
-  rows.reserve(36);
-  for (int64_t i = 0; i < 36; ++i) {
-    rows.push_back(IRow(i));
-  }
-  auto exchange = std::make_shared<ExchangeExecutor>(
-      Src(rows), ExchangeType::kRange, 4, std::vector<slot_t>{0},
-      std::vector<Value>{Value(int64_t{10}), Value(int64_t{20}),
-                         Value(int64_t{30})});
-  exchange->MaterializePipeline();
-  // Keys < 10 -> 0, < 20 -> 1, < 30 -> 2, else 3.
-  EXPECT_EQ(exchange->GetPartitionRows(0).size(), 10U);
-  EXPECT_EQ(exchange->GetPartitionRows(1).size(), 10U);
-  EXPECT_EQ(exchange->GetPartitionRows(2).size(), 10U);
-  EXPECT_EQ(exchange->GetPartitionRows(3).size(), 6U);
-
-  // NULL keys route to the first partition.
-  auto null_exchange = std::make_shared<ExchangeExecutor>(
-      Src(std::vector<Row>{Row({Value()}), IRow(5)}), ExchangeType::kRange, 2,
-      std::vector<slot_t>{0}, std::vector<Value>{Value(int64_t{10})});
-  null_exchange->MaterializePipeline();
-  EXPECT_EQ(null_exchange->GetPartitionRows(0).size(), 2U);
-}
-
-TEST(ExchangeExecutorTest, RangeExchangeSkipsIncomparableBounds) {
-  // An INT64 key against a STRING bound cannot be ordered; the router skips
-  // the bound instead of throwing across the partition boundary, then clamps
-  // to the last partition.
-  auto exchange = std::make_shared<ExchangeExecutor>(
-      Src({IRow(5)}), ExchangeType::kRange, 2, std::vector<slot_t>{0},
-      std::vector<Value>{Value("zzz")});
-  exchange->MaterializePipeline();
-  EXPECT_EQ(exchange->GetPartitionRows(0).size(), 0U);
-  EXPECT_EQ(exchange->GetPartitionRows(1).size(), 1U);
-}
-
-TEST(ExchangeExecutorTest, GatherNextAndBatchDrainAcrossPartitions) {
-  std::vector<Row> rows;
-  rows.reserve(10);
-  for (int64_t i = 0; i < 10; ++i) {
-    rows.push_back(IRow(i));
-  }
-  auto exchange = std::make_shared<ExchangeExecutor>(
-      Src(rows), ExchangeType::kHash, 3, std::vector<slot_t>{0});
-  // Lazy materialization: Next() itself triggers distribution.
-  std::vector<Row> gathered;
-  Row row;
-  RowPosition rp;
-  while (exchange->Next(&row, &rp)) {
-    gathered.push_back(row);
-    row = Row();
-  }
-  ExpectSameMultiset(gathered, rows);
-  // Exhausted gather stays exhausted.
-  EXPECT_FALSE(exchange->Next(&row, nullptr));
-
-  // Batch path resets the reused chunk.
-  const Schema schema("t", {Column("x", ValueType::kInt64)});
-  DataChunk chunk(schema, 8);
-  auto exchange2 =
-      std::make_shared<ExchangeExecutor>(Src(rows), ExchangeType::kGather, 1);
-  size_t total = 0;
-  for (;;) {
-    const size_t got = exchange2->NextBatch(&chunk, 4);
-    if (got == 0) {
-      break;
-    }
-    total += got;
-    EXPECT_EQ(chunk.Size(), got);
-  }
-  EXPECT_EQ(total, 10U);
-}
-
-TEST(ExchangeExecutorTest, ChildErrorSurfacesAsStickyStatus) {
-  auto gather = std::make_shared<ExchangeExecutor>(
-      std::make_shared<FailingSource>(), ExchangeType::kGather, 1);
-  Row row;
-  EXPECT_FALSE(gather->Next(&row, nullptr));
-  EXPECT_NE(gather->GetStatus(), Status::kSuccess);
-
-  auto hash = std::make_shared<ExchangeExecutor>(
-      std::make_shared<FailingSource>(), ExchangeType::kHash, 2,
-      std::vector<slot_t>{0});
-  Executor partition = hash->GetPartitionExecutor(0);
-  EXPECT_FALSE(partition->Next(&row, nullptr));
-  EXPECT_NE(partition->GetStatus(), Status::kSuccess);
-}
-
-TEST(ExchangeExecutorTest, DumpShowsTypeAndPartitionCount) {
-  auto exchange = std::make_shared<ExchangeExecutor>(
-      Src({IRow(1)}), ExchangeType::kBroadcast, 2);
-  std::stringstream ss;
-  exchange->Dump(ss, 0);
-  EXPECT_NE(ss.str().find("ExchangeExecutor"), std::string::npos);
-  EXPECT_NE(ss.str().find("partitions=2"), std::string::npos);
-  std::stringstream ss2;
-  exchange->Explain(ss2, 0);
-  EXPECT_EQ(ss.str(), ss2.str());
-}
-
-// ===========================================================================
-// SetOperationExecutor direct construction (spill + coercion paths).
-// ===========================================================================
 
 TEST(SetOperationExecutorTest, IncompatibleColumnTypesFailSticky) {
   SetOperationExecutor bad({Src({Row({Value::Date("2020-01-01")})}),

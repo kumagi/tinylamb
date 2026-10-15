@@ -1,6 +1,6 @@
 # outer_hash_join
 
-- 状態: done   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: done   /   執筆基準リビジョン: `9ce7837` (2026-09-25)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内の登録 `"outer_hash_join"`（パターンは `cascades::dsl::OuterJoin()`）
 
 ## 概要
@@ -44,24 +44,14 @@ graph TD
 1. **子式数の制約**: 入力関係が左右 2 つであること。
 2. **行位置要求の排除**: `PhysicalProperties` に行位置要求（`require_row_position`）が含まれないこと。外部結合で生成される NULL パディング行は物理ストレージ上のタプル位置を持たないため、行位置の保証は不可能です。
 3. **等値キー対の存在**: 述語 `logical.predicate` から 1 組以上の等値結合キー対を抽出できること。
-4. **残余述語の完全不在**: 非 inner 結合（外部結合を含む）において、等値条件以外の残余述語（residual predicate）が存在する場合は代替候補の生成を拒絶します。
-
-```cpp
-  // A semi/anti hash join emits only the probe side. A residual predicate
-  // mentioning the build side cannot be evaluated after that reduction, so
-  // leave such shapes for the existing relational fallback until a
-  // residual-aware mark join is available.
-  if (kind != JoinAlternativeKind::kInner && residual) {
-    return {};
-  }
-```
+4. **残余述语的扱い**: 外部結合の等値条件以外の残余述語は候補から除去せず、join node 内で候補ごとに評価します。候補が全て FALSE/NULL のとき、match として記録せず、preserved side を NULL pad します。semi/anti の残余は probe side だけで評価できないため従来どおり候補を生成しません。
 
 ## 意味論的根拠と物理実行の契約
 
-### 1. NULL パディング行の例外保護と残余述語の排除
+### 1. NULL パディング行の例外保護と残余述語の評価
 外部結合の意味論の核心は、結合条件を満たさない行を相手側 NULL で補完して出力することにあります。
 
-もし残余述語を含む外部結合に対し、ハッシュ結合ノードの上位へ `SelectionPlan` を配置して残余述語を事後評価した場合、相手側が NULL パディングされた行は述語評価で偽または UNKNOWN（NULL）となり、すべて除外されてしまいます。これにより外部結合が事実上内部結合へと縮退し、重大な意味論の破綻を招きます。したがって、残余述語が存在する外部結合は本 Rule から除外され、プランノード内でペアごとに残余述語を評価する `outer_nested_loop` または `batch_nested_loop_outer` に委ねられます。
+残余述語を hash join の上位 `SelectionPlan` で評価すると、述語が FALSE/UNKNOWN になった一致候補が削除され、match として記録される前に NULL pad が失われます。実装は残余述語を `HashJoin` へ渡し、key が一致した各候補について述語を評価してから `matched_right` と出力を更新します。候補が一つも成立しない preserved row は、その(right/left)側を NULL で補完して出力します。
 
 ### 2. 物理行位置（RowPosition）の喪失
 外部結合により補完生成されたタプルは、ページ内の実レコードではなく実行時に合成された揮発的値です。`UPDATE ... WHERE CURRENT OF` などのカーソル位置保証が要求されるコンテキストでは適用できません。
@@ -73,7 +63,7 @@ graph TD
 ```cpp
           std::vector<PlanAlternative> alternatives = JoinAlternatives(
               memo, logical.children[1], logical.predicate, children[0],
-              children[1], context, true, false, false, kind);
+              children[1], context, true, false, false, kind, true);
           std::vector<PlanAlternative> merge =
               MergeJoinAlternative(memo, logical.children[1], logical.predicate,
                                    children[0], children[1], context, kind);
@@ -85,6 +75,7 @@ graph TD
 
 - **ハッシュ外部結合代替**:
   - `ProductPlan` に `LeftOuterJoinKind()`、`RightOuterJoinKind()`、または `FullOuterJoinKind()` を設定します。
+  - 外部結合の残余 ON 述語は `ProductPlan` に保持し、`HashJoin` が候補ごとに評価します。
   - インメモリ（`kInMemory`）およびハイブリッド（`kHybrid`）の 2 系統が生成されます。
   - 局所コストは `l_rows + r_rows` を基本とし、ハイブリッド優先判定時はインメモリ側に `r_rows * 3` のスピルペナルティが加算されます。
   - ハッシュ結合の推定行数は下限保証として `std::max(l_rows, r_rows)` を採用します。
@@ -107,6 +98,9 @@ graph TD
 
 - `plan/optimizer_test.cpp`:
   - `OptimizerTest.OuterJoinRuleAddsMergeJoinAlternative`: 本 Rule が外部結合に対してマージ結合代替を追加することを検証。
+  - `OptimizerTest.OuterHashResidualPadsWhenAllKeyMatchesFail`: key 一致候補が全て残余述語 FALSE でも hash outer join が preserved row を pad することを検証。
+- `executor/executor_feature_test.cpp`:
+  - `HashJoinOuterTest.NonRejectingResidualPadsEveryOuterKind`: LEFT/RIGHT/FULL、NULL key、重複 key、空入力、残余 NULL/ERROR を検証。
 - `plan/cascades_test.cpp`:
   - `CascadesTest.OuterNestedLoopPlansNonEquiLeftJoin`: 非等値 LEFT 結合において `outer_hash_join` が除外され、正しくネステッドループが選択される責務分担を検証。
 - `plan/plan_test.cpp`:

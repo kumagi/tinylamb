@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #ifndef TINYLAMB_DISTINCT_EXECUTOR_HPP
 #define TINYLAMB_DISTINCT_EXECUTOR_HPP
+#include <unordered_set>
 #include <vector>
 
 #include "executor/executor_base.hpp"
@@ -9,6 +10,14 @@
 #include "type/schema.hpp"
 
 namespace tinylamb {
+
+struct DistinctRowEqual {
+  bool operator()(const Row& left, const Row& right) const;
+};
+
+using DistinctRowSet =
+    std::unordered_set<Row, std::hash<Row>, DistinctRowEqual>;
+
 class DistinctExecutor : public ExecutorBase {
  public:
   explicit DistinctExecutor(Executor source, Schema schema = {},
@@ -23,8 +32,8 @@ class DistinctExecutor : public ExecutorBase {
   Executor source_;
   Schema schema_;
   std::vector<Expression> distinct_on_;
-  std::vector<Row> seen_;
-  std::vector<std::vector<Value>> seen_keys_;
+  DistinctRowSet seen_;
+  DistinctRowSet seen_keys_;
 };
 
 class SortDistinctExecutor final : public ExecutorBase {

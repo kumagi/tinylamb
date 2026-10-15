@@ -125,15 +125,8 @@ HAVING(集約条件)は上に残ります。SQL フロントエンドが
 
 ## 関連 Rule との相互作用
 
-- `having_to_filter_rewrite`: Aggregation が述語を自分の payload として
-  持つ形を「集約 + 上位 Selection 」の形にする Rule。この Rule の
-  上流で発火すると、本 Rule が押し込める形になります。
 - `push_selection_through_projection`: 同じ `RewriteThroughOutputs` を
   使う出力名の張り替え。
-- `group_by_functional_dependency_reduction`: GROUP BY キーの縮約。本
-  Rule で押し込まれた述語が参照するキーが縮約の影響を受ける点に注意が
-  要ります(コード上の自動追従ではなく、等価な代替としてメモに並ぶ形での
-  相互作用です)。
 
 ## 検証テスト
 

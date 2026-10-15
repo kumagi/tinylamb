@@ -23,167 +23,46 @@ flowchart TB
 
 第 1 段階の `Explore` が探索空間（等価式の候補群）を生成し、第 2 段階の `OptimizeGroup` がその中から具体的な物理実行計画を導出します。
 
-## 40-2. `Explore` — ワークリストによる規則の飽和適用
+## 40-2. 子の変化を親に伝える探索
 
-`SearchEngine::Explore` の処理本体は以下のとおりです（`plan/cascades.cpp`）。
+2026-10-02 更新（`9ce7837` 上の作業ツリー）。対応シンボルは
+`plan/cascades.cpp` の `SearchEngine::Explore` / `ExploreGroup` です。
 
-```cpp
-void SearchEngine::Explore(GroupId root) {
-  best_.clear();
-  next_expression_.clear();
-  steps_ = 0;
-  budget_exhausted_ = false;
-  std::deque<GroupId> queue;
-  std::unordered_set<GroupId> queued;
-  const std::function<void(GroupId)> enqueue = [&](GroupId group) {
-    if (group == kInvalidGroup) {
-      return;
-    }
-    if (queued.insert(group).second) {
-      queue.push_back(group);
-    }
-  };
-  enqueue(root);
-  size_t steps = 0;
-  constexpr size_t kMaxExploreSteps = 20000;
-  while (!queue.empty() && steps < kMaxExploreSteps) {
-    ++steps;
-    const GroupId group = queue.front();
-    queue.pop_front();
-    ExploreGroup(group, enqueue);
-    for (GroupId touched : memo_.DrainTouchedGroups()) {
-      enqueue(touched);
-    }
-  }
-}
+次は簡略化した疑似コードです。実装引用ではありません。
+
+```text
+reachable children を先に、parent を後に queue へ入れる
+while queue が空でなく予算が残る:
+    group の未処理 expression に rule を適用する
+    touched group を queue へ戻す
+    touched group に依存する既処理 parent の cursor を 0 に戻して enqueue
 ```
 
-この処理は幅優先探索（BFS）型のワークリストとして動作します。
+自分に新しい式が追加された Group は続きから処理します。一方、子が変わった親は
+既存の式も再照合します。Selection(Projection(X)) のようなパターンは、親の式自体が
+増えなくても、子に Projection が追加された時点で新しく成立するからです。
+以前の「既知の式は読み直さない」方式ではこの機会を落としていました。
+scan filter の変更も touched 通知を発行します。式数、探索ステップ、worklist 回数の
+上限を維持し、循環する同値変換が無制限に探索を延ばすことを防ぎます。
 
-- **重複キューイングの抑止**: `queued` 集合を用いて、同じ Group がキューへ重複して追加されるのを防ぎます。Memo は既存の式を変更せず、新しい式だけを追記します。
-- **派生更新の追跡**: `Memo::AddExpression` は式が追加されたグループを `touched_groups_` に記録します。`ExploreGroup` の完了ごとに `DrainTouchedGroups()` でこれらを回収してキューへ再投入することで、新しく生成された式に対する規則適用を順次進める。
-- **探索回数の安全上限**: 論理規則の適用予算（`search_step_budget`）とは別に、ループ自体の安全弁として `kMaxExploreSteps = 20000` の上限が設けられています。
+## 40-3. コストと順序の要求
 
-各グループの探索処理は `ExploreGroup` が担います（`plan/cascades.cpp`）。
+`OptimizeGroup` は `(GroupId, PhysicalProperties::Key())` をキャッシュキーとします。
+処理中のキー集合も持ち、自分の未確定 winner を要求する循環候補は辞退します。
 
-```cpp
-void SearchEngine::ExploreGroup(GroupId group,
-                                const std::function<void(GroupId)>& enqueue) {
-  size_t& next = next_expression_[group];
-  while (next < memo_.Get(group).expressions.size()) {
-    const LogicalExpression expression = memo_.Get(group).expressions[next];
-    ++next;
-    for (const Rule& rule : rules_->Rules()) {
-      if (!rule.MayApply(expression.operation)) {
-        continue;
-      }
-      if (step_budget_ != 0 && steps_ >= step_budget_) {
-        budget_exhausted_ = true;
-        return;
-      }
-      ++steps_;
-      try {
-        if (rule.Apply(memo_, group, expression)) {
-          applied_rules_.insert(rule.Name());
-        }
-      } catch (const std::invalid_argument&) {
-        continue;
-      }
-    }
-    for (GroupId child : expression.children) {
-      enqueue(child);
-    }
-  }
-}
-```
+候補の実コストは子の実コストと local_cost の和です。順序が不足する候補には
+選択用スコアとして sort 罰則を加えますが、その罰則を `BestPlan::cost` に入れません。
+親が実際に sort を追加するとき、まだ存在しない sort を二重計上しないためです。
+枝刈りは子のコストが incumbent の選択スコアを超えるときに行います。
 
-Group ごとに、次に読む式の位置 `next`（`next_expression_[group]`）を
-記録します。式が追加された後に同じ Group を再び処理しても、探索は未評価の式から
-再開するため、既知の式を読み直しません。
+Aggregation と Sort は、通常の子の要求に加え、キー順を指定した子も比較します。
+これにより若干高い ordered scan と stream aggregate の組み合わせも候補になります。
+Empty は子のスキーマだけを利用するので子の実行コストは 0 として扱います。
 
-## 40-3. `OptimizeGroup` — メモ化再帰と分枝限定法
-
-第 2 段階の `OptimizeGroup` は、指定された物理要求を満たす最良の物理プランを再帰的に決定します（`plan/cascades.cpp`）。
-
-```cpp
-std::optional<BestPlan>
-SearchEngine::OptimizeGroup(
-    GroupId group, const PhysicalProperties& properties,
-    const Implement& implement, const RuleContext& context) {
-  const std::string cache_key = std::to_string(group) + '/' + properties.Key();
-  if (const auto found = best_.find(cache_key); found != best_.end()) {
-    return found->second;
-  }
-
-  const bool needs_ordering = !properties.ordering.empty() &&
-                              context.query != nullptr &&
-                              !context.query->order_expressions_.empty();
-  std::optional<BestPlan> best;
-  const Group& memo_group = memo_.Get(group);
-  for (size_t index = 0; index < memo_group.expressions.size(); ++index) {
-    const LogicalExpression& expression = memo_group.expressions[index];
-    const std::vector<PhysicalProperties> child_properties =
-        RequiredChildProperties(expression, properties);
-    if (child_properties.size() != expression.children.size()) {
-      continue;
-    }
-    std::vector<BestPlan> children;
-    double child_cost = 0;
-    double child_rows = 0;
-    bool valid = true;
-    for (size_t child = 0; child < expression.children.size(); ++child) {
-      std::optional<BestPlan> child_plan =
-          OptimizeGroup(expression.children[child], child_properties[child],
-                        implement, context);
-      if (!child_plan) {
-        valid = false;
-        break;
-      }
-      child_cost += child_plan->cost;
-      child_rows += child_plan->estimated_rows;
-      children.push_back(std::move(*child_plan));
-    }
-    if (!valid) {
-      continue;
-    }
-
-    if (best && child_cost >= best->cost) {
-      continue;
-    }
-
-    for (PlanAlternative alternative :
-         implement(group, memo_, expression, children, properties, context)) {
-      if (!alternative.plan) {
-        continue;
-      }
-      double cost = child_cost + alternative.local_cost;
-      if (needs_ordering &&
-          !alternative.plan->IsOrderedBy(context.query->order_expressions_,
-                                         context.query->order_ascending_,
-                                         context.query->order_nulls_first_)) {
-        const double rows = std::max(alternative.estimated_rows, child_rows);
-        cost += rows * std::log2(std::max(2.0, rows));
-      }
-      if (!best || cost < best->cost) {
-        best = BestPlan{.plan = std::move(alternative.plan),
-                        .cost = cost,
-                        .estimated_rows = alternative.estimated_rows,
-                        .group = group,
-                        .expression_index = index};
-      }
-    }
-  }
-  best_.emplace(cache_key, best);
-  return best;
-}
-```
-
-この処理における設計上の重要事項は以下のとおりです。
-
-1. **(Group, 物理要求) を単位とするメモ化**: キャッシュキーはグループ番号と物理要求キーの組（`group/properties.Key()`）で構成されます。同じ関係集合であっても、ソート順を要求する場合と要求しない場合とで異なる最適解が導出・保持されます。
-2. **分枝限定法（Branch-and-Bound）による枝刈り**: 各候補の総コストは「子ノードの累積コスト ＋ 自ノードの局所コスト（＋ 整列ペナルティ）」です。局所コストとペナルティは非負なので、`child_cost` だけで暫定最小値 `best->cost` 以上なら、その候補は最小値を更新できません。この時点で後続の物理化を打ち切ります。
-3. **物理要求のコスト評価（D6 規律）**: 要求された整列順序を自然に出力できない物理計画に対しては、後段で必要となるソート処理の推定コスト $N \log_2 N$ をペナルティとして加算します。これにより、インデックス走査によって整列順を無償で提供する計画と、全表走査にソート演算子を追加する計画とを、同一のコスト基準で比較できます。
-4. **失敗結果のキャッシュ**: 要求を満たす実行計画が存在しない場合、`std::nullopt` がキャッシュされます。同一の (Group, 物理要求) に対する不要な再帰探索を防ぎます。
+統計の入口は `ColumnStats::EstimateJoinMatches` と
+`TableStatistics::EstimateDistinctRows` です。前者は MCV / NULL / NDV と範囲、
+後者は NULL を含む NDV の指数バックオフを使用します。統計による推定は意味論的な
+空集合・一意性の証明に使いません。詳細は [監査](../../optimizer_rule_audit.md) を参照してください。
 
 ## 40-4. 物理演算子の局所コスト算出例
 

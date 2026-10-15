@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -63,10 +64,7 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
   // serial AggregateAccumulator stays the reference for these shapes.
   for (const NamedExpression& named : aggregates_) {
     const auto& aggregate = named.expression->AsAggregateExpression();
-    const AggregationType type = aggregate.GetType();
-    if (aggregate.Distinct() && (type == AggregationType::kCovarSamp ||
-                                 type == AggregationType::kCovarPop ||
-                                 type == AggregationType::kCorr)) {
+    if (aggregate.Distinct() && IsTwoInputStatAggregate(aggregate.GetType())) {
       worker_count_ = 1;
       break;
     }
@@ -94,10 +92,7 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
       const auto& trailing_args = aggregate.TrailingArgs();
-      const bool two_input =
-          aggregate.GetType() == AggregationType::kCovarSamp ||
-          aggregate.GetType() == AggregationType::kCovarPop ||
-          aggregate.GetType() == AggregationType::kCorr;
+      const bool two_input = IsTwoInputStatAggregate(aggregate.GetType());
       int trailing_offset = -1;
       if (two_input && trailing_args.size() == 1 && trailing_args[0] &&
           trailing_args[0]->Type() == TypeTag::kColumnValue) {
@@ -704,9 +699,7 @@ Status ParallelAggregationExecutor::AccumulateStatValue(
   const AggregationType type = aggregates_[aggregate_index]
                                    .expression->AsAggregateExpression()
                                    .GetType();
-  const bool two_input = type == AggregationType::kCovarSamp ||
-                         type == AggregationType::kCovarPop ||
-                         type == AggregationType::kCorr;
+  const bool two_input = IsTwoInputStatAggregate(type);
   Value other;
   if (two_input) {
     if (trailing_values.empty()) {
@@ -931,6 +924,56 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
       const long double vy = syy - (count * my * my);
       return Value(static_cast<double>(sdd / std::sqrt(vx * vy)));
     }
+    case AggregationType::kRegrCount:
+      return Value(count);
+    case AggregationType::kRegrSlope:
+    case AggregationType::kRegrIntercept:
+    case AggregationType::kRegrR2:
+    case AggregationType::kRegrAvgX:
+    case AggregationType::kRegrAvgY:
+    case AggregationType::kRegrSxx:
+    case AggregationType::kRegrSyy:
+    case AggregationType::kRegrSxy: {
+      if (count == 0) {
+        return {};
+      }
+      // x is the trailing argument, y the child: Σx lives in sx.
+      const long double mx = sx / count;
+      const long double my = sy / count;
+      const long double reg_sxy = sxy - (count * mx * my);
+      const long double reg_sxx = sxx - (count * mx * mx);
+      const long double reg_syy = syy - (count * my * my);
+      switch (type) {
+        case AggregationType::kRegrAvgX:
+          return Value(static_cast<double>(mx));
+        case AggregationType::kRegrAvgY:
+          return Value(static_cast<double>(my));
+        case AggregationType::kRegrSxx:
+          return Value(static_cast<double>(reg_sxx));
+        case AggregationType::kRegrSyy:
+          return Value(static_cast<double>(reg_syy));
+        case AggregationType::kRegrSxy:
+          return Value(static_cast<double>(reg_sxy));
+        case AggregationType::kRegrSlope:
+          if (count < 2 || reg_sxx <= 0) {
+            return {};
+          }
+          return Value(static_cast<double>(reg_sxy / reg_sxx));
+        case AggregationType::kRegrIntercept:
+          if (count < 2 || reg_sxx <= 0) {
+            return {};
+          }
+          return Value(static_cast<double>(my - ((reg_sxy / reg_sxx) * mx)));
+        case AggregationType::kRegrR2:
+          if (count < 2 || reg_sxx <= 0 || reg_syy <= 0) {
+            return {};
+          }
+          return Value(
+              static_cast<double>((reg_sxy * reg_sxy) / (reg_sxx * reg_syy)));
+        default:
+          return {};
+      }
+    }
     default:
       return {};
   }
@@ -972,11 +1015,31 @@ bool ParallelAggregationExecutor::Next(Row* destination,
   }
 
   std::mutex input_mutex;
+  std::condition_variable turn_cv;
+  // Turn-taking under input_mutex: worker w accumulates batches w, w+W, ... .
+  // The per-worker partial states are then a deterministic function of the
+  // child's batch sequence, so the worker-order Merge below is too — a
+  // DOUBLE sum can no longer depend on which worker won a mutex race.
+  // Stop/exhaustion flags are written under input_mutex so a waiter blocked
+  // on the turn predicate can never miss the wakeup.
+  size_t turn = 0;
+  bool input_exhausted = false;
+  bool stopped = false;
   std::mutex error_mutex;
   Status error = Status::kSuccess;
-  std::atomic<bool> stopped{false};
   std::vector<std::jthread> workers;
   workers.reserve(worker_count_);
+  const auto stop_under_lock = [&](Status failure) {
+    {
+      std::scoped_lock input_guard(input_mutex);
+      stopped = true;
+      turn_cv.notify_all();
+    }
+    std::scoped_lock error_guard(error_mutex);
+    if (error == Status::kSuccess) {
+      error = std::move(failure);
+    }
+  };
   for (size_t worker = 0; worker < worker_count_; ++worker) {
     try {
       workers.emplace_back([&, worker] {
@@ -985,43 +1048,41 @@ bool ParallelAggregationExecutor::Next(Row* destination,
         // the Status channel so no exception escapes this executor.
         try {
           DataChunk chunk;
-          while (!stopped.load(std::memory_order_relaxed)) {
+          while (true) {
             size_t rows = 0;
             {
-              std::scoped_lock input_guard(input_mutex);
+              std::unique_lock input_guard(input_mutex);
+              turn_cv.wait(input_guard, [&] {
+                return stopped || input_exhausted || turn == worker;
+              });
+              if (stopped || input_exhausted) {
+                return;
+              }
               rows = child_->NextBatch(&chunk);
-            }
-            if (rows == 0) {
-              break;
+              if (rows == 0) {
+                input_exhausted = true;
+                turn_cv.notify_all();
+                return;
+              }
+              turn = (turn + 1) % worker_count_;
+              turn_cv.notify_all();
             }
             if (Status st = Accumulate(&partials[worker], chunk);
                 st != Status::kSuccess) {
-              stopped.store(true, std::memory_order_relaxed);
-              std::scoped_lock error_guard(error_mutex);
-              if (error == Status::kSuccess) {
-                error = st;
-              }
+              stop_under_lock(st);
               return;
             }
           }
         } catch (const std::exception& ex) {
-          stopped.store(true, std::memory_order_relaxed);
-          std::scoped_lock error_guard(error_mutex);
-          if (error == Status::kSuccess) {
-            error = StatusError(StatusCode::kRuntimeError, ex.what());
-          }
+          stop_under_lock(StatusError(StatusCode::kRuntimeError, ex.what()));
         }
       });
     } catch (const std::exception& ex) {
-      stopped.store(true, std::memory_order_relaxed);
-      std::scoped_lock error_guard(error_mutex);
-      error = StatusError(StatusCode::kRuntimeError, ex.what());
+      stop_under_lock(StatusError(StatusCode::kRuntimeError, ex.what()));
       break;
     } catch (...) {
-      stopped.store(true, std::memory_order_relaxed);
-      std::scoped_lock error_guard(error_mutex);
-      error = StatusError(StatusCode::kRuntimeError,
-                          "failed to start aggregation worker");
+      stop_under_lock(StatusError(StatusCode::kRuntimeError,
+                                  "failed to start aggregation worker"));
       break;
     }
   }

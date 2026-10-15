@@ -90,6 +90,17 @@
 
 namespace tinylamb {
 
+namespace detail {
+// Cold path of StatusOr value access. Outlined so the hot check in
+// Value()/MoveValue() stays one predictable branch that inlines everywhere;
+// the LOG(FATAL) machinery would otherwise keep the whole accessor out of
+// line on the row-decode hot path.
+inline __attribute__((noreturn)) void StatusOrNoValue(const Status& status) {
+  LOG(FATAL) << "StatusOr has no value: " << status;
+  std::abort();
+}
+}  // namespace detail
+
 // A struct which could have value only when the status is success.
 template <typename T>
 class StatusOr {
@@ -114,8 +125,7 @@ class StatusOr {
   // StatusOr is a contract violation and aborts (no exceptions).
   T& Value() {
     if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
-      LOG(FATAL) << "StatusOr has no value: " << status_;
-      std::abort();
+      detail::StatusOrNoValue(status_);
     }
     return *value_;
   }
@@ -123,16 +133,14 @@ class StatusOr {
   // Value()) on the same object aborts.
   T&& MoveValue() {
     if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
-      LOG(FATAL) << "StatusOr has no value: " << status_;
-      std::abort();
+      detail::StatusOrNoValue(status_);
     }
     status_ = Status::kUnknown;
     return std::move(*value_);
   }
   [[nodiscard]] const T& Value() const {
     if (UNLIKELY(status_ != Status::kSuccess || !value_.has_value())) {
-      LOG(FATAL) << "StatusOr has no value: " << status_;
-      std::abort();
+      detail::StatusOrNoValue(status_);
     }
     return *value_;
   }

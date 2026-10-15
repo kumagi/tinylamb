@@ -116,7 +116,7 @@ std::string SetOperationPlan::ToString() const {
 
 - `union`: 重複排除を行う set 和集合の実装 Rule。順序付きマージ連結経路は持たず、ハッシュ重複排除を実行します。
 - `union_all_merge`: ネストした複数の `kUnionAll` ノードを 1 つの多項 `kUnionAll` へと平坦化する論理 Rule。
-- `push_limit_through_union_all` / `union_all_push_limit`: LIMIT を `UNION ALL` の各子枝へ押し込んで早期打ち切りを可能にする論理 Rule。
+- `union_all_push_limit` / `union_all_push_limit`: LIMIT を `UNION ALL` の各子枝へ押し込んで早期打ち切りを可能にする論理 Rule。
 - `sort`: 各子枝の整序が必要な場合に挿入されるソートノード。
 
 ## 検証テスト

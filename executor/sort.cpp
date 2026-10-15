@@ -31,6 +31,7 @@
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -41,7 +42,6 @@ namespace {
 
 using PositionedRow = std::pair<Row, RowPosition>;
 
-constexpr size_t kMergeWindowRows = 128;
 constexpr size_t kParallelSortMinRows = 4096;
 
 uint64_t BSwap64(uint64_t v) { return __builtin_bswap64(v); }
@@ -148,6 +148,7 @@ class SortKeyEncoder {
       // SortExecutor always placed NULLs first for ASC (last for DESC) and
       // disagreed with TopNExecutor on the same ORDER BY.
       spec.nulls_first = key.nulls_first.value_or(key.ascending);
+      spec.collation = key.collation;
       if (key.expression->Type() == TypeTag::kColumnValue) {
         const int offset =
             schema.Offset(key.expression->AsColumnValue().GetColumnName());
@@ -187,6 +188,7 @@ class SortKeyEncoder {
                      Status* error = nullptr) const {
     for (const Spec& spec : specs_) {
       Value evaluated;
+      Value folded;
       const Value* v = nullptr;
       if (spec.column >= 0) {
         v = &row.values_[static_cast<size_t>(spec.column)];
@@ -201,6 +203,18 @@ class SortKeyEncoder {
           evaluated = res.MoveValue();
         }
         v = &evaluated;
+      }
+      // Collation-aware encoding: a case-insensitive key folds its text
+      // before the memcomparable form is written, so byte order *is* the
+      // collation order. Doing it here (not in the comparator) keeps the
+      // in-memory permutation, the spilled runs and the external merge
+      // windows on one encoding — the merge re-evaluates the same key
+      // expression on the row it read back, and a COLLATE tag on the value
+      // survives that round trip even though Row serialization drops it.
+      if (ResolveCollation(spec.collation, CollationOf(*v)) ==
+          Collation::kCaseInsensitive) {
+        folded = ApplyKeyCollation(*v, spec.collation);
+        v = &folded;
       }
       const bool nulls_first = spec.nulls_first;
       if (spec.ascending) {
@@ -236,6 +250,7 @@ class SortKeyEncoder {
     bool nulls_first{true};
     int column{-1};
     bool is_unsigned{false};
+    Collation collation{Collation::kNone};
   };
   const Schema* schema_;
   std::vector<Spec> specs_;
@@ -513,18 +528,38 @@ Status SortExecutor::Materialize() {
   };
 
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+  // The shape's own bound, when the plan gave one. It is checked in addition to
+  // the process budget, never instead of it: the buffered shape may not outgrow
+  // the memory it was planned with, and nothing may outgrow the process.
+  const size_t shape_budget = options_.memory_budget_bytes;
+  size_t buffered_bytes{0};
+  const auto can_hold = [&](size_t bytes) {
+    if (shape_budget != 0 && buffered_bytes + bytes > shape_budget) {
+      return false;
+    }
+    return budget.CanReserve(bytes);
+  };
+  // An external merge shape is expected to spill, so it also bounds its
+  // buffered run by rows. Zero means the memory bound alone decides.
+  const size_t run_rows = options_.spill_mode == SpillMode::kExternalMerge
+                              ? options_.spill_threshold_rows
+                              : 0;
+  const bool always_spill = options_.spill_mode == SpillMode::kExternalMerge;
   QueryMemoryCharge charge;
   Status encode_error{Status::kSuccess};
   Row row;
   RowPosition position;
   while (source_->Next(&row, &position)) {
     const size_t bytes = EstimateRowBytes(row) + sizeof(RowPosition);
-    const bool spill_now = !budget.CanReserve(bytes);
+    const bool spill_now =
+        !can_hold(bytes) || (run_rows != 0 && rows_.size() >= run_rows);
     if (spill_now && !rows_.empty()) {
       RETURN_IF_FAIL(write_sorted_run());
       charge.ReleaseAll();
+      buffered_bytes = 0;
     }
     charge.Add(bytes);
+    buffered_bytes += bytes;
     ordering.AppendRow(row, &encode_error);
     RETURN_IF_FAIL(encode_error);
     rows_.emplace_back(std::move(row), position);
@@ -534,7 +569,7 @@ Status SortExecutor::Materialize() {
     return st;
   }
 
-  if (runs.empty()) {
+  if (runs.empty() && !always_spill) {
     const size_t workers =
         rows_.size() < kParallelSortMinRows
             ? 1
@@ -546,13 +581,19 @@ Status SortExecutor::Materialize() {
       RETURN_IF_FAIL(write_sorted_run());
       charge.ReleaseAll();
     }
+    // How many rows one run keeps decoded while the runs are merged back; the
+    // plan's policy hands it down (see SortMemoryPolicy::merge_window_rows).
+    const size_t window_rows = MergeWindowRows();
 
     struct MergeWindow {
+      explicit MergeWindow(size_t rows_per_window)
+          : window_rows(rows_per_window) {}
       QueryMemoryCharge charge;
       std::vector<PositionedRow> rows;
       std::string keys;
       std::vector<std::pair<uint32_t, uint32_t>> spans;
       size_t index{0};
+      size_t window_rows{0};
 
       bool Fill(const KeyOrdering& ord, RunReader* reader,
                 Status* error = nullptr) {
@@ -562,7 +603,7 @@ Status SortExecutor::Materialize() {
         spans.clear();
         index = 0;
         PositionedRow item;
-        while (rows.size() < kMergeWindowRows && reader->Next(&item)) {
+        while (rows.size() < window_rows && reader->Next(&item)) {
           charge.Add(EstimateRowBytes(item.first) + sizeof(RowPosition));
           const auto begin = static_cast<uint32_t>(keys.size());
           ord.AppendEncodedTo(item.first, &keys, error);
@@ -577,8 +618,9 @@ Status SortExecutor::Materialize() {
       std::unique_ptr<RunReader> reader;
       std::optional<MergeWindow> window;
 
-      bool FillInitial(const KeyOrdering& ord, Status* error) {
-        window.emplace();
+      bool FillInitial(const KeyOrdering& ord, size_t window_rows,
+                       Status* error) {
+        window.emplace(window_rows);
         return window->Fill(ord, reader.get(), error);
       }
       bool Advance(const KeyOrdering& ord, Status* error) {
@@ -600,7 +642,7 @@ Status SortExecutor::Materialize() {
       if (auto st = cursors[i].reader->GetStatus(); st != Status::kSuccess) {
         return st;
       }
-      cursors[i].FillInitial(ordering, &encode_error);
+      cursors[i].FillInitial(ordering, window_rows, &encode_error);
     }
     auto current_key = [&cursors](size_t id) -> std::string_view {
       const MergeWindow& w = *cursors[id].window;
@@ -674,8 +716,15 @@ bool SortExecutor::Next(Row* dst, RowPosition* rp) {
 }
 
 void SortExecutor::Dump(std::ostream& output, int indent) const {
-  output << "ParallelSort (" << worker_count_ << " workers)\n"
-         << std::string(static_cast<size_t>(indent) + 2, ' ');
+  output << "ParallelSort (" << worker_count_
+         << " workers, spill=" << SpillModeLabel(options_.spill_mode);
+  if (options_.memory_budget_bytes != 0) {
+    output << ", budget=" << options_.memory_budget_bytes << "B";
+  }
+  if (options_.spill_threshold_rows != 0) {
+    output << ", run_rows=" << options_.spill_threshold_rows;
+  }
+  output << ")\n" << std::string(static_cast<size_t>(indent) + 2, ' ');
   source_->Dump(output, indent + 2);
 }
 

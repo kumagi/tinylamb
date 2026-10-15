@@ -28,7 +28,7 @@ The query optimization process is a multi-stage process that involves several ke
     -   **Predicate Pushdown**: The optimizer will try to move `SelectionPlan` nodes as far down the plan tree as possible. This reduces the number of rows that need to be processed by higher-level operators, such as joins.
     -   **Join Order Selection**: For queries with multiple joins, the optimizer will explore different join orders to find the one that minimizes the size of the intermediate results.
     -   **Index Selection**: The optimizer will examine the available indexes on the tables and determine if using an index would be more efficient than a full table scan. It will consider both `IndexScanPlan` and `IndexOnlyScanPlan` options.
-    -   **Join Algorithm Selection**: For each join, the optimizer will choose the most appropriate join algorithm (e.g., `HashJoin`, `IndexJoin`) based on the properties of the input data and the available indexes.
+    -   **Join Algorithm Selection**: For each join, the optimizer will choose the most appropriate join algorithm (e.g., `HashJoin`, `LookupJoin`) based on the properties of the input data and the available indexes.
 
 4.  **Physical Plan Generation**: Once the optimizer has chosen the best logical plan, it is converted into a physical execution plan. This is a tree of `Executor` objects, where each executor implements a specific physical algorithm (e.g., `HashJoin`, `IndexScan`). This physical plan is then passed to the execution engine to be executed.
 

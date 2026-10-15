@@ -47,6 +47,21 @@ std::filesystem::path BlobPath(const std::filesystem::path& dir) {
   return dir / "blob.db";
 }
 
+bool IsBlobNumericSegment(const std::string& name) {
+  constexpr std::string_view kPrefix = "blob.db.";
+  if (!name.starts_with(kPrefix) || name.size() == kPrefix.size()) {
+    return false;
+  }
+  std::string suffix = name.substr(kPrefix.size());
+  while (suffix.ends_with(".bad")) {
+    suffix.resize(suffix.size() - 4);
+  }
+  return !suffix.empty() &&
+         std::all_of(suffix.begin(), suffix.end(), [](char c) {
+           return std::isdigit(static_cast<unsigned char>(c)) != 0;
+         });
+}
+
 // D10 (docs/design.md): run files are named "<id>-<blob-high-water>" for
 // flushed runs and "merged-<id>-<blob-high-water>" for merged runs.  The
 // numeric id in a merged file name is a FILE id, not the inherited
@@ -113,9 +128,19 @@ Status LSMTree::RestoreRuns() {
     if (name == "blob.db") {
       continue;
     }
+    if (IsBlobNumericSegment(name) || name == "blob.db.meta" ||
+        name == "blob.db.meta.tmp" || name == "blob.db.migrating" ||
+        name == "blob.db.migrating.tmp") {
+      std::error_code remove_ec;
+      std::filesystem::remove(entry.path(), remove_ec);
+      if (remove_ec) {
+        return StatusError(StatusCode::kIOError,
+                           "failed to remove obsolete blob artifact " + name +
+                               ": " + remove_ec.message());
+      }
+      continue;
+    }
     if (name.ends_with(".meta")) {
-      // WAL segment geometry sidecar of blob.db (Logger::SegmentMetadataPath):
-      // it lives next to the runs but is not one of them.
       continue;
     }
     if (name.ends_with(".pending")) {

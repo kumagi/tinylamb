@@ -71,7 +71,8 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
           // rejected row is rolled back, so nothing is modeled.
           break;
         }
-        ASSIGN_OR_CRASH(RowPosition, pos, rp);
+        ASSIGN_OR_CRASH(  // NOLINT(performance-unnecessary-copy-initialization)
+            RowPosition, pos, rp);
         rows[pos] = new_row;
         break;
       }
@@ -90,7 +91,8 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
       }
       default: {  // Verify the whole model against the table.
         for (const auto& [rp, expected_row] : rows) {
-          ASSIGN_OR_CRASH(Row, read_row, table.Read(ctx.txn_, rp));
+          ASSIGN_OR_CRASH(  // NOLINT(performance-unnecessary-copy-initialization)
+              Row, read_row, table.Read(ctx.txn_, rp));
           assert(expected_row == read_row);
         }
         break;
@@ -99,16 +101,20 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     assert(ctx.txn_.PreCommit() == Status::kSuccess);
     if (stream.Pick(4) == 0) {
       db->EmulateCrash();
+      db.reset();
       auto recovered = Database::Create(db_name).MoveValue();
-      TransactionContext verify_ctx = recovered->BeginContext();
-      ASSIGN_OR_CRASH(Table, verify_table,
-                      recovered->GetTable(verify_ctx, "FuzzerTable"));
-      for (const auto& [rp, expected_row] : rows) {
-        ASSIGN_OR_CRASH(Row, read_row, verify_table.Read(verify_ctx.txn_, rp));
-        assert(expected_row == read_row);
+      {
+        TransactionContext verify_ctx = recovered->BeginContext();
+        ASSIGN_OR_CRASH_CONST(Table, verify_table,
+                              recovered->GetTable(verify_ctx, "FuzzerTable"));
+        for (const auto& [rp, expected_row] : rows) {
+          ASSIGN_OR_CRASH(  // NOLINT(performance-unnecessary-copy-initialization)
+              Row, read_row, verify_table.Read(verify_ctx.txn_, rp));
+          assert(expected_row == read_row);
+        }
+        assert(verify_ctx.txn_.PreCommit() == Status::kSuccess);
       }
-      assert(verify_ctx.txn_.PreCommit() == Status::kSuccess);
-      db->DeleteAll();
+      recovered->DeleteAll();
       return;
     }
   }

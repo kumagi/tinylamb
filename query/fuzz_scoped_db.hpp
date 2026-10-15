@@ -3,12 +3,14 @@
 #ifndef TINYLAMB_FUZZ_SCOPED_DB_HPP
 #define TINYLAMB_FUZZ_SCOPED_DB_HPP
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -28,9 +30,12 @@ class ScopedDb {
  public:
   explicit ScopedDb(std::string_view prefix)
       : name_(std::string(prefix) + "-" + RandomString(8)) {
-    StatusOr<std::unique_ptr<Database>> created = Database::Create(name_);
-    if (created.HasValue()) {
-      db_ = created.MoveValue();
+    if (std::getenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE") ==
+        nullptr) {
+      StatusOr<std::unique_ptr<Database>> created = Database::Create(name_);
+      if (created.HasValue()) {
+        db_ = created.MoveValue();
+      }
     }
   }
 
@@ -46,17 +51,40 @@ class ScopedDb {
     db_.reset();
   }
 
+  void Reset() { db_.reset(); }
+
+  void Cleanup() {
+    if (db_ != nullptr) {
+      db_->DeleteAll();
+      db_.reset();
+      return;
+    }
+    StatusOr<std::unique_ptr<Database>> created = Database::Create(name_);
+    if (created.HasValue()) {
+      created.Value()->DeleteAll();
+    }
+  }
+
   // Emulates a crash mid-session: discard every unflushed pool image and
   // reopen the same database files so recovery (REDO + loser UNDO) runs
   // against exactly what reached the disk.  The old Database must be torn
   // down before Create so no shutdown-time writeback resurrects images
   // that never made it out of the pool.
-  void CrashAndReopen() {
+  bool CrashAndReopen() {
     if (db_ != nullptr) {
       db_->EmulateCrash();
     }
     db_.reset();
-    db_ = Database::Create(name_).MoveValue();
+    StatusOr<std::unique_ptr<Database>> reopened = Database::Create(name_);
+    if (!reopened.HasValue()) {
+      // Recovery diagnostics: a silent false here turns long fuzz sweeps
+      // into "replay crash reopen failed" mysteries.
+      LOG(ERROR) << "ScopedDb::CrashAndReopen: reopen failed: "
+                 << ToString(reopened.GetStatus());
+      return false;
+    }
+    db_ = reopened.MoveValue();
+    return true;
   }
 
   [[nodiscard]] Database* operator->() const { return db_.get(); }

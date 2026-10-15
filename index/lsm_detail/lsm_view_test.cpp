@@ -267,6 +267,7 @@ TEST_F(LSMViewTest, Recover) {
   // Arrange -- destroy the existing view_ and blob_ to emulate a crash+recover
   // scenario
   view_.reset();
+  blob_.reset();
   blob_ = BlobFile::Create(path_ / "blob.db").MoveValue();
   std::vector<SortedRun> idx;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {

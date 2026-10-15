@@ -83,7 +83,7 @@ class hash<tinylamb::FreePage> {
  public:
   uint64_t operator()(const tinylamb::FreePage& p) {
     return 0xf1ee1a4e0000 + std::hash<uint64_t>()(p.next_free_page) +
-           std::hash<uint64_t>()(p.destroyer_) * 31;
+           (std::hash<uint64_t>()(p.destroyer_) * 31);
   }
 };
 

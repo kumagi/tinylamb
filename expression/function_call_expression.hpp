@@ -33,6 +33,10 @@ class EvaluationContext;
 
 std::string UnicodeUpper(std::string_view value);
 std::string UnicodeLower(std::string_view value);
+// Comparison-oriented full case folding (NORMALIZE_AND_CASEFOLD): diverges
+// from lowercase for the sharp-s/final-sigma/micro-sign/ligature entries and
+// falls back to lowercase everywhere else.
+std::string UnicodeCaseFold(std::string_view value);
 std::string UnicodeInitcap(std::string_view value, std::string_view delimiters,
                            bool has_delimiters);
 std::string FormatFloatingForPrintf(double value, char specifier,

@@ -89,6 +89,8 @@ class TableSampleExecutor final : public ExecutorBase {
   Status reservoir_status_{Status::kSuccess};
   std::unordered_map<Row, size_t, PartitionHash, PartitionEqual> partitions_;
   std::vector<PartitionState> partition_states_;
+  // SYSTEM TABLESAMPLE: one include/exclude decision per storage page.
+  std::unordered_map<uint64_t, bool> page_decisions_;
   std::vector<Candidate> output_rows_;
   size_t output_offset_{0};
   DataChunk output_batch_;

@@ -382,6 +382,86 @@ TEST_F(WindowSqlCov, RangeOffsetFramesOnFloatKeys) {
                                              Row({Value(40)})})));
 }
 
+// INTERVAL boundaries turn RANGE frames into calendar-aware rolling windows
+// over DATE keys: day arithmetic for DAY/WEEK, month-end clamping for MONTH.
+TEST_F(WindowSqlCov, RangeIntervalFramesOnDateKeys) {
+  // g=1 date rows: 01-01(v=10), 01-02(20), 01-03(30), 01-04(40), NULL(50).
+  const auto rolling = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT d, SUM(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL 1 DAY "
+      "PRECEDING AND CURRENT ROW) FROM wx WHERE d IS NOT NULL AND g = 1 "
+      "ORDER BY d");
+  ASSERT_TRUE(rolling.HasValue()) << rolling.GetStatus().GetMessage();
+  EXPECT_EQ(rolling.Value(),
+            (std::vector<Row>({Row({Value::Date("2020-01-01"), Value(10)}),
+                               Row({Value::Date("2020-01-02"), Value(30)}),
+                               Row({Value::Date("2020-01-03"), Value(50)}),
+                               Row({Value::Date("2020-01-04"), Value(70)})})));
+
+  // MONTH applies the same calendar arithmetic as DATE - INTERVAL: the
+  // January window reaches back to 2023-12-04, so every row sees the full
+  // group total.
+  const auto monthly = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT d, SUM(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL 1 MONTH "
+      "PRECEDING AND CURRENT ROW) FROM wx WHERE d IS NOT NULL AND g = 1 "
+      "ORDER BY d");
+  ASSERT_TRUE(monthly.HasValue()) << monthly.GetStatus().GetMessage();
+  // Each frame opens at key - 1 month: only 2020-01-04's window (back to
+  // 2023-12-04) reaches the whole group.
+  EXPECT_EQ(monthly.Value(),
+            (std::vector<Row>({Row({Value::Date("2020-01-01"), Value(10)}),
+                               Row({Value::Date("2020-01-02"), Value(30)}),
+                               Row({Value::Date("2020-01-03"), Value(60)}),
+                               Row({Value::Date("2020-01-04"), Value(100)})})));
+
+  // FOLLOWING end bound: the frame closes one calendar day after the key.
+  const auto following = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT d, SUM(v) OVER (ORDER BY d RANGE BETWEEN CURRENT ROW AND "
+      "INTERVAL 1 DAY FOLLOWING) FROM wx WHERE d IS NOT NULL AND g = 1 "
+      "ORDER BY d");
+  ASSERT_TRUE(following.HasValue()) << following.GetStatus().GetMessage();
+  EXPECT_EQ(following.Value(),
+            (std::vector<Row>({Row({Value::Date("2020-01-01"), Value(30)}),
+                               Row({Value::Date("2020-01-02"), Value(50)}),
+                               Row({Value::Date("2020-01-03"), Value(70)}),
+                               Row({Value::Date("2020-01-04"), Value(40)})})));
+
+  // DESC order mirrors the band around the current key.
+  const auto descending = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT d, SUM(v) OVER (ORDER BY d DESC RANGE BETWEEN INTERVAL 1 DAY "
+      "PRECEDING AND CURRENT ROW) FROM wx WHERE d IS NOT NULL AND g = 1 "
+      "ORDER BY d");
+  ASSERT_TRUE(descending.HasValue()) << descending.GetStatus().GetMessage();
+  EXPECT_EQ(descending.Value(),
+            (std::vector<Row>({Row({Value::Date("2020-01-01"), Value(30)}),
+                               Row({Value::Date("2020-01-02"), Value(50)}),
+                               Row({Value::Date("2020-01-03"), Value(70)}),
+                               Row({Value::Date("2020-01-04"), Value(40)})})));
+
+  // A NULL key has no interval arithmetic: the bound collapses to the peer
+  // group, so the NULL-d row aggregates alone.
+  const auto null_key = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT SUM(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL 1 DAY PRECEDING "
+      "AND CURRENT ROW) FROM wx WHERE d IS NULL AND g = 1");
+  ASSERT_TRUE(null_key.HasValue()) << null_key.GetStatus().GetMessage();
+  EXPECT_EQ(null_key.Value(), (std::vector<Row>({Row({Value(50)})})));
+
+  // INTERVAL bounds are DATE-only; other key types keep the numeric rules.
+  const auto int_key = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN INTERVAL 1 DAY PRECEDING "
+      "AND CURRENT ROW) FROM wx WHERE g = 1");
+  ASSERT_FALSE(int_key.HasValue());
+  EXPECT_NE(int_key.GetStatus().GetMessage().find(
+                "RANGE INTERVAL offset requires a DATE order key"),
+            std::string::npos)
+      << int_key.GetStatus().GetMessage();
+}
+
 TEST_F(WindowSqlCov, RowsFrameCornerBounds) {
   // CURRENT ROW..CURRENT ROW isolates the row itself.
   const auto current = TryRunSql(

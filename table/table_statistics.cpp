@@ -52,8 +52,11 @@
 namespace tinylamb {
 namespace {
 
-constexpr uint64_t kStatisticsMagic = 0x544C535441545302ULL;  // TLSTATS + v2.
-constexpr uint64_t kStatisticsVersion = 2;
+// TLSTATS + v3. v3 appends the table's row-layout generation (the clustering
+// proof stamp); v2 payloads are still readable and simply carry no proof.
+constexpr uint64_t kStatisticsMagic = 0x544C535441545302ULL;
+constexpr uint64_t kStatisticsVersion = 3;
+constexpr uint64_t kStatisticsVersionWithoutProof = 2;
 constexpr size_t kStoredStringPrefixLength = 32;
 // Reservoir size per column: a multiple of the histogram bucket count so
 // every bucket rests on >=256 sampled values.  Populations up to this size
@@ -120,11 +123,21 @@ class ColumnCollector {
     }
     CHECK_MSG(value.type == type_, "column statistics type mismatch");
     ++non_null_count_;
-    const Value compacted = CompactValue(value);
-    TrackOrder(compacted);
-    TrackLowest(compacted);
-    TrackHighest(compacted);
-    Sample(compacted);
+    // Only oversized VARCHAR cells need the truncating copy; everything
+    // else is tracked by reference, saving one full Value copy (and a
+    // string materialization for VARCHAR) per column per scanned row.
+    Value compacted;
+    const bool oversized =
+        value.type == ValueType::kVarChar &&
+        value.value.varchar_value.size() > kStoredStringPrefixLength;
+    if (oversized) {
+      compacted = CompactValue(value);
+    }
+    const Value& tracked = oversized ? compacted : value;
+    TrackOrder(tracked);
+    TrackLowest(tracked);
+    TrackHighest(tracked);
+    Sample(tracked);
   }
 
   [[nodiscard]] CollectedColumn Finish() const {
@@ -218,9 +231,12 @@ class ColumnCollector {
   [[nodiscard]] size_t EstimateDistinct(const std::vector<ValueFrequency>& runs,
                                         size_t sampled) const {
     size_t singletons = 0;
+    size_t doubletons = 0;
     for (const ValueFrequency& frequency : runs) {
       if (frequency.count == 1) {
         ++singletons;
+      } else if (frequency.count == 2) {
+        ++doubletons;
       }
     }
     auto estimate = static_cast<double>(runs.size());
@@ -230,7 +246,21 @@ class ColumnCollector {
       if (coverage >= 0.05) {
         estimate = static_cast<double>(runs.size()) / coverage;
       } else {
-        estimate = static_cast<double>(non_null_count_);
+        // High-distinctness columns leave the sample nearly all singletons
+        // (a 4096-row sample over 200k distinct values sees ~98% of them
+        // once), so the coverage ratio degenerates.  Claiming the full
+        // population here fabricated NDV = row count for exactly the FK
+        // columns join costing multiplies together, collapsing composite-key
+        // estimates by orders of magnitude.  Chao1 (S_obs + f1^2 / 2·f2,
+        // bias-corrected without doubletons) tracks those populations from
+        // the singleton/doubleton shape; cap at the observed count so a
+        // degenerate sample can never exceed the population.
+        const auto observed = static_cast<double>(runs.size());
+        const auto f1 = static_cast<double>(singletons);
+        estimate = doubletons > 0
+                       ? observed + ((f1 * f1) /
+                                     (2.0 * static_cast<double>(doubletons)))
+                       : observed + ((f1 * (f1 - 1.0)) / 2.0);
       }
     }
     const double capped = std::clamp(estimate, static_cast<double>(runs.size()),
@@ -250,6 +280,16 @@ class ColumnCollector {
   }
 
   void TrackLowest(const Value& value) {
+    // Fast reject for orderable scalars: with a full sorted window, a value
+    // above the largest of the k lowest can neither displace them nor match
+    // one (equality follows the same order).  Interval-shaped varchars can
+    // compare unequal byte-wise yet be equal as intervals, so they keep the
+    // linear scan.
+    if (lowest_.size() == kBoundaryValueCount && lowest_.back().value < value &&
+        (value.type == ValueType::kInt64 || value.type == ValueType::kDouble ||
+         value.type == ValueType::kDate)) {
+      return;
+    }
     for (size_t i = 0; i < lowest_.size(); ++i) {
       if (SameValue(lowest_[i].value, value)) {
         ++lowest_[i].count;
@@ -270,6 +310,12 @@ class ColumnCollector {
   }
 
   void TrackHighest(const Value& value) {
+    if (highest_.size() == kBoundaryValueCount &&
+        value < highest_.back().value &&
+        (value.type == ValueType::kInt64 || value.type == ValueType::kDouble ||
+         value.type == ValueType::kDate)) {
+      return;
+    }
     for (size_t i = 0; i < highest_.size(); ++i) {
       if (SameValue(highest_[i].value, value)) {
         ++highest_[i].count;
@@ -419,6 +465,33 @@ double ColumnConstantSelectivity(const ColumnStats& stats, size_t rows,
   const std::optional<Value> value = CoerceValue(raw_value, stats.Type());
   if (!value) {
     return 0;
+  }
+
+  // An unmeasured column knows nothing: not that the value is absent, not
+  // that half the column matches a range. Neutral defaults keep the plan's
+  // row estimates alive instead of collapsing them to a proven-empty zero.
+  if (stats.Unmeasured()) {
+    switch (operation) {
+      case BinaryOperation::kEquals:
+      case BinaryOperation::kNotEquals: {
+        const double equal =
+            std::min(0.25, 1.0 / std::sqrt(static_cast<double>(rows)));
+        return operation == BinaryOperation::kEquals ? equal : 1 - equal;
+      }
+      case BinaryOperation::kLessThan:
+      case BinaryOperation::kLessThanEquals:
+      case BinaryOperation::kGreaterThan:
+      case BinaryOperation::kGreaterThanEquals:
+        return 1.0 / 3.0;
+      case BinaryOperation::kLike:
+      case BinaryOperation::kNotLike: {
+        const double matching =
+            std::min(0.25, 1.0 / std::sqrt(static_cast<double>(rows)));
+        return operation == BinaryOperation::kLike ? matching : 1 - matching;
+      }
+      default:
+        return 1;
+    }
   }
 
   double count = 0;
@@ -578,10 +651,15 @@ double EstimatePredicate(const TableStatistics& table,
       if (offset < 0 || table.Rows() == 0) {
         return 0;
       }
-      const double null_fraction =
-          static_cast<double>(
-              table.Column(static_cast<size_t>(offset)).NullCount()) /
-          static_cast<double>(table.Rows());
+      const ColumnStats& stats = table.Column(static_cast<size_t>(offset));
+      // An unmeasured column has no null mass to report either way; the
+      // neutral 0.1 keeps a NULL-filtering join rewriter from "proving" the
+      // predicate eliminates everything.
+      if (stats.Unmeasured()) {
+        return unary.Op() == UnaryOperation::kIsNull ? 0.1 : 0.9;
+      }
+      const double null_fraction = static_cast<double>(stats.NullCount()) /
+                                   static_cast<double>(table.Rows());
       return unary.Op() == UnaryOperation::kIsNull ? null_fraction
                                                    : 1 - null_fraction;
     }
@@ -711,6 +789,11 @@ double EstimatePredicate(const TableStatistics& table,
     }
     const size_t max_distinct = std::max(left.Distinct(), right.Distinct());
     if (max_distinct == 0) {
+      // Unmeasured columns (a computed projection column, a stats-less
+      // schema): unknown distribution, not a proven non-match.
+      if (left.Unmeasured() || right.Unmeasured()) {
+        return 0.1;
+      }
       return 0;
     }
     const double both_non_null = (static_cast<double>(left.NonNullCount()) /
@@ -763,12 +846,158 @@ double ColumnStats::EstimateEqual(const Value& raw_value) const {
   return 0;
 }
 
+double ColumnStats::ClusteringStrength() const {
+  return std::clamp(std::abs((2.0 * correlation_) - 1.0), 0.0, 1.0);
+}
+
+ColumnStats ColumnStats::UntransformedPrior() const {
+  ColumnStats prior(*this);
+  prior.histogram_.clear();
+  prior.lowest_values_.clear();
+  prior.highest_values_.clear();
+  prior.most_common_values_.clear();
+  return prior;
+}
+
+double ColumnStats::EstimateJoinMatches(const ColumnStats& other,
+                                        bool null_safe) const {
+  const double cross = static_cast<double>(non_null_count_) *
+                       static_cast<double>(other.non_null_count_);
+  const double null_pairs = null_safe
+                                ? static_cast<double>(null_count_) *
+                                      static_cast<double>(other.null_count_)
+                                : 0.0;
+  if (cross == 0.0) {
+    return null_pairs;
+  }
+  // Different domains need coercion-aware costing; retain the NDV fallback.
+  if (type_ != other.type_) {
+    const auto widest = static_cast<double>(
+        std::max<size_t>({1, distinct_count_, other.distinct_count_}));
+    return (cross / widest) + null_pairs;
+  }
+  if (!histogram_.empty() && !other.histogram_.empty() &&
+      (histogram_.back().upper < other.histogram_.front().lower ||
+       other.histogram_.back().upper < histogram_.front().lower)) {
+    return null_pairs;
+  }
+  std::vector<Value> tracked;
+  const auto collect = [&](const std::vector<ValueFrequency>& values) {
+    for (const auto& entry : values) {
+      if (std::ranges::none_of(tracked, [&](const Value& value) {
+            return SameValue(value, entry.value);
+          })) {
+        tracked.push_back(entry.value);
+      }
+    }
+  };
+  collect(most_common_values_);
+  collect(other.most_common_values_);
+  auto left_mass = static_cast<double>(non_null_count_);
+  auto right_mass = static_cast<double>(other.non_null_count_);
+  auto left_ndv = static_cast<double>(distinct_count_);
+  auto right_ndv = static_cast<double>(other.distinct_count_);
+  double pairs = 0.0;
+  for (const Value& value : tracked) {
+    const double l = std::min(left_mass, EstimateEqual(value));
+    const double r = std::min(right_mass, other.EstimateEqual(value));
+    pairs += l * r;
+    left_mass -= l;
+    right_mass -= r;
+    left_ndv -= l > 0.0 ? 1.0 : 0.0;
+    right_ndv -= r > 0.0 ? 1.0 : 0.0;
+  }
+  pairs += left_mass * right_mass / std::max({1.0, left_ndv, right_ndv});
+  return std::clamp(pairs, 0.0, cross) + null_pairs;
+}
+
+double TableStatistics::EstimateDistinctRows(
+    const std::vector<size_t>& columns) const {
+  if (row_count_ == 0) {
+    return 0.0;
+  }
+  if (columns.empty()) {
+    return 1.0;
+  }
+  std::vector<size_t> seen;
+  std::vector<double> counts;
+  const auto rows = static_cast<double>(row_count_);
+  for (size_t column : columns) {
+    if (column >= stats_.size()) {
+      return rows;
+    }
+    if (std::ranges::find(seen, column) != seen.end()) {
+      continue;
+    }
+    seen.push_back(column);
+    const auto& stats = stats_[column];
+    const double ndv = static_cast<double>(stats.Distinct()) +
+                       (stats.NullCount() > 0 ? 1.0 : 0.0);
+    if (ndv == 0.0) {
+      return rows;
+    }
+    counts.push_back(std::clamp(ndv, 1.0, rows));
+  }
+  std::ranges::sort(counts, std::greater<>());
+  double estimate = 1.0, weight = 1.0;
+  for (double ndv : counts) {
+    estimate *= std::pow(ndv, weight);
+    if (estimate >= rows) {
+      return rows;
+    }
+    weight *= 0.5;
+  }
+  return estimate;
+}
+
 double ColumnStats::EstimateLessThan(const Value& raw_value) const {
   std::optional<Value> value = CoerceValue(raw_value, type_);
   if (!value || non_null_count_ == 0) {
     return 0;
   }
   *value = CompactValue(*value);
+  // When the tracked value lists account for every non-NULL row (the
+  // small-relation case: ANALYZE sampled the whole table, or a low-cardinality
+  // column whose MCV list is uncapped), their exact counts answer range
+  // questions precisely; interpolating a histogram bucket instead can
+  // over- or under-estimate by whole rows and flip an index-vs-full-scan
+  // decision. Partial coverage (large relations) falls through to the
+  // histogram below. MCV, lowest and highest overlap on small tables, so
+  // the union is deduplicated before the totals are compared.
+  std::vector<const ValueFrequency*> tracked;
+  tracked.reserve(most_common_values_.size() + lowest_values_.size() +
+                  highest_values_.size());
+  auto track = [&](const std::vector<ValueFrequency>& list) {
+    for (const ValueFrequency& frequency : list) {
+      bool seen = false;
+      for (const ValueFrequency* kept : tracked) {
+        if (SameValue(kept->value, frequency.value)) {
+          seen = true;
+          break;
+        }
+      }
+      if (!seen) {
+        tracked.push_back(&frequency);
+      }
+    }
+  };
+  track(most_common_values_);
+  track(lowest_values_);
+  track(highest_values_);
+  double tracked_total = 0;
+  for (const ValueFrequency* frequency : tracked) {
+    tracked_total += static_cast<double>(frequency->count);
+  }
+  if (!tracked.empty() &&
+      tracked_total >= static_cast<double>(non_null_count_)) {
+    double exact = 0;
+    for (const ValueFrequency* frequency : tracked) {
+      if (frequency->value < *value) {
+        exact += static_cast<double>(frequency->count);
+      }
+    }
+    return std::clamp(exact, 0.0, static_cast<double>(non_null_count_));
+  }
   if (histogram_.empty()) {
     return static_cast<double>(non_null_count_) * 0.5;
   }
@@ -897,6 +1126,11 @@ TableStatistics::TableStatistics(const Schema& schema) : row_count_(0) {
 
 Status TableStatistics::Update(Transaction& txn, const Table& target) {
   const Schema& schema = target.GetSchema();
+  // The generation window brackets the whole scan: a writer that enters or
+  // leaves Table::Insert/Update/Delete while this loop runs moves the counter
+  // away from `generation`, and a row that committed after the scan's snapshot
+  // would be visible to a later reader without having been measured here.
+  const uint64_t generation = target.LayoutGeneration();
   std::vector<ColumnCollector> collectors;
   collectors.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
@@ -918,6 +1152,8 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
   // A scan that stopped on an error would otherwise persist partial counts
   // as if they were complete.
   RETURN_IF_FAIL(iterator.GetStatus());
+  const bool stable =
+      generation != 0 && target.LayoutGeneration() == generation;
 
   std::vector<ColumnStats> rebuilt;
   rebuilt.reserve(collectors.size());
@@ -936,6 +1172,7 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
   }
   row_count_ = scanned_rows;
   stats_ = std::move(rebuilt);
+  layout_generation_ = stable ? generation : 0;
   return Status::kSuccess;
 }
 
@@ -965,12 +1202,29 @@ double TableStatistics::EstimateCount(int column_index, const Value& from,
     return 0;
   }
   const ColumnStats& column_stats = stats_[static_cast<size_t>(column_index)];
-  std::optional<Value> lower = CoerceValue(from, column_stats.Type());
-  std::optional<Value> upper = CoerceValue(to, column_stats.Type());
-  if (!lower || !upper) {
-    return 0;
+  std::optional<Value> lower;
+  std::optional<Value> upper;
+  if (!from.IsNull()) {
+    lower = CoerceValue(from, column_stats.Type());
+    if (!lower) {
+      return 0;
+    }
   }
-  if (*upper < *lower) {
+  if (!to.IsNull()) {
+    upper = CoerceValue(to, column_stats.Type());
+    if (!upper) {
+      return 0;
+    }
+  }
+  if (!lower && !upper) {
+    return static_cast<double>(row_count_);
+  }
+  if (column_stats.Unmeasured()) {
+    // No measured distribution: a neutral third of the table instead of a
+    // "proven empty" zero that would make every range access look free.
+    return static_cast<double>(row_count_) / 3.0;
+  }
+  if (lower && upper && *upper < *lower) {
     // An inverted range (e.g. BETWEEN 9 AND 3) is legitimately empty: report
     // zero instead of swapping, matching ColumnStats::EstimateRange and the
     // scan iterators (which yield no rows for such bounds).
@@ -990,6 +1244,9 @@ TableStatistics TableStatistics::TransformBy(int column_index,
   for (ColumnStats& stats : result.stats_) {
     stats *= multiplier;
   }
+  // A rewritten column no longer describes the stored values, so the physical
+  // clustering proof cannot travel with it.
+  result.layout_generation_ = 0;
   return result;
 }
 
@@ -1001,6 +1258,9 @@ TableStatistics TableStatistics::Filter(const Schema& schema,
   for (ColumnStats& stats : result.stats_) {
     stats *= multiplier;
   }
+  // The estimate is a projection of this table, not the table itself: a
+  // clustering claim must be re-derived from a fresh measurement.
+  result.layout_generation_ = 0;
   return result;
 }
 
@@ -1014,6 +1274,31 @@ TableStatistics TableStatistics::ScaleToRows(size_t rows) const {
   for (ColumnStats& stats : result.stats_) {
     stats *= multiplier;
   }
+  result.layout_generation_ = 0;
+  return result;
+}
+
+TableStatistics TableStatistics::ScaleCardinality(size_t rows) const {
+  TableStatistics result(Schema("", {}));
+  result.row_count_ = rows;
+  const double multiplier =
+      row_count_ == 0
+          ? 0
+          : static_cast<double>(rows) / static_cast<double>(row_count_);
+  const double distinct_multiplier =
+      multiplier < 1 ? std::sqrt(std::max(0.0, multiplier)) : 1;
+  result.stats_.reserve(stats_.size());
+  for (const ColumnStats& stats : stats_) {
+    ColumnStats scaled;
+    scaled.type_ = stats.type_;
+    scaled.non_null_count_ = ScaleCount(stats.non_null_count_, multiplier);
+    scaled.null_count_ = ScaleCount(stats.null_count_, multiplier);
+    scaled.distinct_count_ =
+        std::min(scaled.non_null_count_,
+                 ScaleCount(stats.distinct_count_, distinct_multiplier));
+    scaled.correlation_ = stats.correlation_;
+    result.stats_.push_back(std::move(scaled));
+  }
   return result;
 }
 
@@ -1022,11 +1307,15 @@ void TableStatistics::Concat(const TableStatistics& rhs) {
     row_count_ = rhs.row_count_;
   }
   stats_.insert(stats_.end(), rhs.stats_.begin(), rhs.stats_.end());
+  // Two row sources are not one table's chain: no clustering proof survives.
+  layout_generation_ = 0;
 }
 
-void TableStatistics::Assign(size_t rows, std::vector<ColumnStats> columns) {
+void TableStatistics::Assign(size_t rows, std::vector<ColumnStats> columns,
+                             uint64_t layout_generation) {
   row_count_ = rows;
   stats_ = std::move(columns);
+  layout_generation_ = layout_generation;
 }
 
 TableStatistics TableStatistics::operator*(size_t multiplier) const {
@@ -1036,6 +1325,7 @@ TableStatistics TableStatistics::operator*(size_t multiplier) const {
   for (ColumnStats& stats : result.stats_) {
     stats.Duplicate(multiplier);
   }
+  result.layout_generation_ = 0;
   return result;
 }
 
@@ -1100,7 +1390,8 @@ Decoder& operator>>(Decoder& decoder, ColumnStats& stats) {
 
 Encoder& operator<<(Encoder& encoder, const TableStatistics& stats) {
   encoder << kStatisticsMagic << kStatisticsVersion
-          << static_cast<uint64_t>(stats.row_count_) << stats.stats_;
+          << static_cast<uint64_t>(stats.row_count_) << stats.stats_
+          << stats.layout_generation_;
   return encoder;
 }
 
@@ -1111,12 +1402,23 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
     uint64_t version = 0;
     uint64_t rows = 0;
     decoder >> version;
-    if (version != kStatisticsVersion) {
+    if (version != kStatisticsVersion &&
+        version != kStatisticsVersionWithoutProof) {
       decoder.Fail();
       return decoder;
     }
     decoder >> rows >> stats.stats_;
     stats.row_count_ = rows;
+    // A v2 record predates the proof stamp; it describes whatever the chain
+    // looked like in an earlier process, so it certifies nothing.
+    stats.layout_generation_ = 0;
+    if (version == kStatisticsVersion) {
+      uint64_t generation = 0;
+      decoder >> generation;
+      if (!decoder.Failed()) {
+        stats.layout_generation_ = generation;
+      }
+    }
     return decoder;
   }
 
@@ -1130,6 +1432,7 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
   stats.stats_.clear();
   stats.stats_.resize(marker);
   stats.row_count_ = 0;
+  stats.layout_generation_ = 0;
   for (ColumnStats& column : stats.stats_) {
     decoder >> column.type_;
     uint64_t count = 0;

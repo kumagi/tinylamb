@@ -141,14 +141,6 @@ Status TableSampleExecutor::Initialize() {
       return StatusError(StatusCode::kInvalidArgument,
                          "TABLESAMPLE requires a size expression");
     }
-    if (spec_.method == TableSampleMethod::kSystem) {
-      return StatusError(StatusCode::kNotImplemented,
-                         "SYSTEM TABLESAMPLE is not implemented");
-    }
-    if (spec_.method == TableSampleMethod::kSystem) {
-      return StatusError(StatusCode::kNotImplemented,
-                         "SYSTEM TABLESAMPLE is not implemented");
-    }
     const bool reservoir = spec_.method == TableSampleMethod::kReservoir;
     if (reservoir != (spec_.unit == TableSampleUnit::kRows)) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -331,7 +323,7 @@ size_t TableSampleExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
         const double weight = selected == 0 ? 1.0
                                             : static_cast<double>(state.seen) /
                                                   static_cast<double>(selected);
-        row.values_.push_back(Value(weight));
+        row.values_.emplace_back(weight);
       }
       destination->Append(std::move(row), candidate.position);
     }
@@ -342,6 +334,7 @@ size_t TableSampleExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   if (probability_ <= 0.0) {
     return 0;
   }
+  const bool block_level = spec_.method == TableSampleMethod::kSystem;
   DataChunk input;
   while (destination->Size() < max_rows) {
     const size_t requested = max_rows - destination->Size();
@@ -353,11 +346,31 @@ size_t TableSampleExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
       break;
     }
     for (size_t i = 0; i < count; ++i) {
+      const RowPosition position = input.PositionAt(i);
       double unit = 0.0;
       if (probability_ < 1.0) {
-        if (seed_.has_value()) {
-          unit = static_cast<double>(
-                     NextPriority(input.PositionAt(i), ordinal_++) >> 11) *
+        if (block_level && position.IsValid()) {
+          // SYSTEM sampling includes or excludes whole storage blocks: every
+          // row of an included page survives, rows of an excluded page are
+          // dropped.  The decision is a hash of the page id (mixed with the
+          // REPEATABLE seed when present), so repeated scans of the same
+          // page agree.
+          const auto [iterator, inserted] = page_decisions_.try_emplace(
+              static_cast<uint64_t>(position.page_id), false);
+          if (inserted) {
+            const uint64_t priority =
+                seed_.has_value()
+                    ? Mix(*seed_ ^ Mix(static_cast<uint64_t>(position.page_id)))
+                    : random_();
+            iterator->second =
+                static_cast<double>(priority >> 11) * 0x1.0p-53 < probability_;
+          }
+          if (!iterator->second) {
+            ++ordinal_;
+            continue;
+          }
+        } else if (seed_.has_value()) {
+          unit = static_cast<double>(NextPriority(position, ordinal_++) >> 11) *
                  0x1.0p-53;
         } else {
           unit = NextUnit();
@@ -367,9 +380,9 @@ size_t TableSampleExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
       if (probability_ >= 1.0 || unit < probability_) {
         Row row = input.RowAt(i);
         if (spec_.with_weight) {
-          row.values_.push_back(Value(1.0 / probability_));
+          row.values_.emplace_back(1.0 / probability_);
         }
-        destination->Append(std::move(row), input.PositionAt(i));
+        destination->Append(std::move(row), position);
       }
     }
   }

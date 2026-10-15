@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 #include "common/status_or.hpp"
 #include "expression/expression.hpp"
@@ -29,6 +30,19 @@ std::string NormalizeTimestampText(const std::string& text);
 // text and shift every following token).
 std::string DecodeStringEscapes(std::string_view value, bool is_bytes,
                                 bool is_triple, char quote);
+
+// Session-scoped (thread-local) view registry: name -> defining query AST.
+// CREATE VIEW registers here immediately; SqlEngine re-registers persisted
+// definitions on demand so views survive a restart.  Declared here because
+// the engine seeds it in Prepare before the visitor runs.
+std::unordered_map<std::string, std::shared_ptr<GoogleSqlAstNode>>&
+ViewRegistry();
+
+// Clones `query` into the view registry under `name` (used by the engine to
+// re-seed persisted definitions after a reopen; CREATE VIEW registers
+// through the visitor directly).
+void RegisterViewDefinition(std::string_view name,
+                            const GoogleSqlAstNode& query);
 
 class GoogleSqlAstVisitor {
  public:

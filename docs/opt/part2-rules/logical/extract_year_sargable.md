@@ -97,7 +97,7 @@ graph TD
 
 - `cast_pushdown_on_comparison`: 列に対する型キャストを定数側へ押し下げる SARGable 化兄弟 Rule です。
 - `push_selection_into_scan`: Selection 述語をベーステーブルの scan filter へ統合する基本 Rule です。
-- `scan_zone_map_filter_integration`: scan filter に登録された範囲条件を活用してストレージブロックをスキップします。
+
 
 ## 検証テスト
 

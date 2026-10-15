@@ -2,13 +2,17 @@
 #include "expression/bytecode.hpp"
 
 #include <cassert>
+#include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -16,12 +20,15 @@
 #include "common/exc_shim.hpp"
 #include "executor/data_chunk.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
+#include "type/date.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
 #include "type/value_type.hpp"
@@ -99,6 +106,78 @@ std::optional<BytecodeOp> BinaryOpcode(ValueType type) {
       return std::nullopt;
   }
   return std::nullopt;
+}
+
+// Mirrors the AST extract_{year,month,day} evaluator (FunctionCallExpression):
+// DATE renders through FormatDateDays ("%04d-%02u-%02u") and slices, VARCHAR
+// slices raw, then std::stoll parses each slice with its whitespace/sign/
+// digit scanning and std::logic_error -> error mapping.  Reproduced here so
+// the VM kernel is differential-equal to the AST on every input.
+StatusOr<Value> TryExtractDatePart(const Value& value, uint16_t part) {
+  if (value.IsNull()) {
+    return Value();
+  }
+  if (value.type == ValueType::kDate) {
+    if (value.value.int_value < kDateMinDays ||
+        kDateMaxDays < value.value.int_value) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "DATE value out of range");
+    }
+    const std::chrono::year_month_day ymd{std::chrono::sys_days{
+        std::chrono::days{static_cast<int>(value.value.int_value)}}};
+    if (part == 0) {
+      const int64_t year = static_cast<int>(ymd.year());
+      if (year >= -999 && year <= 9999) {
+        return Value(year);
+      }
+      // The formatted year runs past 4 digits, so the AST's substr(0, 4)
+      // keeps only the leading 4 (e.g. 12345 -> 1234, -1234 -> -123).
+      return Value(year / 10);
+    }
+    if (part == 1) {
+      return Value(static_cast<int64_t>(static_cast<unsigned>(ymd.month())));
+    }
+    return Value(static_cast<int64_t>(static_cast<unsigned>(ymd.day())));
+  }
+  if (value.type != ValueType::kVarChar) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "EXTRACT requires DATE or STRING");
+  }
+  const std::string_view text(value.value.varchar_value);
+  if (text.size() < 10) {
+    return StatusError(StatusCode::kInvalidArgument, "invalid DATE value");
+  }
+  const size_t begin = part == 0 ? 0 : (part == 1 ? 5 : 8);
+  const size_t length = part == 0 ? 4 : 2;
+  const std::string_view digits = text.substr(begin, length);
+  // std::stoll semantics: leading C-locale whitespace, optional sign, at
+  // least one digit; anything else is std::invalid_argument, which the AST
+  // maps to "invalid DATE value: <text>".  Slices are at most 4 characters,
+  // so int64 overflow (stoll's out_of_range) is unreachable here.
+  size_t index = 0;
+  const auto is_space = [](char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' ||
+           c == '\r';
+  };
+  while (index < digits.size() && is_space(digits[index])) {
+    ++index;
+  }
+  bool negative = false;
+  if (index < digits.size() && (digits[index] == '+' || digits[index] == '-')) {
+    negative = digits[index] == '-';
+    ++index;
+  }
+  if (index >= digits.size() || digits[index] < '0' || '9' < digits[index]) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "invalid DATE value: " + std::string(text));
+  }
+  int64_t parsed = 0;
+  while (index < digits.size() && '0' <= digits[index] &&
+         digits[index] <= '9') {
+    parsed = (parsed * 10) + (digits[index] - '0');
+    ++index;
+  }
+  return Value(negative ? -parsed : parsed);
 }
 
 bool CompileNode(  // NOLINT(misc-no-recursion)
@@ -233,10 +312,96 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       }
       return CompileNode(expanded, schema, program);
     }
+    case TypeTag::kCaseExp: {
+      // Searched CASE lowers to chained conditional jumps.  Layout (the
+      // conditional jump PEEKS the top, so each WHEN condition is popped
+      // explicitly on both of its exits):
+      //     cond_0; JumpIfTrue -> T0; Pop
+      //     cond_1; JumpIfTrue -> T1; Pop
+      //     <else | NULL constant>;  Jump -> END
+      // T0: Pop; then_0; Jump -> END
+      // T1: Pop; then_1; Jump -> END
+      // END:
+      // TryPickBranch semantics hold branch-for-branch: a NULL condition is
+      // not taken (kJumpIfTrue only fires on TRUE), a raising condition
+      // aborts the whole CASE in evaluation order, and no match yields
+      // ELSE-or-NULL.  Branch types must unify (ResultType kInvalid fails
+      // the final type check exactly as before).
+      const CaseExpression& case_expression = expression->AsCaseExpression();
+      if (case_expression.when_clauses_.empty()) {
+        return false;
+      }
+      std::vector<size_t> then_jumps;
+      std::vector<size_t> branch_ends;
+      for (const auto& when : case_expression.when_clauses_) {
+        if (!when.first || !when.second) {
+          return false;
+        }
+        if (!CompileNode(when.first, schema, program)) {
+          return false;
+        }
+        then_jumps.push_back(program->Size());
+        program->AddInstruction({.opcode = BytecodeOp::kJumpIfTrue});
+        program->AddInstruction({.opcode = BytecodeOp::kPop});
+      }
+      if (case_expression.else_clause_ != nullptr) {
+        if (!CompileNode(case_expression.else_clause_, schema, program)) {
+          return false;
+        }
+      } else {
+        uint16_t offset = 0;
+        if (!program->AddConstant(Value(), &offset)) {
+          return false;
+        }
+        program->AddInstruction(
+            {.opcode = BytecodeOp::kLoadConstant, .operand = offset});
+      }
+      const size_t end_jump = program->Size();
+      program->AddInstruction({.opcode = BytecodeOp::kJump});
+      for (size_t i = 0; i < case_expression.when_clauses_.size(); ++i) {
+        // Jump target: relative from the jump instruction itself.
+        program->SetJumpTarget(then_jumps[i],
+                               static_cast<int32_t>(program->Size()) -
+                                   static_cast<int32_t>(then_jumps[i]));
+        program->AddInstruction({.opcode = BytecodeOp::kPop});
+        if (!CompileNode(case_expression.when_clauses_[i].second, schema,
+                         program)) {
+          return false;
+        }
+        branch_ends.push_back(program->Size());
+        program->AddInstruction({.opcode = BytecodeOp::kJump});
+      }
+      program->SetJumpTarget(end_jump, static_cast<int32_t>(program->Size()) -
+                                           static_cast<int32_t>(end_jump));
+      for (const size_t branch_end : branch_ends) {
+        program->SetJumpTarget(branch_end,
+                               static_cast<int32_t>(program->Size()) -
+                                   static_cast<int32_t>(branch_end));
+      }
+      return true;
+    }
     case TypeTag::kUnaryExp: {
       const UnaryExpression& unary = expression->AsUnaryExpression();
       if (!CompileNode(unary.Child(), schema, program)) {
         return false;
+      }
+      // The null-check / truthiness family is type-agnostic on both legs:
+      // TryEvaluateUnary dispatches on the value itself and the fast
+      // interpreter implements the same table for any slot type.
+      switch (unary.Op()) {
+        case UnaryOperation::kIsNull:
+        case UnaryOperation::kIsNotNull:
+        case UnaryOperation::kIsTrue:
+        case UnaryOperation::kIsNotTrue:
+        case UnaryOperation::kIsFalse:
+        case UnaryOperation::kIsNotFalse:
+          program->AddInstruction({.opcode = BytecodeOp::kUnaryInt64,
+                                   .operand = 0,
+                                   .binary = BinaryOperation::kAdd,
+                                   .unary = unary.Op()});
+          return true;
+        default:
+          break;
       }
       const ValueType operand_type =
           ValueTypeFor(unary.Child()->ResultType(schema));
@@ -252,9 +417,99 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
                                .unary = unary.Op()});
       return true;
     }
+    case TypeTag::kFunctionCallExp: {
+      const FunctionCallExpression& call =
+          expression->AsFunctionCallExpression();
+      // EXTRACT(year|month|day FROM x) lowers to one dedicated op whose
+      // kernel reproduces the AST evaluator; every other function (and any
+      // odd arity) fails compilation and the caller falls back to the AST
+      // evaluator, the semantic ground truth.
+      uint16_t part = 0;
+      if (call.FuncName() == "extract_year") {
+        part = 0;
+      } else if (call.FuncName() == "extract_month") {
+        part = 1;
+      } else if (call.FuncName() == "extract_day") {
+        part = 2;
+      } else {
+        return false;
+      }
+      if (call.Args().size() != 1) {
+        return false;
+      }
+      if (!CompileNode(call.Args()[0], schema, program)) {
+        return false;
+      }
+      program->AddInstruction(
+          {.opcode = BytecodeOp::kExtractDatePart, .operand = part});
+      return true;
+    }
     default:
       return false;
   }
+}
+
+}  // namespace
+
+namespace {
+
+// The boxing-free interpreter covers these opcodes only; jumps and the
+// varchar/date kernels stay on the canonical path.
+bool FastOpcode(BytecodeOp opcode) {
+  switch (opcode) {
+    case BytecodeOp::kLoadColumn:
+    case BytecodeOp::kLoadConstant:
+    case BytecodeOp::kBinaryInt64:
+    case BytecodeOp::kBinaryDouble:
+    case BytecodeOp::kBinaryVarchar:
+    case BytecodeOp::kBinaryDate:
+    case BytecodeOp::kUnaryInt64:
+    case BytecodeOp::kUnaryDouble:
+    case BytecodeOp::kExtractDatePart:
+    case BytecodeOp::kJump:
+    case BytecodeOp::kJumpIfFalse:
+    case BytecodeOp::kJumpIfTrue:
+    case BytecodeOp::kPop:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Compile-time under-approximation: every instruction is fast-shaped and
+// every constant loaded is numeric (or NULL).  Programs built by hand
+// (BytecodeProgram{} placeholders) never get the flag.
+bool ProgramIsFastInterpretable(const BytecodeProgram& program) {
+  if (program.Instructions().empty()) {
+    return false;
+  }
+  for (const BytecodeInstruction& instruction : program.Instructions()) {
+    if (!FastOpcode(instruction.opcode)) {
+      return false;
+    }
+    if (instruction.opcode == BytecodeOp::kLoadConstant) {
+      const Value& constant = program.Constants()[instruction.operand];
+      switch (constant.type) {
+        case ValueType::kNull:
+        case ValueType::kInt64:
+        case ValueType::kDouble:
+          if (constant.IsUnsigned()) {
+            return false;
+          }
+          break;
+        case ValueType::kVarChar:
+          // A collated string constant compares under folding rules the
+          // fast slot cannot reproduce; keep those programs canonical.
+          if (constant.Collation() != 0) {
+            return false;
+          }
+          break;
+        default:
+          return false;
+      }
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -291,6 +546,7 @@ std::optional<BytecodeProgram> BytecodeCompiler::Compile(
       return std::nullopt;
     }
     program.SetResultType(result_type);
+    program.SetFastInterpretable(ProgramIsFastInterpretable(program));
     return program;
   } catch (const std::exception&) {
     // Plans with partially qualified or deferred schemas remain valid.  An
@@ -364,6 +620,20 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           ASSIGN_OR_RETURN(Value, result_value,
                            (TryEvaluateUnary(instruction.unary, child)));
           stack.push_back(std::move(result_value));
+          break;
+        }
+        case BytecodeOp::kExtractDatePart: {
+          assert(!stack.empty());
+          Value child = std::move(stack.back());
+          stack.pop_back();
+          ASSIGN_OR_RETURN(Value, part_value,
+                           TryExtractDatePart(child, instruction.operand));
+          stack.push_back(std::move(part_value));
+          break;
+        }
+        case BytecodeOp::kPop: {
+          assert(!stack.empty());
+          stack.pop_back();
           break;
         }
       }
@@ -442,6 +712,20 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         stack.push_back(std::move(result_value));
         break;
       }
+      case BytecodeOp::kExtractDatePart: {
+        assert(!stack.empty());
+        Value child = std::move(stack.back());
+        stack.pop_back();
+        ASSIGN_OR_RETURN(Value, part_value,
+                         TryExtractDatePart(child, instruction.operand));
+        stack.push_back(std::move(part_value));
+        break;
+      }
+      case BytecodeOp::kPop: {
+        assert(!stack.empty());
+        stack.pop_back();
+        break;
+      }
     }
   }
   if (stack.size() != 1) {
@@ -454,10 +738,576 @@ Value BytecodeProgram::EvaluateRow(const Row& row) const {
   return ExcShimUnwrap(TryEvaluateRow(row), "BytecodeProgram::EvaluateRow");
 }
 
+namespace {
+
+// One boxing-free stack slot: the raw payload plus the runtime type.  Doubles
+// ride in the same int64 payload through memcpy on push/pop.  VARCHAR
+// operands carry a view into the row cell (or program constant) so string
+// compares avoid Value construction; collated strings never reach this slot.
+struct FastSlot {
+  int64_t bits;
+  ValueType type;
+  bool is_null;
+  std::string_view text;
+};
+
+bool FastTruthy(const FastSlot& slot) {
+  if (slot.is_null) {
+    return false;
+  }
+  if (slot.type == ValueType::kInt64) {
+    return slot.bits != 0;
+  }
+  if (slot.type == ValueType::kDouble) {
+    double d = 0.0;
+    std::memcpy(&d, &slot.bits, sizeof(d));
+    return d != 0.0;
+  }
+  return true;
+}
+
+// Int64 operands promote to double on the double opcode (the compiler emits
+// kBinaryDouble for mixed-operand shapes).
+void FastSlotToDouble(const FastSlot& slot, double* out) {
+  if (slot.type == ValueType::kDouble) {
+    std::memcpy(out, &slot.bits, sizeof(double));
+  } else {
+    *out = static_cast<double>(slot.bits);
+  }
+}
+
+FastSlot FastSlotFromValue(const Value& value, bool* unsupported) {
+  FastSlot slot{
+      .bits = 0, .type = value.type, .is_null = value.IsNull(), .text = {}};
+  switch (value.type) {
+    case ValueType::kInt64:
+    case ValueType::kDate:
+      if (value.IsUnsigned()) {
+        *unsupported = true;
+        break;
+      }
+      slot.bits = value.value.int_value;
+      break;
+    case ValueType::kDouble:
+      std::memcpy(&slot.bits, &value.value.double_value, sizeof(double));
+      break;
+    case ValueType::kVarChar:
+      // A collated (case-insensitive) string compares under folding rules the
+      // plain view cannot reproduce; those programs stay on the canonical VM.
+      if (value.Collation() != 0) {
+        *unsupported = true;
+        break;
+      }
+      slot.text = value.value.varchar_value;
+      break;
+    case ValueType::kNull:
+      break;
+    default:
+      *unsupported = true;
+      break;
+  }
+  return slot;
+}
+
+Value FastValueFromSlot(const FastSlot& slot) {
+  if (slot.is_null) {
+    return {};
+  }
+  switch (slot.type) {
+    case ValueType::kInt64:
+      // Value's numeric constructors are explicit, so the braced form the
+      // check prefers does not compile here.
+      return Value(slot.bits);  // NOLINT(modernize-return-braced-init-list)
+    case ValueType::kDouble: {
+      double d = 0.0;
+      std::memcpy(&d, &slot.bits, sizeof(d));
+      return Value(d);  // NOLINT(modernize-return-braced-init-list)
+    }
+    case ValueType::kDate:
+      return Value::DateFromDays(slot.bits);
+    case ValueType::kVarChar: {
+      // Plain view-carrying value (collation 0): no owned copy.
+      Value string_value;
+      string_value.type = ValueType::kVarChar;
+      string_value.value.varchar_value = slot.text;
+      return string_value;
+    }
+    default:
+      return {};
+  }
+}
+
+}  // namespace
+
+BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
+    const Row& row, Value* out, Status* error) const {
+  if (!fast_interpretable_) {
+    return FastEval::kUnsupported;
+  }
+  // The interpreter has no call instruction; one stack per thread removes a
+  // heap allocation per row (same trick as TryEvaluateRow).
+  thread_local std::vector<FastSlot> stack;
+  stack.clear();
+  stack.reserve(instructions_.size());
+  const auto push_null = [](std::vector<FastSlot>& s) {
+    s.push_back(FastSlot{
+        .bits = 0, .type = ValueType::kNull, .is_null = true, .text = {}});
+  };
+  const auto push_int = [](std::vector<FastSlot>& s, int64_t v) {
+    s.push_back(FastSlot{
+        .bits = v, .type = ValueType::kInt64, .is_null = false, .text = {}});
+  };
+  const auto push_double = [](std::vector<FastSlot>& s, double v) {
+    FastSlot slot{
+        .bits = 0, .type = ValueType::kDouble, .is_null = false, .text = {}};
+    std::memcpy(&slot.bits, &v, sizeof(v));
+    s.push_back(slot);
+  };
+  const auto push_error = [error](StatusCode code, const char* message) {
+    *error = StatusError(code, message);
+    return FastEval::kError;
+  };
+  // Indexed walk (not a range-for): the jump ops need pc arithmetic.
+  for (size_t pc = 0; pc < instructions_.size(); ++pc) {
+    const BytecodeInstruction& instruction = instructions_[pc];
+    switch (instruction.opcode) {
+      case BytecodeOp::kJump:
+        pc += static_cast<size_t>(instruction.jump_target);
+        --pc;
+        continue;
+      case BytecodeOp::kJumpIfFalse:
+      case BytecodeOp::kJumpIfTrue: {
+        // Same contract as the canonical interpreter: a decided AND/OR
+        // short-circuit replaces the operand with a normalized BOOLEAN
+        // (INT64 0/1); an undecided jump leaves the operand in place.
+        const FastSlot& top = stack.back();
+        const bool decides =
+            instruction.opcode == BytecodeOp::kJumpIfFalse
+                ? (!top.is_null && !FastTruthy(top))
+                : (!top.is_null && FastTruthy(top));
+        if (decides) {
+          stack.back() = FastSlot{
+              .bits = instruction.opcode == BytecodeOp::kJumpIfTrue ? 1 : 0,
+              .type = ValueType::kInt64,
+              .is_null = false,
+              .text = {}};
+          pc += static_cast<size_t>(instruction.jump_target);
+          --pc;
+        }
+        continue;
+      }
+      case BytecodeOp::kPop: {
+        stack.pop_back();
+        continue;
+      }
+      case BytecodeOp::kLoadColumn: {
+        if (instruction.operand >= row.Count()) {
+          return FastEval::kUnsupported;
+        }
+        const Value& cell = row[instruction.operand];
+        bool unsupported = false;
+        stack.push_back(FastSlotFromValue(cell, &unsupported));
+        if (unsupported) {
+          return FastEval::kUnsupported;
+        }
+        break;
+      }
+      case BytecodeOp::kLoadConstant: {
+        bool unsupported = false;
+        stack.push_back(
+            FastSlotFromValue(constants_[instruction.operand], &unsupported));
+        if (unsupported) {
+          return FastEval::kUnsupported;
+        }
+        break;
+      }
+      case BytecodeOp::kBinaryInt64:
+      case BytecodeOp::kBinaryDouble:
+      case BytecodeOp::kBinaryVarchar:
+      case BytecodeOp::kBinaryDate: {
+        const FastSlot right = stack.back();
+        stack.pop_back();
+        const FastSlot left = stack.back();
+        stack.pop_back();
+        // Three-valued logical ops and IS [NOT] DISTINCT FROM resolve before
+        // NULL propagation, exactly like the canonical dispatch.
+        switch (instruction.binary) {
+          case BinaryOperation::kAnd: {
+            const bool lt = FastTruthy(left);
+            const bool rt = FastTruthy(right);
+            if ((!left.is_null && !lt) || (!right.is_null && !rt)) {
+              push_int(stack, 0);
+            } else if (left.is_null || right.is_null) {
+              push_null(stack);
+            } else {
+              push_int(stack, 1);
+            }
+            continue;
+          }
+          case BinaryOperation::kOr: {
+            const bool lt = FastTruthy(left);
+            const bool rt = FastTruthy(right);
+            if ((!left.is_null && lt) || (!right.is_null && rt)) {
+              push_int(stack, 1);
+            } else if (left.is_null || right.is_null) {
+              push_null(stack);
+            } else {
+              push_int(stack, 0);
+            }
+            continue;
+          }
+          case BinaryOperation::kXor: {
+            if (left.is_null || right.is_null) {
+              push_null(stack);
+            } else {
+              push_int(stack, FastTruthy(left) != FastTruthy(right) ? 1 : 0);
+            }
+            continue;
+          }
+          case BinaryOperation::kIsDistinctFrom:
+          case BinaryOperation::kIsNotDistinctFrom: {
+            bool equal = false;
+            if (left.is_null || right.is_null) {
+              equal = left.is_null && right.is_null;
+            } else if (left.type == ValueType::kDouble ||
+                       right.type == ValueType::kDouble) {
+              double l = 0.0;
+              double r = 0.0;
+              FastSlotToDouble(left, &l);
+              FastSlotToDouble(right, &r);
+              equal = l == r || (std::isnan(l) && std::isnan(r));
+            } else {
+              equal = left.bits == right.bits;
+            }
+            push_int(stack, static_cast<int64_t>(
+                                instruction.binary ==
+                                        BinaryOperation::kIsNotDistinctFrom
+                                    ? equal
+                                    : !equal));
+            continue;
+          }
+          default:
+            break;
+        }
+        if (left.is_null || right.is_null) {
+          push_null(stack);
+          continue;
+        }
+        if (instruction.opcode == BytecodeOp::kBinaryInt64) {
+          if (left.type != ValueType::kInt64 ||
+              right.type != ValueType::kInt64) {
+            return FastEval::kUnsupported;
+          }
+          switch (instruction.binary) {
+            case BinaryOperation::kEquals:
+              push_int(stack, static_cast<int64_t>(left.bits == right.bits));
+              continue;
+            case BinaryOperation::kNotEquals:
+              push_int(stack, static_cast<int64_t>(left.bits != right.bits));
+              continue;
+            case BinaryOperation::kLessThan:
+              push_int(stack, static_cast<int64_t>(left.bits < right.bits));
+              continue;
+            case BinaryOperation::kLessThanEquals:
+              push_int(stack, static_cast<int64_t>(left.bits <= right.bits));
+              continue;
+            case BinaryOperation::kGreaterThan:
+              push_int(stack, static_cast<int64_t>(left.bits > right.bits));
+              continue;
+            case BinaryOperation::kGreaterThanEquals:
+              push_int(stack, static_cast<int64_t>(left.bits >= right.bits));
+              continue;
+            case BinaryOperation::kAdd:
+            case BinaryOperation::kSubtract:
+            case BinaryOperation::kMultiply: {
+              int64_t result = 0;
+              bool overflow = false;
+              if (instruction.binary == BinaryOperation::kAdd) {
+                overflow =
+                    __builtin_add_overflow(left.bits, right.bits, &result);
+              } else if (instruction.binary == BinaryOperation::kSubtract) {
+                overflow =
+                    __builtin_sub_overflow(left.bits, right.bits, &result);
+              } else {
+                overflow =
+                    __builtin_mul_overflow(left.bits, right.bits, &result);
+              }
+              if (overflow) {
+                return push_error(
+                    StatusCode::kInvalidArgument,
+                    instruction.binary == BinaryOperation::kAdd
+                        ? "integer overflow on '+'"
+                    : instruction.binary == BinaryOperation::kSubtract
+                        ? "integer overflow on '-'"
+                        : "integer overflow on '*'");
+              }
+              push_int(stack, result);
+              continue;
+            }
+            case BinaryOperation::kDivide:
+              // kDivide always divides in double (the type contract declares
+              // it DOUBLE, and the canonical kDivide-numeric shortcut runs
+              // before any integer kernel), so INT64_MIN/-1 is a large finite
+              // double, not an overflow error.
+              {
+                const auto ld = static_cast<double>(left.bits);
+                const auto rd = static_cast<double>(right.bits);
+                if (rd == 0.0) {
+                  return push_error(StatusCode::kIsInfinity,
+                                    "division by zero");
+                }
+                const double result = ld / rd;
+                if (std::isfinite(ld) && std::isfinite(rd) &&
+                    std::isinf(result)) {
+                  return push_error(StatusCode::kIsInfinity, "double overflow");
+                }
+                push_double(stack, result);
+              }
+              continue;
+            case BinaryOperation::kModulo:
+              if (right.bits == 0) {
+                return push_error(StatusCode::kIsInfinity, "modulo by zero");
+              }
+              if (left.bits == std::numeric_limits<int64_t>::min() &&
+                  right.bits == -1) {
+                return push_error(StatusCode::kInvalidArgument,
+                                  "integer overflow on '%'");
+              }
+              push_int(stack, left.bits % right.bits);
+              continue;
+            default:
+              return FastEval::kUnsupported;
+          }
+        }
+        // kBinaryVarchar / kBinaryDate: delegate to the canonical binary
+        // dispatch so string ordering, LIKE matching, and date coercions are
+        // instruction-for-instruction identical; the fast path only removes
+        // the Value stack traffic around the call.  (Collated operands never
+        // reach this opcode -- FastSlotFromValue refuses them.)
+        if (instruction.opcode == BytecodeOp::kBinaryVarchar ||
+            instruction.opcode == BytecodeOp::kBinaryDate) {
+          StatusOr<Value> combined =
+              TryEvaluateBinary(instruction.binary, FastValueFromSlot(left),
+                                FastValueFromSlot(right));
+          if (!combined.HasValue()) {
+            *error = combined.GetStatus();
+            return FastEval::kError;
+          }
+          bool result_unsupported = false;
+          stack.push_back(
+              FastSlotFromValue(combined.Value(), &result_unsupported));
+          if (result_unsupported) {
+            return FastEval::kUnsupported;
+          }
+          continue;
+        }
+        // kBinaryDouble: int64 operands promote to double (the compiler
+        // picked this opcode for mixed-operand shapes too, so the runtime
+        // types decide which canonical ladder the op takes).
+        if ((left.type != ValueType::kInt64 &&
+             left.type != ValueType::kDouble) ||
+            (right.type != ValueType::kInt64 &&
+             right.type != ValueType::kDouble)) {
+          return FastEval::kUnsupported;
+        }
+        double l = 0.0;
+        double r = 0.0;
+        FastSlotToDouble(left, &l);
+        FastSlotToDouble(right, &r);
+        const bool l_nan = std::isnan(l);
+        const bool r_nan = std::isnan(r);
+        switch (instruction.binary) {
+          case BinaryOperation::kEquals:
+            push_int(stack, l_nan || r_nan ? 0 : static_cast<int64_t>(l == r));
+            continue;
+          case BinaryOperation::kNotEquals:
+            push_int(stack, l_nan || r_nan ? 1 : static_cast<int64_t>(l != r));
+            continue;
+          case BinaryOperation::kLessThan:
+            push_int(stack, l_nan || r_nan ? 0 : static_cast<int64_t>(l < r));
+            continue;
+          case BinaryOperation::kLessThanEquals:
+            push_int(stack, l_nan || r_nan ? 0 : static_cast<int64_t>(l <= r));
+            continue;
+          case BinaryOperation::kGreaterThan:
+            push_int(stack, l_nan || r_nan ? 0 : static_cast<int64_t>(l > r));
+            continue;
+          case BinaryOperation::kGreaterThanEquals:
+            push_int(stack, l_nan || r_nan ? 0 : static_cast<int64_t>(l >= r));
+            continue;
+          case BinaryOperation::kAdd:
+            push_double(stack, l + r);
+            continue;
+          case BinaryOperation::kSubtract:
+            push_double(stack, l - r);
+            continue;
+          case BinaryOperation::kMultiply:
+            push_double(stack, l * r);
+            continue;
+          case BinaryOperation::kDivide:
+            if (r == 0.0) {
+              return push_error(StatusCode::kIsInfinity, "division by zero");
+            }
+            {
+              const double result = l / r;
+              if (std::isfinite(l) && std::isfinite(r) && std::isinf(result)) {
+                return push_error(StatusCode::kIsInfinity, "double overflow");
+              }
+              push_double(stack, result);
+            }
+            continue;
+          case BinaryOperation::kModulo:
+            // Homogeneous DOUBLE modulo has no kernel (TryArithmetic rejects
+            // it); only the mixed-promotion ladder defines fmod.
+            if (left.type == ValueType::kDouble &&
+                right.type == ValueType::kDouble) {
+              return push_error(StatusCode::kInvalidArgument,
+                                "unsupported binary operation");
+            }
+            if (r == 0.0) {
+              return push_error(StatusCode::kIsInfinity, "division by zero");
+            }
+            push_double(stack, std::fmod(l, r));
+            continue;
+          default:
+            return FastEval::kUnsupported;
+        }
+      }
+      case BytecodeOp::kUnaryInt64:
+      case BytecodeOp::kUnaryDouble: {
+        const FastSlot child = stack.back();
+        stack.pop_back();
+        switch (instruction.unary) {
+          case UnaryOperation::kIsNull:
+            push_int(stack, static_cast<int64_t>(child.is_null));
+            continue;
+          case UnaryOperation::kIsNotNull:
+            push_int(stack, static_cast<int64_t>(!child.is_null));
+            continue;
+          case UnaryOperation::kIsTrue:
+            push_int(stack,
+                     static_cast<int64_t>(!child.is_null && FastTruthy(child)));
+            continue;
+          case UnaryOperation::kIsNotTrue:
+            push_int(stack,
+                     static_cast<int64_t>(child.is_null || !FastTruthy(child)));
+            continue;
+          case UnaryOperation::kIsFalse:
+            push_int(stack, static_cast<int64_t>(!child.is_null &&
+                                                 !FastTruthy(child)));
+            continue;
+          case UnaryOperation::kIsNotFalse:
+            push_int(stack,
+                     static_cast<int64_t>(child.is_null || FastTruthy(child)));
+            continue;
+          case UnaryOperation::kNot:
+            if (child.is_null) {
+              push_null(stack);
+            } else {
+              push_int(stack, static_cast<int64_t>(!FastTruthy(child)));
+            }
+            continue;
+          case UnaryOperation::kMinus:
+            if (child.is_null) {
+              push_null(stack);
+              continue;
+            }
+            if (child.type == ValueType::kDouble) {
+              double d = 0.0;
+              std::memcpy(&d, &child.bits, sizeof(d));
+              push_double(stack, -d);
+              continue;
+            }
+            if (child.type == ValueType::kInt64) {
+              if (child.bits == std::numeric_limits<int64_t>::min()) {
+                return push_error(StatusCode::kIsInfinity,
+                                  "integer overflow in unary minus");
+              }
+              push_int(stack, -child.bits);
+              continue;
+            }
+            return push_error(StatusCode::kInvalidArgument,
+                              "unary minus requires a number");
+          case UnaryOperation::kBitwiseNot:
+            if (child.is_null) {
+              push_null(stack);
+              continue;
+            }
+            if (child.type != ValueType::kInt64) {
+              return push_error(StatusCode::kInvalidArgument,
+                                "bitwise not requires an integer");
+            }
+            push_int(stack,
+                     static_cast<int64_t>(~static_cast<uint64_t>(child.bits)));
+            continue;
+          default:
+            return FastEval::kUnsupported;
+        }
+      }
+      case BytecodeOp::kExtractDatePart: {
+        const FastSlot child = stack.back();
+        stack.pop_back();
+        if (child.is_null) {
+          push_null(stack);
+          continue;
+        }
+        if (child.type != ValueType::kDate) {
+          // VARCHAR inputs take the string-slice kernel on the canonical
+          // path.
+          return FastEval::kUnsupported;
+        }
+        if (child.bits < kDateMinDays || kDateMaxDays < child.bits) {
+          return push_error(StatusCode::kInvalidArgument,
+                            "DATE value out of range");
+        }
+        const std::chrono::year_month_day ymd{std::chrono::sys_days{
+            std::chrono::days{static_cast<int>(child.bits)}}};
+        if (instruction.operand == 0) {
+          const int64_t year = static_cast<int>(ymd.year());
+          // The formatted year runs past 4 digits past this range, so the
+          // AST's substr(0, 4) keeps only the leading 4 digits.
+          push_int(stack, year >= -999 && year <= 9999 ? year : year / 10);
+        } else if (instruction.operand == 1) {
+          push_int(stack,
+                   static_cast<int64_t>(static_cast<unsigned>(ymd.month())));
+        } else {
+          push_int(stack,
+                   static_cast<int64_t>(static_cast<unsigned>(ymd.day())));
+        }
+        continue;
+      }
+      default:
+        return FastEval::kUnsupported;
+    }
+  }
+  if (stack.size() != 1) {
+    return push_error(StatusCode::kRuntimeError, "invalid bytecode stack");
+  }
+  *out = FastValueFromSlot(stack.back());
+  return FastEval::kDone;
+}
+
 bool BytecodeEnabled() {
   // Not cached: the differential harness flips the variable between the two
   // executions of the same statement inside one process.
   return std::getenv("TINYLAMB_DISABLE_BYTECODE") == nullptr;
+}
+
+StatusOr<Value> TryEvaluateRowAuto(const BytecodeProgram& program,
+                                   const Row& row) {
+  if (program.FastInterpretable()) {
+    Value out;
+    Status error{Status::kSuccess};
+    switch (program.TryEvaluateRowFast(row, &out, &error)) {
+      case BytecodeProgram::FastEval::kDone:
+        return out;
+      case BytecodeProgram::FastEval::kError:
+        return error;
+      case BytecodeProgram::FastEval::kUnsupported:
+        break;
+    }
+  }
+  return program.TryEvaluateRow(row);
 }
 
 }  // namespace tinylamb

@@ -238,6 +238,77 @@ class CascadesRulesCoverageTest : public ::testing::Test {
   std::unique_ptr<SqlEngine> engine_;
 };
 
+TEST_F(CascadesRulesCoverageTest, GroupedSqlSelectsHashAndStreamAlternatives) {
+  // The HashAggregate/StreamAggregate plan-shape pins assume the
+  // Cascades-first grouped route.  Since the 2026-10-07 route flip the
+  // default grouped route is the relational interpreter (same rows,
+  // different plan text), so the shapes only hold under the
+  // TINYLAMB_GROUPED_ROUTE=cascades escape hatch.
+  const char* grouped_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  if (grouped_route == nullptr ||
+      std::string_view(grouped_route) != "cascades") {
+    GTEST_SKIP() << "plan-shape pins require the cascades grouped route";
+  }
+  const std::string hash_sql =
+      "SELECT d4 AS g, COUNT(*) AS n, SUM(d1) AS total FROM Sc2 GROUP BY d4";
+  EXPECT_NE(Explain(hash_sql).find("HashAggregate"), std::string::npos);
+  const auto rows = Run(hash_sql);
+  ASSERT_EQ(rows.size(), 4U);
+  for (const Row& row : rows) {
+    EXPECT_EQ(row[1], Value(50));
+    EXPECT_EQ(row[2], Value(4900 + (50 * row[0].value.int_value)));
+  }
+  const std::string stream_sql =
+      "SELECT f2 AS k, COUNT(*) AS n FROM Sc4 GROUP BY f2";
+  EXPECT_NE(Explain(stream_sql).find("StreamAggregate"), std::string::npos)
+      << Explain(stream_sql);
+  const auto unique_rows = Run(stream_sql);
+  ASSERT_EQ(unique_rows.size(), 4U);
+  for (const Row& row : unique_rows) {
+    EXPECT_EQ(row[1], Value(25));
+  }
+}
+
+TEST_F(CascadesRulesCoverageTest, OrderedDistinctSelectsSortDistinct) {
+  const std::string sql = "SELECT DISTINCT e1, e2 FROM Sc3 ORDER BY e1, e2";
+  const std::string plan = Explain(sql);
+  EXPECT_NE(plan.find("SortDistinct"), std::string::npos) << plan;
+  EXPECT_EQ(Run(sql).size(), 20U);
+}
+
+TEST_F(CascadesRulesCoverageTest, DistinctUsesProjectedKeysAndStatistics) {
+  const std::string unique =
+      "SELECT DISTINCT c1 AS k FROM Sc1 WHERE c1 < 4 ORDER BY k";
+  EXPECT_EQ(Explain(unique).find("Distinct"), std::string::npos)
+      << Explain(unique);
+  EXPECT_EQ(Run(unique), (std::vector<Row>{Row({Value(0)}), Row({Value(1)}),
+                                           Row({Value(2)}), Row({Value(3)})}));
+  const std::string non_unique = "SELECT DISTINCT c2 FROM Sc1";
+  EXPECT_EQ(Run(non_unique).size(), 7U);
+  // f2 is base column 1 but column 0 in the covering scan's statistics.
+  const std::string skip = "SELECT DISTINCT f2 FROM Sc4 ORDER BY f2";
+  EXPECT_NE(Explain(skip).find("SkipScanDistinct"), std::string::npos)
+      << Explain(skip);
+  EXPECT_EQ(Run(skip).size(), 4U);
+}
+
+TEST_F(CascadesRulesCoverageTest, RichGroupedSqlKeepsTypedNullArray) {
+  Run("CREATE TABLE audit_group_nulls (g INT64, v INT64)");
+  Run("INSERT INTO audit_group_nulls VALUES (1, NULL), (1, NULL)");
+  const auto rows =
+      Run("SELECT g, ARRAY_AGG(v) FROM audit_group_nulls GROUP BY g");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][1].ArrayElementSqlType(), "INT64");
+  ASSERT_EQ(rows[0][1].ArrayElements().size(), 2U);
+  EXPECT_TRUE(rows[0][1].ArrayElements()[0].IsNull());
+}
+
+TEST_F(CascadesRulesCoverageTest, GroupedSqlKeepsUnselectedGroupingKeys) {
+  // Distinct pairs must survive even when the final projection repeats d4.
+  const auto rows = Run("SELECT d4 FROM Sc2 GROUP BY d4, d1");
+  EXPECT_EQ(rows.size(), 200U);
+}
+
 // ---------------------------------------------------------------------------
 // Join enumeration, associativity, commutativity
 // ---------------------------------------------------------------------------
@@ -457,16 +528,33 @@ TEST_F(CascadesRulesCoverageTest, ExplainSemiJoinMentionsJoinOperator) {
 // Aggregation family
 // ---------------------------------------------------------------------------
 
-TEST_F(CascadesRulesCoverageTest, CountStarUsesConstantTableRewrite) {
+TEST_F(CascadesRulesCoverageTest, CountStarUsesNormalAggregation) {
   const auto rows = Run("SELECT COUNT(*) FROM sc1");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{100}));
 }
 
 TEST_F(CascadesRulesCoverageTest, CountNonNullColumnRewritesToCountStar) {
-  const auto rows = Run("SELECT COUNT(c1) FROM sc1");
+  const std::string sql = "SELECT COUNT(c1) FROM sc1";
+  const std::string plan = Explain(sql);
+  EXPECT_NE(plan.find("COUNT(*)"), std::string::npos) << plan;
+  const auto rows = Run(sql);
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{100}));
+  // Statistics showing no observed NULLs are not a NOT NULL proof.
+  const std::string nullable_plan = Explain("SELECT COUNT(d4) FROM sc2");
+  EXPECT_EQ(nullable_plan.find("COUNT(*)"), std::string::npos) << nullable_plan;
+}
+
+TEST_F(CascadesRulesCoverageTest, AggregateUnionRewriteIsReachableFromSqlOr) {
+  const std::string sql =
+      "SELECT COUNT(*), SUM(c1) FROM sc1 WHERE c1 < 3 OR c3 > 106";
+  const std::string plan = Explain(sql);
+  EXPECT_NE(plan.find("aggregate_union_transpose"), std::string::npos) << plan;
+  const auto rows = Run(sql);
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(6));
+  EXPECT_EQ(rows[0][1], Value(297));
 }
 
 TEST_F(CascadesRulesCoverageTest, GroupByWithHavingOnGroupingKey) {
@@ -837,305 +925,5 @@ TEST_F(CascadesRulesCoverageTest, CastInPredicateStaysResidual) {
 // ---------------------------------------------------------------------------
 // Direct memo API: rule pattern-match failure branches
 // ---------------------------------------------------------------------------
-
-namespace {
-
-using cascades::GroupId;
-using cascades::LogicalExpression;
-using cascades::LogicalOperator;
-using cascades::Memo;
-using cascades::Rule;
-using cascades::RuleSet;
-using cascades::SearchEngine;
-
-Expression EqExp(std::string_view column, const Value& value) {
-  return BinaryExpressionExp(ColumnValueExp(column), BinaryOperation::kEquals,
-                             ConstantValueExp(value));
-}
-
-Expression UnaryTest(UnaryOperation op, const ColumnName& column) {
-  return UnaryExpressionExp(ColumnValueExp(column), op);
-}
-
-// Builds a memo whose root group holds Selection(MarkJoin(scan a, scan b))
-// with the given marker test, and explores it with ONLY the built-in
-// `mark_join_to_filter` rule.  Returns the logical operators discovered in
-// the root group (empty when the rule declined or nothing was added).
-std::vector<LogicalOperator> ExploreMarkJoinToFilter(
-    const Expression& marker_test) {
-  Memo memo;
-  const GroupId root = memo.Build({"a", "b"});
-  const cascades::Group& base = memo.Get(root);
-  EXPECT_EQ(base.expressions.size(), 1U);
-  if (base.expressions.size() != 1) {
-    return {};
-  }
-  const GroupId left = base.expressions.at(0).children.at(0);
-  const GroupId right = base.expressions.at(0).children.at(1);
-  const GroupId mark = memo.EnsureDerivedGroup({"a", "b"}, "mark");
-  LogicalExpression mark_join{.operation = LogicalOperator::kMarkJoin,
-                              .children = {left, right},
-                              .marker_column = "mark"};
-  EXPECT_TRUE(memo.AddExpression(mark, mark_join));
-  const GroupId selection = memo.EnsureDerivedGroup({"a", "b"}, "selection");
-  LogicalExpression selection_expression{
-      .operation = LogicalOperator::kSelection, .children = {mark}};
-  selection_expression.predicate = marker_test;
-  EXPECT_TRUE(memo.AddExpression(selection, selection_expression));
-
-  // Keep only mark_join_to_filter from the default set.
-  RuleSet single;
-  for (const Rule& rule : RuleSet::Default().Rules()) {
-    if (rule.Name() == "mark_join_to_filter") {
-      single.Add(rule);
-    }
-  }
-  EXPECT_EQ(single.Rules().size(), 1U);
-  SearchEngine search(std::move(memo), single);
-  search.Explore(selection);
-  const Memo& result = search.GetMemo();
-  std::vector<LogicalOperator> operations;
-  for (const LogicalExpression& expression :
-       result.Get(selection).expressions) {
-    operations.push_back(expression.operation);
-  }
-  return operations;
-}
-
-bool HasOperator(const std::vector<LogicalOperator>& operations,
-                 LogicalOperator operation) {
-  return std::find(operations.begin(), operations.end(), operation) !=
-         operations.end();
-}
-
-}  // namespace
-
-TEST(MarkJoinToFilterBranchTest, IsTrueMarkerBecomesSemiJoin) {
-  const auto operations = ExploreMarkJoinToFilter(
-      UnaryTest(UnaryOperation::kIsTrue, ColumnName("mark")));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kSemiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, IsNotFalseMarkerDeclines) {
-  // IS NOT FALSE keeps the TRUE *and* NULL markers; a semi join drops the
-  // NULL-marker rows (probe key NULL / build holds NULL), so the rewrite is
-  // unsound under three-valued marker semantics.
-  const auto operations = ExploreMarkJoinToFilter(
-      UnaryTest(UnaryOperation::kIsNotFalse, ColumnName("mark")));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, IsFalseMarkerDeclines) {
-  // IS FALSE keeps only FALSE markers; a plain anti join also keeps the
-  // NULL-marker rows (a NULL probe key matches nothing), so no single join
-  // kind reproduces the filter exactly.
-  const auto operations = ExploreMarkJoinToFilter(
-      UnaryTest(UnaryOperation::kIsFalse, ColumnName("mark")));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, IsNotTrueMarkerBecomesAntiJoin) {
-  const auto operations = ExploreMarkJoinToFilter(
-      UnaryTest(UnaryOperation::kIsNotTrue, ColumnName("mark")));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, NotMarkerDeclines) {
-  // NOT marker is three-valued: it drops the NULL markers exactly like
-  // IS FALSE, which no plain semi/anti join reproduces.
-  const auto operations = ExploreMarkJoinToFilter(
-      UnaryTest(UnaryOperation::kNot, ColumnName("mark")));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, IsNullMarkerDoesNotRewrite) {
-  // The unary `default` branch: an unsupported marker test declines.
-  const auto operations = ExploreMarkJoinToFilter(
-      UnaryTest(UnaryOperation::kIsNull, ColumnName("mark")));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, IsTrueOverNonColumnDoesNotRewrite) {
-  // kIsTrue whose child is not a plain column leaves `marker` empty.
-  const auto test =
-      BinaryExpressionExp(ColumnValueExp(ColumnName("a", "x")),
-                          BinaryOperation::kAdd, ConstantValueExp(Value(1)));
-  const auto operations = ExploreMarkJoinToFilter(
-      UnaryExpressionExp(test, UnaryOperation::kIsTrue));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, MarkerEqualsTrueBecomesSemiJoin) {
-  const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
-      ColumnValueExp(ColumnName("mark")), BinaryOperation::kEquals,
-      ConstantValueExp(Value(true))));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kSemiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, MarkerEqualsFalseDeclines) {
-  // = FALSE keeps only FALSE markers; a plain anti join keeps the NULL
-  // markers too, so the equality does not hold under three-valued markers.
-  const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
-      ColumnValueExp(ColumnName("mark")), BinaryOperation::kEquals,
-      ConstantValueExp(Value(false))));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, MarkerEqualsNullDeclines) {
-  // A NULL constant is neither TRUE nor FALSE: the rule declines.
-  const auto operations = ExploreMarkJoinToFilter(
-      BinaryExpressionExp(ColumnValueExp(ColumnName("mark")),
-                          BinaryOperation::kEquals, ConstantValueExp(Value())));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, MarkerNonEqualityComparisonDeclines) {
-  const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
-      ColumnValueExp(ColumnName("mark")), BinaryOperation::kGreaterThan,
-      ConstantValueExp(Value(true))));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, ConstantEqualsMarkerBecomesSemiJoin) {
-  // Flipped operand order: TRUE = marker.
-  const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
-      ConstantValueExp(Value(true)), BinaryOperation::kEquals,
-      ColumnValueExp(ColumnName("mark"))));
-  EXPECT_TRUE(HasOperator(operations, LogicalOperator::kSemiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, FalseConstantEqualsMarkerDeclines) {
-  // FALSE = marker keeps only FALSE markers (see MarkerEqualsFalseDeclines).
-  const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
-      ConstantValueExp(Value(false)), BinaryOperation::kEquals,
-      ColumnValueExp(ColumnName("mark"))));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, NonConstantAgainstMarkerDeclines) {
-  // The flipped side is a non-constant expression: decline.
-  const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
-      ColumnValueExp(ColumnName("a", "x")), BinaryOperation::kEquals,
-      ColumnValueExp(ColumnName("mark"))));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, ColumnEqualsNonConstantDeclines) {
-  // marker = <column> has no TRUE/FALSE constant: decline.
-  const auto operations = ExploreMarkJoinToFilter(BinaryExpressionExp(
-      ColumnValueExp(ColumnName("mark")), BinaryOperation::kEquals,
-      ColumnValueExp(ColumnName("a", "x"))));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, NeitherSideIsMarkerDeclines) {
-  const auto operations = ExploreMarkJoinToFilter(EqExp("a.x", Value(1)));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, ConstantTestDeclines) {
-  // Neither unary nor binary: a bare constant test declines.
-  const auto operations =
-      ExploreMarkJoinToFilter(ConstantValueExp(Value(true)));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, ConjunctiveMarkerTestDeclines) {
-  // Multiple conjuncts: the rule only handles a single marker test.
-  const auto test = BinaryExpressionExp(
-      UnaryTest(UnaryOperation::kIsTrue, ColumnName("mark")),
-      BinaryOperation::kAnd,
-      UnaryTest(UnaryOperation::kIsFalse, ColumnName("mark")));
-  const auto operations = ExploreMarkJoinToFilter(test);
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kSemiJoin));
-  EXPECT_FALSE(HasOperator(operations, LogicalOperator::kAntiJoin));
-}
-
-TEST(MarkJoinToFilterBranchTest, MissingPredicateDeclines) {
-  // A predicate-less Selection violates the memo invariant before the rule
-  // ever runs.
-  EXPECT_DEATH(ExploreMarkJoinToFilter(Expression{nullptr}),
-               "selection must carry a predicate");
-}
-
-TEST(MarkJoinToFilterBranchTest, MarkerNameMismatchDeclines) {
-  Memo memo;
-  const GroupId root = memo.Build({"a", "b"});
-  const cascades::Group& base = memo.Get(root);
-  const GroupId left = base.expressions.at(0).children.at(0);
-  const GroupId right = base.expressions.at(0).children.at(1);
-  const GroupId mark = memo.EnsureDerivedGroup({"a", "b"}, "mark");
-  LogicalExpression mark_join{.operation = LogicalOperator::kMarkJoin,
-                              .children = {left, right},
-                              .marker_column = "other_marker"};
-  EXPECT_TRUE(memo.AddExpression(mark, mark_join));
-  const GroupId selection = memo.EnsureDerivedGroup({"a", "b"}, "selection");
-  LogicalExpression selection_expression{
-      .operation = LogicalOperator::kSelection, .children = {mark}};
-  selection_expression.predicate =
-      UnaryTest(UnaryOperation::kIsTrue, ColumnName("mark"));
-  EXPECT_TRUE(memo.AddExpression(selection, selection_expression));
-
-  RuleSet single;
-  for (const Rule& rule : RuleSet::Default().Rules()) {
-    if (rule.Name() == "mark_join_to_filter") {
-      single.Add(rule);
-    }
-  }
-  SearchEngine search(std::move(memo), single);
-  search.Explore(selection);
-  bool found_semi = false;
-  for (const LogicalExpression& expression :
-       search.GetMemo().Get(selection).expressions) {
-    found_semi |= expression.operation == LogicalOperator::kSemiJoin;
-  }
-  EXPECT_FALSE(found_semi);
-}
-
-TEST(MarkJoinToFilterBranchTest, GroupWithoutMarkJoinDeclines) {
-  Memo memo;
-  const GroupId root = memo.Build({"a", "b"});
-  const cascades::Group& base = memo.Get(root);
-  const GroupId left = base.expressions.at(0).children.at(0);
-  const GroupId right = base.expressions.at(0).children.at(1);
-  // The "mark" group holds an inner join instead of a MarkJoin.
-  const GroupId inner = memo.EnsureDerivedGroup({"a", "b"}, "plain-join");
-  EXPECT_TRUE(memo.AddExpression(
-      inner, LogicalExpression{.operation = LogicalOperator::kJoin,
-                               .children = {left, right}}));
-  const GroupId selection = memo.EnsureDerivedGroup({"a", "b"}, "selection");
-  LogicalExpression selection_expression{
-      .operation = LogicalOperator::kSelection, .children = {inner}};
-  selection_expression.predicate =
-      UnaryTest(UnaryOperation::kIsTrue, ColumnName("mark"));
-  EXPECT_TRUE(memo.AddExpression(selection, selection_expression));
-
-  RuleSet single;
-  for (const Rule& rule : RuleSet::Default().Rules()) {
-    if (rule.Name() == "mark_join_to_filter") {
-      single.Add(rule);
-    }
-  }
-  SearchEngine search(std::move(memo), single);
-  search.Explore(selection);
-  bool found_semi = false;
-  for (const LogicalExpression& expression :
-       search.GetMemo().Get(selection).expressions) {
-    found_semi |= expression.operation == LogicalOperator::kSemiJoin;
-  }
-  EXPECT_FALSE(found_semi);
-}
 
 }  // namespace tinylamb

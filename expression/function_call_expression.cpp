@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -36,11 +37,21 @@
 #include <optional>
 #include <ostream>
 #include <random>
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC 15 reports -Wmaybe-uninitialized inside <regex>'s NFA construction when
+// instantiating std::regex in sanitizer builds; the library code is fine.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <regex>
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -54,9 +65,12 @@
 #include "expression/evaluation_context.hpp"
 #include "expression/expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/json_doc.hpp"
+#include "expression/json_text.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/sql_udf.hpp"
+#include "type/collation.hpp"
 #include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
@@ -569,38 +583,39 @@ std::optional<DecodedUtf8> DecodeUtf8(std::string_view value, size_t offset) {
   const auto byte_at = [&](size_t index) {
     return static_cast<unsigned char>(value[index]);
   };
-  const unsigned char first = byte_at(offset);
+  const auto first = byte_at(offset);
   if (first <= 0x7F) {
-    return DecodedUtf8{first, 1};
+    return DecodedUtf8{.code_point = first, .length = 1};
   }
   if (first >= 0xC2 && first <= 0xDF && offset + 1 < value.size() &&
       (byte_at(offset + 1) & 0xC0) == 0x80) {
-    return DecodedUtf8{static_cast<uint32_t>(((first & 0x1F) << 6) |
-                                             (byte_at(offset + 1) & 0x3F)),
-                       2};
+    return DecodedUtf8{
+        .code_point = static_cast<uint32_t>(((first & 0x1F) << 6) |
+                                            (byte_at(offset + 1) & 0x3F)),
+        .length = 2};
   }
   if (first >= 0xE0 && first <= 0xEF && offset + 2 < value.size() &&
       (byte_at(offset + 1) & 0xC0) == 0x80 &&
       (byte_at(offset + 2) & 0xC0) == 0x80) {
-    const uint32_t code_point = static_cast<uint32_t>(
+    const auto code_point = static_cast<uint32_t>(
         ((first & 0x0F) << 12) | ((byte_at(offset + 1) & 0x3F) << 6) |
         (byte_at(offset + 2) & 0x3F));
     if (code_point < 0x800 || (code_point >= 0xD800 && code_point <= 0xDFFF)) {
       return std::nullopt;
     }
-    return DecodedUtf8{code_point, 3};
+    return DecodedUtf8{.code_point = code_point, .length = 3};
   }
   if (first >= 0xF0 && first <= 0xF4 && offset + 3 < value.size() &&
       (byte_at(offset + 1) & 0xC0) == 0x80 &&
       (byte_at(offset + 2) & 0xC0) == 0x80 &&
       (byte_at(offset + 3) & 0xC0) == 0x80) {
-    const uint32_t code_point = static_cast<uint32_t>(
+    const auto code_point = static_cast<uint32_t>(
         ((first & 0x07) << 18) | ((byte_at(offset + 1) & 0x3F) << 12) |
         ((byte_at(offset + 2) & 0x3F) << 6) | (byte_at(offset + 3) & 0x3F));
     if (code_point < 0x10000 || code_point > 0x10FFFF) {
       return std::nullopt;
     }
-    return DecodedUtf8{code_point, 4};
+    return DecodedUtf8{.code_point = code_point, .length = 4};
   }
   return std::nullopt;
 }
@@ -631,7 +646,8 @@ const std::locale& UnicodeLocale() {
     for (const char* name : {"C.UTF-8", "C.utf8", "en_US.UTF-8"}) {
       try {
         return std::locale(name);
-      } catch (const std::exception&) {
+      } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
+        // Fall through to the next candidate locale name.
       }
     }
     return std::locale::classic();
@@ -1387,6 +1403,77 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
       return Value();
     }
     return Value(UnicodeLower(raw_str(values[0])));
+  }
+  if (name == "collate") {
+    // COLLATE(value, 'spec'): attaches a collator without changing the
+    // value. Every downstream comparison, grouping and ordering then resolves
+    // the same collation through the shared contract (type/collation.hpp); the
+    // batch evaluator applies the identical rule.
+    if (values.size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "COLLATE requires 2 arguments");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    return values[0].WithCollation(
+        static_cast<uint8_t>(CollationOfSpec(raw_str(values[1]))));
+  }
+  if (name == "bit_count") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "BIT_COUNT requires 1 argument");
+    }
+    const Value& input = values[0];
+    if (input.IsNull()) {
+      return Value();
+    }
+    if (input.type != ValueType::kInt64) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "BIT_COUNT requires an INT32/INT64 argument");
+    }
+    // The runtime value model keeps every integer in an INT64 slot (INT32
+    // declarations are width-validated at cast time only), so the popcount
+    // runs at the storage width: identical to GoogleSQL for non-negative
+    // inputs of any declared width.
+    return Value(static_cast<int64_t>(
+        std::popcount(static_cast<uint64_t>(input.value.int_value))));
+  }
+  if (name == "normalize_and_casefold" || name == "normalize") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    if (values[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires a STRING argument");
+    }
+    // The engine keeps text in composed form and has no decompose/compose
+    // tables: NFC/NFKC are identity-preserving for composed input, while
+    // the decomposed forms are rejected instead of silently mis-normalized.
+    if (values.size() == 2) {
+      if (values[1].type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           name + " normalization mode must be a STRING");
+      }
+      const std::string mode_text = raw_str(values[1]);
+      std::string mode;
+      for (char c : mode_text) {
+        mode.push_back(
+            static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+      }
+      if (mode != "NFC" && mode != "NFKC") {
+        return StatusError(StatusCode::kNotImplemented,
+                           name + " supports NFC/NFKC only, got " + mode);
+      }
+    }
+    if (name == "normalize") {
+      return values[0];
+    }
+    return Value(UnicodeCaseFold(raw_str(values[0])));
   }
   auto to_numeric_double = [](const Value& val,
                               const std::string& fname) -> StatusOr<double> {
@@ -3317,6 +3404,17 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     output << std::put_time(&utc, "%Y-%m-%d %H:%M:%S");
     return Value(output.str());
   }
+  if (name == "user" || name == "session_user") {
+    if (!values.empty()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "USER takes no arguments");
+    }
+    const char* os_user = std::getenv("USER");
+    if (os_user == nullptr || *os_user == '\0') {
+      os_user = std::getenv("LOGNAME");
+    }
+    return Value(std::string(os_user != nullptr ? os_user : "tinylamb"));
+  }
   if (name == "current_datetime") {
     if (values.size() > 1) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -3766,6 +3864,45 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     return Value(digest::Sha512Digest(input));
   }
 
+  if (name == "farm_fingerprint") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "FARM_FINGERPRINT requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    return Value(
+        static_cast<int64_t>(digest::FarmFingerprint64(raw_str(values[0]))));
+  }
+
+  // PARSE_JSON validates strict JSON text and hands it back in the engine's
+  // string-based JSON representation; TO_JSON renders a scalar/struct value
+  // as JSON text. Struct payloads ({...} VARCHAR) pass through both routes
+  // untouched so TO_JSON(PARSE_JSON(...)) round-trips object text.
+  if (name == "parse_json" || name == "to_json") {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 argument");
+    }
+    if (values[0].IsNull()) {
+      return Value();
+    }
+    if (name == "parse_json") {
+      if (values[0].type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "PARSE_JSON requires a string argument");
+      }
+      const std::string_view text = values[0].value.varchar_value;
+      if (!json_text::IsValid(text)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Parsed JSON is invalid");
+      }
+      return Value(std::string(text));
+    }
+    return Value(json_text::ToJsonText(values[0]));
+  }
+
   // JSON accessor family.  The same evaluator backs the json_path_constant_fold
   // rewrite (fold) and this execution path, so constant and row-wise inputs
   // cannot diverge.
@@ -3782,6 +3919,13 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     }
     const std::string path = values.size() == 2 ? raw_str(values[1]) : "$";
     return EvaluateJsonFunctionCall(name, raw_str(values[0]), path);
+  }
+
+  // The JSON document family (JSON_TYPE/KEYS/ARRAY_LENGTH/SET/INSERT/REPLACE/
+  // REMOVE/ARRAY/OBJECT and the LAX_* coercions) shares one implementation
+  // with the relational evaluator through json_doc.
+  if (json_doc::family::IsJsonFamilyFunction(name)) {
+    return json_doc::family::Evaluate(name, values);
   }
 
   // INTERVAL construction from runtime parts (the visitor emits this for
@@ -3926,6 +4070,7 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
                          "DATE value out of range");
     }
     int64_t step_days = 1;
+    int64_t step_months = 0;
     if (values.size() == 3) {
       const Value& step = values[2];
       if (step.type == ValueType::kInt64) {
@@ -3935,19 +4080,47 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
         ASSIGN_OR_RETURN(IntervalValue, parsed,
                          text.empty() ? StatusOr<IntervalValue>{IntervalValue{}}
                                       : IntervalValue::TryParse(text));
-        if (parsed.months != 0 || parsed.nanos != 0) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "unsupported GENERATE_DATE_ARRAY step unit");
+        if (parsed.nanos != 0 || (parsed.months != 0 && parsed.days != 0)) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "unsupported GENERATE_DATE_ARRAY step unit: the step must be "
+              "a whole number of days or of months");
         }
-        step_days = parsed.days;
+        if (parsed.months != 0) {
+          step_months = parsed.months;
+          step_days = 0;
+        } else {
+          step_days = parsed.days;
+        }
       }
     }
-    if (step_days == 0) {
+    if (step_days == 0 && step_months == 0) {
       return StatusError(StatusCode::kIsInfinity, "Sequence step cannot be 0.");
     }
-    if ((step_days > 0 && start_days > end_days) ||
-        (step_days < 0 && start_days < end_days)) {
+    if ((step_days >= 0 && step_months >= 0 && start_days > end_days) ||
+        (step_days <= 0 && step_months <= 0 && start_days < end_days)) {
       return Value::Array({}, "DATE");
+    }
+    if (step_months != 0) {
+      // Month/quarter/year steps advance through the calendar (month-end
+      // clamped like DATE_ADD), not through fixed day counts.
+      std::vector<Value> elements;
+      constexpr size_t kMaxGeneratedDates = 1'000'000;
+      int64_t d = start_days;
+      while (step_months > 0 ? d <= end_days : d >= end_days) {
+        if (elements.size() == kMaxGeneratedDates) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "GENERATE_DATE_ARRAY generated too many elements");
+        }
+        elements.push_back(Value::DateFromDays(d));
+        ASSIGN_OR_RETURN(int64_t, next,
+                         (TryAddDateIntervalDays(d, step_months, "month")));
+        if (next == d) {
+          break;  // defensive: a clamped add that stopped moving forward
+        }
+        d = next;
+      }
+      return Value::Array(std::move(elements), "DATE");
     }
     std::vector<Value> elements;
     constexpr size_t kMaxGeneratedDates = 1'000'000;
@@ -3990,6 +4163,45 @@ std::string UnicodeUpper(std::string_view value) {
 
 std::string UnicodeLower(std::string_view value) {
   return ConvertUnicodeCase(value, UnicodeCaseMode::kLower, {}, false);
+}
+
+std::string UnicodeCaseFold(std::string_view value) {
+  // Full case folding for the entries where folding diverges from lowercase
+  // within the engine's Latin/Latin-1/Greek coverage; everything else falls
+  // back to lowercase.  Comparison-oriented: casefold('STRASSE') and
+  // casefold('stra\303\237e') both normalize the sharp s to "ss".
+  static const std::unordered_map<uint32_t, std::string> kFullFolding = {
+      {0x00DF, "ss"},  // ß
+      {
+          0x03C2, "\xCF\x82" /* σ (final sigma folds to sigma) */
+      },
+      {0x00B5, "\xCE\xBC" /* µ MICRO SIGN → μ GREEK SMALL MU */},
+      {0x0130, "i\xCC\x87" /* İ → i + COMBINING DOT ABOVE */},
+      {0xFB00, "ff"},
+      {0xFB01, "fi"},
+      {0xFB02, "fl"},
+      {0xFB03, "ffi"},
+      {0xFB04, "ffl"},
+      {0xFB05, "st"},
+      {0xFB06, "st"},
+  };
+  std::string result;
+  result.reserve(value.size());
+  for (size_t offset = 0; offset < value.size();) {
+    const auto decoded = DecodeUtf8(value, offset);
+    if (!decoded.has_value()) {
+      result.push_back(value[offset++]);
+      continue;
+    }
+    const auto found = kFullFolding.find(decoded->code_point);
+    if (found != kFullFolding.end()) {
+      result += found->second;
+    } else {
+      AppendUtf8(&result, UnicodeCaseCodePoint(decoded->code_point, false));
+    }
+    offset += decoded->length;
+  }
+  return result;
 }
 
 std::string UnicodeInitcap(std::string_view value, std::string_view delimiters,
@@ -4880,8 +5092,21 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
     return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
-      func_name_.ends_with("_array")) {
+      func_name_ == "json_keys" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
+  }
+  if (func_name_ == "json_array_length" || func_name_ == "lax_int64" ||
+      func_name_ == "lax_bool") {
+    return {TypeTag::kBigInt};
+  }
+  if (func_name_ == "lax_float64") {
+    return {TypeTag::kDouble};
+  }
+  if (func_name_ == "json_type" || func_name_ == "json_array" ||
+      func_name_ == "json_object" || func_name_ == "json_set" ||
+      func_name_ == "json_insert" || func_name_ == "json_replace" ||
+      func_name_ == "json_remove" || func_name_ == "lax_string") {
+    return {TypeTag::kVarChar};
   }
   if (func_name_ == "concat" || func_name_ == "current_timestamp" ||
       func_name_ == "format" || func_name_ == "substr" ||
@@ -5005,8 +5230,21 @@ Type FunctionCallExpression::ResultType(const Schema& left,
     return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
-      func_name_.ends_with("_array")) {
+      func_name_ == "json_keys" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
+  }
+  if (func_name_ == "json_array_length" || func_name_ == "lax_int64" ||
+      func_name_ == "lax_bool") {
+    return {TypeTag::kBigInt};
+  }
+  if (func_name_ == "lax_float64") {
+    return {TypeTag::kDouble};
+  }
+  if (func_name_ == "json_type" || func_name_ == "json_array" ||
+      func_name_ == "json_object" || func_name_ == "json_set" ||
+      func_name_ == "json_insert" || func_name_ == "json_replace" ||
+      func_name_ == "json_remove" || func_name_ == "lax_string") {
+    return {TypeTag::kVarChar};
   }
   if (func_name_ == "concat" || func_name_ == "current_timestamp" ||
       func_name_ == "format" || func_name_ == "substr" ||

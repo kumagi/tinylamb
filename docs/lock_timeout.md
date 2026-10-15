@@ -16,6 +16,35 @@ own deadlock policies (`DeadlockPolicy`: `kLegacy` 5ms abort,
 `kWaitDie`/`kWoundWait` timestamp ordering, `kDeadlockDetect` background
 wait-for graph with youngest-victim wounding); see
 `transaction/transaction_manager.hpp` and `docs/lock_order.md` §7-8.
+**The default is `kDeadlockDetect`** (2026-09-28): the wait-for detector is
+event-driven (sleeps until a wait-for edge exists) and resolves a cycle by
+wounding the youngest participant within one notification. TPC-C W=2
+measurements: at 32 clients the previous `kLegacy` default accumulated
+12x more engine aborts (each a full undo walk with CLR WAL records) and
+~30% less throughput; at 64 clients legacy reached 48,533 aborts vs 1,435
+under detection. `kLegacy` remains selectable explicitly for benchmarks.
+
+## Write-intent wait failure classification (2026-10-01)
+
+Every failed write-intent wait records *why* it gave up —
+`Transaction::IntentWaitFailure`: `kConflict` (try-mode contention),
+`kWounded` (wounded by the deadlock detector or a waiter-die timestamp
+rule), `kHolderAborting` (the conflicting holder started aborting),
+`kTimeout` (the 5-second wait ceiling), or `kFailStopped` (the manager is
+shutting down). `executor/index_scan.cpp` surfaces these as distinct
+messages; the pre-classification blanket "write intent wait timed out"
+text was misleading — real 5-second timeouts were rare, with try-mode
+conflicts and wounds dominating.
+
+When the conflicting holder is itself aborting, waiters give up after
+`kHolderAbortGiveupDelay` (250 ms, `transaction/transaction_manager.cpp`)
+instead of waiting out the full 5 seconds: the holder's undo walk may need
+the very page latch a waiter holds, so a shorter give-up breaks the latch
+cycle. The 250 ms grace period is load-bearing — without it, the strict-2PL
+"wait completes before the holder's intent disappears" contract breaks and
+`DeadlockDetectorBreaksThreeTransactionCycle` flakes. A `kDeadlockDetect`
+give-up must also remove its own wait-for edge, or the stale edge fabricates
+a phantom cycle.
 
 ## 実装上の注意(2026-08-24 レビュー反映)
 

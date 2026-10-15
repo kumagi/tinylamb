@@ -32,6 +32,17 @@ enum class BytecodeOp : uint8_t {
   kJumpIfFalse,
   kJumpIfTrue,
   kJump,
+  // EXTRACT(year|month|day FROM date): pops one DATE/VARCHAR value and pushes
+  // the extracted part as INT64.  `operand` selects the part (0 = year,
+  // 1 = month, 2 = day).  The kernel reproduces the AST's
+  // extract_{year,month,day} evaluator (string-slice + stoll) exactly,
+  // including its error conditions, so differential coverage holds.
+  kExtractDatePart,
+  // Discards the stack top.  The searched-CASE lowering uses it to drop a
+  // WHEN condition that was already peeked by its conditional jump (the
+  // jump decides without popping), keeping the stack depth invariant across
+  // every branch path.
+  kPop,
 };
 
 struct BytecodeInstruction {
@@ -58,6 +69,23 @@ class BytecodeProgram {
   [[nodiscard]] StatusOr<Value> TryEvaluateRow(const Row& row) const;
   // EXC-SHIM: deprecated throwing wrapper; library callers use TryEvaluateRow.
   [[nodiscard]] Value EvaluateRow(const Row& row) const;
+
+  // Boxing-free interpreter result: kDone fills *out, kError fills *error,
+  // kUnsupported means the program shape or an operand needs the canonical
+  // interpreter (the caller retries with TryEvaluateRow; nothing was
+  // consumed).
+  enum class FastEval { kDone, kUnsupported, kError };
+  // Evaluates numeric programs (columns/constants, int64+double arithmetic,
+  // comparisons, unary, EXTRACT date parts) straight on the row cells without
+  // constructing intermediate Values.  Semantics mirror the canonical
+  // interpreter instruction-for-instruction; differential_test compares both
+  // paths.  Only valid after a successful Compile (the shape flag is computed
+  // there; hand-built programs report kUnsupported).
+  [[nodiscard]] FastEval TryEvaluateRowFast(const Row& row, Value* out,
+                                            Status* error) const;
+  // True when every instruction is in the fast interpreter's supported set
+  // and the constants it loads are numeric (the Compile-time shape scan).
+  [[nodiscard]] bool FastInterpretable() const { return fast_interpretable_; }
   [[nodiscard]] const std::vector<BytecodeInstruction>& Instructions() const {
     return instructions_;
   }
@@ -83,12 +111,17 @@ class BytecodeProgram {
     return true;
   }
   void SetResultType(ValueType type) { result_type_ = type; }
+  // Compile-time shape scan: marks whether TryEvaluateRowFast can take this
+  // program.  Only the compiler may call it (hand-built programs stay
+  // canonical-only, which keeps the flag an under-approximation).
+  void SetFastInterpretable(bool fast) { fast_interpretable_ = fast; }
 
  private:
   friend class BytecodeCompiler;
   std::vector<BytecodeInstruction> instructions_;
   std::vector<Value> constants_;
   ValueType result_type_{ValueType::kNull};
+  bool fast_interpretable_{false};
 };
 
 class BytecodeCompiler {
@@ -108,6 +141,14 @@ class BytecodeCompiler {
 // executed through the AST evaluation path (the semantic reference) and
 // compared against the bytecode/JIT fast path.
 [[nodiscard]] bool BytecodeEnabled();
+
+// Row evaluation through the boxing-free interpreter with a canonical
+// fallback: fast-shaped programs (columns/constants/int64+double arithmetic)
+// skip intermediate Value construction; every other shape runs
+// BytecodeProgram::TryEvaluateRow.  Semantics are identical on both legs
+// (differential_test pins this).
+[[nodiscard]] StatusOr<Value> TryEvaluateRowAuto(const BytecodeProgram& program,
+                                                 const Row& row);
 
 }  // namespace tinylamb
 #endif

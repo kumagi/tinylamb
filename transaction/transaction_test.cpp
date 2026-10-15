@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -35,8 +36,10 @@
 #include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
+#include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "transaction/lock_manager.hpp"
@@ -54,7 +57,7 @@ class TransactionTest : public ::testing::Test {
     pm_.reset();
     l_.reset();
     if (!log_name_.empty()) {
-      std::ignore = std::remove(log_name_.c_str());
+      tinylamb::RemoveLogAndSegments(log_name_);
       log_name_.clear();
     }
     // Unique log file per run: parallel test suites must not share a WAL.
@@ -73,7 +76,7 @@ class TransactionTest : public ::testing::Test {
     pm_.reset();
     l_.reset();
     if (!log_name_.empty()) {
-      std::ignore = std::remove(log_name_.c_str());
+      tinylamb::RemoveLogAndSegments(log_name_);
       log_name_.clear();
     }
   }
@@ -86,10 +89,83 @@ class TransactionTest : public ::testing::Test {
   std::unique_ptr<TransactionManager> tm_;
 };
 
+namespace {
+class RecordingFinishHook final : public TransactionFinishHook {
+ public:
+  void OnTransactionFinished(TransactionStatus status) noexcept override {
+    status_ = status;
+    calls_++;
+  }
+
+  TransactionStatus status_{TransactionStatus::kUnknown};
+  size_t calls_{0};
+};
+}  // namespace
+
+// Round 9 regression: the index-undo reservation drain is the wait every
+// B+Tree insert parks in when a split's bytes are still reserved. A wounded
+// waiter (deadlock-detector victim) must bail at the first slice -- its
+// abort releases the very reservations everyone is waiting for -- instead
+// of riding the full write-intent limit while holding its own row intents.
+TEST_F(TransactionTest, ReservationDrainBailsWhenWounded) {
+  Transaction holder = tm_->Begin();
+  holder.ReserveIndexUndoBytes(1234, 512);
+  Transaction waiter = tm_->Begin();
+  waiter.Wound();
+  const auto start = std::chrono::steady_clock::now();
+  const Status drained =
+      waiter.WaitAllIndexReservationsDrain(std::chrono::seconds(30));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_EQ(drained, Status::kConflicts);
+  EXPECT_LT(elapsed, std::chrono::seconds(1));
+  ASSERT_SUCCESS(tm_->Abort(holder));
+}
+
+// The drain honors an explicit short budget: B+Tree passes one wherever the
+// caller may hold an index write gate, because a multi-second wait under
+// the gate deadlocks against a reservation owner whose next index op needs
+// the same gate. Past the budget the honest kConflicts surfaces.
+TEST_F(TransactionTest, ReservationDrainHonorsShortBudget) {
+  Transaction holder = tm_->Begin();
+  holder.ReserveIndexUndoBytes(4321, 512);
+  Transaction waiter = tm_->Begin();
+  const auto start = std::chrono::steady_clock::now();
+  const Status drained =
+      waiter.WaitAllIndexReservationsDrain(std::chrono::milliseconds(150));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_EQ(drained, Status::kConflicts);
+  EXPECT_LT(elapsed, std::chrono::seconds(1));
+  ASSERT_SUCCESS(tm_->Abort(holder));
+}
+
 TEST_F(TransactionTest, construct) {
   // Arrange -- nothing to set up; default TransactionManager created by SetUp()
   // Act -- nothing to execute; default constructed via SetUp()
   // Assert -- nothing to verify; gtest green on pass, death on crash
+}
+
+TEST_F(TransactionTest, FinishHooksRunOnCommitAbortAndMove) {
+  auto committed_hook = std::make_shared<RecordingFinishHook>();
+  Transaction committed = tm_->Begin();
+  committed.AddFinishHook(committed_hook);
+  ASSERT_EQ(committed.PreCommit(), Status::kSuccess);
+  EXPECT_EQ(committed_hook->calls_, 1U);
+  EXPECT_EQ(committed_hook->status_, TransactionStatus::kCommitted);
+
+  auto aborted_hook = std::make_shared<RecordingFinishHook>();
+  Transaction aborted = tm_->Begin();
+  aborted.AddFinishHook(aborted_hook);
+  ASSERT_EQ(tm_->Abort(aborted), Status::kSuccess);
+  EXPECT_EQ(aborted_hook->calls_, 1U);
+  EXPECT_EQ(aborted_hook->status_, TransactionStatus::kAborted);
+
+  auto moved_hook = std::make_shared<RecordingFinishHook>();
+  Transaction source = tm_->Begin();
+  source.AddFinishHook(moved_hook);
+  Transaction moved(std::move(source));
+  ASSERT_EQ(moved.PreCommit(), Status::kSuccess);
+  EXPECT_EQ(moved_hook->calls_, 1U);
+  EXPECT_EQ(moved_hook->status_, TransactionStatus::kCommitted);
 }
 
 TEST_F(TransactionTest, UpgradePreservesUnrelatedSharedLocks) {
@@ -135,6 +211,33 @@ TEST_F(TransactionTest, TransactionIdsIncrement) {
   ASSERT_EQ(third.ID(), 3U);
 }
 
+// Long-uptime gauges: an operator watching RuntimeStats must see the MVCC
+// chain backlog and the live-transaction count move so a GC-pinning runaway
+// transaction is diagnosable before memory becomes a problem.
+TEST_F(TransactionTest, RuntimeStatsReportsGaugesForLongUptime) {
+  const RowPosition row(7, 1);
+  Transaction publisher = tm_->Begin();
+  ASSERT_TRUE(publisher.AddWriteSet(row, "before"));
+  publisher.RegisterVersionWrite(row, "before", "after");
+  ASSERT_EQ(publisher.PreCommit(), Status::kSuccess);
+
+  Transaction writer = tm_->Begin();
+  Transaction reader = tm_->Begin();
+  const TransactionRuntimeStats stats = tm_->RuntimeStats();
+  EXPECT_EQ(stats.active_transactions, 2U);
+  // The committed chain from |publisher| (GC runs asynchronously and only
+  // after kGcCommitThreshold commits, so it is still retained here).
+  EXPECT_GE(stats.version_chains, 1U);
+  EXPECT_GE(stats.current_commit_ts, 1U);
+  EXPECT_NE(stats.oldest_snapshot_ts, 0U);
+  EXPECT_LE(stats.oldest_snapshot_ts, stats.current_commit_ts);
+  EXPECT_EQ(stats.write_intent_attempts, 0U);
+
+  ASSERT_EQ(tm_->Abort(writer), Status::kSuccess);
+  ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
+  EXPECT_EQ(tm_->RuntimeStats().active_transactions, 0U);
+}
+
 TEST_F(TransactionTest, ReadOnlyTransactionCommit) {
   // Arrange -- nothing more than fixture setup
   // Act -- commit a read-only transaction
@@ -144,6 +247,71 @@ TEST_F(TransactionTest, ReadOnlyTransactionCommit) {
 
   // Assert -- the read-only transaction finishes without writing a commit log
   ASSERT_TRUE(txn.IsFinished());
+}
+
+TEST_F(TransactionTest, WalScratchReuseKeepsCommitBytesExact) {
+  Transaction txn = tm_->Begin();
+  const std::string first_payload(1024, 'a');
+  const std::string second_payload("b\0c", 3);
+  const LogRecord first =
+      LogRecord::InsertingLogRecord(0, txn.ID(), 1, 2, first_payload);
+  const lsn_t first_start = txn.InsertLog(1, 2, first_payload).Value();
+  const lsn_t second_start = txn.InsertLog(3, 4, second_payload).Value();
+  ASSERT_EQ(first_start, 0U);
+  ASSERT_EQ(second_start, first_start + first.Serialize().size());
+  ASSERT_EQ(txn.PreCommit(), Status::kSuccess);
+  ASSERT_EQ(l_->WaitForDurable(l_->BufferedLSN()), Status::kSuccess);
+
+  const LogRecord second = LogRecord::InsertingLogRecord(first_start, txn.ID(),
+                                                         3, 4, second_payload);
+  const LogRecord commit(second_start, txn.ID(), LogType::kCommit);
+  const std::string expected =
+      first.Serialize() + second.Serialize() + commit.Serialize();
+
+  std::ifstream file(log_name_, std::ios::binary);
+  std::ostringstream contents;
+  contents << file.rdbuf();
+  EXPECT_EQ(contents.str(), expected);
+}
+
+TEST_F(TransactionTest, FirstLsnRemainsAtOldestRecord) {
+  Transaction txn = tm_->Begin();
+  const lsn_t first = txn.InsertLog(1, 0, "first").Value();
+  const lsn_t second = txn.InsertLog(1, 1, "second").Value();
+  EXPECT_EQ(txn.FirstLSN(), first);
+  EXPECT_NE(txn.PrevLSN(), first);
+  EXPECT_EQ(
+      second,
+      first + LogRecord::InsertingLogRecord(0, txn.ID(), 1, 0, "first").Size());
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(TransactionTest, FinishedTransactionCannotAppendWal) {
+  Transaction txn = tm_->Begin();
+  ASSERT_SUCCESS(txn.PreCommit());
+  EXPECT_EQ(txn.InsertLog(1, 0, "forbidden").GetStatus(),
+            Status::kRuntimeError);
+}
+
+TEST_F(TransactionTest, FinishedTransactionCannotPreCommitAgain) {
+  Transaction txn = tm_->Begin();
+  ASSERT_SUCCESS(txn.Abort());
+  EXPECT_EQ(txn.PreCommit(), Status::kRuntimeError);
+}
+
+TEST_F(TransactionTest, WoundedTransactionCannotCommit) {
+  Transaction txn = tm_->Begin();
+  txn.Wound();
+  EXPECT_EQ(txn.PreCommit(), Status::kConflicts);
+  EXPECT_TRUE(txn.IsFinished());
+}
+
+TEST_F(TransactionTest, ReadOnlyTransactionCannotAppendWal) {
+  Transaction txn = tm_->Begin(true);
+  EXPECT_EQ(txn.InsertLog(1, 0, "forbidden").GetStatus(),
+            Status::kInvalidArgument);
+  EXPECT_FALSE(txn.HasLogRecord());
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(TransactionTest, ReadOnlyTransactionAbort) {
@@ -222,8 +390,10 @@ TEST_F(TransactionTest, ReadVersionPhysicalFallback) {
   auto with_physical = tm_->ReadVersion(txn, rp, std::string_view("physical"));
   auto without_physical = tm_->ReadVersion(txn, rp, std::nullopt);
 
-  // Assert -- the physical value falls back when no version chain exists
-  ASSERT_SUCCESS_AND_EQ(with_physical, "physical");
+  // Assert -- with no version chain the manager reports nullopt: the
+  // latched page image is authoritative and the caller serves a view of
+  // it (no per-read copy).
+  ASSERT_SUCCESS_AND_EQ(with_physical, std::optional<std::string>());
   ASSERT_EQ(without_physical.GetStatus(), Status::kNotExists);
   txn.PreCommit();
 }
@@ -252,7 +422,8 @@ TEST_F(TransactionTest, GcDropsRedundantLatestVersionBeforeDeleteIntentRead) {
   Transaction deleting = tm_->Begin();
   ASSERT_TRUE(deleting.AddWriteSet(rp));
   ASSERT_SUCCESS_AND_EQ(
-      tm_->ReadVersion(deleting, rp, std::string_view("physical")), "physical");
+      tm_->ReadVersion(deleting, rp, std::string_view("physical")),
+      std::optional<std::string>());
   deleting.Abort();
 }
 

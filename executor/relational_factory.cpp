@@ -23,20 +23,24 @@
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/apply.hpp"
+#include "executor/band_join.hpp"
 #include "executor/batch_nested_loop_join.hpp"
 #include "executor/bitmap_scan.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
 #include "executor/detail/relation.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
+#include "executor/grouped_aggregate.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/incremental_sort.hpp"
-#include "executor/index_join.hpp"
 #include "executor/index_only_scan.hpp"
 #include "executor/index_scan.hpp"
+#include "executor/late_materialization_join.hpp"
 #include "executor/limit.hpp"
+#include "executor/lookup_join.hpp"
 #include "executor/materialize.hpp"
 #include "executor/max1_row.hpp"
 #include "executor/merge_append.hpp"
@@ -59,13 +63,17 @@
 #include "executor/unnest.hpp"
 #include "executor/values.hpp"
 #include "executor/window.hpp"
+#include "executor/zigzag_join.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/parameter_slot.hpp"
+#include "expression/rewrite.hpp"
 #include "index/index.hpp"
 #include "page/row_position.hpp"
 #include "plan/aggregation_plan.hpp"
 #include "plan/apply_plan.hpp"
+#include "plan/band_join_plan.hpp"
 #include "plan/bitmap_scan_plan.hpp"
 #include "plan/distinct_plan.hpp"
 #include "plan/empty_plan.hpp"
@@ -75,6 +83,7 @@
 #include "plan/index_only_scan_plan.hpp"
 #include "plan/index_scan_plan.hpp"
 #include "plan/index_skip_scan_plan.hpp"
+#include "plan/late_materialization_join_plan.hpp"
 #include "plan/limit_plan.hpp"
 #include "plan/materialize_plan.hpp"
 #include "plan/max1_row_plan.hpp"
@@ -97,6 +106,7 @@
 #include "plan/unnest_plan.hpp"
 #include "plan/values_plan.hpp"
 #include "plan/window_plan.hpp"
+#include "plan/zigzag_join_plan.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -173,6 +183,15 @@ class RelationRenameExecutor final : public ExecutorBase {
     return count;
   }
   void Dump(std::ostream& o, int indent) const override;
+  // Renaming is layout-transparent (rows and positions pass through
+  // untouched), so a dynamic join filter addressed by slot reaches the scan
+  // below unchanged. This is what makes the filter reach the storage-level
+  // pre-decode rejection instead of stopping at this decorator.
+  bool AttachRuntimeFilter(
+      const std::shared_ptr<const RuntimeFilterGroup>& group, slot_t column,
+      ValueType type) override {
+    return src_->AttachRuntimeFilter(group, column, type);
+  }
 
  private:
   Executor src_;
@@ -187,8 +206,14 @@ void RelationRenameExecutor::Dump(std::ostream& o, int indent) const {
 }
 
 Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
-  // DML source scans (lock_rows_) must resolve rows under a write intent;
-  // the morsel-based ParallelScan has no such hook, so they stay on the
+  // A morsel-parallel scan with the morsel-ordered handoff still delivers
+  // stored-chain order (D-9), so a clustered-order proof no longer forces the
+  // single-threaded FullScan; the ordered parallel scan just refuses row
+  // filter pushdown (deferred-row parking would reorder). IsOrderedBy
+  // consults EmitsChainOrderedScan, so the two never disagree.
+  //
+  // DML source scans (lock_rows_) must resolve rows under a write intent; the
+  // morsel-based ParallelScan has no such hook, so they stay on the
   // single-threaded FullScan.
   if (!lock_rows_ && MaxRows() == std::numeric_limits<size_t>::max() &&
       stats_.Rows() >= kParallelScanMinRows) {
@@ -197,15 +222,45 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
         std::min(kMaxParallelScanWorkers,
                  std::max<size_t>(1, std::thread::hardware_concurrency()));
     return std::make_shared<ParallelScan>(txn.txn_, table_, workers, 8,
-                                          std::nullopt, peek_compares_);
+                                          projection_, peek_compares_,
+                                          ReportsClusteredOrder());
+  }
+  const slot_t clustered = ClusteredColumn();
+  std::optional<ColumnName> clustered_order;
+  if (clustered != kNoClusteredColumn) {
+    clustered_order = table_.GetSchema().GetColumn(clustered).Name();
   }
   return std::make_shared<FullScan>(txn.txn_, table_, MaxRows(), lock_rows_,
-                                    wait_for_write_intent_);
+                                    wait_for_write_intent_,
+                                    std::move(clustered_order), projection_);
 }
 
 Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<Selection>(exp_, src_->GetSchema(),
-                                     src_->EmitExecutor(ctx));
+  Executor src = src_->EmitExecutor(ctx);
+  // A Selection directly above a morsel-parallel scan is the Cascades core's
+  // big-table filter shape.  When the predicate lowers to context-free
+  // bytecode, push it into the scan so the decode workers decide rows before
+  // chunk append (the serial Selection evaluates on the single consumer
+  // thread); rows a worker program cannot decide park for the same
+  // context-free re-check the serial Selection would run.  Everything else
+  // keeps the streaming serial Selection.
+  auto* scan = dynamic_cast<ParallelScan*>(src.get());
+  if (scan != nullptr && scan->CanTakeRowFilter() &&
+      std::getenv("TINYLAMB_DISABLE_WORKER_SCAN_FILTER") == nullptr &&
+      !relational_detail::ContainsQuery(exp_) && BytecodeEnabled()) {
+    std::vector<Expression> conjuncts = SplitConjuncts(exp_);
+    auto filter = std::make_unique<relational_detail::CompiledScanFilter>(
+        relational_detail::CompileScanFilter(conjuncts, src_->GetSchema()));
+    auto programs =
+        std::make_unique<relational_detail::WorkerScanFilterPrograms>(
+            relational_detail::CompileWorkerFilter(*filter, src_->GetSchema()));
+    if (programs->complete) {
+      scan->SetRowFilter(std::move(conjuncts), std::move(*filter),
+                         std::move(*programs));
+      return src;
+    }
+  }
+  return std::make_shared<Selection>(exp_, src_->GetSchema(), std::move(src));
 }
 
 Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -223,16 +278,146 @@ Executor SamplePlan::EmitExecutor(TransactionContext& ctx) const {
                                                child_->GetSchema(), spec_);
 }
 
-Executor SortPlan::EmitExecutor(TransactionContext& ctx) const {
-  std::vector<SortExecutor::Key> keys;
-  keys.reserve(Keys().size());
-  for (const SortKey& key : Keys()) {
-    keys.push_back(SortExecutor::Key{.expression = key.expression,
-                                     .ascending = key.ascending,
-                                     .nulls_first = key.nulls_first});
+namespace {
+// Translates a plan sort key list into the operator's key list; both shapes
+// (BufferedSortPlan / ExternalMergeSortPlan) and the base node use it, so the
+// ORDER BY contract reaches the operator identically in every case.
+std::vector<SortExecutor::Key> ExecutorSortKeys(
+    const std::vector<SortKey>& keys) {
+  std::vector<SortExecutor::Key> out;
+  out.reserve(keys.size());
+  for (const SortKey& key : keys) {
+    out.push_back(SortExecutor::Key{.expression = key.expression,
+                                    .ascending = key.ascending,
+                                    .nulls_first = key.nulls_first,
+                                    .collation = key.collation});
   }
+  return out;
+}
+
+// The physical options a plan's logical memory policy (SortMemoryPolicy)
+// resolves to. The operator keeps its own spill selection as the last resort,
+// so a mis-estimated shape still returns the right rows in the right order.
+SortExecutor::Options SortExecutorOptions(const SortPlan& plan) {
+  const SortMemoryPolicy& memory = plan.Memory();
+  return SortExecutor::Options{
+      .spill_mode = SortExecutor::SpillMode::kAuto,
+      .memory_budget_bytes = memory.memory_budget_bytes,
+      .merge_window_rows = memory.merge_window_rows,
+      .spill_threshold_rows = 0};
+}
+
+// The physical options a plan's logical memory policy (AggregateMemoryPolicy)
+// resolves to. Shared by the three grouped shapes so they cannot disagree about
+// the memory contract they were planned with.
+GroupedAggregateOptions GroupedAggregateOptionsFor(
+    const AggregationPlan& plan) {
+  const AggregateMemoryPolicy& memory = plan.Memory();
+  GroupedAggregateOptions options;
+  options.memory_budget_bytes = memory.memory_budget_bytes;
+  options.spill_partition_count = AggregateSpillPartitionCount(memory);
+  options.merge_window_rows = memory.merge_window_rows;
+  return options;
+}
+
+// Workers the hash shape may use. Same threshold and worker cap as the scalar
+// parallel aggregation, so one rule decides "is this big enough to fan out" for
+// every aggregation shape.
+size_t GroupedAggregateWorkers(size_t child_rows) {
+  if (child_rows < kParallelAggregationMinRows) {
+    return 1;
+  }
+  constexpr size_t kMaxParallelAggregationWorkers = 16;
+  return std::min(kMaxParallelAggregationWorkers,
+                  std::max<size_t>(1, std::thread::hardware_concurrency()));
+}
+
+// The no-GROUP-BY-KEYS path, shared by all three shapes: the historical serial
+// accumulator with its typed batch fast path, promoted to the parallel
+// accumulator above the threshold. A payload without keys has exactly one
+// group, so every shape routes here and the no-key behavior cannot differ
+// between them.
+Executor EmitScalarAggregation(const AggregationPlan& plan,
+                               TransactionContext& ctx) {
+  const std::vector<NamedExpression>& aggregates = plan.Aggregates();
+  // ParallelAggregationExecutor keeps only streaming scalar state
+  // (PartialState has no per-aggregate row buffer), so aggregates that need
+  // whole-group context — HAVING MIN/MAX, inner ORDER BY/LIMIT, a secondary
+  // argument — or kinds with no parallel kernel (ARRAY_AGG, STRING_AGG,
+  // ANY_VALUE, BIT_*, COUNTIF, approx sketches) must stay on the serial
+  // AggregationExecutor, where AggregateAccumulator buffers and replays.
+  const bool parallel_safe =
+      std::ranges::all_of(aggregates, [](const NamedExpression& named) {
+        if (!named.expression ||
+            named.expression->Type() != TypeTag::kAggregateExp) {
+          return false;
+        }
+        const auto& agg = named.expression->AsAggregateExpression();
+        if (agg.Having() != AggregateHavingModifier::kNone ||
+            !agg.InnerOrderBy().empty() || agg.InnerLimit().has_value() ||
+            agg.SecondaryArg() || agg.HasInnerGroupBy()) {
+          return false;
+        }
+        switch (agg.GetType()) {
+          case AggregationType::kCount:
+          case AggregationType::kSum:
+          case AggregationType::kAvg:
+          case AggregationType::kMin:
+          case AggregationType::kMax:
+          case AggregationType::kLogicalAnd:
+          case AggregationType::kLogicalOr:
+            return agg.TrailingArgs().empty();
+          default:
+            return IsStatisticalAggregate(agg.GetType());
+        }
+      });
+  if (parallel_safe &&
+      plan.Child()->EmitRowCount() >= kParallelAggregationMinRows) {
+    // Cap workers like the parallel table scan path; unbounded
+    // hardware_concurrency() oversubscribes under nested or concurrent
+    // aggregations.
+    constexpr size_t kMaxParallelAggregationWorkers = 16;
+    const size_t workers =
+        std::min(kMaxParallelAggregationWorkers,
+                 std::max<size_t>(1, std::thread::hardware_concurrency()));
+    return std::make_shared<ParallelAggregationExecutor>(
+        plan.Child()->EmitExecutor(ctx), plan.Child()->GetSchema(), aggregates,
+        workers);
+  }
+  return std::make_shared<AggregationExecutor>(
+      plan.Child()->EmitExecutor(ctx), plan.Child()->GetSchema(), aggregates);
+}
+}  // namespace
+
+Executor SortPlan::EmitExecutor(TransactionContext& ctx) const {
+  // The base node predates the shape split, so it keeps the historical wiring
+  // byte for byte: no shape bound, the operator's own spill selection only.
+  return std::make_shared<SortExecutor>(
+      Child()->EmitExecutor(ctx), Child()->GetSchema(),
+      ExecutorSortKeys(Keys()), 1, SortExecutor::Options{});
+}
+
+Executor BufferedSortPlan::EmitExecutor(TransactionContext& ctx) const {
+  // In-memory sort bounded by the shape's memory budget. It never plans a
+  // spill, but it keeps the operator's budget-driven fallback so a wrong row
+  // estimate cannot change the answer.
+  SortExecutor::Options options = SortExecutorOptions(*this);
+  options.spill_mode = SortExecutor::SpillMode::kBuffered;
   return std::make_shared<SortExecutor>(Child()->EmitExecutor(ctx),
-                                        Child()->GetSchema(), std::move(keys));
+                                        Child()->GetSchema(),
+                                        ExecutorSortKeys(Keys()), 1, options);
+}
+
+Executor ExternalMergeSortPlan::EmitExecutor(TransactionContext& ctx) const {
+  // Sorted runs are written once the shape's row threshold is reached, and the
+  // tail run is always written, so the working set stays bounded by the memory
+  // budget however large the input is.
+  SortExecutor::Options options = SortExecutorOptions(*this);
+  options.spill_mode = SortExecutor::SpillMode::kExternalMerge;
+  options.spill_threshold_rows = SpillThresholdRows();
+  return std::make_shared<SortExecutor>(Child()->EmitExecutor(ctx),
+                                        Child()->GetSchema(),
+                                        ExecutorSortKeys(Keys()), 1, options);
 }
 
 Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -241,7 +426,8 @@ Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
   for (const TopNKey& key : Keys()) {
     keys.push_back(TopNExecutor::Key{.expression = key.expression,
                                      .ascending = key.ascending,
-                                     .nulls_first = key.nulls_first});
+                                     .nulls_first = key.nulls_first,
+                                     .collation = key.collation});
   }
   return std::make_shared<TopNExecutor>(Child()->EmitExecutor(ctx),
                                         Child()->GetSchema(), std::move(keys),
@@ -299,12 +485,14 @@ Executor IncrementalSortPlan::EmitExecutor(TransactionContext& ctx) const {
   for (const SortKey& key : prefix_keys_) {
     prefix.push_back(SortExecutor::Key{.expression = key.expression,
                                        .ascending = key.ascending,
-                                       .nulls_first = key.nulls_first});
+                                       .nulls_first = key.nulls_first,
+                                       .collation = key.collation});
   }
   for (const SortKey& key : suffix_keys_) {
     suffix.push_back(SortExecutor::Key{.expression = key.expression,
                                        .ascending = key.ascending,
-                                       .nulls_first = key.nulls_first});
+                                       .nulls_first = key.nulls_first,
+                                       .collation = key.collation});
   }
   return std::make_shared<IncrementalSortExecutor>(
       child_->EmitExecutor(ctx), child_->GetSchema(), std::move(prefix),
@@ -328,7 +516,8 @@ Executor SetOperationPlan::EmitExecutor(TransactionContext& ctx) const {
     for (const SortKey& key : OrderKeys()) {
       keys.push_back(SortExecutor::Key{.expression = key.expression,
                                        .ascending = key.ascending,
-                                       .nulls_first = key.nulls_first});
+                                       .nulls_first = key.nulls_first,
+                                       .collation = key.collation});
     }
     return std::make_shared<MergeAppendExecutor>(
         std::move(children), std::move(schemas), GetSchema(), std::move(keys));
@@ -338,50 +527,48 @@ Executor SetOperationPlan::EmitExecutor(TransactionContext& ctx) const {
 }
 
 Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
-  // ParallelAggregationExecutor keeps only streaming scalar state
-  // (PartialState has no per-aggregate row buffer), so aggregates that need
-  // whole-group context — HAVING MIN/MAX, inner ORDER BY/LIMIT, a secondary
-  // argument — or kinds with no parallel kernel (ARRAY_AGG, STRING_AGG,
-  // ANY_VALUE, BIT_*, COUNTIF, approx sketches) must stay on the serial
-  // AggregationExecutor, where AggregateAccumulator buffers and replays.
-  const bool parallel_safe =
-      std::ranges::all_of(aggregates_, [](const NamedExpression& named) {
-        if (!named.expression ||
-            named.expression->Type() != TypeTag::kAggregateExp) {
-          return false;
-        }
-        const auto& agg = named.expression->AsAggregateExpression();
-        if (agg.Having() != AggregateHavingModifier::kNone ||
-            !agg.InnerOrderBy().empty() || agg.InnerLimit().has_value() ||
-            agg.SecondaryArg() || agg.HasInnerGroupBy()) {
-          return false;
-        }
-        switch (agg.GetType()) {
-          case AggregationType::kCount:
-          case AggregationType::kSum:
-          case AggregationType::kAvg:
-          case AggregationType::kMin:
-          case AggregationType::kMax:
-          case AggregationType::kLogicalAnd:
-          case AggregationType::kLogicalOr:
-            return agg.TrailingArgs().empty();
-          default:
-            return IsStatisticalAggregate(agg.GetType());
-        }
-      });
-  if (parallel_safe && child_->EmitRowCount() >= kParallelAggregationMinRows) {
-    // Cap workers like the parallel table scan path; unbounded
-    // hardware_concurrency() oversubscribes under nested or concurrent
-    // aggregations.
-    constexpr size_t kMaxParallelAggregationWorkers = 16;
-    const size_t workers =
-        std::min(kMaxParallelAggregationWorkers,
-                 std::max<size_t>(1, std::thread::hardware_concurrency()));
-    return std::make_shared<ParallelAggregationExecutor>(
-        child_->EmitExecutor(ctx), child_->GetSchema(), aggregates_, workers);
+  return EmitScalarAggregation(*this, ctx);
+}
+
+Executor HashAggregatePlan::EmitExecutor(TransactionContext& ctx) const {
+  if (GroupKeys().empty()) {
+    return EmitScalarAggregation(*this, ctx);
   }
-  return std::make_shared<AggregationExecutor>(
-      child_->EmitExecutor(ctx), child_->GetSchema(), aggregates_);
+  // Hash table over the group keys. Workers are only asked for above the
+  // parallel-aggregation threshold, and the operator itself refuses them when
+  // the payload is not positionally foldable.
+  GroupedAggregateOptions options = GroupedAggregateOptionsFor(*this);
+  options.worker_count = GroupedAggregateWorkers(Child()->EmitRowCount());
+  return std::make_shared<HashAggregateExecutor>(
+      Child()->EmitExecutor(ctx), Child()->GetSchema(), GroupKeys(),
+      Aggregates(), Having(), options);
+}
+
+Executor SortAggregatePlan::EmitExecutor(TransactionContext& ctx) const {
+  if (GroupKeys().empty()) {
+    return EmitScalarAggregation(*this, ctx);
+  }
+  // Sorted runs over the group keys, then one pass over the equal runs. The
+  // run threshold is the shape's memory contract, so the sort plans its own
+  // spill instead of discovering one.
+  GroupedAggregateOptions options = GroupedAggregateOptionsFor(*this);
+  options.spill_threshold_rows = SpillThresholdRows();
+  return std::make_shared<SortAggregateExecutor>(
+      Child()->EmitExecutor(ctx), Child()->GetSchema(), GroupKeys(),
+      Aggregates(), Having(), options);
+}
+
+Executor StreamAggregatePlan::EmitExecutor(TransactionContext& ctx) const {
+  if (GroupKeys().empty()) {
+    return EmitScalarAggregation(*this, ctx);
+  }
+  // One group resident, no hash table and no sort — valid only over an input
+  // that already arrives in group-key order, which the shape verifies itself.
+  GroupedAggregateOptions options = GroupedAggregateOptionsFor(*this);
+  options.require_ordered_input = true;
+  return std::make_shared<StreamAggregateExecutor>(
+      Child()->EmitExecutor(ctx), Child()->GetSchema(), GroupKeys(),
+      Aggregates(), Having(), options);
 }
 
 Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
@@ -561,6 +748,19 @@ void BuildKeyOffsets(const Schema& schema,
   }
 }
 
+const Index* ZigZagIndex(const Plan& plan) {
+  if (const auto* scan = dynamic_cast<const IndexScanPlan*>(plan.get())) {
+    return &scan->GetIndex();
+  }
+  if (const auto* scan = dynamic_cast<const IndexOnlyScanPlan*>(plan.get())) {
+    return &scan->GetIndex();
+  }
+  if (const auto* scan = dynamic_cast<const IndexSkipScanPlan*>(plan.get())) {
+    return ZigZagIndex(scan->GetSource());
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -592,6 +792,119 @@ Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
       std::move(right), Kind(), Left()->GetSchema().ColumnCount(),
       Right()->GetSchema().ColumnCount(), Residual(),
       std::move(residual_schema));
+}
+
+Executor BandJoinPlan::EmitExecutor(TransactionContext& ctx) const {
+  std::vector<slot_t> left;
+  std::vector<slot_t> right;
+  BuildKeyOffsets(Left()->GetSchema(), LeftKeys(), &left);
+  BuildKeyOffsets(Right()->GetSchema(), RightKeys(), &right);
+  const Schema combined = Left()->GetSchema() + Right()->GetSchema();
+  const Schema output_schema = IsSemiJoinKind(Kind()) ||
+                                       IsAntiJoinKind(Kind()) ||
+                                       IsNullAwareAntiJoinKind(Kind())
+                                   ? Left()->GetSchema()
+                                   : combined;
+  return std::make_shared<BandJoin>(
+      Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),
+      std::move(right), Comparison(), Predicate(), combined, Kind(),
+      Left()->GetSchema().ColumnCount(), Right()->GetSchema().ColumnCount(),
+      output_schema);
+}
+
+Executor LateMaterializationJoinPlan::EmitExecutor(
+    TransactionContext& ctx) const {
+  CHECK_MSG(RightTable() != nullptr,
+            "LateMaterializationJoinPlan requires a right table");
+  const Schema& right_physical = RightTable()->GetSchema();
+  CHECK_MSG(GetSchema().ColumnCount() > Left()->GetSchema().ColumnCount(),
+            "LateMaterializationJoinPlan requires a right payload schema");
+  std::vector<Column> right_columns;
+  right_columns.reserve(GetSchema().ColumnCount() -
+                        Left()->GetSchema().ColumnCount());
+  for (size_t i = Left()->GetSchema().ColumnCount();
+       i < GetSchema().ColumnCount(); ++i) {
+    right_columns.push_back(GetSchema().GetColumn(i));
+  }
+  const Schema right_output("", std::move(right_columns));
+  CHECK_MSG(RightProjection().size() == right_output.ColumnCount(),
+            "LateMaterializationJoinPlan payload width mismatch");
+  const auto fallback = [&] {
+    Executor right = std::make_shared<FullScan>(ctx.txn_, *RightTable());
+    bool identity_projection =
+        RightProjection().size() == right_physical.ColumnCount();
+    for (size_t i = 0; identity_projection && i < RightProjection().size();
+         ++i) {
+      identity_projection = RightProjection()[i] == static_cast<slot_t>(i);
+    }
+    if (!identity_projection) {
+      std::vector<NamedExpression> items;
+      items.reserve(right_output.ColumnCount());
+      for (size_t i = 0; i < right_output.ColumnCount(); ++i) {
+        const slot_t source = RightProjection()[i];
+        items.emplace_back(
+            right_output.GetColumn(i).Name().ToString(),
+            ColumnValueExp(right_physical.GetColumn(source).Name()));
+      }
+      right = std::make_shared<Projection>(std::move(items), right_physical,
+                                           std::move(right));
+    }
+    return std::make_shared<NestedLoopJoin>(
+        Left()->EmitExecutor(ctx), Left()->GetSchema(), std::move(right),
+        right_output, Predicate());
+  };
+  if (Identity() == LateMaterializationIdentity::kRowId) {
+    return std::make_shared<LateMaterializationJoin>(
+        ctx.txn_, Left()->EmitExecutor(ctx), *RightTable(), GetSchema(),
+        RowId(), RightProjection(), Predicate());
+  }
+  if (RightIndex() == nullptr) {
+    return fallback();
+  }
+  std::vector<slot_t> left;
+  std::vector<slot_t> right;
+  BuildKeyOffsets(Left()->GetSchema(), LeftKeys(), &left);
+  BuildKeyOffsets(right_physical, RightKeys(), &right);
+  if (ctx.txn_.IndexKeysMayBeStale(RightIndex()->Root())) {
+    return fallback();
+  }
+  auto guard = ctx.txn_.AcquireIndexReadGuard(RightIndex()->Root());
+  return std::make_shared<LateMaterializationJoin>(
+      ctx.txn_, Left()->EmitExecutor(ctx), std::move(left), *RightTable(),
+      *RightIndex(), std::move(right), GetSchema(), Predicate(), UniqueWinner(),
+      RightProjection(), std::move(guard));
+}
+
+Executor ZigZagJoinPlan::EmitExecutor(TransactionContext& ctx) const {
+  std::vector<slot_t> left;
+  std::vector<slot_t> right;
+  BuildKeyOffsets(Left()->GetSchema(), {LeftKey()}, &left);
+  BuildKeyOffsets(Right()->GetSchema(), {RightKey()}, &right);
+
+  const Index* left_index = ZigZagIndex(Left());
+  const Index* right_index = ZigZagIndex(Right());
+  if ((left_index != nullptr &&
+       ctx.txn_.IndexKeysMayBeStale(left_index->Root())) ||
+      (right_index != nullptr &&
+       ctx.txn_.IndexKeysMayBeStale(right_index->Root()))) {
+    return std::make_shared<NestedLoopJoin>(
+        Left()->EmitExecutor(ctx), Left()->GetSchema(),
+        Right()->EmitExecutor(ctx), Right()->GetSchema(), Predicate());
+  }
+
+  Executor left_executor = Left()->EmitExecutor(ctx);
+  Executor right_executor = Right()->EmitExecutor(ctx);
+  if ((left_index != nullptr &&
+       ctx.txn_.IndexKeysMayBeStale(left_index->Root())) ||
+      (right_index != nullptr &&
+       ctx.txn_.IndexKeysMayBeStale(right_index->Root()))) {
+    return std::make_shared<NestedLoopJoin>(
+        std::move(left_executor), Left()->GetSchema(),
+        std::move(right_executor), Right()->GetSchema(), Predicate());
+  }
+  return std::make_shared<ZigZagJoin>(std::move(left_executor), left.front(),
+                                      std::move(right_executor), right.front(),
+                                      Operation(), Predicate(), GetSchema());
 }
 
 Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -663,7 +976,18 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   if (right_tbl_ != nullptr) {
     Executor left_executor = left_src_->EmitExecutor(ctx);
     auto index_read_guard = ctx.txn_.AcquireIndexReadGuard(right_idx_->Root());
-    if (ctx.txn_.IndexKeysMayBeStale(right_idx_->Root())) {
+    const bool any_null_safe =
+        std::ranges::any_of(key_null_safe_, [](bool safe) { return safe; });
+    // Index nested loop: the probe columns are resolved in the index's key
+    // order, so the seek key is a real prefix of the stored key image even when
+    // only some of a composite index's key columns are join keys.
+    //
+    // Three shapes have no index probe and lower to the hash join over a full
+    // scan of the right table instead: a stale index read set, NULL-safe equi
+    // keys (the index seek has no NULL-key path), and an absent derived probe
+    // (no leading index key column is a join key, so there is no point lookup
+    // to perform in the first place).
+    const auto hash_over_full_scan = [&] {
       auto join = std::make_shared<HashJoin>(
           std::move(left_executor), left,
           std::make_shared<FullScan>(ctx.txn_, *right_tbl_), right, hash_mode_,
@@ -672,11 +996,37 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
               16, std::max<size_t>(1, std::thread::hardware_concurrency())),
           right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount());
       join->SetJoinAnnotations(key_null_safe_, residual_note_);
+      if (residual_note_ &&
+          (kind_ == JoinKind::kLeftOuter || kind_ == JoinKind::kRightOuter ||
+           kind_ == JoinKind::kFullOuter)) {
+        join->SetJoinResidual(residual_note_,
+                              left_src_->GetSchema() + right_schema);
+      }
       return join;
+    };
+    if (ctx.txn_.IndexKeysMayBeStale(right_idx_->Root()) || any_null_safe ||
+        !Lookup()) {
+      return hash_over_full_scan();
     }
-    return std::make_shared<IndexJoin>(ctx.txn_, std::move(left_executor), left,
-                                       *right_tbl_, *right_idx_, right,
-                                       std::move(index_read_guard));
+    const LookupSeek& seek = *Lookup();
+    std::vector<slot_t> probe_left;
+    std::vector<slot_t> probe_right;
+    probe_left.reserve(seek.left_columns.size());
+    probe_right.reserve(seek.right_columns.size());
+    for (const ColumnName& column : seek.left_columns) {
+      std::vector<slot_t> offset;
+      BuildKeyOffsets(left_src_->GetSchema(), {column}, &offset);
+      probe_left.push_back(offset.front());
+    }
+    for (const ColumnName& column : seek.right_columns) {
+      std::vector<slot_t> offset;
+      BuildKeyOffsets(right_schema, {column}, &offset);
+      probe_right.push_back(offset.front());
+    }
+    return std::make_shared<LookupJoin>(
+        ctx.txn_, std::move(left_executor), std::move(probe_left), *right_tbl_,
+        *right_idx_, std::move(probe_right), seek.range_position,
+        seek.range_operation, std::move(index_read_guard));
   }
   if (kind_ != JoinKind::kInner) {
     // Semi/anti and outer hash joins retain the logical join kind.  Widths
@@ -689,8 +1039,27 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
             16, std::max<size_t>(1, std::thread::hardware_concurrency())),
         right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount());
     join->SetJoinAnnotations(key_null_safe_, residual_note_);
+    if (semi_reduction_) {
+      // Phase 2 "Hash Semi Reduction": a semi/anti join emits only the probe
+      // side, so its hash build is a pure membership test and the executor may
+      // shrink it. Every other kind ignores the marker.
+      join->EnableSemiReduction();
+    }
+    if (residual_note_ &&
+        (kind_ == JoinKind::kLeftOuter || kind_ == JoinKind::kRightOuter ||
+         kind_ == JoinKind::kFullOuter)) {
+      join->SetJoinResidual(residual_note_,
+                            left_src_->GetSchema() + right_schema);
+    }
     return join;
   }
+  // Dynamic filter pushdown (Phase 2 "Dynamic Filter Join / SIP / Bloom"):
+  // the sequential executor below can order its intake build-side-first and
+  // publish a sound filter over the build keys to the probe scan, which then
+  // rejects non-members before row decode. It needs the sequential executor
+  // (the shared-build parallel join has no filter contract), so the dynamic
+  // filter shape and the parallel shape are mutually exclusive.
+  const bool dynamic_filter = PrefersDynamicFilter();
   // Inner equi hash joins go parallel past the threshold (TODO.md item
   // 5b): workers share one concurrent build table, then probe concurrently.
   // The threshold mirrors the scan/aggregation ones (thread startup only
@@ -699,7 +1068,7 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   // sequential too: the parallel executor has no null-safe key encoding.
   const bool any_null_safe =
       std::ranges::any_of(key_null_safe_, [](bool safe) { return safe; });
-  if (!any_null_safe &&
+  if (!dynamic_filter && !any_null_safe &&
       left_src_->EmitRowCount() + right_src_->EmitRowCount() >=
           kParallelHashJoinMinRows) {
     const size_t workers = std::min<size_t>(
@@ -713,6 +1082,9 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
                                          right_src_->EmitExecutor(ctx), right,
                                          hash_mode_);
   join->SetJoinAnnotations(key_null_safe_, residual_note_);
+  if (dynamic_filter) {
+    join->EnableDynamicFilter(DynamicFilterBuildsLeft());
+  }
   return join;
 }
 
@@ -724,7 +1096,8 @@ StatusOr<Relation> ApplyTableSample(TransactionContext& context,
   if (!source.sample) {
     return input;
   }
-  input.FinishSpill();
+  RETURN_IF_FAIL(input.FinishSpill());
+  RETURN_IF_FAIL(input.GetStatus());
   std::vector<Row> rows;
   RETURN_IF_FAIL(
       input.ForEachRow([&](const Row& row) { rows.push_back(row); }));
@@ -742,7 +1115,8 @@ StatusOr<Relation> ApplyTableSample(TransactionContext& context,
     return executor->GetStatus();
   }
   CopyExecutionStats(&output, input);
-  output.FinishSpill();
+  RETURN_IF_FAIL(output.FinishSpill());
+  RETURN_IF_FAIL(output.GetStatus());
   output.peak_intermediate_rows =
       std::max(output.peak_intermediate_rows, output.TotalRows());
   return output;

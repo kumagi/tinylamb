@@ -32,15 +32,13 @@
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/exc_shim.hpp"
 #include "common/serdes.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
-Value& Row::operator[](size_t i) { return values_[i]; }
-
-const Value& Row::operator[](size_t i) const { return values_[i]; }
 
 size_t Row::Serialize(char* dst) const {
   const char* const original_offset = dst;
@@ -99,27 +97,126 @@ StatusOr<size_t> Row::TryDeserialize(const char* src, const Schema& sc) {
     bitmap = src;
     src += (count + 7) / 8;
   }
-  values_.clear();
-  values_.reserve(count);
-  for (slot_t i = 0; i < count; ++i) {
-    const bool is_null =
-        has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
-    Value v;
-    if (!is_null) {
-      ASSIGN_OR_RETURN(size_t, consumed,
-                       v.TryDeserialize(src, sc.GetColumn(i).Type()));
+  const Column* const columns = count != 0 ? &sc.GetColumn(0) : nullptr;
+  Status error = Status::kSuccess;
+  // Reuse surviving Value slots (see TryDeserializeProjected): a repeated
+  // decode into the same Row keeps owned_data capacity alive across rows.
+  if (values_.size() != count) {
+    if (values_.size() < count) {
+      values_.reserve(count);
+    }
+    values_.resize(count);
+  }
+  if (has_null) {
+    for (slot_t i = 0; i < count; ++i) {
+      if ((bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0) {
+        values_[i] = Value{};  // SQL NULL; clears the payload, keeps capacity.
+        continue;
+      }
+      const size_t consumed =
+          values_[i].DeserializeInto(src, columns[i].Type(), &error);
+      if (error != Status::kSuccess) [[unlikely]] {
+        return error;
+      }
       src += consumed;
-      if (sc.GetColumn(i).IsUnsigned() && v.type == ValueType::kInt64) {
-        v = v.WithUnsigned();
+      if (columns[i].IsUnsigned() && values_[i].type == ValueType::kInt64) {
+        values_[i].SetUnsigned();
       }
     }
-    values_.push_back(v);
+  } else {
+    for (slot_t i = 0; i < count; ++i) {
+      const size_t consumed =
+          values_[i].DeserializeInto(src, columns[i].Type(), &error);
+      if (error != Status::kSuccess) [[unlikely]] {
+        return error;
+      }
+      src += consumed;
+      if (columns[i].IsUnsigned() && values_[i].type == ValueType::kInt64) {
+        values_[i].SetUnsigned();
+      }
+    }
   }
   return static_cast<size_t>(src - original_offset);
 }
 
+namespace {
+// Legacy projected decode (clear + emplace per kept column). Kept only for
+// malformed (non-ascending) projections, where producing the narrow row is
+// the observable contract violation downstream checks abort on.
+StatusOr<size_t> DeserializeProjectedUnchecked(
+    const char* src, const Schema& sc, const std::vector<slot_t>& columns,
+    std::vector<Value>& values_out) {
+  const char* const original_offset = src;
+  constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  slot_t encoded_count = 0;
+  src += DeserializeSlot(src, &encoded_count);
+  const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
+  const auto count = static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
+  if (count != sc.ColumnCount()) {
+    return StatusError(StatusCode::kCorrupt, "row image column count mismatch");
+  }
+  const char* bitmap = nullptr;
+  if (has_null) {
+    bitmap = src;
+    src += (count + 7) / 8;
+  }
+  const Column* const schema_columns = count != 0 ? &sc.GetColumn(0) : nullptr;
+  const size_t kept_count = columns.size();
+  const slot_t* const kept = kept_count != 0 ? columns.data() : nullptr;
+  Status error = Status::kSuccess;
+  values_out.clear();
+  values_out.reserve(kept_count);
+  size_t projection = 0;
+  for (slot_t i = 0; i < count;) {
+    const bool keep = projection < kept_count && kept[projection] == i;
+    if (has_null) {
+      if ((bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0) {
+        if (keep) {
+          values_out.emplace_back();
+          ++projection;
+        }
+        ++i;
+        continue;
+      }
+    }
+    const ValueType type = schema_columns[i].Type();
+    if (keep) {
+      Value& value = values_out.emplace_back();
+      const size_t consumed = value.DeserializeInto(src, type, &error);
+      if (error != Status::kSuccess) [[unlikely]] {
+        return error;
+      }
+      src += consumed;
+      if (schema_columns[i].IsUnsigned() && value.type == ValueType::kInt64) {
+        value.SetUnsigned();
+      }
+      ++projection;
+    } else {
+      const size_t skipped = Value::SkipSerializedInto(src, type, &error);
+      if (error != Status::kSuccess) [[unlikely]] {
+        return error;
+      }
+      src += skipped;
+    }
+    ++i;
+  }
+  return static_cast<size_t>(src - original_offset);
+}
+}  // namespace
+
 StatusOr<size_t> Row::TryDeserializeProjected(
     const char* src, const Schema& sc, const std::vector<slot_t>& columns) {
+  const size_t kept_count = columns.size();
+  // The slot-reuse decode below presumes the caller contract (ascending,
+  // in-range projection). A malformed projection keeps reproducing the legacy
+  // clear()+emplace decode, which yields a row narrower than the chunk layout
+  // so downstream width checks still catch the violation
+  // (ParallelScanReorderedProjectionThrows).
+  for (size_t k = 1; k < kept_count; ++k) {
+    if (columns[k - 1] >= columns[k]) {
+      return DeserializeProjectedUnchecked(src, sc, columns, values_);
+    }
+  }
   const char* const original_offset = src;
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
   slot_t encoded_count = 0;
@@ -137,33 +234,281 @@ StatusOr<size_t> Row::TryDeserializeProjected(
     src += (count + 7) / 8;
   }
 
-  values_.clear();
-  values_.reserve(columns.size());
+  const Column* const schema_columns = count != 0 ? &sc.GetColumn(0) : nullptr;
+  const slot_t* const kept = kept_count != 0 ? columns.data() : nullptr;
+  Status error = Status::kSuccess;
+  // Reuse surviving Value slots instead of clear()+emplace_back(): the scan
+  // iterator decodes row after row into the same Row, and a surviving slot
+  // keeps its owned_data capacity, so VARCHAR decode stops paying one
+  // malloc/free pair per variable column per row. Slot -> column mapping is
+  // fixed per projection, so a reused slot only ever sees one column's type
+  // and its collation flag stays consistent.
+  if (values_.size() != kept_count) {
+    if (values_.size() < kept_count) {
+      values_.reserve(kept_count);
+    }
+    values_.resize(kept_count);
+  }
   size_t projection = 0;
-  for (slot_t i = 0; i < count; ++i) {
-    const bool is_null =
-        has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
-    const bool keep = projection < columns.size() && columns[projection] == i;
-    if (is_null) {
+  size_t i = 0;
+  // Two loops (bitmap / no-bitmap) keep the common no-NULL row free of the
+  // per-column bitmap branch; `keep` is checked first since projections are
+  // usually a small subset walked in order.
+  for (; has_null && i < count; ++i) {
+    const bool keep = projection < kept_count && kept[projection] == i;
+    if ((bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0) {
       if (keep) {
-        values_.emplace_back();
+        // NULL slot; the reset clears the payload but keeps owned_data
+        // capacity, so a later non-NULL row refills without allocating.
+        values_[projection] = Value{};
         ++projection;
       }
       continue;
     }
-    const ValueType type = sc.GetColumn(i).Type();
+    const ValueType type = schema_columns[i].Type();
     if (keep) {
-      Value value;
-      ASSIGN_OR_RETURN(size_t, consumed, value.TryDeserialize(src, type));
-      src += consumed;
-      if (sc.GetColumn(i).IsUnsigned() && value.type == ValueType::kInt64) {
-        value = value.WithUnsigned();
+      Value& value = values_[projection];
+      if (const size_t fixed = FixedSerializedSize(type); fixed != 0)
+          [[likely]] {
+        uint64_t bits = 0;
+        src += DeserializeU64(src, &bits);
+        value.value.int_value = static_cast<int64_t>(bits);
+        value.type = type;
+        src += fixed - sizeof(int64_t);
+      } else {
+        const size_t consumed = value.DeserializeInto(src, type, &error);
+        if (error != Status::kSuccess) [[unlikely]] {
+          return error;
+        }
+        src += consumed;
       }
-      values_.push_back(std::move(value));
+      if (schema_columns[i].IsUnsigned() && value.type == ValueType::kInt64) {
+        value.SetUnsigned();
+      }
       ++projection;
     } else {
-      ASSIGN_OR_RETURN(size_t, skipped, Value::TrySkipSerialized(src, type));
-      src += skipped;
+      if (const size_t fixed = FixedSerializedSize(type); fixed != 0)
+          [[likely]] {
+        src += fixed;
+      } else {
+        const size_t skipped = Value::SkipSerializedInto(src, type, &error);
+        if (error != Status::kSuccess) [[unlikely]] {
+          return error;
+        }
+        src += skipped;
+      }
+    }
+  }
+  for (; i < count; ++i) {
+    const bool keep = projection < kept_count && kept[projection] == i;
+    const ValueType type = schema_columns[i].Type();
+    if (keep) {
+      Value& value = values_[projection];
+      if (const size_t fixed = FixedSerializedSize(type); fixed != 0)
+          [[likely]] {
+        uint64_t bits = 0;
+        src += DeserializeU64(src, &bits);
+        value.value.int_value = static_cast<int64_t>(bits);
+        value.type = type;
+        src += fixed - sizeof(int64_t);
+      } else {
+        const size_t consumed = value.DeserializeInto(src, type, &error);
+        if (error != Status::kSuccess) [[unlikely]] {
+          return error;
+        }
+        src += consumed;
+      }
+      if (schema_columns[i].IsUnsigned() && value.type == ValueType::kInt64) {
+        value.SetUnsigned();
+      }
+      ++projection;
+    } else {
+      if (const size_t fixed = FixedSerializedSize(type); fixed != 0)
+          [[likely]] {
+        src += fixed;
+      } else {
+        const size_t skipped = Value::SkipSerializedInto(src, type, &error);
+        if (error != Status::kSuccess) [[unlikely]] {
+          return error;
+        }
+        src += skipped;
+      }
+    }
+  }
+  return static_cast<size_t>(src - original_offset);
+}
+
+StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
+                                            const RowDecodePlan& plan) {
+  const char* const original_offset = src;
+  constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  slot_t encoded_count = 0;
+  src += DeserializeSlot(src, &encoded_count);
+  const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
+  const auto count = static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
+  // Same image contract as TryDeserializeProjected: projected reads still
+  // walk the full stored image, so the count must match the whole schema.
+  if (count != plan.stored_count) {
+    return StatusError(StatusCode::kCorrupt, "row image column count mismatch");
+  }
+  const char* bitmap = nullptr;
+  if (has_null) {
+    bitmap = src;
+    src += (count + 7) / 8;
+  }
+  const size_t kept_count = plan.kept_count;
+  // Slot-reuse decode (see TryDeserializeProjected): a surviving slot keeps
+  // its owned_data capacity across rows.
+  if (values_.size() != kept_count) {
+    if (values_.size() < kept_count) {
+      values_.reserve(kept_count);
+    }
+    values_.resize(kept_count);
+  }
+  const ValueType* const types = plan.stored_types.data();
+  const size_t* const slots = plan.stored_slot.data();
+  Status error = Status::kSuccess;
+  // Every stored column fixed-width and no unsigned tag: the per-cell
+  // dispatch (FixedSerializedSize switch, Status-plumbed skip calls,
+  // unsigned check) collapses to a constant 8-byte stride.  A row without a
+  // null bitmap has every cell present, so the kept slots also sit at
+  // constant payload offsets (independent loads instead of a cursor chain).
+  if (plan.all_fixed && !plan.has_unsigned) {
+    Value* const out = values_.data();
+    if (!has_null) [[likely]] {
+      if (kept_count == plan.stored_count) {
+        for (slot_t i = 0; i < count; ++i) {
+          uint64_t bits = 0;
+          std::memcpy(&bits, src, sizeof(bits));
+          src += sizeof(bits);
+          out[i].value.int_value = static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
+          out[i].type = types[i];
+        }
+      } else {
+        const char* const payload = src;
+        for (slot_t i = 0; i < count; ++i) {
+          const size_t slot = slots[i];
+          if (slot == RowDecodePlan::kNoSlot) [[likely]] {
+            continue;
+          }
+          uint64_t bits = 0;
+          std::memcpy(&bits, payload + i * sizeof(bits), sizeof(bits));
+          out[slot].value.int_value =
+              static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
+          out[slot].type = types[i];
+        }
+        src = payload + static_cast<size_t>(count) * sizeof(uint64_t);
+      }
+      return static_cast<size_t>(src - original_offset);
+    }
+    // Rows carrying a bitmap: a NULL column contributes no payload, so the
+    // cursor walk stays, but the FixedSerializedSize/skip dispatch still
+    // collapses to the fixed stride.
+    for (slot_t i = 0; i < count; ++i) {
+      const size_t slot = slots[i];
+      if ((bitmap[i >> 3] & static_cast<char>(1U << (i & 7))) != 0) {
+        if (slot != RowDecodePlan::kNoSlot) {
+          out[slot] = Value{};  // clears payload, keeps owned_data capacity
+        }
+        continue;
+      }
+      uint64_t bits = 0;
+      std::memcpy(&bits, src, sizeof(bits));
+      src += sizeof(bits);
+      if (slot != RowDecodePlan::kNoSlot) {
+        out[slot].value.int_value = static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
+        out[slot].type = types[i];
+      }
+    }
+    return static_cast<size_t>(src - original_offset);
+  }
+  size_t i = 0;
+  for (; has_null && i < count; ++i) {
+    const size_t slot = slots[i];
+    if ((bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0) {
+      if (slot != RowDecodePlan::kNoSlot) {
+        values_[slot] = Value{};  // clears payload, keeps owned_data capacity
+      }
+      continue;
+    }
+    if (slot == RowDecodePlan::kNoSlot) {
+      if (const size_t fixed = FixedSerializedSize(types[i]); fixed != 0)
+          [[likely]] {
+        src += fixed;
+      } else if (types[i] == ValueType::kVarChar) [[likely]] {
+        // VARCHAR dominates the variable-width skip set; inline the
+        // length-prefix walk instead of the Status-plumbed call.
+        bin_size_t len = 0;
+        std::memcpy(&len, src, sizeof(len));
+        src += sizeof(len) + TINYLAMB_BSWAP16(len);
+      } else {
+        const size_t skipped = Value::SkipSerializedInto(src, types[i], &error);
+        if (error != Status::kSuccess) [[unlikely]] {
+          return error;
+        }
+        src += skipped;
+      }
+      continue;
+    }
+    Value& value = values_[slot];
+    if (const size_t fixed = FixedSerializedSize(types[i]); fixed != 0)
+        [[likely]] {
+      uint64_t bits = 0;
+      src += DeserializeU64(src, &bits);
+      value.value.int_value = static_cast<int64_t>(bits);
+      value.type = types[i];
+      src += fixed - sizeof(int64_t);
+    } else {
+      const size_t consumed = value.DeserializeInto(src, types[i], &error);
+      if (error != Status::kSuccess) [[unlikely]] {
+        return error;
+      }
+      src += consumed;
+    }
+    if (slot != RowDecodePlan::kNoSlot && plan.slot_unsigned[slot] != 0 &&
+        value.type == ValueType::kInt64) {
+      value.SetUnsigned();
+    }
+  }
+  for (; i < count; ++i) {
+    const size_t slot = slots[i];
+    if (slot == RowDecodePlan::kNoSlot) {
+      if (const size_t fixed = FixedSerializedSize(types[i]); fixed != 0)
+          [[likely]] {
+        src += fixed;
+      } else if (types[i] == ValueType::kVarChar) [[likely]] {
+        // VARCHAR dominates the variable-width skip set; inline the
+        // length-prefix walk instead of the Status-plumbed call.
+        bin_size_t len = 0;
+        std::memcpy(&len, src, sizeof(len));
+        src += sizeof(len) + TINYLAMB_BSWAP16(len);
+      } else {
+        const size_t skipped = Value::SkipSerializedInto(src, types[i], &error);
+        if (error != Status::kSuccess) [[unlikely]] {
+          return error;
+        }
+        src += skipped;
+      }
+      continue;
+    }
+    Value& value = values_[slot];
+    if (const size_t fixed = FixedSerializedSize(types[i]); fixed != 0)
+        [[likely]] {
+      uint64_t bits = 0;
+      src += DeserializeU64(src, &bits);
+      value.value.int_value = static_cast<int64_t>(bits);
+      value.type = types[i];
+      src += fixed - sizeof(int64_t);
+    } else {
+      const size_t consumed = value.DeserializeInto(src, types[i], &error);
+      if (error != Status::kSuccess) [[unlikely]] {
+        return error;
+      }
+      src += consumed;
+    }
+    if (slot != RowDecodePlan::kNoSlot && plan.slot_unsigned[slot] != 0 &&
+        value.type == ValueType::kInt64) {
+      value.SetUnsigned();
     }
   }
   return static_cast<size_t>(src - original_offset);
@@ -196,14 +541,29 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
       if (type != ValueType::kInt64 && type != ValueType::kDate) {
         return std::nullopt;
       }
-      Value value;
-      value.Deserialize(src, type);
-      return value.value.int_value;
+      // INT64/DATE images are fixed-width big-endian; a direct load answers
+      // the peek without constructing a Value (row decode ran this per row).
+      int64_t key = 0;
+      DeserializeInteger(src, &key);
+      return key;
     }
     if (is_null) {
       continue;
     }
-    src += Value::SkipSerialized(src, sc.GetColumn(i).Type());
+    if (const size_t fixed = FixedSerializedSize(sc.GetColumn(i).Type());
+        fixed != 0) [[likely]] {
+      src += fixed;
+      continue;
+    }
+    Status skip_error = Status::kSuccess;
+    const size_t skipped =
+        Value::SkipSerializedInto(src, sc.GetColumn(i).Type(), &skip_error);
+    if (skip_error != Status::kSuccess) [[unlikely]] {
+      // Same failure mode as the retired StatusOr wrapper: corrupt images
+      // surface loudly instead of silently pruning the row.
+      detail::ExcShimThrow("Value::SkipSerialized", skip_error);
+    }
+    src += skipped;
   }
   return std::nullopt;
 }
@@ -265,12 +625,13 @@ Row Row::Extract(const std::vector<slot_t>& elms) const {
 }
 
 Row Row::operator+(const Row& rhs) const {
-  std::vector v(values_);
-  v.reserve(v.size() + rhs.values_.size());
-  for (const auto& r : rhs.values_) {
-    v.push_back(r);
-  }
-  return Row(v);
+  // Join output materialization calls this per emitted tuple; size up front so
+  // the lhs copy does not grow-regrow (two allocations) per row.
+  std::vector<Value> v;
+  v.reserve(values_.size() + rhs.values_.size());
+  v.insert(v.end(), values_.begin(), values_.end());
+  v.insert(v.end(), rhs.values_.begin(), rhs.values_.end());
+  return Row(std::move(v));
 }
 
 std::ostream& operator<<(std::ostream& o, const Row& r) {

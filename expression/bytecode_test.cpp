@@ -333,4 +333,113 @@ TEST(BytecodeTest, Int64PlusBool_UsesAstDoublePromotionNotIntKernel) {
                            schema);
 }
 
+TEST(BytecodeTest, ExtractDatePart_LowersToDedicatedOpcodeAndMatchesAst) {
+  const Schema schema(
+      "dates", {Column("d", ValueType::kDate), Column("s", ValueType::kVarChar),
+                Column("n", ValueType::kInt64)});
+  DataChunk input(schema);
+  input.Append(Row({Value::Date("1996-03-13"), Value("1997-12-01"), Value(5)}));
+  input.Append(Row({Value(), Value("2000-01-31"), Value()}));
+  // A malformed VARCHAR slice raises exactly like the AST evaluator; keep it
+  // out of the batch chunk, whose wrapper turns errors into exceptions.
+  DataChunk clean(schema);
+  clean.Append(Row({Value::Date("1996-03-13"), Value("1997-12-01"), Value(5)}));
+  clean.Append(Row({Value(), Value("2000-01-31"), Value()}));
+  Row malformed({Value::Date("1996-03-13"), Value("short"), Value(7)});
+
+  const std::vector<std::pair<const char*, int64_t>> parts{
+      {"extract_year", 1996}, {"extract_month", 3}, {"extract_day", 13}};
+  for (const auto& [name, expected] : parts) {
+    const Expression expr = FunctionCallExp(name, {ColumnValueExp("d")});
+    auto program = BytecodeCompiler::Compile(expr, schema);
+    ASSERT_TRUE(program.has_value()) << name;
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    EXPECT_EQ(program->Instructions().back().opcode,
+              BytecodeOp::kExtractDatePart)
+        << name;
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    const ColumnVector output = program->EvaluateBatch(clean);
+    EXPECT_EQ(output.ValueAt(0), Value(expected)) << name;
+    EXPECT_TRUE(output.ValueAt(1).IsNull()) << name;
+    // The row-based VM must agree with the batch VM and the AST.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    auto row_result = program->TryEvaluateRow(input.RowAt(0));
+    ASSERT_TRUE(row_result.HasValue()) << name;
+    EXPECT_EQ(row_result.Value(), Value(expected)) << name;
+  }
+  // VARCHAR input slices the same fixed-width fields.
+  const Expression varchar_year =
+      FunctionCallExp("extract_year", {ColumnValueExp("s")});
+  auto varchar_program = BytecodeCompiler::Compile(varchar_year, schema);
+  ASSERT_TRUE(varchar_program.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  const ColumnVector varchar_output = varchar_program->EvaluateBatch(clean);
+  EXPECT_EQ(varchar_output.ValueAt(0), Value(1997));
+  EXPECT_EQ(varchar_output.ValueAt(1), Value(2000));
+  // A malformed VARCHAR slice raises exactly like the AST evaluator.
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_FALSE(varchar_program->TryEvaluateRow(malformed).HasValue());
+  // Non-date/non-string input raises on both paths.
+  const Expression int_year =
+      FunctionCallExp("extract_year", {ColumnValueExp("n")});
+  auto int_program = BytecodeCompiler::Compile(int_year, schema);
+  ASSERT_TRUE(int_program.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  auto int_result = int_program->TryEvaluateRow(input.RowAt(0));
+  EXPECT_FALSE(int_result.HasValue());
+  auto ast_result = int_year->TryEvaluate(input.RowAt(0), schema);
+  EXPECT_FALSE(ast_result.HasValue());
+}
+
+TEST(BytecodeTest, SearchedCase_LowersToConditionalJumpsAndMatchesAst) {
+  const Schema schema(
+      "cases", {Column("i", ValueType::kInt64), Column("d", ValueType::kDouble),
+                Column("s", ValueType::kVarChar)});
+  // Rows cover every condition verdict: TRUE, FALSE, NULL, and no-match
+  // (NULL ELSE result).  Conditions mix column compares and IS NULL so
+  // both the TRUE and the fall-through legs get exercised, including the
+  // multi-WHEN fall-through that must pop every skipped condition.
+  struct RowCase {
+    Row row;
+    std::string label;
+  };
+  const std::vector<RowCase> rows{
+      {Row({Value(int64_t{5}), Value(1.5), Value(std::string("x"))}),
+       "all-true"},
+      {Row({Value(), Value(), Value()}), "all-null"},
+  };
+  // when_clauses: i > 1 -> d * 2; s IS NOT NULL -> 0.5; ELSE 99.0.  Branch
+  // types must unify (ResultType contract), so every branch is DOUBLE.
+  const Expression case_expr = CaseExpressionExp(
+      {{BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,
+                            ConstantValueExp(Value(int64_t{1}))),
+        BinaryExpressionExp(ColumnValueExp("d"), BinaryOperation::kMultiply,
+                            ConstantValueExp(Value(2.0)))},
+       {UnaryExpressionExp(ColumnValueExp("s"), UnaryOperation::kIsNotNull),
+        ConstantValueExp(Value(0.5))}},
+      ConstantValueExp(Value(99.0)));
+  for (const RowCase& row_case : rows) {
+    ExpectAstMatchesBytecode(case_expr, row_case.row, schema);
+  }
+  // No ELSE: the no-match path yields NULL exactly like TryPickBranch.
+  const Expression case_no_else = CaseExpressionExp(
+      {{BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,
+                            ConstantValueExp(Value(int64_t{100}))),
+        ColumnValueExp("d")}},
+      nullptr);
+  ExpectAstMatchesBytecode(case_no_else,
+                           Row({Value(int64_t{5}), Value(), Value()}), schema);
+  ExpectAstMatchesBytecode(
+      case_no_else, Row({Value(int64_t{200}), Value(2.5), Value()}), schema);
+  ExpectAstMatchesBytecode(case_no_else, Row({Value(), Value(), Value()}),
+                           schema);
+  // A program containing the CASE lowering now runs on the fast
+  // interpreter (conditional jumps are part of its opcode set) and every
+  // shape above still matches the AST row for row.
+  auto program = BytecodeCompiler::Compile(case_expr, schema);
+  ASSERT_TRUE(program.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_TRUE(program->FastInterpretable());
+}
+
 }  // namespace tinylamb

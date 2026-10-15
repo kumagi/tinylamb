@@ -95,8 +95,7 @@ if (agg.GetType() == AggregationType::kCount) {
 
 ## 関連 Rule との相互作用
 
-- `push_aggregation_through_union_all`: 同様に集約を `UnionAll` の下位へ押し込む Rule ですが、再集約の target_list 読み替えを行わない設計であるため `COUNT` を除外する等の差異があります。
-- `count_distinct_expansion`: `DISTINCT` 集約を事前に GROUP BY へと多段展開することで、本 Rule の適用契機を広げます。
+- `aggregate_union_transpose`: 同様に集約を `UnionAll` の下位へ押し込む Rule ですが、再集約の target_list 読み替えを行わない設計であるため `COUNT` を除外する等の差異があります。
 
 ## 検証テスト
 

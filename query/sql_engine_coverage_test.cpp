@@ -17,7 +17,10 @@
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
+#include "table/table.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -40,7 +43,14 @@ std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
       throw std::runtime_error(engine->LastError());
     }
   }
-  return result.MoveValue().Collect();
+  QueryResult query = result.MoveValue();
+  std::vector<Row> rows = query.Collect();
+  if (query.GetStatus() != Status::kSuccess) {
+    throw std::runtime_error(query.GetStatus().GetMessage().empty()
+                                 ? "query execution failed"
+                                 : query.GetStatus().GetMessage());
+  }
+  return rows;
 }
 }  // namespace
 
@@ -192,6 +202,86 @@ TEST_F(SqlEngineCoverageTest, StatementTypeRouting) {
   EXPECT_EQ(engine_->LastStatementType(), StatementType::kAnalyze);
   // The deleted row stays deleted; the counts line up.
   EXPECT_EQ(Scalar("SELECT COUNT(*) FROM t"), Value(int64_t{2}));
+}
+
+TEST_F(SqlEngineCoverageTest, PrimaryKeyDefinitionCreatesUniqueIndex) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE catalog_pk (id STRING PRIMARY KEY, payload INT64);");
+  StatusOr<std::shared_ptr<Table>> table = context_->GetTable("catalog_pk");
+  ASSERT_TRUE(table.HasValue());
+  const Schema& schema = table.Value()->GetSchema();
+  ASSERT_EQ(schema.ColumnCount(), 2U);
+  EXPECT_EQ(schema.GetColumn(0).GetConstraint().ctype, Constraint::kPrimaryKey);
+  ASSERT_EQ(table.Value()->IndexCount(), 1U);
+  EXPECT_TRUE(table.Value()->GetIndex(0).IsUnique());
+  const std::vector<Row> plan_rows = Rows(
+      "EXPLAIN SELECT id, payload, COUNT(*) FROM catalog_pk "
+      "GROUP BY id, payload");
+  ASSERT_FALSE(plan_rows.empty());
+  std::string plan;
+  for (const Row& row : plan_rows) {
+    plan += row[0].AsString();
+  }
+  EXPECT_NE(plan.find("group_keys=id"), std::string::npos) << plan;
+}
+
+TEST_F(SqlEngineCoverageTest, NullableUniqueDoesNotProveGroupDependency) {
+  const Schema schema(
+      "nullable_unique",
+      {Column("id", ValueType::kVarChar, Constraint(Constraint::kUnique)),
+       Column("payload", ValueType::kVarChar)});
+  ASSERT_SUCCESS(database_->CreateTable(*context_, schema).GetStatus());
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO nullable_unique (id, payload) VALUES "
+         "(NULL, 'first'), (NULL, 'second'), ('key', 'third');");
+  const std::vector<Row> rows =
+      Rows("SELECT id, payload FROM nullable_unique GROUP BY id, payload");
+  ASSERT_EQ(rows.size(), 3U);
+  // The plan-shape assertions below pin the Cascades-first grouped route's
+  // EXPLAIN text.  Since the 2026-10-07 route flip the default grouped
+  // route is the relational interpreter (same rows, different plan text),
+  // so the pin only holds under TINYLAMB_GROUPED_ROUTE=cascades.
+  const char* grouped_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  if (grouped_route == nullptr ||
+      std::string_view(grouped_route) != "cascades") {
+    GTEST_SKIP() << "plan-shape pin requires the cascades grouped route";
+  }
+  const std::vector<Row> plan_rows = Rows(
+      "EXPLAIN SELECT id, payload FROM nullable_unique GROUP BY id, payload");
+  ASSERT_FALSE(plan_rows.empty());
+  std::string plan;
+  for (const Row& row : plan_rows) {
+    plan += row[0].AsString();
+  }
+  EXPECT_NE(plan.find("HashDistinct"), std::string::npos) << plan;
+  EXPECT_NE(plan.find("nullable_unique.payload AS payload"), std::string::npos)
+      << plan;
+}
+
+TEST_F(SqlEngineCoverageTest,
+       PrimaryKeyRejectsNullBeforeGroupDependencyRewrite) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE non_null_pk (id INT64 PRIMARY KEY, payload INT64);");
+  EXPECT_THROW(RunSql(engine_.get(), context_.get(),
+                      "INSERT INTO non_null_pk VALUES (NULL, 1)"),
+               std::runtime_error);
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO non_null_pk VALUES (1, 10), (2, 20);");
+  EXPECT_THROW(RunSql(engine_.get(), context_.get(),
+                      "UPDATE non_null_pk SET id = NULL WHERE id = 1"),
+               std::runtime_error);
+  const std::vector<Row> rows = Rows(
+      "SELECT id, payload, COUNT(*) FROM non_null_pk GROUP BY id, payload");
+  ASSERT_EQ(rows.size(), 2U);
+  const std::vector<Row> plan_rows = Rows(
+      "EXPLAIN SELECT id, payload, COUNT(*) FROM non_null_pk "
+      "GROUP BY id, payload");
+  ASSERT_FALSE(plan_rows.empty());
+  std::string plan;
+  for (const Row& row : plan_rows) {
+    plan += row[0].AsString();
+  }
+  EXPECT_NE(plan.find("group_keys=id"), std::string::npos) << plan;
 }
 
 // ------------------------------------------------------------- EXPLAIN ------

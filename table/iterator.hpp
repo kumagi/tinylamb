@@ -23,6 +23,7 @@
 
 namespace tinylamb {
 struct Row;
+struct TypedCellBatch;
 
 class Iterator {
  public:
@@ -35,9 +36,22 @@ class Iterator {
   [[nodiscard]] RowPosition Position() const { return iter_->Position(); }
   Row* operator->() { return &**iter_; }
   const Row& operator*() const { return **iter_; }
+  // Non-const access lets hot scan loops move the row out (the next ++
+  // re-deserializes into a fresh row regardless).
+  Row& operator*() { return **iter_; }
   Iterator& operator++() {
     ++(*iter_);
     return *this;
+  }
+  // Forwards to the underlying iterator; a no-op for iterators that cannot
+  // prune (see IteratorBase::SetRuntimeFilter).
+  void SetRuntimeFilter(const RuntimeFilterGroup* group, slot_t column,
+                        ValueType type) {
+    iter_->SetRuntimeFilter(group, column, type);
+  }
+  // Typed batch decode; 0 means exhausted or unsupported (check GetStatus()).
+  size_t DecodeNextTypedBatch(TypedCellBatch* batch, size_t max_rows) {
+    return iter_->DecodeNextTypedBatch(batch, max_rows);
   }
   Iterator& operator--() {
     --(*iter_);

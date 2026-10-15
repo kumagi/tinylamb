@@ -26,6 +26,7 @@ class ZoneMap {
   // bumps value_count_ so MayMatch keeps the zone instead of pruning a batch
   // that holds only array values.
   void AddOpaque();
+  void Merge(const ZoneMap& other);
   void Reset();
 
   [[nodiscard]] bool MayMatch(BinaryOperation operation,

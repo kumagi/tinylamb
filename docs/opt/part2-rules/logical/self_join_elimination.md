@@ -85,7 +85,6 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `unused_join_elimination` / `fk_join_elimination`: 行の重複度保存を証明して不要な結合を除去する結合簡約 Rule 群。
 - `push_selection_into_scan`: 左右のスキャンフィルタをスキャングループへ統合し、`AreFiltersEquivalent` による同一性判定の基礎を提供します。
 - `join_commutativity`: 本 Rule が成立した場合、結合ノードそのものがスキャン式へ置換されるため、結合順序探索の対象から除外されます。
 

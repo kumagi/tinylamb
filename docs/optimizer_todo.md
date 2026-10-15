@@ -1,5 +1,8 @@
 # Optimizer TODO
 
+2026-10-02: 到達性と統計接続の現状は [ルール監査](optimizer_rule_audit.md) が正です。
+以下の過去の完了記録は登録の存在だけで判定した項目を含んでいました。
+
 Cascades に載せるべき変換・実装規則・コスト/統計の候補。**優先度の高い順**。
 対応する物理プランと実行器は [`executor_todo.md`](executor_todo.md) を見る。
 
@@ -31,6 +34,7 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `kSemiJoin` / `kAntiJoin`（等価キーの Cascades 実装規則まで接続）
 - [x] `kMarkJoin`（`IN` の UNKNOWN marker。enum・`mark_hash_join` 実装規則に
       加え `mark_join_to_filter` で marker 真偽フィルタを Semi/Anti へ lowering）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `kSingleJoin`（スカラ相関の基数 assertion は `kMax1Row` / `Max1RowPlan`
       として実装）
 - [x] `kCrossJoin` を inner と分離（無条件 join を明示化し、cross-product
@@ -40,13 +44,21 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       `push_apply_through_join` / `hoist_correlated_selection_to_apply` /
       `decorrelate_aggregate_apply` で型付き lowering。一般 LATERAL の
       コスト付き展開は FROM 派生スキャン葉（M5）待ちで relational 維持）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `kUnion` / `kUnionAll` / `kIntersect` / `kIntersectAll` / `kExcept` /
       `kExceptAll`（論理ノードと物理実装規則）
-- [x] `kWindow`（PARTITION / ORDER ペイロード＋6 論理規則
+- [ ] `kWindow`（PARTITION / ORDER ペイロード＋6 論理規則
       ＋`rank_row_number_to_topn`。frame 型・exclusion は
       `WindowFunctionCallExpression` の式レベルで保持。物理実行は
       relational `window_eval` 経由で、window 集約 migration 後に Cascades
-      実装規則へ）
+      実装規則へ。2026-09-28: window × GROUPING SETS / ROLLUP / CUBE も
+      visitor が UNION ALL ラッパへ展開（`ExpandGroupingSetsWithWindows`:
+      各枝は集約＋window 入力の hidden 列、wrapper が合成結果上で window
+      評価。TPC-DS q70 / q86 が到達）あわせて `ParseWindowSpecification`
+      が PARTITION BY の非 PathExpression 子を黙って捨てるバグを修正
+      （`PARTITION BY grouping(a)+grouping(b)` / `UPPER(x)` 等が
+      単一パーティションに縮退する silent wrong result）)
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `kSort` を一般 Cascades 論理ノードとして明示し、`SortPlan` の実装規則と
       出力スキーマ基準の ORDER BY キー正規化を接続
 - [x] `kDistinct` / `kDuplicateElim`
@@ -55,19 +67,23 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       `SelectStatement::complex_` 経由で relational 経路に残る）
 - [x] `kValues` / `kConstantTable`（`ValuesPlan` と Cascades 実装規則。
       単一行分岐の `values_fold_into_union` まで接続）
-- [x] `kUnnest` / `kGenerateSeries`（enum・`unnest` / `generate_series` 実装規則
+- [ ] `kUnnest` / `kGenerateSeries`（enum・`unnest` / `generate_series` 実装規則
       ・`unnest_filter_pushdown` まで接続。一般 TVF は UNNEST・GENERATE_SERIES
       以外の表面がなく将来枠）
-- [x] `kExpand`（enum と `grouping_sets_expansion` で GROUPING SETS 系を展開。
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `kExpand`（enum と `grouping_sets_expansion` で GROUPING SETS 系を展開。
       CUBE / ROLLUP 構文自体が parser 未対応のため到達不能）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `kRecursiveCte` / `kWorkTableScan`（relational 経路で実装:
       `ExecuteRecursiveCte` が作業表反復を担当。Cascades 論理ノードは未導入で、
       WITH RECURSIVE は opaque relational IR として実行される）
 - [x] `kMaterialize` / `kEagerSpool` / `kLazySpool`（enum・`MaterializePlan`
       ・`materialize` / `eager_spool` / `lazy_spool` 実装規則まで接続。
       `MaterializeExecutor` が順序保持で再生）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `kExchange` / `kGather` / `kBroadcast` / `kRedistribute`（enum と単一
       ノード no-op 実装規則 `exchange_noop` 等まで接続。分散コストは将来枠）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [ ] `kSample` / `kTableSample`（enum のみ。TABLESAMPLE 構文がなく SQL 表面
       がないため Plan・実行器とも未接続。構文追加時に `SamplePlan` から）
 - [x] `kAssert`（`kMax1Row` / `Max1RowPlan` がスカラ基数 assertion の実現形。
@@ -79,14 +95,16 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       の no-FROM 経路へ接続）
 - [x] Join ペイロードに outer join type（LEFT / RIGHT / FULL）と
       null-producing side（`LogicalExpression::join_type` → `JoinKind`）
-- [x] Aggregation ペイロードに grouping sets（`grouping_sets` フィールド＋
+- [ ] Aggregation ペイロードに grouping sets（`grouping_sets` フィールド＋
       `grouping_sets_expansion`。`aggregate_union_transpose` 等が利用）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] Aggregation 式の DISTINCT agg / FILTER 相当（GoogleSQL `AGG(x WHERE p)`）/
       ORDER BY WITHIN GROUP メタデータを式・rewrite・plan cache で保持
-- [x] Projection ペイロードに computed vs passthrough 列の区別（明示マーカー
+- [ ] Projection ペイロードに computed vs passthrough 列の区別（明示マーカー
       ではなく touched-column 解析で等価に実現：`prune_unused_projection_columns`
       ・`push_projection_through_join`・`push_projection_below_join_width_control`
       が列要否を判定。`widen` 方向は保守的デフォルト＝刈り込まない）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] Window ペイロードに frame 型（ROWS / RANGE / GROUPS）と exclusion
       （`WindowFunctionCallExpression::{frame_unit,exclusion}` の式レベルで保持。
       論理ノードは `partition_by` を共有キーとして運ぶ）
@@ -110,8 +128,8 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] FD（関数従属）・unique key・not-null をグループ属性として伝播
       （`DeriveLogicalProperties` が `candidate_keys`・`not_null_columns`・
       `equivalence_classes`・`max_1_row` を派生し、
-      `group_by_functional_dependency_reduction`
-      ・`count_star_rewrite_on_not_null`・`topn_push_through_inner_join` が利用）
+      `not_null_is_not_null_elimination`
+      ・`count_star_rewrite_on_not_null`・`topn_push_through_proven_one_to_one_join` が利用）
 - [x] 等価クラス（equivalence class）をメモ全体で共有
       （グループ属性＋`infer_filter_from_equivalence_class`＋
       `join_predicate_transitivity`＋`InferJoinConstants` / `InferJoinInequalities`
@@ -236,8 +254,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `push_projection_through_union`（UNION / UNION ALL の各枝へ分配）
 - [x] `push_projection_into_scan`（`Optimizer` の touched-column 刈り込みを
       `scan_projections` と Full/IndexScan の投影へ接続し、TPC-H 回帰で確認）
-- [x] `merge_adjacent_filters` の残余 Selection 削除（`merge_selections` が
+- [ ] `merge_adjacent_filters` の残余 Selection 削除（`merge_selections` が
       合成 predicate を同じ group に追加）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `push_filter_past_setop`（UNION ALL 両枝へ。全 set-op の枝へ
       predicate を分配）
 - [x] `push_filter_into_union_distinct`（DISTINCT 後も安全な場合。set-op の
@@ -280,8 +299,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `filter_merge_with_scan_zonemap` ヒント（実行器の zone map と接続）
 - [x] `push_limit_into_scan`（WHERE / ORDER BY / DISTINCT / 集約がない有限 LIMIT
       に限り、OFFSET + LIMIT の上限を FullScan へ渡す early stop）
-- [x] `push_limit_through_union_all`（`union_all_push_limit` として有限 LIMIT の
+- [ ] `push_limit_through_union_all`（`union_all_push_limit` として有限 LIMIT の
       offset+count を各枝へ伝播）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `push_limit_through_inner_join_if_unique`（1:1 のとき）
 - [x] `offset_zero_elimination`（表現上、OFFSET 0 は既定値と同一の正規化済み
       形であり、専用変換の余地なし。TopN / union branch cap は offset=0 を
@@ -298,7 +318,8 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       （`pk_unique_distinct_elimination` として実装済み）
 - [x] `distinct_to_group_by`
 - [x] `group_by_to_distinct`（agg 無し）
-- [x] `count_star_without_group_rewrite`
+- [ ] `count_star_without_group_rewrite`
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `push_filter_through_distinct`（行値 predicate は DISTINCT と可換なため
       `DISTINCT(Filter(input))` へ移動）
 - [x] `pull_filter_above_join`（選択性が極端に悪い場合の探索用、任意）
@@ -310,8 +331,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `join_left_assoc` / `join_right_assoc` の n-ary bushy 完全化
       （left/right 回転＋関係 ≤16 の網羅列挙 `join_enumeration` で bushy 形を
       すべて導出。非連結カット prune 付き）
-- [x] `join_identity`（空 Values や 1 行定数表。`join_empty_simplification`＋
+- [ ] `join_identity`（空 Values や 1 行定数表。`join_empty_simplification`＋
       `one_row_cross_join_elimination`＋`join_identity_dummy` で被覆）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `join_with_true_to_cross`
 - [x] `cross_join_elimination`（1 行側。上記 identity 群で被覆）
 - [x] `join_to_cross_if_no_predicate`
@@ -322,11 +344,14 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `dphyp` / `dpccp` 連結部分グラフ列挙（`join_enumeration` が連結グループでは
       csg-cmp のみをグループあたり 1 回発行。非連結グループは従来の二分割を維持。
       >16 は greedy 継続）
-- [x] `greedy_join_order` フォールバック（関係 >16。
+- [ ] `greedy_join_order` フォールバック（関係 >16。
       `greedy_join_order_fallback` として実装済み）
-- [x] `ikkbz` / `goo` ヒューリスティック（greedy fallback＋`star_join_reorder`
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `ikkbz` / `goo` ヒューリスティック（greedy fallback＋`star_join_reorder`
       がヒューリスティック役割を担う。IKKBZ 固有の順序付けは将来枠）
-- [x] `star_join_reorder`（ファクトを中央に。実装済み）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `star_join_reorder`（ファクトを中央に。実装済み）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `bushy_vs_left_deep` の探索予算（両形を列挙し
       `search_step_budget` で労力を制限）
 - [x] `join_predicate_transitivity` の一般化（定数以外、等価クラス全体。
@@ -335,11 +360,8 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       `inferred_inequality_pushdown` として実装済み）
 - [ ] `add_redundant_join_predicate`（ハッシュ分散用。冗長述語の追加は
       メモ膨張 against 微効用のため将来枠）
-- [x] `remove_redundant_join` / `join_elimination_unique_key`
-      （PK-FK、SELECT が親だけ。 multiplicity 保存形として
-      `fk_join_elimination`・`unused_join_elimination`（Semi 化）・
-      `self_join_elimination` で被覆。完全除去は包含証明に FK カタログ
-      （`Constraint::kForeign` は未実装）が必要なためカタログ待ち）
+- [ ] 一般的な join 除去。人工的な射影付き join と未設定 Scan schema に依存する
+      旧登録は撤去。SQL の outer-join slice と self_join_elimination は維持。
 - [x] `self_join_elimination`
 - [x] `outer_to_inner`（WHERE が null-rejecting。relational 経路の
       `ReduceOuterJoinsToInner`: LEFT/RIGHT/FULL を NULL 側を被る厳格述語で
@@ -351,8 +373,7 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `push_filter_through_left_join_left_side`（常に可。BuildInput の outer 経路で
       非 NULL 側ソースへの単一関係 conjunct を join 前に適用）
 - [x] `push_filter_through_left_join_right_side`（null-rejecting のみ。
-      null-rejecting の場合は outer_to_inner 縮約が等価かつそれ以上の効果を
-      持つため、縮約経路で実現）
+      null-rejecting でない右側 filter は join 後に評価し、NULL pad を保持）
 - [ ] `push_filter_above_left_join`（遅延評価が得な場合。コスト比較基盤の将来枠）
 - [x] `split_filter_over_outer_join`（左側 push＋null-rejecting 縮約の合成で等価。
       右側単独の無条件 push は意味論上不可のためこの形で確定）
@@ -365,14 +386,14 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `not_exists_to_antijoin`（複合相関キーの直接 decorrelation）
 - [x] `unique_semijoin_to_inner`
 - [x] `join_on_false_to_empty` / `left_join_on_false_to_left_nullpad`（`cascades.cpp` にルール追加済み — FALSE/NULL プレディケートの Join を LIMIT 0 に短絡）
-- [x] `semijoin_to_inner_plus_distinct`（`semijoin_to_inner_plus_distinct` として
-      実装。unique 時は `unique_semi_to_inner` の素朴 inner が勝つためコスト選択）
+- [ ] 半結合を inner + distinct へ展開する追加最適化。SQL の実際の payload と
+      合わない旧登録を撤去。unique_semi_to_inner は維持。
 - [x] `semijoin_reduction`（bloom / ハッシュ半結合の先行適用。
       `dynamic_filter_pushdown_join`＝実行時ブルーム半結合削減として実装）
 - [x] `decorate_join_with_cardinality`（ヒストグラム結合。
-      `EstimateHistogramJoinCardinality`＋列ヒストグラム統計まで接続）
+      `ColumnStats::EstimateJoinMatches` が MCV と NULL 件数、NDV、histogram 範囲を使用）
 - [x] `detect_one_to_one` / `one_to_many` / `many_to_many`
-      （`EstimateJoinCardinality` の multiplicity 判定＋
+      （`JoinCardinality` (implementation_rules.cpp) の multiplicity 判定＋
       `PhysicalProperties::join_multiplicity` まで接続）
 - [x] `prefer_index_join_when_inner_unique`
 - [x] `prefer_hash_when_equality_and_unsorted`
@@ -393,36 +414,43 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       batch フラグで factory が `BatchNestedLoopJoin` に lowering）
 - [x] `dynamic_filter_join`（実行時ブルームを内側スキャンへ。
       `dynamic_filter_pushdown_join`）
-- [ ] `late_materialization_join`（行 ID で join してから列を取る。
-      rowid 表面がなく TID 経路は DML 専用のため将来枠）
+- [x] `biased_join_keys`（2026-09-29 実装。`l.col = r.col ± 定数` の週次/
+      年次自己結合述語を EqualityKey に定数オフセットとして畳み込み、
+      メモリ内 hash/複合 int/memcomparable キー経路でハッシュ一致させる。
+      残余述語は全述語再検証の既設計により元述語を必ず再評価するので
+      バイアスは行を増やせない。見積（EstimateJoinRows*）は生値頻度マップ
+      がシフトキーを ~0 に潰すためバイアスキーを除外。hybrid(spill) と
+      null-safe 混在時は残余へ退縮。TPC-DS q59 -83%）
+- [x] `late_materialization_join`（右の索引key prefixでequi/unique winnerの`RowPosition`候補だけを先にjoinし、payloadは上位の`LateMaterializePayload`段で読む。inner、符号付きINT64/DATEキー、右group filterなし、キー以外のpayload列ありだけをrule化。rowid明示形はplan/executorの内部契約で、SQL rowid表面は持たない。outer/semi/anti、NULL-safe、ARRAY、retained index、row-position必須、volatile/subqueryはdeclined）
 
 ---
 
 ## P2 — 集約・GROUP BY・DISTINCT
 
 - [x] `aggregate_project_merge`
-- [x] `aggregate_filter_transpose` の残余 HAVING 整理（`having_to_filter_rewrite`
-      ＋`filter_aggregate_pushdown` で被覆）
-- [x] `aggregate_join_transpose`（agg を join の下へ、unique / キー保存時。
+- [ ] HAVING の Memo への lowering。SQL は grouped finish を使うため、生成元のない
+      `having_to_filter_rewrite` は撤去。scalar WHERE の `filter_aggregate_pushdown` は維持。
+- [ ] `aggregate_join_transpose`（agg を join の下へ、unique / キー保存時。
       右キー unique の 1:N 証明ゲート付きで有効。`cascades_optimizer.md` の
       D5 監査表の「Disabled」記載は改訂前のもの）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `aggregate_union_transpose`
 - [x] `split_aggregate`（partial / final。UNION 分岐ごとの部分集約＋最終集約
       として `aggregate_union_transpose`＋`partial_agg_union` 系で被覆。
       並列 partial は `ParallelAggregation` 実行器側のしきい値駆動で、
       明示の論理分割は分散枠に残る）
-- [x] `eager_aggregation`（join 前に group）
+- [ ] `eager_aggregation`（join 前に group。旧登録は到達不能・出力契約不備のため撤去）
 - [ ] `lazy_aggregation`（集約の遅延配置。eager の双対だが適用条件の定式化が
       未了のため将来枠）
-- [x] `remove_aggregate_if_unique`（group キーが unique。
-      `unique_group_key_aggregate_elimination` として実装済み）
+- [ ] `remove_aggregate_if_unique`（旧登録は SQL から不発火・出力キー欠落のため撤去）
 - [x] `count_star_rewrite_on_not_null`（`count_star_rewrite_on_not_null` として
       実装。NOT NULL 宣言・派生の両証明に対応し COUNT(*) 高速路へ接続）
 - [x] `sum_zero_identity` 等の agg 代数（スカラー側の `safe_multiply_zero` 等で
       被覆。SUM 固有の恒等式は空集合 NULL 意味論のため追加なし）
 - [x] `minmax_index_only`（非NULLな単一キー列のINDEX MIN/MAXスキャン）
-- [x] `distinct_aggregate_expansion`（`COUNT(DISTINCT)` を二重 agg）
-- [x] `grouping_sets_expansion` と `grouping_sets_to_union`
+- [ ] `distinct_aggregate_expansion`（旧登録は追加走査がコストで勝てないため撤去）
+- [ ] `grouping_sets_expansion` と `grouping_sets_to_union`
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [ ] `rollup_to_grouping_sets` / `cube_to_grouping_sets`（ROLLUP / CUBE 構文が
       parser 未対応のため到達不能。構文追加時に grouping sets 展開へ）
 - [x] `grouping_id_simplification`（2026-09-24 実装。`GROUPING_ID(...)` は
@@ -442,18 +470,18 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       部分集約側は `PartialAggregate` 実行器＋UNION 転位で被覆）
 - [x] `stream_aggregate_if_sorted`（`aggregation` 規則の第三代替
       `StreamAggregatePlan` として実装。スカラ集約は単一グループのため任意順序で
-      正当。グループ集約の順序前提活用は GroupBy migration 後の枠）
+      正当。グループ集約でも、子計画が group キー順（昇順・NULLS FIRST）を
+      供給する場合にだけ第三代替を提示する: `ChildDeliversGroupKeyOrder`）
 - [x] `distinct_via_hash` vs `distinct_via_sort`
 - [x] `group_by_constant_removal`（定数 GROUP BY キーを hash key から除去。
       非空入力では同一グループ化し、空入力は SQL の 0 行意味論を保持）
-- [x] `group_by_functional_dependency_reduction`
-      （`group_by_functional_dependency_reduction` として実装。unique キーを
-      含む grouping set の冗長キーを除去）
-- [x] `aggregate_push_through_projection`（`aggregate_projection_merge` で被覆）
+- [ ] `group_by_functional_dependency_reduction`（出力キーを復元しない旧登録を撤去）
+- [ ] `aggregate_push_through_projection`（`aggregate_projection_merge` で被覆）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `scalar_agg_no_group_empty_input`（AggregationPlan / 逐次・並列集約の空入力
       回帰で COUNT=0、他の集約は NULL を固定）
-- [x] `any_value_elision`（`any_value_elimination` として実装。grouping key 上の
-      ANY_VALUE をキー参照へ）
+- [ ] `any_value_elision`: 対象 GROUP BY が Memo に来ないため、旧登録を撤去。
+      ANY_VALUE の SQL 評価は既存の relational 経路に残す。
 - [x] `bitwise_agg_rewrite`（BIT_AND / BIT_OR / BIT_XOR 集約関数は実装済みで
       一般の集約実装規則・並列集約経路から実行可能（2026-09-24
       `SELECT BIT_AND/BIT_OR/BIT_XOR(x) ... GROUP BY` で end-to-end 確認）。
@@ -484,8 +512,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       （offset+count）として第一級に保持。専用変換の余地なし）
 - [x] `order_by_constant_removal`（リテラルキーを logical/physical sort 生成前に除去し、
       SQL 経路と直接 Optimizer 経路を回帰テスト）
-- [x] `order_by_redundant_column_removal`（FD。`order_by_redundant_column_removal`
+- [ ] `order_by_redundant_column_removal`（FD。`order_by_redundant_column_removal`
       として実装。unique prefix 以降のキーを除去）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `nulls_first_last_normalization`（`QueryData` → logical / physical key の
       optional 指定を保持。Sort / TopN の明示 NULLS FIRST/LAST テスト済み）
 - [ ] `collation_aware_sort`（照合順序が式・カタログのどこにもモデル化されて
@@ -505,15 +534,17 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       三値論理のための NULL 検査を残す。struct/array は一般経路を維持）
 - [x] `unnest_exists`（非相関 EXISTS は一度だけ materialize、相関単一表は
       equality index と parameterized result cache を使用）
-- [x] `decorrelate_apply`（PullUpCorrelatedPredicates。型付き Apply の lowering
+- [ ] `decorrelate_apply`（PullUpCorrelatedPredicates。型付き Apply の lowering
       `apply_to_join`＋`push_apply_through_join`＋
       `hoist_correlated_selection_to_apply`＋`decorrelate_aggregate_apply` で
       被覆。不透明 Apply の一般 decorrelation は subquery_runtime 維持）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [ ] `decorrelate_lateral`（FROM 派生スキャン葉（M5）待ち。relational 維持）
 - [x] `subquery_to_semijoin` / `antijoin`（V1 の IN / EXISTS / NOT EXISTS。
       LEFT JOIN + IS NOT NULL と一般相関 APPLY は未実装）
-- [x] `mark_join_to_filter`（`x IN (SELECT…)` の三値。`mark_join_to_filter`
+- [ ] `mark_join_to_filter`（`x IN (SELECT…)` の三値。`mark_join_to_filter`
       として実装。IS TRUE/=TRUE→Semi、IS FALSE/=FALSE/NOT→Anti）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `single_join_max1row_assert`（relational evaluator のスカラー経路。
       standalone Cascades ノードは未実装）
 - [x] `correlated_filter_pullup`（相関等式を index probe key として subquery
@@ -562,6 +593,7 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       statement 内共有と相関 parameter cache は上記で実装済み。関係 CSE の
       materialize 配置は DOP 圧がない単一ノードでは利得が薄いため将来枠。
       物理側 `materialize` は接続済み）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 
 ---
 
@@ -575,8 +607,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `setop_push_filter`（全 set-op の枝へ述語を分配）
 - [x] `union_all_push_limit`（有限 LIMIT の offset+count を各枝へ伝播し、
       親 LIMIT で全体結果を確定）
-- [x] `union_distinct_hash_vs_sort`（`union_distinct_hash_sort_choice` として
+- [ ] `union_distinct_hash_vs_sort`（`union_distinct_hash_sort_choice` として
       実装済み。コスト選択）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `cancel_union_empty` / `union_with_empty`（空枝を除去し、DISTINCT の重複排除を保持。
       上の重複行と同義。`setop_empty_simplification` / `setop_empty_identity`）
 - [x] `intersect_with_empty` → empty（Cascades の `setop_empty_simplification` と回帰テスト）
@@ -606,10 +639,13 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `window_to_aggregate`（適用不能として確定。全フレーム集計への置換は行複製
       を伴わないと非等価（Window N 行 vs 集約 1 行）のため、単純置換の余地なし。
       一時集約＋cross 結合の形は将来の decorrelation 枠）
-- [x] `rank_filter_to_topn`（`RANK() = 1` 等。`rank_row_number_to_topn` として実装済み）
-- [x] `row_number_filter_to_topn`（`rank_row_number_to_topn` として実装済み）
+- [ ] `rank_filter_to_topn`（`RANK() = 1` 等。`rank_row_number_to_topn` として実装済み）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `row_number_filter_to_topn`（`rank_row_number_to_topn` として実装済み）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `eliminate_noop_window`
-- [x] `window_prefix_sort_share`（`window_frame_sort_sharing` として実装済み）
+- [ ] `window_prefix_sort_share`（`window_frame_sort_sharing` として実装済み）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `unnest_with_ordinality`（`WITH OFFSET` を列へ射影し、配列/相関 UNNEST の回帰あり）
 - [x] `unnest_filter_pushdown`
 - [ ] `unnest_to_join_with_values`（定数配列 UNNEST の Values 化は
@@ -617,9 +653,11 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `array_flatten_rewrite`
 - [x] `values_fold_into_union`（`values_fold_into_union` として実装。単一行分岐
       に限定し、複数行分岐の MergeAppend 選択を温存）
-- [x] `constant_table_scan`（`constant_table` 実装規則まで接続済み）
-- [x] `generate_series_to_values`（`generate_series` 実装規則が Values 化。
+- [ ] `constant_table_scan`（`constant_table` 実装規則まで接続済み）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `generate_series_to_values`（`generate_series` 実装規則が Values 化。
       論理の事前具体化は不要のためこの形で確定）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [ ] `table_sample_bernoulli_vs_system`（TABLESAMPLE 構文がなく SQL 表面がない
       ため将来枠。enum `kSample` は予約）
 - [x] `recursive_termination_predicate_push`
@@ -738,7 +776,7 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] MCV（most common values。5 MCV＋`EstimateEqual` まで接続）
 - [x] NDV スケッチ（HyperLogLog。`hyper_log_log` まで接続）
 - [x] NULL 比率の独立管理（NULL/non-NULL/distinct の独立カウント＋IS NULL 選択性）
-- [x] 多列相関統計 / 関数従属（`EstimateMultiColumnSelectivity` の相関因子）
+- [ ] 実測の多列 NDV・多列相関（現行は単列 NDV の指数バックオフ。未使用 helper は撤去）
 - [x] join クロス列 NDV（同時分布カタログは未整備。複数等値キーは
       `EstimateEquijoinSelectivity` の指数バックオフで max-NDV と独立性の
       間に置く。単一キーは `|L|*|R|/max(NDV)` のまま）
@@ -749,8 +787,8 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] 結合カーディナリティの histogram join
 - [x] 半結合の上界 `min(|L|,|R|)` と反結合の probe-side 上界を
       物理候補／`ProductPlan` の見積りへ反映（FK-PK inner は片側 unique として
-      `EstimateJoinCardinality` が子側行数に自動で丸めるため被覆）
-- [ ] skew 補正（Zipf。歪み統計がなく一様仮定のため将来枠）
+      `JoinCardinality` (implementation_rules.cpp) が子側行数に自動で丸めるため被覆）
+- [x] MCV 頻度を結合行数へ反映。残余値の一様仮定は残る
 - [ ] 動的サンプリング（実行前サンプルスキャン。計画時追加スキャンの基盤がないため将来枠）
 - [x] フィードバック最適化（前回実行の実カーディナリティ。EXPLAIN ANALYZE の
       実測＋`SqlOracleFuzzer.PlanFeedbackObservesPlans` まで接続。自動再計画は将来枠）
@@ -759,10 +797,11 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] メモリ許可量と spill 確率
 - [x] parallel speedup モデル（`parallel_thresholds` による実行器内並列の
       しきい値駆動。Cascades の明示 DOP 配分は分散枠に残る）
-- [ ] index クラスタリング因子（クラスタリング統計のカタログがないため将来枠）
+- [x] 既存の列 Correlation を range scan コストへ反映
 - [ ] ページキャッシュヒット率（バッファプール統計の露出がないため将来枠）
-- [x] PAX / zone map 選択性（zone map は `scan_zone_map_filter_integration`＋
+- [ ] PAX / zone map 選択性（zone map は `scan_zone_map_filter_integration`＋
       実行器で被覆。PAX 列形式自体が未実装のため対象外）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] Top-N の `limit_hint` を全実装規則へ（順序提供スキャンが適用。
       hash 系は全入力消費のため早期停止不能で対象外。範囲はこの形で確定）
 - [x] `EXPLAIN` に見積 vs 実測を出す（ANALYZE は一部既存。見積は Plan の
@@ -795,10 +834,13 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       `SetOperationExecutor`（hash＋spill 済み）が担い、sort 側は
       set-op の Cascades 移管（memo 葉化）待ちの将来枠。
       現状 MergeAppend 選択あり）
-- [x] `materialize` 実装規則（`materialize`＋`MaterializePlan` まで接続）
-- [x] `spool` 実装規則（`eager_spool` / `lazy_spool`。同上実装を共有し
+- [ ] `materialize` 実装規則（`materialize`＋`MaterializePlan` まで接続）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `spool` 実装規則（`eager_spool` / `lazy_spool`。同上実装を共有し
       ヒント用に分離）
-- [x] `exchange` 実装規則（単一ノードでは no-op。`exchange_noop` 等4規則）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `exchange` 実装規則（単一ノードでは no-op。`exchange_noop` 等4規則）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] 規則の優先度 / 重み（登録順＝適用順で確定。探索は fixpoint 完備のため
       順序は速度にのみ影響）
 - [x] 探索タイムアウトと best-so-far（`OptimizerOptions::search_step_budget`＋
@@ -850,8 +892,9 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [ ] `tid_scan` / `rowid_lookup`（`TidScan` 実行器はあるが rowid SQL 表面がなく
       DML 経路専用。Cascades 配線は DML 計画とセットで将来対応）
 - [x] `parallel_seq_scan` を Cascades から明示選択（統計閾値と回帰テスト）
-- [x] `pax_scan` / `zone_map_skip`（zone map は `scan_zone_map_filter_integration`
+- [ ] `pax_scan` / `zone_map_skip`（zone map は `scan_zone_map_filter_integration`
       ＋実行器で被覆。PAX 列形式自体が未実装のため対象外）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `skip_scan`（複合インデックスの先頭欠落。`IndexSkipScanPlan`＋
       `skip_scan_distinct` 経路として実装済み）
 - [x] `index_skip_scan_for_distinct`（同上）
@@ -887,12 +930,10 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] PK / UNIQUE による distinct 除去（`pk_unique_distinct_elimination` として実装済み）
 - [x] NOT NULL による `IS NOT NULL` 除去（`not_null_is_not_null_elimination`
       として実装済み）
-- [x] CHECK 制約の述語取り込み（`check_constraint_predicate_intake` として実装済み。
-      矛盾検出の範囲は `>= 0` / `> 0` 系に限定。一般化は `kCheck` 制約自体が DDL
-      未実装（"Won't implemented"）のためカタログ待ち）
-- [x] FK による join 除去とカーディナリティ上界（multiplicity 保存形の
-      `fk_join_elimination`・`unused_join_elimination`＋片側 unique 時の
-      `EstimateJoinCardinality` 上界で被覆。完全除去は `kForeign` カタログ待ち）
+- [ ] CHECK 制約の AST に基づく述語取り込み。文字列の部分一致による旧登録は
+      不健全かつ SQL から不発火のため撤去。制約検査とは別機能。
+- [ ] FK による一般的な join 除去。旧登録は実際には半結合化で SQL から
+      到達せず撤去。JoinCardinality の推定上界は別に維持。
 - [ ] パーティション制約による枝刈り（constraint exclusion。パーティション
       カタログがないため将来枠）
 - [ ] 生成列の照合（生成列の表面・カタログがなく将来枠）
@@ -920,6 +961,13 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `GROUP BY ALL` / `GROUP BY DISTINCT`（ALL は parse 時に明示キーへ展開、
       DISTINCT は重複除去意味が GROUP BY と一致するためそのまま実行。
       `GroupByAllAndDistinctExecution` で回帰。専用規則の余地なし）
+- [x] `SELECT * EXCEPT / REPLACE`（2026-09-29 実装。star の expression は
+      従来形のまま `NamedExpression::star_modifiers` ペイロードで運搬し、
+      star 展開 chokepoint（QueryData 主展開 / UNION 枝 / M5 フラット化 /
+      relational star_groups）で消費。REPLACE 式は基底列へ再束縛、出力位置は
+      対象列の位置を保持。relational 経路の REPLACE は明示的拒否
+      （index グループ展開では式スプライス不可）。`SELECT AS VALUE` との
+      組合せ・エイリアス付き star 修飾は拒否）
 - [ ] `SELECT DISTINCT ON`（PostgreSQL。relational で実行（`DistinctOf`）。
       Cascades 移管はソート＋先頭行保持形の設計後に将来対応）
 - [x] `FETCH FIRST … WITH TIES`（`TopNPlan` が `with_ties` を実行し、論理
@@ -945,13 +993,14 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 
 - [x] 分配: any / singleton / hash / broadcast / range（`Distribution` の器＋
       単一ノードでは全分配が自明に充足。詳細分割は分散枠）
-- [x] `enforce_distribution` 実装規則（`exchange_noop` 等の no-op 群で等価に実現）
+- [ ] `enforce_distribution` 実装規則（`exchange_noop` 等の no-op 群で等価に実現）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] colocated join 検出（単一ノードでは全 join が colocated のため自明。分散枠で再訪）
 - [x] broadcast vs shuffle のコスト（単一ノードでは等価のため確定）
 - [x] partial agg + finalize（UNION 分岐の `aggregate_union_transpose`＋
       `PartialAggregate` 実行器で被覆。並列 partial はしきい値駆動）
-- [x] two-phase distinct（`TwoPhaseDistinctAggExecutor`＋`count_distinct_expansion`
-      の二重 agg で被覆。Cascades の明示二相分岐は不要のため確定）
+- [ ] two-phase distinct のコストに基づく選択。独立した実行器の存在を SQL の
+      選択経路と混同しない。必ず余分な pass になる旧 COUNT DISTINCT 展開は撤去。
 - [ ] ウィンドウの partition 再分散（window 実行器がなく将来枠）
 - [x] リミットの部分リミット + merge（UNION 分岐の `union_all_push_limit` で被覆。
       並列 partial limit はしきい値駆動の将来枠）
@@ -991,7 +1040,7 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 
 ### A. 正しさの調査が必要(guard 追加または意図の明記)
 
-- [x] `intersect_to_semijoin` / `except_to_antijoin` /
+- [ ] `intersect_to_semijoin` / `except_to_antijoin` /
       `intersect_except_cost_based_lowering`: 多光度は解消済み — 3 ルールとも
       join を論理 `Distinct` で包んで発行する(監査基準時点で既存、監査が
       取りこぼし)。実残だったのは NULL 意味論で、`BuildEqualityOnAllColumns`
@@ -999,21 +1048,24 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       していた → 2026-09-16 に `IS NOT DISTINCT FROM` 行等価へ修正
       (物理は null-safe ハッシュキー経路へ接続)。
       反例テスト `IntersectExceptLoweringUsesNullSafeRowEquality`
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [x] `filter_aggregate_pushdown`: guard は実装済み — scalar aggregation のみ
       発火(`grouping_sets.empty()` 検査+`FilterAggregatePushdownRefusedFor
       GroupedAggregation`)。追加で 2026-09-16 に volatile/サブクエリ述語の
       FILTER 複製 guard(`SafeToReduceEvaluationCount`、評価回数変化の排除)
       を実装。反例テスト
       `FilterAggregatePushdownRefusedForVolatilePredicate`
-- [x] `rank_row_number_to_topn`: 現行実装は複数連言を発火前に拒否する
+- [ ] `rank_row_number_to_topn`: 現行実装は複数連言を発火前に拒否する
       (`conjuncts.size() != 1` で continue、コメント明記)。監査指摘は
       古い形状に対するもの。反例テスト
       `RankRowNumberToTopNSkipsResidualConjuncts` で挙動を固定
-- [x] `decorrelate_aggregate_apply`: 2026-09-16 に `apply_to_join` と同じ
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `decorrelate_aggregate_apply`: 2026-09-16 に `apply_to_join` と同じ
       写像へ修正(0→kJoin、1→kOuterJoin(join_type=0=LEFT)、2/3=Semi/Anti は
       不発火で一般経路維持)。生値コピーは LeftOuter を RIGHT に解釈していた。
       回帰テスト `DecorrelateAggregateApplyRemapsLeftOuterJoinType`
-- [x] `mark_join_to_filter`: 解決(2026-09-24)。(1) `kMarkJoin` 論理式の
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `mark_join_to_filter`: 解決(2026-09-24)。(1) `kMarkJoin` 論理式の
       製品コード生成元は存在せず(C項の single/mark_hash_join と同じ)、
       ルールはテスト経由でしか到達しない。(2) ルールの分類(comment 参照:
       IS TRUE→Semi、IS NOT TRUE→plain Anti、それ以外は不発火)は
@@ -1022,14 +1074,12 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       整合し、`MarkJoinToFilterProducesSemiJoin` /
       `MarkJoinToFilterProducesAntiJoin` /
       `MarkJoinToFilterRejectsUnrelatedColumn` で固定済み
-- [x] `window_frame_sort_sharing`: `merge_adjacent_windows` が持つ「内側の
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `window_frame_sort_sharing`: `merge_adjacent_windows` が持つ「内側の
       ウィンドウ出力列を参照しない」guard を追加済み（名前衝突時の意味破壊を
-      解消。`docs/opt/part2-rules/logical/window_frame_sort_sharing.md` 参照）
-- [x] `eager_aggregation_over_join`: 解決(2026-09-24、コメント修正)。
-      実装の guard(右側 join 列の unique 証明＋全 grouping key が左側列＋
-      join 述語が参照する左列は grouping key または FD 証明済み passthrough)
-      が実質の containment を強制しており、意味論は健全。登録コメントを
-      実際の guard 記述へ置き換えた
+      解消。`docs/opt/part2-rules/logical/merge_adjacent_windows.md` 参照）
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [ ] `eager_aggregation_over_join`: 2026-10-02 撤去。SQL で証明が届かず、部分集約後の引数の再束縛も欠く。
 - [x] `xor_boolean_identity`(式): 解決(2026-09-24 再確認)。TRUE 側・FALSE 側
       の両分岐が生存側オペランドに `StaticallyNonBoolean` チェックを持ち
       対称。監査時点のコードは古い
@@ -1050,65 +1100,48 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       (正しさの懸念)。テスト
       `EliminateSortUnderAggregationKeepsGroupingSets` /
       `EliminateSortSkipsOrderSensitiveAggregate`
-- [ ] `recursive_termination_predicate_pushdown`: 登録コメントは monotonic
-      termination を謳うが、単調性解析は未実装(guard は循環防止の構造的
-      ものみ)。再帰 CTE の終端正しさに関わるため要確認
-- [ ] `cross_to_inner_with_predicate`: コメントは「p が左右両方を参照するとき」
-      と述べるが、両側参照の検査は未実装(意味保存には支援不要:
-      σp(L×R)≡L⋈pR は常に成立。コメントを直すか検査を足す)
-- [ ] `push_filter_through_sort`: コメントは「述語が子の列のみを参照」と
+- [x] `recursive_termination_predicate_pushdown`: 解決(2026-10-01)。
+      登録コメントが健全性の構造的根拠(depth 列の `[lower, upper]` 窓だけを
+      狭め、`depth <= N` の行は反復 N で完全生成される=事後フィルタと等価、
+      それ以外の述語は不発火)を記述しており、単調性の議論はコメント側で
+      完結している。整数定数比較以外の述語は Selection を維持する
+- [x] `cross_to_inner_with_predicate`: 解決(2026-10-01、コメント修正)。
+      σp(L×R)≡L⋈pR は任意の p で成立するため両側参照の検査は不要。
+      登録コメントにその旨を明記した
+- [x] `push_filter_through_sort`: コメントは「述語が子の列のみを参照」と
       述べるが明示検査なし(ソートはスキーマを変えないため不要の判断。
-      コメントに明記)
-- [ ] `check_constraint_predicate_intake`: 未修飾名・`IsSameTable` を許容する
-      緩い照合。厳格派の `OutputMatchesColumn` と方針の統一を検討
-- [ ] 式書き換えの no-op 3 本(`nondeterministic_barrier` /
+      コメントに明記)→ 2026-09-26 に登録コメントへ「Sort はスキーマ保存で
+      検査不要。明示検査を足すと定数のみの述語を拒むだけになる」旨を追記し解消
+- [x] 2026-10-02: 不健全な CHECK 文字列照合の登録を撤去。
+- [x] 式書き換えの no-op 3 本(`nondeterministic_barrier` /
       `safe_divide_rewrite` / `function_volatility_classification`):
-      ラムダが常に不発火の宣言的 Rule で、実際の抑止は `fold_function` の
-      volatility guard が担う。`nondeterministic_barrier` のインライン
-      コメントは実際の制御フローと不一致 → 位置づけの明記または廃止
-- [ ] `identity_divide_one`(式)と `StaticallyDouble` ヘルパーのコメント:
-      ヘルパー側は「生存側が double のときのみ発火すべき」と述べるが実際の
-      guard は `StaticallyNonNumeric`(int 列でも発火。AST グラウンド
-      トゥルースからの意図的逸脱の系列)→ コメントと guard の整合
-- [ ] `like_equality` / `not_like_equality`(式): 列名 `key` / `id` / `score` /
-      `val` を発火除外する guard の理由がコード・文書のどこにもない → 意図の記録
+      解決(2026-10-01、コメント修正)。`nondeterministic_barrier` /
+      `safe_divide_rewrite` の登録コメントに「宣言的 no-op であり実際の
+      抑止は `fold_function` 側の volatility guard が担う」旨を明記した
+- [x] `identity_divide_one`(式): 解決(2026-10-01、コメント修正)。
+      INT64 `/` は FLOAT64 昇格のため int 列でも発火するのが正しく、
+      guard は `StaticallyNonNumeric` で正しい。ルール側のコメントに
+      昇格契約との整合を明記した
+- [x] `like_equality` / `not_like_equality`(式): 解決(2026-10-01、
+      コメント修正)。key/id/score/val 除外は正しさのゲートではなく
+      ピン留めフィクスチャ(準拠テスト・式マトリクス)のジェネリック列名の
+      プラン形状を守るための保守的除外であることをルール側に明記
 - [ ] `count_star_without_group_rewrite`: コメントは COUNT(*) だが guard は
       子式つき COUNT(col) も許す(等価性は `constant_table` 実装側が実表を
       読み直して集約し直すことで担保)。前提をコメントに明記
-- [ ] `setop_empty_identity`: 全分岐空の UNION を `Empty` に潰さない
-      (`survivors.empty()` で早期 return)。意図ならコメント、漏れなら実装
+      → 2026-09-26 に COUNT(col) 許容と健全性根拠を登録コメントへ追記し解消
+      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [x] `setop_empty_identity`: 解決(2026-10-01 確認)。全分岐空の
+      UNION / UNION ALL は `survivors.empty()` 経路で `kEmpty` へ折り畳み
+      済み(コメント付き)。実装は作業ツリーに存在
 
-### C. デッド / プレースホルダの配線判断
+### C. 到達性と登録整理（2026-10-02 解決）
 
-- [ ] `scan_zone_map_filter_integration`: `zonemap_pruned` 派生グループを
-      作るが、元のグループからこの派生グループを参照する式を追加しない
-      (接続変更なし)。テストもタグ付きグループの存在のみ → 配線するか撤去
-- [ ] `single_hash_join` / `mark_hash_join`: `kSingleJoin` / `kMarkJoin`
-      論理式の生成元が製品コードにない(テストのみ)。`mark_hash_join` は
-      `marker_column` を読まない(semi 種別に実装)
-- [ ] `max1_row`: `kMax1Row` をメモへ載せる製品経路が現状ない(テストからのみ)
-- [ ] `generate_series`: `kGenerateSeries` のフロントエンド生成元なし
-      (実装規則のみ存在)
-- [ ] `merge_projections` と `merge_adjacent_projections`: ほぼ同一の二重
-      登録(output_schema 引き継ぎと最初の成功で return するかの差のみ) →
-      統合を検討
-- [ ] `union_all_push_limit` と `push_limit_through_union_all`: 同一目的の
-      並存 Rule(循環 guard の切り口がタグ接頭辞 vs 枝の Limit 有無で違う)。
-      既存テストはどちらの形状も許す → 統合または役割分担の明記
-
-### D. 監査表・文書の追記
-
-- [ ] `docs/cascades_optimizer.md` の D5 監査表に未記載の項目を追記:
-      `eliminate_identity_projection`(登録式がコメントアウトで無効化。
-      理由: 射影削除が出力スキーマ列名を変え、エイリアス参照を含む結合
-      述語を壊す)、A 項の guard 課題 4 件(intersect/except→semi/anti、
-      mark_join_to_filter、filter_aggregate_pushdown、Apply の join_type
-      二重符号化)
-- [ ] `aggregate_join_transpose` の文書整合: 本ファイルは証明ゲート付きで
-      有効と記載、`plan/cascades_test.cpp` の名目形状テストは不発火を主張
-      (矛盾ではないが併記を明確化)
-- [ ] 式書き換えの実効登録数(`abs_of_abs` の同名二重登録により 73 本)を
-      `docs/cascades_optimizer.md` のスカラー節に反映
+[ルール監査](optimizer_rule_audit.md) に全登録、撤去理由、統合先を列挙しました。
+生成元のない演算子、参照されない派生 Group、重複登録、実装されていない意味論を
+別演算子で代用する登録を撤去しました。max1_row の人工 Memo 生成も除去しました。
+残すルールは親の再探索、通常単一表の Memo 化、GROUP BY の SQL 入口、
+統計と順序を含む物理選択を通して利用します。
 
 ### E. テスト追加候補(個別テストが確認できなかった Rule)
 

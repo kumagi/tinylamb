@@ -106,7 +106,7 @@ $$(R \ltimes_{p_1} S) \ltimes_{p_2} T \equiv (R \ltimes_{p_2} T) \ltimes_{p_1} S
 ## 関連 Rule との相互作用
 
 - `semi_join_inner_join_reorder`: 半結合と内部結合が混在するケースにおいて、同様の属性局所性ガードを用いて結合順序を再構成します。
-- `apply_to_join` / `in_list_to_semi_join`: サブクエリ展開により生成された連続する半結合に対して本交換則が作用します。
+
 - `join_commutativity`: 通常の内部結合（`kJoin`）を対象とする交換則であり、半結合演算子は本 Rule によって独立して順序探索されます。
 
 ## 検証テスト

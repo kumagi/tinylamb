@@ -85,6 +85,16 @@ TEST(SqlSessionFuzzer, SeededSessionsHoldState) {
   }
 }
 
+TEST(SqlSessionFuzzer, ResourcePressureSkipsWithoutFailure) {
+  ASSERT_EQ(setenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1", 1), 0);
+  // The seed is fixed on purpose: this trace must be reproducible.
+  std::mt19937 rng(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp)
+  SessionTrace trace;
+  EXPECT_EQ(RunSessionIteration(rng, false, nullptr, &trace), "");
+  EXPECT_TRUE(trace.steps.empty());
+  EXPECT_EQ(unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"), 0);
+}
+
 // Minimal probe for the abort-undo phantom-row bug: a committed empty table,
 // then a transaction that inserts rows and builds an index, aborted — a scan
 // afterwards must see an empty table.

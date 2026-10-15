@@ -56,14 +56,29 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int skip_ran = 0;
   int window_ran = 0;
   int topties_ran = 0;
+  int ordinal_order_ran = 0;
+  int ordinal_derived_ran = 0;
+  int ordinal_cte_ran = 0;
+  int ordinal_setop_ran = 0;
   int dqe_ran = 0;
   int troc_ran = 0;
   constexpr int kIterations = 64;
   for (uint32_t seed = 0; seed < kIterations; ++seed) {
     std::mt19937 rng(seed);
     OracleIterationStats stats;
-    std::string report = RunOracleIteration(rng, false, &stats);
+    OracleTrace trace;
+    std::string report = RunOracleIteration(rng, false, &stats, &trace);
     ASSERT_EQ(report, "") << (seed != 0U) << report;
+    if (!trace.ordinal_order.empty()) {
+      const std::string& query = trace.ordinal_order.front();
+      if (query.find("WITH q AS") != std::string::npos) {
+        ++ordinal_cte_ran;
+      } else if (query.find(" UNION ALL ") != std::string::npos) {
+        ++ordinal_setop_ran;
+      } else {
+        ++ordinal_derived_ran;
+      }
+    }
     tlp_ran += stats.tlp_ran ? 1 : 0;
     tlp_agg_ran += stats.tlp_agg_ran ? 1 : 0;
     unionall_ran += stats.unionall_ran ? 1 : 0;
@@ -75,6 +90,7 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
     skip_ran += stats.skip_ran ? 1 : 0;
     window_ran += stats.window_ran ? 1 : 0;
     topties_ran += stats.topties_ran ? 1 : 0;
+    ordinal_order_ran += stats.ordinal_order_ran ? 1 : 0;
     dqe_ran += stats.dqe_ran ? 1 : 0;
     troc_ran += stats.troc_ran ? 1 : 0;
   }
@@ -89,6 +105,10 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   EXPECT_GT(skip_ran, kIterations / 2);
   EXPECT_GT(window_ran, kIterations / 2);
   EXPECT_GT(topties_ran, kIterations / 2);
+  EXPECT_GT(ordinal_order_ran, kIterations / 2);
+  EXPECT_GT(ordinal_derived_ran, 0);
+  EXPECT_GT(ordinal_cte_ran, 0);
+  EXPECT_GT(ordinal_setop_ran, 0);
   EXPECT_GT(dqe_ran, kIterations / 2);
   EXPECT_GT(troc_ran, kIterations / 2);
 }
@@ -119,6 +139,19 @@ TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
 // End-to-end check of the failure->file->replay pipeline: a hand-crafted
 // trace with a deliberately inconsistent oracle must serialize, parse and
 // replay into a mismatch, and its consistent twin must replay clean.
+TEST(SqlOracleFuzzer, DerivedTableOrderByOrdinalUsesProjectedColumn) {
+  OracleTrace trace;
+  trace.setup = {
+      "CREATE TABLE ordinal_t (u INT64, a INT64);",
+      "INSERT INTO ordinal_t VALUES (2, 1), (0, NULL), (1, 2);",
+  };
+  trace.ordinal_order = {
+      "SELECT * FROM (SELECT u, a FROM ordinal_t) q ORDER BY 1;",
+  };
+  trace.ordinal_order_expect = {"[0, NULL]", "[1, 2]", "[2, 1]"};
+  EXPECT_EQ(ReplayOracleTrace(trace, true), "");
+}
+
 TEST(SqlOracleFuzzer, TestFileRoundTripDetectsMismatch) {
   OracleTrace broken;
   broken.setup = {

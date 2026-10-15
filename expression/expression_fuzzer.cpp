@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -52,8 +53,8 @@ namespace tinylamb {
 namespace {
 
 struct FuzzStream {
-  const uint8_t* data;
-  size_t size;
+  const uint8_t* data{};
+  size_t size{};
   size_t offset{0};
 
   uint8_t NextU8() {
@@ -80,30 +81,50 @@ struct FuzzStream {
 
   bool NextBool() { return (NextU8() % 2) != 0; }
 
-  bool Exhausted() const { return offset >= size; }
+  [[nodiscard]] bool Exhausted() const { return offset >= size; }
 };
 
 Value GenerateValue(FuzzStream& stream) {
   const uint8_t type_pick = stream.NextU8() % 5;
   switch (type_pick) {
     case 0:
-      return Value();  // Null
+      return {};  // Null
     case 1: {
       const uint8_t special = stream.NextU8() % 6;
-      if (special == 0) return Value(int64_t{0});
-      if (special == 1) return Value(int64_t{1});
-      if (special == 2) return Value(int64_t{-1});
-      if (special == 3) return Value(std::numeric_limits<int64_t>::max());
-      if (special == 4) return Value(std::numeric_limits<int64_t>::min());
+      if (special == 0) {
+        return Value(int64_t{0});
+      }
+      if (special == 1) {
+        return Value(int64_t{1});
+      }
+      if (special == 2) {
+        return Value(int64_t{-1});
+      }
+      if (special == 3) {
+        return Value(std::numeric_limits<int64_t>::max());
+      }
+      if (special == 4) {
+        return Value(std::numeric_limits<int64_t>::min());
+      }
       return Value(stream.NextI64());
     }
     case 2: {
       const uint8_t special = stream.NextU8() % 6;
-      if (special == 0) return Value(0.0);
-      if (special == 1) return Value(1.0);
-      if (special == 2) return Value(-1.0);
-      if (special == 3) return Value(std::numeric_limits<double>::infinity());
-      if (special == 4) return Value(std::numeric_limits<double>::quiet_NaN());
+      if (special == 0) {
+        return Value(0.0);
+      }
+      if (special == 1) {
+        return Value(1.0);
+      }
+      if (special == 2) {
+        return Value(-1.0);
+      }
+      if (special == 3) {
+        return Value(std::numeric_limits<double>::infinity());
+      }
+      if (special == 4) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
       return Value(stream.NextDouble());
     }
     case 3:
@@ -116,36 +137,62 @@ Value GenerateValue(FuzzStream& stream) {
       }
       return Value(std::move(s));
     }
+    default:
+      break;
   }
-  return Value();
+  return {};
 }
 
 // Schema-typed value generators: the DataChunk column vectors CHECK on a
 // type mismatch, so the row values must match the column types (NULL stays
 // legal for every column).
 Value GenerateIntValue(FuzzStream& stream) {
-  const uint8_t special = stream.NextU8() % 8;
-  if (special == 0) return Value();
-  if (special == 1) return Value(int64_t{0});
-  if (special == 2) return Value(int64_t{-1});
-  if (special == 3) return Value(std::numeric_limits<int64_t>::min());
-  if (special == 4) return Value(std::numeric_limits<int64_t>::max());
+  const uint8_t special = stream.NextU8() % 6;
+  if (special == 0) {
+    return {};  // NULL
+  }
+  if (special == 1) {
+    return Value(int64_t{0});
+  }
+  if (special == 2) {
+    return Value(int64_t{-1});
+  }
+  if (special == 3) {
+    return Value(std::numeric_limits<int64_t>::min());
+  }
+  if (special == 4) {
+    return Value(std::numeric_limits<int64_t>::max());
+  }
   return Value(stream.NextI64());
 }
 
 Value GenerateDoubleValue(FuzzStream& stream) {
   const uint8_t special = stream.NextU8() % 9;
-  if (special == 0) return Value();
-  if (special == 1) return Value(0.0);
-  if (special == 2) return Value(-0.0);
-  if (special == 3) return Value(std::numeric_limits<double>::infinity());
-  if (special == 4) return Value(-std::numeric_limits<double>::infinity());
-  if (special == 5) return Value(std::numeric_limits<double>::quiet_NaN());
+  if (special == 0) {
+    return {};  // NULL
+  }
+  if (special == 1) {
+    return Value(0.0);
+  }
+  if (special == 2) {
+    return Value(-0.0);
+  }
+  if (special == 3) {
+    return Value(std::numeric_limits<double>::infinity());
+  }
+  if (special == 4) {
+    return Value(-std::numeric_limits<double>::infinity());
+  }
+  if (special == 5) {
+    return Value(std::numeric_limits<double>::quiet_NaN());
+  }
   return Value(stream.NextDouble());
 }
 
 Value GenerateStringValue(FuzzStream& stream) {
-  if (stream.NextU8() % 8 == 0) return Value();
+  if (stream.NextU8() % 8 == 0) {
+    return {};  // NULL
+  }
   const uint8_t len = stream.NextU8() % 8;
   std::string s;
   for (size_t i = 0; i < len; ++i) {
@@ -162,7 +209,9 @@ Value GenerateStringValue(FuzzStream& stream) {
 }
 
 Value GenerateDateValue(FuzzStream& stream) {
-  if (stream.NextU8() % 8 == 0) return Value();
+  if (stream.NextU8() % 8 == 0) {
+    return {};  // NULL
+  }
   return Value::DateFromDays(static_cast<int64_t>(stream.NextU8() % 4000));
 }
 
@@ -170,16 +219,22 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
   if (depth <= 0 || stream.Exhausted()) {
     if (stream.NextBool()) {
       Value v = GenerateValue(stream);
-      if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE")) {
-        fprintf(stderr, "  leaf const type=%d val=%s\n", (int)v.type,
-                v.AsString().c_str());
+      if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE") != nullptr) {
+        (void)fprintf(stderr, "  leaf const type=%d val=%s\n",
+                      static_cast<int>(v.type), v.AsString().c_str());
       }
-      return ConstantValueExp(std::move(v));
+      return ConstantValueExp(v);
     }
     const uint8_t col = stream.NextU8() % 4;
-    if (col == 0) return ColumnValueExp("col_i");
-    if (col == 1) return ColumnValueExp("col_d");
-    if (col == 2) return ColumnValueExp("col_s");
+    if (col == 0) {
+      return ColumnValueExp("col_i");
+    }
+    if (col == 1) {
+      return ColumnValueExp("col_d");
+    }
+    if (col == 2) {
+      return ColumnValueExp("col_s");
+    }
     return ColumnValueExp("col_t");
   }
 
@@ -189,7 +244,7 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
     case 1:
     case 2: {
       // Binary expression
-      static const BinaryOperation ops[] = {
+      static constexpr auto ops = std::to_array<BinaryOperation>({
           BinaryOperation::kAdd,
           BinaryOperation::kSubtract,
           BinaryOperation::kMultiply,
@@ -210,23 +265,25 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
           BinaryOperation::kXor,
           BinaryOperation::kLike,
           BinaryOperation::kNotLike,
-      };
-      BinaryOperation op =
-          ops[stream.NextU8() % (sizeof(ops) / sizeof(ops[0]))];
+      });
+      BinaryOperation op = ops[stream.NextU8() % ops.size()];
       Expression left = GenerateExpression(stream, depth - 1);
       Expression right = GenerateExpression(stream, depth - 1);
       return BinaryExpressionExp(std::move(left), op, std::move(right));
     }
     case 3: {
       // Unary expression
-      static const UnaryOperation un_ops[] = {
-          UnaryOperation::kMinus,   UnaryOperation::kNot,
-          UnaryOperation::kIsNull,  UnaryOperation::kIsNotNull,
-          UnaryOperation::kIsTrue,  UnaryOperation::kIsNotTrue,
-          UnaryOperation::kIsFalse, UnaryOperation::kIsNotFalse,
-      };
-      UnaryOperation op =
-          un_ops[stream.NextU8() % (sizeof(un_ops) / sizeof(un_ops[0]))];
+      static constexpr auto un_ops = std::to_array<UnaryOperation>({
+          UnaryOperation::kMinus,
+          UnaryOperation::kNot,
+          UnaryOperation::kIsNull,
+          UnaryOperation::kIsNotNull,
+          UnaryOperation::kIsTrue,
+          UnaryOperation::kIsNotTrue,
+          UnaryOperation::kIsFalse,
+          UnaryOperation::kIsNotFalse,
+      });
+      UnaryOperation op = un_ops[stream.NextU8() % un_ops.size()];
       Expression child = GenerateExpression(stream, depth - 1);
       return UnaryExpressionExp(std::move(child), op);
     }
@@ -234,6 +291,7 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
       // Case expression
       const size_t when_count = 1 + (stream.NextU8() % 3);
       std::vector<std::pair<Expression, Expression>> whens;
+      whens.reserve(when_count);
       for (size_t i = 0; i < when_count; ++i) {
         whens.emplace_back(GenerateExpression(stream, depth - 1),
                            GenerateExpression(stream, depth - 1));
@@ -247,6 +305,7 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
       const size_t list_count = 1 + (stream.NextU8() % 3);
       Expression target = GenerateExpression(stream, depth - 1);
       std::vector<Expression> list;
+      list.reserve(list_count);
       for (size_t i = 0; i < list_count; ++i) {
         list.push_back(GenerateExpression(stream, depth - 1));
       }
@@ -256,19 +315,27 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
       // CAST to one of the scalar SQL types (a rich differential seam:
       // int<->double promotion, string parsing, date encoding, failures).
       Expression child = GenerateExpression(stream, depth - 1);
-      static const char* kTypes[] = {"INT64", "DOUBLE", "STRING", "DATE",
-                                     "BOOL"};
-      const char* type = kTypes[stream.NextU8() % 5];
+      static constexpr auto k_types = std::to_array<const char*>(
+          {"INT64", "DOUBLE", "STRING", "DATE", "BOOL"});
+      const char* type = k_types[stream.NextU8() % k_types.size()];
       return CastExpressionExp(std::move(child), type);
     }
+    default:
+      break;
   }
   return ConstantValueExp(GenerateValue(stream));
 }
 
 bool ValuesMatch(const Value& a, const Value& b) {
-  if (a.IsNull() && b.IsNull()) return true;
-  if (a.IsNull() != b.IsNull()) return false;
-  if (a.type != b.type) return false;
+  if (a.IsNull() && b.IsNull()) {
+    return true;
+  }
+  if (a.IsNull() != b.IsNull()) {
+    return false;
+  }
+  if (a.type != b.type) {
+    return false;
+  }
   if (a.type == ValueType::kDouble) {
     if (std::isnan(a.value.double_value) && std::isnan(b.value.double_value)) {
       return true;
@@ -316,12 +383,9 @@ bool TypesComparable(const Expression& left, const Expression& right,
     // so it stays "comparable".  Any other statically indeterminate operand
     // (a CASE whose branches disagree, a cast the static model cannot type)
     // is exactly where the AST decides comparability from the RUNTIME value
-    // of the selected branch; folds that treat evaluation as total may drop
-    // or add that raise by design, so treat it as mismatched (tolerated).
-    if (null_constant(left) || null_constant(right)) {
-      return true;
-    }
-    return false;
+    // of the selected branch; folds that treat evaluation as totareturn
+    // null_constant(left) || null_constant(right)turn null_constant(left) ||
+    // null_constant(right);
   }
   if (l == r) {
     return true;  // Same type; only VALUE-dependent raises (string dates).
@@ -389,11 +453,9 @@ bool ContainsStaticallyMismatchedComparison(const Expression& exp,
     if (ContainsStaticallyMismatchedComparison(in.child_, schema)) {
       return true;
     }
-    for (const Expression& item : in.list_) {
-      if (ContainsStaticallyMismatchedComparison(item, schema)) {
-        return true;
-      }
-    }
+    return std::ranges::any_of(in.list_, [&schema](const Expression& item) {
+      return ContainsStaticallyMismatchedComparison(item, schema);
+    });
     return false;
   }
   if (exp->Type() == TypeTag::kBinaryExp) {
@@ -419,12 +481,10 @@ bool ContainsStaticallyMismatchedComparison(const Expression& exp,
     return ContainsStaticallyMismatchedComparison(binary.Left(), schema) ||
            ContainsStaticallyMismatchedComparison(binary.Right(), schema);
   }
-  for (const Expression& child : ExpressionChildren(exp)) {
-    if (ContainsStaticallyMismatchedComparison(child, schema)) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(
+      ExpressionChildren(exp), [&schema](const Expression& child) {
+        return ContainsStaticallyMismatchedComparison(child, schema);
+      });
 }
 
 bool ContainsNeutralArithmetic(const Expression& exp) {
@@ -474,12 +534,9 @@ bool ContainsNeutralArithmetic(const Expression& exp) {
     return ContainsNeutralArithmetic(binary.Left()) ||
            ContainsNeutralArithmetic(binary.Right());
   }
-  for (const Expression& child : ExpressionChildren(exp)) {
-    if (ContainsNeutralArithmetic(child)) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(
+      ExpressionChildren(exp),
+      [](const Expression& child) { return ContainsNeutralArithmetic(child); });
 }
 
 bool PinnedIdentityPromotion(const Expression& exp, const Value& a,
@@ -504,7 +561,7 @@ bool PinnedIdentityPromotion(const Expression& exp, const Value& a,
   // folded int path rounds; compare with ~4-ulp slack instead of ==.
   const double av = toDouble(a);
   const double bv = toDouble(b);
-  const double scale = std::max(1.0, std::max(std::abs(av), std::abs(bv)));
+  const double scale = std::max({1.0, std::abs(av), std::abs(bv)});
   return std::abs(av - bv) <= scale * (1.0 / 281474976710656.0);  // 2^-48
 }
 
@@ -518,7 +575,7 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
   }
 
   using namespace tinylamb;
-  FuzzStream stream{data, size};
+  FuzzStream stream{.data = data, .size = size};
 
   Schema schema("fuzz_schema", {
                                    Column("col_i", ValueType::kInt64),
@@ -535,11 +592,13 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
   });
 
   Expression exp = GenerateExpression(stream, 4);
-  if (!exp) return 0;
+  if (!exp) {
+    return 0;
+  }
 
-  if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE")) {
-    fprintf(stderr, "expr=%s row=%s\n", exp->ToString().c_str(),
-            row.ToString().c_str());
+  if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE") != nullptr) {
+    (void)fprintf(stderr, "expr=%s row=%s\n", exp->ToString().c_str(),
+                  row.ToString().c_str());
   }
 
   // (1) AST Ground Truth evaluation
@@ -585,13 +644,13 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
         ((ast_threw != bc_threw) &&
          ContainsStaticallyMismatchedComparison(exp, schema));
     if (ast_threw != bc_threw && !fold_tolerated) {
-      if (getenv("TINYLAMB_EXPR_FUZZ_PASSES")) {
+      if (getenv("TINYLAMB_EXPR_FUZZ_PASSES") != nullptr) {
         const ExpressionRewriter pr(ExpressionRuleSet::Default());
         Expression cur = exp;
         for (int pass = 0; pass < 6 && cur; ++pass) {
           StatusOr<Expression> nx = pr.TryRewriteOnce(cur, 0);
           if (!nx.HasValue() || !nx.Value()) {
-            fprintf(
+            (void)fprintf(
                 stderr, "pass%d stop: %s\n", pass,
                 nx.HasValue() ? "<null>" : ToString(nx.GetStatus()).c_str());
             break;
@@ -603,8 +662,8 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
           } catch (const std::exception& e) {
             vv = std::string("THREW:") + e.what();
           }
-          fprintf(stderr, "pass%d val=%s :: %s\n", pass, vv.c_str(),
-                  nx.Value()->ToString().c_str());
+          (void)fprintf(stderr, "pass%d val=%s :: %s\n", pass, vv.c_str(),
+                        nx.Value()->ToString().c_str());
           if (nx.Value()->ToString() == cur->ToString()) {
             break;
           }
@@ -623,18 +682,20 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
           fold_dump += " => THREW";
         }
       }
-      fprintf(stderr,
-              "threw mismatch ast=%d(%s) bc=%d tol=%d neutral=%d exp=%s "
-              "folded=%s\n",
-              ast_threw, ast_throw_reason.c_str(), bc_threw,
-              (int)ContainsStaticallyMismatchedComparison(exp, schema),
-              (int)ContainsNeutralArithmetic(exp), exp->ToString().c_str(),
-              fold_dump.c_str());
+      (void)fprintf(
+          stderr,
+          "threw mismatch ast=%d(%s) bc=%d tol=%d neutral=%d exp=%s "
+          "folded=%s\n",
+          static_cast<int>(ast_threw), ast_throw_reason.c_str(),
+          static_cast<int>(bc_threw),
+          static_cast<int>(ContainsStaticallyMismatchedComparison(exp, schema)),
+          static_cast<int>(ContainsNeutralArithmetic(exp)),
+          exp->ToString().c_str(), fold_dump.c_str());
     }
     assert(ast_threw == bc_threw || fold_tolerated);
     if (!ast_threw && !bc_threw && !ValuesMatch(ast_result, bc_result) &&
         !PinnedIdentityPromotion(exp, ast_result, bc_result) &&
-        getenv("TINYLAMB_EXPR_FUZZ_PASSES")) {
+        (getenv("TINYLAMB_EXPR_FUZZ_PASSES") != nullptr)) {
       const ExpressionRewriter pr(ExpressionRuleSet::Default());
       Expression cur = exp;
       for (int pass = 0; pass < 6 && cur; ++pass) {
@@ -649,8 +710,8 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
         } catch (const std::exception& e) {
           vv = std::string("THREW:") + e.what();
         }
-        fprintf(stderr, "pass%d val=%s :: %s\n", pass, vv.c_str(),
-                nx.Value()->ToString().c_str());
+        (void)fprintf(stderr, "pass%d val=%s :: %s\n", pass, vv.c_str(),
+                      nx.Value()->ToString().c_str());
         if (nx.Value()->ToString() == cur->ToString()) {
           break;
         }
@@ -671,12 +732,12 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
           folded_text += " => THREW";
         }
       }
-      fprintf(stderr,
-              "value mismatch ast=(%d)%s bc=(%d)%s exp=%s folded=%s row=%s\n",
-              (int)ast_result.type, ast_result.AsString().c_str(),
-              (int)bc_result.type, bc_result.AsString().c_str(),
-              exp->ToString().c_str(), folded_text.c_str(),
-              row.ToString().c_str());
+      (void)fprintf(
+          stderr,
+          "value mismatch ast=(%d)%s bc=(%d)%s exp=%s folded=%s row=%s\n",
+          (int)ast_result.type, ast_result.AsString().c_str(),
+          (int)bc_result.type, bc_result.AsString().c_str(),
+          exp->ToString().c_str(), folded_text.c_str(), row.ToString().c_str());
     }
     if (!ast_threw && !bc_threw) {
       assert(ValuesMatch(ast_result, bc_result) ||
@@ -689,7 +750,8 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
   Value detail_result;
   try {
     TransactionContext context(Transaction{}, nullptr);
-    const relational_detail::Scope scope{&row, &schema, nullptr};
+    const relational_detail::Scope scope{
+        .row = &row, .schema = &schema, .outer = nullptr};
     const relational_detail::CteMap ctes;
     detail_result =
         relational_detail::Evaluate(exp, scope, nullptr, context, ctes);
@@ -697,16 +759,17 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
     detail_threw = true;
   }
   if (ast_threw != detail_threw) {
-    fprintf(stderr, "threw mismatch ast=%d detail=%d exp=%s row=%s\n",
-            ast_threw, detail_threw, exp->ToString().c_str(),
-            row.ToString().c_str());
+    (void)fprintf(stderr, "threw mismatch ast=%d detail=%d exp=%s row=%s\n",
+                  static_cast<int>(ast_threw), static_cast<int>(detail_threw),
+                  exp->ToString().c_str(), row.ToString().c_str());
   }
   assert(ast_threw == detail_threw);
   if (!ast_threw && !ValuesMatch(ast_result, detail_result) &&
       !PinnedIdentityPromotion(exp, ast_result, detail_result)) {
-    fprintf(stderr, "value mismatch ast=%s detail=%s exp=%s row=%s\n",
-            ast_result.AsString().c_str(), detail_result.AsString().c_str(),
-            exp->ToString().c_str(), row.ToString().c_str());
+    (void)fprintf(stderr, "value mismatch ast=%s detail=%s exp=%s row=%s\n",
+                  ast_result.AsString().c_str(),
+                  detail_result.AsString().c_str(), exp->ToString().c_str(),
+                  row.ToString().c_str());
   }
   if (!ast_threw) {
     assert(ValuesMatch(ast_result, detail_result) ||

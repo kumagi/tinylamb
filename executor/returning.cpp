@@ -18,6 +18,7 @@ namespace tinylamb {
 bool ReturningExecutor::Next(Row* dst, RowPosition* rp) {
   Row src_row;
   if (!source_->Next(&src_row, rp)) {
+    FailWithChildOf(*source_);
     return false;
   }
   std::vector<Value> projected_values;

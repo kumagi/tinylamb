@@ -10,6 +10,7 @@
 
 #include "executor/zone_map.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -32,6 +33,11 @@ class ColumnVector {
   // Copies one value from another column without boxing it into a Value.
   // The source must share this column's type (or be an all-null kNull column).
   void AppendFrom(const ColumnVector& source, size_t index);
+  void AppendRange(const ColumnVector& source);
+  // Appends `count` non-null boolean cells from a 0/1 byte array (the JIT
+  // filter's output): all rows land in the int64 payload storage with an
+  // empty null bitmap region, skipping one Value construction per row.
+  void AppendBoolBatch(const uint8_t* bits, size_t count);
   void Reset();
   void Reserve(size_t capacity);
 
@@ -55,6 +61,14 @@ class ColumnVector {
 
   [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
   void SetUnsigned(bool value) { unsigned_ = value; }
+  // VARCHAR only: the collator shared by every value in this column, so a
+  // value that arrived tagged (COLLATE) leaves the batch carrying it and the
+  // sort/group stages downstream keep folding the same way they would have
+  // row-at-a-time. A column that mixes collators degrades to the engine
+  // default (binary) rather than folding some rows and not others.
+  [[nodiscard]] Collation ColumnCollation() const {
+    return mixed_collation_ ? Collation::kNone : collation_;
+  }
 
   [[nodiscard]] Value AggregateLogicalAnd(
       const SelectionVector* sel = nullptr) const;
@@ -68,12 +82,16 @@ class ColumnVector {
       const SelectionVector* sel = nullptr) const;
 
  private:
+  void ObserveCollation(const Value& value);
+  void ObserveSourceCollation(const ColumnVector& source);
   void AppendDefault();
   void EnsureNullBit(size_t index, bool is_null);
   void MaterializeInferredStorage();
 
   ValueType type_;
   bool unsigned_{false};
+  Collation collation_{Collation::kNone};
+  bool mixed_collation_{false};
   size_t size_{0};
   std::vector<uint64_t> null_bitmap_;
   std::vector<int64_t> integers_;

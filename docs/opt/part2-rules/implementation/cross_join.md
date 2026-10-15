@@ -80,14 +80,14 @@ if (cross) {
 
 明示的または暗黙的な直積クエリに対して、最小のオーバーヘッドで実行可能な物理プランを供給します。
 
-直積の計算量と出力サイズは $O(|L| \times |R|)$ です。このため、本 Rule が最終プランに採用されるのは、両入力が小さい場合や、論理層で直積を除去できなかった場合に限られます。論理最適化層の `one_row_cross_join_elimination` や `join_empty_simplification` が先に適用されれば、直積そのものを実行せずに済みます。
+直積の計算量と出力サイズは $O(|L| \times |R|)$ です。このため、本 Rule が最終プランに採用されるのは、両入力が小さい場合や、論理層で直積を除去できなかった場合に限られます。論理最適化層の `join_identity_dummy` や `join_empty_simplification` が先に適用されれば、直積そのものを実行せずに済みます。
 
 ## 関連 Rule との相互作用
 
 - `join_to_cross_if_no_predicate`: 述語を持たない内部結合 `kJoin` を `kCrossJoin` に変換し、本 Rule への誘導を一意化する論理 Rule です。
 - `cross_to_inner_with_predicate`: 述語が付与された直積を内部結合 `kJoin` へ戻す論理 Rule です。
 - `nested_loop_join`: 内部結合 `kJoin` に対する物理実装 Rule です。述語なしの入れ子ループ結合と直積は同一のコスト計算式を持ちますが、入力となる論理演算子の違いによって住み分けられています。
-- `one_row_cross_join_elimination`: 片側が確実に 1 行である直積を除去する論理 Rule です。
+
 
 ## 検証テスト
 

@@ -82,11 +82,11 @@ changed = true;
 
 行ごとの列値取り出しおよび NULL 判定の CPU オーバーヘッドが完全に排除されます。
 
-`COUNT(*)` へ正規化すると、後続の `count_star_without_group_rewrite` やストレージ層のメタデータ走査（B+Tree のリーフエントリ数やインデックスオンリースキャン）を適用できるようになります。
+`COUNT(*)` へ正規化すると、後続の 物理 `aggregation` と必要列だけを読むインデックスオンリースキャンを適用できるようになります。
 
 ## 関連 Rule との相互作用
 
-- `count_star_without_group_rewrite`: 単一テーブルに対する `COUNT(*)` をテーブル統計やインデックスメタデータから即座に解決する高速化ルールです。本 Rule はその前提形を供給します。
+
 - `not_null_is_not_null_elimination`: 同一の NOT NULL 証明機構を共有する述語簡約ルールです。
 
 ## 検証テスト

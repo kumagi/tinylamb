@@ -14,6 +14,9 @@ struct TopNKey {
   Expression expression;
   bool ascending{true};
   std::optional<bool> nulls_first;
+  // Collation the key's comparison runs under (see SortKey::collation): the
+  // heap keeps the rows the equivalent sort would have kept.
+  Collation collation{Collation::kNone};
 };
 
 class TopNPlan final : public PlanBase {
@@ -58,6 +61,7 @@ class TopNPlan final : public PlanBase {
     return (!with_ties_ && limit_ <= 1) || child_->EnforcesDistinct();
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
+  [[nodiscard]] Collation OrderCollation() const override;
   [[nodiscard]] const std::vector<TopNKey>& Keys() const { return keys_; }
   [[nodiscard]] size_t Limit() const { return limit_; }
   [[nodiscard]] size_t Offset() const { return offset_; }

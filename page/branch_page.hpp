@@ -93,7 +93,7 @@ class BranchPage final {
   [[nodiscard]] std::string_view GetKey(size_t idx) const;
   [[nodiscard]] page_id_t GetValue(size_t idx) const;
 
-  void InsertImpl(std::string_view key, page_id_t pid);
+  Status InsertImpl(std::string_view key, page_id_t pid);
   void UpdateImpl(std::string_view key, page_id_t pid);
   void DeleteImpl(std::string_view key);
 

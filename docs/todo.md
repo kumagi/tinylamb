@@ -51,12 +51,24 @@ Cascades rule / cost / statistics
 
 ### 検証基盤
 
-- [ ] 全テストを `ctest --output-on-failure` で再現できる固定コマンドとログを用意する。
-- [ ] SQL経路、直接Executor経路、Cascades経路を同じ期待結果で比較する。
-- [ ] 各TODOに、最小の成功例、NULL、空入力、重複、境界値、エラー例を追加する。
-- [ ] ルール適用前後の結果集合・スキーマ・順序・推定行数を検証する。
-- [ ] EXPLAINに選択されたルール名、物理演算子、required/provided propertyを表示する。
-- [ ] ルール追加で無限展開しないことをfingerprintと上限テストで保証する。
+- [x] 全テストを `ctest --output-on-failure` で再現できる固定コマンドとログを用意する。
+      `scripts/verify_all.sh` がRelWithDebInfo build・CTest・layering lintを
+      同一ログへ記録する。
+- [x] SQL経路、直接Executor経路、Cascades経路を同じ期待結果で比較する。
+      `plan/phase0_contract_test.cpp:SqlCascadesAndDirectExecutorShareExpectedRows`
+      がNULL・重複・境界値を含む順序付き行多重集合を3経路で比較する。
+- [x] 各TODOに、最小の成功例、NULL、空入力、重複、境界値、エラー例を追加する。
+      `Phase0ContractTest.ManifestCoversEveryTodoAndSemanticClass` が55–59の
+      各項目に6ケースを固定し、SQL fixtureの結果とerror statusを検証する。
+- [x] ルール適用前後の結果集合・スキーマ・順序・推定行数を検証する。
+      `Phase0ContractTest.RuleRewritePreservesSchemaOrderSetAndEstimate` が
+      `push_selection_into_scan` 適用前後を比較する。
+- [x] EXPLAINに選択されたルール名、物理演算子、required/provided propertyを表示する。
+      `Phase0ContractTest.ExplainShowsRuleOperatorAndPropertyContract` と
+      `plan/plan.hpp` の `PlanExplainInfo` がSQL EXPLAIN回帰を固定する。
+- [x] ルール追加で無限展開しないことをfingerprintと上限テストで保証する。
+      `CascadesNonConvergenceTest.FingerprintsRejectDuplicateRuleExpansion` と
+      `SearchStepBudgetStopsUniqueExpansion` が重複fingerprintと探索予算を検証する。
 
 ---
 
@@ -96,40 +108,191 @@ Cascades rule / cost / statistics
 
 ### Join
 
-（以下は実装済み: HashJoin [Inner, Semi, Anti, NullAwareAnti, LeftOuter, RightOuter, FullOuter, Mark, Single], MergeJoin, NestedLoopJoin [BlockNestedLoop], CrossJoin, IndexJoin）
+（以下は実装済み: HashJoin [Inner, Semi, Anti, NullAwareAnti, LeftOuter, RightOuter, FullOuter, Mark, Single], MergeJoin, NestedLoopJoin [BlockNestedLoop], CrossJoin, LookupJoin [Index Nested Loop; 複合キー等値prefix＋range bound 1個], LateMaterializationJoin [equi/unique winner/rowid; payload遅延], ZigZagJoin [両側Index; 単一署名付きINT64キー; 等値/単一range]）
 
-- [ ] inequality merge / band joinを実装する。
-- [ ] outer joinのsemiではないnull-aware matchを実装する。
-- [ ] null-rejectingでない右側filterに対する実行時NULL生成を修正する。
+- [x] inequality merge / band joinを実装する（inner、単一の符号付きINT64/DATE順序比較、NULL・重複・空入力・エラー・順序・行数を固定。複合キー/複数述語/他型とouter/semi/antiのCascades loweringはImplementation倒し）。
+      - [x] `join_commutativity` で左右の子が交換されたPlanningにおける band join の行落ちを修正する（`TryBandJoinSpec` の交換分岐で比較演算子を鏡像化し、spec を「`left <op> right`」＝実行器の子の実際の順で表すようにする。候補範囲と残差再検査が食い違い一致行を落としていた。回帰: `band_join_test.cpp` の `RuleMirrorsComparisonForSwappedChildOrder` / `SwappedChildOrderReturnsTheSamePairs`、`optimizer_test.cpp` の `BandJoinSurvivesJoinCommutativity`）。
+- [x] outer joinのsemiではないnull-aware matchを実装する。
+- [x] null-rejectingでない右側filterに対する実行時NULL生成を修正する。
 - [x] uniqueness付きsemi joinのruntime assertionを実装する。
 - [x] Batch Nested Loop Joinを実装する。
-- [ ] 複合キー・範囲対応のLookupJoin / Index Nested Loopを実装する。
-- [ ] ZigZag Joinを実装する。
-- [ ] Late Materialization Joinを実装する。
-- [ ] Dynamic Filter Join / SIP / Bloomを実装する。
-- [ ] Hash Semi Reductionを実装する。
+- [x] 複合キー・範囲対応のLookupJoin / Index Nested Loopを実装する（等値prefix＋1個のrange bound（INT64/DATE）。probe列は索引キー順で導出。複数range・非対応型・非キー列の等値は残差述語へ明示fallback。unique indexの単一probeはshort-circuit。SQL/optimizer/直接実行器の回帰あり）。
+- [x] Late Materialization Joinを実装する（equi key / unique winner / 明示rowidの候補RUS表现为`RowPosition`のみで保持し、payloadを上位`LateMaterializePayload`段で`Table::Read`する。inner・符号付きINT64/DATEキー・NULL/重複/空入力/unique/error・row position/順序を固定。outer/semi/anti、NULL-safe、ARRAY、retained index、row-position必須、volatile/subquery、巨大spillはrule拒否またはfactory fallback）。
+- [x] Dynamic Filter Join / SIP / Bloomを実装する（`common/runtime_filter.{hpp,cpp}` の3形状: exact_set＝buildキー集合のIP、min_max＝[lo,hi]囲い、bloom＝2 probeのビット集合。`RuntimeFilterGroup` は合算則AND。build側は先にdrainして`ExecutorBase::AttachRuntimeFilter`でprobe scanへpublishし、`FullScanIterator` がrow decode前のpeekで判定する。probe childが拒否すればjoin自身が`JoinState::Consume`で適用。NULLキーは常にreject、型不一致（INT64 vs DATE）はpublish前に拒否、spilled build・複合キー・null-safe・outer/semi/anti・hybrid hash・shared-build parallel hashは明示fallback。論理側は`dynamic_filter_pushdown_join` がprobe groupへ`dynamic_filter_keys`をannotateし、`hash_join` implementation ruleが「inner/非null-safe/単一INT64・DATE等値 かつ build*4 <= probe（または build<=1024 かつ probe>=8192）」のときだけ`ProductPlan::PreferDynamicFilter(build_left)`を立てる。回帰: `common/runtime_filter_test.cpp`、`executor/dynamic_filter_join_test.cpp`、`plan/cascades_test.cpp` の `DynamicFilterPushdownJoinAnnotatesTheProbeKeys` / `DynamicFilterPushdownJoinSkipsNonEqualityJoins` / `DynamicFilterPushdownJoinSkipsMultiRelationProbe`、`plan/optimizer_test.cpp` の `DynamicFilterMarkerFollowsTheAnnotatedProfitableShape` / `DynamicFilterMarkerEngagesOnAProbeHeavyShape`）。
+- [x] Hash Semi Reductionを実装する（存在判定だけを使う semi / anti / null-aware anti は build 側を
+      「probe 側ドメインに含まれるキーの1行」に縮める。probe の等値キーを先に `JoinHashIndex` で
+      ドメイン化し（NULL は照合不能なのでドメインに加えない。null-safe キーではハッシュ索引と同じ
+      memcomparable エンコードで NULL も一致させる）、その外側の build 行は intake 中に捨てて
+      しまう。build キー重複も1行に畳む）。出力行・順序・行位置は従来 semi と完全に一致し、防御は
+      2つ: (1) `kSemiReductionMaxDomainKeys` を超えた domain は解放し非制限 intake に fallback
+      して build キー重複除去だけを残す、(2) `NOT IN` の三値論理と「build 側が空」の判定は縮約後
+      の hash ではなく *生の* build cardinality と NULL フラグを読む。論理側は
+      `semi_reduction_pushdown_semi_join` / `semi_reduction_pushdown_anti_join` が probe 側の
+      等値キー列を `Group::semi_reduction_probe_keys` に記す（キー列の fingerprint を tag に持つ
+      derived group。derived group は probe の selection を持ち D5 ゲートを満たす）、
+      `ProductPlan::PreferSemiReduction` が物理マーカー、`executor/relational_factory.cpp` が
+      実行器へ渡す。採否は `SemiReductionIsProfitable`（`plan/product_plan.cpp`。Cascades の hash
+      実装規則と decorrelation が同じ判定を共有する）で、build 行数が probe 行数より大きく、
+      かつ build の半分以上が消え、かつ絶対下限 64 行を越えるときだけ採用する。inner / outer /
+      mark / single、null-safe キー、残余述語付きの semi/anti（そもそも hash 代替を生成しない）、
+      収益性不十分な形は従来 semi へ fallback する。spill した build も domain と同じハッシュ規則
+      で区画分割されるため、縮約済みの行が区画をまたいでも照合は exhaustive のまま。
+      EXPLAIN ANALYZE の `SemiReduction <status> probe_keys= build_rows= build_rows_kept=
+      build_rows_pruned= duplicate_keys_pruned=` が証拠。回帰: `executor/hash_semi_reduction_test.cpp`
+      （SQL / 直接実行器 / 収益性ゲート。NULL・重複・空入力・外側結合・anti・`NOT IN`・spill・
+      並列 probe・一意 INTEGER キー・ORDER BY・行位置・batch 経路）、
+      `plan/cascades_test.cpp` の `SemiReductionPushdownAnnotatesTheProbeKeys` /
+      `SemiReductionPushdownSkipsNonEqualityJoins` /
+      `SemiReductionPushdownAnnotatesEveryCompositeKey`）。
 - [x] As-of Join / Interval Joinを実装する。
 
 ### Sort / Top-N
 
-（以下は実装済み: SortPlan, TopNPlan, ExternalMergeSort, SortExecutor, TopNExecutor, ParallelSort）
+（以下は実装済み: SortPlan（base）, BufferedSortPlan, ExternalMergeSortPlan, TopNPlan, ExternalMergeSort, SortExecutor, TopNExecutor, ParallelSort）
 
 - [x] In-memory quicksort / pdqsortの選択経路を実装し、外部sortと契約を統一する。
 - [x] Incremental Sortを実装する。
 - [x] Partial Sortを実装する。
-- [ ] FullScanがclustered index orderを安全に報告する。
+- [x] FullScanがclustered index orderを安全に報告する。
+      ヒープは row-page chain の tail への追記だけで成り、`FullScanIterator` は先頭→末尾・slot 昇順で歩くので、走査順は「挿入順」そのものである。これが SQL の順序になるには「カタログ」「測定」「鮮度」の3条件が揃う必要があり、`plan/full_scan_plan.hpp` の `ClusteredOrderColumn()` が検査する。
+      (1) カタログ: その列が UNIQUE 索引のキー全体（CREATE TABLE は PRIMARY KEY/UNIQUE 列ごとに索引を作る）で、列制約が NOT NULL。NULL が挟まらないので、報告する順序は NULLS FIRST でも NULLS LAST でも同じ列になる。
+      (2) 測定: ANALYZE がその列の相関を 1.0 として記録済み（走査順で隣接する非 NULL 対がすべて非減少）。
+      (3) 鮮度: 統計が `Table::LayoutGeneration()` を持ち、それが表の現在値と一致する。row mutation は layout generation を進め、UPDATE/DELETE はさらに 1 プロセス内で in-place 書き換えの latch を立てる（古い snapshot は pre-image を解決しうるので、現在の画像の測定はその代用にならない）。ANALYZE は自分の走査の前後で世代が動いていた場合、証拠を捨てる（走査中に commit された行は測定に含まれない）。生成直後のプロセスでは世代がプロセスグローバルカウンタから採番されるので、再開前の永続化済み stamp とは一致しない。
+      非unique/複合キー/nullable/未ANALYZE/更新/削除/並列閾値超（`ParallelScan` はモーセル完了順にチャンクを出すので保存順ではない）/DML source scan（`lock_rows_`）はいずれも false へ fallback する。`IsOrderedBy` は昇順・先頭キー1個・素の列参照だけに一致し（降順は逆順チェーン走査がない、2個目以降は prefix として `IncrementalSort` 側へ委ねる）、EXPLAIN には `FullScan: t (clustered order: id ASC)` が出る。順序を守るため `FullScanPlan::EmitExecutor` はこの場合 single-threaded なチェーン順 `FullScan` を保つ。
+      コストは別に扱う: `PlanBase::OrderIsMeasured()` が「保存順から測定した順序」を表し、構造的な順序（索引・スート）と違い全チェーンを読んだ代償が残る。したがって direct path の「順序付き候補を優先」段も `ApplyLimitHint` の LIMIT 早期打ち切り割引も適用対象外にする（適用しないと `ORDER BY pk LIMIT 1` が全表読みを1行扱いとして索引を追い越してしまう）。
+      順序主張は失効しうる（次の行変異で false に戻る）ので、`query/plan_cache.hpp` の契約どおり、その文脈で解決済みテーブルに claim がある間は `sql_engine.cpp` が plan をキャッシュしない。ソート除去が上限の折畳み / `IncrementalSort` として木に焼き込まれた plan は、後の別 snapshot で再生すると壊れるため。
+      回帰: `plan/full_scan_plan_test.cpp`（ゲート全分岐と EXPLAIN 描画）、`query/sql_clustered_order_test.cpp`（SQL の順序結果、LIMIT/OFFSET/DISTINCT/NULL 順序/空表/失敗文、変異後の Sort 復帰、キャッシュ非登録）、`plan/optimizer_test.cpp` の `ClusteredFullScanDoesNotOutrankASelectiveIndexPath` / `ClusteredFullScanIsNotPricedAsALimitEarlyStop`（アクセスパス選択とコストの非干渉）、`table/table_statistics_test.cpp` の `*LayoutGeneration*`（stamp の記録・失効・派生統計の破棄・永続化ラウンドトリップ）。
 - [x] `IncrementalSort` を入力の既存順序 prefix と suffix ソートへ接続する。
 - [x] Skip Scan DISTINCTを実装する。
-- [ ] collation対応比較を実装する（NULL順序だけの対応から拡張する）。
-- [ ] buffered sortとexternal mergeのimplementation ruleを分離する。
+- [x] collation対応比較を実装する（NULL順序だけの対応から拡張する）。
+      比較契約は `type/collation.{hpp,cpp}` に一元化し（`Collation` / `ResolveCollation` /
+      `ApplyCollation` / `CompareWithCollation` / `CompareUnderCollation` / `EqualUnderCollation` /
+      `SortKeyOrder`）、`Value` のタグ（0=なし・1=binary・2=case-insensitive。3は符号なし整数マーカーで
+      照合順序ではない）だけが照合順序の解決点になる。畳み込みは ASCII のみで、`expression/` の
+      `FoldCase`・`CompareForOrderBy` の VARCHAR 経路・`CanonicalDistinctValue` がこの一個所を使う。
+      ロケール／ICU 照合順序は未実装で、`en_US` 等は case-insensitive として扱う（未対応は binary
+      fallback）。UTF-8 のマルチバイト列・`interval` 表現・ENUM 固定順位は byte 順のまま変わらない。
+      実装: `SortExecutor` はキー符号化**前**に畳むので、メモリ内経路・spill した run・外部マージの
+      merge window が同じ符号化を使う（`Row` 直列化はタグを落としてもマージ側がキー式を再評価するので
+      付け直る）。比較経路の `TopNExecutor` ヒープ / `PdqSort` / `MergeAppendExecutor` /
+      `PartialSortExecutor` / SQL 関係代数の三つの `ORDER BY` ソータはすべて `SortKeyOrder` を使い、
+      NULL 位置・方向・照合順序が一つの契約に集約される。`WITH TIES` の境界行と `IncrementalSort`
+      の prefix 判定は `EqualUnderCollation`。Window の ORDER BY はその場限りの関数名判定をやめて同じ契約へ。
+      `GROUP BY` / `DISTINCT` は既存の `CanonicalDistinctValue`（同じ畳み込み）と一致。
+      `COLLATE(value, spec)` を AST 経路にも実装し（従来はバッチ評価器しか "not yet executable" にしていた）、
+      `ColumnVector` が列の collator を保持して値に付け直すので、射影の隠し `$orderN` 経由でも畳みが
+      失われない。optimizer は `PhysicalProperties::collation` で伝播し、`PlanBase::OrderCollation()`
+      （`SortPlan`/`TopNPlan` が override、projection/selection/limit は転送）と
+      `SatisfiesOrderingCollation` が「要求照合順序と同一か」を判定する。case-insensitive な順序は
+      binary な順序の代替にならない（`und:ci` で `a` < `B`、binary では逆）ので
+      `ORDER BY x COLLATE 'und:ci'` は索引順にも clustered order にも畳まれない。
+      `ORDER BY x COLLATE 'spec'` の節構文（AST は `Collate` 子ノード）も関數-call 形と同じ
+      `COLLATE(x, 'spec')` に畳む（`query/googlesql_ast_visitor.cpp`）。従来はこの節が無視されて
+      binary 順が黙って返っていた。`ORDER BY 1 COLLATE 'spec'` の ordinal は照合順序と対で
+      遅延解決する（`AsCollatedOrdinal` / `ApplyCollationSpec` / `ReapplyCollation`）。解決し損なうと
+      全行共通の中間キーになり「整列が何もしない」ので binary ではなく明示的に畳む。
+      回帰: `type/collation_test.cpp`（タグ往復・解決規則・畳み込み・全順序性・peer 等価・SortKeyOrder の
+      NULL 位置/方向）、`executor/sort_collation_test.cpp`（Sort/外部merge spill/TopN/WITH TIES/
+      PdqSort/IncrementalSort/PartialSort/MergeAppend、重複・空・境界バイト・interval 形・非ASCII・
+      キー評価エラー）、`plan/collation_property_test.cpp`（OrderCollation・requirement 判定・
+      Property Key 分離・provided/EXPLAIN 伝播）、`query/sql_collation_test.cpp`（SQL 実行順の回帰:
+      base table/subquery/UNNEST/alias/ordinal の一致、NULL 位置、LIMIT/OFFSET/WITH TIES、
+      GROUP BY と window RANK との一致、`=` 述語・DISTINCT との一致、非ASCII と interval 形の
+      byte 順維持、整数キー・空入力・重複）。
+- [x] buffered sortとexternal mergeのimplementation ruleを分離する。
+      内部 spill 選択は `SortExecutor::Materialize` のまま残し、**どちらの形を選ぶか**だけを plan 側に出した。
+      論理情報は同じ ORDER BY（キー・方向・NULL 位置・照合順序を全共有）なので、分離するのはメモリ契約と
+      EXPLAIN の名前だけで、`IsOrderedBy` / `OrderCollation` / `EnforcesLimit` / 行数 /
+      ParameterSlot の転送は base `SortPlan` に一本化して両形が報告する。
+      - `plan/sort_plan.hpp`: `SortMemoryPolicy{memory_budget_bytes, merge_window_rows}`、
+        `SortRowCapacity(policy)`（`budget / kSortEstimatedRowBytes`）、`SortStrategy`、
+        base `SortPlan`（互換のためfinalを外し、EXPLAIN名"StrategyName()"は"Sort"のまま）、
+        `BufferedSortPlan`（"BufferedSort"）/ `ExternalMergeSortPlan`（"ExternalMergeSort"）、
+        選択の単一実装 `MakeSortPlan(child, keys, estimated_rows, policy)`。
+      - 実装 rule は `sort`（buffered）と `sort_external_merge`（spill runs）の**排他な2片**で、
+        共通部分（キー構築・`SatisfiesOrderingCollation` を伴う省略判定）は `PrepareSortShape` に抽出。
+        推定行数 <= `SortRowCapacity` なら buffered のみ、越えたら external merge のみが alternative を
+        出す（選択は推定行数の決定関数）。external merge のコストは
+        `EstimateMemorySpillCost(kSort, …)` を加えた分だけ高く、run の書き出し/再マージの対価を
+        明示している。子が既に順序を配送するなら両 rule とも sort を挿入しない（省略は buffered
+        側だけが提供し、同一 plan が2つの rule 名で memo に残らないようにする）。
+        merge join / band join / sort-distinct / UNION ALL の内部 sort と
+        `OptimizeSingleRelation` の高速経路も同じ `MakeSortPlan` を通す。
+      - 専用 factory wiring: `executor/relational_factory.cpp` に `BufferedSortPlan::EmitExecutor` と
+        `ExternalMergeSortPlan::EmitExecutor`（`ExecutorSortKeys` / `SortExecutorOptions` 共有）。
+        `SortExecutor::Options{spill_mode, memory_budget_bytes, merge_window_rows, spill_threshold_rows}`
+        を渡す。既存4引数 ctor は `Options{}`（kAuto）へ委譲するので**既存 Sort API は互換**。
+      - operator 側: kBuffered は予算までメモリに保持して**spill を計画しない**（予算/プロセス予算が尽き
+        た時だけ executor 内部の選択で spill する = 誤った推定でも答えは変えない安全弁）、
+        kExternalMerge は `spill_threshold_rows` 到達で sorted run を書き出し、末尾 run も必ず書いて
+        merge window 越しにマージするので作業集合が入力サイズに依存しない。全 mode で内部 spill 選択は
+        最終手段として残る。Dump は `ParallelSort (1 workers, spill=external-merge, budget=…, run_rows=…)`。
+      回帰: `plan/sort_shape_test.cpp`（両形の順序/collation/NULL/ParameterSlot 契約の一致、メモリ契約と
+      RowCapacity、EXPLAIN 名と memory suffix、PlanExplainInfo の rule/physical operator/provided 順序が
+      形で変わらないこと、`MakeSortPlan` と2 rule の排他選択契約、順序配送済み子の省略、folding 要求を
+      binary な子が満たさないこと、factory が各形の operator 設定を渡すこと、両形が同じ行順を返す
+      こと）、`executor/sort_shape_executor_test.cpp`（既定 kAuto の互換、小入力は非 spill、
+      予算超過時の正しい fallback、rows threshold 複数 run のマージ、merge window の clamp、
+      ORDER BY/NULL/ties・降順+NULLS LAST の一致、キー評価失敗/子 cursor 失敗が両形で error として
+      出て部分結果を返さないこと、空入力）。
 
 ### Aggregation
 
-（以下は実装済み: AggregationPlan, HashAggregatePlan, SortAggregatePlan, StreamAggregate, FilteredAggregate, ScalarAggEmptyInput, ParallelAggregation）
+（以下は実装済み: AggregationPlan, HashAggregatePlan, SortAggregatePlan, StreamAggregatePlan, HashAggregateExecutor, SortAggregateExecutor, StreamAggregateExecutor, FilteredAggregate, ScalarAggEmptyInput, ParallelAggregation）
 
-- [ ] GROUP BYキーを持つHashAgg / SortAgg / StreamAggを実装する。
-- [ ] HashAggとSortAggの実際のアルゴリズムを分離する。
-- [ ] `StreamAggregate` の入力順序契約と実行器を接続する。
+- [x] GROUP BYキーを持つHashAgg / SortAgg / StreamAggを実装する。
+      `AggregatePayload`{group_keys, aggregates, having, estimated_groups,
+      memory} を `plan/aggregation_plan.hpp` に用意し、3つの plan 型と3つの
+      実行器（`executor/grouped_aggregate.{hpp,cpp}`）が同じ payload を受け取る。
+      出力行は [group key..., aggregate...]、`HAVING` はその出力行に対する述語
+      （ノード上の `kSelection` と同じスコープ）。グループキーなしは 1 group
+      のまま既存スカラー経路（`AggregationExecutor` /
+      `ParallelAggregationExecutor`）へ束ね、既存 API は非互換なし。
+      回帰: `executor/grouped_aggregate_test.cpp`（NULL/空/重複キー/複合キー/
+      FILTER/DISTINCT/AVG/HAVING/エラー/spill/file error/並列/SQL 差分）、
+      `plan/aggregate_shape_test.cpp`（payload・順序契約・EXPLAIN・規則選択・
+      factory 配線）。
+- [x] HashAggとSortAggの実際のアルゴリズムを分離する。
+      HashAgg は group table（予算超過時: key hash で partition spill して
+      partition 単位で再集計）、SortAgg は group key の sort run（run 書き込み
+      + merge window）→ 同一 key run を 1 パスで畳む。両者は同じ group 集合を
+      返し、違うのはメモリ契約と出力順序（SortAgg は group-key 順を約束する）。
+      分離は `PeakResidentGroups()`（同時に保持する group 数）で観測可能な
+      まま固定した: HashAgg のピークは distinct key 数（spill 後は最大 1
+      partition の group 数）、SortAgg は常に 1。factory も strategy ごとに
+      設定を分けて引き渡す（worker 数 → HashAgg、run threshold →
+      SortAgg、順序検証 → StreamAgg）。
+      回帰: `grouped_aggregate_test.cpp` の
+      `AllThreeShapesReturnTheSameGroups` /
+      `TheHashShapeKeepsAGroupTableTheSortShapeKeepsOneGroup` /
+      `TheHashShapeDoesNotReorderItsInputTheSortShapeDoes` /
+      `InterleavedKeysFoldIntoTheSameGroupsAsAdjacentOnes` /
+      `EachGroupedShapeSpillsOnItsOwnContractOnly` /
+      `APartitionedHashBuildHoldsOnePartitionsGroups` /
+      `TheHashShapePartitionsAndStillReturnsEveryGroup` /
+      `TheSortShapeWritesRunsAndStillReturnsEveryGroup` /
+      `TheSpillPathsKeepTheNullAndDuplicateContract` /
+      `TheSortShapeFoldsNanAndSignedZeroKeysAcrossItsRuns` /
+      `TheEmptyInputReachesNeitherGroupedSpillPath` /
+      `OnlyTheHashShapeFoldsItsInputInParallel` /
+      `AFailingChildIsTheSameErrorOnBothGroupedAlgorithms`、
+      `aggregate_shape_test.cpp` の
+      `OnlyTheOrderedShapesPromiseAnOrder` /
+      `EveryAlternativeIsExactlyOneStrategy` /
+      `TheStrategyChoiceFollowsTheGroupTableMemoryContract` /
+      `EachShapeEmitsItsOwnStrategySettings` / `ExplainInfo...`。
+- [x] `StreamAggregate` の入力順序契約と実行器を接続する。
+      順序契約は「group key を昇順・NULLS FIRST で到着済み」の入力。規則
+      `aggregation` はその順序を供給する子の場合にだけ第3代替を提示し
+      （`ChildDeliversGroupKeyOrder`）、実行器は `require_ordered_input` で
+      同じ契約を自分で検証する（違反は `kInvalidArgument`、部分結果は返さ
+      ない）。group key が 0 個なら group が 1 個なので任意順序で valid。
+      回帰: `grouped_aggregate_test.cpp` の
+      `TheStreamShapeRefusesAnUnorderedInput` /
+      `TheStreamShapeAcceptsThePromisedInputOrder` /
+      `TheStreamShapeRefusesNullsThatAreNotFirst` /
+      `AKeylessPayloadNeedsNoInputOrder`、
+      `aggregate_shape_test.cpp` の `TheStreamShapeNeedsAnOrderedInput`。
 - [x] `PartialAggregate` + `FinalizeAggregate`を実装する。
 - [x] `TwoPhaseDistinctAgg`を実装する。
 - [x] MIN/MAXのindex-only aggregate scanを実装する（非NULLな単一キー列を
@@ -262,7 +425,7 @@ Cascades rule / cost / statistics
 
 ### Join変換・探索
 
-（以下は実装済み: join_commutativity, join_enumeration, join_associativity_left/right, infer_join_predicates, push_selection_through_join, split_selection_over_join, join_to_cross_if_no_predicate, merge_adjacent_filters, push_filter_through_left_join_left_side, join_on_false_to_empty, cross_to_inner_with_predicate, join_empty_simplification, self_join_elimination, unique_semi_to_inner, outer_to_anti_join, right_to_left_outer_join, full_outer_join_decomposition, push_down_limit_through_join, greedy_join_order_fallback, dynamic_filter_pushdown_join, join_predicate_transitivity, inferred_inequality_pushdown, redundant_join_predicate_elimination, outer_to_inner (relational)）
+（以下は実装済み: join_commutativity, join_enumeration, join_associativity_left/right, infer_join_predicates, push_selection_through_join, split_selection_over_join, join_to_cross_if_no_predicate, merge_adjacent_filters, push_filter_through_left_join_left_side, join_on_false_to_empty, cross_to_inner_with_predicate, join_empty_simplification, self_join_elimination, unique_semi_to_inner, outer_to_anti_join, right_to_left_outer_join, full_outer_join_decomposition, push_down_limit_through_join, dynamic_filter_pushdown_join, join_predicate_transitivity, inferred_inequality_pushdown, redundant_join_predicate_elimination, outer_to_inner (relational)）
 
 - [ ] n-ary bushy joinのleft/right associationを完全化する。
 - [x] 空Values / 1行定数表によるjoin identityを実装する。
@@ -314,7 +477,7 @@ Cascades rule / cost / statistics
 
 ### Scalar rewrite（ExpressionRuleSet）
 
-（以下はExpressionRuleSetに実装済み: fold_binary/unary/in/function, singleton_in, canonicalize_comparison, boolean_identity, double_negation, de_morgan, simplify_case, not_comparison/not_like/not_is_null/not_is_not_null, xor_boolean_identity, and/or_idempotent, absorption_and/or, identity_add/subtract_zero, identity_multiply/divide_one, double_negation_arithmetic, reassociate_add/subtract_constants, dedupe_in_list, uniform_case_result, like_equality, is_null/is_not_null_of_null_check, collapse_nested_identical_cast, factor_or_common_and, nullif_to_case, self_inequality, contradiction_from_null_eq, greatest_least_fold, in_single_null, concat_flatten, xor_to_or_and_not, is_distinct_from_rewrite, boolean_eq_true_false_three_valued, abs_of_abs, empty_in_list, coalesce_and_nullif_simplification, datetime_and_string_fold_extent, if_to_case, json_path_constant_fold, numeric_widening_cast, or_of_ranges_to_in, interval_normalize, predicate_pushdown_case, inner_join_not_null_inference, regexp_prefix_extraction, cast_pushdown_comparison, deterministic_function_cse, function_volatility_classification, boolean_filter_pullup, not_in_null_semantics, array_flatten_optimization）
+（以下はExpressionRuleSetに実装済み: fold_binary/unary/in/function, singleton_in, canonicalize_comparison, boolean_identity, double_negation, de_morgan, simplify_case, not_comparison/not_like/not_is_null/not_is_not_null, xor_boolean_identity, and/or_idempotent, absorption_and/or, identity_add/subtract_zero, identity_multiply/divide_one, double_negation_arithmetic, reassociate_add/subtract_constants, dedupe_in_list, uniform_case_result, like_equality, is_null/is_not_null_of_null_check, collapse_nested_identical_cast, factor_or_common_and, nullif_to_case, self_inequality, contradiction_from_null_eq, greatest_least_fold, in_single_null, concat_flatten, xor_to_or_and_not, is_distinct_from_rewrite, boolean_eq_true_false_three_valued, abs_of_abs, empty_in_list, coalesce_and_nullif_simplification, datetime_and_string_fold_extent, if_to_case, json_path_constant_fold, numeric_widening_cast, or_of_ranges_to_in, interval_normalize, predicate_pushdown_case, inner_join_not_null_inference, regexp_prefix_extraction, cast_pushdown_comparison, deterministic_function_cse, boolean_filter_pullup, not_in_null_semantics, array_flatten_optimization）
 
 - [x] numeric widening cast簡約とDATE/TIMESTAMP cast正規化を実装する。
 - [x] NOT IN with NULL listの警告・計画を実装する。
@@ -328,7 +491,7 @@ Cascades rule / cost / statistics
 
 ### Aggregate変換規則
 
-（以下はCascadesルールとして実装済み: push_selection_through_aggregation, distinct_over_group_by, aggregate_projection_merge, eager_aggregation_over_join, unique_group_key_aggregate_elimination, aggregate_union_transpose, aggregate_join_transpose）
+（以下はCascadesルールとして実装済み: push_selection_through_aggregation, distinct_over_group_by, unique_group_key_aggregate_elimination, aggregate_union_transpose）
 
 - [x] aggregateとprojectをmergeする。
 - [ ] aggregateとfilterをtransposeし、HAVING残余を整理する。
@@ -396,6 +559,11 @@ Cascades rule / cost / statistics
 - [x] compressed PAX direct scan、zero-copy projectionを実装する。
 - [x] operatorごとのmemory reservationを実装する。
 - [ ] HashJoin / HashAgg / Sort / Windowのspill protocolを統一する。
+      （HashAgg の partition spill は 1 段だけ: 1 partition の group table が
+      予算内に収まることを `spill_partition_count` に任せている。偏った key
+      分布で収まらない場合の多段 spill は未実装 —
+      `executor/grouped_aggregate_test.cpp` の
+      `APartitionedHashBuildHoldsOnePartitionsGroups` がその現状を固定。）
 - [ ] statement timeoutのcancelを全operatorへ伝播する。
 - [x] memory不足時のgraceful degradeを実装する。
 - [x] distributed any / singleton / hash / broadcast / rangeを実装する。

@@ -40,7 +40,7 @@ graph TD
 
 `kValues` は、計画時にすべての属性値と行が確定している完全な静的リレーションを表します。実行時にストレージエンジンからのページ読み出しや MVCC 可視性チェックを必要としないため、I/O 待ちや並行性異常は発生しません。
 
-一方で、行リテラルには物理ストレージ上のレコード識別子（RID）が存在しないため、物理プロパティ `require_row_position`（行位置保持要求）を満たすことはできません。この検査は呼び出し側の単一リレーション高速パス（`OptimizeSingleRelation`）等で検証され、行位置が要求された場合には `Status::kNotImplemented` が返却されます。
+一方で、行リテラルには物理ストレージ上のレコード識別子（RID）が存在しないため、物理プロパティ `require_row_position`（行位置保持要求）を満たすことはできません。この検査は呼び出し側の単一リレーション高速パス（`Optimizer::Optimize（通常の Memo 経路）`）等で検証され、行位置が要求された場合には `Status::kNotImplemented` が返却されます。
 
 また、行数が 0 または 1 の場合、重複が存在し得ないため `ValuesPlan::EnforcesDistinct()` は真となります。オプティマイザの論理特性推定においても、`values.size() <= 1` の `kValues` には `max_1_row` 特性が付与され、スカラサブクエリの単一行保証ノード（`max1_row`）を省略する最適化が可能となります。
 
@@ -81,7 +81,7 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `constant_table`: 論理演算子 `kConstantTable` を処理する兄弟実装 Rule。
+
 - `dummy_scan`: 列を持たず 1 行のみを出力する退化形式の静的スキャン Rule。
 - `in_list_to_semi_join`: IN リストから `kValues` を生成する論理 Rule。
 - `values_fold_into_union`: 複数の `kValues` 枝を 1 つにマージする論理 Rule。

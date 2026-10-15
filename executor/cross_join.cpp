@@ -39,6 +39,7 @@ bool CrossJoin::Next(Row* dst, RowPosition* /*rp*/) {
   }
   if (right_iter_ == right_table_.end()) {
     if (!left_->Next(&hold_left_, nullptr)) {
+      FailWithChildOf(*left_);
       return false;
     }
     right_iter_ = right_table_.begin();

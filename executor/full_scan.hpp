@@ -19,9 +19,13 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "executor/executor_base.hpp"
 #include "table/iterator.hpp"
+#include "type/column_name.hpp"
 
 namespace tinylamb {
 class Table;
@@ -40,14 +44,29 @@ class FullScan : public ExecutorBase {
   // lock_rows marks a DML source scan: the iterator write-intent-locks every
   // occupied slot before resolving it, so yielded rows carry the head
   // (newest committed) image rather than the transaction's snapshot image.
+  // clustered_order names the column whose stored order this scan delivers
+  // (FullScanPlan::ClusteredColumn); it is reported in EXPLAIN and is empty
+  // whenever the scan makes no such promise.
   FullScan(Transaction& txn, const Table& table,
            size_t max_rows = std::numeric_limits<size_t>::max(),
-           bool lock_rows = false, bool wait_for_write_intent = true);
+           bool lock_rows = false, bool wait_for_write_intent = true,
+           std::optional<ColumnName> clustered_order = std::nullopt,
+           std::optional<std::vector<slot_t>> projection = std::nullopt);
   ~FullScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
+  // Accepts a dynamic join filter published by the hash join this scan probes
+  // for. FullScan yields whole table rows, so `column` is a table-schema slot
+  // and the rejection happens inside the iterator before row decode.
+  bool AttachRuntimeFilter(
+      const std::shared_ptr<const RuntimeFilterGroup>& group, slot_t column,
+      ValueType type) override;
+
+  [[nodiscard]] const std::optional<ColumnName>& ClusteredOrder() const {
+    return clustered_order_;
+  }
 
  private:
   // Not owned; the executor must not outlive the Table.
@@ -55,6 +74,17 @@ class FullScan : public ExecutorBase {
   Iterator iter_;
   size_t max_rows_;
   size_t emitted_{0};
+  // Set by the first Next/NextBatch: past that point the iterator has already
+  // consumed rows, and installing a filter could only prune them retroactively.
+  bool started_{false};
+  // Owns the group so the iterator's raw pointer stays valid for its lifetime.
+  std::shared_ptr<const RuntimeFilterGroup> runtime_filter_;
+  slot_t runtime_filter_column_{0};
+  // Owned copy of the schema the projected iterator yields (the table schema
+  // when no projection was requested); NextBatch resets chunks to this width.
+  Schema output_schema_{Schema("", {})};
+  // Diagnostic only: the plan decided the chain walk is in this key's order.
+  std::optional<ColumnName> clustered_order_;
 };
 
 }  // namespace tinylamb

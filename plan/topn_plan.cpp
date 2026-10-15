@@ -72,6 +72,14 @@ bool TopNPlan::IsOrderedBy(
   return true;
 }
 
+Collation TopNPlan::OrderCollation() const {
+  Collation resolved = Collation::kNone;
+  for (const TopNKey& key : keys_) {
+    resolved = ResolveCollation(resolved, key.collation);
+  }
+  return resolved;
+}
+
 void TopNPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << ToString() << "\n"
          << Indent(static_cast<size_t>(indent) + 2);

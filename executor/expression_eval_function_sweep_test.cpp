@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -192,6 +193,32 @@ std::vector<Case> SweepCases() {
       {"json_query_array", {kJson, Value(std::string("$.b"))}, -1},
       {"json_value", {kJson, kPath}, 1},
       {"json_value_array", {kJson, Value(std::string("$"))}, -1},
+      // JSON document family (shared json_doc implementation).
+      {"json_type", {kJson}, 1},
+      {"json_type", {kJson, Value(std::string("$.b"))}, 1},
+      {"json_type", {kJson, Value(std::string("$.zz"))}, 1},
+      {"json_type", {kStr}, 0},
+      {"json_keys", {kJson}, 1},
+      {"json_keys", {Value(std::string("[1]"))}, 1},
+      {"json_array_length", {Value(std::string("[1, 2, 3]"))}, 1},
+      {"json_array_length", {kJson}, 1},
+      {"json_set", {kJson, Value(std::string("$.z")), Value(9)}, 1},
+      {"json_set",
+       {Value(std::string("[1]")), Value(std::string("$[3]")), Value(9)},
+       0},
+      {"json_insert", {kJson, Value(std::string("$.q")), Value(1)}, 1},
+      {"json_insert", {kJson, Value(std::string("$.a")), Value(1)}, 0},
+      {"json_replace", {kJson, Value(std::string("$.a")), Value(2)}, 1},
+      {"json_replace", {kJson, Value(std::string("$.zz")), Value(2)}, 0},
+      {"json_remove", {kJson, Value(std::string("$.a"))}, 1},
+      {"json_array", {Value(1), kStr}, 1},
+      {"json_object", {Value(std::string("k")), Value(1)}, 1},
+      {"json_object", {Value(1), Value(2)}, 0},
+      {"lax_int64", {Value(std::string("5.9"))}, 1},
+      {"lax_float64", {kJson}, 1},
+      {"lax_bool", {Value(std::string("true"))}, 1},
+      {"lax_string", {Value(42)}, 1},
+      {"lax_int64", {Value(std::string("[1]"))}, 1},
       {"__struct_json__", {kInt, kStr}, -1},
       {"__struct_set", {kJson, Value(std::string("a")), Value(9)}, -1},
       {"__get_field_safe", {kJson, Value(std::string("a"))}, 1},
@@ -480,12 +507,33 @@ TEST_F(RelationalFunctionSweepTest, CanonicalPins) {
       {"extract_day", {Value::Date("2026-09-22")}, Value(22)},
       {"byte_length", {Value(std::string("abcd"))}, Value(4)},
       {"to_json_string", {Value(7)}, Value(std::string("7"))},
+      {"json_type",
+       {Value(std::string(R"({"a": [1]})"))},
+       Value(std::string("object"))},
+      {"json_array_length", {Value(std::string("[1, 2, 3]"))}, Value(3)},
+      {"json_keys",
+       {Value(std::string(R"({"b": 1, "a": 2})"))},
+       Arr({Value(std::string("b")), Value(std::string("a"))}, "STRING")},
+      {"json_set",
+       {Value(std::string(R"({"a": 1})")), Value(std::string("$.b")), Value(2)},
+       Value(std::string(R"({"a":1,"b":2})"))},
+      {"json_object",
+       {Value(std::string("k")), Value(1)},
+       Value(std::string(R"({"k":1})"))},
+      {"lax_int64", {Value(std::string("5.9"))}, Value(5)},
+      {"lax_float64", {Value(std::string("2.5"))}, Value(2.5)},
+      {"lax_bool",
+       {Value(std::string("false"))},
+       Value(static_cast<int64_t>(0))},
+      {"lax_string", {Value(42)}, Value(std::string("42"))},
   };
   for (const Pin& pin : pins) {
     SCOPED_TRACE(testing::Message() << pin.name << "/" << pin.args.size());
     const std::optional<Value> result = Evaluate(pin.name, pin.args);
     ASSERT_TRUE(result.has_value()) << "pin must succeed: " << pin.name;
-    EXPECT_EQ(*result, pin.expected) << pin.name;  // NOLINT(bugprone-unchecked-optional-access)
+    assert(result.has_value());
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    EXPECT_EQ(*result, pin.expected) << pin.name;
   }
 }
 
@@ -495,7 +543,11 @@ TEST_F(RelationalFunctionSweepTest, DeterminismAndNullPropagation) {
   const std::optional<Value> first = Evaluate("upper", args);
   const std::optional<Value> second = Evaluate("upper", args);
   ASSERT_TRUE(first.has_value());
-  EXPECT_EQ(first.value(), *second);  // NOLINT(bugprone-unchecked-optional-access)
+  ASSERT_TRUE(second.has_value());
+  assert(first.has_value());
+  assert(second.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(first, *second);
 
   // NULL arguments: the evaluator must either return NULL or fail cleanly,
   // never crash, for a representative slice of the function surface.

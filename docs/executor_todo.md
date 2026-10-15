@@ -28,7 +28,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `Limit` + `LimitPlan`
 - [x] `HashJoin`（in-memory / hybrid spill）+ `JoinKind`: inner / semi / anti /
       null-aware anti
-- [x] `IndexJoin` + エイリアス付き自己結合
+- [x] `LookupJoin`（旧 `IndexJoin`）+ エイリアス付き自己結合
 - [x] `CrossJoin` / nested-loop（完全述語評価）
 - [x] `Sort`（外部マージ）※計画ノードとしてはエンジン安全網が主
 - [x] `Distinct`
@@ -66,8 +66,10 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       コストにソート費用を加算し、他方式との比較対象にする）
 - [x] 興味深い順序を出力（左入力の join キー昇順を `IsOrderedBy` で伝播）
 - [x] many-to-many の交差（重複キー run の直積を出力）
-- [ ] 非等価 merge（`a.x < b.y` のバンドジョイン）は後回しでも項目化:
-      - [ ] inequality merge / band join
+- [x] 非等価 merge（`a.x < b.y` のバンドジョイン）を実装:
+      - [x] inequality merge / band join（inner、単一の符号付きINT64/DATE順序比較。NULL・重複・空入力・エラー・順序・行数を固定）
+      - [x] `join_commutativity` で子の順序が逆になった Planning でも band join の比較を鏡像化する（`TryBandJoinSpec`。これまでは候補範囲が「書かれた演算子」のまま残り、
+            残差再検査と食い違い一致行を落としていた）
 
 ### Outer hash / nested loop
 
@@ -81,8 +83,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       文字列キー回帰 `Relational_WithHybridHashLeftJoinUnderBudget_SpillsToDisk` /
       `Relational_WithStringKeyHybridLeftJoinUnderBudget_SpillsToDisk`）
 - [x] `LeftNestedLoopJoin` / `Right` / `Full`（非等価外部結合の relational fallback と回帰テストあり）
-- [ ] outer の Semi ではない null-aware マッチ
-- [ ] 右側フィルタが null-rejecting でないときの実行時 NULL 生成
+- [x] outer の Semi ではない null-aware マッチ
+- [x] 右側フィルタが null-rejecting でないときの実行時 NULL 生成（残余 ON は match 判定内で評価し、全候補不成立の preserved side も pad）
 
 ### Semi / Anti / Mark / Single（実行器は部分的に既存）
 
@@ -99,13 +101,23 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 - [ ] `BlockNestedLoopJoin`（外側ブロック × 内側全走査）
 - [ ] `BatchNestedLoopJoin`（外側キーを IN リスト化）
-- [ ] `LookupJoin` の複合キー・範囲（IndexJoin の一般化）
-- [ ] `ZigZagJoin`（両側インデックス）
-- [ ] `LateMaterializationJoin`（RID 結合 → 列フェッチ）
+- [x] `LookupJoin` の複合キー・範囲（等値prefix＋range bound 1個、INT64/DATE）
+- [x] `ZigZagJoin`（両側インデックス、INNER、単一署名付きINT64キー、等値または単一range）
+- [x] `LateMaterializationJoin`（equi/unique winnerの索引キーと`RowPosition`だけを先に保持し、payloadは上位段で`Table::Read`。内部結合、符号付きINT64/DATEキー、NULL/重複/空入力/unique/error、row positionと順序を固定。内部key probeは左major、rowid明示形は内部専用でSQL rowid表面は持たない。array/outer/semi/anti/NULL-safe/巨大候補・stale indexは拒否またはfallback）
 - [ ] `DynamicFilterJoin` / sideway information passing（ブルームをスキャンへ）
-- [ ] `HashSemiReduction`（巨大ファクトの前に次元を縮約）
+- [x] `HashSemiReduction`（巨大ファクトの前に次元を縮約。`HashJoin::EnableSemiReduction` は
+      存在判定だけを使う semi / anti / null-aware anti だけを対象にし、probe 側の等値キーを先に
+      `JoinHashIndex` でドメイン化してから build を取り込む。probe 側ドメインの外にある build 行は
+      intake 中に捨て、build キー重複も1行に畳む。`NOT IN` の三値論理と「build 側が空」は *生の*
+      build cardinality / NULL フラグで判定するので縮約の影響を受けない。domain が
+      `kSemiReductionMaxDomainKeys` を超えたら解放して非制限 intake に fallback し、build キー
+      重複除去だけを残す。論理側は `semi_reduction_pushdown_semi_join` /
+      `semi_reduction_pushdown_anti_join`、`ProductPlan::PreferSemiReduction`、
+      `plan/product_plan.cpp` の `SemiReductionIsProfitable` を通る。回帰は
+      `executor/hash_semi_reduction_test.cpp` と `plan/cascades_test.cpp` の
+      `SemiReductionPushdown*`。詳細は `docs/todo.md` Phase 2 Join。）
 - [x] `CrossJoinUnnest`（定数/相関配列を通常の cross/lateral 行源として結合、SQL 回帰あり）
-- [x] `AsOfJoin` / `IntervalJoin`（時系列、将来）
+- [x] `AsOfJoin` / `IntervalJoin`（時系列、将来）(2026-10-03 削除: 生成元なし)
 
 ---
 
@@ -121,7 +133,15 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `WITH TIES` Top-N（TopNExecutor の ties 境界拡張）
 - [x] `IncrementalSort`（入力が prefix ソート済み）
 - [x] `PartialSort`
-- [ ] `ClusteredIndexOrder` を FullScan が報告（PK 順ページ）
+- [x] `ClusteredIndexOrder` を FullScan が報告（PK 順ページ）。順序は「測定」であり
+      保証ではない: `plan/full_scan_plan.hpp` の `ClusteredOrderColumn()` が UNIQUE
+      単一キー + NOT NULL + ANALYZE の相関 1.0 + 未変化の `Table::LayoutGeneration()`
+      （+ in-place 書き換えの latch が立っていない）をすべて満たすときだけ昇順を
+      報告し、`FullScanPlan::EmitExecutor` はその場合 single-threaded な
+      chain-ordered `FullScan` を保つ（`ParallelScan` は保存順でない）。EXPLAIN には
+      `FullScan: t (clustered order: id ASC)`。詳細は `docs/todo.md` Phase 2 Sort /
+      Top-N。残件: モーセル並列のまま順序を保つ scan（`ParallelScan` のモーセル順
+      出力）を作れば並列閾値以上の表でも報告できる。
 - [x] `LimitPushdownScan`（unordered LIMIT の OFFSET + LIMIT 上限を FullScan が
       受け取り、スカラー/バッチ双方で early stop）
 - [x] `SkipScanDistinct`（インデックスで DISTINCT キーを飛ばす）
@@ -136,13 +156,24 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 - [x] `HashAggregatePlan` と `SortAggregatePlan` の分離選択（スカラー集約の
       物理 plan 型と `AggregationStrategy` を分離。GROUP BY payload の
-      Cascades 接続までは別項目）
-- [ ] `StreamAggregate`（入力が group キー順。前提: Cascades 論理ペイロードへの
-      GROUP BY キー導入が未着手のため、単体実行器だけでは接続先がない）
+      Cascades 接続は下の `StreamAggregate` と同時に完了）
+- [x] HashAgg と SortAgg の**アルゴリズム**分離（state / order / spill /
+      parallel / empty / NULL / duplicate / ties / 子エラーを形ごとに固定。
+      `PeakResidentGroups()` が state の差（HashAgg = group table の peak、
+      SortAgg = 常に 1）、Dump が spill の差（`spill=partitioned,
+      partitions=N` vs `run_rows=R, window=W`）、順序の承諾は plan 側の
+      `IsOrderedBy`。選択は group 数が `AggregateGroupCapacity()` を超えると
+      sort が安くなる memory 契約のコスト。
+      `plan/aggregate_shape_test.cpp` / `executor/grouped_aggregate_test.cpp`）
+- [x] `StreamAggregate`（入力が group キー順。GROUP BY キーは
+      `AggregatePayload.group_keys` として論理ペイロードへ入り、規則
+      `aggregation` が順序を供給する子にだけ第3代替を提示する。実行器は
+      `require_ordered_input` で契約違反を検出してエラーにする。
+      `plan/aggregate_shape_test.cpp` / `executor/grouped_aggregate_test.cpp`）
 - [x] `PartialAggregate` + `FinalizeAggregate`（並列・分散）
 - [x] `DistinctAggregate`（逐次・並列 `Aggregation` が aggregate metadata の
       DISTINCT 集合を保持して `COUNT(DISTINCT x)` を処理）
-- [x] `TwoPhaseDistinctAgg`
+- [x] `TwoPhaseDistinctAgg`(2026-10-03 削除: 経路なし。COUNT DISTINCT は並列2相集約が担う)
 - [x] `MinMaxIndexScan`（非NULLな単一キー列をINDEX ONLYの先頭1件から取得）
 - [x] `FilteredAggregate`（GoogleSQL `AGG(x WHERE …)`。直列・並列集約と
       `COUNT(*)` のフィルタ順序を回帰）
@@ -164,7 +195,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 - [x] `BitmapIndexScan` + `BitmapHeapScan`（単一キーの複数インデックス OR/AND を optimizer に接続）
 - [x] `BitmapAnd` / `BitmapOr` オペレータ
-- [x] `TidScan` / `RowIdLookup` / `CTID` 相当
+- [x] `TidScan` / `RowIdLookup` / `CTID` 相当(2026-10-03 削除: SQL/計画経路からの参照がなく到達不能)
 - [ ] `IndexSkipScan`（先頭列が等式でない複合インデックス）
 - [ ] `IndexOnlyScan` の visibility map 相当（MVCC で heap fetch 省略を広げる）
 - [ ] `CoveringIndex` 選択のコスト精度
@@ -219,6 +250,11 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] パーティション切替
 - [x] ROWS フレーム（BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW 等）
 - [x] RANGE フレーム（ORDER BY キーの同値）
+- [x] RANGE INTERVAL オフセット（DATE キーのカレンダ窓:
+      `RANGE BETWEEN INTERVAL 7 DAY PRECEDING AND CURRENT ROW`。
+      MONTH/YEAR は `DATE + INTERVAL` と同じ月末クランプ、
+      DATE 以外のキー+INTERVAL は明示エラー。
+      `WindowSqlCov.RangeIntervalFramesOnDateKeys`）
 - [x] GROUPS フレーム（peer group 単位の preceding/current/following 境界と回帰テスト）
 - [x] EXCLUDE CURRENT ROW / GROUP / TIES
 - [x] フレーム無しランキング（ROW_NUMBER / RANK / DENSE_RANK / NTILE）
@@ -390,7 +426,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `ExchangeRange`
 - [ ] `RemoteScan`
 - [ ] `DistributedLimitMerge`
-- [ ] `DistributedAggFinalize`
+- [ ] `DistributedAggFinalize`(2026-10-03 削除: 実分散実行は未実装)
 
 ---
 

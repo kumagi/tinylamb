@@ -59,6 +59,26 @@ constexpr size_t kHybridPartitions = 32;
 constexpr size_t kParallelBuildMinRows = 4096;
 constexpr size_t kParallelProbeMinRows = size_t{1} << 15;
 
+#if defined(__GNUC__) || defined(__clang__)
+void PrefetchRow(const Row& row) {
+  __builtin_prefetch(row.values_.data(), 0, 1);
+}
+#else
+void PrefetchRow(const Row& row) { (void)row; }
+#endif
+
+void PrefetchProbeRow(const std::vector<PositionedRow>& rows, size_t index) {
+  if (index < rows.size()) {
+    PrefetchRow(rows[index].first);
+  }
+}
+
+void PrefetchProbeRow(const std::vector<Row>& rows, size_t index) {
+  if (index < rows.size()) {
+    PrefetchRow(rows[index]);
+  }
+}
+
 uint64_t BSwap64(uint64_t v) { return __builtin_bswap64(v); }
 
 uint64_t MixHash(uint64_t h) {
@@ -409,12 +429,16 @@ void JoinHashIndex::Insert(uint64_t hash, int64_t int_key,
 size_t JoinHashIndex::Find(uint64_t hash, int64_t int_key,
                            std::string_view byte_key) const {
   size_t idx = hash & mask_;
+  // Warm the next probe slot while the home slot is being fetched: linear
+  // probing walks forward and int-key mode reads slot_int_keys_ right after
+  // slots_, so two lines ahead is where the probe usually lands next.
+  __builtin_prefetch(&slots_[(idx + 2) & mask_], 0, 1);
   for (;;) {
     const size_t head = slots_[idx];
-    if (head == kNil) {
+    if (head == kNil) [[likely]] {
       return kNil;
     }
-    if (SlotKeyEquals(idx, int_key, byte_key)) {
+    if (SlotKeyEquals(idx, int_key, byte_key)) [[likely]] {
       return head;
     }
     idx = (idx + 1) & mask_;
@@ -475,21 +499,67 @@ struct HashJoin::JoinState {
     // Sticky SpillFile failure (EXC removal, migration Phase 7).
     Status spill_error{Status::kSuccess};
     bool has_null_key{false};
+    // Rows the child produced, and how many of them this side's dynamic filter
+    // rejected afterwards (0 when the scan applied the filter itself).
+    size_t seen_rows{0};
+    size_t filtered_rows{0};
+    size_t filtered_null_rows{0};
     // Parallels the join's key columns (nullptr unless a null-safe key).
     const std::vector<bool>* null_safe{nullptr};
+    // Scratch for the spill-partition key encoding, shared by Flush and
+    // Accumulate so neither reallocates per row.
+    std::string spill_key;
+    // Comparison domain the dynamic filter was built over; a probe value of a
+    // different ValueType is never rejected. `filter_rejects_all` covers the
+    // domain-less RejectAll group (empty / all-NULL build side).
+    ValueType filter_type{ValueType::kInt64};
+    bool filter_rejects_all{false};
 
     [[nodiscard]] bool Spilled() const { return !spills.empty(); }
 
+    // One row's worth of budget-aware accumulation: resident while the global
+    // budget allows it, spilled into the matching hash partition otherwise.
+    // Shared by the plain intake below and by the reduced semi/anti intake,
+    // so both spill under exactly the same rules. Returns false once a spill
+    // has failed, which stops the caller from pulling more rows from a child
+    // whose output can no longer be stored.
+    bool Accumulate(Row row, RowPosition position,
+                    const std::vector<slot_t>& cols) {
+      QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+      const size_t bytes = EstimateRowBytes(row);
+      if (!Spilled() && !budget.CanReserve(bytes)) {
+        Flush(cols);
+      }
+      if (Spilled()) {
+        Status st_sp = Status::kSuccess;
+        if (!EncodeJoinKeyInto(row, cols, &spill_key, null_safe)) {
+          st_sp = spills[0].Append(row, position);
+        } else {
+          st_sp =
+              spills[HashBytesKey(spill_key) % kReactiveSpillPartitions].Append(
+                  row, position);
+        }
+        if (st_sp != Status::kSuccess) {
+          spill_error = st_sp;
+          return false;
+        }
+        return true;
+      }
+      charge.Add(bytes);
+      rows.emplace_back(std::move(row), position);
+      return true;
+    }
+
     void Flush(const std::vector<slot_t>& cols) {
       spills.resize(kReactiveSpillPartitions);
-      std::string key;
       for (const PositionedRow& item : rows) {
         Status st_sp = Status::kSuccess;
-        if (!EncodeJoinKeyInto(item.first, cols, &key, null_safe)) {
+        if (!EncodeJoinKeyInto(item.first, cols, &spill_key, null_safe)) {
           st_sp = spills[0].Append(item.first, item.second);
         } else {
-          st_sp = spills[HashBytesKey(key) % kReactiveSpillPartitions].Append(
-              item.first, item.second);
+          st_sp =
+              spills[HashBytesKey(spill_key) % kReactiveSpillPartitions].Append(
+                  item.first, item.second);
         }
         if (st_sp != Status::kSuccess) {
           spill_error = st_sp;
@@ -583,40 +653,49 @@ struct HashJoin::JoinState {
   bool nl_probe_valid = false;
   bool nl_probe_null = false;
 
+  // `runtime_filter` is the dynamic join filter published for
+  // `filter_column`. Scans apply it themselves before row decode; Consume
+  // applies it only when the probe child could not, so a row is never tested
+  // against the filter twice.
   static void Consume(ExecutorBase* child, const std::vector<slot_t>& cols,
-                      Side* side) {
-    QueryMemoryBudget& budget = QueryMemoryBudget::Global();
-    std::string key;
+                      Side* side,
+                      const RuntimeFilterGroup* runtime_filter = nullptr,
+                      std::optional<slot_t> filter_column = std::nullopt) {
     Row row;
     RowPosition position;
+    std::atomic<size_t> filtered{0};
+    std::atomic<size_t> filtered_null{0};
+    const bool apply_filter =
+        runtime_filter != nullptr && filter_column.has_value();
     while (child->Next(&row, &position)) {
+      ++side->seen_rows;
       for (const slot_t col : cols) {
         side->has_null_key = side->has_null_key || row[col].IsNull();
       }
-      const size_t bytes = EstimateRowBytes(row);
-      if (!side->Spilled() && !budget.CanReserve(bytes)) {
-        side->Flush(cols);
+      if (apply_filter) {
+        const Value& value = row[*filter_column];
+        // A NULL join key never matches an equi-join, and a value outside the
+        // filter's comparison domain is never rejected.
+        if (value.IsNull() || side->filter_rejects_all ||
+            (value.type == side->filter_type &&
+             runtime_filter->Reject(value.value.int_value))) {
+          ++filtered;
+          if (value.IsNull()) {
+            ++filtered_null;
+          }
+          continue;
+        }
       }
-      if (side->Spilled()) {
-        Status st_sp = Status::kSuccess;
-        if (!EncodeJoinKeyInto(row, cols, &key, side->null_safe)) {
-          st_sp = side->spills[0].Append(row, position);
-        } else {
-          st_sp =
-              side->spills[HashBytesKey(key) % kReactiveSpillPartitions].Append(
-                  row, position);
-        }
-        if (st_sp != Status::kSuccess) {
-          side->spill_error = st_sp;
-          break;
-        }
-      } else {
-        side->charge.Add(bytes);
-        side->rows.emplace_back(std::move(row), position);
+      if (!side->Accumulate(std::move(row), position, cols)) {
+        break;
       }
     }
     if (side->child_status == Status::kSuccess) {
       side->child_status = child->GetStatus();
+    }
+    if (filtered.load() != 0) {
+      side->filtered_rows += filtered.load();
+      side->filtered_null_rows += filtered_null.load();
     }
   }
 };
@@ -647,6 +726,12 @@ HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
       worker_count_(std::max<size_t>(1, worker_count)) {}
 
 HashJoin::~HashJoin() = default;
+
+std::atomic<size_t> HashJoin::semi_reduction_max_domain_keys_{size_t{1} << 20};
+
+void HashJoin::SetSemiReductionMaxDomainKeysForTest(size_t keys) {
+  semi_reduction_max_domain_keys_.store(keys, std::memory_order_relaxed);
+}
 
 bool HashJoin::MaterializeOrThrow() {
   if (materialize_failed_) {
@@ -734,7 +819,19 @@ Status HashJoin::Materialize() {
     return Status::kSuccess;
   }
   if (kind_ != JoinKind::kInner) {
-    RETURN_IF_FAIL(MaterializeSemiAnti());
+    // Hash semi reduction: an existence-only join may shrink its hash build
+    // (Phase 2 "Hash Semi Reduction"). Inner / outer / mark / single kinds are
+    // not existence-only -- they emit or null-pad build columns -- so they keep
+    // the unrestricted intake no matter what the plan asked for.
+    const bool existence_only =
+        semi_reduction_ &&
+        (kind_ == JoinKind::kSemi || kind_ == JoinKind::kAnti ||
+         kind_ == JoinKind::kNullAwareAnti);
+    if (existence_only) {
+      RETURN_IF_FAIL(MaterializeSemiAntiReduced());
+    } else {
+      RETURN_IF_FAIL(MaterializeSemiAnti());
+    }
     pipelined_ = false;
     materialized_ = true;
     return Status::kSuccess;
@@ -1006,6 +1103,18 @@ Status HashJoin::MaterializeOuter() {
   std::string scratch;
   const std::optional<ValueType> int_mode =
       JoinIntModeType(left_rows, left_cols_, right_rows, right_cols_);
+  const auto pair_passes = [&](const PositionedRow& left,
+                               const PositionedRow& right) -> StatusOr<bool> {
+    if (!residual_predicate_) {
+      return true;
+    }
+    StatusOr<Value> value = residual_predicate_->TryEvaluate(
+        left.first + right.first, residual_schema_);
+    if (!value.HasValue()) {
+      return value.GetStatus();
+    }
+    return !value.Value().IsNull() && value.Value().Truthy();
+  };
 
   if (preserve_left) {
     const SideIndex build =
@@ -1016,6 +1125,7 @@ Status HashJoin::MaterializeOuter() {
       const size_t first =
           key.valid ? build.index.Find(key.hash, key.int_key, key.byte_key)
                     : JoinHashIndex::kNil;
+      bool left_matched = false;
       if (first == JoinHashIndex::kNil) {
         output_.emplace_back(left.first + Row(std::vector<Value>(right_width_)),
                              left.second);
@@ -1024,8 +1134,20 @@ Status HashJoin::MaterializeOuter() {
       for (size_t entry = first; entry != JoinHashIndex::kNil;
            entry = build.index.ChainNext(entry)) {
         const size_t right_index = build.index.RowIndex(entry);
+        StatusOr<bool> passes = pair_passes(left, right_rows[right_index]);
+        if (!passes.HasValue()) {
+          return passes.GetStatus();
+        }
+        if (!passes.Value()) {
+          continue;
+        }
+        left_matched = true;
         matched_right[right_index] = true;
         output_.emplace_back(left.first + right_rows[right_index].first,
+                             left.second);
+      }
+      if (!left_matched) {
+        output_.emplace_back(left.first + Row(std::vector<Value>(right_width_)),
                              left.second);
       }
     }
@@ -1046,6 +1168,13 @@ Status HashJoin::MaterializeOuter() {
       for (size_t entry = first; entry != JoinHashIndex::kNil;
            entry = build.index.ChainNext(entry)) {
         const PositionedRow& left = left_rows[build.index.RowIndex(entry)];
+        StatusOr<bool> passes = pair_passes(left, right);
+        if (!passes.HasValue()) {
+          return passes.GetStatus();
+        }
+        if (!passes.Value()) {
+          continue;
+        }
         matched_right[right_index] = true;
         output_.emplace_back(left.first + right.first, left.second);
       }
@@ -1077,11 +1206,179 @@ Status HashJoin::MaterializeSemiAnti() {
   RETURN_IF_FAIL(IntakeBothSides());
   s.left.charge.ReleaseAll();
   s.right.charge.ReleaseAll();
+  SemiAntiBuild build;
+  build.total_rows = s.right.rows.size();
+  for (const SpillFile& part : s.right.spills) {
+    build.total_rows += part.Count();
+  }
+  build.has_null_key = s.right.has_null_key;
+  // The reduced intake replaces the unrestricted one above only for
+  // existence-only kinds; everything else keeps the unchanged pipeline.
+  return EmitSemiAnti(
+      JoinIntModeType(s.left.rows, left_cols_, s.right.rows, right_cols_),
+      build);
+}
+
+Status HashJoin::MaterializeSemiAntiReduced() {
+  state_ = std::make_unique<JoinState>();
+  JoinState& s = *state_;
+  s.left.null_safe = NullSafeArg();
+  s.right.null_safe = NullSafeArg();
+
+  // 1) The probe side first. It is the domain the build side is filtered
+  //    against, and it must be COMPLETE before a single build row is judged, so
+  //    it is consumed exactly as the plain pipeline consumes it -- resident
+  //    rows plus every spilled partition, which together are the whole child
+  //    output. This is not an extra pass over the input: the plain pipeline
+  //    materializes the probe side before the first lookup as well.
+  JoinState::Consume(left_.get(), left_cols_, &s.left);
+  if (s.left.child_status != Status::kSuccess) {
+    return s.left.child_status;
+  }
+  if (s.left.spill_error != Status::kSuccess) {
+    return s.left.spill_error;
+  }
+  s.left.charge.ReleaseAll();
+
+  // 2) The probe key domain. Built from the same memcomparable byte encoding
+  //    (and the same per-key null-safety annotation) the build index uses, so
+  //    a membership test here decides exactly what the real lookup would. A
+  //    NULL key encodes to the null-rejecting failure and therefore adds no
+  //    domain member, matching the probe phase, where such a row matches
+  //    nothing either.
+  std::unique_ptr<JoinHashIndex> domain = std::make_unique<JoinHashIndex>();
+  domain->Init(JoinHashIndex::KeyMode::kBytes, 0);
+  std::string domain_key;
+  size_t domain_keys = 0;
+  bool domain_capped = false;
+  const auto observe = [&](const PositionedRow& probe) {
+    if (domain_capped) {
+      return;
+    }
+    if (!EncodeJoinKeyInto(probe.first, left_cols_, &domain_key,
+                           NullSafeArg())) {
+      return;
+    }
+    const uint64_t hash = HashBytesKey(domain_key);
+    if (domain->Find(hash, 0, domain_key) != JoinHashIndex::kNil) {
+      return;
+    }
+    if (domain_keys >=
+        semi_reduction_max_domain_keys_.load(std::memory_order_relaxed)) {
+      domain_capped = true;
+      return;
+    }
+    // The stored row index is the domain ordinal, which doubles as the "a build
+    // row with this key was already kept" bit below.
+    domain->Insert(hash, 0, domain_key, domain_keys);
+    ++domain_keys;
+  };
+  for (const PositionedRow& probe : s.left.rows) {
+    observe(probe);
+  }
+  if (!domain_capped) {
+    for (SpillFile& part : s.left.spills) {
+      ASSIGN_OR_RETURN(std::vector<PositionedRow>, part_rows,
+                       (part.ReadAllPositioned()));
+      for (const PositionedRow& probe : part_rows) {
+        observe(probe);
+      }
+    }
+  }
+  if (domain_capped) {
+    // The probe side is itself a huge key domain: holding it would cost more
+    // than the build rows it could prune, so the domain is released and the
+    // intake below runs unrestricted. Deduplication stays, because it is
+    // unconditionally sound for an existence-only join. The emitted rows are
+    // identical either way.
+    domain.reset();
+    semi_reduction_description_ = "fallback=domain_cap";
+  } else {
+    semi_reduction_probe_keys_ = domain_keys;
+    semi_reduction_description_ =
+        domain_keys == 0 ? "empty_probe_domain" : "probe_key_domain";
+  }
+
+  // 3) The build side, through the domain. `kept` marks the domain ordinals
+  //    that already have a resident build row, so a duplicate key is dropped
+  //    instead of extending an entry chain the existence lookup never walks.
+  //    On the fallback path a second index plays the same role, over the keys
+  //    that were actually kept.
+  std::vector<bool> kept(domain_keys, false);
+  std::unique_ptr<JoinHashIndex> seen;
+  if (domain == nullptr) {
+    seen = std::make_unique<JoinHashIndex>();
+    seen->Init(JoinHashIndex::KeyMode::kBytes, 0);
+  }
+  size_t seen_keys = 0;
+  bool raw_build_null_key = false;
+  std::string build_key;
+  Row build_row;
+  RowPosition build_position;
+  while (right_->Next(&build_row, &build_position)) {
+    ++semi_reduction_build_rows_;
+    // Mirrors JoinState::Consume's own accounting: `NOT IN` is UNKNOWN for
+    // every non-match as soon as the build side carries a NULL key, and an
+    // empty build side makes `x NOT IN S` true for every x. Both read the RAW
+    // build side, not the reduced one.
+    for (const slot_t col : right_cols_) {
+      raw_build_null_key = raw_build_null_key || build_row[col].IsNull();
+    }
+    if (!EncodeJoinKeyInto(build_row, right_cols_, &build_key, NullSafeArg())) {
+      // No encodable key: the row can never join anything.
+      continue;
+    }
+    const uint64_t hash = HashBytesKey(build_key);
+    if (domain != nullptr) {
+      const size_t entry = domain->Find(hash, 0, build_key);
+      if (entry == JoinHashIndex::kNil) {
+        // No probe row carries this key, so this build row joins nothing.
+        continue;
+      }
+      const size_t ordinal = domain->RowIndex(entry);
+      if (kept[ordinal]) {
+        ++semi_reduction_duplicate_keys_;
+        continue;
+      }
+      kept[ordinal] = true;
+    } else {
+      const size_t entry = seen->Find(hash, 0, build_key);
+      if (entry != JoinHashIndex::kNil) {
+        ++semi_reduction_duplicate_keys_;
+        continue;
+      }
+      seen->Insert(hash, 0, build_key, seen_keys);
+      ++seen_keys;
+    }
+    if (!s.right.Accumulate(std::move(build_row), build_position,
+                            right_cols_)) {
+      break;
+    }
+    ++semi_reduction_build_rows_kept_;
+  }
+  if (s.right.spill_error != Status::kSuccess) {
+    return s.right.spill_error;
+  }
+  if (right_->GetStatus() != Status::kSuccess) {
+    return right_->GetStatus();
+  }
+  s.right.charge.ReleaseAll();
+  semi_reduction_active_ = true;
+
+  SemiAntiBuild build;
+  build.total_rows = semi_reduction_build_rows_;
+  build.has_null_key = raw_build_null_key;
+  return EmitSemiAnti(
+      JoinIntModeType(s.left.rows, left_cols_, s.right.rows, right_cols_),
+      build);
+}
+
+Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
+                              const SemiAntiBuild& build) {
+  JoinState& s = *state_;
   const bool semi = kind_ == JoinKind::kSemi;
   std::string scratch;
   size_t output_bytes = 0;
-  const std::optional<ValueType> int_mode =
-      JoinIntModeType(s.left.rows, left_cols_, s.right.rows, right_cols_);
   const auto emit_probe = [&](const PositionedRow& probe) {
     output_bytes += EstimateRowBytes(probe.first);
     output_.emplace_back(probe.first, probe.second);
@@ -1089,14 +1386,13 @@ Status HashJoin::MaterializeSemiAnti() {
   // Existence lookup of one probe row against an already-built index.
   // Returns: 0 = no match, 1 = match, -1 = NULL key (never matches).
   const auto probe_lookup = [&](const PositionedRow& probe,
-                                const SideIndex& build) -> int {
-    const KeyRef k = KeyOf(probe.first, left_cols_, build.mode, build.int_type,
+                                const SideIndex& side) -> int {
+    const KeyRef k = KeyOf(probe.first, left_cols_, side.mode, side.int_type,
                            &scratch, NullSafeArg());
     if (!k.valid) {
       return -1;
     }
-    return build.index.Find(k.hash, k.int_key, k.byte_key) !=
-                   JoinHashIndex::kNil
+    return side.index.Find(k.hash, k.int_key, k.byte_key) != JoinHashIndex::kNil
                ? 1
                : 0;
   };
@@ -1115,7 +1411,7 @@ Status HashJoin::MaterializeSemiAnti() {
     return state != 1;
   };
 
-  if (kind_ == JoinKind::kNullAwareAnti && s.right.has_null_key) {
+  if (null_aware && build.has_null_key) {
     // NOT IN is UNKNOWN for every non-matching probe when the build set has a
     // NULL key; UNKNOWN is filtered out by a surrounding WHERE.
     return Status::kSuccess;
@@ -1126,10 +1422,7 @@ Status HashJoin::MaterializeSemiAnti() {
   // non-empty set turns it into UNKNOWN unless x is found (NULL probes are
   // then dropped). Callers decorrelating NOT IN must guarantee a NOT NULL
   // build key so this case cannot arise (see optimizer.cpp).
-  size_t build_total = s.right.rows.size();
-  for (const SpillFile& part : s.right.spills) {
-    build_total += part.Count();
-  }
+  const size_t build_total = build.total_rows;
   if (!semi && build_total == 0) {
     if (!s.left.Spilled()) {
       for (const PositionedRow& probe : s.left.rows) {
@@ -1151,11 +1444,11 @@ Status HashJoin::MaterializeSemiAnti() {
   if (!s.right.Spilled()) {
     // Resident build side: index it once and stream every left partition
     // through an existence check.
-    const SideIndex build =
+    const SideIndex side_index =
         BuildSideIndex(s.right.rows, right_cols_, int_mode, NullSafeArg());
     const auto stream_left = [&](const std::vector<PositionedRow>& rows) {
       for (const PositionedRow& probe : rows) {
-        if (probe_survives(probe_lookup(probe, build))) {
+        if (probe_survives(probe_lookup(probe, side_index))) {
           emit_probe(probe);
         }
       }
@@ -1189,13 +1482,13 @@ Status HashJoin::MaterializeSemiAnti() {
       if (right_part.empty()) {
         continue;
       }
-      const SideIndex build =
+      const SideIndex side_index =
           BuildSideIndex(right_part, right_cols_, int_mode, NullSafeArg());
       for (size_t i = 0; i < s.left.rows.size(); ++i) {
         if (matched[i] == ProbeState::kMatch) {
           continue;
         }
-        const int state = probe_lookup(s.left.rows[i], build);
+        const int state = probe_lookup(s.left.rows[i], side_index);
         if (state == 1) {
           matched[i] = ProbeState::kMatch;
         } else if (state < 0 && matched[i] == ProbeState::kNoMatch) {
@@ -1227,10 +1520,10 @@ Status HashJoin::MaterializeSemiAnti() {
         }
         continue;
       }
-      const SideIndex build =
+      const SideIndex side_index =
           BuildSideIndex(right_part, right_cols_, int_mode, NullSafeArg());
       for (const PositionedRow& probe : left_part) {
-        if (probe_survives(probe_lookup(probe, build))) {
+        if (probe_survives(probe_lookup(probe, side_index))) {
           emit_probe(probe);
         }
       }
@@ -1419,7 +1712,12 @@ bool HashJoin::FetchNextProbe() {
 
 void HashJoin::SetupInMemoryJoin() {
   JoinState& s = *state_;
-  s.left_builds = SumRowBytes(s.left.rows) < SumRowBytes(s.right.rows);
+  // The dynamic filter path already chose the orientation (it had to, to know
+  // which side to publish from); keep it instead of re-deciding from byte
+  // sizes, which would point the filter at the wrong side.
+  s.left_builds = dynamic_filter_forced_build_left_
+                      ? dynamic_filter_build_left_
+                      : SumRowBytes(s.left.rows) < SumRowBytes(s.right.rows);
   build_left_side_ = s.left_builds;
   if (s.left_builds) {
     s.build_rows = &s.left.rows;
@@ -1512,7 +1810,10 @@ void HashJoin::JoinPartitionPair(const std::vector<PositionedRow>& left_part,
       left_builds ? right_cols_ : left_cols_;
   std::string scratch;
   if (left_builds) {
-    for (const auto& probe_row : right_part) {
+    for (size_t probe_index = 0; probe_index < right_part.size();
+         ++probe_index) {
+      PrefetchProbeRow(right_part, probe_index + 8);
+      const auto& probe_row = right_part[probe_index];
       const KeyRef k = KeyOf(RowOf(probe_row), probe_cols, build.mode,
                              build.int_type, &scratch, NullSafeArg());
       if (!k.valid) {
@@ -1525,7 +1826,10 @@ void HashJoin::JoinPartitionPair(const std::vector<PositionedRow>& left_part,
       }
     }
   } else {
-    for (const PositionedRow& probe : left_part) {
+    for (size_t probe_index = 0; probe_index < left_part.size();
+         ++probe_index) {
+      PrefetchProbeRow(left_part, probe_index + 8);
+      const PositionedRow& probe = left_part[probe_index];
       const KeyRef k = KeyOf(probe.first, probe_cols, build.mode,
                              build.int_type, &scratch, NullSafeArg());
       if (!k.valid) {
@@ -1633,6 +1937,7 @@ void HashJoin::RunStripedProbe() {
         try {
           std::string scratch;
           for (size_t i = begin; i < end; ++i) {
+            PrefetchProbeRow(*s.probe_rows, i + 8);
             const PositionedRow& probe = (*s.probe_rows)[i];
             const KeyRef k = KeyOf(probe.first, *s.probe_cols, s.key_mode,
                                    s.int_mode_type, &scratch, NullSafeArg());
@@ -1687,7 +1992,15 @@ void HashJoin::RunStripedProbe() {
 
 Status HashJoin::MaterializeInMemory() {
   state_ = std::make_unique<JoinState>();
-  RETURN_IF_FAIL(IntakeBothSides());
+  if (DynamicFilterEligible()) {
+    RETURN_IF_FAIL(MaterializeDynamicFilter());
+  } else {
+    RETURN_IF_FAIL(IntakeBothSides());
+  }
+  return MaterializeInMemoryTail();
+}
+
+Status HashJoin::MaterializeInMemoryTail() {
   JoinState& s = *state_;
   const bool left_spilled = s.left.Spilled();
   const bool right_spilled = s.right.Spilled();
@@ -1699,6 +2012,122 @@ Status HashJoin::MaterializeInMemory() {
     SetupInMemoryJoin();
   }
 
+  return Status::kSuccess;
+}
+
+bool HashJoin::DynamicFilterEligible() const {
+  if (!dynamic_filter_ || kind_ != JoinKind::kInner || pipelined_ ||
+      state_ == nullptr || materialized_) {
+    return false;
+  }
+  // A null-safe (IS NOT DISTINCT FROM) key matches NULL to NULL, so a filter
+  // that rejects NULL probe keys would drop real matches. The build side's
+  // NULL key domain would also have to be part of the filter.
+  if (NullSafeArg() != nullptr) {
+    return false;
+  }
+  if (mode_ == HashJoinMode::kHybrid) {
+    return false;
+  }
+  // The runtime filter is defined over a single INT64/DATE key; composite and
+  // non-integer equijoins keep the unchanged path.
+  const std::vector<slot_t>& build_cols =
+      dynamic_filter_build_left_ ? left_cols_ : right_cols_;
+  const std::vector<slot_t>& probe_cols =
+      dynamic_filter_build_left_ ? right_cols_ : left_cols_;
+  return build_cols.size() == 1 && probe_cols.size() == 1;
+}
+
+Status HashJoin::MaterializeDynamicFilter() {
+  JoinState& s = *state_;
+  s.left.null_safe = nullptr;
+  s.right.null_safe = nullptr;
+  const bool build_left = dynamic_filter_build_left_;
+  JoinState::Side& build = build_left ? s.left : s.right;
+  JoinState::Side& probe = build_left ? s.right : s.left;
+  Executor& build_child = build_left ? left_ : right_;
+  Executor& probe_child = build_left ? right_ : left_;
+  const std::vector<slot_t>& build_cols = build_left ? left_cols_ : right_cols_;
+  const std::vector<slot_t>& probe_cols = build_left ? right_cols_ : left_cols_;
+
+  // 1) Drain the build side first: the filter must describe its COMPLETE key
+  //    domain before a single probe row is tested against it.
+  std::jthread build_thread(
+      [&] { JoinState::Consume(build_child.get(), build_cols, &build); });
+  build_thread.join();
+  if (build.child_status != Status::kSuccess) {
+    return build.child_status;
+  }
+  if (build.spill_error != Status::kSuccess) {
+    return build.spill_error;
+  }
+
+  // 2) Derive the filter. A spilled build side is an incomplete key domain, so
+  //    no filter is published for it (the join still runs, just unpruned).
+  std::shared_ptr<const RuntimeFilterGroup> group;
+  ValueType key_type = ValueType::kNull;
+  if (!build.Spilled()) {
+    RuntimeFilterBuilder builder;
+    for (const PositionedRow& item : build.rows) {
+      const Value& key = item.first[build_cols[0]];
+      if (key.IsNull()) {
+        builder.ObserveNull();
+        continue;
+      }
+      if (key_type == ValueType::kNull) {
+        key_type = key.type;
+      } else if (key_type != key.type) {
+        // A build side mixing INT64 and DATE keys has no single int64
+        // comparison domain; leave the probe side unfiltered.
+        key_type = ValueType::kNull;
+        break;
+      }
+      builder.Observe(key.value.int_value);
+    }
+    // allow_reject_all: an empty or all-NULL build side makes this inner
+    // equi-join empty, and a RejectAll filter lets the probe scan skip
+    // everything instead of decoding rows that cannot match. Such a group has
+    // no comparison domain, so it is publishable even when no build key ever
+    // revealed the column's type.
+    group = builder.Build(/*allow_reject_all=*/true);
+    if (group != nullptr && !group->RejectsAll() &&
+        key_type != ValueType::kInt64 && key_type != ValueType::kDate) {
+      group.reset();
+    }
+  }
+  if (group != nullptr && !group->empty()) {
+    probe.filter_type = key_type;
+    probe.filter_rejects_all = group->RejectsAll();
+    const bool pushed =
+        probe_child->AttachRuntimeFilter(group, probe_cols[0], key_type);
+    if (pushed) {
+      dynamic_filter_published_ = true;
+    }
+    // When the probe child cannot prune, Consume applies the filter instead.
+    dynamic_filter_keys_ = group->DistinctKeys();
+    dynamic_filter_description_ = group->Describe();
+  } else {
+    group.reset();
+  }
+
+  // 3) Drain the probe side, through the scan's own filter when it took one.
+  if (dynamic_filter_published_) {
+    JoinState::Consume(probe_child.get(), probe_cols, &probe);
+  } else {
+    JoinState::Consume(
+        probe_child.get(), probe_cols, &probe, group.get(),
+        group != nullptr ? std::optional<slot_t>(probe_cols[0]) : std::nullopt);
+  }
+  dynamic_filter_forced_build_left_ = build_left;
+  dynamic_filter_probe_rows_ = probe.seen_rows;
+  dynamic_filter_rejected_ = probe.filtered_rows;
+  dynamic_filter_null_rejected_ = probe.filtered_null_rows;
+  if (probe.child_status != Status::kSuccess) {
+    return probe.child_status;
+  }
+  if (probe.spill_error != Status::kSuccess) {
+    return probe.spill_error;
+  }
   return Status::kSuccess;
 }
 
@@ -1813,6 +2242,9 @@ bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
         s.nl_probe_hash = s.nl_probe_valid ? HashBytesKey(s.nl_probe_bytes) : 0;
         continue;
       }
+    }
+    if (s.probe_spills == nullptr) {
+      PrefetchProbeRow(*s.probe_rows, s.probe_cursor + 8);
     }
     const KeyRef k = KeyOf(probe.first, *s.probe_cols, s.key_mode,
                            s.int_mode_type, &s.scratch, NullSafeArg());
@@ -2008,6 +2440,21 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
   left_->Dump(o, indent + 2);
   o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   right_->Dump(o, indent + 2);
+  if (materialized_ && semi_reduction_ &&
+      (kind_ == JoinKind::kSemi || kind_ == JoinKind::kAnti ||
+       kind_ == JoinKind::kNullAwareAnti)) {
+    // The hash semi reduction line (Phase 2 "Hash Semi Reduction"):
+    // `status` says which intake ran -- probe_key_domain, empty_probe_domain
+    // or fallback=domain_cap -- and the counters say what it bought.
+    o << "\n"
+      << Indent(static_cast<size_t>(indent)) << "SemiReduction "
+      << semi_reduction_description_
+      << " probe_keys=" << semi_reduction_probe_keys_
+      << " build_rows=" << semi_reduction_build_rows_
+      << " build_rows_kept=" << semi_reduction_build_rows_kept_
+      << " build_rows_pruned=" << SemiReductionBuildRowsPruned()
+      << " duplicate_keys_pruned=" << semi_reduction_duplicate_keys_;
+  }
   if (materialized_ && kind_ == JoinKind::kInner) {
     o << "\n"
       << Indent(static_cast<size_t>(indent))
@@ -2026,6 +2473,22 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
         << "probe_rows_rejected=" << probe_rows_rejected_.load() << "\n"
         << Indent(static_cast<size_t>(indent))
         << "probe_rows_null_rejected=" << probe_rows_null_rejected_.load();
+    }
+    if (dynamic_filter_published_ || dynamic_filter_rejected_ != 0) {
+      // The dynamic filter is the join-published half of Phase 2
+      // "Dynamic Filter Join / SIP / Bloom"; `pushdown` says whether the probe
+      // scan applied it before row decode or the join applied it while
+      // consuming the probe side.
+      o << "\n"
+        << Indent(static_cast<size_t>(indent)) << "DynamicFilter build_side="
+        << (dynamic_filter_build_left_ ? "left" : "right")
+        << " published=" << (dynamic_filter_published_ ? "scan" : "join") << " "
+        << dynamic_filter_description_ << "\n"
+        << Indent(static_cast<size_t>(indent))
+        << "probe_rows_scanned=" << dynamic_filter_probe_rows_
+        << " probe_rows_pruned=" << dynamic_filter_rejected_ << "\n"
+        << Indent(static_cast<size_t>(indent))
+        << "probe_rows_null_rejected=" << dynamic_filter_null_rejected_;
     }
     if (adaptive_switched_) {
       o << "\n"

@@ -11,6 +11,7 @@
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -26,23 +27,21 @@ Status TopNExecutor::Materialize() {
                               ? static_cast<size_t>(-1)
                               : offset_ + limit_;
   heap_capacity_ = capacity;
-  auto precedes = [this](const Candidate& left, const Candidate& right) {
+  // One comparator contract for the whole heap: NULL placement, direction and
+  // collation all come from SortKeyOrder (type/collation.hpp), the same type
+  // the sort operators and PdqSort use, so a LIMIT over a case-insensitive
+  // ORDER BY keeps exactly the rows a full sort would have kept.
+  std::vector<SortKeyOrder> orders;
+  orders.reserve(keys_.size());
+  for (const Key& key : keys_) {
+    orders.push_back(MakeSortKeyOrder(key));
+  }
+  auto precedes = [&orders](const Candidate& left, const Candidate& right) {
     for (size_t i = 0; i < left.keys.size(); ++i) {
-      const Value& lhs = left.keys[i];
-      const Value& rhs = right.keys[i];
-      if (lhs.IsNull() || rhs.IsNull()) {
-        if (lhs.IsNull() != rhs.IsNull()) {
-          const bool nulls_first =
-              keys_[i].nulls_first.value_or(keys_[i].ascending);
-          return lhs.IsNull() == nulls_first;
-        }
-        continue;
+      const int cmp = orders[i].Compare(left.keys[i], right.keys[i]);
+      if (cmp != 0) {
+        return cmp < 0;
       }
-      const int cmp = CompareForOrderBy(lhs, rhs);
-      if (cmp == 0) {
-        continue;
-      }
-      return cmp < 0 ? keys_[i].ascending : !keys_[i].ascending;
     }
     return left.sequence < right.sequence;
   };
@@ -86,7 +85,12 @@ Status TopNExecutor::Materialize() {
         while (output_end_ < rows_.size()) {
           bool tied = true;
           for (size_t i = 0; i < last.keys.size(); ++i) {
-            if (!(last.keys[i] == rows_[output_end_].keys[i])) {
+            // Peers must collapse exactly the way the ordering groups them,
+            // so a case-insensitive key treats 'a' and 'A' as the same tie
+            // instead of splitting the boundary row. A binary key keeps
+            // Value's equality (NaN, -0.0 and interval equivalence).
+            if (!EqualUnderCollation(last.keys[i],
+                                     rows_[output_end_].keys[i])) {
               tied = false;
               break;
             }

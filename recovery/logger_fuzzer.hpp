@@ -46,7 +46,8 @@ constexpr size_t kMaxLogs = 1024;
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::string filename = RandomString(16) + "-fuzzer.log";
-  std::remove(filename.c_str());
+  // Best-effort cleanup: ENOENT is expected on a fresh run.
+  (void)std::remove(filename.c_str());
   std::vector<std::string> written;
   std::unique_ptr<Logger> logger =
       Logger::Create(filename, kBufferSize, 1).MoveValue();
@@ -81,7 +82,8 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   std::string a(1, ' ');
   file.read(a.data(), 1);
   assert(file.eof());
-  std::remove(filename.c_str());
+  // Best-effort cleanup: ENOENT is expected on a fresh run.
+  (void)std::remove(filename.c_str());
 }
 
 }  // namespace tinylamb

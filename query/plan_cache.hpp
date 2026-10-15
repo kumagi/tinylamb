@@ -27,7 +27,15 @@
 // TABLE / CREATE INDEX / statistics refresh (ANALYZE). Entries whose epoch no
 // longer matches are dropped lazily on lookup and recompiled through the
 // legacy path. Row-count drift between ANALYZEs only skews cost estimates,
-// never results, so it does not need its own invalidation trigger.
+// never results, so it does not need its own invalidation trigger -- with one
+// exception: a *clustered index order* a full scan reports is a measured,
+// revocable proof (plan/full_scan_plan.hpp). A statement planned while such a
+// proof was live may have baked an order assumption into its tree (a folded
+// LIMIT, an incremental sort over the clustered prefix), which a later
+// execution of the cached plan would take at face value. SqlEngine therefore
+// keeps such statements out of this cache: it samples
+// AnyResolvedTableHasClusteredOrder() before optimizing and again before
+// storing, and skips the fill if either sample was true.
 //
 // External retention policy matches the existing sql_template AST cache:
 // entries are advisory process-global state; nothing outside the cache pins

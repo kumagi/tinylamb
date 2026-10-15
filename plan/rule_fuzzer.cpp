@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <syncstream>
 #include <thread>
 #include <vector>
 
@@ -598,7 +600,7 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
   return true;
 }
 
-void Worker(int thread_id, uint64_t base_seed,
+void Worker(int thread_id, uint64_t base_seed, bool trace_cases,
             std::atomic<bool>& stop_requested,
             std::chrono::steady_clock::time_point deadline, Stats& stats) {
   std::mt19937_64 rng(base_seed +
@@ -614,9 +616,16 @@ void Worker(int thread_id, uint64_t base_seed,
   }
   Database& db = db_holder->GetDb();
 
+  uint64_t iteration = 0;
   while (!stop_requested.load(std::memory_order_relaxed) &&
          std::chrono::steady_clock::now() < deadline) {
     const auto pass = static_cast<uint32_t>(rng() % 9);
+    if (trace_cases) {
+      std::osyncstream(std::cerr)
+          << "[case] worker=" << thread_id << " iteration=" << iteration
+          << " pass=" << pass << '\n';
+    }
+    ++iteration;
     if (pass == 0) {
       // Pass 0: Semantic Pushdown & NoREC Differential Execution Oracle
       std::string mismatch;
@@ -629,7 +638,7 @@ void Worker(int thread_id, uint64_t base_seed,
       }
       stats.norec_pushdown_runs.fetch_add(1, std::memory_order_relaxed);
     } else if (pass == 1) {
-      // Pass 1: Complex Multi-Operator Memo Oracle (All 105 Rules)
+      // Pass 1: Complex Multi-Operator Memo Oracle (registered rules)
       ComplexMemoGenConfig config;
       config.min_relations = 2 + static_cast<int>(rng() % 2);
       config.max_relations = config.min_relations + static_cast<int>(rng() % 2);
@@ -811,6 +820,8 @@ int main(int argc, char** argv) {
     const std::string owned(text);
     return static_cast<int>(std::strtol(owned.c_str(), nullptr, 10));
   };
+  std::optional<uint64_t> requested_seed;
+  bool trace_cases = false;
   int duration_sec = 1800;  // Default 30 minutes
   int num_threads = static_cast<int>(std::thread::hardware_concurrency());
   if (num_threads <= 0) {
@@ -820,7 +831,19 @@ int main(int argc, char** argv) {
   int positional_idx = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
-    if (arg.starts_with("--duration_sec=")) {
+    if (arg.starts_with("--seed=")) {
+      const auto text = arg.substr(7);
+      uint64_t seed = 0;
+      const auto [end, error] =
+          std::from_chars(text.data(), text.data() + text.size(), seed);
+      if (error != std::errc{} || end != text.data() + text.size()) {
+        std::cerr << "Invalid --seed: expected an unsigned 64-bit integer\n";
+        return 2;
+      }
+      requested_seed = seed;
+    } else if (arg == "--trace-cases") {
+      trace_cases = true;
+    } else if (arg.starts_with("--duration_sec=")) {
       duration_sec = parse_int(arg.substr(15));
     } else if (arg.starts_with("--duration=")) {
       duration_sec = parse_int(arg.substr(11));
@@ -844,14 +867,21 @@ int main(int argc, char** argv) {
     num_threads = parse_int(env_threads);
   }
 
+  std::random_device rd;
+  const uint64_t base_seed = requested_seed.has_value()
+                                 ? *requested_seed
+                                 : (static_cast<uint64_t>(rd()) << 32) | rd();
+
   std::cout
       << "============================================================\n"
       << "Starting Ferocious TinyLamb Rule & Pushdown Fuzzer\n"
+      << "Seed:        " << base_seed << " (replay with --seed=)\n"
       << "Concurrency: " << num_threads << " threads\n"
       << "Duration:    " << duration_sec << " seconds (" << (duration_sec / 60)
       << "m " << (duration_sec % 60) << "s)\n"
       << "Oracles:     1. Semantic Execution Pushdown Oracle (NoREC)\n"
-      << "             2. Complex Multi-Operator Cascades Memo (105 Rules)\n"
+      << "             2. Complex Multi-Operator Cascades Memo ("
+      << tinylamb::cascades::RuleSet::Default().Names().size() << " Rules)\n"
       << "             3. Complex Memo Random Rule-Subset Exploration\n"
       << "             4. Scalar Expression AST Simplification Oracle\n"
       << "             5. Full Expression Engine vs AST Reference Oracle\n"
@@ -866,16 +896,13 @@ int main(int argc, char** argv) {
   const auto start_time = std::chrono::steady_clock::now();
   const auto deadline = start_time + std::chrono::seconds(duration_sec);
 
-  std::random_device rd;
-  const uint64_t base_seed = (static_cast<uint64_t>(rd()) << 32) | rd();
-
   tinylamb::Stats stats;
   std::atomic<bool> stop_requested{false};
 
   std::vector<std::thread> workers;
   workers.reserve(static_cast<size_t>(num_threads));
   for (int t = 0; t < num_threads; ++t) {
-    workers.emplace_back(tinylamb::Worker, t, base_seed,
+    workers.emplace_back(tinylamb::Worker, t, base_seed, trace_cases,
                          std::ref(stop_requested), deadline, std::ref(stats));
   }
 

@@ -26,7 +26,7 @@ These executors are responsible for combining rows from two or more tables based
 
 - **`HashJoin`**: A more efficient join algorithm that builds a hash table on the smaller of the two tables (the build side) and then probes the hash table with rows from the larger table (the probe side). This is very effective for equi-joins.
 
-- **`IndexJoin`** (also known as Index Nested Loop Join): An efficient join strategy that iterates through the rows of the outer table and uses an index on the inner table to quickly find matching rows. This is particularly effective when the outer table is small and there is a selective index on the inner table's join key.
+- **`LookupJoin`** (also known as Index Nested Loop Join): An efficient join strategy that iterates through the rows of the outer table and probes an index on the inner table with each outer row. The probe columns are derived in the *index's* key order, so a composite index works even when only some of its key columns are join keys; an equality prefix plus one range bound on the next key column (INT64/DATE) narrows the seek, and everything the probe cannot decide (a second range, a non-key equality, a non-whitelisted type) stays a residual predicate above the join. Effective when the outer table is small and the index is selective on the join key.
 
 ### Other Executors
 

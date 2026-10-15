@@ -43,6 +43,7 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
   int group_queries = 0;
   int window_queries = 0;
+  int primary_key_group_queries = 0;
   const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
   const int kIterations =
       (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
@@ -66,9 +67,11 @@ TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
                           << report;
     group_queries += stats.group_queries;
     window_queries += stats.window_queries;
+    primary_key_group_queries += stats.primary_key_group_queries;
   }
   EXPECT_GT(group_queries, kIterations) << "GROUP BY oracle almost never ran";
   EXPECT_GT(window_queries, 0) << "window oracle never ran";
+  EXPECT_EQ(primary_key_group_queries, kIterations);
 }
 
 TEST(SqlAggregateFuzzer, TestFileRoundTripDetectsMismatch) {

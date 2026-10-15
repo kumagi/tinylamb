@@ -239,10 +239,27 @@ TEST_F(SqlSubqueryShapesCoverageTest, RowValueIn) {
   EXPECT_EQ(remaining[1][0], Value(int64_t{1}));
   EXPECT_EQ(remaining[1][1], Value(int64_t{20}));
 
+  // A plain multi-column subquery is now a positional row-value probe:
+  // amt > 4.0 keeps orders 1 and 2.
+  ExpectColumn(
+      "SELECT id FROM orders WHERE (id, cust) IN "
+      "(SELECT id, cust FROM orders WHERE amt > 4.0) ORDER BY id",
+      "1,2");
+  // NOT IN over a two-column subquery flips only decisive outcomes; the
+  // NULL-cust order 5 stays UNKNOWN and excluded.
+  ExpectColumn(
+      "SELECT id FROM orders WHERE (id, cust) NOT IN "
+      "(SELECT id, cust FROM orders WHERE amt > 4.0) ORDER BY id",
+      "3,4");
+  // A NULL in any field of a candidate makes a probe miss UNKNOWN.
+  EXPECT_TRUE(Scalar("SELECT (1, NULL) IN (SELECT 1, NULL);").IsNull());
+  EXPECT_TRUE(Scalar("SELECT (1, 2) IN (SELECT 1, NULL);").IsNull());
+
+  // A scalar probe against a multi-column subquery keeps the contract.
   bool rejected = false;
   try {
     Query(
-        "SELECT id FROM orders WHERE (id, cust) IN "
+        "SELECT id FROM orders WHERE id IN "
         "(SELECT id, cust FROM orders)");
   } catch (const std::runtime_error& error) {
     rejected =
@@ -251,6 +268,42 @@ TEST_F(SqlSubqueryShapesCoverageTest, RowValueIn) {
         std::string::npos;
   }
   EXPECT_TRUE(rejected);
+}
+
+TEST_F(SqlSubqueryShapesCoverageTest, CorrelatedRowValueIn) {
+  // A row-value `(a, b) IN (SELECT AS STRUCT ... WHERE correlated)` must
+  // stay on the scope-aware relational evaluator: the keyed semi-join
+  // decorrelator only probes with a single column, and routing the
+  // composite (deferred struct) test to the Cascades core used to strand
+  // the conjunct on a context-free physical filter ("query expression
+  // requires relational evaluation").
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE tgt(k INT64, g INT64)");
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE src(k INT64, g INT64, v STRING(MAX))");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO tgt VALUES (1, 10), (1, 20), (2, 30)");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO src VALUES (1, 10, 'hit1'), (1, NULL, 'nullv'), "
+         "(2, 30, 'hit2')");
+  // (1, 10) matches; (1, 20) misses against a NULL-bearing candidate set
+  // (UNKNOWN); (2, 30) matches.
+  ExpectColumn(
+      "SELECT t.k FROM tgt t WHERE (t.k, t.g) IN "
+      "(SELECT AS STRUCT s.k, s.g FROM src s WHERE s.k = t.k) ORDER BY t.k",
+      "1,2");
+  // NOT IN flips only the decisive FALSE/TRUE outcomes; the UNKNOWN row
+  // (the NULL candidate for k=1) stays excluded.
+  ExpectColumn(
+      "SELECT t.k FROM tgt t WHERE (t.k, t.g) NOT IN "
+      "(SELECT AS STRUCT s.k, s.g FROM src s WHERE s.k = t.k) ORDER BY t.k",
+      "");
+  // A non-correlated inner block keeps the semi-join lowering and must not
+  // regress through the same gate.
+  ExpectColumn(
+      "SELECT t.k FROM tgt t WHERE (t.k, t.g) IN "
+      "(SELECT AS STRUCT s.k, s.g FROM src s WHERE s.v = 'hit2') "
+      "ORDER BY t.k",
+      "2");
 }
 
 TEST_F(SqlSubqueryShapesCoverageTest, SubqueriesInHavingAndDerived) {
@@ -294,6 +347,46 @@ TEST_F(SqlSubqueryShapesCoverageTest, VolatileUncorrelatedSubqueryIsNotReused) {
   const Value first = Scalar("SELECT (SELECT RAND() FROM custs LIMIT 1)");
   const Value second = Scalar("SELECT (SELECT RAND() FROM custs LIMIT 1)");
   EXPECT_NE(first, second);
+}
+
+TEST_F(SqlSubqueryShapesCoverageTest, SiblingExistsBuildsShareOneScan) {
+  // TPC-H Q21 shape: an EXISTS/NOT EXISTS pair over the same base table with
+  // the same correlation column and the same required columns.  The first
+  // build publishes its keyed rows; the second reuses them and defers its
+  // own build-side conjunct (l3.amt > 100) to probe time.  Ground truth by
+  // hand: ord 1 = (sup 1, amt 10), (sup 2, amt 20); ord 2 = (sup 1, amt 10),
+  // (sup 2, amt 300); ord 3 = (sup 1, amt 10) only.  sup-1 lines qualifying:
+  // ord 1 (other-sup exists with amt < 1000, none > 100) yes; ord 2 excluded
+  // by the anti residual; ord 3 excluded by the semi.
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE lines(ord INT64, sup INT64, amt INT64)");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO lines VALUES (1, 1, 10), (1, 2, 20), (2, 1, 10), "
+         "(2, 2, 300), (3, 1, 10)");
+  const std::string query =
+      "SELECT s.ord FROM lines s WHERE s.sup = 1 "
+      "AND EXISTS (SELECT * FROM lines l2 WHERE l2.ord = s.ord "
+      "AND l2.sup <> s.sup AND l2.amt <> s.amt) "
+      "AND NOT EXISTS (SELECT * FROM lines l3 WHERE l3.ord = s.ord "
+      "AND l3.sup <> s.sup AND l3.amt > 100) ORDER BY s.ord";
+  ExpectColumn(query, "1");
+
+  // EXPLAIN ANALYZE exposes the runtime counters: one published build plus
+  // one reuse (the second sibling must not re-scan `lines`).
+  SqlEngine engine(*database_);
+  StatusOr<Executor> prepared =
+      engine.Prepare(*context_, "EXPLAIN ANALYZE " + query);
+  ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+  std::string plan;
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    plan += std::string(row[0].value.varchar_value);
+    plan += '\n';
+  }
+  ASSERT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
+  EXPECT_NE(plan.find("shared_exists_build_reuses=1"), std::string::npos)
+      << plan;
+  EXPECT_EQ(context_->PreCommit(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

@@ -1,6 +1,8 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "distinct_plan.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <optional>
 #include <ostream>
@@ -13,10 +15,32 @@
 #include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
 #include "plan/skip_scan_distinct_plan.hpp"
+#include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
+
+TableStatistics EstimateDistinctPlanStats(const Plan& child) {
+  TableStatistics stats = child->GetStats();
+  if (stats.Rows() == 0 || child->GetSchema().ColumnCount() == 0) {
+    return stats;
+  }
+  std::vector<size_t> columns;
+  columns.reserve(child->GetSchema().ColumnCount());
+  for (size_t i = 0; i < child->GetSchema().ColumnCount(); ++i) {
+    columns.push_back(i);
+  }
+  const auto output_rows =
+      static_cast<size_t>(std::ceil(stats.EstimateDistinctRows(columns)));
+  return stats.ScaleToRows(std::min(output_rows, stats.Rows()));
+}
+
+DistinctPlan::DistinctPlan(Plan child, std::vector<Expression> distinct_on)
+    : child_(std::move(child)),
+      distinct_on_(std::move(distinct_on)),
+      stats_(distinct_on_.empty() ? EstimateDistinctPlanStats(child_)
+                                  : child_->GetStats()) {}
 
 void DistinctPlan::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << "HashDistinct";
@@ -52,10 +76,8 @@ SkipScanDistinctPlan::SkipScanDistinctPlan(
 size_t SkipScanDistinctPlan::AccessRowCount() const { return stats_.Rows(); }
 
 size_t SkipScanDistinctPlan::EmitRowCount() const {
-  // One output row per distinct index-key value.
-  const size_t distinct =
-      stats_.Columns() == 0 ? 0 : stats_.Column(0).Distinct();
-  return distinct == 0 ? 1 : distinct;
+  // The covering scan supplies statistics in output-column order.
+  return static_cast<size_t>(std::ceil(stats_.EstimateDistinctRows({0})));
 }
 
 bool SkipScanDistinctPlan::IsOrderedBy(

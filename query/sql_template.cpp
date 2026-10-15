@@ -1181,9 +1181,53 @@ StatusOr<std::unique_ptr<Statement>> BindStatementLiterals(
       bound = std::move(bound_delete);
       break;
     }
+    case StatementType::kMerge: {
+      const auto& merge = dynamic_cast<const MergeStatement&>(statement);
+      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, bound_source,
+                       (BindSelect(*merge.Source(), parameters, &index)));
+      ASSIGN_OR_RETURN(
+          Expression, bound_on,
+          (BindExpression(merge.OnCondition(), parameters, &index)));
+      auto bound_merge = std::make_unique<MergeStatement>(
+          merge.TargetTable(), std::move(bound_source), merge.SourceAlias(),
+          std::move(bound_on));
+      std::vector<MergeWhenClause> clauses;
+      clauses.reserve(merge.Clauses().size());
+      for (const MergeWhenClause& clause : merge.Clauses()) {
+        MergeWhenClause bound_clause;
+        bound_clause.match_type = clause.match_type;
+        if (clause.condition) {
+          ASSIGN_OR_RETURN(
+              Expression, bound_condition,
+              (BindExpression(clause.condition, parameters, &index)));
+          bound_clause.condition = std::move(bound_condition);
+        }
+        bound_clause.action.kind = clause.action.kind;
+        for (const auto& [column, value] : clause.action.set_clause) {
+          ASSIGN_OR_RETURN(Expression, bound_value,
+                           (BindExpression(value, parameters, &index)));
+          bound_clause.action.set_clause.emplace_back(column,
+                                                      std::move(bound_value));
+        }
+        bound_clause.action.insert_columns = clause.action.insert_columns;
+        for (const Expression& value : clause.action.insert_values) {
+          ASSIGN_OR_RETURN(Expression, bound_value,
+                           (BindExpression(value, parameters, &index)));
+          bound_clause.action.insert_values.push_back(std::move(bound_value));
+        }
+        clauses.push_back(std::move(bound_clause));
+      }
+      bound_merge->SetClauses(std::move(clauses));
+      bound_merge->SetDesugaredFromUpdate(merge.DesugaredFromUpdate());
+      bound = std::move(bound_merge);
+      break;
+    }
     case StatementType::kCreateTable:
     case StatementType::kDropTable:
+    case StatementType::kAlterTable:
     case StatementType::kAnalyze:
+    case StatementType::kCreateMaterializedView:
+    case StatementType::kDropMaterializedView:
       return Status(Status::kInvalidArgument, "SQL template does not bind DDL");
   }
   if (index != parameters.size()) {

@@ -69,7 +69,47 @@ struct WorkerStats {
   std::string warmup_first_error;
   std::string first_error;
   tinylamb::SqlRuntimeStats sql_runtime;
+  // Engine-abort reason buckets: a txn that dies mid-flight wastes every
+  // statement it already applied (plus its undo walk), so the abort MIX --
+  // not just the abort count -- decides which concurrency lever pays.
+  // Worker-local, no contention; merged once at report time.
+  std::map<std::string, uint64_t> abort_reasons;
 };
+
+// Buckets an engine-abort message into a short stable tag. Matching is by
+// the diagnostic prefixes the engine emits, so a bucket survives unrelated
+// message-wording churn around it.
+std::string ClassifyAbortReason(std::string_view error) {
+  if (error.find("index-undo reservation drain timed out") !=
+      std::string_view::npos) {
+    return "index_undo_drain_timeout";
+  }
+  if (error.find("write intent unavailable") != std::string_view::npos) {
+    if (error.find("intent holder is aborting") != std::string_view::npos) {
+      return "write_intent_holder_aborting";
+    }
+    if (error.find("wound") != std::string_view::npos) {
+      return "write_intent_wounded";
+    }
+    if (error.find("timed out") != std::string_view::npos) {
+      return "write_intent_timeout";
+    }
+    return "write_intent_conflict";
+  }
+  if (error.find("violates foreign key") != std::string_view::npos) {
+    return "foreign_key";
+  }
+  if (error.find("delete failed on table") != std::string_view::npos) {
+    return "delete_failed";
+  }
+  if (error.find("insert failed on table") != std::string_view::npos) {
+    return "insert_failed";
+  }
+  if (error.find("update failed on table") != std::string_view::npos) {
+    return "update_failed";
+  }
+  return "other";
+}
 
 void Usage(std::ostream& out, std::string_view program) {
   out << "usage: " << program << " <new-database-path> [options]\n"
@@ -276,15 +316,22 @@ int main(int argc, char** argv) {
       }
     }
   }
+  // No --deadlock-policy flag and no environment override: measure the
+  // ENGINE default instead of pinning kLegacy, so benchmark runs track the
+  // production configuration as it evolves.
+  const bool pin_deadlock_policy =
+      !deadlock_arg.empty() || deadlock_env != nullptr;
   const std::string policy_source =
       !deadlock_arg.empty()
           ? deadlock_arg
           : (deadlock_env != nullptr ? std::string(deadlock_env)
-                                     : std::string("legacy"));
-  const tinylamb::Database::DeadlockPolicy deadlock_policy =
-      parse_policy(policy_source);
-  std::cout << "deadlock_policy=" << policy_source
-            << " (0=legacy 1=wait_die 2=wound_wait 3=deadlock_detect)\n";
+                                     : std::string("engine-default"));
+  if (pin_deadlock_policy) {
+    std::cout << "deadlock_policy=" << policy_source
+              << " (0=legacy 1=wait_die 2=wound_wait 3=deadlock_detect)\n";
+  } else {
+    std::cout << "deadlock_policy=engine-default\n";
+  }
 
   auto database_or_status =
       tinylamb::Database::Create(options.database_path, options.wal_sync_ms);
@@ -294,7 +341,9 @@ int main(int argc, char** argv) {
     return 1;
   }
   tinylamb::Database& database = *database_or_status.Value();
-  database.SetDeadlockPolicy(deadlock_policy);
+  if (pin_deadlock_policy) {
+    database.SetDeadlockPolicy(parse_policy(policy_source));
+  }
   std::string error;
   if (!options.reuse_existing) {
     const tinylamb::Status initialized = tinylamb::TpccWorkload::Initialize(
@@ -420,6 +469,10 @@ int main(int argc, char** argv) {
         stats.sql_path_bypasses += result.sql_statements == 0 ? 1 : 0;
         stats.latency +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed);
+        if (!result.committed && !result.user_rollback) {
+          ++worker_stats[static_cast<size_t>(worker)]
+                .abort_reasons[ClassifyAbortReason(result.error)];
+        }
         if (!result.committed && !result.user_rollback &&
             worker_stats[static_cast<size_t>(worker)].first_error.empty()) {
           worker_stats[static_cast<size_t>(worker)].first_error = result.error;
@@ -531,8 +584,19 @@ int main(int argc, char** argv) {
   std::cout << "attempted_transactions=" << attempted << '\n'
             << "committed_transactions=" << committed << '\n'
             << "user_rollback_transactions=" << user_rollback << '\n'
-            << "engine_aborted_transactions=" << engine_aborts << '\n'
-            << "executed_sql_statements=" << statements << '\n'
+            << "engine_aborted_transactions=" << engine_aborts << '\n';
+  {
+    std::map<std::string, uint64_t> abort_reasons;
+    for (const WorkerStats& worker : worker_stats) {
+      for (const auto& [reason, count] : worker.abort_reasons) {
+        abort_reasons[reason] += count;
+      }
+    }
+    for (const auto& [reason, count] : abort_reasons) {
+      std::cout << "abort." << reason << "=" << count << '\n';
+    }
+  }
+  std::cout << "executed_sql_statements=" << statements << '\n'
             << "sql_path_gate=" << (sql_path_gate_ok ? "PASS" : "FAIL") << '\n'
             << "tps=" << std::fixed << std::setprecision(3)
             << static_cast<double>(committed) / seconds << '\n'
@@ -606,6 +670,12 @@ int main(int argc, char** argv) {
                                      txn_stats_before.write_intent_attempts;
     const uint64_t intent_conflicts = txn_after.write_intent_conflicts -
                                       txn_stats_before.write_intent_conflicts;
+    const uint64_t intent_timeouts =
+        txn_after.write_intent_wait_timeouts -
+        txn_stats_before.write_intent_wait_timeouts;
+    const uint64_t intent_holder_abort_giveups =
+        txn_after.write_intent_holder_abort_giveups -
+        txn_stats_before.write_intent_holder_abort_giveups;
     const uint64_t intent_wait_ns = txn_after.write_intent_mutex_wait_ns -
                                     txn_stats_before.write_intent_mutex_wait_ns;
     const uint64_t commit_wait_ns = txn_after.commit_shard_mutex_wait_ns -
@@ -614,33 +684,60 @@ int main(int argc, char** argv) {
         scheduler_after.acquire_count - scheduler_stats_before.acquire_count;
     const uint64_t scheduler_wait_ns = scheduler_after.acquire_wait_ns -
                                        scheduler_stats_before.acquire_wait_ns;
-    std::cout << "wait.wal.count=" << wal_waits << '\n'
-              << "wait.wal.total_ms="
-              << static_cast<double>(wal_wait_ns) / 1'000'000.0 << '\n'
-              << "wait.wal.average_us="
-              << (wal_waits == 0 ? 0.0
-                                 : static_cast<double>(wal_wait_ns) / 1000.0 /
-                                       static_cast<double>(wal_waits))
-              << '\n'
-              << "mvcc.write_intent.attempts=" << intent_attempts << '\n'
-              << "mvcc.write_intent.conflicts=" << intent_conflicts << '\n'
-              << "mvcc.write_intent.conflict_percent="
-              << (intent_attempts == 0
-                      ? 0.0
-                      : 100.0 * static_cast<double>(intent_conflicts) /
-                            static_cast<double>(intent_attempts))
-              << '\n'
-              << "wait.mvcc_intent_mutex.total_ms="
-              << static_cast<double>(intent_wait_ns) / 1'000'000.0 << '\n'
-              << "wait.mvcc_commit_shards.total_ms="
-              << static_cast<double>(commit_wait_ns) / 1'000'000.0 << '\n'
-              << "wait.scheduler.acquires=" << scheduler_acquires << '\n'
-              << "wait.scheduler.total_ms="
-              << static_cast<double>(scheduler_wait_ns) / 1'000'000.0 << '\n'
-              << "wait.scheduler.contended="
-              << scheduler_after.contended_acquires -
-                     scheduler_stats_before.contended_acquires
-              << '\n';
+    std::cout
+        << "wait.wal.count=" << wal_waits << '\n'
+        << "wait.wal.total_ms="
+        << static_cast<double>(wal_wait_ns) / 1'000'000.0 << '\n'
+        << "wait.wal.average_us="
+        << (wal_waits == 0 ? 0.0
+                           : static_cast<double>(wal_wait_ns) / 1000.0 /
+                                 static_cast<double>(wal_waits))
+        << '\n'
+        << "mvcc.write_intent.attempts=" << intent_attempts << '\n'
+        << "mvcc.write_intent.conflicts=" << intent_conflicts << '\n'
+        << "mvcc.write_intent.wait_timeouts=" << intent_timeouts << '\n'
+        << "mvcc.write_intent.holder_abort_giveups="
+        << intent_holder_abort_giveups << '\n'
+        << "mvcc.write_intent.conflict_percent="
+        << (intent_attempts == 0
+                ? 0.0
+                : 100.0 * static_cast<double>(intent_conflicts) /
+                      static_cast<double>(intent_attempts))
+        << '\n'
+        << "wait.mvcc_intent_mutex.total_ms="
+        << static_cast<double>(intent_wait_ns) / 1'000'000.0 << '\n'
+        << "wait.mvcc_commit_shards.total_ms="
+        << static_cast<double>(commit_wait_ns) / 1'000'000.0 << '\n'
+        << "wait.scheduler.acquires=" << scheduler_acquires << '\n'
+        << "wait.scheduler.total_ms="
+        << static_cast<double>(scheduler_wait_ns) / 1'000'000.0 << '\n'
+        << "wait.scheduler.contended="
+        << scheduler_after.contended_acquires -
+               scheduler_stats_before.contended_acquires
+        << '\n'
+        << "tm.active_transactions=" << txn_after.active_transactions << '\n'
+        << "tm.version_chains=" << txn_after.version_chains << '\n'
+        << "tm.index_undo_reserved_pages="
+        << txn_after.index_undo_reserved_pages << '\n'
+        << "wait.index_gate.contended="
+        << txn_after.index_gate_contended_acquires << '\n'
+        << "wait.index_gate.total_ms="
+        << static_cast<double>(txn_after.index_gate_wait_ns) / 1'000'000.0
+        << '\n'
+        << "wait.index_gate.long_waits=" << txn_after.index_gate_long_waits
+        << '\n'
+        << "wait.table_tail.count=" << txn_after.table_tail_wait_count << '\n'
+        << "wait.table_tail.total_ms="
+        << static_cast<double>(txn_after.table_tail_wait_ns) / 1'000'000.0
+        << '\n'
+        << "tm.oldest_snapshot_lag="
+        << (txn_after.oldest_snapshot_ts == 0
+                ? 0  // No live snapshot: zero lag, not commit_ts - 0.
+                : (txn_after.oldest_snapshot_ts <= txn_after.current_commit_ts
+                       ? txn_after.current_commit_ts -
+                             txn_after.oldest_snapshot_ts
+                       : 0))
+        << '\n';
   }
   if (!sql_path_gate_ok) {
     std::cerr << "TPC-C SQL path gate failed: measured transactions did not "

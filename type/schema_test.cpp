@@ -46,6 +46,53 @@ TEST(SchemaTest, Constructor_WithValidColumns_InitializesCorrectly) {
   EXPECT_EQ(t.Name(), "next_schema");
 }
 
+TEST(SchemaTest, LookupIdentity_ChangesForIndependentSchemas) {
+  Schema first("first", {Column("a", ValueType::kInt64)});
+  Schema second("second", {Column("b", ValueType::kInt64)});
+  Schema copy = first;
+
+  EXPECT_NE(first.LookupIdentity(), second.LookupIdentity());
+  EXPECT_NE(first.LookupIdentity(), copy.LookupIdentity());
+  copy = second;
+  EXPECT_NE(copy.LookupIdentity(), first.LookupIdentity());
+}
+
+TEST(SchemaTest, WithName_RenamesSchemaAndQualifiesEveryColumn) {
+  Schema s("old",
+           {Column("a", ValueType::kInt64), Column("b", ValueType::kVarChar)});
+  const Schema renamed = s.WithName("new");
+  EXPECT_EQ(renamed.Name(), "new");
+  ASSERT_EQ(renamed.ColumnCount(), 2U);
+  EXPECT_EQ(renamed.GetColumn(0).Name().schema, "new");
+  EXPECT_EQ(renamed.GetColumn(0).Name().name, "a");
+  EXPECT_EQ(renamed.GetColumn(1).Name().schema, "new");
+  // The source schema is untouched.
+  EXPECT_EQ(s.Name(), "old");
+  EXPECT_EQ(s.GetColumn(0).Name().schema, "old");
+}
+
+TEST(SchemaTest, WithRenamedColumn_RenamesOnlyTheTargetOffset) {
+  Schema s("t",
+           {Column("a", ValueType::kInt64), Column("b", ValueType::kVarChar),
+            Column("c", ValueType::kDouble)});
+  const Schema renamed = s.WithRenamedColumn(1, "renamed");
+  ASSERT_EQ(renamed.ColumnCount(), 3U);
+  EXPECT_EQ(renamed.GetColumn(1).Name().name, "renamed");
+  EXPECT_EQ(renamed.GetColumn(1).Name().schema, "t");
+  EXPECT_EQ(renamed.GetColumn(0).Name().name, "a");
+  EXPECT_EQ(renamed.GetColumn(2).Name().name, "c");
+  // The renamed column resolves, the old name no longer does, and the other
+  // columns keep their offsets.
+  EXPECT_EQ(renamed.Offset(ColumnName("", "renamed")), 1);
+  EXPECT_EQ(renamed.Offset(ColumnName("", "b")), -1);
+  EXPECT_EQ(renamed.Offset(ColumnName("", "a")), 0);
+  EXPECT_EQ(renamed.Offset(ColumnName("", "c")), 2);
+  // An out-of-range offset is a no-op, not a crash.
+  const Schema untouched = s.WithRenamedColumn(99, "nope");
+  EXPECT_EQ(untouched.GetColumn(0).Name().name, "a");
+  EXPECT_EQ(untouched.Offset(ColumnName("", "nope")), -1);
+}
+
 TEST(SchemaTest, SerializeDeserialize_DiverseSchemas_PreservesStructure) {
   SerializeDeserializeTest(
       Schema("sample", {Column(ColumnName("c1"), ValueType::kInt64,

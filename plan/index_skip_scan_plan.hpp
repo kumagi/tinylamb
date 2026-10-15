@@ -41,6 +41,7 @@ class IndexSkipScanPlan final : public PlanBase {
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return inner_->GetStats();
   }
+  [[nodiscard]] const Plan& GetSource() const { return inner_; }
   [[nodiscard]] size_t AccessRowCount() const override {
     return inner_->AccessRowCount();
   }

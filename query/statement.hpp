@@ -100,7 +100,28 @@ enum class StatementType : uint8_t {
   kInsert,
   kUpdate,
   kDelete,
+  kMerge,
   kAnalyze,
+  kAlterTable,
+  kCreateMaterializedView,
+  kDropMaterializedView,
+  kCreateView,
+  kDropView,
+};
+
+// ALTER TABLE action.  v1 carries the catalog-level actions (table rename,
+// column rename); row-layout actions (ADD/DROP COLUMN) stay explicit errors
+// at the visitor until the rebuild path lands.
+struct AlterTableAction {
+  enum class Kind : uint8_t {
+    kRenameTo,
+    kRenameColumn,
+  };
+  Kind kind{Kind::kRenameTo};
+  // kRenameTo: the new table name.  kRenameColumn: [0] = old column name,
+  // [1] = new column name.
+  std::string new_name;
+  std::string old_column;
 };
 
 inline std::string StatementTypeName(StatementType t) {
@@ -117,8 +138,20 @@ inline std::string StatementTypeName(StatementType t) {
       return "Update";
     case StatementType::kDelete:
       return "Delete";
+    case StatementType::kMerge:
+      return "Merge";
     case StatementType::kAnalyze:
       return "Analyze";
+    case StatementType::kAlterTable:
+      return "AlterTable";
+    case StatementType::kCreateMaterializedView:
+      return "CreateMaterializedView";
+    case StatementType::kDropMaterializedView:
+      return "DropMaterializedView";
+    case StatementType::kCreateView:
+      return "CreateView";
+    case StatementType::kDropView:
+      return "DropView";
   }
   return "Unknown";
 }
@@ -152,6 +185,27 @@ struct ForeignKeyDef {
   std::vector<std::string> parent_columns;
   Action on_delete{Action::kNoAction};
   Action on_update{Action::kNoAction};
+};
+
+class AlterTableStatement : public Statement {
+ public:
+  AlterTableStatement(std::string table_name, AlterTableAction action)
+      : Statement(StatementType::kAlterTable),
+        table_name_(std::move(table_name)),
+        action_(std::move(action)) {}
+
+  [[nodiscard]] const std::string& TableName() const { return table_name_; }
+  [[nodiscard]] const AlterTableAction& Action() const { return action_; }
+  void Dump(std::ostream& o) const override {
+    o << "table=" << table_name_ << " action="
+      << (action_.kind == AlterTableAction::Kind::kRenameTo ? "rename-to "
+                                                            : "rename-column ")
+      << action_.new_name;
+  }
+
+ private:
+  std::string table_name_;
+  AlterTableAction action_;
 };
 
 class CreateTableStatement : public Statement {
@@ -222,6 +276,94 @@ class CreateTableStatement : public Statement {
   std::vector<Column> columns_;
   std::vector<ForeignKeyDef> foreign_keys_;
   std::shared_ptr<SelectStatement> as_query_;
+};
+
+// CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS <query>.  The result is
+// materialized into a catalog table of the same name; the defining query
+// text rides along in the catalog so the view can be refreshed by re-running
+// it.  Staleness is manual (BigQuery-style automatic incremental refresh is
+// out of scope): queries read the stored rows until an explicit refresh.
+class CreateMaterializedViewStatement : public Statement {
+ public:
+  CreateMaterializedViewStatement(std::string view_name, bool if_not_exists,
+                                  std::shared_ptr<SelectStatement> query,
+                                  std::string query_text)
+      : Statement(StatementType::kCreateMaterializedView),
+        view_name_(std::move(view_name)),
+        if_not_exists_(if_not_exists),
+        query_(std::move(query)),
+        query_text_(std::move(query_text)) {}
+
+  [[nodiscard]] const std::string& ViewName() const { return view_name_; }
+  [[nodiscard]] bool IfNotExists() const { return if_not_exists_; }
+  [[nodiscard]] const std::shared_ptr<SelectStatement>& Query() const {
+    return query_;
+  }
+  // The defining query, sliced verbatim from the statement source; refresh
+  // and catalog introspection re-run this text.
+  [[nodiscard]] const std::string& QueryText() const { return query_text_; }
+  void Dump(std::ostream& o) const override {
+    o << "view=" << view_name_ << (if_not_exists_ ? " if_not_exists" : "")
+      << " AS " << query_text_;
+  }
+
+ private:
+  std::string view_name_;
+  bool if_not_exists_;
+  std::shared_ptr<SelectStatement> query_;
+  std::string query_text_;
+};
+
+// CREATE VIEW: the defining query persists as text (Database view records)
+// and expands at FROM-reference time through the session ViewRegistry.  The
+// visitor registers the parsed query immediately so same-transaction
+// references resolve; execution persists the definition for later sessions.
+class CreateViewStatement : public Statement {
+ public:
+  CreateViewStatement(std::string view_name, bool or_replace,
+                      std::string query_text)
+      : Statement(StatementType::kCreateView),
+        view_name_(std::move(view_name)),
+        or_replace_(or_replace),
+        query_text_(std::move(query_text)) {}
+
+  [[nodiscard]] const std::string& ViewName() const { return view_name_; }
+  [[nodiscard]] bool OrReplace() const { return or_replace_; }
+  [[nodiscard]] const std::string& QueryText() const { return query_text_; }
+  void Dump(std::ostream& o) const override {
+    o << "view=" << view_name_ << (or_replace_ ? " or_replace" : "") << " AS "
+      << query_text_;
+  }
+
+ private:
+  std::string view_name_;
+  bool or_replace_;
+  std::string query_text_;
+};
+
+class DropViewStatement : public Statement {
+ public:
+  explicit DropViewStatement(std::string view_name)
+      : Statement(StatementType::kDropView), view_name_(std::move(view_name)) {}
+
+  [[nodiscard]] const std::string& ViewName() const { return view_name_; }
+  void Dump(std::ostream& o) const override { o << "view=" << view_name_; }
+
+ private:
+  std::string view_name_;
+};
+
+class DropMaterializedViewStatement : public Statement {
+ public:
+  explicit DropMaterializedViewStatement(std::string view_name)
+      : Statement(StatementType::kDropMaterializedView),
+        view_name_(std::move(view_name)) {}
+
+  [[nodiscard]] const std::string& ViewName() const { return view_name_; }
+  void Dump(std::ostream& o) const override { o << "view=" << view_name_; }
+
+ private:
+  std::string view_name_;
 };
 
 class DropTableStatement : public Statement {
@@ -354,6 +496,16 @@ class SelectStatement : public Statement {
     with_queries_.erase(name);
     std::erase(with_query_order_, name);
   }
+  // Drops every CTE declaration from this statement. Grouping-set expansion
+  // copies the WITH clause onto each UNION ALL branch; the owning statement
+  // keeps the declarations and branch references resolve through the
+  // execution's inherited CTE map, so a branch carrying its own copy would
+  // re-execute every CTE body once per grouping set.
+  void ClearWithQueries() {
+    with_queries_.clear();
+    with_query_order_.clear();
+    recursive_with_queries_.clear();
+  }
   [[nodiscard]] bool IsRecursiveWith(const std::string& name) const {
     return recursive_with_queries_.contains(name);
   }
@@ -480,8 +632,8 @@ class SelectStatement : public Statement {
       for (const std::string& column : source.using_columns) {
         append_string(column);
       }
-      if (source.sample) {
-        source.sample->Dump(stream);
+      if (const std::optional<TableSampleSpec>& sample = source.sample) {
+        sample->Dump(stream);
       }
       stream << ';';
     }
@@ -782,6 +934,80 @@ class UpdateStatement : public Statement {
   int64_t assert_rows_modified_{-1};
 };
 
+// MERGE INTO target USING source ON condition WHEN [NOT] MATCHED THEN action.
+// Clones of the source expression / set expressions keep the source alias
+// qualified so evaluation resolves source columns through an outer Scope.
+
+enum class MergeActionKind : uint8_t { kSkip, kUpdate, kDelete, kInsert };
+
+struct MergeAction {
+  MergeActionKind kind{MergeActionKind::kSkip};
+  // kUpdate: assignments in WHEN MATCHED THEN UPDATE SET order.
+  std::vector<std::pair<ColumnName, Expression>> set_clause;
+  // kInsert: target column list (empty = all columns in schema order) and the
+  // single row's value expressions evaluated against the unmatched source row.
+  std::vector<std::string> insert_columns;
+  std::vector<Expression> insert_values;
+};
+
+struct MergeWhenClause {
+  enum class MatchType : uint8_t {
+    kMatched,
+    kNotMatchedByTarget,
+    kNotMatchedBySource,
+  };
+
+  MatchType match_type{MatchType::kMatched};
+  // Search condition; empty = unconditional.
+  Expression condition;
+  MergeAction action;
+};
+
+class MergeStatement : public Statement {
+ public:
+  MergeStatement(std::string target_table,
+                 std::shared_ptr<SelectStatement> source,
+                 std::string source_alias, Expression on_condition)
+      : Statement(StatementType::kMerge),
+        target_table_(std::move(target_table)),
+        source_(std::move(source)),
+        source_alias_(std::move(source_alias)),
+        on_condition_(std::move(on_condition)) {}
+
+  [[nodiscard]] const std::string& TargetTable() const { return target_table_; }
+  [[nodiscard]] const std::shared_ptr<SelectStatement>& Source() const {
+    return source_;
+  }
+  [[nodiscard]] const std::string& SourceAlias() const { return source_alias_; }
+  [[nodiscard]] const Expression& OnCondition() const { return on_condition_; }
+  // True when this MERGE was produced by desugaring `UPDATE ... FROM` (the
+  // visitor lowers that statement shape onto the MERGE machinery).  Diagnostics
+  // and server command tags report UPDATE for such statements so scripts see
+  // the statement the user wrote, not the implementation vehicle.
+  [[nodiscard]] bool DesugaredFromUpdate() const {
+    return desugared_from_update_;
+  }
+  void SetDesugaredFromUpdate(bool value) { desugared_from_update_ = value; }
+  [[nodiscard]] const std::vector<MergeWhenClause>& Clauses() const {
+    return clauses_;
+  }
+  void SetClauses(std::vector<MergeWhenClause> clauses) {
+    clauses_ = std::move(clauses);
+  }
+  void Dump(std::ostream& o) const override {
+    o << "target=" << target_table_ << " using=" << source_alias_
+      << " on=" << (on_condition_ ? on_condition_->ToString() : "(null)")
+      << " clauses=" << clauses_.size();
+  }
+
+ private:
+  std::string target_table_;
+  std::shared_ptr<SelectStatement> source_;
+  std::string source_alias_;
+  Expression on_condition_;
+  bool desugared_from_update_{false};
+  std::vector<MergeWhenClause> clauses_;
+};
 class DeleteStatement : public Statement {
  public:
   DeleteStatement(std::string table_name, Expression where_clause)

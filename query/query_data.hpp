@@ -135,6 +135,9 @@ struct QueryData {
   std::vector<std::string> from_;
   Expression where_;
   std::vector<NamedExpression> select_;
+  // Resolved column keys supplied by the grouped-SQL bridge. Aggregation
+  // outputs contain these keys followed by select_'s aggregate targets.
+  std::vector<Expression> grouping_keys_;
   std::unordered_map<std::string, std::string> aliases_;
   // QUALIFY clause (window-filter). Like WHERE it filters rows, but it
   // evaluates after window functions; the optimizer lowers it to a Selection

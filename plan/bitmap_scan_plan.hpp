@@ -25,7 +25,7 @@ struct BitmapIndexRange {
 
 class BitmapScanPlan final : public PlanBase {
  public:
-  BitmapScanPlan(const Table& table, TableStatistics statistics,
+  BitmapScanPlan(const Table& table, const TableStatistics& statistics,
                  std::vector<BitmapIndexRange> ranges, BitmapCombine combine,
                  Expression where, size_t estimated_rows, size_t access_rows);
 

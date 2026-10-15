@@ -67,13 +67,13 @@ return std::vector<PlanAlternative>{
 
 ## 最適化効果
 
-論理式 `kIntersect` から単一の物理演算子 `SetOperationPlan`（`Intersect`）を生成します。論理等値規則 `intersect_to_semijoin` およびコストベース選択 `intersect_except_cost_based_lowering` により、半結合（`semi_hash_join` 等）へ落とすべきか、素直な集合演算として実行すべきかがコスト比較によって最適に決定されます。
+論理式 `kIntersect` から単一の物理演算子 `SetOperationPlan`（`Intersect`）を生成します。論理等値規則 `intersect_to_semijoin` およびコストベース選択 `intersect_to_semijoin / except_to_antijoin` により、半結合（`semi_hash_join` 等）へ落とすべきか、素直な集合演算として実行すべきかがコスト比較によって最適に決定されます。
 
 ## 関連 Rule との相互作用
 
 - `intersect_all`, `union`, `union_all`, `except`, `except_all`: 同一の `implement_set_operation` ラムダを共有する集合演算実装規則群です。
 - `intersect_to_semijoin`: `kIntersect` を `kSemiJoin` へ変換する論理規則です。
-- `intersect_except_cost_based_lowering`: 集合積を物理集合演算とするか半結合とするかをコスト判定する論理変換規則です。
+- `intersect_to_semijoin / except_to_antijoin`: 集合積を物理集合演算とするか半結合とするかをコスト判定する論理変換規則です。
 - `push_filter_past_setop`, `setop_empty_simplification`: フィルタの先行適用や、空リレーションを含む場合の `kEmpty` への簡約を行う論理規則群です。
 - `semi_hash_join`, `semi_nested_loop_join`: 半結合に変換された場合に選択される物理結合規則群です。
 

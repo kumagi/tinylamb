@@ -35,6 +35,12 @@ enum class PageType : uint8_t {
   kPaxPage,
 };
 
+enum class PageAllocationKind : uint8_t {
+  kFresh,
+  kRecycled,
+  kInPlace,
+};
+
 inline std::string PageTypeString(enum PageType type) {
   switch (type) {
     case PageType::kFreePage:

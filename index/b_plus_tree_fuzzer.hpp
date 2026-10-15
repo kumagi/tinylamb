@@ -46,8 +46,9 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::string db_name = RandomString();
   std::string log_name = db_name + ".log";
-  std::remove((db_name + ".db").c_str());
-  std::remove(log_name.c_str());
+  // Best-effort cleanup: ENOENT is expected on a fresh run.
+  (void)std::remove((db_name + ".db").c_str());
+  (void)std::remove(log_name.c_str());
   std::unique_ptr<LockManager> lm;
   std::unique_ptr<PageManager> page_manager;
   std::unique_ptr<Logger> logger;
@@ -62,7 +63,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
                                               rm.get());
   };
   Open();
-  page_id_t root;
+  page_id_t root = 0;
   {
     auto boot_txn = tm->Begin();
     PageRef page = page_manager->AllocateNewPage(boot_txn, PageType::kLeafPage)
@@ -106,15 +107,19 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         if (!kvp.empty()) {
           auto iter = kvp.begin();
           std::advance(iter, stream.Pick(kvp.size()));
+          // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
           ASSIGN_OR_CRASH(std::string, val, bpt.Read(txn, iter->first));
           assert(val == iter->second);
+          (void)val;  // The assert vanishes in NDEBUG builds.
         }
         break;
       }
       case 3: {  // Verify the whole model against the tree.
         for (const auto& [key, value] : kvp) {
+          // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
           ASSIGN_OR_CRASH(std::string, val, bpt.Read(txn, key));
           assert(val == value);
+          (void)val;  // The assert vanishes in NDEBUG builds.
         }
         // Full ascending scan must enumerate exactly the model in order.
         size_t model_idx = 0;
@@ -161,16 +166,19 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         kvp = committed;
         assert(bpt.SanityCheckForTest(page_manager.get()));
         for (const auto& [key, value] : kvp) {
+          // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
           ASSIGN_OR_CRASH(std::string, val, bpt.Read(txn, key));
           assert(val == value);
+          (void)val;  // The assert vanishes in NDEBUG builds.
         }
         break;
       }
     }
   }
   txn.Abort();
-  std::remove((db_name + ".db").c_str());
-  std::remove(log_name.c_str());
+  // Best-effort cleanup: ENOENT is expected on a fresh run.
+  (void)std::remove((db_name + ".db").c_str());
+  (void)std::remove(log_name.c_str());
 }
 
 }  // namespace tinylamb

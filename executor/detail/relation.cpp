@@ -182,9 +182,13 @@ void Relation::AddRow(Row row) {
 
 Status Relation::FinishSpill() {
   if (spill_tail_) {
-    return spill_tail_->FinishWriting();
+    const Status status = spill_tail_->FinishWriting();
+    if (status != Status::kSuccess && spill_error_ == Status::kSuccess) {
+      spill_error_ = status;
+    }
+    return status;
   }
-  return Status::kSuccess;
+  return spill_error_;
 }
 
 void Relation::ResetContents() {
@@ -208,13 +212,15 @@ StatusOr<Relation> MaterializeRelation(const Relation& source) {
   out.using_columns = source.using_columns;
   Status copied = source.ForEachRow([&](const Row& row) { out.AddRow(row); });
   if (copied == Status::kSuccess) {
-    // A source that already degraded (dropped/kept-in-memory rows on spill
-    // failure) must not silently copy as a clean, complete relation.
     copied = source.GetStatus();
   }
+  if (copied == Status::kSuccess) {
+    copied = out.FinishSpill();
+  }
+  if (copied == Status::kSuccess) {
+    copied = out.GetStatus();
+  }
   if (copied != Status::kSuccess) {
-    // A truncated copy presented as complete would silently drop rows from
-    // joins/snapshots; surface the failure instead.
     return copied;
   }
   return out;

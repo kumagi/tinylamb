@@ -34,6 +34,7 @@
 #include "index_key.hpp"
 #include "page/free_page.hpp"
 #include "page/meta_page.hpp"
+#include "page/page_manager.hpp"
 #include "page/page_type.hpp"
 #include "page/row_page.hpp"
 #include "page_ref.hpp"
@@ -53,6 +54,14 @@ namespace tinylamb {
 Page::Page(page_id_t pid, PageType page_type) { PageInit(pid, page_type); }
 
 void Page::PageInit(page_id_t pid, PageType page_type) {
+  // Zero the whole object, not just the named fields: alignment padding
+  // between the header scalars is never written otherwise, so StoredChecksum
+  // (a raw-bytes CRC over everything but recovery_lsn/checksum) mixed heap
+  // garbage into the checksum. That made checksums vary across runs under
+  // ASAN's malloc fill and let a stored checksum stop matching a recompute on
+  // the same image. Page is standard-layout and trivially destructible (see
+  // the static_asserts in page.hpp), so a byte-wise clear is well-defined.
+  std::memset(reinterpret_cast<void*>(this), 0, sizeof(Page));
   body.dummy_.fill(0);
   format_magic = kSerdesMagic;
   format_version = kSerdesVersion;
@@ -93,7 +102,8 @@ void Page::EncodeDisk(char* destination) const {
   offset += SerializeU64(destination + offset, page_lsn);
   offset += SerializeU64(destination + offset, recovery_lsn);
   offset += SerializeU64(destination + offset, static_cast<uint64_t>(type));
-  offset += SerializeU64(destination + offset, checksum);
+  // The in-memory "repaired" bit is deliberately not part of the page format.
+  offset += SerializeU64(destination + offset, checksum & kChecksumDiskMask);
   CHECK(offset == kPageHeaderSize);
 
   std::memcpy(destination + offset, &body, kPageBodySize);
@@ -130,12 +140,59 @@ Status Page::DecodeDisk(const char* source) {
   return Status::kSuccess;
 }
 
+Status Page::DecodeDiskInPlace() {
+  // The image is already in this object's bytes; only the big-endian header
+  // scalars need fixing up.  Layout contract (see the static_asserts): the
+  // members occupy the same leading offsets as the serialized header except
+  // that `type` is a full u64 on disk while the member is 4 bytes followed
+  // by 4 padding bytes.  StoredChecksum hashes bytes [0, 24) and [32, 40)
+  // plus the raw body, so the fixup must reproduce the write-time image
+  // exactly: native-endian scalars (EncodeDisk's source of those bytes) and
+  // zero padding (PageInit and operator new zero the object; nothing writes
+  // between that and SetChecksum).
+  const char* source = reinterpret_cast<const char*>(this);
+  size_t offset = 0;
+  offset += DeserializeU32(source + offset, &format_magic);
+  offset += DeserializeU32(source + offset, &format_version);
+  if (format_magic != kSerdesMagic) {
+    return StatusError(StatusCode::kCorrupt, "invalid page magic");
+  }
+  if (format_version != kSerdesVersion) {
+    return StatusError(
+        StatusCode::kCorrupt,
+        "unsupported page version: " + std::to_string(format_version));
+  }
+  offset += DeserializeU64(source + offset, &page_id);
+  offset += DeserializeU64(source + offset, &page_lsn);
+  offset += DeserializeU64(source + offset, &recovery_lsn);
+  uint64_t raw_type = 0;
+  offset += DeserializeU64(source + offset, &raw_type);
+  // A bit-rotted type discriminant must not reach CHECK-aborts in
+  // RowCount/GetKey/etc; same kCorrupt contract as DecodeDisk.
+  if (raw_type > static_cast<uint64_t>(PageType::kPaxPage)) {
+    return StatusError(StatusCode::kCorrupt,
+                       "invalid page type: " + std::to_string(raw_type));
+  }
+  type = static_cast<PageType>(raw_type);
+  offset += DeserializeU64(source + offset, &checksum);
+  CHECK(offset == kPageHeaderSize);
+  // Zero the padding between `type` (1 byte in memory) and `checksum`
+  // (8-aligned at +40): the pread filled it with the big-endian type's high
+  // bytes, while the stored checksum was computed over zeroed padding
+  // (PageInit / operator new zero the object and nothing writes between
+  // that and SetChecksum).
+  std::memset(reinterpret_cast<char*>(&type) + sizeof(type), 0,
+              reinterpret_cast<const char*>(&checksum) -
+                  (reinterpret_cast<const char*>(&type) + sizeof(type)));
+  return Status::kSuccess;
+}
+
 // Meta page functions.
 Status Page::DestroyPage(Transaction& txn, Page* target) {
   ASSERT_PAGE_TYPE(PageType::kMetaPage);
   RETURN_IF_FAIL(body.meta_page.DestroyPage(txn, target));
   SetPageLSN(txn.PrevRecordEndLSN());
-  SetRecLSN(txn.PrevRecordEndLSN());
+  SetRecLSN(txn.PrevLSN());
   return Status::kSuccess;
 }
 
@@ -188,7 +245,7 @@ StatusOr<slot_t> Page::Insert(Transaction& txn, std::string_view record) {
   StatusOr<slot_t> result = body.row_page.Insert(PageID(), txn, record);
   if (result.GetStatus() == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -198,7 +255,7 @@ Status Page::Update(Transaction& txn, slot_t slot, std::string_view row) {
   Status result = body.row_page.Update(PageID(), txn, slot, row);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -208,9 +265,41 @@ Status Page::Delete(Transaction& txn, const slot_t pos) {
   Status result = body.row_page.Delete(PageID(), txn, pos);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
+}
+
+Status Page::SetNextPage(Transaction& txn, page_id_t next) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  const page_id_t old_next = body.row_page.next_page_id_;
+  Status result = body.row_page.SetNextPage(PageID(), txn, next);
+  if (result == Status::kSuccess && old_next != next) {
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
+  return result;
+}
+
+Status Page::SetPrevPage(Transaction& txn, page_id_t prev) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  const page_id_t old_prev = body.row_page.prev_page_id_;
+  Status result = body.row_page.SetPrevPage(PageID(), txn, prev);
+  if (result == Status::kSuccess && old_prev != prev) {
+    SetPageLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
+  return result;
+}
+
+void Page::SetNextPageImpl(page_id_t next) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  body.row_page.SetNextPageImpl(next);
+}
+
+void Page::SetPrevPageImpl(page_id_t prev) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  body.row_page.SetPrevPageImpl(prev);
 }
 
 slot_t Page::RowCount() const {
@@ -250,7 +339,7 @@ Status Page::InsertLeaf(Transaction& txn, std::string_view key,
   Status result = body.leaf_page.Insert(PageID(), txn, key, value);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -261,7 +350,7 @@ Status Page::Update(Transaction& txn, std::string_view key,
   Status result = body.leaf_page.Update(PageID(), txn, key, value);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -282,7 +371,7 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -309,7 +398,7 @@ Status Page::InsertBranch(Transaction& txn, std::string_view key,
   Status result = body.branch_page.Insert(PageID(), txn, key, pid);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -320,14 +409,24 @@ Status Page::UpdateBranch(Transaction& txn, std::string_view key,
   Status result = body.branch_page.Update(PageID(), txn, key, pid);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
 
 StatusOr<page_id_t> Page::GetPageForKey(Transaction& txn, std::string_view key,
                                         bool less_than) const {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage);
+  if (type != PageType::kBranchPage) {
+    // A descent routed here through a stale separator (observed after a
+    // crash recovery whose loser undo could not fully restore an index
+    // subtree). Surfacing kCorrupt fails the one statement loudly and keeps
+    // the process up -- a long-lived server must not abort on a single
+    // stale route; the ASSERT that stood here took the whole process down.
+    return StatusError(
+        StatusCode::kCorrupt,
+        "descent routed to a non-branch page: pid=" + std::to_string(PageID()) +
+            " type=" + std::to_string(static_cast<int>(type)));
+  }
   return body.branch_page.GetPageForKey(txn, key, less_than);
 }
 
@@ -335,14 +434,14 @@ Status Page::SetLowestValue(Transaction& txn, page_id_t v) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage);
   RETURN_IF_FAIL(body.branch_page.SetLowestValue(PageID(), txn, v));
   SetPageLSN(txn.PrevRecordEndLSN());
-  SetRecLSN(txn.PrevRecordEndLSN());
+  SetRecLSN(txn.PrevLSN());
   return Status::kSuccess;
 }
 
-void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
-                     std::string* middle) {
+Status Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
+                       std::string* middle) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage);
-  body.branch_page.Split(PageID(), txn, new_key, right, middle);
+  return body.branch_page.Split(PageID(), txn, new_key, right, middle);
 }
 
 Status Page::PageTypeChange(Transaction& txn, PageType new_type) {
@@ -350,13 +449,17 @@ Status Page::PageTypeChange(Transaction& txn, PageType new_type) {
   std::string old_body(reinterpret_cast<const char*>(&body), kPageBodySize);
   const lsn_t old_page_lsn = PageLSN();
   const lsn_t old_rec_lsn = RecoveryLSN();
-  PageTypeChangeImpl(new_type);
-  Status append = txn.AllocatePageLog(page_id, new_type).GetStatus();
+  ASSIGN_OR_RETURN(std::string, old_meta_payload,
+                   txn.GetPageManager()->GetAllocationMetaPayload());
+  Status append = txn.DestroyPageLog(page_id, old_type, old_body).GetStatus();
   if (append != Status::kSuccess) {
-    // WAL append failed: no CLR will compensate the type change, so restore
-    // the previous image instead of leaving an unlogged conversion behind
-    // the abort (an in-memory type diverging from the last logged image
-    // would corrupt the next write-back).
+    return append;
+  }
+  PageTypeChangeImpl(new_type);
+  append = txn.AllocatePageLog(page_id, new_type, PageAllocationKind::kInPlace,
+                               old_type, old_body, std::move(old_meta_payload))
+               .GetStatus();
+  if (append != Status::kSuccess) {
     PageTypeChangeImpl(old_type);
     std::memcpy(&body, old_body.data(),
                 std::min(old_body.size(), static_cast<size_t>(kPageBodySize)));
@@ -365,7 +468,7 @@ Status Page::PageTypeChange(Transaction& txn, PageType new_type) {
     return append;
   }
   SetPageLSN(txn.PrevRecordEndLSN());
-  SetRecLSN(txn.PrevRecordEndLSN());
+  SetRecLSN(txn.PrevLSN());
   return Status::kSuccess;
 }
 
@@ -391,15 +494,37 @@ uint64_t StoredChecksum(const Page& p) {
 }
 }  // namespace
 
-void Page::SetChecksum() const { checksum = StoredChecksum(*this); }
+void Page::SetChecksum() const {
+  // A fresh CRC also clears the in-memory "repaired" bit: the on-disk image now
+  // matches the body, so there is nothing left to disclaim.
+  checksum = StoredChecksum(*this);
+}
 
-bool Page::IsValid() const { return checksum == StoredChecksum(*this); }
+// "This image is whole": either the body still matches the CRC that came off
+// disk, or recovery has already repaired it in memory (the stored CRC
+// describes the pre-repair image by then). ChecksumMatches stays the strict
+// dirty test -- see page.hpp.
+bool Page::IsValid() const {
+  return (checksum & kRepairedInMemoryBit) != 0 ||
+         (checksum & kChecksumDiskMask) == StoredChecksum(*this);
+}
 
-bool Page::ChecksumMatches() const { return IsValid(); }
+bool Page::ChecksumMatches() const {
+  return (checksum & kChecksumDiskMask) == StoredChecksum(*this);
+}
 
-void Page::InsertImpl(slot_t slot, std::string_view redo) {
+Status Page::InsertImpl(slot_t slot, std::string_view redo) {
   ASSERT_PAGE_TYPE(PageType::kRowPage);
-  body.row_page.InsertRowAt(slot, redo);
+  if (slot == std::numeric_limits<slot_t>::max()) {
+    return StatusError(StatusCode::kCorrupt, "invalid row slot in WAL");
+  }
+  const StatusOr<slot_t> inserted = body.row_page.InsertRowAt(slot, redo);
+  if (inserted.GetStatus() == Status::kConflicts &&
+      slot < body.row_page.RowMax() && body.row_page.rows_[slot].offset != 0 &&
+      body.row_page.GetRow(slot) == redo) {
+    return Status::kSuccess;
+  }
+  return inserted.GetStatus();
 }
 
 void Page::UpdateImpl(slot_t slot, std::string_view redo) {
@@ -412,9 +537,9 @@ void Page::DeleteImpl(slot_t slot) {
   body.row_page.DeleteRow(slot);
 }
 
-void Page::InsertImpl(std::string_view key, std::string_view value) {
+Status Page::InsertImpl(std::string_view key, std::string_view value) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage);
-  body.leaf_page.InsertImpl(key, value);
+  return body.leaf_page.InsertImpl(key, value);
 }
 
 void Page::UpdateImpl(std::string_view key, std::string_view value) {
@@ -442,7 +567,7 @@ Status Page::SetLowFence(Transaction& txn, const IndexKey& key) {
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -462,7 +587,7 @@ Status Page::SetHighFence(Transaction& txn, const IndexKey& key) {
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -504,7 +629,7 @@ Status Page::SetFoster(Transaction& txn, const FosterPair& foster) {
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevRecordEndLSN());
-    SetRecLSN(txn.PrevRecordEndLSN());
+    SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
@@ -574,23 +699,22 @@ void Page::SetHighFenceImpl(const IndexKey& key) {
   }
 }
 
-void Page::SetFosterImpl(const FosterPair& foster) {
+Status Page::SetFosterImpl(const FosterPair& foster) {
   switch (type) {
     case PageType::kLeafPage:
-      body.leaf_page.SetFosterImpl(foster);
-      return;
+      return body.leaf_page.SetFosterImpl(foster);
     case PageType::kBranchPage:
       body.branch_page.SetFosterImpl(foster);
-      return;
+      return Status::kSuccess;
     default:
       CHECK_MSG(false,
                 "SetFosterImpl on invalid page type: " + PageTypeString(type));
   }
 }
 
-void Page::InsertBranchImpl(std::string_view key, page_id_t pid) {
+Status Page::InsertBranchImpl(std::string_view key, page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage);
-  body.branch_page.InsertImpl(key, pid);
+  return body.branch_page.InsertImpl(key, pid);
 }
 
 void Page::UpdateBranchImpl(std::string_view key, page_id_t pid) {

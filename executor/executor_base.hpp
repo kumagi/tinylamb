@@ -22,7 +22,9 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "common/runtime_filter.hpp"
 #include "executor/data_chunk.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 struct Row;
@@ -46,6 +48,25 @@ class ExecutorBase {
     return o;
   }
 
+  // Dynamic ("runtime") join filter pushdown (Phase 2 "Dynamic Filter Join /
+  // SIP / Bloom").  A hash join materializes its build side first, publishes a
+  // sound filter over the build keys here, and only then pulls rows from the
+  // probe side: `column` on this executor holds a join key whose value has no
+  // counterpart on the build side, so the row cannot produce a match.
+  //
+  // Returns false when the executor cannot prune (the default, and for any
+  // executor whose output is not the probed table); the join then applies the
+  // filter itself.  Contract: called exactly once, before the executor has
+  // produced its first row.
+  virtual bool AttachRuntimeFilter(
+      const std::shared_ptr<const RuntimeFilterGroup>& group, slot_t column,
+      ValueType type) {
+    (void)group;
+    (void)column;
+    (void)type;
+    return false;
+  }
+
   // Sticky execution error. Next()/NextBatch() return false/0 both at EOF
   // and on failure; callers must inspect GetStatus() after exhaustion to
   // tell the two apart. The first recorded error wins (ARIES-style
@@ -65,12 +86,15 @@ class ExecutorBase {
     }
     return false;
   }
-  // Copies a child's sticky error when the child stops without one of its
-  // own rows; returns true if a failure was forwarded (caller returns
-  // false).
+  // Copies a child's sticky error when the child stopped on a failure;
+  // returns true if a failure was forwarded.  In a bool Next() do not
+  // return this value directly (true would claim a row exists) — latch and
+  // `return false` instead; in Status-returning materializers use
+  // `if (FailWithChildOf(...)) { return GetStatus(); }`.
   bool FailWithChildOf(const ExecutorBase& child) const {
     if (child.GetStatus() != Status::kSuccess) {
-      return FailWith(child.GetStatus());
+      FailWith(child.GetStatus());
+      return true;
     }
     return false;
   }

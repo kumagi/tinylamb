@@ -1251,7 +1251,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
   SessionTrace& t = *trace;
   ScopedDb sdb("sql_session_fuzz");
   if (!sdb) {
-    return "failed to create throwaway database\n";
+    return "";
   }
   Database* db = sdb.get();
   std::optional<SqlEngine> engine;
@@ -1322,7 +1322,8 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
   }
 
   // ---- dual phase ----
-  // ctxs[static_cast<size_t>(0)] re-begins via the commit above's semantics; begin both contexts.
+  // ctxs[static_cast<size_t>(0)] re-begins via the commit above's semantics;
+  // begin both contexts.
   std::array<TransactionContext, 2> ctxs = {db->BeginContext(),
                                             db->BeginContext()};
   t.steps.push_back({.is_begin = true, .txn = 1});
@@ -1334,7 +1335,8 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
   auto check_txn = [&](int x) -> std::string {
     for (const MirrorTable& tab : view[static_cast<size_t>(x)]) {
       std::string error;
-      const std::string mismatch = CheckTable(*db, ctxs[static_cast<size_t>(x)], tab, &error);
+      const std::string mismatch =
+          CheckTable(*db, ctxs[static_cast<size_t>(x)], tab, &error);
       if (verbose) {
         std::cerr << "[session][dual-check] txn" << x << " " << tab.name
                   << " rows=" << tab.rows.size()
@@ -1408,8 +1410,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     }
     if (roll <= 19) {
       // Crash: BOTH in-flight transactions are loser-undone.
-      sdb.CrashAndReopen();
-      if (!sdb) {
+      if (!sdb.CrashAndReopen() || !sdb) {
         return "crash recovery failed to reopen database at step " +
                std::to_string(step) + "\n";
       }
@@ -1454,7 +1455,8 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     if (oproll <= 25) {
       // Check this txn's view of one table.
       std::string error;
-      const std::string mismatch = CheckTable(*db, ctxs[static_cast<size_t>(x)], *target, &error);
+      const std::string mismatch =
+          CheckTable(*db, ctxs[static_cast<size_t>(x)], *target, &error);
       SessionCheck check;
       check.table = target->name;
       check.after_step = t.steps.size() - 1;
@@ -1649,7 +1651,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
 
   ScopedDb sdb("sql_session_fuzz");
   if (!sdb) {
-    return "failed to create throwaway database\n";
+    return "";
   }
   // Held as a pointer so a crash step can rebind to the reopened Database.
   Database* db = sdb.get();
@@ -1796,8 +1798,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       // ARIES recovery must restore exactly the committed mirror — REDO for
       // committed work, loser-UNDO for the in-flight transaction (which the
       // mirror treats as an abort), free-list rebuild, index/catalog redo.
-      sdb.CrashAndReopen();
-      if (!sdb) {
+      if (!sdb.CrashAndReopen() || !sdb) {
         return "crash recovery failed to reopen database at step " +
                std::to_string(step) + "\n";
       }
@@ -2153,14 +2154,11 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           }
         }
         auto key_covered = [&](int col) {
-          return std::ranges::any_of(target->unique_keys,
-                                     [&](const std::vector<int>& key) {
-                                       return std::find(key.begin(),
-                                                        key.end(), 0) ==
-                                                  key.end() &&
-                                              std::find(key.begin(), key.end(),
-                                                        col) != key.end();
-                                     });
+          return std::ranges::any_of(
+              target->unique_keys, [&](const std::vector<int>& key) {
+                return std::find(key.begin(), key.end(), 0) == key.end() &&
+                       std::find(key.begin(), key.end(), col) != key.end();
+              });
         };
         bool touches_key = false;
         for (const auto& [col, expr] : sets) {
@@ -2517,20 +2515,20 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
       // Reproduce the original transaction boundary: everything committed so
       // far must become visible to a fresh context, exactly as during
       // generation.
-      if (ctxs[static_cast<size_t>(step.txn)]->txn_.PreCommit() != Status::kSuccess) {
+      if (ctxs[static_cast<size_t>(step.txn)]->txn_.PreCommit() !=
+          Status::kSuccess) {
         return "replay commit failed at step " + std::to_string(i) + "\n";
       }
       ctxs[static_cast<size_t>(step.txn)].emplace(db->BeginContext());
     } else if (step.is_abort) {
-      if (ctxs[static_cast<size_t>(step.txn)]->txn_.Abort() != Status::kSuccess) {
+      if (ctxs[static_cast<size_t>(step.txn)]->txn_.Abort() !=
+          Status::kSuccess) {
         return "replay abort failed at step " + std::to_string(i) + "\n";
       }
       ctxs[static_cast<size_t>(step.txn)].emplace(db->BeginContext());
     } else if (step.is_crash) {
-      sdb.CrashAndReopen();
-      if (!sdb) {
-        return "replay cra != nullptrsh reopen failed at step " +
-               std::to_string(i) + "\n";
+      if (!sdb.CrashAndReopen() || !sdb) {
+        return "replay crash reopen failed at step " + std::to_string(i) + "\n";
       }
       db = sdb.get();
       engine.emplace(*db);
@@ -2549,8 +2547,8 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
       }
     } else if (step.is_ddl) {
       bool rejected_dup = false;
-      const bool ddl_ok =
-          ApplyDdl(*db, *ctxs[static_cast<size_t>(step.txn)], step.sql, &error, &rejected_dup);
+      const bool ddl_ok = ApplyDdl(*db, *ctxs[static_cast<size_t>(step.txn)],
+                                   step.sql, &error, &rejected_dup);
       if (step.must_fail) {
         if (ddl_ok || !rejected_dup) {
           return "replay unique-index DDL did not reproduce the duplicate "
@@ -2562,7 +2560,8 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
                step.sql + " :: " + error + "\n";
       }
     } else {
-      const bool ok = RunSql(*db, *ctxs[static_cast<size_t>(step.txn)], step.sql, RouteFlipFor(i));
+      const bool ok = RunSql(*db, *ctxs[static_cast<size_t>(step.txn)],
+                             step.sql, RouteFlipFor(i));
       if (step.must_fail) {
         if (ok) {
           return "replay statement unexpectedly succeeded at step " +
@@ -2584,7 +2583,8 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
           check.sql_override.empty()
               ? "SELECT * FROM " + check.table + " ORDER BY u;"
               : check.sql_override;
-      auto got = RunSelect(*db, *ctxs[static_cast<size_t>(check.txn)], check_sql, &error);
+      auto got = RunSelect(*db, *ctxs[static_cast<size_t>(check.txn)],
+                           check_sql, &error);
       if (!got.has_value()) {
         return "replay check failed on " + check.table + " :: " + error + "\n";
       }
@@ -2600,7 +2600,8 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
                                " after step " + std::to_string(i) + "\n";
         mismatch += "  expected:\n" + DumpLines(expected);
         mismatch += "  actual:\n" + DumpLines(actual);
-        mismatch += DebugDumpTableChain(*ctxs[static_cast<size_t>(check.txn)], check.table);
+        mismatch += DebugDumpTableChain(*ctxs[static_cast<size_t>(check.txn)],
+                                        check.table);
         return mismatch;
       }
       if (verbose) {

@@ -91,8 +91,8 @@ $$\Pi_A (L \Join_p R) \equiv \Pi_A (\Pi_{U_L}(L) \Join_p \Pi_{U_R}(R))$$
 
 ## 関連 Rule との相互作用
 
-- `push_projection_below_join_width_control`: 結合下の幅制御を行う補完的な Rule です。
-- `merge_adjacent_projections` / `merge_projections`: 事前射影が既存のスキャン射影等と隣接した場合に、多段射影を 1 段に折り畳みます。
+- `push_projection_through_join`: 結合下の幅制御を行う補完的な Rule です。
+- `merge_projections` / `merge_projections`: 事前射影が既存のスキャン射影等と隣接した場合に、多段射影を 1 段に折り畳みます。
 - `push_selection_through_join`: 述語の先行評価と並行して適用され、行数と行幅の双方を削減します。
 
 ## 検証テスト

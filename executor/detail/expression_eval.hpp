@@ -21,6 +21,7 @@
 #include "expression/expression.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
+#include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
 
@@ -68,8 +69,6 @@ struct AggregateInput {
   std::vector<Value> trailing_values;
 };
 
-std::string ElementSqlTypeName(ValueType type);
-
 // DISTINCT semantics: all NaNs collapse to one entry and -0 folds to +0.
 struct DistinctValueHash {
   size_t operator()(const Value& value) const;
@@ -85,11 +84,59 @@ using DistinctValueSet =
 // where raw IEEE bit patterns would otherwise count NaNs as distinct.
 [[nodiscard]] Value CanonicalDistinctValue(const Value& value);
 
+// SQL equality for group keys: NaN equals NaN and -0 equals +0, unlike raw
+// IEEE Value::operator== which never folds NaNs together. NULL equals NULL (a
+// NULL group key is one group), and two keys of different arity never match.
+struct GroupKeyEqual {
+  bool operator()(const Row& a, const Row& b) const;
+};
+
+// Transparent hash/equal pair: lets a grouped-aggregation index probe with the
+// scratch key vector directly, avoiding a Row construction per probe. The
+// vector overload reproduces std::hash<Row> bit-for-bit.
+struct GroupKeyTransparentHash {
+  using is_transparent = void;
+  size_t operator()(const Row& row) const { return std::hash<Row>{}(row); }
+  size_t operator()(const std::vector<Value>& values) const;
+};
+
+struct GroupKeyTransparentEqual {
+  using is_transparent = void;
+  bool operator()(const Row& a, const Row& b) const;
+  bool operator()(const std::vector<Value>& a, const Row& b) const;
+  bool operator()(const Row& a, const std::vector<Value>& b) const;
+};
+
+// The one grouped-aggregation index: canonicalized group key -> group slot.
+// Shared by the relational path's grouping loop and the physical grouped
+// aggregation shapes (executor/grouped_aggregate.hpp) so both agree on what
+// "the same group" means.
+using GroupKeyMap = std::unordered_map<Row, size_t, GroupKeyTransparentHash,
+                                       GroupKeyTransparentEqual>;
+
 // The layout mirrors the per-stat switch structure for readability.
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct AggregateAccumulator {
+  // Per-aggregate classification hoisted out of the per-group constructor.
+  // The string scans here (array element type, SUM column-name lowering,
+  // buffer need) are identical for every group of one aggregate, so
+  // multi-million-group builds compute them once and construct from the
+  // shared Shape instead of re-deriving it per group.
+  struct Shape {
+    bool distinct_mode{false};
+    bool sum_is_uint64{false};
+    bool sum_can_infer_uint64{false};
+    bool needs_buffer{false};
+    std::string resolved_element_type;
+  };
+  static Shape AnalyzeShape(const AggregateExpression* aggregate,
+                            const Schema* input_schema);
   explicit AggregateAccumulator(const AggregateExpression* aggregate,
-                                const Schema* input_schema = nullptr);
+                                const Schema* input_schema = nullptr)
+      : AggregateAccumulator(aggregate, AnalyzeShape(aggregate, input_schema)) {
+  }
+  AggregateAccumulator(const AggregateExpression* aggregate,
+                       const Shape& shape);
   // Distinct-set handle: the hash set is allocated lazily.  COUNT/SUM
   // (DISTINCT) over INT64/DATE values never touch it (they use the inline
   // int array below), and materializing one per group cost a heap
@@ -118,6 +165,9 @@ struct AggregateAccumulator {
   [[nodiscard]] bool IsDone() const;
 
   const AggregateExpression* expression;
+  // Cached expression->GetType(): the per-row Add path consulted the virtual
+  // two or three times per input row on multi-million-row GROUP BY builds.
+  AggregationType core_type_{AggregationType::kCount};
   int64_t count = 0;
   double total = 0.0;
   // Integer sums accumulate exactly here (int64 with overflow checks);
@@ -217,6 +267,12 @@ struct AggregateAccumulator {
   mutable std::vector<SumWeight> top_sums_;
   mutable std::vector<Value> top_count_values_;
   mutable std::vector<int64_t> top_count_counts_;
+  // MODE: counts keyed by value, with the value vector pinned in
+  // first-insertion order so ties resolve deterministically (first value to
+  // reach the maximum count wins).
+  mutable std::vector<Value> mode_values_;
+  mutable std::vector<int64_t> mode_counts_;
+  mutable std::unique_ptr<std::unordered_map<Value, size_t>> mode_index_;
   mutable std::vector<std::string> sketch_values_;  // HLL/KLL distinct entries
   mutable int sketch_type_ = 0;                     // 0 = unset
   mutable int64_t sketch_precision_ = 0;

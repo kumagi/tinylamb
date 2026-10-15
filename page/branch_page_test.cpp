@@ -84,7 +84,7 @@ class BranchPageTest : public ::testing::Test {
 
   void TearDown() override {
     std::ignore = std::remove(db_name_.c_str());
-    std::ignore = std::remove(log_name_.c_str());
+    tinylamb::RemoveLogAndSegments(log_name_);
   }
 
   std::string db_name_;
@@ -170,6 +170,62 @@ TEST_F(BranchPageTest, GetPageForKey) {
   AssertPIDForKey("b", 20);
   AssertPIDForKey("c", 23);
   AssertPIDForKey("zeta", 40);
+}
+
+// Regression for the "GetValue out of range: -1" crash class: Search's
+// less-than landing for keys in [GetKey(0), GetKey(1)) is -1 ("child -1"),
+// which the old code resolved by reading the foster slot as a child id. The
+// guard's return 0 routed TPC-C descents to page 0 (MetaPage).
+TEST_F(BranchPageTest, LessThanSeekBelowSecondSeparatorLandsLowest) {
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->SetLowestValue(txn, 100);
+  // Single separator first: every key >= "b" with less_than must land on the
+  // lowest subtree, never on a fabricated index.
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 200));
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "b", true), 100);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "delta", true), 100);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "zzz", true), 100);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "alpha", true), 100);
+  // Grow to three separators (100 is now "child -1" below "b", 200's child
+  // sits at "b", 23's at "c", 40's at "e"): the [GetKey(0), GetKey(1))
+  // interval and the below-lowest interval land on the lowest subtree while
+  // the equality and later intervals land on their own children.
+  ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "alpha", true), 100);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "b", true), 100);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "bb", true), 100);
+  // A less-than seek lands one child BEFORE the interval holding |key| (the
+  // forward leaf scan crosses into the right page from there); "child -1" is
+  // the lowest subtree.
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "c", true), 200);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "d", true), 200);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "e", true), 23);
+  // Above the last separator the landing stays one child before the (foster
+  // extended) interval; the forward scan crosses into it.
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "f", true), 23);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+// The binary search floors on the foster slot; with an empty foster (the
+// steady state outside splits) its stale offset bytes must never be
+// deserialized as a probe key -- they made Search land on -1 and one-off
+// insert positions.
+TEST_F(BranchPageTest, EmptyFosterSlotIsMinusInfinityProbe) {
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->SetLowestValue(txn, 2);
+  ASSERT_SUCCESS(page->InsertBranch(txn, "m", 20));
+  // The foster slot is empty here; probe keys on both sides of "m" resolve
+  // through the normal separator ordering.
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "a", false), 2);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "z", false), 20);
+  // Insert around the floor: the position must be 0 (before "m") despite the
+  // stale foster bytes, then the ordered invariant holds.
+  ASSERT_SUCCESS(page->InsertBranch(txn, "a", 10));
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "aa", false), 10);
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(BranchPageTest, InsertAndGetKey) {
@@ -525,6 +581,56 @@ TEST_F(BranchPageTest, DeleteAbort) {
   AssertPIDForKey("b", 20);
   AssertPIDForKey("c", 23);
   AssertPIDForKey("zeta", 40);
+}
+
+// The twin of DeleteAbort for the destroy-skip guard: a separator whose
+// child page a COMMITTED destroy freed must NOT be restored by the loser's
+// undo (re-inserting it would dangle into a free page), while DeleteAbort
+// pins that a separator whose child never existed must be restored.
+TEST_F(BranchPageTest, DeleteAbortAfterCommittedChildDestroySkipsReinsert) {
+  // Act 1 -- separators "b"->child and "c"->23; commit.
+  page_id_t child_pid = 0;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = Page();
+    page->SetLowestValue(txn, 2);
+    PageRef child = p_->AllocateNewPage(txn, PageType::kBranchPage).MoveValue();
+    child_pid = child->PageID();
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", child_pid));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+
+  // Act 2 -- a committed destroy frees the child (DROP TABLE shape).
+  {
+    auto txn = tm_->Begin();
+    PageRef child = p_->GetPage(child_pid).MoveValue();
+    ASSERT_SUCCESS(p_->DestroyPage(txn, child.get()));
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+
+  // Act 3 -- a loser deletes the separator "b" and aborts; the flush makes
+  // the skip (or restore) observable through recovery instead of just the
+  // runtime abort's in-memory undo.
+  {
+    auto txn = tm_->Begin();
+    PageRef page = Page();
+    ASSERT_SUCCESS(page->Delete(txn, "b"));
+    txn.Abort();
+  }
+  Flush();
+
+  // Act 4 -- recover: the DeleteBranch undo recognizes the freed child and
+  // skips the re-insert.
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- "b" stays deleted (falls through to the lowest subtree),
+  // "c" is intact, and nothing dangles into the freed child page.
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 2);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 23);
 }
 
 TEST_F(BranchPageTest, UpdateHeavy) {

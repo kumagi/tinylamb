@@ -133,8 +133,7 @@ graph TD
 - `topn_push_through_projection`: TopN 版の兄弟 Rule です。TopN はソート
   キーを射影の出力から入力側へ翻訳できる場合にのみ押し込めます(Limit は
   キーを気にしないので無条件に押せる、という対比になります)。
-- `eliminate_identity_projection`: 射影が恒等写像ならまず消えるため、
-  本 Rule の出番は「実質的な計算をする射影」に限られます。
+- 恒等射影の除去は物理実装の `RemoveIdentityProjection` がスキーマを確認して行います。
 
 ## 検証テスト
 

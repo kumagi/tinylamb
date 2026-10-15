@@ -66,7 +66,7 @@ SamplePlan::SamplePlan(Plan child, TableSampleSpec spec)
       output_schema_(BuildSchema(child_->GetSchema(), spec_)) {}
 
 size_t SamplePlan::EmitRowCount() const {
-  const double input = static_cast<double>(child_->EmitRowCount());
+  const auto input = static_cast<double>(child_->EmitRowCount());
   if (spec_.method == TableSampleMethod::kReservoir) {
     if (!spec_.partition_by.empty()) {
       return child_->EmitRowCount();
@@ -142,7 +142,7 @@ Schema SamplePlan::BuildSchema(const Schema& child,
     columns.emplace_back(ColumnName(qualifier, spec.weight_alias),
                          ValueType::kDouble);
   }
-  return Schema("", std::move(columns));
+  return {"", std::move(columns)};
 }
 
 }  // namespace tinylamb

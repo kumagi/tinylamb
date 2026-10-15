@@ -5,12 +5,13 @@
 #include <utility>
 
 #include "plan/plan.hpp"
+#include "table/table_statistics.hpp"
 
 namespace tinylamb {
 
 class SortDistinctPlan final : public PlanBase {
  public:
-  explicit SortDistinctPlan(Plan child) : child_(std::move(child)) {}
+  explicit SortDistinctPlan(Plan child);
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] bool ContainsParameterSlots() const override {
@@ -25,7 +26,7 @@ class SortDistinctPlan final : public PlanBase {
     return child_->ScanSource();
   }
   [[nodiscard]] const TableStatistics& GetStats() const override {
-    return child_->GetStats();
+    return stats_;
   }
   [[nodiscard]] const Schema& GetSchema() const override {
     return child_->GetSchema();
@@ -33,9 +34,7 @@ class SortDistinctPlan final : public PlanBase {
   [[nodiscard]] size_t AccessRowCount() const override {
     return child_->AccessRowCount();
   }
-  [[nodiscard]] size_t EmitRowCount() const override {
-    return child_->EmitRowCount();
-  }
+  [[nodiscard]] size_t EmitRowCount() const override { return stats_.Rows(); }
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override {
@@ -54,6 +53,7 @@ class SortDistinctPlan final : public PlanBase {
 
  private:
   Plan child_;
+  TableStatistics stats_;
 };
 
 }  // namespace tinylamb

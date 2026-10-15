@@ -20,13 +20,8 @@ using std::chrono::year;
 using std::chrono::year_month_day;
 using std::chrono::year_month_day_last;
 
-// sys_days counts days in a 32-bit representation and chrono::year saturates
-// at ±32767; keep every day count well inside both limits.
-constexpr int64_t kMinSupportedDays = -11000000;
-constexpr int64_t kMaxSupportedDays = 11000000;
-
 StatusOr<sys_days> ToSysDays(int64_t days) {
-  if (days < kMinSupportedDays || kMaxSupportedDays < days) {
+  if (days < kDateMinDays || kDateMaxDays < days) {
     return StatusError(StatusCode::kInvalidArgument, "DATE value out of range");
   }
   return sys_days{std::chrono::days{static_cast<int>(days)}};

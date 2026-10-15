@@ -8,6 +8,7 @@
 #include "executor/sort.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -18,7 +19,7 @@ namespace {
 
 int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
                    const std::vector<SortExecutor::Key>& keys, Status* error) {
-  for (const auto& key : keys) {
+  for (const SortExecutor::Key& key : keys) {
     StatusOr<Value> lv_or = key.expression->TryEvaluate(lhs, schema);
     StatusOr<Value> rv_or = key.expression->TryEvaluate(rhs, schema);
     if (!lv_or.HasValue() || !rv_or.HasValue()) {
@@ -34,22 +35,15 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
     if (lv.IsNull() && rv.IsNull()) {
       continue;
     }
-    if (lv.IsNull()) {
-      bool nulls_first = key.nulls_first.value_or(key.ascending);
-      return nulls_first ? -1 : 1;
-    }
-    if (rv.IsNull()) {
-      bool nulls_first = key.nulls_first.value_or(key.ascending);
-      return nulls_first ? 1 : -1;
-    }
     // CompareForOrderBy canonicalizes NaN (equal to itself, above +inf)
     // like SortExecutor/TopN.  Raw `lv < rv` / `rv < lv` makes NaN compare
     // "equal" to every value while 5 < 7 -- not a strict weak ordering, so
     // std::sort below is UB (unguarded partitioning can read out of
-    // bounds) and NaN rows land in inconsistent positions.
-    const int cmp = CompareForOrderBy(lv, rv);
+    // bounds) and NaN rows land in inconsistent positions.  SortKeyOrder adds
+    // the NULL placement, the direction and the key's collation on top.
+    const int cmp = MakeSortKeyOrder(key).Compare(lv, rv);
     if (cmp != 0) {
-      return key.ascending ? cmp : -cmp;
+      return cmp;
     }
   }
   return 0;

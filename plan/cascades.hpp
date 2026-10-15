@@ -42,15 +42,12 @@ enum class LogicalOperator : uint8_t {
   kCrossJoin,
   kSemiJoin,
   kAntiJoin,
-  kSingleJoin,
-  kMarkJoin,
   kSelection,
   kProjection,
   kAggregation,
   kSort,
   kTopN,
   kDistinct,
-  kMax1Row,
   kUnion,
   kUnionAll,
   kIntersect,
@@ -60,24 +57,12 @@ enum class LogicalOperator : uint8_t {
   kLimit,
   kEmpty,
   kValues,
-  kConstantTable,
   kDummyScan,
   kWindow,
   kUnnest,
-  kGenerateSeries,
   kRecursiveCte,
-  kWorkTableScan,
-  kMaterialize,
-  kEagerSpool,
-  kLazySpool,
-  kExpand,
   kApply,
-  kExchange,
-  kGather,
-  kBroadcast,
-  kRedistribute,
   kSample,
-  kAssert,
   // Opaque relational IR (outer/semi/anti joins, subqueries and CTEs). The
   // memo can cost/select it while its internal lowering remains specialized.
   kRelational,
@@ -111,7 +96,6 @@ struct LogicalExpression {
   Schema output_schema{};
 
   // Extended payload fields for Window / Grouping / Marker / Assertion:
-  std::string marker_column{};
   std::vector<Expression> partition_by{};
   std::vector<Expression> grouping_sets{};
   std::string unnest_alias{};
@@ -127,6 +111,40 @@ struct LogicalExpression {
   std::optional<RecursiveDepthSpec> depth_spec{};
 
   [[nodiscard]] std::string Fingerprint() const;
+};
+
+class LogicalExpressionList {
+ public:
+  using const_iterator = std::vector<LogicalExpression>::const_iterator;
+
+  [[nodiscard]] const_iterator begin() const { return expressions_.begin(); }
+  [[nodiscard]] const_iterator end() const { return expressions_.end(); }
+  [[nodiscard]] size_t size() const { return expressions_.size(); }
+  [[nodiscard]] bool empty() const { return expressions_.empty(); }
+  [[nodiscard]] const LogicalExpression& operator[](size_t index) const {
+    return expressions_[index];
+  }
+  [[nodiscard]] const LogicalExpression& at(size_t index) const {
+    return expressions_.at(index);
+  }
+  [[nodiscard]] const LogicalExpression& front() const {
+    return expressions_.front();
+  }
+  [[nodiscard]] const LogicalExpression& back() const {
+    return expressions_.back();
+  }
+  operator const std::vector<LogicalExpression>&() const {
+    return expressions_;
+  }
+
+ private:
+  friend class Memo;
+
+  void PushBack(LogicalExpression&& expression) {
+    expressions_.push_back(std::move(expression));
+  }
+
+  std::vector<LogicalExpression> expressions_{};
 };
 
 struct LogicalProperties {
@@ -146,7 +164,7 @@ struct LogicalProperties {
 struct Group {
   GroupId id{kInvalidGroup};
   std::vector<std::string> relations{};
-  std::vector<LogicalExpression> expressions{};
+  LogicalExpressionList expressions{};
   // Single-relation conjuncts of the query predicate, applied by every scan
   // implementation of this group (D1: the group, not the expression, owns the
   // scan filter so all alternatives filter identically).
@@ -156,8 +174,23 @@ struct Group {
   // Non-empty for derived root-layer groups (Selection/Projection/
   // Aggregation/Limit chains); distinguishes groups that share a relation set.
   std::string tag{};
+  // Probe-side join keys a dynamic ("shared information passing") filter can be
+  // built over, recorded by the `dynamic_filter_pushdown_join` rule. Purely
+  // logical: it says WHICH columns carry the join key, never which filter
+  // shape the executor should build. The derived group's tag fingerprints the
+  // key set, so this vector is always consistent with the group identity.
+  std::vector<ColumnName> dynamic_filter_keys{};
+  // Probe-side join keys whose distinct values bound the build side of a
+  // semi/anti join, recorded by the `semi_reduction_pushdown_join` rule
+  // (Phase 2 "Hash Semi Reduction"). Like `dynamic_filter_keys` this is purely
+  // logical: it names WHICH columns carry the join key, never how the executor
+  // should shrink the hash build.
+  std::vector<ColumnName> semi_reduction_probe_keys{};
   bool sample_barrier{false};
   LogicalProperties logical_properties{};
+  std::optional<size_t> logical_properties_expression_count{};
+  bool logical_properties_stale{true};
+  std::vector<GroupId> logical_property_dependents{};
 };
 
 // A WHERE conjunct together with the relations it touches (D5).
@@ -206,7 +239,9 @@ class Memo {
   // by the union but by neither side. All default join rules must create
   // joins through this helper; it guarantees each conjunct is applied exactly
   // once on every root-to-leaf path.
-  [[nodiscard]] LogicalExpression NewJoin(GroupId left, GroupId right) const;
+  [[nodiscard]] LogicalExpression NewJoin(
+      GroupId left, GroupId right,
+      const Expression& inherited_condition = {}) const;
   // Constructs an outer-join expression with an explicit ON predicate and
   // join-type payload (0 = LEFT, 1 = RIGHT, 2 = FULL). Unlike NewJoin the ON
   // condition is supplied by the caller: WHERE conjuncts must never be folded
@@ -273,18 +308,27 @@ class Memo {
   // Expression cap exceeded: exploration degrades gracefully by keeping the
   // expressions discovered so far (documented degradation path).
   [[nodiscard]] bool Degraded() const { return degraded_; }
+  [[nodiscard]] size_t Revision() const { return revision_; }
 
   // Provide table schemas so Scan expressions carry output_schema for
   // constraint-based optimization rules.
   void SetTableSchemas(const std::unordered_map<std::string, Schema>& schemas) {
     table_schemas_ = schemas;
-    for (size_t i = 0; i < groups_.size(); ++i) {
-      DeriveLogicalProperties(i);
-    }
+    RefreshLogicalProperties();
   }
   [[nodiscard]] const std::unordered_map<std::string, Schema>& GetTableSchemas()
       const {
     return table_schemas_;
+  }
+
+  // Filtered base cardinalities, populated before Build. They guide only
+  // the bounded large-join seed; they are never correctness proofs.
+  void SetRelationRows(std::unordered_map<std::string, double> rows) {
+    relation_rows_ = std::move(rows);
+  }
+  [[nodiscard]] double RelationRows(const std::string& relation) const {
+    const auto found = relation_rows_.find(relation);
+    return found == relation_rows_.end() ? 1.0 : found->second;
   }
 
   void Dump(std::ostream& out) const;
@@ -297,6 +341,9 @@ class Memo {
   void DeriveLogicalProperties(GroupId group);
 
  private:
+  void RefreshLogicalProperties();
+  void InvalidateLogicalPropertyDependents(GroupId group);
+
   [[nodiscard]] static std::string GroupKey(
       const std::vector<std::string>& relations);
 
@@ -308,9 +355,11 @@ class Memo {
   std::vector<GroupId> touched_groups_;
   std::unordered_map<std::string, Schema> table_schemas_;
   std::unordered_set<std::string> proven_one_to_one_;
+  std::unordered_map<std::string, double> relation_rows_;
   // Parallel to groups_: 1 after join_enumeration has partitioned that group.
   std::vector<uint8_t> join_enumerated_;
   const size_t expression_cap_;
+  size_t revision_{0};
   bool degraded_{false};
 };
 
@@ -463,10 +512,7 @@ inline Pattern Distinct(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kDistinct, {std::move(child)},
                      std::move(capture));
 }
-inline Pattern Max1Row(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kMax1Row, {std::move(child)},
-                     std::move(capture));
-}
+
 // Set operations intentionally accept any arity; the SQL surface commonly
 // represents a chain as a single n-ary logical expression.
 inline Pattern Union(std::string capture = {}) {
@@ -495,19 +541,7 @@ inline Pattern Limit(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kLimit, {std::move(child)},
                      std::move(capture));
 }
-inline Pattern SingleJoin(Pattern left = Any(), Pattern right = Any(),
-                          std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kSingleJoin,
-                     {std::move(left), std::move(right)}, std::move(capture));
-}
-inline Pattern MarkJoin(Pattern left = Any(), Pattern right = Any(),
-                        std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kMarkJoin,
-                     {std::move(left), std::move(right)}, std::move(capture));
-}
-inline Pattern ConstantTable(std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kConstantTable, {}, std::move(capture));
-}
+
 inline Pattern Window(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kWindow, {std::move(child)},
                      std::move(capture));
@@ -516,34 +550,14 @@ inline Pattern Unnest(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kUnnest, {std::move(child)},
                      std::move(capture));
 }
-inline Pattern GenerateSeries(std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kGenerateSeries, {}, std::move(capture));
-}
+
 inline Pattern RecursiveCte(Pattern anchor = Any(), Pattern recursive = Any(),
                             std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kRecursiveCte,
                      {std::move(anchor), std::move(recursive)},
                      std::move(capture));
 }
-inline Pattern WorkTableScan(std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kWorkTableScan, {}, std::move(capture));
-}
-inline Pattern Materialize(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kMaterialize, {std::move(child)},
-                     std::move(capture));
-}
-inline Pattern EagerSpool(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kEagerSpool, {std::move(child)},
-                     std::move(capture));
-}
-inline Pattern LazySpool(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kLazySpool, {std::move(child)},
-                     std::move(capture));
-}
-inline Pattern Expand(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kExpand, {std::move(child)},
-                     std::move(capture));
-}
+
 inline Pattern UnaryApply(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kApply, {std::move(child)},
                      std::move(capture));
@@ -553,30 +567,12 @@ inline Pattern Apply(Pattern left = Any(), Pattern right = Any(),
   return Pattern::Op(LogicalOperator::kApply,
                      {std::move(left), std::move(right)}, std::move(capture));
 }
-inline Pattern Exchange(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kExchange, {std::move(child)},
-                     std::move(capture));
-}
-inline Pattern Gather(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kGather, {std::move(child)},
-                     std::move(capture));
-}
-inline Pattern Broadcast(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kBroadcast, {std::move(child)},
-                     std::move(capture));
-}
-inline Pattern Redistribute(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kRedistribute, {std::move(child)},
-                     std::move(capture));
-}
+
 inline Pattern Sample(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kSample, {std::move(child)},
                      std::move(capture));
 }
-inline Pattern Assert(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kAssert, {std::move(child)},
-                     std::move(capture));
-}
+
 }  // namespace dsl
 
 class Rule {
@@ -686,26 +682,19 @@ struct PhysicalProperties {
   bool operator==(const PhysicalProperties&) const = default;
 };
 
-struct JoinCardinalityEstimate {
-  double rows{0.0};
-  JoinMultiplicity multiplicity{JoinMultiplicity::kUnknown};
-};
+// Whether `plan`'s delivered ordering may stand in for the ordering
+// `required` asks for. The required property states the collation its
+// consumer compares under (PhysicalProperties::collation; "" is the engine
+// default, binary byte order), and a plan only satisfies a requirement stated
+// under the collation it was actually produced under: under 'und:ci' 'a'
+// sorts before 'B' while under binary 'B' sorts before 'a', so the two orders
+// are not interchangeable even though they agree on every ASCII pair that
+// differs only in case. Scan and index orders carry the engine default, so a
+// collated ORDER BY never folds into a stored order.
+[[nodiscard]] bool SatisfiesOrderingCollation(
+    const Plan& plan, const PhysicalProperties& required);
 
-[[nodiscard]] JoinCardinalityEstimate EstimateJoinCardinality(
-    double left_rows, double right_rows, bool left_is_unique,
-    bool right_is_unique, double selectivity = 1.0);
-
-enum class OperatorCostKind : uint8_t {
-  kHashJoin,
-  kMergeJoin,
-  kNestedLoopJoin,
-  kIndexScan,
-  kBitmapScan,
-  kSort
-};
-
-[[nodiscard]] double EstimateMultiColumnSelectivity(
-    const std::vector<double>& selectivities, double correlation_factor = 0.0);
+enum class OperatorCostKind : uint8_t { kHashJoin, kSort };
 
 // Per-equality-key selectivities (each 1/max(NDV)) combined when the catalog
 // has no cross-column NDV. A single key returns that selectivity. Further
@@ -713,27 +702,6 @@ enum class OperatorCostKind : uint8_t {
 // fourth root, ...), between the max-NDV model and full independence.
 [[nodiscard]] double EstimateEquijoinSelectivity(
     const std::vector<double>& key_selectivities);
-
-enum class PatternMatchingKind : uint8_t { kLike, kRegexp };
-
-[[nodiscard]] double EstimatePatternSelectivity(
-    PatternMatchingKind kind, std::string_view pattern,
-    double domain_cardinality = 1000.0);
-
-struct HistogramBucket {
-  double lower{0.0};
-  double upper{0.0};
-  double count{0.0};
-  double distinct_count{0.0};
-};
-
-[[nodiscard]] double EstimateHistogramJoinCardinality(
-    const std::vector<HistogramBucket>& left_buckets,
-    const std::vector<HistogramBucket>& right_buckets);
-
-[[nodiscard]] double EstimateStarJoinCost(
-    double fact_rows, const std::vector<double>& dimension_rows,
-    const std::vector<double>& selectivities = {});
 
 struct MemoryBudget {
   double max_memory_bytes{64.0 * 1024.0 * 1024.0};
@@ -745,19 +713,20 @@ struct MemoryBudget {
                                              double input_rows,
                                              const MemoryBudget& budget = {});
 
-[[nodiscard]] double CalibrateOperatorCost(OperatorCostKind kind,
-                                           double input_rows_left,
-                                           double input_rows_right,
-                                           const PhysicalProperties& delivered,
-                                           const PhysicalProperties& required);
-
 struct PlanAlternative {
   Plan plan;
   double local_cost{0};
   // Estimated output rows of this alternative (Phase 6); parents combine it
   // into join cardinalities and sort penalties.
   double estimated_rows{0};
+  std::string rule_name{};
+  PhysicalProperties required_properties{};
+  PhysicalProperties provided_properties{};
 };
+
+void AttachPlanExplainInfo(PlanAlternative& alternative,
+                           const PhysicalProperties& required,
+                           const RuleContext& context);
 
 class ImplementationRule {
  public:
@@ -866,9 +835,12 @@ class SearchEngine {
   std::unordered_map<GroupId, size_t> next_expression_;
   std::unordered_map<std::string, std::optional<BestPlan>> best_;
   std::unordered_set<std::string> applied_rules_;
+  std::unordered_set<std::string> optimizing_;
   // Diagnostics: per-rule application counts, dumped from Explore() when
   // TINYLAMB_RULE_STATS is set (planning-cost attribution only).
   std::unordered_map<std::string, size_t> rule_attempt_counts_;
+  // Temporary profiling (TINYLAMB_RULE_STATS=1): nanoseconds per rule name.
+  std::unordered_map<std::string, uint64_t> rule_attempt_nanos_;
   bool rule_stats_{false};
   size_t step_budget_{0};
   size_t steps_{0};

@@ -123,8 +123,7 @@ graph TD
 ## 関連 Rule との相互作用
 
 - `merge_projections`: 適用後に外側射影と下流の射影が隣接すれば合成されます。
-- `aggregate_projection_merge`: 隣接する射影を集約に**吸収**して 1 演算に
-  する Rule。本 Rule とは逆方向(演算数を減らす)の整理で併用されます。
+
 - `push_selection_through_aggregation`: フィルタを集約の下へ押し込む兄弟
   Rule です。
 

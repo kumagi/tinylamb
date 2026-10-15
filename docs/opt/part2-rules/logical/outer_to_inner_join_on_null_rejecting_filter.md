@@ -1,6 +1,6 @@
 # outer_to_inner_join_on_null_rejecting_filter
 
-- 状態: draft   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: draft   /   執筆基準リビジョン: `9ce7837` (2026-09-25)
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録名 `"outer_to_inner_join_on_null_rejecting_filter"`）
 
 ## 概要
@@ -110,5 +110,7 @@ SQL 意味論において、外部結合の結合述語（ON 節 $p$）は NULL 
   `t2.val IS NOT NULL` により内部結合への降格が発生することを確認します。
 - `CascadesTest.OuterToInnerJoinNullAllowingPredicateDoesNotRewrite`:
   `t2.val IS NULL` において内部結合化が抑止されることを確認します。
+- `CascadesTest.NonRejectingRightFilterKeepsEveryOuterKind`:
+  `COALESCE(right.val, 0) = 0` のように NULL を受理する右側 filter が LEFT/RIGHT/FULL を縮約しないことを確認します。
 - `CascadesTest.OuterToInnerJoinCoalesceDoesNotRewrite`:
   `COALESCE(t2.val, 0) = 0` のように NULL を値化する述語において降格が抑止されることを確認します。

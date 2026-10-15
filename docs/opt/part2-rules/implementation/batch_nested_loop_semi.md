@@ -121,7 +121,6 @@ return {PlanAlternative{.plan = std::move(join),
 - `semi_hash_join` / `semi_merge_join`: 等値キー対を持つ半結合を担当する物理実装 Rule です。ゲート条件によって適用領域が排他的に分離されます。
 - `batch_nested_loop`: 同一のビルダ関数を共有する内部結合版 Rule です。タプル版との同点でフォールバックとなりますが、半結合にはタプル版が存在しないため本 Rule が主たる実行手段となります。
 - `batch_nested_loop_anti`: 同一のビルダ関数を共有する反結合版 Rule です。
-- `unique_semi_to_inner` / `semijoin_to_inner_plus_distinct` / `in_list_to_semi_join`: 半結合を導入・変換する論理 Rule 群であり、本 Rule への入力を生成します。
 
 ## 検証テスト
 

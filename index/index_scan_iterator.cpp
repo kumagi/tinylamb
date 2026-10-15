@@ -239,17 +239,25 @@ void IndexScanIterator::ResolveRow() const {
     // row once resolution failed.
     const_cast<IndexScanIterator*>(this)->status_ = ref.GetStatus();
     current_row_.Clear();
+    const_cast<IndexScanIterator*>(this)->Clear();
     current_row_resolved_ = true;
     return;
   }
-  if (!ref.Value().IsValid()) {
+  if (!ref.Value().IsValid() || ref.Value().IsNull() ||
+      ref.Value()->Type() != PageType::kRowPage) {
+    const_cast<IndexScanIterator*>(this)->status_ = Status::kCorrupt;
     current_row_.Clear();
+    const_cast<IndexScanIterator*>(this)->Clear();
     current_row_resolved_ = true;
     return;
   }
   StatusOr<std::string_view> row =
       ref.Value()->Read(txn_, pos_.slot, resolve_head_);
   if (!row.HasValue()) {
+    if (row.GetStatus() != Status::kNotExists) {
+      const_cast<IndexScanIterator*>(this)->status_ = row.GetStatus();
+      const_cast<IndexScanIterator*>(this)->Clear();
+    }
     current_row_.Clear();
     current_row_resolved_ = true;
     return;

@@ -14,12 +14,23 @@ Namespace `relational_detail`. Promotion to a real layer is an open A5 item.
   (`Evaluate/Lookup/Binary/Like/Truthy`) + aggregation accumulators
   (SUM/MIN/MAX, stats, HLL/KLL, APPROX_TOP…). Former three-valued-logic and
   numeric-edge divergences are fixed by delegating to the canonical evaluator.
+  It also owns the *grouped* key contract: `CanonicalDistinctValue` plus
+  `GroupKeyEqual` / `GroupKeyTransparentHash` / `GroupKeyMap` (NULL is one
+  group, NaN one peer, -0 folds, a case-insensitive key folds), shared by the
+  relational grouping loop and the physical grouped aggregation shapes
+  (`executor/grouped_aggregate.hpp`) so both agree on "the same group".
 - `scan_filter.{hpp,cpp}` — `CompiledScanFilter` (+ residual bytecode):
-  `Match/LoadSource/FilterRelation`.
+  `Match/LoadSource/FilterRelation`. `LoadSource` takes an optional
+  `ScanRuntimeFilter` (group + projected column + comparison domain), the
+  relational-path form of the dynamic join filter published in
+  `common/runtime_filter.hpp`; it is applied as a pre-decode peek when the
+  guarded column maps into the scan, and post-decode otherwise.
 - `planning_heuristics.{hpp,cpp}` — predicate analysis, join order/shape
   choices (`AnalyzePredicates/Join/InnerJoin/HybridHashJoin/BuildInput`),
   outer→inner reduction.
 - `subquery_runtime.{hpp,cpp}` — `Scope/CteMap/ExecutionRuntime`,
+  `TableKeyFilter` (the owner-scoped stash of a published dynamic filter; the
+  filter is a `RuntimeFilterGroup`, not a bare key set),
   `ExecuteQuery/FinishQuery/ExecuteRecursiveCte`, correlated-index and
   uncorrelated-fingerprint caches, `OptimizeDerivedBoundaries`.
 - `window_eval.*`, `explain_format.*` — window evaluation, EXPLAIN rendering.

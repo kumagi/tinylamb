@@ -21,6 +21,7 @@
 #include <optional>
 #include <ostream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -81,7 +82,33 @@ TableStatistics ProjectedStats(const TableStatistics& source,
     if (source_offset >= 0 &&
         static_cast<size_t>(source_offset) < source.Columns()) {
       columns.push_back(source.Column(static_cast<size_t>(source_offset)));
-    } else if (i < output_schema.ColumnCount()) {
+      continue;
+    }
+    // A computed expression loses the source column's per-value stats, but a
+    // transform of a single column that keeps its result type (UPPER(x),
+    // x || 's', CAST-preserving arithmetic) still describes the same row mass
+    // and an upper bound on distinct values. Carrying that prior keeps a
+    // Selection above the projection from collapsing to "estimated rows: 0".
+    // Type-changing transforms (EXTRACT(year FROM d)) and multi-column
+    // expressions fall through to the neutral unmeasured column: a wrong
+    // domain's histogram would fabricate selectivities instead of guessing.
+    if (expression) {
+      const std::unordered_set<ColumnName> touched =
+          expression->TouchedColumns();
+      if (touched.size() == 1) {
+        const int touched_offset = source_schema.Offset(*touched.begin());
+        if (touched_offset >= 0 &&
+            static_cast<size_t>(touched_offset) < source.Columns() &&
+            StaticResultValueType(expression, source_schema) ==
+                source_schema.GetColumn(static_cast<size_t>(touched_offset))
+                    .Type()) {
+          columns.push_back(source.Column(static_cast<size_t>(touched_offset))
+                                .UntransformedPrior());
+          continue;
+        }
+      }
+    }
+    if (i < output_schema.ColumnCount()) {
       columns.emplace_back(output_schema.GetColumn(i).Type());
     } else {
       columns.emplace_back();

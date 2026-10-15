@@ -1677,6 +1677,55 @@ TEST(ExpressionRewriteTest, JsonPathConstantFold) {
   EXPECT_EQ(rewritten_root->AsConstantValue().GetValue(), Value("{\"x\":42}"));
 }
 
+// The JSON document family folds all-constant calls at rewrite time through
+// the same json_doc implementation both evaluators execute.
+TEST(ExpressionRewriteTest, JsonFamilyConstantFold) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression type_call =
+      FunctionCallExp("json_type", {ConstantValueExp(Value(R"({"a": [1]})")),
+                                    ConstantValueExp(Value("$.a"))});
+  Expression rewritten_type = rewriter.Rewrite(type_call);
+  ASSERT_EQ(rewritten_type->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_type->AsConstantValue().GetValue(), Value("array"));
+
+  Expression keys_call =
+      FunctionCallExp("json_keys", {ConstantValueExp(Value(R"({"z": 0})"))});
+  Expression rewritten_keys = rewriter.Rewrite(keys_call);
+  ASSERT_EQ(rewritten_keys->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_keys->AsConstantValue().GetValue(),
+            Value::Array({Value("z")}, "STRING"));
+
+  Expression set_call = FunctionCallExp(
+      "json_set", {ConstantValueExp(Value(R"({"a": 1})")),
+                   ConstantValueExp(Value("$.b")), ConstantValueExp(Value(2))});
+  Expression rewritten_set = rewriter.Rewrite(set_call);
+  ASSERT_EQ(rewritten_set->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_set->AsConstantValue().GetValue(),
+            Value(R"({"a":1,"b":2})"));
+
+  Expression lax_call =
+      FunctionCallExp("lax_int64", {ConstantValueExp(Value("5.9"))});
+  Expression rewritten_lax = rewriter.Rewrite(lax_call);
+  ASSERT_EQ(rewritten_lax->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_lax->AsConstantValue().GetValue(), Value(int64_t{5}));
+
+  // Column input stays row-wise: the fold must not fire.
+  Expression row_call = FunctionCallExp(
+      "json_type", {ColumnValueExp("doc"), ConstantValueExp(Value("$"))});
+  Expression rewritten_row = rewriter.Rewrite(row_call);
+  EXPECT_EQ(rewritten_row->Type(), TypeTag::kFunctionCallExp);
+
+  // Errors are not folded into constants; the call keeps evaluating per row
+  // so the error surfaces at execution with the standard message.
+  Expression error_call =
+      FunctionCallExp("json_set", {ConstantValueExp(Value("[1]")),
+                                   ConstantValueExp(Value("$[7]")),
+                                   ConstantValueExp(Value(9))});
+  Expression rewritten_error = rewriter.Rewrite(error_call);
+  EXPECT_EQ(rewritten_error->Type(), TypeTag::kFunctionCallExp);
+}
+
 TEST(ExpressionRewriteTest, NumericWideningCast) {
   ExpressionRewriter rewriter(ExpressionRuleSet::Default());
 

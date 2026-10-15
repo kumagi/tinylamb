@@ -126,7 +126,7 @@ return {PlanAlternative{.plan = std::move(join),
 - `anti_hash_join` / `anti_merge_join`: 等値キー対を持つ反結合を担当する物理実装 Rule です。等値キー対の有無により本 Rule と適用領域が厳密に排他分離されます。
 - `batch_nested_loop_semi`: 同一のビルダ関数 `BatchNestedLoopFor` を共有する対称的な Rule です。`SemiJoinKind` を指定して結合結果を probe 側に畳み込みます。
 - `outer_to_anti_join` / `except_to_antijoin`: 論理反結合演算子 `kAntiJoin` を生成する論理 Rule であり、本 Rule に探索対象の入力を供給します。
-- `mark_hash_join`: MARK 結合演算子を担当する実装 Rule です。
+
 
 ## 検証テスト
 

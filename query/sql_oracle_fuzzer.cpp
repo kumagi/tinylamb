@@ -2794,6 +2794,76 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     }
   }
 
+  {
+    const int ordinal_column = g.Pick(0, 1);
+    const bool descending = g.Chance(50);
+    const int explicit_nulls = g.Pick(0, 2);
+    const bool nulls_first =
+        explicit_nulls == 0 ? !descending : explicit_nulls == 1;
+    const std::string nulls_clause =
+        explicit_nulls == 0 ? ""
+                            : (nulls_first ? " NULLS FIRST" : " NULLS LAST");
+    const std::string primary = std::to_string(ordinal_column + 1) +
+                                (descending ? " DESC" : "") + nulls_clause;
+    const std::string tie = ordinal_column == 0 ? ", a" : ", u";
+    const std::string inner =
+        "SELECT u, a FROM " + tab + " WHERE " + t.predicate;
+    const int shape = g.Pick(0, 2);
+    std::string sql;
+    if (shape == 0) {
+      sql = "SELECT * FROM (" + inner + ") q ORDER BY " + primary + tie;
+    } else if (shape == 1) {
+      sql =
+          "WITH q AS (" + inner + ") SELECT * FROM q ORDER BY " + primary + tie;
+    } else {
+      sql = "SELECT * FROM (" + inner + " UNION ALL " + inner +
+            ") q ORDER BY " + primary + tie;
+    }
+    const bool doubled = shape == 2;
+    std::vector<const MirrorRow*> rows;
+    for (const MirrorRow& row : mirror) {
+      if (pred->Eval(row) != 'T') {
+        continue;
+      }
+      rows.push_back(&row);
+      if (doubled) {
+        rows.push_back(&row);
+      }
+    }
+    std::stable_sort(
+        rows.begin(), rows.end(),
+        [&](const MirrorRow* left, const MirrorRow* right) {
+          const int64_t lv = ordinal_column == 0 ? left->u : left->a;
+          const int64_t rv = ordinal_column == 0 ? right->u : right->a;
+          const bool lnull = lv == kNull;
+          const bool rnull = rv == kNull;
+          if (lnull != rnull) {
+            return nulls_first ? lnull : rnull;
+          }
+          if (!lnull && lv != rv) {
+            return descending ? lv > rv : lv < rv;
+          }
+          return left->u < right->u;
+        });
+    const auto total = static_cast<int64_t>(rows.size());
+    int64_t limit = -1;
+    int64_t offset = 0;
+    if (g.Chance(60)) {
+      limit = g.Pick(0, static_cast<int>(total) + 2);
+      sql += " LIMIT " + std::to_string(limit);
+      if (g.Chance(40)) {
+        offset = g.Pick(0, static_cast<int>(total) + 1);
+        sql += " OFFSET " + std::to_string(offset);
+      }
+    }
+    t.ordinal_order = {sql + ";"};
+    const int64_t end = std::min(total, offset + (limit < 0 ? total : limit));
+    for (int64_t i = offset; i < end; ++i) {
+      t.ordinal_order_expect.push_back(ExpectRow(
+          {rows[static_cast<size_t>(i)]->u, rows[static_cast<size_t>(i)]->a}));
+    }
+  }
+
   // ---- HAVING over grouped aggregates ----
   // Aggregates stay in INT64 so the mirror formats identically; NULL-valued
   // aggregates (empty SUM, all-NULL MIN/MAX) make the HAVING condition
@@ -3226,6 +3296,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->troc_ran = !t.troc.empty();
     stats->setop_ran = t.setop.size() == 1;
     stats->orderby_ran = t.orderby.size() == 1;
+    stats->ordinal_order_ran = t.ordinal_order.size() == 1;
     stats->ties_ran = t.ties.size() == 1;
     stats->having_ran = t.having.size() == 1;
     stats->cte_ran = t.cte.size() == 2;
@@ -3267,7 +3338,10 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
                      /*ordered=*/false, "SETOP", &report, verbose) ||
       !CheckExpected(db, ctx, trace.orderby, trace.orderby_expect,
                      /*ordered=*/true, "ORDERBY", &report, verbose) ||
+      !CheckExpected(db, ctx, trace.ordinal_order, trace.ordinal_order_expect,
+                     /*ordered=*/true, "ORDINAL_ORDER", &report, verbose) ||
       !CheckExpected(db, ctx, trace.ties, trace.ties_expect,
+
                      /*ordered=*/false, "TIES", &report, verbose) ||
       !CheckExpected(db, ctx, trace.having, trace.having_expect,
                      /*ordered=*/false, "HAVING", &report, verbose) ||
@@ -3401,6 +3475,12 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& row : trace.orderby_expect) {
     out += "-- orderbyexpect: " + row + "\n";
+  }
+  for (const std::string& sql : trace.ordinal_order) {
+    out += "-- ordinalorder: " + sql + "\n";
+  }
+  for (const std::string& row : trace.ordinal_order_expect) {
+    out += "-- ordinalorderexpect: " + row + "\n";
   }
   for (const std::string& sql : trace.ties) {
     out += "-- ties: " + sql + "\n";
@@ -3543,6 +3623,10 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->orderby.push_back(value);
     } else if (consume("-- orderbyexpect: ", &value)) {
       trace->orderby_expect.push_back(value);
+    } else if (consume("-- ordinalorder: ", &value)) {
+      trace->ordinal_order.push_back(value);
+    } else if (consume("-- ordinalorderexpect: ", &value)) {
+      trace->ordinal_order_expect.push_back(value);
     } else if (consume("-- ties: ", &value)) {
       trace->ties.push_back(value);
     } else if (consume("-- tiesexpect: ", &value)) {

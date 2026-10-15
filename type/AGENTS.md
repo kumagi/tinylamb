@@ -8,7 +8,19 @@ serializes through here; depends only on `common/`.
 - `value.hpp`/`value.cpp` (+ `value_type.hpp`, zero-dependency enum header
   also included from `common/`) — `ValueType{kNull/kInt64/kVarChar/kDouble/
   kDate/kArray}`, type-safe operators, `Serialize` / memcomparable encoding
-  (index-key ordering).
+  (index-key ordering), `CompareForOrderBy` (the ORDER BY total order).
+- `collation.{hpp,cpp}` — **the comparison contract for ordering**:
+  `Collation{kNone/kBinary/kCaseInsensitive}` decoded from `Value`'s tag
+  (tag 3 is the unsigned marker, not a collation), `ResolveCollation`
+  (either side folds, matching the `=` predicate),
+  `ApplyCollation`/`ApplyKeyCollation` (ASCII-only fold, the one fold rule
+  `expression::FoldCase` and `CanonicalDistinctValue` delegate to),
+  `CompareVarCharForOrderBy` (the shared ENUM rank + fold), 
+  `CompareWithCollation`/`CompareUnderCollation`/`EqualUnderCollation`
+  (peer equality with DISTINCT's NaN/-0.0 canonicalization) and
+  `SortKeyOrder` + `MakeSortKeyOrder` (NULL placement, direction, collation —
+  what every sort-shaped operator resolves its keys through). No locale
+  collation: a non-`binary` spec folds, non-ASCII keeps byte order.
 - `row.{hpp,cpp}` — `Row{vector<Value>}`: `Serialize`/`Deserialize` (needs a
   `Schema`), `TryPeekInteger` (INT64/DATE fast path), `Extract`/`operator+`
   (join concatenation).
@@ -29,4 +41,5 @@ pins across AST/Bytecode/JIT.
 Note: `type/column.hpp -> page/row_position.hpp` (constants only) is an
 allowlisted edge in `scripts/check_layering.py`.
 
-Test: `./build/value_test`, `row_test`, `schema_test`, `constraint_test`.
+Test: `./build/value_test`, `collation_test`, `row_test`, `schema_test`,
+`constraint_test`.

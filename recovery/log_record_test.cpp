@@ -20,15 +20,18 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <ios>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/crc32c.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/serdes.hpp"
@@ -38,6 +41,41 @@
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
+namespace {
+
+std::string ReferenceSerialize(const LogRecord& record) {
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << record;
+  std::string bytes = stream.str();
+  const uint32_t crc = Crc32C(bytes.data(), bytes.size());
+  const std::array<char, sizeof(uint32_t)> crc_bytes{
+      static_cast<char>((crc >> 24) & 0xFF),
+      static_cast<char>((crc >> 16) & 0xFF),
+      static_cast<char>((crc >> 8) & 0xFF), static_cast<char>(crc & 0xFF)};
+  bytes.append(crc_bytes.data(), crc_bytes.size());
+  return bytes;
+}
+
+LogRecord TestAllocation(lsn_t prev_lsn, txn_id_t txn, page_id_t pid,
+                         PageType page_type,
+                         PageAllocationKind kind = PageAllocationKind::kFresh) {
+  if (kind == PageAllocationKind::kFresh) {
+    return LogRecord::AllocatePageLogRecord(
+        prev_lsn, txn, pid, page_type, kind, PageType::kFreePage, {},
+        EncodeAllocationMetaPayload(0, pid - 1));
+  }
+  if (kind == PageAllocationKind::kRecycled) {
+    return LogRecord::AllocatePageLogRecord(
+        prev_lsn, txn, pid, page_type, kind, PageType::kFreePage,
+        EncodeAllocationFreePayload(0, txn),
+        EncodeAllocationMetaPayload(pid, pid));
+  }
+  return LogRecord::AllocatePageLogRecord(
+      prev_lsn, txn, pid, page_type, kind, PageType::kRowPage,
+      std::string(kPageBodySize, 'a'), EncodeAllocationMetaPayload(0, pid));
+}
+}  // namespace
 
 class LogRecordTest : public ::testing::Test {
  protected:
@@ -169,8 +207,7 @@ TEST_F(LogRecordTest, check) {
 
   // Arrange -- Page manipulation logs (AllocatePage / DestroyPage)
   // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality
-  SerializeDeserializeCheck(
-      LogRecord::AllocatePageLogRecord(15, 7, 10, PageType::kMetaPage));
+  SerializeDeserializeCheck(TestAllocation(15, 7, 10, PageType::kRowPage));
   SerializeDeserializeCheck(LogRecord::DestroyPageLogRecord(16, 8, 21));
 
   // Arrange -- Lowest value log (SetLowest with 5 fields)
@@ -209,7 +246,13 @@ TEST_F(LogRecordTest, SerializationSizeMatchesSerialize) {
       LogRecord::SetFosterLogRecord(1, 2, 3, FosterPair("new", 4),
                                     FosterPair("old", 5)),
       LogRecord::SetLowestLogRecord(1, 2, 3, 4, 5),
-      LogRecord::AllocatePageLogRecord(1, 2, 3, PageType::kRowPage),
+      LogRecord::SetRowPageNextLogRecord(1, 2, 3, 4, 5),
+      LogRecord::SetRowPagePrevLogRecord(1, 2, 3, 4, 5),
+      LogRecord::CompensateSetRowPageNextLogRecord(1, 2, 3, 4),
+      LogRecord::CompensateSetRowPagePrevLogRecord(1, 2, 3, 4),
+      TestAllocation(1, 2, 3, PageType::kRowPage),
+      LogRecord::CompensateAllocatePageLogRecord(
+          TestAllocation(1, 2, 3, PageType::kRowPage)),
       LogRecord::DestroyPageLogRecord(1, 2, 3),
       LogRecord::BeginCheckpointLogRecord(),
       LogRecord::EndCheckpointLogRecord(
@@ -220,6 +263,322 @@ TEST_F(LogRecordTest, SerializationSizeMatchesSerialize) {
   for (const auto& log : records) {
     SCOPED_TRACE(static_cast<uint16_t>(log.type));
     ASSERT_EQ(log.Serialize().size(), log.Size());
+  }
+}
+
+TEST_F(LogRecordTest, SerializeToMatchesSerializeForRepresentativeRecords) {
+  const std::string embedded("a\0b", 3);
+  const std::vector<LogRecord> records{
+      LogRecord(1, 2, LogType::kBegin),
+      LogRecord::InsertingLeafLogRecord(3, 4, 5, std::string("k\0", 2),
+                                        embedded),
+      LogRecord::UpdatingLeafLogRecord(6, 7, 8, "key", {}, embedded),
+      LogRecord::DestroyPageLogRecord(9, 10, 11, PageType::kRowPage, embedded),
+      LogRecord::CompensateDestroyPageLogRecord(12, 13, PageType::kLeafPage,
+                                                embedded),
+      LogRecord::FullPageImageLogRecord(14, PageType::kRowPage, embedded),
+      LogRecord::EndCheckpointLogRecord({{1, 2}, {3, 4}},
+                                        {{5, TransactionStatus::kRunning, 6}}),
+  };
+
+  for (const LogRecord& record : records) {
+    SCOPED_TRACE(static_cast<uint16_t>(record.type));
+    const std::string expected = ReferenceSerialize(record);
+    EXPECT_EQ(record.Serialize(), expected);
+    std::string direct;
+    record.SerializeTo(direct);
+    EXPECT_EQ(direct, expected);
+
+    std::string appended = "prefix";
+    record.SerializeTo(appended);
+    EXPECT_EQ(appended, "prefix" + expected);
+  }
+}
+
+TEST_F(LogRecordTest, SerializeToWritesExactV6HeaderAndCrc) {
+  const LogRecord record(0x0102030405060708ULL, 0x1112131415161718ULL,
+                         LogType::kBegin);
+  static constexpr std::array<char, 32> expected_bytes = {
+      "\x54\x59\x42\x31"
+      "\x00\x00\x00\x06"
+      "\x00\x01"
+      "\x01\x02\x03\x04\x05\x06\x07\x08"
+      "\x11\x12\x13\x14\x15\x16\x17\x18"
+      "\x00"
+      "\xa7\x9c\x60\xbe"};
+  static_assert(expected_bytes.size() == 32);
+  const std::string expected(expected_bytes.data(), expected_bytes.size() - 1);
+
+  std::string actual;
+  record.SerializeTo(actual);
+  EXPECT_EQ(actual, expected);
+
+  std::string appended = "p";
+  record.SerializeTo(appended);
+  EXPECT_EQ(appended, std::string("p") + expected);
+}
+
+TEST_F(LogRecordTest, RowPageLinkRecordsRoundTrip) {
+  const std::vector<LogRecord> records{
+      LogRecord::SetRowPageNextLogRecord(11, 22, 33, 44, 55),
+      LogRecord::SetRowPagePrevLogRecord(12, 23, 34, 45, 56),
+      LogRecord::CompensateSetRowPageNextLogRecord(13, 24, 35, 57),
+      LogRecord::CompensateSetRowPagePrevLogRecord(14, 25, 36, 58),
+  };
+  for (const LogRecord& record : records) {
+    EXPECT_EQ(record.Serialize().size(), record.Size());
+    SerializeDeserializeCheck(record);
+  }
+}
+
+TEST_F(LogRecordTest, VersionFourRecordStillDecodes) {
+  const LogRecord source = LogRecord::SetLowestLogRecord(1, 2, 3, 4, 5);
+  std::string v4 = source.Serialize();
+  SerializeU32(v4.data() + sizeof(uint32_t), 4);
+  const size_t body_size = v4.size() - kWalRecordCrcSize;
+  const uint32_t crc = Crc32C(v4.data(), body_size);
+  v4[body_size] = static_cast<char>((crc >> 24) & 0xff);
+  v4[body_size + 1] = static_cast<char>((crc >> 16) & 0xff);
+  v4[body_size + 2] = static_cast<char>((crc >> 8) & 0xff);
+  v4[body_size + 3] = static_cast<char>(crc & 0xff);
+
+  std::istringstream input(v4, std::istringstream::binary);
+  Decoder decoder(input);
+  LogRecord decoded;
+  decoder >> decoded;
+  ASSERT_FALSE(decoder.Failed());
+  EXPECT_EQ(decoded.wire_version, 4U);
+  EXPECT_EQ(decoded.type, LogType::kLowestValue);
+  EXPECT_EQ(decoded.redo_page, 4U);
+  EXPECT_EQ(decoded.undo_page, 5U);
+}
+
+TEST_F(LogRecordTest, VersionSixAllocationPayloadRoundTrips) {
+  for (const PageAllocationKind kind :
+       {PageAllocationKind::kFresh, PageAllocationKind::kRecycled,
+        PageAllocationKind::kInPlace}) {
+    LogRecord record = TestAllocation(91, 17, 23, PageType::kRowPage, kind);
+    EXPECT_EQ(record.redo_data.size(), kAllocationMetaPayloadSize);
+    if (kind == PageAllocationKind::kFresh) {
+      EXPECT_TRUE(record.undo_data.empty());
+      EXPECT_LT(record.Size(), 1024U);
+    } else if (kind == PageAllocationKind::kRecycled) {
+      EXPECT_EQ(record.undo_data.size(), kAllocationFreePayloadSize);
+      EXPECT_LT(record.Size(), 1024U);
+    } else {
+      EXPECT_EQ(record.undo_data.size(), kPageBodySize);
+      EXPECT_GE(record.Size(), kPageBodySize);
+      EXPECT_LT(record.Size(), kPageBodySize + 1024U);
+      EXPECT_EQ(record.undo_data.size(), kPageBodySize);
+      record.undo_data.front() = '\0';
+      record.undo_data.back() = '\x7f';
+    }
+    page_id_t old_first = 0;
+    page_id_t old_max = 0;
+    ASSERT_TRUE(
+        DecodeAllocationMetaPayload(record.redo_data, &old_first, &old_max));
+    EXPECT_LE(old_first, old_max);
+    ASSERT_EQ(record.Serialize().size(), record.Size());
+    EXPECT_EQ(static_cast<unsigned char>(record.Serialize()[7]),
+              kWalRecordVersion);
+    SerializeDeserializeCheck(record);
+
+    const LogRecord clr =
+        LogRecord::CompensateAllocatePageLogRecord(record, 55);
+    EXPECT_EQ(clr.type, LogType::kCompensateAllocPage);
+    EXPECT_EQ(clr.prev_lsn, 55U);
+    EXPECT_EQ(clr.allocation_kind, kind);
+    EXPECT_EQ(clr.undo_data, record.undo_data);
+    EXPECT_EQ(clr.redo_data, record.redo_data);
+    EXPECT_EQ(clr.Serialize().size(), clr.Size());
+    SerializeDeserializeCheck(clr);
+  }
+}
+
+TEST_F(LogRecordTest, AllocationPayloadUsesStableBigEndianLayout) {
+  EXPECT_EQ(
+      EncodeAllocationMetaPayload(0x0102030405060708ULL, 0x1112131415161718ULL),
+      std::string("\x01\x02\x03\x04\x05\x06\x07\x08"
+                  "\x11\x12\x13\x14\x15\x16\x17\x18",
+                  16));
+  EXPECT_EQ(
+      EncodeAllocationFreePayload(0x2122232425262728ULL, 0x3132333435363738ULL),
+      std::string("\x21\x22\x23\x24\x25\x26\x27\x28"
+                  "\x31\x32\x33\x34\x35\x36\x37\x38",
+                  16));
+
+  page_id_t first_free = 0;
+  page_id_t max_page = 0;
+  ASSERT_TRUE(DecodeAllocationMetaPayload(EncodeAllocationMetaPayload(41, 73),
+                                          &first_free, &max_page));
+  EXPECT_EQ(first_free, 41U);
+  EXPECT_EQ(max_page, 73U);
+
+  page_id_t next_free = 0;
+  txn_id_t destroyer = 0;
+  ASSERT_TRUE(DecodeAllocationFreePayload(EncodeAllocationFreePayload(17, 91),
+                                          &next_free, &destroyer));
+  EXPECT_EQ(next_free, 17U);
+  EXPECT_EQ(destroyer, 91U);
+  EXPECT_FALSE(DecodeAllocationMetaPayload({}, &first_free, &max_page));
+  EXPECT_FALSE(DecodeAllocationFreePayload(std::string(15, '\0'), &next_free,
+                                           &destroyer));
+
+  const LogRecord repaired_high_water = LogRecord::AllocatePageLogRecord(
+      0, 1, 3, PageType::kRowPage, PageAllocationKind::kRecycled,
+      PageType::kFreePage, EncodeAllocationFreePayload(5, 1),
+      EncodeAllocationMetaPayload(3, 2));
+  EXPECT_EQ(repaired_high_water.redo_data, EncodeAllocationMetaPayload(3, 2));
+  SerializeDeserializeCheck(repaired_high_water);
+
+  const LogRecord forced_fresh = LogRecord::AllocatePageLogRecord(
+      0, 1, 1, PageType::kLeafPage, PageAllocationKind::kFresh,
+      PageType::kFreePage, {}, EncodeAllocationMetaPayload(1, 0));
+  EXPECT_TRUE(forced_fresh.undo_data.empty());
+  SerializeDeserializeCheck(forced_fresh);
+}
+
+TEST_F(LogRecordTest, VersionSixAllocationDecoderRejectsMalformedPayloads) {
+  const auto expect_rejected = [](const LogRecord& record) {
+    std::istringstream input(record.Serialize(), std::istringstream::binary);
+    Decoder decoder(input);
+    LogRecord decoded;
+    decoder >> decoded;
+    EXPECT_TRUE(decoder.Failed());
+  };
+
+  LogRecord fresh =
+      TestAllocation(1, 2, 3, PageType::kRowPage, PageAllocationKind::kFresh);
+  LogRecord bad_fresh_undo = fresh;
+  bad_fresh_undo.undo_data.push_back('\0');
+  expect_rejected(bad_fresh_undo);
+
+  LogRecord bad_fresh_meta = fresh;
+  bad_fresh_meta.redo_data = EncodeAllocationMetaPayload(0, 3);
+  expect_rejected(bad_fresh_meta);
+
+  LogRecord recycled = TestAllocation(1, 2, 3, PageType::kRowPage,
+                                      PageAllocationKind::kRecycled);
+  LogRecord bad_recycled_meta = recycled;
+  bad_recycled_meta.redo_data = EncodeAllocationMetaPayload(0, 3);
+  expect_rejected(bad_recycled_meta);
+
+  LogRecord bad_recycled_link = recycled;
+  bad_recycled_link.undo_data = EncodeAllocationFreePayload(3, 2);
+  expect_rejected(bad_recycled_link);
+
+  LogRecord in_place =
+      TestAllocation(1, 2, 3, PageType::kRowPage, PageAllocationKind::kInPlace);
+  LogRecord bad_in_place_body = in_place;
+  bad_in_place_body.undo_data.pop_back();
+  expect_rejected(bad_in_place_body);
+
+  LogRecord bad_in_place_meta = in_place;
+  bad_in_place_meta.previous_page_type = PageType::kMetaPage;
+  expect_rejected(bad_in_place_meta);
+
+  LogRecord bad_target_type = fresh;
+  bad_target_type.allocated_page_type = PageType::kMetaPage;
+  expect_rejected(bad_target_type);
+
+  LogRecord bad_kind = fresh;
+  // Write an out-of-range discriminant without naming it as the enum (the
+  // analyzer rightly rejects casting 3 to PageAllocationKind directly).
+  std::underlying_type_t<PageAllocationKind> invalid_kind = 3;
+  std::memcpy(&bad_kind.allocation_kind, &invalid_kind, sizeof(invalid_kind));
+  expect_rejected(bad_kind);
+}
+
+TEST_F(LogRecordTest, VersionOneThroughFiveAllocationRecordsDecode) {
+  const LogRecord current = TestAllocation(3, 4, 5, PageType::kLeafPage);
+  for (uint32_t version = kLegacyWalRecordVersion;
+       version < kAllocationPayloadWalVersion; ++version) {
+    std::string bytes = current.Serialize();
+    bytes.resize(bytes.size() - (sizeof(uint64_t) + sizeof(uint8_t) +
+                                 SerializeSize(current.undo_data) +
+                                 SerializeSize(current.redo_data)));
+    if (version < kCrcWalRecordVersion) {
+      bytes.resize(bytes.size() - kWalRecordCrcSize);
+    }
+    SerializeU32(bytes.data() + sizeof(uint32_t), version);
+    if (version >= kCrcWalRecordVersion) {
+      const size_t body_size = bytes.size() - kWalRecordCrcSize;
+      const uint32_t crc = Crc32C(bytes.data(), body_size);
+      bytes[body_size] = static_cast<char>((crc >> 24) & 0xff);
+      bytes[body_size + 1] = static_cast<char>((crc >> 16) & 0xff);
+      bytes[body_size + 2] = static_cast<char>((crc >> 8) & 0xff);
+      bytes[body_size + 3] = static_cast<char>(crc & 0xff);
+    }
+
+    std::istringstream input(bytes, std::istringstream::binary);
+    Decoder decoder(input);
+    LogRecord decoded;
+    decoder >> decoded;
+    ASSERT_FALSE(decoder.Failed()) << version;
+    EXPECT_EQ(decoded.type, LogType::kSystemAllocPage);
+    EXPECT_EQ(decoded.wire_version, version);
+    EXPECT_EQ(decoded.allocated_page_type, PageType::kLeafPage);
+    EXPECT_EQ(decoded.previous_page_type, PageType::kUnknown);
+    EXPECT_EQ(decoded.allocation_kind, PageAllocationKind::kFresh);
+    EXPECT_TRUE(decoded.undo_data.empty());
+    EXPECT_TRUE(decoded.redo_data.empty());
+    EXPECT_EQ(decoded.Size(), bytes.size());
+
+    const std::string reserialized = decoded.Serialize();
+    EXPECT_EQ(reserialized.size(), bytes.size());
+    std::istringstream reserialized_input(reserialized,
+                                          std::istringstream::binary);
+    Decoder reserialized_decoder(reserialized_input);
+    LogRecord reparsed;
+    reserialized_decoder >> reparsed;
+    ASSERT_FALSE(reserialized_decoder.Failed()) << version;
+    EXPECT_EQ(reparsed.wire_version, version);
+    EXPECT_EQ(reparsed.Size(), reserialized.size());
+  }
+}
+
+TEST_F(LogRecordTest, SerializeToUpgradesDecodedLegacyRecords) {
+  const LogRecord source = LogRecord::DestroyPageLogRecord(
+      17, 18, 19, PageType::kRowPage, std::string("body\0", 5));
+  for (const uint32_t version : {kLegacyWalRecordVersion, 2U}) {
+    std::string legacy = source.Serialize();
+    if (version == kLegacyWalRecordVersion) {
+      legacy.resize(legacy.size() - sizeof(uint64_t) -
+                    SerializeSize(source.undo_data) - kWalRecordCrcSize);
+    } else {
+      legacy.resize(legacy.size() - kWalRecordCrcSize);
+    }
+    SerializeU32(legacy.data() + 4, version);
+
+    std::istringstream input(legacy, std::istringstream::binary);
+    Decoder decoder(input);
+    LogRecord decoded;
+    decoder >> decoded;
+    ASSERT_FALSE(decoder.Failed());
+    EXPECT_EQ(decoded.wire_version, version);
+    EXPECT_EQ(decoded.Size(), legacy.size());
+
+    const std::string expected = ReferenceSerialize(decoded);
+    EXPECT_EQ(decoded.Serialize(), expected);
+    std::string output;
+    decoded.SerializeTo(output);
+    EXPECT_EQ(output, expected);
+    ASSERT_GT(output.size(), kWalRecordCrcSize);
+    EXPECT_EQ(static_cast<unsigned char>(output[7]), kWalRecordVersion);
+    const size_t body_size = output.size() - kWalRecordCrcSize;
+    const size_t crc_start = body_size;
+    const uint32_t stored_crc =
+        (static_cast<uint32_t>(static_cast<unsigned char>(output[crc_start]))
+         << 24) |
+        (static_cast<uint32_t>(
+             static_cast<unsigned char>(output[crc_start + 1]))
+         << 16) |
+        (static_cast<uint32_t>(
+             static_cast<unsigned char>(output[crc_start + 2]))
+         << 8) |
+        static_cast<uint32_t>(
+            static_cast<unsigned char>(output[crc_start + 3]));
+    EXPECT_EQ(stored_crc, Crc32C(output.data(), body_size));
   }
 }
 
@@ -268,13 +627,19 @@ TEST_F(LogRecordTest, LogTypeStreamOperator) {
                                    LogType::kCompensateSetLowFence,
                                    LogType::kCompensateSetHighFence,
                                    LogType::kCompensateSetFoster,
+                                   LogType::kCompensateSetLowestValue,
+                                   LogType::kSetRowPageNext,
+                                   LogType::kSetRowPagePrev,
+                                   LogType::kCompensateSetRowPageNext,
+                                   LogType::kCompensateSetRowPagePrev,
                                    LogType::kCommit,
                                    LogType::kBeginCheckpoint,
                                    LogType::kEndCheckpoint,
                                    LogType::kSystemAllocPage,
                                    LogType::kSystemDestroyPage,
                                    LogType::kLowestValue,
-                                   LogType::kCompensateDestroyPage};
+                                   LogType::kCompensateDestroyPage,
+                                   LogType::kCompensateAllocPage};
 
   // Act -- stream each type
   // Assert -- the common types print their canonical names
@@ -319,7 +684,9 @@ TEST_F(LogRecordTest, DumpOperatorCoversAllRecordCategories) {
       LogRecord::CompensateSetLowFenceLogRecord(12, 3, 1, IndexKey("redo")),
       LogRecord::CompensateSetHighFenceLogRecord(12, 3, 1, IndexKey("redo")),
       LogRecord::CompensateSetFosterLogRecord(12, 3, 1, FosterPair("new", 4)),
-      LogRecord::AllocatePageLogRecord(12, 3, 1, PageType::kLeafPage),
+      TestAllocation(12, 3, 1, PageType::kLeafPage),
+      LogRecord::CompensateAllocatePageLogRecord(
+          TestAllocation(12, 3, 1, PageType::kLeafPage)),
       LogRecord::DestroyPageLogRecord(12, 3, 1),
       LogRecord::BeginCheckpointLogRecord(),
       LogRecord::EndCheckpointLogRecord(
@@ -384,7 +751,7 @@ TEST_F(LogRecordTest, CompensatingFenceFosterAndLowestConstructors) {
   EXPECT_EQ(low_fence.type, LogType::kCompensateSetLowFence);
   EXPECT_EQ(high_fence.type, LogType::kCompensateSetHighFence);
   EXPECT_EQ(foster.type, LogType::kCompensateSetFoster);
-  EXPECT_EQ(lowest.type, LogType::kLowestValue);
+  EXPECT_EQ(lowest.type, LogType::kCompensateSetLowestValue);
   EXPECT_EQ(low_fence.txn_id, 3);
   EXPECT_EQ(low_fence.pid, 1);
   EXPECT_EQ(low_fence.Serialize().size(), low_fence.Size());
@@ -430,6 +797,54 @@ TEST_F(LogRecordTest, CompensatingFenceRoundTrip) {
   EXPECT_TRUE(parsed.key.empty());
   EXPECT_TRUE(parsed.undo_data.empty());
   EXPECT_EQ(parsed.redo_data, Encode(IndexKey("low-key")));
+}
+
+TEST_F(LogRecordTest, CompensationCarriesUndoNextLsn) {
+  const lsn_t undo_next = 0x123456789abcdef0ULL;
+  EXPECT_EQ(
+      LogRecord::CompensatingInsertLogRecord(7, 11, 3, undo_next).prev_lsn,
+      undo_next);
+  EXPECT_EQ(
+      LogRecord::CompensatingInsertLogRecord(7, 11, "k", undo_next).prev_lsn,
+      undo_next);
+  EXPECT_EQ(LogRecord::CompensatingInsertBranchLogRecord(7, 11, "k", undo_next)
+                .prev_lsn,
+            undo_next);
+  EXPECT_EQ(LogRecord::CompensatingUpdateLogRecord(7, 11, 3, "redo", undo_next)
+                .prev_lsn,
+            undo_next);
+  EXPECT_EQ(
+      LogRecord::CompensatingUpdateLeafLogRecord(7, 11, "k", "redo", undo_next)
+          .prev_lsn,
+      undo_next);
+  EXPECT_EQ(
+      LogRecord::CompensatingUpdateBranchLogRecord(7, 11, "k", 9, undo_next)
+          .prev_lsn,
+      undo_next);
+  EXPECT_EQ(LogRecord::CompensatingDeleteLogRecord(7, 11, 3, "redo", undo_next)
+                .prev_lsn,
+            undo_next);
+  EXPECT_EQ(
+      LogRecord::CompensatingDeleteLeafLogRecord(7, 11, "k", "redo", undo_next)
+          .prev_lsn,
+      undo_next);
+  EXPECT_EQ(
+      LogRecord::CompensatingDeleteBranchLogRecord(7, 11, "k", 9, undo_next)
+          .prev_lsn,
+      undo_next);
+  EXPECT_EQ(LogRecord::CompensateSetLowestValueLogRecord(7, 11, 9, undo_next)
+                .prev_lsn,
+            undo_next);
+  EXPECT_EQ(LogRecord::CompensateSetRowPageNextLogRecord(undo_next, 7, 11, 9)
+                .prev_lsn,
+            undo_next);
+  EXPECT_EQ(LogRecord::CompensateSetRowPagePrevLogRecord(undo_next, 7, 11, 9)
+                .prev_lsn,
+            undo_next);
+  EXPECT_EQ(LogRecord::CompensateDestroyPageLogRecord(7, 11, PageType::kRowPage,
+                                                      "body", undo_next)
+                .prev_lsn,
+            undo_next);
 }
 
 TEST_F(LogRecordTest, DecodeHugeEndCheckpointTableSizeRejected) {
@@ -608,7 +1023,13 @@ TEST_F(LogRecordTest, RoundTripAllRecordKindsWithSize) {
       LogRecord::SetFosterLogRecord(1, 2, 3, FosterPair("new", 4),
                                     FosterPair("old", 5)),
       LogRecord::SetLowestLogRecord(1, 2, 3, 4, 5),
-      LogRecord::AllocatePageLogRecord(1, 2, 3, PageType::kRowPage),
+      LogRecord::SetRowPageNextLogRecord(1, 2, 3, 4, 5),
+      LogRecord::SetRowPagePrevLogRecord(1, 2, 3, 4, 5),
+      LogRecord::CompensateSetRowPageNextLogRecord(1, 2, 3, 4),
+      LogRecord::CompensateSetRowPagePrevLogRecord(1, 2, 3, 4),
+      TestAllocation(1, 2, 3, PageType::kRowPage),
+      LogRecord::CompensateAllocatePageLogRecord(
+          TestAllocation(1, 2, 3, PageType::kRowPage)),
       LogRecord::DestroyPageLogRecord(1, 2, 3),
       LogRecord::BeginCheckpointLogRecord(),
       LogRecord::EndCheckpointLogRecord(
@@ -655,7 +1076,7 @@ TEST_F(LogRecordTest, V2RecordsWithoutCrcStillDecode) {
   std::string v3 = begin.Serialize();
   ASSERT_GE(v3.size(), 4 + 4 + kWalRecordCrcSize);
   std::string v2 = v3.substr(0, v3.size() - kWalRecordCrcSize);
-  ASSERT_EQ(static_cast<unsigned char>(v2[7]), 3);
+  ASSERT_EQ(static_cast<unsigned char>(v2[7]), kWalRecordVersion);
   v2[7] = static_cast<char>(2);
   std::istringstream in(v2, std::istringstream::binary);
   Decoder dec(in);

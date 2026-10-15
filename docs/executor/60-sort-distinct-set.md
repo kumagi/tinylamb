@@ -16,6 +16,19 @@
 
 ただし、`NaN` と通常値の相対位置は、現在の三つの処理で一致していない。`SortExecutor` のバイト列符号化は、昇順で `NaN` を `+∞` より後ろに置く。共通の `CompareForOrderBy` を使う Top-N と `PdqSort` は、昇順で `NaN` をすべての非 `NULL` 通常値より前に置く。`PartialSortExecutor` と `MergeAppendExecutor` の一部は、浮動小数点の大小演算を直接使う。この比較では、`NaN` と任意の数値のどちらも他方より小さくない。このため、`NaN` を含む入力では、物理方式によって相対順が異なる。
 
+## 1.1 照合順序（collation）
+
+比較の契約は `type/collation.hpp` に一元化し、すべての整列経路が同じ型（`SortKeyOrder` / `CompareWithCollation` / `EqualUnderCollation`）を使う。
+
+- 照合順序は `Value` のタグで持つ。`0` = なし（エンジン既定）、`1` = 明示的な `binary`、`2` = 大文字小文字を区別しない（`und:ci` および他の非 `binary` な指定）。タグ `3` は符号なし整数マーカーであり照合順序ではなく、未知のタグは `0` へ退化する。
+- 比較の照合順序は「どちらか一方が case-insensitive なら全体 case-insensitive」という規則で解決する。これは `=` 述語（`expression/binary_expression.cpp`）と同じ規則なので、述語と整列が「どの行が同値か」で食い違うことがない。
+- 大文字小文字の畳み込みは ASCII のみ（`FoldCaseForCollation`）。UTF-8 のマルチバイト列は畳み込まれないため、既存のバイト順・`interval` 表現順・適合 catalog の ENUM 固定順位（`TESTENUMNEGATIVE` 先行）は変わらない。ロケール／ICU の照合順序は未実装で、`en_US` や `en_US:cs` は case-insensitive として扱われる。これは「未対応は binary fallback」という範囲内の意図的な契約である。
+- 照合順序つきのキーは、比較可能なバイト列へ符号化する前に畳み込む（`SortExecutor` の `SortKeyEncoder`）。メモリ内整列も、外部マージの run も、マージ窓口も同じ符号化を使うため、spill を跨いでも順序が一致する。`Row` の直列化はタグを落とすが、マージ側は行に対して同じキー式を再評価するので `COLLATE` が付け直される。
+- 比較ベースのパスはすべて `SortKeyOrder` を使う: `TopNExecutor` のヒープ、`PdqSort`、`MergeAppendExecutor`、`PartialSortExecutor`、SQL 関係代数パスの三つの `ORDER BY` ソータ。NULL 位置・方向・照合順序が一つの型に集約されるので、方式が違っても答えが違わない。`IncrementalSortExecutor` の prefix 等価判定と `WITH TIES` の境界行は `EqualUnderCollation` を使う。
+- `EqualUnderCollation` は `FLOAT64` を `NaN` 一つの peer 群・`±0.0` 同値に正規化し、case-insensitive な `VARCHAR` は畳み込み後に比較する。interval 相当テキストは `Value::operator==` に従い同値。`DISTINCT` / `GROUP BY` の `CanonicalDistinctValue` も同じ畳み込みを使う。
+
+optimizer 側は同じ契約を `PhysicalProperties::collation`（空文字がエンジン既定 = binary）で伝播する。`SortPlan` / `TopNPlan` は `PlanBase::OrderCollation()` で自分たちのキーがどの照合順序で作られたかを報告し、`SatisfiesOrderingCollation` が「要求された照合順序と同じ順序か」を判定する。case-insensitive な順序は binary な順序の代替にならない（`und:ci` では `a` が `B` より先に、`binary` では逆）ため、`ORDER BY x COLLATE 'und:ci'` は索引順や clustered order に畳めない。`ProjectionPlan` / `SelectionPlan` / `LimitPlan` は行成型ラッパーなのでこの主張を転送する。
+
 ## 2. `SortExecutor`
 
 `SortExecutor` は入力全体を読み、指定したキーによる全体順序を作るパイプラインブレーカーである。行と `RowPosition` を対で保持するため、並べ替えた後も元の物理位置を保存する。
@@ -45,9 +58,19 @@
 
 次の行を追加すると作業メモリの軟限界を超える場合は、現在保持している行を整列し、一つの整列済み列として一時ファイルへ書く。その後でメモリを解放し、次の整列済み列を作る。
 
-全入力を処理した後、各整列済み列から最大 128 行を先読みする。各列の先頭キーを最小ヒープへ入れ、k 路マージ（k-way merge）する。同じキーでは番号の小さい列を先に選び、元の入力順に由来する安定性を保つ。行数ヘッダの不整合、復号、キーの再評価、I/O のいずれかに失敗すると、問い合わせ全体を失敗させる。
+全入力を処理した後、各整列済み列から最大 `merge_window_rows` 行（既定 128 行）を先読みする。各列の先頭キーを最小ヒープへ入れ、k 路マージ（k-way merge）する。同じキーでは番号の小さい列を先に選び、元の入力順に由来する安定性を保つ。行数ヘッダの不整合、復号、キーの再評価、I/O のいずれかに失敗すると、問い合わせ全体を失敗させる。
 
 最後にマージした結果は、再びメモリ上の出力配列へ保存する。整列済み列を作る段階のピークメモリは抑えられるが、最終出力全体を保持するメモリは必要になる。したがって、結果を逐次返す外部マージではない。
+
+### 2.4 形の選択（spill mode）
+
+どの形を使うかは optimizer が決める（`BufferedSortPlan` / `ExternalMergeSortPlan`、`plan/sort_plan.hpp`）。実行器は `SortExecutor::Options` としてそれを受け取る。
+
+- `kBuffered`（既定の 4 引数構築子ではなく、buffered 形が明示指定した場合）: spill を**計画しない**。形状のメモリ予算（`memory_budget_bytes`）かプロセス予算のどちらか一方でも超える場合に限り、この節の内部 spill 選択へ落ちる。行数推定を誤っても答えは変えないための安全弁である。
+- `kExternalMerge`: `spill_threshold_rows` 行に達したら整列済み列を書き出し、入力の末尾の列も必ず書いてからマージ経路に入る。したがって入力がどれほど大きくても作業集合は予算で上限される。`spill_threshold_rows = 0` なら行数ではなくメモリ予算だけで run の大きさを決める。
+- `kAuto`（既存の 4 引数構築子）: プロセス予算だけを見て内部選択する。従来どおりの挙動で、既存 API の互換のために残る。
+
+いずれの形でも、メモリ予算はプロセス予算と**併せて**判定する（片方が上限を追い越さない）。`Dump` は `ParallelSort (N workers, spill=external-merge, budget=…, run_rows=…)` のように形の情報を出す。
 
 ## 3. `TopNExecutor`
 

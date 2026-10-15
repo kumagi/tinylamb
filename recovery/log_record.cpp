@@ -21,8 +21,8 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -63,9 +63,105 @@ enum KeyTypes : uint8_t {
   return std::string(original);
 }
 
+uint32_t SerializedWireVersion(const tinylamb::LogRecord& record) {
+  if (record.type == tinylamb::LogType::kSystemAllocPage &&
+      record.wire_version < tinylamb::kAllocationPayloadWalVersion) {
+    return record.wire_version;
+  }
+  return tinylamb::kWalRecordVersion;
+}
+
+bool ValidV6AllocationPayload(const tinylamb::LogRecord& record) {
+  using tinylamb::PageAllocationKind;
+  using tinylamb::PageType;
+  tinylamb::page_id_t first_free = 0;
+  tinylamb::page_id_t max_page = 0;
+  if (record.pid == 0 || record.allocated_page_type == PageType::kUnknown ||
+      record.allocated_page_type == PageType::kMetaPage ||
+      !tinylamb::DecodeAllocationMetaPayload(record.redo_data, &first_free,
+                                             &max_page)) {
+    return false;
+  }
+  switch (record.allocation_kind) {
+    case PageAllocationKind::kFresh:
+      return record.previous_page_type == PageType::kFreePage &&
+             record.undo_data.empty() &&
+             max_page != std::numeric_limits<tinylamb::page_id_t>::max() &&
+             max_page + 1 == record.pid;
+    case PageAllocationKind::kRecycled: {
+      if (record.previous_page_type != PageType::kFreePage ||
+          record.undo_data.size() != tinylamb::kAllocationFreePayloadSize ||
+          first_free != record.pid) {
+        return false;
+      }
+      tinylamb::page_id_t next_free = 0;
+      tinylamb::txn_id_t destroyer = 0;
+      return tinylamb::DecodeAllocationFreePayload(record.undo_data, &next_free,
+                                                   &destroyer) &&
+             (next_free == 0 || next_free != record.pid);
+    }
+    case PageAllocationKind::kInPlace:
+      return record.previous_page_type != PageType::kMetaPage &&
+             first_free <= max_page &&
+             record.undo_data.size() == tinylamb::kPageBodySize;
+  }
+  return false;
+}
+
+class StringAppendBuffer final : public std::streambuf {
+ public:
+  explicit StringAppendBuffer(std::string& output) : output_(output) {}
+
+ protected:
+  std::streamsize xsputn(const char* data, std::streamsize count) override {
+    if (count <= 0) {
+      return 0;
+    }
+    output_.append(data, static_cast<size_t>(count));
+    return count;
+  }
+
+  int_type overflow(int_type ch) override {
+    if (std::char_traits<char>::eq_int_type(ch,
+                                            std::char_traits<char>::eof())) {
+      return std::char_traits<char>::not_eof(ch);
+    }
+    output_.push_back(std::char_traits<char>::to_char_type(ch));
+    return ch;
+  }
+
+ private:
+  std::string& output_;
+};
+
 }  // namespace
 
 namespace tinylamb {
+
+bool IsCompensation(LogType type) {
+  switch (type) {
+    case LogType::kCompensateInsertRow:
+    case LogType::kCompensateInsertLeaf:
+    case LogType::kCompensateInsertBranch:
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateUpdateLeaf:
+    case LogType::kCompensateUpdateBranch:
+    case LogType::kCompensateDeleteRow:
+    case LogType::kCompensateDeleteLeaf:
+    case LogType::kCompensateDeleteBranch:
+    case LogType::kCompensateSetLowFence:
+    case LogType::kCompensateSetHighFence:
+    case LogType::kCompensateSetFoster:
+    case LogType::kCompensateDestroyPage:
+    case LogType::kCompensateSetLowestValue:
+    case LogType::kCompensateSetRowPageNext:
+    case LogType::kCompensateSetRowPagePrev:
+    case LogType::kCompensateAllocPage:
+      return true;
+    default:
+      return false;
+  }
+}
 
 std::ostream& operator<<(std::ostream& o, const LogType& type) {
   switch (type) {
@@ -150,6 +246,21 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kCompensateSetFoster:
       o << "COMPENSATE SET FOSTER\t";
       break;
+    case LogType::kCompensateSetLowestValue:
+      o << "COMPENSATE SET LOWEST VALUE\t";
+      break;
+    case LogType::kSetRowPageNext:
+      o << "SET ROW PAGE NEXT\t";
+      break;
+    case LogType::kSetRowPagePrev:
+      o << "SET ROW PAGE PREV\t";
+      break;
+    case LogType::kCompensateSetRowPageNext:
+      o << "COMPENSATE SET ROW PAGE NEXT\t";
+      break;
+    case LogType::kCompensateSetRowPagePrev:
+      o << "COMPENSATE SET ROW PAGE PREV\t";
+      break;
     case LogType::kLowestValue:
       o << "SET LOWEST VALUE\t";
       break;
@@ -168,10 +279,60 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kCompensateDestroyPage:
       o << "COMPENSATE DESTROY\t";
       break;
+    case LogType::kCompensateAllocPage:
+      o << "COMPENSATE ALLOCATE\t";
+      break;
+    case LogType::kFullPageImage:
+      o << "FULL PAGE IMAGE\t";
+      break;
     default:
       o << "(undefined: " << static_cast<uint16_t>(type) << ")";
   }
   return o;
+}
+
+std::string EncodeAllocationMetaPayload(page_id_t first_free_page,
+                                        page_id_t max_page_count) {
+  std::string payload(kAllocationMetaPayloadSize, '\0');
+  SerializeU64(payload.data(), first_free_page);
+  SerializeU64(payload.data() + sizeof(uint64_t), max_page_count);
+  return payload;
+}
+
+std::string EncodeAllocationFreePayload(page_id_t next_free_page,
+                                        txn_id_t destroyer) {
+  std::string payload(kAllocationFreePayloadSize, '\0');
+  SerializeU64(payload.data(), next_free_page);
+  SerializeU64(payload.data() + sizeof(uint64_t), destroyer);
+  return payload;
+}
+
+bool DecodeAllocationMetaPayload(std::string_view payload,
+                                 page_id_t* first_free_page,
+                                 page_id_t* max_page_count) {
+  if (payload.size() != kAllocationMetaPayloadSize ||
+      first_free_page == nullptr || max_page_count == nullptr) {
+    return false;
+  }
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
+  DeserializeU64(payload.data(), first_free_page);
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
+  DeserializeU64(payload.data() + sizeof(uint64_t), max_page_count);
+  return true;
+}
+
+bool DecodeAllocationFreePayload(std::string_view payload,
+                                 page_id_t* next_free_page,
+                                 txn_id_t* destroyer) {
+  if (payload.size() != kAllocationFreePayloadSize ||
+      next_free_page == nullptr || destroyer == nullptr) {
+    return false;
+  }
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
+  DeserializeU64(payload.data(), next_free_page);
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
+  DeserializeU64(payload.data() + sizeof(uint64_t), destroyer);
+  return true;
 }
 
 std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
@@ -218,8 +379,19 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
       o << "\t Delete: " << l.undo_page;
       break;
     case LogType::kLowestValue:
+    case LogType::kCompensateSetLowestValue:
       l.DumpPosition(o);
       o << "\t Lowest: " << l.undo_page << " -> " << l.redo_page;
+      break;
+    case LogType::kSetRowPageNext:
+    case LogType::kSetRowPagePrev:
+      l.DumpPosition(o);
+      o << "\t Link: " << l.undo_page << " -> " << l.redo_page;
+      break;
+    case LogType::kCompensateSetRowPageNext:
+    case LogType::kCompensateSetRowPagePrev:
+      l.DumpPosition(o);
+      o << "\t Link: " << l.redo_page;
       break;
     case LogType::kBeginCheckpoint:
       return o;
@@ -249,10 +421,22 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
     case LogType::kSystemAllocPage:
     case LogType::kSystemDestroyPage:
     case LogType::kCompensateDestroyPage:
+    case LogType::kCompensateAllocPage:
+    case LogType::kFullPageImage:
       break;
   }
   o << "\tprev_lsn: " << l.prev_lsn << "\ttxn_id: " << l.txn_id;
   return o;
+}
+
+LogRecord LogRecord::FullPageImageLogRecord(page_id_t pid, PageType page_type,
+                                            std::string_view body) {
+  LogRecord l;
+  l.pid = pid;
+  l.type = LogType::kFullPageImage;
+  l.allocated_page_type = page_type;
+  l.redo_data = body;
+  return l;
 }
 
 LogRecord::LogRecord(lsn_t prev, txn_id_t txn, LogType t)
@@ -299,8 +483,9 @@ LogRecord LogRecord::InsertingBranchLogRecord(lsn_t p, txn_id_t txn,
 }
 
 LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
-                                                 slot_t key) {
+                                                 slot_t key, lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.slot = key;
@@ -309,8 +494,10 @@ LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
 }
 
 LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
-                                                 std::string_view key) {
+                                                 std::string_view key,
+                                                 lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
@@ -320,8 +507,10 @@ LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
 
 LogRecord LogRecord::CompensatingInsertBranchLogRecord(txn_id_t txn,
                                                        page_id_t pid,
-                                                       std::string_view key) {
+                                                       std::string_view key,
+                                                       lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
@@ -375,8 +564,10 @@ LogRecord LogRecord::UpdatingBranchLogRecord(lsn_t prev_lsn, txn_id_t txn,
 
 LogRecord LogRecord::CompensatingUpdateLogRecord(txn_id_t txn, page_id_t pid,
                                                  slot_t key,
-                                                 std::string_view redo) {
+                                                 std::string_view redo,
+                                                 lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.slot = key;
@@ -387,8 +578,10 @@ LogRecord LogRecord::CompensatingUpdateLogRecord(txn_id_t txn, page_id_t pid,
 
 LogRecord LogRecord::CompensatingUpdateLeafLogRecord(lsn_t txn, page_id_t pid,
                                                      std::string_view key,
-                                                     std::string_view redo) {
+                                                     std::string_view redo,
+                                                     lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
@@ -399,8 +592,10 @@ LogRecord LogRecord::CompensatingUpdateLeafLogRecord(lsn_t txn, page_id_t pid,
 
 LogRecord LogRecord::CompensatingUpdateBranchLogRecord(lsn_t txn, page_id_t pid,
                                                        std::string_view key,
-                                                       page_id_t redo) {
+                                                       page_id_t redo,
+                                                       lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
@@ -451,8 +646,10 @@ LogRecord LogRecord::DeletingBranchLogRecord(lsn_t prev_lsn, txn_id_t txn,
 
 LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
                                                  slot_t slot,
-                                                 std::string_view redo) {
+                                                 std::string_view redo,
+                                                 lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.slot = slot;
@@ -464,8 +661,10 @@ LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
 LogRecord LogRecord::CompensatingDeleteLeafLogRecord(txn_id_t txn,
                                                      page_id_t pid,
                                                      std::string_view key,
-                                                     std::string_view redo) {
+                                                     std::string_view redo,
+                                                     lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
@@ -477,8 +676,10 @@ LogRecord LogRecord::CompensatingDeleteLeafLogRecord(txn_id_t txn,
 LogRecord LogRecord::CompensatingDeleteBranchLogRecord(txn_id_t txn,
                                                        page_id_t pid,
                                                        std::string_view slot,
-                                                       page_id_t redo) {
+                                                       page_id_t redo,
+                                                       lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = slot;
@@ -577,29 +778,110 @@ LogRecord LogRecord::SetLowestLogRecord(lsn_t prev_lsn, txn_id_t tid,
 
 LogRecord LogRecord::CompensateSetLowestValueLogRecord(txn_id_t tid,
                                                        page_id_t pid,
-                                                       page_id_t redo) {
+                                                       page_id_t redo,
+                                                       lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = tid;
   l.pid = pid;
-  l.type = LogType::kLowestValue;
+  l.type = LogType::kCompensateSetLowestValue;
   l.redo_page = redo;
-  // The CLR reuses the normal kLowestValue type (there is no dedicated
-  // kCompensateSetLowestValue), so LogUndo would otherwise treat it as a
-  // fresh undo with undo_page == 0 and clobber lowest_page_ to an invalid id
-  // on a second recovery pass. Setting undo_page == redo_page makes the
-  // record idempotent: redo and undo both leave the same value.
   l.undo_page = redo;
   return l;
 }
-LogRecord LogRecord::AllocatePageLogRecord(lsn_t prev_lsn, txn_id_t txn,
-                                           page_id_t pid,
-                                           PageType new_page_type) {
+
+LogRecord LogRecord::SetRowPageNextLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                             page_id_t pid, page_id_t redo,
+                                             page_id_t undo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kSetRowPageNext;
+  l.redo_page = redo;
+  l.undo_page = undo;
+  return l;
+}
+
+LogRecord LogRecord::SetRowPagePrevLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                             page_id_t pid, page_id_t redo,
+                                             page_id_t undo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kSetRowPagePrev;
+  l.redo_page = redo;
+  l.undo_page = undo;
+  return l;
+}
+
+LogRecord LogRecord::CompensateSetRowPageNextLogRecord(lsn_t prev_lsn,
+                                                       txn_id_t txn,
+                                                       page_id_t pid,
+                                                       page_id_t redo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kCompensateSetRowPageNext;
+  l.redo_page = redo;
+  return l;
+}
+
+LogRecord LogRecord::CompensateSetRowPagePrevLogRecord(lsn_t prev_lsn,
+                                                       txn_id_t txn,
+                                                       page_id_t pid,
+                                                       page_id_t redo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kCompensateSetRowPagePrev;
+  l.redo_page = redo;
+  return l;
+}
+
+LogRecord LogRecord::AllocatePageLogRecord(
+    lsn_t prev_lsn, txn_id_t txn, page_id_t pid, PageType new_page_type,
+    PageAllocationKind allocation_kind, PageType old_page_type,
+    std::string old_target_payload, std::string old_meta_payload) {
   LogRecord l;
   l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.type = LogType::kSystemAllocPage;
   l.allocated_page_type = new_page_type;
+  l.previous_page_type = old_page_type;
+  l.allocation_kind = allocation_kind;
+  l.undo_data = std::move(old_target_payload);
+  l.redo_data = std::move(old_meta_payload);
+  CHECK_MSG(ValidV6AllocationPayload(l), "invalid v6 allocation payload");
+  return l;
+}
+
+LogRecord LogRecord::AllocatePageLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                           page_id_t pid,
+                                           PageType new_page_type) {
+  CHECK_MSG(pid > 0, "fresh allocation page id must be positive");
+  return AllocatePageLogRecord(
+      prev_lsn, txn, pid, new_page_type, PageAllocationKind::kFresh,
+      PageType::kFreePage, {}, EncodeAllocationMetaPayload(pid - 1, pid - 1));
+}
+
+LogRecord LogRecord::CompensateAllocatePageLogRecord(
+    const LogRecord& allocation, lsn_t prev_lsn) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = allocation.txn_id;
+  l.pid = allocation.pid;
+  l.type = LogType::kCompensateAllocPage;
+  l.allocated_page_type = allocation.allocated_page_type;
+  l.previous_page_type = allocation.previous_page_type;
+  l.allocation_kind = allocation.allocation_kind;
+  l.undo_data = allocation.undo_data;
+  l.redo_data = allocation.redo_data;
+  CHECK_MSG(ValidV6AllocationPayload(l), "invalid v6 allocation CLR payload");
   return l;
 }
 
@@ -618,8 +900,10 @@ LogRecord LogRecord::DestroyPageLogRecord(lsn_t prev_lsn, txn_id_t txn,
 
 LogRecord LogRecord::CompensateDestroyPageLogRecord(txn_id_t txn, page_id_t pid,
                                                     PageType restored_type,
-                                                    std::string restored_body) {
+                                                    std::string restored_body,
+                                                    lsn_t prev_lsn) {
   LogRecord l;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.type = LogType::kCompensateDestroyPage;
@@ -658,6 +942,8 @@ void LogRecord::Clear() {
   dirty_page_table.clear();
   active_transaction_table.clear();
   allocated_page_type = PageType::kUnknown;
+  previous_page_type = PageType::kUnknown;
+  allocation_kind = PageAllocationKind::kFresh;
   wire_version = kWalRecordVersion;
 }
 
@@ -712,7 +998,14 @@ size_t LogRecord::Size() const {
       break;
     case LogType::kUpdateBranch:
     case LogType::kLowestValue:
+    case LogType::kCompensateSetLowestValue:
+    case LogType::kSetRowPageNext:
+    case LogType::kSetRowPagePrev:
       size += sizeof(page_id_t) * 2;
+      break;
+    case LogType::kCompensateSetRowPageNext:
+    case LogType::kCompensateSetRowPagePrev:
+      size += sizeof(page_id_t);
       break;
     case LogType::kEndCheckpoint:
       size += sizeof(dirty_page_table.size()) +
@@ -722,9 +1015,20 @@ size_t LogRecord::Size() const {
                CheckpointManager::ActiveTransactionEntry::Size());
       break;
     case LogType::kSystemAllocPage:
-      // The encoder stores PageType as a uint64_t to keep the WAL format
-      // independent of the enum's underlying representation.
       size += sizeof(uint64_t);
+      if (wire_version >= kAllocationPayloadWalVersion) {
+        size += sizeof(uint64_t);
+        size += sizeof(uint8_t);
+        size += SerializeSize(undo_data);
+        size += SerializeSize(redo_data);
+      }
+      break;
+    case LogType::kCompensateAllocPage:
+      size += sizeof(uint64_t);
+      size += sizeof(uint64_t);
+      size += sizeof(uint8_t);
+      size += SerializeSize(undo_data);
+      size += SerializeSize(redo_data);
       break;
     case LogType::kSystemDestroyPage:
       // D3 (docs/design.md): v2+ carries the destroyed page's type and an
@@ -739,6 +1043,11 @@ size_t LogRecord::Size() const {
       size += sizeof(uint64_t);
       size += SerializeSize(undo_data);
       break;
+    case LogType::kFullPageImage:
+      // Type + the complete page body in redo_data.
+      size += sizeof(uint64_t);
+      size += SerializeSize(redo_data);
+      break;
     case LogType::kBegin:
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertBranch:
@@ -749,14 +1058,14 @@ size_t LogRecord::Size() const {
   }
   // D9 (docs/design.md): v3 records end with a CRC32C field that Size()
   // includes so the recovery scan advances byte-exactly over the checksum.
-  if (wire_version >= kWalRecordVersion) {
+  if (wire_version >= kCrcWalRecordVersion) {
     size += kWalRecordCrcSize;
   }
   return size;
 }
 
 Encoder& operator<<(Encoder& e, const LogRecord& l) {
-  e << kSerdesMagic << kWalRecordVersion << static_cast<uint16_t>(l.type)
+  e << kSerdesMagic << SerializedWireVersion(l) << static_cast<uint16_t>(l.type)
     << l.prev_lsn << l.txn_id;
   const uint8_t types = (l.HasPageID() ? kHasPageID : 0) |
                         (l.HasSlot() ? kHasSlot : 0) |
@@ -805,7 +1114,14 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
       break;
     case LogType::kUpdateBranch:
     case LogType::kLowestValue:
+    case LogType::kCompensateSetLowestValue:
+    case LogType::kSetRowPageNext:
+    case LogType::kSetRowPagePrev:
       e << l.redo_page << l.undo_page;
+      break;
+    case LogType::kCompensateSetRowPageNext:
+    case LogType::kCompensateSetRowPagePrev:
+      e << l.redo_page;
       break;
     case LogType::kDeleteBranch:
       e << l.undo_page;
@@ -816,15 +1132,28 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
     }
     case LogType::kSystemAllocPage:
       e << static_cast<uint64_t>(l.allocated_page_type);
+      if (l.wire_version >= kAllocationPayloadWalVersion) {
+        e << static_cast<uint64_t>(l.previous_page_type)
+          << static_cast<uint8_t>(l.allocation_kind) << l.undo_data
+          << l.redo_data;
+      }
+      break;
+    case LogType::kCompensateAllocPage:
+      e << static_cast<uint64_t>(l.allocated_page_type)
+        << static_cast<uint64_t>(l.previous_page_type)
+        << static_cast<uint8_t>(l.allocation_kind) << l.undo_data
+        << l.redo_data;
       break;
     case LogType::kSystemDestroyPage:
+    case LogType::kCompensateDestroyPage:
       // D3 (docs/design.md): type plus optional body image of the destroyed
-      // page, so undo of an aborted destroy restores it exactly.
+      // page, so undo of an aborted destroy restores it exactly. The undo
+      // (compensate) record shares the destroy record's payload shape.
       e << static_cast<uint64_t>(l.allocated_page_type) << l.undo_data;
       break;
-    case LogType::kCompensateDestroyPage:
-      // Same payload shape as the destroy record: restored type + body.
-      e << static_cast<uint64_t>(l.allocated_page_type) << l.undo_data;
+    case LogType::kFullPageImage:
+      // System record: page type plus the complete body image in redo_data.
+      e << static_cast<uint64_t>(l.allocated_page_type) << l.redo_data;
       break;
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertRow:
@@ -855,8 +1184,6 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
     d.Fail();
     return d;
   }
-  // Accept v1/v2/v3 (header contract in log_record.hpp): v1 is
-  // kSerdesVersion, v2 added the destroy-page payload, v3 added the CRC.
   if (version < kLegacyWalRecordVersion || version > kWalRecordVersion) {
     d.Fail();
     return d;
@@ -899,6 +1226,26 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
       d >> l.allocated_page_type;
       d >> l.undo_data;
       break;
+    case LogType::kSetRowPageNext:
+    case LogType::kSetRowPagePrev:
+      if (l.wire_version < kRowPageLinkWalVersion) {
+        d.Fail();
+        return d;
+      }
+      d >> l.redo_page >> l.undo_page;
+      break;
+    case LogType::kCompensateSetRowPageNext:
+    case LogType::kCompensateSetRowPagePrev:
+      if (l.wire_version < kRowPageLinkWalVersion) {
+        d.Fail();
+        return d;
+      }
+      d >> l.redo_page;
+      break;
+    case LogType::kFullPageImage:
+      d >> l.allocated_page_type;
+      d >> l.redo_data;
+      break;
     case LogType::kInsertRow:
     case LogType::kInsertLeaf:
     case LogType::kCompensateUpdateRow:
@@ -928,6 +1275,7 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
       break;
     case LogType::kUpdateBranch:
     case LogType::kLowestValue:
+    case LogType::kCompensateSetLowestValue:
       d >> l.redo_page >> l.undo_page;
       break;
     case LogType::kDeleteBranch:
@@ -935,6 +1283,42 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
       break;
     case LogType::kSystemAllocPage:
       d >> l.allocated_page_type;
+      if (l.wire_version >= kAllocationPayloadWalVersion) {
+        uint8_t allocation_kind = 0;
+        d >> l.previous_page_type >> allocation_kind >> l.undo_data >>
+            l.redo_data;
+        if (allocation_kind >
+            static_cast<uint8_t>(PageAllocationKind::kInPlace)) {
+          d.Fail();
+          return d;
+        }
+        l.allocation_kind = static_cast<PageAllocationKind>(allocation_kind);
+        if (!ValidV6AllocationPayload(l)) {
+          d.Fail();
+          return d;
+        }
+      }
+      break;
+    case LogType::kCompensateAllocPage:
+      if (l.wire_version < kAllocationPayloadWalVersion) {
+        d.Fail();
+        return d;
+      }
+      {
+        uint8_t allocation_kind = 0;
+        d >> l.allocated_page_type >> l.previous_page_type >> allocation_kind >>
+            l.undo_data >> l.redo_data;
+        if (allocation_kind >
+            static_cast<uint8_t>(PageAllocationKind::kInPlace)) {
+          d.Fail();
+          return d;
+        }
+        l.allocation_kind = static_cast<PageAllocationKind>(allocation_kind);
+        if (!ValidV6AllocationPayload(l)) {
+          d.Fail();
+          return d;
+        }
+      }
       break;
     case LogType::kEndCheckpoint: {
       d >> l.dirty_page_table >> l.active_transaction_table;
@@ -951,18 +1335,41 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
   return d;
 }
 
+void LogRecord::SerializeTo(std::string& output) const {
+  const uint32_t output_version = SerializedWireVersion(*this);
+  size_t current_size = Size();
+  if (wire_version < kCrcWalRecordVersion &&
+      output_version >= kCrcWalRecordVersion) {
+    current_size += kWalRecordCrcSize;
+  }
+  if (type == LogType::kSystemDestroyPage &&
+      wire_version < kDestroyPayloadWalVersion) {
+    current_size += sizeof(uint64_t) + SerializeSize(undo_data);
+  }
+  const size_t start = output.size();
+  output.reserve(start + current_size);
+
+  StringAppendBuffer buffer(output);
+  std::ostream stream(&buffer);
+  Encoder encoder(stream);
+  encoder << *this;
+
+  const size_t body_size = output.size() - start;
+  if (output_version < kCrcWalRecordVersion) {
+    return;
+  }
+  const uint32_t crc = Crc32C(output.data() + start, body_size);
+  output.resize(start + body_size + kWalRecordCrcSize);
+  char* crc_bytes = output.data() + start + body_size;
+  crc_bytes[0] = static_cast<char>((crc >> 24) & 0xFF);
+  crc_bytes[1] = static_cast<char>((crc >> 16) & 0xFF);
+  crc_bytes[2] = static_cast<char>((crc >> 8) & 0xFF);
+  crc_bytes[3] = static_cast<char>(crc & 0xFF);
+}
+
 std::string LogRecord::Serialize() const {
-  std::stringstream ss;
-  Encoder enc(ss);
-  enc << *this;
-  std::string record = ss.str();
-  // D9 (docs/design.md): the CRC field is appended at the record tail and
-  // covers the complete record byte sequence excluding itself.
-  const uint32_t crc = Crc32C(record.data(), record.size());
-  record.push_back(static_cast<char>((crc >> 24) & 0xFF));
-  record.push_back(static_cast<char>((crc >> 16) & 0xFF));
-  record.push_back(static_cast<char>((crc >> 8) & 0xFF));
-  record.push_back(static_cast<char>(crc & 0xFF));
+  std::string record;
+  SerializeTo(record);
   return record;
 }
 

@@ -111,6 +111,7 @@ class TableStatisticsTest : public ::testing::Test {
   void Recover() {
     if (db_) {
       db_->EmulateCrash();
+      db_.reset();
     }
     db_ = Database::Create(prefix_).MoveValue();
   }
@@ -165,6 +166,9 @@ TEST_F(TableStatisticsTest,
   EXPECT_EQ(integers.HighestValues().front().value, Value(95));
   EXPECT_EQ(integers.HighestValues().back().value, Value(99));
   EXPECT_NEAR(statistics.EstimateCount(0, Value(10), Value(19)), 10, 1.5);
+  EXPECT_NEAR(statistics.EstimateCount(0, Value(10), Value()), 90, 2.0);
+  EXPECT_NEAR(statistics.EstimateCount(0, Value(), Value(9)), 10, 1.5);
+  EXPECT_GT(statistics.TransformBy(0, Value(50), Value()).Rows(), 0U);
 }
 
 TEST_F(TableStatisticsTest,
@@ -317,10 +321,12 @@ TEST_F(TableStatisticsTest, Correlation_SortedAndReverseInput_ReportsExtremes) {
                               db_->GetStatistics(context, "Sc1"));
   // Sc1.c1 is inserted 0..99 in order: fully clustered.
   EXPECT_DOUBLE_EQ(sc1.Column(0).Correlation(), 1.0);
+  EXPECT_DOUBLE_EQ(sc1.Column(0).ClusteringStrength(), 1.0);
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, sc3,
                               db_->GetStatistics(context, "Sc3"));
   // Sc3.e1 is inserted 10..1 in reverse: every adjacency decreases.
   EXPECT_DOUBLE_EQ(sc3.Column(0).Correlation(), 0.0);
+  EXPECT_DOUBLE_EQ(sc3.Column(0).ClusteringStrength(), 1.0);
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -348,6 +354,129 @@ TEST_F(TableStatisticsTest, Correlation_RoundTrip_PreservesValue) {
   EXPECT_DOUBLE_EQ(legacy.Correlation(), 1.0);
   EXPECT_EQ(legacy.NonNullCount(), column.NonNullCount());
   EXPECT_EQ(legacy.Distinct(), column.Distinct());
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, LayoutGeneration_TracksTheMeasuredChain) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "Sc1"));
+  // RefreshStatistics ran in SetUp: the stored stamp is the table's current
+  // row-layout generation, which is what a physical-order claim re-checks.
+  EXPECT_NE(statistics.LayoutGeneration(), 0U);
+  EXPECT_EQ(statistics.LayoutGeneration(), table.LayoutGeneration());
+
+  // Any row mutation moves the chain, so the stamp stops matching.
+  ASSERT_SUCCESS(table
+                     .Insert(context.txn_, Row({Value(1000), Value("c2-late"),
+                                                Value(2000.0)}))
+                     .GetStatus());
+  EXPECT_NE(statistics.LayoutGeneration(), table.LayoutGeneration());
+  // Re-measuring re-establishes the stamp at the new generation.
+  ASSERT_SUCCESS(statistics.Update(context.txn_, table));
+  EXPECT_EQ(statistics.LayoutGeneration(), table.LayoutGeneration());
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, DerivedStatisticsDropTheLayoutGeneration) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
+  ASSERT_NE(statistics.LayoutGeneration(), 0U);
+  const Schema& schema = table.GetSchema();
+  // Every derived estimate describes a hypothetical row set, not this chain, so
+  // none of them may carry the physical-layout stamp into a scan plan.
+  EXPECT_EQ(statistics.Filter(schema, ConstantValueExp(Value(true)))
+                .LayoutGeneration(),
+            0U);
+  EXPECT_EQ(statistics.TransformBy(0, Value(10), Value(20)).LayoutGeneration(),
+            0U);
+  EXPECT_EQ(statistics.ScaleToRows(10).LayoutGeneration(), 0U);
+  EXPECT_EQ(statistics.ScaleCardinality(10).LayoutGeneration(), 0U);
+  EXPECT_EQ(statistics.operator*(2).LayoutGeneration(), 0U);
+  TableStatistics concatenated = statistics;
+  concatenated.Concat(statistics);
+  EXPECT_EQ(concatenated.LayoutGeneration(), 0U);
+  // The measurement itself is untouched.
+  EXPECT_NE(statistics.LayoutGeneration(), 0U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, LayoutGeneration_SurvivesTheCatalogRoundTrip) {
+  // The stamp lives in the per-table statistics meta record, so a reopened
+  // database still knows which chain the measurement describes -- and a
+  // reopened database's fresh incarnations never reproduce an old value, so a
+  // persisted stamp can only match after a new measurement.
+  uint64_t before_restart = 0;
+  {
+    TransactionContext context = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                          db_->GetStatistics(context, "Sc1"));
+    before_restart = statistics.LayoutGeneration();
+    ASSERT_NE(before_restart, 0U);
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  Recover();
+  {
+    TransactionContext context = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
+    ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                          db_->GetStatistics(context, "Sc1"));
+    EXPECT_EQ(statistics.LayoutGeneration(), before_restart);
+    // The reopened table's generation comes from a process-global counter, so
+    // the persisted stamp describes a chain this incarnation never saw: stale
+    // until the next measurement.
+    EXPECT_NE(statistics.LayoutGeneration(), table.LayoutGeneration());
+    ASSERT_SUCCESS(db_->RefreshStatistics(context, "Sc1"));
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  // The fresh stamp round-trips through the catalog: the meta record carries
+  // it, so the next session recognizes the chain it describes.
+  {
+    TransactionContext context = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+    ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                                db_->GetStatistics(context, "Sc1"));
+    EXPECT_NE(statistics.LayoutGeneration(), 0U);
+    EXPECT_EQ(statistics.LayoutGeneration(), table.LayoutGeneration());
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+}
+
+TEST_F(TableStatisticsTest, LayoutGeneration_PreProofPayloadsDecodeAsUnknown) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
+  std::stringstream payload_stream;
+  Encoder payload_encoder(payload_stream);
+  payload_encoder << statistics;
+  {
+    TableStatistics decoded(table.GetSchema());
+    Decoder decoder(payload_stream);
+    decoder >> decoded;
+    EXPECT_FALSE(decoder.Failed());
+    EXPECT_EQ(decoded.LayoutGeneration(), statistics.LayoutGeneration());
+    EXPECT_EQ(decoded, statistics);
+  }
+
+  // A v2 payload (written before the stamp existed) still decodes, and carries
+  // no proof: its measurement describes a chain in a previous process.
+  {
+    std::stringstream stream;
+    Encoder encoder(stream);
+    const std::vector<ColumnStats> columns{statistics.Column(0)};
+    encoder << uint64_t{0x544C535441545302ULL} << uint64_t{2}
+            << static_cast<uint64_t>(statistics.Rows()) << columns;
+    TableStatistics old(table.GetSchema());
+    Decoder decoder(stream);
+    decoder >> old;
+    EXPECT_FALSE(decoder.Failed());
+    EXPECT_EQ(old.Rows(), statistics.Rows());
+    EXPECT_EQ(old.LayoutGeneration(), 0U);
+  }
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -890,10 +1019,17 @@ TEST_F(TableStatisticsTest, EstimateCount_InvalidColumnIndex_Aborts) {
   ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
                               db_->GetStatistics(context, "Sc1"));
 
+  // The engine runs background threads (WAL flush / checkpoint), so the
+  // default "fast" death-test style forks a multi-threaded child and
+  // intermittently loses the CHECK message (gtest: "died but not with
+  // expected error"). The threadsafe style re-executes the binary in a
+  // single-threaded child, making the message capture deterministic.
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
   EXPECT_DEATH(std::ignore = statistics.EstimateCount(3, Value(0), Value(1)),
                "statistics column index");
   EXPECT_DEATH(std::ignore = statistics.EstimateCount(-1, Value(0), Value(1)),
                "statistics column index");
+  testing::FLAGS_gtest_death_test_style = "fast";
   std::ignore = context.PreCommit();
 }
 
@@ -1080,6 +1216,122 @@ TEST_F(TableStatisticsTest,
   scaled *= 1e30;
   EXPECT_EQ(scaled.NonNullCount(), std::numeric_limits<size_t>::max());
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, DistinctEstimateIsMonotoneAndDeduplicatesKeys) {
+  auto ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      db_->CreateTable(ctx, Schema("joint", {Column("a", ValueType::kInt64),
+                                             Column("b", ValueType::kInt64)})));
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_SUCCESS(
+        table.Insert(ctx.txn_, Row({Value(i % 10), Value(i % 5)})).GetStatus());
+  }
+  TableStatistics stats(table.GetSchema());
+  ASSERT_SUCCESS(stats.Update(ctx.txn_, table));
+  EXPECT_DOUBLE_EQ(stats.EstimateDistinctRows({}), 1.0);
+  EXPECT_DOUBLE_EQ(stats.EstimateDistinctRows({0}), 10.0);
+  EXPECT_DOUBLE_EQ(stats.EstimateDistinctRows({0, 0}), 10.0);
+  EXPECT_GE(stats.EstimateDistinctRows({0, 1}), 10.0);
+  EXPECT_LE(stats.EstimateDistinctRows({0, 1}), 50.0);
+  EXPECT_DOUBLE_EQ(stats.EstimateDistinctRows({0, 1}),
+                   stats.EstimateDistinctRows({1, 0}));
+}
+
+TEST_F(TableStatisticsTest, JoinEstimateUsesSkewNullsAndDisjointDomains) {
+  auto ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      db_->CreateTable(ctx, Schema("skew", {Column("a", ValueType::kInt64),
+                                            Column("b", ValueType::kInt64),
+                                            Column("c", ValueType::kInt64)})));
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_SUCCESS(
+        table
+            .Insert(ctx.txn_, Row({i < 8 ? Value(1) : Value(),
+                                   i < 3 ? Value(1) : Value(), Value(2)}))
+            .GetStatus());
+  }
+  TableStatistics stats(table.GetSchema());
+  ASSERT_SUCCESS(stats.Update(ctx.txn_, table));
+  EXPECT_DOUBLE_EQ(stats.Column(0).EstimateJoinMatches(stats.Column(1)), 24.0);
+  EXPECT_DOUBLE_EQ(stats.Column(0).EstimateJoinMatches(stats.Column(1), true),
+                   38.0);
+  EXPECT_DOUBLE_EQ(stats.Column(1).EstimateJoinMatches(stats.Column(0)), 24.0);
+  EXPECT_DOUBLE_EQ(stats.Column(0).EstimateJoinMatches(stats.Column(2)), 0.0);
+  EXPECT_DOUBLE_EQ(
+      stats.Column(0).EstimateJoinMatches(ColumnStats(ValueType::kInt64)), 0.0);
+}
+
+TEST_F(TableStatisticsTest, UnmeasuredColumnStaysNeutralNeverEmpty) {
+  // A computed projection column (or a stats-less schema) arrives as a typed
+  // ColumnStats with no measured mass. Estimates over it must stay neutral:
+  // a zero here used to read as a proven-empty relation and collapse every
+  // row estimate above the projection.
+  const Schema schema("unmeasured", {Column("a", ValueType::kInt64),
+                                     Column("b", ValueType::kVarChar),
+                                     Column("c", ValueType::kInt64)});
+  TableStatistics stats(schema);
+  stats.Assign(
+      1000, {ColumnStats(ValueType::kInt64), ColumnStats(ValueType::kVarChar),
+             ColumnStats(ValueType::kInt64)});
+
+  Expression equals = BinaryExpressionExp(ColumnValueExp("unmeasured.a"),
+                                          BinaryOperation::kEquals,
+                                          ConstantValueExp(Value(int64_t{7})));
+  const double equal_sel = stats.EstimateSelectivity(schema, equals);
+  EXPECT_GT(equal_sel, 0.0);
+  EXPECT_LE(equal_sel, 0.25);
+
+  Expression below = BinaryExpressionExp(ColumnValueExp("unmeasured.a"),
+                                         BinaryOperation::kLessThan,
+                                         ConstantValueExp(Value(int64_t{7})));
+  EXPECT_NEAR(stats.EstimateSelectivity(schema, below), 1.0 / 3.0, 1e-9);
+
+  Expression like = BinaryExpressionExp(ColumnValueExp("unmeasured.b"),
+                                        BinaryOperation::kLike,
+                                        ConstantValueExp(Value("prefix%")));
+  EXPECT_GT(stats.EstimateSelectivity(schema, like), 0.0);
+
+  Expression same_table = BinaryExpressionExp(ColumnValueExp("unmeasured.a"),
+                                              BinaryOperation::kEquals,
+                                              ColumnValueExp("unmeasured.c"));
+  EXPECT_NEAR(stats.EstimateSelectivity(schema, same_table), 0.1, 1e-9);
+
+  // The neutral estimate keeps derived row counts alive instead of zeroing
+  // them: Filter over the unmeasured column must not report an empty table.
+  EXPECT_GT(stats.Filter(schema, equals).Rows(), 0U);
+
+  // A range count over an unmeasured column also stays away from zero (and
+  // away from a free full-table claim).
+  const double ranged =
+      stats.EstimateCount(0, Value(int64_t{10}), Value(int64_t{20}));
+  EXPECT_GT(ranged, 0.0);
+  EXPECT_LT(ranged, 1000.0);
+  EXPECT_DOUBLE_EQ(stats.EstimateCount(0, Value(), Value()), 1000.0);
+
+  // A genuinely measured all-NULL column is NOT unmeasured: it keeps the
+  // exact zero-match estimate for equality on a non-NULL constant.
+  {
+    auto ctx = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        db_->CreateTable(ctx,
+                         Schema("allnull", {Column("n", ValueType::kInt64)})));
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_SUCCESS(table.Insert(ctx.txn_, Row({Value()})).GetStatus());
+    }
+    TableStatistics measured(table.GetSchema());
+    ASSERT_SUCCESS(measured.Update(ctx.txn_, table));
+    EXPECT_FALSE(measured.Column(0).Unmeasured());
+    Expression null_equals = BinaryExpressionExp(
+        ColumnValueExp("allnull.n"), BinaryOperation::kEquals,
+        ConstantValueExp(Value(int64_t{1})));
+    EXPECT_DOUBLE_EQ(
+        measured.EstimateSelectivity(table.GetSchema(), null_equals), 0.0);
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
 }
 
 }  // namespace tinylamb

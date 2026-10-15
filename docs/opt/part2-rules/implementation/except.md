@@ -66,13 +66,13 @@ return std::vector<PlanAlternative>{
 
 ## 最適化効果
 
-論理式 `kExcept` から単一の物理演算子 `SetOperationPlan`（`Except`）が生成されます。論理規則 `except_to_antijoin` が適用された場合は論理式が `kAntiJoin` へ変換されるため、ハッシュ反結合（`anti_hash_join` 等）と本規則による集合演算実装が物理プラン候補として競合し、コストモデル（`intersect_except_cost_based_lowering`）に基づいて最適な実装が選択されます。
+論理式 `kExcept` から単一の物理演算子 `SetOperationPlan`（`Except`）が生成されます。論理規則 `except_to_antijoin` が適用された場合は論理式が `kAntiJoin` へ変換されるため、ハッシュ反結合（`anti_hash_join` 等）と本規則による集合演算実装が物理プラン候補として競合し、コストモデル（`intersect_to_semijoin / except_to_antijoin`）に基づいて最適な実装が選択されます。
 
 ## 関連 Rule との相互作用
 
 - `except_all`, `union`, `union_all`, `intersect`, `intersect_all`: 同一の `implement_set_operation` ラムダを共有する集合演算実装規則群です。
 - `except_to_antijoin`: `kExcept` を `kAntiJoin` へ書き換える論理同値規則です。
-- `intersect_except_cost_based_lowering`: 集合差を集合演算として物理化するか、反結合へ降ろすかをコスト比較により決定する制御機構です。
+- `intersect_to_semijoin / except_to_antijoin`: 集合差を集合演算として物理化するか、反結合へ降ろすかをコスト比較により決定する制御機構です。
 - `push_filter_past_setop`, `setop_empty_simplification`, `setop_empty_identity`: `kExcept` の子式に対する述語プッシュダウンや空入力簡約を行う論理規則群です。
 - `anti_hash_join`, `anti_nested_loop_join`: 反結合に変換された場合に適用される物理結合規則群です。
 

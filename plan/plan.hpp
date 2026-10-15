@@ -17,11 +17,15 @@
 #ifndef TINYLAMB_PLAN_HPP
 #define TINYLAMB_PLAN_HPP
 
+#include <iosfwd>
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "expression/expression.hpp"
+#include "type/collation.hpp"
 
 namespace tinylamb {
 class Table;
@@ -33,6 +37,14 @@ class Index;
 // EmitExecutor for every concrete plan node.
 class ExecutorBase;
 using Executor = std::shared_ptr<ExecutorBase>;
+
+struct PlanExplainInfo {
+  std::string rule_name{};
+  std::string physical_operator{};
+  std::string required_properties{};
+  std::string provided_properties{};
+  std::string applied_rules{};
+};
 
 class PlanBase {
  public:
@@ -77,6 +89,28 @@ class PlanBase {
     static_cast<void>(ascending);
     return false;
   }
+  // The collation this plan's delivered ordering was produced under
+  // (kNone = the engine default, i.e. binary byte order). ORDER BY
+  // comparators are collation sensitive — under a case-insensitive
+  // collation 'a' sorts before 'B', under binary 'B' sorts before 'a' — so
+  // an ordering is only good for a consumer that asked for the same
+  // collation. Comparison-based operators (sort, top-n) override this;
+  // index and scan orders are storage byte orders and keep the default.
+  [[nodiscard]] virtual Collation OrderCollation() const {
+    return Collation::kNone;
+  }
+  // True when the ordering this plan reports was MEASURED from the stored
+  // layout (a provably clustered full scan) instead of produced by a sorted
+  // structure such as an index or a sort operator.
+  //
+  // Costing has to tell the two apart. A structural order is free for the scan
+  // that yields it, so the optimizer may prefer such a plan over a cheaper
+  // unordered one and may read a LIMIT above it as an early stop. A measured
+  // order is not: the scan already walked a whole row chain to obtain it, and
+  // the LIMIT stays above the scan, so such a plan has to win on cost alone.
+  // Transparent wrappers (projection / selection / limit) forward this to their
+  // child; every other plan keeps the default.
+  [[nodiscard]] virtual bool OrderIsMeasured() const { return false; }
   // True when the plan already caps its output to `limit_count` rows after
   // skipping `limit_offset`, so callers must not apply the same LIMIT/OFFSET
   // again (D6: single enforcement point).
@@ -89,9 +123,18 @@ class PlanBase {
   // point).
   [[nodiscard]] virtual bool EnforcesDistinct() const { return false; }
 
+  void SetExplainInfo(PlanExplainInfo info) { explain_info_ = std::move(info); }
+  [[nodiscard]] const PlanExplainInfo& ExplainInfo() const {
+    return explain_info_;
+  }
+
   virtual void Dump(std::ostream& o, int indent) const = 0;
+  virtual void Explain(std::ostream& o, int indent) const;
   [[nodiscard]] virtual std::string ToString() const = 0;
   friend std::ostream& operator<<(std::ostream& o, const PlanBase& p);
+
+ private:
+  PlanExplainInfo explain_info_{};
 };
 
 using Plan = std::shared_ptr<PlanBase>;

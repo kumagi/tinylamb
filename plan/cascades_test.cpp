@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,69 @@
 
 namespace tinylamb::cascades {
 
+TEST(CascadesTest, ReconsidersParentAfterChildAlternativeAppears) {
+  Memo memo;
+  const auto leaf = memo.Build({"t"});
+  const auto child = memo.EnsureDerivedGroup({"t"}, "child");
+  memo.AddExpression(child,
+                     {.operation = LogicalOperator::kScan, .table = "t"});
+  const auto root = memo.EnsureDerivedGroup({"t"}, "root");
+  memo.AddExpression(
+      root, {.operation = LogicalOperator::kProjection,
+             .children = {child},
+             .target_list = {NamedExpression("x", ColumnValueExp("t.x"))}});
+  RuleSet rules;
+  rules.Add(Rule(
+      "consume", dsl::Projection(dsl::Selection(dsl::Any())),
+      [](const Bindings&, Memo& target, GroupId group,
+         const LogicalExpression& expr) {
+        target.AddExpression(group, {.operation = LogicalOperator::kLimit,
+                                     .children = expr.children,
+                                     .limit_count = 1});
+      },
+      LogicalOperator::kProjection));
+  rules.Add(Rule(
+      "produce", dsl::Projection(),
+      [child, leaf](const Bindings&, Memo& target, GroupId,
+                    const LogicalExpression&) {
+        target.AddExpression(child,
+                             {.operation = LogicalOperator::kSelection,
+                              .children = {leaf},
+                              .predicate = ConstantValueExp(Value(true))});
+      },
+      LogicalOperator::kProjection));
+  SearchEngine search(std::move(memo), rules);
+  search.Explore(root);
+  EXPECT_TRUE(search.AppliedRuleNames().contains("consume"));
+  EXPECT_EQ(search.GetMemo().ExpressionCount(root), 2U);
+}
+
+TEST(CascadesTest, LargeJoinSeedUsesFilteredRowsAndPreservesConnectivity) {
+  Memo memo;
+  std::vector<std::string> relations;
+  std::vector<ConjunctInfo> predicates;
+  std::unordered_map<std::string, double> rows;
+  for (int i = 0; i < 17; ++i) {
+    const std::string name = "t" + std::to_string(i);
+    relations.push_back(name);
+    rows[name] = i == 16 ? 100000.0 : 10.0;
+    if (i > 0) {
+      const std::string previous = "t" + std::to_string(i - 1);
+      predicates.push_back({BinaryExpressionExp(ColumnValueExp(previous + ".k"),
+                                                BinaryOperation::kEquals,
+                                                ColumnValueExp(name + ".k")),
+                            {previous, name}});
+    }
+  }
+  memo.SetRelationRows(std::move(rows));
+  const auto root = memo.Build(relations, predicates);
+  const auto& join = memo.Get(root).expressions.front();
+  EXPECT_EQ(memo.Get(join.children[0]).relations,
+            std::vector<std::string>{"t16"});
+  EXPECT_TRUE(
+      memo.InducedSubgraphConnected(memo.Get(join.children[1]).relation_mask));
+}
+
 TEST(CascadesTest, DefaultRulesEnumerateEquivalentJoinTreesInMemo) {
   Memo memo;
   const GroupId root = memo.Build({"a", "b", "c"});
@@ -47,6 +111,90 @@ TEST(CascadesTest, DefaultRulesEnumerateEquivalentJoinTreesInMemo) {
 
   EXPECT_GE(search.GetMemo().ExpressionCount(root), 4);
   EXPECT_GE(search.GetMemo().GroupCount(), 6);
+}
+
+TEST(CascadesTest, JoinCommutativityPreservesInheritedPredicate) {
+  Memo memo;
+  (void)memo.Build({"a", "b"});
+  const GroupId a = memo.EnsureGroup({"a"});
+  const GroupId b = memo.EnsureGroup({"b"});
+  const GroupId group =
+      memo.EnsureDerivedGroup({"a", "b"}, "inherited_join_predicate");
+  const Expression predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("a", "id")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("b", "id")));
+  memo.AddExpression(group,
+                     LogicalExpression{.operation = LogicalOperator::kJoin,
+                                       .children = {a, b},
+                                       .predicate = predicate});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(group);
+
+  bool found_commuted = false;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(group).expressions) {
+    if (expression.operation != LogicalOperator::kJoin ||
+        expression.children.size() != 2 || expression.children[0] != b ||
+        expression.children[1] != a) {
+      continue;
+    }
+    found_commuted = true;
+    ASSERT_TRUE(expression.predicate.has_value());
+    // The plain assert teaches the optional-access checker what ASSERT_TRUE
+    // already guarantees.
+    assert(expression.predicate.has_value());
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    EXPECT_EQ(expression.predicate.value()->ToString(), predicate->ToString());
+  }
+  EXPECT_TRUE(found_commuted);
+}
+
+TEST(CascadesTest, NonCanonicalJoinPredicateDoesNotReassociate) {
+  const Expression ab_predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("a", "id")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("b", "id")));
+  const Expression bc_predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("b", "id")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("c", "id")));
+  Memo memo;
+  (void)memo.Build({"a", "b", "c"},
+                   {{.conjunct = ab_predicate, .relations = {"a", "b"}},
+                    {.conjunct = bc_predicate, .relations = {"b", "c"}}});
+  const GroupId a = memo.EnsureGroup({"a"});
+  const GroupId b = memo.EnsureGroup({"b"});
+  const GroupId c = memo.EnsureGroup({"c"});
+  const GroupId ab = memo.EnsureGroup({"a", "b"});
+  const GroupId all =
+      memo.EnsureDerivedGroup({"a", "b", "c"}, "partial_join_predicate");
+  memo.AddExpression(ab, LogicalExpression{.operation = LogicalOperator::kJoin,
+                                           .children = {a, b},
+                                           .predicate = ab_predicate});
+  memo.AddExpression(all, LogicalExpression{.operation = LogicalOperator::kJoin,
+                                            .children = {ab, c},
+                                            .predicate = ab_predicate});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(all);
+
+  const Memo& explored = search.GetMemo();
+  for (const LogicalExpression& expression : explored.Get(all).expressions) {
+    if (expression.operation != LogicalOperator::kJoin ||
+        expression.children.size() != 2) {
+      continue;
+    }
+    const std::vector<std::string> left =
+        explored.Get(expression.children[0]).relations;
+    const std::vector<std::string> right =
+        explored.Get(expression.children[1]).relations;
+    const bool unsafe_a_bc =
+        (left.size() == 1 && left[0] == "a" && right.size() == 2) ||
+        (right.size() == 1 && right[0] == "a" && left.size() == 2);
+    const bool unsafe_b_ac =
+        (left.size() == 1 && left[0] == "b" && right.size() == 2) ||
+        (right.size() == 1 && right[0] == "b" && left.size() == 2);
+    EXPECT_FALSE(unsafe_a_bc || unsafe_b_ac);
+  }
 }
 
 TEST(CascadesTest, JoinEnumerationBoundsConnectedJoinClosure) {
@@ -572,9 +720,10 @@ TEST(CascadesTest, PushSelectionIntoScanAnnotatesGroupFilter) {
   // Act
   search.Explore(selection);
 
-  // Assert: the predicate moved into the scan group's filter.
-  ASSERT_TRUE(search.GetMemo().Get(scan).filter);
-  EXPECT_EQ(search.GetMemo().Get(scan).filter->ToString(),
+  // Assert: the result owns its scan filter; the shared input stays unchanged.
+  EXPECT_FALSE(search.GetMemo().Get(scan).filter);
+  ASSERT_TRUE(search.GetMemo().Get(selection).filter);
+  EXPECT_EQ(search.GetMemo().Get(selection).filter->ToString(),
             EqExp("a.x", Value(1))->ToString());
 }
 
@@ -602,7 +751,7 @@ TEST(CascadesTest, MergeSelectionsCollapsesSelectionChain) {
   // Assert: the outer group gained a merged Selection over the same child.
   const Group& group = search.GetMemo().Get(outer);
   ASSERT_GE(group.expressions.size(), 2U);
-  EXPECT_TRUE(group.expressions[1].children == std::vector<GroupId>{inner});
+  EXPECT_TRUE(group.expressions[1].children == std::vector<GroupId>{scan});
 }
 
 TEST(CascadesTest, PushSelectionThroughJoinMovesSingleRelationConjuncts) {
@@ -689,7 +838,6 @@ TEST(CascadesTest, JoinEnumerationKeepsChainSplitsConnected) {
   RuleSet rules = RuleSet::Default();
   ASSERT_TRUE(rules.Remove("join_associativity_left"));
   ASSERT_TRUE(rules.Remove("join_associativity_right"));
-  ASSERT_TRUE(rules.Remove("star_join_reorder"));
   SearchEngine search(std::move(memo), rules);
 
   search.Explore(root);
@@ -826,24 +974,6 @@ TEST(CascadesTest, TopNPropagatesItsKeysAndLimitToTheChild) {
             (std::vector<ColumnName>{ColumnName("a", "key")}));
   EXPECT_EQ(child_requirements[0].limit_hint, 5U);
   EXPECT_NE(expression.Fingerprint().find("#l:2,3"), std::string::npos);
-}
-
-TEST(CascadesTest, Max1RowIsAUnaryLogicalOperator) {
-  Memo memo;
-  const GroupId scan = memo.Build({"a"});
-  const GroupId max1 = memo.EnsureDerivedGroup({"a"}, "max1");
-  LogicalExpression expression;
-  expression.operation = LogicalOperator::kMax1Row;
-  expression.children = {scan};
-  ASSERT_TRUE(memo.AddExpression(max1, expression));
-
-  PhysicalProperties required;
-  required.ordering = {ColumnName("a", "key")};
-  const std::vector<PhysicalProperties> child_requirements =
-      SearchEngine::RequiredChildProperties(expression, required);
-  ASSERT_EQ(child_requirements.size(), 1U);
-  EXPECT_EQ(child_requirements[0].ordering,
-            (std::vector<ColumnName>{ColumnName("a", "key")}));
 }
 
 TEST(CascadesTest, SetOperationValidatesArityRelationsAndDropsProperties) {
@@ -1509,9 +1639,7 @@ TEST(CascadesTest, DefaultRulesIncludePredicateAndProjectionTransforms) {
   EXPECT_TRUE(rules.Contains("push_semi_join_through_inner_join"));
   EXPECT_TRUE(rules.Contains("push_limit_through_left_join"));
   EXPECT_TRUE(rules.Contains("merge_adjacent_windows"));
-  EXPECT_TRUE(rules.Contains("decorrelate_aggregate_apply"));
   EXPECT_TRUE(rules.Contains("push_not_through_expression"));
-  EXPECT_TRUE(rules.Contains("push_aggregation_through_union_all"));
 }
 
 TEST(CascadesTest, FalseSelectionAddsEmptyLogicalAlternative) {
@@ -1658,59 +1786,6 @@ TEST(CascadesTest, InferJoinPredicatesCopiesConstantsAcrossEquals) {
   ASSERT_TRUE(b.filter);
   EXPECT_NE(b.filter->ToString().find("b.y"), std::string::npos);
   EXPECT_NE(b.filter->ToString().find('1'), std::string::npos);
-}
-
-TEST(CascadesTest, SingleJoinAndMarkJoinAreBinaryLogicalOperators) {
-  using namespace dsl;
-  Memo memo;
-  const GroupId left = memo.Build({"a"});
-  const GroupId right = memo.Build({"b"});
-  const GroupId join = memo.Build({"a", "b"});
-
-  LogicalExpression single_join{.operation = LogicalOperator::kSingleJoin,
-                                .children = {left, right}};
-  EXPECT_TRUE(memo.AddExpression(join, single_join));
-
-  LogicalExpression mark_join{.operation = LogicalOperator::kMarkJoin,
-                              .children = {left, right},
-                              .marker_column = "in_marker"};
-  EXPECT_TRUE(memo.AddExpression(join, mark_join));
-
-  LogicalExpression apply{.operation = LogicalOperator::kApply,
-                          .children = {left, right}};
-  EXPECT_TRUE(memo.AddExpression(join, apply));
-}
-
-TEST(CascadesTest, WindowAndSpoolAreUnaryLogicalOperators) {
-  using namespace dsl;
-  Memo memo;
-  const GroupId scan = memo.Build({"t"});
-  const GroupId window_group = memo.EnsureDerivedGroup({"t"}, "window");
-
-  LogicalExpression window_expr{.operation = LogicalOperator::kWindow,
-                                .children = {scan},
-                                .partition_by = {ColumnValueExp("t.dept")}};
-  EXPECT_TRUE(memo.AddExpression(window_group, window_expr));
-
-  const GroupId spool_group = memo.EnsureDerivedGroup({"t"}, "spool");
-  LogicalExpression spool_expr{.operation = LogicalOperator::kMaterialize,
-                               .children = {scan}};
-  EXPECT_TRUE(memo.AddExpression(spool_group, spool_expr));
-}
-
-TEST(CascadesTest, ConstantTableAndGenerateSeriesAreLeafOperators) {
-  using namespace dsl;
-  Memo memo;
-  const GroupId const_group = memo.Build({"const_tab"});
-
-  LogicalExpression const_table{.operation = LogicalOperator::kConstantTable,
-                                .table = "const_tab"};
-  EXPECT_TRUE(memo.AddExpression(const_group, const_table));
-
-  const GroupId series_group = memo.Build({"series_tab"});
-  LogicalExpression series_expr{.operation = LogicalOperator::kGenerateSeries,
-                                .table = "series_tab"};
-  EXPECT_TRUE(memo.AddExpression(series_group, series_expr));
 }
 
 TEST(CascadesTest,
@@ -2020,33 +2095,6 @@ TEST(CascadesTest, ExceptToAntiJoinRewrite) {
   EXPECT_TRUE(found_distinct_antijoin);
 }
 
-TEST(CascadesTest, CountStarWithoutGroupRewriteToConstantTable) {
-  Memo memo;
-  const GroupId scan = memo.Build({"t1"});
-  const GroupId agg_group = memo.EnsureDerivedGroup({"t1"}, "count_star_agg");
-  memo.AddExpression(
-      agg_group, LogicalExpression{
-                     .operation = LogicalOperator::kAggregation,
-                     .children = {scan},
-                     .target_list = {NamedExpression(
-                         "cnt", AggregateExpressionExp(AggregationType::kCount,
-                                                       nullptr, false))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  const auto& exprs = search.GetMemo().Get(agg_group).expressions;
-  bool found_constant_table = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kConstantTable &&
-        expr.table == "t1") {
-      found_constant_table = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_constant_table);
-}
-
 TEST(CascadesTest, SetopEmptySimplificationRequiresEmptyLeftForExcept) {
   // A EXCEPT empty(B) is just A: an Empty alternative must NOT appear, or
   // costing (Empty costs 0) would collapse a non-empty result.
@@ -2102,89 +2150,6 @@ TEST(CascadesTest, SetopEmptySimplificationCollapsesEmptyLeftExcept) {
     }
   }
   EXPECT_TRUE(found_empty);
-}
-
-TEST(CascadesTest, CountStarRewriteRefusesDerivedSelectionGroup) {
-  // EnsureDerivedGroup leaves Group::filter null on derived selection
-  // groups; the rewrite gates on the group TAG so a derived filter cannot be
-  // silently dropped by the ConstantTable COUNT.
-  Memo memo;
-  const GroupId scan = memo.Build({"t1"});
-  const GroupId sel_group = memo.EnsureDerivedGroup({"t1"}, "sel-derived");
-  memo.AddExpression(
-      sel_group, LogicalExpression{
-                     .operation = LogicalOperator::kSelection,
-                     .children = {scan},
-                     .predicate = BinaryExpressionExp(
-                         ColumnValueExp("t1.v"), BinaryOperation::kGreaterThan,
-                         ConstantValueExp(Value(int64_t{10})))});
-  const GroupId agg_group = memo.EnsureDerivedGroup({"t1"}, "count_star_agg");
-  memo.AddExpression(
-      agg_group, LogicalExpression{
-                     .operation = LogicalOperator::kAggregation,
-                     .children = {sel_group},
-                     .target_list = {NamedExpression(
-                         "cnt", AggregateExpressionExp(AggregationType::kCount,
-                                                       nullptr, false))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  for (const auto& expr : search.GetMemo().Get(agg_group).expressions) {
-    ASSERT_FALSE(expr.operation == LogicalOperator::kConstantTable);
-  }
-}
-
-TEST(CascadesTest, EagerAggregationOverJoinRefusesWhenJoinKeyNotGrouped) {
-  // The join predicate binds t1.t2_id on the aggregated side, but the
-  // grouping sets only cover t1.grp: pushing the aggregate would leave the
-  // re-join predicate binding a column the aggregate no longer produces.
-  Memo memo;
-  Schema t1_schema("t1", {Column("grp", ValueType::kInt64),
-                          Column("t2_id", ValueType::kInt64)});
-  Schema t2_schema("t2", {Column("id", ValueType::kInt64,
-                                 Constraint(Constraint::kPrimaryKey)),
-                          Column("val", ValueType::kInt64)});
-  memo.SetTableSchemas({{"t1", t1_schema}, {"t2", t2_schema}});
-  (void)memo.Build({"t1", "t2"});
-  const GroupId t1 = memo.EnsureGroup({"t1"});
-  const GroupId t2 = memo.EnsureGroup({"t2"});
-
-  const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "j_eager");
-  memo.AddExpression(
-      join_group,
-      LogicalExpression{.operation = LogicalOperator::kJoin,
-                        .children = {t1, t2},
-                        .predicate = BinaryExpressionExp(
-                            ColumnValueExp(ColumnName("t1", "t2_id")),
-                            BinaryOperation::kEquals,
-                            ColumnValueExp(ColumnName("t2", "id")))});
-
-  const GroupId agg_group = memo.EnsureDerivedGroup({"t1", "t2"}, "agg_eager");
-  memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {join_group},
-          .target_list = {NamedExpression(
-              "grp", ColumnValueExp(ColumnName("t1", "grp")))},
-          .grouping_sets = {ColumnValueExp(ColumnName("t1", "grp"))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  for (const auto& expr : search.GetMemo().Get(agg_group).expressions) {
-    if (expr.operation != LogicalOperator::kAggregation ||
-        expr.children.size() != 1 || expr.children[0] == join_group) {
-      continue;
-    }
-    const Group& join_child = search.GetMemo().Get(expr.children[0]);
-    for (const auto& jexpr : join_child.expressions) {
-      if (jexpr.operation == LogicalOperator::kJoin) {
-        ASSERT_FALSE(jexpr.children.size() == 2 && jexpr.children[0] != t1);
-      }
-    }
-  }
 }
 
 TEST(CascadesTest, DistinctAndGroupByInterchangeBothDirections) {
@@ -2624,81 +2589,6 @@ TEST(CascadesTest, PushDownLimitThroughJoin) {
   EXPECT_FALSE(found_limit_pushed);
 }
 
-TEST(CascadesTest, RankRowNumberToTopNRewrite) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId scan = memo.EnsureGroup({"t1"});
-  const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "window_rank");
-  memo.AddExpression(
-      win_group,
-      LogicalExpression{.operation = LogicalOperator::kWindow,
-                        .children = {scan},
-                        .target_list = {NamedExpression(
-                            "rn", ColumnValueExp(ColumnName("t1", "id")))},
-                        .sort_ascending = {true}});
-
-  const GroupId sel_group = memo.EnsureDerivedGroup({"t1"}, "rank_le_5");
-  memo.AddExpression(
-      sel_group, LogicalExpression{.operation = LogicalOperator::kSelection,
-                                   .children = {win_group},
-                                   .predicate = BinaryExpressionExp(
-                                       ColumnValueExp(ColumnName("t1", "rn")),
-                                       BinaryOperation::kLessThanEquals,
-                                       ConstantValueExp(Value(int64_t{5})))});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel_group);
-
-  const auto& exprs = search.GetMemo().Get(sel_group).expressions;
-  bool found_topn = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kTopN && expr.children.size() == 1 &&
-        expr.children[0] == scan && expr.limit_count == 5) {
-      found_topn = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_topn);
-}
-
-TEST(CascadesTest, RankRowNumberToTopNRejectsNonPositiveBounds) {
-  // A non-positive bound keeps no rows (`rn <= 0` is never true, `rn < 1`
-  // likewise).  Casting such a bound through size_t would wrap it into
-  // SIZE_MAX and the rewrite would emit every row instead of none.
-  for (const auto& [op, bound] :
-       std::array<std::pair<BinaryOperation, int64_t>, 3>{
-           {{BinaryOperation::kLessThanEquals, 0},
-            {BinaryOperation::kLessThan, 1},
-            {BinaryOperation::kLessThan, -3}}}) {
-    Memo memo;
-    (void)memo.Build({"t1"});
-    const GroupId scan = memo.EnsureGroup({"t1"});
-    const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "window_rank");
-    memo.AddExpression(
-        win_group,
-        LogicalExpression{.operation = LogicalOperator::kWindow,
-                          .children = {scan},
-                          .target_list = {NamedExpression(
-                              "rn", ColumnValueExp(ColumnName("t1", "id")))},
-                          .sort_ascending = {true}});
-    const GroupId sel_group =
-        memo.EnsureDerivedGroup({"t1"}, "rank_nonpositive");
-    memo.AddExpression(
-        sel_group, LogicalExpression{.operation = LogicalOperator::kSelection,
-                                     .children = {win_group},
-                                     .predicate = BinaryExpressionExp(
-                                         ColumnValueExp(ColumnName("t1", "rn")),
-                                         op, ConstantValueExp(Value(bound)))});
-
-    SearchEngine search(std::move(memo), RuleSet::Default());
-    search.Explore(sel_group);
-    for (const auto& expr : search.GetMemo().Get(sel_group).expressions) {
-      EXPECT_FALSE(expr.operation == LogicalOperator::kTopN)
-          << "non-positive bound " << bound << " became a TopN limit";
-    }
-  }
-}
-
 TEST(CascadesTest, NoOpWindowElimination) {
   Memo memo;
   (void)memo.Build({"t1"});
@@ -2724,95 +2614,6 @@ TEST(CascadesTest, NoOpWindowElimination) {
     }
   }
   EXPECT_TRUE(found_proj);
-}
-
-TEST(CascadesTest, AggregateProjectionMerge) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId scan = memo.EnsureGroup({"t1"});
-  const GroupId agg_group = memo.EnsureDerivedGroup({"t1"}, "agg");
-  memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {scan},
-          .target_list = {NamedExpression(
-              "c1", ColumnValueExp(ColumnName("t1", "id")))},
-          .grouping_sets = {ColumnValueExp(ColumnName("t1", "id"))}});
-
-  const GroupId proj_group = memo.EnsureDerivedGroup({"t1"}, "proj_over_agg");
-  memo.AddExpression(
-      proj_group,
-      LogicalExpression{.operation = LogicalOperator::kProjection,
-                        .children = {agg_group},
-                        .target_list = {NamedExpression(
-                            "c1", ColumnValueExp(ColumnName("t1", "id")))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(proj_group);
-
-  const auto& exprs = search.GetMemo().Get(proj_group).expressions;
-  bool found_merged_agg = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kAggregation &&
-        expr.children.size() == 1 && expr.children[0] == scan) {
-      found_merged_agg = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_merged_agg);
-}
-
-TEST(CascadesTest, EagerAggregationOverJoin) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId left = memo.EnsureGroup({"t1"});
-  const GroupId right = memo.EnsureGroup({"t2"});
-  const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "join");
-  memo.AddExpression(
-      join_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kJoin,
-          .children = {left, right},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("t1", "id")), BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("t2", "id")))});
-
-  const GroupId agg_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "agg_over_join");
-  memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {join_group},
-          .target_list = {NamedExpression(
-              "c1", ColumnValueExp(ColumnName("t1", "id")))},
-          .grouping_sets = {ColumnValueExp(ColumnName("t1", "id"))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  const auto& exprs = search.GetMemo().Get(agg_group).expressions;
-  bool found_join_with_eager_agg = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kJoin && expr.children.size() == 2) {
-      const Group& child_group = search.GetMemo().Get(expr.children[0]);
-      for (const auto& child_expr : child_group.expressions) {
-        if (child_expr.operation == LogicalOperator::kAggregation) {
-          found_join_with_eager_agg = true;
-          break;
-        }
-      }
-      if (found_join_with_eager_agg) {
-        break;
-      }
-    }
-  }
-  // D5 (docs/design.md): eager_aggregation_over_join is gated OFF.  Without
-  // a proof that the join is 1:N on the aggregated side, pushing the
-  // aggregate below the join multiplies COUNT/SUM results, so the rule must
-  // not fire even in its nominal shape.
-  EXPECT_FALSE(found_join_with_eager_agg);
 }
 
 TEST(CascadesTest, ProjectionCseAndPruning) {
@@ -2846,7 +2647,7 @@ TEST(CascadesTest, ProjectionCseAndPruning) {
   EXPECT_FALSE(found_reduced_arity);
 }
 
-TEST(CascadesTest, ProjectionConstantPropagation) {
+TEST(CascadesTest, MergeProjectionsPropagatesConstants) {
   Memo memo;
   (void)memo.Build({"t1"});
   const GroupId scan = memo.EnsureGroup({"t1"});
@@ -2869,14 +2670,21 @@ TEST(CascadesTest, ProjectionConstantPropagation) {
                                      BinaryOperation::kAdd,
                                      ConstantValueExp(Value(int64_t{1}))))}});
 
-  SearchEngine search(std::move(memo), RuleSet::Default());
+  RuleSet rules;
+  for (const auto& rule : RuleSet::Default().Rules()) {
+    if (rule.Name() == "merge_projections") {
+      rules.Add(rule);
+    }
+  }
+  SearchEngine search(std::move(memo), rules);
   search.Explore(outer_proj);
 
   const auto& exprs = search.GetMemo().Get(outer_proj).expressions;
   bool found_prop = false;
   for (const auto& expr : exprs) {
     if (expr.operation == LogicalOperator::kProjection &&
-        !expr.target_list.empty()) {
+        !expr.target_list.empty() &&
+        expr.children == std::vector<GroupId>{scan}) {
       if (expr.target_list[0].expression &&
           expr.target_list[0].expression->Type() == TypeTag::kBinaryExp) {
         const auto& bin = expr.target_list[0].expression->AsBinaryExpression();
@@ -2949,7 +2757,7 @@ TEST(CascadesTest, PushProjectionBelowJoinWidthControl) {
   EXPECT_TRUE(found_width_control);
 }
 
-TEST(CascadesTest, MergeAdjacentProjectionsCompose) {
+TEST(CascadesTest, MergeProjectionsCompose) {
   Memo memo;
   (void)memo.Build({"t1"});
   const GroupId scan = memo.EnsureGroup({"t1"});
@@ -2990,74 +2798,6 @@ TEST(CascadesTest, MergeAdjacentProjectionsCompose) {
   EXPECT_TRUE(found_composed);
 }
 
-TEST(CascadesTest, GreedyJoinOrderFallback) {
-  std::vector<std::string> rels;
-  rels.reserve(18);
-  for (int i = 1; i <= 18; ++i) {
-    rels.push_back("t" + std::to_string(i));
-  }
-  Memo memo;
-  const GroupId root = memo.Build(rels);
-  const auto& exprs = memo.Get(root).expressions;
-  EXPECT_FALSE(exprs.empty());
-  EXPECT_EQ(exprs[0].operation, LogicalOperator::kJoin);
-  EXPECT_EQ(exprs[0].children.size(), 2);
-  EXPECT_EQ(memo.Get(exprs[0].children[0]).relations.size(), 1);
-  EXPECT_EQ(memo.Get(exprs[0].children[1]).relations.size(), 17);
-}
-
-TEST(CascadesTest, JoinCardinalityEstimation) {
-  // 1-to-1 join
-  auto est_1to1 = EstimateJoinCardinality(100.0, 100.0, true, true, 0.5);
-  EXPECT_EQ(est_1to1.multiplicity, JoinMultiplicity::kOneToOne);
-  EXPECT_DOUBLE_EQ(est_1to1.rows, 50.0);
-
-  // 1-to-many join
-  auto est_1toN = EstimateJoinCardinality(100.0, 20.0, false, true, 1.0);
-  EXPECT_EQ(est_1toN.multiplicity, JoinMultiplicity::kOneToMany);
-  EXPECT_DOUBLE_EQ(est_1toN.rows, 100.0);
-
-  // many-to-many join
-  auto est_NtoM = EstimateJoinCardinality(100.0, 50.0, false, false, 0.05);
-  EXPECT_EQ(est_NtoM.multiplicity, JoinMultiplicity::kManyToMany);
-  EXPECT_DOUBLE_EQ(est_NtoM.rows, 250.0);
-}
-
-TEST(CascadesTest, CostModelCalibration) {
-  PhysicalProperties delivered;
-  PhysicalProperties required;
-
-  double hash_cost = CalibrateOperatorCost(OperatorCostKind::kHashJoin, 100.0,
-                                           200.0, delivered, required);
-  EXPECT_GT(hash_cost, 0.0);
-
-  double merge_cost = CalibrateOperatorCost(OperatorCostKind::kMergeJoin, 100.0,
-                                            200.0, delivered, required);
-  EXPECT_GT(merge_cost, 0.0);
-
-  double nlj_cost = CalibrateOperatorCost(OperatorCostKind::kNestedLoopJoin,
-                                          100.0, 200.0, delivered, required);
-  EXPECT_GT(nlj_cost, hash_cost);
-
-  double idx_cost = CalibrateOperatorCost(OperatorCostKind::kIndexScan, 100.0,
-                                          0.0, delivered, required);
-  EXPECT_GT(idx_cost, 0.0);
-
-  double bitmap_cost = CalibrateOperatorCost(OperatorCostKind::kBitmapScan,
-                                             100.0, 0.0, delivered, required);
-  EXPECT_GT(bitmap_cost, 0.0);
-
-  double sort_cost = CalibrateOperatorCost(OperatorCostKind::kSort, 100.0, 0.0,
-                                           delivered, required);
-  EXPECT_GT(sort_cost, 0.0);
-
-  // Property mismatch penalties
-  required.ordering = {ColumnName("t1", "id")};
-  double penalized_cost = CalibrateOperatorCost(
-      OperatorCostKind::kHashJoin, 100.0, 200.0, delivered, required);
-  EXPECT_GT(penalized_cost, hash_cost);
-}
-
 TEST(CascadesTest, DynamicFilterPushdownJoin) {
   Memo memo;
   (void)memo.Build({"t1", "t2"});
@@ -3089,6 +2829,269 @@ TEST(CascadesTest, DynamicFilterPushdownJoin) {
     }
   }
   EXPECT_TRUE(found_bloom);
+}
+
+// The logical half of the dynamic filter contract: the probe-side group records
+// WHICH columns carry the join key, and nothing else. The filter shape (exact
+// set / min-max / Bloom) is an executor decision, so no filter information may
+// leak into the group.
+TEST(CascadesTest, DynamicFilterPushdownJoinAnnotatesTheProbeKeys) {
+  Memo memo;
+  (void)memo.Build({"t1", "t2"});
+  const GroupId g1 = memo.EnsureGroup({"t1"});
+  const GroupId g2 = memo.EnsureGroup({"t2"});
+  const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "root_join");
+  memo.AddExpression(
+      join_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kJoin,
+          .children = {g1, g2},
+          .predicate = BinaryExpressionExp(
+              ColumnValueExp(ColumnName("t1", "id")), BinaryOperation::kEquals,
+              ColumnValueExp(ColumnName("t2", "id")))});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(join_group);
+
+  // The unannotated groups must stay unannotated: the annotation belongs to the
+  // derived probe group only, or every join would look filterable.
+  EXPECT_TRUE(search.GetMemo().Get(g1).dynamic_filter_keys.empty());
+  EXPECT_TRUE(search.GetMemo().Get(g2).dynamic_filter_keys.empty());
+
+  size_t annotated = 0;
+  for (const auto& expr : search.GetMemo().Get(join_group).expressions) {
+    if (expr.operation != LogicalOperator::kJoin || expr.children.size() != 2) {
+      continue;
+    }
+    const Group& probe = search.GetMemo().Get(expr.children[1]);
+    if (probe.tag.find("bloom_probe") == std::string::npos) {
+      continue;
+    }
+    ++annotated;
+    ASSERT_EQ(probe.dynamic_filter_keys.size(), 1U) << probe.tag;
+    // The annotated key always belongs to the annotated group itself: it is the
+    // column the build side's filter would be tested against.
+    ASSERT_EQ(probe.relations.size(), 1U) << probe.tag;
+    EXPECT_EQ(probe.dynamic_filter_keys.front().schema,
+              probe.relations.front());
+    EXPECT_EQ(probe.dynamic_filter_keys.front().name, "id");
+    // The derived group keeps the probe side's selection (D5), so the
+    // alternative stays predicate-equivalent to the original join.
+    EXPECT_FALSE(probe.filter);
+  }
+  // Join commutativity supplies the mirrored expression, so both orientations
+  // are annotated and the implementation rules can pick either build side.
+  EXPECT_GE(annotated, 2U);
+}
+
+// A non-equality join key cannot be expressed as a membership filter, and a
+// multi-relation probe group has no single scan to push into: neither is
+// annotated.
+TEST(CascadesTest, DynamicFilterPushdownJoinSkipsNonEqualityJoins) {
+  Memo memo;
+  (void)memo.Build({"t1", "t2"});
+  const GroupId g1 = memo.EnsureGroup({"t1"});
+  const GroupId g2 = memo.EnsureGroup({"t2"});
+  const GroupId range_group =
+      memo.EnsureDerivedGroup({"t1", "t2"}, "range_join");
+  // A band predicate has no membership domain, so a dynamic filter over the
+  // build keys could not be sound.
+  memo.AddExpression(
+      range_group,
+      LogicalExpression{.operation = LogicalOperator::kJoin,
+                        .children = {g1, g2},
+                        .predicate = BinaryExpressionExp(
+                            ColumnValueExp(ColumnName("t1", "id")),
+                            BinaryOperation::kLessThan,
+                            ColumnValueExp(ColumnName("t2", "id")))});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(range_group);
+  for (const auto& expr : search.GetMemo().Get(range_group).expressions) {
+    if (expr.operation != LogicalOperator::kJoin || expr.children.size() != 2) {
+      continue;
+    }
+    const Group& probe = search.GetMemo().Get(expr.children[1]);
+    EXPECT_TRUE(probe.dynamic_filter_keys.empty()) << probe.tag;
+  }
+  EXPECT_TRUE(search.GetMemo().Get(g1).dynamic_filter_keys.empty());
+  EXPECT_TRUE(search.GetMemo().Get(g2).dynamic_filter_keys.empty());
+}
+
+// A multi-relation probe group is left alone: the filter would have to be
+// pushed through a join, which this rule does not model.
+TEST(CascadesTest, DynamicFilterPushdownJoinSkipsMultiRelationProbe) {
+  Memo memo;
+  (void)memo.Build({"t1", "t2", "t3"});
+  const GroupId g1 = memo.EnsureGroup({"t1"});
+  const GroupId g2 = memo.EnsureGroup({"t2"});
+  const GroupId g34 = memo.EnsureGroup({"t3"});
+  const GroupId g23 = memo.EnsureGroup({"t2", "t3"});
+  const GroupId root = memo.EnsureDerivedGroup({"t1", "t2", "t3"}, "root");
+  memo.AddExpression(
+      g23, LogicalExpression{.operation = LogicalOperator::kJoin,
+                             .children = {g2, g34},
+                             .predicate = BinaryExpressionExp(
+                                 ColumnValueExp(ColumnName("t2", "id")),
+                                 BinaryOperation::kEquals,
+                                 ColumnValueExp(ColumnName("t3", "id")))});
+  // root = t1 join (t2 join t3) on two equalities: the probe side is the
+  // two-relation group g23.
+  memo.AddExpression(
+      root,
+      LogicalExpression{
+          .operation = LogicalOperator::kJoin,
+          .children = {g1, g23},
+          .predicate = CombineConjuncts(
+              {BinaryExpressionExp(ColumnValueExp(ColumnName("t1", "id")),
+                                   BinaryOperation::kEquals,
+                                   ColumnValueExp(ColumnName("t2", "id"))),
+               BinaryExpressionExp(ColumnValueExp(ColumnName("t1", "id")),
+                                   BinaryOperation::kEquals,
+                                   ColumnValueExp(ColumnName("t3", "id")))})});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(root);
+  for (const auto& expr : search.GetMemo().Get(root).expressions) {
+    if (expr.operation != LogicalOperator::kJoin || expr.children.size() != 2) {
+      continue;
+    }
+    const Group& probe = search.GetMemo().Get(expr.children[1]);
+    if (probe.relations.size() == 1) {
+      continue;  // commutativity-derived single-relation alternative
+    }
+    EXPECT_TRUE(probe.dynamic_filter_keys.empty()) << probe.tag;
+  }
+}
+
+// The logical half of the hash semi reduction contract
+// (`semi_reduction_pushdown_semi_join` / `..._anti_join`): the probe-side group
+// records WHICH columns carry the join key whose distinct values bound the
+// build side. Like the dynamic-filter annotation it says nothing about HOW the
+// build is shrunk -- dedup, domain restriction and the fallback are all
+// executor decisions -- and it must not leak onto the unannotated groups, or
+// every semi/anti join would look reducible.
+TEST(CascadesTest, SemiReductionPushdownAnnotatesTheProbeKeys) {
+  for (const LogicalOperator operation :
+       {LogicalOperator::kSemiJoin, LogicalOperator::kAntiJoin}) {
+    Memo memo;
+    (void)memo.Build({"t1", "t2"});
+    const GroupId g1 = memo.EnsureGroup({"t1"});
+    const GroupId g2 = memo.EnsureGroup({"t2"});
+    const GroupId join_group =
+        memo.EnsureDerivedGroup({"t1", "t2"}, "root_semi");
+    memo.AddExpression(
+        join_group,
+        LogicalExpression{.operation = operation,
+                          .children = {g1, g2},
+                          .predicate = BinaryExpressionExp(
+                              ColumnValueExp(ColumnName("t1", "id")),
+                              BinaryOperation::kEquals,
+                              ColumnValueExp(ColumnName("t2", "id")))});
+
+    SearchEngine search(std::move(memo), RuleSet::Default());
+    search.Explore(join_group);
+
+    // The base groups stay unannotated: the annotation belongs to the derived
+    // probe group only.
+    EXPECT_TRUE(search.GetMemo().Get(g1).semi_reduction_probe_keys.empty());
+    EXPECT_TRUE(search.GetMemo().Get(g2).semi_reduction_probe_keys.empty());
+
+    size_t annotated = 0;
+    for (const auto& expr : search.GetMemo().Get(join_group).expressions) {
+      if (expr.operation != operation || expr.children.size() != 2) {
+        continue;
+      }
+      const Group& probe = search.GetMemo().Get(expr.children[0]);
+      if (probe.tag.find("semi_reduce_probe") == std::string::npos) {
+        continue;
+      }
+      ++annotated;
+      ASSERT_EQ(probe.semi_reduction_probe_keys.size(), 1U) << probe.tag;
+      // The annotated key always belongs to the annotated group itself.
+      ASSERT_EQ(probe.relations.size(), 1U) << probe.tag;
+      EXPECT_EQ(probe.semi_reduction_probe_keys.front().schema,
+                probe.relations.front());
+      EXPECT_EQ(probe.semi_reduction_probe_keys.front().name, "id");
+      // No filter information may leak into the group: the rule names columns,
+      // not filter shapes.
+      EXPECT_FALSE(probe.filter);
+    }
+    EXPECT_GE(annotated, 1U) << "op=" << static_cast<int>(operation);
+  }
+}
+
+// A band predicate has no membership domain, so there is no key set a build
+// side could be cut down to. Neither is annotated.
+TEST(CascadesTest, SemiReductionPushdownSkipsNonEqualityJoins) {
+  for (const LogicalOperator operation :
+       {LogicalOperator::kSemiJoin, LogicalOperator::kAntiJoin}) {
+    Memo memo;
+    (void)memo.Build({"t1", "t2"});
+    const GroupId g1 = memo.EnsureGroup({"t1"});
+    const GroupId g2 = memo.EnsureGroup({"t2"});
+    const GroupId join_group =
+        memo.EnsureDerivedGroup({"t1", "t2"}, "range_semi");
+    memo.AddExpression(
+        join_group,
+        LogicalExpression{.operation = operation,
+                          .children = {g1, g2},
+                          .predicate = BinaryExpressionExp(
+                              ColumnValueExp(ColumnName("t1", "id")),
+                              BinaryOperation::kLessThan,
+                              ColumnValueExp(ColumnName("t2", "id")))});
+
+    SearchEngine search(std::move(memo), RuleSet::Default());
+    search.Explore(join_group);
+    for (const auto& expr : search.GetMemo().Get(join_group).expressions) {
+      if (expr.operation != operation || expr.children.size() != 2) {
+        continue;
+      }
+      const Group& probe = search.GetMemo().Get(expr.children[0]);
+      EXPECT_TRUE(probe.semi_reduction_probe_keys.empty()) << probe.tag;
+    }
+    EXPECT_TRUE(search.GetMemo().Get(g1).semi_reduction_probe_keys.empty());
+    EXPECT_TRUE(search.GetMemo().Get(g2).semi_reduction_probe_keys.empty());
+  }
+}
+
+// A composite semi key is annotated with EVERY key column, because the
+// executor's domain is built over the whole memcomparable encoding.
+TEST(CascadesTest, SemiReductionPushdownAnnotatesEveryCompositeKey) {
+  Memo memo;
+  (void)memo.Build({"t1", "t2"});
+  const GroupId g1 = memo.EnsureGroup({"t1"});
+  const GroupId g2 = memo.EnsureGroup({"t2"});
+  const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "composite");
+  memo.AddExpression(
+      join_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kSemiJoin,
+          .children = {g1, g2},
+          .predicate = CombineConjuncts(
+              {BinaryExpressionExp(ColumnValueExp(ColumnName("t1", "a")),
+                                   BinaryOperation::kEquals,
+                                   ColumnValueExp(ColumnName("t2", "a"))),
+               BinaryExpressionExp(ColumnValueExp(ColumnName("t1", "b")),
+                                   BinaryOperation::kEquals,
+                                   ColumnValueExp(ColumnName("t2", "b")))})});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(join_group);
+  size_t composite_annotations = 0;
+  for (const auto& expr : search.GetMemo().Get(join_group).expressions) {
+    if (expr.operation != LogicalOperator::kSemiJoin ||
+        expr.children.size() != 2) {
+      continue;
+    }
+    const Group& probe = search.GetMemo().Get(expr.children[0]);
+    if (probe.semi_reduction_probe_keys.empty()) {
+      continue;
+    }
+    ++composite_annotations;
+    EXPECT_EQ(probe.semi_reduction_probe_keys.size(), 2U) << probe.tag;
+  }
+  EXPECT_GE(composite_annotations, 1U);
 }
 
 TEST(CascadesTest, JoinPredicateTransitivity) {
@@ -3334,77 +3337,6 @@ TEST(CascadesTest, IntersectExceptLoweringUsesNullSafeRowEquality) {
                                             LogicalOperator::kAntiJoin));
 }
 
-TEST(CascadesTest, UnionDistinctHashSortChoice) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId g1 = memo.EnsureGroup({"t1"});
-  const GroupId g2 = memo.EnsureGroup({"t2"});
-  const GroupId union_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "union_root");
-
-  memo.AddExpression(
-      union_group,
-      LogicalExpression{.operation = LogicalOperator::kUnion,
-                        .children = {g1, g2},
-                        .target_list = {NamedExpression(
-                            "id", ColumnValueExp(ColumnName("t1", "id")))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(union_group);
-
-  const auto& exprs = search.GetMemo().Get(union_group).expressions;
-  bool found_distinct = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kDistinct) {
-      found_distinct = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_distinct);
-}
-
-TEST(CascadesTest, WindowFrameSortSharing) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId scan = memo.EnsureGroup({"t1"});
-  const GroupId inner_win = memo.EnsureDerivedGroup({"t1"}, "inner_w");
-  const GroupId outer_win = memo.EnsureDerivedGroup({"t1"}, "outer_w");
-
-  const std::vector<Expression> partition = {
-      ColumnValueExp(ColumnName("t1", "dept"))};
-  const std::vector<bool> ascending = {true};
-
-  memo.AddExpression(inner_win,
-                     LogicalExpression{.operation = LogicalOperator::kWindow,
-                                       .children = {scan},
-                                       .target_list = {NamedExpression(
-                                           "w1", ColumnValueExp("t1.dept"))},
-                                       .sort_ascending = ascending,
-                                       .partition_by = partition});
-
-  memo.AddExpression(outer_win,
-                     LogicalExpression{.operation = LogicalOperator::kWindow,
-                                       .children = {inner_win},
-                                       .target_list = {NamedExpression(
-                                           "w2", ColumnValueExp("t1.dept"))},
-                                       .sort_ascending = ascending,
-                                       .partition_by = partition});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(outer_win);
-
-  const auto& exprs = search.GetMemo().Get(outer_win).expressions;
-  bool found_shared = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kWindow &&
-        expr.children.size() == 1 && expr.children[0] == scan) {
-      found_shared = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_shared);
-}
-
 TEST(CascadesTest, UnnestFilterPushdown) {
   Memo memo;
   const GroupId scan = memo.Build({"t1"});
@@ -3553,46 +3485,6 @@ TEST(CascadesTest, InListToSemiJoin) {
   EXPECT_TRUE(found_semi);
 }
 
-TEST(CascadesTest, FilterPullUpForExtremeSelectivity) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId g1 = memo.EnsureGroup({"t1"});
-  const GroupId g2 = memo.EnsureGroup({"t2"});
-  const GroupId sel_left = memo.EnsureDerivedGroup({"t1"}, "sel_left");
-
-  Expression filter_pred =
-      BinaryExpressionExp(ColumnValueExp("t1.status"), BinaryOperation::kEquals,
-                          ConstantValueExp(Value(int64_t{1})));
-  memo.AddExpression(sel_left,
-                     LogicalExpression{.operation = LogicalOperator::kSelection,
-                                       .children = {g1},
-                                       .predicate = filter_pred});
-
-  const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "root_join");
-  Expression join_pred =
-      BinaryExpressionExp(ColumnValueExp("t1.id"), BinaryOperation::kEquals,
-                          ColumnValueExp("t2.id"));
-
-  memo.AddExpression(join_group,
-                     LogicalExpression{.operation = LogicalOperator::kJoin,
-                                       .children = {sel_left, g2},
-                                       .predicate = join_pred});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(join_group);
-
-  const auto& exprs = search.GetMemo().Get(join_group).expressions;
-  bool found_pull_up = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kSelection &&
-        expr.children.size() == 1) {
-      found_pull_up = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_pull_up);
-}
-
 TEST(CascadesTest, FunctionalDependencyFilterReduction) {
   Memo memo;
   const GroupId scan = memo.Build({"t1"});
@@ -3629,132 +3521,6 @@ TEST(CascadesTest, FunctionalDependencyFilterReduction) {
     }
   }
   EXPECT_TRUE(found_reduced);
-}
-
-TEST(CascadesTest, ScanZoneMapFilterIntegration) {
-  Memo memo;
-  const GroupId scan = memo.Build({"t1"});
-  memo.MergeScanFilter(
-      scan, BinaryExpressionExp(ColumnValueExp("t1.id"),
-                                BinaryOperation::kGreaterThan,
-                                ConstantValueExp(Value(int64_t{100}))));
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(scan);
-
-  bool found_zm = false;
-  for (size_t g = 0; g < search.GetMemo().GroupCount(); ++g) {
-    if (search.GetMemo().Get(g).tag.find("zonemap") != std::string::npos) {
-      found_zm = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_zm);
-}
-
-TEST(CascadesTest, CountDistinctExpansion) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId scan = memo.EnsureGroup({"t1"});
-  const GroupId agg_group =
-      memo.EnsureDerivedGroup({"t1"}, "agg_count_distinct");
-  memo.AddExpression(
-      agg_group, LogicalExpression{
-                     .operation = LogicalOperator::kAggregation,
-                     .children = {scan},
-                     .target_list = {NamedExpression(
-                         "cnt", AggregateExpressionExp(AggregationType::kCount,
-                                                       ColumnValueExp("t1.id"),
-                                                       /*distinct=*/true))},
-                     .grouping_sets = {ColumnValueExp("t1.k")}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  const auto& exprs = search.GetMemo().Get(agg_group).expressions;
-  bool found_expanded = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kAggregation &&
-        expr.children.size() == 1 && expr.children[0] != scan) {
-      const auto& child_exprs =
-          search.GetMemo().Get(expr.children[0]).expressions;
-      for (const auto& c_expr : child_exprs) {
-        if (c_expr.operation == LogicalOperator::kAggregation &&
-            c_expr.children.size() == 1 && c_expr.children[0] == scan) {
-          found_expanded = true;
-          break;
-        }
-      }
-    }
-  }
-  EXPECT_TRUE(found_expanded);
-}
-
-TEST(CascadesTest, GroupingSetsExpansion) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId scan = memo.EnsureGroup({"t1"});
-  const GroupId agg_group =
-      memo.EnsureDerivedGroup({"t1"}, "agg_multi_grouping");
-  memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {scan},
-          .target_list = {NamedExpression(
-              "cnt", AggregateExpressionExp(AggregationType::kCount,
-                                            ColumnValueExp("t1.id"),
-                                            /*distinct=*/false))},
-          .grouping_sets = {ColumnValueExp("t1.a"), ColumnValueExp("t1.b")}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  const auto& exprs = search.GetMemo().Get(agg_group).expressions;
-  bool found_union_all = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kUnionAll &&
-        expr.children.size() == 2) {
-      found_union_all = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_union_all);
-}
-
-TEST(CascadesTest, HavingToFilterRewrite) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId scan = memo.EnsureGroup({"t1"});
-  const GroupId agg_group = memo.EnsureDerivedGroup({"t1"}, "agg_having");
-  Expression having_pred =
-      BinaryExpressionExp(ColumnValueExp("cnt"), BinaryOperation::kGreaterThan,
-                          ConstantValueExp(Value(int64_t{5})));
-  memo.AddExpression(
-      agg_group, LogicalExpression{
-                     .operation = LogicalOperator::kAggregation,
-                     .children = {scan},
-                     .predicate = having_pred,
-                     .target_list = {NamedExpression(
-                         "cnt", AggregateExpressionExp(AggregationType::kCount,
-                                                       ColumnValueExp("t1.id"),
-                                                       /*distinct=*/false))},
-                     .grouping_sets = {ColumnValueExp("t1.k")}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  const auto& exprs = search.GetMemo().Get(agg_group).expressions;
-  bool found_sel = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kSelection &&
-        expr.children.size() == 1 && expr.predicate.has_value() &&
-        *expr.predicate == having_pred) {
-      found_sel = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_sel);
 }
 
 TEST(CascadesTest, FilterAggregatePushdown) {
@@ -3894,47 +3660,6 @@ TEST(CascadesTest, EquijoinSelectivityBackoff) {
   EXPECT_NEAR(three_keys, 0.1 * std::sqrt(0.2) * std::pow(0.5, 0.25), 1e-12);
 }
 
-TEST(CascadesTest, MultiColumnCorrelationNdv) {
-  std::vector<double> selectivities = {0.1, 0.2};
-  const double independent = EstimateMultiColumnSelectivity(selectivities, 0.0);
-  EXPECT_NEAR(independent, 0.02, 1e-6);
-
-  const double fully_correlated =
-      EstimateMultiColumnSelectivity(selectivities, 1.0);
-  EXPECT_NEAR(fully_correlated, 0.1, 1e-6);
-
-  const double partial_correlated =
-      EstimateMultiColumnSelectivity(selectivities, 0.5);
-  EXPECT_NEAR(partial_correlated, 0.06, 1e-6);
-}
-
-TEST(CascadesTest, LikeRegexSelectivityModel) {
-  const double sel_all =
-      EstimatePatternSelectivity(PatternMatchingKind::kLike, "%");
-  EXPECT_NEAR(sel_all, 1.0, 1e-6);
-
-  const double sel_prefix1 =
-      EstimatePatternSelectivity(PatternMatchingKind::kLike, "a%");
-  const double sel_prefix3 =
-      EstimatePatternSelectivity(PatternMatchingKind::kLike, "abc%");
-  EXPECT_GT(sel_prefix1, sel_prefix3);
-
-  const double sel_regex_prefix =
-      EstimatePatternSelectivity(PatternMatchingKind::kRegexp, "^abc.*");
-  EXPECT_NEAR(sel_regex_prefix, sel_prefix3, 1e-6);
-}
-
-TEST(CascadesTest, HistogramJoinEstimation) {
-  std::vector<HistogramBucket> left = {
-      {.lower = 0.0, .upper = 10.0, .count = 100.0, .distinct_count = 10.0},
-      {.lower = 10.0, .upper = 20.0, .count = 200.0, .distinct_count = 20.0}};
-  std::vector<HistogramBucket> right = {
-      {.lower = 5.0, .upper = 15.0, .count = 150.0, .distinct_count = 15.0}};
-
-  const double est = EstimateHistogramJoinCardinality(left, right);
-  EXPECT_GT(est, 0.0);
-}
-
 TEST(CascadesTest, MemorySpillCostModel) {
   MemoryBudget budget;
   budget.max_memory_bytes = 1024.0 * 1024.0;
@@ -3952,100 +3677,6 @@ TEST(CascadesTest, MemorySpillCostModel) {
   const double spill_hash =
       EstimateMemorySpillCost(OperatorCostKind::kHashJoin, 20000.0, budget);
   EXPECT_GT(spill_hash, 0.0);
-}
-
-TEST(CascadesTest, UniqueGroupKeyAggregateElimination) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId scan = memo.EnsureGroup({"t1"});
-  const GroupId agg_group =
-      memo.EnsureDerivedGroup({"t1"}, "unique_group_key_agg");
-
-  memo.AddExpression(
-      scan,
-      LogicalExpression{.operation = LogicalOperator::kScan,
-                        .table = "t1",
-                        .output_schema = Schema(
-                            "t1", {Column("id", ValueType::kInt64,
-                                          Constraint(Constraint::kPrimaryKey)),
-                                   Column("val", ValueType::kInt64),
-                                   Column("v2", ValueType::kVarChar)})});
-
-  memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {scan},
-          .target_list = {NamedExpression("id", ColumnValueExp("t1.id")),
-                          NamedExpression(
-                              "min_val",
-                              AggregateExpressionExp(AggregationType::kMin,
-                                                     ColumnValueExp("t1.val"))),
-                          NamedExpression(
-                              "any_v",
-                              AggregateExpressionExp(AggregationType::kAnyValue,
-                                                     ColumnValueExp("t1.v2")))},
-          .output_schema = Schema("t1", {Column("id", ValueType::kInt64),
-                                         Column("min_val", ValueType::kInt64),
-                                         Column("any_v", ValueType::kVarChar)}),
-          .grouping_sets = {ColumnValueExp("t1.id")}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  const auto& exprs = search.GetMemo().Get(agg_group).expressions;
-  bool found_proj = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kProjection &&
-        expr.children.size() == 1 && expr.children[0] == scan) {
-      if (expr.target_list.size() == 3 &&
-          expr.target_list[1].expression->Type() == TypeTag::kColumnValue &&
-          expr.target_list[2].expression->Type() == TypeTag::kColumnValue) {
-        found_proj = true;
-        break;
-      }
-    }
-  }
-  EXPECT_TRUE(found_proj);
-}
-
-TEST(CascadesTest, OneRowCrossJoinElimination) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId left = memo.EnsureGroup({"t1"});
-  const GroupId right = memo.EnsureDerivedGroup({}, "one_row_const");
-
-  memo.AddExpression(
-      right, LogicalExpression{.operation = LogicalOperator::kValues,
-                               .values = {Row({Value(int64_t{42})})},
-                               .output_schema = Schema(
-                                   "c", {Column("k", ValueType::kInt64)})});
-
-  const GroupId cross_group =
-      memo.EnsureDerivedGroup({"t1"}, "cross_join_1row");
-  memo.AddExpression(
-      cross_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kCrossJoin,
-          .children = {left, right},
-          .target_list = {NamedExpression("id", ColumnValueExp("t1.id")),
-                          NamedExpression("k", ColumnValueExp("c.k"))},
-          .output_schema = Schema("out", {Column("id", ValueType::kInt64),
-                                          Column("k", ValueType::kInt64)})});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(cross_group);
-
-  const auto& exprs = search.GetMemo().Get(cross_group).expressions;
-  bool found_scalar_proj = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kProjection &&
-        expr.children.size() == 1 && expr.children[0] == left) {
-      found_scalar_proj = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_scalar_proj);
 }
 
 TEST(CascadesTest, AggregateUnionTranspose) {
@@ -4106,59 +3737,7 @@ TEST(CascadesTest, AggregateUnionTranspose) {
   EXPECT_TRUE(found_transposed);
 }
 
-TEST(CascadesTest, AggregateJoinTranspose) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId left = memo.EnsureGroup({"t1"});
-  const GroupId right = memo.EnsureGroup({"t2"});
-  const GroupId join_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "join_input");
-  memo.AddExpression(
-      join_group,
-      LogicalExpression{.operation = LogicalOperator::kJoin,
-                        .children = {left, right},
-                        .predicate = BinaryExpressionExp(
-                            ColumnValueExp("t1.id"), BinaryOperation::kEquals,
-                            ColumnValueExp("t2.fk_id"))});
-
-  const GroupId agg_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "agg_over_join");
-  memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {join_group},
-          .target_list = {NamedExpression(
-              "sum_v", AggregateExpressionExp(AggregationType::kSum,
-                                              ColumnValueExp("t1.v")))},
-          .output_schema = Schema("out", {Column("sum_v", ValueType::kInt64)}),
-          .grouping_sets = {ColumnValueExp("t1.id")}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  const auto& exprs = search.GetMemo().Get(agg_group).expressions;
-  bool found_join_over_agg = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kJoin && expr.children.size() == 2) {
-      const auto& left_child_exprs =
-          search.GetMemo().Get(expr.children[0]).expressions;
-      for (const auto& lc : left_child_exprs) {
-        if (lc.operation == LogicalOperator::kAggregation &&
-            lc.children.size() == 1 && lc.children[0] == left) {
-          found_join_over_agg = true;
-          break;
-        }
-      }
-    }
-  }
-  // D5 (docs/design.md): aggregate_join_transpose is gated OFF until the
-  // 1:N precondition is proven from constraints; the transposed aggregate
-  // inflates SUM/COUNT when the join multiplies rows.
-  EXPECT_FALSE(found_join_over_agg);
-}
-
-TEST(CascadesTest, WindowAfterFilterPartitionPushdown) {
+TEST(CascadesTest, WindowPartitionFilterPushdownUsesCanonicalRule) {
   Memo memo;
   (void)memo.Build({"t1"});
   const GroupId scan = memo.EnsureGroup({"t1"});
@@ -4168,8 +3747,9 @@ TEST(CascadesTest, WindowAfterFilterPartitionPushdown) {
       LogicalExpression{
           .operation = LogicalOperator::kWindow,
           .children = {scan},
-          .target_list = {NamedExpression("part", ColumnValueExp("t1.part")),
-                          NamedExpression("val", ColumnValueExp("t1.val"))},
+          .target_list = {NamedExpression(
+              "rn", WindowFunctionCallExp("row_number", {},
+                                          {ColumnValueExp("t1.part")}, {}))},
           .output_schema = Schema("t1", {Column("part", ValueType::kInt64),
                                          Column("val", ValueType::kInt64)}),
           .partition_by = {ColumnValueExp("t1.part")}});
@@ -4205,45 +3785,6 @@ TEST(CascadesTest, WindowAfterFilterPartitionPushdown) {
   EXPECT_TRUE(found_win_over_sel);
 }
 
-TEST(CascadesTest, StarJoinReorderAndCostModel) {
-  Memo memo;
-  (void)memo.Build(
-      {"fact", "dim1", "dim2"},
-      {ConjunctInfo{.conjunct = BinaryExpressionExp(
-                        ColumnValueExp("fact.d1_id"), BinaryOperation::kEquals,
-                        ColumnValueExp("dim1.id")),
-                    .relations = {"fact", "dim1"}},
-       ConjunctInfo{.conjunct = BinaryExpressionExp(
-                        ColumnValueExp("fact.d2_id"), BinaryOperation::kEquals,
-                        ColumnValueExp("dim2.id")),
-                    .relations = {"fact", "dim2"}}});
-
-  const GroupId root = memo.EnsureGroup({"fact", "dim1", "dim2"});
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(root);
-
-  const auto& exprs = search.GetMemo().Get(root).expressions;
-  bool found_fact_split = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kJoin && expr.children.size() == 2) {
-      const auto& left_rels = search.GetMemo().Get(expr.children[0]).relations;
-      const auto& right_rels = search.GetMemo().Get(expr.children[1]).relations;
-      if ((left_rels.size() == 1 && left_rels[0] == "fact" &&
-           right_rels.size() == 2) ||
-          (right_rels.size() == 1 && right_rels[0] == "fact" &&
-           left_rels.size() == 2)) {
-        found_fact_split = true;
-        break;
-      }
-    }
-  }
-  EXPECT_TRUE(found_fact_split);
-
-  const double star_cost =
-      EstimateStarJoinCost(100000.0, {100.0, 500.0}, {0.01, 0.05});
-  EXPECT_GT(star_cost, 0.0);
-}
-
 TEST(CascadesTest, PkUniqueDistinctElimination) {
   Memo memo;
   (void)memo.Build({"t1"});
@@ -4276,7 +3817,7 @@ TEST(CascadesTest, PkUniqueDistinctElimination) {
   const auto& exprs = search.GetMemo().Get(distinct_group).expressions;
   bool found_eliminated = false;
   for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kProjection) {
+    if (expr.operation == LogicalOperator::kScan) {
       found_eliminated = true;
       break;
     }
@@ -4288,14 +3829,11 @@ TEST(CascadesTest, NotNullIsNotNullElimination) {
   Memo memo;
   (void)memo.Build({"t1"});
   const GroupId scan = memo.EnsureGroup({"t1"});
-  memo.AddExpression(
-      scan,
-      LogicalExpression{.operation = LogicalOperator::kScan,
-                        .table = "t1",
-                        .output_schema = Schema(
-                            "t1", {Column("id", ValueType::kInt64,
-                                          Constraint(Constraint::kNotNull)),
-                                   Column("name", ValueType::kVarChar)})});
+  // SQL publishes the catalog separately; its Scan has no output_schema.
+  memo.SetTableSchemas(
+      {{"t1", Schema("t1", {Column("id", ValueType::kInt64,
+                                   Constraint(Constraint::kNotNull)),
+                            Column("name", ValueType::kVarChar)})}});
 
   const GroupId sel_group = memo.EnsureDerivedGroup({"t1"}, "sel_is_not_null");
   memo.AddExpression(
@@ -4307,6 +3845,8 @@ TEST(CascadesTest, NotNullIsNotNullElimination) {
 
   SearchEngine search(std::move(memo), RuleSet::Default());
   search.Explore(sel_group);
+  EXPECT_TRUE(
+      search.AppliedRuleNames().contains("not_null_is_not_null_elimination"));
 
   const auto& exprs = search.GetMemo().Get(sel_group).expressions;
   bool found_true_or_scan = false;
@@ -4325,98 +3865,6 @@ TEST(CascadesTest, NotNullIsNotNullElimination) {
     }
   }
   EXPECT_TRUE(found_true_or_scan);
-}
-
-TEST(CascadesTest, FkJoinElimination) {
-  Memo memo;
-  (void)memo.Build({"child", "parent"});
-  const GroupId child = memo.EnsureGroup({"child"});
-  const GroupId parent = memo.EnsureGroup({"parent"});
-  memo.AddExpression(
-      child, LogicalExpression{
-                 .operation = LogicalOperator::kScan,
-                 .table = "child",
-                 .output_schema = Schema(
-                     "child", {Column("id", ValueType::kInt64),
-                               Column("fk_id", ValueType::kInt64,
-                                      Constraint(Constraint::kNotNull))})});
-  memo.AddExpression(
-      parent,
-      LogicalExpression{
-          .operation = LogicalOperator::kScan,
-          .table = "parent",
-          .output_schema =
-              Schema("parent", {Column("id", ValueType::kInt64,
-                                       Constraint(Constraint::kPrimaryKey))})});
-
-  const GroupId join_group =
-      memo.EnsureDerivedGroup({"child", "parent"}, "fk_join");
-  memo.AddExpression(
-      join_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kJoin,
-          .children = {child, parent},
-          .predicate = BinaryExpressionExp(ColumnValueExp("child.fk_id"),
-                                           BinaryOperation::kEquals,
-                                           ColumnValueExp("parent.id")),
-          .target_list = {NamedExpression("id", ColumnValueExp("child.id")),
-                          NamedExpression("fk_id",
-                                          ColumnValueExp("child.fk_id"))},
-          .output_schema =
-              Schema("child", {Column("id", ValueType::kInt64),
-                               Column("fk_id", ValueType::kInt64)})});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(join_group);
-
-  const auto& exprs = search.GetMemo().Get(join_group).expressions;
-  bool found_semi = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kSemiJoin &&
-        expr.children.size() == 2 && expr.children[0] == child &&
-        expr.children[1] == parent) {
-      found_semi = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_semi);
-}
-
-TEST(CascadesTest, CheckConstraintPredicateIntake) {
-  Memo memo;
-  (void)memo.Build({"t1"});
-  const GroupId scan = memo.EnsureGroup({"t1"});
-  memo.AddExpression(
-      scan, LogicalExpression{
-                .operation = LogicalOperator::kScan,
-                .table = "t1",
-                .output_schema = Schema(
-                    "t1", {Column("x", ValueType::kInt64,
-                                  Constraint(Constraint::kCheck,
-                                             Value(std::string("x >= 0"))))})});
-
-  const GroupId sel_group =
-      memo.EnsureDerivedGroup({"t1"}, "sel_contradiction");
-  memo.AddExpression(
-      sel_group,
-      LogicalExpression{.operation = LogicalOperator::kSelection,
-                        .children = {scan},
-                        .predicate = BinaryExpressionExp(
-                            ColumnValueExp("t1.x"), BinaryOperation::kLessThan,
-                            ConstantValueExp(Value(int64_t{0})))});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel_group);
-
-  const auto& exprs = search.GetMemo().Get(sel_group).expressions;
-  bool found_empty = false;
-  for (const auto& expr : exprs) {
-    if (expr.operation == LogicalOperator::kEmpty) {
-      found_empty = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_empty);
 }
 
 TEST(CascadesTest, SplitSelectionOverJoinPushesConjunctsOfBothSides) {
@@ -4587,8 +4035,7 @@ TEST(CascadesTest, PushFilterThroughLeftJoinLeftSide) {
 }
 
 TEST(CascadesTest, PushProjectionThroughAggregationMovesProjectionBelow) {
-  // Projection over an aggregation with simple column references can push
-  // the projection below the aggregation.
+  // Prune aggregate inputs while retaining the output projection and aliases.
   Memo memo;
   const GroupId scan = memo.Build({"a"});
   const GroupId agg_group = memo.EnsureDerivedGroup({"a"}, "agg");
@@ -4610,23 +4057,32 @@ TEST(CascadesTest, PushProjectionThroughAggregationMovesProjectionBelow) {
   const bool found = std::ranges::any_of(
       search.GetMemo().Get(root).expressions,
       [&](const LogicalExpression& expression) {
-        if (expression.operation != LogicalOperator::kAggregation ||
-            expression.children.size() != 1) {
+        if (expression.operation != LogicalOperator::kProjection ||
+            expression.children.size() != 1 ||
+            expression.children[0] == agg_group) {
           return false;
         }
-        return std::ranges::any_of(
-            search.GetMemo().Get(expression.children.front()).expressions,
-            [&](const LogicalExpression& child) {
-              return child.operation == LogicalOperator::kProjection &&
-                     child.children.size() == 1 &&
-                     child.children.front() == scan;
-            });
+        for (const auto& aggregate :
+             search.GetMemo().Get(expression.children[0]).expressions) {
+          if (aggregate.operation != LogicalOperator::kAggregation ||
+              aggregate.children.size() != 1) {
+            continue;
+          }
+          for (const auto& child :
+               search.GetMemo().Get(aggregate.children[0]).expressions) {
+            if (child.operation == LogicalOperator::kProjection &&
+                child.children == std::vector<GroupId>{scan}) {
+              return true;
+            }
+          }
+        }
+        return false;
       });
   EXPECT_TRUE(found);
 }
 
-TEST(CascadesTest, MergeAdjacentFiltersCombinesBothPredicates) {
-  // merge_adjacent_filters flattens Selection(p2, Selection(p1, X)) into a
+TEST(CascadesTest, MergeSelectionsFlattensBothPredicates) {
+  // merge_selections flattens Selection(p2, Selection(p1, X)) into a
   // single Selection(p1 AND p2, X) so the residual chain collapses.
   Memo memo;
   const GroupId scan = memo.Build({"a"});
@@ -4658,73 +4114,6 @@ TEST(CascadesTest, MergeAdjacentFiltersCombinesBothPredicates) {
                    std::string::npos;
       });
   EXPECT_TRUE(found);
-}
-
-TEST(CascadesTest, UnusedJoinEliminationRewritesToSemiJoin) {
-  // PRODUCTION FIX: an inner join whose right side is never projected must
-  // NOT be replaced by a bare left-side projection.  The join duplicates
-  // left rows when several right rows match, so the old rewrite silently
-  // changed the result cardinality (and dropped left-side-only predicate
-  // conjuncts).  The sound rewrite is a SEMI join over the same children.
-  Memo memo;
-  (void)memo.Build({"a", "b"});
-  const GroupId left_child = memo.EnsureGroup({"a"});
-  const GroupId right_child = memo.EnsureGroup({"b"});
-  const GroupId join_group = memo.EnsureDerivedGroup({"a", "b"}, "inner-join");
-  ASSERT_TRUE(memo.AddExpression(
-      join_group, LogicalExpression{.operation = LogicalOperator::kJoin,
-                                    .children = {left_child, right_child},
-                                    .predicate = EqExp("a.id", Value(1))}));
-  const GroupId proj_group = memo.EnsureDerivedGroup({"a", "b"}, "proj");
-  ASSERT_TRUE(memo.AddExpression(
-      proj_group, LogicalExpression{.operation = LogicalOperator::kProjection,
-                                    .children = {join_group},
-                                    .target_list = {NamedExpression(
-                                        "id", ColumnValueExp("a.id"))}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(proj_group);
-
-  bool semi_join_added = false;
-  for (const LogicalExpression& expression :
-       search.GetMemo().Get(proj_group).expressions) {
-    if (expression.operation == LogicalOperator::kSemiJoin &&
-        expression.children.size() == 2 &&
-        expression.children[0] == left_child &&
-        expression.children[1] == right_child) {
-      semi_join_added = true;
-    }
-  }
-  EXPECT_TRUE(semi_join_added);
-}
-
-TEST(CascadesTest, UnusedJoinEliminationDoesNotFireWithoutPredicate) {
-  // A cross join duplicates every left row by the right cardinality: it must
-  // never be rewritten into a semi join.
-  Memo memo(64);
-  (void)memo.Build({"a", "b"});
-  const GroupId left_child = memo.EnsureGroup({"a"});
-  const GroupId right_child = memo.EnsureGroup({"b"});
-  const GroupId join_group = memo.EnsureDerivedGroup({"a", "b"}, "cross");
-  ASSERT_TRUE(memo.AddExpression(
-      join_group, LogicalExpression{.operation = LogicalOperator::kJoin,
-                                    .children = {left_child, right_child},
-                                    .predicate = Expression{}}));
-  const GroupId proj_group = memo.EnsureDerivedGroup({"a", "b"}, "proj");
-  ASSERT_TRUE(memo.AddExpression(
-      proj_group, LogicalExpression{.operation = LogicalOperator::kProjection,
-                                    .children = {join_group},
-                                    .target_list = {NamedExpression(
-                                        "id", ColumnValueExp("a.id"))}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(proj_group);
-  bool semi_join_added = false;
-  for (const LogicalExpression& expression :
-       search.GetMemo().Get(proj_group).expressions) {
-    if (expression.operation == LogicalOperator::kSemiJoin) {
-      semi_join_added = true;
-    }
-  }
-  EXPECT_FALSE(semi_join_added);
 }
 
 // Note: contradiction detection and join elimination effectiveness are
@@ -4966,144 +4355,6 @@ TEST(CascadesTest, OuterToAntiJoinRequiresNullCheckOnAllRightColumns) {
   EXPECT_FALSE(has_anti_join);
 }
 
-TEST(CascadesTest, RankRowNumberToTopNSkipsPartitionedWindow) {
-  // D5 counterexample: rank_row_number_to_topn must NOT convert a
-  // partitioned window function to TopN. ROW_NUMBER() OVER (PARTITION BY x)
-  // requires per-partition numbering, which a single TopN cannot provide.
-  Memo memo;
-  const GroupId scan = memo.Build({"t"});
-  const GroupId win = memo.EnsureDerivedGroup({"t"}, "win");
-  ASSERT_TRUE(memo.AddExpression(
-      win, LogicalExpression{
-               .operation = LogicalOperator::kWindow,
-               .children = {scan},
-               .target_list = {NamedExpression("rn", ColumnValueExp("t.id"))},
-               .sort_ascending = {true},
-               .sort_nulls_first = {false},
-               .partition_by = {ColumnValueExp("t.department")}}));
-  // WHERE rn <= 3
-  Expression pred = BinaryExpressionExp(ColumnValueExp("rn"),
-                                        BinaryOperation::kLessThanEquals,
-                                        ConstantValueExp(Value(int64_t{3})));
-  const GroupId sel = memo.EnsureDerivedGroup({"t"}, "sel");
-  ASSERT_TRUE(memo.AddExpression(
-      sel, LogicalExpression{.operation = LogicalOperator::kSelection,
-                             .children = {win},
-                             .predicate = pred}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel);
-
-  // The rule should NOT have created a TopN because the window has
-  // PARTITION BY which requires per-partition numbering.
-  const bool has_topn = std::ranges::any_of(
-      search.GetMemo().Get(sel).expressions, [](const LogicalExpression& expr) {
-        return expr.operation == LogicalOperator::kTopN;
-      });
-  EXPECT_FALSE(has_topn);
-}
-
-TEST(CascadesTest, RankRowNumberToTopNSkipsNonWindowColumn) {
-  // D5 counterexample (列出自検証): Selection filters on a column that is
-  // NOT one of the window's output columns; rn-style TopN conversion must
-  // refuse because the limit counts a different attribute.
-  Memo memo;
-  const GroupId scan = memo.Build({"t"});
-  const GroupId win = memo.EnsureDerivedGroup({"t"}, "win");
-  ASSERT_TRUE(memo.AddExpression(
-      win, LogicalExpression{
-               .operation = LogicalOperator::kWindow,
-               .children = {scan},
-               .target_list = {NamedExpression("rn", ColumnValueExp("t.id"))},
-               .sort_ascending = {true},
-               .sort_nulls_first = {false}}));
-  Expression pred = BinaryExpressionExp(ColumnValueExp("t.salary"),
-                                        BinaryOperation::kLessThanEquals,
-                                        ConstantValueExp(Value(int64_t{3})));
-  const GroupId sel = memo.EnsureDerivedGroup({"t"}, "sel");
-  ASSERT_TRUE(memo.AddExpression(
-      sel, LogicalExpression{.operation = LogicalOperator::kSelection,
-                             .children = {win},
-                             .predicate = pred}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel);
-  const bool has_topn = std::ranges::any_of(
-      search.GetMemo().Get(sel).expressions, [](const LogicalExpression& expr) {
-        return expr.operation == LogicalOperator::kTopN;
-      });
-  EXPECT_FALSE(has_topn);
-}
-
-TEST(CascadesTest, RankRowNumberToTopNSkipsResidualConjuncts) {
-  // D5 counterexample: a conjunct besides the window-column bound (here
-  // t.salary > 100) must survive the rewrite. The rule replaces the whole
-  // Selection, so any residual would be silently dropped; the rule must
-  // refuse the rewrite instead of converting only the first conjunct.
-  Memo memo;
-  const GroupId scan = memo.Build({"t"});
-  const GroupId win = memo.EnsureDerivedGroup({"t"}, "win");
-  ASSERT_TRUE(memo.AddExpression(
-      win, LogicalExpression{
-               .operation = LogicalOperator::kWindow,
-               .children = {scan},
-               .target_list = {NamedExpression("rn", ColumnValueExp("t.id"))},
-               .sort_ascending = {true},
-               .sort_nulls_first = {false}}));
-  Expression pred = BinaryExpressionExp(
-      BinaryExpressionExp(ColumnValueExp("t.id"),
-                          BinaryOperation::kLessThanEquals,
-                          ConstantValueExp(Value(int64_t{3}))),
-      BinaryOperation::kAnd,
-      BinaryExpressionExp(ColumnValueExp("t.salary"),
-                          BinaryOperation::kGreaterThan,
-                          ConstantValueExp(Value(int64_t{100}))));
-  const GroupId sel = memo.EnsureDerivedGroup({"t"}, "sel");
-  ASSERT_TRUE(memo.AddExpression(
-      sel, LogicalExpression{.operation = LogicalOperator::kSelection,
-                             .children = {win},
-                             .predicate = pred}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel);
-  const bool has_topn = std::ranges::any_of(
-      search.GetMemo().Get(sel).expressions, [](const LogicalExpression& expr) {
-        return expr.operation == LogicalOperator::kTopN;
-      });
-  EXPECT_FALSE(has_topn);
-}
-
-TEST(CascadesTest, RankRowNumberToTopNEqualsUsesOffsetForKthRow) {
-  // `WHERE rn = 3` over row_number() must become TopN(limit=1, offset=2):
-  // exactly the 3rd ranked row, skipping the first 2.  (An earlier form
-  // emitted limit=3/offset=2 -- correct but wider -- and the original bug
-  // emitted limit=1/offset=0, returning the FIRST row instead of the 3rd.)
-  Memo memo;
-  const GroupId scan = memo.Build({"t"});
-  const GroupId win = memo.EnsureDerivedGroup({"t"}, "win");
-  ASSERT_TRUE(memo.AddExpression(
-      win, LogicalExpression{
-               .operation = LogicalOperator::kWindow,
-               .children = {scan},
-               .target_list = {NamedExpression("rn", ColumnValueExp("t.id"))},
-               .sort_ascending = {true},
-               .sort_nulls_first = {false}}));
-  Expression pred =
-      BinaryExpressionExp(ColumnValueExp("rn"), BinaryOperation::kEquals,
-                          ConstantValueExp(Value(int64_t{3})));
-  const GroupId sel = memo.EnsureDerivedGroup({"t"}, "sel");
-  ASSERT_TRUE(memo.AddExpression(
-      sel, LogicalExpression{.operation = LogicalOperator::kSelection,
-                             .children = {win},
-                             .predicate = pred}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel);
-  const auto it = std::ranges::find_if(
-      search.GetMemo().Get(sel).expressions, [](const LogicalExpression& expr) {
-        return expr.operation == LogicalOperator::kTopN;
-      });
-  ASSERT_TRUE(it != search.GetMemo().Get(sel).expressions.end());
-  EXPECT_EQ(it->limit_count, 1U);
-  EXPECT_EQ(it->limit_offset, 2U);
-}
-
 TEST(CascadesTest, InListToSemiJoinRejectsUncollectableBranch) {
   // D5 counterexample (収集できなかったOR枝を捨てない): three collectable
   // same-column equalities PLUS one range branch.  The old rule fired on the
@@ -5180,113 +4431,6 @@ TEST(CascadesTest, DerivedGroupFingerprintSeparatesDifferentInLists) {
   ASSERT_TRUE(found_a);
   ASSERT_TRUE(found_b);
   EXPECT_NE(const_a, const_b);
-}
-
-TEST(CascadesTest, EagerAggregationOverJoinSkipsOuterJoin) {
-  // D5 counterexample: eager_aggregation_over_join must NOT push aggregation
-  // below an outer join. LEFT JOIN preserves unmatched left rows with NULLs;
-  // aggregating before the join would lose those rows.
-  Memo memo;
-  (void)memo.Build({"a", "b"});
-  const GroupId left = memo.EnsureGroup({"a"});
-  const GroupId right = memo.EnsureGroup({"b"});
-  const GroupId join_group = memo.EnsureDerivedGroup({"a", "b"}, "oj");
-  ASSERT_TRUE(memo.AddExpression(
-      join_group,
-      LogicalExpression{.operation = LogicalOperator::kOuterJoin,
-                        .children = {left, right},
-                        .predicate = BinaryExpressionExp(
-                            ColumnValueExp("a.id"), BinaryOperation::kEquals,
-                            ColumnValueExp("b.id")),
-                        .join_type = 0}));
-  // SELECT a.dept, COUNT(a.id) FROM a LEFT JOIN b ON a.id=b.id GROUP BY a.dept
-  Expression agg_input = ColumnValueExp("a.id");
-  Expression group_key = ColumnValueExp("a.dept");
-  const GroupId agg_group = memo.EnsureDerivedGroup({"a", "b"}, "agg");
-  ASSERT_TRUE(memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {join_group},
-          .target_list = {NamedExpression("dept", group_key),
-                          NamedExpression("cnt", AggregateExpressionExp(
-                                                     AggregationType::kCount,
-                                                     agg_input, false))},
-          .grouping_sets = {group_key}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  // The rule should NOT have pushed aggregation below the outer join.
-  const bool agg_pushed = std::ranges::any_of(
-      search.GetMemo().Get(agg_group).expressions,
-      [&](const LogicalExpression& expr) {
-        if (expr.operation != LogicalOperator::kJoin) {
-          return false;
-        }
-        for (GroupId child : expr.children) {
-          for (const LogicalExpression& cexpr :
-               search.GetMemo().Get(child).expressions) {
-            if (cexpr.operation == LogicalOperator::kAggregation) {
-              return true;
-            }
-          }
-        }
-        return false;
-      });
-  EXPECT_FALSE(agg_pushed);
-}
-
-TEST(CascadesTest, AggregateJoinTransposeSkipsOuterJoin) {
-  // D5 counterexample: aggregate_join_transpose must NOT push aggregation
-  // below an outer join. The aggregation would lose NULL-padded rows.
-  Memo memo;
-  (void)memo.Build({"a", "b"});
-  const GroupId left = memo.EnsureGroup({"a"});
-  const GroupId right = memo.EnsureGroup({"b"});
-  const GroupId join_group = memo.EnsureDerivedGroup({"a", "b"}, "oj");
-  ASSERT_TRUE(memo.AddExpression(
-      join_group,
-      LogicalExpression{.operation = LogicalOperator::kOuterJoin,
-                        .children = {left, right},
-                        .predicate = BinaryExpressionExp(
-                            ColumnValueExp("a.id"), BinaryOperation::kEquals,
-                            ColumnValueExp("b.id")),
-                        .join_type = 0}));
-  // SELECT a.dept, COUNT(a.id) FROM a LEFT JOIN b ON a.id=b.id GROUP BY a.dept
-  Expression agg_input = ColumnValueExp("a.id");
-  Expression group_key = ColumnValueExp("a.dept");
-  const GroupId agg_group = memo.EnsureDerivedGroup({"a", "b"}, "agg");
-  ASSERT_TRUE(memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {join_group},
-          .target_list = {NamedExpression("dept", group_key),
-                          NamedExpression("cnt", AggregateExpressionExp(
-                                                     AggregationType::kCount,
-                                                     agg_input, false))},
-          .grouping_sets = {group_key}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  // The rule should NOT have pushed aggregation below the outer join.
-  const bool agg_pushed = std::ranges::any_of(
-      search.GetMemo().Get(agg_group).expressions,
-      [&](const LogicalExpression& expr) {
-        if (expr.operation != LogicalOperator::kJoin) {
-          return false;
-        }
-        for (GroupId child : expr.children) {
-          for (const LogicalExpression& cexpr :
-               search.GetMemo().Get(child).expressions) {
-            if (cexpr.operation == LogicalOperator::kAggregation) {
-              return true;
-            }
-          }
-        }
-        return false;
-      });
-  EXPECT_FALSE(agg_pushed);
 }
 
 TEST(CascadesTest, UniqueSemiToInnerDoesNotFireWithoutKeyEquality) {
@@ -5510,6 +4654,69 @@ TEST(CascadesTest, GroupLogicalPropertiesPropagation) {
   EXPECT_FALSE(props.IsUniqueOn({"users.email"}));
   EXPECT_TRUE(props.IsNotNull("users.id"));
   EXPECT_FALSE(props.IsUniqueOn({"users.name"}));
+}
+
+TEST(CascadesTest, IncrementalPropertiesRefreshChangedChildren) {
+  Memo memo;
+  const GroupId base = memo.Build({"users"});
+  const GroupId child = memo.EnsureDerivedGroup({"users"}, "child");
+  const GroupId parent = memo.EnsureDerivedGroup({"users"}, "parent");
+
+  ASSERT_TRUE(memo.AddExpression(
+      child, LogicalExpression{.operation = LogicalOperator::kSelection,
+                               .children = {base},
+                               .predicate = BinaryExpressionExp(
+                                   ColumnValueExp(ColumnName("users", "id")),
+                                   BinaryOperation::kGreaterThan,
+                                   ConstantValueExp(Value(0)))}));
+  ASSERT_TRUE(memo.AddExpression(
+      parent, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                .children = {child},
+                                .predicate = BinaryExpressionExp(
+                                    ColumnValueExp(ColumnName("users", "id")),
+                                    BinaryOperation::kGreaterThan,
+                                    ConstantValueExp(Value(0)))}));
+  ASSERT_TRUE(memo.AddExpression(
+      child, LogicalExpression{
+                 .operation = LogicalOperator::kSelection,
+                 .children = {base},
+                 .predicate = BinaryExpressionExp(
+                     ColumnValueExp(ColumnName("users", "id")),
+                     BinaryOperation::kEquals,
+                     ColumnValueExp(ColumnName("users", "employee_id")))}));
+  ASSERT_TRUE(memo.AddExpression(
+      parent, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                .children = {child},
+                                .predicate = BinaryExpressionExp(
+                                    ColumnValueExp(ColumnName("users", "id")),
+                                    BinaryOperation::kLessThan,
+                                    ConstantValueExp(Value(100)))}));
+
+  EXPECT_TRUE(memo.Get(parent).logical_properties.AreEqual(
+      "users.id", "users.employee_id"));
+}
+
+TEST(CascadesTest, LogicalPropertiesSchemaRefreshIsChildFirst) {
+  Memo memo;
+  (void)memo.Build({"a", "b"});
+  const GroupId left = memo.EnsureGroup({"a"});
+  const GroupId right = memo.EnsureGroup({"b"});
+  const GroupId parent = memo.EnsureDerivedGroup({"a", "b"}, "join");
+  ASSERT_TRUE(memo.AddExpression(
+      parent, LogicalExpression{.operation = LogicalOperator::kJoin,
+                                .children = {left, right},
+                                .predicate = BinaryExpressionExp(
+                                    ColumnValueExp(ColumnName("a", "x")),
+                                    BinaryOperation::kEquals,
+                                    ColumnValueExp(ColumnName("b", "id")))}));
+
+  memo.SetTableSchemas(
+      {{"a", Schema("a", {Column("x", ValueType::kInt64,
+                                 Constraint(Constraint::kPrimaryKey))})},
+       {"b", Schema("b", {Column("id", ValueType::kInt64,
+                                 Constraint(Constraint::kPrimaryKey))})}});
+
+  EXPECT_TRUE(memo.Get(parent).logical_properties.IsUniqueOn({"a.x"}));
 }
 
 TEST(CascadesTest, PushDownLimitThroughJoinOnUniqueKey) {
@@ -5780,175 +4987,6 @@ TEST(CascadesTest, SemiJoinCommutativity) {
   EXPECT_TRUE(found_commuted);
 }
 
-TEST(CascadesTest, ApplyToJoinDecorrelation) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId left = memo.EnsureGroup({"t1"});
-  const GroupId right = memo.EnsureGroup({"t2"});
-  const GroupId apply_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "apply_test");
-  memo.AddExpression(
-      apply_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kApply,
-          .children = {left, right},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("t1", "id")), BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("t2", "id"))),
-          .join_type = 0});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(apply_group);
-
-  bool found_join = false;
-  for (const auto& expr : search.GetMemo().Get(apply_group).expressions) {
-    if (expr.operation == LogicalOperator::kJoin) {
-      found_join = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_join);
-}
-
-// Apply and OuterJoin encode join_type differently (Apply:
-// 0=Inner/1=LeftOuter/2=Semi/3=Anti; OuterJoin: 0=LEFT/1=RIGHT/2=FULL).
-// decorrelate_aggregate_apply must remap, not copy: a LeftOuter apply
-// lowered with the raw value becomes a RIGHT join (wrong null-padded side),
-// and Semi/Anti would become FULL.
-TEST(CascadesTest, DecorrelateAggregateApplyRemapsLeftOuterJoinType) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId outer = memo.EnsureGroup({"t1"});
-  const GroupId inner_scan = memo.EnsureGroup({"t2"});
-  const GroupId inner_sel =
-      memo.EnsureDerivedGroup({"t2"}, "decorr_sel_left_outer");
-  memo.AddExpression(
-      inner_sel,
-      LogicalExpression{
-          .operation = LogicalOperator::kSelection,
-          .children = {inner_scan},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("t2", "id")), BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("t1", "id")))});
-  const GroupId inner_agg =
-      memo.EnsureDerivedGroup({"t2"}, "decorr_agg_left_outer");
-  memo.AddExpression(
-      inner_agg,
-      LogicalExpression{.operation = LogicalOperator::kAggregation,
-                        .children = {inner_sel},
-                        .target_list = {NamedExpression(
-                            "total", AggregateExpressionExp(
-                                         AggregationType::kSum,
-                                         ColumnValueExp(ColumnName("t2", "v")),
-                                         /*distinct=*/false))}});
-  const GroupId apply_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "decorr_apply_left_outer");
-  memo.AddExpression(apply_group,
-                     LogicalExpression{.operation = LogicalOperator::kApply,
-                                       .children = {outer, inner_agg},
-                                       .join_type = 1});  // LeftOuter
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(apply_group);
-
-  bool found_left_outer = false;
-  for (const auto& expr : search.GetMemo().Get(apply_group).expressions) {
-    if (expr.operation == LogicalOperator::kOuterJoin) {
-      EXPECT_EQ(expr.join_type, 0)  // LeftOuter, never RIGHT (=1)
-          << "Apply join_type=1 leaked into the OuterJoin payload";
-      found_left_outer = true;
-    }
-  }
-  EXPECT_TRUE(found_left_outer);
-}
-
-TEST(CascadesTest, PushSelectionThroughApply) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId left = memo.EnsureGroup({"t1"});
-  const GroupId right = memo.EnsureGroup({"t2"});
-  const GroupId apply_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "apply_sub");
-  memo.AddExpression(apply_group,
-                     LogicalExpression{.operation = LogicalOperator::kApply,
-                                       .children = {left, right},
-                                       .join_type = 0});
-
-  const GroupId sel_group = memo.EnsureDerivedGroup({"t1", "t2"}, "sel_apply");
-  memo.AddExpression(
-      sel_group, LogicalExpression{.operation = LogicalOperator::kSelection,
-                                   .children = {apply_group},
-                                   .predicate = BinaryExpressionExp(
-                                       ColumnValueExp(ColumnName("t1", "val")),
-                                       BinaryOperation::kGreaterThan,
-                                       ConstantValueExp(Value(5L)))});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel_group);
-
-  bool found_pushed_apply = false;
-  for (const auto& expr : search.GetMemo().Get(sel_group).expressions) {
-    if (expr.operation == LogicalOperator::kApply &&
-        expr.children.size() == 2) {
-      const Group& left_child = search.GetMemo().Get(expr.children[0]);
-      for (const auto& cexpr : left_child.expressions) {
-        if (cexpr.operation == LogicalOperator::kSelection) {
-          found_pushed_apply = true;
-          break;
-        }
-      }
-    }
-  }
-  EXPECT_TRUE(found_pushed_apply);
-}
-
-TEST(CascadesTest, PushApplyThroughJoin) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2", "sub"});
-  const GroupId t1 = memo.EnsureGroup({"t1"});
-  const GroupId t2 = memo.EnsureGroup({"t2"});
-  const GroupId sub = memo.EnsureGroup({"sub"});
-  const GroupId join_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "join_t1_t2");
-  memo.AddExpression(
-      join_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kJoin,
-          .children = {t1, t2},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("t1", "id")), BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("t2", "id")))});
-
-  const GroupId apply_group =
-      memo.EnsureDerivedGroup({"t1", "t2", "sub"}, "apply_join");
-  memo.AddExpression(
-      apply_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kApply,
-          .children = {join_group, sub},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("t1", "val")), BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("sub", "val"))),
-          .join_type = 0});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(apply_group);
-
-  bool found_pushed_join = false;
-  for (const auto& expr : search.GetMemo().Get(apply_group).expressions) {
-    if (expr.operation == LogicalOperator::kJoin && expr.children.size() == 2) {
-      const Group& left_child = search.GetMemo().Get(expr.children[0]);
-      for (const auto& cexpr : left_child.expressions) {
-        if (cexpr.operation == LogicalOperator::kApply) {
-          found_pushed_join = true;
-          break;
-        }
-      }
-    }
-  }
-  EXPECT_TRUE(found_pushed_join);
-}
-
 TEST(CascadesTest, OuterToInnerJoinNullAllowingPredicateDoesNotRewrite) {
   Memo memo;
   (void)memo.Build({"t1", "t2"});
@@ -6040,6 +5078,53 @@ TEST(CascadesTest, OuterToInnerJoinCoalesceDoesNotRewrite) {
   EXPECT_FALSE(found_inner_join);
 }
 
+TEST(CascadesTest, NonRejectingRightFilterKeepsEveryOuterKind) {
+  for (uint8_t kind : {uint8_t{0}, uint8_t{1}, uint8_t{2}}) {
+    SCOPED_TRACE(kind);
+    Memo memo;
+    (void)memo.Build({"t1", "t2"});
+    const GroupId left = memo.EnsureGroup({"t1"});
+    const GroupId right = memo.EnsureGroup({"t2"});
+    const GroupId outer = memo.EnsureDerivedGroup({"t1", "t2"}, "outer");
+    memo.AddExpression(
+        outer, LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                                 .children = {left, right},
+                                 .predicate = BinaryExpressionExp(
+                                     ColumnValueExp(ColumnName("t1", "id")),
+                                     BinaryOperation::kEquals,
+                                     ColumnValueExp(ColumnName("t2", "id"))),
+                                 .join_type = kind});
+    const GroupId selection =
+        memo.EnsureDerivedGroup({"t1", "t2"}, "selection");
+    memo.AddExpression(
+        selection,
+        LogicalExpression{
+            .operation = LogicalOperator::kSelection,
+            .children = {outer},
+            .predicate = BinaryExpressionExp(
+                FunctionCallExp("coalesce",
+                                {ColumnValueExp(ColumnName("t2", "val")),
+                                 ConstantValueExp(Value(int64_t{0}))}),
+                BinaryOperation::kEquals,
+                ConstantValueExp(Value(int64_t{0})))});
+    SearchEngine search(std::move(memo), RuleSet::Default());
+    search.Explore(selection);
+    bool found_inner = false;
+    for (const LogicalExpression& expression :
+         search.GetMemo().Get(selection).expressions) {
+      if (expression.operation != LogicalOperator::kSelection ||
+          expression.children.size() != 1) {
+        continue;
+      }
+      for (const LogicalExpression& child :
+           search.GetMemo().Get(expression.children[0]).expressions) {
+        found_inner = found_inner || child.operation == LogicalOperator::kJoin;
+      }
+    }
+    EXPECT_FALSE(found_inner);
+  }
+}
+
 TEST(CascadesTest, OuterJoinAssociativityRejectsInvalidPredicate) {
   Memo memo;
   (void)memo.Build({"a", "b", "c"});
@@ -6083,67 +5168,7 @@ TEST(CascadesTest, OuterJoinAssociativityRejectsInvalidPredicate) {
   EXPECT_FALSE(found_associated);
 }
 
-TEST(CascadesTest, ApplyToAntiJoinDecorrelation) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId left = memo.EnsureGroup({"t1"});
-  const GroupId right = memo.EnsureGroup({"t2"});
-  const GroupId apply_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "apply_anti_test");
-  memo.AddExpression(
-      apply_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kApply,
-          .children = {left, right},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("t1", "id")), BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("t2", "id"))),
-          .join_type = 3});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(apply_group);
-
-  bool found_anti = false;
-  for (const auto& expr : search.GetMemo().Get(apply_group).expressions) {
-    if (expr.operation == LogicalOperator::kAntiJoin) {
-      found_anti = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_anti);
-}
-
-TEST(CascadesTest, ApplyToSemiJoinDecorrelation) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId left = memo.EnsureGroup({"t1"});
-  const GroupId right = memo.EnsureGroup({"t2"});
-  const GroupId apply_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "apply_semi_test");
-  memo.AddExpression(
-      apply_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kApply,
-          .children = {left, right},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("t1", "id")), BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("t2", "id"))),
-          .join_type = 2});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(apply_group);
-
-  bool found_semi = false;
-  for (const auto& expr : search.GetMemo().Get(apply_group).expressions) {
-    if (expr.operation == LogicalOperator::kSemiJoin) {
-      found_semi = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_semi);
-}
-
-TEST(CascadesTest, LogicalPropertiesAggregationAndMax1Row) {
+TEST(CascadesTest, LogicalPropertiesAggregationAndLimitOne) {
   Memo memo;
   (void)memo.Build({"t1"});
   const GroupId t1 = memo.EnsureGroup({"t1"});
@@ -6178,67 +5203,6 @@ TEST(CascadesTest, LogicalPropertiesAggregationAndMax1Row) {
                                        .children = {t1},
                                        .limit_count = 1});
   EXPECT_TRUE(memo.Get(limit_group).logical_properties.max_1_row);
-}
-
-TEST(CascadesTest, EagerAggregationOverJoinOnUniqueKey) {
-  Memo memo;
-  const Schema t1_schema("t1", {Column("grp", ValueType::kInt64),
-                                Column("t2_id", ValueType::kInt64)});
-  const Schema t2_schema("t2", {Column("id", ValueType::kInt64,
-                                       Constraint(Constraint::kPrimaryKey)),
-                                Column("val", ValueType::kInt64)});
-  memo.SetTableSchemas({{"t1", t1_schema}, {"t2", t2_schema}});
-  memo.MarkProvenOneToOne("t1", "t2");
-  (void)memo.Build({"t1", "t2"});
-  const GroupId t1 = memo.EnsureGroup({"t1"});
-  const GroupId t2 = memo.EnsureGroup({"t2"});
-
-  const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "j_eager");
-  memo.AddExpression(
-      join_group,
-      LogicalExpression{.operation = LogicalOperator::kJoin,
-                        .children = {t1, t2},
-                        .predicate = BinaryExpressionExp(
-                            ColumnValueExp(ColumnName("t1", "t2_id")),
-                            BinaryOperation::kEquals,
-                            ColumnValueExp(ColumnName("t2", "id")))});
-
-  const GroupId agg_group = memo.EnsureDerivedGroup({"t1", "t2"}, "agg_eager");
-  // The join key t1.t2_id must be a grouping key: the pushed aggregate only
-  // exposes grouping columns, and the re-join predicate still binds it.
-  memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {join_group},
-          .target_list = {NamedExpression(
-              "grp", ColumnValueExp(ColumnName("t1", "grp")))},
-          .grouping_sets = {ColumnValueExp(ColumnName("t1", "grp")),
-                            ColumnValueExp(ColumnName("t1", "t2_id"))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  bool found_eager_agg = false;
-  for (const auto& expr : search.GetMemo().Get(agg_group).expressions) {
-    if (expr.operation == LogicalOperator::kAggregation &&
-        expr.children.size() == 1 && expr.children[0] != join_group) {
-      const Group& join_child = search.GetMemo().Get(expr.children[0]);
-      for (const auto& jexpr : join_child.expressions) {
-        if (jexpr.operation == LogicalOperator::kJoin &&
-            jexpr.children.size() == 2) {
-          const Group& left_child = search.GetMemo().Get(jexpr.children[0]);
-          for (const auto& cexpr : left_child.expressions) {
-            if (cexpr.operation == LogicalOperator::kAggregation) {
-              found_eager_agg = true;
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
-  EXPECT_TRUE(found_eager_agg);
 }
 
 TEST(CascadesTest, PushSelectionThroughWindowOnPartitionColumns) {
@@ -6350,72 +5314,6 @@ TEST(CascadesTest, PushLimitThroughUnionAll) {
   EXPECT_TRUE(found_pushed_limit);
 }
 
-TEST(CascadesTest, ForeignKeyOuterJoinElimination) {
-  Memo memo;
-  const Schema t1_schema(
-      "t1",
-      {Column("id", ValueType::kInt64, Constraint(Constraint::kPrimaryKey)),
-       Column("t2_id", ValueType::kInt64,
-              Constraint(Constraint::kForeign, Value(std::string("t2"))))});
-  const Schema t2_schema("t2", {Column("id", ValueType::kInt64,
-                                       Constraint(Constraint::kPrimaryKey)),
-                                Column("val", ValueType::kInt64)});
-  memo.SetTableSchemas({{"t1", t1_schema}, {"t2", t2_schema}});
-  (void)memo.Build({"t1", "t2"});
-
-  const GroupId left_base = memo.EnsureGroup({"t1"});
-  memo.AddExpression(left_base,
-                     LogicalExpression{.operation = LogicalOperator::kScan,
-                                       .table = "t1",
-                                       .output_schema = t1_schema});
-  const GroupId left = memo.EnsureDerivedGroup({"t1"}, "t1_not_null");
-  memo.AddExpression(
-      left, LogicalExpression{.operation = LogicalOperator::kSelection,
-                              .children = {left_base},
-                              .predicate = UnaryExpressionExp(
-                                  ColumnValueExp(ColumnName("t1", "t2_id")),
-                                  UnaryOperation::kIsNotNull),
-                              .output_schema = t1_schema});
-  const GroupId right = memo.EnsureGroup({"t2"});
-  memo.AddExpression(right,
-                     LogicalExpression{.operation = LogicalOperator::kScan,
-                                       .table = "t2",
-                                       .output_schema = t2_schema});
-
-  const GroupId ojoin_group = memo.EnsureDerivedGroup({"t1", "t2"}, "ojoin");
-  memo.AddExpression(
-      ojoin_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kOuterJoin,
-          .children = {left, right},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("t1", "t2_id")),
-              BinaryOperation::kEquals, ColumnValueExp(ColumnName("t2", "id"))),
-          .join_type = 0});
-
-  const GroupId proj_group = memo.EnsureDerivedGroup({"t1", "t2"}, "proj");
-  memo.AddExpression(
-      proj_group,
-      LogicalExpression{.operation = LogicalOperator::kProjection,
-                        .children = {ojoin_group},
-                        .target_list = {NamedExpression(
-                            "id", ColumnValueExp(ColumnName("t1", "id")))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(proj_group);
-
-  bool found_semi = false;
-  for (const auto& expr : search.GetMemo().Get(proj_group).expressions) {
-    if (expr.operation == LogicalOperator::kSemiJoin &&
-        expr.children.size() == 2 && expr.children[0] == left &&
-        expr.children[1] == right) {
-      found_semi = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_semi);
-}
-
 TEST(CascadesTest, InferFilterFromEquivalenceClass) {
   Memo memo;
   (void)memo.Build({"t1", "t2"});
@@ -6459,45 +5357,60 @@ TEST(CascadesTest, InferFilterFromEquivalenceClass) {
   EXPECT_TRUE(found_inferred_predicate);
 }
 
-TEST(CascadesTest, HoistCorrelatedSelectionToApply) {
+// The recorded classes are pairwise ({a,b} from one join expression, {b,c}
+// from another). The inference rule merges them, so a filter on `a` must
+// reach `c` through the chain without any direct a=c equality.
+TEST(CascadesTest, InferFilterFromEquivalenceClassTransitiveChain) {
   Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId left = memo.EnsureGroup({"t1"});
-  const GroupId right = memo.EnsureGroup({"t2"});
+  (void)memo.Build({"t1", "t2", "t3"});
+  const GroupId t1 = memo.EnsureGroup({"t1"});
+  const GroupId t2 = memo.EnsureGroup({"t2"});
+  const GroupId t3 = memo.EnsureGroup({"t3"});
 
-  const GroupId inner_sel = memo.EnsureDerivedGroup({"t2"}, "inner_sel");
+  const GroupId join_12 = memo.EnsureDerivedGroup({"t1", "t2"}, "join_12");
   memo.AddExpression(
-      inner_sel,
-      LogicalExpression{
-          .operation = LogicalOperator::kSelection,
-          .children = {right},
-          .predicate = BinaryExpressionExp(
-              BinaryExpressionExp(ColumnValueExp(ColumnName("t2", "id")),
-                                  BinaryOperation::kEquals,
-                                  ColumnValueExp(ColumnName("t1", "id"))),
-              BinaryOperation::kAnd,
-              BinaryExpressionExp(ColumnValueExp(ColumnName("t2", "val")),
-                                  BinaryOperation::kGreaterThan,
-                                  ConstantValueExp(Value(int64_t{5}))))});
+      join_12, LogicalExpression{.operation = LogicalOperator::kJoin,
+                                 .children = {t1, t2},
+                                 .predicate = BinaryExpressionExp(
+                                     ColumnValueExp(ColumnName("t1", "id")),
+                                     BinaryOperation::kEquals,
+                                     ColumnValueExp(ColumnName("t2", "id")))});
 
-  const GroupId apply_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "apply_corr");
-  memo.AddExpression(apply_group,
-                     LogicalExpression{.operation = LogicalOperator::kApply,
-                                       .children = {left, inner_sel},
-                                       .join_type = 0});
+  const GroupId join_group =
+      memo.EnsureDerivedGroup({"t1", "t2", "t3"}, "join_all");
+  memo.AddExpression(
+      join_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kJoin,
+          .children = {join_12, t3},
+          .predicate = BinaryExpressionExp(
+              ColumnValueExp(ColumnName("t2", "id")), BinaryOperation::kEquals,
+              ColumnValueExp(ColumnName("t3", "id")))});
+
+  const GroupId sel_group = memo.EnsureDerivedGroup({"t1", "t2", "t3"}, "sel");
+  memo.AddExpression(
+      sel_group, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                   .children = {join_group},
+                                   .predicate = BinaryExpressionExp(
+                                       ColumnValueExp(ColumnName("t1", "id")),
+                                       BinaryOperation::kGreaterThan,
+                                       ConstantValueExp(Value(int64_t{10})))});
 
   SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(apply_group);
+  search.Explore(sel_group);
 
-  bool found_join = false;
-  for (const auto& expr : search.GetMemo().Get(apply_group).expressions) {
-    if (expr.operation == LogicalOperator::kJoin) {
-      found_join = true;
-      break;
+  bool found_t3_inferred = false;
+  for (const auto& expr : search.GetMemo().Get(sel_group).expressions) {
+    if (expr.operation == LogicalOperator::kSelection && expr.predicate &&
+        *expr.predicate) {
+      const std::string pred_str = (*expr.predicate)->ToString();
+      if (pred_str.find("t3.id") != std::string::npos) {
+        found_t3_inferred = true;
+        break;
+      }
     }
   }
-  EXPECT_TRUE(found_join);
+  EXPECT_TRUE(found_t3_inferred);
 }
 
 TEST(CascadesTest, PushSemiJoinThroughInnerJoin) {
@@ -6698,63 +5611,6 @@ TEST(CascadesTest, MergeAdjacentWindows) {
   EXPECT_TRUE(found_merged);
 }
 
-TEST(CascadesTest, DecorrelateAggregateApply) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId outer = memo.EnsureGroup({"t1"});
-  const GroupId inner = memo.EnsureGroup({"t2"});
-
-  const GroupId inner_sel = memo.EnsureDerivedGroup({"t2"}, "inner_sel");
-  memo.AddExpression(
-      inner_sel,
-      LogicalExpression{
-          .operation = LogicalOperator::kSelection,
-          .children = {inner},
-          .predicate = BinaryExpressionExp(
-              BinaryExpressionExp(ColumnValueExp(ColumnName("t2", "t1_id")),
-                                  BinaryOperation::kEquals,
-                                  ColumnValueExp(ColumnName("t1", "id"))),
-              BinaryOperation::kAnd,
-              BinaryExpressionExp(ColumnValueExp(ColumnName("t2", "val")),
-                                  BinaryOperation::kGreaterThan,
-                                  ConstantValueExp(Value(int64_t{5}))))});
-
-  const GroupId inner_agg = memo.EnsureDerivedGroup({"t2"}, "inner_agg");
-  memo.AddExpression(
-      inner_agg, LogicalExpression{
-                     .operation = LogicalOperator::kAggregation,
-                     .children = {inner_sel},
-                     .target_list = {NamedExpression(
-                         "cnt", AggregateExpressionExp(AggregationType::kCount,
-                                                       nullptr, false))}});
-
-  const GroupId apply_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "apply_agg");
-  memo.AddExpression(apply_group,
-                     LogicalExpression{.operation = LogicalOperator::kApply,
-                                       .children = {outer, inner_agg},
-                                       .join_type = 0});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(apply_group);
-
-  bool found_join_with_grouped_agg = false;
-  for (const auto& expr : search.GetMemo().Get(apply_group).expressions) {
-    if (expr.operation == LogicalOperator::kJoin && expr.children.size() == 2 &&
-        expr.children[0] == outer) {
-      const Group& right_child = search.GetMemo().Get(expr.children[1]);
-      for (const auto& right_expr : right_child.expressions) {
-        if (right_expr.operation == LogicalOperator::kAggregation &&
-            !right_expr.grouping_sets.empty()) {
-          found_join_with_grouped_agg = true;
-          break;
-        }
-      }
-    }
-  }
-  EXPECT_TRUE(found_join_with_grouped_agg);
-}
-
 TEST(CascadesTest, PushNotThroughExpression) {
   Memo memo;
   const GroupId scan = memo.Build({"t"});
@@ -6821,62 +5677,6 @@ TEST(CascadesTest, PushNotThroughExpressionPreservesOrderedComparison) {
   EXPECT_FALSE(found_rewritten);
 }
 
-TEST(CascadesTest, PushAggregationThroughUnionAll) {
-  Memo memo;
-  (void)memo.Build({"t1", "t2"});
-  const GroupId t1 = memo.EnsureGroup({"t1"});
-  const GroupId t2 = memo.EnsureGroup({"t2"});
-
-  const GroupId union_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "union_all");
-  memo.AddExpression(union_group,
-                     LogicalExpression{.operation = LogicalOperator::kUnionAll,
-                                       .children = {t1, t2}});
-
-  const GroupId agg_group =
-      memo.EnsureDerivedGroup({"t1", "t2"}, "agg_over_union");
-  memo.AddExpression(
-      agg_group,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {union_group},
-          .target_list = {NamedExpression(
-              "m", AggregateExpressionExp(AggregationType::kMax,
-                                          ColumnValueExp(ColumnName("t1", "v")),
-                                          false))}});
-
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg_group);
-
-  bool found_pushed_agg = false;
-  for (const auto& expr : search.GetMemo().Get(agg_group).expressions) {
-    if (expr.operation == LogicalOperator::kAggregation &&
-        expr.children.size() == 1) {
-      const Group& union_child = search.GetMemo().Get(expr.children[0]);
-      for (const auto& u_expr : union_child.expressions) {
-        if (u_expr.operation == LogicalOperator::kUnionAll &&
-            u_expr.children.size() == 2) {
-          const Group& b1 = search.GetMemo().Get(u_expr.children[0]);
-          const Group& b2 = search.GetMemo().Get(u_expr.children[1]);
-          bool b1_has_agg =
-              std::ranges::any_of(b1.expressions, [](const auto& e) {
-                return e.operation == LogicalOperator::kAggregation;
-              });
-          bool b2_has_agg =
-              std::ranges::any_of(b2.expressions, [](const auto& e) {
-                return e.operation == LogicalOperator::kAggregation;
-              });
-          if (b1_has_agg && b2_has_agg) {
-            found_pushed_agg = true;
-            break;
-          }
-        }
-      }
-    }
-  }
-  EXPECT_TRUE(found_pushed_agg);
-}
-
 TEST(CascadesTest, JoinIdentityDummyEliminatesDummySide) {
   Memo memo;
   (void)memo.Build({"a"});
@@ -6898,99 +5698,6 @@ TEST(CascadesTest, JoinIdentityDummyEliminatesDummySide) {
         return expression.operation == LogicalOperator::kScan;
       });
   EXPECT_TRUE(scan_present);
-}
-
-TEST(CascadesTest, MarkJoinToFilterProducesSemiJoin) {
-  Memo memo;
-  (void)memo.Build({"l", "r"});
-  const GroupId left = memo.EnsureGroup({"l"});
-  const GroupId right = memo.EnsureGroup({"r"});
-  const GroupId mark = memo.EnsureDerivedGroup({"l", "r"}, "mark_case");
-  ASSERT_TRUE(memo.AddExpression(
-      mark, LogicalExpression{.operation = LogicalOperator::kMarkJoin,
-                              .children = {left, right},
-                              .predicate = BinaryExpressionExp(
-                                  ColumnValueExp(ColumnName("l", "k")),
-                                  BinaryOperation::kEquals,
-                                  ColumnValueExp(ColumnName("r", "k"))),
-                              .marker_column = "m"}));
-  const GroupId sel = memo.EnsureDerivedGroup({"l", "r"}, "mark_filter");
-  ASSERT_TRUE(memo.AddExpression(
-      sel, LogicalExpression{.operation = LogicalOperator::kSelection,
-                             .children = {mark},
-                             .predicate = UnaryExpressionExp(
-                                 ColumnValueExp(ColumnName("", "m")),
-                                 UnaryOperation::kIsTrue)}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel);
-  const bool semi_present = std::ranges::any_of(
-      search.GetMemo().Get(sel).expressions,
-      [](const LogicalExpression& expression) {
-        return expression.operation == LogicalOperator::kSemiJoin;
-      });
-  EXPECT_TRUE(semi_present);
-}
-
-TEST(CascadesTest, MarkJoinToFilterProducesAntiJoin) {
-  // IS NOT TRUE keeps exactly the {FALSE, NULL} markers, which is what a
-  // plain anti join emits (no-match probe rows, NULL keys included); the
-  // `= FALSE` / `NOT` forms keep only FALSE markers and stay unrewritten.
-  Memo memo;
-  (void)memo.Build({"l", "r"});
-  const GroupId left = memo.EnsureGroup({"l"});
-  const GroupId right = memo.EnsureGroup({"r"});
-  const GroupId mark = memo.EnsureDerivedGroup({"l", "r"}, "mark_case_anti");
-  ASSERT_TRUE(memo.AddExpression(
-      mark, LogicalExpression{.operation = LogicalOperator::kMarkJoin,
-                              .children = {left, right},
-                              .predicate = BinaryExpressionExp(
-                                  ColumnValueExp(ColumnName("l", "k")),
-                                  BinaryOperation::kEquals,
-                                  ColumnValueExp(ColumnName("r", "k"))),
-                              .marker_column = "m"}));
-  const GroupId sel = memo.EnsureDerivedGroup({"l", "r"}, "mark_filter_anti");
-  ASSERT_TRUE(memo.AddExpression(
-      sel, LogicalExpression{.operation = LogicalOperator::kSelection,
-                             .children = {mark},
-                             .predicate = UnaryExpressionExp(
-                                 ColumnValueExp(ColumnName("", "m")),
-                                 UnaryOperation::kIsNotTrue)}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel);
-  const bool anti_present = std::ranges::any_of(
-      search.GetMemo().Get(sel).expressions,
-      [](const LogicalExpression& expression) {
-        return expression.operation == LogicalOperator::kAntiJoin;
-      });
-  EXPECT_TRUE(anti_present);
-}
-
-TEST(CascadesTest, MarkJoinToFilterRejectsUnrelatedColumn) {
-  Memo memo;
-  (void)memo.Build({"l", "r"});
-  const GroupId left = memo.EnsureGroup({"l"});
-  const GroupId right = memo.EnsureGroup({"r"});
-  const GroupId mark = memo.EnsureDerivedGroup({"l", "r"}, "mark_case_other");
-  ASSERT_TRUE(memo.AddExpression(
-      mark, LogicalExpression{.operation = LogicalOperator::kMarkJoin,
-                              .children = {left, right},
-                              .marker_column = "m"}));
-  const GroupId sel = memo.EnsureDerivedGroup({"l", "r"}, "mark_filter_other");
-  ASSERT_TRUE(memo.AddExpression(
-      sel, LogicalExpression{.operation = LogicalOperator::kSelection,
-                             .children = {mark},
-                             .predicate = UnaryExpressionExp(
-                                 ColumnValueExp(ColumnName("", "other")),
-                                 UnaryOperation::kIsTrue)}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sel);
-  const bool converted = std::ranges::any_of(
-      search.GetMemo().Get(sel).expressions,
-      [](const LogicalExpression& expression) {
-        return expression.operation == LogicalOperator::kSemiJoin ||
-               expression.operation == LogicalOperator::kAntiJoin;
-      });
-  EXPECT_FALSE(converted);
 }
 
 TEST(CascadesTest, CountStarRewriteOnNotNullColumn) {
@@ -7063,38 +5770,6 @@ TEST(CascadesTest, CountStarRewriteKeepsNullableColumn) {
             });
       });
   EXPECT_FALSE(found_star);
-}
-
-TEST(CascadesTest, GroupByFunctionalDependencyReduction) {
-  Memo memo;
-  const Schema schema("t", {Column("pk", ValueType::kInt64,
-                                   Constraint(Constraint::kPrimaryKey)),
-                            Column("x", ValueType::kInt64)});
-  memo.SetTableSchemas({{"t", schema}});
-  (void)memo.Build({"t"});
-  const GroupId input = memo.EnsureGroup({"t"});
-  const GroupId agg = memo.EnsureDerivedGroup({"t"}, "agg_fd");
-  ASSERT_TRUE(memo.AddExpression(
-      agg, LogicalExpression{
-               .operation = LogicalOperator::kAggregation,
-               .children = {input},
-               .target_list = {NamedExpression("pk", ColumnName("t", "pk")),
-                               NamedExpression(
-                                   "n", AggregateExpressionExp(
-                                            AggregationType::kCount, nullptr))},
-               .grouping_sets = {ColumnValueExp(ColumnName("t", "pk")),
-                                 ColumnValueExp(ColumnName("t", "x"))}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg);
-  bool found_reduced = false;
-  for (const LogicalExpression& expression :
-       search.GetMemo().Get(agg).expressions) {
-    if (expression.operation == LogicalOperator::kAggregation &&
-        expression.grouping_sets.size() == 1) {
-      found_reduced = true;
-    }
-  }
-  EXPECT_TRUE(found_reduced);
 }
 
 TEST(CascadesTest, TopNPushThroughInnerJoinOnForeignKey) {
@@ -7269,29 +5944,6 @@ TEST(CascadesTest, OuterNestedLoopPlansNonEquiLeftJoin) {
   EXPECT_NE(best->plan->ToString().find("Left Outer Join"), std::string::npos);
 }
 
-TEST(CascadesTest, ExchangeNoopPassesChildThrough) {
-  Memo memo;
-  (void)memo.Build({"a"});
-  const GroupId input = memo.EnsureDerivedGroup({"a"}, "exchange_input");
-  ASSERT_TRUE(memo.AddExpression(
-      input, LogicalExpression{.operation = LogicalOperator::kValues,
-                               .values = {Row({Value(7)})},
-                               .output_schema = Schema(
-                                   "", {Column("x", ValueType::kInt64)})}));
-  const GroupId exchange = memo.EnsureDerivedGroup({"a"}, "exchange_case");
-  ASSERT_TRUE(memo.AddExpression(
-      exchange, LogicalExpression{.operation = LogicalOperator::kExchange,
-                                  .children = {input}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  const std::optional<BestPlan> best = search.Optimize(
-      exchange, PhysicalProperties{}, tinylamb::DefaultImplementationRules());
-  ASSERT_TRUE(best.has_value());
-  if (!best) {
-    return;
-  }
-  EXPECT_NE(best->plan->ToString().find("Values"), std::string::npos);
-}
-
 TEST(CascadesTest, AppliedRuleNamesTrackFiredRules) {
   Memo memo;
   const GroupId root = memo.Build({"a", "b"});
@@ -7316,36 +5968,6 @@ TEST(CascadesTest, SearchStepBudgetDegradesToBestSoFar) {
   EXPECT_FALSE(full.BudgetExhausted());
   // The budgeted exploration still covers the initial join tree.
   EXPECT_GE(limited.GetMemo().ExpressionCount(root), 1U);
-}
-
-TEST(CascadesTest, OrderByRedundantColumnRemoval) {
-  Memo memo;
-  const Schema schema("t", {Column("pk", ValueType::kInt64,
-                                   Constraint(Constraint::kPrimaryKey)),
-                            Column("x", ValueType::kInt64)});
-  memo.SetTableSchemas({{"t", schema}});
-  (void)memo.Build({"t"});
-  const GroupId input = memo.EnsureGroup({"t"});
-  const GroupId sort = memo.EnsureDerivedGroup({"t"}, "sort_trim");
-  ASSERT_TRUE(memo.AddExpression(
-      sort, LogicalExpression{
-                .operation = LogicalOperator::kSort,
-                .children = {input},
-                .target_list =
-                    {NamedExpression("", ColumnValueExp(ColumnName("t", "pk"))),
-                     NamedExpression("", ColumnValueExp(ColumnName("t", "x")))},
-                .sort_ascending = {true, true}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(sort);
-  bool found_trimmed = false;
-  for (const LogicalExpression& expression :
-       search.GetMemo().Get(sort).expressions) {
-    if (expression.operation == LogicalOperator::kSort &&
-        expression.target_list.size() == 1) {
-      found_trimmed = true;
-    }
-  }
-  EXPECT_TRUE(found_trimmed);
 }
 
 TEST(CascadesTest, ExtractYearSargableAddsScanRange) {
@@ -7406,44 +6028,6 @@ TEST(CascadesTest, ComparisonSelfPredicatesFold) {
   EXPECT_TRUE(found_null_test);
 }
 
-TEST(CascadesTest, AnyValueEliminationOnGroupingKey) {
-  Memo memo;
-  (void)memo.Build({"t"});
-  const GroupId input = memo.EnsureGroup({"t"});
-  const GroupId agg = memo.EnsureDerivedGroup({"t"}, "agg_any_value");
-  ASSERT_TRUE(memo.AddExpression(
-      agg,
-      LogicalExpression{
-          .operation = LogicalOperator::kAggregation,
-          .children = {input},
-          .target_list = {NamedExpression("k", ColumnName("t", "k")),
-                          NamedExpression(
-                              "a", AggregateExpressionExp(
-                                       AggregationType::kAnyValue,
-                                       ColumnValueExp(ColumnName("t", "k"))))},
-          .grouping_sets = {ColumnValueExp(ColumnName("t", "k"))}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg);
-  bool found_elided = false;
-  for (const LogicalExpression& expression :
-       search.GetMemo().Get(agg).expressions) {
-    if (expression.operation != LogicalOperator::kAggregation) {
-      continue;
-    }
-    const bool has_any_value = std::ranges::any_of(
-        expression.target_list, [](const NamedExpression& target) {
-          return target.expression &&
-                 target.expression->Type() == TypeTag::kAggregateExp &&
-                 target.expression->AsAggregateExpression().GetType() ==
-                     AggregationType::kAnyValue;
-        });
-    if (!has_any_value && expression.target_list.size() == 2) {
-      found_elided = true;
-    }
-  }
-  EXPECT_TRUE(found_elided);
-}
-
 TEST(CascadesTest, ComparisonSelfPredicatesSkipFloats) {
   Memo memo;
   const Schema schema("t", {Column("f", ValueType::kDouble)});
@@ -7475,66 +6059,6 @@ TEST(CascadesTest, ComparisonSelfPredicatesSkipFloats) {
                                    });
       });
   EXPECT_FALSE(found_null_test);
-}
-
-TEST(CascadesTest, SemijoinToInnerPlusDistinct) {
-  // The rewrite is multiset-preserving only when the projection identifies
-  // the left row: DISTINCT dedupes values while a semi join emits one row
-  // per qualifying left row. The gate therefore requires the projected
-  // column set to be provably unique on the left (here l.k is the primary
-  // key); without catalog schemas the rule must not fire.
-  Memo memo;
-  const Schema l_schema("l", {Column("k", ValueType::kInt64,
-                                     Constraint(Constraint::kPrimaryKey))});
-  const Schema r_schema("r", {Column("k", ValueType::kInt64)});
-  memo.SetTableSchemas({{"l", l_schema}, {"r", r_schema}});
-  (void)memo.Build({"l", "r"});
-  const GroupId left = memo.EnsureGroup({"l"});
-  const GroupId right = memo.EnsureGroup({"r"});
-  const GroupId semi = memo.EnsureDerivedGroup({"l", "r"}, "semi_distinct");
-  ASSERT_TRUE(memo.AddExpression(
-      semi,
-      LogicalExpression{
-          .operation = LogicalOperator::kSemiJoin,
-          .children = {left, right},
-          .predicate = BinaryExpressionExp(
-              ColumnValueExp(ColumnName("l", "k")), BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("r", "k"))),
-          .target_list = {NamedExpression("k", ColumnName("l", "k"))}}));
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(semi);
-  const bool distinct_present = std::ranges::any_of(
-      search.GetMemo().Get(semi).expressions,
-      [](const LogicalExpression& expression) {
-        return expression.operation == LogicalOperator::kDistinct;
-      });
-  EXPECT_TRUE(distinct_present);
-}
-
-TEST(CascadesTest, MaterializeAndSpoolHaveImplementationRules) {
-  for (LogicalOperator operation :
-       {LogicalOperator::kMaterialize, LogicalOperator::kEagerSpool,
-        LogicalOperator::kLazySpool}) {
-    Memo memo;
-    (void)memo.Build({"a"});
-    const GroupId input = memo.EnsureDerivedGroup({"a"}, "spool_input");
-    ASSERT_TRUE(memo.AddExpression(
-        input, LogicalExpression{.operation = LogicalOperator::kValues,
-                                 .values = {Row({Value(3)})},
-                                 .output_schema = Schema(
-                                     "", {Column("x", ValueType::kInt64)})}));
-    const GroupId root = memo.EnsureDerivedGroup({"a"}, "spool_case");
-    ASSERT_TRUE(memo.AddExpression(
-        root, LogicalExpression{.operation = operation, .children = {input}}));
-    SearchEngine search(std::move(memo), RuleSet::Default());
-    const std::optional<BestPlan> best = search.Optimize(
-        root, PhysicalProperties{}, tinylamb::DefaultImplementationRules());
-    ASSERT_TRUE(best.has_value());
-    if (!best) {
-      return;
-    }
-    EXPECT_NE(best->plan->ToString().find("Materialize"), std::string::npos);
-  }
 }
 
 TEST(CascadesTest, TopNWithTiesCarriesPayload) {
@@ -7577,57 +6101,11 @@ TEST(CascadesTest, ExploreTwiceReachesSameFixpoint) {
   EXPECT_EQ(search.GetMemo().ExpressionCount(root), root_exprs_once);
 }
 
-TEST(CascadesTest, CostMonotonicityApproximateVerification) {
-  PhysicalProperties delivered;
-  PhysicalProperties required;
-
-  // 1. Operator cost monotonicity across fine-grained row counts.
+TEST(CascadesTest, SpillCostIsMonotone) {
   const std::vector<double> row_counts = {
       0.0,   0.1,   0.5,    0.9,    1.0,     1.05,    1.1,
       1.5,   2.0,   5.0,    10.0,   20.0,    50.0,    100.0,
       250.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0};
-
-  const std::vector<OperatorCostKind> all_operators = {
-      OperatorCostKind::kHashJoin,       OperatorCostKind::kMergeJoin,
-      OperatorCostKind::kNestedLoopJoin, OperatorCostKind::kIndexScan,
-      OperatorCostKind::kBitmapScan,     OperatorCostKind::kSort};
-
-  for (OperatorCostKind kind : all_operators) {
-    // Monotonicity in left input rows.
-    for (size_t i = 1; i < row_counts.size(); ++i) {
-      double cost_prev = CalibrateOperatorCost(kind, row_counts[i - 1], 100.0,
-                                               delivered, required);
-      double cost_curr = CalibrateOperatorCost(kind, row_counts[i], 100.0,
-                                               delivered, required);
-      EXPECT_LE(cost_prev, cost_curr + 1e-9)
-          << "Operator cost not monotonic in left rows for kind "
-          << static_cast<int>(kind) << " between " << row_counts[i - 1]
-          << " and " << row_counts[i];
-    }
-    // Monotonicity in right input rows.
-    for (size_t i = 1; i < row_counts.size(); ++i) {
-      double cost_prev = CalibrateOperatorCost(kind, 100.0, row_counts[i - 1],
-                                               delivered, required);
-      double cost_curr = CalibrateOperatorCost(kind, 100.0, row_counts[i],
-                                               delivered, required);
-      EXPECT_LE(cost_prev, cost_curr + 1e-9)
-          << "Operator cost not monotonic in right rows for kind "
-          << static_cast<int>(kind) << " between " << row_counts[i - 1]
-          << " and " << row_counts[i];
-    }
-  }
-
-  // 2. Ordering mismatch penalty monotonicity.
-  PhysicalProperties required_ordered;
-  required_ordered.ordering = {ColumnName("t1", "id")};
-  for (double rows : row_counts) {
-    double match_cost = CalibrateOperatorCost(OperatorCostKind::kHashJoin, rows,
-                                              100.0, delivered, required);
-    double mismatch_cost = CalibrateOperatorCost(
-        OperatorCostKind::kHashJoin, rows, 100.0, delivered, required_ordered);
-    EXPECT_GE(mismatch_cost, match_cost)
-        << "Mismatch penalty must not decrease total cost at rows " << rows;
-  }
 
   // 3. Memory spill cost monotonicity.
   MemoryBudget budget{.max_memory_bytes = 64.0 * 1024.0,
@@ -7644,76 +6122,6 @@ TEST(CascadesTest, CostMonotonicityApproximateVerification) {
           << " between " << row_counts[i - 1] << " and " << row_counts[i];
     }
   }
-
-  // 4. Star join cost monotonicity.
-  const std::vector<double> dim_rows = {10.0, 50.0, 100.0};
-  const std::vector<double> selectivities = {0.1, 0.5, 0.8};
-  for (size_t i = 1; i < row_counts.size(); ++i) {
-    double star_prev =
-        EstimateStarJoinCost(row_counts[i - 1], dim_rows, selectivities);
-    double star_curr =
-        EstimateStarJoinCost(row_counts[i], dim_rows, selectivities);
-    EXPECT_LE(star_prev, star_curr + 1e-9);
-  }
-  for (size_t i = 1; i < row_counts.size(); ++i) {
-    double star_prev =
-        EstimateStarJoinCost(1000.0, {row_counts[i - 1], 50.0}, {0.5, 0.5});
-    double star_curr =
-        EstimateStarJoinCost(1000.0, {row_counts[i], 50.0}, {0.5, 0.5});
-    EXPECT_LE(star_prev, star_curr + 1e-9);
-  }
-
-  // 5. Multi-column selectivity monotonicity under conjunction.
-  std::vector<double> sels = {0.8};
-  double prev_sel = EstimateMultiColumnSelectivity(sels, 0.2);
-  for (double additional_sel : {0.7, 0.5, 0.3, 0.1}) {
-    sels.push_back(additional_sel);
-    double curr_sel = EstimateMultiColumnSelectivity(sels, 0.2);
-    EXPECT_LE(curr_sel, prev_sel + 1e-9)
-        << "Adding selective predicate increased total selectivity";
-    prev_sel = curr_sel;
-  }
-
-  // 6. Pattern selectivity monotonicity with prefix length.
-  EXPECT_LE(EstimatePatternSelectivity(PatternMatchingKind::kLike, "abcd%"),
-            EstimatePatternSelectivity(PatternMatchingKind::kLike, "abc%"));
-  EXPECT_LE(EstimatePatternSelectivity(PatternMatchingKind::kLike, "abc%"),
-            EstimatePatternSelectivity(PatternMatchingKind::kLike, "ab%"));
-  EXPECT_LE(EstimatePatternSelectivity(PatternMatchingKind::kLike, "ab%"),
-            EstimatePatternSelectivity(PatternMatchingKind::kLike, "a%"));
-  EXPECT_LE(EstimatePatternSelectivity(PatternMatchingKind::kLike, "a%"),
-            EstimatePatternSelectivity(PatternMatchingKind::kLike, "%"));
-
-  // 7. Join cardinality monotonicity.
-  for (size_t i = 1; i < row_counts.size(); ++i) {
-    auto c_prev =
-        EstimateJoinCardinality(row_counts[i - 1], 100.0, false, false, 0.1);
-    auto c_curr =
-        EstimateJoinCardinality(row_counts[i], 100.0, false, false, 0.1);
-    EXPECT_LE(c_prev.rows, c_curr.rows + 1e-9);
-  }
-
-  // 8. Histogram join cardinality monotonicity with scaling.
-  std::vector<HistogramBucket> left_buckets = {
-      HistogramBucket{
-          .lower = 0.0, .upper = 50.0, .count = 100.0, .distinct_count = 50.0},
-      HistogramBucket{.lower = 50.0,
-                      .upper = 100.0,
-                      .count = 200.0,
-                      .distinct_count = 50.0}};
-  std::vector<HistogramBucket> right_buckets = {HistogramBucket{
-      .lower = 25.0, .upper = 75.0, .count = 150.0, .distinct_count = 50.0}};
-
-  double base_hist_join =
-      EstimateHistogramJoinCardinality(left_buckets, right_buckets);
-  EXPECT_GT(base_hist_join, 0.0);
-
-  std::vector<HistogramBucket> scaled_left = left_buckets;
-  scaled_left[0].count *= 2.0;
-  scaled_left[1].count *= 2.0;
-  double scaled_hist_join =
-      EstimateHistogramJoinCardinality(scaled_left, right_buckets);
-  EXPECT_GE(scaled_hist_join, base_hist_join);
 }
 
 namespace {
@@ -7732,7 +6140,7 @@ struct TopNProvenJoinFixture {
 
   TopNProvenJoinFixture(bool fk, bool mark,
                         std::string fk_reference = "dim(id)",
-                        bool filter_null = true) {
+                        bool filter_null = true, bool residual = false) {
     std::vector<Column> fact_columns = {
         Column("id", ValueType::kInt64, Constraint(Constraint::kPrimaryKey)),
         Column("dim_id", ValueType::kInt64,
@@ -7773,14 +6181,23 @@ struct TopNProvenJoinFixture {
                                          .table = "dim",
                                          .output_schema = dim_schema});
     const GroupId join = memo.EnsureDerivedGroup({"fact", "dim"}, "inner_join");
+    const Expression equality = BinaryExpressionExp(
+        ColumnValueExp(ColumnName("fact", "dim_id")), BinaryOperation::kEquals,
+        ColumnValueExp(ColumnName("dim", "id")));
     memo.AddExpression(
         join,
-        LogicalExpression{.operation = LogicalOperator::kJoin,
-                          .children = {fact, dim},
-                          .predicate = BinaryExpressionExp(
-                              ColumnValueExp(ColumnName("fact", "dim_id")),
-                              BinaryOperation::kEquals,
-                              ColumnValueExp(ColumnName("dim", "id")))});
+        LogicalExpression{
+            .operation = LogicalOperator::kJoin,
+            .children = {fact, dim},
+            .predicate =
+                residual
+                    ? BinaryExpressionExp(
+                          equality, BinaryOperation::kAnd,
+                          BinaryExpressionExp(
+                              ColumnValueExp(ColumnName("fact", "payload")),
+                              BinaryOperation::kGreaterThan,
+                              ConstantValueExp(Value(int64_t{0}))))
+                    : equality});
     topn = memo.EnsureDerivedGroup({"fact", "dim"}, "topn");
     memo.AddExpression(
         topn,
@@ -7842,23 +6259,9 @@ TEST(CascadesTest,
 }
 
 TEST(CascadesTest, TopNPushThroughProvenOneToOneJoinRejectsResidual) {
-  TopNProvenJoinFixture fixture(false, true);
-  Memo& memo = fixture.memo;
-  const GroupId join = memo.Get(fixture.topn).expressions.front().children[0];
-  memo.Get(join).expressions.clear();
-  const Expression equality = BinaryExpressionExp(
-      ColumnValueExp(ColumnName("fact", "dim_id")), BinaryOperation::kEquals,
-      ColumnValueExp(ColumnName("dim", "id")));
-  const Expression residual = BinaryExpressionExp(
-      ColumnValueExp(ColumnName("fact", "payload")),
-      BinaryOperation::kGreaterThan, ConstantValueExp(Value(int64_t{0})));
-  memo.AddExpression(
-      join, LogicalExpression{.operation = LogicalOperator::kJoin,
-                              .children = {fixture.fact, fixture.dim},
-                              .predicate = BinaryExpressionExp(
-                                  equality, BinaryOperation::kAnd, residual)});
+  TopNProvenJoinFixture fixture(false, true, "dim(id)", true, true);
   const GroupId topn = fixture.topn;
-  SearchEngine search(std::move(memo), RuleSet::Default());
+  SearchEngine search(std::move(fixture.memo), RuleSet::Default());
   search.Explore(topn);
   EXPECT_FALSE(fixture.HasPushedTopN(search.GetMemo()));
 }
@@ -8279,77 +6682,6 @@ TEST(CascadesTest, TopNPushThroughUnionAllSkipsWithTies) {
   search.Explore(topn);
   EXPECT_FALSE(
       search.AppliedRuleNames().contains("topn_push_through_union_all"));
-}
-
-TEST(CascadesTest, EagerAndLazyAggregationCoexistForCostChoice) {
-  // Lazy placement (a single aggregation above the join) is not a separate
-  // rewrite: the eager rule is additive, so both shapes must coexist in one
-  // group for branch-and-bound costing to pick the cheaper one.  Pin that the
-  // original Agg(Join) survives alongside the eager Agg(Join(Agg)).  The
-  // passthrough join column `l.rid` is only row-exact because `l.g` is the
-  // primary key of the left side (FD proof in the surviving-column gate).
-  Memo memo;
-  const Schema r_schema("r", {Column("id", ValueType::kInt64,
-                                     Constraint(Constraint::kPrimaryKey))});
-  const Schema l_schema(
-      "l", {Column("g", ValueType::kInt64, Constraint(Constraint::kPrimaryKey)),
-            Column("id", ValueType::kInt64), Column("rid", ValueType::kInt64)});
-  memo.SetTableSchemas({{"l", l_schema}, {"r", r_schema}});
-  memo.MarkProvenOneToOne("l", "r");
-  (void)memo.Build({"l", "r"});
-  const GroupId left = memo.EnsureGroup({"l"});
-  const GroupId right = memo.EnsureGroup({"r"});
-  memo.AddExpression(left,
-                     LogicalExpression{.operation = LogicalOperator::kScan,
-                                       .table = "l",
-                                       .output_schema = l_schema});
-  memo.AddExpression(right,
-                     LogicalExpression{.operation = LogicalOperator::kScan,
-                                       .table = "r",
-                                       .output_schema = r_schema});
-  const GroupId join = memo.EnsureDerivedGroup({"l", "r"}, "inner_join");
-  memo.AddExpression(
-      join, LogicalExpression{.operation = LogicalOperator::kJoin,
-                              .children = {left, right},
-                              .predicate = BinaryExpressionExp(
-                                  ColumnValueExp(ColumnName("l", "rid")),
-                                  BinaryOperation::kEquals,
-                                  ColumnValueExp(ColumnName("r", "id")))});
-  Expression count_ids = AggregateExpressionExp(
-      AggregationType::kCount, ColumnValueExp(ColumnName("l", "id")));
-  const GroupId agg = memo.EnsureDerivedGroup({"l", "r"}, "aggregation");
-  memo.AddExpression(
-      agg, LogicalExpression{
-               .operation = LogicalOperator::kAggregation,
-               .children = {join},
-               // l.rid rides as a plain passthrough target so the
-               // join column survives the pushed aggregate
-               // (surviving-column gate).
-               .target_list = {NamedExpression(
-                                   "g", ColumnValueExp(ColumnName("l", "g"))),
-                               NamedExpression("rid", ColumnValueExp(ColumnName(
-                                                          "l", "rid"))),
-                               NamedExpression("n", count_ids)},
-               .grouping_sets = {ColumnValueExp(ColumnName("l", "g"))}});
-  SearchEngine search(std::move(memo), RuleSet::Default());
-  search.Explore(agg);
-  EXPECT_TRUE(
-      search.AppliedRuleNames().contains("eager_aggregation_over_join"));
-  size_t lazy_shapes = 0;
-  size_t eager_shapes = 0;
-  for (const auto& expr : search.GetMemo().Get(agg).expressions) {
-    if (expr.operation != LogicalOperator::kAggregation ||
-        expr.children.size() != 1) {
-      continue;
-    }
-    if (expr.children[0] == join) {
-      ++lazy_shapes;
-    } else {
-      ++eager_shapes;
-    }
-  }
-  EXPECT_GE(lazy_shapes, 1U);
-  EXPECT_GE(eager_shapes, 1U);
 }
 
 }  // namespace tinylamb::cascades

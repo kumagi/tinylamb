@@ -24,6 +24,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -572,8 +573,324 @@ std::string NormalizeGroupByDistinct(std::string_view sql) {
   return std::string(sql);
 }
 
+namespace {
+
+// The pinned parser has no ILIKE token, so `x [NOT] ILIKE y` is rewritten to
+// the equivalent `LOWER(x) [NOT] LIKE LOWER(y)` before parsing. Every extent
+// check is conservative: when an operand boundary cannot be proven the
+// rewrite bails and the statement fails to parse loudly — never rewritten
+// into different semantics.
+bool IsIdentChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+         c == '$';
+}
+
+bool IsSqlSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+// Keywords that may legally sit immediately before a comparison operand.
+// An identifier-shaped atom whose predecessor is a different identifier (or
+// nothing on this list) means the "atom" is actually part of a larger
+// construction the rewrite does not understand.
+bool BoundaryKeywordBeforeOperand(std::string_view word) {
+  static constexpr std::array<std::string_view, 16> kKeywords = {
+      "SELECT", "WHERE", "AND",     "OR",   "NOT",  "HAVING",   "BY",  "WHEN",
+      "THEN",   "ON",    "QUALIFY", "CASE", "ELSE", "DISTINCT", "ALL", "ANY"};
+  return std::ranges::any_of(
+      kKeywords, [word](std::string_view keyword) { return word == keyword; });
+}
+
+// Scans backward from `pos` (exclusive) over the atom ending there and
+// returns the atom start, or std::string::npos when the text before `pos`
+// is not an operand this rewrite understands. Literal interiors are
+// detected through the position-preserving mask (blanked).
+size_t LikeOperandBegin(std::string_view sql, std::string_view mask,
+                        size_t pos) {
+  size_t j = pos;
+  while (j > 0 && IsSqlSpace(sql[j - 1])) {
+    --j;
+  }
+  if (j == 0) {
+    return std::string::npos;
+  }
+  const size_t atom_end = j;  // exclusive
+  size_t atom_begin = 0;
+  bool literal_atom = false;
+  if (sql[j - 1] == '\'' || sql[j - 1] == '"' || sql[j - 1] == '`') {
+    // Literal: the opening quote is the first char going backward whose
+    // mask copy is not blanked-while-original-isn't.
+    literal_atom = true;
+    atom_begin = j - 1;
+    while (atom_begin > 0 && mask[atom_begin] != sql[atom_begin]) {
+      --atom_begin;
+    }
+    if (atom_begin > 0 || mask[atom_begin] == sql[atom_begin]) {
+      // `atom_begin` sits on the boundary char before the opening quote.
+      ++atom_begin;
+    }
+  } else if (sql[j - 1] == ')') {
+    // Parenthesized expression (or call tail): match backward.
+    size_t depth = 0;
+    atom_begin = j - 1;
+    while (true) {
+      if (mask[atom_begin] == sql[atom_begin]) {  // outside literals
+        if (sql[atom_begin] == ')') {
+          ++depth;
+        } else if (sql[atom_begin] == '(') {
+          --depth;
+          if (depth == 0) {
+            break;
+          }
+        }
+      }
+      if (atom_begin == 0) {
+        return std::string::npos;
+      }
+      --atom_begin;
+    }
+    // Function-call tail: absorb the callee name and its dotted path.
+    while (atom_begin > 0 &&
+           (IsIdentChar(sql[atom_begin - 1]) || sql[atom_begin - 1] == '.')) {
+      --atom_begin;
+    }
+  } else if (IsIdentChar(sql[j - 1])) {
+    atom_begin = j - 1;
+    while (atom_begin > 0 && IsIdentChar(sql[atom_begin - 1])) {
+      --atom_begin;
+    }
+    // Dotted path segments to the left (t.col).
+    while (atom_begin > 1 && sql[atom_begin - 1] == '.' &&
+           IsIdentChar(sql[atom_begin - 2])) {
+      atom_begin -= 2;
+      while (atom_begin > 0 && IsIdentChar(sql[atom_begin - 1])) {
+        --atom_begin;
+      }
+    }
+  } else {
+    return std::string::npos;
+  }
+  // The atom must not be a bare keyword (SELECT ilike ... would otherwise
+  // rewrite "SELECT"); literal atoms are exempt.
+  if (!literal_atom) {
+    std::string_view word(sql.data() + atom_begin, atom_end - atom_begin);
+    std::string upper;
+    upper.reserve(word.size());
+    for (const char c : word) {
+      upper.push_back(
+          static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    if (!IsIdentChar(sql[atom_begin]) || BoundaryKeywordBeforeOperand(upper)) {
+      return std::string::npos;
+    }
+  }
+  return atom_begin;
+}
+
+// Scans forward from `pos` (inclusive) over the atom starting there and
+// returns one-past-the-end, or npos when the shape is not understood.
+size_t LikeOperandEnd(std::string_view sql, std::string_view mask, size_t pos) {
+  const size_t size = sql.size();
+  size_t j = pos;
+  while (j < size && IsSqlSpace(sql[j])) {
+    ++j;
+  }
+  if (j >= size) {
+    return std::string::npos;
+  }
+  const char c = sql[j];
+  if (c == '\'' || c == '"' || c == '`') {
+    // Literal: run to the end of the blanked mask region; the loop stops on
+    // the first char after the closing quote (the quote itself is blanked).
+    ++j;
+    while (j < size && mask[j] != sql[j]) {
+      ++j;
+    }
+    if (j >= size) {
+      // The literal may legitimately close on the statement's last char.
+      if (j == size && sql[size - 1] == c) {
+        return size;
+      }
+      return std::string::npos;
+    }
+    return j;
+  }
+  if (c == '(') {
+    size_t depth = 0;
+    while (j < size) {
+      if (mask[j] == sql[j]) {  // outside literals
+        if (sql[j] == '(') {
+          ++depth;
+        } else if (sql[j] == ')') {
+          --depth;
+          if (depth == 0) {
+            return j + 1;
+          }
+        }
+      }
+      ++j;
+    }
+    return std::string::npos;
+  }
+  if (IsIdentChar(c)) {
+    while (j < size && IsIdentChar(sql[j])) {
+      ++j;
+    }
+    // Dotted path to the right (t.col).
+    while (j + 1 < size && sql[j] == '.' && IsIdentChar(sql[j + 1])) {
+      j += 2;
+      while (j < size && IsIdentChar(sql[j])) {
+        ++j;
+      }
+    }
+    // Function call tail.
+    if (j < size && sql[j] == '(') {
+      return LikeOperandEnd(sql, mask, j);
+    }
+    return j;
+  }
+  return std::string::npos;
+}
+
+std::string NormalizeCaseInsensitiveLike(std::string_view sql) {
+  const std::string mask = MaskLiteralsAndComments(sql);
+  std::string lower_mask(mask);
+  for (char& c : lower_mask) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  std::vector<size_t> matches;
+  for (size_t pos = lower_mask.find("ilike"); pos != std::string::npos;
+       pos = lower_mask.find("ilike", pos + 1)) {
+    // Word-bounded on both sides (mask and sql agree at these positions).
+    if (pos > 0 && (IsIdentChar(mask[pos - 1]) || mask[pos - 1] == '"')) {
+      continue;
+    }
+    if (pos + 5 < mask.size() && IsIdentChar(mask[pos + 5])) {
+      continue;
+    }
+    matches.push_back(pos);
+  }
+  if (matches.empty()) {
+    return std::string(sql);
+  }
+  std::string result(sql);
+  // Right-to-left so earlier offsets stay valid across rewrites.
+  for (const size_t ilike_pos : std::ranges::reverse_view(matches)) {
+    size_t operand_end = ilike_pos;
+    bool negated = false;
+    {
+      // Optional NOT immediately before the left operand.
+      size_t k = ilike_pos;
+      while (k > 0 && IsSqlSpace(sql[k - 1])) {
+        --k;
+      }
+      if (k >= 3) {
+        std::string word(sql.substr(k - 3, 3));
+        for (char& c : word) {
+          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        const bool word_not = word == "NOT";
+        const bool bounded_left =
+            k == 3 || (!IsIdentChar(sql[k - 4]) && sql[k - 4] != '"' &&
+                       sql[k - 4] != '\'');
+        if (word_not && bounded_left) {
+          negated = true;
+          operand_end = k - 3;
+        }
+      }
+    }
+    const size_t left_begin = LikeOperandBegin(sql, mask, operand_end);
+    if (left_begin == std::string::npos) {
+      continue;
+    }
+    // The char before the left atom must be a structural boundary.
+    size_t before = left_begin;
+    while (before > 0 && IsSqlSpace(sql[before - 1])) {
+      --before;
+    }
+    if (before > 0) {
+      const char b = sql[before - 1];
+      const bool operator_boundary =
+          b == '(' || b == ',' || b == '=' || b == '<' || b == '>' ||
+          b == '!' || b == '+' || b == '-' || b == '*' || b == '/';
+      bool keyword_boundary = false;
+      if (IsIdentChar(b)) {
+        size_t word_end = before;
+        size_t word_begin = before;
+        while (word_begin > 0 && IsIdentChar(sql[word_begin - 1])) {
+          --word_begin;
+        }
+        std::string word(sql.substr(word_begin, word_end - word_begin));
+        for (char& c : word) {
+          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        keyword_boundary = BoundaryKeywordBeforeOperand(word);
+      }
+      if (!operator_boundary && !keyword_boundary) {
+        continue;
+      }
+    }
+    const size_t right_begin = ilike_pos + 5;
+    const size_t right_end = LikeOperandEnd(sql, mask, right_begin);
+    if (right_end == std::string::npos) {
+      continue;
+    }
+    // After the right atom the statement must continue at a structural
+    // boundary (end, `;`, `,`, depth-0 close, or a clause keyword).
+    size_t after = right_end;
+    while (after < sql.size() && IsSqlSpace(sql[after])) {
+      ++after;
+    }
+    if (after < sql.size()) {
+      const char a = sql[after];
+      bool structural = a == ';' || a == ',' || a == ')' || a == ']';
+      if (!structural && IsIdentChar(a)) {
+        size_t word_end = after;
+        while (word_end < sql.size() && IsIdentChar(sql[word_end])) {
+          ++word_end;
+        }
+        static constexpr std::array<std::string_view, 18> kFollowers = {
+            "AND",   "OR",     "NOT",     "GROUP",     "ORDER",  "HAVING",
+            "LIMIT", "OFFSET", "QUALIFY", "WINDOW",    "THEN",   "ELSE",
+            "END",   "WHEN",   "UNION",   "INTERSECT", "EXCEPT", "AS"};
+        std::string word(sql.substr(after, word_end - after));
+        for (char& c : word) {
+          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        for (const std::string_view follower : kFollowers) {
+          if (word == follower) {
+            structural = true;
+            break;
+          }
+        }
+      }
+      if (!structural) {
+        continue;
+      }
+    }
+    const std::string left =
+        result.substr(left_begin, operand_end - left_begin);
+    const std::string right =
+        result.substr(right_begin, right_end - right_begin);
+    std::string rewritten = result.substr(0, left_begin);
+    rewritten += "LOWER(";
+    rewritten += left;
+    rewritten += ")";
+    rewritten += negated ? " NOT LIKE" : " LIKE";
+    rewritten += " LOWER(";
+    rewritten += right;
+    rewritten += ")";
+    rewritten += result.substr(right_end);
+    result = std::move(rewritten);
+  }
+  return result;
+}
+
+}  // namespace
+
 GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
-  std::string current_sql = NormalizeGroupByDistinct(sql);
+  std::string current_sql =
+      NormalizeCaseInsensitiveLike(NormalizeGroupByDistinct(sql));
 
   size_t dist_start = 0;
   size_t dist_end = 0;

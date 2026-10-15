@@ -130,6 +130,8 @@ std::string CommandTag(StatementType type, int64_t affected_rows) {
       return "CREATE TABLE";
     case StatementType::kDropTable:
       return "DROP TABLE";
+    case StatementType::kAlterTable:
+      return "ALTER TABLE";
     case StatementType::kSelect:
       return "SELECT " + std::to_string(affected_rows);
     case StatementType::kInsert:
@@ -138,13 +140,28 @@ std::string CommandTag(StatementType type, int64_t affected_rows) {
       return "UPDATE " + std::to_string(affected_rows);
     case StatementType::kDelete:
       return "DELETE " + std::to_string(affected_rows);
+    case StatementType::kMerge:
+      return "MERGE " + std::to_string(affected_rows);
     case StatementType::kAnalyze:
       return "ANALYZE";
+    case StatementType::kCreateMaterializedView:
+      return "CREATE MATERIALIZED VIEW";
+    case StatementType::kDropMaterializedView:
+      return "DROP MATERIALIZED VIEW";
   }
   return "OK";
 }
 
 }  // namespace
+
+Status DrainCommandResult(QueryResult& result, int64_t* affected_rows) {
+  const int64_t count = result.AffectedRows();
+  result.Drain();
+  if (affected_rows != nullptr) {
+    *affected_rows = count;
+  }
+  return result.GetStatus();
+}
 
 class PostgresServer::Impl {
  public:
@@ -1010,8 +1027,17 @@ class PostgresServer::Impl {
         }
         Queue(client, wire.MoveValue());
       } else {
-        Queue(client, pgwire::CommandComplete(
-                          CommandTag(type, result->AffectedRows())));
+        int64_t affected_rows = 0;
+        const Status drain_status = DrainCommandResult(*result, &affected_rows);
+        if (drain_status != Status::kSuccess) {
+          result.reset();
+          FailStatement(
+              client, automatic, implicit,
+              "statement execution failed: " + StatusMessage(drain_status),
+              "XX000");
+          return false;
+        }
+        Queue(client, pgwire::CommandComplete(CommandTag(type, affected_rows)));
       }
       // Tear the executor (and its pins/read-set) down before committing so
       // FailStatement/PreCommit below can never outlive their context.

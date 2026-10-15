@@ -17,15 +17,11 @@ namespace tinylamb {
 // thread-local closure.
 const cascades::ImplementationRuleSet& DefaultImplementationRules();
 
-// Plans the common single-relation case without constructing and exploring a
-// multi-group Cascades search.  It uses the same scan alternatives and cost
-// model as the default implementation rules, then adds the root projection,
-// aggregation and LIMIT layers directly.  The caller must already have
-// rewritten and resolved the QueryData and populated RuleContext.
-StatusOr<Plan> OptimizeSingleRelation(
+// Exact one-entry MIN/MAX optimization. All other single-table statements
+// participate in the same logical and physical rule search as joins.
+StatusOr<Plan> OptimizeMinMaxIndex(
     const QueryData& query, const Expression& predicate,
-    const std::vector<NamedExpression>& projection_items, bool has_aggregate,
-    bool distinct, const cascades::PhysicalProperties& required,
+    const std::vector<NamedExpression>& projection_items,
     const cascades::RuleContext& context);
 
 }  // namespace tinylamb

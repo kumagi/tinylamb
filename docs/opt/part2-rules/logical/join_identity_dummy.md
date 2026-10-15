@@ -103,7 +103,7 @@ $$R \times D_1 \equiv R$$
 ## 関連 Rule との相互作用
 
 - `join_to_cross_if_no_predicate`: 述語のない内部結合をクロス結合へと正規化する先行 Rule です。本 Rule の入力形を準備します。
-- `one_row_cross_join_elimination`: 属性列を持つ1 行関係（定数テーブルや単一行集約結果）とのクロス結合を処理する上位 Rule です。
+
 - `dummy_scan`（実装 Rule）: 除去されずに残った `DummyScan` を物理実行オペレータへと具体化します。
 
 ## 検証テスト

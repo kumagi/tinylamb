@@ -148,11 +148,7 @@ semi join の意味は「C にマッチする行だけを probe 側から残す�
   semi join の probe / build の入替や、内部結合との順序交換を行う
   兄弟 Rule です。本 Rule と合わせて「semi join を含む結合木の順序探索」
   を構成します。
-- `apply_to_join`: 相関サブクエリが `EXISTS` 等から semi join に
-  デコレーションされる経路で、生成された semi join が本 Rule の
-  入力になります。
-- `unique_semi_to_inner` / `semijoin_to_inner_plus_distinct`:
-  押し込まれた semi join がさらに内部結合へ降格できる局面を拾います。
+
 
 ## 検証テスト
 

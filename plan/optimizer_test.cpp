@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -45,6 +46,7 @@
 #include "expression/query_expression.hpp"
 #include "gtest/gtest.h"
 #include "index/index_schema.hpp"
+#include "plan/band_join_plan.hpp"
 #include "plan/cascades.hpp"
 #include "plan/full_scan_plan.hpp"
 #include "plan/implementation_rules.hpp"
@@ -53,6 +55,7 @@
 #include "plan/product_plan.hpp"
 #include "plan/sort_distinct_plan.hpp"
 #include "plan/sort_plan.hpp"
+#include "plan/zigzag_join_plan.hpp"
 #include "query/query_data.hpp"
 #include "query/statement.hpp"
 #include "table/iterator.hpp"
@@ -166,6 +169,7 @@ class OptimizerTest : public ::testing::Test {
   void Recover() {
     if (rs_) {
       rs_->EmulateCrash();
+      rs_.reset();
     }
     rs_ = Database::Create(prefix_).MoveValue();
   }
@@ -196,6 +200,18 @@ class OptimizerTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
+namespace {
+
+// gtest ASSERT_TRUE is invisible to clang-tidy's dataflow, so the optional
+// probe is unwrapped through this helper: the assert keeps
+// bugprone-unchecked-optional-access quiet while the failure mode (abort in
+// debug, a benign static_cast in release) matches the tests' expectations.
+const LookupSeek& SeekOf(const std::optional<LookupSeek>& probe) {
+  assert(probe.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  return *probe;
+}
+}  // namespace
 TEST_F(OptimizerTest, Construct) {
   // Arrange (SetUp created 4 tables + indexes + statistics)
 
@@ -242,7 +258,7 @@ TEST_F(OptimizerTest, NonUniqueIndexEstimatesMatchPointFrequencies) {
   rule_context.tables.emplace("Sc4", table);
   rule_context.statistics.emplace("Sc4", std::move(statistics));
 
-  const cascades::ImplementationRuleSet implementation_rules =
+  const cascades::ImplementationRuleSet& implementation_rules =
       DefaultImplementationRules();
   const cascades::ImplementationRule* index_rule = nullptr;
   for (const cascades::ImplementationRule& rule :
@@ -269,7 +285,8 @@ TEST_F(OptimizerTest, NonUniqueIndexEstimatesMatchPointFrequencies) {
     if (alternative.estimated_rows >= 24.0 &&
         alternative.estimated_rows <= 26.0) {
       equality_found = true;
-      EXPECT_NEAR(alternative.plan->EmitRowCount(), 25U, 1U);
+      EXPECT_NEAR(static_cast<double>(alternative.plan->EmitRowCount()), 25.0,
+                  1.0);
     }
   }
   EXPECT_TRUE(equality_found);
@@ -296,7 +313,7 @@ TEST_F(OptimizerTest, NonUniqueIndexEstimatesMatchPointFrequencies) {
   }
   ASSERT_NE(point_plan, nullptr);
   EXPECT_NEAR(point_estimate, 50.0, 1.0);
-  EXPECT_NEAR(point_plan->EmitRowCount(), 50U, 1U);
+  EXPECT_NEAR(static_cast<double>(point_plan->EmitRowCount()), 50.0, 1.0);
   Executor executor = point_plan->EmitExecutor(context);
   Row row;
   size_t rows = 0;
@@ -1502,7 +1519,7 @@ TEST_F(OptimizerTest, OrderByCapsCostForIndexProvidedOrdering) {
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
-  // Act + Assert: optimize + execute and verify the matching row.
+  // Act
   const auto plan_or = (Optimizer::Optimize(query, context));
   ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
   const Plan& plan = plan_or.Value();
@@ -1687,9 +1704,11 @@ TEST_F(OptimizerTest, HashJoinPreferredOverCrossProductForEquiJoin) {
       {NamedExpression("c1"), NamedExpression("d1")}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
+  OptimizerOptions options = OptimizerOptions::Default();
+  options.disabled_implementation_rules.insert("zigzag_join");
 
   // Act
-  const auto plan_or = (Optimizer::Optimize(query, context));
+  const auto plan_or = (Optimizer::Optimize(query, context, options));
   ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
   const Plan& plan = plan_or.Value();
 
@@ -1698,9 +1717,156 @@ TEST_F(OptimizerTest, HashJoinPreferredOverCrossProductForEquiJoin) {
   dump << plan;
   const std::string text = dump.str();
   EXPECT_TRUE(text.find("Hash Join") != std::string::npos ||
-              text.find("Index Join") != std::string::npos)
+              text.find("Index Join") != std::string::npos ||
+              text.find("MergeJoin") != std::string::npos)
       << text;
   EXPECT_EQ(text.find("Cross Join"), std::string::npos) << text;
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+// The physical half of the dynamic filter contract: the implementation rule
+// turns the logical probe-key annotation into a marker on the hash-join
+// ProductPlan, but only for a shape the filter can actually pay for -- an
+// inner, non null-safe, single INT64/DATE equi-join whose build side is
+// materially smaller than the probe side. Everything else keeps the plain hash
+// join.
+TEST_F(OptimizerTest, DynamicFilterMarkerFollowsTheAnnotatedProfitableShape) {
+  QueryData query{
+      {"Sc1", "Sc2"},
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                          ColumnValueExp("d1")),
+      {NamedExpression("c1"), NamedExpression("d1")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  OptimizerOptions options = OptimizerOptions::Default();
+  options.disabled_implementation_rules.insert("merge_join");
+  options.disabled_implementation_rules.insert("zigzag_join");
+  options.disabled_implementation_rules.insert("index_join");
+  options.disabled_implementation_rules.insert("late_materialization_join");
+  const auto plan_or = Optimizer::Optimize(query, context, options);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  const Plan& plan = plan_or.Value();
+
+  // Sc1 has 100 rows and Sc2 200: the build side is not materially smaller, so
+  // the filter is declined and the marker never appears in EXPLAIN.
+  std::ostringstream dump;
+  dump << plan;
+  const std::string text = dump.str();
+  // The marker is rendered by ProductPlan::Dump / ToString, so its absence
+  // is exactly "no dynamic filter on this plan".
+  EXPECT_NE(text.find("Hash Join"), std::string::npos) << text;
+  EXPECT_EQ(text.find("dynamic_filter:build="), std::string::npos) << text;
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, DynamicFilterMarkerEngagesOnAProbeHeavyShape) {
+  // Sc1 (100 rows) is the build side, and a subquery keeps Sc2 small enough to
+  // be scanned twice: the join has a real filter opportunity, and the marker
+  // must appear with the build side on the left.
+  TransactionContext context = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, sc1_stats,
+                        context.GetStats("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, sc2_stats,
+                        context.GetStats("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, sc1_table,
+                        context.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, sc2_table,
+                        context.GetTable("Sc2"));
+  Plan left = std::make_shared<FullScanPlan>(*sc1_table, *sc1_stats);
+  Plan right = std::make_shared<FullScanPlan>(*sc2_table, *sc2_stats);
+  cascades::Memo memo;
+  (void)memo.Build({"Sc1", "Sc2"});
+  const cascades::GroupId left_group = memo.EnsureGroup({"Sc1"});
+  const cascades::GroupId right_group = memo.EnsureGroup({"Sc2"});
+  const cascades::GroupId join_group =
+      memo.EnsureDerivedGroup({"Sc1", "Sc2"}, "root_join");
+  memo.AddExpression(
+      left_group,
+      cascades::LogicalExpression{.operation = cascades::LogicalOperator::kScan,
+                                  .table = "Sc1"});
+  memo.AddExpression(
+      right_group,
+      cascades::LogicalExpression{.operation = cascades::LogicalOperator::kScan,
+                                  .table = "Sc2"});
+  const Expression predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("Sc1", "c1")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("Sc2", "d1")));
+  memo.AddExpression(
+      join_group,
+      cascades::LogicalExpression{.operation = cascades::LogicalOperator::kJoin,
+                                  .children = {left_group, right_group},
+                                  .predicate = predicate});
+
+  cascades::SearchEngine search(std::move(memo), cascades::RuleSet::Default());
+  search.Explore(join_group);
+  const cascades::ImplementationRule* hash_rule = nullptr;
+  for (const auto& rule : DefaultImplementationRules().Rules()) {
+    if (rule.Name() == "hash_join") {
+      hash_rule = &rule;
+    }
+  }
+  ASSERT_NE(hash_rule, nullptr);
+
+  // Both orientations are enumerated; the one whose build side is the small
+  // relation is the only one a filter pays for. Each shape is handed to the
+  // implementation rule bound to the memo group the rule reads the annotation
+  // from, which is what a real search does.
+  const auto marker_for = [&](double left_rows,
+                              double right_rows) -> std::optional<bool> {
+    cascades::Memo rebuilt;
+    (void)rebuilt.Build({"Sc1", "Sc2"});
+    const cascades::GroupId l = rebuilt.EnsureGroup({"Sc1"});
+    const cascades::GroupId r = rebuilt.EnsureGroup({"Sc2"});
+    const cascades::GroupId j =
+        rebuilt.EnsureDerivedGroup({"Sc1", "Sc2"}, "root_join");
+    rebuilt.AddExpression(j, cascades::LogicalExpression{
+                                 .operation = cascades::LogicalOperator::kJoin,
+                                 .children = {l, r},
+                                 .predicate = predicate});
+    cascades::SearchEngine engine(std::move(rebuilt),
+                                  cascades::RuleSet::Default());
+    engine.Explore(j);
+    const cascades::Memo& annotated_memo = engine.GetMemo();
+    // Implement the expression whose children[1] is the annotated probe group.
+    for (const auto& expression : annotated_memo.Get(j).expressions) {
+      if (expression.operation != cascades::LogicalOperator::kJoin ||
+          expression.children.size() != 2) {
+        continue;
+      }
+      if (annotated_memo.Get(expression.children[1])
+              .dynamic_filter_keys.empty()) {
+        continue;
+      }
+      const std::vector<cascades::BestPlan> children{
+          cascades::BestPlan{.plan = left,
+                             .estimated_rows = left_rows,
+                             .group = expression.children[0]},
+          cascades::BestPlan{.plan = right,
+                             .estimated_rows = right_rows,
+                             .group = expression.children[1]}};
+      const auto alternatives = hash_rule->Apply(
+          annotated_memo, j, expression, children,
+          cascades::PhysicalProperties{}, cascades::RuleContext::Empty());
+      for (const auto& alternative : alternatives) {
+        const auto* product =
+            dynamic_cast<const ProductPlan*>(alternative.plan.get());
+        if (product != nullptr && product->PrefersDynamicFilter()) {
+          return product->DynamicFilterBuildsLeft();
+        }
+      }
+    }
+    return std::nullopt;
+  };
+
+  // children[1] is the annotated probe, so the build is children[0]: the small
+  // relation when the first shape is used, the large one otherwise.
+  EXPECT_EQ(marker_for(/*left_rows=*/5.0, /*right_rows=*/40000.0),
+            std::optional<bool>(true));
+  EXPECT_EQ(marker_for(/*left_rows=*/40000.0, /*right_rows=*/5.0),
+            std::nullopt);
+  // Same orientation, both sides the same size: no shape is profitable enough.
+  EXPECT_EQ(marker_for(/*left_rows=*/100.0, /*right_rows=*/200.0),
+            std::nullopt);
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -1715,6 +1881,9 @@ TEST_F(OptimizerTest, HashJoinUsesSmallerInputAsBuildSide) {
 
   OptimizerOptions options = OptimizerOptions::Default();
   options.disabled_implementation_rules.insert("merge_join");
+  options.disabled_implementation_rules.insert("zigzag_join");
+  options.disabled_implementation_rules.insert("index_join");
+  options.disabled_implementation_rules.insert("late_materialization_join");
   const auto plan_or = Optimizer::Optimize(query, context, options);
   ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
   std::ostringstream dump;
@@ -2008,6 +2177,190 @@ TEST_F(OptimizerTest, OuterJoinRuleAddsMergeJoinAlternative) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, NullSafeOuterJoinUsesOnlySupportedHashLowering) {
+  TransactionContext context = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, left_table,
+                        context.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, right_table,
+                        context.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, left_stats,
+                        context.GetStats("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, right_stats,
+                        context.GetStats("Sc2"));
+  Plan left = std::make_shared<FullScanPlan>(*left_table, *left_stats);
+  Plan right = std::make_shared<FullScanPlan>(*right_table, *right_stats);
+  cascades::Memo memo;
+  const cascades::GroupId root = memo.Build({"Sc1", "Sc2"});
+  cascades::LogicalExpression logical = memo.Get(root).expressions.front();
+  logical.predicate = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc2", "d1"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c2")),
+                          BinaryOperation::kIsNotDistinctFrom,
+                          ColumnValueExp(ColumnName("Sc2", "d3"))));
+  const std::vector<cascades::BestPlan> children{
+      cascades::BestPlan{
+          .plan = left,
+          .estimated_rows = static_cast<double>(left->EmitRowCount())},
+      cascades::BestPlan{
+          .plan = right,
+          .estimated_rows = static_cast<double>(right->EmitRowCount())}};
+
+  const cascades::ImplementationRule* outer_hash = nullptr;
+  const cascades::ImplementationRule* merge = nullptr;
+  const cascades::ImplementationRule* index = nullptr;
+  for (const auto& candidate : DefaultImplementationRules().Rules()) {
+    if (candidate.Name() == "outer_hash_join") {
+      outer_hash = &candidate;
+    } else if (candidate.Name() == "merge_join") {
+      merge = &candidate;
+    } else if (candidate.Name() == "index_join") {
+      index = &candidate;
+    }
+  }
+  ASSERT_NE(outer_hash, nullptr);
+  ASSERT_NE(merge, nullptr);
+  ASSERT_NE(index, nullptr);
+
+  logical.operation = cascades::LogicalOperator::kOuterJoin;
+  logical.join_type = 0;
+  const auto outer_alternatives = outer_hash->Apply(
+      memo, root, logical, children, cascades::PhysicalProperties{},
+      cascades::RuleContext::Empty());
+  bool found_hash = false;
+  for (const auto& alternative : outer_alternatives) {
+    const auto product =
+        std::dynamic_pointer_cast<ProductPlan>(alternative.plan);
+    if (product == nullptr) {
+      continue;
+    }
+    found_hash = true;
+    EXPECT_EQ(product->Kind(), LeftOuterJoinKind());
+    EXPECT_EQ(product->KeyNullSafe(), (std::vector<bool>{false, true}));
+    EXPECT_EQ(std::dynamic_pointer_cast<MergeJoinPlan>(alternative.plan),
+              nullptr);
+  }
+  EXPECT_TRUE(found_hash);
+  EXPECT_TRUE(merge
+                  ->Apply(memo, root, logical, children,
+                          cascades::PhysicalProperties{},
+                          cascades::RuleContext::Empty())
+                  .empty());
+
+  logical.operation = cascades::LogicalOperator::kJoin;
+  cascades::RuleContext rule_context;
+  rule_context.tables.emplace("Sc1", left_table);
+  rule_context.tables.emplace("Sc2", right_table);
+  rule_context.statistics.emplace("Sc1", left_stats);
+  rule_context.statistics.emplace("Sc2", right_stats);
+  EXPECT_TRUE(index
+                  ->Apply(memo, root, logical, children,
+                          cascades::PhysicalProperties{}, rule_context)
+                  .empty());
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterHashCarriesResidualBeforeNullPadding) {
+  TransactionContext context = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, left_table,
+                        context.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, right_table,
+                        context.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, left_stats,
+                        context.GetStats("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, right_stats,
+                        context.GetStats("Sc2"));
+  Plan left = std::make_shared<FullScanPlan>(*left_table, *left_stats);
+  Plan right = std::make_shared<FullScanPlan>(*right_table, *right_stats);
+  cascades::Memo memo;
+  const cascades::GroupId root = memo.Build({"Sc1", "Sc2"});
+  cascades::LogicalExpression logical = memo.Get(root).expressions.front();
+  logical.operation = cascades::LogicalOperator::kOuterJoin;
+  logical.join_type = 0;
+  logical.predicate = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc2", "d1"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc2", "d4")),
+                          BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0}))));
+  const std::vector<cascades::BestPlan> children{
+      cascades::BestPlan{
+          .plan = left,
+          .estimated_rows = static_cast<double>(left->EmitRowCount())},
+      cascades::BestPlan{
+          .plan = right,
+          .estimated_rows = static_cast<double>(right->EmitRowCount())}};
+  const cascades::ImplementationRule* rule = nullptr;
+  for (const auto& candidate : DefaultImplementationRules().Rules()) {
+    if (candidate.Name() == "outer_hash_join") {
+      rule = &candidate;
+      break;
+    }
+  }
+  ASSERT_NE(rule, nullptr);
+  const auto alternatives =
+      rule->Apply(memo, root, logical, children, cascades::PhysicalProperties{},
+                  cascades::RuleContext::Empty());
+  bool found = false;
+  for (const auto& alternative : alternatives) {
+    const auto product =
+        std::dynamic_pointer_cast<ProductPlan>(alternative.plan);
+    if (product != nullptr && product->Kind() == LeftOuterJoinKind() &&
+        product->ResidualNote()) {
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, OuterHashResidualPadsWhenAllKeyMatchesFail) {
+  QueryData query{{"Sc1", "Sc2"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression("c1"), NamedExpression("d1")}};
+  QueryData::OuterJoinEdge edge;
+  edge.right_index = 1;
+  edge.join_kind = 0;
+  edge.on_condition = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc2", "d1"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(
+          ColumnValueExp(ColumnName("Sc1", "c3")), BinaryOperation::kLessThan,
+          BinaryExpressionExp(ColumnValueExp(ColumnName("Sc2", "d2")),
+                              BinaryOperation::kSubtract,
+                              ConstantValueExp(Value(1000000.0)))));
+  query.outer_joins_.push_back(std::move(edge));
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  OptimizerOptions options = OptimizerOptions::Default();
+  options.disabled_implementation_rules = {"merge_join", "outer_nested_loop",
+                                           "batch_nested_loop_outer",
+                                           "index_join", "band_join"};
+  const StatusOr<Plan> plan = Optimizer::Optimize(query, context, options);
+  ASSERT_TRUE(plan.HasValue()) << plan.GetStatus().GetMessage();
+  std::ostringstream dump;
+  plan.Value()->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("Left Outer Join"), std::string::npos)
+      << dump.str();
+  Executor executor = plan.Value()->EmitExecutor(context);
+  size_t rows = 0;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+    ASSERT_EQ(row.values_.size(), 2U);
+    EXPECT_TRUE(row[1].IsNull());
+  }
+  EXPECT_EQ(rows, 100U);
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, OuterJoinSliceLowersLeftJoinThroughMemo) {
   // M6: QueryData with a single LEFT edge optimizes to a LeftOuter physical
   // join. Sc2.d4 is constant 16, so left row c1 = 16 matches all 200 right
@@ -2218,6 +2571,9 @@ TEST_F(OptimizerTest, OuterJoinSliceFullNonEquiJoinUsesBatchNestedLoop) {
 
   const auto plan_or = Optimizer::Optimize(query, context);
   ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream debug_plan;
+  debug_plan << plan_or.Value();
+  SCOPED_TRACE(debug_plan.str());
   Executor executor = plan_or.Value()->EmitExecutor(context);
   std::ostringstream dump;
   executor->Dump(dump, 0);
@@ -2263,6 +2619,9 @@ TEST_F(OptimizerTest, OuterJoinSliceKeepsFullWhereAboveJoin) {
 
   const auto plan_or = Optimizer::Optimize(query, context);
   ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream debug_plan;
+  debug_plan << plan_or.Value();
+  SCOPED_TRACE(debug_plan.str());
   Executor executor = plan_or.Value()->EmitExecutor(context);
   Row row;
   size_t count = 0;
@@ -2814,8 +3173,7 @@ TEST_F(OptimizerTest, BatchNestedLoopExecutesNonEquiInnerJoin) {
     ASSERT_SUCCESS(context.PreCommit());
   }
   {
-    // Act: with the full rule set the tuple nested loop still wins the
-    // exact tie (it is registered first), so existing plans are unchanged.
+    // Act: the blocked executor wins without disabling the tuple fallback.
     QueryData q = query();
     TransactionContext context = rs_->BeginContext();
     ASSERT_SUCCESS(q.Rewrite(context));
@@ -2823,12 +3181,12 @@ TEST_F(OptimizerTest, BatchNestedLoopExecutesNonEquiInnerJoin) {
     ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
     std::ostringstream plan_dump;
     plan_dump << plan_or.Value();
-    EXPECT_EQ(plan_dump.str().find("Batch"), std::string::npos)
+    EXPECT_NE(plan_dump.str().find("Batch"), std::string::npos)
         << plan_dump.str();
     Executor executor = plan_or.Value()->EmitExecutor(context);
     std::ostringstream dump;
     executor->Dump(dump, 0);
-    EXPECT_EQ(dump.str().find("BatchNestedLoopJoin"), std::string::npos)
+    EXPECT_NE(dump.str().find("BatchNestedLoopJoin"), std::string::npos)
         << dump.str();
 
     // Assert: same single row.
@@ -2850,6 +3208,8 @@ TEST_F(OptimizerTest, BatchNestedLoopGateKeepsEquiJoins) {
   options.disabled_implementation_rules.insert("merge_join");
   options.disabled_implementation_rules.insert("index_join");
   options.disabled_implementation_rules.insert("nested_loop_join");
+  options.disabled_implementation_rules.insert("band_join");
+  options.disabled_implementation_rules.insert("zigzag_join");
   {
     QueryData query{
         {"Sc1", "Sc2"},
@@ -3144,6 +3504,467 @@ TEST_F(OptimizerTest, AliasedSelfJoinCanUseIndexNestedLoop) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+// The index nested-loop rule can push ONE range bound into the probe, on the
+// first index key column the equality prefix leaves open. The plan must carry
+// that bound -- so the seek is a range, not a point -- and the residual above
+// it must carry everything the probe does not decide.
+//
+// The rule is applied directly (not through the full memo exploration) so the
+// test pins the rule's own contract. The memo path cannot reach it for a plain
+// nullable equi-join: the expression rewrite's null-safety inference turns
+// `l.x = r.a` into `l.x = r.a AND l.x IS NOT NULL AND r.a IS NOT NULL`, both
+// inferred conjuncts get pushed into the scan groups, and the rule refuses any
+// index whose right scan group carries a filter (see
+// FilteredSelfJoinKeepsRightSidePredicate).
+TEST_F(OptimizerTest, IndexJoinRulePushesOneRangeBoundIntoTheProbe) {
+  TransactionContext setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, left_tbl,
+      rs_->CreateTable(setup,
+                       Schema("ProbeLeft", {Column("x", ValueType::kInt64),
+                                            Column("y", ValueType::kInt64)})));
+  for (const auto& row : {Row({Value(1), Value(5)}), Row({Value(1), Value(6)}),
+                          Row({Value(2), Value(5)})}) {
+    ASSERT_SUCCESS(left_tbl.Insert(setup.txn_, row).GetStatus());
+  }
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(setup,
+                       Schema("ProbeRight", {Column("a", ValueType::kInt64),
+                                             Column("b", ValueType::kInt64),
+                                             Column("c", ValueType::kInt64)})));
+  for (const auto& row : {Row({Value(1), Value(4), Value(50)}),
+                          Row({Value(1), Value(10), Value(100)}),
+                          Row({Value(1), Value(20), Value(200)}),
+                          Row({Value(1), Value(30), Value(300)}),
+                          Row({Value(2), Value(6), Value(60)}),
+                          Row({Value(2), Value(40), Value(400)})}) {
+    ASSERT_SUCCESS(right_tbl.Insert(setup.txn_, row).GetStatus());
+  }
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      setup, "ProbeRight",
+      IndexSchema("ProbeRightAB", {0, 1}, {}, IndexMode::kNonUnique)));
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+  TransactionContext stat_ctx = rs_->BeginContext();
+  rs_->RefreshStatistics(stat_ctx, "ProbeLeft");
+  rs_->RefreshStatistics(stat_ctx, "ProbeRight");
+  ASSERT_SUCCESS(stat_ctx.PreCommit());
+
+  TransactionContext context = rs_->BeginContext();
+  const auto left = context.GetTable("ProbeLeft");
+  const auto right = context.GetTable("ProbeRight");
+  const auto left_stats = context.GetStats("ProbeLeft");
+  const auto right_stats = context.GetStats("ProbeRight");
+  ASSERT_TRUE(left.HasValue());
+  ASSERT_TRUE(right.HasValue());
+  ASSERT_TRUE(left_stats.HasValue());
+  ASSERT_TRUE(right_stats.HasValue());
+
+  const Expression predicate = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("ProbeLeft", "x")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("ProbeRight", "a"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("ProbeRight", "b")),
+                          BinaryOperation::kGreaterThan,
+                          ColumnValueExp(ColumnName("ProbeLeft", "y"))));
+
+  cascades::RuleContext rule_context;
+  rule_context.transaction = &context;
+  rule_context.tables = {{"ProbeLeft", left.Value()},
+                         {"ProbeRight", right.Value()}};
+  rule_context.statistics = {{"ProbeLeft", left_stats.Value()},
+                             {"ProbeRight", right_stats.Value()}};
+  const cascades::ImplementationRule* rule = nullptr;
+  for (const auto& candidate : DefaultImplementationRules().Rules()) {
+    if (candidate.Name() == "index_join") {
+      rule = &candidate;
+      break;
+    }
+  }
+  ASSERT_NE(rule, nullptr);
+
+  const TableStatistics left_ts = *left_stats.Value();
+  Plan left_plan = std::make_shared<FullScanPlan>(*left.Value(), left_ts);
+  Plan right_plan = std::make_shared<FullScanPlan>(*right.Value(), left_ts);
+  cascades::Memo memo;
+  const cascades::GroupId root = memo.Build({"ProbeLeft", "ProbeRight"});
+  const cascades::GroupId right_group =
+      memo.Get(root).expressions.front().children[1];
+  cascades::LogicalExpression logical = memo.Get(root).expressions.front();
+  logical.predicate = predicate;
+  const std::vector<cascades::BestPlan> children{
+      cascades::BestPlan{.plan = left_plan, .estimated_rows = 3.0},
+      cascades::BestPlan{.plan = right_plan, .estimated_rows = 6.0}};
+  const std::vector<cascades::PlanAlternative> alternatives =
+      rule->Apply(memo, right_group, logical, children,
+                  cascades::PhysicalProperties{}, rule_context);
+  ASSERT_EQ(alternatives.size(), 1U);
+  const auto product =
+      std::dynamic_pointer_cast<ProductPlan>(alternatives.front().plan);
+  ASSERT_NE(product, nullptr);
+  ASSERT_TRUE(product->Lookup().has_value());
+  // The equality prefix pins (a); the range bound rides on (b), the first
+  // index key column the prefix leaves open. Both are shown in index key
+  // order, not in the order the predicate lists them.
+  ASSERT_EQ(SeekOf(product->Lookup()).right_columns.size(), 2U);
+  EXPECT_EQ(SeekOf(product->Lookup()).right_columns[0],
+            ColumnName("ProbeRight", "a"));
+  ASSERT_EQ(SeekOf(product->Lookup()).range_position, 1U);
+  EXPECT_EQ(SeekOf(product->Lookup()).left_columns[1],
+            ColumnName("ProbeLeft", "y"));
+  EXPECT_EQ(SeekOf(product->Lookup()).right_columns[1],
+            ColumnName("ProbeRight", "b"));
+  EXPECT_EQ(SeekOf(product->Lookup()).range_operation,
+            BinaryOperation::kGreaterThan);
+  // The range bound is enforced by the probe, so no residual is left.
+  EXPECT_EQ(product->ResidualNote(), nullptr);
+  EXPECT_NE(product->ToString().find("probe:{ProbeRight.a, ProbeLeft.y >"
+                                     " ProbeRight.b}"),
+            std::string::npos)
+      << product->ToString();
+
+  Executor executor = product->EmitExecutor(context);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("LookupJoin"), std::string::npos) << dump.str();
+  // The join emits `left(2) + right(3)`, so the payload `c` sits at index 4.
+  constexpr size_t kPayloadColumn = 4;
+  std::vector<int64_t> matched;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    matched.push_back(row[kPayloadColumn].value.int_value);
+  }
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+  // (x=1, y=5): b > 5 -> 10, 20, 30.  (x=1, y=6): b > 6 -> 10, 20, 30.
+  // (x=2, y=5): b > 5 -> 6, 40.
+  std::vector<int64_t> expected{60, 100, 100, 200, 200, 300, 300, 400};
+  std::ranges::sort(matched);
+  std::ranges::sort(expected);
+  EXPECT_EQ(matched, expected);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+// A second range column, a range the type whitelist rejects and an equality on
+// a non-key column all have to stay residual predicates. The probe
+// over-fetches and the predicate above it decides the rows -- never the other
+// way round.
+TEST_F(OptimizerTest, IndexJoinRuleKeepsUnprobedPredicatesResidual) {
+  TransactionContext setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, left_tbl,
+      rs_->CreateTable(setup,
+                       Schema("ProbeLeft", {Column("x", ValueType::kInt64),
+                                            Column("y", ValueType::kInt64),
+                                            Column("z", ValueType::kDouble)})));
+  for (const auto& row : {Row({Value(1), Value(5), Value(2.5)}),
+                          Row({Value(2), Value(1), Value(0.5)})}) {
+    ASSERT_SUCCESS(left_tbl.Insert(setup.txn_, row).GetStatus());
+  }
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(
+          setup, Schema("ProbeRight", {Column("a", ValueType::kInt64),
+                                       Column("b", ValueType::kInt64),
+                                       Column("c", ValueType::kInt64),
+                                       Column("d", ValueType::kDouble)})));
+  for (const auto& row : {Row({Value(1), Value(10), Value(1), Value(9.5)}),
+                          Row({Value(1), Value(20), Value(7), Value(1.5)}),
+                          Row({Value(1), Value(30), Value(1), Value(3.5)}),
+                          Row({Value(2), Value(5), Value(2), Value(0.25)}),
+                          Row({Value(2), Value(40), Value(9), Value(7.5)})}) {
+    ASSERT_SUCCESS(right_tbl.Insert(setup.txn_, row).GetStatus());
+  }
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      setup, "ProbeRight",
+      IndexSchema("ProbeRightAB", {0, 1}, {}, IndexMode::kNonUnique)));
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+  TransactionContext stat_ctx = rs_->BeginContext();
+  rs_->RefreshStatistics(stat_ctx, "ProbeLeft");
+  rs_->RefreshStatistics(stat_ctx, "ProbeRight");
+  ASSERT_SUCCESS(stat_ctx.PreCommit());
+
+  TransactionContext context = rs_->BeginContext();
+  const auto left = context.GetTable("ProbeLeft");
+  const auto right = context.GetTable("ProbeRight");
+  const auto left_stats = context.GetStats("ProbeLeft");
+  const auto right_stats = context.GetStats("ProbeRight");
+  ASSERT_TRUE(left.HasValue());
+  ASSERT_TRUE(right.HasValue());
+  ASSERT_TRUE(left_stats.HasValue());
+  ASSERT_TRUE(right_stats.HasValue());
+
+  const Expression predicate = BinaryExpressionExp(
+      BinaryExpressionExp(
+          BinaryExpressionExp(
+              BinaryExpressionExp(
+                  ColumnValueExp(ColumnName("ProbeLeft", "x")),
+                  BinaryOperation::kEquals,
+                  ColumnValueExp(ColumnName("ProbeRight", "a"))),
+              BinaryOperation::kAnd,
+              BinaryExpressionExp(
+                  ColumnValueExp(ColumnName("ProbeRight", "b")),
+                  BinaryOperation::kGreaterThan,
+                  ColumnValueExp(ColumnName("ProbeLeft", "y")))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp(ColumnName("ProbeRight", "d")),
+                              BinaryOperation::kLessThan,
+                              ColumnValueExp(ColumnName("ProbeLeft", "z")))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("ProbeLeft", "x")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("ProbeRight", "c"))));
+
+  cascades::RuleContext rule_context;
+  rule_context.transaction = &context;
+  rule_context.tables = {{"ProbeLeft", left.Value()},
+                         {"ProbeRight", right.Value()}};
+  rule_context.statistics = {{"ProbeLeft", left_stats.Value()},
+                             {"ProbeRight", right_stats.Value()}};
+  const cascades::ImplementationRule* rule = nullptr;
+  for (const auto& candidate : DefaultImplementationRules().Rules()) {
+    if (candidate.Name() == "index_join") {
+      rule = &candidate;
+      break;
+    }
+  }
+  ASSERT_NE(rule, nullptr);
+
+  const TableStatistics left_ts = *left_stats.Value();
+  Plan left_plan = std::make_shared<FullScanPlan>(*left.Value(), left_ts);
+  Plan right_plan = std::make_shared<FullScanPlan>(*right.Value(), left_ts);
+  cascades::Memo memo;
+  const cascades::GroupId root = memo.Build({"ProbeLeft", "ProbeRight"});
+  const cascades::GroupId right_group =
+      memo.Get(root).expressions.front().children[1];
+  cascades::LogicalExpression logical = memo.Get(root).expressions.front();
+  logical.predicate = predicate;
+  const std::vector<cascades::BestPlan> children{
+      cascades::BestPlan{.plan = left_plan, .estimated_rows = 2.0},
+      cascades::BestPlan{.plan = right_plan, .estimated_rows = 5.0}};
+  const std::vector<cascades::PlanAlternative> alternatives =
+      rule->Apply(memo, right_group, logical, children,
+                  cascades::PhysicalProperties{}, rule_context);
+  ASSERT_EQ(alternatives.size(), 1U);
+  // The unprobed conjuncts become a residual Selection above the join, and the
+  // probe still carries the one admissible bound.
+  std::ostringstream rendered_stream;
+  alternatives.front().plan->Dump(rendered_stream, 0);
+  const std::string rendered = rendered_stream.str();
+  EXPECT_EQ(rendered.rfind("Select:", 0), 0U) << rendered;
+  EXPECT_NE(rendered.find("ProbeRight.d < ProbeLeft.z"), std::string::npos)
+      << rendered;
+  EXPECT_NE(rendered.find("ProbeLeft.x = ProbeRight.c"), std::string::npos)
+      << rendered;
+  EXPECT_NE(rendered.find("probe:{ProbeRight.a, ProbeLeft.y >"
+                          " ProbeRight.b}"),
+            std::string::npos)
+      << rendered;
+  // The range bound the probe does enforce must NOT be re-checked above it.
+  EXPECT_EQ(rendered.find("ProbeRight.b > ProbeLeft.y"), std::string::npos)
+      << rendered;
+
+  Executor executor = alternatives.front().plan->EmitExecutor(context);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("LookupJoin"), std::string::npos) << dump.str();
+  // The join emits `left(3) + right(4)`, so the right `b` sits at index 4.
+  constexpr size_t kPayloadColumn = 4;
+  std::vector<int64_t> matched;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    matched.push_back(row[kPayloadColumn].value.int_value);
+  }
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+  // (x=1, y=5, z=2.5): a=1, b>5, d<2.5, c=1 -> only (1, 30, 1, 3.5) has
+  // c=1, but its d=3.5 is not below 2.5.
+  // (x=2, y=1, z=0.5): a=2, b>1, d<0.5, c=2 -> (2, 5, 2, 0.25) only.
+  EXPECT_EQ(matched, std::vector<int64_t>{5});
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+// A band join planned through the full memo: join_commutativity registers both
+// child orders, so the band_join rule can be handed children whose order is the
+// reverse of the one the predicate is written in. The seed-17 SqlJoinFuzzer
+// regression came from here -- the candidate range followed the *written*
+// operator while the children's order was swapped, so the range and the
+// residual re-check disagreed and the join lost rows. Whichever orientation
+// wins, the pairs must equal the nested-loop mirror below.
+TEST_F(OptimizerTest, ZigZagJoinChoosesTwoOrderedIndexesAndCanFallback) {
+  QueryData query{
+      {"Sc1", "Sc2"},
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc2", "d1"))),
+      {NamedExpression("left_key", ColumnValueExp(ColumnName("Sc1", "c1"))),
+       NamedExpression("right_key", ColumnValueExp(ColumnName("Sc2", "d1")))}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  dump << *plan;
+  EXPECT_NE(dump.str().find("ZigZagJoin"), std::string::npos) << dump.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  size_t rows = 0;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+    row = Row();
+  }
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+  EXPECT_EQ(rows, 100U);
+
+  OptimizerOptions fallback = OptimizerOptions::Default();
+  fallback.disabled_implementation_rules = {"zigzag_join"};
+  ASSIGN_OR_ASSERT_FAIL(Plan, fallback_plan,
+                        Optimizer::Optimize(query, context, fallback));
+  std::ostringstream fallback_dump;
+  fallback_dump << *fallback_plan;
+  EXPECT_EQ(fallback_dump.str().find("ZigZagJoin"), std::string::npos)
+      << fallback_dump.str();
+  Executor fallback_executor = fallback_plan->EmitExecutor(context);
+  rows = 0;
+  while (fallback_executor->Next(&row, nullptr)) {
+    ++rows;
+    row = Row();
+  }
+  EXPECT_EQ(fallback_executor->GetStatus(), Status::kSuccess);
+  EXPECT_EQ(rows, 100U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, BandJoinSurvivesJoinCommutativity) {
+  TransactionContext setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, left_tbl,
+      rs_->CreateTable(setup,
+                       Schema("BandLeft", {Column("a", ValueType::kInt64)})));
+  for (const auto& row : {Row({Value(10)}), Row({Value(2)}), Row({Value(4)})}) {
+    ASSERT_SUCCESS(left_tbl.Insert(setup.txn_, row).GetStatus());
+  }
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(setup,
+                       Schema("BandRight", {Column("k", ValueType::kInt64)})));
+  for (const auto& row : {Row({Value(1)}), Row({Value(3)}), Row({Value(5)})}) {
+    ASSERT_SUCCESS(right_tbl.Insert(setup.txn_, row).GetStatus());
+  }
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+  TransactionContext stat_ctx = rs_->BeginContext();
+  rs_->RefreshStatistics(stat_ctx, "BandLeft");
+  rs_->RefreshStatistics(stat_ctx, "BandRight");
+  ASSERT_SUCCESS(stat_ctx.PreCommit());
+
+  TransactionContext context = rs_->BeginContext();
+  const auto left = context.GetTable("BandLeft");
+  const auto right = context.GetTable("BandRight");
+  const auto left_stats = context.GetStats("BandLeft");
+  const auto right_stats = context.GetStats("BandRight");
+  ASSERT_TRUE(left.HasValue());
+  ASSERT_TRUE(right.HasValue());
+  ASSERT_TRUE(left_stats.HasValue());
+  ASSERT_TRUE(right_stats.HasValue());
+
+  cascades::RuleContext rule_context;
+  rule_context.transaction = &context;
+  rule_context.tables = {{"BandLeft", left.Value()},
+                         {"BandRight", right.Value()}};
+  rule_context.statistics = {{"BandLeft", left_stats.Value()},
+                             {"BandRight", right_stats.Value()}};
+  const cascades::ImplementationRule* rule = nullptr;
+  for (const auto& candidate : DefaultImplementationRules().Rules()) {
+    if (candidate.Name() == "band_join") {
+      rule = &candidate;
+      break;
+    }
+  }
+  ASSERT_NE(rule, nullptr);
+
+  // The nested-loop mirror: every (a, k) pair with a <= k.
+  std::vector<std::pair<int64_t, int64_t>> expected;
+  for (const int64_t a : {10, 2, 4}) {
+    for (const int64_t k : {1, 3, 5}) {
+      if (a <= k) {
+        expected.emplace_back(a, k);
+      }
+    }
+  }
+  std::ranges::sort(expected);
+
+  // NOTE: FullScanPlan keeps its statistics by reference, so the scans' stats
+  // must outlive the plans.
+  const TableStatistics left_ts = *left_stats.Value();
+  const TableStatistics right_ts = *right_stats.Value();
+  Plan left_plan = std::make_shared<FullScanPlan>(*left.Value(), left_ts);
+  Plan right_plan = std::make_shared<FullScanPlan>(*right.Value(), right_ts);
+  const Expression written =
+      BinaryExpressionExp(ColumnValueExp(ColumnName("BandLeft", "a")),
+                          BinaryOperation::kLessThanEquals,
+                          ColumnValueExp(ColumnName("BandRight", "k")));
+
+  // Both orientations are exercised, each with a fresh memo so the child order
+  // in the bindings is exactly the one under test.
+  for (const bool swapped : {false, true}) {
+    SCOPED_TRACE(swapped ? "children (right, left)" : "children (left, right)");
+    cascades::Memo memo;
+    const cascades::GroupId root = memo.Build({"BandLeft", "BandRight"});
+    cascades::LogicalExpression logical = memo.Get(root).expressions.front();
+    logical.predicate = written;
+    std::vector<cascades::BestPlan> children;
+    children.reserve(2);
+    if (swapped) {
+      children.push_back(
+          cascades::BestPlan{.plan = right_plan, .estimated_rows = 3.0});
+      children.push_back(
+          cascades::BestPlan{.plan = left_plan, .estimated_rows = 3.0});
+    } else {
+      children.push_back(
+          cascades::BestPlan{.plan = left_plan, .estimated_rows = 3.0});
+      children.push_back(
+          cascades::BestPlan{.plan = right_plan, .estimated_rows = 3.0});
+    }
+    const std::vector<cascades::PlanAlternative> alternatives =
+        rule->Apply(memo, logical.children[1], logical, children,
+                    cascades::PhysicalProperties{}, rule_context);
+    ASSERT_EQ(alternatives.size(), 1U);
+    const auto band =
+        std::dynamic_pointer_cast<BandJoinPlan>(alternatives.front().plan);
+    ASSERT_NE(band, nullptr);
+    // Each side is ordered by its OWN key, and the comparison reads in the
+    // child order the plan actually has.
+    if (swapped) {
+      EXPECT_EQ(band->LeftKeys().front(), ColumnName("BandRight", "k"));
+      EXPECT_EQ(band->RightKeys().front(), ColumnName("BandLeft", "a"));
+      EXPECT_EQ(band->Comparison(), BinaryOperation::kGreaterThanEquals);
+    } else {
+      EXPECT_EQ(band->LeftKeys().front(), ColumnName("BandLeft", "a"));
+      EXPECT_EQ(band->RightKeys().front(), ColumnName("BandRight", "k"));
+      EXPECT_EQ(band->Comparison(), BinaryOperation::kLessThanEquals);
+    }
+    // The plan is ordered by each child's own key.
+    EXPECT_TRUE(band->Left()->IsOrderedBy(
+        {ColumnValueExp(band->LeftKeys().front())}, {true}));
+    EXPECT_TRUE(band->Right()->IsOrderedBy(
+        {ColumnValueExp(band->RightKeys().front())}, {true}));
+
+    Executor executor = alternatives.front().plan->EmitExecutor(context);
+    std::vector<std::pair<int64_t, int64_t>> got;
+    Row row;
+    while (executor->Next(&row, nullptr)) {
+      const int64_t first = row[0].value.int_value;
+      const int64_t second = row[1].value.int_value;
+      // The join emits (left, right); normalize to (a, k) either way.
+      got.emplace_back(swapped ? second : first, swapped ? first : second);
+    }
+    EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+    std::ranges::sort(got);
+    EXPECT_EQ(got, expected);
+  }
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, AliasedOrderByLimitFoldsTopK) {
   // Phase 8 follow-up: the relation rename translates ordering requests back
   // to physical names. An ordered IndexOnlyScan already delivers rows in the
@@ -3223,13 +4044,15 @@ TEST_F(OptimizerTest, CommonEqualityInEveryOrBranchBecomesJoinKey) {
       {"Sc1", "Sc2"},
       BinaryExpressionExp(
           conjunction(
-              BinaryExpressionExp(left_key, BinaryOperation::kEquals,
-                                  right_key),
+              BinaryExpressionExp(
+                  left_key, BinaryOperation::kEquals,
+                  right_key),  // NOLINT(readability-suspicious-call-argument)
               BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
                                   BinaryOperation::kLessThan,
                                   ConstantValueExp(Value(10)))),
           BinaryOperation::kOr,
           conjunction(
+              // NOLINTNEXTLINE(readability-suspicious-call-argument)
               BinaryExpressionExp(right_key, BinaryOperation::kEquals,
                                   left_key),
               BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
@@ -3598,6 +4421,83 @@ TEST_F(OptimizerTest, ParallelAggregationEmittedForLargeChild) {
   EXPECT_EQ(row[0], Value(kParallelTestRows));
   EXPECT_EQ(row[1], Value(kParallelTestRows * (kParallelTestRows - 1) / 2));
   EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+namespace {
+// Analyzed table whose primary key arrives in ascending order, so a full scan
+// over it may report the clustered index order (plan/full_scan_plan.hpp).
+void InsertAnalyzedClusteredTable(Database* db, std::string_view table,
+                                  int64_t rows) {
+  TransactionContext writer = db->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, tbl,
+      db->CreateTable(
+          writer, Schema(table, {Column("key", ValueType::kInt64,
+                                        Constraint(Constraint::kPrimaryKey)),
+                                 Column("payload", ValueType::kInt64)})));
+  for (int64_t key = 0; key < rows; ++key) {
+    ASSERT_SUCCESS(
+        tbl.Insert(writer.txn_, Row({Value(key), Value(key * 3)})).GetStatus());
+  }
+  ASSERT_SUCCESS(writer.PreCommit());
+  TransactionContext stats_ctx = db->BeginContext();
+  ASSERT_SUCCESS(db->RefreshStatistics(stats_ctx, table));
+  ASSERT_SUCCESS(stats_ctx.PreCommit());
+}
+}  // namespace
+
+TEST_F(OptimizerTest, ClusteredFullScanDoesNotOutrankASelectiveIndexPath) {
+  // The clustered order is a measured property of the heap, not a free access
+  // path: a point/range index lookup must still win the cost comparison, and
+  // the plan must not borrow the ordering preference an index scan earns.
+  const std::string kTable = "ClusteredCost";
+  InsertAnalyzedClusteredTable(rs_.get(), kTable, 40);
+  QueryData query{
+      {kTable},
+      BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(7))),
+      {NamedExpression("key"), NamedExpression("payload")}};
+  query.order_expressions_ = {ColumnValueExp(ColumnName("ClusteredCost.key"))};
+  query.order_ascending_ = {true};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = (Optimizer::Optimize(query, context));
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << plan_or.Value();
+  EXPECT_NE(dump.str().find("Index"), std::string::npos) << dump.str();
+  EXPECT_EQ(dump.str().find("FullScan"), std::string::npos) << dump.str();
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, ClusteredFullScanIsNotPricedAsALimitEarlyStop) {
+  // ORDER BY <clustered key> LIMIT n must not price a whole-chain read as an
+  // n-row prefix: the LIMIT stays above the scan, so the covering index (which
+  // can stop after the prefix) keeps winning.
+  const std::string kTable = "ClusteredLimit";
+  InsertAnalyzedClusteredTable(rs_.get(), kTable, 40);
+  QueryData query{
+      {kTable}, nullptr, {NamedExpression("key"), NamedExpression("payload")}};
+  query.order_expressions_ = {ColumnValueExp(ColumnName("ClusteredLimit.key"))};
+  query.order_ascending_ = {true};
+  query.limit_count_ = 1;
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = (Optimizer::Optimize(query, context));
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  const Plan& plan = plan_or.Value();
+  std::ostringstream dump;
+  dump << plan;
+  EXPECT_NE(dump.str().find("IndexScan"), std::string::npos) << dump.str();
+  EXPECT_EQ(dump.str().find("FullScan"), std::string::npos) << dump.str();
+  // The result is the same either way, and it must be the smallest key.
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(0));
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -4109,8 +5009,8 @@ TEST_F(OptimizerTest, TopNPushSkippedWhenReferentialIntegrityFails) {
 }
 
 TEST_F(OptimizerTest, ClusteringPenaltySteersWideRangeScanChoice) {
-  // TODO.md item 1b: two 2000-row tables with an index on key, one inserted
-  // in order (correlation 1.0) and one fully reversed (correlation 0.0).
+  // Two 2000-row tables with an index on key: one in ascending order,
+  // one permuted with adjacent comparisons balanced in both directions.
   // A 60% range costs 1200 heap rows clustered (index wins over the 2000-row
   // full scan) but 1200 x 3.0 = 3600 unclustered (full scan wins).
   constexpr int64_t kRows = 2000;
@@ -4132,7 +5032,7 @@ TEST_F(OptimizerTest, ClusteringPenaltySteersWideRangeScanChoice) {
       ASSERT_SUCCESS(
           clust.Insert(writer.txn_, Row({Value(i), Value(i)})).GetStatus());
       ASSERT_SUCCESS(
-          unclust.Insert(writer.txn_, Row({Value(kRows - 1 - i), Value(i)}))
+          unclust.Insert(writer.txn_, Row({Value((i * 997) % kRows), Value(i)}))
               .GetStatus());
     }
     ASSERT_SUCCESS(

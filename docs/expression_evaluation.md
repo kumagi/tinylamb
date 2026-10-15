@@ -42,6 +42,23 @@ the short-circuit path never reaches the JIT. Coverage lives in
 `differential_test.cpp` (`Evaluate_LogicalShortCircuitErrors_MatchAcrossPaths`)
 and `bytecode_test.cpp` (`D7_*`).
 
+### Searched CASE (and kPop)
+
+Searched CASE lowers to the same control-flow machinery, one conditional jump
+per WHEN: `cond_i; JumpIfTrue -> T_i; Pop`, chained, then `<else | NULL>`;
+`T_i: Pop; then_i; Jump -> END`. The conditional jump PEEKS the condition, so
+both of its exits pop explicitly (`kPop`): the taken path drops the normalized
+TRUE before evaluating the branch, the fall-through drops the FALSE/NULL
+condition before the next WHEN. This preserves `TryPickBranch` semantics
+exactly: a NULL condition never takes its branch, a raising condition aborts
+the whole CASE in evaluation order, and no match yields ELSE-or-NULL. Branch
+types must unify (CaseExpression::ResultType kInvalid fails Compile, as
+before — such shapes stay on the AST evaluator). Programs containing the
+lowering stay canonical (jumps are outside the fast interpreter's set). The
+null-check/truthiness unary family (IS [NOT] NULL, IS [NOT] TRUE/FALSE) is
+type-agnostic on both legs and compiles for any operand type. Coverage:
+`bytecode_test.cpp` (`SearchedCase_*`) and `differential_test.cpp`.
+
 **Bytecode is the authoritative description of what a batch kernel may assume**
 about an expression (column slots, constants, operators, result type).
 

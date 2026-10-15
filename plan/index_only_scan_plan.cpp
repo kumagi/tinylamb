@@ -5,6 +5,7 @@
 
 #include "index_only_scan_plan.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <ostream>
@@ -58,8 +59,31 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
   return true;
 }
 
-Value FirstOrNull(const std::vector<Value>& keys) {
-  return keys.empty() ? Value() : keys.front();
+TableStatistics IndexRangeStats(const TableStatistics& source,
+                                const Index& index,
+                                const std::vector<Value>& begin_key,
+                                const std::vector<Value>& end_key) {
+  TableStatistics result = source;
+  size_t equality_rows = result.Rows();
+  const size_t key_count = std::max(begin_key.size(), end_key.size());
+  for (size_t i = 0; i < key_count; ++i) {
+    if (i >= index.sc_.key_.size()) {
+      break;
+    }
+    const Value lower = i < begin_key.size() ? begin_key[i] : Value();
+    const Value upper = i < end_key.size() ? end_key[i] : Value();
+    result =
+        result.TransformBy(static_cast<int>(index.sc_.key_[i]), lower, upper);
+    if (!lower.IsNull() && !upper.IsNull() && lower == upper) {
+      equality_rows = result.Rows();
+    }
+  }
+  if (result.Rows() < equality_rows) {
+    const size_t difference = equality_rows - result.Rows();
+    const size_t estimate = equality_rows - (difference / 2) - (difference % 2);
+    result = result.ScaleCardinality(estimate);
+  }
+  return result;
 }
 
 TableStatistics IndexOnlyStats(const TableStatistics& source,
@@ -95,12 +119,11 @@ IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
                                      std::vector<ColumnName> provided_order)
     : table_(table),
       index_(index),
-      stats_(IndexOnlyStats(
-          begin_key.empty() && end_key.empty()
-              ? ts
-              : ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
-                               FirstOrNull(end_key)),
-          table.GetSchema(), index)),
+      stats_(
+          IndexOnlyStats(begin_key.empty() && end_key.empty()
+                             ? ts
+                             : IndexRangeStats(ts, index, begin_key, end_key),
+                         table.GetSchema(), index)),
       begin_key_(std::move(begin_key)),
       end_key_(std::move(end_key)),
       ascending_(ascending),

@@ -528,26 +528,66 @@ TEST(GoogleSqlAstTest, InsertSelectMapsToQuerySource) {
   EXPECT_NE(insert->Query(), nullptr);
 }
 
-TEST(GoogleSqlAstTest, TableValuedFunctionSourceThrows) {
-  // A table-valued function in FROM parses into a TVF node, which is not a
-  // recognized table source kind.
-  const std::string message =
-      ThrowMessage([] { VisitSqlOrThrow("SELECT * FROM my_func(1);"); });
-  EXPECT_NE(message.find("unsupported table source TVF"), std::string::npos)
-      << message;
+TEST(GoogleSqlAstTest, TableValuedFunctionExpandsStoredBody) {
+  // A table-valued function in FROM parses into a TVF node; the visitor
+  // expands the stored defining query with the call-site arguments (unknown
+  // functions and non-constant arguments stay explicit errors).
+  EXPECT_THROW(VisitSqlOrThrow("SELECT * FROM my_func(1);"), std::exception);
+  VisitSqlOrThrow("CREATE TABLE FUNCTION my_func(x INT64) AS SELECT x;");
+  const std::unique_ptr<Statement>& statement =
+      VisitSqlOrThrow("SELECT * FROM my_func(1);");
+  const auto* select = dynamic_cast<const SelectStatement*>(statement.get());
+  ASSERT_NE(select, nullptr);
+  ASSERT_EQ(select->Sources().size(), 1U);
+  EXPECT_NE(select->Sources()[0].query, nullptr);
+  // A non-constant argument cannot parameterize the expansion.
+  const std::string message = ThrowMessage([] {
+    VisitSqlOrThrow("SELECT * FROM my_func(1+CAST(RAND() AS INT64));");
+  });
+  EXPECT_NE(message.find("must be constant"), std::string::npos) << message;
 }
 
 TEST(GoogleSqlAstTest, UnsupportedStatementKindsThrow) {
   // Statements beyond SELECT / CREATE TABLE / INSERT / UPDATE / DELETE / DROP
-  // TABLE have no translation and must be rejected explicitly.
+  // TABLE / MERGE / ALTER TABLE RENAME have no translation and must be
+  // rejected explicitly.
   for (const char* sql :
        {"EXPLAIN SELECT 1;", "SHOW TABLES;", "BEGIN;", "COMMIT;",
-        "CREATE INDEX i ON t(a);", "ALTER TABLE t ADD COLUMN b INT64;",
-        "CREATE SCHEMA s;", "DESCRIBE t;"}) {
+        "CREATE INDEX i ON t(a);", "CREATE SCHEMA s;", "DESCRIBE t;"}) {
     const std::string message = ThrowMessage([sql] { VisitSqlOrThrow(sql); });
     EXPECT_NE(message.find("unsupported statement"), std::string::npos)
         << sql << "\n"
         << message;
+  }
+  // ALTER TABLE is partially supported: catalog-level renames translate, but
+  // row-layout actions are rejected with a dedicated diagnostic naming the
+  // unsupported action (not the generic unsupported-statement text).
+  {
+    const std::string message = ThrowMessage(
+        [] { VisitSqlOrThrow("ALTER TABLE t ADD COLUMN b INT64;"); });
+    EXPECT_NE(message.find("ALTER TABLE ADD COLUMN is not supported"),
+              std::string::npos)
+        << message;
+  }
+  {
+    const std::unique_ptr<Statement> statement =
+        VisitSqlOrThrow("ALTER TABLE t RENAME TO u;");
+    const auto* alter =
+        dynamic_cast<const AlterTableStatement*>(statement.get());
+    ASSERT_NE(alter, nullptr);
+    EXPECT_EQ(alter->TableName(), "t");
+    EXPECT_EQ(alter->Action().kind, AlterTableAction::Kind::kRenameTo);
+    EXPECT_EQ(alter->Action().new_name, "u");
+  }
+  {
+    const std::unique_ptr<Statement> statement =
+        VisitSqlOrThrow("ALTER TABLE t RENAME COLUMN a TO b;");
+    const auto* alter =
+        dynamic_cast<const AlterTableStatement*>(statement.get());
+    ASSERT_NE(alter, nullptr);
+    EXPECT_EQ(alter->Action().kind, AlterTableAction::Kind::kRenameColumn);
+    EXPECT_EQ(alter->Action().old_column, "a");
+    EXPECT_EQ(alter->Action().new_name, "b");
   }
 }
 
@@ -838,6 +878,26 @@ TEST(GoogleSqlAstTest, RecoversAggregateNullTreatmentModifiers) {
   const auto& aggregate =
       select.SelectList()[0].expression->AsAggregateExpression();
   EXPECT_TRUE(aggregate.IgnoreNulls());
+}
+
+TEST(GoogleSqlAstTest, WindowPartitionKeepsArbitraryExpressions) {
+  // Partition keys are arbitrary expressions; only column paths used to
+  // survive the AST visit and anything else silently degraded to one global
+  // partition.
+  auto statement = VisitSql(
+      "SELECT k, RANK() OVER (PARTITION BY grp + 1, UPPER(k) ORDER BY v DESC) "
+      "AS rk FROM t");
+  ASSERT_NE(statement, nullptr);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 2U);
+  const auto& window =
+      select.SelectList()[1].expression->AsWindowFunctionCallExpression();
+  ASSERT_EQ(window.partition_by.size(), 2U);
+  EXPECT_EQ(window.partition_by[0]->ToString(), "(grp + 1)");
+  EXPECT_EQ(window.partition_by[1]->ToString(), "upper(k)");
+  ASSERT_EQ(window.order_by.size(), 1U);
+  EXPECT_EQ(window.order_by[0].expression->ToString(), "v");
+  EXPECT_FALSE(window.order_by[0].ascending);
 }
 
 TEST(GoogleSqlAstTest, QualifyAstVisitor) {

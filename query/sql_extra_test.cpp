@@ -841,7 +841,8 @@ TEST(SelectStatementFingerprintTest, IncludesAggregateFilter) {
   filtered->SetWhereFilter(ConstantValueExp(Value(true)));
   SelectStatement first({NamedExpression("v", plain)}, {"t"}, nullptr);
   SelectStatement second(
-      {NamedExpression("v", std::static_pointer_cast<ExpressionBase>(filtered))},
+      {NamedExpression("v",
+                       std::static_pointer_cast<ExpressionBase>(filtered))},
       {"t"}, nullptr);
   EXPECT_NE(first.Fingerprint(), second.Fingerprint());
 }

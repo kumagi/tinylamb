@@ -76,9 +76,7 @@ Selection 演算子ノードの実行コスト、および Selection と Aggrega
 
 ## 関連 Rule との相互作用
 
-- `having_to_filter_rewrite`: HAVING 句の述語を集約上位の Selection へ引き抜く Rule です。
 - `push_selection_into_scan`: 述語をストレージスキャン層まで一気に押し下げる基本 Rule です。本 Rule は「スキャンへ落とせない複雑な述語を集約式内部で吸収する」代替経路として機能します。
-- `count_distinct_expansion` / `aggregate_union_transpose`: `WhereFilter` を持つ集約式を分配変換の対象から除外するガードを持っており、本 Rule の適用順序が影響を与えます。
 
 ## 検証テスト
 

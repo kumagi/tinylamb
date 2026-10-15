@@ -1,8 +1,20 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/detail/expression_eval.hpp"
 
+// The regexp_* branches below drive libstdc++'s <regex>, and under
+// sanitizer-enabled -O2 inlining GCC 15 reports -Wmaybe-uninitialized for
+// std::function state inside <regex_automaton.h>/<std_function.h> even though
+// every std::regex object here is fully constructed before use. The false
+// positive lives in the standard library, not in this file; suppress it for
+// this translation unit only. The pragma must precede the includes it covers:
+// the diagnostics are attributed to code instantiated from those headers.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -10,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <exception>
@@ -19,11 +32,21 @@
 #include <memory>
 #include <optional>
 #include <random>
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC 15 reports -Wmaybe-uninitialized inside <regex>'s NFA construction when
+// instantiating std::regex in sanitizer builds; the library code is fine.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <regex>
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -46,6 +69,8 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/json_doc.hpp"
+#include "expression/json_text.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/query_expression.hpp"
@@ -53,6 +78,7 @@
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/statement.hpp"
+#include "type/collation.hpp"
 #include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
@@ -67,21 +93,6 @@ namespace tinylamb::relational_detail {
 // (AST evaluation, VectorizedExpression, and DataChunk all use it). The
 // residual/scan-filter path must not diverge for DOUBLE 0.0 or "".
 bool Truthy(const Value& value) { return value.Truthy(); }
-
-std::string ElementSqlTypeName(ValueType type) {
-  switch (type) {
-    case ValueType::kInt64:
-      return "INT64";
-    case ValueType::kDouble:
-      return "FLOAT64";
-    case ValueType::kVarChar:
-      return "STRING";
-    case ValueType::kDate:
-      return "DATE";
-    default:
-      return {};
-  }
-}
 
 size_t DistinctValueHash::operator()(const Value& value) const {
   return std::hash<Value>()(CanonicalDistinctValue(value));
@@ -104,9 +115,12 @@ bool DistinctValueEqual::operator()(const Value& left,
 }
 
 Value CanonicalDistinctValue(const Value& value) {
-  if (value.type == ValueType::kVarChar && value.IsCaseInsensitive()) {
-    return Value(FoldCase(value.value.varchar_value))
-        .WithCollation(value.Collation());
+  // GROUP BY / DISTINCT / semi-anti key canonicalization. A case-insensitive
+  // key is folded through the shared collation contract (type/collation.hpp)
+  // so a grouped 'a'/'A' pair and an ORDER BY over the same key agree on
+  // which rows are peers.
+  if (CollationOf(value) == Collation::kCaseInsensitive) {
+    return ApplyCollation(value, Collation::kCaseInsensitive);
   }
   if (value.type == ValueType::kDouble) {
     const double d = value.value.double_value;
@@ -120,23 +134,99 @@ Value CanonicalDistinctValue(const Value& value) {
   return value;
 }
 
+bool GroupKeyEqual::operator()(const Row& a, const Row& b) const {
+  if (a.values_.size() != b.values_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.values_.size(); ++i) {
+    const Value& x = a.values_[i];
+    const Value& y = b.values_[i];
+    if (x.type != y.type) {
+      return false;
+    }
+    if (x.type == ValueType::kDouble) {
+      const double p = x.value.double_value;
+      const double q = y.value.double_value;
+      if (std::isnan(p) && std::isnan(q)) {
+        continue;
+      }
+      if (!(p == q)) {
+        return false;
+      }
+      continue;
+    }
+    if (!(x == y)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t GroupKeyTransparentHash::operator()(
+    const std::vector<Value>& values) const {
+  // Reproduces std::hash<Row> bit-for-bit so a scratch key vector and the Row
+  // it becomes probe the same bucket.
+  uint64_t ret = 0x9e3779b97f4a7c15ULL;
+  for (const auto& v : values) {
+    ret = (ret << 7) | (ret >> 57);
+    ret ^= std::hash<Value>()(v);
+    ret *= 0x100000001b3ULL;
+  }
+  return ret;
+}
+
+bool GroupKeyTransparentEqual::operator()(const Row& a, const Row& b) const {
+  return GroupKeyEqual{}(a, b);
+}
+
+bool GroupKeyTransparentEqual::operator()(const std::vector<Value>& a,
+                                          const Row& b) const {
+  if (a.size() != b.values_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (!(a[i] == b.values_[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool GroupKeyTransparentEqual::operator()(const Row& a,
+                                          const std::vector<Value>& b) const {
+  return (*this)(b, a);
+}
+
 namespace {
 
 bool IdentifierEquals(std::string_view left, std::string_view right) {
+  if (left == right) [[likely]] {
+    return true;
+  }
   if (left.size() != right.size()) {
     return false;
   }
-  if (left == right) {
-    // Same-case match: skip per-character locale folding.  Column-name
-    // resolution runs per row in interpreted expression evaluation, and the
-    // tolower loop dominated Q9 profiles (~3% of all instructions).
-    return true;
+  for (size_t i = 0; i < left.size(); ++i) {
+    const auto lhs = static_cast<unsigned char>(left[i]);
+    const auto rhs = static_cast<unsigned char>(right[i]);
+    if (lhs == rhs) {
+      continue;
+    }
+    if (lhs >= 0x80 || rhs >= 0x80) {
+      if (std::tolower(lhs) != std::tolower(rhs)) {
+        return false;
+      }
+      continue;
+    }
+    const unsigned char folded_left =
+        lhs >= 'A' && lhs <= 'Z' ? lhs + ('a' - 'A') : lhs;
+    const unsigned char folded_right =
+        rhs >= 'A' && rhs <= 'Z' ? rhs + ('a' - 'A') : rhs;
+    if (folded_left != folded_right) {
+      return false;
+    }
   }
-  return std::equal(left.begin(), left.end(), right.begin(),
-                    [](char lhs, char rhs) {
-                      return std::tolower(static_cast<unsigned char>(lhs)) ==
-                             std::tolower(static_cast<unsigned char>(rhs));
-                    });
+  return true;
 }
 
 StatusOr<int> FindColumn(const Schema& schema, const ColumnName& name,
@@ -195,6 +285,26 @@ StatusOr<int> FindColumn(const Schema& schema, const ColumnName& name,
     }
   }
   return match;
+}
+
+StatusOr<int> FindColumnCached(const Schema& schema, const ColumnName& name,
+                               bool allow_bare_fallback,
+                               ColumnLookupCache* cache) {
+  if (cache == nullptr) [[unlikely]] {
+    return FindColumn(schema, name, allow_bare_fallback);
+  }
+  auto& entries = cache->schemas[schema.LookupIdentity()];
+  auto [it, inserted] = entries.try_emplace(name);
+  int& cached = allow_bare_fallback ? it->second.fallback : it->second.strict;
+  if (inserted || cached == -2) [[unlikely]] {
+    StatusOr<int> result = FindColumn(schema, name, allow_bare_fallback);
+    if (result.HasValue()) {
+      cached = result.Value();
+      return result;
+    }
+    return result;
+  }
+  return cached;
 }
 
 // ---- Nested field resolution ----------------------------------------------
@@ -998,7 +1108,11 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
         return Value();
       }
     }
-    ASSIGN_OR_RETURN(int, offset, (FindColumn(*current->schema, name, false)));
+    ASSIGN_OR_RETURN(int, offset,
+                     (FindColumnCached(*current->schema, name, false,
+                                       (current->lookup_cache == nullptr
+                                            ? active_lookup_cache
+                                            : current->lookup_cache))));
 
     if (offset >= 0) {
       return (*current->row)[static_cast<size_t>(offset)];
@@ -1014,7 +1128,11 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
     if (current->row == nullptr || current->schema == nullptr) {
       continue;
     }
-    ASSIGN_OR_RETURN(int, offset, (FindColumn(*current->schema, name)));
+    ASSIGN_OR_RETURN(int, offset,
+                     (FindColumnCached(*current->schema, name, true,
+                                       (current->lookup_cache == nullptr
+                                            ? active_lookup_cache
+                                            : current->lookup_cache))));
 
     if (offset >= 0) {
       return (*current->row)[static_cast<size_t>(offset)];
@@ -1156,9 +1274,12 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
       // column as if they were columns of the relation (p.int32_val1).
       // There is no physical column named int32_val1 to find, so bind the
       // qualifier to the only column carrying that relation identity.
-      ASSIGN_OR_RETURN(int, base_column_idx,
-                       (FindColumn(*current->schema,
-                                   ColumnName(segments.front(), segments[1]))));
+      ASSIGN_OR_RETURN(
+          int, base_column_idx,
+          (FindColumnCached(
+              *current->schema, ColumnName(segments.front(), segments[1]), true,
+              (current->lookup_cache == nullptr ? active_lookup_cache
+                                                : current->lookup_cache))));
       const bool explicit_base_column =
           segments.size() >= 2 && base_column_idx >= 0;
       if (!name.schema.empty() && !explicit_base_column) {
@@ -1186,7 +1307,11 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
           qualifier += segments[i];
         }
         const ColumnName base(qualifier, segments[split]);
-        ASSIGN_OR_RETURN(int, offset, (FindColumn(*current->schema, base)));
+        ASSIGN_OR_RETURN(int, offset,
+                         (FindColumnCached(*current->schema, base, true,
+                                           (current->lookup_cache == nullptr
+                                                ? active_lookup_cache
+                                                : current->lookup_cache))));
 
         if (offset >= 0) {
           const Value& base_value =
@@ -1216,6 +1341,13 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
     for (const Scope* current = &scope; current != nullptr;
          current = current->outer) {
       if (current->row == nullptr || current->schema == nullptr) {
+        continue;
+      }
+      // A grouped-emission OUTPUT scope is not a source: its bare names are
+      // output columns, aliases and aggregates only, so the whole-row
+      // fallback must not fabricate a STRUCT out of an unresolvable name
+      // (a typo'd ORDER BY key used to "sort" by the output row itself).
+      if (current->no_row_alias) {
         continue;
       }
       const Schema& schema = *current->schema;
@@ -1503,9 +1635,9 @@ void CollectAggregates(  // NOLINT(misc-no-recursion)
   }
 }
 
-AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
-                                           const Schema* input_schema)
-    : expression(aggregate), distinct_mode_(aggregate->Distinct()) {
+AggregateAccumulator::Shape AggregateAccumulator::AnalyzeShape(
+    const AggregateExpression* aggregate, const Schema* input_schema) {
+  Shape shape;
   // The DISTINCT hash set is allocated lazily (EnsureDistinctSet): INT64/DATE
   // distinct tracking never needs it, and per-group allocation dominated
   // multi-million-group COUNT(DISTINCT) builds.
@@ -1513,8 +1645,9 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
   // even when every input element is NULL; InferAggregateArrayElementType
   // only covers literal/CAST arguments, so plain column references arrive
   // here without a static type.
-  resolved_element_type_ = aggregate->ArrayElementSqlType();
-  if (resolved_element_type_.empty() && input_schema != nullptr &&
+  shape.distinct_mode = aggregate->Distinct();
+  shape.resolved_element_type = aggregate->ArrayElementSqlType();
+  if (shape.resolved_element_type.empty() && input_schema != nullptr &&
       aggregate->GetType() == AggregationType::kArrayAgg &&
       aggregate->Child() != nullptr &&
       aggregate->Child()->Type() == TypeTag::kColumnValue) {
@@ -1523,17 +1656,17 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
     if (offset >= 0) {
       const Column& column =
           input_schema->GetColumn(static_cast<size_t>(offset));
-      resolved_element_type_ = ElementSqlTypeName(column.Type());
+      shape.resolved_element_type = ElementSqlTypeName(column.Type());
       if (column.Type() == ValueType::kInt64 && column.IsUnsigned()) {
-        resolved_element_type_ = "UINT64";
+        shape.resolved_element_type = "UINT64";
       }
     }
   }
   if (aggregate->GetType() == AggregationType::kSum &&
       aggregate->Child()->Type() == TypeTag::kColumnValue) {
-    // Runs once per new group, so keep it allocation-free for ordinary
-    // column-name lengths: lowercase into a stack buffer instead of a
-    // heap std::string.
+    // Runs once per aggregate (not once per new group), so keep it
+    // allocation-free for ordinary column-name lengths: lowercase into a
+    // stack buffer instead of a heap std::string.
     const std::string& original =
         aggregate->Child()->AsColumnValue().GetColumnName().name;
     std::array<char, 64> lowered{};
@@ -1557,17 +1690,29 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
     // whose declared unsigned type is unavailable here; their runtime
     // values are handled by the deferred UINT64_MAX detector below.  Keep
     // the name-based fast classification for ordinary table columns.
-    sum_is_uint64 =
+    shape.sum_is_uint64 =
         !aggregate->Distinct() && name.find("uint64") != std::string_view::npos;
     // The compliance overflow UNION exposes its anonymous value as `x`.
     // Restrict this heuristic to that genuinely untyped shape so a signed
     // column such as int64_val containing -1 is never reinterpreted as an
     // unsigned value merely because it is DISTINCT.
-    sum_can_infer_uint64 = aggregate->Distinct() && name == "x";
+    shape.sum_can_infer_uint64 = aggregate->Distinct() && name == "x";
   }
-  if (aggregate->GetType() == AggregationType::kArrayAgg ||
-      aggregate->GetType() == AggregationType::kStringAgg ||
-      aggregate->NeedsGroupContext()) {
+  shape.needs_buffer = aggregate->GetType() == AggregationType::kArrayAgg ||
+                       aggregate->GetType() == AggregationType::kStringAgg ||
+                       aggregate->NeedsGroupContext();
+  return shape;
+}
+
+AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
+                                           const Shape& shape)
+    : expression(aggregate),
+      core_type_(aggregate->GetType()),
+      sum_is_uint64(shape.sum_is_uint64),
+      sum_can_infer_uint64(shape.sum_can_infer_uint64),
+      distinct_mode_(shape.distinct_mode),
+      resolved_element_type_(shape.resolved_element_type) {
+  if (shape.needs_buffer) {
     buffer_ = std::make_unique<std::vector<BufferedRow>>();
   }
 }
@@ -1684,8 +1829,8 @@ Status AggregateAccumulator::TryApplyCore(
   // declaration, but UINT64_MAX is still recognizable as -1.  Only promote
   // when it is paired with a nonnegative distinct value; ordinary signed
   // SUM(DISTINCT -1) remains a signed sum.
-  if (expression->GetType() == AggregationType::kSum &&
-      expression->Distinct() && !sum_is_uint64 && sum_can_infer_uint64 &&
+  if (core_type == AggregationType::kSum && expression->Distinct() &&
+      !sum_is_uint64 && sum_can_infer_uint64 &&
       value.type == ValueType::kInt64) {
     if (value.value.int_value == -1) {
       if (sum_nonnegative_total != 0) {
@@ -1710,7 +1855,7 @@ Status AggregateAccumulator::TryApplyCore(
       }
     }
   }
-  switch (expression->GetType()) {
+  switch (core_type) {
     case AggregationType::kCount:
       ++count;
       break;
@@ -1776,6 +1921,10 @@ Status AggregateAccumulator::TryApplyCore(
       if (extreme.IsNull() || value < extreme) {
         extreme = value;
       }
+      // count is the "saw a contributing input" marker the parallel merge
+      // paths test to skip empty partials; MIN/MAX must set it like the
+      // other streaming aggregates or a worker partial is silently dropped.
+      ++count;
       break;
     case AggregationType::kMax:
       if (!value.IsNull() && value.type == ValueType::kDouble &&
@@ -1785,6 +1934,7 @@ Status AggregateAccumulator::TryApplyCore(
       if (extreme.IsNull() || extreme < value) {
         extreme = value;
       }
+      ++count;
       break;
     case AggregationType::kLogicalAnd:
       if (!value.IsNull()) {
@@ -1858,6 +2008,20 @@ Status AggregateAccumulator::TryApplyCore(
         saw_any_ = true;
       }
       break;
+    case AggregationType::kMode: {
+      if (!mode_index_) {
+        mode_index_ = std::make_unique<std::unordered_map<Value, size_t>>();
+      }
+      const auto [iterator, inserted] =
+          mode_index_->try_emplace(value, mode_values_.size());
+      if (inserted) {
+        mode_values_.push_back(value);
+        mode_counts_.push_back(1);
+      } else {
+        ++mode_counts_[iterator->second];
+      }
+      break;
+    }
     case AggregationType::kVarSamp:
     case AggregationType::kVarPop:
     case AggregationType::kStddevSamp:
@@ -1871,7 +2035,16 @@ Status AggregateAccumulator::TryApplyCore(
     }
     case AggregationType::kCovarSamp:
     case AggregationType::kCovarPop:
-    case AggregationType::kCorr: {
+    case AggregationType::kCorr:
+    case AggregationType::kRegrSlope:
+    case AggregationType::kRegrIntercept:
+    case AggregationType::kRegrCount:
+    case AggregationType::kRegrR2:
+    case AggregationType::kRegrAvgX:
+    case AggregationType::kRegrAvgY:
+    case AggregationType::kRegrSxx:
+    case AggregationType::kRegrSyy:
+    case AggregationType::kRegrSxy: {
       if (trailing_values.empty()) {
         return StatusError(StatusCode::kInvalidArgument,
                            ::tinylamb::ToString(expression->GetType()) +
@@ -2706,6 +2879,7 @@ Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
     return Status::kSuccess;
   }
   saw_nan_ = saw_nan_ || other.saw_nan_;
+  count += other.count;
   if (extreme.IsNull()) {
     extreme = other.extreme;
   } else if (!other.extreme.IsNull()) {
@@ -2729,6 +2903,31 @@ Status AggregateAccumulator::Add(const Value& value) {
                                    .condition = Value(),
                                    .auxiliary = Value(),
                                    .trailing_values = {}});
+    return Status::kSuccess;
+  }
+  // Streaming fast lanes for the two multi-million-input kinds (Q18/Q21
+  // GROUP BY shapes).  Mirrors TryApplyCore exactly for these shapes -- NULL
+  // inputs are ignored, COUNT(DISTINCT) and UINT64 promotion stay on the
+  // general path, SUM overflow still raises -- while skipping the repeated
+  // virtual GetType() dispatches per input row.
+  if (core_type_ == AggregationType::kCount && !distinct_mode_) {
+    if (!value.IsNull()) {
+      ++count;
+    }
+    return Status::kSuccess;
+  }
+  if (core_type_ == AggregationType::kSum && !distinct_mode_ &&
+      !sum_is_uint64 && !sum_can_infer_uint64 &&
+      value.type == ValueType::kInt64 && !value.IsNull() &&
+      !value.IsUnsigned()) {
+    // Signed accumulation keeps negative inputs exact (GoogleSQL SUM raises
+    // on INT64 overflow rather than wrapping).
+    int64_t updated = 0;
+    if (__builtin_add_overflow(int_total, value.value.int_value, &updated)) {
+      return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+    }
+    int_total = updated;
+    ++count;
     return Status::kSuccess;
   }
   return TryApplyCore(value);
@@ -2996,6 +3195,73 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
       const long double vx = stat_.sxx - (count * mx * mx);
       const long double vy = stat_.syy - (count * my * my);
       return Value(static_cast<double>(sdd / std::sqrt(vx * vy)));
+    }
+    case AggregationType::kMode: {
+      // First-insertion order + strictly-greater comparison keeps the first
+      // value to reach the maximum count; no non-NULL input yields NULL.
+      Value best;
+      int64_t best_count = -1;
+      for (size_t i = 0; i < mode_values_.size(); ++i) {
+        if (mode_counts_[i] > best_count) {
+          best_count = mode_counts_[i];
+          best = mode_values_[i];
+        }
+      }
+      return best;
+    }
+    case AggregationType::kRegrCount:
+      // Number of non-NULL (y, x) pairs; defined (0) even on empty input.
+      return Value(count);
+    case AggregationType::kRegrSlope:
+    case AggregationType::kRegrIntercept:
+    case AggregationType::kRegrR2:
+    case AggregationType::kRegrAvgX:
+    case AggregationType::kRegrAvgY:
+    case AggregationType::kRegrSxx:
+    case AggregationType::kRegrSyy:
+    case AggregationType::kRegrSxy: {
+      if (count == 0) {
+        return Value();
+      }
+      // x is the trailing argument, y the child: Σx lives in sx.
+      const long double mx = stat_.sx / count;
+      const long double my = stat_.sy / count;
+      const long double sxy = stat_.sxy - (count * mx * my);
+      const long double sxx = stat_.sxx - (count * mx * mx);
+      const long double syy = stat_.syy - (count * my * my);
+      switch (expression->GetType()) {
+        case AggregationType::kRegrAvgX:
+          return Value(static_cast<double>(mx));
+        case AggregationType::kRegrAvgY:
+          return Value(static_cast<double>(my));
+        case AggregationType::kRegrSxx:
+          return Value(static_cast<double>(sxx));
+        case AggregationType::kRegrSyy:
+          return Value(static_cast<double>(syy));
+        case AggregationType::kRegrSxy:
+          return Value(static_cast<double>(sxy));
+        case AggregationType::kRegrSlope:
+          // A constant x column leaves the slope undefined: NULL, like the
+          // SQL standard's division-by-zero convention for REGR_*.
+          if (count < 2 || sxx <= 0) {
+            return Value();
+          }
+          return Value(static_cast<double>(sxy / sxx));
+        case AggregationType::kRegrIntercept:
+          if (count < 2 || sxx <= 0) {
+            return Value();
+          }
+          return Value(static_cast<double>(my - ((sxy / sxx) * mx)));
+        case AggregationType::kRegrR2:
+          // R² is the squared correlation; undefined when either side is
+          // constant.
+          if (count < 2 || sxx <= 0 || syy <= 0) {
+            return Value();
+          }
+          return Value(static_cast<double>((sxy * sxy) / (sxx * syy)));
+        default:
+          return Value();
+      }
     }
     case AggregationType::kApproxQuantiles: {
       // No rows reached the aggregate (empty input): the result is a NULL
@@ -3643,10 +3909,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return val.AsString();
   };
-  std::string name = call.FuncName();
-  for (char& c : name) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
+  // FunctionCallExpression lowercases its name at construction, so this
+  // binds the stored copy directly: the per-row re-copy + re-lowercase ran
+  // inside the residual-predicate loop of every AST-evaluated scan filter.
+  const std::string& name = call.FuncName();
   // IF evaluates only the chosen branch: the untaken branch must not raise
   // (e.g. guarded out-of-range array accesses under IF guards).
   if (name == "if") {
@@ -4312,6 +4578,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::weekday{std::chrono::sys_days{ymd}}.c_encoding());
       return Value(static_cast<int64_t>(wd + 1));
     }
+    if (name == "extract_weekday") {
+      // BigQuery WEEKDAY: Monday = 1 ... Sunday = 7 (ISO encoding).
+      std::chrono::year_month_day ymd{
+          std::chrono::year{ct.year},
+          std::chrono::month{static_cast<unsigned>(ct.month)},
+          std::chrono::day{static_cast<unsigned>(ct.day)}};
+      int wd = static_cast<int>(
+          std::chrono::weekday{std::chrono::sys_days{ymd}}.iso_encoding());
+      return Value(static_cast<int64_t>(wd));
+    }
     if (name == "extract_dayofyear") {
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
@@ -4481,6 +4757,19 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", t.tm_hour,
                    t.tm_min, t.tm_sec);
     return Value(std::string(buf.data()));
+  }
+  if (name == "user" || name == "session_user") {
+    if (!arguments.empty()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "USER takes no arguments");
+    }
+    // No multi-user session layer exists yet; report the OS account, which
+    // is the identity a tinylamb server process runs as.
+    const char* os_user = std::getenv("USER");
+    if (os_user == nullptr || *os_user == '\0') {
+      os_user = std::getenv("LOGNAME");
+    }
+    return Value(std::string(os_user != nullptr ? os_user : "tinylamb"));
   }
   if (name == "current_datetime") {
     if (arguments.size() > 1) {
@@ -4951,7 +5240,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       // Field traversals collapse a single-occurrence repeated field to its
       // scalar; UNNEST iterates it as a one-element array.
-      const std::string element_type = ElementSqlTypeName(arr.type);
+      const std::string element_type(ElementSqlTypeName(arr.type));
       arr = Value::Array({std::move(arr)},
                          element_type.empty() ? "INT64" : element_type);
     }
@@ -6524,6 +6813,60 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(UnicodeLower(raw_str(arguments[0])));
   }
+  if (name == "bit_count") {
+    if (arguments.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "BIT_COUNT requires 1 argument");
+    }
+    const Value& input = arguments[0];
+    if (input.IsNull()) {
+      return Value();
+    }
+    if (input.type != ValueType::kInt64) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "BIT_COUNT requires an INT32/INT64 argument");
+    }
+    // Storage-width popcount: the runtime value model keeps every integer
+    // in an INT64 slot (INT32 declarations are width-validated at cast time
+    // only), identical to GoogleSQL for non-negative inputs.
+    return Value(static_cast<int64_t>(
+        std::popcount(static_cast<uint64_t>(input.value.int_value))));
+  }
+  if (name == "normalize_and_casefold" || name == "normalize") {
+    if (arguments.empty() || arguments.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull()) {
+      return Value();
+    }
+    if (arguments[0].type != ValueType::kVarChar) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires a STRING argument");
+    }
+    // Mirrors the AST ground truth (function_call_expression.cpp): text
+    // stays in composed form, so NFC/NFKC are accepted and the decomposed
+    // forms are rejected instead of silently mis-normalized.
+    if (arguments.size() == 2) {
+      if (arguments[1].type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           name + " normalization mode must be a STRING");
+      }
+      std::string mode;
+      for (char c : raw_str(arguments[1])) {
+        mode.push_back(
+            static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+      }
+      if (mode != "NFC" && mode != "NFKC") {
+        return StatusError(StatusCode::kNotImplemented,
+                           name + " supports NFC/NFKC only, got " + mode);
+      }
+    }
+    if (name == "normalize") {
+      return arguments[0];
+    }
+    return Value(UnicodeCaseFold(raw_str(arguments[0])));
+  }
   if (name == "trim") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -7709,6 +8052,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     }
     return Value(std::move(res));
+  }
+
+  // The JSON document family (JSON_TYPE/KEYS/ARRAY_LENGTH/SET/INSERT/REPLACE/
+  // REMOVE/ARRAY/OBJECT, LAX_* coercions): one shared implementation with the
+  // AST evaluator and the constant-fold rewrite, via expression/json_doc.hpp.
+  if (json_doc::family::IsJsonFamilyFunction(name)) {
+    return json_doc::family::Evaluate(name, arguments);
   }
 
   // JSON functions
@@ -9242,8 +9592,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
   if (name == "collate") {
     // COLLATE(value, spec): attaches the collator to the value; the value
-    // itself is unchanged.  1 = explicit binary collator, 2 =
-    // case-insensitive (or unknown non-binary) collator.
+    // itself is unchanged.  The spec rule lives in type/collation.hpp so the
+    // AST evaluator (expression/function_call_expression.cpp) resolves the
+    // same tag for the same spec.
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "COLLATE requires 2 arguments");
@@ -9252,12 +9603,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (v.IsNull()) {
       return Value();
     }
-    std::string spec = raw_str(arguments[1]);
-    for (char& c : spec) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    const uint8_t code = spec == "binary" ? 1 : 2;
-    return v.WithCollation(code);
+    return v.WithCollation(
+        static_cast<uint8_t>(CollationOfSpec(raw_str(arguments[1]))));
   }
 
   if (name == "array_length") {
@@ -9778,6 +10125,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          "DATE value out of range");
     }
     int64_t step_days = 1;
+    int64_t step_months = 0;
     if (call.Args().size() == 3) {
       if (call.Args()[2]->Type() == TypeTag::kIntervalExp) {
         const auto& interval = call.Args()[2]->AsIntervalExpression();
@@ -9787,6 +10135,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           step_days = amount * 7;
         } else if (unit.starts_with("day")) {
           step_days = amount;
+        } else if (unit.starts_with("month") || unit.starts_with("quarter") ||
+                   unit.starts_with("year")) {
+          // Calendar steps advance through DATE_ADD's clamped month
+          // arithmetic, not fixed day counts.
+          step_months =
+              unit.starts_with("month")
+                  ? amount
+                  : (unit.starts_with("quarter") ? amount * 3 : amount * 12);
         } else {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -9802,23 +10158,50 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           const std::string text = raw_str(step);
           const IntervalValue parsed =
               text.empty() ? IntervalValue{} : IntervalValue::Parse(text);
-          if (parsed.months != 0 || parsed.nanos != 0) {
-            return StatusError(StatusCode::kInvalidArgument,
-                               "unsupported GENERATE_DATE_ARRAY step unit");
+          if (parsed.nanos != 0 || (parsed.months != 0 && parsed.days != 0)) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "unsupported GENERATE_DATE_ARRAY step unit: the step must "
+                "be a whole number of days or of months");
           }
-          step_days = parsed.days;
+          if (parsed.months != 0) {
+            step_months = parsed.months;
+          } else {
+            step_days = parsed.days;
+          }
         }
       }
     }
-    if (step_days == 0) {
+    if (step_days == 0 && step_months == 0) {
       return StatusError(StatusCode::kIsInfinity, "Sequence step cannot be 0.");
     }
-    if ((step_days > 0 && start_days > end_days) ||
-        (step_days < 0 && start_days < end_days)) {
+    if ((step_days >= 0 && step_months >= 0 && start_days > end_days) ||
+        (step_days <= 0 && step_months <= 0 && start_days < end_days)) {
       return Value::Array({}, "DATE");
     }
     std::vector<Value> elements;
     constexpr size_t kMaxGeneratedDates = 1'000'000;
+    if (step_months != 0) {
+      int64_t d = start_days;
+      while (step_months > 0 ? d <= end_days : d >= end_days) {
+        if (elements.size() == kMaxGeneratedDates) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "GENERATE_DATE_ARRAY generated too many elements");
+        }
+        if (d < -11000000 || d > 11000000) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "DATE value out of range");
+        }
+        elements.push_back(Value::DateFromDays(d));
+        ASSIGN_OR_RETURN(int64_t, next,
+                         (TryAddDateIntervalDays(d, step_months, "month")));
+        if (next == d) {
+          break;
+        }
+        d = next;
+      }
+      return Value::Array(std::move(elements), "DATE");
+    }
     for (int64_t d = start_days; step_days > 0 ? d <= end_days : d >= end_days;
          d += step_days) {
       if (elements.size() == kMaxGeneratedDates) {
@@ -9960,7 +10343,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(uuid));
   }
 
-  if (name == "md5" || name == "sha1" || name == "sha256" || name == "sha512") {
+  if (name == "md5" || name == "sha1" || name == "sha256" || name == "sha512" ||
+      name == "farm_fingerprint") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -9978,7 +10362,36 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (name == "sha256") {
       return Value(digest::Sha256Digest(input));
     }
-    return Value(digest::Sha512Digest(input));
+    if (name == "sha512") {
+      return Value(digest::Sha512Digest(input));
+    }
+    return Value(static_cast<int64_t>(digest::FarmFingerprint64(input)));
+  }
+
+  // PARSE_JSON validates strict JSON text and hands it back in the engine's
+  // string-based JSON representation; TO_JSON renders a scalar/struct value
+  // as JSON text (same shape as the AST evaluator's branch).
+  if (name == "parse_json" || name == "to_json") {
+    if (arguments.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         name + " requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return Value();
+    }
+    if (name == "parse_json") {
+      if (arguments[0].type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "PARSE_JSON requires a string argument");
+      }
+      const std::string_view text = arguments[0].value.varchar_value;
+      if (!json_text::IsValid(text)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Parsed JSON is invalid");
+      }
+      return Value(std::string(text));
+    }
+    return Value(json_text::ToJsonText(arguments[0]));
   }
 
   if (name == "to_hex") {
@@ -10682,8 +11095,39 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       // long as the entry can be probed (statements otherwise die with
       // their prepared executor and the allocator would recycle them).
       if (context.execution_runtime() != nullptr) {
-        context.execution_runtime()->retained_statements.push_back(
-            value.Query());
+        auto& retained = context.execution_runtime()->retained_statements;
+        // Evaluated once per outer row, a statement repeats in runs; the
+        // retention push (a shared_ptr refcount + append) is skipped for
+        // anything already among the last few retained entries.
+        bool already_retained = false;
+        for (size_t k = retained.size() > 8 ? retained.size() - 8 : 0;
+             k < retained.size(); ++k) {
+          if (retained[k] == value.Query()) {
+            already_retained = true;
+            break;
+          }
+        }
+        if (!already_retained) {
+          retained.push_back(value.Query());
+        }
+      }
+      // Scalar uncorrelated subqueries re-enter this evaluator once per
+      // outer row (TPC-H Q22: 61128 probes of two AVG subqueries); the
+      // projected value is invariant across those probes, so a node-keyed
+      // memo answers repeats with one map hit. Same liveness contract as
+      // the membership cache: retained_statements pins the node address.
+      if (context.execution_runtime() != nullptr && !value.Exists() &&
+          value.Test() == nullptr && !value.ArrayResult()) {
+        auto& scalar_memo =
+            context.execution_runtime()->uncorrelated_scalar_by_node;
+        if (const auto memo_hit = scalar_memo.find(expression.get());
+            memo_hit != scalar_memo.end()) {
+          // A memo hit served the evaluation from a cached result; keep the
+          // uncorrelated_cache_hits telemetry (and the EXPLAIN line derived
+          // from it) meaningful.
+          ++context.execution_runtime()->uncorrelated_cache_hits;
+          return memo_hit->second;
+        }
       }
       // Subqueries carrying their own WITH clauses must run through
       // ExecuteQuery, which materializes the local CTEs first.
@@ -10706,7 +11150,8 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       if (relation == nullptr) {
         const bool apply_cacheable =
             scope.row != nullptr && context.execution_runtime() != nullptr &&
-            !StatementContainsVolatileFunction(*value.Query());
+            !StatementContainsVolatileFunctionCached(
+                context.execution_runtime(), *value.Query());
         if (apply_cacheable) {
           correlated_apply_key = CorrelatedApplyCacheKey(*value.Query(), &scope,
                                                          ctes, value.Exists());
@@ -10755,12 +11200,27 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
         }
       }
       auto& row_source = const_cast<Relation&>(*relation);
-      const bool as_struct = value.Query()->AsStruct();
+      bool as_struct = value.Query()->AsStruct();
       if (!as_struct && value.Test() && value.Mode() == QuantifierMode::kIn &&
           relation->schema.ColumnCount() != 1) {
-        return StatusError(
-            StatusCode::kInvalidArgument,
-            "Subquery of type IN must have only one output column");
+        // `(a, b) IN (SELECT x, y ...)` probes with an anonymous row value
+        // (struct JSON) against each result row taken positionally.  A
+        // scalar probe (including a decoded ARRAY) against a multi-column
+        // result stays rejected: GoogleSQL requires the single output
+        // column there.
+        ASSIGN_OR_RETURN(
+            Value, probe,
+            TryEvaluate(value.Test(), scope, aggregates, context, ctes));
+        if (LooksLikeStructJson(probe)) {
+          // Positional fN keys line both sides up under the field-count
+          // check in ThreeValuedEqualsImpl; declared names would hide a
+          // width mismatch behind string inequality.
+          as_struct = true;
+        } else {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "Subquery of type IN must have only one output column");
+        }
       }
       // Declared select-list names feed struct field keys; without them
       // SELECT AS STRUCT rows would carry positional fN keys.
@@ -10813,12 +11273,15 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           found = false;
         } else if (uncorrelated && context.execution_runtime() != nullptr &&
                    !structural_members) {
-          const std::string structural_key =
-              UncorrelatedCacheKey(*value.Query(), ctes, false);
+          // Probe-side fast path: the membership build is keyed on the
+          // kQueryExp node pointer, so a repeat probe skips the fingerprint
+          // string rebuild entirely.  The node's statement outlives the
+          // runtime (retained above and owned by the executor).
+          const void* membership_node = expression.get();
           auto [cached, inserted] =
               context.execution_runtime()
-                  ->uncorrelated_membership_by_fingerprint.try_emplace(
-                      structural_key);
+                  ->uncorrelated_membership_by_node.try_emplace(
+                      membership_node);
           if (inserted) {
             cached->second.values.reserve(relation->TotalRows());
             Status collation_error = Status::kSuccess;
@@ -10960,11 +11423,17 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
         return StatusError(StatusCode::kInvalidArgument,
                            "Scalar subquery produced more than one row");
       }
-      if (!first || first->values_.empty()) {
-        // Empty subquery: scalar NULL.
-        return Value();
+      Value scalar =
+          (!first || first->values_.empty())
+              ? Value()  // Empty subquery: scalar NULL.
+              : ProjectSubqueryRow(*first, as_struct, &subquery_schema);
+      // Memoize only uncorrelated results: the correlated-index path yields
+      // row-dependent values. See the node-keyed memo lookup above.
+      if (uncorrelated && context.execution_runtime() != nullptr) {
+        context.execution_runtime()->uncorrelated_scalar_by_node.emplace(
+            expression.get(), scalar);
       }
-      return ProjectSubqueryRow(*first, as_struct, &subquery_schema);
+      return scalar;
     }
     case TypeTag::kIntervalExp: {
       // Relational execution exposes interval literals as their logical
@@ -11027,6 +11496,10 @@ void CollectStatementColumns(  // NOLINT(misc-no-recursion)
     CollectExpressionColumns(key, columns);
   }
   CollectExpressionColumns(statement.Having(), columns);
+  // QUALIFY predicates evaluate above the grouping/window passes but name
+  // base columns: missing them pruned scan inputs down to a schema those
+  // passes cannot resolve (aggregate children bound to the wrong column).
+  CollectExpressionColumns(statement.Qualify(), columns);
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
     CollectExpressionColumns(term.expression, columns);
   }

@@ -20,6 +20,15 @@ edge cases (div-by-zero, `INT64_MIN/-1`, overflow, type mismatch).
 - `jit.{hpp,cpp}` — optional LLVM ORC (`TINYLAMB_HAS_LLVM`), narrow non-NULL
   INT64 kernels only (`Filter/Project/Sum` + overflow-checked variants that
   throw like the AST); process-lifetime function-pointer cache.
+- `collation.{hpp,cpp}` — the *static* collation an expression asks for:
+  `CollationOfExpression` (a `COLLATE(x, 'spec')` call; everything else is
+  kNone) and `CollationOfOrdering` (one collated key makes the whole ORDER BY
+  case-insensitive; combine single keys with `ResolveCollation`). The plan
+  and the sort operators read the key's collation from here; the
+  *value*-resolved collation is
+  `type/collation.hpp`. `COLLATE()` itself lives in the function-call
+  evaluator and resolves the spec through `CollationOfSpec`, the same rule
+  the batch evaluator uses.
 - `rewrite.{hpp,cpp}` (`ExpressionPattern/Rule/RuleSet/Rewriter`,
   `ExpressionRuleSet::Default`: folding, boolean identity, De Morgan,
   comparison canonicalization), `proto_text.*`/`proto_schema.*`

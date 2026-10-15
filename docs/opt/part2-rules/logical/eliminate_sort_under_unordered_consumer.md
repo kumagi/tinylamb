@@ -93,7 +93,7 @@ graph TD
 
 - `eliminate_double_sort`: ソート同士の重なりを解消する Rule です。本 Rule は「ソートの上流が集約である場合」を担当します。
 - `push_filter_through_sort`: ソートを跨いでフィルタを押し下げる Rule です。
-- `count_star_without_group_rewrite`: GROUP BY のない COUNT 集約を直接高速リーフへ縮約する Rule です。
+
 
 ## 検証テスト
 

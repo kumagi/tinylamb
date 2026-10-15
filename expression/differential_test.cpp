@@ -76,7 +76,7 @@ std::string DescribeValue(const Value& value) {
 
 std::string DescribeRow(const Schema& schema, const Row& row) {
   std::string description;
-  for (size_t i = 0; i < schema.ColumnCount() && i < row.Size(); ++i) {
+  for (size_t i = 0; i < schema.ColumnCount() && i < row.Count(); ++i) {
     if (!description.empty()) {
       description += ", ";
     }
@@ -127,17 +127,65 @@ Attempt EvaluateAst(const Expression& expression, const Row& row,
   }
 }
 
+bool SameValue(const Value& left, const Value& right);
+std::string Describe(const Attempt& attempt);
+
 Attempt EvaluateBytecode(const std::optional<BytecodeProgram>& program,
                          const Schema& schema, const Row& row) {
   if (!program.has_value()) {
     return Unsupported("bytecode compile failed");
   }
+  Attempt canonical = Unsupported("unreachable");
   try {
-    return Evaluated(
+    canonical = Evaluated(
         program->EvaluateBatch(MakeSingleRowChunk(schema, row)).ValueAt(0));
   } catch (const std::exception& error) {
-    return Thrown(error);
+    canonical = Thrown(error);
   }
+  // The boxing-free interpreter must agree with the canonical VM on every
+  // cell this suite evaluates.  kUnsupported cells are skipped (the callers
+  // fall back to the canonical path by contract); kDone/kError cells must
+  // match it exactly — a divergence is reported on this path so the tally
+  // fails the cell with the fast interpreter's answer in the note.
+  Value fast_value;
+  Status fast_error{Status::kSuccess};
+  switch (program->TryEvaluateRowFast(row, &fast_value, &fast_error)) {
+    case BytecodeProgram::FastEval::kUnsupported:
+      break;
+    case BytecodeProgram::FastEval::kDone: {
+      const Attempt fast = Evaluated(std::move(fast_value));
+      const bool agree = canonical.kind == Attempt::Kind::kValue &&
+                         SameValue(canonical.value, fast.value);
+      if (!agree) {
+        Attempt diverged = Unsupported("placeholder");
+        diverged.kind = Attempt::Kind::kThrow;
+        diverged.exception.clear();
+        diverged.note = "fast-interpreter divergence: fast=" + Describe(fast) +
+                        " canonical=" + Describe(canonical);
+        return diverged;
+      }
+      break;
+    }
+    case BytecodeProgram::FastEval::kError: {
+      // ExcShim maps a failed Status to runtime_error(message); mirror that
+      // so error cells compare like the canonical throw cells.
+      Attempt fast = Unsupported("placeholder");
+      fast.kind = Attempt::Kind::kThrow;
+      fast.exception = "runtime_error";
+      fast.note = fast_error.GetMessage();
+      const bool agree = canonical.kind == Attempt::Kind::kThrow &&
+                         canonical.exception == fast.exception &&
+                         canonical.note == fast.note;
+      if (!agree) {
+        fast.note = "fast-interpreter divergence: fast=" + Describe(fast) +
+                    " canonical=" + Describe(canonical);
+        fast.exception.clear();
+        return fast;
+      }
+      break;
+    }
+  }
+  return canonical;
 }
 
 Attempt EvaluateDetailPath(const Expression& expression, const Row& row,

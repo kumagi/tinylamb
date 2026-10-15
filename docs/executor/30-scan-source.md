@@ -30,7 +30,11 @@
 - ストリーミングで、追加作業メモリは 1 バッチ程度。
 - 時間は表の可視候補行数に対して `O(N)`。
 - 行位置を保存する。
-- 上位に明示的な順序保証を提供しない。
+- 通常は上位に明示的な順序保証を提供しない。ただし保存順が証明できる場合は例外で、そのとき `FullScan` は順序を報告する（節末参照）。
+
+### 保存順の報告（clustered index order）
+
+`FullScanPlan` が保存順を証明できたときだけ、`FullScan` はそのキー列の昇順で並ぶことを上位に報告し、`EXPLAIN` に `FullScan: t (clustered order: id ASC)` と出る。証明はカタログ（UNIQUE 単一キー + NOT NULL）、測定（ANALYZE の相関 1.0）、鮮度（`Table::LayoutGeneration()` が未変化、かつ in-place 書き換えの latch が立っていない）の3条件がすべて揃ったときだけで、判定は `plan/full_scan_plan.hpp` の `ClusteredOrderColumn()` にある。この場合 `FullScanPlan::EmitExecutor` は `ParallelScan` を使わず、本節の逐次走査（チェーン順・slot 昇順）を保つ。`ParallelScan` はモーセル完了順にチャンクを取り出すため保存順ではない閾値（`kParallelScanMinRows`）以上では、意図的に順序を報告しない。
 
 ## 3. `ChunkedScan`：モーセル単位の走査
 

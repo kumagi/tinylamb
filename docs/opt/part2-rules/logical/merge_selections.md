@@ -9,7 +9,7 @@
 
 ## 変換前後の関係
 
-外側 Group に、内側 Group を子として参照したまま述語を統合した等価式を追加します。
+外側 Group に、内側 Selection の子を参照して述語を統合した等価式を追加します。
 
 ```mermaid
 graph TD
@@ -17,11 +17,11 @@ graph TD
     S1["Selection p2"] --> S2["Selection p1"] --> X["Scan t"]
   end
   subgraph after["変換後: 外側Groupに統合Selectionを追加（元の二段構成も残存）"]
-    S3["Selection (p1 AND p2)"] --> S4["Selection p1"] --> X2["Scan t"]
+    S3["Selection (p1 AND p2)"] --> X2["Scan t"]
   end
 ```
 
-本 Rule は外側 Group に新しい式を追加するのみであり、子ノードの参照先は内側 Group のままとなります。子ノードを直接 $X$ に繋ぎ替えて木をフラット化する変形は、相補的な Rule である `merge_adjacent_filters` が担当します。
+本 Rule は子を X へ繋ぎ替え、単一の Selection に統合します。2026-10-02 に述語だけを統合していた旧動作を修正しました。
 
 ## 適用条件
 
@@ -39,7 +39,7 @@ graph TD
             memo.AddExpression(
                 group,
                 LogicalExpression{.operation = LogicalOperator::kSelection,
-                                  .children = expression.children,
+                                  .children = inner.children,
                                   .predicate = merged});
           }
 ```
@@ -78,7 +78,7 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `merge_adjacent_filters`: 本 Rule と同一のパターンにマッチしますが、子ノードの参照を内側 Group の子（`inner.children`）に直接繋ぎ替えるフラット化変形を行います。
+- `merge_selections`: 本 Rule と同一のパターンにマッチしますが、子ノードの参照を内側 Group の子（`inner.children`）に直接繋ぎ替えるフラット化変形を行います。
 - `eliminate_false_selection`: 統合述語が矛盾により `false` 定数へ縮退した際、部分木全体を空集合ノード（`kEmpty`）へ置換します。
 - `push_selection_into_scan`: 内側ノードの下位がスキャンである場合、統合された述語をスキャンフィルタへと押し込みます。
 

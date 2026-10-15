@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
@@ -47,15 +48,16 @@
 #include "executor/cross_join.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/delete.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/hash_join_mode.hpp"
-#include "executor/index_join.hpp"
 #include "executor/index_scan.hpp"
 #include "executor/insert.hpp"
 #include "executor/limit.hpp"
+#include "executor/lookup_join.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/projection.hpp"
@@ -68,8 +70,10 @@
 #include "gtest/gtest.h"
 #include "index/index_schema.hpp"
 #include "index_only_scan.hpp"
+#include "plan/full_scan_plan.hpp"
 #include "plan/merge_join_plan.hpp"
 #include "plan/product_plan.hpp"
+#include "plan/selection_plan.hpp"
 #include "plan/values_plan.hpp"
 #include "transaction/transaction.hpp"
 #include "type/column_name.hpp"
@@ -152,6 +156,7 @@ class ExecutorTest : public ::testing::Test {
   void Recover() {
     if (rs_) {
       rs_->EmulateCrash();
+      rs_.reset();
     }
     rs_ = Database::Create(prefix_).MoveValue();
   }
@@ -162,6 +167,18 @@ class ExecutorTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
+namespace {
+
+// gtest ASSERT_TRUE is invisible to clang-tidy's dataflow, so the optional
+// probe is unwrapped through this helper: the assert keeps
+// bugprone-unchecked-optional-access quiet while the failure mode (abort in
+// debug, a benign static_cast in release) matches the tests' expectations.
+const LookupSeek& SeekOf(const std::optional<LookupSeek>& probe) {
+  assert(probe.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  return *probe;
+}
+}  // namespace
 TEST_F(ExecutorTest, Construct) {
   // Arrange -- nothing to set up; default database created by SetUp()
   // Act -- nothing to execute; default constructed via SetUp()
@@ -640,7 +657,7 @@ TEST_F(ExecutorTest, BasicJoin) {
   ASSERT_TRUE(expected.empty());
 }
 
-TEST_F(ExecutorTest, IndexJoin) {
+TEST_F(ExecutorTest, LookupJoin) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
   const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
@@ -667,8 +684,8 @@ TEST_F(ExecutorTest, IndexJoin) {
   ASSERT_EQ(reload_right_status.GetStatus(), Status::kSuccess);
   const std::shared_ptr<Table>& reload_right = reload_right_status.Value();
   ASSERT_EQ(reload_right->IndexCount(), 1);
-  IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
-               *reload_right, reload_right->GetIndex(0), {0});
+  LookupJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
+                *reload_right, reload_right->GetIndex(0), {0});
   LOG(INFO) << ij;
   std::unordered_set expected(
       {Row({Value(0), Value("hello"), Value(1.2), Value(0), Value(9.2),
@@ -683,7 +700,7 @@ TEST_F(ExecutorTest, IndexJoin) {
             Value("right two")})});
   Row got;
 
-  // Act -- iterate IndexJoin cursor through all matched pairs
+  // Act -- iterate LookupJoin cursor through all matched pairs
   ASSERT_TRUE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.contains(got));
   ASSERT_TRUE(expected.erase(got));
@@ -705,7 +722,7 @@ TEST_F(ExecutorTest, IndexJoin) {
   ASSERT_TRUE(expected.empty());
 }
 
-TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
+TEST_F(ExecutorTest, LookupJoinWithCompositeKey) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
   const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
@@ -727,14 +744,17 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
               {Row({Value(0), Value(0.1), Value("build")})}});
   ASSERT_SUCCESS(rs_->CreateIndex(
       ctx, "RightTable",
-      IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
+      IndexSchema("RightIdx", {0, 2}, {}, IndexMode::kNonUnique)));
   const StatusOr<std::shared_ptr<Table>> reload_right_status =
       ctx.GetTable("RightTable");
   ASSERT_EQ(reload_right_status.GetStatus(), Status::kSuccess);
   const std::shared_ptr<Table>& reload_right = reload_right_status.Value();
   ASSERT_EQ(reload_right->IndexCount(), 1);
-  IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0, 1},
-               *reload_right, reload_right->GetIndex(0), {0, 2});
+  // The probe columns are aligned with the index's key order (key, name), not
+  // with the order the join happens to list its keys in: the seek key has to be
+  // a prefix of the stored key image.
+  LookupJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0, 1},
+                *reload_right, reload_right->GetIndex(0), {0, 2});
   LOG(INFO) << ij;
   std::unordered_set expected({Row({Value(0), Value("hello"), Value(1.2),
                                     Value(0), Value(9.2), Value("hello")}),
@@ -744,7 +764,7 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
                                     Value(2), Value(12.3), Value("arise")})});
   Row got;
 
-  // Act -- iterate IndexJoin cursor through all composite-key matched pairs
+  // Act -- iterate LookupJoin cursor through all composite-key matched pairs
   ASSERT_TRUE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.contains(got));
   ASSERT_TRUE(expected.erase(got));
@@ -760,7 +780,7 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
   ASSERT_TRUE(expected.empty());
 }
 
-TEST_F(ExecutorTest, IndexJoinRejectsNullAndNaNKeys) {
+TEST_F(ExecutorTest, LookupJoinRejectsNullAndNaNKeys) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(
       Table, right_table,
@@ -784,7 +804,7 @@ TEST_F(ExecutorTest, IndexJoinRejectsNullAndNaNKeys) {
   const std::shared_ptr<Table>& reloaded = reloaded_status.Value();
   auto left = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(nan)}), Row({Value(1.0)}), Row({Value()})});
-  IndexJoin join(ctx.txn_, left, {0}, *reloaded, reloaded->GetIndex(0), {0});
+  LookupJoin join(ctx.txn_, left, {0}, *reloaded, reloaded->GetIndex(0), {0});
   std::vector<Row> rows;
   Row row;
   while (join.Next(&row, nullptr)) {
@@ -794,6 +814,355 @@ TEST_F(ExecutorTest, IndexJoinRejectsNullAndNaNKeys) {
   EXPECT_EQ(rows[0][0], Value(1.0));
   EXPECT_EQ(rows[0][1], Value(1.0));
   EXPECT_EQ(rows[0][2], Value(8));
+}
+
+namespace {
+
+// Left-hand probe input for the LookupJoin range regressions: (a, bound)
+// rows fed through a constant executor, so the assertions are about the
+// operator alone and not about any optimizer choice.
+Executor RangeProbeInput(std::vector<Row> rows) {
+  return std::make_shared<ConstantExecutor>(std::move(rows));
+}
+
+std::vector<Row> Drain(ExecutorBase& join) {
+  std::vector<Row> rows;
+  Row row;
+  while (join.Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+  return rows;
+}
+
+}  // namespace
+
+// A composite index (a, b) probed with an equality on `a` and a range bound on
+// `b`: the seek opens the half-open key range and the re-check resolves the
+// inclusive/exclusive edges, duplicates included.
+TEST_F(ExecutorTest, LookupJoinCompositeInt64RangeProbe) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_table,
+      rs_->CreateTable(ctx, Schema{"RangeTarget",
+                                   {Column("a", ValueType::kInt64),
+                                    Column("b", ValueType::kInt64),
+                                    Column("v", ValueType::kInt64)}}));
+  for (const auto& row :
+       {Row({Value(1), Value(10), Value(100)}),
+        Row({Value(1), Value(20), Value(200)}),
+        // Duplicate keys on a non-unique index: both must come back.
+        Row({Value(1), Value(20), Value(201)}),
+        Row({Value(1), Value(30), Value(300)}),
+        Row({Value(2), Value(5), Value(400)}),
+        Row({Value(2), Value(6), Value(500)})}) {
+    ASSERT_SUCCESS(right_table.Insert(ctx.txn_, row).GetStatus());
+  }
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "RangeTarget",
+                IndexSchema("RangeAB", {0, 1}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto reloaded_status = ctx.GetTable("RangeTarget");
+  ASSERT_EQ(reloaded_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& reloaded = reloaded_status.Value();
+
+  // Output rows are `left(2) + right(3)`, so the payload `v` is column 4.
+  // a = 1 AND b < 20 -> only b = 10.
+  LookupJoin less(ctx.txn_, RangeProbeInput({Row({Value(1), Value(20)})}),
+                  {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+                  BinaryOperation::kLessThan);
+  const std::vector<Row> less_rows = Drain(less);
+  ASSERT_EQ(less_rows.size(), 1U);
+  EXPECT_EQ(less_rows[0],
+            Row({Value(1), Value(20), Value(1), Value(10), Value(100)}));
+
+  // a = 1 AND b <= 20 -> the boundary row is inside the seek range and the
+  // re-check keeps it; the duplicate key comes back too.
+  LookupJoin less_equal(ctx.txn_, RangeProbeInput({Row({Value(1), Value(20)})}),
+                        {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+                        BinaryOperation::kLessThanEquals);
+  const std::vector<Row> less_equal_rows = Drain(less_equal);
+  ASSERT_EQ(less_equal_rows.size(), 3U);
+  EXPECT_EQ(less_equal_rows[0],
+            Row({Value(1), Value(20), Value(1), Value(10), Value(100)}));
+  EXPECT_EQ(less_equal_rows[1],
+            Row({Value(1), Value(20), Value(1), Value(20), Value(200)}));
+  EXPECT_EQ(less_equal_rows[2],
+            Row({Value(1), Value(20), Value(1), Value(20), Value(201)}));
+
+  // a = 2 AND b > 6 -> nothing (the mirrored seek starts at the bound).
+  LookupJoin greater(ctx.txn_, RangeProbeInput({Row({Value(2), Value(6)})}),
+                     {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+                     BinaryOperation::kGreaterThan);
+  EXPECT_TRUE(Drain(greater).empty());
+
+  // a = 2 AND b >= 5 -> both rows of a = 2.
+  LookupJoin greater_equal(
+      ctx.txn_, RangeProbeInput({Row({Value(2), Value(5)})}), {0, 1}, *reloaded,
+      reloaded->GetIndex(0), {0, 1}, 1, BinaryOperation::kGreaterThanEquals);
+  const std::vector<Row> greater_equal_rows = Drain(greater_equal);
+  ASSERT_EQ(greater_equal_rows.size(), 2U);
+  EXPECT_EQ(greater_equal_rows[0],
+            Row({Value(2), Value(5), Value(2), Value(5), Value(400)}));
+  EXPECT_EQ(greater_equal_rows[1],
+            Row({Value(2), Value(5), Value(2), Value(6), Value(500)}));
+
+  // A NULL bound compares UNKNOWN against every right row, so it cannot match;
+  // the probe must fall back to the wider prefix scan and reject there.
+  LookupJoin null_bound(ctx.txn_, RangeProbeInput({Row({Value(1), Value()})}),
+                        {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+                        BinaryOperation::kLessThan);
+  EXPECT_TRUE(Drain(null_bound).empty());
+}
+
+// The range whitelist covers DATE as well as INT64: both encode as
+// order-preserving signed integers, so a DATE key column takes a range bound
+// exactly like an INT64 one.
+TEST_F(ExecutorTest, LookupJoinDateRangeProbe) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_table,
+      rs_->CreateTable(ctx, Schema{"DateTarget",
+                                   {Column("a", ValueType::kInt64),
+                                    Column("d", ValueType::kDate),
+                                    Column("v", ValueType::kInt64)}}));
+  for (const auto& row :
+       {Row({Value(1), Value::DateFromDays(20000), Value(1)}),
+        Row({Value(1), Value::DateFromDays(20112), Value(2)}),
+        Row({Value(1), Value::DateFromDays(20365), Value(3)}),
+        Row({Value(2), Value::DateFromDays(20000), Value(4)})}) {
+    ASSERT_SUCCESS(right_table.Insert(ctx.txn_, row).GetStatus());
+  }
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "DateTarget",
+                IndexSchema("DateAD", {0, 1}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto reloaded_status = ctx.GetTable("DateTarget");
+  ASSERT_EQ(reloaded_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& reloaded = reloaded_status.Value();
+
+  // a = 1 AND d < 20184 (2024-06-23) -> the two DATE rows before the bound.
+  LookupJoin join(
+      ctx.txn_, RangeProbeInput({Row({Value(1), Value::DateFromDays(20184)})}),
+      {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+      BinaryOperation::kLessThan);
+  const std::vector<Row> rows = Drain(join);
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value::DateFromDays(20184), Value(1),
+                          Value::DateFromDays(20000), Value(1)}));
+  EXPECT_EQ(rows[1], Row({Value(1), Value::DateFromDays(20184), Value(1),
+                          Value::DateFromDays(20112), Value(2)}));
+
+  // An INT64 bound on a DATE key column encodes under a different type tag, so
+  // it must not reach the seek: the probe falls back to the (a) prefix and the
+  // cross-typed re-check rejects every candidate.
+  LookupJoin cross_typed(
+      ctx.txn_, RangeProbeInput({Row({Value(1), Value(20184)})}), {0, 1},
+      *reloaded, reloaded->GetIndex(0), {0, 1}, 1, BinaryOperation::kLessThan);
+  EXPECT_TRUE(Drain(cross_typed).empty());
+}
+
+// A single-value unique index holds at most one position per key, so a point
+// probe on the complete key short-circuits: the operator advances the outer
+// cursor after the single candidate instead of walking the index. A missing
+// key must not leave the short circuit stuck.
+TEST_F(ExecutorTest, LookupJoinUniqueIndexShortCircuitsTheProbe) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_table,
+      rs_->CreateTable(ctx, Schema{"UniqueTarget",
+                                   {Column("k", ValueType::kInt64),
+                                    Column("v", ValueType::kInt64)}}));
+  for (const auto& row :
+       {Row({Value(1), Value(10)}), Row({Value(3), Value(30)})}) {
+    ASSERT_SUCCESS(right_table.Insert(ctx.txn_, row).GetStatus());
+  }
+  ASSERT_EQ(
+      rs_->CreateIndex(ctx, "UniqueTarget",
+                       IndexSchema("UniqueK", {0}, {}, IndexMode::kUnique)),
+      Status::kSuccess);
+  const auto reloaded_status = ctx.GetTable("UniqueTarget");
+  ASSERT_EQ(reloaded_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& reloaded = reloaded_status.Value();
+
+  // Probe order hits a missing key first, then both present keys.
+  LookupJoin join(ctx.txn_,
+                  RangeProbeInput({Row({Value(2)}), Row({Value(1)}),
+                                   Row({Value(99)}), Row({Value(3)})}),
+                  {0}, *reloaded, reloaded->GetIndex(0), {0});
+  const std::vector<Row> rows = Drain(join);
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(1), Value(10)}));
+  EXPECT_EQ(rows[1], Row({Value(3), Value(3), Value(30)}));
+}
+
+// An empty right side makes every probe miss: the cursor must report a clean
+// exhaustion, not a failure, and must not lose the left side's error either.
+TEST_F(ExecutorTest, LookupJoinEmptyRightSideExhaustsCleanly) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_table,
+      rs_->CreateTable(ctx, Schema{"EmptyTarget",
+                                   {Column("a", ValueType::kInt64),
+                                    Column("b", ValueType::kInt64)}}));
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "EmptyTarget",
+                IndexSchema("EmptyAB", {0, 1}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto reloaded_status = ctx.GetTable("EmptyTarget");
+  ASSERT_EQ(reloaded_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& reloaded = reloaded_status.Value();
+
+  LookupJoin join(
+      ctx.txn_,
+      RangeProbeInput({Row({Value(1), Value(2)}), Row({Value(3), Value(4)})}),
+      {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+      BinaryOperation::kLessThan);
+  EXPECT_TRUE(Drain(join).empty());
+
+  // An empty left side never probes at all.
+  LookupJoin empty_left(ctx.txn_, RangeProbeInput({}), {0, 1}, *reloaded,
+                        reloaded->GetIndex(0), {0, 1}, 1,
+                        BinaryOperation::kLessThan);
+  EXPECT_TRUE(Drain(empty_left).empty());
+}
+
+// The residual predicate carries what the probe cannot decide. Driven here
+// through the plan/factory pair: an equality on a NON-key column of a composite
+// index leaves the seek on the leading key only, and the extra equality must
+// still filter the probe's over-fetch. The old executor sought with the join's
+// own key order here, landing between unrelated stored keys and silently
+// dropping every match.
+TEST_F(ExecutorTest, LookupJoinRechecksEqualityOnANonKeyColumn) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, left_table,
+      rs_->CreateTable(ctx, Schema{"ProbeSide",
+                                   {Column("x", ValueType::kInt64),
+                                    Column("y", ValueType::kInt64)}}));
+  ASSERT_SUCCESS(
+      left_table.Insert(ctx.txn_, Row({Value(1), Value(5)})).GetStatus());
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_table,
+      rs_->CreateTable(ctx, Schema{"CompositeSide",
+                                   {Column("a", ValueType::kInt64),
+                                    Column("b", ValueType::kInt64),
+                                    Column("c", ValueType::kInt64)}}));
+  for (const auto& row : {Row({Value(1), Value(10), Value(5)}),
+                          Row({Value(1), Value(20), Value(5)}),
+                          Row({Value(1), Value(30), Value(6)}),
+                          Row({Value(2), Value(40), Value(5)})}) {
+    ASSERT_SUCCESS(right_table.Insert(ctx.txn_, row).GetStatus());
+  }
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "CompositeSide",
+                IndexSchema("CompositeAB", {0, 1}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto right = ctx.GetTable("CompositeSide");
+  const auto right_stats = ctx.GetStats("CompositeSide");
+  ASSERT_TRUE(right.HasValue());
+  ASSERT_TRUE(right_stats.HasValue());
+  // NOTE: FullScanPlan keeps its statistics by reference, so the scan's stats
+  // must outlive the plan -- bind them to a named local, not a temporary.
+  const TableStatistics left_stats(left_table.GetSchema());
+  Plan plan(new ProductPlan(
+      std::make_shared<FullScanPlan>(left_table, left_stats),
+      {ColumnName("ProbeSide", "x"), ColumnName("ProbeSide", "y")},
+      *right.Value(), right.Value()->GetIndex(0),
+      {ColumnName("CompositeSide", "a"), ColumnName("CompositeSide", "c")},
+      *right_stats.Value()));
+  // The probe derives the (a) prefix in the index's own key order; `c` is not
+  // an index key column, so `x = c` is not part of the seek. The join emits
+  // the probe's over-fetch and the residual predicate above it decides.
+  auto& product = static_cast<ProductPlan&>(*plan);
+  const std::optional<LookupSeek>& probe = product.Lookup();
+  ASSERT_TRUE(probe.has_value());
+  ASSERT_EQ(SeekOf(probe).right_columns.size(), 1U);
+  EXPECT_EQ(SeekOf(probe).right_columns[0], ColumnName("CompositeSide", "a"));
+  EXPECT_EQ(SeekOf(probe).left_columns[0], ColumnName("ProbeSide", "x"));
+  ASSERT_EQ(SeekOf(probe).range_position, std::nullopt);
+  // Without the residual the probe over-fetches every row under the (a)
+  // prefix: 1, 2 and 3 rows of the composite side.
+  {
+    Executor raw = plan->EmitExecutor(ctx);
+    const std::vector<Row> over_fetched = Drain(*raw);
+    ASSERT_EQ(over_fetched.size(), 3U);
+  }
+
+  const Expression residual = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("ProbeSide", "y")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("CompositeSide", "c")));
+  Plan filtered = std::make_shared<SelectionPlan>(
+      plan, residual, TableStatistics(right.Value()->GetSchema()));
+  Executor executor = filtered->EmitExecutor(ctx);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("LookupJoin"), std::string::npos) << dump.str();
+  const std::vector<Row> rows = Drain(*executor);
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(5), Value(1), Value(10), Value(5)}));
+  EXPECT_EQ(rows[1], Row({Value(1), Value(5), Value(1), Value(20), Value(5)}));
+}
+
+// The range whitelist is INT64/DATE only. A FLOAT64 range column stays a
+// residual predicate, so the probe must still return the right rows through the
+// wider equality-prefix scan.
+TEST_F(ExecutorTest, LookupJoinRejectsNonWhitelistedRangeTypes) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, probe_table,
+      rs_->CreateTable(ctx, Schema{"FloatProbe",
+                                   {Column("a", ValueType::kInt64),
+                                    Column("f", ValueType::kDouble)}}));
+  ASSERT_SUCCESS(
+      probe_table.Insert(ctx.txn_, Row({Value(1), Value(1.5)})).GetStatus());
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_table,
+      rs_->CreateTable(ctx, Schema{"FloatTarget",
+                                   {Column("a", ValueType::kInt64),
+                                    Column("f", ValueType::kDouble),
+                                    Column("v", ValueType::kInt64)}}));
+  for (const auto& row : {Row({Value(1), Value(1.5), Value(10)}),
+                          Row({Value(1), Value(9.5), Value(90)}),
+                          Row({Value(1), Value(2.5), Value(20)})}) {
+    ASSERT_SUCCESS(right_table.Insert(ctx.txn_, row).GetStatus());
+  }
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "FloatTarget",
+                IndexSchema("FloatAV", {0, 2}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto right = ctx.GetTable("FloatTarget");
+  const auto right_stats = ctx.GetStats("FloatTarget");
+  ASSERT_TRUE(right.HasValue());
+  ASSERT_TRUE(right_stats.HasValue());
+  // NOTE: FullScanPlan keeps its statistics by reference, so the scan's stats
+  // must outlive the plan -- bind them to a named local, not a temporary.
+  const TableStatistics left_stats(probe_table.GetSchema());
+  Plan left_plan = std::make_shared<FullScanPlan>(probe_table, left_stats);
+  auto product = std::make_shared<ProductPlan>(
+      left_plan,
+      std::vector<ColumnName>{ColumnName("FloatProbe", "a"),
+                              ColumnName("FloatProbe", "f")},
+      *right.Value(), right.Value()->GetIndex(0),
+      std::vector<ColumnName>{ColumnName("FloatTarget", "a"),
+                              ColumnName("FloatTarget", "f")},
+      *right_stats.Value());
+  EXPECT_FALSE(product->SetLookupRange(1, ColumnName("FloatProbe", "f"),
+                                       ColumnName("FloatTarget", "f"),
+                                       BinaryOperation::kLessThan));
+  ASSERT_TRUE(product->Lookup().has_value());
+  EXPECT_EQ(SeekOf(product->Lookup()).range_position, std::nullopt);
+  EXPECT_EQ(SeekOf(product->Lookup()).right_columns.size(), 1U);
+  // A mismatched operand type is rejected as well: the per-row re-check could
+  // not decide a cross-typed comparison.
+  EXPECT_FALSE(product->SetLookupRange(1, ColumnName("FloatProbe", "a"),
+                                       ColumnName("FloatTarget", "f"),
+                                       BinaryOperation::kLessThan));
+  // The range column is not the first unpinned index key column, so a bound
+  // there cannot narrow the seek at all.
+  EXPECT_FALSE(product->SetLookupRange(2, ColumnName("FloatProbe", "f"),
+                                       ColumnName("FloatTarget", "f"),
+                                       BinaryOperation::kLessThan));
 }
 
 TEST_F(ExecutorTest, Insert) {
@@ -1095,6 +1464,141 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
   EXPECT_TRUE(keys.contains(0));
   EXPECT_TRUE(keys.contains(kRows - 1));
   ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+// The worker-side row filter must decide rows inside the decode workers and
+// hand chunks out exactly as a serial Selection over the same conjuncts
+// would: survivors only, once each, no rows lost across morsel boundaries.
+TEST_F(ExecutorTest, MorselDrivenParallelScanWorkerFilterDecidesRows) {
+  constexpr std::string_view kFilteredTable = "ParallelFilteredTable";
+  constexpr int64_t kRows = 2000;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{kFilteredTable,
+                  {Column("key", ValueType::kInt64),
+                   Column("payload", ValueType::kVarChar)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t key = 0; key < kRows; ++key) {
+      std::string payload = "row-" + std::to_string(key);
+      payload.resize(100, 'x');
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_, Row({Value(key), Value(std::move(payload))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  const StatusOr<std::shared_ptr<Table>> table_status =
+      reader.GetTable(kFilteredTable);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
+
+  // One simple compare (worker fast path) plus one residual (bytecode):
+  // `key >= 10 AND key % 2 = 0`.
+  const std::vector<Expression> conjuncts{
+      BinaryExpressionExp(ColumnValueExp("key"),
+                          BinaryOperation::kGreaterThanEquals,
+                          ConstantValueExp(Value(int64_t{10}))),
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kModulo,
+                              ConstantValueExp(Value(int64_t{2}))),
+          BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0})))};
+  const Schema& schema = table->GetSchema();
+  const relational_detail::CompiledScanFilter filter =
+      relational_detail::CompileScanFilter(conjuncts, schema);
+  relational_detail::WorkerScanFilterPrograms programs =
+      relational_detail::CompileWorkerFilter(filter, schema);
+  ASSERT_TRUE(programs.complete)
+      << "residual bytecode must compile for the worker filter test";
+
+  ParallelScan scan(reader.txn_, *table, 4, 1);
+  ASSERT_TRUE(scan.CanTakeRowFilter());
+  scan.SetRowFilter(conjuncts, filter, std::move(programs));
+
+  std::unordered_set<int64_t> keys;
+  DataChunk chunk;
+  while (scan.NextBatch(&chunk, 53) != 0) {
+    for (size_t row = 0; row < chunk.Size(); ++row) {
+      EXPECT_TRUE(
+          keys.insert(chunk.ColumnAt(0).ValueAt(row).value.int_value).second);
+    }
+  }
+  ASSERT_SUCCESS(scan.GetStatus());
+  for (int64_t key = 0; key < kRows; ++key) {
+    EXPECT_EQ(keys.contains(key), key >= 10 && key % 2 == 0) << key;
+  }
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+// Rows whose worker program raises are parked for the contextful re-check on
+// the consumer thread, and the first such error surfaces as the scan's
+// sticky status: a raising row must not be silently dropped.
+TEST_F(ExecutorTest, MorselDrivenParallelScanSurfacesDeferredRowErrors) {
+  constexpr std::string_view kDeferredTable = "ParallelDeferredTable";
+  constexpr int64_t kRows = 2000;
+  constexpr int64_t kBoomKey = 500;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{kDeferredTable,
+                  {Column("key", ValueType::kInt64),
+                   Column("payload", ValueType::kVarChar)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t key = 0; key < kRows; ++key) {
+      std::string payload = "row-" + std::to_string(key);
+      payload.resize(100, 'x');
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_, Row({Value(key), Value(std::move(payload))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  const StatusOr<std::shared_ptr<Table>> table_status =
+      reader.GetTable(kDeferredTable);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
+
+  // `1000 / (500 - key) = 1`: INT64 division promotes to FLOAT64, so within
+  // the key domain [0, 2000) no row satisfies it (the exact quotient 1.0
+  // would need key == -500) -- every row is a clean rejection except
+  // key == 500, where the division by zero raises inside the worker program
+  // and parks the row for the consumer-side re-check.
+  const std::vector<Expression> conjuncts{BinaryExpressionExp(
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{1000})),
+                          BinaryOperation::kDivide,
+                          BinaryExpressionExp(ConstantValueExp(Value(kBoomKey)),
+                                              BinaryOperation::kSubtract,
+                                              ColumnValueExp("key"))),
+      BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{1})))};
+  const Schema& schema = table->GetSchema();
+  const relational_detail::CompiledScanFilter filter =
+      relational_detail::CompileScanFilter(conjuncts, schema);
+  relational_detail::WorkerScanFilterPrograms programs =
+      relational_detail::CompileWorkerFilter(filter, schema);
+  ASSERT_TRUE(programs.complete);
+
+  ParallelScan scan(reader.txn_, *table, 4, 1);
+  scan.SetRowFilter(conjuncts, filter, std::move(programs));
+
+  std::unordered_set<int64_t> keys;
+  DataChunk chunk;
+  while (scan.NextBatch(&chunk, 53) != 0) {
+    for (size_t row = 0; row < chunk.Size(); ++row) {
+      EXPECT_TRUE(
+          keys.insert(chunk.ColumnAt(0).ValueAt(row).value.int_value).second);
+    }
+  }
+  EXPECT_NE(scan.GetStatus(), Status::kSuccess)
+      << "the deferred raising row must surface as a sticky error";
+  // The raising row must not be silently dropped into the result as a
+  // match or a non-match: the scan ends in an error, never a row.
+  EXPECT_TRUE(keys.empty());
+  EXPECT_FALSE(keys.contains(kBoomKey));
+  reader.txn_.PreCommit();
 }
 
 TEST_F(ExecutorTest, ThreadLocalAggregationMergesPartialAndDistinctStates) {
@@ -3288,6 +3792,35 @@ TEST_F(ExecutorTest, RelationalNullSafeInnerJoinSpillMatchesUnbudgeted) {
   }
 }
 
+TEST_F(ExecutorTest, RelationalNullSafeOuterSpillMatchesUnbudgeted) {
+  CreateWideTableWithNullKeys(*rs_, "NullSafeOuterJoin", 200);
+  const std::vector<std::string> sqls{
+      "SELECT a.key, b.key FROM NullSafeOuterJoin AS a "
+      "LEFT JOIN NullSafeOuterJoin AS b "
+      "ON a.key IS NOT DISTINCT FROM b.key "
+      "WHERE EXISTS (SELECT 1 FROM NullSafeOuterJoin)",
+      "SELECT a.key, b.key FROM NullSafeOuterJoin AS a "
+      "RIGHT JOIN NullSafeOuterJoin AS b "
+      "ON a.key IS NOT DISTINCT FROM b.key "
+      "WHERE EXISTS (SELECT 1 FROM NullSafeOuterJoin)",
+      "SELECT a.key, b.key FROM NullSafeOuterJoin AS a "
+      "FULL JOIN NullSafeOuterJoin AS b "
+      "ON a.key IS NOT DISTINCT FROM b.key "
+      "WHERE EXISTS (SELECT 1 FROM NullSafeOuterJoin)"};
+  for (const std::string& sql : sqls) {
+    std::vector<std::pair<int64_t, int64_t>> reference;
+    {
+      ScopedQueryMemory unlimited(0);
+      reference = KeyPairCounts(RelationalRun(*rs_, sql));
+    }
+    EXPECT_FALSE(reference.empty());
+    {
+      ScopedQueryMemory memory(65536);
+      EXPECT_EQ(KeyPairCounts(RelationalRun(*rs_, sql)), reference);
+    }
+  }
+}
+
 TEST_F(ExecutorTest, RelationalRightOuterJoinSpillMatchesUnbudgeted) {
   CreateWideTableWithNullKeys(*rs_, "RightJoin", 200);
   // The right (build) side spills; every unmatched right row must still be
@@ -3368,14 +3901,17 @@ TEST_F(ExecutorTest, RelationalPartitionedAggregationSpillsUnderBudget) {
   CreateWideTable(*rs_, "WideAgg", 400);
   ScopedQueryMemory memory(65536);
   const auto rows =
-      RelationalRun(*rs_, "SELECT key, COUNT(*) FROM WideAgg GROUP BY key;");
+      RelationalRun(*rs_,
+                    "SELECT key, COUNT(*) FROM WideAgg GROUP BY key "
+                    "HAVING COUNT(*) > 0;");
   ASSERT_EQ(rows.size(), 400U);
   for (const Row& row : rows) {
     EXPECT_EQ(row[1], Value(1));  // keys are unique, every group is size 1
   }
   const std::string plan = RelationalExplain(*rs_,
                                              "SELECT key, COUNT(*) FROM "
-                                             "WideAgg GROUP BY key;",
+                                             "WideAgg GROUP BY key "
+                                             "HAVING COUNT(*) > 0;",
                                              /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "aggregate_groups="), 400);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
@@ -4730,6 +5266,243 @@ TEST_F(ExecutorTest, OptimizerAndRelationalPathsAgree) {
     EXPECT_EQ(optimized, relational) << "divergence for: " << optimizer_sql;
     EXPECT_FALSE(optimized.empty());
   }
+}
+
+// Row-independent subqueries in a scan filter fold to constants at filter
+// compile time (FoldRowIndependentSubqueries).  avg(score) over the fixture =
+// (1.2 + 12.2 + 4.9 + 4.14) / 4 = 5.61, so exactly key 3 qualifies.
+TEST_F(ExecutorTest, RelationalUncorrelatedScalarSubqueryFoldKeepsResults) {
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT key FROM SampleTable WHERE score > "
+                    "(SELECT avg(score) FROM SampleTable) ORDER BY key;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(3));
+}
+
+// Uncorrelated membership and EXISTS probes share the same fold contract;
+// their folded constants must reproduce the three-valued per-row verdicts.
+TEST_F(ExecutorTest, RelationalUncorrelatedMembershipAndExistsFold) {
+  const auto not_in = RelationalRun(
+      *rs_,
+      "SELECT key FROM SampleTable WHERE key NOT IN "
+      "(SELECT key FROM SampleTable WHERE key <= 1) ORDER BY key;");
+  ASSERT_EQ(not_in.size(), 2U);
+  EXPECT_EQ(not_in[0][0], Value(2));
+  EXPECT_EQ(not_in[1][0], Value(3));
+
+  const auto exists =
+      RelationalRun(*rs_,
+                    "SELECT key FROM SampleTable WHERE key = 0 AND EXISTS "
+                    "(SELECT 1 FROM SampleTable WHERE key = 3);");
+  ASSERT_EQ(exists.size(), 1U);
+  EXPECT_EQ(exists[0][0], Value(0));
+}
+
+// Correlated subqueries must never fold: the per-row verdict decides the row.
+// min(score of the OTHER rows) is 1.2 for every outer row, so keys 1, 2, 3
+// (score >= 1.2) qualify while key 0 (1.2 > 1.2 is false) does not.  A wrong
+// compile-time fold would use one global constant instead and keep key 0.
+TEST_F(ExecutorTest, RelationalCorrelatedSubqueryStaysPerRow) {
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT a.key FROM SampleTable a WHERE a.score >= "
+                    "(SELECT min(b.score) FROM SampleTable b "
+                    "WHERE b.key <> a.key) ORDER BY a.key;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(2));
+  EXPECT_EQ(rows[2][0], Value(3));
+}
+
+// `substr(name, 1, 2) IN (...)` compiles to the byte-prefix membership
+// predicate: ASCII prefixes keep the byte compare equivalent to the AST's
+// code-point substr, including NULL, short, and multi-byte-leading values.
+TEST_F(ExecutorTest, RelationalPrefixInPeelMatchesSubstrVerdicts) {
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{"PrefixTable",
+                  {Column("key", ValueType::kInt64),
+                   Column("name", ValueType::kVarChar)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    BulkInsert(writer.txn_, table,
+               {{Row({Value(0), Value("hello")})},  // prefix "he" -> match
+                {Row({Value(1), Value("he")})},     // exact prefix -> match
+                {Row({Value(2), Value("h")})},      // shorter than prefix
+                {Row({Value(3), Value("hex")})},    // prefix "he" -> match
+                {Row({Value(4), Value("héllo")})},  // multi-byte 2nd cp
+                {Row({Value(5), Value("πe")})},     // multi-byte 1st cp
+                {Row({Value(6), Value()})}});       // NULL -> UNKNOWN
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT key FROM PrefixTable WHERE "
+                    "substr(name, 1, 2) IN ('he', 'ho') ORDER BY key;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(0));
+  EXPECT_EQ(rows[1][0], Value(1));
+  EXPECT_EQ(rows[2][0], Value(3));
+
+  // A start offset other than 1 stays on the AST residual path and must keep
+  // its exact semantics: substr(name, 2, 2) matches only "hello" -> "el".
+  const auto offset_rows =
+      RelationalRun(*rs_,
+                    "SELECT key FROM SampleTable WHERE "
+                    "substr(name, 2, 2) IN ('el') ORDER BY key;");
+  ASSERT_EQ(offset_rows.size(), 1U);
+  EXPECT_EQ(offset_rows[0][0], Value(0));
+}
+
+// `col [NOT] IN (uncorrelated subquery)` peels to a compile-time value set
+// (PrebuiltMembershipPredicate).  These pin the exact three-valued semantics
+// the peel must reproduce: NULL members, NULL probes, and the decisive
+// empty set.
+TEST_F(ExecutorTest, RelationalPrebuiltMembershipMatchesThreeValuedIn) {
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema outer_schema{
+        "MemOuter",
+        {Column("key", ValueType::kInt64), Column("d", ValueType::kDate)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, outer, rs_->CreateTable(writer, outer_schema));
+    BulkInsert(writer.txn_, outer,
+               {{Row({Value(1), Value::DateFromDays(100)})},
+                {Row({Value(2), Value::DateFromDays(200)})},
+                {Row({Value(3), Value::DateFromDays(300)})},
+                {Row({Value(), Value::DateFromDays(400)})}});
+    Schema inner_schema{
+        "MemInner",
+        {Column("k", ValueType::kInt64), Column("dd", ValueType::kDate)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, inner, rs_->CreateTable(writer, inner_schema));
+    // Members 1, 2 and one NULL: IN keeps {1}; NOT IN rejects everything
+    // (the NULL member turns every miss UNKNOWN).
+    BulkInsert(writer.txn_, inner,
+               {{Row({Value(1), Value::DateFromDays(100)})},
+                {Row({Value(2), Value::DateFromDays(200)})},
+                {Row({Value(), Value()})}});
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  const auto in_rows = RelationalRun(*rs_,
+                                     "SELECT key FROM MemOuter WHERE key IN "
+                                     "(SELECT k FROM MemInner) ORDER BY key;");
+  // Members are {1, 2, NULL}: keys 1 and 2 match.
+  ASSERT_EQ(in_rows.size(), 2U);
+  EXPECT_EQ(in_rows[0][0], Value(1));
+  EXPECT_EQ(in_rows[1][0], Value(2));
+
+  const auto not_in_rows =
+      RelationalRun(*rs_,
+                    "SELECT key FROM MemOuter WHERE key NOT IN "
+                    "(SELECT k FROM MemInner);");
+  EXPECT_TRUE(not_in_rows.empty());
+
+  // NULL probe: `NULL IN (...)` is UNKNOWN for any non-empty set.
+  const auto null_probe =
+      RelationalRun(*rs_,
+                    "SELECT d FROM MemOuter WHERE key IS NULL AND key IN "
+                    "(SELECT k FROM MemInner);");
+  EXPECT_TRUE(null_probe.empty());
+
+  // DATE probes over a DATE member set take the same peel; members are
+  // days {100, 200, NULL}.
+  const auto date_rows =
+      RelationalRun(*rs_,
+                    "SELECT key FROM MemOuter WHERE d IN "
+                    "(SELECT dd FROM MemInner) ORDER BY key;");
+  ASSERT_EQ(date_rows.size(), 2U);
+  EXPECT_EQ(date_rows[0][0], Value(1));
+  EXPECT_EQ(date_rows[1][0], Value(2));
+}
+
+// The empty member set is decisive without consulting the probe: `x IN ()`
+// is FALSE and `x NOT IN ()` is TRUE even for a NULL x.
+TEST_F(ExecutorTest, RelationalPrebuiltMembershipEmptySetIsDecisive) {
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema outer_schema{"EmptyOuter", {Column("key", ValueType::kInt64)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, outer, rs_->CreateTable(writer, outer_schema));
+    BulkInsert(writer.txn_, outer, {{Row({Value(1)})}, {Row({Value()})}});
+    Schema inner_schema{"EmptyInner", {Column("k", ValueType::kInt64)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, inner, rs_->CreateTable(writer, inner_schema));
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  const auto all = RelationalRun(*rs_,
+                                 "SELECT key FROM EmptyOuter WHERE key NOT IN "
+                                 "(SELECT k FROM EmptyInner) ORDER BY key;");
+  ASSERT_EQ(all.size(), 2U);
+  // ASC orders NULL first (the engine default).
+  EXPECT_TRUE(all[0][0].IsNull());
+  EXPECT_EQ(all[1][0], Value(1));
+  const auto none = RelationalRun(*rs_,
+                                  "SELECT key FROM EmptyOuter WHERE key IN "
+                                  "(SELECT k FROM EmptyInner);");
+  EXPECT_TRUE(none.empty());
+}
+
+// `col op (correlated min/max scalar subquery)` peels to a pre-aggregated
+// key->value map (PrebuiltScalarComparePredicate): one GROUP BY execution
+// replaces the per-key correlated applies.  These pin the per-key values,
+// the empty-group scalar NULL, and the NULL-probe rejection.
+TEST_F(ExecutorTest, RelationalPrebuiltScalarCompareMatchesCorrelatedMin) {
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema part_schema{
+        "ScalarPart",
+        {Column("pid", ValueType::kInt64), Column("price", ValueType::kInt64)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, part, rs_->CreateTable(writer, part_schema));
+    BulkInsert(writer.txn_, part,
+               {{Row({Value(1), Value(10)})},
+                {Row({Value(2), Value(20)})},
+                {Row({Value(3), Value(30)})},
+                {Row({Value(), Value(40)})}});
+    Schema supply_schema{
+        "ScalarSupply",
+        {Column("pid", ValueType::kInt64), Column("cost", ValueType::kInt64),
+         Column("flag", ValueType::kInt64)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, supply,
+                          rs_->CreateTable(writer, supply_schema));
+    // Per-pid MIN(cost) over flag=1 rows: pid1 -> 5, pid2 -> 20 (its only
+    // flag=1 row), pid3 -> no flag=1 rows (scalar NULL).
+    BulkInsert(writer.txn_, supply,
+               {{Row({Value(1), Value(9), Value(0)})},
+                {Row({Value(1), Value(5), Value(1)})},
+                {Row({Value(1), Value(7), Value(1)})},
+                {Row({Value(2), Value(20), Value(1)})},
+                {Row({Value(2), Value(1), Value(0)})},
+                {Row({Value(3), Value(1), Value(0)})},
+                {Row({Value(), Value(1), Value(1)})}});
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  const auto min_rows =
+      RelationalRun(*rs_,
+                    "SELECT pid FROM ScalarPart WHERE price = "
+                    "(SELECT MIN(cost) FROM ScalarSupply "
+                    "WHERE ScalarSupply.pid = ScalarPart.pid AND flag = 1) "
+                    "ORDER BY pid;");
+  // pid1: 10 != MIN(5,7)=5.  pid2: 20 = 20.  pid3: scalar NULL -> UNKNOWN.
+  // NULL probe -> UNKNOWN.
+  ASSERT_EQ(min_rows.size(), 1U);
+  EXPECT_EQ(min_rows[0][0], Value(2));
+
+  const auto gt_rows =
+      RelationalRun(*rs_,
+                    "SELECT pid FROM ScalarPart WHERE price > "
+                    "(SELECT MIN(cost) FROM ScalarSupply "
+                    "WHERE ScalarSupply.pid = ScalarPart.pid AND flag = 1) "
+                    "ORDER BY pid;");
+  ASSERT_EQ(gt_rows.size(), 1U);
+  EXPECT_EQ(gt_rows[0][0], Value(1));  // 10 > 5.
+
+  // MAX over the same correlation: pid1 -> 7, pid2 -> 20, pid3 -> NULL.
+  const auto max_rows =
+      RelationalRun(*rs_,
+                    "SELECT pid FROM ScalarPart WHERE price = "
+                    "(SELECT MAX(cost) FROM ScalarSupply "
+                    "WHERE ScalarSupply.pid = ScalarPart.pid AND flag = 1) "
+                    "ORDER BY pid;");
+  // pid1: 10 != MAX(5,7)=7.  pid2: 20 = 20.  pid3: scalar NULL.
+  ASSERT_EQ(max_rows.size(), 1U);
+  EXPECT_EQ(max_rows[0][0], Value(2));
 }
 
 }  // namespace tinylamb

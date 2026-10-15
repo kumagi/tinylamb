@@ -126,8 +126,39 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
   return true;
 }
 
-Value FirstOrNull(const std::vector<Value>& keys) {
-  return keys.empty() ? Value() : keys.front();
+TableStatistics IndexRangeStats(const TableStatistics& source,
+                                const Index& index,
+                                const std::vector<Value>& begin_key,
+                                const std::vector<Value>& end_key) {
+  TableStatistics result = source;
+  size_t equality_rows = result.Rows();
+  size_t equality_keys = 0;
+  const size_t key_count = std::max(begin_key.size(), end_key.size());
+  for (size_t i = 0; i < key_count; ++i) {
+    if (i >= index.sc_.key_.size()) {
+      break;
+    }
+    const Value lower = i < begin_key.size() ? begin_key[i] : Value();
+    const Value upper = i < end_key.size() ? end_key[i] : Value();
+    result =
+        result.TransformBy(static_cast<int>(index.sc_.key_[i]), lower, upper);
+    if (!lower.IsNull() && !upper.IsNull() && lower == upper) {
+      equality_rows = result.Rows();
+      ++equality_keys;
+    }
+  }
+  // The halfway blend corrects a key AFTER an equality prefix: the prefix
+  // already pinned the row count its own NDV implies, and the deeper key's
+  // independent-range transform under-counts those rows. A LEADING range key
+  // has no such anchor -- blending toward the source row count just halves
+  // the range's real selectivity (e.g. a 30% range read as 60%) and wrongly
+  // prices the index out against a full scan.
+  if (equality_keys != 0 && result.Rows() < equality_rows) {
+    const size_t difference = equality_rows - result.Rows();
+    const size_t estimate = equality_rows - (difference / 2) - (difference % 2);
+    result = result.ScaleCardinality(estimate);
+  }
+  return result;
 }
 
 double PrefixFrequency(const TableStatistics& statistics, const Index& index,
@@ -135,7 +166,7 @@ double PrefixFrequency(const TableStatistics& statistics, const Index& index,
   if (statistics.Rows() == 0 || key.empty()) {
     return 0.0;
   }
-  double rows = static_cast<double>(statistics.Rows());
+  auto rows = static_cast<double>(statistics.Rows());
   const size_t prefix_size = std::min(key.size(), index.sc_.key_.size());
   for (size_t i = 0; i < prefix_size; ++i) {
     const slot_t slot = index.sc_.key_[i];
@@ -195,8 +226,7 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
       index_(index),
       stats_(begin_key.empty() && end_key.empty()
                  ? ts
-                 : ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
-                                  FirstOrNull(end_key))),
+                 : IndexRangeStats(ts, index, begin_key, end_key)),
       begin_key_(std::move(begin_key)),
       end_key_(std::move(end_key)),
       ascending_(ascending),

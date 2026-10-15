@@ -16,7 +16,9 @@
 
 #include "page/leaf_page.hpp"
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <sstream>
@@ -30,6 +32,7 @@
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
+#include "page/leaf_page_fuzzer.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "page/page_type.hpp"
@@ -72,7 +75,7 @@ class LeafPageTest : public ::testing::Test {
 
   void TearDown() override {
     std::ignore = std::remove(db_name_.c_str());
-    std::ignore = std::remove(log_name_.c_str());
+    tinylamb::RemoveLogAndSegments(log_name_);
   }
 
   std::string db_name_;
@@ -996,6 +999,11 @@ TEST_F(LeafPageTest, ImplOperationsAreIdempotent) {
   ASSERT_EQ(page->body.leaf_page.RowCount(), 1);
   ASSIGN_OR_ASSERT_FAIL(std::string_view, v2, page->Read(txn, "k2"));
   EXPECT_EQ(v2, "v2");
+}
+
+TEST(LeafPageFuzzerRegression, CrashBeforeFirstCommitRecoversLeaf) {
+  static constexpr std::array<std::uint8_t, 2> input{0x7d, 0xda};
+  Try(input.data(), input.size(), false);
 }
 
 }  // namespace tinylamb

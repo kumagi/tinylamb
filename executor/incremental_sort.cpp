@@ -18,6 +18,7 @@
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -43,7 +44,11 @@ bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
       }
       return false;
     }
-    return va_or.Value() == vb_or.Value();
+    // Peers must collapse the way the ordering groups them, so a
+    // case-insensitive prefix key starts a new run at 'a' vs 'A' instead of
+    // treating the already-sorted run as a single group. A binary prefix key
+    // keeps Value's equality.
+    return EqualUnderCollation(va_or.Value(), vb_or.Value());
   });
 }
 

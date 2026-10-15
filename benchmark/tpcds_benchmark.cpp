@@ -304,7 +304,7 @@ size_t MetricValue(std::string_view text, std::string_view metric) {
   size_t value = 0;
   while (position < text.size() && text[position] >= '0' &&
          text[position] <= '9') {
-    value = value * 10 + static_cast<size_t>(text[position] - '0');
+    value = (value * 10) + static_cast<size_t>(text[position] - '0');
     ++position;
   }
   return value;

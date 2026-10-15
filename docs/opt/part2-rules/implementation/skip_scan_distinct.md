@@ -93,16 +93,14 @@ graph TD
           Plan skip_scan = std::make_shared<SkipScanDistinctPlan>(
               *table, index, index_only->GetStats(), index_only->IsAscending(),
               std::move(select_items), scan_schema);
-          const double rows = std::max<double>(
-              1.0,
-              static_cast<double>(index_only->GetStats().Column(0).Distinct()));
+          const double rows = index_only->GetStats().EstimateDistinctRows({0});
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(skip_scan),
                               .local_cost = rows,
                               .estimated_rows = rows}};
 ```
 
-局所コスト（`local_cost`）および推定行数（`estimated_rows`）には、入力行数 $N$ ではなく、対象列の統計情報における異なり数（NDV: Number of Distinct Values）を採用します（統計欠落時は下限値 1.0）。各キー値につき 1 回のツリーシークが発生するため、コストを NDV に比例させるモデルとなっています。
+局所コスト（`local_cost`）および推定行数（`estimated_rows`）には、入力行数 $N$ ではなく、対象列の統計情報における異なり数（NDV: Number of Distinct Values）を採用します（NULL を一値として含め、統計欠落時は入力行数へ退縮）。各キー値につき 1 回のツリーシークが発生するため、コストを NDV に比例させるモデルとなっています。
 
 さらに、`SkipScanDistinctPlan::IsOrderedBy` は昇順スキャンの場合に「対象列の昇順順序」を物理プロパティとして申告します。これにより、上位の `ORDER BY a` クエリに対して追加のソートノード挿入を不要とします。
 
@@ -120,3 +118,9 @@ graph TD
 
 - `plan/plan_extra_test.cpp`:
   - `SkipScanDistinctPlanExtraTest.StatsDrivenRowCountsAndOrdering`: `SkipScanDistinctPlan` が統計に基づく NDV 行数見積もりと昇順順序プロパティを正しく申告することを検証。
+
+
+2026-10-02 更新: DISTINCT の子にも無制約 index-only scan を候補として渡します。
+統計は scan の出力列順に既に射影されているので、元表の slot 番号ではなく
+列 0 の NDV を読みます。`DistinctUsesProjectedKeysAndStatistics` は元表の第2列を
+対象にし、この取り違えを検出します。

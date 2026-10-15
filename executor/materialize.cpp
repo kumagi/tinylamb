@@ -42,7 +42,7 @@ void MaterializeExecutor::EnsureMaterialized() {
   charge_.Add(est_bytes);
   // Latch only after the drain completed: a child that throws mid-drain must
   // leave the executor unmaterialized so a retry does not serve a truncated
-  // result (same contract as ExchangeExecutor::EnsureMaterialized).
+  // result.
   materialized_ = true;
 }
 

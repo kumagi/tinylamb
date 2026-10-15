@@ -147,6 +147,7 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 - [x] `DATE_ADD(date, INTERVAL n unit)`
 - [x] `DATE_SUB(date, INTERVAL n unit)`
 - [x] `DATE_DIFF(date1, date2, unit)`
+- [x] Binary `DATE ± INTERVAL`, `DATE ± INT64` (days), `INT64 + DATE`, `DATE - DATE` → day count
 - [x] `DATE_TRUNC(date, unit)`
 - [x] `EXTRACT(part FROM date_or_timestamp)` for `YEAR`, `MONTH`, `DAY`, `DAYOFWEEK`, `DAYOFYEAR`, `QUARTER`, `HOUR`, `MINUTE`, `SECOND`
 - [x] `FORMAT_DATE(format_string, date)`
@@ -179,14 +180,21 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 - [x] `INSERT INTO table SELECT ...` (insert from query)
 - [x] `UPDATE table SET col = expr WHERE condition`
 - [x] `DELETE FROM table WHERE condition`
-- [ ] DML `RETURNING` clause support (`INSERT/UPDATE/DELETE ... RETURNING col1, col2`)
+- [x] DML `RETURNING` clause support (`INSERT/UPDATE/DELETE ... RETURNING col1, col2`)
+- [x] `MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED [BY TARGET|BY SOURCE]
+      THEN UPDATE|DELETE|INSERT` (implemented 2026-10-07: source
+      materialization + per-row classification in `SqlEngine::ExecuteMerge`,
+      BigQuery clause semantics, FK NO ACTION enforced; `query/merge_test.cpp`)
+- [x] `TRUNCATE TABLE` (implemented 2026-10-07: desugars to an unconditional
+      DELETE; physical page-chain reset is a future transaction-layer
+      optimization)
 
 ---
 
 ### [ ] Phase 3: Complex Data Types (ARRAY & STRUCT) and UNNEST
 
 #### 3.1 Composite Type Representation in Type System
-- [ ] Introduce `Value::Array` representing dynamic vector of homogenous `Value`s
+- [x] Introduce `Value::Array` representing dynamic vector of homogenous `Value`s
 - [ ] Introduce `Value::Struct` representing ordered tuple of named/unnamed `Value`s
 - [ ] Type serialization/deserialization for `ARRAY` and `STRUCT`
 - [ ] Nullability and empty array semantics (`[]` vs `NULL`)
@@ -206,25 +214,31 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 - [ ] Safe array ordinal accessor: `array_expr[SAFE_ORDINAL(n)]`
 
 #### 3.4 Array Construction & Manipulation Functions
-- [ ] `ARRAY_CONCAT(arr1, arr2, ...)`
-- [ ] `ARRAY_LENGTH(arr)`
-- [ ] `ARRAY_TO_STRING(arr, delimiter[, null_text])`
-- [ ] `GENERATE_ARRAY(start, end[, step])`
-- [ ] `GENERATE_DATE_ARRAY(start_date, end_date[, INTERVAL n unit])`
-- [ ] `ARRAY_REVERSE(arr)`
+- [x] `ARRAY_CONCAT(arr1, arr2, ...)`
+- [x] `ARRAY_LENGTH(arr)`
+- [x] `ARRAY_TO_STRING(arr, delimiter[, null_text])`
+- [x] `GENERATE_ARRAY(start, end[, step])`
+- [x] `GENERATE_DATE_ARRAY(start_date, end_date[, INTERVAL n unit])`
+- [x] `ARRAY_REVERSE(arr)`
 
 #### 3.5 UNNEST Operator & Relational Flattening
-- [ ] AST translation for `FROM UNNEST(array_expr) [AS alias]`
+- [x] AST translation for `FROM UNNEST(array_expr) [AS alias]`
 - [x] `UnnestPlan` relational plan node in `plan/`
 - [x] `UnnestExecutor` physical iterator in `executor/`
-- [ ] `WITH OFFSET [AS offset_alias]` support in `UNNEST`
-- [ ] Lateral/Correlated join with `UNNEST`: `FROM table t, UNNEST(t.array_col) a`
-- [ ] `LEFT JOIN UNNEST(...) ON ...` outer unnesting semantics
+- [x] `WITH OFFSET [AS offset_alias]` support in `UNNEST`
+      (verified 2026-10-06: pseudo-column ORDER BY / `AS` alias both pinned
+      in `query/query_test.cpp`; implicit field-path unnest also takes
+      `WITH OFFSET`)
+- [x] Lateral/Correlated join with `UNNEST`: `FROM table t, UNNEST(t.array_col) a`
+      (verified 2026-10-06: compliance `unnest_queries.test` covers
+      `LEFT JOIN UNNEST(t.arr)` and correlated forms)
+- [x] `LEFT JOIN UNNEST(...) ON ...` outer unnesting semantics
+      (verified 2026-10-06: compliance `unnest_queries.test`)
 
 #### 3.6 Collection Aggregation
-- [ ] `ARRAY_AGG(expr [ORDER BY ...] [LIMIT ...])` aggregate function
-- [ ] `ARRAY_CONCAT_AGG(arr [ORDER BY ...] [LIMIT ...])` aggregate function
-- [ ] `STRING_AGG(str[, delimiter] [ORDER BY ...] [LIMIT ...])` aggregate function
+- [x] `ARRAY_AGG(expr [ORDER BY ...] [LIMIT ...])` aggregate function
+- [x] `ARRAY_CONCAT_AGG(arr [ORDER BY ...] [LIMIT ...])` aggregate function
+- [x] `STRING_AGG(str[, delimiter] [ORDER BY ...] [LIMIT ...])` aggregate function
 
 ---
 
@@ -241,20 +255,20 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 - [x] Parenthesized set operation subtrees: `(SELECT ...) UNION ALL (SELECT ...)`
 
 #### 4.2 Advanced CTE (`WITH`) Scoping & Recursion
-- [ ] Multi-statement CTE resolution (`WITH q1 AS (...), q2 AS (...) SELECT ...`)
-- [ ] Scalar subquery with local `WITH` clause: `SELECT (WITH q AS (...) SELECT x FROM q)`
-- [ ] `IN` subquery with local `WITH` clause: `WHERE x IN (WITH q AS (...) SELECT y FROM q)`
+- [x] Multi-statement CTE resolution (`WITH q1 AS (...), q2 AS (...) SELECT ...`)
+- [x] Scalar subquery with local `WITH` clause: `SELECT (WITH q AS (...) SELECT x FROM q)`
+- [x] `IN` subquery with local `WITH` clause: `WHERE x IN (WITH q AS (...) SELECT y FROM q)`
 - [ ] Forward reference prevention and shadowing rules in nested CTEs
-- [ ] `WITH RECURSIVE` fixed-point iteration for recursive CTEs
+- [x] `WITH RECURSIVE` fixed-point iteration for recursive CTEs
 
 #### 4.3 Correlated Subqueries & Query Expressions
-- [ ] Multi-column `IN` subqueries: `WHERE (a, b) IN (SELECT x, y FROM t)`
-- [ ] `EXISTS` and `NOT EXISTS` subqueries with deep correlation
-- [ ] Scalar subqueries returning 0 rows (evaluated to `NULL`)
-- [ ] Scalar subqueries returning >1 row (runtime cardinality check error)
-- [ ] `QUALIFY` clause for filtering over windowed expressions
-- [ ] `GROUP BY ALL` automatic grouping column derivation
-- [ ] `GROUPING SETS`, `ROLLUP`, and `CUBE` multidimensional aggregation
+- [x] Multi-column `IN` subqueries: `WHERE (a, b) IN (SELECT x, y FROM t)`
+- [x] `EXISTS` and `NOT EXISTS` subqueries with deep correlation
+- [x] Scalar subqueries returning 0 rows (evaluated to `NULL`)
+- [x] Scalar subqueries returning >1 row (runtime cardinality check error)
+- [x] `QUALIFY` clause for filtering over windowed expressions
+- [x] `GROUP BY ALL` automatic grouping column derivation
+- [x] `GROUPING SETS`, `ROLLUP`, and `CUBE` multidimensional aggregation
 
 ---
 
@@ -297,19 +311,23 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 
 #### 6.1 JSON Data Type & Functions
 - [ ] Native `Value::Json` representation
-- [ ] `JSON_VALUE(json_expr, json_path)`
-- [ ] `JSON_QUERY(json_expr, json_path)`
-- [ ] `JSON_EXTRACT(json_expr, json_path)`
-- [ ] `JSON_EXTRACT_SCALAR(json_expr, json_path)`
-- [ ] `TO_JSON_STRING(value)`
-- [ ] `PARSE_JSON(json_string)`
+- [x] `JSON_VALUE(json_expr, json_path)`
+- [x] `JSON_QUERY(json_expr, json_path)`
+- [x] `JSON_EXTRACT(json_expr, json_path)`
+- [x] `JSON_EXTRACT_SCALAR(json_expr, json_path)`
+- [x] `TO_JSON_STRING(value)`
+- [x] `PARSE_JSON(json_string)` (strict RFC 8259 validation; JSON stays in the
+      engine's string representation)
 
 #### 6.2 Precise Decimals & Binary Data
 - [ ] `NUMERIC` (128-bit fixed-point decimal, 38 digits precision, 9 scale)
 - [ ] `BIGNUMERIC` (256-bit fixed-point decimal, 76 digits precision, 38 scale)
 - [ ] `BYTES` literal support: `b"..."` and `B'...'`
-- [ ] Binary encoding/decoding: `TO_HEX`, `FROM_HEX`, `TO_BASE64`, `FROM_BASE64`
-- [ ] Hash functions: `MD5`, `SHA1`, `SHA256`, `SHA512`, `FARM_FINGERPRINT`
+- [x] Binary encoding/decoding: `TO_HEX`, `FROM_HEX`, `TO_BASE64`, `FROM_BASE64`
+- [x] Hash functions: `MD5`, `SHA1`, `SHA256`, `SHA512` (raw-byte digests; wrap with `TO_HEX` for hex text)
+- [ ] `FARM_FINGERPRINT` (implemented 2026-10-05: bit-exact port of
+      farmhashna::Hash64 / Fingerprint64 in `common/digest.hpp`, verified
+      against the reference implementation)
 
 #### 6.3 Timezone & Civil Time
 - [ ] `TIMESTAMP WITH TIME ZONE` support
@@ -321,8 +339,8 @@ Comprehensive, granular implementation roadmap to achieve 100% pass rate on all 
 #### 6.4 Table-Valued Functions (TVF) & Advanced Syntaxes
 - [ ] Table-Valued Function (TVF) invocation syntax
 - [ ] Time-window TVFs: `TUMBLE(...)`, `HOP(...)`
-- [ ] PIVOT / UNPIVOT relational operators
-- [ ] Pipe syntax operators (`|> WHERE ... |> AGGREGATE ...`)
+- [x] PIVOT / UNPIVOT relational operators
+- [x] Pipe syntax core operators (`FROM t |> WHERE/SELECT/AGGREGATE/ORDER BY/LIMIT/JOIN/set-ops/AS`; `DROP/RENAME/SET/EXTEND/CALL/PIVOT/TABLESAMPLE` pipes are parsed but rejected loudly)
 
 ---
 

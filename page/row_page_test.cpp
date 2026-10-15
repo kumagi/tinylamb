@@ -16,11 +16,17 @@
 
 #include "page/row_page.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <chrono>
 #include <cstddef>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -36,6 +42,20 @@
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
+namespace {
+
+void ForceRowPageWalFailure(Logger* logger) {
+  const int full_fd = ::open("/dev/full", O_WRONLY);
+  ASSERT_GE(full_fd, 0);
+  ASSERT_EQ(::dup2(full_fd, logger->Fd()), logger->Fd());
+  ASSERT_EQ(::close(full_fd), 0);
+  std::ignore = logger->AddLog("dead");
+  ASSERT_NE(logger->WaitForDurable(logger->BufferedLSN()), Status::kSuccess);
+  ASSERT_TRUE(logger->Failed());
+}
+
+}  // namespace
+
 TEST(ConstructTest, constrct) {
   // Arrange
   Page test_page(0, PageType::kRowPage);
@@ -252,7 +272,7 @@ TEST_F(RowPageTest, RepeatedGrowingUpdatesPreserveAllRows) {
     const std::string expected =
         std::to_string(i) +
         std::string(i < kGrowingRows ? 80 : 60, i < kGrowingRows ? 'b' : 'a');
-    EXPECT_EQ(ReadRow(i), expected) << true << (i != 0);
+    EXPECT_EQ(ReadRow(i), expected) << (i != 0);
   }
 }
 
@@ -274,12 +294,11 @@ TEST_F(RowPageTest, ReusingManyHolesDoesNotOverwriteSlotArray) {
   ASSERT_GT(replacements, 0);
 
   for (int i = kDeletedRows; i < kRows; ++i) {
-    EXPECT_EQ(ReadRow(i), "original-" + std::to_string(i)) << true << (i != 0);
+    EXPECT_EQ(ReadRow(i), "original-" + std::to_string(i)) << (i != 0);
   }
   for (int i = 0; i < replacements; ++i) {
     const int slot = i < kDeletedRows ? i : kRows + i - kDeletedRows;
-    EXPECT_EQ(ReadRow(slot), replacement + std::to_string(i))
-        << true << (slot != 0);
+    EXPECT_EQ(ReadRow(slot), replacement + std::to_string(i)) << (slot != 0);
   }
 }
 
@@ -416,22 +435,23 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
     ASSERT_TRUE(InsertRow(std::string(2000, 'a')));
   }
 
+  std::unique_ptr<Transaction> txn;
   // Act 1 -- an uncommitted transaction shrinks slot 0, freeing ~1900 bytes.
   {
-    auto txn = tm_->Begin();
+    txn = std::make_unique<Transaction>(tm_->Begin());
     PageRef page = p_->GetPage(page_id_).MoveValue();
-    ASSERT_SUCCESS(page->Update(txn, 0, std::string(100, 'b')));
+    ASSERT_SUCCESS(page->Update(*txn, 0, std::string(100, 'b')));
     page.PageUnlock();
     // Deliberately never commit or abort: recovery must roll it back.
   }
 
   // Act 2 -- a second, committed transaction consumes the freed space.
   {
-    auto txn = tm_->Begin();
+    auto consumer = tm_->Begin();
     PageRef page = p_->GetPage(page_id_).MoveValue();
-    StatusOr<slot_t> slot = page->Insert(txn, std::string(1900, 'c'));
+    StatusOr<slot_t> slot = page->Insert(consumer, std::string(1900, 'c'));
     ASSERT_SUCCESS(slot.GetStatus());
-    ASSERT_SUCCESS(txn.PreCommit());
+    ASSERT_SUCCESS(consumer.PreCommit());
   }
 
   // Act 3 -- flush the page image, then crash and recover from the log.
@@ -442,7 +462,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
   // Assert -- the page layout must stay intact: free_ptr_ never drops below
   // the slot array end, every live row must sit fully inside the page body,
   // and no live row may be lost.
-  auto txn = tm_->Begin();
+  auto probe = tm_->Begin();
   PageRef page = p_->GetPage(page_id_).MoveValue();
   const RowPage& rp = page.GetRowPage();
   const char* const body = reinterpret_cast<const char*>(&rp);
@@ -466,11 +486,11 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
   // stays readable without any structural damage.
   (void)ReadRow(0);
   for (int i = 1; i < 16; ++i) {
-    EXPECT_EQ(ReadRow(i), std::string(2000, 'a')) << true << (i != 0);
+    EXPECT_EQ(ReadRow(i), std::string(2000, 'a')) << (i != 0);
   }
   bool found_committed_insert = false;
   {
-    auto probe = tm_->Begin();
+    auto insert_probe = tm_->Begin();
     PageRef scan = p_->GetPage(page_id_).MoveValue();
     const RowPage& body_rp = scan.GetRowPage();
     for (slot_t i = 0; i < body_rp.RowMax(); ++i) {
@@ -480,8 +500,8 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
       }
     }
     scan.PageUnlock();
-    EXPECT_SUCCESS(probe.PreCommit());
-    probe.CommitWait();
+    EXPECT_SUCCESS(insert_probe.PreCommit());
+    insert_probe.CommitWait();
   }
   EXPECT_TRUE(found_committed_insert);
 }
@@ -502,11 +522,12 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
     ASSERT_TRUE(InsertRow(std::string(2000, 'a')));
   }
 
+  std::unique_ptr<Transaction> txn;
   // Act 1 -- an uncommitted transaction deletes slot 0, freeing 2000 bytes.
   {
-    auto txn = tm_->Begin();
+    txn = std::make_unique<Transaction>(tm_->Begin());
     PageRef page = p_->GetPage(page_id_).MoveValue();
-    ASSERT_SUCCESS(page->Delete(txn, 0));
+    ASSERT_SUCCESS(page->Delete(*txn, 0));
     page.PageUnlock();
     // Deliberately never commit or abort: recovery must roll it back.
   }
@@ -514,10 +535,11 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
   // Act 2 -- a second, committed transaction grows a different row (slot 15,
   // a position txn 1 does not lock) to consume the freed ~1900 bytes.
   {
-    auto txn = tm_->Begin();
+    auto consumer = tm_->Begin();
     PageRef page = p_->GetPage(page_id_).MoveValue();
-    ASSERT_SUCCESS(page->Update(txn, 15, std::string(3900, 'c')));
-    ASSERT_SUCCESS(txn.PreCommit());
+    ASSERT_SUCCESS(page->Update(consumer, 15, std::string(3900, 'c')));
+    page.PageUnlock();
+    ASSERT_SUCCESS(consumer.PreCommit());
   }
 
   // Act 3 -- flush the page image, then crash and recover from the log.
@@ -527,7 +549,7 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
 
   // Assert -- the page layout must stay intact: free_ptr_ never drops below
   // the slot array end, every live row must sit fully inside the page body.
-  auto txn = tm_->Begin();
+  auto probe = tm_->Begin();
   PageRef page = p_->GetPage(page_id_).MoveValue();
   const RowPage& rp = page.GetRowPage();
   const char* const body = reinterpret_cast<const char*>(&rp);
@@ -550,19 +572,20 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
   // applied, all untouched rows keep their committed images, and T2's grown
   // row survives.
   {
-    auto probe = tm_->Begin();
+    auto delete_probe = tm_->Begin();
     PageRef scan = p_->GetPage(page_id_).MoveValue();
-    EXPECT_EQ(scan->Read(probe, 0).GetStatus(), Status::kNotExists);
+    EXPECT_EQ(scan->Read(delete_probe, 0).GetStatus(), Status::kNotExists);
     for (int i = 1; i < 15; ++i) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, value,
-                            scan->Read(probe, static_cast<slot_t>(i)));
-      EXPECT_EQ(value, std::string(2000, 'a')) << true << (i != 0);
+                            scan->Read(delete_probe, static_cast<slot_t>(i)));
+      EXPECT_EQ(value, std::string(2000, 'a')) << (i != 0);
     }
-    ASSIGN_OR_ASSERT_FAIL(std::string_view, grown, scan->Read(probe, 15));
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, grown,
+                          scan->Read(delete_probe, 15));
     EXPECT_EQ(grown, std::string(3900, 'c'));
     scan.PageUnlock();
-    EXPECT_SUCCESS(probe.PreCommit());
-    probe.CommitWait();
+    EXPECT_SUCCESS(delete_probe.PreCommit());
+    delete_probe.CommitWait();
   }
 }
 
@@ -632,6 +655,124 @@ TEST_F(RowPageTest, ConflictedInsertConsumesNoPhysicalSlot) {
     txn.CommitWait();
   }
   EXPECT_EQ(ReadRow(0), "real");
+}
+
+// Round 9 regression: a hole whose deleting transaction is STILL PENDING
+// must not park the inserter. The insert runs under the page's exclusive
+// content latch, and the old blocking AddWriteSet held that latch while
+// riding the full write-intent wait -- the aborting deleter needs the very
+// latch for its undo walk, so the pair formed the latch x intent cycle that
+// only the multi-second escape hatch could break. The insert now treats the
+// foreign hole's bytes as locked and takes a fresh slot instead.
+TEST_F(RowPageTest, InsertDoesNotWaitForForeignPendingHole) {
+  // Commit row 0, then stage its delete in a still-running transaction:
+  // the hole keeps the deleter's write intent until it resolves.
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_).MoveValue();
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, "victim"));
+    ASSERT_EQ(slot, 0U);
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  auto deleter = tm_->Begin();
+  {
+    PageRef page = p_->GetPage(page_id_).MoveValue();
+    ASSERT_SUCCESS(page->Delete(deleter, 0));
+  }
+  // Single-threaded on purpose: nothing will ever release the deleter's
+  // intent, so any completion proves the insert did not wait for it.
+  const auto start = std::chrono::steady_clock::now();
+  slot_t inserted = 0;
+  {
+    auto inserter = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_).MoveValue();
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(inserter, "late"));
+    inserted = slot;
+    ASSERT_SUCCESS(inserter.PreCommit());
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_LT(elapsed, std::chrono::seconds(2));
+  EXPECT_NE(inserted, 0U);
+  // The deleter's abort must still put its row back.
+  ASSERT_SUCCESS(tm_->Abort(deleter));
+  EXPECT_EQ(ReadRow(0), "victim");
+}
+
+TEST_F(RowPageTest, FailedInsertWalCannotPublishGhostVersion) {
+  ForceRowPageWalFailure(l_.get());
+  {
+    Transaction writer = tm_->Begin();
+    PageRef writer_page = p_->GetPage(page_id_).MoveValue();
+    const StatusOr<slot_t> inserted = writer_page->Insert(writer, "ghost");
+    ASSERT_NE(inserted.GetStatus(), Status::kSuccess);
+    EXPECT_TRUE(writer.IsFailed());
+    writer_page.PageUnlock();
+    EXPECT_NE(writer.PreCommit(), Status::kSuccess);
+    EXPECT_TRUE(writer.IsFinished());
+  }
+
+  Recover();
+  ASSERT_NO_FATAL_FAILURE(r_->RecoverFrom(0, tm_.get()));
+  EXPECT_EQ(p_->GetPage(page_id_).MoveValue()->RowCount(), 0U);
+  EXPECT_FALSE(tm_->HasVersionChain(RowPosition(page_id_, 0)));
+
+  Transaction reader = tm_->Begin(true);
+  PageRef reader_page = p_->GetPage(page_id_).MoveValue();
+  EXPECT_EQ(reader_page->Read(reader, 0).GetStatus(), Status::kNotExists);
+  reader_page.PageUnlock();
+  EXPECT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(RowPageTest, FailedUpdateWalRestoresPhysicalAndCancelsVersion) {
+  ASSERT_TRUE(InsertRow("durable"));
+  ForceRowPageWalFailure(l_.get());
+  {
+    Transaction writer = tm_->Begin();
+    PageRef writer_page = p_->GetPage(page_id_).MoveValue();
+    ASSERT_NE(writer_page->Update(writer, 0, "discarded"), Status::kSuccess);
+    EXPECT_TRUE(writer.IsFailed());
+    EXPECT_EQ(writer_page->body.row_page.GetRow(0), "durable");
+    writer_page.PageUnlock();
+    EXPECT_EQ(tm_->DebugDumpVersionChains(page_id_).find("/staged"),
+              std::string::npos);
+    EXPECT_NE(writer.PreCommit(), Status::kSuccess);
+    EXPECT_TRUE(writer.IsFinished());
+  }
+
+  Recover();
+  ASSERT_NO_FATAL_FAILURE(r_->RecoverFrom(0, tm_.get()));
+  Transaction reader = tm_->Begin(true);
+  PageRef reader_page = p_->GetPage(page_id_).MoveValue();
+  EXPECT_EQ(reader_page->body.row_page.GetRow(0), "durable");
+  ASSERT_SUCCESS_AND_EQ(reader_page->Read(reader, 0), "durable");
+  reader_page.PageUnlock();
+  EXPECT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(RowPageTest, FailedDeleteWalCancelsTombstoneVersion) {
+  ASSERT_TRUE(InsertRow("durable"));
+  ForceRowPageWalFailure(l_.get());
+  {
+    Transaction writer = tm_->Begin();
+    PageRef writer_page = p_->GetPage(page_id_).MoveValue();
+    ASSERT_NE(writer_page->Delete(writer, 0), Status::kSuccess);
+    EXPECT_TRUE(writer.IsFailed());
+    EXPECT_EQ(writer_page->body.row_page.GetRow(0), "durable");
+    writer_page.PageUnlock();
+    EXPECT_EQ(tm_->DebugDumpVersionChains(page_id_).find("/staged"),
+              std::string::npos);
+    EXPECT_NE(writer.PreCommit(), Status::kSuccess);
+    EXPECT_TRUE(writer.IsFinished());
+  }
+
+  Recover();
+  ASSERT_NO_FATAL_FAILURE(r_->RecoverFrom(0, tm_.get()));
+  Transaction reader = tm_->Begin(true);
+  PageRef reader_page = p_->GetPage(page_id_).MoveValue();
+  EXPECT_EQ(reader_page->body.row_page.GetRow(0), "durable");
+  ASSERT_SUCCESS_AND_EQ(reader_page->Read(reader, 0), "durable");
+  reader_page.PageUnlock();
+  EXPECT_SUCCESS(reader.PreCommit());
 }
 
 TEST_F(RowPageTest, InsertSkipsHoleReservedByConcurrentDelete) {

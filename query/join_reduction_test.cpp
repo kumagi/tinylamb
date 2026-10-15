@@ -75,14 +75,14 @@ TEST(JoinReductionTest, AndCombinationOfRejectingConjunctsReduces) {
   EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kInner);
 }
 
-TEST(JoinReductionTest, OneNullAcceptingConjunctKeepsLeftJoin) {
+TEST(JoinReductionTest, AndWithNullAcceptingConjunctStillRejectsPadding) {
   const std::unique_ptr<SelectStatement> statement = ParseSelect(
       "SELECT c.customer_id, o.order_id FROM customers c LEFT JOIN orders o "
       "ON c.customer_id = o.customer_id "
       "WHERE o.amount >= 60 AND o.amount IS NULL");
   ASSERT_NE(statement, nullptr);
-  EXPECT_FALSE(ReduceOuterJoins(statement.get()));
-  EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kLeft);
+  EXPECT_TRUE(ReduceOuterJoins(statement.get()));
+  EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kInner);
 }
 
 TEST(JoinReductionTest, NotWrappingRejectingPredicateReduces) {
@@ -121,6 +121,35 @@ TEST(JoinReductionTest, MissingWhereClauseIsNoOp) {
   const std::unique_ptr<SelectStatement> statement = ParseSelect(
       "SELECT c.customer_id, o.order_id FROM customers c LEFT JOIN orders o "
       "ON c.customer_id = o.customer_id");
+  ASSERT_NE(statement, nullptr);
+  EXPECT_FALSE(ReduceOuterJoins(statement.get()));
+  EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kLeft);
+}
+
+TEST(JoinReductionTest, RightNullRejectingWhereReducesRightJoin) {
+  const std::unique_ptr<SelectStatement> statement = ParseSelect(
+      "SELECT c.customer_id FROM customers c RIGHT JOIN orders o "
+      "ON c.customer_id = o.customer_id WHERE c.name = 'x'");
+  ASSERT_NE(statement, nullptr);
+  EXPECT_TRUE(ReduceOuterJoins(statement.get()));
+  EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kInner);
+}
+
+TEST(JoinReductionTest, FullNonRejectingFilterKeepsFullJoin) {
+  const std::unique_ptr<SelectStatement> statement = ParseSelect(
+      "SELECT c.customer_id FROM customers c FULL JOIN orders o "
+      "ON c.customer_id = o.customer_id "
+      "WHERE COALESCE(o.amount, 0) = 0");
+  ASSERT_NE(statement, nullptr);
+  EXPECT_FALSE(ReduceOuterJoins(statement.get()));
+  EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kFull);
+}
+
+TEST(JoinReductionTest, ComplexNullAcceptingFilterKeepsLeftJoin) {
+  const std::unique_ptr<SelectStatement> statement = ParseSelect(
+      "SELECT c.customer_id FROM customers c LEFT JOIN orders o "
+      "ON c.customer_id = o.customer_id "
+      "WHERE (o.amount >= 60 AND c.name = 'x') IS NOT NULL");
   ASSERT_NE(statement, nullptr);
   EXPECT_FALSE(ReduceOuterJoins(statement.get()));
   EXPECT_EQ(statement->Sources()[1].join_type, JoinType::kLeft);

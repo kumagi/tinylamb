@@ -17,21 +17,18 @@
 #ifndef TINYLAMB_BLOB_FILE_HPP
 #define TINYLAMB_BLOB_FILE_HPP
 
+#include <atomic>
 #include <cstddef>
-#include <cstring>
 #include <filesystem>
-#include <map>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <vector>
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "index/lsm_detail/cache.hpp"
-#include "recovery/logger.hpp"
 
 namespace tinylamb {
 
@@ -47,40 +44,18 @@ class BlobFile final {
   BlobFile(const BlobFile& o) = delete;
   BlobFile& operator=(BlobFile&& o) = delete;
   BlobFile& operator=(const BlobFile& o) = delete;
-  ~BlobFile() = default;
+  ~BlobFile();
 
   [[nodiscard]] StatusOr<std::string> ReadAt(size_t offset,
                                              size_t length) const;
   [[nodiscard]] StatusOr<Cache::Locks> ReadAt(size_t offset,
                                               std::string_view& out) const;
   StatusOr<lsn_t> Append(std::string_view payload);
-  [[nodiscard]] lsn_t Written() const { return file_writer_->CommittedLSN(); }
-  [[nodiscard]] Status Flush() const {
-    const Logger* writer = file_writer_.get();
-    const lsn_t lsn = writer->BufferedLSN();
-    while (writer->CommittedLSN() < lsn) {
-      // A dead writer would stall this loop forever; surface its error.
-      if (writer->Failed()) {
-        return StatusError(
-            StatusCode::kIOError,
-            "BlobFile flush failed: " +
-                std::string(std::strerror(writer->ErrorNumber())));
-      }
-      std::this_thread::yield();
-    }
-    return Status::kSuccess;
+  [[nodiscard]] lsn_t Written() const {
+    return written_.load(std::memory_order_acquire);
   }
-  // Write-wait (as Flush) plus a durability wait: every byte referenced by a
-  // freshly flushed run must survive fdatasync BEFORE the run is registered.
-  // SortedRun::FlushInternal fsyncs the run file itself, but without this a
-  // crash between that fsync and the blob's own group-commit window leaves a
-  // durable run pointing at torn blob payloads (quarantined on restore:
-  // acknowledged writes lost). Called by LSMTree::Sync, not by readers, so
-  // the read path keeps its write-only wait.
-  Status Sync() {
-    RETURN_IF_FAIL(Flush());
-    return file_writer_->WaitForDurable(file_writer_->BufferedLSN());
-  }
+  [[nodiscard]] Status Flush() const;
+  Status Sync();
 
   friend std::ostream& operator<<(std::ostream& o, const BlobFile& b) {
     o << "BlobFile(written=" << b.Written() << ", cache=" << *b.cache_ << ")";
@@ -88,13 +63,14 @@ class BlobFile final {
   }
 
  private:
-  BlobFile(std::unique_ptr<Logger> file_writer, std::unique_ptr<Cache> cache);
+  BlobFile(int fd, lsn_t written, size_t max_filesize,
+           std::unique_ptr<Cache> cache);
 
-  // Member order matters: `file_writer_` owns the fd, `cache_` only borrows
-  // it (Cache never closes), so the Logger is the sole closer of the file.
-  std::unique_ptr<Logger> file_writer_;
+  int fd_ = -1;
+  std::atomic<lsn_t> written_{0};
+  size_t max_filesize_ = 0;
   std::unique_ptr<Cache> cache_;
-  std::mutex writer_lock_;
+  mutable std::mutex writer_lock_;
 };
 
 }  // namespace tinylamb

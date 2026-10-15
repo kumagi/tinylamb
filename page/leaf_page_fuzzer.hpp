@@ -44,12 +44,13 @@ namespace tinylamb {
 // steer the exact key bytes and operation interleaving toward split /
 // slot-array edge cases AND the ARIES redo/undo path instead of guessing a
 // PRNG seed.
-void Try(const uint8_t* data, size_t size, bool verbose) {
+inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::string db_name = RandomString();
   std::string log_name = db_name + ".log";
-  std::remove(db_name.c_str());
-  std::remove(log_name.c_str());
+  // Best-effort cleanup: ENOENT is expected on a fresh run.
+  (void)std::remove(db_name.c_str());
+  (void)std::remove(log_name.c_str());
   std::unique_ptr<LockManager> lm;
   std::unique_ptr<PageManager> page_manager;
   std::unique_ptr<Logger> logger;
@@ -64,10 +65,19 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
                                               rm.get());
   };
   Open();
+  page_id_t page_id = 0;
+  {
+    Transaction setup_txn = tm->Begin();
+    PageRef setup_page =
+        page_manager->AllocateNewPage(setup_txn, PageType::kLeafPage)
+            .MoveValue();
+    page_id = setup_page->PageID();
+    if (setup_txn.PreCommit() != Status::kSuccess) {
+      LOG(FATAL) << "initial leaf page commit failed";
+    }
+  }
   Transaction txn = tm->Begin();
-  PageRef page =
-      page_manager->AllocateNewPage(txn, PageType::kLeafPage).MoveValue();
-  const page_id_t page_id = page->PageID();
+  PageRef page = page_manager->GetPage(page_id).MoveValue();
   // `model` tracks what the page should contain right now; `committed` is the
   // same map as of the last successful PreCommit, i.e. what MUST survive a
   // crash after ARIES redo+undo.
@@ -85,6 +95,7 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
         if (page->InsertLeaf(txn, key, value) == Status::kSuccess) {
           model[key] = value;
           ASSIGN_OR_CRASH(std::string_view, val, page->Read(txn, key));
+          static_cast<void>(val);
           assert(val == value);
         }
         break;
@@ -103,6 +114,7 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
       case 3: {  // Verify the whole model against the page.
         for (const auto& [key, value] : model) {
           ASSIGN_OR_CRASH(std::string_view, val, page->Read(txn, key));
+          static_cast<void>(val);
           assert(val == value);
         }
         break;
@@ -146,6 +158,7 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
         model = committed;
         for (const auto& [key, value] : model) {
           ASSIGN_OR_CRASH(std::string_view, val, page->Read(txn, key));
+          static_cast<void>(val);
           assert(val == value);
         }
         break;
@@ -158,8 +171,8 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
   page.PageUnlock();
   txn.Abort();
   // Remove the files only after every RAII handle above has closed them.
-  std::remove((db_name + ".db").c_str());
-  std::remove(log_name.c_str());
+  (void)std::remove((db_name + ".db").c_str());
+  (void)std::remove(log_name.c_str());
 }
 
 }  // namespace tinylamb

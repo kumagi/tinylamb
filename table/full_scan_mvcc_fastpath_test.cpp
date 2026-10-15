@@ -16,10 +16,12 @@
 
 // Visibility regression tests for the read-only MVCC fast path in
 // FullScanIterator (see PhysicalReadEligible in full_scan_iterator.cpp).
-// The fast path serves raw page bytes for pages whose PageLSN does not
-// exceed the reader snapshot's commit timestamp; these tests pin down that
-// such readers never observe a concurrent writer's post-snapshot change,
-// whether the page is served through the fast path or through the
+// The fast path serves raw page bytes for pages with no MVCC version chain
+// registered in TransactionManager::HasPageVersionChains: a page without
+// chains carries no in-flight or uncommitted mutation, so its bytes are a
+// committed state every snapshot may read directly.  These tests pin down
+// that such readers never observe a concurrent writer's post-snapshot
+// change, whether the page is served through the fast path or through the
 // ReadVersion fallback.
 
 #include <cstdint>
@@ -78,7 +80,8 @@ class FullScanMvccFastPathTest : public ::testing::Test {
   void TearDown() override { db_->DeleteAll(); }
 
   // Commits |count| empty write transactions so the stable commit timestamp
-  // grows past the early pages' PageLSN values.
+  // grows past the seeded page's write era (the fast path no longer compares
+  // PageLSN values, but the age still exercises the GC drop discipline).
   void AdvanceCommitClock(int count) {
     for (int i = 0; i < count; ++i) {
       TransactionContext bump = db_->BeginContext();
@@ -126,8 +129,46 @@ TEST_F(FullScanMvccFastPathTest, ConcurrentUpdateSameRowConflicts) {
       << "concurrent update acquired the intent another txn holds";
 }
 
-// A read-only scan over pages whose stamp qualifies for the physical path
-// must return exactly the seeded rows -- no more, no fewer, correct values.
+// A read-only scan over a page that qualifies for the physical path (no
+// version chain) must return exactly the seeded rows -- no more, no fewer,
+// correct values.
+TEST_F(FullScanMvccFastPathTest,
+       LockedScanFilterDoesNotReleasePreexistingIntent) {
+  TransactionContext seed = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              seed.GetTable("SampleTable"));
+  ASSERT_SUCCESS(
+      table->Insert(seed.txn_, Row({Value(0), Value("a"), Value(0.5)}))
+          .GetStatus());
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  TransactionContext owner = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, owner_table,
+                              owner.GetTable("SampleTable"));
+  RowPosition target;
+  Iterator locate = owner_table->BeginFullScan(owner.txn_);
+  ASSERT_TRUE(locate.IsValid());
+  target = locate.Position();
+  ASSERT_TRUE(owner.txn_.TryAddWriteSet(target));
+
+  const std::unordered_set<int64_t> key_filter{999};
+  TableScanOptions options;
+  options.key_filter = &key_filter;
+  options.key_column = 0;
+  options.lock_rows = true;
+  options.wait_for_write_intent = false;
+  Iterator scan = owner_table->BeginFullScan(owner.txn_, options);
+  while (scan.IsValid()) {
+    ++scan;
+  }
+  ASSERT_EQ(scan.GetStatus(), Status::kSuccess);
+
+  TransactionContext contender = db_->BeginContext();
+  EXPECT_FALSE(contender.txn_.TryAddWriteSet(target));
+  contender.Abort();
+  owner.Abort();
+}
+
 TEST_F(FullScanMvccFastPathTest,
        BeginFullScan_ReadOnlyScan_ReturnsSeededRowsVerbatim) {
   TransactionContext seed = db_->BeginContext();
@@ -209,6 +250,28 @@ TEST_F(FullScanMvccFastPathTest,
 
 // Same contract for deletions: an open read-only snapshot keeps seeing a
 // physically removed row; snapshots opened after the delete do not.
+TEST_F(FullScanMvccFastPathTest,
+       BeginFullScan_WhenUncommittedWriterPredatesReader_HidesItsUpdate) {
+  TransactionContext seed = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "SampleTable"));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, inserted,
+      table.Insert(seed.txn_, Row({Value(4), Value("old"), Value(0.4)})));
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  TransactionContext writer = db_->BeginContext();
+  ASSERT_TRUE(table
+                  .Update(writer.txn_, inserted,
+                          Row({Value(40), Value("pending"), Value(4.0)}))
+                  .HasValue());
+  AdvanceCommitClock(128);
+
+  TransactionContext reader = db_->BeginReadOnlyContext();
+  ASSERT_NO_FATAL_FAILURE(ExpectScannedKeys(table, reader.txn_, {4}));
+  ASSERT_SUCCESS(reader.PreCommit());
+  ASSERT_SUCCESS(writer.txn_.Abort());
+}
+
 TEST_F(
     FullScanMvccFastPathTest,
     BeginFullScan_WhenWriterDeletesRowAfterBegin_ReaderKeepsDeletedRowVisible) {

@@ -19,7 +19,8 @@
 
 namespace tinylamb {
 
-BitmapScanPlan::BitmapScanPlan(const Table& table, TableStatistics statistics,
+BitmapScanPlan::BitmapScanPlan(const Table& table,
+                               const TableStatistics& statistics,
                                std::vector<BitmapIndexRange> ranges,
                                BitmapCombine combine, Expression where,
                                size_t estimated_rows, size_t access_rows)

@@ -11,10 +11,12 @@
 #include "common/log_message.hpp"
 #include "recovery/log_record_fuzzer.hpp"
 
-static void TestCase(std::string_view input) {
+namespace {
+void TestCase(std::string_view input) {
   tinylamb::Try(reinterpret_cast<const uint8_t*>(input.data()), input.size(),
                 true);
 }
+}  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {

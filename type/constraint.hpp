@@ -19,7 +19,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "type/value.hpp"
 
@@ -68,6 +71,16 @@ struct Constraint {
   ConstraintType ctype{kNothing};
   Value value{};
 };
+
+// Canonical FOREIGN KEY reference payload carried in
+// `Constraint(kForeign, ...).value`: "table(col1,col2)".  A bare "table"
+// (no parenthesized list) is accepted for hand-built constraints and means
+// "referenced columns unknown".  Double quotes around the table name are
+// stripped on parse.
+std::string FormatForeignKeyReference(std::string_view table,
+                                      const std::vector<std::string>& columns);
+bool ParseForeignKeyReference(const Constraint& constraint, std::string* table,
+                              std::vector<std::string>* columns);
 
 }  // namespace tinylamb
 

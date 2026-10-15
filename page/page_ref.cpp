@@ -48,11 +48,17 @@ void PageRef::PageUnlock() {
   assert(page_);
   assert(pool_);
   if (exclusive_page_lock_.owns_lock()) {
+    // Read the page id while the latch is still held: Page::PageInit rewrites
+    // page_id under an exclusive latch, so reading it after unlock races a
+    // concurrent re-init of the same page (TSAN-observed in parallel recovery
+    // replay: PageInit write vs PageUnlock's unlocked PageID read).
+    const page_id_t id = page_->PageID();
     exclusive_page_lock_.unlock();
-    ReleasePin(pin_count_, page_->PageID());
+    ReleasePin(pin_count_, id);
   } else if (shared_page_lock_.owns_lock()) {
+    const page_id_t id = page_->PageID();
     shared_page_lock_.unlock();
-    ReleasePin(pin_count_, page_->PageID());
+    ReleasePin(pin_count_, id);
   }
 }
 

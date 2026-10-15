@@ -33,7 +33,9 @@
 #include "lsm_tree.hpp"
 namespace tinylamb {
 
-inline uint64_t Generate(size_t offset) { return offset * 19937 + 2147483647; }
+inline uint64_t Generate(size_t offset) {
+  return (offset * 19937) + 2147483647;
+}
 
 // Byte-driven LSM stress test.  The input directly encodes a Write / Delete /
 // Verify operation stream with key and value bytes taken from the same buffer,

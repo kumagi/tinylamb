@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -74,6 +75,25 @@
 
 namespace tinylamb {
 namespace {
+
+void AttachAppliedRuleNames(const Plan& plan,
+                            const cascades::SearchEngine& search) {
+  if (plan == nullptr) {
+    return;
+  }
+  std::vector<std::string> names(search.AppliedRuleNames().begin(),
+                                 search.AppliedRuleNames().end());
+  std::ranges::sort(names);
+  PlanExplainInfo info = plan->ExplainInfo();
+  info.applied_rules.clear();
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (i > 0) {
+      info.applied_rules.push_back(',');
+    }
+    info.applied_rules += names[i];
+  }
+  plan->SetExplainInfo(std::move(info));
+}
 
 // Expands a literal "*" into every column of every FROM relation (Phase 8):
 // columns are qualified with the relation identity (alias when given, else
@@ -2214,6 +2234,129 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   return Optimize(query, ctx, OptimizerOptions::Default());
 }
 
+bool Optimizer::SupportsGrouping(const std::vector<Expression>& keys,
+                                 const std::vector<NamedExpression>& outputs) {
+  if (keys.empty() || outputs.empty() ||
+      !std::ranges::all_of(keys, [](const Expression& key) {
+        return key && key->Type() == TypeTag::kColumnValue;
+      })) {
+    return false;
+  }
+  return std::ranges::all_of(outputs, [](const NamedExpression& output) {
+    if (!output.expression) {
+      return false;
+    }
+    if (output.expression->Type() == TypeTag::kColumnValue) {
+      return true;
+    }
+    if (output.expression->Type() != TypeTag::kAggregateExp) {
+      return false;
+    }
+    const auto& aggregate = output.expression->AsAggregateExpression();
+    if (aggregate.Distinct() || aggregate.NeedsGroupContext() ||
+        aggregate.WhereFilter() || !aggregate.InnerGroupBy().empty()) {
+      return false;
+    }
+    switch (aggregate.GetType()) {
+      case AggregationType::kCount:
+      case AggregationType::kSum:
+      case AggregationType::kMin:
+      case AggregationType::kMax:
+      case AggregationType::kAvg:
+        return true;
+      default:
+        return false;
+    }
+  });
+}
+
+StatusOr<Plan> Optimizer::OptimizeGrouping(
+    const QueryData& core, const Plan& input,
+    const std::vector<Expression>& keys,
+    const std::vector<NamedExpression>& outputs, TransactionContext& ctx) {
+  if (!SupportsGrouping(keys, outputs)) {
+    return Status::kNotImplemented;
+  }
+  std::vector<Expression> resolved_keys;
+  std::unordered_map<int, std::string> key_names;
+  std::unordered_set<std::string> names;
+  for (const auto& key : keys) {
+    if (!key || key->Type() != TypeTag::kColumnValue) {
+      return Status::kNotImplemented;
+    }
+    const int offset =
+        input->GetSchema().Offset(key->AsColumnValue().GetColumnName());
+    if (offset < 0) {
+      return Status::kNotImplemented;
+    }
+    if (key_names.contains(offset)) {
+      continue;
+    }
+    const auto& column =
+        input->GetSchema().GetColumn(static_cast<size_t>(offset));
+    if (!names.insert(column.Name().name).second) {
+      return Status::kNotImplemented;
+    }
+    key_names.emplace(offset, column.Name().name);
+    resolved_keys.push_back(ColumnValueExp(column.Name()));
+  }
+  std::vector<NamedExpression> aggregates, projection;
+  for (const auto& output : outputs) {
+    if (!output.expression) {
+      return Status::kNotImplemented;
+    }
+    if (output.expression->Type() == TypeTag::kColumnValue) {
+      const int offset = input->GetSchema().Offset(
+          output.expression->AsColumnValue().GetColumnName());
+      if (!key_names.contains(offset)) {
+        return Status::kNotImplemented;
+      }
+      projection.emplace_back(output.name,
+                              ColumnValueExp(key_names.at(offset)));
+    } else if (output.expression->Type() == TypeTag::kAggregateExp) {
+      const auto& aggregate = output.expression->AsAggregateExpression();
+      for (const auto& column : output.expression->TouchedColumns()) {
+        if (aggregate.GetType() == AggregationType::kCount &&
+            column.name == "*") {
+          continue;
+        }
+        if (input->GetSchema().Offset(column) < 0) {
+          return Status::kNotImplemented;
+        }
+      }
+      std::string name =
+          "$group_aggregate_" + std::to_string(aggregates.size());
+      while (names.contains(name)) {
+        name += "_";
+      }
+      names.insert(name);
+      aggregates.emplace_back(name, output.expression);
+      projection.emplace_back(output.name, ColumnValueExp(name));
+    } else {
+      return Status::kNotImplemented;
+    }
+  }
+  // With no aggregate, keep all keys through DISTINCT, then project the
+  // requested subset: dropping a grouping key before deduplication is unsound.
+  if (aggregates.empty()) {
+    std::vector<NamedExpression> key_outputs;
+    key_outputs.reserve(resolved_keys.size());
+    for (const auto& key : resolved_keys) {
+      key_outputs.emplace_back(key->AsColumnValue().GetColumnName().name, key);
+    }
+    Plan distinct = std::make_shared<DistinctPlan>(
+        std::make_shared<ProjectionPlan>(input, key_outputs));
+    return Plan(std::make_shared<ProjectionPlan>(distinct, projection));
+  }
+  QueryData grouped = core;
+  grouped.select_ = std::move(aggregates);
+  grouped.grouping_keys_ = std::move(resolved_keys);
+  ASSIGN_OR_RETURN(Plan, aggregate, Optimize(grouped, ctx));
+  Plan result = std::make_shared<ProjectionPlan>(aggregate, projection);
+  result->SetExplainInfo(aggregate->ExplainInfo());
+  return result;
+}
+
 StatusOr<Plan> Optimizer::OptimizeRelational(
     std::shared_ptr<const SelectStatement> statement, Schema output_schema,
     TransactionContext& ctx) {
@@ -2233,8 +2376,20 @@ StatusOr<Plan> Optimizer::OptimizeRelational(
   if (!best) {
     return Status::kNotImplemented;
   }
+  AttachAppliedRuleNames(best->plan, search);
   return best->plan;
 }
+
+namespace {
+
+// Temporary plan-time profiling helper (TINYLAMB_PLAN_PROFILE=1).
+double PlanProfileMillisSince(std::chrono::steady_clock::time_point begin) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - begin)
+      .count();
+}
+
+}  // namespace
 
 StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                                    TransactionContext& ctx,
@@ -2448,7 +2603,11 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       plan = std::make_shared<LimitPlan>(std::move(plan), query.limit_count_,
                                          query.limit_offset_);
     }
-    return plan;
+    cascades::PlanAlternative trace{.plan = std::move(plan),
+                                    .rule_name = "no_from_projection"};
+    cascades::AttachPlanExplainInfo(trace, cascades::PhysicalProperties{},
+                                    cascades::RuleContext{});
+    return std::move(trace.plan);
   }
 
   const Expression source_predicate =
@@ -2721,6 +2880,9 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
 
   std::unordered_set<ColumnName> touched =
       effective_predicate->TouchedColumns();
+  for (const Expression& key : query.grouping_keys_) {
+    touched.merge(key->TouchedColumns());
+  }
   for (const NamedExpression& selected : projection_items) {
     touched.merge(selected.expression->TouchedColumns());
   }
@@ -2852,7 +3014,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
         needs_root_selection = true;
         continue;
       }
-      if (relations.size() == 1 && query.from_.size() > 1) {
+      if (relations.size() == 1) {
         needs_root_selection = true;
       }
       conjuncts.push_back({conjunct, {relations.begin(), relations.end()}});
@@ -2975,7 +3137,36 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   }
 
   cascades::Memo memo;
+  std::unordered_map<std::string, double> relation_rows;
+  const bool plan_profile = std::getenv("TINYLAMB_PLAN_PROFILE") != nullptr;
+  const auto memo_phase_begin = std::chrono::steady_clock::now();
+  for (const auto& [relation, statistics] : rule_context.statistics) {
+    const Schema& source = rule_context.tables.at(relation)->GetSchema();
+    std::vector<Column> columns;
+    for (size_t i = 0; i < source.ColumnCount(); ++i) {
+      Column column = source.GetColumn(i);
+      column.Name().schema = relation;
+      columns.push_back(std::move(column));
+    }
+    const Schema schema(relation, std::move(columns));
+    std::vector<Expression> local;
+    for (const auto& conjunct : conjuncts) {
+      if (conjunct.relations == std::vector<std::string>{relation}) {
+        local.push_back(conjunct.conjunct);
+      }
+    }
+    relation_rows.emplace(relation, static_cast<double>(statistics->Rows()) *
+                                        statistics->EstimateSelectivity(
+                                            schema, CombineConjuncts(local)));
+  }
+  memo.SetRelationRows(std::move(relation_rows));
+
   cascades::GroupId search_root = cascades::kInvalidGroup;
+  if (plan_profile) {
+    LOG(INFO) << "plan-profile: stats+schema+rewrites (pre memo.Build)="
+              << PlanProfileMillisSince(memo_phase_begin) << "ms";
+  }
+  const auto build_begin = std::chrono::steady_clock::now();
   if (!is_outer) {
     search_root = memo.Build(query.from_, conjuncts);
   } else if (left_join_chain) {
@@ -3238,7 +3429,8 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                            .children = {search_root},
                            .table = "",
                            .predicate = std::nullopt,
-                           .target_list = projection_items});
+                           .target_list = projection_items,
+                           .grouping_sets = query.grouping_keys_});
     search_root = aggregation;
   } else {
     const cascades::GroupId projection =
@@ -3339,32 +3531,28 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     properties.limit_hint = query.limit_offset_ + query.limit_count_;
   }
 
-  // OLTP statements overwhelmingly consist of one indexed relation.  Their
-  // search space has no joins and therefore no useful Cascades exploration:
-  // cost the exact same scan alternatives directly and build the root layers
-  // without memo worklists, rule matching, or best-property hash tables.
-  // Keep the general search for custom rule sets and decorrelated subqueries.
-  // A single materialized CTE (M4) also takes the fast path: its Values
-  // alternative carries an explicit residual there, which subsumes the root
-  // Selection the general search would add.
-  const bool default_rules = options.relational_rules.Names() ==
-                                 cascades::RuleSet::Default().Names() &&
-                             options.disabled_implementation_rules.empty() &&
-                             options.extra_implementation_rules.empty();
-  const bool single_materialized =
-      query.from_.size() == 1 &&
-      query.lifted_ctes_.cells.contains(query.from_.front());
-  if (query.samples_.empty() && query.from_.size() == 1 && default_rules &&
-      decorrelations.empty() &&
-      (single_materialized || query.lifted_ctes_.cells.empty()) &&
-      (single_materialized || !needs_root_selection) && !has_window) {
-    return OptimizeSingleRelation(query, effective_predicate, projection_items,
-                                  has_aggregate, query.distinct_, properties,
-                                  rule_context);
+  // MIN/MAX can read one index endpoint without a child scan. Every other
+  // single-relation shape uses the memo, including custom rules with default
+  // names.
+  if (has_aggregate && query.grouping_keys_.empty() && !query.distinct_ &&
+      query.limit_count_ == 0 && query.limit_offset_ == 0 &&
+      query.samples_.empty() && decorrelations.empty() &&
+      options.disabled_implementation_rules.empty() &&
+      options.extra_implementation_rules.empty()) {
+    auto minmax = OptimizeMinMaxIndex(query, effective_predicate,
+                                      projection_items, rule_context);
+    if (minmax.HasValue()) {
+      return minmax;
+    }
   }
 
   const cascades::ImplementationRuleSet* implementation_rules =
       &DefaultImplementationRules();
+  if (plan_profile) {
+    LOG(INFO) << "plan-profile: memo.Build="
+              << PlanProfileMillisSince(build_begin) << "ms";
+  }
+  const auto search_begin = std::chrono::steady_clock::now();
   cascades::ImplementationRuleSet customized;
   if (!options.disabled_implementation_rules.empty() ||
       !options.extra_implementation_rules.empty()) {
@@ -3386,9 +3574,19 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   search.SetStepBudget(options.search_step_budget);
   std::optional<cascades::BestPlan> best = search.Optimize(
       search_root, properties, *implementation_rules, rule_context);
+  if (plan_profile) {
+    LOG(INFO) << "plan-profile: search.Optimize="
+              << PlanProfileMillisSince(search_begin) << "ms";
+  }
   if (!best) {
     return Status::kNotImplemented;
   }
+  AttachAppliedRuleNames(best->plan, search);
+  const auto preserve_explain = [](Plan& target, const Plan& source) {
+    if (target != nullptr && source != nullptr) {
+      target->SetExplainInfo(source->ExplainInfo());
+    }
+  };
 
   // A projection group can be subsumed by a commuted join alternative when
   // the required output properties are otherwise satisfied.  Keep the
@@ -3406,6 +3604,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                     actual_schema.GetColumn(i).Name();
     }
     if (!same_layout) {
+      projection->SetExplainInfo(best->plan->ExplainInfo());
       best->plan = std::move(projection);
     }
   }
@@ -3436,9 +3635,22 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     for (const Expression& inner_key : spec.inner_keys) {
       inner_keys.push_back(inner_key->AsColumnValue().GetColumnName());
     }
-    best->plan = std::make_shared<ProductPlan>(
+    Plan joined = std::make_shared<ProductPlan>(
         best->plan, std::move(outer_keys), inner_plan, std::move(inner_keys),
         spec.kind);
+    // Hash semi reduction (Phase 2 "Hash Semi Reduction"). The decorrelated
+    // IN / EXISTS / NOT IN shape builds this ProductPlan directly instead of
+    // going through the memo, so the marker is decided here -- against the very
+    // same profitability helper the Cascades hash-join rule uses, so the two
+    // paths can never disagree about whether a semi join is worth reducing.
+    if (auto* product = dynamic_cast<ProductPlan*>(joined.get());
+        product != nullptr &&
+        SemiReductionProfitable(product->Left(), product->LeftKeys(),
+                                product->Right(), product->RightKeys())) {
+      product->PreferSemiReduction();
+    }
+    preserve_explain(joined, best->plan);
+    best->plan = std::move(joined);
   }
 
   // Correlation keys added only for the semi/anti join are implementation
@@ -3458,12 +3670,16 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       trim.emplace_back(expanded_select[i].name,
                         ColumnValueExp(core_schema.GetColumn(i).Name()));
     }
-    best->plan = std::make_shared<ProjectionPlan>(best->plan, trim);
+    Plan trimmed = std::make_shared<ProjectionPlan>(best->plan, trim);
+    preserve_explain(trimmed, best->plan);
+    best->plan = std::move(trimmed);
     // With hidden semi-join keys in the core output, an in-search DISTINCT
     // would dedupe over the implementation columns and leak duplicates that
     // differ only in a key; dedupe above the trim instead.
     if (query.distinct_ && hidden_semi_keys_added) {
-      best->plan = std::make_shared<DistinctPlan>(best->plan);
+      Plan distinct = std::make_shared<DistinctPlan>(best->plan);
+      preserve_explain(distinct, best->plan);
+      best->plan = std::move(distinct);
     }
   }
 

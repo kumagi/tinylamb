@@ -11,6 +11,7 @@
 #include "executor/sort.hpp"
 #include "expression/column_value.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/column_name.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -70,7 +71,9 @@ StatusOr<Value> MergeAppendExecutor::KeyValue(
                       .Type())));
     value = std::move(coerced);
   }
-  return value;
+  // Same collation contract as the sort operators: a case-insensitive key
+  // folds its text once, before the merge compares it.
+  return ApplyKeyCollation(value, key.collation);
 }
 
 bool MergeAppendExecutor::Before(const Head& left, const Head& right) const {
@@ -124,7 +127,10 @@ bool MergeAppendExecutor::Next(Row* destination, RowPosition* position) {
     return FailWith(st);
   }
   if (heads_.empty()) {
-    return FailWithChildOf(*sources_.front());
+    if (!sources_.empty()) {
+      FailWithChildOf(*sources_.front());
+    }
+    return false;
   }
   size_t best = 0;
   for (size_t index = 1; index < heads_.size(); ++index) {

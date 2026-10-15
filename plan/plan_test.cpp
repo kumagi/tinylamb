@@ -17,6 +17,7 @@
 #include "plan/plan.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -30,6 +31,7 @@
 #include "aggregation_plan.hpp"
 #include "bitmap_scan_plan.hpp"
 #include "common/constants.hpp"
+#include "common/join_kind.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/set_operation.hpp"
@@ -54,6 +56,7 @@
 #include "projection_plan.hpp"
 #include "selection_plan.hpp"
 #include "set_operation_plan.hpp"
+#include "sort_distinct_plan.hpp"
 #include "sort_plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
@@ -132,9 +135,8 @@ class PlanTest : public ::testing::Test {
           rs_->CreateTable(ctx,
                            Schema("Sc3", {Column("e1", ValueType::kInt64),
                                           Column("e2", ValueType::kDouble)})));
-      ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(52), Value(53.4),
-                                               Value("ou"), Value(16)}))
-                         .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(ctx.txn_, Row({Value(52), Value(53.4)})).GetStatus());
     }
     rs_->CreateIndex(ctx, "Sc2", IndexSchema("Sc2PK", {0}));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -143,6 +145,7 @@ class PlanTest : public ::testing::Test {
   void Recover() {
     if (rs_) {
       rs_->EmulateCrash();
+      rs_.reset();
     }
     rs_ = Database::Create(prefix_).MoveValue();
   }
@@ -163,6 +166,51 @@ class PlanTest : public ::testing::Test {
   std::string prefix_;
   std::unique_ptr<Database> rs_;
 };
+
+namespace {
+
+// gtest ASSERT_TRUE is invisible to clang-tidy's dataflow, so the optional
+// probe is unwrapped through this helper: the assert keeps
+// bugprone-unchecked-optional-access quiet while the failure mode (abort in
+// debug, a benign static_cast in release) matches the tests' expectations.
+const LookupSeek& SeekOf(const std::optional<LookupSeek>& probe) {
+  assert(probe.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  return *probe;
+}
+}  // namespace
+TEST_F(PlanTest, OuterJoinCardinalityDoesNotDoubleCountMatchedRows) {
+  const Schema left_schema("left", {Column("id", ValueType::kInt64),
+                                    Column("value", ValueType::kInt64)});
+  const Schema right_schema("right", {Column("id", ValueType::kInt64),
+                                      Column("value", ValueType::kInt64)});
+  auto left = std::make_shared<ValuesPlan>(
+      left_schema,
+      std::vector<Row>{Row({Value(1), Value(10)}), Row({Value(2), Value(20)}),
+                       Row({Value(3), Value(30)}), Row({Value(4), Value(40)}),
+                       Row({Value(5), Value(50)})});
+  auto right = std::make_shared<ValuesPlan>(
+      right_schema,
+      std::vector<Row>{Row({Value(1), Value(100)}), Row({Value(2), Value(200)}),
+                       Row({Value(3), Value(300)})});
+
+  ProductPlan left_join(left, {ColumnName("left", "id")}, right,
+                        {ColumnName("right", "id")}, JoinKind::kLeftOuter, 3);
+  ProductPlan right_join(left, {ColumnName("left", "id")}, right,
+                         {ColumnName("right", "id")}, JoinKind::kRightOuter, 3);
+  ProductPlan full_join(left, {ColumnName("left", "id")}, right,
+                        {ColumnName("right", "id")}, JoinKind::kFullOuter, 3);
+  EXPECT_EQ(left_join.EmitRowCount(), 5U);
+  EXPECT_EQ(right_join.EmitRowCount(), 3U);
+  EXPECT_EQ(full_join.EmitRowCount(), 5U);
+
+  ProductPlan many_left(left, {ColumnName("left", "id")}, right,
+                        {ColumnName("right", "id")}, JoinKind::kLeftOuter, 12);
+  ProductPlan many_full(left, {ColumnName("left", "id")}, right,
+                        {ColumnName("right", "id")}, JoinKind::kFullOuter, 12);
+  EXPECT_EQ(many_left.EmitRowCount(), 12U);
+  EXPECT_EQ(many_full.EmitRowCount(), 12U);
+}
 
 TEST_F(PlanTest, Construct) {
   // Arrange -- nothing to set up; default database created by SetUp()
@@ -265,6 +313,66 @@ TEST_F(PlanTest, ProjectionRebuildsStatisticsInOutputOrder) {
             stats->Column(static_cast<size_t>(c3)).Distinct());
   EXPECT_EQ(projection->GetStats().Column(1).Distinct(),
             stats->Column(static_cast<size_t>(c1)).Distinct());
+}
+
+TEST_F(PlanTest, ProjectionKeepsEstimatesAliveThroughComputedColumns) {
+  // A type-preserving transform of one column (c1 + 1) carries the source
+  // column's row mass and NDV as a prior; a type-changing transform (c3 as
+  // double from ... or c1 * 1.0) stays honestly unmeasured; and a Selection
+  // above either projection must never collapse to a proven-empty zero.
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  // Measure the fixture table in-memory: the catalog stats are absent until
+  // ANALYZE, and this test needs real per-column mass to observe the carry.
+  TableStatistics measured(table->GetSchema());
+  ASSERT_SUCCESS(measured.Update(ctx.txn_, *table));
+  Plan source = std::make_shared<FullScanPlan>(*table, measured);
+  const int c1 = table->GetSchema().Offset(ColumnName("Sc1.c1"));
+  ASSERT_GE(c1, 0);
+  ASSERT_GT(measured.Column(static_cast<size_t>(c1)).NonNullCount(), 0U);
+
+  // Type-preserving arithmetic: INT64 + INT64 stays INT64.
+  Expression shifted = BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1.c1")),
+                                           BinaryOperation::kAdd,
+                                           ConstantValueExp(Value(int64_t{1})));
+  Plan carried = std::make_shared<ProjectionPlan>(
+      source, std::vector<NamedExpression>{NamedExpression("", shifted)});
+  EXPECT_FALSE(carried->GetStats().Column(0).Unmeasured());
+  EXPECT_EQ(carried->GetStats().Column(0).NonNullCount(),
+            measured.Column(static_cast<size_t>(c1)).NonNullCount());
+  // A transform can only merge distinct values, so the source NDV is a
+  // legitimate prior.
+  EXPECT_EQ(carried->GetStats().Column(0).Distinct(),
+            measured.Column(static_cast<size_t>(c1)).Distinct());
+  // The per-value payloads describe the pre-transform domain and must not
+  // survive (they would fabricate selectivities for the shifted values).
+  EXPECT_TRUE(carried->GetStats().Column(0).MostCommonValues().empty());
+  EXPECT_TRUE(carried->GetStats().Column(0).Histogram().empty());
+
+  // A Selection over the computed column keeps a non-zero row estimate.
+  const ColumnName shifted_name = carried->GetSchema().GetColumn(0).Name();
+  Expression filter = BinaryExpressionExp(ColumnValueExp(shifted_name),
+                                          BinaryOperation::kEquals,
+                                          ConstantValueExp(Value(int64_t{5})));
+  Plan selection =
+      std::make_shared<SelectionPlan>(carried, filter, carried->GetStats());
+  EXPECT_GT(selection->GetStats().Rows(), 0U);
+
+  // Type-changing arithmetic (INT64 * DOUBLE -> DOUBLE) must not carry the
+  // integer stats into a double column: the prior's domain would be wrong.
+  Expression widened = BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1.c1")),
+                                           BinaryOperation::kMultiply,
+                                           ConstantValueExp(Value(1.0)));
+  Plan changed = std::make_shared<ProjectionPlan>(
+      source, std::vector<NamedExpression>{NamedExpression("", widened)});
+  EXPECT_TRUE(changed->GetStats().Column(0).Unmeasured());
+  Expression changed_filter = BinaryExpressionExp(
+      ColumnValueExp(changed->GetSchema().GetColumn(0).Name()),
+      BinaryOperation::kEquals, ConstantValueExp(Value(5.0)));
+  Plan changed_selection = std::make_shared<SelectionPlan>(
+      changed, changed_filter, changed->GetStats());
+  // Unknown, not empty.
+  EXPECT_GT(changed_selection->GetStats().Rows(), 0U);
 }
 
 TEST_F(PlanTest, SelectionPlan) {
@@ -663,6 +771,69 @@ TEST_F(PlanTest, ProjectionTranslatesAliasedOrderKeysToChildExpressions) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
+TEST_F(PlanTest, CompositeIndexRangeUsesTrailingKeyWithDampedCorrelation) {
+  auto ctx = rs_->BeginContext();
+  const Schema schema("composite_range",
+                      {Column("group_id", ValueType::kInt64),
+                       Column("sequence_id", ValueType::kInt64)});
+  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(ctx, schema));
+  for (int64_t i = 0; i < 1000; ++i) {
+    ASSERT_SUCCESS(
+        table.Insert(ctx.txn_, Row({Value(i % 10), Value(i)})).GetStatus());
+  }
+  ASSERT_SUCCESS(table.CreateIndex(
+      ctx.txn_,
+      IndexSchema("composite_range_idx", {0, 1}, {}, IndexMode::kNonUnique)));
+  TableStatistics statistics(schema);
+  ASSERT_SUCCESS(statistics.Update(ctx.txn_, table));
+  const Index& index = table.GetIndex(0);
+  const Expression predicate = BinaryExpressionExp(
+      BinaryExpressionExp(
+          ColumnValueExp(ColumnName("composite_range.group_id")),
+          BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{1}))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(
+          ColumnValueExp(ColumnName("composite_range.sequence_id")),
+          BinaryOperation::kGreaterThanEquals,
+          ConstantValueExp(Value(int64_t{20}))));
+  IndexScanPlan scan(table, index, statistics,
+                     {Value(int64_t{1}), Value(int64_t{20})},
+                     {Value(int64_t{1}), Value(int64_t{30})}, true, predicate);
+  IndexOnlyScanPlan index_only(
+      table, index, statistics, {Value(int64_t{1}), Value(int64_t{20})},
+      {Value(int64_t{1}), Value(int64_t{30})}, true, predicate);
+  EXPECT_LT(scan.EmitRowCount(), 100U);
+  EXPECT_GT(scan.EmitRowCount(), 10U);
+  EXPECT_EQ(scan.EmitRowCount(), index_only.EmitRowCount());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(PlanTest, DistinctPlansEstimateProjectedNdv) {
+  auto ctx = rs_->BeginContext();
+  const Schema schema("cardinality_distinct",
+                      {Column("group_id", ValueType::kInt64),
+                       Column("payload", ValueType::kInt64)});
+  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(ctx, schema));
+  for (int64_t i = 0; i < 100; ++i) {
+    ASSERT_SUCCESS(
+        table.Insert(ctx.txn_, Row({Value(i % 10), Value(i)})).GetStatus());
+  }
+  TableStatistics statistics(schema);
+  ASSERT_SUCCESS(statistics.Update(ctx.txn_, table));
+  Plan scan = std::make_shared<FullScanPlan>(table, statistics);
+  Plan projection = std::make_shared<ProjectionPlan>(
+      scan, std::vector<NamedExpression>{NamedExpression(
+                "group_id", ColumnValueExp(ColumnName("cardinality_distinct",
+                                                      "group_id")))});
+  DistinctPlan distinct(projection);
+  SortDistinctPlan sort_distinct(projection);
+  EXPECT_EQ(distinct.EmitRowCount(), 10U);
+  EXPECT_EQ(sort_distinct.EmitRowCount(), 10U);
+  EXPECT_EQ(distinct.GetStats().Rows(), 10U);
+  EXPECT_EQ(sort_distinct.GetStats().Rows(), 10U);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
 TEST_F(PlanTest, DistinctPlanUsesHashExecutorAndPreservesOrderingMetadata) {
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
@@ -937,6 +1108,209 @@ TEST_F(PlanTest, ProductIndexJoinAccessors) {
   std::ostringstream oss;
   prop->Dump(oss, 0);
   EXPECT_NE(oss.str().find("left:{Sc1.c1}"), std::string::npos);
+}
+
+TEST_F(PlanTest, NullSafeIndexJoinShapeFallsBackToHashJoin) {
+  auto ctx = rs_->BeginContext();
+  const auto tbl1_or = ctx.GetTable("Sc1");
+  const auto tbl2_or = ctx.GetTable("Sc2");
+  const auto stats2_or = ctx.GetStats("Sc2");
+  ASSERT_TRUE(tbl1_or.HasValue());
+  ASSERT_TRUE(tbl2_or.HasValue());
+  ASSERT_TRUE(stats2_or.HasValue());
+  Plan prop(new ProductPlan(
+      std::make_shared<FullScanPlan>(
+          *tbl1_or.Value(), TableStatistics(tbl1_or.Value()->GetSchema())),
+      {ColumnName("Sc1.c1")}, *tbl2_or.Value(), tbl2_or.Value()->GetIndex(0),
+      {ColumnName("Sc2.d1")}, *stats2_or.Value()));
+  static_cast<ProductPlan&>(*prop).SetJoinNotes({true}, Expression());
+  Executor executor = prop->EmitExecutor(ctx);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_EQ(dump.str().find("IndexJoin"), std::string::npos) << dump.str();
+  EXPECT_EQ(dump.str().find("LookupJoin"), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find("HashJoin"), std::string::npos) << dump.str();
+}
+
+// The index nested-loop probe is derived in the INDEX's key order, not in the
+// order the equi-join lists its keys. This is what makes a composite index
+// usable when only some of its key columns are join keys: the seek key has to
+// be a prefix of the stored key image, and the join's own key order need not be
+// one.
+TEST_F(PlanTest, LookupProbeDerivesPrefixInIndexKeyOrder) {
+  auto ctx = rs_->BeginContext();
+  const auto tbl1_or = ctx.GetTable("Sc1");
+  const auto stats2_or = ctx.GetStats("Sc2");
+  ASSERT_TRUE(tbl1_or.HasValue());
+  ASSERT_TRUE(stats2_or.HasValue());
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "Sc2",
+                IndexSchema("Sc2D1D4", {0, 3}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto reloaded = ctx.GetTable("Sc2");
+  ASSERT_TRUE(reloaded.HasValue());
+  ASSERT_EQ(reloaded.Value()->IndexCount(), 2U);
+  const TableStatistics left_stats(tbl1_or.Value()->GetSchema());
+  // The join lists (d4, d1) -- the reverse of the (d1, d4) index key order --
+  // and adds c2 = d3, which is no index key column at all.
+  Plan plan(new ProductPlan(
+      std::make_shared<FullScanPlan>(*tbl1_or.Value(), left_stats),
+      {ColumnName("Sc1.c3"), ColumnName("Sc1.c1"), ColumnName("Sc1.c2")},
+      *reloaded.Value(), reloaded.Value()->GetIndex(1),
+      {ColumnName("Sc2.d4"), ColumnName("Sc2.d1"), ColumnName("Sc2.d3")},
+      *stats2_or.Value()));
+  auto& product = static_cast<ProductPlan&>(*plan);
+  const std::optional<LookupSeek>& probe = product.Lookup();
+  ASSERT_TRUE(probe.has_value());
+  assert(probe.has_value());
+  // Both index key columns are pinned, so the probe covers the complete key --
+  // walked in index order, with each column paired to the join key that pins
+  // it.
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  ASSERT_EQ(probe->right_columns.size(), 2U);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(probe->right_columns[0], ColumnName("Sc2.d1"));
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(probe->left_columns[0], ColumnName("Sc1.c1"));
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(probe->right_columns[1], ColumnName("Sc2.d4"));
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(probe->left_columns[1], ColumnName("Sc1.c3"));
+  // d3 is not an index key column, so it never enters the probe: the
+  // `c2 = d3` conjunct is the residual predicate's business.
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(probe->range_position, std::nullopt);
+  EXPECT_NE(product.ToString().find("probe:{Sc2.d1, Sc2.d4}"),
+            std::string::npos)
+      << product.ToString();
+
+  // A range needs a position to land on, and the complete key is already
+  // pinned, so there is none left.
+  EXPECT_FALSE(product.SetLookupRange(2, ColumnName("Sc1.c1"),
+                                      ColumnName("Sc2.d2"),
+                                      BinaryOperation::kLessThan));
+  EXPECT_EQ(SeekOf(product.Lookup()).range_position, std::nullopt);
+}
+
+TEST_F(PlanTest, LookupRangeAcceptsOnlyInt64AndDate) {
+  auto ctx = rs_->BeginContext();
+  const auto tbl1_or = ctx.GetTable("Sc1");
+  const auto stats2_or = ctx.GetStats("Sc2");
+  ASSERT_TRUE(tbl1_or.HasValue());
+  ASSERT_TRUE(stats2_or.HasValue());
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "Sc2",
+                IndexSchema("Sc2D1D4", {0, 3}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto reloaded = ctx.GetTable("Sc2");
+  ASSERT_TRUE(reloaded.HasValue());
+  ASSERT_EQ(reloaded.Value()->IndexCount(), 2U);
+  const TableStatistics left_stats(tbl1_or.Value()->GetSchema());
+  // Prefix (d1); the next index key column is the INT64 d4.
+  Plan plan(new ProductPlan(
+      std::make_shared<FullScanPlan>(*tbl1_or.Value(), left_stats),
+      {ColumnName("Sc1.c1"), ColumnName("Sc1.c2")}, *reloaded.Value(),
+      reloaded.Value()->GetIndex(1),
+      {ColumnName("Sc2.d1"), ColumnName("Sc2.d3")}, *stats2_or.Value()));
+  auto& product = static_cast<ProductPlan&>(*plan);
+  ASSERT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
+  // The bound has to land on the index key column at that offset; d3 is a
+  // plain column of the table, so a bound there cannot order the seek.
+  EXPECT_FALSE(product.SetLookupRange(1, ColumnName("Sc1.c2"),
+                                      ColumnName("Sc2.d3"),
+                                      BinaryOperation::kLessThan));
+  // ... and the operands must share a type, or the per-row re-check could not
+  // decide the comparison (c3 is DOUBLE, d4 is INT64).
+  EXPECT_FALSE(product.SetLookupRange(1, ColumnName("Sc1.c3"),
+                                      ColumnName("Sc2.d4"),
+                                      BinaryOperation::kLessThan));
+  EXPECT_EQ(SeekOf(product.Lookup()).range_position, std::nullopt);
+  // INT64 on both sides: adopted, and the position is now occupied.
+  EXPECT_TRUE(product.SetLookupRange(1, ColumnName("Sc1.c1"),
+                                     ColumnName("Sc2.d4"),
+                                     BinaryOperation::kLessThanEquals));
+  ASSERT_EQ(SeekOf(product.Lookup()).range_position, 1U);
+  EXPECT_EQ(SeekOf(product.Lookup()).left_columns[1], ColumnName("Sc1.c1"));
+  EXPECT_EQ(SeekOf(product.Lookup()).right_columns[1], ColumnName("Sc2.d4"));
+  EXPECT_EQ(SeekOf(product.Lookup()).range_operation,
+            BinaryOperation::kLessThanEquals);
+  EXPECT_EQ(SeekOf(product.Lookup()).right_columns.size(), 2U);
+  EXPECT_NE(product.ToString().find("probe:{Sc2.d1, Sc1.c1 <= Sc2.d4}"),
+            std::string::npos)
+      << product.ToString();
+  // A second range column has nowhere to go: the only position a bound can
+  // narrow is already taken, so the extra conjunct stays a residual.
+  EXPECT_FALSE(product.SetLookupRange(1, ColumnName("Sc1.c1"),
+                                      ColumnName("Sc2.d4"),
+                                      BinaryOperation::kGreaterThan));
+  EXPECT_FALSE(product.SetLookupRange(2, ColumnName("Sc1.c1"),
+                                      ColumnName("Sc2.d4"),
+                                      BinaryOperation::kGreaterThan));
+  EXPECT_EQ(SeekOf(product.Lookup()).range_position, 1U);
+  EXPECT_EQ(SeekOf(product.Lookup()).right_columns.size(), 2U);
+  EXPECT_EQ(SeekOf(product.Lookup()).range_operation,
+            BinaryOperation::kLessThanEquals);
+}
+
+TEST_F(PlanTest, LookupRangeRejectsNonWhitelistedKeyColumnType) {
+  auto ctx = rs_->BeginContext();
+  const auto tbl1_or = ctx.GetTable("Sc1");
+  const auto stats2_or = ctx.GetStats("Sc2");
+  ASSERT_TRUE(tbl1_or.HasValue());
+  ASSERT_TRUE(stats2_or.HasValue());
+  // A composite index whose second key column is the VARCHAR d3.
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "Sc2",
+                IndexSchema("Sc2D1D3", {0, 2}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto reloaded = ctx.GetTable("Sc2");
+  ASSERT_TRUE(reloaded.HasValue());
+  ASSERT_EQ(reloaded.Value()->IndexCount(), 2U);
+  const TableStatistics left_stats(tbl1_or.Value()->GetSchema());
+  // Only d1 is a join key, so the prefix stops there and the first unpinned
+  // index key column is the VARCHAR d3.
+  Plan plan(new ProductPlan(
+      std::make_shared<FullScanPlan>(*tbl1_or.Value(), left_stats),
+      {ColumnName("Sc1.c1"), ColumnName("Sc1.c3")}, *reloaded.Value(),
+      reloaded.Value()->GetIndex(1),
+      {ColumnName("Sc2.d1"), ColumnName("Sc2.d4")}, *stats2_or.Value()));
+  auto& product = static_cast<ProductPlan&>(*plan);
+  ASSERT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
+  // d3 is the right index key column at that offset and both operands are
+  // VARCHAR, but
+  // VARCHAR is outside the range whitelist: its memcomparable encoding has no
+  // collation contract, so the comparison could order rows outside the seek.
+  EXPECT_FALSE(SupportsLookupRangeType(ValueType::kVarChar));
+  EXPECT_FALSE(product.SetLookupRange(1, ColumnName("Sc1.c2"),
+                                      ColumnName("Sc2.d3"),
+                                      BinaryOperation::kLessThan));
+  EXPECT_EQ(SeekOf(product.Lookup()).range_position, std::nullopt);
+  EXPECT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
+  EXPECT_TRUE(SupportsLookupRangeType(ValueType::kInt64));
+  EXPECT_TRUE(SupportsLookupRangeType(ValueType::kDate));
+}
+
+TEST_F(PlanTest, LookupSeekIsAbsentWithoutALeadingKeyJoinColumn) {
+  auto ctx = rs_->BeginContext();
+  const auto tbl1_or = ctx.GetTable("Sc1");
+  const auto tbl2_or = ctx.GetTable("Sc2");
+  const auto stats2_or = ctx.GetStats("Sc2");
+  ASSERT_TRUE(tbl1_or.HasValue());
+  ASSERT_TRUE(tbl2_or.HasValue());
+  ASSERT_TRUE(stats2_or.HasValue());
+  const TableStatistics left_stats(tbl1_or.Value()->GetSchema());
+  // The only index is Sc2PK on d1; joining on d4 offers no point lookup, so the
+  // factory must fall back to the hash join over a full scan.
+  Plan plan(new ProductPlan(
+      std::make_shared<FullScanPlan>(*tbl1_or.Value(), left_stats),
+      {ColumnName("Sc1.c3")}, *tbl2_or.Value(), tbl2_or.Value()->GetIndex(0),
+      {ColumnName("Sc2.d4")}, *stats2_or.Value()));
+  EXPECT_EQ(static_cast<ProductPlan&>(*plan).Lookup(), std::nullopt);
+  Executor executor = plan->EmitExecutor(ctx);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_EQ(dump.str().find("LookupJoin"), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find("HashJoin"), std::string::npos) << dump.str();
 }
 
 TEST_F(PlanTest, IndexOnlyScanPlanBasic) {

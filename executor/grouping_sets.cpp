@@ -472,8 +472,8 @@ Status GroupingSetsExecutor::Materialize() {
 
 bool GroupingSetsExecutor::Next(Row* dst, RowPosition* rp) {
   if (!materialized_) {
-    if (Materialize() != Status::kSuccess) {
-      return false;
+    if (Status st = Materialize(); st != Status::kSuccess) {
+      return FailWith(st);
     }
   }
   if (cursor_ >= output_rows_.size()) {

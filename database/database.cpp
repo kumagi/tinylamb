@@ -23,9 +23,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <ostream>
+#include <ranges>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -35,6 +37,10 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
@@ -62,10 +68,40 @@ constexpr page_id_t kDefaultFunctionRoot = 3;
 
 namespace {
 
+#ifdef __GLIBC__
+// Engine heap tuning.  Join/sort/aggregation row stores repeatedly grow and
+// free multi-hundred-MB blocks; with the default glibc thresholds every such
+// cycle bounced through mmap/munmap (or heap trims via mprotect), costing
+// kernel time and fresh page faults on each regrow.  Raising both thresholds
+// keeps those blocks in the brk heap where freed space is recycled in place.
+// Mirrors the tuning PostgreSQL applies for the same reason.  Sanitizer and
+// non-glibc builds replace malloc entirely and ignore mallopt.
+struct MallocTuning {
+  MallocTuning() {
+    mallopt(M_MMAP_THRESHOLD, 512 << 20);
+    mallopt(M_TRIM_THRESHOLD, 512 << 20);
+  }
+};
+// Intentional static-initializer side effect: applies the heap tuning
+// thresholds once at process start, before any big block churns.
+const MallocTuning g_malloc_tuning;  // NOLINT(cert-err58-cpp)
+#endif
+
 // Base names of every database this process opened through Create().
 // Guards RemoveCreatedDatabaseFiles(); see the header comment.
 std::mutex created_databases_mutex;
 std::unordered_set<std::string> created_databases;
+
+// GoogleSQL identifiers are case-insensitive; table-name comparison folds
+// ASCII case the same way GetTable()'s catalog fallback does.
+bool EqualsIgnoreCase(std::string_view left, std::string_view right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](char a, char b) {
+                      return std::tolower(static_cast<unsigned char>(a)) ==
+                             std::tolower(static_cast<unsigned char>(b));
+                    });
+}
 
 }  // namespace
 
@@ -121,6 +157,59 @@ std::ostream& operator<<(std::ostream& o, const Database& db) {
 
 namespace {
 
+using TableDropHookState = std::shared_ptr<std::atomic<bool>>;
+
+class TableDropFinishHook final : public TransactionFinishHook {
+ public:
+  TableDropFinishHook(std::shared_ptr<TableIncarnation> incarnation,
+                      TableDropHookState state)
+      : incarnation_(std::move(incarnation)), state_(std::move(state)) {}
+
+  void OnTransactionFinished(TransactionStatus status) noexcept override {
+    if (incarnation_ == nullptr ||
+        !state_->exchange(false, std::memory_order_acq_rel)) {
+      return;
+    }
+    if (status == TransactionStatus::kCommitted) {
+      incarnation_->CommitDrop();
+    } else if (status == TransactionStatus::kAborted) {
+      incarnation_->AbortDrop();
+    }
+  }
+
+ private:
+  std::shared_ptr<TableIncarnation> incarnation_;
+  TableDropHookState state_;
+};
+
+class TableDropRollback {
+ public:
+  TableDropRollback(Transaction* txn,
+                    std::shared_ptr<TableIncarnation> incarnation,
+                    TableDropHookState state)
+      : txn_(txn),
+        incarnation_(std::move(incarnation)),
+        state_(std::move(state)) {}
+  TableDropRollback(const TableDropRollback&) = delete;
+  TableDropRollback& operator=(const TableDropRollback&) = delete;
+  TableDropRollback(TableDropRollback&&) = delete;
+  TableDropRollback& operator=(TableDropRollback&&) = delete;
+  ~TableDropRollback() {
+    if (active_) {
+      txn_->MarkFailed();
+      state_->store(false, std::memory_order_release);
+      incarnation_->AbortDrop();
+    }
+  }
+  void Dismiss() { active_ = false; }
+
+ private:
+  Transaction* txn_;
+  std::shared_ptr<TableIncarnation> incarnation_;
+  TableDropHookState state_;
+  bool active_{true};
+};
+
 template <typename Serializable>
 std::string Serialize(const Serializable& from) {
   std::stringstream ss;
@@ -160,10 +249,14 @@ std::string StatisticsColumnKey(std::string_view table, slot_t column) {
   return key;
 }
 
-std::string EncodeStatisticsMeta(size_t rows) {
+// {magic, rows, layout_generation}. The generation is the clustering-proof
+// stamp (TableStatistics::LayoutGeneration); readers tolerate its absence so a
+// record written before v3 keeps working, and it decodes to 0 = "no proof".
+std::string EncodeStatisticsMeta(size_t rows, uint64_t layout_generation) {
   std::stringstream stream;
   Encoder encoder(stream);
-  encoder << kStatisticsMetaMagic << static_cast<uint64_t>(rows);
+  encoder << kStatisticsMetaMagic << static_cast<uint64_t>(rows)
+          << layout_generation;
   return stream.str();
 }
 
@@ -191,8 +284,9 @@ Status UpsertStatistics(BPlusTree& tree, Transaction& txn, std::string_view key,
 Status WriteSplitStatistics(BPlusTree& tree, Transaction& txn,
                             std::string_view table_name,
                             const TableStatistics& stats) {
-  RETURN_IF_FAIL(UpsertStatistics(tree, txn, table_name,
-                                  EncodeStatisticsMeta(stats.Rows())));
+  RETURN_IF_FAIL(UpsertStatistics(
+      tree, txn, table_name,
+      EncodeStatisticsMeta(stats.Rows(), stats.LayoutGeneration())));
   for (size_t column = 0; column < stats.Columns(); ++column) {
     RETURN_IF_FAIL(UpsertStatistics(
         tree, txn, StatisticsColumnKey(table_name, static_cast<slot_t>(column)),
@@ -245,10 +339,70 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
       return read_status;
     }
   }
+  // FOREIGN KEY validation: every kForeign column must name an existing
+  // parent table/column of the same type.  A self-reference resolves
+  // against the schema being created (the table does not exist yet).
+  // Uniqueness of the parent column is intentionally not required:
+  // enforcement is an existence check, which stays well-defined with
+  // duplicate parent keys.
+  for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
+    const Column& child = schema.GetColumn(i);
+    const Constraint& constraint = child.GetConstraint();
+    if (constraint.ctype != Constraint::kForeign) {
+      continue;
+    }
+    const std::string child_name = child.Name().name;
+    std::string parent_table;
+    std::vector<std::string> parent_columns;
+    if (!ParseForeignKeyReference(constraint, &parent_table, &parent_columns) ||
+        parent_columns.size() != 1) {
+      return Status(
+          StatusCode::kInvalidArgument,
+          "FOREIGN KEY on column " + child_name + " names an unknown or " +
+              "multi-column reference; only single-column references of "
+              "the form parent(col) are supported");
+    }
+    const Schema* parent_schema = &schema;
+    Table parent_table_obj;
+    if (!EqualsIgnoreCase(parent_table, schema.Name())) {
+      StatusOr<Table> parent_result = GetTable(ctx, parent_table);
+      if (!parent_result.HasValue()) {
+        if (parent_result.GetStatus() == Status::kNotExists) {
+          std::string message = "FOREIGN KEY on column " + child_name;
+          message += " references missing table ";
+          message += parent_table;
+          return Status(StatusCode::kInvalidArgument, message);
+        }
+        return parent_result.GetStatus();
+      }
+      parent_table_obj = parent_result.MoveValue();
+      parent_schema = &parent_table_obj.GetSchema();
+    }
+    const int parent_offset =
+        parent_schema->Offset(ColumnName("", parent_columns[0]));
+    if (parent_offset < 0) {
+      std::string message = "FOREIGN KEY on column " + child_name;
+      message += " references missing column ";
+      message += parent_table;
+      message += ".";
+      message += parent_columns[0];
+      return Status(StatusCode::kInvalidArgument, message);
+    }
+    const Column& parent_column =
+        parent_schema->GetColumn(static_cast<size_t>(parent_offset));
+    if (parent_column.Type() != child.Type()) {
+      std::string message = "FOREIGN KEY on column " + child_name;
+      message += " has a type mismatch with ";
+      message += parent_table;
+      message += ".";
+      message += parent_columns[0];
+      return Status(StatusCode::kInvalidArgument, message);
+    }
+  }
   ASSIGN_OR_RETURN(
       PageRef, table_page,
       storage_->pm_->AllocateNewPage(ctx.txn_, PageType::kRowPage));
-  Table new_table(schema, table_page->PageID());
+  Table new_table(schema, table_page->PageID(), SchemaEpoch());
   TableStatistics new_stat(schema);
   // CreateIndex full-scans the table and reacquires this page latch.
   table_page.PageUnlock();
@@ -320,6 +474,11 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
       return unwind_allocation(stats_status);
     }
   }
+  {
+    std::scoped_lock incarnation_lock(table_incarnations_mu_);
+    table_incarnations_[std::string(schema.Name())] =
+        new_table.incarnation_state_;
+  }
   // Compiled plans may reference the previous catalog shape; drop them.
   BumpSchemaEpoch();
   return new_table;
@@ -327,14 +486,75 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
 
 Status Database::DropTable(TransactionContext& ctx,
                            std::string_view schema_name) {
+  std::string canonical;
+  std::shared_ptr<TableIncarnation> incarnation;
+  std::unique_ptr<TableDropRollback> rollback;
+  {
+    std::scoped_lock lock(catalog_mu_);
+    ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
+    canonical = tbl.GetSchema().Name();
+    for (BPlusTreeIterator iter = catalog_.Begin(ctx.txn_); iter.IsValid();
+         ++iter) {
+      if (EqualsIgnoreCase(iter.Key(), canonical)) {
+        continue;
+      }
+      Table other;
+      if (!Deserialize(iter.Value(), &other)) {
+        return Status::kCorrupt;
+      }
+      const Schema& other_schema = other.GetSchema();
+      for (slot_t i = 0; i < other_schema.ColumnCount(); ++i) {
+        const Constraint& constraint =
+            other_schema.GetColumn(i).GetConstraint();
+        if (constraint.ctype != Constraint::kForeign) {
+          continue;
+        }
+        std::string parent_table;
+        std::vector<std::string> parent_columns;
+        if (!ParseForeignKeyReference(constraint, &parent_table,
+                                      &parent_columns)) {
+          continue;
+        }
+        if (EqualsIgnoreCase(parent_table, canonical)) {
+          return StatusError(StatusCode::kConflicts,
+                             "cannot drop table " + canonical +
+                                 " because table " +
+                                 std::string(other_schema.Name()) +
+                                 " has a FOREIGN KEY referencing it");
+        }
+      }
+    }
+    incarnation = tbl.incarnation_state_;
+    if (incarnation == nullptr || !incarnation->BeginDrop()) {
+      return Status::kConflicts;
+    }
+    auto hook_state = std::make_shared<std::atomic<bool>>(true);
+    rollback =
+        std::make_unique<TableDropRollback>(&ctx.txn_, incarnation, hook_state);
+    ctx.txn_.AddFinishHook(
+        std::make_shared<TableDropFinishHook>(incarnation, hook_state));
+    ctx.txn_.MarkTableDrop();
+    BumpSchemaEpoch();
+  }
+  if (!incarnation->WaitForQuiescence(ctx.txn_.ID())) {
+    return Status::kConflicts;
+  }
+  ASSIGN_OR_RETURN(Table, preflight, GetTable(ctx, canonical));
+  RETURN_IF_FAIL(storage_->pm_->WaitForTableTailQuiescence(preflight.first_pid_,
+                                                           ctx.txn_.ID()));
+
   std::scoped_lock lock(catalog_mu_);
-  ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
-  // GetTable() resolves case-insensitively, but every catalog/statistics key
-  // below is written under the canonical (declared) name.  Using the
-  // user-provided spelling left orphaned entries and failed DROPs for
-  // differently-cased references.
-  const std::string canonical(tbl.GetSchema().Name());
-  const Schema& schema = tbl.GetSchema();
+  ASSIGN_OR_RETURN(Table, current, GetTable(ctx, canonical));
+  if (current.incarnation_state_ != incarnation) {
+    return Status::kConflicts;
+  }
+  const Schema& schema = current.GetSchema();
+  std::vector<page_id_t> index_roots;
+  index_roots.reserve(current.IndexCount());
+  for (size_t index = 0; index < current.IndexCount(); ++index) {
+    index_roots.push_back(current.GetIndex(index).Root());
+  }
+  auto index_write_guards = ctx.txn_.AcquireIndexWriteGuards(index_roots);
   for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
     const Status deleted =
         statistics_.Delete(ctx.txn_, StatisticsColumnKey(canonical, column));
@@ -349,42 +569,344 @@ Status Database::DropTable(TransactionContext& ctx,
     }
   }
   RETURN_IF_FAIL(catalog_.Delete(ctx.txn_, canonical));
-  // D3 (docs/design.md): reclaim the table's storage.  Row pages follow the
-  // chain; index pages are enumerated from each B+Tree root (children,
-  // lowest links and foster chains).  Every destroy is WAL-logged with the
-  // old page type and image, so a crash after DROP replays the destroy redo
-  // (pages become free pages and rejoin the free list at recovery) while a
-  // ROLLBACK restores the pages exactly.
-  {
-    page_id_t pid = tbl.first_pid_;
-    while (pid != 0) {
-      ASSIGN_OR_RETURN(PageRef, page, storage_->pm_->GetPage(pid));
+  page_id_t pid = current.first_pid_;
+  while (pid != 0) {
+    ASSIGN_OR_RETURN(PageRef, page, storage_->pm_->GetPage(pid));
+    if (!page.IsValid()) {
+      break;
+    }
+    const page_id_t next = page->body.row_page.next_page_id_;
+    RETURN_IF_FAIL(storage_->pm_->DestroyPage(ctx.txn_, &*page));
+    page.PageUnlock();
+    pid = next;
+  }
+  for (size_t i = 0; i < current.IndexCount(); ++i) {
+    for (const page_id_t idx_pid :
+         BPlusTree::CollectPageIds(ctx.txn_, current.GetIndex(i).Root())) {
+      ASSIGN_OR_RETURN(PageRef, page, storage_->pm_->GetPage(idx_pid));
       if (!page.IsValid()) {
-        break;
+        continue;
       }
-      const page_id_t next = page->body.row_page.next_page_id_;
       RETURN_IF_FAIL(storage_->pm_->DestroyPage(ctx.txn_, &*page));
       page.PageUnlock();
-      pid = next;
     }
-    for (size_t i = 0; i < tbl.IndexCount(); ++i) {
-      for (const page_id_t idx_pid :
-           BPlusTree::CollectPageIds(ctx.txn_, tbl.GetIndex(i).Root())) {
-        ASSIGN_OR_RETURN(PageRef, page, storage_->pm_->GetPage(idx_pid));
-        if (!page.IsValid()) {
-          continue;
-        }
-        RETURN_IF_FAIL(storage_->pm_->DestroyPage(ctx.txn_, &*page));
-        page.PageUnlock();
-      }
-    }
-    storage_->pm_->ForgetTableTail(tbl.first_pid_);
   }
-  // Invalidate cached images so later lookups observe the drop.
+  storage_->pm_->ForgetTableTail(current.first_pid_);
   ctx.tables_.erase(canonical);
   ctx.stats_.erase(canonical);
   ctx.tables_.erase(std::string(schema_name));
   ctx.stats_.erase(std::string(schema_name));
+  rollback->Dismiss();
+  return Status::kSuccess;
+}
+
+std::string MaterializedViewKey(std::string_view name) {
+  std::string key(Database::kMaterializedViewKeyPrefix);
+  for (char c : name) {
+    key.push_back(
+        static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return key;
+}
+
+Status Database::PutMaterializedViewDefinition(TransactionContext& ctx,
+                                               std::string_view name,
+                                               std::string_view query_text) {
+  std::scoped_lock lock(catalog_mu_);
+  const std::string key = MaterializedViewKey(name);
+  const Status existing = functions_.Delete(ctx.txn_, key);
+  if (existing != Status::kSuccess && existing != Status::kNotExists) {
+    return existing;
+  }
+  return functions_.Insert(ctx.txn_, key, std::string(query_text));
+}
+
+StatusOr<std::string> Database::GetMaterializedViewDefinition(
+    TransactionContext& ctx, std::string_view name) {
+  StatusOr<std::string> value =
+      functions_.Read(ctx.txn_, MaterializedViewKey(name));
+  if (value.GetStatus() != Status::kSuccess &&
+      value.GetStatus() != Status::kNotExists) {
+    return value.GetStatus();
+  }
+  if (value.GetStatus() == Status::kNotExists) {
+    return Status::kNotExists;
+  }
+  return value.MoveValue();
+}
+
+Status Database::DeleteMaterializedViewDefinition(TransactionContext& ctx,
+                                                  std::string_view name) {
+  std::scoped_lock lock(catalog_mu_);
+  const Status deleted = functions_.Delete(ctx.txn_, MaterializedViewKey(name));
+  if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
+    return deleted;
+  }
+  return Status::kSuccess;
+}
+
+std::string ViewKey(std::string_view name) {
+  std::string key(Database::kViewKeyPrefix);
+  for (char c : name) {
+    key.push_back(
+        static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return key;
+}
+
+// The name index is one record: newline-joined lowercased view names.
+// Views are DDL-rare, so a read-modify-write under catalog_mu_ is cheap and
+// avoids needing a range-scan primitive on the functions tree.
+StatusOr<std::vector<std::string>> DecodeViewIndex(std::string_view record) {
+  std::vector<std::string> names;
+  size_t start = 0;
+  while (start <= record.size()) {
+    const size_t newline = record.find('\n', start);
+    const std::string_view piece = newline == std::string_view::npos
+                                       ? record.substr(start)
+                                       : record.substr(start, newline - start);
+    if (!piece.empty()) {
+      names.emplace_back(piece);
+    }
+    if (newline == std::string_view::npos) {
+      break;
+    }
+    start = newline + 1;
+  }
+  return names;
+}
+
+std::string EncodeViewIndex(const std::vector<std::string>& names) {
+  std::string record;
+  for (const std::string& name : names) {
+    record += name;
+    record += '\n';
+  }
+  return record;
+}
+
+Status WriteViewIndex(BPlusTree& functions, TransactionContext& ctx,
+                      const std::vector<std::string>& names) {
+  const Status deleted =
+      functions.Delete(ctx.txn_, std::string(Database::kViewIndexKey));
+  if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
+    return deleted;
+  }
+  return functions.Insert(ctx.txn_, std::string(Database::kViewIndexKey),
+                          EncodeViewIndex(names));
+}
+
+Status Database::PutViewDefinition(TransactionContext& ctx,
+                                   std::string_view name,
+                                   std::string_view query_text) {
+  std::scoped_lock lock(catalog_mu_);
+  const std::string key = ViewKey(name);
+  const Status existing = functions_.Delete(ctx.txn_, key);
+  if (existing != Status::kSuccess && existing != Status::kNotExists) {
+    return existing;
+  }
+  const Status inserted =
+      functions_.Insert(ctx.txn_, key, std::string(query_text));
+  if (inserted != Status::kSuccess) {
+    return inserted;
+  }
+  std::string lowered(name);
+  for (char& c : lowered) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  std::vector<std::string> names;
+  StatusOr<std::string> index =
+      functions_.Read(ctx.txn_, std::string(kViewIndexKey));
+  if (index.HasValue()) {
+    StatusOr<std::vector<std::string>> decoded = DecodeViewIndex(index.Value());
+    if (decoded.HasValue()) {
+      names = std::move(decoded.Value());
+    }
+  }
+  if (std::ranges::find(names, lowered) == names.end()) {
+    names.push_back(std::move(lowered));
+  }
+  return WriteViewIndex(functions_, ctx, names);
+}
+
+StatusOr<std::string> Database::GetViewDefinition(TransactionContext& ctx,
+                                                  std::string_view name) {
+  StatusOr<std::string> value = functions_.Read(ctx.txn_, ViewKey(name));
+  if (value.GetStatus() != Status::kSuccess &&
+      value.GetStatus() != Status::kNotExists) {
+    return value.GetStatus();
+  }
+  if (value.GetStatus() == Status::kNotExists) {
+    return Status::kNotExists;
+  }
+  return value.MoveValue();
+}
+
+Status Database::DeleteViewDefinition(TransactionContext& ctx,
+                                      std::string_view name) {
+  std::scoped_lock lock(catalog_mu_);
+  const Status deleted = functions_.Delete(ctx.txn_, ViewKey(name));
+  if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
+    return deleted;
+  }
+  std::string lowered(name);
+  for (char& c : lowered) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  StatusOr<std::string> index =
+      functions_.Read(ctx.txn_, std::string(kViewIndexKey));
+  if (!index.HasValue()) {
+    return Status::kSuccess;
+  }
+  StatusOr<std::vector<std::string>> decoded = DecodeViewIndex(index.Value());
+  if (!decoded.HasValue()) {
+    return Status::kSuccess;
+  }
+  std::erase(decoded.Value(), lowered);
+  return WriteViewIndex(functions_, ctx, decoded.Value());
+}
+
+StatusOr<std::vector<std::string>> Database::ListViewDefinitions(
+    TransactionContext& ctx) {
+  StatusOr<std::string> index =
+      functions_.Read(ctx.txn_, std::string(kViewIndexKey));
+  if (index.GetStatus() == Status::kNotExists) {
+    return std::vector<std::string>{};
+  }
+  if (!index.HasValue()) {
+    return index.GetStatus();
+  }
+  return DecodeViewIndex(index.Value());
+}
+
+Status Database::RenameTable(TransactionContext& ctx,
+                             std::string_view from_name,
+                             std::string_view to_name) {
+  std::scoped_lock lock(catalog_mu_);
+  ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, from_name));
+  const std::string canonical(tbl.GetSchema().Name());
+  const std::string target(to_name);
+  if (target.empty()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "RENAME TO requires a non-empty name");
+  }
+  if (EqualsIgnoreCase(target, canonical)) {
+    // Renaming to the same (case-variant) name keeps the canonical spelling
+    // stable; nothing to move.
+    return Status::kSuccess;
+  }
+  // Target existence must be checked case-insensitively (same reasoning as
+  // CreateTable).
+  for (BPlusTreeIterator iter = catalog_.Begin(ctx.txn_); iter.IsValid();
+       ++iter) {
+    const std::string& name = iter.Key();
+    if (name.size() == target.size() &&
+        std::equal(name.begin(), name.end(), target.begin(),
+                   [](char a, char b) {
+                     return std::tolower(static_cast<unsigned char>(a)) ==
+                            std::tolower(static_cast<unsigned char>(b));
+                   })) {
+      return StatusError(StatusCode::kConflicts,
+                         "table " + target + " already exists");
+    }
+  }
+  // A FOREIGN KEY in any other table stores its parent table name as a
+  // string; renaming the parent would silently dangle it (DropTable refuses
+  // for the same reason).
+  for (BPlusTreeIterator iter = catalog_.Begin(ctx.txn_); iter.IsValid();
+       ++iter) {
+    if (EqualsIgnoreCase(iter.Key(), canonical)) {
+      continue;
+    }
+    Table other;
+    if (!Deserialize(iter.Value(), &other)) {
+      return Status::kCorrupt;
+    }
+    const Schema& other_schema = other.GetSchema();
+    for (slot_t i = 0; i < other_schema.ColumnCount(); ++i) {
+      const Constraint& constraint = other_schema.GetColumn(i).GetConstraint();
+      if (constraint.ctype != Constraint::kForeign) {
+        continue;
+      }
+      std::string parent_table;
+      std::vector<std::string> parent_columns;
+      if (!ParseForeignKeyReference(constraint, &parent_table,
+                                    &parent_columns)) {
+        continue;
+      }
+      if (EqualsIgnoreCase(parent_table, canonical)) {
+        return StatusError(StatusCode::kConflicts,
+                           "cannot rename table " + canonical +
+                               " because table " +
+                               std::string(other_schema.Name()) +
+                               " has a FOREIGN KEY referencing it");
+      }
+    }
+  }
+  Table renamed = tbl;
+  renamed.schema_ = tbl.GetSchema().WithName(target);
+  {
+    std::scoped_lock incarnation_lock(table_incarnations_mu_);
+    auto state = table_incarnations_.find(canonical);
+    if (state != table_incarnations_.end()) {
+      table_incarnations_[target] = state->second;
+      table_incarnations_.erase(state);
+    }
+  }
+  RETURN_IF_FAIL(catalog_.Insert(ctx.txn_, target, Serialize(renamed)));
+  RETURN_IF_FAIL(catalog_.Delete(ctx.txn_, canonical));
+  // Statistics entries are keyed by the canonical table name; carry them to
+  // the new name so ANALYZE results survive a rename.
+  if (StatusOr<TableStatistics> stats = GetStatistics(ctx, canonical);
+      stats.HasValue()) {
+    RETURN_IF_FAIL(
+        WriteSplitStatistics(statistics_, ctx.txn_, target, stats.Value()));
+    for (size_t column = 0; column < stats.Value().Columns(); ++column) {
+      const Status deleted = statistics_.Delete(
+          ctx.txn_,
+          StatisticsColumnKey(canonical, static_cast<slot_t>(column)));
+      if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
+        return deleted;
+      }
+    }
+    const Status deleted = statistics_.Delete(ctx.txn_, canonical);
+    if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
+      return deleted;
+    }
+  }
+  BumpSchemaEpoch();
+  return Status::kSuccess;
+}
+
+Status Database::RenameColumn(TransactionContext& ctx,
+                              std::string_view table_name,
+                              std::string_view old_column,
+                              std::string_view new_column) {
+  std::scoped_lock lock(catalog_mu_);
+  ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, table_name));
+  const std::string canonical(tbl.GetSchema().Name());
+  const ColumnName wanted("", old_column);
+  const int offset = tbl.GetSchema().Offset(wanted);
+  if (offset < 0) {
+    return StatusError(
+        StatusCode::kNotExists,
+        "column " + std::string(old_column) + " not found in " + canonical);
+  }
+  for (size_t i = 0; i < tbl.GetSchema().ColumnCount(); ++i) {
+    if (std::cmp_equal(i, offset)) {
+      continue;
+    }
+    if (EqualsIgnoreCase(tbl.GetSchema().GetColumn(i).Name().name,
+                         new_column)) {
+      return StatusError(StatusCode::kConflicts,
+                         "column " + std::string(new_column) +
+                             " already exists in " + canonical);
+    }
+  }
+  Table renamed = tbl;
+  renamed.schema_ = tbl.GetSchema().WithRenamedColumn(
+      static_cast<size_t>(offset), new_column);
+  RETURN_IF_FAIL(catalog_.Update(ctx.txn_, canonical, Serialize(renamed)));
   BumpSchemaEpoch();
   return Status::kSuccess;
 }
@@ -397,6 +919,7 @@ Status Database::CreateIndex(TransactionContext& ctx,
   // Serialize catalog/cache updates under the canonical name: a differently
   // cased reference used to write a second, unreachable catalog entry.
   const std::string canonical(tbl.GetSchema().Name());
+  tbl.incarnation_ = SchemaEpoch();
   RETURN_IF_FAIL(tbl.CreateIndex(ctx.txn_, idx));
   RETURN_IF_FAIL(catalog_.Update(ctx.txn_, canonical, Serialize(tbl)));
   // Refresh the cached image so later inserts maintain the new index.
@@ -414,7 +937,7 @@ StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
   // Read→Insert pair so concurrent registrations cannot both take the
   // insert path.
   std::scoped_lock lock(catalog_mu_);
-  StatusOr<std::string_view> val = functions_.Read(ctx.txn_, function_name);
+  StatusOr<std::string> val = functions_.Read(ctx.txn_, function_name);
   if (val.GetStatus() != Status::kSuccess &&
       val.GetStatus() != Status::kNotExists) {
     return val.GetStatus();
@@ -434,6 +957,14 @@ StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
 
 StatusOr<Table> Database::GetTable(TransactionContext& ctx,
                                    std::string_view schema_name) {
+  const auto bind_incarnation = [&](Table& table) {
+    std::scoped_lock incarnation_lock(table_incarnations_mu_);
+    auto& state = table_incarnations_[std::string(table.GetSchema().Name())];
+    if (state == nullptr) {
+      state = std::make_shared<TableIncarnation>();
+    }
+    table.SetIncarnationState(state);
+  };
   auto read_result = catalog_.Read(ctx.txn_, schema_name);
   if (read_result.HasValue()) {
     Table tbl;
@@ -442,6 +973,7 @@ StatusOr<Table> Database::GetTable(TransactionContext& ctx,
       // out a garbage schema.
       return Status::kCorrupt;
     }
+    bind_incarnation(tbl);
     return tbl;
   }
   // GoogleSQL identifiers are case-insensitive; fall back to a
@@ -459,6 +991,7 @@ StatusOr<Table> Database::GetTable(TransactionContext& ctx,
       if (!Deserialize(iter.Value(), &tbl)) {
         return Status::kCorrupt;
       }
+      bind_incarnation(tbl);
       return tbl;
     }
   }
@@ -519,8 +1052,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
   // Statistics live under the canonical (declared) table name; a differently
   // cased reference used to miss the record and fail the whole lookup.
   const std::string canonical(tbl.GetSchema().Name());
-  ASSIGN_OR_RETURN(std::string_view, meta,
-                   statistics_.Read(ctx.txn_, canonical));
+  ASSIGN_OR_RETURN(std::string, meta, statistics_.Read(ctx.txn_, canonical));
   TableStatistics ts(tbl.GetSchema());
   if (PeekUint64(meta) != kStatisticsMetaMagic) {
     if (!Deserialize(meta, &ts)) {
@@ -531,13 +1063,20 @@ StatusOr<TableStatistics> Database::GetStatistics(
   }
   uint64_t magic = 0;
   uint64_t rows = 0;
+  uint64_t layout_generation = 0;
   {
-    std::string copy(meta);
-    std::stringstream stream(copy);
+    std::stringstream stream(meta);
     Decoder decoder(stream);
     decoder >> magic >> rows;
     if (stream.fail()) {
       return Status::kCorrupt;
+    }
+    // Pre-v3 records stop after `rows`: they certify no physical order.
+    if (!decoder.AtEnd()) {
+      decoder >> layout_generation;
+      if (stream.fail()) {
+        return Status::kCorrupt;
+      }
     }
   }
   const Schema& schema = tbl.GetSchema();
@@ -547,7 +1086,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
     // Column keys live under the canonical name too; using the caller's raw
     // case missed every column record for a differently-cased reference and
     // silently substituted empty ColumnStats.
-    StatusOr<std::string_view> payload =
+    StatusOr<std::string> payload =
         statistics_.Read(ctx.txn_, StatisticsColumnKey(canonical, column));
     if (!payload.HasValue()) {
       columns.emplace_back(schema.GetColumn(column).Type());
@@ -559,7 +1098,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
     }
     columns.push_back(std::move(stats));
   }
-  ts.Assign(rows, std::move(columns));
+  ts.Assign(rows, std::move(columns), layout_generation);
   cache.entries.emplace(name, ts);
   return ts;
 }
@@ -595,6 +1134,36 @@ StatusOr<lsn_t> Database::WriteCheckpoint() {
   return storage_->cm_->WriteCheckpoint();
 }
 
+namespace {
+// Removes the WAL segment series `<wal_base>.<index>` for one database,
+// where `wal_base` is the database's `.log` path. Segments are contiguous
+// from index 0 (recycling only ever trims a prefix), so the first missing
+// file ends the sweep.
+void RemoveWalSegmentFiles(const std::filesystem::path& wal_base) {
+  const std::filesystem::path directory = wal_base.has_parent_path()
+                                              ? wal_base.parent_path()
+                                              : std::filesystem::path(".");
+  const std::string prefix = wal_base.filename().string() + ".";
+  std::error_code ec;
+  std::filesystem::directory_iterator it(directory, ec);
+  if (ec) {
+    return;
+  }
+  for (const std::filesystem::directory_entry& entry : it) {
+    const std::string filename = entry.path().filename().string();
+    if (!filename.starts_with(prefix)) {
+      continue;
+    }
+    const std::string suffix = filename.substr(prefix.size());
+    if (!suffix.empty() && std::ranges::all_of(suffix, [](char c) {
+          return c >= '0' && c <= '9';
+        })) {
+      std::filesystem::remove(entry.path(), ec);
+    }
+  }
+}
+}  // namespace
+
 void Database::RemoveCreatedDatabaseFiles() {
   std::unordered_set<std::string> names;
   {
@@ -602,30 +1171,36 @@ void Database::RemoveCreatedDatabaseFiles() {
     names = created_databases;
   }
   for (const std::string& name : names) {
-    // Same file set as DeleteAll(): the page file, WAL, checkpoint marker
-    // and its stranded temp sibling. Missing entries are the norm (not
-    // every database reaches every stage) and simply ignored.
+    // Same file set as DeleteAll(): the page file, the WAL segment series,
+    // the checkpoint marker and its stranded temp sibling. Missing entries
+    // are the norm (not every database reaches every stage) and simply
+    // ignored.
     std::ignore = std::remove((name + ".db").c_str());
     std::ignore = std::remove((name + ".log").c_str());
+    std::ignore = std::remove((name + ".log.meta").c_str());
+    std::ignore = std::remove((name + ".log.meta.tmp").c_str());
+    RemoveWalSegmentFiles(name + ".log");
     std::ignore = std::remove((name + ".last_checkpoint").c_str());
     std::ignore = std::remove((name + ".last_checkpoint.tmp").c_str());
   }
 }
 
 void Database::DeleteAll() {
-  // The fuzzer harnesses call DeleteAll() mid-session and again from the
-  // ScopedDb destructor, so the storage must stay usable afterwards (no
-  // storage_.reset() here) and a second call must be a no-op.
   if (storage_ == nullptr) {
     return;
   }
   EmulateCrash();
-  std::ignore = std::remove(storage_->DBName().c_str());
-  std::ignore = std::remove(storage_->LogName().c_str());
-  std::ignore = std::remove(storage_->MasterRecordName().c_str());
-  // A failed WriteMasterRecord used to strand its temp file; sweep it here
-  // so repeated DeleteAll/Create cycles don't accumulate strays.
-  std::ignore = std::remove((storage_->MasterRecordName() + ".tmp").c_str());
+  const std::string database_name = storage_->DBName();
+  const std::string log_name = storage_->LogName();
+  const std::string master_record_name = storage_->MasterRecordName();
+  storage_.reset();
+  std::ignore = std::remove(database_name.c_str());
+  std::ignore = std::remove(log_name.c_str());
+  std::ignore = std::remove((log_name + ".meta").c_str());
+  std::ignore = std::remove((log_name + ".meta.tmp").c_str());
+  RemoveWalSegmentFiles(log_name);
+  std::ignore = std::remove(master_record_name.c_str());
+  std::ignore = std::remove((master_record_name + ".tmp").c_str());
 }
 
 }  // namespace tinylamb

@@ -518,6 +518,189 @@ inline std::string Sha512Digest(std::string_view data) {
   return h.Finalize();
 }
 
+// ---------------------------------------------------- FarmHash64 (Fingerprint)
+// Bit-exact port of FarmHash's `farmhashna::Hash64`, the function behind
+// GoogleSQL FARM_FINGERPRINT (Fingerprint64 in the reference library).
+// Algorithm by Google (github.com/google/farmhash); re-typed here so the
+// engine keeps its self-contained dependency stance. Byte order matches the
+// reference: 64/32-bit reads are little-endian words of the input bytes.
+
+inline uint64_t Fetch64Little(const char* p) {
+  uint64_t result = 0;
+  std::memcpy(&result, p, sizeof(result));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  result = __builtin_bswap64(result);
+#endif
+  return result;
+}
+
+inline uint32_t Fetch32Little(const char* p) {
+  uint32_t result = 0;
+  std::memcpy(&result, p, sizeof(result));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  result = __builtin_bswap32(result);
+#endif
+  return result;
+}
+
+inline uint64_t FarmRotate(uint64_t val, int shift) {
+  return shift == 0 ? val : ((val >> shift) | (val << (64 - shift)));
+}
+
+inline uint64_t FarmShiftMix(uint64_t val) { return val ^ (val >> 47); }
+
+// Murmur-inspired 128 -> 64 mixing (farmhash.h Hash128to64).
+inline uint64_t FarmHash128to64(uint64_t lo, uint64_t hi) {
+  constexpr uint64_t kMul = 0x9ddfea08eb382d69ULL;
+  uint64_t a = (lo ^ hi) * kMul;
+  a ^= (a >> 47);
+  uint64_t b = (hi ^ a) * kMul;
+  b ^= (b >> 47);
+  b *= kMul;
+  return b;
+}
+
+inline uint64_t FarmHashLen16(uint64_t u, uint64_t v, uint64_t mul) {
+  uint64_t a = (u ^ v) * mul;
+  a ^= (a >> 47);
+  uint64_t b = (v ^ a) * mul;
+  b ^= (b >> 47);
+  b *= mul;
+  return b;
+}
+
+inline uint64_t FarmHashLen0to16(const char* s, size_t len) {
+  constexpr uint64_t k0 = 0xc3a5c85c97cb3127ULL;
+  constexpr uint64_t k2 = 0x9ae16a3b2f90404fULL;
+  if (len >= 8) {
+    const uint64_t mul = k2 + (len * 2);
+    const uint64_t a = Fetch64Little(s) + k2;
+    const uint64_t b = Fetch64Little(s + len - 8);
+    const uint64_t c = (FarmRotate(b, 37) * mul) + a;
+    const uint64_t d = (FarmRotate(a, 25) + b) * mul;
+    return FarmHashLen16(c, d, mul);
+  }
+  if (len >= 4) {
+    const uint64_t mul = k2 + (len * 2);
+    const uint64_t a = Fetch32Little(s);
+    return FarmHashLen16(len + (a << 3), Fetch32Little(s + len - 4), mul);
+  }
+  if (len > 0) {
+    const auto a = static_cast<uint8_t>(s[0]);
+    const auto b = static_cast<uint8_t>(s[len >> 1]);
+    const auto c = static_cast<uint8_t>(s[len - 1]);
+    const uint32_t y =
+        static_cast<uint32_t>(a) + (static_cast<uint32_t>(b) << 8);
+    const uint32_t z =
+        static_cast<uint32_t>(len) + (static_cast<uint32_t>(c) << 2);
+    return FarmShiftMix((y * k2) ^ (z * k0)) * k2;
+  }
+  return k2;
+}
+
+inline uint64_t FarmHashLen17to32(const char* s, size_t len) {
+  constexpr uint64_t k1 = 0xb492b66fbe98f273ULL;
+  constexpr uint64_t k2 = 0x9ae16a3b2f90404fULL;
+  const uint64_t mul = k2 + (len * 2);
+  const uint64_t a = Fetch64Little(s) * k1;
+  const uint64_t b = Fetch64Little(s + 8);
+  const uint64_t c = Fetch64Little(s + len - 8) * mul;
+  const uint64_t d = Fetch64Little(s + len - 16) * k2;
+  return FarmHashLen16(FarmRotate(a + b, 43) + FarmRotate(c, 30) + d,
+                       a + FarmRotate(b + k2, 18) + c, mul);
+}
+
+// Quick-and-dirty 16-byte hash used inside the long-input loop.
+inline std::pair<uint64_t, uint64_t> FarmWeakHashLen32WithSeeds(
+    uint64_t w, uint64_t x, uint64_t y, uint64_t z, uint64_t a, uint64_t b) {
+  a += w;
+  b = FarmRotate(b + a + z, 21);
+  const uint64_t c = a;
+  a += x;
+  a += y;
+  b += FarmRotate(a, 44);
+  return {a + z, b + c};
+}
+
+inline std::pair<uint64_t, uint64_t> FarmWeakHashLen32WithSeeds(const char* s,
+                                                                uint64_t a,
+                                                                uint64_t b) {
+  return FarmWeakHashLen32WithSeeds(Fetch64Little(s), Fetch64Little(s + 8),
+                                    Fetch64Little(s + 16),
+                                    Fetch64Little(s + 24), a, b);
+}
+
+inline uint64_t FarmHashLen33to64(const char* s, size_t len) {
+  constexpr uint64_t k2 = 0x9ae16a3b2f90404fULL;
+  const uint64_t mul = k2 + (len * 2);
+  const uint64_t a = Fetch64Little(s) * k2;
+  const uint64_t b = Fetch64Little(s + 8);
+  const uint64_t c = Fetch64Little(s + len - 8) * mul;
+  const uint64_t d = Fetch64Little(s + len - 16) * k2;
+  const uint64_t y = FarmRotate(a + b, 43) + FarmRotate(c, 30) + d;
+  const uint64_t z = FarmHashLen16(y, a + FarmRotate(b + k2, 18) + c, mul);
+  const uint64_t e = Fetch64Little(s + 16) * mul;
+  const uint64_t f = Fetch64Little(s + 24);
+  const uint64_t g = (y + Fetch64Little(s + len - 32)) * mul;
+  const uint64_t h = (z + Fetch64Little(s + len - 24)) * mul;
+  return FarmHashLen16(FarmRotate(e + f, 43) + FarmRotate(g, 30) + h,
+                       e + FarmRotate(f + a, 18) + g, mul);
+}
+
+// Fingerprint64: 0..32 bytes take the short paths, 33..64 the medium one and
+// anything longer walks 64-byte blocks keeping v/w/x/y/z state.
+inline uint64_t FarmFingerprint64(std::string_view data) {
+  constexpr uint64_t k0 = 0xc3a5c85c97cb3127ULL;
+  constexpr uint64_t k1 = 0xb492b66fbe98f273ULL;
+  constexpr uint64_t k2 = 0x9ae16a3b2f90404fULL;
+  const char* s = data.data();
+  const size_t len = data.size();
+  if (len <= 32) {
+    return len <= 16 ? FarmHashLen0to16(s, len) : FarmHashLen17to32(s, len);
+  }
+  if (len <= 64) {
+    return FarmHashLen33to64(s, len);
+  }
+  const uint64_t seed = 81;
+  uint64_t x = seed;
+  uint64_t y = (seed * k1) + 113;
+  uint64_t z = FarmShiftMix((y * k2) + 113) * k2;
+  std::pair<uint64_t, uint64_t> v{0, 0};
+  std::pair<uint64_t, uint64_t> w{0, 0};
+  x = (x * k2) + Fetch64Little(s);
+  const char* end = s + (((len - 1) / 64) * 64);
+  const char* last64 = end + ((len - 1) & 63) - 63;
+  do {
+    x = FarmRotate(x + y + v.first + Fetch64Little(s + 8), 37) * k1;
+    y = FarmRotate(y + v.second + Fetch64Little(s + 48), 42) * k1;
+    x ^= w.second;
+    y += v.first + Fetch64Little(s + 40);
+    z = FarmRotate(z + w.first, 33) * k1;
+    v = FarmWeakHashLen32WithSeeds(s, v.second * k1, x + w.first);
+    w = FarmWeakHashLen32WithSeeds(s + 32, z + w.second,
+                                   y + Fetch64Little(s + 16));
+    std::swap(z, x);
+    s += 64;
+  } while (s != end);
+  const uint64_t mul = k1 + ((z & 0xff) << 1);
+  s = last64;
+  w.first += ((len - 1) & 63);
+  v.first += w.first;
+  w.first += v.first;
+  x = FarmRotate(x + y + v.first + Fetch64Little(s + 8), 37) * mul;
+  y = FarmRotate(y + v.second + Fetch64Little(s + 48), 42) * mul;
+  x ^= w.second * 9;
+  y += (v.first * 9) + Fetch64Little(s + 40);
+  z = FarmRotate(z + w.first, 33) * mul;
+  v = FarmWeakHashLen32WithSeeds(s, v.second * mul, x + w.first);
+  w = FarmWeakHashLen32WithSeeds(s + 32, z + w.second,
+                                 y + Fetch64Little(s + 16));
+  std::swap(z, x);
+  return FarmHashLen16(
+      (FarmHashLen16(v.first, w.first, mul) + (FarmShiftMix(y) * k0)) + z,
+      FarmHashLen16(v.second, w.second, mul) + x, mul);
+}
+
 }  // namespace tinylamb::digest
 
 #endif  // TINYLAMB_DIGEST_HPP

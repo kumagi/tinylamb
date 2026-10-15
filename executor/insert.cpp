@@ -231,12 +231,16 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
     StatusOr<RowPosition> inserted = target_->Insert(*txn_, new_row);
     if (inserted.GetStatus() != Status::kSuccess) {
       // A failed insert (e.g. UNIQUE violation) must not be counted as
-      // inserted; surface the failure instead of reporting success.
-      return FailWith(
-          StatusError(StatusCode::kConflicts,
-
-                      "insert failed on table " +
-                          std::string(target_->GetSchema().Name())));
+      // inserted; surface the failure instead of reporting success. The
+      // original message rides along when the failure carried one, so a
+      // table-tail timeout is not flattened into a bare "Conflicts".
+      const Status failure = inserted.GetStatus();
+      std::string message =
+          "insert failed on table " + std::string(target_->GetSchema().Name());
+      if (!failure.GetMessage().empty()) {
+        message += ": " + failure.GetMessage();
+      }
+      return FailWith(StatusError(failure.GetCode(), std::move(message)));
     }
     if (has_key) {
       existing_keys.insert(key);

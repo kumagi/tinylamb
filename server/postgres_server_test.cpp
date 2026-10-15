@@ -25,8 +25,13 @@
 
 #include "common/random_string.hpp"
 #include "database/database.hpp"
+#include "executor/executor_base.hpp"
 #include "gtest/gtest.h"
+#include "query/sql_engine.hpp"
+#include "query/statement.hpp"
 #include "server/postgres_protocol.hpp"
+#include "type/row.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 namespace {
@@ -126,6 +131,34 @@ class StopGuard {
  private:
   PostgresServer* server_;
 };
+
+class LateFailureExecutor final : public ExecutorBase {
+ public:
+  bool Next(Row* row, RowPosition* /*position*/) override {
+    ++next_calls;
+    if (next_calls == 1) {
+      *row = Row({Value("Insert Rows"), Value(int64_t{7})});
+      return true;
+    }
+    return FailWith(
+        StatusError(StatusCode::kRuntimeError, "late executor failure"));
+  }
+
+  void Dump(std::ostream& output, int /*indent*/) const override {
+    output << "LateFailureExecutor";
+  }
+
+  int next_calls{0};
+};
+
+TEST(PostgresServerTest, NonSelectCommandDrainRejectsLateFailure) {
+  auto executor = std::make_shared<LateFailureExecutor>();
+  QueryResult result(executor, StatementType::kInsert, {});
+  int64_t affected_rows = 0;
+  EXPECT_EQ(DrainCommandResult(result, &affected_rows), Status::kRuntimeError);
+  EXPECT_EQ(affected_rows, 7);
+  EXPECT_EQ(executor->next_calls, 2);
+}
 
 TEST(PostgresServerTest, ExecutesQueriesOverTcpProtocol) {
   const std::string path = "postgres_server_test-" + RandomString();
@@ -1138,15 +1171,17 @@ TEST(PostgresServerTest, ListenFailsWhenPortAlreadyInUse) {
       getsockname(conflict, reinterpret_cast<sockaddr*>(&bound), &bound_size),
       0);
 
-  PostgresServerOptions options;
-  options.listen_address = "127.0.0.1";
-  options.port = ntohs(bound.sin_port);
-  PostgresServer server(path, options);
-  std::string listen_error;
-  // Act -- binding the same address:port must fail cleanly
-  EXPECT_FALSE(server.Listen(&listen_error)) << listen_error;
-  // Assert -- the error names the bind step
-  EXPECT_NE(listen_error.find("could not bind"), std::string::npos);
+  {
+    PostgresServerOptions options;
+    options.listen_address = "127.0.0.1";
+    options.port = ntohs(bound.sin_port);
+    PostgresServer server(path, options);
+    std::string listen_error;
+    // Act -- binding the same address:port must fail cleanly
+    EXPECT_FALSE(server.Listen(&listen_error)) << listen_error;
+    // Assert -- the error names the bind step
+    EXPECT_NE(listen_error.find("could not bind"), std::string::npos);
+  }
 
   close(conflict);
   auto database_holder = Database::Create(path).MoveValue();
@@ -1157,17 +1192,19 @@ TEST(PostgresServerTest, ListenFailsWhenPortAlreadyInUse) {
 
 TEST(PostgresServerTest, ListenOnIpv6Loopback) {
   const std::string path = "postgres_server_ipv6_test-" + RandomString();
-  PostgresServerOptions options;
-  options.listen_address = "::1";
-  options.port = 0;
-  PostgresServer server(path, options);
-  std::string listen_error;
-  // Act -- bind to the IPv6 loopback (skips when IPv6 is unavailable)
-  if (!server.Listen(&listen_error)) {
-    GTEST_SKIP() << listen_error;
+  {
+    PostgresServerOptions options;
+    options.listen_address = "::1";
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string listen_error;
+    // Act -- bind to the IPv6 loopback (skips when IPv6 is unavailable)
+    if (!server.Listen(&listen_error)) {
+      GTEST_SKIP() << listen_error;
+    }
+    EXPECT_NE(server.BoundPort(), 0);
+    server.RequestStop();
   }
-  EXPECT_NE(server.BoundPort(), 0);
-  server.RequestStop();
   auto database_holder = Database::Create(path).MoveValue();
   CHECK(database_holder != nullptr);
   Database& database = *database_holder;
@@ -1217,15 +1254,17 @@ TEST(PostgresServerTest, FailedAutomaticTransactionRecoversSession) {
 
 TEST(PostgresServerTest, ListenFailsOnUnresolvableListenAddress) {
   const std::string path = "postgres_server_badaddr_test-" + RandomString();
-  PostgresServerOptions options;
-  options.listen_address = "256.256.256.256";
-  options.port = 0;
-  PostgresServer server(path, options);
-  std::string listen_error;
-  // Act -- name resolution for the invalid address must fail up front
-  EXPECT_FALSE(server.Listen(&listen_error));
-  // Assert -- the error names the getaddrinfo step
-  EXPECT_NE(listen_error.find("getaddrinfo"), std::string::npos);
+  {
+    PostgresServerOptions options;
+    options.listen_address = "256.256.256.256";
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string listen_error;
+    // Act -- name resolution for the invalid address must fail up front
+    EXPECT_FALSE(server.Listen(&listen_error));
+    // Assert -- the error names the getaddrinfo step
+    EXPECT_NE(listen_error.find("getaddrinfo"), std::string::npos);
+  }
   auto database_holder = Database::Create(path).MoveValue();
   CHECK(database_holder != nullptr);
   Database& database = *database_holder;

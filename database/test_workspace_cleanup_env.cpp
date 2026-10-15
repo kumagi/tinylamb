@@ -23,11 +23,13 @@ namespace {
 class TestDatabaseCleanup : public ::testing::Environment {
  public:
   void SetUp() override {
-    const char* const keep = std::getenv("TINYLAMB_KEEP_TEST_DATABASES");
+    const char* keep = std::getenv("TINYLAMB_KEEP_TEST_DATABASES");
     keep_artifacts_ = keep != nullptr && keep[0] != '\0' && keep[0] != '0';
   }
 
-  void TearDown() override {
+  // gtest's Environment::TearDown is a non-const virtual, so the const
+  // transformation the checker suggests would silently drop the override.
+  void TearDown() override {  // NOLINT(readability-make-member-function-const)
     if (!keep_artifacts_) {
       tinylamb::Database::RemoveCreatedDatabaseFiles();
     }

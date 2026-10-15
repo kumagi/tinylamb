@@ -27,6 +27,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
@@ -327,6 +328,42 @@ double ElapsedMs(std::chrono::steady_clock::time_point begin) {
 
 namespace {
 
+// Runtime-selected backing store for int64-keyed group maps: the flat
+// open-addressing table by default, the node-based unordered_map under the
+// TINYLAMB_DISABLE_FLAT_GROUP_MAP hatch.  One shape serves every use site.
+template <typename Group>
+class IntGroupMapAdapter {
+ public:
+  IntGroupMapAdapter() : use_flat_(true) {}
+  explicit IntGroupMapAdapter(bool use_flat) : use_flat_(use_flat) {}
+
+  std::pair<Group*, bool> TryEmplace(int64_t key) {
+    if (use_flat_) {
+      bool inserted = false;
+      return {flat_.TryEmplace(key, &inserted), inserted};
+    }
+    auto [iter, inserted] = node_.try_emplace(key);
+    return {&iter->second, inserted};
+  }
+
+  template <typename Fn>
+  void ForEach(Fn&& fn) {
+    if (use_flat_) {
+      flat_.ForEach(std::forward<Fn>(fn));
+      return;
+    }
+    for (auto& [key, group] : node_) {
+      fn(key, group);
+    }
+  }
+
+  void set_use_flat(bool value) { use_flat_ = value; }
+
+ private:
+  bool use_flat_;
+  FlatIntKeyMap<Group> flat_;
+  std::unordered_map<int64_t, Group> node_;
+};
 void CountStatementTablesImpl(  // NOLINT(misc-no-recursion)
     const SelectStatement& statement,
     std::unordered_map<std::string, size_t>* counts,
@@ -440,11 +477,111 @@ const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
   }
   return &found->second;
 }
+
+ScopedCorrelatedOuter::ScopedCorrelatedOuter(TransactionContext& context,
+                                             const Relation& relation)
+    : context_(&context),
+      saved_relation_(
+          context.execution_runtime() != nullptr
+              ? context.execution_runtime()->correlated_outer_relation
+              : nullptr),
+      saved_serial_(context.execution_runtime() != nullptr
+                        ? context.execution_runtime()->correlated_outer_serial
+                        : 0) {
+  ExecutionRuntime* runtime = context.execution_runtime();
+  if (runtime == nullptr) {
+    return;
+  }
+  runtime->correlated_outer_serials += 1;
+  runtime->correlated_outer_relation = &relation;
+  runtime->correlated_outer_serial = runtime->correlated_outer_serials;
+}
+
+ScopedCorrelatedOuter::~ScopedCorrelatedOuter() {
+  ExecutionRuntime* runtime = context_->execution_runtime();
+  if (runtime == nullptr) {
+    return;
+  }
+  runtime->correlated_outer_relation = saved_relation_;
+  runtime->correlated_outer_serial = saved_serial_;
+}
+
+std::optional<ScanRuntimeFilter> CorrelationDomainFilter(
+    const Schema& source_schema, slot_t local_column,
+    const ColumnName& outer_column, const std::vector<slot_t>& projection,
+    const ExecutionRuntime& runtime) {
+  static const bool disabled =
+      std::getenv("TINYLAMB_DISABLE_CORRELATED_DOMAIN_FILTER") != nullptr;
+  if (disabled || runtime.correlated_outer_relation == nullptr ||
+      local_column >= source_schema.ColumnCount()) {
+    return std::nullopt;
+  }
+  const ValueType type = source_schema.GetColumn(local_column).Type();
+  if (type != ValueType::kInt64 && type != ValueType::kDate) {
+    return std::nullopt;
+  }
+  const Relation& outer = *runtime.correlated_outer_relation;
+  const std::optional<size_t> outer_offset =
+      LocalColumnOffset(outer.schema, outer_column);
+  if (!outer_offset || *outer_offset >= outer.schema.ColumnCount()) {
+    return std::nullopt;
+  }
+  // The extraction walks every outer row once per build; skip shapes whose
+  // outer pipeline is large enough to make that walk its own regression.
+  // Spilled outer relations are also skipped outright: iteration then reads
+  // through the spill layer, and a misread value here would silently shrink
+  // the build into a wrong empty result (the spill-memory-budget regime is
+  // one where the unfiltered build was affordable anyway).
+  if (outer.HasSpill() || outer.TotalRows() == 0 ||
+      outer.TotalRows() > 2000000) {
+    return std::nullopt;
+  }
+  RuntimeFilterBuilder builder;
+  const Status iteration = outer.ForEachRow([&](const Row& row) {
+    const Value& value = row[*outer_offset];
+    // NULL never satisfies an equality, so it is correctly outside the
+    // domain; a value of any other type is foreign to the comparison domain.
+    if (value.IsNull() ||
+        static_cast<int8_t>(value.type) != static_cast<int8_t>(type)) {
+      return;
+    }
+    builder.Observe(value.value.int_value);
+  });
+  if (iteration != Status::kSuccess || builder.overflowed() ||
+      builder.empty() || builder.DistinctKeys() > 1000000) {
+    return std::nullopt;
+  }
+  auto group = builder.Build(false);
+  if (group == nullptr) {
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < projection.size(); ++i) {
+    if (projection[i] == local_column) {
+      ScanRuntimeFilter filter;
+      filter.group = std::move(group);
+      filter.column = static_cast<slot_t>(i);
+      filter.type = type;
+      return filter;
+    }
+  }
+  return std::nullopt;
+}
+
 // True when the cache entry keyed by `statement`'s address was created for
 // this very statement (address recycling guard). Records `fresh` when absent.
+// The fingerprint string is memoized per statement pointer for the execution:
+// subquery statements are retained (retained_statements) and immutable within
+// one runtime, so rebuilding the AST walk per probe (Q22: ~61K) is waste.
 bool CacheEntryIsCurrent(const SelectStatement& statement,
                          ExecutionRuntime& runtime) {
-  const std::string& fresh = statement.Fingerprint();
+  const auto memo = runtime.fingerprint_memo.find(&statement);
+  const std::string* fresh_ptr =
+      memo != runtime.fingerprint_memo.end()
+          ? &memo->second
+          : &runtime.fingerprint_memo
+                 .emplace(&statement, statement.Fingerprint())
+                 .first->second;
+  const std::string& fresh = *fresh_ptr;
   const auto [it, inserted] =
       runtime.cache_fingerprints.try_emplace(&statement, fresh);
   if (!inserted && it->second != fresh) {
@@ -457,6 +594,140 @@ bool CacheEntryIsCurrent(const SelectStatement& statement,
 void DropCacheEntry(ExecutionRuntime& runtime, const SelectStatement* key) {
   runtime.cache_fingerprints.erase(key);
 }
+
+namespace {
+
+// Count of the statement's base-table sources whose (alias-qualified) schema
+// resolves `name`, with the resolving source's ordinal when exactly one
+// does.  CTE sources have no base table to peek and never resolve here.
+std::optional<size_t> ResolvingSource(TransactionContext& context,
+                                      const SelectStatement& statement,
+                                      const CteMap& ctes,
+                                      const ColumnName& name) {
+  std::optional<size_t> found;
+  for (size_t i = 0; i < statement.Sources().size(); ++i) {
+    const SelectSource& source = statement.Sources()[i];
+    if (source.query != nullptr || source.unnest != nullptr ||
+        source.sample.has_value() || source.table.empty()) {
+      continue;
+    }
+    if (ctes.contains(source.table) ||
+        statement.WithQueries().contains(source.table)) {
+      continue;
+    }
+    StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
+    if (!table.HasValue()) {
+      continue;
+    }
+    Schema schema = table.Value()->GetSchema();
+    const std::string qualifier =
+        source.alias.empty() ? source.table : source.alias;
+    if (!qualifier.empty()) {
+      schema = QualifySchema(schema, qualifier);
+    }
+    if (LocalColumnOffset(schema, name).has_value()) {
+      if (found.has_value()) {
+        return std::nullopt;  // Ambiguous: two sources resolve the name.
+      }
+      found = i;
+    }
+  }
+  return found;
+}
+
+// The `local = outer` column pair of the statement's first correlation
+// equality, with the local side resolving in exactly one base-table source.
+// Drives the multi-source build's domain stash.
+std::optional<std::pair<ColumnName, ColumnName>> CorrelationEqualityOf(
+    TransactionContext& context, const SelectStatement& statement,
+    const CteMap& ctes) {
+  for (const Expression& predicate : SplitConjuncts(statement.WhereClause())) {
+    if (predicate == nullptr || predicate->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const BinaryExpression& binary = predicate->AsBinaryExpression();
+    if (binary.Op() != BinaryOperation::kEquals ||
+        binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& left = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& right = binary.Right()->AsColumnValue().GetColumnName();
+    const std::optional<size_t> left_source =
+        ResolvingSource(context, statement, ctes, left);
+    const std::optional<size_t> right_source =
+        ResolvingSource(context, statement, ctes, right);
+    if (left_source.has_value() != right_source.has_value()) {
+      if (left_source.has_value()) {
+        return std::make_pair(left, right);
+      }
+      return std::make_pair(right, left);
+    }
+  }
+  return std::nullopt;
+}
+
+// Stashes the correlation-domain key filter for the source table the
+// statement's correlation equality resolves against, so BuildInput's own
+// scan of that table prunes foreign keys pre-decode.  Owner-scoped to this
+// statement; the caller erased any previous entries.
+void StashBuildDomainFilter(
+    TransactionContext& context, const SelectStatement& statement,
+    const CteMap& ctes, const std::pair<ColumnName, ColumnName>& correlation) {
+  ExecutionRuntime& runtime = *context.execution_runtime();
+  const std::optional<size_t> index =
+      ResolvingSource(context, statement, ctes, correlation.first);
+  if (!index.has_value()) {
+    return;
+  }
+  const SelectSource& source = statement.Sources()[*index];
+  StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
+  if (!table.HasValue()) {
+    return;
+  }
+  Schema schema = table.Value()->GetSchema();
+  const std::string qualifier =
+      source.alias.empty() ? source.table : source.alias;
+  if (!qualifier.empty()) {
+    schema = QualifySchema(schema, qualifier);
+  }
+  const std::optional<size_t> local_offset =
+      LocalColumnOffset(schema, correlation.first);
+  if (!local_offset) {
+    return;
+  }
+  // Identity projection: the filter binds the full-schema slot; the
+  // consuming scan remaps it into its own projection.
+  std::vector<slot_t> identity(schema.ColumnCount());
+  for (size_t i = 0; i < identity.size(); ++i) {
+    identity[i] = static_cast<slot_t>(i);
+  }
+  std::optional<ScanRuntimeFilter> filter =
+      CorrelationDomainFilter(schema, static_cast<slot_t>(*local_offset),
+                              correlation.second, identity, runtime);
+  if (!filter.has_value()) {
+    return;
+  }
+  // A self-join over the same table would apply one column's domain to both
+  // sides; only stash unambiguous (single-source) tables.
+  size_t same_table = 0;
+  for (const SelectSource& other : statement.Sources()) {
+    if (other.table == source.table) {
+      ++same_table;
+    }
+  }
+  if (same_table != 1) {
+    return;
+  }
+  TableKeyFilter& stored = runtime.table_key_filters[source.table];
+  stored.filter = filter->group;
+  stored.type = filter->type;
+  stored.key_count = filter->group->DistinctKeys();
+  stored.column = static_cast<slot_t>(*local_offset);
+  stored.owner = &statement;
+}
+
+}  // namespace
 
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
@@ -488,7 +759,22 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       context.execution_runtime()->correlated_indexes.find(&statement);
   if (cached != context.execution_runtime()->correlated_indexes.end()) {
     if (CacheEntryIsCurrent(statement, *context.execution_runtime())) {
-      index = cached->second.get();
+      CorrelatedIndex* candidate = cached->second.get();
+      // A build made under a correlation-domain filter only carries keys of
+      // the outer context it was built for; reusing it under any other
+      // context (including no context) would silently miss rows.  Unfiltered
+      // builds (serial 0) stay universally valid.
+      if (candidate->outer_filter_serial == 0 ||
+          (candidate->outer_filter_relation ==
+               context.execution_runtime()->correlated_outer_relation &&
+           candidate->outer_filter_serial ==
+               context.execution_runtime()->correlated_outer_serial)) {
+        index = candidate;
+      } else {
+        DropCacheEntry(*context.execution_runtime(), &statement);
+        context.execution_runtime()->correlated_indexes.erase(cached);
+        context.execution_runtime()->unindexable_queries.erase(&statement);
+      }
     } else {
       // Address recycled: the entry belongs to a dead statement.
       DropCacheEntry(*context.execution_runtime(), &statement);
@@ -544,6 +830,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       return std::nullopt;
     }
     Relation source;
+    // Set when the build scan gets pruned by the correlation-key domain of
+    // the currently registered outer relation; recorded on the cache entry
+    // so a later probe from a different context rebuilds.
+    const void* domain_relation = nullptr;
+    uint64_t domain_serial = 0;
     if (statement.Sources().size() == 1) {
       std::vector<slot_t> projection;
       if (peek_schema.ColumnCount() > 0) {
@@ -558,18 +849,100 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           projection.push_back(0);
         }
       }
+      // Correlation-domain pruning: the registered outer relation (the
+      // WHERE-filter pipeline evaluating this subquery) carries every outer
+      // value the probes will ever present, so rows whose correlation key
+      // falls outside that domain can be rejected before decode — the same
+      // sound shape a hash join uses to prune its probe side.  The stash
+      // note above stays true for TableKeyFilter: this filter is derived
+      // from THIS statement's own correlation equality and recorded on the
+      // cache entry, so an unrelated or later outer context can never
+      // narrow another scan.
+      std::optional<std::pair<slot_t, ColumnName>> correlation_equality;
+      for (const Expression& predicate :
+           SplitConjuncts(statement.WhereClause())) {
+        if (predicate->Type() != TypeTag::kBinaryExp) {
+          continue;
+        }
+        const BinaryExpression& binary = predicate->AsBinaryExpression();
+        if (binary.Op() != BinaryOperation::kEquals ||
+            binary.Left()->Type() != TypeTag::kColumnValue ||
+            binary.Right()->Type() != TypeTag::kColumnValue) {
+          continue;
+        }
+        const ColumnName& left = binary.Left()->AsColumnValue().GetColumnName();
+        const ColumnName& right =
+            binary.Right()->AsColumnValue().GetColumnName();
+        const auto left_local = LocalColumnOffset(peek_schema, left);
+        const auto right_local = LocalColumnOffset(peek_schema, right);
+        if (left_local && !right_local) {
+          correlation_equality.emplace(static_cast<slot_t>(*left_local), right);
+          break;
+        }
+        if (right_local && !left_local) {
+          correlation_equality.emplace(static_cast<slot_t>(*right_local), left);
+          break;
+        }
+      }
+      ScanRuntimeFilter domain_filter;
+      const ScanRuntimeFilter* domain_filter_ptr = nullptr;
+      if (correlation_equality &&
+          context.execution_runtime()->correlated_outer_relation != nullptr) {
+        std::optional<ScanRuntimeFilter> filter =
+            CorrelationDomainFilter(peek_schema, correlation_equality->first,
+                                    correlation_equality->second, projection,
+                                    *context.execution_runtime());
+        if (filter.has_value()) {
+          domain_filter = std::move(*filter);
+          domain_filter_ptr = &domain_filter;
+          domain_relation =
+              context.execution_runtime()->correlated_outer_relation;
+          domain_serial = context.execution_runtime()->correlated_outer_serial;
+          ++context.execution_runtime()->correlated_domain_filter_builds;
+        }
+      }
       // NOTE: table_key_filters are intentionally NOT applied here. The stash
       // is owned by the statement that derived it; applying it to correlated
       // subqueries silently narrowed unrelated scans.
       StatusOr<Relation> loaded =
           LoadSource(context, from, &outer, ctes,
                      projection.empty() ? nullptr : &projection, nullptr,
-                     nullptr, std::nullopt);
+                     domain_filter_ptr);
       if (!loaded.HasValue()) {
         return std::nullopt;
       }
       source = loaded.MoveValue();
     } else {
+      // Multi-source build: prune the correlation table's scan to the outer
+      // key domain.  The registered outer relation (the WHERE-filter
+      // pipeline probing this subquery) carries every correlation value a
+      // probe can present, so rows with foreign keys are rejected before
+      // decode — the same sound shape the single-source path derives above.
+      // Routed through the BuildInput stash (owner = this statement) so the
+      // join's own scan of the correlation table consumes it and no other
+      // statement ever sees it.  A build made without a registration, or
+      // under a different registration, must never inherit a previous
+      // domain: stale entries are erased first and the cache entry records
+      // the serial it was built under.
+      {
+        ExecutionRuntime& runtime = *context.execution_runtime();
+        for (auto iter = runtime.table_key_filters.begin();
+             iter != runtime.table_key_filters.end();) {
+          if (iter->second.owner == &statement) {
+            iter = runtime.table_key_filters.erase(iter);
+          } else {
+            ++iter;
+          }
+        }
+        std::optional<std::pair<ColumnName, ColumnName>> correlation =
+            CorrelationEqualityOf(context, statement, ctes);
+        if (correlation.has_value() &&
+            runtime.correlated_outer_relation != nullptr) {
+          domain_relation = runtime.correlated_outer_relation;
+          domain_serial = runtime.correlated_outer_serial;
+          StashBuildDomainFilter(context, statement, ctes, *correlation);
+        }
+      }
       bool predicates_applied = false;
       StatusOr<Relation> built =
           BuildInput(context, statement, &outer, ctes, &predicates_applied);
@@ -580,6 +953,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     }
     auto created = std::make_unique<CorrelatedIndex>();
     created->schema = source.schema;
+    created->outer_filter_relation = domain_relation;
+    created->outer_filter_serial = domain_serial;
     std::vector<Expression> indexed_equalities;
     for (const Expression& predicate :
          SplitConjuncts(statement.WhereClause())) {
@@ -657,42 +1032,6 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       local_predicates.push_back(predicate);
     }
 
-    // Expressions evaluated while building the index below run without the
-    // outer scope, so anything referencing outer columns cannot be handled
-    // here. Treat such statements as unindexable and let the generic
-    // correlated path (which evaluates WHERE with the outer scope) take over.
-    {
-      bool references_outer = false;
-      auto check = [&](const Expression& expression) {
-        if (!expression) {
-          return;
-        }
-        for (const ColumnName& column : expression->TouchedColumns()) {
-          if (column.name == "*") {
-            continue;
-          }
-          if (!LocalColumnOffset(source.schema, column)) {
-            references_outer = true;
-          }
-        }
-      };
-      for (const Expression& predicate : local_predicates) {
-        check(predicate);
-      }
-      if (aggregate_only) {
-        for (const NamedExpression& item : statement.SelectList()) {
-          check(item.expression);
-        }
-        check(statement.Having());
-      }
-      if (references_outer) {
-        context.execution_runtime()->unindexable_queries.insert(&statement);
-        return std::nullopt;
-      }
-    }
-
-    source.FinishSpill();
-    Status group_error{Status::kSuccess};
     const bool integer_key =
         SingleIntegerJoinKey(source.schema, created->local_columns);
     const auto integer_key_value = [&](int64_t key) {
@@ -705,6 +1044,87 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       }
       return value;
     };
+
+    std::vector<Expression> build_predicates;
+    std::vector<Expression> probe_predicates;
+    bool references_outer = false;
+    auto check = [&](const Expression& expression) {
+      if (!expression) {
+        return;
+      }
+      for (const ColumnName& column : expression->TouchedColumns()) {
+        if (column.name == "*") {
+          continue;
+        }
+        if (!LocalColumnOffset(source.schema, column)) {
+          references_outer = true;
+        }
+      }
+    };
+    for (const Expression& predicate : local_predicates) {
+      bool predicate_references_outer = false;
+      if (predicate) {
+        for (const ColumnName& column : predicate->TouchedColumns()) {
+          if (column.name != "*" && !LocalColumnOffset(source.schema, column)) {
+            predicate_references_outer = true;
+            break;
+          }
+        }
+      }
+      references_outer |= predicate_references_outer;
+      if (predicate_references_outer) {
+        probe_predicates.push_back(predicate);
+      } else {
+        build_predicates.push_back(predicate);
+      }
+    }
+    if (aggregate_only) {
+      for (const NamedExpression& item : statement.SelectList()) {
+        check(item.expression);
+      }
+      check(statement.Having());
+    }
+    const bool simple_exists_projection =
+        exists_only && statement.GroupBy().empty() &&
+        statement.Having() == nullptr && statement.OrderBy().empty() &&
+        !statement.Distinct() && !statement.HasLimit() &&
+        statement.Offset() == 0 && !statement.Sources()[0].sample &&
+        !statement.Sources()[0].join_condition &&
+        std::ranges::all_of(
+            statement.SelectList(),
+            [&](const NamedExpression& item) {
+              if (!item.expression) {
+                return false;
+              }
+              if (item.expression->Type() == TypeTag::kConstantValue) {
+                return true;
+              }
+              if (item.expression->Type() != TypeTag::kColumnValue) {
+                return false;
+              }
+              const ColumnName& name =
+                  item.expression->AsColumnValue().GetColumnName();
+              return name.name == "*" ||
+                     LocalColumnOffset(source.schema, name).has_value();
+            }) &&
+        std::ranges::all_of(local_predicates, [](const Expression& predicate) {
+          return predicate && !ContainsQuery(predicate) &&
+                 !ContainsAggregate(predicate);
+        });
+    const bool residual_exists_fast_path =
+        simple_exists_projection && !aggregate_only && integer_key &&
+        created->local_columns.size() == 1 && !probe_predicates.empty();
+    if (references_outer && !residual_exists_fast_path) {
+      context.execution_runtime()->unindexable_queries.insert(&statement);
+      return std::nullopt;
+    }
+    if (residual_exists_fast_path) {
+      created->exists_residual_fast_path = true;
+      created->exists_residual_predicates = probe_predicates;
+    }
+
+    source.FinishSpill();
+    Status group_error{Status::kSuccess};
     if (aggregate_only) {
       // One-pass hash aggregate into finished scalar results. Storing only
       // aggregates (not every lineitem row) keeps Q17-style subqueries small.
@@ -723,10 +1143,107 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       struct GroupAggs {
         std::vector<AggregateAccumulator> accumulators;
       };
-      std::unordered_map<int64_t, GroupAggs> int_groups;
+      // A/B hatch: TINYLAMB_DISABLE_FLAT_GROUP_MAP=1 restores the node-based
+      // unordered_map for int group keys; the adapter keeps every use site
+      // identical across the two backends.
+      static const bool flat_map_disabled =
+          std::getenv("TINYLAMB_DISABLE_FLAT_GROUP_MAP") != nullptr;
+      using IntGroupMap = IntGroupMapAdapter<GroupAggs>;
+      IntGroupMap int_groups{!flat_map_disabled};
       std::unordered_map<std::string, GroupAggs> str_groups;
+      // Column-vs-column conjuncts over same-type INT64/DATE columns (Q21's
+      // l_receiptdate > l_commitdate) evaluate positionally: peeling them out
+      // of the bytecode residual keeps the per-row filter allocation-free.
+      // Both conjunct styles must pass, and a positional compare can never
+      // raise, so the tolerant-combination semantics are unchanged.
+      struct ColumnCompare {
+        slot_t a;
+        slot_t b;
+        BinaryOperation op;
+      };
+      // A/B hatch: TINYLAMB_DISABLE_AGG_COLUMN_PEEK=1 keeps column-vs-column
+      // conjuncts in the bytecode residual (the pre-change behavior).
+      static const bool column_peek_disabled =
+          std::getenv("TINYLAMB_DISABLE_AGG_COLUMN_PEEK") != nullptr;
+      std::vector<ColumnCompare> column_compares;
+      std::vector<Expression> residual_predicates;
+      residual_predicates.reserve(local_predicates.size());
+      for (const Expression& predicate : local_predicates) {
+        bool peeled = false;
+        if (!column_peek_disabled && predicate &&
+            predicate->Type() == TypeTag::kBinaryExp) {
+          const BinaryExpression& binary = predicate->AsBinaryExpression();
+          const BinaryOperation op = binary.Op();
+          if (op == BinaryOperation::kEquals ||
+              op == BinaryOperation::kNotEquals ||
+              op == BinaryOperation::kGreaterThan ||
+              op == BinaryOperation::kGreaterThanEquals ||
+              op == BinaryOperation::kLessThan ||
+              op == BinaryOperation::kLessThanEquals) {
+            if (binary.Left()->Type() == TypeTag::kColumnValue &&
+                binary.Right()->Type() == TypeTag::kColumnValue) {
+              const std::optional<slot_t> a = LocalColumnOffset(
+                  source.schema,
+                  binary.Left()->AsColumnValue().GetColumnName());
+              const std::optional<slot_t> b = LocalColumnOffset(
+                  source.schema,
+                  binary.Right()->AsColumnValue().GetColumnName());
+              if (a && b) {
+                const ValueType ta = source.schema.GetColumn(*a).Type();
+                const ValueType tb = source.schema.GetColumn(*b).Type();
+                if (ta == tb &&
+                    (ta == ValueType::kInt64 || ta == ValueType::kDate)) {
+                  column_compares.push_back({*a, *b, op});
+                  peeled = true;
+                }
+              }
+            }
+          }
+        }
+        if (!peeled) {
+          residual_predicates.push_back(predicate);
+        }
+      }
       const CompiledScanFilter local_filter =
-          CompileScanFilter(local_predicates, source.schema);
+          CompileScanFilter(residual_predicates, source.schema);
+      auto column_compares_pass = [&](const Row& row) -> bool {
+        for (const ColumnCompare& compare : column_compares) {
+          const Value& left = row[compare.a];
+          const Value& right = row[compare.b];
+          if (left.IsNull() || right.IsNull()) {
+            return false;
+          }
+          const int64_t lv = left.value.int_value;
+          const int64_t rv = right.value.int_value;
+          bool keep = false;
+          switch (compare.op) {
+            case BinaryOperation::kEquals:
+              keep = lv == rv;
+              break;
+            case BinaryOperation::kNotEquals:
+              keep = lv != rv;
+              break;
+            case BinaryOperation::kGreaterThan:
+              keep = lv > rv;
+              break;
+            case BinaryOperation::kGreaterThanEquals:
+              keep = lv >= rv;
+              break;
+            case BinaryOperation::kLessThan:
+              keep = lv < rv;
+              break;
+            case BinaryOperation::kLessThanEquals:
+              keep = lv <= rv;
+              break;
+            default:
+              return false;
+          }
+          if (!keep) {
+            return false;
+          }
+        }
+        return true;
+      };
       // Child column fast path: an aggregate whose input is a plain column
       // (the Q17 avg(l_quantity) shape) skips per-row AST evaluation, which
       // would otherwise resolve the column by name for every build row.
@@ -743,21 +1260,44 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       }
       // Worker-safe aggregation check: plain-column inputs (or count(*))
       // for streaming SUM/AVG/COUNT/MIN/MAX let the build run as a parallel
-      // row-slice reduction; anything else (per-row filters, DISTINCT,
-      // buffered aggregates) falls back to the serial pass.
+      // row-slice reduction; anything else (per-row filters, buffered
+      // aggregates) falls back to the serial pass.  COUNT(DISTINCT
+      // plain-column) also qualifies: its partials merge as a set union
+      // (AggregateAccumulator::Merge), which keeps Q21-style whole-table
+      // COUNT(DISTINCT l_suppkey) builds parallel.  DISTINCT on SUM/AVG has
+      // no exact set-union merge, so it stays serial.
       bool build_parallel =
           integer_key && !source.HasSpill() && source.TotalRows() >= 65536;
       std::vector<bool> worker_safe(aggregate_expressions.size(), false);
       for (size_t i = 0; build_parallel && i < aggregate_expressions.size();
            ++i) {
         const AggregateExpression& aggregate = *aggregate_expressions[i];
+        static const bool distinct_count_disabled =
+            std::getenv("TINYLAMB_DISABLE_PARALLEL_COUNT_DISTINCT") != nullptr;
+        const bool distinct_count =
+            !distinct_count_disabled && aggregate.Distinct() &&
+            aggregate.GetType() == AggregationType::kCount;
+        // Only accumulator kinds whose parallel partials merge exactly
+        // (AggregateAccumulator::Merge) may aggregate inside a worker.
+        // Buffered aggregates (ARRAY_AGG/STRING_AGG/group-context kinds)
+        // keep their inputs in `buffer_`, which Merge never combines, and
+        // kinds like LOGICAL_*/BIT_*/ANY_VALUE neither merge nor set the
+        // `count` marker the merge below uses to detect empty partials.
+        const bool mergeable_type =
+            aggregate.GetType() == AggregationType::kCount ||
+            aggregate.GetType() == AggregationType::kSum ||
+            aggregate.GetType() == AggregationType::kAvg ||
+            aggregate.GetType() == AggregationType::kMin ||
+            aggregate.GetType() == AggregationType::kMax;
         const bool safe =
+            mergeable_type &&
             (IsCountStar(aggregate) ||
              (aggregate_child_columns[i].has_value() &&
               !aggregate.WhereFilter() &&
               aggregate.Having() == AggregateHavingModifier::kNone &&
               aggregate.InnerOrderBy().empty() && !aggregate.SecondaryArg() &&
-              !aggregate.Distinct() && aggregate.TrailingArgs().empty())) &&
+              (!aggregate.Distinct() || distinct_count) &&
+              aggregate.TrailingArgs().empty())) &&
             (IsCountStar(aggregate) ||
              LocalColumnOffset(
                  source.schema,
@@ -767,11 +1307,16 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         build_parallel = build_parallel && safe;
       }
       struct BuildWorker {
-        std::unordered_map<int64_t, GroupAggs> int_groups;
+        IntGroupMap int_groups;
         std::vector<Row> deferred;
       };
+      // Hatch plumbing: worker maps share the outer map's backend choice.
+      const bool use_flat_groups = !flat_map_disabled;
       auto accumulate_one = [&](const Row& row) -> void {
         if (HasNullKey(row, created->local_columns)) {
+          return;
+        }
+        if (!column_compares_pass(row)) {
           return;
         }
         if (!MatchScanFilter(row, source.schema, local_filter, nullptr, context,
@@ -783,7 +1328,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         int64_t int_key = 0;
         if (integer_key) {
           int_key = IntegerJoinKey(row, created->local_columns[0]);
-          group = &int_groups[int_key];
+          group = int_groups.TryEmplace(int_key).first;
         } else {
           str_key = EncodeJoinKey(row, created->local_columns);
           group = &str_groups[str_key];
@@ -892,6 +1437,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                               std::max<size_t>(1, build_rows / 32768)});
         if (workers > 1) {
           std::vector<BuildWorker> build_workers(workers);
+          for (BuildWorker& local : build_workers) {
+            local.int_groups.set_use_flat(use_flat_groups);
+          }
           std::vector<Status> build_errors(workers, Status::kSuccess);
           std::atomic<size_t> next_chunk{0};
           const size_t chunk_rows = 8192;
@@ -921,6 +1469,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                         if (HasNullKey(row, created->local_columns)) {
                           continue;
                         }
+                        if (!column_compares_pass(row)) {
+                          continue;
+                        }
                         bool matches = true;
                         for (const SimpleComparePredicate& pred :
                              shared_filter.simple) {
@@ -931,9 +1482,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                         }
                         bool decided = matches;
                         if (matches && shared_filter.residual_bytecode) {
-                          StatusOr<Value> result =
-                              shared_filter.residual_bytecode->TryEvaluateRow(
-                                  row);
+                          StatusOr<Value> result = TryEvaluateRowAuto(
+                              *shared_filter.residual_bytecode, row);
                           if (result.HasValue()) {
                             matches = !result.Value().IsNull() &&
                                       result.Value().Truthy();
@@ -948,15 +1498,15 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                         } else if (matches) {
                           int64_t key =
                               IntegerJoinKey(row, created->local_columns[0]);
-                          auto [iter, inserted] =
-                              local.int_groups.try_emplace(key);
+                          auto [group, inserted] =
+                              local.int_groups.TryEmplace(key);
                           if (inserted) {
-                            iter->second.accumulators.reserve(
+                            group->accumulators.reserve(
                                 aggregate_expressions.size());
                             for (const AggregateExpression* aggregate :
                                  aggregate_expressions) {
-                              iter->second.accumulators.emplace_back(
-                                  aggregate, &source.schema);
+                              group->accumulators.emplace_back(aggregate,
+                                                               &source.schema);
                             }
                           }
                           for (size_t i = 0; i < aggregate_expressions.size();
@@ -965,15 +1515,15 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                               continue;
                             }
                             if (IsCountStar(*aggregate_expressions[i])) {
-                              if (Status st = iter->second.accumulators[i].Add(
-                                      Value(1));
+                              if (Status st =
+                                      group->accumulators[i].Add(Value(1));
                                   st != Status::kSuccess) {
                                 build_errors[w] = st;
                                 return;
                               }
                               continue;
                             }
-                            if (Status st = iter->second.accumulators[i].Add(
+                            if (Status st = group->accumulators[i].Add(
                                     row[*aggregate_child_columns[i]]);
                                 st != Status::kSuccess) {
                               build_errors[w] = st;
@@ -1008,22 +1558,25 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             }
           }
           for (BuildWorker& local : build_workers) {
-            for (auto& [key, group] : local.int_groups) {
-              GroupAggs& dst = int_groups[key];
-              if (dst.accumulators.empty()) {
-                dst.accumulators = std::move(group.accumulators);
-                continue;
+            local.int_groups.ForEach([&](int64_t key, GroupAggs& group) {
+              auto [dst, inserted] = int_groups.TryEmplace(key);
+              if (inserted) {
+                dst->accumulators = std::move(group.accumulators);
+                return;
               }
-              for (size_t i = 0; i < dst.accumulators.size(); ++i) {
+              for (size_t i = 0; i < dst->accumulators.size(); ++i) {
                 if (group.accumulators[i].count == 0) {
                   continue;
                 }
                 if (Status st =
-                        dst.accumulators[i].Merge(group.accumulators[i]);
+                        dst->accumulators[i].Merge(group.accumulators[i]);
                     st != Status::kSuccess) {
-                  return std::nullopt;
+                  group_error = st;
                 }
               }
+            });
+            if (group_error != Status::kSuccess) {
+              return std::nullopt;
             }
           }
           for (BuildWorker& local : build_workers) {
@@ -1047,6 +1600,12 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       }
       if (group_error != Status::kSuccess) {
         return std::nullopt;  // Fall back to the generic (diagnostic) path.
+      }
+      // Projection names are group-invariant; building them per group showed
+      // up as a multi-million-string cost on Q18/Q21-sized builds.
+      std::vector<std::string> emit_names(statement.SelectList().size());
+      for (size_t i = 0; i < statement.SelectList().size(); ++i) {
+        emit_names[i] = ProjectionName(statement.SelectList()[i], i);
       }
       auto emit_group = [&](const std::string& key, GroupAggs& group) {
         AggregateResultMap aggregate_results;
@@ -1101,8 +1660,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         std::vector<Column> columns;
         columns.reserve(values.size());
         for (size_t i = 0; i < values.size(); ++i) {
-          columns.emplace_back(ProjectionName(statement.SelectList()[i], i),
-                               ValueTypeOf(values[i]));
+          columns.emplace_back(emit_names[i], ValueTypeOf(values[i]));
           columns.back().SetUnsigned(values[i].IsUnsigned());
         }
         Relation finished;
@@ -1112,12 +1670,101 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             key, std::make_shared<Relation>(std::move(finished)));
       };
       if (integer_key) {
-        for (auto& [key, group] : int_groups) {
+        int_groups.ForEach([&](int64_t key, GroupAggs& group) {
           emit_group(integer_key_value(key).EncodeMemcomparableFormat(), group);
-        }
+        });
       } else {
         for (auto& [key, group] : str_groups) {
           emit_group(key, group);
+        }
+      }
+    } else if (created->exists_residual_fast_path) {
+      // Sibling build sharing (TPC-H Q21: an EXISTS/NOT EXISTS pair over the
+      // same table with the same correlation column).  Published builds
+      // carry no build-time predicates, so a consumer defers its build-side
+      // conjuncts into exists_residual_predicates and probes the shared
+      // rows instead of re-scanning the base table.  Domain-filtered
+      // entries are only shared under the same registration context.
+      static const bool sharing_disabled =
+          std::getenv("TINYLAMB_DISABLE_SHARED_EXISTS_BUILD") != nullptr;
+      const bool shareable = !sharing_disabled && !source.HasSpill() &&
+                             statement.Sources().size() == 1 && !from.query &&
+                             !from.table.empty() &&
+                             created->local_columns.size() == 1;
+      std::string share_key;
+      if (shareable) {
+        // Sibling statements qualify the same physical columns under their
+        // own aliases (l2.ord vs l3.ord), so the key uses the bare column
+        // name sequence: equal sequences mean the loaded rows are
+        // positionally compatible even though the qualifier prefixes
+        // differ.  The consumer keeps its own (alias-qualified) schema for
+        // residual evaluation and borrows only the row storage.
+        share_key = from.table;
+        for (size_t i = 0; i < source.schema.ColumnCount(); ++i) {
+          share_key.push_back('\x1f');
+          share_key += std::string(source.schema.GetColumn(i).Name().name);
+        }
+      }
+      const auto shared =
+          shareable ? context.execution_runtime()->shared_exists_builds.find(
+                          share_key)
+                    : context.execution_runtime()->shared_exists_builds.end();
+      const bool same_domain =
+          shared != context.execution_runtime()->shared_exists_builds.end() &&
+          (shared->second.outer_filter_relation == nullptr ||
+           (shared->second.outer_filter_relation ==
+                context.execution_runtime()->correlated_outer_relation &&
+            shared->second.outer_filter_serial ==
+                context.execution_runtime()->correlated_outer_serial));
+      if (same_domain) {
+        created->shared_int_rows = shared->second.rows;
+        created->outer_filter_relation = shared->second.outer_filter_relation;
+        created->outer_filter_serial = shared->second.outer_filter_serial;
+        // The published build applies no predicates; this statement's full
+        // residual conjunction (inner-local and outer-referencing alike)
+        // evaluates per candidate row at probe time.
+        created->exists_residual_predicates = local_predicates;
+        ++context.execution_runtime()->shared_exists_build_reuses;
+      } else {
+        const CompiledScanFilter local_filter =
+            CompileScanFilter(build_predicates, source.schema);
+        created->int_rows.reserve(source.TotalRows());
+        const Status source_status = source.ForEachRow([&](const Row& row) {
+          if (group_error != Status::kSuccess ||
+              HasNullKey(row, created->local_columns)) {
+            return;
+          }
+          if (!build_predicates.empty() &&
+              !MatchScanFilter(row, source.schema, local_filter, nullptr,
+                               context, ctes, &group_error)) {
+            return;
+          }
+          created->int_rows.emplace_back(
+              IntegerJoinKey(row, created->local_columns.front()), row);
+        });
+        if (source_status != Status::kSuccess ||
+            group_error != Status::kSuccess) {
+          return std::nullopt;
+        }
+        std::sort(created->int_rows.begin(), created->int_rows.end(),
+                  [](const auto& left, const auto& right) {
+                    return left.first < right.first;
+                  });
+        if (shareable && build_predicates.empty()) {
+          // Only builds without build-time predicates may be published: a
+          // consumer of this entry probes every loaded row under its own
+          // residual conjunction.
+          auto rows =
+              std::make_shared<const std::vector<std::pair<int64_t, Row>>>(
+                  std::move(created->int_rows));
+          created->shared_int_rows = rows;
+          context.execution_runtime()->shared_exists_builds.emplace(
+              std::move(share_key),
+              ExecutionRuntime::SharedExistsBuild{
+                  .schema = source.schema,
+                  .rows = std::move(rows),
+                  .outer_filter_relation = domain_relation,
+                  .outer_filter_serial = domain_serial});
         }
       }
     } else if (exists_only &&
@@ -1258,6 +1905,81 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     // NULL equality parameters do not participate in the result cache, but
     // they are still one distinct parameter tuple for profiling purposes.
     index->parameter_keys_seen.insert("\xfftinylamb-null-parameter");
+  }
+
+  if (index->exists_residual_fast_path) {
+    StatusOr<Value> outer_value =
+        TryLookup(index->outer_columns.front(), outer);
+    if (!outer_value.HasValue()) {
+      return std::nullopt;
+    }
+    const Value& probe = outer_value.Value();
+    if (probe.IsNull()) {
+      Relation empty;
+      empty.schema = index->schema;
+      return empty;
+    }
+    if (probe.type != ValueType::kInt64 && probe.type != ValueType::kDate) {
+      return std::nullopt;
+    }
+    const auto& exist_rows = index->ExistRows();
+    const auto begin = std::lower_bound(
+        exist_rows.begin(), exist_rows.end(), probe.value.int_value,
+        [](const auto& entry, int64_t key) { return entry.first < key; });
+    const auto end = std::upper_bound(
+        begin, exist_rows.end(), probe.value.int_value,
+        [](int64_t key, const auto& entry) { return key < entry.first; });
+    bool matched = false;
+    Status residual_error{Status::kSuccess};
+    for (auto iter = begin; iter != end; ++iter) {
+      const Scope scope{
+          .row = &iter->second, .schema = &index->schema, .outer = &outer};
+      bool rejected = false;
+      for (const Expression& predicate : index->exists_residual_predicates) {
+        StatusOr<Value> value =
+            TryEvaluate(predicate, scope, nullptr, context, ctes);
+        if (!value.HasValue()) {
+          if (residual_error.ok()) {
+            residual_error = value.GetStatus();
+          }
+          continue;
+        }
+        if (value.Value().IsNull() || !value.Value().Truthy()) {
+          rejected = true;
+          break;
+        }
+      }
+      if (rejected) {
+        continue;
+      }
+      if (residual_error != Status::kSuccess) {
+        return std::nullopt;
+      }
+      matched = true;
+      break;
+    }
+    if (residual_error != Status::kSuccess) {
+      return std::nullopt;
+    }
+    const auto make_result = [&](bool present) {
+      Relation result(context.execution_runtime());
+      result.schema = index->schema;
+      if (present) {
+        result.AddRow(Row(std::vector<Value>(index->schema.ColumnCount())));
+      }
+      return result;
+    };
+    if (cache_key.has_value()) {
+      auto cached_relation =
+          std::make_shared<Relation>(context.execution_runtime());
+      cached_relation->schema = index->schema;
+      if (matched) {
+        cached_relation->AddRow(
+            Row(std::vector<Value>(index->schema.ColumnCount())));
+      }
+      index->cached_results.emplace(*cache_key, std::move(cached_relation));
+    }
+    return make_result(matched);
   }
 
   if (index->exists_key_set) {
@@ -1519,35 +2241,34 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
              self(aggregate.HavingCondition(), self) ||
              self(aggregate.SecondaryArg(), self) ||
              self(aggregate.WhereFilter(), self) ||
-             std::ranges::any_of(aggregate.TrailingArgs(), [&](const auto& arg) {
-               return self(arg, self);
-             }) ||
              std::ranges::any_of(
-                 aggregate.InnerOrderBy(), [&](const auto& term) {
-                   return self(term.expression, self);
-                 }) ||
+                 aggregate.TrailingArgs(),
+                 [&](const auto& arg) { return self(arg, self); }) ||
+             std::ranges::any_of(aggregate.InnerOrderBy(),
+                                 [&](const auto& term) {
+                                   return self(term.expression, self);
+                                 }) ||
              std::ranges::any_of(
-                 aggregate.InnerGroupBy(), [&](const auto& key) {
-                   return self(key, self);
-                 });
+                 aggregate.InnerGroupBy(),
+                 [&](const auto& key) { return self(key, self); });
     }
     if (expression->Type() == TypeTag::kWindowFunctionExp) {
       const auto& window = expression->AsWindowFunctionCallExpression();
-      return std::ranges::any_of(window.args, [&](const auto& arg) {
-               return self(arg, self);
-             }) ||
+      return std::ranges::any_of(
+                 window.args,
+                 [&](const auto& arg) { return self(arg, self); }) ||
              self(window.where_filter, self) ||
              std::ranges::any_of(
-                 window.partition_by, [&](const auto& key) {
-                   return self(key, self);
-                 }) ||
-             std::ranges::any_of(window.order_by, [&](const auto& term) {
-               return self(term.expression, self);
-             }) ||
-             std::ranges::any_of(
-                 window.inner_order_by, [&](const auto& term) {
-                   return self(term.expression, self);
-                 }) ||
+                 window.partition_by,
+                 [&](const auto& key) { return self(key, self); }) ||
+             std::ranges::any_of(window.order_by,
+                                 [&](const auto& term) {
+                                   return self(term.expression, self);
+                                 }) ||
+             std::ranges::any_of(window.inner_order_by,
+                                 [&](const auto& term) {
+                                   return self(term.expression, self);
+                                 }) ||
              self(window.frame_start.offset, self) ||
              self(window.frame_end.offset, self);
     }
@@ -1607,6 +2328,19 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
         });
   };
   return statement_contains_volatile(statement, statement_contains_volatile);
+}
+
+bool StatementContainsVolatileFunctionCached(ExecutionRuntime* runtime,
+                                             const SelectStatement& statement) {
+  if (runtime == nullptr) {
+    return StatementContainsVolatileFunction(statement);
+  }
+  const auto [it, inserted] =
+      runtime->volatile_memo.try_emplace(&statement, false);
+  if (inserted) {
+    it->second = StatementContainsVolatileFunction(statement);
+  }
+  return it->second;
 }
 
 std::string UncorrelatedCacheKey(const SelectStatement& statement,
@@ -1753,7 +2487,8 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           bool exists_only) {
   if (context.execution_runtime() == nullptr ||
       context.execution_runtime()->noncacheable_queries.contains(&statement) ||
-      StatementContainsVolatileFunction(statement)) {
+      StatementContainsVolatileFunctionCached(context.execution_runtime(),
+                                              statement)) {
     return nullptr;
   }
   // Separate AST nodes can describe the same uncorrelated subquery (for
@@ -1765,18 +2500,11 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
   // the complete relation (and scalar consumers must still observe a second
   // row as a cardinality violation). Never let the capped representation be
   // reused by a full-result consumer.
-  const std::string structural_key =
-      UncorrelatedCacheKey(statement, ctes, exists_only);
-  if (const auto structural =
-          context.execution_runtime()->uncorrelated_results_by_fingerprint.find(
-              structural_key);
-      structural !=
-      context.execution_runtime()->uncorrelated_results_by_fingerprint.end()) {
-    ++context.execution_runtime()->uncorrelated_cache_hits;
-    context.execution_runtime()->uncorrelated_results.emplace(
-        &statement, structural->second);
-    return structural->second.get();
-  }
+  // Fast path first: a current per-node entry answers the overwhelmingly
+  // common repeat probe (TPC-H Q22 re-probes its uncorrelated subqueries
+  // once per outer row, 61128 times) with one pointer-keyed find. The
+  // structural fingerprint lookup below hashes a multi-hundred-byte key
+  // string and only needs to run when the node entry is missing.
   const auto cached =
       context.execution_runtime()->uncorrelated_results.find(&statement);
   if (cached != context.execution_runtime()->uncorrelated_results.end()) {
@@ -1786,6 +2514,27 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     }
     DropCacheEntry(*context.execution_runtime(), &statement);
     context.execution_runtime()->uncorrelated_results.erase(cached);
+  }
+  const auto key_memo =
+      context.execution_runtime()->uncorrelated_key_memo.find(&statement);
+  const std::string* key_ptr =
+      key_memo != context.execution_runtime()->uncorrelated_key_memo.end()
+          ? &key_memo->second
+          : &context.execution_runtime()
+                 ->uncorrelated_key_memo
+                 .emplace(&statement,
+                          UncorrelatedCacheKey(statement, ctes, exists_only))
+                 .first->second;
+  const std::string& structural_key = *key_ptr;
+  if (const auto structural =
+          context.execution_runtime()->uncorrelated_results_by_fingerprint.find(
+              structural_key);
+      structural !=
+      context.execution_runtime()->uncorrelated_results_by_fingerprint.end()) {
+    ++context.execution_runtime()->uncorrelated_cache_hits;
+    context.execution_runtime()->uncorrelated_results.emplace(
+        &statement, structural->second);
+    return structural->second.get();
   }
   CacheEntryIsCurrent(statement, *context.execution_runtime());
 
@@ -1888,19 +2637,93 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     return nullptr;
   }
   Relation result = executed.MoveValue();
-  if (std::getenv("TINYLAMB_TRACE_UNCORRELATED") !=
-      nullptr) {  // NOLINT(cert-err33-c)
-    (void)fprintf(stderr, "[UNCORR] rows=%zu schema_cols=%zu exists=%d\n",
-            result.TotalRows(),
-            static_cast<size_t>(result.schema.ColumnCount()),
-            static_cast<int>(exists_only));
-  }
   auto [iter, inserted] =
       context.execution_runtime()->uncorrelated_results.emplace(
           &statement, std::make_shared<Relation>(std::move(result)));
   context.execution_runtime()->uncorrelated_results_by_fingerprint.emplace(
       structural_key, iter->second);
   return iter->second.get();
+}
+
+void MaterializeArenaRange(const BaseRelationArena& arena, const Schema& schema,
+                           size_t begin, size_t end, std::vector<Row>* rows) {
+  const size_t stride = arena.stride;
+  for (size_t index = begin; index < end; ++index) {
+    const int64_t* cells = arena.cells.data() + (index * stride);
+    Row& row = (*rows)[index];
+    row.values_.resize(stride);
+    for (size_t c = 0; c < stride; ++c) {
+      if (arena.IsNull(index, c)) {
+        row.values_[c] = Value();
+        continue;
+      }
+      const ValueType type = arena.slot_types.size() == stride
+                                 ? arena.slot_types[c]
+                                 : schema.GetColumn(c).Type();
+      if (type == ValueType::kVarChar) {
+        row.values_[c] = Value(std::string(arena.Varchar(index, c)));
+      } else if (type == ValueType::kDouble) {
+        Value value;
+        value.type = ValueType::kDouble;
+        value.value.double_value = std::bit_cast<double>(cells[c]);
+        row.values_[c] = value;
+      } else {
+        Value value;
+        value.type = type;
+        value.value.int_value = cells[c];
+        if (type == ValueType::kInt64 && schema.ColumnCount() > c &&
+            schema.GetColumn(c).IsUnsigned()) {
+          value.SetUnsigned();
+        }
+        row.values_[c] = value;
+      }
+    }
+  }
+}
+
+void MaterializeCacheRowsIfNeeded(const std::string& cache_key,
+                                  Relation* cached, ExecutionRuntime* runtime) {
+  if (cached == nullptr || runtime == nullptr || !cached->rows.empty()) {
+    return;
+  }
+  const auto arena = runtime->base_relation_arenas.find(cache_key);
+  if (arena == runtime->base_relation_arenas.end() ||
+      arena->second->rows == 0 || !arena->second->published_rowsless ||
+      arena->second->rows_boxed) {
+    return;
+  }
+  cached->rows.resize(arena->second->rows);
+  MaterializeArenaRange(*arena->second, cached->schema, 0, arena->second->rows,
+                        &cached->rows);
+  arena->second->rows_boxed = true;
+}
+
+void MaterializeCacheRowsParallel(const std::string& cache_key,
+                                  Relation* cached, ExecutionRuntime* runtime) {
+  if (cached == nullptr || runtime == nullptr || !cached->rows.empty()) {
+    return;
+  }
+  const auto arena = runtime->base_relation_arenas.find(cache_key);
+  if (arena == runtime->base_relation_arenas.end() ||
+      arena->second->rows == 0 || !arena->second->published_rowsless ||
+      arena->second->rows_boxed) {
+    return;
+  }
+  BaseRelationArena& a = *arena->second;
+  cached->rows.resize(a.rows);
+  const size_t workers =
+      std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+  std::vector<std::jthread> threads;
+  for (size_t w = 1; w < workers; ++w) {
+    threads.emplace_back([&, w] {
+      const size_t begin = a.rows * w / workers;
+      const size_t end = a.rows * (w + 1) / workers;
+      MaterializeArenaRange(a, cached->schema, begin, end, &cached->rows);
+    });
+  }
+  MaterializeArenaRange(a, cached->schema, 0, a.rows / workers, &cached->rows);
+  threads.clear();
+  a.rows_boxed = true;
 }
 
 }  // namespace tinylamb::relational_detail

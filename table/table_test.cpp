@@ -16,8 +16,10 @@
 
 #include "table/table.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -29,6 +31,8 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -68,6 +72,7 @@ class TableTest : public ::testing::Test {
   void Recover() {
     if (rs_) {
       rs_->EmulateCrash();
+      rs_.reset();
     }
     rs_ = Database::Create(prefix_).MoveValue();
   }
@@ -79,6 +84,22 @@ class TableTest : public ::testing::Test {
 };
 
 TEST_F(TableTest, Construct_Default_Succeeds) {}
+
+TEST_F(TableTest, Serialization_RoundTripsIncarnationAndReadsLegacyPayload) {
+  Table table(Schema("serialized", {Column("value", ValueType::kInt64)}), 7,
+              99);
+  const std::string payload = Encode(table);
+  ASSIGN_OR_ASSERT_FAIL(Table, decoded, Decode<Table>(payload));
+  EXPECT_EQ(decoded.Incarnation(), 99U);
+
+  std::stringstream legacy_stream;
+  Encoder legacy_encoder(legacy_stream);
+  const std::vector<Index> no_indexes;
+  legacy_encoder << table.GetSchema() << table.FirstPageId()
+                 << table.LastPageId() << no_indexes;
+  ASSIGN_OR_ASSERT_FAIL(Table, legacy, Decode<Table>(legacy_stream.str()));
+  EXPECT_EQ(legacy.Incarnation(), 0U);
+}
 
 TEST_F(TableTest, Insert_SingleRow_Succeeds) {
   TransactionContext ctx = rs_->BeginContext();
@@ -131,6 +152,92 @@ TEST_F(TableTest, Update_DuplicateKeyCompensation_DoesNotDeadlockOrLoseRow) {
                         Row({Value(1), Value("a")}));
   ASSERT_SUCCESS_AND_EQ(tbl->Read(ctx2.txn_, second),
                         Row({Value(2), Value("b")}));
+
+  size_t first_key_count = 0;
+  for (Iterator it =
+           tbl->BeginIndexScan(ctx2.txn_, tbl->GetIndex(0), Value(1), Value(1));
+       it.IsValid(); ++it) {
+    ++first_key_count;
+  }
+  size_t second_key_count = 0;
+  for (Iterator it =
+           tbl->BeginIndexScan(ctx2.txn_, tbl->GetIndex(0), Value(2), Value(2));
+       it.IsValid(); ++it) {
+    ++second_key_count;
+  }
+  EXPECT_EQ(first_key_count, 1U);
+  EXPECT_EQ(second_key_count, 1U);
+  ASSERT_SUCCESS(ctx2.txn_.PreCommit());
+
+  TransactionContext verify = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, verified,
+                              verify.GetTable("uniq_upd_tbl"));
+  ASSERT_SUCCESS_AND_EQ(verified->Read(verify.txn_, first),
+                        Row({Value(1), Value("a")}));
+  ASSERT_SUCCESS_AND_EQ(verified->Read(verify.txn_, second),
+                        Row({Value(2), Value("b")}));
+  size_t verified_count = 0;
+  for (Iterator it = verified->BeginIndexScan(
+           verify.txn_, verified->GetIndex(0), Value(2), Value(2));
+       it.IsValid(); ++it) {
+    ++verified_count;
+  }
+  EXPECT_EQ(verified_count, 1U);
+  ASSERT_SUCCESS(verify.txn_.PreCommit());
+}
+
+TEST_F(TableTest, Update_DuplicateKeyCompensation_AbortKeepsHeapAndIndex) {
+  TransactionContext setup = rs_->BeginContext();
+  Schema schema("uniq_upd_abort_tbl", {Column("id", ValueType::kInt64,
+                                              Constraint(Constraint::kUnique)),
+                                       Column("val", ValueType::kVarChar)});
+  ASSIGN_OR_ASSERT_FAIL(Table, created, rs_->CreateTable(setup, schema));
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  RowPosition first;
+  RowPosition second;
+  {
+    TransactionContext seed = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                seed.GetTable(schema.Name()));
+    first = table->Insert(seed.txn_, Row({Value(1), Value("a")})).Value();
+    second = table->Insert(seed.txn_, Row({Value(2), Value("b")})).Value();
+    ASSERT_SUCCESS(seed.txn_.PreCommit());
+  }
+
+  TransactionContext update = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              update.GetTable(schema.Name()));
+  EXPECT_EQ(table->Update(update.txn_, second, Row({Value(1), Value("b2")}))
+                .GetStatus(),
+            Status::kDuplicates);
+  EXPECT_FALSE(update.txn_.IsFailed());
+  ASSERT_SUCCESS_AND_EQ(table->Read(update.txn_, second),
+                        Row({Value(2), Value("b")}));
+  ASSERT_SUCCESS(update.txn_.Abort());
+
+  TransactionContext verify = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, verified,
+                              verify.GetTable(schema.Name()));
+  ASSERT_SUCCESS_AND_EQ(verified->Read(verify.txn_, first),
+                        Row({Value(1), Value("a")}));
+  ASSERT_SUCCESS_AND_EQ(verified->Read(verify.txn_, second),
+                        Row({Value(2), Value("b")}));
+  size_t key_one = 0;
+  size_t key_two = 0;
+  for (Iterator it = verified->BeginIndexScan(
+           verify.txn_, verified->GetIndex(0), Value(1), Value(1));
+       it.IsValid(); ++it) {
+    ++key_one;
+  }
+  for (Iterator it = verified->BeginIndexScan(
+           verify.txn_, verified->GetIndex(0), Value(2), Value(2));
+       it.IsValid(); ++it) {
+    ++key_two;
+  }
+  EXPECT_EQ(key_one, 1U);
+  EXPECT_EQ(key_two, 1U);
+  ASSERT_SUCCESS(verify.txn_.PreCommit());
 }
 
 TEST_F(TableTest, Update_NoSpaceRecovery_PreservesRowWithoutIndex) {
@@ -158,6 +265,77 @@ TEST_F(TableTest, Update_NoSpaceRecovery_PreservesRowWithoutIndex) {
   EXPECT_EQ(status, Status::kNoSpace);
   ASSERT_SUCCESS_AND_EQ(tbl->Read(ctx2.txn_, rp),
                         Row({Value(1), Value("original")}));
+}
+
+TEST_F(TableTest,
+       Update_RelocationReleasesSourceBeforeVersionedUniqueReinsert) {
+  TransactionContext setup = rs_->BeginContext();
+  Schema schema("relocate_versioned", {Column("k", ValueType::kInt64),
+                                       Column("v", ValueType::kVarChar)});
+  ASSIGN_OR_ASSERT_FAIL(Table, created, rs_->CreateTable(setup, schema));
+  ASSERT_SUCCESS(rs_->CreateIndex(setup, "relocate_versioned",
+                                  IndexSchema("relocate_versioned_idx", {0}, {},
+                                              IndexMode::kVersionedUnique)));
+  ASSERT_SUCCESS(setup.PreCommit());
+
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              ctx.GetTable("relocate_versioned"));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, position,
+      table->Insert(ctx.txn_, Row({Value(1), Value("seed")})));
+  ASSERT_SUCCESS(
+      table->Insert(ctx.txn_, Row({Value(2), Value(std::string(500, 'y'))}))
+          .GetStatus());
+  const page_id_t initial_page = position.page_id;
+  Row expected({Value(1), Value("seed")});
+  for (size_t length = 250; length <= 32500; length += 250) {
+    expected = Row({Value(1), Value(std::string(length, 'x'))});
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, moved,
+                          table->Update(ctx.txn_, position, expected));
+    position = moved;
+  }
+  EXPECT_NE(position.page_id, initial_page);
+  ASSERT_SUCCESS_AND_EQ(table->Read(ctx.txn_, position), expected);
+}
+
+TEST_F(TableTest, Update_CommittedRelocationSurvivesCrashReplay) {
+  TransactionContext setup = rs_->BeginContext();
+  Schema schema("relocation_crash", {Column("payload", ValueType::kVarChar)});
+  ASSERT_SUCCESS(rs_->CreateTable(setup, schema).GetStatus());
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              ctx.GetTable("relocation_crash"));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, position,
+      table->Insert(ctx.txn_, Row({Value(std::string(256, 'a'))})));
+  ASSERT_SUCCESS(table->Insert(ctx.txn_, Row({Value(std::string(16000, 'f'))}))
+                     .GetStatus());
+  const page_id_t initial_page = position.page_id;
+  for (size_t length = 512; length <= 28000; length += 512) {
+    ASSIGN_OR_ASSERT_FAIL(
+        RowPosition, updated_position,
+        table->Update(ctx.txn_, position,
+                      Row({Value(std::string(length, 'b'))})));
+    position = updated_position;
+  }
+  EXPECT_NE(position.page_id, initial_page);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+
+  Recover();
+  TransactionContext read = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, reopened_table,
+                              read.GetTable("relocation_crash"));
+  Iterator iterator = reopened_table->BeginFullScan(read.txn_);
+  size_t rows = 0;
+  while (iterator.IsValid()) {
+    ++rows;
+    ++iterator;
+  }
+  EXPECT_EQ(rows, size_t{2});
+  ASSERT_SUCCESS(read.txn_.PreCommit());
 }
 
 TEST_F(TableTest, Update_SingleRow_UpdatesRowSuccessfully) {
@@ -337,6 +515,74 @@ TEST_F(TableTest, Insert_NullUniqueKey_AllowsMultipleNullsAndDeletes) {
     ++it;
   }
   ASSERT_EQ(count, 1U);
+}
+
+TEST_F(TableTest, DmlRejectsNullPrimaryAndNotNullColumns) {
+  TransactionContext setup = rs_->BeginContext();
+  Schema schema(
+      "non_null_constraints",
+      {Column("pk", ValueType::kInt64, Constraint(Constraint::kPrimaryKey)),
+       Column("required", ValueType::kInt64, Constraint(Constraint::kNotNull)),
+       Column("optional", ValueType::kInt64)});
+  ASSERT_SUCCESS(rs_->CreateTable(setup, schema).GetStatus());
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              ctx.GetTable(schema.Name()));
+  EXPECT_EQ(
+      table->Insert(ctx.txn_, Row({Value(), Value(1), Value(2)})).GetStatus(),
+      Status::kInvalidArgument);
+  EXPECT_EQ(
+      table->Insert(ctx.txn_, Row({Value(1), Value(), Value(2)})).GetStatus(),
+      Status::kInvalidArgument);
+
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, position,
+      table->Insert(ctx.txn_, Row({Value(1), Value(2), Value()})));
+  EXPECT_EQ(
+      table->Update(ctx.txn_, position, Row({Value(), Value(2), Value(3)}))
+          .GetStatus(),
+      Status::kInvalidArgument);
+  EXPECT_EQ(
+      table->Update(ctx.txn_, position, Row({Value(1), Value(), Value(3)}))
+          .GetStatus(),
+      Status::kInvalidArgument);
+  ASSERT_SUCCESS_AND_EQ(table->Read(ctx.txn_, position),
+                        Row({Value(1), Value(2), Value()}));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+// A UNIQUE index stores NULL-bearing keys as multi-value lists (SQL says
+// NULL != NULL) and every other key as a single value.  An ascending scan
+// that reaches such a list after only single-value entries used to find the
+// unpositioned offset sentinel, Clear() the iterator, and silently truncate
+// the scan — which turned a DELETE-over-index-source into a partial delete.
+TEST_F(TableTest, IndexScan_UniqueIndexNullKeyAfterSingleValueEntries) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(ctx, kTableName, IndexSchema("col2_unique", {2})));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  ASSERT_SUCCESS(tbl->Insert(ctx.txn_, Row({Value(1), Value("a"), Value(3.3)}))
+                     .GetStatus());
+  ASSERT_SUCCESS(
+      tbl->Insert(ctx.txn_, Row({Value(2), Value("b"), Value()})).GetStatus());
+  ASSERT_SUCCESS(
+      tbl->Insert(ctx.txn_, Row({Value(3), Value("c"), Value()})).GetStatus());
+  const Index& idx = tbl->GetIndex(tbl->IndexCount() - 1);
+  Iterator scan = tbl->BeginIndexScan(ctx.txn_, idx, Value(), Value());
+  std::vector<int64_t> seen;
+  while (scan.IsValid()) {
+    if ((*scan).IsValid()) {
+      seen.push_back((*scan)[0].value.int_value);
+    }
+    ++scan;
+  }
+  std::sort(seen.begin(), seen.end());
+  ASSERT_EQ(seen.size(), 3U);
+  EXPECT_EQ(seen[0], 1);
+  EXPECT_EQ(seen[2], 3);
 }
 
 TEST_F(TableTest, IndexScan_VersionedUniqueIndex_ServesOldAndNewSnapshots) {
@@ -639,6 +885,71 @@ TEST_F(TableTest, Insert_WhenPageIsFull_AllocatesNewPage) {
   }
 }
 
+TEST_F(TableTest, AbortedTailReservationDoesNotClobberWaiterRow) {
+  TransactionContext setup = rs_->BeginContext();
+  Schema schema("tail_reservation", {Column("value", ValueType::kVarChar)});
+  ASSIGN_OR_ASSERT_FAIL(Table, created, rs_->CreateTable(setup, schema));
+  page_id_t first_page = created.FirstPageId();
+  {
+    PageRef page = setup.txn_.GetPageManager()->GetPage(first_page).MoveValue();
+    ASSERT_FALSE(page.IsNull());
+    const size_t payload_size = page->body.row_page.FreeSizeForTest() - 64;
+    ASSERT_GT(payload_size, 1024U);
+    Row row({Value(std::string(payload_size, 'a'))});
+    std::string image(row.Size(), '\0');
+    row.Serialize(image.data());
+    ASSERT_SUCCESS(page->Insert(setup.txn_, image).GetStatus());
+  }
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  TransactionContext owner = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, owner_table,
+                              owner.GetTable("tail_reservation"));
+  ASSERT_SUCCESS(
+      owner_table->Insert(owner.txn_, Row({Value(std::string(32, 'o'))}))
+          .GetStatus());
+  {
+    PageRef page = owner.txn_.GetPageManager()->GetPage(first_page).MoveValue();
+    ASSERT_FALSE(page.IsNull());
+    EXPECT_LT(page->body.row_page.FreeSizeForTest(), 2048U);
+    EXPECT_NE(page->body.row_page.next_page_id_, 0U);
+  }
+
+  TransactionContext waiter = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, waiter_table,
+                              waiter.GetTable("tail_reservation"));
+  auto waiter_result = std::async(std::launch::async, [&] {
+    return waiter_table->Insert(waiter.txn_,
+                                Row({Value(std::string(32, 'w'))}));
+  });
+  ASSERT_EQ(waiter_result.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+
+  ASSERT_SUCCESS(owner.txn_.Abort());
+  ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  const StatusOr<RowPosition> committed_position = waiter_result.get();
+  ASSERT_SUCCESS(committed_position.GetStatus());
+  ASSERT_SUCCESS(waiter.txn_.PreCommit());
+
+  TransactionContext verify = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, verified,
+                              verify.GetTable("tail_reservation"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(
+      Row, committed_row,
+      verified->Read(verify.txn_, committed_position.Value()));
+  EXPECT_EQ(committed_row[0].value.varchar_value, std::string(32, 'w'));
+  size_t rows = 0;
+  Iterator iterator = verified->BeginFullScan(verify.txn_);
+  while (iterator.IsValid()) {
+    ++rows;
+    ++iterator;
+  }
+  EXPECT_EQ(iterator.GetStatus(), Status::kSuccess);
+  EXPECT_EQ(rows, 2U);
+  ASSERT_SUCCESS(verify.txn_.PreCommit());
+}
+
 TEST_F(TableTest, Update_NonIndexedColumn_PreservesRowPosition) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
@@ -888,6 +1199,226 @@ TEST_F(TableTest,
   EXPECT_TRUE(m_iter.IsValid());
 
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, UnfinishedDropContextDestructorRestoresTable) {
+  TransactionContext writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              writer.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      table->Insert(writer.txn_, Row({Value(1), Value("one"), Value(1.0)}))
+          .GetStatus());
+  ASSERT_SUCCESS(writer.txn_.PreCommit());
+
+  {
+    TransactionContext dropper = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->DropTable(dropper, kTableName));
+  }
+
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, restored,
+                              reader.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(
+      Row, row,
+      restored->Read(reader.txn_, RowPosition(table->FirstPageId(), 0)));
+  EXPECT_EQ(row[0], Value(1));
+}
+
+TEST_F(TableTest, UnfinishedDmlDestructorReleasesIndexMutation) {
+  RowPosition position;
+  {
+    TransactionContext seed = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                seed.GetTable(kTableName));
+    position =
+        table->Insert(seed.txn_, Row({Value(1), Value("old"), Value(1.0)}))
+            .Value();
+    ASSERT_SUCCESS(seed.txn_.PreCommit());
+  }
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    ASSERT_SUCCESS(table
+                       ->Update(writer.txn_, position,
+                                Row({Value(2), Value("new"), Value(2.0)}))
+                       .GetStatus());
+  }
+
+  TransactionContext reader = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  const Index& index = table->GetIndex(0);
+  EXPECT_FALSE(reader.txn_.IndexKeysMayBeStale(index.Root()));
+  ASSERT_SUCCESS_AND_EQ(table->Read(reader.txn_, position),
+                        Row({Value(1), Value("old"), Value(1.0)}));
+  size_t old_key_count = 0;
+  size_t new_key_count = 0;
+  for (Iterator it =
+           table->BeginIndexScan(reader.txn_, index, Value(1), Value(1));
+       it.IsValid(); ++it) {
+    ++old_key_count;
+  }
+  for (Iterator it =
+           table->BeginIndexScan(reader.txn_, index, Value(2), Value(2));
+       it.IsValid(); ++it) {
+    ++new_key_count;
+  }
+  EXPECT_EQ(old_key_count, 1U);
+  EXPECT_EQ(new_key_count, 0U);
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(TableTest, DropTableWaitsForActiveFullScan) {
+  TransactionContext writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, writer_table,
+                              writer.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      writer_table
+          ->Insert(writer.txn_, Row({Value(1), Value("one"), Value(1.0)}))
+          .GetStatus());
+  ASSERT_SUCCESS(writer.txn_.PreCommit());
+
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, reader_table,
+                              reader.GetTable(kTableName));
+  std::future<Status> drop_future;
+  {
+    Iterator scan = reader_table->BeginFullScan(reader.txn_);
+    ASSERT_TRUE(scan.IsValid());
+    std::promise<void> started;
+    std::future<void> started_future = started.get_future();
+    drop_future = std::async(std::launch::async, [this, &started]() {
+      started.set_value();
+      TransactionContext drop_context = rs_->BeginContext();
+      Status status = rs_->DropTable(drop_context, kTableName);
+      if (status != Status::kSuccess) {
+        return status;
+      }
+      return drop_context.txn_.PreCommit();
+    });
+    started_future.wait();
+    EXPECT_EQ(drop_future.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+  }
+  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_EQ(drop_future.get(), Status::kSuccess);
+}
+
+TEST_F(TableTest, DropAbortReopensFullScan) {
+  TransactionContext writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, writer_table,
+                              writer.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      writer_table
+          ->Insert(writer.txn_, Row({Value(1), Value("one"), Value(1.0)}))
+          .GetStatus());
+  ASSERT_SUCCESS(writer.txn_.PreCommit());
+
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, reader_table,
+                              reader.GetTable(kTableName));
+  std::future<Status> drop_future;
+  {
+    Iterator scan = reader_table->BeginFullScan(reader.txn_);
+    ASSERT_TRUE(scan.IsValid());
+    std::promise<void> started;
+    std::future<void> started_future = started.get_future();
+    drop_future = std::async(std::launch::async, [this, &started]() {
+      started.set_value();
+      TransactionContext drop_context = rs_->BeginContext();
+      Status status = rs_->DropTable(drop_context, kTableName);
+      if (status != Status::kSuccess) {
+        return status;
+      }
+      return drop_context.txn_.Abort();
+    });
+    started_future.wait();
+    EXPECT_EQ(drop_future.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+  }
+  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_EQ(drop_future.get(), Status::kSuccess);
+
+  TransactionContext restored = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, restored_table,
+                              restored.GetTable(kTableName));
+  size_t rows = 0;
+  Iterator scan = restored_table->BeginFullScan(restored.txn_);
+  for (; scan.IsValid(); ++scan) {
+    ++rows;
+  }
+  EXPECT_EQ(rows, 1U);
+  ASSERT_SUCCESS(restored.txn_.PreCommit());
+}
+
+TEST_F(TableTest, DropTableRejectsSelfLeaseAndAbortsTransaction) {
+  TransactionContext context = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              context.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      table->Insert(context.txn_, Row({Value(1), Value("one"), Value(1.0)}))
+          .GetStatus());
+  {
+    Iterator scan = table->BeginFullScan(context.txn_);
+    ASSERT_TRUE(scan.IsValid());
+    EXPECT_EQ(rs_->DropTable(context, kTableName), Status::kConflicts);
+  }
+  EXPECT_TRUE(context.txn_.IsFailed());
+  EXPECT_NE(context.txn_.PreCommit(), Status::kSuccess);
+  ASSERT_SUCCESS(context.txn_.Abort());
+
+  TransactionContext check = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, restored,
+                              check.GetTable(kTableName));
+  size_t rows = 0;
+  Iterator scan = restored->BeginFullScan(check.txn_);
+  for (; scan.IsValid(); ++scan) {
+    ++rows;
+  }
+  EXPECT_EQ(rows, 0U);
+  ASSERT_SUCCESS(check.txn_.PreCommit());
+}
+
+TEST_F(TableTest, DropTableWaitsForActiveIndexScan) {
+  TransactionContext writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, writer_table,
+                              writer.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      writer_table
+          ->Insert(writer.txn_, Row({Value(1), Value("one"), Value(1.0)}))
+          .GetStatus());
+  ASSERT_SUCCESS(writer.txn_.PreCommit());
+
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, reader_table,
+                              reader.GetTable(kTableName));
+  std::future<Status> drop_future;
+  {
+    Iterator scan = reader_table->BeginIndexScan(
+        reader.txn_, reader_table->GetIndex(0), Value(1), Value(1));
+    ASSERT_TRUE(scan.IsValid());
+    EXPECT_TRUE(scan.Position().IsValid());
+    std::promise<void> started;
+    std::future<void> started_future = started.get_future();
+    drop_future = std::async(std::launch::async, [this, &started]() {
+      started.set_value();
+      TransactionContext drop_context = rs_->BeginContext();
+      Status status = rs_->DropTable(drop_context, kTableName);
+      if (status != Status::kSuccess) {
+        return status;
+      }
+      return drop_context.txn_.PreCommit();
+    });
+    started_future.wait();
+    EXPECT_EQ(drop_future.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+  }
+  EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_EQ(drop_future.get(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

@@ -47,6 +47,8 @@ class SelectionPlan final : public PlanBase {
   [[nodiscard]] const Table* ScanSource() const override {
     return src_->ScanSource();
   }
+  [[nodiscard]] const Expression& Predicate() const { return exp_; }
+  [[nodiscard]] const Plan& Src() const { return src_; }
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return stats_;
@@ -67,6 +69,16 @@ class SelectionPlan final : public PlanBase {
   }
   [[nodiscard]] bool EnforcesDistinct() const override {
     return src_->EnforcesDistinct();
+  }
+  // Row-per-row and order-preserving: the child's order provenance carries.
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return src_->OrderIsMeasured();
+  }
+  // Row-shaping wrappers preserve the child's order, so they also preserve the
+  // collation that order was produced under (a case-insensitive sort under a
+  // projection is still a case-insensitive order).
+  [[nodiscard]] Collation OrderCollation() const override {
+    return src_->OrderCollation();
   }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;

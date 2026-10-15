@@ -30,17 +30,22 @@
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/statement.hpp"
+#include "type/collation.hpp"
 #include "type/column.hpp"
+#include "type/date.hpp"
+#include "type/interval.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -552,10 +557,32 @@ struct WindowRuntime {
       }
       return j;
     };
-    auto range_offset =
-        [&](const WindowFrameBound& bound) -> std::optional<double> {
-      if (window.order_by.size() != 1 || !bound.offset ||
-          bound.offset->Type() != TypeTag::kConstantValue) {
+    // A RANGE frame boundary: a plain numeric offset, or a calendar-aware
+    // interval for DATE keys (`RANGE BETWEEN INTERVAL 7 DAY PRECEDING AND
+    // CURRENT ROW` spells rolling time-series windows directly).  Interval
+    // boundaries apply the engine's DATE + INTERVAL arithmetic (month-end
+    // clamping included), so a DATE key at a month boundary keeps the same
+    // window the scalar arithmetic produces.
+    struct RangeBound {
+      double numeric{0};
+      bool is_interval{false};
+      IntervalValue interval;
+    };
+    auto range_bound =
+        [&](const WindowFrameBound& bound) -> std::optional<RangeBound> {
+      if (window.order_by.size() != 1 || !bound.offset) {
+        frame_error = StatusError(StatusCode::kInvalidArgument,
+                                  "RANGE offset requires one constant key");
+        return std::nullopt;
+      }
+      if (bound.offset->Type() == TypeTag::kIntervalExp) {
+        RangeBound parsed;
+        parsed.is_interval = true;
+        parsed.interval =
+            bound.offset->AsIntervalExpression().GetIntervalValue();
+        return parsed;
+      }
+      if (bound.offset->Type() != TypeTag::kConstantValue) {
         frame_error = StatusError(StatusCode::kInvalidArgument,
                                   "RANGE offset requires one constant key");
         return std::nullopt;
@@ -566,6 +593,18 @@ struct WindowRuntime {
             StatusCode::kInvalidArgument,
             "Window frame offset for PRECEDING or FOLLOWING cannot be NULL");
         return std::nullopt;
+      }
+      if (off_val.type == ValueType::kVarChar) {
+        // A constant-folded interval literal evaluates to its text form; a
+        // non-interval string here was never a valid numeric offset anyway.
+        if (StatusOr<IntervalValue> interval =
+                IntervalValue::TryParse(off_val.value.varchar_value);
+            interval.HasValue()) {
+          RangeBound parsed;
+          parsed.is_interval = true;
+          parsed.interval = interval.MoveValue();
+          return parsed;
+        }
       }
       if (off_val.type != ValueType::kInt64 &&
           off_val.type != ValueType::kDouble) {
@@ -586,7 +625,48 @@ struct WindowRuntime {
                                   "FOLLOWING must be non-negative");
         return std::nullopt;
       }
-      return off;
+      RangeBound parsed;
+      parsed.numeric = off;
+      return parsed;
+    };
+    // Boundary day count for an interval bound over a DATE key:
+    // `key + sign * interval`.  Sub-day components carry no DATE meaning and
+    // are rejected so the window cannot silently widen or narrow.
+    auto interval_boundary_days =
+        [&](const Value& key, int sign,
+            const IntervalValue& interval) -> std::optional<int64_t> {
+      if (key.type != ValueType::kDate) {
+        frame_error =
+            StatusError(StatusCode::kInvalidArgument,
+                        "RANGE INTERVAL offset requires a DATE order key");
+        return std::nullopt;
+      }
+      if (interval.nanos != 0) {
+        frame_error = StatusError(
+            StatusCode::kInvalidArgument,
+            "RANGE INTERVAL offset must be day-aligned for DATE keys");
+        return std::nullopt;
+      }
+      int64_t days = key.value.int_value;
+      if (interval.months != 0) {
+        StatusOr<int64_t> shifted =
+            TryAddDateIntervalDays(days, sign * interval.months, "month");
+        if (!shifted.HasValue()) {
+          frame_error = shifted.GetStatus();
+          return std::nullopt;
+        }
+        days = shifted.MoveValue();
+      }
+      if (interval.days != 0) {
+        StatusOr<int64_t> shifted =
+            TryAddDateIntervalDays(days, sign * interval.days, "day");
+        if (!shifted.HasValue()) {
+          frame_error = shifted.GetStatus();
+          return std::nullopt;
+        }
+        days = shifted.MoveValue();
+      }
+      return days;
     };
     auto start_of =
         [&](const WindowFrameBound& bound) -> std::optional<size_t> {
@@ -596,11 +676,10 @@ struct WindowRuntime {
         case WindowFrameBoundType::kCurrentRow:
           return first_peer(position);
         case WindowFrameBoundType::kOffsetPreceding: {
-          const auto opt_off = range_offset(bound);
-          if (!opt_off.has_value()) {
+          const auto opt_bound = range_bound(bound);
+          if (!opt_bound.has_value()) {
             return std::nullopt;
           }
-          const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
             // NULLs are peers of each other: the offset bound collapses to
@@ -611,6 +690,25 @@ struct WindowRuntime {
           // band around the current key: first row with candidate <=
           // key + off.
           const bool asc = window.order_by[0].ascending;
+          if (opt_bound->is_interval) {
+            const auto boundary =
+                interval_boundary_days(key, asc ? -1 : 1, opt_bound->interval);
+            if (!boundary.has_value()) {
+              return std::nullopt;
+            }
+            for (size_t j = 0; j <= position; ++j) {
+              const Value& candidate = order_values[j][0];
+              if (candidate.IsNull()) {
+                continue;
+              }
+              if (asc ? candidate.value.int_value >= *boundary
+                      : candidate.value.int_value <= *boundary) {
+                return j;
+              }
+            }
+            return position;
+          }
+          const double off = opt_bound->numeric;
           for (size_t j = 0; j <= position; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
@@ -626,11 +724,10 @@ struct WindowRuntime {
         case WindowFrameBoundType::kOffsetFollowing: {
           // Start bound `N FOLLOWING`: the FIRST row whose key is >=
           // `key + off` (ASC) / <= `key - off` (DESC).
-          const auto opt_off = range_offset(bound);
-          if (!opt_off.has_value()) {
+          const auto opt_bound = range_bound(bound);
+          if (!opt_bound.has_value()) {
             return std::nullopt;
           }
-          const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
             // NULLs are peers of each other: the offset bound collapses to
@@ -638,6 +735,26 @@ struct WindowRuntime {
             return first_peer(position);
           }
           const bool asc = window.order_by[0].ascending;
+          if (opt_bound->is_interval) {
+            const auto boundary =
+                interval_boundary_days(key, asc ? 1 : -1, opt_bound->interval);
+            if (!boundary.has_value()) {
+              return std::nullopt;
+            }
+            for (size_t j = 0; j < m; ++j) {
+              const Value& candidate = order_values[j][0];
+              if (candidate.IsNull()) {
+                continue;
+              }
+              if (asc ? candidate.value.int_value >= *boundary
+                      : candidate.value.int_value <= *boundary) {
+                return j;
+              }
+            }
+            // No row satisfies the bound: the frame is empty.
+            return std::nullopt;
+          }
+          const double off = opt_bound->numeric;
           for (size_t j = 0; j < m; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
@@ -665,11 +782,10 @@ struct WindowRuntime {
         case WindowFrameBoundType::kCurrentRow:
           return peer_end[position];
         case WindowFrameBoundType::kOffsetFollowing: {
-          const auto opt_off = range_offset(bound);
-          if (!opt_off.has_value()) {
+          const auto opt_bound = range_bound(bound);
+          if (!opt_bound.has_value()) {
             return std::nullopt;
           }
-          const double off = *opt_off;
           const Value& key = order_values[position][0];
           if (key.IsNull()) {
             return peer_end[position];
@@ -678,6 +794,25 @@ struct WindowRuntime {
           // candidate >= key - off.
           const bool asc = window.order_by[0].ascending;
           std::optional<size_t> reached;
+          if (opt_bound->is_interval) {
+            const auto boundary =
+                interval_boundary_days(key, asc ? 1 : -1, opt_bound->interval);
+            if (!boundary.has_value()) {
+              return std::nullopt;
+            }
+            for (size_t j = 0; j < m; ++j) {
+              const Value& candidate = order_values[j][0];
+              if (candidate.IsNull()) {
+                continue;
+              }
+              if (asc ? candidate.value.int_value <= *boundary
+                      : candidate.value.int_value >= *boundary) {
+                reached = j;
+              }
+            }
+            return reached;
+          }
+          const double off = opt_bound->numeric;
           for (size_t j = 0; j < m; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
@@ -697,16 +832,19 @@ struct WindowRuntime {
           // so any CURRENT/FOLLOWING start bound produces an empty frame.
           return size_t{0};
         case WindowFrameBoundType::kOffsetPreceding: {
-          const auto opt_off = range_offset(bound);
-          if (!opt_off.has_value()) {
+          const auto opt_bound = range_bound(bound);
+          if (!opt_bound.has_value()) {
             return std::nullopt;
           }
-          const double off = *opt_off;
           // RANGE `0 PRECEDING` is defined as CURRENT ROW, i.e. the bound is
           // the last row of the current row's peer group. The value scan below
           // is capped at `position`, which would truncate a peer group to its
           // first row.
-          if (off == 0.0) {
+          const bool zero_interval = opt_bound->is_interval &&
+                                     opt_bound->interval.months == 0 &&
+                                     opt_bound->interval.days == 0;
+          if ((!opt_bound->is_interval && opt_bound->numeric == 0.0) ||
+              zero_interval) {
             return peer_end[position];
           }
           const Value& key = order_values[position][0];
@@ -719,6 +857,25 @@ struct WindowRuntime {
           // unbounded-start frame.
           const bool asc = window.order_by[0].ascending;
           std::optional<size_t> reached;
+          if (opt_bound->is_interval) {
+            const auto boundary =
+                interval_boundary_days(key, asc ? -1 : 1, opt_bound->interval);
+            if (!boundary.has_value()) {
+              return std::nullopt;
+            }
+            for (size_t j = 0; j <= position; ++j) {
+              const Value& candidate = order_values[j][0];
+              if (candidate.IsNull()) {
+                continue;
+              }
+              if (asc ? candidate.value.int_value <= *boundary
+                      : candidate.value.int_value >= *boundary) {
+                reached = j;
+              }
+            }
+            return reached;
+          }
+          const double off = opt_bound->numeric;
           const bool key_int = key.type == ValueType::kInt64;
           const long double asc_limit =
               key_int ? static_cast<long double>(key.value.int_value) -
@@ -1237,11 +1394,18 @@ struct WindowRuntime {
                  : static_cast<double>(v.value.int_value);
     };
     Status pairs_error{Status::kSuccess};
-    auto frame_pairs =
-        [&]() -> std::optional<std::tuple<double, double, double, size_t>> {
+    struct FramePairStats {
+      double covar_pop = 0;  // population covariance of (arg0, arg1)
+      double var_arg0 = 0;   // population variance of the first argument
+      double var_arg1 = 0;   // population variance of the second argument
+      double mean_arg0 = 0;
+      double mean_arg1 = 0;
+      size_t n = 0;  // aligned non-NULL pair count
+    };
+    auto frame_pairs = [&]() -> std::optional<FramePairStats> {
       // Evaluates both arguments per aligned row (NULL on either side skips
       // the pair), over the frame rows that survive EXCLUDE and the WHERE
-      // filter.  Returns {covar_pop, var_x, var_y, n}.
+      // filter.  The pair count is exact even below 2; REGR_COUNT uses it.
       std::vector<std::pair<double, double>> pairs;
       StatusOr<std::vector<size_t>> survivors_or =
           FrameSurvivors(window, rows, ordered, order_values, current, lo, hi);
@@ -1281,8 +1445,10 @@ struct WindowRuntime {
         pairs.emplace_back(xv, yv);
       }
       const size_t n = pairs.size();
-      if (n < 2) {
-        return std::nullopt;
+      FramePairStats stats;
+      stats.n = n;
+      if (n == 0) {
+        return stats;
       }
       double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
       for (const auto& [xv, yv] : pairs) {
@@ -1294,10 +1460,12 @@ struct WindowRuntime {
       }
       const double mx = sx / static_cast<double>(n);
       const double my = sy / static_cast<double>(n);
-      const double covar_pop = (sxy / static_cast<double>(n)) - (mx * my);
-      const double var_x = (sxx / static_cast<double>(n)) - (mx * mx);
-      const double var_y = (syy / static_cast<double>(n)) - (my * my);
-      return std::make_tuple(covar_pop, var_x, var_y, n);
+      stats.mean_arg0 = mx;
+      stats.mean_arg1 = my;
+      stats.covar_pop = (sxy / static_cast<double>(n)) - (mx * my);
+      stats.var_arg0 = (sxx / static_cast<double>(n)) - (mx * mx);
+      stats.var_arg1 = (syy / static_cast<double>(n)) - (my * my);
+      return stats;
     };
     auto frame_variance = [&](bool samp) -> Value {
       if (non_null.empty()) {
@@ -1341,10 +1509,12 @@ struct WindowRuntime {
       if (pairs_error != Status::kSuccess) {
         return pairs_error;
       }
-      if (!stats.has_value()) {
+      if (!stats.has_value() || stats->n < 2) {
         return Value();
       }
-      const auto& [covar_pop, var_x, var_y, n] = *stats;
+      const auto& [covar_pop, var_x, var_y, mean_x, mean_y, n] = *stats;
+      (void)mean_x;
+      (void)mean_y;
       if (fn == "COVAR_POP") {
         return Value(covar_pop);
       }
@@ -1357,6 +1527,85 @@ struct WindowRuntime {
         return Value();
       }
       return Value(covar_pop / std::sqrt(var_x * var_y));
+    }
+    if (fn == "REGR_SLOPE" || fn == "REGR_INTERCEPT" || fn == "REGR_COUNT" ||
+        fn == "REGR_R2" || fn == "REGR_AVGX" || fn == "REGR_AVGY" ||
+        fn == "REGR_SXX" || fn == "REGR_SYY" || fn == "REGR_SXY") {
+      // REGR_*(y, x): y is the first argument, x the second; all statistics
+      // mirror the grouped accumulator (population sums scaled by n).
+      auto stats = frame_pairs();
+      if (pairs_error != Status::kSuccess) {
+        return pairs_error;
+      }
+      if (!stats.has_value()) {
+        return Value();
+      }
+      // arg0 = y (first argument), arg1 = x (second argument).
+      const double covar_pop = stats->covar_pop;
+      const double var_x = stats->var_arg1;
+      const double var_y = stats->var_arg0;
+      const double mean_x = stats->mean_arg1;
+      const double mean_y = stats->mean_arg0;
+      const size_t n = stats->n;
+      if (fn == "REGR_COUNT") {
+        return Value(static_cast<int64_t>(n));
+      }
+      if (n < 2) {
+        return Value();
+      }
+      const double sxy_total = covar_pop * static_cast<double>(n);
+      const double sxx_total = var_x * static_cast<double>(n);
+      const double syy_total = var_y * static_cast<double>(n);
+      if (fn == "REGR_SXX") {
+        return Value(sxx_total);
+      }
+      if (fn == "REGR_SYY") {
+        return Value(syy_total);
+      }
+      if (fn == "REGR_SXY") {
+        return Value(sxy_total);
+      }
+      if (fn == "REGR_AVGX") {
+        return Value(mean_x);
+      }
+      if (fn == "REGR_AVGY") {
+        return Value(mean_y);
+      }
+      if (var_x <= 0.0) {
+        return Value();
+      }
+      const double slope = sxy_total / sxx_total;
+      if (fn == "REGR_SLOPE") {
+        return Value(slope);
+      }
+      if (fn == "REGR_INTERCEPT") {
+        return Value(mean_y - (slope * mean_x));
+      }
+      // REGR_R2: undefined when either side is constant.
+      if (var_y <= 0.0) {
+        return Value();
+      }
+      return Value((sxy_total * sxy_total) / (sxx_total * syy_total));
+    }
+    if (fn == "MODE") {
+      // Most frequent non-NULL frame value; ties keep the first value to
+      // reach the maximum count (same deterministic choice as the grouped
+      // accumulator).
+      Value best;
+      int64_t best_count = -1;
+      for (size_t i = 0; i < non_null.size(); ++i) {
+        int64_t seen = 0;
+        for (size_t j = 0; j <= i; ++j) {
+          if (ValuesEqual(non_null[j], non_null[i])) {
+            ++seen;
+          }
+        }
+        if (seen > best_count) {
+          best_count = seen;
+          best = non_null[i];
+        }
+      }
+      return best;
     }
     if (fn == "PERCENTILE_CONT" || fn == "PERCENTILE_DISC") {
       // PERCENTILE_CONT(value, p) OVER (ORDER BY ...): p in [0,1] constant.
@@ -1593,25 +1842,14 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
           ASSIGN_OR_RETURN(
               Value, key,
               (runtime.EvalAt(term.expression, rows, partition.ordered[k])));
-          // COLLATE-wrapped keys sort case-insensitively (und:ci style);
-          // folding the hidden sort key is sufficient.
-          if (term.expression->Type() == TypeTag::kFunctionCallExp) {
-            const auto& call = term.expression->AsFunctionCallExpression();
-            std::string fname = call.FuncName();
-            for (char& c : fname) {
-              c = static_cast<char>(
-                  std::tolower(static_cast<unsigned char>(c)));
-            }
-            if (fname == "collate" && !key.IsNull() &&
-                key.type == ValueType::kVarChar) {
-              std::string folded(key.value.varchar_value);
-              for (char& c : folded) {
-                c = static_cast<char>(
-                    std::tolower(static_cast<unsigned char>(c)));
-              }
-              key = Value(std::move(folded));
-            }
-          }
+          // COLLATE-wrapped keys sort case-insensitively ('und:ci'); folding
+          // the hidden sort key is sufficient because ValueLess then only
+          // sees the folded text. The collation comes from the value's tag
+          // (the shared type/collation.hpp contract) rather than from the
+          // expression shape, so a collator that is not a literal COLLATE
+          // call — a parameter, a subquery output — folds too, and non-ASCII
+          // bytes keep byte order instead of passing through std::tolower.
+          key = ApplyKeyCollation(key, CollationOfExpression(term.expression));
           values.push_back(std::move(key));
         }
       }
@@ -1939,7 +2177,7 @@ Status ComputeOneWindowImpl(TransactionContext& context,
               selected = std::move(candidate_value);
             }
             ++seen;
-            if (seen == static_cast<size_t>(nth)) {
+            if (std::cmp_equal(seen, nth)) {
               target = candidate;
               found = true;
               break;

@@ -1741,6 +1741,60 @@ incl. `byte_` variants) in both `function_call_expression.cpp` (AST/fold)
 and `expression_eval.cpp` (relational) so the two paths stay equivalent.
 Regression: `ScalarFunctionSqlTest.RegexpNestedRepetitionRejected`.
 
+### Bug 71 — MIN/MAX partials dropped by the parallel-merge empty check
+
+Surfaced while auditing the Bug-69 follow-up (array element typing): the
+existing regression query
+`SELECT (SELECT MAX(a) FROM m), (SELECT MAX(a) FROM m) + 1` returned
+`[30, 21]` — the second subquery produced the first row's `a` plus one
+instead of `MAX(a) + 1`.
+
+Root cause is two layers deep. Both subqueries scan `m`, so the table is
+marked reusable and the first execution fills the shared
+`base_relations` cache; the second `ExecuteQuery` hits it and
+`RunTypedParallelStreamAggregate` re-aggregates the resident rows across
+up to 16 row-sliced workers (the fresh-scan path uses `morsels.size()` —
+one morsel on small tables — which is why only the cache-hit leg
+diverged). The worker merge skips a partial with `count == 0`, but
+`AggregateAccumulator::TryApplyCore` never incremented `count` for
+MIN/MAX — every worker partial looked empty and was dropped, leaving
+worker 0's slice alone in the result: `MAX` over `[20]` → 20.
+
+Fix: `TryApplyCore` now increments `count` for kMin/kMax (making it the
+"saw a contributing input" marker the merges assume), `Merge` propagates
+`count` for the extreme-carrying tail, and the correlated-index parallel
+build's `worker_safe` gate in `subquery_runtime.cpp` now restricts to the
+mergeable accumulator kinds (count/sum/avg/min/max) — buffered
+aggregates (ARRAY_AGG/STRING_AGG/group-context) keep their rows in
+`buffer_`, which `Merge` never combines, so they previously could lose
+whole worker slices the same way; they now take the serial build.
+Regression:
+`RelationalRegressionTest.Execute_SharedBaseRelationCache_MinMaxMergesAcrossWorkers`
+(fails pre-fix, `[4, 2, 1, -11]` vs `[4, 5, 1, -14]`).
+
+### Array element typing — the Bug-69 latent wart, resolved
+
+`InferArrayElementSqlType` no longer defaults unrecognized nodes to
+"INT64": predicate-shaped nodes (`IsPredicateAstNode` — comparisons,
+IN/LIKE/BETWEEN/quantified comparisons, AND/OR/NOT, BOOL casts) report
+"BOOL" (runtime values cannot distinguish BOOL from INT64), `ConcatExpr`
+resolves array-vs-string concatenation by inspecting operands, and
+anything unknown reports "" so both evaluators infer the tag from
+produced elements (ARRAY_TRANSFORM with a string lambda now declares
+`ARRAY<STRING>` on every execution path, not just the cache-hit rerun).
+`InferAggregateArrayElementType` (ARRAY_AGG) and
+`InferSubqueryArrayElementType` (ARRAY(SELECT ...)) got the same
+predicate treatment, and the ARRAY_FILTER rewrite now takes its element
+type from the *input array* rather than the filter predicate body.  The
+AST-side `QueryExpression::TryEvaluate` falls back to produced values and
+then the subquery result schema — the latter via a defaulted
+`EvaluationContext::RunSubqueryDetailed` that only
+`RelationalEvaluationContext` overrides — matching the relational
+evaluator's order (static tag → values → schema → INT64).
+`ElementSqlTypeName` moved to `type/value_type.hpp` so the expression
+layer can share it. Regression:
+`QueryTest.LambdaArrayElementTypeFollowsProducedValues`.
+
 ## Round 15 — handoff: WIP union-pushdown rule corrupts correlated-EXISTS DML
 
 w15 sql_session caught a divergence (crash-fa8902d2…, tbl0 c1 kept the

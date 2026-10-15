@@ -49,7 +49,7 @@ graph TD
 
 ## 意味論的根拠と刈り込み方針
 
-16 表上限は探索効率とメモリ消費を両立させる境界です。関係数 $N$ に対して二分割の組合せは $2^{N-1}$ 通り存在し、各分割で `EnsureGroup` が部分 Group を生成するため、16 表を超える結合では列挙を行わず、貪欲法を用いる `greedy_join_order_fallback` に処理を委ねます。
+16 表上限は探索効率とメモリ消費を両立させる境界です。関係数 $N$ に対して二分割の組合せは $2^{N-1}$ 通り存在し、各分割で `EnsureGroup` が部分 Group を生成するため、16 表を超える結合では列挙を行わず、貪欲法を用いる `GreedyConnectedSplit（Memo 初期構築）` に処理を委ねます。
 
 最下位ビットが0のマスクをスキップする処理（`(mask & 1U) == 0`）は、二分割の対称性を利用した冗長性排除です。マスクとその補集合は左右を入れ替えた同一の二分割を表すため、最下位ビット（最初の関係）を常に左側に固定することで、`{a}|{b,c}` と `{b,c}|{a}` の一方のみを生成します。左右を反転させた形状は `join_commutativity` によって網羅されます。
 
@@ -123,7 +123,7 @@ bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
 
 - `join_commutativity`: 左右反転の鏡像ペアを生成。メモへの登録時に指紋照合（`Expression::Fingerprint`）によって重複が排除されます。
 - `join_associativity_left` / `join_associativity_right`: 部分 Group の内部で局所的な結合順序を組み替えます。`join_enumeration` が無効化された場合でも、結合則と交換則の組合せによって全順序を探索可能な冗長設計となっています。
-- `greedy_join_order_fallback`: 16 表を超える結合において、貪欲法により初期結合順序を補正します。
+- `GreedyConnectedSplit（Memo 初期構築）`: 16 表を超える結合において、貪欲法により初期結合順序を補正します。
 - `join_to_cross_if_no_predicate`: 連接詞を持たない結合に対し、物理実装のためのCrossJoin代替式を供給します。
 
 ## 検証テスト

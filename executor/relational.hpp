@@ -59,10 +59,12 @@ class RelationalExecutor : public ExecutorBase {
   size_t correlated_index_builds_{0};
   size_t correlated_index_probes_{0};
   size_t correlated_result_cache_hits_{0};
+  size_t shared_exists_build_reuses_{0};
   size_t correlated_distinct_keys_{0};
   size_t uncorrelated_cache_hits_{0};
   size_t uncorrelated_hash_builds_{0};
   size_t uncorrelated_hash_probes_{0};
+  size_t grouped_join_fusions_{0};
   double scan_ms_{0};
   double filter_ms_{0};
   double join_ms_{0};
@@ -83,10 +85,16 @@ class RelationalExecutor : public ExecutorBase {
   size_t scan_values_decoded_{0};
   size_t scan_values_available_{0};
   size_t exists_short_circuit_queries_{0};
+  size_t correlated_domain_filter_builds_{0};
   size_t key_filter_scans_{0};
   size_t key_filter_keys_{0};
   size_t key_filter_rejected_{0};
   size_t key_filter_null_rejected_{0};
+  // Dynamic filter composition: how many published filters carried a range
+  // enclosure / a Bloom part, and their combined footprint.
+  size_t key_filter_minmax_{0};
+  size_t key_filter_bloom_{0};
+  size_t key_filter_bytes_{0};
   bool empty_build_short_circuit_{false};
   bool null_aware_anti_build_contains_null_{false};
 };

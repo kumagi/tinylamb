@@ -88,7 +88,7 @@ TEST_F(CliMainTest, ScriptExecutesAndPrintsRowsAfterCommit) {
       "INSERT INTO t VALUES (1, 'one'), (2, 'two');"
       "SELECT k FROM t ORDER BY k;",
       &out, &err);
-  EXPECT_EQ(code, 0) << true << err;
+  EXPECT_EQ(code, 0) << err;
   // Row output uses Row's operator<< format; every buffered statement's
   // output (including command tags) prints only after the commit barrier.
   EXPECT_NE(out.find("[1]"), std::string::npos) << out;

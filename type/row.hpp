@@ -30,6 +30,27 @@
 namespace tinylamb {
 class Schema;
 
+// Precomputed projected-decode plan: per stored column, its type and the
+// output slot it lands in (or none).  Everything the decode loop needs, so a
+// scan with a fixed projection stops re-deriving it per row (the ascending
+// projection guard, schema column lookups, projection cursor).  Built once
+// per scan iterator; malformed (non-ascending / out-of-range) projections
+// have no plan and keep the legacy per-row path.
+struct RowDecodePlan {
+  static constexpr size_t kNoSlot = static_cast<size_t>(-1);
+  slot_t stored_count{0};
+  size_t kept_count{0};
+  std::vector<ValueType> stored_types;  // per stored column
+  std::vector<size_t> stored_slot;     // per stored column: kept slot / kNoSlot
+  std::vector<uint8_t> slot_unsigned;  // per kept slot
+  // Plan-shape flags the decode loop reads once per row instead of
+  // re-deriving per cell.  all_fixed: every stored column has a fixed-width
+  // image; has_unsigned: any kept slot applies the unsigned tag (the per-cell
+  // check only runs when it can fire).
+  bool all_fixed{false};
+  bool has_unsigned{false};
+};
+
 struct Row {
   Row() = default;
   Row(std::initializer_list<Value> v) : values_(v) {}
@@ -40,8 +61,13 @@ struct Row {
   Row& operator=(Row&&) = default;
   ~Row() = default;
 
-  Value& operator[](size_t i);
-  const Value& operator[](size_t i) const;
+  // Hot path: cell access is on every scan/join/aggregate row loop, so it
+  // stays inline in the header.
+  Value& operator[](size_t i) { return values_[i]; }
+  const Value& operator[](size_t i) const { return values_[i]; }
+  // Number of cells (bounds checks want this, never the serialized byte
+  // size returned by Size()).
+  [[nodiscard]] size_t Count() const { return values_.size(); }
   // Serialize assumes the row image fits the on-disk widths; callers taking
   // user-supplied rows must check CheckSerializable() first (VARCHAR values
   // are length-prefixed with 16 bits and the column count carries a flag
@@ -52,6 +78,10 @@ struct Row {
                                                 const Schema& sc);
   [[nodiscard]] StatusOr<size_t> TryDeserializeProjected(
       const char* src, const Schema& sc, const std::vector<slot_t>& columns);
+  // Projected decode against a precomputed RowDecodePlan (same image
+  // contract and slot-reuse behavior as TryDeserializeProjected).
+  [[nodiscard]] StatusOr<size_t> TryDeserializePlanned(
+      const char* src, const RowDecodePlan& plan);
   // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
   size_t Deserialize(const char* src, const Schema& sc) {
     return ExcShimUnwrap(TryDeserialize(src, sc), "Row::Deserialize");
@@ -61,10 +91,16 @@ struct Row {
     return ExcShimUnwrap(TryDeserializeProjected(src, sc, columns),
                          "Row::DeserializeProjected");
   }
+  size_t DeserializePlanned(const char* src, const RowDecodePlan& plan) {
+    return ExcShimUnwrap(TryDeserializePlanned(src, plan),
+                         "Row::DeserializePlanned");
+  }
   // Read a single INT64/DATE column without materializing other values.
   [[nodiscard]] static std::optional<int64_t> TryPeekInteger(const char* src,
                                                              const Schema& sc,
                                                              slot_t column);
+  // Serialized byte size of the row image (count + optional null bitmap +
+  // payload).  Bounds checks over cell indexes want Count(), never this.
   [[nodiscard]] size_t Size() const;
   [[nodiscard]] std::string ToString() const;
   [[nodiscard]] StatusOr<std::string> TryEncodeMemcomparableFormat() const;

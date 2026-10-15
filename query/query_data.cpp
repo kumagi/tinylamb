@@ -652,8 +652,7 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   for (auto& [relation, sample] : samples_) {
     (void)relation;
     for (Expression& partition : sample.partition_by) {
-      Expression mapped =
-          BindFieldPaths(partition, col_table_map, relations);
+      Expression mapped = BindFieldPaths(partition, col_table_map, relations);
       if (mapped) {
         partition = std::move(mapped);
       }

@@ -145,16 +145,18 @@ struct OracleTrace {
   std::vector<std::string> setop_expect;    // sorted multiset
   std::vector<std::string> orderby;         // ORDER BY/LIMIT/OFFSET query
   std::vector<std::string> orderby_expect;  // ordered sequence
-  std::vector<std::string> ties;            // FETCH FIRST n ROWS WITH TIES
-  std::vector<std::string> ties_expect;     // sorted multiset
-  std::vector<std::string> having;          // GROUP BY ... HAVING query
-  std::vector<std::string> having_expect;   // sorted multiset
-  std::vector<std::string> cte;             // {WITH form, inline form}
-  std::string recursive;                    // WITH RECURSIVE query
-  std::string recursive_expect;             // expected single row
-  std::vector<std::string> unnest;          // UNNEST query
-  std::vector<std::string> unnest_expect;   // ordered or multiset
-  bool unnest_ordered{false};               // WITH OFFSET: compare verbatim
+  std::vector<std::string> ordinal_order;
+  std::vector<std::string> ordinal_order_expect;
+  std::vector<std::string> ties;           // FETCH FIRST n ROWS WITH TIES
+  std::vector<std::string> ties_expect;    // sorted multiset
+  std::vector<std::string> having;         // GROUP BY ... HAVING query
+  std::vector<std::string> having_expect;  // sorted multiset
+  std::vector<std::string> cte;            // {WITH form, inline form}
+  std::string recursive;                   // WITH RECURSIVE query
+  std::string recursive_expect;            // expected single row
+  std::vector<std::string> unnest;         // UNNEST query
+  std::vector<std::string> unnest_expect;  // ordered or multiset
+  bool unnest_ordered{false};              // WITH OFFSET: compare verbatim
   // Guarded-division conjunct oracle: WHERE clauses pairing a possibly
   // erroring conjunct ((b / a) <op> c) with a sibling that may reject the
   // row first.  Every permutation must agree; when no conjunct cleanly
@@ -194,6 +196,7 @@ struct OracleIterationStats {
   bool troc_ran{false};
   bool setop_ran{false};
   bool orderby_ran{false};
+  bool ordinal_order_ran{false};
   bool ties_ran{false};
   bool having_ran{false};
   bool cte_ran{false};

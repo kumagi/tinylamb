@@ -83,7 +83,7 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `union_to_union_all_plus_distinct` / `union_distinct_hash_sort_choice`: UNION DISTINCT から導出された派生 UNION ALL に対して本 Rule が適用され、平坦化を行います。
+
 - `union_all_push_limit`: 平坦化された n 項 UNION ALL の全分岐に対して一括で LIMIT を押し込む。
 - `values_fold_into_union`: 全分岐が単行 VALUES である平坦化ノードを単一の VALUES ノードへと畳み込む。
 

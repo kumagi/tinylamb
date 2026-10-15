@@ -85,6 +85,74 @@ std::ostream& operator<<(std::ostream& o, const Constraint& c) {
   return o;
 }
 
+std::string FormatForeignKeyReference(std::string_view table,
+                                      const std::vector<std::string>& columns) {
+  std::string out(table);
+  if (!columns.empty()) {
+    out += "(";
+    for (size_t i = 0; i < columns.size(); ++i) {
+      if (i != 0) {
+        out += ",";
+      }
+      out += columns[i];
+    }
+    out += ")";
+  }
+  return out;
+}
+
+bool ParseForeignKeyReference(const Constraint& constraint, std::string* table,
+                              std::vector<std::string>* columns) {
+  if (constraint.ctype != Constraint::kForeign || table == nullptr ||
+      columns == nullptr) {
+    return false;
+  }
+  const std::string ref =
+      (constraint.value.type == ValueType::kVarChar)
+          ? std::string(constraint.value.value.varchar_value)
+          : constraint.value.AsString();
+  const size_t open = ref.find('(');
+  std::string table_part =
+      (open == std::string::npos) ? ref : ref.substr(0, open);
+  if (table_part.size() >= 2 && table_part.starts_with('"') &&
+      table_part.ends_with('"')) {
+    table_part = table_part.substr(1, table_part.size() - 2);
+  }
+  if (table_part.empty()) {
+    return false;
+  }
+  std::vector<std::string> parsed;
+  if (open != std::string::npos) {
+    if (!ref.ends_with(')')) {
+      return false;
+    }
+    size_t pos = open + 1;
+    while (pos < ref.size() - 1) {
+      const size_t comma = ref.find(',', pos);
+      const size_t end = (comma == std::string::npos) ? ref.size() - 1 : comma;
+      std::string col = ref.substr(pos, end - pos);
+      // Trim ASCII whitespace; quoted identifiers keep their quotes.
+      while (!col.empty() && (col.front() == ' ' || col.front() == '\t')) {
+        col.erase(col.begin());
+      }
+      while (!col.empty() && (col.back() == ' ' || col.back() == '\t')) {
+        col.pop_back();
+      }
+      if (col.empty()) {
+        return false;
+      }
+      parsed.push_back(std::move(col));
+      pos = end + 1;
+    }
+    if (parsed.empty()) {
+      return false;
+    }
+  }
+  *table = std::move(table_part);
+  *columns = std::move(parsed);
+  return true;
+}
+
 Encoder& operator<<(Encoder& a, const Constraint& c) {
   a << static_cast<uint8_t>(c.ctype) << c.value;
   return a;

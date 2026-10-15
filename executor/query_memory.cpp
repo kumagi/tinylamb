@@ -38,7 +38,8 @@ size_t QueryMemoryBudget::LimitFromEnv() {
 }
 
 QueryMemoryBudget::QueryMemoryBudget(size_t limit_bytes)
-    : limit_(limit_bytes) {}
+    : limit_(limit_bytes),
+      soft_(limit_bytes / kSoftFractionDen * kSoftFractionNum) {}
 
 QueryMemoryBudget& QueryMemoryBudget::Global() {
   static QueryMemoryBudget instance(LimitFromEnv());
@@ -47,6 +48,7 @@ QueryMemoryBudget& QueryMemoryBudget::Global() {
 
 void QueryMemoryBudget::ResetForTest(size_t limit_bytes) {
   limit_ = limit_bytes;
+  soft_ = limit_bytes / kSoftFractionDen * kSoftFractionNum;
   used_.store(0, std::memory_order_relaxed);
 }
 
@@ -62,10 +64,8 @@ bool QueryMemoryBudget::CanReserve(size_t bytes) const {
   if (bytes == 0 || Unlimited()) {
     return true;
   }
-  const size_t soft =
-      limit_ / kSoftFractionDen * kSoftFractionNum;  // 80% of limit
   const size_t cur = used_.load(std::memory_order_relaxed);
-  return cur < soft && soft - cur >= bytes;
+  return cur < soft_ && soft_ - cur >= bytes;
 }
 
 void QueryMemoryBudget::ReserveForced(size_t bytes) {

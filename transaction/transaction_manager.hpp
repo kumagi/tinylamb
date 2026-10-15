@@ -19,6 +19,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
@@ -42,8 +43,48 @@ struct TransactionRuntimeStats {
   uint64_t wal_wait_ns{0};
   uint64_t write_intent_attempts{0};
   uint64_t write_intent_conflicts{0};
+  // Times the latch-cycle escape hatch fired: a waiter gave up after
+  // GetWriteIntentWaitLimit() instead of sleeping forever. Each occurrence
+  // is a multi-second stall, so this gauge stays near zero on a healthy
+  // deployment; a climbing value means latch-owning waits need attention.
+  uint64_t write_intent_wait_timeouts{0};
+  // Times a waiter gave up because the intent HOLDER had started aborting
+  // (Transaction::IsAbortStarted). The holder's undo walk may need the page
+  // latch the waiter is holding, so only the waiter can break that cycle;
+  // detecting it via the abort flag resolves it in one poll tick (~10ms)
+  // instead of riding the multi-second wait limit. A healthy deployment
+  // shows this near zero; a climbing value means aborts and write waits
+  // interleave (heavy conflict on rows whose pages are latched mid-wait).
+  uint64_t write_intent_holder_abort_giveups{0};
   uint64_t write_intent_mutex_wait_ns{0};
   uint64_t commit_shard_mutex_wait_ns{0};
+  // Long-uptime observability: a snapshot age that keeps growing while
+  // version_chains climbs means MVCC GC is pinned by a live transaction
+  // (see GarbageCollectVersions' pin warning).
+  uint64_t active_transactions{0};
+  uint64_t version_chains{0};
+  uint64_t oldest_snapshot_ts{0};
+  uint64_t current_commit_ts{0};
+  // Pages with an outstanding index-undo reservation. Bounded by the write
+  // sets of active transactions; growth while active_transactions is zero
+  // means a reservation release path leaked (a leaked page permanently loses
+  // its reserved bytes from insert admission).
+  uint64_t index_undo_reserved_pages{0};
+  // Per-index mutation gate (AcquireIndexWriteGuard) contention, sampled:
+  // only acquisitions that blocked >1ms accumulate, so the uncontended RMW
+  // majority pays no extra atomic traffic. index_gate_long_waits counts
+  // acquisitions that blocked >1s -- a sign a single RMW (foster absorption
+  // chain, split storm) is serializing a whole index; that is the
+  // precondition measurement for a gate-free RMW rebuild.
+  uint64_t index_gate_contended_acquires{0};
+  uint64_t index_gate_wait_ns{0};
+  uint64_t index_gate_long_waits{0};
+  // Table-tail growth waits (ReserveTableTail / WaitForTableTailPage),
+  // sampled >1ms. Tail ownership resolves at the grower's commit, so a
+  // climbing total with a low count = one slow grower convoying the table's
+  // appends; a high count = repeated page-boundary convoys.
+  uint64_t table_tail_wait_count{0};
+  uint64_t table_tail_wait_ns{0};
 };
 
 class IndexKey;
@@ -66,6 +107,8 @@ class TransactionManager {
   TransactionManager& operator=(TransactionManager&&) = delete;
   TransactionManager(PageManager* pm, Logger* l, RecoveryManager* r)
       : page_manager_(pm), logger_(l), recovery_(r) {
+    write_intent_wait_limit_ms_.store(WriteIntentWaitLimitMsFromEnv(),
+                                      std::memory_order_release);
     StartGcWorker();
   }
 
@@ -132,7 +175,13 @@ class TransactionManager {
     if (policy == DeadlockPolicy::kDeadlockDetect) {
       std::scoped_lock lock(deadlock_detector_mutex_);
       if (!deadlock_detector_.joinable()) {
-        deadlock_detector_ = std::thread([this] { DeadlockDetectorLoop(); });
+        try {
+          deadlock_detector_ = std::thread([this] { DeadlockDetectorLoop(); });
+        } catch (...) {
+          deadlock_policy_.store(
+              static_cast<uint8_t>(DeadlockPolicy::kWoundWait),
+              std::memory_order_release);
+        }
       }
     }
   }
@@ -145,7 +194,9 @@ class TransactionManager {
   // deadlocked on the WAITER's page latch (RowPage ops run exclusively
   // latched; Abort's undo walk re-acquires that latch before AbortVersions
   // can release the intents), a cycle no detector can see.  Generous enough
-  // that legitimate contention never hits it; test-tunable.
+  // that legitimate contention never hits it; test-tunable, and
+  // TINYLAMB_WRITE_INTENT_WAIT_MS overrides the default at startup for
+  // deployments whose workload mix needs a different stall bound.
   void SetWriteIntentWaitLimit(std::chrono::milliseconds limit) {
     write_intent_wait_limit_ms_.store(static_cast<int64_t>(limit.count()),
                                       std::memory_order_release);
@@ -154,7 +205,47 @@ class TransactionManager {
     return std::chrono::milliseconds(
         write_intent_wait_limit_ms_.load(std::memory_order_acquire));
   }
+  // Upper bound for the durability-stall extension of the write-intent
+  // escape hatch (see ExtendIntentDeadlineForDurabilityBarrier).  The twin
+  // of LockManager::kDurabilityWaitFloor: a stalled fsync must not turn
+  // innocent waiters into spurious latch-cycle victims, but a genuine cycle
+  // still cannot outwait this bound.
+  static constexpr std::chrono::milliseconds kDurabilityIntentWaitFloor{60'000};
+  // Marks the caller as blocked on a WAL durability barrier (commit fsync,
+  // write-back durability gate).  While any barrier is in flight the
+  // write-intent escape hatch stretches toward kDurabilityIntentWaitFloor:
+  // the dominant holder-slowed-by-I/O case is not a latch cycle, and timing
+  // it out produced abort cascades whenever a checkpoint's data-file sync
+  // stretched group-commit latency.  Prefer the RAII DurabilityBarrierGuard.
+  void BeginDurabilityBarrier() noexcept {
+    durability_barrier_waits_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  void EndDurabilityBarrier() noexcept {
+    durability_barrier_waits_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+  class [[nodiscard]] DurabilityBarrierGuard {
+   public:
+    explicit DurabilityBarrierGuard(TransactionManager& tm) : tm_(&tm) {
+      tm_->BeginDurabilityBarrier();
+    }
+    ~DurabilityBarrierGuard() { tm_->EndDurabilityBarrier(); }
+    DurabilityBarrierGuard(const DurabilityBarrierGuard&) = delete;
+    DurabilityBarrierGuard& operator=(const DurabilityBarrierGuard&) = delete;
+    DurabilityBarrierGuard(DurabilityBarrierGuard&&) = delete;
+    DurabilityBarrierGuard& operator=(DurabilityBarrierGuard&&) = delete;
+
+   private:
+    TransactionManager* tm_;
+  };
+  // WaitForDurable with the durability-barrier bookkeeping the write-intent
+  // wait loops consult.  Every engine-side fsync wait should go through this
+  // (PreCommit barriers, write-back gates) so a stalled disk reads as "the
+  // system is slow", not "my holder is deadlocked".
+  Status WaitForWALDurable(lsn_t lsn);
   [[nodiscard]] TransactionRuntimeStats RuntimeStats() const;
+  [[nodiscard]] bool FailStopped() const {
+    return fail_stop_.load(std::memory_order_acquire);
+  }
 
   Status Abort(Transaction& txn);
 
@@ -163,41 +254,62 @@ class TransactionManager {
   // use it to keep page_lsn at or above the record whose effect the page
   // now reflects (see RecoveryManager::LogUndoWithPage).
   StatusOr<lsn_t> CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                      slot_t slot);
+                                      slot_t slot, lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                      std::string_view key);
+                                      std::string_view key,
+                                      lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateInsertBranchLog(txn_id_t txn_id, page_id_t pid,
-                                            std::string_view key);
+                                            std::string_view key,
+                                            lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
-                                      slot_t slot, std::string_view redo);
+                                      slot_t slot, std::string_view redo,
+                                      lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
                                       std::string_view key,
-                                      std::string_view redo);
+                                      std::string_view redo,
+                                      lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateUpdateBranchLog(txn_id_t txn_id, page_id_t pid,
                                             std::string_view key,
-                                            page_id_t redo);
+                                            page_id_t redo,
+                                            lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
-                                      slot_t slot, std::string_view redo);
+                                      slot_t slot, std::string_view redo,
+                                      lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
                                       std::string_view key,
-                                      std::string_view redo);
+                                      std::string_view redo,
+                                      lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateDeleteBranchLog(txn_id_t txn_id, page_id_t pid,
                                             std::string_view key,
-                                            page_id_t redo);
+                                            page_id_t redo,
+                                            lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateSetLowestValueLog(txn_id_t txn_id, page_id_t pid,
-                                              page_id_t redo);
+                                              page_id_t redo,
+                                              lsn_t undo_next_lsn = 0);
+  StatusOr<lsn_t> CompensateSetRowPageNextLog(txn_id_t txn_id, page_id_t pid,
+                                              page_id_t redo,
+                                              lsn_t undo_next_lsn = 0);
+  StatusOr<lsn_t> CompensateSetRowPagePrevLog(txn_id_t txn_id, page_id_t pid,
+                                              page_id_t redo,
+                                              lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateSetLowFenceLog(txn_id_t txn_id, page_id_t pid,
-                                           const IndexKey& redo);
+                                           const IndexKey& redo,
+                                           lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateSetHighFenceLog(txn_id_t txn_id, page_id_t pid,
-                                            const IndexKey& redo);
+                                            const IndexKey& redo,
+                                            lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
-                                         const FosterPair& foster);
+                                         const FosterPair& foster,
+                                         lsn_t undo_next_lsn = 0);
   // CLR for a destroy undo: the record carries the restored page type and
   // body image, so a later REDO replays the restore rather than leaving the
   // destroyed (free) image that the original destroy record would recreate.
   StatusOr<lsn_t> CompensateDestroyPageLog(txn_id_t txn_id, page_id_t pid,
                                            PageType restored_type,
-                                           std::string_view restored_body);
+                                           std::string_view restored_body,
+                                           lsn_t undo_next_lsn = 0);
+  StatusOr<lsn_t> CompensateAllocatePageLog(const LogRecord& allocation,
+                                            lsn_t undo_next_lsn);
   // Non-waiting first-updater-wins reservation stored in the same shard as
   // the row's MVCC chain. A stale snapshot or another pending writer loses.
   // When `before` is supplied (update/delete of an existing row), the chain's
@@ -223,14 +335,22 @@ class TransactionManager {
   // statement cannot leak a post-snapshot commit into plain reads.  Write
   // paths keep the default so a writer that waited on an intent resolves
   // the predecessor's newest committed image.
-  StatusOr<std::string> ReadVersion(const Transaction& txn,
-                                    const RowPosition& rp,
-                                    std::optional<std::string_view> physical,
-                                    bool resolve_head = true) const;
+  //
+  // Returns nullopt when the caller's latched page image is the
+  // authoritative version: the value equals *physical byte for byte, so the
+  // caller may serve a view of the image instead of paying a string copy
+  // per read (full scans of chain-bearing pages otherwise allocate and copy
+  // every row body twice -- here and into the read cache).
+  StatusOr<std::optional<std::string>> ReadVersion(
+      const Transaction& txn, const RowPosition& rp,
+      std::optional<std::string_view> physical, bool resolve_head = true) const;
   // True when any version chain entry exists for the row.  Without one, the
   // physical row image is the only version and is visible to every snapshot,
   // letting readers skip the copy/cache slow path in Transaction::ReadVersion.
   [[nodiscard]] bool HasVersionChain(const RowPosition& rp) const;
+  // Reports whether any row on |pid| has a version chain. Exact per page:
+  // only pages whose rows actually carry a chain answer true.
+  [[nodiscard]] bool HasPageVersionChains(page_id_t pid) const;
   // Drops every version chain keyed to |pid|.  RowPosition namespaces chain
   // keys by {page_id, slot} only, so a page id recycled off the free list
   // would otherwise serve the previous incarnation's committed rows to scans
@@ -244,10 +364,73 @@ class TransactionManager {
   // a fresh write intent under the new incarnation instead of skipping the
   // reservation on a stale write-set entry.
   void InvalidatePageVersions(page_id_t pid, Transaction* reclaimer);
+  void CommitRecycledPageAllocation(Transaction& txn, page_id_t pid);
+  // Index-page undo space reservation. A logged leaf/branch mutation whose
+  // UNDO re-consumes the bytes it freed (delete re-insert, shrink update,
+  // fence/foster restore) must keep those bytes out of OTHER transactions'
+  // reach until the mutator resolves: a concurrent insert admitted on the
+  // freed accounting makes the undo physically impossible (kNoSpace),
+  // fail-stops the runtime abort, and -- because restart recovery replays the
+  // same undo against the same page -- wedges the open forever. This is the
+  // Leaf/Branch twin of the RowPage hole reservation: pages stay
+  // format-unchanged; the reservation lives here, keyed by (page, owner), and
+  // is released when the transaction leaves the active table. A transaction
+  // never discounts its OWN reservation: the reverse-chain undo frees the
+  // later ops' bytes before the earlier ops' undo re-claims them.
+  void ReserveIndexUndoBytes(Transaction& txn, page_id_t pid, size_t bytes);
+  // Diagnostic bisect for the reservation machinery (env
+  // TINYLAMB_DISABLE_INDEX_RESERVATION): 0=on, 1=off, 2=no shared map,
+  // 3=no per-transaction vector.
+  static int ReservationBisectMode();
+  // Bytes on |pid| that transactions OTHER than |self| may still claim for
+  // their undo. Admission checks subtract this from free_size_ (a hash hit
+  // only shrinks usable space; it can never grant space that is not there).
+  [[nodiscard]] size_t IndexUndoReservedBytes(page_id_t pid,
+                                              txn_id_t self) const;
+  // Waits until no OTHER transaction holds an index-undo reservation on
+  // |pid| (ending early when they resolve; kConflicts at |limit|).
+  // LATCH-FREE by contract: the caller must not hold the page's latch,
+  // because a reservation owner's remaining statements may need that very
+  // latch -- waiting latched would rebuild the latch cycle the write-intent
+  // escape hatch exists for. This is what turns a spurious kNoSpace (a
+  // concurrent deleter's undo reservation, released at its commit/abort)
+  // into a short productive wait instead of a failed statement.
+  Status WaitForIndexReservationDrain(page_id_t pid, txn_id_t self,
+                                      std::chrono::milliseconds limit) const;
+  // True when ANY page carries a reservation from a transaction other than
+  // |self|. Cheap: only pages with in-flight mutators appear.
+  [[nodiscard]] bool HasForeignIndexReservations(txn_id_t self) const;
+  // Waits until no transaction other than |self| holds any index-undo
+  // reservation (kConflicts at |limit|). LATCH-FREE by contract -- see
+  // WaitForIndexReservationDrain. The coarse form backs the tree-level
+  // statement retry: a structural step (branch split, foster absorption)
+  // refused on some page's reservation re-runs whole after the drain.
+  Status WaitForAllIndexReservationsDrain(
+      txn_id_t self, std::chrono::milliseconds limit) const;
+  // Watcher-aware variant: slices the wait (wounded transactions bail at
+  // the next slice instead of riding the full limit) and tags the stall
+  // phase for the timeout postmortem. See ReserveTableTail's twin.
+  Status WaitForAllIndexReservationsDrain(txn_id_t self,
+                                          std::chrono::milliseconds limit,
+                                          const Transaction* watcher) const;
+  // Diagnostic: render outstanding reservation owners on |pid| as text.
+  [[nodiscard]] std::string DebugDumpIndexReservations(page_id_t pid) const;
+  // Diagnostic: every outstanding index-undo reservation EXCEPT |except|'s
+  // own, with each owner's registry status and stall phase. Used by the
+  // slow-drain warning; not on any hot path.
+  [[nodiscard]] std::string DebugDumpAllIndexReservations(
+      txn_id_t except) const;
   // True while |id| is registered in the active-transaction table (between
   // Begin's registration and the ForgetTransaction at the end of
   // commit/abort).
   [[nodiscard]] bool IsActive(txn_id_t id) const;
+  // True when |id| names a live transaction that has started aborting.  The
+  // registry lookup under transaction_table_lock keeps the Transaction*
+  // dereference safe (the object cannot finish between the find and the
+  // flag read).  Write-intent waiters call this to give up on an
+  // aborting holder instead of riding the full wait limit -- see
+  // Transaction::MarkAbortStarted.
+  [[nodiscard]] bool IsAborting(txn_id_t id) const;
   void RegisterVersionWrite(Transaction& txn, const RowPosition& rp,
                             std::optional<std::string_view> before,
                             std::optional<std::string_view> after);
@@ -270,6 +453,27 @@ class TransactionManager {
   [[nodiscard]] bool IndexKeysMayBeStale(const Transaction& txn) const;
   [[nodiscard]] bool IndexKeysMayBeStale(const Transaction& txn,
                                          page_id_t index_root) const;
+
+  class IndexReadGuard {
+   public:
+    IndexReadGuard() = default;
+    explicit IndexReadGuard(std::shared_mutex& mutex) : lock_(mutex) {}
+    IndexReadGuard(IndexReadGuard&&) noexcept = default;
+    IndexReadGuard& operator=(IndexReadGuard&&) noexcept = default;
+    IndexReadGuard(const IndexReadGuard&) = delete;
+    IndexReadGuard& operator=(const IndexReadGuard&) = delete;
+    ~IndexReadGuard() = default;
+    [[nodiscard]] bool HoldsLock() const noexcept { return lock_.owns_lock(); }
+
+   private:
+    std::shared_lock<std::shared_mutex> lock_;
+  };
+  [[nodiscard]] IndexReadGuard AcquireIndexReadGuard(
+      page_id_t index_root) const;
+  [[nodiscard]] std::unique_lock<std::shared_mutex> AcquireIndexWriteGuard(
+      page_id_t index_root) const;
+  [[nodiscard]] std::vector<std::unique_lock<std::shared_mutex>>
+  AcquireIndexWriteGuards(const std::vector<page_id_t>& index_roots) const;
 
   StatusOr<lsn_t> AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;
@@ -333,8 +537,22 @@ class TransactionManager {
 
   // ---- background GC ----
   static constexpr uint64_t kGcCommitThreshold = 8;
+  // A version space at or below this many chains is swept in one full pass
+  // (the historical behavior; unit tests rely on prompt reclamation). Above
+  // it, each pass sweeps a rotating window of shards so the per-pass shard
+  // lock footprint stays bounded no matter how large the space grows: a
+  // full scan of millions of chains every kGcCommitThreshold commits would
+  // make GC interference with commit/read hot paths grow with database
+  // size, forever. Full coverage cycles every kGcPassDivisor passes.
+  static constexpr uint64_t kGcFullScanChainLimit = 8192;
+  static constexpr size_t kGcPassDivisor = 4;
+  // A snapshot this many commits behind the frontier while more than
+  // kGcFullScanChainLimit chains exist trips the rate-limited GC-pin warning.
+  static constexpr uint64_t kGcPinWarnAgeCommits = 100'000;
   void StartGcWorker();
   void GcWorkerLoop();
+  void MaybeWarnGcPin(const std::optional<uint64_t>& oldest_snapshot,
+                      txn_id_t oldest_snapshot_txn, uint64_t total_chains);
 
   // Transaction move operations use these to keep active_transactions_
   // pointing at the live object: Begin() registers the address of the
@@ -360,6 +578,55 @@ class TransactionManager {
     return static_cast<size_t>(root * 11400714819323198485ULL) %
            kIndexMutationShardCount;
   }
+  static constexpr size_t kPageChainShardCount = 256;
+  [[nodiscard]] static size_t PageChainShardIndex(page_id_t pid) {
+    return static_cast<size_t>((pid * 131ULL) % kPageChainShardCount);
+  }
+  // Lock-free scan fast path: a zero shard counter proves the row's page has
+  // no version chain anywhere in the shard, so its physical image is the
+  // only version and ReadVersion can serve it without locking a shard.
+  // ReadTransaction::ReadVersion uses this instead of a full HasVersionChain
+  // probe (which would take the shard mutex just to confirm what the caller
+  // resolves again in TransactionManager::ReadVersion).
+  [[nodiscard]] bool VersionShardIdle(const RowPosition& rp) const {
+    return page_chain_counts_[PageChainShardIndex(rp.page_id)].load(
+               std::memory_order_acquire) == 0;
+  }
+  // Sharded outstanding index-undo reservations, keyed by exact page id and
+  // owner. Only pages with in-flight mutators appear, so the maps stay tiny;
+  // the mutex is a leaf lock (admission paths hold it under a page latch,
+  // release paths hold no page latch).
+  static constexpr size_t kIndexReservationShardCount = 64;
+  struct IndexReservationShard {
+    mutable std::mutex mutex;
+    // Signaled whenever a reservation on this shard is released; the drain
+    // wait (WaitForIndexReservationDrain) sleeps on it.
+    mutable std::condition_variable released;
+    std::unordered_map<page_id_t, std::unordered_map<txn_id_t, uint64_t>> bytes;
+  };
+  [[nodiscard]] static size_t IndexReservationShardIndex(page_id_t pid) {
+    return static_cast<size_t>((pid * 131ULL) % kIndexReservationShardCount);
+  }
+  std::array<IndexReservationShard, kIndexReservationShardCount>
+      index_reservations_;
+  // Signaled after any reservation release for the coarse drain wait. The
+  // notify takes this mutex alone (never nested with a shard mutex), so the
+  // wait path's drain_mu_ -> shard-mutex order has no inverse.
+  mutable std::mutex reservation_drain_mu_;
+  mutable std::condition_variable reservation_drain_cv_;
+  void ReleaseIndexUndoReservations(Transaction& txn);
+  VersionChain& GetOrCreateVersionChain(VersionShard& shard,
+                                        const RowPosition& rp);
+  void ForgetVersionChain(const RowPosition& rp);
+  void MarkPendingIndexMutation(page_id_t index_root);
+  void CommitIndexMutations(Transaction& txn, uint64_t commit_ts);
+  void ClearPendingIndexMutations(Transaction& txn);
+  void ReleasePendingIndexMutation(size_t shard);
+
+  // Per-page chain bookkeeping (page_chain_shards_). Called exactly when a
+  // chain enters/leaves shard.versions, mirroring page_chain_counts_.
+  void PageChainCreated(page_id_t pid);
+  void PageChainForgotten(page_id_t pid);
 
   std::atomic<uint64_t> commit_timestamp_{0};
   std::atomic<uint64_t> stable_timestamp_{0};
@@ -372,16 +639,44 @@ class TransactionManager {
   // delete from degrading all indexes to full scans.
   std::array<std::atomic<uint64_t>, kIndexMutationShardCount>
       max_index_mutation_ts_{};
+  std::array<std::atomic<uint64_t>, kIndexMutationShardCount>
+      pending_index_mutations_{};
+  std::atomic<uint64_t> pending_index_mutation_count_{0};
+  mutable std::array<std::shared_mutex, kIndexMutationShardCount>
+      index_gates_{};
   mutable std::array<VersionShard, kVersionShardCount> version_shards_;
+  std::array<std::atomic<int64_t>, kPageChainShardCount> page_chain_counts_{};
+  // Exact per-page version-chain presence, sharded by page id (the same
+  // sharding as page_chain_counts_). The atomic counters above only bound a
+  // whole shard ("some page here has a chain"), which poisons every page in
+  // the shard: scans answered them with a per-row shard-mutex + RowPosition
+  // probe. The per-page map answers "does THIS page have a chain" with one
+  // small probe, so read-mostly pages stay on the physical-read fast path
+  // while any chain exists anywhere in the shard. Mutations hold the shard
+  // mutex as a leaf lock; it nests only under a VersionShard::mutex (see
+  // docs/lock_order.md).
+  struct PageChainShard {
+    mutable std::mutex mutex;
+    std::unordered_map<page_id_t, uint32_t> counts;
+  };
+  mutable std::array<PageChainShard, kPageChainShardCount> page_chain_shards_{};
   std::unordered_map<txn_id_t, uint64_t> active_snapshots_;
   PageManager* const page_manager_;
   Logger* const logger_;
   RecoveryManager* const recovery_;
   mutable std::mutex transaction_table_lock;
+  // WAL chain serialization lives on Transaction::chain_mu_ (one mutex per
+  // transaction); the former manager-wide chain_publish_mu_ serialized every
+  // append of every transaction on a single contended lock.
   std::atomic<bool> synchronous_commit_{true};
+  std::atomic<bool> fail_stop_{false};
   std::atomic<bool> metrics_enabled_{false};
   std::atomic<uint64_t> wal_wait_count_{0};
   std::atomic<uint64_t> wal_wait_ns_{0};
+  // mutable: AcquireIndexWriteGuard is const and records sampled waits.
+  mutable std::atomic<uint64_t> index_gate_contended_acquires_{0};
+  mutable std::atomic<uint64_t> index_gate_wait_ns_{0};
+  mutable std::atomic<uint64_t> index_gate_long_waits_{0};
   std::atomic<uint64_t> write_intent_attempts_{0};
   std::atomic<uint64_t> write_intent_conflicts_{0};
   std::atomic<uint64_t> write_intent_mutex_wait_ns_{0};
@@ -390,16 +685,44 @@ class TransactionManager {
   // Background GC (declared last so the worker thread only starts after
   // every member it may touch is fully constructed).
   std::atomic<uint64_t> commits_since_gc_{0};
+  // Rotating shard cursor for the incremental GC pass. Owned by the GC
+  // worker thread alone; no synchronization needed.
+  size_t gc_cursor_{0};
   std::atomic<bool> gc_stop_{false};
   std::mutex gc_mutex_;
   std::condition_variable gc_cv_;
   std::thread gc_worker_;
+  // Rate limiting for MaybeWarnGcPin; steady_clock milliseconds.
+  std::atomic<int64_t> last_gc_pin_warn_ms_{0};
+  static constexpr std::chrono::milliseconds kGcPinWarnInterval{10 * 60 * 1000};
 
   // ---- deadlock policy & wait-for graph ----
+  // Default is kDeadlockDetect: the wait-for graph detector resolves a
+  // genuine deadlock in ~one detector tick (2 ms) by wounding the youngest
+  // participant, while kLegacy leaves a cycle to the 5 s write-intent
+  // escape hatch -- measured on TPC-C (W=2, 32 clients) that turns every
+  // cycle into a 5-second stall plus a full undo walk, 12x more engine
+  // aborts and ~30% less throughput than detection. The explicit kLegacy
+  // value remains available for benchmarks that want the pre-policy
+  // behavior.
   std::atomic<uint8_t> deadlock_policy_{
-      static_cast<uint8_t>(DeadlockPolicy::kLegacy)};
+      static_cast<uint8_t>(DeadlockPolicy::kDeadlockDetect)};
   // Write-intent wait escalation limit; see SetWriteIntentWaitLimit.
   std::atomic<int64_t> write_intent_wait_limit_ms_{5'000};
+  // Startup read of TINYLAMB_WRITE_INTENT_WAIT_MS (fallback: the 5 s
+  // default above; 0 or garbage keeps the default).
+  static int64_t WriteIntentWaitLimitMsFromEnv();
+  // Rate limiting for the escape-hatch warning; steady_clock milliseconds.
+  std::atomic<int64_t> last_intent_timeout_warn_ms_{0};
+  static constexpr std::chrono::milliseconds kIntentTimeoutWarnInterval{60 *
+                                                                        1000};
+  std::atomic<uint64_t> write_intent_wait_timeouts_{0};
+  // In-flight WAL durability barrier waits (commit fsyncs, write-back
+  // gates); see BeginDurabilityBarrier.  Read by the write-intent wait
+  // loops to distinguish a stalled disk from a deadlocked holder.
+  std::atomic<int64_t> durability_barrier_waits_{0};
+  // Holder-abort fast give-ups; see TransactionRuntimeStats for the meaning.
+  std::atomic<uint64_t> write_intent_holder_abort_giveups_{0};
   // Active deadlock detector thread (kDeadlockDetect only).
   std::atomic<bool> deadlock_detector_stop_{false};
   std::thread deadlock_detector_;
@@ -418,6 +741,18 @@ class TransactionManager {
     txn_id_t holder{};
   };
   std::unordered_map<txn_id_t, WaitForEdge> wait_for_edges_;
+  // Cheap sleep predicate for the detector: updated under wait_for_mu_
+  // together with the map, read relaxed by the detector. count == 0 implies
+  // the map is empty, so the detector can block indefinitely instead of
+  // polling the map every tick.
+  std::atomic<int64_t> wait_for_edge_count_{0};
+  // Bumped under wait_for_mu_ on every edge insert and removal; the detector
+  // skips an analysis pass when this has not moved since the last one. Under
+  // sustained contention waiters are always present, so the edge count alone
+  // would make the detector re-run its O(V+E) pass back to back (a busy
+  // spin); the generation distinguishes "waiters still waiting" from
+  // "the graph changed".
+  std::atomic<uint64_t> wait_for_generation_{0};
   // Background detector body: scans wait_for_edges_ for cycles and aborts the
   // youngest participant in each cycle.
   void DeadlockDetectorLoop();
@@ -430,6 +765,24 @@ class TransactionManager {
   // under the version shard's mutex by AcquireWriteIntent. No-op for
   // policies that handle ordering without a graph.
   void AddWaitForEdge(txn_id_t waiter, txn_id_t holder, RowPosition row);
+  // Pushes an expired escape-hatch deadline out instead of giving up, when
+  // the holder's lack of progress is explained by an in-flight WAL
+  // durability barrier or a group-commit backlog: those stall holders for
+  // seconds without any deadlock, and timing out against them produced
+  // abort cascades (TPC-C: bursts of 5 s escapes exactly while a
+  // checkpoint's data-file sync was stretching every fsync).  Returns false
+  // when no barrier is in flight or the kDurabilityIntentWaitFloor total
+  // budget is spent -- only then is the give-up a real latch-cycle answer.
+  [[nodiscard]] bool ExtendIntentDeadlineForDurabilityBarrier(
+      std::chrono::steady_clock::time_point wait_begin,
+      std::chrono::steady_clock::time_point* deadline) const;
+  // Counts one holder-abort fast give-up (see TransactionRuntimeStats).
+  void RecordHolderAbortGiveup();
+  // Escape-hatch bookkeeping: bumps the timeout gauge and (rate-limited)
+  // says which row stalled, so a deployment whose delivery-style deletes
+  // keep tripping the latch cycle shows up in the log instead of surfacing
+  // only as a latency tail.
+  void RecordIntentWaitTimeout(const Transaction& txn, const RowPosition& rp);
   // Removes a waiter's edge when the lock is granted, the waiter times out,
   // or the waiter is aborted.
   void RemoveWaitForEdge(txn_id_t waiter);

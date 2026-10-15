@@ -64,44 +64,104 @@ StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn,
  */
 StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
                                  std::string_view record) {
-  // Whether any hole (vacant slot) exists decides the capacity cost: a reused
-  // hole needs no new RowPointer.  The old check always charged +8, falsely
-  // reporting kNoSpace when free_size_ == record.size() with a hole present.
-  bool has_hole = false;
+  // Holes (vacant slots) decide the capacity picture. A hole whose deleting
+  // transaction is STILL ACTIVE holds a write intent on its RowPosition: this
+  // insert can neither reuse the slot nor consume the bytes that delete
+  // credited back to free_size_ -- an aborting deleter must be able to put
+  // its row back, and before the reservation below a concurrent fresh-slot
+  // insert could eat exactly those bytes inside the deleter's intent window
+  // (TPC-C delivery: a 5 s latch-cycle abort then failed its undo re-insert
+  // with kNoSpace and fail-stopped the engine -- and a restart replayed the
+  // same undo against the same full page, wedging the open). Bytes of a hole
+  // this transaction CAN acquire belong to the page again; the deleter of
+  // such a hole has resolved, so its undo can no longer need them.
+  size_t locked_hole_bytes = 0;
+  // First usable hole, with its intent already acquired; row_max_ when none.
+  slot_t hole_slot = row_max_;
   for (slot_t i = 0; i < row_max_; ++i) {
-    if (rows_[i].offset == 0) {
-      has_hole = true;
-      break;
+    if (rows_[i].offset != 0) {
+      continue;
     }
+    const RowPosition hole(page_id, i);
+    // Non-blocking acquisition ONLY: this method runs under the page's
+    // exclusive content latch, and a blocking wait here parks the latch on a
+    // foreign write intent -- the exact latch×intent cycle whose only
+    // in-engine escape is the multi-second write-intent hatch (the aborting
+    // owner of that intent needs this very latch for its undo walk, the
+    // detector cannot see the latch edge, and every queued inserter behind
+    // us piles onto the same park). A hole whose deleter is mid-abort simply
+    // keeps its bytes reserved for that undo, exactly like the
+    // still-running deleter below.
+    if (txn.TryAddWriteSet(hole)) {
+      if (hole_slot == row_max_ && !txn.SnapshotSeesRow(hole)) {
+        hole_slot = i;
+        continue;
+      }
+      // Either a later duplicate we cannot use, or one whose pre-delete
+      // image this transaction's snapshot still sees: staging an insert
+      // there would mask the snapshot-visible version behind our own
+      // pending value (ReadVersion consults pending first), silently
+      // dropping the old row from the inserter's view. Release and move on;
+      // once we hold the intent no other writer can publish a version
+      // covering our snapshot at this position.
+      txn.ReleaseWriteIntent(hole);
+      continue;
+    }
+    // Foreign pending delete: its bytes stay reserved for the deleter's
+    // abort undo (DeleteRow kept the row size on the hole for exactly this).
+    locked_hole_bytes += rows_[i].size;
   }
-  const size_t needed = record.size() + (has_hole ? 0 : sizeof(RowPointer));
-  if (free_size_ < needed) {
+  const size_t available =
+      free_size_ >= locked_hole_bytes ? free_size_ - locked_hole_bytes : 0;
+  auto release_acquired_hole = [&] {
+    if (hole_slot != row_max_) {
+      txn.ReleaseWriteIntent(RowPosition(page_id, hole_slot));
+      hole_slot = row_max_;
+    }
+  };
+  if (hole_slot != row_max_) {
+    // Reusing a hole costs the record bytes only -- no new RowPointer.
+    if (available < record.size()) {
+      release_acquired_hole();
+      return Status::kNoSpace;
+    }
+    const StatusOr<slot_t> inserted = InsertRowAt(hole_slot, record);
+    if (!inserted.HasValue()) {
+      release_acquired_hole();
+      return inserted.GetStatus();
+    }
+    txn.RegisterVersionWrite(RowPosition(page_id, inserted.Value()),
+                             std::nullopt, record);
+    Status append =
+        txn.InsertLog(page_id, inserted.Value(), record).GetStatus();
+    if (append != Status::kSuccess) {
+      // The WAL append failed: no CLR will ever compensate this insert, and
+      // once AbortVersions clears the unstaged pending, the physical image
+      // would serve phantom rows through ReadVersion's fallback.  Roll the
+      // slot back to a hole now (DeleteRow keeps the high-water mark, which
+      // is harmless; the space stays reusable through the hole).
+      DeleteRow(inserted.Value());
+      (void)txn.CancelStagedVersion(RowPosition(page_id, inserted.Value()));
+      txn.MarkFailed();
+      return append;
+    }
+    return inserted.Value();
+  }
+  // A fresh slot costs one RowPointer on top of the record (and extends the
+  // slot array when it grows past row_max_ -- InsertRowAt re-checks the
+  // contiguous bound). Without the hole-discount this is where the old
+  // early check used to under-charge by sizeof(RowPointer).
+  if (available < static_cast<size_t>(record.size()) + sizeof(RowPointer)) {
     return Status::kNoSpace;
   }
-  // Reuse the first hole whose MVCC intent is available. A concurrent delete
-  // can leave an earlier physical hole reserved until commit; repeatedly
-  // choosing only that hole would starve every inserter on the page.
-  // A hole whose committed chain still serves the deleted row under THIS
-  // transaction's snapshot is also unusable: staging the insert there would
-  // mask the snapshot-visible version behind our own pending value
-  // (ReadVersion consults pending first), silently dropping the old row from
-  // the inserter's view.  Acquire, re-check, and release on disqualification —
-  // once we hold the intent no other writer can publish a version covering
-  // our snapshot at this position.
-  slot_t slot = 0;
-  for (; slot < row_max_; ++slot) {
-    const RowPosition hole(page_id, slot);
-    if (rows_[slot].offset == 0 && txn.AddWriteSet(hole)) {
-      if (!txn.SnapshotSeesRow(hole)) {
-        break;
-      }
-      txn.ReleaseWriteIntent(hole);
-    }
-  }
-  if (slot == row_max_ && !txn.AddWriteSet(RowPosition(page_id, slot))) {
+  // Same latch discipline as the hole loop: try, never wait. A foreign
+  // pending on the boundary slot is a mid-abort window; failing fast (pre-
+  // mutation) lets the caller treat it like any other conflict instead of
+  // parking this page's latch under a multi-second intent wait.
+  if (!txn.TryAddWriteSet(RowPosition(page_id, row_max_))) {
     return Status::kConflicts;
   }
-  const StatusOr<slot_t> inserted = InsertRowAt(slot, record);
+  const StatusOr<slot_t> inserted = InsertRowAt(row_max_, record);
   if (!inserted.HasValue()) {
     return inserted.GetStatus();
   }
@@ -115,6 +175,8 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
     // slot back to a hole now (DeleteRow keeps the high-water mark, which is
     // harmless; the space stays reusable through the hole).
     DeleteRow(inserted.Value());
+    (void)txn.CancelStagedVersion(RowPosition(page_id, inserted.Value()));
+    txn.MarkFailed();
     return append;
   }
   return inserted.Value();
@@ -199,6 +261,11 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
   if (!txn.AddWriteSet(pos, prev_row)) {
     return Status::kConflicts;
   }
+  StatusOr<std::string_view> head = txn.ReadVersion(
+      pos, std::string_view(GetRow(slot)), /*resolve_head=*/true);
+  if (!head.HasValue() || head.Value() != prev_row) {
+    return Status::kConflicts;
+  }
   // Reserve contiguous space before any WAL write: a failed allocation must
   // not leave a log record describing an update that never reached the page.
   RETURN_IF_FAIL(UpdateRow(pos.slot, record));
@@ -214,9 +281,23 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
       LOG(ERROR) << "Update rollback failed; unlogged image at " << page_id
                  << "/" << pos.slot;
     }
+    (void)txn.CancelStagedVersion(pos);
+    txn.MarkFailed();
     return append;
   }
   return Status::kSuccess;
+}
+
+StatusOr<lsn_t> RowPage::RestorePhysicalUpdate(page_id_t page_id,
+                                               Transaction& txn, slot_t slot,
+                                               std::string_view record) {
+  if (row_max_ <= slot || rows_[slot].offset == 0) {
+    return Status::kNotExists;
+  }
+  ASSIGN_OR_RETURN(lsn_t, compensation_end,
+                   txn.AppendPhysicalUpdateCompensation(page_id, slot, record));
+  RETURN_IF_FAIL(UpdateRow(slot, record));
+  return compensation_end;
 }
 
 Status RowPage::UpdateRow(slot_t slot, std::string_view record) {
@@ -273,8 +354,18 @@ Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
   if (!txn.AddWriteSet(pos, previous)) {
     return Status::kConflicts;
   }
+  StatusOr<std::string_view> head = txn.ReadVersion(
+      pos, std::string_view(GetRow(slot)), /*resolve_head=*/true);
+  if (!head.HasValue() || head.Value() != previous) {
+    return Status::kConflicts;
+  }
   txn.RegisterVersionWrite(pos, previous, std::nullopt);
-  RETURN_IF_FAIL(txn.DeleteLog(page_id, slot, previous).GetStatus());
+  Status append = txn.DeleteLog(page_id, slot, previous).GetStatus();
+  if (append != Status::kSuccess) {
+    (void)txn.CancelStagedVersion(pos);
+    txn.MarkFailed();
+    return append;
+  }
   DeleteRow(slot);
   return Status::kSuccess;
 }
@@ -290,11 +381,42 @@ void RowPage::DeleteRow(slot_t slot) {
   }
   row_count_--;
   free_size_ += rows_[slot].size;
-  rows_[slot].size = rows_[slot].offset = 0;
+  // Keep the row SIZE on the hole (only the offset clears): while the
+  // deleting transaction is unresolved, its write intent locks the slot and
+  // RowPage::Insert subtracts the hole's bytes from what a fresh-slot insert
+  // may consume -- the deleter's abort undo must always be able to put the
+  // row back. GetRow reports holes as empty regardless of the stored size.
+  rows_[slot].offset = 0;
   // Keep the high-water mark: an older MV2PL snapshot may still need to ask
   // the version store for a physically deleted tail slot. Vacant slots remain
   // reusable by InsertRow.
 }
+
+Status RowPage::SetNextPage(page_id_t page_id, Transaction& txn,
+                            page_id_t next) {
+  if (next_page_id_ == next) {
+    return Status::kSuccess;
+  }
+  RETURN_IF_FAIL(
+      txn.SetRowPageNextLog(page_id, next, next_page_id_).GetStatus());
+  next_page_id_ = next;
+  return Status::kSuccess;
+}
+
+Status RowPage::SetPrevPage(page_id_t page_id, Transaction& txn,
+                            page_id_t prev) {
+  if (prev_page_id_ == prev) {
+    return Status::kSuccess;
+  }
+  RETURN_IF_FAIL(
+      txn.SetRowPagePrevLog(page_id, prev, prev_page_id_).GetStatus());
+  prev_page_id_ = prev;
+  return Status::kSuccess;
+}
+
+void RowPage::SetNextPageImpl(page_id_t next) { next_page_id_ = next; }
+
+void RowPage::SetPrevPageImpl(page_id_t prev) { prev_page_id_ = prev; }
 
 slot_t RowPage::RowCount() const { return row_count_; }
 

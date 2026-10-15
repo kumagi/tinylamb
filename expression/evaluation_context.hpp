@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_EVALUATION_CONTEXT_HPP
 #define TINYLAMB_EVALUATION_CONTEXT_HPP
 
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -48,6 +49,25 @@ class EvaluationContext {
   // consumers derive their three-valued result from that distinction.
   [[nodiscard]] virtual StatusOr<std::vector<Value>> RunSubquery(
       const SelectStatement& statement, const Row* outer_row) = 0;
+
+  // RunSubquery plus the subquery's declared element type, when the
+  // execution context can supply one.  ARRAY(SELECT ...) uses the hint only
+  // after every produced element is NULL and no static type was declared —
+  // the schema column keeps e.g. ARRAY<STRING> from degrading to the
+  // ARRAY<INT64> last resort that the values alone would force.
+  struct SubqueryResult {
+    std::vector<Value> values;
+    std::string element_type_hint;
+  };
+  [[nodiscard]] virtual StatusOr<SubqueryResult> RunSubqueryDetailed(
+      const SelectStatement& statement, const Row* outer_row) {
+    StatusOr<std::vector<Value>> values = RunSubquery(statement, outer_row);
+    if (!values.HasValue()) {
+      return values.GetStatus();
+    }
+    return SubqueryResult{.values = values.MoveValue(),
+                          .element_type_hint = {}};
+  }
 
   // Aggregation results prepared for the group under evaluation, or nullptr
   // outside grouping contexts.

@@ -94,6 +94,11 @@ class SqlEngine {
   [[nodiscard]] const std::vector<std::string>& ResultColumnNames() const {
     return result_column_names_;
   }
+  // Number of sibling derived-aggregate fusions performed while preparing
+  // the most recent statement (0 otherwise; see FuseSiblingDerivedAggregates).
+  [[nodiscard]] size_t LastFusedSiblingAggregates() const {
+    return fused_sibling_aggregates_;
+  }
 
   // Compliance-driver hook: when enabled, INSERT statements emulate
   // first_column_is_primary_key semantics (duplicate-key errors, and
@@ -150,6 +155,11 @@ class SqlEngine {
   StatusOr<Executor> ExecuteSetOperation(const SelectStatement& select,
                                          TransactionContext& ctx);
 
+  // MERGE INTO: materializes the source, classifies target/source rows
+  // against the WHEN clauses, and applies the pending DML in one transaction.
+  StatusOr<Executor> ExecuteMerge(TransactionContext& ctx,
+                                  const MergeStatement& merge);
+
   // GROUP BY / HAVING / aggregate routing: optimizes the FROM + WHERE core
   // through Cascades and wraps it in a GroupByPlan finish node.
   // `lifted` carries the lifted CTE layer (M4) into the core QueryData;
@@ -205,12 +215,18 @@ class SqlEngine {
     Plan plan;
   };
 
+  // Re-registers persisted view definitions into the session ViewRegistry
+  // when the catalog's schema epoch moved (CREATE/DROP VIEW bump it).  The
+  // per-engine epoch cache keeps a quiet statement's cost at one compare.
+  void EnsureViewsRegistered(TransactionContext& ctx);
+
   Database* database_;
   std::string last_error_;
   std::optional<StatementType> last_statement_type_;
   std::string last_dml_table_;
   std::vector<std::string> result_column_names_;
   std::string plan_cache_fingerprint_;
+  size_t fused_sibling_aggregates_{0};
 
   // True when this statement's WHERE/SET carried a subquery folded to
   // constants at prepare time (Bug 57): the folded values are valid only
@@ -219,6 +235,7 @@ class SqlEngine {
   std::vector<Value> plan_cache_parameters_;
   bool force_relational_fallback_{false};
   std::vector<SharedGroupingCore> shared_grouping_cores_;
+  uint64_t views_registered_epoch_{~uint64_t{0}};
 };
 
 }  // namespace tinylamb

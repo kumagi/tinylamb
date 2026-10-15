@@ -106,6 +106,317 @@ std::vector<Row> RunSql(TransactionContext& ctx, Database& db,
 }
 }  // namespace
 
+// Column DEFAULT clauses: the constant rides the column's reserved
+// Constraint::kDefault slot, the INSERT executor substitutes it for columns
+// omitted from the target list, and the DEFAULT keyword in VALUES resolves
+// through the same catalog lookup.
+TEST_F(QueryTest, ColumnDefaultSubstitutesForOmittedColumns) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE td (k INT64, x INT64 DEFAULT 5, "
+         "s STRING DEFAULT 'hello', d DATE DEFAULT DATE '2024-01-01');");
+  RunSql(ctx, *db_, "INSERT INTO td (k) VALUES (1), (2);");
+  const auto rows = RunSql(ctx, *db_, "SELECT k, x, s, d FROM td ORDER BY k;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{1}));
+  EXPECT_EQ(rows[0][1], Value(int64_t{5}));
+  EXPECT_EQ(rows[0][2], Value("hello"));
+  EXPECT_EQ(rows[0][3], Value::Date("2024-01-01"));
+  // Explicit values still win, in every position.
+  RunSql(ctx, *db_,
+         "INSERT INTO td VALUES (3, 99, 'override', DATE '2024-12-31');");
+  const auto overridden = RunSql(ctx, *db_, "SELECT x, s FROM td WHERE k = 3;");
+  ASSERT_EQ(overridden.size(), 1U);
+  EXPECT_EQ(overridden[0][0], Value(int64_t{99}));
+  EXPECT_EQ(overridden[0][1], Value("override"));
+}
+
+TEST_F(QueryTest, ColumnDefaultKeywordInValuesResolvesTargetColumn) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE tk (a INT64, b INT64 DEFAULT 42);");
+  // Column-list form: DEFAULT maps through the target column list.
+  RunSql(ctx, *db_, "INSERT INTO tk (b, a) VALUES (DEFAULT, 7);");
+  const auto listed = RunSql(ctx, *db_, "SELECT a, b FROM tk;");
+  ASSERT_EQ(listed.size(), 1U);
+  EXPECT_EQ(listed[0][0], Value(int64_t{7}));
+  EXPECT_EQ(listed[0][1], Value(int64_t{42}));
+  // Positional form: DEFAULT resolves against the column at its own index.
+  RunSql(ctx, *db_, "INSERT INTO tk VALUES (8, DEFAULT), (9, 1);");
+  const auto positional = RunSql(ctx, *db_, "SELECT a, b FROM tk ORDER BY a;");
+  ASSERT_EQ(positional.size(), 3U);
+  EXPECT_EQ(positional[1][1], Value(int64_t{42}));
+  // A column without a declared default has the implicit default NULL
+  // (BigQuery semantics, pinned by the dml_* compliance cases).
+  RunSql(ctx, *db_, "INSERT INTO tk VALUES (DEFAULT, 2);");
+  const auto undeclared =
+      RunSql(ctx, *db_, "SELECT a, b FROM tk WHERE a IS NULL;");
+  ASSERT_EQ(undeclared.size(), 1U);
+  EXPECT_EQ(undeclared[0][1], Value(int64_t{2}));
+}
+
+TEST_F(QueryTest, ColumnDefaultAppliesToInsertSelectAndPersists) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE ts (a INT64, b INT64 DEFAULT 42);");
+  RunSql(ctx, *db_, "INSERT INTO ts (a) SELECT 1;");
+  const auto rows = RunSql(ctx, *db_, "SELECT a, b FROM ts;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][1], Value(int64_t{42}));
+  // The constraint (with its payload) round-trips through the catalog, so
+  // defaults keep applying after a full close/reopen.
+  const std::string prefix = prefix_;
+  ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  db_.reset();
+  std::unique_ptr<Database> reopened = Database::Create(prefix).MoveValue();
+  TransactionContext reopened_ctx = reopened->BeginContext();
+  SqlEngine reopened_engine(*reopened);
+  StatusOr<Executor> prepared =
+      reopened_engine.Prepare(reopened_ctx, "INSERT INTO ts (a) VALUES (2);");
+  ASSERT_TRUE(prepared.HasValue()) << reopened_engine.LastError();
+  Row inserted;
+  while (prepared.Value()->Next(&inserted, nullptr)) {
+  }
+  const auto after =
+      RunSql(reopened_ctx, *reopened, "SELECT a, b FROM ts ORDER BY a;");
+  ASSERT_EQ(after.size(), 2U);
+  EXPECT_EQ(after[1][1], Value(int64_t{42}));
+  ASSERT_EQ(reopened_ctx.txn_.PreCommit(), Status::kSuccess);
+}
+
+TEST_F(QueryTest, ColumnDefaultRejectsVolatileExpressions) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  StatusOr<Executor> rejected =
+      engine.Prepare(ctx, "CREATE TABLE tv (a INT64 DEFAULT (RAND() * 10));");
+  EXPECT_FALSE(rejected.HasValue());
+  EXPECT_EQ(engine.LastError(), "column DEFAULT must be a constant expression");
+  ctx.txn_.Abort();
+}
+
+// Persisted views: CREATE VIEW stores the defining query in the catalog
+// (re-seeded into the session registry on demand), DROP VIEW removes it, and
+// OR REPLACE overwrites.  Expansion happens at FROM-reference time, so the
+// view tracks its base table without a stored row image.
+TEST_F(QueryTest, ViewPersistsAcrossRestartAndDropsCleanly) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE base (k INT64, v STRING);");
+  RunSql(ctx, *db_, "INSERT INTO base VALUES (1, 'a'), (2, 'b');");
+  RunSql(ctx, *db_, "CREATE VIEW vv AS SELECT k, v FROM base WHERE k > 1;");
+  const auto immediate = RunSql(ctx, *db_, "SELECT * FROM vv;");
+  ASSERT_EQ(immediate.size(), 1U);
+  EXPECT_EQ(immediate[0][0], Value(int64_t{2}));
+
+  const std::string prefix = prefix_;
+  ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  db_.reset();
+  std::unique_ptr<Database> reopened = Database::Create(prefix).MoveValue();
+  TransactionContext reopened_ctx = reopened->BeginContext();
+  const auto after =
+      RunSql(reopened_ctx, *reopened, "SELECT * FROM vv ORDER BY k;");
+  ASSERT_EQ(after.size(), 1U);
+  EXPECT_EQ(after[0][0], Value(int64_t{2}));
+  EXPECT_EQ(after[0][1], Value("b"));
+
+  // DROP VIEW removes the definition durably; the same-transaction SELECT
+  // fails and the abort rolls the drop back, so the view survives.
+  SqlEngine dropping(*reopened);
+  StatusOr<Executor> dropped = dropping.Prepare(reopened_ctx, "DROP VIEW vv; ");
+  ASSERT_TRUE(dropped.HasValue()) << dropping.LastError();
+  Row drop_row;
+  while (dropped.Value()->Next(&drop_row, nullptr)) {
+  }
+  EXPECT_EQ(drop_row[0], Value("DROP VIEW"));
+  StatusOr<Executor> gone = dropping.Prepare(reopened_ctx, "SELECT * FROM vv;");
+  EXPECT_FALSE(gone.HasValue());
+  reopened_ctx.txn_.Abort();
+  db_ = std::move(reopened);
+  TransactionContext verify_ctx = db_->BeginContext();
+  const auto rolled_back = RunSql(verify_ctx, *db_, "SELECT COUNT(*) FROM vv;");
+  ASSERT_EQ(rolled_back.size(), 1U);
+  EXPECT_EQ(rolled_back[0][0], Value(int64_t{1}));
+
+  // A durable drop removes the view for later sessions too.
+  RunSql(verify_ctx, *db_, "DROP VIEW vv;");
+  ASSERT_EQ(verify_ctx.txn_.PreCommit(), Status::kSuccess);
+  db_.reset();
+  std::unique_ptr<Database> reopened2 = Database::Create(prefix).MoveValue();
+  TransactionContext verify2 = reopened2->BeginContext();
+  SqlEngine engine2(*reopened2);
+  StatusOr<Executor> missing = engine2.Prepare(verify2, "SELECT * FROM vv;");
+  EXPECT_FALSE(missing.HasValue());
+  StatusOr<Executor> missing_drop = engine2.Prepare(verify2, "DROP VIEW vv;");
+  EXPECT_FALSE(missing_drop.HasValue());
+  EXPECT_EQ(engine2.LastError(), "view vv does not exist");
+  verify2.txn_.Abort();
+  db_ = std::move(reopened2);
+}
+
+TEST_F(QueryTest, ViewOrReplaceAndNameConflicts) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE plain (x INT64);");
+  RunSql(ctx, *db_, "CREATE VIEW v2 AS SELECT 1 AS one;");
+  SqlEngine engine(*db_);
+  StatusOr<Executor> duplicate =
+      engine.Prepare(ctx, "CREATE VIEW v2 AS SELECT 2 AS two;");
+  EXPECT_FALSE(duplicate.HasValue());
+  EXPECT_EQ(engine.LastError(), "view v2 already exists");
+  // Tables and materialized views block the name too.
+  StatusOr<Executor> over_table =
+      engine.Prepare(ctx, "CREATE VIEW plain AS SELECT 1;");
+  EXPECT_FALSE(over_table.HasValue());
+  EXPECT_EQ(engine.LastError(), "view plain already exists");
+  // OR REPLACE overwrites the definition; a view over a view chains.
+  RunSql(ctx, *db_, "CREATE OR REPLACE VIEW v2 AS SELECT 3 AS three;");
+  RunSql(ctx, *db_, "CREATE VIEW v4 AS SELECT * FROM v2;");
+  const auto chained = RunSql(ctx, *db_, "SELECT * FROM v4;");
+  ASSERT_EQ(chained.size(), 1U);
+  EXPECT_EQ(chained[0][0], Value(int64_t{3}));
+  // Dropping a non-view name is a loud error.
+  StatusOr<Executor> not_a_view = engine.Prepare(ctx, "DROP VIEW plain;");
+  EXPECT_FALSE(not_a_view.HasValue());
+  EXPECT_EQ(engine.LastError(), "view plain does not exist");
+  ctx.txn_.Abort();
+}
+
+// Sibling derived-aggregate fusion (TPC-H Q21 shape): two derived tables
+// over one base table sharing the GROUP BY key fold into a single
+// aggregation.  Pins the row multisets, the fusion counter, the group-
+// membership witness (a key whose only rows fail the sibling WHERE must not
+// surface through the join), the HAVING lift, and the ORDER BY output-name
+// mapping; bare member references keep the statement unfused and correct.
+TEST_F(QueryTest, SiblingDerivedAggregatesFuseIntoSingleScan) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE fs (k INT64, s INT64, v FLOAT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO fs VALUES (1, 10, 1.0), (1, 20, 2.0), (1, 10, 3.0), "
+         "(2, 30, 0.5), (3, 40, 5.0), (3, 41, 0.8), (4, 50, 0.2);");
+
+  SqlEngine engine(*db_);
+  const auto run = [&](std::string_view sql) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                      << engine.LastError();
+    std::vector<Row> rows;
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+
+  const std::string q21_shape =
+      "SELECT m.k, m.ds, o.k2, o.late_ds FROM "
+      "(SELECT k, COUNT(DISTINCT s) AS ds FROM fs GROUP BY k) m, "
+      "(SELECT k AS k2, COUNT(DISTINCT s) AS late_ds FROM fs "
+      "WHERE v > 1.0 GROUP BY k) o "
+      "WHERE m.k = o.k2 ORDER BY o.k2;";
+  const std::vector<Row> fused = run(q21_shape);
+  EXPECT_EQ(engine.LastFusedSiblingAggregates(), 1U);
+  // k=2 and k=4 have no row with v > 1.0, so the `o` side has no group for
+  // them and the inner join drops them entirely (the fused witness must not
+  // resurrect them as late_ds=0 rows).
+  ASSERT_EQ(fused.size(), 2U);
+  EXPECT_EQ(fused[0][0].value.int_value, 1);
+  EXPECT_EQ(fused[0][1].value.int_value, 2);
+  EXPECT_EQ(fused[0][2].value.int_value, 1);
+  EXPECT_EQ(fused[0][3].value.int_value, 2);
+  EXPECT_EQ(fused[1][0].value.int_value, 3);
+  EXPECT_EQ(fused[1][1].value.int_value, 2);
+  EXPECT_EQ(fused[1][2].value.int_value, 3);
+  EXPECT_EQ(fused[1][3].value.int_value, 1);
+
+  // HAVING-only aggregates lift to outer conjuncts over the fused columns.
+  const std::vector<Row> having_lift =
+      run("SELECT m.k FROM "
+          "(SELECT k FROM fs GROUP BY k HAVING COUNT(DISTINCT s) > 1) m, "
+          "(SELECT k AS k2 FROM fs WHERE v > 1.0 GROUP BY k "
+          "HAVING COUNT(DISTINCT s) = 1) o "
+          "WHERE m.k = o.k2 ORDER BY m.k;");
+  EXPECT_EQ(engine.LastFusedSiblingAggregates(), 1U);
+  ASSERT_EQ(having_lift.size(), 1U);
+  EXPECT_EQ(having_lift[0][0].value.int_value, 3);
+
+  // Conditional SUM/AVG keep value semantics (NULL-skipping makes the CASE
+  // wrap exact), and the witness conjunct guards membership.
+  const std::vector<Row> conditional =
+      run("SELECT m.k, m.tot, o.avg2 FROM "
+          "(SELECT k, SUM(v) AS tot FROM fs GROUP BY k) m, "
+          "(SELECT k AS k2, AVG(v) AS avg2 FROM fs WHERE v > 1.0 GROUP BY k) o "
+          "WHERE m.k = o.k2 ORDER BY m.k;");
+  EXPECT_EQ(engine.LastFusedSiblingAggregates(), 1U);
+  ASSERT_EQ(conditional.size(), 2U);
+  EXPECT_EQ(conditional[0][0].value.int_value, 1);
+  EXPECT_DOUBLE_EQ(conditional[0][1].value.double_value, 6.0);
+  EXPECT_DOUBLE_EQ(conditional[0][2].value.double_value, 2.5);
+  EXPECT_EQ(conditional[1][0].value.int_value, 3);
+  EXPECT_DOUBLE_EQ(conditional[1][1].value.double_value, 5.8);
+  EXPECT_DOUBLE_EQ(conditional[1][2].value.double_value, 5.0);
+
+  // A bare reference to a member output must not fuse (ambiguous binding
+  // changes with the renamed fused columns) but must stay correct.
+  const std::vector<Row> bare =
+      run("SELECT m.k, m.ds, o.k2, o.late_ds FROM "
+          "(SELECT k, COUNT(DISTINCT s) AS ds FROM fs GROUP BY k) m, "
+          "(SELECT k AS k2, COUNT(DISTINCT s) AS late_ds FROM fs "
+          "WHERE v > 1.0 GROUP BY k) o "
+          "WHERE k = o.k2 ORDER BY o.k2;");
+  EXPECT_EQ(engine.LastFusedSiblingAggregates(), 0U);
+  ASSERT_EQ(bare.size(), fused.size());
+  for (size_t i = 0; i < fused.size(); ++i) {
+    EXPECT_EQ(bare[i], fused[i]);
+  }
+}
+
+// CREATE TABLE FUNCTION bodies expand at FROM-reference time with the
+// call-site arguments: constant arguments substitute into the stored query
+// (multi-argument, WHERE, and alias forms), and unknown functions or
+// non-constant arguments are explicit errors.
+TEST_F(QueryTest, TableValuedFunctionInvokesStoredBody) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE td (k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO td VALUES (1), (2), (3);");
+
+  SqlEngine engine(*db_);
+  const auto run = [&](std::string_view sql) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                      << engine.LastError();
+    std::vector<Row> rows;
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+
+  run("CREATE TABLE FUNCTION dbl(m INT64) AS SELECT m * k AS mk FROM td;");
+  const std::vector<Row> doubled = run("SELECT mk FROM dbl(2) ORDER BY mk;");
+  ASSERT_EQ(doubled.size(), 3U);
+  EXPECT_EQ(doubled[0][0].value.int_value, 2);
+  EXPECT_EQ(doubled[1][0].value.int_value, 4);
+  EXPECT_EQ(doubled[2][0].value.int_value, 6);
+
+  run("CREATE TABLE FUNCTION pick(lo INT64, hi INT64) AS "
+      "SELECT k FROM td WHERE k >= lo AND k < hi;");
+  const std::vector<Row> picked = run("SELECT k FROM pick(1, 3) ORDER BY k;");
+  ASSERT_EQ(picked.size(), 2U);
+  EXPECT_EQ(picked[0][0].value.int_value, 1);
+  EXPECT_EQ(picked[1][0].value.int_value, 2);
+
+  const std::vector<Row> aliased =
+      run("SELECT d.mk FROM dbl(3) AS d ORDER BY d.mk;");
+  ASSERT_EQ(aliased.size(), 3U);
+  EXPECT_EQ(aliased[2][0].value.int_value, 9);
+
+  EXPECT_FALSE(engine.Prepare(ctx, "SELECT * FROM no_such_tvf(1);").HasValue());
+  EXPECT_FALSE(engine.Prepare(ctx, "SELECT * FROM dbl(k);").HasValue());
+}
+
 TEST_F(QueryTest, TableSampleExecutorSemantics) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE sample_t (id INT64, part INT64);");
@@ -307,7 +618,34 @@ TEST_F(QueryTest, TemplateCacheKeepsArraySubqueryElementType) {
   ASSERT_EQ(second.size(), 1U);
   EXPECT_EQ(second[0].ToString(), first[0].ToString())
       << "template-cache hit changed the declared array element type";
-  EXPECT_EQ(first[0][0].ArrayElementSqlType(), "INT64");
+  // `e || 'a'` is string concatenation, so the declared tag is STRING.
+  EXPECT_EQ(first[0][0].ArrayElementSqlType(), "STRING");
+}
+
+// The declared element type of a lambda-desugared array must match the
+// values the lambda actually produces: InferArrayElementSqlType reports ""
+// for bodies it cannot type statically, and both evaluators then infer the
+// tag from the produced elements instead of defaulting to INT64.
+TEST_F(QueryTest, LambdaArrayElementTypeFollowsProducedValues) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (arr ARRAY<STRING>);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (['a', 'bb']);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT ARRAY_TRANSFORM(arr, e -> e || '!') FROM t;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0].ArrayElementSqlType(), "STRING");
+
+  // A predicate-producing body is tagged BOOL statically (runtime values
+  // cannot distinguish BOOL from INT64).
+  rows = RunSql(ctx, *db_, "SELECT ARRAY_TRANSFORM(arr, e -> e > 'a') FROM t;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0].ArrayElementSqlType(), "BOOL");
+
+  // ARRAY_FILTER keeps the input's element type, not the predicate's BOOL.
+  rows = RunSql(ctx, *db_, "SELECT ARRAY_FILTER(arr, e -> e > 'a') FROM t;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0].ArrayElementSqlType(), "STRING");
 }
 
 TEST_F(QueryTest, DmlQuantifiedFoldMatchesRelationalRoute) {
@@ -853,6 +1191,12 @@ TEST_F(QueryTest, SqlEngineDistinctDoesNotStackDuplicateDistinctExecutor) {
     std::string explain_text;
     while (prepared.Value()->Next(&row, nullptr)) {
       explain_text += row[0].AsString();
+    }
+    // The memo's explanation also names the selected physical operator.
+    // Count nodes in the tree, excluding the repeated metadata name.
+    if (const size_t metadata = explain_text.find("Rule:");
+        metadata != std::string::npos) {
+      explain_text.resize(metadata);
     }
     size_t count = 0;
     size_t pos = 0;
@@ -2752,6 +3096,50 @@ TEST_F(QueryTest, SqlEngineMultiSiteCtePushesWeakenedFilter) {
   ctx.txn_.Abort();
 }
 
+// Multi-site CTE narrowing must weaken to the WEAKEST bound per direction
+// (min lower, MAX upper): the shared cell feeds sites whose filters admit
+// different ranges, and a row any site needs must survive the injected
+// body predicate.  A narrower site's upper bound must not drop rows that
+// the wider site still joins against surviving partners.
+TEST_F(QueryTest, SqlEngineMultiSiteCteUpperBoundStaysWeakest) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 28), (1, 20), (2, 5);");
+
+  SqlEngine engine(*db_);
+  // Site x admits v <= 28, site y admits v <= 20.  The narrow (y) bound
+  // must not shrink the shared body: x's row (1, 28) still joins y's
+  // surviving (1, 20) partner.
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH c AS (SELECT k, v FROM t) "
+             "SELECT x.v, y.v FROM c AS x JOIN c AS y ON x.k = y.k "
+             "WHERE x.v <= 28 AND y.v <= 20 ORDER BY x.v, y.v;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(5));
+  EXPECT_EQ(rows[0][1], Value(5));
+  EXPECT_EQ(rows[1][0], Value(20));
+  EXPECT_EQ(rows[1][1], Value(20));
+  EXPECT_EQ(rows[2][0], Value(28));
+  EXPECT_EQ(rows[2][1], Value(20));
+
+  // Same shape with the bounds swapped between the aliases.
+  std::vector<Row> swapped =
+      RunSql(ctx, *db_,
+             "WITH c AS (SELECT k, v FROM t) "
+             "SELECT x.v, y.v FROM c AS x JOIN c AS y ON x.k = y.k "
+             "WHERE x.v <= 20 AND y.v <= 28 ORDER BY x.v, y.v;");
+  ASSERT_EQ(swapped.size(), 3U);
+  EXPECT_EQ(swapped[0][0], Value(5));
+  EXPECT_EQ(swapped[0][1], Value(5));
+  EXPECT_EQ(swapped[1][0], Value(20));
+  EXPECT_EQ(swapped[1][1], Value(20));
+  EXPECT_EQ(swapped[2][0], Value(20));
+  EXPECT_EQ(swapped[2][1], Value(28));
+
+  ctx.txn_.Abort();
+}
+
 // M4 shared-cell safety: a multiply-referenced CTE never takes a
 // site-specific filter into its cell; every site observes complete rows.
 TEST_F(QueryTest, SqlEngineMultiUseCteCellIgnoresSiteSpecificFilter) {
@@ -3304,6 +3692,175 @@ TEST_F(QueryTest, SqlEngineNullSupplyingFilterNotPushed) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, SqlEngineOuterNonRejectingFilterContract) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE of_l (id INT64, grp INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE of_r (id INT64, val INT64, label STRING);");
+  RunSql(ctx, *db_,
+         "INSERT INTO of_l VALUES (1,10),(1,11),(2,20),(3,30),(NULL,40);");
+  RunSql(ctx, *db_,
+         "INSERT INTO of_r VALUES (1,0,'zero'),(1,100,'high'),"
+         "(2,NULL,'null'),(3,0,'zero3'),(4,400,'four'),"
+         "(NULL,500,'nullkey');");
+  RunSql(ctx, *db_, "CREATE TABLE of_empty (id INT64, val INT64);");
+
+  const std::vector<Row> left =
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.id, r.val FROM of_l l LEFT JOIN of_r r "
+             "ON l.id = r.id AND COALESCE(r.val, 0) = 0 ORDER BY l.id, r.val;");
+  EXPECT_EQ(
+      left,
+      (std::vector<Row>{
+          Row({Value(), Value(), Value()}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+          Row({Value(int64_t{2}), Value(int64_t{2}), Value()}),
+          Row({Value(int64_t{3}), Value(int64_t{3}), Value(int64_t{0})})}));
+
+  const std::vector<Row> right =
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.id, r.val FROM of_l l RIGHT JOIN of_r r "
+             "ON l.id = r.id AND COALESCE(r.val, 0) = 0 ORDER BY r.id, l.id;");
+  EXPECT_EQ(right,
+            (std::vector<Row>{
+                Row({Value(), Value(), Value(int64_t{500})}),
+                Row({Value(), Value(int64_t{1}), Value(int64_t{100})}),
+                Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+                Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+                Row({Value(int64_t{2}), Value(int64_t{2}), Value()}),
+                Row({Value(int64_t{3}), Value(int64_t{3}), Value(int64_t{0})}),
+                Row({Value(), Value(int64_t{4}), Value(int64_t{400})})}));
+
+  const std::vector<Row> full =
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.id, r.val FROM of_l l FULL JOIN of_r r "
+             "ON l.id = r.id AND COALESCE(r.val, 0) = 0 ORDER BY l.id, r.id;");
+  EXPECT_EQ(
+      full,
+      (std::vector<Row>{
+          Row({Value(), Value(), Value()}),
+          Row({Value(), Value(), Value(int64_t{500})}),
+          Row({Value(), Value(int64_t{1}), Value(int64_t{100})}),
+          Row({Value(), Value(int64_t{4}), Value(int64_t{400})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+          Row({Value(int64_t{2}), Value(int64_t{2}), Value()}),
+          Row({Value(int64_t{3}), Value(int64_t{3}), Value(int64_t{0})})}));
+
+  const std::vector<Row> where =
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.id, r.val FROM of_l l LEFT JOIN of_r r "
+             "ON l.id = r.id WHERE r.val IS NULL OR r.val >= 100 "
+             "ORDER BY l.id, r.val;");
+  EXPECT_EQ(
+      where,
+      (std::vector<Row>{
+          Row({Value(), Value(), Value()}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{100})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{100})}),
+          Row({Value(int64_t{2}), Value(int64_t{2}), Value()})}));
+
+  const std::vector<Row> right_strict =
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.id, r.val FROM of_l l RIGHT JOIN of_r r "
+             "ON l.id = r.id WHERE l.id >= 0 ORDER BY r.id, l.id;");
+  EXPECT_EQ(
+      right_strict,
+      (std::vector<Row>{
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{100})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{100})}),
+          Row({Value(int64_t{2}), Value(int64_t{2}), Value()}),
+          Row({Value(int64_t{3}), Value(int64_t{3}), Value(int64_t{0})})}));
+
+  const std::vector<Row> full_strict =
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.id, r.val FROM of_l l FULL JOIN of_r r "
+             "ON l.id = r.id WHERE l.id >= 0 AND r.val >= 0 "
+             "ORDER BY l.id, r.id;");
+  EXPECT_EQ(
+      full_strict,
+      (std::vector<Row>{
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{0})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{100})}),
+          Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{100})}),
+          Row({Value(int64_t{3}), Value(int64_t{3}), Value(int64_t{0})})}));
+
+  const std::vector<Row> boundary =
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.val FROM of_l l LEFT JOIN of_r r ON l.id = r.id "
+             "WHERE r.val >= 0 AND r.val <= 0 ORDER BY l.id;");
+  EXPECT_EQ(boundary,
+            (std::vector<Row>{Row({Value(int64_t{1}), Value(int64_t{0})}),
+                              Row({Value(int64_t{1}), Value(int64_t{0})}),
+                              Row({Value(int64_t{3}), Value(int64_t{0})})}));
+
+  const std::vector<Row> empty = RunSql(
+      ctx, *db_,
+      "SELECT l.id, e.val FROM of_l l LEFT JOIN of_empty e ON l.id = e.id "
+      "WHERE e.val IS NULL ORDER BY l.id;");
+  EXPECT_EQ(empty, (std::vector<Row>{Row({Value(), Value()}),
+                                     Row({Value(int64_t{1}), Value()}),
+                                     Row({Value(int64_t{1}), Value()}),
+                                     Row({Value(int64_t{2}), Value()}),
+                                     Row({Value(int64_t{3}), Value()})}));
+
+  const std::vector<Row> aggregate = RunSql(
+      ctx, *db_,
+      "SELECT l.id, COUNT(*), COUNT(r.val), SUM(r.val) "
+      "FROM of_l l LEFT JOIN of_r r ON l.id = r.id "
+      "WHERE r.val IS NULL OR r.val >= 100 GROUP BY l.id ORDER BY l.id;");
+  EXPECT_EQ(aggregate,
+            (std::vector<Row>{
+                Row({Value(), Value(int64_t{1}), Value(int64_t{0}), Value()}),
+                Row({Value(int64_t{1}), Value(int64_t{2}), Value(int64_t{2}),
+                     Value(int64_t{200})}),
+                Row({Value(int64_t{2}), Value(int64_t{1}), Value(int64_t{0}),
+                     Value()})}));
+
+  const std::vector<Row> limited =
+      RunSql(ctx, *db_,
+             "SELECT l.id, r.val FROM of_l l LEFT JOIN of_r r ON l.id = r.id "
+             "WHERE r.val IS NULL OR r.val >= 100 "
+             "ORDER BY l.id DESC, r.val DESC LIMIT 2;");
+  EXPECT_EQ(limited,
+            (std::vector<Row>{Row({Value(int64_t{2}), Value()}),
+                              Row({Value(int64_t{1}), Value(int64_t{100})})}));
+
+  SqlEngine error_engine(*db_);
+  StatusOr<Executor> bad =
+      error_engine.Prepare(ctx, "SELECT CAST('bad' AS DATE) FROM of_r;");
+  if (bad.HasValue()) {
+    Row bad_row;
+    EXPECT_FALSE(bad.Value()->Next(&bad_row, nullptr));
+    EXPECT_NE(bad.Value()->GetStatus(), Status::kSuccess);
+  } else {
+    EXPECT_NE(bad.GetStatus(), Status::kSuccess);
+  }
+
+  const auto run_fallback = [&](bool fallback) {
+    SqlEngine engine(*db_);
+    engine.SetForceRelationalFallback(fallback);
+    StatusOr<Executor> prepared = engine.Prepare(
+        ctx,
+        "SELECT l.id, r.id, r.val FROM of_l l LEFT JOIN of_r r "
+        "ON l.id = r.id AND COALESCE(r.val, 0) = 0 ORDER BY l.id, r.val;");
+    std::vector<Row> rows;
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+  EXPECT_EQ(run_fallback(false), run_fallback(true));
+  ctx.txn_.Abort();
+}
+
 // A unique index on a nullable column stores NULL-bearing keys in the
 // multi-value encoding, so it may hold many NULL rows; DISTINCT must not be
 // dropped on the strength of that index.
@@ -3850,6 +4407,11 @@ TEST_F(QueryTest, SqlEnginePlanCacheRevalidatesSnapshotDependentTopNProof) {
 
 TEST_F(QueryTest, CompliancePrimaryKeyModeNeverReplaysUncheckedDml) {
   struct ModeReset {
+    ModeReset() = default;
+    ModeReset(const ModeReset&) = delete;
+    ModeReset& operator=(const ModeReset&) = delete;
+    ModeReset(ModeReset&&) = delete;
+    ModeReset& operator=(ModeReset&&) = delete;
     ~ModeReset() { SqlEngine::SetCompliancePrimaryKeyMode(false); }
   } mode_reset;
   TransactionContext ctx = db_->BeginContext();
@@ -4737,6 +5299,255 @@ TEST_F(QueryTest, SqlEngineWholeRowRefNestedInExpressionResolves) {
   ctx.txn_.Abort();
 }
 
+// Index nested-loop (lookup join) end to end through the SQL engine. The
+// composite-index shapes here are the ones the probe is designed for: an
+// equality prefix plus a range bound, an equality on a non-key column, and a
+// second range the single bound slot cannot take. Whatever the planner picks,
+// the answers must match the nested-loop semantics the mirror below spells out.
+TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE lk (x INT64, y INT64, z FLOAT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO lk VALUES (1, 5, 2.5), (1, 6, 3.5), (2, 1, 0.5), "
+         "(3, 9, 1.5);");
+  RunSql(ctx, *db_, "CREATE TABLE rk (a INT64, b INT64, c INT64, d FLOAT64);");
+  {
+    std::string values =
+        "(1, 10, 1, 9.5), (1, 20, 7, 1.5), (1, 30, 1, 3.5), (1, 4, 5, 0.5), "
+        "(2, 5, 2, 0.25), (2, 40, 9, 7.5), (2, 0, 3, 2.5), (3, 2, 3, 0.5), "
+        "(4, 100, 4, 1.0)";
+    RunSql(ctx, *db_, "INSERT INTO rk VALUES " + values + ";");
+  }
+  ASSERT_EQ(
+      db_->CreateIndex(ctx, "rk",
+                       IndexSchema("rk_ab", {0, 1}, {}, IndexMode::kNonUnique)),
+      Status::kSuccess);
+  {
+    TransactionContext stat_ctx = db_->BeginContext();
+    db_->RefreshStatistics(stat_ctx, "lk");
+    db_->RefreshStatistics(stat_ctx, "rk");
+    ASSERT_EQ(stat_ctx.PreCommit(), Status::kSuccess);
+  }
+
+  // Equality prefix on (a) plus a range bound on (b). The mirror below lists
+  // the pairs the predicate accepts, computed in plain C++.
+  const std::vector<Row> probe_left{{Value(1), Value(5), Value(2.5)},
+                                    {Value(1), Value(6), Value(3.5)},
+                                    {Value(2), Value(1), Value(0.5)},
+                                    {Value(3), Value(9), Value(1.5)}};
+  const std::vector<Row> probe_right{
+      {Value(1), Value(10), Value(1), Value(9.5)},
+      {Value(1), Value(20), Value(7), Value(1.5)},
+      {Value(1), Value(30), Value(1), Value(3.5)},
+      {Value(1), Value(4), Value(5), Value(0.5)},
+      {Value(2), Value(5), Value(2), Value(0.25)},
+      {Value(2), Value(40), Value(9), Value(7.5)},
+      {Value(2), Value(0), Value(3), Value(2.5)},
+      {Value(3), Value(2), Value(3), Value(0.5)},
+      {Value(4), Value(100), Value(4), Value(1.0)}};
+  const auto mirror = [&](const std::string& sql_extra, int comparison) {
+    std::vector<std::pair<int64_t, int64_t>> expected;
+    for (const Row& l : probe_left) {
+      for (const Row& r : probe_right) {
+        if (l[0].value.int_value != r[0].value.int_value) {
+          continue;
+        }
+        if (!sql_extra.empty()) {
+          continue;
+        }
+        const int64_t l_y = l[1].value.int_value;
+        const int64_t r_b = r[1].value.int_value;
+        const bool keep = comparison == 0   ? r_b > l_y
+                          : comparison == 1 ? r_b >= l_y
+                                            : r_b < l_y;
+        if (keep) {
+          expected.emplace_back(r[0].value.int_value, r[1].value.int_value);
+        }
+      }
+    }
+    std::ranges::sort(expected);
+    return expected;
+  };
+  const auto collect = [&](const std::string& sql) {
+    std::vector<std::pair<int64_t, int64_t>> got;
+    for (const Row& row : RunSql(ctx, *db_, sql)) {
+      got.emplace_back(row[0].value.int_value, row[1].value.int_value);
+    }
+    std::ranges::sort(got);
+    return got;
+  };
+
+  // `b > y` -- the mirror's comparison 0.
+  EXPECT_EQ(collect("SELECT rk.a, rk.b FROM lk JOIN rk ON lk.x = rk.a AND "
+                    "rk.b > lk.y;"),
+            mirror("", 0));
+  // `b >= y` includes the boundary rows the seek's exclusive end drops.
+  EXPECT_EQ(collect("SELECT rk.a, rk.b FROM lk JOIN rk ON lk.x = rk.a AND "
+                    "rk.b >= lk.y;"),
+            mirror("", 1));
+  // `b < y` -- the mirrored probe, seeking from the prefix start to the bound.
+  EXPECT_EQ(collect("SELECT rk.a, rk.b FROM lk JOIN rk ON lk.x = rk.a AND "
+                    "rk.b < lk.y;"),
+            mirror("", 2));
+
+  // An equality on a NON-key column: the probe pins (a) only, so `x = c` has
+  // to filter the over-fetch. (The old seek built its key from the join's own
+  // key order and returned nothing here.)
+  {
+    std::vector<std::pair<int64_t, int64_t>> expected;
+    for (const Row& l : probe_left) {
+      for (const Row& r : probe_right) {
+        if (l[0].value.int_value == r[0].value.int_value &&
+            l[0].value.int_value == r[2].value.int_value) {
+          expected.emplace_back(r[0].value.int_value, r[1].value.int_value);
+        }
+      }
+    }
+    std::ranges::sort(expected);
+    EXPECT_EQ(collect("SELECT rk.a, rk.b FROM lk JOIN rk ON lk.x = rk.a AND "
+                      "lk.x = rk.c;"),
+              expected);
+  }
+
+  // A range on a FLOAT64 column is outside the probe's range whitelist: it is
+  // an explicit fallback to a residual predicate, never a dropped one. The
+  // right `d` values are the third kind of conjunct the single bound slot and
+  // the key prefix both decline, so the whole predicate decides the rows.
+  {
+    std::vector<std::pair<int64_t, int64_t>> expected;
+    for (const Row& l : probe_left) {
+      for (const Row& r : probe_right) {
+        if (l[0].value.int_value == r[0].value.int_value &&
+            r[1].value.int_value > l[1].value.int_value &&
+            r[3].value.double_value < l[2].value.double_value) {
+          expected.emplace_back(r[0].value.int_value, r[1].value.int_value);
+        }
+      }
+    }
+    std::ranges::sort(expected);
+    EXPECT_EQ(collect("SELECT rk.a, rk.b FROM lk JOIN rk ON lk.x = rk.a AND "
+                      "rk.b > lk.y AND rk.d < lk.z;"),
+              expected);
+  }
+
+  // A NULL equality key never matches, and neither does a NULL range bound.
+  RunSql(ctx, *db_, "INSERT INTO lk VALUES (NULL, 5, 1.0), (1, NULL, 1.0);");
+  EXPECT_EQ(collect("SELECT rk.a, rk.b FROM lk JOIN rk ON lk.x = rk.a AND "
+                    "rk.b > lk.y;"),
+            mirror("", 0));
+  // An empty right side makes every probe miss, and the query returns nothing
+  // rather than failing.
+  RunSql(ctx, *db_, "CREATE TABLE rk_empty (a INT64, b INT64);");
+  ASSERT_EQ(db_->CreateIndex(
+                ctx, "rk_empty",
+                IndexSchema("rk_empty_ab", {0, 1}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  EXPECT_TRUE(RunSql(ctx, *db_,
+                     "SELECT lk.x FROM lk JOIN rk_empty ON lk.x = "
+                     "rk_empty.a AND rk_empty.b > lk.y;")
+                  .empty());
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, ZigZagJoinSqlContracts) {
+  TransactionContext setup = db_->BeginContext();
+  RunSql(setup, *db_, "CREATE TABLE zz_left (k INT64);");
+  RunSql(setup, *db_, "CREATE TABLE zz_right (k INT64);");
+  ASSERT_EQ(db_->CreateIndex(
+                setup, "zz_left",
+                IndexSchema("zz_left_k", {0}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  ASSERT_EQ(db_->CreateIndex(
+                setup, "zz_right",
+                IndexSchema("zz_right_k", {0}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  RunSql(setup, *db_, "INSERT INTO zz_left VALUES (NULL), (1), (1), (3), (5);");
+  RunSql(setup, *db_,
+         "INSERT INTO zz_right VALUES (NULL), (1), (1), (2), (3), (3), "
+         "(6);");
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  TransactionContext stats_context = db_->BeginContext();
+  db_->RefreshStatistics(stats_context, "zz_left");
+  db_->RefreshStatistics(stats_context, "zz_right");
+  ASSERT_SUCCESS(stats_context.txn_.PreCommit());
+
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  const std::string equality_sql =
+      "SELECT zz_left.k, zz_right.k FROM zz_left JOIN zz_right ON "
+      "zz_left.k = zz_right.k ORDER BY zz_left.k, zz_right.k;";
+  const std::vector<Row> equality = RunSql(ctx, *db_, equality_sql);
+  ASSERT_EQ(equality.size(), 6U);
+  EXPECT_EQ(equality[0], (Row({Value(1), Value(1)})));
+  EXPECT_EQ(equality[1], (Row({Value(1), Value(1)})));
+  EXPECT_EQ(equality[2], (Row({Value(1), Value(1)})));
+  EXPECT_EQ(equality[3], (Row({Value(1), Value(1)})));
+  EXPECT_EQ(equality[4], (Row({Value(3), Value(3)})));
+  EXPECT_EQ(equality[5], (Row({Value(3), Value(3)})));
+
+  const std::vector<Row> range =
+      RunSql(ctx, *db_,
+             "SELECT zz_left.k, zz_right.k FROM zz_left JOIN zz_right ON "
+             "zz_left.k < zz_right.k ORDER BY zz_left.k, zz_right.k;");
+  ASSERT_EQ(range.size(), 10U);
+  EXPECT_EQ(range.front(), (Row({Value(1), Value(2)})));
+  EXPECT_EQ(range.back(), (Row({Value(5), Value(6)})));
+
+  const std::vector<Row> residual =
+      RunSql(ctx, *db_,
+             "SELECT zz_left.k, zz_right.k FROM zz_left JOIN zz_right ON "
+             "zz_left.k = zz_right.k AND zz_left.k <> 1 ORDER BY zz_left.k, "
+             "zz_right.k;");
+  ASSERT_EQ(residual.size(), 2U);
+  EXPECT_EQ(residual[0], (Row({Value(3), Value(3)})));
+  EXPECT_EQ(residual[1], (Row({Value(3), Value(3)})));
+
+  StatusOr<Executor> explained = engine.Prepare(
+      ctx,
+      "EXPLAIN SELECT zz_left.k, zz_right.k FROM zz_left JOIN zz_right "
+      "ON zz_left.k = zz_right.k ORDER BY zz_left.k, zz_right.k;");
+  ASSERT_TRUE(explained.HasValue()) << engine.LastError();
+  std::string plan_text;
+  Row plan_row;
+  while (explained.Value()->Next(&plan_row, nullptr)) {
+    plan_text += plan_row[0].AsString() + "\n";
+  }
+  EXPECT_NE(plan_text.find("ZigZagJoin"), std::string::npos) << plan_text;
+
+  RunSql(ctx, *db_, "CREATE TABLE zz_empty (k INT64);");
+  ASSERT_EQ(db_->CreateIndex(
+                ctx, "zz_empty",
+                IndexSchema("zz_empty_k", {0}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  EXPECT_TRUE(RunSql(ctx, *db_,
+                     "SELECT zz_left.k FROM zz_left JOIN zz_empty ON "
+                     "zz_left.k = zz_empty.k;")
+                  .empty());
+
+  RunSql(ctx, *db_, "CREATE TABLE zz_unique_left (k INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE zz_unique_right (k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO zz_unique_left VALUES (1), (2);");
+  RunSql(ctx, *db_, "INSERT INTO zz_unique_right VALUES (2), (3);");
+  ASSERT_EQ(db_->CreateIndex(
+                ctx, "zz_unique_left",
+                IndexSchema("zz_unique_left_k", {0}, {}, IndexMode::kUnique)),
+            Status::kSuccess);
+  ASSERT_EQ(db_->CreateIndex(
+                ctx, "zz_unique_right",
+                IndexSchema("zz_unique_right_k", {0}, {}, IndexMode::kUnique)),
+            Status::kSuccess);
+  const std::vector<Row> unique = RunSql(
+      ctx, *db_,
+      "SELECT zz_unique_left.k, zz_unique_right.k FROM zz_unique_left JOIN "
+      "zz_unique_right ON zz_unique_left.k = zz_unique_right.k ORDER BY "
+      "zz_unique_left.k;");
+  ASSERT_EQ(unique.size(), 1U);
+  EXPECT_EQ(unique[0], (Row({Value(2), Value(2)})));
+
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, UnsignedInt64_CreateInsertOrderAndIndex) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE u_tbl (u UINT64);");
@@ -5473,5 +6284,376 @@ TEST_F(QueryTest, DmlDuplicateExistsConjunctDecorrelateOnce) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][1].value.int_value, 2);
   ctx.txn_.Abort();
+}
+TEST_F(QueryTest, GroupedOrderBySpelledAggregate) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE ord_t (k INT64, v INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO ord_t VALUES (1, 30), (1, 10), (2, 5), (2, 20), "
+         "(3, 7);");
+
+  SqlEngine engine(*db_);
+  const auto run = [&](std::string_view sql) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                      << engine.LastError();
+    std::vector<Row> rows;
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+
+  // The single-table stream-aggregation path must prepare aggregates that
+  // appear only in the ORDER BY: the AggregateResultMap is keyed by node
+  // pointer, and the spelled-out sort key ("ORDER BY SUM(v)") is a different
+  // instance from the select-list aggregate.  Pre-fix these failed with
+  // "aggregate was not prepared".
+  const std::vector<Row> spelled =
+      run("SELECT k, SUM(v) FROM ord_t GROUP BY k ORDER BY SUM(v) DESC;");
+  ASSERT_EQ(spelled.size(), 3U);
+  EXPECT_EQ(spelled[0][0].value.int_value, 1);
+  EXPECT_EQ(spelled[0][1].value.int_value, 40);
+  EXPECT_EQ(spelled[1][0].value.int_value, 2);
+  EXPECT_EQ(spelled[1][1].value.int_value, 25);
+  EXPECT_EQ(spelled[2][0].value.int_value, 3);
+  EXPECT_EQ(spelled[2][1].value.int_value, 7);
+
+  const std::vector<Row> count_star =
+      run("SELECT k, COUNT(*) FROM ord_t GROUP BY k ORDER BY COUNT(*) ASC, k;");
+  ASSERT_EQ(count_star.size(), 3U);
+  EXPECT_EQ(count_star[0][0].value.int_value, 3);
+  EXPECT_EQ(count_star[0][1].value.int_value, 1);
+  EXPECT_EQ(count_star[1][0].value.int_value, 1);
+  EXPECT_EQ(count_star[1][1].value.int_value, 2);
+  EXPECT_EQ(count_star[2][0].value.int_value, 2);
+  EXPECT_EQ(count_star[2][1].value.int_value, 2);
+
+  // An ORDER BY aggregate that is not projected gets prepared on its own.
+  const std::vector<Row> unprojected =
+      run("SELECT k FROM ord_t GROUP BY k ORDER BY SUM(v) DESC;");
+  ASSERT_EQ(unprojected.size(), 3U);
+  EXPECT_EQ(unprojected[0][0].value.int_value, 1);
+  EXPECT_EQ(unprojected[1][0].value.int_value, 2);
+  EXPECT_EQ(unprojected[2][0].value.int_value, 3);
+
+  // Alias and bounded (Top-N) forms stay correct alongside the fix.
+  const std::vector<Row> aliased =
+      run("SELECT k, SUM(v) AS s FROM ord_t GROUP BY k ORDER BY s DESC "
+          "LIMIT 2;");
+  ASSERT_EQ(aliased.size(), 2U);
+  EXPECT_EQ(aliased[0][0].value.int_value, 1);
+  EXPECT_EQ(aliased[1][0].value.int_value, 2);
+}
+
+// A typo'd ORDER BY column over a grouped statement must be an error.  The
+// grouped-emission scopes used to let the whole-row fallback resolve ANY bare
+// name to a STRUCT of the output row, so `ORDER BY nosuch` silently "sorted"
+// by that struct (or by its JSON text) instead of failing.  Both the bare and
+// the arithmetic spelling must report the missing column.
+TEST_F(QueryTest, GroupedOrderByUnknownColumnErrors) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE ord_u (k INT64, v INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO ord_u VALUES (1, 30), (1, 10), (2, 5), (2, 20), (3, 7);");
+  SqlEngine engine(*db_);
+  for (std::string_view sql :
+       {"SELECT k, COUNT(*) FROM ord_u GROUP BY k ORDER BY nosuch",
+        "SELECT k, COUNT(*) FROM ord_u GROUP BY k ORDER BY nosuch + 1",
+        "SELECT k, COUNT(*) AS c FROM ord_u GROUP BY k ORDER BY nosuch "
+        "LIMIT 2"}) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    ASSERT_TRUE(prepared.HasValue()) << sql << "\n" << engine.LastError();
+    // The relational finish defers to the first drain; the failure must
+    // surface there and name the missing column (pre-fix this silently
+    // "sorted" by a fabricated STRUCT of the output row).
+    Row row;
+    std::vector<Row> leaked;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      leaked.push_back(row);
+    }
+    const Status status = prepared.Value()->GetStatus();
+    ASSERT_NE(status, Status::kSuccess)
+        << sql << " silently returned " << leaked.size() << " rows";
+    EXPECT_NE(status.GetMessage().find("nosuch"), std::string::npos)
+        << sql << "\nerror was: " << status.GetMessage();
+  }
+  // Referencing the whole source row in a grouped ORDER BY is not a group
+  // key either: the query is grouped by parts of that row.
+  StatusOr<Executor> whole_row = engine.Prepare(
+      ctx, "SELECT k, COUNT(*) FROM ord_u GROUP BY k ORDER BY v");
+  // `v` IS a real base column but not a group key; GoogleSQL allows ordering
+  // by input columns of the group only when they are functionally derived
+  // from the key, which the evaluator decides -- it must not silently
+  // fabricate a STRUCT either way.
+  if (whole_row.HasValue()) {
+    Row row;
+    while (whole_row.Value()->Next(&row, nullptr)) {
+      for (const Value& value : row.values_) {
+        EXPECT_NE(value.type, ValueType::kVarChar)
+            << "order key fabricated a STRUCT value: " << value;
+      }
+    }
+  }
+}
+
+// `col = col +/- constant` join predicates become biased hash keys (the
+// constant folds into the key on the expression side); every matched pair is
+// still re-verified against the original predicate, so results must equal
+// the unbiased spelling exactly.  Week-over-week self joins exercise the
+// string+int composite key path the TPC-DS shapes hit.
+TEST_F(QueryTest, BiasedJoinKeysMatchPlainEquality) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE biased_l (k STRING, week INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE biased_r (k STRING, week INT64, w INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO biased_l VALUES ('a', 10, 1), ('a', 20, 2), "
+         "('b', 10, 3), ('c', 30, 4);");
+  RunSql(ctx, *db_,
+         "INSERT INTO biased_r VALUES ('a', 20, 100), ('a', 30, 200), "
+         "('b', 20, 300), ('d', 40, 400);");
+  SqlEngine engine(*db_);
+  const auto run = [&](std::string_view sql) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                      << engine.LastError();
+    std::vector<Row> rows;
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+  // Inner join, constant on the right side of the expression.
+  const std::vector<Row> shifted =
+      run("SELECT l.v, r.w FROM biased_l l JOIN biased_r r "
+          "ON l.k = r.k AND l.week = r.week - 10 ORDER BY l.v;");
+  ASSERT_EQ(shifted.size(), 3U);
+  EXPECT_EQ(shifted[0][0].value.int_value, 1);
+  EXPECT_EQ(shifted[0][1].value.int_value, 100);
+  EXPECT_EQ(shifted[1][0].value.int_value, 2);
+  EXPECT_EQ(shifted[1][1].value.int_value, 200);
+  EXPECT_EQ(shifted[2][0].value.int_value, 3);
+  EXPECT_EQ(shifted[2][1].value.int_value, 300);
+  // The unbiased spelling of the same predicate agrees row for row.
+  const std::vector<Row> plain =
+      run("SELECT l.v, r.w FROM biased_l l JOIN biased_r r "
+          "ON l.k = r.k AND l.week + 10 = r.week ORDER BY l.v;");
+  ASSERT_EQ(plain.size(), shifted.size());
+  for (size_t i = 0; i < plain.size(); ++i) {
+    EXPECT_EQ(plain[i][0], shifted[i][0]);
+    EXPECT_EQ(plain[i][1], shifted[i][1]);
+  }
+  // Constant folded on the left side too.
+  const std::vector<Row> mirrored =
+      run("SELECT l.v, r.w FROM biased_l l JOIN biased_r r "
+          "ON l.k = r.k AND l.week - 10 = r.week - 20 ORDER BY l.v;");
+  ASSERT_EQ(mirrored.size(), 3U);
+  EXPECT_EQ(mirrored[0][1].value.int_value, 100);
+  // LEFT JOIN keeps unmatched left rows with NULL padding.
+  const std::vector<Row> left_join =
+      run("SELECT l.v, r.w FROM biased_l l LEFT JOIN biased_r r "
+          "ON l.k = r.k AND l.week = r.week - 10 ORDER BY l.v;");
+  ASSERT_EQ(left_join.size(), 4U);
+  EXPECT_EQ(left_join[0][0].value.int_value, 1);
+  EXPECT_EQ(left_join[0][1].value.int_value, 100);
+  EXPECT_EQ(left_join[3][0].value.int_value, 4);
+  EXPECT_TRUE(left_join[3][1].IsNull());
+  // DATE keys bias by whole days: (a=(03-01, 03-29)) joins b=(03-29, 03-29)
+  // on d2/d1, and a.d1 = b.d2 - 28 holds (03-29 minus 28 days = 03-01).
+  RunSql(ctx, *db_, "CREATE TABLE biased_d (d1 DATE, d2 DATE);");
+  RunSql(ctx, *db_,
+         "INSERT INTO biased_d VALUES (DATE '2024-03-01', DATE "
+         "'2024-03-29'), (DATE '2024-03-29', DATE '2024-03-29');");
+  const std::vector<Row> dates =
+      run("SELECT 'x' FROM biased_d a JOIN biased_d b ON a.d2 = b.d1 "
+          "WHERE a.d1 = b.d2 - 28;");
+  EXPECT_EQ(dates.size(), 1U);
+  // Large-magnitude join keys: the bias folding into the hash key must stay
+  // exact near the INT64 bounds, and the residual must still decide every
+  // k-matched pair. Values stay inside the range where `column +/- 10`
+  // cannot overflow: an overflow inside the optimizer-derived
+  // `IS NOT NULL (week +/- 10)` scan conjunct currently drops rows silently
+  // instead of surfacing the evaluation error, and the probe-biased spelling
+  // (`l.week + 10 = r.week`) loses matches near the bounds -- both are
+  // pre-existing issues in the wider join/predicate machinery, tracked
+  // separately from the biased-key hashing this case guards.
+  RunSql(ctx, *db_, "CREATE TABLE biased_xl (k STRING, week INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE biased_xr (k STRING, week INT64, w INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO biased_xl VALUES "
+         "('p', 9223372036854775798, 1), "   // INT64_MAX - 9
+         "('q', -9223372036854775798, 2), "  // INT64_MIN + 10
+         "('z', 0, 4);");
+  RunSql(ctx, *db_,
+         "INSERT INTO biased_xr VALUES "
+         "('p', 9223372036854775807, 100), "   // INT64_MAX
+         "('q', -9223372036854775788, 200), "  // INT64_MIN + 20
+         "('z', 10, 500);");
+  const std::vector<Row> extreme_biased =
+      run("SELECT xl.v, xr.w FROM biased_xl xl JOIN biased_xr xr "
+          "ON xl.k = xr.k AND xl.week = xr.week - 10 ORDER BY xl.v;");
+  // p straddles the top of the range without matching (MAX - 9 does not
+  // equal MAX - 10); the q pair matches across the minimum; z matches at 0.
+  ASSERT_EQ(extreme_biased.size(), 2U);
+  EXPECT_EQ(extreme_biased[0][0].value.int_value, 2);
+  EXPECT_EQ(extreme_biased[0][1].value.int_value, 200);
+  EXPECT_EQ(extreme_biased[1][0].value.int_value, 4);
+  EXPECT_EQ(extreme_biased[1][1].value.int_value, 500);
+}
+
+// Disjunctions whose every branch implies the same equi-join conjunct gain a
+// synthetic join edge in the relational planner (TPC-DS q13 shape): the
+// pair keys a hash join while the original disjunction re-verifies matched
+// pairs, so results match the explicit conjunct spelling row for row and
+// the join stops being a nested loop over the cross product.
+TEST_F(QueryTest, DisjunctCommonEqualityBecomesJoinEdge) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE edge_l (k INT64, m INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE edge_r (k INT64, n INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO edge_l VALUES (1, 1), (2, 1), (3, 2), (4, 9);");
+  RunSql(ctx, *db_,
+         "INSERT INTO edge_r VALUES (1, 5), (2, 9), (3, 2), (9, 9);");
+  SqlEngine engine(*db_);
+  const auto run_count = [&](const std::string& sql) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_TRUE(prepared.HasValue()) << sql << "\n" << engine.LastError();
+    if (!prepared.HasValue()) {
+      return std::make_pair(int64_t{-1}, std::string());
+    }
+    Row row;
+    EXPECT_TRUE(prepared.Value()->Next(&row, nullptr));
+    const int64_t count = row[0].value.int_value;
+    std::ostringstream plan;
+    prepared.Value()->Dump(plan, 0);
+    EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
+    return std::make_pair(count, plan.str());
+  };
+  // The trailing uncorrelated EXISTS forces the relational interpreter
+  // (PostRewriteNeedsRelational), where the greedy planner would otherwise
+  // see `(a AND p) OR (a AND q)` as an opaque three-source blob.
+  const auto [or_count, or_plan] = run_count(
+      "SELECT COUNT(*) FROM edge_l, edge_r "
+      "WHERE ((edge_l.k = edge_r.k AND edge_l.m = 1) "
+      "OR (edge_l.k = edge_r.k AND edge_r.n = 2)) "
+      "AND EXISTS (SELECT 1 FROM edge_r);");
+  EXPECT_EQ(or_count, 3);
+  EXPECT_NE(or_plan.find("nested_loop_joins=0"), std::string::npos) << or_plan;
+  EXPECT_NE(or_plan.find("hash_joins=1"), std::string::npos) << or_plan;
+  // Same multiset as the explicit conjunct spelling.
+  const auto [explicit_count, explicit_plan] = run_count(
+      "SELECT COUNT(*) FROM edge_l, edge_r "
+      "WHERE edge_l.k = edge_r.k "
+      "AND (edge_l.m = 1 OR edge_r.n = 2) "
+      "AND EXISTS (SELECT 1 FROM edge_r);");
+  EXPECT_EQ(explicit_count, or_count);
+  // A branch that drops the shared equality must NOT gain an edge: rows
+  // where the equality fails can still satisfy the disjunction, so the only
+  // sound plan evaluates the full predicate (result pin; the plan shape is
+  // unchanged and may stay a nested loop).
+  const auto [partial_count, partial_plan] = run_count(
+      "SELECT COUNT(*) FROM edge_l, edge_r "
+      "WHERE ((edge_l.k = edge_r.k AND edge_l.m = 1) "
+      "OR (edge_r.n = 9)) "
+      "AND EXISTS (SELECT 1 FROM edge_r);");
+  // Equality pairs: (1,1)r(1,5), (2,1)r(2,9); plus every left row against
+  // the two n=9 right rows (one pair already counted).
+  EXPECT_EQ(partial_count, 9);
+  EXPECT_NE(partial_plan.find("join_comparisons="), std::string::npos);
+}
+
+// Three-way disjunction with two shared equi-join pairs (TPC-DS q13): both
+// pairs become hash join keys, so every join step in the chain stays a hash
+// join instead of collapsing into nested loops over the accumulated cross.
+TEST_F(QueryTest, ThreeWayDisjunctCommonPairsKeyBothJoins) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE fact (h INT64, c INT64, tag INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE dimh (h INT64, y INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE dimc (c INT64, z INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO fact VALUES (1, 10, 1), (2, 20, 2), (3, 30, 3), "
+         "(4, 40, 4);");
+  RunSql(ctx, *db_, "INSERT INTO dimh VALUES (1, 100), (3, 300);");
+  RunSql(ctx, *db_, "INSERT INTO dimc VALUES (10, 7), (30, 9), (40, 1);");
+  SqlEngine engine(*db_);
+  StatusOr<Executor> prepared = engine.Prepare(
+      ctx,
+      "SELECT fact.tag, dimh.y, dimc.z FROM fact, dimh, dimc "
+      "WHERE ((fact.h = dimh.h AND fact.c = dimc.c AND fact.tag = 1) "
+      "OR (fact.h = dimh.h AND fact.c = dimc.c AND dimh.y = 300) "
+      "OR (fact.h = dimh.h AND fact.c = dimc.c AND dimc.z = 1)) "
+      "AND EXISTS (SELECT 1 FROM dimc) "
+      "ORDER BY fact.tag;");
+  ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+  std::vector<Row> rows;
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  // Stats are only populated after execution (Dump does not execute).
+  std::ostringstream plan;
+  prepared.Value()->Dump(plan, 0);
+  EXPECT_NE(plan.str().find("nested_loop_joins=0"), std::string::npos)
+      << plan.str();
+  EXPECT_NE(plan.str().find("hash_joins=2"), std::string::npos) << plan.str();
+  // fact(1,10): branch 1 (tag=1) TRUE. fact(3,30): branch 2 (y=300) TRUE.
+  // fact(2,20) has no dimh row and fact(4,40) fails `fact.h = dimh.h` in
+  // every branch, so both drop out.
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0].value.int_value, 1);
+  EXPECT_EQ(rows[0][1].value.int_value, 100);
+  EXPECT_EQ(rows[0][2].value.int_value, 7);
+  EXPECT_EQ(rows[1][0].value.int_value, 3);
+  EXPECT_EQ(rows[1][1].value.int_value, 300);
+  EXPECT_EQ(rows[1][2].value.int_value, 9);
+}
+
+// An arithmetic overflow inside a WHERE conjunct must surface through the
+// drain-status channel instead of reading as EOF (a silent short result).
+TEST_F(QueryTest, FilterOverflowSurfacesThroughDrainStatus) {
+  SqlEngine& engine = *engines_.front();
+  TransactionContext drain_ctx = db_->BeginContext();
+  RunSql(drain_ctx, *db_, "CREATE TABLE t (k VARCHAR(4), week INT64);");
+  RunSql(drain_ctx, *db_,
+         "INSERT INTO t VALUES ('z', 10), "
+         "('lo', -9223372036854775803);");  // INT64_MIN + 5
+  ASSERT_SUCCESS(drain_ctx.txn_.PreCommit());
+  drain_ctx = db_->BeginContext();
+
+  auto drained = [&](const std::string& sql) {
+    auto r = engine.Execute(drain_ctx, sql);
+    EXPECT_TRUE(r.HasValue()) << sql << "\n" << engine.LastError();
+    if (!r.HasValue()) {
+      return std::make_pair(std::string(), false);
+    }
+    std::vector<Row> rows;
+    r.Value().ForEach([&](const Row& row) { rows.push_back(row); });
+    const Status status = r.Value().GetStatus();
+    return std::make_pair(ToString(status), status == Status::kSuccess);
+  };
+
+  // The 'lo' row raises on `week - 10`: the query fails loudly even though
+  // the 'z' row matched (drain may have collected it before the error).
+  const auto [status, ok] = drained("SELECT k FROM t WHERE week - 10 = 0;");
+  EXPECT_FALSE(ok) << "overflow swallowed as success (status: " << status
+                   << ")";
+  EXPECT_NE(status.find("overflow"), std::string::npos)
+      << "expected an overflow diagnostic, got: " << status;
+
+  // Tolerant-WHERE semantics: a sibling conjunct that cleanly rejects the
+  // row suppresses the sibling error, so the same scan succeeds with an
+  // empty result instead of raising.
+  drain_ctx = db_->BeginContext();
+  const auto [tolerant_status, tolerant_ok] =
+      drained("SELECT k FROM t WHERE week - 10 = 0 AND k = 'nomatch';");
+  EXPECT_TRUE(tolerant_ok) << tolerant_status;
 }
 }  // namespace tinylamb

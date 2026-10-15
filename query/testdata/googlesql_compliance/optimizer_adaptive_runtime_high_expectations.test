@@ -104,8 +104,8 @@ ARRAY<STRUCT<id INT64>>[{8}, {7}, {6}]
 ==
 
 [mode=explain_analyze]
-[plan_contains=Aggregate input_rows=8 groups=6 updates=8]
-[name=hash_aggregate_reports_groups_and_updates]
+[plan_contains=HashAggregate (groups=6, input_rows=8]
+[name=hash_aggregate_reports_groups_and_input]
 SELECT k, COUNT(*) AS n FROM opt_probe GROUP BY k
 --
 ARRAY<STRUCT<k INT64, n INT64>>[unknown order:

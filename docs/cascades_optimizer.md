@@ -13,11 +13,33 @@ Adding or removing a scalar rule does not require editing memo exploration,
 and adding a logical equivalence does not require changing the physical
 implementations.
 
+
+The current audit and complete registry are in [optimizer_rule_audit.md](optimizer_rule_audit.md).
+There are 83 logical and 46 physical registrations. Normal single-table queries
+and simple column-key GROUP BY use the same memo as joins; only exact MIN/MAX
+index endpoint retrieval retains its specialized shortcut. Advanced grouped SQL
+keeps the existing relational finish where the narrow memo contract declines.
+
+Exploration seeds reachable children before parents. A changed child group
+requeues previously processed dependents from their first expression, while
+budget and size caps bound the fixed point. Physical search detects cycles.
+Ordering penalties select a preferred child but are not accumulated as if an
+unbuilt sort had executed. EmptyPlan's child contributes schema, not execution
+cost. Aggregation and sort also compare children requested in key order.
+
+Join costing uses ColumnStats::EstimateJoinMatches (MCV frequencies, NULL mass,
+NDV and disjoint histogram domains). Group/distinct estimates share
+TableStatistics::EstimateDistinctRows; this is a monotone NDV backoff heuristic,
+not measured multicolumn correlation. Large-join seeding uses filtered base rows.
+Range-index I/O uses direction-independent `ClusteringStrength`; ascending
+order certification still uses `Correlation` and its layout-generation gate.
+The persisted statistics format is unchanged.
+
 ## Search flow
 
 `Optimizer::Optimize` rewrites expressions, decomposes conjuncts while building
 the memo, builds one memo group for every equivalent relation set, explores
-logical rules with an append-only worklist, and performs a top-down cost search
+logical rules with a child-first, dependency-aware worklist, and performs a top-down cost search
 from the root group. A memo group can contain multiple join trees. The best
 physical plan is cached with a `(group, PhysicalProperties)` key.
 
@@ -25,13 +47,12 @@ Every predicate conjunct is attached to the deepest covering join or to a
 single-relation scan filter. A residual `Selection` remains where the chosen
 physical access path cannot prove it consumed a conjunct. For MULTI-relation
 groups the residual re-evaluates every conjunct, so scan-filter bounds are a
-pure optimization there. For SINGLE-relation groups there is no root
-`Selection` wrap: the scan filter is the only predicate evaluated, so scan
-bounds must be semantically exact in both operand orders — rules that enrich
-a single-table scan filter are correctness changes, not optimizations.
+pure optimization there. Single-table predicates are also exposed as Selection expressions for logical
+rewrites. A pushed scan is added to the Selection result group; it must not
+mutate the shared input group. Scan bounds must remain semantically exact.
 
 The built-in logical rules include (see `RuleSet::Default` in
-`plan/cascades.cpp` for the authoritative list, which has grown past 110):
+`plan/cascades.cpp` for the authoritative list, 83 registrations):
 
 - `join_commutativity`
 - `join_enumeration`
@@ -52,13 +73,11 @@ The built-in logical rules include (see `RuleSet::Default` in
 - `push_filter_through_sort` / `limit_push_through_sort` (offset-free only)
 - `push_projection_through_join` / `push_projection_through_union`
 - `self_join_elimination`, `unique_semi_to_inner` (key-equality gated),
-  `semijoin_to_inner_plus_distinct`, `mark_join_to_filter`,
   `outer_to_anti_join`, `union_all_push_limit`, `eliminate_double_sort`,
   `join_identity_dummy`, `count_star_rewrite_on_not_null`,
-  `group_by_functional_dependency_reduction`, `split_window`, `values_fold_into_union`, `cast_pushdown_on_comparison`,
+  `split_window`, `values_fold_into_union`, `cast_pushdown_on_comparison`,
   `extract_year_sargable`, `comparison_self_predicates`,
-  `any_value_elimination`, `order_by_redundant_column_removal`, and
-  subquery/aggregate lowering rules
+  and subquery/aggregate lowering rules
 
 The built-in physical rules include (see `plan/implementation_rules.cpp`):
 
@@ -69,17 +88,29 @@ The built-in physical rules include (see `plan/implementation_rules.cpp`):
 - `aggregation`
 - `limit`
 - `hash_join` (inner/outer/semi/anti, bitmap and TopN/Sort/Distinct/SetOp/Window variants)
+- `band_join` (inner; one signed INT64/DATE ordered comparison, with child SortPlans)
 - `outer_nested_loop` (LEFT non-equi; RIGHT normalizes to LEFT)
 - `index_join`
+- `late_materialization_join` (inner equi; right index key prefix supplies
+  row identities, then the payload is read above the identity join)
+- `zigzag_join` (inner; two ordered INT64 index inputs, equality or one range)
 - `nested_loop_join`
 - `aggregation` (its third `PlanAlternative` is the scalar stream aggregate beside hash/sort)
-- `materialize` / `eager_spool` / `lazy_spool`
-- `exchange_noop` / `gather_noop` / `broadcast_noop` / `redistribute_noop`
+- `sort` / `sort_external_merge` (the two memory shapes of one ORDER BY: an
+  in-memory `BufferedSortPlan` at or below the policy's row capacity, a
+  `ExternalMergeSortPlan` above it; exactly one of the two rules offers an
+  alternative, so the choice is a deterministic function of the estimate — see
+  `plan/sort_plan.hpp`)
+- `sort_incremental` reuses an ordered prefix and costs only the suffix runs.
 
 `index_scan` may produce an `IndexOnlyScanPlan` when the chosen index covers
 the requested columns. `hash_join` offers both in-memory and hybrid variants;
 `nested_loop_join` is a cross product followed by evaluation of the complete
-join predicate.
+join predicate. `late_materialization_join` is limited to inner signed
+INT64/DATE equijoins whose right child is a filter-free table scan with a
+payload column beyond the index key prefix; its alternative declines
+row-position-required shapes, so the existing DML property boundary is
+unchanged.
 
 Scalar defaults include constant folding for binary, unary, and `IN`
 expressions, comparison canonicalization, boolean identities, singleton `IN`
@@ -116,12 +147,38 @@ auto plan = plan_or.Value();
 explicit and avoids ordering two implementations with the same identity.
 
 A `Rule` may declare one target operator, a set of them, or none. The target
-set is an applicability prefilter for the append-only worklist: a rule whose
+set is an applicability prefilter for the dependency-aware worklist: a rule whose
 body gates on several root operators (INTERSECT/EXCEPT shapes, the
 window/projection pair of `no_op_window_elimination`, …) must declare all of
 them, so scan/join expressions skip the rule without running its pattern.
 Setting `TINYLAMB_RULE_STATS=1` logs per-rule attempt counts during `Explore`
 (planning-cost attribution; zero cost when unset).
+
+## Phase 0 regression contracts
+
+`plan/phase0_contract_test.cpp` is the executable contract for the optimizer
+boundary. It compares the SQL facade, a plan emitted by `Optimizer::Optimize`,
+and a directly emitted physical executor on the same ordered row multiset. Its
+manifest repeats the success, NULL, empty-input, duplicate, boundary, and
+error cases for Phase 0 items 55–59. The rule-contract case snapshots the
+output schema, child ordering properties, evaluated row multiset (including
+duplicates), and `TableStatistics::Filter` estimate before and after
+`push_selection_into_scan`.
+
+Every implementation alternative considered by `SearchEngine` carries its
+implementation rule name, physical-operator name, required properties, and
+provided properties.
+SQL `EXPLAIN` renders these as `Rule:`, `Physical operator:`,
+`Required properties:`, and `Provided properties:` lines, followed by the
+sorted logical `Applied rules:` trace when exploration fired any rule. Ordinary single-table statements report their selected implementation rule; a missing or degraded
+route remains visible through the best plan found so far.
+
+Memo expression fingerprints are checked before insertion, and duplicate
+rewrites do not count as rule applications or memo growth. `SetStepBudget`
+terminates the dependency-aware worklist at the requested rule-application bound;
+the built-in worklist and rule-application ceilings remain the final safety
+nets. `plan/phase0_contract_test.cpp` exercises both the fingerprint-idempotent
+and unique-growth budget paths.
 
 ## Adding a scalar rule with the C++ DSL
 
@@ -192,7 +249,7 @@ Tests for rule isolation and memo enumeration are in
 - `PhysicalProperties` contains `require_row_position`, `ordering`,
   `limit_hint`, `access_method`, and the reserved `distribution`. Selection,
   projection, and limit forward requirements; joins and aggregation drop them.
-- Logical exploration drives an append-only worklist to completion, bounded by
+- Logical exploration drives an dependency-aware worklist to completion, bounded by
   the built-in `kMaxExploreSteps` (20000 rule applications; exploration stops
   silently at the cap and keeps the best plan so far — visible only via
   `dump_memo`). `OptimizerOptions::search_step_budget` additionally caps rule
@@ -234,27 +291,22 @@ disabled and its basis recorded here. Counterexample tests live in
 | `topn_push_through_inner_join` | every left row matches exactly one right row; right uniqueness + left NOT NULL proves only ≤1 | **Disabled**: an unmatched left row inside the top-(limit+offset) prefix dropped rows the original plan keeps | `TopNPushThroughInnerJoinOnForeignKey` |
 | `topn_push_through_proven_one_to_one_join` | inner join, single col=col edge, TopN keys local to the pushed side, other-side keys unique + NOT NULL, **and** ≥1-match proof via declared FOREIGN KEY (only with a pushed-side NOT NULL proof: a NULL key matches nothing, so the FK certificate alone bounds matches at ≤1) or optimizer snapshot containment (`Memo::IsProvenOneToOne`); no WITH TIES | Gated: the ≥1-match half re-enables the TopN push family only under 1:1 proof (TODO.md item 1) | `TopNPushThroughProvenOneToOneJoin{WithForeignKey,WithSnapshotProof,SkipsWithoutProof,SkipsNonLocalKeys}`, `TopNPush{ThroughSnapshotProvenOneToOneJoin,SkippedWhenReferentialIntegrityFails}` |
 | `or_to_union` | single-relation Selection, exactly 2 stable disjuncts (no subquery/agg/window/volatile), not same-column equality (or_to_in territory) | Gated: UNION DISTINCT keeps the OR multiset under overlap and three-valued logic; branch tags content-addressed (TODO.md item 4a) | `OrToUnion{SplitsTwoBranchDisjunction,SkipsSameColumnEqualities,SkipsThreeDisjuncts}` |
-| `distinct_eager_over_join` | full-row DISTINCT directly over inner join (either side) or LEFT join (preserved side only), other-side equi keys unique | Gated: ≤1 match per row makes pre-join dedup multiplicity-preserving; no containment needed; pushed-join tags carry the predicate (TODO.md item 4b) | `DistinctEagerOverJoin{PushesDistinctBelowJoin,SkipsNonUniqueSide}`, `EagerAndLazyAggregationCoexistForCostChoice` (lazy coexistence) |
+| `distinct_eager_over_join` | full-row DISTINCT directly over inner join (either side) or LEFT join (preserved side only), other-side equi keys unique | Gated: ≤1 match per row makes pre-join dedup multiplicity-preserving; no containment needed; pushed-join tags carry the predicate (TODO.md item 4b) | `DistinctEagerOverJoin{PushesDistinctBelowJoin,SkipsNonUniqueSide}` |
 | `topn_push_through_union_all` | TopN (no WITH TIES, finite) over UnionAll; per-branch same-keys TopN cap not already present | Gated: branch top-(limit+offset) provably contains global candidates; parent TopN re-establishes output; branch tags carry the branch GroupId (TODO.md item 4c) | `TopNPushThroughUnionAll{CapsBranches,SkipsWithTies}` |
-| `dynamic_filter_pushdown_join` | derived probe group keeps the probe group's residual filter; no filter loss | Gated: probe filter carried onto the derived group, tag fingerprints the bloom key set | `DynamicFilterPushdownJoin` |
+| `dynamic_filter_pushdown_join` | derived probe group keeps the probe group's residual filter; no filter loss; the annotated keys are pinned by an `=` conjunct of this join and live in the single-relation probe group | Gated: probe filter carried onto the derived group, tag fingerprints the key set. The rule records ONLY which columns carry the join key (`Group::dynamic_filter_keys`) -- never a filter shape; the hash-join implementation rule turns that annotation into `ProductPlan::PreferDynamicFilter(build_left)` for an inner, non-NULL-safe, single INT64/DATE equi-join whose build side is materially smaller than the probe side, and the executor then publishes a sound `RuntimeFilterGroup` (exact set / min-max / Bloom) to the probe scan | `DynamicFilterPushdownJoin`, `DynamicFilterPushdownJoinAnnotatesTheProbeKeys`, `DynamicFilterPushdownJoinSkipsNonEqualityJoins`, `DynamicFilterPushdownJoinSkipsMultiRelationProbe`, `OptimizerTest.DynamicFilterMarkerFollowsTheAnnotatedProfitableShape`, `OptimizerTest.DynamicFilterMarkerEngagesOnAProbeHeavyShape` |
+| `semi_reduction_pushdown_semi_join` / `semi_reduction_pushdown_anti_join` | derived probe group keeps the probe group's residual filter; no filter loss; the annotated keys are pinned by an `=` conjunct of this semi/anti join and live in the probe group | Gated: probe filter carried onto the derived group, tag fingerprints the key set. The rule records ONLY which columns carry the probe-side join key (`Group::semi_reduction_probe_keys`) -- never how the build is shrunk. The hash-join implementation rule turns that annotation into `ProductPlan::PreferSemiReduction()` for a semi/anti equi-join (no residual, non-NULL-safe key) whose build side `SemiReductionIsProfitable` says the reduction would shrink; the executor then materializes the probe key domain first and cuts the build down to one row per distinct key inside it, falling back to the unrestricted intake when the domain outgrows its cap | `SemiReductionPushdownAnnotatesTheProbeKeys`, `SemiReductionPushdownSkipsNonEqualityJoins`, `SemiReductionPushdownAnnotatesEveryCompositeKey`, `HashSemiReductionSqlTest.*`, `HashSemiReductionExecutorTest.*`, `SemiReductionGateTest.*` |
+| `late_materialization_join` | inner `kJoin` only; no row-position requirement; right child is a filter-free base scan; at least one same-typed equi column on a signed INT64/DATE index prefix; payload columns survive the right projection; no NULL-safe key, ARRAY, retained-versioned index, subquery, or volatile expression | Gated (2026-09): unsupported shapes return no alternative and the existing hash/index/outer implementations keep ownership; a stale index read set falls back in the relational factory to a predicate join | `LateMaterializationPlanTest.RulePublishesLogicalPlanForWideSmallBuild`, `LateMaterializationPlanTest.RuleRejectsRowPositionOuterAndArrayShapes`, `LateMaterializationQueryTest.OuterJoinFallsBackAndNullKeysNeverMatch`, `LateMaterializationJoinTest.StaleIndexFallsBackToPredicateJoin` |
+| `outer_hash_join` | LEFT/RIGHT/FULL with an equality key; a non-equality ON residual is evaluated per candidate before match marking and NULL padding; a residual is never placed in a post-join Selection for an outer kind | Gated: residual-aware hash execution; NULL/UNKNOWN failures remain unmatched and preserve the outer side | `OptimizerTest.OuterHashResidualPadsWhenAllKeyMatchesFail`, `HashJoinOuterTest.NonRejectingResidualPadsEveryOuterKind` |
 | `outer_to_anti_join` | inner join, IS-NULL on a right column, no other right-column conjunct | Gated | `OuterToAntiJoinRequiresNullCheckOnAllRightColumns` |
-| `eager_aggregation_over_join` | join provably 1:N (non-multiplying) on the aggregated side | Gated: fires only with a uniqueness proof on the aggregated side; outer joins never qualify | `EagerAggregationOverJoinSkipsOuterJoin`, `EagerAggregationOverJoinOnUniqueKey` |
-| `aggregate_join_transpose` | join provably 1:N on a foreign key | Gated: fires only with a uniqueness proof on the pushed side | `AggregateJoinTransposeSkipsOuterJoin` |
 | `in_list_to_semi_join` | every OR branch is a col=const equality on one column (no branch dropped); group tag fingerprints all constants | Gated | `InListToSemiJoinRejectsMixedColumnOr`, `InListToSemiJoinRejectsUncollectableBranch` |
 | `eliminate_double_sort` | key expressions, direction and NULLS order all equal (collation is not modelled in the logical expression, so it cannot diverge) | Gated | `EliminateDoubleSortRequiresSameKeyExpressions`, `EliminateDoubleSortRequiresSameNullsFirst` |
-| `rank_row_number_to_topn` | window has no PARTITION BY and the Selection filters the window's own output column | Gated | `RankRowNumberToTopNSkipsPartitionedWindow`, `RankRowNumberToTopNSkipsNonWindowColumn` |
 | `no_op_window_elimination` bypasses | kWindow targets contain no window calls (branch 1); outer targets reference no `$win` outputs of the bypassed node and contain no raw calls (branch 2) | Gated: the comment promised "when outer expressions do not reference results" but the code never checked — bypassing a live `$win` silently dropped its computation (`compatible_windows_share_single_sort` regressed to `column $win0 not found` with ANALYZE) | `NoOpWindowElimination` (plain-target bypass preserved), `SqlEngineWindowRankingPlansThroughCascades` |
 | opaque recursive-CTE leaf (`LiftRecursiveCtes`) | single top-level FROM site; body references no mapped CTE except itself (worktable); unique output names; single-use counting excludes the body's own self-references | Gated: multiple sites would re-run the fixpoint per site instead of sharing it; sibling-scoped references keep map-scoped execution; a renamed alias with surviving CTE-qualified refs would orphan them | `SqlEngineRecursiveCtePlansOuterThroughCascades`, `SqlEngineMultiUseAndRecursiveCteStayCorrect` |
 | `unused_left_join_elimination` (statement-level, `TryEliminateUnusedOuterJoin`) | single LEFT/RIGHT edge (FULL excluded) with a single col=col equi-ON whose null-supplying-side column is declared UNIQUE/PK (each preserved row matches ≤1, so the join is the identity); nothing above the join (SELECT/ORDER/WHERE/QUALIFY, window partition/order keys included) names the dropped side | Gated: without the uniqueness proof duplicate matches would collapse (`OuterJoinSliceKeepsJoinWithoutUniquenessProof` pins 3 rows vs 2); an orphaned right reference has no sound placement so it blocks elimination | `OuterJoinSliceEliminatesUnusedUniqueRightSide`, `OuterJoinSliceEliminatesUnusedUniqueLeftSideForRight`, `OuterJoinSliceKeepsJoinWithoutUniquenessProof` |
 | derived group creation | tag must fingerprint the expression *meaning*, never a bare count | `TargetListFingerprint` used by all projection/aggregate/values derived groups | `DerivedGroupFingerprintSeparatesDifferentInLists` |
 | `setop_empty_simplification` | INTERSECT empties on ANY empty branch; EXCEPT only when its LEFT branch is empty (an earlier gate accepted any empty branch, collapsing non-empty `A EXCEPT empty-B` to `Empty`) | Gated (2026-09) | `CascadesTest.SetopEmptySimplification*` family |
-| `intersect_to_semijoin` / `except_to_antijoin` / `intersect_except_cost_based_lowering` | INTERSECT/EXCEPT are DISTINCT set operations: the semi/anti join keeps left-side multiplicity, so the join alternative is published through a logical Distinct wrapper; row equality uses IS NOT DISTINCT FROM so NULL rows compare equal exactly like set-op duplicate detection (plain `=` dropped NULL rows from INTERSECT and kept them in EXCEPT) | Gated: Distinct-wrapped (2026-09); null-safe equality (2026-09-16) | `IntersectToSemiJoinRewrite`, `ExceptToAntiJoinRewrite`, `IntersectExceptCostBasedLowering`, `IntersectExceptLoweringUsesNullSafeRowEquality` |
 | `filter_aggregate_pushdown` | scalar aggregation only (with GROUP BY, groups whose every row fails the predicate would survive as COUNT=0 phantoms); the predicate must be evaluation-count-safe (`SafeToReduceEvaluationCount` — no volatile functions or subqueries, which would be re-evaluated once per aggregate FILTER); a FILTER already present on an aggregate is conjoined, never overwritten | Gated (2026-09); volatile/subquery gate (2026-09-16) | `FilterAggregatePushdown`, `FilterAggregatePushdownRefusedForGroupedAggregation`, `FilterAggregatePushdownRefusedForVolatilePredicate` |
 | `eliminate_sort_under_unordered_consumer` | the lowered aggregation copies the full payload (grouping sets / partition / output schema — dropping them turned GROUP BY aggregates into scalar ones) and only fires when every aggregate is order-insensitive (count/sum/avg/min/max/logical/count_if/statistical family/bit family/approx_count_distinct; WITHIN GROUP, string_agg, array_agg, ANY_VALUE, percentile and sketch aggregates are excluded) | Gated: payload + order-sensitivity allowlist (2026-09-16) | `EliminateSortUnderAggregationKeepsGroupingSets`, `EliminateSortSkipsOrderSensitiveAggregate` |
-| `decorrelate_aggregate_apply` | Apply join_type is remapped to the OuterJoin encoding (0=Inner→kJoin, 1=LeftOuter→kOuterJoin(LEFT)); the raw value made LeftOuter produce a RIGHT join. Semi/Anti aggregate applies do not lower here and stay on the general apply path | Gated: join-type remap (2026-09-16) | `DecorrelateAggregateApplyRemapsLeftOuterJoinType` |
-| `grouping_sets_expansion` (aggregation branch) | exactly two grouping sets — the UNION-ALL decomposition covers only the first two; larger sets must not be rewritten | Gated (2026-09) | — |
-| `eager_aggregation_over_join` / `aggregate_join_transpose` (surviving-column gate) | every left-side column referenced by the join predicate must survive the pushed aggregate (grouping key or plain passthrough target); otherwise the re-join binds a column the aggregate no longer produces | Gated (2026-09) | `EagerAggregationOverJoinOnUniqueKey` |
-| `count_star_without_group_rewrite` | input group is a base-table scan (empty tag, kScan present): derived selection groups would lose their predicate to the ConstantTable COUNT | Gated (2026-09) | — |
 | `push_limit_through_left_join` | LIMIT without ORDER BY (any subset of the join output is acceptable); re-introduces the limit-through-join family ONLY under unordered semantics — must not be enabled once a required ordering can attach to a kLimit expression | Gated (recorded 2026-09) | — |
 | `Memo::AddExpression` | schema/arity/child-group/relation-set contract | Violations are `CHECK` aborts (fast-fail, no exceptions); rule bodies must probe with `Memo::ContainsRelation` / uniqueness checks instead of relying on throws. `ExploreGroup` skips a rule whose alternative is declined, and keeps a legacy `std::invalid_argument` containment for the remaining planning-path throws | memo contract tests in `cascades_test.cpp` |
 

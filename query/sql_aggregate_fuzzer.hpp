@@ -42,6 +42,7 @@ struct AggTrace {
 struct AggStats {
   int group_queries{0};
   int window_queries{0};
+  int primary_key_group_queries{0};
 };
 
 // Runs one seeded iteration; "" = all results matched the mirror.

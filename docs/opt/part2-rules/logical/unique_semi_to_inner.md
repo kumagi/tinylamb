@@ -90,7 +90,6 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `semijoin_to_inner_plus_distinct`: 右キーの一意性が証明できない場合に、DISTINCT を付加して内部結合化を行う補完 Rule です。一意性が証明できる場合は本 Rule の方が DISTINCT のコストがないため優位となります。
 - `semi_join_commutativity` / `semi_join_inner_join_reorder`: 半結合のまま順序を入れ替える代替 Rule 群です。
 
 ## 検証テスト

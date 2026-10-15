@@ -91,7 +91,8 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   Page page(41, PageType::kPaxPage);
   const Status store = page.body.pax_page.Store(chunk);
   if (store == Status::kSuccess) {
-    ASSIGN_OR_CRASH(DataChunk, restored, page.body.pax_page.Load());
+    ASSIGN_OR_CRASH(  // NOLINT(performance-unnecessary-copy-initialization)
+        DataChunk, restored, page.body.pax_page.Load());
     assert(restored.Size() == chunk.Size());
     for (size_t row = 0; row < chunk.Size(); ++row) {
       assert(restored.RowAt(row) == chunk.RowAt(row));

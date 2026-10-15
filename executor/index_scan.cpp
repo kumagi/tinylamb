@@ -55,7 +55,7 @@ TransactionManager::IndexReadGuard AcquireScanIndexReadGuard(
   return txn.AcquireIndexReadGuard(index.Root());
 }
 
-}
+}  // namespace
 
 IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const Value& begin, const Value& end, bool ascending,
@@ -151,13 +151,39 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
     }
     const RowPosition pointed_row = iter_.Position();
     const bool already_reserved = lock_rows_ && txn_.HasWriteSet(pointed_row);
+    txn_.DebugSetPhase("indexscan-lock");
     const bool locked = !lock_rows_ || (wait_for_write_intent_
                                             ? txn_.AddWriteSet(pointed_row)
                                             : txn_.TryAddWriteSet(pointed_row));
+    txn_.DebugSetPhase(nullptr);
     if (!locked) {
+      // The bare "timed out" text predated the distinct failure reasons and
+      // misattributed deadlock-victim wounds (the common case) to the 5s
+      // wait limit, sending postmortems down the wrong path.  This value is
+      // also the conservative default for any failure kind added later.
+      const char* reason = "conflicting writer holds the write intent";
+      using Failure = Transaction::IntentWaitFailure;
+      switch (txn_.LastIntentWaitFailure()) {
+        case Failure::kWounded:
+          reason = "aborted as a deadlock/wound victim";
+          break;
+        case Failure::kHolderAborting:
+          reason = "intent holder is aborting (rolled back)";
+          break;
+        case Failure::kTimeout:
+          reason = "wait timed out (latch-cycle escape hatch)";
+          break;
+        case Failure::kFailStopped:
+          reason = "engine is fail-stopped";
+          break;
+        case Failure::kConflict:
+        case Failure::kNone:
+          break;
+      }
       return FailWith(StatusError(StatusCode::kConflicts,
-                                  "write intent wait timed out on table " +
-                                      std::string(table_.GetSchema().Name())));
+                                  "write intent unavailable on table " +
+                                      std::string(table_.GetSchema().Name()) +
+                                      ": " + reason));
     }
     if (cond_ || lock_rows_) {
       *dst = *iter_;

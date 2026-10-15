@@ -84,7 +84,7 @@ graph TD
 
 - `semi_join_commutativity`: 半結合同士の交換可能性を探索する Rule であり、同様に参照列の局所性検査と派生グループ生成を用います。
 - `push_semi_join_through_inner_join`: `(A JOIN B) SEMI JOIN C` を `(A SEMI JOIN C) JOIN B` などへ組み替える逆方向の移動を担います。本 Rule と組み合わさることで、半結合演算子のプラン木上下移動が対称的に探索されます。
-- `in_list_to_semi_join` / `apply_to_join`: `IN` サブクエリ等から半結合を導出する Rule であり、導出された半結合が内側結合と隣接することで本 Rule の適用契機となります。
+
 
 ## 検証テスト
 

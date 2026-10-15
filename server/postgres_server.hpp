@@ -9,7 +9,13 @@
 #include <memory>
 #include <string>
 
+#include "common/constants.hpp"
+
 namespace tinylamb {
+
+class QueryResult;
+
+Status DrainCommandResult(QueryResult& result, int64_t* affected_rows);
 
 struct PostgresServerOptions {
   std::string listen_address{"127.0.0.1"};

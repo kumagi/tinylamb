@@ -99,7 +99,7 @@ Selection 演算子の述語は AntiJoin の意味論へ完全に吸収される
 ## 関連 Rule との相互作用
 
 - `outer_to_inner_join_on_null_rejecting_filter`: NULL 拒否述語が存在する場合に内部結合へ変換する相補的 Rule です。本 Rule は「NULL 許容行のみを残す」という逆方向の条件を扱います。
-- `mark_join_to_filter`: 相関サブクエリ由来の MarkJoin を semi/anti join へ展開する処理と目的を共有します。
+
 - `join_empty_simplification`: 反結合の右側が空関係である場合の恒等単純化（$L \triangleright \emptyset \equiv L$）を後段で実行します。
 
 ## 検証テスト

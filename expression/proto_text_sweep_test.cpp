@@ -123,13 +123,17 @@ TEST(ProtoTextPlausibilityTest, LooksLikeProtoTextClassifiesBodies) {
 TEST(ProtoTextNormalizeTest, CanonicalizesSpacingAndOrdersExtensions) {
   const auto normalized = NormalizeProtoText("b: 2 [x.y]: 1 a: 0");
   ASSERT_TRUE(normalized.has_value());
-  EXPECT_EQ(normalized.value(), "b: 2 a: 0 [x.y]: 1");  // NOLINT(bugprone-unchecked-optional-access)
+  assert(normalized.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(*normalized, "b: 2 a: 0 [x.y]: 1");
 
   // Normalization preserves field order inside message bodies (only
   // extension entries move after plain fields); it re-nests recursively.
   const auto nested = NormalizeProtoText("m { b: 2 a: 1 }");
   ASSERT_TRUE(nested.has_value());
-  EXPECT_EQ(nested.value(), "m { b: 2 a: 1 }");  // NOLINT(bugprone-unchecked-optional-access)
+  assert(nested.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(*nested, "m { b: 2 a: 1 }");
 
   const auto empty = NormalizeProtoText("   ");
   ASSERT_TRUE(empty.has_value());
@@ -220,28 +224,38 @@ TEST(ProtoTextSetFieldTest, UpdatesCreatesAndClears) {
   auto updated = TryProtoTextSetField("a: 1 b: 2", {"b"}, Value(int64_t{9}), "")
                      .MoveValue();
   ASSERT_TRUE(updated.has_value());
-  EXPECT_EQ(updated.value(), "a: 1 b: 9");  // NOLINT(bugprone-unchecked-optional-access)
+  assert(updated.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(*updated, "a: 1 b: 9");
 
   // Append a new field at the end.
   auto appended =
       TryProtoTextSetField("a: 1", {"c"}, Value(int64_t{3}), "").MoveValue();
   ASSERT_TRUE(appended.has_value());
-  EXPECT_EQ(appended.value(), "a: 1 c: 3");  // NOLINT(bugprone-unchecked-optional-access)
+  assert(appended.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(*appended, "a: 1 c: 3");
 
   // A NULL clears the field.
   auto cleared =
       TryProtoTextSetField("a: 1 b: 2", {"a"}, Value(), "").MoveValue();
   ASSERT_TRUE(cleared.has_value());
-  EXPECT_EQ(cleared.value(), "b: 2");  // NOLINT(bugprone-unchecked-optional-access)
+  assert(cleared.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(*cleared, "b: 2");
 
   // Dotted paths reach into nested messages.
   auto nested = TryProtoTextSetField("m { inner: 1 }", {"m", "inner"},
                                      Value(int64_t{5}), "")
                     .MoveValue();
   ASSERT_TRUE(nested.has_value());
-  EXPECT_NE(nested.value().find("inner: 5"), std::string::npos);  // NOLINT(bugprone-unchecked-optional-access)
+  assert(nested.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_NE(nested->find("inner: 5"), std::string::npos);
   Value out;
-  ASSERT_TRUE(TryProtoTextExtractField(*nested, "m", &out).MoveValue());  // NOLINT(bugprone-unchecked-optional-access)
+  assert(nested.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  ASSERT_TRUE(TryProtoTextExtractField(*nested, "m", &out).MoveValue());
   EXPECT_NE(out.AsString().find("inner: 5"), std::string::npos);
 
   // Empty path is a no-op.
@@ -254,7 +268,9 @@ TEST(ProtoTextSetFieldTest, OuterBracesAreOptional) {
   auto updated = TryProtoTextSetField("{ a: 1 }", {"a"}, Value(int64_t{4}), "")
                      .MoveValue();
   ASSERT_TRUE(updated.has_value());
-  EXPECT_EQ(updated.value(), "a: 4");  // NOLINT(bugprone-unchecked-optional-access)
+  assert(updated.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(*updated, "a: 4");
 }
 
 }  // namespace tinylamb

@@ -66,12 +66,20 @@ bool AnalyzeScan::Next(Row* dst, RowPosition* rp) {
     while (child_->Next(&r, &pos)) {
       rows.push_back(r);
     }
+    // Statistics from a scan that failed mid-drain would silently describe
+    // only the rows read so far — and then be persisted over the catalog.
+    if (child_->GetStatus() != Status::kSuccess) {
+      return FailWith(child_->GetStatus());
+    }
   } else if (table_ != nullptr) {
     FullScan scan(ctx_->txn_, *table_);
     Row r;
     RowPosition pos;
     while (scan.Next(&r, &pos)) {
       rows.push_back(r);
+    }
+    if (scan.GetStatus() != Status::kSuccess) {
+      return FailWith(scan.GetStatus());
     }
   }
 

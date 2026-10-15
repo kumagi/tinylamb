@@ -22,6 +22,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <type_traits>
 
 #include "common/constants.hpp"
@@ -47,6 +48,12 @@ class Page {
   [[nodiscard]] lsn_t RecoveryLSN() const { return recovery_lsn; }
   void SetPageLSN(lsn_t lsn) { page_lsn = lsn; }
   void SetRecLSN(lsn_t lsn) { recovery_lsn = std::min(lsn, recovery_lsn); }
+  // Marks the on-disk image as current through page_lsn: after a successful
+  // write-back the file reflects every record up to PageLSN(), so redo never
+  // needs anything at or below it. Without this the recLSN of a hot page
+  // would ratchet down forever and pin old WAL segments against recycling.
+  // Call only while no mutator can touch the page (flush paths).
+  void ResetRecLSN() { recovery_lsn = std::numeric_limits<lsn_t>::max(); }
 
   // Meta page manipulations.
   Status DestroyPage(Transaction& txn, Page* target);
@@ -64,6 +71,11 @@ class Page {
   Status Update(Transaction& txn, slot_t slot, std::string_view row);
 
   Status Delete(Transaction& txn, slot_t pos);
+
+  Status SetNextPage(Transaction& txn, page_id_t next);
+  Status SetPrevPage(Transaction& txn, page_id_t prev);
+  void SetNextPageImpl(page_id_t next);
+  void SetPrevPageImpl(page_id_t prev);
 
   [[nodiscard]] slot_t RowCount() const;
 
@@ -94,7 +106,7 @@ class Page {
 
   void SetHighFenceImpl(const IndexKey& key);
 
-  void SetFosterImpl(const FosterPair& foster);
+  Status SetFosterImpl(const FosterPair& foster);
 
   // Leaf page manipulations.
   Status InsertLeaf(Transaction& txn, std::string_view key,
@@ -120,25 +132,25 @@ class Page {
 
   Status SetLowestValue(Transaction& txn, page_id_t v);
 
-  void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
-                 std::string* middle);
+  Status SplitInto(Transaction& txn, std::string_view new_key, Page* right,
+                   std::string* middle);
 
   Status PageTypeChange(Transaction& txn, PageType new_type);
 
   // Internal methods exposed for recovery.
-  void InsertImpl(slot_t slot, std::string_view redo);
+  Status InsertImpl(slot_t slot, std::string_view redo);
 
   void UpdateImpl(slot_t slot, std::string_view redo);
 
   void DeleteImpl(slot_t slot);
 
-  void InsertImpl(std::string_view key, std::string_view value);
+  Status InsertImpl(std::string_view key, std::string_view value);
 
   void UpdateImpl(std::string_view key, std::string_view value);
 
   void DeleteImpl(std::string_view key);
 
-  void InsertBranchImpl(std::string_view key, page_id_t pid);
+  Status InsertBranchImpl(std::string_view key, page_id_t pid);
 
   void UpdateBranchImpl(std::string_view key, page_id_t pid);
 
@@ -150,16 +162,39 @@ class Page {
 
   void SetChecksum() const;
 
+  // Page has no spare bytes (static_assert sizeof(Page) == kPageSize), and the
+  // stored CRC is 32 bits wide, so the "repaired in memory" claim rides in the
+  // unused high half of `checksum` instead of a new member.
+  static constexpr uint64_t kRepairedInMemoryBit = uint64_t{1} << 63;
+  static constexpr uint64_t kChecksumDiskMask = ~kRepairedInMemoryBit;
+
+  // Marks the page as repaired in memory (recovery redo/undo, the free-list
+  // relink). The stored CRC then still describes the PRE-repair disk image, so
+  // IsValid() would report a page recovery just fixed as torn -- and a false
+  // "torn" verdict is expensive: PageManager::GetPage hands back an empty ref
+  // and BPlusTree::Open silently bootstraps a fresh, empty tree, losing the
+  // committed catalog. In-memory only (EncodeDisk masks it away);
+  // SetChecksum() clears it, because the on-disk image then matches the body
+  // again.
+  void MarkRepairedInMemory() const { checksum |= kRepairedInMemoryBit; }
+
   [[nodiscard]] bool IsValid() const;
 
   // True when the cached checksum matches the current page image, i.e. the
-  // in-memory content equals what the last WriteBack persisted.
+  // in-memory content equals what the last WriteBack persisted. This is the
+  // DIRTY predicate: a repaired page deliberately still reports false so the
+  // repair is written back instead of being lost with the buffer pool.
   [[nodiscard]] bool ChecksumMatches() const;
 
   // Version-1 disk codec. The in-memory Page remains a directly addressable
   // object, while its fixed header is emitted/accepted in big-endian order.
   void EncodeDisk(char* destination) const;
   Status DecodeDisk(const char* source);
+  // Single-pread read path: the page image already sits in this object's own
+  // bytes (the body was never copied out), so the big-endian header scalars
+  // are fixed up in place.  Same verdicts and resulting member states as
+  // DecodeDisk over that image.
+  Status DecodeDiskInPlace();
 
   void* operator new(size_t /*byte size, always kPageSize*/);
 
@@ -178,12 +213,16 @@ class Page {
   // The ID for this page. This ID is also an offset of this page in file.
   page_id_t page_id = 0;
 
-  // An LSN of the latest log which modified this page.
+  // End LSN of the latest WAL record whose effect is reflected on this page.
   lsn_t page_lsn = 0;
 
-  // An LSN of manipulation log which first make this page dirty.
+  // Start LSN of the earliest WAL record that made this page dirty.
   uint64_t recovery_lsn = 0;
   enum PageType type = PageType::kUnknown;
+  // Low 32 bits: the CRC32C of the image as loaded/written. High bits: only
+  // kRepairedInMemoryBit is used, and only in memory (see
+  // MarkRepairedInMemory); the disk header always carries the bare CRC, so the
+  // page format is unaffected.
   mutable uint64_t checksum = 0;
 
   // RowPage contains an intentional zero-sized tail array. Keep this union's

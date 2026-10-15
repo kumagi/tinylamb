@@ -1295,6 +1295,7 @@ TEST_F(BPlusTreeTest, DeleteLiftUpLeafWithoutFoster) {
   {
     auto txn = tm_->Begin();
     ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
+    ASSERT_SUCCESS(txn.PreCommit());
   }
 
   // Assert -- the remaining leaf is directly reachable
@@ -1618,6 +1619,7 @@ TEST_F(BPlusTreeTest, SetFosterRecursivelyWalksFosterChain) {
   {
     auto txn = tm_->Begin();
     ASSERT_SUCCESS(bpt_->Delete(txn, "c"));
+    ASSERT_SUCCESS(txn.PreCommit());
   }
 
   // Assert -- all surviving keys read back and "c" is gone

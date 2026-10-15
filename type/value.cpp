@@ -40,6 +40,7 @@
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
 #include "common/serdes.hpp"
+#include "type/collation.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
 #include "type/value_type.hpp"
@@ -153,6 +154,26 @@ std::string ToString(AggregationType type) {
       return "PERCENTILE_CONT";
     case AggregationType::kApproxCountDistinct:
       return "APPROX_COUNT_DISTINCT";
+    case AggregationType::kMode:
+      return "MODE";
+    case AggregationType::kRegrSlope:
+      return "REGR_SLOPE";
+    case AggregationType::kRegrIntercept:
+      return "REGR_INTERCEPT";
+    case AggregationType::kRegrCount:
+      return "REGR_COUNT";
+    case AggregationType::kRegrR2:
+      return "REGR_R2";
+    case AggregationType::kRegrAvgX:
+      return "REGR_AVGX";
+    case AggregationType::kRegrAvgY:
+      return "REGR_AVGY";
+    case AggregationType::kRegrSxx:
+      return "REGR_SXX";
+    case AggregationType::kRegrSyy:
+      return "REGR_SYY";
+    case AggregationType::kRegrSxy:
+      return "REGR_SXY";
     default:
       return "UNKNOWN";
   }
@@ -167,6 +188,35 @@ bool IsStatisticalAggregate(AggregationType type) {
     case AggregationType::kCovarSamp:
     case AggregationType::kCovarPop:
     case AggregationType::kCorr:
+    case AggregationType::kRegrSlope:
+    case AggregationType::kRegrIntercept:
+    case AggregationType::kRegrCount:
+    case AggregationType::kRegrR2:
+    case AggregationType::kRegrAvgX:
+    case AggregationType::kRegrAvgY:
+    case AggregationType::kRegrSxx:
+    case AggregationType::kRegrSyy:
+    case AggregationType::kRegrSxy:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsTwoInputStatAggregate(AggregationType type) {
+  switch (type) {
+    case AggregationType::kCovarSamp:
+    case AggregationType::kCovarPop:
+    case AggregationType::kCorr:
+    case AggregationType::kRegrSlope:
+    case AggregationType::kRegrIntercept:
+    case AggregationType::kRegrCount:
+    case AggregationType::kRegrR2:
+    case AggregationType::kRegrAvgX:
+    case AggregationType::kRegrAvgY:
+    case AggregationType::kRegrSxx:
+    case AggregationType::kRegrSyy:
+    case AggregationType::kRegrSxy:
       return true;
     default:
       return false;
@@ -265,8 +315,15 @@ const std::string& Value::ArrayElementSqlType() const {
   return array_->element_sql_type;
 }
 
-Value::Value(const Value& o)
-    : value(o.value), type(o.type), array_(o.array_), collation_(o.collation_) {
+// The scalar halves of the copy/move quartet are always_inline in value.hpp;
+// these are the cold VarChar/Array halves (kept out of line so every hot call
+// site is a straight-line scalar move).  VarChar keeps the materialize-on-move
+// contract: a view into a page buffer must not outlive the pin, so it lands
+// in owned_data here.
+
+void Value::InitCopySlow(const Value& o) {
+  array_ = o.array_;
+  collation_ = o.collation_;
   if (type == ValueType::kVarChar) {
     if (!o.owned_data.empty()) {
       owned_data = o.owned_data;
@@ -277,31 +334,27 @@ Value::Value(const Value& o)
   }
 }
 
-Value::Value(Value&& o) noexcept
-    : value(o.value),
-      type(o.type),
-      owned_data(std::move(o.owned_data)),
-      array_(std::move(o.array_)),
-      collation_(o.collation_) {
+void Value::InitMoveSlow(Value& o) noexcept {
+  collation_ = o.collation_;
   if (type == ValueType::kVarChar) {
+    owned_data = std::move(o.owned_data);
     if (owned_data.empty() && !o.value.varchar_value.empty()) {
       owned_data.assign(o.value.varchar_value);
     }
     value.varchar_value = owned_data;
+    array_ = std::move(o.array_);
+  } else {
+    array_ = std::move(o.array_);
   }
   o.type = ValueType::kNull;
 }
 
-Value& Value::operator=(const Value& rhs) {
-  if (this == &rhs) {
-    return *this;
-  }
+Value& Value::CopyAssignSlow(const Value& rhs) {
   type = rhs.type;
   value = rhs.value;
-  owned_data.clear();
   array_ = rhs.array_;
   collation_ = rhs.collation_;
-  if (type == ValueType::kVarChar) {
+  if (rhs.type == ValueType::kVarChar) {
     if (!rhs.owned_data.empty()) {
       owned_data = rhs.owned_data;
     } else {
@@ -312,20 +365,20 @@ Value& Value::operator=(const Value& rhs) {
   return *this;
 }
 
-Value& Value::operator=(Value&& o) noexcept {
-  if (this == &o) {
-    return *this;
-  }
-  owned_data = std::move(o.owned_data);
-  array_ = std::move(o.array_);
+Value& Value::MoveAssignSlow(Value& o) noexcept {
   type = o.type;
   value = o.value;
   collation_ = o.collation_;
-  if (type == ValueType::kVarChar) {
+  if (o.type == ValueType::kVarChar) {
+    owned_data = std::move(o.owned_data);
     if (owned_data.empty() && !o.value.varchar_value.empty()) {
       owned_data.assign(o.value.varchar_value);
     }
     value.varchar_value = owned_data;
+    array_.reset();
+  } else {
+    array_ = std::move(o.array_);
+    owned_data.clear();
   }
   o.type = ValueType::kNull;
   return *this;
@@ -434,12 +487,14 @@ size_t Value::Serialize(char* dst) const {
   return 0;
 }
 
-StatusOr<size_t> Value::TryDeserialize(const char* src, ValueType as_type) {
+size_t Value::DeserializeInto(const char* src, ValueType as_type,
+                              Status* out_status) {
   type = as_type;
   switch (as_type) {
     case ValueType::kNull:
-      return StatusError(StatusCode::kInvalidArgument,
-                         "Cannot parse without type.");
+      *out_status = StatusError(StatusCode::kInvalidArgument,
+                                "Cannot parse without type.");
+      return 0;
     case ValueType::kInt64:
     case ValueType::kDate:
       return DeserializeInteger(src, &value.int_value);
@@ -468,11 +523,13 @@ StatusOr<size_t> Value::TryDeserialize(const char* src, ValueType as_type) {
           continue;
         }
         const auto elem_type = static_cast<ValueType>(*cursor++);
-        Value element;
-        ASSIGN_OR_RETURN(size_t, consumed,
-                         element.TryDeserialize(cursor, elem_type));
+        Value& element = elements.emplace_back();
+        const size_t consumed =
+            element.DeserializeInto(cursor, elem_type, out_status);
+        if (*out_status != Status::kSuccess) {
+          return 0;
+        }
         cursor += consumed;
-        elements.push_back(std::move(element));
       }
       array_ = std::make_shared<ArrayPayload>();
       array_->element_sql_type = std::string(sql_type);
@@ -480,14 +537,26 @@ StatusOr<size_t> Value::TryDeserialize(const char* src, ValueType as_type) {
       return static_cast<size_t>(cursor - src);
     }
   }
-  return StatusError(StatusCode::kCorrupt, "undefined type");
+  *out_status = StatusError(StatusCode::kCorrupt, "undefined type");
+  return 0;
 }
 
-StatusOr<size_t> Value::TrySkipSerialized(const char* src, ValueType as_type) {
+StatusOr<size_t> Value::TryDeserialize(const char* src, ValueType as_type) {
+  Status status = Status::kSuccess;
+  const size_t consumed = DeserializeInto(src, as_type, &status);
+  if (status != Status::kSuccess) {
+    return status;
+  }
+  return consumed;
+}
+
+size_t Value::SkipSerializedInto(const char* src, ValueType as_type,
+                                 Status* out_status) {
   switch (as_type) {
     case ValueType::kNull:
-      return StatusError(StatusCode::kInvalidArgument,
-                         "Cannot skip without type.");
+      *out_status = StatusError(StatusCode::kInvalidArgument,
+                                "Cannot skip without type.");
+      return 0;
     case ValueType::kInt64:
     case ValueType::kDate:
       return sizeof(int64_t);
@@ -510,14 +579,27 @@ StatusOr<size_t> Value::TrySkipSerialized(const char* src, ValueType as_type) {
           continue;
         }
         const auto elem_type = static_cast<ValueType>(*cursor++);
-        ASSIGN_OR_RETURN(size_t, consumed,
-                         TrySkipSerialized(cursor, elem_type));
+        const size_t consumed =
+            SkipSerializedInto(cursor, elem_type, out_status);
+        if (*out_status != Status::kSuccess) {
+          return 0;
+        }
         cursor += consumed;
       }
       return static_cast<size_t>(cursor - src);
     }
   }
-  return StatusError(StatusCode::kCorrupt, "undefined type");
+  *out_status = StatusError(StatusCode::kCorrupt, "undefined type");
+  return 0;
+}
+
+StatusOr<size_t> Value::TrySkipSerialized(const char* src, ValueType as_type) {
+  Status status = Status::kSuccess;
+  const size_t skipped = SkipSerializedInto(src, as_type, &status);
+  if (status != Status::kSuccess) {
+    return status;
+  }
+  return skipped;
 }
 
 std::string FormatDoubleShortest(double value) {
@@ -595,11 +677,16 @@ bool LooksLikeIntervalText(std::string_view s) {
   if (sp == std::string_view::npos) {
     return false;
   }
-  const size_t hy = s.find('-');
-  if (hy == std::string_view::npos || hy > sp) {
-    return false;
+  size_t first_hyphen = std::string_view::npos;
+  for (size_t i = 0; i < sp; ++i) {
+    if (s[i] == '-') {
+      if (first_hyphen != std::string_view::npos) {
+        return false;  // a second hyphen before the space: not interval text
+      }
+      first_hyphen = i;
+    }
   }
-  return s.substr(0, sp).find('-') == s.substr(0, sp).rfind('-');
+  return first_hyphen != std::string_view::npos;
 }
 
 std::optional<IntervalValue> ParseAsInterval(std::string_view s) {
@@ -612,7 +699,7 @@ std::optional<IntervalValue> ParseAsInterval(std::string_view s) {
 }
 }  // namespace
 
-bool Value::operator==(const Value& rhs) const {
+bool Value::EqualsSlow(const Value& rhs) const {
   if (type != rhs.type) {
     return false;
   }
@@ -633,6 +720,12 @@ bool Value::operator==(const Value& rhs) const {
       std::string_view sv2 = rhs.value.varchar_value;
       if (sv1 == sv2) {
         return true;
+      }
+      // Interval equivalence needs interval-shaped text on both sides, and
+      // every interval rendering embeds a space; a space-free side settles
+      // the comparison before the interval parser is touched.
+      if (!ViewContainsSpace(sv1) || !ViewContainsSpace(sv2)) {
+        return false;
       }
       if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
         const auto iv1 = ParseAsInterval(sv1);
@@ -976,6 +1069,10 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
   return StatusError(StatusCode::kCorrupt, "broken data");
 }
 
+bool Value::LessSlow(const Value& rhs) const {
+  return ExcShimUnwrap(TryLess(rhs), "Value::operator<");
+}
+
 StatusOr<bool> Value::TryLess(const Value& rhs) const {
   if (type != rhs.type) {
     return StatusError(StatusCode::kInvalidArgument,
@@ -1010,6 +1107,16 @@ StatusOr<bool> Value::TryLess(const Value& rhs) const {
     case ValueType::kVarChar: {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
+      const int cmp = sv1.compare(sv2);
+      if (cmp == 0) {
+        return false;
+      }
+      // Interval equivalence can only reorder interval-shaped texts and
+      // every interval rendering embeds a space; a space-free side makes
+      // the byte order final without touching the interval parser.
+      if (!ViewContainsSpace(sv1) || !ViewContainsSpace(sv2)) {
+        return cmp < 0;
+      }
       if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
         const auto iv1 = ParseAsInterval(sv1);
         const auto iv2 = ParseAsInterval(sv2);
@@ -1017,12 +1124,26 @@ StatusOr<bool> Value::TryLess(const Value& rhs) const {
           return *iv1 < *iv2;
         }
       }
-      return value.varchar_value < rhs.value.varchar_value;
+      return cmp < 0;
     }
     case ValueType::kDouble:
       return value.double_value < rhs.value.double_value;
-    case ValueType::kArray:
-      return ArrayElements() < rhs.ArrayElements();
+    case ValueType::kArray: {
+      // Lexicographic compare through the StatusOr path: std::vector::operator<
+      // would call the throwing Value::operator< (ExcShimUnwrap) and let a C++
+      // exception escape the Try* contract on incomparable elements (NULL or
+      // mixed element types).
+      const auto& lhs_elements = ArrayElements();
+      const auto& rhs_elements = rhs.ArrayElements();
+      const size_t common = std::min(lhs_elements.size(), rhs_elements.size());
+      for (size_t i = 0; i < common; ++i) {
+        if (lhs_elements[i] == rhs_elements[i]) {
+          continue;
+        }
+        return lhs_elements[i].TryLess(rhs_elements[i]);
+      }
+      return lhs_elements.size() < rhs_elements.size();
+    }
   }
   return StatusError(StatusCode::kInvalidArgument, "undefined type");
 }
@@ -1061,6 +1182,16 @@ StatusOr<bool> Value::TryGreater(const Value& rhs) const {
     case ValueType::kVarChar: {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
+      const int cmp = sv2.compare(sv1);
+      if (cmp == 0) {
+        return false;
+      }
+      // Interval equivalence can only reorder interval-shaped texts and
+      // every interval rendering embeds a space; a space-free side makes
+      // the byte order final without touching the interval parser.
+      if (!ViewContainsSpace(sv1) || !ViewContainsSpace(sv2)) {
+        return cmp < 0;
+      }
       if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
         const auto iv1 = ParseAsInterval(sv1);
         const auto iv2 = ParseAsInterval(sv2);
@@ -1068,12 +1199,22 @@ StatusOr<bool> Value::TryGreater(const Value& rhs) const {
           return *iv1 > *iv2;
         }
       }
-      return value.varchar_value > rhs.value.varchar_value;
+      return cmp < 0;
     }
     case ValueType::kDouble:
       return value.double_value > rhs.value.double_value;
-    case ValueType::kArray:
-      return ArrayElements() > rhs.ArrayElements();
+    case ValueType::kArray: {
+      const auto& lhs_elements = ArrayElements();
+      const auto& rhs_elements = rhs.ArrayElements();
+      const size_t common = std::min(lhs_elements.size(), rhs_elements.size());
+      for (size_t i = 0; i < common; ++i) {
+        if (lhs_elements[i] == rhs_elements[i]) {
+          continue;
+        }
+        return lhs_elements[i].TryGreater(rhs_elements[i]);
+      }
+      return lhs_elements.size() > rhs_elements.size();
+    }
   }
   return StatusError(StatusCode::kInvalidArgument, "undefined type");
 }
@@ -1320,37 +1461,13 @@ int CompareForOrderBy(const Value& a, const Value& b) {
       }
       return x < y ? -1 : (y < x ? 1 : 0);
     }
-    case ValueType::kVarChar: {
-      // ENUM values currently share the compact VARCHAR representation.  The
-      // compliance catalog uses this fixed TestEnum ordering, which differs
-      // from lexical ordering (NEGATIVE precedes the numeric members).
-      auto enum_rank = [](std::string_view value) -> int {
-        if (value == "TESTENUMNEGATIVE") {
-          return 0;
-        }
-        if (value == "TESTENUM0") {
-          return 1;
-        }
-        if (value == "TESTENUM1") {
-          return 2;
-        }
-        if (value == "TESTENUM2") {
-          return 3;
-        }
-        if (value == "TESTENUM2147483647") {
-          return 4;
-        }
-        return -1;
-      };
-      const int ar = enum_rank(a.value.varchar_value);
-      const int br = enum_rank(b.value.varchar_value);
-      if (ar >= 0 && br >= 0 && ar != br) {
-        return ar < br ? -1 : 1;
-      }
-      return a.value.varchar_value < b.value.varchar_value
-                 ? -1
-                 : (b.value.varchar_value < a.value.varchar_value ? 1 : 0);
-    }
+    case ValueType::kVarChar:
+      // Binary (engine default) VARCHAR order. The case-insensitive variant
+      // and the shared ENUM ranking live in type/collation.hpp so ORDER BY,
+      // filtering and grouping cannot disagree about the ordering.
+      return CompareVarCharForOrderBy(a.value.varchar_value,
+                                      b.value.varchar_value,
+                                      /*case_insensitive=*/false);
     case ValueType::kArray: {
       const auto& xs = a.ArrayElements();
       const auto& ys = b.ArrayElements();

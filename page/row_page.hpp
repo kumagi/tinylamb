@@ -71,7 +71,15 @@ class RowPage {
   Status Update(page_id_t page_id, Transaction& txn, slot_t slot,
                 std::string_view record);
 
+  StatusOr<lsn_t> RestorePhysicalUpdate(page_id_t page_id, Transaction& txn,
+                                        slot_t slot, std::string_view record);
+
   Status Delete(page_id_t page_id, Transaction& txn, slot_t slot);
+
+  Status SetNextPage(page_id_t page_id, Transaction& txn, page_id_t next);
+  Status SetPrevPage(page_id_t page_id, Transaction& txn, page_id_t prev);
+  void SetNextPageImpl(page_id_t next);
+  void SetPrevPageImpl(page_id_t prev);
 
   [[nodiscard]] slot_t RowCount() const;
   [[nodiscard]] slot_t RowMax() const { return row_max_; }
@@ -85,6 +93,12 @@ class RowPage {
   friend class std::hash<RowPage>;
 
   [[nodiscard]] std::string_view GetRow(slot_t slot) const {
+    // Holes read as empty even though DeleteRow keeps the row size on the
+    // slot for the reservation accounting (see RowPage::Insert): the bytes
+    // behind offset 0 are dead until the slot is reused.
+    if (rows_[slot].offset == 0) {
+      return {};
+    }
     return {Payload() + rows_[slot].offset,
             static_cast<size_t>(rows_[slot].size)};
   }

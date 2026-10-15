@@ -58,6 +58,41 @@ ColumnVector::ColumnVector(ValueType type, size_t capacity) : type_(type) {
   Reserve(capacity);
 }
 
+void ColumnVector::ObserveSourceCollation(const ColumnVector& source) {
+  if (mixed_collation_) {
+    return;
+  }
+  const Collation observed = source.ColumnCollation();
+  if (collation_ == Collation::kNone && size_ == 0) {
+    collation_ = observed;
+    return;
+  }
+  if (observed != collation_) {
+    mixed_collation_ = true;
+    collation_ = Collation::kNone;
+  }
+}
+
+void ColumnVector::ObserveCollation(const Value& value) {
+  // VARCHAR only: for every other type Value's tag is the unsigned marker,
+  // which `unsigned_` already tracks, and overwriting it would flip the
+  // integer signedness.
+  if (value.IsNull() || type_ != ValueType::kVarChar || mixed_collation_) {
+    return;
+  }
+  const Collation observed = CollationOf(value);
+  if (collation_ == Collation::kNone && size_ == 0) {
+    collation_ = observed;
+    return;
+  }
+  if (observed != collation_) {
+    // Mixed collators in one column: fall back to the engine default instead
+    // of folding part of the batch.
+    mixed_collation_ = true;
+    collation_ = Collation::kNone;
+  }
+}
+
 void ColumnVector::Append(const Value& value) {
   const bool is_null = value.IsNull();
   if (!is_null && type_ == ValueType::kNull) {
@@ -73,6 +108,7 @@ void ColumnVector::Append(const Value& value) {
   if (is_null) {
     AppendDefault();
   } else {
+    ObserveCollation(value);
     switch (type_) {
       case ValueType::kInt64:
       case ValueType::kDate:
@@ -109,6 +145,7 @@ void ColumnVector::Append(Value&& value) {
   if (is_null) {
     AppendDefault();
   } else {
+    ObserveCollation(value);
     switch (type_) {
       case ValueType::kInt64:
       case ValueType::kDate:
@@ -147,6 +184,9 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
   if (is_null) {
     AppendDefault();
   } else {
+    if (source.type_ == ValueType::kVarChar) {
+      ObserveSourceCollation(source);
+    }
     switch (type_) {
       case ValueType::kInt64:
       case ValueType::kDate:
@@ -168,9 +208,90 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
   ++size_;
 }
 
+void ColumnVector::AppendRange(const ColumnVector& source) {
+  if (source.size_ == 0 || this == &source) {
+    return;
+  }
+  if (type_ == ValueType::kNull && source.type_ != ValueType::kNull) {
+    type_ = source.type_;
+    unsigned_ = source.unsigned_;
+    MaterializeInferredStorage();
+  } else if (source.type_ != ValueType::kNull && type_ != source.type_) {
+    CHECK_MSG(false, "column vector type mismatch");
+  }
+  if (source.type_ == ValueType::kVarChar) {
+    ObserveSourceCollation(source);
+  }
+  const size_t old_size = size_;
+  const size_t count = source.size_;
+  size_ = old_size + count;
+  null_bitmap_.resize((size_ + 63) / 64, 0);
+  if (source.type_ == ValueType::kNull) {
+    for (size_t i = 0; i < count; ++i) {
+      null_bitmap_[(old_size + i) / 64] |= uint64_t{1} << ((old_size + i) % 64);
+      AppendDefault();
+    }
+    return;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (source.IsNull(i)) {
+      null_bitmap_[(old_size + i) / 64] |= uint64_t{1} << ((old_size + i) % 64);
+    }
+  }
+  switch (type_) {
+    case ValueType::kInt64:
+    case ValueType::kDate:
+      integers_.insert(
+          integers_.end(), source.integers_.begin(),
+          source.integers_.begin() + static_cast<std::ptrdiff_t>(count));
+      break;
+    case ValueType::kDouble:
+      doubles_.insert(
+          doubles_.end(), source.doubles_.begin(),
+          source.doubles_.begin() + static_cast<std::ptrdiff_t>(count));
+      break;
+    case ValueType::kVarChar:
+      strings_.insert(
+          strings_.end(), source.strings_.begin(),
+          source.strings_.begin() + static_cast<std::ptrdiff_t>(count));
+      break;
+    case ValueType::kArray:
+      nested_.insert(
+          nested_.end(), source.nested_.begin(),
+          source.nested_.begin() + static_cast<std::ptrdiff_t>(count));
+      break;
+    case ValueType::kNull:
+      break;
+  }
+}
+
+void ColumnVector::AppendBoolBatch(const uint8_t* bits, size_t count) {
+  if (count == 0) {
+    return;
+  }
+  if (type_ == ValueType::kNull) {
+    type_ = ValueType::kInt64;
+    MaterializeInferredStorage();
+  }
+  const size_t old_size = size_;
+  size_ = old_size + count;
+  null_bitmap_.resize((size_ + 63) / 64, 0);
+  // Every appended cell is non-null: the new bitmap words stay zero.
+  if (type_ != ValueType::kInt64 && type_ != ValueType::kDate) {
+    CHECK_MSG(false, "bool batch append on non-integer column vector");
+  }
+  integers_.resize(size_);
+  int64_t* out = integers_.data() + old_size;
+  for (size_t i = 0; i < count; ++i) {
+    out[i] = bits[i] != 0 ? 1 : 0;
+  }
+}
+
 void ColumnVector::Reset() {
   size_ = 0;
   unsigned_ = false;
+  collation_ = Collation::kNone;
+  mixed_collation_ = false;
   null_bitmap_.clear();
   integers_.clear();
   doubles_.clear();
@@ -270,8 +391,13 @@ Value ColumnVector::ValueAt(size_t index) const {
       return Value::DateFromDays(integers_[index]);
     case ValueType::kDouble:
       return Value(doubles_[index]);
-    case ValueType::kVarChar:
-      return Value(std::string(strings_[index]));
+    case ValueType::kVarChar: {
+      const Collation collation = ColumnCollation();
+      return collation == Collation::kNone
+                 ? Value(std::string(strings_[index]))
+                 : Value(std::string(strings_[index]))
+                       .WithCollation(static_cast<uint8_t>(collation));
+    }
     case ValueType::kArray:
       return nested_[index];
     case ValueType::kNull:
@@ -289,6 +415,36 @@ DataChunk::DataChunk(const std::vector<ValueType>& types, size_t capacity) {
 }
 
 void DataChunk::Initialize(const Schema& schema, size_t capacity) {
+  // Same-layout chunks (the per-batch Reset path) keep their allocated
+  // ColumnVectors: rebuilding the column vector would free and re-allocate
+  // every column's storage each 1024-row batch. Only a column-count or type
+  // change (a different operator tap on the same chunk object) takes the
+  // rebuild path.
+  if (columns_.size() == schema.ColumnCount() &&
+      zone_maps_.size() == columns_.size()) {
+    bool match = true;
+    for (size_t i = 0; i < columns_.size(); ++i) {
+      if (columns_[i].Type() != schema.GetColumn(i).Type()) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      for (size_t i = 0; i < columns_.size(); ++i) {
+        columns_[i].Reset();
+        // ColumnVector::Reset clears the unsigned marker; restore the
+        // schema's per-column flag the constructor would have set.
+        columns_[i].SetUnsigned(schema.GetColumn(i).IsUnsigned());
+      }
+      for (ZoneMap& zone_map : zone_maps_) {
+        zone_map.Reset();
+      }
+      positions_.clear();
+      positions_.reserve(capacity);
+      size_ = 0;
+      return;
+    }
+  }
   columns_.clear();
   columns_.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
@@ -306,6 +462,27 @@ void DataChunk::Initialize(const Schema& schema, size_t capacity) {
 
 void DataChunk::Initialize(const std::vector<ValueType>& types,
                            size_t capacity) {
+  if (columns_.size() == types.size() && zone_maps_.size() == columns_.size()) {
+    bool match = true;
+    for (size_t i = 0; i < columns_.size(); ++i) {
+      if (columns_[i].Type() != types[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      for (ColumnVector& column : columns_) {
+        column.Reset();
+      }
+      for (ZoneMap& zone_map : zone_maps_) {
+        zone_map.Reset();
+      }
+      positions_.clear();
+      positions_.reserve(capacity);
+      size_ = 0;
+      return;
+    }
+  }
   columns_.clear();
   columns_.reserve(types.size());
   for (ValueType type : types) {
@@ -476,16 +653,37 @@ void DataChunk::AppendGather(const DataChunk& source, const uint32_t* selection,
   if (ColumnCount() != source.ColumnCount()) {
     CHECK_MSG(false, "data chunk width mismatch");
   }
-  for (size_t i = 0; i < count; ++i) {
-    const size_t row_index = selection[i];
-    for (size_t c = 0; c < columns_.size(); ++c) {
-      const ColumnVector& column = source.ColumnAt(c);
-      columns_[c].AppendFrom(column, row_index);
-      UpdateZoneMapFrom(column, row_index, &zone_maps_[c]);
-    }
-    positions_.push_back(source.PositionAt(row_index));
-    ++size_;
+  bool identity = count == source.Size();
+  for (size_t i = 0; identity && i < count; ++i) {
+    identity = selection[i] == i;
   }
+  if (identity) {
+    for (size_t c = 0; c < columns_.size(); ++c) {
+      columns_[c].AppendRange(source.ColumnAt(c));
+      zone_maps_[c].Merge(source.ZoneMapAt(c));
+    }
+    positions_.insert(positions_.end(), source.positions_.begin(),
+                      source.positions_.end());
+    size_ += count;
+    return;
+  }
+  // Column-major gather: each column streams its gathered cells into one
+  // contiguous output buffer, instead of hopping across all columns per row
+  // (which re-faults each column's destination line for every row).
+  for (size_t c = 0; c < columns_.size(); ++c) {
+    const ColumnVector& column = source.ColumnAt(c);
+    ColumnVector& target = columns_[c];
+    for (size_t i = 0; i < count; ++i) {
+      target.AppendFrom(column, selection[i]);
+      UpdateZoneMapFrom(column, selection[i], &zone_maps_[c]);
+    }
+  }
+  const size_t old_size = size_;
+  positions_.resize(old_size + count);
+  for (size_t i = 0; i < count; ++i) {
+    positions_[old_size + i] = source.PositionAt(selection[i]);
+  }
+  size_ += count;
 }
 
 Row DataChunk::RowAt(size_t row_index) const {

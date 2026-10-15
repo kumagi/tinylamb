@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_PLAN_SET_OPERATION_PLAN_HPP
 #define TINYLAMB_PLAN_SET_OPERATION_PLAN_HPP
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -27,22 +28,16 @@ class SetOperationPlan final : public PlanBase {
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] bool ContainsParameterSlots() const override {
-    for (const Plan& child : children_) {
-      if (child->ContainsParameterSlots()) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(children_, [](const Plan& child) {
+      return child->ContainsParameterSlots();
+    });
   }
   bool InstallParameterSlots(const std::vector<Value>& parameters,
                              size_t* cursor,
                              std::vector<Expression>* slots) override {
-    for (const Plan& child : children_) {
-      if (!child->InstallParameterSlots(parameters, cursor, slots)) {
-        return false;
-      }
-    }
-    return true;
+    return std::ranges::all_of(children_, [&](const Plan& child) {
+      return child->InstallParameterSlots(parameters, cursor, slots);
+    });
   }
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
   [[nodiscard]] const TableStatistics& GetStats() const override {

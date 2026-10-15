@@ -88,8 +88,32 @@ class ColumnStats {
   // Used by the optimizer to penalize range index scans over unclustered
   // columns (TODO.md item 1). Never affects correctness.
   [[nodiscard]] double Correlation() const { return correlation_; }
+  // Direction-independent locality for range I/O costing. Ascending and
+  // descending runs both have sequential locality; random adjacency is weak.
+  // Unlike Correlation(), this must never certify ascending output order.
+  [[nodiscard]] double ClusteringStrength() const;
+  // True when ANALYZE (or a stats-preserving derivation) never measured this
+  // column: neither non-NULL nor NULL rows were ever counted. A measured
+  // all-NULL column has NullCount() > 0, so only an unmeasured column can
+  // have both counters at zero. Estimation must treat such a column as
+  // unknown (neutral defaults), never as proof of an empty result: a computed
+  // projection column that lost its stats would otherwise zero out every
+  // selectivity above it and collapse the whole plan's row estimates.
+  [[nodiscard]] bool Unmeasured() const {
+    return non_null_count_ == 0 && null_count_ == 0;
+  }
+  // A prior for a column produced by a type-preserving transform of this
+  // column (e.g. UPPER(x)): row mass and NDV carry over as an upper-bound
+  // prior (a transform can only merge distinct values), while per-value
+  // payloads (histogram, MCV, boundary values) are dropped because they
+  // describe the pre-transform domain.
+  [[nodiscard]] ColumnStats UntransformedPrior() const;
 
   [[nodiscard]] double EstimateEqual(const Value& value) const;
+  // Matching pairs, including skew and NULL mass (only for null-safe equality).
+  // Estimates never establish a semantic uniqueness or emptiness proof.
+  [[nodiscard]] double EstimateJoinMatches(const ColumnStats& other,
+                                           bool null_safe = false) const;
   [[nodiscard]] double EstimateRange(const std::optional<Value>& lower,
                                      bool lower_inclusive,
                                      const std::optional<Value>& upper,
@@ -142,9 +166,25 @@ class TableStatistics {
 
   [[nodiscard]] size_t Rows() const { return row_count_; }
   [[nodiscard]] size_t Columns() const { return stats_.size(); }
+  // Group cardinality with duplicate keys removed and exponential backoff
+  // when no joint distribution has been measured. NULL is one group.
+  [[nodiscard]] double EstimateDistinctRows(
+      const std::vector<size_t>& columns) const;
   [[nodiscard]] const ColumnStats& Column(size_t index) const {
     return stats_.at(index);
   }
+
+  // Table::LayoutGeneration() at the moment these statistics were measured
+  // (0 = never measured in this process, or measured across a row mutation).
+  //
+  // This is the only staleness handle a physical-order claim gets: a full scan
+  // reports the clustered order of a column only while the generation recorded
+  // here still equals the table's, which means no INSERT/UPDATE/DELETE has
+  // touched the row pages since ANALYZE walked them -- so the per-column
+  // Correlation() values describe the chain the scan will walk. Derived
+  // statistics (Filter/TransformBy/ScaleToRows/ScaleCardinality/Concat/*) drop
+  // the generation: they describe a hypothetical row set, not this table.
+  [[nodiscard]] uint64_t LayoutGeneration() const { return layout_generation_; }
 
   [[nodiscard]] double EstimateCount(int column_index, const Value& from,
                                      const Value& to) const;
@@ -153,12 +193,19 @@ class TableStatistics {
   [[nodiscard]] TableStatistics Filter(const Schema& schema,
                                        const Expression& predicate) const;
   [[nodiscard]] TableStatistics ScaleToRows(size_t rows) const;
+  // Same row-count and NDV scaling as ScaleToRows, without copying histogram
+  // or MCV payloads. Join costing only reads row counts and distinct counts;
+  // the histogram vectors were the dominant allocation in HashJoinStats.
+  [[nodiscard]] TableStatistics ScaleCardinality(size_t rows) const;
 
   void Concat(const TableStatistics& rhs);
   TableStatistics operator*(size_t multiplier) const;
 
   // Rebuild from per-column catalog entries. Missing columns stay default.
-  void Assign(size_t rows, std::vector<ColumnStats> columns);
+  // |layout_generation| is the table's row-layout generation the columns were
+  // measured at; 0 (the default) means "no clustering proof".
+  void Assign(size_t rows, std::vector<ColumnStats> columns,
+              uint64_t layout_generation = 0);
 
   friend Encoder& operator<<(Encoder& encoder, const TableStatistics& stats);
   friend Decoder& operator>>(Decoder& decoder, TableStatistics& stats);
@@ -168,6 +215,7 @@ class TableStatistics {
  private:
   size_t row_count_{0};
   std::vector<ColumnStats> stats_;
+  uint64_t layout_generation_{0};
 };
 
 }  // namespace tinylamb

@@ -70,6 +70,16 @@ class ProjectionPlan : public PlanBase {
                                    size_t limit_offset) const override {
     return src_->EnforcesLimit(limit_count, limit_offset);
   }
+  // Transparent for the row stream, so the child's order provenance carries.
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return src_->OrderIsMeasured();
+  }
+  // Row-shaping wrappers preserve the child's order, so they also preserve the
+  // collation that order was produced under (a case-insensitive sort under a
+  // projection is still a case-insensitive order).
+  [[nodiscard]] Collation OrderCollation() const override {
+    return src_->OrderCollation();
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

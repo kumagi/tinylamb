@@ -20,7 +20,16 @@
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC 15 reports -Wmaybe-uninitialized inside <regex>'s NFA construction when
+// instantiating std::regex in sanitizer builds; the library code is fine.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <regex>
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #include <string>
 #include <string_view>
 #include <vector>
@@ -35,7 +44,9 @@ namespace regex_guard_detail {
 using CharSet = std::bitset<256>;
 
 inline void AddRange(CharSet& set, unsigned lo, unsigned hi) {
-  for (unsigned c = lo; c <= hi && c < 256; ++c) set.set(c);
+  for (unsigned c = lo; c <= hi && c < 256; ++c) {
+    set.set(c);
+  }
 }
 
 // Character set denoted by a one-letter escape: "\d", "\w", "\s" and
@@ -90,7 +101,9 @@ inline CharSet EscapeCharSet(char e) {
 // ASCII approximation of a POSIX "[:name:]" class.
 inline CharSet PosixClassSet(std::string_view name) {
   CharSet set;
-  if (name == "digit") AddRange(set, '0', '9');
+  if (name == "digit") {
+    AddRange(set, '0', '9');
+  }
   if (name == "xdigit") {
     AddRange(set, '0', '9');
     AddRange(set, 'a', 'f');
@@ -100,22 +113,36 @@ inline CharSet PosixClassSet(std::string_view name) {
     AddRange(set, 'a', 'z');
     AddRange(set, 'A', 'Z');
   }
-  if (name == "alnum" || name == "digit") AddRange(set, '0', '9');
-  if (name == "lower") AddRange(set, 'a', 'z');
-  if (name == "upper") AddRange(set, 'A', 'Z');
-  if (name == "space" || name == "blank") set.set(' ');
+  if (name == "alnum" || name == "digit") {
+    AddRange(set, '0', '9');
+  }
+  if (name == "lower") {
+    AddRange(set, 'a', 'z');
+  }
+  if (name == "upper") {
+    AddRange(set, 'A', 'Z');
+  }
+  if (name == "space" || name == "blank") {
+    set.set(' ');
+  }
   if (name == "space") {
     for (char c : {'\t', '\n', '\v', '\f', '\r'}) {
       set.set(static_cast<unsigned char>(c));
     }
   }
-  if (name == "blank") set.set('\t');
+  if (name == "blank") {
+    set.set('\t');
+  }
   if (name == "cntrl") {
     AddRange(set, 0, 31);
     set.set(127);
   }
-  if (name == "print") AddRange(set, 32, 126);
-  if (name == "graph") AddRange(set, 33, 126);
+  if (name == "print") {
+    AddRange(set, 32, 126);
+  }
+  if (name == "graph") {
+    AddRange(set, 33, 126);
+  }
   if (name == "punct") {
     AddRange(set, 33, 47);
     AddRange(set, 58, 64);
@@ -186,9 +213,13 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
                       : f.cur_len + pending_len;
       if (!f.first_done) {
         f.cur_first |= pending_first;
-        if (!pending_nullable) f.first_done = true;
+        if (!pending_nullable) {
+          f.first_done = true;
+        }
       }
-      if (!pending_nullable) f.cur_nullable = false;
+      if (!pending_nullable) {
+        f.cur_nullable = false;
+      }
       f.cur_ambiguous = f.cur_ambiguous || pending_ambiguous;
     }
     pending_len = 0;
@@ -228,7 +259,9 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
       CharSet first;
       ++i;
       const bool negated = i < n && pattern[i] == '^';
-      if (negated) ++i;
+      if (negated) {
+        ++i;
+      }
       bool first_item = true;
       while (i < n && (pattern[i] != ']' || first_item)) {
         first_item = false;
@@ -251,7 +284,7 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
              pattern[i + 1] == '=')) {
           const char kind = pattern[i + 1];
           size_t j = i + 2;
-          while (j + 1 < n && !(pattern[j] == kind && pattern[j + 1] == ']')) {
+          while (j + 1 < n && (pattern[j] != kind || pattern[j + 1] != ']')) {
             ++j;
           }
           if (j + 1 < n) {
@@ -276,8 +309,12 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
         first.set(static_cast<unsigned char>(pattern[i]));
         ++i;
       }
-      if (i < n) ++i;  // consume ']'
-      if (negated) first.flip();
+      if (i < n) {
+        ++i;  // consume ']'
+      }
+      if (negated) {
+        first.flip();
+      }
       note_atom(1, first, false);
       continue;
     }
@@ -303,8 +340,12 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
           if (i < n && (pattern[i] == '=' || pattern[i] == '!')) {
             ++i;
           } else {
-            while (i < n && pattern[i] != '>') ++i;  // (?<name>
-            if (i < n) ++i;
+            while (i < n && pattern[i] != '>') {
+              ++i;  // (?<name>
+            }
+            if (i < n) {
+              ++i;
+            }
           }
         }
       }
@@ -400,12 +441,16 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
       len = 1;  // '?' is bounded but length-varying (0 or 1)
     } else if (c == '{') {
       size_t j = i + 1;
-      while (j < n && pattern[j] >= '0' && pattern[j] <= '9') ++j;
+      while (j < n && pattern[j] >= '0' && pattern[j] <= '9') {
+        ++j;
+      }
       if (j > i + 1) {
         int64_t lo = 0;
         for (size_t d = i + 1; d < j; ++d) {
-          lo = lo * 10 + (pattern[d] - '0');
-          if (lo > (1 << 20)) break;  // saturating; only ordering matters
+          lo = (lo * 10) + (pattern[d] - '0');
+          if (lo > (1 << 20)) {
+            break;  // saturating; only ordering matters
+          }
         }
         if (j < n && pattern[j] == '}') {
           exact = true;
@@ -414,7 +459,9 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
           len = j - i + 1;
         } else if (j < n && pattern[j] == ',') {
           size_t k = j + 1;
-          while (k < n && pattern[k] >= '0' && pattern[k] <= '9') ++k;
+          while (k < n && pattern[k] >= '0' && pattern[k] <= '9') {
+            ++k;
+          }
           if (k < n && pattern[k] == '}') {
             unbounded = (k == j + 1);  // "{m,}"
             can_be_empty = (lo == 0);

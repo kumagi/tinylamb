@@ -352,5 +352,5 @@ Rule はインデックス照合を維持するため、整数型の列にも適
 - ブール論理の簡約（9 本）: `xor_boolean_identity.md`, `xor_to_or_and_not.md`, `absorption_and.md`, `absorption_and_reversed.md`, `absorption_or.md`, `absorption_or_reversed.md`, `boolean_filter_pullup.md`, `distribute_or_over_and_budgeted.md`, `boolean_eq_true_false_three_valued.md`
 - 文字列照合と正規表現（3 本）: `like_equality.md`, `not_like_equality.md`, `regexp_prefix_extraction.md`
 - NULL と三値論理（5 本）: `is_null_of_null_check.md`, `is_not_null_of_null_check.md`, `contradiction_from_null_eq.md`, `in_single_null.md`, `not_in_null_semantics.md`
-- 型変換と関数特性（10 本）: `collapse_nested_identical_cast.md`, `nullif_to_case.md`, `coalesce_and_nullif_simplification.md`, `deterministic_function_cse.md`, `function_volatility_classification.md`, `nondeterministic_barrier.md`, `safe_divide_rewrite.md`, `datetime_and_string_fold_extent.md`, `json_path_constant_fold.md`, `numeric_widening_cast.md`
+- 型変換と関数特性（7 本）: `collapse_nested_identical_cast.md`, `nullif_to_case.md`, `coalesce_and_nullif_simplification.md`, `deterministic_function_cse.md`, `datetime_and_string_fold_extent.md`, `json_path_constant_fold.md`, `numeric_widening_cast.md`
 - 述語推論と因子展開（5 本）: `factor_or_common_and.md`, `or_of_ranges_to_in.md`, `interval_normalize.md`, `predicate_pushdown_case.md`, `inner_join_not_null_inference.md`

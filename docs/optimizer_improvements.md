@@ -82,7 +82,7 @@ Three improvements landed after auditing the aliased/self-join path:
    schema via a new `ProductPlan` constructor — previously the alias-
    qualified keys never matched the physical schema, silently disabling
    index joins for every self-join. A soundness guard skips index joins when
-   the right scan group carries a pushed filter: the IndexJoin executor
+   the right scan group carries a pushed filter: the lookup join executor
    probes the raw table through its index and bypasses the child plan, so a
    filter implemented by that child would otherwise vanish.
 2. **Ordering visibility across renames** (`plan/relation_rename_plan.*`).

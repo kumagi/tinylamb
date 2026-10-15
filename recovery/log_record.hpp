@@ -42,14 +42,17 @@ namespace tinylamb {
 //     records ended after their payload (no CRC).
 // v2: kSystemDestroyPage additionally carries the destroyed page's type and
 //     an optional full body image so undo restores the page exactly.
-// v3 (D9): every new record ends with a CRC32C over all preceding record
-//     bytes; readers verify it and treat a mismatch as the valid log end.
-// Readers must keep accepting v1/v2 (no CRC); writers always emit the
-// current version.
-inline constexpr uint32_t kWalRecordVersion = 3U;
+// v3 (D9): every record ends with a CRC32C over all preceding record bytes;
+//     readers verify it and treat a mismatch as the valid log end.
+inline constexpr uint32_t kWalRecordVersion = 6U;
+inline constexpr uint32_t kRowPageLinkWalVersion = 5U;
+inline constexpr uint32_t kCrcWalRecordVersion = 3U;
 inline constexpr uint32_t kLegacyWalRecordVersion = 1U;
 // First wire version whose kSystemDestroyPage carries type + body (D3).
 inline constexpr uint32_t kDestroyPayloadWalVersion = 2U;
+inline constexpr uint32_t kAllocationPayloadWalVersion = 6U;
+inline constexpr size_t kAllocationMetaPayloadSize = sizeof(uint64_t) * 2;
+inline constexpr size_t kAllocationFreePayloadSize = sizeof(uint64_t) * 2;
 // D9: the CRC field itself is not covered by the checksum.
 inline constexpr size_t kWalRecordCrcSize = sizeof(uint32_t);
 
@@ -93,7 +96,27 @@ enum class LogType : uint16_t {  // NOLINT(performance-enum-size)
   // image in the pool but must also be logged, or a later crash replays
   // the destroy and leaves the catalog pointing at a free page.
   kCompensateDestroyPage,
+  // Full-page image (fuzzy-checkpoint protection, docs/wal_format.md): a
+  // system record (txn_id 0) carrying one page's complete body, written by
+  // PagePool::WriteBack before a page image whose on-disk copy is not known
+  // durable. REDO restores the image verbatim, which lets recovery rebuild
+  // a torn data-file page from the WAL alone even after the log prefix was
+  // recycled. Never compensated and never undone.
+  kFullPageImage,
+  kCompensateSetLowestValue,
+  kSetRowPageNext,
+  kSetRowPagePrev,
+  kCompensateSetRowPageNext,
+  kCompensateSetRowPagePrev,
+  kCompensateAllocPage,
 };
+
+// CLR family test: true for every kCompensate* record type. Recovery uses
+// this to soften the replay page-type check for stale compensations (the
+// twin of LogUndo's stale-incarnation skip): a CLR written for an operation
+// whose page was later destroyed or re-issued has no physical half left to
+// apply, and failing the restart on it would wedge the reopen forever.
+[[nodiscard]] bool IsCompensation(LogType type);
 inline std::istream& operator>>(std::istream& in, LogType& val) {
   uint16_t raw = 0;
   in >> raw;
@@ -102,6 +125,17 @@ inline std::istream& operator>>(std::istream& in, LogType& val) {
 }
 
 std::ostream& operator<<(std::ostream& o, const LogType& type);
+
+std::string EncodeAllocationMetaPayload(page_id_t first_free_page,
+                                        page_id_t max_page_count);
+std::string EncodeAllocationFreePayload(page_id_t next_free_page,
+                                        txn_id_t destroyer);
+bool DecodeAllocationMetaPayload(std::string_view payload,
+                                 page_id_t* first_free_page,
+                                 page_id_t* max_page_count);
+bool DecodeAllocationFreePayload(std::string_view payload,
+                                 page_id_t* next_free_page,
+                                 txn_id_t* destroyer);
 
 struct LogRecord {
   LogRecord() = default;
@@ -126,12 +160,14 @@ struct LogRecord {
                                             page_id_t redo);
 
   static LogRecord CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
-                                               slot_t key);
+                                               slot_t key, lsn_t prev_lsn = 0);
   static LogRecord CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
-                                               std::string_view key);
+                                               std::string_view key,
+                                               lsn_t prev_lsn = 0);
   static LogRecord CompensatingInsertBranchLogRecord(txn_id_t txn,
                                                      page_id_t pid,
-                                                     std::string_view key);
+                                                     std::string_view key,
+                                                     lsn_t prev_lsn = 0);
 
   static LogRecord UpdatingLogRecord(lsn_t prev_lsn, txn_id_t txn,
                                      page_id_t pid, slot_t key,
@@ -147,13 +183,17 @@ struct LogRecord {
 
   static LogRecord CompensatingUpdateLogRecord(txn_id_t txn, page_id_t pid,
                                                slot_t key,
-                                               std::string_view redo);
-  static LogRecord CompensatingUpdateLeafLogRecord(lsn_t txn, page_id_t pid,
+                                               std::string_view redo,
+                                               lsn_t prev_lsn = 0);
+  static LogRecord CompensatingUpdateLeafLogRecord(txn_id_t txn, page_id_t pid,
                                                    std::string_view key,
-                                                   std::string_view redo);
-  static LogRecord CompensatingUpdateBranchLogRecord(lsn_t txn, page_id_t pid,
+                                                   std::string_view redo,
+                                                   lsn_t prev_lsn = 0);
+  static LogRecord CompensatingUpdateBranchLogRecord(txn_id_t txn,
+                                                     page_id_t pid,
                                                      std::string_view key,
-                                                     page_id_t redo);
+                                                     page_id_t redo,
+                                                     lsn_t prev_lsn = 0);
 
   static LogRecord DeletingLogRecord(lsn_t prev_lsn, txn_id_t txn,
                                      page_id_t pid, slot_t slot,
@@ -167,14 +207,17 @@ struct LogRecord {
 
   static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
                                                slot_t slot,
-                                               std::string_view redo);
+                                               std::string_view redo,
+                                               lsn_t prev_lsn = 0);
   static LogRecord CompensatingDeleteLeafLogRecord(txn_id_t txn, page_id_t pid,
                                                    std::string_view key,
-                                                   std::string_view redo);
+                                                   std::string_view redo,
+                                                   lsn_t prev_lsn = 0);
   static LogRecord CompensatingDeleteBranchLogRecord(txn_id_t txn,
                                                      page_id_t pid,
                                                      std::string_view slot,
-                                                     page_id_t redo);
+                                                     page_id_t redo,
+                                                     lsn_t prev_lsn = 0);
 
   static LogRecord SetLowFenceLogRecord(lsn_t prev_lsn, txn_id_t tx,
                                         page_id_t pid, const IndexKey& redo,
@@ -200,10 +243,35 @@ struct LogRecord {
                                       page_id_t undo);
   static LogRecord CompensateSetLowestValueLogRecord(txn_id_t tid,
                                                      page_id_t pid,
+                                                     page_id_t redo,
+                                                     lsn_t prev_lsn = 0);
+
+  static LogRecord SetRowPageNextLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                           page_id_t pid, page_id_t redo,
+                                           page_id_t undo);
+  static LogRecord SetRowPagePrevLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                           page_id_t pid, page_id_t redo,
+                                           page_id_t undo);
+  static LogRecord CompensateSetRowPageNextLogRecord(lsn_t prev_lsn,
+                                                     txn_id_t txn,
+                                                     page_id_t pid,
+                                                     page_id_t redo);
+  static LogRecord CompensateSetRowPagePrevLogRecord(lsn_t prev_lsn,
+                                                     txn_id_t txn,
+                                                     page_id_t pid,
                                                      page_id_t redo);
 
   static LogRecord AllocatePageLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                         page_id_t pid, PageType new_page_type,
+                                         PageAllocationKind allocation_kind,
+                                         PageType old_page_type,
+                                         std::string old_target_payload,
+                                         std::string old_meta_payload);
+  static LogRecord AllocatePageLogRecord(lsn_t prev_lsn, txn_id_t txn,
                                          page_id_t pid, PageType new_page_type);
+
+  static LogRecord CompensateAllocatePageLogRecord(const LogRecord& allocation,
+                                                   lsn_t prev_lsn = 0);
 
   // D3 (docs/design.md): the destroy record carries the destroyed page's
   // type and (unless provably all-zero) its body image so that undo can
@@ -218,9 +286,15 @@ struct LogRecord {
   // the restore instead of leaving the destroyed (free) image in place.
   static LogRecord CompensateDestroyPageLogRecord(txn_id_t txn, page_id_t pid,
                                                   PageType restored_type,
-                                                  std::string restored_body);
+                                                  std::string restored_body,
+                                                  lsn_t prev_lsn = 0);
 
   static LogRecord BeginCheckpointLogRecord();
+
+  // Full-page image record: pid + page type + the complete 32 KiB body in
+  // redo_data. Written by the page pool, not by any transaction.
+  static LogRecord FullPageImageLogRecord(page_id_t pid, PageType page_type,
+                                          std::string_view body);
 
   static LogRecord EndCheckpointLogRecord(
       const std::vector<std::pair<page_id_t, lsn_t>>& dpt,
@@ -232,6 +306,7 @@ struct LogRecord {
 
   friend Encoder& operator<<(Encoder& e, const LogRecord& l);
   friend Decoder& operator>>(Decoder& d, LogRecord& l);
+  void SerializeTo(std::string& output) const;
   [[nodiscard]] std::string Serialize() const;
 
   bool operator==(const LogRecord& r) const = default;
@@ -256,10 +331,12 @@ struct LogRecord {
       active_transaction_table;
   // Page alloc/destroy target.b
   PageType allocated_page_type = PageType::kUnknown;
+  PageType previous_page_type = PageType::kUnknown;
+  PageAllocationKind allocation_kind = PageAllocationKind::kFresh;
   // WAL wire format that produced (or will receive) this record.  Written
   // records always use kWalRecordVersion; decoded records keep the version
-  // read from the header so Size() matches the on-disk byte count for both
-  // v1 and v2 destroy records.
+  // read from the header so Size() matches the on-disk byte count for older
+  // record layouts.
   uint32_t wire_version = kWalRecordVersion;
 };
 

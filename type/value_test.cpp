@@ -1082,6 +1082,42 @@ TEST(ValueTest, GreaterThan_WithArrays_ComparesElementsCorrectly) {
   EXPECT_FALSE(a > b);
 }
 
+TEST(ValueTest, TryCompare_WithArrays_LexicographicAndPrefixOrdering) {
+  Value a = Value::Array({Value(int64_t{1}), Value(int64_t{9})}, "INT64");
+  Value b = Value::Array({Value(int64_t{2})}, "INT64");
+  Value prefix = Value::Array({Value(int64_t{1})}, "INT64");
+
+  auto lt_ab = a.TryLess(b);
+  ASSERT_TRUE(lt_ab.HasValue());
+  EXPECT_TRUE(lt_ab.Value());
+  auto lt_prefix = prefix.TryLess(a);
+  ASSERT_TRUE(lt_prefix.HasValue());
+  EXPECT_TRUE(lt_prefix.Value());
+  auto gt_nested =
+      Value::Array({Value::Array({Value(int64_t{2})}, "INT64")}, "ARRAY<INT64>")
+          .TryGreater(Value::Array({Value::Array({Value(int64_t{1})}, "INT64")},
+                                   "ARRAY<INT64>"));
+  ASSERT_TRUE(gt_nested.HasValue());
+  EXPECT_TRUE(gt_nested.Value());
+}
+
+// Bug 67: TryLess/TryGreater used std::vector<Value>::operator<, which calls
+// the throwing Value::operator< (ExcShimUnwrap).  Arrays containing NULL or
+// type-mismatched elements let a C++ exception escape the StatusOr contract
+// and crash callers of Expression::TryEvaluate (found by function_fuzzer).
+TEST(ValueTest, TryCompare_WithArrays_IncomparableElementsReturnStatusError) {
+  Value with_null = Value::Array({Value(), Value(int64_t{1})}, "INT64");
+  Value plain = Value::Array({Value(int64_t{2}), Value(int64_t{3})}, "INT64");
+  Value mixed = Value::Array({Value("text"), Value(int64_t{1})}, "INT64");
+
+  EXPECT_NO_THROW({
+    EXPECT_FALSE(with_null.TryLess(plain).HasValue());
+    EXPECT_FALSE(with_null.TryGreater(plain).HasValue());
+    EXPECT_FALSE(mixed.TryLess(plain).HasValue());
+    EXPECT_FALSE(mixed.TryGreater(plain).HasValue());
+  });
+}
+
 TEST(ValueTest, Arithmetic_EdgeCasesAndOverflow_ThrowsRuntimeError) {
   Value min_int(std::numeric_limits<int64_t>::min());
   Value one(int64_t{1});

@@ -85,7 +85,7 @@ graph TD
 
 - `push_limit_through_projection`: ソートキーを持たない単純な Limit 演算子のプッシュダウンを担当します。
 - `limit_push_through_sort`: `Limit(Sort(X))` を単一の `TopN(X)` ノードへ融合します。
-- `rank_row_number_to_topn`: `ROW_NUMBER()` ウィンドウ関数とフィルタの組み合わせから TopN を導出します。
+
 
 ## 検証テスト
 

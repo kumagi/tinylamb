@@ -15,6 +15,7 @@
 #include "executor/sort.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -23,6 +24,11 @@ namespace tinylamb {
 
 namespace {
 
+// PartialSort keeps Value's own comparison (which knows interval-equivalent
+// text and IEEE semantics) rather than CompareForOrderBy, so its key ordering
+// stays exactly as documented in docs/executor/60-sort-distinct-set.md. The
+// NULL placement and the collation are still resolved from the shared
+// contract, so a case-insensitive key folds before the raw comparison.
 int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
                    const std::vector<SortExecutor::Key>& keys, Status* error) {
   for (const auto& key : keys) {
@@ -46,6 +52,13 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
     if (rv.IsNull()) {
       bool nulls_first = key.nulls_first.value_or(key.ascending);
       return nulls_first ? 1 : -1;
+    }
+    if (ResolveCollation(key.collation, CollationOf(lv)) ==
+            Collation::kCaseInsensitive ||
+        ResolveCollation(key.collation, CollationOf(rv)) ==
+            Collation::kCaseInsensitive) {
+      lv = ApplyKeyCollation(lv, key.collation);
+      rv = ApplyKeyCollation(rv, key.collation);
     }
     if (lv < rv) {
       return key.ascending ? -1 : 1;

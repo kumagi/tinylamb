@@ -9,6 +9,7 @@
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -26,13 +27,10 @@ bool DistinctEquals(const Row& a, const Row& b) {
     return false;
   }
   for (size_t i = 0; i < a.values_.size(); ++i) {
-    const Value& x = a[i];
-    const Value& y = b[i];
-    const bool equal =
-        (x.type == ValueType::kDouble && y.type == ValueType::kDouble)
-            ? (CompareForOrderBy(x, y) == 0)
-            : (x == y);
-    if (!equal) {
+    // One peer rule for DISTINCT and ORDER BY: NaN collapses, -0.0 equals
+    // +0.0, interval-equivalent text matches, and a case-insensitive VARCHAR
+    // pair is equal once folded (type/collation.hpp).
+    if (!EqualUnderCollation(a[i], b[i])) {
       return false;
     }
   }
@@ -41,60 +39,34 @@ bool DistinctEquals(const Row& a, const Row& b) {
 
 }  // namespace
 
+bool DistinctRowEqual::operator()(const Row& left, const Row& right) const {
+  return DistinctEquals(left, right);
+}
+
 bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
   Row row;
   RowPosition position;
   while (source_->Next(&row, &position)) {
     if (distinct_on_.empty()) {
-      bool duplicate = false;
-      for (const Row& seen : seen_) {
-        if (DistinctEquals(seen, row)) {
-          duplicate = true;
-          break;
-        }
-      }
-      if (!duplicate) {
-        seen_.push_back(row);
-        *dst = seen_.back();
+      const auto [it, inserted] = seen_.insert(std::move(row));
+      if (inserted) {
+        *dst = *it;
         if (rp != nullptr) {
           *rp = position;
         }
         return true;
       }
     } else {
-      std::vector<Value> current_keys;
-      current_keys.reserve(distinct_on_.size());
+      Row current_keys;
+      current_keys.values_.reserve(distinct_on_.size());
       for (const auto& expr : distinct_on_) {
         StatusOr<Value> key = expr->TryEvaluate(row, schema_);
         if (!key.HasValue()) {
           return FailWith(key.GetStatus());
         }
-        current_keys.push_back(key.MoveValue());
+        current_keys.values_.push_back(key.MoveValue());
       }
-      bool duplicate = false;
-      for (const auto& seen_k : seen_keys_) {
-        if (seen_k.size() == current_keys.size()) {
-          bool match = true;
-          for (size_t i = 0; i < seen_k.size(); ++i) {
-            const Value& x = seen_k[i];
-            const Value& y = current_keys[i];
-            const bool equal =
-                (x.type == ValueType::kDouble && y.type == ValueType::kDouble)
-                    ? (CompareForOrderBy(x, y) == 0)
-                    : (x == y);
-            if (!equal) {
-              match = false;
-              break;
-            }
-          }
-          if (match) {
-            duplicate = true;
-            break;
-          }
-        }
-      }
-      if (!duplicate) {
-        seen_keys_.push_back(std::move(current_keys));
+      if (seen_keys_.insert(std::move(current_keys)).second) {
         *dst = std::move(row);
         if (rp != nullptr) {
           *rp = position;

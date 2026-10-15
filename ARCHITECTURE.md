@@ -111,9 +111,9 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
   許容している。修正が完了したらその行を削る (潰すごとにリストが減る)。
   新規に赤くなったら、allowlist 追加ではなく層の配置を見直すのが原則
 
-## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 63 辺)
+## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 65 辺)
 
-`python3 scripts/check_layering.py` のサマリ (2026-09 時点):
+`python3 scripts/check_layering.py` のサマリ (2026-10 時点):
 
 | 区分 | エッジ | 辺数 |
 |---|---|---|
@@ -121,7 +121,7 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
 | V3' | relational/executor → statement IR (query/statement.hpp) | relational→sql=12, executor→sql=6 |
 | V4 | plan → executor | 2 (plan/product_plan.cpp, plan/implementation_rules.cpp → executor/hash_join_mode.hpp) |
 
-無番号の許容エッジ (詳細はスクリプト内コメント参照): common→type (5),
+無番号の許容エッジ (詳細はスクリプト内コメント参照): common→type (6),
 type→storage/row_position (1), index→table (3), table→expression (7),
 expression→executor (bytecode/pax_block→data_chunk, 2), storage→executor (4),
-relational(detail)→executor 本体 (9), plan→sql (query_data/statement, 12)。
+relational(detail)→executor 本体 (9), plan→sql (query_data/statement, 13)。

@@ -3267,7 +3267,7 @@ TEST_F(SqlStatementSweepTest, ErrorTable) {
       "SELECT * FROM (SELECT a FROM t UNION SELECT a FROM t) ORDER BY 1",
       "INSERT INTO tiny SELECT a FROM g",
       "INSERT INTO t (a, c) VALUES STRUCT(11 AS a, 'kumquat' AS c)",
-      "TRUNCATE TABLE tiny",
+      "TRUNCATE TABLE no_such_table",
       "INSERT INTO st_t VALUES (1, STRUCT(10 AS x, 'hello' AS y))",
       "INSERT INTO st_t VALUES (2, NULL)",
       "INSERT INTO st_t (id, s) VALUES (3, STRUCT(20 AS x, "
@@ -3305,6 +3305,41 @@ TEST_F(SqlStatementSweepTest, ExplainSweep) {
     SCOPED_TRACE(sql);
     EXPECT_NO_THROW({ RunSql(engine_.get(), context_.get(), sql); });
   }
+}
+
+// TRUNCATE TABLE removes every row, keeps the definition usable, and errors
+// on a missing table.
+TEST_F(SqlStatementSweepTest, TruncateTable) {
+  EXPECT_NO_THROW({
+    RunSql(engine_.get(), context_.get(), "CREATE TABLE trunc_t (a INT64)");
+  });
+  EXPECT_NO_THROW({
+    RunSql(engine_.get(), context_.get(),
+           "INSERT INTO trunc_t VALUES (1), (2), (3)");
+  });
+  // TRUNCATE desugars to an unconditional DELETE and reports the removed
+  // row count.
+  const auto emptied =
+      RunSql(engine_.get(), context_.get(), "TRUNCATE TABLE trunc_t");
+  ASSERT_EQ(emptied.size(), 1);
+  EXPECT_EQ(emptied[0][1].AsString(), "3");
+  const auto after =
+      RunSql(engine_.get(), context_.get(), "SELECT COUNT(*) FROM trunc_t");
+  ASSERT_EQ(after.size(), 1);
+  EXPECT_EQ(after[0][0].AsString(), "0");
+  // The definition survives: the table accepts inserts again.
+  EXPECT_NO_THROW({
+    RunSql(engine_.get(), context_.get(), "INSERT INTO trunc_t VALUES (9)");
+  });
+  const auto back =
+      RunSql(engine_.get(), context_.get(), "SELECT COUNT(*) FROM trunc_t");
+  ASSERT_EQ(back.size(), 1);
+  EXPECT_EQ(back[0][0].AsString(), "1");
+  EXPECT_THROW(
+      {
+        RunSql(engine_.get(), context_.get(), "TRUNCATE TABLE trunc_missing");
+      },
+      std::exception);
 }
 
 }  // namespace tinylamb

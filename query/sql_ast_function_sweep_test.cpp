@@ -169,6 +169,47 @@ TEST_F(SqlAstFunctionSweepTest, ConditionalAndJsonFamily) {
                 Value(std::string("7"))});
 }
 
+// The JSON document family executes through the projection's AST evaluator
+// (expression/function_call_expression.cpp), one shared json_doc
+// implementation with the relational evaluator and the constant-fold rewrite.
+TEST_F(SqlAstFunctionSweepTest, JsonDocumentFamily) {
+  ExpectColumn("json_type('{\"a\": [1]}')",
+               {Value(std::string("object")), Value(std::string("object")),
+                Value(std::string("object"))});
+  ExpectColumn("json_type('[1, 2]')",
+               {Value(std::string("array")), Value(std::string("array")),
+                Value(std::string("array"))});
+  ExpectColumn("json_type('{\"a\": 1}', '$.zz')", {Value(), Value(), Value()});
+  ExpectColumn("json_keys('{\"b\": 1, \"a\": 2}')",
+               {Value::Array({Value(std::string("b")), Value(std::string("a"))},
+                             "STRING"),
+                Value::Array({Value(std::string("b")), Value(std::string("a"))},
+                             "STRING"),
+                Value::Array({Value(std::string("b")), Value(std::string("a"))},
+                             "STRING")});
+  ExpectColumn("json_array_length('[1, 2, 3]')",
+               {Value(int64_t{3}), Value(int64_t{3}), Value(int64_t{3})});
+  ExpectColumn("json_set('{\"a\": 1}', '$.b', 2)",
+               {Value(std::string(R"({"a":1,"b":2})")),
+                Value(std::string(R"({"a":1,"b":2})")),
+                Value(std::string(R"({"a":1,"b":2})"))});
+  ExpectColumn("json_remove('[1, 2, 3]', '$[1]')",
+               {Value(std::string("[1,3]")), Value(std::string("[1,3]")),
+                Value(std::string("[1,3]"))});
+  ExpectColumn("json_array(id, 'x', NULL)",
+               {Value(std::string(R"([1,"x",null])")),
+                Value(std::string(R"([2,"x",null])")),
+                Value(std::string(R"([3,"x",null])"))});
+  ExpectColumn("json_object('k', id)", {Value(std::string(R"({"k":1})")),
+                                        Value(std::string(R"({"k":2})")),
+                                        Value(std::string(R"({"k":3})"))});
+  ExpectColumn("lax_int64('5.9')",
+               {Value(int64_t{5}), Value(int64_t{5}), Value(int64_t{5})});
+  ExpectColumn("lax_string(id)",
+               {Value(std::string("1")), Value(std::string("2")),
+                Value(std::string("3"))});
+}
+
 TEST_F(SqlAstFunctionSweepTest, ArrayAndDateFamily) {
   ExpectColumn("array_length([10, 20, 30])",
                {Value(int64_t{3}), Value(int64_t{3}), Value(int64_t{3})});

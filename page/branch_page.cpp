@@ -73,8 +73,15 @@ Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
   if (static_cast<size_t>(kPageBodySize / 6) < physical_size) {
     return Status::kTooBigData;
   }
-  if (free_size_ <
+  // Bytes an unresolved mutator's undo still claims on this page are not
+  // available to this insert (see LeafPage::Insert).
+  const size_t reserved = txn.IndexUndoReservedBytes(pid);
+  const size_t usable_free = free_size_ >= reserved ? free_size_ - reserved : 0;
+  if (usable_free <
       physical_size + (sizeof(RowPointer) * (row_count_ + kExtraIdx + 1))) {
+    if (reserved != 0) {
+      LOG(ERROR) << "ADMREF branch-insert pid=" << pid;
+    }
     return Status::kNoSpace;
   }
   size_t pos = SearchToInsert(key);
@@ -94,11 +101,11 @@ Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
   return Status::kSuccess;
 }
 
-void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
+Status BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   const size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
   assert(physical_size <= std::numeric_limits<bin_size_t>::max());
   if (physical_size > std::numeric_limits<bin_size_t>::max()) {
-    return;
+    return Status::kTooBigData;
   }
   // D2 (docs/design.md): re-applied branch insert (same log replayed, or a
   // redo after an undo rewound page_lsn) must not duplicate the separator or
@@ -110,7 +117,7 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
       GetKey(static_cast<size_t>(dup)) == key) {
     SerializePID(Payload() + rows_[static_cast<size_t>(dup) + kExtraIdx].offset,
                  pid);
-    return;
+    return Status::kSuccess;
   }
   free_size_ -= static_cast<bin_size_t>(physical_size + sizeof(RowPointer));
   if ((Payload() + free_ptr_ - physical_size) <=
@@ -126,7 +133,7 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
     LOG(ERROR) << "InsertImpl: insufficient space for payload ("
                << physical_size << " bytes) rejected";
     free_size_ += static_cast<bin_size_t>(physical_size + sizeof(RowPointer));
-    return;
+    return Status::kNoSpace;
   }
   ++row_count_;
   free_ptr_ -= static_cast<bin_size_t>(physical_size);
@@ -137,6 +144,7 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   rows_[static_cast<size_t>(pos) + kExtraIdx].offset = free_ptr_;
   rows_[static_cast<size_t>(pos) + kExtraIdx].size =
       static_cast<bin_size_t>(physical_size);
+  return Status::kSuccess;
 }
 
 Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
@@ -158,9 +166,11 @@ Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
   }
   // |pos| is a logical index; the slot array is prefixed by the fence/foster
   // slots, so the size must be read from rows_[pos + kExtraIdx].
+  const size_t reserved = txn.IndexUndoReservedBytes(pid);
+  const size_t usable_free = free_size_ >= reserved ? free_size_ - reserved : 0;
   if (rows_[static_cast<size_t>(pos) + kExtraIdx].size < physical_size &&
       physical_size - rows_[static_cast<size_t>(pos) + kExtraIdx].size >
-          free_size_) {
+          usable_free) {
     return Status::kNoSpace;
   }
   RETURN_IF_FAIL(
@@ -215,6 +225,15 @@ void BranchPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
 
 Status BranchPage::Delete(page_id_t pid, Transaction& txn,
                           std::string_view key) {
+  // An empty branch is structurally impossible in a consistent Foster B+Tree
+  // (the tree collapses a root that runs empty before Delete can run on it).
+  // DeleteImpl's row_count_ guard shows the path was considered reachable, so
+  // refuse it here as corruption instead of letting GetValue(0) below log and
+  // fabricate a DeleteBranchLog(key="", child=0) record.
+  if (row_count_ == 0) {
+    LOG(ERROR) << "BranchPage::Delete on empty branch page " << pid;
+    return Status::kCorrupt;
+  }
   const int pos = Search(key, false);
   if (pos < 0) {
     page_id_t next_lowest = GetValue(0);
@@ -223,6 +242,13 @@ Status BranchPage::Delete(page_id_t pid, Transaction& txn,
         txn.DeleteBranchLog(pid, GetKey(0), next_lowest).GetStatus());
     RETURN_IF_FAIL(txn.SetLowestLog(pid, next_lowest, prev_lowest).GetStatus());
   } else {
+    // Search(false) lands in [0, row_count_-1] for any key >= GetKey(0); an
+    // out-of-range landing means the page image is inconsistent.
+    if (std::cmp_greater_equal(pos, row_count_)) {
+      LOG(ERROR) << "BranchPage::Delete search out of range on page " << pid
+                 << ": pos=" << pos << " / " << row_count_;
+      return Status::kCorrupt;
+    }
     RETURN_IF_FAIL(txn.DeleteBranchLog(pid, GetKey(static_cast<size_t>(pos)),
                                        GetValue(static_cast<size_t>(pos)))
                        .GetStatus());
@@ -260,11 +286,20 @@ void BranchPage::DeleteImpl(std::string_view key) {
 StatusOr<page_id_t> BranchPage::GetPageForKey(Transaction& /*txn*/,
                                               std::string_view key,
                                               bool less_than) const {
+  // The less-than seek protocol lands at "child p" where the keys strictly
+  // below |key| begin scanning forward; p == -1 (key below the first
+  // separator, or anywhere in [GetKey(0), GetKey(1))) designates child -1,
+  // which is the lowest_page_ subtree. A forward leaf-chain scan from there
+  // still reaches every page below |key|. Before the production guards this
+  // landing read the foster slot as a child id (.GetValue(-1)) -- routing
+  // descents to a garbage page id, the "GetValue out of range: -1" crash
+  // class under TPC-C.
   assert(0 < row_count_);
-  if (key < GetKey(0) || (less_than && key == GetKey(0))) {
+  const int pos = Search(key, less_than);
+  if (pos < 0) {
     return lowest_page_;
   }
-  return GetValue(static_cast<size_t>(Search(key, less_than)));
+  return GetValue(static_cast<size_t>(pos));
 }
 
 void BranchPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
@@ -280,13 +315,17 @@ void BranchPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
 
 Status BranchPage::SetLowFence(page_id_t pid, Transaction& txn,
                                const IndexKey& lf) {
+  // Same admission as LeafPage::Insert: bytes an unresolved mutator's undo
+  // still claims on this page are not available to a fence that grows.
+  const size_t reserved = txn.IndexUndoReservedBytes(pid);
+  const size_t usable_free = free_size_ >= reserved ? free_size_ - reserved : 0;
   if (lf.IsNotInfinity()) {
     const size_t physical_size = SerializeSize(lf);
     const bin_size_t old_size = (rows_[kLowFenceIdx] == kMinusInfinity ||
                                  rows_[kLowFenceIdx] == kPlusInfinity)
                                     ? 0
                                     : rows_[kLowFenceIdx].size;
-    if (physical_size > old_size && free_size_ < physical_size - old_size) {
+    if (physical_size > old_size && usable_free < physical_size - old_size) {
       return Status::kNoSpace;
     }
   }
@@ -297,13 +336,17 @@ Status BranchPage::SetLowFence(page_id_t pid, Transaction& txn,
 
 Status BranchPage::SetHighFence(page_id_t pid, Transaction& txn,
                                 const IndexKey& hf) {
+  // Same admission as LeafPage::Insert: bytes an unresolved mutator's undo
+  // still claims on this page are not available to a fence that grows.
+  const size_t reserved = txn.IndexUndoReservedBytes(pid);
+  const size_t usable_free = free_size_ >= reserved ? free_size_ - reserved : 0;
   if (hf.IsNotInfinity()) {
     const size_t physical_size = SerializeSize(hf);
     const bin_size_t old_size = (rows_[kHighFenceIdx] == kMinusInfinity ||
                                  rows_[kHighFenceIdx] == kPlusInfinity)
                                     ? 0
                                     : rows_[kHighFenceIdx].size;
-    if (physical_size > old_size && free_size_ < physical_size - old_size) {
+    if (physical_size > old_size && usable_free < physical_size - old_size) {
       return Status::kNoSpace;
     }
   }
@@ -343,8 +386,10 @@ Status BranchPage::SetFoster(page_id_t pid, Transaction& txn,
   size_t physical_size =
       new_foster.IsEmpty() ? 0
                            : SerializeSize(new_foster.key) + sizeof(page_id_t);
+  const size_t reserved = txn.IndexUndoReservedBytes(pid);
+  const size_t usable_free = free_size_ >= reserved ? free_size_ - reserved : 0;
   if (rows_[kFosterIdx].size < physical_size &&
-      free_size_ < physical_size - rows_[kFosterIdx].size) {
+      usable_free < physical_size - rows_[kFosterIdx].size) {
     return Status::kNoSpace;
   }
   if (auto prev_foster = GetFoster()) {
@@ -397,9 +442,8 @@ StatusOr<FosterPair> BranchPage::GetFoster() const {
   return FosterPair(serialized_key, child);
 }
 
-Status BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
-                         std::string_view key, Page* right,
-                         std::string* middle) {
+Status BranchPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
+                         Page* right, std::string* middle) {
   const size_t kPayload = kPageBodySize - offsetof(BranchPage, rows_);
   const size_t kThreshold = kPayload / 2;
   const size_t expected_size =
@@ -426,6 +470,17 @@ Status BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
     pivot--;
   }
 
+  // pivot designates the separator promoted to the parent; every consumer
+  // below (GetKey/GetValue/Delete loop) requires it to stay inside the slot
+  // array. Reaching row_count_ means every existing key sorts below the new
+  // one -- the rightmost-insert case the foster slot handles without a split
+  // -- so this can only describe an inconsistent tree.
+  if (static_cast<size_t>(row_count_) <= pivot) {
+    LOG(ERROR) << "BranchPage::Split pivot out of range on page: pivot="
+               << pivot << " / " << row_count_;
+    return Status::kCorrupt;
+  }
+
   const size_t original_row_count = row_count_;
   *middle = GetKey(pivot);
   right->SetLowestValue(txn, GetValue(pivot));
@@ -440,9 +495,17 @@ Status BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
   }
   if (right->RowCount() == 0 ||  // NOLINT(bugprone-branch-clone)
       right->GetKey(0) <= key) {
-    assert(expected_size <= right->body.branch_page.free_size_);
+    [[maybe_unused]] const size_t right_reserved =
+        txn.IndexUndoReservedBytes(right->page_id);
+    assert(expected_size <=
+           (right->body.branch_page.free_size_ >= right_reserved
+                ? right->body.branch_page.free_size_ - right_reserved
+                : 0));
   } else {
-    assert(expected_size <= free_size_);
+    [[maybe_unused]] const size_t this_reserved =
+        txn.IndexUndoReservedBytes(pid);
+    assert(expected_size <=
+           (free_size_ >= this_reserved ? free_size_ - this_reserved : 0));
   }
   return Status::kSuccess;
 }
@@ -478,17 +541,30 @@ int BranchPage::Search(std::string_view key, bool less_than) const {
 }
 
 std::string_view BranchPage::GetKey(size_t idx) const {
-  // Mirror GetValue's guard: a negative index silently read the foster slot.
+  // Out of range means the page image is internally inconsistent (or a caller
+  // bug); every reachable caller validates idx first, and a fabricated empty
+  // key here would be persisted as a separator by Delete/Split. Fail loudly
+  // instead of silently corrupting the tree (ASSERT_PAGE_TYPE precedent).
   assert(static_cast<int64_t>(idx) >= 0 && idx < row_count_);
   if (static_cast<int64_t>(idx) < 0 || idx >= row_count_) {
-    LOG(ERROR) << "BranchPage::GetKey out of range: " << idx << " / "
-               << row_count_;
-    return {};
+    CHECK_MSG(false, "BranchPage::GetKey out of range: " + std::to_string(idx) +
+                         " / " + std::to_string(row_count_));
   }
   return GetRow(idx + kExtraIdx);
 }
 
 std::string_view BranchPage::GetRow(size_t idx) const {
+  // Size-0 slots are sentinels, never real rows: the fence slots carry the
+  // kMinusInfinity/kPlusInfinity RowPointers and an empty foster slot is a
+  // default RowPointer. Their offset fields are stale, so deserializing from
+  // them handed the binary search in Search/SearchToInsert a garbage probe
+  // key for the foster floor -- landing Search on -1 (the crash signature
+  // "GetValue out of range: -1" routed to page 0) and one-off insert
+  // positions. Report an empty key: it sorts below every real separator,
+  // which is exactly the floor the search invariants expect.
+  if (rows_[idx].size == 0) {
+    return {};
+  }
   std::string_view key;
   assert(idx < row_count_ + kExtraIdx);
   DeserializeStringView(Payload() + rows_[idx].offset + sizeof(page_id_t),
@@ -500,13 +576,16 @@ page_id_t BranchPage::GetValue(size_t idx) const {
   page_id_t result = 0;
   // PRODUCTION GUARD: a negative int (e.g. GetValue(next_idx - 1) with
   // next_idx == 0) converts to a huge size_t, passes the old assert, and
-  // deserializes a foster/fence slot as a child pid -- routing lookups to
-  // garbage pages.
+  // deserializes a foster/fence slot as a child pid. Returning 0 routed the
+  // lookup to page 0 (MetaPage) and let Split persist 0 as a child id, so
+  // every reachable caller now validates idx first and this guard is a
+  // corruption tripwire: fail loudly instead of silently navigating to the
+  // meta page.
   assert(static_cast<int64_t>(idx) >= 0 && idx < row_count_);
   if (static_cast<int64_t>(idx) < 0 || idx >= row_count_) {
-    LOG(ERROR) << "BranchPage::GetValue out of range: " << idx << " / "
-               << row_count_;
-    return 0;
+    CHECK_MSG(false,
+              "BranchPage::GetValue out of range: " + std::to_string(idx) +
+                  " / " + std::to_string(row_count_));
   }
   DeserializePID(Payload() + rows_[idx + kExtraIdx].offset, &result);
   return result;
@@ -670,19 +749,21 @@ Status BranchPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
   if (1 < right.RowCount()) {
     // Move leftmost entry from foster.
     page_id_t move_value = right.body.branch_page.GetValue(0);
-    COERCE(this_page->SetFoster(txn, FosterPair(move_key, right.PageID())));
-    COERCE(this_page->InsertBranch(txn, old_foster.key,
-                                   right.body.branch_page.lowest_page_));
+    RETURN_IF_FAIL(
+        this_page->SetFoster(txn, FosterPair(move_key, right.PageID())));
+    RETURN_IF_FAIL(this_page->InsertBranch(
+        txn, old_foster.key, right.body.branch_page.lowest_page_));
     right.SetLowestValue(txn, move_value);
-    COERCE(right.Delete(txn, move_key));
+    RETURN_IF_FAIL(right.Delete(txn, move_key));
     return Status::kSuccess;
   }
   // Merge foster.
-  COERCE(this_page->SetFoster(txn, FosterPair()));
-  COERCE(this_page->InsertBranch(txn, old_foster.key,
-                                 right.body.branch_page.lowest_page_));
-  COERCE(this_page->InsertBranch(txn, right.GetKey(0), right.GetPage(0)));
-  COERCE(right.Delete(txn, move_key));
+  RETURN_IF_FAIL(this_page->SetFoster(txn, FosterPair()));
+  RETURN_IF_FAIL(this_page->InsertBranch(txn, old_foster.key,
+                                         right.body.branch_page.lowest_page_));
+  RETURN_IF_FAIL(
+      this_page->InsertBranch(txn, right.GetKey(0), right.GetPage(0)));
+  RETURN_IF_FAIL(right.Delete(txn, move_key));
   right.SetLowestValue(txn, 0);
   return Status::kSuccess;
 }

@@ -12,10 +12,12 @@
 // DECIMAL columns are represented as DOUBLE, matching the engine's numeric
 // surface; queries ported in tpcds_queries.hpp cast accordingly.
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "type/row.hpp"
@@ -39,8 +41,8 @@ struct Rng {
   }
   int64_t Int(int64_t lo, int64_t hi) { return lo + Below(hi - lo + 1); }
   double Uniform(double lo, double hi) {
-    return lo +
-           (hi - lo) * (static_cast<double>(Next() >> 11) / 9007199254740992.0);
+    return lo + ((hi - lo) *
+                 (static_cast<double>(Next() >> 11) / 9007199254740992.0));
   }
   template <typename T>
   const T& Pick(const std::vector<T>& pool) {
@@ -50,16 +52,19 @@ struct Rng {
 
 struct ScaleConfig {
   int64_t factor{1};
-  int64_t ItemRows() const { return 1200; }
-  int64_t CustomerRows() const { return 2000; }
-  int64_t AddressRows() const { return 3000; }
-  int64_t StoreSalesRows() const { return 30000 * factor; }
-  int64_t StoreReturnsRows() const { return 3000 * factor; }
-  int64_t CatalogSalesRows() const { return 25000 * factor; }
-  int64_t CatalogReturnsRows() const { return 2500 * factor; }
-  int64_t WebSalesRows() const { return 25000 * factor; }
-  int64_t WebReturnsRows() const { return 2500 * factor; }
-  int64_t InventoryRows() const { return 20000 * factor; }
+  [[nodiscard]] static int64_t ItemRows() { return 1200; }
+  [[nodiscard]] static int64_t CustomerRows() { return 2000; }
+  [[nodiscard]] static int64_t AddressRows() { return 3000; }
+  [[nodiscard]] int64_t StoreSalesRows() const { return 30000 * factor; }
+  [[nodiscard]] int64_t StoreReturnsRows() const { return 3000 * factor; }
+  [[nodiscard]] int64_t CatalogSalesRows() const { return 25000 * factor; }
+  [[nodiscard]] int64_t CatalogReturnsRows() const { return 2500 * factor; }
+  [[nodiscard]] int64_t WebSalesRows() const { return 25000 * factor; }
+  [[nodiscard]] int64_t WebReturnsRows() const { return 2500 * factor; }
+  [[nodiscard]] int64_t InventoryRows() const { return 20000 * factor; }
+  // time_dim carries one row per minute of the day (sk 1..1440); the
+  // TPC-DS surface only exercises t_hour/t_minute buckets through it.
+  [[nodiscard]] static int64_t TimeDimRows() { return 1440; }
 };
 
 inline std::vector<std::string_view> Ddl() {
@@ -75,17 +80,19 @@ inline std::vector<std::string_view> Ddl() {
       "INT64, i_brand STRING, i_class_id INT64, i_class STRING, "
       "i_category_id INT64, i_category STRING, i_manufact_id INT64, "
       "i_manufact STRING, i_manager_id INT64, i_size STRING, "
-      "i_color STRING);",
+      "i_color STRING, i_product_name STRING);",
       "CREATE TABLE store (s_store_sk INT64, s_store_id STRING, s_store_name "
       "STRING, s_number_employees INT64, s_floor_space INT64, s_county "
       "STRING, s_state STRING, s_city STRING, s_company_name STRING, "
       "s_company_id INT64, s_gmt_offset INT64, s_zip STRING);",
-      "CREATE TABLE customer (c_customer_sk INT64, c_customer_id STRING, "
+      "CREATE TABLE customer (c_customer_sk INT64, c_customer_id STRING "
+      "PRIMARY KEY, "
       "c_current_cdemo_sk INT64, c_current_hdemo_sk INT64, c_current_addr_sk "
       "INT64, c_birth_month INT64, c_birth_day INT64, c_birth_year INT64, "
       "c_gender STRING, c_salutation STRING, c_first_name STRING, "
       "c_last_name STRING, c_preferred_cust_flag STRING, c_email STRING, "
-      "c_login STRING, c_email_address STRING);",
+      "c_login STRING, c_email_address STRING, c_birth_country STRING, "
+      "c_last_review_date DATE);",
       "CREATE TABLE customer_address (ca_address_sk INT64, ca_address_id "
       "STRING, ca_city STRING, ca_county STRING, ca_state STRING, ca_zip "
       "STRING, ca_country STRING, ca_gmt_offset INT64);",
@@ -107,7 +114,23 @@ inline std::vector<std::string_view> Ddl() {
       "w_warehouse_name STRING, w_city STRING, w_state STRING, "
       "w_gmt_offset INT64);",
       "CREATE TABLE call_center (cc_call_center_sk INT64, cc_call_center_id "
-      "STRING, cc_county STRING, cc_state STRING);",
+      "STRING, cc_county STRING, cc_state STRING, cc_name STRING, "
+      "cc_manager STRING);",
+      // Channel dimensions added with the web/catalog-page query wave.
+      // All draws come from the aux stream (see Generate) so the pinned
+      // rows above stay byte-identical.
+      "CREATE TABLE web_site (web_site_sk INT64, web_site_id STRING, "
+      "web_name STRING, web_city STRING, web_state STRING, web_county "
+      "STRING);",
+      "CREATE TABLE web_page (wp_web_page_sk INT64, wp_web_page_id STRING, "
+      "wp_type STRING, wp_char_count INT64, wp_link_count INT64);",
+      "CREATE TABLE catalog_page (cp_catalog_page_sk INT64, "
+      "cp_catalog_page_id STRING, cp_department STRING, cp_catalog_number "
+      "INT64);",
+      "CREATE TABLE ship_mode (sm_ship_mode_sk INT64, sm_type STRING, "
+      "sm_carrier STRING);",
+      "CREATE TABLE time_dim (t_time_sk INT64, t_time STRING, t_hour INT64, "
+      "t_minute INT64, t_am_pm STRING, t_meal_time STRING);",
       // Fact tables.
       "CREATE TABLE store_sales (ss_sold_date_sk INT64, ss_item_sk INT64, "
       "ss_customer_sk INT64, ss_cdemo_sk INT64, ss_hdemo_sk INT64, "
@@ -116,7 +139,8 @@ inline std::vector<std::string_view> Ddl() {
       "ss_list_price DOUBLE, ss_sales_price DOUBLE, ss_ext_discount_amt "
       "DOUBLE, ss_ext_sales_price DOUBLE, ss_ext_wholesale_cost DOUBLE, "
       "ss_ext_list_price DOUBLE, ss_ext_tax DOUBLE, ss_coupon_amt DOUBLE, "
-      "ss_net_paid DOUBLE, ss_net_paid_inc_tax DOUBLE, ss_net_profit DOUBLE);",
+      "ss_net_paid DOUBLE, ss_net_paid_inc_tax DOUBLE, ss_net_profit DOUBLE, "
+      "ss_sold_time_sk INT64);",
       "CREATE TABLE store_returns (sr_returned_date_sk INT64, sr_item_sk "
       "INT64, sr_customer_sk INT64, sr_cdemo_sk INT64, sr_hdemo_sk INT64, "
       "sr_addr_sk INT64, sr_store_sk INT64, sr_ticket_number INT64, "
@@ -133,7 +157,9 @@ inline std::vector<std::string_view> Ddl() {
       "DOUBLE, cs_coupon_amt DOUBLE, cs_net_paid DOUBLE, "
       "cs_net_paid_inc_tax DOUBLE, cs_net_profit DOUBLE, "
       "cs_ship_customer_sk INT64, cs_ship_date_sk INT64, cs_ship_addr_sk "
-      "INT64, cs_call_center_sk INT64, cs_ext_ship_cost DOUBLE);",
+      "INT64, cs_call_center_sk INT64, cs_ext_ship_cost DOUBLE, "
+      "cs_sold_time_sk INT64, cs_catalog_page_sk INT64, cs_ship_mode_sk "
+      "INT64);",
       "CREATE TABLE web_sales (ws_sold_date_sk INT64, ws_item_sk INT64, "
       "ws_bill_customer_sk INT64, ws_bill_cdemo_sk INT64, ws_bill_hdemo_sk "
       "INT64, ws_bill_addr_sk INT64, ws_ship_customer_sk INT64, ws_promo_sk "
@@ -142,24 +168,31 @@ inline std::vector<std::string_view> Ddl() {
       "ws_ext_discount_amt DOUBLE, ws_ext_sales_price DOUBLE, "
       "ws_ext_wholesale_cost DOUBLE, ws_ext_list_price DOUBLE, ws_ext_tax "
       "DOUBLE, ws_coupon_amt DOUBLE, ws_net_paid DOUBLE, "
-      "ws_net_paid_inc_tax DOUBLE, ws_net_profit DOUBLE);",
+      "ws_net_paid_inc_tax DOUBLE, ws_net_profit DOUBLE, "
+      "ws_sold_time_sk INT64, ws_web_site_sk INT64, ws_web_page_sk INT64, "
+      "ws_ship_date_sk INT64, ws_warehouse_sk INT64, ws_ship_mode_sk INT64, "
+      "ws_ship_hdemo_sk INT64, ws_ship_addr_sk INT64, ws_ext_ship_cost "
+      "DOUBLE);",
       "CREATE TABLE inventory (inv_date_sk INT64, inv_item_sk INT64, "
       "inv_warehouse_sk INT64, inv_quantity_on_hand INT64);",
       // Return fact tables (column subset following the TPC-DS v2.x schema;
-      // the returning_* / call-center / web-page slots are unused by the
-      // ported queries).
+      // the returning_* / call-center / web-page slots were extended when the
+      // web-channel queries were ported).
       "CREATE TABLE catalog_returns (cr_returned_date_sk INT64, "
       "cr_item_sk INT64, cr_refunded_customer_sk INT64, cr_refunded_cdemo_sk "
       "INT64, cr_refunded_hdemo_sk INT64, cr_refunded_addr_sk INT64, "
       "cr_warehouse_sk INT64, cr_order_number INT64, cr_return_quantity "
       "INT64, cr_return_amount DOUBLE, cr_fee DOUBLE, cr_refunded_cash "
-      "DOUBLE, cr_net_loss DOUBLE, cr_reason_sk INT64);",
+      "DOUBLE, cr_net_loss DOUBLE, cr_reason_sk INT64, "
+      "cr_catalog_page_sk INT64, cr_call_center_sk INT64, "
+      "cr_returning_customer_sk INT64, cr_returning_addr_sk INT64);",
       "CREATE TABLE web_returns (wr_returned_date_sk INT64, wr_item_sk "
       "INT64, wr_refunded_customer_sk INT64, wr_refunded_cdemo_sk INT64, "
       "wr_refunded_hdemo_sk INT64, wr_refunded_addr_sk INT64, "
       "wr_order_number INT64, wr_return_quantity INT64, wr_return_amount "
       "DOUBLE, wr_fee DOUBLE, wr_refunded_cash DOUBLE, wr_net_loss DOUBLE, "
-      "wr_reason_sk INT64);",
+      "wr_reason_sk INT64, wr_returning_customer_sk INT64, "
+      "wr_returning_cdemo_sk INT64, wr_returning_addr_sk INT64);",
   };
 }
 
@@ -170,14 +203,25 @@ inline int64_t DateSkFromCivil(int64_t year, int64_t month, int64_t day) {
   auto days_from_civil = [](int64_t y, int64_t m, int64_t d) -> int64_t {
     y -= m <= 2 ? 1 : 0;
     const int64_t era = (y >= 0 ? y : y - 399) / 400;
-    const int64_t yoe = y - era * 400;
-    const int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + doe - 719468;
+    const int64_t yoe = y - (era * 400);
+    const int64_t doy = ((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1;
+    const int64_t doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy;
+    return (era * 146097) + doe - 719468;
   };
   // 25567 anchors the civil count at 1900-01-01, 2415022 is the TPC-DS
   // surrogate-key base for that date.
   return 2415022 + days_from_civil(year, month, day) + 25567;
+}
+
+// Renders a YYYY-MM-DD civil date; used by index-derived DATE columns so
+// their text never depends on an RNG stream.
+inline std::array<char, 16> civil_date_text(int64_t year, int64_t month,
+                                            int64_t day) {
+  std::array<char, 16> text{};
+  (void)std::snprintf(text.data(), text.size(), "%04ld-%02ld-%02ld",
+                      static_cast<long>(year), static_cast<long>(month),
+                      static_cast<long>(day));
+  return text;
 }
 
 struct GeneratedData {
@@ -193,6 +237,11 @@ struct GeneratedData {
   std::vector<Row> income_band;
   std::vector<Row> warehouse;
   std::vector<Row> call_center;
+  std::vector<Row> web_site;
+  std::vector<Row> web_page;
+  std::vector<Row> catalog_page;
+  std::vector<Row> ship_mode;
+  std::vector<Row> time_dim;
   std::vector<Row> store_sales;
   std::vector<Row> store_returns;
   std::vector<Row> catalog_sales;
@@ -272,73 +321,86 @@ inline GeneratedData Generate(int64_t scale) {
         "Sunday",   "Monday", "Tuesday", "Wednesday",
         "Thursday", "Friday", "Saturday"};
     const int64_t sk_epoch = DateSkFromCivil(1998, 1, 1);
-    int64_t month_seq = (1998 - 1900) * 12;
+    int64_t month_seq = int64_t{1998 - 1900} * 12;
     for (int64_t year = 1998; year <= 2003; ++year) {
       for (int64_t month = 1; month <= 12; ++month, ++month_seq) {
-        static const int64_t kDaysInMonth[] = {31, 28, 31, 30, 31, 30,
-                                               31, 31, 30, 31, 30, 31};
+        static constexpr std::array<int64_t, 12> kDaysInMonth = {
+            31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
         const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-        const int64_t days = month == 2 && leap ? 29 : kDaysInMonth[month - 1];
+        const int64_t days = month == 2 && leap
+                                 ? 29
+                                 : kDaysInMonth[static_cast<size_t>(month - 1)];
         for (int64_t day = 1; day <= days; ++day) {
           const int64_t sk = DateSkFromCivil(year, month, day);
           const int64_t dow = (sk + 5) % 7;  // 1998-01-01 is a Thursday(4)
-          char id[32];
-          std::snprintf(id, sizeof(id), "AAAAAA%08ld",
-                        static_cast<long>(sk % 100000000));
-          char date_text[64];
-          std::snprintf(date_text, sizeof(date_text), "%04ld-%02ld-%02ld",
-                        static_cast<long>(year), static_cast<long>(month),
-                        static_cast<long>(day));
-          char quarter[48];
-          std::snprintf(quarter, sizeof(quarter), "%04ldQ%ld",
-                        static_cast<long>(year),
-                        static_cast<long>((month - 1) / 3 + 1));
-          data.date_dim.emplace_back(Row(std::vector<Value>{
-              Value(sk), Value(std::string(id)), Value::Date(date_text),
-              Value(month_seq), Value(year), Value(dow), Value(month),
-              Value(day), Value((month - 1) / 3 + 1),
-              Value(std::string(quarter)), Value((sk - sk_epoch) / 7 + 1),
-              Value(std::string(kDayNames[static_cast<size_t>(dow)]))}));
+          std::array<char, 32> id{};
+          [[maybe_unused]] const int printed1 =
+              std::snprintf(id.data(), id.size(), "AAAAAA%08ld",
+                            static_cast<long>(sk % 100000000));
+          std::array<char, 64> date_text{};
+          [[maybe_unused]] const int printed2 =
+              std::snprintf(date_text.data(), date_text.size(),
+                            "%04ld-%02ld-%02ld", static_cast<long>(year),
+                            static_cast<long>(month), static_cast<long>(day));
+          std::array<char, 48> quarter{};
+          [[maybe_unused]] const int printed3 =
+              std::snprintf(quarter.data(), quarter.size(), "%04ldQ%ld",
+                            static_cast<long>(year),
+                            static_cast<long>(((month - 1) / 3) + 1));
+          data.date_dim.emplace_back(std::vector<Value>{
+              Value(sk), Value(std::string(id.data())),
+              Value::Date(date_text.data()), Value(month_seq), Value(year),
+              Value(dow), Value(month), Value(day),
+              Value(((month - 1) / 3) + 1), Value(std::string(quarter.data())),
+              Value(((sk - sk_epoch) / 7) + 1),
+              Value(std::string(kDayNames[static_cast<size_t>(dow)]))});
         }
       }
     }
   }
 
   // item
-  for (int64_t i = 1; i <= config.ItemRows(); ++i) {
+  for (int64_t i = 1; i <= ScaleConfig::ItemRows(); ++i) {
     const int64_t category_index = rng.Below(8);
     const auto& category = kCategories[static_cast<size_t>(category_index)];
     const auto& klass =
         rng.Pick(kClassesByCategory[static_cast<size_t>(category_index)]);
-    const int64_t brand_id = static_cast<int64_t>(rng.Next() % 30 + 1);
+    const auto brand_id = static_cast<int64_t>((rng.Next() % 30) + 1);
     // q3 filters i_manufact_id = 128; keep a quarter of items there.
     const int64_t manufact_id = rng.Below(4) == 0 ? 128 : rng.Below(1000) + 1;
-    char id[20];
-    std::snprintf(id, sizeof(id), "AAAAAAAA%08ld", static_cast<long>(i));
+    // The buffers hold the theoretical maximum long rendering even though
+    // the loops only produce a few digits, so snprintf cannot truncate.
+    std::array<char, 32> id{};
+    [[maybe_unused]] const int printed4 = std::snprintf(
+        id.data(), id.size(), "AAAAAAAA%08ld", static_cast<long>(i));
     // A cheap tail keeps q21's i_current_price BETWEEN 0.99 AND 1.49 hit;
     // the tracked items (1..60, densely inventoried below) are all cheap.
     const bool cheap_tail = rng.Below(6) == 0;
     const double list_price = (i <= 60 || cheap_tail) ? rng.Uniform(1.0, 3.0)
                                                       : rng.Uniform(1.0, 400.0);
-    data.item.emplace_back(Row(std::vector<Value>{
-        Value(i), Value(std::string(id)),
+    data.item.emplace_back(std::vector<Value>{
+        Value(i), Value(std::string(id.data())),
         Value("lyricite " + std::string(klass) + " " + std::string(category)),
         Value(list_price), Value(list_price * 0.55), Value(brand_id),
         Value("brand#" + std::to_string(brand_id)),
-        Value(static_cast<int64_t>(rng.Next() % 10 + 1)),
+        Value(static_cast<int64_t>((rng.Next() % 10) + 1)),
         Value(std::string(klass)), Value(category_index + 1),
         Value(std::string(category)), Value(manufact_id),
         Value("manufact#" + std::to_string(manufact_id)),
-        Value(static_cast<int64_t>(rng.Next() % 64 +
+        Value(static_cast<int64_t>((rng.Next() % 64) +
                                    1)),  // q42 picks 1, q55 picks 28
         Value(std::string(rng.Pick(kSizes))),
-        Value(std::string(rng.Pick(kColors)))}));
+        Value(std::string(rng.Pick(kColors))),
+        // q22 groups by i_product_name (added post-hoc).  Index-derived, so
+        // no RNG stream (main or aux) shifts and the pinned rows stay put;
+        // the 12-value pool keeps the ROLLUP group count bounded.
+        Value("product#" + std::to_string((i % 12) + 1))});
   }
 
   // store (12 fixed-size)
   for (int64_t i = 1; i <= 12; ++i) {
-    const int64_t company_id = (i - 1) / 6 + 1;
-    data.store.emplace_back(Row(std::vector<Value>{
+    const int64_t company_id = ((i - 1) / 6) + 1;
+    data.store.emplace_back(std::vector<Value>{
         Value(i), Value("store#" + std::to_string(i)),
         Value("store_" + std::to_string(i)), Value(rng.Int(50, 400)),
         Value(rng.Int(1000, 20000)), Value(std::string(rng.Pick(kCounties))),
@@ -346,22 +408,24 @@ inline GeneratedData Generate(int64_t scale) {
             (i - 1) % static_cast<int64_t>(kStates.size()))])),
         Value(std::string(rng.Pick(kCities))),
         Value("company" + std::to_string(company_id)), Value(company_id),
-        Value(rng.Below(2) == 0 ? -5 : -7), Value("zip" + std::to_string(i))}));
+        Value(rng.Below(2) == 0 ? -5 : -7), Value("zip" + std::to_string(i))});
   }
 
   // customer_address
-  for (int64_t i = 1; i <= config.AddressRows(); ++i) {
-    char id[16];
-    std::snprintf(id, sizeof(id), "AAAAAAA%08ld", static_cast<long>(i));
-    char zip[12];
-    std::snprintf(zip, sizeof(zip), "%05ld",
-                  static_cast<long>(rng.Below(100000)));
-    data.customer_address.emplace_back(Row(std::vector<Value>{
-        Value(i), Value(std::string(id)), Value(std::string(rng.Pick(kCities))),
+  for (int64_t i = 1; i <= ScaleConfig::AddressRows(); ++i) {
+    std::array<char, 32> id{};
+    [[maybe_unused]] const int printed5 = std::snprintf(
+        id.data(), id.size(), "AAAAAAA%08ld", static_cast<long>(i));
+    std::array<char, 24> zip{};
+    [[maybe_unused]] const int printed6 = std::snprintf(
+        zip.data(), zip.size(), "%05ld", static_cast<long>(rng.Below(100000)));
+    data.customer_address.emplace_back(std::vector<Value>{
+        Value(i), Value(std::string(id.data())),
+        Value(std::string(rng.Pick(kCities))),
         Value(std::string(rng.Pick(kCounties))),
-        Value(std::string(rng.Pick(kStates))), Value(std::string(zip)),
+        Value(std::string(rng.Pick(kStates))), Value(std::string(zip.data())),
         Value(std::string("United States")),
-        Value(rng.Below(2) == 0 ? -5 : -7)}));
+        Value(rng.Below(2) == 0 ? -5 : -7)});
   }
 
   // customer_demographics: every 2x5x5 gender x marital x education combo
@@ -372,13 +436,13 @@ inline GeneratedData Generate(int64_t scale) {
       for (const std::string_view gender : {"M", "F"}) {
         for (const std::string_view marital : {"S", "M", "W", "D", "U"}) {
           for (const std::string_view education : kEducations) {
-            data.customer_demographics.emplace_back(Row(std::vector<Value>{
+            data.customer_demographics.emplace_back(std::vector<Value>{
                 Value(sk), Value(std::string(gender)),
                 Value(std::string(marital)), Value(std::string(education)),
                 Value(rng.Int(1000, 20000)),
                 Value(std::string(rng.Pick(kCreditRatings))),
                 Value(rng.Int(0, 6)), Value(rng.Int(0, 7)),
-                Value(rng.Int(0, 5))}));
+                Value(rng.Int(0, 5))});
             ++sk;
           }
         }
@@ -389,18 +453,19 @@ inline GeneratedData Generate(int64_t scale) {
   // household_demographics (100)
   for (int64_t i = 1; i <= 100; ++i) {
     data.household_demographics.emplace_back(
-        Row(std::vector<Value>{Value(i), Value(rng.Int(1, 20)),
-                               Value(std::string(rng.Pick(kBuyPotential))),
-                               Value(rng.Int(0, 5)), Value(rng.Int(0, 4))}));
+        std::vector<Value>{Value(i), Value(rng.Int(1, 20)),
+                           Value(std::string(rng.Pick(kBuyPotential))),
+                           Value(rng.Int(0, 5)), Value(rng.Int(0, 4))});
   }
 
   // customer
-  for (int64_t i = 1; i <= config.CustomerRows(); ++i) {
-    char id[32];
-    std::snprintf(id, sizeof(id), "AAAAAAAA%08ld", static_cast<long>(i * 17));
-    data.customer.emplace_back(Row(std::vector<Value>{
-        Value(i), Value(std::string(id)), Value(rng.Int(1, 200)),
-        Value(rng.Int(1, 100)), Value(rng.Int(1, config.AddressRows())),
+  for (int64_t i = 1; i <= ScaleConfig::CustomerRows(); ++i) {
+    std::array<char, 32> id{};
+    [[maybe_unused]] const int printed7 = std::snprintf(
+        id.data(), id.size(), "AAAAAAAA%08ld", static_cast<long>(i * 17));
+    data.customer.emplace_back(std::vector<Value>{
+        Value(i), Value(std::string(id.data())), Value(rng.Int(1, 200)),
+        Value(rng.Int(1, 100)), Value(rng.Int(1, ScaleConfig::AddressRows())),
         Value(rng.Int(1, 12)), Value(rng.Int(1, 28)),
         Value(rng.Int(1930, 2000)),
         Value(std::string(rng.Below(2) == 0 ? "M" : "F")),
@@ -408,47 +473,76 @@ inline GeneratedData Generate(int64_t scale) {
         Value(std::string(rng.Pick(kFirstNames))),
         Value(std::string(rng.Pick(kLastNames))),
         Value(std::string(rng.Below(4) == 0 ? "Y" : "N")),
-        Value(std::string(rng.Pick(kFirstNames)) + "." +
-              std::string(rng.Pick(kLastNames)) + "@" +
-              std::to_string(rng.Below(100000)) + ".com"),
-        Value("login" + std::to_string(i)),
-        Value(std::string(aux_rng.Pick(kFirstNames)) + "." +
-              std::string(aux_rng.Pick(kLastNames)) + "@" +
-              std::to_string(aux_rng.Below(100000)) + ".org")}));
+        // Each draw in its own statement: an operator+ chain does not
+        // sequence its operand draws, which made the fixture
+        // compiler-dependent (gcc vs clang argument evaluation order).
+        Value([&] {
+          const std::string first(rng.Pick(kFirstNames));
+          const std::string last(rng.Pick(kLastNames));
+          const std::string number = std::to_string(rng.Below(100000));
+          std::string email;
+          email.reserve(first.size() + last.size() + number.size() + 7);
+          email += first;
+          email += '.';
+          email += last;
+          email += '@';
+          email += number;
+          email += ".com";
+          return Value(std::move(email));
+        }()),
+        Value("login" + std::to_string(i)), Value([&] {
+          const std::string first(aux_rng.Pick(kFirstNames));
+          const std::string last(aux_rng.Pick(kLastNames));
+          const std::string number = std::to_string(aux_rng.Below(100000));
+          std::string email;
+          email.reserve(first.size() + last.size() + number.size() + 7);
+          email += first;
+          email += '.';
+          email += last;
+          email += '@';
+          email += number;
+          email += ".org";
+          return Value(std::move(email));
+        }()),
+        Value("United States"),
+        // q30 output column; index-derived DATE so no stream shifts.
+        Value::Date(civil_date_text(1998 + ((i * 37) % 6), ((i * 11) % 12) + 1,
+                                    ((i * 13) % 28) + 1)
+                        .data())});
   }
 
   // promotion (50)
   for (int64_t i = 1; i <= 50; ++i) {
-    data.promotion.emplace_back(Row(std::vector<Value>{
+    data.promotion.emplace_back(std::vector<Value>{
         Value(i), Value("promo#" + std::to_string(i)),
         Value(std::string(rng.Pick(kYN))), Value(std::string(rng.Pick(kYN))),
-        Value(std::string(rng.Pick(kYN))), Value(std::string(rng.Pick(kYN)))}));
+        Value(std::string(rng.Pick(kYN))), Value(std::string(rng.Pick(kYN)))});
   }
 
   // reason
-  for (int64_t i = 1; i <= static_cast<int64_t>(kReasons.size()); ++i) {
-    char id[40];
-    std::snprintf(id, sizeof(id), "AAAAAAAABAAAAAAA%02ld",
-                  static_cast<long>(i));
-    data.reason.emplace_back(Row(std::vector<Value>{
-        Value(i), Value(std::string(id)),
-        Value(std::string(kReasons[static_cast<size_t>(i - 1)]))}));
+  for (int64_t i = 1; std::cmp_less_equal(i, kReasons.size()); ++i) {
+    std::array<char, 40> id{};
+    [[maybe_unused]] const int printed8 = std::snprintf(
+        id.data(), id.size(), "AAAAAAAABAAAAAAA%02ld", static_cast<long>(i));
+    data.reason.emplace_back(std::vector<Value>{
+        Value(i), Value(std::string(id.data())),
+        Value(std::string(kReasons[static_cast<size_t>(i - 1)]))});
   }
 
   // income_band (20 fixed)
   for (int64_t i = 1; i <= 20; ++i) {
-    data.income_band.emplace_back(Row(
-        std::vector<Value>{Value(i), Value((i - 1) * 5000), Value(i * 5000)}));
+    data.income_band.emplace_back(
+        std::vector<Value>{Value(i), Value((i - 1) * 5000), Value(i * 5000)});
   }
 
   // warehouse (5)
   for (int64_t i = 1; i <= 5; ++i) {
-    data.warehouse.emplace_back(Row(
+    data.warehouse.emplace_back(
         std::vector<Value>{Value(i), Value("warehouse#" + std::to_string(i)),
                            Value("warehouse_" + std::to_string(i)),
                            Value(std::string(rng.Pick(kCities))),
                            Value(std::string(rng.Pick(kStates))),
-                           Value(rng.Below(2) == 0 ? -5 : -7)}));
+                           Value(rng.Below(2) == 0 ? -5 : -7)});
   }
 
   // call_center (6, matching the cs_call_center_sk key range; q16 filters
@@ -456,11 +550,69 @@ inline GeneratedData Generate(int64_t scale) {
   // All draws come from the aux stream: this table was added after the
   // fixture's pinned data was generated.
   for (int64_t i = 1; i <= 6; ++i) {
-    data.call_center.emplace_back(Row(std::vector<Value>{
+    data.call_center.emplace_back(std::vector<Value>{
         Value(i), Value("call_center#" + std::to_string(i)),
         Value(std::string(i % 3 == 0 ? "Williamson County"
                                      : aux_rng.Pick(kCounties))),
-        Value(std::string(aux_rng.Pick(kStates)))}));
+        Value(std::string(aux_rng.Pick(kStates))),
+        // q91/q99 group by cc_name; index-derived so the aux stream above
+        // keeps its draw order.
+        Value("CC#" + std::to_string(i)),
+        Value("manager#" + std::to_string(((i - 1) % 3) + 1))});
+  }
+
+  // Channel dimensions for the web/catalog-page query wave: every value
+  // comes from the aux stream (or is index-derived) so none of the earlier
+  // pins move.  web_page char counts span the q90 band (5000..5200).
+  for (int64_t i = 1; i <= 12; ++i) {
+    data.web_site.emplace_back(
+        std::vector<Value>{Value(i), Value("site#" + std::to_string(i)),
+                           Value("site_" + std::to_string(i)),
+                           Value(std::string(aux_rng.Pick(kCities))),
+                           Value(std::string(aux_rng.Pick(kStates))),
+                           Value(std::string(aux_rng.Pick(kCounties)))});
+  }
+  static const std::vector<std::string_view> kWebPageTypes = {
+      "home", "search", "item", "product", "static"};
+  for (int64_t i = 1; i <= 60; ++i) {
+    data.web_page.emplace_back(std::vector<Value>{
+        Value(i), Value("page#" + std::to_string(i)),
+        Value(std::string(aux_rng.Pick(kWebPageTypes))),
+        Value(aux_rng.Int(4000, 6000)), Value(aux_rng.Int(1, 50))});
+  }
+  for (int64_t i = 1; i <= 30; ++i) {
+    data.catalog_page.emplace_back(std::vector<Value>{
+        Value(i), Value("catalog_page#" + std::to_string(i)),
+        Value(std::string(kCategories[static_cast<size_t>(i % 8)])),
+        Value(aux_rng.Int(1, 20))});
+  }
+  // ship_mode: 20 modes over the five canonical TPC-DS type labels,
+  // index-derived so the aux stream keeps its draw order.
+  static const std::vector<std::string_view> kShipModes = {
+      "2-DAY", "AIR", "ECONOMY", "EXPRESS", "REGULAR"};
+  for (int64_t i = 1; i <= 20; ++i) {
+    data.ship_mode.emplace_back(std::vector<Value>{
+        Value(i),
+        Value(std::string(kShipModes[static_cast<size_t>((i - 1) % 5)])),
+        Value("carrier#" + std::to_string(((i - 1) % 6) + 1))});
+  }
+  // time_dim: one row per minute of the day.  t_meal_time follows the
+  // official breakfast/lunch/dinner bands (elsewhere an empty string);
+  // entirely index-derived.
+  for (int64_t minute = 0; minute < ScaleConfig::TimeDimRows(); ++minute) {
+    const int64_t hour = minute / 60;
+    std::array<char, 16> time_text{};
+    [[maybe_unused]] const int printed9 =
+        std::snprintf(time_text.data(), time_text.size(), "%02ld:%02ld:00",
+                      static_cast<long>(hour), static_cast<long>(minute % 60));
+    const std::string_view meal = hour >= 5 && hour <= 10    ? "breakfast"
+                                  : hour >= 12 && hour <= 14 ? "lunch"
+                                  : hour >= 17 && hour <= 20 ? "dinner"
+                                                             : "";
+    data.time_dim.emplace_back(std::vector<Value>{
+        Value(minute + 1), Value(std::string(time_text.data())), Value(hour),
+        Value(minute % 60), Value(hour < 12 ? "AM" : "PM"),
+        Value(std::string(meal))});
   }
 
   // Fact rows share one generator: sale dates 1998-01-01..2002-12-31,
@@ -493,29 +645,42 @@ inline GeneratedData Generate(int64_t scale) {
             Value(ext_sales),      Value(ext_wholesale),
             Value(ext_list),       Value(tax),
             Value(coupon),         Value(net_paid),
-            Value(net_paid + tax), Value(net_paid - ext_wholesale * 0.1)};
+            Value(net_paid + tax), Value(net_paid - (ext_wholesale * 0.1))};
       };
 
   const int64_t sk_min = DateSkFromCivil(1998, 1, 1);
   const int64_t sk_span = DateSkFromCivil(2002, 12, 31) - sk_min + 1;
   for (int64_t i = 1; i <= config.StoreSalesRows(); ++i) {
-    data.store_sales.push_back(Row(std::vector<Value>(make_sale_row(
-        sk_min + rng.Below(sk_span), rng.Int(1, config.ItemRows()),
-        rng.Int(1, config.CustomerRows()), rng.Int(1, 200), rng.Int(1, 100),
-        rng.Int(1, config.AddressRows()), rng.Int(1, 12), rng.Int(1, 50),
-        rng.Int(1, 5000)))));
+    // One draw per statement: function-argument evaluation order is
+    // unspecified, so inline draws made every fact row compiler-dependent
+    // (gcc right-to-left vs clang left-to-right).
+    const int64_t date_sk = sk_min + rng.Below(sk_span);
+    const int64_t item_sk = rng.Int(1, ScaleConfig::ItemRows());
+    const int64_t customer_sk = rng.Int(1, ScaleConfig::CustomerRows());
+    const int64_t cdemo_sk = rng.Int(1, 200);
+    const int64_t hdemo_sk = rng.Int(1, 100);
+    const int64_t addr_sk = rng.Int(1, ScaleConfig::AddressRows());
+    const int64_t seller_sk = rng.Int(1, 12);
+    const int64_t promo_sk = rng.Int(1, 50);
+    const int64_t ticket = rng.Int(1, 5000);
+    std::vector<Value> sale =
+        make_sale_row(date_sk, item_sk, customer_sk, cdemo_sk, hdemo_sk,
+                      addr_sk, seller_sk, promo_sk, ticket);
+    // Post-pinned column (q88/q96): minute-of-day sk into time_dim.
+    sale.emplace_back(aux_rng.Int(1, ScaleConfig::TimeDimRows()));
+    data.store_sales.emplace_back(std::move(sale));
   }
   // store_returns: every k-th store_sales row becomes a return, keeping the
   // (item, customer, ticket) join keys so sr⋈ss predicates have matches.
   for (size_t i = 0; i < data.store_sales.size() &&
-                     i < static_cast<size_t>(config.StoreReturnsRows());
+                     std::cmp_less(i, config.StoreReturnsRows());
        ++i) {
     const std::vector<Value>& sale =
         data.store_sales[i * data.store_sales.size() /
                          static_cast<size_t>(config.StoreReturnsRows())]
             .values_;
     const int64_t returned_sk = sale[0].value.int_value + rng.Int(5, 60);
-    data.store_returns.emplace_back(Row(std::vector<Value>{
+    data.store_returns.emplace_back(std::vector<Value>{
         Value(returned_sk), sale[1], sale[2], sale[3], sale[4], sale[5],
         sale[6], sale[8], Value(sale[9].value.int_value),
         Value(sale[14].value.double_value),        // sr_return_amt
@@ -523,7 +688,7 @@ inline GeneratedData Generate(int64_t scale) {
         Value(sale[19].value.double_value),        // sr_refunded_cash
         Value(sale[19].value.double_value),        // sr_net_paid
         Value(sale[19].value.double_value + 1.0),  // sr_net_paid_inc_tax
-        Value(rng.Int(1, static_cast<int64_t>(kReasons.size())))}));
+        Value(rng.Int(1, static_cast<int64_t>(kReasons.size())))});
   }
 
   for (int64_t i = 1; i <= config.CatalogSalesRows(); ++i) {
@@ -533,69 +698,114 @@ inline GeneratedData Generate(int64_t scale) {
     const bool reuse = !data.store_sales.empty() && rng.Below(2) == 0;
     const Row& donor = data.store_sales[static_cast<size_t>(
         rng.Below(static_cast<int64_t>(data.store_sales.size())))];
-    std::vector<Value> sale = make_sale_row(
-        sk_min + rng.Below(sk_span),
-        reuse ? donor.values_[1].value.int_value
-              : rng.Int(1, config.ItemRows()),
-        reuse ? donor.values_[2].value.int_value
-              : rng.Int(1, config.CustomerRows()),
-        rng.Int(1, 200), rng.Int(1, 100), rng.Int(1, config.AddressRows()),
-        rng.Int(1, 5), rng.Int(1, 50), rng.Int(1, 100000));
+    // One draw per statement (see the store_sales loop above).
+    const int64_t date_sk = sk_min + rng.Below(sk_span);
+    const int64_t item_sk = reuse ? donor.values_[1].value.int_value
+                                  : rng.Int(1, ScaleConfig::ItemRows());
+    const int64_t customer_sk = reuse ? donor.values_[2].value.int_value
+                                      : rng.Int(1, ScaleConfig::CustomerRows());
+    const int64_t cdemo_sk = rng.Int(1, 200);
+    const int64_t hdemo_sk = rng.Int(1, 100);
+    const int64_t addr_sk = rng.Int(1, ScaleConfig::AddressRows());
+    const int64_t seller_sk = rng.Int(1, 5);
+    const int64_t promo_sk = rng.Int(1, 50);
+    const int64_t ticket = rng.Int(1, 100000);
+    std::vector<Value> sale =
+        make_sale_row(date_sk, item_sk, customer_sk, cdemo_sk, hdemo_sk,
+                      addr_sk, seller_sk, promo_sk, ticket);
     // Trailing ship-slot columns (cs_ship_customer_sk / cs_ship_date_sk /
     // cs_ship_addr_sk / cs_call_center_sk / cs_ext_ship_cost).  q16 compares
     // warehouse sks across catalog_sales rows sharing an order number, so
     // ship dates keep a separate draw from the sale date.
-    sale.push_back(Value(aux_rng.Int(1, config.CustomerRows())));
-    sale.push_back(Value(aux_rng.Int(0, 30) + sale[0].value.int_value));
-    sale.push_back(Value(aux_rng.Int(1, config.AddressRows())));
-    sale.push_back(Value(aux_rng.Int(1, 6)));
-    sale.push_back(Value(aux_rng.Uniform(100.0, 2000.0)));
-    data.catalog_sales.push_back(Row(std::move(sale)));
+    sale.emplace_back(aux_rng.Int(1, ScaleConfig::CustomerRows()));
+    sale.emplace_back(aux_rng.Int(0, 30) + sale[0].value.int_value);
+    sale.emplace_back(aux_rng.Int(1, ScaleConfig::AddressRows()));
+    sale.emplace_back(aux_rng.Int(1, 6));
+    sale.emplace_back(aux_rng.Uniform(100.0, 2000.0));
+    // Post-pinned columns (q5/q71/q99): time sk, catalog page, ship mode.
+    sale.emplace_back(aux_rng.Int(1, ScaleConfig::TimeDimRows()));
+    sale.emplace_back(aux_rng.Int(1, 30));
+    sale.emplace_back(aux_rng.Int(1, 20));
+    data.catalog_sales.emplace_back(std::move(sale));
   }
   for (int64_t i = 1; i <= config.WebSalesRows(); ++i) {
-    // seller slot carries the ship-customer key; ticket slot the order number.
-    data.web_sales.push_back(Row(std::vector<Value>(make_sale_row(
-        sk_min + rng.Below(sk_span), rng.Int(1, config.ItemRows()),
-        rng.Int(1, config.CustomerRows()), rng.Int(1, 200), rng.Int(1, 100),
-        rng.Int(1, config.AddressRows()), rng.Int(1, config.CustomerRows()),
-        rng.Int(1, 50), i))));
+    // seller slot carries the ship-customer key; ticket slot the order
+    // number.  Orders carry 5 line items (index-derived 1 + (i-1)/5) so the
+    // same-order cross-warehouse self-joins of q94/q95 have matches; the
+    // template's one-line orders would make those shapes empty.
+    // One draw per statement (see the store_sales loop above).
+    const int64_t date_sk = sk_min + rng.Below(sk_span);
+    const int64_t item_sk = rng.Int(1, ScaleConfig::ItemRows());
+    const int64_t customer_sk = rng.Int(1, ScaleConfig::CustomerRows());
+    const int64_t cdemo_sk = rng.Int(1, 200);
+    const int64_t hdemo_sk = rng.Int(1, 100);
+    const int64_t addr_sk = rng.Int(1, ScaleConfig::AddressRows());
+    const int64_t ship_customer_sk = rng.Int(1, ScaleConfig::CustomerRows());
+    const int64_t promo_sk = rng.Int(1, 50);
+    const int64_t order_number = ((i - 1) / 5) + 1;
+    std::vector<Value> sale =
+        make_sale_row(date_sk, item_sk, customer_sk, cdemo_sk, hdemo_sk,
+                      addr_sk, ship_customer_sk, promo_sk, order_number);
+    // Post-pinned columns (q5/q30/q62/q71/q80/q90/q94/q95): time sk,
+    // web site / page, ship date (lags 0..140 days so q62's delay buckets
+    // all fill), warehouse / ship-mode / ship household / ship address.
+    sale.emplace_back(aux_rng.Int(1, ScaleConfig::TimeDimRows()));
+    sale.emplace_back(aux_rng.Int(1, 12));
+    sale.emplace_back(aux_rng.Int(1, 60));
+    sale.emplace_back(aux_rng.Int(0, 140) + sale[0].value.int_value);
+    sale.emplace_back(aux_rng.Int(1, 5));
+    sale.emplace_back(aux_rng.Int(1, 20));
+    sale.emplace_back(aux_rng.Int(1, 100));
+    sale.emplace_back(aux_rng.Int(1, ScaleConfig::AddressRows()));
+    sale.emplace_back(aux_rng.Uniform(100.0, 2000.0));
+    data.web_sales.emplace_back(std::move(sale));
   }
   // catalog_returns / web_returns: every k-th sale row becomes a return,
   // keeping the (item, customer, order) join keys so wr⋈ws / cr⋈cs
   // predicates have matches, mirroring the store_returns derivation.
   for (size_t i = 0; i < data.catalog_sales.size() &&
-                     i < static_cast<size_t>(config.CatalogReturnsRows());
+                     std::cmp_less(i, config.CatalogReturnsRows());
        ++i) {
     const std::vector<Value>& sale =
         data.catalog_sales[i * data.catalog_sales.size() /
                            static_cast<size_t>(config.CatalogReturnsRows())]
             .values_;
     const int64_t returned_sk = sale[0].value.int_value + aux_rng.Int(5, 60);
-    data.catalog_returns.emplace_back(Row(std::vector<Value>{
+    data.catalog_returns.emplace_back(std::vector<Value>{
         Value(returned_sk), sale[1], sale[2], sale[3], sale[4], sale[5],
         sale[6], sale[8], Value(sale[9].value.int_value),
         Value(sale[14].value.double_value),        // cr_return_amount
         Value(aux_rng.Uniform(1.0, 10.0)),         // cr_fee
         Value(sale[19].value.double_value),        // cr_refunded_cash
         Value(sale[14].value.double_value * 0.1),  // cr_net_loss
-        Value(aux_rng.Int(1, static_cast<int64_t>(kReasons.size())))}));
+        Value(aux_rng.Int(1, static_cast<int64_t>(kReasons.size()))),
+        // Post-pinned columns (q5/q81/q91/q99): catalog page, call center,
+        // returning customer / address.
+        Value(aux_rng.Int(1, 30)), Value(aux_rng.Int(1, 6)),
+        Value(aux_rng.Int(1, ScaleConfig::CustomerRows())),
+        Value(aux_rng.Int(1, ScaleConfig::AddressRows()))});
   }
-  for (size_t i = 0; i < data.web_sales.size() &&
-                     i < static_cast<size_t>(config.WebReturnsRows());
+  for (size_t i = 0;
+       i < data.web_sales.size() && std::cmp_less(i, config.WebReturnsRows());
        ++i) {
     const std::vector<Value>& sale =
         data.web_sales[i * data.web_sales.size() /
                        static_cast<size_t>(config.WebReturnsRows())]
             .values_;
     const int64_t returned_sk = sale[0].value.int_value + aux_rng.Int(5, 60);
-    data.web_returns.emplace_back(Row(std::vector<Value>{
+    data.web_returns.emplace_back(std::vector<Value>{
         Value(returned_sk), sale[1], sale[2], sale[3], sale[4], sale[5],
         sale[8], Value(sale[9].value.int_value),
         Value(sale[14].value.double_value),        // wr_return_amount
         Value(aux_rng.Uniform(1.0, 10.0)),         // wr_fee
         Value(sale[19].value.double_value),        // wr_refunded_cash
         Value(sale[14].value.double_value * 0.1),  // wr_net_loss
-        Value(aux_rng.Int(1, static_cast<int64_t>(kReasons.size())))}));
+        Value(aux_rng.Int(1, static_cast<int64_t>(kReasons.size()))),
+        // Post-pinned columns (q30/q85): returning customer / demographics /
+        // address.
+        Value(aux_rng.Int(1, ScaleConfig::CustomerRows())),
+        Value(aux_rng.Int(1, 200)),
+        Value(aux_rng.Int(1, ScaleConfig::AddressRows()))});
   }
   // Dense weekly inventory for the tracked items (see item generation) plus
   // sparse random rows elsewhere, so q21 sees both sides of its date split.
@@ -603,16 +813,16 @@ inline GeneratedData Generate(int64_t scale) {
     for (int64_t warehouse = 1; warehouse <= 5; ++warehouse) {
       for (int64_t item_sk = 1; item_sk <= 60; ++item_sk) {
         data.inventory.emplace_back(
-            Row(std::vector<Value>{Value(sk_min + day), Value(item_sk),
-                                   Value(warehouse), Value(rng.Int(0, 500))}));
+            std::vector<Value>{Value(sk_min + day), Value(item_sk),
+                               Value(warehouse), Value(rng.Int(0, 500))});
       }
     }
   }
   for (int64_t i = 1; i <= config.InventoryRows(); ++i) {
     data.inventory.emplace_back(
-        Row(std::vector<Value>{Value(sk_min + rng.Below(sk_span)),
-                               Value(rng.Int(61, config.ItemRows())),
-                               Value(rng.Int(1, 5)), Value(rng.Int(0, 500))}));
+        std::vector<Value>{Value(sk_min + rng.Below(sk_span)),
+                           Value(rng.Int(61, ScaleConfig::ItemRows())),
+                           Value(rng.Int(1, 5)), Value(rng.Int(0, 500))});
   }
   return data;
 }
@@ -620,25 +830,78 @@ inline GeneratedData Generate(int64_t scale) {
 // Table name -> row container, in DDL order for the loader.
 inline const std::vector<Row>& RowsOf(const GeneratedData& data,
                                       std::string_view table) {
-  if (table == "date_dim") return data.date_dim;
-  if (table == "item") return data.item;
-  if (table == "store") return data.store;
-  if (table == "customer") return data.customer;
-  if (table == "customer_address") return data.customer_address;
-  if (table == "household_demographics") return data.household_demographics;
-  if (table == "customer_demographics") return data.customer_demographics;
-  if (table == "promotion") return data.promotion;
-  if (table == "reason") return data.reason;
-  if (table == "income_band") return data.income_band;
-  if (table == "warehouse") return data.warehouse;
-  if (table == "call_center") return data.call_center;
-  if (table == "store_sales") return data.store_sales;
-  if (table == "store_returns") return data.store_returns;
-  if (table == "catalog_sales") return data.catalog_sales;
-  if (table == "web_sales") return data.web_sales;
-  if (table == "catalog_returns") return data.catalog_returns;
-  if (table == "web_returns") return data.web_returns;
-  if (table == "inventory") return data.inventory;
+  if (table == "date_dim") {
+    return data.date_dim;
+  }
+  if (table == "item") {
+    return data.item;
+  }
+  if (table == "store") {
+    return data.store;
+  }
+  if (table == "customer") {
+    return data.customer;
+  }
+  if (table == "customer_address") {
+    return data.customer_address;
+  }
+  if (table == "household_demographics") {
+    return data.household_demographics;
+  }
+  if (table == "customer_demographics") {
+    return data.customer_demographics;
+  }
+  if (table == "promotion") {
+    return data.promotion;
+  }
+  if (table == "reason") {
+    return data.reason;
+  }
+  if (table == "income_band") {
+    return data.income_band;
+  }
+  if (table == "warehouse") {
+    return data.warehouse;
+  }
+  if (table == "call_center") {
+    return data.call_center;
+  }
+  if (table == "web_site") {
+    return data.web_site;
+  }
+  if (table == "web_page") {
+    return data.web_page;
+  }
+  if (table == "catalog_page") {
+    return data.catalog_page;
+  }
+  if (table == "ship_mode") {
+    return data.ship_mode;
+  }
+  if (table == "time_dim") {
+    return data.time_dim;
+  }
+  if (table == "store_sales") {
+    return data.store_sales;
+  }
+  if (table == "store_returns") {
+    return data.store_returns;
+  }
+  if (table == "catalog_sales") {
+    return data.catalog_sales;
+  }
+  if (table == "web_sales") {
+    return data.web_sales;
+  }
+  if (table == "catalog_returns") {
+    return data.catalog_returns;
+  }
+  if (table == "web_returns") {
+    return data.web_returns;
+  }
+  if (table == "inventory") {
+    return data.inventory;
+  }
   static const std::vector<Row> kEmpty;
   return kEmpty;
 }

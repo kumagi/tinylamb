@@ -114,7 +114,7 @@ list の射影が来れば別グループに隔離**されます。次に各分�
 
 ## 関連 Rule との相互作用
 
-- `merge_projections` / `merge_adjacent_projections`: 分岐内の射影が
+- `merge_projections` / `merge_projections`: 分岐内の射影が
   分岐側の既存射影と隣接した場合に合成されます。
 - `union_all_merge`: 隣接する UNION ALL を 1 つにまとめ、分配後の
   多分岐形を正規化します。

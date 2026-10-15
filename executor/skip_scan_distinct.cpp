@@ -139,7 +139,7 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       next_key.DecodeMemcomparableFormat(iter_.Key());
       bool prefix_equal = true;
       for (size_t col = 0;
-           col < prefix_cols_ && col < prev_key.Size() && col < next_key.Size();
+           col < prefix_cols_ && col < prev_key.Count() && col < next_key.Count();
            ++col) {
         if (prev_key[col] != next_key[col]) {
           prefix_equal = false;
@@ -152,7 +152,7 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       // Same prefix, seek past this prefix using BPlusTree seek with prefix
       // upper bound!
       std::vector<Value> prefix_values;
-      for (size_t col = 0; col < prefix_cols_ && col < prev_key.Size(); ++col) {
+      for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count(); ++col) {
         prefix_values.push_back(prev_key[col]);
       }
       std::string seek_after = EncodeParts(prefix_values);
@@ -167,7 +167,7 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       next_key.DecodeMemcomparableFormat(iter_.Key());
       bool prefix_equal = true;
       for (size_t col = 0;
-           col < prefix_cols_ && col < prev_key.Size() && col < next_key.Size();
+           col < prefix_cols_ && col < prev_key.Count() && col < next_key.Count();
            ++col) {
         if (prev_key[col] != next_key[col]) {
           prefix_equal = false;

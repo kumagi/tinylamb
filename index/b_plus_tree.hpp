@@ -81,7 +81,7 @@ class BPlusTree {
                                                page_id_t root);
 
  private:
-  static Status LeafInsert(Transaction& txn, PageRef& leaf,
+  static Status LeafInsert(Transaction& txn, page_id_t root, PageRef& leaf,
                            std::string_view key, std::string_view value);
   // Descending-scan start position: last key strictly below `end`, retreating
   // leftwards through leaves; false when no such key exists.
@@ -105,6 +105,10 @@ class BPlusTree {
   // Follows the foster chain rightwards while the chain key is <= `key`.
   static Status FollowFosterChain(Transaction& txn, PageRef& leaf,
                                   std::string_view key);
+  // Single latch-held descent; FindLeaf wraps this with the foreign-
+  // reservation drain retry.
+  StatusOr<PageRef> FindLeafOnce(Transaction& txn, std::string_view key,
+                                 bool less_than);
   StatusOr<PageRef> FindLeaf(Transaction& txn, std::string_view key,
                              bool less_than);
   // Landing-leaf reuse: validate `hint` against the live tree (current root

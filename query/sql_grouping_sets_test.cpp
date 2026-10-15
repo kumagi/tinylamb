@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -282,6 +283,62 @@ TEST_F(SqlGroupingSetsTest, HavingUsesGroupingConstants) {
   EXPECT_EQ(rows[3][1], Value(int64_t{100}));
 }
 
+// A ROLLUP nested inside GROUPING SETS unions its hierarchy into the list:
+// GROUPING SETS ((a), ROLLUP(b)) == GROUPING SETS ((a), (b), ()).
+TEST_F(SqlGroupingSetsTest, GroupingSetListUnionsNestedRollup) {
+  const auto rows =
+      Run("SELECT a, b, COUNT(*) AS c, GROUPING(a) AS ga, GROUPING(b) AS gb "
+          "FROM g GROUP BY GROUPING SETS ((a), ROLLUP(b)) "
+          "ORDER BY a NULLS LAST, b NULLS LAST, ga, gb");
+  // Branch (a): 3 a-groups; branch (b): 4 b-groups; branch (): grand total.
+  ASSERT_EQ(rows.size(), 8U);
+  // The (a) branches keep a and NULL-pad b (ga=0, gb=1).
+  EXPECT_EQ(rows[0][0], Value(int64_t{1}));
+  EXPECT_TRUE(rows[0][1].IsNull());
+  EXPECT_EQ(rows[0][3], Value(int64_t{0}));
+  EXPECT_EQ(rows[0][4], Value(int64_t{1}));
+  EXPECT_EQ(rows[0][2], Value(int64_t{2}));
+  EXPECT_EQ(rows[1][0], Value(int64_t{2}));
+  EXPECT_EQ(rows[1][2], Value(int64_t{1}));
+  // The (b) branches NULL-pad a and keep b (ga=1, gb=0).
+  EXPECT_TRUE(rows[2][0].IsNull());
+  EXPECT_EQ(rows[2][1], Value(std::string("n1")));
+  EXPECT_EQ(rows[2][3], Value(int64_t{1}));
+  EXPECT_EQ(rows[2][4], Value(int64_t{0}));
+  EXPECT_EQ(rows[2][2], Value(int64_t{1}));
+  EXPECT_EQ(rows[5][1], Value(std::string("q1")));
+  // The (a)-branch row whose key is NULL sorts with a NULLS LAST but keeps
+  // ga=0; the () branch NULL-pads both keys (ga=1, gb=1) over all 4 rows.
+  EXPECT_TRUE(rows[6][0].IsNull());
+  EXPECT_TRUE(rows[6][1].IsNull());
+  EXPECT_EQ(rows[6][3], Value(int64_t{0}));
+  EXPECT_EQ(rows[6][2], Value(int64_t{1}));
+  EXPECT_TRUE(rows[7][0].IsNull());
+  EXPECT_TRUE(rows[7][1].IsNull());
+  EXPECT_EQ(rows[7][3], Value(int64_t{1}));
+  EXPECT_EQ(rows[7][4], Value(int64_t{1}));
+  EXPECT_EQ(rows[7][2], Value(int64_t{4}));
+}
+
+// Same union semantics for CUBE inside the list; a ROLLUP-only list keeps
+// the hierarchy.
+TEST_F(SqlGroupingSetsTest, GroupingSetListUnionsNestedCubeAndList) {
+  const auto rows =
+      Run("SELECT COUNT(*) AS c FROM ("
+          "  SELECT a, b FROM g GROUP BY GROUPING SETS ((a), CUBE(b)))");
+  // Branch (a): 3 rows; CUBE(b): 4 b-groups + the () grand-total row.
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{8}));
+
+  const auto rollup_only =
+      Run("SELECT b, COUNT(*) AS c FROM g GROUP BY GROUPING SETS (ROLLUP(b)) "
+          "ORDER BY b NULLS LAST");
+  ASSERT_EQ(rollup_only.size(), 5U);
+  EXPECT_EQ(rollup_only[0][1], Value(int64_t{1}));
+  EXPECT_TRUE(rollup_only[4][0].IsNull());
+  EXPECT_EQ(rollup_only[4][1], Value(int64_t{4}));
+}
+
 // GROUP BY may reference select aliases inside the constructors; the
 // aliased entry NULL-pads in branches where the alias key is inactive.
 TEST_F(SqlGroupingSetsTest, AliasKeyRollupNullPadsAliasedEntry) {
@@ -359,12 +416,32 @@ TEST_F(SqlGroupingSetsTest, OrdinalKeysInsideRollup) {
   EXPECT_EQ(rows[3][1], Value(int64_t{4}));
 }
 
+// Window calls see the composite of every grouping set: ranks run across the
+// NULL-padded inactive-key rows instead of restarting per branch.
+TEST_F(SqlGroupingSetsTest, WindowOverRollupRanksComposite) {
+  // a: {1, 1, 2, NULL}.  ROLLUP(a) emits groups {1}, {2}, {NULL} plus the ()
+  // grand total, so the window input is {1, 2, NULL, NULL} with NULLS FIRST
+  // ranking: both NULL rows take ranks 1-2, then 1 -> 3 and 2 -> 4.  Branch
+  // -local ranking would have given 1 -> 2 instead of 3.
+  const auto rows =
+      Run("SELECT a, RANK() OVER (ORDER BY a) AS rk FROM g "
+          "GROUP BY ROLLUP(a)");
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{1}));
+  EXPECT_EQ(rows[0][1], Value(int64_t{3}));
+  EXPECT_EQ(rows[1][0], Value(int64_t{2}));
+  EXPECT_EQ(rows[1][1], Value(int64_t{4}));
+  EXPECT_TRUE(rows[2][0].IsNull());
+  EXPECT_TRUE(rows[3][0].IsNull());
+  // The two NULL rows (inactive-key group and grand total) are peers at
+  // rank 1; the tie is what pushes the {1} group to rank 3.
+  EXPECT_EQ(rows[2][1], Value(int64_t{1}));
+  EXPECT_EQ(rows[3][1], Value(int64_t{1}));
+}
+
 // Shapes the expansion refuses, each with a dedicated diagnostic.
 TEST_F(SqlGroupingSetsTest, UnsupportedShapesRejectWithDiagnostics) {
   EXPECT_THROW(Run("SELECT DISTINCT a, COUNT(*) AS c FROM g GROUP BY "
-                   "ROLLUP(a)"),
-               std::runtime_error);
-  EXPECT_THROW(Run("SELECT a, RANK() OVER (ORDER BY a) FROM g GROUP BY "
                    "ROLLUP(a)"),
                std::runtime_error);
   // GROUPING without a set constructor never folds; the evaluator rejects
@@ -377,6 +454,52 @@ TEST_F(SqlGroupingSetsTest, UnsupportedShapesRejectWithDiagnostics) {
   // GROUPING arguments must be grouping keys.
   EXPECT_THROW(Run("SELECT a, GROUPING(b) AS gb FROM g GROUP BY ROLLUP(a)"),
                std::runtime_error);
+}
+
+// The UNION ALL branches of a grouping-set expansion must not carry their own
+// WITH copies: each branch used to re-execute every CTE body once per
+// grouping set (TPC-DS q5-class queries paid N× the CTE scan).
+TEST_F(SqlGroupingSetsTest, CteBodyExecutesOncePerGroupingSetExpansion) {
+  const auto rows =
+      Run("WITH c AS (SELECT a, x FROM g UNION ALL SELECT NULL, x FROM g "
+          "WHERE x > 100) "
+          "SELECT a, SUM(x) AS s FROM c GROUP BY ROLLUP(a) "
+          "ORDER BY a NULLS LAST");
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{1}));
+  EXPECT_EQ(rows[0][1], Value(int64_t{30}));
+  EXPECT_EQ(rows[1][0], Value(int64_t{2}));
+  EXPECT_EQ(rows[1][1], Value(int64_t{30}));
+  EXPECT_TRUE(rows[2][0].IsNull());
+  EXPECT_TRUE(rows[3][0].IsNull());
+  // Rows: the {1} group covers (1,p1)+(1,p2), the {2} group covers (2,q1),
+  // and the two NULL rows are the (a) NULL key group and the grand total.
+
+  SqlEngine engine(*database_);
+  StatusOr<Executor> prepared = engine.Prepare(
+      *context_,
+      "WITH c AS (SELECT a, x FROM g UNION ALL SELECT NULL, x FROM g "
+      "WHERE x > 100) "
+      "SELECT a, SUM(x) AS s FROM c GROUP BY ROLLUP(a) ORDER BY a NULLS LAST");
+  ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+  Row result;
+  ASSERT_TRUE(prepared.Value()->Next(&result, nullptr));
+  while (prepared.Value()->Next(&result, nullptr)) {
+  }
+  std::ostringstream profile;
+  prepared.Value()->Dump(profile, 0);
+  // One CTE body pass scans g twice (4 rows per scan). Re-execution per
+  // grouping-set branch would multiply this by the branch count.
+  const std::string dumped = profile.str();
+  const size_t scan_rows = [&dumped]() -> size_t {
+    const std::string key = "scan_rows=";
+    const size_t at = dumped.find(key);
+    return at == std::string::npos
+               ? 0
+               : std::stoull(dumped.substr(at + key.size()));
+  }();
+  EXPECT_GT(scan_rows, 0U) << dumped;
+  EXPECT_LE(scan_rows, 8U) << dumped;
 }
 
 }  // namespace tinylamb

@@ -8,7 +8,7 @@
 
 論理式 `kApply`（相関サブクエリにおいて外側の 1 行ごとに入力パラメータを束縛して内側を実行する入れ子ループ演算）を、物理プラン `ApplyPlan` へと変換する Rule です。
 
-デコリレーション論理ルール（`apply_to_join` や `decorrelate_aggregate_apply` など）によって通常の結合へ解消されなかった残余の相関式に対し、実行系として正しく動作する標準的な物理フォールバックを提供します。
+デコリレーションによって通常の結合へ解消されなかった残余の相関式（旧 `apply_to_join` / `decorrelate_aggregate_apply` は 2026-10-02 に撤去、履歴はルール監査を参照）に対し、実行系として正しく動作する標準的な物理フォールバックを提供します。
 
 ## 変換前後の関係
 
@@ -89,8 +89,8 @@ return std::vector<PlanAlternative>{
 
 ## 関連 Rule との相互作用
 
-- `apply_to_join` / `decorrelate_aggregate_apply`: `kApply` を可能な限り結合へとデコリレーションする論理ルール群です。これらが適用できなかった相関が本 Rule に到達します。
-- `push_selection_through_apply`: Apply ノードの上位にある述語を下位へ押し込みます。
+
+
 
 ## 検証テスト
 

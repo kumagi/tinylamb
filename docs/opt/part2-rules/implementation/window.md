@@ -83,7 +83,7 @@ graph TD
 - `split_window`: 異なる `PARTITION BY` / `ORDER BY` 仕様を持つ複数のウィンドウ関数を個別の `kWindow` ノードへと分割し、本 Rule の適用前提を整える論理 Rule。
 - `merge_adjacent_windows`: 同一のパーティション仕様を持つ連続した `kWindow` ノードを 1 つにマージする論理 Rule。
 - `no_op_window_elimination`: 空のウィンドウノードを消去する論理 Rule。
-- `window_frame_sort_sharing`: フレーム間のソートを共有して実行負荷を削減する論理 Rule。
+- `merge_adjacent_windows`: フレーム間のソートを共有して実行負荷を削減する論理 Rule。
 - `sort`: 本 Rule と同一の $N \log_2 N$ コスト式を持つ物理ソート実装 Rule。
 
 ## 検証テスト

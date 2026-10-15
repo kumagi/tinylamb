@@ -9,6 +9,7 @@
 //   * date arithmetic agrees between 1+2 and 3 at the same unit,
 // and no input may ever crash, hang, or misbehave outside a Status error.
 
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cstddef>
@@ -24,12 +25,12 @@ namespace tinylamb {
 namespace {
 
 struct Cursor {
-  const uint8_t* data;
-  size_t size;
+  const uint8_t* data{};
+  size_t size{};
   size_t pos{0};
 
   uint8_t Next() { return pos < size ? data[pos++] : 0; }
-  bool Done() const { return pos >= size; }
+  [[nodiscard]] bool Done() const { return pos >= size; }
 
   // A NUL-free text slice (parse entry points take string_view; keeping the
   // bytes printable-ish steers the mutations into the grammar).
@@ -39,8 +40,9 @@ struct Cursor {
     for (size_t i = 0; i < len && !Done(); ++i) {
       uint8_t b = Next();
       if (b % 16 == 0) {
-        static constexpr char kPunct[] = "+-/.:_eE ";  // grammar punctuation
-        out.push_back(kPunct[Next() % 10]);
+        static constexpr std::array<char, 10> kPunct = {
+            "+-/.:_eE "};  // grammar punctuation
+        out.push_back(kPunct[Next() % kPunct.size()]);
       } else {
         out.push_back(static_cast<char>('0' + (b % 43)));  // digits..z
       }
@@ -59,11 +61,13 @@ struct Cursor {
 
 }  // namespace
 
-inline void Try(const uint8_t* data, size_t size, bool verbose) {
+namespace {
+
+void Try(const uint8_t* data, size_t size, bool verbose) {
   if (size < 2) {
     return;
   }
-  Cursor c{data, size};
+  Cursor c{.data = data, .size = size};
 
   // ---- DATE round trip -----------------------------------------------
   const std::string date_text = c.Text(24);
@@ -78,9 +82,10 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   }
 
   // ---- DATE interval arithmetic --------------------------------------
-  static const char* kUnits[] = {"day",    "week",   "month",  "year",   "hour",
-                                 "micros", "millis", "second", "quarter"};
-  const std::string_view unit = kUnits[c.Next() % 9];
+  static constexpr auto kUnits = std::to_array<std::string_view>(
+      {"day", "week", "month", "year", "hour", "micros", "millis", "second",
+       "quarter"});
+  const std::string_view unit = kUnits[c.Next() % kUnits.size()];
   const int64_t amount = c.Signed() % 4000;
   if (days.HasValue()) {
     const StatusOr<int64_t> zero =
@@ -99,7 +104,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     }
     if (amount % 2 == 0 && split.HasValue() && whole.HasValue()) {
       const StatusOr<int64_t> step2 =
-          TryAddDateIntervalDays(split.Value(), amount - amount / 2, unit);
+          TryAddDateIntervalDays(split.Value(), amount - (amount / 2), unit);
       if (step2.HasValue() && unit == "day") {
         // Day arithmetic is a plain sum; month/year paths legitimately
         // clamp (Jan 31 + 1m + 1m != Jan 31 + 2m).
@@ -115,11 +120,10 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     // be outside the range the formatter accepts.
     for (int k = -3; k <= 3; ++k) {
       const StatusOr<int64_t> moved = TryAddDateIntervalDays(base, k, "day");
-      if (moved.HasValue()) {
-        assert(moved.Value() == base + k);
-      } else {
-        assert(!TryFormatDateDays(base + k).HasValue());
-      }
+      // One assert (not an if/else): both branches are just asserts, and
+      // NDEBUG turns those into an empty if/else clone.
+      assert(moved.HasValue() ? moved.Value() == base + k
+                              : !TryFormatDateDays(base + k).HasValue());
     }
     // WEEK is a pinned unsupported unit (value_test
     // AddDateIntervalDays_WithUnknownUnits_ThrowsRuntimeError): the call
@@ -130,7 +134,9 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     }
     // MONTH/YEAR must be monotone in the amount (calendar clamping may
     // collapse two amounts onto one date but never reorder them).
-    int64_t prev = std::numeric_limits<int64_t>::min();
+    // The tracker only feeds the monotonicity assert above, which NDEBUG
+    // compiles away in release builds.
+    [[maybe_unused]] int64_t prev = std::numeric_limits<int64_t>::min();
     for (int k = -15; k <= 15; ++k) {
       const StatusOr<int64_t> m = TryAddDateIntervalDays(base, k, "month");
       if (m.HasValue()) {
@@ -141,11 +147,11 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   }
 
   // ---- INTERVAL parse/serialize/justify ------------------------------
-  static const char* kIUnits[] = {"",       "day",    "hour",
-                                  "minute", "second", "month",
-                                  "year",   "week",   "microsecond"};
+  static constexpr auto kIUnits =
+      std::to_array<std::string_view>({"", "day", "hour", "minute", "second",
+                                       "month", "year", "week", "microsecond"});
   const std::string iv_text = c.Text(32);
-  const std::string_view iv_unit = kIUnits[c.Next() % 9];
+  const std::string_view iv_unit = kIUnits[c.Next() % kIUnits.size()];
   const StatusOr<IntervalValue> parsed =
       IntervalValue::TryParse(iv_text, iv_unit);
   IntervalValue base;
@@ -166,14 +172,16 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   } else {
     // Malformed text must be rejected, not crash: synthesise a valid value
     // from the byte stream so the algebra below still runs.
-    base = IntervalValue{c.Signed() % 5000, c.Signed() % 5000,
-                         c.Signed() % 1000000000};
+    base = IntervalValue{.months = c.Signed() % 5000,
+                         .days = c.Signed() % 5000,
+                         .nanos = c.Signed() % 1000000000};
     have_base = true;
   }
   (void)have_base;
 
-  const IntervalValue other{c.Signed() % 7000, c.Signed() % 7000,
-                            c.Signed() % 900000000};
+  const IntervalValue other{.months = c.Signed() % 7000,
+                            .days = c.Signed() % 7000,
+                            .nanos = c.Signed() % 900000000};
   const StatusOr<IntervalValue> sum = base.TryPlus(other);
   const StatusOr<IntervalValue> reverse = other.TryPlus(base);
   assert(sum.HasValue() == reverse.HasValue());
@@ -216,6 +224,8 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     assert(journey.TryTotalNanos().Value() == before.Value());
   }
 }
+
+}  // namespace
 
 }  // namespace tinylamb
 

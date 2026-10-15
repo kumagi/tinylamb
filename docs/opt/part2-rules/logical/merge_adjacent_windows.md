@@ -126,7 +126,7 @@ graph TD
 ## 関連 Rule との相互作用
 
 - `split_window`: 異なるウィンドウ仕様を持つ単一ノードを適切な評価単位へ分解する対向 Rule です。分解後に同一仕様となったノード同士を本 Rule が再融合します。
-- `window_frame_sort_sharing`: 同一パーティションで順序仕様が緩やかに互換な場合に実行順を共有する関連 Rule です。
+- `merge_adjacent_windows`: 同一パーティションで順序仕様が緩やかに互換な場合に実行順を共有する関連 Rule です。
 - `no_op_window_elimination`: 出力がクエリ全体で全く参照されないウィンドウ演算そのものを消去する Rule です。
 
 ## 検証テスト

@@ -144,7 +144,7 @@ PARTITION BY 列でフィルタしても**パーティションの構成員が�
 - 派生グループのタグ `win_part_push:<連言>` は押し込む述語を指紋に含むため、
   別の述語の押し込みが同じ下位グループに混線しません。
 
-なお、兄弟 Rule `window_after_filter_partition_pushdown` は同じ「パーティ
+なお、兄弟 Rule `push_selection_through_window` は同じ「パーティ
 ション列へのフィルタの下押し込み」を、(a) PARTITION BY 式の `TouchedColumns()`
 から列を集める(式 `p+1` も列 `p` を供給する)、(b) 全連言が押せるときだけ
 全体を押す、という異なる切り口で実装されています。どちらも代替として追加
@@ -159,10 +159,9 @@ PARTITION BY 列でフィルタしても**パーティションの構成員が�
 
 ## 関連 Rule との相互作用
 
-- `window_after_filter_partition_pushdown`: 同方向の兄弟 Rule(列の集め方と
+- `push_selection_through_window`: 同方向の兄弟 Rule(列の集め方と
   部分押し込みの扱いが違う。上記参照)。
-- `rank_row_number_to_topn`: ウィンドウ出力(`rn`)でのフィルタは下に押せない
-  代わりに、条件が揃えば TopN への変換で処理されます。
+
 - `no_op_window_elimination`: フィルタとウィンドウの組み合わせの簡約の
   うち、ウィンドウ結果自体が不要な場合を扱います。
 

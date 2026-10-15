@@ -19,6 +19,15 @@ enum header `type/value_type.hpp`, allowlisted).
   S3-FIFO migration (`s3-fifo.md`). Do not confuse with `page/PagePool`.
 - `ring_buffer.hpp` — SPSC lock-free queue. `join_kind.hpp`,
   `set_operation.hpp`, `byte_stream.hpp`, `converter.hpp`, `debug.*`.
+- `runtime_filter.{hpp,cpp}` — sound runtime ("dynamic") join filters over one
+  INT64/DATE key domain: `ExactSetRuntimeFilter` (information passing),
+  `MinMaxRuntimeFilter` (SIP range half), `BloomRuntimeFilter` (SIP membership
+  half), `RejectAllRuntimeFilter`, and the conjunctive `RuntimeFilterGroup`
+  built by `RuntimeFilterBuilder`. Invariant: `Reject(k) == true` implies no
+  build row carries an equal non-NULL key `k`; Bloom false positives are allowed,
+  false negatives never are. Lives at the lowest layer so the storage scan
+  iterator (table/full_scan_iterator.cpp) can reject a probe row before row
+  decode.
 
 ## Before reading code here
 
@@ -26,4 +35,5 @@ enum header `type/value_type.hpp`, allowlisted).
 kTooBigData/kDeleted/kCorrupt…`) and the macro forms above are the vocabulary
 of every layer — learn them first and the rest reads faster.
 
-Test: `./build/vm_cache_test`, `log_message_test`, `crc32c_test`, `debug_test`.
+Test: `./build/vm_cache_test`, `log_message_test`, `crc32c_test`, `debug_test`,
+`runtime_filter_test`.

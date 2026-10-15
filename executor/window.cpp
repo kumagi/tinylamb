@@ -52,7 +52,8 @@ bool WindowExecutor::EnsureComputed() {
       input.push_back(std::move(row));
     }
     if (child_->GetStatus() != Status::kSuccess) {
-      return FailWithChildOf(*child_);
+      FailWithChildOf(*child_);
+      return false;
     }
     rows_.reserve(input.size());
     for (Row& input_row : input) {

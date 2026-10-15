@@ -105,7 +105,7 @@ INTERSECT 演算は、集合論的に両入力の共通部分を抽出します�
 ## 関連 Rule との相互作用
 
 - `except_to_antijoin`: EXCEPT 演算を AntiJoin へ変換する対照的な Rule です。同一の判定基盤および述語構築ロジックを共有します。
-- `intersect_except_cost_based_lowering`: `Pattern::Any()` を用いて INTERSECT と EXCEPT の双方を一括処理する Rule です。本 Rule と同一の論理代替を導出しますが、`Memo::AddExpression` により重複は排除されます。
+- `intersect_to_semijoin / except_to_antijoin`: `Pattern::Any()` を用いて INTERSECT と EXCEPT の双方を一括処理する Rule です。本 Rule と同一の論理代替を導出しますが、`Memo::AddExpression` により重複は排除されます。
 - `semi_hash_join` / `semi_merge_join`（実装 Rule）: 本 Rule が生成した `kSemiJoin` 式を物理プランへ具体化します。
 
 ## 検証テスト

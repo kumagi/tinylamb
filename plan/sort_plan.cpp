@@ -55,8 +55,20 @@ bool SortPlan::IsOrderedBy(
   return true;
 }
 
-void SortPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(static_cast<size_t>(indent)) << "Sort: [";
+Collation SortPlan::OrderCollation() const {
+  // A sort compares its keys left to right, so the delivered ordering is
+  // case-insensitive as soon as one key asks for it (CollationOfOrdering's
+  // rule). Reporting the resolved collation — not the first key's — keeps
+  // the answer correct for the composite keys the memo pushes down.
+  Collation resolved = Collation::kNone;
+  for (const SortKey& key : keys_) {
+    resolved = ResolveCollation(resolved, key.collation);
+  }
+  return resolved;
+}
+
+std::string SortPlan::KeysToString() const {
+  std::ostringstream output;
   for (size_t i = 0; i < keys_.size(); ++i) {
     if (i > 0) {
       output << ", ";
@@ -64,22 +76,45 @@ void SortPlan::Dump(std::ostream& output, int indent) const {
     output << keys_[i].expression->ToString()
            << (keys_[i].ascending ? " ASC" : " DESC");
   }
-  output << "]\n" << Indent(static_cast<size_t>(indent) + 2);
+  return output.str();
+}
+
+std::string SortPlan::MemorySuffix() const { return {}; }
+
+void SortPlan::Dump(std::ostream& output, int indent) const {
+  output << Indent(static_cast<size_t>(indent)) << StrategyName() << ": ["
+         << KeysToString() << "]" << MemorySuffix() << "\n"
+         << Indent(static_cast<size_t>(indent) + 2);
   child_->Dump(output, indent + 2);
 }
 
 std::string SortPlan::ToString() const {
+  return StrategyName() + ": [" + KeysToString() + "]" + MemorySuffix();
+}
+
+std::string BufferedSortPlan::MemorySuffix() const {
   std::ostringstream output;
-  output << "Sort: [";
-  for (size_t i = 0; i < keys_.size(); ++i) {
-    if (i > 0) {
-      output << ", ";
-    }
-    output << keys_[i].expression->ToString()
-           << (keys_[i].ascending ? " ASC" : " DESC");
-  }
-  output << "]";
+  output << " (buffered, budget=" << Memory().memory_budget_bytes
+         << "B, rows=" << RowCapacity() << ")";
   return output.str();
+}
+
+std::string ExternalMergeSortPlan::MemorySuffix() const {
+  std::ostringstream output;
+  output << " (spill runs, budget=" << Memory().memory_budget_bytes
+         << "B, rows=" << SpillThresholdRows()
+         << ", window=" << MergeWindowRows() << ")";
+  return output.str();
+}
+
+Plan MakeSortPlan(Plan child, std::vector<SortKey> keys, double estimated_rows,
+                  const SortMemoryPolicy& memory) {
+  if (SortStrategyForRows(estimated_rows, memory) == SortStrategy::kBuffered) {
+    return std::make_shared<BufferedSortPlan>(std::move(child), std::move(keys),
+                                              memory);
+  }
+  return std::make_shared<ExternalMergeSortPlan>(std::move(child),
+                                                 std::move(keys), memory);
 }
 
 bool SortPlan::ContainsParameterSlots() const {

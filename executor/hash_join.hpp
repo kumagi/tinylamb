@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -126,7 +127,7 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
 
   // EXPLAIN annotations from the physical plan: per-key null-safety (an IS
   // NOT DISTINCT FROM equijoin matches NULL to NULL) and the residual
-  // predicate filtered above the join.  When any key is null-safe the key
+  // predicate retained by the plan.  When any key is null-safe the key
   // encoder folds NULL into a comparable sentinel so `NULL IS NOT DISTINCT
   // FROM NULL` joins correctly.
   void SetJoinAnnotations(std::vector<bool> key_null_safe,
@@ -137,11 +138,103 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
         std::ranges::any_of(key_null_safe_, [](bool safe) { return safe; });
   }
 
+  void SetJoinResidual(Expression residual, Schema schema) {
+    residual_predicate_ = std::move(residual);
+    residual_schema_ = std::move(schema);
+  }
+
+  // Dynamic ("runtime") join filter pushdown (Phase 2 "Dynamic Filter Join /
+  // SIP / Bloom").  With `build_left` the executor materializes the LEFT side
+  // first, publishes a sound filter over its join keys to the probe scan
+  // (children[1]) through ExecutorBase::AttachRuntimeFilter, and only then
+  // consumes the probe side.  A probe row whose key has no build counterpart
+  // cannot join, so the scan drops it before row decode.
+  //
+  // Gated at run time: an inner, null-safe-free, single INT64/DATE equi-join
+  // whose probe child accepted the filter and whose build side did not spill
+  // (a spilled build side is an incomplete key domain).  Anything else falls
+  // back to the unchanged both-sides-first path.
+  void EnableDynamicFilter(bool build_left) {
+    dynamic_filter_ = true;
+    dynamic_filter_build_left_ = build_left;
+  }
+
+  // Hash semi reduction (Phase 2 "Hash Semi Reduction").  A semi / anti /
+  // null-aware anti join never emits a build column, so its hash build is a
+  // pure membership test over the join key.  That admits two reductions which
+  // the plain pipeline cannot do:
+  //
+  //  * probe key domain: the probe side's distinct join keys are materialized
+  //    FIRST, so a build row whose key the probe side never carries is dropped
+  //    while the build is still being consumed.  A huge fact on the build side
+  //    shrinks to the keys that can still join instead of being hashed in full.
+  //  * build key dedup: existence only needs one row per distinct key, so the
+  //    duplicate chains the shared index would otherwise carry are never built.
+  //
+  // Purely an optimization: the emitted rows and their order are exactly the
+  // plain pipeline's.  The gate is on kind, so inner / outer / mark / single
+  // joins ignore it, and a run-time guard (the domain cap) falls back to the
+  // unrestricted intake without changing any result either.
+  void EnableSemiReduction() { semi_reduction_ = true; }
+  [[nodiscard]] bool SemiReductionEnabled() const { return semi_reduction_; }
+  // True when the reduced intake actually ran (an inner/outer kind, or a
+  // disabled reduction, leaves this false even when it was requested).
+  [[nodiscard]] bool SemiReductionActive() const {
+    return semi_reduction_active_;
+  }
+  // Distinct probe join keys the domain holds. 0 on the fallback path.
+  [[nodiscard]] size_t SemiReductionProbeKeys() const {
+    return semi_reduction_probe_keys_;
+  }
+  // Build rows the child produced, the ones kept, and the split of the dropped
+  // ones into "no probe row carries this key" and "duplicate of a kept key".
+  [[nodiscard]] size_t SemiReductionBuildRows() const {
+    return semi_reduction_build_rows_;
+  }
+  [[nodiscard]] size_t SemiReductionBuildRowsKept() const {
+    return semi_reduction_build_rows_kept_;
+  }
+  [[nodiscard]] size_t SemiReductionBuildRowsPruned() const {
+    return semi_reduction_build_rows_ - semi_reduction_build_rows_kept_;
+  }
+  [[nodiscard]] size_t SemiReductionDuplicateKeysPruned() const {
+    return semi_reduction_duplicate_keys_;
+  }
+  // "probe_key_domain", "empty_probe_domain", "fallback=domain_cap" or
+  // "disabled" -- why the run-time intake took the path it did.
+  [[nodiscard]] const std::string& SemiReductionDescription() const {
+    return semi_reduction_description_;
+  }
+  // Test hook: the domain cap is a run-time guard, so a test lowers it to
+  // exercise the fallback without materializing a million distinct keys.
+  static void SetSemiReductionMaxDomainKeysForTest(size_t keys);
+  [[nodiscard]] bool DynamicFilterEnabled() const { return dynamic_filter_; }
+  [[nodiscard]] bool DynamicFilterPublished() const {
+    return dynamic_filter_published_;
+  }
+  [[nodiscard]] size_t DynamicFilterKeys() const {
+    return dynamic_filter_keys_;
+  }
+  [[nodiscard]] size_t DynamicFilterProbeRows() const {
+    return dynamic_filter_probe_rows_;
+  }
+  [[nodiscard]] size_t DynamicFilterRejected() const {
+    return dynamic_filter_rejected_;
+  }
+  [[nodiscard]] const std::string& DynamicFilterDescription() const {
+    return dynamic_filter_description_;
+  }
+
  private:
   struct JoinState;
 
   Status Materialize();
   Status MaterializeInMemory();
+  Status MaterializeInMemorySetup();
+  // Build side first, publish the filter, then probe side.
+  Status MaterializeDynamicFilter();
+  [[nodiscard]] bool DynamicFilterEligible() const;
+  Status MaterializeInMemoryTail();
   Status MaterializeHybrid();
   bool MaterializeOrThrow();
   // Dedicated semi/anti pipeline: materialize both sides (reactive spill
@@ -149,6 +242,20 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   // check. Output rows are the untouched probe rows, so row positions are
   // preserved for UPDATE/DELETE consumers.
   Status MaterializeSemiAnti();
+  // Existence-only join with a reduced hash build: the probe key domain is
+  // built first and the build side is then consumed through it, deduplicated
+  // on the join key. Emits through the same phase as MaterializeSemiAnti.
+  Status MaterializeSemiAntiReduced();
+  // Shared emission phase of the semi / anti / null-aware anti pipeline. The
+  // caller has already decided which build rows exist; `build` describes the
+  // build side as its CHILD produced it, which is what the three-valued
+  // `NOT IN` rule and the "empty build side" rule read.
+  struct SemiAntiBuild {
+    size_t total_rows{0};
+    bool has_null_key{false};
+  };
+  Status EmitSemiAnti(std::optional<ValueType> int_mode,
+                      const SemiAntiBuild& build);
   Status MaterializeOuter();
   Status MaterializeMarkJoin();
   Status MaterializeSingle();
@@ -190,6 +297,8 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   std::vector<bool> key_null_safe_;
   bool any_null_safe_{false};
   Expression residual_note_;
+  Expression residual_predicate_;
+  Schema residual_schema_;
   // Adaptive small-build execution: the join starts as a nested loop over the
   // tiny build side (and installs its key set as an exact runtime filter),
   // then builds the hash index once the outer cardinality exceeds the
@@ -200,8 +309,35 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   size_t runtime_filter_keys_{0};
   std::atomic<size_t> probe_rows_rejected_{0};
   std::atomic<size_t> probe_rows_null_rejected_{0};
+  // Dynamic join filter state (see EnableDynamicFilter).
+  bool dynamic_filter_{false};
+  bool dynamic_filter_build_left_{false};
+  bool dynamic_filter_published_{false};
+  size_t dynamic_filter_keys_{0};
+  // Rows the probe side produced, and how many the filter dropped afterwards.
+  // When the probe scan applied the filter itself the pruning happened before
+  // row decode and is only visible as the difference between these two.
+  size_t dynamic_filter_probe_rows_{0};
+  size_t dynamic_filter_rejected_{0};
+  size_t dynamic_filter_null_rejected_{0};
+  std::string dynamic_filter_description_;
+  // Forces SetupInMemoryJoin to keep the orientation the dynamic filter chose
+  // instead of re-deciding it from the two sides' byte sizes.
+  bool dynamic_filter_forced_build_left_{false};
   bool adaptive_switched_{false};
   bool adaptive_stayed_nested_loop_{false};
+  // Hash semi reduction state (see EnableSemiReduction). A distinct probe-key
+  // domain above this cap would cost more memory than the build rows it could
+  // prune, so the run-time intake gives up on the domain and keeps only the
+  // (always sound) build key dedup.
+  static std::atomic<size_t> semi_reduction_max_domain_keys_;
+  bool semi_reduction_{false};
+  bool semi_reduction_active_{false};
+  size_t semi_reduction_probe_keys_{0};
+  size_t semi_reduction_build_rows_{0};
+  size_t semi_reduction_build_rows_kept_{0};
+  size_t semi_reduction_duplicate_keys_{0};
+  std::string semi_reduction_description_{"disabled"};
   size_t memory_peak_bytes_{0};
   size_t spill_partition_count_{0};
   // The hybrid path keeps its fully materialized output (frozen spill spec).

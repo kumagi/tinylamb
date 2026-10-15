@@ -16,15 +16,22 @@
 
 #include "page_pool.hpp"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <ios>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -71,7 +78,7 @@ class PagePoolTest : public ::testing::Test {
   void TearDown() override {
     pp.reset();
     std::ignore = std::remove(filename_.c_str());
-    std::ignore = std::remove((filename_ + ".log").c_str());
+    tinylamb::RemoveLogAndSegments((filename_ + ".log"));
   }
 
   std::string filename_;
@@ -83,6 +90,71 @@ TEST_F(PagePoolTest, Construct) {
   // Act -- nothing to execute; default constructed via SetUp()
   // Assert -- pool size is 0 (no pages have been requested yet)
   ASSERT_EQ(pp->Size(), 0);
+}
+
+TEST_F(PagePoolTest, SecondLivePoolFailsWithoutDisplacingFirst) {
+  auto second = PagePool::Create(filename_, kDefaultCapacity);
+  ASSERT_FALSE(second.HasValue());
+  EXPECT_EQ(second.GetStatus(), Status::kConflicts);
+  EXPECT_NE(second.GetStatus().GetMessage().find("already open"),
+            std::string::npos);
+
+  PageRef page = pp->GetPage(0).MoveValue();
+  EXPECT_EQ(page->PageID(), 0U);
+}
+
+TEST_F(PagePoolTest, PageFileLockIsReleasedAtPoolDestruction) {
+  pp.reset();
+  auto reopened = PagePool::Create(filename_, kDefaultCapacity);
+  ASSERT_TRUE(reopened.HasValue()) << reopened.GetStatus();
+  pp = reopened.MoveValue();
+  EXPECT_EQ(pp->Size(), 0U);
+}
+
+TEST_F(PagePoolTest, ForkInheritedDescriptorKeepsPageFileLocked) {
+  std::array<int, 2> control{};
+  ASSERT_EQ(::pipe(control.data()), 0);
+  const pid_t child = ::fork();
+  if (child < 0) {
+    ::close(control[0]);
+    ::close(control[1]);
+    FAIL() << "fork failed";
+    return;
+  }
+  if (child == 0) {
+    ::close(control[1]);
+    char token = 0;
+    ssize_t received = 0;
+    do {
+      received = ::read(control[0], &token, 1);
+    } while (received < 0 && errno == EINTR);
+    ::close(control[0]);
+    ::_exit(received == 1 ? 0 : 1);
+  }
+
+  ::close(control[0]);
+  pp.reset();
+  auto blocked = PagePool::Create(filename_, kDefaultCapacity);
+  EXPECT_EQ(blocked.GetStatus(), Status::kConflicts);
+
+  const char token = 'x';
+  ssize_t sent = 0;
+  do {
+    sent = ::write(control[1], &token, 1);
+  } while (sent < 0 && errno == EINTR);
+  EXPECT_EQ(sent, 1);
+  EXPECT_EQ(::close(control[1]), 0);
+
+  int child_status = 0;
+  EXPECT_EQ(::waitpid(child, &child_status, 0), child);
+  EXPECT_TRUE(WIFEXITED(child_status));
+  if (WIFEXITED(child_status)) {
+    EXPECT_EQ(WEXITSTATUS(child_status), 0);
+  }
+
+  auto reopened = PagePool::Create(filename_, kDefaultCapacity);
+  ASSERT_TRUE(reopened.HasValue()) << reopened.GetStatus();
+  pp = reopened.MoveValue();
 }
 
 TEST_F(PagePoolTest, GetPage) {
@@ -117,6 +189,34 @@ TEST_F(PagePoolTest, GetManyPage) {
     ASSERT_EQ(p->PageID(), i);
     ASSERT_EQ(pp->Size(), i + 1);
   }
+}
+
+TEST_F(PagePoolTest, ContainsResidentTracksResidencyWithoutMaterializing) {
+  // Arrange -- an empty pool: the query answers false and must not
+  // materialize a page as a side effect (recovery's undo walks rely on that
+  // to tell never-issued page ids apart).
+  ASSERT_EQ(pp->Size(), 0);
+  EXPECT_FALSE(pp->ContainsResident(0));
+  EXPECT_FALSE(pp->ContainsResident(3));
+  ASSERT_EQ(pp->Size(), 0);
+
+  // Act -- pin page 3 in a scope, then release it.
+  {
+    PageRef page = pp->GetPage(3, nullptr).MoveValue();
+    EXPECT_EQ(page->PageID(), 3);
+    EXPECT_TRUE(pp->ContainsResident(3));
+    EXPECT_FALSE(pp->ContainsResident(0));
+    EXPECT_EQ(pp->Size(), 1);
+  }
+
+  // Assert -- after unpin + eviction, residency follows the pool: page 3 is
+  // the sole LRU victim once 10 fresh pages arrive.
+  for (page_id_t i = 10; i < 20; ++i) {
+    PageRef p = pp->GetPage(i, nullptr).MoveValue();
+    ASSERT_EQ(p->PageID(), i);
+  }
+  EXPECT_FALSE(pp->ContainsResident(3));
+  EXPECT_TRUE(pp->ContainsResident(19));
 }
 
 TEST_F(PagePoolTest, EvictPage) {
@@ -346,6 +446,7 @@ TEST_F(PagePoolTest, PageRefStreamInsertion) {
 
 TEST_F(PagePoolTest, MetaPageAllocateDestroyReuse) {
   // Arrange -- full page manager + transaction machinery
+  pp.reset();
   auto pm_holder = PageManager::Create(filename_, kDefaultCapacity).MoveValue();
   CHECK(pm_holder != nullptr);
   PageManager& pm = *pm_holder;
@@ -471,6 +572,54 @@ TEST_F(PagePoolTest, DropAllPagesWithPinnedRefsRetiresEntries) {
   ASSERT_EQ(fresh->PageID(), 6U);
 }
 
+TEST_F(PagePoolTest, DropAllPagesWaitsForActiveWriteback) {
+  for (page_id_t page_id = 0; page_id < kDefaultCapacity; ++page_id) {
+    ASSERT_TRUE(pp->GetPage(page_id).HasValue());
+  }
+  {
+    PageRef dirty = pp->GetPage(0).MoveValue();
+    dirty->PageInit(0, PageType::kFreePage);
+    dirty->body.free_page.FreeBody()[0] = 0x44;
+  }
+  for (page_id_t page_id = 1; page_id < kDefaultCapacity; ++page_id) {
+    ASSERT_TRUE(pp->GetPage(page_id).HasValue());
+  }
+
+  std::atomic<bool> entered{false};
+  std::atomic<bool> release{false};
+  pp->SetDurabilityGate([&](lsn_t) {
+    if (!entered.exchange(true, std::memory_order_acq_rel)) {
+      while (!release.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    return Status::kSuccess;
+  });
+  std::thread eviction(
+      [&] { EXPECT_TRUE(pp->GetPage(kDefaultCapacity).HasValue()); });
+  while (!entered.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  std::atomic<bool> dropped{false};
+  std::thread dropper([&] {
+    pp->DropAllPages();
+    dropped.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_FALSE(dropped.load(std::memory_order_acquire));
+  release.store(true, std::memory_order_release);
+  eviction.join();
+  dropper.join();
+  EXPECT_TRUE(dropped.load(std::memory_order_acquire));
+  // Uninstall the gate before TestBody returns: the pool's destructor
+  // (TearDown) runs a final WriteBack that would invoke the lambda after
+  // these locals are gone (stack-use-after-return under ASAN; with a
+  // deterministic page checksum the final write-back now reliably fires and
+  // the stale lambda blocked on dead locals forever).
+  pp->SetDurabilityGate(nullptr);
+}
+
 TEST_F(PagePoolTest, DurabilityGateFiresForDirtyPagesOnly) {
   // Arrange -- record every LSN the gate observes before a pwrite
   std::vector<lsn_t> gated;
@@ -527,6 +676,35 @@ TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
   }
 }
 
+TEST_F(PagePoolTest, RecoveryLoadRejectsMisdirectedPageImage) {
+  constexpr page_id_t kSource = 1;
+  constexpr page_id_t kTarget = 2;
+  {
+    PageRef source = pp->GetPage(kSource).MoveValue();
+    source->PageInit(kSource, PageType::kFreePage);
+    source->body.free_page.FreeBody()[0] = 0x31;
+  }
+  ASSERT_SUCCESS(pp->FlushPageForTest(kSource));
+  pp->DropAllPages();
+  {
+    std::fstream file(filename_,
+                      std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.good());
+    std::vector<char> image(kPageSize);
+    file.seekg(static_cast<std::streamoff>(kSource) * kPageSize, std::ios::beg);
+    file.read(image.data(), static_cast<std::streamsize>(image.size()));
+    ASSERT_EQ(file.gcount(), static_cast<std::streamsize>(image.size()));
+    file.seekp(static_cast<std::streamoff>(kTarget) * kPageSize, std::ios::beg);
+    file.write(image.data(), static_cast<std::streamsize>(image.size()));
+    ASSERT_TRUE(file.good());
+  }
+  PageRef recovered = pp->GetPageForRecovery(kTarget).MoveValue();
+  ASSERT_FALSE(recovered.IsNull());
+  EXPECT_EQ(recovered->PageID(), kTarget);
+  EXPECT_EQ(recovered->Type(), PageType::kUnknown);
+  EXPECT_FALSE(recovered->IsValid());
+}
+
 TEST_F(PagePoolTest, ConstructorThrowsForUnopenablePath) {
   // Arrange/Act -- a pool whose backing file cannot be created (missing parent
   // directory); the constructor retries with O_TRUNC then throws
@@ -569,6 +747,21 @@ TEST_F(PagePoolTest, WriteBackFailureOnFullDeviceThrows) {
 
   // Tear down without another write-back so the destructor does not rethrow.
   pool->DropAllPages();
+}
+
+TEST_F(PagePoolTest, CleanEvictionDoesNotRewriteDurablePage) {
+  constexpr page_id_t kDurablePage = 1;
+  {
+    PageRef page = pp->GetPage(kDurablePage).MoveValue();
+    page->PageInit(kDurablePage, PageType::kFreePage);
+    page->body.free_page.FreeBody()[0] = 0x7e;
+  }
+  ASSERT_SUCCESS(pp->FlushPageForTest(kDurablePage));
+  pp->SetPWriteFaultForTest(true);
+  for (page_id_t page_id = 2; page_id <= kDefaultCapacity + 1; ++page_id) {
+    EXPECT_TRUE(pp->GetPage(page_id).HasValue());
+  }
+  pp->SetPWriteFaultForTest(false);
 }
 
 TEST_F(PagePoolTest, ConcurrentLoadsOfSamePageInstallOnce) {
@@ -716,6 +909,270 @@ TEST_F(PagePoolTest, DestructorWarnsOnPinnedPage) {
   // Assert -- no crash; the pinned page is deliberately NOT written back
   // (writing under a live ref would be a data race), its dirty image is lost.
   ASSERT_EQ(pp, nullptr);
+}
+
+TEST_F(PagePoolTest, FlushPageWaitsForTheContentLatch) {
+  constexpr page_id_t kPageId = 17;
+  Status flush_status = Status::kUnknown;
+  std::atomic<bool> flushed{false};
+  {
+    PageRef page = pp->GetPage(kPageId).MoveValue();
+    page->PageInit(kPageId, PageType::kFreePage);
+    page->body.free_page.FreeBody()[0] = 0x2a;
+    std::thread writer([&] {
+      flush_status = pp->FlushPage(kPageId);
+      flushed.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(flushed.load(std::memory_order_acquire));
+    page.PageUnlock();
+    writer.join();
+  }
+  EXPECT_TRUE(flushed.load(std::memory_order_acquire));
+  EXPECT_SUCCESS(flush_status);
+  pp->DropAllPages();
+  PageRef reloaded = pp->GetPage(kPageId).MoveValue();
+  ASSERT_EQ(reloaded->body.free_page.FreeBody()[0], static_cast<char>(0x2a));
+}
+
+TEST_F(PagePoolTest, SyncDataFileKeepsFpwWhenDurabilityGateFails) {
+  constexpr page_id_t kPageId = 41;
+  std::atomic<lsn_t> next_snapshot_end{100};
+  std::atomic<bool> fail_gate{true};
+  pp->SetWalSnapshotSink(
+      [&](page_id_t, PageType, std::string_view) -> StatusOr<lsn_t> {
+        return next_snapshot_end.fetch_add(100);
+      });
+  pp->SetDurabilityGate([&](lsn_t) -> Status {
+    if (fail_gate.exchange(false, std::memory_order_acq_rel)) {
+      return StatusError(StatusCode::kIOError, "injected gate failure");
+    }
+    return Status::kSuccess;
+  });
+  {
+    PageRef page = pp->GetPage(kPageId).MoveValue();
+    page->PageInit(kPageId, PageType::kRowPage);
+    page->SetPageLSN(7);
+  }
+
+  EXPECT_EQ(pp->FlushPageForTest(kPageId),
+            StatusError(StatusCode::kIOError, "injected gate failure"));
+  // The sink reports the record's EXCLUSIVE end; the floor is its last byte so
+  // Logger::RecycleUpTo cannot unlink the segment holding that record.
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), 99U);
+  ASSERT_TRUE(pp->SyncDataFile(std::numeric_limits<lsn_t>::max() / 2));
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), 99U);
+
+  EXPECT_SUCCESS(pp->FlushPageForTest(kPageId));
+  ASSERT_TRUE(pp->SyncDataFile(std::numeric_limits<lsn_t>::max() / 2));
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), std::numeric_limits<lsn_t>::max());
+  // Uninstall hooks before the locals die: ~PagePool's final WriteBack would
+  // otherwise invoke them from TearDown (stack-use-after-return under ASAN).
+  pp->SetWalSnapshotSink(nullptr);
+  pp->SetDurabilityGate(nullptr);
+}
+
+// The recycling floor must never reach a pending full-page image's record end:
+// Logger::RecycleUpTo drops a segment as soon as
+// (index + 1) * segment_size <= floor, so a floor equal to an end that lands
+// exactly on a segment boundary would unlink the very FPW a torn page needs.
+TEST_F(PagePoolTest, UnsyncedSnapshotFloorStaysBelowFpwRecordEnd) {
+  constexpr page_id_t kPageId = 77;
+  // A record that ends exactly on a 64 KiB segment boundary.
+  constexpr lsn_t kRecordEnd = static_cast<lsn_t>(64) * 1024;
+  constexpr lsn_t kSegmentSize = static_cast<lsn_t>(64) * 1024;
+  pp->SetWalSnapshotSink(
+      [&](page_id_t, PageType, std::string_view) -> StatusOr<lsn_t> {
+        return kRecordEnd;
+      });
+  {
+    PageRef page = pp->GetPage(kPageId).MoveValue();
+    page->PageInit(kPageId, PageType::kRowPage);
+    page->SetPageLSN(9);
+  }
+  ASSERT_SUCCESS(pp->FlushPageForTest(kPageId));
+
+  const lsn_t floor = pp->UnsyncedSnapshotFloor();
+  EXPECT_LT(floor, kRecordEnd);
+  EXPECT_EQ(floor, kRecordEnd - 1);
+  // RecycleUpTo's drop rule for segment 0 of this geometry must not fire.
+  EXPECT_FALSE((0 + 1) * kSegmentSize <= floor);
+
+  // Once the pwrite is durable the image is retired and the floor lifts.
+  ASSERT_TRUE(pp->SyncDataFile(std::numeric_limits<lsn_t>::max() / 2));
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), std::numeric_limits<lsn_t>::max());
+  // Uninstall hooks before the locals die: ~PagePool's final WriteBack would
+  // otherwise invoke them from TearDown (stack-use-after-return under ASAN).
+  pp->SetWalSnapshotSink(nullptr);
+  pp->SetDurabilityGate(nullptr);
+}
+
+TEST_F(PagePoolTest, SyncDataFileKeepsFpwWhenPwriteFails) {
+  constexpr page_id_t kPageId = 42;
+  std::atomic<lsn_t> next_snapshot_end{200};
+  pp->SetWalSnapshotSink(
+      [&](page_id_t, PageType, std::string_view) -> StatusOr<lsn_t> {
+        return next_snapshot_end.fetch_add(100);
+      });
+  pp->SetPWriteFaultForTest(true);
+  {
+    PageRef page = pp->GetPage(kPageId).MoveValue();
+    page->PageInit(kPageId, PageType::kRowPage);
+    page->SetPageLSN(8);
+  }
+
+  EXPECT_EQ(pp->FlushPageForTest(kPageId), Status::kIOError);
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), 199U);
+  pp->SetPWriteFaultForTest(false);
+  ASSERT_TRUE(pp->SyncDataFile(std::numeric_limits<lsn_t>::max() / 2));
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), 199U);
+
+  EXPECT_SUCCESS(pp->FlushPageForTest(kPageId));
+  ASSERT_TRUE(pp->SyncDataFile(std::numeric_limits<lsn_t>::max() / 2));
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), std::numeric_limits<lsn_t>::max());
+  // Uninstall hooks before the locals die: ~PagePool's final WriteBack would
+  // otherwise invoke them from TearDown (stack-use-after-return under ASAN).
+  pp->SetWalSnapshotSink(nullptr);
+  pp->SetDurabilityGate(nullptr);
+}
+
+// SyncDataFile must retire exactly the pages whose writes completed before
+// the sync, even while ANOTHER page's write-back is still in flight: the old
+// all-or-nothing check skipped the whole retirement whenever any pwrite was
+// in flight, which under sustained load froze the recycle floor forever and
+// let the WAL grow without bound.
+TEST_F(PagePoolTest, SyncDataFileRetiresOnlyCompletedWrites) {
+  std::atomic<lsn_t> fake_lsn{1000};
+  std::atomic<bool> release_page2{false};
+  pp->SetWalSnapshotSink(
+      [&](page_id_t, PageType, std::string_view) -> StatusOr<lsn_t> {
+        return fake_lsn.fetch_add(100) + 100;
+      });
+  // Page 2's flush parks inside the durability gate (after its full-page
+  // image was emitted) until the main thread releases it.
+  pp->SetDurabilityGate([&](lsn_t gate_lsn) {
+    if (gate_lsn == 1200) {
+      while (!release_page2.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    return Status::kSuccess;
+  });
+
+  // Page 3 flushes to completion: emits FPW 1100, pwrite finishes. The body
+  // mutation leaves the stored checksum stale, so the page counts as dirty
+  // and the FPW/gate paths engage.
+  {
+    PageRef page = pp->GetPage(3, nullptr).MoveValue();
+    page->PageInit(3, PageType::kRowPage);
+    page->SetPageLSN(5);
+  }
+  EXPECT_SUCCESS(pp->FlushPageForTest(3));
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), 1099);  // record end 1100, minus one
+
+  // Page 2's flush emits FPW 1200, then blocks in the gate (in flight).
+  {
+    PageRef page = pp->GetPage(2, nullptr).MoveValue();
+    page->PageInit(2, PageType::kRowPage);
+    page->SetPageLSN(6);
+  }
+  std::thread stuck_writer([&] { EXPECT_SUCCESS(pp->FlushPageForTest(2)); });
+  // Wait until page 2's full-page image was emitted (the second sink call).
+  while (fake_lsn.load() < 1200) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // The sync retires page 3 (written before it ran) and keeps page 2 (still
+  // in flight): the floor sits at page 2's image, not page 3's.
+  ASSERT_TRUE(pp->SyncDataFile(std::numeric_limits<lsn_t>::max() / 2));
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), 1199);  // record end 1200, minus one
+
+  release_page2.store(true, std::memory_order_release);
+  stuck_writer.join();
+  // With every write complete, the next sync clears the floor entirely.
+  ASSERT_TRUE(pp->SyncDataFile(std::numeric_limits<lsn_t>::max() / 2));
+  EXPECT_EQ(pp->UnsyncedSnapshotFloor(), std::numeric_limits<lsn_t>::max());
+  // Uninstall hooks before the locals die: ~PagePool's final WriteBack would
+  // otherwise invoke them from TearDown (stack-use-after-return under ASAN).
+  pp->SetWalSnapshotSink(nullptr);
+  pp->SetDurabilityGate(nullptr);
+}
+
+// A page recovery rewrote in memory keeps a CRC that describes the PRE-repair
+// disk image. The two predicates must then disagree: IsValid() has to report
+// the image as whole (a false "torn" verdict makes PageManager::GetPage hand
+// back an empty ref, and BPlusTree::Open then silently bootstraps an empty
+// catalog), while ChecksumMatches() has to keep reporting it dirty so the
+// repair is actually written back instead of dying with the buffer pool.
+TEST(PageChecksumTest, RepairedInMemoryPageIsValidButStillDirty) {
+  Page page(7, PageType::kRowPage);
+  page.SetChecksum();
+  ASSERT_TRUE(page.IsValid());
+  ASSERT_TRUE(page.ChecksumMatches());
+
+  // Rewrite the body the way recovery redo/undo does: the stored CRC now
+  // describes the old image.
+  ASSERT_SUCCESS(page.InsertImpl(0, "row-image"));
+  ASSERT_FALSE(page.ChecksumMatches());
+  ASSERT_FALSE(page.IsValid())
+      << "an ordinary mutation reads as torn until flushed";
+
+  page.MarkRepairedInMemory();
+  ASSERT_TRUE(page.IsValid()) << "recovery-repaired page must not read as torn";
+  ASSERT_FALSE(page.ChecksumMatches())
+      << "and must stay dirty so it gets written back";
+
+  // The repair claim is in-memory only: EncodeDisk must never put it in the
+  // 48-byte header. (The stored CRC is still the pre-repair one here, so the
+  // encoded image legitimately fails validation -- exactly like a page whose
+  // write-back has not happened yet.)
+  std::vector<char> image(kPageSize);
+  page.EncodeDisk(image.data());
+  Page encoded_view(0, PageType::kUnknown);
+  ASSERT_SUCCESS(encoded_view.DecodeDisk(image.data()));
+  EXPECT_EQ(encoded_view.checksum >> 32, 0U)
+      << "the in-memory repair bit must not reach the page format";
+  EXPECT_EQ(encoded_view.PageID(), 7);
+  EXPECT_EQ(encoded_view.Type(), PageType::kRowPage);
+
+  // Writing the page out (WriteBack recomputes the CRC) discharges the claim:
+  // on-disk image == body again, and a reload validates.
+  page.SetChecksum();
+  ASSERT_TRUE(page.IsValid());
+  ASSERT_TRUE(page.ChecksumMatches());
+  std::vector<char> flushed(kPageSize);
+  page.EncodeDisk(flushed.data());
+  Page reloaded(0, PageType::kUnknown);
+  ASSERT_SUCCESS(reloaded.DecodeDisk(flushed.data()));
+  ASSERT_TRUE(reloaded.IsValid());
+  ASSERT_TRUE(reloaded.ChecksumMatches());
+  ASSERT_EQ(reloaded.PageID(), 7);
+}
+
+// StoredChecksum hashes the raw page bytes (minus recovery_lsn/checksum), so
+// any header alignment padding PageInit left uninitialized entered the CRC as
+// heap garbage: checksums differed across runs under ASAN malloc fill, and a
+// stored CRC could stop matching a recompute on the SAME image. PageInit must
+// therefore clear the whole object; the checksum of a freshly initialized
+// page may not depend on the memory it was carved from.
+TEST(PageChecksumTest, FreshPageChecksumIsIndependentOfPriorMemory) {
+  Page over_aa(0, PageType::kUnknown);
+  Page over_55(0, PageType::kUnknown);
+  // Poison every byte (padding included), then re-init the way a reused page
+  // object is re-issued by the pool and by recovery replay.
+  // Page is standard-layout and trivially destructible (static_asserted in
+  // page.hpp), so byte-poisoning the object is the point of this test; the
+  // void* cast keeps -Wclass-memaccess from flagging the deliberate write.
+  std::memset(static_cast<void*>(&over_aa), 0xAA, sizeof(Page));
+  std::memset(static_cast<void*>(&over_55), 0x55, sizeof(Page));
+  over_aa.PageInit(9, PageType::kBranchPage);
+  over_55.PageInit(9, PageType::kBranchPage);
+  over_aa.SetChecksum();
+  over_55.SetChecksum();
+  EXPECT_EQ(over_aa.checksum & 0xffffffffU, over_55.checksum & 0xffffffffU)
+      << "padding bytes leaked into the fresh-page checksum";
+  ASSERT_TRUE(over_aa.IsValid());
+  ASSERT_TRUE(over_55.IsValid());
 }
 
 }  // namespace tinylamb
