@@ -66,6 +66,17 @@ class IndexScanIterator : public IteratorBase {
   [[nodiscard]] const Row& Include() const { return include_; }
   [[nodiscard]] std::string GetValue() const;
   [[nodiscard]] RowPosition Position() const override;
+  // Index-only visibility fast path (the MVCC visibility-map equivalent of
+  // full_scan_iterator.cpp's PhysicalReadEligible): when the index does not
+  // retain deleted entries and the entry's row page carries no version
+  // chains, the B+Tree entry itself -- key columns plus INCLUDE payload --
+  // is the committed image every snapshot sees, so a covering consumer can
+  // be served without the heap fetch.  Returns true and fills |dst| when
+  // the entry qualifies; false means the caller must dereference the
+  // iterator for the MVCC-resolved row.  Callers must hold the scan's
+  // stale-key gate (see IndexOnlyScanPlan::EmitExecutor) and the index read
+  // guard (held for the iterator's lifetime).
+  [[nodiscard]] bool TryReadIndexOnly(Row* dst) const;
   void Clear();
   IteratorBase& operator++() override;
   IteratorBase& operator--() override;
@@ -109,6 +120,11 @@ class IndexScanIterator : public IteratorBase {
   Row include_;
   mutable Row current_row_;
   mutable bool current_row_resolved_{false};
+  // One-slot memo for the chain probe in TryReadIndexOnly: consecutive
+  // entries usually land on the same row page.  A cached verdict stays sound
+  // for the scan's lifetime -- see the implementation.
+  mutable page_id_t chain_checked_page_{0};
+  mutable bool chain_checked_free_{false};
 };
 
 }  // namespace tinylamb

@@ -85,6 +85,12 @@ struct TransactionRuntimeStats {
   // appends; a high count = repeated page-boundary convoys.
   uint64_t table_tail_wait_count{0};
   uint64_t table_tail_wait_ns{0};
+  // Rows served by the index-only visibility-map fast path: a non-retained
+  // index entry on a page with no version chains is answered from the
+  // B+Tree entry itself (key + INCLUDE payload) without the heap fetch
+  // (see IndexScanIterator::TryReadIndexOnly).  A/B hatch:
+  // TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP=1.
+  uint64_t index_only_visible_serves{0};
 };
 
 class IndexKey;
@@ -351,6 +357,11 @@ class TransactionManager {
   // Reports whether any row on |pid| has a version chain. Exact per page:
   // only pages whose rows actually carry a chain answer true.
   [[nodiscard]] bool HasPageVersionChains(page_id_t pid) const;
+  // Counts one row served by the index-only visibility-map fast path (see
+  // TransactionRuntimeStats::index_only_visible_serves).
+  void RecordIndexOnlyVisibleServe() const {
+    index_only_visible_serves_.fetch_add(1, std::memory_order_relaxed);
+  }
   // Drops every version chain keyed to |pid|.  RowPosition namespaces chain
   // keys by {page_id, slot} only, so a page id recycled off the free list
   // would otherwise serve the previous incarnation's committed rows to scans
@@ -677,6 +688,9 @@ class TransactionManager {
   mutable std::atomic<uint64_t> index_gate_contended_acquires_{0};
   mutable std::atomic<uint64_t> index_gate_wait_ns_{0};
   mutable std::atomic<uint64_t> index_gate_long_waits_{0};
+  // Rows served by the index-only visibility-map fast path (see
+  // RecordIndexOnlyVisibleServe).
+  mutable std::atomic<uint64_t> index_only_visible_serves_{0};
   std::atomic<uint64_t> write_intent_attempts_{0};
   std::atomic<uint64_t> write_intent_conflicts_{0};
   std::atomic<uint64_t> write_intent_mutex_wait_ns_{0};

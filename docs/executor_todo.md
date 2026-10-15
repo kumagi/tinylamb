@@ -197,7 +197,12 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `BitmapAnd` / `BitmapOr` オペレータ
 - [x] `TidScan` / `RowIdLookup` / `CTID` 相当(2026-10-03 削除: SQL/計画経路からの参照がなく到達不能)
 - [ ] `IndexSkipScan`（先頭列が等式でない複合インデックス）
-- [ ] `IndexOnlyScan` の visibility map 相当（MVCC で heap fetch 省略を広げる）
+- [x] `IndexOnlyScan` の visibility map 相当（MVCC で heap fetch 省略を広げる）。
+      `IndexScanIterator::TryReadIndexOnly` が非保持インデックス＋チェーンフリー頁を
+      B+Tree 像（キー＋INCLUDE）から直接返す。回帰:
+      `IndexScanIteratorTest.IndexOnlyVisibilityMap*`、
+      `ExecutorTest.IndexOnlyScanServesVisibilityMapWithoutHeapFetch`、
+      `SqlClusteredOrderTest.CountStarIndexOnlyScanServesVisibilityMap`
 - [ ] `CoveringIndex` 選択のコスト精度
 - [ ] `PAXScan` / カラムナ・スキャンの Cascades 接続
 - [ ] `ZoneMapSkipScan`（既存 zone map をプラン属性に）

@@ -19,8 +19,14 @@ lives here but compiles into `tinylamb_table` (see `table/AGENTS.md`).
   is a compat alias, disk encoding unchanged.
 - `index_scan_iterator.{hpp,cpp}` — unified scan bound to `Table+Index+Txn`:
   fwd/rev, composite `vector<Value>` keys, non-unique offsets, `IndexOnly`
-  key/include access. **CMake builds it into `tinylamb_table`** to keep the
-  `table → index` edge one-directional.
+  key/include access. `TryReadIndexOnly` is the index-only visibility fast
+  path (the MVCC visibility-map equivalent of full scans'
+  `PhysicalReadEligible`): a non-retained entry (`kUnique`/`kNonUnique`)
+  whose row page carries no version chains is served from the B+Tree image
+  (key + INCLUDE payload) without the heap fetch; retained entries, chain-
+  bearing pages and old snapshots keep the heap resolution. A/B hatch:
+  `TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP`. **CMake builds it into
+  `tinylamb_table`** to keep the `table → index` edge one-directional.
 - `lsm_tree.{hpp,cpp}` + `lsm_detail/` — WiscKey-style LSM (see
   `lsm_detail/AGENTS.md`).
 

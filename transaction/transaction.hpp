@@ -457,6 +457,13 @@ class Transaction final {
     return transaction_manager_ != nullptr &&
            transaction_manager_->HasPageVersionChains(page_id);
   }
+  // Counts one row served by the index-only visibility-map fast path (see
+  // IndexScanIterator::TryReadIndexOnly).
+  void RecordIndexOnlyVisibleServe() const {
+    if (transaction_manager_ != nullptr) {
+      transaction_manager_->RecordIndexOnlyVisibleServe();
+    }
+  }
   // Bytes on |pid| that OTHER transactions' unresolved undo may still claim
   // (see TransactionManager::ReserveIndexUndoBytes). Admission checks
   // subtract it from free_size_; callers without a manager (recovery redo)

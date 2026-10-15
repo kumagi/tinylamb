@@ -1573,6 +1573,8 @@ TransactionRuntimeStats TransactionManager::RuntimeStats() const {
           page_manager_ == nullptr ? 0 : page_manager_->TailWaitCount(),
       .table_tail_wait_ns =
           page_manager_ == nullptr ? 0 : page_manager_->TailWaitNs(),
+      .index_only_visible_serves =
+          index_only_visible_serves_.load(std::memory_order_relaxed),
   };
 }
 

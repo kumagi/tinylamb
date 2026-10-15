@@ -13,11 +13,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "common/random_string.hpp"
@@ -127,6 +129,18 @@ class SqlClusteredOrderTest : public ::testing::Test {
 
   std::vector<int64_t> ScanIds(TransactionContext& ctx) const {
     return IntColumn(RunSql(ctx, *database_, std::string(kScan) + ";"), 0);
+  }
+
+  // Waits (bounded) for the background GC worker to drop the committed
+  // version chains, which is what arms the index-only visibility map.
+  void WaitForChainFreePages() const {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (database_->TransactionStats().version_chains != 0) {
+      ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+          << "background GC did not drop version chains";
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
 
   std::unique_ptr<Database> database_;
@@ -506,6 +520,24 @@ TEST_F(SqlClusteredOrderTest, ClaimedScanStaysOrderedAfterAConcurrentWrite) {
              "2;"),
       0);
   EXPECT_EQ(top, (std::vector<int64_t>{-9, 9}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+// The SQL COUNT(*) index-only path serves its entries from the visibility
+// map once the committed rows' version chains are gone: the answer is
+// unchanged and the heap fetch is skipped.  (The plan shape itself is
+// pinned by OptimizerTest.CountStarUsesUnboundedIndexOnlyScan.)
+TEST_F(SqlClusteredOrderTest, CountStarIndexOnlyScanServesVisibilityMap) {
+  WaitForChainFreePages();
+  TransactionContext ctx = database_->BeginReadOnlyContext();
+  const uint64_t serves_before =
+      database_->TransactionStats().index_only_visible_serves;
+  const std::vector<Row> rows =
+      RunSql(ctx, *database_, "SELECT COUNT(*) FROM clustered;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{20}));
+  EXPECT_GT(database_->TransactionStats().index_only_visible_serves,
+            serves_before);
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 

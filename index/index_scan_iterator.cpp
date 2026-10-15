@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -357,6 +358,46 @@ Row& IndexScanIterator::operator*() {
     ResolveRow();
   }
   return current_row_;
+}
+
+bool IndexScanIterator::TryReadIndexOnly(Row* dst) const {
+  if (!IsValid() || index_.RetainsDeletedEntries()) {
+    return false;
+  }
+  static const bool visibility_map_disabled =
+      std::getenv("TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP") != nullptr;
+  if (visibility_map_disabled) {
+    return false;
+  }
+  // Why the entry alone is enough:
+  //  * The caller's stale-key gate (checked before AND after taking this
+  //    scan's index read guard) proved every committed index mutation is
+  //    visible to this snapshot, and the guard keeps INCLUDE payloads and
+  //    entry membership frozen for the scan's lifetime, so a present entry
+  //    in a non-retained index points at a live row.
+  //  * The write-before-latch / GC-drop invariant full scans trust
+  //    (PhysicalReadEligible in table/full_scan_iterator.cpp) says a page
+  //    with no version chains carries only committed images that every
+  //    snapshot sees.  Same-key updates rewrite the entry's INCLUDE payload
+  //    when they install the new committed image, so the payload is exactly
+  //    that image.
+  //  * A chain appearing mid-scan belongs to a writer whose commit postdates
+  //    this snapshot: the entry's pre-write image is what the snapshot must
+  //    see, so the memoized verdict cannot serve a wrong version.
+  const page_id_t page_id = pos_.page_id;
+  if (page_id != chain_checked_page_) {
+    chain_checked_free_ = !txn_.HasPageVersionChains(page_id);
+    chain_checked_page_ = page_id;
+  }
+  if (!chain_checked_free_) {
+    return false;
+  }
+  *dst = keys_ + include_;
+  if (!dst->IsValid()) {
+    return false;
+  }
+  txn_.RecordIndexOnlyVisibleServe();
+  return true;
 }
 
 void IndexScanIterator::Dump(std::ostream& o, int /*indent*/) const {

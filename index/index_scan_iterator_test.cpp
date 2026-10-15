@@ -19,11 +19,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 
 #include "common/random_string.hpp"
@@ -93,6 +95,19 @@ class IndexScanIteratorTest : public ::testing::Test {
       db_.reset();
     }
     db_ = Database::Create(prefix_).MoveValue();
+  }
+
+  // Waits (bounded) for the background GC worker to drop every committed
+  // version chain: a page without chains is the index-only visibility-map
+  // condition, so tests that need the fast path to fire wait here first.
+  void WaitForChainFreePages() {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (db_->TransactionStats().version_chains != 0) {
+      ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+          << "background GC did not drop version chains";
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
 
   void TearDown() override { db_->DeleteAll(); }
@@ -675,6 +690,262 @@ TEST_F(IndexScanIteratorTest, ReadVersionFailureTerminatesScanSticky) {
   }
   std::ignore = std::remove(db_name.c_str());
   tinylamb::RemoveLogAndSegments(log_name);
+}
+
+// ---------------------------------------------------------------------------
+// Index-only visibility map: a non-retained index entry on a page with no
+// version chains is served straight from the B+Tree image (key + INCLUDE
+// payload) without the heap fetch.  See IndexScanIterator::TryReadIndexOnly.
+// ---------------------------------------------------------------------------
+
+TEST_F(IndexScanIteratorTest, IndexOnlyVisibilityMapServesChainFreePages) {
+  // Arrange -- commit rows, then let the background GC drop their version
+  // chains: a chain-free page is the visibility-map condition.
+  {
+    TransactionContext seed = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                seed.GetTable(kTableName));
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_SUCCESS(
+          table
+              ->Insert(seed.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                       Value(0.1 + i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(seed.txn_.PreCommit());
+  }
+  WaitForChainFreePages();
+
+  TransactionContext reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  const uint64_t serves_before =
+      db_->TransactionStats().index_only_visible_serves;
+
+  // Act -- NameIdx (kNonUnique key {1} include {2}) serves key + payload.
+  IndexScanIterator scan(*table, table->GetIndex(1), reader.txn_);
+  std::vector<Row> from_index;
+  while (scan.IsValid()) {
+    Row row;
+    ASSERT_TRUE(scan.TryReadIndexOnly(&row));
+    // The heap-resolved full row agrees with the entry image.
+    const Row& heap = *scan;
+    EXPECT_EQ(row[0], heap[1]);
+    EXPECT_EQ(row[1], heap[2]);
+    from_index.push_back(std::move(row));
+    ++scan;
+  }
+
+  // Assert -- the expected rows arrive in key order, one serve per row.
+  ASSERT_EQ(from_index.size(), 10U);
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_EQ(from_index[static_cast<size_t>(i)],
+              Row({Value("v" + std::to_string(i)), Value(0.1 + i)}));
+  }
+  EXPECT_EQ(db_->TransactionStats().index_only_visible_serves,
+            serves_before + from_index.size());
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, IndexOnlyVisibilityMapRefusesRetainedEntries) {
+  // kVersionedUnique retains deleted entries for old snapshots, so the heap
+  // must keep deciding which entry version is visible: the fast path must
+  // refuse even on a chain-free page.
+  TransactionContext ddl = db_->BeginContext();
+  ASSERT_SUCCESS(db_->CreateIndex(
+      ddl, kTableName,
+      IndexSchema("VersionedIdx", {0}, {1}, IndexMode::kVersionedUnique)));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              ddl.GetTable(kTableName));
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ddl.txn_, Row({Value(i), Value("r" + std::to_string(i)),
+                                    Value(0.5 + i)}))
+            .GetStatus());
+  }
+  ASSERT_SUCCESS(ddl.txn_.PreCommit());
+  WaitForChainFreePages();
+
+  TransactionContext reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, r_table,
+                              reader.GetTable(kTableName));
+  const uint64_t serves_before =
+      db_->TransactionStats().index_only_visible_serves;
+  IndexScanIterator scan(*r_table, r_table->GetIndex(3), reader.txn_);
+  int seen = 0;
+  while (scan.IsValid()) {
+    Row row;
+    EXPECT_FALSE(scan.TryReadIndexOnly(&row));
+    EXPECT_TRUE((*scan).IsValid());
+    ++seen;
+    ++scan;
+  }
+  EXPECT_EQ(seen, 3);
+  EXPECT_EQ(db_->TransactionStats().index_only_visible_serves, serves_before);
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, IndexOnlyVisibilityMapRefusesPagesWithChains) {
+  // Arrange -- seed and keep a writer's uncommitted update: the pending
+  // version registers a chain on the row page, so the entry may not be
+  // trusted for visibility and the heap path must decide.
+  TransactionContext seed = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              seed.GetTable(kTableName));
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(seed.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                     Value(0.1 + i)}))
+            .GetStatus());
+  }
+  ASSERT_SUCCESS(seed.txn_.PreCommit());
+
+  TransactionContext writer = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, w_table,
+                              writer.GetTable(kTableName));
+  RowPosition target;
+  for (Iterator it = w_table->BeginFullScan(writer.txn_); it.IsValid(); ++it) {
+    if ((*it)[0] == Value(1)) {
+      target = it.Position();
+    }
+  }
+  ASSERT_TRUE(target.IsValid());
+  ASSERT_SUCCESS(w_table
+                     ->Update(writer.txn_, target,
+                              Row({Value(1), Value("pending"), Value(9.9)}))
+                     .GetStatus());
+
+  TransactionContext reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, r_table,
+                              reader.GetTable(kTableName));
+  const uint64_t serves_before =
+      db_->TransactionStats().index_only_visible_serves;
+  Row observed;
+  {
+    // The scan must be destroyed before the writer aborts: its shared index
+    // read guard would block the abort's exclusive index-gate acquisition
+    // (ClearPendingIndexMutations) on this same thread.
+    IndexScanIterator scan(*r_table, r_table->GetIndex(0), reader.txn_,
+                           Value(1), Value(1));
+    ASSERT_TRUE(scan.IsValid());
+
+    // Act / Assert -- the chain blocks the fast path; the heap serves the
+    // committed pre-update image to this snapshot.
+    Row row;
+    EXPECT_FALSE(scan.TryReadIndexOnly(&row));
+    observed = *scan;
+  }
+  EXPECT_EQ(observed[1], Value("v1"));
+  EXPECT_EQ(observed[2], Value(0.1 + 1));
+  EXPECT_EQ(db_->TransactionStats().index_only_visible_serves, serves_before);
+  ASSERT_SUCCESS(writer.txn_.Abort());
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, IndexOnlyVisibilityMapServesUpdatedInclude) {
+  // Arrange -- seed rows and rewrite one row's INCLUDE column with the same
+  // key; the committed image must be reflected by the entry's payload once
+  // the version chain is gone.
+  {
+    TransactionContext seed = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                seed.GetTable(kTableName));
+    for (int i = 0; i < 5; ++i) {
+      ASSERT_SUCCESS(
+          table
+              ->Insert(seed.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                       Value(0.1 + i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(seed.txn_.PreCommit());
+  }
+  {
+    TransactionContext writer = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    RowPosition target;
+    {
+      IndexScanIterator locate(*table, table->GetIndex(1), writer.txn_,
+                               Value("v2"), Value("v2"));
+      ASSERT_TRUE(locate.IsValid());
+      target = locate.Position();
+    }
+    ASSERT_SUCCESS(table
+                       ->Update(writer.txn_, target,
+                                Row({Value(2), Value("v2"), Value(99.5)}))
+                       .GetStatus());
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  WaitForChainFreePages();
+
+  TransactionContext reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  IndexScanIterator scan(*table, table->GetIndex(1), reader.txn_, Value("v2"),
+                         Value("v2"));
+  ASSERT_TRUE(scan.IsValid());
+  Row row;
+  ASSERT_TRUE(scan.TryReadIndexOnly(&row));
+  EXPECT_EQ(row, Row({Value("v2"), Value(99.5)}));
+  ++scan;
+  EXPECT_FALSE(scan.IsValid());
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, IndexOnlyVisibilityMapDropsMovedKeyEntries) {
+  // A non-retained index physically removes the old key's entry on a
+  // key-changing update, so the visibility map never resurrects it.
+  {
+    TransactionContext seed = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                seed.GetTable(kTableName));
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_SUCCESS(
+          table
+              ->Insert(seed.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                       Value(0.1 + i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(seed.txn_.PreCommit());
+  }
+  {
+    TransactionContext writer = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    RowPosition target;
+    {
+      IndexScanIterator locate(*table, table->GetIndex(1), writer.txn_,
+                               Value("v1"), Value("v1"));
+      ASSERT_TRUE(locate.IsValid());
+      target = locate.Position();
+    }
+    ASSERT_SUCCESS(table
+                       ->Update(writer.txn_, target,
+                                Row({Value(1), Value("v1x"), Value(1.1)}))
+                       .GetStatus());
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  WaitForChainFreePages();
+
+  TransactionContext reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  {
+    IndexScanIterator gone(*table, table->GetIndex(1), reader.txn_, Value("v1"),
+                           Value("v1"));
+    EXPECT_FALSE(gone.IsValid());
+  }
+  IndexScanIterator moved(*table, table->GetIndex(1), reader.txn_, Value("v1x"),
+                          Value("v1x"));
+  ASSERT_TRUE(moved.IsValid());
+  Row row;
+  ASSERT_TRUE(moved.TryReadIndexOnly(&row));
+  EXPECT_EQ(row, Row({Value("v1x"), Value(1.1)}));
+  ++moved;
+  EXPECT_FALSE(moved.IsValid());
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
 }
 
 }  // namespace tinylamb

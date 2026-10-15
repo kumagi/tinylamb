@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -159,6 +161,19 @@ class ExecutorTest : public ::testing::Test {
       rs_.reset();
     }
     rs_ = Database::Create(prefix_).MoveValue();
+  }
+
+  // Waits (bounded) for the background GC worker to drop every committed
+  // version chain: a page without chains is the index-only visibility-map
+  // condition, so tests that need the fast path to fire wait here first.
+  void WaitForChainFreePages() {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (rs_->TransactionStats().version_chains != 0) {
+      ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+          << "background GC did not drop version chains";
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
 
   void TearDown() override { rs_->DeleteAll(); }
@@ -459,6 +474,50 @@ TEST_F(ExecutorTest, IndexOnlyScanAndBitmapScanMvccSnapshotVisibility) {
   EXPECT_EQ(fresh_bhs_rows[1][0], Value(3));
   EXPECT_EQ(fresh_bhs_rows[2][0], Value(4));
   ASSERT_SUCCESS(fresh_ctx.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, IndexOnlyScanServesVisibilityMapWithoutHeapFetch) {
+  // The fixture's committed rows are chain-free once the background GC has
+  // dropped their version chains, so every index entry is served from the
+  // B+Tree image (key + INCLUDE payload) without touching the heap.
+  WaitForChainFreePages();
+  TransactionContext ctx = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(ctx, kTableName));
+  const uint64_t serves_before =
+      rs_->TransactionStats().index_only_visible_serves;
+
+  // Act -- Idx1 (kUnique {1,2}, no include) delivers [name, score].
+  IndexOnlyScan key_only(ctx.txn_, tbl, tbl.GetIndex(0), Value(), Value(), true,
+                         Expression(), tbl.GetSchema());
+  std::vector<Row> key_rows;
+  Row row;
+  while (key_only.Next(&row, nullptr)) {
+    key_rows.push_back(row);
+  }
+
+  // Act -- Idx2 (kNonUnique {1} include {1,2}) delivers [name, name, score].
+  IndexOnlyScan with_include(ctx.txn_, tbl, tbl.GetIndex(1), Value(), Value(),
+                             true, Expression(), tbl.GetSchema());
+  std::vector<Row> include_rows;
+  while (with_include.Next(&row, nullptr)) {
+    include_rows.push_back(row);
+  }
+
+  // Assert -- rows and INCLUDE payloads match the fixture, one serve each.
+  ASSERT_EQ(key_rows.size(), 4U);
+  EXPECT_EQ(key_rows[0], Row({Value("arise"), Value(4.14)}));
+  EXPECT_EQ(key_rows[1], Row({Value("hello"), Value(1.2)}));
+  EXPECT_EQ(key_rows[2], Row({Value("piyo"), Value(12.2)}));
+  EXPECT_EQ(key_rows[3], Row({Value("world"), Value(4.9)}));
+  ASSERT_EQ(include_rows.size(), 4U);
+  EXPECT_EQ(include_rows[0],
+            Row({Value("arise"), Value("arise"), Value(4.14)}));
+  EXPECT_EQ(include_rows[1], Row({Value("hello"), Value("hello"), Value(1.2)}));
+  EXPECT_EQ(include_rows[2], Row({Value("piyo"), Value("piyo"), Value(12.2)}));
+  EXPECT_EQ(include_rows[3], Row({Value("world"), Value("world"), Value(4.9)}));
+  EXPECT_EQ(rs_->TransactionStats().index_only_visible_serves,
+            serves_before + 8);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
 TEST_F(ExecutorTest, Projection) {

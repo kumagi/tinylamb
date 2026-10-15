@@ -1,5 +1,40 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-16 加筆(第29報)。統合TODO(docs/todo.md)先頭項目の消化:
+**IndexOnlyScan の MVCC visibility map 相当**(チェーンフリー頁のエントリを
+B+Tree 像から直接返し heap fetch を省略)。詳細は下記
+「2026-10-16 IndexOnlyScan visibility map」の節。
+
+## 2026-10-16 IndexOnlyScan visibility map の成果
+
+- **[executor/index] `IndexScanIterator::TryReadIndexOnly` を新設。**
+  非保持インデックス(kUnique/kNonUnique)のエントリが、行ページにバージョン
+  チェーンを持たないとき、B+Tree エントリそのもの(キー列+INCLUDE ペイロード)
+  を可視イメージとして返せる。根拠はフルスキャンの `PhysicalReadEligible`
+  と同じ write-before-latch / GC-drop 不変条件: チェーンの無い頁は
+  コミット済み状態のみを持ち、非保持エントリは削除・キー移動時に物理削除
+  される。呼び出し側(`IndexOnlyScanPlan::EmitExecutor`)の stale-key ゲート
+  (index read guard 取得の前後で `IndexKeysMayBeStale` を再確認)が
+  エントリの鮮度を、スキャン中の read guard が INCLUDE ペイロードの凍結を
+  保証する。kVersionedUnique は古い版のエントリを保持するため従来通り
+  ヒープ解決。旧スナップショットが pin したチェーン・未コミット書き込みの
+  チェーンも同様に対象外。
+- **[executor] `IndexOnlyScan::Next` がこの高速路を最初に試し**、非該当時のみ
+  ヒープ行を解決して可視版+INCLUDE を得る。
+- **[計測] `TransactionRuntimeStats::index_only_visible_serves`** を追加
+  (A/B hatch `TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP=1` で従来経路に
+  固定できる。ハッチ無効化時はカウンタが動かないことを手動確認済み)。
+- **回帰**: `IndexScanIteratorTest.IndexOnlyVisibilityMap*` 5件
+  (チェーンフリー頁の提供/保持エントリ拒否/チェーン頁拒否/同キー更新後の
+  INCLUDE 鮮度/キー移動後の旧エントリ消滅)、
+  `ExecutorTest.IndexOnlyScanServesVisibilityMapWithoutHeapFetch`(直接実行器+
+  カウンタ)、`SqlClusteredOrderTest.CountStarIndexOnlyScanServesVisibilityMap`
+  (SQL COUNT(*) 経路の end-to-end)。
+- **検証**: index_scan_iterator(21)/executor(199)/table(47)/
+  transaction(35+16+70)/full_scan系(9+10)/differential(15)/
+  sql_clustered_order(16) green、`check_layering.py` 成功(allowlist 65辺)、
+  clang-format 済。
+
 2026-10-10 加筆(第28報)。トランザクションエンジン強化(第15ラウンド):
 **チェックポイント後の再オープンでコミット済みデータが大量欠落する P0 の根治**
 (リサイクル済みWALプレフィックス上のコミット事前走査がセグメント末尾の

@@ -114,22 +114,27 @@ Schema IndexOnlyScan::OutputSchema(const Index& idx,
 
 bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
   while (iter_.IsValid()) {
-    // Heap visibility: uncommitted or snapshot-invisible index entries must
-    // not leak through INCLUDE columns that are not versioned.
-    const Row& heap_row = *iter_;
-    if (!heap_row.IsValid()) {
-      ++iter_;
-      continue;
-    }
-    if (include_offsets_.empty()) {
-      *dst = iter_.GetKey();
-    } else {
-      Row inc;
-      inc.values_.reserve(include_offsets_.size());
-      for (slot_t offset : include_offsets_) {
-        inc.values_.push_back(heap_row[offset]);
+    // Index-only visibility map: a non-retained entry on a page with no
+    // version chains is served straight from the B+Tree image (key +
+    // INCLUDE payload), skipping the heap fetch.  Otherwise the heap row
+    // resolves both the snapshot-visible version and its INCLUDE values, so
+    // uncommitted or snapshot-invisible entries cannot leak through.
+    if (!iter_.TryReadIndexOnly(dst)) {
+      const Row& heap_row = *iter_;
+      if (!heap_row.IsValid()) {
+        ++iter_;
+        continue;
       }
-      *dst = iter_.GetKey() + inc;
+      if (include_offsets_.empty()) {
+        *dst = iter_.GetKey();
+      } else {
+        Row inc;
+        inc.values_.reserve(include_offsets_.size());
+        for (slot_t offset : include_offsets_) {
+          inc.values_.push_back(heap_row[offset]);
+        }
+        *dst = iter_.GetKey() + inc;
+      }
     }
     ++iter_;
     if (!dst->IsValid()) {
