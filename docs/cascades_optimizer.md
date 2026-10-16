@@ -104,7 +104,12 @@ The built-in physical rules include (see `plan/implementation_rules.cpp`):
 - `sort_incremental` reuses an ordered prefix and costs only the suffix runs.
 
 `index_scan` may produce an `IndexOnlyScanPlan` when the chosen index covers
-the requested columns. `hash_join` offers both in-memory and hybrid variants;
+the requested columns. Covering candidates are priced as matched rows times
+`kCoveringIndexCostFactor` (0.5) and skip the range clustering penalty (their
+I/O is index-only and key-ordered), so a covering index wins over a
+non-covering index of the same range and stays competitive with the
+sequential full scan on an unclustered column. `hash_join` offers both
+in-memory and hybrid variants;
 `nested_loop_join` is a cross product followed by evaluation of the complete
 join predicate. `late_materialization_join` is limited to inner signed
 INT64/DATE equijoins whose right child is a filter-free table scan with a
@@ -240,7 +245,10 @@ Tests for rule isolation and memo enumeration are in
   can produce the root.
 - Total cost is child cost plus each rule's `local_cost`. Scan rules use
   statistics/selectivity and Top-K hints; joins use cardinality estimates and
-  spill penalties. A single equijoin key still estimates `|L|*|R|/max(NDV)`.
+  spill penalties. Range index scans multiply matched rows by the column
+  clustering penalty; covering (index-only) scans apply the covering factor
+  instead and carry no clustering penalty. A single equijoin key still
+  estimates `|L|*|R|/max(NDV)`.
   Additional keys combine those per-key selectivities with exponential
   backoff (`EstimateEquijoinSelectivity`): the catalog has no cross-column
   NDV, so the estimate sits between max-NDV and full independence. A plan

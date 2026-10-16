@@ -1,5 +1,35 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-16 加筆(第30報)。統合TODOの次項目: **covering index 選択のコスト精度**
+(covering 候補の検出漏れと、covering へのクラスタリング罰の誤適用の修正)。
+詳細は下記「2026-10-16 covering index コスト精度」の節。
+
+## 2026-10-16 covering index コスト精度の成果
+
+- **[planner] covering(IndexOnly)候補の検出をラップ前に移動。**
+  `ScanAlternatives` は `BuildIndexScan` の戻り値を Selection/Projection/
+  Rename で包んだ後に型判定していたため、covering 判定が常に外れていた
+  (無拘束経路も finalize 後に判定しており、別名付きでは外れていた)。
+- **[planner] covering 候補のコストを「マッチ行数 ×
+  `kCoveringIndexCostFactor` (0.5)」に統一し、range スキャンの
+  クラスタリング罰 (`RangeClusteringPenalty`) は covering には適用しない**
+  (インデックスのみを読み、エントリはキー順に到着するためヒープシークが
+  無い)。非 covering は従来通り matched rows × penalty。無拘束 covering
+  経路も同じ定数へ統一。
+- **効果**: 同一 range の非 covering インデックス(先に作成された場合でも)
+  に covering が勝つ / 非クラスタ列の covering range がフルスキャンに勝つ。
+- **回帰**: `OptimizerTest.CoveringIndexWinsOverNonCoveringIndexForTheSameRange`
+  / `CoveringIndexRangeSkipsTheClusteringPenalty`。IN リストの point-union
+  テストは、IN が非選択的な既存データでは covering range が正当に勝つため、
+  選択的な IN を持つ専用テーブル形状へ更新(意図=point-union 選択は不変)。
+- **既知の残り(別項目)**: IN リストの point-union 候補は
+  `IndexScanPlan` 直構築で、`IndexOnlyScanPlan` が複数レンジを持たないため
+  covering にならない(複数レンジ covering は未実装)。
+- **検証**: 全 ctest **3913/3913 合格**(意図的 skip 3)。
+  optimizer(121)/cascades(82)/googlesql_compliance(296)/TPC-H(8)/TPC-C(1)/
+  TPC-DS(15)/query(186)/sql_* 各スイート green、`check_layering.py`
+  成功(65辺)。
+
 2026-10-16 加筆(第29報)。統合TODO(docs/todo.md)先頭項目の消化:
 **IndexOnlyScan の MVCC visibility map 相当**(チェーンフリー頁のエントリを
 B+Tree 像から直接返し heap fetch を省略)。詳細は下記

@@ -203,7 +203,11 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       `IndexScanIteratorTest.IndexOnlyVisibilityMap*`、
       `ExecutorTest.IndexOnlyScanServesVisibilityMapWithoutHeapFetch`、
       `SqlClusteredOrderTest.CountStarIndexOnlyScanServesVisibilityMap`
-- [ ] `CoveringIndex` 選択のコスト精度
+- [x] `CoveringIndex` 選択のコスト精度。
+      `ScanAlternatives` が covering（IndexOnly）候補をラップ前に検出し、
+      クラスタリング罰を適用せず `kCoveringIndexCostFactor`(0.5) を掛ける。
+      回帰: `OptimizerTest.CoveringIndexWinsOverNonCoveringIndexForTheSameRange` /
+      `CoveringIndexRangeSkipsTheClusteringPenalty`
 - [ ] `PAXScan` / カラムナ・スキャンの Cascades 接続
 - [ ] `ZoneMapSkipScan`（既存 zone map をプラン属性に）
 - [ ] `LateMaterializationScan`（まずキー、後でワイド列）

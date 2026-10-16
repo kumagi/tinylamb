@@ -490,6 +490,13 @@ void ApplyLimitHint(const Plan& plan, const PhysicalProperties& required,
 // 1+k for a fully uncorrelated column.
 inline constexpr double kIndexRangeClusteringPenalty = 2.0;
 
+// Covering (index-only) scans read the index alone: no heap fetch per row,
+// and the executor skips version resolution entirely on chain-free pages
+// (the index-only visibility map).  Price them as a fraction of a heap row
+// touch so they win against a non-covering alternative of the same range and
+// stay competitive with the sequential full scan.
+inline constexpr double kCoveringIndexCostFactor = 0.5;
+
 double RangeClusteringPenalty(const TableStatistics& statistics, slot_t slot) {
   double correlation = 1.0;
   if (slot < statistics.Columns()) {
@@ -883,12 +890,14 @@ std::vector<PlanAlternative> ScanAlternatives(
               table, index, statistics, {}, {}, scan_ascending, scan_predicate,
               fallback_select, required.require_row_position,
               required.wait_for_write_intent, full_index_order);
+          // Detect covering before finalize wraps the node (aliased
+          // relations get a rename node that hides the scan type).
+          const bool covering = std::dynamic_pointer_cast<IndexOnlyScanPlan>(
+                                    unconstrained) != nullptr;
           unconstrained = finalize(unconstrained);
           const double unconstrained_cost =
               static_cast<double>(statistics.Rows()) *
-              (std::dynamic_pointer_cast<IndexOnlyScanPlan>(unconstrained)
-                   ? 0.5
-                   : 1.0);
+              (covering ? kCoveringIndexCostFactor : 1.0);
           candidates.push_back(PlanAlternative{
               .plan = std::move(unconstrained),
               .local_cost = unconstrained_cost,
@@ -1189,6 +1198,11 @@ std::vector<PlanAlternative> ScanAlternatives(
             table, index, statistics, begin_key, end_key, scan_ascending,
             scan_predicate, fallback_select, required.require_row_position,
             required.wait_for_write_intent, provided_order);
+        // Covering-ness is a property of the scan BuildIndexScan picked; the
+        // Selection/Projection/Rename wrappers below hide the node type, so
+        // capture it before wrapping.
+        const bool covering =
+            std::dynamic_pointer_cast<IndexOnlyScanPlan>(candidate) != nullptr;
         // The scan filter is applied either by the scan itself or, when its
         // columns are not covered by the index key, by a Selection on top.
         // Only equality-pinned slots are provably exact in the scan output;
@@ -1224,6 +1238,13 @@ std::vector<PlanAlternative> ScanAlternatives(
         // exact point lookups with no clustering signal, so a pure point
         // scan keeps the base cost above. Statistics-free tables keep the
         // old cost exactly (no datapoint to penalize with).
+        //
+        // A covering (index-only) candidate reads only the index, whose
+        // entries arrive in key order: it has no scattered heap seek to
+        // penalize, and its cost is the index traversal times the covering
+        // factor.  This is what lets a covering index win over a
+        // non-covering index with the same range and over a full scan on an
+        // unclustered column.
         bool has_range_slot = false;
         double range_penalty = 1.0;
         for (const slot_t slot : consumed) {
@@ -1233,8 +1254,11 @@ std::vector<PlanAlternative> ScanAlternatives(
           }
         }
         if (has_range_slot && candidate->AccessRowCount() > 0) {
-          local_cost =
-              static_cast<double>(candidate->AccessRowCount()) * range_penalty;
+          local_cost = static_cast<double>(candidate->AccessRowCount()) *
+                       (covering ? 1.0 : range_penalty);
+        }
+        if (covering) {
+          local_cost *= kCoveringIndexCostFactor;
         }
         auto estimated_rows = static_cast<double>(candidate->GetStats().Rows());
         ApplyLimitHint(candidate, required, context, filter_selectivity,

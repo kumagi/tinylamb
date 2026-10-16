@@ -4254,20 +4254,45 @@ TEST_F(OptimizerTest, IndependentIndexPredicatesUseBitmapAnd) {
 
 TEST_F(OptimizerTest, EqualityPrefixAndInListDriveCompositePointUnion) {
   // A predicate such as (warehouse = ?) AND (item IN (...)) must use one
-  // composite point range per item instead of scanning every warehouse's
-  // stock rows. NameIdx has the equivalent two-column shape (d3, d4).
+  // composite point range per item instead of scanning every row under the
+  // equality prefix.  The dedicated table makes the IN list selective: the
+  // prefix a matches 20 rows while each (a, b) point matches exactly one, so
+  // the point union is genuinely cheaper than the single equality-prefix
+  // range (which a covering index would otherwise win on cost).
+  const std::string kTable = "PointUnionChoice";
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl,
+        rs_->CreateTable(writer,
+                         Schema(kTable, {Column("a", ValueType::kInt64),
+                                         Column("b", ValueType::kInt64),
+                                         Column("c", ValueType::kInt64)})));
+    for (int64_t i = 0; i < 400; ++i) {
+      ASSERT_SUCCESS(
+          tbl.Insert(writer.txn_, Row({Value(i % 20), Value(i / 20), Value(i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        writer, kTable,
+        IndexSchema("CompositeIdx", {0, 1}, {}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  {
+    TransactionContext stats_ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, kTable));
+    ASSERT_SUCCESS(stats_ctx.PreCommit());
+  }
   QueryData query{
-      {"a"},
+      {kTable},
       BinaryExpressionExp(
-          BinaryExpressionExp(ColumnValueExp(ColumnName("a", "d3")),
-                              BinaryOperation::kEquals,
-                              ConstantValueExp(Value("d3-2"))),
+          BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value(int64_t{5}))),
           BinaryOperation::kAnd,
-          InExpressionExp(
-              ColumnValueExp(ColumnName("a", "d4")),
-              {ConstantValueExp(Value(16)), ConstantValueExp(Value(17))})),
-      {NamedExpression("ad1", ColumnValueExp(ColumnName("a", "d1")))}};
-  query.aliases_ = {{"a", "Sc2"}};
+          InExpressionExp(ColumnValueExp("b"),
+                          {ConstantValueExp(Value(int64_t{1})),
+                           ConstantValueExp(Value(int64_t{2}))})),
+      {NamedExpression("a"), NamedExpression("b")}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -4282,9 +4307,9 @@ TEST_F(OptimizerTest, EqualityPrefixAndInListDriveCompositePointUnion) {
   while (executor->Next(&row, nullptr)) {
     keys.push_back(row[0].value.int_value);
   }
-  EXPECT_EQ(keys.size(), 20);
+  EXPECT_EQ(keys.size(), 2U);
   EXPECT_TRUE(std::all_of(keys.begin(), keys.end(),
-                          [](int64_t key) { return key % 10 == 2; }));
+                          [](int64_t key) { return key == 5; }));
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -5080,6 +5105,113 @@ TEST_F(OptimizerTest, ClusteringPenaltySteersWideRangeScanChoice) {
   const auto [unclust_dump, unclust_rows] = plan_for("UnclustKeys");
   EXPECT_NE(unclust_dump.find("FullScan"), std::string::npos) << unclust_dump;
   EXPECT_EQ(unclust_rows, 1200U);
+}
+
+TEST_F(OptimizerTest, CoveringIndexWinsOverNonCoveringIndexForTheSameRange) {
+  // Two indexes over the same leading key with identical range selectivity:
+  // the covering one answers the projection without a heap fetch, so it must
+  // win the cost comparison even though the non-covering one was created
+  // first (a cost tie keeps the first candidate found).
+  constexpr int64_t kRows = 2000;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl,
+        rs_->CreateTable(
+            writer,
+            Schema("CoveringChoice", {Column("key", ValueType::kInt64),
+                                      Column("payload", ValueType::kInt64)})));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_SUCCESS(
+          tbl.Insert(writer.txn_, Row({Value(i), Value(i * 2)})).GetStatus());
+    }
+    // Non-covering first: `SELECT key, payload` needs the heap through it.
+    ASSERT_SUCCESS(rs_->CreateIndex(writer, "CoveringChoice",
+                                    IndexSchema("WideIdx", {0})));
+    // Covering second: the same projection is answered by the index alone.
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        writer, "CoveringChoice",
+        IndexSchema("CoverIdx", {0}, {1}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  {
+    TransactionContext stats_ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, "CoveringChoice"));
+    ASSERT_SUCCESS(stats_ctx.PreCommit());
+  }
+  QueryData query{
+      {"CoveringChoice"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("key"),
+                              BinaryOperation::kGreaterThanEquals,
+                              ConstantValueExp(Value(int64_t{200}))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kLessThan,
+                              ConstantValueExp(Value(int64_t{1400})))),
+      {NamedExpression("key"), NamedExpression("payload")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("IndexOnlyScan"), std::string::npos) << dump.str();
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, CoveringIndexRangeSkipsTheClusteringPenalty) {
+  // A covering range scan reads only the index (already key-ordered): the
+  // heap-seek clustering penalty must not apply, so an unclustered column's
+  // covering index still beats the full scan on a wide range.
+  constexpr int64_t kRows = 2000;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl,
+        rs_->CreateTable(writer,
+                         Schema("CoveringUnclustered",
+                                {Column("key", ValueType::kInt64),
+                                 Column("payload", ValueType::kInt64)})));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_SUCCESS(
+          tbl.Insert(writer.txn_, Row({Value((i * 997) % kRows), Value(i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        writer, "CoveringUnclustered",
+        IndexSchema("CoverIdx", {0}, {1}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  {
+    TransactionContext stats_ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, "CoveringUnclustered"));
+    ASSERT_SUCCESS(stats_ctx.PreCommit());
+  }
+  QueryData query{
+      {"CoveringUnclustered"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("key"),
+                              BinaryOperation::kGreaterThanEquals,
+                              ConstantValueExp(Value(int64_t{200}))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kLessThan,
+                              ConstantValueExp(Value(int64_t{1400})))),
+      {NamedExpression("key"), NamedExpression("payload")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("IndexOnlyScan"), std::string::npos) << dump.str();
+  EXPECT_EQ(dump.str().find("FullScan"), std::string::npos) << dump.str();
+  // The rows are still exactly the range's, and none of them are duplicated.
+  Executor executor = plan->EmitExecutor(context);
+  size_t rows = 0;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+  }
+  EXPECT_EQ(rows, 1200U);
+  ASSERT_SUCCESS(context.PreCommit());
 }
 
 }  // namespace tinylamb

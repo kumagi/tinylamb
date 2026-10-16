@@ -311,7 +311,6 @@ Cascades rule / cost / statistics
 - [x] BitmapAnd / BitmapOrを実装する。
 - [x] TidScan / RowIdLookup / CTID相当を実装する。
 - [x] Index Skip Scanを実装する。
-- [ ] covering index選択のコスト精度を上げる。
 - [x] PAXScanをCascadesへ接続する。
 - [x] ZoneMapSkipScanをplan属性へ接続する。
 - [x] LateMaterializationScanを実装する。
