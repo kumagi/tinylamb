@@ -33,7 +33,11 @@ lives here but compiles into `tinylamb_table` (see `table/AGENTS.md`).
   `TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP`. **CMake builds it into
   `tinylamb_table`** to keep the `table → index` edge one-directional.
 - `lsm_tree.{hpp,cpp}` + `lsm_detail/` — WiscKey-style LSM (see
-  `lsm_detail/AGENTS.md`).
+  `lsm_detail/AGENTS.md`).  The plan/executor half lives above this layer:
+  `plan/lsm_scan_plan.*` + `executor/lsm_scan.*` behind the `lsm_scan`
+  implementation rule (`LogicalOperator::kLsmScan`, built by plan-level
+  callers; SQL not wired).  `LSMView` covers the registered runs only, so
+  fresh writes become visible after `Sync` (or the flusher's periodic flush).
 
 Test: `./build/b_plus_tree_test`, `b_plus_tree_iterator_test`,
 `lsm_tree_test`, `index_scan_iterator_test`, `b_plus_tree_concurrent_test`.

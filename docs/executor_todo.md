@@ -241,7 +241,15 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       回帰: `OptimizerTest.InListPointUnionKeepsKeyOrderWithoutSort` /
       `DisjunctivePrefixRangesKeepKeyOrderWithoutSort` /
       `SqlClusteredOrderTest.InListPointUnionKeepsKeyOrder`
-- [ ] LSM / WiscKey 経路の `LsmScan` 実装規則
+- [x] LSM / WiscKey 経路の `LsmScan` 実装規則。
+      `LogicalOperator::kLsmScan`（葉・ツリー参照＋行数推定）＋ `LsmScanPlan`
+      （出力 = key/value の VARCHAR、キー昇順を主張）＋ `LsmScan` 実行器
+      （`LSMView` スナップショット、世代最新勝ち・tombstone スキップ）＋
+      `lsm_scan` implementation rule。**SQL からの到達経路は未接続**
+      （plan-level API/テストから直接 Memo を構築する。ビューは登録済み run
+      のみを対象とするため、最新書き込みは `Sync` 後に見える）。
+      回帰: `LsmScanTest.*`（キー順の live pair、規則→plan→executor の
+      end-to-end、空ツリー、Fingerprint 分離）
 
 ---
 

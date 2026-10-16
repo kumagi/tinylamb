@@ -42,6 +42,7 @@
 #include "executor/late_materialization_join.hpp"
 #include "executor/limit.hpp"
 #include "executor/lookup_join.hpp"
+#include "executor/lsm_scan.hpp"
 #include "executor/materialize.hpp"
 #include "executor/max1_row.hpp"
 #include "executor/merge_append.hpp"
@@ -87,6 +88,7 @@
 #include "plan/index_skip_scan_plan.hpp"
 #include "plan/late_materialization_join_plan.hpp"
 #include "plan/limit_plan.hpp"
+#include "plan/lsm_scan_plan.hpp"
 #include "plan/materialize_plan.hpp"
 #include "plan/max1_row_plan.hpp"
 #include "plan/merge_join_plan.hpp"
@@ -447,6 +449,12 @@ Executor ValuesPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
 
 Executor DummyScanPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
   return std::make_shared<ValuesExecutor>(std::vector<Row>{Row({})});
+}
+
+Executor LsmScanPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
+  // The LSM scan needs no transaction context: the tree's own snapshot view
+  // is the consistency boundary (no MVCC/row locks).
+  return std::make_shared<LsmScan>(tree_);
 }
 
 Executor IndexSkipScanPlan::EmitExecutor(TransactionContext& txn) const {

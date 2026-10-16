@@ -27,6 +27,7 @@ namespace tinylamb {
 class TransactionContext;
 class Table;
 class TableStatistics;
+class LSMTree;
 struct QueryData;
 }  // namespace tinylamb
 
@@ -63,6 +64,11 @@ enum class LogicalOperator : uint8_t {
   kRecursiveCte,
   kApply,
   kSample,
+  // LSM / WiscKey scan (index/lsm_tree.hpp): a leaf over a caller-owned
+  // LSM tree, yielding its live (key, value) pairs.  SQL does not produce
+  // this node; plan-level callers and tests build it directly (the rule is
+  // exercised through a directly constructed memo).
+  kLsmScan,
   // Opaque relational IR (outer/semi/anti joins, subqueries and CTEs). The
   // memo can cost/select it while its internal lowering remains specialized.
   kRelational,
@@ -109,6 +115,13 @@ struct LogicalExpression {
   std::string sample_weight_alias{};
   size_t depth_limit{0};
   std::optional<RecursiveDepthSpec> depth_spec{};
+
+  // kLsmScan payload: the caller-owned LSM tree to scan and the caller's
+  // row-count estimate (the tree exposes no row count; the scan itself
+  // streams live keys only).  The tree must outlive the memo, its plans and
+  // their executors.
+  const LSMTree* lsm_tree{nullptr};
+  size_t lsm_estimated_rows{0};
 
   [[nodiscard]] std::string Fingerprint() const;
 };
@@ -571,6 +584,10 @@ inline Pattern Apply(Pattern left = Any(), Pattern right = Any(),
 inline Pattern Sample(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kSample, {std::move(child)},
                      std::move(capture));
+}
+
+inline Pattern LsmScan(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kLsmScan, {}, std::move(capture));
 }
 
 }  // namespace dsl

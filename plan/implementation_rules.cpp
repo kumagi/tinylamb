@@ -51,6 +51,7 @@
 #include "index_skip_scan_plan.hpp"
 #include "late_materialization_join_plan.hpp"
 #include "limit_plan.hpp"
+#include "lsm_scan_plan.hpp"
 #include "merge_join_plan.hpp"
 #include "minmax_index_plan.hpp"
 #include "plan/cascades.hpp"
@@ -3252,6 +3253,27 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               .estimated_rows = static_cast<double>(logical.values.size())}};
         },
         c::LogicalOperator::kValues));
+    // LSM / WiscKey scan: the kLsmScan node carries a caller-owned tree and
+    // its row-count estimate; SQL does not produce the node (plan-level
+    // callers and tests build the memo directly).
+    built.Add(c::ImplementationRule(
+        "lsm_scan", c::dsl::LsmScan(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children, const PhysicalProperties&,
+           const c::RuleContext&) {
+          if (!children.empty() || logical.lsm_tree == nullptr) {
+            return std::vector<PlanAlternative>{};
+          }
+          Plan plan = std::make_shared<LsmScanPlan>(*logical.lsm_tree,
+                                                    logical.lsm_estimated_rows);
+          const auto rows = static_cast<double>(logical.lsm_estimated_rows);
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(plan),
+                              .local_cost = rows,
+                              .estimated_rows = rows}};
+        },
+        c::LogicalOperator::kLsmScan));
     built.Add(c::ImplementationRule(
         "unnest", c::dsl::Unnest(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,

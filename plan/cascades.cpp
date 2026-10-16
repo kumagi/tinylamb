@@ -1240,6 +1240,12 @@ std::string LogicalExpression::Fingerprint() const {
       }
     }
   }
+  if (operation == LogicalOperator::kLsmScan) {
+    // Tree identity (pointer) plus the caller's estimate: two LSM scans of
+    // different trees (or different estimates) must not dedupe into one.
+    out << "#lsm:" << static_cast<const void*>(lsm_tree) << ':'
+        << lsm_estimated_rows;
+  }
   return out.str();
 }
 
@@ -1614,6 +1620,7 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
       break;
     case LogicalOperator::kValues:
     case LogicalOperator::kDummyScan:
+    case LogicalOperator::kLsmScan:
     case LogicalOperator::kRelational:
       break;
     case LogicalOperator::kJoin:
@@ -9167,6 +9174,7 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
     case LogicalOperator::kScan:
     case LogicalOperator::kValues:
     case LogicalOperator::kDummyScan:
+    case LogicalOperator::kLsmScan:
     case LogicalOperator::kRelational:
       return {};
     case LogicalOperator::kJoin:

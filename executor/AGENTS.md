@@ -16,7 +16,9 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   `index_only_scan`, `parallel_index_scan` (morsel-driven parallel index
   scan over B+Tree-leaf-partitioned key ranges, morsel-ordered handoff),
   `bitmap_scan`, `tid_scan`, `minmax_index`, `zone_map`, `remote_scan`,
-  `analyze_scan`, `cardinality_probe`, `constant_executor`.
+  `analyze_scan`, `cardinality_probe`, `constant_executor`, `lsm_scan`
+  (streams an LSM/WiscKey tree's live key/value pairs; `LSMTree::GetView()`
+  snapshot taken at construction).
   The serial `IndexScan` prefetches its upcoming heap pages with a look-ahead
   cursor (`TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH`); the index-only visibility
   map is `IndexScanIterator::TryReadIndexOnly`.

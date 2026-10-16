@@ -94,8 +94,10 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   NL/LookupJoin/LateMaterializationJoin, outer NL, StreamAgg,
   `sort` / `sort_external_merge` (the buffered vs external-merge halves of one
   ORDER BY, see `sort_plan.hpp`),
-  `sort_incremental`; normal single-table queries use Memo, with only
-  `OptimizeMinMaxIndex` retaining exact endpoint lookup).
+  `sort_incremental`, `lsm_scan` (LSM/WiscKey scan: `plan/lsm_scan_plan.*`
+  over a caller-owned `LSMTree`; the `kLsmScan` node is built by plan-level
+  callers and tests — SQL is not wired); normal single-table queries use
+  Memo, with only `OptimizeMinMaxIndex` retaining exact endpoint lookup).
   Dynamic join filters: `dynamic_filter_pushdown_join` records the probe-side
   join keys on a derived probe group (`Group::dynamic_filter_keys`), and the
   hash-join rule turns that annotation into `ProductPlan::PreferDynamicFilter`

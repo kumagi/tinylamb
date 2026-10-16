@@ -1,5 +1,37 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-16 加筆(第33報)。統合TODOの次項目: **LSM / WiscKey の `LsmScan`
+実装規則**(plan/executor 層のみ)。詳細は下記「2026-10-16 LsmScan 実装規則」の節。
+
+## 2026-10-16 LsmScan 実装規則の成果
+
+- **[方針] スコープは plan/executor 層のみ**(ユーザー判断)。LSM は現在
+  テーブル/SQL/カタログに未接続で、トランザクション統合(WAL/undo)を伴う
+  副索引化は複数セッション規模のため、今回は論理ノード→実装規則→plan→
+  executor の縦の一本を完成させ、SQL からの到達は将来の storage 統合に委ねる。
+- **[plan] `LogicalOperator::kLsmScan`(葉)** を追加。ペイロードは
+  caller-owned の `const LSMTree*` と行数推定(`lsm_estimated_rows`)。
+  Fingerprint にツリー同一性(ポインタ)と推定値を含める。Memo 検証・
+  RequiredChildProperties は葉として扱う。
+- **[plan] `LsmScanPlan`**: 出力スキーマ = (key VARCHAR, value VARCHAR)。
+  `IsOrderedBy` はキー1列の昇順のみ主張(ビューは run をキー順にマージする。
+  NULL は出ないため NULL 配置要求は常に充足)。
+- **[executor] `LsmScan`**: `LSMTree::GetView()` のスナップショットを構築時に
+  取得し、`LSMView::Iterator` で世代最新勝ち・tombstone スキップの live pair
+  を流す。blob/IO 失敗は sticky status。**ビューは登録済み run のみを対象**
+  とするため、最新の書き込みは `Sync`(またはフラッシャーの flush)後に見える。
+- **[rule] `lsm_scan`**: `kLsmScan` → `LsmScanPlan`(推定行数をコスト)。
+- **回帰**: `LsmScanTest.StreamsLivePairsInKeyOrder`(上書き勝ち・tombstone
+  スキップ・blob 長キー)、`RuleSelectsThePlanAndEmitsTheSameRows`
+  (規則→plan→EmitExecutor→行、順序主張)、`EmptyTreeYieldsNoRows`、
+  `FingerprintSeparatesTreesAndEstimates`。
+- **既知の残り(将来の storage 統合時)**: SQL 到達(DDL/カタログ)、キー範囲
+  境界(ビューは seek 非対応)、トランザクション統合(WAL/undo/可視性)。
+- **検証**: 全 ctest **3927/3927 合格**(意図的 skip 3)。
+  lsm_scan(4)/cascades(192)/cascades_rules(82)/plan(59)/
+  plan_extra(10)/optimizer(124)/executor(200)/query(186)/TPC-H(8)/
+  compliance(296) green、`check_layering.py` 成功(65辺)。
+
 2026-10-16 加筆(第32報)。統合TODOの次項目: **複数レンジ IndexScan の順序回復**
 (point-union / OR-of-prefixes の大域順序主張)。詳細は下記
 「2026-10-16 複数レンジ IndexScan の順序回復」の節。
