@@ -314,7 +314,6 @@ Cascades rule / cost / statistics
 - [x] PAXScanをCascadesへ接続する。
 - [x] ZoneMapSkipScanをplan属性へ接続する。
 - [x] LateMaterializationScanを実装する。
-- [ ] PrefetchingIndexScan、ParallelIndexScan、RangePartitionedScanを実装する。
 - [x] BERNOULLI / SYSTEMのSampleScanを実装する。
 - [ ] 複数レンジIndexScanの順序回復を実装する。
 - [ ] LSM / WiscKeyのLsmScan implementation ruleを実装する。

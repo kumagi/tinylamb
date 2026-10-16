@@ -442,6 +442,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/detail/explain_format.cpp
         executor/index_scan.cpp
         executor/index_only_scan.cpp
+        executor/parallel_index_scan.cpp
         executor/lookup_join.cpp
         executor/late_materialization_join.cpp
         executor/bitmap_scan.cpp
@@ -822,6 +823,7 @@ add_simple_test(expression/bytecode_test.cpp)
 add_simple_test(expression/jit_test.cpp)
 add_simple_test(expression/parameter_slot_test.cpp)
 add_simple_test(executor/executor_test.cpp)
+add_simple_test(executor/parallel_index_scan_test.cpp)
 add_simple_test(executor/relational_regression_test.cpp)
 add_simple_test(executor/data_chunk_test.cpp)
 add_simple_test(executor/distinct_test.cpp)

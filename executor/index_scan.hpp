@@ -21,6 +21,7 @@
 #ifndef TINYLAMB_INDEX_SCAN_HPP
 #define TINYLAMB_INDEX_SCAN_HPP
 
+#include <memory>
 #include <vector>
 
 #include "executor/executor_base.hpp"
@@ -69,6 +70,18 @@ class IndexScan : public ExecutorBase {
  private:
   void OpenRange(const std::vector<Value>& begin_key,
                  const std::vector<Value>& end_key);
+  // PrefetchingIndexScan: (re)builds the look-ahead cursor for a range and
+  // primes it |kIndexScanPrefetchDistance| entries ahead of the main
+  // iterator.  A no-op when the A/B hatch disables prefetching.
+  void OpenPrefetch(const std::vector<Value>& begin_key,
+                    const std::vector<Value>& end_key);
+  // Advances the look-ahead cursor one entry and warms the heap page at its
+  // new position (best effort).  O(1) amortized: it is called once per main
+  // iterator step, keeping the lead constant.
+  void AdvancePrefetch();
+  // The single place the main iterator advances: keeps the look-ahead cursor
+  // in lockstep so the lead never drifts.
+  void StepIterators();
   void ReleaseIndexReadGuard();
 
   Transaction& txn_;
@@ -83,6 +96,10 @@ class IndexScan : public ExecutorBase {
   size_t pending_offset_{0};
   TransactionManager::IndexReadGuard index_read_guard_;
   Iterator iter_;
+  // PrefetchingIndexScan: look-ahead cursor running
+  // |kIndexScanPrefetchDistance| entries ahead of |iter_|; null when
+  // prefetching is off (A/B hatch).
+  std::unique_ptr<IndexScanIterator> prefetch_iter_;
   Expression cond_;
   // Top-level conjuncts of `cond_`; the filter follows commutative WHERE
   // semantics (executor/detail/scan_filter.hpp) so conjunct order is not

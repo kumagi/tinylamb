@@ -91,6 +91,11 @@ struct TransactionRuntimeStats {
   // (see IndexScanIterator::TryReadIndexOnly).  A/B hatch:
   // TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP=1.
   uint64_t index_only_visible_serves{0};
+  // Row pages warmed by the index-scan prefetcher (a second iterator runs a
+  // fixed distance ahead of the scan and fetches each upcoming page into the
+  // buffer pool, so the scan's own fetch is a pool hit).  A/B hatch:
+  // TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH=1.
+  uint64_t index_scan_prefetch_pages{0};
 };
 
 class IndexKey;
@@ -361,6 +366,11 @@ class TransactionManager {
   // TransactionRuntimeStats::index_only_visible_serves).
   void RecordIndexOnlyVisibleServe() const {
     index_only_visible_serves_.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Counts one row page warmed by the index-scan prefetcher (see
+  // TransactionRuntimeStats::index_scan_prefetch_pages).
+  void RecordIndexScanPrefetch() const {
+    index_scan_prefetch_pages_.fetch_add(1, std::memory_order_relaxed);
   }
   // Drops every version chain keyed to |pid|.  RowPosition namespaces chain
   // keys by {page_id, slot} only, so a page id recycled off the free list
@@ -691,6 +701,9 @@ class TransactionManager {
   // Rows served by the index-only visibility-map fast path (see
   // RecordIndexOnlyVisibleServe).
   mutable std::atomic<uint64_t> index_only_visible_serves_{0};
+  // Row pages warmed by the index-scan prefetcher (see
+  // RecordIndexScanPrefetch).
+  mutable std::atomic<uint64_t> index_scan_prefetch_pages_{0};
   std::atomic<uint64_t> write_intent_attempts_{0};
   std::atomic<uint64_t> write_intent_conflicts_{0};
   std::atomic<uint64_t> write_intent_mutex_wait_ns_{0};

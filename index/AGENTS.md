@@ -11,6 +11,11 @@ lives here but compiles into `tinylamb_table` (see `table/AGENTS.md`).
   the chain, only writers absorb it. `hint_leaf` skips the root-to-leaf walk
   when the previous landing leaf still routes the key (verified against root
   + fences). Reclaim via `ReclaimIfOrphaned` (row-less + foster-less only).
+  `ScanPartitionBoundaries` walks the leaf chain for RangePartitionedScan:
+  the first key of every K-th non-empty leaf within the range, strictly
+  ascending and strictly greater than the scan's begin, which
+  `IndexScanIterator::PartitionBoundaries` decodes into key images for
+  `ParallelIndexScan`'s half-open morsels.
 - `b_plus_tree_iterator.{hpp,cpp}` — range scan cursor (asc/desc) built on
   `BPlusTree::PositionAtOrAbove`/`BPlusTree::PositionBelow`.
 - `index_schema.{hpp,cpp}` (`IndexMode{kNonUnique/kUnique/kVersionedUnique}`),

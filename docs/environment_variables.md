@@ -68,6 +68,8 @@ documented SQL semantics; flipping one must not change results, only speed
 | `TINYLAMB_DISABLE_WORKER_SCAN_FILTER` | Worker-side scan filter (relational factory). |
 | `TINYLAMB_DISABLE_PARALLEL_KEYED_SCAN` | Parallel keyed (index) scan. |
 | `TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP` | Index-only visibility-map fast path: a non-retained entry on a chain-free page is served from the B+Tree image (key + INCLUDE) instead of the heap. |
+| `TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH` | Index-scan look-ahead heap-page prefetcher (a second cursor warms the pages the serial `IndexScan` is about to fetch). |
+| `TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN` | ParallelIndexScan for large ascending single-range index scans (falls back to the serial `IndexScan`). |
 | `TINYLAMB_DISABLE_INT_KEY_JOIN` | Fixed-width int-key fast path in the parallel hash join. |
 | `TINYLAMB_DISABLE_JOIN_FLIP` | Hash-join build/probe flip. |
 | `TINYLAMB_DISABLE_JOIN_REORDER` | Ordered-path inner-run reorder + WHERE-to-inner-ON placement. |

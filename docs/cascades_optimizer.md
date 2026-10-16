@@ -108,7 +108,10 @@ the requested columns. Covering candidates are priced as matched rows times
 `kCoveringIndexCostFactor` (0.5) and skip the range clustering penalty (their
 I/O is index-only and key-ordered), so a covering index wins over a
 non-covering index of the same range and stays competitive with the
-sequential full scan on an unclustered column. `hash_join` offers both
+sequential full scan on an unclustered column. A large ascending single-range
+`IndexScanPlan` emits `ParallelIndexScan` (leaf-aligned key morsels,
+`kParallelIndexScanMinRows`) with the residual predicate on a Selection above
+it; the morsel-ordered handoff keeps the key order. `hash_join` offers both
 in-memory and hybrid variants;
 `nested_loop_join` is a cross product followed by evaluation of the complete
 join predicate. `late_materialization_join` is limited to inner signed

@@ -5214,4 +5214,77 @@ TEST_F(OptimizerTest, CoveringIndexRangeSkipsTheClusteringPenalty) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, ParallelIndexScanEmittedForLargeIndexRange) {
+  // A large ascending range scan over a non-covering index partitions at
+  // leaf boundaries and scans the partitions in parallel (RangePartitionedScan
+  // + ParallelIndexScan); a small range stays on the serial executor.
+  const std::string kTable = "BigIdxRange";
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl,
+        rs_->CreateTable(
+            writer, Schema(kTable, {Column("key", ValueType::kInt64),
+                                    Column("payload", ValueType::kInt64)})));
+    for (int64_t key = 0; key < kParallelTestRows; ++key) {
+      ASSERT_SUCCESS(tbl.Insert(writer.txn_, Row({Value(key), Value(key * 3)}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(writer, kTable, IndexSchema("BigIdx", {0})));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  {
+    TransactionContext stats_ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, kTable));
+    ASSERT_SUCCESS(stats_ctx.PreCommit());
+  }
+  QueryData query{{kTable},
+                  BinaryExpressionExp(ColumnValueExp("key"),
+                                      BinaryOperation::kGreaterThanEquals,
+                                      ConstantValueExp(Value(int64_t{0}))),
+                  {NamedExpression("key"), NamedExpression("payload")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  Executor executor = plan->EmitExecutor(context);
+  std::ostringstream physical;
+  executor->Dump(physical, 0);
+  EXPECT_NE(physical.str().find("ParallelIndexScan"), std::string::npos)
+      << physical.str();
+  // The morsel-ordered handoff delivers every row exactly once, in key
+  // order.
+  int64_t expected = 0;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    ASSERT_EQ(row[0], Value(expected));
+    ++expected;
+  }
+  EXPECT_EQ(expected, kParallelTestRows);
+  ASSERT_SUCCESS(context.PreCommit());
+
+  // A small range (10 rows) keeps the serial IndexScan.
+  QueryData small{
+      {kTable},
+      BinaryExpressionExp(ColumnValueExp("key"),
+                          BinaryOperation::kGreaterThanEquals,
+                          ConstantValueExp(Value(kParallelTestRows - 10))),
+      {NamedExpression("key"), NamedExpression("payload")}};
+  TransactionContext small_ctx = rs_->BeginContext();
+  ASSERT_SUCCESS(small.Rewrite(small_ctx));
+  ASSIGN_OR_ASSERT_FAIL(Plan, small_plan,
+                        Optimizer::Optimize(small, small_ctx));
+  Executor small_executor = small_plan->EmitExecutor(small_ctx);
+  std::ostringstream small_physical;
+  small_executor->Dump(small_physical, 0);
+  EXPECT_EQ(small_physical.str().find("ParallelIndexScan"), std::string::npos)
+      << small_physical.str();
+  int64_t small_rows = 0;
+  while (small_executor->Next(&row, nullptr)) {
+    ++small_rows;
+  }
+  EXPECT_EQ(small_rows, 10);
+  ASSERT_SUCCESS(small_ctx.PreCommit());
+}
+
 }  // namespace tinylamb

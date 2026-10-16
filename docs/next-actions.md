@@ -1,5 +1,44 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-16 加筆(第31報)。統合TODOの次項目: **PrefetchingIndexScan /
+ParallelIndexScan / RangePartitionedScan**(インデックススキャンの先読み・
+リーフ境界分割・並列化)。詳細は下記「2026-10-16 インデックススキャン
+先読み+並列化」の節。
+
+## 2026-10-16 インデックススキャン先読み+並列化の成果
+
+- **[executor] PrefetchingIndexScan。** 直列 `IndexScan` に先読みカーソルを
+  追加: `kIndexScanPrefetchDistance`(8) エントリ先を並走し、その位置の
+  行頁を `GetPage`+即解放でバッファプールにウォームする(先読みは主経路の
+  1 歩につき 1 歩=定数償却)。ゲージ `index_scan_prefetch_pages`、
+  A/B hatch `TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH=1`(無効時はウォーム 0 を
+  確認済み)。失敗は無視(主経路が再取得して自分の status を返す)。
+- **[index] RangePartitionedScan。** `BPlusTree::ScanPartitionBoundaries` が
+  リーフ鎖を歩き、`leaves_per_partition` 枚ごとの非空リーフ先頭キー
+  (begin より厳密に大、end 以内、重複排除済み)を memcomparable で返す。
+  `IndexScanIterator::PartitionBoundaries` が復号してキー像にする。
+  空リーフ・foster・高フェンスの扱いは `BPlusTreeIterator::operator++` と
+  同一の歩き方。
+- **[executor] ParallelIndexScan。** キー範囲を半開モーセル
+  `[b_i, b_{i+1})` に分割し、worker は静的所有(worker w が
+  w, w+W, …)で 1 モーセルずつ直列 `IndexScan` を回す。内部境界キーは
+  次モーセルが所有するため除外(重複キーがリーフ境界を跨いでも欠落・重複
+  なし)。モーセル順ハンドオフで**直列と同じキー順・行・RowPosition** を
+  返す。残余述語は AST 評価の単一スレッド契約に合わせて上位 Selection に
+  乗せる。閾値 `kParallelIndexScanMinRows`(8192)、hatch
+  `TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN`(無効時は直列 `IndexScan` に
+  フォールバックすることを確認済み)。DML ソース(lock_rows)と降順は直列維持。
+- **回帰**: `ParallelIndexScanTest` 4件(範囲一致/全範囲/空範囲/バッチ経路)、
+  `IndexScanIteratorTest.PartitionBoundariesTileTheLeafChain`、
+  `OptimizerTest.ParallelIndexScanEmittedForLargeIndexRange`(大範囲で並列・
+  小範囲で直列)、`ExecutorTest.IndexScanPrefetchesHeapPagesAhead`。
+- **検証**: 全 ctest **3920/3920 合格**(意図的 skip 3)。
+  index_scan_iterator(22)/parallel_index_scan(4)/executor(200)/
+  b_plus_tree(70)/b_plus_tree_iterator(32)/index(11)/table(47)/
+  optimizer(122)/plan(59)/cascades(192)/cascades_rules(82)/
+  query(186)/TPC-H(8)/TPC-DS(15)/compliance(296)/sql_* 各スイート green、
+  `check_layering.py` 成功(65辺)。
+
 2026-10-16 加筆(第30報)。統合TODOの次項目: **covering index 選択のコスト精度**
 (covering 候補の検出漏れと、covering へのクラスタリング罰の誤適用の修正)。
 詳細は下記「2026-10-16 covering index コスト精度」の節。

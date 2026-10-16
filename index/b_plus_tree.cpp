@@ -1286,6 +1286,79 @@ BPlusTreeIterator BPlusTree::Begin(Transaction& txn, std::string_view left,
   return {this, &txn, left, right, ascending};
 }
 
+StatusOr<std::vector<std::string>> BPlusTree::ScanPartitionBoundaries(
+    Transaction& txn, std::string_view begin, std::string_view end,
+    size_t leaves_per_partition) {
+  leaves_per_partition = std::max<size_t>(1, leaves_per_partition);
+  std::vector<std::string> boundaries;
+  StatusOr<PageRef> leaf_or =
+      begin.empty() ? LeftmostPage(txn) : FindLeafReadOnly(txn, begin, false);
+  if (!leaf_or.HasValue()) {
+    return leaf_or.GetStatus();
+  }
+  PageRef leaf = leaf_or.MoveValue();
+  if (!begin.empty()) {
+    size_t idx = 0;
+    ASSIGN_OR_RETURN(bool, positioned,
+                     PositionAtOrAbove(leaf, idx, txn, begin));
+    if (!positioned) {
+      return boundaries;  // The range starts past every key.
+    }
+  }
+  size_t leaf_index = 0;
+  for (;;) {
+    // Empty leaves are reachable after deletions; walk past them exactly
+    // like BPlusTreeIterator::operator++ (foster chain first, then the high
+    // fence) so a boundary is never taken from a page with no keys.
+    while (leaf->body.leaf_page.row_count_ == 0) {
+      if (auto foster = leaf->GetFoster(txn)) {
+        ASSIGN_OR_RETURN(
+            PageRef, child,
+            txn.GetPageManager()->GetPage(foster.Value().child_pid, true));
+        leaf.PageUnlock();
+        leaf = std::move(child);
+        continue;
+      }
+      const IndexKey high_fence = leaf->GetHighFence(txn);
+      if (high_fence.IsPlusInfinity()) {
+        return boundaries;
+      }
+      const std::string seek(high_fence.GetKey().Value());
+      leaf.PageUnlock();
+      ASSIGN_OR_RETURN(PageRef, next, FindLeafReadOnly(txn, seek, false));
+      leaf = std::move(next);
+    }
+    const std::string first_key(leaf->body.leaf_page.GetKey(0));
+    if (!end.empty() && end < first_key) {
+      break;
+    }
+    if ((begin.empty() || begin < first_key) &&
+        leaf_index % leaves_per_partition == 0 &&
+        (boundaries.empty() || boundaries.back() != first_key)) {
+      boundaries.push_back(first_key);
+    }
+    ++leaf_index;
+    // Step to the next leaf in the chain.
+    if (auto foster = leaf->GetFoster(txn)) {
+      ASSIGN_OR_RETURN(
+          PageRef, child,
+          txn.GetPageManager()->GetPage(foster.Value().child_pid, true));
+      leaf.PageUnlock();
+      leaf = std::move(child);
+      continue;
+    }
+    const IndexKey high_fence = leaf->GetHighFence(txn);
+    if (high_fence.IsPlusInfinity()) {
+      break;
+    }
+    const std::string seek(high_fence.GetKey().Value());
+    leaf.PageUnlock();
+    ASSIGN_OR_RETURN(PageRef, next, FindLeafReadOnly(txn, seek, false));
+    leaf = std::move(next);
+  }
+  return boundaries;
+}
+
 bool BPlusTree::SanityCheckForTest(PageManager* pm) const {
   PageRef page = pm->GetPage(root_).MoveValue();
   if (page->Type() == PageType::kLeafPage) {

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -49,6 +50,7 @@
 #include "executor/nested_loop_join.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_hash_join.hpp"
+#include "executor/parallel_index_scan.hpp"
 #include "executor/parallel_merge_join.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/projection.hpp"
@@ -619,6 +621,30 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
     return std::make_shared<IndexScan>(
         txn.txn_, table_, index_, point_ranges, ascending_, where_, GetSchema(),
         lock_rows_, wait_for_write_intent_, std::move(index_read_guard));
+  }
+  // RangePartitionedScan / ParallelIndexScan: a large ascending single-range
+  // scan partitions at B+Tree leaf boundaries and scans the partitions in
+  // parallel.  The morsel-ordered handoff keeps the key order, so the plan's
+  // ordering claims stay valid; the residual predicate rides a Selection
+  // above the scan because AST evaluation is single-threaded.  DML source
+  // scans (lock_rows_) stay serial.
+  static const bool parallel_index_scan_disabled =
+      std::getenv("TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN") != nullptr;
+  if (!parallel_index_scan_disabled && ascending_ && !lock_rows_ &&
+      EmitRowCount() >= kParallelIndexScanMinRows) {
+    constexpr size_t kMaxParallelIndexScanWorkers = 16;
+    constexpr size_t kLeavesPerIndexMorsel = 8;
+    const size_t workers =
+        std::min(kMaxParallelIndexScanWorkers,
+                 std::max<size_t>(1, std::thread::hardware_concurrency()));
+    Executor scan = std::make_shared<ParallelIndexScan>(
+        txn.txn_, table_, index_, begin_key, end_key, ascending_, workers,
+        kLeavesPerIndexMorsel, std::move(index_read_guard));
+    if (where_) {
+      scan = std::make_shared<Selection>(where_, table_.GetSchema(),
+                                         std::move(scan));
+    }
+    return scan;
   }
   return std::make_shared<IndexScan>(txn.txn_, table_, index_, begin_key,
                                      end_key, ascending_, where_, GetSchema(),

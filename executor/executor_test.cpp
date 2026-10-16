@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
@@ -517,6 +518,58 @@ TEST_F(ExecutorTest, IndexOnlyScanServesVisibilityMapWithoutHeapFetch) {
   EXPECT_EQ(include_rows[3], Row({Value("world"), Value("world"), Value(4.9)}));
   EXPECT_EQ(rs_->TransactionStats().index_only_visible_serves,
             serves_before + 8);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, IndexScanPrefetchesHeapPagesAhead) {
+  // PrefetchingIndexScan: a look-ahead cursor warms the heap pages the scan
+  // is about to fetch, so the main path's fetch is a buffer-pool hit.  The
+  // A/B hatch (TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH) must change only the
+  // warmed-page count, never the rows.
+  const std::string kPrefetchTable = "PrefetchTable";
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl,
+        rs_->CreateTable(
+            writer,
+            Schema(kPrefetchTable, {Column("key", ValueType::kInt64),
+                                    Column("payload", ValueType::kInt64)})));
+    for (int64_t i = 0; i < 64; ++i) {
+      ASSERT_SUCCESS(
+          tbl.Insert(writer.txn_, Row({Value(i), Value(i * 2)})).GetStatus());
+    }
+    ASSERT_SUCCESS(rs_->CreateIndex(writer, kPrefetchTable,
+                                    IndexSchema("PrefetchIdx", {0})));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(ctx, kPrefetchTable));
+  const uint64_t warm_before =
+      rs_->TransactionStats().index_scan_prefetch_pages;
+
+  IndexScan scan(ctx.txn_, tbl, tbl.GetIndex(0), Value(int64_t{0}),
+                 Value(int64_t{63}), true, Expression(), tbl.GetSchema());
+  std::vector<Row> rows;
+  Row row;
+  while (scan.Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  const uint64_t warmed =
+      rs_->TransactionStats().index_scan_prefetch_pages - warm_before;
+
+  ASSERT_EQ(rows.size(), 64U);
+  for (size_t i = 0; i < rows.size(); ++i) {
+    EXPECT_EQ(rows[i], Row({Value(static_cast<int64_t>(i)),
+                            Value(static_cast<int64_t>(i) * 2)}));
+  }
+  static const bool prefetch_disabled =
+      std::getenv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") != nullptr;
+  if (prefetch_disabled) {
+    EXPECT_EQ(warmed, 0U);
+  } else {
+    EXPECT_GT(warmed, 0U);
+  }
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 

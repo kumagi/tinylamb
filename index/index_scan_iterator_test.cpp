@@ -948,4 +948,38 @@ TEST_F(IndexScanIteratorTest, IndexOnlyVisibilityMapDropsMovedKeyEntries) {
   ASSERT_SUCCESS(reader.txn_.PreCommit());
 }
 
+TEST_F(IndexScanIteratorTest, PartitionBoundariesTileTheLeafChain) {
+  // RangePartitionedScan: boundaries are the first keys of every leaf group
+  // strictly greater than the scan's begin and not past its end, strictly
+  // ascending, so half-open morsels built from them tile the range.
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              ctx.GetTable(kTableName));
+  for (int i = 0; i < 4000; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
+            .GetStatus());
+  }
+  const Index& pk = table->GetIndex(0);
+  ASSIGN_OR_ASSERT_FAIL(std::vector<Row>, boundaries,
+                        IndexScanIterator::PartitionBoundaries(
+                            pk, ctx.txn_, {Value(10)}, {Value(3990)}, 1));
+  ASSERT_GE(boundaries.size(), 2U);
+  for (size_t i = 0; i < boundaries.size(); ++i) {
+    EXPECT_GT(boundaries[i][0], Value(10));
+    EXPECT_LE(boundaries[i][0], Value(3990));
+    if (i > 0) {
+      EXPECT_LT(boundaries[i - 1][0], boundaries[i][0]);
+    }
+  }
+  // A single group covers the whole range when the leaf count fits inside it.
+  ASSIGN_OR_ASSERT_FAIL(std::vector<Row>, one_group,
+                        IndexScanIterator::PartitionBoundaries(
+                            pk, ctx.txn_, {Value(10)}, {Value(3990)}, 1000));
+  EXPECT_TRUE(one_group.empty());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
 }  // namespace tinylamb

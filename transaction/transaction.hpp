@@ -464,6 +464,13 @@ class Transaction final {
       transaction_manager_->RecordIndexOnlyVisibleServe();
     }
   }
+  // Counts one row page warmed by the index-scan prefetcher (see
+  // IndexScan::StepIterators).
+  void RecordIndexScanPrefetch() const {
+    if (transaction_manager_ != nullptr) {
+      transaction_manager_->RecordIndexScanPrefetch();
+    }
+  }
   // Bytes on |pid| that OTHER transactions' unresolved undo may still claim
   // (see TransactionManager::ReserveIndexUndoBytes). Admission checks
   // subtract it from free_size_; callers without a manager (recovery redo)

@@ -60,6 +60,17 @@ class BPlusTree {
   [[nodiscard]] page_id_t Root() const { return root_; }
   BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
                           std::string_view right = "", bool ascending = true);
+  // RangePartitionedScan support: walks the leaf chain and returns the first
+  // key of every |leaves_per_partition|-th non-empty leaf whose keys lie
+  // within (begin, end], encoded in memcomparable form, strictly ascending,
+  // and always strictly greater than |begin|.  The caller builds half-open
+  // key ranges [b_i, b_{i+1}) from consecutive boundaries; the scan's own
+  // begin bound is never returned.  Empty |begin| starts at the leftmost
+  // leaf, empty |end| runs to the last one.  Navigation failures surface as a
+  // status; an empty range yields no boundaries with Status::kSuccess.
+  StatusOr<std::vector<std::string>> ScanPartitionBoundaries(
+      Transaction& txn, std::string_view begin, std::string_view end,
+      size_t leaves_per_partition);
   friend std::ostream& operator<<(std::ostream& o, const BPlusTree& t) {
     o << "BPlusTree(root=" << t.root_ << ")";
     return o;

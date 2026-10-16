@@ -211,9 +211,18 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `PAXScan` / カラムナ・スキャンの Cascades 接続
 - [ ] `ZoneMapSkipScan`（既存 zone map をプラン属性に）
 - [ ] `LateMaterializationScan`（まずキー、後でワイド列）
-- [ ] `PrefetchingIndexScan`
-- [ ] `ParallelIndexScan`
-- [ ] `RangePartitionedScan`（ページ範囲の分割）
+- [x] `PrefetchingIndexScan`。
+      直列 `IndexScan` が `kIndexScanPrefetchDistance`(8) 先のヒープ頁を
+      先読みウォームする(先読みカーソル+`index_scan_prefetch_pages` ゲージ、
+      hatch `TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH`)。回帰:
+      `ExecutorTest.IndexScanPrefetchesHeapPagesAhead`
+- [x] `ParallelIndexScan` + `RangePartitionedScan`（リーフ境界でのキー範囲分割）。
+      `BPlusTree::ScanPartitionBoundaries` がリーフ鎖の先頭キーを返し、
+      `IndexScanIterator::PartitionBoundaries` が復号。`ParallelIndexScan` が
+      モーセル順ハンドオフで直列と同じキー順・行・位置を返す。閾値
+      `kParallelIndexScanMinRows`(8192)、hatch `TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN`。
+      回帰: `ParallelIndexScanTest.*`、`IndexScanIteratorTest.PartitionBoundariesTileTheLeafChain`、
+      `OptimizerTest.ParallelIndexScanEmittedForLargeIndexRange`
 - [ ] `SampleScan`（BERNOULLI / SYSTEM）
 - [x] `DummyScan` / `OneRow`（`DummyScanPlan` + `ValuesExecutor`。SELECT 1 を
       Optimizer 経路で実行）

@@ -29,6 +29,12 @@ inline constexpr size_t kParallelHashJoinMinRows = 8192;
 // threshold with scans and aggregations.
 inline constexpr size_t kParallelMergeJoinMinRows = 8192;
 
+// A single-range ascending index scan switches to ParallelIndexScan when the
+// optimizer estimates at least this many matching rows (the same scale as
+// the full-scan morsel threshold): below it, thread startup and leaf-aligned
+// partition computation cost more than the scan itself.
+inline constexpr size_t kParallelIndexScanMinRows = 8192;
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_PLAN_PARALLEL_THRESHOLDS_HPP

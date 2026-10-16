@@ -21,7 +21,9 @@
 #include "index_scan.hpp"
 
 #include <cstddef>
+#include <cstdlib>
 #include <iterator>
+#include <memory>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -34,6 +36,8 @@
 #include "expression/rewrite.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
+#include "page/page_manager.hpp"
+#include "page/page_ref.hpp"
 #include "page/row_position.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
@@ -42,6 +46,20 @@
 
 namespace tinylamb {
 namespace {
+
+// PrefetchingIndexScan: how many entries the look-ahead cursor runs ahead of
+// the main iterator.  One prefetch per main step keeps the lead constant, so
+// the page the scan is about to need is fetched while the previous row is
+// still being processed -- the I/O is grouped ahead of the consumer instead
+// of interleaved one page at a time.  A/B hatch:
+// TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH=1.
+inline constexpr size_t kIndexScanPrefetchDistance = 8;
+
+bool IndexScanPrefetchDisabled() {
+  static const bool disabled =
+      std::getenv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") != nullptr;
+  return disabled;
+}
 
 TransactionManager::IndexReadGuard AcquireScanIndexReadGuard(
     Transaction& txn, const Index& index, bool lock_rows,
@@ -87,7 +105,9 @@ IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                                   ascending, lock_rows, &index_read_guard_)),
       cond_(std::move(where)),
       cond_conjuncts_(SplitConjuncts(cond_)),
-      schema_(std::move(sc)) {}
+      schema_(std::move(sc)) {
+  OpenPrefetch(begin_key, end_key);
+}
 
 IndexScan::IndexScan(
     Transaction& txn, const Table& table, const Index& index,
@@ -117,6 +137,7 @@ IndexScan::IndexScan(
   if (!ranges.empty()) {
     pending_.assign(std::make_move_iterator(ranges.begin()) + 1,
                     std::make_move_iterator(ranges.end()));
+    OpenPrefetch(ranges.front().first, ranges.front().second);
   }
 }
 
@@ -125,6 +146,49 @@ void IndexScan::OpenRange(const std::vector<Value>& begin_key,
   iter_ = Iterator(new IndexScanIterator(table_, index_, txn_, begin_key,
                                          end_key, ascending_, lock_rows_,
                                          &index_read_guard_));
+  OpenPrefetch(begin_key, end_key);
+}
+
+void IndexScan::OpenPrefetch(const std::vector<Value>& begin_key,
+                             const std::vector<Value>& end_key) {
+  prefetch_iter_.reset();
+  if (IndexScanPrefetchDisabled()) {
+    return;
+  }
+  prefetch_iter_ = std::make_unique<IndexScanIterator>(
+      table_, index_, txn_, begin_key, end_key, ascending_, lock_rows_,
+      &index_read_guard_);
+  for (size_t i = 0;
+       i < kIndexScanPrefetchDistance && prefetch_iter_->IsValid(); ++i) {
+    AdvancePrefetch();
+  }
+}
+
+void IndexScan::AdvancePrefetch() {
+  if (prefetch_iter_ == nullptr || !prefetch_iter_->IsValid()) {
+    return;
+  }
+  ++(*prefetch_iter_);
+  if (!prefetch_iter_->IsValid()) {
+    return;
+  }
+  const RowPosition ahead = prefetch_iter_->Position();
+  if (!ahead.IsValid()) {
+    return;
+  }
+  // Best-effort warm: fetch and immediately release the row page so the main
+  // iterator's own fetch becomes a buffer-pool hit.  A failed warm is
+  // ignored; the main path re-fetches and surfaces the error with its own
+  // status.
+  StatusOr<PageRef> warm = txn_.GetPageManager()->GetPage(ahead.page_id, true);
+  if (warm.HasValue()) {
+    txn_.RecordIndexScanPrefetch();
+  }
+}
+
+void IndexScan::StepIterators() {
+  ++iter_;
+  AdvancePrefetch();
 }
 
 void IndexScan::ReleaseIndexReadGuard() {
@@ -190,7 +254,7 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
     } else {
       *dst = std::move(*iter_);
     }
-    ++iter_;
+    StepIterators();
     if (!dst->IsValid()) {
       if (lock_rows_ && !already_reserved) {
         txn_.ReleaseWriteIntent(pointed_row);

@@ -141,8 +141,8 @@ IndexScanIterator::IndexScanIterator(
     pos_ = val.Value().pos;
     include_ = val.Value().include;
   } else {
-    StatusOr<std::vector<Table::IndexValueType> > val =
-        Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+    StatusOr<std::vector<Table::IndexValueType>> val =
+        Decode<std::vector<Table::IndexValueType>>(iter_.Value());
     if (!val.HasValue()) {
       status_ = val.GetStatus();
       Clear();
@@ -172,6 +172,24 @@ RowPosition IndexScanIterator::Position() const {
     return {};
   }
   return pos_;
+}
+
+StatusOr<std::vector<Row>> IndexScanIterator::PartitionBoundaries(
+    const Index& index, Transaction& txn, const std::vector<Value>& begin_key,
+    const std::vector<Value>& end_key, size_t leaves_per_partition) {
+  BPlusTree tree(index.Root());
+  ASSIGN_OR_RETURN(std::vector<std::string>, encoded,
+                   tree.ScanPartitionBoundaries(txn, EncodeParts(begin_key),
+                                                EncodeEndParts(index, end_key),
+                                                leaves_per_partition));
+  std::vector<Row> boundaries;
+  boundaries.reserve(encoded.size());
+  for (std::string& key : encoded) {
+    Row row;
+    row.DecodeMemcomparableFormat(key);
+    boundaries.push_back(std::move(row));
+  }
+  return boundaries;
 }
 
 void IndexScanIterator::Clear() {
@@ -207,8 +225,8 @@ void IndexScanIterator::UpdateIteratorState() {
     pos_ = rp.Value().pos;
     include_ = rp.Value().include;
   } else {
-    StatusOr<std::vector<Table::IndexValueType> > val =
-        Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+    StatusOr<std::vector<Table::IndexValueType>> val =
+        Decode<std::vector<Table::IndexValueType>>(iter_.Value());
     if (!val.HasValue()) {
       status_ = val.GetStatus();
       Clear();
@@ -302,8 +320,8 @@ IteratorBase& IndexScanIterator::operator++() {
   if (StoredAsSingleValue()) {
     ++iter_;
   } else {
-    StatusOr<std::vector<Table::IndexValueType> > val =
-        Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+    StatusOr<std::vector<Table::IndexValueType>> val =
+        Decode<std::vector<Table::IndexValueType>>(iter_.Value());
     if (!val.HasValue()) {
       status_ = val.GetStatus();
       Clear();
