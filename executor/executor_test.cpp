@@ -1027,6 +1027,94 @@ TEST_F(ExecutorTest, LookupJoinCompositeInt64RangeProbe) {
   EXPECT_TRUE(Drain(null_bound).empty());
 }
 
+// The interval probe: an equality prefix plus BOTH sides of an inequality on
+// the next key column.  The seek narrows to `[lo, hi]` and the per-candidate
+// re-check resolves the inclusive/exclusive edges, so the two bounds are order
+// independent and either side may be the one adopted first.
+TEST_F(ExecutorTest, LookupJoinCompositeIntervalProbe) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_table,
+      rs_->CreateTable(ctx, Schema{"IntervalTarget",
+                                   {Column("a", ValueType::kInt64),
+                                    Column("b", ValueType::kInt64),
+                                    Column("v", ValueType::kInt64)}}));
+  for (const auto& row :
+       {Row({Value(1), Value(10), Value(100)}),
+        Row({Value(1), Value(20), Value(200)}),
+        // Duplicate keys on a non-unique index: both must come back.
+        Row({Value(1), Value(20), Value(201)}),
+        Row({Value(1), Value(30), Value(300)}),
+        Row({Value(2), Value(5), Value(400)}),
+        Row({Value(2), Value(6), Value(500)})}) {
+    ASSERT_SUCCESS(right_table.Insert(ctx.txn_, row).GetStatus());
+  }
+  ASSERT_EQ(rs_->CreateIndex(
+                ctx, "IntervalTarget",
+                IndexSchema("IntervalAB", {0, 1}, {}, IndexMode::kNonUnique)),
+            Status::kSuccess);
+  const auto reloaded_status = ctx.GetTable("IntervalTarget");
+  ASSERT_EQ(reloaded_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& reloaded = reloaded_status.Value();
+
+  // Output rows are `left(3) + right(3)`, so the payload `v` is column 5.
+  // a = 1 AND 15 < b <= 25 -> the two b = 20 rows.
+  LookupJoin interval(
+      ctx.txn_, RangeProbeInput({Row({Value(1), Value(15), Value(25)})}),
+      {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+      BinaryOperation::kGreaterThan,
+      /*second_range_column=*/2,
+      /*second_range_operation=*/BinaryOperation::kLessThanEquals);
+  const std::vector<Row> interval_rows = Drain(interval);
+  ASSERT_EQ(interval_rows.size(), 2U);
+  EXPECT_EQ(interval_rows[0], Row({Value(1), Value(15), Value(25), Value(1),
+                                   Value(20), Value(200)}));
+  EXPECT_EQ(interval_rows[1], Row({Value(1), Value(15), Value(25), Value(1),
+                                   Value(20), Value(201)}));
+
+  // The bounds are order independent: an upper bound adopted first still
+  // produces the same interval.
+  LookupJoin reversed(ctx.txn_,
+                      RangeProbeInput({Row({Value(1), Value(25), Value(15)})}),
+                      {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+                      BinaryOperation::kLessThanEquals,
+                      /*second_range_column=*/2,
+                      /*second_range_operation=*/BinaryOperation::kGreaterThan);
+  const std::vector<Row> reversed_rows = Drain(reversed);
+  ASSERT_EQ(reversed_rows.size(), 2U);
+  EXPECT_EQ(reversed_rows[0], Row({Value(1), Value(25), Value(15), Value(1),
+                                   Value(20), Value(200)}));
+  EXPECT_EQ(reversed_rows[1], Row({Value(1), Value(25), Value(15), Value(1),
+                                   Value(20), Value(201)}));
+
+  // Strict upper edge: b < 20 excludes the boundary rows.
+  LookupJoin strict_upper(
+      ctx.txn_, RangeProbeInput({Row({Value(1), Value(15), Value(20)})}),
+      {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+      BinaryOperation::kGreaterThan,
+      /*second_range_column=*/2,
+      /*second_range_operation=*/BinaryOperation::kLessThan);
+  EXPECT_TRUE(Drain(strict_upper).empty());
+
+  // Inclusive lower edge: b >= 15 AND b <= 20 keeps the duplicate pair.
+  LookupJoin inclusive_lower(
+      ctx.txn_, RangeProbeInput({Row({Value(1), Value(15), Value(20)})}),
+      {0, 1}, *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+      BinaryOperation::kGreaterThanEquals, /*second_range_column=*/2,
+      /*second_range_operation=*/BinaryOperation::kLessThanEquals);
+  EXPECT_EQ(Drain(inclusive_lower).size(), 2U);
+
+  // A NULL second bound can never compare TRUE, so the left row matches
+  // nothing -- the same skip a NULL equality key gets.
+  LookupJoin null_upper(
+      ctx.txn_, RangeProbeInput({Row({Value(1), Value(15), Value()})}), {0, 1},
+      *reloaded, reloaded->GetIndex(0), {0, 1}, 1,
+      BinaryOperation::kGreaterThan,
+      /*second_range_column=*/2,
+      /*second_range_operation=*/BinaryOperation::kLessThanEquals);
+  EXPECT_TRUE(Drain(null_upper).empty());
+}
+
 // The range whitelist covers DATE as well as INT64: both encode as
 // order-preserving signed integers, so a DATE key column takes a range bound
 // exactly like an INT64 one.

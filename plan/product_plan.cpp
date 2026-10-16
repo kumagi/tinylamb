@@ -110,10 +110,33 @@ const Column* ResolveUnqualified(const Schema& schema,
   }
   return &schema.GetColumn(static_cast<size_t>(offset));
 }
+
+// Rewrites a comparison stored as `right <op> left` into the equivalent
+// `left <op'> right`, used only to render an interval probe in the
+// conventional `lower < key < upper` reading order.
+BinaryOperation FlipLookupRange(BinaryOperation operation) {
+  switch (operation) {
+    case BinaryOperation::kLessThan:
+      return BinaryOperation::kGreaterThan;
+    case BinaryOperation::kLessThanEquals:
+      return BinaryOperation::kGreaterThanEquals;
+    case BinaryOperation::kGreaterThan:
+      return BinaryOperation::kLessThan;
+    case BinaryOperation::kGreaterThanEquals:
+      return BinaryOperation::kLessThanEquals;
+    default:
+      return operation;
+  }
+}
 }  // namespace
 
 bool SupportsLookupRangeType(ValueType type) {
   return type == ValueType::kInt64 || type == ValueType::kDate;
+}
+
+bool IsLowerLookupRange(BinaryOperation operation) {
+  return operation == BinaryOperation::kGreaterThan ||
+         operation == BinaryOperation::kGreaterThanEquals;
 }
 
 std::string ProductPlan::LookupProbeText() const {
@@ -128,9 +151,37 @@ std::string ProductPlan::LookupProbeText() const {
     if (lookup_seek_->range_position && i == *lookup_seek_->range_position) {
       // `ProductPlan::ToString` hides the namespace-scope overload inside this
       // member, so qualify it explicitly.
+      const std::string right = lookup_seek_->right_columns[i].ToString();
+      if (lookup_seek_->second_range_operation &&
+          lookup_seek_->second_range_left_column) {
+        // Interval probe: render the bounds in the conventional
+        // `lower < key < upper` reading order, whichever order the two
+        // conjuncts arrived in.  Both operations are stored as
+        // `right <op> left`, so the lower one is flipped to put the left
+        // column first.
+        const bool first_is_lower =
+            IsLowerLookupRange(lookup_seek_->range_operation);
+        const ColumnName& lower_left =
+            first_is_lower ? lookup_seek_->left_columns[i]
+                           : *lookup_seek_->second_range_left_column;
+        const BinaryOperation lower_op =
+            first_is_lower ? lookup_seek_->range_operation
+                           : *lookup_seek_->second_range_operation;
+        const ColumnName& upper_left =
+            first_is_lower ? *lookup_seek_->second_range_left_column
+                           : lookup_seek_->left_columns[i];
+        const BinaryOperation upper_op =
+            first_is_lower ? *lookup_seek_->second_range_operation
+                           : lookup_seek_->range_operation;
+        text += lower_left.ToString() + " " +
+                std::string(tinylamb::ToString(FlipLookupRange(lower_op))) +
+                " " + right + " " + std::string(tinylamb::ToString(upper_op)) +
+                " " + upper_left.ToString();
+        continue;
+      }
       text += lookup_seek_->left_columns[i].ToString() + " " +
               std::string(tinylamb::ToString(lookup_seek_->range_operation)) +
-              " " + lookup_seek_->right_columns[i].ToString();
+              " " + right;
       continue;
     }
     text += lookup_seek_->right_columns[i].ToString();
@@ -194,8 +245,17 @@ bool ProductPlan::SetLookupRange(size_t range_key_offset,
   // Only the first unpinned index key column can narrow the seek: a bound on a
   // later column would be ordered behind a value the probe does not fix, so
   // it cannot open a smaller key range than the equality prefix already does.
-  if (range_key_offset != lookup_seek_->right_columns.size() ||
-      range_key_offset >= right_idx_->sc_.key_.size()) {
+  // A second call lands on the SAME position (the interval's other side).
+  if (range_key_offset >= right_idx_->sc_.key_.size()) {
+    return false;
+  }
+  const bool extending_interval = lookup_seek_->range_position.has_value();
+  if (!extending_interval) {
+    if (range_key_offset != lookup_seek_->right_columns.size()) {
+      return false;
+    }
+  } else if (range_key_offset != *lookup_seek_->range_position ||
+             lookup_seek_->second_range_left_column.has_value()) {
     return false;
   }
   const Schema& physical = right_tbl_->GetSchema();
@@ -218,6 +278,18 @@ bool ProductPlan::SetLookupRange(size_t range_key_offset,
   if (left->Type() != right->Type() ||
       !SupportsLookupRangeType(right->Type())) {
     return false;
+  }
+  if (extending_interval) {
+    // Interval probe: only the opposite side may be added. A same-side second
+    // bound would not narrow the interval and stays with the residual
+    // predicate.
+    if (IsLowerLookupRange(operation) ==
+        IsLowerLookupRange(lookup_seek_->range_operation)) {
+      return false;
+    }
+    lookup_seek_->second_range_left_column = std::move(left_column);
+    lookup_seek_->second_range_operation = operation;
+    return true;
   }
   lookup_seek_->left_columns.push_back(std::move(left_column));
   lookup_seek_->right_columns.push_back(std::move(right_column));

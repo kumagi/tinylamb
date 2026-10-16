@@ -1714,16 +1714,19 @@ struct LookupRangeCandidate {
   Expression conjunct;
 };
 
-// Picks the single range conjunct that can narrow a probe whose equality
-// prefix is already fixed. Only column-vs-column comparisons qualify: a
-// constant bound belongs to the right child's scan filter, and the index join
-// bypasses the right child plan entirely. `right_key_column` is the
-// relation-qualified name of the first index key column the prefix leaves
-// unpinned.
-std::optional<LookupRangeCandidate> FindLookupRange(
+// Picks the range conjuncts that can narrow a probe whose equality prefix is
+// already fixed: at most one lower and one upper bound on the same key column
+// (an interval probe). Only column-vs-column comparisons qualify: a constant
+// bound belongs to the right child's scan filter, and the index join bypasses
+// the right child plan entirely. `right_key_column` is the relation-qualified
+// name of the first index key column the prefix leaves unpinned.
+std::vector<LookupRangeCandidate> FindLookupRanges(
     const std::vector<Expression>& conjuncts, const Schema& left_schema,
     const Schema& right_schema, const ColumnName& right_key_column,
     const ColumnName& right_key_physical) {
+  std::vector<LookupRangeCandidate> found;
+  bool have_lower = false;
+  bool have_upper = false;
   for (const Expression& conjunct : conjuncts) {
     if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
       continue;
@@ -1753,11 +1756,21 @@ std::optional<LookupRangeCandidate> FindLookupRange(
     if (candidate.right_column != right_key_column) {
       continue;
     }
+    // One bound per side: the first conjunct on each side wins; the rest stay
+    // with the residual predicate.
+    const bool lower = IsLowerLookupRange(candidate.operation);
+    if ((lower && have_lower) || (!lower && have_upper)) {
+      continue;
+    }
+    (lower ? have_lower : have_upper) = true;
     candidate.right_physical = right_key_physical;
     candidate.conjunct = conjunct;
-    return candidate;
+    found.push_back(std::move(candidate));
+    if (have_lower && have_upper) {
+      break;
+    }
   }
-  return std::nullopt;
+  return found;
 }
 
 std::vector<PlanAlternative> JoinAlternatives(
@@ -2165,21 +2178,22 @@ std::vector<PlanAlternative> JoinAlternatives(
                         ->ToString());
               }
             }
-            // One range bound on the first index key column the equality
-            // prefix leaves open. SetLookupRange rejects the shapes that
-            // cannot be probed safely (a later key column, mismatched operand
-            // types, a type outside the range whitelist) and the conjunct then
-            // simply stays in the residual predicate below: an explicit
-            // fallback, never a silently dropped one.
-            std::optional<LookupRangeCandidate> range;
+            // Range bounds on the first index key column the equality prefix
+            // leaves open: at most one lower and one upper conjunct (an
+            // interval probe). SetLookupRange rejects the shapes that cannot
+            // be probed safely (a later key column, mismatched operand types,
+            // a type outside the range whitelist) and the conjunct then simply
+            // stays in the residual predicate below: an explicit fallback,
+            // never a silently dropped one.
+            std::vector<LookupRangeCandidate> ranges;
             auto range_key_slot = slot_t{0};
-            if (probe->right_columns.size() < index_handle.sc_.key_.size()) {
-              const slot_t next_key =
-                  index_handle.sc_.key_[probe->right_columns.size()];
+            const size_t prefix_len = probe->right_columns.size();
+            if (prefix_len < index_handle.sc_.key_.size()) {
+              const slot_t next_key = index_handle.sc_.key_[prefix_len];
               if (next_key < physical_schema.ColumnCount()) {
                 const ColumnName& key_physical =
                     physical_schema.GetColumn(next_key).Name();
-                range = FindLookupRange(
+                ranges = FindLookupRanges(
                     all_conjuncts, left.plan->GetSchema(),
                     right.plan->GetSchema(),
                     ColumnName(right_relation, key_physical.name),
@@ -2188,8 +2202,7 @@ std::vector<PlanAlternative> JoinAlternatives(
               }
             }
             const bool point_probe =
-                !range.has_value() &&
-                probe->right_columns.size() == index_handle.sc_.key_.size();
+                ranges.empty() && prefix_len == index_handle.sc_.key_.size();
             // A unique index caps the output at the left row count only for a
             // point probe on the complete key; with a range bound (or a prefix
             // shorter than the key) one left row can still match several right
@@ -2202,13 +2215,14 @@ std::vector<PlanAlternative> JoinAlternatives(
             Plan join = std::make_shared<ProductPlan>(
                 left_child, left_columns, *right_table, index_handle,
                 right_physical, *stats_it->second, declared_output, index_rows);
-            const bool range_adopted =
-                range.has_value() &&
-                static_cast<ProductPlan&>(*join).SetLookupRange(
-                    probe->right_columns.size(), range->left_column,
-                    range->right_physical, range->operation);
-            if (range_adopted) {
-              enforced.insert(range->conjunct->ToString());
+            bool range_adopted = false;
+            for (const LookupRangeCandidate& range : ranges) {
+              if (static_cast<ProductPlan&>(*join).SetLookupRange(
+                      prefix_len, range.left_column, range.right_physical,
+                      range.operation)) {
+                range_adopted = true;
+                enforced.insert(range.conjunct->ToString());
+              }
             }
             // Everything the probe does not decide, and that was not already
             // pushed below the join, becomes the residual predicate. This is

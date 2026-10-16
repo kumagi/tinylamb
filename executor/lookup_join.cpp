@@ -122,6 +122,8 @@ LookupJoin::LookupJoin(Transaction& txn, Executor left,
                        const Index& idx, std::vector<slot_t> right_cols,
                        std::optional<size_t> range_position,
                        BinaryOperation range_operation,
+                       std::optional<slot_t> second_range_column,
+                       std::optional<BinaryOperation> second_range_operation,
                        TransactionManager::IndexReadGuard index_read_guard)
     : txn_(txn),
       left_(std::move(left)),
@@ -134,6 +136,8 @@ LookupJoin::LookupJoin(Transaction& txn, Executor left,
       right_cols_(std::move(right_cols)),
       range_position_(range_position),
       range_operation_(range_operation),
+      second_range_column_(second_range_column),
+      second_range_operation_(second_range_operation),
       range_key_type_(ValueType::kNull),
       at_most_one_(false) {
   // The probe columns must be aligned with the index's key order: the seek key
@@ -163,6 +167,11 @@ LookupJoin::LookupJoin(Transaction& txn, Executor left,
     // the caller's residual predicate still decides the rows.
     range_position_.reset();
   }
+  if (!range_position_) {
+    // The interval fields are only meaningful together with a first bound.
+    second_range_column_.reset();
+    second_range_operation_.reset();
+  }
   if (range_position_) {
     // Remember the index key column's declared type: a bound of any other type
     // encodes into a different key space and must not reach the seek. The
@@ -186,24 +195,49 @@ void LookupJoin::BuildSeekRange(const Row& left_key) {
       left_key.values_.begin(),
       left_key.values_.begin() + static_cast<std::ptrdiff_t>(prefix));
   end_key_ = begin_key_;
-  if (!range_position_ ||
-      !UsableRangeBound(left_key[*range_position_], range_key_type_)) {
+  if (!range_position_) {
     // Equality prefix only. IndexScanIterator turns a short end key into the
     // prefix ceiling, so this is "every entry under the prefix"; when the
     // prefix is the complete key it degenerates to a point probe.
     return;
   }
-  const Value& bound = left_key[*range_position_];
-  if (IsMirroredRange(range_operation_)) {
-    // `right > bound` / `right >= bound`: seek starts at the bound and runs to
-    // the end of the prefix.
-    begin_key_.push_back(bound);
-  } else {
-    // `right < bound` / `right <= bound`: seek starts at the prefix and
-    // stops at the bound. The seek's end is inclusive, so the boundary row
-    // always reaches the re-check: `<` drops it there, `<=` keeps it.
-    end_key_.push_back(bound);
+  // The seek is only an enclosure: the lower bound starts the walk, the upper
+  // bound stops it, and Matches resolves the inclusive/exclusive edges per
+  // candidate.  An unusable bound (NULL / NaN / cross-typed / unsigned) is
+  // dropped here -- the re-check still applies it, so the fallback only
+  // widens the scan, never admits a wrong row.
+  std::optional<Value> lower;
+  std::optional<Value> upper;
+  const auto place = [&](const Value& bound, BinaryOperation operation) {
+    if (!UsableRangeBound(bound, range_key_type_)) {
+      return;
+    }
+    if (IsMirroredRange(operation)) {
+      lower = bound;
+    } else {
+      upper = bound;
+    }
+  };
+  place(left_key[*range_position_], range_operation_);
+  if (second_range_operation_) {
+    if (std::optional<Value> bound = SecondRangeBound()) {
+      place(*bound, *second_range_operation_);
+    }
   }
+  if (lower) {
+    begin_key_.push_back(*lower);
+  }
+  if (upper) {
+    end_key_.push_back(*upper);
+  }
+}
+
+std::optional<Value> LookupJoin::SecondRangeBound() const {
+  if (!second_range_column_ ||
+      *second_range_column_ >= hold_left_.values_.size()) {
+    return std::nullopt;
+  }
+  return hold_left_[*second_range_column_];
 }
 
 bool LookupJoin::Matches(const Row& left_key, const Row& right_key) const {
@@ -216,6 +250,14 @@ bool LookupJoin::Matches(const Row& left_key, const Row& right_key) const {
       // inclusivity and the per-row bound fallback are only decidable here.
       if (!JoinValueOrdered(right_key[i], left_key[i], range_operation_)) {
         return false;
+      }
+      if (second_range_operation_) {
+        if (std::optional<Value> bound = SecondRangeBound()) {
+          if (!JoinValueOrdered(right_key[i], *bound,
+                                *second_range_operation_)) {
+            return false;
+          }
+        }
       }
       continue;
     }
@@ -246,6 +288,15 @@ bool LookupJoin::Load() {
           return value.IsNull() || JoinKeyUnmatchable(value);
         })) {
       continue;
+    }
+    // The interval probe's second bound never rides in the extracted key: a
+    // NULL / NaN bound can never compare TRUE either, so the left row has no
+    // matches at all (the same skip the key check above applies).
+    if (second_range_operation_) {
+      if (std::optional<Value> bound = SecondRangeBound();
+          bound && (bound->IsNull() || JoinKeyUnmatchable(*bound))) {
+        continue;
+      }
     }
     BuildSeekRange(left_key);
     right_it_ = std::make_unique<IndexScanIterator>(right_, right_idx_, txn_,

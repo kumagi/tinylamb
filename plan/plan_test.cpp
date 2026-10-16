@@ -1238,11 +1238,25 @@ TEST_F(PlanTest, LookupRangeAcceptsOnlyInt64AndDate) {
   EXPECT_NE(product.ToString().find("probe:{Sc2.d1, Sc1.c1 <= Sc2.d4}"),
             std::string::npos)
       << product.ToString();
-  // A second range column has nowhere to go: the only position a bound can
-  // narrow is already taken, so the extra conjunct stays a residual.
+  // The opposite side is the interval's other end: a lower bound joins the
+  // upper one and the probe becomes an interval.  The rendered form reads
+  // `lower < key <= upper`.
+  EXPECT_TRUE(product.SetLookupRange(1, ColumnName("Sc1.c1"),
+                                     ColumnName("Sc2.d4"),
+                                     BinaryOperation::kGreaterThan));
+  EXPECT_EQ(SeekOf(product.Lookup()).second_range_left_column,
+            ColumnName("Sc1.c1"));
+  EXPECT_EQ(SeekOf(product.Lookup()).second_range_operation,
+            BinaryOperation::kGreaterThan);
+  EXPECT_NE(
+      product.ToString().find("probe:{Sc2.d1, Sc1.c1 < Sc2.d4 <= Sc1.c1}"),
+      std::string::npos)
+      << product.ToString();
+  // A same-side second bound does not narrow the interval and stays a
+  // residual; a third bound has nowhere to go either.
   EXPECT_FALSE(product.SetLookupRange(1, ColumnName("Sc1.c1"),
                                       ColumnName("Sc2.d4"),
-                                      BinaryOperation::kGreaterThan));
+                                      BinaryOperation::kLessThan));
   EXPECT_FALSE(product.SetLookupRange(2, ColumnName("Sc1.c1"),
                                       ColumnName("Sc2.d4"),
                                       BinaryOperation::kGreaterThan));

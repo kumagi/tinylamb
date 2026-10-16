@@ -48,7 +48,19 @@ struct LookupSeek {
   std::vector<ColumnName> right_columns;
   std::optional<size_t> range_position;
   BinaryOperation range_operation{BinaryOperation::kLessThan};
+  // Two-sided (interval) probe: a second bound on the SAME key position, on
+  // the opposite side of |range_operation| -- one lower and one upper bound,
+  // compared as `right <second_range_operation> second_range_left_column`.
+  // Its value comes from this left column of the probe row (the first
+  // bound's value rides in `left_columns[range_position]`).
+  std::optional<ColumnName> second_range_left_column;
+  std::optional<BinaryOperation> second_range_operation;
 };
+
+// True when `operation`, read as `right <operation> bound`, is a lower bound
+// of the seek interval (the seek starts at the bound); false for the upper
+// bounds (`right < bound` / `right <= bound`).
+[[nodiscard]] bool IsLowerLookupRange(BinaryOperation operation);
 
 // Range-probe whitelist for the index nested-loop join. The seek range is only
 // an enclosure (the executor re-checks the comparison per candidate), so a
@@ -211,7 +223,7 @@ class ProductPlan final : public PlanBase {
   [[nodiscard]] const std::optional<LookupSeek>& Lookup() const {
     return lookup_seek_;
   }
-  // Extends the derived equality prefix with one range bound on the first
+  // Extends the derived equality prefix with a range bound on the first
   // unpinned index key column. Returns false (and leaves the plan unchanged)
   // when the range cannot be probed safely -- the caller then keeps the
   // conjunct as a residual predicate, which is an explicit fallback rather
@@ -221,6 +233,12 @@ class ProductPlan final : public PlanBase {
   //  * the left/right column types differ, so the per-row re-check could not
   //    decide the comparison;
   //  * the right (index key) column type is outside SupportsLookupRangeType.
+  //
+  // A second call with the same `range_key_offset` adds the opposite side and
+  // turns the one-sided probe into an interval probe
+  // `lower <= right <= upper` (boundaries re-checked per candidate).  A
+  // same-side second bound is rejected: it would not narrow the interval and
+  // belongs to the residual predicate.
   bool SetLookupRange(size_t range_key_offset, ColumnName left_column,
                       ColumnName right_column, BinaryOperation operation);
   void Dump(std::ostream& o, int indent) const override;

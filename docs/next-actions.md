@@ -1,5 +1,46 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-17 加筆(第34報)。統合TODOの次項目: **複合インデックスの等式 +
+不等式混在**(LookupJoin probe の区間境界)。ForeignScan は外部ソース形式が
+未定のため保留し、次の具体項目から着手した。詳細は下記
+「2026-10-17 LookupJoin 区間 probe」の節。
+
+## 2026-10-17 LookupJoin 区間 probe の成果
+
+- **[方針] 等式 prefix + 同一キー列の両側境界**(ユーザー判断で ForeignScan を
+  一旦スキップ)。従来の probe は「等式 prefix + 片側の範囲 bound 1 個」だけで、
+  `lo < b < hi` のような両側不等式は片側しか probe に入らず、残りは残差として
+  過剰フェッチを絞るだけだった。下限・上限を 1 個ずつまで採用して区間
+  `[prefix + lower, prefix + upper]` をシークし、両端の開閉は候補行ごとの
+  再検査で決める。
+- **[plan] `LookupSeek` に `second_range_left_column` / `second_range_operation`
+  を追加**(区間の 2 個目の bound。値は左行のその列から取り、比較は
+  `right <op> left` の向きで保持)。`ProductPlan::SetLookupRange` は 2 回目の
+  呼び出しを「同じ位置・反対側」のときだけ受け入れ、同側の 2 個目・3 個目・
+  位置違いは `false` を返して conjunct を残差に戻す。
+- **[rule] `FindLookupRange` → `FindLookupRanges`**: 対象キー列について下限・
+  上限を 1 個ずつまで集める(conjunct 順は不問)。採用した bound は両方とも
+  `enforced` に入り、残差 `Selection` から消える。
+- **[executor] `LookupJoin`** は区間 seek を組み立て(`BuildSeekRange` が
+  lower を begin、upper を end へ)、`Matches` で両 bound を再検査する。
+  2 個目の bound が NULL/NaN の左行は「述語が TRUE になり得ない」ので
+  キー NULL と同じく読み飛ばす。片側 bound が実行時に使えない場合
+  (UINT64 タグ等)はその側だけ落として走査を広げ、再検査が行を決める。
+- **[EXPLAIN] `probe:{a, lo < b < hi}`** の形で区間を表示(下限は
+  `right <op> left` の格納向きを反転して `left < right` として描画)。
+- **回帰**: `OptimizerTest.IndexJoinRuleAdoptsBothIntervalBoundsIntoTheProbe`
+  (両 bound 採用・残差なし・鏡像一致)、
+  `ExecutorTest.LookupJoinCompositeIntervalProbe`(区間 seek、bound の順序交換、
+  開閉端、NULL 上端)、`QueryTest.CompositeIndexLookupJoinIntervalProbe`
+  (SQL 経路の鏡像一致)、`PlanTest.LookupRangeAcceptsOnlyInt64AndDate`
+  (反対側の採用と区間表記、同側・3 個目・位置違いの拒否)。
+- **既知の残り**: 同じ側の 2 個目の境界(例: `b > x AND b > y`)と 3 個目以降の
+  キー列の境界は残差のまま(前者は区間を狭めないため採用しない)。
+- **検証**: 全 ctest **3930/3930 合格**(意図的 skip 3)。
+  plan(59)/optimizer(125)/executor(201)/query(187)/plan_extra(10)/
+  relational_regression(20)/late_materialization_join(9) green、
+  `check_layering.py` 成功(65辺)。
+
 2026-10-16 加筆(第33報)。統合TODOの次項目: **LSM / WiscKey の `LsmScan`
 実装規則**(plan/executor 層のみ)。詳細は下記「2026-10-16 LsmScan 実装規則」の節。
 

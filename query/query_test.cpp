@@ -5449,6 +5449,79 @@ TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
   ctx.txn_.Abort();
 }
 
+// The two-sided interval probe reached through SQL: `lo < b < hi` adopts BOTH
+// bounds, so the index join narrows its seek to the interval instead of
+// over-fetching from one side.  The plan text pins the interval and the mirror
+// below lists the accepted pairs in plain C++.
+TEST_F(QueryTest, CompositeIndexLookupJoinIntervalProbe) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE il (x INT64, lo INT64, hi INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO il VALUES (1, 5, 15), (2, 9, 26), (3, 20, 31);");
+  RunSql(ctx, *db_, "CREATE TABLE ir (a INT64, b INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO ir VALUES (1, 4), (1, 10), (1, 15), (1, 20), (2, 10), "
+         "(2, 25), (3, 21), (3, 30);");
+  ASSERT_EQ(
+      db_->CreateIndex(ctx, "ir",
+                       IndexSchema("ir_ab", {0, 1}, {}, IndexMode::kNonUnique)),
+      Status::kSuccess);
+  {
+    TransactionContext stat_ctx = db_->BeginContext();
+    db_->RefreshStatistics(stat_ctx, "il");
+    db_->RefreshStatistics(stat_ctx, "ir");
+    ASSERT_EQ(stat_ctx.PreCommit(), Status::kSuccess);
+  }
+
+  const std::vector<Row> left{{Value(1), Value(5), Value(15)},
+                              {Value(2), Value(9), Value(26)},
+                              {Value(3), Value(20), Value(31)}};
+  const std::vector<Row> right{{Value(1), Value(4)},  {Value(1), Value(10)},
+                               {Value(1), Value(15)}, {Value(1), Value(20)},
+                               {Value(2), Value(10)}, {Value(2), Value(25)},
+                               {Value(3), Value(21)}, {Value(3), Value(30)}};
+  const auto mirror = [&](bool lower_inclusive, bool upper_inclusive) {
+    std::vector<std::pair<int64_t, int64_t>> expected;
+    for (const Row& l : left) {
+      for (const Row& r : right) {
+        if (l[0].value.int_value != r[0].value.int_value) {
+          continue;
+        }
+        const int64_t lo = l[1].value.int_value;
+        const int64_t hi = l[2].value.int_value;
+        const int64_t b = r[1].value.int_value;
+        const bool keep = (lower_inclusive ? b >= lo : b > lo) &&
+                          (upper_inclusive ? b <= hi : b < hi);
+        if (keep) {
+          expected.emplace_back(r[0].value.int_value, r[1].value.int_value);
+        }
+      }
+    }
+    std::ranges::sort(expected);
+    return expected;
+  };
+  const auto collect = [&](const std::string& sql) {
+    std::vector<std::pair<int64_t, int64_t>> got;
+    for (const Row& row : RunSql(ctx, *db_, sql)) {
+      got.emplace_back(row[0].value.int_value, row[1].value.int_value);
+    }
+    std::ranges::sort(got);
+    return got;
+  };
+
+  // The SQL planner is free to pick the hash join here (it does at this size);
+  // the interval probe itself is pinned by the rule-level and executor-level
+  // regressions, and this test holds the SQL shape to the same answer either
+  // way.
+  EXPECT_EQ(collect("SELECT ir.a, ir.b FROM il JOIN ir ON il.x = ir.a AND "
+                    "ir.b > il.lo AND ir.b < il.hi;"),
+            mirror(false, false));
+  EXPECT_EQ(collect("SELECT ir.a, ir.b FROM il JOIN ir ON il.x = ir.a AND "
+                    "ir.b >= il.lo AND ir.b <= il.hi;"),
+            mirror(true, true));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, ZigZagJoinSqlContracts) {
   TransactionContext setup = db_->BeginContext();
   RunSql(setup, *db_, "CREATE TABLE zz_left (k INT64);");

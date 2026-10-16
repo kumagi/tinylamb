@@ -3645,6 +3645,152 @@ TEST_F(OptimizerTest, IndexJoinRulePushesOneRangeBoundIntoTheProbe) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+// Both sides of an inequality on the same open key column are adopted
+// together: the probe becomes an interval seek instead of a one-sided bound.
+// The rule removes BOTH conjuncts from the residual, so the interval has to be
+// exact -- and it is, because the executor re-checks each bound per candidate.
+TEST_F(OptimizerTest, IndexJoinRuleAdoptsBothIntervalBoundsIntoTheProbe) {
+  TransactionContext setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, left_tbl,
+      rs_->CreateTable(
+          setup, Schema("IntervalLeft", {Column("x", ValueType::kInt64),
+                                         Column("lo", ValueType::kInt64),
+                                         Column("hi", ValueType::kInt64)})));
+  for (const auto& row : {Row({Value(1), Value(5), Value(15)}),
+                          Row({Value(2), Value(9), Value(26)}),
+                          Row({Value(3), Value(20), Value(31)})}) {
+    ASSERT_SUCCESS(left_tbl.Insert(setup.txn_, row).GetStatus());
+  }
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(setup, Schema("IntervalRight",
+                                     {Column("a", ValueType::kInt64),
+                                      Column("b", ValueType::kInt64),
+                                      Column("payload", ValueType::kInt64)})));
+  for (const auto& row : {Row({Value(1), Value(4), Value(40)}),
+                          Row({Value(1), Value(10), Value(100)}),
+                          Row({Value(1), Value(15), Value(150)}),
+                          Row({Value(1), Value(20), Value(200)}),
+                          Row({Value(2), Value(10), Value(210)}),
+                          Row({Value(2), Value(25), Value(250)}),
+                          Row({Value(3), Value(21), Value(321)}),
+                          Row({Value(3), Value(30), Value(330)})}) {
+    ASSERT_SUCCESS(right_tbl.Insert(setup.txn_, row).GetStatus());
+  }
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      setup, "IntervalRight",
+      IndexSchema("IntervalRightAB", {0, 1}, {}, IndexMode::kNonUnique)));
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+  TransactionContext stat_ctx = rs_->BeginContext();
+  rs_->RefreshStatistics(stat_ctx, "IntervalLeft");
+  rs_->RefreshStatistics(stat_ctx, "IntervalRight");
+  ASSERT_SUCCESS(stat_ctx.PreCommit());
+
+  TransactionContext context = rs_->BeginContext();
+  const auto left = context.GetTable("IntervalLeft");
+  const auto right = context.GetTable("IntervalRight");
+  const auto left_stats = context.GetStats("IntervalLeft");
+  const auto right_stats = context.GetStats("IntervalRight");
+  ASSERT_TRUE(left.HasValue());
+  ASSERT_TRUE(right.HasValue());
+  ASSERT_TRUE(left_stats.HasValue());
+  ASSERT_TRUE(right_stats.HasValue());
+
+  // x = a AND lo < b AND b < hi: one equality pinning the leading key column
+  // and an interval on the next one.
+  const Expression predicate = BinaryExpressionExp(
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp(ColumnName("IntervalLeft", "x")),
+                              BinaryOperation::kEquals,
+                              ColumnValueExp(ColumnName("IntervalRight", "a"))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(
+              ColumnValueExp(ColumnName("IntervalLeft", "lo")),
+              BinaryOperation::kLessThan,
+              ColumnValueExp(ColumnName("IntervalRight", "b")))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("IntervalRight", "b")),
+                          BinaryOperation::kLessThan,
+                          ColumnValueExp(ColumnName("IntervalLeft", "hi"))));
+
+  cascades::RuleContext rule_context;
+  rule_context.transaction = &context;
+  rule_context.tables = {{"IntervalLeft", left.Value()},
+                         {"IntervalRight", right.Value()}};
+  rule_context.statistics = {{"IntervalLeft", left_stats.Value()},
+                             {"IntervalRight", right_stats.Value()}};
+  const cascades::ImplementationRule* rule = nullptr;
+  for (const auto& candidate : DefaultImplementationRules().Rules()) {
+    if (candidate.Name() == "index_join") {
+      rule = &candidate;
+      break;
+    }
+  }
+  ASSERT_NE(rule, nullptr);
+
+  const TableStatistics left_ts = *left_stats.Value();
+  Plan left_plan = std::make_shared<FullScanPlan>(*left.Value(), left_ts);
+  Plan right_plan = std::make_shared<FullScanPlan>(*right.Value(), left_ts);
+  cascades::Memo memo;
+  const cascades::GroupId root = memo.Build({"IntervalLeft", "IntervalRight"});
+  const cascades::GroupId right_group =
+      memo.Get(root).expressions.front().children[1];
+  cascades::LogicalExpression logical = memo.Get(root).expressions.front();
+  logical.predicate = predicate;
+  const std::vector<cascades::BestPlan> children{
+      cascades::BestPlan{.plan = left_plan, .estimated_rows = 3.0},
+      cascades::BestPlan{.plan = right_plan, .estimated_rows = 8.0}};
+  const std::vector<cascades::PlanAlternative> alternatives =
+      rule->Apply(memo, right_group, logical, children,
+                  cascades::PhysicalProperties{}, rule_context);
+  ASSERT_EQ(alternatives.size(), 1U);
+  const auto product =
+      std::dynamic_pointer_cast<ProductPlan>(alternatives.front().plan);
+  ASSERT_NE(product, nullptr);
+  ASSERT_TRUE(product->Lookup().has_value());
+  // The equality prefix pins (a); the interval rides on (b).
+  ASSERT_EQ(SeekOf(product->Lookup()).right_columns.size(), 2U);
+  ASSERT_EQ(SeekOf(product->Lookup()).range_position, 1U);
+  // The lower conjunct arrived first, so it is the probe's first bound; the
+  // upper one lands on the same position as the interval's other end.
+  EXPECT_EQ(SeekOf(product->Lookup()).left_columns[1],
+            ColumnName("IntervalLeft", "lo"));
+  EXPECT_EQ(SeekOf(product->Lookup()).range_operation,
+            BinaryOperation::kGreaterThan);
+  EXPECT_EQ(SeekOf(product->Lookup()).second_range_left_column,
+            ColumnName("IntervalLeft", "hi"));
+  EXPECT_EQ(SeekOf(product->Lookup()).second_range_operation,
+            BinaryOperation::kLessThan);
+  // Both bounds are enforced by the probe, so no residual is left.
+  EXPECT_EQ(product->ResidualNote(), nullptr);
+  EXPECT_NE(product->ToString().find("probe:{IntervalRight.a, IntervalLeft.lo <"
+                                     " IntervalRight.b < IntervalLeft.hi}"),
+            std::string::npos)
+      << product->ToString();
+
+  Executor executor = product->EmitExecutor(context);
+  std::ostringstream dump;
+  executor->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("LookupJoin"), std::string::npos) << dump.str();
+  // The join emits `left(3) + right(3)`, so the payload sits at index 5.
+  constexpr size_t kPayloadColumn = 5;
+  std::vector<int64_t> matched;
+  Row row;
+  while (executor->Next(&row, nullptr)) {
+    matched.push_back(row[kPayloadColumn].value.int_value);
+  }
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+  // (x=1, 5 < b < 15): b = 10.  (x=2, 9 < b < 26): b = 10, 25.
+  // (x=3, 20 < b < 31): b = 21, 30.  The exclusive edges at b = 15 and
+  // b = 20/25 are excluded by the per-candidate re-check.
+  std::vector<int64_t> expected{100, 210, 250, 321, 330};
+  std::ranges::sort(matched);
+  std::ranges::sort(expected);
+  EXPECT_EQ(matched, expected);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 // A second range column, a range the type whitelist rejects and an equality on
 // a non-key column all have to stay residual predicates. The probe
 // over-fetches and the predicate above it decides the rows -- never the other

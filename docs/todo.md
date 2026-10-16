@@ -315,8 +315,7 @@ Cascades rule / cost / statistics
 - [x] ZoneMapSkipScanをplan属性へ接続する。
 - [x] LateMaterializationScanを実装する。
 - [x] BERNOULLI / SYSTEMのSampleScanを実装する。
-- [ ] ForeignScanを実装する。
-- [ ] 複合インデックスの等式 + 不等式混在を実装する。
+- [ ] ForeignScanを実装する。（2026-10-17 保留: 外部ソース形式が未定のため設計待ち。次の具体項目から着手）
 - [ ] 複数インデックスを用いたcovering判定を実装する。
 - [x] NestedLoopIndexJoinのprefetchを実装する。
 - [ ] 内側filterをindexへ適用できない場合にheap側へ残す契約を明示する。

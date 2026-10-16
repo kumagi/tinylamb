@@ -51,6 +51,11 @@ class Transaction;
 //     `right_cols[range_position] <range_operation> left_cols[range_position]`
 //     per candidate, so inclusive/exclusive boundary rows are always
 //     resolved by the predicate, never by the seek.
+//   * a second bound on the same position (`second_range_column` /
+//     `second_range_operation`, always the opposite side) turns the probe
+//     into an interval: the seek becomes
+//     `[prefix + lower, prefix + upper]` and both comparisons are re-checked
+//     per candidate.
 //
 // `range_position` == the equality-prefix length, and the whole probe degrades
 // to a prefix point lookup when it is std::nullopt.  Anything the seek cannot
@@ -60,11 +65,14 @@ class Transaction;
 // rejects it, so the fallback only costs a wider scan, never a wrong row.
 class LookupJoin : public ExecutorBase {
  public:
-  LookupJoin(Transaction& txn, Executor left, std::vector<slot_t> left_cols,
-             const Table& tbl, const Index& idx, std::vector<slot_t> right_cols,
-             std::optional<size_t> range_position = std::nullopt,
-             BinaryOperation range_operation = BinaryOperation::kLessThan,
-             TransactionManager::IndexReadGuard index_read_guard = {});
+  LookupJoin(
+      Transaction& txn, Executor left, std::vector<slot_t> left_cols,
+      const Table& tbl, const Index& idx, std::vector<slot_t> right_cols,
+      std::optional<size_t> range_position = std::nullopt,
+      BinaryOperation range_operation = BinaryOperation::kLessThan,
+      std::optional<slot_t> second_range_column = std::nullopt,
+      std::optional<BinaryOperation> second_range_operation = std::nullopt,
+      TransactionManager::IndexReadGuard index_read_guard = {});
   LookupJoin(const LookupJoin&) = delete;
   LookupJoin(LookupJoin&&) = delete;
   LookupJoin& operator=(const LookupJoin&) = delete;
@@ -82,6 +90,8 @@ class LookupJoin : public ExecutorBase {
   void BuildSeekRange(const Row& left_key);
   // Re-checks one candidate row against the join keys.
   [[nodiscard]] bool Matches(const Row& left_key, const Row& right_key) const;
+  // The interval probe's second bound, read from the current left row.
+  [[nodiscard]] std::optional<Value> SecondRangeBound() const;
 
   Transaction& txn_;
   Executor left_;
@@ -94,6 +104,12 @@ class LookupJoin : public ExecutorBase {
   std::vector<slot_t> right_cols_;
   std::optional<size_t> range_position_;
   BinaryOperation range_operation_{BinaryOperation::kLessThan};
+  // Interval probe: the second bound's value slot on the left row and the
+  // comparison as applied to the right key (`right <op> left`).  Both are set
+  // together, only with `range_position_`, and always the opposite side of
+  // `range_operation_`.
+  std::optional<slot_t> second_range_column_;
+  std::optional<BinaryOperation> second_range_operation_;
   // Declared type of the index key column at `range_position_`; kNull when
   // there is no range column.
   ValueType range_key_type_{ValueType::kNull};

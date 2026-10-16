@@ -1057,10 +1057,20 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
       BuildKeyOffsets(right_schema, {column}, &offset);
       probe_right.push_back(offset.front());
     }
+    // Interval probe: the second bound's value comes from a left column that
+    // is not part of the seek key vectors, so it is resolved separately.
+    std::optional<slot_t> second_range_column;
+    if (seek.second_range_left_column) {
+      std::vector<slot_t> offset;
+      BuildKeyOffsets(left_src_->GetSchema(), {*seek.second_range_left_column},
+                      &offset);
+      second_range_column = offset.front();
+    }
     return std::make_shared<LookupJoin>(
         ctx.txn_, std::move(left_executor), std::move(probe_left), *right_tbl_,
         *right_idx_, std::move(probe_right), seek.range_position,
-        seek.range_operation, std::move(index_read_guard));
+        seek.range_operation, second_range_column, seek.second_range_operation,
+        std::move(index_read_guard));
   }
   if (kind_ != JoinKind::kInner) {
     // Semi/anti and outer hash joins retain the logical join kind.  Widths

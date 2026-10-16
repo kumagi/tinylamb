@@ -420,7 +420,11 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## P4 — インデックス結合・ルックアップの拡張
 
-- [ ] 複合インデックスの不等式 + 等式ミックス
+- [x] 複合インデックスの不等式 + 等式ミックス（等式 prefix + 同一キー列の両側境界。
+      `LookupSeek::second_range_left_column` / `second_range_operation`、
+      `ProductPlan::SetLookupRange` の2回目呼び出し、`FindLookupRanges`、
+      `LookupJoin` の区間 seek。`probe:{a, lo < b < hi}` として EXPLAIN に出る。
+      同側の2個目・3個目の境界と後続キー列の境界は残差へ明示 fallback）
 - [ ] covering 判定の複数インデックス
 - [ ] `NestedLoopIndexJoin` のプリフェッチ
 - [ ] 内側フィルタをインデックスに落とせず heap に残す明示
