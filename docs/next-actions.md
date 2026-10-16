@@ -1,5 +1,30 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-16 加筆(第32報)。統合TODOの次項目: **複数レンジ IndexScan の順序回復**
+(point-union / OR-of-prefixes の大域順序主張)。詳細は下記
+「2026-10-16 複数レンジ IndexScan の順序回復」の節。
+
+## 2026-10-16 複数レンジ IndexScan の順序回復の成果
+
+- **[planner] `ScanAlternatives` の point-union と disjunctive-prefix 候補が
+  全キー列を provided order として提示するようにした。** どちらもレンジ列は
+  ソート済み・非重複に構築され (`std::ranges::sort` + `unique`、prefix は
+  同サイズで disjoint)、等値プレフィックスは全レンジで一定なので、
+  レンジを順にスキャンするだけで大域的にキー順になる(マージ不要)。
+  従来は point-union が単一レンジのときだけサフィックス列を提示し、
+  複数レンジでは順序主張なし → SQL 層が Sort を挿入していた。
+- **効果**: `WHERE k IN (...) ORDER BY k` や `(...prefix...) OR ...` の
+  ORDER BY が Sort なしで満たされる。SQL 経路の EXPLAIN で
+  `ParallelSort`/`BufferedSort` が消えることを CLI とテストで確認。
+- **回帰**: `OptimizerTest.InListPointUnionKeepsKeyOrderWithoutSort` /
+  `DisjunctivePrefixRangesKeepKeyOrderWithoutSort`(plan の order 主張と
+  昇順行)、`SqlClusteredOrderTest.InListPointUnionKeepsKeyOrder`
+  (EXPLAIN に Sort なし、end-to-end)。
+- **検証**: 全 ctest **3923/3923 合格**(意図的 skip 3)。
+  optimizer(124)/plan(59)/cascades(192)/cascades_rules(82)/
+  query(186)/TPC-H(8)/TPC-DS(15)/compliance(296)/sql_* 各スイート green、
+  `check_layering.py` 成功(65辺)。
+
 2026-10-16 加筆(第31報)。統合TODOの次項目: **PrefetchingIndexScan /
 ParallelIndexScan / RangePartitionedScan**(インデックススキャンの先読み・
 リーフ境界分割・並列化)。詳細は下記「2026-10-16 インデックススキャン

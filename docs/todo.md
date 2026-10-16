@@ -315,7 +315,6 @@ Cascades rule / cost / statistics
 - [x] ZoneMapSkipScanをplan属性へ接続する。
 - [x] LateMaterializationScanを実装する。
 - [x] BERNOULLI / SYSTEMのSampleScanを実装する。
-- [ ] 複数レンジIndexScanの順序回復を実装する。
 - [ ] LSM / WiscKeyのLsmScan implementation ruleを実装する。
 - [ ] ForeignScanを実装する。
 - [ ] 複合インデックスの等式 + 不等式混在を実装する。

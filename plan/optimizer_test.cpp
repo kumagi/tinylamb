@@ -5287,4 +5287,120 @@ TEST_F(OptimizerTest, ParallelIndexScanEmittedForLargeIndexRange) {
   ASSERT_SUCCESS(small_ctx.PreCommit());
 }
 
+TEST_F(OptimizerTest, InListPointUnionKeepsKeyOrderWithoutSort) {
+  // Multi-range point unions scan sorted, disjoint ranges in sequence, so the
+  // output is globally key-ordered: the plan must claim the order (and the
+  // SQL layer therefore needs no Sort above it).
+  const std::string kTable = "PointOrder";
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl,
+        rs_->CreateTable(
+            writer, Schema(kTable, {Column("key", ValueType::kInt64),
+                                    Column("payload", ValueType::kInt64)})));
+    for (int64_t key = 0; key < 200; ++key) {
+      ASSERT_SUCCESS(tbl.Insert(writer.txn_, Row({Value(key), Value(key * 2)}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(writer, kTable, IndexSchema("PointIdx", {0})));
+    ASSERT_SUCCESS(writer.PreCommit());
+    TransactionContext stats_ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, kTable));
+    ASSERT_SUCCESS(stats_ctx.PreCommit());
+  }
+  QueryData query{{kTable},
+                  InExpressionExp(ColumnValueExp("key"),
+                                  {ConstantValueExp(Value(int64_t{9})),
+                                   ConstantValueExp(Value(int64_t{3})),
+                                   ConstantValueExp(Value(int64_t{7}))}),
+                  {NamedExpression("key"), NamedExpression("payload")}};
+  query.order_expressions_ = {ColumnValueExp(ColumnName(kTable + ".key"))};
+  query.order_ascending_ = {true};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("x3 points"), std::string::npos) << dump.str();
+  EXPECT_TRUE(
+      plan->IsOrderedBy(query.order_expressions_, query.order_ascending_))
+      << dump.str();
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  std::vector<int64_t> keys;
+  while (executor->Next(&row, nullptr)) {
+    keys.push_back(row[0].value.int_value);
+  }
+  EXPECT_EQ(keys, (std::vector<int64_t>{3, 7, 9}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, DisjunctivePrefixRangesKeepKeyOrderWithoutSort) {
+  // OR-of-conjunctions over distinct key prefixes is a union of sorted,
+  // disjoint ranges: the plan must claim the full key order.  Three
+  // single-comparison disjuncts keep the shape intact through the rewrites
+  // (OR-to-union needs exactly two branches; OR-distribution needs one side
+  // to be an AND), so the disjunctive index scan is the index alternative.
+  const std::string kTable = "PrefixOrder";
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl,
+        rs_->CreateTable(
+            writer, Schema(kTable, {Column("a", ValueType::kInt64),
+                                    Column("b", ValueType::kInt64),
+                                    Column("payload", ValueType::kInt64)})));
+    for (int64_t i = 0; i < 200; ++i) {
+      ASSERT_SUCCESS(
+          tbl.Insert(writer.txn_, Row({Value(i % 10), Value(i / 10), Value(i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        writer, kTable,
+        IndexSchema("PrefixIdx", {0, 1}, {}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(writer.PreCommit());
+    TransactionContext stats_ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, kTable));
+    ASSERT_SUCCESS(stats_ctx.PreCommit());
+  }
+  const auto equality = [](std::string_view column, int64_t value) {
+    return BinaryExpressionExp(ColumnValueExp(column), BinaryOperation::kEquals,
+                               ConstantValueExp(Value(value)));
+  };
+  QueryData query{
+      {kTable},
+      BinaryExpressionExp(
+          BinaryExpressionExp(equality("a", 2), BinaryOperation::kOr,
+                              equality("a", 5)),
+          BinaryOperation::kOr, equality("a", 8)),
+      {NamedExpression("a"), NamedExpression("b"), NamedExpression("payload")}};
+  query.order_expressions_ = {ColumnValueExp(ColumnName(kTable + ".a")),
+                              ColumnValueExp(ColumnName(kTable + ".b"))};
+  query.order_ascending_ = {true, true};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("x3 points"), std::string::npos) << dump.str();
+  EXPECT_TRUE(
+      plan->IsOrderedBy(query.order_expressions_, query.order_ascending_))
+      << dump.str();
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  std::vector<std::pair<int64_t, int64_t>> rows;
+  while (executor->Next(&row, nullptr)) {
+    rows.emplace_back(row[0].value.int_value, row[1].value.int_value);
+  }
+  ASSERT_EQ(rows.size(), 60U);
+  for (size_t i = 1; i < rows.size(); ++i) {
+    EXPECT_LT(rows[i - 1], rows[i]) << "row " << i;
+  }
+  EXPECT_EQ(rows.front(), (std::pair<int64_t, int64_t>{2, 0}));
+  EXPECT_EQ(rows.back(), (std::pair<int64_t, int64_t>{8, 19}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 }  // namespace tinylamb

@@ -541,4 +541,26 @@ TEST_F(SqlClusteredOrderTest, CountStarIndexOnlyScanServesVisibilityMap) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
+// A constant IN list is a point union of sorted, disjoint index ranges: the
+// scan delivers key order, so the SQL layer must not add a Sort above an
+// ORDER BY on the key.
+TEST_F(SqlClusteredOrderTest, InListPointUnionKeepsKeyOrder) {
+  Analyze();
+  TransactionContext ctx = database_->BeginContext();
+  const std::string plan = Explain(
+      ctx, *database_,
+      "EXPLAIN SELECT id, tag FROM clustered WHERE id IN (3, 7, 9) ORDER BY "
+      "id;");
+  EXPECT_EQ(plan.find("Sort"), std::string::npos) << plan;
+  const std::vector<Row> rows =
+      RunSql(ctx, *database_,
+             "SELECT id, tag FROM clustered WHERE id IN (3, 7, 9) ORDER BY "
+             "id;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{3}));
+  EXPECT_EQ(rows[1][0], Value(int64_t{7}));
+  EXPECT_EQ(rows[2][0], Value(int64_t{9}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
 }  // namespace tinylamb

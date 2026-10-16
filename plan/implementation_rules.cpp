@@ -1039,9 +1039,19 @@ std::vector<PlanAlternative> ScanAlternatives(
           scan_ranges.emplace_back(prefix, prefix);
           access_rows += EqualityPrefixRows(statistics, index, prefix);
         }
+        // The prefixes are sorted, disjoint and of equal size, so every
+        // entry of one range precedes every entry of the next: scanning the
+        // ranges in sequence delivers the index key order.  Advertise the
+        // full key list so an ORDER BY on the key (or any prefix) needs no
+        // Sort.
+        std::vector<ColumnName> prefix_order;
+        prefix_order.reserve(index.sc_.key_.size());
+        for (const slot_t slot : index.sc_.key_) {
+          prefix_order.push_back(schema.GetColumn(slot).Name());
+        }
         Plan disjunctive = std::make_shared<IndexScanPlan>(
             table, index, statistics, std::move(scan_ranges), true,
-            scan_predicate, std::vector<ColumnName>{},
+            scan_predicate, std::move(prefix_order),
             required.require_row_position, required.wait_for_write_intent);
         if (fallback_select.size() != disjunctive->GetSchema().ColumnCount()) {
           disjunctive =
@@ -1093,13 +1103,16 @@ std::vector<PlanAlternative> ScanAlternatives(
             std::vector<Value> end_key = key;
             scan_ranges.emplace_back(std::move(key), std::move(end_key));
           }
+          // The point ranges are sorted and disjoint, so scanning them in
+          // sequence preserves the index key order: the equality prefix is
+          // constant across ranges and the IN column ascends, so every entry
+          // of one point precedes every entry of the next.  Advertise the
+          // full key list so an ORDER BY on the key (or any prefix) needs no
+          // Sort.
           std::vector<ColumnName> point_order;
-          if (scan_ranges.size() == 1) {
-            for (size_t key = point_key_offset + 1; key < index.sc_.key_.size();
-                 ++key) {
-              point_order.push_back(
-                  schema.GetColumn(index.sc_.key_[key]).Name());
-            }
+          point_order.reserve(index.sc_.key_.size());
+          for (const slot_t slot : index.sc_.key_) {
+            point_order.push_back(schema.GetColumn(slot).Name());
           }
           Plan point_candidate = std::make_shared<IndexScanPlan>(
               table, index, statistics, std::move(scan_ranges), true,

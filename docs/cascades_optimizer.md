@@ -108,7 +108,10 @@ the requested columns. Covering candidates are priced as matched rows times
 `kCoveringIndexCostFactor` (0.5) and skip the range clustering penalty (their
 I/O is index-only and key-ordered), so a covering index wins over a
 non-covering index of the same range and stays competitive with the
-sequential full scan on an unclustered column. A large ascending single-range
+sequential full scan on an unclustered column. Multi-range shapes (constant
+IN-list point unions and OR-of-prefix disjunctions) build sorted, disjoint
+ranges and advertise the full key order, so an ORDER BY on the key needs no
+Sort. A large ascending single-range
 `IndexScanPlan` emits `ParallelIndexScan` (leaf-aligned key morsels,
 `kParallelIndexScanMinRows`) with the residual predicate on a Selection above
 it; the morsel-ordered handoff keeps the key order. `hash_join` offers both

@@ -234,8 +234,13 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `ForeignScan`（将来の外部データ）
 - [x] `FilteredScanPushdown` と残余フィルタの EXPLAIN 区別（IndexScan の predicate
       と、非カバー条件を Selection に残す経路を分離）
-- [ ] 複数レンジ IndexScan の大域順序保証（1 レンジ以外は順序なし、既存）の
-      マージによる順序回復
+- [x] 複数レンジ IndexScan の大域順序保証（1 レンジ以外は順序なし、既存）の
+      マージによる順序回復。point-union と OR-of-prefixes はレンジがソート済み・
+      非重複なので、`ScanAlternatives` が全キー列を provided order として提示し、
+      ORDER BY が Sort なしで満たされる（マージ不要: 逐次スキャンが既に大域順序）。
+      回帰: `OptimizerTest.InListPointUnionKeepsKeyOrderWithoutSort` /
+      `DisjunctivePrefixRangesKeepKeyOrderWithoutSort` /
+      `SqlClusteredOrderTest.InListPointUnionKeepsKeyOrder`
 - [ ] LSM / WiscKey 経路の `LsmScan` 実装規則
 
 ---
