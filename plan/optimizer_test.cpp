@@ -5591,4 +5591,99 @@ TEST_F(OptimizerTest, DisjunctivePrefixRangesKeepKeyOrderWithoutSort) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, OrderedOuterDiscountsTheIndexProbeIntoAWin) {
+  // Lookup locality (docs/todo.md Phase 2 "ソート済み外側からのlookup
+  // locality"). Two outer tables hold the same 100 rows; only one of them has
+  // an index on the join key, so only that one can hand the probe its keys in
+  // probe order. The filter keeps 20 outer rows and the inner side has 37 rows
+  // with a unique key: the ordered probe (0.75x -> 55) beats the best hash
+  // orientation (37 + 20 = 57) while the unordered probe (60) loses to it, so
+  // the chosen shape IS the evidence that the discount exists.
+  TransactionContext setup = rs_->BeginContext();
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, ordered_outer,
+        rs_->CreateTable(
+            setup,
+            Schema("LocOrdered", {Column("k", ValueType::kInt64),
+                                  Column("payload", ValueType::kInt64)})));
+    for (int i = 0; i < 100; ++i) {
+      ASSERT_SUCCESS(ordered_outer.Insert(setup.txn_, Row({Value(i), Value(i)}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(rs_->CreateIndex(setup, "LocOrdered",
+                                    IndexSchema("LocOrderedPK", {0})));
+  }
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, plain_outer,
+        rs_->CreateTable(
+            setup, Schema("LocPlain", {Column("k", ValueType::kInt64),
+                                       Column("payload", ValueType::kInt64)})));
+    for (int i = 0; i < 100; ++i) {
+      ASSERT_SUCCESS(plain_outer.Insert(setup.txn_, Row({Value(i), Value(i)}))
+                         .GetStatus());
+    }
+  }
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, inner,
+        rs_->CreateTable(setup,
+                         Schema("LocInner", {Column("k", ValueType::kInt64),
+                                             Column("v", ValueType::kInt64)})));
+    for (int i = 80; i < 117; ++i) {
+      ASSERT_SUCCESS(
+          inner.Insert(setup.txn_, Row({Value(i), Value(i * 10)})).GetStatus());
+    }
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(setup, "LocInner", IndexSchema("LocInnerPK", {0})));
+  }
+  rs_->RefreshStatistics(setup, "LocOrdered");
+  rs_->RefreshStatistics(setup, "LocPlain");
+  rs_->RefreshStatistics(setup, "LocInner");
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  // Returns the plan text and the emitted rows for one outer table.
+  const auto plan_and_rows = [&](const std::string& outer) {
+    QueryData query{
+        {outer, "LocInner"},
+        BinaryExpressionExp(
+            BinaryExpressionExp(ColumnValueExp(ColumnName(outer, "k")),
+                                BinaryOperation::kEquals,
+                                ColumnValueExp(ColumnName("LocInner", "k"))),
+            BinaryOperation::kAnd,
+            BinaryExpressionExp(ColumnValueExp(ColumnName(outer, "k")),
+                                BinaryOperation::kGreaterThanEquals,
+                                ConstantValueExp(Value(80)))),
+        {NamedExpression("k", ColumnValueExp(ColumnName(outer, "k"))),
+         NamedExpression("v", ColumnValueExp(ColumnName("LocInner", "v")))}};
+    TransactionContext context = rs_->BeginContext();
+    EXPECT_SUCCESS(query.Rewrite(context));
+    StatusOr<Plan> optimized = Optimizer::Optimize(query, context);
+    EXPECT_TRUE(optimized.HasValue());
+    Plan plan = optimized.Value();
+    std::ostringstream dump;
+    plan->Dump(dump, 0);
+    std::vector<std::pair<int64_t, int64_t>> rows;
+    Executor executor = plan->EmitExecutor(context);
+    Row row;
+    while (executor->Next(&row, nullptr)) {
+      rows.emplace_back(row[0].value.int_value, row[1].value.int_value);
+    }
+    EXPECT_SUCCESS(context.PreCommit());
+    return std::pair<std::string, std::vector<std::pair<int64_t, int64_t>>>{
+        dump.str(), std::move(rows)};
+  };
+
+  const auto [ordered_text, ordered_rows] = plan_and_rows("LocOrdered");
+  const auto [plain_text, plain_rows] = plan_and_rows("LocPlain");
+  // Same answer either way -- the discount may only change the shape.
+  EXPECT_EQ(ordered_rows, plain_rows);
+  EXPECT_EQ(ordered_rows.size(), 20U);
+  // The ordered outer side keeps the index nested-loop; without an order to
+  // offer, the same query loses to the hash join.
+  EXPECT_NE(ordered_text.find("Index Join"), std::string::npos) << ordered_text;
+  EXPECT_EQ(plain_text.find("Index Join"), std::string::npos) << plain_text;
+}
+
 }  // namespace tinylamb

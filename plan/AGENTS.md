@@ -113,6 +113,15 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   multi-index covering scan candidates (see
   `multi_index_covering_scan_plan.hpp`); normal single-table queries use
   Memo, with only `OptimizeMinMaxIndex` retaining exact endpoint lookup).
+  Index nested-loop costing discounts the **probe half** of its per-left-row
+  cost (`kOrderedLookupProbeFactor`) when the outer plan already delivers the
+  probe key order (`DeliversProbeOrder` over `probe->left_columns`): sorted
+  probes stay on the leaf the previous one used (or its neighbour), so the
+  descent path and the leaf page stay resident. Measured (clustered) orders
+  count — the order really is delivered; `OrderIsMeasured` only keeps them out
+  of the LIMIT early-stop discount, and such statements are already excluded
+  from the compiled-plan cache. It is a tie-breaker, not a requirement: the
+  join does not yet ask its child for the probe order.
   Dynamic join filters: `dynamic_filter_pushdown_join` records the probe-side
   join keys on a derived probe group (`Group::dynamic_filter_keys`), and the
   hash-join rule turns that annotation into `ProductPlan::PreferDynamicFilter`

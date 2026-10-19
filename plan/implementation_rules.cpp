@@ -507,6 +507,38 @@ double RangeClusteringPenalty(const TableStatistics& statistics, slot_t slot) {
   return 1.0 + (kIndexRangeClusteringPenalty * (1.0 - correlation));
 }
 
+// Lookup locality (Phase 2 "ソート済み外側からのlookup locality").  When the
+// outer side already arrives in the probe key order, consecutive probes either
+// land on the leaf the previous one used or on the one next to it, so the
+// root-to-leaf descent path and the leaf page stay in the buffer pool instead
+// of being re-read per row.  True when `plan` delivers `columns` ascending; the
+// probe's own left-column names are handed over unchanged because every
+// IsOrderedBy implementation resolves the qualified and unqualified spellings.
+//
+// A measured order (the clustered-scan claim) counts here.  The reason costing
+// keeps measured orders out of the LIMIT early-stop discount -- "the scan
+// already walked a whole chain to obtain the order" -- says the ORDER was not
+// earned; it does not say the order is absent.  The probe really does receive
+// sorted keys, so the locality is real, and a statement that folded such a
+// claim is kept out of the compiled-plan cache anyway.
+bool DeliversProbeOrder(const Plan& plan,
+                        const std::vector<ColumnName>& columns) {
+  if (columns.empty()) {
+    return false;
+  }
+  std::vector<Expression> order;
+  order.reserve(columns.size());
+  for (const ColumnName& column : columns) {
+    order.push_back(ColumnValueExp(column));
+  }
+  return plan->IsOrderedBy(order, std::vector<bool>(columns.size(), true));
+}
+
+// Multiplier on the per-probe half of an index nested-loop join's cost when
+// the outer side delivers the probe order.  Only the probe is discounted: the
+// rows the probe hands back and their assembly cost the same either way.
+inline constexpr double kOrderedLookupProbeFactor = 0.75;
+
 // Independent-column statistics are sufficient to distinguish two common
 // composite-index choices even without multi-column histograms.  In
 // particular, (warehouse,district,customer,order) is far narrower for three
@@ -2435,11 +2467,18 @@ std::vector<PlanAlternative> JoinAlternatives(
                 lookup_plan->GetStats());
           }
           // One B+Tree probe plus row assembly per left row, plus the rows
-          // the probe is expected to hand back. A range bound turns the
-          // point probe into a range walk over the heap, so it pays the same
+          // the probe is expected to hand back. The probe half is discounted
+          // when the outer side already arrives in the probe key order: the
+          // descent then amortizes into a left-to-right leaf walk, so the
+          // pages it touches stay resident. A range bound turns the point
+          // probe into a range walk over the heap, so it pays the same
           // clustering penalty the range-sliced index scan applies
           // (see RangeClusteringPenalty).
-          double local_cost = (l_rows * 2.0) + equi_estimate;
+          const double probe_factor =
+              DeliversProbeOrder(left.plan, probe->left_columns)
+                  ? kOrderedLookupProbeFactor
+                  : 1.0;
+          double local_cost = (l_rows * probe_factor) + l_rows + equi_estimate;
           if (range_adopted) {
             local_cost = std::max(
                 1.0, local_cost * RangeClusteringPenalty(*stats_it->second,

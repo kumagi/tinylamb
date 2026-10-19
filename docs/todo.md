@@ -387,7 +387,33 @@ Cascades rule / cost / statistics
       既知の残り: `kVersionedUnique` は保持削除でキー1つに複数 position が
       並び得る（挿入は一意性を強制しない）ため短絡しない。連続する重複
       外側キーで probe を作り直さない locality 最適化は次項。
-- [ ] ソート済み外側からのlookup localityをcost化する。
+- [x] ソート済み外側からのlookup localityをcost化する。
+      `JoinAlternatives` の index nested-loop 局所コストは
+      `l_rows * 2.0 + equi`（B+Tree probe 1回 + 行の組み立て1回）で、外側が
+      probe キー順に来ていても何も変わらなかった。probe 側だけを
+      `DeliversProbeOrder(left.plan, probe->left_columns)` で割り引く:
+      `l_rows * (ordered ? 0.75 : 1.0) + l_rows + equi`。外側が probe の
+      キー順（索引キー順の左カラム列）を昇順で供給しているとき、連続する
+      probe は直前のリーフか隣のリーフに着地するので、根からの下降路と
+      リーフページが buffer pool に残る。組み立て側と返る行は順序に依存しない
+      ので割り引かない。`IsOrderedBy` は修飾/非修飾の両表記を解決するため、
+      probe の left カラム名をそのまま渡せる。
+      **measured order（clustered scan の主張）も対象**にする: 「順序を得るのに
+      鎖を最後まで歩いた」という `OrderIsMeasured` の理屈は『順序を*得て*
+      いない』ことの理由にはならず、probe には実際に昇順キーが届く
+      （その主張を含む文はコンパイル済み計画キャッシュから除外済み）。
+      回帰: `OptimizerTest.OrderedOuterDiscountsTheIndexProbeIntoAWin`。
+      同じ100行の外側を2つ用意し、片方だけ join キーに索引を持つ（=外側が
+      索引順を供給できる）。フィルタ後の外側20行・内側37行では、順序ありの
+      probe 55 が最良の hash 向き 57 を下回り、順序なしの 60 は負けるので、
+      **選ばれる形状そのものが割引の証拠**になる（`Index Join` の有無）。
+      両者の出力行は一致（割引は形状だけを変える）。係数を 1.0 に戻す変異で
+      落ちる。
+      既知の残り: 子グループに「probe キー順」を要求していないので、割引は
+      「たまたま最安の外側計画が順序を供給する」ときだけ効く。結合の子に
+      interesting order を要求する仕組みは未実装。リーフヒント
+      (`BPlusTree::Read` の `hint_leaf`) を read 経路へ通す実装も未着手で、
+      現状の効果はキャッシュ局所性のみ。
 
 ### DISTINCT / 集合演算
 

@@ -8,10 +8,51 @@ Path)の次項目: **内側filterを index へ適用できない場合に heap �
 Path)の次項目: **unique内側の1行lookup短絡**。詳細は下記
 「2026-10-19 LookupJoin の unique 内側短絡」の節。
 
+2026-10-19 加筆(第38報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
+Path)の次項目: **ソート済み外側からの lookup locality の cost 化**。詳細は
+下記「2026-10-19 lookup locality の cost 化」の節。Scan / Access Path の
+`[ ]` は `ForeignScan`(保留)のみになった。
+
 2026-10-19 加筆(第35報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-19 lookup locality の cost 化
+
+- **[課題] index nested-loop の局所コストが外側の順序を見ていなかった。**
+  `JoinAlternatives` は `l_rows * 2.0 + equi`（probe 1回 + 行組み立て1回）で
+  見積もっていた。外側が probe キー順に来ていれば、連続する probe は直前の
+  リーフか隣のリーフに着地し、根からの下降路とリーフページが buffer pool に
+  残る。同じ仕事量でも順序ありの方が安いのに、コストは同額だった。
+- **[修正] probe 半分だけを割り引く。**
+  `l_rows * (ordered ? 0.75 : 1.0) + l_rows + equi`。返る行とその組み立ては
+  順序に依存しないので触らない。`DeliversProbeOrder` は
+  `probe->left_columns`（索引キー順に並べた左カラム）を
+  `ColumnValueExp` にして `IsOrderedBy` に渡すだけでよい
+  （`OrderMatches` は修飾/非修飾の両表記を解決する）。
+- **[判断] measured order も対象。** `OrderIsMeasured` が early-stop 割引から
+  外す理由は「順序*を得る*のに鎖を最後まで歩いた」ことであって、順序が
+  存在しないことではない。probe には実際に昇順キーが届くので局所性は本物。
+  なお clustered 主張を含む文はコンパイル済み計画キャッシュから除外される
+  （`AnyResolvedTableHasClusteredOrder`）ため、取り消し可能な主張が計画に
+  焼き付く問題もない。
+- **[回帰] 形状が割引の証拠になる形にした。**
+  `OptimizerTest.OrderedOuterDiscountsTheIndexProbeIntoAWin`。同じ100行の
+  外側を2つ作り、片方だけ join キーに索引を持たせる（⇒ その外側だけが
+  索引順を供給できる）。フィルタ後の外側20行・内側37行（一意キー）では
+    - 順序あり probe = 0.75\*20 + 20 + 20 = 55
+    - 最良の hash 向き = 37 + 20 = 57（逆向きは 20 + 37 + 8.5 = 65.5）
+    - 順序なし probe = 20\*2 + 20 = 60
+  なので、順序ありだけが index join を選ぶ。`Index Join` の有無で判定し、
+  両者の出力行が一致することも確認（割引は形状だけを変える）。係数を 1.0 に
+  戻す変異で落ちる。
+- **[残りのレバー]** 子グループに「probe キー順」を *要求* していないので、
+  割引は「最安の外側計画がたまたま順序を供給する」ときだけ効く。結合の子に
+  interesting order を要求する仕組み（`PhysicalProperties` の ordering
+  requirement を join の子へ渡す）は未実装。実行器側も
+  `BPlusTree::Read` の `hint_leaf` を read 経路へ通していないため、現在の
+  効果はキャッシュ局所性に限られる（根からの下降を実際に省くのは別作業）。
 
 ## 2026-10-19 LookupJoin の unique 内側短絡
 
