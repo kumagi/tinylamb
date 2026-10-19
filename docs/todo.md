@@ -343,7 +343,25 @@ Cascades rule / cost / statistics
       既知の残り: 交差表は `BitmapHeapScan` と同じく位置列を全件メモリに
       持つ（両経路共通の予算化は別項目）。
 - [x] NestedLoopIndexJoinのprefetchを実装する。
-- [ ] 内側filterをindexへ適用できない場合にheap側へ残す契約を明示する。
+- [x] 内側filterをindexへ適用できない場合にheap側へ残す契約を明示する。
+      `LookupJoin` は右の子 plan を完全にバイパスして生テーブルを index で
+      probe するため、以前は「右の scan group に filter があるなら index join
+      形状を出さない」という保守ゲートで応えていた。契約を改めた: **index が
+      表現できない内側 filter は拒否理由ではなく、residual が運ぶ conjunct**。
+      `JoinAlternatives`(`plan/implementation_rules.cpp`)で
+      (a) ゲートを撤去し (b) residual の供給元を「probe が確定しなかった
+      join 述語 conjunct」だけに狭めず、**probe がバイパスする右の子 plan に
+      押し込まれた conjunct と、内側 relation の scan group filter** も加えた
+      (ToString で重複排除)。
+      既に適用済みという印 `pushed` は**左の子だけ**(=この実行器が消費する子)。
+      結合結果は右の全カラムを持つので、内側 conjunct はそこで元の意味のまま
+      評価される。付け加えるのは元の WHERE の conjunct だけなので、誤って
+      含める方向にしか動かない(安全)。
+      回帰: `OptimizerTest.FilteredSelfJoinStillPlansThroughTheIndexNestedLoop`
+      (hash/NL を無効化して probe 形状を強制し、`b.c3 > 107` が結果を決める
+      ことを固定。旧ゲートを戻すと「Index Join なし」で落ちる)。
+      既知の残り: 内側 filter の conjunct を probe の seek range へ出す
+      (定数 bound を先頭キーへ載せる)最適化は未実装 —— 現状は全部 residual。
 - [ ] unique内側の1行lookup短絡を実装する。
 - [ ] ソート済み外側からのlookup localityをcost化する。
 

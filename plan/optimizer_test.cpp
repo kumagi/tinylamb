@@ -3462,6 +3462,50 @@ TEST_F(OptimizerTest, FilteredSelfJoinKeepsRightSidePredicate) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, FilteredSelfJoinStillPlansThroughTheIndexNestedLoop) {
+  // The index nested-loop bypasses its right child plan, so a filter merged
+  // into the right scan group is not enforced by that child. The rule used to
+  // refuse the shape outright; it now carries the inner filter into the
+  // residual instead. With hash/NL joins disabled this is the only join left,
+  // so it pins both halves of that contract at once: the plan really is the
+  // probe, and the filter still decides the rows.
+  QueryData query{
+      {"a", "b"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp(ColumnName("a", "c1")),
+                              BinaryOperation::kEquals,
+                              ColumnValueExp(ColumnName("b", "c1"))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp(ColumnName("b", "c3")),
+                              BinaryOperation::kGreaterThan,
+                              ConstantValueExp(Value(107.0)))),
+      {NamedExpression("ac3", ColumnValueExp(ColumnName("a", "c3")))}};
+  query.aliases_ = {{"a", "Sc1"}, {"b", "Sc1"}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  OptimizerOptions options = OptimizerOptions::Default();
+  options.disabled_implementation_rules = {"hash_join", "nested_loop_join"};
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan,
+                        Optimizer::Optimize(query, context, options));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("Index Join"), std::string::npos) << dump.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  std::vector<double> sums;
+  while (executor->Next(&row, nullptr)) {
+    sums.push_back(row[0].value.double_value);
+  }
+  std::sort(sums.begin(), sums.end());
+  // b.c3 > 107 pins b.c1 to {98, 99}; the equality join copies those to a.
+  // Without the inner filter carried into the residual the probe would also
+  // return every lower key, so this vector IS the filter's evidence.
+  EXPECT_EQ(sums, (std::vector<double>{107.9, 108.9}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, AliasedSelfJoinCanUseIndexNestedLoop) {
   // Phase 8 follow-up: with hash/NL joins disabled the aliased self-join
   // must still plan through the index nested-loop path, which resolves keys
@@ -3510,12 +3554,10 @@ TEST_F(OptimizerTest, AliasedSelfJoinCanUseIndexNestedLoop) {
 // it must carry everything the probe does not decide.
 //
 // The rule is applied directly (not through the full memo exploration) so the
-// test pins the rule's own contract. The memo path cannot reach it for a plain
-// nullable equi-join: the expression rewrite's null-safety inference turns
-// `l.x = r.a` into `l.x = r.a AND l.x IS NOT NULL AND r.a IS NOT NULL`, both
-// inferred conjuncts get pushed into the scan groups, and the rule refuses any
-// index whose right scan group carries a filter (see
-// FilteredSelfJoinKeepsRightSidePredicate).
+// test pins the rule's own contract. The memo path reaches the same rule
+// through FilteredSelfJoinStillPlansThroughTheIndexNestedLoop, which shows the
+// inferred null-safety conjuncts no longer disqualify an index whose right
+// scan group carries a filter.
 TEST_F(OptimizerTest, IndexJoinRulePushesOneRangeBoundIntoTheProbe) {
   TransactionContext setup = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(

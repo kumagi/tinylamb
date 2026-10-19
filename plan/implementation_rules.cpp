@@ -2253,178 +2253,206 @@ std::vector<PlanAlternative> JoinAlternatives(
     const Table* right_table = right.plan->ScanSource();
     if (right_table != nullptr) {
       // The index nested-loop executor bypasses the right child plan entirely
-      // and probes the raw table through its index. A filter merged into the
-      // right scan group is implemented by that child plan, so offering an
-      // index join here would silently drop it; hash/NL joins consume the
-      // child executor and stay safe.
-      if (!memo.Get(right_group).filter) {
-        // Locate the relation key owning this physical table: aliased
-        // self-joins rename scan schemas, and statistics are keyed by the
-        // relation identity.
-        std::string right_relation;
-        for (const auto& [relation, table] : context.tables) {
-          if (table.get() == right_table) {
-            right_relation = relation;
-            break;
+      // and probes the raw table through its index, so anything that child
+      // plan would have filtered has to be enforced HERE instead.  That is the
+      // contract: an inner filter the index probe cannot express is not a
+      // reason to refuse the shape, it is a conjunct the residual carries.
+      //
+      // Locate the relation key owning this physical table: aliased
+      // self-joins rename scan schemas, and statistics are keyed by the
+      // relation identity.
+      std::string right_relation;
+      for (const auto& [relation, table] : context.tables) {
+        if (table.get() == right_table) {
+          right_relation = relation;
+          break;
+        }
+      }
+      const auto stats_it = right_relation.empty()
+                                ? context.statistics.end()
+                                : context.statistics.find(right_relation);
+      if (stats_it != context.statistics.end()) {
+        const Schema& physical_schema = right_table->GetSchema();
+        const auto to_physical = [&](const ColumnName& column) {
+          if (column.schema == right_relation &&
+              right_relation != std::string(physical_schema.Name())) {
+            return ColumnName(physical_schema.Name(), column.name);
+          }
+          return column;
+        };
+        // Declared output renames the full-width right side so the raw
+        // rows emitted by the executor stay positionally aligned with the
+        // schema consumed above us.
+        std::vector<Column> renamed_columns;
+        renamed_columns.reserve(physical_schema.ColumnCount());
+        for (size_t i = 0; i < physical_schema.ColumnCount(); ++i) {
+          Column col = physical_schema.GetColumn(i);
+          col.Name() = ColumnName(right_relation, col.Name().name);
+          renamed_columns.push_back(std::move(col));
+        }
+        const Schema declared_output =
+            left.plan->GetSchema() + Schema("", std::move(renamed_columns));
+        std::vector<ColumnName> right_physical;
+        right_physical.reserve(right_columns.size());
+        for (const ColumnName& c : right_columns) {
+          right_physical.push_back(to_physical(c));
+        }
+        // Every conjunct of the join predicate. The probe decides only a
+        // prefix of them, so this is also the source of the residual that
+        // restores the rest.
+        const std::vector<Expression> all_conjuncts =
+            predicate ? SplitConjuncts(predicate) : std::vector<Expression>{};
+        // Only the LEFT child is consumed by this executor, so only its
+        // pushed conjuncts are genuinely already applied.  A conjunct
+        // pushed into the RIGHT child plan is NOT: the probe bypasses that
+        // plan, so skipping it here would silently answer a different
+        // query.
+        std::unordered_set<std::string> pushed;
+        for (const Expression& conjunct : left_pushed) {
+          pushed.insert(conjunct->ToString());
+        }
+        // Everything this executor still has to enforce itself, from three
+        // sources: the join predicate's own conjuncts, the conjuncts pushed
+        // into the bypassed right child plan, and the inner relation's
+        // scan-group filter.  The joined row carries every right column
+        // (declared_output renames them under the right relation), so an
+        // inner conjunct evaluates on it exactly as it would on the child.
+        // Deduplicated because the same conjunct commonly arrives by two
+        // of these routes.
+        std::vector<Expression> residual_pool = all_conjuncts;
+        std::unordered_set<std::string> pooled;
+        for (const Expression& conjunct : all_conjuncts) {
+          pooled.insert(conjunct->ToString());
+        }
+        const auto pool = [&residual_pool,
+                           &pooled](const Expression& conjunct) {
+          if (!conjunct) {
+            return;
+          }
+          if (pooled.insert(conjunct->ToString()).second) {
+            residual_pool.push_back(conjunct);
+          }
+        };
+        for (const Expression& conjunct : right_pushed) {
+          pool(conjunct);
+        }
+        if (const Expression& inner_filter = memo.Get(right_group).filter;
+            inner_filter) {
+          for (const Expression& conjunct : SplitConjuncts(inner_filter)) {
+            pool(conjunct);
           }
         }
-        const auto stats_it = right_relation.empty()
-                                  ? context.statistics.end()
-                                  : context.statistics.find(right_relation);
-        if (stats_it != context.statistics.end()) {
-          const Schema& physical_schema = right_table->GetSchema();
-          const auto to_physical = [&](const ColumnName& column) {
-            if (column.schema == right_relation &&
-                right_relation != std::string(physical_schema.Name())) {
-              return ColumnName(physical_schema.Name(), column.name);
-            }
-            return column;
-          };
-          // Declared output renames the full-width right side so the raw
-          // rows emitted by the executor stay positionally aligned with the
-          // schema consumed above us.
-          std::vector<Column> renamed_columns;
-          renamed_columns.reserve(physical_schema.ColumnCount());
-          for (size_t i = 0; i < physical_schema.ColumnCount(); ++i) {
-            Column col = physical_schema.GetColumn(i);
-            col.Name() = ColumnName(right_relation, col.Name().name);
-            renamed_columns.push_back(std::move(col));
+        for (size_t i = 0; i < right_table->IndexCount(); ++i) {
+          const Index& index_handle = right_table->GetIndex(i);
+          // Equality prefix in the index's own key order. Deriving it (rather
+          // than reusing the equi-join's key order) is what makes a
+          // composite index usable when only some of its key columns are
+          // join keys: the seek key has to be a prefix of the stored key
+          // image, not an unrelated byte range.
+          std::optional<LookupSeek> probe = DeriveLookupSeek(
+              index_handle, physical_schema, right_physical, left_columns);
+          if (!probe) {
+            continue;
           }
-          const Schema declared_output =
-              left.plan->GetSchema() + Schema("", std::move(renamed_columns));
-          std::vector<ColumnName> right_physical;
-          right_physical.reserve(right_columns.size());
-          for (const ColumnName& c : right_columns) {
-            right_physical.push_back(to_physical(c));
-          }
-          // Every conjunct of the join predicate. The probe decides only a
-          // prefix of them, so this is also the source of the residual that
-          // restores the rest.
-          const std::vector<Expression> all_conjuncts =
-              predicate ? SplitConjuncts(predicate) : std::vector<Expression>{};
-          // Single-side conjuncts were already moved below the join; keeping
-          // them in the residual would evaluate them twice.
-          std::unordered_set<std::string> pushed;
-          for (const std::vector<Expression>* side :
-               {&left_pushed, &right_pushed}) {
-            for (const Expression& conjunct : *side) {
-              pushed.insert(conjunct->ToString());
+          // Conjuncts this probe decides by itself: the pinned prefix
+          // equalities, plus the range bound below when it is admissible.
+          std::unordered_set<std::string> enforced;
+          for (const ColumnName& key_column : probe->right_columns) {
+            const auto equality = std::ranges::find_if(
+                equalities,
+                [&](const std::pair<ColumnName, ColumnName>& entry) {
+                  return to_physical(entry.second) == key_column;
+                });
+            if (equality != equalities.end()) {
+              enforced.insert(equi_conjuncts[static_cast<size_t>(
+                                                 equality - equalities.begin())]
+                                  ->ToString());
             }
           }
-          for (size_t i = 0; i < right_table->IndexCount(); ++i) {
-            const Index& index_handle = right_table->GetIndex(i);
-            // Equality prefix in the index's own key order. Deriving it (rather
-            // than reusing the equi-join's key order) is what makes a
-            // composite index usable when only some of its key columns are
-            // join keys: the seek key has to be a prefix of the stored key
-            // image, not an unrelated byte range.
-            std::optional<LookupSeek> probe = DeriveLookupSeek(
-                index_handle, physical_schema, right_physical, left_columns);
-            if (!probe) {
+          // Range bounds on the first index key column the equality prefix
+          // leaves open: at most one lower and one upper conjunct (an
+          // interval probe). SetLookupRange rejects the shapes that cannot
+          // be probed safely (a later key column, mismatched operand types,
+          // a type outside the range whitelist) and the conjunct then simply
+          // stays in the residual predicate below: an explicit fallback,
+          // never a silently dropped one.
+          std::vector<LookupRangeCandidate> ranges;
+          auto range_key_slot = slot_t{0};
+          const size_t prefix_len = probe->right_columns.size();
+          if (prefix_len < index_handle.sc_.key_.size()) {
+            const slot_t next_key = index_handle.sc_.key_[prefix_len];
+            if (next_key < physical_schema.ColumnCount()) {
+              const ColumnName& key_physical =
+                  physical_schema.GetColumn(next_key).Name();
+              ranges = FindLookupRanges(
+                  all_conjuncts, left.plan->GetSchema(),
+                  right.plan->GetSchema(),
+                  ColumnName(right_relation, key_physical.name), key_physical);
+              range_key_slot = next_key;
+            }
+          }
+          const bool point_probe =
+              ranges.empty() && prefix_len == index_handle.sc_.key_.size();
+          // A unique index caps the output at the left row count only for a
+          // point probe on the complete key; with a range bound (or a prefix
+          // shorter than the key) one left row can still match several right
+          // rows.
+          std::optional<size_t> index_rows = equi_rows;
+          if (point_probe && index_handle.IsUnique() &&
+              index_rows.has_value()) {
+            index_rows = std::min(*index_rows, RowEstimate(l_rows));
+          }
+          Plan join = std::make_shared<ProductPlan>(
+              left_child, left_columns, *right_table, index_handle,
+              right_physical, *stats_it->second, declared_output, index_rows);
+          bool range_adopted = false;
+          for (const LookupRangeCandidate& range : ranges) {
+            if (static_cast<ProductPlan&>(*join).SetLookupRange(
+                    prefix_len, range.left_column, range.right_physical,
+                    range.operation)) {
+              range_adopted = true;
+              enforced.insert(range.conjunct->ToString());
+            }
+          }
+          // Everything the probe does not decide, and that this
+          // executor is not already applying through a child it consumes,
+          // becomes the residual predicate. This is where a second range
+          // column, an equality on a non-key column, a range the whitelist
+          // rejected and the inner relation's whole filter all end up: the
+          // probe over-fetches and the predicate decides the rows.
+          std::vector<Expression> lookup_residual;
+          for (const Expression& conjunct : residual_pool) {
+            const std::string printed = conjunct->ToString();
+            if (enforced.contains(printed) || pushed.contains(printed)) {
               continue;
             }
-            // Conjuncts this probe decides by itself: the pinned prefix
-            // equalities, plus the range bound below when it is admissible.
-            std::unordered_set<std::string> enforced;
-            for (const ColumnName& key_column : probe->right_columns) {
-              const auto equality = std::ranges::find_if(
-                  equalities,
-                  [&](const std::pair<ColumnName, ColumnName>& entry) {
-                    return to_physical(entry.second) == key_column;
-                  });
-              if (equality != equalities.end()) {
-                enforced.insert(
-                    equi_conjuncts[static_cast<size_t>(equality -
-                                                       equalities.begin())]
-                        ->ToString());
-              }
-            }
-            // Range bounds on the first index key column the equality prefix
-            // leaves open: at most one lower and one upper conjunct (an
-            // interval probe). SetLookupRange rejects the shapes that cannot
-            // be probed safely (a later key column, mismatched operand types,
-            // a type outside the range whitelist) and the conjunct then simply
-            // stays in the residual predicate below: an explicit fallback,
-            // never a silently dropped one.
-            std::vector<LookupRangeCandidate> ranges;
-            auto range_key_slot = slot_t{0};
-            const size_t prefix_len = probe->right_columns.size();
-            if (prefix_len < index_handle.sc_.key_.size()) {
-              const slot_t next_key = index_handle.sc_.key_[prefix_len];
-              if (next_key < physical_schema.ColumnCount()) {
-                const ColumnName& key_physical =
-                    physical_schema.GetColumn(next_key).Name();
-                ranges = FindLookupRanges(
-                    all_conjuncts, left.plan->GetSchema(),
-                    right.plan->GetSchema(),
-                    ColumnName(right_relation, key_physical.name),
-                    key_physical);
-                range_key_slot = next_key;
-              }
-            }
-            const bool point_probe =
-                ranges.empty() && prefix_len == index_handle.sc_.key_.size();
-            // A unique index caps the output at the left row count only for a
-            // point probe on the complete key; with a range bound (or a prefix
-            // shorter than the key) one left row can still match several right
-            // rows.
-            std::optional<size_t> index_rows = equi_rows;
-            if (point_probe && index_handle.IsUnique() &&
-                index_rows.has_value()) {
-              index_rows = std::min(*index_rows, RowEstimate(l_rows));
-            }
-            Plan join = std::make_shared<ProductPlan>(
-                left_child, left_columns, *right_table, index_handle,
-                right_physical, *stats_it->second, declared_output, index_rows);
-            bool range_adopted = false;
-            for (const LookupRangeCandidate& range : ranges) {
-              if (static_cast<ProductPlan&>(*join).SetLookupRange(
-                      prefix_len, range.left_column, range.right_physical,
-                      range.operation)) {
-                range_adopted = true;
-                enforced.insert(range.conjunct->ToString());
-              }
-            }
-            // Everything the probe does not decide, and that was not already
-            // pushed below the join, becomes the residual predicate. This is
-            // where a second range column, an equality on a non-key column and
-            // a range the whitelist rejected all end up: the probe over-fetches
-            // and the predicate decides the rows.
-            std::vector<Expression> lookup_residual;
-            for (const Expression& conjunct : all_conjuncts) {
-              const std::string printed = conjunct->ToString();
-              if (enforced.contains(printed) || pushed.contains(printed)) {
-                continue;
-              }
-              lookup_residual.push_back(conjunct);
-            }
-            Plan lookup_plan = std::move(join);
-            if (!lookup_residual.empty()) {
-              lookup_plan = std::make_shared<SelectionPlan>(
-                  lookup_plan, CombineConjuncts(lookup_residual),
-                  lookup_plan->GetStats());
-            }
-            // One B+Tree probe plus row assembly per left row, plus the rows
-            // the probe is expected to hand back. A range bound turns the
-            // point probe into a range walk over the heap, so it pays the same
-            // clustering penalty the range-sliced index scan applies
-            // (see RangeClusteringPenalty).
-            double local_cost = (l_rows * 2.0) + equi_estimate;
-            if (range_adopted) {
-              local_cost = std::max(
-                  1.0, local_cost * RangeClusteringPenalty(*stats_it->second,
-                                                           range_key_slot));
-            }
-            // Read the estimate before the move: designated initializers are
-            // evaluated in declaration order, so `.plan = std::move(...)` runs
-            // before a later member's initializer would touch the plan.
-            const auto lookup_rows =
-                static_cast<double>(lookup_plan->EmitRowCount());
-            candidates.push_back(
-                PlanAlternative{.plan = std::move(lookup_plan),
-                                .local_cost = local_cost,
-                                .estimated_rows = lookup_rows});
+            lookup_residual.push_back(conjunct);
           }
+          Plan lookup_plan = std::move(join);
+          if (!lookup_residual.empty()) {
+            lookup_plan = std::make_shared<SelectionPlan>(
+                lookup_plan, CombineConjuncts(lookup_residual),
+                lookup_plan->GetStats());
+          }
+          // One B+Tree probe plus row assembly per left row, plus the rows
+          // the probe is expected to hand back. A range bound turns the
+          // point probe into a range walk over the heap, so it pays the same
+          // clustering penalty the range-sliced index scan applies
+          // (see RangeClusteringPenalty).
+          double local_cost = (l_rows * 2.0) + equi_estimate;
+          if (range_adopted) {
+            local_cost = std::max(
+                1.0, local_cost * RangeClusteringPenalty(*stats_it->second,
+                                                         range_key_slot));
+          }
+          // Read the estimate before the move: designated initializers are
+          // evaluated in declaration order, so `.plan = std::move(...)` runs
+          // before a later member's initializer would touch the plan.
+          const auto lookup_rows =
+              static_cast<double>(lookup_plan->EmitRowCount());
+          candidates.push_back(PlanAlternative{.plan = std::move(lookup_plan),
+                                               .local_cost = local_cost,
+                                               .estimated_rows = lookup_rows});
         }
       }
     }

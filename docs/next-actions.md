@@ -1,16 +1,54 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-19 加筆(第36報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
+Path)の次項目: **内側filterを index へ適用できない場合に heap 側へ残す契約**。
+詳細は下記「2026-10-19 LookupJoin の内側 filter 契約」の節。
+
 2026-10-19 加筆(第35報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-19 LookupJoin の内側 filter 契約
+
+- **[旧ゲート] 右の scan group に filter があれば index join 形状を出さない。**
+  `LookupJoin` は右の子 plan を完全にバイパスして生テーブルを index で probe
+  するため、右の子に載っている filter は実行されない。旧コメントはこれを
+  「黙って落ちる」事情として形状ごと拒否していた。実際には
+  `push_selection_through_join` / `split_selection_over_join` は conjunct を
+  scan group へ**併記**するだけで join の Selection からは落とさないので、
+  gate が守っていた bug は現状発火しない。つまりこれは**過剰に保守的な拒否**で、
+  そのせいで nullable equi-join(NULL 安全性の推論が
+  `l.x = r.a AND l.x IS NOT NULL AND r.a IS NOT NULL` を打ち込む形)は
+  index nested-loop に到達できていなかった。
+- **[新契約] 拒否理由ではなく residual の積荷。** gate を撤去し、
+  residual の供給元を 3 系統に広げた:
+  1. probe が確定しなかった join 述語の conjunct(従来どおり)
+  2. **右の子 plan に押し込まれた conjunct** —— probe はその子を消費しない
+  3. **内側 relation の scan group filter**
+
+  既に適用済みという印 `pushed` は**左の子だけ**にした(右の子はバイパス
+  されるので「消費済み」に数えてはいけない)。結合結果は右の全カラムを持つ
+  ので、内側 conjunct はそこで元の意味のまま評価される。付け加える conjunct
+  はすべて元の WHERE 由来なので、誤って行を**含める**方向にしか動かない
+  ——既存の結果が悪化しないことが構成上保証される。
+- **[回帰]** `OptimizerTest.FilteredSelfJoinStillPlansThroughTheIndexNestedLoop`
+  (hash/NL を無効化して probe 形状を強制。旧ゲートを戻すと「Index Join なし」
+  で落ちる)。既存の `FilteredSelfJoinKeepsRightSidePredicate` は「どの join
+  が勝っても結果は同じ」という契約としてそのまま green。
+- **[残りのレバー]** 内側 filter の conjunct を probe の seek range へ出す
+  (定数 bound を先頭キーへ載せる)最適化は**未実装**。現状は全部 residual に
+  落ちるので、probe は少数の index range を読むが inner rows は全部
+  materialize される。
+- **検証**: 全 ctest **3940/3940 合格**(意図的 skip 3)。`check_layering.py`
+  成功(allowlist 65辺)。clang-format 済。
 
 ## 2026-10-19 複数インデックス covering scan の成果
 
 - **[方針] どの1本も被覆しないなら、2本を束ねて被覆する**。既に
   `IndexOnlyScanPlan` が「1本のインデックス(キー+INCLUDE)が述語列と出力列を
   被覆する」場合を面倒見ていた。残っていたのは **どれも単独では被覆しない**
-  形で、`MultiIndexCoveringScanPlan`(`plan/multi_index_covering_scan_plan.*`)
+  形。`MultiIndexCoveringScanPlan`(`plan/multi_index_covering_scan_plan.*`)
   と `executor/multi_index_covering_scan.*` を追加した。
 - **[plan] 参加者は「先頭キー列に範囲を1つ持つ非保持インデックス」1本ずつ。**
   最小被覆は貪欲法、他の参加者が既に持つ被覆列しかない参加者は削除(1本だけ
