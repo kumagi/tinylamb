@@ -13,10 +13,47 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 下記「2026-10-19 lookup locality の cost 化」の節。Scan / Access Path の
 `[ ]` は `ForeignScan`(保留)のみになった。
 
+2026-10-19 加筆(第39報)。統合TODO(`docs/todo.md` Phase 2 Window / UNNEST /
+生成)の次項目: **Window の hash partition + sort**。詳細は下記
+「2026-10-19 Window の hash 区画化」の節。
+
 2026-10-19 加筆(第35報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-19 Window の hash 区画化
+
+- **[課題] 区画分けが見つけた順の代表キー線形走査だった。**
+  `BuildWindowOrderLayout` は行ごとに「これまでに見つけた代表キー」を前から
+  比較し、一致しなければ新規グループにしていた（O(行 × 区画数)）。全表に対する
+  顧客ごとの RANK のような「小さな区画が大量」の形ではこれが支配項になる。
+- **[修正] 代表キータプルをハッシュ表で引く。**
+  `std::unordered_map<std::vector<Value>, size_t, PartitionKeyHash,
+  PartitionKeyEq>`。グループは初出順に `partitions` へ push するので
+  **レイアウトも出力位置も旧実装と同一**で、探索だけが期待 O(1) になる。
+  区画内の並べ替え（事前評価した `order_values` + `peer_end` + `stable_sort`）は
+  変更なし。つまり TODO の "sort" 半分は既にあり、"hash partition" 半分が
+  これで入った。
+- **[契約] ハッシュは等価性と一方向に整合していればよい。**
+  等価判定は `ValuesEqual` のまま:
+    - NULL 同士は同一区画（SQL では `NULL = NULL` は unknown だが区画は同じ）
+    - 全 NaN が1つの peer group
+    - interval 風テキストは interval として比較（`EqualsSlow`）
+  ハッシュは `std::hash<Value>` で、同じく NULL を1パターンに、NaN を正規化し、
+  interval テキストを parse してハッシュするので「等しい値 ⇒ 等しいハッシュ」が
+  成り立つ。逆向きは不要で、衝突（同じビット列の INT64 と UINT64 など）は
+  `PartitionKeyEq` が弾くので区画が混ざることはない。
+- **[回帰] `query/sql_extra_test.cpp` の 2 件。**
+  `InterleavedPartitionsKeepTheirOwnFrames`: 400 行 / 50 グループを
+  `g = i % 50` で非連続に置き、各行の `COUNT(*) OVER (PARTITION BY g)` が 8、
+  `SUM` が `8g + 1400`、`ROW_NUMBER` が自分のグループ内順位であることを固定。
+  `NullAndNanPartitionKeysEachFormOneGroup`: NULL 3 行が1区画、NaN 2 行が
+  1区画であることを `COUNT`/`SUM` の2つの window で固定。
+  グループを再利用しない変異（毎行を新規区画にする）で両方が落ちることを確認。
+- **[残りのレバー]** 次項の Window spill。区画化はメモリ常駐前提で、行も
+  区画も予算を持たない。`order_values` の事前評価は区画あたり O(行 log 行) の
+  並べ替えを軽くしているが、メモリは減らさない。
 
 ## 2026-10-19 lookup locality の cost 化
 

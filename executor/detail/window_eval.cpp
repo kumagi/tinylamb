@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <memory>
@@ -245,6 +246,38 @@ bool ValuesEqual(const Value& a, const Value& b) {
     return false;
   }
 }
+
+// Hash of a PARTITION BY key tuple. It only has to agree with ValuesEqual in
+// the safe direction -- equal tuples must hash equally -- which is exactly the
+// canonicalization std::hash<Value> already applies: NULL is one pattern, NaN
+// folds to one pattern, and interval-shaped text hashes as the interval it
+// renders. A collision (an INT64 and a UINT64 sharing bits, say) is harmless
+// because PartitionKeyEq still decides.
+struct PartitionKeyHash {
+  size_t operator()(const std::vector<Value>& key) const {
+    uint64_t hash = 0x9e3779b97f4a7c15ULL;
+    for (const Value& value : key) {
+      hash ^= std::hash<Value>()(value) + 0x9e3779b97f4a7c15ULL + (hash << 6) +
+              (hash >> 2);
+    }
+    return static_cast<size_t>(hash);
+  }
+};
+
+struct PartitionKeyEq {
+  bool operator()(const std::vector<Value>& a,
+                  const std::vector<Value>& b) const {
+    if (a.size() != b.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (!ValuesEqual(a[i], b[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
 
 double NumericOf(const Value& value) {
   if (value.type == ValueType::kDouble) {
@@ -1804,7 +1837,19 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
     const WindowFunctionCallExpression& window, std::vector<Row>& rows,
     const WindowRuntime& runtime) {
   WindowOrderLayout layout;
-  std::vector<std::vector<Value>> partition_keys;
+  // Group the rows by their PARTITION BY tuple through a hash table. The
+  // groups are appended in first-seen order, so the layout (and therefore every
+  // output position) is the same as a scan that searched the groups found so
+  // far; only the search is O(1) instead of O(partitions). A window over many
+  // small partitions -- a per-customer rank over a whole sales table -- made
+  // that linear search the dominant term.
+  //
+  // Equality stays ValuesEqual (see PartitionKeyEq): SQL says every NULL is in
+  // the same partition even though NULL != NULL, every NaN is one peer group,
+  // and interval-shaped text partitions by the interval it renders.
+  std::unordered_map<std::vector<Value>, size_t, PartitionKeyHash,
+                     PartitionKeyEq>
+      groups;
   for (size_t i = 0; i < rows.size(); ++i) {
     std::vector<Value> keys;
     keys.reserve(window.partition_by.size());
@@ -1812,24 +1857,12 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
       ASSIGN_OR_RETURN(Value, partition_key, (runtime.EvalAt(key, rows, i)));
       keys.push_back(std::move(partition_key));
     }
-    size_t group = layout.partitions.size();
-    for (size_t g = 0; g < partition_keys.size(); ++g) {
-      bool equal = partition_keys[g].size() == keys.size();
-      for (size_t t = 0; equal && t < keys.size(); ++t) {
-        if (!ValuesEqual(partition_keys[g][t], keys[t])) {
-          equal = false;
-        }
-      }
-      if (equal) {
-        group = g;
-        break;
-      }
-    }
-    if (group == layout.partitions.size()) {
+    const auto [entry, inserted] =
+        groups.try_emplace(std::move(keys), layout.partitions.size());
+    if (inserted) {
       layout.partitions.emplace_back();
-      partition_keys.push_back(std::move(keys));
     }
-    layout.partitions[group].ordered.push_back(i);
+    layout.partitions[entry->second].ordered.push_back(i);
   }
 
   for (WindowPartitionLayout& partition : layout.partitions) {

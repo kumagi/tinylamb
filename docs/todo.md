@@ -432,7 +432,24 @@ Cascades rule / cost / statistics
 - [x] `WindowAggPlan` / `WindowExecutor` を専用plan・executorとして実装する。
 - [x] GROUPS frameのpeer group境界を修正する。
 - [x] EXCLUDE CURRENT ROW / GROUP / TIESを修正する。
-- [ ] Windowのhash partition + sortを実装する。
+- [x] Windowのhash partition + sortを実装する。
+      `BuildWindowOrderLayout` は PARTITION BY のグループを「見つけた順に並んだ
+      代表キーを線形走査」で決めていた（行×グループ）。代表キーのタプルを
+      `std::unordered_map`（キー `std::vector<Value>`）で引くよう変更:
+      グループの生成順は初出順のままなので、`partitions` と出力位置は不変で、
+      探索だけが O(1) になる。内側の並べ替え（`std::stable_sort` + 事前評価した
+      `order_values` と peer 境界）はそのまま。
+      **ハッシュと等価性の契約**を明示: 等価判定は `ValuesEqual`（NULL 同士は
+      同一パーティション、NaN は1つの peer group、interval 風テキストは interval
+      として比較）で、ハッシュは `std::hash<Value>`（同じく NULL/NaN を
+      正規化し、interval テキストを parse してハッシュする）。等しい値が
+      等しくハッシュされる方向さえ守ればよく、衝突（INT64 と UINT64 が同じ
+      ビット列）は `PartitionKeyEq` が弾くので無害。
+      回帰: `WindowSqlTest.InterleavedPartitionsKeepTheirOwnFrames`（400行/50
+      グループを非連続に配置し、各区画が自分のフレーム全体を見ることを固定）と
+      `WindowSqlTest.NullAndNanPartitionKeysEachFormOneGroup`（NULL 3行が1区画・
+      NaN 2行が1区画）。グループを再利用しない変異で両方が落ちる。
+      既知の残り: 次項の Window spill（区画とソート状態のメモリ予算化）。
 - [ ] Windowのspillを実装する。
 - [ ] `FunctionScan` / TVFを実装する。
 - [x] `GenerateSeriesExecutor` と `GENERATE_SERIES` のSQL接続を実装する。

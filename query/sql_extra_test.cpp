@@ -322,6 +322,66 @@ TEST_F(WindowSqlTest, RankingFamilyMatchesPeerGroups) {
             (Row({Value(1), Value(1), Value(1), Value(0.0), Value(1.0)})));
 }
 
+// Regression for the hashed partition grouping: the rows of one group must be
+// collected wherever they sit in the input. 400 rows over 50 groups, laid out
+// so no group's rows are contiguous, and every row of a group must see the
+// whole group (a grouping that keyed on adjacency, or that let a hash
+// collision merge two groups, would report a short frame here).
+TEST_F(WindowSqlTest, InterleavedPartitionsKeepTheirOwnFrames) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE wide (g INT64, v INT64);");
+  std::string insert = "INSERT INTO wide VALUES ";
+  for (int i = 0; i < 400; ++i) {
+    if (i != 0) {
+      insert += ", ";
+    }
+    insert += "(" + std::to_string(i % 50) + ", " + std::to_string(i) + ")";
+  }
+  insert += ";";
+  RunSql(engine_.get(), context_.get(), insert);
+
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT g, COUNT(*) OVER (PARTITION BY g), SUM(v) OVER (PARTITION BY g), "
+      "ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) FROM wide "
+      "ORDER BY g, v;");
+  ASSERT_EQ(rows.size(), 400U);
+  // ORDER BY g, v: row i is the (i%8)-th member of group i/8, and group g
+  // holds v = g + 50*j for j in [0, 8), so sum = 8g + 50*(0+..+7).
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const int64_t g = static_cast<int64_t>(i / 8);
+    const int64_t member = static_cast<int64_t>(i % 8);
+    EXPECT_EQ(rows[i][0], Value(g)) << "row " << i;
+    EXPECT_EQ(rows[i][1], Value(int64_t{8})) << "row " << i;
+    EXPECT_EQ(rows[i][2], Value(8 * g + 1400)) << "row " << i;
+    EXPECT_EQ(rows[i][3], Value(member + 1)) << "row " << i;
+  }
+}
+
+// A PARTITION BY key follows SQL equality, not value identity.  Every NULL
+// forms one partition even though NULL = NULL is unknown, and every NaN forms
+// one peer group.  The hash has to canonicalize both the same way the equality
+// does, or the table would split a group that belongs together.
+TEST_F(WindowSqlTest, NullAndNanPartitionKeysEachFormOneGroup) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE wn (g INT64, f FLOAT64, v INT64);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO wn VALUES (NULL, 1.5, 1), (NULL, CAST('NaN' AS FLOAT64), "
+         "2), (7, 1.5, 4), (NULL, CAST('NaN' AS FLOAT64), 8);");
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT COUNT(*) OVER (PARTITION BY g), SUM(v) OVER (PARTITION BY g), "
+      "COUNT(*) OVER (PARTITION BY f), SUM(v) OVER (PARTITION BY f) "
+      "FROM wn ORDER BY v;");
+  ASSERT_EQ(rows.size(), 4U);
+  // v order is 1, 2, 4, 8. Three rows share the NULL g partition (v sum 11)
+  // and the single g=7 row is alone; the NaN f partition is {v=2, v=8}.
+  EXPECT_EQ(rows[0], (Row({Value(3), Value(11), Value(2), Value(5)})));
+  EXPECT_EQ(rows[1], (Row({Value(3), Value(11), Value(2), Value(10)})));
+  EXPECT_EQ(rows[2], (Row({Value(1), Value(4), Value(2), Value(5)})));
+  EXPECT_EQ(rows[3], (Row({Value(3), Value(11), Value(2), Value(10)})));
+}
+
 // Regression: the window accumulator's DOUBLE path returned the bare total
 // for AVG (TPC-DS q89 exposed it), so AVG(v) OVER (...) answered SUM(v).
 TEST_F(WindowSqlTest, AvgOverPartitionDividesByCount) {

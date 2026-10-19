@@ -104,7 +104,17 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   historical behavior. A mis-estimated shape must never change the answer, so
   every mode keeps the internal spill selection as the last resort.
 - Window: `window` (physical operator wired from `WindowPlan::EmitExecutor`)
-  over `detail/window_eval` partition/frame evaluation.
+  over `detail/window_eval` partition/frame evaluation. `BuildWindowOrderLayout`
+  groups the buffered rows by their PARTITION BY tuple through a hash table
+  (`std::unordered_map<std::vector<Value>, size_t, PartitionKeyHash,
+  PartitionKeyEq>`), so grouping is expected O(rows) instead of O(rows x
+  partitions); groups are appended in first-seen order, so the layout and every
+  output position are unchanged. Equality stays `ValuesEqual` (all NULLs are one
+  partition, all NaNs one peer group, interval-shaped text compares as the
+  interval it renders) and the hash is `std::hash<Value>`, which canonicalizes
+  the same way -- a hash collision cannot merge two partitions because
+  `PartitionKeyEq` decides. Ordering inside each partition is a `stable_sort`
+  over precomputed `order_values` with `peer_end` boundaries.
 - DML/other: `insert`, `update`, `delete`, `truncate`, `merge`, `returning`,
   `values`, `generate_series`, `unnest`, `recursive_cte`, `set_operation`,
   `merge_append`, `limit`, `max1_row`, `minmax_index`, `materialize`,
