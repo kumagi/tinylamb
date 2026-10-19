@@ -316,7 +316,32 @@ Cascades rule / cost / statistics
 - [x] LateMaterializationScanを実装する。
 - [x] BERNOULLI / SYSTEMのSampleScanを実装する。
 - [ ] ForeignScanを実装する。（2026-10-17 保留: 外部ソース形式が未定のため設計待ち。次の具体項目から着手）
-- [ ] 複数インデックスを用いたcovering判定を実装する。
+- [x] 複数インデックスを用いたcovering判定を実装する。
+      `ScanAlternatives`（`plan/implementation_rules.cpp`）が `touched` =
+      述語列 ∪ 出力列を **複数インデックス** で被覆できる場合に
+      `MultiIndexCoveringScanPlan`（`plan/multi_index_covering_scan_plan.*`）を
+      候補に出す。各参加者は先頭キー列の範囲を1つだけ持ち（範囲のない
+      インデックスは参加者にしない）、最小被覆は貪欲法で選び、
+      他の参加者が既に被覆する列しか持たない参加者は削除する（1本だけは
+      index-only 経路の担当なので残さない）。保持削除を行う
+      `kVersionedUnique` は参加者にしない（エントリが committed image で
+      ない）。`executor/multi_index_covering_scan.*` が行位置で交差を作り、
+      エントリの行ページにバージョン鎖が無ければ index image だけで行を
+      組み立て（`IndexScanIterator::TryReadIndexOnly` と同じ可視性根拠）、
+      鎖があれば heap read に落とす。**計画キャッシュが literal を
+      ParameterSlot に書き換えるため、参加者の seek キーは emit 時に
+      bound 済み述語から `ReboundIndexKeysFromPredicate` で張り直す**
+      （`IndexOnlyScanPlan::EmitExecutor` と同じ契約。これが無いと SQL 経路
+      では常に full scan にフォールバックして dead code になる）。先頭キーの
+      bound を失った参加者が1つでもあればノード全体を full scan に落とす。
+      read guard は全参加者を index root 昇順で一括取得（連結した取得順が
+      writer starvation のデッドロックを生まないため）。回帰:
+      `executor/multi_index_covering_scan_test.cpp` 9件（EXPLAIN 形状 /
+      フルスキャン結果一致 / recheck が交差を狭める向き /
+      NULL キー / 単一 covering は index-only のまま / 保持インデックスは
+      不参加 / UPDATE 後の新イメージ / 削除済み行 / 直接実行器の交差のみ）。
+      既知の残り: 交差表は `BitmapHeapScan` と同じく位置列を全件メモリに
+      持つ（両経路共通の予算化は別項目）。
 - [x] NestedLoopIndexJoinのprefetchを実装する。
 - [ ] 内側filterをindexへ適用できない場合にheap側へ残す契約を明示する。
 - [ ] unique内側の1行lookup短絡を実装する。

@@ -1,5 +1,49 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-19 加筆(第35報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
+Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
+「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
+ソース形式が未定のため保留のまま。
+
+## 2026-10-19 複数インデックス covering scan の成果
+
+- **[方針] どの1本も被覆しないなら、2本を束ねて被覆する**。既に
+  `IndexOnlyScanPlan` が「1本のインデックス(キー+INCLUDE)が述語列と出力列を
+  被覆する」場合を面倒見ていた。残っていたのは **どれも単独では被覆しない**
+  形で、`MultiIndexCoveringScanPlan`(`plan/multi_index_covering_scan_plan.*`)
+  と `executor/multi_index_covering_scan.*` を追加した。
+- **[plan] 参加者は「先頭キー列に範囲を1つ持つ非保持インデックス」1本ずつ。**
+  最小被覆は貪欲法、他の参加者が既に持つ被覆列しかない参加者は削除(1本だけ
+  残ったら index-only 経路の担当なので不発)。`kVersionedUnique`(削除エントリ
+  を保持)は committed image を保証しないので参加者にしない。
+- **[executor] 行位置で交差**し、交差集合の行を index image だけで組み立てる。
+  エントリの行ページにバージョン鎖が無ければ `TryReadIndexOnly` と同じ可視性
+  根拠で heap fetch を省き、鎖があれば snapshot 解決の heap read に落とす。
+  Cover 列はテーブル slot 順の和集合(位置で埋められる決定的 layout)。
+  範囲は「一致行の超集合」に過ぎないので、**交差後の recheck が答えを決める**
+  (短絡には決してしない)。
+- **[実装で判明した落とし穴(重要)] 計画キャッシュが literal を ParameterSlot に
+  書き換えるため、計画時の sniffed 範囲は emit 時に必ず古くできている。**
+  当初「slot があれば full scan に落とす」という `BitmapScanPlan` と同じ契約
+  にしていただけると、**EXPLAIN には MultiIndexCoveringScan が出ても SQL
+  実行時は常に full scan になり、演算子が dead code だった**。突変テスト
+  (recheck を off にした時に結果が変わらないこと)で発覚し、
+  `IndexOnlyScanPlan::EmitExecutor` と同じく **bound 済み述語から
+  `ReboundIndexKeysFromPredicate` で各参加者の seek キーを張り直す** よう
+  修正した。先頭キーの bound を失った参加者が1つでもあればノード全体を
+  full scan に落とす(狭まらない promise をできないので)。read guard は全参加者
+  を index root 昇順で一括取得。
+- **回帰**: `executor/multi_index_covering_scan_test.cpp` 9件。SQL 結果は
+  インデックスなしの双子テーブル `parts_plain` のフルスキャン結果と行単位で
+  一致。突変検証: (a) recheck を切ると 7件が落ちる (b) 交差の drop を切ると
+  直接実行器ケースが落ちる(＝交差と recheck が独立に固定されている)。
+  直接実行器のケースでは `region` だけを recheck に残すことで、交差が
+  唯一の絞り込みになっている答えを検証している。
+- **検証**: 全 ctest **3939/3939 合格**(意図的 skip 3、うち新規9件込み)。
+  `check_layering.py` 成功(allowlist 65辺)。clang-format 済。
+- **既知の残り**: 交差表は `BitmapHeapScan` と同じく位置列を全件メモリに
+  持つ。両経路共通のメモリ予算化は別項目。
+
 2026-10-17 加筆(第34報)。統合TODOの次項目: **複合インデックスの等式 +
 不等式混在**(LookupJoin probe の区間境界)。ForeignScan は外部ソース形式が
 未定のため保留し、次の具体項目から着手した。詳細は下記

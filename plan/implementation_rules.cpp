@@ -54,6 +54,7 @@
 #include "lsm_scan_plan.hpp"
 #include "merge_join_plan.hpp"
 #include "minmax_index_plan.hpp"
+#include "multi_index_covering_scan_plan.hpp"
 #include "plan/cascades.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
@@ -1280,6 +1281,166 @@ std::vector<PlanAlternative> ScanAlternatives(
         candidates.push_back(PlanAlternative{.plan = std::move(candidate),
                                              .local_cost = local_cost,
                                              .estimated_rows = estimated_rows});
+      }
+    }
+
+    // Multi-index covering: two or more indexes whose stored columns together
+    // cover every column the predicate and the output list touch, while no
+    // single index covers them alone (that case is the index-only path
+    // above).  Each participant contributes a leading-key range from the
+    // filter, so the intersection of their entries is a superset of the
+    // matching rows and the recheck on the covered columns decides.  A
+    // participant without a range would force a full index walk per position
+    // and stays with the bitmap / single-index paths.
+    if (!required.require_row_position && filter &&
+        relational_detail::SplitDisjuncts(filter).size() == 1) {
+      std::unordered_set<slot_t> touched;
+      for (const ColumnName& column : filter->TouchedColumns()) {
+        const int offset = schema.Offset(column);
+        if (offset >= 0) {
+          touched.insert(static_cast<slot_t>(offset));
+        }
+      }
+      for (const NamedExpression& item : fallback_select) {
+        for (const ColumnName& column : item.expression->TouchedColumns()) {
+          const int offset = schema.Offset(column);
+          if (offset >= 0) {
+            touched.insert(static_cast<slot_t>(offset));
+          }
+        }
+      }
+      // Participants: one per distinct leading key slot, each with a usable
+      // range on a non-retained index (a retained entry is not the committed
+      // image the covering read serves).
+      std::vector<BitmapIndexRange> participants;
+      std::unordered_set<slot_t> seen_leading;
+      for (size_t index_offset = 0; index_offset < table.IndexCount();
+           ++index_offset) {
+        const Index& candidate = table.GetIndex(index_offset);
+        if (candidate.RetainsDeletedEntries()) {
+          continue;
+        }
+        const auto bound = ranges.find(candidate.sc_.key_.front());
+        if (bound == ranges.end() ||
+            (!bound->second.min && !bound->second.max)) {
+          continue;
+        }
+        if (!seen_leading.insert(candidate.sc_.key_.front()).second) {
+          continue;
+        }
+        BitmapIndexRange range;
+        range.index = &candidate;
+        if (bound->second.min) {
+          range.begin_key.push_back(*bound->second.min);
+        }
+        if (bound->second.max) {
+          range.end_key.push_back(*bound->second.max);
+        }
+        participants.push_back(std::move(range));
+      }
+      // Greedy minimal cover over the touched columns.
+      std::vector<BitmapIndexRange> chosen;
+      {
+        std::unordered_set<slot_t> covered;
+        std::vector<bool> used(participants.size(), false);
+        while (!Covered(covered, touched)) {
+          size_t best = participants.size();
+          size_t best_gain = 0;
+          for (size_t i = 0; i < participants.size(); ++i) {
+            if (used[i]) {
+              continue;
+            }
+            size_t gain = 0;
+            for (const slot_t slot : participants[i].index->CoveredColumns()) {
+              if (touched.contains(slot) && !covered.contains(slot)) {
+                ++gain;
+              }
+            }
+            if (gain > best_gain) {
+              best_gain = gain;
+              best = i;
+            }
+          }
+          if (best == participants.size()) {
+            break;
+          }
+          used[best] = true;
+          for (const slot_t slot : participants[best].index->CoveredColumns()) {
+            if (touched.contains(slot)) {
+              covered.insert(slot);
+            }
+          }
+          chosen.push_back(std::move(participants[best]));
+        }
+        if (!Covered(covered, touched)) {
+          chosen.clear();
+        }
+      }
+      // Drop participants whose touched columns the rest already provide:
+      // they would only widen the intersection work.  At least two stay -- a
+      // single covering index is the index-only path's job.
+      bool pruned = true;
+      while (pruned && chosen.size() > 2) {
+        pruned = false;
+        for (size_t i = 0; i < chosen.size() && !pruned; ++i) {
+          std::unordered_set<slot_t> others;
+          for (size_t j = 0; j < chosen.size(); ++j) {
+            if (i == j) {
+              continue;
+            }
+            for (const slot_t slot : chosen[j].index->CoveredColumns()) {
+              if (touched.contains(slot)) {
+                others.insert(slot);
+              }
+            }
+          }
+          const bool redundant = std::ranges::all_of(
+              chosen[i].index->CoveredColumns(), [&](const slot_t slot) {
+                return !touched.contains(slot) || others.contains(slot);
+              });
+          if (redundant) {
+            chosen.erase(chosen.begin() + static_cast<std::ptrdiff_t>(i));
+            pruned = true;
+          }
+        }
+      }
+      if (chosen.size() >= 2) {
+        // The narrowest range is materialized first: the executor seeds its
+        // intersection table from the first participant.
+        const auto range_rows = [&](const BitmapIndexRange& range) {
+          if (!range.begin_key.empty() && range.begin_key == range.end_key) {
+            return EqualityPrefixRows(statistics, *range.index,
+                                      range.begin_key);
+          }
+          return static_cast<double>(statistics.Rows()) * filter_selectivity;
+        };
+        // Stable, so two participants with the same estimated width keep
+        // their catalog (creation) order: the participant order is visible in
+        // EXPLAIN and must not wobble between runs of the same statement.
+        std::ranges::stable_sort(
+            chosen, [&](const BitmapIndexRange& a, const BitmapIndexRange& b) {
+              return range_rows(a) < range_rows(b);
+            });
+        const double covering_rows = std::max(
+            1.0, static_cast<double>(statistics.Rows()) * filter_selectivity);
+        const double index_access =
+            std::max(1.0, covering_rows * static_cast<double>(chosen.size()));
+        Plan covering = std::make_shared<MultiIndexCoveringScanPlan>(
+            table, statistics, std::move(chosen), scan_predicate,
+            RowEstimate(covering_rows),
+            RowEstimate(index_access + covering_rows));
+        covering =
+            RemoveIdentityProjection(std::move(covering), fallback_select);
+        covering = finalize(std::move(covering));
+        // The same shape as the bitmap AND price, discounted like every
+        // covering (index-only) read: the intersection costs one index walk
+        // per participant but saves every heap fetch the recheck would need.
+        candidates.push_back(PlanAlternative{
+            .plan = std::move(covering),
+            .local_cost =
+                std::max(1.0, (index_access * 0.25 + covering_rows * 0.25) *
+                                  kCoveringIndexCostFactor),
+            .estimated_rows = covering_rows});
       }
     }
   }

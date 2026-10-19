@@ -22,6 +22,16 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   The serial `IndexScan` prefetches its upcoming heap pages with a look-ahead
   cursor (`TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH`); the index-only visibility
   map is `IndexScanIterator::TryReadIndexOnly`.
+  `multi_index_covering_scan` intersects two or more index ranges BY ROW
+  POSITION and assembles each output row from the index images alone
+  (`TryReadIndexOnly`) when the entry's page carries no version chains — the
+  case no single index covers, since it needs two indexes' stored columns at
+  once. A position on a chain-bearing page, or absent from any participant's
+  range, is dropped; the surviving rows are rechecked against the predicate
+  on the covered columns, so the intersection is a superset filter and never a
+  shortcut. Like `BitmapHeapScan` it materializes the position set, and the
+  plan orders participants narrowest-first so the table starts from the
+  smallest side.
 - Joins: `hash_join` (+ `hash_join_mode.hpp` cost helper; `EnableDynamicFilter`
   drains the build side first and publishes a `RuntimeFilterGroup` through
   `ExecutorBase::AttachRuntimeFilter`, falling back to filtering the probe side
@@ -106,5 +116,6 @@ Test: `./build/executor_test`, `relational_regression_test`,
 `data_chunk_test`, `distinct_test`, `merge_append_test`, `sort_collation_test`,
 `sort_shape_executor_test`, `grouped_aggregate_test`,
 `late_materialization_join_test`, `hash_semi_reduction_test`,
+`multi_index_covering_scan_test`,
 `query_scheduler_test`, `query_memory_test`, `spill_file_test`,
 `executor_extra_test`.

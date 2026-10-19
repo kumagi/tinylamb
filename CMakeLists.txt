@@ -447,6 +447,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/lookup_join.cpp
         executor/late_materialization_join.cpp
         executor/bitmap_scan.cpp
+        executor/multi_index_covering_scan.cpp
         executor/truncate.cpp
         executor/partial_aggregate.cpp
         executor/merge.cpp
@@ -483,6 +484,7 @@ tinylamb_add_layer(tinylamb_executor
         plan/relation_rename_plan.cpp
         plan/implementation_rules.cpp
         plan/index_only_scan_plan.cpp
+        plan/multi_index_covering_scan_plan.cpp
         plan/late_materialization_join_plan.cpp
         plan/aggregation_plan.cpp
         plan/empty_plan.cpp
@@ -935,6 +937,7 @@ add_simple_test(executor/executor_feature_test.cpp)
 add_simple_test(executor/band_join_test.cpp)
 add_simple_test(executor/dynamic_filter_join_test.cpp)
 add_simple_test(executor/hash_semi_reduction_test.cpp)
+add_simple_test(executor/multi_index_covering_scan_test.cpp)
 
 add_simple_test(executor/zigzag_join_test.cpp)
 add_simple_test(executor/late_materialization_join_test.cpp)

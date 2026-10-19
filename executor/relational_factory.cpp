@@ -48,6 +48,7 @@
 #include "executor/merge_append.hpp"
 #include "executor/merge_join.hpp"
 #include "executor/minmax_index.hpp"
+#include "executor/multi_index_covering_scan.hpp"
 #include "executor/nested_loop_join.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_hash_join.hpp"
@@ -93,6 +94,7 @@
 #include "plan/max1_row_plan.hpp"
 #include "plan/merge_join_plan.hpp"
 #include "plan/minmax_index_plan.hpp"
+#include "plan/multi_index_covering_scan_plan.hpp"
 #include "plan/parallel_thresholds.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
@@ -743,6 +745,97 @@ Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& txn) const {
   return std::make_shared<IndexOnlyScan>(
       txn.txn_, table_, index_, begin_key, end_key, ascending_, where_,
       table_.GetSchema(), std::move(index_read_guard));
+}
+
+Executor MultiIndexCoveringScanPlan::EmitExecutor(
+    TransactionContext& ctx) const {
+  // Full scan + residual predicate + projection to the covered layout: what
+  // every bail-out below returns.  It answers exactly the same rows (the
+  // predicate decides) and only gives up the heap-fetch avoidance.
+  auto full_scan_fallback = [&]() -> Executor {
+    Executor scan = std::make_shared<FullScan>(ctx.txn_, table_);
+    if (where_) {
+      scan = std::make_shared<Selection>(where_, table_.GetSchema(),
+                                         std::move(scan));
+    }
+    std::vector<NamedExpression> columns;
+    columns.reserve(output_schema_.ColumnCount());
+    for (size_t i = 0; i < output_schema_.ColumnCount(); ++i) {
+      columns.emplace_back(output_schema_.GetColumn(i).Name());
+    }
+    bool same_layout = columns.size() == table_.GetSchema().ColumnCount();
+    for (size_t i = 0; same_layout && i < columns.size(); ++i) {
+      same_layout = columns[i].expression->Type() == TypeTag::kColumnValue &&
+                    columns[i].expression->AsColumnValue().GetColumnName() ==
+                        table_.GetSchema().GetColumn(i).Name();
+    }
+    if (same_layout) {
+      return scan;
+    }
+    return std::make_shared<Projection>(std::move(columns), table_.GetSchema(),
+                                        std::move(scan));
+  };
+  // The compiled-plan cache rewrites literals into ParameterSlots, so at
+  // emit time the sniffed participant ranges are stale by construction.
+  // Rebuild each participant's seek keys from the BOUND predicate -- the same
+  // rebind IndexOnlyScanPlan::EmitExecutor does -- instead of falling back:
+  // without this the node is dead code for every SQL statement.  A
+  // participant whose leading key lost its bound (a NULL constant, a
+  // cross-typed literal, or no range at all) has no narrower walk to promise,
+  // so the whole node falls back rather than scan an unbounded index.
+  std::vector<BitmapIndexRange> participants = ranges_;
+  if (ContainsParameterSlot(where_)) {
+    participants.clear();
+    for (const BitmapIndexRange& range : ranges_) {
+      const ReboundIndexKeys rebound = ReboundIndexKeysFromPredicate(
+          where_, table_.GetSchema(), *range.index, /*want_points=*/false);
+      if (rebound.begin_key.empty() && rebound.end_key.empty()) {
+        return full_scan_fallback();
+      }
+      BitmapIndexRange participant;
+      participant.index = range.index;
+      participant.begin_key = std::move(rebound.begin_key);
+      participant.end_key = std::move(rebound.end_key);
+      participants.push_back(std::move(participant));
+    }
+  }
+  // Acquire every participant's read guard in one global order (sorted by
+  // index root, deduplicated) so two concurrent multi-index scans cannot
+  // interleave their acquisitions into a writer-starvation deadlock.
+  std::vector<page_id_t> roots;
+  roots.reserve(participants.size());
+  for (const BitmapIndexRange& range : participants) {
+    roots.push_back(range.index->Root());
+  }
+  std::ranges::sort(roots);
+  roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+  std::vector<std::pair<page_id_t, TransactionManager::IndexReadGuard>> held;
+  held.reserve(roots.size());
+  for (const page_id_t root : roots) {
+    if (ctx.txn_.IndexKeysMayBeStale(root)) {
+      return full_scan_fallback();
+    }
+    auto guard = ctx.txn_.AcquireIndexReadGuard(root);
+    if (ctx.txn_.IndexKeysMayBeStale(root)) {
+      return full_scan_fallback();
+    }
+    held.emplace_back(root, std::move(guard));
+  }
+  // Hand each participant the guard for its own index root; the scan keeps
+  // them alive for its lifetime, which is what makes the index-only reads
+  // sound.
+  std::vector<TransactionManager::IndexReadGuard> guards;
+  guards.reserve(participants.size());
+  for (const BitmapIndexRange& range : participants) {
+    const page_id_t root = range.index->Root();
+    const auto found = std::ranges::find_if(
+        held, [root](const auto& entry) { return entry.first == root; });
+    CHECK_MSG(found != held.end(), "multi-index covering scan guard missing");
+    guards.push_back(std::move(found->second));
+  }
+  return std::make_shared<MultiIndexCoveringScan>(
+      ctx.txn_, table_, std::move(participants), std::move(guards), where_,
+      covered_slots_, output_schema_);
 }
 
 Executor RelationRenamePlan::EmitExecutor(TransactionContext& ctx) const {

@@ -86,6 +86,19 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   keyed by relation-set + tag; each `Group` owns its scan filter so
   alternatives stay semantically identical; expression cap 4096 degrades
   gracefully (`Degraded`).
+- `multi_index_covering_scan_plan.{hpp,cpp}` — the covering case that no
+  SINGLE index can serve: two or more indexes whose stored columns (key +
+  INCLUDE, `Index::CoveredColumns()`) together cover every column the
+  predicate and the projection touch. `ScanAlternatives` offers it only when
+  no single index covers the set alone (that case stays `IndexOnlyScanPlan`),
+  every participant carries a leading-key range (an index without one would
+  force a full walk), a greedy minimal cover picks the set, an entry-retaining
+  (`kVersionedUnique`) index is never a participant, and redundancy pruning
+  leaves at least two. The node's schema is the union of the participants'
+  stored columns in table slot order, so the executor can assemble rows
+  positionally. Costed like a covering read (`kCoveringIndexCostFactor`).
+  Its `EmitExecutor` takes `IndexOnlyScanPlan`'s stale-key gate around a read
+  guard for EVERY participant, acquired in one index-root order.
 - Rule families: `ExpressionRuleSet::Default` (folds, De Morgan, comparison
   canonicalization…) → `cascades::RuleSet::Default` (83 logical equivalences:
   join commutativity/associativity/enumeration, selection merge/pushdown,
@@ -96,7 +109,9 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   ORDER BY, see `sort_plan.hpp`),
   `sort_incremental`, `lsm_scan` (LSM/WiscKey scan: `plan/lsm_scan_plan.*`
   over a caller-owned `LSMTree`; the `kLsmScan` node is built by plan-level
-  callers and tests — SQL is not wired); normal single-table queries use
+  callers and tests — SQL is not wired),
+  multi-index covering scan candidates (see
+  `multi_index_covering_scan_plan.hpp`); normal single-table queries use
   Memo, with only `OptimizeMinMaxIndex` retaining exact endpoint lookup).
   Dynamic join filters: `dynamic_filter_pushdown_join` records the probe-side
   join keys on a derived probe group (`Group::dynamic_filter_keys`), and the
