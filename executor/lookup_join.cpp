@@ -321,20 +321,20 @@ bool LookupJoin::Next(Row* dst, RowPosition* /* rp */) {
     Row right_row = **right_it_;
     const Row right_key = right_row.Extract(right_cols_);
     const bool matched = Matches(left_key, right_key);
-    if (at_most_one_) {
-      // The probe was a point lookup on a single-value unique key: this is
-      // the only position that key can name, so step the outer cursor instead
-      // of walking the index.
-      const Row left_row = hold_left_;
+    if (at_most_one_ && matched) {
+      // Point probe on a single-value unique key: this matching position is
+      // the only row that key can name, so step the outer cursor instead of
+      // walking on.
+      //
+      // Only a MATCH short-circuits.  A non-matching candidate falls through
+      // to the ordinary walk because the seek is an enclosure, not a
+      // predicate: `BuildSeekRange` widens an unusable bound to a prefix scan,
+      // and `Matches` is what decides admission.  Short-circuiting on the
+      // first candidate instead of the first match would turn that documented
+      // fallback into dropped rows.
+      *dst = hold_left_ + right_row;
       hold_left_.Clear();
-      if (matched) {
-        *dst = left_row + right_row;
-        return true;
-      }
-      if (!Load()) {
-        return false;
-      }
-      continue;
+      return true;
     }
     ++*right_it_;
     *dst = hold_left_ + right_row;
@@ -378,6 +378,12 @@ void LookupJoin::Dump(std::ostream& o, int indent) const {
     }
   }
   ss << "}";
+  if (at_most_one_) {
+    // Auditable in logs: the probe is a point lookup on a single-value unique
+    // key, so the cursor steps the outer side on the first match instead of
+    // walking on.
+    ss << " at-most-one";
+  }
   o << "LookupJoin: " << ss.str() << "\n"
     << Indent(static_cast<size_t>(indent) + 2);
   left_->Dump(o, indent + 2);

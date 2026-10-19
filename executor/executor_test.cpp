@@ -892,6 +892,192 @@ TEST_F(ExecutorTest, LookupJoinWithCompositeKey) {
   ASSERT_TRUE(expected.empty());
 }
 
+// The unique-inner short-circuit. A point probe on a COMPLETE single-value
+// unique key can name at most one row, so the cursor emits it and steps the
+// OUTER cursor instead of walking on. The four cases below pin the gate from
+// both sides: the two shapes that qualify, and the two that must not.
+TEST_F(ExecutorTest, LookupJoinUniquePointProbeShortCircuits) {
+  TransactionContext ctx = rs_->BeginContext();
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"UniqueInner",
+                                   {Column("key", ValueType::kInt64),
+                                    Column("label", ValueType::kVarChar)}}));
+  BulkInsert(ctx.txn_, right_tbl,
+             {{Row({Value(1), Value("one")})},
+              {Row({Value(2), Value("two")})},
+              {Row({Value(3), Value("three")})}});
+  // Default mode of IndexSchema is kUnique: one stored value per key.
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(ctx, "UniqueInner", IndexSchema("UniqueKey", {0})));
+  const StatusOr<std::shared_ptr<Table>> right_status =
+      ctx.GetTable("UniqueInner");
+  ASSERT_EQ(right_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& right = right_status.Value();
+  ASSERT_EQ(right->IndexCount(), 1);
+  ASSERT_TRUE(right->GetIndex(0).StoresSingleValue());
+  LookupJoin join(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
+                  *right, right->GetIndex(0), {0});
+  EXPECT_TRUE(join.AtMostOneProbe());
+  // The shape is also auditable in an executor dump, where the operator is
+  // explained next to the columns it probes.
+  std::ostringstream dump;
+  join.Dump(dump, 0);
+  EXPECT_NE(dump.str().find("at-most-one"), std::string::npos) << dump.str();
+
+  std::unordered_set<Row> expected(
+      {Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value("three")}),
+       Row({Value(1), Value("world"), Value(4.9), Value(1), Value("one")}),
+       Row({Value(2), Value("arise"), Value(4.14), Value(2), Value("two")})});
+  Row got;
+  while (join.Next(&got, nullptr)) {
+    ASSERT_TRUE(expected.erase(got)) << got;
+  }
+  ASSERT_SUCCESS(join.GetStatus());
+  EXPECT_TRUE(expected.empty());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(ExecutorTest, LookupJoinNonUniqueInnerKeepsTheFullMatchSet) {
+  TransactionContext ctx = rs_->BeginContext();
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"SharedInner",
+                                   {Column("key", ValueType::kInt64),
+                                    Column("label", ValueType::kVarChar)}}));
+  BulkInsert(ctx.txn_, right_tbl,
+             {{Row({Value(3), Value("three-a")})},
+              {Row({Value(3), Value("three-b")})},
+              {Row({Value(1), Value("one")})}});
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      ctx, "SharedInner",
+      IndexSchema("SharedKey", {0}, {}, IndexMode::kNonUnique)));
+  const StatusOr<std::shared_ptr<Table>> right_status =
+      ctx.GetTable("SharedInner");
+  ASSERT_EQ(right_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& right = right_status.Value();
+  LookupJoin join(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
+                  *right, right->GetIndex(0), {0});
+  // A non-unique index holds a vector of positions per key, so the probe has
+  // to walk all of them: the short-circuit must stay off.
+  EXPECT_FALSE(join.AtMostOneProbe());
+
+  std::unordered_set<Row> expected(
+      {Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value("three-a")}),
+       Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value("three-b")}),
+       Row({Value(1), Value("world"), Value(4.9), Value(1), Value("one")})});
+  Row got;
+  while (join.Next(&got, nullptr)) {
+    ASSERT_TRUE(expected.erase(got)) << got;
+  }
+  ASSERT_SUCCESS(join.GetStatus());
+  EXPECT_TRUE(expected.empty());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(ExecutorTest, LookupJoinUniqueCompositeKeyNeedsTheWholeKey) {
+  TransactionContext ctx = rs_->BeginContext();
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"CompositeInner",
+                                   {Column("key", ValueType::kInt64),
+                                    Column("tag", ValueType::kVarChar),
+                                    Column("payload", ValueType::kInt64)}}));
+  BulkInsert(ctx.txn_, right_tbl,
+             {{Row({Value(3), Value("piyo"), Value(30)})},
+              {Row({Value(3), Value("other"), Value(31)})},
+              {Row({Value(1), Value("world"), Value(10)})}});
+  ASSERT_SUCCESS(rs_->CreateIndex(ctx, "CompositeInner",
+                                  IndexSchema("CompositeKey", {0, 1})));
+  const StatusOr<std::shared_ptr<Table>> right_status =
+      ctx.GetTable("CompositeInner");
+  ASSERT_EQ(right_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& right = right_status.Value();
+  // Only the leading key is pinned: the seek is a prefix walk, not a point
+  // lookup, so every (3, *) entry has to be emitted.
+  LookupJoin prefix(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
+                    *right, right->GetIndex(0), {0});
+  EXPECT_FALSE(prefix.AtMostOneProbe());
+  std::unordered_set<Row> prefix_expected(
+      {Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value("piyo"),
+            Value(30)}),
+       Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value("other"),
+            Value(31)}),
+       Row({Value(1), Value("world"), Value(4.9), Value(1), Value("world"),
+            Value(10)})});
+  Row got;
+  while (prefix.Next(&got, nullptr)) {
+    ASSERT_TRUE(prefix_expected.erase(got)) << got;
+  }
+  ASSERT_SUCCESS(prefix.GetStatus());
+  EXPECT_TRUE(prefix_expected.empty());
+
+  // The complete key is a single-value point probe again.
+  LookupJoin whole(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0, 1},
+                   *right, right->GetIndex(0), {0, 1});
+  EXPECT_TRUE(whole.AtMostOneProbe());
+  std::unordered_set<Row> whole_expected(
+      {Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value("piyo"),
+            Value(30)}),
+       Row({Value(1), Value("world"), Value(4.9), Value(1), Value("world"),
+            Value(10)})});
+  while (whole.Next(&got, nullptr)) {
+    ASSERT_TRUE(whole_expected.erase(got)) << got;
+  }
+  ASSERT_SUCCESS(whole.GetStatus());
+  EXPECT_TRUE(whole_expected.empty());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(ExecutorTest, LookupJoinRetainedUniqueIndexIsNotASingleValue) {
+  TransactionContext ctx = rs_->BeginContext();
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"RetainedInner",
+                                   {Column("key", ValueType::kInt64),
+                                    Column("label", ValueType::kVarChar)}}));
+  BulkInsert(
+      ctx.txn_, right_tbl,
+      {{Row({Value(3), Value("three")})}, {Row({Value(1), Value("one")})}});
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      ctx, "RetainedInner",
+      IndexSchema("RetainedKey", {0}, {}, IndexMode::kVersionedUnique)));
+  const StatusOr<std::shared_ptr<Table>> right_status =
+      ctx.GetTable("RetainedInner");
+  ASSERT_EQ(right_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& right = right_status.Value();
+  // kVersionedUnique stores a VECTOR per key (deleted positions are retained
+  // so an older snapshot can still reach the row version), so "at most one"
+  // does not hold and the cursor must walk the entry list.
+  EXPECT_TRUE(right->GetIndex(0).IsUnique());
+  EXPECT_FALSE(right->GetIndex(0).StoresSingleValue());
+  LookupJoin join(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
+                  *right, right->GetIndex(0), {0});
+  EXPECT_FALSE(join.AtMostOneProbe());
+  std::unordered_set<Row> expected(
+      {Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value("three")}),
+       Row({Value(1), Value("world"), Value(4.9), Value(1), Value("one")})});
+  Row got;
+  while (join.Next(&got, nullptr)) {
+    ASSERT_TRUE(expected.erase(got)) << got;
+  }
+  ASSERT_SUCCESS(join.GetStatus());
+  EXPECT_TRUE(expected.empty());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
 TEST_F(ExecutorTest, LookupJoinRejectsNullAndNaNKeys) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(
@@ -948,6 +1134,40 @@ std::vector<Row> Drain(ExecutorBase& join) {
 }
 
 }  // namespace
+
+// The short-circuit clears the held outer row on every match, so a repeated
+// probe key must seek again instead of reusing the previous landing. This is
+// the state machine an outer side with duplicate keys exercises.
+TEST_F(ExecutorTest, LookupJoinUniquePointProbeHandlesRepeatedOuterKeys) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"RepeatedTarget",
+                                   {Column("k", ValueType::kInt64),
+                                    Column("v", ValueType::kInt64)}}));
+  BulkInsert(ctx.txn_, right_tbl,
+             {{Row({Value(7), Value(70)})}, {Row({Value(8), Value(80)})}});
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(ctx, "RepeatedTarget",
+                       IndexSchema("RepeatedK", {0}, {}, IndexMode::kUnique)));
+  const StatusOr<std::shared_ptr<Table>> right_status =
+      ctx.GetTable("RepeatedTarget");
+  ASSERT_EQ(right_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& right = right_status.Value();
+  // 7 twice, a miss, then 8: every left row is answered by its own probe.
+  LookupJoin join(ctx.txn_,
+                  RangeProbeInput({Row({Value(7)}), Row({Value(7)}),
+                                   Row({Value(9)}), Row({Value(8)})}),
+                  {0}, *right, right->GetIndex(0), {0});
+  EXPECT_TRUE(join.AtMostOneProbe());
+  const std::vector<Row> rows = Drain(join);
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0], Row({Value(7), Value(7), Value(70)}));
+  EXPECT_EQ(rows[1], Row({Value(7), Value(7), Value(70)}));
+  EXPECT_EQ(rows[2], Row({Value(8), Value(8), Value(80)}));
+  ASSERT_SUCCESS(join.GetStatus());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
 
 // A composite index (a, b) probed with an equality on `a` and a range bound on
 // `b`: the seek opens the half-open key range and the re-check resolves the

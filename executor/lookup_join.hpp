@@ -82,6 +82,13 @@ class LookupJoin : public ExecutorBase {
   bool Next(Row* dst, RowPosition* /* rp */) override;
   void Dump(std::ostream& o, int indent) const override;
 
+  // Shape guard for the single-row short-circuit: the seek is a point probe on
+  // a COMPLETE single-value unique key, so a matching candidate is the only
+  // row that key can name and `Next` steps the outer cursor instead of walking
+  // the index.  False for a non-unique / entry-retaining index and for a
+  // prefix or range probe (those keep the per-candidate walk).
+  [[nodiscard]] bool AtMostOneProbe() const { return at_most_one_; }
+
  private:
   // Positions the next left row into a new index probe. Returns false at
   // end-of-input or on failure (with the sticky status recorded).

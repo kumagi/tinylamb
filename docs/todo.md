@@ -362,7 +362,31 @@ Cascades rule / cost / statistics
       ことを固定。旧ゲートを戻すと「Index Join なし」で落ちる)。
       既知の残り: 内側 filter の conjunct を probe の seek range へ出す
       (定数 bound を先頭キーへ載せる)最適化は未実装 —— 現状は全部 residual。
-- [ ] unique内側の1行lookup短絡を実装する。
+- [x] unique内側の1行lookup短絡を実装する。
+      短絡の扉 `LookupJoin::at_most_one_` 自体は既にあったが、契約も回帰も無く
+      「探せばある」状態だったので、条件・安全性・監査点を確定させた。
+      **発火条件**: seek が single-value unique 索引の**完全キー**への点 probe
+      であること（`!range_position_` かつ `StoresSingleValue()` かつ
+      `left_cols_.size() == index.sc_.key_.size()`）。このとき一致した候補は
+      そのキーが指し得る唯一の行（`kUnique` は NULL 以外のキーを単一値で持ち、
+      重複挿入は `BPlusTree::Insert` が `kDuplicates` で弾く）なので、索引
+      カーソルを進めず外側カーソルを1つ進める。
+      **安全性の要件を1つ足した**: 短絡してよいのは**一致した候補だけ**。
+      `BuildSeekRange` は使えない bound を前置走査へ広げる契約（「広がるだけで
+      誤った行は通さない」）なので、最初の候補で打ち切るとその fallback が行の
+      取りこぼしに変わる。一致しなかった候補は通常の走査へ落とし、`Matches` を
+      唯一の判定者に保つ（現状の点 probe では未達だが、契約として固定）。
+      形状は `AtMostOneProbe()` と実行器 dump の `at-most-one` 表示で監査可能。
+      回帰: `ExecutorTest.LookupJoinUniquePointProbeShortCircuits` /
+      `...UniquePointProbeHandlesRepeatedOuterKeys`（外側キー重複時に
+      hold を捨てて再 probe する状態機械）/ `...NonUniqueInnerKeepsTheFullMatchSet` /
+      `...UniqueCompositeKeyNeedsTheWholeKey`（前置だけなら短絡しない）/
+      `...RetainedUniqueIndexIsNotASingleValue` の5件、および SQL
+      `QueryTest.UniqueInnerJoinEmitsOneRowPerOuterRow`（外側キー重複・内側に
+      無いキー・COUNT の3方向）。扉を殺す変異で3件が落ちることを確認。
+      既知の残り: `kVersionedUnique` は保持削除でキー1つに複数 position が
+      並び得る（挿入は一意性を強制しない）ため短絡しない。連続する重複
+      外側キーで probe を作り直さない locality 最適化は次項。
 - [ ] ソート済み外側からのlookup localityをcost化する。
 
 ### DISTINCT / 集合演算

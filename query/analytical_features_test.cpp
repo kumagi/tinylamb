@@ -358,14 +358,18 @@ TEST_F(AnalyticalFeaturesTest, SystemTableSampleBandOnMultiPageTable) {
   RunSql(
       engine_.get(), context_.get(),
       "INSERT INTO big SELECT k FROM UNNEST(GENERATE_ARRAY(1, 20000)) AS k;");
+  // Block granularity makes the count lumpy, and this table has few enough
+  // pages that one block is a big share of its rows: an unpinned 50% draw was
+  // observed anywhere from 12% to 88% of the table across seeds, so the band
+  // means nothing without pinning the draw (and this case really did flake in
+  // full ctest runs). REPEATABLE makes the case deterministic; the band still
+  // fails a whole-table, empty or grossly-wrong-percentage answer.
   const auto sampled =
       RunSql(engine_.get(), context_.get(),
-             "SELECT COUNT(*) FROM big TABLESAMPLE SYSTEM (50 PERCENT);");
+             "SELECT COUNT(*) FROM big TABLESAMPLE SYSTEM (50 PERCENT) "
+             "REPEATABLE(123);");
   ASSERT_EQ(sampled.size(), 1U);
   const int64_t count = sampled[0][0].value.int_value;
-  // Block granularity makes the count lumpy; a 20%-80% band leaves room for
-  // page-level variance while still failing on per-row (25%/75%) or
-  // whole-table bugs.
   EXPECT_GE(count, 4000);
   EXPECT_LE(count, 16000);
 

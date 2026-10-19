@@ -4,10 +4,49 @@
 Path)の次項目: **内側filterを index へ適用できない場合に heap 側へ残す契約**。
 詳細は下記「2026-10-19 LookupJoin の内側 filter 契約」の節。
 
+2026-10-19 加筆(第37報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
+Path)の次項目: **unique内側の1行lookup短絡**。詳細は下記
+「2026-10-19 LookupJoin の unique 内側短絡」の節。
+
 2026-10-19 加筆(第35報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-19 LookupJoin の unique 内側短絡
+
+- **[状況] 扉はあったが契約が無かった。** `LookupJoin::at_most_one_` は
+  `!range_position_` かつ `StoresSingleValue()` かつ
+  `left_cols_.size() == index.sc_.key_.size()` のとき立ち、一致した候補で
+  索引カーソルを進めず外側カーソルを進める。実装自体は入っていたが、
+  (a) 何が「1行」を保証するのか、(b) どこまで打ち切ってよいのか、
+  (c) 形状をどう監査するのか、がどこにも書かれておらず、回帰も
+  「結果が正しい」ことしか見ていなかった(結果は短絡の有無で変わらないので、
+  扉が壊れても緑のままだった)。
+- **[保証] `kUnique` はキーごとに単一値。** 索引は NULL 以外のキーを
+  `IndexValueType` 1個で持ち、重複キーの挿入は `BPlusTree::Insert` が
+  `kDuplicates` で弾く。よって完全キーへの点 probe の候補は高々1行。
+  `kVersionedUnique` は同じキーに複数 position が並び得る(削除保持のための
+  ベクタ表現で、挿入は一意性を強制しない)ので対象外。
+- **[修正] 打ち切ってよいのは「一致した」候補だけ。** 旧実装は最初の**候補**で
+  打ち切り、`Matches` が偽ならその外側行を捨てていた。点 probe では未達だが、
+  `BuildSeekRange` の契約は「使えない bound は前置走査へ広げる。広がるだけで
+  誤った行は通さない」であり、この前提が崩れた瞬間に fallback が**行の
+  取りこぼし**へ変わる。一致した候補だけ短絡し、不一致は通常の走査へ落とす形に
+  した(`Matches` が唯一の判定者)。挙動は不変、契約だけが強くなる。
+- **[監査] `AtMostOneProbe()` + dump の `at-most-one`。** 形状は EXPLAIN では
+  なく実行器 dump に出るので、ログで「なぜこの probe が歩かないのか」が読める。
+- **[回帰]** `ExecutorTest.LookupJoinUniquePointProbeShortCircuits` /
+  `...UniquePointProbeHandlesRepeatedOuterKeys`(外側キー重複。hold を捨てて
+  次の行を probe する状態機械を固定) / `...NonUniqueInnerKeepsTheFullMatchSet` /
+  `...UniqueCompositeKeyNeedsTheWholeKey`(前置のみ → 短絡しない、完全キー →
+  短絡する、を同一索引で対比) / `...RetainedUniqueIndexIsNotASingleValue`。
+  SQL: `QueryTest.UniqueInnerJoinEmitsOneRowPerOuterRow`(外側キー重複・内側に
+  無いキー・COUNT の3方向)。扉を `&& false` で殺す変異で3件が落ちる。
+- **[残りのレバー]** 外側が同じキーを連続で持つとき probe を作り直さない
+  locality 最適化(次項「ソート済み外側からの lookup locality」の実行器側)と、
+  その cost 化。内側 filter の定数 bound を seek range へ載せる話は前節のまま
+  未実装。
 
 ## 2026-10-19 LookupJoin の内側 filter 契約
 
@@ -2721,6 +2760,11 @@ WAL snapshot sink のラムダが `[&]` で TestBody ローカルを捕獲した
     もフル ctest 高負荷時のみ 1 回落ちて単独では 128 ms で安定パス
     (2026-09-23 記録のタイミング系フレークと同系統。外部パーサ子プロセスと
     -j 満載時のリソース競合の疑い、要 root-cause)。
+    **2026-10-20 解決**: 負荷ではなく **seed 無しの統計フレーク**だった。
+    この表はページ数が少なく、1 ブロックが全行の 1/8 前後を占めるため、
+    50% のブロック抽選は seed 次第で 12%〜88% まで振れる。単独実行でも 4 回に
+    2 回は帯 [4000,16000] の外に出た。`REPEATABLE(123)` で抽選を固定し
+    （6570 行）、帯は「全表 / 空 / 桁違い」を落とす網として残した。
 
 ## 2026-09-27 トランザクションエンジン強化セッション
 

@@ -5621,6 +5621,54 @@ TEST_F(QueryTest, ZigZagJoinSqlContracts) {
   ctx.txn_.Abort();
 }
 
+// A unique inner side means a probe can name at most one row: the join must
+// then emit exactly one row per left row -- never a second copy for a repeated
+// outer key, and nothing at all for a key the inner side lacks.  The planner is
+// free to pick the hash join here; the executor short-circuit itself is pinned
+// by `ExecutorTest.LookupJoinUniquePointProbe*`, and this test holds the SQL
+// shape to the same answer either way.
+TEST_F(QueryTest, UniqueInnerJoinEmitsOneRowPerOuterRow) {
+  TransactionContext setup = db_->BeginContext();
+  RunSql(setup, *db_, "CREATE TABLE ui_left (k INT64, tag STRING);");
+  RunSql(setup, *db_, "CREATE TABLE ui_right (k INT64, v INT64);");
+  ASSERT_EQ(
+      db_->CreateIndex(setup, "ui_right",
+                       IndexSchema("ui_right_k", {0}, {}, IndexMode::kUnique)),
+      Status::kSuccess);
+  // The outer side repeats key 2 (once per tag) and carries a key the inner
+  // side does not have.
+  RunSql(setup, *db_,
+         "INSERT INTO ui_left VALUES (2, 'a'), (2, 'b'), (1, 'c'), (5, 'd');");
+  RunSql(setup, *db_, "INSERT INTO ui_right VALUES (2, 20), (1, 10);");
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  TransactionContext stats_context = db_->BeginContext();
+  db_->RefreshStatistics(stats_context, "ui_left");
+  db_->RefreshStatistics(stats_context, "ui_right");
+  ASSERT_SUCCESS(stats_context.txn_.PreCommit());
+
+  TransactionContext ctx = db_->BeginContext();
+  const std::vector<Row> joined = RunSql(
+      ctx, *db_,
+      "SELECT ui_left.k, ui_left.tag, ui_right.v FROM ui_left JOIN ui_right "
+      "ON ui_left.k = ui_right.k ORDER BY ui_left.k, ui_left.tag;");
+  ASSERT_EQ(joined.size(), 3U);
+  EXPECT_EQ(joined[0], (Row({Value(1), Value("c"), Value(10)})));
+  EXPECT_EQ(joined[1], (Row({Value(2), Value("a"), Value(20)})));
+  EXPECT_EQ(joined[2], (Row({Value(2), Value("b"), Value(20)})));
+
+  // The same shape counted from the inner side: a unique key must not add a
+  // second row to the aggregate either.
+  const std::vector<Row> counted = RunSql(
+      ctx, *db_,
+      "SELECT ui_right.k, COUNT(*) FROM ui_left JOIN ui_right "
+      "ON ui_left.k = ui_right.k GROUP BY ui_right.k ORDER BY ui_right.k;");
+  ASSERT_EQ(counted.size(), 2U);
+  EXPECT_EQ(counted[0], (Row({Value(1), Value(1)})));
+  EXPECT_EQ(counted[1], (Row({Value(2), Value(2)})));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, UnsignedInt64_CreateInsertOrderAndIndex) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE u_tbl (u UINT64);");

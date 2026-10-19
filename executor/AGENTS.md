@@ -43,7 +43,16 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   `merge_join`, `parallel_merge_join`, `nested_loop_join`,
   `batch_nested_loop_join`, `cross_join`, `lookup_join`,
   `late_materialization_join`, `interval_join`, `as_of_join`, `apply`
-  (correlated), `join_kind.hpp`.
+  (correlated), `join_kind.hpp`. `lookup_join` short-circuits a **point probe
+  on a complete single-value unique key** (`!range_position_`,
+  `Index::StoresSingleValue()`, `left_cols.size() == key.size()`): a matching
+  candidate is the only row that key can name, so it steps the outer cursor
+  instead of walking the index (`AtMostOneProbe()`, rendered as `at-most-one`
+  in the operator dump). Only a *match* short-circuits — a non-matching
+  candidate keeps walking, because the seek is an enclosure that
+  `BuildSeekRange` may widen and `Matches` is the authority. A non-unique or
+  entry-retaining (`kVersionedUnique`) index and any prefix/range probe keep
+  the per-candidate walk.
 - Sort/agg: `sort`, `topn`, `partial_sort`, `incremental_sort`, `pdqsort`,
   (every sort-shaped operator resolves its keys through
   `type/collation.hpp`'s `SortKeyOrder` / `EqualUnderCollation`; `sort.cpp`
